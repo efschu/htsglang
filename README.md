@@ -5,9 +5,11 @@ fLLiper is an LLM inference server for mismatched GPUs, derived from [SGLang](ht
 project is called fLLiper from release 0.1.0 on. The Python package is `flliper`, the runtime environment variables are
 `FLLIPER_*`, the P/D-flip subsystem is `pdflip` (`FLLIPER_PDFLIP_*`, `--pdflip-*`, log markers `PDFLIP-*`).
 
-> **Status.** Release 0.1.0 is prepared in the repository. The image is **not published** yet; pushing the tree to
-> `github.com/efschu/fLLiper` and the image to `ghcr.io` are user gates. Everything below describes the state of the
-> integration branches `desk/flliper-27b-int-1008` (27B line) and `desk/flliper-nf-int-1008` (Flash-Next line).
+> **Status: release candidate RC1 (without the vision rebuild).** Release 0.1.0 is prepared in the repository; RC1 is the state of the integration
+> branches `desk/flliper-27b-int-1009` (27B line) and `desk/flliper-nf-int-1009` (Flash-Next line), the fix round after the RC1 acceptance of 09.10.
+> **RC2** follows after the port of the vision rebuild (`desk/post-vision-weights-1009` @ 9f7e57363f) and its planner work package (AP4); until
+> then 0.1.0 is not final. Vision in Dual: Umbau folgt als RC2 (Nutzerentscheid 09.10.: 0.1.0-Bedingung). The image is **not published** yet; pushing the
+> tree to `github.com/efschu/fLLiper` and the image to `ghcr.io` are user gates.
 
 ## What is in it
 

@@ -1,4 +1,4 @@
-# fLLiper 0.1.0: release notes (state of the integration branches, F0-I, 09.10.2026)
+# fLLiper 0.1.0 RC1: release notes (state of the integration branches after the RC1 fix round F0-K, 09.10.2026)
 
 Scope: the rename of htsglang to fLLiper and what the release contains. Every number below comes from a work-package report
 (F0-D .. F0-M, F0-I) or from a test run named in it; "unproven" means nobody ran it. Nothing here has been published: the push to
@@ -8,9 +8,10 @@ Scope: the rename of htsglang to fLLiper and what the release contains. Every nu
 
 | | |
 |---|---|
+| Status | **RC1, without the vision rebuild.** RC2 = RC1 + the port of the vision rebuild (`desk/post-vision-weights-1009` @ 9f7e57363f) + its planner package AP4; 0.1.0 final needs RC2 (user decision 09.10.). Vision in Dual: Umbau folgt als RC2 (Nutzerentscheid 09.10.: 0.1.0-Bedingung) |
 | Name | fLLiper (derived from SGLang, Apache-2.0). Python package `flliper`, environment `FLLIPER_*`, P/D-flip subsystem `pdflip` (`FLLIPER_PDFLIP_*`, `--pdflip-*`, markers `PDFLIP-*`) |
 | Purpose | LLM inference on mismatched GPUs: heterogeneous tensor parallelism, prefill/decode flipping on one box (`pdflip`), profile planner, dashboard |
-| Lines | two code states in one image: **27B** (`desk/flliper-27b-int-1008`) and **Flash-Next / NF** (`desk/flliper-nf-int-1008`) |
+| Lines | two code states in one image: **27B** (`desk/flliper-27b-int-1009`) and **Flash-Next / NF** (`desk/flliper-nf-int-1009`) |
 | Image | Duo image `ghcr.io/efschu/flliper:0.1.0-cu130` (and `flliper:cu130-<sha10>`), labels `io.github.efschu.flliper.*`, source `https://github.com/efschu/fLLiper`; built by `docker/flliper/make_flat_ctx.sh` + `Dockerfile.flliper`, gated by `host_publish_flliper.sh` |
 | Predecessor | htsglang; the published tag `htsglang:cu130-nccl2307` is untouched |
 
@@ -24,7 +25,7 @@ Scope: the rename of htsglang to fLLiper and what the release contains. Every nu
   markers and log stems. **No Python import alias** `sglang` -> `flliper` (plan row F0-C, not built).
 * Must-keep (RENAME_PLAN 2): licence and attribution lines, URLs and upstream ids, foreign packages, the kernel wheel `sgl_kernel`, C/C++/CUDA
   sources, host paths `/spinning/htsglang*`, evidence names (boot tags `weg2xsn246`, `boot_weg2_*` logs, `/spinning/gpu-arb/weg2`),
-  persisted format ids (`weg2-footprint/1`, `weg2-x-curves/1`, `weg2.form_measures/N`), the product environment `HTSGLANG_*`.
+  persisted format ids (`weg2-footprint/1`, `weg2-x-curves/1`, `weg2.form_measures/N`, and since the RC1 fix round the L3 index snapshot header `WEG2-L3-INDEX v3` and the seed of the salted KV page keys `sglang-kv-namespace-v1`), the C++ namespaces the JIT wrappers name (`sglang`, `sglang_<x>`), the product environment `HTSGLANG_*`.
 * **Metric names are must-keep** (user decision 08.10.2026 "pdflip as the name, the metrics stay", F0-M, RENAME_PLAN 8.17): the engine's
   `sglang:*` / `sglang_*` and the flip subsystem's `weg2_*` (front, rank, boot, GPU, Influx `weg2_flip`, label `weg2_group`, scrape job
   `weg2-front`) keep their spelling, so VictoriaMetrics history and Grafana panels continue; the dashboard readers select both stems
@@ -61,7 +62,7 @@ The 27B line has no post-freeze fixes. On the NF line the tree contains, ported 
 * **D queue head** (int18 decode dip): one free base for SEAT-AGE and form A, an unservable D head goes to P, re-evaluation only on a state change (markers `D-HEAD-HOLD`, `D-WALL-HEAD`, `W50-REROUTE`).
 * **UD-H**: P rank death "prefill out of memory / eviction under-delivered": host-only children are evicted before dropping.
 * **PP-ROOM-VOTE** (int21): one agreed room count per pass across the P stages (`PR PP-ROOM-CAP`, `PR AGREED-ROOM SHORT`).
-* **W3 spill anchor pool** (`FLLIPER_PDFLIP_ENABLE_W3_SPILL_ANCHOR_POOL`, default off) and the three int23 parts: Mamba last-resort (`FLLIPER_PDFLIP_MAMBA_SPILL_LAST_RESORT`, default off), PR-ARENA (`FLLIPER_PDFLIP_ENABLE_PP_ROOM_ARENA_FREE_ROOM`, default on), W3 host leaves (`FLLIPER_PDFLIP_ENABLE_W3_SPILL_HOST_LEAVES`, default off).
+* **W3 spill anchor pool** (`FLLIPER_PDFLIP_ENABLE_W3_SPILL_ANCHOR_POOL`, default off) and the three int23 parts: Mamba last-resort (`FLLIPER_PDFLIP_MAMBA_SPILL_LAST_RESORT`, **default on since the user decision of 09.10.**, `0` = the old answer), PR-ARENA (`FLLIPER_PDFLIP_ENABLE_PP_ROOM_ARENA_FREE_ROOM`, default on), W3 host leaves (`FLLIPER_PDFLIP_ENABLE_W3_SPILL_HOST_LEAVES`, **default on since 09.10.**, `0` = the old spill; on hybrid boots it is reached only through the anchor pool, whose switch stays off). Ported from `desk/nf-defaults-on-1008` @ dd65a419fb (F0-K M4); the 27B tree has neither switch.
 
 Metal status of these fixes is the NF seat's (list in `FIXES-NACH-FREEZE-1007.md`); this document claims none of them as proven on metal.
 Not in these heads: fixes after int23, among them the H88 W4A8 work with its scale fix `dec66fb0b4` (the NF tree has no `marlin_a8` files) and the room-short repro; a second port round is open.
@@ -72,7 +73,7 @@ Not in these heads: fixes after int23, among them the H88 W4A8 work with its sca
 2. Dashboard deploy (`install.sh`, `install_510.sh`), image build from the integration heads on the build host (`make_flat_ctx.sh`, `Dockerfile.flliper`), F0.5 acceptance boots, the push to `efschu/fLLiper` and `ghcr.io`: seats and user gates.
 3. Product layer ("phase 2b" of section 5, the lower-case `htsglang` product name: units `htsglang-*.service`, `/etc|/var/lib|/opt/htsglang`, `x-htsglang` API namespace, `docker/htsglang*` compose / Dockerfiles, volume names): not renamed in F0. Counted as findings in the inventory; the release image carries `/opt/htsglang/src-{27b,nf}` and the `SGLANG_WEG2_*` variables the double-reading entrypoint expects.
 4. Prose pass (Variant B): comments and docstrings, mixed language left by `ident_fix`, root notes (`FEATURES_VS_UPSTREAM.md`, `HANDOVER_760.md`, ...), the draft release README `docker/pdflip-release/README_RELEASE_DRAFT.md`.
-5. Default decision (user): `FLLIPER_PDFLIP_ENABLE_W3_SPILL_HOST_LEAVES` and `FLLIPER_PDFLIP_MAMBA_SPILL_LAST_RESORT` are off; the metal evidence is the NF seat's (`FIXES-NACH-FREEZE-1007.md`).
+5. Default decision (user, 09.10.): `FLLIPER_PDFLIP_ENABLE_W3_SPILL_HOST_LEAVES` and `FLLIPER_PDFLIP_MAMBA_SPILL_LAST_RESORT` are **on** by default (NF line; row 21 of `FIXES-NACH-FREEZE-1007.md`); the metal evidence is the NF seat's. The profiles `-mlr` / `-hl` set them explicitly and stay valid.
 6. Second NF port round for fixes after int23 (not in the NF head: the H88 W4A8 work with its scale fix `dec66fb0b4`, the room-short repro).
 7. No `sglang` -> `flliper` import alias (plan row F0-C).
 8. Dry-runs end at the launcher's first refusal on this box (W61 / W128 / W163, W64 on one profile): what lies behind it is compared on the host in F0-J.

@@ -862,9 +862,58 @@ lists and in the inventory as `kit-span` / `collision_ok-file` / `exclude-conten
 2. Dashboard deploy (`install.sh`, `install_510.sh`), image build from the integration heads on the build host (`make_flat_ctx.sh`, `Dockerfile.flliper`), F0.5 acceptance boots, the push to `efschu/fLLiper` and `ghcr.io`: seats and user gates.
 3. Product layer ("phase 2b" of section 5, the lower-case `htsglang` product name: units `htsglang-*.service`, `/etc|/var/lib|/opt/htsglang`, `x-htsglang` API namespace, `docker/htsglang*` compose / Dockerfiles, volume names): not renamed in F0. Counted as findings in the inventory; the release image carries `/opt/htsglang/src-{27b,nf}` and the `SGLANG_WEG2_*` variables the double-reading entrypoint expects.
 4. Prose pass (Variant B): comments and docstrings, mixed language left by `ident_fix`, root notes (`FEATURES_VS_UPSTREAM.md`, `HANDOVER_760.md`, ...), the draft release README `docker/pdflip-release/README_RELEASE_DRAFT.md`.
-5. Default decision (user): `FLLIPER_PDFLIP_ENABLE_W3_SPILL_HOST_LEAVES` and `FLLIPER_PDFLIP_MAMBA_SPILL_LAST_RESORT` are off; the metal evidence is the NF seat's (`FIXES-NACH-FREEZE-1007.md`).
+5. Default decision (user, 09.10.): `FLLIPER_PDFLIP_ENABLE_W3_SPILL_HOST_LEAVES` and `FLLIPER_PDFLIP_MAMBA_SPILL_LAST_RESORT` are on by default since F0-K (section 8.20, M4; they were off in RC1); the metal evidence is the NF seat's (`FIXES-NACH-FREEZE-1007.md`).
 6. Second NF port round for fixes after int23 (not in the NF head: the H88 W4A8 work with its scale fix `dec66fb0b4`, the room-short repro).
 7. No `sglang` -> `flliper` import alias (plan row F0-C).
 8. Dry-runs end at the launcher's first refusal on this box (W61 / W128 / W163, W64 on one profile): what lies behind it is compared on the host in F0-J.
 9. Known red tests, not touched here: `test_rename_collision_free_0928` (209 files carry old and new names, also on the base), 7 `test_webui` cases (404), P1b reference tests with the live profiles, `test_plan_parser`, `flipzeit_dp_user_0930` (a source finding, red on int22 too), Playwright tests (module missing).
 10. Small items of the work packages: `make_flat_ctx.sh` takes `entrypoint.sh` from `/spinning/gpu-arb/docker` (live copy of 03.10.), not the tree master; `profconv.py --convert-live --apply` does not check siblings; the dashboard's `StateDirectory` must stay a relative path; the card-plan screen shows GATE-FEHLT on the desktop screenshot; a stray empty tracked file `0` at the repository root; two vendored files (`_vendor/rife`) name the old module path in a comment.
+
+## 8.20 F0-K, fix round after the RC1 acceptance (09.10.2026, both lines)
+
+Source: `deskq/done/flliper-rename-abnahme-1009.md` (F0-J verdict: RC1 not acceptable). Heads before: 27B `desk/flliper-27b-int-1008` @ ecdd1d6c79, NF `desk/flliper-nf-int-1008` @ f90dedaed9.
+Heads after: `desk/flliper-27b-int-1009`, `desk/flliper-nf-int-1009` (SHAs: `git log` of the two branches).
+
+**One class, three members (B1, M1, M2, plus m1).** The kit renamed a spelling whose other side is R2 must-keep: a C++ namespace (`namespace sglang` of the JIT kernels), the header of a
+file on the persistent L3 store, the seed of a hashed page key. The wave-2 method (AST comparison with the strings blanked out) and the rest inventory (it counts what is LEFT) cannot see
+this class, so the repair is a rule in the kit and a test that looks at exactly these constants.
+
+| Finding | Where (before -> after) | Rule / test |
+|---|---|---|
+| B1 (blocker, NF; the 27B profile does not run these modules) | `python/flliper/kernels/jit/utils.py:24` `wrap_namespace` `"flliper"` -> `"sglang"`; docstring `jit_kernel/utils.py:126` | kit span `jit-wrapper-namespace` (`wrap_namespace = "sglang"`, `namespace sglang { ... }`, `sglang_<x>::`); `test_f0k_jit_wrapper_compile_1009.py`: `nvcc -c` (no device, sm_86 and sm_120 flags as `load_jit` builds them) of the REAL source `load_jit` hands to the compiler for QSA indexer, fast_topk 512, hc_combine, grouped_gemma_rmsnorm and the five diffusion kernels; red on ecdd1d6c79 / f90dedaed9 (11 failed / 7 passed), green after; a wrong-namespace control proves the gate has teeth |
+| m1 | five diffusion wrappers `flliper_<x>::` -> `sglang_<x>::` (`causal_conv3d_cat_pad.py:27`, `ltx2_qknorm_split_rope.py:22`, `norm_scale_shift_native.py:69,73`, `residual_gate_add.py:27`, `timestep_embedding.py:24`) | same span, same test (parity scan: every namespace a wrapper names is declared by a C++ file) |
+| M1 | `mem_cache/storage/file/store_journal.py` `MAGIC` `b"PDFLIP-L3-INDEX v3"` -> `b"WEG2-L3-INDEX v3"` (27B Z. 244, NF Z. 250) | kit span `persisted-id` (`\bWEG2-L3-INDEX\b`); pin in `test_f0k_persisted_consts_1009.py` |
+| M2 | `mem_cache/utils.py:115` `_NAMESPACE_SEED_TAG` `b"flliper-kv-namespace-v1\0"` -> `b"sglang-kv-namespace-v1\0"` | kit span `persisted-id` (`\bsglang-kv-namespace-v\d+`); pin incl. the digest of `namespace_root_hash("tenant-a")` computed with the freeze code |
+
+The generic hold (`test_f0k_persisted_consts_1009.py`, fixture `fixtures/f0k_persisted_consts_1009.json` made by `tools/release/persisted_consts_1009.py` from the freeze tree): every `bytes`
+constant of every Python file (27B: 388 in 107 files of 86ff356d0d; NF: c651892375) is still there byte for byte, except four that are consistent inside their file (the two JSON field names
+`weg2_seq_hash` / `weg2_resumable_depth` of the P/D hand-off, the NVRTC kernel name `weg2_lane_copy` and its program label; listed with the reason in the test; the two fields are the open minor m2);
+every old-family format id (`<name>/<n>`) is unchanged or on the RENAMED table with its reader (`weg2.state/1`, `weg2.event/1`, `weg2.rankstats/1` are read in both spellings by the dashboard's
+`names.schema_ok`; `weg2.rank_vram/1`, `weg2.vram_plan/1` are written and read inside one boot); the nine frozen ids (`weg2-footprint/1`, `weg2-x-curves/1`, `weg2.form_measures/2|3`,
+`weg2-pp-calib/1`, `weg2-lane-coverage-1`, `sglang.expert_stats/1`, `sglang.forward_peak/1`, `htsglang-rig-artifact/v1`) are still in the tree. The L3 store identity is pinned by value, computed with the
+freeze code: `l3_persist_dir_name` of a synthetic identity (`l3-27b-nvfp4-synthetic-27b-8f9c80316e`), `L3_PERSIST_GENERATION` `706`, `L3_ROPE_APPLY` `merge-v1`, `compute_model_identity_hash` (`421234b6ef4b57d3`,
+`a993cb59e3131585` with `--rank-tp-ratio`). `dc6a8c2062` itself is not recomputable on this box (the model files are invisible); the functions that make it are pinned instead.
+
+**M3, the six dashboard commits after the freeze** (`desk/dashboard-i18n-1008` = the running `/opt/rigdash/current` -> `releases/9d3f7bed11`). Ported one by one with the F0-H procedure
+(`rename_to_flliper.py apply --weg2 --ident-map merged_0928`, `ident_fix.py` with `IDENT_FIX_WEB=1` and the refined collision rule, translation memory only, on the parent and on the fix version,
+3-way `git merge-file` into the tree; no hand renaming). Two kit points found on the way: `static/i18n_de.json` mixes `sglang` and `flliper` (collision exemption for the file, as for the other dashboard
+files) and its German values must not go through `ident_fix` (`Katalog` -> `Catalog` would silently show English in the German view): `NO_IDENT_FIX` in `ident_fix.py`. Conflicts: three hunks in
+`static/index.html` (sessions block, TTFT help text and `ttftOf()`), all of the kind "the tree side is the old text this commit replaces"; the fix side was taken. Old -> new SHA per line: see the
+port table in the seat report. Deploy: a commit of the old name is never an ancestor of a renamed tree, so `install.sh --check` now also counts a commit as contained when the revision itself lists it
+in `tools/rig_dashboard/rigdash/deploy/CARRIED_FROM` (`d983311745` deploy line, `9d3f7bed11` running release; read with `git show <rev>:...`, never from the work tree); proof:
+`install.sh --check <head>` -> `deploy-linie ok` on both heads (before: REFUSED on both), `test_f0k_dashboard_deploy_check_1009.py` (7 cases, real script, throw-away repository).
+
+**M4, DEFAULTS-ON (NF line; user decision 09.10.).** `desk/nf-defaults-on-1008` @ dd65a419fb ported (`FLLIPER_PDFLIP_ENABLE_W3_SPILL_HOST_LEAVES` and `FLLIPER_PDFLIP_MAMBA_SPILL_LAST_RESORT`: `EnvBool(True)`,
+`0` = the old path; docstrings and the three tests). The edge catalog follows: K132's sentence said "both default off" and its evidence anchor moved with the docstring (catalog build: K132 `veraltet`);
+`catalog.json` rebuilt by rule from both final code commits (27B `9a213225d8`, NF `97f3fda8a1`), identical bytes on both lines. The 27B tree has neither switch (documentation only: README, release notes,
+this section). Row 23 of `FIXES-NACH-FREEZE-1007.md`.
+
+**M5.** README and release notes name the status: RC1 = without the vision rebuild; RC2 after the port of `desk/post-vision-weights-1009` @ 9f7e57363f and AP4; the sentence "Vision in Dual: Umbau folgt als RC2
+(Nutzerentscheid 09.10.: 0.1.0-Bedingung)". Numbers only from reports. The F0-E sentence "R1 by AST comparison: 0 structure differences" stays a true number but is not the R1 proof for strings (m8): this section is.
+
+**M6.** No copy of the chain / acceptance scripts is tracked in either tree (`git ls-files | grep -i kette` is empty; no `.sh` greps `GROUP-ENV`), so there is nothing to change in the trees. The live copy
+`/spinning/gpu-arb/deskq/bl/kette_int8_abnahme1005.sh` is covered by the patch `deskq/done/f0b-gpu-arb-1007-v3-kette.patch` (insertions only on top of v2: nine added lines; forbidden release-form keys are
+counted in both spellings, the expected `EXTRA_CENV` list is found in either spelling, the allowances name both spellings) with the selftest `deskq/done/f0b-gpu-arb-selftest-1007-v3.py` (20 cases, each defect case
+red on v2 and green on v3). **Not applied**: v3 goes in after v2, with the boot and the watcher stopped (hand-over list step 1).
+
+**Open after F0-K:** m2 (API field `weg2_seq_hash` has no alias for external clients), m3 (kit inventory numbers in 8.19 are the pre-F0-K ones), m4, m5, m6, m7, m8, m9, m10 of the acceptance report are not part of this round.
