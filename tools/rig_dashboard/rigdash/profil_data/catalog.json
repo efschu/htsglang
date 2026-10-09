@@ -6237,7 +6237,7 @@
    "depends": [],
    "gain": "",
    "group": "",
-   "help": "Window length of the ONLINE card-equivalent estimator (#274 slice D): share_c = rate_c(shared window) / rate_c(solo floor), E = SUM_c share_c, published as flliper:lane_share / flliper:lane_share_e and under internal_states[...][\"lane_share\"]. The window has to sit above the A-vs-A noise floor of the underlying rates (0.25-0.39 %%), which is what ~1 s buys; shorter windows measure noise, longer ones smear load changes. DEFAULT 0 = OFF: the estimator costs work in the scheduler thread, directly in front of the serving group's batch launch, and its PREFILL-arm reading is known to be quantization-limited (one counter tick per finished lane prefill), so it is an opt-in instrument rather than always-on telemetry. It is NOT off because of the slice-D1 crash: that was a concurrent-lane buffer aliasing defect in share_input_buffer, which the estimator only made likely by shifting the timing -- found and fixed in slice D2 (DESIGN_121 §13). 1.0 is the value it was validated at (DESIGN_121 §12.1). Only allocated when --dual-group-lane is set.",
+   "help": "Window length of the ONLINE card-equivalent estimator (#274 slice D): share_c = rate_c(shared window) / rate_c(solo floor), E = SUM_c share_c, published as sglang:lane_share / sglang:lane_share_e and under internal_states[...][\"lane_share\"]. The window has to sit above the A-vs-A noise floor of the underlying rates (0.25-0.39 %%), which is what ~1 s buys; shorter windows measure noise, longer ones smear load changes. DEFAULT 0 = OFF: the estimator costs work in the scheduler thread, directly in front of the serving group's batch launch, and its PREFILL-arm reading is known to be quantization-limited (one counter tick per finished lane prefill), so it is an opt-in instrument rather than always-on telemetry. It is NOT off because of the slice-D1 crash: that was a concurrent-lane buffer aliasing defect in share_input_buffer, which the estimator only made likely by shifting the timing -- found and fixed in slice D2 (DESIGN_121 §13). 1.0 is the value it was validated at (DESIGN_121 §12.1). Only allocated when --dual-group-lane is set.",
    "id": "--dual-group-lane-share-window-s",
    "kind": "flag",
    "level": "expert",
@@ -6512,7 +6512,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22096
+      "line": 22099
      }
     }
    },
@@ -7081,7 +7081,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22100
+      "line": 22103
      }
     }
    },
@@ -11291,7 +11291,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22152
+      "line": 22155
      }
     }
    },
@@ -17616,7 +17616,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22412
+      "line": 22415
      }
     }
    }
@@ -18147,7 +18147,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 23578
+      "line": 23581
      }
     }
    },
@@ -18851,7 +18851,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22857
+      "line": 22860
      }
     }
    },
@@ -27082,7 +27082,7 @@
     "tree": "nf",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23395
+    "line": 23398
    },
    "status": "curated",
    "text": "Names the census row from which a card is priced that is not in the census file by UUID: list <live>=<census UUID>, <live> = card UUID, nvml<N> or class (RTX3080). Without an entry the start borrows the heaviest row of the same class (otherwise of the whole census) and refuses that as HW-BORROWED until force is set.",
@@ -28220,7 +28220,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22295
+      "line": 22298
      }
     }
    },
@@ -29577,7 +29577,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2463
+      "line": 2522
      }
     }
    },
@@ -29632,7 +29632,7 @@
     "tree": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2453
+    "line": 2512
    },
    "status": "harvested",
    "text": "",
@@ -29655,7 +29655,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2499
+      "line": 2558
      }
     }
    },
@@ -39184,7 +39184,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2474
+      "line": 2533
      }
     }
    },
@@ -39353,7 +39353,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2478
+      "line": 2537
      }
     }
    },
@@ -53555,7 +53555,7 @@
     "tree": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1642
+    "line": 1701
    },
    "status": "harvested",
    "text": "",
@@ -65103,7 +65103,7 @@
     "tree": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1581
+    "line": 1640
    },
    "status": "explained",
    "text": "Protection against a mutual blockade when waking D to P: two groups wait in a circle for memory room. On: the waiting part counts its own waiting from the start of the wait; the resolution (swapping the rest out to host RAM) begins after about 0.1 s instead of about 0.6 s. Off: only after the wait flag has gone up after 0.5 s. Default off (preparation/experiment, \"Default off until metal A/B\"). According to the code necessary before FLLIPER_OPT_PDFLIP_DRAFT_PARK_SKIP_UNCHANGED (is off) goes on again. Related: FLLIPER_PDFLIP_BAR1_SPILL_GRACE_S (0.1 s). Acts only for the sending side. Not verified individually on the metal. No user value recognizable.",
@@ -65283,7 +65283,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 889
+      "line": 906
      }
     }
    },
@@ -65426,7 +65426,7 @@
      "source": {
       "file": "pdflip/front.py",
       "kind": "os.environ",
-      "line": 4086
+      "line": 4090
      }
     }
    },
@@ -65475,7 +65475,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 881
+      "line": 898
      }
     }
    },
@@ -65617,7 +65617,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 884
+      "line": 901
      }
     }
    },
@@ -65728,7 +65728,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 1890
+      "line": 1949
      }
     }
    },
@@ -66067,7 +66067,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 919
+      "line": 936
      }
     }
    },
@@ -69789,7 +69789,7 @@
     "tree": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 976
+    "line": 993
    },
    "status": "explained",
    "text": "Threshold in milliseconds for FLLIPER_PDFLIP_ENABLE_D_DIRECT_YIELD_FETCH: how much estimated reload wait time must at least be incurred for the short request to yield to P. The estimate is fixed at 624 ms (one wave) or 1248 ms (two waves, from 190 uncached tokens). Value up to 624: every request from 8 tokens yields; 625 to 1248: only those from 190 tokens; above 1248: never. Default 600. Without effect without FLLIPER_PDFLIP_ENABLE_D_DIRECT_YIELD_FETCH=1 and without FLLIPER_PDFLIP_ENABLE_D_DIRECT_YIELD. Note: the comment in environ.py (\"raising it past 1248 exposes only the two-wave SHORTs\") contradicts the logic in the code (if the estimate lies below the threshold, the request stays on D); this explanation follows the logic. Setting number for an experiment. Unverified: whether and how the user should change it.",
@@ -70820,7 +70820,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 3599
+      "line": 3658
      }
     }
    },
@@ -71101,7 +71101,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 1994
+      "line": 2053
      }
     }
    },
@@ -71179,7 +71179,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4271
+      "line": 4330
      }
     }
    },
@@ -71210,6 +71210,35 @@
    },
    "status": "explained",
    "text": "Arrival rule: if a new request arrives while D is working, and a seat is free there and enough free KV memory (memory for the conversation history), it is prefilled immediately, short ones on D itself, long ones by an immediate switch to P, without a collection window. Without a free seat it waits in arrival order; the oldest waiting one may park the youngest running one. Off: the front works as before this rule (with a collection window). Default on in the NF tree (form switch of the NF line, since 03.10.; NF metal since 29.09.: DP-WAIT p90 3 to 6.5 s against 16 to 60 s on 27B); off in the 27B tree (according to the code comment the 27B line runs without it). With the rule on, FLLIPER_PDFLIP_ENABLE_PARK_COLLECT_WINDOW and FLLIPER_PDFLIP_ENABLE_PARK_WINDOW_GATE are without effect; FLLIPER_PDFLIP_ENABLE_ARRIVAL_SEAT_AGE_PLAN (default on) needs it. The NF profile sets it to 1. Not verified individually on the metal. Unverified: whether the user should change it (0 = the front before the rule); whether the 27B profiles set it to off (only the code comment says so).",
+   "type": "EnvBool"
+  },
+  "FLLIPER_PDFLIP_ENABLE_CAPPARK_FLIP_HOLD": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "True",
+   "depends": [],
+   "gain": "The D->P flip does not wait for D to finish capacity-parked requests.",
+   "group": "Other",
+   "help": "CAPPARK-FLIP-HOLD (08.10., NF dauer10081045 D->P flip epoch 4->5): while a flip park is open (park_running until the sleep / the awake re-queue) the #248h capacity re-queue does not run -- the capacity-parked requests ride the flip and the wake's hold read takes them up. On metal the re-queue ran three just-parked requests to their end while the front's D->P quiesce waited 28180 ms for D. Off = the re-queue inside the park.",
+   "id": "FLLIPER_PDFLIP_ENABLE_CAPPARK_FLIP_HOLD",
+   "kind": "env",
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_ENABLE_CAPPARK_FLIP_HOLD",
+   "nargs": null,
+   "planner_derived": false,
+   "satz_quelle": "NF line, post-freeze fix round 2: sentence taken from the comment of the switch in environ.py (nothing added); the five switches are NF-only (not in the 27B environ.py) (environ.py, CAPPARK-FLIP-HOLD comment)",
+   "source": {
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 736,
+    "tree": "nf"
+   },
+   "status": "explained",
+   "text": "While a flip park is open (from park_running until the sleep or the awake re-queue) the #248h capacity re-queue does not run: the capacity-parked requests ride the flip and the wake takes them up. Off: the re-queue runs inside the park (on metal it ran three just-parked requests to their end while the front waited 28180 ms for D). Default on.",
+   "trees": [
+    "nf"
+   ],
    "type": "EnvBool"
   },
   "FLLIPER_PDFLIP_ENABLE_CLIENT_GONE_ABORT": {
@@ -71258,7 +71287,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2492
+      "line": 2551
      }
     }
    },
@@ -71458,7 +71487,7 @@
     "tree": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 966
+    "line": 983
    },
    "status": "harvested",
    "text": "",
@@ -71487,7 +71516,7 @@
     "tree": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 972
+    "line": 989
    },
    "status": "explained",
    "text": "A short request that would be prefilled directly on D, but there mainly waits for the reloading of expert weights from RAM (about 0.6 s per pass), is computed together with P instead, even if no flip is foreseeable at the moment. Off: it stays on D. Default off (experimental switch). Needs FLLIPER_PDFLIP_ENABLE_D_DIRECT_YIELD (default on); acts only if no P request is waiting in the queue and the request has at least 8 uncached tokens. Threshold: FLLIPER_PDFLIP_D_DIRECT_YIELD_FETCH_MS. On the metal: fires (yield=d_direct_fetch 59/132/60 lines), effect on latency/throughput according to the report \"not evidenced\". Unverified: whether it brings the user anything.",
@@ -71572,7 +71601,7 @@
     "tree": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2014
+    "line": 2073
    },
    "status": "harvested",
    "text": "",
@@ -71723,6 +71752,34 @@
    "text": "",
    "type": "EnvBool"
   },
+  "FLLIPER_PDFLIP_ENABLE_FORM_A_ADMIT_ROOM_FIRST": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "True",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "ENABLE_FORM_A_ADMIT_ROOM_FIRST (H98e, the cause behind H98d, NF xc D 21:37:29Z 07.10., pdflip-130-2093 -> pdflip-130-2092): a Form A load-back whose group ADMIT is already taken (worker off the token cut, every rank on it) decides its room from the LIVE pool with a shortfall-only eviction on its FIRST attempt (H105c's follow-room). Off = the first attempt goes through the pass-published floor, whose refusal runs the xsn285 full drain (every evictable leaf, the voted-but-not-admitted prefixes of the same pass included) before H105c retries from the live pool. The host-first path (H105b/H106) is not touched.",
+   "id": "FLLIPER_PDFLIP_ENABLE_FORM_A_ADMIT_ROOM_FIRST",
+   "kind": "env",
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_ENABLE_FORM_A_ADMIT_ROOM_FIRST",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 773,
+    "tree": "nf"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "EnvBool"
+  },
   "FLLIPER_PDFLIP_ENABLE_FORM_A_TP0_FOLLOW": {
    "trees": [
     "27b",
@@ -71774,7 +71831,7 @@
     "tree": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1918
+    "line": 1977
    },
    "status": "harvested",
    "text": "",
@@ -71797,7 +71854,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2483
+      "line": 2542
      }
     }
    },
@@ -71909,7 +71966,7 @@
     "tree": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 988
+    "line": 1005
    },
    "status": "harvested",
    "text": "",
@@ -72019,7 +72076,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4251
+      "line": 4310
      }
     }
    },
@@ -72253,6 +72310,35 @@
    "text": "",
    "type": "EnvBool"
   },
+  "FLLIPER_PDFLIP_ENABLE_PP_ROOM_ARENA_FREE_ROOM": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "True",
+   "depends": [],
+   "gain": "The room vote no longer promises backup room the arena cannot give.",
+   "group": "Other",
+   "help": "PR-ARENA (NF int22, P PP1 18:34:20Z, boot 1008_171755 @ 6b3bd1a6df): the PP room vote's walk (pdflip/pp_room_vote.estimate_payable) priced a peel's write_back backup at the KV host pool's available_size() -- on an arena pool (slots - claimed) * P, complete slots counted free -- while every claim was refused (no free slot): PP1's fact paid 195968 tokens the peel could not (on_frontier=8192 behind_device_child=187776), PP0 launched 16321 rows, PP1 'Prefill out of memory'. On: an arena-bound pool's backup room is its FREE slots (slots - complete - claimed) times the slot's tokens. Off = the available_size() reading, byte for byte.",
+   "id": "FLLIPER_PDFLIP_ENABLE_PP_ROOM_ARENA_FREE_ROOM",
+   "kind": "env",
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_ENABLE_PP_ROOM_ARENA_FREE_ROOM",
+   "nargs": null,
+   "planner_derived": false,
+   "satz_quelle": "NF line, post-freeze fix round 2: sentence taken from the comment of the switch in environ.py (nothing added); the five switches are NF-only (not in the 27B environ.py) (environ.py, PR-ARENA comment)",
+   "source": {
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 1066,
+    "tree": "nf"
+   },
+   "status": "explained",
+   "text": "The prefill stages' room vote priced a peel's backup at the host pool's available_size(), which on an arena pool counts complete slots as free while every claim was refused (one stage paid 195968 tokens the peel could not and ended in 'Prefill out of memory'). On: an arena-bound pool's backup room is its FREE slots times the slot's tokens. Off: the available_size() reading. Default on.",
+   "trees": [
+    "nf"
+   ],
+   "type": "EnvBool"
+  },
   "FLLIPER_PDFLIP_ENABLE_PREFILL_FETCH_OVERLAP": {
    "trees": [
     "27b",
@@ -72477,7 +72563,7 @@
     "tree": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 981
+    "line": 998
    },
    "status": "harvested",
    "text": "",
@@ -72708,7 +72794,7 @@
     "tree": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1929
+    "line": 1988
    },
    "status": "harvested",
    "text": "",
@@ -72736,10 +72822,91 @@
     "tree": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1924
+    "line": 1983
    },
    "status": "harvested",
    "text": "",
+   "type": "EnvBool"
+  },
+  "FLLIPER_PDFLIP_ENABLE_W3_SPILL_ANCHOR_POOL": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "False",
+   "depends": [],
+   "gain": "The W3 arena spill works on hybrid boots (it can then free arena room for a claim).",
+   "group": "Other",
+   "help": "W3-ANCHOR-POOL (NF int20 1008_135412, P PP0 13:58-14:01): the W3-ARENA spill (UnifiedRadixCache._w3_arena_spill) stopped at its first gate on every hybrid boot -- the KV host pool is a HostPoolGroup whose __getattr__ forwards the claim calls but not secure_rows_to_l3, so hasattr() said False and it returned 0 before its log line ('W3-ARENA' 0x in 15 NF P logs; PUBLISH-SWEEP issued=0 refused=5130, every L3->L2 fill ended at the full arena: ARENA-GET MISS, prefetch completed=0 of hit_pages=1318). On: the spill uses the group's anchor (arena) host pool, the one alloc_write already forwards to -- the 27B dual line's Q-697c (a), without its dual gate. Off = the old silent stop, byte for byte.",
+   "id": "FLLIPER_PDFLIP_ENABLE_W3_SPILL_ANCHOR_POOL",
+   "kind": "env",
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_ENABLE_W3_SPILL_ANCHOR_POOL",
+   "nargs": null,
+   "planner_derived": false,
+   "satz_quelle": "NF line, post-freeze fix round 2: sentence taken from the comment of the switch in environ.py (nothing added); the five switches are NF-only (not in the 27B environ.py) (environ.py, W3-ANCHOR-POOL comment)",
+   "source": {
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 1100,
+    "tree": "nf"
+   },
+   "status": "explained",
+   "text": "On hybrid boots the W3 arena spill stopped at its first gate because the KV host pool is a group whose forwarding does not include secure_rows_to_l3. On: the spill uses the group's anchor (arena) host pool, the one alloc_write already forwards to. Off: the old silent stop. Default off.",
+   "trees": [
+    "nf"
+   ],
+   "type": "EnvBool"
+  },
+  "FLLIPER_PDFLIP_ENABLE_W3_SPILL_HOST_LEAVES": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "False",
+   "depends": [
+    {
+     "belegt": true,
+     "calc": "text",
+     "edge": "K132",
+     "effect": "The host-leaf spill works through the arena pool of the W3 spill; on hybrid boots that pool is the anchor pool of FLLIPER_PDFLIP_ENABLE_W3_SPILL_ANCHOR_POOL (both default off) -- what it brings is freeing arena room from host-only leaves; what it costs is two linked switches.",
+     "evidence": {
+      "anchor": "``FLLIPER_PDFLIP_ENABLE_W3_SPILL_ANCHOR_POOL`` that carries the pool) AND the local-PP",
+      "aufloesung": "other_line",
+      "file": "python/flliper/srt/pdflip/host_only_spill.py",
+      "row_note": 32,
+      "zeile": 32
+     },
+     "quelle": "catalog",
+     "rel": "requires",
+     "satz": "The host-leaf spill works through the arena pool of the W3 spill; on hybrid boots that pool is the anchor pool of FLLIPER_PDFLIP_ENABLE_W3_SPILL_ANCHOR_POOL (both default off) -- what it brings is freeing arena room from host-only leaves; what it costs is two linked switches.",
+     "to": "FLLIPER_PDFLIP_ENABLE_W3_SPILL_ANCHOR_POOL",
+     "to_kind": "env",
+     "trees": [
+      "nf"
+     ],
+     "value": null
+    }
+   ],
+   "gain": "A full KV arena can free room from host-only leaves.",
+   "group": "Other",
+   "help": "W3-HOST-LEAF (NF int22, P 18:33:37-18:34:20Z, boot 1008_171755): the W3 spill found candidates=0 on all three stages -- it releases only host copies of device-resident nodes; the full KV arena freed nothing for a claim (ARENA-DROP freed=0). On (local-PP floor only, as UD-H): the 27B line's Q-697c host-only spill, ported (pdflip/host_only_spill.py): host-only H-leaves get their L3 copy for every page first (secure_rows_to_l3, #257), then leave the tree; aux host-only (anchor) / in-flight leaves stay. Needs the spill's arena pool (on hybrid boots FLLIPER_PDFLIP_ENABLE_W3_SPILL_ANCHOR_POOL). Off = the old spill.",
+   "id": "FLLIPER_PDFLIP_ENABLE_W3_SPILL_HOST_LEAVES",
+   "kind": "env",
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_ENABLE_W3_SPILL_HOST_LEAVES",
+   "nargs": null,
+   "planner_derived": false,
+   "satz_quelle": "NF line, post-freeze fix round 2: sentence taken from the comment of the switch in environ.py (nothing added); the five switches are NF-only (not in the 27B environ.py) (environ.py, W3-HOST-LEAF comment)",
+   "source": {
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 1088,
+    "tree": "nf"
+   },
+   "status": "explained",
+   "text": "The W3 spill found no candidates because it released only host copies of device-resident nodes. On (local-PP floor only): host-only leaves first get their L3 copy for every page, then leave the tree; leaves with a host-only anchor state or in flight stay. Needs the spill's arena pool (on hybrid boots FLLIPER_PDFLIP_ENABLE_W3_SPILL_ANCHOR_POOL). Off: the old spill. Default off.",
+   "trees": [
+    "nf"
+   ],
    "type": "EnvBool"
   },
   "FLLIPER_PDFLIP_ENABLE_WAKE_KV_FUSED": {
@@ -73235,7 +73402,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 1160
+      "line": 1219
      }
     }
    },
@@ -73289,7 +73456,7 @@
     "tree": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1163
+    "line": 1222
    },
    "status": "harvested",
    "text": "",
@@ -73439,7 +73606,7 @@
     "tree": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 994
+    "line": 1011
    },
    "status": "harvested",
    "text": "",
@@ -73681,7 +73848,7 @@
     "tree": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1039
+    "line": 1056
    },
    "status": "explained",
    "text": "Before sleep the system tidies up the intermediate store (\"publish round\", about 1.2 s per poll). On: a round that could not move anything is not made again at the next poll as long as nothing has changed (saves the about 1.2 s). Off: every poll makes the round anew. Default off (optional accelerator, \"until metal\"). Effective only if the hierarchical cache is on, FLLIPER_HICACHE_FLUSH_PUBLISH_SWEEP is not 0 (default 1), nothing is running and no chunk is open. On the metal it fires (MEMO-SKIP 106/97 lines); that the 1177 ms stall disappears as a result is not shown. Unverified: whether the user should switch it on.",
@@ -75129,7 +75296,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4371
+      "line": 4430
      }
     }
    },
@@ -76524,7 +76691,7 @@
      "source": {
       "file": "pdflip/front.py",
       "kind": "os.environ",
-      "line": 1182
+      "line": 1186
      }
     }
    },
@@ -76953,6 +77120,35 @@
    "text": "",
    "type": "EnvBool"
   },
+  "FLLIPER_PDFLIP_MAMBA_SPILL_LAST_RESORT": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "False",
+   "depends": [],
+   "gain": "A full anchor arena can make room without losing an anchor (the next reader takes it from the store).",
+   "group": "Other",
+   "help": "MAMBA-LAST-RESORT (NF int22, D TP0 boot 1008_171755 17:51:57): the D mamba anchor arena (32 slots, 6 staging) held only END and deepest anchors, so the flush / park-first spill found victim=none (`#1427 ARENA-DROP ... slot_bytes=58834944 freed=0` x59, `PDFLIP-ANCHOR-LOST at=flush n=15` incl. the END anchor 112896 of the parked pdflip-24-128). On: with no victim by the old rules, the shallowest settled END/deepest anchor OFF the claimer's park chain is secured to L3 first (arena_secure_to_disk) and then released -- never one whose copy could not be secured. Off = the old answer, byte for byte.",
+   "id": "FLLIPER_PDFLIP_MAMBA_SPILL_LAST_RESORT",
+   "kind": "env",
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_MAMBA_SPILL_LAST_RESORT",
+   "nargs": null,
+   "planner_derived": false,
+   "satz_quelle": "NF line, post-freeze fix round 2: sentence taken from the comment of the switch in environ.py (nothing added); the five switches are NF-only (not in the 27B environ.py) (environ.py, MAMBA-LAST-RESORT comment)",
+   "source": {
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 1110,
+    "tree": "nf"
+   },
+   "status": "explained",
+   "text": "The D mamba anchor arena held only END and deepest anchors, so the flush spill found no victim. On: with no victim by the old rules, the shallowest settled END/deepest anchor off the claimer's park chain is secured to L3 first and then released, never one whose copy could not be secured. Off: the old answer. Default off.",
+   "trees": [
+    "nf"
+   ],
+   "type": "EnvBool"
+  },
   "FLLIPER_PDFLIP_MAMBA_STATE_KEYS": {
    "trees": [
     "27b",
@@ -77215,7 +77411,7 @@
    "depends": [],
    "gain": "",
    "group": "",
-   "help": "TSDB (user 01.10. ~07:40Z, docs/TSDB-DELTA-27B-1001.md 1c): the front's optional Influx-line push of one `pdflip_req` point per finished request to VictoriaMetrics (e.g. http://192.168.0.88:8428/write), bundled ~2 s in the front's IPC writer thread. Unset = no push (default). The model tag of every point (e.g. NF / 27B).",
+   "help": "TSDB (user 01.10. ~07:40Z, docs/TSDB-DELTA-27B-1001.md 1c): the front's optional Influx-line push of one `weg2_req` point per finished request to VictoriaMetrics (e.g. http://192.168.0.88:8428/write), bundled ~2 s in the front's IPC writer thread. Unset = no push (default). The model tag of every point (e.g. NF / 27B).",
    "id": "FLLIPER_PDFLIP_METRICS_PUSH_URL",
    "kind": "env",
    "level": "expert",
@@ -77249,7 +77445,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4180
+      "line": 4239
      }
     }
    },
@@ -77810,7 +78006,7 @@
     "tree": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2359
+    "line": 2418
    },
    "status": "explained",
    "text": "If a paused (parked) request is to continue later and the room for Mamba anchors in host RAM is full, its re-entry point gets priority: other intermediate states without a park reference are swapped to disk first, so that the entry point of the parked request is not lost. Off: the old way; parked requests can lose their entry point and recompute. Without a park nothing changes. Acts only on nodes that are marked as parked. Default on. Unverified: dependency on another switch; whether the user should change it (only the decision \"stays on\" of 05.10. ~17:47Z is verified); benefit on the metal (according to the report \"active, effect not shown\").",
@@ -77959,7 +78155,7 @@
     "tree": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1836
+    "line": 1895
    },
    "status": "harvested",
    "text": "",
@@ -78016,7 +78212,7 @@
     "tree": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1859
+    "line": 1918
    },
    "status": "harvested",
    "text": "",
@@ -78503,7 +78699,7 @@
     "tree": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 763
+    "line": 780
    },
    "status": "explained",
    "text": "Pure observation log: after every park D writes additional log lines about the memory row bookkeeping; on a memory leak alarm the orphaned row numbers are appended. Changes no behavior. Default off. Pure diagnostics. Unverified: dependency on another switch.",
@@ -79851,7 +80047,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 870
+      "line": 887
      }
     }
    },
@@ -80978,7 +81174,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 1619
+      "line": 1678
      }
     }
    },
@@ -81743,7 +81939,7 @@
      "source": {
       "file": "managers/scheduler.py",
       "kind": "os.environ",
-      "line": 918
+      "line": 920
      }
     }
    },
@@ -83157,7 +83353,7 @@
      "source": {
       "file": "pdflip/front.py",
       "kind": "os.environ",
-      "line": 4201
+      "line": 4205
      }
     }
    },
@@ -84447,7 +84643,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4358
+      "line": 4417
      }
     }
    },
@@ -85178,7 +85374,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4564,
+    "line": 4623,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -85206,7 +85402,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4563,
+    "line": 4622,
     "tree": "nf"
    },
    "status": "harvested",
@@ -85234,7 +85430,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 1911,
+    "line": 1970,
     "tree": "nf"
    },
    "status": "harvested",
@@ -85262,7 +85458,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 2134,
+    "line": 2193,
     "tree": "nf"
    },
    "status": "harvested",
@@ -85322,7 +85518,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 2143,
+    "line": 2202,
     "tree": "nf"
    },
    "status": "harvested",
@@ -85350,7 +85546,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 2148,
+    "line": 2207,
     "tree": "nf"
    },
    "status": "harvested",
@@ -85378,7 +85574,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 756,
+    "line": 763,
     "tree": "nf"
    },
    "status": "harvested",
@@ -85406,7 +85602,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 1051,
+    "line": 1078,
     "tree": "nf"
    },
    "status": "harvested",
@@ -85434,7 +85630,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 934,
+    "line": 951,
     "tree": "nf"
    },
    "status": "harvested",
@@ -85457,7 +85653,8 @@
    "problem": [],
    "status": {
     "eindeutig": 119,
-    "nah": 12
+    "nah": 12,
+    "other_line": 1
    }
   },
   "beleg_aufloesung_baeume": {
@@ -85465,14 +85662,15 @@
     "problem": [],
     "status": {
      "eindeutig": 119,
-     "nah": 12
+     "nah": 12,
+     "other_line": 1
     }
    },
    "nf": {
     "problem": [],
     "status": {
      "other_line": 44,
-     "eindeutig": 77,
+     "eindeutig": 78,
      "nah": 10
     }
    }
@@ -85480,10 +85678,10 @@
   "file": "kantenkatalog_1004.json",
   "geladen": true,
   "reason": "",
-  "kanten_belegt": 131,
-  "edges_total": 131,
+  "kanten_belegt": 132,
+  "edges_total": 132,
   "edges_without_evidence": 25,
-  "neu": 80,
+  "neu": 81,
   "rel_abweichend": [
    "K12",
    "K19",
@@ -85512,25 +85710,25 @@
    "abweichung": 44,
    "beide": 2462,
    "nur_27b": 180,
-   "nur_nf": 38
+   "nur_nf": 44
   },
-  "entries": 2698,
-  "envs": 1821,
-  "explained": 304,
+  "entries": 2704,
+  "envs": 1827,
+  "explained": 309,
   "flags": 862,
-  "harvested": 1673,
+  "harvested": 1674,
   "curated": 119,
   "unexplained": 602
  },
- "tree_rev": "27b=244ec64415+nf=ffea1c00ff",
+ "tree_rev": "27b=302bccbe62+nf=25fa77bff7",
  "trees": {
   "27b": {
    "entries": 2642,
-   "rev": "244ec64415"
+   "rev": "302bccbe62"
   },
   "nf": {
-   "entries": 2500,
-   "rev": "ffea1c00ff"
+   "entries": 2506,
+   "rev": "25fa77bff7"
   }
  },
  "warnungen": []

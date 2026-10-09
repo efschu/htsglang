@@ -225,12 +225,13 @@ class Catalog(unittest.TestCase):
         cat = json.load(open(os.path.join(os.path.dirname(HERE), "profil_data", "catalog.json"), encoding="utf-8"))
         k = cat["kanten"]
         self.assertTrue(k["geladen"])
+        # F0-I 09.10.: the shipped catalog is the union of both lines and carries K132 (FLLIPER_PDFLIP_ENABLE_W3_SPILL_HOST_LEAVES requires ..._W3_SPILL_ANCHOR_POOL, trees nf): 132 edges, new 80 -> 81, on both lines (the 27B tree's own kantenkatalog_1004.json stays at 131 edges, its tests pin the file).
         # Katalog-Neubau 07.10.: 131 Kanten (K117-K131 neu: Waechter-Envs, D-COMPACT, AUX-SPILL, --x-mode/--x-curves; neu 65 -> 80). AP-G 06.10.: 108 Kanten (K62-K108 neu: Form A / ungleiches DCP / Draft / D-only / Dual, alle belegt; neu 10 -> 57, ohne Beleg weiter 24). Davor 61 Kanten seit 05.10.: K60 (Graph-Kalibriertabelle <-> Layer-Schnitt) und K61 (Tabelle wirkt nur bei Politik auto) sind NEU dazugekommen
         # (neu 8 -> 10, alle 61 belegt); die 24 "ohne Beleg" sind kuratierte Kantenwünsche, unverändert
         # "ohne Beleg" = kuratierte Kanten ohne Katalogkante: 24 im Kern der 27B-Linie; der NF-eigene kuratierte Eintrag --pdflip-xchg-census-map (nur NF-Baum) traegt
         # eine weitere (braucht --pdflip-xchg-census), ist der Katalog aus dem NF-Kern gebaut (Neubau NF-Linie 07.10.), sind es 25
         nf_census_map = cat["entries"].get("--pdflip-xchg-census-map", {}).get("status") == "curated"
-        self.assertEqual((k["edges_total"], k["verschmolzen"], k["neu"], k["edges_without_evidence"]), (131, 51, 80, 25 if nf_census_map else 24))
+        self.assertEqual((k["edges_total"], k["verschmolzen"], k["neu"], k["edges_without_evidence"]), (132, 51, 81, 25 if nf_census_map else 24))
         deps = [d for e in cat["entries"].values() for d in e["depends"]]
         self.assertTrue(all("belegt" in d and "to_kind" in d for d in deps))
         self.assertTrue(any(d["to_kind"] == "refusal" for d in deps))

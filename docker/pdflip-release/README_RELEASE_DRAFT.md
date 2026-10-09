@@ -1,3 +1,9 @@
+> **F0-I (09.10.2026): the front page is now `README.md`; the facts about the release are in `docs/dev/RELEASE_NOTES_FLLIPER_0.1.0.md`.**
+> This draft stays as the long manual (sections 1 to 8). It was written before the rename and still spells some names the old way
+> (image and container names `htsglang`, the readiness route `/weg2/state`, the `-v ... htsglang ...` volume names); the names that apply are:
+> image `ghcr.io/efschu/flliper:0.1.0-cu130`, route `/pdflip/state` (the old route answers too), container product environment `HTSGLANG_*`
+> unchanged. The prose pass over this document is an open point (RENAME_PLAN 8.19).
+
 # DRAFT — README for the htsglang pdflip release (upgrade of `cu130-nccl2307`)
 
 > **NOT PUBLISHED. NOT THE README YET.** Internal draft by the 27B seat (Agent R), 2026-09-24, based on the #135

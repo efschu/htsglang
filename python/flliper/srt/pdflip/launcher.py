@@ -14421,9 +14421,7 @@ def apply_profile_d_kv_token_cut_default(ns, argv_words: Sequence[str]) -> Optio
 OWNED_MISS_RECORD_ENV = "FLLIPER_PDFLIP_OWNED_MISS_RECORD"
 
 
-def owned_miss_record_root() -> str:
-    """The records root the D ranks WRITE to. What the pre-rename tree wrote lies next to it under the old subsystem name
-    and is READ as well (``pool_miss_cost.record_dirs_for``, F0-F); nothing is moved."""
+def owned_miss_record_root() -> str:  # the root the D ranks WRITE to; the pre-rename sibling is READ too (pool_miss_cost.record_dirs_for, F0-F)
     return os.path.join(EVIDENCE_DIR, "records", "pdflip")
 
 
@@ -14492,8 +14490,7 @@ def d_owned_miss_ms(ns, *, env_d: Mapping[str, str], host: int
     from flliper.srt.layers.moe import pool_miss_cost as _miss_cost
 
     root = str(env_d.get("FLLIPER_PDFLIP_OWNED_MISS_RECORD", "") or "").strip()
-    # F0-F: the records root of the line AND its pre-rename sibling are read (writers: the root alone)
-    rank_dirs = _miss_cost.record_dirs_for(root, model) if root else None
+    rank_dirs = _miss_cost.record_dirs_for(root, model) if root else None  # F0-F: the root AND its pre-rename sibling are read (writers: the root alone)
     ms, tier, src = _er.resolve_owned_miss_ms(
         _er.read_owned_miss_records(measured_record_path()),
         rank_records=_er.read_owned_miss_rank_records(rank_dirs), host=int(host),
