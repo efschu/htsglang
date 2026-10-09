@@ -682,7 +682,7 @@ class GpuSampler:
 # Engine statistics
 # ---------------------------------------------------------------------------
 
-_METRIC = re.compile(r"^(flliper:[a-z_0-9]+)(?:\{([^}]*)\})?\s+([0-9eE.+-]+)\s*$")
+_METRIC = re.compile(r"^(sglang:[a-z_0-9]+)(?:\{([^}]*)\})?\s+([0-9eE.+-]+)\s*$")
 _LABEL = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:[^"\\]|\\.)*)"')
 
 #: Metrics the engine already publishes PER TP RANK, which is what makes an

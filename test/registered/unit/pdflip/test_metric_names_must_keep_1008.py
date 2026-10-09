@@ -278,8 +278,11 @@ def test_translation_gate_must_keep_lists_the_metric_names():
 
 #: dashboard files that mention the names but belong to the dashboard work package (F0-F: readers, generated catalog, UI text).
 #: Empty this list when they are restored (metric_inventory.py restore --apply on them); until then they are the only exceptions.
-OWNED_BY_F0F = ["tools/rig_dashboard/server.py", "tools/rig_dashboard/README.md", "tools/rig_dashboard/rigdash/README.md",
-                "tools/rig_dashboard/rigdash/profil_data/catalog.json", "tools/rig_dashboard/rigdash/static/index.html"]
+#: (fix round 2: server.py is NOT in the list any more -- it is the engine tile's READER and now spells the engine's names; ``weg2line.py``
+#: carries the docker-image regexes ``^flliper:(cu\d+)`` which look like a regex head but are image tags, not metrics.)
+OWNED_BY_F0F = ["tools/rig_dashboard/README.md", "tools/rig_dashboard/rigdash/README.md",
+                "tools/rig_dashboard/rigdash/profil_data/catalog.json", "tools/rig_dashboard/rigdash/static/index.html",
+                "tools/rig_dashboard/rigdash/weg2line.py"]
 
 
 def test_restore_is_a_noop_on_this_tree():
@@ -333,3 +336,132 @@ def test_vm_push_label_values_are_the_pre_rename_ones():
     assert got == old, {"missing": sorted(old - got)[:10], "new": sorted(got - old)[:10]}
     assert ("%s_flip_user_view_ms" % OLD_SUB, "part", "vorlauf") in got
     assert not [t for t in got if t[1] == "part" and t[2] == "warmup"]
+
+
+# ---- 5. the READERS of the exposition (fix round 2): a regex head is a name too ------------------------------------------------
+# F0-M restored the keys of rigmon/sources.py and the dashboard's keep map but not the regex that parses the exposition: the engine
+# exported ``sglang:*``, the parser read ``flliper:*``, every live value went empty and nothing raised.  These tests run the PARSERS on
+# a REAL exposition (the engine's SchedulerMetricsCollector through prometheus_client.generate_latest), not on strings of the test.
+
+_EXPO_PROG = r'''
+import types
+from prometheus_client import REGISTRY, generate_latest
+from flliper.srt.observability.metrics_collector import QueueCount, SchedulerMetricsCollector, SchedulerStats
+
+sa = types.SimpleNamespace(
+    enable_metrics=True, enable_metrics_for_all_schedulers=False, kv_events_config=None,
+    prefill_delayer_forward_passes_buckets=None, prefill_delayer_max_delay_passes=0, prefill_delayer_wait_seconds_buckets=None)
+labels = {"model_name": "m", "moe_ep_rank": 0, "engine_type": "e", "tp_rank": 0, "pp_rank": 0, "dp_rank": 0}
+c = SchedulerMetricsCollector(labels=labels, server_args=sa)
+s = SchedulerStats()
+s.num_running_reqs = QueueCount(total=3)
+s.num_queue_reqs = QueueCount(total=2)
+s.gen_throughput = 12.5
+s.token_usage = 0.25
+s.cache_hit_rate = 0.5
+c.log_stats(s)
+print("@@EXPO" + generate_latest(REGISTRY).decode().replace("\n", "\x01"))
+'''
+
+
+@pytest.fixture(scope="module")
+def real_exposition():
+    pytest.importorskip("prometheus_client")
+    import subprocess
+    out = subprocess.run([sys.executable, "-c", _EXPO_PROG], capture_output=True, text=True, timeout=300,
+                         env=dict(os.environ, PYTHONPATH=os.path.join(REPO, "python") + os.pathsep + os.environ.get("PYTHONPATH", "")))
+    if out.returncode != 0 and ("ImportError" in out.stderr or "ModuleNotFoundError" in out.stderr):
+        pytest.skip("the engine's metrics collector is not importable here: " + out.stderr[-300:])
+    assert out.returncode == 0, out.stderr[-1500:]            # a failing driver is a failure, never a skip
+    line = [x for x in out.stdout.splitlines() if x.startswith("@@EXPO")]
+    assert line, out.stdout[-500:] + out.stderr[-500:]
+    return line[0][len("@@EXPO"):].replace("\x01", "\n")
+
+
+def test_the_real_exposition_is_in_the_old_spelling(real_exposition):
+    names = _names(real_exposition)
+    assert OLD_ENG + ":num_running_reqs" in names and OLD_ENG + ":gen_throughput" in names, sorted(names)[:10]
+    assert not [n for n in names if n.startswith(NEW_ENG + ":")]
+
+
+def test_rigmon_parser_reads_the_real_exposition(real_exposition):
+    from flliper.srt.rigmon import sources as rs
+    got = rs.parse_prometheus(real_exposition)
+    assert got, "parse_prometheus found nothing in a real exposition: its regex does not read the engine's spelling"
+    assert all(k.startswith(OLD_ENG + ":") for k in got), sorted(got)[:5]
+    assert got[OLD_ENG + ":num_running_reqs"][0][1] == 3.0 and got[OLD_ENG + ":num_running_reqs"][0][0]["tp_rank"] == "0"
+    assert got[OLD_ENG + ":gen_throughput"][0][1] == 12.5
+    # every key the collector maps to a short name is the spelling the parser returns (keys and regex agree)
+    keys = list(rs._ENGINE_KEYS.values()) + list(rs.PER_RANK_KEYS.values()) + [rs.FORWARD_TIME_METRIC]
+    assert all(k.startswith(OLD_ENG + ":") for k in keys), [k for k in keys if not k.startswith(OLD_ENG + ":")]
+    present = [k for k in keys if k in got]
+    assert OLD_ENG + ":num_running_reqs" in present and OLD_ENG + ":gen_throughput" in present and len(present) >= 4, present
+
+
+def test_dashboard_server_engine_tile_reads_the_real_exposition(real_exposition, monkeypatch):
+    sys.path.insert(0, os.path.join(REPO, "tools", "rig_dashboard"))
+    try:
+        import importlib
+        srv = importlib.import_module("server")
+    except Exception as e:  # noqa: BLE001
+        pytest.skip(f"dashboard server not importable here: {type(e).__name__}")
+    finally:
+        sys.path.remove(os.path.join(REPO, "tools", "rig_dashboard"))
+    monkeypatch.setitem(srv._CFG, NEW_ENG, "http://127.0.0.1:1")
+    monkeypatch.setattr(srv, "_get", lambda url, timeout=1.5: real_exposition)
+    vals = srv.scrape_metrics()
+    assert vals, "the dashboard's engine tile reads nothing from a real exposition"
+    assert vals["num_running_reqs"] == 3.0 and vals["num_queue_reqs"] == 2.0 and vals["gen_throughput"] == 12.5, vals
+    assert vals["token_usage"] == 0.25 and vals["cache_hit_rate"] == 0.5, vals
+
+
+def test_no_regex_head_or_grep_of_a_reader_spells_the_kit_name():
+    """Static: a reader that matches the exposition with a regex / grep (``^sglang:[a-z_]+``, ``^sglang:(a|b)``) keeps the old head.
+    Docker-image regexes (``^flliper:(cu\\d+)``, ``(\\d+...)``) are image tags, not metrics."""
+    import subprocess
+    rx = re.compile(r"(?<![A-Za-z0-9_])" + NEW_ENG + r":[\[(\\]")
+    files = _in_git(lambda: subprocess.run(["git", "-C", REPO, "ls-files", "-z"], check=True,
+                                           stdout=subprocess.PIPE).stdout.split(b"\0"))
+    bad = []
+    for raw in files:
+        rel = raw.decode("utf-8", "surrogateescape")
+        if not rel.endswith((".py", ".sh", ".json", ".yml", ".yaml", ".html", ".js")):
+            continue
+        if rel.startswith(("tools/release/", "python/flliper/test/")) or "/tests/" in rel or rel.startswith("test/"):
+            continue
+        p = os.path.join(REPO, rel)
+        if not os.path.isfile(p):
+            continue
+        try:
+            text = open(p, encoding="utf-8").read()
+        except (UnicodeDecodeError, OSError):
+            continue
+        for i, ln in enumerate(text.splitlines(), 1):
+            for m in rx.finditer(ln):
+                if not re.match(r"\((?:cu|\\d)", ln[m.end() - 1:]):
+                    bad.append(f"{rel}:{i}: {ln.strip()[:100]}")
+    assert bad == [], bad[:10]
+
+
+def test_kit_keeps_the_regex_head_of_a_reader():
+    R = _kit("rename_to_flliper")
+    R._MK = None
+    head = 're.compile(r"^(%s:[a-z_0-9]+)(?:\\{)") grep -E "^%s:(cache_hit_rate|x)"' % (OLD_ENG, OLD_ENG)
+    for path in ("python/%s/srt/rigmon/sources.py" % OLD_ENG, "tools/rig_dashboard/server.py",
+                 "scripts/dev/543_yarn/validate_544.sh", "python/%s/srt/any/new_reader.py" % OLD_ENG):
+        assert R.rewrite_all(head, False, True, {}, path)[0] == head, path
+    # the neighbours are still renamed: a docker-image regex, a process title, a docker tag
+    other = "^%s:(cu\\d+)-x %s::scheduler %s:dev" % (OLD_ENG, OLD_ENG, OLD_ENG)
+    assert R.rewrite_all(other, False, True, {}, "tools/rig_dashboard/rigdash/weg2line.py")[0] == \
+        "^%s:(cu\\d+)-x %s::scheduler %s:dev" % (NEW_ENG, NEW_ENG, NEW_ENG)
+    # the table says so (and the translation gate keeps the head in string units)
+    tb = _kit("metric_inventory")
+    assert tb.REGEX_HEADS == (OLD_ENG + ":",)
+    with open(os.path.join(KIT, "data", "metric_names_1008.json")) as f:
+        table = json.load(f)
+    assert table["regex_heads"] == [OLD_ENG + ":"]
+    for rd in ("python/%s/srt/rigmon/sources.py" % OLD_ENG, "tools/rig_dashboard/server.py"):
+        assert table["files"][rd] == [OLD_ENG + ":"], rd
+    with open(os.path.join(KIT, "data", "must_keep.txt")) as f:
+        entries = {ln.strip() for ln in f if ln.strip() and not ln.startswith("#")}
+    assert {OLD_ENG + ":[", OLD_ENG + ":("} <= entries
