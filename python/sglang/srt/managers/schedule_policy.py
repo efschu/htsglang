@@ -1180,6 +1180,12 @@ def _h110_promised_rows(adder) -> int:
 
 
 class PrefillAdder:
+    # PRIORITY LANES 1008 (L3, weg2/lanes_p.py): written by `lanes_p.configure_adder` only when the rank holds lane state
+    # (an RPC or a stamp arrived with SGLANG_WEG2_LANES=1); these class defaults ARE the switch-off behaviour.
+    lane_floor: int = 0  # a request of a lane below this gets no chunk (0 = nothing is held)
+    lane_chunk_cap_tokens: int = 0  # SGLANG_WEG2_LANE_PREEMPT_CHUNK_TOKENS in pages (0 = the normal chunk)
+    lane_higher_waiting: int = -1  # the highest lane among the waiting requests (-1 = unknown)
+
     def __init__(
         self,
         page_size: int,
@@ -2427,6 +2433,26 @@ class PrefillAdder:
         )
         return AddReqResult.CONTINUE
 
+    def _weg2_lane_hold_chunked(self, req: Req) -> bool:
+        """PRIORITY LANES 1008 (L3): True = the chunked continuation `req` is held by the lane floor and has been parked in
+        place (no extend range, `weg2_pool_parked` + `weg2_lane_parked` for the head-of-step park). A continuation whose
+        floor fell before its rows went back is released from the lane park here (False)."""
+        lane_parked = getattr(req, "weg2_lane_parked", False) is True
+        if self.lane_floor <= 0 and not lane_parked:
+            return False  # the switch-off path: two attribute reads
+        from sglang.srt.weg2 import lanes_p
+
+        if lanes_p.holds(lanes_p.req_lane(req), self.lane_floor):
+            n = len(req.prefix_indices)
+            req.set_extend_range(n, n)
+            req.weg2_pool_parked = True
+            req.weg2_lane_parked = True
+            return True
+        if lane_parked:
+            req.weg2_lane_parked = False
+            req.weg2_pool_parked = False
+        return False
+
     def add_chunked_req(self, req: Req):
         # #791 CORE: the carried chunked request is the consumer that had NO
         # forwarded-decision gate at all. `add_one_req` at least read the
@@ -2456,6 +2482,16 @@ class PrefillAdder:
                 if req.extend_range.end < len(req.full_untruncated_fill_ids)
                 else None
             )
+        # PRIORITY LANES 1008 (L3): the floor stands above this continuation's lane -> no chunk this pass, the request
+        # parks IN PLACE at the chunk boundary (the #679 shape) and `process_pending_weg2_park` gives its rows back to
+        # the tree (is_insert=True) at the head of the next step. Reached on PP0 (it owns the decision) and on a follower
+        # only for a request the forwarded schedule does NOT name -- where it reads the SAME stamped floor, so every
+        # stage parks. A request the schedule names was run by the branch above (the decision wins). On a follower the
+        # scheduler's #992 gate (a continuation the decision does not name gets no seat; under the row authority every
+        # follower has an effective map, `{}` included) would skip this method; `lanes_p.continuation_held` exempts the
+        # lane-held continuation from that skip, because it takes no seat here (no chunk, no budget, no can_run_list).
+        if self._weg2_lane_hold_chunked(req):
+            return req
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens()
         else:

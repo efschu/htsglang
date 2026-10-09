@@ -240,6 +240,7 @@ from sglang.srt.managers import weg2_flush_nonblock as _weg2_flush_nonblock  # B
 from sglang.srt.weg2 import fork_anchor as _weg2_fork
 from sglang.srt.weg2 import twin_anchor as _weg2_twin_anchor  # TWIN ANCHOR (y4a 16-28)
 from sglang.srt.weg2 import d_park_read as _weg2_park_read  # PARK-RETAIN READ
+from sglang.srt.weg2 import lanes_p as _lanes_p  # PRIORITY LANES 1008 (L3): the P-side lane floor
 from sglang.srt.weg2 import resume_via_p as _weg2_rvp  # RESUME-VIA-P
 from sglang.srt.weg2 import d_wall_head as _weg2_d_wall_head  # PW-R
 from sglang.srt.weg2 import d_head_hold as _weg2_d_head_hold  # DQH
@@ -1311,6 +1312,23 @@ def _weg2_dormant_admit_armed() -> bool:
 #: #823 HEAD-VOTE ANCHOR line count (module-level: the vote runs on scheduler
 #: doubles in the #823/#610 harnesses, which carry only the reduce's members).
 _HEAD_VOTE_ANCHOR_N = [0]
+
+
+def _pp_chunked_continuation_not_named(sched, incoming, req) -> bool:
+    """The #992 predicate: this rank executes a forwarded schedule that does not name its chunked continuation `req`, so the
+    seat is refused (the continuation is kept, `add_chunked_req` is not called).
+
+    PRIORITY LANES 1008 (L3, weg2/lanes_p.py): a continuation the stamped lane floor holds is NOT a seat this gate has to
+    refuse -- it takes no chunk and no budget (`add_chunked_req` parks it in place and returns before it touches
+    `can_run_list`), and the follower MUST reach that park, or PP1/PP2 keep the device rows of the parked lane locked while
+    PP0 has given its own back (L3 review, finding 1: under the default row authority every follower holds an effective map,
+    `{}` included, so without this exemption a lane hold never left PP0). Without lane state (switch off / no RPC)
+    `continuation_held` is False and this is the expression it was."""
+    return (
+        incoming is not None
+        and incoming.get(req.rid) is None
+        and not _lanes_p.continuation_held(sched, req)
+    )
 
 
 def _len_or_zero(x) -> int:
@@ -4002,6 +4020,7 @@ class Scheduler(
                 (Weg2ParkRunningReqInput, self.handle_weg2_park_running),
                 (Weg2LaneFloorReqInput, self.handle_weg2_lane_floor),
                 (Weg2ParkWindowReqInput, self.handle_weg2_park_window),
+                (Weg2LaneFloorReqInput, self.handle_weg2_lane_floor),
                 (Weg2VisionVerdict, self.handle_weg2_vision_verdict),
                 (PlePrefetchHintReqInput, self.handle_ple_prefetch_hint),
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
@@ -6531,6 +6550,14 @@ class Scheduler(
         from sglang.srt.weg2 import park_window_gate
 
         park_window_gate.note(self, recv_req)
+
+    def handle_weg2_lane_floor(self, recv_req) -> None:
+        """PRIORITY LANES 1008 (L3, weg2/lanes_p.py): ``POST /weg2/lane_floor``. Group P: PP0 records the value for its
+        next pass (it stamps it on the PP-room vote, every stage applies it in the same pass), PP1/PP2 ignore the
+        request itself. Ignored without SGLANG_WEG2_LANES=1. No reply."""
+        from sglang.srt.weg2 import lanes_p
+
+        lanes_p.on_rpc(self, recv_req)
 
     def weg2_d_hold_parked(self) -> int:
         """H91b: the sleep leg's dormant point -- parked requests enter the
@@ -10142,9 +10169,16 @@ class Scheduler(
         if getattr(req, "finished", lambda: False)() or req.req_pool_idx is None:
             req.weg2_pool_parked = False
             return
+        # PRIORITY LANES 1008 (L3, weg2/lanes_p.py): the trigger is the lane floor, not the pool. The rows go back whether
+        # or not anybody waits (the floor holds the whole lane), and only while the floor still stands above the lane.
+        _lane_park = _lanes_p.park_is_lane(req)
+        if _lane_park and not _lanes_p.park_still_due(self, req):
+            req.weg2_pool_parked = False  # the floor fell before the rows went back: the park is void
+            req.weg2_lane_parked = False
+            return
         if int(getattr(req, "inflight_middle_chunks", 0) or 0) > 0:
             return  # a launched chunk still writes its rows; try next step
-        if not getattr(self, "waiting_queue", None):
+        if not _lane_park and not getattr(self, "waiting_queue", None):
             return  # nobody to make room for: keep the in-place park (#679)
         try:
             from sglang.srt.weg2.park import park_active
@@ -10165,6 +10199,10 @@ class Scheduler(
         req.reset_for_retract()
         self.chunked_req = None
         self._add_request_to_queue(req, is_retracted=True)
+        if _lane_park:
+            # the request keeps `weg2_lane_parked` (the admission loop skips it while the floor stands above its lane)
+            _lanes_p.note_parked(self, req, span=span, total=len(getattr(req, "origin_input_ids", ()) or ()))
+            return
         n = getattr(self, "_weg2_park_n", 0) + 1
         self._weg2_park_n = n
         logger.info(
@@ -16258,6 +16296,9 @@ class Scheduler(
         # H105: on a Form A group the attention host's gate verdict is the
         # group's (None elsewhere: every gate in add_one_req stays rank-local).
         adder.form_a_admission_follow = self._form_a_admission_follow_fn()
+        # PRIORITY LANES 1008 (L3): this pass's lane floor (and the lane chunk) for the adder; nothing is written without
+        # lane state (no RPC / switch off), so the adder keeps its class defaults.
+        _lanes_p.configure_adder(self, adder)
         # ED (rc12o b1): on a Form A group only the host's vote decides (H105);
         # a worker keeps the reported evictable count so its local extend
         # arithmetic is the pre-ED one (mem_cache/evict_frontier_census.py).
@@ -16442,8 +16483,8 @@ class Scheduler(
             # below rather than guessed at, so boot 12 measures the second
             # half instead of assuming it.
             incoming = getattr(self, "_pp_admission_incoming_effective", None)
-            not_named = (
-                incoming is not None and incoming.get(self.chunked_req.rid) is None
+            not_named = _pp_chunked_continuation_not_named(
+                self, incoming, self.chunked_req
             )
             if not_named:
                 self._992_chunked_not_named = (
@@ -16575,7 +16616,8 @@ class Scheduler(
                                 count,
                             )
                         self.chunked_req.truncate_prefix_to(told)
-                self.chunked_req = adder.add_chunked_req(self.chunked_req)
+                with _lanes_p.chunk_scope(adder, self.chunked_req):
+                    self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
         # #959 THE RESIDENCY FACT, STAMPED WHERE IT IS SETTLED. Both branches
         # above leave `self.chunked_req` final for this pass -- the seam
@@ -16713,8 +16755,14 @@ class Scheduler(
         from sglang.srt.weg2 import hol_overtake as _hol_mod
 
         _hol = _hol_mod.HolPass(self)
+        # PRIORITY LANES 1008 (L3): while the floor stands above a request's lane the rank that owns the admission truth
+        # (PP0 / non-PP; a follower executes PP0's named schedule and never skips by lane) does not admit it. 0 = off.
+        _lane_floor = _lanes_p.floor_for_pass(self) if _lanes_p.owns_admission(self) else 0
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
+            if _lane_floor and _lanes_p.holds(_lanes_p.req_lane(req), _lane_floor):
+                _note_skip("weg2_lane_held", req.rid)
+                continue
             if _burst_hold is not None:  # fnFL2 H42b: the burst is still assembling
                 _note_skip("weg2_burst_assembly", req.rid)
                 continue
@@ -17507,10 +17555,11 @@ class Scheduler(
 
             try:
                 _ar_t0 = time.perf_counter()  # xsn325: host cost per admission
-                res = adder.add_one_req(
-                    req,
-                    truncation_align_size=self.truncation_align_size,
-                )
+                with _lanes_p.chunk_scope(adder, req):  # L3: a lower lane's chunk is smaller while a higher lane waits
+                    res = adder.add_one_req(
+                        req,
+                        truncation_align_size=self.truncation_align_size,
+                    )
                 if getattr(self, "_weg2_post_wake_pass_n", None) is not None:
                     _arl = getattr(self, "_weg2_gnbp_addreq", None)
                     if _arl is None:
