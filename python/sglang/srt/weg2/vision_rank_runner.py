@@ -52,6 +52,7 @@ import gc
 import logging
 import os
 import time
+import weakref
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -647,6 +648,12 @@ class StageOutcome:
     planned_work_bytes: Optional[int] = None
     victim_host_line: str = ""
     fatal: str = ""
+    #: VISION-GC-SKIP (AP5, ported from NF c651892375, weights stage only):
+    #: "skipped" (every tower tensor dead after the strip) | "full" (gc.collect
+    #: ran) | "" (not a weights stage: the full gc as before); the tensors
+    #: still alive after the strip, before any gc
+    gc_mode: str = ""
+    gc_alive: int = 0
 
 
 class _StageDeadline(vrs.VisionRankStageRefused):
@@ -884,14 +891,27 @@ def run_rank_stage(scheduler, reqs: Sequence[Any], *, model_dir: str, hf_config:
             _close_lease(out, lease, device, int(getattr(scheduler, "_weg2_vision_runs", 0) or 0))
             lease = None
         t0 = clock()
+        # VISION-GC-SKIP (AP5): every tensor the tower held, weakly -- on a
+        # weights stage the full gc.collect runs only when one of them is
+        # still alive after the strip (a cycle or a traceback holds it)
+        refs = [weakref.ref(v) for v in (views or {}).values() if isinstance(v, torch.Tensor)]
+        if slab is not None:
+            refs.append(weakref.ref(slab))
         views = plan = rows = segments = slab = None
         if module is not None:
-            _strip_module(module)
+            refs.extend(_strip_module(module))
         module = None
         for key in set(rope_factory._ROPE_DICT) - rope_keys:
             rope_factory._ROPE_DICT.pop(key, None)
         _tg = clock()
-        if touched:
+        if touched and place == vrs.PLACE_WEIGHTS:
+            out.gc_alive = sum(1 for r in refs if r() is not None)
+            if out.ok and out.gc_alive == 0:
+                out.gc_mode = "skipped"
+            else:
+                gc.collect()
+                out.gc_mode = "full"
+        elif touched:
             gc.collect()
         _ts = clock()
         if on_card and touched:
@@ -925,15 +945,31 @@ def run_rank_stage(scheduler, reqs: Sequence[Any], *, model_dir: str, hf_config:
     return out
 
 
-def _strip_module(module: torch.nn.Module) -> None:
-    """Drop every parameter (the views) and buffer (the rope cache) the
-    tower holds; the module object itself may live on in a cycle
-    (graph_runners -> module) until ``gc.collect``, empty."""
+def _strip_module(module: torch.nn.Module) -> List["weakref.ref"]:
+    """Drop every parameter (the views), buffer (the rope cache) and plain
+    tensor attribute the tower holds; the module object itself may live on
+    in a cycle (graph_runners -> module) until a gc, empty. Returns a weak
+    reference to each tensor dropped (VISION-GC-SKIP, NF c651892375: all dead
+    = no tensor of the tower survives, the full ``gc.collect`` is not
+    needed)."""
+    refs: List[weakref.ref] = []
+
+    def _drop(t: Any) -> None:
+        if isinstance(t, torch.Tensor):
+            refs.append(weakref.ref(t))
+
     for mod in list(module.modules()):
         for name in list(mod._parameters):
+            _drop(mod._parameters[name])
             mod._parameters[name] = None
         for name in list(mod._buffers):
+            _drop(mod._buffers[name])
             mod._buffers[name] = None
+        for name, val in list(vars(mod).items()):
+            if isinstance(val, torch.Tensor):
+                _drop(val)
+                setattr(mod, name, None)
+    return refs
 
 
 def log_outcome(out: StageOutcome, rids: Sequence[str], run: int) -> None:
@@ -960,7 +996,8 @@ def log_outcome(out: StageOutcome, rids: Sequence[str], run: int) -> None:
     if out.victim_fields:  # VISION-WEIGHTS: only a weights stage adds these
         line += (f" {out.victim_fields} checksum={out.checksum or 'n/a'} "
                  f"encode_peak_mib={_mib_or_na(out.encode_peak_bytes)} "
-                 f"planned_work_mib={_mib_or_na(out.planned_work_bytes)}")
+                 f"planned_work_mib={_mib_or_na(out.planned_work_bytes)} "
+                 f"gc={out.gc_mode or 'none'} gc_alive={out.gc_alive}")
     if out.ok:
         logger.info("%s %s rids=%s", W_STAGE_OK, line, list(rids))
     else:
