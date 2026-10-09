@@ -14,6 +14,7 @@
    "nicht gemessen" mit dem Grund im Hover, nie als Zahl.  Nur im Rig-Dashboard (Edition rig, nur LAN). */
 (function (root) {
   "use strict";
+  const LOC = () => (typeof RigI18n === "undefined" ? "en-US" : RigI18n.loc());      // the number format follows the page language (i18n.js); node tests have none
   const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   // source tags of the values (API: flliper.hardware/1); the English tags and the German ones are both accepted
   const BADGE = { "measured": ["hwp-m", "meas."], "NVML": ["hwp-n", "NVML"], "datasheet": ["hwp-d", "datash."], "estimated": ["hwp-e", "est."], "not measured": ["hwp-x", ""],
@@ -36,7 +37,7 @@
     if (s < 129600) return Math.round(s / 3600) + " h ago";
     return Math.round(s / 86400) + " d ago";
   }
-  function num(v, d) { return (typeof v === "number") ? v.toLocaleString("en-US", { maximumFractionDigits: d == null ? 1 : d }) : String(v); }
+  function num(v, d) { return (typeof v === "number") ? v.toLocaleString(LOC(), { maximumFractionDigits: d == null ? 1 : d }) : String(v); }
 
   /* Ein Wertknoten {v, src, at?, probe?, note?, unit?} -> Zelleninhalt.  Hover: Quelle, Alter, Datei, Anmerkung. */
   function cell(n, d, o) {

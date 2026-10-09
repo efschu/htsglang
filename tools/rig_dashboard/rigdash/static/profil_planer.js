@@ -12,6 +12,7 @@
            input(row) -> HTML (Skalar-Feld), short(row) -> Text, explain(row) -> HTML, depChip(dep) -> HTML }. */
 (function (root) {
   "use strict";
+  const LOC = () => (typeof RigI18n === "undefined" ? "en-US" : RigI18n.loc());      // the number format follows the page language (i18n.js); node tests have none
   const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   const tail = (label) => { const p = String(label == null ? "" : label).trim().split(/\s+/); return (p[p.length - 1] || "").replace(/=$/, ""); };
   const shortName = (n) => String(n == null ? "" : n).replace(/^NVIDIA\s+/i, "").replace(/^GeForce\s+/i, "");
@@ -32,7 +33,7 @@
     for (const p of parts) { const v = Number(p); if (!isFinite(v)) return null; s += v; }
     return Math.round(s * 1e6) / 1e6;
   }
-  const fmtNum = (v) => (v == null ? "" : Number(v).toLocaleString("en-US", { maximumFractionDigits: 6 }));
+  const fmtNum = (v) => (v == null ? "" : Number(v).toLocaleString(LOC(), { maximumFractionDigits: 6 }));
 
   // ------------------------------------------------------------------ Betriebsform aus dem Profil
   /* Form des geladenen Profils: --dual-layout oder --dual-share (impliziert --dual-layout, launcher.py:14693) -> dual, --d-only -> tp, sonst flip;
