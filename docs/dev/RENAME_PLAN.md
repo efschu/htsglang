@@ -773,6 +773,31 @@ does not touch it: `git diff 8aaa67e72c 33006acfb2 -- tools/rig_dashboard/server
 Tests: the two parsers run on a REAL exposition (`SchedulerMetricsCollector` -> `generate_latest`), a static scan for kit-spelled regex heads, the engine
 on the old text of the three files, mutants of both regexes fail the tests.
 
-Still left to the dashboard package (F0-F): `rigdash` reads `pdflip_*` series (it must read the old and the new spelling, F0-F does this) and the
-generated `catalog.json` / UI texts / READMEs that mention the names.
+Still left to the dashboard package (F0-F): the generated `catalog.json` / UI texts / READMEs that mention the names.  The readers
+(`rigdash`) are settled in 8.18.
 
+## 8.18 F0-M and F0-F together: the dashboard reads both prefixes, how the two branches are merged (08.10.2026, fix round 3)
+
+F0-F (dashboard) built its readers for the case "the sampler writes `pdflip_*`": `vmpush.dual_promql` rewrote only `pdflip_x` into
+`{__name__=~"(<old>|pdflip)_x"}`.  F0-M (this branch) keeps the old names, so the readers, `make_dashboard.py` and the panels say `<old>_x`, which that
+rewrite does not touch: after a plain merge `test_shipped_dashboard_reads_both_generations` of F0-F fails (0 of the >= 10 dual panels) and, the other way
+round, the F0-M tests fail on the F0-F reader text.  Decision (the user's: the names are must-keep, the history stays readable): the readers keep
+the dual form, but it is keyed on BOTH stems, so the old-spelling PromQL of F0-M and any `pdflip_x` of F0-F produce the same selector.  The
+interim prefix is only ever READ (nothing in the tree writes it; the exporter tests of F0-M forbid it).
+
+Merge recipe for F0-I (both lines, same patch file `tools/release/data/f0m_f0f_merge_fix_1008.patch`; 27B = `88e8aa4e9c..` + `33006acfb2`, NF =
+`1dd123efa4..` + `021e9ebcbf`; the recipe was dry-run on both with the results in the commit message):
+
+    git merge --no-ff <F0-F branch>                       # one conflict: rigdash/deploy/grafana/dashboards/rig-verlauf.json
+    git checkout --ours tools/rig_dashboard/rigdash/deploy/grafana/dashboards/rig-verlauf.json
+    git apply --index tools/release/data/f0m_f0f_merge_fix_1008.patch
+    git commit
+
+What the patch does: (1) `vmpush.py`: `_METRIC_RX` matches either stem, the comments / docstring no longer say the sampler writes `pdflip_*`;
+(2) `rig-verlauf.json`: every target expression run through `dual_promql` (14 panel queries become `{__name__=~"(<old>|pdflip)_x",...}`);
+(3) `make_dashboard.py`: comment only; (4) `test_f0f_dashboard_1008.py`: the test inputs are built from the stem token (the kit's `restore` would otherwise
+rewrite them) + a test for the old-stem input.  **The JSON is NOT regenerated with `make_dashboard.py`**: in both trees the shipped JSON and the
+generator have drifted apart (the JSON carries `def="t2t"` selectors and the "Flipzeit" legends, the generator has two PCIe panels the JSON lacks), so
+a regeneration would change panels this work package must not touch.  The transform is exact: the shipped JSON after the patch is a fixpoint of
+`dual_promql`, and the same expressions go through `make_dashboard.py` the next time somebody regenerates.  A kit re-run on a tree that already
+carries `(<old>|pdflip)_x` is not part of the flow (the kit runs on the old tree); the reader token comes from `names.STEM_TOKENS`, split there.
