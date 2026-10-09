@@ -293,14 +293,64 @@ async def test_lane1_while_p_prefills_sends_the_floor_and_counts_the_legs_it_sto
 
 
 @_on
-async def test_a_sleeping_d_is_not_asked_to_park_its_dormant_requests_the_front_books_the_hold():
+async def test_a_sleeping_d_is_not_asked_to_park_its_dormant_requests_the_front_books_the_hold_unconfirmed():
+    """Review L4 FR1 finding 4: a booking for a sleeping D is UNCONFIRMED (``dormant``) until a park RPC after the
+    wake is answered; only that answer moves it to ``parked_d``."""
     f = _front("P")
     f.groups["D"].outstanding["dd"] = NOW
     _note(f, "dd", 0)
     assert await _arrive(f, "hi", 1) is None
     assert f.rpc.paths(PP.PARK_PATH) == []
-    assert f._d_parked["dd"] == PP.LANE_PARK_STAMP and "dd" in f._lane_ctl_obj.parked_d
-    assert f.counters["lane_parked_d_dormant"] == 1
+    lc = f._lane_ctl_obj
+    assert f._d_parked["dd"] == PP.LANE_PARK_STAMP and "dd" in lc.dormant and "dd" not in lc.parked_d
+    assert f.counters["lane_parked_d_dormant"] == 1 and f.counters["lane_parked_d"] == 0
+    assert "dd" in f._lane_parked_set()                       # still out of the flip ledger / the wake counts
+    assert f._flip_ledger(f.groups["D"]) == []
+    # nothing asks a sleeping D, however often the loop ticks
+    await LC.step(f, time.time() + 10)
+    assert f.rpc.paths(PP.PARK_PATH) == []
+
+
+@_on
+async def test_after_the_wake_the_dormant_booking_is_parked_by_rid_and_booked_only_on_d_s_answer(caplog):
+    caplog.set_level(logging.INFO, logger="weg2.front")
+    f = _front("P")
+    f.groups["D"].outstanding["dd"] = NOW
+    _note(f, "dd", 0)
+    assert await _arrive(f, "hi", 1) is None
+    lc = f._lane_ctl_obj
+    assert _marks(caplog, LN.MARK_PREEMPT)[0].startswith("WEG2 LANE-PREEMPT floor=1 epoch=1 parked_d=0 parked_p=0 held=0 dormant=1 ")
+    # the P->D wake: the lane parks stay booked over it (the flip's PARK-RESUME must not resume them)
+    parked = dict(f._d_parked)
+    assert f._lane_unpark_keep(parked) == {"dd": PP.LANE_PARK_STAMP} and parked == {}
+    f.awake = "D"
+    # D answers the park without it ("dd" is not running there): still dormant, asked again
+    f.rpc.d_running = set()
+    await LC.step(f, time.time() + 1)
+    assert [b["rids"] for _g, b in f.rpc.paths(PP.PARK_PATH)] == [["dd"]]
+    assert "dd" in lc.dormant and "dd" not in lc.parked_d
+    f.rpc.d_running = None
+    await LC.step(f, time.time() + 3)
+    assert [b["rids"] for _g, b in f.rpc.paths(PP.PARK_PATH)] == [["dd"], ["dd"]] and f.rpc.paths(PP.PARK_PATH)[1][1]["hold"] == "lane"
+    assert "dd" in lc.parked_d and "dd" not in lc.dormant and f.counters["lane_parked_d"] == 1
+    await LC.step(f, time.time() + 6)                                    # confirmed: not asked a third time
+    assert len(f.rpc.paths(PP.PARK_PATH)) == 2
+    # the lane ends: the confirmed park resumes
+    f._lane_end("hi")
+    await LC.reconcile(f, "end")
+    assert "dd" not in lc.parked_d and "dd" not in f._d_parked
+
+
+@_on
+async def test_a_dormant_booking_ends_with_the_lane_if_the_floor_falls_before_the_wake():
+    f = _front("P")
+    f.groups["D"].outstanding["dd"] = NOW
+    _note(f, "dd", 0)
+    assert await _arrive(f, "hi", 1) is None
+    f._lane_end("hi")
+    await LC.reconcile(f, "end")
+    lc = f._lane_ctl_obj
+    assert "dd" not in lc.dormant and "dd" not in f._d_parked and f.counters["lane_resumed_d"] == 1
 
 
 @_on
@@ -880,10 +930,13 @@ async def test_e2e_lane1_while_d_decodes_lane0_parks_runs_alone_and_the_parked_r
         lo = [h.post_lane(f"lo{i}") for i in range(3)]
         assert await _until(lambda: len(h.d.running) == 3, 10)
         lo_rids = sorted(h.d.running)
+        # the front's own ledger of D must hold all three too before lane 1 arrives (D's fake sees the POST a moment
+        # before the front books it): a park of two of them is the harness race, not the controller
+        assert await _until(lambda: sorted(h.front.groups["D"].outstanding) == lo_rids, 10)
         hi = h.post_lane("hi", priority=1)
         assert await _until(lambda: "gen:hi" in h.d.timeline, 10)
         # the park (exactly the three lane-0 rids, hold=lane) came BEFORE the lane-1 request reached D
-        assert h.d.park_bodies and h.d.park_bodies[0]["rids"] == lo_rids and h.d.park_bodies[0]["hold"] == "lane"
+        assert h.d.park_bodies and sorted(h.d.park_bodies[0]["rids"]) == lo_rids and h.d.park_bodies[0]["hold"] == "lane"
         assert h.d.timeline.index("rpc:weg2/park_running") < h.d.timeline.index("gen:hi")
         assert {"floor": 1, "epoch": 1} in h.d.floor_bodies and {"floor": 1, "epoch": 1} in h.p.floor_bodies
         assert all(h.front._d_parked.get(r) == PP.LANE_PARK_STAMP for r in lo_rids)
@@ -935,6 +988,9 @@ async def test_e2e_a_lane1_long_request_flips_without_waiting_for_the_parked_and
         assert h.front._d_parked[lo_rid] == PP.LANE_PARK_STAMP
         # ... and the flip back to D: the wake carries hi alone (handoff_n 1), the lane park is not "resumed"
         assert await _until(lambda: "gen:hi" in h.d.timeline, 20)
+        # (the leg 2 may reach D a moment before the wake RPC is recorded: wait for the wake, never read it early --
+        # the same test flaked 2 in 8 on 572f86f3f3 for exactly that)
+        assert await _until(lambda: any("kv_cache" in (b.get("tags") or []) for b in h.d.resume_bodies), 10)
         kv = [b for b in h.d.resume_bodies if "kv_cache" in (b.get("tags") or [])]
         assert kv and kv[-1].get("parked_n") == 0 and kv[-1].get("handoff_n") == 1, kv
         assert kv[-1].get("lane_floor") == 1
@@ -947,3 +1003,361 @@ async def test_e2e_a_lane1_long_request_flips_without_waiting_for_the_parked_and
         (s, _) = await asyncio.wait_for(lo, 10)
         assert s == 200
         assert h.d.gen_marks.count("lo") == 1                            # never re-posted: a resume, not a redo
+
+
+# ------------------------------------------------------------------ review FR1: held P legs leave P before the P->D flip
+@_on
+async def test_the_pool_takes_the_held_legs_off_p_when_only_they_are_left_and_returns_without_them(caplog):
+    """Review L4 FR1 finding 1: the held legs must not stay behind on P (they would sit in P's waiting queue, the
+    P->D witness would read 'rank not idle' = W3, and nothing would run them after the floor fell)."""
+    caplog.set_level(logging.INFO, logger="weg2.front")
+    f = _front("P")
+    queue = collections.deque()
+    done_order = []
+    gates = {}
+
+    async def one(p):
+        ev = gates.setdefault(p.rid, asyncio.Event())
+        try:
+            await ev.wait()
+        except asyncio.CancelledError:
+            if p.lane_p_taken:
+                return p                                          # what the controller's ``one`` does
+            raise
+        return p
+
+    def on_done(p):
+        if not p.lane_p_taken:
+            done_order.append(p.rid)
+
+    lo = [_pend(f, f"lo{i}", 0, NOW + i) for i in range(2)]
+    queue.extend(lo)
+    ls = f._lane_state()
+    task = asyncio.ensure_future(_p_drain_pool(
+        queue, 2, one, on_done, lambda: True, lane_held=lambda p: p.lane < ls.lane_floor,
+        lane_take=lambda its, cancel: LC.p_take(f, its, cancel)))
+    await asyncio.sleep(0.05)
+    assert sorted(gates) == ["lo0", "lo1"]
+    hi = _pend(f, "hi", 1, NOW + 10)
+    ls.set_floor(1)
+    queue.append(hi)
+    await asyncio.sleep(0.25)
+    assert "hi" in gates and not task.done()                    # the lane runs beside the two held legs
+    gates["hi"].set()
+    assert await asyncio.wait_for(task, 3) >= 1                 # only held legs left: they are taken, the drain ends
+    assert done_order == ["hi"]
+    lc = f._lane_ctl_obj
+    assert sorted(h.p.rid for h in lc.held.values()) == ["lo0", "lo1"]
+    assert sorted(b["rid"] for _g, b in f.rpc.paths("/abort_request")) == ["lo0", "lo1"]
+    assert all(p.lane_p_taken for p in lo) and not any(p.leg1_done for p in lo)
+    assert f.counters["lane_p_taken"] == 2
+    # a pool whose callback fails falls back to the late hand-over (nothing is lost)
+    queue2 = collections.deque([_pend(f, "lo9", 0, NOW + 20)])
+    ls.set_floor(1)
+    seen = []
+
+    async def boom(its, cancel):
+        raise RuntimeError("take failed")
+
+    async def one3(p):
+        await asyncio.sleep(0.2)
+        return p
+    t2 = asyncio.ensure_future(_p_drain_pool(
+        queue2, 1, one3, lambda p: seen.append(p.rid), lambda: True, lane_held=lambda p: p.lane < ls.lane_floor,
+        lane_take=boom))
+    assert await asyncio.wait_for(t2, 2) >= 0
+    ls.set_floor(0)
+    await asyncio.sleep(0.4)
+    assert seen == ["lo9"]
+    assert any("LANE-P-TAKE failed" in r.getMessage() for r in caplog.records)
+
+
+@_on
+async def test_p_take_marks_aborts_by_rid_keeps_the_pendings_and_the_resume_puts_them_back_by_arrival(caplog):
+    caplog.set_level(logging.INFO, logger="weg2.front")
+    f = _front("P")
+    ls = f._lane_state()
+    lo = [_pend(f, f"lo{i}", 0, NOW + i) for i in range(2)]
+    cancelled = []
+    _note(f, "hi", 1)
+    ls.set_floor(1)
+    for p in lo:
+        f.groups["P"].outstanding[p.rid] = NOW
+    n = await LC.p_take(f, lo, lambda: cancelled.append(True))
+    assert n == 2 and cancelled == [True]
+    assert all(p.lane_p_taken and p.lane_state == "held" for p in lo)
+    aborts = f.rpc.paths("/abort_request")
+    assert sorted(b["rid"] for _g, b in aborts) == ["lo0", "lo1"] and all(g == "P" for g, _b in aborts)
+    lc = f._lane_ctl_obj
+    assert sorted(h.p.rid for h in lc.held.values()) == ["lo0", "lo1"] and list(f.queue) == []
+    assert "lo0" in f._park_stuck().lane_held
+    assert _marks(caplog, LC.MARK_P_TAKE)[0].startswith("WEG2 LANE-P-TAKE rid=lo0,lo1 floor=1 epoch=")
+    assert f.counters["lane_p_taken"] == 2
+    # a newer lane-0 request waits in the queue meanwhile; the lane ends: the taken legs come back BEFORE it
+    f.queue.append(_pend(f, "newer", 0, NOW + 50))
+    f._lane_end("hi")
+    await LC.reconcile(f, "end")
+    assert [p.rid for p in f.queue] == ["lo0", "lo1", "newer"]
+    assert not any(p.lane_p_taken for p in lo) and not any(p.leg1_done for p in lo)
+    assert all(p.lane_held_s >= 0.0 and p.t_arrive == NOW + i for i, p in enumerate(lo))
+
+
+@_on
+async def test_p_take_when_the_floor_fell_during_the_aborts_puts_the_legs_straight_back():
+    f = _front("P")
+    ls = f._lane_state()
+    lo = _pend(f, "lo0", 0, NOW)
+    ls.set_floor(0)                                             # the lane ended while the aborts were on the wire
+    await LC.p_take(f, [lo], lambda: None)
+    assert [p.rid for p in f.queue] == ["lo0"] and not f._lane_ctl_obj.held and lo.lane_p_taken is False
+
+
+@_on
+async def test_a_take_abort_that_fails_is_counted_and_the_leg_is_kept_all_the_same(caplog):
+    f = _front("P")
+    f._lane_state().set_floor(1)
+    _note(f, "hi", 1)
+
+    async def bad(g, path, body, timeout):
+        return 500, "no"
+    f.rpc = bad
+    lo = _pend(f, "lo0", 0, NOW)
+    assert await LC.p_take(f, [lo], lambda: None) == 1
+    assert f.counters["lane_p_take_abort_failed"] == 1 and len(f._lane_ctl_obj.held) == 1
+    assert any("abort on P failed" in r.getMessage() for r in caplog.records)
+
+
+def _p_hold_group(group):
+    """P that keeps every leg until released; ``/abort_request`` is only recorded (the leg is the front's to cancel)."""
+    group.hold = {}
+    return group
+
+
+@_e2e
+async def test_e2e_lane1_during_a_lane0_p_prefill_runs_through_the_p_to_d_flip_and_the_taken_leg_prefills_again(caplog):
+    """The plan's 'Spur 1 waehrend P-Prefill' through the P->D flip and the floor fall (review FR1 finding 1):
+    lane 0 LONG held on P, lane 1 LONG arrives -> the floor RPC, the lane runs beside the held leg, only the held
+    leg is left -> it is taken off P by rid BEFORE the flip (no W3), the flip goes through, the lane runs on D,
+    the floor falls, the taken leg is queued by its original arrival, flips back to P and finishes."""
+    caplog.set_level(logging.INFO, logger="weg2.front")
+    async with LaneHarness(awake="P", d_bs=4, tp_prefill_max_tokens=1000, p_phase_max_requests=6,
+                           d_wait_bound_s=0.4, idle_layout="D") as h:
+        h.p.hold = {}
+        h.d.hold = {}
+        lo = h.post_lane("lo", chars=9000)                      # LONG lane 0: P prefills it
+        assert await _until(lambda: h.p.running, 10)
+        lo_rid = next(iter(h.p.running))
+        hi = h.post_lane("hi", priority=1, chars=9000)          # LONG lane 1
+        assert await _until(lambda: "gen:hi" in h.p.timeline, 10)   # dispatched beside the held leg
+        assert {"floor": 1, "epoch": 1} in h.p.floor_bodies
+        h.p.release("hi")                                       # the lane's own leg 1 ends
+        # only the held leg is left in the pool: it is taken off P (abort by rid) and the P->D flip follows
+        assert await _until(lambda: h.front._lane_ctl_obj.held or h.front.counters["lane_p_taken"], 15)
+        assert h.front.counters["lane_p_taken"] == 1
+        assert "rpc:abort_request" in h.p.timeline
+        assert await _until(lambda: "gen:hi" in h.d.timeline, 20)   # the flip went through: hi runs on D
+        assert not any("W3" in r.getMessage() and "STOP" in r.getMessage() for r in caplog.records)
+        assert h.front.state == "serving" and lo_rid not in h.front._d_parked
+        assert not lo.done()
+        h.d.release("hi")
+        await asyncio.wait_for(hi, 10)
+        # the floor falls: the taken leg is queued again (original arrival) and the front goes back to P for it
+        assert await _until(lambda: h.front._lane_state().lane_floor == 0, 10)
+        assert await _until(lambda: h.p.gen_marks.count("lo") == 2, 30)     # its leg 1 runs on P again
+        h.p.release_all()
+        h.d.release_all()
+        (s, _) = await asyncio.wait_for(lo, 30)
+        assert s == 200
+        assert h.front.counters["lane_p_taken"] == 1
+
+
+# ------------------------------------------------------------------ review FR1: waiters, X-SOLO, SK under the lane filter
+def _asr_front():
+    """A front with D awake and one seat, for ``_arrival_seat_wait`` (the seat is 'taken' by a flag)."""
+    f = _front("D")
+    f.d_bs = 1
+    f._d_phase_n = 1
+    f.d_wait_bound_s = 60.0
+    f.t_awake = time.time() - 1.0
+    f.__dict__["_seat_taken"] = 1
+
+    def taken():
+        return f.__dict__["_seat_taken"], 1
+    f._arrival_seat_taken = taken
+
+    async def kv(est, max_tokens, rid, uncached):
+        return True, "kv ok", 0
+    f._arrival_seat_kv = kv
+    return f
+
+
+@_on
+async def test_an_arrival_seat_waiter_below_the_floor_takes_no_seat_counts_no_clock_and_keeps_its_place(caplog):
+    """Review L4 FR1 finding 2: a lane-0 SHORT already in ``_arrival_seat_wait`` when the preempt hits is held --
+    out of ``waiters`` (no wait bound, no head, no displacement victim), never granted the freed seat; it re-enters
+    with its ORIGINAL order stamp and the held time as clock offset."""
+    caplog.set_level(logging.INFO, logger="weg2.front")
+    f = _asr_front()
+    st = f._asr_st()
+    _note(f, "lo", 0)
+    _note(f, "lo2", 0)
+    w = asyncio.ensure_future(f._arrival_seat_wait("lo", 100, None, 100))
+    await asyncio.sleep(0.2)
+    stamp = st["waiters"]["lo"]
+    w2 = asyncio.ensure_future(f._arrival_seat_wait("lo2", 100, None, 100))   # a NEWER lane-0 waiter
+    await asyncio.sleep(0.1)
+    assert await _arrive(f, "hi", 1) is None                  # the floor rises
+    lc = f._lane_ctl_obj
+    assert await _until(lambda: set(lc.waiter_held) == {"lo", "lo2"}, 5)     # held at each waiter's next tick
+    assert "lo" not in st["waiters"] and "lo2" not in st["waiters"] and set(lc.waiter_held) == {"lo", "lo2"}
+    assert lc.waiter_held["lo"][0] == stamp                    # the original order stamp is kept
+    assert f._asr_waiter_clocks(st) == []                      # no wait clock for the bound
+    assert f.counters["lane_waiter_held"] == 2 and not w.done() and not w2.done()
+    f.__dict__["_seat_taken"] = 0                              # a seat frees up (the lane-1 request has not taken it)
+    await asyncio.sleep(0.3)
+    assert not w.done() and not w2.done() and not st["granted"]    # held waiters never take the freed seat
+    assert set(f.__dict__["_lane_ctl_obj"].waiter_held) == {"lo", "lo2"}
+    f.__dict__["_seat_taken"] = 1
+    f._lane_end("hi")
+    await LC.reconcile(f, "end")                               # the floor falls: both re-enter, 'lo' first
+    assert await _until(lambda: set(st["waiters"]) == {"lo", "lo2"}, 5)
+    assert sorted(st["waiters"], key=st["waiters"].get) == ["lo", "lo2"] and st["waiters"]["lo"] == stamp
+    off = st["lane_off"]["lo"]
+    assert off >= 0.3 and f._asr_waiter_clocks(st)[0] == pytest.approx(stamp + off)
+    assert "WEG2 LANE-RESUME" in " ".join(r.getMessage() for r in caplog.records)
+    assert any("waiters=2" in r.getMessage() for r in caplog.records)
+    f.__dict__["_seat_taken"] = 0
+    assert await asyncio.wait_for(w, 3) is True                # the OLDEST waiter is granted first
+    assert not w2.done() or st["granted"].get("lo") is not None
+    f.__dict__["_seat_taken"] = 1
+    w2.cancel()
+    await asyncio.gather(w2, return_exceptions=True)
+    assert "lo2" not in lc.waiter_held and "lo2" not in st.get("lane_off", {})
+
+
+@_on
+async def test_a_held_waiter_that_leaves_takes_its_registers_with_it():
+    f = _asr_front()
+    _note(f, "lo", 0)
+    w = asyncio.ensure_future(f._arrival_seat_wait("lo", 100, None, 100))
+    await asyncio.sleep(0.1)
+    assert await _arrive(f, "hi", 1) is None
+    await asyncio.sleep(0.2)
+    assert "lo" in f._lane_ctl_obj.waiter_held
+    w.cancel()
+    await asyncio.gather(w, return_exceptions=True)
+    assert "lo" not in f._lane_ctl_obj.waiter_held and "lo" not in f._asr_st()["waiters"]
+    assert f._lane_block()["lane_hold"]["waiters"] == 0
+
+
+@_on
+async def test_a_waiter_released_from_the_gate_keeps_the_original_arrival_as_its_order_and_the_hold_as_offset():
+    f = _asr_front()
+    _note(f, "lo", 0)
+    lc = LC.ctl(f)
+    lc.gate_done["lo"] = (NOW - 100.0, 7.0)
+    w = asyncio.ensure_future(f._arrival_seat_wait("lo", 100, None, 100))
+    await asyncio.sleep(0.1)
+    st = f._asr_st()
+    assert st["waiters"]["lo"] == NOW - 100.0 and st["lane_off"]["lo"] == 7.0
+    w.cancel()
+    await asyncio.gather(w, return_exceptions=True)
+
+
+def test_arrival_seat_waiter_clocks_are_the_raw_stamps_with_the_switch_off():
+    f = _front("D")
+    st = f._asr_st()
+    st["waiters"].update({"a": 5.0, "b": 9.0})
+    assert f._asr_waiter_clocks(st) == [5.0, 9.0]
+    with _switch(False):
+        assert LC.waiter_hold(f, st, "a") is False and "_lane_ctl_obj" not in f.__dict__
+
+
+@_on
+async def test_x_solo_decides_p_for_a_band_request_below_a_floor_that_rose_inside_its_window():
+    f = _front("D")
+    f.tp_prefill_max_tokens = X
+    _note(f, "lo", 0)
+    with _env("SGLANG_WEG2_X_SOLO_WINDOW_MS", "300"):
+        t = asyncio.ensure_future(f._x_solo_admits("lo", 5000))
+        await asyncio.sleep(0.1)
+        f._lane_state().set_floor(1)                          # no arrival counted in the window: only the floor
+        assert await asyncio.wait_for(t, 3) is False          # P (queue, then the lane sweep holds it)
+        _note(f, "hi", 1)
+        t2 = asyncio.ensure_future(f._x_solo_admits("hi", 5000))
+        assert await asyncio.wait_for(t2, 3) is True          # the lane itself is a singleton as before
+
+
+@_on
+async def test_short_kept_requests_below_the_floor_are_held_in_queue_and_ready_and_come_back_by_arrival():
+    f = _front("D")
+    sk_q = _pend(f, "sk_q", 0, NOW - 30, short_kept=True)
+    sk_d = _pend(f, "sk_d", 0, NOW - 40, short_kept=True, d_direct=True, skip_leg1=True)
+    f.queue.append(sk_q)
+    f._ready_for_d.append(sk_d)
+    f._sync_batch_gate()
+    assert await _arrive(f, "hi", 1) is None
+    assert list(f.queue) == [] and list(f._ready_for_d) == [] and f._batch_gate.is_set()
+    lc = f._lane_ctl_obj
+    assert sorted(h.p.rid for h in lc.held.values()) == ["sk_d", "sk_q"]
+    f._lane_end("hi")
+    await LC.reconcile(f, "end")
+    assert [p.rid for p in f.queue] == ["sk_q"] and [p.rid for p in f._ready_for_d] == ["sk_d"]
+    assert sk_q.short_kept and sk_d.d_direct and sk_q.t_arrive == NOW - 30
+
+
+# ------------------------------------------------------------------ review FR1: lane 1 during a lane-0 D prefill (X route)
+@_e2e
+async def test_e2e_lane1_during_a_lane0_d_prefill_on_the_x_route_parks_it_runs_alone_and_the_parked_resume(caplog):
+    """The plan's fourth scenario (review FR1 finding 3): a lane-0 SHORT (uncached <= X) is prefilled by D itself
+    (ARRIVAL-SEAT verdict d_prefill / the X route, no leg 1, no flip); lane 1 arrives while that prefill runs."""
+    caplog.set_level(logging.INFO, logger="weg2.front")
+    async with LaneHarness(awake="D", d_bs=4, tp_prefill_max_tokens=100_000) as h:
+        h.d.hold = {}
+        lo = h.post_lane("lo", chars=300)
+        assert await _until(lambda: len(h.d.running) == 1, 10)
+        lo_rid = next(iter(h.d.running))
+        # the route really was the X route: D prefills it itself (no leg 1 on P), the verdict is logged
+        assert "lo" not in h.p.gen_marks
+        assert any(("verdict=d_prefill" in r.getMessage() and lo_rid in r.getMessage())
+                   or ("WEG2-ROUTE rid=%s SHORT" % lo_rid) in r.getMessage() for r in caplog.records), \
+            [r.getMessage()[:120] for r in caplog.records if lo_rid in r.getMessage()][:12]
+        hi = h.post_lane("hi", priority=1, chars=300)
+        assert await _until(lambda: "gen:hi" in h.d.timeline, 10)
+        assert h.d.park_bodies[0]["rids"] == [lo_rid] and h.d.park_bodies[0]["hold"] == "lane"
+        assert h.d.timeline.index("rpc:weg2/park_running") < h.d.timeline.index("gen:hi")
+        assert h.front._d_parked[lo_rid] == PP.LANE_PARK_STAMP and h.front.state == "serving"
+        assert not lo.done() and "hi" not in h.p.gen_marks
+        h.d.release("hi")
+        await asyncio.wait_for(hi, 10)
+        assert await _until(lambda: h.front._lane_state().lane_floor == 0 and lo_rid not in h.front._d_parked, 10)
+        h.d.release_all()
+        (s, _) = await asyncio.wait_for(lo, 10)
+        assert s == 200 and h.d.gen_marks.count("lo") == 1     # a resume, never a second prefill
+
+
+@_e2e
+async def test_e2e_a_lane0_arrival_seat_waiter_is_not_granted_the_seat_the_lane1_park_frees(caplog):
+    """Review FR1 finding 2 end to end, on a bs1 D: lo1 runs, lo2 waits for the seat (ARRIVAL-SEAT), lane 1 arrives.
+    lo1 is parked and gives its seat back; lo2 must NOT take it (priority inversion) -- the lane-1 request does,
+    and after it the lane-0 requests resume in the order of their arrival."""
+    caplog.set_level(logging.INFO, logger="weg2.front")
+    async with LaneHarness(awake="D", d_bs=1, tp_prefill_max_tokens=100_000, d_wait_bound_s=60.0) as h:
+        h.d.hold = {}
+        lo1 = h.post_lane("lo1", chars=300)
+        assert await _until(lambda: len(h.d.running) == 1, 10)
+        lo2 = h.post_lane("lo2", chars=300)
+        assert await _until(lambda: bool(h.front._asr_st()["waiters"]), 10)       # lo2 waits for the seat
+        hi = h.post_lane("hi", priority=1, chars=300)
+        assert await _until(lambda: "gen:hi" in h.d.timeline, 15)
+        assert "gen:lo2" not in h.d.timeline                    # the freed seat went to the lane
+        assert await _until(lambda: len(h.front._lane_ctl_obj.waiter_held) == 1, 5)     # held at its next tick
+        assert "gen:lo2" not in h.d.timeline and not h.front._asr_st()["waiters"]
+        h.d.release("hi")
+        await asyncio.wait_for(hi, 10)
+        assert await _until(lambda: h.front._lane_state().lane_floor == 0, 10)
+        h.d.release_all()
+        res = await asyncio.wait_for(asyncio.gather(lo1, lo2), 20)
+        assert [s for s, _ in res] == [200, 200]
+        assert h.d.timeline.index("gen:hi") < h.d.timeline.index("gen:lo2")
+        assert h.d.gen_marks.count("lo1") == 1 and h.d.gen_marks.count("lo2") == 1

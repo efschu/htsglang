@@ -24,8 +24,14 @@ WHERE A REQUEST BELOW THE FLOOR WAITS (never anywhere the rest of the controller
   * running on D: parked by ``POST /weg2/park_running`` for exactly those rids with ``hold="lane"``
     (:func:`phase_policy.lane_park_body`); in the front's book ``_d_parked`` with a stamp that never lapses
     (:data:`phase_policy.LANE_PARK_STAMP`: no 30-s PARK-LAPSED, ``_flip_ledger`` excludes it);
-  * in flight on P: the floor RPC alone (L3 parks it at the chunk border); the front counts such a leg as held
-    (not against the pool plan, not for the P->D drain, not as a stall).
+  * in flight on P: the floor RPC (L3 parks it at the chunk border); the front counts such a leg as held (not
+    against the pool plan, not for the P->D drain, not as a stall).  When only held legs are left in the drain
+    pool they are TAKEN OFF P (:func:`p_take`: ``/abort_request`` by rid, KV of the finished chunks stays in P's
+    tree) and kept in ``held`` like any waiting Pending: a leg parked in P's waiting queue would make the P->D
+    witness read "rank not idle" (W3) and nothing would run it after the floor fell;
+  * waiting for a D seat in ARRIVAL-SEAT (``_arrival_seat_wait``): the waiter takes itself out of
+    ``st["waiters"]`` (:func:`waiter_hold`) and re-enters with its ORIGINAL order stamp and the held time as its
+    clock offset.
 
 CLOCKS (user decision 1): a held request keeps its ORIGINAL arrival (``Pending.t_arrive``: ordering, "oldest
 first") and the time it was held is ``Pending.lane_held_s``; every wait clock (``d_wait_bound_s``, ARRIVAL-SEAT
@@ -67,6 +73,9 @@ KEPT = 4096
 #: the SSE comment a held stream gets (L4 -> client; an SSE comment line starts with ':' and is ignored by every
 #: SSE reader, owui_proxy.py:215 skips every line that is not 'data:')
 KEEPALIVE_FMT = ": lane-hold floor=%d\n\n"
+
+#: a held P leg taken off P before the P->D flip (L4 only, not an L1 name)
+MARK_P_TAKE = "WEG2 LANE-P-TAKE"
 
 
 def enabled() -> bool:
@@ -116,6 +125,11 @@ class LaneCtl:
         self.held: "collections.OrderedDict[int, Held]" = collections.OrderedDict()
         #: rid -> the real time D confirmed the lane park (``_d_parked`` carries the never-lapsing stamp)
         self.parked_d: Dict[str, float] = {}
+        #: rid -> real time the front BOOKED a lane park for a dormant (asleep) D request that D never confirmed;
+        #: confirmed by a park RPC after the P->D wake (:func:`_park_d`), then it moves to ``parked_d``
+        self.dormant: Dict[str, float] = {}
+        #: rid -> (order stamp, time held): an ARRIVAL-SEAT waiter held below the floor
+        self.waiter_held: Dict[str, Tuple[float, float]] = {}
         self.gates: Dict[str, Gate] = {}
         #: rid -> (t_arrive of the first arrival, seconds held at the gate), read once at the Pending's creation
         self.gate_done: "collections.OrderedDict[str, Tuple[float, float]]" = collections.OrderedDict()
@@ -149,6 +163,8 @@ class LaneCtl:
         """The rid's handler ended: it leaves every register."""
         r = str(rid)
         self.parked_d.pop(r, None)
+        self.dormant.pop(r, None)
+        self.waiter_held.pop(r, None)
         self.streams.pop(r, None)
         self.gates.pop(r, None)
         self.gate_done.pop(r, None)
@@ -279,6 +295,7 @@ async def _preempt(fr: Any, lc: LaneCtl, ls: Any, prev: int, floor: int, cause: 
     t0 = time.time()
     ls.set_floor(floor)
     held = _hold_waiting(fr, lc, floor, t0)
+    dorm0 = fr.counters["lane_parked_d_dormant"]
     P, D = fr.groups["P"], fr.groups["D"]
     parked_p = [r for r in list(P.outstanding) if ls.lane_for(r) < floor]
     res = await asyncio.gather(_park_d(fr, lc, ls, floor), sync_floor(fr, force=True), return_exceptions=True)
@@ -289,11 +306,12 @@ async def _preempt(fr: Any, lc: LaneCtl, ls: Any, prev: int, floor: int, cause: 
     fr.counters["lane_preempt"] += 1
     fr.counters["lane_held"] += held
     logger.warning(
-        "%s floor=%d epoch=%d parked_d=%d parked_p=%d held=%d prev_floor=%d cause=%s rid=%s ms=%.0f -- a higher "
-        "lane displaces every lower one: D's running requests of lower lanes are parked (hold=lane), P's legs "
-        "stop at the chunk border (floor RPC), waiting ones are held out of queue/_ready_for_d (original "
-        "arrival kept)", _ln.MARK_PREEMPT, floor, ls.lane_epoch, parked_d, len(parked_p), held, prev, cause,
-        rid or "-", (time.time() - t0) * 1000.0)
+        "%s floor=%d epoch=%d parked_d=%d parked_p=%d held=%d dormant=%d prev_floor=%d cause=%s rid=%s ms=%.0f -- "
+        "a higher lane displaces every lower one: D's running requests of lower lanes are parked (hold=lane), "
+        "P's legs stop at the chunk border (floor RPC), waiting ones are held out of queue/_ready_for_d (original "
+        "arrival kept); dormant = booked for a sleeping D, confirmed by a park RPC after its wake",
+        _ln.MARK_PREEMPT, floor, ls.lane_epoch, parked_d, len(parked_p), held,
+        fr.counters["lane_parked_d_dormant"] - dorm0, prev, cause, rid or "-", (time.time() - t0) * 1000.0)
     fr._kick_controller("arrival")
     _changed(fr)
 
@@ -320,7 +338,8 @@ def _release_seats(fr: Any, rids: Iterable[str]) -> int:
 
 
 async def _park_d(fr: Any, lc: LaneCtl, ls: Any, floor: int, retry: bool = False) -> int:
-    """Park D's open requests below ``floor`` for the lane.  Returns how many D confirmed."""
+    """Park D's open requests below ``floor`` for the lane.  Returns how many D confirmed (0 with D asleep:
+    the dormant bookings are unconfirmed until the first park RPC after the wake)."""
     if lc.park_unsupported:
         return 0
     D = fr.groups["D"]
@@ -329,19 +348,22 @@ async def _park_d(fr: Any, lc: LaneCtl, ls: Any, floor: int, retry: bool = False
         return 0
     if fr.awake != "D":
         # D sleeps (P phase): what it still holds is parked / held dormant already -- the park RPC has nothing to
-        # take off a batch and a sleeping group cannot be asked for it.  The front books the hold; D learns the
-        # floor with the wake message and the floor RPC right after the wake (stragglers are re-parked by rid).
+        # take off a batch and a sleeping group cannot be asked for it.  The front BOOKS the hold (``dormant``:
+        # out of the flip ledger, no 30-s lapse, no seat) but it is UNCONFIRMED: D never acknowledged it, and the
+        # wake message cannot carry it (``ResumeMemoryOccupationReqInput`` ignores unknown keys).  After the P->D
+        # wake the lane loop finds these rids in D's ledger and not in ``parked_d`` and sends the park RPC by
+        # rid (this function, awake branch); only D's answer moves them to ``parked_d``.
+        fresh = [r for r in rids if r not in lc.dormant]
         t_park = time.time()
-        for r in rids:
-            lc.parked_d[r] = t_park
+        for r in fresh:
+            lc.dormant[r] = t_park
             fr._d_parked[r] = _pp.LANE_PARK_STAMP
             lc.mark_held(r)
             fr._req_book().park(r, t_park, f"lane:{floor}", fr.epoch)
-        _release_seats(fr, rids)
-        fr._park_stuck().hold(rids)  # after the seat release: Seat.release ends the rid's park streak
-        fr.counters["lane_parked_d"] += len(rids)
-        fr.counters["lane_parked_d_dormant"] += len(rids)
-        return len(rids)
+        _release_seats(fr, fresh)
+        fr._park_stuck().hold(fresh)  # after the seat release: Seat.release ends the rid's park streak
+        fr.counters["lane_parked_d_dormant"] += len(fresh)
+        return 0
     body = _pp.lane_park_body(fr.epoch, rids, floor, ls.lane_epoch)
     t_park = time.time()
     try:
@@ -368,20 +390,22 @@ async def _park_d(fr: Any, lc: LaneCtl, ls: Any, floor: int, retry: bool = False
         if r not in D.outstanding:
             continue
         if ls.lane_for(r) < floor:
+            lc.dormant.pop(r, None)  # a dormant booking D confirms now (counted as booked when it was made)
+            n += 1
             lc.parked_d[r] = t_park
             fr._d_parked[r] = _pp.LANE_PARK_STAMP
             lc.mark_held(r)
             fr._req_book().park(r, t_park, f"lane:{floor}", fr.epoch)
-            n += 1
         else:
             # a D that ignores the ``rids`` filter parked a request of the floor lane too: it is a plain park
             # for the front (it resumes with the next wake), and the floor lane is not displaced on purpose.
             fr._d_parked[r] = t_park
             over.append(r)
-    if n:
-        mine = [r for r in got if r in lc.parked_d]
+    mine = [r for r in got if r in lc.parked_d]
+    if mine:
         _release_seats(fr, mine)
         fr._park_stuck().hold(mine)  # after the seat release: Seat.release ends the rid's park streak
+    if n:
         fr.counters["lane_parked_d"] += n
     if over:
         fr.counters["lane_park_overreach"] += len(over)
@@ -435,11 +459,9 @@ async def sync_floor(fr: Any, force: bool = False, now: Optional[float] = None) 
     await asyncio.gather(*(one(g) for g in todo))
 
 
-async def _resume(fr: Any, lc: LaneCtl, ls: Any, prev: int, floor: int, cause: str) -> None:
-    """LANE-EMPTY: no open request of the old floor lane is left; the floor falls to the highest lane with work."""
-    t0 = time.time()
-    ls.set_floor(floor)
-    # 1. held waiting Pendings of the new floor lane, back in the order of their ORIGINAL arrival
+def _restore_held(fr: Any, lc: LaneCtl, floor: int, now: float) -> Tuple[int, int]:
+    """Put every held Pending of lane >= ``floor`` back into ``queue`` / ``_ready_for_d`` in the order of its
+    ORIGINAL arrival (``t_arrive``); the time it was held becomes its clock offset.  Returns (queue, ready)."""
     back: Dict[str, List[Any]] = {"queue": [], "ready": []}
     for k, h in list(lc.held.items()):
         p = h.p
@@ -449,8 +471,13 @@ async def _resume(fr: Any, lc: LaneCtl, ls: Any, prev: int, floor: int, cause: s
             continue
         if lane_of_pending(p) >= floor:
             lc.held.pop(k, None)
-            p.lane_held_s = float(getattr(p, "lane_held_s", 0.0) or 0.0) + max(0.0, t0 - h.t_held)
+            p.lane_held_s = float(getattr(p, "lane_held_s", 0.0) or 0.0) + max(0.0, now - h.t_held)
             p.lane_state = "resuming"
+            if p.lane_p_taken:
+                # a leg taken off P prefills again (the chunks it finished are P's prefix hit); a request that
+                # waited in ``_ready_for_d`` with its leg 1 DONE keeps ``leg1_done``
+                p.lane_p_taken = False
+                p.leg1_done = False
             back[h.where].append(p)
     n_q = n_r = 0
     for dq, where in ((fr.queue, "queue"), (fr._ready_for_d, "ready")):
@@ -464,14 +491,27 @@ async def _resume(fr: Any, lc: LaneCtl, ls: Any, prev: int, floor: int, cause: s
             fr._sync_batch_gate()
         else:
             n_q = len(back[where])
+    ids = [p.rid for p in back["queue"] + back["ready"]]
+    if ids:
+        fr._park_stuck().release(ids)
+    return n_q, n_r
+
+
+async def _resume(fr: Any, lc: LaneCtl, ls: Any, prev: int, floor: int, cause: str) -> None:
+    """LANE-EMPTY: no open request of the old floor lane is left; the floor falls to the highest lane with work."""
+    t0 = time.time()
+    ls.set_floor(floor)
+    # 1. held waiting Pendings of the new floor lane, back in the order of their ORIGINAL arrival
+    n_q, n_r = _restore_held(fr, lc, floor, t0)
     # 2. D's lane parks of the new floor lane end (D requeues them in arrival order on the floor RPC below)
-    rel = [r for r in list(lc.parked_d) if ls.lane_for(r) >= floor]
+    rel = [r for r in list(lc.parked_d) + [r for r in lc.dormant if r not in lc.parked_d]
+           if ls.lane_for(r) >= floor]
     for r in rel:
         lc.parked_d.pop(r, None)
+        lc.dormant.pop(r, None)
         fr._d_parked.pop(r, None)
-    resumed_ids = [p.rid for p in back["queue"] + back["ready"]] + rel
-    if resumed_ids:
-        fr._park_stuck().release(resumed_ids)
+    if rel:
+        fr._park_stuck().release(rel)
     if rel:
         fr._rb_resume(rel, "lane_resume")
         fr.counters["lane_resumed_d"] += len(rel)
@@ -479,13 +519,17 @@ async def _resume(fr: Any, lc: LaneCtl, ls: Any, prev: int, floor: int, cause: s
     await sync_floor(fr, force=True)
     # 4. new arrivals of the lane last (the gate releases after the parked)
     n_gate = _release_gates(fr, lc, floor)
-    resumed = n_q + n_r + len(rel) + n_gate
+    # ARRIVAL-SEAT waiters of the lane re-enter ``waiters`` on their next tick (:func:`waiter_hold`), by their
+    # ORIGINAL order stamp -- before every newer waiter, like the parked
+    n_wait = sum(1 for r in lc.waiter_held if ls.lane_for(r) >= floor)
+    resumed = n_q + n_r + len(rel) + n_gate + n_wait
     fr.counters["lane_resume"] += 1
     logger.warning(
-        "%s floor=%d->%d epoch=%d resumed=%d held_back=%d parked_d=%d gate=%d cause=%s ms=%.0f -- no request of "
-        "lane %d is left: the floor falls to the highest lane with work; its parked requests run first, with "
-        "their original arrival, the arrivals held at the gate after them", _ln.MARK_RESUME, prev, floor,
-        ls.lane_epoch, resumed, n_q + n_r, len(rel), n_gate, cause, (time.time() - t0) * 1000.0, prev)
+        "%s floor=%d->%d epoch=%d resumed=%d held_back=%d parked_d=%d gate=%d waiters=%d cause=%s ms=%.0f -- no "
+        "request of lane %d is left: the floor falls to the highest lane with work; its parked requests run "
+        "first, with their original arrival, the arrivals held at the gate after them", _ln.MARK_RESUME, prev,
+        floor, ls.lane_epoch, resumed, n_q + n_r, len(rel), n_gate, n_wait, cause,
+        (time.time() - t0) * 1000.0, prev)
     fr._kick_controller("arrival")
     _changed(fr)
 
@@ -580,6 +624,89 @@ def lane_held_leg(fr: Any, p: Any) -> bool:
     return enabled() and p_held(fr, lane_of_pending(p))
 
 
+async def p_take(fr: Any, items: List[Any], cancel: Callable[[], Any]) -> int:
+    """The P drain pool's ONLY legs left are held for a higher lane: take them OFF P before the P->D flip.
+
+    Why: L3 parks such a leg at the chunk border into P's waiting queue, and ``is_fully_idle`` still asks an empty
+    waiting queue -- the flip's witness reads "front drained, rank NOT idle" and W3 stops; and after the floor
+    fell nothing would run the leg again (the D phase flips back to P only for a queue entry).  So: mark the
+    Pendings (``lane_p_taken``: their ``one`` tasks end un-prefilled, no failure answer, no hand-off), cancel the
+    tasks, ``/abort_request`` by rid on P (every PP rank drops it; the KV of the chunks already finished stays in
+    P's radix tree, the later prefill is a prefix hit -- L3's park contract, proven by L5), and keep the
+    Pendings in ``held`` with their original arrival.  Returns how many were taken."""
+    lc = ctl(fr)
+    ls = fr._lane_state()
+    P = fr.groups["P"]
+    now = time.time()
+    for p in items:
+        p.lane_p_taken = True
+    cancel()
+    rids = [p.rid for p in items]
+    res = await asyncio.gather(*(fr.rpc(P, "/abort_request", {"rid": r}, 30) for r in rids), return_exceptions=True)
+    bad = []
+    for r, x in zip(rids, res):
+        if isinstance(x, BaseException) or (isinstance(x, tuple) and x[0] != 200):
+            bad.append(r)
+    if bad:
+        fr.counters["lane_p_take_abort_failed"] += len(bad)
+        logger.warning("WEG2 LANE-P-TAKE abort on P failed for rids=%s -- the leg may stay in P's queue (the "
+                       "flip's witness decides)", bad[:8])
+    n = 0
+    for p in items:
+        fut = getattr(p, "fut", None)
+        if p.client_gone or (fut is not None and fut.done()):
+            continue
+        p.lane_state = "held"
+        p.leg1_done = False
+        lc.held[id(p)] = Held(p, "queue", now)
+        lc.mark_held(p.rid)
+        n += 1
+    if rids:
+        fr._park_stuck().hold(rids)
+    fr.counters["lane_p_taken"] += n
+    logger.warning("%s rid=%s floor=%d epoch=%d n=%d abort_failed=%d -- only legs held for a higher lane were left "
+                   "in the P drain: taken off P by rid before the P->D flip (a leg parked in P's waiting queue "
+                   "is not idle for the witness), kept with their original arrival for the lane resume",
+                   MARK_P_TAKE, ",".join(rids[:8]), ls.lane_floor, ls.lane_epoch, n, len(bad))
+    # the floor may have fallen while the aborts were on the wire: nothing else would resume them then
+    _restore_held(fr, lc, ls.lane_floor, time.time())
+    _changed(fr)
+    return n
+
+
+def waiter_hold(fr: Any, st: Dict[str, Any], rid: str) -> bool:
+    """ARRIVAL-SEAT waiter ``rid`` (its ``_arrival_seat_wait`` loop, once per tick): True = the lane holds it.
+
+    A waiter below the floor takes itself out of ``st["waiters"]`` -- the head choice, the backfill order, the
+    wait bound, the displacement victim all read that dict -- and may not be granted a seat.  It re-enters with
+    its ORIGINAL order stamp (before every newer waiter), and the time it was held is its clock offset
+    (``st["lane_off"]``, read by ``Front._asr_waiter_clocks``): held time counts against no bound.  Returns
+    False (and does nothing) with the switch off."""
+    if not enabled():
+        return False
+    ls = fr._lane_state()
+    lc = ctl(fr)
+    waiters = st["waiters"]
+    now = time.time()
+    if ls.lane_floor > 0 and ls.lane_for(rid) < ls.lane_floor:
+        if rid in waiters:
+            lc.waiter_held[rid] = (waiters.pop(rid), now)
+            st.setdefault("fits", {}).pop(rid, None)
+            st.setdefault("age_plan", {}).pop(rid, None)
+            lc.mark_held(rid)
+            fr.counters["lane_waiter_held"] += 1
+            logger.info("WEG2 LANE-WAITER-HOLD rid=%s lane=%d floor=%d epoch=%d -- an ARRIVAL-SEAT waiter below the "
+                        "floor takes no seat, counts for no wait clock and displaces nobody", rid, ls.lane_for(rid),
+                        ls.lane_floor, ls.lane_epoch)
+        return True
+    got = lc.waiter_held.pop(rid, None)
+    if got is not None:
+        waiters[rid] = got[0]
+        off = st.setdefault("lane_off", {})
+        off[rid] = float(off.get(rid, 0.0)) + max(0.0, now - got[1])
+    return False
+
+
 # ---------------------------------------------------------------------------
 # keepalive
 # ---------------------------------------------------------------------------
@@ -631,6 +758,8 @@ async def step(fr: Any, now: Optional[float] = None) -> None:
     await reconcile(fr, "tick")
     ls = fr._lane_state()
     lc = ctl(fr)
+    if lc.held:
+        _restore_held(fr, lc, ls.lane_floor, now)  # a hold whose lane the floor no longer exceeds goes back
     if fr.state == "serving":
         if ls.lane_floor > 0 or lc.acked.get("P") or lc.acked.get("D"):
             await sync_floor(fr, now=now)
@@ -672,10 +801,12 @@ def hold_block(fr: Any) -> Dict[str, Any]:
     if lc is None:
         return {}
     ls = fr._lane_state()
-    if not (lc.held or lc.parked_d or lc.gates or lc.reprefill or ls.lane_floor > 0):
+    if not (lc.held or lc.parked_d or lc.dormant or lc.waiter_held or lc.gates or lc.reprefill
+            or ls.lane_floor > 0):
         return {}
     return {"lane_hold": {
-        "held": len(lc.held), "parked_d": len(lc.parked_d), "gate": len(lc.gates),
+        "held": len(lc.held), "parked_d": len(lc.parked_d), "dormant": len(lc.dormant),
+        "waiters": len(lc.waiter_held), "gate": len(lc.gates),
         "reprefill": len(lc.reprefill),
         "acked": {k: list(v) for k, v in sorted(lc.acked.items())},
         "unsupported": sorted(lc.unsupported) + (["park"] if lc.park_unsupported else []),
