@@ -1,5 +1,10 @@
 # htsglang container images
 
+> **This project is now called fLLiper (release 0.1.0).** htsglang is dormant: the container files below are kept as they are for the
+> published tag `htsglang:cu130-nccl2307` and for readers of the old history. New work, the renamed package `flliper`, the pdflip
+> release and the Duo image (`ghcr.io/efschu/flliper:0.1.0-cu130`, **not published yet**) are described in the repository's top-level
+> `README.md` and in `docker/flliper/README.md`. The product layer (`HTSGLANG_*`, `/opt/htsglang`, `/var/lib/htsglang`) is unchanged in 0.1.0.
+
 Everything in this document is preparation. Nothing here has been built or run
 — the numbers that come from measurement are marked as such, the rest is
 derived from the code and the wheels.

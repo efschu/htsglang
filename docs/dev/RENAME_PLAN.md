@@ -801,3 +801,68 @@ generator have drifted apart (the JSON carries `def="t2t"` selectors and the "Fl
 a regeneration would change panels this work package must not touch.  The transform is exact: the shipped JSON after the patch is a fixpoint of
 `dual_promql`, and the same expressions go through `make_dashboard.py` the next time somebody regenerates.  A kit re-run on a tree that already
 carries `(<old>|pdflip)_x` is not part of the flow (the kit runs on the old tree); the reader token comes from `names.STEM_TOKENS`, split there.
+
+## 8.19 F0-I, closing state of waves 1 to 4 (09.10.2026, both lines)
+
+Wave state (SHAs are the branch heads named in the plan `deskq/PLAN-RENAME-FLLIPER-1007.md`, 2b to 2e):
+
+| Wave | Packages | Result |
+|---|---|---|
+| 1 | F0-A kit into the tree, F0-B tools read both names, F0-C compat layer | ok; freeze 08.10. 06:20Z (27B `86ff356d0d`, NF `a452294dd2`) |
+| 2 | F0-D 27B `8aaa67e72c`, F0-E NF `ffea1c00ff` | ok (verify PASS, imports PASS, test set old = new modulo names) |
+| 3 | F0-F dashboard + catalog (`33006acfb2`, `021e9ebcbf`), F0-G profiles + container (`585c557cf4`, `3c4c119501`), F0-H post-freeze fixes NF (`10198b0310`, round 2 `88c368f44d`), F0-M metric names (`e6fc27c6d2`, `af0e4e17f3`) | ok, each with Opus review |
+| 4 | F0-I: one integration branch per line, final catalog, rest inventory, README, this section | `desk/flliper-27b-int-1008` @ 302bccbe62 + F0-I commit, `desk/flliper-nf-int-1008` @ 25fa77bff7 + F0-I commit |
+
+**Merge order and record.** Per line: F0-M first, then F0-F with the recipe of 8.18, then F0-G, on the NF line F0-H2 last (it contains F0-H).
+27B: F0-M, F0-F, F0-G: one conflict, `rig-verlauf.json` (recipe applied: `git checkout --ours`, `git add`, `git apply --index tools/release/data/f0m_f0f_merge_fix_1008.patch`; the file was not
+regenerated). NF: the same conflict with the same recipe (git's rerere offered the 27B resolution; the recipe was applied anyway, the NF patch file being the NF branch's own), and one more conflict
+at F0-H2, `catalog.json` (F0-H2's version taken, the file is rebuilt in the next step by rule). Each recipe step needed a `git add` of the file between `checkout --ours` and `apply --index` (the
+recipe text of 8.18 omits it).
+
+**The catalog is built once.** `tools/rig_dashboard/rigdash/profil_data/catalog.json` is the union of the two integration heads, built by the generator of the NF head (its curated table and edge
+catalog are the superset: the 27B `profile_catalog_curated.py` has no entry the NF one lacks, the NF one has 5 more `EXPLAINED` entries and edge K132):
+
+    git archive <27B head> python | tar -x -C <D27> ;  git archive <NF head> python | tar -x -C <DNF>
+    cd <NF worktree>/python && PYTHONPATH=. python3 -W ignore flliper/srt/pdflip/profile_catalog.py --tree-27b <D27>/python --tree-nf <DNF>/python \
+        --rev-27b 302bccbe62 --rev-nf 25fa77bff7 -o catalog_raw.json
+    python3 tools/release/catalog_order_merge_1008.py catalog_raw.json <previous catalog.json> catalog.json     # key order of the previous file, indent=1, ensure_ascii=False
+
+Two generator runs gave the same bytes. Result: 2704 entries (862 flags, 1827 envs): 119 curated, 309 explained, 1674 harvested, 602 unexplained; trees only-27B 180, only-NF 44, both 2462, differing 44; 132 edges (51 merged, 81 new, 25 without evidence); edge anchors 27B 119 unique / 12 near / 1 other-line / 0 problems, NF 78 / 10 / 44 other-line / 0 problems. Against the 27B F0-F catalog (2698 entries): +6 entries (the 5 NF `EXPLAINED` switches and `FLLIPER_PDFLIP_ENABLE_FORM_A_ADMIT_ROOM_FIRST`), none removed. Both lines ship these bytes (sha256 `6b8a4fb9e00c4d6a633284e2cc327c06034a8d6f229535c9786e3a4613e804f4`). K132 (`FLLIPER_PDFLIP_ENABLE_W3_SPILL_HOST_LEAVES` requires
+`FLLIPER_PDFLIP_ENABLE_W3_SPILL_ANCHOR_POOL`, trees `nf`) is in the catalog once; the 27B tree's own `kantenkatalog_1004.json` keeps its 131 edges and the pins of the edge tests stay per line (27B 131,
+NF 132): a pin counts the tree's own file, the catalog is the union.
+
+**Gates** (`pytest_gedeckelt.sh`, venv python, no GPU, HOME empty = state S0; load average of the box 16 to 19 during the runs). Integration head vs the renamed base of the line (base = `8aaa67e72c` / `ffea1c00ff`):
+
+| Set | 27B base | 27B int | NF base | NF int |
+|---|---|---|---|---|
+| kit test set (`tools/release/run_tests.sh`, 46 files + `test_compat_shims`) | 26 failed / 1193 passed / 14 skipped / 1 error | 26 / 1193 / 14 / 1 (same failing set) | 10 / 1162 / 9 / 3 errors | 11 / 1161 / 9 / 3 errors: the extra red is a timing test (`test_pdflip_front_loop_blockers_h78::test_a_real_prewarm_holds_the_loop_under_120_ms`), alone it passes (26 passed 29 s, base 26 passed 27 s) |
+| gateF set (planner, catalog, compat, hw-generic: 25 files, NF + `test_nf_n3_unchanged_1005`) | F0-D: 19 failed (17 on the pre-rename tree) | 19 failed / 483 passed / 8 skipped | 6 reds on 3 files, same names as int | 6 failed / 414 passed / 21 skipped |
+| dashboard suite (`COUPLINGS_TREE`, rigdash tests + `test_crossover_panel`) | F0-F: 1006 / 1 / 3 | 4 failed / 1007 passed | F0-F: 1010 / 0 / 5 | 4 failed / 1010 passed / 2 skipped |
+| own tests F0-M / F0-F / F0-G / F0-H (added files) | | 55 passed | | 137 passed / 5 skipped |
+
+Reading of the reds (none is new against the base, none is caused by the merge except where stated):
+
+* gateF, both lines: the planner dry-run goldens and `*_dry_run_equals_golden` tests need model / draft files and the reference NVML state that this box does not show; they are red on the pre-rename NF tree `c651892375` too (5 failed, same tests) and on the renamed bases. So **"NF golden diff 0" and "27B golden diff 0" cannot be shown green on this box**; the golden files themselves are those of F0-D / F0-E (byte-identical to the pipeline output). `test_release_dir_covers_the_named_profiles` expects the live profile names (known).
+* 27B gateF: `test_planer_nacharbeit_1006::test_the_cited_lines_hold_the_launcher_text` was **new red after the merge**: F0-F added 3 lines to `launcher.py` before the cited lines. Fixed by making the F0-F edit line-neutral (comment-only, `launcher.py` has 28787 lines before and after); the test passes (G5).
+* dashboard: 3 Playwright tests (`test_vram_balken_880`: browser executable missing), on 27B the live NF profile with old env names (`test_profil_balken_aph2_1006`, until the switch-over), on NF `test_profil_force_katalog_2002::test_shipped_catalog_carries_the_edge_status_and_fields`: the pin of the shipped catalog (edges 131 / 80 new) moved with K132 to 132 / 81 on **both** lines (fixed, re-run with `test_profil_nacharbeit_1006`: 81 passed on each line).
+* catalog: `test_profile_catalog_1003::Build::test_build_and_shipped_catalog_agree` and the five other catalog / edge files green on both lines (27B first run 64 passed / 1 skipped; final run with the new test 85 passed / 1 skipped on 27B, 74 passed / 1 skipped on NF; the one red of that run was a wrong probe path of the new test, fixed, 11 passed).
+* NF dry-run `nf-int4-h6-abl` (pre-rename `c651892375` + `.env.alt` vs NF int + `.env`, `docker/flliper/drycmp`): refusal W128 on both sides (draft files invisible), 24 other lines on each side, 23 equal after name folding, 1 equal except digits, residual 0: "0 diff modulo names up to the boundary" (not byte-identical: the names differ by definition; nothing behind W128 was compared).
+
+**Rest inventory.** `tools/release/rest_inventory_1008.py` gives every remaining hit of `sglang`, `weg2` and `htsglang` one verdict (rules and numbers: `deskq/done/f0i-rest-inventar-1008.md`).
+Result: 27B 43 962 hits: keep (R2) 43 032, decision 302, finding 628, **residue 0**; NF 42 570 hits: keep 41 672, decision 300, finding 598, **residue 0**. The findings are the product-layer name `htsglang` (units, state dirs, `x-htsglang` namespace, compose / Dockerfiles, prose: 514 on 27B, 486 on NF), the root-level notes outside the kit's scope (110) and 4 stale module paths in vendored files. Kit inventory (`rename_to_flliper.py inventory --root`), in scope: 27B `env-SGLANG_` 851, `identifier` 55, `pkg-dotted` 2, `product-htsglang` 1021, `product-HTSGLANG_` 651; NF 850 / 55 / 2 / 985 / 629
+
+**Decisions kept:** the double-reading files stay as they are (`rigdash/weg2line.py`, `test_weg2line.py`, class `weg2link`, the prose "HW-GENERISCH"): they are in the kit's `collision_ok` / `EXCLUDE_CONTENT`
+lists and in the inventory as `kit-span` / `collision_ok-file` / `exclude-content`.
+
+**Open points after wave 4** (for F0-J and the switch-over):
+
+1. Live profiles under `/spinning/gpu-arb` are not converted (`profconv.py --convert-live --apply`, after the gpu-arb patch `f0b-gpu-arb-1007-v2`); tests that read the live profiles stay red until then.
+2. Dashboard deploy (`install.sh`, `install_510.sh`), image build from the integration heads on the build host (`make_flat_ctx.sh`, `Dockerfile.flliper`), F0.5 acceptance boots, the push to `efschu/fLLiper` and `ghcr.io`: seats and user gates.
+3. Product layer ("phase 2b" of section 5, the lower-case `htsglang` product name: units `htsglang-*.service`, `/etc|/var/lib|/opt/htsglang`, `x-htsglang` API namespace, `docker/htsglang*` compose / Dockerfiles, volume names): not renamed in F0. Counted as findings in the inventory; the release image carries `/opt/htsglang/src-{27b,nf}` and the `SGLANG_WEG2_*` variables the double-reading entrypoint expects.
+4. Prose pass (Variant B): comments and docstrings, mixed language left by `ident_fix`, root notes (`FEATURES_VS_UPSTREAM.md`, `HANDOVER_760.md`, ...), the draft release README `docker/pdflip-release/README_RELEASE_DRAFT.md`.
+5. Default decision (user): `FLLIPER_PDFLIP_ENABLE_W3_SPILL_HOST_LEAVES` and `FLLIPER_PDFLIP_MAMBA_SPILL_LAST_RESORT` are off; the metal evidence is the NF seat's (`FIXES-NACH-FREEZE-1007.md`).
+6. Second NF port round for fixes after int23 (not in the NF head: the H88 W4A8 work with its scale fix `dec66fb0b4`, the room-short repro).
+7. No `sglang` -> `flliper` import alias (plan row F0-C).
+8. Dry-runs end at the launcher's first refusal on this box (W61 / W128 / W163, W64 on one profile): what lies behind it is compared on the host in F0-J.
+9. Known red tests, not touched here: `test_rename_collision_free_0928` (209 files carry old and new names, also on the base), 7 `test_webui` cases (404), P1b reference tests with the live profiles, `test_plan_parser`, `flipzeit_dp_user_0930` (a source finding, red on int22 too), Playwright tests (module missing).
+10. Small items of the work packages: `make_flat_ctx.sh` takes `entrypoint.sh` from `/spinning/gpu-arb/docker` (live copy of 03.10.), not the tree master; `profconv.py --convert-live --apply` does not check siblings; the dashboard's `StateDirectory` must stay a relative path; the card-plan screen shows GATE-FEHLT on the desktop screenshot; a stray empty tracked file `0` at the repository root; two vendored files (`_vendor/rife`) name the old module path in a comment.
