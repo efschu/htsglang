@@ -123,7 +123,7 @@ def _make_wrapper(tup: Tuple[str, str]) -> str:
 
 def _wrap_in_namespace(lines: List[str], namespace: str | None) -> List[str]:
     """Upstream (kernels/jit spec.py) emits every export inside
-    ``namespace flliper { ... }`` so a wrapper may name the kernel struct and
+    ``namespace sglang { ... }`` so a wrapper may name the kernel struct and
     its template arguments (``bf16_t``) unqualified. This line keeps the
     bare form by default -- every existing build hash stays -- and wraps
     only when a caller asks (the ``flliper.kernels.jit`` alias does, for the

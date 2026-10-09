@@ -112,7 +112,9 @@ def maybe_init_custom_mem_pool(
 #: namespaced key hashes over this seed instead of no prior, so every page of
 #: the chain differs per namespace. ``None`` keeps the old key exactly -- the
 #: unsalted store of earlier boots stays readable.
-_NAMESPACE_SEED_TAG = b"flliper-kv-namespace-v1\0"
+# F0-K (M2): PERSISTED identity, NOT a name -- it seeds the page key of every salted L2/L3 chain; the rename must leave the bytes alone
+# (RENAME_PLAN 2 "persisted ids"; kit must-keep rule persisted-id).
+_NAMESPACE_SEED_TAG = b"sglang-kv-namespace-v1\0"
 
 
 def namespace_root_hash(extra_key: Optional[str]) -> Optional[str]:

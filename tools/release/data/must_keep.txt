@@ -3,6 +3,10 @@
 # slot_attrib_1358.py, model_vs_measured.py, vramwatch.sh, wedge_trace_watch.sh, test27b.sh, mon_*.sh).
 # Names are the post-rename spelling (WEG2-* -> PDFLIP-*). A translated log/help/string unit must keep
 # every occurrence. Changing one of these = a paired marker rename in tree AND evaluators (RENAME_PLAN 8.4).
+# NATIVE NAMES (F0-K, RC1 acceptance 09.10.2026) are not log markers and live in the engine, not in this list: C++ namespaces named from Python
+# (`wrap_namespace="<old package>"`, `<old package>_<x>::Kernel` in JIT wrappers), the L3 index snapshot magic and the KV namespace seed are
+# `DENY_SPAN` / `W_DENY_SPAN` entries of rename_to_flliper.py (spans `jit-wrapper-namespace`, `persisted-id`); test_f0k_jit_wrapper_compile_1009.py
+# and test_f0k_persisted_consts_1009.py hold the renamed tree against them.
 ACHIEVED
 AGENT-HOLD
 ALLOCATOR

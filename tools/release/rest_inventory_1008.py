@@ -120,6 +120,9 @@ DECISION_FILES = {
     "test/registered/unit/docker/test_flliper_container_f0g_1008.py": "F0-G test: old spelling is the input of the profile-conversion / old-vs-new checks",
     "test/registered/unit/pdflip/test_metric_names_must_keep_1008.py": "F0-M test: the old metric spellings are what the test pins",
     "tools/rig_dashboard/rigdash/tests/test_f0f_dashboard_1008.py": "F0-F test: builds old-spelling inputs from split tokens on purpose",
+    "test/registered/unit/pdflip/test_f0k_jit_wrapper_compile_1009.py": "F0-K test: the C++ namespace of the JIT kernels is the old spelling on purpose (R2 must-keep); the kit-keeps tests feed old text",
+    "test/registered/unit/pdflip/test_f0k_persisted_consts_1009.py": "F0-K test: persisted formats / seeds / schema ids held against the freeze tree, old spelling is the pinned value",
+    "tools/release/persisted_consts_1009.py": "F0-K tool: reads the freeze tree, its old-family word filter names the old spellings",
 }
 # captured evidence carried in the tree as data (boot records / dry-run protocols / dashboard state fixtures of boots run on the old names)
 EVIDENCE_PATH = re.compile(r"^(docker/flliper/drycmp/protocols/|tools/rig_dashboard/rigdash/tests/fixtures/|test/registered/unit/[\w/]*fixtures/|scripts/fixtures/)")
