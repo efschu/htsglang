@@ -4185,9 +4185,34 @@ class MoEExpertOffloadCache:
             if os.environ.get("SGLANG_NAN_GUARD_FETCH", "0").strip() in ("", "0", "off"):
                 return  # the per-fetch check joins copy and compute -- a race hides behind it
             import torch
+            from sglang.srt.layers.moe.moe_w4a8_layout import FACTOR_OF_SCALE
             slots = [int(sl) for _e, sl in fetch_plan]
             for attr, dst in self._resident.items():
                 if not dst.is_floating_point():
+                    continue
+                # H88 SCALEFIX (1008): a W4A8 scale (layer carries its int16 factor; channelwise G==1 has None and
+                # stays float) holds SIGNED int16 bit patterns in the model-dtype container -- a negative int16 is
+                # a NaN/-inf pattern in bf16 ([-128,-1]) / fp16 ([-1024,-1]), so isfinite would be a false alarm.
+                # The pendant check: the slot's bytes leave the int16 band |v| <= W4A8_SCALE_INT_RANGE.
+                if (
+                    attr in FACTOR_OF_SCALE
+                    and getattr(self.layer, FACTOR_OF_SCALE[attr], None) is not None
+                    and dst.element_size() == 2
+                ):
+                    from sglang.jit_kernel.marlin_w4a8_utils import W4A8_SCALE_INT_RANGE
+                    iv = dst[slots].view(torch.int16).to(torch.int32).abs()
+                    bad = (iv > W4A8_SCALE_INT_RANGE).reshape(len(slots), -1).any(dim=1)
+                    if not bool(bad.any().item()):
+                        continue
+                    bad_idx = torch.nonzero(bad).reshape(-1).tolist()
+                    pairs = [fetch_plan[i] for i in bad_idx[:6]]
+                    import logging
+                    logging.getLogger(__name__).error(
+                        "[nan-guard] fetched slot(s) with int16 scale out of band (|v| > %d) %s on layer %s: "
+                        "%d of %d slots, (expert, slot) %s",
+                        W4A8_SCALE_INT_RANGE, attr, getattr(self.layer, "layer_id", "?"), len(bad_idx),
+                        len(slots), pairs,
+                    )
                     continue
                 sub = dst[slots].float()
                 if bool(torch.isfinite(sub).all().item()):
