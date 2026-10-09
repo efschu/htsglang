@@ -2486,7 +2486,10 @@ class PrefillAdder:
         # parks IN PLACE at the chunk boundary (the #679 shape) and `process_pending_weg2_park` gives its rows back to
         # the tree (is_insert=True) at the head of the next step. Reached on PP0 (it owns the decision) and on a follower
         # only for a request the forwarded schedule does NOT name -- where it reads the SAME stamped floor, so every
-        # stage parks. A request the schedule names was run by the branch above (the decision wins).
+        # stage parks. A request the schedule names was run by the branch above (the decision wins). On a follower the
+        # scheduler's #992 gate (a continuation the decision does not name gets no seat; under the row authority every
+        # follower has an effective map, `{}` included) would skip this method; `lanes_p.continuation_held` exempts the
+        # lane-held continuation from that skip, because it takes no seat here (no chunk, no budget, no can_run_list).
         if self._weg2_lane_hold_chunked(req):
             return req
         if self.dllm_config is not None:

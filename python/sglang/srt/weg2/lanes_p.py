@@ -25,8 +25,13 @@ stamp, byte-identical lists.
 WHO DECIDES WHAT.  Membership of a pass is PP0's decision (``#791`` forwarded schedule: followers admit only what the
 decision names).  So: the admission loop skips a held request only on the rank that owns its admission truth
 (:func:`owns_admission`: PP0 or a non-PP boot); a follower never skips a request PP0 named.  The chunked continuation is the
-one request a follower decides about when the schedule does not name it: there ``add_chunked_req`` reads the SAME stamped
-floor, so PP0 and a follower both park in place.  Where the schedule DOES name it, the schedule is executed (it wins).
+one request a follower decides about when the schedule does not name it.  Under the default row authority every follower
+holds an effective map for every pass (a map or ``{}``), so the ``#992`` gate of the scheduler would refuse the seat of a
+continuation the decision does not name and never reach ``add_chunked_req`` -- on PP1/PP2 the lane park would never happen
+and their device rows of the parked lane would stay locked while PP0 holds.  :func:`continuation_held` exempts exactly the
+continuation the stamped floor holds from that refusal (it takes no seat), so ``add_chunked_req`` reads the SAME stamped
+floor on every stage and PP0 and both followers park in place; ``process_pending_weg2_park`` then returns the rows on each.
+Where the schedule DOES name the continuation, the schedule is executed (it wins).
 
 WHY THE VOTE WAY CARRIES AND ``Weg2ParkReq`` STAYS UNWIRED.  ``Weg2ParkReq`` (``weg2/park.py``) would name a request to
 tear down on every rank at the head of the same step.  What the lane needs uniform is the DECISION (park / do not run the
@@ -257,6 +262,17 @@ def owns_admission(sched: Any) -> bool:
     schedule and never skips a request by lane."""
     pp_size, pp_rank = _pp(sched)
     return pp_size <= 1 or pp_rank == 0
+
+
+def continuation_held(sched: Any, req: Any) -> bool:
+    """The chunked continuation ``req`` is held by the floor THIS rank applies in this pass (the stamped one on a follower).
+
+    The ``#992`` gate in ``Scheduler._get_new_batch_prefill_raw`` skips ``add_chunked_req`` for a continuation the forwarded
+    schedule does not name.  A held continuation is exempt from that skip: it takes no seat (no chunk, no budget, not in
+    ``can_run_list``), and reaching ``add_chunked_req`` is what parks it in place on every stage, so that
+    ``process_pending_weg2_park`` gives the rows of PP1/PP2 back as it does PP0's.  A continuation the schedule DOES name
+    never depends on this (``add_chunked_req`` executes the schedule first).  False without lane state."""
+    return holds(req_lane(req), floor_for_pass(sched))
 
 
 def configure_adder(sched: Any, adder: Any) -> None:

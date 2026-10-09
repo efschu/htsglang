@@ -1314,6 +1314,23 @@ def _weg2_dormant_admit_armed() -> bool:
 _HEAD_VOTE_ANCHOR_N = [0]
 
 
+def _pp_chunked_continuation_not_named(sched, incoming, req) -> bool:
+    """The #992 predicate: this rank executes a forwarded schedule that does not name its chunked continuation `req`, so the
+    seat is refused (the continuation is kept, `add_chunked_req` is not called).
+
+    PRIORITY LANES 1008 (L3, weg2/lanes_p.py): a continuation the stamped lane floor holds is NOT a seat this gate has to
+    refuse -- it takes no chunk and no budget (`add_chunked_req` parks it in place and returns before it touches
+    `can_run_list`), and the follower MUST reach that park, or PP1/PP2 keep the device rows of the parked lane locked while
+    PP0 has given its own back (L3 review, finding 1: under the default row authority every follower holds an effective map,
+    `{}` included, so without this exemption a lane hold never left PP0). Without lane state (switch off / no RPC)
+    `continuation_held` is False and this is the expression it was."""
+    return (
+        incoming is not None
+        and incoming.get(req.rid) is None
+        and not _lanes_p.continuation_held(sched, req)
+    )
+
+
 def _len_or_zero(x) -> int:
     """``len(x)`` for a list or a tensor, 0 for None -- never ``x or ()``: the
     truth value of an empty tensor raises (27B rc12z9 D 08:23:24, all three
@@ -16448,8 +16465,8 @@ class Scheduler(
             # below rather than guessed at, so boot 12 measures the second
             # half instead of assuming it.
             incoming = getattr(self, "_pp_admission_incoming_effective", None)
-            not_named = (
-                incoming is not None and incoming.get(self.chunked_req.rid) is None
+            not_named = _pp_chunked_continuation_not_named(
+                self, incoming, self.chunked_req
             )
             if not_named:
                 self._992_chunked_not_named = (

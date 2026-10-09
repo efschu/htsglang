@@ -315,6 +315,189 @@ class RankUniformityTest(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# 1b. the REAL follower path: row authority, the #992 gate, the park on PP1/PP2 (L3 review, findings 1 and 2)
+# ---------------------------------------------------------------------------
+
+def _park_stage(rank, pp_size=3):
+    """A PP stage that can run the real head-of-step park: the lane-state stage plus what `process_pending_weg2_park` reads."""
+    s = _stage(rank, pp_size)
+    s.chunked_req = None
+    s.tree_cache = object()
+    s.queued = []
+    s._add_request_to_queue = lambda req, is_retracted=False: s.queued.append((req.rid, is_retracted))
+    return s
+
+
+def _continuation_on(stage, rid="R", priority=0):
+    """The chunked continuation this stage holds at the chunk boundary: its OWN Req object (each rank has its own rows)."""
+    req = _req(rid, priority, prefix=SPAN)
+    req.req_pool_idx = 3
+    req.inflight_middle_chunks = 0
+    req.origin_input_ids = list(range(N_TOK))
+    req.reset_for_retract = MagicMock()
+    stage.chunked_req = req
+    return req
+
+
+def _stage_pass(stage, incoming, *, old_gate=False):
+    """What `Scheduler._get_new_batch_prefill_raw` does with `self.chunked_req` on this stage: the REAL #992 predicate
+    (`Scheduler`'s `_pp_chunked_continuation_not_named`, the function the scheduler calls at that site), then -- when the
+    seat is not refused -- the REAL adder with the floor this stage applies. `old_gate` = the expression before the L3 fix
+    (CAN-FAIL twin). Returns (adder, not_named)."""
+    from sglang.srt.managers import scheduler as sch
+
+    req = stage.chunked_req
+    adder = _adder()
+    lanes_p.configure_adder(stage, adder)
+    if old_gate:
+        not_named = incoming is not None and incoming.get(req.rid) is None
+    else:
+        not_named = sch._pp_chunked_continuation_not_named(stage, incoming, req)
+    if not not_named:
+        with lanes_p.chunk_scope(adder, req):
+            stage.chunked_req = adder.add_chunked_req(req)
+    return adder, not_named
+
+
+def _row_authority_incoming(stage):
+    """PP0 decides (`None`: its own derivation); under the default row authority every follower holds an effective map for
+    every pass -- `{}` when the decision names nothing (scheduler_pp_mixin.py: '{} is the admit nothing spelling')."""
+    return None if stage.ps.pp_rank == 0 else {}
+
+
+class FollowerPathTest(unittest.TestCase):
+    def setUp(self):
+        from sglang.srt.managers import scheduler as sch
+
+        self.sch = sch
+        self.released = []
+        self.orig = sch.release_kv_cache
+        sch.release_kv_cache = lambda req, tree, is_insert=True: self.released.append((req.rid, is_insert))
+
+    def tearDown(self):
+        self.sch.release_kv_cache = self.orig
+
+    def _stamped_stages(self, floor=1):
+        """Three stages with a continuation each, the floor stamped and applied by the real functions in one pass."""
+        stages = [_park_stage(i) for i in range(3)]
+        reqs = [_continuation_on(s) for s in stages]
+        lanes_p.on_rpc(stages[0], _rpc(floor, 1))
+        stamp = lanes_p.pp0_pass(stages[0])
+        wire = pr.stamp_lane_floor([], stamp)
+        for s in stages[1:]:
+            sent_on = list(wire)
+            _rest, st = pr.absorb_lane_floor(wire)
+            lanes_p.apply_follower(s, st)
+            wire = sent_on
+        self.assertEqual({lanes_p.echo(s) for s in stages}, {(floor, 1)})
+        return stages, reqs
+
+    def test_every_stage_parks_in_place_under_the_row_authority(self):
+        with _LanesOn():
+            stages, reqs = self._stamped_stages()
+            for s, req in zip(stages, reqs):
+                adder, not_named = _stage_pass(s, _row_authority_incoming(s))
+                self.assertFalse(not_named, f"rank {s.ps.pp_rank}: the #992 gate must not swallow a lane-held continuation")
+                self.assertEqual(adder.can_run_list, [], "no seat: no chunk, nothing in the batch")
+                self.assertIs(s.chunked_req, req, "it stays the chunked request (nothing leaks)")
+                self.assertEqual(req.extend_range, Range(SPAN, SPAN))
+                self.assertTrue(req.weg2_pool_parked and req.weg2_lane_parked, f"rank {s.ps.pp_rank} did not park")
+
+    def test_every_stage_gives_its_rows_back_to_the_tree_with_is_insert(self):
+        with _LanesOn():
+            stages, reqs = self._stamped_stages()
+            for s in stages:
+                _stage_pass(s, _row_authority_incoming(s))
+            with self.assertLogs("sglang.srt.weg2.lanes_p", level="INFO") as cm:
+                for s in stages:
+                    self.sch.Scheduler.process_pending_weg2_park(s)
+            self.assertEqual(self.released, [("R", True)] * 3, "PP0, PP1 and PP2 each return the rows, inserted into the tree")
+            for s, req in zip(stages, reqs):
+                self.assertIsNone(s.chunked_req)
+                self.assertEqual(s.queued, [("R", True)])
+                self.assertEqual(req.weg2_parked_span, SPAN)
+                self.assertTrue(req.weg2_lane_parked)
+            self.assertEqual(len([l for l in cm.output if "WEG2-PARK (lane) n=1" in l]), 3)
+
+    def test_canfail_the_old_992_gate_keeps_the_follower_rows_locked(self):
+        """The expression before the fix: under the row authority a follower's continuation that the decision does not name
+        is refused its seat and `add_chunked_req` is never reached -- PP0 parks, PP1/PP2 hold the device rows of the lower
+        lane while the hold lasts (the review's finding 1), and the higher lane's PP-room vote carries that smaller room."""
+        with _LanesOn():
+            stages, reqs = self._stamped_stages()
+            for s in stages:
+                _adder_, not_named = _stage_pass(s, _row_authority_incoming(s), old_gate=True)
+                self.assertEqual(not_named, s.ps.pp_rank != 0)
+            for s in stages:
+                self.sch.Scheduler.process_pending_weg2_park(s)
+            self.assertEqual(self.released, [("R", True)], "only PP0 gave its rows back")
+            self.assertIsNone(stages[0].chunked_req)
+            for s, req in zip(stages[1:], reqs[1:]):
+                self.assertIs(s.chunked_req, req, "PP1/PP2 still hold the continuation")
+                self.assertFalse(getattr(req, "weg2_lane_parked", False))
+
+    def test_the_predicate_is_the_old_992_expression_everywhere_the_lane_does_not_hold(self):
+        """No lane state / floor 0 / a continuation at or above the floor: #992 behaves exactly as before the lanes."""
+        sch = self.sch
+        floor_free = _park_stage(1)
+        held_free = _continuation_on(floor_free)
+        for incoming in (None, {}, {"other": 5}, {"R": 7}):
+            old = incoming is not None and incoming.get("R") is None
+            self.assertEqual(sch._pp_chunked_continuation_not_named(floor_free, incoming, held_free), old)
+        with _LanesOn():
+            stages, _reqs = self._stamped_stages(floor=1)
+            above = _continuation_on(stages[1], rid="H", priority=1)  # lane 1 at floor 1: not held
+            for incoming in (None, {}, {"other": 5}, {"H": 7}):
+                old = incoming is not None and incoming.get("H") is None
+                self.assertEqual(sch._pp_chunked_continuation_not_named(stages[1], incoming, above), old)
+            # held: never refused by #992, whatever the decision says (named: the schedule is executed by add_chunked_req)
+            held = _continuation_on(stages[1], rid="L", priority=0)
+            for incoming in (None, {}, {"other": 5}, {"L": 7}):
+                self.assertFalse(sch._pp_chunked_continuation_not_named(stages[1], incoming, held))
+
+    def test_a_lane_at_the_floor_is_still_refused_its_seat_by_992_when_unnamed(self):
+        """The exemption is only for the held lane: a continuation of an admitted lane that the decision does not name keeps
+        the #992 refusal (and its log), unchanged."""
+        with _LanesOn():
+            stages, _reqs = self._stamped_stages(floor=1)
+            above = _continuation_on(stages[2], rid="H", priority=1)
+            adder, not_named = _stage_pass(stages[2], {})
+            self.assertTrue(not_named)
+            self.assertIs(stages[2].chunked_req, above)
+            self.assertFalse(getattr(above, "weg2_lane_parked", False))
+            self.assertEqual(adder.can_run_list, [])
+
+    def test_a_floor_that_falls_voids_the_follower_park_too(self):
+        with _LanesOn():
+            stages, reqs = self._stamped_stages(floor=1)
+            for s in stages:
+                _stage_pass(s, _row_authority_incoming(s))
+            # LANE-EMPTY: floor 0, epoch 2, stamped and applied by every stage in the next pass before the rows went back
+            lanes_p.on_rpc(stages[0], _rpc(0, 2))
+            stamp = lanes_p.pp0_pass(stages[0])
+            for s in stages[1:]:
+                lanes_p.apply_follower(s, stamp)
+            for s in stages:
+                self.sch.Scheduler.process_pending_weg2_park(s)
+            self.assertEqual(self.released, [], "the floor fell first: no rows go back, the continuation resumes")
+            for s, req in zip(stages, reqs):
+                self.assertIs(s.chunked_req, req)
+                self.assertFalse(req.weg2_lane_parked or req.weg2_pool_parked)
+
+    def test_the_scheduler_calls_the_predicate_at_the_992_site(self):
+        """The one site the desk cannot drive (the 4000-line admission pass): pinned by text."""
+        src = open(self.sch.__file__).read()
+        i = src.index("incoming = getattr(self, \"_pp_admission_incoming_effective\", None)")
+        blk = src[i:i + 400]
+        self.assertIn("not_named = _pp_chunked_continuation_not_named(", blk)
+        self.assertIn("self, incoming, self.chunked_req", blk)
+        j = src.index("if not_named:", i)
+        k = src.index("self.chunked_req = adder.add_chunked_req(self.chunked_req)", j)
+        self.assertLess(j, k)  # the refusal branch comes first, the adder is in the else branch the predicate now routes to
+        self.assertIn("_992_chunked_not_named", src[j:j + 400])
+
+
+# ---------------------------------------------------------------------------
 # 5. switch off / no RPC: byte-identical
 # ---------------------------------------------------------------------------
 
