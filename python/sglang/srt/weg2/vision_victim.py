@@ -669,6 +669,13 @@ def item_patches(item: Any) -> int:
     return int((grid[:, 0] * grid[:, 1] * grid[:, 2]).sum().item())
 
 
+def item_segments(item: Any) -> int:
+    """Attention segments of one item: sum over its grid rows of t (the
+    tower's cu_seqlens repeats h*w once per frame). A still image is one."""
+    grid = torch.as_tensor(item.image_grid_thw).reshape(-1, 3)
+    return int(grid[:, 0].sum().item())
+
+
 def encode_work_bytes(patches: int, *, hidden: int, intermediate: int, heads: int, out_hidden: int,
                       merge: int, deepstack: int, in_dim: int, quadratic: bool, elem: int = 2) -> int:
     """Peak bytes the tower's forward allocates for ONE item of ``patches``
@@ -684,8 +691,13 @@ def encode_work_bytes(patches: int, *, hidden: int, intermediate: int, heads: in
                   phase (residual, norm, fc2 out = 3 hidden, fc1 out + act)
     * rows     -- the merged rows of the merger and each deepstack merger,
                   and their concatenation
-    * quad     -- ``quadratic`` (the sdpa backend): the block-diagonal mask on
-                  the device, bool + its additive bf16 form = 3 B per pair
+    * quad     -- ``quadratic`` (sdpa AND more than one segment, see
+                  ``encode_work_for``): the block-diagonal mask on the device,
+                  bool + its additive bf16 form = 3 B per pair. One segment
+                  (a still image) runs sdpa without a mask
+                  (``layers/attention/vision.py:_sdpa_single_segment``), so no
+                  pair term; the 4096x4096 image (65536 patches) of the
+                  metal W105b (09.10.) books 2402 MiB instead of 14690 MiB
     """
     p = int(patches)
     head_dim = max(1, hidden // max(1, heads))
@@ -698,15 +710,19 @@ def encode_work_bytes(patches: int, *, hidden: int, intermediate: int, heads: in
 
 
 def encode_work_for(vision_config: Any, items: Sequence[Any], backend: Optional[str]) -> int:
-    """The largest per-item work of ``items`` under ``vision_config``."""
+    """The largest per-item work of ``items`` under ``vision_config``. The
+    pair term only for sdpa with more than one segment in the item: one
+    segment drops the mask (``_sdpa_single_segment``)."""
     vc = vision_config
     in_dim = (int(getattr(vc, "in_channels", 3)) * int(getattr(vc, "temporal_patch_size", 2))
               * int(vc.patch_size) ** 2)
     kw = dict(hidden=int(vc.hidden_size), intermediate=int(vc.intermediate_size),
               heads=int(vc.num_heads), out_hidden=int(vc.out_hidden_size),
               merge=int(vc.spatial_merge_size), deepstack=len(getattr(vc, "deepstack_visual_indexes", ()) or ()),
-              in_dim=in_dim, quadratic=(backend or "sdpa") == "sdpa")
-    return max((encode_work_bytes(item_patches(it), **kw) for it in items), default=0)
+              in_dim=in_dim)
+    sdpa = (backend or "sdpa") == "sdpa"
+    return max((encode_work_bytes(item_patches(it), quadratic=sdpa and item_segments(it) > 1, **kw)
+                for it in items), default=0)
 
 
 def encode_peak_start(device: torch.device) -> Optional[int]:
