@@ -76,6 +76,12 @@ KEEPALIVE_FMT = ": lane-hold floor=%d\n\n"
 
 #: a held P leg taken off P before the P->D flip (L4 only, not an L1 name)
 MARK_P_TAKE = "WEG2 LANE-P-TAKE"
+#: a LEG1-EARLY leg still in flight on P cancelled and aborted by rid when its Pending is held (L4 FR2)
+MARK_EARLY_TAKE = "WEG2 LANE-EARLY-TAKE"
+#: the re-run of a leg that was taken off P: its cached tokens against what the first run left (L4 FR2)
+MARK_P_RESUME = "WEG2 LANE-P-RESUME"
+#: a held SSE stream was opened (200 + text/event-stream) so that it can get its keepalive (L4 FR2)
+MARK_SSE_OPEN = "WEG2 LANE-SSE-OPEN"
 
 
 def enabled() -> bool:
@@ -146,6 +152,10 @@ class LaneCtl:
         self.ever_held: "collections.OrderedDict[str, bool]" = collections.OrderedDict()
         self.reprefill: set = set()
         self.defer_logged: Optional[Tuple[int, int]] = None
+        #: rid -> the stream request's early-open record (L4 FR2): {request, resp, lock, taken, held_t0}
+        self.pre: Dict[str, Dict[str, Any]] = {}
+        #: the abort tasks of cancelled early legs (a fresh leg 1 of the Pending waits for its own)
+        self.early_tasks: set = set()
         self.lock: Optional[asyncio.Lock] = None
         self.kick_evt: Optional[asyncio.Event] = None
 
@@ -166,6 +176,7 @@ class LaneCtl:
         self.dormant.pop(r, None)
         self.waiter_held.pop(r, None)
         self.streams.pop(r, None)
+        self.pre.pop(r, None)
         self.gates.pop(r, None)
         self.gate_done.pop(r, None)
         self.reprefill.discard(r)
@@ -269,11 +280,57 @@ def _hold_waiting(fr: Any, lc: LaneCtl, floor: int, now: float) -> int:
             p.lane_state = "held"
             lc.mark_held(p.rid)
             n += 1
+            if where == "queue":
+                _cancel_early(fr, lc, p, now)
         if where == "ready":
             fr._sync_batch_gate()
     if n:
         fr._park_stuck().hold(lc.held_rids())
     return n
+
+
+def _cancel_early(fr: Any, lc: LaneCtl, p: Any, now: float) -> bool:
+    """A Pending taken out of ``queue`` may carry a LEG1-EARLY leg still in flight on P (DP-NACHLAUF posts the
+    queue head's leg 1 at the D->P flip's begin; with a lane deferred over that flip, the first pass after
+    ``WEG2-FLIP done`` holds the Pending under it).  Such a leg is in no drain pool, so :func:`p_take` never sees
+    it: left alone it would be parked by L3 in P's waiting queue and the P->D witness would read "rank not idle"
+    (W3).  So it is treated like a taken leg: the task is cancelled, the rid is aborted on P by name (the KV of the
+    finished chunks stays in P's tree), the Pending keeps its original arrival and runs a fresh leg 1 after the
+    resume (its re-run is checked for the prefix, :func:`retake_check`).  A finished early leg (task done) stays on
+    the Pending: the drain consumes its verdict at the resume.  Returns True when a running leg was cancelled."""
+    early = getattr(p, "_leg1_early", None)
+    if early is None or early.done():
+        return False
+    P = fr.groups["P"]
+    t_on = P.outstanding.get(p.rid)
+    cancel = getattr(fr, "_leg1_early_cancel", None)
+    if cancel is None:
+        return False
+    on_p = bool(cancel(p, "lane-hold"))
+    p.lane_retake = True
+    p.lane_p_ran_s = max(0.0, now - t_on) if t_on else 0.0
+    fr.counters["lane_early_taken"] += 1
+    logger.warning("%s rid=%s lane=%d floor=%d on_p=%s ran_s=%.1f -- the early leg 1 of a held request was still in "
+                   "flight on P: cancelled and aborted by rid (a leg parked in P's waiting queue is not idle for "
+                   "the P->D witness); it runs a fresh leg 1 after the resume, with the finished chunks as prefix",
+                   MARK_EARLY_TAKE, p.rid, lane_of_pending(p), fr._lane_state().lane_floor, on_p, p.lane_p_ran_s)
+    if on_p:
+        try:
+            t = asyncio.ensure_future(fr.rpc(P, "/abort_request", {"rid": p.rid}, 30))
+        except RuntimeError:  # no running loop (a sync caller): the witness / the next abort decides
+            return True
+        p._leg1_abort = t
+        lc.early_tasks.add(t)
+
+        def _done(task: Any, p: Any = p) -> None:
+            lc.early_tasks.discard(task)
+            if getattr(p, "_leg1_abort", None) is task:
+                p._leg1_abort = None
+            if not task.cancelled() and task.exception() is not None:
+                fr.counters["lane_early_abort_failed"] += 1
+
+        t.add_done_callback(_done)
+    return True
 
 
 def sweep(fr: Any) -> int:
@@ -298,7 +355,8 @@ async def _preempt(fr: Any, lc: LaneCtl, ls: Any, prev: int, floor: int, cause: 
     dorm0 = fr.counters["lane_parked_d_dormant"]
     P, D = fr.groups["P"], fr.groups["D"]
     parked_p = [r for r in list(P.outstanding) if ls.lane_for(r) < floor]
-    res = await asyncio.gather(_park_d(fr, lc, ls, floor), sync_floor(fr, force=True), return_exceptions=True)
+    res = await asyncio.gather(_park_d(fr, lc, ls, floor), sync_floor(fr, force=True),
+                               *list(lc.early_tasks), return_exceptions=True)
     parked_d = res[0] if isinstance(res[0], int) else 0
     for r in res:
         if isinstance(r, BaseException):
@@ -478,6 +536,7 @@ def _restore_held(fr: Any, lc: LaneCtl, floor: int, now: float) -> Tuple[int, in
                 # waited in ``_ready_for_d`` with its leg 1 DONE keeps ``leg1_done``
                 p.lane_p_taken = False
                 p.leg1_done = False
+                p.lane_retake = True  # its re-run leg 1 is checked for the prefix (LANE-REPREFILL)
             back[h.where].append(p)
     n_q = n_r = 0
     for dq, where in ((fr.queue, "queue"), (fr._ready_for_d, "ready")):
@@ -640,6 +699,8 @@ async def p_take(fr: Any, items: List[Any], cancel: Callable[[], Any]) -> int:
     now = time.time()
     for p in items:
         p.lane_p_taken = True
+        t_on = P.outstanding.get(p.rid)
+        p.lane_p_ran_s = max(0.0, now - t_on) if t_on else 0.0
     cancel()
     rids = [p.rid for p in items]
     res = await asyncio.gather(*(fr.rpc(P, "/abort_request", {"rid": r}, 30) for r in rids), return_exceptions=True)
@@ -672,6 +733,33 @@ async def p_take(fr: Any, items: List[Any], cancel: Callable[[], Any]) -> int:
     _restore_held(fr, lc, ls.lane_floor, time.time())
     _changed(fr)
     return n
+
+
+def retake_check(fr: Any, p: Any, pt: int, ct: int) -> bool:
+    """The fresh leg 1 of a Pending that was taken off P (or whose early leg was cancelled) for a lane has answered:
+    did the prefix the first run left come back?  ``ct`` = P's ``cached_tokens`` of THIS run, ``pt`` its prompt.
+
+    The reference is what P reports finished at the take: ``p.lane_p_done_tokens``.  P reports no such number today
+    (``/abort_request`` answers nothing and the floor RPC is one-way: lanes.py), so it is 0 = unknown, and then the
+    only provable loss is the whole of it: a leg that STOOD ON P at the take (``lane_p_ran_s`` > 0) and whose re-run
+    finds nothing cached (``ct`` <= 0) is counted, LANE-REPREFILL, plan decision 3.  That rule can count a leg that
+    was admitted by nobody before the take (nothing to keep) -- the direction a "must be 0" instrument errs in; each
+    re-run is logged with ``ran_s`` and ``cached`` (LANE-P-RESUME) so metal can read a count against L3's
+    ``WEG2-PARK (lane) ... span=`` line of the same rid.  With a known reference every shortfall counts.
+    Returns True when a prefix loss was counted."""
+    p.lane_retake = False
+    done = int(getattr(p, "lane_p_done_tokens", 0) or 0)
+    ran = float(getattr(p, "lane_p_ran_s", 0.0) or 0.0)
+    if done > 0:
+        lost = int(ct) < done
+    else:
+        lost = int(ct) <= 0 and ran > 0.0
+    fr.counters["lane_p_retake"] += 1
+    logger.info("%s rid=%s cached=%d prompt=%d done_ref=%d ran_s=%.1f lost=%s -- the leg 1 of a request taken off P "
+                "for a lane ran again", MARK_P_RESUME, p.rid, int(ct), int(pt), done, ran, lost)
+    if lost:
+        fr._lane_reprefill(p.rid, "p-retake: cached=%d prompt=%d done_ref=%d ran_s=%.1f" % (int(ct), int(pt), done, ran))
+    return lost
 
 
 def waiter_hold(fr: Any, st: Dict[str, Any], rid: str) -> bool:
@@ -720,18 +808,101 @@ def stream_open(fr: Any, rid: str, request: Any, resp: Any) -> Optional[Dict[str
     return e
 
 
+def new_sse_response() -> Any:
+    """The response of an early-opened stream (a function so a test can swap the aiohttp object)."""
+    from aiohttp import web
+
+    resp = web.StreamResponse(status=200, headers={"Cache-Control": "no-cache"})
+    resp.content_type = "text/event-stream"
+    return resp
+
+
+def pre_register(fr: Any, rid: str, request: Any) -> None:
+    """A ``stream=true`` request entered ``handle_generate`` (switch on): note it, so a hold that lasts one keepalive
+    period opens its SSE response (:func:`_pre_open`) before any group answered.  Nothing else changes for it."""
+    if not enabled():
+        return
+    lc = ctl(fr)
+    lc.pre[str(rid)] = {"request": request, "resp": None, "lock": None, "taken": False, "held_t0": None}
+    try:
+        request["weg2_lane_rid"] = str(rid)
+    except Exception:  # noqa: BLE001 -- a request object without item assignment
+        pass
+
+
+async def pre_take(fr: Any, request: Any, rid: str) -> Optional[Any]:
+    """Leg 2 reached its response: the early-opened one when there is one (the loop opens none after this call), else
+    None and leg 2 builds its own as always."""
+    lc = fr.__dict__.get("_lane_ctl_obj")
+    e = lc.pre.get(str(rid)) if lc is not None else None
+    if e is None:
+        return None
+    if e["lock"] is None:
+        e["lock"] = asyncio.Lock()
+    async with e["lock"]:
+        e["taken"] = True
+        return e["resp"]
+
+
+async def _pre_open(fr: Any, lc: LaneCtl, rid: str, e: Dict[str, Any], floor: int, now: float) -> bool:
+    """Open the held request's SSE response now: 200 + ``text/event-stream`` + the first keepalive comment.  Under the
+    entry's lock against leg 2's :func:`pre_take`.  From here on the request's status is 200 -- an error later is an
+    error event (``Front._lane_pre_finish``)."""
+    if e["lock"] is None:
+        e["lock"] = asyncio.Lock()
+    async with e["lock"]:
+        if e["taken"] or e["resp"] is not None:
+            return False
+        req = e["request"]
+        resp = new_sse_response()
+        try:
+            await resp.prepare(req)
+            await resp.write((KEEPALIVE_FMT % floor).encode())
+        except Exception:  # noqa: BLE001 -- a client that left: its own handler ends the rid
+            lc.pre.pop(rid, None)
+            return False
+        e["resp"] = resp
+        try:
+            req["weg2_prepared"] = True
+            req["weg2_lane_pre"] = resp
+        except Exception:  # noqa: BLE001
+            pass
+    lc.streams[rid] = {"resp": resp, "request": req, "boundary": True, "t_last": now}
+    fr.counters["lane_pre_opened"] += 1
+    fr.counters["lane_keepalives"] += 1
+    logger.warning("%s rid=%s lane=%d floor=%d held_s=%.0f -- a held stream request got its SSE response (200, "
+                   "text/event-stream) and a first %r comment before any group answered; an error from now on "
+                   "is an error event", MARK_SSE_OPEN, rid, fr._lane_state().lane_for(rid), floor,
+                   now - (e["held_t0"] or now), (KEEPALIVE_FMT % floor).strip())
+    return True
+
+
 async def keepalive_tick(fr: Any, now: Optional[float] = None) -> int:
     """One SSE comment line ``: lane-hold floor=N`` into every held open stream that has been quiet for
-    ``SGLANG_WEG2_LANE_KEEPALIVE_S`` and stands at an event border.  Non-stream requests get none (they hold)."""
+    ``SGLANG_WEG2_LANE_KEEPALIVE_S`` and stands at an event border.  A held stream request whose response is not
+    open yet (waiting at the gate, in ``queue`` / ``_ready_for_d``, for an ARRIVAL-SEAT seat, or already past
+    leg 2's ``prepare`` never) is opened after it has been held for one period (:func:`_pre_open`); its first
+    comment goes out with it.  Non-stream requests get none (they hold)."""
     period = _ln.keepalive_s()
     lc = fr.__dict__.get("_lane_ctl_obj")
-    if period <= 0 or lc is None or not lc.streams:
+    if period <= 0 or lc is None or not (lc.streams or lc.pre):
         return 0
     ls = fr._lane_state()
-    if ls.lane_floor <= 0:
-        return 0
     now = time.time() if now is None else now
     n = 0
+    if lc.pre:
+        for rid, e in list(lc.pre.items()):
+            if e["resp"] is not None or e["taken"]:
+                continue
+            if ls.lane_floor <= 0 or ls.lane_for(rid) >= ls.lane_floor:
+                e["held_t0"] = None
+                continue
+            if e["held_t0"] is None:
+                e["held_t0"] = now
+            if now - e["held_t0"] >= period and await _pre_open(fr, lc, rid, e, ls.lane_floor, now):
+                n += 1
+    if ls.lane_floor <= 0:
+        return n
     for rid, e in list(lc.streams.items()):
         if ls.lane_for(rid) >= ls.lane_floor or not e["boundary"] or now - e["t_last"] < period:
             continue
@@ -808,6 +979,7 @@ def hold_block(fr: Any) -> Dict[str, Any]:
         "held": len(lc.held), "parked_d": len(lc.parked_d), "dormant": len(lc.dormant),
         "waiters": len(lc.waiter_held), "gate": len(lc.gates),
         "reprefill": len(lc.reprefill),
+        "sse_open": sum(1 for e in lc.pre.values() if e["resp"] is not None),
         "acked": {k: list(v) for k, v in sorted(lc.acked.items())},
         "unsupported": sorted(lc.unsupported) + (["park"] if lc.park_unsupported else []),
     }}

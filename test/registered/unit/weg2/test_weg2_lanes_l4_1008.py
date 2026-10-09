@@ -1361,3 +1361,316 @@ async def test_e2e_a_lane0_arrival_seat_waiter_is_not_granted_the_seat_the_lane1
         assert [s for s, _ in res] == [200, 200]
         assert h.d.timeline.index("gen:hi") < h.d.timeline.index("gen:lo2")
         assert h.d.gen_marks.count("lo1") == 1 and h.d.gen_marks.count("lo2") == 1
+
+
+# ------------------------------------------------------------------ review FR2 finding 1: a LEG1-EARLY leg under a lane hold
+async def _early_leg(f, rid):
+    """What ``Front.leg1`` does around its POST: the rid stands in P's ledger for as long as the task lives."""
+    P = f.groups["P"]
+    P.outstanding[rid] = time.time() - 3.0
+    try:
+        await asyncio.sleep(60)
+    finally:
+        P.outstanding.pop(rid, None)
+
+
+@_on
+async def test_defer_early_leg_and_the_p_to_d_flip_the_held_head_leaves_p_and_its_early_leg_is_aborted(caplog):
+    """Review L4 FR2 finding 1 (metal probe 4): the D->P flip posted leg 1 of the queue head early (DP-NACHLAUF),
+    a lane-1 request arrived during the flip (DEFER), ``WEG2-FLIP done``: the first pass holds the head -- and its
+    early leg, which is in no drain pool, must leave P (else L3 parks it in P's waiting queue and the P->D witness
+    reads 'rank not idle')."""
+    caplog.set_level(logging.INFO, logger="weg2.front")
+    f = _front("P")
+    f.state = "flipping"
+    f._flip_dst = "P"
+    P = f.groups["P"]
+    head = _pend(f, "lo0", 0, NOW)
+    other = _pend(f, "lo1", 0, NOW + 1)
+    f.queue.extend([head, other])
+    head._leg1_early = asyncio.ensure_future(_early_leg(f, "lo0"))
+    Front._leg1_early_watch(f, head)
+    await asyncio.sleep(0.02)
+    assert "lo0" in P.outstanding
+    assert await _arrive(f, "hi", 1) is None                      # DEFER: nothing held, nothing aborted
+    assert f._lane_state().lane_floor == 0 and f.rpc.paths("/abort_request") == []
+    assert head._leg1_early is not None and not head._leg1_early.done()
+    early = head._leg1_early
+    f.state = "serving"                                          # WEG2-FLIP done
+    await LC.step(f)
+    lc = f._lane_ctl_obj
+    assert f._lane_state().lane_floor == 1 and list(f.queue) == []
+    assert sorted(h.p.rid for h in lc.held.values()) == ["lo0", "lo1"]
+    assert head._leg1_early is None
+    await asyncio.sleep(0.02)
+    assert early.cancelled()
+    aborts = f.rpc.paths("/abort_request")
+    assert [(g, b["rid"]) for g, b in aborts] == [("P", "lo0")]   # by rid, on P, for the one leg that flew
+    assert getattr(other, "_leg1_early", None) is None and other.lane_retake is False
+    assert head.lane_retake is True and head.lane_p_ran_s >= 2.5
+    await asyncio.sleep(0.02)
+    assert head._leg1_abort is None                              # the abort landed; a fresh leg 1 waits for none
+    assert "lo0" not in P.outstanding and LC.p_ledger(f, P) == []   # the P->D drain / witness sees an empty P
+    assert f.counters["lane_early_taken"] == 1
+    assert _marks(caplog, LC.MARK_EARLY_TAKE)[0].startswith("WEG2 LANE-EARLY-TAKE rid=lo0 lane=0 floor=1 on_p=True")
+    # the lane ends: the head is back in the queue in the order of its original arrival, its re-run is checked
+    f._lane_end("hi")
+    await LC.step(f)
+    assert [p.rid for p in f.queue] == ["lo0", "lo1"] and head.lane_retake is True
+
+
+@_on
+async def test_a_fresh_leg1_waits_for_the_early_legs_abort_and_a_finished_early_leg_stays_on_the_pending():
+    f = _front("P")
+    f._lane_state().set_floor(1)
+    _note(f, "hi", 1)
+    gate = asyncio.Event()
+
+    async def slow_rpc(g, path, body, timeout):
+        f.rpc.calls.append((g.name, path, body))
+        await gate.wait()
+        return 200, "{}"
+    f.rpc = slow_rpc
+    f.rpc.calls = []
+    p = _pend(f, "lo0", 0, NOW)
+    f.queue.append(p)
+    p._leg1_early = asyncio.ensure_future(_early_leg(f, "lo0"))
+    await asyncio.sleep(0.02)
+    LC.sweep(f)
+    assert p._leg1_abort is not None and not p._leg1_abort.done()
+    waiter = asyncio.ensure_future(Front._leg1_abort_landed(f, p))
+    await asyncio.sleep(0.05)
+    assert not waiter.done()                                     # the fresh leg 1 may not run before the abort landed
+    gate.set()
+    assert await asyncio.wait_for(waiter, 2) is True
+    # a finished early leg is not touched: the drain consumes its verdict at the resume
+    done = _pend(f, "lo1", 0, NOW + 1)
+    f.queue.append(done)
+    done._leg1_early = asyncio.get_event_loop().create_future()
+    done._leg1_early.set_result(None)
+    keep = done._leg1_early
+    LC.sweep(f)
+    assert done._leg1_early is keep and done.lane_retake is False
+    assert sorted(h.p.rid for h in f._lane_ctl_obj.held.values()) == ["lo0", "lo1"]
+
+
+# ------------------------------------------------------------------ review FR2 finding 2: LANE-REPREFILL on the P-take path
+@_on
+async def test_lane_reprefill_counts_a_taken_leg_whose_rerun_finds_no_prefix_and_not_one_that_found_it(caplog):
+    caplog.set_level(logging.INFO, logger="weg2.front")
+    f = _front("P")
+    ls = f._lane_state()
+    _note(f, "hi", 1)
+    ls.set_floor(1)
+    lo = [_pend(f, f"lo{i}", 0, NOW + i) for i in range(3)]
+    for p in lo:
+        f.groups["P"].outstanding[p.rid] = time.time() - 2.0
+    await LC.p_take(f, lo, lambda: None)
+    assert all(p.lane_p_ran_s >= 1.5 for p in lo)
+    f._lane_end("hi")
+    await LC.reconcile(f, "end")                                 # the lane ends: the taken legs resume
+    assert all(p.lane_retake and not p.lane_p_taken for p in lo)
+    assert LC.retake_check(f, lo[0], 9000, 4096) is False        # the finished chunks came back as prefix
+    assert LC.retake_check(f, lo[1], 9000, 0) is True            # nothing cached although the leg stood on P
+    assert f.counters["lane_reprefill"] == 1 and "lo1" in f._lane_ctl_obj.reprefill
+    lo[2].lane_p_done_tokens = 8192                              # a known reference: every shortfall counts
+    assert LC.retake_check(f, lo[2], 9000, 4096) is True
+    assert f.counters["lane_reprefill"] == 2 and f.counters["lane_p_retake"] == 3
+    assert not any(p.lane_retake for p in lo)                    # checked once per take
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any(m.startswith(LN.MARK_REPREFILL + " rid=lo1") and "p-retake" in m for m in msgs)
+    assert sum(m.startswith(LC.MARK_P_RESUME) for m in msgs) == 3
+
+
+@_on
+async def test_leg1_of_a_retaken_pending_reads_the_p_answer_and_counts_the_lost_prefix():
+    """The hook in ``Front.leg1`` itself: the P answer of the re-run, not a hand-made call."""
+    f = _front("P")
+    _note(f, "hi", 1)
+    f._lane_state().set_floor(1)
+    p = _pend(f, "lo0", 0, NOW)
+    p.lane_retake, p.lane_p_ran_s = True, 4.0
+    LC.ctl(f).mark_held("lo0")
+
+    class _R:
+        status = 200
+
+        async def read(self):
+            return json.dumps({"meta_info": {"prompt_tokens": 9000, "cached_tokens": 0}}).encode()
+
+    class _Cm:
+        async def __aenter__(self):
+            return _R()
+
+        async def __aexit__(self, *a):
+            return False
+
+    f.session = types.SimpleNamespace(post=lambda *a, **k: _Cm())
+    try:
+        await f.leg1(p)
+    except Exception as e:  # noqa: BLE001 -- the rest of leg 1 (instruments) is not under test here
+        if f.counters["lane_p_retake"] == 0:
+            raise AssertionError(f"leg1 died before the lane hook: {e!r}")
+    assert f.counters["lane_p_retake"] == 1 and f.counters["lane_reprefill"] == 1 and p.lane_retake is False
+
+
+# ------------------------------------------------------------------ review FR2 finding 3: keepalive for a stream not yet opened
+class _Req(dict):
+    path = "/v1/chat/completions"
+
+
+class _OpenResp(_Resp):
+    def __init__(self):
+        super().__init__()
+        self.prepared = False
+        self.eof = False
+
+    async def prepare(self, request):
+        self.prepared = True
+
+    async def write_eof(self):
+        self.eof = True
+
+
+@contextlib.contextmanager
+def _sse(resp):
+    old = LC.new_sse_response
+    LC.new_sse_response = lambda: resp
+    try:
+        yield
+    finally:
+        LC.new_sse_response = old
+
+
+@_on
+async def test_a_stream_held_at_the_gate_is_opened_after_one_period_and_gets_its_keepalives():
+    """Review L4 FR2 finding 3: most held streams have no response yet (gate, queue, ARRIVAL-SEAT): they were silent
+    for an unbounded hold.  After one keepalive period of hold the front opens the SSE response (200,
+    text/event-stream) and sends the comment; later ticks go on; leg 2 then continues on THAT response."""
+    f = _front("D")
+    resp = _OpenResp()
+    req = _Req()
+    f._lane_state().set_floor(1)
+    _note(f, "hi", 1)
+    out = asyncio.ensure_future(f._lane_arrive(req, "lo0", {"stream": True}))
+    await asyncio.sleep(0.05)
+    assert not out.done() and "lo0" in f._lane_ctl_obj.gates and "lo0" in f._lane_ctl_obj.pre
+    with _sse(resp), _env(LN.ENV_KEEPALIVE_S, 5):
+        t0 = time.time()
+        assert await LC.keepalive_tick(f, t0) == 0                  # the hold is seen
+        assert await LC.keepalive_tick(f, t0 + 4) == 0 and not resp.prepared
+        assert await LC.keepalive_tick(f, t0 + 6) == 1              # one period held: opened + first comment
+        assert resp.prepared and resp.written == [b": lane-hold floor=1\n\n"]
+        assert req["weg2_prepared"] is True and req["weg2_lane_pre"] is resp
+        assert f.counters["lane_pre_opened"] == 1
+        assert await LC.keepalive_tick(f, t0 + 7) == 0
+        assert await LC.keepalive_tick(f, t0 + 12) == 1 and len(resp.written) == 2   # the open stream goes on
+        assert await LC.keepalive_tick(f, t0 + 13) == 0 and len(resp.written) == 2   # opened once, not again
+        assert f._lane_block()["lane_hold"]["sse_open"] == 1
+        f._lane_end("hi")
+        await LC.reconcile(f, "end")
+        assert await asyncio.wait_for(out, 2) is None
+        assert await LC.pre_take(f, req, "lo0") is resp              # leg 2 continues on the opened response
+        assert await LC.pre_take(f, req, "lo0") is resp              # ... also a re-entry (X-requeue)
+    f._lane_end("lo0")
+    assert "lo0" not in f._lane_ctl_obj.pre and "lo0" not in f._lane_ctl_obj.streams
+
+
+@_on
+async def test_a_short_hold_opens_nothing_and_leg_2_builds_its_own_response():
+    f = _front("D")
+    resp = _OpenResp()
+    req = _Req()
+    f._lane_state().set_floor(1)
+    _note(f, "hi", 1)
+    out = asyncio.ensure_future(f._lane_arrive(req, "lo0", {"stream": True}))
+    await asyncio.sleep(0.05)
+    with _sse(resp), _env(LN.ENV_KEEPALIVE_S, 5):
+        t0 = time.time()
+        await LC.keepalive_tick(f, t0)
+        await LC.keepalive_tick(f, t0 + 3)
+        f._lane_end("hi")
+        await LC.reconcile(f, "end")
+        assert await asyncio.wait_for(out, 2) is None
+        assert await LC.keepalive_tick(f, t0 + 30) == 0              # floor 0 / request released: nothing opens
+    assert not resp.prepared and "weg2_lane_pre" not in req
+    assert await LC.pre_take(f, req, "lo0") is None                  # leg 2 prepares its own, as today
+    # a non-stream request is never registered; a request arriving at the floor lane is never opened
+    out2 = await f._lane_arrive(_Req(), "nostream", {"stream": False})
+    assert out2 is None and "nostream" not in f._lane_ctl_obj.pre
+
+
+@_on
+async def test_a_request_that_was_taken_by_leg_2_is_not_opened_behind_its_back():
+    f = _front("D")
+    resp = _OpenResp()
+    req = _Req()
+    LC.pre_register(f, "r0", req)
+    _note(f, "r0", 0)
+    assert await LC.pre_take(f, req, "r0") is None                   # leg 2 got there first
+    f._lane_state().set_floor(1)
+    with _sse(resp), _env(LN.ENV_KEEPALIVE_S, 1):
+        t0 = time.time()
+        await LC.keepalive_tick(f, t0)
+        assert await LC.keepalive_tick(f, t0 + 5) == 0
+    assert not resp.prepared
+
+
+@_on
+async def test_an_answer_that_is_no_stream_after_the_early_open_becomes_one_error_event_and_the_close():
+    f = _front("D")
+    resp = _OpenResp()
+    req = _Req()
+    req["weg2_lane_pre"] = resp
+    req["weg2_lane_rid"] = "lo0"
+    from aiohttp import web
+    # the open response itself: untouched
+    assert await f._lane_pre_finish(req, resp, None) is None
+    # a json_response 503 (a refusal path of handle_generate): an OpenAI error chunk, then EOF
+    out = web.json_response({"error": "WEG2 STOP x"}, status=503)
+    assert await f._lane_pre_finish(req, out, None) is resp
+    assert resp.eof and resp.written[0].startswith(b'data: {"error"') and b"status=503" in resp.written[0]
+    # an exception: the same, and a request without an early open is left alone
+    resp2 = _OpenResp()
+    req2 = _Req()
+    req2["weg2_lane_pre"] = resp2
+    assert await f._lane_pre_finish(req2, None, RuntimeError("boom")) is resp2 and b"RuntimeError: boom" in resp2.written[0]
+    assert await f._lane_pre_finish(_Req(), out, None) is None
+    # the anthropic wire gets its event: error
+    req3 = _Req()
+    req3.path = "/v1/messages"
+    resp3 = _OpenResp()
+    req3["weg2_lane_pre"] = resp3
+    await f._lane_pre_finish(req3, out, None)
+    assert resp3.written[0].startswith(b"event: error\n")
+    assert f.counters["lane_pre_error_event"] == 3
+
+
+@_on
+async def test_the_stop_guard_turns_the_handlers_503_into_an_error_event_on_an_opened_stream_and_is_inert_off():
+    f = _front("D")
+    resp = _OpenResp()
+    from aiohttp import web
+
+    async def handler(request):
+        request["weg2_lane_pre"] = resp
+        return web.json_response({"error": "x"}, status=503)
+
+    async def raising(request):
+        request["weg2_lane_pre"] = resp
+        raise RuntimeError("leg2 died")
+
+    req = _Req()
+    out = await f.stop_guard(handler)(req)
+    assert out is resp and resp.eof
+    resp.eof = False
+    out = await f.stop_guard(raising)(_Req())
+    assert out is resp and resp.eof
+    with pytest.raises(RuntimeError):                                # no early open: the exception goes on as before
+        async def plain(request):
+            raise RuntimeError("plain")
+        await f.stop_guard(plain)(_Req())
+    with _switch(False):                                             # switch off: the guard is the old guard
+        resp.eof = False
+        out = await f.stop_guard(handler)(_Req())
+        assert out is not resp and out.status == 503 and not resp.eof

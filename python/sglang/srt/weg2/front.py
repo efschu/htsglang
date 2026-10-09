@@ -3734,6 +3734,13 @@ class Pending:
     #: PRIORITY LANES 1008 (L4): this leg 1 was taken off P for a higher lane (``lane_ctl.p_take``): its ``one`` task
     #: ends with the Pending un-prefilled, no hand-off to D, no failure answer; reset at the lane resume.
     lane_p_taken: bool = False
+    #: PRIORITY LANES 1008 (L4 FR2): this leg 1 runs AGAIN after it was taken off P (``lane_ctl.p_take``) or its
+    #: early leg was cancelled for a lane hold; the P response of that re-run is checked for the prefix the first
+    #: run left (``lane_ctl.retake_check``, LANE-REPREFILL). ``lane_p_ran_s``: seconds the first run stood on P at the
+    #: take; ``lane_p_done_tokens``: tokens P reported finished at the take (0 = P reports none, today's case).
+    lane_retake: bool = False
+    lane_p_ran_s: float = 0.0
+    lane_p_done_tokens: int = 0
 
 
 #: H102 (#23p, dkrnfbar1agent0925): A CLIENT THAT HANGS UP BEFORE ITS ANSWER
@@ -7324,6 +7331,8 @@ class Front:
         seat or queue place. Returns a response only when the client left while it was held."""
         if not _lanes.enabled():
             return None
+        if isinstance(payload, dict) and payload.get("stream"):
+            _lctl.pre_register(self, rid, request)  # L4 FR2: a held stream is opened for its keepalive
         try:
             out = await _lctl.arrive(self, request, rid, client_gone, web)
         except asyncio.CancelledError:
@@ -7384,7 +7393,7 @@ class Front:
         return _fp.lane_hold(ls.lane_floor, ls.lane_epoch, lane, held,
                              acked=lc.acked.get(g.name) == (ls.lane_floor, ls.lane_epoch))
 
-    def _lane_reprefill(self, rid: str) -> None:
+    def _lane_reprefill(self, rid: str, why: str = "") -> None:
         """LANE-REPREFILL: a request that was held / parked for a lane found no prefix at its resume (D asked for a
         P prefill, RESUME-VIA-P) -- the displacement chain (VRAM -> L2 -> L3) did not keep its KV. Must count 0 on
         metal; a count is the chain's fault, not the lane's (plan decision 3)."""
@@ -7397,11 +7406,43 @@ class Front:
         self.counters["lane_reprefill"] += 1
         logger.warning("%s rid=%s lane=%d floor=%d epoch=%d -- the resume of a lane-held request found no prefix: "
                        "P prefills its context again (RESUME-VIA-P); the VRAM->L2->L3 chain did not keep its KV "
-                       "(must count 0 on metal)", _lanes.MARK_REPREFILL, rid, Front._lane_state(self).lane_for(rid),
-                       Front._lane_state(self).lane_floor, Front._lane_state(self).lane_epoch)
+                       "(must count 0 on metal)%s", _lanes.MARK_REPREFILL, rid, Front._lane_state(self).lane_for(rid),
+                       Front._lane_state(self).lane_floor, Front._lane_state(self).lane_epoch,
+                       (" [" + why + "]") if why else "")
 
     def _lane_stream_open(self, rid: str, request, resp):
         return _lctl.stream_open(self, rid, request, resp)
+
+    async def _lane_pre_finish(self, request, out, exc):
+        """The handler of a request whose SSE response the lane loop OPENED EARLY (``lane_ctl.pre_*``) ended with
+        something else than that response -- a ``json_response`` 503, an HTTPException, a raised error: the status
+        line is sent already, so the answer becomes ONE named error event on the open stream and the stream is
+        closed. Returns the open response, or None when the request has no early-opened response (the caller goes
+        on as before)."""
+        pre = request.get("weg2_lane_pre") if hasattr(request, "get") else None
+        if pre is None or out is pre:
+            return None
+        if exc is not None:
+            msg = f"{type(exc).__name__}: {exc}"
+        else:
+            msg = ""
+            try:
+                body = getattr(out, "body", None)
+                msg = (body.decode(errors="replace") if isinstance(body, (bytes, bytearray))
+                       else str(getattr(out, "text", "") or ""))[:400]
+            except Exception:  # noqa: BLE001
+                msg = ""
+            msg = f"status={getattr(out, 'status', '?')} {msg}".strip()
+        self.counters["lane_pre_error_event"] += 1
+        logger.warning("WEG2 LANE-SSE-ERROR rid=%s path=%s -- the stream was opened early for the keepalive and "
+                       "the request ended with an answer that is no stream: sent as an error event, stream "
+                       "closed (%s)", request.get("weg2_lane_rid", "?"), request.path, msg[:200])
+        try:
+            await pre.write(named_error_chunk(request.path, f"WEG2 lane hold ended with an error: {msg}"))
+            await pre.write_eof()
+        except Exception:  # noqa: BLE001 -- a client that left
+            pass
+        return pre
 
     def _lane_block(self) -> dict:
         """``{lane_floor, lane_epoch, lanes}`` for state.json / ``/weg2/state``; ``{}`` with the switch off
@@ -9563,7 +9604,19 @@ class Front:
             if task is not None:
                 live.add(task)
             try:
-                return await handler(request)
+                if not _lanes.enabled():
+                    return await handler(request)
+                try:
+                    out = await handler(request)
+                except (asyncio.CancelledError, Weg2Stop):
+                    raise
+                except Exception as e:  # noqa: BLE001 -- an exception after the early SSE open: an error event
+                    out = await Front._lane_pre_finish(self, request, None, e)
+                    if out is None:
+                        raise
+                    return out
+                fin = await Front._lane_pre_finish(self, request, out, None)
+                return out if fin is None else fin
             except asyncio.CancelledError:
                 if (self.state != "STOP" or task is None
                         or not getattr(task, "_weg2_stop_cancel", False)
@@ -12148,6 +12201,8 @@ class Front:
                 js = {}
             pt, ct, _, _ = usage_of(js)
             p.leg1_prompt_tokens = pt
+            if p.lane_retake:
+                _lctl.retake_check(self, p, pt, ct)  # PRIORITY LANES 1008 (L4 FR2): LANE-REPREFILL on a lost prefix
             self._note_p_prefix_reuse(p, ct)
             # #1324: NO PRESENCE RECORD HERE. This site used to call
             # `self.spans.record(p.text, pt)`, i.e. it credited the span
@@ -12776,12 +12831,17 @@ class Front:
                         and envs.SGLANG_WEG2_ENABLE_P_ANCHOR_PRESENCE.get()):
                     self._p_anchor_presence(rid, text, pending)
                 if stream:
-                    resp = web.StreamResponse(
-                        status=r.status,
-                        headers=({"Retry-After": str(STATE_REFUSAL_RETRY_AFTER_S)}
-                                 if r.status == 503 else None))
-                    resp.content_type = r.content_type
-                    await resp.prepare(request)
+                    # PRIORITY LANES 1008 (L4 FR2): a stream held long enough was opened early (200 + SSE) so it
+                    # could get its keepalive; leg 2 continues on THAT response (None = the normal path, always
+                    # so with the switch off)
+                    resp = await _lctl.pre_take(self, request, rid) if _lanes.enabled() else None
+                    if resp is None:
+                        resp = web.StreamResponse(
+                            status=r.status,
+                            headers=({"Retry-After": str(STATE_REFUSAL_RETRY_AFTER_S)}
+                                     if r.status == 503 else None))
+                        resp.content_type = r.content_type
+                        await resp.prepare(request)
                     request["weg2_prepared"] = True   # W3-STOP: a STOP closes this stream, no 503 after it
                     # PRIORITY LANES 1008 (L4): the open stream, for the keepalive of a held one (None = off)
                     _lane_stream = Front._lane_stream_open(self, rid, request, resp)
