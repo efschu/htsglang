@@ -923,7 +923,7 @@ files) and its German values must not go through `ident_fix` (`Katalog` -> `Cata
 `static/index.html` (sessions block, TTFT help text and `ttftOf()`), all of the kind "the tree side is the old text this commit replaces"; the fix side was taken. Old -> new SHA per line: see the
 port table in the seat report. Deploy: a commit of the old name is never an ancestor of a renamed tree, so `install.sh --check` now also counts a commit as contained when the revision itself lists it
 in `tools/rig_dashboard/rigdash/deploy/CARRIED_FROM` (`d983311745` deploy line, `9d3f7bed11` running release; read with `git show <rev>:...`, never from the work tree); proof:
-`install.sh --check <head>` -> `deploy-linie ok` on both heads (before: REFUSED on both), `test_f0k_dashboard_deploy_check_1009.py` (7 cases, real script, throw-away repository).
+`install.sh --check <head>` -> `deploy-linie ok` on the 27B head (before: REFUSED); every `CARRIED_FROM` entry is pinned to content by `test_f0k_dashboard_deploy_check_1009.py` (9 cases, real script, throw-away repository, `CONTENT_PIN`; the Flash-Next head lists only `9d3f7bed11` and stays refused on the line rule, fix round 1).
 
 **M4, DEFAULTS-ON (NF line; user decision 09.10.).** `desk/nf-defaults-on-1008` @ dd65a419fb ported (`FLLIPER_PDFLIP_ENABLE_W3_SPILL_HOST_LEAVES` and `FLLIPER_PDFLIP_MAMBA_SPILL_LAST_RESORT`: `EnvBool(True)`,
 `0` = the old path; docstrings and the three tests). The edge catalog follows: K132's sentence said "both default off" and its evidence anchor moved with the docstring (catalog build: K132 `veraltet`);

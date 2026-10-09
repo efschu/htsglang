@@ -8,7 +8,8 @@ asked about.  The cases run the REAL script against a throw-away repository:
 * an old-name commit that is neither an ancestor nor listed is still refused (both rules);
 * the same revision with the list is accepted;
 * the list is read from the REVISION, not from the working directory or the environment;
-* a listed commit that is an ancestor changes nothing.
+* a listed commit that is an ancestor changes nothing;
+* every entry of the shipped list is pinned to content the tree really holds (CONTENT_PIN).
 """
 import os
 import pathlib
@@ -26,6 +27,28 @@ INSTALL = ROOT / "tools" / "rig_dashboard" / "rigdash" / "deploy" / "install.sh"
 CARRIED = "tools/rig_dashboard/rigdash/deploy/CARRIED_FROM"
 ENV = {**{k: v for k, v in os.environ.items() if not k.startswith("GIT_")}, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@x", "GIT_COMMITTER_NAME": "t",
        "GIT_COMMITTER_EMAIL": "t@x"}
+
+
+# What each CARRIED_FROM entry claims the tree holds: (file, regex) pairs; a tree may list an entry only if all of them match.
+CONTENT_PIN = {
+    # tip of the deploy line: always-on read-only planner (ff2f2f539c ... 2e75e2a82b) -- only the 27B line carries it (F0-J section 7 step 3)
+    "d983311745": [
+        ("python/flliper/srt/planner/webui.py", r"(?m)^READONLY = "),
+        ("python/flliper/srt/planner/webui.py", r"_NEVER_MONITOR_PORTS"),
+        ("tools/rig_dashboard/rigdash/weg2line.py", r"."),
+        ("tools/rig_dashboard/rigdash/deploy/rig-planner.service", r"(?m)^Environment=FLLIPER_PLANNER_READONLY=1"),
+    ],
+    # running release /opt/rigdash/current: language switch EN/DE, RigTip, ...
+    "9d3f7bed11": [
+        ("tools/rig_dashboard/rigdash/static/i18n_de.json", r"."),
+        ("tools/rig_dashboard/rigdash/static/tooltip.js", r"RigTip"),
+    ],
+}
+
+
+def _shipped_heads():
+    txt = (ROOT / CARRIED).read_text(encoding="utf-8")
+    return [ln.split()[0][:10] for ln in txt.splitlines() if ln.strip() and not ln.startswith("#")]
 
 
 def git(repo, *a):
@@ -105,10 +128,27 @@ class DeployCheck(CustomTestCase):
         p = self._check(git(self.repo, "rev-parse", "HEAD"))
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
 
-    def test_the_shipped_list_names_exactly_what_the_acceptance_missed(self):
-        txt = (ROOT / CARRIED).read_text(encoding="utf-8")
-        heads = [ln.split()[0] for ln in txt.splitlines() if ln.strip() and not ln.startswith("#")]
-        self.assertEqual(sorted(heads), ["9d3f7bed11", "d983311745"])
+    def test_the_shipped_list_names_only_known_commits(self):
+        heads = _shipped_heads()
+        self.assertIn("9d3f7bed11", heads)                          # every renamed head carries the running release
+        self.assertEqual(sorted(set(heads) - set(CONTENT_PIN)), [], "a CARRIED_FROM entry without a content pin is a bare self-declaration")
+
+    def test_every_shipped_entry_is_backed_by_its_content(self):
+        """The check trusts the list and never looks at content (install.sh `carried`), so the list may claim only what the tree really holds.
+        Review finding F0-K fix round 1: the Flash-Next head listed the deploy-line tip d983311745 without carrying the always-on planner
+        (READONLY lock, router-port exclusion) and was accepted -- it must not list it until the content is ported."""
+        for head in _shipped_heads():
+            for rel, pattern in CONTENT_PIN[head]:
+                f = ROOT / rel
+                self.assertTrue(f.is_file(), "%s claimed in CARRIED_FROM, but %s is missing" % (head, rel))
+                self.assertRegex(f.read_text(encoding="utf-8"), pattern, "%s claimed in CARRIED_FROM, but %s lacks %r" % (head, rel, pattern))
+
+    def test_the_content_pin_is_not_vacuous(self):
+        """each pattern must reject a tree without the content (guards the pin itself)"""
+        planner = CONTENT_PIN["d983311745"][0]
+        import re
+        self.assertIsNone(re.search(planner[1], "READONLY: bool = False\nsomething_else = 1\n"))
+        self.assertIsNotNone(re.search(planner[1], "x = 1\nREADONLY = os.environ.get('FLLIPER_PLANNER_READONLY') == '1'\n"))
 
 
 if __name__ == "__main__":
