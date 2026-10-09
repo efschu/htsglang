@@ -241,6 +241,41 @@ def tower_extent(
     )
 
 
+def is_gguf_file(path: str) -> bool:
+    """The server's own GGUF predicate (``hf_transformers.common.check_gguf_file``:
+    a FILE with the ``.gguf`` suffix or the GGUF magic), stdlib only so the
+    planner side never imports torch for it."""
+    if not path or not os.path.isfile(path):
+        return False
+    if path.endswith(".gguf"):
+        return True
+    with open(path, "rb") as fh:
+        return fh.read(4) == b"GGUF"
+
+
+def tower_source_dir(*, model_path: str, tokenizer_path: str) -> str:
+    """VISION-GGUF (09.10.): the directory the transient tower is read from.
+
+    A safetensors ``--model`` is its own source, unchanged. A ``.gguf`` FILE
+    carries no tower (llama.cpp keeps it in an mmproj; the GGUF loader maps
+    text tensors only), so the stage reads it from ``--tokenizer-path``: the
+    sharded checkpoint of the same model, whose index this loader prices like
+    any other. Only the transient stage calls this (rank arming, the tokenizer
+    process's arming, the launcher's refusal and host post). A GGUF without
+    such a directory is refused by name; nothing is guessed."""
+    if not is_gguf_file(model_path):
+        return model_path
+    tok = str(tokenizer_path or "")
+    if not (os.path.isdir(tok) and os.path.isfile(os.path.join(tok, "model.safetensors.index.json"))):
+        raise VisionStageLoadRefused(
+            f"{model_path} is a GGUF file and carries no vision tower; the transient "
+            f"stage reads the tower from --tokenizer-path, and {tok!r} is not a "
+            "directory with a model.safetensors.index.json. Pass --tokenizer-path "
+            "<the safetensors checkpoint of the same model>."
+        )
+    return tok
+
+
 def find_tower_shard(
     model_dir: str, *, selector: Callable[[str], bool] = is_vision_weight
 ) -> str:

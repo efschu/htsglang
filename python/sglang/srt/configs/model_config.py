@@ -455,6 +455,7 @@ class ModelConfig:
                 detect_gguf_multimodal,
                 is_qwen35_gguf_arch,
             )
+            from sglang.srt.weg2.vision_d_guard import transient_group_without_tower
 
             mmproj_path = None
             if is_qwen35_gguf_arch(
@@ -471,6 +472,14 @@ class ModelConfig:
                     "vision tower will be loaded from it and multimodal "
                     "stays enabled.",
                     mmproj_path,
+                )
+            elif transient_group_without_tower(self.hf_config):
+                # VISION-GGUF: --weg2-vision transient builds NO tower
+                # (language_model_only); P's stage reads it per image from
+                # --tokenizer-path, so the tokenizer's image path stays on.
+                logger.info(
+                    "GGUF multimodal: --weg2-vision transient (language_model_only, "
+                    "no tower built); multimodal tokenization stays enabled."
                 )
             else:
                 if enable_multimodal:

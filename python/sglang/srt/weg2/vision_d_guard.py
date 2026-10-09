@@ -54,6 +54,22 @@ def d_guard_armed(model_config: Any, env: Optional[Dict[str, str]] = None) -> bo
     return bool(getattr(hf, "language_model_only", False))
 
 
+def transient_group_without_tower(hf_config: Any, env: Optional[Dict[str, str]] = None) -> bool:
+    """VISION-GGUF (09.10.): this group runs ``--weg2-vision transient``'s model
+    form -- no tower in the model (``language_model_only``), images encoded by
+    P's stage (``SGLANG_WEG2_VISION=transient``, P only) or guarded on D
+    (:func:`d_guard_armed`). For a GGUF ``--model`` this is the one case in
+    which multimodal TOKENIZATION may stay on without an mmproj: no tower is
+    built, so none can run uninitialized (model_config.py's GGUF branch)."""
+    if not bool(getattr(hf_config, "language_model_only", False)):
+        return False
+    e = os.environ if env is None else env
+    group = (e.get("SGLANG_WEG2_GROUP", "") or "").strip().upper()
+    if group == "D":
+        return True
+    return group in ("", "P") and (e.get("SGLANG_WEG2_VISION", "") or "").strip() == "transient"
+
+
 def image_spans(req: Any) -> List[Tuple[int, int]]:
     """Every multimodal placeholder span of the request, (start, end) inclusive."""
     mm = getattr(req, "multimodal_inputs", None)

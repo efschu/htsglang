@@ -96,8 +96,10 @@ from sglang.srt.planner.vision_stage_load import (
     MEASURED_LOADER_GBPS,
     VisionStageLoadRefused,
     find_tower_shard,
+    is_gguf_file,
     strip_checkpoint_prefix,
     tower_extent,
+    tower_source_dir,
     tower_state_dict,
 )
 from sglang.srt.weg2 import vision_stage_service as _vss
@@ -1000,6 +1002,9 @@ def arm_transient_vision(
                 "no model path on the server args; the rank cannot find the "
                 "tower's shard"
             )
+        if is_gguf_file(model_dir):
+            # VISION-GGUF: the tower comes from --tokenizer-path (the rank reads it there)
+            tower_source_dir(model_path=model_dir, tokenizer_path=str(server_args.tokenizer_path or ""))
         if hf_config is None or getattr(hf_config, "vision_config", None) is None:
             raise VisionStageArmRefused(
                 "no vision_config on the model config; the rank would have no "
