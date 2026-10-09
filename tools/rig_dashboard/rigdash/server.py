@@ -37,9 +37,13 @@ from typing import Optional
 
 from . import (energy, features, flipzeit, health, history, hwprofil, imagechanges, ipcboot, kartenplan, launchview, live,
                modellprofil, profil, profile_oracle, profile_recompute, redact, sampler, sources, vmpush, weg2line)
+from . import names as N
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATIC = os.path.join(HERE, "static")
+#: the start-line page: ``/pdflip`` and, for bookmarks and links written before the rename (F0-F), the old subsystem name
+#: (``names.STEM_TOKENS``, split there). The page text and the error messages name the new route.
+LINE_PAGES = ("/pdflip", "/pdflip.html", "/" + N.STEM_TOKENS[0], "/" + N.STEM_TOKENS[0] + ".html")
 VERSION_FILE = os.path.join(HERE, "VERSION")
 #: vendored, served locally (the rig is LAN-only, no CDN): uPlot 1.6.32 (MIT, static/uplot.LICENSE)
 STATIC_FILES = {
@@ -79,7 +83,7 @@ def _version():
 
 
 def _container_token(name: str) -> str:
-    n = re.sub(r"^htsglang-(acc-)?", "", name or "")
+    n = re.sub(r"^%s-(acc-)?" % N.name_match_rx(), "", name or "")     # F0-F: containers of either product name
     return n.replace("-", "").replace("_", "")
 
 
@@ -603,7 +607,7 @@ def make_handler(app: App):
         def _pdflip(self, path):
             if self._via_proxy():
                 # the dry run executes a check script on the Proxmox host: LAN only
-                return self._json({"ok": False, "error": "Start line and dry run only in the LAN (http://192.168.0.88:8890/weg2)"}, 403)
+                return self._json({"ok": False, "error": "Start line and dry run only in the LAN (http://192.168.0.88:8890/pdflip)"}, 403)
             from urllib.parse import parse_qs, urlsplit
 
             q = {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()}
@@ -845,12 +849,12 @@ def make_handler(app: App):
                     name = "mark.svg" if path == "/favicon.svg" else path[1:]
                     with open(os.path.join(STATIC, name), "rb") as fh:
                         return self._send(200, fh.read(), "image/svg+xml")
-                if app.edition == "release" and (path in ("/pdflip", "/pdflip.html", "/api/launch")
+                if app.edition == "release" and (path in LINE_PAGES + ("/api/launch",)
                                                  or path.startswith("/api/pdflip/")):
                     return self._send(404, "not found", "text/plain")
-                if path in ("/pdflip", "/pdflip.html") and self._via_proxy():
-                    return self._send(403, "Start line only in the LAN: http://192.168.0.88:8890/weg2", "text/plain; charset=utf-8")
-                if path in ("/pdflip", "/pdflip.html"):
+                if path in LINE_PAGES and self._via_proxy():
+                    return self._send(403, "Start line only in the LAN: http://192.168.0.88:8890/pdflip", "text/plain; charset=utf-8")
+                if path in LINE_PAGES:
                     with open(os.path.join(STATIC, "pdflip.html"), "rb") as fh:
                         return self._send(200, fh.read(), "text/html; charset=utf-8")
                 if path.startswith("/api/pdflip/"):

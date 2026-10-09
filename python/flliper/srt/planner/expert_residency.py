@@ -944,29 +944,34 @@ def read_owned_miss_records(path: Optional[str]) -> List[Dict[str, object]]:
     return [e for e in entries if isinstance(e, dict) and e.get("kind") == OWNED_MISS_KIND]
 
 
-def read_owned_miss_rank_records(directory: Optional[str]) -> List[Dict[str, object]]:
+def read_owned_miss_rank_records(directory) -> List[Dict[str, object]]:
     """The rank records the D ranks wrote (``pool_miss_cost.flush``); a missing
-    directory or an unreadable file is skipped, never read as a zero."""
+    directory or an unreadable file is skipped, never read as a zero.
+    ``directory`` is one path or several (F0-F: the records root of the line and
+    its pre-rename sibling, ``pool_miss_cost.record_dirs_for``); the records of
+    all of them are one pool -- the youngest-window rule picks among them."""
     if not directory:
         return []
     import json
     import os
 
-    try:
-        names = sorted(os.listdir(directory))
-    except OSError:
-        return []
+    dirs = [directory] if isinstance(directory, str) else [d for d in directory if d]
     out = []
-    for name in names:
-        if not (name.startswith("owned_miss_") and name.endswith(".json")):
-            continue
+    for d in dirs:
         try:
-            with open(os.path.join(directory, name)) as fh:
-                rec = json.load(fh)
-        except (OSError, ValueError):
+            names = sorted(os.listdir(d))
+        except OSError:
             continue
-        if isinstance(rec, dict) and rec.get("kind") == OWNED_MISS_RANK_KIND:
-            out.append(rec)
+        for name in names:
+            if not (name.startswith("owned_miss_") and name.endswith(".json")):
+                continue
+            try:
+                with open(os.path.join(d, name)) as fh:
+                    rec = json.load(fh)
+            except (OSError, ValueError):
+                continue
+            if isinstance(rec, dict) and rec.get("kind") == OWNED_MISS_RANK_KIND:
+                out.append(rec)
     return out
 
 

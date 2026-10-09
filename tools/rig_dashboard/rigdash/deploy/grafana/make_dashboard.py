@@ -6,6 +6,13 @@ Live-Zustand.  Eine Quelle der Wahrheit für die Tafel ist diese Datei; nach Än
 """
 
 import json
+import os
+import sys
+
+# F0-F + F0-M (rename): the metric names are must-keep (old prefix, user decision 08.10.); every panel still reads both the old and
+# the interim prefix. One rule for the dashboard and for this file: rigdash.vmpush.dual_promql.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".."))
+from rigdash.vmpush import dual_promql  # noqa: E402
 
 DS = {"type": "prometheus", "uid": "vm"}
 _id = [0]
@@ -36,7 +43,7 @@ def panel(title, targets, unit="short", x=0, y=0, w=12, h=8, desc="", draw="line
 
 
 def t(expr, legend):
-    return {"expr": expr, "legendFormat": legend}
+    return {"expr": dual_promql(expr), "legendFormat": legend}
 
 
 def row(title, y):

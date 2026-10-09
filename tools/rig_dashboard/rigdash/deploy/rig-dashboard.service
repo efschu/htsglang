@@ -9,6 +9,9 @@
 # Runs from a DEPLOYED copy (/opt/rigdash/current -> releases/<sha>), never
 # from a git worktree an unrelated agent can delete (the defect recorded in
 # htsglang-planner.service, 2026-08-12). Deploy/update: deploy/install.sh.
+#
+# State dir: /var/lib/flliper (F0-F, rename). install.sh keeps /var/lib/rigdash instead when that is where this rig's
+# history.sqlite already lies and /var/lib/flliper has none (it substitutes --state-dir and StateDirectory= then).
 
 [Unit]
 Description=Rig-Dashboard live (rigdash, read-only, LAN :8890)
@@ -21,8 +24,8 @@ StartLimitBurst=20
 Type=exec
 WorkingDirectory=/opt/rigdash/current
 # --release-profile: which profiles the start-line wizard offers (Operator 27.09.: 27B INT8 drq + NF H91).
-ExecStart=/usr/bin/python3 -m rigdash --host 0.0.0.0 --port 8890 --front http://127.0.0.1:30030 --state-dir /var/lib/rigdash --release-profile 27b-release-draft --release-profile nf-h91
-StateDirectory=rigdash
+ExecStart=/usr/bin/python3 -m rigdash --host 0.0.0.0 --port 8890 --front http://127.0.0.1:30030 --state-dir /var/lib/flliper --release-profile 27b-release-draft --release-profile nf-h91
+StateDirectory=flliper
 Environment=PYTHONUNBUFFERED=1
 # ssh reads the `proxmox` alias and key from /root/.ssh
 Environment=HOME=/root

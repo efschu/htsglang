@@ -21,7 +21,10 @@ import time
 import urllib.request
 from typing import Dict, Iterable, List, Optional, Tuple
 
+import re
+
 from . import flipzeit
+from . import names as N
 
 DEFAULT_URL = "http://127.0.0.1:8428"
 PUSH_S = 5.0
@@ -219,6 +222,23 @@ class Bridge:
 
 # ----------------------------------------------------------------------------- reading (PromQL)
 
+#: F0-F + F0-M (rename): the metric NAMES are must-keep (user decision 08.10.): the sampler WRITES the series under the old
+#: subsystem prefix, as it did before the rename, and VictoriaMetrics keeps the history under it. Every reader still reads BOTH
+#: families, the old prefix (all that is pushed) and the interim ``pdflip`` prefix (series a renamed-tree test boot may have
+#: pushed), whichever spelling the PromQL text uses. The old token comes from ``names.STEM_TOKENS`` (split there, so the rename
+#: tool never rewrites it here).
+_METRIC_RX = re.compile(r"(?<![A-Za-z0-9_:])(?:%s|%s)_([a-z0-9_]+)(\{[^}]*\})?" % tuple(re.escape(t) for t in N.STEM_TOKENS))
+
+
+def dual_promql(promql: str) -> str:
+    """``<prefix>_front_queue{model="NF"}`` (either prefix) -> ``{__name__=~"(<old>|<interim>)_front_queue",model="NF"}``: every
+    metric of the family in a PromQL text reads the old and the interim series. Idempotent (the output has no bare metric name)."""
+    def sub(m):
+        labels = (m.group(2) or "")[1:-1].strip()
+        return '{__name__=~"(%s|%s)_%s"%s}' % (N.STEM_TOKENS[0], N.STEM_TOKENS[1], m.group(1), ("," + labels) if labels else "")
+    return _METRIC_RX.sub(sub, promql)
+
+
 class VmClient:
     """rigdash reads VictoriaMetrics per PromQL HTTP API (``/api/v1/query``)."""
 
@@ -227,7 +247,7 @@ class VmClient:
 
     def query(self, promql: str, t: Optional[float] = None) -> List[dict]:
         from urllib.parse import urlencode
-        q = {"query": promql}
+        q = {"query": dual_promql(promql)}
         if t is not None:
             q["time"] = "%.3f" % t
         with urllib.request.urlopen(self.url + "/api/v1/query?" + urlencode(q), timeout=self.timeout) as r:
@@ -239,7 +259,7 @@ class VmClient:
     def query_range(self, promql: str, start: float, end: float, step: float) -> Dict[int, float]:
         """{unix_s: value} of the (summed) result of a range query."""
         from urllib.parse import urlencode
-        q = {"query": promql, "start": "%.3f" % start, "end": "%.3f" % end, "step": "%ds" % max(1, int(step))}
+        q = {"query": dual_promql(promql), "start": "%.3f" % start, "end": "%.3f" % end, "step": "%ds" % max(1, int(step))}
         with urllib.request.urlopen(self.url + "/api/v1/query_range?" + urlencode(q), timeout=self.timeout) as r:
             d = json.loads(r.read())
         if d.get("status") != "success":
@@ -256,7 +276,7 @@ class VmClient:
     def query_range_by(self, promql: str, start: float, end: float, step: float, label: str) -> Dict[str, Dict[int, float]]:
         """{label value: {unix_s: value}} of a range query."""
         from urllib.parse import urlencode
-        q = {"query": promql, "start": "%.3f" % start, "end": "%.3f" % end, "step": "%ds" % max(1, int(step))}
+        q = {"query": dual_promql(promql), "start": "%.3f" % start, "end": "%.3f" % end, "step": "%ds" % max(1, int(step))}
         with urllib.request.urlopen(self.url + "/api/v1/query_range?" + urlencode(q), timeout=self.timeout) as r:
             d = json.loads(r.read())
         if d.get("status") != "success":

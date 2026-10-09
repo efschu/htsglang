@@ -1,6 +1,7 @@
 {
  "_comment": "Auftrag 2012: Dateien des Editor-Pakets, die ALTEN und NEUEN Namen absichtlich nebeneinander schreiben (Schema flliper.server/1, FLLIPER_PROFILE, Prosa 'sglang-Umgebung'). Das Kit bricht bei so einer Datei in Schritt 1 ab (Kollision flliper <- {flliper,sglang}); hier sind genau diese Dateien mit ihren Woertern freigegeben, gedeckt durch test_rename_editor_2012 (umbenanntes Paket: Importe, Katalog, Editor-Tests). Eine NEUE Kollisionsdatei bricht das Skript ab, bis sie gelesen und hier eingetragen ist. Pfade relativ zum Inhalt von tools/rig_dashboard.",
  "_f0a_1007": "F0-A 07.10.2026: +6 files/words of the 27B head 07c20a35e5 (collision_proposal.py, full-token proof or read by F0-A; tools/release/data/collision_ok_1007_27b.json): files added or grown after 05.10. A new collision file still aborts.",
+ "_f0f_1008": "F0-F 08.10.2026: the Grafana panel reads the metric family under both prefixes ((old|pdflip)_front_*; vmpush.dual_promql), so the file writes the old and the new subsystem word side by side on purpose. A new collision file still aborts.",
  "README.md": [
   "flliper"
  ],
@@ -12,6 +13,9 @@
  ],
  "rigdash/README.md": [
   "flliper"
+ ],
+ "rigdash/deploy/grafana/dashboards/rig-verlauf.json": [
+  "pdflip"
  ],
  "rigdash/deploy/install_510.sh": [
   "flliper"

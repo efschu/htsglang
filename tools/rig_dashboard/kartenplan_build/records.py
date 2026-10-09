@@ -344,14 +344,28 @@ def flags_of(argv: List[str]) -> List[str]:
     return [a.split("=", 1)[0] for a in argv if a.startswith("--")]
 
 
+#: the boot-log stem token of both generations, old first: a boot of the tree before the rename wrote ``boot_<old>_<tag>_*``, one of the
+#: renamed tree writes ``boot_pdflip_<tag>_*``.  Split on purpose: the mechanical rename must not turn this table into ``(pdflip, pdflip)``
+#: (same technique as rigdash/names.py, F0-B).
+BOOT_STEMS = ("we" "g2", "pdflip")
+
+
+def boot_logs(evidence_root: str, tag: str, suffix: str) -> List[str]:
+    """The boot logs ``boot_<stem>_<tag>_*<suffix>`` of EITHER generation (a tag names one boot, so at most one generation matches)."""
+    out: List[str] = []
+    for stem in BOOT_STEMS:
+        out += sorted(glob.glob(os.path.join(evidence_root, "boot_%s_%s_*%s" % (stem, tag, suffix))))
+    return out
+
+
 def build_record(spec: dict) -> dict:
     rec: dict = {"schema": SCHEMA, "id": spec["id"], "profile": spec["profile_id"], "line": spec["line"],
                  "built_from": {}}
     ev = spec["evidence_root"]
     tag = spec["tag"]
-    front = glob.glob(os.path.join(ev, "boot_weg2_%s_*.front.log" % tag))
-    dlog = glob.glob(os.path.join(ev, "boot_weg2_%s_*.D.log" % tag))
-    plog = glob.glob(os.path.join(ev, "boot_weg2_%s_*.P.log" % tag))
+    front = boot_logs(ev, tag, ".front.log")
+    dlog = boot_logs(ev, tag, ".D.log")
+    plog = boot_logs(ev, tag, ".P.log")
     rec["built_from"]["evidence"] = {"front": front[:1], "D": dlog[:1], "P": plog[:1]}
     rec["boot"] = {"tag": tag, "rev": spec["rev"], "image": spec.get("image"), "boot_profile": spec["boot_profile"],
                    "state_dir": spec.get("state_dir"), "ipc_era": bool(spec.get("state_dir"))}
