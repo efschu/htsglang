@@ -1833,6 +1833,11 @@ class Envs:
     # is in flight; otherwise it is routed with the start X (to P). NF D is
     # bs1, so a burst served serially on D would be slower than P's batch.
     SGLANG_WEG2_X_SOLO_WINDOW_MS = EnvInt(250)
+    # X-SUM-PRICE on the arrival path (user 09.10.): a D that is PREFILLING a
+    # granted SHORT counts as busy for DECODE-COLLECT, and what it still has
+    # to prefill is carried into the collected set's sum. Off = collect only
+    # while D decodes (the sum of an arriving burst on an idle D is unpriced).
+    SGLANG_WEG2_ENABLE_DECODE_COLLECT_PREFILL_BUSY = EnvBool(True)
     # X_ROUTED_NEEDS_P (#246b, 30.09., NF y4c ...dauer09300427 front 04:39:57):
     # a queued request needs P above the X it was ROUTED on, not only above the
     # live X. weg2-22-37 / 22-38 (4447 / 4191 tokens) were routed LONG on the
