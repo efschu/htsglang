@@ -162,7 +162,6 @@ from sglang.srt.managers.io_struct import (
     VramBudgetReqInput,
     Weg2LaneFloorReqInput,
     Weg2ParkRunningReqInput,
-    Weg2LaneFloorReqInput,
     Weg2ParkWindowReqInput,
 )
 from sglang.srt.managers.multi_tokenizer_mixin import (
@@ -1456,7 +1455,8 @@ async def weg2_park_running(obj: Annotated[Weg2ParkRunningReqInput, Body()], req
 @app.api_route("/weg2/lane_floor", methods=["POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def weg2_lane_floor(obj: Annotated[Weg2LaneFloorReqInput, Body()], request: Request):
-    """PRIORITY LANES 1008 (L2): the front's floor for group D. Body {"floor": <int>, "epoch": <int>}; answer
+    """PRIORITY LANES 1008 (L2 + L3, one route for both groups): the front's floor. Group P: PP0 stamps it into the
+    PP-room vote so every stage applies it in the same pass (weg2/lanes_p.py). Group D: Body {"floor": <int>, "epoch": <int>}; answer
     200 {"success", "floor", "epoch", "requeued": [rid, ...], "held": <n>, "message"} -- the floor and epoch in
     force, the held lane parks this call re-queued (oldest first) and the holds still standing. D's admission
     lets in only requests with priority >= floor; a request parked with hold="lane" (POST /weg2/park_running
@@ -1490,19 +1490,6 @@ async def weg2_park_window(obj: Annotated[Weg2ParkWindowReqInput, Body()], reque
     except Exception as e:
         return _create_error_response(e)
     return ORJSONResponse({"sent": True, "left_ms": obj.left_ms}, status_code=200)
-
-
-@app.api_route("/weg2/lane_floor", methods=["POST"])
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def weg2_lane_floor(obj: Annotated[Weg2LaneFloorReqInput, Body()], request: Request):
-    """PRIORITY LANES 1008: the Weg-2 front's lane floor for this group (body {"floor": int, "epoch": int}).
-    One-way to the scheduler; group P: PP0 stamps it into the PP-room vote so every stage applies it in the same
-    pass (weg2/lanes_p.py); group D reads it in its admission. Without SGLANG_WEG2_LANES=1 the scheduler ignores it."""
-    try:
-        _global_state.tokenizer_manager._dispatch_to_scheduler(obj)
-    except Exception as e:
-        return _create_error_response(e)
-    return ORJSONResponse({"sent": True, "floor": obj.floor, "epoch": obj.epoch}, status_code=200)
 
 
 @app.api_route("/weg2/ple_prefetch_hint", methods=["POST"])
