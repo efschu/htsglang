@@ -29557,7 +29557,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2508
+      "line": 2538
      }
     }
    },
@@ -29612,7 +29612,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2498
+    "line": 2528
    },
    "status": "geerntet",
    "text": "",
@@ -29635,7 +29635,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2544
+      "line": 2574
      }
     }
    },
@@ -38354,7 +38354,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 4609
+    "line": 4639
    },
    "status": "unerklaert",
    "text": "",
@@ -38672,7 +38672,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 4608
+    "line": 4638
    },
    "status": "geerntet",
    "text": "",
@@ -39225,7 +39225,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2179
+    "line": 2209
    },
    "status": "geerntet",
    "text": "",
@@ -39248,7 +39248,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2519
+      "line": 2549
      }
     }
    },
@@ -39417,7 +39417,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2523
+      "line": 2553
      }
     }
    },
@@ -39617,7 +39617,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1956
+    "line": 1986
    },
    "status": "geerntet",
    "text": "",
@@ -47576,7 +47576,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2188
+    "line": 2218
    },
    "status": "geerntet",
    "text": "",
@@ -47604,7 +47604,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2193
+    "line": 2223
    },
    "status": "geerntet",
    "text": "",
@@ -53703,7 +53703,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1687
+    "line": 1717
    },
    "status": "geerntet",
    "text": "",
@@ -65251,7 +65251,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1626
+    "line": 1656
    },
    "status": "erklaert",
    "text": "Protection against a mutual blockade when waking D to P: two groups wait in a circle for memory room. On: the waiting part counts its own waiting from the start of the wait; the resolution (swapping the rest out to host RAM) begins after about 0.1 s instead of about 0.6 s. Off: only after the wait flag has gone up after 0.5 s. Default off (preparation/experiment, \"Default off until metal A/B\"). According to the code necessary before SGLANG_OPT_WEG2_DRAFT_PARK_SKIP_UNCHANGED (is off) goes on again. Related: SGLANG_WEG2_BAR1_SPILL_GRACE_S (0.1 s). Acts only for the sending side. Not verified individually on the metal. No user value recognizable.",
@@ -65574,7 +65574,7 @@
      "source": {
       "file": "weg2/front.py",
       "kind": "os.environ",
-      "line": 4094
+      "line": 4176
      }
     }
    },
@@ -65876,7 +65876,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 1935
+      "line": 1965
      }
     }
    },
@@ -70751,7 +70751,7 @@
    "id": "SGLANG_WEG2_D_PARK_BARRIER_BACKFILL",
    "kind": "env",
    "lesestellen": [
-    "weg2/d_seats.py:591"
+    "weg2/d_seats.py:599"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_D_PARK_BARRIER_BACKFILL",
@@ -70762,7 +70762,7 @@
     "baum": "nf",
     "file": "weg2/d_seats.py",
     "kind": "os.environ",
-    "line": 591
+    "line": 599
    },
    "status": "erklaert",
    "text": "After a park, a lock holds back new requests of D until the parked ones have had their turn. On: if the lock stands only because of parked requests that are not in the queue at all (e.g. because their state is missing), a new small request may nevertheless occupy another free seat. Off: the lock holds back every new request (failing boot: a 69-token request held up for 43 passes over 7 D phases). Default on. Raw text switch without an entry in environ.py, off with 0/false/no/off. Applies only if a free seat is known, nothing is blocked, parked requests stand outside the queue, all parked ones of the queue have already been admitted and a seat remains free after the new ones. Correction switch (fix #1210), fallback with 0. Unverified: interplay with the related switch SGLANG_WEG2_D_PARK_BARRIER_ADMITTED and whether the lock itself depends on a switch (not checked); recommendation for the user; evidence on the metal.",
@@ -70968,7 +70968,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 3644
+      "line": 3674
      }
     }
    },
@@ -71249,7 +71249,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2039
+      "line": 2069
      }
     }
    },
@@ -71327,7 +71327,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4316
+      "line": 4346
      }
     }
    },
@@ -71434,7 +71434,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2537
+      "line": 2567
      }
     }
    },
@@ -71748,7 +71748,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2059
+    "line": 2089
    },
    "status": "geerntet",
    "text": "",
@@ -72006,7 +72006,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1963
+    "line": 1993
    },
    "status": "geerntet",
    "text": "",
@@ -72029,7 +72029,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2528
+      "line": 2558
      }
     }
    },
@@ -72251,7 +72251,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4296
+      "line": 4326
      }
     }
    },
@@ -72480,6 +72480,34 @@
     "file": "environ.py",
     "kind": "environ",
     "line": 1774
+   },
+   "status": "geerntet",
+   "text": "",
+   "type": "EnvBool"
+  },
+  "SGLANG_WEG2_ENABLE_PP_ROOM_ARENA_FREE_ROOM": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "True",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "PR-ARENA (NF int22, P PP1 18:34:20Z, boot 1008_171755 @ 6b3bd1a6df): the PP room vote's walk (weg2/pp_room_vote.estimate_payable) priced a peel's write_back backup at the KV host pool's available_size() -- on an arena pool (slots - claimed) * P, complete slots counted free -- while every claim was refused (no free slot): PP1's fact paid 195968 tokens the peel could not (on_frontier=8192 behind_device_child=187776), PP0 launched 16321 rows, PP1 'Prefill out of memory'. On: an arena-bound pool's backup room is its FREE slots (slots - complete - claimed) times the slot's tokens. Off = the available_size() reading, byte for byte.",
+   "id": "SGLANG_WEG2_ENABLE_PP_ROOM_ARENA_FREE_ROOM",
+   "kind": "env",
+   "level": "experte",
+   "name": "SGLANG_WEG2_ENABLE_PP_ROOM_ARENA_FREE_ROOM",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "baum": "nf",
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 1066
    },
    "status": "geerntet",
    "text": "",
@@ -72824,7 +72852,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1068
+    "line": 1078
    },
    "status": "geerntet",
    "text": "",
@@ -72968,7 +72996,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1974
+    "line": 2004
    },
    "status": "geerntet",
    "text": "",
@@ -72996,7 +73024,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1969
+    "line": 1999
    },
    "status": "geerntet",
    "text": "",
@@ -73024,7 +73052,35 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1080
+    "line": 1100
+   },
+   "status": "geerntet",
+   "text": "",
+   "type": "EnvBool"
+  },
+  "SGLANG_WEG2_ENABLE_W3_SPILL_HOST_LEAVES": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "False",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "W3-HOST-LEAF (NF int22, P 18:33:37-18:34:20Z, boot 1008_171755): the W3 spill found candidates=0 on all three stages -- it releases only host copies of device-resident nodes; the full KV arena freed nothing for a claim (ARENA-DROP freed=0). On (local-PP floor only, as UD-H): the 27B line's Q-697c host-only spill, ported (weg2/host_only_spill.py): host-only H-leaves get their L3 copy for every page first (secure_rows_to_l3, #257), then leave the tree; aux host-only (anchor) / in-flight leaves stay. Needs the spill's arena pool (on hybrid boots SGLANG_WEG2_ENABLE_W3_SPILL_ANCHOR_POOL). Off = the old spill.",
+   "id": "SGLANG_WEG2_ENABLE_W3_SPILL_HOST_LEAVES",
+   "kind": "env",
+   "level": "experte",
+   "name": "SGLANG_WEG2_ENABLE_W3_SPILL_HOST_LEAVES",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "baum": "nf",
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 1088
    },
    "status": "geerntet",
    "text": "",
@@ -73523,7 +73579,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 1205
+      "line": 1235
      }
     }
    },
@@ -73577,7 +73633,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1208
+    "line": 1238
    },
    "status": "geerntet",
    "text": "",
@@ -75445,7 +75501,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4416
+      "line": 4446
      }
     }
    },
@@ -76970,7 +77026,7 @@
      "source": {
       "file": "weg2/front.py",
       "kind": "os.environ",
-      "line": 1187
+      "line": 1188
      }
     }
    },
@@ -77399,6 +77455,34 @@
    "text": "",
    "type": "EnvBool"
   },
+  "SGLANG_WEG2_MAMBA_SPILL_LAST_RESORT": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "False",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "MAMBA-LAST-RESORT (NF int22, D TP0 boot 1008_171755 17:51:57): the D mamba anchor arena (32 slots, 6 staging) held only END and deepest anchors, so the flush / park-first spill found victim=none (`#1427 ARENA-DROP ... slot_bytes=58834944 freed=0` x59, `WEG2-ANCHOR-LOST at=flush n=15` incl. the END anchor 112896 of the parked weg2-24-128). On: with no victim by the old rules, the shallowest settled END/deepest anchor OFF the claimer's park chain is secured to L3 first (arena_secure_to_disk) and then released -- never one whose copy could not be secured. Off = the old answer, byte for byte.",
+   "id": "SGLANG_WEG2_MAMBA_SPILL_LAST_RESORT",
+   "kind": "env",
+   "level": "experte",
+   "name": "SGLANG_WEG2_MAMBA_SPILL_LAST_RESORT",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "baum": "nf",
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 1110
+   },
+   "status": "geerntet",
+   "text": "",
+   "type": "EnvBool"
+  },
   "SGLANG_WEG2_MAMBA_STATE_KEYS": {
    "baeume": [
     "27b",
@@ -77695,7 +77779,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4225
+      "line": 4255
      }
     }
    },
@@ -78256,7 +78340,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2404
+    "line": 2434
    },
    "status": "erklaert",
    "text": "If a paused (parked) request is to continue later and the room for Mamba anchors in host RAM is full, its re-entry point gets priority: other intermediate states without a park reference are swapped to disk first, so that the entry point of the parked request is not lost. Off: the old way; parked requests can lose their entry point and recompute. Without a park nothing changes. Acts only on nodes that are marked as parked. Default on. Unverified: dependency on another switch; whether the user should change it (only the decision \"stays on\" of 05.10. ~17:47Z is verified); benefit on the metal (according to the report \"active, effect not shown\").",
@@ -78405,7 +78489,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1881
+    "line": 1911
    },
    "status": "geerntet",
    "text": "",
@@ -78462,7 +78546,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1904
+    "line": 1934
    },
    "status": "geerntet",
    "text": "",
@@ -81424,7 +81508,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 1664
+      "line": 1694
      }
     }
    },
@@ -83603,7 +83687,7 @@
      "source": {
       "file": "weg2/front.py",
       "kind": "os.environ",
-      "line": 4209
+      "line": 4291
      }
     }
    },
@@ -84893,7 +84977,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4403
+      "line": 4433
      }
     }
    },
@@ -85674,25 +85758,25 @@
    "abweichung": 43,
    "beide": 2464,
    "nur_27b": 180,
-   "nur_nf": 41
+   "nur_nf": 44
   },
-  "entries": 2703,
-  "envs": 1826,
+  "entries": 2706,
+  "envs": 1829,
   "erklaert": 304,
   "flags": 862,
-  "geerntet": 1675,
+  "geerntet": 1678,
   "kuratiert": 122,
   "unerklaert": 602
  },
- "tree_rev": "27b=84d04adae1+L1-environ+nf=6b3bd1a6df+lanes-l1-l3",
+ "tree_rev": "27b=84d04adae1+nf=958dbe858a",
  "trees": {
   "27b": {
    "entries": 2644,
-   "rev": "84d04adae1+L1-environ"
+   "rev": "84d04adae1"
   },
   "nf": {
-   "entries": 2505,
-   "rev": "6b3bd1a6df+lanes-l1-l3"
+   "entries": 2508,
+   "rev": "958dbe858a"
   }
  },
  "warnungen": []
