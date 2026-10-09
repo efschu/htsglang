@@ -9,6 +9,10 @@ The fixture ``fixtures/metric_names_1008/inv_old.json`` is the inventory of the 
 scan on the base ref).  Four layers: the static scan of this tree against it, the exporters run on synthetic input, the rename
 kit's engine on the old spellings (a re-run of the kit leaves them standing), the must-keep list of the translation gate.
 
+F0-F reads both generations of a series: a panel / PromQL may say ``{__name__=~"(<old>|pdflip)_x"}`` (``vmpush.dual_promql``). That
+is a read of the OLD name (the old stem is an alternative of the regex) and is accepted wherever a panel is checked; what is never
+accepted is a bare ``pdflip_x`` (a series the exporters would have to write) or an exporter that writes a name of the kit's spelling.
+
 The words of the old names are built from pieces so that this file itself passes the mechanical rename unchanged."""
 import json
 import os
@@ -82,6 +86,29 @@ def _names(text):
     return out
 
 
+def _panel_reads(text):
+    """The OLD metric names a panel / PromQL text reads: the literal ``<old>_x`` and the dual-read form ``(<old>|pdflip)_x``."""
+    pat = (r"(?<![A-Za-z0-9_])%s_([a-z0-9_]+)", r"\(%s\|%s\)_([a-z0-9_]+)")
+    out = {OLD_SUB + "_" + n for n in re.findall(pat[0] % OLD_SUB, text)}
+    out |= {OLD_SUB + "_" + n for n in re.findall(pat[1] % (OLD_SUB, NEW_SUB), text)}
+    return out
+
+
+def _string_tokens(text, skip_docstring_of=("dual_promql",)):
+    """(line, string) of every string literal of a Python source, except the docstring of the functions in skip_docstring_of
+    (F0-F's reader construct explains itself with an example of the interim spelling; comments are no exporter output)."""
+    import ast
+    import io
+    import tokenize
+    skip = set()
+    for node in ast.walk(ast.parse(text)):
+        if isinstance(node, ast.FunctionDef) and node.name in skip_docstring_of and ast.get_docstring(node, clean=False) is not None:
+            d = node.body[0]
+            skip.update(range(d.lineno, d.end_lineno + 1))
+    return [(t.start[0], t.string) for t in tokenize.generate_tokens(io.StringIO(text).readline)
+            if t.type == tokenize.STRING and t.start[0] not in skip]
+
+
 # ---- 1. static: the tree against the inventory of the old tree --------------------------------------------------------------
 
 def test_every_old_metric_name_is_still_in_the_tree_and_the_kit_spelling_is_not():
@@ -117,7 +144,13 @@ def test_subject_files_carry_no_kit_spelled_word_at_all():
         if not os.path.isfile(p):
             continue
         with open(p, encoding="utf-8") as f:
-            for i, ln in enumerate(f, 1):
+            text = f.read()
+        if rel.endswith(".py"):              # F0-F's dual_promql(): its prose / comments / example are not exporter output
+            lines = _string_tokens(text)
+            for i, tok in lines:
+                bad += [f"{rel}:{i}: {m.group(0)}" for m in rx.finditer(tok)]
+        else:
+            for i, ln in enumerate(text.splitlines(), 1):
                 bad += [f"{rel}:{i}: {m.group(0)}" for m in rx.finditer(ln)]
     assert bad == [], bad[:10]
 
@@ -125,7 +158,9 @@ def test_subject_files_carry_no_kit_spelled_word_at_all():
 def test_grafana_panels_query_the_old_names_and_the_scrape_job_keeps_its_name():
     base = os.path.join(REPO, "tools", "rig_dashboard", "rigdash", "deploy")
     panels = open(os.path.join(base, "grafana", "dashboards", "rig-verlauf.json"), encoding="utf-8").read()
-    assert OLD_SUB + "_front_ttft_ms_sum" in panels and OLD_ENG + ":time_to_first_token_seconds" in panels
+    reads = _panel_reads(panels)                                 # literal old name or the dual-read form (<old>|pdflip)_x
+    assert OLD_SUB + "_front_ttft_ms_sum" in reads and OLD_ENG + ":time_to_first_token_seconds" in panels
+    assert not re.findall(r"(?<![A-Za-z0-9_|(])%s_[a-z]" % NEW_SUB, panels), "a bare interim-spelled series in a panel"
     scrape = open(os.path.join(base, "vm", "scrape.yml"), encoding="utf-8").read()
     assert "job_name: " + OLD_SUB + "-front" in scrape            # the `job` label value of every scraped front series
     ex = os.path.join(REPO, "examples", "monitoring", "grafana", "dashboards", "json", NEW_ENG + "-dashboard.json")
@@ -221,7 +256,9 @@ def test_sampler_lines_for_victoriametrics_keep_the_old_names():
     # the series the panels read are produced under the same names
     panels = open(os.path.join(REPO, "tools", "rig_dashboard", "rigdash", "deploy", "grafana", "dashboards", "rig-verlauf.json"),
                   encoding="utf-8").read()
-    for n in set(re.findall(r"(?<![A-Za-z0-9_])" + OLD_SUB + r"_(?:front|rank)_[a-z0-9_]+", panels)):
+    read = {n for n in _panel_reads(panels) if re.match(OLD_SUB + r"_(?:front|rank)_", n)}
+    assert len(read) >= 10, sorted(read)
+    for n in read:
         assert n in names, n
 
 

@@ -1,0 +1,241 @@
+diff --git a/tools/rig_dashboard/rigdash/deploy/grafana/dashboards/rig-verlauf.json b/tools/rig_dashboard/rigdash/deploy/grafana/dashboards/rig-verlauf.json
+index d962091c43..0244fdc1be 100644
+--- a/tools/rig_dashboard/rigdash/deploy/grafana/dashboards/rig-verlauf.json
++++ b/tools/rig_dashboard/rigdash/deploy/grafana/dashboards/rig-verlauf.json
+@@ -102,7 +102,7 @@
+       "uid": "vm"
+      },
+      "refId": "A",
+-     "expr": "sum by (model) (increase(weg2_front_ttft_ms_sum{model=~\"$model\"}[5s])) / (sum by (model) (increase(weg2_front_ttft_count{model=~\"$model\"}[5s])) > 0) / 1000",
++     "expr": "sum by (model) (increase({__name__=~\"(weg2|pdflip)_front_ttft_ms_sum\",model=~\"$model\"}[5s])) / (sum by (model) (increase({__name__=~\"(weg2|pdflip)_front_ttft_count\",model=~\"$model\"}[5s])) > 0) / 1000",
+      "legendFormat": "{{model}}"
+     }
+    ],
+@@ -163,7 +163,7 @@
+       "uid": "vm"
+      },
+      "refId": "A",
+-     "expr": "max by (model) (weg2_front_ttft_ms_max{model=~\"$model\"}) / 1000",
++     "expr": "max by (model) ({__name__=~\"(weg2|pdflip)_front_ttft_ms_max\",model=~\"$model\"}) / 1000",
+      "legendFormat": "max {{model}}"
+     }
+    ]
+@@ -223,7 +223,7 @@
+       "uid": "vm"
+      },
+      "refId": "A",
+-     "expr": "sum by (model) (rate(weg2_front_served_total{group=\"D\",model=~\"$model\"}[$__rate_interval])) * 60",
++     "expr": "sum by (model) (rate({__name__=~\"(weg2|pdflip)_front_served_total\",group=\"D\",model=~\"$model\"}[$__rate_interval])) * 60",
+      "legendFormat": "{{model}}"
+     }
+    ]
+@@ -283,7 +283,7 @@
+       "uid": "vm"
+      },
+      "refId": "A",
+-     "expr": "max by (model, dir) (weg2_flip_user_view_ms{def=\"t2t\",part=\"total\",model=~\"$model\"}) / 1000",
++     "expr": "max by (model, dir) ({__name__=~\"(weg2|pdflip)_flip_user_view_ms\",def=\"t2t\",part=\"total\",model=~\"$model\"}) / 1000",
+      "legendFormat": "Flipzeit {{dir}} {{model}}"
+     },
+     {
+@@ -292,7 +292,7 @@
+       "uid": "vm"
+      },
+      "refId": "B",
+-     "expr": "max by (model, dir) (weg2_flip_user_view_ms{def=\"t2t\",part=\"layer\",model=~\"$model\"}) / 1000",
++     "expr": "max by (model, dir) ({__name__=~\"(weg2|pdflip)_flip_user_view_ms\",def=\"t2t\",part=\"layer\",model=~\"$model\"}) / 1000",
+      "legendFormat": "Teil Layer-Tausch (in Flipzeit enthalten) {{dir}} {{model}}"
+     }
+    ]
+@@ -434,7 +434,7 @@
+       "uid": "vm"
+      },
+      "refId": "A",
+-     "expr": "sum by (model) (rate(weg2_rank_decode_tokens_total{group=\"D\",rank=\"tp0pp0\",model=~\"$model\"}[$__rate_interval]))",
++     "expr": "sum by (model) (rate({__name__=~\"(weg2|pdflip)_rank_decode_tokens_total\",group=\"D\",rank=\"tp0pp0\",model=~\"$model\"}[$__rate_interval]))",
+      "legendFormat": "{{model}}"
+     }
+    ]
+@@ -494,7 +494,7 @@
+       "uid": "vm"
+      },
+      "refId": "A",
+-     "expr": "sum by (model, group) (rate(weg2_rank_prefill_new_tokens_total{rank=\"tp0pp0\",group=~\"P|D\",model=~\"$model\"}[$__rate_interval]))",
++     "expr": "sum by (model, group) (rate({__name__=~\"(weg2|pdflip)_rank_prefill_new_tokens_total\",rank=\"tp0pp0\",group=~\"P|D\",model=~\"$model\"}[$__rate_interval]))",
+      "legendFormat": "{{group}} {{model}}"
+     }
+    ]
+@@ -554,7 +554,7 @@
+       "uid": "vm"
+      },
+      "refId": "A",
+-     "expr": "max by (model) (weg2_rank_decode_last_bs{group=\"D\",rank=\"tp0pp0\",model=~\"$model\"})",
++     "expr": "max by (model) ({__name__=~\"(weg2|pdflip)_rank_decode_last_bs\",group=\"D\",rank=\"tp0pp0\",model=~\"$model\"})",
+      "legendFormat": "bs {{model}}"
+     },
+     {
+@@ -563,7 +563,7 @@
+       "uid": "vm"
+      },
+      "refId": "B",
+-     "expr": "max by (model) (weg2_front_outstanding_n{model=~\"$model\"})",
++     "expr": "max by (model) ({__name__=~\"(weg2|pdflip)_front_outstanding_n\",model=~\"$model\"})",
+      "legendFormat": "outstanding {{model}}"
+     },
+     {
+@@ -572,7 +572,7 @@
+       "uid": "vm"
+      },
+      "refId": "C",
+-     "expr": "max by (model) (weg2_front_queue{model=~\"$model\"})",
++     "expr": "max by (model) ({__name__=~\"(weg2|pdflip)_front_queue\",model=~\"$model\"})",
+      "legendFormat": "Warteschlange {{model}}"
+     }
+    ]
+@@ -632,7 +632,7 @@
+       "uid": "vm"
+      },
+      "refId": "A",
+-     "expr": "max by (model, group) (weg2_rank_kv_usage_ratio{model=~\"$model\"}) * 100",
++     "expr": "max by (model, group) ({__name__=~\"(weg2|pdflip)_rank_kv_usage_ratio\",model=~\"$model\"}) * 100",
+      "legendFormat": "{{group}} {{model}}"
+     }
+    ]
+@@ -705,7 +705,7 @@
+       "uid": "vm"
+      },
+      "refId": "A",
+-     "expr": "sum by (model, group) (rate(weg2_rank_l2_loadback_tokens_total{rank=\"tp0pp0\",model=~\"$model\"}[$__rate_interval]))",
++     "expr": "sum by (model, group) (rate({__name__=~\"(weg2|pdflip)_rank_l2_loadback_tokens_total\",rank=\"tp0pp0\",model=~\"$model\"}[$__rate_interval]))",
+      "legendFormat": "Load-back Tok/s {{group}} {{model}}"
+     },
+     {
+@@ -714,7 +714,7 @@
+       "uid": "vm"
+      },
+      "refId": "B",
+-     "expr": "sum by (model, group) (rate(weg2_rank_mamba_resume_total{rank=\"tp0pp0\",model=~\"$model\"}[$__rate_interval])) * 60",
++     "expr": "sum by (model, group) (rate({__name__=~\"(weg2|pdflip)_rank_mamba_resume_total\",rank=\"tp0pp0\",model=~\"$model\"}[$__rate_interval])) * 60",
+      "legendFormat": "Mamba-Resumes/min {{group}} {{model}}"
+     }
+    ]
+@@ -774,7 +774,7 @@
+       "uid": "vm"
+      },
+      "refId": "A",
+-     "expr": "sum by (model, group, outcome) (rate(weg2_rank_l3_prefetch_total{rank=\"tp0pp0\",model=~\"$model\"}[$__rate_interval])) * 60",
++     "expr": "sum by (model, group, outcome) (rate({__name__=~\"(weg2|pdflip)_rank_l3_prefetch_total\",rank=\"tp0pp0\",model=~\"$model\"}[$__rate_interval])) * 60",
+      "legendFormat": "{{outcome}} {{group}} {{model}}"
+     }
+    ]
+diff --git a/tools/rig_dashboard/rigdash/deploy/grafana/make_dashboard.py b/tools/rig_dashboard/rigdash/deploy/grafana/make_dashboard.py
+index 6550ac5049..422fa4ef17 100644
+--- a/tools/rig_dashboard/rigdash/deploy/grafana/make_dashboard.py
++++ b/tools/rig_dashboard/rigdash/deploy/grafana/make_dashboard.py
+@@ -9,9 +9,8 @@ import json
+ import os
+ import sys
+ 
+-# F0-F (rename): the metrics were pushed as <old subsystem>_* before the rename and as pdflip_* after it; every panel reads
+-# both families (the metric names themselves are not turned back, open user decision). One rule for the dashboard and
+-# for this file: rigdash.vmpush.dual_promql.
++# F0-F + F0-M (rename): the metric names are must-keep (old prefix, user decision 08.10.); every panel still reads both the old and
++# the interim prefix. One rule for the dashboard and for this file: rigdash.vmpush.dual_promql.
+ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".."))
+ from rigdash.vmpush import dual_promql  # noqa: E402
+ 
+diff --git a/tools/rig_dashboard/rigdash/tests/test_f0f_dashboard_1008.py b/tools/rig_dashboard/rigdash/tests/test_f0f_dashboard_1008.py
+index 327090a52f..c4ff685739 100644
+--- a/tools/rig_dashboard/rigdash/tests/test_f0f_dashboard_1008.py
++++ b/tools/rig_dashboard/rigdash/tests/test_f0f_dashboard_1008.py
+@@ -1,8 +1,7 @@
+ """F0-F (rename 08.10.): the dashboard in the renamed tree reads both generations and installs under the new names.
+ 
+-* metrics: the sampler pushes ``pdflip_*``; the series pushed before the rename keep the old prefix in VictoriaMetrics
+-  (retention). Every PromQL the dashboard sends and every Grafana panel reads BOTH (``vmpush.dual_promql``); the metric
+-  NAMES are not turned back (open user decision).
++* metrics (F0-M: the names are must-keep, the sampler pushes the old prefix): every PromQL the dashboard sends and every Grafana
++  panel reads BOTH the old prefix and the interim ``pdflip`` prefix (``vmpush.dual_promql``), whichever the query text uses.
+ * deploy: ``install.sh`` picks the state dir (/var/lib/flliper, fallback /var/lib/rigdash with the pre-rename history),
+   the unit is written for /var/lib/flliper, install_510.sh no longer pins pre-rename commits.
+ * container names of either product name; issue-text templates in the new product name.
+@@ -38,24 +37,30 @@ DEPLOY = os.path.join(PKG, "deploy")
+ 
+ class DualPromql(unittest.TestCase):
+     def test_bare_metric_reads_both_prefixes(self):
+-        self.assertEqual(V.dual_promql("pdflip_front_queue"), '{__name__=~"(%s|%s)_front_queue"}' % (OLD, NEW))
++        self.assertEqual(V.dual_promql(NEW + "_front_queue"), '{__name__=~"(%s|%s)_front_queue"}' % (OLD, NEW))
++
++    def test_old_prefix_reads_both_too(self):
++        """F0-M: the names are must-keep, a query in the old spelling gets the same dual form (the same series set)."""
++        self.assertEqual(V.dual_promql(OLD + "_front_queue"), V.dual_promql(NEW + "_front_queue"))
++        q = 'max by (model) (%s_rank_kv_usage_ratio{model=~"$model"}) * 100' % OLD
++        self.assertEqual(V.dual_promql(q), 'max by (model) ({__name__=~"(%s|%s)_rank_kv_usage_ratio",model=~"$model"}) * 100' % (OLD, NEW))
+ 
+     def test_labels_are_kept_and_selectors_inside_functions_work(self):
+-        q = V.dual_promql('sum by (model) (increase(pdflip_front_ttft_ms_sum{model="NF",boot=~"b.*"}[5m]))')
++        q = V.dual_promql('sum by (model) (increase(%s_front_ttft_ms_sum{model="NF",boot=~"b.*"}[5m]))' % NEW)
+         self.assertEqual(q, 'sum by (model) (increase({__name__=~"(%s|%s)_front_ttft_ms_sum",model="NF",boot=~"b.*"}[5m]))' % (OLD, NEW))
+ 
+     def test_range_vector_selector_of_raw(self):
+-        self.assertEqual(V.dual_promql('pdflip_rank_x{boot="b"}[43200s]'), '{__name__=~"(%s|%s)_rank_x",boot="b"}[43200s]' % (OLD, NEW))
++        self.assertEqual(V.dual_promql('%s_rank_x{boot="b"}[43200s]' % NEW), '{__name__=~"(%s|%s)_rank_x",boot="b"}[43200s]' % (OLD, NEW))
+ 
+     def test_other_metrics_and_idempotence(self):
+         for q in ("nvidia_smi_power_draw_watts", "sum(node_cpu_seconds_total)", 'up{job="x"}'):
+             self.assertEqual(V.dual_promql(q), q)
+-        q = 'max by (model) (pdflip_flip_user_view_ms{part="total"}) / 1000'
++        q = 'max by (model) (%s_flip_user_view_ms{part="total"}) / 1000' % NEW
+         once = V.dual_promql(q)
+         self.assertEqual(V.dual_promql(once), once)
+ 
+     def test_a_name_that_only_ends_in_the_prefix_is_not_touched(self):
+-        self.assertEqual(V.dual_promql("my_pdflip_x"), "my_pdflip_x")
++        self.assertEqual(V.dual_promql("my_" + NEW + "_x"), "my_" + NEW + "_x")
+ 
+     def test_every_vm_client_call_sends_the_dual_form(self):
+         seen = []
+@@ -73,10 +78,10 @@ class DualPromql(unittest.TestCase):
+ 
+         c = V.VmClient("http://x")
+         with mock.patch("urllib.request.urlopen", fake):
+-            c.query("pdflip_front_queue")
+-            c.query_range("sum(pdflip_front_queue)", 0, 10, 5)
+-            c.query_range_by("sum by (model) (pdflip_front_queue)", 0, 10, 5, "model")
+-            c.raw("pdflip_rank_x", 60)
++            c.query(NEW + "_front_queue")
++            c.query_range("sum(%s_front_queue)" % NEW, 0, 10, 5)
++            c.query_range_by("sum by (model) (%s_front_queue)" % NEW, 0, 10, 5, "model")
++            c.raw(NEW + "_rank_x", 60)
+         self.assertEqual(len(seen), 4)
+         from urllib.parse import unquote_plus
+         for u in seen:
+diff --git a/tools/rig_dashboard/rigdash/vmpush.py b/tools/rig_dashboard/rigdash/vmpush.py
+index 3f2948b210..c1014698c0 100644
+--- a/tools/rig_dashboard/rigdash/vmpush.py
++++ b/tools/rig_dashboard/rigdash/vmpush.py
+@@ -222,16 +222,17 @@ class Bridge:
+ 
+ # ----------------------------------------------------------------------------- reading (PromQL)
+ 
+-#: F0-F (rename): the sampler WRITES ``pdflip_*`` from now on; the series pushed before the rename carry the old subsystem
+-#: prefix and stay in VictoriaMetrics for the retention time. Metric NAMES are not turned back (open user decision); every
+-#: reader therefore reads BOTH families. The old token comes from ``names.STEM_TOKENS`` (split there, so the rename tool
+-#: never rewrites it here).
+-_METRIC_RX = re.compile(r"(?<![A-Za-z0-9_:])%s_([a-z0-9_]+)(\{[^}]*\})?" % re.escape(N.STEM_TOKENS[1]))
++#: F0-F + F0-M (rename): the metric NAMES are must-keep (user decision 08.10.): the sampler WRITES the series under the old
++#: subsystem prefix, as it did before the rename, and VictoriaMetrics keeps the history under it. Every reader still reads BOTH
++#: families, the old prefix (all that is pushed) and the interim ``pdflip`` prefix (series a renamed-tree test boot may have
++#: pushed), whichever spelling the PromQL text uses. The old token comes from ``names.STEM_TOKENS`` (split there, so the rename
++#: tool never rewrites it here).
++_METRIC_RX = re.compile(r"(?<![A-Za-z0-9_:])(?:%s|%s)_([a-z0-9_]+)(\{[^}]*\})?" % tuple(re.escape(t) for t in N.STEM_TOKENS))
+ 
+ 
+ def dual_promql(promql: str) -> str:
+-    """``pdflip_front_queue{model="NF"}`` -> ``{__name__=~"(<old>|pdflip)_front_queue",model="NF"}``: every metric of the
+-    renamed family in a PromQL text reads the old and the new series. Idempotent (the output has no bare metric name)."""
++    """``<prefix>_front_queue{model="NF"}`` (either prefix) -> ``{__name__=~"(<old>|<interim>)_front_queue",model="NF"}``: every
++    metric of the family in a PromQL text reads the old and the interim series. Idempotent (the output has no bare metric name)."""
+     def sub(m):
+         labels = (m.group(2) or "")[1:-1].strip()
+         return '{__name__=~"(%s|%s)_%s"%s}' % (N.STEM_TOKENS[0], N.STEM_TOKENS[1], m.group(1), ("," + labels) if labels else "")
