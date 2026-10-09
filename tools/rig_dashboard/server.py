@@ -176,7 +176,7 @@ def scrape_server_info():
     return None
 
 
-_METRIC = re.compile(r'^(flliper:[a-z_]+)(?:\{[^}]*\})?\s+([0-9eE.+-]+)\s*$')
+_METRIC = re.compile(r'^(sglang:[a-z_]+)(?:\{[^}]*\})?\s+([0-9eE.+-]+)\s*$')
 
 
 def scrape_metrics():
@@ -200,18 +200,18 @@ def scrape_metrics():
         except ValueError:
             pass
     keep = {
-        "gen_throughput": "flliper:gen_throughput",
-        "num_running_reqs": "flliper:num_running_reqs",
-        "num_queue_reqs": "flliper:num_queue_reqs",
-        "num_paused_reqs": "flliper:num_paused_reqs",
-        "token_usage": "flliper:token_usage",
-        "kv_used_tokens": "flliper:kv_used_tokens",
-        "kv_available_tokens": "flliper:kv_available_tokens",
-        "mamba_used_tokens": "flliper:mamba_used_tokens",
-        "max_total_num_tokens": "flliper:max_total_num_tokens",
-        "cache_hit_rate": "flliper:cache_hit_rate",
-        "spec_accept_length": "flliper:spec_accept_length",
-        "num_requests_total": "flliper:num_requests_total",
+        "gen_throughput": "sglang:gen_throughput",
+        "num_running_reqs": "sglang:num_running_reqs",
+        "num_queue_reqs": "sglang:num_queue_reqs",
+        "num_paused_reqs": "sglang:num_paused_reqs",
+        "token_usage": "sglang:token_usage",
+        "kv_used_tokens": "sglang:kv_used_tokens",
+        "kv_available_tokens": "sglang:kv_available_tokens",
+        "mamba_used_tokens": "sglang:mamba_used_tokens",
+        "max_total_num_tokens": "sglang:max_total_num_tokens",
+        "cache_hit_rate": "sglang:cache_hit_rate",
+        "spec_accept_length": "sglang:spec_accept_length",
+        "num_requests_total": "sglang:num_requests_total",
     }
     return {k: vals[v] for k, v in keep.items() if v in vals}
 
