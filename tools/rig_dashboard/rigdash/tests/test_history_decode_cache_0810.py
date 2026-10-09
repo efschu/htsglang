@@ -68,5 +68,47 @@ class TestDecodeByBatchSize(unittest.TestCase):
         self.assertIsNone(t["6"]["rate"])
 
 
+class TestInputTokenLevels(unittest.TestCase):
+    def levels(self):
+        m = model()
+        m.pchunks = {"P": [dict(c) for c in P_REQ]}
+        return m.buckets(0.0, N, 1.0)
+
+    def test_jump_to_the_cached_prefix_then_new_tokens_rise_above_it(self):
+        b = self.levels()
+        run = range(10, 26)
+        # blue: the cached prefix from the FIRST second of the request on, constant (a jump, not a ramp from 0)
+        self.assertEqual([b["pf_cached"][i] for i in run], [50000.0] * 16)
+        # green (new tokens so far): rises monotonically from the start and ends at the request's own new tokens
+        new = [b["pf_new"][i] for i in run]
+        self.assertEqual(new, sorted(new))
+        self.assertAlmostEqual(new[0], 4096.0)
+        self.assertAlmostEqual(new[-1], 4 * 16384.0)
+        # the top of the stack = the input length of the request grows from 54 096 to 115 536 (cached + new)
+        self.assertAlmostEqual(b["pf_cached"][25] + b["pf_new"][25], 50000 + 65536)
+
+    def test_no_prefill_is_a_gap_not_zero(self):
+        b = self.levels()
+        for k in ("pf_cached", "pf_new"):
+            self.assertTrue(all(b[k][i] is None for i in list(range(0, 10)) + list(range(26, N))), k)
+
+    def test_second_request_jumps_to_its_own_prefix(self):
+        m = model()
+        m.pchunks = {"P": [dict(c) for c in P_REQ] + [chunk(40.0, 42.0, 3000, 20000)]}
+        b = m.buckets(0.0, N, 1.0)
+        self.assertEqual(b["pf_cached"][25], 50000.0)
+        self.assertEqual(b["pf_cached"][40], 20000.0)             # jumps down to the next request's prefix
+        self.assertAlmostEqual(b["pf_new"][41], 3000.0)
+        self.assertIsNone(b["pf_cached"][30])
+
+    def test_old_rate_stack_is_not_the_level_curve(self):
+        """The old chart: cache + P + D rates per bucket.  It starts at the smeared rate, not at the cached length,
+        and falls back to zero after the burst -- the 'from zero up and down' of the user's complaint."""
+        b = self.levels()
+        stack = [(b["tok_cache"][i] or 0) + (b["tok_comp_p"][i] or 0) for i in range(N)]
+        self.assertLess(stack[10], 50000.0 / 2)        # nowhere near the 50 000 cached tokens at the start
+        self.assertEqual(stack[30], 0.0)               # and down to 0 again after the burst
+
+
 if __name__ == "__main__":
     unittest.main()
