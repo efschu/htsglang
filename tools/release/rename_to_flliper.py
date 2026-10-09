@@ -256,6 +256,14 @@ def _load_metric_keep(path: str):
     alts = [re.escape(n) for n in colon] + pats
     if alts:
         glob.append(("metric-name", re.compile(_MK_B + "sglang:(?:" + "|".join(alts) + ")" + _MK_HIST + _MK_E)))
+    # REGEX HEADS (F0-M fix round 2): a READER that parses the exposition spells the family as the head of a regex -- `^(sglang:[a-z_0-9]+)` in
+    # rigmon/sources.py and rig_dashboard/server.py.  That is no name of the table, but it is the same metric contract: renamed it reads
+    # `flliper:` while the engine exports `sglang:` and every live value goes empty, without an error.  A head is kept where it is directly
+    # followed by a character class `[`, a group `(` or an escape `\` (`sglang::scheduler`, `sglang.srt` and docker tags are not heads;
+    # a docker-tag REGEX such as `^flliper:(cu\d+)` -- group `(cu` / `(\d` -- is no head either, which is also how restore tells them apart).
+    heads = [re.escape(h) for h in d.get("regex_heads", [])]
+    if heads:
+        glob.append(("metric-regex-head", re.compile(_MK_B + "(?:" + "|".join(heads) + r")(?=[\[(\\])(?!\((?:cu|\\d))")))
     rx = _mk_exact(d.get("weg2_global", []))
     if rx is not None:
         glob.append(("metric-name", rx))
@@ -1200,7 +1208,11 @@ def cmd_selftest(_: argparse.Namespace) -> int:
           ("sglang:spill_tier_used_bytes sglang:spill_tier_*_bytes", "sglang:spill_tier_used_bytes sglang:spill_tier_*_bytes"),
           ("docker run sglang:dev local/sglang:latest", "docker run flliper:dev local/flliper:latest"),
           ("'sglang:prompt_tokens_total 10\\nsglang:generation_tokens_total 20\\n'", "'sglang:prompt_tokens_total 10\\nsglang:generation_tokens_total 20\\n'"),
-          ("xsglang:num_running_reqs", "xflliper:num_running_reqs")]
+          ("xsglang:num_running_reqs", "xflliper:num_running_reqs"),
+          # fix round 2: a regex head of a reader stays (class, group), the process title / docker-tag shapes do not
+          ("re.compile(r\"^(sglang:[a-z_0-9]+)(?:\\{)\")", "re.compile(r\"^(sglang:[a-z_0-9]+)(?:\\{)\")"),
+          ("grep -E \"^sglang:(cache_hit_rate|x)\\{\"", "grep -E \"^sglang:(cache_hit_rate|x)\\{\""),
+          ("setproctitle('sglang::scheduler_TP0') ^sglang:(cu\\d+)-x", "setproctitle('flliper::scheduler_TP0') ^flliper:(cu\\d+)-x")]
     for src, want in mk:
         got, _, _ = rewrite_text(src)
         bad += got != want

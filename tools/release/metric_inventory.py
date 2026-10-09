@@ -344,6 +344,9 @@ AMBIGUOUS_WEG2 = ("weg2_group", "weg2_d_parked")
 EXTRA_COLON = ("num_generation_tokens_total", "time_per_output_token_seconds", "num_prefill_retries")
 #: docs / prose wildcards of the colon family (`sglang:spill_tier_*_bytes`): kept as written
 COLON_WILDCARDS = ("encoder_*", "hicache_host_*_tokens", "spill_tier_*_bytes")
+#: REGEX HEADS (fix round 2): the family prefix written as the head of a regex in a READER of the exposition (`^(sglang:[a-z_0-9]+)`,
+#: rigmon/sources.py + rig_dashboard/server.py); the engine keeps `sglang:` where a `[`, `(` or a backslash follows
+REGEX_HEADS = ("sglang:",)
 #: old path -> entries.  A trailing "_" or ":" is a PREFIX (every token starting with it), anything else an exact token
 FILE_ENTRIES = {
     "python/sglang/srt/weg2/front_metrics.py": ["weg2_"],
@@ -351,6 +354,10 @@ FILE_ENTRIES = {
     "python/sglang/srt/weg2/front.py": ["weg2_group"],            # comments: the label the front sets on the group metrics
     "python/sglang/srt/entrypoints/v1_loads.py": ["sglang_"],     # /v1/loads?format=prometheus: f"sglang_{prefix}_{sub_key}"
     "tools/rig_dashboard/rigdash/vmpush.py": ["weg2_"],           # the sampler's writer
+    # the two READERS of the engine's exposition: their regex and key map spell the engine's names (fix round 2: the restore had missed the
+    # regex head, every live value of rigmon / the dashboard's engine tile went empty)
+    "python/sglang/srt/rigmon/sources.py": ["sglang:"],
+    "tools/rig_dashboard/server.py": ["sglang:"],
     "tools/rig_dashboard/rigdash/deploy/grafana/make_dashboard.py": ["weg2_"],
     "tools/rig_dashboard/rigdash/deploy/grafana/dashboards/rig-verlauf.json": ["weg2_"],
     # job_name `weg2-front` is the `job` LABEL VALUE of every series scraped from the front: renamed, the history splits in two series
@@ -378,6 +385,7 @@ def must_keep_section(table: dict) -> List[str]:
     for ents in table["files"].values():
         names += [e for e in ents if e not in ("weg2_", "sglang_", "sglang:")]
     names += ["weg2_group", "weg2_d_parked"]
+    names += [h + c for h in table.get("regex_heads", []) for c in "[("]
     return [MK_BEGIN] + sorted(set(names)) + [MK_END]
 
 
@@ -413,6 +421,7 @@ def keepfile(scans: List[dict]) -> dict:
                      "(METRIC-NAME MUST-KEEP). Regenerate: metric_inventory.py keepfile; prove: metric_inventory.py compare."),
         "sglang_colon": sorted(colon | set(EXTRA_COLON)),
         "sglang_colon_patterns": sorted(COLON_WILDCARDS),
+        "regex_heads": list(REGEX_HEADS),
         "weg2_global": sorted(wg),
         "weg2_global_prefixes": list(GLOBAL_WEG2_PREFIXES),
         "files": {k: v for k, v in sorted(FILE_ENTRIES.items())},
