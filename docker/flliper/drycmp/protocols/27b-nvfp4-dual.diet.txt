@@ -1,0 +1,21 @@
+PROFILE 27b-nvfp4-dual.diet
+OLD  tree dab894b021 (pre-rename)   profile file 27b-nvfp4-dual.diet.env.alt (pure old-spelling chain)
+NEW  tree 67366ac820 (renamed)      profile file 27b-nvfp4-dual.diet.env
+BOUNDARY old: complete (plan to the end, nothing started)   [EXIT=0]
+BOUNDARY new: complete (plan to the end, nothing started)   [EXIT=0]
+PROFILE_ARGS folded: equal
+ENV group D: keys old=68 new=68  only_old=[] only_new=[]  changed=0  run-specific=['NAME_NAME_BOOT_TOKEN']
+ENV group P: keys old=68 new=68  only_old=[] only_new=[]  changed=0  run-specific=['NAME_NAME_BOOT_TOKEN']
+compile warnings dropped (fresh checkout, not launcher output): old=0 new=0
+OTHER lines: old=261 new=261  equal after name folding=235  equal except digits (live-box readings/timings)=18  matched by skeleton=258
+RESIDUAL lines old-side 3  new-side 3 (full lines first, then the word-level pairing)
+   - WEG2-LAUNCH H2c STORE-IDENTITY ENTFAELLT: keine Experten-Karte -> D-Store-Adopt inaktiv
+   - WEG2-LAUNCH D-RANK VRAM (#145) VERDIKT D(dual-share, P-Plan): rang0 nvml1 NVIDIA GeForce RTX 5090: total 32607 - fremd 0 - nichttorch 0 - reserve 0 = 32607 verfuegbar, gefragt 17656 -> REST 14951 MiB [Korridor ok (14951 >= 819 MiB)] | rang1 nvml0 NVIDIA GeForce RTX 3080: total 20480 - fremd 0 - nichttorch 0 - reserve 0 = 20480 verfuegbar, gefragt 12472 -> REST 8008 MiB [Korridor ok (8008 >= 819 MiB)] | rang2 nvml2 NVIDIA GeForce RTX 3080: total 20480 - fremd 0 - nichttorch 0 - reserve 0 = 20480 verfuegbar, gefragt 11984 -> REST 8496 MiB [Korridor ok (8496 >= 819 MiB)] [NICHT GEBUCHT: --d-foreign-context-mib, --d-nontorch-mib, --d-reserve-mib -- diese Zeile ist damit eine OBERGRENZE, keine Bilanz]
+   - WEG2-LAUNCH D-RANK VRAM (#145) VERDIKT D(dry, expectation): rang0 nvml1 NVIDIA GeForce RTX 5090: total 32607 - fremd 0 - nichttorch 0 - reserve 0 = 32607 verfuegbar, gefragt 27264 -> REST 5343 MiB [Korridor ok (5343 >= 819 MiB)] | rang1 nvml0 NVIDIA GeForce RTX 3080: total 20480 - fremd 0 - nichttorch 0 - reserve 0 = 20480 verfuegbar, gefragt 17104 -> REST 3376 MiB [Korridor ok (3376 >= 819 MiB)] | rang2 nvml2 NVIDIA GeForce RTX 3080: total 20480 - fremd 0 - nichttorch 0 - reserve 0 = 20480 verfuegbar, gefragt 16928 -> REST 3552 MiB [Korridor ok (3552 >= 819 MiB)] [NICHT GEBUCHT: --d-foreign-context-mib, --d-nontorch-mib, --d-reserve-mib -- diese Zeile ist damit eine OBERGRENZE, keine Bilanz]
+   + PDFLIP-LAUNCH H2c STORE-IDENTITY ENTFAELLT: no experts card -> D-Store-Adopt inactive
+   + PDFLIP-LAUNCH D-RANK VRAM (#145) VERDIKT D(dual-share, P-Plan): rang0 nvml1 NVIDIA GeForce RTX 5090: total 32607 - fremd 0 - nichttorch 0 - reserve 0 = 32607 verfuegbar, gefragt 17656 -> REST 14951 MiB [Korridor ok (14951 >= 819 MiB)] | rang1 nvml0 NVIDIA GeForce RTX 3080: total 20480 - fremd 0 - nichttorch 0 - reserve 0 = 20480 verfuegbar, gefragt 12472 -> REST 8008 MiB [Korridor ok (8008 >= 819 MiB)] | rang2 nvml2 NVIDIA GeForce RTX 3080: total 20480 - fremd 0 - nichttorch 0 - reserve 0 = 20480 verfuegbar, gefragt 11984 -> REST 8496 MiB [Korridor ok (8496 >= 819 MiB)] [NICHT GEBUCHT: --d-foreign-context-mib, --d-nontorch-mib, --d-reserve-mib -- this row is thus a OBERGRENZE, keine Bilanz]
+   + PDFLIP-LAUNCH D-RANK VRAM (#145) VERDIKT D(dry, expectation): rang0 nvml1 NVIDIA GeForce RTX 5090: total 32607 - fremd 0 - nichttorch 0 - reserve 0 = 32607 verfuegbar, gefragt 27264 -> REST 5343 MiB [Korridor ok (5343 >= 819 MiB)] | rang1 nvml0 NVIDIA GeForce RTX 3080: total 20480 - fremd 0 - nichttorch 0 - reserve 0 = 20480 verfuegbar, gefragt 17104 -> REST 3376 MiB [Korridor ok (3376 >= 819 MiB)] | rang2 nvml2 NVIDIA GeForce RTX 3080: total 20480 - fremd 0 - nichttorch 0 - reserve 0 = 20480 verfuegbar, gefragt 16928 -> REST 3552 MiB [Korridor ok (3552 >= 819 MiB)] [NICHT GEBUCHT: --d-foreign-context-mib, --d-nontorch-mib, --d-reserve-mib -- this row is thus a OBERGRENZE, keine Bilanz]
+   pair: translation [keine Experten-Karte -> no experts card] ; translation [inaktiv -> inactive]
+   pair: translation [diese Zeile ist damit eine -> this row is thus a]
+   pair: translation [diese Zeile ist damit eine -> this row is thus a]
+VERDICT OK: 0 diff modulo names for flags and env; 3 translated prose line(s) (German -> English, listed above), nothing unexplained (up to the boundary above)
