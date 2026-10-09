@@ -24,7 +24,7 @@ import time
 from collections import deque
 from typing import Dict, List, Optional, Tuple
 
-from . import activity, flipzeit, grouplog, ipcfields, ipcstate, stops
+from . import activity, flipzeit, grouplog, ipcfields, ipcstate, sessions, stops
 
 SAMPLE_S = 1.0
 RING_S = 16 * 60.0
@@ -1433,6 +1433,7 @@ def build_view(ipc: dict, ring, rank: dict, rates: dict, now: float,
     v["flip_views"] = fv[-24:]
     v["flip_diag"] = flip_diag(fv)
     v["phase_now"] = phase_now(v["timeline"]["segs"], ipc, front, fv, live, now)
+    v["sessions"] = sessions.sessions_view(ipc.get("request_done") or [])
     view_ipc = {k: x for k, x in ipc.items() if k not in ("ipc_events", "flip_first_work", "flip_user_time", "request_done")}
     v["ipc"] = view_ipc
     return v
