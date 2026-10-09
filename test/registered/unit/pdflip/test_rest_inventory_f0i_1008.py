@@ -61,7 +61,7 @@ class Rules(unittest.TestCase):
         v = verdicts("python/flliper/srt/x.py", 'N = ("%s", "flliper")\nM = "%s"\n' % (SG, SG))
         self.assertEqual([(k, r) for _w, k, r in v], [("keep", "dual-line"), ("residue", "unexplained")])
 
-    def test_collision_ok_file_keeps_sglang_but_not_the_product_name(self):
+    def test_collision_ok_file_keeps_the_old_word_but_not_the_product_name(self):
         ctx = {"collision_ok": {"python/flliper/srt/y.py": frozenset({"flliper"})}}
         v = verdicts("python/flliper/srt/y.py", "a = '%s'\nb = '%s-pip'\n" % (SG, HT), ctx)
         self.assertEqual([(k, r) for _w, k, r in v][0], ("keep", "collision_ok-file"))
