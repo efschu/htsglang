@@ -23,7 +23,7 @@
  "profile_inputs": {
   "base": {
    "file": "profiles/27b-base.env",
-   "sha256": "7f48188299747a86c76b7eb591b57de07cd4897cd65a058fa9859295ca6026b9"
+   "sha256": "203d7913e9f12247f7a1f67f0dd20e3d2446a63898d734a50bdbde742ad18e8b"
   },
   "census": {
    "file": "/spinning/gpu-arb/weg2/census/xchg_census_weg2xsn246_27198a2711.json",
@@ -34,6 +34,7 @@
    "sha256": "a56d1c7a4fb93206e6251540db80dc36656355daed95a3faf1e19de5fc99237c"
   }
  },
+ "regen": "2026-10-09: regenerated (propose_oracle golden/launch, two runs byte-equal) after the user decision of 2026-10-09 that --weg2-vision-place weights is the default of the 27B RELEASE profiles: one line PROFILE_ARGS+=(--weg2-vision-place weights) in profiles/27b-base.env (sha256 7f48188299 -> 203d7913e9; live /spinning/gpu-arb/docker/profiles_release/27b-base.env identical, backup .bak_vision_0910); the Dual profiles inherit it by `source`. Expected diff only: argv_n +2, WEG2-HOST vision_victim_host=879 MiB + VISION-VICTIM host-RAM WARNING lines, SGLANG_WEG2_VISION_PLACE=weights in group P's env.",
  "replay": "fixtures/xchg_launch_replay_0911/nvml_devices_1378.json",
  "schema": "planer-ap0-golden-provenance/1",
  "tree": "173161c595 + desk/planer-ap0-1006"

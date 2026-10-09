@@ -22,8 +22,8 @@
  "note": "Header snapshots of the RELEASE checkpoints (not the sibling gdncov/DFlash2 the dev box holds): read-only ssh to the Proxmox host, safetensors header bytes 8+N per file, small files and index verbatim; no weight byte was read. Measured: index total_size 29548245472 (release) vs 30819147232 (sibling Qwen3.8-27B-INT8-gdncov); draft model.safetensors 2172742656 vs 3848817896 (sibling Qwen3.8-27B-DFlash2).",
  "profile": {
   "file": "profiles/27b-base.env",
-  "live": "/spinning/gpu-arb/docker/profiles_release/27b-base.env (identical sha256 on 2026-10-06)",
-  "sha256": "7f48188299747a86c76b7eb591b57de07cd4897cd65a058fa9859295ca6026b9"
+  "live": "/spinning/gpu-arb/docker/profiles_release/27b-base.env (identical sha256 on 2026-10-09 after the VISION-WEIGHTS line; before: identical on 2026-10-06)",
+  "sha256": "203d7913e9f12247f7a1f67f0dd20e3d2446a63898d734a50bdbde742ad18e8b"
  },
  "profile_inputs": {
   "census": {
@@ -31,6 +31,7 @@
    "sha256": "1a8f1c51e93182b83b45e73192f78b69ba921f80beb6098646621fbb6d3ac953"
   }
  },
+ "regen": "2026-10-09: regenerated (propose_oracle golden/launch, two runs byte-equal) after the user decision of 2026-10-09 that --weg2-vision-place weights is the default of the 27B RELEASE profiles: one line PROFILE_ARGS+=(--weg2-vision-place weights) in profiles/27b-base.env (sha256 7f48188299 -> 203d7913e9; live /spinning/gpu-arb/docker/profiles_release/27b-base.env identical, backup .bak_vision_0910); the Dual profiles inherit it by `source`. Expected diff only: argv_n +2, WEG2-HOST vision_victim_host=879 MiB + VISION-VICTIM host-RAM WARNING lines, SGLANG_WEG2_VISION_PLACE=weights in group P's env.",
  "replay": "fixtures/xchg_launch_replay_0911/nvml_devices_1378.json",
  "schema": "planer-ap0-golden-provenance/1",
  "tree": "173161c595 + desk/planer-ap0-1006"

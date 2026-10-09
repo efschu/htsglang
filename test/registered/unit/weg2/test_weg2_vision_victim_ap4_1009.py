@@ -8,7 +8,8 @@ of ``--weg2-vision-place weights``.  GPU-free, NVML-free, Docker-free.
 * ``TestBars``              ``profile_couplings.phase_bars`` (schema ``flliper.balken/1``): sub-item in the weights segment + host row, NOT added to the sum;
                             the default bar has not one new key.
 * ``TestLauncherVerdicts``  each launcher refusal red -> green: ``kvtail|auto`` told + ``--dual-layout``; ``vision_async_refusal`` (port from the NF line);
-                            the host-RAM warning term; the default dual / flip dry runs print nothing new.
+                            the host-RAM warning term; the default dual / flip dry runs print nothing new.  Since 2026-10-09 the 27B release
+                            profile snapshots name ``weights`` themselves (``27b-base.env``): "default" = that line taken out (``_without_place``).
 * ``TestHostLedgerPost``    ``host_ledger.charge_terms(vision_victim_host_gib=)``: run-moment term only, 0 changes no number, warning only.
 """
 
@@ -58,9 +59,22 @@ def _profile(name="27b-nvfp4-dual"):
     return O.profile_launch_input(os.path.join(PROFILES, name + ".env"))
 
 
+def _without_place(argv):
+    """``argv`` with every ``--weg2-vision-place <value>`` pair removed: the launcher DEFAULT (place unset).  Since 2026-10-09 the 27B release
+    profiles (and their snapshots here) name ``weights`` themselves (user decision; ``27b-base.env``, the Dual inherits it by ``source``)."""
+    out, i = [], 0
+    while i < len(argv):
+        if argv[i] == "--weg2-vision-place":
+            i += 2
+            continue
+        out.append(argv[i])
+        i += 1
+    return out
+
+
 def _with_place(base, place):
-    """The profile with ``--weg2-vision-place <place>`` appended (None = unchanged)."""
-    argv = list(base.argv) + ([] if place is None else ["--weg2-vision-place", place])
+    """The profile with its own place removed and ``--weg2-vision-place <place>`` appended (None = the place left unset)."""
+    argv = _without_place(base.argv) + ([] if place is None else ["--weg2-vision-place", place])
     return O.LaunchInput(argv, base.env, base.vars, [], "t", base.instruments)
 
 
@@ -448,9 +462,27 @@ def _dry_possible():
 
 @unittest.skipUnless(_dry_possible(), "27B launcher line + NVFP4 checkpoints + census needed (box-bound, like the AP0 goldens)")
 class TestDryRuns(unittest.TestCase):
-    def run_dual(self, *extra):
-        return O.run_profile(os.path.join(PROFILES, "27b-nvfp4-dual.env"), _ref_rows(), tree=str(launcher.__file__).split("/python/")[0],
+    #: the release line of the 27B base profile (user decision 2026-10-09); removed, the chain is the launcher's default path again
+    PLACE_LINE = "PROFILE_ARGS+=(--weg2-vision-place weights)\n"
+
+    def run_dual(self, *extra, profiles=PROFILES):
+        return O.run_profile(os.path.join(profiles, "27b-nvfp4-dual.env"), _ref_rows(), tree=str(launcher.__file__).split("/python/")[0],
                              extra_args=list(extra))
+
+    def run_dual_default(self):
+        """The Dual chain with the release line taken out of its base (copies in a temp dir): the place UNSET."""
+        with tempfile.TemporaryDirectory(prefix="ap4-default-place-") as td:
+            for n in ("27b-base.env", "27b-nvfp4-dual.env", "27b-nvfp4.pchunk.json"):
+                with open(os.path.join(PROFILES, n), encoding="utf-8") as fh:
+                    text = fh.read()
+                if n == "27b-base.env":
+                    self.assertEqual(text.count(self.PLACE_LINE), 1, "the release line of 27b-base.env moved")
+                    text = text.replace(self.PLACE_LINE, "")
+                with open(os.path.join(td, n), "w", encoding="utf-8") as fh:
+                    fh.write(text)
+            run = self.run_dual(profiles=td)
+        self.assertNotIn("--weg2-vision-place", run.argv)
+        return run
 
     def test_dual_with_kvtail_told_is_refused_by_the_launcher_itself(self):
         r = self.run_dual("--weg2-vision-place", "kvtail").result
@@ -459,7 +491,11 @@ class TestDryRuns(unittest.TestCase):
         self.assertIn("--weg2-vision-place kvtail", r.exc_msg)
 
     def test_dual_with_weights_runs_and_names_the_host_price(self):
-        r = self.run_dual("--weg2-vision-place", "weights").result
+        """The release Dual profile itself (no extra flag): it names ``weights`` once, via its base (user decision 2026-10-09)."""
+        run = self.run_dual()
+        self.assertEqual(run.argv.count("--weg2-vision-place"), 1)
+        self.assertEqual(run.argv[run.argv.index("--weg2-vision-place") + 1], "weights")
+        r = run.result
         self.assertIsNone(r.exc_type, "%s: %s" % (r.exc_type, r.exc_msg[:300]))
         self.assertEqual(r.rc, 0)
         host = [x for x in r.text.splitlines() if "WEG2-HOST vision_victim_host=" in x]
@@ -488,7 +524,7 @@ class TestDryRuns(unittest.TestCase):
         self.assertFalse([x for x in r.text.splitlines() if "host-RAM WARNING" in x])
 
     def test_dual_default_prints_nothing_of_it(self):
-        r = self.run_dual().result
+        r = self.run_dual_default().result
         self.assertIsNone(r.exc_type, r.exc_msg[:200])
         self.assertNotIn("vision_victim", r.text)
         self.assertNotIn("VISION-VICTIM", r.text)

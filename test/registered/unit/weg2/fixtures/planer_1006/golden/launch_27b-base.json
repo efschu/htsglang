@@ -44,6 +44,8 @@
   "4096",
   "--x-ceiling-tokens",
   "12288",
+  "--weg2-vision-place",
+  "weights",
   "--idle-layout",
   "pp",
   "--d-hold-s",
