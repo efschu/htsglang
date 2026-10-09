@@ -164,6 +164,12 @@ def _arrival(req) -> float:
     return float("inf") if seq is None else float(seq)
 
 
+def _lane_held(req) -> bool:
+    from sglang.srt.weg2.d_lane import lane_held
+
+    return lane_held(req)
+
+
 def park_site(req) -> Optional[str]:
     site = getattr(req, SITE_ATTR, None)
     return site if site in SITES else None
@@ -237,8 +243,10 @@ def order_waiting(waiting: Sequence) -> List:
     held on every rank first), and a re-sort could lift a request one rank
     does not hold above that head.  The park marks themselves are set by
     group-uniform events, so moving the parked requests is replicated."""
-    parked = [r for r in waiting if park_site(r) is not None]
-    rest = [r for r in waiting if park_site(r) is None]
+    # PRIORITY LANES 1008 (L2): a request in a LANE hold (``d_lane.lane_held``) is not preferred -- it
+    # waits for its floor, not for a seat, so it must not move ahead of the requests that can run
+    parked = [r for r in waiting if park_site(r) is not None and not _lane_held(r)]
+    rest = [r for r in waiting if park_site(r) is None or _lane_held(r)]
     return park_running_order(parked) + rest
 
 
