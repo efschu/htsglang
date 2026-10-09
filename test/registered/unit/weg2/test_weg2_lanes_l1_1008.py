@@ -423,7 +423,8 @@ def test_catalog_entries_and_edges_for_the_three_envs():
     for kid, von in (("K135", "SGLANG_WEG2_LANE_KEEPALIVE_S"), ("K136", "SGLANG_WEG2_LANE_PREEMPT_CHUNK_TOKENS")):
         k = kanten[kid]
         assert (k["von"], k["nach"], k["rel"]) == (von, "SGLANG_WEG2_LANES", "braucht")
-        assert k["beleg"]["datei"] == "python/sglang/srt/environ.py" and "baeume" not in k
+        # the lane envs exist on the NF line only (27B 84d04adae1 has none): the edge documents NF code only
+        assert k["beleg"]["datei"] == "python/sglang/srt/environ.py" and k["baeume"] == ["nf"]
 
 
 def test_the_launch_snapshot_shows_the_lane_envs_without_a_launcher_change():
