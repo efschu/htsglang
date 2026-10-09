@@ -58,3 +58,34 @@ Die Reihenfolge ist die der Sammel-Integs (int16 -> int17 -> int18 -> int19/20 -
 * Das Profil `nf-int4-h6-abl-xc-w3sp.env` (Fix-Liste Nr. 16) steht in keinem Commit des alten Baums, nur als Datei in `/spinning/gpu-arb/docker/profiles/`; in-tree Konvertierung der Profile = F0-G.
 * `tools/owui_proxy/*` (neu mit Nr. 7/client_ip): Hostpfade `/spinning/htsglang-gpu`, `/opt/owui_proxy`, `htsglang front` im Test-Docstring bleiben (R2: Hostpfade und Evidenz nicht umbenannt).
 * Zweite Runde fuer Fixes ab int23: `python port_one.py <sha>` je Fix-Commit in der Reihenfolge der Liste, danach `verify_final.py` gegen den neuen Quellkopf (Pfade in portlib.py: F0E-Laufverzeichnis fuer collision_ok.json/identfix_merged.json/uf.translated.jsonl bleibt Voraussetzung).
+
+## Runde 2 (int23, 08.10.2026): Zweig `desk/flliper-nf-f0h2-1008` ab `desk/flliper-nf-f0h-1008` @ 10198b0310
+
+Quelle: Delta `origin/desk/nf-int22-1008 @ 6b3bd1a6df .. origin/desk/nf-int23-1008 @ c651892375`, first-parent: genau drei Fix-Commits (keine Sammel-Merges im Delta). `desk/nf-h88-scalefix-1008` bewusst nicht portiert (eigenes Verfahren nach Review). Verfahren, Kit-Regel, Werkzeuge wie Runde 1 (`deskq/done/f0h2-port-tools-1008/`, Pfade auf planer-f0h2 angepasst).
+
+| Nr | alt | neu | Listeneintrag | Betreff | Dateien | Ergebnis | nicht rot auf Basis |
+|---|---|---|---|---|---|---|---|
+| 1 | 6f03a18a7f | 9a3cb0c415 | Nr. 20 (D-Anker) | MAMBA-LAST-RESORT (Schalter `SGLANG_WEG2_MAMBA_SPILL_LAST_RESORT`, Default aus) | 4 | 204 passed, 20 warnings, 6 subtests passed | keine |
+| 2 | c59353374a | f6e38f086a | int23 Eviction Teil A | PR-ARENA (Schalter `SGLANG_WEG2_ENABLE_PP_ROOM_ARENA_FREE_ROOM`, Default an) | 3 | 1 failed, 204 passed, 1 skipped, 23 warnings, 6 subtests passed | keine (das eine Rote `test_profile_catalog_1003::Build::test_build_and_shipped_catalog_agree` ist auf der Basis ebenso rot, Befund Runde 1) |
+| 3 | c651892375 | 554388cb3a | int23 Eviction Teil B | W3-HOST-LEAF (Schalter `SGLANG_WEG2_ENABLE_W3_SPILL_HOST_LEAVES`, Default aus; neues Modul `pdflip/host_only_spill.py`) | 4 | 130 passed, 18 warnings, 6 subtests passed | keine |
+| 4 | (kein alter Commit) | 67c5701c73 | Katalog-Nachzug | EXPLAINED-Eintraege fuer 5 Schalter + Kante K132 (catalog.json nicht neu gebaut) | 5 | 1 failed, 63 passed, 1 skipped (6 Katalog-/Kantenkatalog-Dateien; Basis gleiche Dateien: 1 failed, 63 passed, 1 skipped) | keine |
+
+Testsatz je Port-Commit wie Runde 1 (eigene Tests + Tests, die die geaenderten Module nennen, <=110 Dateien, + test_nf_form_a_*, + Katalogtests bei Nr. 2), `pytest_gedeckelt.sh`, leeres HOME.
+
+### Env-Namen alt -> neu (Spiegel geprueft: `name_compat.canonical_env_name` liefert fuer alle fuenf den neuen Namen)
+* `SGLANG_WEG2_MAMBA_SPILL_LAST_RESORT` -> `FLLIPER_PDFLIP_MAMBA_SPILL_LAST_RESORT` (EnvBool, Default aus; ohne ENABLE im Namen, wie im alten Baum)
+* `SGLANG_WEG2_ENABLE_PP_ROOM_ARENA_FREE_ROOM` -> `FLLIPER_PDFLIP_ENABLE_PP_ROOM_ARENA_FREE_ROOM` (EnvBool, Default AN)
+* `SGLANG_WEG2_ENABLE_W3_SPILL_HOST_LEAVES` -> `FLLIPER_PDFLIP_ENABLE_W3_SPILL_HOST_LEAVES` (EnvBool, Default aus)
+* Nachtrag Runde 1: `FLLIPER_PDFLIP_ENABLE_CAPPARK_FLIP_HOLD`, `FLLIPER_PDFLIP_ENABLE_W3_SPILL_ANCHOR_POOL` (fehlten im Katalog)
+
+### Katalog (Nr. 4)
+`profile_catalog_curated.py`: ein EXPLAINED-Block mit den fuenf Schaltern (Satz je Schalter = Kommentar des Schalters in `environ.py`, keine Zahl, die dort nicht steht; `trees_expected: ["nf"]`, keiner der fuenf steht in der 27B-`environ.py`, belegt per git grep auf `desk/27b-integ-1006a`). `kantenkatalog_1004.json`: Kante K132 `W3_SPILL_HOST_LEAVES requires W3_SPILL_ANCHOR_POOL` (trees nf, Anker `host_only_spill.py:32`, Beleg: environ-Kommentar "Needs the spill's arena pool (on hybrid boots ...ANCHOR_POOL)"). Die Pins in `test_kantenkatalog_1433` (131 -> 132, K-IDs bis K132), `test_kantenkatalog_anker_2013` (131 -> 132) und `test_kanten_loader_2002` (131/51/80 -> 132/51/81, n_curated + 81) sind angehoben. `catalog.json` NICHT neu gebaut (F0-I); die Pins gelten fuer den Build aus dem Baum, die ausgelieferte catalog.json bleibt wie auf der Basis (der Test `test_build_and_shipped_catalog_agree` bleibt rot wie auf der Basis).
+
+### Beweise
+* Endprobe (`verify_final.py`): alle 8 Dateien des Deltas `6b3bd1a6df..c651892375` aus der Pipeline auf dem int23-Stand sind **byte-gleich** zum portierten Baum (8 IDENTICAL, 0 abweichend; vor dem Katalog-Commit Nr. 4 geprueft).
+* Konflikte: 0 (`MERGED-CLEAN` fuer environ.py, unified_radix_cache.py, mamba_arena_displace.py, pp_room_vote.py; `NEW` fuer host_only_spill.py und die drei Testdateien). Uebersetzungs-Einheiten (log/help/doc) der drei Commits: 0.
+* Gates auf dem Endstand 67c5701c73 gegen die Basis 10198b0310 (eigener Basis-Worktree, gleiche Skripte): Kit-Testsatz 10 failed, 1162 passed, 9 skipped, 3 errors (Basis identisch); gateF 6 failed, 429 passed, 21 skipped (Basis identisch); rigdash/tests 3 failed, 964 passed, 15 skipped (identisch); rigmon 3 failed, 52 passed (identisch). Namen der Roten je Satz identisch (diff leer).
+
+### Offen
+* Kein Metallbeweis (keine GPU); Default-Entscheid von `W3_SPILL_HOST_LEAVES` und `MAMBA_SPILL_LAST_RESORT` laut Fix-Liste Nutzerentscheid.
+* Profile `nf-int4-h6-abl-xc-w3sp-mlr*.env` liegen nur unter `/spinning/gpu-arb/docker/profiles/` (in-tree Konvertierung = F0-G).
