@@ -26,7 +26,19 @@
                  "budget_over_available_mib": 0,     // optional: Budget größer als das Verfügbare (der Launcher meldet DARUEBER und startet trotzdem, launcher.py:19902-19958)
                  "user_reserve_mib": 0,              // optional: --d-reserve-mib (D-Phase); geht in den Verfügbar-Vergleich ein, wird nicht gezeichnet
                  "shared_with_d": [ RefSegment, ... ],  // optional (Dual-Form --dual-share, P-Phase): REFERENZ ohne Budgetverbrauch, NICHT in segments und nicht in der Summe
-                 "not_computed": [ "Festposten" ], "over_text": "" }
+                 "not_computed": [ "Festposten" ], "over_text": "",
+                 "host_zeilen": [ HostRow ] }         // optional (VISION-WEIGHTS AP4, only with --weg2-vision-place weights, PP0 card of the P phase): host RAM rows, NOT in the card bar
+
+     // VISION-WEIGHTS AP4 -- DATA ONLY, no layout change (the page shows ONE line each, the bar and its sum stay as they are):
+     //   Segment "weights" (in the Dual the RefSegment "diff"/"weights" the weights live in) may carry "unterposten": [ SubItem ].
+     //   SubItem = { "name": "vision_transient", "label": "Vision transient", "mib": 878.8, "resident_mib": 0, "in_summe": false, "transient": true,
+     //               "opferart": "dense" | "pp_only" | "experts", "verfuegbar_mib": number | null, "verfuegbar_quelle": "...", "verdikt": { "code": "W105b",
+     //               "stufe": "ja" | "nein" | "ungeprueft", "text": "..." }, "detail", "herkunft", "gerechnet" }
+     //   = the victim weights the transient tower sits on: a CHECK item inside the weights (the victims are weights that are already counted), NOT added
+     //   to posts_mib and not to the sum of the segments (draw it hatched inside the weights segment, tooltip = detail + verdikt.text).
+     //   HostRow = { "name": "vision_victim_host", "label": "Displaced weights, temporary (host)", "mib": 878.8 | 0, "transient": true,
+     //               "nach_rueckholung_mib": 0, "detail", "gerechnet" }   // 27B: the victim bytes in a host image while an image is encoded; NF: 0
+     //   Without --weg2-vision-place weights (or without --weg2-vision transient) none of these keys exists.
 
      RefSegment = { "name", "label", "mib": number | null, "ref": "shared" | "in_festposten", "herkunft", "detail", "gerechnet" }
                  // "shared" = die Bytes liegen in D's Union-Image bzw. im Karten-KV-Pool; "in_festposten" = der Betrag steckt schon im Festposten;

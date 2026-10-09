@@ -501,6 +501,16 @@ class ProposeStartprofil(unittest.TestCase):
         self.assertEqual(row["vorschlag"]["verdikte"][0]["code"], "UNBELEGT")
         self.assertEqual(row["vorschlag"]["kanten"], row["explain"]["depends"])
 
+    def test_the_vision_section_of_the_proposal_reaches_the_page_data_only(self):
+        """VISION-WEIGHTS AP4: ``vorschlag.vision`` (``flliper.vision-victim/1``) passes through as DATA; an answer without it adds no key."""
+        self.assertNotIn("vision", self.ed.propose(self._body())["vorschlag"])
+        sec = {"schema": "flliper.vision-victim/1", "aktiv": True, "opferart": "dense", "turm_mib": 878.8, "host_mib": 878.8,
+               "vision_transient": {"name": "vision_transient", "label": "Vision transient", "mib": 878.8, "resident_mib": 0.0},
+               "host_posten": {"name": "vision_victim_host", "mib": 878.8}, "verdikt": {"code": "W105b", "stufe": "ja"}}
+        self.answer["vorschlag"]["vision"] = sec
+        r = self.ed.propose(self._body())
+        self.assertEqual(r["vorschlag"]["vision"], sec)
+
     def test_the_balken_request_is_the_h2_contract(self):
         for form, want in (("flip", "flip"), ("tp", "d_only")):
             r = self.ed.propose(self._body(form=form))
