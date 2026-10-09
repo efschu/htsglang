@@ -5392,7 +5392,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def _pdflip_last_resort_victim(self, node, mp):
         """MAMBA-LAST-RESORT (``FLLIPER_PDFLIP_MAMBA_SPILL_LAST_RESORT``, default
-        off): the anchor a full arena's claim may spill when the H19 /
+        on since 09.10.): the anchor a full arena's claim may spill when the H19 /
         PARK-END-ANCHOR-FIRST rules found none (NF int22, D TP0 boot
         1008_171755 17:51:57: 26 usable slots, all END or deepest anchors,
         ``FLUSH-SPILL victim=none`` x4, ``ARENA-DROP slot_bytes=58834944
@@ -5401,7 +5401,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         served). The shallowest settled anchor (END too) off the claimer's
         park chain; the caller secures its L3 copy before it releases it, so
         no anchor is lost -- the next reader takes it from the store. None
-        with the switch off: the old answer, byte for byte."""
+        with the switch set to 0: the old answer, byte for byte."""
         if not envs.FLLIPER_PDFLIP_MAMBA_SPILL_LAST_RESORT.get():
             return None
         cands = _mad.tree_anchors(
@@ -5675,7 +5675,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # W3-HOST-LEAF (NF int22 1008_171755: candidates=0 on all P stages;
             # port of the 27B Q-697c spill, pdflip/host_only_spill.py): when the
             # device-resident round did not cover the claim, host-only leaves
-            # spill too (L3 copy first). Gate off: not entered.
+            # spill too (L3 copy first). Gate 0 / not the local-PP floor: not
+            # entered.
             from flliper.srt.pdflip import host_only_spill as _hos
 
             if _hos.armed(self):

@@ -16,14 +16,16 @@ runs after the device-resident round: host-only H-LEAVES are secured to L3 for
 every page first and then leave the tree -- their arena references go; the
 claimer's host-only children included, so the un-backed claimer becomes
 childless and droppable (UD). A leaf without a secured copy, with a host lock
-or without page hashes stays. Off (default) / not the local-PP floor: the old
-spill.
+or without page hashes stays. Default ON since the user decision of 09.10.;
+``=0`` / not the local-PP floor: the old spill.
 """
 
 from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(__file__)
 
+import contextlib
+import os
 import unittest
 
 import torch
@@ -97,6 +99,24 @@ def _spill(cache, pool, claimer, *, on, floor=True):
         return cache._w3_arena_spill(pool, SPAN, claimer=claimer)
 
 
+SWITCH = "FLLIPER_PDFLIP_ENABLE_W3_SPILL_HOST_LEAVES"
+
+
+@contextlib.contextmanager
+def _raw_env(value):
+    """The variable exactly as a boot sees it: unset (``None``) or a raw string."""
+    had, old = SWITCH in os.environ, os.environ.get(SWITCH)
+    os.environ.pop(SWITCH, None)
+    if value is not None:
+        os.environ[SWITCH] = value
+    try:
+        yield
+    finally:
+        os.environ.pop(SWITCH, None)
+        if had:
+            os.environ[SWITCH] = old
+
+
 class TestW3SpillHostLeaves(CustomTestCase):
     def test_fixture_is_the_death_shape(self):
         cache, top, mid, leaf = _death_shape()
@@ -126,6 +146,27 @@ class TestW3SpillHostLeaves(CustomTestCase):
         cache, top, mid, leaf = _death_shape()
         pool = _AnchorPool()
         self.assertEqual(_spill(cache, pool, top, on=False), 0)
+        self.assertEqual(pool.secured, [])
+        self.assertIn(leaf, cache._collect_all_nodes())
+
+    def test_default_unset_is_on(self):
+        """DEFAULT ON (user decision 09.10.): unset, the host-only leaves leave
+        with their L3 copy, as with ``=1`` (red on the base dacc89e543)."""
+        cache, top, mid, leaf = _death_shape()
+        pool = _AnchorPool()
+        with _raw_env(None):
+            self.assertIs(envs.FLLIPER_PDFLIP_ENABLE_W3_SPILL_HOST_LEAVES.get(), True)
+            got = cache._w3_arena_spill(pool, SPAN, claimer=top)
+        self.assertEqual(got, 2 * SPAN)
+        self.assertEqual(pool.secured, [SPAN, SPAN])
+        self.assertNotIn(leaf, cache._collect_all_nodes())
+
+    def test_env_0_is_the_old_spill(self):
+        cache, top, mid, leaf = _death_shape()
+        pool = _AnchorPool()
+        with _raw_env("0"):
+            self.assertIs(envs.FLLIPER_PDFLIP_ENABLE_W3_SPILL_HOST_LEAVES.get(), False)
+            self.assertEqual(cache._w3_arena_spill(pool, SPAN, claimer=top), 0)
         self.assertEqual(pool.secured, [])
         self.assertIn(leaf, cache._collect_all_nodes())
 

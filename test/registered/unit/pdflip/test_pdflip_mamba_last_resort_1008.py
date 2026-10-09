@@ -18,10 +18,11 @@ DER BEFUND (D-Log boot_weg2_dkrnfint4h6ablxcw3spbar1dauer10081717_6b3bd1a6df_100
   keep every request's deepest one (``pick_foreign_victim``), so an arena of
   END anchors has no victim.
 
-THE FIX: with ``FLLIPER_PDFLIP_MAMBA_SPILL_LAST_RESORT`` on, a claim the old rules
-refuse spills the shallowest settled anchor (END too) off the claimer's park
-chain -- secured to L3 first (``arena_secure_to_disk``), released only when
-that worked. Off = the old answer, byte for byte.
+THE FIX: with ``FLLIPER_PDFLIP_MAMBA_SPILL_LAST_RESORT`` on (the default since the
+user decision of 09.10.), a claim the old rules refuse spills the shallowest
+settled anchor (END too) off the claimer's park chain -- secured to L3 first
+(``arena_secure_to_disk``), released only when that worked. ``0`` = the old
+answer, byte for byte.
 
 Hermetic: the real shared arena (arena.c, gcc), three rank pools, real tree
 nodes, the real ``UnifiedRadixCache._pdflip_mamba_claim`` (the harness of the
@@ -115,13 +116,40 @@ def test_an_arena_of_end_anchors_spills_the_shallowest_one_secured_first(tmp_pat
 
 @needs_gcc
 def test_switch_off_is_the_old_answer_byte_for_byte(tmp_path, monkeypatch):
-    """The log's failure, unchanged without the switch: nothing is spilled,
+    """The log's failure, unchanged with the switch at 0: nothing is spilled,
     the claimer stays un-backed, every END anchor stays."""
-    monkeypatch.delenv(SWITCH, raising=False)
+    monkeypatch.setenv(SWITCH, "0")
     L = _Layout(tmp_path, 4, n_end=4)
     L.run()
     assert all(rk.unbacked for rk in L.ranks)
     assert [L.state(h) for h in L.ends] == [2] * 4 and L.spilled == []
+
+
+@needs_gcc
+def test_default_unset_is_on_the_shallowest_end_anchor_gives_its_slot(tmp_path, monkeypatch):
+    """DEFAULT ON (user decision 09.10.): with the variable unset the claim
+    behaves as with ``=1`` -- the shallowest END anchor is secured to L3 on
+    every rank and its slot goes to the claimer (red on the base dacc89e543,
+    whose default was off)."""
+    monkeypatch.delenv(SWITCH, raising=False)
+    L = _Layout(tmp_path, 4, n_end=4)
+    L.run()
+    assert L.state("NEW") == 2, "the claimer landed without the variable"
+    assert not any(rk.unbacked for rk in L.ranks)
+    assert L.state(L.ends[0]) != 2
+    assert [L.state(h) for h in L.ends[1:]] == [2] * 3
+    assert sum(1 for w, _ in L.spilled if w == "flush_spill") == L.H.RANKS
+
+
+def test_env_default_is_on_and_0_is_off(monkeypatch):
+    from flliper.srt.environ import envs
+
+    monkeypatch.delenv(SWITCH, raising=False)
+    assert envs.FLLIPER_PDFLIP_MAMBA_SPILL_LAST_RESORT.get() is True, "default on"
+    monkeypatch.setenv(SWITCH, "0")
+    assert envs.FLLIPER_PDFLIP_MAMBA_SPILL_LAST_RESORT.get() is False, "0 = off"
+    monkeypatch.setenv(SWITCH, "1")
+    assert envs.FLLIPER_PDFLIP_MAMBA_SPILL_LAST_RESORT.get() is True
 
 
 @needs_gcc

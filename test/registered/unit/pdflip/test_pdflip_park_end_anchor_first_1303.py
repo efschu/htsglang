@@ -23,6 +23,11 @@ intermediate that still finds no slot goes down KV-only and is not retried.
 Switch ``FLLIPER_PDFLIP_PARK_END_ANCHOR_FIRST`` (default on). No mark = no
 change: the H19 answer stands byte for byte.
 
+MAMBA-LAST-RESORT (``FLLIPER_PDFLIP_MAMBA_SPILL_LAST_RESORT``, default on since
+the user decision of 09.10.) is the step AFTER these rules: the tests that pin
+the answer of the H19 / PARK-END-ANCHOR-FIRST rules alone set it to 0
+(``_no_last_resort``); its own proof is test_pdflip_mamba_last_resort_1008.py.
+
 Hermetic: the real shared arena (arena.c, gcc), three rank pools, real tree
 nodes, the real ``UnifiedRadixCache._pdflip_mamba_claim`` (the harness of the
 H19 / D-NORECOMPUTE tests).
@@ -46,6 +51,11 @@ from flliper.srt.pdflip import mamba_arena_displace as mad  # noqa: E402
 
 M = ComponentType.MAMBA
 needs_gcc = pytest.mark.skipif(shutil.which("gcc") is None, reason="needs gcc")
+
+
+def _no_last_resort(monkeypatch):
+    """The rules of this file alone: MAMBA-LAST-RESORT (default on) off."""
+    monkeypatch.setenv("FLLIPER_PDFLIP_MAMBA_SPILL_LAST_RESORT", "0")
 
 
 def _h19():
@@ -112,12 +122,13 @@ class _Layout:
 # ---- the model of the log: arena full of anchors without park reference ----------------
 
 @needs_gcc
-def test_park_chain_takes_slots_from_untagged_anchors_off_the_chain(tmp_path):
+def test_park_chain_takes_slots_from_untagged_anchors_off_the_chain(tmp_path, monkeypatch):
     """4 slots, all held by older untagged anchors (the D tree of the log); the
     parked chain A -> B -> END needs 3. Before: FLUSH-SPILL victim=none, the
     sweep stuck on A, END un-backed. Now: the three shallowest off-chain
     anchors are spilled (secured first), the chain lands, the deepest older
     anchor stays."""
+    _no_last_resort(monkeypatch)   # every spill is park_first's, none the flush's last resort
     L = _Layout(tmp_path, 4, off_chain=4)
     assert [L.state(h) for h in L.off] == [2] * 4
     L.mark()
@@ -130,10 +141,12 @@ def test_park_chain_takes_slots_from_untagged_anchors_off_the_chain(tmp_path):
 
 
 @needs_gcc
-def test_without_the_mark_the_h19_answer_stands(tmp_path):
+def test_without_the_mark_the_h19_answer_stands(tmp_path, monkeypatch):
     """Regression proof / byte-identity: the same layout, no park mark. The
     flush spill finds no TAGGED victim (a D tree has none), the chain stays
-    un-backed, nothing is spilled -- exactly the log's failure."""
+    un-backed, nothing is spilled -- exactly the log's failure (MAMBA-LAST-RESORT
+    at 0; with it on, the flush's last resort takes over)."""
+    _no_last_resort(monkeypatch)
     L = _Layout(tmp_path, 4, off_chain=4)
     L.run()
     assert all(L.state(h) != 2 for h in L.chain)
@@ -145,6 +158,7 @@ def test_without_the_mark_the_h19_answer_stands(tmp_path):
 @needs_gcc
 def test_switch_off_is_the_old_behaviour(tmp_path, monkeypatch):
     monkeypatch.setenv("FLLIPER_PDFLIP_PARK_END_ANCHOR_FIRST", "0")
+    _no_last_resort(monkeypatch)
     L = _Layout(tmp_path, 4, off_chain=4)
     L.mark()
     L.run()

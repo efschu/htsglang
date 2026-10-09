@@ -28,10 +28,11 @@ hashes stays.
 NOT PORTED: the #1500i census (``dual_pkvwait_instr``), the Q-1190b ``allow_aux``
 stage and the ``budget_s`` brake (callers on the 27B line only).
 
-GATE: ``FLLIPER_PDFLIP_ENABLE_W3_SPILL_HOST_LEAVES`` (default off, like
-``FLLIPER_PDFLIP_ENABLE_W3_SPILL_ANCHOR_POOL`` that carries the pool) AND the local-PP
+GATE: ``FLLIPER_PDFLIP_ENABLE_W3_SPILL_HOST_LEAVES`` (default on since the user
+decision of 09.10.; on hybrid boots it is reached only through the pool that
+``FLLIPER_PDFLIP_ENABLE_W3_SPILL_ANCHOR_POOL`` carries, default off) AND the local-PP
 floor (``pp_slot_fidelity.FLOOR_LOCAL_PP_ATTR``: tp group of one, the tree is this
-rank's own -- UD-H's scope; a TP group's replicas never edit rank-locally). Off:
+rank's own -- UD-H's scope; a TP group's replicas never edit rank-locally). ``0``:
 the spill byte for byte as before.
 """
 from __future__ import annotations
