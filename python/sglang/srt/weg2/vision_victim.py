@@ -749,8 +749,11 @@ def encode_air_refusal(work: int, card_free: int, cache_idle: int, patches: int)
 # ---------------------------------------------------------------------------
 
 #: modules that register a source (``register_source``) at import; a line
-#: adds its own (NF: its expert-row source)
-SOURCE_MODULES: Tuple[str, ...] = ("sglang.srt.weg2.vision_victim_27b",)
+#: adds its own. NF line (AP3): only the expert-row source -- the 27B module
+#: is not on this line, and its ``dense`` source applies to EVERY non-dual
+#: rank, so in a tree that carries both the experts module must come FIRST
+#: (its ``applies`` is "this rank has Platztausch refill rows").
+SOURCE_MODULES: Tuple[str, ...] = ("sglang.srt.weg2.vision_victim_experts",)
 
 #: (kind, applies(scheduler) -> bool, build(scheduler) -> VictimSource), in order
 _SOURCES: List[Tuple[str, Callable[[Any], bool], Callable[[Any], VictimSource]]] = []

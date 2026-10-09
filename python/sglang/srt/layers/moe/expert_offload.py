@@ -7465,6 +7465,28 @@ class DeferredRowsFill:
                 break  # ein Strom: dahinter ist auch noch nichts fertig
             self._promote(cache, "tick")
 
+    def land_now(self, why: str) -> int:
+        """VISION-WEIGHTS (AP3, NF): jede offene Zeile JETZT auf der Karte,
+        auf dem Host abgewartet. Die Vision-Stufe leiht residente Zeilen als
+        Turmspeicher und bildet vorher ihre Pruefsumme -- ein Nachlader, der
+        noch auf dem Seitenstrom schreibt, waere ein zweiter Schreiber (Plan
+        R3). Nicht eingereihte Layer werden eingereiht (hinter den laufenden
+        Strom), dann wartet der Host jedes Event. Befoerdert wird NICHTS: das
+        macht der naechste Forward (``tick``), dessen Warten dann leer ist.
+        Gibt die Zahl der abgewarteten Layer zurueck (0: nichts offen)."""
+        if not self.pending:
+            return 0
+        if not self.started:
+            self.start(why=why)
+        late = [c for c in self.pending if id(c) not in self.events]
+        if late:
+            self._issue(late)
+        for cache in self.pending:
+            ev = self.events.get(id(cache))
+            if ev is not None:
+                ev.synchronize()
+        return len(self.pending)
+
     def settle(self) -> None:
         """Vor dem Schlaf: einen laufenden Nachlader abwarten (die Puffer
         werden gleich pausiert), dann alles vergessen -- der naechste Wake
