@@ -5,6 +5,7 @@
    Jeder Wert trägt seine Quelle: config | Index | geschätzt | stat.  Nur im Rig-Dashboard (Edition rig). */
 (function (root) {
   "use strict";
+  const LOC = () => (typeof RigI18n === "undefined" ? "en-US" : RigI18n.loc());      // the number format follows the page language (i18n.js); node tests have none
   const QUELLE = {
     "config": "stated in the model's config.json",
     "Index": "from the header lines of the Safetensors/GGUF files (exact tensor sizes)",
@@ -40,12 +41,12 @@
   function bytes(n) {
     if (n == null) return "–";
     const a = Math.abs(n);
-    if (a >= 1073741824) return (n / 1073741824).toLocaleString("en-US", { maximumFractionDigits: 2 }) + " GiB";
-    if (a >= 1048576) return (n / 1048576).toLocaleString("en-US", { maximumFractionDigits: 1 }) + " MiB";
-    if (a >= 1024) return (n / 1024).toLocaleString("en-US", { maximumFractionDigits: 1 }) + " KiB";
-    return n.toLocaleString("en-US") + " B";
+    if (a >= 1073741824) return (n / 1073741824).toLocaleString(LOC(), { maximumFractionDigits: 2 }) + " GiB";
+    if (a >= 1048576) return (n / 1048576).toLocaleString(LOC(), { maximumFractionDigits: 1 }) + " MiB";
+    if (a >= 1024) return (n / 1024).toLocaleString(LOC(), { maximumFractionDigits: 1 }) + " KiB";
+    return n.toLocaleString(LOC()) + " B";
   }
-  const zahl = (n) => (n == null ? "–" : n.toLocaleString("en-US"));
+  const zahl = (n) => (n == null ? "–" : n.toLocaleString(LOC()));
   const leaf = (o) => (o && typeof o === "object" && "v" in o ? o : { v: null, src: "" });
 
   /* Das Schätzprofil als flache Zeilenliste, gruppiert wie der Editor sie requires. */
@@ -82,7 +83,7 @@
     add("KV", "KV per token and attention layer", kv.cell_bytes_per_attn_layer_token, (v) => zahl(v) + " B", "choice: " + leaf(kv.chosen).v);
     const vfp8 = ((kv.variants || {}).fp8_e4m3 || {}).bytes_per_token_all_attn_layers;
     add("KV", "KV per token (fp8, all attention layers)", vfp8, (v) => zahl(v) + " B");
-    add("State", "Mamba/GDN state per linear layer and request", st.per_linear_layer_per_slot_mib, (v) => v.toLocaleString("en-US", { maximumFractionDigits: 4 }) + " MiB",
+    add("State", "Mamba/GDN state per linear layer and request", st.per_linear_layer_per_slot_mib, (v) => v.toLocaleString(LOC(), { maximumFractionDigits: 4 }) + " MiB",
         "SSM dtype " + leaf(st.ssm_dtype).v + (st.variants_mib ? " (float32 " + st.variants_mib.float32 + " / bfloat16 " + st.variants_mib.bfloat16 + " MiB)" : ""));
     if (leaf(ex.n).v) {
       add("Experts", "Count", ex.n, zahl);
@@ -95,7 +96,7 @@
     const rp = (cx.rope || {});
     add("Context", "Rope", rp.type, (v) => v + (leaf(rp.theta).v ? " · θ " + zahl(leaf(rp.theta).v) : ""));
     add("Context", "Rope extended", cx.rope_extended_tokens, zahl);
-    add("Activation", "Extend rate per row", (p.activation || {}).extend_rate_mib_per_row, (v) => v.toLocaleString("en-US", { maximumFractionDigits: 4 }) + " MiB",
+    add("Activation", "Extend rate per row", (p.activation || {}).extend_rate_mib_per_row, (v) => v.toLocaleString(LOC(), { maximumFractionDigits: 4 }) + " MiB",
         "initial value from the geometry; the measurement on the rank replaces it");
     return out;
   }

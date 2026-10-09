@@ -6,6 +6,7 @@
    Kantenkatalog (2002 C); ausgewertet wird keine Regel.  Nur im Rig-Dashboard (Edition rig) und nur im LAN. */
 (function () {
   "use strict";
+  const LOC = () => (typeof RigI18n === "undefined" ? "en-US" : RigI18n.loc());      // the number format follows the page language (i18n.js); node tests have none
   const root = document.getElementById("pf-root");
   if (!root) return;
   const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -414,7 +415,7 @@
         body = `${note}${st.barBusy ? '<div class="muted pf-note">recomputing …</div>' : ""}${fastNote}` +
           `<div class="muted pf-note">Operating form: <b>${esc(FORM_NAME[res.form] || res.form || "")}</b>${res.draft && res.draft.kind && res.draft.kind !== "none" ? " · draft: " + esc(res.draft.kind) + (res.draft.placement ? " (" + esc(res.draft.placement) + ")" : "") : ""}</div>` +
           r.html +
-          (ctxf != null ? `<div class="muted pf-note">Context floor (smallest KV capacity across the stages): ${ctxf.toLocaleString("en-US")} tokens</div>` : "") +
+          (ctxf != null ? `<div class="muted pf-note">Context floor (smallest KV capacity across the stages): ${ctxf.toLocaleString(LOC())} tokens</div>` : "") +
           (b.draftError ? `<div class="kp-verdict bad">${esc(b.draftError)}</div>` : "") +
           (b.hints && b.hints.length ? `<ul class="pf-hints">${b.hints.map((h) => `<li>${esc(h)}</li>`).join("")}</ul>` : "") +
           `<div class="muted pf-note">Model: <span class="mono">${esc(b.model || "")}</span>. ${nc.length ? "<b>Not computed:</b> " + esc(nc.join(", ")) + " (chips below the bar, the tooltip names the reason); “Free” is then an upper bound. " : ""}Fixed items (CUDA context, graphs, allocator remainders) can only be measured on the hardware. Values with source “approximation” are estimates of the editor, not those of the launcher solver.</div>`;
@@ -606,7 +607,7 @@
     const vals = [...wrap.querySelectorAll("input[data-vk]")].map((x) => x.value.trim());
     if (vals.some((v) => !v || /[,\s]/.test(v))) { st.err = "Every entry needs a value without comma and spaces."; return draw(); }
     const sum = wrap.querySelector(".pfx-sum"), PX = window.ProfilPlaner, sm = PX.vecSum(vals);
-    if (sum && sm != null) sum.textContent = "Σ " + sm.toLocaleString("en-US", { maximumFractionDigits: 6 });
+    if (sum && sm != null) sum.textContent = "Σ " + sm.toLocaleString(LOC(), { maximumFractionDigits: 6 });
     clearTimeout(st.vecTimer);
     st.vecTimer = setTimeout(() => doEdit([{ key, op: "set", value: PX.vecJoin(vals) }]), 650);
   }

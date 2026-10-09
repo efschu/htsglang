@@ -4,12 +4,13 @@
    Seit 05.10. kein eigener Reiter mehr: der Plan ist der aufklappbare Abschnitt "Plan für andere Karten" im Profil-Planer (#kp-fold). */
 (function () {
   "use strict";
+  const LOC = () => (typeof RigI18n === "undefined" ? "en-US" : RigI18n.loc());      // the number format follows the page language (i18n.js); node tests have none
   const root = document.getElementById("kp-root");
   if (!root) return;
   const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-  const fmt = (n) => (n == null ? "–" : Math.round(n).toLocaleString("en-US"));
+  const fmt = (n) => (n == null ? "–" : Math.round(n).toLocaleString(LOC()));
   const srcDisp = (t) => ({ "Datasheet": "datasheet", "NVML-Record": "NVML record" })[t] || t;   // display words of the catalog source tags (the tags stay German keys)
-  const gib = (n) => (n == null ? "–" : (n / 1024).toLocaleString("en-US", { maximumFractionDigits: 1 }));
+  const gib = (n) => (n == null ? "–" : (n / 1024).toLocaleString(LOC(), { maximumFractionDigits: 1 }));
   const state = { cat: null, profile: null, cards: [], hostPatched: true, view: "einfach", res: null, busy: false, err: null, envFilter: "" };
   try { const v = localStorage.getItem("rigdash.kp.view"); if (v === "einfach" || v === "expert") state.view = v; } catch (e) { /* private window */ }
 
@@ -68,7 +69,7 @@
   // Reihenfolge (Server, stabil): Block "gemeinsam" (Treiber), Block P, Block D; innerhalb eines Blocks nach Postenart.
   const PHN = { P: "P phase", D: "D phase", gemeinsam: "shared (driver)", shared: "shared (driver)" };   // "gemeinsam" is the API phase key
   const OVER_TOL = 8;      // MiB: rounding of the planner items
-  const pct = (a, t) => (t ? (100 * a / t).toLocaleString("en-US", { maximumFractionDigits: 1 }) : "–") + " %";
+  const pct = (a, t) => (t ? (100 * a / t).toLocaleString(LOC(), { maximumFractionDigits: 1 }) : "–") + " %";
   // Modell eines Balkens: Segmente mit Start/Ende in MiB, Skala = max(Karte, Summe) -- wächst die Summe über die Karte,
   // wächst der Balken mit (Kante bleibt markiert)
   function barModel(ph, total) {
