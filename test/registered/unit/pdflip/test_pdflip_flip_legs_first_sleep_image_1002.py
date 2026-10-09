@@ -2,7 +2,7 @@
 """FLIP-LEGS 02.10.: the first-sleep dormant image leaves the flip.
 
 MEASURED (N4p f405217a61 1002_095319, N4q 58361d5471 1002_101341, front logs;
-VM pdflip_flip_user_view_ms): the user's flip total exceeds warmup + layer +
+VM weg2_flip_user_view_ms): the user's flip total exceeds warmup + layer +
 nachlauf by 1.49/1.52 s on the FIRST D->P and by 1.03/1.06 s on the FIRST P->D
 of each boot -- and by ~0 on every later flip. FLIP-TIMELINE puts the gap
 between the kv wake and ``done``: ``wake-kv@2992 dc@4511`` (first D->P) against

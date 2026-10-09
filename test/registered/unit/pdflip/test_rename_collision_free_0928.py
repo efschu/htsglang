@@ -37,6 +37,8 @@ _NEW_RX = re.compile("|".join(re.escape(n) for _, n in _PAIRS) + "|" + "fLL" "ip
 _EXEMPT = {
     "test/registered/unit/pdflip/test_pdflip_name_compat_env_1b.py",
     "test/registered/unit/pdflip/test_pdflip_name_compat_readers_1a.py",
+    # F0-M: the pin of the exported metric names states both spellings in its prose (old name, name the kit would make of it)
+    "test/registered/unit/pdflip/test_metric_names_must_keep_1008.py",
 }
 
 
@@ -51,8 +53,31 @@ def _mapped(word):
     return word
 
 
-def collisions(text):
+def _without_metric_names(text, path):
+    """F0-M: the exported metric names (``<old package word>:<name>``, ``<old subsystem word>_<name>`` ...) are KEPT by the kit
+    (rename_to_flliper METRIC-NAME MUST-KEEP, data/metric_names_1008.json): they are deny spans there, so they never merge with a renamed
+    word.  The same spans are blanked here before the words are compared; without the kit in the tree nothing is blanked."""
+    if path is None:
+        return text
+    kit = str(ROOT / "tools" / "release")
+    if not (Path(kit) / "rename_to_flliper.py").is_file():
+        return text
+    import sys
+    sys.path.insert(0, kit)
+    try:
+        import rename_to_flliper as kit_engine
+        kit_engine._MK = None
+        spans = kit_engine.metric_keep_spans(text, path)
+    finally:
+        sys.path.remove(kit)
+    for a, b, _ in sorted(spans, reverse=True):
+        text = text[:a] + " " * (b - a) + text[b:]
+    return text
+
+
+def collisions(text, path=None):
     """{renamed word: [distinct source words]} for words that merge under the rename."""
+    text = _without_metric_names(text, path)
     seen = {}
     for w in set(_WORD.findall(text)):
         seen.setdefault(_mapped(w), set()).add(w)
@@ -86,7 +111,7 @@ def test_no_tree_file_merges_two_words_under_the_rename():
     for rel in _files_with_renamed_words():
         if rel in _EXEMPT:
             continue
-        c = collisions((ROOT / rel).read_text(errors="replace"))
+        c = collisions((ROOT / rel).read_text(errors="replace"), rel)
         if c:
             bad[rel] = c
     assert not bad, "rename collisions (write the renamed spelling split or build it at run time): %s" % bad

@@ -1253,8 +1253,8 @@ def power_limit_sweep(
 
 # ---------------------------------------------------------------------------
 # LIVE monitoring: poll a RUNNING server's Prometheus /metrics, compute
-# client-side delta rates. Token counters (flliper:prompt_tokens_total /
-# flliper:generation_tokens_total) are ALREADY Prometheus Counters, so
+# client-side delta rates. Token counters (sglang:prompt_tokens_total /
+# sglang:generation_tokens_total) are ALREADY Prometheus Counters, so
 # prefill/s + decode/s are pure client-side deltas of the raw counters — far
 # finer-grained than scheduler.last_gen_throughput (a ~1s server-side average).
 # The spec signals (accept rate, active adaptive-k, and the newly-exposed
@@ -1310,12 +1310,12 @@ class LiveSnapshot:
         g = metrics.get
         return cls(
             t=t if t is not None else time.time(),
-            prompt_tokens_total=g("flliper:prompt_tokens_total", 0.0),
-            generation_tokens_total=g("flliper:generation_tokens_total", 0.0),
-            spec_accept_rate=g("flliper:spec_accept_rate", 0.0),
-            spec_num_steps=g("flliper:spec_num_steps", 0.0),
-            spec_ema_accept_len=g("flliper:spec_ema_accept_len", 0.0),
-            gen_throughput=g("flliper:gen_throughput", 0.0),
+            prompt_tokens_total=g("sglang:prompt_tokens_total", 0.0),
+            generation_tokens_total=g("sglang:generation_tokens_total", 0.0),
+            spec_accept_rate=g("sglang:spec_accept_rate", 0.0),
+            spec_num_steps=g("sglang:spec_num_steps", 0.0),
+            spec_ema_accept_len=g("sglang:spec_ema_accept_len", 0.0),
+            gen_throughput=g("sglang:gen_throughput", 0.0),
         )
 
 

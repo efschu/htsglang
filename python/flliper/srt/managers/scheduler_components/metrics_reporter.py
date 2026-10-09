@@ -1968,7 +1968,7 @@ class SchedulerMetricsReporter:
         if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
             self.stats.utilization = -1
         else:
-            # TODO: max_running_requests_under_SLO has no setter — flliper:utilization stuck at 0 (regressed #22713).
+            # TODO: max_running_requests_under_SLO has no setter — sglang:utilization stuck at 0 (regressed #22713).
             max_under_slo = getattr(
                 self.scheduler, "max_running_requests_under_SLO", None
             )

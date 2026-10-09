@@ -10,7 +10,7 @@ Rules this module is shaped around (operator 01.10.):
   (``FLLIPER_PDFLIP_METRICS_PUSH_URL``) only. It runs in the front's BoundedWriter
   thread (a ``submit`` callable the front hands in) -- never on the event loop,
   never on the flip path; a full buffer drops its oldest points (counted).
-* A metric failure is COUNTED (``pdflip_metrics_errors_total{where}``), never
+* A metric failure is COUNTED (``weg2_metrics_errors_total{where}``), never
   raised into the front.
 * Never ``rid`` as a label (cardinality); the push carries it as a FIELD.
 
@@ -41,7 +41,7 @@ PUSH_BUFFER_MAX = 20000
 PUSH_TIMEOUT_S = 2.0
 #: one group's /metrics scrape bound (spec: 2 s)
 GROUP_SCRAPE_TIMEOUT_S = 2.0
-GROUP_LABEL = "pdflip_group"
+GROUP_LABEL = "weg2_group"
 
 _LAT_BUCKETS = (0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0, 300.0, 600.0)
 _FLIP_BUCKETS = (0.1, 0.25, 0.5, 1.0, 2.0, 3.0, 5.0, 7.5, 10.0, 15.0, 20.0, 30.0, 60.0, 120.0)
@@ -188,7 +188,7 @@ _SAMPLE_RE = re.compile(r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(\{[^}]*\})?(\s.*)$")
 
 
 def relabel_group(text: str, group: str, seen_meta: set) -> str:
-    """Every sample of a group server's exposition gets ``pdflip_group="<group>"``;
+    """Every sample of a group server's exposition gets ``weg2_group="<group>"``;
     a ``# HELP``/``# TYPE`` line of a family already emitted (by the front or
     the other group) is dropped, so the joint text names each family once."""
     out: List[str] = []
@@ -254,32 +254,32 @@ class FrontMetrics:
             return
         p = self.prom
         r = self.registry = p.CollectorRegistry(auto_describe=True)
-        self.ttft = p.Histogram("pdflip_ttft_seconds", "Arrival at the front to D's first content",
+        self.ttft = p.Histogram("weg2_ttft_seconds", "Arrival at the front to D's first content",
                                 ["via"], buckets=_LAT_BUCKETS, registry=r)
-        self.leg2_first = p.Histogram("pdflip_leg2_first_content_seconds",
+        self.leg2_first = p.Histogram("weg2_leg2_first_content_seconds",
                                       "Leg-2 dispatch to D's first content", ["via"],
                                       buckets=_LAT_BUCKETS, registry=r)
-        self.request = p.Histogram("pdflip_request_seconds", "Wall time of a served leg",
+        self.request = p.Histogram("weg2_request_seconds", "Wall time of a served leg",
                                    ["group"], buckets=_LAT_BUCKETS, registry=r)
-        self.served = p.Counter("pdflip_served", "Served legs", ["group"], registry=r)
-        self.tokens = p.Counter("pdflip_tokens", "Tokens of served legs", ["group", "kind"], registry=r)
-        self.flip = p.Histogram("pdflip_flip_seconds", "Flip times (layer = the flip_log flip_ms, "
+        self.served = p.Counter("weg2_served", "Served legs", ["group"], registry=r)
+        self.tokens = p.Counter("weg2_tokens", "Tokens of served legs", ["group", "kind"], registry=r)
+        self.flip = p.Histogram("weg2_flip_seconds", "Flip times (layer = the flip_log flip_ms, "
                                 "first_work = begin to the woken group's first work, user = "
                                 "decode end to P prefill start)", ["dir", "kind"],
                                 buckets=_FLIP_BUCKETS, registry=r)
-        self.flips = p.Counter("pdflip_flips", "Flips done", ["dir"], registry=r)
-        self.park_rpc = p.Histogram("pdflip_park_rpc_seconds", "D park RPC wall time",
+        self.flips = p.Counter("weg2_flips", "Flips done", ["dir"], registry=r)
+        self.park_rpc = p.Histogram("weg2_park_rpc_seconds", "D park RPC wall time",
                                     buckets=_RPC_BUCKETS, registry=r)
-        self.queue_len = p.Gauge("pdflip_queue_len", "Front queue length", registry=r)
-        self.outstanding = p.Gauge("pdflip_outstanding", "Open requests of the front", registry=r)
-        self.d_seats = p.Gauge("pdflip_d_seats", "D seats in force", registry=r)
-        self.d_parked = p.Gauge("pdflip_d_parked", "D parked requests", registry=r)
-        self.awake = p.Gauge("pdflip_awake", "1 for the awake group", ["group"], registry=r)
-        self.scrape_ok = p.Gauge("pdflip_group_scrape_ok", "1 when the group's /metrics answered",
+        self.queue_len = p.Gauge("weg2_queue_len", "Front queue length", registry=r)
+        self.outstanding = p.Gauge("weg2_outstanding", "Open requests of the front", registry=r)
+        self.d_seats = p.Gauge("weg2_d_seats", "D seats in force", registry=r)
+        self.d_parked = p.Gauge("weg2_d_parked", "D parked requests", registry=r)
+        self.awake = p.Gauge("weg2_awake", "1 for the awake group", ["group"], registry=r)
+        self.scrape_ok = p.Gauge("weg2_group_scrape_ok", "1 when the group's /metrics answered",
                                  [GROUP_LABEL], registry=r)
-        self.err_c = p.Counter("pdflip_metrics_errors", "Metric/push failures (never raised)",
+        self.err_c = p.Counter("weg2_metrics_errors", "Metric/push failures (never raised)",
                                ["where"], registry=r)
-        self.push_c = p.Gauge("pdflip_metrics_push", "Push state (points, dropped, errors, writes)",
+        self.push_c = p.Gauge("weg2_metrics_push", "Push state (points, dropped, errors, writes)",
                               ["what"], registry=r)
 
     # -- error discipline -------------------------------------------------
@@ -338,7 +338,7 @@ class FrontMetrics:
                     if v:
                         self.tokens.labels(group=group, kind=kind).inc(max(0, int(v)))
             if group == "D":
-                # the pdflip_req POINT is the front's request_done (DASHBOARD-IPC, NF
+                # the weg2_req POINT is the front's request_done (DASHBOARD-IPC, NF
                 # front_requests.influx_req_fields) -- one point per finished request,
                 # written through this module's pusher; nothing pushed per leg here
                 self._req.pop(str(rid), None)
@@ -358,7 +358,7 @@ class FrontMetrics:
                     self.flips.labels(dir=d).inc()
                     if fm is not None:
                         self.flip.labels(dir=d, kind="layer").observe(float(fm) / 1000.0)
-                self._push("pdflip_flip", {"dir": d}, {"epoch": data.get("epoch"), "flip_ms": fm,
+                self._push("weg2_flip", {"dir": d}, {"epoch": data.get("epoch"), "flip_ms": fm,
                                                      "drain_quiesce_ms": data.get("drain_quiesce_ms")})
             elif typ == "flip_first_work":
                 v = data.get("flip_time_ms")
@@ -366,14 +366,14 @@ class FrontMetrics:
                     d = str(data.get("dir") or "?")
                     if self.registry is not None:
                         self.flip.labels(dir=d, kind="first_work").observe(float(v) / 1000.0)
-                    self._push("pdflip_flip", {"dir": d}, {"epoch": data.get("epoch"), "first_work_ms": v})
+                    self._push("weg2_flip", {"dir": d}, {"epoch": data.get("epoch"), "first_work_ms": v})
             elif typ == "flip_user_time":
                 v = data.get("flip_user_ms")
                 d = str(data.get("dir") or "D>P")
                 parts = data.get("parts") or {}
                 if v is not None and self.registry is not None:
                     self.flip.labels(dir=d, kind="user").observe(float(v) / 1000.0)
-                self._push("pdflip_flip", {"dir": d}, {"epoch": data.get("epoch"), "user_ms": v,
+                self._push("weg2_flip", {"dir": d}, {"epoch": data.get("epoch"), "user_ms": v,
                                                      "park_rpc_ms": parts.get("park_rpc_ms")})
         except Exception as e:  # noqa: BLE001
             self._err("on_event", e)
@@ -423,7 +423,7 @@ class FrontMetrics:
 
     def aggregate(self, group_texts: List[Tuple[str, Optional[str]]]) -> str:
         """The front's own text plus every group's, relabelled; a group whose
-        text is None (scrape failed) contributes only ``pdflip_group_scrape_ok 0``."""
+        text is None (scrape failed) contributes only ``weg2_group_scrape_ok 0``."""
         for g, t in group_texts:
             self.set_scrape_ok(g, t is not None)
         own = self.render()

@@ -216,11 +216,95 @@ def _replacement(word: str, text: str, start: int, end: int) -> str:
     return "Flliper" if glued else "fLLiper"
 
 
-def deny_intervals(text: str) -> List[Tuple[int, int, str]]:
+# ---- METRIC-NAME MUST-KEEP (F0-M, 08.10.2026, user decision "pdflip as the name, the metrics are must-keep") ---------------------
+# The SERIES and LABEL names that leave the process (Prometheus exposition of the servers and of the front, the Influx points
+# pushed to VictoriaMetrics, the sampler's /api/v1/import/prometheus lines, the Grafana panels) keep the spelling they had:
+# weg2_* (P/D-flip subsystem) and sglang:* / sglang_* (engine).  Reason: the time series in VictoriaMetrics (192.168.0.88:8428) and
+# the panels of Grafana (rig-verlauf) must not break.  The table is DATA (data/metric_names_1008.json, made by
+# `metric_inventory.py keepfile` from the scan of the old trees); this block only turns it into deny spans:
+#   sglang_colon / sglang_colon_patterns  `sglang:<name>` in ANY file (the colon form is unambiguous; docker tags and org ids are
+#                                         caught first by DENY_SPAN, and only DEFINED metric names are in the table)
+#   weg2_global / weg2_global_prefixes    exact `weg2_<name>` tokens and `weg2_front_`-style prefixes that occur only as metric names in the old trees
+#   files                                 per OLD path: a prefix entry (ends in `_` or `:`: `weg2_`, `sglang_`) keeps every token starting with it in that
+#                                         file (the writer / panel files), an exact entry keeps that token (`weg2_group` is also a
+#                                         server_args attribute elsewhere, `weg2_d_parked` a request key)
+# Entries are spelled OLD; the file keys are registered under the old AND the renamed path, so the second pass over the renamed tree
+# is a no-op.  METRIC_KEEP_FILE="" switches the rule off (the pre-F0-M behaviour, used by the byte-identity proofs of earlier runs).
+# a metric name may follow an ESCAPED newline / tab inside a source string ("...10\\nsglang:generation_tokens_total 20"): the `n` is no identifier char
+_MK_B = r"(?:(?<![A-Za-z0-9_])|(?<=\\[nrt]))"
+_MK_E = r"(?![A-Za-z0-9_])"
+_MK_HIST = r"(?:_bucket|_sum|_count|_created|_total)?"
+_MK_DEFAULT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "metric_names_1008.json")
+METRIC_KEEP_FILE = os.environ.get("METRIC_KEEP_FILE", _MK_DEFAULT)
+
+
+def _mk_exact(names: Iterable[str]) -> Optional["re.Pattern"]:
+    names = sorted(set(names), key=lambda n: (-len(n), n))
+    return re.compile(_MK_B + "(?:" + "|".join(re.escape(n) for n in names) + ")" + _MK_HIST + _MK_E) if names else None
+
+
+def _load_metric_keep(path: str):
+    """-> (global spans [(name, regex)], per-path spans {path: [regex]}); both empty without a table."""
+    if not path or not os.path.isfile(path):
+        return [], {}
+    import json as _jmk
+    with open(path) as f:
+        d = _jmk.load(f)
+    glob = []
+    colon = sorted(set(d.get("sglang_colon", [])), key=lambda n: (-len(n), n))
+    pats = [re.escape(n) for n in d.get("sglang_colon_patterns", [])]   # prose wildcards (`sglang:spill_tier_*_bytes`) are literal text
+    alts = [re.escape(n) for n in colon] + pats
+    if alts:
+        glob.append(("metric-name", re.compile(_MK_B + "sglang:(?:" + "|".join(alts) + ")" + _MK_HIST + _MK_E)))
+    # REGEX HEADS (F0-M fix round 2): a READER that parses the exposition spells the family as the head of a regex -- `^(sglang:[a-z_0-9]+)` in
+    # rigmon/sources.py and rig_dashboard/server.py.  That is no name of the table, but it is the same metric contract: renamed it reads
+    # `flliper:` while the engine exports `sglang:` and every live value goes empty, without an error.  A head is kept where it is directly
+    # followed by a character class `[`, a group `(` or an escape `\` (`sglang::scheduler`, `sglang.srt` and docker tags are not heads;
+    # a docker-tag REGEX such as `^flliper:(cu\d+)` -- group `(cu` / `(\d` -- is no head either, which is also how restore tells them apart).
+    heads = [re.escape(h) for h in d.get("regex_heads", [])]
+    if heads:
+        glob.append(("metric-regex-head", re.compile(_MK_B + "(?:" + "|".join(heads) + r")(?=[\[(\\])(?!\((?:cu|\\d))")))
+    rx = _mk_exact(d.get("weg2_global", []))
+    if rx is not None:
+        glob.append(("metric-name", rx))
+    gp = d.get("weg2_global_prefixes", [])
+    if gp:
+        glob.append(("metric-name", re.compile(_MK_B + "(?:" + "|".join(re.escape(e) for e in gp) + ")")))
+    files: Dict[str, list] = {}
+    for fp, entries in d.get("files", {}).items():
+        spans = []
+        prefixes = [e for e in entries if e.endswith(("_", ":"))]
+        if prefixes:
+            spans.append(re.compile(_MK_B + "(?:" + "|".join(re.escape(e) for e in prefixes) + ")"))
+        ex = _mk_exact([e for e in entries if not e.endswith(("_", ":"))])
+        if ex is not None:
+            spans.append(ex)
+        for key in {fp, rewrite_path(fp, True)}:
+            files.setdefault(key, []).extend(spans)
+    return glob, files
+
+
+_MK: Optional[tuple] = None   # loaded on first use (rewrite_path is defined further down)
+
+
+def metric_keep_spans(text: str, path: Optional[str]) -> List[Tuple[int, int, str]]:
+    global _MK
+    if _MK is None:
+        _MK = ([], {})   # the loader renames the table's own file keys (rewrite_path): no table yet while it does
+        _MK = _load_metric_keep(METRIC_KEEP_FILE)
+    glob, files = _MK
+    iv = [(m.start(), m.end(), n) for n, rx in glob for m in rx.finditer(text)]
+    for rx in files.get(path or "", ()):
+        iv.extend((m.start(), m.end(), "metric-name") for m in rx.finditer(text))
+    return iv
+
+
+def deny_intervals(text: str, path: Optional[str] = None) -> List[Tuple[int, int, str]]:
     iv: List[Tuple[int, int, str]] = []
     for name, rx in DENY_SPAN:
         for m in rx.finditer(text):
             iv.append((m.start(), m.end(), name))
+    iv.extend(metric_keep_spans(text, path))
     pos = 0
     for line in text.splitlines(keepends=True):
         if DENY_LINE.search(line):
@@ -312,8 +396,8 @@ def _w_replacement(word: str, text: str, start: int, end: int) -> str:
     return "PdFlip"  # always CapWords: a free-standing `Weg2` may be a Python name, never merge it with `pdflip`
 
 
-def _intervals(text: str, spans) -> List[Tuple[int, int, str]]:
-    iv = sorted((m.start(), m.end(), n) for n, rx in spans for m in rx.finditer(text))
+def _intervals(text: str, spans, extra=()) -> List[Tuple[int, int, str]]:
+    iv = sorted([(m.start(), m.end(), n) for n, rx in spans for m in rx.finditer(text)] + list(extra))
     merged: List[Tuple[int, int, str]] = []
     for a, b, n in iv:
         if merged and a <= merged[-1][1]:
@@ -323,8 +407,8 @@ def _intervals(text: str, spans) -> List[Tuple[int, int, str]]:
     return merged
 
 
-def rewrite_weg2(text: str) -> Tuple[str, collections.Counter, collections.Counter]:
-    iv = _intervals(text, W_DENY_SPAN)
+def rewrite_weg2(text: str, path: Optional[str] = None) -> Tuple[str, collections.Counter, collections.Counter]:
+    iv = _intervals(text, W_DENY_SPAN, metric_keep_spans(text, path))
     starts = [a for a, _, _ in iv]
     out, last = [], 0
     rep: collections.Counter = collections.Counter()
@@ -370,25 +454,25 @@ def rewrite_idents(text: str, imap: Dict[str, str]) -> Tuple[str, collections.Co
     return text, rep
 
 
-def rewrite_all(text: str, is_py: bool, weg2: bool, imap: Dict[str, str]):
+def rewrite_all(text: str, is_py: bool, weg2: bool, imap: Dict[str, str], path: Optional[str] = None):
     rep: collections.Counter = collections.Counter()
     skip: collections.Counter = collections.Counter()
     if is_py and imap:
         text, r = rewrite_idents(text, imap)
         rep.update(r)
-    text, r, k = rewrite_text(text)
+    text, r, k = rewrite_text(text, path)
     rep.update(r)
     skip.update(k)
     if weg2:
-        text, r, k = rewrite_weg2(text)
+        text, r, k = rewrite_weg2(text, path)
         rep.update(r)
         skip.update(k)
     return text, rep, skip
 
 
-def rewrite_text(text: str) -> Tuple[str, collections.Counter, collections.Counter]:
+def rewrite_text(text: str, path: Optional[str] = None) -> Tuple[str, collections.Counter, collections.Counter]:
     """Return (new_text, replaced_counter[(old,new)], skipped_counter[reason])."""
-    iv = deny_intervals(text)
+    iv = deny_intervals(text, path)
     starts = [a for a, _, _ in iv]
     out: List[str] = []
     last = 0
@@ -763,9 +847,9 @@ def cmd_apply(a: argparse.Namespace) -> int:
         text = as_text(data) if mode != "120000" else None
         ext = os.path.splitext(path)[1]
         if text is not None and in_scope(path) and (cxx or ext not in CXX_EXT):
-            new_text, rep, skip = rewrite_all(text, path.endswith(".py"), a.weg2, imap)
+            new_text, rep, skip = rewrite_all(text, path.endswith(".py"), a.weg2, imap, path)
             # name-rule collisions: token-aligned over the whole text, without the ident map
-            clash = file_collisions(text, rewrite_all(text, path.endswith(".py"), a.weg2, {})[0]) \
+            clash = file_collisions(text, rewrite_all(text, path.endswith(".py"), a.weg2, {}, path)[0]) \
                 if imap else file_collisions(text, new_text)
             ok = COLLISION_OK.get(path, frozenset())
             for k in sorted(set(clash) & ok):
@@ -1118,6 +1202,36 @@ def cmd_selftest(_: argparse.Namespace) -> int:
         got = _vw_word(w)
         bad += got != want
         print(("ok  " if got == want else "FAIL"), "(verifier weg2 word)", w, "->", got)
+    # F0-M (08.10.2026): metric names are must-keep (table data/metric_names_1008.json); the same words as identifiers are renamed
+    mk = [("name=\"sglang:num_running_reqs\"", "name=\"sglang:num_running_reqs\""),
+          ("sglang:e2e_request_latency_seconds_bucket{le=\"1\"}", "sglang:e2e_request_latency_seconds_bucket{le=\"1\"}"),
+          ("sglang:spill_tier_used_bytes sglang:spill_tier_*_bytes", "sglang:spill_tier_used_bytes sglang:spill_tier_*_bytes"),
+          ("docker run sglang:dev local/sglang:latest", "docker run flliper:dev local/flliper:latest"),
+          ("'sglang:prompt_tokens_total 10\\nsglang:generation_tokens_total 20\\n'", "'sglang:prompt_tokens_total 10\\nsglang:generation_tokens_total 20\\n'"),
+          ("xsglang:num_running_reqs", "xflliper:num_running_reqs"),
+          # fix round 2: a regex head of a reader stays (class, group), the process title / docker-tag shapes do not
+          ("re.compile(r\"^(sglang:[a-z_0-9]+)(?:\\{)\")", "re.compile(r\"^(sglang:[a-z_0-9]+)(?:\\{)\")"),
+          ("grep -E \"^sglang:(cache_hit_rate|x)\\{\"", "grep -E \"^sglang:(cache_hit_rate|x)\\{\""),
+          ("setproctitle('sglang::scheduler_TP0') ^sglang:(cu\\d+)-x", "setproctitle('flliper::scheduler_TP0') ^flliper:(cu\\d+)-x")]
+    for src, want in mk:
+        got, _, _ = rewrite_text(src)
+        bad += got != want
+        print(("ok  " if got == want else "FAIL"), "(metric keep)", repr(src), "->", repr(got))
+    mkw = [("weg2_ttft_seconds weg2_prefill_s", None, "weg2_ttft_seconds pdflip_prefill_s"),
+           ("weg2_front_up weg2_rank_prefill_new_tokens_total weg2_boot_decode_settled_ts", None,
+            "weg2_front_up weg2_rank_prefill_new_tokens_total weg2_boot_decode_settled_ts"),
+           ("weg2_served_total weg2_flips_total", None, "weg2_served_total weg2_flips_total"),
+           ("getattr(sa, 'weg2_group') weg2_d_parked", None, "getattr(sa, 'pdflip_group') pdflip_d_parked"),
+           ("weg2_group=\"P\" _weg2_rank()", "python/sglang/srt/weg2/front.py", "weg2_group=\"P\" _pdflip_rank()"),
+           ("weg2_group=\"P\" _weg2_rank()", "python/flliper/srt/pdflip/front.py", "weg2_group=\"P\" _pdflip_rank()"),
+           ("weg2_d_parked weg2_group_name", "python/sglang/srt/weg2/front_metrics.py", "weg2_d_parked weg2_group_name"),
+           ("job_name: weg2-front", "tools/rig_dashboard/rigdash/deploy/vm/scrape.yml", "job_name: weg2-front"),
+           ("job_name: weg2-front", "tools/rig_dashboard/rigdash/deploy/vm/other.yml", "job_name: pdflip-front"),
+           ("sglang_{prefix}_{key} sglang_x", "python/sglang/srt/entrypoints/v1_loads.py", "sglang_{prefix}_{key} sglang_x")]
+    for src, pth, want in mkw:
+        got, _, _ = rewrite_all(src, False, True, {}, pth)
+        bad += got != want
+        print(("ok  " if got == want else "FAIL"), "(metric keep, weg2)", repr(src), pth, "->", repr(got))
     fx = "test/registered/unit/weg2/fixtures/wake_credit_h14/x.lines"
     got = (in_path_scope(fx), in_scope(fx))
     bad += got != (True, False)

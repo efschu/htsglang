@@ -1,5 +1,5 @@
 """NF 06.10.2026 (Boot dkrnfint4h6ablbar1dauer10061420, boot-20261006T142041Z-3e55): von 47 D>P-Flips hatte VM nur 20
-Punkte pdflip_flip_user_view_ms{def="t2t",dir="D>P",part="total"}.  Nachgerechnet mit dem echten State (events.jsonl +
+Punkte weg2_flip_user_view_ms{def="t2t",dir="D>P",part="total"}.  Nachgerechnet mit dem echten State (events.jsonl +
 D-Log): 20 ok, 17 "fehlt" (Start), 9 "leerlauf", 1 "fehlt" (Ende) -- zwei Ursachen, beide in ipcboot.flip_views:
 
   A  D>P-Flip, in dessen D-Phase D KEINE Decode-Runde schrieb (D wurde geweckt, rechnete nur einen Prefill-Forward und

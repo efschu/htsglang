@@ -296,7 +296,7 @@ Small model (Qwen3.5-4B), one card, TP=1.
   from `/get_server_info` (argument validation is CPU-tested — what is new is
   that the values reach the scheduler); two identical greedy generations are
   identical (the ladders are supposed to be inert); ≥20 occupancy samples from
-  `flliper:token_usage` with a maximum > 0 (a flat zero line would mean the load
+  `sglang:token_usage` with a maximum > 0 (a flat zero line would mean the load
   never reached the pool); the sensor returns a reading with a verdict, a
   finite occupancy and a trend — and twice the same one from the same series.
 * **Explicitly NOT tested** the wiring of the sensor to scheduler occupancy,

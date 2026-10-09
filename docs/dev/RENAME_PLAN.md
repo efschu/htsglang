@@ -38,6 +38,7 @@ Status: phase 1 (inventory, tooling, probe), extended by §8 (weg2 → pdflip, G
 * Whole trees: `3rdparty/`, `sgl-kernel/`, `sgl-model-gateway/`, `experimental/`, `rust/`, `proto/`, `.github/` (upstream CI), `docs/`, `docs_new/` (prose, separate pass), `.claude/`.
 * Host paths that exist on the rig: `/spinning/htsglang`, `/spinning/htsglang-gpu/.venv` (211 in-scope hits).
 * Published artifacts: the old image tags (`htsglang:cu130-nccl2307`), old GitHub repo links.
+* **Metric names (F0-M, user decision 08.10.2026 "pdflip as the name, the metrics are must-keep")**: the series, labels and Influx measurements that leave the process keep their spelling, so the history in VictoriaMetrics (192.168.0.88:8428) and the Grafana panels (rig-verlauf, examples/monitoring) do not break: the engine's `sglang:*` (and `sglang_*` on `/v1/loads?format=prometheus`), the P/D-flip subsystem's `weg2_*` (front, rank gauges, sampler, Influx points `weg2_req` / `weg2_flip`, label `weg2_group`) and the VictoriaMetrics scrape job name `weg2-front` (the `job` label value of every scraped front series). Module, flag, env, marker and path names stay renamed. Table: `tools/release/data/metric_names_1008.json` (read by the engine), `tools/release/metric_inventory.py` (scan / compare / keepfile / restore), words in `tools/release/data/must_keep.txt` (section "METRIC NAMES"), §8.17.
 
 ## 3. Inventory (base `489368a7ef`, 11,362 files)
 
@@ -761,3 +762,64 @@ Two classes were found by review after the kit run; neither is a naming slip of 
    must keep its old spelling.  `planer_golden_regen.py` takes the stable lines (equal in the old golden and the old dump at the reference
    state S0 = empty `$HOME`) from the renamed dump and rewrites the live-box lines with the kit's fragment table (string constants of the old
    modules paired with the renamed ones by AST position); the method is graded on the stable lines (see the tool's docstring).
+
+## 8.17 F0-M, metric names are must-keep (08.10.2026, both lines)
+
+User decision 08.10.2026 ~19:30Z: "pdflip as the name, the metrics are must-keep".  The first kit run (F0-D/E) had renamed the exported series
+(`weg2_*` -> `pdflip_*`, `sglang:*` -> `flliper:*`, `sglang_*` on /v1/loads -> `flliper_*`, Grafana panels with them), which would have cut every
+time series in VictoriaMetrics and every panel query.  Closed in three parts, each with its proof:
+
+1. **Inventory** (`metric_inventory.py scan`, AST + text): every metric-name literal that is *defined* by a constructor (`Counter`/`Gauge`/`Histogram`/
+   `GaugeHistogram`/`Ray*Wrapper`, `influx_line("...")`), every literal of the writers that build names by concatenation (`vmpush.py`,
+   `v1_loads.py`), and every use of a defined name in a reader, a probe or a panel.  Old tree vs renamed tree: the kit had renamed all of them
+   (27B 264 hits, NF 237 hits; the table of the F0-M report).
+2. **Rule in the kit** (`rename_to_flliper.py`, block `METRIC-NAME MUST-KEEP`; data `metric_names_1008.json`): the colon form `sglang:<defined name>`
+   is kept in any file (docker tags such as `sglang:dev` are not in the table and are still renamed); `weg2_<name>` is kept as an exact token where the
+   name occurs only as a metric in the old trees, and as a family prefix (`weg2_front_`, `weg2_rank_`, `weg2_boot_decode_`, `weg2_gpu_pcie_`);
+   words that are metric AND something else elsewhere (`weg2_group` = label and `server_args` attribute, `weg2_d_parked` = gauge and request key) are
+   kept per file (front_metrics.py, the writer and panel files).  The table is keyed by the old path and the renamed path, so the second pass is a no-op.
+   Proof: the engine run on the 27B base `86ff356d0d` leaves 264/264 inventory hits in their old spelling; the kept tokens of that run equal the tokens
+   `metric_inventory.py restore` produced in the renamed tree, file by file (all but the five files of the dashboard package).  The translation
+   gate keeps the same words (`must_keep.txt`, section "METRIC NAMES").
+3. **Restore on the renamed branches** (`metric_inventory.py restore --apply`, same table, same scope): the metric names are back in the emitters,
+   the in-tree readers (planner/live_metrics, rigmon/sources, probes, gpu_battery), the tests that pin them and the panels.  Test
+   `test_metric_names_must_keep_1008.py`: static scan vs the old inventory (fixture), the exporters on synthetic input (front exposition, rank gauges,
+   sampler lines, /v1/loads), the engine on the old spellings, the must-keep list; no `pdflip_*` / `flliper:*` name for the same metric appears next to the old one.
+
+Fix round 2 (review findings 1 and 2): a **regex head** is a metric name too.  The parser of the exposition in `rigmon/sources.py`
+(`^(sglang:[a-z_0-9]+)`) and the one of the dashboard's engine tile (`tools/rig_dashboard/server.py`, `^(sglang:[a-z_]+)` + its key map) spell the family
+as the head of a regex, which no name table lists: restored keys with a renamed regex read nothing and raise nothing.  Rule: table key `regex_heads`
+(`sglang:` directly followed by `[`, `(` or a backslash is kept; `^flliper:(cu\d+)` docker-image regexes and `sglang::` process titles are not heads),
+per-file entries `sglang:` for the two readers, `sglang:[` / `sglang:(` in the translation gate.  `server.py` is therefore NOT left to F0-F (F0-F
+does not touch it: `git diff 8aaa67e72c 33006acfb2 -- tools/rig_dashboard/server.py` is empty); `validate_544.sh` (a grep of the exposition) came back too.
+Tests: the two parsers run on a REAL exposition (`SchedulerMetricsCollector` -> `generate_latest`), a static scan for kit-spelled regex heads, the engine
+on the old text of the three files, mutants of both regexes fail the tests.
+
+Still left to the dashboard package (F0-F): the generated `catalog.json` / UI texts / READMEs that mention the names.  The readers
+(`rigdash`) are settled in 8.18.
+
+## 8.18 F0-M and F0-F together: the dashboard reads both prefixes, how the two branches are merged (08.10.2026, fix round 3)
+
+F0-F (dashboard) built its readers for the case "the sampler writes `pdflip_*`": `vmpush.dual_promql` rewrote only `pdflip_x` into
+`{__name__=~"(<old>|pdflip)_x"}`.  F0-M (this branch) keeps the old names, so the readers, `make_dashboard.py` and the panels say `<old>_x`, which that
+rewrite does not touch: after a plain merge `test_shipped_dashboard_reads_both_generations` of F0-F fails (0 of the >= 10 dual panels) and, the other way
+round, the F0-M tests fail on the F0-F reader text.  Decision (the user's: the names are must-keep, the history stays readable): the readers keep
+the dual form, but it is keyed on BOTH stems, so the old-spelling PromQL of F0-M and any `pdflip_x` of F0-F produce the same selector.  The
+interim prefix is only ever READ (nothing in the tree writes it; the exporter tests of F0-M forbid it).
+
+Merge recipe for F0-I (both lines, same patch file `tools/release/data/f0m_f0f_merge_fix_1008.patch`; 27B = `88e8aa4e9c..` + `33006acfb2`, NF =
+`1dd123efa4..` + `021e9ebcbf`; the recipe was dry-run on both with the results in the commit message):
+
+    git merge --no-ff <F0-F branch>                       # one conflict: rigdash/deploy/grafana/dashboards/rig-verlauf.json
+    git checkout --ours tools/rig_dashboard/rigdash/deploy/grafana/dashboards/rig-verlauf.json
+    git apply --index tools/release/data/f0m_f0f_merge_fix_1008.patch
+    git commit
+
+What the patch does: (1) `vmpush.py`: `_METRIC_RX` matches either stem, the comments / docstring no longer say the sampler writes `pdflip_*`;
+(2) `rig-verlauf.json`: every target expression run through `dual_promql` (14 panel queries become `{__name__=~"(<old>|pdflip)_x",...}`);
+(3) `make_dashboard.py`: comment only; (4) `test_f0f_dashboard_1008.py`: the test inputs are built from the stem token (the kit's `restore` would otherwise
+rewrite them) + a test for the old-stem input.  **The JSON is NOT regenerated with `make_dashboard.py`**: in both trees the shipped JSON and the
+generator have drifted apart (the JSON carries `def="t2t"` selectors and the "Flipzeit" legends, the generator has two PCIe panels the JSON lacks), so
+a regeneration would change panels this work package must not touch.  The transform is exact: the shipped JSON after the patch is a fixpoint of
+`dual_promql`, and the same expressions go through `make_dashboard.py` the next time somebody regenerates.  A kit re-run on a tree that already
+carries `(<old>|pdflip)_x` is not part of the flow (the kit runs on the old tree); the reader token comes from `names.STEM_TOKENS`, split there.

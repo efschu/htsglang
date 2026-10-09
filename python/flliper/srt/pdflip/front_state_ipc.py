@@ -261,7 +261,7 @@ class BoundedWriter:
 
 class OutstandingBook:
     """(Ported 1:1 from the NF front, desk/nf-y6d-anchor-pin-1001; the 27B front
-    uses its arrival stamp for pdflip_ttft_seconds, TSDB 01.10.)
+    uses its arrival stamp for weg2_ttft_seconds, TSDB 01.10.)
 
     Every open request of the front: its arrival and its last token
     (state.json ``front.oldest_outstanding_*`` / ``front.outstanding_stalest``).

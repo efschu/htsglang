@@ -42,10 +42,10 @@ class OptimisticPrefillRetryCounterMixin:
         response.raise_for_status()
         total = 0.0
         for family in text_string_to_metric_families(response.text):
-            if family.name != "flliper:num_prefill_retries":
+            if family.name != "sglang:num_prefill_retries":
                 continue
             for sample in family.samples:
-                if sample.name == "flliper:num_prefill_retries_total":
+                if sample.name == "sglang:num_prefill_retries_total":
                     total += sample.value
         return total
 

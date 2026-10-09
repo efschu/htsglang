@@ -4,7 +4,7 @@
 # ==============================================================================
 """The always-on planner on the pdflip/Docker rig (rig-planner.service, 2026-09-27).
 
-* rates fall back to ``flliper:realtime_tokens_total`` when a server (the pdflip
+* rates fall back to ``sglang:realtime_tokens_total`` when a server (the pdflip
   front) exports no prompt/generation counters -- before, every Monitor rate
   read 0.0 against a server decoding at ~200 tok/s,
 * the Anthropic split routers (30097/30099) are never chosen as the monitor
@@ -23,12 +23,12 @@ from unittest import mock
 from flliper.srt.planner import live_metrics
 
 PDFLIP_METRICS = """\
-# HELP flliper:realtime_tokens_total x
-# TYPE flliper:realtime_tokens_total counter
-flliper:realtime_tokens_total{engine_type="unified",mode="prefill_compute",pp_rank="0",tp_rank="0"} %d
-flliper:realtime_tokens_total{engine_type="unified",mode="prefill_cache",pp_rank="0",tp_rank="0"} %d
-flliper:realtime_tokens_total{engine_type="unified",mode="decode",pp_rank="0",tp_rank="0"} %d
-flliper:gen_throughput{engine_type="unified"} 143.9
+# HELP sglang:realtime_tokens_total x
+# TYPE sglang:realtime_tokens_total counter
+sglang:realtime_tokens_total{engine_type="unified",mode="prefill_compute",pp_rank="0",tp_rank="0"} %d
+sglang:realtime_tokens_total{engine_type="unified",mode="prefill_cache",pp_rank="0",tp_rank="0"} %d
+sglang:realtime_tokens_total{engine_type="unified",mode="decode",pp_rank="0",tp_rank="0"} %d
+sglang:gen_throughput{engine_type="unified"} 143.9
 """
 
 
@@ -49,7 +49,7 @@ class RealtimeFallbackTests(unittest.TestCase):
         self.assertAlmostEqual(r["prefill_tok_s"], 150.0)
 
     def test_classic_counters_still_win(self):
-        txt = ("flliper:prompt_tokens_total 10\nflliper:generation_tokens_total 20\n"
+        txt = ("sglang:prompt_tokens_total 10\nsglang:generation_tokens_total 20\n"
                + PDFLIP_METRICS % (1, 2, 3))
         c = live_metrics._parse_counters(txt)
         self.assertEqual(c["token_source"], "prompt/generation_tokens_total")

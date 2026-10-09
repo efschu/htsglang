@@ -52,10 +52,10 @@ def _format_loads_prometheus(load_results, include=None) -> Response:
                 for sub_key, sub_value in value.items():
                     if isinstance(sub_value, (int, float)):
                         metric_samples.setdefault(
-                            f"flliper_{prefix}_{sub_key}", []
+                            f"sglang_{prefix}_{sub_key}", []
                         ).append((dp_rank, sub_value))
             elif isinstance(value, (int, float)):
-                metric_samples.setdefault(f"flliper_{key}", []).append((dp_rank, value))
+                metric_samples.setdefault(f"sglang_{key}", []).append((dp_rank, value))
 
     lines = []
     for metric_name, samples in metric_samples.items():

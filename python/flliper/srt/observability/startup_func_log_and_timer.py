@@ -38,7 +38,7 @@ def enable_startup_timer():
     enable_startup_metrics = True
 
     STARTUP_LATENCY_SECONDS = Gauge(
-        "flliper:startup_latency_breakdown_seconds_max",
+        "sglang:startup_latency_breakdown_seconds_max",
         "Startup latency breakdown in seconds by context, only records the maximum duration if the context is called multiple times.",
         labelnames=["context"],
         multiprocess_mode="mostrecent",

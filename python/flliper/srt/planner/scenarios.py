@@ -297,7 +297,7 @@ ACCEPT_LENGTH = Metric(
     "accepted tokens per verify round",
     "tokens",
     "higher_better",
-    source="engine: flliper:spec_accept_length, or meta_info.spec_accept_length "
+    source="engine: sglang:spec_accept_length, or meta_info.spec_accept_length "
     "per request",
 )
 VERIFY_CT = Metric(
@@ -444,7 +444,7 @@ _register(
             axis_flags={'repeat': '(repeat the whole invocation)'},
             metric_fields={
                 'ms_per_verify_round': '(collector: round_time over the same wall clock)',
-                'accept_length': '(engine: flliper:spec_accept_length; meta_info.spec_accept_length per request)',
+                'accept_length': '(engine: sglang:spec_accept_length; meta_info.spec_accept_length per request)',
                 'verify_ct': '(engine: meta_info.spec_verify_ct, summed over the window)',
                 'ms_per_1k_prefill_tokens': '(collector: round_time.ms_per_1k_prefill_tokens)',
                 'ttft_p50': 'median_ttft_ms',
@@ -535,7 +535,7 @@ _register(
             axis_flags={},
             metric_fields={
                 'ms_per_verify_round': '(collector: round_time over the same wall clock)',
-                'accept_length': '(engine: flliper:spec_accept_length; meta_info.spec_accept_length per request)',
+                'accept_length': '(engine: sglang:spec_accept_length; meta_info.spec_accept_length per request)',
                 'j_per_token': '(collector: energy counter delta / generated tokens)',
                 'tok_s': 'output_throughput',
             },
@@ -757,7 +757,7 @@ _register(
                 'ttft_p95': 'p95_ttft_ms',
                 'ttft_p50': 'median_ttft_ms',
                 'ms_per_1k_prefill_tokens': '(collector: round_time.ms_per_1k_prefill_tokens)',
-                'queue_wait_ms': '(engine: flliper:num_queue_reqs and the scheduler wait histogram)',
+                'queue_wait_ms': '(engine: sglang:num_queue_reqs and the scheduler wait histogram)',
                 'prefill_tok_s': 'input_throughput',
             },
             external_axes=['topology'],
@@ -854,7 +854,7 @@ _register(
             metric_fields={
                 'victim_ms_per_verify_round': '(collector: round_time of the spilled session, per window)',
                 'bystander_ms_per_verify_round': '(collector: round_time of the others, per window)',
-                'accept_length': '(engine: flliper:spec_accept_length; meta_info.spec_accept_length per request)',
+                'accept_length': '(engine: sglang:spec_accept_length; meta_info.spec_accept_length per request)',
                 'e2e_p95': 'p95_e2e_latency_ms',
                 'restore_ms': '(collector: restore window duration)',
             },
@@ -1040,7 +1040,7 @@ _register(
             metric_fields={
                 "ms_per_1k_prefill_tokens": "(collector: round_time.ms_per_1k_prefill_tokens)",
                 "ms_per_verify_round": "(collector: round_time over the same wall clock)",
-                "accept_length": "(engine: flliper:spec_accept_length; meta_info.spec_accept_length per request)",
+                "accept_length": "(engine: sglang:spec_accept_length; meta_info.spec_accept_length per request)",
                 "verify_ct": "(engine: meta_info.spec_verify_ct, summed over the window)",
                 "max_total_num_tokens": "(engine: /get_server_info, once per boot)",
                 "cached_token_fraction": "(server log: #cached-token per prefill chunk)",

@@ -1337,7 +1337,7 @@ class Envs:
     # consecutive D phases with no output in between (pdflip/park_stuck.py).
     FLLIPER_PDFLIP_PARK_STUCK_PHASES = EnvInt(3)
     # TSDB (user 01.10. ~07:40Z, docs/TSDB-DELTA-27B-1001.md 1c): the front's
-    # optional Influx-line push of one `pdflip_req` point per finished request
+    # optional Influx-line push of one `weg2_req` point per finished request
     # to VictoriaMetrics (e.g. http://192.168.0.88:8428/write), bundled ~2 s in
     # the front's IPC writer thread. Unset = no push (default). The model tag
     # of every point (e.g. NF / 27B).
