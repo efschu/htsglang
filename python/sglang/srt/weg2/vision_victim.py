@@ -79,6 +79,9 @@ W_VICTIM_NOT_RESTORED = "W110c Weg2VisionVictimNotRestored"
 W_VICTIM_PLAN_REFUSED = "W111b Weg2VisionVictimPlanRefused"
 #: the arming line of the victim inventory (M0) and the host-RAM line
 W_VICTIM_ARMED = "W102 Weg2VisionStage VICTIM-ARMED"
+#: the store census of the expert-row source (its own line: ARMED is the M0
+#: arming line, one per arming -- review H2)
+W_VICTIM_STORE = "W102 Weg2VisionStage VICTIM-STORE"
 W_VICTIM_HOST = "W102 Weg2VisionStage VICTIM-HOST"
 
 
@@ -304,18 +307,28 @@ CHECKSUM_CHUNK = 8 * MIB
 
 
 def segment_checksum(view: torch.Tensor) -> Tuple[int, ...]:
-    """Sums of the int32 words per 8 MiB chunk (int64, wrapping), the
-    tail bytes last. One host sync. Any changed word changes its chunk."""
+    """Two sums per 8 MiB chunk, the tail bytes last (review S3): the sum of
+    the int32 words (int64, wrapping) and the POSITION-WEIGHTED sum (each word
+    times its index in the chunk, wrapping at 2^32). A changed word changes
+    the first; two rows swapped inside one chunk leave the first equal and
+    change the second. Callers only compare tuples for equality. One host
+    sync; the weights are one int32 arange per call, freed with it."""
     n = int(view.numel())
     words = n // 4
     sums = []
     if words:
         w = view[:words * 4].view(torch.int32)
         step = CHECKSUM_CHUNK // 4
+        pos = torch.arange(min(step, words), dtype=torch.int32, device=view.device)
         for s in range(0, words, step):
-            sums.append(w[s:s + step].sum(dtype=torch.int64))
+            c = w[s:s + step]
+            sums.append(c.sum(dtype=torch.int64))
+            sums.append((c * pos[:c.numel()]).sum(dtype=torch.int64))
     if n > words * 4:
-        sums.append(view[words * 4:].sum(dtype=torch.int64))
+        tail = view[words * 4:].to(torch.int64)
+        sums.append(tail.sum())
+        sums.append((tail * torch.arange(1, int(tail.numel()) + 1, dtype=torch.int64,
+                                         device=view.device)).sum())
     return tuple(int(x) for x in torch.stack(sums).tolist()) if sums else ()
 
 
@@ -371,6 +384,13 @@ class VictimSource(Protocol):
 
     def views(self, segments: Sequence[VictimSegment]) -> List[torch.Tensor]: ...
 
+    def verify_before_move(self, views: Sequence[torch.Tensor]) -> None:
+        """Raise ``VisionVictimPlanRefused`` (W111b) when the bytes the stage
+        will give BACK are not the bytes that are on the device now -- called
+        before anything moved (review S2). A source that returns the very
+        bytes it stashed has nothing to compare."""
+        ...
+
     def stash(self, views: Sequence[torch.Tensor]) -> None: ...
 
     def restore(self, views: Sequence[torch.Tensor]) -> None: ...
@@ -407,6 +427,9 @@ class HostImageVictims:
 
     def join(self) -> None:
         return None
+
+    def verify_before_move(self, views: Sequence[torch.Tensor]) -> None:
+        return None  # the host image IS the device bytes, copied right after
 
     # -- the interface --
     @property
@@ -574,6 +597,13 @@ class VictimLease:
         t0 = clock()
         sums0 = [checksum(v) for v in views]
         legs["checksum"] = (clock() - t0) * 1e3
+        t0 = clock()
+        try:
+            source.verify_before_move(views)  # W111b BEFORE a byte moves (review S2)
+        except Exception:
+            source.release()
+            raise
+        legs["store_check"] = (clock() - t0) * 1e3
         probe = probe or HostProbe()
         probe.start()
         probe.mark("before")
@@ -810,5 +840,8 @@ def arming_line(source: VictimSource, ckpt: Sequence[CkptTensor],
         plan = plan_victims(inv, pieces)
     except VisionVictimShort as exc:
         return f"{head} plan=REFUSED", str(exc)
+    # H2: only a host-image source stashes the victims; the expert rows are
+    # already in the store (host_image_mib=0 at every stage)
+    image = plan.victim_bytes if isinstance(source, HostImageVictims) else 0
     return (f"{head} planned_victim_mib={plan.victim_bytes / MIB:.1f} planned_segments={len(plan.segments)} "
-            f"planned_host_image_mib={plan.victim_bytes / MIB:.1f}"), ""
+            f"planned_host_image_mib={image / MIB:.1f}"), ""
