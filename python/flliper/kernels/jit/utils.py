@@ -21,7 +21,7 @@ NEXT_INCLUDE = str(pathlib.Path(__file__).resolve().parent / "include")
 
 def load_jit(*args, extra_include_paths=None, **kwargs):
     paths = [NEXT_INCLUDE] + list(extra_include_paths or [])
-    kwargs.setdefault("wrap_namespace", "flliper")
+    kwargs.setdefault("wrap_namespace", "sglang")
     return _utils.load_jit(*args, extra_include_paths=paths, **kwargs)
 
 

@@ -196,6 +196,14 @@ DENY_SPAN = [
     ("grpc-wire-name", re.compile(r"\bsglang\.grpc\.[\w.]+|\bSglang(?:Encoder|Scheduler)\w*")),
     # versioned payload schema ids written into JSON records (FL4 26.09.): a format id is data, not a name
     ("persisted-id", re.compile(r"\bsglang\.(?:expert_stats|forward_peak)/\d+")),
+    # F0-K (RC1 acceptance 09.10., M2): the seed of the salted KV page keys (mem_cache/utils.py _NAMESPACE_SEED_TAG = b"sglang-kv-namespace-v1\0")
+    # is HASHED into every L2/L3 page key of a namespaced chain; renamed, all pages written so far are silent misses.
+    ("persisted-id", re.compile(r"\bsglang-kv-namespace-v\d+")),
+    # F0-K (B1/m1): C++ NAMESPACES.  The kernels stay in `namespace sglang` / `namespace sglang_<x>` (R2: C++ is not renamed); the JIT wrapper that
+    # names them from Python -- `load_jit(..., wrap_namespace="sglang")`, the qualified `sglang_<x>::Kernel::run` strings, the docstring (``namespace sglang { ... }``) that
+    # describes the wrapper -- must say the same.  Renamed, nvcc stops with `identifier "bf16_t" is undefined` / `name followed by "::" must be a
+    # class or namespace name` and the first QSA forward of a Flash-Next boot kills the rank.
+    ("jit-wrapper-namespace", re.compile(r"\bwrap_namespace\W{1,6}sglang\b|\bnamespace sglang\w* \{ \.\.\. \}|\bsglang_\w+::")),
 ]
 # whole lines that carry attribution / licence text
 DENY_LINE = re.compile(
@@ -383,6 +391,11 @@ W_DENY_SPAN = [
     # `==` when a measure document is read.  The runtime has no reader for the renamed spelling and R1 forbids giving it one, so the
     # format id stays as written: "a format id is data, not a name".
     ("persisted-id", re.compile(r"\bweg2-footprint/\d+|\bweg2-x-curves/\d+|\bweg2\.form_measures/\d+")),
+    #
+    # F0-K (RC1 acceptance 09.10., M1): the header magic of the L3 index snapshot file (store_journal.py MAGIC = b"WEG2-L3-INDEX v3") is the
+    # first line of a file on the persistent store.  `load_snapshot` compares it with `startswith`; renamed, the first boot after the switch
+    # and every boot after a way back rejects the snapshot and walks the whole L3 (NF: 161 851 entries).  A file format keeps its bytes.
+    ("persisted-id", re.compile(r"\bWEG2-L3-INDEX\b")),
 ]
 
 

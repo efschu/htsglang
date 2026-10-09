@@ -8,7 +8,7 @@ it). It now lives in the store as
 
 * ``L3_INDEX.snap`` -- the index as it is (every page file ``(mtime, stem,
   bytes)`` oldest first, plus epoch and kernel boot id), PICKLED in frames
-  behind one line ``PDFLIP-L3-INDEX v3 n=<N>``, the last frame carrying n,
+  behind one line ``WEG2-L3-INDEX v3 n=<N>``, the last frame carrying n,
   bytes and the sha1 of the frames before it; written
   tmp + fsync + rename by ONE rank (the D group's owner) when a boot attaches
   -- never in a flip -- and
@@ -241,7 +241,9 @@ class JournalReader:
 # the snapshot
 # ---------------------------------------------------------------------------
 
-MAGIC = b"PDFLIP-L3-INDEX v3"
+# F0-K (M1): the header of the snapshot FILE on disk -- a persisted format id, NOT a name.  Renamed, the first boot after the switch (and
+# every boot after a way back) rejects the snapshot and walks the whole L3 once more.  Kit must-keep rule persisted-id.
+MAGIC = b"WEG2-L3-INDEX v3"
 #: entries per pickled frame: load and write hold ONE frame beside the index,
 #: never the whole payload (R4 28.09.: v2 held payload + list + dict + copy,
 #: measured 419 B/entry transient over the 263 B/entry index at attach).
@@ -277,7 +279,7 @@ class _HashIO:
 def write_snapshot(store: str, items, epoch: int, n: Optional[int] = None) -> Tuple[int, int]:
     """``items`` = iterable of (mtime, stem, bytes) oldest first -- the index as
     it is, pickled (no format of our own) in frames of ``FRAME`` entries behind
-    one line ``PDFLIP-L3-INDEX v3 n=<N>``; the last frame carries n, bytes and
+    one line ``WEG2-L3-INDEX v3 n=<N>``; the last frame carries n, bytes and
     the sha1 of every frame before it. Streamed: no payload, no list. Atomic:
     tmp + fsync + rename + directory fsync."""
     if n is None:

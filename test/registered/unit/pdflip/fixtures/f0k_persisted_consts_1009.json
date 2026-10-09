@@ -1,0 +1,658 @@
+{
+ "_comment": "F0-K: bytes constants and old-family format ids of the FREEZE tree, keyed by the renamed path (tools/release/persisted_consts_1009.py); test_f0k_persisted_consts_1009.py holds the renamed tree against it",
+ "bytes": {
+  "python/flliper/jit_kernel/utils.py": [
+   "b'\\x00'",
+   "b'\\x00'",
+   "b'\\x00'",
+   "b'\\x00'",
+   "b'\\x01'"
+  ],
+  "python/flliper/multimodal_gen/runtime/disaggregation/orchestrator.py": [
+   "b''",
+   "b''",
+   "b''",
+   "b''"
+  ],
+  "python/flliper/multimodal_gen/runtime/disaggregation/transport/protocol.py": [
+   "b'__transfer__'"
+  ],
+  "python/flliper/multimodal_gen/runtime/distributed/parallel_state.py": [
+   "b'magic_message'"
+  ],
+  "python/flliper/multimodal_gen/runtime/entrypoints/openai/realtime/realtime_output_adapter.py": [
+   "b''",
+   "b''",
+   "b''",
+   "b''",
+   "b''"
+  ],
+  "python/flliper/multimodal_gen/runtime/entrypoints/vla/protocol.py": [
+   "b'__ndarray__'",
+   "b'__ndarray__'",
+   "b'__npgeneric__'",
+   "b'__npgeneric__'",
+   "b'data'",
+   "b'data'",
+   "b'data'",
+   "b'dtype'",
+   "b'dtype'",
+   "b'dtype'",
+   "b'shape'",
+   "b'shape'"
+  ],
+  "python/flliper/multimodal_gen/runtime/managers/scheduler.py": [
+   "b''"
+  ],
+  "python/flliper/multimodal_gen/runtime/utils/hf_diffusers_utils.py": [
+   "b'GGUF'"
+  ],
+  "python/flliper/multimodal_gen/runtime/utils/profiler.py": [
+   "b'\\x1f\\x8b'"
+  ],
+  "python/flliper/multimodal_gen/runtime/utils/realtime_video.py": [
+   "b''",
+   "b''"
+  ],
+  "python/flliper/multimodal_gen/test/server/test_server_utils.py": [
+   "b''",
+   "b''",
+   "b'glTF'"
+  ],
+  "python/flliper/multimodal_gen/test/single_test_file/test_disagg_server.py": [
+   "b''"
+  ],
+  "python/flliper/multimodal_gen/test/test_utils.py": [
+   "b'RIFF'",
+   "b'WEBP'",
+   "b'\\x1aE\\xdf\\xa3'",
+   "b'\\x1aE\\xdf\\xa3'",
+   "b'\\x89PNG\\r\\n\\x1a\\n'",
+   "b'\\xff\\xd8\\xff'",
+   "b'ftyp'"
+  ],
+  "python/flliper/multimodal_gen/test/unit/realtime/test_realtime_consistency_harness.py": [
+   "b'png-bytes'",
+   "b'png-bytes'",
+   "b'too-short'"
+  ],
+  "python/flliper/multimodal_gen/test/unit/realtime/test_realtime_output_transport.py": [
+   "b''",
+   "b'RIFF'",
+   "b'RIFF'",
+   "b'RIFF'",
+   "b'\\xff\\xd8'",
+   "b'rgb'",
+   "b'rgb'"
+  ],
+  "python/flliper/multimodal_gen/test/unit/realtime/test_realtime_runtime.py": [
+   "b'fake-image'",
+   "b'stale'"
+  ],
+  "python/flliper/multimodal_gen/test/unit/test_cfg_parallel_warmup.py": [
+   "b'0'",
+   "b'0'"
+  ],
+  "python/flliper/multimodal_gen/test/unit/test_component_loading_order.py": [
+   "b'\\x00'"
+  ],
+  "python/flliper/multimodal_gen/test/unit/test_openai_utils.py": [
+   "b'image-bytes'",
+   "b'image-bytes'"
+  ],
+  "python/flliper/multimodal_gen/test/unit/test_server_args.py": [
+   "b'\\x89PNG\\r\\n\\x1a\\n'"
+  ],
+  "python/flliper/multimodal_gen/test/unit/test_storage.py": [
+   "b'\\x89PNG\\r\\n\\x1a\\nfake'",
+   "b'test_data'",
+   "b'test_data'"
+  ],
+  "python/flliper/multimodal_gen/test/unit/test_transformer_quant.py": [
+   "b'{\"format\":\"float8_e4m3fn\"}'",
+   "b'{\"format\":\"nvfp4\"}'"
+  ],
+  "python/flliper/srt/disaggregation/common/conn.py": [
+   "b'ABORT'"
+  ],
+  "python/flliper/srt/disaggregation/common/staging_handler.py": [
+   "b'STAGING_REQ'",
+   "b'STAGING_RSP'",
+   "b'WATERMARK'"
+  ],
+  "python/flliper/srt/disaggregation/common/utils.py": [
+   "b''",
+   "b''",
+   "b''"
+  ],
+  "python/flliper/srt/disaggregation/kv_events.py": [
+   "b''",
+   "b''",
+   "b''"
+  ],
+  "python/flliper/srt/disaggregation/mooncake/conn.py": [
+   "b''",
+   "b''",
+   "b''",
+   "b''",
+   "b''",
+   "b''",
+   "b''",
+   "b''",
+   "b''",
+   "b''",
+   "b''",
+   "b'ABORT_ACK'",
+   "b'ABORT_ACK'",
+   "b'AUX_DATA'",
+   "b'CHUNK_READY'",
+   "b'CHUNK_READY'",
+   "b'O'",
+   "b'O'",
+   "b'STAGING_REQ'"
+  ],
+  "python/flliper/srt/disaggregation/mori/conn.py": [
+   "b''",
+   "b''",
+   "b''",
+   "b''",
+   "b''",
+   "b''",
+   "b''",
+   "b''",
+   "b''",
+   "b''",
+   "b'AUX_DATA'",
+   "b'MoriMsgGuard'"
+  ],
+  "python/flliper/srt/disaggregation/nixl/conn.py": [
+   "b''",
+   "b''",
+   "b''",
+   "b''",
+   "b''",
+   "b''",
+   "b''",
+   "b''",
+   "b''",
+   "b''",
+   "b''",
+   "b''",
+   "b'STAGING_REQ'",
+   "b'STAGING_RSP'",
+   "b'WATERMARK'"
+  ],
+  "python/flliper/srt/distributed/communication_tags.py": [
+   "b'PpGr'",
+   "b'PpHi'"
+  ],
+  "python/flliper/srt/distributed/device_communicators/barlink_bar1.py": [
+   "b'x'"
+  ],
+  "python/flliper/srt/distributed/device_communicators/barlink_liveness.py": [
+   "b')'"
+  ],
+  "python/flliper/srt/distributed/device_communicators/barlink_ucx_bindings.py": [
+   "b'NET_DEVICES'"
+  ],
+  "python/flliper/srt/distributed/device_communicators/shm_broadcast.py": [
+   "b'READY'",
+   "b'READY'",
+   "b'READY'",
+   "b'READY'"
+  ],
+  "python/flliper/srt/distributed/parallel_state.py": [
+   "b'magic_message'"
+  ],
+  "python/flliper/srt/elastic_ep/expert_backup_client.py": [
+   "b''"
+  ],
+  "python/flliper/srt/entrypoints/anthropic/serving.py": [
+   "b''",
+   "b''"
+  ],
+  "python/flliper/srt/entrypoints/grpc_bridge.py": [
+   "b''"
+  ],
+  "python/flliper/srt/entrypoints/http_request_decompression.py": [
+   "b''",
+   "b''",
+   "b'content-length'",
+   "b'content-length'",
+   "b'x-body-compressed'"
+  ],
+  "python/flliper/srt/entrypoints/http_server.py": [
+   "b'\\n\\n'",
+   "b'\\n\\n'",
+   "b'data: '",
+   "b'data: '",
+   "b'data: [DONE]\\n\\n'"
+  ],
+  "python/flliper/srt/entrypoints/ollama/serving.py": [
+   "b'\\n'",
+   "b'\\n'",
+   "b'\\n'"
+  ],
+  "python/flliper/srt/entrypoints/openai/registry_view.py": [
+   "b'{}'"
+  ],
+  "python/flliper/srt/entrypoints/openai/request_binding.py": [
+   "b'{}'",
+   "b'{}'"
+  ],
+  "python/flliper/srt/entrypoints/openai/sse_utils.py": [
+   "b'\\n\\n'",
+   "b'data: '"
+  ],
+  "python/flliper/srt/layers/moe/cold_tier_shm.py": [
+   "b'SGLCOLD1'",
+   "b'\\x00'",
+   "b'\\x00'",
+   "b'\\x00'"
+  ],
+  "python/flliper/srt/layers/moe/expert_store.py": [
+   "b'\\x00'",
+   "b'\\x00'",
+   "b'\\x00'",
+   "b'h2c-v1\\x00'",
+   "b'map\\x00'",
+   "b'model-id\\x00'"
+  ],
+  "python/flliper/srt/managers/kv_session_spill_destination.py": [
+   "b'}'",
+   "b'}'"
+  ],
+  "python/flliper/srt/managers/kv_spill_park_tier.py": [
+   "b'\\x00'"
+  ],
+  "python/flliper/srt/managers/load_snapshot.py": [
+   "b'SLNS'",
+   "b'\\x00'"
+  ],
+  "python/flliper/srt/managers/tree_congruence.py": [
+   "b''",
+   "b'\\x00'"
+  ],
+  "python/flliper/srt/mem_cache/canonical_page_store.py": [
+   "b''",
+   "b''",
+   "b'SGL706\\x02'"
+  ],
+  "python/flliper/srt/mem_cache/hicache_migrate.py": [
+   "b'\\x01'"
+  ],
+  "python/flliper/srt/mem_cache/hicache_storage.py": [
+   "b''"
+  ],
+  "python/flliper/srt/mem_cache/storage/file/hicache_arena.py": [
+   "b''"
+  ],
+  "python/flliper/srt/mem_cache/storage/file/store_journal.py": [
+   "b' '",
+   "b' '",
+   "b'WEG2-L3-INDEX v3'",
+   "b'\\n'",
+   "b'\\n'"
+  ],
+  "python/flliper/srt/mem_cache/storage/flexkv/flexkv_comm.py": [
+   "b'FxA2'",
+   "b'FxAR'",
+   "b'FxB2'",
+   "b'FxB3'",
+   "b'FxCP'",
+   "b'FxPP'",
+   "b'FxSc'",
+   "b'FxTP'",
+   "b'x'"
+  ],
+  "python/flliper/srt/mem_cache/utils.py": [
+   "b'sglang-kv-namespace-v1\\x00'"
+  ],
+  "python/flliper/srt/model_executor/dual_group_lane.py": [
+   "b'|none|'"
+  ],
+  "python/flliper/srt/model_loader/sparse_write.py": [
+   "b'\\xaa'",
+   "b'\\xbb'"
+  ],
+  "python/flliper/srt/model_loader/weight_utils.py": [
+   "b'RssAnon:'"
+  ],
+  "python/flliper/srt/models/qwen4_exp_ple_pread_worker.py": [
+   "b''",
+   "b''",
+   "b''"
+  ],
+  "python/flliper/srt/models/qwen4_exp_ple_prefetch.py": [
+   "b''"
+  ],
+  "python/flliper/srt/observability/forward_pass_metrics.py": [
+   "b''"
+  ],
+  "python/flliper/srt/pdflip/bar1_lanes.py": [
+   "b''",
+   "b''",
+   "b''",
+   "b'D'",
+   "b'F'",
+   "b'P'",
+   "b'R'"
+  ],
+  "python/flliper/srt/pdflip/dual_share.py": [
+   "b'\\n\\n'"
+  ],
+  "python/flliper/srt/pdflip/form.py": [
+   "b'POWER-LIMIT rank '",
+   "b'group D argv:'"
+  ],
+  "python/flliper/srt/pdflip/front.py": [
+   "b' \\t\\r\\n'",
+   "b' \\t\\r\\n'",
+   "b'\"'",
+   "b'\"'",
+   "b'\"(?:finish_reason|stop_reason)\"\\\\s*:\\\\s*\"|event:\\\\s*message_stop|\"type\"\\\\s*:\\\\s*\"message_stop\"'",
+   "b'\"cached_tokens_details\"\\\\s*:\\\\s*\\\\{[^{}]*\\\\}'",
+   "b'\"choices\"'",
+   "b'\"error\"'",
+   "b'\"error\"'",
+   "b'\"sglext\"\\\\s*:\\\\s*\\\\{'",
+   "b'\"text\"'",
+   "b'\"type\": \"error\"'",
+   "b'\"type\":\"error\"'",
+   "b''",
+   "b'(\"type\"\\\\s*:\\\\s*)\"overloaded_error\"'",
+   "b'[DONE]'",
+   "b'[DONE]'",
+   "b'[DONE]'",
+   "b'[DONE]'",
+   "b'[DONE]'",
+   "b'\\n'",
+   "b'\\n'",
+   "b'\\n'",
+   "b'\\n'",
+   "b'\\n'",
+   "b'\\n'",
+   "b'\\n'",
+   "b'\\n\\n'",
+   "b'\\n\\n'",
+   "b'\\n\\n'",
+   "b'\\n\\n'",
+   "b'\\n\\n'",
+   "b'\\n\\n'",
+   "b'cached_tokens_details'",
+   "b'cached_tokens_details'",
+   "b'cached_tokens_details'",
+   "b'cached_tokens_details'",
+   "b'content_block_delta'",
+   "b'content_block_start'",
+   "b'data: '",
+   "b'data: '",
+   "b'data: '",
+   "b'data:'",
+   "b'data:'",
+   "b'data:'",
+   "b'data:'",
+   "b'data:'",
+   "b'data:'",
+   "b'data:'",
+   "b'data:'",
+   "b'event: error'",
+   "b'event: error'",
+   "b'event: error'",
+   "b'event: error\\ndata: '",
+   "b'overloaded_error'",
+   "b'weg2_resumable_depth'",
+   "b'weg2_seq_hash'"
+  ],
+  "python/flliper/srt/pdflip/host_ledger.py": [
+   "b'RssAnon:'"
+  ],
+  "python/flliper/srt/pdflip/idle_census.py": [
+   "b':'",
+   "b'RssAnon:'",
+   "b'RssFile:'",
+   "b'RssShmem:'",
+   "b'Threads:'"
+  ],
+  "python/flliper/srt/pdflip/idle_clock.py": [
+   "b''",
+   "b''",
+   "b''",
+   "b'\\n'",
+   "b'\\n'"
+  ],
+  "python/flliper/srt/pdflip/l15_hold_share.py": [
+   "b''"
+  ],
+  "python/flliper/srt/pdflip/l15_manifest.py": [
+   "b''",
+   "b'L15MB1\\n'"
+  ],
+  "python/flliper/srt/pdflip/l15_tree_cand.py": [
+   "b'\\x00'",
+   "b'\\x00'"
+  ],
+  "python/flliper/srt/pdflip/lane_sm_copy.py": [
+   "b'-lineinfo'",
+   "b'?'",
+   "b'weg2_lane_copy'",
+   "b'weg2_lane_copy.cu'"
+  ],
+  "python/flliper/srt/pdflip/launcher.py": [
+   "b' '",
+   "b')'",
+   "b'='",
+   "b'POWER-LIMIT rank '",
+   "b'\\x00'",
+   "b'\\x00'",
+   "b'\\x00'"
+  ],
+  "python/flliper/srt/pdflip/model_profile.py": [
+   "b'GGUF'"
+  ],
+  "python/flliper/srt/pdflip/ple_state.py": [
+   "b'PLESIDE1'"
+  ],
+  "python/flliper/srt/pdflip/prefix_fp.py": [
+   "b''",
+   "b'\\n'"
+  ],
+  "python/flliper/srt/pdflip/seam_digest.py": [
+   "b'\\x00'",
+   "b'\\x00'",
+   "b'\\x00'"
+  ],
+  "python/flliper/srt/pdflip/tail_handoff.py": [
+   "b'\\x00'"
+  ],
+  "python/flliper/srt/pdflip/tools/vram_hires.py": [
+   "b' '",
+   "b' '",
+   "b'\\x00'",
+   "b'\\x00'"
+  ],
+  "python/flliper/srt/pdflip/union_arena_vmm.py": [
+   "b''",
+   "b'F'"
+  ],
+  "python/flliper/srt/pdflip/usage_true.py": [
+   "b' \\t\\r\\n'",
+   "b'\"cache_read_input_tokens\"'",
+   "b'\"cached_tokens\"'",
+   "b'\"reasoning_content\"'",
+   "b'\"reasoning_content\"'",
+   "b'\"thinking\"'",
+   "b'\"thinking'",
+   "b'\"usage\"'",
+   "b'\"usage\"'",
+   "b'\"usage\"'",
+   "b''",
+   "b''",
+   "b''",
+   "b''",
+   "b','",
+   "b',}] \\t\\r\\n'",
+   "b':'",
+   "b'\\n'",
+   "b'\\n'",
+   "b'\\n'",
+   "b'\\n\\n'",
+   "b'\\n\\n'",
+   "b'\\r'",
+   "b'\\r'",
+   "b'cached_tokens_details'",
+   "b'cached_tokens_details'",
+   "b'data: '",
+   "b'data: '",
+   "b'data:'",
+   "b'data:'",
+   "b'data:'"
+  ],
+  "python/flliper/srt/pdflip/vram_actual.py": [
+   "b'='",
+   "b'\\x00'"
+  ],
+  "python/flliper/srt/pdflip/weight_exchange.py": [
+   "b'|'"
+  ],
+  "python/flliper/srt/pdflip/weight_exchange_region.py": [
+   "b'WEG2XCHG'",
+   "b'\\x00'",
+   "b'\\x00'",
+   "b'\\x00'"
+  ],
+  "python/flliper/srt/pdflip/weight_exchange_transport.py": [
+   "b''"
+  ],
+  "python/flliper/srt/planner/server_manager.py": [
+   "b''",
+   "b''",
+   "b'\\n'"
+  ],
+  "python/flliper/srt/planner/webui.py": [
+   "b'{}'",
+   "b'{}'"
+  ],
+  "python/flliper/srt/registry/adapters/process.py": [
+   "b')'"
+  ],
+  "python/flliper/srt/rigmon/aggregator.py": [
+   "b'no UI installed'",
+   "b'{}'"
+  ],
+  "python/flliper/srt/rigmon/probe.py": [
+   "b''",
+   "b'\\x00'",
+   "b'\\x00'"
+  ],
+  "python/flliper/srt/tokenizer/tiktoken_tokenizer.py": [
+   "b'\\x00'"
+  ],
+  "python/flliper/srt/training/backends/mock.py": [
+   "b'htsglang-mock-adapter\\n'",
+   "b'htsglang-mock-adapter\\n'"
+  ],
+  "python/flliper/srt/translator/tts_backends.py": [
+   "b''"
+  ],
+  "python/flliper/srt/turnkey/plan.py": [
+   "b'\\x00'"
+  ],
+  "python/flliper/srt/turnkey/runner.py": [
+   "b' '",
+   "b'\\x00'"
+  ],
+  "python/flliper/srt/uneven_perf.py": [
+   "b'GGUF'"
+  ],
+  "python/flliper/srt/utils/common.py": [
+   "b''",
+   "b''",
+   "b''",
+   "b'\\xff\\xd8'",
+   "b'\\xff\\xd9'"
+  ],
+  "python/flliper/srt/utils/cudacore_pyspy_dump_utils.py": [
+   "b'1'"
+  ],
+  "python/flliper/srt/utils/hf_transformers/common.py": [
+   "b'GGUF'"
+  ],
+  "python/flliper/srt/utils/kernel_dist_guard.py": [
+   "b'\\x00'",
+   "b'\\x7fELF'",
+   "b'int8_scaled_mm'"
+  ],
+  "python/flliper/srt/utils/wheel_sass.py": [
+   "b'(\\xb5/\\xfd'",
+   "b'NVIDIA Corp\\x00'"
+  ],
+  "python/flliper/srt/video_enhance/codec.py": [
+   "b''",
+   "b''",
+   "b'\\x00'"
+  ],
+  "python/flliper/srt/video_enhance/mux.py": [
+   "b''",
+   "b'\\x00\\x00'"
+  ],
+  "python/flliper/test/ascend/output_capturer.py": [
+   "b''",
+   "b''"
+  ],
+  "python/flliper/utils.py": [
+   "b''"
+  ]
+ },
+ "format_ids": {
+  "python/flliper/srt/layers/moe/expert_stats.py": [
+   "sglang.expert_stats/1"
+  ],
+  "python/flliper/srt/model_executor/forward_peak.py": [
+   "sglang.forward_peak/1"
+  ],
+  "python/flliper/srt/pdflip/form.py": [
+   "weg2-footprint/1"
+  ],
+  "python/flliper/srt/pdflip/form_measures.py": [
+   "weg2.form_measures/2",
+   "weg2.form_measures/3"
+  ],
+  "python/flliper/srt/pdflip/host_ledger.py": [
+   "weg2-pp-calib/1"
+  ],
+  "python/flliper/srt/pdflip/lane_coverage.py": [
+   "weg2-lane-coverage-1"
+  ],
+  "python/flliper/srt/pdflip/rankstats.py": [
+   "weg2.rankstats/1"
+  ],
+  "python/flliper/srt/pdflip/state_file.py": [
+   "weg2.event/1",
+   "weg2.state/1"
+  ],
+  "python/flliper/srt/pdflip/vram_actual.py": [
+   "weg2.rank_vram/1"
+  ],
+  "python/flliper/srt/pdflip/vram_plan.py": [
+   "weg2.vram_plan/1"
+  ],
+  "python/flliper/srt/pdflip/x_curves.py": [
+   "weg2-x-curves/1"
+  ],
+  "python/flliper/srt/planner/rig_artifact.py": [
+   "htsglang-rig-artifact/v1"
+  ],
+  "python/flliper/test/ascend/e2e/test_npu_accuracy_utils.py": [
+   "sglang-node-0"
+  ],
+  "python/flliper/test/ascend/e2e/test_npu_multi_node_utils.py": [
+   "sglang-node-0",
+   "sglang-node-0"
+  ],
+  "python/flliper/test/ascend/e2e/test_npu_performance_utils.py": [
+   "sglang-node-0"
+  ]
+ },
+ "ref": "86ff356d0d"
+}
