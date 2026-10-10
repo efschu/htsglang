@@ -54,7 +54,7 @@ import os
 import time
 import weakref
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -81,6 +81,9 @@ from sglang.srt.weg2.vision_stage_service import (
     W_TEARDOWN,
     W_TIMEOUT,
 )
+
+if TYPE_CHECKING:
+    from sglang.srt.weg2.vision_victim import EncodeAir
 
 logger = logging.getLogger(__name__)
 
@@ -677,9 +680,10 @@ def _check_deadline(deadline_s: Optional[float], t_start: float, clock: Callable
 
 
 def _weights_lease(scheduler, module, items, backend, hf_config, device, victims, air, clock, out):
-    """VISION-WEIGHTS (hook 2/4): wait for PP0's forward, check the encode's
-    work memory against the card's air (computed from the real image), then
-    borrow the victims (W105b/W111b before any byte moved)."""
+    """VISION-WEIGHTS (hook 2/4): wait for PP0's forward, return the idle
+    cache and check the encode's work memory (computed from the real image)
+    against the driver's free memory (``settle_encode_air``), then borrow the
+    victims (W105b/W111b before any byte moved)."""
     from sglang.srt.weg2 import vision_victim as vv
 
     out.sync_ms = wait_pp0_forward(scheduler, clock)
@@ -688,9 +692,11 @@ def _weights_lease(scheduler, module, items, backend, hf_config, device, victims
     vc = getattr(hf_config, "vision_config", None)
     if vc is not None and items:
         out.planned_work_bytes = vv.encode_work_for(vc, items, backend)
-        card_free, cache_idle = air(device)
-        why = vv.encode_air_refusal(out.planned_work_bytes, card_free, cache_idle,
-                                    max(vv.item_patches(it) for it in items))
+        patches = max(vv.item_patches(it) for it in items)
+        reading = settle_encode_air(device, air=air, clock=clock)
+        why = vv.encode_air_refusal(work=out.planned_work_bytes, air=reading, patches=patches)
+        logger.info("%s AIR %s work_mib=%.0f patches=%d verdict=%s", W_STAGE_OK, reading.fields(),
+                    out.planned_work_bytes / vrs.MIB, patches, "fits" if not why else vv.W_VICTIM_SHORT)
         if why:
             raise vv.VisionVictimShort(why)
     # the scheduler's own stream was synchronized at the top of the reserve
@@ -737,6 +743,38 @@ def card_air(device: torch.device) -> Tuple[int, int]:
     free, _total = torch.cuda.mem_get_info(device)
     idle = torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
     return int(free), int(idle)
+
+
+def settle_encode_air(device: torch.device, *, air: Callable[[torch.device], Tuple[int, int]],
+                      clock: Callable[[], float] = time.perf_counter) -> "EncodeAir":
+    """VISION-WEIGHTS (metal 10.10., jzmxnp INT8 flip 4096x4096): the encode's air, honestly.
+
+    The idle cache counted as air although it lay in pieces smaller than the
+    encode's largest tensor (W107 OOM behind a passed check, see
+    ``vision_victim.EncodeAir``). ``empty_cache`` returns every wholly unused
+    cached segment to the driver; the air is measured again after it.
+
+    Only on the weights path, after ``wait_pp0_forward`` (PP0's workspace is
+    back in the cache) and BEFORE ``VictimLease.open``: no victim view exists
+    yet, and between here and the encode only small checksum temporaries are
+    allocated (the load's bounce buffers are pinned HOST memory). Safe for the
+    rank's memory by the allocator's own semantics (torch 2.11
+    ``CUDACachingAllocator.cpp`` ``release_cached_blocks``/``release_blocks``):
+    only unsplit blocks with no live allocation are freed, so weight storages
+    and every tensor in use stay where they are; a CUDA-graph private pool is
+    released only once it is in ``graph_pools_freeable`` (use_count 0, no graph
+    left on it), so the captured graphs' pools stay untouched. The stage's
+    teardown already calls ``empty_cache`` on the same rank in the same state.
+    On a CPU device ``torch.cuda.empty_cache`` is a no-op (CUDA uninitialized)."""
+    from sglang.srt.weg2 import vision_victim as vv
+
+    free0, idle0 = air(device)
+    t0 = clock()
+    torch.cuda.empty_cache()
+    ms = (clock() - t0) * 1e3
+    free1, idle1 = air(device)
+    return vv.EncodeAir(free_before=int(free0), idle_before=int(idle0), free_after=int(free1),
+                        idle_after=int(idle1), empty_cache_ms=ms)
 
 
 def run_rank_stage(scheduler, reqs: Sequence[Any], *, model_dir: str, hf_config: Any,
