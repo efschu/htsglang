@@ -2569,6 +2569,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     "the file-backed table is the offloaded table."
                 )
             if _is_qwen4_exp:
+                # NF-GGUF G2: a GGUF export holds the PLE table as one IQ4_NL
+                # tensor (28.8 GB); it is only ever mapped (never copied or
+                # dequantised whole), which is the checkpoint backend. Refuse any
+                # other form here, before a pinned 100 GB table is allocated.
+                from sglang.srt.utils.hf_transformers_utils import (
+                    check_gguf_file as _check_gguf_file,
+                )
+
+                if _check_gguf_file(self.server_args.model_path) and (
+                    not _ple or _ple_backend != "checkpoint"
+                ):
+                    raise ValueError(
+                        "a GGUF Qwen4-Exp export needs --ple-offload-embedding "
+                        "--ple-offload-backend checkpoint: its PLE n-gram table is one "
+                        "IQ4_NL tensor that is mapped from the GGUF file, not copied "
+                        f"(got ple_offload_embedding={_ple!r}, "
+                        f"ple_offload_backend={_ple_backend!r})"
+                    )
                 _tc = self.model_config.hf_text_config
                 _tc.ple_offload_embedding = bool(_ple)
                 _tc.ple_offload_backend = _ple_backend

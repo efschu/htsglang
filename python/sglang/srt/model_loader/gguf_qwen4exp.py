@@ -79,8 +79,18 @@ them at the end as int64 tensors named like the HF buffers
 ``ngram_heads_vocab_sizes``) so the model's own buffer loader
 (``qwen4_exp.py _load_qwen4_exp_ple_buffer``) takes them.
 
-Not in G1: the MTP draft (``blk.<n>.nextn.*``, AP G3), the PLE table consumer
-(AP G2), MoE/PLE kernels.
+Not in G1: the MTP draft (``blk.<n>.nextn.*``, AP G3), MoE/PLE kernels.
+
+PLE table consumer (AP G2). The 28.8 GB ``per_layer_token_embd`` payload must
+NOT go through the generic weight stream: ``gguf_quant_weights_iterator`` copies
+every mapped tensor (``torch.tensor(...)``). The loader therefore builds the
+iterator from :meth:`Qwen4ExpGGUFAdapter.stream_name_map` (the name map without
+the table), and :meth:`transform_stream` yields ONE small marker tensor first,
+``model.layers.<ple layer>.ple.ple_embedding.ngram_embedding.gguf_table``, whose
+uint8 payload is the table's location (file, absolute offset, type, shape;
+``qwen4_exp_ple_gguf.encode_ple_table_marker``). The model maps the span lazily
+(``Qwen4ExpPinnedHostEmbedding.attach_gguf_table``). Any table format but IQ4_NL
+is refused by name before a single tensor is streamed.
 """
 
 from __future__ import annotations
@@ -242,6 +252,12 @@ _PLE_CONSTANTS: Tuple[Tuple[str, str], ...] = (
 #: qwen35 stream (which matches by NAME SUFFIX, e.g. ``conv1d.weight``) leaves
 #: it alone. Stripped again before the loader sees it.
 _FINAL = "\x00final"
+
+# the marker leaf and the table's GGUF name live with the table code
+from sglang.srt.models.qwen4_exp_ple_gguf import (  # noqa: E402
+    PLE_TABLE_GGUF_NAME,
+    PLE_TABLE_MARKER_LEAF,
+)
 
 
 def _split_blk(name: str) -> Optional[Tuple[int, str]]:
@@ -765,6 +781,49 @@ class Qwen4ExpGGUFAdapter(Qwen35GGUFAdapter):
                 f"{sorted(idx_types) + sorted(idx_data)}"
             )
 
+    # ------------------------------------------------------------------
+    # PLE table (G2)
+    # ------------------------------------------------------------------
+
+    def _ple_table_hf_name(self) -> Optional[str]:
+        """HF name the name map gives the table (``...ngram_embedding.weight``)."""
+        layers = self._kv().get("ple.layers")
+        layer = int(layers[0]) if isinstance(layers, list) and layers else None
+        if layer is None:
+            layer = self._ple_layer(sorted(self._file_tensors()))
+        if layer is None:
+            return None
+        return f"model.layers.{layer}.ple.ple_embedding.ngram_embedding.weight"
+
+    def stream_name_map(self, name_map: Dict[str, str]) -> Dict[str, str]:
+        """The map the weight ITERATOR is built from: ``name_map`` without the PLE
+        table, whose payload is mapped by the model instead of copied
+        (``gguf_quant_weights_iterator`` only streams tensors named in its map)."""
+        if self.is_draft:
+            return name_map
+        return {g: h for g, h in name_map.items() if g != PLE_TABLE_GGUF_NAME}
+
+    def ple_table_marker(self) -> Optional[Tuple[str, torch.Tensor]]:
+        """``(marker name, marker tensor)`` for the table, or None when the file
+        has none. Reads the GGUF headers only; refuses every format but IQ4_NL."""
+        from sglang.srt.models.qwen4_exp_ple_gguf import (
+            check_ple_table_supported,
+            encode_ple_table_marker,
+            locate_gguf_tensor,
+        )
+
+        if PLE_TABLE_GGUF_NAME not in self._file_tensors():
+            return None
+        hf = self._ple_table_hf_name()
+        if hf is None:
+            raise RuntimeError(
+                f"qwen4exp GGUF {self.gguf_file}: has {PLE_TABLE_GGUF_NAME} but names no PLE layer"
+            )
+        loc = locate_gguf_tensor(self.shard_paths(), PLE_TABLE_GGUF_NAME)
+        check_ple_table_supported(loc)
+        base = hf[: -len(".weight")]
+        return f"{base}.{PLE_TABLE_MARKER_LEAF}", encode_ple_table_marker(loc)
+
     def _ple_constant_tensors(self) -> Iterable[Tuple[str, torch.Tensor]]:
         """The UINT64 KV arrays as the int64 buffers the model loads."""
         kv = self._kv()
@@ -786,6 +845,11 @@ class Qwen4ExpGGUFAdapter(Qwen35GGUFAdapter):
     ) -> Iterable[Tuple[str, torch.Tensor]]:
         if self.is_draft:
             raise RuntimeError("qwen4exp GGUF MTP draft: AP G3")
+        # G2: the table's location goes first, so a refused format (or a model
+        # without the checkpoint offload backend) fails before the weights load
+        marker = self.ple_table_marker()
+        if marker is not None:
+            yield marker
         for name, weight in super().transform_stream(self._pre_stream(weights)):
             if name.endswith(_FINAL):
                 name = name[: -len(_FINAL)]
