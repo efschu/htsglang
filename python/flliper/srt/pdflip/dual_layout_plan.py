@@ -29,7 +29,9 @@ Byte model (checked against the checkpoint header by the tests):
   on the first / last stage.
 * ``draft`` (DFlash2) is TP-sharded in D (draft vector, default = mlp vector);
   P keeps it whole on ``draft_stage`` (or not at all: ``draft_stage=None``).
-* ``vision`` stays with P stage 0 when ``vision_in_p`` (D never holds it).
+* ``vision`` stays with P stage 0 when ``vision_in_p`` (D never holds it).  Under ``--pdflip-vision transient`` it is NOT resident
+  (``vision_in_p`` False, the planner books nothing in the weights); with ``--pdflip-vision-place weights`` the tower borrows ``pp_only``
+  bytes of stage 0 while an image is encoded: a CHECK item against ``pp_only`` (``pdflip/vision_victim_plan.py``), not a part of this plan.
 
 A ratio vector is a RATIO, not a fraction (memory rank-ratios-sind-
 verhaeltnis): ``share_r = v_r / sum(v)``; bytes are split proportionally, not

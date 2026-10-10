@@ -1656,12 +1656,39 @@ def contract_bar(stage: Mapping[str, Any], phase: str) -> Dict[str, Any]:
         obergrenze = (" -- UPPER BOUND: not calculated are " + ", ".join(missing)) if missing else ""
         segs.append({"name": "free", "label": "Free", "mib": round(free, 3), "source": "gerechnet",
                      "detail": BALKEN_SEGMENTS[-1][2] + obergrenze, "gerechnet": True})
-    return {"card": stage.get("ord"), "label": stage["label"], "phase": phase, "total_mib": total, "budget_mib": budget,
-            "budget_herkunft": _origin(bsrc["src"]), "segments": segs, "posts_mib": round(known, 3), "free_mib": round(free, 3),
-            "overflow_mib": round(overflow, 3), "beyond_card_mib": round(beyond, 3), "outside_budget_mib": round(outside, 3),
-            "available_mib": round(available, 3), "budget_over_available_mib": round(over_avail, 3), "user_reserve_mib": round(user_reserve, 3),
-            "shared_with_d": refs, "not_computed": missing,
-            "over_text": _over_text(stage["label"], phase, overflow, beyond, budget, total, over_avail, outside, user_reserve)}
+    bar = {"card": stage.get("ord"), "label": stage["label"], "phase": phase, "total_mib": total, "budget_mib": budget,
+           "budget_herkunft": _origin(bsrc["src"]), "segments": segs, "posts_mib": round(known, 3), "free_mib": round(free, 3),
+           "overflow_mib": round(overflow, 3), "beyond_card_mib": round(beyond, 3), "outside_budget_mib": round(outside, 3),
+           "available_mib": round(available, 3), "budget_over_available_mib": round(over_avail, 3), "user_reserve_mib": round(user_reserve, 3),
+           "shared_with_d": refs, "not_computed": missing,
+           "over_text": _over_text(stage["label"], phase, overflow, beyond, budget, total, over_avail, outside, user_reserve)}
+    _attach_vision_victim(bar, stage)
+    return bar
+
+
+def _attach_vision_victim(bar: Dict[str, Any], stage: Mapping[str, Any]) -> None:
+    """VISION-WEIGHTS AP4 (data only, no layout change): ``stage["vision_victim"]`` (``pdflip.vision_victim_plan.section`` of the PP0 stage, only with
+    ``--pdflip-vision-place weights``) becomes (a) the sub-item ``unterposten`` of the WEIGHTS item -- the segment ``weights``, in the Dual the
+    reference item (``shared_with_d`` ``diff``/``weights``) the weights live in --, NOT added to ``posts_mib`` (the victims are weights that are
+    already counted) and (b) the host row ``host_zeilen`` (displaced weights, temporary).  Without ``vision_victim`` the bar is unchanged."""
+    vs = stage.get("vision_victim")
+    if not vs or not vs.get("aktiv"):
+        return
+    sub = dict(vs["vision_transient"])
+    sub["verfuegbar_mib"] = vs.get("verfuegbar_mib")
+    sub["verfuegbar_quelle"] = vs.get("verfuegbar_quelle")
+    sub["opferart"] = vs.get("opferart")
+    sub["verdict"] = vs.get("verdict")
+    target = next((x for x in bar["segments"] if x.get("name") == "weights"), None)
+    if target is None:
+        target = next((x for x in bar["shared_with_d"] if x.get("name") == "diff"), None)
+    if target is None:
+        target = next((x for x in bar["shared_with_d"] if x.get("name") == "weights"), None)
+    if target is not None:
+        target.setdefault("unterposten", []).append(sub)
+    else:
+        bar["unterposten_ohne_ziel"] = [sub]
+    bar["host_zeilen"] = [dict(vs["host_posten"])]
 
 
 def _over_text(label: str, phase: str, overflow: float, beyond: float, budget: float, total: float,
@@ -1743,6 +1770,38 @@ def _dual_share_p_terms(stage: Dict[str, Any], args: Mapping[str, str], seen: Op
         seen.append({"was": "dual_share", "value": "an", "source": "Profile row --dual-share: weights/experts (and KV with --dual-unified-kv on) do not count against the P budget"})
 
 
+def _vision_victim_for_stage0(model: Mapping[str, Any], all_args: Mapping[str, str], settings: Mapping[str, Any], form: str) -> Dict[str, Any]:
+    """VISION-WEIGHTS AP4: the ``vision`` section for the PP0 stage of the bar (``pdflip.vision_victim_plan.section``).  The tower bytes come from the
+    model profile (``weights.visual_bytes``), the victim bytes where the bar can derive them (27B flip: MLP bytes of stage 0; NF: resident expert rows
+    of stage 0); in the Dual the pp_only part is the diff the bar does not compute (see ``_dual_share_p_terms``) -> ``verfuegbar_mib: None`` -- the
+    proposal (``propose_dual``) calculates it.  Inactive (default profiles): ``{"aktiv": False}``."""
+    from flliper.srt.pdflip import vision_victim_plan as VV
+
+    vision, place = all_args.get(VV.VISION_FLAG), all_args.get(VV.PLACE_FLAG)
+    if not VV.active(vision, place):
+        return {"aktiv": False}
+    w = model.get("weights") or {}
+    vb = _val(w.get("visual_bytes"), None)
+    tower, tsrc = (float(vb), "model profile weights.visual_bytes (%s)" % _src(w.get("visual_bytes"), "Index")) if vb else (
+        float(VV.TOWER_BYTES_27B), "reference of the 27B tower (AP2 921460192 B); the model profile carries no visual_bytes: unverified for this model")
+    is_moe = int(_val((model.get("experts") or {}).get("n"), 0) or 0) > 0
+    dual = form == "dual"
+    layers = [int(c) for c in (settings.get("stage_layers") or [])]
+    stage0 = layers[0] if layers else None
+    kind = VV.victim_kind(is_moe=is_moe, dual=dual)
+    if kind == VV.KIND_PP_ONLY:
+        avail, asrc = None, "27B dual: the pp_only part is the diff of the P weights; not calculated in the bar (proposal: propose_dual)"
+    elif kind == VV.KIND_EXPERTS:
+        le = _val(w.get("layer_expert_bytes"), None)
+        fr = settings.get("moe_resident_fraction", None)
+        fr0 = None if fr is None else (float(fr[0]) if isinstance(fr, (list, tuple)) else float(fr))
+        avail, asrc = VV.available_experts_mib([float(b) / MIB for b in (le or [])], stage0, fr0)
+    else:
+        avail, asrc = VV.available_dense_mib(model, stage0)
+    return VV.section(form=form, vision=vision, place=place, is_moe=is_moe, dual=dual, tower_bytes=tower, tower_src=tsrc,
+                      available_mib=avail, available_src=asrc)
+
+
 def phase_bars(hw: Mapping[str, Any], model: Mapping[str, Any], args: Mapping[str, str], phase_args: Optional[Mapping[str, Any]] = None,
                phase_env: Optional[Mapping[str, Any]] = None, form: Optional[str] = None, tokens: Sequence[str] = (),
                overrides: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
@@ -1779,6 +1838,8 @@ def phase_bars(hw: Mapping[str, Any], model: Mapping[str, Any], args: Mapping[st
             st2 = dict(st)
             st2["_rate_known"] = t["_ctx"]["rate"] > 0
             st2["terms"] = _p_terms_for_contract(st2, draft, carries, i == len(t["stages"]) - 1, settings)
+            if i == 0 and name == "P":
+                st2["vision_victim"] = _vision_victim_for_stage0(model, all_args, settings, form)
             if dual_share and name == "P":
                 _dual_share_p_terms(st2, all_args, seen if i == 0 else None)
             stages.append(st2)

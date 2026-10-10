@@ -4,7 +4,7 @@ Gepinnt (rot -> gruen gegen ``ae25180e67``, wo es weder ``resolve_edge_evidence_
   * ``resolve_anchor``: genau ein Treffer = eindeutig; mehrere = naechster zur erwarteten Zeile (``nah``); Gleichstand oder
     zu weit weg = ``mehrdeutig``; kein Treffer = ``veraltet`` (nie ein stilles Raten).
   * Verschiebung: der echte Quelltext (launcher.py, environ.py, profile_couplings.py) wird in einem Temp-Verzeichnis um N Zeilen
-    verschoben (Prepend am Dateianfang UND Einschub mitten in launcher.py); JEDE der 131 Kanten loest weiter auf, auf genau
+    verschoben (Prepend am Dateianfang UND Einschub mitten in launcher.py); JEDE der 134 Kanten loest weiter auf, auf genau
     die verschobene Zeile -- auch die mit Mehrfachtreffer-Ankern (``exchange`` 229x, ``DFLASH`` 73x, ``entries`` 30x).
   * Mutant: ein entfernter Anker wird ``veraltet`` und macht die Pruefung rot; ein verdoppelter eindeutiger Anker mit
     Gleichstand wird ``mehrdeutig``.
@@ -101,10 +101,10 @@ class ResolveAnchor(unittest.TestCase):
 
 
 class ResolveEdges(unittest.TestCase):
-    def test_real_tree_resolves_all_131(self):
-        """All 131 edges, resolved against this tree as its own line: every one resolves, except the edges that name only the OTHER line."""
+    def test_real_tree_resolves_all_134(self):
+        """All 134 edges, resolved against this tree as its own line: every one resolves, except the edges that name only the OTHER line."""
         res = PC.resolve_edge_evidence_items(KANTEN_ALLE, REPO_ROOT, TREE)
-        self.assertEqual(len(res), 131)
+        self.assertEqual(len(res), 134)
         self.assertEqual(problems(res), {})
         for i, r in res.items():
             self.assertIn(r["status"], PC.ANCHOR_OK + PC.ANKER_FREMD + ("extern_fehlt",), i)
@@ -114,7 +114,7 @@ class ResolveEdges(unittest.TestCase):
         self.assertEqual(sorted(set(res) - set(fremd)), sorted(k["id"] for k in KANTEN))
 
     def test_without_a_tree_label_every_edge_is_checked(self):
-        """No label = no filter: on the NF tree the 44 ``trees: [27b]`` edges are then stale or missing (the label is what lets them pass)."""
+        """No label = no filter: on the NF tree the 47 ``trees: [27b]`` edges are then stale or missing (the label is what lets them pass)."""
         res = PC.resolve_edge_evidence_items(KANTEN_ALLE, REPO_ROOT)
         self.assertFalse(any(r["status"] in PC.ANKER_FREMD for r in res.values()))
         if not DUAL_LINE:

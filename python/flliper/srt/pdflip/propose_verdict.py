@@ -51,6 +51,10 @@ OWN_CODES: Dict[str, Dict[str, Any]] = {
                      "consequence": "hw_fit does not calculate the dual (it prints 'Dual ... NOT modelled'); the planner calculates per card P budget + overhead + rest items of D + D weights (with draft) against the card. This is a NECESSARY condition from model sizes and records, not a measurement; whether the start runs is told by the launcher run (the other verdicts)."},
     "DUAL-PFLICHT": {"level": "fit", "parent": None, "title": "P KV obligation of the dual form per card (planner calculation)",
                      "consequence": "P must carry the KV obligation (default 262144 tokens) as ONE prompt: cap, level of the P pool and the shared pool of each card. The pool per card is calibrated only for the cards and the model of the reference boot; otherwise it says 'not calculated'. There is no dual pool bar in the launcher according to the 27B seat (done/dual-cut-262k-1006.md section 5): this calculation is the only protection against it."},
+    "W105b": {"level": "fit", "parent": None, "title": "Vision tower: the victim weights of PP0 are smaller than the tower (planner calculation)",
+              "consequence": "VISION-WEIGHTS (--pdflip-vision-place weights): the tower borrows weight memory of PP0 (27B flip: MLP storages, 27B dual: the pp_only hull parts that are not D's shard, NF: resident expert rows). Fewer victim bytes than tower bytes: the runtime refuses the image request by name with 503 (W105b PdFlipVisionVictimShort), text keeps running, the rig stays intact, there is NO fallback to KV or free VRAM. A verdict with the numbers, not a lock of the start; whether the start runs is told by the launcher run."},
+    "VISION-VICTIM": {"level": "fit", "parent": None, "title": "Vision tower on displaced weights: victim bytes against tower bytes (planner calculation)",
+                      "consequence": "VISION-WEIGHTS (--pdflip-vision-place weights): the victim bytes of PP0 against the tower bytes. The victims are weights that are already counted: the tower adds 0 MiB resident (item 'Vision transient' is a check item); the host image of the displaced weights (27B: the tower bytes, temporary) is a warning only. A NECESSARY condition from model sizes, not a measurement."},
     "EINZEL-PASSUNG": {"level": "fit", "parent": None, "title": "Single card: fit as a planner calculation (no launcher run)",
                        "consequence": "The single card has no pdflip launcher (topology.py MIN_CARDS=2): the planner calculates weights + draft + KV obligation + Mamba pool + reserve against the static budget (fraction x free memory before loading). This is a NECESSARY condition from model sizes, not a measurement; there is no force at N=1."},
     "EINZEL-PARSE": {"level": "fit", "parent": None, "title": "Single card: ServerArgs parse (argparse only, without device)",
@@ -472,6 +476,18 @@ def build_verdict(n: int, first: Any, second: Any = None, *, lens: Optional[Mapp
             v_list.append(budget_verdict(str(dv["code"]), level="fit", text=str(dv.get("text", "")), reason=str(dv.get("text", "")),
                                   force_state={"ja": GOES, "nein": BLOCKED if dv["code"] == "DUAL-PASSUNG" else HINT}.get(stage, HINT),
                                   extra={"stage": stage, "etikett": dv.get("etikett"), "rest_mib": dv.get("rest_mib")}))
+        # VISION-WEIGHTS AP4: the tower on displaced weights.  W105b is a VERDICT with code and numbers, never a lock (plan 8, oracle rule)
+        vs = proposal.get("vision") or {}
+        vd = vs.get("verdict") if vs.get("aktiv") else None
+        if vd:
+            stage = str(vd.get("stage") or "")
+            ex = {"stage": stage, "opferart": vs.get("opferart"), "turm_mib": vd.get("turm_mib"), "verfuegbar_mib": vd.get("verfuegbar_mib"),
+                  "missing_mib": vd.get("missing_mib"), "host_mib": vs.get("host_mib"), "etikett": "planner calculation"}
+            if stage == "nein":
+                v_list.append(budget_verdict("W105b", level="fit", text=str(vd["text"]), reason=str(vd["text"]), force_state=HINT, extra=ex))
+            else:
+                v_list.append(budget_verdict("VISION-VICTIM", level="fit", text=str(vd["text"]), reason=str(vd["text"]),
+                                      force_state=GOES if stage == "ja" else HINT, extra=ex))
         for b in proposal.get("blocker") or []:
             v_list.append(budget_verdict("PLANER", level="planer", text=str(b), reason=str(b), force_state=BLOCKED))
         wrong = {k: int(c) for k, c in (proposal.get("vectors_wrong") or {}).items()}

@@ -219,6 +219,22 @@ CURATED: Dict[str, Dict[str, object]] = {
         "text": "'off' (default) starts both groups without a vision tower; 'resident' keeps it loaded.",
         "gain": 'off saves VRAM and host ring per prefill card.', "cost": 'Without the tower there is no image input. off changes the form key of the P group (the first start recomputes its ring).',
         "depends": []},
+    "--pdflip-vision-place": {
+        "kind": "flag", "group": 'Memory', "level": "expert", "planner_derived": False,
+        # VISION-WEIGHTS AP4 (09.10.): text from the argparse help= (launcher.py --pdflip-vision-place) and pdflip/vision_victim.py (module head); the
+        # edges (needs --pdflip-vision transient, excludes VISION_ASYNC=1, kvtail/auto excluded with --dual-layout) stand in the edge catalog K132-K134.
+        "text": "Where the TRANSIENT vision tower sits on PP0's card (only with --pdflip-vision transient). 'auto' (default): the KV tail when it is wholly free (the phase start), else the card's free VRAM, else a named refusal. 'kvtail': the 27B stage exactly. 'free': always the card's free VRAM. 'weights': the tower's parameters are views on victim WEIGHT memory of PP0 (27B flip: MLP storages; dual: only the hull parts that are not D's shard; NF: resident expert rows); the victim bytes go to a host image (27B; freed after every image) and come back with a device checksum before the admission -- a mismatch stops the group (W110c). No KV page, no free VRAM, always synchronous.",
+        "gain": "'weights': the tower takes no KV page and no free VRAM; the planner shows it as the check item 'Vision transient' inside the weights.",
+        "cost": "'weights': on the 27B a host image of the tower bytes per image request (freed after the give-back; NF: none); a checksum mismatch stops the group (W110c); not yet a profile default.",
+        "satz_quelle": "launcher.py --pdflip-vision-place (help=) and pdflip/vision_victim.py (module head)",
+        "depends": []},
+    "FLLIPER_PDFLIP_VISION_ASYNC": {
+        "kind": "env", "group": 'Memory', "level": "expert", "planner_derived": False,
+        # VISION-WEIGHTS AP4 (09.10.): text from vision_rank_runner.vision_async_on (docstring) and launcher.VISION_SYNC_LAW; the edge to
+        # --pdflip-vision-place weights stands in the edge catalog (K133).
+        "text": "The asynchronous vision stage: the tower's read + encode run on a worker thread and their own CUDA stream while the scheduler keeps passing; 0 = the synchronous stage. The code default is ON on the 27B line (vision_rank_runner.vision_async_on) and OFF on the NF line. VISION-SYNC LAW (user 02.10., both lines): vision runs ONLY synchronously, before the real prefill; the launcher therefore refuses an explicit ON (this switch and FLLIPER_PDFLIP_P_ROW_VISION_ASYNC) by name, and --pdflip-vision-place weights is always synchronous.",
+        "gain": "", "cost": "Switched on it is refused at launch (VISION-SYNC LAW).",
+        "satz_quelle": "vision_rank_runner.py vision_async_on (docstring) and launcher.py VISION_SYNC_LAW / vision_async_refusal", "depends": []},
     "--flip-weights": {
         "kind": "flag", "group": 'Memory', "level": "expert", "planner_derived": False,
         "text": "'family' (default) moves the weights on the P/D change; 'resident' keeps both groups in VRAM and only changes the KV cache.",

@@ -417,6 +417,45 @@ class _Rec:
             self.unverified.append("%s: %s" % (label, source))
 
 
+def _vision_victim_section(la: Any, form: str, fp: Any, model: Mapping[str, Any], is_moe: bool, cut: Sequence[int],
+                           frp: Optional[Sequence[float]], dual: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+    """VISION-WEIGHTS AP4: the ``vision`` section of the proposal (``vision_victim_plan.section``).  The place is read from the profile
+    (``--pdflip-vision-place``), not decided: the default profiles carry ``auto`` and get ``{"aktiv": false}`` (no new item)."""
+    from flliper.srt.pdflip import vision_victim_plan as VV
+
+    vision = la.get_flag(VV.VISION_FLAG) or la.extra_get("p", VV.VISION_FLAG)
+    place = la.get_flag(VV.PLACE_FLAG) or la.extra_get("p", VV.PLACE_FLAG)
+    if not VV.active(vision, place):
+        return VV.section(form=form, vision=vision, place=place, is_moe=is_moe, dual=(form == "dual"), tower_bytes=None, tower_src="",
+                          available_mib=None, available_src="")
+    stage0 = int(cut[0]) if cut else None
+    tower = float(fp.visual_mib) * R.MIB if fp.visual_mib else None
+    tower_src = "model profile weights.visual_bytes (safetensors index)"
+    if tower is None:
+        tower, tower_src = float(VV.TOWER_BYTES_27B), "reference of the 27B tower (AP2, 921460192 B); the model profile carries no visual_bytes: unverified for this model"
+    kind = VV.victim_kind(is_moe=is_moe, dual=(form == "dual"))
+    if kind == VV.KIND_PP_ONLY:
+        k0 = ((dual or {}).get("karten") or [{}])[0]
+        avail = k0.get("p_privat_mib")
+        asrc = ("Dual plan of the planner (dual_layout_plan pp_only of the stage 0 card = the hull parts that are not D's shard)" if avail is not None
+                else "no Dual plan of stage 0")
+    elif kind == VV.KIND_EXPERTS:
+        fr_flag = la.get_flag("--pp-cut-expert-device-fraction") or la.extra_get("p", "--pp-cut-expert-device-fraction")
+        fr0 = None
+        if fr_flag:
+            try:
+                fr0 = float(str(fr_flag).split(",")[0])
+            except ValueError:
+                fr0 = None
+        if fr0 is None and frp:
+            fr0 = float(frp[0])
+        avail, asrc = VV.available_experts_mib(list(fp.layer_expert_mib), stage0, fr0)
+    else:
+        avail, asrc = VV.available_dense_mib(model, stage0)
+    return VV.section(form=form, vision=vision, place=place, is_moe=is_moe, dual=(form == "dual"), tower_bytes=tower, tower_src=tower_src,
+                      available_mib=avail, available_src=asrc)
+
+
 def propose(hardware: Any, model: Mapping[str, Any], form: str = "flip", goals: Optional[Mapping[str, Any]] = None, *,
             basis: Any = None, draft: Optional[Mapping[str, Any]] = None, rates: Optional[Mapping[str, float]] = None,
             library: Any = None) -> Dict[str, Any]:
@@ -930,6 +969,13 @@ def propose(hardware: Any, model: Mapping[str, Any], form: str = "flip", goals: 
                              kv_tokens=kv_tokens, kv_dtype=kv_dtype, rate=rate, rate_src=rate_src, layers=layers, attn=attn, posts=sb["posts"], d_slots=asm.d_mamba_slots,
                              carried=carried, inv_txt=inv_txt, get=_get, set_=_set, slot_label=slot_label)
 
+    # --- VISION-WEIGHTS AP4: the transient tower on displaced weights (only with --pdflip-vision-place weights) -----------------------
+    vision_sec = _vision_victim_section(la, form, fp, model, is_moe, effective_cut(), frp, dual)
+    if vision_sec.get("aktiv") and vision_sec.get("verdict", {}).get("stage") == "nein":
+        rec.notes.append(vision_sec["verdict"]["text"])
+    if vision_sec.get("aktiv") and vision_sec.get("verdict", {}).get("stage") == "ungeprueft":
+        rec.unverified.append("Vision on displaced weights: " + vision_sec["verdict"]["text"])
+
     # --- the checks and the result -------------------------------------------------------------------------------------------
     lens = vector_lengths(la.t, la.env)
     bad = {k: v for k, v in lens.items() if v != n}
@@ -946,7 +992,7 @@ def propose(hardware: Any, model: Mapping[str, Any], form: str = "flip", goals: 
                   "fr_p": frp, "draft": dp, "form_a": fa, "dense_d_shares": results.get("dense_d_shares")},
         "fit": {"level": fv.level, "first": fv.first, "margin_mib": fv.margin_mib, "lines": list(fv.lines),
                 "marks": sorted(set(fv.marks + verdict.marks))},
-        "goals": {"seats": seats, "kv_tokens": kv_tokens, "kv_dtype": kv_dtype, "p_cut": pin_mode}, "dual": dual,
+        "goals": {"seats": seats, "kv_tokens": kv_tokens, "kv_dtype": kv_dtype, "p_cut": pin_mode}, "dual": dual, "vision": vision_sec,
         "unverified": rec.unverified, "notes": rec.notes, "blocker": rec.blocker,
         "vector_lengths": lens, "vectors_ok": not bad, "vectors_wrong": bad,
     }

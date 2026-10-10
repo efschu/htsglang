@@ -1485,7 +1485,7 @@ class ProfilEditor:
             if row is not None:
                 row["proposal"] = {k: wv[k] for k in ("state", "source", "reason", "verdikte", "kanten", "changed")}
         keep = ("schema", "form", "n", "cards", "inventory", "seeds", "fit", "goals", "unverified", "notes", "blocker", "vector_lengths", "vectors_ok", "vectors_wrong", "basis",
-                "dual", "single_card")
+                "dual", "single_card", "vision")     # "vision": VISION-WEIGHTS AP4 -- data only (flliper.vision-victim/1; {"aktiv": false} unless --pdflip-vision-place weights)
         vd = res["verdict"]
         return {"ok": True, "schema": self.PROPOSE_SCHEMA, "form": form, "n": v["n"],
                 "basis": {"kind": kind, "name": name, "sha256": bsha, "profil": vd.get("profil")},

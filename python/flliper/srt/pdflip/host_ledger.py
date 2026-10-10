@@ -2947,6 +2947,9 @@ def charge_terms(
     # hand-off (charged) and the shmem no class names (printed, ungebucht).
     census: Optional[Dict[str, object]] = None,
     memhist_run_only: bool = False,
+    # VISION-WEIGHTS AP4: host image of the displaced weights (--pdflip-vision-place weights), TRANSIENT: charged at the RUN moment only, 0 at launch
+    # and between images; 0.0 changes no number of any existing arm; a warning term (W20/W87 warn only, host-RAM rule 06.10.). Last parameter.
+    vision_victim_host_gib: float = 0.0,
 ) -> Dict[str, object]:
     """Everything the BOOT ITSELF adds to ``memory.current``, per term.
 
@@ -2976,6 +2979,7 @@ def charge_terms(
         flip_ratchet_gib, arena_gib, staging_gb, _m_real, hicache_disabled,
         d_draft_host_gib, d_only, memhist_gib, l3_index_gib, cold_tier_shm_gib,
         census, memhist_run_only)
+    _terms["vision_victim_host_gib"] = max(0.0, float(vision_victim_host_gib))      # VISION-WEIGHTS AP4 (key always present, 0.0 = off)
     _terms.update(census_shm_posts(_terms, census))
     return _terms
 
@@ -3237,6 +3241,8 @@ def _run_moment_charges_gib(terms: Dict[str, object]) -> float:
     """
     return (
         _boot_charges_gib(terms) + _flip_ratchet_charge_gib(terms)
+        # VISION-WEIGHTS AP4: the displaced weights wait in host RAM while an image is encoded -- a RUN-moment term (0 at launch and between images)
+        + float(terms.get("vision_victim_host_gib", 0.0) or 0.0)
         # rc12d: the lean history arms after the first sleep -- run moment only
         + (float(terms.get("memhist_gib", 0.0) or 0.0) if terms.get("memhist_run_only") else 0.0)
     )
@@ -4789,6 +4795,9 @@ def price(
     d_only: bool = False,
     reference_model_ok: Optional[bool] = None,
     reference_model_why: str = "",
+    # VISION-WEIGHTS AP4: host image of the displaced weights (--pdflip-vision-place weights), TRANSIENT: charged at the RUN moment only, 0 at launch
+    # and between images; 0.0 changes no number of any existing arm; a warning term (W20/W87 warn only, host-RAM rule 06.10.). Last parameter.
+    vision_victim_host_gib: float = 0.0,
 ) -> Arm:
     """Price one arm at both moments.  Pure.
 
@@ -4950,6 +4959,7 @@ def price(
                            hicache_disabled=hicache_disabled,
                            arena_gib=arena_gib, staging_gb=staging_gb, anchor_mib=anchor_mib,
                            d_draft_host_gib=d_draft_host_gib, d_only=d_only,
+                           vision_victim_host_gib=vision_victim_host_gib,
                            memhist_gib=memhist_gib, memhist_run_only=memhist_run_only,
                            l3_index_gib=l3_index_gib,
                            cold_tier_shm_gib=cold_tier_shm_gib,
@@ -5092,6 +5102,7 @@ def price(
         "rings_gib": rings_gib,
         "arena_gib": float(charges.get("arena_gib", 0.0) or 0.0),  # #1432: in the Arm's own terms, so the run peak carries it
         "d_draft_host_gib": float(charges.get("d_draft_host_gib", 0.0) or 0.0),  # H25
+        "vision_victim_host_gib": float(charges.get("vision_victim_host_gib", 0.0) or 0.0),  # VISION-WEIGHTS AP4
         "memhist_gib": float(charges.get("memhist_gib", 0.0) or 0.0),  # rc12d
         "l3_index_gib": float(charges.get("l3_index_gib", 0.0) or 0.0),  # 28.09.
         "cold_tier_shm_gib": float(charges.get("cold_tier_shm_gib", 0.0) or 0.0),  # 29.09.
@@ -6272,6 +6283,7 @@ def arm_terms_line(arm) -> str:
     return (
         f"anchors={_g('anchors_gib')} rings={_g('rings_gib')} arena={_g('arena_gib')} "
         f"d_draft_host={_g('d_draft_host_gib')} "
+        + (f"vision_victim_host={_g('vision_victim_host_gib')}(run) " if float(t.get('vision_victim_host_gib') or 0.0) else "")
         + (f"memhist={_g('memhist_gib')}{'(run)' if t.get('memhist_run_only') else ''} "
            if float(t.get('memhist_gib') or 0.0) else "")
         + (f"l3_index={_g('l3_index_gib')} " if float(t.get('l3_index_gib') or 0.0) else "")
@@ -6382,6 +6394,9 @@ def choose(
     # hand-off (charged) and the shmem no class names (printed, ungebucht).
     census: Optional[Dict[str, object]] = None,
     memhist_run_only: bool = False,
+    # VISION-WEIGHTS AP4: host image of the displaced weights (--pdflip-vision-place weights), TRANSIENT: charged at the RUN moment only, 0 at launch
+    # and between images; 0.0 changes no number of any existing arm; a warning term (W20/W87 warn only, host-RAM rule 06.10.). Last parameter.
+    vision_victim_host_gib: float = 0.0,
 ) -> Tuple[Arm, Optional[float], List[str]]:
     """Walk the ladder; return (arm, reap headroom GiB, printed lines) or W20/W21.
 
@@ -6441,6 +6456,7 @@ def choose(
             hicache_disabled=hicache_disabled,
             arena_gib=arena_gib, staging_gb=staging_gb, anchor_mib=anchor_mib,
             d_draft_host_gib=d_draft_host_gib,
+            vision_victim_host_gib=vision_victim_host_gib,
             d_only=d_only,
             reference_model_ok=reference_model_ok,
             reference_model_why=reference_model_why,
@@ -7057,6 +7073,7 @@ def choose(
                         flip_ratchet=flip_ratchet,
                         arena_gib=arena_gib, staging_gb=staging_gb, anchor_mib=anchor_mib,
                         d_draft_host_gib=d_draft_host_gib,
+                        vision_victim_host_gib=vision_victim_host_gib,
                         d_only=d_only,
                         reference_model_ok=reference_model_ok,
                         reference_model_why=reference_model_why,

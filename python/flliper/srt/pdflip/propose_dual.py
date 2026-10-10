@@ -281,6 +281,10 @@ def apply_dual(*, la: Any, la0: Any, rec: Any, cards: Sequence[Mapping[str, Any]
     annahmen.append("P-private weights = D shard difference from the layer sizes of the model profile (dual_layout_plan, D holds the embedding block whole); Mamba slot %.4f MiB (%s); KV cell %.0f B per layer and token (%s)" % (slot_mib, slot_src, cell_b, cell_src))
     if not vision_in_p:
         annahmen.append("Vision is transient (--pdflip-vision transient): no vision block in P")
+        if str(la0.get_flag("--pdflip-vision-place") or "") == "weights":
+            annahmen.append("Vision on displaced weights (--pdflip-vision-place weights): still no resident vision block in P; the tower sits on pp_only "
+                            "victim bytes of stage 0 while an image is encoded (check item 'Vision transient' and the host item in the section "
+                            "'vision' of the proposal)")
     anchored_tokens = boot_tokens == POOL_REF["boot_tokens"]
     if not anchored_tokens:
         annahmen.append("Boot KV per P stage %d tokens (goal dual_p_boot_tokens), not the measured value of the reference boot" % boot_tokens)
