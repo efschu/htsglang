@@ -625,11 +625,14 @@ class VisionStageBackendRefused(VisionStageLoadRefused):
 TRITON_VISION_ATTN_SMEM_BYTES = 131072
 
 #: The backend chosen when the Triton kernel does not fit.  ``sdpa`` has no
-#: opt-in shared-memory demand at all: it builds a boolean mask ``[1, s, s]``
-#: (``VisionSdpaAttention._generate_mask_cache``, ``layers/attention/vision.py:209``)
-#: and hands the rest to torch.  At the design's named geometry -- 1024x1024,
-#: 4096 patch rows -- that mask is 4096^2 bytes = 16 MiB, which is small beside
-#: the 79 MiB of encoder activation the arming line already books.
+#: opt-in shared-memory demand at all.  A still image is ONE attention segment
+#: (cu_seqlens ``[0, s]``): sdpa then runs without a mask
+#: (``layers/attention/vision.py:_sdpa_single_segment``) and torch may take an
+#: O(s) kernel.  Only an item of more than one segment (a clip, t>1, or several
+#: grid rows) builds the block mask ``[1, s, s]``
+#: (``VisionSdpaAttention._generate_mask_cache``, a bool on the host plus its
+#: additive form on the device = 3 B per pair), which ``encode_work_for`` books
+#: as its ``quad`` term.
 VISION_BACKEND_FALLBACK = "sdpa"
 
 #: Backends that carry the Triton kernel's demand.  Named as a set rather than

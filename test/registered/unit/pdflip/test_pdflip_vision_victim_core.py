@@ -263,7 +263,8 @@ def test_a_host_image_that_cannot_be_written_is_W105b_before_any_byte_moved(tmp_
 
 def test_the_encode_work_memory_comes_from_the_real_image_and_is_refused_by_name(tmp_path):
     """No own area cap (user 09.10.): the work memory is computed from the
-    item's patches -- quadratic under sdpa -- and an encode the card's air
+    item's patches -- quadratic under sdpa for an item of more than one
+    segment (test_pdflip_vision_encoder_nomask_1009) -- and an encode the card's air
     cannot hold is W105b with the numbers, before any victim byte moved."""
     kw = dict(hidden=1152, intermediate=4304, heads=16, out_hidden=5120, merge=2, deepstack=3,
               in_dim=1536, quadratic=True)

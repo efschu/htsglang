@@ -174,6 +174,23 @@ def resolve_max_seqlen(source, cu_seqlens: torch.Tensor) -> int:
     return int(seq_lens.max().item())
 
 
+def _sdpa_single_segment(
+    *, cu_seqlens: Optional[torch.Tensor], s: int, bsz: int
+) -> bool:
+    """True when ``cu_seqlens`` is ONE segment ``[0, s]`` of one sequence.
+
+    ``VisionSdpaAttention._generate_mask_cache`` then returns an all-True mask
+    in both branches (flatten: the single block ``[0:s, 0:s]``; batched:
+    ``row < s & col < s`` for the one length ``s``) -- the same attention as
+    no mask, without the s*s bool on the host and its additive form on the
+    device. A still image (grid t=1) of the Qwen-VL towers is exactly this.
+    """
+    if cu_seqlens is None or bsz != 1 or cu_seqlens.numel() != 2:
+        return False
+    first, last = cu_seqlens.reshape(-1).tolist()
+    return first == 0 and last == s
+
+
 class VisionSdpaAttention(nn.Module):
     r"""
     Scaled Dot Product Attention inner product
@@ -284,8 +301,12 @@ class VisionSdpaAttention(nn.Module):
 
         s = q.shape[0] // bsz
 
-        # [b, 1, s, s]
-        if attention_mask is None:
+        # [b, 1, s, s]; one segment over all of s would be an all-True mask:
+        # none instead, so torch may take an O(s) kernel and no s*s is built
+        if attention_mask is None and (
+            self.softmax_in_single_precision
+            or not _sdpa_single_segment(cu_seqlens=cu_seqlens, s=s, bsz=bsz)
+        ):
             attention_mask = self.generate_patch_attention_mask(
                 s, cu_seqlens, flatten_batch=self.flatten_batch
             )
