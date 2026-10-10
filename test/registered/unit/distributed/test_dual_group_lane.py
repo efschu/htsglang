@@ -670,6 +670,20 @@ class TestLanePartsSwitchTheCudaContext(unittest.TestCase):
         self.assertEqual([e[0] for e in log], ["home", "foreign"])
         self.assertEqual(rec.active, rec.ambient)
 
+    def test_vocab_embedding_shell_exposes_the_global_vocab_size(self):
+        """Bug 09.10. (dual P, first image request): ``embed_mm_inputs`` reads
+        ``input_embedding.num_embeddings`` to clamp the multimodal placeholder
+        ids; the shell had no such attribute, so the request died with an
+        AttributeError AFTER the vision stage had succeeded and took the P group
+        down (W17). The parts are vocab-sharded but each carries the GLOBAL
+        count, so the shell answers with part 0's."""
+        rec, log = _ContextRecorder(torch.device("cpu")), []
+        parts = self._parts(rec, log)
+        for p in parts:
+            p.num_embeddings = 248320
+        shell = dgl.LaneVocabEmbeddingShell(parts)
+        self.assertEqual(shell.num_embeddings, 248320)
+
     def test_unguarded_shell_would_fail_the_way_triton_does(self):
         """The falsifier: without the guard the foreign part raises.
 

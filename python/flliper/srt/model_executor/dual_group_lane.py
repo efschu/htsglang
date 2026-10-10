@@ -475,6 +475,18 @@ class LaneVocabEmbeddingShell(nn.Module):
         companion tower's when a target holds both (contract 5)."""
         return getattr(self._lane_parts[0], "embedding_dim", None)
 
+    @property
+    def num_embeddings(self):
+        """Full vocabulary size. The parts are VOCAB-sharded but every part
+        carries the GLOBAL count (``VocabParallelEmbedding.num_embeddings`` is
+        the unsharded vocabulary, the shard bounds are in ``shard_indices``),
+        so part 0 answers for the shell. ``embed_mm_inputs`` clamps the
+        multimodal placeholder ids to ``num_embeddings - 1`` before the lookup;
+        without this the first image request on a dual P lane died with an
+        AttributeError after the vision stage had succeeded (metal 09.10.,
+        boot ...dualvwweights...095510)."""
+        return self._lane_parts[0].num_embeddings
+
     def forward(self, input_):
         from flliper.srt.layers.vocab_parallel_embedding import (
             get_masked_input_and_mask,
