@@ -790,7 +790,10 @@ PLACE_ENV = "FLLIPER_PDFLIP_VISION_PLACE"
 PLACE_AUTO = "auto"
 PLACE_KVTAIL = "kvtail"
 PLACE_FREE = "free"
-PLACES = (PLACE_AUTO, PLACE_KVTAIL, PLACE_FREE)
+#: VISION-WEIGHTS (AP1, 09.10.): the tower borrows victim WEIGHT memory of the
+#: rank (``pdflip.vision_victim``); default off until the metal proof
+PLACE_WEIGHTS = "weights"
+PLACES = (PLACE_AUTO, PLACE_KVTAIL, PLACE_FREE, PLACE_WEIGHTS)
 #: air kept on the card beyond the tower for the encoder's activations (one
 #: image at a time: a 1024x1024 image is 4096 patches x 1152 wide, tens of
 #: MiB per activation) and the allocator's rounding.
