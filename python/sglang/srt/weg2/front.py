@@ -3743,6 +3743,24 @@ class Seat:
         )
 
 
+def _w17_mem_suffix(mem: Optional[str] = None) -> str:
+    """Instrument for the W17 verdict line (int24e): `` mem: <host_mem_line()>``.
+
+    Same suffix format as the WEG2-HEALTH line (`` mem: psi_mem_some_avg10=.. swap_used_mib=..``),
+    so one grep reads both. ``mem`` is the reading the poll already took (a second
+    ``host_mem_line()`` call would span ~0 s and show a zero delta); None = measure now
+    (the old poller). Log text only, never changes a verdict: any failure of the
+    measurement returns ``""`` -- an instrument must never prevent the STOP."""
+    try:
+        if mem is None:
+            from sglang.srt.weg2 import front_health as _fh
+
+            mem = _fh.host_mem_line()
+        return f" mem: {mem}" if mem else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _sid_alive(sid: int) -> bool:
     if not sid:
         return True
@@ -16480,7 +16498,10 @@ class Front:
             *(self._probe_group_health(g, _fh.PROBE_TIMEOUT_S) for g in groups)
         )
         # D-HEALTH (I): host memory-stall facts, read every poll, printed beside a failure.
-        _mem = _fh.host_mem_line()
+        try:
+            _mem = _fh.host_mem_line()
+        except Exception:  # noqa: BLE001 -- an instrument never stops the poll (int24e)
+            _mem = ""
         from sglang.srt.weg2 import progress_beacon as _fp
 
         _fp_dir = _fp.beacon_dir(getattr(self, "tag", "") or "") if _fp.enabled() else ""
@@ -16529,10 +16550,11 @@ class Front:
                         "W17 Weg2GroupDead",
                         f"group {g.name}: a rank is held at its wall (#1223 DEBUG-HOLD pid={hold.pid}: "
                         f"{hold.exception}; dump {hold.path}) -- a held rank serves no request, "
-                        f"http_ok={ok} process_alive={alive} say nothing about it",
+                        f"http_ok={ok} process_alive={alive} say nothing about it"
+                        + _w17_mem_suffix(_mem),
                     )
                 else:
-                    self.do_stop("W17 Weg2GroupDead", f"group {g.name}: /health failed {n}x and process_alive={alive} (a 200 alone is a transport fact)")
+                    self.do_stop("W17 Weg2GroupDead", f"group {g.name}: /health failed {n}x and process_alive={alive} (a 200 alone is a transport fact)" + _w17_mem_suffix(_mem))
         # DASHBOARD-AUS-IPC (A12): a verdict change of any group as an event.
         for g in groups:
             self._ipc_group_health_observe(g)
@@ -16557,7 +16579,7 @@ class Front:
                     state=self.state, ok=ok, alive=alive,
                     streak=g.health_fail_streak,
                 ):
-                    self.do_stop("W17 Weg2GroupDead", f"group {g.name}: /health failed {g.health_fail_streak}x and process_alive={alive} (a 200 alone is a transport fact)")
+                    self.do_stop("W17 Weg2GroupDead", f"group {g.name}: /health failed {g.health_fail_streak}x and process_alive={alive} (a 200 alone is a transport fact)" + _w17_mem_suffix())
 
     def corridor_sample(self) -> Optional[str]:
         """One corridor sample: read, fold into ``min_so_far``, log, return the line.
