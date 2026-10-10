@@ -1784,6 +1784,12 @@ def checkpoint_arch(model: str) -> Tuple[Optional[str], str]:
     when it cannot be read (the profile's expectation then stands, and the
     source says so)."""
     path = os.path.join(str(model or ""), "config.json")
+    if str(model or "").endswith(".gguf"):
+        # NF-GGUF G5: a GGUF launch names the .gguf FILE; its config is the sibling config.json
+        # (the server's own rule, server_args.declared_config_path_for). A directory is unchanged.
+        from sglang.srt.server_args import declared_config_path_for
+
+        path = declared_config_path_for(str(model)) or path
     try:
         with open(path) as f:
             cfg = json.load(f)

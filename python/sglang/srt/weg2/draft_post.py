@@ -88,12 +88,39 @@ class DraftPost(msgspec.Struct, frozen=True):
         )
 
 
+#: HF tensor-name fragment -> the GGUF tensor-name prefixes it stands for (llama.cpp ``constants.py``:
+#: ``token_embd`` / ``output``)
+_GGUF_NAME_OF = {"lm_head": ("output.",), "embed_tokens": ("token_embd.",)}
+
+
+def _gguf_tensor_mib(path: str, exclude: Sequence[str]) -> Optional[float]:
+    """MiB of the tensors of a GGUF file (set) outside ``exclude``, header only; None when the header
+    cannot be read (absent, never 0)."""
+    from sglang.srt.weg2 import model_profile as _mp
+
+    try:
+        td, _kv, _files = _mp.scan_gguf_set(path)
+    except _mp.ModelProfileError:
+        return None
+    skip = tuple(p for x in exclude for p in _GGUF_NAME_OF.get(x, (x,)))
+    total = sum(int(t.nbytes) for t in td.tensors if not (skip and t.name.startswith(skip)))
+    return total / MIB
+
+
 def checkpoint_tensor_mib(path: str, *, exclude: Sequence[str] = ()) -> Optional[float]:
     """MiB of every tensor in ``path``'s ``*.safetensors`` whose name contains
     none of ``exclude``, read from the HEADERS (no tensor byte is read).
 
     ``None`` when the directory holds no safetensors file -- absent, never 0.
+
+    NF-GGUF G5: a ``.gguf`` FILE is priced from its HEADER the same way (every tensor's byte size, the
+    split set of a ``-0000N-of-0000M`` name included); ``exclude`` names are the HF spellings
+    (``lm_head``, ``embed_tokens``) and are matched against the GGUF names they stand for
+    (``output.``, ``token_embd.``). The unsloth ``shared`` MTP file carries neither tensor (it shares
+    the target's: ``nextn_shared_target_tensors``), so the exclusion costs it nothing there.
     """
+    if str(path).endswith(".gguf") and os.path.isfile(str(path)):
+        return _gguf_tensor_mib(str(path), exclude)
     files = sorted(glob.glob(os.path.join(str(path), "*.safetensors")))
     if not files:
         return None
@@ -236,11 +263,17 @@ def raise_for_draft_post(*, fracs: Sequence[float], stage_layers: Sequence[int],
         return fr, None, (f"draft checkpoint {draft_path!r} holds no *.safetensors -- "
                           "the draft post cannot be priced, fractions unchanged")
     freed = weights + transient
-    rows, new = expert_rows_for(freed, int(stage_layers[stage]), row_mib,
+    # NF-GGUF G5: with a per-layer row vector (mixed-quant GGUF) the last stage pays the rows of
+    # ITS slice of layers; the mean of that slice keeps "layers x row" exact. A scalar row is
+    # returned unchanged by stage_mean (float(row_mib)), so every other checkpoint is as before.
+    from sglang.srt.planner import expert_layer_rows as _elr
+
+    row_stage = _elr.stage_mean(row_mib, stage_layers, stage)
+    rows, new = expert_rows_for(freed, int(stage_layers[stage]), row_stage,
                                 num_experts, fr[stage])
     post = DraftPost(stage=stage, card=stage_card_label(cards, stage),
                      freed_mib=freed, weights_mib=weights, transient_mib=transient,
-                     layers=int(stage_layers[stage]), row_mib=float(row_mib),
+                     layers=int(stage_layers[stage]), row_mib=float(row_stage),
                      rows=rows, frac_before=fr[stage], frac_after=new)
     out = list(fr)
     out[stage] = new

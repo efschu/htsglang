@@ -824,8 +824,8 @@ def snapshot_checkpoint(model_dir: str, out_dir: str, *, name: Optional[str] = N
 
     src = os.path.abspath(model_dir)
     name = name or os.path.basename(src.rstrip("/"))
-    if not os.path.isfile(os.path.join(src, "config.json")):
-        raise FileNotFoundError("%s has no config.json: nothing to snapshot (an empty mount point?)" % src)
+    if not os.path.isfile(os.path.join(src, "config.json")) and not _has_gguf(src):
+        raise FileNotFoundError("%s has no config.json and no .gguf: nothing to snapshot (an empty mount point?)" % src)
     files_dir = os.path.join(out_dir, "files")
     shutil.rmtree(out_dir, ignore_errors=True)
     os.makedirs(files_dir)
@@ -837,7 +837,15 @@ def snapshot_checkpoint(model_dir: str, out_dir: str, *, name: Optional[str] = N
             skipped_dirs.append(fn)
             continue
         size = os.path.getsize(path)
-        if fn.endswith(".safetensors"):
+        if fn.endswith(".gguf"):
+            # NF-GGUF G5: a GGUF part is its HEADER (KV block + tensor directory, up to the data region): the launcher
+            # reads tensor names/types/shapes/byte sizes from it (``host_ledger.gguf_header_facts``, ``model_profile.scan_gguf``)
+            # and file sizes from ``stat``, never the data region
+            hdr = _gguf_header_bytes(path)
+            gz = _store_blob(os.path.join(files_dir, fn + ".hdr"), hdr)
+            entries.append({"name": fn, "size": size, "kind": "header", "sha256_header": hashlib.sha256(hdr).hexdigest(),
+                            **({"gz": True} if gz else {})})
+        elif fn.endswith(".safetensors"):
             with open(path, "rb") as fh:
                 raw = fh.read(8)
                 (n,) = struct.unpack("<Q", raw)
@@ -858,6 +866,23 @@ def snapshot_checkpoint(model_dir: str, out_dir: str, *, name: Optional[str] = N
                    "files": entries}, fh, indent=1, sort_keys=True)
         fh.write("\n")
     return out_dir
+
+
+def _has_gguf(directory: str) -> bool:
+    try:
+        return any(fn.endswith(".gguf") for fn in os.listdir(directory))
+    except OSError:
+        return False
+
+
+def _gguf_header_bytes(path: str) -> bytes:
+    """The bytes of a GGUF file before its tensor-data region (``GGUFReader.data_offset``: magic, KV block, tensor
+    directory, alignment padding). A part without tensors (the split set's metadata part) is the whole file."""
+    import gguf
+
+    off = int(gguf.GGUFReader(path, "r").data_offset)
+    with open(path, "rb") as fh:
+        return fh.read(off)
 
 
 def read_snapshot_manifest(snapshot_dir: str) -> Dict[str, Any]:
@@ -905,7 +930,7 @@ def ensure_model_dir(path: str, *, siblings: Sequence[str] = (), farm_root: str 
     ``snapshot`` (a :func:`snapshot_checkpoint` directory of THIS checkpoint, i.e. of the very directory ``path`` names):
     when ``path`` is empty on this box the stub rebuilt from it is used under ``farm_root/<name>`` BEFORE any sibling --
     it is the checkpoint's own headers, a sibling is another checkpoint's."""
-    if os.path.isfile(os.path.join(path, "config.json")):
+    if os.path.isfile(os.path.join(path, "config.json")) or _has_gguf(path):
         return path
     if snapshot and os.path.isfile(os.path.join(snapshot, "manifest.json")):
         if read_snapshot_manifest(snapshot)["name"] != os.path.basename(path.rstrip("/")):
@@ -964,8 +989,28 @@ def run_profile(env_path: str, devices: Sequence[Mapping[str, Any]], *, tree: st
 
     def farm(p: str, what: str) -> str:
         nonlocal farmed
+        _snap_here = bool((snapshots or {}).get(os.path.basename(os.path.dirname(p.rstrip("/")))))
+        if p.endswith(".gguf") and (not os.path.isfile(p) or _snap_here):
+            # NF-GGUF G5: a GGUF FILE names its directory's snapshot (the registry name of a GGUF checkpoint is the
+            # name of the directory that holds the part and its sibling config.json); the stub is rebuilt under the
+            # same directory name and the file keeps its own name inside it
+            parent = os.path.dirname(p)
+            q = farm_dir(parent, what, force_snapshot=_snap_here)
+            return os.path.join(q, os.path.basename(p)) if q != parent else p
+        return farm_dir(p, what)
+
+    def farm_dir(p: str, what: str, force_snapshot: bool = False) -> str:
+        nonlocal farmed
         try:
             bn = os.path.basename(p.rstrip("/"))
+            if force_snapshot:
+                # a snapshot of this GGUF directory was handed in: the stub stands in even where the real files exist,
+                # so the dump does not depend on the box (the stub's mtime is a constant, the real file's is not)
+                snap = (snapshots or {}).get(bn, "")
+                q = materialize_checkpoint(snap, farm_root)
+                farmed = True
+                notes.append("%s: %s -> header snapshot stub %s" % (what, p, q))
+                return q
             q = ensure_model_dir(p, siblings=siblings.get(bn, ()), farm_root=farm_root,
                                  snapshot=(snapshots or {}).get(bn, ""))
         except FileNotFoundError as e:
@@ -988,6 +1033,13 @@ def run_profile(env_path: str, devices: Sequence[Mapping[str, Any]], *, tree: st
         nm = farm(argv[i + 1], "model")
         if nm != argv[i + 1]:
             argv[i + 1] = nm
+    if "--tokenizer-path" in argv:
+        # NF-GGUF G5: the tokenizer directory of a GGUF profile is the sibling directory the model file sits in; it is
+        # stood in for by the same snapshot (the launcher's W163 reads its sibling tokenizer files)
+        i = len(argv) - 1 - argv[::-1].index("--tokenizer-path")
+        nt = farm(argv[i + 1], "tokenizer")
+        if nt != argv[i + 1]:
+            argv[i + 1] = nt
     flags = _flags(argv)
     if "--dflash-draft-path" not in flags and li.draft and flags.get("--spec-form", "").upper() == "DFLASH":
         pre += ["--dflash-draft-path", farm(li.draft, "draft")]

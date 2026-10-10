@@ -77,6 +77,18 @@ class GgufTensorCensus:
             out[hf] = out.get(hf, 0) + int(nbytes)
         return out
 
+    def expert_count(self) -> int:
+        """NF-GGUF G5: the routed experts per layer, read off the STACKED expert tensors
+        (``ffn_*_exps`` carry them as the last ggml dim: ``(in, out, E)``). The safetensors
+        checkpoint names each expert (``mlp.experts.<E>.``) and the planner counts the ids; a GGUF
+        stacks them, so without this the planner saw a MoE layer with 0 experts. 0 for a model
+        with no stacked expert tensor (a dense model)."""
+        best = 0
+        for hf, _g, _t, shape, _n in self.rows:
+            if ".mlp.experts." in hf and len(shape) == 3:
+                best = max(best, int(shape[-1]))
+        return best
+
     @property
     def total_bytes(self) -> int:
         return sum(int(r[4]) for r in self.rows)
@@ -98,18 +110,56 @@ def is_gguf_checkpoint(model_path: str) -> bool:
 
 
 def _sibling_text_config(gguf_file: str) -> dict:
+    """The text config the family name map is built from: the sibling ``config.json`` when the
+    server's own rule finds one, else (NF-GGUF G5) the geometry the GGUF HEADER carries.
+
+    The unsloth Qwen3.8-Flash-Next export is a directory of ``.gguf`` parts and no ``config.json``;
+    the census (and with it the P cut) used to stop there although the header states the depth, the
+    expert count and every tensor. With no sibling config the census reads
+    ``model_profile.config_from_gguf`` -- the same reader the planner's model profile uses -- and
+    names the registered family by its GGUF arch. A sibling config, when present, wins exactly as
+    before (the loader reads that one too, and the launcher's W173 holds it to the header)."""
     from sglang.srt.server_args import declared_config_path_for
 
     cfg_path = declared_config_path_for(gguf_file)
     if cfg_path is None:
-        raise GgufCensusUnavailable(
-            f"GGUF {gguf_file}: no sibling config.json (declared_config_path_for); "
-            f"the family name map needs the model's own config"
-        )
+        return _header_text_config(gguf_file)
     with open(cfg_path) as fh:
         cfg = json.load(fh)
     text = dict(cfg.get("text_config") or cfg)
     text.setdefault("model_type", cfg.get("model_type"))
+    return text
+
+
+def _header_text_config(gguf_file: str) -> dict:
+    """A text config out of the GGUF header alone (see :func:`_sibling_text_config`)."""
+    from sglang.srt.model_loader import gguf_registry
+    from sglang.srt.weg2 import model_profile as MP
+
+    try:
+        td, kv, _files = MP.scan_gguf_set(gguf_file)
+        cfg, _notes = MP.config_from_gguf(kv, td)
+    except MP.ModelProfileError as exc:
+        raise GgufCensusUnavailable(
+            f"GGUF {gguf_file}: no sibling config.json (declared_config_path_for) and the header "
+            f"carries no readable geometry ({exc}); the family name map needs the model's own config"
+        ) from exc
+    arch = str(kv.get("general.architecture") or "")
+    model_type = None
+    for _family, cls in gguf_registry._iter_adapter_classes():
+        for mt, a in cls.MODEL_TYPE_TO_ARCH.items():
+            if a == arch:
+                model_type = mt
+                break
+        if model_type is not None:
+            break
+    if model_type is None:
+        raise GgufCensusUnavailable(
+            f"GGUF {gguf_file}: no sibling config.json and arch {arch!r} has no bespoke GGUF family in "
+            f"gguf_registry; the family name map needs the model's own config"
+        )
+    text = dict(cfg.get("text_config") or cfg)
+    text["model_type"] = model_type
     return text
 
 

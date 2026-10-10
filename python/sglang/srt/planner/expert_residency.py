@@ -64,6 +64,7 @@ from typing import Callable, Dict, List, Mapping, NamedTuple, Optional, Sequence
 import msgspec
 
 from sglang.srt.name_compat import tolerant_compile
+from sglang.srt.planner import expert_layer_rows as _elr
 
 MIB = float(1 << 20)
 #: rc12e: rows of the persistent gather ring per expert tensor on every D rank
@@ -2062,6 +2063,10 @@ def solve_d_rank_residency(
             )
     spans = expert_span_by_rank(num_experts=num_experts, ratios=ratios)
     slot_mib = float(slot_bytes) / MIB
+    # NF-GGUF G5: n_layers x MEAN row is exactly the SUM over layers -- and a D rank holds ALL layers
+    # (``slot_bytes`` = the checkpoint's mean expert row over the same layers), so a mixed-quant
+    # GGUF needs no per-layer vector here (calc.py: D delta 0). Only a P stage, which holds a
+    # SLICE, does (expert_layer_rows.stage_total).
     layer_row_mib = float(n_layers) * slot_mib
     out: List[DRankResidency] = []
     for r in range(n):
@@ -2232,10 +2237,16 @@ def solve_stage_fraction_by_buffer_rule(
             f"Budgets / {len(scratch_rows)} Scratch / {len(res)} Reserven"
         )
     out: List[float] = []
-    for b, L, s, rsv in zip(budgets_mib, stage_layers, scratch_rows, res):
+    for idx, (b, L, s, rsv) in enumerate(zip(budgets_mib, stage_layers, scratch_rows, res)):
         L = max(1, int(L))
         frei = float(b) - float(rsv) - L * float(dense_layer_mib)
-        max_rows = int(math.floor(frei / (L * float(slot_mib)))) if slot_mib > 0 else 0
+        # NF-GGUF G5: ``slot_mib`` may be a per-layer vector (mixed-quant GGUF): the stage pays
+        # the rows of ITS slice. A plain float is the exact pre-G5 product L x slot.
+        if _elr.is_layer_vector(slot_mib):
+            layer_rows = _elr.stage_total(slot_mib, stage_layers, idx) if int(stage_layers[idx]) >= 1 else L * float(slot_mib)
+        else:
+            layer_rows = L * float(slot_mib)
+        max_rows = int(math.floor(frei / layer_rows)) if slot_mib > 0 else 0
         f = largest_fraction_for_rows(
             local_experts=int(num_experts), scratch_rows=int(s), max_rows=max_rows
         )
@@ -3493,11 +3504,17 @@ class SeatVramForm(msgspec.Struct, frozen=True, kw_only=True):
     #: the part of ``expert_row_bytes`` in tensors too small to unmap (the
     #: scales), GESCHAETZT as row - packed int4 weights; 0 = unknown
     small_row_bytes: int = 0
+    #: NF-GGUF G5: bytes of one expert row of EACH MoE layer (header), when the layers carry
+    #: unequal rows (a UD GGUF mixes quant types across layers); () = every layer is
+    #: ``expert_row_bytes`` (every INT4/AWQ/FP8 checkpoint: unchanged). ``expert_row_bytes`` stays
+    #: the mean so that moe_layers x row is the sum the D ranks (which hold all layers) pay.
+    row_bytes_by_layer: Tuple[int, ...] = ()
 
 
 def seat_vram_form(
     text_cfg: Mapping[str, object], *, ssm_dtype: Optional[str], rank_tp_ratio: str,
     n_ranks: int, expert_row_bytes: float, moe_layers: int,
+    expert_row_bytes_by_layer: Optional[Sequence[float]] = None,
 ) -> Optional[SeatVramForm]:
     """H95c: :class:`SeatVramForm` from the config, the D group's
     --mamba-ssm-dtype and --rank-tp-ratio (the GDN value heads split like the
@@ -3530,9 +3547,17 @@ def seat_vram_form(
         inter = hidden = 0
     packed = 3 * inter * hidden // 2  # w13 (2 x I x H) + w2 (I x H) at 4 bit
     small = row - packed if 0 < packed < row and (row - packed) * 10 < row else 0
+    # NF-GGUF G5: unequal rows per layer (header) -> the per-layer form. The "4 bit packed + scales"
+    # split above is an INT4 assumption; a GGUF row has no scale tensor (the quant blocks carry
+    # them), so small stays 0 there -- stated, not guessed.
+    by_layer: Tuple[int, ...] = ()
+    if expert_row_bytes_by_layer and _elr.nonuniform(expert_row_bytes_by_layer):
+        by_layer = tuple(int(round(float(x))) for x in expert_row_bytes_by_layer)
+        small = 0
     return SeatVramForm(
         temporal_slot_bytes=tuple(h * v * k * eb for h in heads), gdn_layers=gdn,
-        expert_row_bytes=row, moe_layers=int(moe_layers), small_row_bytes=int(small))
+        expert_row_bytes=row, moe_layers=int(moe_layers), small_row_bytes=int(small),
+        row_bytes_by_layer=by_layer)
 
 
 def _seat_vram_columns(rows: Sequence[SeatTableRow], form: SeatVramForm) -> Tuple[SeatTableRow, ...]:
@@ -3561,9 +3586,16 @@ def _seat_vram_columns(rows: Sequence[SeatTableRow], form: SeatVramForm) -> Tupl
         packed = int(form.expert_row_bytes) - int(form.small_row_bytes)
         parts = ((packed * 2 // 3, packed - packed * 2 // 3) if form.small_row_bytes
                  else (int(form.expert_row_bytes),))
-        rows_t = [dsv.RowTensorGeom("layer%d.%d" % (i, j), int(rows_cap), int(rows_cap) + x_max,
-                                    rb, dsv.align_up((int(rows_cap) + x_max) * rb, g))
-                  for i in range(int(form.moe_layers)) for j, rb in enumerate(parts)]
+        if form.row_bytes_by_layer and len(form.row_bytes_by_layer) >= int(form.moe_layers):
+            # NF-GGUF G5: each layer's own row (one tensor per layer, small_row_bytes is 0)
+            rows_t = [dsv.RowTensorGeom("layer%d.0" % i, int(rows_cap), int(rows_cap) + x_max,
+                                        int(form.row_bytes_by_layer[i]),
+                                        dsv.align_up((int(rows_cap) + x_max) * int(form.row_bytes_by_layer[i]), g))
+                      for i in range(int(form.moe_layers))]
+        else:
+            rows_t = [dsv.RowTensorGeom("layer%d.%d" % (i, j), int(rows_cap), int(rows_cap) + x_max,
+                                        rb, dsv.align_up((int(rows_cap) + x_max) * rb, g))
+                      for i in range(int(form.moe_layers)) for j, rb in enumerate(parts)]
         per_rank.append(dsv.seat_vram_rows([slot], rows_t, cap=cap, pool_size=size,
                                            extra_max=x_max, granule=g))
     out = []
@@ -3726,6 +3758,10 @@ def kv_stage_table(
     C = int(last.scratch_given[h])
     R = int(last.max_rows[h]) - C
     row_bytes = (int(form.expert_row_bytes) - int(form.small_row_bytes)) * int(form.moe_layers)
+    if form.row_bytes_by_layer and len(form.row_bytes_by_layer) >= int(form.moe_layers):
+        # NF-GGUF G5: the sum over the layers (D holds all of them), no scale part to subtract
+        row_bytes = sum(int(x) for x in form.row_bytes_by_layer[: int(form.moe_layers)]) - (
+            int(form.small_row_bytes) * int(form.moe_layers))
     if C <= 0 or row_bytes <= 0:
         return _none("keine Scratch-Geometrie (Scratch %d, Stufenzeile %d B)" % (C, row_bytes))
     t0 = int(kv_tokens)
@@ -4164,7 +4200,14 @@ def plan_d_residency(
             refusal=None,
         )
     terms = _pp_cut.checkpoint_weight_terms(model_path)
-    with open(os.path.join(model_path, "config.json")) as fh:
+    cfg_path = os.path.join(model_path, "config.json")
+    if str(model_path).endswith(".gguf"):
+        # NF-GGUF G5: the config of a GGUF file is its sibling config.json (server's own rule); a
+        # directory resolves exactly as before
+        from sglang.srt.server_args import declared_config_path_for
+
+        cfg_path = declared_config_path_for(str(model_path)) or cfg_path
+    with open(cfg_path) as fh:
         cfg = json.load(fh)
     text_cfg = cfg.get("text_config") or cfg
     slot_bytes = float(terms.expert_layer_weight_bytes) / int(terms.num_experts)
