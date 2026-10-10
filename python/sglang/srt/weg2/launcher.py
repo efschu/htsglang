@@ -13900,11 +13900,54 @@ def model_config_path(model: str) -> str:
         looked = declared_config_path_candidates(model) or [
             os.path.join(str(model), "config.json")
         ]
+        arch = _gguf_sibling_config_arch(model)
+        if arch is not None:
+            # NF-GGUF AP G1 (W172): the unsloth export of a bespoke-arch model
+            # is a directory of .gguf parts and NO config.json. Named, with
+            # the fix, instead of the bare FileNotFoundError below (which a
+            # caller catching OSError still gets: the class is both).
+            raise Weg2GgufConfigMissing(
+                2,
+                "W172 Weg2GgufConfigMissing: %s is a %s GGUF, whose geometry the "
+                "server reads ONLY from a sibling config.json, and none was found "
+                "(looked at %s). Put the config.json of exactly this model next "
+                "to the .gguf (a directory holding symlinks to every .gguf part "
+                "plus that config.json; the safetensors original of the same "
+                "model ships it, e.g. models-cache/Qwen3.8-Flash-Next-NVFP4-nvidia/"
+                "config.json), and pass --tokenizer-path <dir with tokenizer.json> "
+                "(W163)." % (model, arch, ", ".join(looked)),
+                looked[-1],
+            )
         raise FileNotFoundError(
             2, "no config.json describes %s (looked at %s)" % (model, ", ".join(looked)),
             looked[-1],
         )
     return path
+
+
+class Weg2GgufConfigMissing(Weg2LaunchRefused, FileNotFoundError):
+    """W172: a bespoke-arch GGUF with no sibling config.json. Both a launch
+    refusal and the ``FileNotFoundError`` every ``model_config_path`` caller
+    that catches ``OSError`` already handles (``model_config_path`` raised that
+    type here before)."""
+
+    def __str__(self) -> str:
+        return str(self.args[1]) if len(self.args) > 1 else super().__str__()
+
+
+def _gguf_sibling_config_arch(model: str) -> Optional[str]:
+    """The GGUF ``general.architecture`` of ``model`` when it is a GGUF FILE of
+    an arch the server reads from a sibling config.json, else None. Never
+    raises: this runs on an error path."""
+    try:
+        if not (model and os.path.isfile(model) and model_is_gguf_file(model)):
+            return None
+        from sglang.srt.model_loader.gguf_registry import sibling_config_gguf_archs
+
+        arch = host_ledger.gguf_header_facts(model).arch
+        return arch if arch in sibling_config_gguf_archs() else None
+    except Exception:  # noqa: BLE001 - diagnosis only
+        return None
 
 
 def model_is_gguf_file(model: str) -> bool:
@@ -13954,7 +13997,44 @@ def model_num_layers(model: str) -> int:
                 "config -- two sides of one seam on different models. Supply "
                 "the config.json of exactly this GGUF next to it."
             )
+        mismatch = gguf_sibling_meta_refusal(model)
+        if mismatch:
+            raise Weg2LaunchRefused(mismatch)
     return int(n)
+
+
+def gguf_sibling_meta_refusal(model: str) -> Optional[str]:
+    """W173 text when the sibling config.json of a ``qwen4exp`` GGUF disagrees
+    with the file's own header (experts, hyper connections, QSA indexer, PLE,
+    GDN dims, layer kinds, vocabulary); None when consistent or not qwen4exp.
+
+    NF-GGUF AP G1. The sibling config of this format is borrowed from the
+    safetensors original, so these are the numbers a different checkpoint would
+    change; the same list is enforced in the loader
+    (``gguf_registry.reconcile_sibling_config``) -- this is the same seam read
+    before any card is taken (W162's class)."""
+    facts = host_ledger.gguf_header_facts(model)
+    if facts.arch != "qwen4exp":
+        return None
+    from sglang.srt.model_loader import gguf_qwen4exp as _q4
+
+    rows = {t.name: t.shape for t in facts.tensors}
+    embd, ple = rows.get("token_embd.weight"), rows.get("per_layer_token_embd.weight")
+    problems = _q4.qwen4exp_meta_mismatches(
+        _q4.sibling_config_text(model_config_path(model)),
+        _q4.read_qwen4exp_kv(model),
+        n_blocks_backbone=facts.backbone_depth,
+        token_embd_rows=(max(embd[:2]) if embd else None),
+        ple_table_rows=(ple[-1] if ple else None),
+    )
+    if not problems:
+        return None
+    return (
+        f"W173 Weg2GgufMetaMismatch: {model} (qwen4exp) and its sibling "
+        f"{model_config_path(model)} describe different models: "
+        + "; ".join(problems)
+        + ". Supply the config.json of exactly this GGUF next to it."
+    )
 
 
 #: --tokenizer-path (27B line G2, 2026-09-25): the tokenizer BOTH groups load.
