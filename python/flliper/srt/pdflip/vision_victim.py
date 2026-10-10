@@ -800,16 +800,42 @@ def encode_peak_since(device: torch.device, start: int) -> Optional[int]:
         return None
 
 
-def encode_air_refusal(work: int, card_free: int, cache_idle: int, patches: int) -> str:
-    """'' when the encode's work memory fits the card's air, else the W105b
-    text with the numbers (never a silent cut of the image)."""
-    air = int(card_free) + max(0, int(cache_idle))
-    if int(work) <= air:
+class EncodeAir(msgspec.Struct, frozen=True):
+    """The card's air for the encode, measured around ONE ``empty_cache`` (bytes).
+
+    Metal 10.10. (jzmxnp, INT8 flip 4096x4096): free 1471 + idle cache 489 MiB passed the 1574 MiB work
+    check, then fc1 (538 MiB, the encode's largest single tensor) found no block: the idle cache lay in
+    pieces < 538 MiB (W107 OutOfMemoryError, 266.75 MiB free, 420.32 MiB reserved but unallocated). After
+    ``empty_cache`` every wholly unused cached segment is driver memory again (``free_after``, which a
+    cudaMalloc of any size can take); what stays cached (``idle_after``) sits in segments that hold a live
+    block -- fragments, not air. ``idle_after`` is also the upper bound of the largest cached block: the
+    allocator's own largest-unused-block query (``cacheInfo``) has no Python binding in torch 2.11 and
+    ``memory_snapshot`` walks every segment and block, so no exact figure is taken."""
+
+    free_before: int
+    idle_before: int
+    free_after: int
+    idle_after: int
+    empty_cache_ms: float
+
+    def fields(self) -> str:
+        return (f"free_before_mib={self.free_before / MIB:.0f} idle_before_mib={max(0, self.idle_before) / MIB:.0f} "
+                f"free_after_mib={self.free_after / MIB:.0f} idle_after_mib={max(0, self.idle_after) / MIB:.0f} "
+                f"empty_cache_ms={self.empty_cache_ms:.1f}")
+
+
+def encode_air_refusal(*, work: int, air: EncodeAir, patches: int) -> str:
+    """'' when the encode's work memory fits the driver's free memory after the
+    idle cache went back (``EncodeAir``), else the W105b text with the numbers
+    (never a silent cut of the image). The idle cache left after ``empty_cache``
+    is not counted: it is fragments in segments that hold live blocks."""
+    if int(work) <= int(air.free_after):
         return ""
     return (f"{W_VICTIM_SHORT}: the encode of the largest item ({patches} patches) needs "
-            f"{work / MIB:.0f} MiB of work memory, the card's air is {air / MIB:.0f} MiB "
-            f"(free {card_free / MIB:.0f} + idle cache {max(0, int(cache_idle)) / MIB:.0f}); the "
-            "image is not cut")
+            f"{work / MIB:.0f} MiB of work memory, the card's air is {air.free_after / MIB:.0f} MiB "
+            f"(free {air.free_before / MIB:.0f} before, {air.free_after / MIB:.0f} after empty_cache; idle "
+            f"cache {max(0, air.idle_before) / MIB:.0f} before, {max(0, air.idle_after) / MIB:.0f} left in "
+            "segments that hold live blocks, not counted); the image is not cut")
 
 
 # ---------------------------------------------------------------------------
