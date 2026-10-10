@@ -13,6 +13,13 @@ One test per way, each red against the mutant that removes its line:
 * the seat comes back None                                 -> freed
 * the admitter's POST barrier expires (W36)                -> freed
 * D-SHORT-DRAIN with the switch off reads no book (m1)     -> int23 behaviour
+
+int24 follow-up (review xsum-review3-1010, R3-1), same rule, read with `live={rid}`:
+* PARK-HANDBACK / W50 requeue / D-verdict REROUTE            -> freed before the wait on P
+* cancel in `_x_exact_backfill`                              -> freed
+* caller's grant at WINDOW_S=0 (the only booking there)      -> booked
+* first content (main release) and `enter_leg2` (> TTL)      -> row ends at the first content,
+                                                                lives while D prefills
 """
 from __future__ import annotations
 
@@ -213,5 +220,234 @@ def test_d_short_drain_prices_the_hand_over_only_with_the_switch_on(monkeypatch,
         f.queue.append(q)
         assert f._d_short_drain(time.time()) == moved
         assert (q in f._ready_for_d) == bool(moved)
+
+    asyncio.run(body())
+
+
+# ---- review xsum-review3-1010 R3-1: the rest of the book's writers ------------------
+# `_booked(f)` reads with `live={}`: a row in leg 2 is then always dead, which hides
+# a row that a missing `done` leaves behind. The tests below read with
+# `live={rid}`: D still holds the rid (the running decode, or the inner leg 2 that
+# sets it in `outstanding` again), so a row that was not removed counts again.
+def _live(f, rid):
+    return f._d_pf_book().pending_tokens(now=time.time(), live={rid})
+
+
+def _rpc_stub(f):
+    async def rpc(group, path, body, timeout=0):
+        return 200, "ok"
+
+    f.rpc = rpc
+
+
+async def _until_queued(f, p):
+    for _ in range(500):
+        await asyncio.sleep(0)
+        if p in f.queue:
+            return
+    raise AssertionError("the request never reached P's queue")
+
+
+def test_park_handback_frees_the_booking_before_it_waits_on_p():
+    """PARK-HANDBACK: D held the leg unstarted at a park; the request joins P's
+    batch. Its row is freed there -- the inner leg 2 sets the rid in `outstanding`
+    again and would bring a row that was left standing back to life."""
+
+    async def body():
+        f = _front()
+        _rpc_stub(f)
+        p = _pending(f, "hb")
+        f._d_pf_book().grant(rid="hb", tokens=TOKENS, now=time.time())
+        f._d_pf_book().enter_leg2(rid="hb")
+        assert _live(f, "hb") == TOKENS
+        req = types.SimpleNamespace(path="/generate")
+        task = asyncio.ensure_future(f._requeue_park_handback(req, "hb", {}, "x", False, p, None))
+        try:
+            await _until_queued(f, p)
+            assert _live(f, "hb") == 0, "handed back to P's batch, the row must be gone"
+        finally:
+            await _drop(task)
+
+    asyncio.run(body())
+
+
+def test_a_w50_requeue_frees_the_booking_before_it_waits_on_p():
+    """W50: D refused the SHORT (X gate); back on P's batch, same rule as above."""
+
+    async def body():
+        f = _front()
+        p = _pending(f, "w50", d_direct=False)
+        f._d_pf_book().grant(rid="w50", tokens=TOKENS, now=time.time())
+        f._d_pf_book().enter_leg2(rid="w50")
+        assert _live(f, "w50") == TOKENS
+        req = types.SimpleNamespace(path="/generate")
+        refusal = b'{"error": "W31 Weg2TpPrefillExceeded uncached=9000 X=4096"}'
+        task = asyncio.ensure_future(
+            f._requeue_after_x_refusal(req, "w50", {}, "x", False, p, None, refusal))
+        try:
+            await _until_queued(f, p)
+            assert _live(f, "w50") == 0, "refused by D, back on P's batch: the row must be gone"
+        finally:
+            await _drop(task)
+
+    asyncio.run(body())
+
+
+def test_a_cancel_in_the_exact_backfill_frees_the_booking():
+    """leg 2 has entered the book (`enter_leg2`) and is cancelled in
+    `_x_exact_backfill`, before the try whose finally ends the leg: this `except`
+    is the only place that frees the row, and D never got the request."""
+
+    async def body():
+        f = _front()
+
+        async def cancelled(*a, **k):
+            raise asyncio.CancelledError()
+
+        f._x_exact_backfill = cancelled
+        f._d_pf_book().grant(rid="bf", tokens=TOKENS, now=time.time())
+        req = types.SimpleNamespace(path="/generate")
+        with pytest.raises(asyncio.CancelledError):
+            await f.leg2(req, "bf", {}, "x", False, None, seat=None)
+        # `outstanding` keeps the rid on this path (the finally is not reached),
+        # so the row is read as live: only the `done` makes it go away.
+        assert _live(f, "bf") == 0
+
+    asyncio.run(body())
+
+
+def test_the_window_zero_grant_of_the_caller_books_the_short(monkeypatch):
+    """K135 (int24; K132 in the xsum branch): with SGLANG_WEG2_DECODE_COLLECT_WINDOW_S=0 the
+    collect gate returns before it books, so the caller's grant after the seat is
+    the ONLY booking of a granted SHORT -- and it prices the queue-take and the
+    D-SHORT-DRAIN."""
+    monkeypatch.setenv("SGLANG_WEG2_DECODE_COLLECT_WINDOW_S", "0")
+    monkeypatch.setenv("SGLANG_WEG2_ENABLE_DECODE_COLLECT_PREFILL_BUSY", "1")
+
+    async def body():
+        f = _front()
+        seen = {}
+
+        async def seat_without_booking(rid, est_prompt, why=None, **kw):
+            seen["rid"] = rid
+            seen["uncached"] = kw.get("uncached")
+            return types.SimpleNamespace(release=lambda *a, **k: None)  # a seat; the gate did not book
+
+        async def stop_at_leg2(request, rid, payload, text, stream, pending=None, seat=None, **kw):
+            seen["booked_at_leg2"] = _live(f, rid)
+            return types.SimpleNamespace(status=200)
+
+        f._acquire_short_seat = seat_without_booking
+        f.leg2 = stop_at_leg2
+        await f.handle_generate(_Req(_payload(500)))
+        assert seen.get("uncached"), "handle_generate never took the short seat"
+        assert seen["booked_at_leg2"] == seen["uncached"], (
+            "the SHORT was granted on D and nothing booked it: the next arrival, the queue-take "
+            "and the D-SHORT-DRAIN read an idle D")
+
+    asyncio.run(body())
+
+
+# ---- leg 2 against a D that streams: the two ends of the row's life ----------------
+class _FakeStreamBody:
+    """D's stream as leg 2 reads it (`readany`, also under ROS's polled read and
+    `iter_any`): the first chunk waits for `gate` (D prefills until then), the
+    next never comes (D decodes: the rid stays in `outstanding`)."""
+
+    def __init__(self, gate, first):
+        self.gate, self.first, self.reads, self.reading_on = gate, first, 0, asyncio.Event()
+
+    async def readany(self):
+        self.reads += 1
+        if self.reads == 1:
+            await self.gate.wait()
+            return self.first
+        self.reading_on.set()  # past the first chunk: D decodes
+        await asyncio.sleep(3600)
+        return b""
+
+    async def iter_any(self):
+        yield await self.readany()
+
+
+class _FakeD:
+    """What leg 2 reads of aiohttp's `session.post(...)` and its response."""
+
+    def __init__(self, body):
+        self.status, self.content_type, self.content = 200, "text/event-stream", body
+
+    def post(self, *a, **k):
+        d = self
+
+        class _Cm:
+            async def __aenter__(self):
+                return d
+
+            async def __aexit__(self, *exc):
+                return False
+
+        return _Cm()
+
+
+def test_the_row_lives_while_d_prefills_and_ends_at_the_first_content():
+    """enter_leg2: the row is kept as long as D holds the rid, however long D
+    prefills (a prefill over GRANT_TTL_S must still count). First content: D's
+    prefill is over, the row ends there and not with the whole decode (D holds the
+    rid for all of it, so a row left standing would be a phantom the entire decode)."""
+    from aiohttp.test_utils import make_mocked_request
+
+    from sglang.srt.weg2.d_prefill_inflight import GRANT_TTL_S
+
+    async def body():
+        f = _front()
+        gate = asyncio.Event()
+        stream = _FakeStreamBody(gate, b'data: {"text": "hi"}\n\n')
+        f.session = _FakeD(stream)
+        f._d_pf_book().grant(rid="fc", tokens=TOKENS, now=time.time())
+        req = make_mocked_request("POST", "/generate")
+        task = asyncio.ensure_future(f.leg2(req, "fc", {"stream": True}, "x", True, None, seat=None))
+        try:
+            for _ in range(500):  # leg 2 is at D, waiting for the first chunk
+                await asyncio.sleep(0)
+                if "fc" in f.groups["D"].outstanding:
+                    break
+            await asyncio.sleep(0.05)
+            late = time.time() + GRANT_TTL_S + 5
+            assert f._d_pf_book().pending_tokens(now=late, live={"fc"}) == TOKENS, (
+                "D still prefills: the row must outlive the grant TTL while D holds the rid")
+            gate.set()
+            await asyncio.wait_for(stream.reading_on.wait(), 5.0)  # first content passed, D decodes
+            assert "fc" in f.groups["D"].outstanding
+            assert _live(f, "fc") == 0, "first content = prefill over: the row ends there"
+        finally:
+            await _drop(task)
+
+    asyncio.run(body())
+
+
+def test_a_d_verdict_reroute_frees_the_booking_before_it_waits_on_p():
+    """leg 2 priced D's answer over X: the request rejoins P's batch (WEG2-REROUTE).
+    The row is freed there; the inner leg 2 books anew."""
+
+    async def body():
+        f = _front()
+        _rpc_stub(f)
+        p = _pending(f, "rr", d_direct=False)
+
+        async def read():
+            return b'{"text": "x", "meta_info": {"prompt_tokens": 20000, "cached_tokens": 0, "completion_tokens": 1}}'
+
+        d = _FakeD(None)
+        d.content_type, d.read = "application/json", read
+        f.session = d
+        f._d_pf_book().grant(rid="rr", tokens=TOKENS, now=time.time())
+        req = types.SimpleNamespace(path="/generate")
+        task = asyncio.ensure_future(f.leg2(req, "rr", {}, "x", False, p, seat=None))
+        try:
+            await _until_queued(f, p)
+            assert f.counters["reroute"] == 1
+            assert _live(f, "rr") == 0
+        finally:
+            await _drop(task)
 
     asyncio.run(body())
