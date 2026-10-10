@@ -721,6 +721,14 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         )
         load_time = time.perf_counter()
         rid = getattr(request_obj, "rid", "anonymous_rid")
+        mm_tokenize_offload.note(
+            load_ms=(load_time - entry_time) * 1000,
+            pixels=sum(
+                im.width * im.height
+                for im in base_output.images
+                if isinstance(im, Image.Image)
+            ),
+        )
 
         video_metadata = None
         if base_output.videos and not isinstance(base_output.videos[0], dict):
@@ -846,6 +854,10 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         if mrope_positions.ndim == 3:
             mrope_positions = mrope_positions.squeeze(1)
         get_rope_index_time = time.perf_counter()
+        mm_tokenize_offload.note(
+            img_tokens=int((input_ids == self.mm_tokens.image_token_id).sum()),
+            mrope_ms=(get_rope_index_time - process_time) * 1000,
+        )
         logger.debug(
             f"[QwenVLProcessor Perf] {rid=}, "
             f"load_time: {(load_time - entry_time) * 1000:.2f} ms, "
