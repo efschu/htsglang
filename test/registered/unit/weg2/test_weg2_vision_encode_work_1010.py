@@ -220,8 +220,12 @@ _VC = types.SimpleNamespace(hidden_size=1152, intermediate_size=4304, num_heads=
 def test_the_metal_4096_image_fits_the_metal_flip_air():
     """W105b of 10.10.: 65536 patches against free 1471 + idle cache 489 MiB.
     The model books the leaner forward: pixels 192 + rope 18 + the MLP phase
-    (residual, norm2, fc1, act = 2*1152 + 2*4304 wide) 1364 = 1574 MiB."""
+    (residual, norm2, fc1, act = 2*1152 + 2*4304 wide) 1364 = 1574 MiB. It
+    fits once the idle cache went back to the driver (free 1960 MiB after
+    empty_cache, test_weg2_vision_air_fragments_1010), not on free alone."""
     still = types.SimpleNamespace(image_grid_thw=torch.tensor([[1, 256, 256]]))
     work = vv.encode_work_for(_VC, [still], "sdpa")
     assert work == 1574 * MIB
-    assert vv.encode_air_refusal(work, 1471 * MIB, 489 * MIB, 65536) == ""
+    settled = vv.EncodeAir(free_before=1471 * MIB, idle_before=489 * MIB, free_after=1960 * MIB,
+                           idle_after=0, empty_cache_ms=0.0)
+    assert vv.encode_air_refusal(work=work, air=settled, patches=65536) == ""
