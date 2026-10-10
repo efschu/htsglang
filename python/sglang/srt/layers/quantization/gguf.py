@@ -15,6 +15,7 @@ import torch
 from gguf import GGMLQuantizationType as WeightType
 from torch.nn.parameter import Parameter, UninitializedParameter
 
+from sglang.jit_kernel import gguf_iq_mmq_policy as _iq_policy  # G6: torch-free policy of the IQ MMQ kernels
 from sglang.srt.layers.linear import LinearBase
 from sglang.srt.layers.moe import MoeRunnerConfig
 from sglang.srt.layers.quantization.gguf_path_census import (
@@ -288,6 +289,106 @@ if MXFP4_NATIVE:
     DEQUANT_TYPES = DEQUANT_TYPES | MXFP4_QUANT_TYPES
     MMVQ_QUANT_TYPES = MMVQ_QUANT_TYPES | MXFP4_QUANT_TYPES
     MMQ_QUANT_TYPES = MMQ_QUANT_TYPES | MXFP4_QUANT_TYPES
+
+# ---------------------------------------------------------------------------------------------------------------------
+# G6 (GGUF-NF, 2026-10-09): MMQ / MoE-MMQ for the I-quant types (IQ3_S / IQ4_NL / IQ4_XS and their siblings).
+#
+# Before G6 these types had no MMQ kernel: the MoE prefill of an unsloth UD-IQ4_XS checkpoint (experts gate/up IQ3_S, down
+# IQ4_NL) ran entirely through ``ggml_moe_a8_vec`` (batch-1 mat-vec) and the dense path through dequant + cuBLAS. The kernels
+# are sglang PR #36122, vendored as NEW JIT sources (csrc/gguf_iq_mmq/); the sgl-kernel wheel is not touched. ``IQ_MMQ_TYPES``
+# is deliberately NOT merged into MMQ_QUANT_TYPES: the wheel's ggml_moe_a8 / ggml_mul_mat_a8 know nothing about type 16..23, so
+# the type sets that follow the WHEEL stay as they are and the IQ kernels are reached through their own, load-time-armed
+# branches below. A type is "ready" only after ``iq_mmq_prepare`` built it (or refused it by name: SGLANG_GGUF_IQ_MMQ=0, the
+# Blackwell nvcc gate of gguf_iq_mmq_policy.py); until then every shape takes the pre-G6 path unchanged.
+_IQ_MMQ_TYPES = _iq_policy.IQ_MMQ_TYPES
+_iq_mmq_mod = None
+
+
+def _iq_mmq_kernels():
+    """The G6 JIT glue module, imported on first use; None off CUDA or when it cannot be imported."""
+    global _iq_mmq_mod
+    if _iq_mmq_mod is None:
+        if not _is_cuda or not _has_sgl_gguf_kernels:
+            return None
+        try:
+            from sglang.jit_kernel import gguf_iq_mmq as mod
+
+            _iq_mmq_mod = mod
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("IQ-MMQ-IMPORT-FAILED: %s: %s -- IQ types keep the pre-G6 path", type(exc).__name__, exc)
+            _iq_mmq_mod = False
+    return _iq_mmq_mod or None
+
+
+def iq_mmq_prepare(*qweight_types) -> None:
+    """Load-time hook (never call from a forward): build / refuse the IQ MMQ module of every IQ type among ``qweight_types``."""
+    wanted = {int(t) for t in qweight_types if t is not None and int(t) in _IQ_MMQ_TYPES}
+    if not wanted:
+        return
+    mod = _iq_mmq_kernels()
+    if mod is None:
+        return
+    for t in sorted(wanted):
+        mod.prepare(t)
+
+
+def _iq_mmq_ready(qweight_type) -> bool:
+    mod = _iq_mmq_mod
+    return bool(mod) and mod.is_ready(int(qweight_type))
+
+
+def _iq_rows_contiguous(w: torch.Tensor) -> bool:
+    return w.stride(-1) == 1 and (w.dim() < 2 or w.stride(-2) == w.shape[-1])
+
+
+def _iq_dense_mmq_selected(x: torch.Tensor, qweight: torch.Tensor, qweight_type: int, mmvq_safe: int) -> bool:
+    """Dense IQ MMQ window (PR #36122): mmvq_safe < M <= 16, K aligned, kernel armed. False for every non-IQ type."""
+    if qweight_type not in _IQ_MMQ_TYPES:
+        return False
+    return (
+        x.dim() == 2
+        and x.dtype in (torch.float16, torch.bfloat16)
+        and qweight.dim() == 2
+        and qweight.dtype == torch.uint8
+        and _iq_policy.dense_mmq_shape_ok(x.shape[0], mmvq_safe)
+        and _iq_policy.k_aligned(qweight_type, x.shape[1])
+        and _iq_rows_contiguous(qweight)
+        and _iq_mmq_ready(qweight_type)
+    )
+
+
+def _iq_moe_mmq_selected(
+    x: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_ids: torch.Tensor,
+    qweight_type: int,
+    qweight_type2: int,
+) -> bool:
+    """IQ MoE-MMQ (PR #36122): M >= 128 and enough assignments per expert; each side is an armed IQ type or a wheel-MMQ type.
+
+    False for any pair without an IQ type (the pre-G6 branches then decide exactly as before).
+    """
+    if qweight_type not in _IQ_MMQ_TYPES and qweight_type2 not in _IQ_MMQ_TYPES:
+        return False
+    if x.dim() != 2 or x.dtype not in (torch.float16, torch.bfloat16) or w1.dim() != 3 or w2.dim() != 3:
+        return False
+    num_tokens = x.shape[0]
+    num_experts, n13, _ = w1.shape
+    if not _iq_policy.moe_mmq_shape_ok(num_tokens, num_experts, topk_ids.shape[1]):
+        return False
+    for qtype, k in ((qweight_type, x.shape[1]), (qweight_type2, n13 // 2)):
+        if qtype in _IQ_MMQ_TYPES:
+            if not (_iq_policy.k_aligned(qtype, k) and _iq_mmq_ready(qtype)):
+                return False
+        elif qtype in MMQ_QUANT_TYPES:
+            # wheel kernel side of a mixed pair: same tile width as the IQ kernels, else the shared alignment is wrong
+            if _ggml_moe_get_block_size(qtype) != _iq_policy.IQ_MOE_MMQ_BLOCK_SIZE:
+                return False
+        else:
+            return False
+    return _iq_rows_contiguous(w1) and _iq_rows_contiguous(w2)
+
 
 #: ggml types the GGUF MoE expert-offload half (#123) covers.
 #:
@@ -1158,6 +1259,12 @@ def fused_mul_mat_gguf(
         if on_path is not None:
             on_path("mmq")
         y = ggml_mul_mat_a8(qweight, x, qweight_type, qweight.shape[0])
+    # G6: I-quant MMQ (PR #36122) for the window the MMVQ leaves (mmvq_safe < M <= 16); only reached for IQ types that
+    # iq_mmq_prepare armed at load time, else this branch is False and the dequant branch below decides as before.
+    elif _iq_dense_mmq_selected(x, qweight, qweight_type, mmvq_safe):
+        if on_path is not None:
+            on_path("mmq")
+        y = _iq_mmq_mod.mul_mat_a8(qweight, x, qweight_type, qweight.shape[0])
     # Large batch (or a type without an MMQ kernel): dequantize once, then a
     # single fp16 cuBLAS GEMM. All MMQ types are also in DEQUANT_TYPES, so
     # large-batch K-quants land here.
@@ -1225,6 +1332,44 @@ def _ggml_moe_get_block_size(qtype: int) -> int:
         return 8 if _is_hip else 4
 
 
+def _moe_mm_a8(x, w, sorted_token_ids, expert_ids, num_tokens_post_padded, qtype, rows, top_k, tokens):
+    """One grouped GEMM of the MoE MMQ path: the IQ JIT kernel for IQ types, the wheel's ggml_moe_a8 for the rest."""
+    if qtype in _IQ_MMQ_TYPES:
+        return _iq_mmq_mod.moe_a8(
+            x, w, sorted_token_ids, expert_ids, num_tokens_post_padded, qtype, rows, top_k, tokens
+        )
+    return ggml_moe_a8(x, w, sorted_token_ids, expert_ids, num_tokens_post_padded, qtype, rows, top_k, tokens)
+
+
+def _fused_moe_gguf_iq_mmq(
+    x, w1, w2, topk_weights, topk_ids, qweight_type, qweight_type2, act, out_hidden_states
+) -> torch.Tensor:
+    """The MMQ branch of fused_moe_gguf for pairs that contain an I-quant type (same structure, per-side kernel choice)."""
+    num_tokens, _ = x.shape
+    E, N, _ = w1.shape
+    top_k = topk_ids.shape[1]
+
+    from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
+        moe_align_block_size,
+    )
+
+    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+        topk_ids, _iq_policy.IQ_MOE_MMQ_BLOCK_SIZE, E
+    )
+    # Same sanitiser as the wheel path (#109/#112): trailing expert_ids are uninitialised and the zero-pad expert of an
+    # uneven expert-dim shard is id E; the kernel's `exp_idx >= num_experts || exp_idx < 0` guard needs them as -1.
+    # A scalar masked_fill stays CUDA-graph-capture safe.
+    expert_ids = expert_ids.masked_fill(expert_ids >= E, -1)
+    out = _moe_mm_a8(x, w1, sorted_token_ids, expert_ids, num_tokens_post_padded, qweight_type, N, top_k, num_tokens)
+    out = act(out)
+    out = _moe_mm_a8(
+        out, w2, sorted_token_ids, expert_ids, num_tokens_post_padded, qweight_type2, w2.shape[1], 1, num_tokens * top_k
+    )
+    out = out.reshape(num_tokens, top_k, w2.shape[1]).mul_(topk_weights.view(num_tokens, top_k, 1))
+    moe_sum(out, out_hidden_states)
+    return out_hidden_states
+
+
 def fused_moe_gguf(
     x: torch.Tensor,
     w1: torch.Tensor,
@@ -1243,6 +1388,12 @@ def fused_moe_gguf(
         raise ValueError(f"Unsupported activation: {activation}")
 
     out_hidden_states = torch.empty_like(x)
+    # G6: I-quant MoE-MMQ (PR #36122). False for every pair without an IQ type and for IQ pairs that are not armed /
+    # too small (M < 128, too few assignments per expert), which then fall through to moe_vec below, unchanged.
+    if _iq_moe_mmq_selected(x, w1, w2, topk_ids, qweight_type, qweight_type2):
+        return _fused_moe_gguf_iq_mmq(
+            x, w1, w2, topk_weights, topk_ids, qweight_type, qweight_type2, act, out_hidden_states
+        )
     # unless we decent expert reuse we are better off running moe_vec kernel
     if (
         qweight_type2 in MMQ_QUANT_TYPES
@@ -1511,6 +1662,9 @@ class GGUFLinearMethod(LinearMethodBase):
         # #63: pre-size the persistent dequant workspace at LOAD time so the
         # KV-budget profiling that runs afterwards accounts for it.
         self._reserve_dequant_scratch(layer)
+        # G6: arm the dense IQ MMQ kernel of this layer's type(s) at LOAD time (dense IQ types only; no-op otherwise).
+        shard_types = getattr(layer.qweight_type, "shard_weight_type", None) or {}
+        iq_mmq_prepare(layer.qweight_type.weight_type, *shard_types.values())
 
     def _create_flat_weight_param(self, layer: torch.nn.Module):
         """Materialize merged GGUF shards into ONE flat byte buffer + views.
@@ -1791,6 +1945,8 @@ class GGUFMoEMethod(FusedMoEMethodBase):
         # for already-materialized / non-GGUF params.
         if hasattr(layer, "materialize_gguf_weights"):
             layer.materialize_gguf_weights()
+        # G6: arm (build / named refusal) the IQ MMQ kernels of this layer's expert types at LOAD time, never in a forward.
+        iq_mmq_prepare(layer.w13_qweight_type.weight_type, layer.w2_qweight_type.weight_type)
 
     def apply(
         self,
