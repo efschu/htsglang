@@ -4,7 +4,7 @@ import logging
 import time
 
 from flliper.srt.managers.pdflip_pass_timer import timed as _pass_timed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http import HTTPStatus
 from typing import (
     TYPE_CHECKING,
@@ -16,6 +16,7 @@ from typing import (
     Union,
 )
 
+import msgspec
 import zmq
 from torch.distributed import barrier
 
@@ -23,6 +24,7 @@ from flliper.srt.disaggregation.utils import prepare_abort
 from flliper.srt.managers.io_struct import (
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
+    FlushCacheReqInput,
     TokenizedEmbeddingReqInput,
     ReleaseMemoryOccupationReqInput,
     TokenizedGenerateReqInput,
@@ -54,6 +56,25 @@ if TYPE_CHECKING:
     from flliper.test.scripted_runtime.tokenizer_recv_proxy import (
         ScriptedTokenizerRecvProxy,
     )
+
+
+class QuiesceProbeWindow(msgspec.Struct):
+    """#1158c: the origin's "a quiesce flush went out, no Release / real request
+    since" bit (the window in which an admitted probe voids the quiesce)."""
+
+    open: bool = False
+
+
+#: #1158c: requests that end the window. A Release is the sleep the quiesce was
+#: for (a probe behind it keeps the W25 path); a real request means the group
+#: serves again. Any other control request leaves the window open.
+_QUIESCE_WINDOW_CLOSERS = (
+    ReleaseMemoryOccupationReqInput,
+    TokenizedGenerateReqInput,
+    TokenizedEmbeddingReqInput,
+    BatchTokenizedGenerateReqInput,
+    BatchTokenizedEmbeddingReqInput,
+)
 
 
 @dataclass(kw_only=True, slots=True, frozen=True)
@@ -127,6 +148,9 @@ class SchedulerRequestReceiver:
     # applies them in the same pass. Called only on the request origin.
     # None (every other boot) leaves the intake exactly as it was.
     origin_extra_reqs_hook: Optional[Callable[[], List[Any]]] = None
+    # #1158c: origin-only state of _dispose_health_checks_at_origin (mutable
+    # content of a frozen field; read and written only on the request origin).
+    quiesce_probe_window: QuiesceProbeWindow = field(default_factory=QuiesceProbeWindow)
 
     #: How many drain turns one chain receive may trigger before the stall
     #: is allowed to propagate. A closed ring is cut by the FIRST turn; a
@@ -373,8 +397,23 @@ class SchedulerRequestReceiver:
             ),
             default=-1,
         )
+        # #1158c BOOT RACE (boot ..._a8e569fd83_1010_005819, D 01:07:52, overlap):
+        # the quiesce /flush_cache and a direct /health_generate (the group
+        # deadman's first probe) came out in ONE intake, flush first. The flush
+        # answered idle, the probe passed the gate and ran as the next batch; the
+        # Release came one pass later, its drain read last_batch +
+        # overlap_result_queue (other_terms=2) -> W120 on every rank. A quiesce
+        # verdict holds only while nothing is admitted after it, so a probe
+        # behind a flush and before the next Release or real request is answered
+        # alive here and never broadcast. A probe AHEAD of the flush keeps the
+        # gate (the flush then answers 400 and the front re-polls).
+        window = self.quiesce_probe_window
         for idx, req in enumerate(recv_reqs):
             if not is_health_check_generate_req(req):
+                if isinstance(req, FlushCacheReqInput):
+                    window.open = True
+                elif isinstance(req, _QUIESCE_WINDOW_CLOSERS):
+                    window.open = False
                 kept.append(req)
                 continue
             if idx < last_release:
@@ -385,6 +424,18 @@ class SchedulerRequestReceiver:
                     "#1158b HEALTH-CHECK dropped at origin before broadcast rid=%s "
                     "ahead of ReleaseMemoryOccupation in the same intake "
                     "(answered %s; a queued probe is a sleep-drain blocker, W120)",
+                    getattr(req, "rid", None),
+                    "now" if self.answer_health_check_now is not None else "via deque",
+                )
+                continue
+            if window.open:
+                answer = self.answer_health_check_now or self.return_health_check_ipc
+                if answer is not None:
+                    answer(getattr(req, "http_worker_ipc", None))
+                logger.info(
+                    "#1158c HEALTH-CHECK dropped at origin before broadcast rid=%s "
+                    "behind a quiesce /flush_cache, no Release or request since "
+                    "(answered %s; an admitted probe voids the quiesce, W120)",
                     getattr(req, "rid", None),
                     "now" if self.answer_health_check_now is not None else "via deque",
                 )
