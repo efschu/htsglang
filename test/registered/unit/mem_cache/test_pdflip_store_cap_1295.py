@@ -243,6 +243,11 @@ class TestStoreCapBoundsTheDirectory(CustomTestCase):
             )
             admitted = _fill(me, d, [f"mine{i:04d}{SHARED}" for i in range(20)], page)
             self.assertEqual(admitted, 20, "sanity: this owner had room of its own")
+            # The background evictor (EVICT_OFFPATH, default on) may still be unlinking this owner's pages toward
+            # cap x ratio, and the walk below runs without the lock: park it first (D-HEALTH 10.10.: with the
+            # fair lock handoff the fill no longer starves it, so the tail of its run can overlap the walk --
+            # FileNotFoundError in _dir_allocated_bytes). The cap itself is held inline by reserve().
+            self.assertTrue(me.pause_background_eviction(timeout=10, reason="test"))
             for stem in sib_stems:
                 self.assertTrue(
                     os.path.exists(os.path.join(d, f"{stem}.bin")),
