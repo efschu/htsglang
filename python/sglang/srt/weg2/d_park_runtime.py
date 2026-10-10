@@ -342,15 +342,22 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
     )
 
 
-def _land_inflight(sched) -> None:
+def _land_inflight(sched, keep_chunked=None) -> None:
     """The in-flight batch lands first (park_running's shape): its result is processed, an extend batch
-    joins the running batch."""
+    joins the running batch. This landing IS the chunk boundary of a chunked prefill: the launched chunk is
+    over, ``inflight_middle_chunks`` is back to 0, nothing is running on the request's rows.
+
+    LANES FIX 1 (metal jjbbrx probe 3): ``keep_chunked`` = the chunked request that is NOT being parked. It
+    stays the chunked request, so it is excluded from the merge exactly as ``get_next_batch_to_run`` excludes it
+    (``chunked_req_to_exclude.add(self.chunked_req)``); merged with a prefill that is not finished it would
+    decode from an incomplete prompt. ``None`` (the flip park's and upstream ``pause_generation``'s shape) merges
+    everything: the chunked request is then a member of the running batch and the caller retracts it."""
     if sched.enable_overlap and sched.last_batch and sched.result_queue:
         tmp_batch, tmp_result = sched.result_queue.popleft()
         sched.process_batch_result(tmp_batch, tmp_result)
     last = sched.last_batch
     if last and last.forward_mode.is_extend():
-        last.filter_batch(chunked_req_to_exclude=[])
+        last.filter_batch(chunked_req_to_exclude=[keep_chunked] if keep_chunked is not None else [])
         if not last.is_empty():
             if sched.running_batch.is_empty():
                 sched.running_batch = last
@@ -371,6 +378,24 @@ def _retract_subset(sched, reqs, sel) -> list:
     return [reqs[i] for i in sel]
 
 
+def _release_outside_chunk(sched, req):
+    """LANES FIX 1: retract a chunked prefill request that is NOT a member of any batch (the pass after its last
+    chunk ran a decode batch, so ``last_batch`` carried no extend batch to merge it from): the rows go back to the
+    tree with ``is_insert=True`` (``release_req(retain=True)``, the same call the batch retract makes) and the
+    request is reset for the retract. Its previous chunk was stashed at the head of that pass
+    (``get_next_batch_to_run``). Returns the request."""
+    from sglang.srt.managers.schedule_batch import release_req as _release_req
+
+    _release_req(
+        req=req, remaing_req_count=1, server_args=sched.server_args,
+        req_to_token_pool=sched.req_to_token_pool,
+        token_to_kv_pool_allocator=sched.token_to_kv_pool_allocator,
+        tree_cache=sched.tree_cache, hisparse_coordinator=getattr(sched, "hisparse_coordinator", None),
+        retain=True,
+    )
+    return req
+
+
 def park_rids(sched, recv_req, *, rids, hold: str = ""):
     """PRIORITY LANES 1008 (L2), plan section 2 "D (Decode)": ``park_running`` with ``rids`` -- retract ONLY
     these running requests, RETAINING their span (KV, the node's GDN/Mamba anchor, the draft rows) with a forced
@@ -383,6 +408,14 @@ def park_rids(sched, recv_req, *, rids, hold: str = ""):
     preferred by ``order_waiting``, until ``lane_floor`` re-queues it (floor <= its lane). Without ``hold``
     the parked requests are an ordinary flip-site park (the 30-s re-queue brings them back). The park site
     is ``flip``: on the re-queue the request resumes first, oldest first, as soon as it fits.
+
+    A CHUNKED PREFILL on D (plan section 0/1: "Prefill wird an der CHUNK-GRENZE geparkt"): the RPC runs on the
+    scheduler thread between two passes, so no chunk of it is launched; the in-flight one lands first
+    (:func:`_land_inflight`) -- that landing is the chunk boundary. The request is then retracted like a decode
+    seat, its span of finished chunks retained (page-aligned, ``WEG2-D-PARK RETAINED retained=N of M``; the rest
+    is computed at the resume) and -- the part the first Lane park missed -- ``sched.chunked_req`` is released
+    with it (``None``: the next ``get_next_batch_to_run`` reads ``chunked_req.extend_range``, which the retract
+    reset). A chunked request of ANOTHER lane stays the chunked request and is kept out of the merge.
 
     Answered like the flip park (``parked`` = the rids that left the batch, ``held`` = requested rids that
     only wait on D and are kept back by the floor alone) plus ``lane=True`` and ``lane_skipped`` (requested
@@ -418,21 +451,23 @@ def park_rids(sched, recv_req, *, rids, hold: str = ""):
     if getattr(sched, "anchor_tails", None):
         return _out(False, [], "W-PARK refused: anchor tails present (a P-group structure) -- nothing parked")
     t0 = time.perf_counter()
-    _land_inflight(sched)
+    wanted = set(want)
+    chunk = getattr(sched, "chunked_req", None)
+    park_chunk = chunk is not None and str(getattr(chunk, "rid", "")) in wanted
+    _land_inflight(sched, keep_chunked=None if (park_chunk or chunk is None) else chunk)
     if not sched.running_batch.is_empty():
         sched.running_batch.filter_batch()
     running_batch = sched.running_batch
     reqs = list(running_batch.reqs) if not running_batch.is_empty() else []
-    wanted = set(want)
     sel = [i for i, r in enumerate(reqs) if str(r.rid) in wanted]
     running_ids = {str(reqs[i].rid) for i in sel}
     parked = parked_list(sched)
     queued_ids = {str(getattr(q, "rid", "")) for q in list(getattr(sched, "waiting_queue", None) or [])
                   + list(getattr(sched, "weg2_dormant_hold", None) or [])
                   + list(getattr(sched, "weg2_post_wake_settle", None) or [])}
-    chunk = getattr(sched, "chunked_req", None)
     chunk_id = str(getattr(chunk, "rid", "")) if chunk is not None else None
     skipped, held_ids, already = {}, [], []
+    outside = None  # the chunked request to park that is in no batch (see _release_outside_chunk)
     for rid in want:
         if rid in running_ids:
             continue
@@ -441,7 +476,11 @@ def park_rids(sched, recv_req, *, rids, hold: str = ""):
         elif rid in queued_ids:
             held_ids.append(rid)
         elif chunk_id is not None and rid == chunk_id:
-            skipped[rid] = "in a chunked prefill on D (not in the decode batch): not parkable here"
+            if int(getattr(chunk, "inflight_middle_chunks", 0) or 0) > 0 or getattr(chunk, "req_pool_idx", 0) is None:
+                # a chunk of it still writes its rows (cannot be after the landing) or it holds none yet
+                skipped[rid] = "in a chunked prefill on D with a chunk in flight or no rows yet: asked again"
+            else:
+                outside = chunk
         else:
             skipped[rid] = "not running here (finished or not admitted)"
     if hold:
@@ -457,10 +496,10 @@ def park_rids(sched, recv_req, *, rids, hold: str = ""):
         return _out(False, [], "W-PARK refused: the rids are not the back of the batch under speculative "
                                "decoding -- nothing parked, the front asks again",
                     held=held_ids, skipped=skipped)
-    if not sel:
+    if not sel and outside is None:
         return _out(True, already, "nothing to retract: no requested rid is running here",
                     held=held_ids, skipped=skipped)
-    sel_reqs = [reqs[i] for i in sel]
+    sel_reqs = [reqs[i] for i in sel] + ([outside] if outside is not None else [])
     rest = [r for i, r in enumerate(reqs) if i not in set(sel)]
     for req in sel_reqs:
         setattr(req, FORCE_HOST_WRITE_THROUGH_ATTR, True)
@@ -471,8 +510,19 @@ def park_rids(sched, recv_req, *, rids, hold: str = ""):
     _park_end(sched, sel_reqs, also_live=rest)
     park_hold_yield.begin(getattr(sched, "tree_cache", None))
     _pl_before = _poolleak.park_snapshot(sched, sel_reqs, phase="before-retract", epoch=epoch)
-    retracted = park_retract_split.run_split(
-        getattr(sched, "tree_cache", None), lambda: _retract_subset(sched, reqs, sel), epoch)
+    def _retract_all_wanted():
+        out = _retract_subset(sched, reqs, sel) if sel else []
+        if outside is not None:
+            out.append(_release_outside_chunk(sched, outside))
+        return out
+
+    retracted = park_retract_split.run_split(getattr(sched, "tree_cache", None), _retract_all_wanted, epoch)
+    # LANES FIX 1 (metal jjbbrx probe 3): the chunked request left with the retract -- the scheduler must not
+    # keep pointing at it (the next pass reads ``chunked_req.extend_range.end``, None after the retract: the
+    # AttributeError that killed D). The flip park does the same (``sched.chunked_req = None``).
+    chunk_parked = chunk is not None and any(r is chunk for r in retracted)
+    if chunk_parked:
+        sched.chunked_req = None
     _poolleak.park_snapshot(sched, sel_reqs, phase="after-retract", epoch=epoch)
     running_batch.batch_is_full = False
     now = time.monotonic()
@@ -507,10 +557,12 @@ def park_rids(sched, recv_req, *, rids, hold: str = ""):
     _poolleak.ledger_line(sched, epoch=epoch, before=_pl_before)
     parked_ids = [str(r.rid) for r in retracted]
     logger.info(
-        "%s rids=%s ms=%.0f epoch=%d floor=%d hold=%s running_left=%d held=%s skipped=%s -- retracted with "
-        "the span retained and a forced host write-through, no sleep follows, the others decode on%s",
+        "%s rids=%s ms=%.0f epoch=%d floor=%d hold=%s running_left=%d held=%s skipped=%s chunk_boundary=%d -- "
+        "retracted with the span retained and a forced host write-through, no sleep follows, the others decode "
+        "on (chunk_boundary=1: a chunked prefill was parked at its chunk border and released as the chunked "
+        "request)%s",
         lanes.MARK_D_PARK_PARK, parked_ids, (time.perf_counter() - t0) * 1000.0, epoch,
-        d_lane.floor_of(sched), hold or "-", len(rest), held_ids, skipped or "-",
+        d_lane.floor_of(sched), hold or "-", len(rest), held_ids, skipped or "-", 1 if chunk_parked else 0,
         (" (DFlash window draft: %d resume(s) re-armed like a fresh hand-off)" % rearmed if rearmed else ""),
     )
     return _out(True, already + parked_ids, "parked %d (lane), %d only queued, %d skipped"

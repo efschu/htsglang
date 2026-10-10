@@ -3436,11 +3436,19 @@ def _lane_late_done(on_done):
     return _cb
 
 
+def _lane_take_waits(pred) -> bool:
+    """LANES FIX 1: the predicate of ``_p_drain_pool(lane_take_wait=...)``; an error in it never holds a take."""
+    try:
+        return bool(pred())
+    except Exception:  # noqa: BLE001 - the predicate never stops the drain
+        return False
+
+
 async def _p_drain_pool(queue, limit: int, one, on_done, may_dispatch,
                         max_dispatch: int = 0, cost=None, budget: int = 0,
                         stats: Optional[Dict[str, int]] = None,
                         extra=None, poll_s: float = 0.0, cap_exempt=None, lane_held=None,
-                        lane_take=None) -> int:
+                        lane_take=None, lane_take_wait=None) -> int:
     """#1459c: keep up to ``limit`` leg-1 calls in flight, refilling from
     ``queue`` (a deque; new arrivals appended while draining are taken too)
     the moment ONE finishes.  ``on_done(p)`` runs in COMPLETION order, and
@@ -3491,6 +3499,10 @@ async def _p_drain_pool(queue, limit: int, one, on_done, may_dispatch,
     nothing would run it again after the floor fell. The callback marks the Pendings, calls ``cancel_all()``
     (their ``one`` tasks end with the Pending, un-prefilled), takes them off P by rid and keeps them for the lane
     resume; the pool then waits for the tasks and returns when they are gone. ``None`` = the late-callback form.
+
+    LANES FIX 1 (``lane_take_wait``, metal jjbbrx probe 2b): ``lane_take_wait()`` True = a request of the floor lane is
+    on its way to the queue (arrived, no Pending yet): the take is postponed to the next 0.1-s round -- the held legs
+    stay on P and the arrival's own leg, once queued, is dispatched beside them. ``None`` = never wait (default path).
     """
     inflight: Dict[Any, int] = {}
     inflight_tokens = 0
@@ -3588,6 +3600,9 @@ async def _p_drain_pool(queue, limit: int, one, on_done, may_dispatch,
                 # every leg still in flight is held for a higher lane: they cannot finish before the floor falls,
                 # so this drain ends (the P->D flip follows)
                 _fresh = [_t for _t in inflight if _t not in taken]
+                if (lane_take is not None and _fresh and lane_take_wait is not None
+                        and _lane_take_waits(lane_take_wait)):
+                    _fresh = []  # a floor-lane arrival has no place yet: look again next round
                 if lane_take is not None and _fresh:
                     # take them OFF P before the flip (they would stay in P's waiting queue: not idle, W3), keep
                     # them for the lane resume; the tasks end with the Pending and are read below
@@ -15029,6 +15044,8 @@ class Front:
         # NOT after P->D: nothing on D waits for the controller there (leg 2 is
         # admitted by d_admitter), and an immediate D-branch pass could only race
         # the admitter for requests still in _ready_for_d.
+        if _lanes.enabled():
+            _lctl.flip_done(self)  # LANES FIX 1: the end of the flip is the event that ends a lane's deferral
         if dst == "P":
             self._kick_controller("after_flip")
         elif Front._done_kick_due(self):
@@ -16596,6 +16613,7 @@ class Front:
                     # PRIORITY LANES 1008 (L4): legs held for a higher lane stand beside the pool, not in it
                     lane_held=((lambda p: Front._lane_p_held(self, p)) if _lanes.enabled() else None),
                     lane_take=((lambda its, cancel: _lctl.p_take(self, its, cancel)) if _lanes.enabled() else None),
+                    lane_take_wait=((lambda: _lctl.take_wait(self)) if _lanes.enabled() else None),
                     # FLIPCYCLE H5: the phase cap never strands a SHORT
                     # (the seat gate's cap is hard: a SHORT needs a D seat too)
                     cap_exempt=(self._p_phase_short_rides

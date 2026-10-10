@@ -74,6 +74,9 @@ KEPT = 4096
 #: SSE reader, owui_proxy.py:215 skips every line that is not 'data:')
 KEEPALIVE_FMT = ": lane-hold floor=%d\n\n"
 
+#: LANES FIX 1 (metal jjbbrx probe 4): the floor went up (begin of the preempt, BEFORE the awaits of its RPCs) with the
+#: time since ``WEG2-FLIP done`` that ended its deferral.  Not a prefix of ``MARK_PREEMPT`` (greps count that one).
+MARK_RAISE = "WEG2 LANE-RAISE"
 #: a held P leg taken off P before the P->D flip (L4 only, not an L1 name)
 MARK_P_TAKE = "WEG2 LANE-P-TAKE"
 #: a LEG1-EARLY leg still in flight on P cancelled and aborted by rid when its Pending is held (L4 FR2)
@@ -152,6 +155,12 @@ class LaneCtl:
         self.ever_held: "collections.OrderedDict[str, bool]" = collections.OrderedDict()
         self.reprefill: set = set()
         self.defer_logged: Optional[Tuple[int, int]] = None
+        #: LANES FIX 1: real time of the first DEFER of the standing deferral / of the last ``WEG2-FLIP done``
+        self.defer_t0: Optional[float] = None
+        self.flip_done_t: Optional[float] = None
+        #: LANES FIX 1 (probe 2b): rid -> real time of its arrival while it has no place yet (between ``arrive`` and
+        #: the creation of its Pending, ``stamp``): a request of the floor lane that is on its way to a queue.
+        self.arriving: Dict[str, float] = {}
         #: rid -> the stream request's early-open record (L4 FR2): {request, resp, lock, taken, held_t0}
         self.pre: Dict[str, Dict[str, Any]] = {}
         #: the abort tasks of cancelled early legs (a fresh leg 1 of the Pending waits for its own)
@@ -179,6 +188,7 @@ class LaneCtl:
         self.pre.pop(r, None)
         self.gates.pop(r, None)
         self.gate_done.pop(r, None)
+        self.arriving.pop(r, None)
         self.reprefill.discard(r)
         for k in [k for k, h in self.held.items() if h.p.rid == r]:
             self.held.pop(k, None)
@@ -202,6 +212,17 @@ def kick(fr: Any) -> None:
     lc = fr.__dict__.get("_lane_ctl_obj")
     if lc is not None and lc.kick_evt is not None:
         lc.kick_evt.set()
+
+
+def flip_done(fr: Any) -> None:
+    """LANES FIX 1: ``WEG2-FLIP done`` is an EVENT of the controller: the deferral of a higher lane that arrived
+    during the flip (plan decision 2) ends now, not at the next tick.  Records the time (the latency marker reads it)
+    and wakes the lane loop.  No state without the lane controller: a front that never saw a lane has no register."""
+    if not enabled():
+        return
+    lc = ctl(fr)
+    lc.flip_done_t = time.time()
+    kick(fr)
 
 
 def lane_of_pending(p: Any) -> int:
@@ -231,6 +252,7 @@ async def reconcile(fr: Any, cause: str = "tick", rid: Optional[str] = None) -> 
     lc = ctl(fr)
     target = target_floor(fr)
     if target == ls.lane_floor:
+        lc.defer_logged = lc.defer_t0 = None  # LANES FIX 1: nothing left to defer (its lane ended during the flip)
         sweep(fr)
         return
     async with _lock(lc):
@@ -238,22 +260,38 @@ async def reconcile(fr: Any, cause: str = "tick", rid: Optional[str] = None) -> 
         target = target_floor(fr)
         floor = ls.lane_floor
         if target == floor:
+            lc.defer_logged = lc.defer_t0 = None
             return
         if fr.state != "serving":
             # user decision 2: a flip runs to its end, THEN the lane displaces ("kein Flip-Abbruch").  The arrival
             # goes its normal way (it queues: nothing is admitted during a flip); the first pass after
             # ``WEG2-FLIP done`` finds floor < target and preempts.
-            if target > floor and lc.defer_logged != (target, getattr(fr, "epoch", 0)):
-                lc.defer_logged = (target, getattr(fr, "epoch", 0))
-                fr.counters["lane_defer"] += 1
-                logger.warning(
-                    "%s lane=%d floor=%d epoch=%d state=%s rid=%s -- a higher lane arrived while the front is "
-                    "not serving (a flip runs to its end, plan decision 2): the floor rises after "
-                    "WEG2-FLIP done", _ln.MARK_DEFER, target, floor, ls.lane_epoch, fr.state, rid or "-")
+            if target > floor:
+                now = time.time()
+                if lc.defer_logged != (target, getattr(fr, "epoch", 0)):
+                    lc.defer_logged = (target, getattr(fr, "epoch", 0))
+                    lc.defer_t0 = now
+                    fr.counters["lane_defer"] += 1
+                    logger.warning(
+                        "%s lane=%d floor=%d epoch=%d state=%s rid=%s -- a higher lane arrived while the front is "
+                        "not serving (a flip runs to its end, plan decision 2): the floor rises after "
+                        "WEG2-FLIP done", _ln.MARK_DEFER, target, floor, ls.lane_epoch, fr.state, rid or "-")
+                # LANES FIX 1 (metal jjbbrx probe 4): the flip is not aborted, but a LOWER lane's speculative leg 1
+                # (the D->P flip's LEG1-EARLY, posted before the lane arrived and waiting on P for its wake) must
+                # not START its first chunk the moment P wakes: a chunk in flight cannot be taken back before its
+                # border (probe 4: the 16 000-token leg started 1 ms before the abort, 6 s of P pipeline fill
+                # stood in front of the lane-1 leg, TTFT 11.7 s).  It is cancelled and aborted by rid now, the
+                # Pending stays in the queue and is held by the first pass after the flip.
+                _cancel_early_lower(fr, lc, target, now)
             return
+        deferred = lc.defer_logged is not None
+        since_done_ms = None
+        if deferred and lc.flip_done_t is not None and lc.defer_t0 is not None and lc.flip_done_t >= lc.defer_t0:
+            since_done_ms = max(0.0, (time.time() - lc.flip_done_t) * 1000.0)
         lc.defer_logged = None
+        lc.defer_t0 = None
         if target > floor:
-            await _preempt(fr, lc, ls, floor, target, cause, rid)
+            await _preempt(fr, lc, ls, floor, target, cause, rid, deferred=deferred, since_done_ms=since_done_ms)
         else:
             await _resume(fr, lc, ls, floor, target, cause)
 
@@ -289,7 +327,19 @@ def _hold_waiting(fr: Any, lc: LaneCtl, floor: int, now: float) -> int:
     return n
 
 
-def _cancel_early(fr: Any, lc: LaneCtl, p: Any, now: float) -> bool:
+def _cancel_early_lower(fr: Any, lc: LaneCtl, target: int, now: float) -> int:
+    """LANES FIX 1: during a deferral (a flip runs) cancel the early leg 1 of every waiting Pending BELOW ``target``
+    (:func:`_cancel_early`).  Idempotent (a cancelled leg is gone from the Pending).  Returns how many were cancelled."""
+    n = 0
+    for p in list(fr.queue):
+        fut = getattr(p, "fut", None)
+        if lane_of_pending(p) < target and (fut is None or not fut.done()):
+            if _cancel_early(fr, lc, p, now, when="defer", target=target):
+                n += 1
+    return n
+
+
+def _cancel_early(fr: Any, lc: LaneCtl, p: Any, now: float, when: str = "hold", target: int = -1) -> bool:
     """A Pending taken out of ``queue`` may carry a LEG1-EARLY leg still in flight on P (DP-NACHLAUF posts the
     queue head's leg 1 at the D->P flip's begin; with a lane deferred over that flip, the first pass after
     ``WEG2-FLIP done`` holds the Pending under it).  Such a leg is in no drain pool, so :func:`p_take` never sees
@@ -308,12 +358,18 @@ def _cancel_early(fr: Any, lc: LaneCtl, p: Any, now: float) -> bool:
         return False
     on_p = bool(cancel(p, "lane-hold"))
     p.lane_retake = True
-    p.lane_p_ran_s = max(0.0, now - t_on) if t_on else 0.0
+    # when=defer: the leg waited on a P that was still asleep / waking while the flip ran -- nothing ran, so nothing can be
+    # LOST (``retake_check``'s rule "stood on P and found nothing cached" would count a REPREFILL for a leg that was
+    # never admitted: the instrument that must read 0 must not be fed by the fix)
+    p.lane_p_ran_s = 0.0 if when == "defer" else (max(0.0, now - t_on) if t_on else 0.0)
     fr.counters["lane_early_taken"] += 1
-    logger.warning("%s rid=%s lane=%d floor=%d on_p=%s ran_s=%.1f -- the early leg 1 of a held request was still in "
-                   "flight on P: cancelled and aborted by rid (a leg parked in P's waiting queue is not idle for "
-                   "the P->D witness); it runs a fresh leg 1 after the resume, with the finished chunks as prefix",
-                   MARK_EARLY_TAKE, p.rid, lane_of_pending(p), fr._lane_state().lane_floor, on_p, p.lane_p_ran_s)
+    logger.warning("%s rid=%s lane=%d floor=%d on_p=%s ran_s=%.1f when=%s target=%d -- the early leg 1 of a held "
+                   "request was still in flight on P: cancelled and aborted by rid (a leg parked in P's waiting "
+                   "queue is not idle for the P->D witness); it runs a fresh leg 1 after the resume, with the "
+                   "finished chunks as prefix (when=defer: cancelled while the flip still runs, before P's wake "
+                   "starts its first chunk)",
+                   MARK_EARLY_TAKE, p.rid, lane_of_pending(p), fr._lane_state().lane_floor, on_p, p.lane_p_ran_s,
+                   when, int(target))
     if on_p:
         try:
             t = asyncio.ensure_future(fr.rpc(P, "/abort_request", {"rid": p.rid}, 30))
@@ -348,9 +404,17 @@ def sweep(fr: Any) -> int:
     return n
 
 
-async def _preempt(fr: Any, lc: LaneCtl, ls: Any, prev: int, floor: int, cause: str, rid: Optional[str]) -> None:
+async def _preempt(fr: Any, lc: LaneCtl, ls: Any, prev: int, floor: int, cause: str, rid: Optional[str],
+                   deferred: bool = False, since_done_ms: Optional[float] = None) -> None:
     t0 = time.time()
     ls.set_floor(floor)
+    # LANES FIX 1: the LANE-PREEMPT line below is written AFTER the RPCs (its ms= is the whole preempt, probe 4: 5986 ms
+    # of which the front waited for P's reply, P answering only after its in-flight chunk); this line is the moment
+    # the floor rose, with the latency from the end of the flip that deferred it.
+    logger.warning("%s floor=%d epoch=%d prev_floor=%d cause=%s rid=%s deferred=%d since_flip_done_ms=%s -- the floor "
+                   "rose (the RPCs of this preempt follow; LANE-PREEMPT is written when they have answered)",
+                   MARK_RAISE, floor, ls.lane_epoch, prev, cause, rid or "-", 1 if deferred else 0,
+                   "-" if since_done_ms is None else "%.0f" % since_done_ms)
     held = _hold_waiting(fr, lc, floor, t0)
     dorm0 = fr.counters["lane_parked_d_dormant"]
     P, D = fr.groups["P"], fr.groups["D"]
@@ -364,12 +428,15 @@ async def _preempt(fr: Any, lc: LaneCtl, ls: Any, prev: int, floor: int, cause: 
     fr.counters["lane_preempt"] += 1
     fr.counters["lane_held"] += held
     logger.warning(
-        "%s floor=%d epoch=%d parked_d=%d parked_p=%d held=%d dormant=%d prev_floor=%d cause=%s rid=%s ms=%.0f -- "
+        "%s floor=%d epoch=%d parked_d=%d parked_p=%d held=%d dormant=%d prev_floor=%d cause=%s rid=%s ms=%.0f "
+        "since_flip_done_ms=%s -- "
         "a higher lane displaces every lower one: D's running requests of lower lanes are parked (hold=lane), "
         "P's legs stop at the chunk border (floor RPC), waiting ones are held out of queue/_ready_for_d (original "
-        "arrival kept); dormant = booked for a sleeping D, confirmed by a park RPC after its wake",
+        "arrival kept); dormant = booked for a sleeping D, confirmed by a park RPC after its wake; ms = the whole "
+        "preempt (begin: LANE-RAISE), since_flip_done_ms = end of the deferring flip -> begin of the preempt",
         _ln.MARK_PREEMPT, floor, ls.lane_epoch, parked_d, len(parked_p), held,
-        fr.counters["lane_parked_d_dormant"] - dorm0, prev, cause, rid or "-", (time.time() - t0) * 1000.0)
+        fr.counters["lane_parked_d_dormant"] - dorm0, prev, cause, rid or "-", (time.time() - t0) * 1000.0,
+        "-" if since_done_ms is None else "%.0f" % since_done_ms)
     fr._kick_controller("arrival")
     _changed(fr)
 
@@ -616,6 +683,7 @@ async def arrive(fr: Any, request: Any, rid: str, client_gone: Callable[[Any], b
     lc = ctl(fr)
     lane = ls.lane_for(rid)
     floor0 = ls.lane_floor
+    lc.arriving[rid] = time.time()  # LANES FIX 1: on its way to a queue until its Pending exists (``stamp``)
     await reconcile(fr, "arrive", rid)
     if lane > 0 or ls.lane_floor > 0:
         logger.info("WEG2 LANE-ARRIVE rid=%s lane=%d floor=%d->%d epoch=%d action=%s", rid, lane, floor0,
@@ -660,6 +728,7 @@ def stamp(fr: Any, p: Any) -> None:
     lc = fr.__dict__.get("_lane_ctl_obj")
     if lc is None:
         return
+    lc.arriving.pop(p.rid, None)  # it has a place now: the drain sees it in the queue
     got = lc.gate_done.pop(p.rid, None)
     if got is not None:
         p.t_arrive = got[0]
@@ -681,6 +750,27 @@ def p_ledger(fr: Any, g: Any) -> List[str]:
 def lane_held_leg(fr: Any, p: Any) -> bool:
     """For the P drain pool and the leg-1 stall check: is this leg held for a higher lane?"""
     return enabled() and p_held(fr, lane_of_pending(p))
+
+
+def take_wait(fr: Any) -> bool:
+    """LANES FIX 1 (metal jjbbrx probe 2b): True = the P drain pool must NOT take its held legs off P yet, because a
+    request of the floor lane (or above) has arrived and has no place yet -- it is between ``arrive`` (whose reconcile
+    raised the floor, and awaits P's reply to it) and the creation of its Pending.  The pool sees only the held legs
+    in that window and would take them off P and flip P->D although the floor lane's OWN leg is about to be queued
+    for P: probe 2b took the 98 000-token leg, flipped P->D and, 5 s later, D->P again for the 16 000-token lane-1
+    leg (TTFT 18.3 s), and the L3 chunk park (``WEG2-PARK (lane)``) could never fire.  With the leg queued the pool
+    dispatches it beside the held leg, P applies the floor at its next chunk border and parks the lower lane there
+    (the plan path); a lane-1 request that is NOT P-bound leaves P with only held legs and they are taken then.
+    A rid that already stands in a group's outstanding set has its place."""
+    lc = fr.__dict__.get("_lane_ctl_obj")
+    if not enabled() or lc is None or not lc.arriving:
+        return False
+    ls = fr._lane_state()
+    placed = set(fr.groups["P"].outstanding) | set(fr.groups["D"].outstanding)
+    for rid in list(lc.arriving):
+        if rid not in placed and ls.lane_for(rid) >= ls.lane_floor:
+            return True
+    return False
 
 
 async def p_take(fr: Any, items: List[Any], cancel: Callable[[], Any]) -> int:
