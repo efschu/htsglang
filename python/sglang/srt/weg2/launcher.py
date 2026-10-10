@@ -33,8 +33,8 @@ Declared V1 deviations (all printed at launch and listed in the postmortem):
 * SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION=0 for both groups (K2): /health
   is a pure liveness probe; the front's /health_generate reaches the AWAKE
   group only.
-* the deadmen of the two groups run tier 1 only (PROBE_S spaced past the
-  boot); tier 2 (/health_generate) runs on the FRONT's deadman, which the
+* the deadmen of the two groups run tier 1 only (TIER2=0, #1158c; PROBE_S
+  spaced past the boot); tier 2 (/health_generate) runs on the FRONT's deadman, which the
   front routes to the awake group.
 """
 
@@ -13545,6 +13545,10 @@ def release_shared_cache(spec_d: GroupSpec, log: Log) -> Optional[dict]:
     return rec
 
 
+#: deadmen that never probe their own port (boot_deadman.sh TIER2=0): the two groups, whose ports sit behind the front.
+GROUP_DEADMEN_TIER1_ONLY = ("P", "D")
+
+
 def arm_deadman(log: Log, boot_log: str, port: int, pattern: str, probe_s: int, tag: str, name: str, dry: bool) -> int:
     out = f"{GPU_ARB}/deadman_{tag}_{name}.out"
     # IPC Phase 2 (IPC-VERBRAUCHER-27B A4/N4): the deadman writes its verdict into the
@@ -13553,6 +13557,13 @@ def arm_deadman(log: Log, boot_log: str, port: int, pattern: str, probe_s: int, 
     # the group, the interpreter and the writer file (the image has no sglang on PATH).
     ipc = (f"WEG2_DEADMAN_GROUP={shlex.quote(name)} WEG2_PY={shlex.quote(sys.executable)} "
            f"WEG2_STATE_FILE_PY={shlex.quote(state_file_mod.__file__)} ")
+    # #1158c root: the GROUP deadmen run tier 1 only, said explicitly -- PROBE_S spaced past the boot alone did not hold
+    # (boot_deadman.sh started its probe clock at 0, so ONE /health_generate hit the group port at grace end and ran as D's
+    # first forward inside a flip's quiesce window, metal 10.10. 01:07:32Z -> W120). TIER2=0 keeps every synthetic generate
+    # off the group ports; the front's deadman keeps tier 2 (it reaches the awake group through the front).
+    tier1_only = name in GROUP_DEADMEN_TIER1_ONLY
+    if tier1_only:
+        ipc += "TIER2=0 "
     cmd = f"{ipc}GRACE_S=600 PROBE_S={probe_s} setsid {DEADMAN} {shlex.quote(boot_log)} {port} {shlex.quote(pattern)} > {shlex.quote(out)} 2>&1 & echo $!"
     if dry:
         log(f"DRY-RUN: would arm deadman: {cmd}")
@@ -13563,7 +13574,7 @@ def arm_deadman(log: Log, boot_log: str, port: int, pattern: str, probe_s: int, 
     time.sleep(1)
     proof = subprocess.run(["pgrep", "-af", f"boot_deadman.sh {boot_log}"], capture_output=True, text=True).stdout.strip()
     n = len(proof.splitlines())
-    log(f"deadman {name}: pid {pid} GRACE_S=600 PROBE_S={probe_s} pattern={pattern!r} verdict -> {out}; pgrep proof: {n} process(es) whose argv carries THIS log ({proof or 'NONE -- UNKNOWN, never alive'})")
+    log(f"deadman {name}: pid {pid} GRACE_S=600 PROBE_S={probe_s}{' TIER2=0' if tier1_only else ''} pattern={pattern!r} verdict -> {out}; pgrep proof: {n} process(es) whose argv carries THIS log ({proof or 'NONE -- UNKNOWN, never alive'})")
     return pid
 
 
