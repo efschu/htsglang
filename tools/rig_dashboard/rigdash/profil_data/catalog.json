@@ -488,7 +488,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24748
+    "line": 24758
    },
    "status": "geerntet",
    "text": "",
@@ -547,7 +547,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24779
+    "line": 24789
    },
    "status": "geerntet",
    "text": "",
@@ -819,7 +819,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 22781
+    "line": 22783
    },
    "status": "geerntet",
    "text": "",
@@ -848,7 +848,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23210
+    "line": 23212
    },
    "status": "geerntet",
    "text": "",
@@ -1150,7 +1150,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24756
+    "line": 24766
    },
    "status": "geerntet",
    "text": "",
@@ -1359,7 +1359,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24577
+    "line": 24587
    },
    "status": "geerntet",
    "text": "",
@@ -1811,7 +1811,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23187
+    "line": 23189
    },
    "status": "geerntet",
    "text": "",
@@ -1840,7 +1840,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24763
+    "line": 24773
    },
    "status": "geerntet",
    "text": "",
@@ -1883,7 +1883,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 22984
+    "line": 22986
    },
    "status": "kuratiert",
    "text": "Concurrent requests of the decode group and number of front seats.",
@@ -1912,7 +1912,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23198
+    "line": 23200
    },
    "status": "geerntet",
    "text": "",
@@ -1941,7 +1941,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23118
+    "line": 23120
    },
    "status": "geerntet",
    "text": "",
@@ -1970,7 +1970,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24704
+    "line": 24714
    },
    "status": "geerntet",
    "text": "",
@@ -1999,7 +1999,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24717
+    "line": 24727
    },
    "status": "geerntet",
    "text": "",
@@ -2028,7 +2028,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23065
+    "line": 23067
    },
    "status": "geerntet",
    "text": "",
@@ -2060,7 +2060,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23420
+    "line": 23422
    },
    "status": "geerntet",
    "text": "",
@@ -2103,7 +2103,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23180
+    "line": 23182
    },
    "status": "kuratiert",
    "text": "D stays awake this many seconds after its work before it flips (0/empty = off).",
@@ -2135,7 +2135,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23383
+    "line": 23385
    },
    "status": "geerntet",
    "text": "",
@@ -2164,7 +2164,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23393
+    "line": 23395
    },
    "status": "geerntet",
    "text": "",
@@ -2193,7 +2193,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23397
+    "line": 23399
    },
    "status": "geerntet",
    "text": "",
@@ -2255,7 +2255,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23051
+    "line": 23053
    },
    "status": "kuratiert",
    "text": "Cuts the attention KV of the decode group by token across the cards (off/maxmin/vector/joint/owned).",
@@ -2284,7 +2284,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23075
+    "line": 23077
    },
    "status": "geerntet",
    "text": "",
@@ -2305,7 +2305,7 @@
       "anker": "(--tp-prefill-max-tokens = --max-kv-per-request)",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
-      "zeile": 23003,
+      "zeile": 23005,
       "zeile_hinweis": 23003
      },
      "belegt": true,
@@ -2334,7 +2334,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 22999
+    "line": 23001
    },
    "status": "kuratiert",
    "text": "Group D only (TP3 on all cards), no P, no flip, no front (user 25.09.). D is built with the same env and the same argv as in the flip boot (budgets from the expectation as in the dry run), but accepts every uncached length itself (--tp-prefill-max-tokens = --max-kv-per-request) and is addressed directly on the port.",
@@ -2363,7 +2363,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24659
+    "line": 24669
    },
    "status": "geerntet",
    "text": "",
@@ -2395,7 +2395,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23286
+    "line": 23288
    },
    "status": "geerntet",
    "text": "",
@@ -2424,7 +2424,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23086
+    "line": 23088
    },
    "status": "geerntet",
    "text": "",
@@ -2472,7 +2472,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23401
+    "line": 23403
    },
    "status": "kuratiert",
    "text": "The weight split of the decode group per load class (off/wake/wake-seg/live).",
@@ -2501,7 +2501,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23414
+    "line": 23416
    },
    "status": "geerntet",
    "text": "",
@@ -2530,7 +2530,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23430
+    "line": 23432
    },
    "status": "geerntet",
    "text": "",
@@ -2559,7 +2559,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23425
+    "line": 23427
    },
    "status": "geerntet",
    "text": "",
@@ -2588,7 +2588,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23104
+    "line": 23106
    },
    "status": "geerntet",
    "text": "",
@@ -2617,7 +2617,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23092
+    "line": 23094
    },
    "status": "geerntet",
    "text": "",
@@ -2646,7 +2646,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23099
+    "line": 23101
    },
    "status": "geerntet",
    "text": "",
@@ -2667,7 +2667,7 @@
       "anker": "refuse_short_drain_above_x(int(ns.d_short_drain_tokens",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
-      "zeile": 25461,
+      "zeile": 25617,
       "zeile_hinweis": 25461
      },
      "belegt": true,
@@ -2686,7 +2686,7 @@
       "anker": "both must be >= 0",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
-      "zeile": 25458,
+      "zeile": 25614,
       "zeile_hinweis": 25458
      },
      "belegt": true,
@@ -2708,7 +2708,7 @@
       "anker": "--tp-prefill-max-tokens / --x-ceiling-tokens / --d-short-drain-tokens there.",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
-      "zeile": 22875,
+      "zeile": 22877,
       "zeile_hinweis": 22875
      },
      "belegt": true,
@@ -2736,7 +2736,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23172
+    "line": 23174
    },
    "status": "kuratiert",
    "text": "While D is awake, a backlog consisting only of short requests (each at most X) is served on D if their tokens do not exceed N. 0 = off.",
@@ -2765,7 +2765,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23379
+    "line": 23381
    },
    "status": "geerntet",
    "text": "",
@@ -2797,7 +2797,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23364
+    "line": 23366
    },
    "status": "geerntet",
    "text": "",
@@ -2826,7 +2826,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23375
+    "line": 23377
    },
    "status": "geerntet",
    "text": "",
@@ -2847,7 +2847,7 @@
       "anker": "p_split=p_split, chunk_layers=chunk_layers)\n        d_ratio = d_tp_ratio_decision(",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
-      "zeile": 27340,
+      "zeile": 27505,
       "zeile_hinweis": 27340
      },
      "belegt": true,
@@ -2875,7 +2875,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24598
+    "line": 24608
    },
    "status": "kuratiert",
    "text": "What the weight vector of the decode group is solved for: the operating point bs6 (default) or 'maxkv' (largest KV pool first).",
@@ -2904,7 +2904,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24670
+    "line": 24680
    },
    "status": "geerntet",
    "text": "",
@@ -2933,7 +2933,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24696
+    "line": 24706
    },
    "status": "geerntet",
    "text": "",
@@ -2965,7 +2965,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24686
+    "line": 24696
    },
    "status": "geerntet",
    "text": "",
@@ -3129,7 +3129,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 22789
+    "line": 22791
    },
    "status": "unerklaert",
    "text": "",
@@ -3758,7 +3758,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23267
+    "line": 23269
    },
    "status": "geerntet",
    "text": "",
@@ -3787,7 +3787,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23265
+    "line": 23267
    },
    "status": "geerntet",
    "text": "",
@@ -3819,7 +3819,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23272
+    "line": 23274
    },
    "status": "erklaert",
    "text": "DFlash only: off (default) group P loads the draft cold only and computes nothing with it; on is the old producer form, for A/B comparisons only.",
@@ -3848,7 +3848,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23269
+    "line": 23271
    },
    "status": "geerntet",
    "text": "",
@@ -5095,7 +5095,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23234
+    "line": 23236
    },
    "status": "kuratiert",
    "text": "Whether group P is the pure draft KV PRODUCER (#1264). 'on' (default; standing user order of 2026-09-07: draft KV across the flip) puts the mtp.* head of the checkpoint on P's last stage so that D resumes with a warm draft KV after a flip. 'off' boots the rg6-proven form: P carries NO speculative flag and no MTP head (the launcher says so in one line; the serving base / the A-B arm, never silently). Group D stays unchanged with both values: it keeps its own NEXTN head, because 'off' removes the producer, not the speculative decoding.",
@@ -5124,7 +5124,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23193
+    "line": 23195
    },
    "status": "geerntet",
    "text": "",
@@ -5153,7 +5153,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 22765
+    "line": 22767
    },
    "status": "erklaert",
    "text": "Plans and checks the start without actually starting the groups.",
@@ -5336,7 +5336,7 @@
       "anker": "--dual-priority / --dual-d-capture-prio / --dual-p-mps-low-prio need --dual-layout",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
-      "zeile": 15166,
+      "zeile": 15168,
       "zeile_hinweis": 15166
      },
      "belegt": true,
@@ -5365,7 +5365,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 22913
+    "line": 22915
    },
    "status": "kuratiert",
    "text": "DUAL-SHARE stage 1a: D records its CUDA graphs on the device's highest-priority stream (graph nodes keep the priority of the capture stream). Group D of the dual layout only.",
@@ -5388,7 +5388,7 @@
       "anker": "DUAL-TP3PP3 --dual-unified-kv: D's KV pool in GLOBAL tokens",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
-      "zeile": 22946,
+      "zeile": 22948,
       "zeile_hinweis": 22946
      },
      "belegt": true,
@@ -5417,7 +5417,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 22945
+    "line": 22947
    },
    "status": "kuratiert",
    "text": "DUAL-TP3PP3 --dual-unified-kv (default 1048576): D's KV pool in GLOBAL tokens (virtual; D keeps its boot state mapped and grows from the card pool). Must exceed D's boot context; every buffer is created in its owner share of it and immediately trimmed.",
@@ -5446,7 +5446,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 22898
+    "line": 22900
    },
    "status": "kuratiert",
    "text": "DUAL-SHARE: D's minimum decode rate per request (tokens/s, measured on the leg 2 token stream); below it the rung moves toward D. 0 = off.",
@@ -5475,7 +5475,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 22868
+    "line": 22870
    },
    "status": "kuratiert",
    "text": "DUAL-TP3PP3 D prefill admission, default 0 (user 01.10.: in the dual layout EVERY prefill runs on P, D only decodes). D's X (its W31 latch and the routing limit of the front) becomes 1 + this value: the 1 is the N-1 anchor convention (P holds back the last prompt token, D's first step computes it); everything larger goes to P, and a larger remainder on D is refused by name (W31 -> P), never silently recomputed. Ignored without --dual-layout; there it replaces --tp-prefill-max-tokens / --x-ceiling-tokens / --d-short-drain-tokens.",
@@ -5502,7 +5502,7 @@
       "anker": "--dual-green-ladder needs --dual-priority",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
-      "zeile": 15182,
+      "zeile": 15184,
       "zeile_hinweis": 15182
      },
      "belegt": true,
@@ -5524,7 +5524,7 @@
       "anker": "needs 'green' in --dual-share-actuators",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
-      "zeile": 15186,
+      "zeile": 15188,
       "zeile_hinweis": 15186
      },
      "belegt": true,
@@ -5546,7 +5546,7 @@
       "anker": "--dual-green-ladder needs --dual-mps on",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
-      "zeile": 15190,
+      "zeile": 15192,
       "zeile_hinweis": 15190
      },
      "belegt": true,
@@ -5568,7 +5568,7 @@
       "anker": "needs --dual-p-kv-max-tokens > 0",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
-      "zeile": 15194,
+      "zeile": 15196,
       "zeile_hinweis": 15194
      },
      "belegt": true,
@@ -5590,7 +5590,7 @@
       "anker": "--dual-green-ladder and --dual-p-sm-pct below 100 exclude each other",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
-      "zeile": 15198,
+      "zeile": 15200,
       "zeile_hinweis": 15198
      },
      "belegt": true,
@@ -5619,7 +5619,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 22906
+    "line": 22908
    },
    "status": "kuratiert",
    "text": "DUAL-SHARE stage 3 (weg2/dual_green.py): P's SM share as a green context LADDER (100/75/50/25 % per forward, dynamic, up AND down; PP0 stamps the rung onto the request wire so that all three stages run the same one). 'on' = ladder + hold OBSERVER (the P-STUFE line carries would_hold), 'hold' = additionally PP0 really holds (0 %) while the arena is full. Default off = argv/env/start path byte-identical.",
@@ -6503,7 +6503,7 @@
      "source": {
       "file": "weg2/launcher.py",
       "kind": "argparse",
-      "line": 22850
+      "line": 22852
      }
     },
     "nf": {
@@ -6512,7 +6512,7 @@
      "source": {
       "file": "weg2/launcher.py",
       "kind": "argparse",
-      "line": 22189
+      "line": 22191
      }
     }
    },
@@ -6533,7 +6533,7 @@
       "anker": "WEG2-DUAL --dual-share implies --dual-layout",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
-      "zeile": 14762,
+      "zeile": 14764,
       "zeile_hinweis": 14762
      },
      "belegt": true,
@@ -6555,7 +6555,7 @@
       "anker": "with --weg2-d-adopt on -- D would hold placeholder",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
-      "zeile": 14789,
+      "zeile": 14791,
       "zeile_hinweis": 14789
      },
      "belegt": true,
@@ -6584,7 +6584,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 22850
+    "line": 22852
    },
    "status": "kuratiert",
    "text": "DUAL-TP3PP3 (F26, user 29.09.): BOTH groups stay awake for the whole boot, the front never flips. Implies --flip-weights resident; P is not put to sleep after READY, instead its AWAKE footprint is measured and D is sized afterwards (the same PID measurement as for the sleep remainder). The budget of P itself is lowered with --extra-p '--rank-gpu-memory-mib ...' (W100 allows lowering). Refuses --weg2-d-adopt on and --idle-layout pp (help=; the code switches pp to tp without refusing, launcher.py:14722). Default off: the launcher is byte-identical.",
@@ -6610,7 +6610,7 @@
       "anker": "--dual-mps on needs --dual-layout",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
-      "zeile": 14769,
+      "zeile": 14771,
       "zeile_hinweis": 14769
      },
      "belegt": true,
@@ -6639,7 +6639,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 22949
+    "line": 22951
    },
    "status": "kuratiert",
    "text": "DUAL-TP3PP3: starts a private MPS control daemon before the groups (pipe directory under the run directory of the boot) so that P and D kernels run simultaneously on a card instead of time-sliced. Only with --dual-layout.",
@@ -6668,7 +6668,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 22876
+    "line": 22878
    },
    "status": "kuratiert",
    "text": "DUAL-TP3PP3 pause admission (default 1.0 = no pause): P and D run at the same time and share every card, only physics limits them (user 01.10.). Below 1.0 P MAY pause while D holds decodes: the share of wall-clock time in which P's first stage may compute (weg2/dual_duty.py). Simple form: PP0 waits t_fwd*(1-duty)/duty after every forward. With the env SGLANG_WEG2_DUAL_P_GANG_CHUNKS=K (gang window): PP0 computes K chunks, waits until the pipeline is empty and then holds, so that D is alone on all cards.",
@@ -6691,7 +6691,7 @@
       "anker": "DUAL-TP3PP3 --dual-unified-kv: P's KV pool rows",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
-      "zeile": 22942,
+      "zeile": 22944,
       "zeile_hinweis": 22942
      },
      "belegt": true,
@@ -6720,7 +6720,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 22941
+    "line": 22943
    },
    "status": "kuratiert",
    "text": "DUAL-TP3PP3 --dual-unified-kv (default 196608): P's KV pool rows (virtual; pages come from the card pool). Every K/V buffer is created at this size and immediately trimmed, so the boot peak is one buffer (tokens x bytes per token per layer).",
@@ -6749,7 +6749,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 22901
+    "line": 22903
    },
    "status": "kuratiert",
    "text": "DUAL-SHARE: lower limit of P's share (rungs below are never used; default 0.25).",
@@ -6775,7 +6775,7 @@
       "anker": "Needs --dual-mps on, else a named W-DUAL-SHARE-FALLBACK line",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
-      "zeile": 22918,
+      "zeile": 22920,
       "zeile_hinweis": 22918
      },
      "belegt": true,
@@ -6797,7 +6797,7 @@
       "anker": "--dual-priority / --dual-d-capture-prio / --dual-p-mps-low-prio need --dual-layout",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
-      "zeile": 15166,
+      "zeile": 15168,
       "zeile_hinweis": 15166
      },
      "belegt": true,
@@ -6826,7 +6826,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 22916
+    "line": 22918
    },
    "status": "kuratiert",
    "text": "DUAL-SHARE stage 1b: P starts with CUDA_MPS_CLIENT_PRIORITY=1 (below normal; read at connect, at boot only).",
@@ -6849,7 +6849,7 @@
       "anker": "DUAL-TP3PP3 --dual-share: what P holds on a card outside its",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
-      "zeile": 22865,
+      "zeile": 22867,
       "zeile_hinweis": 22865
      },
      "belegt": true,
@@ -6871,7 +6871,7 @@
       "anker": "DUAL-TP3PP3 --dual-share: what P holds on a card outside its",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
-      "zeile": 22865,
+      "zeile": 22867,
       "zeile_hinweis": 22865
      },
      "belegt": true,
@@ -6900,7 +6900,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 22864
+    "line": 22866
    },
    "status": "kuratiert",
    "text": "DUAL-TP3PP3 --dual-share (default 1500): what P holds on a card outside its --rank-gpu-memory-mib budget (CUDA context, graphs, activations); is credited when D is sized from P's plan instead of from P's measurement.",
@@ -6926,7 +6926,7 @@
       "anker": "DEFAULT: ON with --dual-share, OFF otherwise",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
-      "zeile": 22920,
+      "zeile": 22922,
       "zeile_hinweis": 22920
      },
      "belegt": true,
@@ -6948,7 +6948,7 @@
       "anker": "D PRIORITY stage 2 is armed: dual layout + unified KV",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
-      "zeile": 14955,
+      "zeile": 14957,
       "zeile_hinweis": 14955
      },
      "belegt": true,
@@ -6977,7 +6977,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 22919
+    "line": 22921
    },
    "status": "kuratiert",
    "text": "Default: ON with --dual-share, otherwise OFF. With --dual-unified-kv on: D PRIORITY stage 2 (user 01.10.): if D is still short after P has stopped and released its KV, P sleeps and parks its weights in host RAM (P boots with --enable-weights-cpu-backup and NOT resident; the host image is created at the pause and released after the restore, no idle image, NO-PERMANENT-HOSTRAM). off = stage 1 only; the front prints 'stage=2 unavailable (weights resident)'.",
@@ -7006,7 +7006,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 22883
+    "line": 22885
    },
    "status": "kuratiert",
    "text": "DUAL-TP3PP3 with --dual-mps on (default 100): CUDA_MPS_ACTIVE_THREAD_PERCENTAGE for group P, that is the share of the SMs that P's kernels may occupy while D decodes. 100 = no limit.",
@@ -7029,7 +7029,7 @@
       "anker": "--dual-priority / --dual-d-capture-prio / --dual-p-mps-low-prio need --dual-layout",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
-      "zeile": 15166,
+      "zeile": 15168,
       "zeile_hinweis": 15166
      },
      "belegt": true,
@@ -7058,7 +7058,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 22892
+    "line": 22894
    },
    "status": "kuratiert",
    "text": "DUAL-SHARE stage 2: the P/D share controller of the front writes a rung (P's share 1.0/0.75/0.5/0.25, profile env SGLANG_WEG2_DUAL_SHARE_RUNGS) to <busy>.ctl; P acts on it via --dual-share-actuators. p = P full (today), balanced/d = one fixed rung while D decodes, dynamic = matrix from tau (waiting prefill tokens / P's full rate) x D bs. Switchable at runtime: POST /weg2/dual-priority on the front. Unset = off.",
@@ -7072,7 +7072,7 @@
      "source": {
       "file": "weg2/launcher.py",
       "kind": "argparse",
-      "line": 22858
+      "line": 22860
      }
     },
     "nf": {
@@ -7081,7 +7081,7 @@
      "source": {
       "file": "weg2/launcher.py",
       "kind": "argparse",
-      "line": 22193
+      "line": 22195
      }
     }
    },
@@ -7102,7 +7102,7 @@
       "anker": "WEG2-DUAL --dual-share implies --dual-layout",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
-      "zeile": 14762,
+      "zeile": 14764,
       "zeile_hinweis": 14762
      },
      "belegt": true,
@@ -7131,7 +7131,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 22858
+    "line": 22860
    },
    "status": "kuratiert",
    "text": "DUAL-TP3PP3 stage 1b (implies --dual-layout): P's stage computes on D's TP shards (envelopes over D's three shards of its layers) and binds the shard of the D rank on its card to D's bytes via the union image. D boots directly after P as union OWNER, sized from P's PLANNED budget (+ --dual-p-overhead-mib); P waits for D's image before it loads anything.",
@@ -7154,7 +7154,7 @@
       "anker": "--dual-share-actuators duty with --dual-p-duty below 1",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
-      "zeile": 15204,
+      "zeile": 15206,
       "zeile_hinweis": 15204
      },
      "belegt": true,
@@ -7183,7 +7183,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 22903
+    "line": 22905
    },
    "status": "kuratiert",
    "text": "DUAL-SHARE: comma list of the P actuators (default 'chunk'): chunk (PP0's chunk upper limit), duty (P duty throttle at the rung's share), green (rung 3, NOT built: named fallback to chunk).",
@@ -7209,7 +7209,7 @@
       "anker": "--dual-unified-kv on needs --dual-share",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
-      "zeile": 14759,
+      "zeile": 14761,
       "zeile_hinweis": 14759
      },
      "belegt": true,
@@ -7238,7 +7238,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 22937
+    "line": 22939
    },
    "status": "kuratiert",
    "text": "DUAL-TP3PP3: one KV pool per card that P and D share at runtime (user order 30.09. 07:10Z/07:25Z; weg2/card_kv_ledger.py). P maps KV only while it prefills, and pauses when D is short. Needs --dual-share.",
@@ -7267,7 +7267,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23735
+    "line": 23737
    },
    "status": "geerntet",
    "text": "",
@@ -10270,7 +10270,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 22964
+    "line": 22966
    },
    "status": "kuratiert",
    "text": "Environment variables for group D only: KEY=VAL;KEY=VAL (values may carry commas, the last one wins).",
@@ -10299,7 +10299,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 22963
+    "line": 22965
    },
    "status": "kuratiert",
    "text": "Environment variables for group P only: KEY=VAL;KEY=VAL (values may carry commas, the last one wins).",
@@ -10538,7 +10538,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23733
+    "line": 23735
    },
    "status": "geerntet",
    "text": "",
@@ -10747,7 +10747,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 22965
+    "line": 22967
    },
    "status": "kuratiert",
    "text": "Further server flags for group D, as one string (shell separation).",
@@ -10806,7 +10806,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 22962
+    "line": 22964
    },
    "status": "kuratiert",
    "text": "Further server flags for group P, as one string (shell separation).",
@@ -10835,7 +10835,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 22966
+    "line": 22968
    },
    "status": "geerntet",
    "text": "",
@@ -11134,7 +11134,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23034
+    "line": 23036
    },
    "status": "geerntet",
    "text": "",
@@ -11240,7 +11240,7 @@
       "anker": "(both groups stay awake, no weight ever sleeps)",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
-      "zeile": 14799,
+      "zeile": 14801,
       "zeile_hinweis": 14799
      },
      "belegt": true,
@@ -11268,7 +11268,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 22955
+    "line": 22957
    },
    "status": "kuratiert",
    "text": "'family' (default) moves the weights on the P/D change; 'resident' keeps both groups in VRAM and only changes the KV cache.",
@@ -11282,7 +11282,7 @@
      "source": {
       "file": "weg2/launcher.py",
       "kind": "argparse",
-      "line": 22766
+      "line": 22768
      }
     },
     "nf": {
@@ -11291,7 +11291,7 @@
      "source": {
       "file": "weg2/launcher.py",
       "kind": "argparse",
-      "line": 22245
+      "line": 22247
      }
     }
    },
@@ -11317,7 +11317,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 22766
+    "line": 22768
    },
    "status": "geerntet",
    "text": "",
@@ -11346,7 +11346,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23590
+    "line": 23592
    },
    "status": "geerntet",
    "text": "",
@@ -11495,7 +11495,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23627
+    "line": 23629
    },
    "status": "geerntet",
    "text": "",
@@ -11554,7 +11554,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23612
+    "line": 23614
    },
    "status": "geerntet",
    "text": "",
@@ -11583,7 +11583,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 22968
+    "line": 22970
    },
    "status": "geerntet",
    "text": "",
@@ -12475,7 +12475,7 @@
       "anker": "no --host-riegel-gib",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
-      "zeile": 19500,
+      "zeile": 19502,
       "zeile_hinweis": 19500
      },
      "belegt": true,
@@ -12503,7 +12503,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 22734
+    "line": 22736
    },
    "status": "kuratiert",
    "text": "Accepts a refused host ledger verdict under a named reason; requires --host-riegel-gib.",
@@ -12524,7 +12524,7 @@
       "anker": "Requires --host-riegel-gib",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
-      "zeile": 22736,
+      "zeile": 22738,
       "zeile_hinweis": 22736
      },
      "belegt": true,
@@ -12552,7 +12552,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 22739
+    "line": 22741
    },
    "status": "kuratiert",
    "text": "Runtime latch (GiB not reclaimable) below which a refused host ledger deviation is accepted; must lie below the hard limit.",
@@ -12592,7 +12592,7 @@
       "anker": "flip rule",
       "aufloesung": "nah",
       "datei": "python/sglang/srt/weg2/launcher.py",
-      "zeile": 14792,
+      "zeile": 14794,
       "zeile_hinweis": 14792
      },
      "belegt": true,
@@ -12620,7 +12620,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23168
+    "line": 23170
    },
    "status": "kuratiert",
    "text": "Which group is awake in the idle state: tp (decode group D) or pp (prefill group P).",
@@ -15599,7 +15599,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24798
+    "line": 24808
    },
    "status": "geerntet",
    "text": "",
@@ -15661,7 +15661,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23195
+    "line": 23197
    },
    "status": "kuratiert",
    "text": "KV upper limit per request for both groups. Without a value the context of the model applies.",
@@ -15897,7 +15897,7 @@
       "anker": "str(d_bs)",
       "aufloesung": "nah",
       "datei": "python/sglang/srt/weg2/launcher.py",
-      "zeile": 9328,
+      "zeile": 9330,
       "zeile_hinweis": 9328
      },
      "belegt": true,
@@ -15916,7 +15916,7 @@
       "anker": "str(p_bs)",
       "aufloesung": "nah",
       "datei": "python/sglang/srt/weg2/launcher.py",
-      "zeile": 8889,
+      "zeile": 8891,
       "zeile_hinweis": 8889
      },
      "belegt": true,
@@ -16094,7 +16094,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23036
+    "line": 23038
    },
    "status": "geerntet",
    "text": "",
@@ -16273,7 +16273,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 22712
+    "line": 22714
    },
    "status": "kuratiert",
    "text": "Path of the model checkpoint (or of the GGUF file).",
@@ -16920,7 +16920,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24806
+    "line": 24816
    },
    "status": "geerntet",
    "text": "",
@@ -16949,7 +16949,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24813
+    "line": 24823
    },
    "status": "geerntet",
    "text": "",
@@ -16978,7 +16978,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24822
+    "line": 24832
    },
    "status": "geerntet",
    "text": "",
@@ -17006,7 +17006,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24305
+    "line": 24315
    },
    "status": "geerntet",
    "text": "",
@@ -17034,7 +17034,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23587
+    "line": 23589
    },
    "status": "geerntet",
    "text": "",
@@ -17093,7 +17093,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24541
+    "line": 24551
    },
    "status": "erklaert",
    "text": "Group D only: how many decode steps run per scheduler visit; 1 restores the shipped value.",
@@ -17395,7 +17395,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23547
+    "line": 23549
    },
    "status": "geerntet",
    "text": "",
@@ -17427,7 +17427,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23571
+    "line": 23573
    },
    "status": "geerntet",
    "text": "",
@@ -17456,7 +17456,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23566
+    "line": 23568
    },
    "status": "geerntet",
    "text": "",
@@ -17485,7 +17485,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23561
+    "line": 23563
    },
    "status": "geerntet",
    "text": "",
@@ -17514,7 +17514,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24769
+    "line": 24779
    },
    "status": "geerntet",
    "text": "",
@@ -17557,7 +17557,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 22977
+    "line": 22979
    },
    "status": "kuratiert",
    "text": "Concurrent requests of the prefill group (and concurrency of the front, leg 1).",
@@ -17586,7 +17586,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24343
+    "line": 24353
    },
    "status": "geerntet",
    "text": "",
@@ -17615,7 +17615,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23145
+    "line": 23147
    },
    "status": "geerntet",
    "text": "",
@@ -17644,7 +17644,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23152
+    "line": 23154
    },
    "status": "geerntet",
    "text": "",
@@ -17673,7 +17673,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23130
+    "line": 23132
    },
    "status": "geerntet",
    "text": "",
@@ -17702,7 +17702,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23535
+    "line": 23537
    },
    "status": "geerntet",
    "text": "",
@@ -17731,7 +17731,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23498
+    "line": 23500
    },
    "status": "geerntet",
    "text": "",
@@ -17760,7 +17760,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23530
+    "line": 23532
    },
    "status": "geerntet",
    "text": "",
@@ -17822,7 +17822,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23490
+    "line": 23492
    },
    "status": "kuratiert",
    "text": "Only with --p-chunk-policy dynamic: the widest chunk; it becomes the chunk size of the P group.",
@@ -17851,7 +17851,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23494
+    "line": 23496
    },
    "status": "geerntet",
    "text": "",
@@ -17880,7 +17880,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23543
+    "line": 23545
    },
    "status": "geerntet",
    "text": "",
@@ -17923,7 +17923,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23504
+    "line": 23506
    },
    "status": "kuratiert",
    "text": "Only with dynamic: the time model per stage ('builtin-int8', 'fit:<P.log>' or a JSON file).",
@@ -17972,7 +17972,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23510
+    "line": 23512
    },
    "status": "kuratiert",
    "text": "Only with dynamic and a built-in/fitted model: the cost curve over the chunk width per stage.",
@@ -18062,7 +18062,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23434
+    "line": 23436
    },
    "status": "kuratiert",
    "text": "How wide the prefill chunks are: 'fixed' (every forward takes --chunked-prefill-size) or 'dynamic' (one plan per request with a ramp-up and a ramp-down).",
@@ -18091,7 +18091,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 22973
+    "line": 22975
    },
    "status": "geerntet",
    "text": "",
@@ -18120,7 +18120,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23358
+    "line": 23360
    },
    "status": "geerntet",
    "text": "",
@@ -18149,7 +18149,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23673
+    "line": 23675
    },
    "status": "geerntet",
    "text": "",
@@ -18182,7 +18182,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24725
+    "line": 24735
    },
    "status": "geerntet",
    "text": "",
@@ -18196,7 +18196,7 @@
      "source": {
       "file": "weg2/launcher.py",
       "kind": "argparse",
-      "line": 24290
+      "line": 24300
      }
     },
     "nf": {
@@ -18205,7 +18205,7 @@
      "source": {
       "file": "weg2/launcher.py",
       "kind": "argparse",
-      "line": 23671
+      "line": 23680
      }
     }
    },
@@ -18231,7 +18231,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24290
+    "line": 24300
    },
    "status": "geerntet",
    "text": "",
@@ -18260,7 +18260,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24320
+    "line": 24330
    },
    "status": "kuratiert",
    "text": "Instrument: one line per forward with the idle time of the card before it (P).",
@@ -18292,7 +18292,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23451
+    "line": 23453
    },
    "status": "geerntet",
    "text": "",
@@ -18321,7 +18321,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23463
+    "line": 23465
    },
    "status": "geerntet",
    "text": "",
@@ -18350,7 +18350,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23470
+    "line": 23472
    },
    "status": "geerntet",
    "text": "",
@@ -18379,7 +18379,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23486
+    "line": 23488
    },
    "status": "geerntet",
    "text": "",
@@ -18408,7 +18408,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23474
+    "line": 23476
    },
    "status": "geerntet",
    "text": "",
@@ -18437,7 +18437,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23479
+    "line": 23481
    },
    "status": "geerntet",
    "text": "",
@@ -18466,7 +18466,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23466
+    "line": 23468
    },
    "status": "geerntet",
    "text": "",
@@ -18495,7 +18495,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24278
+    "line": 24288
    },
    "status": "geerntet",
    "text": "",
@@ -18524,7 +18524,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23516
+    "line": 23518
    },
    "status": "geerntet",
    "text": "",
@@ -18553,7 +18553,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23527
+    "line": 23529
    },
    "status": "geerntet",
    "text": "",
@@ -18582,7 +18582,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23303
+    "line": 23305
    },
    "status": "geerntet",
    "text": "",
@@ -18611,7 +18611,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23336
+    "line": 23338
    },
    "status": "geerntet",
    "text": "",
@@ -18632,7 +18632,7 @@
       "anker": "different = PREFILL-GRAPH-CALIBRATION CUT-MISMATCH",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
-      "zeile": 23351,
+      "zeile": 23353,
       "zeile_hinweis": 23351
      },
      "belegt": true,
@@ -18651,7 +18651,7 @@
       "anker": "Only with --p-prefill-graph-policy auto: the calibration table",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
-      "zeile": 23345,
+      "zeile": 23347,
       "zeile_hinweis": 23345
      },
      "belegt": true,
@@ -18679,7 +18679,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23343
+    "line": 23345
    },
    "status": "geerntet",
    "text": "",
@@ -18708,7 +18708,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23666
+    "line": 23668
    },
    "status": "geerntet",
    "text": "",
@@ -18737,7 +18737,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23354
+    "line": 23356
    },
    "status": "geerntet",
    "text": "",
@@ -18770,7 +18770,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23321
+    "line": 23323
    },
    "status": "geerntet",
    "text": "",
@@ -18799,7 +18799,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23656
+    "line": 23658
    },
    "status": "geerntet",
    "text": "",
@@ -18828,7 +18828,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24328
+    "line": 24338
    },
    "status": "geerntet",
    "text": "",
@@ -18857,7 +18857,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23643
+    "line": 23645
    },
    "status": "geerntet",
    "text": "",
@@ -18886,7 +18886,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24309
+    "line": 24319
    },
    "status": "geerntet",
    "text": "",
@@ -18900,7 +18900,7 @@
      "source": {
       "file": "weg2/launcher.py",
       "kind": "argparse",
-      "line": 23575
+      "line": 23577
      }
     },
     "nf": {
@@ -18909,7 +18909,7 @@
      "source": {
       "file": "weg2/launcher.py",
       "kind": "argparse",
-      "line": 22950
+      "line": 22952
      }
     }
    },
@@ -18935,7 +18935,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23575
+    "line": 23577
    },
    "status": "geerntet",
    "text": "",
@@ -19248,7 +19248,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 22804
+    "line": 22806
    },
    "status": "kuratiert",
    "text": "Fixes the size M (MiB) of the Mamba host pool of the host ledger arming; 0 = the planner chooses.",
@@ -19277,7 +19277,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 22796
+    "line": 22798
    },
    "status": "geerntet",
    "text": "",
@@ -19452,7 +19452,7 @@
       "anker": "must be given together",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
-      "zeile": 8859,
+      "zeile": 8861,
       "zeile_hinweis": 8859
      },
      "belegt": true,
@@ -19499,7 +19499,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24148
+    "line": 24158
    },
    "status": "kuratiert",
    "text": "How many of the full attention layers each prefill stage carries (e.g. 10,3,3). Attention layers have KV; the other layers do not.",
@@ -19528,7 +19528,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24788
+    "line": 24798
    },
    "status": "geerntet",
    "text": "",
@@ -19557,7 +19557,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24511
+    "line": 24521
    },
    "status": "geerntet",
    "text": "",
@@ -19586,7 +19586,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24269
+    "line": 24279
    },
    "status": "geerntet",
    "text": "",
@@ -19615,7 +19615,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24450
+    "line": 24460
    },
    "status": "geerntet",
    "text": "",
@@ -19644,7 +19644,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24459
+    "line": 24469
    },
    "status": "geerntet",
    "text": "",
@@ -19673,7 +19673,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24441
+    "line": 24451
    },
    "status": "geerntet",
    "text": "",
@@ -19702,7 +19702,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24521
+    "line": 24531
    },
    "status": "geerntet",
    "text": "",
@@ -19731,7 +19731,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24412
+    "line": 24422
    },
    "status": "geerntet",
    "text": "",
@@ -19760,7 +19760,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24420
+    "line": 24430
    },
    "status": "geerntet",
    "text": "",
@@ -19789,7 +19789,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24364
+    "line": 24374
    },
    "status": "geerntet",
    "text": "",
@@ -19810,7 +19810,7 @@
       "anker": "and --pp-cut-expert-lru-rows.\"",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
-      "zeile": 21653,
+      "zeile": 21655,
       "zeile_hinweis": 21653
      },
      "belegt": true,
@@ -19830,7 +19830,7 @@
       "anker": "MiB per layer) that live in a device pool",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
-      "zeile": 21650,
+      "zeile": 21652,
       "zeile_hinweis": 21650
      },
      "belegt": true,
@@ -19858,7 +19858,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24427
+    "line": 24437
    },
    "status": "kuratiert",
    "text": "Resident expert share per prefill stage (vector). Mandatory for a model with experts; the cut solver prices the expert bytes with this share.",
@@ -19879,7 +19879,7 @@
       "anker": "has {len(fracs)} entries and",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
-      "zeile": 21659,
+      "zeile": 21661,
       "zeile_hinweis": 21659
      },
      "belegt": true,
@@ -19921,7 +19921,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24435
+    "line": 24445
    },
    "status": "kuratiert",
    "text": "LRU and staging rows of the expert pool per layer and stage (vector, default 0). Corresponds to SGLANG_MOE_SCRATCH_SLOTS of the P group.",
@@ -19950,7 +19950,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24465
+    "line": 24475
    },
    "status": "geerntet",
    "text": "",
@@ -19979,7 +19979,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24478
+    "line": 24488
    },
    "status": "geerntet",
    "text": "",
@@ -20008,7 +20008,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24260
+    "line": 24270
    },
    "status": "geerntet",
    "text": "",
@@ -20037,7 +20037,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23038
+    "line": 23040
    },
    "status": "geerntet",
    "text": "",
@@ -20066,7 +20066,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24375
+    "line": 24385
    },
    "status": "geerntet",
    "text": "",
@@ -20095,7 +20095,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24390
+    "line": 24400
    },
    "status": "geerntet",
    "text": "",
@@ -20124,7 +20124,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24396
+    "line": 24406
    },
    "status": "geerntet",
    "text": "",
@@ -20153,7 +20153,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24497
+    "line": 24507
    },
    "status": "geerntet",
    "text": "",
@@ -20181,7 +20181,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24400
+    "line": 24410
    },
    "status": "geerntet",
    "text": "",
@@ -20240,7 +20240,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24351
+    "line": 24361
    },
    "status": "geerntet",
    "text": "",
@@ -20299,7 +20299,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24793
+    "line": 24803
    },
    "status": "geerntet",
    "text": "",
@@ -20392,7 +20392,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24154
+    "line": 24164
    },
    "status": "geerntet",
    "text": "",
@@ -20413,7 +20413,7 @@
       "anker": "pp_solve_pool_floor",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
-      "zeile": 22231,
+      "zeile": 22233,
       "zeile_hinweis": 22231
      },
      "belegt": true,
@@ -20441,7 +20441,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24219
+    "line": 24229
    },
    "status": "kuratiert",
    "text": "Hard lower bound (in world KV tokens) for the KV pool that the cut solver may choose. 0 switches the floor off.",
@@ -20462,7 +20462,7 @@
       "anker": "must be given together",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
-      "zeile": 8859,
+      "zeile": 8861,
       "zeile_hinweis": 8859
      },
      "belegt": true,
@@ -20519,7 +20519,7 @@
       "anker": "pp_solve_pool_floor",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
-      "zeile": 22231,
+      "zeile": 22233,
       "zeile_hinweis": 22231
      },
      "belegt": true,
@@ -20547,7 +20547,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24135
+    "line": 24145
    },
    "status": "kuratiert",
    "text": "How many layers each card carries in the prefill group (P, pipeline), e.g. 42,11,11. Without a value the planner computes the cut.",
@@ -20906,7 +20906,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 22760
+    "line": 22762
    },
    "status": "geerntet",
    "text": "",
@@ -20935,7 +20935,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 22751
+    "line": 22753
    },
    "status": "geerntet",
    "text": "",
@@ -21014,7 +21014,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 22713
+    "line": 22715
    },
    "status": "kuratiert",
    "text": "The registry profile of the checkpoints of both groups (qwen27b, nextflash).",
@@ -21035,7 +21035,7 @@
       "anker": "is refused BY NAME (HW-UNCALIBRATED)",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
-      "zeile": 22779,
+      "zeile": 22781,
       "zeile_hinweis": 22779
      },
      "belegt": true,
@@ -21064,7 +21064,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 22773
+    "line": 22775
    },
    "status": "kuratiert",
    "text": "HW-GENERIC 1002: the card inventory (calibration class labels in card order, weg2/card_identity.py, e.g. 'RTX5090,RTX3080,RTX3080') on which the positional vectors of the profile were measured. Default: the inventory that the measured records of the profile state (profile_records_data/<profile>.json, field 'inventory'). A live inventory that differs is refused by name (HW-UNCALIBRATED); positional measurements of other cards are never borrowed.",
@@ -21273,7 +21273,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24739
+    "line": 24749
    },
    "status": "geerntet",
    "text": "",
@@ -21354,7 +21354,7 @@
       "anker": "RAISES the floor",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
-      "zeile": 15383,
+      "zeile": 15385,
       "zeile_hinweis": 15383
      },
      "belegt": true,
@@ -21708,7 +21708,7 @@
       "anker": "SGLANG_MOE_RESIDENT_EXPERT_FRACTION\",\n                                          plan.solved_fractions)",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
-      "zeile": 20242,
+      "zeile": 20244,
       "zeile_hinweis": 20242
      },
      "belegt": true,
@@ -21728,7 +21728,7 @@
       "anker": "resident fraction per stage",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
-      "zeile": 21652,
+      "zeile": 21654,
       "zeile_hinweis": 21652
      },
      "belegt": true,
@@ -21946,7 +21946,7 @@
       "anker": "rank_mlp_ratio",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
-      "zeile": 17301,
+      "zeile": 17303,
       "zeile_hinweis": 17301
      },
      "belegt": true,
@@ -22123,7 +22123,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 22961
+    "line": 22963
    },
    "status": "unerklaert",
    "text": "",
@@ -22490,7 +22490,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23701
+    "line": 23703
    },
    "status": "geerntet",
    "text": "",
@@ -22519,7 +22519,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24126
+    "line": 24136
    },
    "status": "geerntet",
    "text": "",
@@ -23408,7 +23408,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23254
+    "line": 23256
    },
    "status": "kuratiert",
    "text": "The speculative decoding of both groups: NEXTN (default, mtp head of the checkpoint) or DFLASH (external draft).",
@@ -24928,7 +24928,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 22843
+    "line": 22845
    },
    "status": "geerntet",
    "text": "",
@@ -24971,7 +24971,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 22824
+    "line": 22826
    },
    "status": "kuratiert",
    "text": "Size of the store (directory on disk) in GB, absolute. 0 = derive from the pool of the P group.",
@@ -25000,7 +25000,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 22832
+    "line": 22834
    },
    "status": "erklaert",
    "text": "Multiplies the size of the P KV pool to size the store; covers the Mamba blocks and draft pages that lie alongside the KV pages.",
@@ -25182,7 +25182,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 22710
+    "line": 22712
    },
    "status": "erklaert",
    "text": "Name of this start; labels the logs and state files of the run.",
@@ -25241,7 +25241,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24831
+    "line": 24841
    },
    "status": "geerntet",
    "text": "",
@@ -25396,7 +25396,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 22718
+    "line": 22720
    },
    "status": "geerntet",
    "text": "",
@@ -25569,7 +25569,7 @@
       "anker": "(--tp-prefill-max-tokens = --max-kv-per-request)",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
-      "zeile": 23003,
+      "zeile": 23005,
       "zeile_hinweis": 23003
      },
      "belegt": true,
@@ -25591,7 +25591,7 @@
       "anker": "--tp-prefill-max-tokens / --x-ceiling-tokens / --d-short-drain-tokens there.",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
-      "zeile": 22875,
+      "zeile": 22877,
       "zeile_hinweis": 22875
      },
      "belegt": true,
@@ -25619,7 +25619,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 22991
+    "line": 22993
    },
    "status": "kuratiert",
    "text": "X: how many new tokens the decode group D may prefill itself. Larger requests go to P. 0 lets the planner derive it.",
@@ -25991,7 +25991,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23690
+    "line": 23692
    },
    "status": "geerntet",
    "text": "",
@@ -26020,7 +26020,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 22709
+    "line": 22711
    },
    "status": "erklaert",
    "text": "Source tree (directory of the code) from which the groups are started.",
@@ -26169,7 +26169,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23602
+    "line": 23604
    },
    "status": "geerntet",
    "text": "",
@@ -26415,7 +26415,7 @@
       "anker": "RAISES the floor",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
-      "zeile": 15383,
+      "zeile": 15385,
       "zeile_hinweis": 15383
      },
      "belegt": true,
@@ -26443,7 +26443,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24554
+    "line": 24564
    },
    "status": "kuratiert",
    "text": "VRAM in MiB per card that stays free for your own other processes (scalar or list in card ordinal order, 5090 first).",
@@ -26502,7 +26502,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 22711
+    "line": 22713
    },
    "status": "erklaert",
    "text": "Python environment with which the groups are started.",
@@ -26591,7 +26591,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23159
+    "line": 23161
    },
    "status": "geerntet",
    "text": "",
@@ -26703,7 +26703,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24035
+    "line": 24045
    },
    "status": "geerntet",
    "text": "",
@@ -26736,7 +26736,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24059
+    "line": 24069
    },
    "status": "geerntet",
    "text": "",
@@ -26765,7 +26765,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23766
+    "line": 23768
    },
    "status": "geerntet",
    "text": "",
@@ -26797,7 +26797,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24051
+    "line": 24061
    },
    "status": "geerntet",
    "text": "",
@@ -26826,7 +26826,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23743
+    "line": 23745
    },
    "status": "geerntet",
    "text": "",
@@ -26855,7 +26855,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24091
+    "line": 24101
    },
    "status": "geerntet",
    "text": "",
@@ -26884,13 +26884,33 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23962
+    "line": 23972
    },
    "status": "kuratiert",
    "text": "'off' (default) starts both groups without a vision tower; 'resident' keeps it loaded.",
    "type": "str"
   },
   "--weg2-vision-place": {
+   "abweichung": {
+    "27b": {
+     "default": null,
+     "help": "H125: where the TRANSIENT tower sits on PP0's card (only with --weg2-vision transient). `auto` (default): the KV tail when it is wholly free (the phase start), else the card's free VRAM, else a named refusal. `kvtail`: the 27B stage exactly. `free`: always the card's free VRAM. `weights` (VISION-WEIGHTS, not yet a profile default): the tower's parameters are views on victim WEIGHT memory of PP0 (27B flip: MLP storages; dual: only the hull parts D does not share); the victim bytes go to a host image (freed after every image) and come back with a device checksum before the admission -- a mismatch stops the group (W110c). No KV page, no free VRAM, always synchronous. `kvtail` or `auto` TOLD on the command line together with --dual-layout is refused (W111): the dual P pool is born trimmed to 0 tokens, so the dual's place is `weights`.",
+     "source": {
+      "file": "weg2/launcher.py",
+      "kind": "argparse",
+      "line": 23956
+     }
+    },
+    "nf": {
+     "default": null,
+     "help": "H125: where the TRANSIENT tower sits on PP0's card (only with --weg2-vision transient). `auto` (default): the KV tail when it is wholly free (the phase start), else the card's free VRAM, else a named refusal. `kvtail`: the 27B stage exactly. `free`: always the card's free VRAM. `weights` (VISION-WEIGHTS, not yet a profile default): the tower's parameters are views on victim WEIGHT memory of PP0 (27B flip: MLP storages; dual: only the hull parts D does not share; NF: resident expert rows with a store slot, returned from the store); the victim bytes go to a host image (27B; freed after every image; NF: none, the pinned store already holds them) and come back with a device checksum before the admission -- a mismatch stops the group (W110c). No KV page, no free VRAM, always synchronous.",
+     "source": {
+      "file": "weg2/launcher.py",
+      "kind": "argparse",
+      "line": 23327
+     }
+    }
+   },
    "baeume": [
     "27b",
     "nf"
@@ -26902,7 +26922,7 @@
    "depends": [],
    "gain": "",
    "group": "",
-   "help": "H125: where the TRANSIENT tower sits on PP0's card (only with --weg2-vision transient). `auto` (default): the KV tail when it is wholly free (the phase start), else the card's free VRAM, else a named refusal. `kvtail`: the 27B stage exactly. `free`: always the card's free VRAM.",
+   "help": "H125: where the TRANSIENT tower sits on PP0's card (only with --weg2-vision transient). `auto` (default): the KV tail when it is wholly free (the phase start), else the card's free VRAM, else a named refusal. `kvtail`: the 27B stage exactly. `free`: always the card's free VRAM. `weights` (VISION-WEIGHTS, not yet a profile default): the tower's parameters are views on victim WEIGHT memory of PP0 (27B flip: MLP storages; dual: only the hull parts D does not share); the victim bytes go to a host image (freed after every image) and come back with a device checksum before the admission -- a mismatch stops the group (W110c). No KV page, no free VRAM, always synchronous. `kvtail` or `auto` TOLD on the command line together with --dual-layout is refused (W111): the dual P pool is born trimmed to 0 tokens, so the dual's place is `weights`.",
    "id": "--weg2-vision-place",
    "kind": "flag",
    "level": "experte",
@@ -26913,7 +26933,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23954
+    "line": 23956
    },
    "status": "geerntet",
    "text": "",
@@ -26942,7 +26962,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23946
+    "line": 23948
    },
    "status": "geerntet",
    "text": "",
@@ -26963,7 +26983,7 @@
       "anker": "census = xchg_residency.load_census(census_path)   # raises W71 by name",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
-      "zeile": 10654,
+      "zeile": 10656,
       "zeile_hinweis": 10654
      },
      "belegt": true,
@@ -26991,7 +27011,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23810
+    "line": 23812
    },
    "status": "kuratiert",
    "text": "Where a waking group fetches its weight bytes from: 'ring' (default, from the host ring) or 'exchange' (card to card).",
@@ -27020,7 +27040,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23785
+    "line": 23787
    },
    "status": "geerntet",
    "text": "",
@@ -27041,7 +27061,7 @@
       "anker": "if weight_source != \"exchange\":",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
-      "zeile": 10652,
+      "zeile": 10654,
       "zeile_hinweis": 10652
      },
      "belegt": true,
@@ -27069,7 +27089,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24108
+    "line": 24118
    },
    "status": "kuratiert",
    "text": "JSON file with the measured table per card/tag/group from which W71 prices the VRAM peak of the exchange.",
@@ -27098,7 +27118,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24117
+    "line": 24127
    },
    "status": "geerntet",
    "text": "",
@@ -27140,7 +27160,7 @@
     "baum": "nf",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23488
+    "line": 23497
    },
    "status": "kuratiert",
    "text": "Names the census row from which a card is priced that is not in the census file by UUID: list <live>=<census UUID>, <live> = card UUID, nvml<N> or class (RTX3080). Without an entry the start borrows the heaviest row of the same class (otherwise of the whole census) and refuses that as HW-BORROWED until force is set.",
@@ -27169,7 +27189,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24018
+    "line": 24028
    },
    "status": "geerntet",
    "text": "",
@@ -27198,7 +27218,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 24074
+    "line": 24084
    },
    "status": "geerntet",
    "text": "",
@@ -27227,7 +27247,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23996
+    "line": 24006
    },
    "status": "geerntet",
    "text": "",
@@ -27256,7 +27276,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23978
+    "line": 23988
    },
    "status": "geerntet",
    "text": "",
@@ -27285,7 +27305,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 22959
+    "line": 22961
    },
    "status": "geerntet",
    "text": "",
@@ -28040,7 +28060,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23028
+    "line": 23030
    },
    "status": "geerntet",
    "text": "",
@@ -28083,7 +28103,7 @@
       "anker": "--tp-prefill-max-tokens / --x-ceiling-tokens / --d-short-drain-tokens there.",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
-      "zeile": 22875,
+      "zeile": 22877,
       "zeile_hinweis": 22875
      },
      "belegt": true,
@@ -28111,7 +28131,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23005
+    "line": 23007
    },
    "status": "kuratiert",
    "text": "Upper limit up to which the X (D prefill threshold) may rise live. 0 = off, D and the front keep the start X.",
@@ -28183,7 +28203,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23021
+    "line": 23023
    },
    "status": "kuratiert",
    "text": "X-CURVES: the curve file (weg2-x-curves/1, tools/build_x_curves.py). Only with --x-mode curve (otherwise W194); if the file is missing or unreadable W190, if it is faulty W191, if it comes from a different model, a different form or different hardware W192: refused at start. Refused in the dual layout (W197).",
@@ -28255,7 +28275,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23025
+    "line": 23027
    },
    "status": "kuratiert",
    "text": "X-CURVES: a request that lies deeper than the curves reach: clamp (default, computed at the price of the deepest row and named) or refuse (W193 at the front). Only with --x-mode curve (otherwise W194); an unknown value is refused W196; refused in the dual layout (W197).",
@@ -28269,7 +28289,7 @@
      "source": {
       "file": "weg2/launcher.py",
       "kind": "argparse",
-      "line": 23013
+      "line": 23015
      }
     },
     "nf": {
@@ -28278,7 +28298,7 @@
      "source": {
       "file": "weg2/launcher.py",
       "kind": "argparse",
-      "line": 22388
+      "line": 22390
      }
     }
    },
@@ -28337,7 +28357,7 @@
       "anker": "D's W50 riegel = the LOWER of the curves' envelope and",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/launcher.py",
-      "zeile": 23018,
+      "zeile": 23020,
       "zeile_hinweis": 23018
      },
      "belegt": true,
@@ -28366,7 +28386,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23013
+    "line": 23015
    },
    "status": "kuratiert",
    "text": "X-CURVES (user 06.10.: only fixed and curve): how the front sets X. fixed = --tp-prefill-max-tokens for the whole boot, no live recomputation. curve = X PER REQUEST from --x-curves (the D/P prefill curves and the flip price of this model × this form × this hardware); --x-ceiling-tokens alongside limits X from above, D's W50 latch is the LOWER value of the envelope of the curves and this ceiling. Unset = the front exactly as before the flag, argv byte-identical. Refused in the dual layout (W197: no X rebuild for dual). An unknown word is refused W196; curve without --x-curves is refused W190.",
@@ -28395,7 +28415,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23896
+    "line": 23898
    },
    "status": "geerntet",
    "text": "",
@@ -28424,7 +28444,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23832
+    "line": 23834
    },
    "status": "geerntet",
    "text": "",
@@ -28453,7 +28473,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23716
+    "line": 23718
    },
    "status": "geerntet",
    "text": "",
@@ -28482,7 +28502,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23861
+    "line": 23863
    },
    "status": "geerntet",
    "text": "",
@@ -29635,7 +29655,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2524
+      "line": 2529
      }
     }
    },
@@ -29690,7 +29710,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2514
+    "line": 2519
    },
    "status": "geerntet",
    "text": "",
@@ -29713,7 +29733,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2560
+      "line": 2565
      }
     }
    },
@@ -33889,7 +33909,7 @@
    "id": "SGLANG_CPU_WORKERS",
    "kind": "env",
    "lesestellen": [
-    "multimodal/processors/base_processor.py:301"
+    "multimodal/processors/base_processor.py:306"
    ],
    "level": "experte",
    "name": "SGLANG_CPU_WORKERS",
@@ -33899,7 +33919,7 @@
     "baum": "27b",
     "file": "multimodal/processors/base_processor.py",
     "kind": "os.environ",
-    "line": 301
+    "line": 306
    },
    "status": "unerklaert",
    "text": "",
@@ -36419,7 +36439,7 @@
    "id": "SGLANG_DFLASH_SOLO_POOL_FACTOR",
    "kind": "env",
    "lesestellen": [
-    "uneven_perf.py:3480",
+    "uneven_perf.py:3492",
     "speculative/dflash_solo_pool.py:336"
    ],
    "level": "experte",
@@ -36430,7 +36450,7 @@
     "baum": "27b",
     "file": "uneven_perf.py",
     "kind": "os.environ",
-    "line": 3480
+    "line": 3492
    },
    "status": "geerntet",
    "text": "",
@@ -38333,7 +38353,7 @@
    "id": "SGLANG_DUAL_GROUP_LANE_STREAM_PRIORITY",
    "kind": "env",
    "lesestellen": [
-    "model_executor/dual_group_lane.py:2155"
+    "model_executor/dual_group_lane.py:2167"
    ],
    "level": "experte",
    "name": "SGLANG_DUAL_GROUP_LANE_STREAM_PRIORITY",
@@ -38343,7 +38363,7 @@
     "baum": "27b",
     "file": "model_executor/dual_group_lane.py",
     "kind": "os.environ",
-    "line": 2155
+    "line": 2167
    },
    "status": "unerklaert",
    "text": "",
@@ -38432,7 +38452,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 4633
+    "line": 4638
    },
    "status": "unerklaert",
    "text": "",
@@ -38750,7 +38770,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 4632
+    "line": 4637
    },
    "status": "geerntet",
    "text": "",
@@ -39303,7 +39323,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2195
+    "line": 2200
    },
    "status": "geerntet",
    "text": "",
@@ -39326,7 +39346,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2535
+      "line": 2540
      }
     }
    },
@@ -39495,7 +39515,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2539
+      "line": 2544
      }
     }
    },
@@ -39695,7 +39715,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1972
+    "line": 1977
    },
    "status": "geerntet",
    "text": "",
@@ -41293,7 +41313,7 @@
    "lesestellen": [
     "layers/attention/fla/l2norm.py:92",
     "managers/weg2_p_overlap.py:184",
-    "weg2/launcher.py:11541"
+    "weg2/launcher.py:11543"
    ],
    "level": "experte",
    "name": "SGLANG_FLA_L2NORM_RUNTIME_T",
@@ -41966,7 +41986,7 @@
    "id": "SGLANG_FP4_NATIVE_MIXED_BOOT",
    "kind": "env",
    "lesestellen": [
-    "uneven_perf.py:815",
+    "uneven_perf.py:816",
     "weg2/weight_exchange_shadow.py:775"
    ],
    "level": "experte",
@@ -41977,7 +41997,7 @@
     "baum": "27b",
     "file": "uneven_perf.py",
     "kind": "os.environ",
-    "line": 815
+    "line": 816
    },
    "status": "geerntet",
    "text": "",
@@ -43332,7 +43352,7 @@
    "lesestellen": [
     "mem_cache/hicache_storage.py:3157",
     "weg2/decode_warm_handoff.py:46",
-    "weg2/front.py:6361",
+    "weg2/front.py:6374",
     "weg2/handoff.py:30",
     "weg2/tail_handoff.py:480"
    ],
@@ -43368,7 +43388,7 @@
    "lesestellen": [
     "mem_cache/hicache_storage.py:3211",
     "mem_cache/pool_host/arena_pool.py:990",
-    "weg2/launcher.py:26726"
+    "weg2/launcher.py:26889"
    ],
    "level": "experte",
    "name": "SGLANG_HICACHE_ARENA_GIB",
@@ -43402,7 +43422,7 @@
    "lesestellen": [
     "mem_cache/pool_host/arena_pool.py:966",
     "mem_cache/pool_host/mha.py:1463",
-    "weg2/launcher.py:13815"
+    "weg2/launcher.py:13817"
    ],
    "level": "experte",
    "name": "SGLANG_HICACHE_ARENA_HOST",
@@ -43660,7 +43680,7 @@
    "id": "SGLANG_HICACHE_BIGRAM_KEYS",
    "kind": "env",
    "lesestellen": [
-    "weg2/front.py:6365"
+    "weg2/front.py:6378"
    ],
    "level": "experte",
    "name": "SGLANG_HICACHE_BIGRAM_KEYS",
@@ -43670,7 +43690,7 @@
     "baum": "27b",
     "file": "weg2/front.py",
     "kind": "os.environ",
-    "line": 6365
+    "line": 6378
    },
    "status": "unerklaert",
    "text": "",
@@ -45359,7 +45379,7 @@
    "id": "SGLANG_IO_WORKERS",
    "kind": "env",
    "lesestellen": [
-    "multimodal/processors/base_processor.py:297"
+    "multimodal/processors/base_processor.py:302"
    ],
    "level": "experte",
    "name": "SGLANG_IO_WORKERS",
@@ -45369,7 +45389,7 @@
     "baum": "27b",
     "file": "multimodal/processors/base_processor.py",
     "kind": "os.environ",
-    "line": 297
+    "line": 302
    },
    "status": "unerklaert",
    "text": "",
@@ -45912,7 +45932,7 @@
    "kind": "env",
    "lesestellen": [
     "model_executor/model_runner_kv_cache_mixin.py:1057",
-    "weg2/launcher.py:11723"
+    "weg2/launcher.py:11725"
    ],
    "level": "experte",
    "name": "SGLANG_KV_BUDGET_PREFILL_TRANSIENT_MIB",
@@ -46414,7 +46434,7 @@
    "id": "SGLANG_LANE_MARGIN_PROBE",
    "kind": "env",
    "lesestellen": [
-    "model_executor/dual_group_lane.py:2681"
+    "model_executor/dual_group_lane.py:2693"
    ],
    "level": "experte",
    "name": "SGLANG_LANE_MARGIN_PROBE",
@@ -46424,7 +46444,7 @@
     "baum": "27b",
     "file": "model_executor/dual_group_lane.py",
     "kind": "os.environ",
-    "line": 2681
+    "line": 2693
    },
    "status": "unerklaert",
    "text": "",
@@ -46446,7 +46466,7 @@
    "id": "SGLANG_LANE_POOL_CHECKSUM",
    "kind": "env",
    "lesestellen": [
-    "model_executor/dual_group_lane.py:2822"
+    "model_executor/dual_group_lane.py:2834"
    ],
    "level": "experte",
    "name": "SGLANG_LANE_POOL_CHECKSUM",
@@ -46456,7 +46476,7 @@
     "baum": "27b",
     "file": "model_executor/dual_group_lane.py",
     "kind": "os.environ",
-    "line": 2822
+    "line": 2834
    },
    "status": "unerklaert",
    "text": "",
@@ -46478,7 +46498,7 @@
    "id": "SGLANG_LANE_POOL_CHECKSUM_PATH",
    "kind": "env",
    "lesestellen": [
-    "model_executor/dual_group_lane.py:3034"
+    "model_executor/dual_group_lane.py:3046"
    ],
    "level": "experte",
    "name": "SGLANG_LANE_POOL_CHECKSUM_PATH",
@@ -46488,7 +46508,7 @@
     "baum": "27b",
     "file": "model_executor/dual_group_lane.py",
     "kind": "os.environ",
-    "line": 3034
+    "line": 3046
    },
    "status": "unerklaert",
    "text": "",
@@ -46510,7 +46530,7 @@
    "id": "SGLANG_LANE_POOL_CHECKSUM_PER_POS",
    "kind": "env",
    "lesestellen": [
-    "model_executor/dual_group_lane.py:3079"
+    "model_executor/dual_group_lane.py:3091"
    ],
    "level": "experte",
    "name": "SGLANG_LANE_POOL_CHECKSUM_PER_POS",
@@ -46520,7 +46540,7 @@
     "baum": "27b",
     "file": "model_executor/dual_group_lane.py",
     "kind": "os.environ",
-    "line": 3079
+    "line": 3091
    },
    "status": "unerklaert",
    "text": "",
@@ -46542,7 +46562,7 @@
    "id": "SGLANG_LANE_POOL_CHECKSUM_TAIL",
    "kind": "env",
    "lesestellen": [
-    "model_executor/dual_group_lane.py:2828"
+    "model_executor/dual_group_lane.py:2840"
    ],
    "level": "experte",
    "name": "SGLANG_LANE_POOL_CHECKSUM_TAIL",
@@ -46552,7 +46572,7 @@
     "baum": "27b",
     "file": "model_executor/dual_group_lane.py",
     "kind": "os.environ",
-    "line": 2828
+    "line": 2840
    },
    "status": "unerklaert",
    "text": "",
@@ -46574,7 +46594,7 @@
    "id": "SGLANG_LANE_PROPOSAL_PERTURB",
    "kind": "env",
    "lesestellen": [
-    "model_executor/dual_group_lane.py:2498"
+    "model_executor/dual_group_lane.py:2510"
    ],
    "level": "experte",
    "name": "SGLANG_LANE_PROPOSAL_PERTURB",
@@ -46584,7 +46604,7 @@
     "baum": "27b",
     "file": "model_executor/dual_group_lane.py",
     "kind": "os.environ",
-    "line": 2498
+    "line": 2510
    },
    "status": "unerklaert",
    "text": "",
@@ -46670,7 +46690,7 @@
    "id": "SGLANG_LANE_SPEC_DEBUG",
    "kind": "env",
    "lesestellen": [
-    "model_executor/dual_group_lane.py:3236"
+    "model_executor/dual_group_lane.py:3248"
    ],
    "level": "experte",
    "name": "SGLANG_LANE_SPEC_DEBUG",
@@ -46680,7 +46700,7 @@
     "baum": "27b",
     "file": "model_executor/dual_group_lane.py",
     "kind": "os.environ",
-    "line": 3236
+    "line": 3248
    },
    "status": "unerklaert",
    "text": "",
@@ -46702,7 +46722,7 @@
    "id": "SGLANG_LANE_SPEC_ORACLE_DUMP",
    "kind": "env",
    "lesestellen": [
-    "model_executor/dual_group_lane.py:3746"
+    "model_executor/dual_group_lane.py:3758"
    ],
    "level": "experte",
    "name": "SGLANG_LANE_SPEC_ORACLE_DUMP",
@@ -46712,7 +46732,7 @@
     "baum": "27b",
     "file": "model_executor/dual_group_lane.py",
     "kind": "os.environ",
-    "line": 3746
+    "line": 3758
    },
    "status": "unerklaert",
    "text": "",
@@ -46734,7 +46754,7 @@
    "id": "SGLANG_LANE_SPEC_ROW_ORACLE",
    "kind": "env",
    "lesestellen": [
-    "model_executor/dual_group_lane.py:4467"
+    "model_executor/dual_group_lane.py:4479"
    ],
    "level": "experte",
    "name": "SGLANG_LANE_SPEC_ROW_ORACLE",
@@ -46744,7 +46764,7 @@
     "baum": "27b",
     "file": "model_executor/dual_group_lane.py",
     "kind": "os.environ",
-    "line": 4467
+    "line": 4479
    },
    "status": "unerklaert",
    "text": "",
@@ -46766,7 +46786,7 @@
    "id": "SGLANG_LANE_SPEC_TV_MAX_ACCEPT",
    "kind": "env",
    "lesestellen": [
-    "model_executor/dual_group_lane.py:4262"
+    "model_executor/dual_group_lane.py:4274"
    ],
    "level": "experte",
    "name": "SGLANG_LANE_SPEC_TV_MAX_ACCEPT",
@@ -46776,7 +46796,7 @@
     "baum": "27b",
     "file": "model_executor/dual_group_lane.py",
     "kind": "os.environ",
-    "line": 4262
+    "line": 4274
    },
    "status": "unerklaert",
    "text": "",
@@ -46798,7 +46818,7 @@
    "id": "SGLANG_LANE_SPEC_VERIFY",
    "kind": "env",
    "lesestellen": [
-    "model_executor/dual_group_lane.py:4409"
+    "model_executor/dual_group_lane.py:4421"
    ],
    "level": "experte",
    "name": "SGLANG_LANE_SPEC_VERIFY",
@@ -46808,7 +46828,7 @@
     "baum": "27b",
     "file": "model_executor/dual_group_lane.py",
     "kind": "os.environ",
-    "line": 4409
+    "line": 4421
    },
    "status": "unerklaert",
    "text": "",
@@ -47654,7 +47674,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2204
+    "line": 2209
    },
    "status": "geerntet",
    "text": "",
@@ -47682,7 +47702,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2209
+    "line": 2214
    },
    "status": "geerntet",
    "text": "",
@@ -48710,7 +48730,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 3385
+    "line": 3390
    },
    "status": "kuratiert",
    "text": "H88: Umgebungsform von --moe-act-int8 on: die int4-Experten (compressed-tensors WNA16, MoE) rechnen mit int8-Aktivierungen (W4A8) statt mit 16-Bit-Aktivierungen (W4A16). Standard aus; einer der beiden Schalter genügt. Dieser Baum hat das W4A8-MoE-Schema (CompressedTensorsWNA16A8MoE, H88-B): mit dem Schalter an wählt die Schema-Auswahl es für die int4-Expertenschichten auf CUDA (dynamische int8-Aktivierung je Token, Marlin-W4A8-Kernel); zusammen mit --moe-runner-backend triton bricht der Start mit RuntimeError ab. Ein Baum ohne das Schema bräche mit dem Text ab: MOE-ACT-INT8 requested but no W4A8 MoE scheme in this tree.",
@@ -55067,7 +55087,7 @@
    "lesestellen": [
     "mem_ledger/activation_probe.py:55",
     "mem_ledger/activation_probe.py:292",
-    "weg2/launcher.py:11225",
+    "weg2/launcher.py:11227",
     "weg2/xchg_manifest.py:1673"
    ],
    "level": "experte",
@@ -56415,7 +56435,7 @@
    "kind": "env",
    "lesestellen": [
     "distributed/utils.py:2336",
-    "weg2/launcher.py:27115"
+    "weg2/launcher.py:27280"
    ],
    "level": "experte",
    "name": "SGLANG_PP_CROSSING_WIRE",
@@ -56579,9 +56599,9 @@
     "distributed/utils.py:2608",
     "distributed/utils.py:2680",
     "weg2/launcher.py:2146",
-    "weg2/launcher.py:27155",
-    "weg2/launcher.py:18261",
-    "weg2/launcher.py:27113"
+    "weg2/launcher.py:27320",
+    "weg2/launcher.py:18263",
+    "weg2/launcher.py:27278"
    ],
    "level": "experte",
    "name": "SGLANG_PP_LAYER_SET",
@@ -64468,7 +64488,7 @@
    "id": "SGLANG_WEG2_ARENA_FROM_LEDGER",
    "kind": "env",
    "lesestellen": [
-    "weg2/launcher.py:26723"
+    "weg2/launcher.py:26886"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_ARENA_FROM_LEDGER",
@@ -64478,7 +64498,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "os.environ",
-    "line": 26723
+    "line": 26886
    },
    "status": "unerklaert",
    "text": "",
@@ -65704,7 +65724,7 @@
      "source": {
       "file": "weg2/front.py",
       "kind": "os.environ",
-      "line": 4090
+      "line": 4092
      }
     }
    },
@@ -65861,8 +65881,8 @@
    "id": "SGLANG_WEG2_DC_IMAGE_OFF_FLIP",
    "kind": "env",
    "lesestellen": [
-    "weg2/front.py:4137",
-    "weg2/front.py:7825"
+    "weg2/front.py:4150",
+    "weg2/front.py:7838"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_DC_IMAGE_OFF_FLIP",
@@ -65872,7 +65892,7 @@
     "baum": "27b",
     "file": "weg2/front.py",
     "kind": "os.environ",
-    "line": 4137
+    "line": 4150
    },
    "status": "geerntet",
    "text": "",
@@ -66006,7 +66026,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 1951
+      "line": 1956
      }
     }
    },
@@ -66574,7 +66594,7 @@
    "kind": "env",
    "lesestellen": [
     "managers/scheduler.py:1374",
-    "weg2/front.py:4459"
+    "weg2/front.py:4472"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_DORMANT_ADMIT",
@@ -66692,7 +66712,7 @@
       "anker": "if not envs.SGLANG_WEG2_ENABLE_DRAIN_STUCK_STOP.get():",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/front.py",
-      "zeile": 17185,
+      "zeile": 17201,
       "zeile_hinweis": 17185
      },
      "belegt": true,
@@ -67348,7 +67368,7 @@
    "id": "SGLANG_WEG2_DUAL_D_AIR_TOKENS",
    "kind": "env",
    "lesestellen": [
-    "weg2/front.py:15934"
+    "weg2/front.py:15950"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_DUAL_D_AIR_TOKENS",
@@ -67358,7 +67378,7 @@
     "baum": "27b",
     "file": "weg2/front.py",
     "kind": "os.environ",
-    "line": 15934
+    "line": 15950
    },
    "status": "unerklaert",
    "text": "",
@@ -68551,7 +68571,7 @@
     "weg2/dual_p_kv_stage.py:942",
     "weg2/dual_p_kv_stage.py:1458",
     "weg2/dual_p_kv_stage.py:1258",
-    "weg2/front.py:15887"
+    "weg2/front.py:15903"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_DUAL_KV_TAG",
@@ -68697,8 +68717,8 @@
    "id": "SGLANG_WEG2_DUAL_MPS_OPT_IN",
    "kind": "env",
    "lesestellen": [
-    "weg2/launcher.py:14779",
-    "weg2/launcher.py:14785"
+    "weg2/launcher.py:14781",
+    "weg2/launcher.py:14787"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_DUAL_MPS_OPT_IN",
@@ -68708,7 +68728,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "os.environ",
-    "line": 14779
+    "line": 14781
    },
    "status": "geerntet",
    "text": "",
@@ -71098,7 +71118,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 3668
+      "line": 3673
      }
     }
    },
@@ -71379,7 +71399,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2055
+      "line": 2060
      }
     }
    },
@@ -71457,7 +71477,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4340
+      "line": 4345
      }
     }
    },
@@ -71564,7 +71584,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2553
+      "line": 2558
      }
     }
    },
@@ -71624,6 +71644,55 @@
    },
    "status": "geerntet",
    "text": "",
+   "type": "EnvBool"
+  },
+  "SGLANG_WEG2_ENABLE_DECODE_COLLECT_PREFILL_BUSY": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": null,
+   "cost": "A short request that arrives while D prefills another one waits for the collect window before it is served; a long short plus a straggler can flip D to P at the window end.",
+   "default": "True",
+   "depends": [
+    {
+     "beleg": {
+      "anker": "window (as before), else the released route",
+      "aufloesung": "eindeutig",
+      "datei": "python/sglang/srt/weg2/front.py",
+      "zeile": 10379,
+      "zeile_hinweis": 10498
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "The window sets how long a SHORT is held for the sum; with SGLANG_WEG2_DECODE_COLLECT_WINDOW_S=0 only the collecting is off (the old path), the booking of granted SHORTs still prices the queue-take and the D-SHORT-DRAIN.",
+     "kante": "K135",
+     "quelle": "katalog",
+     "rel": "skaliert_mit",
+     "satz": "The window sets how long a SHORT is held for the sum; with SGLANG_WEG2_DECODE_COLLECT_WINDOW_S=0 only the collecting is off (the old path), the booking of granted SHORTs still prices the queue-take and the D-SHORT-DRAIN.",
+     "to": "SGLANG_WEG2_DECODE_COLLECT_WINDOW_S",
+     "to_kind": "env",
+     "wert": null
+    }
+   ],
+   "gain": "A burst of short requests no longer lands on D as one long prefill: the sum is checked, the rest is prefilled by P as a batch.",
+   "group": "Other",
+   "help": "X-SUM-PRICE on the arrival path (user 09.10.): a D that is PREFILLING a granted SHORT counts as busy for DECODE-COLLECT, and what it still has to prefill is carried into the collected set's sum. Off = collect only while D decodes (the sum of an arriving burst on an idle D is unpriced).",
+   "id": "SGLANG_WEG2_ENABLE_DECODE_COLLECT_PREFILL_BUSY",
+   "kind": "env",
+   "level": "experte",
+   "name": "SGLANG_WEG2_ENABLE_DECODE_COLLECT_PREFILL_BUSY",
+   "nargs": null,
+   "planner_derived": false,
+   "satz_quelle": "NF-Sitz, X-SUM-PRICE (Review xsum-review-1009, Planer-Auftrag 10.10.), Metall int23xsum2 09.10. 22:53Z",
+   "source": {
+    "baum": "nf",
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 1840
+   },
+   "status": "erklaert",
+   "text": "Collect rule for short requests when D is prefilling instead of decoding: on, a short request (that would go to D by itself) that was granted to D and has not yet delivered a first token counts as work on D. The next short requests that arrive meanwhile are collected for the window (SGLANG_WEG2_DECODE_COLLECT_WINDOW_S) and priced as a SUM together with those open tokens against the X limit; what does not fit goes to the P batch. Off: the old blind path, every short request is checked alone against X and an idle D takes all of them (six shorts of 6239 tokens within one second: 37k tokens prefilled on D, about 53 s). Default on in the NF tree (since 10.10.; metal int23xsum2 09.10.: 6 x 5200 on an idle D, one seat on D, five to the P batch). With the collect window at 0 (SGLANG_WEG2_DECODE_COLLECT_WINDOW_S) only the collecting is off; the booking still prices the queue-take of waiting shorts and the short drain.",
    "type": "EnvBool"
   },
   "SGLANG_WEG2_ENABLE_DRAIN_EMPTY_SKIP": {
@@ -71878,7 +71947,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2075
+    "line": 2080
    },
    "status": "geerntet",
    "text": "",
@@ -72136,7 +72205,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1979
+    "line": 1984
    },
    "status": "geerntet",
    "text": "",
@@ -72159,7 +72228,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2544
+      "line": 2549
      }
     }
    },
@@ -72381,7 +72450,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4320
+      "line": 4325
      }
     }
    },
@@ -73126,7 +73195,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1990
+    "line": 1995
    },
    "status": "geerntet",
    "text": "",
@@ -73154,7 +73223,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1985
+    "line": 1990
    },
    "status": "geerntet",
    "text": "",
@@ -73555,7 +73624,7 @@
    "id": "SGLANG_WEG2_EXPERT_BANDS_ARM",
    "kind": "env",
    "lesestellen": [
-    "weg2/launcher.py:26473"
+    "weg2/launcher.py:26635"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_EXPERT_BANDS_ARM",
@@ -73565,7 +73634,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "os.environ",
-    "line": 26473
+    "line": 26635
    },
    "status": "unerklaert",
    "text": "",
@@ -73619,7 +73688,7 @@
    "id": "SGLANG_WEG2_EXPERT_MAP_DIR",
    "kind": "env",
    "lesestellen": [
-    "weg2/launcher.py:20671"
+    "weg2/launcher.py:20673"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_EXPERT_MAP_DIR",
@@ -73629,7 +73698,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "os.environ",
-    "line": 20671
+    "line": 20673
    },
    "status": "unerklaert",
    "text": "",
@@ -74629,7 +74698,7 @@
    "id": "SGLANG_WEG2_FRONT_HEALTH_FACTS",
    "kind": "env",
    "lesestellen": [
-    "weg2/front_health.py:74"
+    "weg2/front_health.py:75"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_FRONT_HEALTH_FACTS",
@@ -74639,7 +74708,7 @@
     "baum": "27b",
     "file": "weg2/front_health.py",
     "kind": "os.environ",
-    "line": 74
+    "line": 75
    },
    "status": "unerklaert",
    "text": "",
@@ -74933,7 +75002,7 @@
    "kind": "env",
    "lesestellen": [
     "weg2/corridor_budget.py:144",
-    "weg2/host_ledger.py:4129",
+    "weg2/host_ledger.py:4137",
     "weg2/launcher.py:151"
    ],
    "level": "experte",
@@ -75085,7 +75154,7 @@
       "anker": "if stop and not envs.SGLANG_WEG2_ENABLE_GROUP_DEAD_STOP.get():",
       "aufloesung": "eindeutig",
       "datei": "python/sglang/srt/weg2/front.py",
-      "zeile": 17210,
+      "zeile": 17226,
       "zeile_hinweis": 17210
      },
      "belegt": true,
@@ -75651,7 +75720,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4440
+      "line": 4445
      }
     }
    },
@@ -75825,7 +75894,7 @@
    "lesestellen": [
     "managers/scheduler.py:8408",
     "managers/scheduler_components/weight_updater.py:12348",
-    "weg2/front.py:11625",
+    "weg2/front.py:11641",
     "weg2/l15_deposit_hook.py:42",
     "weg2/l15_plan.py:476"
    ],
@@ -75923,10 +75992,10 @@
     "managers/scheduler.py:8393",
     "managers/scheduler.py:21393",
     "managers/scheduler_components/weight_updater.py:12467",
-    "weg2/front.py:11586",
-    "weg2/front.py:7083",
-    "weg2/front.py:14033",
-    "weg2/front.py:7072"
+    "weg2/front.py:11602",
+    "weg2/front.py:7096",
+    "weg2/front.py:14049",
+    "weg2/front.py:7085"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_L15_HOT_SHARE",
@@ -76683,7 +76752,7 @@
    "lesestellen": [
     "mem_cache/hicache_storage.py:1773",
     "mem_cache/hicache_storage.py:4413",
-    "mem_cache/storage/file/lru_file_evictor.py:1499"
+    "mem_cache/storage/file/lru_file_evictor.py:1575"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_L3_PERSIST",
@@ -77046,7 +77115,7 @@
      "source": {
       "file": "weg2/front.py",
       "kind": "os.environ",
-      "line": 1186
+      "line": 1188
      }
     }
    },
@@ -77245,7 +77314,7 @@
    "id": "SGLANG_WEG2_MAMBA_ANCHOR_MIB",
    "kind": "env",
    "lesestellen": [
-    "weg2/launcher.py:8703"
+    "weg2/launcher.py:8705"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_MAMBA_ANCHOR_MIB",
@@ -77255,7 +77324,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "os.environ",
-    "line": 8703
+    "line": 8705
    },
    "status": "unerklaert",
    "text": "",
@@ -77799,7 +77868,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4249
+      "line": 4254
      }
     }
    },
@@ -78360,7 +78429,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2420
+    "line": 2425
    },
    "status": "erklaert",
    "text": "If a paused (parked) request is to continue later and the room for Mamba anchors in host RAM is full, its re-entry point gets priority: other intermediate states without a park reference are swapped to disk first, so that the entry point of the parked request is not lost. Off: the old way; parked requests can lose their entry point and recompute. Without a park nothing changes. Acts only on nodes that are marked as parked. Default on. Unverified: dependency on another switch; whether the user should change it (only the decision \"stays on\" of 05.10. ~17:47Z is verified); benefit on the metal (according to the report \"active, effect not shown\").",
@@ -78509,7 +78578,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1897
+    "line": 1902
    },
    "status": "geerntet",
    "text": "",
@@ -78566,7 +78635,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1920
+    "line": 1925
    },
    "status": "geerntet",
    "text": "",
@@ -78653,8 +78722,8 @@
    "id": "SGLANG_WEG2_PCUT_BOUNCE_SLACK_GIB",
    "kind": "env",
    "lesestellen": [
-    "weg2/launcher.py:22471",
-    "weg2/launcher.py:22477"
+    "weg2/launcher.py:22473",
+    "weg2/launcher.py:22479"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_PCUT_BOUNCE_SLACK_GIB",
@@ -78664,7 +78733,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "os.environ",
-    "line": 22471
+    "line": 22473
    },
    "status": "geerntet",
    "text": "",
@@ -78686,7 +78755,7 @@
    "id": "SGLANG_WEG2_PCUT_CAP_FLOOR",
    "kind": "env",
    "lesestellen": [
-    "weg2/launcher.py:22246"
+    "weg2/launcher.py:22248"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_PCUT_CAP_FLOOR",
@@ -78696,7 +78765,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "os.environ",
-    "line": 22246
+    "line": 22248
    },
    "status": "unerklaert",
    "text": "",
@@ -78718,8 +78787,8 @@
    "id": "SGLANG_WEG2_PCUT_LANE_PRICE",
    "kind": "env",
    "lesestellen": [
-    "weg2/launcher.py:19393",
-    "weg2/launcher.py:12911"
+    "weg2/launcher.py:19395",
+    "weg2/launcher.py:12913"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_PCUT_LANE_PRICE",
@@ -78729,7 +78798,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "os.environ",
-    "line": 19393
+    "line": 19395
    },
    "status": "unerklaert",
    "text": "",
@@ -79260,7 +79329,7 @@
    "id": "SGLANG_WEG2_PREFIX_FP_PATH",
    "kind": "env",
    "lesestellen": [
-    "weg2/front.py:11760"
+    "weg2/front.py:11776"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_PREFIX_FP_PATH",
@@ -79270,7 +79339,7 @@
     "baum": "27b",
     "file": "weg2/front.py",
     "kind": "os.environ",
-    "line": 11760
+    "line": 11776
    },
    "status": "unerklaert",
    "text": "",
@@ -79901,7 +79970,7 @@
    "id": "SGLANG_WEG2_P_QUEUE_AHEAD",
    "kind": "env",
    "lesestellen": [
-    "weg2/front.py:16707"
+    "weg2/front.py:16723"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_P_QUEUE_AHEAD",
@@ -79911,7 +79980,7 @@
     "baum": "27b",
     "file": "weg2/front.py",
     "kind": "os.environ",
-    "line": 16707
+    "line": 16723
    },
    "status": "unerklaert",
    "text": "",
@@ -82439,8 +82508,8 @@
    "kind": "env",
    "lesestellen": [
     "model_loader/gguf_shards.py:511",
-    "weg2/host_ledger.py:5352",
-    "weg2/host_ledger.py:5420"
+    "weg2/host_ledger.py:5366",
+    "weg2/host_ledger.py:5434"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_SWAP_AWARE",
@@ -82479,7 +82548,7 @@
     "weg2/dual_p_kv_stage.py:942",
     "weg2/dual_p_kv_stage.py:1458",
     "weg2/dual_p_kv_stage.py:1258",
-    "weg2/front.py:15887"
+    "weg2/front.py:15903"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_TAG",
@@ -83300,9 +83369,9 @@
     "planner/profile_couplings.py:1149",
     "weg2/launcher.py:5605",
     "weg2/launcher.py:5641",
-    "weg2/launcher.py:14321",
-    "weg2/launcher.py:19995",
-    "weg2/launcher.py:14335",
+    "weg2/launcher.py:14323",
+    "weg2/launcher.py:19997",
+    "weg2/launcher.py:14337",
     "weg2/torch_cache_cap.py:35",
     "weg2/torch_cache_cap.py:75"
    ],
@@ -83589,7 +83658,7 @@
    "kind": "env",
    "lesestellen": [
     "managers/scheduler.py:4953",
-    "managers/tokenizer_manager.py:491",
+    "managers/tokenizer_manager.py:495",
     "weg2/vision_stage_service.py:832"
    ],
    "level": "experte",
@@ -83614,7 +83683,7 @@
      "source": {
       "file": "weg2/vision_rank_runner.py",
       "kind": "os.environ",
-      "line": 912
+      "line": 1087
      }
     },
     "nf": {
@@ -83623,7 +83692,7 @@
      "source": {
       "file": "weg2/vision_rank_runner.py",
       "kind": "os.environ",
-      "line": 1012
+      "line": 1141
      }
     }
    },
@@ -83642,7 +83711,9 @@
    "id": "SGLANG_WEG2_VISION_ASYNC",
    "kind": "env",
    "lesestellen": [
-    "weg2/vision_rank_runner.py:912"
+    "weg2/vision_rank_runner.py:1087",
+    "weg2/vision_rank_runner.py:211",
+    "weg2/vision_rank_runner.py:212"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_VISION_ASYNC",
@@ -83652,7 +83723,7 @@
     "baum": "27b",
     "file": "weg2/vision_rank_runner.py",
     "kind": "os.environ",
-    "line": 912
+    "line": 1087
    },
    "status": "unerklaert",
    "text": "",
@@ -83674,7 +83745,7 @@
    "id": "SGLANG_WEG2_VISION_D_REROUTE",
    "kind": "env",
    "lesestellen": [
-    "weg2/vision_d_guard.py:132"
+    "weg2/vision_d_guard.py:148"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_VISION_D_REROUTE",
@@ -83684,7 +83755,7 @@
     "baum": "27b",
     "file": "weg2/vision_d_guard.py",
     "kind": "os.environ",
-    "line": 132
+    "line": 148
    },
    "status": "geerntet",
    "text": "",
@@ -83707,7 +83778,7 @@
      "source": {
       "file": "weg2/front.py",
       "kind": "os.environ",
-      "line": 4205
+      "line": 4197
      }
     }
    },
@@ -83727,7 +83798,7 @@
    "kind": "env",
    "lesestellen": [
     "weg2/front.py:1034",
-    "weg2/front.py:4304"
+    "weg2/front.py:4317"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_VISION_FLIP_URGENT",
@@ -83759,9 +83830,9 @@
    "id": "SGLANG_WEG2_VISION_PLACE",
    "kind": "env",
    "lesestellen": [
-    "weg2/launcher.py:11329",
-    "weg2/vision_rank_stage.py:655",
-    "weg2/vision_rank_stage.py:659"
+    "weg2/launcher.py:11331",
+    "weg2/vision_rank_stage.py:658",
+    "weg2/vision_rank_stage.py:662"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_VISION_PLACE",
@@ -83771,7 +83842,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "os.environ",
-    "line": 11329
+    "line": 11331
    },
    "status": "unerklaert",
    "text": "",
@@ -83825,7 +83896,7 @@
    "id": "SGLANG_WEG2_VISION_SOURCE",
    "kind": "env",
    "lesestellen": [
-    "weg2/launcher.py:11325",
+    "weg2/launcher.py:11327",
     "weg2/vision_rank_stage.py:516",
     "weg2/vision_rank_stage.py:521"
    ],
@@ -83837,7 +83908,7 @@
     "baum": "27b",
     "file": "weg2/launcher.py",
     "kind": "os.environ",
-    "line": 11325
+    "line": 11327
    },
    "status": "unerklaert",
    "text": "",
@@ -84168,7 +84239,7 @@
    "id": "SGLANG_WEG2_WAKE_DEFER_BELOW_MIB",
    "kind": "env",
    "lesestellen": [
-    "weg2/front.py:2976"
+    "weg2/front.py:2989"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_WAKE_DEFER_BELOW_MIB",
@@ -84178,7 +84249,7 @@
     "baum": "27b",
     "file": "weg2/front.py",
     "kind": "os.environ",
-    "line": 2976
+    "line": 2989
    },
    "status": "unerklaert",
    "text": "",
@@ -84997,7 +85068,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4427
+      "line": 4432
      }
     }
    },
@@ -85723,7 +85794,7 @@
    "problem": [],
    "status": {
     "andere_linie": 3,
-    "eindeutig": 119,
+    "eindeutig": 120,
     "nah": 12
    }
   },
@@ -85732,7 +85803,7 @@
     "problem": [],
     "status": {
      "andere_linie": 3,
-     "eindeutig": 119,
+     "eindeutig": 120,
      "nah": 12
     }
    },
@@ -85740,7 +85811,7 @@
     "problem": [],
     "status": {
      "andere_linie": 44,
-     "eindeutig": 80,
+     "eindeutig": 81,
      "nah": 10
     }
    }
@@ -85748,10 +85819,10 @@
   "datei": "kantenkatalog_1004.json",
   "geladen": true,
   "grund": "",
-  "kanten_belegt": 134,
-  "kanten_gesamt": 134,
+  "kanten_belegt": 135,
+  "kanten_gesamt": 135,
   "kanten_ohne_beleg": 25,
-  "neu": 83,
+  "neu": 84,
   "rel_abweichend": [
    "K12",
    "K19",
@@ -85777,28 +85848,28 @@
  "schema": "flliper.catalog/1",
  "stats": {
   "baeume": {
-   "abweichung": 44,
+   "abweichung": 45,
    "beide": 2461,
    "nur_27b": 180,
-   "nur_nf": 46
+   "nur_nf": 47
   },
-  "entries": 2705,
-  "envs": 1827,
-  "erklaert": 304,
+  "entries": 2706,
+  "envs": 1828,
+  "erklaert": 305,
   "flags": 863,
   "geerntet": 1678,
   "kuratiert": 121,
   "unerklaert": 602
  },
- "tree_rev": "27b=84d04adae1+nf=dacc89e543+defon",
+ "tree_rev": "27b=02123ee2ef+nf=04bca74219",
  "trees": {
   "27b": {
    "entries": 2641,
-   "rev": "84d04adae1"
+   "rev": "02123ee2ef"
   },
   "nf": {
-   "entries": 2507,
-   "rev": "dacc89e543+defon"
+   "entries": 2508,
+   "rev": "04bca74219"
   }
  },
  "warnungen": []
