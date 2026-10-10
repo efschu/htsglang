@@ -959,7 +959,7 @@ folds the old name), `--weg2-vision-place` -> `--pdflip-vision-place` (the flag 
 `PDFLIP VISION-VICTIM host-RAM WARNING`; the codes W105b, W110c, W111b stay.
 
 **NF line.** Source `c651892375..nf-vision-weights-1009 @ bc040078cd`; ported: AP1 (NF cherry-pick) `59c14423d8`, AP3 `8e7b127fc0` (`ExpertRowVictims`, `DeferredRowsFill.land_now`), tests `950080efd5`, review findings S1-S3
-`bc040078cd`. Not ported (not part of this round): the H88 commits `ae4ab773c0`, `dacc89e543` (row 20; the three files shared with the vision work are proven below to differ from the pipeline output of the tip exactly by the H88 hunks),
+`bc040078cd`. Not ported (not part of this round): the H88 commits `ae4ab773c0`, `dacc89e543` (row 20). Measured on the NF line: of the nine files of the four vision commits, seven are byte-equal to the pipeline output of the tip; `expert_offload.py` equals the tree plus the H88 hunks of `dd65a419fb`; `launcher.py` differs from the pipeline output of the tip by the H88 hunks, by log/help units that the tree has translated and the translation memory does not hold, and by the F0-F records-root lines (not proven line by line, listed by diff in the seat report),
 DEFAULTS-ON `dd65a419fb` (row 21, ported by F0-K as `c642c24f12`).
 
 **Catalog and edges.** The catalog is built once from both final code commits (the generator of the NF head), the same bytes on both lines. The edge file of both lines now holds the same 131 + 3 vision edges (K132-K134,
