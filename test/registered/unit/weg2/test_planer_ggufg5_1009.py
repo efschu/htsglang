@@ -746,5 +746,46 @@ class TestDryRunGolden(unittest.TestCase):
             self.assertIn(name, snaps)
 
 
+class TestGivenFlagWords(unittest.TestCase):
+    """Review 1 (G5 fix round 1): the canonical spelling of the "flag given" words is GGUF-only (R1)."""
+
+    OTHER = "--pdflip-vision"
+
+    def _ns(self, model, vision="off"):
+        import argparse
+
+        return argparse.Namespace(profile="nextflash", model=model, weg2_vision=vision, teardown=False)
+
+    def _other_spelling(self):
+        from sglang.srt.compat_shims import canonical_flags
+
+        w = canonical_flags([self.OTHER, "off"])
+        return w[0] != self.OTHER   # this tree maps --pdflip-* onto --weg2-*; else the case does not exist
+
+    def test_gguf_launch_reads_the_other_spelling_as_given(self):
+        if not self._other_spelling():
+            self.skipTest("running tree spells the flag --pdflip-*")
+        with tempfile.TemporaryDirectory() as td:
+            gg = os.path.join(td, "x-00001-of-00003.gguf")   # check_gguf_file wants the FILE (suffix)
+            open(gg, "wb").close()
+            words = launcher.given_flag_words(self._ns(gg), [self.OTHER, "off"])
+            ns = self._ns(gg)
+            line = launcher.apply_profile_vision_default(ns, words)
+        self.assertTrue(launcher.weg2_form.flag_given(words, "--weg2-vision"))
+        self.assertIsNone(line)
+        self.assertEqual(ns.weg2_vision, "off")
+
+    def test_non_gguf_launch_keeps_the_raw_words_and_the_registry_default(self):
+        # nf-nvfp4-d (NVFP4/Marlin): byte-identical to the pre-G5 base, the row's transient default still applies
+        argv = [self.OTHER, "off", "--profile", "nextflash"]
+        for model in ("/m/Qwen3.8-NVFP4", "", "/m/dir-with.gguf.d"):
+            words = launcher.given_flag_words(self._ns(model), argv)
+            self.assertEqual(words, argv)
+        ns = self._ns("/m/Qwen3.8-NVFP4")
+        line = launcher.apply_profile_vision_default(ns, launcher.given_flag_words(ns, argv))
+        self.assertTrue(line.startswith(launcher.VISION_DEFAULT_MARKER))
+        self.assertEqual(ns.weg2_vision, "transient")
+
+
 if __name__ == "__main__":
     unittest.main()

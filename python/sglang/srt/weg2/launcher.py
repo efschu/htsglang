@@ -14459,6 +14459,18 @@ def apply_profile_group_switch_defaults(ns, environ: Optional[Mapping[str, str]]
             f"a stated --env-p/--env-d or exported value wins): " + " ".join(wrote))
 
 
+def given_flag_words(ns, argv_words: Sequence[str]) -> List[str]:
+    """G5: the words the "was this flag GIVEN" readers (``apply_profile_d_kv_token_cut_default``,
+    ``apply_profile_vision_default``) look at. A GGUF launch (``--model`` a ``.gguf``) reads them in the running
+    tree's spelling (``_canonical_flags``: a profile's ``--pdflip-vision off`` on this tree's ``--weg2-*`` counts
+    as given, so the registry default does not override it). EVERY other launch keeps the raw words: R1, the
+    non-GGUF profiles (nf-nvfp4-d included) behave as before G5."""
+    words = list(argv_words)
+    if model_is_gguf_file(str(getattr(ns, "model", "") or "")):
+        return _canonical_flags(words)
+    return words
+
+
 def apply_profile_d_kv_token_cut_default(ns, argv_words: Sequence[str]) -> Optional[str]:
     """#239 LEISTUNGSSCHALTER: an UNSET ``--d-kv-token-cut`` takes the registry
     row's ``d_kv_token_cut`` (nextflash ``owned``; qwen27b ``off``). Applied
@@ -24452,8 +24464,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if _ls_line:
             print(_ls_line, flush=True)
         # G5: the readers below ask "was this flag GIVEN" of the words: a profile in the OTHER spelling (--pdflip-* on
-        # this tree's --weg2-*) gives it too, or a registry default overrides a stated value (nf-gguf: vision off)
-        _given_words = _canonical_flags(list(sys.argv[1:] if argv is None else argv))
+        # this tree's --weg2-*) gives it too, or a registry default overrides a stated value (nf-gguf: vision off).
+        # ONLY for a GGUF launch (R1: every non-GGUF profile, nf-nvfp4-d included, keeps the raw words and so its
+        # pre-G5 behaviour byte for byte).
+        _given_words = given_flag_words(ns, list(sys.argv[1:] if argv is None else argv))
         _cut_line = apply_profile_d_kv_token_cut_default(ns, _given_words)
         if _cut_line:
             print(_cut_line, flush=True)
