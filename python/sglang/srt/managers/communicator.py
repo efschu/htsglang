@@ -2,9 +2,22 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import logging
+import time
 from typing import Callable, Generic, List, Optional, TypeVar
 
 T = TypeVar("T")
+logger = logging.getLogger(__name__)
+
+#: #1158c instrument 3: the Weg-2 control requests whose zmq SEND to the scheduler is stamped here (log only). Against the
+#: scheduler's `#1458 CTRL-RECV` it splits "tokenizer -> scheduler handover" from "scheduler loop did not come round".
+_CTRL_SEND_KINDS = ("FlushCacheReqInput", "ReleaseMemoryOccupationReqInput", "ResumeMemoryOccupationReqInput")
+
+
+def _ctrl_send_stamp(obj) -> None:
+    kind = type(obj).__name__
+    if kind in _CTRL_SEND_KINDS:
+        logger.info("#1458 CTRL-SEND kind=%s t=%.3f", kind, time.time())
 
 
 class FanOutCommunicator(Generic[T]):
@@ -41,6 +54,7 @@ class FanOutCommunicator(Generic[T]):
         # failed caller never blocks the callers queued behind it.
         async with self._queueing_lock:
             if obj is not None:
+                _ctrl_send_stamp(obj)
                 self._send(obj)
 
             self._result_event = asyncio.Event()
@@ -58,6 +72,7 @@ class FanOutCommunicator(Generic[T]):
             self._result_event = asyncio.Event()
 
             if obj is not None:
+                _ctrl_send_stamp(obj)
                 self._send(obj)
 
         # Capture local refs before await -- after event fires, the first
