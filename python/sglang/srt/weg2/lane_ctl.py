@@ -69,6 +69,10 @@ GATE_TICK_S = 0.5
 SEM_EXTRA = 64
 #: rids remembered for the REPREFILL count / the gate stamps
 KEPT = 4096
+#: LANES FIX 2: a floor-lane arrival that still has no place after this long no longer holds the P drain / the take
+#: (liveness bound only: its own floor RPC times out after 10 s awake, ``arrive`` ends in ``forget`` -- a leaked entry
+#: must not keep a P phase open for good)
+ARRIVING_MAX_S = 30.0
 
 #: the SSE comment a held stream gets (L4 -> client; an SSE comment line starts with ':' and is ignored by every
 #: SSE reader, owui_proxy.py:215 skips every line that is not 'data:')
@@ -223,6 +227,20 @@ def flip_done(fr: Any) -> None:
     lc = ctl(fr)
     lc.flip_done_t = time.time()
     kick(fr)
+
+
+def flip_begin_note(fr: Any, g: Any) -> str:
+    """LANES FIX 2: the tail of ``WEG2-FLIP begin`` with the switch on -- how many of ``outstanding`` the front books as
+    lane-held (they are NOT in the flip ledger the drain and the W3 witness read: :meth:`Front._flip_ledger`) and how
+    many the flip ledger keeps.  Empty with no lane booking, so a boot without lane traffic prints the old line."""
+    try:
+        booked = fr._lane_parked_set()
+        if not booked:
+            return ""
+        n_held = sum(1 for r in g.outstanding if r in booked)
+        return " lane_held=%d ledger=%d" % (n_held, len(fr._flip_ledger(g)))
+    except Exception:  # noqa: BLE001 -- an instrument, never the flip
+        return ""
 
 
 def lane_of_pending(p: Any) -> int:
@@ -433,7 +451,10 @@ async def _preempt(fr: Any, lc: LaneCtl, ls: Any, prev: int, floor: int, cause: 
         "a higher lane displaces every lower one: D's running requests of lower lanes are parked (hold=lane), "
         "P's legs stop at the chunk border (floor RPC), waiting ones are held out of queue/_ready_for_d (original "
         "arrival kept); dormant = booked for a sleeping D, confirmed by a park RPC after its wake; ms = the whole "
-        "preempt (begin: LANE-RAISE), since_flip_done_ms = end of the deferring flip -> begin of the preempt",
+        "preempt (begin: LANE-RAISE), since_flip_done_ms = end of the deferring flip -> begin of the preempt; "
+        "parked_p = the P legs below the floor at the raise that were ASKED to stop at their next chunk border, NOT a "
+        "confirmation (a leg whose last chunk is already in P's pipeline finishes instead; the park of a leg is the "
+        "P-side line 'WEG2-PARK (lane)')",
         _ln.MARK_PREEMPT, floor, ls.lane_epoch, parked_d, len(parked_p), held,
         fr.counters["lane_parked_d_dormant"] - dorm0, prev, cause, rid or "-", (time.time() - t0) * 1000.0,
         "-" if since_done_ms is None else "%.0f" % since_done_ms)
@@ -761,14 +782,20 @@ def take_wait(fr: Any) -> bool:
     leg (TTFT 18.3 s), and the L3 chunk park (``WEG2-PARK (lane)``) could never fire.  With the leg queued the pool
     dispatches it beside the held leg, P applies the floor at its next chunk border and parks the lower lane there
     (the plan path); a lane-1 request that is NOT P-bound leaves P with only held legs and they are taken then.
-    A rid that already stands in a group's outstanding set has its place."""
+    A rid that already stands in a group's outstanding set has its place.
+
+    LANES FIX 2 (metal jjbbrx 18:03:35Z probe 2b, second run): the SAME predicate also keeps the P PHASE open
+    (``_p_drain_pool``: nothing in flight, queue empty) while such an arrival has no place -- the drain ended 77 ms before
+    the lane-1 request's Pending existed and P->D started (a flip pair for a request that needed P).  An arrival older
+    than :data:`ARRIVING_MAX_S` is not waited for."""
     lc = fr.__dict__.get("_lane_ctl_obj")
     if not enabled() or lc is None or not lc.arriving:
         return False
     ls = fr._lane_state()
     placed = set(fr.groups["P"].outstanding) | set(fr.groups["D"].outstanding)
-    for rid in list(lc.arriving):
-        if rid not in placed and ls.lane_for(rid) >= ls.lane_floor:
+    now = time.time()
+    for rid, t0 in list(lc.arriving.items()):
+        if rid not in placed and ls.lane_for(rid) >= ls.lane_floor and now - t0 <= ARRIVING_MAX_S:
             return True
     return False
 

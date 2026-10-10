@@ -3593,6 +3593,14 @@ async def _p_drain_pool(queue, limit: int, one, on_done, may_dispatch,
         if dispatched:
             rounds += 1
         if not inflight:
+            # LANES FIX 2 (metal jjbbrx 18:03:35Z probe 2b): nothing is in flight and the queue is empty, but a request
+            # of the floor lane has ARRIVED and has no place yet (its ``arrive`` still awaits P's reply to the floor RPC,
+            # 1667 ms there): leaving now ends the P phase 77 ms before that request's own leg is queued -- P->D (4.6 s)
+            # and, with the lane-1 leg then queued, D->P again (the flip pair of probe 2b). The phase stays open one
+            # more round; the arrival's leg, once queued, is dispatched by the loop above. ``None`` = the default path.
+            if lane_take_wait is not None and may_dispatch() and _lane_take_waits(lane_take_wait):
+                await asyncio.sleep(0.1)
+                continue
             return rounds
         if lane_held is not None:
             _nh, _th = _held()
@@ -14453,7 +14461,8 @@ class Front:
         self._flip_t0 = t_flip0
         self._flip_stage = "drain"
         self._flip_marks["drain"] = time.time()
-        logger.info("WEG2-FLIP begin epoch=%d sleep=%s wake=%s outstanding=%d queue=%d", self.epoch, src, dst, len(S.outstanding), len(self.queue))
+        logger.info("WEG2-FLIP begin epoch=%d sleep=%s wake=%s outstanding=%d queue=%d%s", self.epoch, src, dst, len(S.outstanding), len(self.queue),
+                    _lctl.flip_begin_note(self, S) if _lanes.enabled() else "")
         _dk = self.__dict__.pop("_done_kick_at", None)
         if _dk is not None and src == "D" and _dk[0] == self.epoch:
             # DONE-KICK: how long the done -> begin took (the controller's pass,
@@ -16580,6 +16589,13 @@ class Front:
                         self._ready_for_d.append(p)
                         self._sync_batch_gate()
                         prefilled += 1
+                        if _lanes.enabled():
+                            # LANES FIX 2 (metal jjbbrx 18:03:35Z probe 2b): a leg that ENDS below the floor is held NOW,
+                            # in this synchronous step -- the lane loop's tick (0.1 s) came after the D admitter had
+                            # handed the lane-0 request to D (D-ADMIT 18:12:40,730), i.e. a request the front books as
+                            # held stood in D's ledger and queue.  Held here it never reaches D; it comes back through
+                            # ``_restore_held`` into ``_ready_for_d`` when the floor falls to its lane.
+                            _lctl.sweep(self)
 
                 # #1459c: a CONTINUOUS pool, not paired batches.  The #1459
                 # form dispatched `p_concurrency + ahead` requests as ONE

@@ -509,7 +509,7 @@ async def test_take_wait_reads_the_arrival_register_and_nothing_else():
     assert LC.take_wait(f) is False                                 # no register
     lc = LC.ctl(f)
     _note(f, "hi", 1)
-    lc.arriving["hi"] = NOW
+    lc.arriving["hi"] = time.time()
     assert LC.take_wait(f) is True                                  # lane 1 >= floor 0
     ls.set_floor(1)
     assert LC.take_wait(f) is True                                  # lane 1 >= floor 1
@@ -521,10 +521,10 @@ async def test_take_wait_reads_the_arrival_register_and_nothing_else():
     del f.groups["D"].outstanding["hi"]
     _note(f, "lo", 0)
     lc.arriving.clear()
-    lc.arriving["lo"] = NOW
+    lc.arriving["lo"] = time.time()
     assert LC.take_wait(f) is False                                 # a lane below the floor waits at the gate: not floor work
     lc.arriving.clear()
-    lc.arriving["hi"] = NOW
+    lc.arriving["hi"] = time.time()
     lc.forget("hi")                                                 # the handler ended before it had a place
     assert LC.take_wait(f) is False and "hi" not in lc.arriving
 
