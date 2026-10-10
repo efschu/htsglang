@@ -190,14 +190,17 @@ def test_unknown_queued_and_chunked_rids_are_named_not_parked(lanes_on):
     # one whose chunk still writes its rows (cannot be after the landing) is named, not parked
     chunk.inflight_middle_chunks = 1
     s = _Sched(running=[a], waiting=[queued])
+    s.weg2_lane_floor, s.weg2_lane_epoch = 1, 1   # D's floor stands (LANES FIX 2: a queued rid is held only below it)
     s.chunked_req = chunk
     out = _park_lane(s, [a.rid, queued.rid, chunk.rid, "weg2-1-99"])
-    assert out.success and out.parked == [a.rid]
-    assert out.held == [queued.rid]  # only queued on D: kept back by the floor alone
+    # LANES FIX 2 (metal 180335): a rid that only waits in ``waiting_queue`` is taken into the lane hold (it used to be
+    # named ``held`` and stay in the queue, where D's idle witness counts it: the D->P quiesce never saw an idle group)
+    assert out.success and out.parked == [a.rid, queued.rid]
+    assert out.held == []
     assert set(out.lane_skipped) == {chunk.rid, "weg2-1-99"}
     assert "chunked prefill" in out.lane_skipped[chunk.rid]
     assert s.chunked_req is chunk  # the lane park never drops the chunked request
-    assert [r.rid for r in s.waiting_queue] == [queued.rid]
+    assert s.waiting_queue == [] and d_lane.lane_held(queued) and queued in s.weg2_d_parked
 
 
 def test_nothing_running_to_park_answers_success_with_the_reasons(lanes_on):
