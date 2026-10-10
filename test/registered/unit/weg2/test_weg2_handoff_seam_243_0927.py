@@ -262,7 +262,8 @@ class Wiring(unittest.TestCase):
 
     def test_admitter_checks_before_and_after_the_seat(self):
         i = self.src.index("    async def d_admitter(self)")
-        blk = self.src[i:i + 9000]
+        # a fixed window, not the function: X-SUM-PRICE's popleft booking (review M3) pushed set_result past 9000
+        blk = self.src[i:i + 12000]
         acq = blk.index("await self._d_seat.acquire()")
         self.assertLess(blk.index('if self._hl_check(p, "admit"):'), acq)
         after = blk.index('if self._hl_check(p, "seat"):')

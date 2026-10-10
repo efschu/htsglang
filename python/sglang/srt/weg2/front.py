@@ -7280,6 +7280,7 @@ class Front:
         self.queue.append(p)
         self._dp_mark(p, "reroute")  # R28
         self._kick_controller("arrival")
+        self._d_pf_book().done(rid=rid)  # X-SUM-PRICE: handed back to P's batch -- no phantom while it waits
         try:
             await p.fut
         except Weg2Stop as e:
@@ -11762,6 +11763,7 @@ class Front:
                     self.counters["W36_Weg2AdmitterBarrierExpired"] += 1
                     logger.error("W36 Weg2AdmitterBarrierExpired rid=%s: no POST within %.0f s of the "
                                  "hand-off; seat released, admission continues", p.rid, POST_BARRIER_S)
+                    self._d_pf_book().done(rid=p.rid)  # X-SUM-PRICE: the POST never came -- no phantom for 30 s
                     if p.seat is not None:
                         p.seat.release("W36_barrier_expired")
             except asyncio.CancelledError:
@@ -12297,7 +12299,11 @@ class Front:
                                rid, type(e).__name__, e)
 
         # X-EXACT-BACKFILL: a request priced by chars/3 while the tokenizer loaded gets its ids now
-        await self._x_exact_backfill(rid, request.path, payload, text)
+        try:
+            await self._x_exact_backfill(rid, request.path, payload, text)
+        except BaseException:
+            self._d_pf_book().done(rid=rid)  # X-SUM-PRICE: cancelled after enter_leg2, before the try below
+            raise
         if pending is not None and pending.skip_leg1:
             single_prefill = True
         if (stream and pending is not None and request.path.startswith("/v1/")
@@ -12916,6 +12922,7 @@ class Front:
                     logger.warning("WEG2-REROUTE rid=%s uncached=%d > %d: rejoining route BATCH once (spec 3.6)",
                                    rid, pt - ct, self.tp_prefill_max_tokens)
                     g.outstanding.pop(rid, None)
+                    self._d_pf_book().done(rid=rid)  # X-SUM-PRICE: back on P; the inner leg 2 books anew
                     try:
                         await pending.fut
                     except Weg2Stop as e:
@@ -13279,6 +13286,7 @@ class Front:
         self.queue.append(p)
         self._dp_mark(p, "reroute")  # R28
         self._kick_controller("arrival")  # 27B flipfast F2 (no-op when off)
+        self._d_pf_book().done(rid=rid)  # X-SUM-PRICE: D refused it -- back on P, no phantom while it waits
         try:
             await p.fut
         except Weg2Stop as e:
