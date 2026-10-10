@@ -23,7 +23,7 @@
  "profile_inputs": {
   "base": {
    "file": "profiles/27b-base.env",
-   "sha256": "a278011c9ac3d09a7679608ae96ae5224f0efc582a7cdcabec0589b5adff63bd"
+   "sha256": "d8addb7190e1c88d31f05f9ae5f8faec65dace86b711531de2c1b7081c5b3355"
   },
   "census": {
    "file": "/spinning/gpu-arb/weg2/census/xchg_census_weg2xsn246_27198a2711.json",

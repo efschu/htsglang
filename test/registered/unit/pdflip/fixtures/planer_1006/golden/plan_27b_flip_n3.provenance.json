@@ -23,7 +23,7 @@
  "profile": {
   "file": "profiles/27b-base.env",
   "live": "/spinning/gpu-arb/docker/profiles_release/27b-base.env (identical sha256 on 2026-10-06)",
-  "sha256": "a278011c9ac3d09a7679608ae96ae5224f0efc582a7cdcabec0589b5adff63bd"
+  "sha256": "d8addb7190e1c88d31f05f9ae5f8faec65dace86b711531de2c1b7081c5b3355"
  },
  "profile_inputs": {
   "census": {

@@ -69,7 +69,10 @@ REGENERATE the 27B goldens after a change that moves the plan ON PURPOSE (the sa
 ``27b-nvfp4-dual.env`` and ``plan_27b_flip_n3.txt`` / ``plan_27b_dual_n3.txt``; the launch JSONs with the ``launch``
 sub-command).  Measured 2026-10-06 on tree 173161c595: run-to-run diff 0 lines (two runs, two scratch dirs); against
 ``deskq/work/hw1004/plan_dump.py`` on the same profile and the same inputs (PROFILE_ARGS only, no exported env) 0 value
-differences, only the path tokens this harness normalises.
+differences, only the path tokens this harness normalises.  Regenerated 2026-10-09 (user decision: ``--pdflip-vision-place weights``
+is the default of the 27B release profiles, one line in ``27b-base.env``, the Dual profiles inherit it by ``source``): the diff of
+the three 27B goldens is argv_n +2, the ``PDFLIP-HOST vision_victim_host=879 MiB`` and ``VISION-VICTIM host-RAM WARNING`` lines and
+``FLLIPER_PDFLIP_VISION_PLACE=weights`` in group P's env, nothing else (two runs byte-equal); the launch JSONs gain the two tokens.
 
 LAUNCHER LINES (07.10., NF seat finding "27 of 234 red on the NF line"): the same test code runs on the 27B launcher line
 (``desk/planer-abnahme-1006``) and on the NF line (``desk/nf-nf22-integ-1006`` + the planer import).  The line is read from the
@@ -116,9 +119,10 @@ GOLDEN = os.path.join(FIX, "golden")
 REPLAY_REF = os.path.join(HERE, "fixtures", "xchg_launch_replay_0911", "nvml_devices_1378.json")
 MC = "/spinning/llm_stuff/club-3090/models-cache/"
 
-#: sha256 of the snapshot files (the live files they were copied from, 2026-10-06)
+#: sha256 of the snapshot files (the live files they were copied from, 2026-10-06; 27b-base.env 2026-10-09: + the release line
+#: ``PROFILE_ARGS+=(--pdflip-vision-place weights)``, user decision VISION-WEIGHTS, live file identical, goldens regenerated)
 PROVENANCE = {
-    "27b-base.env": "a278011c9ac3d09a7679608ae96ae5224f0efc582a7cdcabec0589b5adff63bd",
+    "27b-base.env": "d8addb7190e1c88d31f05f9ae5f8faec65dace86b711531de2c1b7081c5b3355",
     "27b-nvfp4-dual.env": "747c532a4dbfc60ecf03431c4d5d960500d15294caa1ca9ecb029ca6a3f0106e",
     "27b-nvfp4.pchunk.json": "a56d1c7a4fb93206e6251540db80dc36656355daed95a3faf1e19de5fc99237c",
     "nf-int4-h6-abl.env": "0f46887b41fbd71193474aa7d464949bf98f24a90e401abae51474cbfa771894",
