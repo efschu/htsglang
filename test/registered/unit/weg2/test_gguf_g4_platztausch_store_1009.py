@@ -1037,3 +1037,133 @@ def test_the_default_boot_imports_nothing_new(monkeypatch):
     assert gp.boot_wants_platztausch(d) is False
     assert gp.door_wanted(d) is False
     gp.refuse_unstaged_platztausch(d, why="x")  # no raise
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# 9. review round 1: the expert PARAMETER is not a third name of the bank; the host-peak line names the real peak
+# ---------------------------------------------------------------------------------------------------------------
+
+
+class _InvModel(torch.nn.Module):
+    """A one-layer model around a staged GGUF MoE layer, enough for ``card_inventory``'s two walks."""
+
+    def __init__(self, experts):
+        super().__init__()
+        self.model = torch.nn.Module()
+        self.model.layers = torch.nn.ModuleList([torch.nn.Module()])
+        self.model.layers[0].mlp = torch.nn.Module()
+        self.model.layers[0].mlp.experts = experts
+
+
+def _inventory(model):
+    from sglang.srt.weg2 import weight_exchange_shadow as wxs
+
+    return wxs.card_inventory(
+        rank=0,
+        model=model,
+        chunk_geometry=lambda: (1, 1),
+        family_tags=lambda n: ("weights_0",),
+        tag_of=lambda name, region_tag="": "weights_0",
+    )
+
+
+@pytest.mark.parametrize("group,rank", [("P", None), ("D", 0), ("D", 1)])
+def test_the_expert_parameter_is_a_placeholder_so_the_inventory_names_the_bank_once(boot, group, rank):
+    """Review 1 / major 1: before ``MoEExpertOffloadCache.install`` marks the alias (first forward), a parameter
+    still holding the whole [R+C] bank was published by ``card_inventory`` once as a parameter and once as the
+    #135 buffer (W84 / W68). The Marlin door leaves a 0-row placeholder; so does this one."""
+    from sglang.srt.managers import weg2_memory_saver as ms
+    from sglang.srt.weg2 import weight_exchange_shadow as wxs
+
+    boot.group(group)
+    d = _stage(_gguf_layer(1, rank=rank))
+    for attr in gp.GGUF_EXPERT_ATTRS:
+        p = getattr(d, attr)
+        assert p.shape[0] == 0 and p.numel() == 0, "the parameter must not hold the bank"
+        pub = getattr(d, ms.expert_buffer_attr_name(attr))
+        assert pub.numel() > 0
+        # the bank lives on in the stash AND under the flip's name, over one storage
+        bank = _bank(d, attr)
+        assert pub.untyped_storage().data_ptr() == bank.untyped_storage().data_ptr()
+        assert p.untyped_storage().data_ptr() != bank.untyped_storage().data_ptr()
+    assert [n for n, q in d.named_parameters() if q.numel() and not ms.is_expert_stack_alias(q)] == []
+    # the real walk: the inventory carries each bank exactly once, as the buffer
+    inv, skipped, _walked, reason = _inventory(_InvModel(d))
+    assert reason == "", reason
+    names = [g.name for g, _t in inv]
+    assert sorted(n.rsplit(".", 1)[-1] for n in names) == ["weg2_experts_w13_qweight", "weg2_experts_w2_qweight"]
+    storages = [t.untyped_storage().data_ptr() for _g, t in inv]
+    assert len(set(storages)) == len(storages), "two inventory entries over one storage = the W84 / W68 class"
+    assert not any(n.endswith(("w13_qweight", "w2_qweight")) and "weg2_experts" not in n for n in names)
+    assert wxs.expert_buffer_tensors  # the walk's second population is the one that answered
+
+
+def test_the_placeholder_survives_the_cache_install_which_builds_the_real_parameter(boot):
+    """``install`` builds the Parameter from ``_moe_offload_presplit`` (not from the placeholder) and marks it."""
+    from sglang.srt.managers import weg2_memory_saver as ms
+
+    boot.group("D")
+    d = _stage(_gguf_layer(1, rank=0))
+    for attr in gp.GGUF_EXPERT_ATTRS:
+        bank, _spill = d._moe_offload_presplit[attr]
+        stack = torch.nn.Parameter(bank, requires_grad=False)
+        ms.mark_expert_stack_alias(stack)
+        setattr(d, attr, stack)
+    inv, _s, _w, reason = _inventory(_InvModel(d))
+    assert reason == ""
+    assert len(inv) == 2, "after install the aliased parameter is skipped, the buffers stay"
+
+
+def test_the_seat_row_bank_is_a_placeholder_too(boot, seats):
+    """With seat rows the parameter was the seat buffer itself; it must let go of it as well."""
+    boot.group("D")
+    d = _stage(_gguf_layer(0, rank=0))
+    for attr in gp.GGUF_EXPERT_ATTRS:
+        assert getattr(d, attr).numel() == 0
+        assert _bank(d, attr).shape[0] > 0
+
+
+def test_owned_expert_host_bytes_sums_every_layer_at_its_own_row_class(tmp_path):
+    """Review 1 / major 2: the host peak of the streaming-off door is the rank's whole owned set over all layers
+    (materialization runs after the complete load pass), per layer at THAT layer's row, from the header."""
+    f = _write_gguf(str(tmp_path / "m.gguf"), [("Q8_0", "Q8_0", "Q8_0"), ("Q4_0", "Q4_0", "Q4_0")], rows=2, experts=4)
+    per_layer = gl.row_class_bytes([f])
+    row = sum(sum(p.values()) for p in per_layer.values())
+    got, n_layers = gp.owned_expert_host_bytes([f], 1, 4)
+    assert n_layers == 2 and got == row * 3
+    assert got != (row // 2) * 3 * n_layers or per_layer[0] != per_layer[1], "never a mean row"
+
+
+def test_the_streaming_off_line_names_the_whole_owned_set_not_one_layer(boot, tmp_path, monkeypatch, caplog):
+    import logging
+
+    from sglang.srt import server_args as sargs
+    from sglang.srt.environ import envs
+
+    f = _write_gguf(str(tmp_path / "m.gguf"), [("Q8_0", "Q8_0", "Q8_0")] * 2, rows=2, experts=TOTAL)
+    monkeypatch.setattr(sargs, "get_global_server_args", lambda: types.SimpleNamespace(model_path=f))
+    monkeypatch.setattr(gp, "_PEAK_NOTE_LOGGED", False)
+    boot.group("D")
+    with envs.SGLANG_MOE_GGUF_STREAM_STAGING.override(True), caplog.at_level(logging.INFO):
+        assert _gguf_layer(0, rank=0)._gguf_stream_staging_enabled() is False
+        assert _gguf_layer(1, rank=0)._gguf_stream_staging_enabled() is False
+    lines = [r.getMessage() for r in caplog.records if "streaming staging off" in r.getMessage()]
+    assert len(lines) == 1, "named once per process"
+    assert "WHOLE owned expert set" in lines[0] and "one layer's loaded" not in lines[0]
+    want, _n = gp.owned_expert_host_bytes([f], 0, TOTAL // 2)
+    assert "experts [0, %d)" % (TOTAL // 2) in lines[0] and "%.2f GiB" % (want / 2**30) in lines[0]
+
+
+def test_the_streaming_off_line_says_so_when_the_header_is_not_at_hand(boot, monkeypatch, caplog):
+    import logging
+
+    from sglang.srt import server_args as sargs
+    from sglang.srt.environ import envs
+
+    monkeypatch.setattr(sargs, "get_global_server_args", lambda: types.SimpleNamespace(model_path="/no/such.gguf"))
+    monkeypatch.setattr(gp, "_PEAK_NOTE_LOGGED", False)
+    boot.group("D")
+    with envs.SGLANG_MOE_GGUF_STREAM_STAGING.override(True), caplog.at_level(logging.INFO):
+        assert _gguf_layer(0, rank=0)._gguf_stream_staging_enabled() is False
+    msg = [r.getMessage() for r in caplog.records if "streaming staging off" in r.getMessage()][0]
+    assert "size not derived from the header" in msg and "WHOLE owned expert set" in msg

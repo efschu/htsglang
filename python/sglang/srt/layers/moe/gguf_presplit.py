@@ -133,6 +133,57 @@ def boot_wants_platztausch(layer=None) -> bool:
     return False
 
 
+def owned_expert_host_bytes(files, lo: int, hi: int):
+    """Host bytes this rank's loader holds for the owned experts ``[lo, hi)`` of EVERY layer, from the GGUF
+    headers: ``sum over layers of (hi - lo) x (one expert's row, all projections)``. Returns ``(bytes, layers)``.
+
+    This is the host peak of the Platztausch door: ``materialize_gguf_weights`` runs from
+    ``process_weights_after_loading`` only AFTER the complete ``load_weights`` pass, so the whole owned set is in
+    host anon memory before the first layer is staged (the peak boot attempt 5 of #391 was OOM-killed at), and the
+    layer-wise ``drop`` only shrinks it afterwards."""
+    from sglang.srt.layers.moe import gguf_layout as _gl
+
+    per_layer = _gl.row_class_bytes(files)
+    n_owned = int(hi) - int(lo)
+    total = sum(sum(p.values()) for p in per_layer.values()) * n_owned
+    return int(total), len(per_layer)
+
+
+_PEAK_NOTE_LOGGED = False
+
+
+def log_host_peak_once(layer) -> None:
+    """One INFO line per process naming the host peak of the streaming-off door -- from the header when the model
+    path and the owned range are known, else saying so (never a number without its source)."""
+    global _PEAK_NOTE_LOGGED
+    if _PEAK_NOTE_LOGGED:
+        return
+    _PEAK_NOTE_LOGGED = True
+    rng = getattr(layer, "_gguf_expert_range", None)
+    head = (
+        "%s: streaming staging off (SGLANG_MOE_GGUF_STREAM_STAGING) -- the shared store / Karte / seat rows are "
+        "served at materialization, i.e. after the COMPLETE load pass: host peak = this rank's WHOLE owned expert "
+        "set over all layers, not one layer's" % MARKER
+    )
+    try:
+        from sglang.srt.layers.moe import gguf_layout as _gl
+        from sglang.srt.server_args import get_global_server_args
+
+        files = _gl.source_files(getattr(get_global_server_args(), "model_path", "") or "")
+        if not files:
+            raise ValueError("model path is not a GGUF source")
+        if rng is None:
+            lo, hi = 0, int(getattr(layer, "num_experts", 0) or 0)
+        else:
+            lo, hi = int(rng[0]), int(rng[1])
+        total, n_layers = owned_expert_host_bytes(files, lo, hi)
+        logger.info(
+            "%s (header: %d layers x experts [%d, %d) = %.2f GiB per rank)", head, n_layers, lo, hi, total / 2**30
+        )
+    except Exception as exc:  # noqa: BLE001 -- a log line must never fail a load
+        logger.info("%s (size not derived from the header: %s)", head, exc)
+
+
 def refuse_unstaged_platztausch(layer, *, why: str) -> None:
     """W120 for GGUF: the Karte gives this layer a Platztausch buffer, the GGUF door is about to keep the plain
     stack (a ggml type without a MoE kernel, a fraction >= 1.0, a layer the half declined). The other group has no
@@ -313,6 +364,18 @@ def presplit_gguf_param(layer, attr: str, param, source):
         presplit = {}
         layer._moe_offload_presplit = presplit
     presplit[attr] = (buf, spill)
+    # The bank now has TWO names: the cache stash above and the flip buffer attribute published just before.
+    # The expert PARAMETER must stop being a third one: left holding the whole [R+C(+X)] bank (unmarked, same
+    # storage as a prefix view under a Karte), ``card_inventory`` would publish it once as a parameter and once
+    # as the #135 buffer until ``MoEExpertOffloadCache.install`` marks the alias on the first forward -- the
+    # W84 / W68 class. Same cure as the Marlin door (``presplit_expert_offload_after_repack``): swap ``.data``
+    # for a 0-row placeholder, IN PLACE on the same Parameter object (every holder of the object lets go of the
+    # bank; ``install`` builds the real Parameter from ``_moe_offload_presplit`` anyway).
+    placeholder = torch.empty((0,) + tuple(row_shape), dtype=dtype, device=buf.device)
+    if isinstance(param, torch.nn.Parameter):
+        param.data = placeholder
+    else:
+        setattr(layer, attr, placeholder)
     layer._moe_offload_full_experts = plan.num_experts
     if seat_x > 0:
         layer._weg2_seat_rows = int(seat_x)

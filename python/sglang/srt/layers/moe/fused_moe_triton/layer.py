@@ -1819,11 +1819,9 @@ class FusedMoE(torch.nn.Module):
 
                 if _gp.door_wanted(self):
                     on = False
-                    logging.getLogger(__name__).info(
-                        "G4 GGUF-PRESPLIT layer %s: streaming staging off -- the shared store / Karte / seat "
-                        "rows are served at materialization (host peak = this layer's loaded experts)",
-                        getattr(self, "layer_id", "?"),
-                    )
+                    # materialization runs after the complete load pass: the host peak is the rank's whole
+                    # owned expert set, not this layer's (named once, from the header)
+                    _gp.log_host_peak_once(self)
             if on:
                 self._gguf_stream_stagers = {}
             # Published last: a fast-path reader that sees True must find the
