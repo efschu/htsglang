@@ -23242,8 +23242,10 @@ def build_parser() -> argparse.ArgumentParser:
              "named refusal. `kvtail`: the 27B stage exactly. `free`: always the "
              "card's free VRAM. `weights` (VISION-WEIGHTS, not yet a profile default): "
              "the tower's parameters are views on victim WEIGHT memory of PP0 "
-             "(27B flip: MLP storages; dual: only the hull parts D does not share); "
-             "the victim bytes go to a host image (freed after every image) and come "
+             "(27B flip: MLP storages; dual: only the hull parts D does not share; "
+             "NF: resident expert rows with a store slot, returned from the store); "
+             "the victim bytes go to a host image (27B; freed after every image; NF: "
+             "none, the pinned store already holds them) and come "
              "back with a device checksum before the admission -- a mismatch stops "
              "the group (W110c). No KV page, no free VRAM, always synchronous.",
     )
