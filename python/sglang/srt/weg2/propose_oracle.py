@@ -1037,7 +1037,13 @@ def run_profile(env_path: str, devices: Sequence[Mapping[str, Any]], *, tree: st
         # NF-GGUF G5: the tokenizer directory of a GGUF profile is the sibling directory the model file sits in; it is
         # stood in for by the same snapshot (the launcher's W163 reads its sibling tokenizer files)
         i = len(argv) - 1 - argv[::-1].index("--tokenizer-path")
-        nt = farm(argv[i + 1], "tokenizer")
+        # G8 (10.10.2026): the same rule as for the GGUF model FILE above -- a header snapshot handed in for this directory
+        # stands in even where the real directory exists, so the dump does not depend on the box. The rig's sibling directory
+        # (make_nf_gguf_sibling.sh) appeared on the dev box at 10.10. 18:43; from then on the tokenizer path of the
+        # plan_nf_gguf_n3 golden (<MODELS>/...-sibling) came out as the REAL path and the P-FORM key moved (f0c0b6b428b7 ->
+        # dc034a1fee43): a box-bound red that no code change caused. Without a snapshot nothing changes.
+        _tok = argv[i + 1]
+        nt = farm_dir(_tok, "tokenizer", force_snapshot=bool((snapshots or {}).get(os.path.basename(_tok.rstrip("/")))))
         if nt != argv[i + 1]:
             argv[i + 1] = nt
     flags = _flags(argv)

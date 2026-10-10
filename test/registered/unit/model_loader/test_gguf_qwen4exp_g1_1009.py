@@ -23,11 +23,13 @@ import os
 import struct
 import types
 
+# G8 (cross-check finding C): BEFORE the first ``import torch`` -- set after it, the line was a no-op (the wrapper
+# pytest_gedeckelt.sh sets it empty anyway, a bare pytest run did not)
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+
 import numpy as np
 import pytest
 import torch
-
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 import gguf  # noqa: E402
 from gguf.quants import dequantize, quantize  # noqa: E402
@@ -650,6 +652,55 @@ _real = pytest.mark.skipif(
 )
 
 
+def _real_parts():
+    """The part files of the real export by directory listing (stat only; ``resolve_gguf_shard_paths`` reads headers)."""
+    return sorted(
+        os.path.join(REAL_DIR, f) for f in os.listdir(REAL_DIR) if f.endswith(".gguf")
+    )
+
+
+_REAL_ROWS = {}
+
+
+def _real_rows():
+    """``{tensor name: ggml ne tuple}`` of the 3 real parts -- G8 (cross-check finding D): the tensor directory walk
+    (``iter_gguf_tensors`` over a 10.9 MB + 49.8 GB + 43.8 GB split set, GGUFReader parses the tokenizer KV of part 1 each
+    time) took ~9 s per call and ~18 s more for the cold shard resolution, and three tests did it; under the 4 GB / timeout cap
+    of pytest_gedeckelt.sh that was a timeout risk. Walked ONCE per process and kept in a JSON file keyed by (path, size,
+    mtime_ns) of every part, so a changed export invalidates it; the first test that needs the headers pays, the rest and every
+    later run read the cache. ``test_real_export_all_1224_tensors_mapped_none_unknown`` still runs the real shard resolution (and
+    the walk itself on a cold cache) and checks the resolved parts against the directory listing the cache is keyed by."""
+    if _REAL_ROWS:
+        return _REAL_ROWS
+    import hashlib
+    import tempfile
+
+    parts = _real_parts()
+    key = hashlib.sha1(
+        "|".join(f"{q}:{os.stat(q).st_size}:{os.stat(q).st_mtime_ns}" for q in parts).encode()
+    ).hexdigest()[:16]
+    cache = os.path.join(tempfile.gettempdir(), f"g1_qwen4exp_real_rows_{key}.json")
+    try:
+        with open(cache, encoding="utf-8") as fh:
+            _REAL_ROWS.update({k: tuple(v) for k, v in json.load(fh).items()})
+        return _REAL_ROWS
+    except (OSError, ValueError):
+        pass
+    walked = {
+        str(t.name): tuple(int(d) for d in t.shape)
+        for t in gguf_shards.iter_gguf_tensors(gguf_shards.resolve_gguf_shard_paths(REAL_PART1))
+    }
+    _REAL_ROWS.update(walked)
+    try:
+        tmp = cache + f".{os.getpid()}"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({k: list(v) for k, v in walked.items()}, fh)
+        os.replace(tmp, cache)
+    except OSError:
+        pass  # no cache: the next run walks again
+    return _REAL_ROWS
+
+
 def _stub_headers():
     out = {}
     for fn in sorted(os.listdir(STUB_DIR)):
@@ -668,9 +719,10 @@ def _stub_headers():
 def test_real_export_all_1224_tensors_mapped_none_unknown():
     paths = gguf_shards.resolve_gguf_shard_paths(REAL_PART1)
     assert len(paths) == 3
-    tensors = list(gguf_shards.iter_gguf_tensors(paths))
-    names = {str(t.name) for t in tensors}
-    assert len(tensors) == len(names) == 1224
+    assert [os.path.realpath(q) for q in paths] == [os.path.realpath(q) for q in _real_parts()]
+    rows = _real_rows()  # the cached walk of iter_gguf_tensors(paths) -- see _real_rows
+    names = set(rows)
+    assert len(names) == 1224
     mp, unknown = Q4.build_qwen4exp_name_map(names, 48, 1)
     assert unknown == [] and set(mp) == names
     assert Q4.qwen4exp_missing_roles(names, 48) == []
@@ -726,8 +778,7 @@ def test_real_export_shapes_against_the_hf_stubs():
     against the safetensors header. Packed INT4/INT8 stubs carry the out dim in
     dim 0 only; dense stubs the full shape."""
     stub = _stub_headers()
-    paths = gguf_shards.resolve_gguf_shard_paths(REAL_PART1)
-    rows = {str(t.name): tuple(reversed([int(d) for d in t.shape])) for t in gguf_shards.iter_gguf_tensors(paths)}
+    rows = {name: tuple(reversed(ne)) for name, ne in _real_rows().items()}  # cached walk, see _real_rows
     mp, _ = Q4.build_qwen4exp_name_map(rows, 48, 1)
     checked = 0
     for gname, hf in mp.items():
