@@ -680,33 +680,55 @@ def encode_work_bytes(patches: int, *, hidden: int, intermediate: int, heads: in
                       merge: int, deepstack: int, in_dim: int, quadratic: bool, elem: int = 2) -> int:
     """Peak bytes the tower's forward allocates for ONE item of ``patches``
     patches (``encode_items`` runs one item at a time). A model of the
-    Qwen3-VL-family forward, named term by term; the measured
-    ``encode_peak_mib`` of W102 is what calibrates it (plan §9 M1):
+    Qwen3-VL-family forward (``models/qwen3_vl.py``), named term by term: what
+    lives for the whole forward, plus the largest of its phases. The measured
+    ``encode_peak_mib`` of W102 is what calibrates it (plan §9 M1; metal 10.10.
+    before VISION-WORK: 1213/2150 MiB at 3072/4096 = exactly the old forward's
+    live tensors, 12.47 hidden in the MLP phase + pixels + pos rows + rope).
 
-    * inputs   -- the pixel rows on the device (``in_dim`` = C*T*P*P)
-    * pos      -- position embedding rows + the rope cos/sin (fp32)
-    * block    -- one block's live activations, the larger of the attention
-                  phase (residual, norm, qkv x3, rotated q/k x2, contiguous
-                  q/k/v x3, attention out, proj out = 12 hidden) and the MLP
-                  phase (residual, norm, fc2 out = 3 hidden, fc1 out + act)
-    * rows     -- the merged rows of the merger and each deepstack merger,
-                  and their concatenation
+    Held for the whole forward:
+
+    * inputs   -- the pixel rows on the device (``in_dim`` = C*T*P*P);
+                  ``encode_items`` holds them across the call
+    * rope     -- the rope cos/sin rows (fp32, half the head width each)
+
+    The phases (``h`` = one hidden-wide row block, ``i`` = intermediate):
+
+    * embed    -- position interpolation: the patch rows, the four corner
+                  lookups, their sum and its permuted copy = 7 h (the
+                  pos rows are dropped once added, VISION-WORK)
+    * attn     -- residual, norm1, fused qkv (3 h) and the contiguous q/k/v
+                  copies (3 h) = 8 h; after ``del qkv`` the rotation holds
+                  residual, norm1, q/k/v, rotated q/k (7 h) plus the
+                  full-width fp32 cos/sin
+    * mlp      -- residual, norm2, fc1 out, act out = 2 h + 2 i (fc1 is
+                  dropped before fc2: residual, norm2, act, fc2 out =
+                  3 h + i); norm1 and the attention output are dropped
+                  before the MLP (VISION-WORK)
+    * block    -- the larger of attn and mlp, plus the deepstack rows the
+                  earlier mergers left
+    * merger   -- residual, norm, fc1, act (4 h) with the deepstack rows,
+                  or the merged rows and their concatenation, the larger
     * quad     -- ``quadratic`` (sdpa AND more than one segment, see
                   ``encode_work_for``): the block-diagonal mask on the device,
                   bool + its additive bf16 form = 3 B per pair. One segment
                   (a still image) runs sdpa without a mask
                   (``layers/attention/vision.py:_sdpa_single_segment``), so no
-                  pair term; the 4096x4096 image (65536 patches) of the
-                  metal W105b (09.10.) books 2402 MiB instead of 14690 MiB
+                  pair term
     """
     p = int(patches)
     head_dim = max(1, hidden // max(1, heads))
+    h = p * hidden * elem
     inputs = p * in_dim * elem
-    pos = p * hidden * elem + 2 * p * (head_dim // 2) * 4
-    block = p * elem * max(12 * hidden, 3 * hidden + 2 * intermediate)
-    rows = (p // max(1, merge * merge)) * out_hidden * elem * (1 + deepstack) * 2
+    rope = 2 * p * (head_dim // 2) * 4
+    embed = 7 * h
+    attn = max(8 * h, 7 * h + 2 * p * head_dim * 4)
+    mlp = p * elem * max(2 * hidden + 2 * intermediate, 3 * hidden + intermediate)
+    merged = (p // max(1, merge * merge)) * out_hidden * elem
+    block = max(attn, mlp) + deepstack * merged
+    merger = max(4 * h + deepstack * merged, (1 + deepstack) * merged * 2)
     quad = 3 * p * p if quadratic else 0
-    return int(inputs + pos + block + rows + quad)
+    return int(inputs + rope + max(embed, block, merger) + quad)
 
 
 def encode_work_for(vision_config: Any, items: Sequence[Any], backend: Optional[str]) -> int:

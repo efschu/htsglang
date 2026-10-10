@@ -140,7 +140,11 @@ class Qwen3_VisionMLP(nn.Module):
 
     def forward(self, x: torch.Tensor):
         x_fc1, _ = self.linear_fc1(x)
-        mlp_output, _ = self.linear_fc2(self.act(x_fc1))
+        act = self.act(x_fc1)
+        # VISION-WORK: fc1's rows die before fc2 allocates its output (same
+        # numbers, one intermediate-wide tensor less at the MLP peak)
+        del x_fc1
+        mlp_output, _ = self.linear_fc2(act)
         return mlp_output
 
 
@@ -242,8 +246,12 @@ class Qwen3_VisionBlock(nn.Module):
             max_seqlen=max_seqlen,
             sequence_lengths=sequence_lengths,
         )
+        # VISION-WORK: norm1's rows and the attention output are dead once
+        # added; dropped here they do not sit under the MLP's peak
+        del hidden_states
         attn = rearrange(attn, "b s ... -> s b ...")
         x += attn
+        del attn
         norm2 = self.norm2(x)
         mlp = self.mlp(norm2)
         x += mlp
@@ -904,6 +912,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         else:
             pos_embeds = self.fast_pos_embed_interpolate_from_list(grid_thw_list)
         x += pos_embeds
+        del pos_embeds  # VISION-WORK: not held through the blocks
 
         rotary_pos_emb_cos, rotary_pos_emb_sin = self.rot_pos_emb(grid_thw_list)
 
