@@ -85,6 +85,7 @@ __all__ = [
     "slot_base_for_rank",
     "shared_geometry",
     "write_rows",
+    "write_rows_from",
     "mark_rows_written",
     "rows_written",
     "written_rows_cached",
@@ -106,7 +107,14 @@ def store_identity() -> str:
     return os.environ.get(STORE_IDENTITY_ENV, "").strip()
 
 
-def compute_identity(model: str, map_path: str) -> str:
+#: H88-C (same text as ``origin/desk/nf-h88-ident-1008``, so the merge is a no-op on these lines): the weight LAYOUT
+#: of the rows in the store. The store file of a (layer, tensor) has the same name and shape in two layouts, so only
+#: the identity can keep one layout's sentinel from vouching for the other's rows. The default layout's tag does NOT
+#: enter the hash: an INT4 boot's identity stays byte for byte what it was.
+DEFAULT_LAYOUT = "marlin_w4a16"
+
+
+def compute_identity(model: str, map_path: str, layout: str = DEFAULT_LAYOUT) -> str:
     """H2c: der Fingerabdruck, unter dem ein Sentinel gueltig ist.
 
     Aus dem Checkpoint (``config.json``, ``*.safetensors.index.json`` als Bytes,
@@ -122,6 +130,13 @@ def compute_identity(model: str, map_path: str) -> str:
         return ""
     h = hashlib.sha256()
     h.update(b"h2c-v1\0")
+    if layout != DEFAULT_LAYOUT:
+        h.update(b"layout\0" + str(layout).encode() + b"\0")
+    # G4: a GGUF source has no ``*.safetensors*`` for the loop below to size, and a ``.gguf`` path used to be
+    # hashed by NAME only. Its identity is the layout tag (the ggml type of every expert tensor, layer by layer)
+    # and the digest of the shard HEADERS (names, shapes, types, offsets) -- see ``gguf_layout``. ("", "") for
+    # every other source: the INT4 identity does not move.
+    _gguf_tag, _gguf_hdr = _gguf_identity_terms(model)
     if os.path.isdir(model):
         names = sorted(os.listdir(model))
         for name in names:
@@ -131,11 +146,24 @@ def compute_identity(model: str, map_path: str) -> str:
             elif name.endswith(".safetensors"):
                 size = os.path.getsize(os.path.join(model, name))
                 h.update(f"{name}\0{size}\0".encode())
-    else:
+    elif not _gguf_tag:
         h.update(b"model-id\0" + str(model).encode() + b"\0")
+    if _gguf_tag:
+        h.update(b"gguf\0" + _gguf_tag.encode() + b"\0" + _gguf_hdr.encode() + b"\0")
     with open(map_path, "rb") as fh:
         h.update(b"map\0" + fh.read())
     return h.hexdigest()[:24]
+
+
+def _gguf_identity_terms(model: str):
+    """``(layout tag, header digest)`` when ``model`` is a GGUF source, else ``("", "")``. A GGUF set that cannot be
+    read is an ``OSError`` (the launcher's ``publish_store_identity`` turns that into "no identity, nobody adopts")."""
+    from sglang.srt.layers.moe import gguf_layout as _gl
+
+    try:
+        return _gl.layout_for_source(model)
+    except _gl.GGUFLayoutError as exc:
+        raise OSError(str(exc)) from exc
 
 
 def sentinel_is_ours(data: dict) -> bool:
@@ -579,6 +607,67 @@ def write_rows(
         return rows
     for e in locals_:
         store[rows[e]].copy_(src[e], non_blocking=False)
+    return rows
+
+
+def write_rows_from(
+    store: torch.Tensor,
+    get,
+    rows: Dict[int, int],
+    *,
+    release=None,
+) -> Dict[int, int]:
+    """:func:`write_rows` for a source that is not a stack: ``get(local) -> row tensor`` (G4, the GGUF door).
+
+    A GGUF layer has no ``[E, ...]`` tensor to index -- its experts are the loader's per-expert tensors, and
+    stacking them is exactly the allocation the offload exists to avoid. So the rows go one expert at a time,
+    ``store[rows[local]] <- get(local)``, and ``release(local)`` lets the caller drop the loaded bytes at once.
+    Same two guards as :func:`write_rows` (the #108 placeholder-weights denial and the #94 bounds check) and the
+    same return: the ``local -> row`` map that was written. A row whose shape or dtype is not the store's is a
+    named error, not a broadcast: GGUF rows are opaque quantization blocks, and a ``copy_`` that cast or
+    broadcast one would still look like a weight.
+    """
+    try:
+        from sglang.srt.weg2 import adopt as _adopt
+
+        if _adopt.store_writes_denied():
+            import logging as _lg
+
+            _lg.getLogger(__name__).info(
+                "#108 STORE-WRITE UNTERDRUECKT: dieser Rang haelt "
+                "Platzhalter-Gewichte (%s) und der Store gehoert BEIDEN "
+                "Gruppen -- %d Zeilen NICHT geschrieben",
+                _adopt.placeholder_reason() or "dummy-load", len(rows))
+            if release is not None:
+                for local in rows:
+                    release(local)
+            return dict(rows or {})
+    except ImportError:
+        pass
+    rows = dict(rows)
+    if not rows:
+        return rows
+    kapazitaet = int(store.shape[0])
+    daneben = sorted(r for r in rows.values() if not (0 <= int(r) < kapazitaet))
+    if daneben:
+        raise RuntimeError(
+            f"#94: {len(daneben)} Zeilen liegen ausserhalb der Store-Datei "
+            f"(0..{kapazitaet-1}), erste: {daneben[:4]}. Entweder ist die "
+            f"Abbildung lokal->Slot nicht durchgereicht worden (dann sind es "
+            f"globale Ids), oder die Datei wurde mit einer anderen "
+            f"Platzzahl angelegt als die Abbildung annimmt."
+        )
+    for local in sorted(rows):
+        src = get(local)
+        if tuple(src.shape) != tuple(store.shape[1:]) or src.dtype != store.dtype:
+            raise RuntimeError(
+                f"G4 STORE-ROW: local expert {local} has shape {tuple(src.shape)} dtype {src.dtype}, the store "
+                f"row is {tuple(store.shape[1:])} {store.dtype} -- a GGUF row is copied whole or not at all"
+            )
+        store[rows[local]].copy_(src)
+        del src
+        if release is not None:
+            release(local)
     return rows
 
 
