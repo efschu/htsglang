@@ -85,6 +85,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.kv_session_offload import SPILL_CLASSES
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
+from sglang.srt.managers.mm_tokenize_offload import MmDispatchOrder
 from sglang.srt.managers.mm_utils import TensorTransportMode, wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.multimodal.lane_support import image_requests_unsupported_reason
@@ -367,6 +368,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Init running status
         self.init_running_status()
 
+        # Init the dispatch order of off-loop multimodal tokenization (D-HEALTH)
+        self.init_mm_dispatch_order()
+
         # Init logging and dumping
         self.init_request_logging_and_dumping()
 
@@ -579,6 +583,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if self.tokenizer_ipc_name is not None:
             stamp_http_worker_ipc(obj, self.tokenizer_ipc_name)
         await async_sock_send(self.send_to_scheduler, obj)
+
+    def init_mm_dispatch_order(self):
+        self.mm_dispatch_order = MmDispatchOrder()
 
     def init_running_status(self):
         # Request states
@@ -794,14 +801,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
                 # Tokenize the request and send it to the scheduler
                 if obj.is_single:
-                    tokenized_obj = await self._tokenize_one_request(obj)
-                    state = self.rid_to_state[obj.rid]
-                    if obj.return_prompt_token_ids:
-                        state.prompt_token_ids = list(tokenized_obj.input_ids)
-                    elif int(getattr(self.server_args, "tp_prefill_max_tokens", 0) or 0) > 0:
-                        # SEQ-HASH: a Weg-2 D group hashes prompt + output at the finish
-                        state.weg2_prompt_ids = tokenized_obj.input_ids
-                    self._send_one_request(tokenized_obj)
+                    # D-HEALTH: an image request tokenizes off the loop; the
+                    # dispatch order stays FIFO (mm_tokenize_offload).
+                    async with self.mm_dispatch_order.request(
+                        rid=obj.rid, is_mm=obj.contains_mm_input()
+                    ) as turn:
+                        tokenized_obj = await self._tokenize_one_request(obj)
+                        state = self.rid_to_state[obj.rid]
+                        if obj.return_prompt_token_ids:
+                            state.prompt_token_ids = list(tokenized_obj.input_ids)
+                        elif int(getattr(self.server_args, "tp_prefill_max_tokens", 0) or 0) > 0:
+                            # SEQ-HASH: a Weg-2 D group hashes prompt + output at the finish
+                            state.weg2_prompt_ids = tokenized_obj.input_ids
+                        await turn.dispatch(self._send_one_request, tokenized_obj)
                     async for response in self._wait_one_response(obj, request):
                         yield response
                 else:
