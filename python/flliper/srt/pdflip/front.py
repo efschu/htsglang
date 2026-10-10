@@ -2964,19 +2964,6 @@ def health_is_serving_fact(http_200: bool, process_alive: bool) -> bool:
     return bool(http_200 and process_alive)
 
 
-#: VISION-WEIGHTS (metal 09.10., M12 dual): an image request keeps P's HTTP loop busy for tens of seconds
-#: before the stage runs (a 4096x4096 image is decoded and patchified in the tokenizer process: /health
-#: failed at 15:55:10 and 15:55:24, W17 stopped a healthy group, although the stage then answered W105b by
-#: name). The front KNOWS it routed an image to P, exactly as it knows ``flipping``: a silent /health of P
-#: behind such a request is not a failure for this long; past it the streak counts again.
-VISION_HEALTH_GRACE_S = 120.0
-
-
-def vision_inflight_age(inflight: Mapping[int, float], now: float) -> Optional[float]:
-    """Age in seconds of the OLDEST image request still on P, None if there is none."""
-    return (now - min(inflight.values())) if inflight else None
-
-
 def fairness_reached(oldest_arrival: Optional[float], now: float, w_s: float) -> bool:
     return oldest_arrival is not None and (now - oldest_arrival) >= w_s
 
@@ -9234,7 +9221,6 @@ class Front:
                 return web.json_response({"error": f"PDFLIP STOP {self.stop}"}, status=503)
             finally:
                 live.discard(task)
-                self.__dict__.setdefault("_vision_inflight", {}).pop(id(task), None)
 
         return guarded
 
@@ -9269,8 +9255,6 @@ class Front:
             # attaching `precomputed_embeddings`. So the front's whole job
             # here is (a) say so in the log and (b) make sure the request
             # goes to P.
-            # the health poller tolerates a silent P /health behind this request (VISION_HEALTH_GRACE_S)
-            self.__dict__.setdefault("_vision_inflight", {})[id(asyncio.current_task())] = time.monotonic()
             logger.info(
                 "W102 PdFlipVisionStage rid=%s image_parts=%d -- routing to P; "
                 "PP0 of the group runs the transient tower before its admission "
@@ -17332,20 +17316,6 @@ class Front:
                 if _nb <= 12 or _nb % 64 == 0:
                     logger.info("PDFLIP-HEALTH-BUSY group=%s http_ok=False progress=%s (n=%d): the group "
                                 "computes; not counted toward the streak; mem: %s", g.name, _fp_why, _nb, _mem)
-                continue
-            _va = vision_inflight_age(self.__dict__.get("_vision_inflight", {}), time.monotonic())
-            if (not ok and alive and hold is None and g.name == "P"
-                    and _va is not None and _va < VISION_HEALTH_GRACE_S):
-                # VISION-WEIGHTS: an image request is on P (decode + patchify of a big image holds P's HTTP
-                # loop); a silent /health is not a failure until VISION_HEALTH_GRACE_S. Hold / dead process
-                # stay fatal at once (the branch is only for alive and not held).
-                g.health_fail_streak = 0
-                g.health_facts = _fh.GroupFacts(False, True, 0, None, time.time())
-                self.counters["health_busy"] += 1
-                _nb = self.counters["health_busy"]
-                if _nb <= 12 or _nb % 64 == 0:
-                    logger.info("PDFLIP-HEALTH-BUSY group=%s http_ok=False image request on P for %.1f s (grace %.0f s, "
-                                "n=%d): not counted toward the streak", g.name, _va, VISION_HEALTH_GRACE_S, _nb)
                 continue
             g.health_fail_streak += 1
             g.health_facts = _fh.GroupFacts(bool(ok), bool(alive), g.health_fail_streak, hold, time.time())
