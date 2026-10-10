@@ -285,19 +285,15 @@ def test_land_now_waits_every_open_row_without_promoting(monkeypatch):
 # -------------------------------------------------------- W110c (fatal) --
 
 
-@pytest.mark.parametrize("case,needle", [("stale_store", "checksum MISMATCH"),
-                                         ("skip", "checksum MISMATCH"),
+@pytest.mark.parametrize("case,needle", [("skip", "checksum MISMATCH"),
                                          ("raise", "restore raised")])
-def test_a_stale_store_or_a_failed_return_is_W110c(tmp_path, case, needle):
-    """A store slot whose bytes differ from the device row (stale store), a
-    skipped refill (mutant) and a failing copy: the checksum or the raise
-    makes the outcome W110c -- the pass then stops the group (core test)."""
+def test_a_failed_return_is_W110c(tmp_path, case, needle):
+    """A skipped refill (mutant) and a failing copy: the checksum or the
+    raise makes the outcome W110c -- the pass then stops the group (core
+    test). The store matched the device before the move, the RETURN failed."""
     _write_model(tmp_path)
     model = _Model([_MoELayer(seed=6)])
-    refill = None
-    if case == "stale_store":
-        model.layers[0]._moe_offload_presplit[W13][1][0] ^= 1    # slot 0 no longer = row 4
-    elif case == "skip":
+    if case == "skip":
         refill = lambda entries, runs, *, layer_id="?": 0         # noqa: E731
     else:
         def refill(entries, runs, *, layer_id="?"):
@@ -305,6 +301,60 @@ def test_a_stale_store_or_a_failed_return_is_W110c(tmp_path, case, needle):
     src, _calls, _log = _source(model, refill=refill)
     out = _run(_sched(), [_req("r", [_Item()])], tmp_path, victims=src, air=NO_AIR)
     assert not out.ok and out.code == vv.W_VICTIM_NOT_RESTORED and needle in out.fatal
+
+
+def test_a_stale_store_is_W111b_before_a_byte_moves(tmp_path):
+    """Review S2: the device checksum guards the DEVICE rows, the return gives
+    back the STORE's. A store slot that differs from the row it will be loaded
+    into (stale store) is refused W111b by name BEFORE the move: no refill, no
+    row touched, the image not encoded, not fatal -- the old flow (W110c after
+    the overwrite) is gone for this case."""
+    _write_model(tmp_path)
+    model = _Model([_MoELayer(seed=6)])
+    snap = model.snapshot()
+    model.layers[0]._moe_offload_presplit[W13][1][0] ^= 1       # slot 0 no longer = row 4
+    src, calls, _log = _source(model)
+    it = _Item()
+    out = _run(_sched(), [_req("r", [it])], tmp_path, victims=src, air=NO_AIR)
+    assert not out.ok and out.code == vv.W_VICTIM_PLAN_REFUSED and not out.fatal
+    assert "store slots 0..1" in out.detail and "nothing moved" in out.detail
+    assert model.same_as(snap) and calls == [] and it.precomputed_embeddings is None
+
+
+def test_a_store_slot_the_tower_does_not_touch_is_not_compared(tmp_path):
+    """Only the rows the tower touches are compared (the rows restore reloads):
+    the 1.5 KiB tower covers rows 4-6 of the w13 attribute, so a stale slot 3
+    (row 7, untouched) lets the stage run and the return is clipped to rows 4-6."""
+    _write_model(tmp_path)
+    model = _Model([_MoELayer(seed=6)])
+    model.layers[0]._moe_offload_presplit[W13][1][3] ^= 1       # slot 3 = row 7: not borrowed
+    src, calls, _log = _source(model)
+    out = _run(_sched(), [_req("r", [_Item()])], tmp_path, victims=src, air=NO_AIR)
+    assert out.ok, out.detail
+    assert calls == [(W13, ((4, 0, 2), (6, 2, 1)), "layers.0")]
+
+
+def test_the_W110c_verdict_survives_a_raise_in_the_teardown(tmp_path, monkeypatch):
+    """Review S1: the return failed (W110c, set in the finally), then the
+    teardown raises. The pass must still stop the group with the FIRST
+    verdict -- not rebuild a W_LOAD outcome without ``fatal`` and go on with
+    foreign bytes in the expert rows."""
+    _write_model(tmp_path)
+    model = _Model([_MoELayer(seed=6)])
+    src, _calls, _log = _source(model, refill=lambda entries, runs, *, layer_id="?": 0)  # skipped return
+    monkeypatch.setattr(vrr, "_strip_module", lambda module: (_ for _ in ()).throw(RuntimeError("teardown boom")))
+    real = vrr.run_rank_stage
+    monkeypatch.setattr(vrr, "run_rank_stage", lambda s, reqs, **kw: real(s, reqs, build=_build(), **kw))
+    monkeypatch.setattr(vrr, "_rank_device", lambda: torch.device("cpu"))
+    s = types.SimpleNamespace(
+        waiting_queue=[_req("r", [_Item()])], pdflip_dormant=False, _pdflip_vision_refused=set(),
+        _pdflip_vision_arm_refusal="", _pdflip_vision_origin_aborts=[], _pdflip_vision_runs=0,
+        _pdflip_vision_place=vrs.PLACE_WEIGHTS, _pdflip_vision_victims=src,
+        token_to_kv_pool_allocator=_Alloc(_kv()),
+        server_args=types.SimpleNamespace(model_path=str(tmp_path)),
+        model_config=types.SimpleNamespace(hf_config=None))
+    with pytest.raises(vv.VisionVictimNotRestored, match="W110c.*checksum MISMATCH"):
+        vrr.vision_rank_pass(s)
 
 
 # ------------------------------------------------------- switch off / wiring --
@@ -346,3 +396,29 @@ def test_arming_line_plans_the_header_tower_on_the_slot_rows():
     big = [vrs.CkptTensor("model.visual.merger.linear_fc2.weight", torch.bfloat16, (2048, 1), 0, 4096)]
     line, why = vv.arming_line(src, big, lambda n: n)
     assert "plan=REFUSED" in line and "W105b" in why and "in one piece" in why
+
+
+def test_the_arming_reports_no_host_image_for_expert_rows_and_says_ARMED_once(caplog):
+    """Review H2: the rows live in the store, so the arming line names
+    planned_host_image_mib=0.0 although the plan moves victim_mib (it said the
+    victim bytes), and the arming logs ONE 'VICTIM-ARMED' line -- the store
+    census has its own tag (VICTIM-STORE)."""
+
+    class _Big(vve.ExpertRowVictims):
+        def inventory(self):
+            return [vv.VictimCandidate(name="big", key=0x10000, offset=0, nbytes=64 * vrs.MIB,
+                                       storage_nbytes=64 * vrs.MIB)]
+
+    src = _Big(targets=lambda: [], refill=lambda *a, **k: 0, joins=())
+    ck = [vrs.CkptTensor("model.visual.blocks.0.attn.qkv.weight", torch.bfloat16, (2048, 4096), 0, 16 * vrs.MIB)]
+    line, why = vv.arming_line(src, ck, lambda n: n)
+    assert why == "" and "planned_victim_mib=16.0" in line and "planned_host_image_mib=0.0" in line
+
+    model = _Model([_MoELayer(seed=8)])
+    sched = types.SimpleNamespace(tp_worker=types.SimpleNamespace(
+        model_runner=types.SimpleNamespace(model=model)))
+    with caplog.at_level("INFO", logger=vve.logger.name):
+        vv.resolve_source(sched)
+    armed = [r.getMessage() for r in caplog.records if vv.W_VICTIM_ARMED in r.getMessage()]
+    store = [r.getMessage() for r in caplog.records if vv.W_VICTIM_STORE in r.getMessage()]
+    assert armed == [] and len(store) == 1 and "store_layers=1" in store[0]

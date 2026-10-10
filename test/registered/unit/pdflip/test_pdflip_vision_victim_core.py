@@ -145,6 +145,24 @@ def test_checksum_sees_one_changed_word_and_the_tail():
     assert vv.segment_checksum(t) != a
 
 
+def test_checksum_sees_two_rows_swapped_inside_one_chunk():
+    """Review S3: a plain word sum per chunk is blind to rows exchanged inside
+    the chunk (same words, other places) -- a store row loaded into the wrong
+    slot would pass. The position-weighted sum sees it, also in the tail."""
+    row = 128                                                           # 512 B rows
+    g = torch.Generator().manual_seed(11)
+    t = torch.randint(0, 256, (8 * row * 4 + 3,), generator=g, dtype=torch.uint8)
+    a = vv.segment_checksum(t)
+    r = t[:8 * row * 4].view(8, row * 4)
+    r[[1, 5]] = r[[5, 1]].clone()                                       # rows 1 and 5 exchanged
+    assert vv.segment_checksum(t) != a
+    assert vv.segment_checksum(t)[0] == a[0]                            # the plain word sum is blind to it
+    t2 = torch.cat([t[:-3], torch.tensor([1, 2, 3], dtype=torch.uint8)])
+    b = vv.segment_checksum(t2)
+    t2[-3:] = torch.tensor([3, 2, 1], dtype=torch.uint8)                # tail bytes exchanged
+    assert vv.segment_checksum(t2) != b
+
+
 # ------------------------------------------------------------------ stage --
 
 

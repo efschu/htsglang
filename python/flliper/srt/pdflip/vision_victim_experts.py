@@ -10,6 +10,9 @@ are exactly the ones every wake loads from their fixed store slots
 already booked, so the borrow needs
 
 * no D2H and no host image -- ``stash`` is a no-op, ``host_bytes`` is 0;
+  instead ``verify_before_move`` compares the store's checksum with the
+  device rows' before a byte moves (a stale store slot is W111b, not a
+  W110c after the overwrite);
 * the return = the wake's own refill: ``load_refill_rows`` with the SAME runs
   the rearm uses (``_rearm_targets``), clipped to the rows the tower touched.
 
@@ -170,6 +173,13 @@ def model_targets(model: torch.nn.Module) -> List[LayerTarget]:
     return out
 
 
+def _row_bytes(rows: torch.Tensor) -> torch.Tensor:
+    """The bytes of a block of rows as a flat uint8 tensor (a view when the
+    block is contiguous, which a slice of leading rows of a contiguous
+    buffer is)."""
+    return rows.contiguous().reshape(-1).view(torch.uint8)
+
+
 def _run_base(buf: torch.Tensor, row0: int, row_bytes: int) -> int:
     """Byte offset of row ``row0`` of ``buf`` inside its storage."""
     return int(buf.storage_offset()) * int(buf.element_size()) + int(row0) * int(row_bytes)
@@ -291,6 +301,26 @@ class ExpertRowVictims:
         for wait in self._joins:
             wait()
 
+    def verify_before_move(self, views: Sequence[torch.Tensor]) -> None:
+        """Review S2: what comes back is the STORE's rows, what the checksum
+        guards is the DEVICE's rows. Before a byte moves, the checksum of
+        every store piece the return would load must equal the checksum of
+        the device rows it replaces; a stale or rewritten store slot is W111b
+        here (nothing moved, the rig intact) instead of a W110c crash-stop
+        after the rows were already overwritten. Only the rows the tower
+        touches are compared (the same rows ``restore`` reloads)."""
+        for run, (attr, buf, spill), seg in self._borrowed:
+            r0, r1 = rows_touched(row0=run.row0, row_bytes=run.row_bytes, offset=seg.offset,
+                                  nbytes=seg.nbytes)
+            for z0, p0, n in clip_runs(run.runs, row0=r0, row1=r1):
+                dev = vv.segment_checksum(_row_bytes(buf[z0:z0 + n]))
+                host = vv.segment_checksum(_row_bytes(spill[p0:p0 + n]))
+                if dev != host:
+                    raise vv.VisionVictimPlanRefused(
+                        f"{vv.W_VICTIM_PLAN_REFUSED}: store slots {p0}..{p0 + n - 1} of {run.layer}.{attr} "
+                        f"differ from the device rows {z0}..{z0 + n - 1} they would be loaded back into; "
+                        "nothing moved")
+
     def stash(self, views: Sequence[torch.Tensor]) -> None:
         """No-op: the bytes already live in the pinned store (plan R4)."""
         return None
@@ -361,7 +391,7 @@ def _build(scheduler) -> ExpertRowVictims:
     logger.info("%s victim=%s store_layers=%d store_runs=%d store_mib=%.1f refused_rows=%d "
                 "(resident rows with a store slot of this rank's layers; the Platztausch prefix "
                 "has no slot and is never a victim)",
-                vv.W_VICTIM_ARMED, KIND_EXPERTS, c.layers, c.candidates, c.nbytes / MIB, c.refused_rows)
+                vv.W_VICTIM_STORE, KIND_EXPERTS, c.layers, c.candidates, c.nbytes / MIB, c.refused_rows)
     return source
 
 
