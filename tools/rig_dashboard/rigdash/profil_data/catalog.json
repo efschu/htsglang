@@ -488,7 +488,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24748
+    "line": 24758
    },
    "status": "harvested",
    "text": "",
@@ -547,7 +547,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24779
+    "line": 24789
    },
    "status": "harvested",
    "text": "",
@@ -819,7 +819,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 22781
+    "line": 22783
    },
    "status": "harvested",
    "text": "",
@@ -848,7 +848,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23210
+    "line": 23212
    },
    "status": "harvested",
    "text": "",
@@ -1150,7 +1150,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24756
+    "line": 24766
    },
    "status": "harvested",
    "text": "",
@@ -1359,7 +1359,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24577
+    "line": 24587
    },
    "status": "harvested",
    "text": "",
@@ -1811,7 +1811,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23187
+    "line": 23189
    },
    "status": "harvested",
    "text": "",
@@ -1840,7 +1840,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24763
+    "line": 24773
    },
    "status": "harvested",
    "text": "",
@@ -1883,7 +1883,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 22984
+    "line": 22986
    },
    "status": "curated",
    "text": "Concurrent requests of the decode group and number of front seats.",
@@ -1912,7 +1912,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23198
+    "line": 23200
    },
    "status": "harvested",
    "text": "",
@@ -1941,7 +1941,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23118
+    "line": 23120
    },
    "status": "harvested",
    "text": "",
@@ -1970,7 +1970,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24704
+    "line": 24714
    },
    "status": "harvested",
    "text": "",
@@ -1999,7 +1999,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24717
+    "line": 24727
    },
    "status": "harvested",
    "text": "",
@@ -2028,7 +2028,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23065
+    "line": 23067
    },
    "status": "harvested",
    "text": "",
@@ -2060,7 +2060,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23420
+    "line": 23422
    },
    "status": "harvested",
    "text": "",
@@ -2103,7 +2103,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23180
+    "line": 23182
    },
    "status": "curated",
    "text": "D stays awake this many seconds after its work before it flips (0/empty = off).",
@@ -2135,7 +2135,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23383
+    "line": 23385
    },
    "status": "harvested",
    "text": "",
@@ -2164,7 +2164,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23393
+    "line": 23395
    },
    "status": "harvested",
    "text": "",
@@ -2193,7 +2193,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23397
+    "line": 23399
    },
    "status": "harvested",
    "text": "",
@@ -2255,7 +2255,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23051
+    "line": 23053
    },
    "status": "curated",
    "text": "Cuts the attention KV of the decode group by token across the cards (off/maxmin/vector/joint/owned).",
@@ -2284,7 +2284,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23075
+    "line": 23077
    },
    "status": "harvested",
    "text": "",
@@ -2310,7 +2310,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 23003,
-      "zeile": 23003
+      "zeile": 23005
      },
      "quelle": "catalog",
      "rel": "scales_with",
@@ -2334,7 +2334,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 22999
+    "line": 23001
    },
    "status": "curated",
    "text": "Group D only (TP3 on all cards), no P, no flip, no front (user 25.09.). D is built with the same env and the same argv as in the flip boot (budgets from the expectation as in the dry run), but accepts every uncached length itself (--tp-prefill-max-tokens = --max-kv-per-request) and is addressed directly on the port.",
@@ -2363,7 +2363,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24659
+    "line": 24669
    },
    "status": "harvested",
    "text": "",
@@ -2395,7 +2395,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23286
+    "line": 23288
    },
    "status": "harvested",
    "text": "",
@@ -2424,7 +2424,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23086
+    "line": 23088
    },
    "status": "harvested",
    "text": "",
@@ -2472,7 +2472,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23401
+    "line": 23403
    },
    "status": "curated",
    "text": "The weight split of the decode group per load class (off/wake/wake-seg/live).",
@@ -2501,7 +2501,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23414
+    "line": 23416
    },
    "status": "harvested",
    "text": "",
@@ -2530,7 +2530,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23430
+    "line": 23432
    },
    "status": "harvested",
    "text": "",
@@ -2559,7 +2559,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23425
+    "line": 23427
    },
    "status": "harvested",
    "text": "",
@@ -2588,7 +2588,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23104
+    "line": 23106
    },
    "status": "harvested",
    "text": "",
@@ -2617,7 +2617,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23092
+    "line": 23094
    },
    "status": "harvested",
    "text": "",
@@ -2646,7 +2646,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23099
+    "line": 23101
    },
    "status": "harvested",
    "text": "",
@@ -2672,7 +2672,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 25461,
-      "zeile": 25462
+      "zeile": 25570
      },
      "quelle": "catalog+curated",
      "rel": "scales_with",
@@ -2691,7 +2691,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 25458,
-      "zeile": 25459
+      "zeile": 25567
      },
      "quelle": "catalog",
      "rel": "scales_with",
@@ -2710,7 +2710,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 22875,
-      "zeile": 22875
+      "zeile": 22877
      },
      "quelle": "catalog",
      "rel": "derived_from",
@@ -2736,7 +2736,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23172
+    "line": 23174
    },
    "status": "curated",
    "text": "While D is awake, a backlog consisting only of short requests (each at most X) is served on D if their tokens do not exceed N. 0 = off.",
@@ -2765,7 +2765,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23379
+    "line": 23381
    },
    "status": "harvested",
    "text": "",
@@ -2797,7 +2797,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23364
+    "line": 23366
    },
    "status": "harvested",
    "text": "",
@@ -2826,7 +2826,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23375
+    "line": 23377
    },
    "status": "harvested",
    "text": "",
@@ -2852,7 +2852,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 27340,
-      "zeile": 27341
+      "zeile": 27456
      },
      "quelle": "catalog+curated",
      "rel": "derived_from",
@@ -2875,7 +2875,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24598
+    "line": 24608
    },
    "status": "curated",
    "text": "What the weight vector of the decode group is solved for: the operating point bs6 (default) or 'maxkv' (largest KV pool first).",
@@ -2904,7 +2904,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24670
+    "line": 24680
    },
    "status": "harvested",
    "text": "",
@@ -2933,7 +2933,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24696
+    "line": 24706
    },
    "status": "harvested",
    "text": "",
@@ -2965,7 +2965,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24686
+    "line": 24696
    },
    "status": "harvested",
    "text": "",
@@ -3129,7 +3129,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 22789
+    "line": 22791
    },
    "status": "unexplained",
    "text": "",
@@ -3758,7 +3758,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23267
+    "line": 23269
    },
    "status": "harvested",
    "text": "",
@@ -3787,7 +3787,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23265
+    "line": 23267
    },
    "status": "harvested",
    "text": "",
@@ -3819,7 +3819,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23272
+    "line": 23274
    },
    "status": "explained",
    "text": "DFlash only: off (default) group P loads the draft cold only and computes nothing with it; on is the old producer form, for A/B comparisons only.",
@@ -3848,7 +3848,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23269
+    "line": 23271
    },
    "status": "harvested",
    "text": "",
@@ -5095,7 +5095,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23234
+    "line": 23236
    },
    "status": "curated",
    "text": "Whether group P is the pure draft KV PRODUCER (#1264). 'on' (default; standing user order of 2026-09-07: draft KV across the flip) puts the mtp.* head of the checkpoint on P's last stage so that D resumes with a warm draft KV after a flip. 'off' boots the rg6-proven form: P carries NO speculative flag and no MTP head (the launcher says so in one line; the serving base / the A-B arm, never silently). Group D stays unchanged with both values: it keeps its own NEXTN head, because 'off' removes the producer, not the speculative decoding.",
@@ -5124,7 +5124,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23193
+    "line": 23195
    },
    "status": "harvested",
    "text": "",
@@ -5153,7 +5153,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 22765
+    "line": 22767
    },
    "status": "explained",
    "text": "Plans and checks the start without actually starting the groups.",
@@ -5338,7 +5338,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 15166,
-      "zeile": 15166
+      "zeile": 15168
      },
      "quelle": "catalog",
      "rel": "requires",
@@ -5365,7 +5365,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 22913
+    "line": 22915
    },
    "status": "curated",
    "text": "DUAL-SHARE stage 1a: D records its CUDA graphs on the device's highest-priority stream (graph nodes keep the priority of the capture stream). Group D of the dual layout only.",
@@ -5390,7 +5390,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 22946,
-      "zeile": 22946
+      "zeile": 22948
      },
      "quelle": "catalog",
      "rel": "requires",
@@ -5417,7 +5417,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 22945
+    "line": 22947
    },
    "status": "curated",
    "text": "DUAL-TP3PP3 --dual-unified-kv (default 1048576): D's KV pool in GLOBAL tokens (virtual; D keeps its boot state mapped and grows from the card pool). Must exceed D's boot context; every buffer is created in its owner share of it and immediately trimmed.",
@@ -5446,7 +5446,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 22898
+    "line": 22900
    },
    "status": "curated",
    "text": "DUAL-SHARE: D's minimum decode rate per request (tokens/s, measured on the leg 2 token stream); below it the rung moves toward D. 0 = off.",
@@ -5475,7 +5475,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 22868
+    "line": 22870
    },
    "status": "curated",
    "text": "DUAL-TP3PP3 D prefill admission, default 0 (user 01.10.: in the dual layout EVERY prefill runs on P, D only decodes). D's X (its W31 latch and the routing limit of the front) becomes 1 + this value: the 1 is the N-1 anchor convention (P holds back the last prompt token, D's first step computes it); everything larger goes to P, and a larger remainder on D is refused by name (W31 -> P), never silently recomputed. Ignored without --dual-layout; there it replaces --tp-prefill-max-tokens / --x-ceiling-tokens / --d-short-drain-tokens.",
@@ -5504,7 +5504,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 15182,
-      "zeile": 15182
+      "zeile": 15184
      },
      "quelle": "catalog",
      "rel": "requires",
@@ -5526,7 +5526,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 15186,
-      "zeile": 15186
+      "zeile": 15188
      },
      "quelle": "catalog",
      "rel": "requires",
@@ -5548,7 +5548,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 15190,
-      "zeile": 15190
+      "zeile": 15192
      },
      "quelle": "catalog",
      "rel": "requires",
@@ -5570,7 +5570,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 15194,
-      "zeile": 15194
+      "zeile": 15196
      },
      "quelle": "catalog",
      "rel": "requires",
@@ -5592,7 +5592,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 15198,
-      "zeile": 15198
+      "zeile": 15200
      },
      "quelle": "catalog",
      "rel": "excludes",
@@ -5619,7 +5619,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 22906
+    "line": 22908
    },
    "status": "curated",
    "text": "DUAL-SHARE stage 3 (pdflip/dual_green.py): P's SM share as a green context LADDER (100/75/50/25 % per forward, dynamic, up AND down; PP0 stamps the rung onto the request wire so that all three stages run the same one). 'on' = ladder + hold OBSERVER (the P-STUFE line carries would_hold), 'hold' = additionally PP0 really holds (0 %) while the arena is full. Default off = argv/env/start path byte-identical.",
@@ -6503,7 +6503,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22850
+      "line": 22852
      }
     },
     "nf": {
@@ -6512,7 +6512,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22099
+      "line": 22101
      }
     }
    },
@@ -6535,7 +6535,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 14762,
-      "zeile": 14762
+      "zeile": 14764
      },
      "quelle": "catalog",
      "rel": "derived_from",
@@ -6557,7 +6557,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 14789,
-      "zeile": 14789
+      "zeile": 14791
      },
      "quelle": "catalog",
      "rel": "excludes",
@@ -6584,7 +6584,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 22850
+    "line": 22852
    },
    "status": "curated",
    "text": "DUAL-TP3PP3 (F26, user 29.09.): BOTH groups stay awake for the whole boot, the front never flips. Implies --flip-weights resident; P is not put to sleep after READY, instead its AWAKE footprint is measured and D is sized afterwards (the same PID measurement as for the sleep remainder). The budget of P itself is lowered with --extra-p '--rank-gpu-memory-mib ...' (W100 allows lowering). Refuses --pdflip-d-adopt on and --idle-layout pp (help=; the code switches pp to tp without refusing, launcher.py:14722). Default off: the launcher is byte-identical.",
@@ -6612,7 +6612,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 14769,
-      "zeile": 14769
+      "zeile": 14771
      },
      "quelle": "catalog",
      "rel": "requires",
@@ -6639,7 +6639,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 22949
+    "line": 22951
    },
    "status": "curated",
    "text": "DUAL-TP3PP3: starts a private MPS control daemon before the groups (pipe directory under the run directory of the boot) so that P and D kernels run simultaneously on a card instead of time-sliced. Only with --dual-layout.",
@@ -6668,7 +6668,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 22876
+    "line": 22878
    },
    "status": "curated",
    "text": "DUAL-TP3PP3 pause admission (default 1.0 = no pause): P and D run at the same time and share every card, only physics limits them (user 01.10.). Below 1.0 P MAY pause while D holds decodes: the share of wall-clock time in which P's first stage may compute (pdflip/dual_duty.py). Simple form: PP0 waits t_fwd*(1-duty)/duty after every forward. With the env FLLIPER_PDFLIP_DUAL_P_GANG_CHUNKS=K (gang window): PP0 computes K chunks, waits until the pipeline is empty and then holds, so that D is alone on all cards.",
@@ -6693,7 +6693,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 22942,
-      "zeile": 22942
+      "zeile": 22944
      },
      "quelle": "catalog",
      "rel": "requires",
@@ -6720,7 +6720,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 22941
+    "line": 22943
    },
    "status": "curated",
    "text": "DUAL-TP3PP3 --dual-unified-kv (default 196608): P's KV pool rows (virtual; pages come from the card pool). Every K/V buffer is created at this size and immediately trimmed, so the boot peak is one buffer (tokens x bytes per token per layer).",
@@ -6749,7 +6749,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 22901
+    "line": 22903
    },
    "status": "curated",
    "text": "DUAL-SHARE: lower limit of P's share (rungs below are never used; default 0.25).",
@@ -6777,7 +6777,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 22918,
-      "zeile": 22918
+      "zeile": 22920
      },
      "quelle": "catalog",
      "rel": "requires",
@@ -6799,7 +6799,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 15166,
-      "zeile": 15166
+      "zeile": 15168
      },
      "quelle": "catalog",
      "rel": "requires",
@@ -6826,7 +6826,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 22916
+    "line": 22918
    },
    "status": "curated",
    "text": "DUAL-SHARE stage 1b: P starts with CUDA_MPS_CLIENT_PRIORITY=1 (below normal; read at connect, at boot only).",
@@ -6851,7 +6851,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 22865,
-      "zeile": 22865
+      "zeile": 22867
      },
      "quelle": "catalog",
      "rel": "requires",
@@ -6873,7 +6873,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 22865,
-      "zeile": 22865
+      "zeile": 22867
      },
      "quelle": "catalog",
      "rel": "scales_with",
@@ -6900,7 +6900,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 22864
+    "line": 22866
    },
    "status": "curated",
    "text": "DUAL-TP3PP3 --dual-share (default 1500): what P holds on a card outside its --rank-gpu-memory-mib budget (CUDA context, graphs, activations); is credited when D is sized from P's plan instead of from P's measurement.",
@@ -6928,7 +6928,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 22920,
-      "zeile": 22920
+      "zeile": 22922
      },
      "quelle": "catalog",
      "rel": "derived_from",
@@ -6950,7 +6950,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 14955,
-      "zeile": 14955
+      "zeile": 14957
      },
      "quelle": "catalog",
      "rel": "requires",
@@ -6977,7 +6977,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 22919
+    "line": 22921
    },
    "status": "curated",
    "text": "Default: ON with --dual-share, otherwise OFF. With --dual-unified-kv on: D PRIORITY stage 2 (user 01.10.): if D is still short after P has stopped and released its KV, P sleeps and parks its weights in host RAM (P boots with --enable-weights-cpu-backup and NOT resident; the host image is created at the pause and released after the restore, no idle image, NO-PERMANENT-HOSTRAM). off = stage 1 only; the front prints 'stage=2 unavailable (weights resident)'.",
@@ -7006,7 +7006,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 22883
+    "line": 22885
    },
    "status": "curated",
    "text": "DUAL-TP3PP3 with --dual-mps on (default 100): CUDA_MPS_ACTIVE_THREAD_PERCENTAGE for group P, that is the share of the SMs that P's kernels may occupy while D decodes. 100 = no limit.",
@@ -7031,7 +7031,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 15166,
-      "zeile": 15166
+      "zeile": 15168
      },
      "quelle": "catalog",
      "rel": "requires",
@@ -7058,7 +7058,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 22892
+    "line": 22894
    },
    "status": "curated",
    "text": "DUAL-SHARE stage 2: the P/D share controller of the front writes a rung (P's share 1.0/0.75/0.5/0.25, profile env FLLIPER_PDFLIP_DUAL_SHARE_RUNGS) to <busy>.ctl; P acts on it via --dual-share-actuators. p = P full (today), balanced/d = one fixed rung while D decodes, dynamic = matrix from tau (waiting prefill tokens / P's full rate) x D bs. Switchable at runtime: POST /pdflip/dual-priority on the front. Unset = off.",
@@ -7072,7 +7072,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22858
+      "line": 22860
      }
     },
     "nf": {
@@ -7081,7 +7081,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22103
+      "line": 22105
      }
     }
    },
@@ -7104,7 +7104,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 14762,
-      "zeile": 14762
+      "zeile": 14764
      },
      "quelle": "catalog",
      "rel": "requires",
@@ -7131,7 +7131,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 22858
+    "line": 22860
    },
    "status": "curated",
    "text": "DUAL-TP3PP3 stage 1b (implies --dual-layout): P's stage computes on D's TP shards (envelopes over D's three shards of its layers) and binds the shard of the D rank on its card to D's bytes via the union image. D boots directly after P as union OWNER, sized from P's PLANNED budget (+ --dual-p-overhead-mib); P waits for D's image before it loads anything.",
@@ -7156,7 +7156,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 15204,
-      "zeile": 15204
+      "zeile": 15206
      },
      "quelle": "catalog",
      "rel": "excludes",
@@ -7183,7 +7183,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 22903
+    "line": 22905
    },
    "status": "curated",
    "text": "DUAL-SHARE: comma list of the P actuators (default 'chunk'): chunk (PP0's chunk upper limit), duty (P duty throttle at the rung's share), green (rung 3, NOT built: named fallback to chunk).",
@@ -7211,7 +7211,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 14759,
-      "zeile": 14759
+      "zeile": 14761
      },
      "quelle": "catalog",
      "rel": "requires",
@@ -7238,7 +7238,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 22937
+    "line": 22939
    },
    "status": "curated",
    "text": "DUAL-TP3PP3: one KV pool per card that P and D share at runtime (user order 30.09. 07:10Z/07:25Z; pdflip/card_kv_ledger.py). P maps KV only while it prefills, and pauses when D is short. Needs --dual-share.",
@@ -7267,7 +7267,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23735
+    "line": 23737
    },
    "status": "harvested",
    "text": "",
@@ -10270,7 +10270,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 22964
+    "line": 22966
    },
    "status": "curated",
    "text": "Environment variables for group D only: KEY=VAL;KEY=VAL (values may carry commas, the last one wins).",
@@ -10299,7 +10299,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 22963
+    "line": 22965
    },
    "status": "curated",
    "text": "Environment variables for group P only: KEY=VAL;KEY=VAL (values may carry commas, the last one wins).",
@@ -10538,7 +10538,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23733
+    "line": 23735
    },
    "status": "harvested",
    "text": "",
@@ -10747,7 +10747,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 22965
+    "line": 22967
    },
    "status": "curated",
    "text": "Further server flags for group D, as one string (shell separation).",
@@ -10806,7 +10806,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 22962
+    "line": 22964
    },
    "status": "curated",
    "text": "Further server flags for group P, as one string (shell separation).",
@@ -10835,7 +10835,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 22966
+    "line": 22968
    },
    "status": "harvested",
    "text": "",
@@ -11134,7 +11134,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23034
+    "line": 23036
    },
    "status": "harvested",
    "text": "",
@@ -11242,7 +11242,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 14799,
-      "zeile": 14799
+      "zeile": 14801
      },
      "quelle": "catalog",
      "rel": "derived_from",
@@ -11268,7 +11268,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 22955
+    "line": 22957
    },
    "status": "curated",
    "text": "'family' (default) moves the weights on the P/D change; 'resident' keeps both groups in VRAM and only changes the KV cache.",
@@ -11282,7 +11282,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22766
+      "line": 22768
      }
     },
     "nf": {
@@ -11291,7 +11291,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22155
+      "line": 22157
      }
     }
    },
@@ -11317,7 +11317,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 22766
+    "line": 22768
    },
    "status": "harvested",
    "text": "",
@@ -11346,7 +11346,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23590
+    "line": 23592
    },
    "status": "harvested",
    "text": "",
@@ -11495,7 +11495,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23627
+    "line": 23629
    },
    "status": "harvested",
    "text": "",
@@ -11554,7 +11554,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23612
+    "line": 23614
    },
    "status": "harvested",
    "text": "",
@@ -11583,7 +11583,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 22968
+    "line": 22970
    },
    "status": "harvested",
    "text": "",
@@ -12480,7 +12480,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 19500,
-      "zeile": 19500
+      "zeile": 19502
      },
      "quelle": "catalog+curated",
      "rel": "requires",
@@ -12503,7 +12503,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 22734
+    "line": 22736
    },
    "status": "curated",
    "text": "Accepts a refused host ledger verdict under a named reason; requires --host-riegel-gib.",
@@ -12529,7 +12529,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 22736,
-      "zeile": 22736
+      "zeile": 22738
      },
      "quelle": "catalog+curated",
      "rel": "requires",
@@ -12552,7 +12552,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 22739
+    "line": 22741
    },
    "status": "curated",
    "text": "Runtime latch (GiB not reclaimable) below which a refused host ledger deviation is accepted; must lie below the hard limit.",
@@ -12594,7 +12594,7 @@
       "aufloesung": "nah",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 14792,
-      "zeile": 14792
+      "zeile": 14794
      },
      "quelle": "catalog",
      "rel": "derived_from",
@@ -12620,7 +12620,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23168
+    "line": 23170
    },
    "status": "curated",
    "text": "Which group is awake in the idle state: tp (decode group D) or pp (prefill group P).",
@@ -15599,7 +15599,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24798
+    "line": 24808
    },
    "status": "harvested",
    "text": "",
@@ -15661,7 +15661,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23195
+    "line": 23197
    },
    "status": "curated",
    "text": "KV upper limit per request for both groups. Without a value the context of the model applies.",
@@ -15902,7 +15902,7 @@
       "aufloesung": "nah",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 9328,
-      "zeile": 9328
+      "zeile": 9330
      },
      "quelle": "catalog+curated",
      "rel": "derived_from",
@@ -15921,7 +15921,7 @@
       "aufloesung": "nah",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 8889,
-      "zeile": 8889
+      "zeile": 8891
      },
      "quelle": "catalog+curated",
      "rel": "derived_from",
@@ -16094,7 +16094,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23036
+    "line": 23038
    },
    "status": "harvested",
    "text": "",
@@ -16273,7 +16273,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 22712
+    "line": 22714
    },
    "status": "curated",
    "text": "Path of the model checkpoint (or of the GGUF file).",
@@ -16842,7 +16842,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24806
+    "line": 24816
    },
    "status": "harvested",
    "text": "",
@@ -16871,7 +16871,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24813
+    "line": 24823
    },
    "status": "harvested",
    "text": "",
@@ -16900,7 +16900,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24822
+    "line": 24832
    },
    "status": "harvested",
    "text": "",
@@ -16928,7 +16928,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24305
+    "line": 24315
    },
    "status": "harvested",
    "text": "",
@@ -16956,7 +16956,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23587
+    "line": 23589
    },
    "status": "harvested",
    "text": "",
@@ -17015,7 +17015,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24541
+    "line": 24551
    },
    "status": "explained",
    "text": "Group D only: how many decode steps run per scheduler visit; 1 restores the shipped value.",
@@ -17317,7 +17317,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23547
+    "line": 23549
    },
    "status": "harvested",
    "text": "",
@@ -17349,7 +17349,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23571
+    "line": 23573
    },
    "status": "harvested",
    "text": "",
@@ -17378,7 +17378,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23566
+    "line": 23568
    },
    "status": "harvested",
    "text": "",
@@ -17407,7 +17407,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23561
+    "line": 23563
    },
    "status": "harvested",
    "text": "",
@@ -17436,7 +17436,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24769
+    "line": 24779
    },
    "status": "harvested",
    "text": "",
@@ -17479,7 +17479,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 22977
+    "line": 22979
    },
    "status": "curated",
    "text": "Concurrent requests of the prefill group (and concurrency of the front, leg 1).",
@@ -17508,7 +17508,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24343
+    "line": 24353
    },
    "status": "harvested",
    "text": "",
@@ -17537,7 +17537,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23145
+    "line": 23147
    },
    "status": "harvested",
    "text": "",
@@ -17566,7 +17566,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23152
+    "line": 23154
    },
    "status": "harvested",
    "text": "",
@@ -17595,7 +17595,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23130
+    "line": 23132
    },
    "status": "harvested",
    "text": "",
@@ -17607,7 +17607,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 23130
+      "line": 23132
      }
     },
     "nf": {
@@ -17616,7 +17616,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22415
+      "line": 22417
      }
     }
    }
@@ -17644,7 +17644,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23535
+    "line": 23537
    },
    "status": "harvested",
    "text": "",
@@ -17673,7 +17673,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23498
+    "line": 23500
    },
    "status": "harvested",
    "text": "",
@@ -17702,7 +17702,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23530
+    "line": 23532
    },
    "status": "harvested",
    "text": "",
@@ -17764,7 +17764,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23490
+    "line": 23492
    },
    "status": "curated",
    "text": "Only with --p-chunk-policy dynamic: the widest chunk; it becomes the chunk size of the P group.",
@@ -17793,7 +17793,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23494
+    "line": 23496
    },
    "status": "harvested",
    "text": "",
@@ -17822,7 +17822,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23543
+    "line": 23545
    },
    "status": "harvested",
    "text": "",
@@ -17865,7 +17865,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23504
+    "line": 23506
    },
    "status": "curated",
    "text": "Only with dynamic: the time model per stage ('builtin-int8', 'fit:<P.log>' or a JSON file).",
@@ -17914,7 +17914,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23510
+    "line": 23512
    },
    "status": "curated",
    "text": "Only with dynamic and a built-in/fitted model: the cost curve over the chunk width per stage.",
@@ -18004,7 +18004,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23434
+    "line": 23436
    },
    "status": "curated",
    "text": "How wide the prefill chunks are: 'fixed' (every forward takes --chunked-prefill-size) or 'dynamic' (one plan per request with a ramp-up and a ramp-down).",
@@ -18033,7 +18033,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 22973
+    "line": 22975
    },
    "status": "harvested",
    "text": "",
@@ -18062,7 +18062,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23358
+    "line": 23360
    },
    "status": "harvested",
    "text": "",
@@ -18091,7 +18091,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23673
+    "line": 23675
    },
    "status": "harvested",
    "text": "",
@@ -18124,7 +18124,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24725
+    "line": 24735
    },
    "status": "harvested",
    "text": "",
@@ -18138,7 +18138,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 24290
+      "line": 24300
      }
     },
     "nf": {
@@ -18147,7 +18147,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 23581
+      "line": 23590
      }
     }
    },
@@ -18173,7 +18173,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24290
+    "line": 24300
    },
    "status": "harvested",
    "text": "",
@@ -18202,7 +18202,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24320
+    "line": 24330
    },
    "status": "curated",
    "text": "Instrument: one line per forward with the idle time of the card before it (P).",
@@ -18234,7 +18234,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23451
+    "line": 23453
    },
    "status": "harvested",
    "text": "",
@@ -18263,7 +18263,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23463
+    "line": 23465
    },
    "status": "harvested",
    "text": "",
@@ -18292,7 +18292,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23470
+    "line": 23472
    },
    "status": "harvested",
    "text": "",
@@ -18321,7 +18321,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23486
+    "line": 23488
    },
    "status": "harvested",
    "text": "",
@@ -18350,7 +18350,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23474
+    "line": 23476
    },
    "status": "harvested",
    "text": "",
@@ -18379,7 +18379,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23479
+    "line": 23481
    },
    "status": "harvested",
    "text": "",
@@ -18408,7 +18408,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23466
+    "line": 23468
    },
    "status": "harvested",
    "text": "",
@@ -18437,7 +18437,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24278
+    "line": 24288
    },
    "status": "harvested",
    "text": "",
@@ -18466,7 +18466,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23516
+    "line": 23518
    },
    "status": "harvested",
    "text": "",
@@ -18495,7 +18495,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23527
+    "line": 23529
    },
    "status": "harvested",
    "text": "",
@@ -18524,7 +18524,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23303
+    "line": 23305
    },
    "status": "harvested",
    "text": "",
@@ -18553,7 +18553,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23336
+    "line": 23338
    },
    "status": "harvested",
    "text": "",
@@ -18579,7 +18579,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 23351,
-      "zeile": 23351
+      "zeile": 23353
      },
      "quelle": "catalog",
      "rel": "requires",
@@ -18598,7 +18598,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 23345,
-      "zeile": 23345
+      "zeile": 23347
      },
      "quelle": "catalog",
      "rel": "requires",
@@ -18621,7 +18621,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23343
+    "line": 23345
    },
    "status": "harvested",
    "text": "",
@@ -18650,7 +18650,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23666
+    "line": 23668
    },
    "status": "harvested",
    "text": "",
@@ -18679,7 +18679,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23354
+    "line": 23356
    },
    "status": "harvested",
    "text": "",
@@ -18712,7 +18712,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23321
+    "line": 23323
    },
    "status": "harvested",
    "text": "",
@@ -18741,7 +18741,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23656
+    "line": 23658
    },
    "status": "harvested",
    "text": "",
@@ -18770,7 +18770,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24328
+    "line": 24338
    },
    "status": "harvested",
    "text": "",
@@ -18799,7 +18799,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23643
+    "line": 23645
    },
    "status": "harvested",
    "text": "",
@@ -18828,7 +18828,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24309
+    "line": 24319
    },
    "status": "harvested",
    "text": "",
@@ -18842,7 +18842,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 23575
+      "line": 23577
      }
     },
     "nf": {
@@ -18851,7 +18851,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22860
+      "line": 22862
      }
     }
    },
@@ -18877,7 +18877,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23575
+    "line": 23577
    },
    "status": "harvested",
    "text": "",
@@ -19190,7 +19190,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 22804
+    "line": 22806
    },
    "status": "curated",
    "text": "Fixes the size M (MiB) of the Mamba host pool of the host ledger arming; 0 = the planner chooses.",
@@ -19219,7 +19219,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 22796
+    "line": 22798
    },
    "status": "harvested",
    "text": "",
@@ -19399,7 +19399,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 8859,
-      "zeile": 8859
+      "zeile": 8861
      },
      "quelle": "catalog+curated",
      "rel": "requires",
@@ -19441,7 +19441,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24148
+    "line": 24158
    },
    "status": "curated",
    "text": "How many of the full attention layers each prefill stage carries (e.g. 10,3,3). Attention layers have KV; the other layers do not.",
@@ -19470,7 +19470,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24788
+    "line": 24798
    },
    "status": "harvested",
    "text": "",
@@ -19499,7 +19499,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24511
+    "line": 24521
    },
    "status": "harvested",
    "text": "",
@@ -19528,7 +19528,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24269
+    "line": 24279
    },
    "status": "harvested",
    "text": "",
@@ -19557,7 +19557,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24450
+    "line": 24460
    },
    "status": "harvested",
    "text": "",
@@ -19586,7 +19586,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24459
+    "line": 24469
    },
    "status": "harvested",
    "text": "",
@@ -19615,7 +19615,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24441
+    "line": 24451
    },
    "status": "harvested",
    "text": "",
@@ -19644,7 +19644,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24521
+    "line": 24531
    },
    "status": "harvested",
    "text": "",
@@ -19673,7 +19673,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24412
+    "line": 24422
    },
    "status": "harvested",
    "text": "",
@@ -19702,7 +19702,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24420
+    "line": 24430
    },
    "status": "harvested",
    "text": "",
@@ -19731,7 +19731,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24364
+    "line": 24374
    },
    "status": "harvested",
    "text": "",
@@ -19757,7 +19757,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 21653,
-      "zeile": 21653
+      "zeile": 21655
      },
      "quelle": "catalog+curated",
      "rel": "scales_with",
@@ -19777,7 +19777,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 21650,
-      "zeile": 21650
+      "zeile": 21652
      },
      "quelle": "catalog+curated",
      "rel": "scales_with",
@@ -19800,7 +19800,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24427
+    "line": 24437
    },
    "status": "curated",
    "text": "Resident expert share per prefill stage (vector). Mandatory for a model with experts; the cut solver prices the expert bytes with this share.",
@@ -19826,7 +19826,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 21659,
-      "zeile": 21659
+      "zeile": 21661
      },
      "quelle": "catalog+curated",
      "rel": "scales_with",
@@ -19863,7 +19863,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24435
+    "line": 24445
    },
    "status": "curated",
    "text": "LRU and staging rows of the expert pool per layer and stage (vector, default 0). Corresponds to FLLIPER_MOE_SCRATCH_SLOTS of the P group.",
@@ -19892,7 +19892,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24465
+    "line": 24475
    },
    "status": "harvested",
    "text": "",
@@ -19921,7 +19921,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24478
+    "line": 24488
    },
    "status": "harvested",
    "text": "",
@@ -19950,7 +19950,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24260
+    "line": 24270
    },
    "status": "harvested",
    "text": "",
@@ -19979,7 +19979,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23038
+    "line": 23040
    },
    "status": "harvested",
    "text": "",
@@ -20008,7 +20008,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24375
+    "line": 24385
    },
    "status": "harvested",
    "text": "",
@@ -20037,7 +20037,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24390
+    "line": 24400
    },
    "status": "harvested",
    "text": "",
@@ -20066,7 +20066,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24396
+    "line": 24406
    },
    "status": "harvested",
    "text": "",
@@ -20095,7 +20095,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24497
+    "line": 24507
    },
    "status": "harvested",
    "text": "",
@@ -20123,7 +20123,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24400
+    "line": 24410
    },
    "status": "harvested",
    "text": "",
@@ -20182,7 +20182,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24351
+    "line": 24361
    },
    "status": "harvested",
    "text": "",
@@ -20241,7 +20241,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24793
+    "line": 24803
    },
    "status": "harvested",
    "text": "",
@@ -20334,7 +20334,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24154
+    "line": 24164
    },
    "status": "harvested",
    "text": "",
@@ -20360,7 +20360,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 22231,
-      "zeile": 22231
+      "zeile": 22233
      },
      "quelle": "catalog+curated",
      "rel": "scales_with",
@@ -20383,7 +20383,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24219
+    "line": 24229
    },
    "status": "curated",
    "text": "Hard lower bound (in world KV tokens) for the KV pool that the cut solver may choose. 0 switches the floor off.",
@@ -20409,7 +20409,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 8859,
-      "zeile": 8859
+      "zeile": 8861
      },
      "quelle": "catalog+curated",
      "rel": "requires",
@@ -20466,7 +20466,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 22231,
-      "zeile": 22231
+      "zeile": 22233
      },
      "quelle": "catalog+curated",
      "rel": "scales_with",
@@ -20489,7 +20489,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24135
+    "line": 24145
    },
    "status": "curated",
    "text": "How many layers each card carries in the prefill group (P, pipeline), e.g. 42,11,11. Without a value the planner computes the cut.",
@@ -20848,7 +20848,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 22760
+    "line": 22762
    },
    "status": "harvested",
    "text": "",
@@ -20877,7 +20877,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 22751
+    "line": 22753
    },
    "status": "harvested",
    "text": "",
@@ -20956,7 +20956,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 22713
+    "line": 22715
    },
    "status": "curated",
    "text": "The registry profile of the checkpoints of both groups (qwen27b, nextflash).",
@@ -20982,7 +20982,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 22779,
-      "zeile": 22779
+      "zeile": 22781
      },
      "quelle": "catalog",
      "rel": "requires",
@@ -21006,7 +21006,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 22773
+    "line": 22775
    },
    "status": "curated",
    "text": "HW-GENERIC 1002: the card inventory (calibration class labels in card order, pdflip/card_identity.py, e.g. 'RTX5090,RTX3080,RTX3080') on which the positional vectors of the profile were measured. Default: the inventory that the measured records of the profile state (profile_records_data/<profile>.json, field 'inventory'). A live inventory that differs is refused by name (HW-UNCALIBRATED); positional measurements of other cards are never borrowed.",
@@ -21215,7 +21215,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24739
+    "line": 24749
    },
    "status": "harvested",
    "text": "",
@@ -21301,7 +21301,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 15383,
-      "zeile": 15383
+      "zeile": 15385
      },
      "quelle": "catalog+curated",
      "rel": "derived_from",
@@ -21655,7 +21655,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 20242,
-      "zeile": 20242
+      "zeile": 20244
      },
      "quelle": "catalog+curated",
      "rel": "excludes",
@@ -21675,7 +21675,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 21652,
-      "zeile": 21652
+      "zeile": 21654
      },
      "quelle": "catalog+curated",
      "rel": "scales_with",
@@ -21893,7 +21893,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 17301,
-      "zeile": 17301
+      "zeile": 17303
      },
      "quelle": "catalog+curated",
      "rel": "requires",
@@ -22065,7 +22065,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 22961
+    "line": 22963
    },
    "status": "unexplained",
    "text": "",
@@ -22432,7 +22432,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23701
+    "line": 23703
    },
    "status": "harvested",
    "text": "",
@@ -22461,7 +22461,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24126
+    "line": 24136
    },
    "status": "harvested",
    "text": "",
@@ -23350,7 +23350,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23254
+    "line": 23256
    },
    "status": "curated",
    "text": "The speculative decoding of both groups: NEXTN (default, mtp head of the checkpoint) or DFLASH (external draft).",
@@ -24870,7 +24870,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 22843
+    "line": 22845
    },
    "status": "harvested",
    "text": "",
@@ -24913,7 +24913,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 22824
+    "line": 22826
    },
    "status": "curated",
    "text": "Size of the store (directory on disk) in GB, absolute. 0 = derive from the pool of the P group.",
@@ -24942,7 +24942,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 22832
+    "line": 22834
    },
    "status": "explained",
    "text": "Multiplies the size of the P KV pool to size the store; covers the Mamba blocks and draft pages that lie alongside the KV pages.",
@@ -25124,7 +25124,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 22710
+    "line": 22712
    },
    "status": "explained",
    "text": "Name of this start; labels the logs and state files of the run.",
@@ -25183,7 +25183,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24831
+    "line": 24841
    },
    "status": "harvested",
    "text": "",
@@ -25338,7 +25338,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 22718
+    "line": 22720
    },
    "status": "harvested",
    "text": "",
@@ -25516,7 +25516,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 23003,
-      "zeile": 23003
+      "zeile": 23005
      },
      "quelle": "catalog",
      "rel": "derived_from",
@@ -25535,7 +25535,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 22875,
-      "zeile": 22875
+      "zeile": 22877
      },
      "quelle": "catalog",
      "rel": "derived_from",
@@ -25561,7 +25561,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 22991
+    "line": 22993
    },
    "status": "curated",
    "text": "X: how many new tokens the decode group D may prefill itself. Larger requests go to P. 0 lets the planner derive it.",
@@ -25933,7 +25933,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23690
+    "line": 23692
    },
    "status": "harvested",
    "text": "",
@@ -25962,7 +25962,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 22709
+    "line": 22711
    },
    "status": "explained",
    "text": "Source tree (directory of the code) from which the groups are started.",
@@ -26111,7 +26111,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23602
+    "line": 23604
    },
    "status": "harvested",
    "text": "",
@@ -26362,7 +26362,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 15383,
-      "zeile": 15383
+      "zeile": 15385
      },
      "quelle": "catalog+curated",
      "rel": "derived_from",
@@ -26385,7 +26385,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24554
+    "line": 24564
    },
    "status": "curated",
    "text": "VRAM in MiB per card that stays free for your own other processes (scalar or list in card ordinal order, 5090 first).",
@@ -26444,7 +26444,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 22711
+    "line": 22713
    },
    "status": "explained",
    "text": "Python environment with which the groups are started.",
@@ -26533,7 +26533,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23159
+    "line": 23161
    },
    "status": "harvested",
    "text": "",
@@ -26645,7 +26645,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24035
+    "line": 24045
    },
    "status": "harvested",
    "text": "",
@@ -26678,7 +26678,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24059
+    "line": 24069
    },
    "status": "harvested",
    "text": "",
@@ -26707,7 +26707,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23766
+    "line": 23768
    },
    "status": "harvested",
    "text": "",
@@ -26739,7 +26739,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24051
+    "line": 24061
    },
    "status": "harvested",
    "text": "",
@@ -26768,7 +26768,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23743
+    "line": 23745
    },
    "status": "harvested",
    "text": "",
@@ -26797,7 +26797,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24091
+    "line": 24101
    },
    "status": "harvested",
    "text": "",
@@ -26826,39 +26826,121 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23962
+    "line": 23972
    },
    "status": "curated",
    "text": "'off' (default) starts both groups without a vision tower; 'resident' keeps it loaded.",
    "type": "str"
   },
   "--pdflip-vision-place": {
+   "abweichung": {
+    "27b": {
+     "default": null,
+     "help": "H125: where the TRANSIENT tower sits on PP0's card (only with --pdflip-vision transient). `auto` (default): the KV tail when it is wholly free (the phase start), else the card's free VRAM, else a named refusal. `kvtail`: the 27B stage exactly. `free`: always the card's free VRAM. `weights` (VISION-WEIGHTS, not yet a profile default): the tower's parameters are views on victim WEIGHT memory of PP0 (27B flip: MLP storages; dual: only the hull parts D does not share); the victim bytes go to a host image (freed after every image) and come back with a device checksum before the admission -- a mismatch stops the group (W110c). No KV page, no free VRAM, always synchronous. `kvtail` or `auto` TOLD on the command line together with --dual-layout is refused (W111): the dual P pool is born trimmed to 0 tokens, so the dual's place is `weights`.",
+     "source": {
+      "file": "pdflip/launcher.py",
+      "kind": "argparse",
+      "line": 23956
+     }
+    },
+    "nf": {
+     "default": null,
+     "help": "H125: where the TRANSIENT tower sits on PP0's card (only with --pdflip-vision transient). `auto` (default): the KV tail when it is wholly free (the phase start), else the card's free VRAM, else a named refusal. `kvtail`: the 27B stage exactly. `free`: always the card's free VRAM. `weights` (VISION-WEIGHTS, not yet a profile default): the tower's parameters are views on victim WEIGHT memory of PP0 (27B flip: MLP storages; dual: only the hull parts D does not share; NF: resident expert rows with a store slot, returned from the store); the victim bytes go to a host image (27B; freed after every image; NF: none, the pinned store already holds them) and come back with a device checksum before the admission -- a mismatch stops the group (W110c). No KV page, no free VRAM, always synchronous.",
+     "source": {
+      "file": "pdflip/launcher.py",
+      "kind": "argparse",
+      "line": 23237
+     }
+    }
+   },
    "trees": [
     "27b",
     "nf"
    ],
    "bare": false,
    "choices": null,
-   "cost": "",
+   "cost": "'weights': on the 27B a host image of the tower bytes per image request (freed after the give-back; NF: none); a checksum mismatch stops the group (W110c); not yet a profile default.",
    "default": null,
-   "depends": [],
-   "gain": "",
-   "group": "",
-   "help": "H125: where the TRANSIENT tower sits on PP0's card (only with --pdflip-vision transient). `auto` (default): the KV tail when it is wholly free (the phase start), else the card's free VRAM, else a named refusal. `kvtail`: the 27B stage exactly. `free`: always the card's free VRAM.",
+   "depends": [
+    {
+     "belegt": true,
+     "calc": "text",
+     "edge": "K132",
+     "effect": "The place 'weights' (the tower borrows weight memory of PP0 instead of KV-tail pages or free VRAM) acts only on the transient stage: with any other --pdflip-vision the start is refused by name (W111) -- what it brings is a tower without a KV or free-VRAM claim; what it costs is the transient form.",
+     "evidence": {
+      "anchor": "they act only on the transient stage",
+      "aufloesung": "eindeutig",
+      "file": "python/flliper/srt/pdflip/launcher.py",
+      "row_note": 8524,
+      "zeile": 8524
+     },
+     "quelle": "catalog",
+     "rel": "requires",
+     "satz": "The place 'weights' (the tower borrows weight memory of PP0 instead of KV-tail pages or free VRAM) acts only on the transient stage: with any other --pdflip-vision the start is refused by name (W111) -- what it brings is a tower without a KV or free-VRAM claim; what it costs is the transient form.",
+     "to": "--pdflip-vision",
+     "to_kind": "flag",
+     "value": "weights"
+    },
+    {
+     "belegt": true,
+     "calc": "text",
+     "edge": "K133",
+     "effect": "The place 'weights' is always synchronous: the victims are borrowed only inside one pass before the admission, so FLLIPER_PDFLIP_VISION_ASYNC (or FLLIPER_PDFLIP_P_ROW_VISION_ASYNC) switched on is refused at launch by name (VISION-SYNC LAW) -- what it brings is a tower that never outlives its pass; what it costs is the async overlap.",
+     "evidence": {
+      "anchor": "PDFLIP VISION-ASYNC refused",
+      "aufloesung": "eindeutig",
+      "file": "python/flliper/srt/pdflip/launcher.py",
+      "row_note": 24946,
+      "zeile": 24946
+     },
+     "quelle": "catalog",
+     "rel": "excludes",
+     "satz": "The place 'weights' is always synchronous: the victims are borrowed only inside one pass before the admission, so FLLIPER_PDFLIP_VISION_ASYNC (or FLLIPER_PDFLIP_P_ROW_VISION_ASYNC) switched on is refused at launch by name (VISION-SYNC LAW) -- what it brings is a tower that never outlives its pass; what it costs is the async overlap.",
+     "to": "FLLIPER_PDFLIP_VISION_ASYNC",
+     "to_kind": "env",
+     "value": "weights"
+    },
+    {
+     "belegt": true,
+     "calc": "text",
+     "edge": "K134",
+     "effect": "The places 'kvtail' and 'auto' (told on the command line) are refused together with --dual-layout (W111): the dual P pool is born trimmed to 0 tokens, so the tower has no KV-tail page to lend -- the place for the dual is 'weights'.",
+     "evidence": {
+      "anchor": "with --dual-layout: the dual P pool is born trimmed to 0 tokens",
+      "aufloesung": "eindeutig",
+      "file": "python/flliper/srt/pdflip/launcher.py",
+      "row_note": 24969,
+      "zeile": 24969
+     },
+     "quelle": "catalog",
+     "rel": "excludes",
+     "satz": "The places 'kvtail' and 'auto' (told on the command line) are refused together with --dual-layout (W111): the dual P pool is born trimmed to 0 tokens, so the tower has no KV-tail page to lend -- the place for the dual is 'weights'.",
+     "to": "--dual-layout",
+     "to_kind": "flag",
+     "trees": [
+      "27b"
+     ],
+     "value": "kvtail"
+    }
+   ],
+   "gain": "'weights': the tower takes no KV page and no free VRAM; the planner shows it as the check item 'Vision transient' inside the weights.",
+   "group": "Memory",
+   "help": "H125: where the TRANSIENT tower sits on PP0's card (only with --pdflip-vision transient). `auto` (default): the KV tail when it is wholly free (the phase start), else the card's free VRAM, else a named refusal. `kvtail`: the 27B stage exactly. `free`: always the card's free VRAM. `weights` (VISION-WEIGHTS, not yet a profile default): the tower's parameters are views on victim WEIGHT memory of PP0 (27B flip: MLP storages; dual: only the hull parts D does not share); the victim bytes go to a host image (freed after every image) and come back with a device checksum before the admission -- a mismatch stops the group (W110c). No KV page, no free VRAM, always synchronous. `kvtail` or `auto` TOLD on the command line together with --dual-layout is refused (W111): the dual P pool is born trimmed to 0 tokens, so the dual's place is `weights`.",
    "id": "--pdflip-vision-place",
    "kind": "flag",
    "level": "expert",
    "name": "--pdflip-vision-place",
    "nargs": null,
    "planner_derived": false,
+   "satz_quelle": "launcher.py --pdflip-vision-place (help=) and pdflip/vision_victim.py (module head)",
    "source": {
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23954
+    "line": 23956
    },
-   "status": "harvested",
-   "text": "",
+   "status": "curated",
+   "text": "Where the TRANSIENT vision tower sits on PP0's card (only with --pdflip-vision transient). 'auto' (default): the KV tail when it is wholly free (the phase start), else the card's free VRAM, else a named refusal. 'kvtail': the 27B stage exactly. 'free': always the card's free VRAM. 'weights': the tower's parameters are views on victim WEIGHT memory of PP0 (27B flip: MLP storages; dual: only the hull parts that are not D's shard; NF: resident expert rows); the victim bytes go to a host image (27B; freed after every image) and come back with a device checksum before the admission -- a mismatch stops the group (W110c). No KV page, no free VRAM, always synchronous.",
    "type": "str"
   },
   "--pdflip-vision-source": {
@@ -26884,7 +26966,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23946
+    "line": 23948
    },
    "status": "harvested",
    "text": "",
@@ -26910,7 +26992,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 10654,
-      "zeile": 10654
+      "zeile": 10656
      },
      "quelle": "catalog+curated",
      "rel": "requires",
@@ -26933,7 +27015,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23810
+    "line": 23812
    },
    "status": "curated",
    "text": "Where a waking group fetches its weight bytes from: 'ring' (default, from the host ring) or 'exchange' (card to card).",
@@ -26962,7 +27044,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23785
+    "line": 23787
    },
    "status": "harvested",
    "text": "",
@@ -26988,7 +27070,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 10652,
-      "zeile": 10652
+      "zeile": 10654
      },
      "quelle": "catalog+curated",
      "rel": "requires",
@@ -27011,7 +27093,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24108
+    "line": 24118
    },
    "status": "curated",
    "text": "JSON file with the measured table per card/tag/group from which W71 prices the VRAM peak of the exchange.",
@@ -27040,7 +27122,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24117
+    "line": 24127
    },
    "status": "harvested",
    "text": "",
@@ -27082,7 +27164,7 @@
     "tree": "nf",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23398
+    "line": 23407
    },
    "status": "curated",
    "text": "Names the census row from which a card is priced that is not in the census file by UUID: list <live>=<census UUID>, <live> = card UUID, nvml<N> or class (RTX3080). Without an entry the start borrows the heaviest row of the same class (otherwise of the whole census) and refuses that as HW-BORROWED until force is set.",
@@ -27111,7 +27193,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24018
+    "line": 24028
    },
    "status": "harvested",
    "text": "",
@@ -27140,7 +27222,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 24074
+    "line": 24084
    },
    "status": "harvested",
    "text": "",
@@ -27169,7 +27251,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23996
+    "line": 24006
    },
    "status": "harvested",
    "text": "",
@@ -27198,7 +27280,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23978
+    "line": 23988
    },
    "status": "harvested",
    "text": "",
@@ -27227,7 +27309,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 22959
+    "line": 22961
    },
    "status": "harvested",
    "text": "",
@@ -27982,7 +28064,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23028
+    "line": 23030
    },
    "status": "harvested",
    "text": "",
@@ -28027,7 +28109,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 22875,
-      "zeile": 22875
+      "zeile": 22877
      },
      "quelle": "catalog",
      "rel": "derived_from",
@@ -28053,7 +28135,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23005
+    "line": 23007
    },
    "status": "curated",
    "text": "Upper limit up to which the X (D prefill threshold) may rise live. 0 = off, D and the front keep the start X.",
@@ -28125,7 +28207,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23021
+    "line": 23023
    },
    "status": "curated",
    "text": "X-CURVES: the curve file (weg2-x-curves/1, tools/build_x_curves.py). Only with --x-mode curve (otherwise W194); if the file is missing or unreadable W190, if it is faulty W191, if it comes from a different model, a different form or different hardware W192: refused at start. Refused in the dual layout (W197).",
@@ -28197,7 +28279,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23025
+    "line": 23027
    },
    "status": "curated",
    "text": "X-CURVES: a request that lies deeper than the curves reach: clamp (default, computed at the price of the deepest row and named) or refuse (W193 at the front). Only with --x-mode curve (otherwise W194); an unknown value is refused W196; refused in the dual layout (W197).",
@@ -28211,7 +28293,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 23013
+      "line": 23015
      }
     },
     "nf": {
@@ -28220,7 +28302,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22298
+      "line": 22300
      }
     }
    },
@@ -28284,7 +28366,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/launcher.py",
       "row_note": 23018,
-      "zeile": 23018
+      "zeile": 23020
      },
      "quelle": "catalog",
      "rel": "scales_with",
@@ -28308,7 +28390,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23013
+    "line": 23015
    },
    "status": "curated",
    "text": "X-CURVES (user 06.10.: only fixed and curve): how the front sets X. fixed = --tp-prefill-max-tokens for the whole boot, no live recomputation. curve = X PER REQUEST from --x-curves (the D/P prefill curves and the flip price of this model × this form × this hardware); --x-ceiling-tokens alongside limits X from above, D's W50 latch is the LOWER value of the envelope of the curves and this ceiling. Unset = the front exactly as before the flag, argv byte-identical. Refused in the dual layout (W197: no X rebuild for dual). An unknown word is refused W196; curve without --x-curves is refused W190.",
@@ -28337,7 +28419,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23896
+    "line": 23898
    },
    "status": "harvested",
    "text": "",
@@ -28366,7 +28448,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23832
+    "line": 23834
    },
    "status": "harvested",
    "text": "",
@@ -28395,7 +28477,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23716
+    "line": 23718
    },
    "status": "harvested",
    "text": "",
@@ -28424,7 +28506,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23861
+    "line": 23863
    },
    "status": "harvested",
    "text": "",
@@ -38275,7 +38357,7 @@
    "id": "FLLIPER_DUAL_GROUP_LANE_STREAM_PRIORITY",
    "kind": "env",
    "lesestellen": [
-    "model_executor/dual_group_lane.py:2155"
+    "model_executor/dual_group_lane.py:2167"
    ],
    "level": "expert",
    "name": "FLLIPER_DUAL_GROUP_LANE_STREAM_PRIORITY",
@@ -38285,7 +38367,7 @@
     "tree": "27b",
     "file": "model_executor/dual_group_lane.py",
     "kind": "os.environ",
-    "line": 2155
+    "line": 2167
    },
    "status": "unexplained",
    "text": "",
@@ -41123,7 +41205,7 @@
    "lesestellen": [
     "layers/attention/fla/l2norm.py:92",
     "managers/pdflip_p_overlap.py:184",
-    "pdflip/launcher.py:11541"
+    "pdflip/launcher.py:11543"
    ],
    "level": "expert",
    "name": "FLLIPER_FLA_L2NORM_RUNTIME_T",
@@ -43162,7 +43244,7 @@
    "lesestellen": [
     "mem_cache/hicache_storage.py:3157",
     "pdflip/decode_warm_handoff.py:46",
-    "pdflip/front.py:6361",
+    "pdflip/front.py:6374",
     "pdflip/handoff.py:30",
     "pdflip/tail_handoff.py:480"
    ],
@@ -43198,7 +43280,7 @@
    "lesestellen": [
     "mem_cache/hicache_storage.py:3211",
     "mem_cache/pool_host/arena_pool.py:990",
-    "pdflip/launcher.py:26727"
+    "pdflip/launcher.py:26842"
    ],
    "level": "expert",
    "name": "FLLIPER_HICACHE_ARENA_GIB",
@@ -43232,7 +43314,7 @@
    "lesestellen": [
     "mem_cache/pool_host/arena_pool.py:966",
     "mem_cache/pool_host/mha.py:1463",
-    "pdflip/launcher.py:13815"
+    "pdflip/launcher.py:13817"
    ],
    "level": "expert",
    "name": "FLLIPER_HICACHE_ARENA_HOST",
@@ -43490,7 +43572,7 @@
    "id": "FLLIPER_HICACHE_BIGRAM_KEYS",
    "kind": "env",
    "lesestellen": [
-    "pdflip/front.py:6365"
+    "pdflip/front.py:6378"
    ],
    "level": "expert",
    "name": "FLLIPER_HICACHE_BIGRAM_KEYS",
@@ -43500,7 +43582,7 @@
     "tree": "27b",
     "file": "pdflip/front.py",
     "kind": "os.environ",
-    "line": 6365
+    "line": 6378
    },
    "status": "unexplained",
    "text": "",
@@ -45742,7 +45824,7 @@
    "kind": "env",
    "lesestellen": [
     "model_executor/model_runner_kv_cache_mixin.py:1057",
-    "pdflip/launcher.py:11723"
+    "pdflip/launcher.py:11725"
    ],
    "level": "expert",
    "name": "FLLIPER_KV_BUDGET_PREFILL_TRANSIENT_MIB",
@@ -46244,7 +46326,7 @@
    "id": "FLLIPER_LANE_MARGIN_PROBE",
    "kind": "env",
    "lesestellen": [
-    "model_executor/dual_group_lane.py:2681"
+    "model_executor/dual_group_lane.py:2693"
    ],
    "level": "expert",
    "name": "FLLIPER_LANE_MARGIN_PROBE",
@@ -46254,7 +46336,7 @@
     "tree": "27b",
     "file": "model_executor/dual_group_lane.py",
     "kind": "os.environ",
-    "line": 2681
+    "line": 2693
    },
    "status": "unexplained",
    "text": "",
@@ -46276,7 +46358,7 @@
    "id": "FLLIPER_LANE_POOL_CHECKSUM",
    "kind": "env",
    "lesestellen": [
-    "model_executor/dual_group_lane.py:2822"
+    "model_executor/dual_group_lane.py:2834"
    ],
    "level": "expert",
    "name": "FLLIPER_LANE_POOL_CHECKSUM",
@@ -46286,7 +46368,7 @@
     "tree": "27b",
     "file": "model_executor/dual_group_lane.py",
     "kind": "os.environ",
-    "line": 2822
+    "line": 2834
    },
    "status": "unexplained",
    "text": "",
@@ -46308,7 +46390,7 @@
    "id": "FLLIPER_LANE_POOL_CHECKSUM_PATH",
    "kind": "env",
    "lesestellen": [
-    "model_executor/dual_group_lane.py:3034"
+    "model_executor/dual_group_lane.py:3046"
    ],
    "level": "expert",
    "name": "FLLIPER_LANE_POOL_CHECKSUM_PATH",
@@ -46318,7 +46400,7 @@
     "tree": "27b",
     "file": "model_executor/dual_group_lane.py",
     "kind": "os.environ",
-    "line": 3034
+    "line": 3046
    },
    "status": "unexplained",
    "text": "",
@@ -46340,7 +46422,7 @@
    "id": "FLLIPER_LANE_POOL_CHECKSUM_PER_POS",
    "kind": "env",
    "lesestellen": [
-    "model_executor/dual_group_lane.py:3079"
+    "model_executor/dual_group_lane.py:3091"
    ],
    "level": "expert",
    "name": "FLLIPER_LANE_POOL_CHECKSUM_PER_POS",
@@ -46350,7 +46432,7 @@
     "tree": "27b",
     "file": "model_executor/dual_group_lane.py",
     "kind": "os.environ",
-    "line": 3079
+    "line": 3091
    },
    "status": "unexplained",
    "text": "",
@@ -46372,7 +46454,7 @@
    "id": "FLLIPER_LANE_POOL_CHECKSUM_TAIL",
    "kind": "env",
    "lesestellen": [
-    "model_executor/dual_group_lane.py:2828"
+    "model_executor/dual_group_lane.py:2840"
    ],
    "level": "expert",
    "name": "FLLIPER_LANE_POOL_CHECKSUM_TAIL",
@@ -46382,7 +46464,7 @@
     "tree": "27b",
     "file": "model_executor/dual_group_lane.py",
     "kind": "os.environ",
-    "line": 2828
+    "line": 2840
    },
    "status": "unexplained",
    "text": "",
@@ -46404,7 +46486,7 @@
    "id": "FLLIPER_LANE_PROPOSAL_PERTURB",
    "kind": "env",
    "lesestellen": [
-    "model_executor/dual_group_lane.py:2498"
+    "model_executor/dual_group_lane.py:2510"
    ],
    "level": "expert",
    "name": "FLLIPER_LANE_PROPOSAL_PERTURB",
@@ -46414,7 +46496,7 @@
     "tree": "27b",
     "file": "model_executor/dual_group_lane.py",
     "kind": "os.environ",
-    "line": 2498
+    "line": 2510
    },
    "status": "unexplained",
    "text": "",
@@ -46500,7 +46582,7 @@
    "id": "FLLIPER_LANE_SPEC_DEBUG",
    "kind": "env",
    "lesestellen": [
-    "model_executor/dual_group_lane.py:3236"
+    "model_executor/dual_group_lane.py:3248"
    ],
    "level": "expert",
    "name": "FLLIPER_LANE_SPEC_DEBUG",
@@ -46510,7 +46592,7 @@
     "tree": "27b",
     "file": "model_executor/dual_group_lane.py",
     "kind": "os.environ",
-    "line": 3236
+    "line": 3248
    },
    "status": "unexplained",
    "text": "",
@@ -46532,7 +46614,7 @@
    "id": "FLLIPER_LANE_SPEC_ORACLE_DUMP",
    "kind": "env",
    "lesestellen": [
-    "model_executor/dual_group_lane.py:3746"
+    "model_executor/dual_group_lane.py:3758"
    ],
    "level": "expert",
    "name": "FLLIPER_LANE_SPEC_ORACLE_DUMP",
@@ -46542,7 +46624,7 @@
     "tree": "27b",
     "file": "model_executor/dual_group_lane.py",
     "kind": "os.environ",
-    "line": 3746
+    "line": 3758
    },
    "status": "unexplained",
    "text": "",
@@ -46564,7 +46646,7 @@
    "id": "FLLIPER_LANE_SPEC_ROW_ORACLE",
    "kind": "env",
    "lesestellen": [
-    "model_executor/dual_group_lane.py:4467"
+    "model_executor/dual_group_lane.py:4479"
    ],
    "level": "expert",
    "name": "FLLIPER_LANE_SPEC_ROW_ORACLE",
@@ -46574,7 +46656,7 @@
     "tree": "27b",
     "file": "model_executor/dual_group_lane.py",
     "kind": "os.environ",
-    "line": 4467
+    "line": 4479
    },
    "status": "unexplained",
    "text": "",
@@ -46596,7 +46678,7 @@
    "id": "FLLIPER_LANE_SPEC_TV_MAX_ACCEPT",
    "kind": "env",
    "lesestellen": [
-    "model_executor/dual_group_lane.py:4262"
+    "model_executor/dual_group_lane.py:4274"
    ],
    "level": "expert",
    "name": "FLLIPER_LANE_SPEC_TV_MAX_ACCEPT",
@@ -46606,7 +46688,7 @@
     "tree": "27b",
     "file": "model_executor/dual_group_lane.py",
     "kind": "os.environ",
-    "line": 4262
+    "line": 4274
    },
    "status": "unexplained",
    "text": "",
@@ -46628,7 +46710,7 @@
    "id": "FLLIPER_LANE_SPEC_VERIFY",
    "kind": "env",
    "lesestellen": [
-    "model_executor/dual_group_lane.py:4409"
+    "model_executor/dual_group_lane.py:4421"
    ],
    "level": "expert",
    "name": "FLLIPER_LANE_SPEC_VERIFY",
@@ -46638,7 +46720,7 @@
     "tree": "27b",
     "file": "model_executor/dual_group_lane.py",
     "kind": "os.environ",
-    "line": 4409
+    "line": 4421
    },
    "status": "unexplained",
    "text": "",
@@ -54789,7 +54871,7 @@
    "lesestellen": [
     "mem_ledger/activation_probe.py:55",
     "mem_ledger/activation_probe.py:292",
-    "pdflip/launcher.py:11225",
+    "pdflip/launcher.py:11227",
     "pdflip/xchg_manifest.py:1673"
    ],
    "level": "expert",
@@ -56137,7 +56219,7 @@
    "kind": "env",
    "lesestellen": [
     "distributed/utils.py:2336",
-    "pdflip/launcher.py:27116"
+    "pdflip/launcher.py:27231"
    ],
    "level": "expert",
    "name": "FLLIPER_PP_CROSSING_WIRE",
@@ -56301,9 +56383,9 @@
     "distributed/utils.py:2608",
     "distributed/utils.py:2680",
     "pdflip/launcher.py:2146",
-    "pdflip/launcher.py:27156",
-    "pdflip/launcher.py:18261",
-    "pdflip/launcher.py:27114"
+    "pdflip/launcher.py:27271",
+    "pdflip/launcher.py:18263",
+    "pdflip/launcher.py:27229"
    ],
    "level": "expert",
    "name": "FLLIPER_PP_LAYER_SET",
@@ -64190,7 +64272,7 @@
    "id": "FLLIPER_PDFLIP_ARENA_FROM_LEDGER",
    "kind": "env",
    "lesestellen": [
-    "pdflip/launcher.py:26724"
+    "pdflip/launcher.py:26839"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_ARENA_FROM_LEDGER",
@@ -64200,7 +64282,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "os.environ",
-    "line": 26724
+    "line": 26839
    },
    "status": "unexplained",
    "text": "",
@@ -65583,8 +65665,8 @@
    "id": "FLLIPER_PDFLIP_DC_IMAGE_OFF_FLIP",
    "kind": "env",
    "lesestellen": [
-    "pdflip/front.py:4137",
-    "pdflip/front.py:7825"
+    "pdflip/front.py:4150",
+    "pdflip/front.py:7838"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_DC_IMAGE_OFF_FLIP",
@@ -65594,7 +65676,7 @@
     "tree": "27b",
     "file": "pdflip/front.py",
     "kind": "os.environ",
-    "line": 4137
+    "line": 4150
    },
    "status": "harvested",
    "text": "",
@@ -66296,7 +66378,7 @@
    "kind": "env",
    "lesestellen": [
     "managers/scheduler.py:1374",
-    "pdflip/front.py:4459"
+    "pdflip/front.py:4472"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_DORMANT_ADMIT",
@@ -66419,7 +66501,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/front.py",
       "row_note": 17185,
-      "zeile": 17185
+      "zeile": 17201
      },
      "quelle": "catalog",
      "rel": "requires",
@@ -67070,7 +67152,7 @@
    "id": "FLLIPER_PDFLIP_DUAL_D_AIR_TOKENS",
    "kind": "env",
    "lesestellen": [
-    "pdflip/front.py:15934"
+    "pdflip/front.py:15950"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_DUAL_D_AIR_TOKENS",
@@ -67080,7 +67162,7 @@
     "tree": "27b",
     "file": "pdflip/front.py",
     "kind": "os.environ",
-    "line": 15934
+    "line": 15950
    },
    "status": "unexplained",
    "text": "",
@@ -68273,7 +68355,7 @@
     "pdflip/dual_p_kv_stage.py:942",
     "pdflip/dual_p_kv_stage.py:1458",
     "pdflip/dual_p_kv_stage.py:1258",
-    "pdflip/front.py:15887"
+    "pdflip/front.py:15903"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_DUAL_KV_TAG",
@@ -68419,8 +68501,8 @@
    "id": "FLLIPER_PDFLIP_DUAL_MPS_OPT_IN",
    "kind": "env",
    "lesestellen": [
-    "pdflip/launcher.py:14779",
-    "pdflip/launcher.py:14785"
+    "pdflip/launcher.py:14781",
+    "pdflip/launcher.py:14787"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_DUAL_MPS_OPT_IN",
@@ -68430,7 +68512,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "os.environ",
-    "line": 14779
+    "line": 14781
    },
    "status": "harvested",
    "text": "",
@@ -72866,7 +72948,7 @@
     {
      "belegt": true,
      "calc": "text",
-     "edge": "K132",
+     "edge": "K135",
      "effect": "The host-leaf spill works through the arena pool of the W3 spill; on hybrid boots that pool is the anchor pool of FLLIPER_PDFLIP_ENABLE_W3_SPILL_ANCHOR_POOL (the host-leaf switch is on by default since the user decision of 09.10., the anchor pool is off by default) -- what it brings is freeing arena room from host-only leaves; what it costs is two linked switches.",
      "evidence": {
       "anchor": "``FLLIPER_PDFLIP_ENABLE_W3_SPILL_ANCHOR_POOL`` carries, default off) AND the local-PP",
@@ -73248,7 +73330,7 @@
    "id": "FLLIPER_PDFLIP_EXPERT_BANDS_ARM",
    "kind": "env",
    "lesestellen": [
-    "pdflip/launcher.py:26474"
+    "pdflip/launcher.py:26588"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_EXPERT_BANDS_ARM",
@@ -73258,7 +73340,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "os.environ",
-    "line": 26474
+    "line": 26588
    },
    "status": "unexplained",
    "text": "",
@@ -73312,7 +73394,7 @@
    "id": "FLLIPER_PDFLIP_EXPERT_MAP_DIR",
    "kind": "env",
    "lesestellen": [
-    "pdflip/launcher.py:20671"
+    "pdflip/launcher.py:20673"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_EXPERT_MAP_DIR",
@@ -73322,7 +73404,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "os.environ",
-    "line": 20671
+    "line": 20673
    },
    "status": "unexplained",
    "text": "",
@@ -74626,7 +74708,7 @@
    "kind": "env",
    "lesestellen": [
     "pdflip/corridor_budget.py:144",
-    "pdflip/host_ledger.py:4129",
+    "pdflip/host_ledger.py:4137",
     "pdflip/launcher.py:151"
    ],
    "level": "expert",
@@ -74763,7 +74845,7 @@
       "aufloesung": "eindeutig",
       "file": "python/flliper/srt/pdflip/front.py",
       "row_note": 17210,
-      "zeile": 17210
+      "zeile": 17226
      },
      "quelle": "catalog",
      "rel": "requires",
@@ -75470,7 +75552,7 @@
    "lesestellen": [
     "managers/scheduler.py:8408",
     "managers/scheduler_components/weight_updater.py:12348",
-    "pdflip/front.py:11625",
+    "pdflip/front.py:11641",
     "pdflip/l15_deposit_hook.py:42",
     "pdflip/l15_plan.py:476"
    ],
@@ -75568,10 +75650,10 @@
     "managers/scheduler.py:8393",
     "managers/scheduler.py:21393",
     "managers/scheduler_components/weight_updater.py:12467",
-    "pdflip/front.py:11586",
-    "pdflip/front.py:7083",
-    "pdflip/front.py:14033",
-    "pdflip/front.py:7072"
+    "pdflip/front.py:11602",
+    "pdflip/front.py:7096",
+    "pdflip/front.py:14049",
+    "pdflip/front.py:7085"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_L15_HOT_SHARE",
@@ -76890,7 +76972,7 @@
    "id": "FLLIPER_PDFLIP_MAMBA_ANCHOR_MIB",
    "kind": "env",
    "lesestellen": [
-    "pdflip/launcher.py:8703"
+    "pdflip/launcher.py:8705"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_MAMBA_ANCHOR_MIB",
@@ -76900,7 +76982,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "os.environ",
-    "line": 8703
+    "line": 8705
    },
    "status": "unexplained",
    "text": "",
@@ -78299,8 +78381,8 @@
    "id": "FLLIPER_PDFLIP_PCUT_BOUNCE_SLACK_GIB",
    "kind": "env",
    "lesestellen": [
-    "pdflip/launcher.py:22471",
-    "pdflip/launcher.py:22477"
+    "pdflip/launcher.py:22473",
+    "pdflip/launcher.py:22479"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_PCUT_BOUNCE_SLACK_GIB",
@@ -78310,7 +78392,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "os.environ",
-    "line": 22471
+    "line": 22473
    },
    "status": "harvested",
    "text": "",
@@ -78332,7 +78414,7 @@
    "id": "FLLIPER_PDFLIP_PCUT_CAP_FLOOR",
    "kind": "env",
    "lesestellen": [
-    "pdflip/launcher.py:22246"
+    "pdflip/launcher.py:22248"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_PCUT_CAP_FLOOR",
@@ -78342,7 +78424,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "os.environ",
-    "line": 22246
+    "line": 22248
    },
    "status": "unexplained",
    "text": "",
@@ -78364,8 +78446,8 @@
    "id": "FLLIPER_PDFLIP_PCUT_LANE_PRICE",
    "kind": "env",
    "lesestellen": [
-    "pdflip/launcher.py:19393",
-    "pdflip/launcher.py:12911"
+    "pdflip/launcher.py:19395",
+    "pdflip/launcher.py:12913"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_PCUT_LANE_PRICE",
@@ -78375,7 +78457,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "os.environ",
-    "line": 19393
+    "line": 19395
    },
    "status": "unexplained",
    "text": "",
@@ -78906,7 +78988,7 @@
    "id": "FLLIPER_PDFLIP_PREFIX_FP_PATH",
    "kind": "env",
    "lesestellen": [
-    "pdflip/front.py:11760"
+    "pdflip/front.py:11776"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_PREFIX_FP_PATH",
@@ -78916,7 +78998,7 @@
     "tree": "27b",
     "file": "pdflip/front.py",
     "kind": "os.environ",
-    "line": 11760
+    "line": 11776
    },
    "status": "unexplained",
    "text": "",
@@ -79547,7 +79629,7 @@
    "id": "FLLIPER_PDFLIP_P_QUEUE_AHEAD",
    "kind": "env",
    "lesestellen": [
-    "pdflip/front.py:16707"
+    "pdflip/front.py:16723"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_P_QUEUE_AHEAD",
@@ -79557,7 +79639,7 @@
     "tree": "27b",
     "file": "pdflip/front.py",
     "kind": "os.environ",
-    "line": 16707
+    "line": 16723
    },
    "status": "unexplained",
    "text": "",
@@ -82085,8 +82167,8 @@
    "kind": "env",
    "lesestellen": [
     "model_loader/gguf_shards.py:511",
-    "pdflip/host_ledger.py:5352",
-    "pdflip/host_ledger.py:5420"
+    "pdflip/host_ledger.py:5366",
+    "pdflip/host_ledger.py:5434"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_SWAP_AWARE",
@@ -82125,7 +82207,7 @@
     "pdflip/dual_p_kv_stage.py:942",
     "pdflip/dual_p_kv_stage.py:1458",
     "pdflip/dual_p_kv_stage.py:1258",
-    "pdflip/front.py:15887"
+    "pdflip/front.py:15903"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_TAG",
@@ -82945,9 +83027,9 @@
    "lesestellen": [
     "pdflip/launcher.py:5605",
     "pdflip/launcher.py:5641",
-    "pdflip/launcher.py:14321",
-    "pdflip/launcher.py:19995",
-    "pdflip/launcher.py:14335",
+    "pdflip/launcher.py:14323",
+    "pdflip/launcher.py:19997",
+    "pdflip/launcher.py:14337",
     "pdflip/torch_cache_cap.py:35",
     "pdflip/torch_cache_cap.py:75",
     "planner/profile_couplings.py:1149"
@@ -83260,7 +83342,7 @@
      "source": {
       "file": "pdflip/vision_rank_runner.py",
       "kind": "os.environ",
-      "line": 912
+      "line": 1069
      }
     },
     "nf": {
@@ -83269,7 +83351,7 @@
      "source": {
       "file": "pdflip/vision_rank_runner.py",
       "kind": "os.environ",
-      "line": 1012
+      "line": 1141
      }
     }
    },
@@ -83279,29 +83361,32 @@
    ],
    "bare": false,
    "choices": null,
-   "cost": "",
+   "cost": "Switched on it is refused at launch (VISION-SYNC LAW).",
    "default": "\"1\"",
    "depends": [],
    "gain": "",
-   "group": "",
+   "group": "Memory",
    "help": "",
    "id": "FLLIPER_PDFLIP_VISION_ASYNC",
    "kind": "env",
    "lesestellen": [
-    "pdflip/vision_rank_runner.py:912"
+    "pdflip/vision_rank_runner.py:1069",
+    "pdflip/vision_rank_runner.py:193",
+    "pdflip/vision_rank_runner.py:194"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_VISION_ASYNC",
    "nargs": null,
    "planner_derived": false,
+   "satz_quelle": "vision_rank_runner.py vision_async_on (docstring) and launcher.py VISION_SYNC_LAW / vision_async_refusal",
    "source": {
     "tree": "27b",
     "file": "pdflip/vision_rank_runner.py",
     "kind": "os.environ",
-    "line": 912
+    "line": 1069
    },
-   "status": "unexplained",
-   "text": "",
+   "status": "curated",
+   "text": "The asynchronous vision stage: the tower's read + encode run on a worker thread and their own CUDA stream while the scheduler keeps passing; 0 = the synchronous stage. The code default is ON on the 27B line (vision_rank_runner.vision_async_on) and OFF on the NF line. VISION-SYNC LAW (user 02.10., both lines): vision runs ONLY synchronously, before the real prefill; the launcher therefore refuses an explicit ON (this switch and FLLIPER_PDFLIP_P_ROW_VISION_ASYNC) by name, and --pdflip-vision-place weights is always synchronous.",
    "type": "os.environ"
   },
   "FLLIPER_PDFLIP_VISION_D_REROUTE": {
@@ -83373,7 +83458,7 @@
    "kind": "env",
    "lesestellen": [
     "pdflip/front.py:1034",
-    "pdflip/front.py:4304"
+    "pdflip/front.py:4317"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_VISION_FLIP_URGENT",
@@ -83405,9 +83490,9 @@
    "id": "FLLIPER_PDFLIP_VISION_PLACE",
    "kind": "env",
    "lesestellen": [
-    "pdflip/launcher.py:11329",
-    "pdflip/vision_rank_stage.py:655",
-    "pdflip/vision_rank_stage.py:659"
+    "pdflip/launcher.py:11331",
+    "pdflip/vision_rank_stage.py:658",
+    "pdflip/vision_rank_stage.py:662"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_VISION_PLACE",
@@ -83417,7 +83502,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "os.environ",
-    "line": 11329
+    "line": 11331
    },
    "status": "unexplained",
    "text": "",
@@ -83471,7 +83556,7 @@
    "id": "FLLIPER_PDFLIP_VISION_SOURCE",
    "kind": "env",
    "lesestellen": [
-    "pdflip/launcher.py:11325",
+    "pdflip/launcher.py:11327",
     "pdflip/vision_rank_stage.py:516",
     "pdflip/vision_rank_stage.py:521"
    ],
@@ -83483,7 +83568,7 @@
     "tree": "27b",
     "file": "pdflip/launcher.py",
     "kind": "os.environ",
-    "line": 11325
+    "line": 11327
    },
    "status": "unexplained",
    "text": "",
@@ -83814,7 +83899,7 @@
    "id": "FLLIPER_PDFLIP_WAKE_DEFER_BELOW_MIB",
    "kind": "env",
    "lesestellen": [
-    "pdflip/front.py:2976"
+    "pdflip/front.py:2989"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_WAKE_DEFER_BELOW_MIB",
@@ -83824,7 +83909,7 @@
     "tree": "27b",
     "file": "pdflip/front.py",
     "kind": "os.environ",
-    "line": 2976
+    "line": 2989
    },
    "status": "unexplained",
    "text": "",
@@ -85652,7 +85737,7 @@
   "beleg_aufloesung": {
    "problem": [],
    "status": {
-    "eindeutig": 119,
+    "eindeutig": 122,
     "nah": 12,
     "other_line": 1
    }
@@ -85661,7 +85746,7 @@
    "27b": {
     "problem": [],
     "status": {
-     "eindeutig": 119,
+     "eindeutig": 122,
      "nah": 12,
      "other_line": 1
     }
@@ -85669,8 +85754,8 @@
    "nf": {
     "problem": [],
     "status": {
-     "other_line": 44,
-     "eindeutig": 78,
+     "other_line": 45,
+     "eindeutig": 80,
      "nah": 10
     }
    }
@@ -85678,10 +85763,10 @@
   "file": "kantenkatalog_1004.json",
   "geladen": true,
   "reason": "",
-  "kanten_belegt": 132,
-  "edges_total": 132,
+  "kanten_belegt": 135,
+  "edges_total": 135,
   "edges_without_evidence": 25,
-  "neu": 81,
+  "neu": 84,
   "rel_abweichend": [
    "K12",
    "K19",
@@ -85692,7 +85777,7 @@
   "uebersprungen_ohne_von": [],
   "verschmolzen": 51,
   "rejected": 0,
-  "wertbedingt": 22,
+  "wertbedingt": 25,
   "ziel_unbekannt": 0
  },
  "launcher_raise_sites": 97,
@@ -85707,7 +85792,7 @@
  "schema": "flliper.catalog/1",
  "stats": {
   "trees": {
-   "abweichung": 44,
+   "abweichung": 45,
    "beide": 2462,
    "nur_27b": 180,
    "nur_nf": 44
@@ -85716,19 +85801,19 @@
   "envs": 1827,
   "explained": 309,
   "flags": 862,
-  "harvested": 1674,
-  "curated": 119,
-  "unexplained": 602
+  "harvested": 1673,
+  "curated": 121,
+  "unexplained": 601
  },
- "tree_rev": "27b=9a213225d8+nf=97f3fda8a1",
+ "tree_rev": "27b=9e51fc9b8c+nf=8051505666",
  "trees": {
   "27b": {
    "entries": 2642,
-   "rev": "9a213225d8"
+   "rev": "9e51fc9b8c"
   },
   "nf": {
    "entries": 2506,
-   "rev": "97f3fda8a1"
+   "rev": "8051505666"
   }
  },
  "warnungen": []
