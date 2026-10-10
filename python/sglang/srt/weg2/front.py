@@ -9638,12 +9638,16 @@ class Front:
             # UNIFY S7 (27B Review V (3)): D's load at the grant, read BEFORE
             # the seat is taken (the seat itself is not work).
             _x_busy_at_grant = self._d_holds_work()
-            seat = await (self._acquire_short_seat(rid, est_prompt, short_refused,
-                                                   max_tokens=_asr.max_tokens_of(payload),
-                                                   uncached=remainder)
-                          if _asr.enabled()  # ARRIVAL-SEAT: the KV need's decode part
-                          else self._acquire_short_seat(rid, est_prompt, short_refused,
-                                                               uncached=remainder))
+            try:
+                seat = await (self._acquire_short_seat(rid, est_prompt, short_refused,
+                                                       max_tokens=_asr.max_tokens_of(payload),
+                                                       uncached=remainder)
+                              if _asr.enabled()  # ARRIVAL-SEAT: the KV need's decode part
+                              else self._acquire_short_seat(rid, est_prompt, short_refused,
+                                                                   uncached=remainder))
+            except BaseException:
+                self._d_pf_book().done(rid=rid)  # X-SUM-PRICE: cancelled between the gate's booking and the grant
+                raise
             if seat is None:
                 self._d_pf_book().done(rid=rid)  # X-SUM-PRICE: the provisional booking of the collect gate
             if seat is not None:
@@ -10333,7 +10337,7 @@ class Front:
     def _d_pf_book(self) -> "_dpf.DPrefillInflight":
         return self.__dict__.setdefault("_d_pf", _dpf.DPrefillInflight())
 
-    def _d_inflight_tokens(self) -> int:
+    def _d_pf_pending_tokens(self) -> int:
         """The uncached tokens D has been granted to prefill as SHORT and has
         not finished (no first content yet). DECODE-COLLECT used to look only
         at D's DECODES, so a burst arriving on an idle D went in one by one --
@@ -10355,7 +10359,7 @@ class Front:
         ``carried`` every sum check (``sum_price.fits``) starts from."""
         handed = sum(int(getattr(r, "est_uncached", 0) or 0)
                      for r in self._ready_for_d if getattr(r, "d_direct", False))
-        return handed + Front._d_inflight_tokens(self)
+        return handed + Front._d_pf_pending_tokens(self)
 
     def _dc_carried(self) -> int:
         """DECODE-COLLECT's ``carried``: with the arrival-path switch off it
@@ -10430,6 +10434,9 @@ class Front:
             route = "P"  # user ~19:13Z: "ansonsten wartet er auf die 15er grenze und flippt"
         else:
             route = "P" if (p_bound or not set_fits) else "D"
+        if route == "D" and envs.SGLANG_WEG2_ENABLE_DECODE_COLLECT_PREFILL_BUSY.get():
+            for _rid, (_t, _u) in st["shorts"].items():  # X-SUM-PRICE: priced as a set, now booked as one
+                self._d_pf_book().grant(rid=_rid, tokens=int(_u), now=now)
         st.update(route=route, t_rel=now, t_open=None, shorts={}, wid=st["wid"] + 1,
                   rel_rids=[p.rid for p in fresh])  # route D: the set _dc_hand_to_d moves
         self.counters["decode_collect_release_" + route] += 1
@@ -11735,6 +11742,10 @@ class Front:
                     self._sync_batch_gate()
                     continue
                 self._ready_for_d.popleft()
+                if getattr(p, "d_direct", False) and envs.SGLANG_WEG2_ENABLE_DECODE_COLLECT_PREFILL_BUSY.get():
+                    # X-SUM-PRICE: the hand-over leaves `_ready_for_d` here (no await up to the book) -- its
+                    # uncached tokens stay in `carried` until D's first content (review M3, same class as the burst)
+                    self._d_pf_book().grant(rid=p.rid, tokens=int(getattr(p, "est_uncached", 0) or 0), now=time.time())
                 self._sync_batch_gate()
                 p.seat = Seat(self, p.rid, "batch",
                               tokens=d_seat_need(p.est_prompt, p.leg1_prompt_tokens)[0])
@@ -12211,6 +12222,7 @@ class Front:
             # ticked yet) -- D is not asked to prefill for it. The seat goes
             # straight back (the refill point leg 2's finally would be).
             self.counters["client_gone_pre_d"] += 1
+            self._d_pf_book().done(rid=rid)  # X-SUM-PRICE: no phantom for a request D never got
             if seat is not None:
                 seat.release("client_gone")
             logger.warning("WEG2-CLIENT-GONE rid=%s state=pre-d action=not-admitted wait_s=%.1f (H102)",
@@ -15847,7 +15859,7 @@ class Front:
         # sum at once, so it is capped at X as well as at N -- the X IN FORCE,
         # which the live re-solve moves during a boot. The launcher refuses
         # N > X at launch (W153); this riegel holds whatever the flags say.
-        if not _sp.fits(carried=self._d_carried_tokens(), tokens=total, limit=min(n_max, x)):
+        if not _sp.fits(carried=self._dc_carried(), tokens=total, limit=min(n_max, x)):
             if total <= n_max:
                 self.counters["d_short_drain_x_capped"] += 1
             return 0
