@@ -114,7 +114,7 @@ class ResolveEdges(unittest.TestCase):
         self.assertEqual(sorted(set(res) - set(fremd)), sorted(k["id"] for k in KANTEN))
 
     def test_without_a_tree_label_every_edge_is_checked(self):
-        """No label = no filter: on the NF tree the 46 ``trees: [27b]`` edges are then stale or missing (the label is what lets them pass)."""
+        """No label = no filter: on the NF tree the 45 ``trees: [27b]`` edges are then stale or missing (the label is what lets them pass)."""
         res = PC.resolve_edge_evidence_items(KANTEN_ALLE, REPO_ROOT)
         self.assertFalse(any(r["status"] in PC.ANKER_FREMD for r in res.values()))
         if not DUAL_LINE:

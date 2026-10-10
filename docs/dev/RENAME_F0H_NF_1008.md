@@ -89,3 +89,16 @@ Testsatz je Port-Commit wie Runde 1 (eigene Tests + Tests, die die geaenderten M
 ### Offen
 * Kein Metallbeweis (keine GPU); Default-Entscheid von `W3_SPILL_HOST_LEAVES` und `MAMBA_SPILL_LAST_RESORT` laut Fix-Liste Nutzerentscheid.
 * Profile `nf-int4-h6-abl-xc-w3sp-mlr*.env` liegen nur unter `/spinning/gpu-arb/docker/profiles/` (in-tree Konvertierung = F0-G).
+
+## Round 3 (10.10.2026): the vision rebuild (AP3 of the NF line), branch `desk/flliper-nf-int-1010` from `desk/flliper-nf-int-1009` @ 2db4d5cedc
+
+Source: `c651892375 .. origin/desk/nf-vision-weights-1009 @ bc040078cd`; ported: `59c14423d8` (AP1, the model-neutral core), `8e7b127fc0` (AP3 `ExpertRowVictims`), `950080efd5` (its tests), `bc040078cd` (review findings S1-S3). The H88 commits of the
+same branch (`ae4ab773c0`, `dacc89e543`) and DEFAULTS-ON (`dd65a419fb`, already in as `c642c24f12`) are not part of this round. Procedure, rule and tools as in round 1 and 2 (`RENAME_PLAN.md` 8.21 names the one change: a new test file of the
+fix version no longer flips the translation pin of a parent unit). The old -> new table is in the seat report (`deskq/done/f0h-port-tabelle-1008.md`, round 3).
+
+Names: `SGLANG_WEG2_VISION_PLACE` -> `FLLIPER_PDFLIP_VISION_PLACE`, `--weg2-vision-place` -> `--pdflip-vision-place` (alias via `canonical_flags`), `weg2/vision_victim_experts.py` -> `pdflip/vision_victim_experts.py`,
+markers `W102 PdFlipVisionStage VICTIM-ARMED`, `PDFLIP VISION-VICTIM host-RAM WARNING`; the codes W105b, W110c, W111b are unchanged. NF is not a vision-weights standard (`--pdflip-vision-place weights` is a switch, code default `auto`).
+
+Proof of the port: the nine delta files of the four commits from the pipeline run on the tip are byte-equal to the tree for the seven files that carry no other work; `expert_offload.py` and `launcher.py` differ from the pipeline output by exactly
+the H88 hunks (and, in the launcher, 13 log/help units the translation memory does not hold and the tree has translated, plus the F0-F records-root lines): `tree + (dd65a419fb - c651892375 renamed)` equals the pipeline output of the tip for
+`expert_offload.py`, and for the launcher up to those lines.

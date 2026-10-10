@@ -403,7 +403,7 @@
      "evidence": {"file": "python/flliper/srt/pdflip/launcher.py", "zeile": 8524, "anchor": "they act only on the transient stage"}},
     {"id": "K133", "von": "--pdflip-vision-place", "nach": "FLLIPER_PDFLIP_VISION_ASYNC", "rel": "excludes", "calc": "text", "value": "weights",
      "satz": "The place 'weights' is always synchronous: the victims are borrowed only inside one pass before the admission, so FLLIPER_PDFLIP_VISION_ASYNC (or FLLIPER_PDFLIP_P_ROW_VISION_ASYNC) switched on is refused at launch by name (VISION-SYNC LAW) -- what it brings is a tower that never outlives its pass; what it costs is the async overlap.",
-     "evidence": {"file": "python/flliper/srt/pdflip/launcher.py", "zeile": 24946, "anchor": "PDFLIP VISION-ASYNC refused"}, "trees": ["27b"]},
+     "evidence": {"file": "python/flliper/srt/pdflip/launcher.py", "zeile": 24946, "anchor": "PDFLIP VISION-ASYNC refused"}},
     {"id": "K134", "von": "--pdflip-vision-place", "nach": "--dual-layout", "rel": "excludes", "calc": "text", "value": "kvtail",
      "satz": "The places 'kvtail' and 'auto' (told on the command line) are refused together with --dual-layout (W111): the dual P pool is born trimmed to 0 tokens, so the tower has no KV-tail page to lend -- the place for the dual is 'weights'.",
      "evidence": {"file": "python/flliper/srt/pdflip/launcher.py", "zeile": 24969, "anchor": "with --dual-layout: the dual P pool is born trimmed to 0 tokens"}, "trees": ["27b"]},
