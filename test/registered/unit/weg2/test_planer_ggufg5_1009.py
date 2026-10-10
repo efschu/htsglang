@@ -711,6 +711,34 @@ class TestDryRunGolden(unittest.TestCase):
         self.assertIn("tokenizer:", notes)
         self.assertIn("draft:", notes)
 
+    def test_the_dump_does_not_depend_on_the_sibling_directory_existing_on_the_box(self):
+        """G7 review 1: the --tokenizer-path directory of a GGUF profile is stood in for by its snapshot like the GGUF file
+        inside it; it must not take the 'stub only while config.json is missing' path (ensure_model_dir), which made the
+        dump depend on whether /spinning/llm_stuff/.../Qwen3.8-Flash-Next-GGUF-unsloth-sibling exists."""
+        from unittest import mock
+
+        snaps = _snapshots()
+        sib = "Qwen3.8-Flash-Next-GGUF-unsloth-sibling"
+        self.assertIn(sib, snaps)
+        seen = []
+        real = O.ensure_model_dir
+
+        def spy(path, **kw):
+            seen.append(os.path.basename(str(path).rstrip("/")))
+            return real(path, **kw)
+
+        with mock.patch.object(O, "ensure_model_dir", spy):
+            run = O.run_profile(PROFILE, O.read_replay(REPLAY_REF), tree=TREE, snapshots=snaps)
+        self.assertNotIn(sib, seen, "the GGUF sibling directory went through ensure_model_dir (box-dependent)")
+        self.assertEqual(O.diff_lines(self.dump, run.result.dump()), [])
+
+    def test_a_directory_without_gguf_parts_in_its_snapshot_keeps_the_old_rule(self):
+        # only the GGUF sibling and the GGUF MTP draft snapshots hold .gguf parts; every safetensors snapshot keeps the old path
+        snaps = _snapshots()
+        for name, d in snaps.items():
+            has = any(str(e.get("path", e.get("name", ""))).endswith(".gguf") for e in O.read_snapshot_manifest(d)["files"])
+            self.assertEqual(has, name in ("MTP", "Qwen3.8-Flash-Next-GGUF-unsloth-sibling"), name)
+
     def test_the_planner_prices_the_cut_per_layer(self):
         lines = [ln for ln in self.dump.splitlines() if "PP-CUT EXPERT ROWS JE LAYER (G5)" in ln]
         self.assertEqual(len(lines), 1, lines)

@@ -997,7 +997,21 @@ def run_profile(env_path: str, devices: Sequence[Mapping[str, Any]], *, tree: st
             parent = os.path.dirname(p)
             q = farm_dir(parent, what, force_snapshot=_snap_here)
             return os.path.join(q, os.path.basename(p)) if q != parent else p
-        return farm_dir(p, what)
+        # a DIRECTORY whose snapshot holds GGUF parts (the --tokenizer-path of a GGUF profile is the directory the model
+        # file sits in) is stood in for exactly like the GGUF file inside it, also where the real directory exists: the
+        # dump must not change when the box grows the sibling directory (G7 review 1).  Every other directory keeps
+        # the old rule (stub only while config.json is missing).
+        return farm_dir(p, what, force_snapshot=_snapshot_has_gguf(os.path.basename(p.rstrip("/"))))
+
+    def _snapshot_has_gguf(bn: str) -> bool:
+        snap = (snapshots or {}).get(bn, "")
+        if not snap:
+            return False
+        try:
+            return any(str(e.get("path", e.get("name", ""))).endswith(".gguf")
+                       for e in read_snapshot_manifest(snap).get("files", ()))
+        except (OSError, ValueError, KeyError):
+            return False
 
     def farm_dir(p: str, what: str, force_snapshot: bool = False) -> str:
         nonlocal farmed
