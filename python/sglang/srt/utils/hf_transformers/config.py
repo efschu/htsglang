@@ -352,6 +352,20 @@ def get_config(
         # `model` is post-rewrite (gguf parent / runai uri / remote pull).
         model_config_parser = "mistral" if is_mistral_model(model) else "hf"
 
+    if gguf_bespoke_arch == "qwen4exp" and not (Path(model) / "config.json").is_file():
+        # NF-GGUF AP G1: the unsloth qwen4exp export is a directory of .gguf
+        # parts and no config.json; transformers would answer with "does not
+        # appear to have a file named config.json" and name neither the arch
+        # nor the fix (the launcher's W172 says the same before any card is
+        # taken). FileNotFoundError is an OSError, as transformers' own is.
+        raise FileNotFoundError(
+            f"GGUF architecture 'qwen4exp' reads its geometry from a sibling "
+            f"config.json, and {model} holds none. Put the config.json of exactly "
+            f"this model next to the .gguf (a directory with symlinks to every "
+            f".gguf part plus that config.json; the safetensors original of the "
+            f"same model ships it)."
+        )
+
     parser = get_model_config_parser(model_config_parser)
     config = parser.parse(
         model, trust_remote_code=trust_remote_code, revision=revision, **kwargs

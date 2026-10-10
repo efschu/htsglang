@@ -215,6 +215,12 @@ from sglang.srt.models.qwen4_exp_ple_prefetch import (
     ple_next_chunk_hasher,
 )
 from sglang.srt.models.qwen4_exp_ple_decode_pread import make_ple_decode_stager
+from sglang.srt.models.qwen4_exp_ple_gguf import (
+    PLE_TABLE_MARKER_LEAF,
+    GgufMappedPleTable,
+    decode_ple_table_marker,
+    map_ple_table_from_gguf,
+)
 from sglang.srt.models.qwen4_exp_ple_fp8 import ple_fp8_bytes_to_bf16, ple_fp8_decode_arg
 from sglang.srt.weg2 import ple_state as _ple_handoff
 from sglang.srt.runtime_context import get_parallel
@@ -1186,9 +1192,17 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         table_dir: Optional[str] = None,
     ) -> None:
         nn.Module.__init__(self)
+        # NF-GGUF G2: an IQ4_NL table does NOT come through the embedding's own
+        # quant method (the n-gram embedding is built without a quant_config and
+        # stays a bf16 shape carrier); it is mapped from the GGUF file by
+        # ``attach_gguf_table`` under the ``checkpoint`` backend. Every OTHER
+        # quantised embedding is still refused, by name.
         if not isinstance(embedding.quant_method, UnquantizedEmbeddingMethod):
             raise NotImplementedError(
-                "PLE embedding offload requires an unquantized embedding table"
+                "PLE embedding offload requires an unquantized embedding table "
+                f"(got quant method {type(embedding.quant_method).__name__}); a "
+                "GGUF IQ4_NL table is mapped from the GGUF file, not quantised "
+                "through the embedding (--ple-offload-backend checkpoint)"
             )
         if embedding.weight.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
             raise TypeError(
@@ -1214,6 +1228,8 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         # refuses by name.
         self._ckpt_table = None
         self._ckpt_pread = None
+        # NF-GGUF G2: set by attach_gguf_table (IQ4_NL table of a GGUF file)
+        self._gguf_table: Optional[GgufMappedPleTable] = None
         # fnFL2 H32: the owning n-gram embedding's hash, for the next-chunk
         # prefetch (set by Qwen4ExpPLELayer; None = no prefetch)
         self.next_chunk_hasher = None
@@ -1282,6 +1298,104 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             vocab_end=self.shard_indices.org_vocab_end_index,
         )
 
+    def attach_gguf_table(self, table: GgufMappedPleTable) -> None:
+        """``checkpoint`` backend, GGUF source (NF-GGUF G2): adopt the IQ4_NL
+        table mapped from the GGUF file (model load_weights, on the marker the
+        GGUF adapter yields).
+
+        The rows are gathered by the PLE shard-gather kernel as 90-byte bit
+        patterns out of the read-only mapping (HMM, like the safetensors
+        ``checkpoint`` table) and dequantised to bf16 on the GPU by sgl-kernel
+        ``ggml_dequantize`` -- see :meth:`_gather_gguf`. The pread gather, the
+        next-chunk prefetch, the decode stage and the D-side warm are written for
+        ``dtype x embedding_dim`` rows and are NOT wired to this table: every
+        gather goes through the kernel (a cold page costs the HMM fault, as on
+        the plain ``hmm`` mode of the safetensors table).
+        """
+        if not self._ckpt_backend:
+            raise RuntimeError("attach_gguf_table on a non-checkpoint PLE table")
+        if table.embedding_dim != self.embedding_dim:
+            raise ValueError(
+                f"GGUF PLE table {table.embedding_dim} columns does not match the "
+                f"embedding ({self.embedding_dim})"
+            )
+        if table.out_dtype != torch.bfloat16 or self.weight.dtype != torch.bfloat16:
+            raise ValueError(
+                "GGUF IQ4_NL PLE table dequantises to bf16; the embedding carrier is "
+                f"{self.weight.dtype} (fp8 PLE storage is not combined with a GGUF table)"
+            )
+        if table.total_rows != self.org_vocab_size:
+            raise ValueError(
+                f"GGUF PLE table has {table.total_rows} rows, the embedding expects "
+                f"{self.org_vocab_size}"
+            )
+        if self.shard_indices.org_vocab_end_index > table.total_rows:
+            raise ValueError("PLE TP shard reaches beyond the GGUF table")
+        self._ckpt_table = table
+        self._gguf_table = table
+        self._ckpt_prefetcher = None
+        self._ckpt_pread = None
+        if self._decode_stager is not None:
+            self._decode_stager.retire()
+            self._retired_decode_stagers.append(self._decode_stager)
+        self._decode_stager = None
+        pread_mode = os.environ.get("SGLANG_QWEN4_PLE_CKPT_GATHER", "hmm").strip().lower()
+        if pread_mode not in ("", "hmm", "0", "off"):
+            logger.warning(
+                "SGLANG_QWEN4_PLE_CKPT_GATHER=%s does not apply to a GGUF IQ4_NL PLE table "
+                "(rows are 90-byte IQ4_NL blocks); every gather uses the HMM kernel",
+                pread_mode,
+            )
+        logger.info(
+            "PLE-GGUF: IQ4_NL table attached (%d rows x %d B); pread gather, prefetch, "
+            "decode stage and D-side warm are off for it (G2 first form)",
+            table.total_rows,
+            table.row_bytes,
+        )
+
+    def _gather_gguf(
+        self, table: GgufMappedPleTable, flat_ids: torch.Tensor, output: torch.Tensor
+    ) -> torch.Tensor:
+        """IQ4_NL rows of ``flat_ids`` as bf16 into ``output`` ([..., dim]).
+
+        1. ``torch.zeros`` a uint8 ``[m, 90]`` buffer, ``m`` = ``n`` padded to the
+           sgl-kernel dequantiser's superblock (``table.padded_rows``);
+        2. the existing PLE shard-gather kernel copies row ``id`` (in range) from
+           the mapping into it, viewing every 90-byte row as 45 bf16 BIT PATTERNS
+           (``is_fp8=False``, no arithmetic on the values); out-of-range rows and
+           the padding stay zero bytes, i.e. ``d = 0``, i.e. zeros;
+        3. ``ggml_dequantize`` (type 20) turns the buffer into bf16 ``[m, dim]``;
+           the first ``n`` rows are the result, out-of-range ids forced to +0.0.
+        Nothing here syncs the host, so the sequence is capturable.
+        """
+        n = int(flat_ids.numel())
+        dim = self.embedding_dim
+        m = table.padded_rows(n)
+        raw = torch.zeros((m, table.row_bytes), dtype=torch.uint8, device=flat_ids.device)
+        elems = table.kernel_row_elems
+        _gather_ple_embedding_from_shards_kernel[(n,)](
+            table.bases_on(flat_ids.device),
+            table.shard_rows,
+            flat_ids,
+            raw.view(torch.bfloat16),
+            embedding_dim=elems,
+            tp_vocab_start=self.shard_indices.org_vocab_start_index,
+            tp_vocab_end=self.shard_indices.org_vocab_end_index,
+            is_fp8=False,
+            BLOCK_D=triton.next_power_of_2(elems),
+            # unused for a bf16 view (the bytes are copied as bit patterns); passed
+            # like every other launch of this kernel (H68d wiring invariant)
+            FP8_DECODE=ple_fp8_decode_arg(torch.bfloat16, flat_ids.device),
+        )
+        deq = table.dequantize_device(raw, m)
+        # zero bytes dequantise to -0.0 (d = +0 times kvalues[0] = -127); the
+        # kernel's rule for an out-of-range id is a +0.0 row, so mask it here
+        in_range = (flat_ids >= self.shard_indices.org_vocab_start_index) & (
+            flat_ids < self.shard_indices.org_vocab_end_index
+        )
+        output.view(n, dim).copy_(torch.where(in_range.unsqueeze(1), deq[:n], 0))
+        return output
+
     def allocate_output(
         self, shape: Tuple[int, ...], device: torch.device
     ) -> torch.Tensor:
@@ -1320,6 +1434,11 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                     "PLE checkpoint table was never attached (load_weights did "
                     "not see the ngram_embedding shards)"
                 )
+            # getattr: the safetensors checkpoint path must not depend on a G2
+            # attribute (tests and callers build stand-in embeddings without it)
+            gguf_table = getattr(self, "_gguf_table", None)
+            if gguf_table is not None:
+                return self._gather_gguf(gguf_table, flat_ids, output)
             pread = getattr(self, "_ckpt_pread", None)
             if pread is not None and pread.wants(flat_ids):
                 return pread.gather_into(
@@ -3283,6 +3402,37 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             loaded_shard_params.add(f"{mod_prefix}.ngram_embedding.weight")
             return True
 
+        def load_qwen4_exp_ple_gguf_table(name: str, loaded_weight: torch.Tensor) -> bool:
+            """NF-GGUF G2: the marker the GGUF adapter yields for the IQ4_NL PLE
+            table (its location, not its 28.8 GB payload)."""
+            suffix = f".ngram_embedding.{PLE_TABLE_MARKER_LEAF}"
+            if not name.endswith(suffix):
+                return False
+            mod_prefix = name[: -len(suffix)]
+            ple_mod = ple_modules.get(mod_prefix)
+            if ple_mod is None:
+                # a rank that builds no PLE (Form A worker, other PP stage)
+                logger.debug("PLE GGUF marker %s: no PLE module on this rank", name)
+                return True
+            emb = ple_mod.ngram_embedding
+            if not getattr(emb, "_ckpt_backend", False):
+                raise ValueError(
+                    "a GGUF export carries the PLE n-gram table as one IQ4_NL tensor "
+                    "(28.8 GB for Qwen3.8-Flash-Next); it is only mapped, never copied "
+                    "or dequantised whole. Boot with --ple-offload-embedding "
+                    "--ple-offload-backend checkpoint"
+                )
+            if emb._ckpt_table is None:
+                emb.attach_gguf_table(
+                    map_ple_table_from_gguf(
+                        decode_ple_table_marker(loaded_weight),
+                        total_rows=emb.org_vocab_size,
+                        embedding_dim=emb.embedding_dim,
+                    )
+                )
+            loaded_shard_params.add(f"{mod_prefix}.ngram_embedding.weight")
+            return True
+
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         buffers = dict(self.named_buffers())
 
@@ -3343,8 +3493,18 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 name, loaded_weight, buffers, loaded_buffers
             ):
                 continue
+            if load_qwen4_exp_ple_gguf_table(name, loaded_weight):
+                continue
             if load_qwen4_exp_ple_shard(name, loaded_weight):
                 continue
+            if ".ple.ple_embedding.ngram_embedding." in name and name.endswith(
+                (".qweight", ".qweight_type")
+            ):
+                raise ValueError(
+                    f"GGUF PLE table arrived through the weight stream ({name}): the "
+                    "28.8 GB payload would be copied. The GGUF loader must build its "
+                    "iterator from adapter.stream_name_map()"
+                )
             if ".ple.ple_embedding.ngram_embedding." in name and name.endswith(
                 ".weight"
             ):

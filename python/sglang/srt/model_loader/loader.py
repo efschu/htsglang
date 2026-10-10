@@ -2712,8 +2712,14 @@ class GGUFModelLoader(BaseModelLoader):
                 _t_struct,
                 step0_cpu_note(_t_struct, _r_struct),
             )
+            # An adapter may keep a tensor OUT of the copying iterator (qwen4exp:
+            # the 28.8 GB IQ4_NL PLE table, mapped by the model instead); the
+            # default is the full map, byte-identical for every other family.
+            _stream_map = gguf_weights_map
+            if gguf_adapter is not None and hasattr(gguf_adapter, "stream_name_map"):
+                _stream_map = gguf_adapter.stream_name_map(gguf_weights_map)
             weights_iterator = self._get_weights_iterator(
-                local_model_path, gguf_weights_map
+                local_model_path, _stream_map
             )
             if gguf_adapter is not None:
                 weights_iterator = gguf_adapter.transform_stream(weights_iterator)
