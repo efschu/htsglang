@@ -149,6 +149,54 @@ def test_a_simultaneous_burst_books_before_the_seat_not_after(monkeypatch):
     assert f._d_pf_book().pending_tokens(now=time.time(), live={}) == 5200
 
 
+def test_the_booking_stands_before_every_suspension(monkeypatch):
+    """Review m3 (xsum-review-1009): the plain gather test stayed green when the
+    booking moved BEHIND `await _d_seat.acquire()`, because no stub awaited
+    between the gate and the seat. Here the awaits between them really suspend
+    (the reading of D and the arrival-seat wait), as they do on metal: a booking
+    taken after them lets every arrival of the burst read an empty book."""
+    _on(monkeypatch, window="0.3")
+    monkeypatch.setenv("SGLANG_WEG2_DECODE_COLLECT_D_CHECK_S", "0")
+    f = _front(running=[], n=6, kv={"available": 400000, "evictable": 0})
+    f.tp_prefill_max_tokens = 6008
+
+    async def suspends(*a, **k):
+        await asyncio.sleep(0.02)
+        return None
+
+    async def seat_wait(*a, **k):
+        await asyncio.sleep(0.02)
+        return True
+
+    f._d_reading_if_armed = suspends
+    f._arrival_seat_wait = seat_wait
+
+    async def burst():
+        return await asyncio.gather(*[f._acquire_short_seat(f"s{i}", 5260, uncached=5200)
+                                      for i in range(6)])
+
+    seats = asyncio.run(burst())
+    assert sum(s is not None for s in seats) == 1
+
+
+def test_a_release_with_route_d_books_the_held_shorts(monkeypatch):
+    """Review m2a: the set is priced as a set (3000 in flight + 2 x 500 <= X) and
+    released to D; between that release and the caller's seat there are awaits,
+    so the held SHORTs are booked in the release step itself."""
+    _on(monkeypatch, window="0.3")
+    monkeypatch.setenv("SGLANG_WEG2_DECODE_COLLECT_D_CHECK_S", "0")
+    f = _front(running=[], n=6, kv={"available": 400000, "evictable": 0})
+    f.tp_prefill_max_tokens = 6008
+    _idle_d_prefilling(f, 3000)
+
+    async def two():
+        return await asyncio.gather(f._decode_collect_short("a", 500), f._decode_collect_short("b", 500))
+
+    out = asyncio.run(two())
+    assert all(r in ("D", None) for r in out), out  # the release answers D, a late poller "serve now"; never P
+    assert f._d_pf_book().pending_tokens(now=time.time(), live={}) == 3000 + 500 + 500
+
+
 def test_switch_off_is_the_old_blind_path(monkeypatch):
     _on(monkeypatch, window="0.3")
     monkeypatch.setenv("SGLANG_WEG2_ENABLE_DECODE_COLLECT_PREFILL_BUSY", "0")
