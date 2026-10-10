@@ -141,6 +141,81 @@ def _kv_sidecar_twins(stem: str) -> Tuple[str, ...]:
 class Weg2L3EvictorPauseRefused(RuntimeError):
     """NF review 3 (B): the background L3 evictor could not be parked at the sleep entry (named stop)."""
 
+
+class _HandoffLock:
+    """``threading.Lock`` plus a waiter count, so a looping holder can HAND the lock over.
+
+    D-HEALTH 10.10. (boot dkr27bnvfp4dualvwweightsbar1fs10100032): the background evictor released ``_lock``
+    between batches with ``time.sleep(0)`` and took it straight back. ``threading.Lock`` is not fair -- the
+    releasing thread is running, the waiter has to be woken by the kernel first -- so PARK-DEMOTE's
+    ``reserve()``/``commit()`` and the write-behind lost nearly every race: PARK-DEMOTE 16439 pages took
+    9672 ms instead of ~2.3 s. ``handoff()`` (called WITHOUT the lock) returns once the threads that were
+    waiting at the call have each been granted the lock, so the next batch starts behind them, not before.
+
+    The uncontended path is the bare lock; only a thread that has to wait touches the condition.
+
+    The unlink itself stays under the lock: outside it, a ``reserve()``+write+``commit()`` of the SAME stem
+    between the index pop and the delayed ``os.remove`` would lose the new file while the index says it is
+    there. Instead a batch ends after the current victim as soon as a thread waits (``waiting``), so the wait
+    is one unlink, not one batch.
+    """
+
+    __slots__ = ("_lock", "_cv", "_waiting", "_contended_grants")
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._cv = threading.Condition(threading.Lock())
+        self._waiting = 0
+        self._contended_grants = 0
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        if self._lock.acquire(False):
+            return True
+        if not blocking:
+            return False
+        with self._cv:
+            self._waiting += 1
+        got = False
+        try:
+            got = self._lock.acquire(True, timeout)
+        finally:
+            with self._cv:
+                self._waiting -= 1
+                if got:
+                    self._contended_grants += 1
+                self._cv.notify_all()
+        return got
+
+    def release(self) -> None:
+        self._lock.release()
+
+    def locked(self) -> bool:
+        return self._lock.locked()
+
+    def __enter__(self) -> bool:
+        return self.acquire()
+
+    def __exit__(self, *exc) -> None:
+        self.release()
+
+    @property
+    def waiting(self) -> int:
+        """Threads blocked in ``acquire`` right now (a racy read -- a hint for a holder to end its batch)."""
+        return self._waiting
+
+    def handoff(self, timeout: float = 1.0) -> None:
+        """Called without the lock: wait until every thread waiting NOW has been granted it (or ``timeout``)."""
+        with self._cv:
+            if self._waiting == 0:
+                return
+            target = self._contended_grants + self._waiting
+            deadline = time.monotonic() + timeout
+            while self._contended_grants < target and self._waiting > 0:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return
+                self._cv.wait(left)
+
 _BG_EVICT_BATCH_S = 0.005
 # Above this, a wake re-scan says so. A PRICE TAG, NOT A BOUND: crossing it
 # changes nothing about the scan (see ``rescan`` on why a deadline here would
@@ -324,7 +399,8 @@ class LRUFileEvictor:
         self._lru: OrderedDict[str, int] = OrderedDict()
         self._pending_writes: Set[str] = set()
         self._total_bytes: int = 0
-        self._lock = threading.Lock()
+        # D-HEALTH 10.10.: handed over between background-eviction batches (see _HandoffLock).
+        self._lock = _HandoffLock()
 
         # #1295: THE CAP BOUNDS THE DIRECTORY, AND A SECOND OWNER IS THE OTHER
         # HALF OF THE DIRECTORY. F7 elects one evictor per shared-key GROUP,
@@ -2134,7 +2210,8 @@ class LRUFileEvictor:
                 reclaimed += got
                 if stuck:
                     break  # nothing evictable left (pending / sibling / pinned): the cap path names it
-                time.sleep(0)  # let a waiting reserve() take the lock between batches
+                # D-HEALTH 10.10.: was time.sleep(0), after which this thread won the unfair lock back.
+                self._lock.handoff()
             if before is None:
                 continue
             self._bg_evict_report(t0, reclaimed, before)
@@ -2151,16 +2228,22 @@ class LRUFileEvictor:
                 before = cur
             if cur <= target:
                 return None
-            n, t_b = [0], time.monotonic()
+            n, t_b, cut = [0], time.monotonic(), [False]
 
-            def more(_r, n=n, target=target, t_b=t_b):
+            def more(_r, n=n, target=target, t_b=t_b, cut=cut):
                 n[0] += 1
+                if n[0] > 1 and self._lock.waiting > 0:
+                    # D-HEALTH 10.10.: a reserve()/commit() waits -- end the batch after this victim, not
+                    # after the batch bound; handoff() then lets it in before the next batch.
+                    cut[0] = True
+                    return False
                 return (n[0] == 1 or (n[0] <= _BG_EVICT_BATCH
                                       and time.monotonic() - t_b < _BG_EVICT_BATCH_S)) \
                     and self._directory_bytes_locked() > target
 
             got = self._evict_while(more)
-            return before, got, (got == 0 and self._directory_bytes_locked() > target)
+            # A batch cut for a waiter has not shown that nothing is evictable.
+            return before, got, (got == 0 and not cut[0] and self._directory_bytes_locked() > target)
 
     def _bg_evict_report(self, t0: float, reclaimed: int, before: int) -> None:
         with self._lock:
