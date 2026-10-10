@@ -381,7 +381,7 @@ class TestCatalog(unittest.TestCase):
         self.assertEqual((deps["--hicache-storage-backend"]["rel"], deps["--hicache-storage-backend"]["kante"]), ("skaliert_mit", "K134"))
         self.assertEqual({d["to"]: d["kante"] for d in cat["entries"]["SGLANG_MOE_ACT_INT8"]["depends"]}, {"--quantization": "K133"})
         self.assertTrue(all(d["belegt"] for n in self.NAMES for d in cat["entries"][n]["depends"]))
-        self.assertEqual((cat["kanten"]["kanten_gesamt"], cat["kanten"]["kanten_belegt"]), (135, 135))  # int24: + K135 (X-SUM-PRICE)
+        self.assertEqual((cat["kanten"]["kanten_gesamt"], cat["kanten"]["kanten_belegt"]), (137, 137))  # G7: + K136-K137 (NF-GGUF G5); int24: + K135 (X-SUM-PRICE)
 
     def test_no_text_says_the_tree_has_no_w4a8_scheme_yet(self):
         """H88-F fix round 1: since H88-B the tree HAS the scheme (HAS_W4A8_MOE_SCHEME = True), so the help=, the environ.py

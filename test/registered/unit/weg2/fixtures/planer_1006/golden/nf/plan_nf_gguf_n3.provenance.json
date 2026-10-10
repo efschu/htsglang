@@ -75,7 +75,7 @@
  "profile": {
   "file": "tools/release/profconv/nf-gguf.env",
   "note": "in-tree profile (profconv), not a rig snapshot; the test pins its sha256: regenerate the golden when the profile moves",
-  "sha256": "30f916650ecf93c21ecd59e0f19a8be5f4be77f6e48c1c2c0ec4b71f0c5abbb2"
+  "sha256": "154c2a891a68bc9f0d262abbfd332c4b7a653d0e9019227335610af50ae4fda9"
  },
  "profile_base": {
   "file": "tools/release/profconv/nf.env",
@@ -84,5 +84,6 @@
  },
  "replay": "fixtures/xchg_launch_replay_0911/nvml_devices_1378.json",
  "schema": "planer-ap0-golden-provenance/1",
- "tree": "c651892375 + desk/planer-ggufg1-1009 (7f26ce40c1) + desk/planer-ggufg5-1009"
+ "tree": "desk/nf-gguf-1009 (G7 integration: NF int24b 17c8582d2d + G1-G6 merged)",
+ "regenerated": "G7 10.10.2026: only the expert-store identity moved (094d948f308c5ef9381757b5 -> 853c707b895a9937c4a42443: G4's GGUF layout tag + header digest now enter compute_identity, G5's golden predates the G4 merge; lines 193, 247, 248); profile sha256 changed by the HTSGLANG_DRAFT override of G3's PROFILE_DRAFT line"
 }
