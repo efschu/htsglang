@@ -2498,7 +2498,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 getattr(draft_format, "value", draft_format),
                 "--speculative-draft-load-format"
                 if explicit is not None
-                else "a GGUF target's draft that is not a GGUF file",
+                else (
+                    "a GGUF draft file beside a non-GGUF target"
+                    if getattr(draft_format, "value", draft_format) == "gguf"
+                    else "a GGUF target's draft that is not a GGUF file"
+                ),
                 getattr(load_format, "value", load_format),
             )
         return draft_format

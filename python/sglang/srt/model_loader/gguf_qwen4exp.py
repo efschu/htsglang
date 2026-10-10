@@ -79,8 +79,6 @@ them at the end as int64 tensors named like the HF buffers
 ``ngram_heads_vocab_sizes``) so the model's own buffer loader
 (``qwen4_exp.py _load_qwen4_exp_ple_buffer``) takes them.
 
-Not in G1: the MTP draft (``blk.<n>.nextn.*``, AP G3), MoE/PLE kernels.
-
 PLE table consumer (AP G2). The 28.8 GB ``per_layer_token_embd`` payload must
 NOT go through the generic weight stream: ``gguf_quant_weights_iterator`` copies
 every mapped tensor (``torch.tensor(...)``). The loader therefore builds the
@@ -91,6 +89,52 @@ uint8 payload is the table's location (file, absolute offset, type, shape;
 ``qwen4_exp_ple_gguf.encode_ple_table_marker``). The model maps the span lazily
 (``Qwen4ExpPinnedHostEmbedding.attach_gguf_table``). Any table format but IQ4_NL
 is refused by name before a single tensor is streamed.
+
+Not in G1: MoE/PLE kernels (AP G6).
+
+G3 (NF-GGUF AP G3, 2026-10-10): the NEXTN/MTP draft head from its own GGUF
+(``mtp-Qwen3.8-Flash-Next-{Q8_0,shared-Q8_0}.gguf``; llama.cpp PR #29761 "Qwen4Exp:
+add MTP", unsloth ``nextn_shared_target_tensors`` variant). The draft block
+``blk.<block_count - nextn_predict_layers>`` (48 for the real files) carries the
+SAME roles as a full-attention backbone layer (attention, QSA indexer, hyper
+connections, MoE; no GDN, no PLE) plus six ``nextn.*`` tensors. HF side is the
+albucino/Minachist draft layout (``mtp.layers.0.*``, ``mtp.fc_embedding``,
+``mtp.fc_hidden``, ``mtp.pre_fc_norm_*``, ``mtp.hyper_connection_mixer.*``;
+checked against the safetensors header of the albucino MTP draft). Roles:
+
+=======================  =======================================================
+GGUF role (blk.<N>.)      HF name / transform
+=======================  =======================================================
+``nextn.eh_proj``         [2H, H] in ggml order = torch [H, 2H]. The converter
+                          fuses the two HF projections (conversion/qwen4exp.py,
+                          ``modify_tensors``): ``eh = torch.cat([fc_embedding,
+                          fc_hidden], dim=1)``, comment ``eh_proj([e ; h_s]) =
+                          fc_embedding(e) + fc_hidden(h_s) for every hc stream
+                          s``  ->  columns [:H] = ``mtp.fc_embedding``, columns
+                          [H:] = ``mtp.fc_hidden`` (dequantised first: both are
+                          plain ``nn.Linear`` in the draft)
+``nextn.enorm``           ``mtp.pre_fc_norm_embedding`` ([H]); Gemma gamma, ``-1``
+``nextn.hnorm``           ``mtp.pre_fc_norm_hidden`` ([hc*H]); Gemma gamma, ``-1``
+``nextn.hc_head_norm``    ``mtp.hyper_connection_mixer.hc_norm``; ``-1``
+``nextn.hc_head_down``    ``mtp.hyper_connection_mixer.input_mix_weight_down``
+``nextn.hc_head_up``      ``mtp.hyper_connection_mixer.input_mix_weight_up``
+all backbone-layer roles  ``mtp.layers.0.<same HF suffix as LAYER_TABLE>``; the
+                          ``-1`` of every ``*norm.weight`` follows from qwen.py
+                          ``modify_tensors`` (``endswith("norm.weight")``, the
+                          MTP names are renamed to enorm/hnorm/layers.N BEFORE it
+                          runs: ``_QwenMtpMixin.filter_tensors``)
+``token_embd/output``     NOT loaded (full variant only): the draft shares the
+                          target's vocabulary modules (eagle_worker_v2.
+                          ``init_lm_head`` -> ``set_embed_and_head_modules`` for a
+                          quantised-resident target, tensor share otherwise), and
+                          ``Qwen3_5ForCausalLMMTP.load_weights`` has never read a
+                          draft's own vocabulary tensors. The shared variant has
+                          none; the full variant's two Q8_0 tables are skipped
+                          unread (the iterator touches only mapped tensors)
+=======================  =======================================================
+
+The hc_*_inject / hc_*_down / hc_*_up tensors are Q8_0 in the draft (F32 in the
+main model); the same ``hc_dense`` dequantisation as the main model applies.
 """
 
 from __future__ import annotations
@@ -310,6 +354,167 @@ def build_qwen4exp_name_map(
             continue  # NEXTN/MTP block: AP G3
         unknown.append(name)
     return out, unknown
+
+
+# ---------------------------------------------------------------------------
+# G3: the NEXTN/MTP draft head
+# ---------------------------------------------------------------------------
+
+#: Internal HF-side name of the fused ``nextn.eh_proj``; the stream splits it into
+#: ``mtp.fc_embedding`` + ``mtp.fc_hidden`` (never reaches the model).
+DRAFT_EH_PROJ_INTERNAL = "mtp.eh_proj"
+
+#: ``blk.<N>.<suffix>`` -> HF name, the six NEXTN-only roles of the draft block.
+DRAFT_NEXTN_TABLE: Tuple[Tuple[str, str], ...] = (
+    ("nextn.eh_proj.weight", DRAFT_EH_PROJ_INTERNAL + ".weight"),  # tm 2853-2866, cv 145-151
+    ("nextn.enorm.weight", "mtp.pre_fc_norm_embedding.weight"),  # tm 2853-2866
+    ("nextn.hnorm.weight", "mtp.pre_fc_norm_hidden.weight"),  # tm 2853-2866
+    ("nextn.hc_head_norm.weight", "mtp.hyper_connection_mixer.hc_norm.weight"),  # tm 2931-2938
+    (
+        "nextn.hc_head_down.weight",
+        "mtp.hyper_connection_mixer.input_mix_weight_down.weight",
+    ),  # tm 2931-2938
+    (
+        "nextn.hc_head_up.weight",
+        "mtp.hyper_connection_mixer.input_mix_weight_up.weight",
+    ),  # tm 2931-2938
+)
+
+#: HF prefix of the (single) draft decoder layer.
+DRAFT_LAYER_PREFIX = "mtp.layers.0."
+
+#: The roles a full-attention backbone layer has and the draft block carries.
+_DRAFT_LAYER_ROLES = frozenset(_ATTN_ROLES | _EVERY_LAYER_ROLES)
+
+#: Vocabulary tensors of the self-contained draft file (skipped, see module doc).
+DRAFT_VOCAB_ROLES: Tuple[str, ...] = ("token_embd.weight", "output.weight")
+
+#: Global names of a BACKBONE (combined export): never the draft's.
+_BACKBONE_GLOBALS = frozenset(g for g, _ in GLOBAL_TABLE) | frozenset(DRAFT_VOCAB_ROLES)
+
+
+def qwen4exp_draft_blocks(file_tensors: Iterable[str]) -> List[int]:
+    """Block indices that carry ``nextn.eh_proj.weight`` (the NEXTN marker)."""
+    out = set()
+    for name in file_tensors:
+        parts = _split_blk(name)
+        if parts is not None and parts[1] == "nextn.eh_proj.weight":
+            out.add(parts[0])
+    return sorted(out)
+
+
+def qwen4exp_draft_block_index(
+    file_tensors: Iterable[str], kv: Mapping[str, Any], gguf_file: str = "<file>"
+) -> int:
+    """The draft block index of a qwen4exp MTP file, from the file itself.
+
+    NOT ``num_hidden_layers``: the draft ModelConfig rewrites that to 1
+    (``configs/model_config.py``), and the real files hold the block at
+    ``block_count - nextn_predict_layers`` = 48.
+    """
+    blocks = qwen4exp_draft_blocks(file_tensors)
+    nextn = kv.get("nextn_predict_layers")
+    if not blocks:
+        raise RuntimeError(
+            f"qwen4exp GGUF MTP draft {gguf_file}: no blk.<N>.nextn.eh_proj.weight "
+            "tensor -- this is not an MTP/NEXTN head (a plain backbone export has "
+            "none; an MTP head is the separate mtp-*.gguf of the export)"
+        )
+    if len(blocks) != 1 or (nextn is not None and int(nextn) != 1):
+        raise RuntimeError(
+            f"qwen4exp GGUF MTP draft {gguf_file}: {len(blocks)} NEXTN block(s) "
+            f"{blocks} and nextn_predict_layers={nextn}; the draft model is built "
+            "with exactly one MTP layer"
+        )
+    block = blocks[0]
+    count = kv.get("block_count")
+    if count is not None and nextn is not None and block != int(count) - int(nextn):
+        raise RuntimeError(
+            f"qwen4exp GGUF MTP draft {gguf_file}: the NEXTN tensors are at blk."
+            f"{block} but block_count={count} - nextn_predict_layers={nextn} = "
+            f"{int(count) - int(nextn)}"
+        )
+    return block
+
+
+def qwen4exp_draft_is_shared(kv: Mapping[str, Any]) -> bool:
+    """``qwen4exp.nextn_shared_target_tensors`` (unsloth shared-Q8_0 export): the
+    file carries no ``token_embd`` / ``output``."""
+    return bool(kv.get("nextn_shared_target_tensors"))
+
+
+def build_qwen4exp_draft_name_map(
+    file_tensors: Iterable[str], block: int
+) -> Tuple[Dict[str, str], List[str]]:
+    """``({gguf name: HF name}, [file tensors the table does not know])`` for the
+    draft block ``block``. Backbone blocks and the backbone globals of a combined
+    export, and the vocabulary tensors of the self-contained draft, are neither
+    mapped nor reported."""
+    present = set(file_tensors)
+    out: Dict[str, str] = {}
+    for suffix, hf in DRAFT_NEXTN_TABLE:
+        gname = f"blk.{block}.{suffix}"
+        if gname in present:
+            out[gname] = hf
+    for suffix, hf_suffix in LAYER_TABLE:
+        if suffix not in _DRAFT_LAYER_ROLES:
+            continue
+        gname = f"blk.{block}.{suffix}"
+        if gname in present:
+            out[gname] = DRAFT_LAYER_PREFIX + hf_suffix
+    unknown: List[str] = []
+    for name in sorted(present):
+        if name in out or name.startswith(("v.", "mm.")) or name in _BACKBONE_GLOBALS:
+            continue
+        parts = _split_blk(name)
+        if parts is not None and parts[0] != block:
+            continue  # a backbone block of a combined export: the target's
+        unknown.append(name)
+    return out, unknown
+
+
+def qwen4exp_draft_missing_roles(
+    file_tensors: Iterable[str], block: int, kv: Mapping[str, Any]
+) -> List[str]:
+    """What a complete qwen4exp MTP head has and this file lacks (empty when
+    complete), plus the shared-flag contradictions. A GDN tensor in the draft block
+    (the draft model is a full-attention layer) is not in the draft table and is
+    refused earlier as an unmapped tensor."""
+    present = set(file_tensors)
+    problems: List[str] = []
+    want = [f"blk.{block}.{s}" for s, _ in DRAFT_NEXTN_TABLE]
+    want += [f"blk.{block}.{s}" for s, _ in LAYER_TABLE if s in _DRAFT_LAYER_ROLES]
+    gap = [n for n in want if n not in present]
+    if gap:
+        problems.append(f"blk.{block} missing {gap}")
+    vocab = [n for n in DRAFT_VOCAB_ROLES if n in present]
+    if qwen4exp_draft_is_shared(kv) and vocab:
+        problems.append(
+            f"the header says nextn_shared_target_tensors=True but the file carries {vocab}"
+        )
+    return problems
+
+
+def qwen4exp_draft_shape_problems(
+    shapes: Mapping[str, Sequence[int]], block: int, hidden: int, hc_count: int
+) -> List[str]:
+    """Shape facts of the NEXTN tensors in ggml dim order (``ne0`` first)."""
+    problems: List[str] = []
+
+    def shape(suffix: str) -> Optional[Tuple[int, ...]]:
+        s = shapes.get(f"blk.{block}.{suffix}")
+        return None if s is None else tuple(int(d) for d in s)
+
+    for suffix, want in (
+        ("nextn.eh_proj.weight", (2 * hidden, hidden)),
+        ("nextn.enorm.weight", (hidden,)),
+        ("nextn.hnorm.weight", (hc_count * hidden,)),
+        ("nextn.hc_head_norm.weight", (hc_count * hidden,)),
+    ):
+        got = shape(suffix)
+        if got is not None and got != want:
+            problems.append(f"blk.{block}.{suffix}: ggml shape {got}, expected {want}")
+    return problems
 
 
 def qwen4exp_missing_roles(file_tensors: Iterable[str], num_layers: int) -> List[str]:
@@ -535,7 +740,9 @@ class Qwen4ExpGGUFAdapter(Qwen35GGUFAdapter):
     for ``q_norm``/``k_norm`` and the F32 carve-out from the qwen35 adapter
     (same converter base class upstream, ``_LinearAttentionVReorderBase``), and
     adds what only qwen4exp has: hyper connections, the QSA indexer fusion, PLE
-    and the router cast. Draft (MTP) loading is AP G3.
+    and the router cast. The NEXTN/MTP draft (``is_draft``, the architecture
+    ``Qwen4ExpForCausalLMMTP``) is G3: its own name map (``_build_draft_name_map``),
+    the ``eh_proj`` split and the draft-block expert rename in ``_draft_pre``.
     """
 
     FAMILY = "qwen4exp"
@@ -549,7 +756,8 @@ class Qwen4ExpGGUFAdapter(Qwen35GGUFAdapter):
 
     def _post_init(self, config) -> None:
         archs = getattr(config, "architectures", None) or []
-        # AP G3 owns the draft; the architecture name is qwen4_exp_mtp.py:90
+        # the draft's architecture name is qwen4_exp_mtp.py:90 (configs/model_config.py
+        # rewrites the draft ModelConfig to it)
         self.is_draft = archs[:1] == ["Qwen4ExpForCausalLMMTP"]
         # the unsloth export ships no mmproj (plan 1, 13); never route a
         # qwen4exp load through qwen35's clip name map
@@ -560,6 +768,7 @@ class Qwen4ExpGGUFAdapter(Qwen35GGUFAdapter):
         self.head_k_dim = int(getattr(self.config, "linear_key_head_dim", 0) or 0)
         self.head_v_dim = int(getattr(self.config, "linear_value_head_dim", 0) or 0)
         self._kv_cache: Optional[Dict[str, Any]] = None
+        self._draft_block_cache: Optional[int] = None
 
     # ------------------------------------------------------------------
     # Header facts
@@ -585,11 +794,6 @@ class Qwen4ExpGGUFAdapter(Qwen35GGUFAdapter):
     # ------------------------------------------------------------------
 
     def build_name_map(self) -> Dict[str, str]:
-        if self.is_draft:
-            raise RuntimeError(
-                "qwen4exp GGUF MTP draft: the draft name map (blk.<n>.nextn.*, "
-                "eh_proj split) is AP G3 and is not part of this adapter yet"
-            )
         if _hc_mixer_int8_requested():
             raise RuntimeError(
                 "qwen4exp GGUF: SGLANG_HC_MIXER_INT8 builds the hyper-connection "
@@ -597,6 +801,8 @@ class Qwen4ExpGGUFAdapter(Qwen35GGUFAdapter):
                 "Q8_0 mixer tensors to bf16 nn.Linear weights; unset "
                 "SGLANG_HC_MIXER_INT8 for a GGUF boot"
             )
+        if self.is_draft:
+            return self._build_draft_name_map()
         file_tensors = self._file_tensors()
         gguf_to_hf, unknown = build_qwen4exp_name_map(
             file_tensors, self.num_layers, self._ple_layer(sorted(file_tensors))
@@ -618,6 +824,112 @@ class Qwen4ExpGGUFAdapter(Qwen35GGUFAdapter):
             self.arch,
         )
         return gguf_to_hf
+
+    # ------------------------------------------------------------------
+    # G3: the NEXTN/MTP draft
+    # ------------------------------------------------------------------
+
+    def draft_block_index(self) -> int:
+        """Block index of the draft layer, from the file (see
+        :func:`qwen4exp_draft_block_index`)."""
+        if self._draft_block_cache is None:
+            self._draft_block_cache = qwen4exp_draft_block_index(
+                self._file_tensors(), self._kv(), self.gguf_file
+            )
+        return self._draft_block_cache
+
+    def draft_shares_target_vocab(self) -> bool:
+        """True for the unsloth ``shared-*`` head (no token_embd / output in the
+        file). For the self-contained head the two vocabulary tables are skipped
+        and the target's are shared in all the same (module docstring)."""
+        return qwen4exp_draft_is_shared(self._kv())
+
+    def _build_draft_name_map(self) -> Dict[str, str]:
+        """``{gguf name: HF name}`` of the MTP head: ``blk.<N>.*`` -> ``mtp.*`` of
+        ``Qwen4ExpForCausalLMMTP`` (module docstring, G3 table)."""
+        from sglang.srt.model_loader.gguf_shards import iter_gguf_tensors
+
+        file_tensors = self._file_tensors()
+        kv = self._kv()
+        block = self.draft_block_index()
+        gguf_to_hf, unknown = build_qwen4exp_draft_name_map(file_tensors, block)
+        if unknown:
+            raise RuntimeError(
+                f"qwen4exp GGUF MTP draft {self.gguf_file}: {len(unknown)} tensors "
+                f"not mapped: {unknown[:12]}"
+            )
+        problems = qwen4exp_draft_missing_roles(file_tensors, block, kv)
+        hidden = int(getattr(self.config, "hidden_size", 0) or 0)
+        hc = int(getattr(self.config, "hc_count", 0) or 0)
+        if hidden and hc:
+            shapes = {str(t.name): tuple(int(d) for d in t.shape)
+                      for t in iter_gguf_tensors(self.shard_paths())}
+            problems += qwen4exp_draft_shape_problems(shapes, block, hidden, hc)
+        if problems:
+            raise RuntimeError(
+                f"qwen4exp GGUF MTP draft {self.gguf_file}: incomplete or "
+                f"inconsistent head ({len(problems)} problems): {problems[:6]}"
+            )
+        skipped = [n for n in DRAFT_VOCAB_ROLES if n in file_tensors]
+        logger.info(
+            "qwen4exp GGUF MTP draft name map: %d tensors (blk.%d, %s variant%s); "
+            "the draft shares the target's vocabulary modules",
+            len(gguf_to_hf),
+            block,
+            "shared" if self.draft_shares_target_vocab() else "self-contained",
+            f", {skipped} not read" if skipped else "",
+        )
+        return gguf_to_hf
+
+    def _draft_pre(
+        self, weights: Iterable[Tuple[str, torch.Tensor]]
+    ) -> Iterable[Tuple[str, torch.Tensor]]:
+        """The draft-only stream rules, ahead of ``_pre_stream``:
+
+        * the routed experts the generic GGUF iterator emits under the MAIN-model
+          spelling ``model.layers.<N>.mlp.experts.<e>.<proj>.qweight(_type)``
+          (``N`` = the draft block) go to ``mtp.layers.0.mlp.experts...``, where
+          ``Qwen3_5ForCausalLMMTP.load_weights`` keeps them (the qwen35 adapter
+          keys this on ``num_hidden_layers``, which is 1 for this draft);
+          experts of any other block of a combined export are dropped;
+        * ``nextn.eh_proj`` is dequantised and split: columns ``[:H]`` are
+          ``mtp.fc_embedding``, columns ``[H:]`` are ``mtp.fc_hidden``
+          (converter: ``torch.cat([fc_embedding, fc_hidden], dim=1)``).
+        """
+        block = self.draft_block_index()
+        hidden = int(getattr(self.config, "hidden_size", 0) or 0)
+        main_exp = re.compile(r"^model\.layers\.(\d+)\.mlp\.experts\.")
+        eh_type: Optional[int] = None
+        for name, weight in weights:
+            m = main_exp.match(name)
+            if m is not None:
+                if int(m.group(1)) == block:
+                    yield "mtp.layers.0.mlp.experts." + name[m.end():], weight
+                continue
+            base, leaf = self._split_leaf(name)
+            if base != DRAFT_EH_PROJ_INTERNAL:
+                yield name, weight
+                continue
+            if leaf == "qweight_type":
+                eh_type = int(weight.item())
+                continue
+            if leaf == "qweight":
+                if eh_type is None:
+                    raise RuntimeError(
+                        f"qwen4exp GGUF MTP draft: {name}: type marker not seen yet"
+                    )
+                dense = self._dequantize(weight, eh_type)
+            else:  # an F32 eh_proj arrives as a plain .weight
+                dense = weight.to(self._param_dtype())
+            rows, cols = int(dense.shape[0]), int(dense.shape[1])
+            if cols != 2 * rows or (hidden and rows != hidden):
+                raise RuntimeError(
+                    f"qwen4exp GGUF MTP draft: eh_proj is {tuple(dense.shape)} "
+                    f"(torch [out, in]); expected [H, 2H] with H = hidden_size "
+                    f"{hidden or rows}"
+                )
+            yield "mtp.fc_embedding.weight" + _FINAL, dense[:, :rows].contiguous()
+            yield "mtp.fc_hidden.weight" + _FINAL, dense[:, rows:].contiguous()
 
     def _module_prefix_spelling(self, base: str) -> str:
         # the two indexer halves are ONE module in the model
@@ -844,14 +1156,17 @@ class Qwen4ExpGGUFAdapter(Qwen35GGUFAdapter):
         self, weights: Iterable[Tuple[str, torch.Tensor]]
     ) -> Iterable[Tuple[str, torch.Tensor]]:
         if self.is_draft:
-            raise RuntimeError("qwen4exp GGUF MTP draft: AP G3")
-        # G2: the table's location goes first, so a refused format (or a model
-        # without the checkpoint offload backend) fails before the weights load
-        marker = self.ple_table_marker()
-        if marker is not None:
-            yield marker
+            weights = self._draft_pre(weights)
+        else:
+            # G2: the table's location goes first, so a refused format (or a
+            # model without the checkpoint offload backend) fails before the
+            # weights load (the draft has no PLE layer)
+            marker = self.ple_table_marker()
+            if marker is not None:
+                yield marker
         for name, weight in super().transform_stream(self._pre_stream(weights)):
             if name.endswith(_FINAL):
                 name = name[: -len(_FINAL)]
             yield name, weight
-        yield from self._ple_constant_tensors()
+        if not self.is_draft:  # the draft has no PLE layer (config.ple_layer_ids = [])
+            yield from self._ple_constant_tensors()
