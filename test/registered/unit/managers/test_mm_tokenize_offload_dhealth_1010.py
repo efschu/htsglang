@@ -8,9 +8,12 @@ probes timed out (8 s each) and the front stopped the healthy group (W17).
 
 THE MODEL OF THE STALL. A ``time.sleep`` inside ``process_and_combine_mm_data``.
 That is faithful because the GIL probe (job 1ab4cd30, gil_probe.py) measured
-every step of that chain as GIL-releasing on the CPU (worst loop lag 6 ms with
-the step in a thread) -- what stretched 0.6 s of CPU work to 41 s on the metal
-is a wait outside the interpreter, which ``time.sleep`` is too.
+every step of that chain as GIL-releasing on the CPU (max loop lag per step
+with the step in a thread: 6.2 ms PIL decode, 5.5 ms HF processor, 0.4 ms
+sha256, 0.4 ms shm wrap; 2.7 ms for the whole process_and_combine chain; table
+in ``mm_tokenize_offload``), and the metal (boot jzmxnp) showed the 22-33 s as
+kernel time (THP compaction, swap: stime >95 %) -- a wait outside the
+interpreter, which ``time.sleep`` is too.
 
 Red on 86ff356d0d (the module does not exist; ``test_off_*`` documents the
 in-loop lag the base has), green with the offload.
