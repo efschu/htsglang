@@ -230,5 +230,35 @@ class TestDispatchOrder(CustomTestCase):
         self.assertEqual(sent, ["T"])
 
 
+class TestInstrumentLines(CustomTestCase):
+    """(I) The lines that are to prove or refute the memory-stall suspicion at the metal."""
+
+    def test_mm_tokenize_line_carries_phases_noted_in_the_worker(self):
+        """The worker gets a COPY of the context: the stats must be the same object, or every phase
+        noted off the loop (queue, HF processor, hash, shm wrap) would print -1."""
+        proc = _make_proc(0.0)
+        with mock.patch.object(mto, "MM_TOKENIZE_REPORT_S", 0.0), self.assertLogs(
+            mto.logger, level="INFO"
+        ) as logs:
+            asyncio.run(_tokenize_under_ticker(proc))
+        line = next(m for m in logs.output if "PDFLIP-MM-TOKENIZE rid=img-1 " in m)
+        self.assertIn("offloaded=1", line)
+        self.assertNotIn("queue_ms=-1", line)  # noted on the worker thread
+        self.assertNotIn("load_ms=-1", line)  # noted on the loop
+        self.assertIn("pixels=0", line)  # the stub's image is no PIL image
+
+    def test_loop_lag_sampler_reports_a_stall(self):
+        async def scenario():
+            task = asyncio.create_task(mto.loop_lag_sampler(period_s=0.01, report_s=0.05))
+            await asyncio.sleep(0.03)
+            time.sleep(0.2)  # the loop stands
+            await asyncio.sleep(0.05)
+            task.cancel()
+
+        with self.assertLogs(mto.logger, level="INFO") as logs:
+            asyncio.run(scenario())
+        self.assertTrue(any("TOKENIZER-LOOP-LAG max_ms=" in m for m in logs.output), logs.output)
+
+
 if __name__ == "__main__":
     unittest.main()

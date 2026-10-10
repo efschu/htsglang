@@ -6,6 +6,7 @@ import dataclasses
 import multiprocessing as mp
 import os
 import re
+import time
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
@@ -14,6 +15,7 @@ import torch
 from PIL import Image
 from transformers import BaseImageProcessor
 
+from flliper.srt.managers import mm_tokenize_offload
 from flliper.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -1452,6 +1454,7 @@ class BaseMultimodalProcessor(ABC):
         input_ids = None
         # Handle raw items (need processing)
         if raw_images or raw_audios or raw_videos:
+            t_process = time.perf_counter()
             collected_items, input_ids, ret = self._process_and_collect_mm_items(
                 input_text=base_output.input_text,
                 images=raw_images,
@@ -1459,6 +1462,7 @@ class BaseMultimodalProcessor(ABC):
                 videos=raw_videos,
                 **kwargs,
             )
+            mm_tokenize_offload.note(process_ms=(time.perf_counter() - t_process) * 1000)
             all_collected_items = collected_items
 
             # When FLLIPER_MM_AVOID_RETOKENIZE is on, keep the user's exact tokens to avoid retokenize drift.
@@ -1564,12 +1568,14 @@ class BaseMultimodalProcessor(ABC):
 
         all_collected_items = get_new_expanded_mm_items(all_collected_items)
 
+        t_hash = time.perf_counter()
         for item in all_collected_items:
             if item.format in (
                 MultimodalInputFormat.PROCESSOR_OUTPUT,
                 MultimodalInputFormat.PRECOMPUTED_EMBEDDING,
             ):
                 item.set_pad_value()
+        mm_tokenize_offload.note(hash_ms=(time.perf_counter() - t_hash) * 1000)
 
         # Task #58: THE TRANSIENT VISION STAGE RUNS HERE, or not at all.
         #

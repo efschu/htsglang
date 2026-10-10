@@ -85,7 +85,7 @@ from flliper.srt.managers.io_struct import (
 )
 from flliper.srt.managers.kv_session_offload import SPILL_CLASSES
 from flliper.srt.managers.load_snapshot import create_load_snapshot_reader
-from flliper.srt.managers.mm_tokenize_offload import MmDispatchOrder
+from flliper.srt.managers.mm_tokenize_offload import MmDispatchOrder, loop_lag_sampler
 from flliper.srt.managers.mm_utils import TensorTransportMode, wrap_shm_features
 from flliper.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from flliper.srt.multimodal.lane_support import image_requests_unsupported_reason
@@ -2114,6 +2114,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.asyncio_tasks.add(
             loop.create_task(print_exception_wrapper(self.sigterm_watchdog))
         )
+        # D-HEALTH (I): TOKENIZER-LOOP-LAG -- a late wake-up of the loop that serves /health.
+        self.asyncio_tasks.add(loop.create_task(loop_lag_sampler()))
 
     async def handle_loop(self):
         """The event loop that handles requests"""

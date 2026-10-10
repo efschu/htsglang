@@ -56,9 +56,13 @@ import contextvars
 import functools
 import logging
 import threading
+import time
 from typing import Any, AsyncIterator, Callable, Deque, Optional, Tuple
 
+import msgspec
+
 from flliper.srt.constants import HEALTH_CHECK_RID_PREFIX
+from flliper.srt.pdflip import host_mem_probe as _hmp
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +74,72 @@ _OFFLOAD: contextvars.ContextVar[bool] = contextvars.ContextVar(
 
 _EXECUTOR: Optional[concurrent.futures.ThreadPoolExecutor] = None
 _EXECUTOR_LOCK = threading.Lock()
+
+#: (I) a multimodal request slower than this prints its PDFLIP-MM-TOKENIZE line at INFO.
+MM_TOKENIZE_REPORT_S = 1.0
+#: (I) TOKENIZER-LOOP-LAG: the sampler's period and the lag that is reported.
+LOOP_LAG_PERIOD_S = 0.5
+LOOP_LAG_REPORT_S = 2.0
+
+
+class MmTokenizeStats(msgspec.Struct):
+    """(I) Phase times of one multimodal request in the tokenizer, for the PDFLIP-MM-TOKENIZE line.
+
+    Shared by reference with the worker thread (the ContextVar copy carries the
+    same object), so the phases noted there arrive here. -1 = phase not run.
+    """
+
+    rid: str
+    offloaded: bool
+    t0: float
+    ru0: Tuple[float, float, int, int, int]
+    vm0: dict
+    img_tokens: int = -1
+    pixels: int = -1
+    load_ms: float = -1.0
+    queue_ms: float = -1.0
+    process_ms: float = -1.0
+    hash_ms: float = -1.0
+    mrope_ms: float = -1.0
+    shm_wrap_ms: float = -1.0
+    send_ms: float = -1.0
+
+    @classmethod
+    def start(cls, *, rid: Any, offloaded: bool) -> "MmTokenizeStats":
+        return cls(rid=str(rid), offloaded=offloaded, t0=time.perf_counter(),
+                   ru0=_hmp.rusage_self(), vm0=_hmp.read_vmstat())
+
+    def report(self) -> None:
+        total_s = time.perf_counter() - self.t0
+        if total_s <= MM_TOKENIZE_REPORT_S:
+            return
+        ru1 = _hmp.rusage_self()
+        vm = _hmp.vmstat_delta(self.vm0, _hmp.read_vmstat())
+        logger.info(
+            "PDFLIP-MM-TOKENIZE rid=%s img_tokens=%d pixels=%d load_ms=%.0f queue_ms=%.0f process_ms=%.0f "
+            "hash_ms=%.0f mrope_ms=%.0f shm_wrap_ms=%.0f send_ms=%.0f total_ms=%.0f utime_ms=%.0f "
+            "stime_ms=%.0f minflt=%d majflt=%d nivcsw=%d compact_stall=%d pswpin=%d pswpout=%d "
+            "pgmajfault=%d offloaded=%d (process-wide rusage/vmstat deltas over the request)",
+            self.rid, self.img_tokens, self.pixels, self.load_ms, self.queue_ms, self.process_ms,
+            self.hash_ms, self.mrope_ms, self.shm_wrap_ms, self.send_ms, total_s * 1000,
+            (ru1[0] - self.ru0[0]) * 1000, (ru1[1] - self.ru0[1]) * 1000, ru1[2] - self.ru0[2],
+            ru1[3] - self.ru0[3], ru1[4] - self.ru0[4], vm["compact_stall"], vm["pswpin"],
+            vm["pswpout"], vm["pgmajfault"], int(self.offloaded),
+        )
+
+
+_STATS: contextvars.ContextVar[Optional[MmTokenizeStats]] = contextvars.ContextVar(
+    "mm_tokenize_stats", default=None
+)
+
+
+def note(**phases: Any) -> None:
+    """(I) Record phase values on this request's stats; a no-op outside a multimodal request."""
+    stats = _STATS.get()
+    if stats is None:
+        return
+    for name, value in phases.items():
+        setattr(stats, name, value)
 
 
 def requested() -> bool:
@@ -105,8 +175,43 @@ def _executor() -> concurrent.futures.ThreadPoolExecutor:
 async def run_offloaded(fn: Callable[..., Any], /, *args, **kwargs) -> Any:
     """Run ``fn`` on the single worker thread with a copy of this context."""
     ctx = contextvars.copy_context()
-    call = functools.partial(ctx.run, fn, *args, **kwargs)
-    return await asyncio.get_running_loop().run_in_executor(_executor(), call)
+    t_submit = time.perf_counter()
+
+    def call():
+        stats = _STATS.get()
+        if stats is not None:  # (I) summed over the request's offloaded steps
+            stats.queue_ms = max(stats.queue_ms, 0.0) + (time.perf_counter() - t_submit) * 1000
+        return fn(*args, **kwargs)
+
+    return await asyncio.get_running_loop().run_in_executor(
+        _executor(), functools.partial(ctx.run, call)
+    )
+
+
+async def loop_lag_sampler(
+    *, period_s: float = LOOP_LAG_PERIOD_S, report_s: float = LOOP_LAG_REPORT_S
+) -> None:
+    """(I) TOKENIZER-LOOP-LAG: report every wake-up of this task later than ``report_s``.
+
+    The loop that serves /health and /metrics; a late wake-up is the time it
+    answered nothing. Log only, never raises.
+    """
+    loop = asyncio.get_running_loop()
+    while True:
+        t0 = loop.time()
+        await asyncio.sleep(period_s)
+        try:
+            lag = loop.time() - t0 - period_s
+            if lag > report_s:
+                began = time.time() - lag - period_s
+                logger.info(
+                    "TOKENIZER-LOOP-LAG max_ms=%.0f at=%s.%03d (the tokenizer loop, which serves "
+                    "/health and /metrics, answered nothing for this long)",
+                    lag * 1000, time.strftime("%H:%M:%S", time.localtime(began)),
+                    int((began % 1) * 1000),
+                )
+        except Exception:  # noqa: BLE001 -- an instrument never stops the loop
+            pass
 
 
 class _Turn:
@@ -138,8 +243,12 @@ class _Turn:
         if self._own is not None:
             from flliper.srt.managers.mm_utils import wrap_shm_features
 
+            t0 = time.perf_counter()
             tokenized_obj = await run_offloaded(wrap_shm_features, tokenized_obj)
+            note(shm_wrap_ms=(time.perf_counter() - t0) * 1000)
+        t0 = time.perf_counter()
         send(tokenized_obj)
+        note(send_ms=(time.perf_counter() - t0) * 1000)
 
 
 class MmDispatchOrder:
@@ -163,16 +272,26 @@ class MmDispatchOrder:
         if exempt:
             yield _Turn(order=self, own=None, before=())
             return
-        if not (is_mm and offload_permitted()):
-            yield _Turn(order=self, own=None, before=None)
-            return
-        own = asyncio.Event()
-        before = tuple(self._open)
-        self._open.append(own)
-        token = _OFFLOAD.set(True)
+        offload = bool(is_mm) and offload_permitted()
+        own: Optional[asyncio.Event] = None
+        before: Optional[Tuple[asyncio.Event, ...]] = None
+        if offload:
+            own = asyncio.Event()
+            before = tuple(self._open)
+            self._open.append(own)
+        stats = MmTokenizeStats.start(rid=rid, offloaded=offload) if is_mm else None
+        offload_token = _OFFLOAD.set(offload)
+        stats_token = _STATS.set(stats)
         try:
             yield _Turn(order=self, own=own, before=before)
         finally:
-            _OFFLOAD.reset(token)
-            self._open.remove(own)
-            own.set()
+            _STATS.reset(stats_token)
+            _OFFLOAD.reset(offload_token)
+            if own is not None:
+                self._open.remove(own)
+                own.set()
+            if stats is not None:
+                try:
+                    stats.report()
+                except Exception:  # noqa: BLE001 -- an instrument never fails a request
+                    pass
