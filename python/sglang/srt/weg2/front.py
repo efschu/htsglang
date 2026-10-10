@@ -2969,7 +2969,7 @@ def health_is_serving_fact(http_200: bool, process_alive: bool) -> bool:
 #: failed at 15:55:10 and 15:55:24, W17 stopped a healthy group, although the stage then answered W105b by
 #: name). The front KNOWS it routed an image to P, exactly as it knows ``flipping``: a silent /health of P
 #: behind such a request is not a failure for this long; past it the streak counts again.
-VISION_HEALTH_GRACE_S = 120.0
+VISION_HEALTH_GRACE_S = 0.0  # TEST-ONLY (jzmxnp): Grace aus, Beweis dass D-Health-Fix und forward_ct-Busy genuegen
 
 
 def vision_inflight_age(inflight: Mapping[int, float], now: float) -> Optional[float]:
