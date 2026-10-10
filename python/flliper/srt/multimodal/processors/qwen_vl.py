@@ -12,6 +12,7 @@ from torchvision.transforms import InterpolationMode
 
 from flliper.srt.environ import envs
 from flliper.srt.layers.rotary_embedding import MRotaryEmbedding
+from flliper.srt.managers import mm_tokenize_offload
 from flliper.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -732,6 +733,7 @@ class QwenVLImageProcessor(FlliperBaseProcessor):
         preprocess_time = time.perf_counter()
 
         # NOTE: for qwen3-vl, video_meta need to be passed in, since do_sample_frames is already done in preprocess_video
+        combine_kwargs = {}
         if self.hf_config.model_type in (
             "qwen3_vl",
             "qwen3_vl_moe",
@@ -740,15 +742,18 @@ class QwenVLImageProcessor(FlliperBaseProcessor):
             "qwen4_exp",
             "intern_s2_preview",
         ):
-            mm_items, input_ids, ret = self.process_and_combine_mm_data(
+            combine_kwargs = dict(video_metadata=video_metadata, do_sample_frames=False)
+        if mm_tokenize_offload.requested():
+            # D-HEALTH: the HF processor + sha256 off the loop that serves /health.
+            mm_items, input_ids, ret = await mm_tokenize_offload.run_offloaded(
+                self.offload_twin().process_and_combine_mm_data,
                 base_output,
                 self.mm_tokens,
-                video_metadata=video_metadata,
-                do_sample_frames=False,
+                **combine_kwargs,
             )
         else:
             mm_items, input_ids, ret = self.process_and_combine_mm_data(
-                base_output, self.mm_tokens
+                base_output, self.mm_tokens, **combine_kwargs
             )
 
         audio_feature_lengths = None

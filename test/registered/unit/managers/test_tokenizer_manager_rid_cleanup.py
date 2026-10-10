@@ -419,6 +419,7 @@ def _make_tm_for_generate() -> TokenizerManager:
     tm.model_update_lock = Mock()
     tm.model_update_lock.reader_lock = _DummyAsyncCM()
     tm._validate_and_resolve_lora = AsyncMock(return_value=None)
+    tm.init_mm_dispatch_order()
     return tm
 
 
@@ -431,6 +432,7 @@ def _make_generate_obj(rid, is_single):
     obj.external_trace_header = None
     obj.bootstrap_room = None
     obj.normalize_batch_and_arguments = Mock()
+    obj.contains_mm_input = Mock(return_value=False)
     if not is_single:
         obj.__getitem__.side_effect = lambda i: Mock()
     return obj

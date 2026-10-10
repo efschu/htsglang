@@ -1,0 +1,234 @@
+"""D-HEALTH (10.10.): image preprocessing blocked the tokenizer loop that serves /health.
+
+THE BUG (boot dkr27bnvfp4dualvwweightsbar1fs10100032, D group). A 4096x4096
+image (16384 image tokens) was tokenized synchronously on the tokenizer
+process's asyncio loop -- HF image processor, sha256 over pixel_values, shm
+copy. On the metal that took ~41 s, the loop answered nothing, two /health
+probes timed out (8 s each) and the front stopped the healthy group (W17).
+
+THE MODEL OF THE STALL. A ``time.sleep`` inside ``process_and_combine_mm_data``.
+That is faithful because the GIL probe (job 1ab4cd30, gil_probe.py) measured
+every step of that chain as GIL-releasing on the CPU (worst loop lag 6 ms with
+the step in a thread) -- what stretched 0.6 s of CPU work to 41 s on the metal
+is a wait outside the interpreter, which ``time.sleep`` is too.
+
+Red on 86ff356d0d (the module does not exist; ``test_off_*`` documents the
+in-loop lag the base has), green with the offload.
+"""
+
+import asyncio
+import threading
+import time
+import unittest
+from types import SimpleNamespace
+from unittest import mock
+
+import torch
+
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+
+maybe_stub_sgl_kernel()
+
+from flliper.srt.constants import HEALTH_CHECK_RID_PREFIX
+from flliper.srt.managers import mm_tokenize_offload as mto
+from flliper.srt.multimodal.processors.base_processor import (
+    BaseMultiModalProcessorOutput,
+)
+from flliper.srt.multimodal.processors.qwen_vl import QwenVLImageProcessor
+from flliper.srt.pdflip import vision_stage_service as vss
+
+register_cpu_ci(est_time=20, suite="base-a-test-cpu")
+
+STALL_S = 5.5  # longer than the front's health period (5 s)
+HEALTH_PERIOD_S = 5.0
+TICK_S = 0.01
+
+
+class _StallingQwenVL(QwenVLImageProcessor):
+    """The real ``process_mm_data_async``; the CPU chain replaced by a GIL-free stall."""
+
+    def process_and_combine_mm_data(self, base_output, mm_tokens, **kwargs):
+        self.seen.append(
+            dict(
+                thread=threading.current_thread().name,
+                processor=self._processor,
+                tokenizer=self._tokenizer,
+                vision_rid=vss._REQUEST_RID.get(),
+            )
+        )
+        time.sleep(self.stall_s)
+        ids = torch.tensor([1, 2, 3], dtype=torch.long)
+        ret = {
+            "mrope_positions": torch.zeros(3, 3, dtype=torch.long),
+            "mrope_position_delta": torch.tensor([[0]]),
+        }
+        return [], ids, ret
+
+
+def _make_proc(stall_s: float) -> _StallingQwenVL:
+    proc = _StallingQwenVL.__new__(_StallingQwenVL)
+    proc.hf_config = SimpleNamespace(model_type="qwen3_5")
+    proc.model_type = "qwen3_5"
+    proc.mm_tokens = SimpleNamespace(image_token_id=7, video_token_id=8, audio_token_id=None)
+    proc.vision_start_token_id = 5
+    proc.vision_end_token_id = 6
+    hf = SimpleNamespace(tokenizer=SimpleNamespace(name="shared-rust-tokenizer"))
+    proc._processor = hf
+    proc._tokenizer = hf.tokenizer
+    proc._offload_twin = None
+    proc.seen = []
+    proc.stall_s = stall_s
+
+    async def load_mm_data(**kwargs):
+        return BaseMultiModalProcessorOutput(input_text="<img>", images=["decoded"])
+
+    proc.load_mm_data = load_mm_data
+    return proc
+
+
+def _req():
+    return SimpleNamespace(rid="img-1", video_data=None, audio_data=None)
+
+
+async def _tokenize_under_ticker(proc, rid="img-1"):
+    """Worst loop wake-up lag while one image request tokenizes in its dispatch section."""
+    order = mto.MmDispatchOrder()
+    stop = asyncio.Event()
+    worst = [0.0]
+
+    async def ticker():
+        loop = asyncio.get_running_loop()
+        while not stop.is_set():
+            t0 = loop.time()
+            await asyncio.sleep(TICK_S)
+            worst[0] = max(worst[0], loop.time() - t0 - TICK_S)
+
+    task = asyncio.create_task(ticker())
+    await asyncio.sleep(0.05)
+    async with order.request(rid=rid, is_mm=True) as turn:
+        out = await proc.process_mm_data_async(
+            image_data=["x"], input_text="<img>", request_obj=_req()
+        )
+    stop.set()
+    await task
+    return worst[0], out, turn
+
+
+class TestLoopAnswersDuringImagePreprocessing(CustomTestCase):
+    def test_loop_lag_stays_below_health_period(self):
+        proc = _make_proc(STALL_S)
+        lag, out, turn = asyncio.run(_tokenize_under_ticker(proc))
+        self.assertTrue(turn.offloaded)
+        self.assertLess(lag, 1.0, f"loop stood {lag:.2f} s during the image")
+        self.assertLess(lag, HEALTH_PERIOD_S)
+        self.assertEqual(out.input_ids, [1, 2, 3])
+
+    def test_off_is_the_old_path(self):
+        """Offload not permitted = the base: the loop stands for the whole chain."""
+        proc = _make_proc(STALL_S)
+        with mock.patch.object(mto, "offload_permitted", return_value=False):
+            lag, _, turn = asyncio.run(_tokenize_under_ticker(proc))
+        self.assertFalse(turn.offloaded)
+        self.assertGreaterEqual(lag, STALL_S * 0.9)
+        self.assertEqual(proc.seen[0]["thread"], threading.main_thread().name)
+
+
+class TestOffloadedCallIsolation(CustomTestCase):
+    def test_private_processor_and_context_in_the_worker(self):
+        """Two threads on one fast tokenizer raise 'Already borrowed' (tokenizers
+        0.22.2, reproduced): the worker must run on a private HF processor. The
+        transient vision stage's rid (a ContextVar) must reach the worker."""
+        proc = _make_proc(0.0)
+
+        async def go():
+            vss.set_request_rid("img-ctx")
+            return await _tokenize_under_ticker(proc)
+
+        asyncio.run(go())
+        seen = proc.seen[0]
+        self.assertNotEqual(seen["thread"], threading.main_thread().name)
+        self.assertIsNot(seen["processor"], proc._processor)
+        self.assertIsNot(seen["tokenizer"], proc._tokenizer)
+        self.assertEqual(seen["vision_rid"], "img-ctx")
+
+    def test_tower_in_process_stays_on_the_loop(self):
+        """A vision tower service runs inside process_and_combine_mm_data: not offloaded."""
+        proc = _make_proc(0.0)
+        with mock.patch.object(vss, "installed", return_value=object()):
+            _, _, turn = asyncio.run(_tokenize_under_ticker(proc))
+        self.assertFalse(turn.offloaded)
+        self.assertEqual(proc.seen[0]["thread"], threading.main_thread().name)
+
+
+class TestDispatchOrder(CustomTestCase):
+    """Before: nothing reached the scheduler while an image tokenized, and the
+    image went first. Kept: FIFO behind open image requests; /health exempt."""
+
+    def _run(self, scenario):
+        with mock.patch(
+            "flliper.srt.managers.mm_utils.wrap_shm_features", side_effect=lambda o: o
+        ), mock.patch.object(mto, "offload_permitted", return_value=True):
+            return asyncio.run(scenario())
+
+    def test_fifo_behind_open_image_and_health_exempt(self):
+        sent = []
+        release_a = asyncio.Event
+
+        async def scenario():
+            order = mto.MmDispatchOrder()
+            gate = release_a()
+
+            async def req(name, rid, is_mm, wait=None):
+                async with order.request(rid=rid, is_mm=is_mm) as turn:
+                    if wait is not None:
+                        await wait.wait()
+                    await turn.dispatch(sent.append, name)
+
+            a = asyncio.create_task(req("A", "a", True, gate))
+            await asyncio.sleep(0)
+            others = [
+                asyncio.create_task(req("T", "t", False)),
+                asyncio.create_task(req("H", f"{HEALTH_CHECK_RID_PREFIX}_x", False)),
+                asyncio.create_task(req("B", "b", True)),
+            ]
+            for _ in range(5):
+                await asyncio.sleep(0)
+            before_release = list(sent)
+            gate.set()
+            await asyncio.wait_for(asyncio.gather(a, *others), 5)
+            return before_release
+
+        before_release = self._run(scenario)
+        self.assertEqual(before_release, ["H"])
+        self.assertLess(sent.index("A"), sent.index("T"))
+        self.assertLess(sent.index("A"), sent.index("B"))
+
+    def test_failed_image_request_releases_the_order(self):
+        sent = []
+
+        async def scenario():
+            order = mto.MmDispatchOrder()
+
+            async def failing():
+                async with order.request(rid="a", is_mm=True):
+                    await asyncio.sleep(0.01)
+                    raise ValueError("image refused")
+
+            async def text():
+                async with order.request(rid="t", is_mm=False) as turn:
+                    await turn.dispatch(sent.append, "T")
+
+            f = asyncio.create_task(failing())
+            await asyncio.sleep(0)
+            t = asyncio.create_task(text())
+            with self.assertRaises(ValueError):
+                await f
+            await asyncio.wait_for(t, 2)
+
+        self._run(scenario)
+        self.assertEqual(sent, ["T"])
+
+
+if __name__ == "__main__":
+    unittest.main()
