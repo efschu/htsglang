@@ -1813,6 +1813,17 @@ class FusedMoE(torch.nn.Module):
                 and self._gguf_moe_offload_eligible()
             )
             if on:
+                # G4: the streaming door tiers into PRIVATE pools; a boot with a shared store, a Karte or seat
+                # rows needs the Platztausch door, which stages per layer at materialization. One door per
+                # layer: this latch is the only place the two meet.
+                from sglang.srt.layers.moe import gguf_presplit as _gp
+
+                if _gp.door_wanted(self):
+                    on = False
+                    # materialization runs after the complete load pass: the host peak is the rank's whole
+                    # owned expert set, not this layer's (named once, from the header)
+                    _gp.log_host_peak_once(self)
+            if on:
                 self._gguf_stream_stagers = {}
             # Published last: a fast-path reader that sees True must find the
             # registry already there.
@@ -3284,6 +3295,18 @@ class FusedMoE(torch.nn.Module):
 
         self._drain_gguf_stream_stagers()
 
+        if not self._gguf_moe_offload_eligible():
+            # G4 (W120 for GGUF): a Karte that gives this layer a Platztausch buffer, and a layer the GGUF half
+            # will not stage (a ggml type without a MoE kernel, a fraction >= 1.0, ...) -- refuse here, at
+            # load and BEFORE the full stack is built, instead of publishing a plain stack the other group
+            # has no counterpart for (x100: W106 five minutes after READY). No-op without a nested Karte and
+            # for the excluded draft.
+            from sglang.srt.layers.moe import gguf_presplit as _gp
+
+            _gp.refuse_unstaged_platztausch(
+                self, why="the GGUF offload half does not stage this layer"
+            )
+
         staged_attrs = []
         staged_plan = None
         for name, param in list(self.named_parameters()):
@@ -3318,6 +3341,20 @@ class FusedMoE(torch.nn.Module):
                     if source is None:
                         continue
                     count, row_shape, dtype, get, drop = source
+
+                    # G4: a boot with a shared expert store, a Version-2 Karte or seat rows is served by the
+                    # Platztausch door (the same presplit the Marlin schemes run, minus the repack); every
+                    # other boot takes the code below unchanged.
+                    from sglang.srt.layers.moe import gguf_presplit as _gp
+
+                    if _gp.door_wanted(self):
+                        g4_plan = _gp.presplit_gguf_param(self, name, param, source)
+                        if g4_plan is not None:
+                            staged_attrs.append(name)
+                            staged_plan = g4_plan
+                            param.expert_data_map = {}
+                            expert_weights.clear()
+                            continue
 
                     plan = (
                         plan_load_time_staging(

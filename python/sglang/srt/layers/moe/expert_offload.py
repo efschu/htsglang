@@ -6936,6 +6936,61 @@ def _layer_expert_window(layer):
     return None                   # EP-Slice
 
 
+#: G4 (GGUF Platztausch): where the zero PAD expert of a layer sits.  ``PAD_LEAD`` is the generic
+#: expert-dim shard (local 0), ``PAD_TRAIL`` is GGUF's own always-on shard (#82: local ``n_local``, the
+#: LAST row), ``None`` means the layer has no pad.
+PAD_LEAD = "lead"
+PAD_TRAIL = "trail"
+
+
+def _gguf_trailing_pad_window(layer):
+    """``(lo, hi)`` when this layer is GGUF's OWN expert-dim shard (trailing pad), else ``None``.
+
+    Such a layer keeps ``num_local_experts == num_experts`` (the construction does not shrink it), so
+    :func:`_layer_expert_window` would call it an unsharded stage with ``lo == 0`` -- right on rank 0 by
+    accident, wrong everywhere else.  Nothing asked before G4 because no GGUF door reached the Karte or the
+    store.  The generic shard (leading pad) is NOT this case: its window is ``_layer_expert_window``'s.
+    """
+    if not getattr(layer, "_gguf_expert_shard", False):
+        return None
+    if getattr(layer, "_expert_shard_generic", False):
+        return None
+    rng = getattr(layer, "_gguf_expert_range", None)
+    if rng is None:
+        return None
+    return int(rng[0]), int(rng[1])
+
+
+def _layer_expert_window_ex(layer):
+    """``(lo, pad_pos)`` -- :func:`_layer_expert_window` with the pad POSITION instead of a bool.
+
+    ``pad_pos`` is ``PAD_LEAD`` / ``PAD_TRAIL`` / ``None``.  For every layer that is not GGUF's own shard
+    this is ``_layer_expert_window`` (``True`` -> ``PAD_LEAD``, ``False`` -> ``None``) field for field, so the
+    Marlin / compressed-tensors doors read what they always read.  ``None`` = no global window (EP slice).
+    """
+    gw = _gguf_trailing_pad_window(layer)
+    if gw is not None and int(getattr(layer, "num_experts", 0) or 0) > 0:
+        return gw[0], PAD_TRAIL
+    w = _layer_expert_window(layer)
+    if w is None:
+        return None
+    return w[0], (PAD_LEAD if w[1] else None)
+
+
+def _pad_local_index(pad_pos, num_local):
+    """The local index of the pad row for ``pad_pos`` in a layer of ``num_local`` local rows, else ``None``."""
+    if pad_pos == PAD_LEAD:
+        return 0
+    if pad_pos == PAD_TRAIL:
+        return int(num_local) - 1
+    return None
+
+
+def _local_of_global(g, lo, pad_pos):
+    """global expert id -> local row (the pad shifts every id by one only when it LEADS)."""
+    return int(g) - int(lo) + (1 if pad_pos == PAD_LEAD else 0)
+
+
 def _karten_residenz_lokal(layer, num_local):
     """Die LOKALEN Ids, die DIE KARTE fuer diesen Rang resident nennt.
 
@@ -6960,7 +7015,7 @@ def _karten_residenz_lokal(layer, num_local):
     karte = _es.expert_map()
     if karte is None:
         return None
-    fenster = _layer_expert_window(layer)
+    fenster = _layer_expert_window_ex(layer)
     if fenster is None:
         return None
     lo, pad = fenster
@@ -6975,7 +7030,7 @@ def _karten_residenz_lokal(layer, num_local):
     lokal = set()
     fremd = []
     for g in glob:
-        e = int(g) - int(lo) + (1 if pad else 0)
+        e = _local_of_global(g, lo, pad)
         if 0 <= e < int(num_local):
             lokal.add(e)
         else:
@@ -6983,7 +7038,7 @@ def _karten_residenz_lokal(layer, num_local):
     # Der Pad-Experte hat KEIN globales Gegenstueck (#82) und muss resident
     # bleiben, sonst faellt jeder fremde Top-k-Treffer in den Spill-Pool.
     if pad:
-        lokal.add(0)
+        lokal.add(_pad_local_index(pad, num_local))
     if not lokal:
         return None
     # Ids AUSSERHALB des eigenen Fensters sind kein Fehler: die Karte fuehrt
@@ -7015,7 +7070,7 @@ def _karten_layout_lokal(layer, num_local):
     karte = _es.expert_map()
     if not _em.is_nested(karte):
         return None
-    fenster = _layer_expert_window(layer)
+    fenster = _layer_expert_window_ex(layer)
     layer_id = getattr(layer, "layer_id", None)
     if fenster is None or layer_id is None:
         return None
@@ -7028,7 +7083,7 @@ def _karten_layout_lokal(layer, num_local):
     praefix, extra, _ = lay
 
     def lokal(g):
-        return int(g) - int(lo) + (1 if pad else 0)
+        return _local_of_global(g, lo, pad)
 
     pre_l = [lokal(g) for g in praefix]
     ext_l = [lokal(g) for g in extra]
@@ -7040,7 +7095,7 @@ def _karten_layout_lokal(layer, num_local):
             f"pad={pad}, E={num_local}) -- Karte und Expertenfenster "
             f"beschreiben nicht denselben Rang"
         )
-    reihenfolge = pre_l + ([0] if pad else []) + ext_l
+    reihenfolge = pre_l + ([_pad_local_index(pad, num_local)] if pad else []) + ext_l
     refill = []
     zeile = len(pre_l)
     if pad:
@@ -7058,7 +7113,8 @@ def _karten_layout_lokal(layer, num_local):
     return tuple(reihenfolge), len(pre_l), tuple(refill)
 
 
-def _refuse_unbuilt_platztausch_buffer(layer, *, frac: float, why: str) -> None:
+def _refuse_unbuilt_platztausch_buffer(layer, *, frac: float, why: str,
+                                       num_local=None) -> None:
     """W120 at LOAD: the Version-2 Karte gives this layer a Platztausch
     layout, but this rank is about to keep the plain [E] stack instead.
 
@@ -7079,7 +7135,9 @@ def _refuse_unbuilt_platztausch_buffer(layer, *, frac: float, why: str) -> None:
 
     if not _em.is_nested(_es.expert_map()) or layer._moe_offload_excluded:
         return
-    num_local = int(layer.num_local_experts)
+    # G4: a GGUF expert-dim shard counts its LOCAL rows (owned range + trailing pad) itself;
+    # ``layer.num_local_experts`` is the global count there. Every other caller passes nothing.
+    num_local = int(layer.num_local_experts if num_local is None else num_local)
     if num_local <= 0 or _karten_layout_lokal(layer, num_local) is None:
         return
     top = (num_local - MIN_SCRATCH_ROWS) / num_local
@@ -8445,7 +8503,14 @@ def _expert_store_rows_for(layer, plan):
             "(layer.num_experts) and found none"
         )
     num_local = int(getattr(layer, "num_local_experts", 0) or 0)
-    if getattr(layer, "_expert_shard_generic", False):
+    _gguf_win = _gguf_trailing_pad_window(layer)
+    if _gguf_win is not None:
+        # G4: GGUF's own expert-dim shard. The zero pad expert sits at the END
+        # (local n_local, a resident: ``plan_load_time_staging`` gets it as a
+        # pinned id) so it is never a spill id and never has a store row, and
+        # local i < n_local is global lo + i -- exactly ``pad=False``'s rule.
+        lo, pad = _gguf_win[0], False
+    elif getattr(layer, "_expert_shard_generic", False):
         rng = getattr(layer, "_gguf_expert_range", None)
         if rng is None:
             return None
@@ -8906,6 +8971,77 @@ def assert_h2d_cut_covers(layer, rows, *, what: str) -> None:
             f"SGLANG_OPT_LOAD_H2D_READ_ROWS=0 and report the layer")
 
 
+def _resolve_presplit_plan(layer, E, frac, cold_shard=None, fallback_pinned=None):
+    """``(plan, order, n_praefix)`` -- the residency plan of a load-time presplit.
+
+    THE ONE PLACE the Karte (Platztausch layout, then the Karte's resident set), the hotset and the static
+    rule are asked, in that order, for BOTH presplit doors: the Marlin repack door
+    (``presplit_expert_offload_after_repack``) and the GGUF door (``gguf_presplit``, G4). Two doors that each
+    re-derived it would be the "zwei Rechnungen" class this file keeps paying for.
+
+    ``order`` / ``n_praefix`` are ``None`` unless a Version-2 Karte gave the layer a Platztausch layout; then
+    ``layer._moe_offload_exchange_rows`` / ``_moe_offload_refill_runs`` are published here, as ever.
+    ``fallback_pinned`` replaces the hotset in the LAST alternative (no Karte for this layer): the Marlin door
+    passes ``None`` (hotset, as before), the GGUF door passes its pad expert, which is what its pre-G4 door
+    pinned. ``plan`` is ``None`` when there is nothing to split (fraction >= 1.0, or the Karte pins every row).
+    """
+    _layout = _karten_layout_lokal(layer, int(E))
+    _order = None
+    _n_praefix = None
+    if _layout is not None:
+        _order, _n_praefix, _refill = _layout
+        _R_erwartet = resident_slot_count(int(E), frac)
+        if len(_order) != _R_erwartet:
+            raise RuntimeError(
+                f"Platztausch-Karte nennt {len(_order)} residente Zeilen fuer "
+                f"Layer {getattr(layer, 'layer_id', '?')} Rang "
+                f"{getattr(layer, 'moe_tp_rank', '?')} (Praefix {_n_praefix}, "
+                f"Pad+Extra {len(_refill)}), der Rang rechnet bei Fraction "
+                f"{frac} ueber {int(E)} Experten {_R_erwartet}. Die Karte "
+                f"zaehlt mit resident_slot_count(span+pad, f) -- weichen sie "
+                f"ab, wurde sie mit anderen Fractions gebaut als dieser Rang "
+                f"laeuft.")
+        layer._moe_offload_exchange_rows = int(_n_praefix)
+        layer._moe_offload_refill_runs = tuple(_refill_runs(_refill))
+        _karte_res = None
+    else:
+        _karte_res = _karten_residenz_lokal(layer, int(E))
+    if _order is not None:
+        _pinned = _order
+    elif _karte_res is not None:
+        _R_erwartet = resident_slot_count(int(E), frac)
+        if len(_karte_res) != _R_erwartet:
+            # KEIN Anpassen im Stillen. R bestimmt `buffer_slots` und damit
+            # jede VRAM-Zahl dieses Rangs (#439-Latch); waehlte ich hier
+            # einfach die Kartenzahl, waeren Plan und Budget wieder zwei
+            # Rechnungen -- genau die Klasse, die #160 gerade geschlossen
+            # hat. Die Karte und die Fraction muessen zusammenpassen, und
+            # wenn nicht, gehoert das VOR die erste Allokation.
+            raise RuntimeError(
+                f"#159: die KARTE nennt {len(_karte_res)} residente Experten "
+                f"fuer Layer {getattr(layer, 'layer_id', '?')} Rang "
+                f"{getattr(layer, 'moe_tp_rank', '?')}, die Fraction {frac} "
+                f"ueber {int(E)} Experten ergibt {_R_erwartet}. Beide "
+                f"beschreiben dieselbe Karte und muessen dieselbe Zahl "
+                f"meinen -- sonst stimmt das VRAM-Budget nicht zu dem, was "
+                f"wirklich resident wird. Pruefe --rank-moe-resident-fraction "
+                f"gegen die Fractions, mit denen die Karte gebaut wurde."
+            )
+        _pinned = _karte_res
+    elif fallback_pinned is not None:
+        _pinned = tuple(int(e) for e in fallback_pinned)
+    else:
+        _pinned = _hotset_local_ids(layer, int(E))
+    plan = plan_load_time_staging(
+        int(E),
+        fraction=frac,
+        cold_shard=cold_shard,
+        pinned_experts=_pinned,
+        resident_order=_order,
+    )
+    return plan, _order, _n_praefix
+
+
 def presplit_expert_offload_after_repack(
     layer, cold_shard: Optional[ColdShardContext] = None
 ) -> None:  # pragma: no cover - CUDA
@@ -8979,57 +9115,8 @@ def presplit_expert_offload_after_repack(
     # PLATZTAUSCH (Version-2-Karte, Nutzer-Entscheid 22.09.): Menge UND
     # Reihenfolge kommen aus der Karte. Der Praefix ist, was der Austausch
     # bewegt; dahinter Pad und Extra, die der Wake aus dem Store holt.
-    _layout = _karten_layout_lokal(layer, int(E))
-    _order = None
-    _n_praefix = None
-    if _layout is not None:
-        _order, _n_praefix, _refill = _layout
-        _R_erwartet = resident_slot_count(int(E), frac)
-        if len(_order) != _R_erwartet:
-            raise RuntimeError(
-                f"Platztausch-Karte nennt {len(_order)} residente Zeilen fuer "
-                f"Layer {getattr(layer, 'layer_id', '?')} Rang "
-                f"{getattr(layer, 'moe_tp_rank', '?')} (Praefix {_n_praefix}, "
-                f"Pad+Extra {len(_refill)}), der Rang rechnet bei Fraction "
-                f"{frac} ueber {int(E)} Experten {_R_erwartet}. Die Karte "
-                f"zaehlt mit resident_slot_count(span+pad, f) -- weichen sie "
-                f"ab, wurde sie mit anderen Fractions gebaut als dieser Rang "
-                f"laeuft.")
-        layer._moe_offload_exchange_rows = int(_n_praefix)
-        layer._moe_offload_refill_runs = tuple(_refill_runs(_refill))
-        _karte_res = None
-    else:
-        _karte_res = _karten_residenz_lokal(layer, int(E))
-    if _order is not None:
-        _pinned = _order
-    elif _karte_res is not None:
-        _R_erwartet = resident_slot_count(int(E), frac)
-        if len(_karte_res) != _R_erwartet:
-            # KEIN Anpassen im Stillen. R bestimmt `buffer_slots` und damit
-            # jede VRAM-Zahl dieses Rangs (#439-Latch); waehlte ich hier
-            # einfach die Kartenzahl, waeren Plan und Budget wieder zwei
-            # Rechnungen -- genau die Klasse, die #160 gerade geschlossen
-            # hat. Die Karte und die Fraction muessen zusammenpassen, und
-            # wenn nicht, gehoert das VOR die erste Allokation.
-            raise RuntimeError(
-                f"#159: die KARTE nennt {len(_karte_res)} residente Experten "
-                f"fuer Layer {getattr(layer, 'layer_id', '?')} Rang "
-                f"{getattr(layer, 'moe_tp_rank', '?')}, die Fraction {frac} "
-                f"ueber {int(E)} Experten ergibt {_R_erwartet}. Beide "
-                f"beschreiben dieselbe Karte und muessen dieselbe Zahl "
-                f"meinen -- sonst stimmt das VRAM-Budget nicht zu dem, was "
-                f"wirklich resident wird. Pruefe --rank-moe-resident-fraction "
-                f"gegen die Fractions, mit denen die Karte gebaut wurde."
-            )
-        _pinned = _karte_res
-    else:
-        _pinned = _hotset_local_ids(layer, int(E))
-    plan = plan_load_time_staging(
-        int(E),
-        fraction=frac,
-        cold_shard=cold_shard,
-        pinned_experts=_pinned,
-        resident_order=_order,
+    plan, _order, _n_praefix = _resolve_presplit_plan(
+        layer, int(E), frac, cold_shard=cold_shard
     )
     if plan is None:
         if _order is not None:
