@@ -172,10 +172,10 @@ class TestSupplement(unittest.TestCase):
         self.assertIn("--pdflip-weight-source ring", span(xl, 711, 723))
         self.assertIn("def load_census", span(xl, 313, 316))
         self.assertIn("W64 PdFlipTpOperatingPointInfeasible: position", span(ll, 16986, 16992))
-        self.assertIn("W64-DUAL: no measured dual-share D log", span(ll, 17242, 17243))
-        self.assertIn("if mine and dual_layout:", span(ll, 17340, 17340))        # Override nur im Dual ...
-        self.assertIn("raise PdFlipLaunchRefused(mine[0]", span(ll, 17349, 17352))  # ... die Verweigerung gilt in jeder Form
-        self.assertIn("if not dual_layout or not str(refusal).startswith", span(ll, 17231, 17231))
+        self.assertIn("W64-DUAL: no measured dual-share D log", span(ll, 17244, 17245))
+        self.assertIn("if mine and dual_layout:", span(ll, 17342, 17342))        # Override nur im Dual ...
+        self.assertIn("raise PdFlipLaunchRefused(mine[0]", span(ll, 17351, 17354))  # ... die Verweigerung gilt in jeder Form
+        self.assertIn("if not dual_layout or not str(refusal).startswith", span(ll, 17233, 17233))
         for w in PV.SUPPLEMENT_CODES.values():
             for m in re.finditer(r"(\w+/)?[\w.]+\.py:(\d+)(?:-(\d+))?", w["quelle"]):
                 self.assertGreater(int(m.group(2)), 0)

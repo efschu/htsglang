@@ -939,3 +939,30 @@ counted in both spellings, the expected `EXTRA_CENV` list is found in either spe
 red on v2 and green on v3). **Not applied**: v3 goes in after v2, with the boot and the watcher stopped (hand-over list step 1).
 
 **Open after F0-K:** m2 (API field `weg2_seq_hash` has no alias for external clients), m3 (kit inventory numbers in 8.19 are the pre-F0-K ones), m4, m5, m6, m7, m8, m9, m10 of the acceptance report are not part of this round.
+
+## 8.21 F0-H round 3, the vision rebuild ported (10.10.2026, both lines)
+
+Heads before: `desk/flliper-27b-int-1009` @ a1c1235142, `desk/flliper-nf-int-1009` @ 2db4d5cedc. Heads after: `desk/flliper-27b-int-1010`, `desk/flliper-nf-int-1010` (SHAs: `git log` of the two branches).
+
+**Procedure** (the F0-H procedure, `RENAME_F0H_NF_1008.md`): per commit of the old tree the parent and the fix version of every touched file go through `rename_to_flliper.py apply --weg2 --ident-map merged_0928`,
+`ident_fix.py` (`IDENT_FIX_WEB=1`, refined collision rule, `FIXMAP` = identfix_map + `ident_map_1007.json`), `english_audit extract` + translation memory only + `pinned_units` + `apply`; the renamed difference is merged
+three-way (`git merge-file`) into the tree. No hand renaming. One kit point found on the way: `pinned_units` reads the test files of the mini root as readers, so a NEW test file of the fix version pinned (kept German) log
+units of the parent that the parent state had translated (`H2c STORE-IDENTITY ENTFAELLT ...`); a unit present in both states now keeps the parent's decision (`pin_from`), units new in the fix are decided as before.
+
+**27B line.** Source `86ff356d0d..post-vision-weights-1009 @ a8e569fd83`, first-parent order: AP1 `47689fdb0c`, AP5 `11698ffdf7`, AP2 `c685baaf8f`, dual embedding fix `991672a566`, AP4 `07776490a1` + `47d0087d71`
+(merge `9f7e57363f` carries no content of its own: every file of the merge equals the version of one of its parents), health grace `4495c6a44a`, profile standard `9687abf4e9`, encoder without mask `be6d9b91b7`,
+profconv copy `a8e569fd83` (byte-equal to the profile conversion, contained in the profile-standard commit). **`be6d9b91b7` is not proven on the metal yet** (sdpa without mask for one segment): if the metal refutes it, a
+revert commit goes on top. Not ported by the 3-way merge, produced by the tool instead: `catalog.json` (one union build, see below), the nine planner goldens (`planer_golden_regen.py` for `plan_*.txt`; the launch json by the
+same rule as `planer_fixture_sync.py`: conversion of the old file, checked on the old base first), the profile snapshots (`profconv.convert` / `alt_text`: `tools/release/profconv/27b-base.env`,
+`docker/flliper/profiles_release/27b-base.env` + `.alt`, the planner fixture; the sha256 pins of the changed snapshot follow). Names: `SGLANG_WEG2_VISION_PLACE` -> `FLLIPER_PDFLIP_VISION_PLACE` (`name_compat.canonical_env_name`
+folds the old name), `--weg2-vision-place` -> `--pdflip-vision-place` (the flag alias table registers it), marker `W102 Weg2VisionStage VICTIM-ARMED` -> `W102 PdFlipVisionStage VICTIM-ARMED`, `WEG2 VISION-VICTIM host-RAM WARNING` ->
+`PDFLIP VISION-VICTIM host-RAM WARNING`; the codes W105b, W110c, W111b stay.
+
+**NF line.** Source `c651892375..nf-vision-weights-1009 @ bc040078cd`; ported: AP1 (NF cherry-pick) `59c14423d8`, AP3 `8e7b127fc0` (`ExpertRowVictims`, `DeferredRowsFill.land_now`), tests `950080efd5`, review findings S1-S3
+`bc040078cd`. Not ported (not part of this round): the H88 commits `ae4ab773c0`, `dacc89e543` (row 20; the three files shared with the vision work are proven below to differ from the pipeline output of the tip exactly by the H88 hunks),
+DEFAULTS-ON `dd65a419fb` (row 21, ported by F0-K as `c642c24f12`).
+
+**Catalog and edges.** The catalog is built once from both final code commits (the generator of the NF head), the same bytes on both lines. The edge file of both lines now holds the same 131 + 3 vision edges (K132-K134,
+`--pdflip-vision-place weights` requires transient / excludes VISION_ASYNC / kvtail and auto excluded with `--dual-layout`); the NF file holds the W3 edge behind them as **K135** (it was K132; the id clashed with the first vision
+edge). K132 carries no `trees` label any more: the edge holds on both lines since AP1 reached NF. The NF line takes the two curated entries of AP4 (`--pdflip-vision-place`, `FLLIPER_PDFLIP_VISION_ASYNC`) so the curated
+count of the shipped file is true on both lines. Pins per line: 27B own file 134 edges, NF own file 135; the shipped union 135 edges (51 merged, 84 new).
