@@ -1392,10 +1392,15 @@ async def test_defer_early_leg_and_the_p_to_d_flip_the_held_head_leaves_p_and_it
     Front._leg1_early_watch(f, head)
     await asyncio.sleep(0.02)
     assert "lo0" in P.outstanding
-    assert await _arrive(f, "hi", 1) is None                      # DEFER: nothing held, nothing aborted
-    assert f._lane_state().lane_floor == 0 and f.rpc.paths("/abort_request") == []
-    assert head._leg1_early is not None and not head._leg1_early.done()
     early = head._leg1_early
+    assert await _arrive(f, "hi", 1) is None                      # DEFER: nothing held, the flip runs on ...
+    await asyncio.sleep(0.02)
+    # LANES FIX 1 (metal jjbbrx probe 4): ... but the lower lane's early leg is cancelled and aborted NOW, before
+    # P's wake starts its first chunk (the abort at flip end lost that race by 1 ms: a 6-s chunk stood in front of
+    # the lane-1 leg); the Pendings stay in the queue until the first pass after the flip holds them
+    assert f._lane_state().lane_floor == 0 and list(f.queue) == [head, other] and not f._lane_ctl_obj.held
+    assert head._leg1_early is None and early.cancelled()
+    assert [(g, b["rid"]) for g, b in f.rpc.paths("/abort_request")] == [("P", "lo0")]
     f.state = "serving"                                          # WEG2-FLIP done
     await LC.step(f)
     lc = f._lane_ctl_obj
@@ -1407,12 +1412,14 @@ async def test_defer_early_leg_and_the_p_to_d_flip_the_held_head_leaves_p_and_it
     aborts = f.rpc.paths("/abort_request")
     assert [(g, b["rid"]) for g, b in aborts] == [("P", "lo0")]   # by rid, on P, for the one leg that flew
     assert getattr(other, "_leg1_early", None) is None and other.lane_retake is False
-    assert head.lane_retake is True and head.lane_p_ran_s >= 2.5
+    assert head.lane_retake is True and head.lane_p_ran_s == 0.0   # aborted at the DEFER: it waited on a sleeping P, nothing ran (no false REPREFILL)
     await asyncio.sleep(0.02)
     assert head._leg1_abort is None                              # the abort landed; a fresh leg 1 waits for none
     assert "lo0" not in P.outstanding and LC.p_ledger(f, P) == []   # the P->D drain / witness sees an empty P
     assert f.counters["lane_early_taken"] == 1
-    assert _marks(caplog, LC.MARK_EARLY_TAKE)[0].startswith("WEG2 LANE-EARLY-TAKE rid=lo0 lane=0 floor=1 on_p=True")
+    assert len(_marks(caplog, LC.MARK_EARLY_TAKE)) == 1          # once: the hold at the flip's end finds it gone
+    assert _marks(caplog, LC.MARK_EARLY_TAKE)[0].startswith("WEG2 LANE-EARLY-TAKE rid=lo0 lane=0 floor=0 on_p=True")
+    assert "when=defer target=1" in _marks(caplog, LC.MARK_EARLY_TAKE)[0]
     # the lane ends: the head is back in the queue in the order of its original arrival, its re-run is checked
     f._lane_end("hi")
     await LC.step(f)

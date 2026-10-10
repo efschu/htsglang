@@ -186,6 +186,9 @@ def test_unknown_queued_and_chunked_rids_are_named_not_parked(lanes_on):
     a = _req(1, 0)
     queued = _req(5, 0)
     chunk = _req(6, 0)
+    # LANES FIX 1: a chunked prefill with NO chunk in flight is parked at its chunk border (test_weg2_lanes_fix1_1010);
+    # one whose chunk still writes its rows (cannot be after the landing) is named, not parked
+    chunk.inflight_middle_chunks = 1
     s = _Sched(running=[a], waiting=[queued])
     s.chunked_req = chunk
     out = _park_lane(s, [a.rid, queued.rid, chunk.rid, "weg2-1-99"])
