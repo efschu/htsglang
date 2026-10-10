@@ -277,15 +277,65 @@ class _Turn:
             before = self._order.open_events()
         for ev in before:
             await ev.wait()
-        if self._own is not None:
-            from sglang.srt.managers.mm_utils import wrap_shm_features
-
+        if self._own is None:
             t0 = time.perf_counter()
-            tokenized_obj = await _run_on("wrap", wrap_shm_features, (tokenized_obj,), {})
+            send(tokenized_obj)
+            note(send_ms=(time.perf_counter() - t0) * 1000)
+            return
+        from sglang.srt.managers.mm_utils import wrap_shm_features
+
+        # Shielded: a cancelled request must not orphan a wrap still running on the worker.
+        wrap = asyncio.ensure_future(
+            _run_on("wrap", wrap_shm_features, (tokenized_obj,), {})
+        )
+        reached_send = False
+        try:
+            t0 = time.perf_counter()
+            tokenized_obj = await asyncio.shield(wrap)
             note(shm_wrap_ms=(time.perf_counter() - t0) * 1000)
-        t0 = time.perf_counter()
-        send(tokenized_obj)
-        note(send_ms=(time.perf_counter() - t0) * 1000)
+            reached_send = True
+            t0 = time.perf_counter()
+            send(tokenized_obj)
+            note(send_ms=(time.perf_counter() - t0) * 1000)
+        finally:
+            if not reached_send:
+                # Cancelled or failed between wrap and send: nobody will ever
+                # materialize() these segments -- unlink them once the wrap is done.
+                wrap.add_done_callback(functools.partial(_unlink_after_wrap, tokenized_obj))
+
+
+def _unlink_after_wrap(tokenized_obj: Any, wrap: "asyncio.Future") -> None:
+    if not wrap.cancelled():
+        wrap.exception()  # retrieved: a failed wrap is the request's error, not a stray task's
+    unlink_shm_features(tokenized_obj)
+
+
+def unlink_shm_features(tokenized_obj: Any) -> int:
+    """Unlink the /dev/shm segments of a wrapped request that will not be sent. Never raises."""
+    from multiprocessing import shared_memory
+
+    from sglang.srt.managers.mm_utils import ShmPointerMMData
+
+    n = 0
+    mm_inputs = tokenized_obj.mm_inputs
+    if mm_inputs is None:
+        return 0
+    for item in mm_inputs.mm_items:
+        for value in (item.feature, item.precomputed_embeddings):
+            ptrs = value if isinstance(value, (list, tuple)) else [value]
+            for ptr in ptrs:
+                if not isinstance(ptr, ShmPointerMMData):
+                    continue
+                try:
+                    seg = shared_memory.SharedMemory(name=ptr.shm_name)
+                    seg.close()
+                    seg.unlink()
+                    n += 1
+                except Exception:  # noqa: BLE001 -- already gone
+                    pass
+    if n:
+        logger.info("WEG2-MM-SHM-UNLINK rid=%s segments=%d (request not sent)", tokenized_obj.rid, n)
+    return n
 
 
 class MmDispatchOrder:

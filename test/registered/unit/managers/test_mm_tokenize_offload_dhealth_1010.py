@@ -264,6 +264,107 @@ class TestDispatchOrder(CustomTestCase):
         self.assertEqual(sent, ["T"])
 
 
+class TestShmCleanupBetweenWrapAndSend(CustomTestCase):
+    """A request cancelled (client gone) while or after its features were copied to /dev/shm but
+    before the send: nobody materializes -- and so unlinks -- those segments. Each leak is a whole
+    feature tensor (400 MB for a 4096^2 image) in /dev/shm until reboot."""
+
+    def _scenario(self, *, cancel: bool, send_raises: bool = False):
+        from sglang.srt.managers.mm_utils import ShmPointerMMData
+
+        wrap_go = threading.Event()
+        names = []
+
+        def fake_wrap(obj):
+            wrap_go.wait(5)
+            item = obj.mm_inputs.mm_items[0]
+            item.feature = ShmPointerMMData(item.feature)
+            names.append(item.feature.shm_name)
+            return obj
+
+        def send(_obj):
+            if send_raises:
+                raise RuntimeError("zmq gone")
+
+        obj = SimpleNamespace(
+            rid="img-shm",
+            mm_inputs=SimpleNamespace(
+                mm_items=[SimpleNamespace(feature=torch.ones(1024), precomputed_embeddings=None)]
+            ),
+        )
+
+        async def go():
+            order = mto.MmDispatchOrder()
+
+            async def req():
+                async with order.request(rid="img-shm", is_mm=True) as turn:
+                    await turn.dispatch(send, obj)
+
+            task = asyncio.create_task(req())
+            await asyncio.sleep(0.05)
+            if cancel:
+                task.cancel()
+            wrap_go.set()
+            try:
+                await task
+            except (asyncio.CancelledError, RuntimeError):
+                pass
+            t_end = time.monotonic() + 2
+            while not names and time.monotonic() < t_end:
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(0.05)  # the done-callback runs on the loop
+
+        with mock.patch(
+            "sglang.srt.managers.mm_utils.wrap_shm_features", side_effect=fake_wrap
+        ), mock.patch.object(mto, "offload_permitted", return_value=True):
+            asyncio.run(go())
+        self.assertEqual(len(names), 1)
+        return names[0]
+
+    @staticmethod
+    def _exists(name):
+        from multiprocessing import shared_memory
+
+        try:
+            seg = shared_memory.SharedMemory(name=name)
+        except FileNotFoundError:
+            return False
+        seg.close()
+        return True
+
+    def test_cancelled_between_wrap_and_send_unlinks(self):
+        name = self._scenario(cancel=True)
+        self.assertFalse(self._exists(name), "the cancelled request's segment stayed in /dev/shm")
+
+    def test_sent_request_keeps_its_segment(self):
+        """Negative branch: a sent request's segment belongs to the scheduler (materialize unlinks it)."""
+        name = self._scenario(cancel=False)
+        try:
+            self.assertTrue(self._exists(name))
+        finally:
+            _unlink(name)
+
+    def test_send_failure_keeps_its_segment(self):
+        """send() raising counts as 'reached send': the message may already be out, and a scheduler
+        whose segment vanished fails in unwrap_shm_features -- worse than a leak. Kept on purpose."""
+        name = self._scenario(cancel=False, send_raises=True)
+        try:
+            self.assertTrue(self._exists(name))
+        finally:
+            _unlink(name)
+
+
+def _unlink(name):
+    from multiprocessing import shared_memory
+
+    try:
+        seg = shared_memory.SharedMemory(name=name)
+        seg.close()
+        seg.unlink()
+    except FileNotFoundError:
+        pass
+
+
 class TestInstrumentLines(CustomTestCase):
     """(I) The lines that are to prove or refute the memory-stall suspicion at the metal."""
 
