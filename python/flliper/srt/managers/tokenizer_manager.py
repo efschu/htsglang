@@ -789,6 +789,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     async for response in self._wait_one_response(obj, request):
                         yield response
                 else:
+                    # D-HEALTH: a batch dispatches after the image requests already open.
+                    await self.mm_dispatch_order.wait_open()
                     async for response in self._handle_batch_request(
                         obj, request, request_rids
                     ):
