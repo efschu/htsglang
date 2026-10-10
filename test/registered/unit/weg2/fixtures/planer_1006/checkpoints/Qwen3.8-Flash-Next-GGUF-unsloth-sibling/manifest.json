@@ -1,0 +1,63 @@
+{
+ "files": [
+  {
+   "gz": true,
+   "kind": "header",
+   "name": "Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf",
+   "sha256_header": "5ce89370720f8bf90890f439361282104c1aa1482d4013bb9a50923e758e71a4",
+   "size": 10946624
+  },
+  {
+   "kind": "header",
+   "name": "Qwen3.8-Flash-Next-UD-IQ4_XS-00002-of-00003.gguf",
+   "sha256_header": "65aed4c0d6ffeda13b7188179f3c4d9764076012eedacf7cc5e4df52f46d7f70",
+   "size": 49835229856
+  },
+  {
+   "kind": "header",
+   "name": "Qwen3.8-Flash-Next-UD-IQ4_XS-00003-of-00003.gguf",
+   "sha256_header": "f017b6c65eaa7b52dd0cc37d117a1480a79b275732869420b1b850653b9c6a13",
+   "size": 43836407744
+  },
+  {
+   "kind": "copy",
+   "name": "chat_template.jinja",
+   "size": 8952
+  },
+  {
+   "kind": "copy",
+   "name": "config.json",
+   "size": 30820
+  },
+  {
+   "kind": "copy",
+   "name": "generation_config.json",
+   "size": 202
+  },
+  {
+   "gz": true,
+   "kind": "copy",
+   "name": "merges.txt",
+   "size": 3353259
+  },
+  {
+   "kind": "zero",
+   "name": "tokenizer.json",
+   "size": 12809320
+  },
+  {
+   "kind": "copy",
+   "name": "tokenizer_config.json",
+   "size": 17928
+  },
+  {
+   "kind": "zero",
+   "name": "vocab.json",
+   "size": 6722759
+  }
+ ],
+ "name": "Qwen3.8-Flash-Next-GGUF-unsloth-sibling",
+ "schema": "planer-oracle-checkpoint-snapshot/1",
+ "skipped_dirs": [],
+ "source": "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-Flash-Next-GGUF-unsloth/UD-IQ4_XS (3 .gguf parts, headers) + /spinning/llm_stuff/club-3090/models-cache/Qwen3.8-Flash-Next-NVFP4-nvidia (config.json, tokenizer files) -- the directory tools/release/make_nf_gguf_sibling.sh builds"
+}

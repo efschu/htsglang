@@ -202,8 +202,8 @@ APG_REL = {
 
 class AuftragG(Basis, unittest.TestCase):
     def test_edge_count_is_pinned(self):
-        self.assertEqual(len(self.kanten), 135)                         # 61 + 47 (K62-K108, AP-G; fix round 1 dropped 2 wrongly typed edges) + 8 (K109-K116, AP-H1: Dual-ENV-Tabelle) + 15 (K117-K131, Katalog-Neubau 07.10.: Waechter-Envs, D-COMPACT, AUX-SPILL, --x-mode/--x-curves) + 2 (K132-K133, H88-E 07.10.: --moe-act-int8 / SGLANG_MOE_ACT_INT8, baeume nf) + 1 (K134, H88-F 08.10.: L3-Identitaets-Kante --moe-act-int8 -> --hicache-storage-backend, Anker aus H88-D hicache_storage.py:396; offen.txt Nr. 17 ist damit erledigt) + 1 (K135, X-SUM-PRICE 10.10.; int24-Merge, im xsum-Zweig K132))
-        self.assertEqual([k["id"] for k in self.kanten], ["K%02d" % i for i in range(1, 136)])
+        self.assertEqual(len(self.kanten), 137)                         # 61 + 47 (K62-K108, AP-G; fix round 1 dropped 2 wrongly typed edges) + 8 (K109-K116, AP-H1: Dual-ENV-Tabelle) + 15 (K117-K131, Katalog-Neubau 07.10.: Waechter-Envs, D-COMPACT, AUX-SPILL, --x-mode/--x-curves) + 2 (K132-K133, H88-E 07.10.: --moe-act-int8 / SGLANG_MOE_ACT_INT8, baeume nf) + 1 (K134, H88-F 08.10.: L3-Identitaets-Kante --moe-act-int8 -> --hicache-storage-backend, Anker aus H88-D hicache_storage.py:396; offen.txt Nr. 17 ist damit erledigt) + 1 (K135, X-SUM-PRICE 10.10.; int24-Merge, im xsum-Zweig K132) + 2 (K136-K137, NF-GGUF G5 09.10.; G7-Neunummerierung, im G5-Zweig K132/K133: GGUF braucht --tokenizer-path, GGUF braucht --weg2-vision off))
+        self.assertEqual([k["id"] for k in self.kanten], ["K%02d" % i for i in range(1, 138)])
 
     def test_apg_values_are_curated_and_explained_from_the_source(self):
         for n in APG_NAMES:

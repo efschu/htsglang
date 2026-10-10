@@ -2912,7 +2912,13 @@ def d_seat_vram_plan_form(ns, er, plan_kwargs, cfg, form):
         text_cfg, ssm_dtype=getattr(form, "ssm_dtype", None), rank_tp_ratio=ratios,
         n_ranks=len(plan_kwargs.get("budgets_mib") or ()) or 1,
         expert_row_bytes=float(terms.expert_layer_weight_bytes) / int(terms.num_experts),
-        moe_layers=int(terms.n_layers))
+        moe_layers=int(terms.n_layers),
+        # NF-GGUF G5: the header's row of EACH layer when they differ (None = every layer the
+        # mean, as for every INT4/AWQ/FP8 checkpoint)
+        expert_row_bytes_by_layer=(
+            [float(b) / int(terms.num_experts)
+             for b in terms.expert_layer_weight_bytes_by_layer]
+            if terms.expert_layer_weight_bytes_by_layer else None))
 
 
 def apply_d_seat_expert_rows(ns, er, rows, seat_vram, label) -> List[str]:
@@ -3446,7 +3452,10 @@ def d_seat_table_lines(ns, er, plan_kwargs, label) -> List[str]:
 
         import msgspec
 
-        with open(os.path.join(ns.model, "config.json")) as fh:
+        cfg_file = os.path.join(ns.model, "config.json")
+        if str(ns.model).endswith(".gguf"):
+            cfg_file = model_config_path(ns.model)   # G5: a GGUF file's config is its sibling (the server's own rule)
+        with open(cfg_file) as fh:
             cfg = json.load(fh)
         top_k = int((cfg.get("text_config") or cfg).get("num_experts_per_tok") or 0)
         if top_k <= 0:
@@ -14525,6 +14534,18 @@ def apply_profile_group_switch_defaults(ns, environ: Optional[Mapping[str, str]]
             f"a stated --env-p/--env-d or exported value wins): " + " ".join(wrote))
 
 
+def given_flag_words(ns, argv_words: Sequence[str]) -> List[str]:
+    """G5: the words the "was this flag GIVEN" readers (``apply_profile_d_kv_token_cut_default``,
+    ``apply_profile_vision_default``) look at. A GGUF launch (``--model`` a ``.gguf``) reads them in the running
+    tree's spelling (``_canonical_flags``: a profile's ``--pdflip-vision off`` on this tree's ``--weg2-*`` counts
+    as given, so the registry default does not override it). EVERY other launch keeps the raw words: R1, the
+    non-GGUF profiles (nf-nvfp4-d included) behave as before G5."""
+    words = list(argv_words)
+    if model_is_gguf_file(str(getattr(ns, "model", "") or "")):
+        return _canonical_flags(words)
+    return words
+
+
 def apply_profile_d_kv_token_cut_default(ns, argv_words: Sequence[str]) -> Optional[str]:
     """#239 LEISTUNGSSCHALTER: an UNSET ``--d-kv-token-cut`` takes the registry
     row's ``d_kv_token_cut`` (nextflash ``owned``; qwen27b ``off``). Applied
@@ -20873,7 +20894,7 @@ def p_card_verdict(ns, cards, log, *, model: str, chunk_tokens: int,
             reference=reference, support=support, fractions=fractions,
             lru_rows=lru_rows, stage_layers=stage_layers, chunk=int(chunk_tokens),
             kv_mib=[float(x) for x in kv_mib], num_experts=int(num_experts),
-            row_mib=float(row_mib), draft_on_p=draft_on_p,
+            row_mib=row_mib, draft_on_p=draft_on_p,   # G5: a LayerRows keeps its per-layer vector (float() would drop it)
             draft_mib_last_stage=draft_mib,
             cards=[_dp.stage_card_label(cards, s) for s in range(len(stage_layers))],
             near_oom_mib=float(corridor_guard.NEAR_OOM_MIB),
@@ -21157,6 +21178,27 @@ def _unpin_foreign_cut(solve):
     return wrapper
 
 
+def p_expert_rows_for_stage_models(terms, pp_cut) -> Tuple[object, object]:
+    """``(row_mib, expert_layer_mib)`` as the P-side stage models price them.
+
+    NF-GGUF G5: a checkpoint whose layers carry UNEQUAL expert bytes (a UD GGUF mixes quant
+    types across layers: three row classes on the unsloth Qwen3.8-Flash-Next UD-IQ4_XS) gets
+    :class:`~sglang.srt.planner.expert_layer_rows.LayerRows` (the mean as its float value, the
+    per-layer MiB as ``per_layer``): the models that price a stage SLICE (fraction solve, draft
+    post, P card, pool model) then sum the slice's own rows instead of ``layers x mean``. A
+    checkpoint of equal layers (every INT4/AWQ/FP8 release checkpoint) gets the two plain floats
+    the launcher always computed, with the same expressions: byte-identical."""
+    from sglang.srt.planner import expert_layer_rows as _elr
+
+    layer = pp_cut.expert_layer_rows(terms)
+    mib = float(pp_cut.MIB)
+    if _elr.is_layer_vector(layer):
+        per_mib = _elr.LayerRows(tuple(v / mib for v in layer.per_layer), mean=float(layer) / mib)
+        return _elr.slot_of(per_mib, terms.num_experts), per_mib
+    row_bytes = terms.expert_layer_weight_bytes / max(1, terms.num_experts)
+    return row_bytes / mib, terms.expert_layer_weight_bytes / mib
+
+
 @_unpin_foreign_cut
 def solve_p_cut(
     ns,
@@ -21223,6 +21265,10 @@ def solve_p_cut(
     # name, because the 27B constants priced 8 layers on rank 0 and refused
     # every cut (W40, 19.09. dry run nfdry4).
     layer_mib_by_stage: Tuple[float, ...] = ()
+    # NF-GGUF G5: the per-layer expert vector of the pool model ((): equal layers, the scalar model)
+    _pm_expert_vec: Tuple[float, ...] = ()
+    _pm_expert_fac: Tuple[float, ...] = ()
+    _pm_expert_mean = 0.0
     # H92c: P's mamba slots, read ONCE off P's argv (with --extra-p): the pool
     # model's mamba post and the P card's mamba term are the same number.
     _p_mamba_slots, _p_mamba_src = p_mamba_slots(
@@ -21252,6 +21298,7 @@ def solve_p_cut(
                 f"--pp-cut-expert-lru-rows {len(rows)}; the P group has {n_stages_p} stages."
             )
         row_bytes = terms.expert_layer_weight_bytes / max(1, terms.num_experts)
+        _row_mib_p, _expert_layer_mib_p = p_expert_rows_for_stage_models(terms, _pp_cut)
         layer_mib_by_stage = tuple(
             mean_layer_mib
             + (terms.expert_layer_weight_bytes * float(f) + row_bytes * float(r)) / _pp_cut.MIB
@@ -21284,7 +21331,7 @@ def solve_p_cut(
         ns._expert_row_mib = row_bytes / _pp_cut.MIB
         if str(getattr(ns, "draft_kv_on_p", "on")) == "off":
             fracs = apply_p_draft_post(ns, cards, fracs, _stage_layers_for_solve,
-                                       row_bytes / _pp_cut.MIB,
+                                       _row_mib_p,
                                        int(terms.num_experts), log)
             layer_mib_by_stage = tuple(
                 mean_layer_mib
@@ -21405,7 +21452,7 @@ def solve_p_cut(
                 budgets_mib=budgets_p,
                 stage_layers=_stage_layers_for_solve,
                 mean_layer_mib=mean_layer_mib,
-                expert_layer_mib=terms.expert_layer_weight_bytes / _pp_cut.MIB,
+                expert_layer_mib=_expert_layer_mib_p,
                 num_experts=terms.num_experts,
                 lru_rows=rows,
             )
@@ -21413,7 +21460,7 @@ def solve_p_cut(
                 budgets_mib=budgets_p,
                 stage_layers=_stage_layers_for_solve,
                 mean_layer_mib=mean_layer_mib,
-                expert_layer_mib=terms.expert_layer_weight_bytes / _pp_cut.MIB,
+                expert_layer_mib=_expert_layer_mib_p,
                 num_experts=terms.num_experts,
                 lru_rows=rows,
                 reserve_mib_by_stage=_reserve_p,
@@ -21481,7 +21528,7 @@ def solve_p_cut(
             stage_layers=[int(x) for x in _stage_layers_for_solve],
             kv_mib=_kv_p,
             num_experts=int(terms.num_experts),
-            row_mib=row_bytes / _pp_cut.MIB,
+            row_mib=_row_mib_p,
             mamba_slots=int(_p_mamba_slots),
             mamba_mib_per_slot=p_mamba_mib_per_slot_by_stage(
                 kinds, _stage_layers_for_solve,
@@ -21499,6 +21546,25 @@ def solve_p_cut(
                 + (terms.expert_layer_weight_bytes * float(f) + row_bytes * float(r)) / _pp_cut.MIB
                 for f, r in zip(fracs, rows)
             )
+        # NF-GGUF G5: with unequal expert rows per layer the pool model keeps the mean-expert price
+        # above and corrects each stage by the slice it holds (PhasePoolModel.stage_weight_mib),
+        # priced at the FINAL fractions (after the draft post and the card cap).
+        from sglang.srt.planner import expert_layer_rows as _elr_l
+
+        if _elr_l.is_layer_vector(_expert_layer_mib_p):
+            _pm_expert_vec = tuple(float(v) for v in _expert_layer_mib_p.per_layer)
+            _pm_expert_mean = float(_expert_layer_mib_p)
+            _pm_expert_fac = tuple(
+                float(f) + float(r) / max(1, int(terms.num_experts)) for f, r in zip(fracs, rows))
+            log("PP-CUT EXPERT ROWS JE LAYER (G5): %s MiB je Layer (Mittel %.4f), Stufen-Schnitt %s -> "
+                "Experten je Stufe %s MiB gegen Mittelwert-Preis %s MiB"
+                % (_elr_l.describe(_expert_layer_mib_p), _pm_expert_mean,
+                   list(_stage_layers_for_solve),
+                   ["%.0f" % (_pm_expert_fac[i] * _elr_l.stage_total(
+                       _expert_layer_mib_p, _stage_layers_for_solve, i))
+                    for i in range(len(_pm_expert_fac))],
+                   ["%.0f" % (_pm_expert_fac[i] * _pm_expert_mean * int(_stage_layers_for_solve[i]))
+                    for i in range(len(_pm_expert_fac))]))
     ms = _csv_floats(ns.pp_cut_measured_ms_per_layer)
     # YaRN x2 27B (29.09.): the posts were read at 262144; a longer P context
     # grows the eager RoPE cache before the pool is sized (p_rope_context_delta_mib).
@@ -21517,6 +21583,9 @@ def solve_p_cut(
         # The total is exact for any cut summing to n_layers.
         weight_mib_per_layer=mean_layer_mib,
         weight_mib_per_layer_by_stage=layer_mib_by_stage,
+        expert_layer_mib_by_layer=_pm_expert_vec,
+        expert_resident_factor_by_stage=_pm_expert_fac,
+        expert_layer_mib_mean=_pm_expert_mean,
         kv_mib_per_token_per_attn_layer=kv_mib,
         arming_floor_mib=tuple(float(ns.pp_cut_arming_floor_mib) for _ in budgets_p),
         # -- #1286: THE POSTS THE BOOT CHARGES AND THIS MODEL DID NOT ------
@@ -24496,12 +24565,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         _ls_line = apply_profile_group_switch_defaults(ns)
         if _ls_line:
             print(_ls_line, flush=True)
-        _cut_line = apply_profile_d_kv_token_cut_default(
-            ns, list(sys.argv[1:] if argv is None else argv))
+        # G5: the readers below ask "was this flag GIVEN" of the words: a profile in the OTHER spelling (--pdflip-* on
+        # this tree's --weg2-*) gives it too, or a registry default overrides a stated value (nf-gguf: vision off).
+        # ONLY for a GGUF launch (R1: every non-GGUF profile, nf-nvfp4-d included, keeps the raw words and so its
+        # pre-G5 behaviour byte for byte).
+        _given_words = given_flag_words(ns, list(sys.argv[1:] if argv is None else argv))
+        _cut_line = apply_profile_d_kv_token_cut_default(ns, _given_words)
         if _cut_line:
             print(_cut_line, flush=True)
-        _vis_default_line = apply_profile_vision_default(
-            ns, list(sys.argv[1:] if argv is None else argv))
+        _vis_default_line = apply_profile_vision_default(ns, _given_words)
         if _vis_default_line:
             print(_vis_default_line, flush=True)
     _miss_rec_line = apply_owned_miss_record_default(ns)  # PR: paired miss record

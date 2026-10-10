@@ -1239,13 +1239,14 @@ def solve_expert_fraction_per_stage(
             f"{len(list(budgets_mib))} Budgets / {len(rows)} LRU-Zeilen / "
             f"{len(res)} Reserven -- eine halbe Geometrie loest nichts"
         )
+    from sglang.srt.planner import expert_layer_rows as _elr_mod
     from sglang.srt.planner import expert_residency as _er
 
     return _er.solve_stage_fraction_by_buffer_rule(
         budgets_mib=list(budgets_mib),
         stage_layers=list(stage_layers),
         dense_layer_mib=float(mean_layer_mib),
-        slot_mib=float(expert_layer_mib) / max(1, int(num_experts)),
+        slot_mib=_elr_mod.slot_of(expert_layer_mib, num_experts),
         num_experts=int(num_experts),
         scratch_rows=rows,
         reserve_mib_by_stage=res,
@@ -2555,6 +2556,13 @@ class CheckpointWeightTerms:
     expert_layer_weight_bytes: float = 0.0
     ple_layer_weight_bytes: float = 0.0
     num_experts: int = 0
+    #: NF-GGUF G5: the expert bytes of EACH layer 0..n_layers-1 (0.0 where a layer has
+    #: none), from the same headers. ``expert_layer_weight_bytes`` stays the mean over the
+    #: layers that carry experts (what every reader before G5 prices); a checkpoint whose
+    #: layers carry UNEQUAL expert bytes (a UD GGUF mixes quant types across layers) is
+    #: priced per layer through :func:`expert_layer_rows`. Every INT4/AWQ/FP8 release
+    #: checkpoint has equal layers: the vector is a constant there and changes nothing.
+    expert_layer_weight_bytes_by_layer: Tuple[float, ...] = ()
 
 
 def _gguf_weight_sizes(model_path: str) -> Optional[Dict[str, float]]:
@@ -2581,6 +2589,21 @@ def _gguf_weight_sizes(model_path: str) -> Optional[Dict[str, float]]:
             f"({type(exc).__name__}: {exc}); the weight terms cannot be defaulted."
         ) from exc
     return {name: float(nbytes) for name, nbytes in census.sizes().items()}
+
+
+def _gguf_expert_count(model_path: str) -> int:
+    """NF-GGUF G5: routed experts per layer of a GGUF FILE (stacked ``ffn_*_exps`` tensors; the
+    census is cached, so this is the same single header read), 0 for anything else."""
+    if not os.path.isfile(model_path):
+        return 0
+    from sglang.srt.weg2 import gguf_census as _gguf_census
+
+    if not _gguf_census.is_gguf_checkpoint(model_path):
+        return 0
+    try:
+        return int(_gguf_census.gguf_tensor_census(model_path).expert_count())
+    except Exception:  # noqa: BLE001 -- _gguf_weight_sizes names the failure first
+        return 0
 
 
 def checkpoint_weight_terms(model_path: str) -> CheckpointWeightTerms:
@@ -2696,8 +2719,27 @@ def checkpoint_weight_terms(model_path: str) -> CheckpointWeightTerms:
         ple_layer_weight_bytes=(
             sum(ple_bytes.values()) / len(ple_bytes) if ple_bytes else 0.0
         ),
-        num_experts=len(expert_ids),
+        num_experts=len(expert_ids) or (
+            _gguf_expert_count(model_path) if gguf_sizes is not None and expert_bytes else 0),
+        expert_layer_weight_bytes_by_layer=(
+            tuple(float(expert_bytes.get(i, 0.0)) for i in range(len(layer_bytes)))
+            if expert_bytes else ()
+        ),
     )
+
+
+def expert_layer_rows(terms: "CheckpointWeightTerms"):
+    """NF-GGUF G5: the expert bytes of a layer as the planner prices them -- a
+    :class:`~sglang.srt.planner.expert_layer_rows.LayerRows` (value = the mean, plus the
+    per-layer vector) when the layers carry UNEQUAL expert bytes, else the plain
+    ``terms.expert_layer_weight_bytes`` float: every checkpoint of equal layers (INT4, AWQ,
+    FP8, the dense 27B) is priced by the exact scalar it always was."""
+    from sglang.srt.planner import expert_layer_rows as _elr
+
+    vec = tuple(getattr(terms, "expert_layer_weight_bytes_by_layer", ()) or ())
+    if vec and _elr.nonuniform(vec):
+        return _elr.LayerRows(vec, mean=float(terms.expert_layer_weight_bytes))
+    return float(terms.expert_layer_weight_bytes)
 
 
 # ---------------------------------------------------------------------------
@@ -3125,6 +3167,17 @@ class PhasePoolModel:
     weight_mib_per_layer_by_stage: Tuple[float, ...] = ()
     mamba_mib_per_linear_layer_per_slot: float = 0.0
     mamba_slots: int = 0
+    #: NF-GGUF G5: per-LAYER expert MiB (full residency) of a checkpoint whose layers
+    #: carry UNEQUAL expert bytes, and the per-stage resident factor ``k_s`` (fraction +
+    #: LRU rows / experts) that turns a layer's expert MiB into its resident MiB. Empty =
+    #: the scalar model above (every INT4/AWQ/FP8 checkpoint: byte-identical). With both
+    #: set, ``weight_mib_per_layer_by_stage`` still carries the MEAN-expert price and
+    #: :meth:`stage_weight_mib` corrects it by the slice a stage really holds.
+    expert_layer_mib_by_layer: Tuple[float, ...] = ()
+    expert_resident_factor_by_stage: Tuple[float, ...] = ()
+    #: the MEAN expert MiB per layer ``weight_mib_per_layer_by_stage`` was priced with (the
+    #: checkpoint terms' mean over the layers that carry experts); 0 = mean of the vector
+    expert_layer_mib_mean: float = 0.0
 
     def layer_mib(self, stage: int) -> float:
         """The weight MiB one layer costs on ``stage`` (Task #47/#48)."""
@@ -3132,6 +3185,22 @@ class PhasePoolModel:
         if by_stage and 0 <= int(stage) < len(by_stage):
             return float(by_stage[int(stage)])
         return float(self.weight_mib_per_layer)
+
+    def stage_weight_mib(self, stage: int, n: int, start: Optional[int] = None) -> float:
+        """The layer weight a stage holding ``n`` layers (from layer ``start``) pays:
+        ``layer_mib(stage) * n`` exactly, plus -- only when the per-layer expert vector
+        is set (NF-GGUF G5) -- the difference between the slice's expert MiB and ``n``
+        mean layers' at the stage's resident factor."""
+        base = float(self.layer_mib(stage)) * int(n)
+        vec = self.expert_layer_mib_by_layer
+        fac = self.expert_resident_factor_by_stage
+        if not vec or not fac or start is None or not (0 <= int(stage) < len(fac)):
+            return base
+        a, b = int(start), int(start) + int(n)
+        if a < 0 or b > len(vec):
+            return base
+        mean = float(self.expert_layer_mib_mean) or (sum(vec) / len(vec))
+        return base + float(fac[int(stage)]) * (sum(vec[a:b]) - int(n) * mean)
 
     #: The sizer's SECOND floor, and it is not the cell (#1286 F7). The runtime
     #: does ``available_bytes // cell_size`` and then
@@ -4102,7 +4171,11 @@ def _stage_free_after_residency(
             "each stage's own measured prefill transient) and cannot be "
             "broadcast."
         )
+    _counts_l = [int(c) for c in counts]
     for r, (n, a) in enumerate(zip(counts, attn_counts)):
+        # NF-GGUF G5: the first layer of this stage (contiguous cut), read BEFORE the swing
+        # slab adds its layers; None under a swing slab (their positions are not a slice)
+        _start = None if swing else sum(_counts_l[:r])
         if swing:
             # the swing slab: its layers cost weights and mamba like owned ones
             n = int(n) + int(swing[r][0]) + int(swing[r][1])
@@ -4115,7 +4188,7 @@ def _stage_free_after_residency(
         )
         out.append(
             float(model.free_mib[r])
-            - float(model.layer_mib(r)) * int(n)
+            - model.stage_weight_mib(r, int(n), _start)
             - (fixed[r] if fixed else 0.0)
             - holdback
             - float(model.mamba_mib_per_linear_layer_per_slot)

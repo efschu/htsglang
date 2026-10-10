@@ -1,0 +1,88 @@
+{
+ "checkpoints": {
+  "MTP": {
+   "files": {
+    "mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf": {
+     "kind": "header",
+     "sha256_header": "85b40be410e28e9e07bad48062b9fb8db0e3d837658a4bfd999f7f20e58836a6",
+     "size": 2786568256
+    }
+   },
+   "role": "PROFILE_DRAFT (shared-Q8_0 MTP file)",
+   "source": "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-Flash-Next-GGUF-unsloth/MTP (shared-Q8_0 file only)"
+  },
+  "Qwen3.8-Flash-Next-GGUF-unsloth-sibling": {
+   "files": {
+    "Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf": {
+     "kind": "header",
+     "sha256_header": "5ce89370720f8bf90890f439361282104c1aa1482d4013bb9a50923e758e71a4",
+     "size": 10946624
+    },
+    "Qwen3.8-Flash-Next-UD-IQ4_XS-00002-of-00003.gguf": {
+     "kind": "header",
+     "sha256_header": "65aed4c0d6ffeda13b7188179f3c4d9764076012eedacf7cc5e4df52f46d7f70",
+     "size": 49835229856
+    },
+    "Qwen3.8-Flash-Next-UD-IQ4_XS-00003-of-00003.gguf": {
+     "kind": "header",
+     "sha256_header": "f017b6c65eaa7b52dd0cc37d117a1480a79b275732869420b1b850653b9c6a13",
+     "size": 43836407744
+    },
+    "chat_template.jinja": {
+     "kind": "copy",
+     "sha256_header": null,
+     "size": 8952
+    },
+    "config.json": {
+     "kind": "copy",
+     "sha256_header": null,
+     "size": 30820
+    },
+    "generation_config.json": {
+     "kind": "copy",
+     "sha256_header": null,
+     "size": 202
+    },
+    "merges.txt": {
+     "kind": "copy",
+     "sha256_header": null,
+     "size": 3353259
+    },
+    "tokenizer.json": {
+     "kind": "zero",
+     "sha256_header": null,
+     "size": 12809320
+    },
+    "tokenizer_config.json": {
+     "kind": "copy",
+     "sha256_header": null,
+     "size": 17928
+    },
+    "vocab.json": {
+     "kind": "zero",
+     "sha256_header": null,
+     "size": 6722759
+    }
+   },
+   "role": "PROFILE_MODEL + --tokenizer-path (sibling directory, tools/release/make_nf_gguf_sibling.sh)",
+   "source": "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-Flash-Next-GGUF-unsloth/UD-IQ4_XS (3 .gguf parts, headers) + /spinning/llm_stuff/club-3090/models-cache/Qwen3.8-Flash-Next-NVFP4-nvidia (config.json, tokenizer files) -- the directory tools/release/make_nf_gguf_sibling.sh builds"
+  }
+ },
+ "date": "2026-10-10",
+ "golden": "plan_nf_gguf_n3.txt",
+ "launcher_line": "nf",
+ "note": "GGUF header snapshots taken read-only on the dev box (the files are visible there): the bytes up to the tensor-data region of each part (GGUFReader.data_offset), no tensor byte read; config.json and tokenizer files of Qwen3.8-Flash-Next-NVFP4-nvidia. Regenerate: propose_oracle snapshot (python call with source=, see the commit message), then `propose_oracle golden --profile tools/release/profconv/nf-gguf.env --replay <nvml_devices_1378.json> --checkpoint-snapshot <sibling snapshot> --checkpoint-snapshot <MTP snapshot> --out golden/nf/plan_nf_gguf_n3.txt`.",
+ "profile": {
+  "file": "tools/release/profconv/nf-gguf.env",
+  "note": "in-tree profile (profconv), not a rig snapshot; the test pins its sha256: regenerate the golden when the profile moves",
+  "sha256": "30f916650ecf93c21ecd59e0f19a8be5f4be77f6e48c1c2c0ec4b71f0c5abbb2"
+ },
+ "profile_base": {
+  "file": "tools/release/profconv/nf.env",
+  "note": "sourced by nf-gguf.env",
+  "sha256": "551d40ebc5f3728648bd271d4f0e058823548f0765f58c450912ec95d24e804c"
+ },
+ "replay": "fixtures/xchg_launch_replay_0911/nvml_devices_1378.json",
+ "schema": "planer-ap0-golden-provenance/1",
+ "tree": "c651892375 + desk/planer-ggufg1-1009 (7f26ce40c1) + desk/planer-ggufg5-1009"
+}

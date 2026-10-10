@@ -206,6 +206,13 @@ def checkpoint_tensor_mib(path: str, *, exclude: Sequence[str] = ()) -> Optional
     (:func:`gguf_checkpoint_tensor_mib`).
 
     ``None`` when the directory holds neither -- absent, never 0.
+
+    NF-GGUF G3/G5: a ``.gguf`` FILE (the split set of a ``-0000N-of-0000M`` name
+    included) or a directory holding one GGUF set is priced from its HEADER;
+    ``exclude`` names are the HF spellings (``lm_head``, ``embed_tokens``) and are
+    matched against the GGUF names they stand for (``output.``, ``token_embd.``).
+    The unsloth ``shared`` MTP file carries neither tensor (it shares the target's:
+    ``nextn_shared_target_tensors``), so the exclusion costs it nothing there.
     """
     files = sorted(glob.glob(os.path.join(str(path), "*.safetensors")))
     if not files:
@@ -350,11 +357,17 @@ def raise_for_draft_post(*, fracs: Sequence[float], stage_layers: Sequence[int],
                           "and no readable *.gguf -- the draft post cannot be priced, "
                           "fractions unchanged")
     freed = weights + transient
-    rows, new = expert_rows_for(freed, int(stage_layers[stage]), row_mib,
+    # NF-GGUF G5: with a per-layer row vector (mixed-quant GGUF) the last stage pays the rows of
+    # ITS slice of layers; the mean of that slice keeps "layers x row" exact. A scalar row is
+    # returned unchanged by stage_mean (float(row_mib)), so every other checkpoint is as before.
+    from sglang.srt.planner import expert_layer_rows as _elr
+
+    row_stage = _elr.stage_mean(row_mib, stage_layers, stage)
+    rows, new = expert_rows_for(freed, int(stage_layers[stage]), row_stage,
                                 num_experts, fr[stage])
     post = DraftPost(stage=stage, card=stage_card_label(cards, stage),
                      freed_mib=freed, weights_mib=weights, transient_mib=transient,
-                     layers=int(stage_layers[stage]), row_mib=float(row_mib),
+                     layers=int(stage_layers[stage]), row_mib=float(row_stage),
                      rows=rows, frac_before=fr[stage], frac_after=new)
     out = list(fr)
     out[stage] = new

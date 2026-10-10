@@ -547,6 +547,12 @@ def classify_gguf(name: str, n_backbone: int) -> Tuple[str, Optional[int], str]:
         return "lm_head", None, ""
     if name.startswith("token_embd"):
         return "embed", None, ""
+    if name.startswith("per_layer_token_embd"):
+        # qwen4exp (NF-GGUF G5): the n-gram PLE table is ONE tensor outside the blocks (28.8 GB on the
+        # unsloth UD-IQ4_XS); like the safetensors ``ngram_embedding`` shards it stays on disk (mmap)
+        # and never reaches the device -- it is NOT "other" weight. The layer index is unused for
+        # the ``ngram`` class (only the sum is read).
+        return "ngram", -1, ""
     m = _GGUF_BLK_RE.match(name)
     if m is None:
         return "other", None, ""
