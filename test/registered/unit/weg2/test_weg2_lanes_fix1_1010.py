@@ -68,6 +68,13 @@ class _MBatch(_Batch):
     def merge_batch(self, other):
         self.reqs.extend(other.reqs)
 
+    def filter_batch(self, chunked_req_to_exclude=None, keep_indices=None):
+        if keep_indices is None and chunked_req_to_exclude:
+            ex = list(chunked_req_to_exclude)
+            self.reqs = [r for r in self.reqs if not any(r is e for e in ex)]
+            return
+        super().filter_batch(chunked_req_to_exclude=chunked_req_to_exclude, keep_indices=keep_indices)
+
 
 class _Extend(_MBatch):
     """``sched.last_batch`` after a prefill pass: the extend batch that carried the chunked request.  When the running
@@ -257,6 +264,59 @@ def test_mutant_that_merges_another_lanes_chunked_request_decodes_it_unfinished(
     s = _mid_prefill([dec], ch)
     mod.park_running(s, Weg2ParkRunningReqInput(epoch=7, reason="lane", rids=[dec.rid], hold="lane"))
     assert any(r is ch for r in s.running_batch.reqs) and s.chunked_req is ch   # in the decode set AND chunked
+
+
+# ---- review round 1 (major): the spec back-only refusal must not leave the chunk in the decode set
+def _spec(s):
+    s.running_batch.spec_algorithm = types.SimpleNamespace(is_none=lambda: False)
+    return s
+
+
+def test_spec_refusal_of_a_chunked_park_takes_the_chunk_out_of_the_decode_set_again(lanes_on):
+    lo_dec, hi_dec = _req(1, 0), _req(2, 1)
+    ch = _chunked(3, 0)
+    s = _spec(_mid_prefill([lo_dec, hi_dec], ch))
+    out = _park_lane(s, [lo_dec.rid, ch.rid])
+    assert out.success is False and "not the back of the batch" in out.message
+    assert not any(r is ch for r in s.running_batch.reqs)               # not decoding unfinished
+    assert [r.rid for r in s.running_batch.reqs] == [lo_dec.rid, hi_dec.rid]
+    assert s.chunked_req is ch and _next_pass_head(s) == "stash"        # still only chunked_req, consistent
+    assert not out.parked and not s.running_batch.released               # nothing retracted
+
+
+def test_spec_back_only_park_of_the_chunk_and_the_decode_tail_still_parks_both(lanes_on):
+    hi_dec, lo_dec = _req(2, 1), _req(1, 0)
+    ch = _chunked(3, 0)
+    s = _spec(_mid_prefill([hi_dec, lo_dec], ch))
+    out = _park_lane(s, [lo_dec.rid, ch.rid])
+    assert out.success and sorted(out.parked) == sorted([lo_dec.rid, ch.rid])
+    assert s.chunked_req is None and [r.rid for r in s.running_batch.reqs] == [hi_dec.rid]
+
+
+def test_every_tp_rank_refuses_the_spec_chunk_park_the_same_way(lanes_on):
+    def one_rank():
+        lo_dec, hi_dec = _req(1, 0), _req(2, 1)
+        ch = _chunked(3, 0)
+        s = _spec(_mid_prefill([lo_dec, hi_dec], ch))
+        out = _park_lane(s, [lo_dec.rid, ch.rid])
+        return (out.success, [r.rid for r in s.running_batch.reqs], s.chunked_req is ch)
+
+    ranks = [one_rank() for _ in range(3)]
+    assert ranks[0] == ranks[1] == ranks[2] and ranks[0][0] is False
+
+
+def test_mutant_without_the_unmerge_leaves_the_chunk_in_both_sets_under_spec_refusal(lanes_on):
+    mod = _mutant("        if park_chunk:\n            _unmerge_chunk(sched, chunk)  # nothing parked",
+                  "        if False:\n            _unmerge_chunk(sched, chunk)  # nothing parked")
+    from sglang.srt.managers.io_struct import Weg2ParkRunningReqInput
+
+    lo_dec, hi_dec = _req(1, 0), _req(2, 1)
+    ch = _chunked(3, 0)
+    s = _spec(_mid_prefill([lo_dec, hi_dec], ch))
+    out = mod.park_running(s, Weg2ParkRunningReqInput(epoch=7, reason="lane",
+                                                      rids=[lo_dec.rid, ch.rid], hold="lane"))
+    assert out.success is False
+    assert any(r is ch for r in s.running_batch.reqs) and s.chunked_req is ch   # double membership
 
 
 def test_the_flip_park_and_park_youngest_paths_are_untouched():
