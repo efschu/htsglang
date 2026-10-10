@@ -3505,7 +3505,7 @@ def d_seat_table_lines(ns, er, plan_kwargs, label) -> List[str]:
 
         import msgspec
 
-        with open(os.path.join(ns.model, "config.json")) as fh:
+        with open(model_config_path(ns.model)) as fh:  # a GGUF FILE: its sibling config.json
             cfg = json.load(fh)
         top_k = int((cfg.get("text_config") or cfg).get("num_experts_per_tok") or 0)
         if top_k <= 0:
@@ -24972,6 +24972,45 @@ def vision_place_dual_refusal(ns, argv: Optional[Sequence[str]] = None) -> Optio
             "or leave --pdflip-vision-place unset")
 
 
+def vision_tower_dir(ns) -> str:
+    """VISION-GGUF (09.10.): the directory the transient tower is read from -- ``--model``, or for a GGUF FILE ``--tokenizer-path``
+    (``planner.vision_stage_load.tower_source_dir``, the rank's rule; raises ``VisionStageLoadRefused`` when that holds no sharded
+    checkpoint). ``--tokenizer-path`` is read only for a GGUF model."""
+    from flliper.srt.planner.vision_stage_load import tower_source_dir
+
+    model = str(ns.model)
+    if not model_is_gguf_file(model):
+        return model
+    return tower_source_dir(model_path=model, tokenizer_path=str(ns.tokenizer_path or ""))
+
+
+def vision_gguf_tower_refusal(ns) -> Optional[str]:
+    """VISION-GGUF (09.10.): ``--pdflip-vision transient`` with a GGUF ``--model`` reads the tower from ``--tokenizer-path``. Refused by name
+    before any card is taken when that directory holds no single-shard tower in a safetensors index, or when its ``vision_config`` differs
+    from the GGUF's (the rank builds the tower from the GGUF's config and fills it from the other checkpoint; ``model_type`` aside, the
+    two must agree). None = consistent, or not this case (a safetensors model, or not transient: unchanged)."""
+    if str(ns.pdflip_vision) != VISION_TRANSIENT or not model_is_gguf_file(str(ns.model)):
+        return None
+    from flliper.srt.planner.vision_stage_load import find_tower_shard
+
+    try:
+        tower_dir = vision_tower_dir(ns)
+        find_tower_shard(tower_dir)
+        configs = []
+        for path in (str(ns.model), tower_dir):
+            with open(model_config_path(path)) as fh:
+                configs.append(json.load(fh).get("vision_config") or {})
+    except Exception as exc:  # noqa: BLE001 -- every path out is the named refusal
+        return f"{W111_VISION_PLACE_DUAL}: --pdflip-vision transient on a GGUF --model: {type(exc).__name__}: {exc}"
+    mine, theirs = configs
+    differ = sorted(k for k in set(mine) | set(theirs) if k != "model_type" and mine.get(k) != theirs.get(k))
+    if not mine or differ:
+        return (f"{W111_VISION_PLACE_DUAL}: --pdflip-vision transient on a GGUF --model: the vision_config of {ns.model} "
+                f"{'is missing' if not mine else 'differs in ' + ', '.join(differ)} against --tokenizer-path {tower_dir}, "
+                "whose checkpoint the tower is read from")
+    return None
+
+
 def vision_victim_host_term(ns) -> Tuple[float, str]:
     """VISION-WEIGHTS AP4: ``(MiB, provenance)`` of the host image of the displaced weights (ledger post ``vision_victim_host``).
 
@@ -24986,7 +25025,11 @@ def vision_victim_host_term(ns) -> Tuple[float, str]:
     form = getattr(ns, "pdflip_boot_form", None)
     if getattr(form, "arch", None) == "moe":
         return 0.0, "none (victim = resident expert rows; their copy is in the expert store, already booked)"
-    nbytes, src = _vvp.tower_bytes_from_checkpoint(str(getattr(ns, "model", "") or ""))
+    try:
+        tower_dir = vision_tower_dir(ns)
+    except Exception as exc:  # noqa: BLE001 -- unmeasured is said (vision_gguf_tower_refusal stops the boot first)
+        return 0.0, f"UNMEASURED ({type(exc).__name__}: {exc})"
+    nbytes, src = _vvp.tower_bytes_from_checkpoint(tower_dir)
     if nbytes is None:
         return 0.0, f"UNMEASURED ({src})"
     kind = _vvp.KIND_PP_ONLY if bool(getattr(ns, "dual_layout", False)) else _vvp.KIND_DENSE
@@ -25300,6 +25343,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if _vis_place_dual:
         print(_vis_place_dual, flush=True)
         raise SystemExit(_vis_place_dual)
+    _vis_gguf = vision_gguf_tower_refusal(ns)  # VISION-GGUF: the tower of a GGUF comes from --tokenizer-path
+    if _vis_gguf:
+        print(_vis_gguf, flush=True)
+        raise SystemExit(_vis_gguf)
     # Arm the complement instrument in the LAUNCHER's own process too. The
     # rank processes never import this module, so without this the ingest
     # could only ever print NO-OBSERVATION for `launcher.py` -- an honest
@@ -27046,9 +27093,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     env_p = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("P", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="P", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_p", "")), **_env_knobs(ns), expert_map_path=_emap, expert_store_identity=_estore_id)
     # H125: the host-RAM price of `--pdflip-vision-source ram`, named where the
     # P env is built (the line is empty, and nothing is logged, for `disk`).
+    # VISION-GGUF: only a transient boot resolves the tower's directory (a GGUF reads it from --tokenizer-path)
     _vis_line = vision_source_host_line(
-        ns.model, str(getattr(ns, "pdflip_vision_source", VISION_SOURCE_DISK)))
-    if _vis_line and str(getattr(ns, "pdflip_vision", VISION_OFF)) == VISION_TRANSIENT:
+        vision_tower_dir(ns), str(getattr(ns, "pdflip_vision_source", VISION_SOURCE_DISK))
+    ) if str(getattr(ns, "pdflip_vision", VISION_OFF)) == VISION_TRANSIENT else ""
+    if _vis_line:
         log(_vis_line)
     # #1269 PUBLICATION: build_env's own comment says the decision is
     # "published explicitly so the boot log names the decision" -- but it only

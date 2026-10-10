@@ -60,9 +60,12 @@ import torch
 
 from flliper.srt.planner.vision_stage_load import (
     attach_precomputed_embeddings,
+    VisionStageLoadRefused,
     find_tower_shard,
+    is_gguf_file,
     is_vision_weight,
     map_tower_param_name,
+    tower_source_dir,
 )
 from flliper.srt.pdflip import vision_rank_stage as vrs
 from flliper.srt.pdflip import vision_verdict as _vv
@@ -154,8 +157,12 @@ def arm_rank_stage(scheduler, env: Optional[Dict[str, str]] = None) -> bool:
     if not refusal and place == vrs.PLACE_WEIGHTS:
         scheduler._pdflip_vision_victims, refusal = arm_victims(scheduler, env)
     if not refusal and source_kind == vrs.SOURCE_RAM:
-        scheduler._pdflip_vision_source = arm_ram_source(
-            str(getattr(getattr(scheduler, "server_args", None), "model_path", "") or ""), env)
+        try:
+            ram_dir = tower_dir(scheduler.server_args)
+        except VisionStageLoadRefused as exc:  # a GGUF without a tower dir: no disk either
+            refusal = str(exc)
+        else:
+            scheduler._pdflip_vision_source = arm_ram_source(ram_dir, env)
     scheduler._pdflip_vision_arm_refusal = refusal
     scheduler._pdflip_vision_origin_aborts = []
     scheduler._pdflip_vision_refused = set()
@@ -182,6 +189,17 @@ def arm_rank_stage(scheduler, env: Optional[Dict[str, str]] = None) -> bool:
     return True
 
 
+def tower_dir(server_args) -> str:
+    """VISION-GGUF: the directory the tower is read from -- ``--model``, or
+    for a ``.gguf`` file ``--tokenizer-path`` (``tower_source_dir``; raises
+    ``VisionStageLoadRefused`` when that holds no sharded checkpoint).
+    ``tokenizer_path`` is read only for a GGUF model."""
+    model = str(server_args.model_path)
+    if not is_gguf_file(model):
+        return model
+    return tower_source_dir(model_path=model, tokenizer_path=str(server_args.tokenizer_path or ""))
+
+
 def arm_victims(scheduler, env: Optional[Dict[str, str]] = None) -> Tuple[Optional[Any], str]:
     """VISION-WEIGHTS: (victim source, refusal). The VISION-SYNC LAW (user
     02.10.) holds for this place without exception -- the stage borrows
@@ -195,7 +213,7 @@ def arm_victims(scheduler, env: Optional[Dict[str, str]] = None) -> Tuple[Option
                       "one synchronous pass before the admission (VISION-SYNC LAW)")
     try:
         source = vv.resolve_source(scheduler)
-        shard = find_tower_shard(str(getattr(getattr(scheduler, "server_args", None), "model_path", "") or ""))
+        shard = find_tower_shard(tower_dir(scheduler.server_args))
         line, why = vv.arming_line(source, vrs.checkpoint_tensors(shard, is_vision_weight), _tower_name)
     except Exception as exc:  # noqa: BLE001 -- a named arming refusal, never a dead boot
         return None, f"{vv.W_VICTIM_PLAN_REFUSED}: {type(exc).__name__}: {exc}"
@@ -1347,7 +1365,7 @@ def vision_rank_pass(scheduler) -> List[Tuple[int, Any]]:
             try:
                 started = start_async_stage(
                     scheduler, pending,
-                    model_dir=str(scheduler.server_args.model_path),
+                    model_dir=tower_dir(scheduler.server_args),
                     hf_config=scheduler.model_config.hf_config,
                     device=_rank_device(),
                     source=getattr(scheduler, "_pdflip_vision_source", None),
@@ -1379,7 +1397,7 @@ def vision_rank_pass(scheduler) -> List[Tuple[int, Any]]:
                 dev = _rank_device()
                 out = run_rank_stage(
                     scheduler, pending,
-                    model_dir=str(scheduler.server_args.model_path),
+                    model_dir=tower_dir(scheduler.server_args),
                     hf_config=scheduler.model_config.hf_config,
                     device=dev,
                     place=getattr(scheduler, "_pdflip_vision_place", vrs.PLACE_AUTO),
