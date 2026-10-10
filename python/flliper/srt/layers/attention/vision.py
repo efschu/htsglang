@@ -1269,6 +1269,9 @@ class VisionAttention(nn.Module):
             q = q.contiguous()
             k = k.contiguous()
             v = v.contiguous()
+        # the fused projection is dead once q/k/v are their own copies (a view
+        # path keeps its storage alive through q/k/v regardless)
+        del qkv
         if self.qk_normalization_by_head_size:
             q, k = self._apply_qk_norm_head_size(q, k)
 
@@ -1360,6 +1363,9 @@ class VisionAttention(nn.Module):
             window_size=effective_window_size,
             s_aux=s_aux,
         )
+        # q/k/v are dead after the kernel; dropped before the output's
+        # relayout and the projection allocate
+        del q, k, v
 
         assert output.dim() == 3, output.shape
 

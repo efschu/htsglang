@@ -103,7 +103,8 @@ def test_masks_that_are_not_all_true_stay():
 # --------------------------------------------------------------- work model --
 
 #: the tower of the metal W105b (no deepstack mergers: its 4096x4096 booking
-#: was 14690 MiB = 2402 linear + 12288 quad)
+#: was 14690 MiB = 2402 linear + 12288 quad; after VISION-WORK the linear part
+#: is 1574 MiB, test_pdflip_vision_encode_work_1010)
 _VC = types.SimpleNamespace(hidden_size=1152, intermediate_size=4304, num_heads=16, out_hidden_size=5120,
                             spatial_merge_size=2, deepstack_visual_indexes=[], patch_size=16,
                             in_channels=3, temporal_patch_size=2)
@@ -122,8 +123,8 @@ def test_work_model_books_the_quad_term_only_for_more_than_one_segment():
     triton_attn never booked it."""
     still = _item([[1, 256, 256]])  # 4096x4096 at patch 16: 65536 patches
     assert vv.item_segments(still) == 1
-    assert vv.encode_work_bytes(65536, quadratic=True, **_KW) == 14690 * MIB  # the metal booking
-    assert vv.encode_work_for(_VC, [still], "sdpa") == 2402 * MIB
+    assert vv.encode_work_bytes(65536, quadratic=True, **_KW) == (1574 + 12288) * MIB  # 12288 = the pair term
+    assert vv.encode_work_for(_VC, [still], "sdpa") == 1574 * MIB
 
     clip = _item([[2, 128, 128]])
     two_rows = _item([[1, 64, 64], [1, 64, 64]])
