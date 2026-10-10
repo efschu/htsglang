@@ -317,6 +317,7 @@ from flliper.srt.managers.scheduler_components.load_inquirer import SchedulerLoa
 from flliper.srt.managers.scheduler_components.logprob_result_processor import (
     SchedulerLogprobResultProcessor,
 )
+from flliper.srt.managers.scheduler_components.loop_iter_slow import LoopIterSlow
 from flliper.srt.managers.scheduler_components.metrics_reporter import (
     RECORD_STEP_TIME,
     PrefillStats,
@@ -4431,6 +4432,7 @@ class Scheduler(
         self.result_queue: Deque[
             Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
         ] = deque()
+        _slow = LoopIterSlow()  # #1158c instrument 2: LOOP-ITER-SLOW (log only)
 
         def pop_and_process():
             # Process the results of the last batch
@@ -4439,6 +4441,7 @@ class Scheduler(
             self.process_batch_result(tmp_batch, tmp_result)
             _stage_sync(f"result-{tmp_batch.forward_mode.name}")
             _h58_span("result_ms", _h58_t0)
+            _slow.span("result_ms", _h58_t0)
 
         # nf-pd-post: the last batch's result was processed in the iteration
         # that launched it (pdflip/skip_first.result_now) -- nothing to pop for it.
@@ -4449,23 +4452,29 @@ class Scheduler(
                 break
 
             # Receive requests
+            _slow.begin()
             _h58_t0 = time.perf_counter()  # fnFL2 H58: DECODE-HOST-SPLIT recv
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             _h58_span("recv_ms", _h58_t0)
+            _slow.span("recv_ms", _h58_t0)
             if self._engine_paused:
                 continue
 
             # Multi-group runtime (#274): serial lane tick, PD priority
             # (see event_loop_normal). Runs on the default stream before the
             # overlap machinery touches forward_stream this iteration.
+            _t_slow = time.perf_counter()
             self._dual_group_lane_tick()
+            _slow.span("lane_ms", _t_slow)
 
             # #616 instrument: consume/stage the index-race counters. Sync-free
             # (staged D2H + event query), no-op unless the guard is armed.
             index_race_guard.poll()
 
+            _t_slow = time.perf_counter()
             self._apply_war_barrier()
+            _slow.span("war_ms", _t_slow)
 
             # Get the next batch to run
             _h58_t0 = time.perf_counter()  # fnFL2 H58: DECODE-HOST-SPLIT sched
@@ -4473,6 +4482,7 @@ class Scheduler(
                 running_batch=self.running_batch, last_batch=self.last_batch
             )
             _h58_span("sched_ms", _h58_t0)
+            _slow.span("sched_ms", _h58_t0)
             self.running_batch = plan.running_batch
             batch = plan.batch_to_run
             self.cur_batch_for_debug = batch
@@ -4500,7 +4510,9 @@ class Scheduler(
                 # idle poll ladder to its zero-poll rung.
                 if self.idle_sleeper is not None:
                     self.idle_sleeper.reset()
+                _t_slow = time.perf_counter()
                 batch_result = self.run_batch(batch)
+                _slow.span("run_ms", _t_slow)
                 self.result_queue.append((batch.copy(), batch_result))
                 self._pdflip_post_wake_pass_log(batch)  # Wake-Parallel item 2
                 _pdflip_resume_first_token_note(self, batch)  # RW: one line per wake
@@ -4544,6 +4556,7 @@ class Scheduler(
 
             if envs.FLLIPER_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
+            _slow.end(logger)
 
     def is_disable_overlap_for_batch(
         self, batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
@@ -23627,6 +23640,12 @@ def dispatch_event_loop(scheduler: Scheduler):
     # Dispatch to the appropriate event loop based on the disaggregation mode
     server_args = scheduler.server_args
     disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
+    # #1158c instrument 1: the moment this rank enters its event loop, once (log only). Boot 10.10.: whether D's loop had
+    # started at all before the flip's /flush_cache could only be inferred from the first #1028d broadcast stamp.
+    logger.info("EVENT-LOOP-ENTER disagg=%s pp=%s overlap=%s pdmux=%s overlap_mlx=%s t=%.3f",
+                getattr(disaggregation_mode, "name", disaggregation_mode), server_args.pp_size,
+                getattr(scheduler, "enable_overlap", None), getattr(scheduler, "enable_pdmux", None),
+                getattr(scheduler, "enable_overlap_mlx", None), time.time())
     if disaggregation_mode == DisaggregationMode.NULL:
         if scheduler.enable_pdmux:
             scheduler.event_loop_pdmux()
