@@ -16479,6 +16479,8 @@ class Front:
         oks = await asyncio.gather(
             *(self._probe_group_health(g, _fh.PROBE_TIMEOUT_S) for g in groups)
         )
+        # D-HEALTH (I): host memory-stall facts, read every poll, printed beside a failure.
+        _mem = _fh.host_mem_line()
         from sglang.srt.weg2 import progress_beacon as _fp
 
         _fp_dir = _fp.beacon_dir(getattr(self, "tag", "") or "") if _fp.enabled() else ""
@@ -16507,16 +16509,17 @@ class Front:
                 _nb = self.counters["health_busy"]
                 if _nb <= 12 or _nb % 64 == 0:
                     logger.info("WEG2-HEALTH-BUSY group=%s http_ok=False progress=%s (n=%d): the group "
-                                "computes; not counted toward the streak", g.name, _fp_why, _nb)
+                                "computes; not counted toward the streak; mem: %s", g.name, _fp_why, _nb, _mem)
                 continue
             g.health_fail_streak += 1
             g.health_facts = _fh.GroupFacts(bool(ok), bool(alive), g.health_fail_streak, hold, time.time())
             n = g.health_fail_streak
             if n <= 12 or n % 12 == 0:
                 logger.warning(
-                    "WEG2-HEALTH group=%s http_ok=%s process_alive=%s streak=%d hold=%s",
+                    "WEG2-HEALTH group=%s http_ok=%s process_alive=%s streak=%d hold=%s mem: %s",
                     g.name, ok, alive, n,
                     "-" if hold is None else f"pid={hold.pid} exception={hold.exception!r} dump={hold.path}",
+                    _mem,
                 )
             if self.group_dead_should_stop(
                 state=self.state, ok=ok, alive=alive, streak=n, hold=hold is not None,

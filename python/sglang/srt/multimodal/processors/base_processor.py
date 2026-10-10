@@ -1,10 +1,12 @@
 import asyncio
 import concurrent
 import concurrent.futures
+import copy
 import dataclasses
 import multiprocessing as mp
 import os
 import re
+import time
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
@@ -13,6 +15,7 @@ import torch
 from PIL import Image
 from transformers import BaseImageProcessor
 
+from sglang.srt.managers import mm_tokenize_offload
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -283,6 +286,8 @@ class BaseMultimodalProcessor(ABC):
             self._tokenizer = self._processor.tokenizer
         else:
             self._tokenizer = self._processor
+        # D-HEALTH: the private copy the off-loop worker runs on (offload_twin).
+        self._offload_twin: Optional["BaseMultimodalProcessor"] = None
 
         # Same guard as in serving_chat.py against double BOS.
         try:
@@ -582,6 +587,25 @@ class BaseMultimodalProcessor(ABC):
                         result[feature_name] = result[feature_name].to("cpu")
 
         return result
+
+    def offload_twin(self) -> "BaseMultimodalProcessor":
+        """This processor with a PRIVATE HF processor, for the off-loop worker.
+
+        The loop keeps tokenizing text with the shared fast tokenizer while the
+        worker (``mm_tokenize_offload``) runs the image chain; two threads on
+        one Rust tokenizer raise ``RuntimeError: Already borrowed``. Built once,
+        on the loop thread (the deep copy reads the tokenizer), ~0.8 s / 140 MB
+        for the 27B processor.
+        """
+        if self._offload_twin is None:
+            twin = copy.copy(self)
+            twin._processor = copy.deepcopy(self._processor)
+            if hasattr(twin._processor, "tokenizer"):
+                twin._tokenizer = twin._processor.tokenizer
+            else:
+                twin._tokenizer = twin._processor
+            self._offload_twin = twin
+        return self._offload_twin
 
     @abstractmethod
     async def process_mm_data_async(
@@ -1430,6 +1454,7 @@ class BaseMultimodalProcessor(ABC):
         input_ids = None
         # Handle raw items (need processing)
         if raw_images or raw_audios or raw_videos:
+            t_process = time.perf_counter()
             collected_items, input_ids, ret = self._process_and_collect_mm_items(
                 input_text=base_output.input_text,
                 images=raw_images,
@@ -1437,6 +1462,7 @@ class BaseMultimodalProcessor(ABC):
                 videos=raw_videos,
                 **kwargs,
             )
+            mm_tokenize_offload.note(process_ms=(time.perf_counter() - t_process) * 1000)
             all_collected_items = collected_items
 
             # When SGLANG_MM_AVOID_RETOKENIZE is on, keep the user's exact tokens to avoid retokenize drift.
@@ -1542,12 +1568,14 @@ class BaseMultimodalProcessor(ABC):
 
         all_collected_items = get_new_expanded_mm_items(all_collected_items)
 
+        t_hash = time.perf_counter()
         for item in all_collected_items:
             if item.format in (
                 MultimodalInputFormat.PROCESSOR_OUTPUT,
                 MultimodalInputFormat.PRECOMPUTED_EMBEDDING,
             ):
                 item.set_pad_value()
+        mm_tokenize_offload.note(hash_ms=(time.perf_counter() - t_hash) * 1000)
 
         # Task #58: THE TRANSIENT VISION STAGE RUNS HERE, or not at all.
         #

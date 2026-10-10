@@ -13,6 +13,7 @@ from torchvision.transforms import InterpolationMode
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
+from sglang.srt.managers import mm_tokenize_offload
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -721,6 +722,14 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         )
         load_time = time.perf_counter()
         rid = getattr(request_obj, "rid", "anonymous_rid")
+        mm_tokenize_offload.note(
+            load_ms=(load_time - entry_time) * 1000,
+            pixels=sum(
+                im.width * im.height
+                for im in base_output.images
+                if isinstance(im, Image.Image)
+            ),
+        )
 
         video_metadata = None
         if base_output.videos and not isinstance(base_output.videos[0], dict):
@@ -733,6 +742,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         preprocess_time = time.perf_counter()
 
         # NOTE: for qwen3-vl, video_meta need to be passed in, since do_sample_frames is already done in preprocess_video
+        combine_kwargs = {}
         if self.hf_config.model_type in (
             "qwen3_vl",
             "qwen3_vl_moe",
@@ -741,15 +751,18 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             "qwen4_exp",
             "intern_s2_preview",
         ):
-            mm_items, input_ids, ret = self.process_and_combine_mm_data(
+            combine_kwargs = dict(video_metadata=video_metadata, do_sample_frames=False)
+        if mm_tokenize_offload.requested():
+            # D-HEALTH: the HF processor + sha256 off the loop that serves /health.
+            mm_items, input_ids, ret = await mm_tokenize_offload.run_offloaded(
+                self.offload_twin().process_and_combine_mm_data,
                 base_output,
                 self.mm_tokens,
-                video_metadata=video_metadata,
-                do_sample_frames=False,
+                **combine_kwargs,
             )
         else:
             mm_items, input_ids, ret = self.process_and_combine_mm_data(
-                base_output, self.mm_tokens
+                base_output, self.mm_tokens, **combine_kwargs
             )
 
         audio_feature_lengths = None
@@ -842,6 +855,10 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         if mrope_positions.ndim == 3:
             mrope_positions = mrope_positions.squeeze(1)
         get_rope_index_time = time.perf_counter()
+        mm_tokenize_offload.note(
+            img_tokens=int((input_ids == self.mm_tokens.image_token_id).sum()),
+            mrope_ms=(get_rope_index_time - process_time) * 1000,
+        )
         logger.debug(
             f"[QwenVLProcessor Perf] {rid=}, "
             f"load_time: {(load_time - entry_time) * 1000:.2f} ms, "

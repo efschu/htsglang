@@ -14,6 +14,7 @@
 #   2. DEAD-OR-USELESS: /health_generate fails/times out    (probed every PROBE_S,
 #      twice in a row before firing — catches hangs AND livelocks that keep
 #      logging and keep /health green; costs 1 token per probe)
+#      OFF with TIER2=0 (#1158c: the launcher's group deadmen P/D never probe their group port)
 #   3. FLIP-STALL (#1262): the Weg-2 front's OWN 'WEG2-FLIP STALL' line, read
 #      from the same appended chunk tier 2 already reads. Tiers 1 and 2 are
 #      STRUCTURALLY BLIND to a livelock BEHIND a healthy front — boot weg2t2a
@@ -90,6 +91,10 @@ PATTERN="${3:-(sglang|flliper)(::scheduler|\.srt\.entrypoints\.(http_server|open
 PROBE_S="${4:-${PROBE_S:-120}}"
 CHECK_S="${5:-${CHECK_S:-15}}"
 GRACE_S="${6:-${GRACE_S:-240}}"
+# #1158c root (10.10.): TIER2=0 switches tier 2 (and the tier-3/admission questions that only ever ran inside it) OFF --
+# this watcher then never sends /health_generate. The Weg-2 launcher sets it for the GROUP deadmen P and D (their port is
+# the group's own, behind the front; a synthetic generate there runs as a real forward even inside a quiesce window).
+TIER2="${TIER2:-1}"
 
 # pgrep -f matches every process whose ARGV carries the pattern text — this
 # script itself, and any shell/timeout wrapper up the ancestor chain (the
@@ -631,6 +636,65 @@ arm_baseline() {
 # READY marker and the front's own death line, run THIS script as a child with
 # short timers, and assert the verdict it prints. No GPU, no server, ~10 s.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# #1158c root: --selftest-tier2, "A GROUP DEADMAN NEVER SENDS /health_generate".
+#
+# Runs THIS script's main loop as a child, environment exactly as the launcher's arm_deadman hands it (positional LOG PORT
+# PATTERN only, PROBE_S/TIER2/WEG2_DEADMAN_GROUP from the env), with `curl` replaced on PATH by a recorder. Port 0 stands in
+# for 30031/30032: the claim is "no /health_generate at all", and a recorder that failed to shadow curl must never reach a
+# live group. The FRONT case is the can-fail control: its first tier-2 probe must still land in the first loop pass.
+# Also run as W4 of --selftest-wiring. ~30 s, no GPU, no server.
+# ---------------------------------------------------------------------------
+if [ "$LOG" = "--selftest-tier2" ]; then
+  self="$(readlink -f "$0")"
+  tmp="$(mktemp -d)"
+  rc=0
+  tier2_case() {   # tier2_case <name> <want: sent|never> <env assignments...>
+    local name="$1" want="$2" marker log bin calls out kid n
+    shift 2
+    marker="deadman-tier2-$$-$RANDOM"
+    log="$tmp/$marker.log"; bin="$tmp/$marker.bin"; calls="$tmp/$marker.calls"
+    mkdir -p "$bin"; : > "$calls"
+    printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s"\nprintf 200\n' "$calls" > "$bin/curl"
+    chmod +x "$bin/curl"
+    echo "[2026-10-10 01:07:32] The server is fired up and ready to roll!" > "$log"
+    sleep 120 2>/dev/null &
+    kid=$!
+    env -u PDFLIP_DEADMAN_GROUP -u WEG2_DEADMAN_GROUP -u TIER2 -u PROBE_S PATH="$bin:$PATH" \
+      GRACE_UNTIL_READY=1 GRACE_S=5 CHECK_S=1 "$@" timeout 6 "$self" "$log" 0 "sleep 120" > "$log.out" 2>&1
+    kill "$kid" 2>/dev/null || true
+    wait "$kid" 2>/dev/null || true
+    n=$(grep -c 'health_generate' "$calls")
+    out=$(cat "$log.out" 2>/dev/null)
+    case "$want:$n" in
+      never:0) echo "  ok   $name (0 /health_generate)" ;;
+      sent:0)  echo "  FAIL $name: the front's first tier-2 probe did not land"; rc=1 ;;
+      sent:*)  echo "  ok   $name ($n /health_generate, first loop pass)" ;;
+      *)       echo "  FAIL $name: $n /health_generate sent: $(head -1 "$calls")"; rc=1 ;;
+    esac
+    case "$out" in *"DEADMAN grace ended by READY"*) ;; *)
+      echo "  FAIL $name: the child never reached the judging loop: $(printf '%s' "$out" | head -2 | cut -c1-160)"; rc=1 ;; esac
+  }
+  echo "== T1. group deadmen as the launcher arms them (TIER2=0 PROBE_S=10000000)"
+  tier2_case "P, launcher env" never WEG2_DEADMAN_GROUP=P TIER2=0 PROBE_S=10000000
+  tier2_case "D, launcher env" never WEG2_DEADMAN_GROUP=D TIER2=0 PROBE_S=10000000
+  tier2_case "D, renamed launcher env (PDFLIP_)" never PDFLIP_DEADMAN_GROUP=D TIER2=0 PROBE_S=10000000
+  echo "== T2. fallback alone: an older launcher without TIER2 (PROBE_S=10000000 only)"
+  tier2_case "P, no TIER2" never WEG2_DEADMAN_GROUP=P PROBE_S=10000000
+  tier2_case "D, no TIER2" never WEG2_DEADMAN_GROUP=D PROBE_S=10000000
+  echo "== T3. the switch alone: TIER2=0 on an unnamed deadman with PROBE_S=1"
+  tier2_case "no group, TIER2=0, PROBE_S=1" never TIER2=0 PROBE_S=1
+  echo "== T4. the FRONT deadman is unchanged (can-fail control): first probe right at grace end"
+  tier2_case "front, PROBE_S=120" sent WEG2_DEADMAN_GROUP=front PROBE_S=120
+  rm -rf "$tmp"
+  if [ "$rc" = "0" ]; then
+    echo; echo "SELFTEST-TIER2 PASS -- no group deadman sends /health_generate; the front's first probe is unchanged"
+  else
+    echo; echo "SELFTEST-TIER2 FAIL"
+  fi
+  exit "$rc"
+fi
+
 if [ "$LOG" = "--selftest-wiring" ]; then
   self="$(readlink -f "$0")"
   tmp="$(mktemp -d)"
@@ -707,6 +771,9 @@ if [ "$LOG" = "--selftest-wiring" ]; then
   wire_case "an ordinary decode line -> no CONTROLLER-DEAD" \
     '[2026-09-08 12:43:04 PP0] Decode batch phase=tp, #running-req: 1, #full token: 16443, gen throughput (token/s): 40.1' \
     "!CONTROLLER-DEAD"
+  echo "== W4. #1158c: a GROUP deadman never sends /health_generate (--selftest-tier2)"
+  "$self" --selftest-tier2 | sed 's/^/  /' | grep -E 'ok |FAIL|SELFTEST-TIER2'
+  [ "${PIPESTATUS[0]}" = "0" ] || rc=1
   rm -rf "$tmp"
   if [ "$rc" = "0" ]; then
     echo; echo "SELFTEST-WIRING PASS -- the tier is wired, not merely present"
@@ -1202,6 +1269,18 @@ progress_check() {
   # ONE line into the boot log this deadman watches (O_APPEND, one write)
   printf '%s\n' "$line" >> "$LOG" 2>/dev/null || true
 }
+# #1158c root (metal 10.10. 01:07:32Z, D.log of boot dkr27bggufrabar1fs10100058): the launcher armed the group deadmen with
+# PROBE_S=10000000 ("tier 1 only"), but `last_probe=0` above made `now - 0 >= PROBE_S` true on the FIRST loop pass -- one
+# /health_generate straight at :30032 the instant grace ended, 0.7 s before the flip's Release: it ran as D's first forward
+# after the quiesce /flush_cache said idle, and the Release met last_batch/overlap_result_queue -> W120/W29/W17.
+# Fallback for a launcher that does not hand TIER2=0 yet: a GROUP deadman (P, D) starts its probe clock at grace end, so its
+# first tier-2 pass is PROBE_S away, not immediate. The FRONT's deadman (and any unnamed one) keeps last_probe=0 -- its
+# first tier-2 check stays right at grace end, as before.
+case "$(dm_group)" in
+  P|D) last_probe=$(date +%s) ;;
+esac
+[ "$TIER2" = "0" ] && echo "DEADMAN tier 2 OFF (TIER2=0, group=$(dm_group)) $(date -Is) port=$PORT --" \
+  "tiers 1 and 4 only; this watcher never sends /health_generate (#1158c)"
 while true; do
   # Tier 4 first and every CHECK_S: it never ends this watcher (state + log line only).
   progress_check
@@ -1213,7 +1292,7 @@ while true; do
   fi
   # Tier 2: real-generate probe — the only honest liveness signal.
   now=$(date +%s)
-  if [ $(( now - last_probe )) -ge "$PROBE_S" ]; then
+  if [ "$TIER2" != "0" ] && [ $(( now - last_probe )) -ge "$PROBE_S" ]; then
     last_probe=$now
     # PASSIVE FIRST: if the box served real work in the window that just
     # passed, do not manufacture a 1-token request to ask whether it is alive.

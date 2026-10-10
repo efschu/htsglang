@@ -53,6 +53,8 @@ import os
 import re
 from typing import Callable, Iterable, List, NamedTuple, Optional
 
+from sglang.srt.weg2 import host_mem_probe as _hmp
+
 ENV = "SGLANG_WEG2_FRONT_HEALTH_FACTS"
 POLL_S = 5.0
 PROBE_TIMEOUT_S = 8.0
@@ -181,3 +183,21 @@ def unhealthy_reason(facts: GroupFacts, state: str) -> Optional[str]:
     if not facts.http_ok and facts.streak >= 2:
         return f"http_ok=False streak={facts.streak}"
     return None
+
+
+_HOST_MEM: Optional[_hmp.HostMemDeltas] = None
+
+
+def host_mem_line() -> str:
+    """D-HEALTH (I): PSI memory avg10, swap used and the swap/compaction deltas since the previous call.
+
+    Read on every poll (so a delta spans one poll period) and printed beside a
+    failed /health, to tell a memory stall in a group's tokenizer from a hung
+    group. Log only; never raises."""
+    global _HOST_MEM
+    try:
+        if _HOST_MEM is None:
+            _HOST_MEM = _hmp.HostMemDeltas()
+        return _HOST_MEM.line()
+    except Exception as exc:  # noqa: BLE001 -- an instrument never stops the poll
+        return f"unavailable({type(exc).__name__})"
