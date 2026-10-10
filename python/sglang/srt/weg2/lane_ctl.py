@@ -89,6 +89,11 @@ MARK_EARLY_TAKE = "WEG2 LANE-EARLY-TAKE"
 MARK_P_RESUME = "WEG2 LANE-P-RESUME"
 #: a held SSE stream was opened (200 + text/event-stream) so that it can get its keepalive (L4 FR2)
 MARK_SSE_OPEN = "WEG2 LANE-SSE-OPEN"
+#: LANES FIX 3 (metal 211536): the boot's lifecycle went ``dead`` (a rank died) while streams were held: every held stream gets
+#: ONE named error event and is closed at once, instead of an empty 200 until the dead group's HTTP leg finally breaks (76 s there)
+MARK_GROUP_DEAD = "WEG2 LANE-GROUP-DEAD"
+#: how often the lane loop reads the boot lifecycle while it holds streams
+DEATH_CHECK_S = 1.0
 
 
 def enabled() -> bool:
@@ -169,6 +174,9 @@ class LaneCtl:
         self.pre: Dict[str, Dict[str, Any]] = {}
         #: the abort tasks of cancelled early legs (a fresh leg 1 of the Pending waits for its own)
         self.early_tasks: set = set()
+        #: LANES FIX 3: real time of the last lifecycle read, and whether the held streams were answered with the death already
+        self.death_checked_t = 0.0
+        self.death_announced = False
         self.lock: Optional[asyncio.Lock] = None
         self.kick_evt: Optional[asyncio.Event] = None
 
@@ -1035,6 +1043,77 @@ async def keepalive_tick(fr: Any, now: Optional[float] = None) -> int:
 
 
 # ---------------------------------------------------------------------------
+# LANES FIX 3: the death of the boot reaches the held streams
+# ---------------------------------------------------------------------------
+
+def boot_death_reason(fr: Any) -> Optional[str]:
+    """Why the boot is dead (the lifecycle the dying rank wrote through the one state writer, ``state_file.note_rank_death``),
+    or None.  No state directory / no file / an unreadable one: None -- a reading problem is no death."""
+    try:
+        from sglang.srt.environ import envs
+        from sglang.srt.weg2 import state_file
+
+        d = envs.WEG2_STATE_DIR.get() or None
+        if not d:
+            return None
+        st = state_file.read(d)
+    except (Exception, SystemExit):  # noqa: BLE001 -- StateFileError is a SystemExit
+        return None
+    life = st.get("lifecycle") or {}
+    if life.get("state") != "dead":
+        return None
+    cause = st.get("cause") or {}  # the writer puts the cause beside the lifecycle (``state_file.transition``)
+    code = cause.get("code") or "dead"
+    detail = str(cause.get("detail_full") or cause.get("detail") or "")[-200:]
+    grp = cause.get("group")
+    return f"group {grp} died ({code}{': ' + detail if detail else ''})" if grp else f"the server died ({code}{': ' + detail if detail else ''})"
+
+
+async def abort_held_streams(fr: Any, lc: LaneCtl, reason: str, now: float) -> int:
+    """Every held SSE stream gets ONE named error event and is closed: the ones already open, and the ones a hold of this
+    long would have opened at the next keepalive (opened here first: the status is 200 either way, only the event is new).
+    Returns how many.  The handlers still waiting on their legs end later and find the stream closed (``_lane_pre_finish``
+    swallows the write to a closed stream)."""
+    from sglang.srt.weg2.front import named_error_chunk
+
+    ls = fr._lane_state()
+    floor = max(1, int(ls.lane_floor))
+    for rid, e in list(lc.pre.items()):
+        if e["resp"] is None and not e["taken"]:
+            await _pre_open(fr, lc, rid, e, floor, now)
+    n = 0
+    for rid, e in list(lc.streams.items()):
+        lc.streams.pop(rid, None)
+        req = e.get("request")
+        path = getattr(req, "path", "/v1/chat/completions")
+        try:
+            if e.get("boundary", True):  # inside an SSE event the event is not completed with a foreign one: only the close
+                await e["resp"].write(named_error_chunk(path, f"WEG2 lane hold ended: {reason}"))
+            await e["resp"].write_eof()
+        except Exception:  # noqa: BLE001 -- a client that left
+            continue
+        n += 1
+    fr.counters["lane_group_dead_streams"] += n
+    logger.warning("%s streams=%d lane_floor=%d -- %s: every held SSE stream was answered with one named error event and closed "
+                   "(the group answers nobody any more)", MARK_GROUP_DEAD, n, int(ls.lane_floor), reason)
+    return n
+
+
+async def group_death_tick(fr: Any, lc: LaneCtl, now: float) -> int:
+    """Once a second while streams are held: read the boot lifecycle, and on ``dead`` answer them (once per death)."""
+    if lc.death_announced or not (lc.streams or lc.pre) or now - lc.death_checked_t < DEATH_CHECK_S:
+        return 0
+    if fr._lane_state().lane_floor <= 0:
+        return 0  # nothing is held: the ordinary death paths answer the streams as they always did
+    lc.death_checked_t = now
+    reason = await asyncio.to_thread(boot_death_reason, fr)
+    if reason is None:
+        return 0
+    lc.death_announced = True
+    return await abort_held_streams(fr, lc, reason, now)
+
+
+# ---------------------------------------------------------------------------
 # the loop
 # ---------------------------------------------------------------------------
 
@@ -1057,6 +1136,7 @@ async def step(fr: Any, now: Optional[float] = None) -> None:
                    for r in list(D.outstanding)):
                 lc.park_tried = now
                 await _park_d(fr, lc, ls, ls.lane_floor, retry=True)
+    await group_death_tick(fr, lc, now)
     await keepalive_tick(fr, now)
 
 

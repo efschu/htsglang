@@ -622,7 +622,8 @@ class AdderHoldTest(unittest.TestCase):
         from sglang.srt.managers import scheduler as sch
 
         src = open(sch.__file__).read()
-        i = src.index("_lane_floor = _lanes_p.floor_for_pass(self) if _lanes_p.owns_admission(self) else 0")
+        # LANES FIX 3: the rank-local form skips too (every rank that decides membership itself), see test_weg2_lanes_fix3_1010
+        i = src.index("_lane_floor = _lanes_p.floor_for_pass(self) if _lanes_p.skips_by_lane(self) else 0")
         blk = src[i:i + 900]
         self.assertIn("_lanes_p.holds(_lanes_p.req_lane(req), _lane_floor)", blk)
         self.assertIn('_note_skip("weg2_lane_held", req.rid)', blk)
@@ -776,6 +777,7 @@ class ResumeTest(unittest.TestCase):
 class LaneChunkTest(unittest.TestCase):
     def _configured(self, cap, waiting_lane, *, pp_rank=0):
         s = _stage(pp_rank)
+        s.pp_flip_counters = object()  # LANES FIX 3: the chunk cap exists only on a form with a row carrier (the schedule carries it)
         st = lanes_p.state_of(s, create=True)
         st.offer(0, 1)
         st.promote()
