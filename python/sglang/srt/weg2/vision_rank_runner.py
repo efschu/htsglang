@@ -719,15 +719,18 @@ def _close_lease(out: "StageOutcome", lease, device: torch.device, run: int) -> 
     before any teardown step can raise; a failed return is W110c, fatal."""
     sync = (lambda: torch.cuda.current_stream(device).synchronize()) if device.type == "cuda" else None
     why = lease.close(sync=sync)
-    out.legs_ms.update({k: lease.legs_ms[k] for k in ("stash", "restore", "verify") if k in lease.legs_ms})
-    out.victim_fields = lease.fields()
-    out.victim_host_line = lease.host_line(run)
+    # the fatal verdict is written FIRST: nothing below (the field lines, the
+    # teardown, the residue reads) may lose it -- and the caller's ``outcome``
+    # object outlives a raise out of ``run_rank_stage`` (review S1)
     out.checksum = "ok" if why is None else "MISMATCH" if "MISMATCH" in why else "FAILED"
     if why is not None:
         out.ok = False
         out.code = why.split(":", 1)[0]
         out.fatal = why
         out.detail = f"{why}; {out.detail}" if out.detail else why
+    out.legs_ms.update({k: lease.legs_ms[k] for k in ("stash", "restore", "verify") if k in lease.legs_ms})
+    out.victim_fields = lease.fields()
+    out.victim_host_line = lease.host_line(run)
 
 
 def wait_pp0_forward(scheduler, clock: Callable[[], float] = time.perf_counter) -> float:
@@ -793,16 +796,21 @@ def run_rank_stage(scheduler, reqs: Sequence[Any], *, model_dir: str, hf_config:
                    source: Optional[vrs.TowerSource] = None,
                    air: Callable[[torch.device], Tuple[int, int]] = card_air,
                    victims: Optional[Any] = None,
-                   deadline_s: Optional[float] = None) -> StageOutcome:
+                   deadline_s: Optional[float] = None,
+                   outcome: Optional["StageOutcome"] = None) -> StageOutcome:
     """One tower load for all ``reqs``. Never raises: the verdict is the
     outcome. The teardown runs on every path, and the residue is measured
     only after the failure (and its traceback, which pins the forward's
     activations) is gone. ``victims`` (place=weights): the armed victim
-    source; ``deadline_s``: checked only between legs (W109)."""
+    source; ``deadline_s``: checked only between legs (W109). ``outcome``:
+    the caller's own outcome object, filled in place -- if the teardown or
+    a residue read still raises AFTER the victims' return failed (W110c),
+    the caller reads ``outcome.fatal`` from it and the crash-stop is not
+    lost with the exception (review S1)."""
     from sglang.srt.layers.rotary_embedding import factory as rope_factory
     from sglang.srt.weg2 import vision_victim as vv
 
-    out = StageOutcome()
+    out = outcome if outcome is not None else StageOutcome()
     lease = None
     t_stage0 = clock()
     items = [it for r in reqs for it in unstaged_items(r)]
@@ -1422,6 +1430,7 @@ def vision_rank_pass(scheduler) -> List[Tuple[int, Any]]:
             held = pending + held
         else:
             scheduler._weg2_vision_runs += 1
+            stage_out = StageOutcome()  # outlives a raise: W110c must not (review S1)
             try:
                 dev = _rank_device()
                 out = run_rank_stage(
@@ -1432,6 +1441,7 @@ def vision_rank_pass(scheduler) -> List[Tuple[int, Any]]:
                     place=getattr(scheduler, "_weg2_vision_place", vrs.PLACE_AUTO),
                     source=getattr(scheduler, "_weg2_vision_source", None),
                     victims=getattr(scheduler, "_weg2_vision_victims", None),
+                    outcome=stage_out,
                 )
                 if dev.type == "cuda":
                     out.card = _nvml_index_of(dev.index if dev.index is not None else 0)
@@ -1439,6 +1449,14 @@ def vision_rank_pass(scheduler) -> List[Tuple[int, Any]]:
                 logger.exception("%s: the stage raised outside its own verdict", W_LOAD)
                 out = StageOutcome(ok=False, code=W_LOAD,
                                    detail=f"stage: {type(exc).__name__}: {exc}")
+                if stage_out.fatal:
+                    # the victims' return had already failed (W110c) when the
+                    # teardown / the residue reads raised: the verdict that
+                    # stops the group is the FIRST one, never the later raise
+                    out.code = stage_out.fatal.split(":", 1)[0]
+                    out.fatal = stage_out.fatal
+                    out.checksum = stage_out.checksum
+                    out.detail = f"{stage_out.fatal}; {out.detail}"
             log_outcome(out, [r.rid for r in pending], scheduler._weg2_vision_runs)
             if out.fatal:
                 # W110c: the ONE stage verdict that kills the group -- victim
