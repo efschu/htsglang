@@ -88,15 +88,128 @@ class DraftPost(msgspec.Struct, frozen=True):
         )
 
 
+#: GGUF tensor name -> the HF name the ``exclude`` fragments of this module are
+#: written against (``P_SHARED_WITH_TARGET`` / ``D_SHARED_WITH_TARGET``). Every other
+#: GGUF tensor name contains neither fragment, so it is never excluded.
+GGUF_VOCAB_HF_NAMES = {
+    "token_embd.weight": "model.embed_tokens.weight",
+    "output.weight": "lm_head.weight",
+}
+
+
+def _gguf_draft_files(path: str) -> List[str]:
+    """The GGUF file(s) of a draft: the file itself (its whole split set), or the
+    ONE GGUF (set) of a directory. Empty when ``path`` names no GGUF -- and when a
+    directory holds several unrelated ``*.gguf`` (the unsloth ``MTP/`` folder holds
+    four variants of the same head): summing them would price the draft at several
+    times its size, so the draft path must name the file."""
+
+    def whole_set(first: str) -> List[str]:
+        try:
+            from sglang.srt.model_loader.gguf_shards import resolve_gguf_shard_paths
+
+            return [str(x) for x in resolve_gguf_shard_paths(first)]
+        except Exception:  # noqa: BLE001 - an unsplit file is its own set
+            return [first]
+
+    p = str(path)
+    if os.path.isfile(p):
+        with open(p, "rb") as fh:
+            if not (p.endswith(".gguf") or fh.read(4) == b"GGUF"):
+                return []
+        return whole_set(p)
+    if os.path.isdir(p):
+        found = sorted(glob.glob(os.path.join(p, "*.gguf")))
+        if not found:
+            return []
+        parts = whole_set(found[0])
+        return parts if sorted(os.path.realpath(x) for x in parts) == sorted(
+            os.path.realpath(x) for x in found
+        ) else []
+    return []
+
+
+def gguf_checkpoint_tensor_mib(path: str, *, exclude: Sequence[str] = ()) -> Optional[float]:
+    """The :func:`checkpoint_tensor_mib` of a draft shipped as a GGUF (the
+    ``mtp-*.gguf`` head of the unsloth qwen4exp export): the exact per-tensor byte
+    counts of the tensor directory (header only, ``GGUFReader`` maps the file but
+    reads no payload).
+
+    * ``exclude`` fragments are matched against the tensor's GGUF name and its HF
+      alias (:data:`GGUF_VOCAB_HF_NAMES`), so ``lm_head`` removes ``output.weight``
+      and ``embed_tokens`` removes ``token_embd.weight``. The ``shared-*`` head
+      has neither tensor: the whole file is the price.
+    * a COMBINED export (backbone blocks plus a trailing NEXTN block) prices only
+      the draft blocks ``block_count - nextn_predict_layers ..`` -- the backbone is
+      the target's, and counting it would price the draft at the target's size.
+
+    ``None`` when ``path`` is no GGUF or the header cannot be read -- absent,
+    never 0.
+    """
+    files = _gguf_draft_files(path)
+    if not files:
+        return None
+    try:
+        import gguf
+    except ImportError:
+        return None
+    rows: List[Tuple[str, int]] = []
+    arch, block_count, nextn = "", None, 0
+    try:
+        for f in files:
+            reader = gguf.GGUFReader(f, "r")
+            field = reader.fields.get("general.architecture")
+            if field is not None:
+                arch = str(field.contents())
+                for key in ("block_count", "nextn_predict_layers"):
+                    kf = reader.fields.get(f"{arch}.{key}")
+                    if kf is not None:
+                        val = int(kf.contents())
+                        if key == "block_count":
+                            block_count = val
+                        else:
+                            nextn = val
+            rows.extend((str(t.name), int(t.n_bytes)) for t in reader.tensors)
+    except Exception:  # noqa: BLE001 - gguf reader errors are not OSError
+        return None
+    if not rows:
+        return None
+
+    def blk(name: str) -> Optional[int]:
+        parts = name.split(".")
+        if len(parts) > 2 and parts[0] == "blk" and parts[1].isdigit():
+            return int(parts[1])
+        return None
+
+    first_draft = None if block_count is None or nextn <= 0 else block_count - nextn
+    backbone = first_draft is not None and any(
+        (b := blk(n)) is not None and b < first_draft for n, _ in rows
+    )
+    total = 0
+    for name, n_bytes in rows:
+        if backbone:
+            b = blk(name)
+            if b is None or b < first_draft:
+                continue
+        alias = GGUF_VOCAB_HF_NAMES.get(name, name)
+        if any(x in name or x in alias for x in exclude):
+            continue
+        total += n_bytes
+    return total / MIB
+
+
 def checkpoint_tensor_mib(path: str, *, exclude: Sequence[str] = ()) -> Optional[float]:
     """MiB of every tensor in ``path``'s ``*.safetensors`` whose name contains
-    none of ``exclude``, read from the HEADERS (no tensor byte is read).
+    none of ``exclude``, read from the HEADERS (no tensor byte is read). A draft
+    that is a GGUF (file, or a directory with ``*.gguf`` and no safetensors) is
+    priced the same way from its tensor directory
+    (:func:`gguf_checkpoint_tensor_mib`).
 
-    ``None`` when the directory holds no safetensors file -- absent, never 0.
+    ``None`` when the directory holds neither -- absent, never 0.
     """
     files = sorted(glob.glob(os.path.join(str(path), "*.safetensors")))
     if not files:
-        return None
+        return gguf_checkpoint_tensor_mib(path, exclude=exclude)
     total = 0
     for f in files:
         with open(f, "rb") as fh:
@@ -233,8 +346,9 @@ def raise_for_draft_post(*, fracs: Sequence[float], stage_layers: Sequence[int],
     stage = len(fr) - 1
     weights, transient = p_draft_post_mib(draft_path) if draft_path else (None, 0.0)
     if weights is None:
-        return fr, None, (f"draft checkpoint {draft_path!r} holds no *.safetensors -- "
-                          "the draft post cannot be priced, fractions unchanged")
+        return fr, None, (f"draft checkpoint {draft_path!r} holds no *.safetensors "
+                          "and no readable *.gguf -- the draft post cannot be priced, "
+                          "fractions unchanged")
     freed = weights + transient
     rows, new = expert_rows_for(freed, int(stage_layers[stage]), row_mib,
                                 num_experts, fr[stage])
