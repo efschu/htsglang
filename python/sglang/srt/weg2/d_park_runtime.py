@@ -366,6 +366,18 @@ def _land_inflight(sched, keep_chunked=None) -> None:
     sched.last_batch = None
 
 
+def _unmerge_chunk(sched, chunk) -> None:
+    """LANES FIX 1b (review round 1): ``park_rids`` of the chunked request merged it into the running batch
+    (``_land_inflight(keep_chunked=None)``). Every return BEFORE the retract must undo that merge: the unfinished
+    prefill would otherwise decode in ``running_batch`` while ``sched.chunked_req`` keeps chunking it (double
+    membership). Taking it out again restores exactly what ``get_next_batch_to_run`` would have made of the
+    landing (the chunked request is excluded from the merge). No-op when it is not in the batch."""
+    rb = sched.running_batch
+    if chunk is None or rb.is_empty() or not any(r is chunk for r in rb.reqs):
+        return
+    rb.filter_batch(chunked_req_to_exclude=[chunk])
+
+
 def _retract_subset(sched, reqs, sel) -> list:
     """Retract exactly ``reqs[i] for i in sel`` RETAINING their spans (``release_req(retain=True)`` per request,
     then one ``filter_batch(keep_indices=...)`` -- the shape of ``retract_decode`` and of SA (3)'s
@@ -493,10 +505,14 @@ def park_rids(sched, recv_req, *, rids, hold: str = ""):
     if spec and sel and sel != list(range(len(reqs) - len(sel), len(reqs))):
         # SPEC BACK-ONLY REMOVAL INVARIANT (kv_session_offload.spec_decline_non_back_spill): only the back of
         # the batch may leave under speculative decoding -- named, nothing parked, the front asks again
+        if park_chunk:
+            _unmerge_chunk(sched, chunk)  # nothing parked: the chunk goes back to being only chunked_req
         return _out(False, [], "W-PARK refused: the rids are not the back of the batch under speculative "
                                "decoding -- nothing parked, the front asks again",
                     held=held_ids, skipped=skipped)
     if not sel and outside is None:
+        if park_chunk:
+            _unmerge_chunk(sched, chunk)
         return _out(True, already, "nothing to retract: no requested rid is running here",
                     held=held_ids, skipped=skipped)
     sel_reqs = [reqs[i] for i in sel] + ([outside] if outside is not None else [])
