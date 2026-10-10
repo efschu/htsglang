@@ -6512,7 +6512,7 @@
      "source": {
       "file": "weg2/launcher.py",
       "kind": "argparse",
-      "line": 22340
+      "line": 22351
      }
     }
    },
@@ -7081,7 +7081,7 @@
      "source": {
       "file": "weg2/launcher.py",
       "kind": "argparse",
-      "line": 22344
+      "line": 22355
      }
     }
    },
@@ -11291,7 +11291,7 @@
      "source": {
       "file": "weg2/launcher.py",
       "kind": "argparse",
-      "line": 22396
+      "line": 22407
      }
     }
    },
@@ -18247,7 +18247,7 @@
      "source": {
       "file": "weg2/launcher.py",
       "kind": "argparse",
-      "line": 23829
+      "line": 23840
      }
     }
    },
@@ -18951,7 +18951,7 @@
      "source": {
       "file": "weg2/launcher.py",
       "kind": "argparse",
-      "line": 23101
+      "line": 23112
      }
     }
    },
@@ -26949,7 +26949,7 @@
      "source": {
       "file": "weg2/launcher.py",
       "kind": "argparse",
-      "line": 23476
+      "line": 23487
      }
     }
    },
@@ -27202,7 +27202,7 @@
     "baum": "nf",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23646
+    "line": 23657
    },
    "status": "kuratiert",
    "text": "Names the census row from which a card is priced that is not in the census file by UUID: list <live>=<census UUID>, <live> = card UUID, nvml<N> or class (RTX3080). Without an entry the start borrows the heaviest row of the same class (otherwise of the whole census) and refuses that as HW-BORROWED until force is set.",
@@ -28340,7 +28340,7 @@
      "source": {
       "file": "weg2/launcher.py",
       "kind": "argparse",
-      "line": 22539
+      "line": 22550
      }
     }
    },
@@ -82404,7 +82404,7 @@
      "source": {
       "file": "managers/scheduler.py",
       "kind": "os.environ",
-      "line": 920
+      "line": 921
      }
     }
    },
@@ -83734,7 +83734,7 @@
      "source": {
       "file": "weg2/vision_rank_runner.py",
       "kind": "os.environ",
-      "line": 1141
+      "line": 1179
      }
     }
    },
@@ -85901,7 +85901,7 @@
   "kuratiert": 121,
   "unerklaert": 602
  },
- "tree_rev": "27b=84d04adae1+nf=084a9ed595",
+ "tree_rev": "27b=84d04adae1+nf=a119ed82e5",
  "trees": {
   "27b": {
    "entries": 2641,
@@ -85909,7 +85909,7 @@
   },
   "nf": {
    "entries": 2508,
-   "rev": "084a9ed595"
+   "rev": "a119ed82e5"
   }
  },
  "warnungen": []
