@@ -72,9 +72,9 @@ class RealCatalog(unittest.TestCase):
     def test_status_block_counts(self):
         k = self.cat["kanten"]
         self.assertTrue(k["geladen"])
-        self.assertEqual((k["kanten_gesamt"], k["verschmolzen"], k["neu"]), (131, 51, 80))
+        self.assertEqual((k["kanten_gesamt"], k["verschmolzen"], k["neu"]), (132, 51, 81))
         self.assertEqual(k["kanten_ohne_beleg"], OHNE_BELEG)
-        self.assertEqual(k["kanten_belegt"], 131)
+        self.assertEqual(k["kanten_belegt"], 132)
         self.assertEqual(k["uebersprungen_ohne_von"], [])
         self.assertEqual(k["ziel_unbekannt"], ZIEL_UNBEKANNT)
         self.assertEqual(k["wertbedingt"], 22)
@@ -107,7 +107,7 @@ class RealCatalog(unittest.TestCase):
         self.assertTrue(d["effect"])                    # the curated sentence is untouched
         n_curated = sum(len(c.get("depends", [])) for c in CU.CURATED.values())
         n_all = sum(len(e["depends"]) for e in self.ent.values())
-        self.assertEqual(n_all, n_curated + 80)         # nothing deleted, 80 appended (57 + 8 AP-H1 + 15 Katalog-Neubau 07.10.)
+        self.assertEqual(n_all, n_curated + 81)         # nothing deleted, 81 appended (57 + 8 AP-H1 + 15 Katalog-Neubau 07.10. + K132 X-SUM-PRICE 10.10.)
 
     def test_new_edges_are_appended_with_source_katalog(self):
         d = self.dep("--idle-layout", "--dual-layout")  # K44, not curated

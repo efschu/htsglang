@@ -1252,6 +1252,15 @@ ERKLAERT.update({
         "satz_quelle": 'NF-Sitz, Bericht 1504 (Baum nf-release-cand-1005 @3bfee09511), Freigabe als Katalogtext 05.10. 19:22Z'},
 })
 
+# X-SUM-PRICE (NF-Sitz 10.10.): die Ankunftsregel preist D-Prefill als Summe, nicht je Request.
+ERKLAERT.update({
+    'SGLANG_WEG2_ENABLE_DECODE_COLLECT_PREFILL_BUSY': {"kind": "env", "group": 'Other', "level": "experte", "planner_derived": False,
+        "text": 'Collect rule for short requests when D is prefilling instead of decoding: on, a short request (that would go to D by itself) that was granted to D and has not yet delivered a first token counts as work on D. The next short requests that arrive meanwhile are collected for the window (SGLANG_WEG2_DECODE_COLLECT_WINDOW_S) and priced as a SUM together with those open tokens against the X limit; what does not fit goes to the P batch. Off: the old blind path, every short request is checked alone against X and an idle D takes all of them (six shorts of 6239 tokens within one second: 37k tokens prefilled on D, about 53 s). Default on in the NF tree (since 10.10.; metal int23xsum2 09.10.: 6 x 5200 on an idle D, one seat on D, five to the P batch). Effective only with the collect window above 0 (default 15 s); with the window at 0 the rule is the old path anyway.',
+        "gain": 'A burst of short requests no longer lands on D as one long prefill: the sum is checked, the rest is prefilled by P as a batch.',
+        "cost": 'A short request that arrives while D prefills another one waits for the collect window before it is served; a long short plus a straggler can flip D to P at the window end.',
+        "depends": [], "satz_quelle": 'NF-Sitz, X-SUM-PRICE (Review xsum-review-1009, Planer-Auftrag 10.10.), Metall int23xsum2 09.10. 22:53Z', "baeume_erwartet": ["nf"]},
+})
+
 # Wedge-Alarm-Uhr: derselbe Name in beiden Bäumen, je Baum andere Wirkung (27B nur Dual, NF ohne Gate; 05.10.). Beide Sätze belegt von dem Sitz, dem der Baum gehört;
 # der Editor zeigt zusätzlich die Beschreibungen beider Bäume nebeneinander (abweichung).
 ERKLAERT.update({
