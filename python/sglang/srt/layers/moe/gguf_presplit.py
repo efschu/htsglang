@@ -22,6 +22,17 @@ per tensor (``w13_qweight`` / ``w2_qweight``):
 4. the bank published to the flip under ``expert_buffer_attr_name`` (a prefix view under the Karte), the stash
    ``_moe_offload_presplit`` / ``_moe_offload_frozen_layout`` the offload cache adopts verbatim.
 
+D-STORE-ADOPT FOR GGUF IS NOT DELIVERED (review 2 / major 2).  The adoption (a D rank skipping the rows P already
+published) is armed per layer by ``store_adopt.discount_expected``, called only by the compressed-tensors scheme's
+early-presplit counter.  Nothing on the GGUF path sets ``_moe_store_adopt_ok``, so ``store_adopt.vetoed_global_ids``
+answers "no vetoes" for a GGUF layer and the loader reads every owned expert, exactly as before G4.  The GGUF-aware
+pieces that ARE in ``store_adopt`` (``_compute`` for the trailing-pad window, ``repack_rows`` as a pure row copy,
+``filter_store_rows`` in the door) are building blocks for a later arming; they are only reachable on a real boot
+once that arming exists.  Arming it needs two things this AP does not do: the GGUF scheme must discount the vetoed
+experts from the loader's expected count (``_gguf_owned_expert_count`` is ``hi - lo + 1`` and the count check below
+refuses a loader that delivers fewer), and ``qwen4_exp``'s loader veto (``weight_name_needed``) must see the same
+cached veto set.  Until then the tests arm the attribute by hand to drive those building blocks.
+
 The door is OFF unless the boot asks for one of the things it adds: a store directory
 (``SGLANG_MOE_EXPERT_STORE_DIR``), a Version-2 Karte, or seat rows.  Without them ``door_wanted`` is False and
 ``materialize_gguf_weights`` runs the pre-G4 code unchanged (the INT4 / A16 path is a different file entirely).
@@ -133,9 +144,14 @@ def boot_wants_platztausch(layer=None) -> bool:
     return False
 
 
-def owned_expert_host_bytes(files, lo: int, hi: int):
-    """Host bytes this rank's loader holds for the owned experts ``[lo, hi)`` of EVERY layer, from the GGUF
-    headers: ``sum over layers of (hi - lo) x (one expert's row, all projections)``. Returns ``(bytes, layers)``.
+def owned_expert_host_bytes(files, lo: int, hi: int, layers=None):
+    """Host bytes this rank's loader holds for the owned experts ``[lo, hi)`` of the layers it OWNS, from the GGUF
+    headers: ``sum over owned layers of (hi - lo) x (one expert's row, all projections)``. ``layers`` is the set of
+    layer ids this pipeline stage loads (``None`` = every layer in the header, the unpipelined case). Returns
+    ``(bytes, layers counted)``.
+
+    A P pipeline stage loads only its own layers (``qwen4_exp.weight_layer_is_owned`` filters by the stage's
+    ``start_layer``/``end_layer``), so counting the header's other layers would overstate that stage's peak.
 
     This is the host peak of the Platztausch door: ``materialize_gguf_weights`` runs from
     ``process_weights_after_loading`` only AFTER the complete ``load_weights`` pass, so the whole owned set is in
@@ -144,9 +160,39 @@ def owned_expert_host_bytes(files, lo: int, hi: int):
     from sglang.srt.layers.moe import gguf_layout as _gl
 
     per_layer = _gl.row_class_bytes(files)
+    if layers is not None:
+        keep = {int(i) for i in layers}
+        per_layer = {k: v for k, v in per_layer.items() if int(k) in keep}
     n_owned = int(hi) - int(lo)
     total = sum(sum(p.values()) for p in per_layer.values()) * n_owned
     return int(total), len(per_layer)
+
+
+def stage_owned_layers(num_layers: int):
+    """The layer ids THIS pipeline stage loads, resolved with the same two functions ``make_layers`` uses
+    (``get_pp_layer_set`` for a set-form placement, else ``get_pp_indices``) from the live PP group.
+
+    Returns ``(layer_ids or None, pp_note)``: ``None`` with note ``""`` = unpipelined (every layer); ``None`` with a
+    non-empty note = the stage could not be resolved (the caller must say so, never log the all-layers sum as this
+    stage's peak)."""
+    try:
+        from sglang.srt.distributed import get_pp_group, get_pp_indices
+        from sglang.srt.distributed.utils import get_pp_layer_set
+
+        group = get_pp_group()
+        size, rank = int(group.world_size), int(group.rank_in_group)
+    except Exception as exc:  # noqa: BLE001 -- no process group in a unit test / before init
+        return None, "pipeline stage not resolved: %s" % exc
+    if size <= 1:
+        return None, ""
+    try:
+        owned = get_pp_layer_set(int(num_layers), rank, size)
+        if owned is None:
+            start, end = get_pp_indices(int(num_layers), rank, size)
+            owned = range(int(start), int(end))
+        return frozenset(int(i) for i in owned), "PP stage %d of %d" % (rank, size)
+    except Exception as exc:  # noqa: BLE001
+        return None, "pipeline layer span not resolved: %s" % exc
 
 
 _PEAK_NOTE_LOGGED = False
@@ -163,7 +209,7 @@ def log_host_peak_once(layer) -> None:
     head = (
         "%s: streaming staging off (SGLANG_MOE_GGUF_STREAM_STAGING) -- the shared store / Karte / seat rows are "
         "served at materialization, i.e. after the COMPLETE load pass: host peak = this rank's WHOLE owned expert "
-        "set over all layers, not one layer's" % MARKER
+        "set over every layer of this pipeline stage, not one layer's" % MARKER
     )
     try:
         from sglang.srt.layers.moe import gguf_layout as _gl
@@ -176,9 +222,16 @@ def log_host_peak_once(layer) -> None:
             lo, hi = 0, int(getattr(layer, "num_experts", 0) or 0)
         else:
             lo, hi = int(rng[0]), int(rng[1])
-        total, n_layers = owned_expert_host_bytes(files, lo, hi)
+        # layer count = highest expert layer in the header + 1 (every NF layer is a MoE layer; ``make_layers`` splits
+        # the same count over the stages)
+        n_total_layers = max(_gl.row_class_bytes(files)) + 1
+        owned_layers, pp_note = stage_owned_layers(n_total_layers)
+        if owned_layers is None and pp_note:
+            raise ValueError(pp_note + " -- the all-layers sum would overstate a pipeline stage")
+        total, n_layers = owned_expert_host_bytes(files, lo, hi, owned_layers)
         logger.info(
-            "%s (header: %d layers x experts [%d, %d) = %.2f GiB per rank)", head, n_layers, lo, hi, total / 2**30
+            "%s (header: %d layers%s x experts [%d, %d) = %.2f GiB per rank)",
+            head, n_layers, (" of this %s" % pp_note) if pp_note else "", lo, hi, total / 2**30,
         )
     except Exception as exc:  # noqa: BLE001 -- a log line must never fail a load
         logger.info("%s (size not derived from the header: %s)", head, exc)
@@ -280,6 +333,13 @@ def presplit_gguf_param(layer, attr: str, param, source):
             f"{MARKER}: layer {layer_id} {attr}: the loader delivered {count} experts, the layer owns "
             f"{expected} (rank {getattr(layer, 'moe_tp_rank', '?')}, range "
             f"{getattr(layer, '_gguf_expert_range', None)}) -- local ids would no longer be global ids"
+            + (
+                " (the layer carries a D-store-adopt veto set, "
+                f"{len(layer._moe_store_adopt_vetoed_global)} experts: GGUF adoption is not armed by any scheme "
+                "yet, the expected count does not discount vetoed experts)"
+                if getattr(layer, "_moe_store_adopt_vetoed_global", None)
+                else ""
+            )
         )
     plan, order, n_praefix = _plan_for(layer, int(count))
     if plan is None:

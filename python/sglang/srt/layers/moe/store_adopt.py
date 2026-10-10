@@ -216,6 +216,9 @@ ADOPT_OK_ATTR = "_moe_store_adopt_ok"
 #: are still uninitialized when the adoption is armed. Same two names ``FusedMoE._finish_gguf_moe_offload_staging``
 #: demands, and both are in ``MoEExpertOffloadCache.EXPERT_TENSOR_ATTRS``.
 GGUF_EXPERT_ATTRS = ("w13_qweight", "w2_qweight")
+# G4 NOTE: the GGUF branches of ``_compute`` / ``repack_rows`` and the adoption in ``gguf_presplit`` are NOT armed on
+# a real boot: only ``discount_expected`` sets ``ADOPT_OK_ATTR`` and only the compressed-tensors scheme calls it. A
+# GGUF layer therefore never vetoes. Arming it needs the expected-count discount (``gguf_presplit`` module docstring).
 
 
 def discount_expected(layer, expected: Dict[str, int], owned: int) -> Dict[str, int]:

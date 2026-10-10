@@ -745,7 +745,9 @@ def test_a_seat_only_boot_takes_the_door_with_a_private_pool(monkeypatch, seats)
 
 
 # ---------------------------------------------------------------------------------------------------------------
-# 6. D-store-adopt on a GGUF layer: ``repack_rows`` is a PURE ROW COPY here (nothing to repack)
+# 6. D-store-adopt BUILDING BLOCKS on a GGUF layer (NOT armed on a real boot, review 2 / major 2): ``repack_rows`` is a
+# PURE ROW COPY here. Nothing in the GGUF path sets ``_moe_store_adopt_ok`` (only the CT scheme's ``discount_expected``
+# does), so these tests arm it by hand to exercise the pieces a later arming will use.
 # ---------------------------------------------------------------------------------------------------------------
 
 
@@ -771,7 +773,7 @@ def test_the_veto_set_of_a_gguf_shard_is_its_cold_published_rows(boot, monkeypat
     ctx = _arm_adopt(boot, monkeypatch)
     try:
         d = _gguf_layer(0, rank=1)
-        d._moe_store_adopt_ok = True          # what the scheme's ``discount_expected`` arms (GGUF: the door's caller)
+        d._moe_store_adopt_ok = True          # armed BY HAND: no GGUF code path arms it (see the section header)
         # D rank 1 owns 6..11, holds 6..9 resident: its cold ids 10, 11 are P's published rows (slots 2, 3);
         # the pad is nobody's row; P's own extra expert 4 is not in this rank's window
         assert sa.vetoed_global_ids(d) == frozenset({10, 11})
@@ -796,7 +798,7 @@ def test_adopted_rows_are_neither_read_nor_rewritten(boot, monkeypatch):
     ctx = _arm_adopt(boot, monkeypatch)
     try:
         d = _gguf_layer(0, rank=1, poison=(10, 11))
-        d._moe_store_adopt_ok = True
+        d._moe_store_adopt_ok = True          # armed BY HAND, see the section header
         assert sa.vetoed_global_ids(d) == frozenset({10, 11})
         _stage(d)
     finally:
@@ -1123,6 +1125,15 @@ def test_the_seat_row_bank_is_a_placeholder_too(boot, seats):
         assert _bank(d, attr).shape[0] > 0
 
 
+def _pp_group(monkeypatch, rank, size):
+    """Stub the live PP group the peak line reads (a unit test has no process group)."""
+    from sglang.srt import distributed as dist
+
+    monkeypatch.setattr(dist, "get_pp_group", lambda: types.SimpleNamespace(rank_in_group=rank, world_size=size))
+    monkeypatch.delenv("SGLANG_PP_LAYER_SET", raising=False)
+    monkeypatch.delenv("SGLANG_PP_LAYER_PARTITION", raising=False)
+
+
 def test_owned_expert_host_bytes_sums_every_layer_at_its_own_row_class(tmp_path):
     """Review 1 / major 2: the host peak of the streaming-off door is the rank's whole owned set over all layers
     (materialization runs after the complete load pass), per layer at THAT layer's row, from the header."""
@@ -1143,6 +1154,7 @@ def test_the_streaming_off_line_names_the_whole_owned_set_not_one_layer(boot, tm
     f = _write_gguf(str(tmp_path / "m.gguf"), [("Q8_0", "Q8_0", "Q8_0")] * 2, rows=2, experts=TOTAL)
     monkeypatch.setattr(sargs, "get_global_server_args", lambda: types.SimpleNamespace(model_path=f))
     monkeypatch.setattr(gp, "_PEAK_NOTE_LOGGED", False)
+    _pp_group(monkeypatch, 0, 1)
     boot.group("D")
     with envs.SGLANG_MOE_GGUF_STREAM_STAGING.override(True), caplog.at_level(logging.INFO):
         assert _gguf_layer(0, rank=0)._gguf_stream_staging_enabled() is False
@@ -1167,3 +1179,109 @@ def test_the_streaming_off_line_says_so_when_the_header_is_not_at_hand(boot, mon
         assert _gguf_layer(0, rank=0)._gguf_stream_staging_enabled() is False
     msg = [r.getMessage() for r in caplog.records if "streaming staging off" in r.getMessage()][0]
     assert "size not derived from the header" in msg and "WHOLE owned expert set" in msg
+
+
+# --- review 2 / major 1: a P pipeline stage loads ONLY its own layers ------------------------------------------
+
+_PP_TYPES = [("Q8_0", "Q8_0", "Q8_0"), ("Q4_0", "Q4_0", "Q4_0"), ("Q8_0", "Q4_0", "Q8_0"), ("Q4_0", "Q8_0", "Q4_0"),
+             ("Q8_0", "Q8_0", "Q4_0"), ("Q4_0", "Q4_0", "Q8_0")]
+
+
+def test_owned_expert_host_bytes_counts_only_the_stage_layers(tmp_path):
+    f = _write_gguf(str(tmp_path / "m.gguf"), _PP_TYPES, rows=2, experts=4)
+    per_layer = gl.row_class_bytes([f])
+    assert len({sum(p.values()) for p in per_layer.values()}) > 1, "the toy layers must differ in row class"
+    stage = {2, 3}
+    got, n = gp.owned_expert_host_bytes([f], 0, 4, stage)
+    assert n == 2 and got == sum(sum(per_layer[i].values()) for i in stage) * 4
+    all_got, all_n = gp.owned_expert_host_bytes([f], 0, 4)
+    assert all_n == 6 and got < all_got, "the all-layers sum overstates a stage"
+
+
+def test_stage_owned_layers_follows_make_layers(monkeypatch):
+    from sglang.srt.distributed import get_pp_indices
+
+    _pp_group(monkeypatch, 1, 3)
+    layers, note = gp.stage_owned_layers(48)
+    s, e = get_pp_indices(48, 1, 3)
+    assert layers == frozenset(range(s, e)) and "PP stage 1 of 3" in note
+    # the set form (SGLANG_PP_LAYER_SET) is what make_layers honours first
+    monkeypatch.setenv("SGLANG_PP_LAYER_SET", "0-1;2-3;4-5")
+    layers, _note = gp.stage_owned_layers(6)
+    assert layers == frozenset({2, 3})
+    # unpipelined: every layer, no note
+    _pp_group(monkeypatch, 0, 1)
+    assert gp.stage_owned_layers(48) == (None, "")
+
+
+@pytest.mark.parametrize("pp_rank,want_layers", [(0, (0, 1)), (1, (2, 3)), (2, (4, 5))])
+def test_the_peak_line_of_a_p_stage_counts_its_own_layers(boot, tmp_path, monkeypatch, caplog, pp_rank, want_layers):
+    import logging
+
+    from sglang.srt import server_args as sargs
+    from sglang.srt.environ import envs
+
+    f = _write_gguf(str(tmp_path / "m.gguf"), _PP_TYPES, rows=2, experts=TOTAL)
+    per_layer = gl.row_class_bytes([f])
+    monkeypatch.setattr(sargs, "get_global_server_args", lambda: types.SimpleNamespace(model_path=f))
+    monkeypatch.setattr(gp, "_PEAK_NOTE_LOGGED", False)
+    _pp_group(monkeypatch, pp_rank, 3)
+    boot.group("P")
+    with envs.SGLANG_MOE_GGUF_STREAM_STAGING.override(True), caplog.at_level(logging.INFO):
+        assert _gguf_layer(0, rank=None)._gguf_stream_staging_enabled() is False
+    line = [r.getMessage() for r in caplog.records if "streaming staging off" in r.getMessage()][0]
+    want = sum(sum(per_layer[i].values()) for i in want_layers) * TOTAL
+    assert "header: 2 layers of this PP stage %d of 3" % pp_rank in line
+    assert "%.2f GiB" % (want / 2**30) in line
+    every, _n = gp.owned_expert_host_bytes([f], 0, TOTAL)
+    assert want < every
+
+
+def test_the_peak_line_refuses_a_number_when_the_stage_is_unresolved(boot, tmp_path, monkeypatch, caplog):
+    import logging
+
+    from sglang.srt import distributed as dist
+    from sglang.srt import server_args as sargs
+    from sglang.srt.environ import envs
+
+    f = _write_gguf(str(tmp_path / "m.gguf"), _PP_TYPES, rows=2, experts=TOTAL)
+
+    def _no_group():
+        raise AssertionError("pipeline-model-parallel group is not initialized")
+
+    monkeypatch.setattr(sargs, "get_global_server_args", lambda: types.SimpleNamespace(model_path=f))
+    monkeypatch.setattr(dist, "get_pp_group", _no_group)
+    monkeypatch.setattr(gp, "_PEAK_NOTE_LOGGED", False)
+    boot.group("P")
+    with envs.SGLANG_MOE_GGUF_STREAM_STAGING.override(True), caplog.at_level(logging.INFO):
+        assert _gguf_layer(0, rank=None)._gguf_stream_staging_enabled() is False
+    line = [r.getMessage() for r in caplog.records if "streaming staging off" in r.getMessage()][0]
+    assert "size not derived from the header" in line and "GiB" not in line
+
+
+def test_gguf_adoption_is_not_armed_by_the_door(boot, monkeypatch):
+    """Review 2 / major 2, pinned: a GGUF layer staged through the door never sets ``_moe_store_adopt_ok`` (only the
+    CT scheme's ``discount_expected`` does), so its veto set is empty and the loader reads every owned expert."""
+    _publish_p(boot, 0)
+    ctx = _arm_adopt(boot, monkeypatch)
+    try:
+        d = _stage(_gguf_layer(0, rank=1))
+        assert not getattr(d, sa.ADOPT_OK_ATTR, False)
+        assert sa.vetoed_global_ids(d) == frozenset()
+    finally:
+        for c in reversed(ctx):
+            c.__exit__(None, None, None)
+
+
+def test_a_loader_short_by_vetoed_experts_is_refused_with_the_veto_named(boot):
+    """If something DID veto experts for a GGUF layer, the expected count does not discount them: refused, and the
+    message names why (instead of a bare count mismatch)."""
+    boot.group("D")
+    d = _gguf_layer(0, rank=1)
+    d._moe_store_adopt_vetoed_global = frozenset({10, 11})
+    for attr in gp.GGUF_EXPERT_ATTRS:
+        p = getattr(d, attr)
+        for key in [k for k in p.expert_data_map if k[0] in (10, 11)]:
+            del p.expert_data_map[key]
+    with pytest.raises(gp.GGUFPresplitRefused, match="not armed by any scheme"):
+        _stage(d)
