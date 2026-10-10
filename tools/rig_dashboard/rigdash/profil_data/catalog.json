@@ -83342,7 +83342,7 @@
      "source": {
       "file": "pdflip/vision_rank_runner.py",
       "kind": "os.environ",
-      "line": 1069
+      "line": 1077
      }
     },
     "nf": {
@@ -83370,7 +83370,7 @@
    "id": "FLLIPER_PDFLIP_VISION_ASYNC",
    "kind": "env",
    "lesestellen": [
-    "pdflip/vision_rank_runner.py:1069",
+    "pdflip/vision_rank_runner.py:1077",
     "pdflip/vision_rank_runner.py:193",
     "pdflip/vision_rank_runner.py:194"
    ],
@@ -83383,7 +83383,7 @@
     "tree": "27b",
     "file": "pdflip/vision_rank_runner.py",
     "kind": "os.environ",
-    "line": 1069
+    "line": 1077
    },
    "status": "curated",
    "text": "The asynchronous vision stage: the tower's read + encode run on a worker thread and their own CUDA stream while the scheduler keeps passing; 0 = the synchronous stage. The code default is ON on the 27B line (vision_rank_runner.vision_async_on) and OFF on the NF line. VISION-SYNC LAW (user 02.10., both lines): vision runs ONLY synchronously, before the real prefill; the launcher therefore refuses an explicit ON (this switch and FLLIPER_PDFLIP_P_ROW_VISION_ASYNC) by name, and --pdflip-vision-place weights is always synchronous.",
@@ -85805,11 +85805,11 @@
   "curated": 121,
   "unexplained": 601
  },
- "tree_rev": "27b=9e51fc9b8c+nf=8051505666",
+ "tree_rev": "27b=6178a4d076+nf=8051505666",
  "trees": {
   "27b": {
    "entries": 2642,
-   "rev": "9e51fc9b8c"
+   "rev": "6178a4d076"
   },
   "nf": {
    "entries": 2506,
