@@ -16762,9 +16762,11 @@ class Scheduler(
         from sglang.srt.weg2 import hol_overtake as _hol_mod
 
         _hol = _hol_mod.HolPass(self)
-        # PRIORITY LANES 1008 (L3): while the floor stands above a request's lane the rank that owns the admission truth
-        # (PP0 / non-PP; a follower executes PP0's named schedule and never skips by lane) does not admit it. 0 = off.
-        _lane_floor = _lanes_p.floor_for_pass(self) if _lanes_p.owns_admission(self) else 0
+        # PRIORITY LANES 1008 (L3): while the floor stands above a request's lane every rank that DECIDES membership itself
+        # (PP0 / non-PP, and -- FIX 3, NF metal 211536 -- every follower of a form without a row carrier, which plans for
+        # itself: PP1 admitted the lane-0 weg2-6-17 that PP0 held -> #1004) does not admit it. A follower that EXECUTES PP0's
+        # named schedule never skips by lane (the schedule names its members). 0 = off.
+        _lane_floor = _lanes_p.floor_for_pass(self) if _lanes_p.skips_by_lane(self) else 0
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if _lane_floor and _lanes_p.holds(_lanes_p.req_lane(req), _lane_floor):

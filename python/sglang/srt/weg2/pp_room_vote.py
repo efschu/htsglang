@@ -369,6 +369,12 @@ class Weg2PpLaneFloor(msgspec.Struct, frozen=True):
 
     floor: int
     epoch: int
+    #: FIX 3: the batch index (``forward_ct``) from whose plan on EVERY stage -- PP0 too -- the floor stands; -1 = a stamp without
+    #: one (a stand-in / a legacy list): applied in the pass that takes it.  Same value on every pass of the epoch (the standing
+    #: stamp is repeated, never recomputed), so a stage that misses one list reads it on the next.
+    eff: int = -1
+    #: PP0's ``forward_ct`` when it took the RPC (for the marker, never read as a decision)
+    stamped: int = -1
 
 
 def stamp_lane_floor(wire_reqs, stamp: Optional["Weg2PpLaneFloor"]) -> list:
