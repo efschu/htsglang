@@ -103,42 +103,42 @@ SUPPLEMENT_CODES: Dict[str, Dict[str, Any]] = {
             "consequence": "Remains even with force. The census is measured per UUID and bound to the cards; foreign cards have none. Way out according to the launcher: --pdflip-weight-source ring or re-cut the schedule."},
     "W64": {"code": "W64-OPPOINT", "klass": "nicht_forcebar", "forcebar": False,
             "title": "W64 operating point: the model yields no positive KV pool",
-            "quelle": "launcher.py:16986-16993 (PdFlipTpOperatingPointInfeasible), :17349-17352 (fatal for the shipped position, even without dual_layout)",
+            "quelle": "launcher.py:16997-17004 (PdFlipTpOperatingPointInfeasible), :17360-17363 (fatal for the shipped position, even without dual_layout)",
             "class_reason": "The launcher refuses W64 as a verdict of the model (PerfCostModel.predict_capacity feasible=False) without a safety factor and without a force path: there is no value with which a forced start could run.",
             "reason": "W64 PdFlipTpOperatingPointInfeasible: the derived D weights are marked feasible=False against this boot's budgets -- the weight shards "
                      "plus the mamba pool plus the reserves do not leave a positive KV pool on at least one rank. Refused. This is the model's own verdict, "
-                     "not a margin chosen here. [Launcher-Text launcher.py:16986-16993]",
+                     "not a margin chosen here. [Launcher-Text launcher.py:16997-17004]",
             "consequence": "Remains even with force. The verdict is that of the model; the only help is to change budgets, weight split or card count.",
-            # nur wenn die Meldung 'W64-DUAL:' traegt (der Launcher haengt es nur bei dual_layout an, launcher.py:17231/17242): Dual-Wortlaut
+            # nur wenn die Meldung 'W64-DUAL:' traegt (der Launcher haengt es nur bei dual_layout an, launcher.py:17242/17253): Dual-Wortlaut
             "dual": {"title": "W64 dual D: operating point not verified without a measured dual D log",
-                     "quelle": "launcher.py:16986-16993 (PdFlipTpOperatingPointInfeasible), :17242-17243 (no measured dual D log)",
+                     "quelle": "launcher.py:16997-17004 (PdFlipTpOperatingPointInfeasible), :17253-17254 (no measured dual D log)",
                      "class_reason": "The launcher refuses W64 as a verdict of the model (PerfCostModel.predict_capacity feasible=False) without a safety factor; in the dual only a measured dual D log of the weights lifts the refusal (dual_w64.find_dual_d_measurement), not force.",
                      "reason": "W64 PdFlipTpOperatingPointInfeasible: the derived D weights are marked feasible=False against this boot's budgets -- the weight shards "
                               "plus the mamba pool plus the reserves do not leave a positive KV pool on at least one rank. Refused. This is the model's own verdict, "
                               "not a margin chosen here. W64-DUAL: no measured dual-share D log of the model with these weights; the model verdict stands. "
-                              "[Launcher-Text launcher.py:16986-16993, :17242-17243]",
+                              "[Launcher-Text launcher.py:16997-17004, :17253-17254]",
                      "consequence": "Remains even with force. It is lifted only by a measured dual D log of these weights (evidence directory); without a measurement the verdict of the model stands."},
-            # 'W64-DUAL: the refusal names no weight vector' (launcher.py:17235): die Meldung nennt keinen Gewichtsvektor, es gab also keine Suche
+            # 'W64-DUAL: the refusal names no weight vector' (launcher.py:17246): die Meldung nennt keinen Gewichtsvektor, es gab also keine Suche
             "dual_without_weights": {"title": "W64 dual: operating point not verified (message without weight vector, no dual D log searched)",
-                     "quelle": "launcher.py:16986-16993 (PdFlipTpOperatingPointInfeasible), :17235 (the refusal names no weight vector)",
+                     "quelle": "launcher.py:16997-17004 (PdFlipTpOperatingPointInfeasible), :17246 (the refusal names no weight vector)",
                      "class_reason": "The launcher refuses W64 as a verdict of the model without a safety factor; in the dual it could not search for the dual D log because the message names no weight vector (dual_w64.find_dual_d_measurement needs it).",
                      "reason": "W64 PdFlipTpOperatingPointInfeasible: the derived D weights are marked feasible=False against this boot's budgets. "
-                              "W64-DUAL: the refusal names no weight vector; the model verdict stands. [Launcher-Text launcher.py:16986-16993, :17235]",
+                              "W64-DUAL: the refusal names no weight vector; the model verdict stands. [Launcher-Text launcher.py:16997-17004, :17246]",
                      "consequence": "Remains even with force. No dual D log was searched (no weight vector in the message); the verdict of the model stands."},
-            # 'W64-DUAL MEASURED (...) -> INFEASIBLE' (dual_w64.py:117, angehaengt launcher.py:17343-17347): ein Dual-D-Log WURDE gefunden und urteilt selbst
+            # 'W64-DUAL MEASURED (...) -> INFEASIBLE' (dual_w64.py:117, angehaengt launcher.py:17354-17358): ein Dual-D-Log WURDE gefunden und urteilt selbst
             "dual_measured": {"title": "W64 dual D: measured dual D log confirms: no sufficient KV pool",
-                     "quelle": "launcher.py:16986-16993 (PdFlipTpOperatingPointInfeasible), :17343-17347 (measurement appended), dual_w64.py:117 (judge)",
+                     "quelle": "launcher.py:16997-17004 (PdFlipTpOperatingPointInfeasible), :17354-17358 (measurement appended), dual_w64.py:117 (judge)",
                      "class_reason": "The launcher refuses W64 as a verdict of the model; in the dual a measured dual D log of these weights was found (dual_w64.find_dual_d_measurement) and judges INFEASIBLE on the own items of the run. Force does not change the measurement.",
                      "reason": "W64 PdFlipTpOperatingPointInfeasible: the derived D weights are marked feasible=False against this boot's budgets. "
                               "W64-DUAL MEASURED (...) -> INFEASIBLE: a measured dual-share D log of these weights also leaves less than the minimum tokens on at least "
-                              "one rank. [Launcher-Text launcher.py:16986-16993, dual_w64.py:117]",
+                              "one rank. [Launcher-Text launcher.py:16997-17004, dual_w64.py:117]",
                      "consequence": "Remains even with force. The measurement of these weights confirms the verdict; the only help is to change budgets, weight split or card count."}},
 }
 
 def _supp_view(supp: Mapping[str, Any], text: Any) -> Dict[str, Any]:
     """The supplement row in the wording the refusal text earns.  The launcher prints W64 in four shapes (``dual_layout`` adds the last three): no Dual
-    marker (form-neutral base); ``W64-DUAL MEASURED (...) -> INFEASIBLE`` (a measured log was found, dual_w64.py:117, launcher.py:17343-17347);
-    ``W64-DUAL: the refusal names no weight vector`` (no search happened, :17235); ``W64-DUAL: no measured dual-share D log`` (searched, none, :17242)."""
+    marker (form-neutral base); ``W64-DUAL MEASURED (...) -> INFEASIBLE`` (a measured log was found, dual_w64.py:117, launcher.py:17354-17358);
+    ``W64-DUAL: the refusal names no weight vector`` (no search happened, :17246); ``W64-DUAL: no measured dual-share D log`` (searched, none, :17253)."""
     t = str(text or "")
     if "W64-DUAL MEASURED" in t and supp.get("dual_measured"):
         return {**supp, **supp["dual_measured"]}

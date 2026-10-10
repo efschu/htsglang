@@ -91,7 +91,7 @@ class TestSupplement(unittest.TestCase):
 
     def test_w64_three_dual_cases_each_get_their_own_wording(self):
         """Nacharbeit 1006 Runde 6, Befund 3: kein Dual / Dual ohne Messung / Dual mit Messung INFEASIBLE / Meldung ohne Gewichtsvektor sind vier Woerter,
-        nicht zwei (launcher.py:17235, :17242-17243, :17343-17347, dual_w64.py:117)."""
+        nicht zwei (launcher.py:17246, :17253-17254, :17354-17358, dual_w64.py:117)."""
         neutral = PV.budget_verdict("W64-OPPOINT", level="run", text=W64_MSG, force_state=PV.BLOCKED)
         without = PV.budget_verdict("W64-OPPOINT", level="run", force_state=PV.BLOCKED,
                           text=W64_MSG + " | W64-DUAL: no measured dual-share D log of m with weights [20, 12, 8] under /x; the model verdict stands")
@@ -112,11 +112,11 @@ class TestSupplement(unittest.TestCase):
         self.assertIn("measured dual D log confirms", measured["title"])
         self.assertNotIn("without a measured", measured["title"] + measured["consequence"] + measured["class_reason"])
         self.assertIn("confirms", measured["consequence"])
-        self.assertRegex(measured["quelle"], r"17343-17347.*dual_w64\.py:117")
+        self.assertRegex(measured["quelle"], r"17354-17358.*dual_w64\.py:117")
         # Meldung ohne Gewichtsvektor: keine Suche, also nicht "without a measured dual D log"
         self.assertNotIn("without a measured", no_vector["title"] + no_vector["consequence"])
         self.assertIn("without weight vector", no_vector["title"])
-        self.assertRegex(no_vector["quelle"], r"17235")
+        self.assertRegex(no_vector["quelle"], r"17246")
         self.assertEqual(len({neutral["title"], without["title"], measured["title"], no_vector["title"]}), 4)
 
     @unittest.skipUnless(O.pdflip_module_exists("dual_w64"),
@@ -155,7 +155,7 @@ class TestSupplement(unittest.TestCase):
             self.assertEqual(anchor in lsrc, has_dual, anchor)
 
     @unittest.skipUnless(O.launcher_line() == O.LINE_27B,
-                         "the cited line numbers (xchg_residency.py:711-723, launcher.py:16986-17352) are those of the 27B launcher line; "
+                         "the cited line numbers (xchg_residency.py:711-723, launcher.py:16997-17363) are those of the 27B launcher line; "
                          "this tree's launcher line is %r (the anchors are proved by test_the_cited_anchors_exist_in_the_launcher_sources_of_this_tree)"
                          % O.launcher_line())
     def test_the_cited_lines_hold_the_launcher_text(self):
@@ -171,11 +171,11 @@ class TestSupplement(unittest.TestCase):
         self.assertIn("W71 PdFlipXchgResidencyUnarmable: the exchange's predicted VRAM residency", span(xl, 711, 723))
         self.assertIn("--pdflip-weight-source ring", span(xl, 711, 723))
         self.assertIn("def load_census", span(xl, 313, 316))
-        self.assertIn("W64 PdFlipTpOperatingPointInfeasible: position", span(ll, 16986, 16992))
-        self.assertIn("W64-DUAL: no measured dual-share D log", span(ll, 17244, 17245))
-        self.assertIn("if mine and dual_layout:", span(ll, 17342, 17342))        # Override nur im Dual ...
-        self.assertIn("raise PdFlipLaunchRefused(mine[0]", span(ll, 17351, 17354))  # ... die Verweigerung gilt in jeder Form
-        self.assertIn("if not dual_layout or not str(refusal).startswith", span(ll, 17233, 17233))
+        self.assertIn("W64 PdFlipTpOperatingPointInfeasible: position", span(ll, 16997, 17003))
+        self.assertIn("W64-DUAL: no measured dual-share D log", span(ll, 17255, 17256))
+        self.assertIn("if mine and dual_layout:", span(ll, 17353, 17353))        # Override nur im Dual ...
+        self.assertIn("raise PdFlipLaunchRefused(mine[0]", span(ll, 17362, 17365))  # ... die Verweigerung gilt in jeder Form
+        self.assertIn("if not dual_layout or not str(refusal).startswith", span(ll, 17244, 17244))
         for w in PV.SUPPLEMENT_CODES.values():
             for m in re.finditer(r"(\w+/)?[\w.]+\.py:(\d+)(?:-(\d+))?", w["quelle"]):
                 self.assertGreater(int(m.group(2)), 0)

@@ -67,6 +67,18 @@ The 27B line has no post-freeze fixes. On the NF line the tree contains, ported 
 Metal status of these fixes is the NF seat's (list in `FIXES-NACH-FREEZE-1007.md`); this document claims none of them as proven on metal.
 Not in these heads: fixes after int23, among them the H88 W4A8 work with its scale fix `dec66fb0b4` (the NF tree has no `marlin_a8` files) and the room-short repro; a second port round is open.
 
+## 4b. 27B line, vision rebuild and the post-vision delta (F0-H rounds 3 and 4a, 10.10.2026)
+
+Ported by the rename rule (RENAME_PLAN 8.21, 8.22); the metal statements are the 27B seat's (`FIXES-NACH-FREEZE-1007.md`, boots of 10.10.).
+
+* **Vision tower borrows weights instead of KV** (`--pdflip-vision-place weights`, standard in the 27B release profiles, not in the launcher default): on the metal (10.10.): 3072 x 3072 green in the flip and in the Dual, 4096 x 4096 green in the Dual (jzmxnp, +1574.0 MiB) and with the GGUF tower in the flip; the encode drops dead activations (VISION-WORK: the 4096 x 4096 working set 2402 -> 1574 MiB, the model figure).
+* **4096 x 4096 in the flip, with the fragmentation fix** (the idle cache goes back before the air check, W107 OOM behind a passed check): **open on the metal until the RC2 boot**; the 10.10. metal showed the OOM, the fix is proven by tests only.
+* **Front health grace removed**: P without the grace survived a 32.6 s preprocessing on the metal (Dual 4096 x 4096, window jzmxnp: no WEG2-HEALTH-BUSY, no STOP line), the preprocessing of large images runs on one worker thread of the tokenizer process (D-Health A, FIFO dispatch kept; a batch request waits for the open image requests, a batch with images is not offloaded: named limitation). Large images: the time is **kernel time** (THP compaction and swap, over 95 percent of 32.6 s / 22.0 s, host swap active); the thread keeps `/health` answering, it does not shorten the stall (follow-up, not built: `NUMPY_MADVISE_HUGEPAGE=0` in the tokenizer process, host swappiness).
+* **L3 evictor hands the lock over between batches** (D-Health D) and **shm segments of a request cancelled between wrap and send are unlinked** (`WEG2-MM-SHM-UNLINK`).
+* **#1158c quiesce/release race** (a health probe behind the quiesce flush is answered at the origin, GGUF first idle flip, W120): proven on the metal in the GGUF flip of 10.10.
+* **Deadman: the groups P and D run tier 1 only** (`TIER2=0` and the `last_probe` fallback in `boot_deadman.sh`, the front keeps tiers 2 to 4); the host copy under `/spinning/gpu-arb/devtools` is the operator's (patch v4, not applied by this port); new log-only instruments `EVENT-LOOP-ENTER`, `LOOP-ITER-SLOW` (overlap loop only), `#1458 CTRL-SEND`.
+* **GGUF tower source** from `--tokenizer-path` for a `.gguf` model.
+
 ## 5. Known limits and open points
 
 1. Live profiles under `/spinning/gpu-arb` are not converted (`profconv.py --convert-live --apply`, after the gpu-arb patch `f0b-gpu-arb-1007-v2`); tests that read the live profiles stay red until then.
