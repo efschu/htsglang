@@ -380,6 +380,18 @@ class TestLauncherVerdicts(unittest.TestCase):
         self.assertIn("vision_async_refusal(ns)", src)
         self.assertIn("raise SystemExit(_vis_async)", src)
 
+    def test_the_refusal_text_does_not_send_the_27b_operator_to_the_async_default(self):
+        """Review 2: on the 27B line an UNSET FLLIPER_PDFLIP_VISION_ASYNC is the async stage (vision_rank_runner.vision_async_on, default ON), so the text
+        must say 'set it 0', never 'unset it'."""
+        from flliper.srt.pdflip import vision_rank_runner as vrr
+
+        self.assertTrue(vrr.vision_async_on({}))                                    # the premise: unset = async on the 27B line
+        line = launcher.vision_async_refusal(types.SimpleNamespace(env_p="", env_d=""), environ={"FLLIPER_PDFLIP_VISION_ASYNC": "1"})
+        self.assertIn("Set it 0", line)
+        self.assertNotIn("Unset it", line)
+        self.assertNotIn("the code default is the synchronous", line)
+        self.assertIn("UNSET FLLIPER_PDFLIP_VISION_ASYNC is the async stage", line)
+
     def test_the_unset_switch_is_the_old_default_path(self):
         """The 27B runner's code default is the async stage (vision_rank_runner.vision_async_on); the refusal fires on an EXPLICIT on only."""
         self.assertIsNone(launcher.vision_async_refusal(types.SimpleNamespace(env_p="", env_d=""), environ={}))
@@ -500,11 +512,33 @@ class TestHostLedgerPost(unittest.TestCase):
         t = self.terms()
         self.assertEqual(t["vision_victim_host_gib"], 0.0)
 
-    def test_the_post_is_a_run_moment_term_only(self):
+    def test_the_post_is_in_no_sum(self):
+        """Fix round 1: a warning post (host-RAM rule 06.10.) is named and printed, but it is in NEITHER sum -- it cannot move a fundability number."""
         base, withv = self.terms(), self.terms(vision_victim_host_gib=0.86)
-        self.assertEqual(host_ledger._boot_charges_gib(withv), host_ledger._boot_charges_gib(base))        # launch moment / both-moment sum: unchanged
-        self.assertAlmostEqual(host_ledger._run_moment_charges_gib(withv) - host_ledger._run_moment_charges_gib(base), 0.86, places=9)
-        self.assertEqual(host_ledger._run_moment_charges_gib(base), host_ledger._run_moment_charges_gib(self.terms(vision_victim_host_gib=0.0)))
+        self.assertEqual(withv["vision_victim_host_gib"], 0.86)                                              # the post is named
+        self.assertEqual(host_ledger._boot_charges_gib(withv), host_ledger._boot_charges_gib(base))          # launch moment / both-moment sum
+        self.assertEqual(host_ledger._run_moment_charges_gib(withv), host_ledger._run_moment_charges_gib(base))   # run moment
+
+    def test_a_huge_post_moves_no_arm_and_refuses_nothing(self):
+        """Fix round 1 (review 1): price/choose with an absurd post (500 GiB) give the same run peak, leftover, arm and verdict lines as 0.0."""
+        from unittest import mock
+
+        GIB, MIB = int(host_ledger.GIB), 1 << 20
+        kw = dict(ring_bytes=4096 * MIB, ring_span1_bytes=4096 * MIB, cg_current_bytes=int(1.09 * GIB), cg_ceiling_bytes=84 * GIB)
+        a0 = host_ledger.price(int(125.70 * GIB), int(101.96 * GIB), 1, 600, **kw)
+        a1 = host_ledger.price(int(125.70 * GIB), int(101.96 * GIB), 1, 600, **kw, vision_victim_host_gib=500.0)
+        self.assertEqual(a1.terms["vision_victim_host_gib"], 500.0)
+        self.assertEqual(a1.predicted_run_peak_gib(), a0.predicted_run_peak_gib())
+        self.assertEqual(a1.run_leftover_gib, a0.run_leftover_gib)
+        live = {"current_gib": 1.09, "nonreclaim_gib": 0.79, "file_reclaimable_gib": 0.3, "source": "test", "max_gib": None}
+        ck = dict(ring_bytes=4096 * MIB, ring_span1_bytes=4096 * MIB, ring_provenance="test", cg_current_bytes=int(1.09 * GIB),
+                  cg_ceiling_bytes=84 * GIB, cg_ceiling_source="cgroup memory.max", cg_oom_kill=0)
+        res = []
+        for v in (0.0, 500.0):
+            with mock.patch.object(host_ledger, "read_cgroup_pressure", return_value=live):
+                arm, _h, lines = host_ledger.choose(int(125.70 * GIB), int(101.96 * GIB), **ck, vision_victim_host_gib=v)   # no W20/W21 raised
+            res.append((arm.s_gb, arm.m_mib, [ln for ln in lines if "vision_victim_host" not in ln]))
+        self.assertEqual(res[0], res[1])
 
     def test_a_negative_value_is_clamped(self):
         self.assertEqual(self.terms(vision_victim_host_gib=-1.0)["vision_victim_host_gib"], 0.0)

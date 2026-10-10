@@ -12777,7 +12777,7 @@ def choose_host_ledger(
     # flip arm -- no flip ratchet, no dormant group, no P host pools. False is
     # byte-identical to every flip boot.
     d_only: bool = False,
-    vision_victim_host_gib: float = 0.0,  # VISION-WEIGHTS AP4: transient host image of the displaced weights (run moment, warning only); LAST
+    vision_victim_host_gib: float = 0.0,  # VISION-WEIGHTS AP4: transient host image of the displaced weights (printed post, in no ledger sum, warning only); LAST
 ) -> Tuple[host_ledger.Arm, Optional[float], List[str], Dict[str, Optional[int]]]:
     """THE LAUNCHER'S ONE LEDGER CALL SITE: read the host, price the ladder.
 
@@ -13015,7 +13015,7 @@ def choose_host_ledger(
         # H25: the parked D draft's pinned host image (ledger post
         # 'd_draft_host'), priced by `d_draft_park_term` -- one kwargs block,
         # so the pinned arm and the ladder price the same post.
-        d_draft_host_gib=float(d_draft_host_gib), vision_victim_host_gib=float(vision_victim_host_gib),  # AP4: displaced weights, run moment
+        d_draft_host_gib=float(d_draft_host_gib), vision_victim_host_gib=float(vision_victim_host_gib),  # AP4: displaced weights (printed post only)
         # rc12d: the torch allocation history (pdflip/memhist.py) -- 5.4 GiB of
         # host nobody booked when it was armed from rank start in P and D.
         memhist_gib=float(memhist_gib), memhist_run_only=bool(memhist_run_only),
@@ -24943,8 +24943,8 @@ def vision_async_refusal(ns, environ: Optional[Mapping[str, str]] = None) -> Opt
                 hits.append(f"{where} {name}={raw}")
     if not hits:
         return None
-    return ("PDFLIP VISION-ASYNC refused: %s -- %s. Unset it (the code default is the synchronous "
-            "stage) or set it 0" % (", ".join(hits), VISION_SYNC_LAW))
+    return ("PDFLIP VISION-ASYNC refused: %s -- %s. Set it 0 (27B line: an UNSET FLLIPER_PDFLIP_VISION_ASYNC is the async stage, "
+            "vision_rank_runner.vision_async_on default ON; NF line: unset = sync)" % (", ".join(hits), VISION_SYNC_LAW))
 
 
 #: VISION-WEIGHTS AP4 (plan PLAN-VISION-GEWICHTE-VERDRAENGEN-1009 section 8): the places that are guaranteed broken in the dual layout. The tower
@@ -24991,7 +24991,7 @@ def vision_victim_host_term(ns) -> Tuple[float, str]:
         return 0.0, f"UNMEASURED ({src})"
     kind = _vvp.KIND_PP_ONLY if bool(getattr(ns, "dual_layout", False)) else _vvp.KIND_DENSE
     return nbytes / (1 << 20), (f"victim={kind}: the tower bytes wait in a pageable host image per image request, freed after the give-back "
-                                f"({src}); transient, charged at the run moment, 0 between images")
+                                f"({src}); transient, 0 between images; printed only, in no ledger sum")
 
 
 def apply_profile_d_bs_default(ns, argv: Sequence[str]) -> int:
