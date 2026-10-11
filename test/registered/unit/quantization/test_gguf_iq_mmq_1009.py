@@ -855,6 +855,18 @@ def _real_expert_block(layer: int, which: str, n_experts: int = 8) -> tuple[np.n
     raise KeyError(which)
 
 
+def _moe_ref_by_expert(x: torch.Tensor, wd: torch.Tensor, topk_ids: torch.Tensor) -> torch.Tensor:
+    """Reference y[t, j, row] = x[t] @ wd[topk_ids[t, j]].T with ONE matmul per expert (G11): the gathering einsum of `_moe_case` would
+    materialise [tokens, top_k, rows, K] floats -- 12.5 GB for the production form (192 tokens, top_k 10, 640 rows, K 2560)."""
+    tokens, top_k = topk_ids.shape
+    ref = torch.zeros((tokens, top_k, wd.shape[1]), dtype=torch.float32, device=x.device)
+    for e in range(wd.shape[0]):
+        t_idx, j_idx = (topk_ids == e).nonzero(as_tuple=True)
+        if t_idx.numel():
+            ref[t_idx, j_idx] = x[t_idx].float() @ wd[e].T
+    return ref
+
+
 def _rel_rms(a: torch.Tensor, b: torch.Tensor) -> float:
     a, b = a.float(), b.float()
     return float(((a - b).pow(2).mean().sqrt() / b.pow(2).mean().sqrt().clamp_min(1e-12)).item())
@@ -955,6 +967,39 @@ class TestGpuNumerics(CustomTestCase):
             with self.subTest(layer=layer, which=which, qtype=P.IQ_TYPE_NAMES[qtype]):
                 k = raw.shape[2] // gguf_lib.GGML_QUANT_SIZES[gguf_lib.GGMLQuantizationType(qtype)][1] * gguf_lib.GGML_QUANT_SIZES[gguf_lib.GGMLQuantizationType(qtype)][0]
                 self._moe_case(qtype, k, raw.shape[1], E=raw.shape[0], raws=raw, tokens=160, top_k=4)
+
+    def test_moe_real_nf_iq3s_production_shape(self):
+        """G11: the production form -- REAL NF IQ3_S expert blocks (layer 0 gate, layer 4 up: 640 rows, K = 2560, E = 16 of the 512 in
+        the header), 192 tokens (M >= 128: the IQ-MMQ branch), top_k 10 with distinct experts per token.  The PR bound (atol 1.0) is blind for
+        real blocks (outputs ~0.4), so the bounds are relative to the output scale: relative RMS < 1 % and max |err| < 5 % of the output
+        RMS.  CPU model (test_gguf_iq3s_grid_1011.py): shipped grid 0.4-0.6 % / 2-3 %, the vendored iq3xs_grid (15 -> 15.5) 1.6-1.7 % / 8-9 %
+        -- unmeasured on metal.  Stage 0 on metal (G10) saw this defect only through the synthetic case (30 of 49920 values at atol 1.0)."""
+        from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import moe_align_block_size
+
+        self._arm(P.IQ3_S)
+        tokens, top_k, E = 192, 10, 16
+        for layer, which in ((0, "gate"), (4, "up")):
+            raw, qtype = _real_expert_block(layer, which, n_experts=E)
+            self.assertEqual(qtype, P.IQ3_S)
+            rows, k = raw.shape[1], raw.shape[2] // 110 * 256
+            self.assertEqual((rows, k), (640, 2560))
+            wd = torch.stack([self._ref_w(raw[e], qtype) for e in range(E)])
+            w = torch.from_numpy(np.ascontiguousarray(raw)).to(self.dev)
+            for act in ("uniform", "normal"):
+                with self.subTest(layer=layer, which=which, act=act):
+                    torch.manual_seed(5)
+                    x = (torch.rand if act == "uniform" else torch.randn)((tokens, k), dtype=torch.bfloat16, device=self.dev)
+                    topk_ids = torch.topk(torch.rand((tokens, E), device=self.dev), top_k, dim=1).indices.to(torch.int32)
+                    sorted_ids, expert_ids, ntpp = moe_align_block_size(topk_ids, P.IQ_MOE_MMQ_BLOCK_SIZE, E)
+                    expert_ids = expert_ids.masked_fill(expert_ids >= E, -1)
+                    y = self.K.moe_a8(x, w, sorted_ids, expert_ids, ntpp, qtype, rows, top_k, tokens)
+                    ref = _moe_ref_by_expert(x, wd, topk_ids)
+                    y = y.float().reshape(tokens, top_k, rows)
+                    self.assertTrue(torch.isfinite(y).all())
+                    ref_rms = float(ref.pow(2).mean().sqrt())
+                    self.assertLess(_rel_rms(y, ref), 0.01)
+                    self.assertLess(float((y - ref).abs().max()) / ref_rms, 0.05)
+                    torch.testing.assert_close(y, ref, atol=1.0, rtol=1e-1)  # the PR's bound, as everywhere else
 
     def test_moe_invalid_expert_block_writes_zero(self):
         self._arm(P.IQ3_S)
