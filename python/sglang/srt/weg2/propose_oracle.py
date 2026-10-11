@@ -997,21 +997,12 @@ def run_profile(env_path: str, devices: Sequence[Mapping[str, Any]], *, tree: st
             parent = os.path.dirname(p)
             q = farm_dir(parent, what, force_snapshot=_snap_here)
             return os.path.join(q, os.path.basename(p)) if q != parent else p
-        # a DIRECTORY whose snapshot holds GGUF parts (the --tokenizer-path of a GGUF profile is the directory the model
-        # file sits in) is stood in for exactly like the GGUF file inside it, also where the real directory exists: the
-        # dump must not change when the box grows the sibling directory (G7 review 1).  Every other directory keeps
-        # the old rule (stub only while config.json is missing).
-        return farm_dir(p, what, force_snapshot=_snapshot_has_gguf(os.path.basename(p.rstrip("/"))))
-
-    def _snapshot_has_gguf(bn: str) -> bool:
-        snap = (snapshots or {}).get(bn, "")
-        if not snap:
-            return False
-        try:
-            return any(str(e.get("path", e.get("name", ""))).endswith(".gguf")
-                       for e in read_snapshot_manifest(snap).get("files", ()))
-        except (OSError, ValueError, KeyError):
-            return False
+        # a DIRECTORY keeps the old rule (stub only while config.json is missing).  The one directory that is stood in for
+        # even where it exists is the --tokenizer-path directory (rule at the --tokenizer-path call site below, G8): G10
+        # (11.10.2026) removed the second rule that sat here (b935402512: force the stub for a directory whose snapshot holds
+        # .gguf parts) -- it served the same purpose as G8's, each alone kept the goldens green (mutants, G7 review 3 section 5b),
+        # and G8's also covers a safetensors tokenizer directory (27b-gguf.env).
+        return farm_dir(p, what)
 
     def farm_dir(p: str, what: str, force_snapshot: bool = False) -> str:
         nonlocal farmed

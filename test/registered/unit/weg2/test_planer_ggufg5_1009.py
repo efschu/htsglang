@@ -732,12 +732,74 @@ class TestDryRunGolden(unittest.TestCase):
         self.assertNotIn(sib, seen, "the GGUF sibling directory went through ensure_model_dir (box-dependent)")
         self.assertEqual(O.diff_lines(self.dump, run.result.dump()), [])
 
-    def test_a_directory_without_gguf_parts_in_its_snapshot_keeps_the_old_rule(self):
-        # only the GGUF sibling and the GGUF MTP draft snapshots hold .gguf parts; every safetensors snapshot keeps the old path
+    # G10 (11.10.2026): the pin on the SET of snapshots that hold .gguf parts is replaced by a spy on what the oracle really
+    # stubs.  The pin broke when G8 added the GGUF draft snapshot and said nothing about the rule.  ONE rule remains (G8, the
+    # --tokenizer-path call site of propose_oracle.run_profile); the second one (farm(), b935402512) was removed.
+    @staticmethod
+    def _spied_run_profile(li, snaps, farm_root):
+        """run_profile on ``li`` with the dry run replaced by a recorder: returns (ProfileRun, dirs that went through
+        ensure_model_dir, snapshot names materialized in all)."""
+        from unittest import mock
+
+        via_ensure, stubbed = [], []
+        real_ensure, real_mat = O.ensure_model_dir, O.materialize_checkpoint
+
+        def ensure_spy(path, **kw):
+            via_ensure.append(os.path.basename(str(path).rstrip("/")))
+            return real_ensure(path, **kw)
+
+        def mat_spy(snapshot_dir, dest_parent):
+            stubbed.append(O.read_snapshot_manifest(snapshot_dir)["name"])
+            return real_mat(snapshot_dir, dest_parent)
+
+        with mock.patch.object(O, "ensure_model_dir", ensure_spy), mock.patch.object(O, "materialize_checkpoint", mat_spy), \
+                mock.patch.object(O, "run_dry_run", lambda argv, devices, **kw: None):
+            run = O.run_profile(PROFILE, [], tree=TREE, snapshots=snaps, launch_input=li, farm_root=farm_root)
+        return run, via_ensure, stubbed
+
+    def test_exactly_the_tokenizer_path_directory_is_stubbed_where_it_exists(self):
+        """One rule: a --tokenizer-path directory with a header snapshot is stubbed even where the real directory (with a
+        config.json) exists -- GGUF sibling or safetensors alike; every other existing directory (--model, draft) keeps the
+        old rule (ensure_model_dir: used as it is while it has a config.json)."""
         snaps = _snapshots()
-        for name, d in snaps.items():
-            has = any(str(e.get("path", e.get("name", ""))).endswith(".gguf") for e in O.read_snapshot_manifest(d)["files"])
-            self.assertEqual(has, name in ("MTP", "Qwen3.8-Flash-Next-GGUF-unsloth-sibling"), name)
+        tok_name = "Qwen3.8-27B-INT8-gdncov-vocabembed"          # a safetensors snapshot (27b-gguf.env's tokenizer directory)
+        model_name = "Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist-abl-wxp"   # a safetensors snapshot, --model here
+        self.assertIn(tok_name, snaps)
+        self.assertIn(model_name, snaps)
+        with tempfile.TemporaryDirectory() as td:
+            real = {}
+            for n in (tok_name, model_name, "tok-without-snapshot"):
+                d = os.path.join(td, "models", n)
+                os.makedirs(d)
+                with open(os.path.join(d, "config.json"), "w") as fh:
+                    fh.write("{}")
+                real[n] = d
+            base = O.profile_launch_input(PROFILE)
+            argv = ["--model", real[model_name], "--tokenizer-path", real[tok_name]]
+            li = O.LaunchInput(argv, dict(base.env), dict(base.vars), [], base.source, base.instruments)
+            run, via_ensure, stubbed = self._spied_run_profile(li, snaps, os.path.join(td, "farm"))
+            out = dict(zip(run.argv[::2], run.argv[1::2]))
+            self.assertEqual(out["--tokenizer-path"], os.path.join(td, "farm", tok_name))
+            self.assertEqual(stubbed, [tok_name])
+            self.assertNotIn(tok_name, via_ensure)
+            # --model: old rule, ensure_model_dir saw it, the existing directory stayed
+            self.assertEqual(out["--model"], real[model_name])
+            self.assertIn(model_name, via_ensure)
+            # a tokenizer directory WITHOUT a snapshot keeps the old rule too (nothing changes without a snapshot)
+            li2 = O.LaunchInput(["--model", real[model_name], "--tokenizer-path", real["tok-without-snapshot"]],
+                                dict(base.env), dict(base.vars), [], base.source, base.instruments)
+            run2, via_ensure2, stubbed2 = self._spied_run_profile(li2, snaps, os.path.join(td, "farm2"))
+            self.assertEqual(dict(zip(run2.argv[::2], run2.argv[1::2]))["--tokenizer-path"], real["tok-without-snapshot"])
+            self.assertIn("tok-without-snapshot", via_ensure2)
+            self.assertEqual(stubbed2, [])
+
+    def test_the_nf_gguf_profile_stubs_the_sibling_and_the_mtp_directory_and_nothing_else(self):
+        run, via_ensure, stubbed = self._spied_run_profile(O.profile_launch_input(PROFILE), _snapshots(), tempfile.mkdtemp())
+        # nf-gguf.env: the GGUF model file and the --tokenizer-path sit in the sibling directory, the MTP draft FILE in the
+        # directory the registry names "MTP" (nf-gguf-d.env has its own draft directory, test_planer_ggufg8_1010)
+        self.assertEqual(sorted(set(stubbed)), ["MTP", "Qwen3.8-Flash-Next-GGUF-unsloth-sibling"])
+        # no directory of the profile went through the config.json rule, so none depends on the box
+        self.assertEqual(sorted(set(via_ensure) & set(_snapshots())), [])
 
     def test_the_planner_prices_the_cut_per_layer(self):
         lines = [ln for ln in self.dump.splitlines() if "PP-CUT EXPERT ROWS JE LAYER (G5)" in ln]
