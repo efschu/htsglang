@@ -182,6 +182,9 @@ def test_report_leak_carries_the_ids_when_on(on):
 
 def test_report_leak_unchanged_when_off(monkeypatch):
     monkeypatch.delenv(SWITCH, raising=False)
+    # nf-poolleak-1011 Commit B: STRICT=1 (the default) is warn-and-continue with its own
+    # marker line; "unchanged" is the STRICT=0 text, so this test pins STRICT=0.
+    monkeypatch.setenv("SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE", "0")
     chk = object.__new__(ic.SchedulerInvariantChecker)
     seen = {}
     with patch.object(ic, "raise_error_or_warn", lambda _s, _f, _c, msg: seen.setdefault("msg", msg)):
