@@ -6512,7 +6512,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22101
+      "line": 22112
      }
     }
    },
@@ -7081,7 +7081,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22105
+      "line": 22116
      }
     }
    },
@@ -11291,7 +11291,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22157
+      "line": 22168
      }
     }
    },
@@ -17616,7 +17616,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22417
+      "line": 22428
      }
     }
    }
@@ -18147,7 +18147,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 23590
+      "line": 23601
      }
     }
    },
@@ -18851,7 +18851,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22862
+      "line": 22873
      }
     }
    },
@@ -26849,7 +26849,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 23237
+      "line": 23248
      }
     }
    },
@@ -27164,7 +27164,7 @@
     "tree": "nf",
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23407
+    "line": 23418
    },
    "status": "curated",
    "text": "Names the census row from which a card is priced that is not in the census file by UUID: list <live>=<census UUID>, <live> = card UUID, nvml<N> or class (RTX3080). Without an entry the start borrows the heaviest row of the same class (otherwise of the whole census) and refuses that as HW-BORROWED until force is set.",
@@ -28302,7 +28302,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22300
+      "line": 22311
      }
     }
    },
@@ -29659,7 +29659,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2524
+      "line": 2529
      }
     }
    },
@@ -29714,7 +29714,7 @@
     "tree": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2514
+    "line": 2519
    },
    "status": "harvested",
    "text": "",
@@ -29737,7 +29737,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2560
+      "line": 2565
      }
     }
    },
@@ -39266,7 +39266,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2535
+      "line": 2540
      }
     }
    },
@@ -39435,7 +39435,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2539
+      "line": 2544
      }
     }
    },
@@ -65508,7 +65508,7 @@
      "source": {
       "file": "pdflip/front.py",
       "kind": "os.environ",
-      "line": 4090
+      "line": 4092
      }
     }
    },
@@ -65810,7 +65810,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 1951
+      "line": 1956
      }
     }
    },
@@ -70902,7 +70902,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 3660
+      "line": 3665
      }
     }
    },
@@ -71183,7 +71183,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2055
+      "line": 2060
      }
     }
    },
@@ -71261,7 +71261,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4332
+      "line": 4337
      }
     }
    },
@@ -71369,7 +71369,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2553
+      "line": 2558
      }
     }
    },
@@ -71429,6 +71429,58 @@
    },
    "status": "harvested",
    "text": "",
+   "type": "EnvBool"
+  },
+  "FLLIPER_PDFLIP_ENABLE_DECODE_COLLECT_PREFILL_BUSY": {
+   "bare": false,
+   "choices": null,
+   "cost": "A short request that arrives while D prefills another one waits for the collect window before it is served; a long short plus a straggler can flip D to P at the window end.",
+   "default": "True",
+   "depends": [
+    {
+     "belegt": true,
+     "calc": "text",
+     "edge": "K136",
+     "effect": "The window sets how long a SHORT is held for the sum; with FLLIPER_PDFLIP_DECODE_COLLECT_WINDOW_S=0 only the collecting is off (the old path), the booking of granted SHORTs still prices the queue-take and the D-SHORT-DRAIN.",
+     "evidence": {
+      "anchor": "window (as before), else the released route",
+      "aufloesung": "other_line",
+      "file": "python/flliper/srt/pdflip/front.py",
+      "row_note": 10498,
+      "zeile": 10498
+     },
+     "quelle": "catalog",
+     "rel": "scales_with",
+     "satz": "The window sets how long a SHORT is held for the sum; with FLLIPER_PDFLIP_DECODE_COLLECT_WINDOW_S=0 only the collecting is off (the old path), the booking of granted SHORTs still prices the queue-take and the D-SHORT-DRAIN.",
+     "to": "FLLIPER_PDFLIP_DECODE_COLLECT_WINDOW_S",
+     "to_kind": "env",
+     "trees": [
+      "nf"
+     ],
+     "value": null
+    }
+   ],
+   "gain": "A burst of short requests no longer lands on D as one long prefill: the sum is checked, the rest is prefilled by P as a batch.",
+   "group": "Other",
+   "help": "X-SUM-PRICE on the arrival path (user 09.10.): a D that is PREFILLING a granted SHORT counts as busy for DECODE-COLLECT, and what it still has to prefill is carried into the collected set's sum. Off = collect only while D decodes (the sum of an arriving burst on an idle D is unpriced).",
+   "id": "FLLIPER_PDFLIP_ENABLE_DECODE_COLLECT_PREFILL_BUSY",
+   "kind": "env",
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_ENABLE_DECODE_COLLECT_PREFILL_BUSY",
+   "nargs": null,
+   "planner_derived": false,
+   "satz_quelle": "NF-Sitz, X-SUM-PRICE (Review xsum-review-1009, Planer-Auftrag 10.10.), Metall int23xsum2 09.10. 22:53Z",
+   "source": {
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 1840,
+    "tree": "nf"
+   },
+   "status": "explained",
+   "text": "Collect rule for short requests when D is prefilling instead of decoding: on, a short request (that would go to D by itself) that was granted to D and has not yet delivered a first token counts as work on D. The next short requests that arrive meanwhile are collected for the window (FLLIPER_PDFLIP_DECODE_COLLECT_WINDOW_S) and priced as a SUM together with those open tokens against the X limit; what does not fit goes to the P batch. Off: the old blind path, every short request is checked alone against X and an idle D takes all of them (six shorts of 6239 tokens within one second: 37k tokens prefilled on D, about 53 s). Default on in the NF tree (since 10.10.; metal int23xsum2 09.10.: 6 x 5200 on an idle D, one seat on D, five to the P batch). With the collect window at 0 (FLLIPER_PDFLIP_DECODE_COLLECT_WINDOW_S) only the collecting is off; the booking still prices the queue-take of waiting shorts and the short drain.",
+   "trees": [
+    "nf"
+   ],
    "type": "EnvBool"
   },
   "FLLIPER_PDFLIP_ENABLE_DRAIN_EMPTY_SKIP": {
@@ -71683,7 +71735,7 @@
     "tree": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2075
+    "line": 2080
    },
    "status": "harvested",
    "text": "",
@@ -71913,7 +71965,7 @@
     "tree": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1979
+    "line": 1984
    },
    "status": "harvested",
    "text": "",
@@ -71936,7 +71988,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2544
+      "line": 2549
      }
     }
    },
@@ -72158,7 +72210,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4312
+      "line": 4317
      }
     }
    },
@@ -72876,7 +72928,7 @@
     "tree": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1990
+    "line": 1995
    },
    "status": "harvested",
    "text": "",
@@ -72904,7 +72956,7 @@
     "tree": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1985
+    "line": 1990
    },
    "status": "harvested",
    "text": "",
@@ -75378,7 +75430,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4432
+      "line": 4437
      }
     }
    },
@@ -76773,7 +76825,7 @@
      "source": {
       "file": "pdflip/front.py",
       "kind": "os.environ",
-      "line": 1186
+      "line": 1188
      }
     }
    },
@@ -77527,7 +77579,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4241
+      "line": 4246
      }
     }
    },
@@ -78088,7 +78140,7 @@
     "tree": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2420
+    "line": 2425
    },
    "status": "explained",
    "text": "If a paused (parked) request is to continue later and the room for Mamba anchors in host RAM is full, its re-entry point gets priority: other intermediate states without a park reference are swapped to disk first, so that the entry point of the parked request is not lost. Off: the old way; parked requests can lose their entry point and recompute. Without a park nothing changes. Acts only on nodes that are marked as parked. Default on. Unverified: dependency on another switch; whether the user should change it (only the decision \"stays on\" of 05.10. ~17:47Z is verified); benefit on the metal (according to the report \"active, effect not shown\").",
@@ -78237,7 +78289,7 @@
     "tree": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1897
+    "line": 1902
    },
    "status": "harvested",
    "text": "",
@@ -78294,7 +78346,7 @@
     "tree": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1920
+    "line": 1925
    },
    "status": "harvested",
    "text": "",
@@ -82021,7 +82073,7 @@
      "source": {
       "file": "managers/scheduler.py",
       "kind": "os.environ",
-      "line": 920
+      "line": 921
      }
     }
    },
@@ -83351,7 +83403,7 @@
      "source": {
       "file": "pdflip/vision_rank_runner.py",
       "kind": "os.environ",
-      "line": 1141
+      "line": 1179
      }
     }
    },
@@ -83438,7 +83490,7 @@
      "source": {
       "file": "pdflip/front.py",
       "kind": "os.environ",
-      "line": 4205
+      "line": 4197
      }
     }
    },
@@ -84728,7 +84780,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4419
+      "line": 4424
      }
     }
    },
@@ -85459,7 +85511,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4625,
+    "line": 4630,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -85487,7 +85539,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4624,
+    "line": 4629,
     "tree": "nf"
    },
    "status": "harvested",
@@ -85515,7 +85567,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 1972,
+    "line": 1977,
     "tree": "nf"
    },
    "status": "harvested",
@@ -85543,7 +85595,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 2195,
+    "line": 2200,
     "tree": "nf"
    },
    "status": "harvested",
@@ -85603,7 +85655,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 2204,
+    "line": 2209,
     "tree": "nf"
    },
    "status": "harvested",
@@ -85631,7 +85683,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 2209,
+    "line": 2214,
     "tree": "nf"
    },
    "status": "harvested",
@@ -85739,7 +85791,7 @@
    "status": {
     "eindeutig": 122,
     "nah": 12,
-    "other_line": 1
+    "other_line": 2
    }
   },
   "beleg_aufloesung_baeume": {
@@ -85748,14 +85800,14 @@
     "status": {
      "eindeutig": 122,
      "nah": 12,
-     "other_line": 1
+     "other_line": 2
     }
    },
    "nf": {
     "problem": [],
     "status": {
      "other_line": 45,
-     "eindeutig": 80,
+     "eindeutig": 81,
      "nah": 10
     }
    }
@@ -85763,10 +85815,10 @@
   "file": "kantenkatalog_1004.json",
   "geladen": true,
   "reason": "",
-  "kanten_belegt": 135,
-  "edges_total": 135,
+  "kanten_belegt": 136,
+  "edges_total": 136,
   "edges_without_evidence": 25,
-  "neu": 84,
+  "neu": 85,
   "rel_abweichend": [
    "K12",
    "K19",
@@ -85795,25 +85847,25 @@
    "abweichung": 45,
    "beide": 2462,
    "nur_27b": 180,
-   "nur_nf": 44
+   "nur_nf": 45
   },
-  "entries": 2704,
-  "envs": 1827,
-  "explained": 309,
+  "entries": 2705,
+  "envs": 1828,
+  "explained": 310,
   "flags": 862,
   "harvested": 1673,
   "curated": 121,
   "unexplained": 601
  },
- "tree_rev": "27b=08f4e76f8032e5ec3c3a129a89a00279ffe91deb+nf=8051505666",
+ "tree_rev": "27b=985536406f+nf=1f760d3455",
  "trees": {
   "27b": {
    "entries": 2642,
-   "rev": "08f4e76f8032e5ec3c3a129a89a00279ffe91deb"
+   "rev": "985536406f"
   },
   "nf": {
-   "entries": 2506,
-   "rev": "8051505666"
+   "entries": 2507,
+   "rev": "1f760d3455"
   }
  },
  "warnungen": []
