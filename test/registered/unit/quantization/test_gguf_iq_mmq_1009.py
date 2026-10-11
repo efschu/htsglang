@@ -367,6 +367,13 @@ class TestRealNfHeader(CustomTestCase):
         self.assertEqual(2 * 640 // 2, 640)
 
 
+def _align_buffer_len(numel: int, num_experts: int, block: int = 4) -> int:
+    """Length of the sorted_token_ids buffer moe_align_block_size allocates (triton_utils/moe_align_block_size.py:62-66)."""
+    if numel < num_experts + 1:
+        return numel * block
+    return numel + (num_experts + 1) * (block - 1)
+
+
 # ---------------------------------------------------------------------------------------------------------------------
 def _install_fake_iq_module(G, ready_types, calls):
     mod = types.SimpleNamespace()
@@ -415,8 +422,10 @@ class TestDispatch(CustomTestCase):
         fake_align = types.ModuleType("sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size")
 
         def moe_align_block_size(topk_ids, block, E):
-            n = topk_ids.numel() + (E + 1) * (block - 1)
-            n = (n + block - 1) // block * block
+            # G9: the REAL allocation of moe_align_block_size (triton_utils/moe_align_block_size.py:62-66): an upper bound that is
+            # generally NOT a multiple of the block size. Until G9 this fake rounded n up to a multiple of 4, which hid the
+            # stage-0 metal failure ("sorted_token_ids length must be a multiple of the MoE block size 4") from the desk.
+            n = _align_buffer_len(topk_ids.numel(), E, block)
             return (
                 torch.zeros(n, dtype=torch.int32),
                 torch.tensor([0, 1, E, 77, 300], dtype=torch.int32),
@@ -502,6 +511,37 @@ class TestDispatch(CustomTestCase):
         # expert ids >= E (garbage / the zero-pad expert id E of an uneven shard) are sanitised to -1 before the kernel
         self.assertEqual(calls[0][5], [0, 1, -1, 77, 300])  # only ids >= E (512) are masked; ids < E are valid blocks
 
+    def test_nf_class_a_prefill_with_the_real_wrapper_and_the_real_buffer_length(self):
+        """G9: the dispatch -> real gguf_iq_mmq.moe_a8 wrapper -> kernel host checks, with moe_align_block_size's real length.
+
+        The fake module of setUp stands in for the wrapper and the fake aligner used to round the length up, so neither the
+        wrapper nor the length contract was ever exercised on the desk; here only the nvcc-built module is replaced, by the
+        host checks of gguf_iq_mmq.cuh. Without the G9 floor in the wrapper this raises the metal error.
+        """
+        from sglang.jit_kernel import gguf_iq_mmq as K
+
+        host = _HostCheckModule()
+        old = K._module
+        K._module = lambda type_id: host
+        self.addCleanup(setattr, K, "_module", old)
+        self.G._iq_mmq_mod = types.SimpleNamespace(is_ready=lambda t: int(t) in {20, 21, 23}, moe_a8=K.moe_a8)
+        # realistic routing shapes (sorted_ids upper-bound length, expert_ids of ceil(len / 4) blocks) instead of setUp's 5-entry stub
+        sys.modules["sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size"].moe_align_block_size = (
+            lambda topk_ids, block, E: _align_model(topk_ids, E, block)[:3]
+        )
+        for tokens, top_k, E in ((256, 10, 512), (192, 10, 16)):
+            host.calls.clear()
+            self.calls.clear()
+            x = torch.zeros(tokens, 2560, dtype=torch.bfloat16)
+            w1 = torch.zeros(E, 2 * 640, 2560 // 256 * 110, dtype=torch.uint8)  # IQ3_S rows
+            w2 = torch.zeros(E, 2560, 640 // 32 * 18, dtype=torch.uint8)  # IQ4_NL rows
+            topk_ids = torch.zeros(tokens, top_k, dtype=torch.int32)
+            self.G.fused_moe_gguf(x, w1, w2, torch.zeros(tokens, top_k, dtype=x.dtype), topk_ids, 21, 20, "silu")
+            self.assertEqual(len(host.calls), 2, (tokens, top_k, E))
+            for sorted_ids, _, _ in host.calls:
+                self.assertEqual(sorted_ids.shape[0] % 4, 0)
+                self.assertEqual(sorted_ids.shape[0], _align_buffer_len(tokens * top_k, E) // 4 * 4)
+
     def test_nf_class_b_mixed_pair_uses_iq_and_the_wheel_kernel(self):
         calls = self._moe(21, 8, 256)  # IQ3_S + Q8_0 (wheel MMQ, K = 640 % 128 == 0)
         self.assertEqual([c[0] for c in calls], ["iq_moe", "wheel_moe"])
@@ -544,6 +584,171 @@ class TestDispatch(CustomTestCase):
         ready = mod_src.split("def is_ready", 1)[1].split("\ndef ", 1)[0]
         self.assertNotIn("load_jit", ready)
         self.assertNotIn("_module(", ready)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+class _HostCheckModule:
+    """Stands in for the JIT module: replays the HOST checks of gguf_iq_mmq.cuh moe_a8 (lines 326-330) and records the call."""
+
+    def __init__(self):
+        self.calls = []
+
+    def moe_a8(self, X, W, sorted_ids, expert_ids, ntpp, Y, quant_x, type_id, row, top_k, tokens):
+        n = sorted_ids.shape[0]
+        if n % 4 != 0:
+            raise RuntimeError("sorted_token_ids length must be a multiple of the MoE block size 4")
+        if n // 4 > 65535:
+            raise RuntimeError("MoE MMQ grid.y limit")
+        if expert_ids.shape[0] < n // 4:
+            raise RuntimeError("expert_ids shorter than the number of blocks")
+        self.calls.append((sorted_ids, expert_ids, ntpp))
+
+
+def _align_model(topk_ids: torch.Tensor, E: int, block: int = 4):
+    """CPU model of moe_align_block_size: (sorted_ids buffer, expert_ids buffer, num_tokens_post_padded, real used length)."""
+    n_buf = _align_buffer_len(topk_ids.numel(), E, block)
+    ids = topk_ids.reshape(-1).tolist()
+    sorted_ids, expert_ids = [], []
+    for e in range(E + 1):  # E + 1 ids: the extra one is the filtered / zero-pad expert
+        mine = [i for i, v in enumerate(ids) if v == e]
+        padded = -(-len(mine) // block) * block
+        sorted_ids += mine + [len(ids)] * (padded - len(mine))
+        expert_ids += [e] * (padded // block)
+    used = len(sorted_ids)
+    buf = torch.full((n_buf,), len(ids), dtype=torch.int32)
+    buf[:used] = torch.tensor(sorted_ids, dtype=torch.int32)
+    eb = torch.full((-(-n_buf // block),), 7777, dtype=torch.int32)
+    eb[: len(expert_ids)] = torch.tensor(expert_ids, dtype=torch.int32)
+    return buf, eb, torch.tensor([used], dtype=torch.int32), used
+
+
+class TestMoeRoutingContract(CustomTestCase):
+    """G9 (stage-0 metal, sm86 + sm120: 13 MoE cases red): the routing buffer length is an upper bound, not a multiple of 4."""
+
+    def test_buffer_length_is_in_general_not_a_multiple_of_the_block(self):
+        # the failing metal case: tokens=192, top_k=10, E=16 (test_moe_iq4_nl_k640_ffn_down_shape)
+        self.assertEqual(_align_buffer_len(192 * 10, 16), 1971)
+        self.assertNotEqual(1971 % 4, 0)
+        # tiny batch branch (numel < E + 1): numel * block, always aligned
+        self.assertEqual(_align_buffer_len(5, 16), 20)
+
+    def test_moe_routing_len_floors_to_the_block(self):
+        self.assertEqual(P.moe_routing_len(1971), 1968)
+        self.assertEqual(P.moe_routing_len(1968), 1968)
+        self.assertEqual(P.moe_routing_len(4), 4)
+        self.assertEqual(P.moe_routing_len(7), 4)
+        self.assertEqual(P.moe_routing_len(3), 0)
+
+    def test_the_floor_never_cuts_a_used_block(self):
+        """num_tokens_post_padded (a multiple of 4, <= buffer) <= floor(buffer): for random routings incl. the filtered expert."""
+        g = torch.Generator().manual_seed(5)
+        for tokens, top_k, E in ((192, 10, 16), (130, 4, 8), (1, 1, 1), (3, 2, 512), (257, 10, 64), (128, 10, 512), (64, 8, 3)):
+            for _ in range(4):
+                topk = torch.randint(0, E + 1, (tokens, top_k), generator=g, dtype=torch.int32)  # E = the zero-pad expert
+                buf, eb, ntpp, used = _align_model(topk, E)
+                self.assertEqual(used % 4, 0)
+                self.assertLessEqual(used, buf.shape[0])
+                self.assertLessEqual(used, P.moe_routing_len(buf.shape[0]), (tokens, top_k, E))
+                self.assertGreaterEqual(eb.shape[0], P.moe_routing_len(buf.shape[0]) // 4)
+
+    def _call(self, K, buf, eb, ntpp):
+        X = torch.zeros(4, 512, dtype=torch.bfloat16)
+        W = torch.zeros(2, 8, 10, dtype=torch.uint8)
+        return K.moe_a8(X, W, buf, eb, ntpp, P.IQ4_NL, 8, 2, 4)
+
+    def _wrapper(self):
+        from sglang.jit_kernel import gguf_iq_mmq as K
+
+        fake = _HostCheckModule()
+        old = K._module
+        K._module = lambda type_id: fake
+        self.addCleanup(setattr, K, "_module", old)
+        return K, fake
+
+    def test_wrapper_hands_the_kernel_an_aligned_routing_for_the_metal_shape(self):
+        K, fake = self._wrapper()
+        topk = torch.randint(0, 16, (192, 10), dtype=torch.int32)
+        buf, eb, ntpp, used = _align_model(topk, 16)
+        self.assertEqual(buf.shape[0], 1971)
+        X = torch.zeros(192, 640, dtype=torch.bfloat16)
+        W = torch.zeros(16, 256, 10, dtype=torch.uint8)
+        K.moe_a8(X, W, buf, eb, ntpp, P.IQ4_NL, 256, 10, 192)  # raises RuntimeError without the G9 floor
+        (sorted_ids, expert_ids, _), = fake.calls
+        self.assertEqual(sorted_ids.shape[0] % 4, 0)
+        self.assertEqual(sorted_ids.shape[0], 1968)
+        self.assertGreaterEqual(sorted_ids.shape[0], used)
+        # order and content preserved, zero copy: the kernel reads the very same memory
+        self.assertTrue(torch.equal(sorted_ids, buf[:1968]))
+        self.assertEqual(sorted_ids.data_ptr(), buf.data_ptr())
+        self.assertIs(expert_ids, eb)
+
+    def test_wrapper_keeps_an_already_aligned_buffer_whole(self):
+        K, fake = self._wrapper()
+        buf, eb, ntpp, _ = _align_model(torch.zeros(5, 1, dtype=torch.int32), 16)  # numel < E + 1 -> numel * 4 = 20
+        self.assertEqual(buf.shape[0], 20)
+        X = torch.zeros(5, 512, dtype=torch.bfloat16)
+        W = torch.zeros(16, 8, 10, dtype=torch.uint8)
+        K.moe_a8(X, W, buf, eb, ntpp, P.IQ4_NL, 8, 1, 5)
+        self.assertEqual(fake.calls[0][0].shape[0], 20)
+
+    def test_the_kernel_check_is_not_loosened(self):
+        src = (_CSRC / "gguf_iq_mmq.cuh").read_text()
+        self.assertIn('RuntimeCheck(tokens_post_padded % 4 == 0, "sorted_token_ids length must be a multiple of the MoE block size 4");', src)
+        self.assertEqual(_sha(_CSRC / "gguf_iq_mmq.cuh"), "61294f69dc6bafe7fff5253b587b77a5e3ece2cce7d36142f96ebedeed91bdb0")
+
+    def test_production_dispatch_and_the_gpu_test_take_the_same_wrapper_and_the_same_aligner(self):
+        """gguf.py _moe_mm_a8 -> _iq_mmq_mod.moe_a8 (the wrapper under test); the metal test calls K.moe_a8 on moe_align_block_size output."""
+        g_src = Path(__import__("sglang.srt.layers.quantization.gguf", fromlist=["x"]).__file__).read_text()
+        body = g_src.split("def _fused_moe_gguf_iq_mmq", 1)[1].split("\ndef ", 1)[0]
+        self.assertIn("moe_align_block_size(\n        topk_ids, _iq_policy.IQ_MOE_MMQ_BLOCK_SIZE, E\n    )", body)
+        self.assertEqual(body.count("_moe_mm_a8("), 2)
+        mm = g_src.split("def _moe_mm_a8", 1)[1].split("\ndef ", 1)[0]
+        self.assertIn("_iq_mmq_mod.moe_a8(", mm)
+        t_src = Path(__file__).read_text()
+        self.assertIn("moe_align_block_size(topk_ids, P.IQ_MOE_MMQ_BLOCK_SIZE, E)", t_src)
+        self.assertIn("self.K.moe_a8(x, w, sorted_ids, expert_ids, ntpp, qtype, rows, top_k, tokens)", t_src)
+
+
+class TestSyntheticToleranceIsAttainable(CustomTestCase):
+    """G9 (dense IQ4_XS red on sm86 + sm120): the GPU test bounds must be attainable by the EXACT kernel math on its own inputs.
+
+    CPU model of the kernel: exact dequantised weights (gguf-py), q8_1 activation rounding (per 32: d = amax / 127, q = round),
+    exact integer dot, output rounded to the activation dtype. A bound that this model exceeds cannot be met by a correct kernel.
+    """
+
+    @staticmethod
+    def _q81(x: torch.Tensor) -> torch.Tensor:
+        m, k = x.shape
+        xb = x.reshape(m, k // 32, 32)
+        d = xb.abs().amax(-1, keepdim=True) / 127
+        q = torch.round(xb / d.clamp_min(1e-30))
+        return (q * d).reshape(m, k)
+
+    def _utilisation(self, qtype, atol, rtol, moe, seeds=4, dtype=torch.bfloat16):
+        """max |err| / (atol + rtol |ref|) over seeds; > 1 means assert_close fails."""
+        rows, k = (96, 512) if moe else (128, 512)
+        raw = _synth_blocks(qtype, rows, k, seed=qtype)
+        q = gguf_lib.GGMLQuantizationType(qtype)
+        wd = torch.from_numpy(np.ascontiguousarray(gguf_lib.quants.dequantize(raw, q))).float()
+        worst = 0.0
+        for s in range(seeds):
+            torch.manual_seed(s)
+            x = torch.rand((130 if moe else 16, k), dtype=dtype)
+            y = (self._q81(x.float()) @ wd.T).to(dtype).float()
+            ref = x.float() @ wd.T
+            worst = max(worst, float(((y - ref).abs() / (atol + rtol * ref.abs())).max()))
+        return worst, float(wd.pow(2).mean().sqrt())
+
+    def test_every_type_stays_well_inside_the_pr_bounds(self):
+        for q in sorted(P.IQ_MMQ_TYPES):
+            for moe, atol in ((False, 1.5), (True, 1.0)):
+                u, w_rms = self._utilisation(q, atol, 0.1, moe)
+                self.assertLess(u, 0.6, f"{P.IQ_TYPE_NAMES[q]} moe={moe}: tolerance utilisation {u:.2f} (w_rms {w_rms:.2f})")
+
+    def test_iq4_xs_synthetic_amplitude_is_in_the_family(self):
+        _, w_xs = self._utilisation(P.IQ4_XS, 1.5, 0.1, False, seeds=1)
+        _, w_nl = self._utilisation(P.IQ4_NL, 1.5, 0.1, False, seeds=1)
+        self.assertLess(w_xs, 3 * w_nl)  # before G9: 14.25 vs 0.84
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -629,7 +834,15 @@ def _synth_blocks(qtype: int, rows: int, k: int, seed: int) -> np.ndarray:
     nb = k // block
     rng = np.random.default_rng(seed)
     raw = rng.integers(0, 256, size=(rows, nb, size), dtype=np.uint8)
-    d = rng.uniform(0.002, 0.02, size=(rows, nb)).astype(np.float16)
+    d = rng.uniform(0.002, 0.02, size=(rows, nb))
+    if qtype == P.IQ4_XS:
+        # G9: IQ4_XS carries a second, 6-bit per-sub-block scale (-32..31) on top of d and kvalues of +-127, so with the same d
+        # the random block is ~14x larger in RMS than any other type (w_rms 14.3 vs 0.1-1.8; reference output RMS 228 vs 1-21).
+        # The q8_1 activation rounding error scales with it and the PR's ABSOLUTE bound (atol 1.5 dense / 1.0 MoE) is then
+        # exceeded (tolerance utilisation 1.44 dense / 2.14 MoE, CPU model of the exact kernel math) -- a property of the
+        # synthetic input, not of the kernel (real NF IQ4_XS blocks: w_rms 0.013, utilisation 0.02). d / 16 brings w_rms to 0.9.
+        d = d / 16
+    d = d.astype(np.float16)
     raw[:, :, 0:2] = d.view(np.uint8).reshape(rows, nb, 2)
     return raw.reshape(rows, nb * size)
 

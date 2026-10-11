@@ -145,6 +145,21 @@ def moe_mmq_shape_ok(num_tokens: int, num_experts: int, top_k: int) -> bool:
     )
 
 
+def moe_routing_len(buffer_len: int) -> int:
+    """Length of ``sorted_token_ids`` the IQ MoE kernel is launched with: the largest multiple of the MoE block size <= the buffer.
+
+    G9 (stage-0 metal, 2026-10-11). ``moe_align_block_size`` allocates ``sorted_token_ids`` as an UPPER BOUND,
+    ``numel + (E + 1) * (block - 1)`` (or ``numel * block`` for tiny batches) -- exactly the ``max_num_tokens_padded`` of
+    ``moe_mmq_shape_ok`` above -- and fills only the first ``num_tokens_post_padded`` entries; the buffer length is therefore
+    in general NOT a multiple of the block size (192 tokens x top_k 10, E = 16 -> 1971). The wheel kernel (sgl-kernel
+    gguf_kernel.cu ``ggml_moe_a8`` passes ``sorted_token_ids.sizes()[0]``, moe.cuh:257 ``block_num_y = len / mmq_x``) floors
+    that division. The real ``num_tokens_post_padded`` is a multiple of the block size (every expert is padded up to one)
+    and <= the buffer, hence <= this floor: no used block is lost, the grid equals the wheel's, and the host check of the
+    vendored kernel (length % block == 0) stays untouched. A zero-copy slice, CUDA-graph neutral.
+    """
+    return buffer_len // IQ_MOE_MMQ_BLOCK_SIZE * IQ_MOE_MMQ_BLOCK_SIZE
+
+
 def dense_mmq_shape_ok(num_tokens: int, mmvq_safe: int) -> bool:
     """The dense IQ MMQ takes the window the MMVQ leaves: mmvq_safe < M <= IQ_MMQ_MAX_BATCH_SIZE."""
     return mmvq_safe < num_tokens <= IQ_MMQ_MAX_BATCH_SIZE

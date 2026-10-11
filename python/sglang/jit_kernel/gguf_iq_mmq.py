@@ -160,7 +160,12 @@ def moe_a8(
     ``sorted_token_ids`` / ``expert_ids`` / ``num_tokens_post_padded`` come from moe_align_block_size with block size
     ``policy.IQ_MOE_MMQ_BLOCK_SIZE`` (4); ``expert_ids`` must already carry -1 for blocks that are not a valid LOCAL expert
     (the caller sanitises, exactly as for ggml_moe_a8 -- see fused_moe_gguf).
+
+    G9: ``sorted_token_ids`` is the allocation of moe_align_block_size, an upper bound whose length is generally not a multiple
+    of the block size; it is launched with ``policy.moe_routing_len`` of it (see there), so the host check of the kernel
+    ("length % 4 == 0") holds for every real routing instead of only for lengths that happen to be aligned.
     """
+    sorted_token_ids = sorted_token_ids[: policy.moe_routing_len(sorted_token_ids.shape[0])]
     X = X.contiguous()
     mod = _module(int(type_id))
     col = X.shape[1]
