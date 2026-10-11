@@ -10,24 +10,54 @@ dual 4096x4096 image (16384 image tokens) D's loop stood for ~41 s (boot
 intake 00:39:55), two ``/health`` probes timed out and the front stopped the
 healthy group with ``W17 PdFlipGroupDead``.
 
-WHY A THREAD AND NOT A PROCESS (measured, CPU only, 4096x4096 JPEG, the 27B
-preprocessor config, ``/root/.claude/jobs/1ab4cd30/tmp/gil_probe.py``): with
-each step in a worker thread the loop's worst wake-up lag was 6.2 ms for the
-PIL decode, 5.5 ms for the HF processor (326 ms of work), 0.4 ms for the
-sha256 (177 ms), 0.4 ms for the shm fallocate+copy (95 ms) -- every one of
-these releases the GIL. Only the INLINE transport (``pickle.dumps`` /
-msgpack of the 400 MB ``pixel_values``) holds it (222 / 209 ms lag), and that
-transport is not the one a single-node boot uses (``dist_init_addr=None`` ->
-``cuda_ipc`` mode -> shm pointers, whose pickle is 0.3 ms).
+WHY A THREAD AND NOT A PROCESS -- THE GIL QUESTION, AND ONLY THAT. Probe
+``/root/.claude/jobs/1ab4cd30/tmp/gil_probe.py`` (CPU only, 4096x4096 JPEG,
+the 27B preprocessor config, real flliper functions; a 5 ms asyncio ticker
+reports the loop's worst wake-up lag while the step runs in a worker thread).
+Measured max loop lag per step (step duration in the thread):
+
+    PIL decode + RGB                     6.2 ms   (119 ms)
+    HF processor (process_mm_data)       5.5 ms   (326 ms)
+    collect + offsets + expand           0.5 ms   (0.4 ms)
+    set_pad_value (sha256, 400 MB)       0.4 ms   (177 ms)
+    mrope (image-only)                   0.7 ms   (0.7 ms)
+    shm wrap (fallocate + copy)          0.4 ms   (95 ms)
+    pickle(mm_inputs, shm pointer)       0.4 ms   (0.3 ms)
+    process_and_combine (full chain)     2.7 ms   (363 ms)
+    pickle(mm_inputs, inline 400 MB)   221.6 ms   (426 ms)   holds the GIL
+    msgpack(inline)                    209.1 ms   (223 ms)   holds the GIL
+    zmq send+recv(inline)              136.3 ms   (555 ms)
+
+So no step of the shm path holds the GIL for long; only the INLINE transport
+does, and a single-node boot does not use it (``dist_init_addr=None`` ->
+``cuda_ipc`` mode -> shm pointers). The probe answers nothing about WHY the
+chain took 41 s on the metal instead of 0.6 s on an idle CPU.
+
+THE METAL ANSWERS THAT (boot jzmxnp, 10.10., dual 4096x4096, image with this
+module: green, offloaded=1 on P and D, no health or loop-lag line). The
+PDFLIP-MM-TOKENIZE line: process_ms 32555 (P) / 21987 (D) at utime ~1.5 s, i.e.
+stime 33380 / 23167 ms; compact_stall 75 / 1007, pswpin 6270 / 89856, pswpout
+132 / 14927, pgmajfault 92532 / 50660. Over 95 % of the time is KERNEL time --
+THP compaction and swap -- not Python. The thread keeps the loop answering
+through that stall; it does not make the stall shorter.
+
+TODO (follow-up package, not built here): NUMPY_MADVISE_HUGEPAGE=0 in the
+tokenizer process (as in the ranks) and the host's swappiness, against the
+compaction/swap stall itself.
 
 THE RULES THIS MODULE KEEPS.
 
-* Only for a single (non-batch) request with multimodal input, only when no
-  vision tower service runs in this process
-  (``vision_stage_service.installed() is None``; the tower runs inside
-  ``process_and_combine_mm_data`` and stays where it was), and never with a
-  device-resident frontend (CUDA IPC transport, ``--keep-mm-feature-on-device``,
-  GPU preprocessing) -- no CUDA work moves to another thread.
+* Only for a single (non-batch) request with multimodal input (see BATCH
+  PATH below), and never with a device-resident frontend (CUDA IPC transport,
+  ``--keep-mm-feature-on-device``, GPU preprocessing) -- no CUDA work moves to
+  another thread. ``offload_permitted`` also refuses when
+  ``vision_stage_service.installed()`` is not None. That guards a DEAD path:
+  ``vision_stage_service.install(service)`` has no caller in production code
+  (``vision_stage_boot.py`` ends in ``install_rank_stage()``, which sets
+  ``_SERVICE = None`` -- the tower runs in P's PP0 rank), so ``installed() is
+  None`` holds on P too, and P offloads like D (metal jzmxnp: offloaded=1 on
+  both). The guard stays so a revived tokenizer-process tower would not run
+  on the worker thread unreviewed.
 * ONE processing thread: requests are processed one at a time, as on the
   loop before, so N large images never hold N feature tensors at once. The shm
   wrap of a finished request runs on a SECOND single thread: on the shared one
