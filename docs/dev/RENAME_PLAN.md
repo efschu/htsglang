@@ -944,3 +944,28 @@ DEFAULTS-ON `dd65a419fb` (row 21, ported by F0-K as `c642c24f12`).
 `--pdflip-vision-place weights` requires transient / excludes VISION_ASYNC / kvtail and auto excluded with `--dual-layout`); the NF file holds the W3 edge behind them as **K135** (it was K132; the id clashed with the first vision
 edge). K132 carries no `trees` label any more: the edge holds on both lines since AP1 reached NF. The NF line takes the two curated entries of AP4 (`--pdflip-vision-place`, `FLLIPER_PDFLIP_VISION_ASYNC`) so the curated
 count of the shipped file is true on both lines. Pins per line: 27B own file 134 edges, NF own file 135; the shipped union 135 edges (51 merged, 84 new).
+
+## 8.23 F0-H round 4b, the NF post-freeze delta ported (10.10.2026, NF line only; 8.22 is the 27B line's round 4a)
+
+Head before: `desk/flliper-nf-int-1010` @ 8f30025ad7. Head after: `desk/flliper-nf-int-1011` (SHAs: `git log` of the branch). The 27B side of the same fixes is round 4a (8.22, `desk/flliper-27b-int-1011`).
+
+**Source** (old naming scheme): the NF integration line `bc040078cd..desk/nf-int24d-1010 @ 42d3d3ac0e`, 19 commits in the order of the line: (1) X-SUM-PRICE `a6a24f5643`, `6363cb2613`, `aa32854fd0`, `23f7bdbc99`, `9dee5c42b0` (the five picks of `desk/nf-int23-xsum-1009 @ 54f4a8f421`),
+(2) the test follow-up `04bca74219`, (3) `2110fac8dd` (catalog and pins), (4) #1158c `17c8582d2d`, (5) deadman tier 2 `fd84a02da8`, `0b61f38da2`, (6) D-Health `0167f2683c`, `a94786335a`, `89d538a6ad`, `3db3fa0674`, `b39005e9d2`, `5f89defbd1`, `1effdc9b16`, `9a8addcfa8`,
+(7) the fragmentation fix `42d3d3ac0e`. Not part: the H88 commits (`dacc89e543`, not in RC2) and DEFAULTS-ON (already F0-K).
+
+**Procedure** as rounds 1 to 4a (8.21): parent and fix version of every touched file through the kit (`rename_to_flliper.py apply`, `ident_fix.py`, `english_audit` with the translation memory only, `pinned_units` with `pin_from`), three-way merge into the tree, no hand renaming.
+One kit refusal as in round 4a: `test_pdflip_deadman_tier2_1158c.py` names `WEG2_DEADMAN_GROUP` and `PDFLIP_DEADMAN_GROUP` in one tuple on purpose (the double-reading test), the name rule would make them one word (`identifier collision`); the file is listed for the word `PDFLIP_DEADMAN_GROUP` in the collision exceptions of the pipeline.
+Conflicts: the edge file and the three edge-count pins only (below); every other file `MERGED-CLEAN` or `NEW`. Hand edits outside the pipeline output: the edge id and pins of the X-SUM edge, the W64 line pins (+11), docs.
+
+**X-SUM edge.** The old line numbered it K135 (K132 in the xsum branch). This tree holds K132-K134 (vision) and the W3 edge as K135, so the X-SUM edge is **K136** (`FLLIPER_PDFLIP_ENABLE_DECODE_COLLECT_PREFILL_BUSY` scales with `FLLIPER_PDFLIP_DECODE_COLLECT_WINDOW_S`, text and anchor of the source, stored line moved to the anchor's line here). Pins: NF own edge file 136 edges, shipped union 136 edges (51 merged, 85 new); the 27B own file stays 134.
+The old commit `2110fac8dd` also pinned `test_planer_h88e_moe_act_int8_1007` (H88 is not in this tree: skipped) and rebuilt `catalog.json` (rebuilt here once, see below).
+
+**Names.** Env `SGLANG_WEG2_ENABLE_DECODE_COLLECT_PREFILL_BUSY` -> `FLLIPER_PDFLIP_ENABLE_DECODE_COLLECT_PREFILL_BUSY` (`name_compat.canonical_env_name` folds the old name; default on). Markers `WEG2-MM-TOKENIZE` -> `PDFLIP-MM-TOKENIZE`, `WEG2-MM-SHM-UNLINK` -> `PDFLIP-MM-SHM-UNLINK`, `WEG2-HEALTH` -> `PDFLIP-HEALTH`
+(`mem:` suffix); unchanged: `TOKENIZER-LOOP-LAG`, `EVENT-LOOP-ENTER`, `LOOP-ITER-SLOW`, `#1458 CTRL-SEND`, `#1158c`, `W102 ... AIR`, `DECODE-COLLECT`. Deadman: `TIER2` (bash env of `boot_deadman.sh`, no catalog entry), `PDFLIP_DEADMAN_GROUP` read beside `WEG2_DEADMAN_GROUP`.
+
+**Shared files against the 27B port** (`985536406f`): byte-equal in both trees: `mm_tokenize_offload.py`, `host_mem_probe.py`, `loop_iter_slow.py`, `request_receiver.py`, `communicator.py`, `lru_file_evictor.py`, `boot_deadman.sh`, `base_processor.py`. Same added/removed lines (hunk multiset) with different context: `tokenizer_manager.py`, `qwen_vl.py`, `scheduler.py`, `front_health.py`
+(one blank line: the 27B file keeps the imports `guard_switches`/`envs` that only the 27B grace revert needs). `launcher.py`, `vision_rank_runner.py`, `vision_victim.py`: every added/removed line of the NF delta is also in the 27B delta; the 27B delta holds more (GGUF tower, VISION-WORK, the grace revert), none of which exists in this tree.
+
+**Catalog.** Built once as the union of both lines with the generator of the NF head (the 27B generator loses the NF-only EXPLAINED entries, round 4a finding), two runs byte-equal, key order by `catalog_order_merge_1008.py`; one new entry (the X-SUM switch) and edge K136 against the head of round 3; no entry and no edge of either line lost. The same bytes go to the 27B line (branch `desk/flliper-27b-int-1011-katalog`).
+
+**Not proven.** No metal in this round. The 27B metal statements (health grace, fragmentation, deadman tier 1) are the 27B seat's; on the NF line only X-SUM (int23xsum2, 09.10. 22:53Z: 6 x 5200 on an idle D = one seat on D, five to the P batch) has metal evidence, for the race fix; the later X-SUM review rounds, #1158c, D-Health, the deadman tier 1 and the fragmentation fix are proven by tests only.
