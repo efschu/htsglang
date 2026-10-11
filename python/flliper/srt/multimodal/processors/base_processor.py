@@ -1,6 +1,7 @@
 import asyncio
 import concurrent
 import concurrent.futures
+import copy
 import dataclasses
 import multiprocessing as mp
 import os
@@ -283,6 +284,8 @@ class BaseMultimodalProcessor(ABC):
             self._tokenizer = self._processor.tokenizer
         else:
             self._tokenizer = self._processor
+        # D-HEALTH: the private copy the off-loop worker runs on (offload_twin).
+        self._offload_twin: Optional["BaseMultimodalProcessor"] = None
 
         # Same guard as in serving_chat.py against double BOS.
         try:
@@ -582,6 +585,25 @@ class BaseMultimodalProcessor(ABC):
                         result[feature_name] = result[feature_name].to("cpu")
 
         return result
+
+    def offload_twin(self) -> "BaseMultimodalProcessor":
+        """This processor with a PRIVATE HF processor, for the off-loop worker.
+
+        The loop keeps tokenizing text with the shared fast tokenizer while the
+        worker (``mm_tokenize_offload``) runs the image chain; two threads on
+        one Rust tokenizer raise ``RuntimeError: Already borrowed``. Built once,
+        on the loop thread (the deep copy reads the tokenizer), ~0.8 s / 140 MB
+        for the 27B processor.
+        """
+        if self._offload_twin is None:
+            twin = copy.copy(self)
+            twin._processor = copy.deepcopy(self._processor)
+            if hasattr(twin._processor, "tokenizer"):
+                twin._tokenizer = twin._processor.tokenizer
+            else:
+                twin._tokenizer = twin._processor
+            self._offload_twin = twin
+        return self._offload_twin
 
     @abstractmethod
     async def process_mm_data_async(
