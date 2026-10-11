@@ -204,6 +204,37 @@ class TestDispatchOrder(CustomTestCase):
         self.assertLess(sent.index("A"), sent.index("T"))
         self.assertLess(sent.index("A"), sent.index("B"))
 
+    def test_dispatch_does_not_queue_behind_the_next_image(self):
+        """Image A finished processing while image B processes: A's shm wrap must not wait for B's
+        processing (on one shared worker it did -- A's dispatch then waited a whole second image)."""
+        sent = []
+        a_go, b_go = threading.Event(), threading.Event()
+
+        async def scenario():
+            order = mto.MmDispatchOrder()
+
+            async def image(name, go):
+                async with order.request(rid=name, is_mm=True) as turn:
+                    await mto.run_offloaded(go.wait, 5)
+                    await turn.dispatch(sent.append, name)
+
+            a = asyncio.create_task(image("A", a_go))
+            await asyncio.sleep(0.05)
+            b = asyncio.create_task(image("B", b_go))
+            await asyncio.sleep(0.05)  # B's processing is queued behind A's
+            a_go.set()
+            t_end = time.monotonic() + 2
+            while "A" not in sent and time.monotonic() < t_end:
+                await asyncio.sleep(0.01)
+            a_first = list(sent)
+            b_go.set()
+            await asyncio.wait_for(asyncio.gather(a, b), 10)
+            return a_first
+
+        a_first = self._run(scenario)
+        self.assertEqual(a_first, ["A"], "A's dispatch waited for B's processing")
+        self.assertEqual(sent, ["A", "B"])
+
     def test_failed_image_request_releases_the_order(self):
         sent = []
 

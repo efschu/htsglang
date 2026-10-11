@@ -28,8 +28,11 @@ THE RULES THIS MODULE KEEPS.
   ``process_and_combine_mm_data`` and stays where it was), and never with a
   device-resident frontend (CUDA IPC transport, ``--keep-mm-feature-on-device``,
   GPU preprocessing) -- no CUDA work moves to another thread.
-* ONE worker thread: requests are processed one at a time, as on the loop
-  before, so N large images never hold N feature tensors at once.
+* ONE processing thread: requests are processed one at a time, as on the
+  loop before, so N large images never hold N feature tensors at once. The shm
+  wrap of a finished request runs on a SECOND single thread: on the shared one
+  it would queue behind the next image's processing and delay a dispatch that
+  the loop used to make right after the request's own processing.
 * The offloaded call runs on a PRIVATE copy of the HF processor
   (``BaseMultimodalProcessor.offload_twin``): the loop keeps tokenizing text
   with the shared Rust tokenizer, and two threads on one fast tokenizer raise
@@ -57,7 +60,7 @@ import functools
 import logging
 import threading
 import time
-from typing import Any, AsyncIterator, Callable, Deque, Optional, Tuple
+from typing import Any, AsyncIterator, Callable, Deque, Dict, Optional, Tuple
 
 import msgspec
 
@@ -72,7 +75,8 @@ _OFFLOAD: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "mm_tokenize_offload", default=False
 )
 
-_EXECUTOR: Optional[concurrent.futures.ThreadPoolExecutor] = None
+#: One single-thread executor per lane: "process" (HF processor + hash), "wrap" (shm copy).
+_EXECUTORS: Dict[str, concurrent.futures.ThreadPoolExecutor] = {}
 _EXECUTOR_LOCK = threading.Lock()
 
 #: (I) a multimodal request slower than this prints its PDFLIP-MM-TOKENIZE line at INFO.
@@ -162,18 +166,21 @@ def offload_permitted() -> bool:
     return _vss.installed() is None
 
 
-def _executor() -> concurrent.futures.ThreadPoolExecutor:
-    global _EXECUTOR
+def _executor(lane: str) -> concurrent.futures.ThreadPoolExecutor:
     with _EXECUTOR_LOCK:
-        if _EXECUTOR is None:
-            _EXECUTOR = concurrent.futures.ThreadPoolExecutor(
-                max_workers=1, thread_name_prefix="mm_tokenize"
+        if lane not in _EXECUTORS:
+            _EXECUTORS[lane] = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix=f"mm_tokenize_{lane}"
             )
-        return _EXECUTOR
+        return _EXECUTORS[lane]
 
 
 async def run_offloaded(fn: Callable[..., Any], /, *args, **kwargs) -> Any:
-    """Run ``fn`` on the single worker thread with a copy of this context."""
+    """Run ``fn`` on the processing thread with a copy of this context."""
+    return await _run_on("process", fn, args, kwargs)
+
+
+async def _run_on(lane: str, fn: Callable[..., Any], args: tuple, kwargs: dict) -> Any:
     ctx = contextvars.copy_context()
     t_submit = time.perf_counter()
 
@@ -184,7 +191,7 @@ async def run_offloaded(fn: Callable[..., Any], /, *args, **kwargs) -> Any:
         return fn(*args, **kwargs)
 
     return await asyncio.get_running_loop().run_in_executor(
-        _executor(), functools.partial(ctx.run, call)
+        _executor(lane), functools.partial(ctx.run, call)
     )
 
 
@@ -244,7 +251,7 @@ class _Turn:
             from flliper.srt.managers.mm_utils import wrap_shm_features
 
             t0 = time.perf_counter()
-            tokenized_obj = await run_offloaded(wrap_shm_features, tokenized_obj)
+            tokenized_obj = await _run_on("wrap", wrap_shm_features, (tokenized_obj,), {})
             note(shm_wrap_ms=(time.perf_counter() - t0) * 1000)
         t0 = time.perf_counter()
         send(tokenized_obj)
