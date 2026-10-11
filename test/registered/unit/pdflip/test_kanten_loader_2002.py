@@ -1,7 +1,7 @@
 """Auftrag 2002 C: der Kantenkatalog (kantenkatalog_1004.json) wird gelesen und mit ``CURATED[...]["depends"]`` verschmolzen.
 
 Gepinnt (Nutzerentscheid 05.10., Variante A: Loader + Verschmelzung, KEINE Regelauswertung im Editor):
-  * Jede der 135 Katalogkanten steht danach in ``entries[von]["depends"]`` (mit ``edge``-ID, ``evidence``, ``satz``); 51 verschmolzen, 84 neu (AP-G 06.10.: K62-K108 neu, alle ohne kuratierte Zwillingskante; AP-H1: K109-K116 Dual-ENV-Tabelle, neu; Catalog-Neubau 07.10.: K117-K131 neu; VISION-WEIGHTS AP4: K132-K134 neu; F0-H Runde 2: W3-Kante, jetzt K135, neu).
+  * Jede der 136 Katalogkanten steht danach in ``entries[von]["depends"]`` (mit ``edge``-ID, ``evidence``, ``satz``); 51 verschmolzen, 85 neu (AP-G 06.10.: K62-K108 neu, alle ohne kuratierte Zwillingskante; AP-H1: K109-K116 Dual-ENV-Tabelle, neu; Catalog-Neubau 07.10.: K117-K131 neu; VISION-WEIGHTS AP4: K132-K134 neu; F0-H Runde 2: W3-Kante, jetzt K135, neu; X-SUM-PRICE 10.10.: K136 neu).
   * Die 24 kuratierten Kanten ohne Katalogkante bleiben und sind ``belegt: False`` ("ohne Beleg"), nicht geloescht.
   * Weicht die Beziehungsart ab, bleibt die kuratierte und ``rel_catalog`` traegt die andere (kein stilles Ueberschreiben).
   * ``to_kind`` kennzeichnet das Ziel (flag/env/var/refusal/unbekannt): ein Chip zeigt nie stumm ins Leere.
@@ -72,9 +72,9 @@ class RealCatalog(unittest.TestCase):
     def test_status_block_counts(self):
         k = self.cat["kanten"]
         self.assertTrue(k["geladen"])
-        self.assertEqual((k["edges_total"], k["verschmolzen"], k["neu"]), (135, 51, 84))
+        self.assertEqual((k["edges_total"], k["verschmolzen"], k["neu"]), (136, 51, 85))
         self.assertEqual(k["edges_without_evidence"], WITHOUT_EVIDENCE)
-        self.assertEqual(k["kanten_belegt"], 135)
+        self.assertEqual(k["kanten_belegt"], 136)
         self.assertEqual(k["uebersprungen_ohne_von"], [])
         self.assertEqual(k["ziel_unbekannt"], ZIEL_UNBEKANNT)
         self.assertEqual(k["wertbedingt"], 25)
@@ -107,7 +107,7 @@ class RealCatalog(unittest.TestCase):
         self.assertTrue(d["effect"])                    # the curated sentence is untouched
         n_curated = sum(len(c.get("depends", [])) for c in CU.CURATED.values())
         n_all = sum(len(e["depends"]) for e in self.ent.values())
-        self.assertEqual(n_all, n_curated + 84)         # nothing deleted, 84 appended (57 + 8 AP-H1 + 15 Katalog-Neubau 07.10. + 3 VISION-WEIGHTS AP4 + 1 F0-H round 2)
+        self.assertEqual(n_all, n_curated + 85)         # nothing deleted, 85 appended (57 + 8 AP-H1 + 15 Katalog-Neubau 07.10. + 3 VISION-WEIGHTS AP4 + 1 F0-H round 2 + 1 X-SUM-PRICE K136 10.10.)
 
     def test_new_edges_are_appended_with_source_katalog(self):
         d = self.dep("--idle-layout", "--dual-layout")  # K44, not curated
