@@ -436,8 +436,17 @@ class SchedulerInvariantChecker:
         if emit is not None:
             is_warning, line = emit
             (logger.warning if is_warning else logger.info)("%s", line)
+        # UNIT: `free_reading.count` is the number of free PAGE IDS
+        # (len of frozenset(free_pages) | frozenset(release_pages)); the ledger
+        # equation is in TOKENS (`available_size()` multiplies by page_size,
+        # allocator/base.py:available_size). At page_size 64 the unscaled count
+        # turned every surplus the census was meant to explain into a fake
+        # deficit of ~(page_size-1)/page_size of the free pool -- the
+        # "available=1856" of the 11.10. deaths is 118784 tokens, and the
+        # "116864 tokens leaked" is 262144-1856-143424, a mixed-unit artifact
+        # (nf-poolleak-wurzel-1011).
         full_available_size = (
-            free_reading.count
+            free_reading.count * max(1, int(getattr(allocator, "page_size", 1) or 1))
             if free_reading.is_enumerable
             else ps.full_available_size
         )
