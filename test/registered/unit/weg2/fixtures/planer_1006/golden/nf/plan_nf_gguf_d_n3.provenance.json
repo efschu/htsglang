@@ -1,0 +1,93 @@
+{
+ "checkpoints": {
+  "Qwen3.8-Flash-Next-GGUF-unsloth-draft": {
+   "files": {
+    "config.json": {
+     "kind": "copy",
+     "sha256_header": null,
+     "size": 30820
+    },
+    "mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf": {
+     "kind": "header",
+     "sha256_header": "85b40be410e28e9e07bad48062b9fb8db0e3d837658a4bfd999f7f20e58836a6",
+     "size": 2786568256
+    }
+   },
+   "role": "PROFILE_DRAFT (symlink file + config.json in the draft directory)",
+   "source": "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-Flash-Next-GGUF-unsloth-draft"
+  },
+  "Qwen3.8-Flash-Next-GGUF-unsloth-sibling": {
+   "files": {
+    "Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf": {
+     "kind": "header",
+     "sha256_header": "5ce89370720f8bf90890f439361282104c1aa1482d4013bb9a50923e758e71a4",
+     "size": 10946624
+    },
+    "Qwen3.8-Flash-Next-UD-IQ4_XS-00002-of-00003.gguf": {
+     "kind": "header",
+     "sha256_header": "65aed4c0d6ffeda13b7188179f3c4d9764076012eedacf7cc5e4df52f46d7f70",
+     "size": 49835229856
+    },
+    "Qwen3.8-Flash-Next-UD-IQ4_XS-00003-of-00003.gguf": {
+     "kind": "header",
+     "sha256_header": "f017b6c65eaa7b52dd0cc37d117a1480a79b275732869420b1b850653b9c6a13",
+     "size": 43836407744
+    },
+    "chat_template.jinja": {
+     "kind": "copy",
+     "sha256_header": null,
+     "size": 8952
+    },
+    "config.json": {
+     "kind": "copy",
+     "sha256_header": null,
+     "size": 30820
+    },
+    "generation_config.json": {
+     "kind": "copy",
+     "sha256_header": null,
+     "size": 202
+    },
+    "merges.txt": {
+     "kind": "copy",
+     "sha256_header": null,
+     "size": 3353259
+    },
+    "tokenizer.json": {
+     "kind": "zero",
+     "sha256_header": null,
+     "size": 12809320
+    },
+    "tokenizer_config.json": {
+     "kind": "copy",
+     "sha256_header": null,
+     "size": 17928
+    },
+    "vocab.json": {
+     "kind": "zero",
+     "sha256_header": null,
+     "size": 6722759
+    }
+   },
+   "role": "PROFILE_MODEL + PROFILE_TOKENIZER (sibling dir of the target)",
+   "source": "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-Flash-Next-GGUF-unsloth/UD-IQ4_XS (3 .gguf parts, headers) + /spinning/llm_stuff/club-3090/models-cache/Qwen3.8-Flash-Next-NVFP4-nvidia (config.json, tokenizer files) -- the directory tools/release/make_nf_gguf_sibling.sh builds"
+  }
+ },
+ "date": "2026-10-10",
+ "golden": "plan_nf_gguf_d_n3.txt",
+ "launcher_line": "nf",
+ "note": "G8 D-only profile nf-gguf-d (stage A of the metal order). Header snapshots as for plan_nf_gguf_n3 (sibling) plus the draft DIRECTORY (propose_oracle snapshot of Qwen3.8-Flash-Next-GGUF-unsloth-draft: config.json copied, the MTP file as its header). Regenerate: `propose_oracle golden --profile <abs>/tools/release/profconv/nf-gguf-d.env --replay <nvml_devices_1378.json> --tree <abs worktree> --checkpoint-snapshot <sibling snapshot> --checkpoint-snapshot <draft dir snapshot> --out golden/nf/plan_nf_gguf_d_n3.txt` (the tree must be an ABSOLUTE path: a relative one is replaced by <TREE> in every dot of the dump). propose_oracle.run_profile stands in for the --tokenizer-path directory by its snapshot even where the real directory exists (G8): the rig sibling directory appeared on the dev box on 10.10. 18:43 and without that the golden would carry the real path.",
+ "profile": {
+  "file": "tools/release/profconv/nf-gguf-d.env",
+  "note": "in-tree profile (profconv), not a rig snapshot; the test pins its sha256: regenerate the golden when the profile moves",
+  "sha256": "fd02f53839ad19889f0b84d14167939f967908d0ba09f8ac5af0f8020bd5fc07"
+ },
+ "profile_base": {
+  "file": "tools/release/profconv/nf-gguf.env",
+  "note": "sourced by nf-gguf-d.env (which sources nf.env)",
+  "sha256": "154c2a891a68bc9f0d262abbfd332c4b7a653d0e9019227335610af50ae4fda9"
+ },
+ "replay": "fixtures/xchg_launch_replay_0911/nvml_devices_1378.json",
+ "schema": "planer-ap0-golden-provenance/1",
+ "tree": "desk/planer-ggufg8-1010 (base desk/nf-gguf-1009 @ 855367ef0c + G8)"
+}

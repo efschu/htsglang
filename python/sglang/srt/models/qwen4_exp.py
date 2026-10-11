@@ -658,6 +658,40 @@ def _pad_token_rows(x: torch.Tensor, total_tokens: int) -> torch.Tensor:
     return out
 
 
+def gguf_vocab_config(vocab_config):
+    """NF-GGUF G8: the GGUF quant_config a QUANTIZED-RESIDENT vocabulary is
+    built under, or ``None``.
+
+    ``GGUFConfig`` has no ``.config`` dict, so the compressed-tensors rule in
+    ``Qwen4ExpModel._build_embed_tokens`` (``vocab_named_in_targets(raw, name)``)
+    can never fire for a GGUF target: ``embed_tokens`` came out as a DENSE
+    parameter while the GGUF adapter ships ``token_embd`` as
+    ``model.embed_tokens.qweight`` (+ ``qweight_type``) -> the loader found no
+    parameter for it and skipped the tensor, a model without a vocabulary.
+    The lm_head never had this hole: ``Qwen3VLForConditionalGeneration`` hands
+    it the GGUF quant_config (GGUFLinearMethod, packed ``qweight``).
+
+    Same decision the base backbone takes for the 27B GGUF
+    (``Qwen3_5ForCausalLM._build_embed_tokens``): GGUF -> quantized-resident
+    (``GGUFEmbeddingMethod``: ``index_select`` of the packed rows, then
+    ``ggml_dequantize`` of only the gathered rows -- Q8_0 and Q6_K are in
+    ``DEQUANT_TYPES``); ``SGLANG_GGUF_DENSE_VOCAB=1`` (a test/escape hook, NOT
+    a fix) keeps it dense, exactly like the loader (gguf_qwen35.transform_stream)
+    and the lm_head (qwen3_vl.py) honour it. Any other quant_config -> ``None``
+    here and the caller keeps its compressed-tensors rule byte-identically
+    (the GGUF modules are not even imported for them).
+    """
+    if vocab_config is None or vocab_config.get_name() != "gguf":
+        return None
+    from sglang.srt.layers.quantization.gguf import GGUFConfig
+
+    if not isinstance(vocab_config, GGUFConfig):
+        return None
+    from sglang.srt.model_loader.gguf_qwen35 import gguf_dense_vocab
+
+    return None if gguf_dense_vocab() else vocab_config
+
+
 def _use_attn_tp_ngram() -> bool:
     return is_dp_attention_enabled() and envs.SGLANG_USE_ATTN_TP_NGRAM.get()
 
@@ -2364,6 +2398,12 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             if isinstance(raw, dict) and vocab_named_in_targets(raw, name)
             else None
         )
+        # NF-GGUF G8: a GGUF target keeps its vocabulary quantized-resident
+        # (token_embd Q8_0 -> embed_tokens.qweight); see gguf_vocab_config.
+        # Gated on the config class, so every other quantization takes the
+        # lines above unchanged.
+        if vocab_quant is None:
+            vocab_quant = gguf_vocab_config(vocab_config)
         return VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
