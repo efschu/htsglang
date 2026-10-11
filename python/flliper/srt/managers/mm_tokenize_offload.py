@@ -47,8 +47,9 @@ compaction/swap stall itself.
 
 THE RULES THIS MODULE KEEPS.
 
-* Only for a single (non-batch) request with multimodal input (see BATCH
-  PATH below), and never with a device-resident frontend (CUDA IPC transport,
+* Only for a single (non-batch) request with multimodal input -- a batch
+  request keeps tokenizing on the loop and only waits for the image requests
+  open at its entry (``MmDispatchOrder.wait_open``) -- and never with a device-resident frontend (CUDA IPC transport,
   ``--keep-mm-feature-on-device``, GPU preprocessing) -- no CUDA work moves to
   another thread. ``offload_permitted`` also refuses when
   ``vision_stage_service.installed()`` is not None. That guards a DEAD path:
@@ -352,6 +353,19 @@ class MmDispatchOrder:
 
     def open_events(self) -> Tuple[asyncio.Event, ...]:
         return tuple(self._open)
+
+    async def wait_open(self) -> None:
+        """BATCH PATH: wait for the image requests open now, before the batch tokenizes.
+
+        A batch request is not offloaded (its images tokenize on the loop, as
+        before) and its sends sit inside ``_handle_batch_request``; waiting once
+        at its entry keeps it behind every earlier image request. An image
+        request that opens later dispatches after the batch's sends or between
+        them, which is still arrival order. NAMED LIMITATION: a batch request
+        with images still stands the loop for its whole image chain (not built:
+        offloading it means ordering the sends inside ``_handle_batch_request``)."""
+        for ev in tuple(self._open):
+            await ev.wait()
 
     @contextlib.asynccontextmanager
     async def request(self, *, rid: Any, is_mm: bool) -> AsyncIterator[_Turn]:

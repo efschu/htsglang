@@ -395,5 +395,46 @@ class TestInstrumentLines(CustomTestCase):
         self.assertTrue(any("TOKENIZER-LOOP-LAG max_ms=" in m for m in logs.output), logs.output)
 
 
+class TestBatchPathOrder(CustomTestCase):
+    """A batch request has its sends inside _handle_batch_request, outside the single-path dispatch
+    order: without a wait it overtook an earlier image request that was still tokenizing off the loop."""
+
+    def test_batch_waits_for_an_open_image_request(self):
+        from test_tokenizer_manager_rid_cleanup import _make_generate_obj, _make_tm_for_generate
+
+        tm = _make_tm_for_generate()
+        calls = []
+
+        async def batch(obj, request, rids):
+            calls.append("batch")
+            yield "r"
+
+        tm._handle_batch_request = batch
+        obj = _make_generate_obj(["b0", "b1"], is_single=False)
+
+        async def scenario():
+            gate = asyncio.Event()
+
+            async def image():
+                async with tm.mm_dispatch_order.request(rid="img", is_mm=True):
+                    await gate.wait()
+                    calls.append("image")
+
+            with mock.patch.object(mto, "offload_permitted", return_value=True):
+                img = asyncio.create_task(image())
+                await asyncio.sleep(0)
+                gen = asyncio.create_task(tm.generate_request(obj).__anext__())
+                for _ in range(5):
+                    await asyncio.sleep(0)
+                before = list(calls)
+                gate.set()
+                await asyncio.wait_for(asyncio.gather(img, gen), 5)
+            return before
+
+        before = asyncio.run(scenario())
+        self.assertEqual(before, [])
+        self.assertEqual(calls, ["image", "batch"])
+
+
 if __name__ == "__main__":
     unittest.main()
