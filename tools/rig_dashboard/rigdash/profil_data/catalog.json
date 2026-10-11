@@ -71444,16 +71444,19 @@
      "effect": "The window sets how long a SHORT is held for the sum; with FLLIPER_PDFLIP_DECODE_COLLECT_WINDOW_S=0 only the collecting is off (the old path), the booking of granted SHORTs still prices the queue-take and the D-SHORT-DRAIN.",
      "evidence": {
       "anchor": "window (as before), else the released route",
-      "aufloesung": "eindeutig",
+      "aufloesung": "other_line",
       "file": "python/flliper/srt/pdflip/front.py",
       "row_note": 10498,
-      "zeile": 10363
+      "zeile": 10498
      },
      "quelle": "catalog",
      "rel": "scales_with",
      "satz": "The window sets how long a SHORT is held for the sum; with FLLIPER_PDFLIP_DECODE_COLLECT_WINDOW_S=0 only the collecting is off (the old path), the booking of granted SHORTs still prices the queue-take and the D-SHORT-DRAIN.",
      "to": "FLLIPER_PDFLIP_DECODE_COLLECT_WINDOW_S",
      "to_kind": "env",
+     "trees": [
+      "nf"
+     ],
      "value": null
     }
    ],
@@ -85786,18 +85789,18 @@
   "beleg_aufloesung": {
    "problem": [],
    "status": {
-    "eindeutig": 123,
+    "eindeutig": 122,
     "nah": 12,
-    "other_line": 1
+    "other_line": 2
    }
   },
   "beleg_aufloesung_baeume": {
    "27b": {
     "problem": [],
     "status": {
-     "eindeutig": 123,
+     "eindeutig": 122,
      "nah": 12,
-     "other_line": 1
+     "other_line": 2
     }
    },
    "nf": {
@@ -85854,7 +85857,7 @@
   "curated": 121,
   "unexplained": 601
  },
- "tree_rev": "27b=985536406f+nf=29cd152ef0",
+ "tree_rev": "27b=985536406f+nf=1f760d3455",
  "trees": {
   "27b": {
    "entries": 2642,
@@ -85862,7 +85865,7 @@
   },
   "nf": {
    "entries": 2507,
-   "rev": "29cd152ef0"
+   "rev": "1f760d3455"
   }
  },
  "warnungen": []
