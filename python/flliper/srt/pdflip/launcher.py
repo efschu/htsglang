@@ -27483,7 +27483,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "= 208 of 224 usable, measured Used 224/256 incl. RM carve-out; #1234 C1 raised dcp:0 from 24 so the 96-MiB dcp all_reduce plans to 10 rounds "
         "instead of 17 and stops falling to the host-staged plane)",
         "FLLIPER_ENABLE_HEALTH_ENDPOINT_GENERATION=0 on both groups (K2); /health_generate only via the front to the awake group",
-        "group deadmen tier 1 only (PROBE_S spaced past the boot); tier 2 on the front's deadman",
+        "group deadmen tier 1 only (TIER2=0 keeps every synthetic generate off the group ports; PROBE_S spaced past the boot as a second guard); tier 2 on the front's deadman",
         "no disk tier for the store (file backend has no second tier); tmpfs sized by the ledger",
         "the epoch is carried in the front's ledger only (no group echo/checksum on the RPC)",
         "torch_memory_saver 0.0.9.post1 preload hook rebuilt from the vendored csrc with ONE patch (cpu backup freed after resume, "
