@@ -4,8 +4,11 @@
 SPECIMEN (NF int24d, 11.10. 10:25:45Z, group D, TP0/TP1/TP2): the ranks parted at the admission of
 pdflip-0-15. TP0 stood in the extend forward, TP1/TP2 inside the admission pass (watchdog: "1 queued,
 0 running", CLASS=A-PIPELINE-DEAD). The exact blocking line is unproven (no stack was written; see
-test_wedge_stack_forward_hang_1011). One live instance of the class "ranks decide rank-locally over
-a collective" was found and is what this file pins:
+test_wedge_stack_forward_hang_1011). One possible instance of the class "ranks decide rank-locally
+over a collective" was found and is what this file pins. It is a READING of the code, NOT proven as
+the cause of the 10:25:45Z hang (UNVERIFIED): on a Form A group (NF D) the extend-set riegel runs before
+this collective and names such a split FormAAdmissionSplit; for pdflip-0-15 the analysis
+(deskq/done/nf-haenger-admission-wedge-1011.md) rules this path out (host_hit=0):
 
     schedule_policy.add_one_req: a worker reads the group's ADMIT, loads back, finds no device room
     and returns NO_TOKEN ALONE (PDFLIP-LOADBACK-WAIT); the host admits.

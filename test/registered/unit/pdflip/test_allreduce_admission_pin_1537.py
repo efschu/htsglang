@@ -210,7 +210,8 @@ EXPECTED_HELPER_REFS = {
     # whenever D-HOL is on (`_hol.on` = switch + group D + pp_size 1, replicated). NF D-HANG
     # 1011: the HOL head is rank-local (a worker's load-back can return NO_TOKEN alone after
     # the group ADMIT), so it is the payload of the MIN, never its entry condition (the old
-    # "entered iff the head is queued" left the host in the forward). Pinned by
+    # "entered iff the head is queued" would leave the host in the forward -- a READING of
+    # the old guard, unbelegt as the cause of the 11.10. 10:25:45Z hang). Pinned by
     # test_nf_dhang_group_collective_1011.
     ("managers/scheduler.py", "Scheduler._get_new_batch_prefill_raw"): {"_pdflip_group_min_flags"},
     ("pdflip/d_park_runtime.py", "park_tick"): {"_pdflip_group_min_flags"},

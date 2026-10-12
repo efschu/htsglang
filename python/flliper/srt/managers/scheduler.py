@@ -17715,8 +17715,10 @@ class Scheduler(
         # NOT the same on every rank -- a worker's load-back can return NO_TOKEN alone
         # after the group ADMIT (schedule_policy PDFLIP-LOADBACK-WAIT) -- so it is the
         # payload of the MIN, never its entry condition (it used to be: `if _hol.head
-        # is not None`, which left the other ranks in the forward while the one with a
-        # head waited in the all_reduce).
+        # is not None`, which -- READING, unbelegt as the cause of the 11.10. 10:25:45Z
+        # hang -- would leave the other ranks in the forward while the one with a head
+        # waited in the all_reduce; on a Form A group the extend-set riegel above runs
+        # before this MIN and names such a split as FormAAdmissionSplit first).
         _wall_rows = None
         if _hol.on:
             _wall_head = _pdflip_d_wall_head.pick_unservable_head(
