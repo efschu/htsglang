@@ -5,10 +5,11 @@ fLLiper is an LLM inference server for mismatched GPUs, derived from [SGLang](ht
 project is called fLLiper from release 0.1.0 on. The Python package is `flliper`, the runtime environment variables are
 `FLLIPER_*`, the P/D-flip subsystem is `pdflip` (`FLLIPER_PDFLIP_*`, `--pdflip-*`, log markers `PDFLIP-*`).
 
-> **Status: release candidate RC1 (without the vision rebuild).** Release 0.1.0 is prepared in the repository; RC1 is the state of the integration
-> branches `desk/flliper-27b-int-1009` (27B line) and `desk/flliper-nf-int-1009` (Flash-Next line), the fix round after the RC1 acceptance of 09.10.
-> **RC2** follows after the port of the vision rebuild (`desk/post-vision-weights-1009` @ 9f7e57363f) and its planner work package (AP4); until
-> then 0.1.0 is not final. Vision in Dual: Umbau folgt als RC2 (Nutzerentscheid 09.10.: 0.1.0-Bedingung). The image is **not published** yet; pushing the
+> **Status: release candidate RC2.** Release 0.1.0 is prepared in the repository. RC2 is the state of the integration branches
+> `desk/flliper-27b-int-1013` (27B line) and `desk/flliper-nf-int-1012` (Flash-Next line): RC1 plus the vision rebuild (the vision tower
+> borrows weights instead of KV; standard in the 27B release profiles, not on the NF line) and the post-vision fixes of both lines, with the
+> catalog `080fddd9...` (2705 entries, 136 edges). RC2 is **not** the final 0.1.0: acceptance boots on the metal are open, and **the NF line
+> carries a known pool leak (fix in RC3): push go for NF only with RC3 or the user's word** (release notes, section 5). The image is **not published** yet; pushing the
 > tree to `github.com/efschu/fLLiper` and the image to `ghcr.io` are user gates.
 
 ## What is in it
