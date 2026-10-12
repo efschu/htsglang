@@ -6610,7 +6610,7 @@ class Scheduler(
 
         return d_park_draft.restore_admitted(self, batch)
 
-    def _weg2_group_min_flags(self, flags):
+    def _weg2_group_min_flags(self, flags, site=None):
         """#1471e: ONE verdict for the group.  weg2xsn240: rank 2 released a
         parked request from its rank-local verdict while ranks 0/1 still held
         it -> '#791b PREFETCH-BALLOT DIGEST MISMATCH STOP ... queue_len=1
@@ -6621,15 +6621,30 @@ class Scheduler(
         vals = [1 if f else 0 for f in flags]
         if not vals:
             return vals
+        _prev = None
         try:
             tp_size = int(getattr(getattr(self, "ps", None), "tp_size", 1) or 1)
             group = getattr(self, "tp_cpu_group", None)
             if tp_size > 1 and group is not None and torch.distributed.is_initialized():
                 t = torch.tensor(vals, dtype=torch.int64)
+                if site is not None:
+                    # NF D-HANG 1011 (I3): a named call site stamps the same blocked-receive
+                    # pair the Form A exchange does (`_form_a_tp_exchange`), so the admission
+                    # wedge line / watchdog dump names `arm=group-min/<site>` when a rank waits
+                    # here. Two attribute writes; the previous pair is restored, not cleared.
+                    _prev = (
+                        getattr(self, "_pp_blocked_recv_since", None),
+                        getattr(self, "_pp_blocked_recv_arm", None),
+                    )
+                    self._pp_blocked_recv_since = time.monotonic()
+                    self._pp_blocked_recv_arm = f"group-min/{site}"
                 torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MIN, group=group)
                 return [int(x) for x in t.tolist()]
         except Exception as exc:  # noqa: BLE001
             logger.info("#1471 group verdict n/a (%s: %s) -- local flags used", type(exc).__name__, exc)
+        finally:
+            if _prev is not None:
+                self._pp_blocked_recv_since, self._pp_blocked_recv_arm = _prev
         return vals
 
     def _weg2_refetch_one(self, req, now: float, allow_reissue: bool = True) -> str:
@@ -17694,16 +17709,22 @@ class Scheduler(
         # request from that rank's queue with no client-visible signal.
         # PW-R (weg2/d_wall_head.py): the group-D HOL head the backup wall makes
         # unservable goes back to the front by name (W50) instead of waiting for
-        # a flip nothing on D can bring. `_hol.head` is the pass's first NO_TOKEN
-        # (the same rid on every rank), so the group MIN inside is entered alike.
+        # a flip nothing on D can bring.
+        # NF D-HANG 1011: the group MIN is entered by EVERY rank, every pass D-HOL is
+        # on (`_hol.on` = switch + group D + pp_size 1, all replicated). `_hol.head` is
+        # NOT the same on every rank -- a worker's load-back can return NO_TOKEN alone
+        # after the group ADMIT (schedule_policy WEG2-LOADBACK-WAIT) -- so it is the
+        # payload of the MIN, never its entry condition (it used to be: `if _hol.head
+        # is not None`, which left the other ranks in the forward while the one with a
+        # head waited in the all_reduce).
         _wall_rows = None
-        if _hol.head is not None:
+        if _hol.on:
             _wall_head = _weg2_d_wall_head.pick_unservable_head(
                 head_rid=_hol.head,
                 waiting=self.waiting_queue,
                 tree=self.tree_cache,
                 available=int(self.token_to_kv_pool_allocator.available_size()),
-                group_min=self._weg2_group_min_flags,
+                group_min=lambda flags: self._weg2_group_min_flags(flags, site="d-wall-head"),
             )
             if _wall_head is not None:
                 _x_refused.append(_wall_head)
