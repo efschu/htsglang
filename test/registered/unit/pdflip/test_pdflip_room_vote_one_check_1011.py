@@ -128,7 +128,11 @@ class _Tree:
         node.component_data[FULL].host_value = list(range(len(v)))
         return len(v)
 
+    on_drain = None  # optional hook: what the real drain does to the tree (acks)
+
     def writing_check(self, write_back=False):
+        if self.on_drain is not None:
+            self.on_drain()
         return None
 
     def _evict_to_host(self, node, tracker):
@@ -446,6 +450,59 @@ class L3OnlyNode(unittest.TestCase):
             t, p, x = self._tree()
             self.assertEqual(SF.peel_route(t, x), SF.ROUTE_BACKUP)
             self.assertEqual(t.peel(request=X_TOKENS), 0)
+
+    # ---- fix round 3 (review): the state changes between the top L3 check and the
+    # fallback after the refused claim (the #1426 drain / a store ack) ------------------
+    def test_drain_clears_in_flight_l3_node_is_dropped_after_refused_claim(self):
+        """x is l3_present but a write is in flight at the top of the peel (not droppable,
+        so the top L3 check passes it by); the claim is refused; the #1426 drain acks the
+        write (clears ongoing); the fallback re-reads the route = L3_DROP and drops x. The
+        base code (unbacked_drop_allowed, no l3 term) dropped it; ROUTE_UD_DROP-only did not."""
+        t, p, x = self._tree()
+        t.ongoing_write_through[x.id] = object()
+        t.on_drain = lambda: t.ongoing_write_through.pop(x.id, None)
+        with self.assertLogs(SF.logger, level="WARNING") as cap:
+            delivered = t.peel(request=X_TOKENS)
+        self.assertGreaterEqual(delivered, X_TOKENS)
+        self.assertIn(x.id, t.dropped)
+        self.assertGreaterEqual(t.claims, 2, "the claim was tried (and refused) before the drop")
+        self.assertTrue(any("ROOM-VOTE L3-DROP node=%d" % x.id in m for m in cap.output))
+
+    def test_drain_sets_l3_present_unbacked_node_is_dropped(self):
+        """x is NOT l3 at the vote; a store write issued after the vote is acked by the
+        drain (l3_present set, pending id cleared): the fallback drops it (L3_DROP route)."""
+        t, p, x = self._tree()
+        x.l3_present = False
+        x.write_through_pending_id = 7
+
+        def drain():
+            t.ongoing_write_through.pop(x.id, None)
+            x.write_through_pending_id = None
+            x.l3_present = True
+
+        t.on_drain = drain
+        t.ongoing_write_through[x.id] = object()
+        delivered = t.peel(request=X_TOKENS)
+        self.assertGreaterEqual(delivered, X_TOKENS)
+        self.assertIn(x.id, t.dropped)
+
+    def test_mutant_ud_only_fallback_delivers_nothing_after_drain(self):
+        """MUTANT: the fallback accepting ONLY ROUTE_UD_DROP (the round-2 code) leaves an
+        l3_present node undropped once the drain made it droppable."""
+        t, p, x = self._tree()
+        t.ongoing_write_through[x.id] = object()
+        t.on_drain = lambda: t.ongoing_write_through.pop(x.id, None)
+        real = SF.peel_route
+
+        def ud_only(tree, node, host_room=None):
+            r = real(tree, node, host_room=host_room)
+            # the fallback accepted only UD_DROP: an L3_DROP verdict reads as 'no drop'
+            return None if (host_room == 0 and r == SF.ROUTE_L3_DROP) else r
+
+        with mock.patch.object(SF, "peel_route", ud_only):
+            delivered = t.peel(request=X_TOKENS)
+        self.assertEqual(t.dropped, [])
+        self.assertLess(delivered, X_TOKENS)
 
 
 # ---- the window the vote cannot see ------------------------------------------------------
