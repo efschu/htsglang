@@ -403,7 +403,10 @@ class L3OnlyNode(unittest.TestCase):
         walked = t.vote(host_free=0)
         with self.assertLogs(SF.logger, level="WARNING") as cap:
             delivered = t.peel(request=X_TOKENS)
-        self.assertEqual(delivered, X_TOKENS + 0 if t.demoted == [] else delivered)
+        if t.demoted == []:
+            # (was `assertEqual(delivered, X_TOKENS + 0 if ... else delivered)`: by operator
+            # precedence a tautology whenever anything was demoted -- review roomvote R2 minor 3)
+            self.assertEqual(delivered, X_TOKENS)
         self.assertGreaterEqual(delivered, X_TOKENS)
         self.assertEqual(t.claims, 0, "no arena claim: the pages are in L3 already")
         self.assertIn(x.id, t.dropped)
