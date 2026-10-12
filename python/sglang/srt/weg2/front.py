@@ -9725,9 +9725,20 @@ class Front:
         # with three decodes stalled behind it). SK keeps only a D-phase
         # fall-through.
         _p_phase = p_phase_arrival(self.awake, self.state, getattr(self, "_flip_dst", None))
+        # X-SUM-PRICE (user 12.10.): DECODE-COLLECT released this SHORT's set to P (its sum is
+        # over X). That verdict is final -- SK must not turn it into "kept for D": on 12.10.
+        # 21:01:07Z four requests (sum 11724 > X 8095) were released route=P, SHORT-KEPT at once
+        # and prefilled on D, and a fifth (7871, priced alone) followed: 19595 on D, X = 8095.
+        _collect_p = "collect_p" in short_refused
+        if _collect_p:
+            short_refused.remove("collect_p")  # not a D refusal: d_eligible / x_deferred keep their meaning
+            self.counters["collect_p_not_kept"] += 1
+            logger.info("WEG2 COLLECT-P-QUEUED rid=%s uncached=%d X=%d epoch=%d: DECODE-COLLECT sent the "
+                        "set to P (sum over X) -- queued BATCH, the flip takes it; not SHORT-KEPT for D",
+                        rid, remainder, int(self.tp_prefill_max_tokens), self.epoch)
         _sk = (short_ok and _short_keep_enabled() and int(store_span or 0) > 0
                and not short_refused and presence_src not in ("", "none", None)
-               and not _p_phase and _pb_to_p is None)
+               and not _p_phase and _pb_to_p is None and not _collect_p)
         if _pb_to_p is not None:
             # PRICE-BARRIER: priced beside a LONG that flips D to P -- the SHORT
             # joins that P phase's batch (leg 1 on P, prefix from the shared
@@ -10297,6 +10308,16 @@ class Front:
             # DECODE-COLLECT: D decodes -> this SHORT waits for the window; the
             # set's route decides (P: route BATCH, the flip takes it)
             if await self._decode_collect_short(rid, uncached if uncached is not None else est_tokens) == "P":
+                # ``_decode_collect_short`` also answers "P" when the phase moved while this SHORT
+                # waited (epoch / awake changed): that is no verdict of the sum rule and keeps
+                # SK's old fall-through. The sum rule's own verdict is the released route of THIS
+                # epoch's state -- set when the window released over X, and kept for the rest of
+                # the D phase (so a later single arrival under X finds it too, NF 21:01:08Z 663).
+                if refused is not None and self._dc_st().get("route") == "P":
+                    # the set's SUM went over X: this is not "D cannot take it now" (SK's
+                    # fall-through) but the sum rule's verdict -- the caller must queue it
+                    # BATCH for P, never keep it for D (NF int24g 12.10. 21:01:07Z)
+                    refused.append("collect_p")
                 return None
             if not (self.awake == "D" and self.admit_d and self.state == "serving"):
                 return None
