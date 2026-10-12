@@ -10180,6 +10180,8 @@ class Scheduler(
             req.weg2_lane_parked = False
             return
         if int(getattr(req, "inflight_middle_chunks", 0) or 0) > 0:
+            if _lane_park:
+                _lanes_p.note_park_wait(self, req)  # FIX 4: name the count that holds the lane park back (one line per epoch)
             return  # a launched chunk still writes its rows; try next step
         if not _lane_park and not getattr(self, "waiting_queue", None):
             return  # nobody to make room for: keep the in-place park (#679)
@@ -18091,7 +18093,10 @@ class Scheduler(
             assert self.chunked_req is None
             self.chunked_req = adder.new_chunked_req
 
-        if self.chunked_req is not None:
+        # LANES FIX 4 (NF metal 5): a continuation the lane floor holds in place is not in this batch -- no chunk of it was launched, so none
+        # is counted (the head-of-step park waits for the count to drain; a leaked +1 kept every stage from ever parking it, and made
+        # the final chunk of a resumed one look like a middle chunk). Every other continuation is counted exactly as before.
+        if self.chunked_req is not None and not _lanes_p.held_without_seat(self.chunked_req, can_run_list):
             self.chunked_req.inflight_middle_chunks += 1
 
         # fnFL2 H42: this pass's anchor bodies join the carried tails; every

@@ -463,10 +463,22 @@ def park_rids(sched, recv_req, *, rids, hold: str = ""):
     if getattr(sched, "anchor_tails", None):
         return _out(False, [], "W-PARK refused: anchor tails present (a P-group structure) -- nothing parked")
     t0 = time.perf_counter()
+    # LANES FIX 4 (minor, NF metal 5 probe 5: LANE-PREEMPT floor=1 902 ms for 3 decodes, the park body 815 ms, no phase in the log): the
+    # phases of this park on the scheduler thread, one line after the park(lane) line (log only; the flip park has the same in
+    # WEG2-FLIPCYCLE stage=park sub=)
+    _pt = [t0]
+    _pk: list = []
+
+    def _ph(name):
+        now_ = time.perf_counter()
+        _pk.append((name, (now_ - _pt[0]) * 1000.0))
+        _pt[0] = now_
+
     wanted = set(want)
     chunk = getattr(sched, "chunked_req", None)
     park_chunk = chunk is not None and str(getattr(chunk, "rid", "")) in wanted
     _land_inflight(sched, keep_chunked=None if (park_chunk or chunk is None) else chunk)
+    _ph("land")
     if not sched.running_batch.is_empty():
         sched.running_batch.filter_batch()
     running_batch = sched.running_batch
@@ -534,9 +546,12 @@ def park_rids(sched, recv_req, *, rids, hold: str = ""):
         setattr(req, FORCE_HOST_WRITE_THROUGH_ATTR, True)
         setattr(req, _mad_park.PARK_REQ_ATTR, True)
         setattr(req, d_park_read.RETAINED_ATTR, None)
+    _ph("select")
     d_park_draft.save_parked(sched, sel_reqs, site=d_seats.SITE_FLIP)
     rearmed = rearm_window_draft_cold(sched, sel_reqs)
+    _ph("draft")
     _park_end(sched, sel_reqs, also_live=rest)
+    _ph("end")
     park_hold_yield.begin(getattr(sched, "tree_cache", None))
     _pl_before = _poolleak.park_snapshot(sched, sel_reqs, phase="before-retract", epoch=epoch)
     def _retract_all_wanted():
@@ -546,6 +561,7 @@ def park_rids(sched, recv_req, *, rids, hold: str = ""):
         return out
 
     retracted = park_retract_split.run_split(getattr(sched, "tree_cache", None), _retract_all_wanted, epoch)
+    _ph("retract")
     # LANES FIX 1 (metal jjbbrx probe 3): the chunked request left with the retract -- the scheduler must not
     # keep pointing at it (the next pass reads ``chunked_req.extend_range.end``, None after the retract: the
     # AttributeError that killed D). The flip park does the same (``sched.chunked_req = None``).
@@ -585,6 +601,7 @@ def park_rids(sched, recv_req, *, rids, hold: str = ""):
                             str(req.rid), before, d_park_read.describe(req))
     _poolleak.ledger_line(sched, epoch=epoch, before=_pl_before)
     parked_ids = [str(r.rid) for r in retracted]
+    _ph("rest")
     logger.info(
         "%s rids=%s ms=%.0f epoch=%d floor=%d hold=%s running_left=%d held=%s skipped=%s chunk_boundary=%d -- "
         "retracted with the span retained and a forced host write-through, no sleep follows, the others decode "
@@ -593,6 +610,13 @@ def park_rids(sched, recv_req, *, rids, hold: str = ""):
         lanes.MARK_D_PARK_PARK, parked_ids, (time.perf_counter() - t0) * 1000.0, epoch,
         d_lane.floor_of(sched), hold or "-", len(rest), held_ids, skipped or "-", 1 if chunk_parked else 0,
         (" (DFlash window draft: %d resume(s) re-armed like a fresh hand-off)" % rearmed if rearmed else ""),
+    )
+    logger.info(
+        "%s n=%d ms=%.0f epoch=%d sub=%s -- the phases of the park(lane) line above on the scheduler thread (land = the in-flight batch "
+        "lands, select, draft = draft rows saved, end = the END state of each request gathered as park tail parts, retract = "
+        "cache_finished_req with the forced write-through (see WEG2-PARK-RETRACT-SPLIT), rest = marks, L3 order, resumable depths)",
+        lanes.MARK_D_PARK_PHASES, len(retracted), (time.perf_counter() - t0) * 1000.0, epoch,
+        ",".join("%s:%.0f" % kv for kv in _pk),
     )
     moved_ids = _take_queued(sched, queued_take, held_ids)
     return _out(True, already + parked_ids + moved_ids,
