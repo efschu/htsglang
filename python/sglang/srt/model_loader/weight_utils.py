@@ -2485,6 +2485,38 @@ def gguf_dense_payload(tensor: torch.Tensor, weight_type) -> torch.Tensor:
     return tensor
 
 
+def gguf_dequantize_payload(payload: torch.Tensor, qtype) -> torch.Tensor:
+    """Dense float tensor (model element shape) from one ``.qweight`` payload.
+
+    Dtype-aware consumer counterpart of ``gguf_dense_payload`` (G14 fix round 1).
+    Since G14 the iterator hands an UNQUANTIZED F16/BF16 ``.qweight`` over as a
+    tensor of VALUES in its own dtype (torch bfloat16 has no ``.numpy()``);
+    before, it was raw uint8 bytes with the last dim doubled. A consumer that
+    dequantizes through numpy unconditionally therefore raises
+    ``TypeError: Got unsupported ScalarType BFloat16`` on a BF16 payload
+    (mtp.fc / eh_proj, embed_tokens / lm_head under SGLANG_GGUF_DENSE_VOCAB=1,
+    DeepSeek-V4 compressor projections). Rule here:
+
+    * unquantized type (F32/F16/BF16): the payload is viewed / passed as the
+      tensor of its own dtype -- no numpy, no conversion (callers ``.to`` the
+      target dtype). Raw uint8 bytes (an older producer) are re-viewed too.
+    * quantized type: the gguf-py numpy reference dequantizer on the block bytes.
+    """
+    import gguf
+    from gguf.quants import dequantize
+
+    gt = gguf.GGMLQuantizationType(int(qtype))
+    if gt in (
+        gguf.GGMLQuantizationType.F32,
+        gguf.GGMLQuantizationType.F16,
+        gguf.GGMLQuantizationType.BF16,
+    ):
+        if payload.dtype == torch.uint8 and gt.name == "F32":
+            return payload.contiguous().view(torch.float32)
+        return gguf_dense_payload(payload, gt)
+    return torch.from_numpy(dequantize(payload.numpy(), gt).copy())
+
+
 def gguf_quant_weights_iterator(
     gguf_file: str, gguf_to_hf_name_map: Dict[str, str]
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:

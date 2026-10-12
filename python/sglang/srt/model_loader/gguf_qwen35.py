@@ -614,12 +614,15 @@ class Qwen35GGUFAdapter(GGUFAdapterBase):
                     deq_qtype[hit] = int(weight.item())
                     continue
                 if name.endswith(".qweight"):
-                    deq = dequantize(
-                        weight.numpy(), gguf.GGMLQuantizationType(deq_qtype[hit])
+                    # dtype-aware (G14 fix round 1): a BF16/F16 payload (e.g.
+                    # blk.N.nextn.eh_proj / output.weight of the Q8_K_XL qwen35
+                    # files) arrives as a typed tensor, torch bf16 has no numpy.
+                    from sglang.srt.model_loader.weight_utils import (
+                        gguf_dequantize_payload,
                     )
-                    yield hit + "weight", torch.from_numpy(deq).to(
-                        self.config.torch_dtype
-                    )
+
+                    deq = gguf_dequantize_payload(weight, deq_qtype[hit])
+                    yield hit + "weight", deq.to(self.config.torch_dtype)
                     continue
                 # already unquantized (.weight): fall through, passed as-is.
 
