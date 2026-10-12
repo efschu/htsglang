@@ -235,14 +235,27 @@ def note_loaded(tree, rows: int) -> None:
         pass
 
 
+def node_in_flight(ongoing, node) -> bool:
+    """A write of ``node`` is in flight: tracked by its id, or by the id a split
+    node kept (``write_through_pending_id`` names the OLD id)."""
+    if getattr(node, "id", None) in (ongoing or {}):
+        return True
+    return getattr(node, "write_through_pending_id", None) is not None
+
+
+def node_host_locked(node) -> bool:
+    """A load-back reads a host row of ``node`` (any component)."""
+    return any(int(getattr(cd, "host_lock_ref", 0) or 0) > 0
+               for cd in (getattr(node, "component_data", None) or ()))
+
+
 def unbacked_drop_floor(tree, node) -> bool:
     """UD's floor half: the local-PP floor (the tree is this rank's own; on a TP
     group a rank-local drop would split the replicas) and no write-through of
     ``node`` in flight. Children are not looked at here."""
     if not enabled() or not getattr(tree, FLOOR_LOCAL_PP_ATTR, False):
         return False
-    ongoing = getattr(tree, "ongoing_write_through", None) or {}
-    return getattr(node, "id", None) not in ongoing
+    return not node_in_flight(getattr(tree, "ongoing_write_through", None) or {}, node)
 
 
 def unbacked_drop_allowed(tree, node) -> bool:
@@ -253,6 +266,127 @@ def unbacked_drop_allowed(tree, node) -> bool:
     if not unbacked_drop_floor(tree, node):
         return False
     return not getattr(node, "children", None)
+
+
+# ---------------------------------------------------------------------------
+# ROOM-VOTE 1011 (NF int24e 09:29:33Z, death 09:39:42Z): ONE evictability check
+# for the room vote (weg2/pp_room_vote.estimate_payable) and the peel
+# (UnifiedRadixCache._evict_device_leaf).
+#
+# THE DEATH. PP0's vote paid node 181 (120448 tokens) -- ``agreed=140416 =
+# avail 19008 + reported 121408`` -- and the peel paid 960
+# (``AgreedRoomShort ... evicted=960 avail_after=19968``). 10 s before, the W3
+# arena spill had released node 181's L2 copy for a 64-page claim (``released_pages=1882
+# nodes=1``, the node stays on the device, ``l3_present``). The vote priced its
+# leaving as a BACKUP into the arena slots that very spill had just freed
+# (``backup_room_tokens``); the peel's real claim was refused
+# (``#1421 BACKUP-REFUSED why=arena_claim node=181``) and the drop (UD) did not
+# apply (its host-only children could not be cleared: one test in the vote's
+# walk, another in the peel). Third instance of "room estimate != peel" after PR
+# (24ed9b508b, the walk paid a node the peel could not) and PR-ARENA
+# (c59353374a, the walk read the arena's gauge, not its free slots); each was
+# patched by one more special case in the walk.
+#
+# THE RULE. A device leaf leaves the device by exactly one of these routes, and
+# BOTH sides ask this one function (the peel with ``host_room=None``: the claim
+# is its own first attempt; the vote with its remaining host room):
+#
+#   DEMOTE   backed (host copy): the node goes down, rows paid.
+#   L3_DROP  not backed, but its pages are in L3 (``l3_present``, e.g. spilled by
+#            W3): it leaves the tree WITHOUT a new L2 copy -- no arena claim is
+#            made or priced. Same legality as the UD drop (local-PP floor, no write
+#            in flight, host-only subtree clearable).
+#   BACKUP   not backed, write_back: a claim into the host room. Certain for
+#            nobody; the peel tries it, the vote prices it by ``host_room``. NOT
+#            for an l3_present node in the vote: its slots were released by the
+#            tree itself under claim pressure, pricing a re-claim of them is the
+#            092933 over-count.
+#   UD_DROP  not backed, claim refused: dropped on the local-PP floor (UD / UD-H).
+#   DELETE   write_through: deleted, only without surviving children (#841).
+#
+# AgreedRoomShort (``local_pp_room``) stays the stop for a REAL contradiction.
+# ---------------------------------------------------------------------------
+
+ROUTE_DEMOTE = "demote"
+ROUTE_L3_DROP = "l3_drop"
+ROUTE_BACKUP = "backup"
+ROUTE_UD_DROP = "ud_drop"
+ROUTE_DELETE = "delete"
+#: routes after which the node is GONE from the tree (its parent sees no child)
+DROP_ROUTES = (ROUTE_L3_DROP, ROUTE_UD_DROP, ROUTE_DELETE)
+
+
+def host_node_local_ok(node) -> bool:
+    """One host-only node UD-H may remove, ignoring what hangs below it: evicted,
+    backed, no device lock, no host lock. (``_ud_clear_host_children``'s per-node
+    test; ``pp_room_vote``'s walk composes the same test.)"""
+    if not getattr(node, "evicted", False) or not getattr(node, "backuped", False):
+        return False
+    return not any(int(getattr(cd, "lock_ref", 0) or 0) > 0 or int(getattr(cd, "host_lock_ref", 0) or 0) > 0
+                   for cd in (getattr(node, "component_data", None) or ()))
+
+
+def host_children_clearable(node) -> bool:
+    """Every node below ``node`` is a clearable host-only node (UD-H's
+    all-or-nothing test); no children: True."""
+    stack = list(getattr(node, "children", {}).values())
+    while stack:
+        d = stack.pop()
+        if not host_node_local_ok(d):
+            return False
+        stack.extend(d.children.values())
+    return True
+
+
+def device_exit_route(node, *, write_back: bool, local_floor: bool, ongoing, host_room: Optional[int],
+                      children_clearable: bool, surviving_children: bool, tokens: int) -> Optional[str]:
+    """How a DEVICE LEAF (every device child already gone) leaves the device, or
+    None when it cannot now. ``children_clearable``: every child ends up a
+    clearable host-only node (an UD-H subtree clear would succeed);
+    ``surviving_children``: a child outlives the peel (write_through's delete
+    refuses with one, #841). ``host_room``: tokens of host room a claim may
+    take (vote), None = the peel itself (the claim is attempted)."""
+    if getattr(node, "backuped", False):
+        return ROUTE_DEMOTE
+    if not write_back:
+        return None if surviving_children else ROUTE_DELETE
+    droppable = (local_floor and not node_in_flight(ongoing, node) and not node_host_locked(node)
+                 and children_clearable)
+    l3 = bool(getattr(node, "l3_present", False))
+    if l3 and droppable:
+        return ROUTE_L3_DROP
+    if host_room is None:
+        return ROUTE_BACKUP
+    if not l3 and int(host_room) >= int(tokens):
+        return ROUTE_BACKUP
+    return ROUTE_UD_DROP if droppable else None
+
+
+def peel_route(tree, node, *, host_room: Optional[int] = None) -> Optional[str]:
+    """The peel's side of :func:`device_exit_route` for ``node`` (a device leaf of
+    ``tree``): the tree's write policy, floor scope and in-flight table.
+    Switch ``SGLANG_WEG2_PP_SLOT_FIDELITY`` off: no local floor, so the routes
+    are the old ones (backup, no drop)."""
+    cc = getattr(tree, "cache_controller", None)
+    write_back = cc is not None and getattr(cc, "write_policy", None) == "write_back"
+    local = bool(enabled() and getattr(tree, FLOOR_LOCAL_PP_ATTR, False))
+    return device_exit_route(
+        node, write_back=write_back, local_floor=local,
+        ongoing=getattr(tree, "ongoing_write_through", None) or {}, host_room=host_room,
+        children_clearable=host_children_clearable(node),
+        surviving_children=bool(getattr(node, "children", None)),
+        tokens=max(1, len(getattr(node, "key", None) or ())))
+
+
+def note_l3_drop(tree, node, tokens: int) -> None:
+    n = _sampled(tree, "_weg2_sf_l3_drop")
+    if n is not None:
+        logger.warning(
+            "ROOM-VOTE L3-DROP node=%s tokens=%d freed=%d (n=%d): a node whose L2 copy was spilled "
+            "to L3 (l3_present) leaves the device without a new arena claim -- the vote and the "
+            "peel read one evictability check (int24e 09:39:42Z: the vote paid it, the claim "
+            "was refused)",
+            getattr(node, "id", "?"), len(getattr(node, "key", []) or []), int(tokens), n)
 
 
 def note_unbacked_drop(tree, node, tokens: int) -> None:

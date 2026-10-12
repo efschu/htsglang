@@ -428,6 +428,21 @@ def _hfb_deliverable_end(end_base: int, span_len: int, no_writer: bool,
     return dend
 
 
+def _drop_device_leaf(cache, node, tracker) -> None:
+    """The delete of an un-backed device leaf (UD, L3 drop): every component
+    released, the node removed, childless ancestors cascade."""
+    cache._record_remove_event(node, medium=StorageMedium.GPU)
+    for comp in cache._components_tuple:
+        cache._evict_component_and_detach_lru(
+            node, comp, target=EvictLayer.ALL, tracker=tracker
+        )
+    cache.evictable_device_leaves.discard(node)
+    parent = node.parent
+    cache._remove_leaf_from_parent(node)
+    cache._update_evictable_leaf_sets(parent)
+    cache._iteratively_delete_tombstone_leaf(node, tracker)
+
+
 class UnifiedTreeNode:
     counter = 0
 
@@ -4348,6 +4363,20 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 # eviction the node goes down KV-only and loses just the
                 # anchor (a later match resumes at a shallower anchor, the
                 # same state as a node that never carried one).
+                # ROOM-VOTE 1011 (int24e 09:39:42Z): ONE evictability check with
+                # the PP room vote (pp_slot_fidelity.peel_route). A node whose L2
+                # copy was spilled to L3 (``l3_present``) leaves the device
+                # WITHOUT a new arena claim -- the claim is what the full arena
+                # refuses (#1421 arena_claim node=181) and the vote must not
+                # have priced.
+                from sglang.srt.weg2 import pp_slot_fidelity as _sf
+
+                if (
+                    getattr(node, "l3_present", False)
+                    and _sf.peel_route(self, node) == _sf.ROUTE_L3_DROP
+                    and self._l3_drop_leaf(node, tracker)
+                ):
+                    return
                 written = self.write_backup(
                     node, write_back=True, kv_only_if_mamba_refused=True
                 )
@@ -4375,13 +4404,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     # alone) the leaf is DROPPED like a write_through leaf --
                     # the cache content is lost (recomputable), the pool is
                     # paid, and its parent becomes the next leaf.
-                    from sglang.srt.weg2 import pp_slot_fidelity as _sf
-
-                    if _sf.unbacked_drop_floor(self, node) and node.children:
-                        # UD-H: the leaf's only children are host-only nodes
-                        self._ud_clear_host_children(node)
-                    if _sf.unbacked_drop_allowed(self, node):
-                        self._ud_drop_unbacked_leaf(node, tracker)
+                    # (ROOM-VOTE 1011: the same check the vote prices it with --
+                    # the claim just failed, so host room 0)
+                    if _sf.peel_route(self, node, host_room=0) == _sf.ROUTE_UD_DROP:
+                        if node.children:
+                            # UD-H: the leaf's only children are host-only nodes
+                            self._ud_clear_host_children(node)
+                        if not node.children:  # #841: never drop what has children
+                            self._ud_drop_unbacked_leaf(node, tracker)
                     return
                 self.writing_check(write_back=True)
                 self._evict_to_host(node, tracker)
@@ -4440,13 +4470,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         recomputable, and its arena slots come free -- so the leaf becomes
         droppable. All or nothing: any device row, device lock or host lock
         below leaves the subtree untouched. True when no child is left."""
+        from sglang.srt.weg2 import pp_slot_fidelity as _sf
+
         order = []
         stack = list(node.children.values())
         while stack:
             d = stack.pop()
-            if not d.evicted or not d.backuped:
-                return False
-            if any(cd.lock_ref > 0 or cd.host_lock_ref > 0 for cd in d.component_data):
+            if not _sf.host_node_local_ok(d):  # the vote's walk composes this same test
                 return False
             order.append(d)
             stack.extend(d.children.values())
@@ -4476,19 +4506,31 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         """UD: delete an un-backed device leaf entirely (the write_through
         branch's own delete, with its #841 guard checked by the caller)."""
         before = tracker.get(BASE_COMPONENT_TYPE, 0)
-        self._record_remove_event(node, medium=StorageMedium.GPU)
-        for comp in self._components_tuple:
-            self._evict_component_and_detach_lru(
-                node, comp, target=EvictLayer.ALL, tracker=tracker
-            )
-        self.evictable_device_leaves.discard(node)
-        parent = node.parent
-        self._remove_leaf_from_parent(node)
-        self._update_evictable_leaf_sets(parent)
-        self._iteratively_delete_tombstone_leaf(node, tracker)
+        _drop_device_leaf(self, node, tracker)
         from sglang.srt.weg2 import pp_slot_fidelity as _sf
 
         _sf.note_unbacked_drop(self, node, tracker.get(BASE_COMPONENT_TYPE, 0) - before)
+
+    def _l3_drop_leaf(
+        self, node: UnifiedTreeNode, tracker: dict[ComponentType, int]
+    ) -> bool:
+        """ROOM-VOTE 1011: leave the device WITHOUT an L2 copy a node whose pages
+        are in L3 (``l3_present``; the caller checked
+        ``pp_slot_fidelity.peel_route == ROUTE_L3_DROP``: local-PP floor, no write
+        in flight, no host lock, host-only subtree clearable). The host-only
+        subtree below goes first (UD-H, all or nothing), then the node leaves the
+        tree -- its content stays in the store. True when the node left; False
+        (nothing dropped, #841) when a child is left."""
+        if node.children:
+            self._ud_clear_host_children(node)
+        if node.children:
+            return False
+        before = tracker.get(BASE_COMPONENT_TYPE, 0)
+        _drop_device_leaf(self, node, tracker)
+        from sglang.srt.weg2 import pp_slot_fidelity as _sf
+
+        _sf.note_l3_drop(self, node, tracker.get(BASE_COMPONENT_TYPE, 0) - before)
+        return True
 
     def _evict_host_leaf(
         self, node: UnifiedTreeNode, tracker: dict[ComponentType, int]
