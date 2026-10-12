@@ -22203,6 +22203,8 @@ class Scheduler(
             logger.debug(f"Abort queued request. {req.rid=}")
         self._weg2_abort_dormant_hold(recv_req)  # #1445: the hold is a queue too
         self._weg2_d_park_abort(recv_req)  # H91b: so is the D park
+        # FIX 5 (lanes, metal 6 lage (a)): the aborted rid leaves the told ledger of this rank (lane path only; returns at once otherwise)
+        _lanes_p.forget_aborted_told(self, recv_req)
 
         # Delete the requests in the grammar queue
         # Abort method 2: call `set_finish_with_abort`

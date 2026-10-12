@@ -2081,6 +2081,74 @@ def admission(scheduler, req, note_skip: Callable[[str, Any], None]) -> Optional
     return credit
 
 
+#: FIX 5 (NF metal 6, probe 2b lage (a), done/lanes-metall6-1012.md): the per-rid TOLD LEDGER of one rank -- the attributes that carry PP0's
+#: verdict for a rid between its intake and its admission.  ``(attribute, short name in the TOLD-FORGET line)``.
+TOLD_LEDGERS = (
+    ("_weg2_told_early", "early"),                  # paced read-ahead (follower): told seen, Admit not yet
+    ("_weg2_store_told", "told"),                   # the admitted told (PP0: its own Admit; follower: the absorbed Admit/told)
+    ("_weg2_store_told_satisfied", "satisfied"),    # follower: registered nothing, it held the span already
+    ("_weg2_store_fork", "fork"),                   # P-FORK-CUT depth that rides the told
+    ("_weg2_follower_early", "early_read"),         # follower: an early read of this rid is in flight
+)
+
+
+def forget_aborted(scheduler, rid, abort_all: bool = False) -> Dict[str, Dict[str, Any]]:
+    """FIX 5: an ABORTED request leaves this rank's told ledger.  Returns ``{rid: {ledger: value}}`` of what was dropped.
+
+    WHY.  The ledger is keyed by RID, and the lane resume (and every other re-queue after an abort) comes back under the SAME rid as a NEW
+    request object (``#1037 REQ RE-CONSTRUCTED instance=2``).  Nothing took the first instance's entries away when the front aborted it
+    (``LANE-P-TAKE`` -> ``/abort_request``): metal 6 boot 1 -- PP0's read at the park saw 512 of the 1024 parked pages (the followers' write-back
+    of the span was still being claimed: ``#1028B FETCH CAP ... claimed=512``), the paced read-ahead ``told=32768`` went on the wire and the
+    followers absorbed it (``early:own_read``, ``_weg2_told_early[rid] = 32768``); the abort reached PP0 before the Admit (``PACED-DROP``), so
+    the followers never saw an Admit to consume it.  At the resume the follower's ``intake`` found the STALE entry
+    (``(getattr(scheduler, "_weg2_told_early") or {}).get(rid)``), registered a read limited to 32769 tokens (``HANDOFF-KEYS REG ... new=32769``)
+    and PP0's fresh told (65536) met a follower prefix of 32768: ``Weg2StoreToldMismatch`` on PP1 and PP2, group P dead.  Boot 2 (variant b)
+    carries the same mechanism with the Admit entry (``_weg2_store_told[rid] = 49152``, ``new=49153`` on PP1/PP2): green only because the stale
+    value equalled what PP0 read the second time.
+
+    RANK-UNIFORM BY CONSTRUCTION.  The abort reaches every stage through the request wire in the pass that PP0 dispatched it, and the follower's
+    absorb runs before the dispatch of the same pass (``follower_absorb`` is called "after the forward, before dispatch"): a told that PP0 put
+    on the wire before the abort is absorbed first and dropped here, a told after it does not exist (PP0 publishes only for rids still in its
+    queue, and its publish runs at the top of the pass, before the dispatch).  So every stage ends the abort with an empty ledger for the rid
+    and the next instance starts from nothing, whatever the timing of the abort against the pacing window.
+
+    PP0's ``held`` / ``pacing`` are NOT touched (``pp0_publish`` retires them with their own log line and the twin / PF bookkeeping when it
+    sees the rid gone from the queue).  A follower's ``held`` entry IS dropped: it names the request object that this abort deleted, and a
+    later told for the rid must not register a read for it.  Nothing here is armed unless the told form is (``_weg2_store_told_armed``); the
+    caller gates it behind the lanes (``lanes_p.forget_aborted_told``)."""
+    if not getattr(scheduler, "_weg2_store_told_armed", False):
+        return {}
+    if not abort_all and not isinstance(rid, str):
+        return {}
+
+    def _hit(key) -> bool:
+        return bool(abort_all) or str(key).startswith(rid)
+
+    dropped: Dict[str, Dict[str, Any]] = {}
+    for attr, short in TOLD_LEDGERS:
+        ledger = getattr(scheduler, attr, None)
+        if not ledger:
+            continue
+        for key in [k for k in ledger if _hit(k)]:
+            dropped.setdefault(str(key), {})[short] = ledger.pop(key)
+    pp0 = False
+    try:
+        pp0 = is_pp0(scheduler)
+    except Exception:  # noqa: BLE001 - a stand-in without a rank: treat it as a follower (the safe side of the held entry)
+        pp0 = False
+    if not pp0:
+        held = getattr(scheduler, "_weg2_store_held", None)
+        if held:
+            for key in [k for k in held if _hit(k)]:
+                held.pop(key, None)
+                dropped.setdefault(str(key), {})["held"] = True
+        for key in list(dropped):
+            _fb.follower_forget(scheduler, key)
+            if _twin.take_follower_twin(scheduler, key):
+                dropped[key]["twin"] = True
+    return dropped
+
+
 #: :func:`refetch_plan` verdict: this rank must not re-read the rid at all.
 REFETCH_SKIP = "skip"
 
