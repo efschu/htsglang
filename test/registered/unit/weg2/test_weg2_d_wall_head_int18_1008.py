@@ -67,13 +67,25 @@ def _req(rid=HEAD, n=PROMPT):
                                  prefix_indices=torch.empty(0, dtype=torch.int64))
 
 
+def _payload(local, rid):
+    """What one rank puts into the group MIN: its verdict, then its head-rid tag bits and their
+    complements (``d_wall_head.pick_unservable_head``)."""
+    from sglang.srt.weg2 import d_wall_head as W
+
+    bits = W.head_tag_bits(rid)
+    return [int(bool(local))] + [int(b) for b in bits] + [int(not b) for b in bits]
+
+
 class _MinGroup:
-    def __init__(self, peers=(True, True)):
+    """A stand-in group MIN: this rank's payload against the peers' (local verdict, head rid)."""
+
+    def __init__(self, peers=((True, HEAD), (True, HEAD))):
         self.peers, self.calls = peers, 0
 
     def __call__(self, flags):
         self.calls += 1
-        return [int(bool(flags[0]) and all(self.peers))]
+        vecs = [[int(bool(f)) for f in flags]] + [_payload(loc, rid) for loc, rid in self.peers]
+        return [min(col) for col in zip(*vecs)]
 
 
 class WallHeadTest(unittest.TestCase):
@@ -111,15 +123,38 @@ class WallHeadTest(unittest.TestCase):
         from sglang.srt.weg2 import d_wall_head as W
 
         self.assertIsNone(W.pick_unservable_head(head_rid=HEAD, waiting=[_req()], tree=_walled(),
-                                                 available=AVAILABLE, group_min=_MinGroup((True, False))))
+                                                 available=AVAILABLE, group_min=_MinGroup(((True, HEAD), (False, HEAD)))))
 
-    def test_no_head_no_vote(self):
+    def test_no_head_still_enters_the_vote(self):
+        """NF D-HANG 1011: no head on THIS rank does not mean no head on a peer. The MIN is
+        entered every pass (the head is the payload, not the entry condition) and answers None
+        everywhere when any rank has none."""
+        from sglang.srt.weg2 import d_wall_head as W
+
+        gm = _MinGroup()  # the peers do have a wall-unservable head
+        self.assertIsNone(W.pick_unservable_head(head_rid=None, waiting=[_req()], tree=_walled(),
+                                                 available=AVAILABLE, group_min=gm))
+        self.assertEqual(gm.calls, 1)
+
+    def test_a_head_that_left_the_queue_still_enters_the_vote(self):
         from sglang.srt.weg2 import d_wall_head as W
 
         gm = _MinGroup()
-        self.assertIsNone(W.pick_unservable_head(head_rid=None, waiting=[_req()], tree=_walled(),
-                                                 available=AVAILABLE, group_min=gm))
-        self.assertEqual(gm.calls, 0)
+        self.assertIsNone(W.pick_unservable_head(head_rid=HEAD, waiting=[_req("other", 10)],
+                                                 tree=_walled(), available=AVAILABLE, group_min=gm))
+        self.assertEqual(gm.calls, 1)
+
+    def test_different_heads_on_the_ranks_are_not_answered(self):
+        """Every rank finds ITS head unservable, but the heads differ: answering would pull
+        different requests out of the ranks' queues (RAENGE-NIE-UNEINS)."""
+        from sglang.srt.weg2 import d_wall_head as W
+
+        with self.assertLogs(W.logger, level="WARNING") as cm:
+            got = W.pick_unservable_head(
+                head_rid=HEAD, waiting=[_req()], tree=_walled(), available=AVAILABLE,
+                group_min=_MinGroup(((True, "weg2-38-153"), (True, HEAD))))
+        self.assertIsNone(got)
+        self.assertIn("D-WALL-HEAD-SPLIT", cm.output[0])
 
 
 class WallRefusalMessageTest(unittest.TestCase):
