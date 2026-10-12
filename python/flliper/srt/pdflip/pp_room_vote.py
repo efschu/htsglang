@@ -25,9 +25,12 @@ allocated). ``payable`` is what ONE peel can pay without knowing the wall: a
 post-order walk (:func:`estimate_payable`) that pays a device node only when every
 device child is paid and the node itself can leave -- backed (demote), backed up
 into the host room still free (:func:`backup_room_tokens`: on an arena-bound pool
-its FREE slots, PR-ARENA int22), or dropped on the local-PP floor (UD/UD-H: no
-write-through in flight, host-only children clearable); a locked node or an
-unpayable child stops its whole chain. It is capped by PW's measured wall
+its FREE slots, PR-ARENA int22), spilled to L3 and dropped without a claim
+(ROOM-VOTE 1011), or dropped on the local-PP floor (UD/UD-H: no write-through in
+flight, host-only children clearable); a locked node or an unpayable child stops
+its whole chain. HOW a node leaves is decided by ONE function the peel asks too
+(``pp_slot_fidelity.device_exit_route``; int24e 09:39:42Z: the vote paid a spilled
+node the peel could not -- ``AgreedRoomShort``). It is capped by PW's measured wall
 (``payable_evictable_or``). The walk is O(nodes) (86 nodes on PP2 at 13:37:49) and
 its time rides the fact (``sim_us``).
 
@@ -92,21 +95,20 @@ def _locked(node) -> bool:
     return any(cd.lock_ref > 0 for cd in node.component_data)
 
 
-def _host_clearable(node, state: Dict[int, Tuple[int, bool]]) -> bool:
-    """A host-only node UD-H may remove: backed, no device/host lock, every
-    child clearable (``_ud_clear_host_children``'s all-or-nothing test)."""
-    if not node.evicted or not node.backuped:
-        return False
-    if any(cd.lock_ref > 0 or cd.host_lock_ref > 0 for cd in node.component_data):
-        return False
-    return all(state.get(id(c), (0, False))[1] for c in node.children.values())
-
-
 def estimate_payable(tree, *, local_floor: bool, host_free: int) -> int:
-    """Device tokens ONE peel can pay (see the module docstring)."""
+    """Device tokens ONE peel can pay (see the module docstring).
+
+    ROOM-VOTE 1011: how a node leaves is NOT decided here. Every device node asks
+    ``pp_slot_fidelity.device_exit_route`` -- the function the peel asks too
+    (``UnifiedRadixCache._evict_device_leaf``): backed (demote), spilled to L3
+    (drop without a claim), a claim priced by the host room still free, the UD
+    drop. Per node the walk keeps ``(paid, ok, clr)``: tokens paid in its subtree,
+    whether the node itself can leave, and whether it is gone or a clearable
+    host-only node afterwards (what its parent's UD / L3 drop needs of it)."""
     from flliper.srt.mem_cache.unified_cache_components.tree_component import (
         BASE_COMPONENT_TYPE as ct,
     )
+    from flliper.srt.pdflip import pp_slot_fidelity as sf
 
     root = tree.root_node
     cc = getattr(tree, "cache_controller", None)
@@ -117,33 +119,36 @@ def estimate_payable(tree, *, local_floor: bool, host_free: int) -> int:
         n = stack.pop()
         order.append(n)
         stack.extend(n.children.values())
-    state: Dict[int, Tuple[int, bool]] = {}
+    state: Dict[int, Tuple[int, bool, bool]] = {}
     budget = max(0, int(host_free))
     for n in reversed(order):  # children before their parent
         if n is root:
             continue
+        kids = list(n.children.values())
+        children_clr = all(state[id(c)][2] for c in kids)
         value = n.component_data[ct].value
         if value is None:
-            state[id(n)] = (0, _host_clearable(n, state))
+            clr = sf.host_node_local_ok(n) and children_clr
+            state[id(n)] = (0, clr, clr)
             continue
-        dev = [c for c in n.children.values() if c.component_data[ct].value is not None]
-        host = [c for c in n.children.values() if c.component_data[ct].value is None]
+        dev = [c for c in kids if c.component_data[ct].value is not None]
+        host = [c for c in kids if c.component_data[ct].value is None]
         paid = sum(state[id(c)][0] for c in dev)
         if _locked(n) or not all(state[id(c)][1] for c in dev):
-            state[id(n)] = (paid, False)
+            state[id(n)] = (paid, False, False)
             continue
         tokens = len(value)
-        if n.backuped:
-            ok = True
-        elif write_back and budget >= tokens:
+        route = sf.device_exit_route(
+            n, write_back=write_back, local_floor=local_floor, ongoing=ongoing, host_room=budget,
+            children_clearable=children_clr, surviving_children=bool(host), tokens=tokens)
+        if route == sf.ROUTE_BACKUP:
             budget -= tokens
-            ok = True
-        elif write_back:
-            ok = (local_floor and getattr(n, "id", None) not in ongoing
-                  and all(state[id(c)][1] for c in host))
-        else:
-            ok = not host  # write_through deletes; #841 refuses with children
-        state[id(n)] = (paid + (tokens if ok else 0), ok)
+        if route is None:
+            state[id(n)] = (paid, False, False)
+        elif route in sf.DROP_ROUTES:
+            state[id(n)] = (paid + tokens, True, True)  # gone: nothing hangs below it
+        else:  # demoted / backed up: a host-only node afterwards
+            state[id(n)] = (paid + tokens, True, children_clr and not sf.node_host_locked(n))
     return sum(state[id(c)][0] for c in root.children.values() if id(c) in state)
 
 
