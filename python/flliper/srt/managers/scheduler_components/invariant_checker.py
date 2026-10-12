@@ -971,9 +971,29 @@ class SchedulerInvariantChecker:
                 f"session_held={session_req_count}, "
                 f"total_size={self.req_to_token_pool.size}\n"
             )
+            strict = envs.FLLIPER_ENABLE_STRICT_MEM_CHECK_DURING_IDLE.get()
+            if strict:
+                # USER ORDER 11.10.2026 ("er soll warnen und weitermachen"): THE LEAK
+                # CHECK NEVER KILLS THE SERVER -- the request-slot ledger is part of the
+                # same idle leak pass as the KV-pool ledger (_report_leak) and shares its
+                # rule: STRICT=1 writes ONE WARNING and the idle pass goes on (review
+                # nf-poolleak-1011 R1: this raise survived Commit B). Same counter, same
+                # 1-in-LEAK_WARN_LOG_INTERVAL log rate as the non-strict path.
+                n = getattr(self, "count_req_pool_leak_warnings", 0) + 1
+                raise_error_or_warn(
+                    self,
+                    False,
+                    "count_req_pool_leak_warnings",
+                    f"PDFLIP-REQ-POOL-LEAK WARN n={n} "
+                    f"free_slots={len(self.req_to_token_pool.free_slots)} "
+                    f"session_held={session_req_count} expected_total={req_total_size} "
+                    f"(STRICT_MEM_CHECK_DURING_IDLE=1: warn and continue, "
+                    f"user order 11.10.2026) | {msg}",
+                )  # log_interval = raise_error_or_warn's default == LEAK_WARN_LOG_INTERVAL
+                return
             raise_error_or_warn(
                 self,
-                envs.FLLIPER_ENABLE_STRICT_MEM_CHECK_DURING_IDLE.get(),
+                strict,
                 "count_req_pool_leak_warnings",
                 msg,
             )
