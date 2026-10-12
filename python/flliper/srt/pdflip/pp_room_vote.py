@@ -31,9 +31,13 @@ flight, host-only children clearable); a locked node or an unpayable child stops
 its whole chain. HOW a node leaves is decided by ONE function the peel asks too
 (``pp_slot_fidelity.device_exit_route``), and whether a node's children let it be
 dropped is carried up the walk (``clr``: a demoted, host-locked child is NOT
-clearable; int24e 09:39:42Z: the vote paid node 181 over its UD branch because its
-children, demoted by the peel and host-locked, still looked clearable --
-``AgreedRoomShort``). It is capped by PW's measured wall
+clearable). WHAT THIS DOES NOT CLOSE: the walk reads the tree at the PASS TOP; a host
+lock or an in-flight write that appears later in the same pass (the load-back takes its
+own ``inc_host_lock_ref`` before ``local_pp_room``) is invisible to it and the peel then
+pays less than the vote said -- ``AgreedRoomShort`` stays the stop, and its message now
+carries the vote's payable next to a fresh walk (``vote_diagnostic``). Whether that
+window is what killed int24e 09:39:42Z is UNVERIFIED (see pp_slot_fidelity, ROOM-VOTE 1011).
+The room is capped by PW's measured wall
 (``payable_evictable_or``). The walk is O(nodes) (86 nodes on PP2 at 13:37:49) and
 its time rides the fact (``sim_us``).
 
@@ -98,8 +102,12 @@ def _locked(node) -> bool:
     return any(cd.lock_ref > 0 for cd in node.component_data)
 
 
-def estimate_payable(tree, *, local_floor: bool, host_free: int) -> int:
+def estimate_payable(tree, *, local_floor: bool, host_free: int, trace: Optional[list] = None) -> int:
     """Device tokens ONE peel can pay (see the module docstring).
+
+    ``trace`` (diagnostics only, never read by the walk): a list the walk appends
+    ``(node id, tokens, reason)`` to for every device node that is NOT paid or is paid
+    but not clearable afterwards.
 
     ROOM-VOTE 1011: how a node leaves is NOT decided here. Every device node asks
     ``pp_slot_fidelity.device_exit_route`` -- the function the peel asks too
@@ -139,6 +147,9 @@ def estimate_payable(tree, *, local_floor: bool, host_free: int) -> int:
         paid = sum(state[id(c)][0] for c in dev)
         if _locked(n) or not all(state[id(c)][1] for c in dev):
             state[id(n)] = (paid, False, False)
+            if trace is not None:
+                trace.append((getattr(n, "id", "?"), len(value),
+                              "device_locked" if _locked(n) else "child_unpaid"))
             continue
         tokens = len(value)
         route = sf.device_exit_route(
@@ -148,10 +159,18 @@ def estimate_payable(tree, *, local_floor: bool, host_free: int) -> int:
             budget -= tokens
         if route is None:
             state[id(n)] = (paid, False, False)
+            if trace is not None:
+                trace.append((getattr(n, "id", "?"), tokens, sf.route_refusal(
+                    n, write_back=write_back, local_floor=local_floor, ongoing=ongoing,
+                    children_clearable=children_clr, surviving_children=bool(host))))
         elif route in sf.DROP_ROUTES:
             state[id(n)] = (paid + tokens, True, True)  # gone: nothing hangs below it
         else:  # demoted / backed up: a host-only node afterwards
-            state[id(n)] = (paid + tokens, True, sf.demoted_node_clearable(n, children_clr))
+            clr = sf.demoted_node_clearable(n, children_clr)
+            state[id(n)] = (paid + tokens, True, clr)
+            if trace is not None and not clr:
+                trace.append((getattr(n, "id", "?"), tokens, "paid_not_clearable:" + (
+                    "host_locked" if sf.node_host_locked(n) else "children_not_clearable")))
     return sum(state[id(c)][0] for c in root.children.values() if id(c) in state)
 
 
@@ -206,8 +225,44 @@ def follower_fact(*, tree, allocator, rank: int, executed: int, local_floor: boo
     walked = estimate_payable(tree, local_floor=local_floor, host_free=host_free)
     sim_us = (time.perf_counter() - t0) * 1e6
     payable = max(0, min(walked, walled))
+    note_vote(tree, payable)  # diagnostics: what the AgreedRoomShort stop compares a fresh walk to
     return PdFlipPpRoomFact(rank=int(rank), executed=int(executed), room=available + payable,
                           available=available, payable=payable, reported=reported, sim_us=sim_us)
+
+
+#: tree attribute: the payable PP0/follower measured at this pass's top (diagnostics)
+VOTE_PAYABLE_ATTR = "pdflip_pp_room_vote_payable"
+
+
+def note_vote(tree, payable: int) -> None:
+    """Remember what this pass's vote counted as payable, for ``vote_diagnostic``."""
+    try:
+        setattr(tree, VOTE_PAYABLE_ATTR, int(payable))
+    except Exception:  # noqa: BLE001 -- a slotted double
+        pass
+
+
+def vote_diagnostic(tree, limit: int = 6) -> str:
+    """Text for the AgreedRoomShort stop: the payable the vote counted at the pass top next
+    to a FRESH walk of the tree as it is now, and the nodes the fresh walk refuses (id:tokens:
+    reason). A vote far above the fresh walk is the pass-top-to-peel window (a host lock or
+    an in-flight write that appeared after the vote); equal numbers point elsewhere. Never
+    raises: the stop it decorates must stay the stop."""
+    try:
+        from flliper.srt.pdflip.pp_slot_fidelity import FLOOR_LOCAL_PP_ATTR
+
+        cc = getattr(tree, "cache_controller", None)
+        host_free = backup_room_tokens(getattr(cc, "mem_pool_host", None) if cc is not None else None)
+        trace: list = []
+        now = estimate_payable(tree, local_floor=bool(getattr(tree, FLOOR_LOCAL_PP_ATTR, False)),
+                               host_free=host_free, trace=trace)
+        vote = getattr(tree, VOTE_PAYABLE_ATTR, None)
+        shown = ",".join("%s:%s:%s" % t for t in trace[:int(limit)])
+        return (f" vote_payable={vote if vote is not None else 'unknown'} walk_now={now} "
+                f"host_free_now={host_free} unpaid=[{shown}]"
+                f"{'+%d more' % (len(trace) - int(limit)) if len(trace) > int(limit) else ''}")
+    except Exception as e:  # noqa: BLE001
+        return f" vote_diagnostic_failed={type(e).__name__}"
 
 
 class FollowerSender:

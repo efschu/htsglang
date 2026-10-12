@@ -4395,8 +4395,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 # the PP room vote (pp_slot_fidelity.peel_route). A node whose L2
                 # copy was spilled to L3 (``l3_present``) leaves the device
                 # WITHOUT a new arena claim -- the claim is what a full arena
-                # refuses (#1421 arena_claim node=181). (The 092933 over-count
-                # itself was the vote's children test, see pp_slot_fidelity.)
+                # refuses (#1421 arena_claim node=181). (Why the 092933 drop of
+                # 181 did not happen at the peel is UNBELEGT, see pp_slot_fidelity.)
                 from flliper.srt.pdflip import pp_slot_fidelity as _sf
 
                 if (
