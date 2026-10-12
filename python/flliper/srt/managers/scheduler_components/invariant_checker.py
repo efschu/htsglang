@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import logging
 import os
 import threading
@@ -1794,6 +1795,174 @@ def _rank_label(scheduler: Scheduler) -> str:
     return f"pp{pp if pp is not None else 'x'}-tp{tp if tp is not None else 'x'}"
 
 
+# --------------------------------------------------------------------------
+# NF D-HANG 1011: the wedge watchdog writes the scheduler thread's stack on EVERY rank
+# --------------------------------------------------------------------------
+#
+# WHY. NF int24d, 11.10. 10:25:45Z, group D (TP0/TP1/TP2): the ranks parted at the admission
+# of pdflip-0-15 (`#969 EXTENT` written by TP0 only). TP0 stood in the extend forward waiting for
+# its peers; TP1/TP2 stood somewhere between scheduler.py `_pdflip_x_refuses` and
+# `self.waiting_queue = [...]` inside `_get_new_batch_prefill_raw`. WHERE is not known: the
+# watchdog logged "ADMISSION-WEDGE: 1 queued, 0 running" and "CLASS=A-PIPELINE-DEAD" on TP1/TP2
+# and nothing on TP0 (queue empty -> the predicate `queued > 0 and running == 0` cannot fire
+# on the rank that ran ahead), and no rank wrote a stack. Two marker names close that:
+#
+#   WEDGE-STACK    the scheduler thread's Python stack (file:line per frame), on the rank that
+#                  logs the ADMISSION-WEDGE alarm: at the FIRST alarm of a wedge, once more when
+#                  the CLASS=A-PIPELINE-DEAD verdict first appears, once more at
+#                  ADMISSION-WEDGE-UNRECOVERED. Bounded: each reason once per wedge, and
+#                  WEDGE_STACK_MAX_PER_PROCESS dumps per process.
+#   FORWARD-HANG   the rank's `forward_ct` has stood still for FORWARD_HANG_SECONDS while
+#                  `cur_batch_for_debug` is set (a batch was handed to the loop and no
+#                  forward completed) -- whatever the queue says. This is the signal the rank
+#                  that ran ahead (TP0) was missing. Logged once per frozen counter value,
+#                  with the same stack dump (reason `forward-hang`).
+#
+# Both run on the watchdog thread (poll cadence ADMISSION_WEDGE_POLL_SECONDS), read
+# attributes only and write to the log; the scheduler thread's hot path is untouched. The
+# dump formats `sys._current_frames()` under the GIL (`pdflip/stall_sampler.dump_stacks`); a
+# scheduler thread blocked in a gloo/NCCL wait has released the GIL, so its Python frame is
+# readable and names the call that waits. No switch, no new threshold knob.
+
+#: seconds `forward_ct` must stand with a batch set before FORWARD-HANG (never below the
+#: ADMISSION-WEDGE alarm threshold, which may be raised by FLLIPER_ADMISSION_WEDGE_SECONDS)
+FORWARD_HANG_SECONDS: float = 30.0
+FORWARD_HANG = "FORWARD-HANG"
+WEDGE_STACK = "WEDGE-STACK"
+#: stack dumps one process may write (a flapping wedge must not bury the log)
+WEDGE_STACK_MAX_PER_PROCESS: int = 12
+#: innermost frames kept per dumped stack
+WEDGE_STACK_FRAMES: int = 60
+
+
+def _scheduler_thread_ident(scheduler) -> Optional[int]:
+    ident = getattr(scheduler, "_wedge_sched_thread_ident", None)
+    return ident if ident is not None else threading.main_thread().ident
+
+
+def write_scheduler_stack(scheduler, why: str, detail: str = "") -> bool:
+    """Log the scheduler thread's stack once per (wedge episode, ``why``), bounded per process.
+
+    Returns True when a dump was written. Never raises (an instrument may not break the watchdog)."""
+    try:
+        done = getattr(scheduler, "_wedge_stack_done", None)
+        if done is None:
+            done = scheduler._wedge_stack_done = set()
+        if why in done:
+            return False
+        total = int(getattr(scheduler, "_wedge_stack_total", 0) or 0)
+        if total >= WEDGE_STACK_MAX_PER_PROCESS:
+            return False
+        done.add(why)
+        scheduler._wedge_stack_total = total + 1
+        from flliper.srt.pdflip import stall_sampler
+
+        buf = io.StringIO()
+        stall_sampler.dump_stacks(
+            buf,
+            f"{WEDGE_STACK} rank={_rank_label(scheduler)} why={why} "
+            f"forward_ct={int(getattr(scheduler, 'forward_ct', 0) or 0)} "
+            f"arm={getattr(scheduler, '_pp_blocked_recv_arm', None) or '-'} "
+            f"n={total + 1}/{WEDGE_STACK_MAX_PER_PROCESS}"
+            + (f" {detail}" if detail else "")
+            + ": the scheduler thread's Python stack (outermost first, file:line)",
+            only_ident=_scheduler_thread_ident(scheduler),
+            max_frames=WEDGE_STACK_FRAMES,
+        )
+        logger.error(buf.getvalue().rstrip("\n"))
+        return True
+    except Exception as e:  # noqa: BLE001 - a watchdog must not die
+        logger.warning("%s stack dump failed: %s: %s", WEDGE_STACK, type(e).__name__, e)
+        return False
+
+
+def _wedge_stack_poll(scheduler, alarm: bool, detail: str, recovery: Optional[dict]) -> None:
+    """The ADMISSION-WEDGE half: first alarm, A-PIPELINE-DEAD verdict, UNRECOVERED escalation.
+    The episode ends (the per-wedge reasons re-arm) when the alarm clears."""
+    if not alarm:
+        if getattr(scheduler, "_wedge_stack_done", None):
+            scheduler._wedge_stack_done = set()
+        return
+    write_scheduler_stack(scheduler, "first-alarm")
+    from flliper.srt.managers.wedge_class import CLASS_PIPELINE_DEAD
+
+    if CLASS_PIPELINE_DEAD in (detail or ""):
+        write_scheduler_stack(scheduler, "class-A-PIPELINE-DEAD")
+    if recovery and recovery.get("escalated"):
+        write_scheduler_stack(scheduler, "unrecovered")
+
+
+def check_forward_hang_once(
+    scheduler, now: Optional[float] = None
+) -> Tuple[bool, str]:
+    """FORWARD-HANG: has this rank's forward counter stood still with a batch set?
+
+    Stateful (``scheduler._fwd_hang_sample`` = (forward_ct, first poll that saw it)), one writer:
+    the watchdog thread. Returns (hang, detail); True on every poll while it lasts. Not a hang:
+    initializing, no batch set (an idle pass sets None), the engine paused, a dormant group.
+    Never raises."""
+    now = time.monotonic() if now is None else now
+    try:
+        if (
+            scheduler.is_initializing
+            or getattr(scheduler, "_engine_paused", False)
+            or getattr(scheduler, "pdflip_dormant", False)
+            or scheduler.cur_batch_for_debug is None
+        ):
+            scheduler._fwd_hang_sample = None
+            return False, "no batch in flight"
+        ct = int(getattr(scheduler, "forward_ct", 0) or 0)
+        sample = getattr(scheduler, "_fwd_hang_sample", None)
+        if sample is None or sample[0] != ct:
+            scheduler._fwd_hang_sample = (ct, now)
+            return False, "forward counter moved"
+        frozen = now - sample[1]
+        if frozen < max(FORWARD_HANG_SECONDS, _wedge_alarm_threshold()):
+            return False, f"forward_ct={ct} frozen {frozen:.1f}s (below the bound)"
+        batch = scheduler.cur_batch_for_debug
+        try:
+            mode = getattr(getattr(batch, "forward_mode", None), "name", None) or "?"
+            bs = batch.batch_size()
+        except Exception:  # noqa: BLE001
+            mode, bs = "?", "?"
+        since = getattr(scheduler, "_pp_blocked_recv_since", None)
+        arm = getattr(scheduler, "_pp_blocked_recv_arm", None) or "-"
+        if since is not None:
+            arm = f"{arm}(waited {time.monotonic() - since:.1f}s)"
+        return True, (
+            f"forward_ct={ct} has not moved for {frozen:.1f}s while a batch is set "
+            f"(mode={mode} bs={bs}); queued={len(scheduler.waiting_queue)} "
+            f"running={len(scheduler.running_batch.reqs)} arm={arm}: this rank has "
+            "handed a batch to its loop and no forward completed -- a rank waiting in a "
+            "collective for peers that never arrive looks exactly like this"
+        )
+    except Exception as e:  # noqa: BLE001 - a watchdog must not die
+        return False, f"check failed: {type(e).__name__}: {e}"
+
+
+def _forward_hang_poll(scheduler, now: Optional[float] = None) -> None:
+    hang, detail = check_forward_hang_once(scheduler, now)
+    if not hang:
+        scheduler._fwd_hang_said = None
+        return
+    ct = int(getattr(scheduler, "forward_ct", 0) or 0)
+    if getattr(scheduler, "_fwd_hang_said", None) == ct:
+        return  # once per frozen counter value
+    scheduler._fwd_hang_said = ct
+    history = ""
+    try:
+        from flliper.srt.distributed import collective_census
+
+        history = " | " + collective_census.format_local_history(
+            int(getattr(getattr(scheduler, "ps", None), "pp_rank", -1))
+        )
+    except Exception as e:  # noqa: BLE001
+        history = f" | collective history unavailable: {e}"
+    logger.error("%s rank=%s %s%s", FORWARD_HANG, _rank_label(scheduler), detail, history)
+    # one episode per frozen counter value: the dump key carries it
+    write_scheduler_stack(scheduler, f"forward-hang@{ct}")
+
+
 def make_admission_wedge_poller(scheduler: Scheduler):
     """One watchdog poll, as a callable. The thread calls this; so do tests.
 
@@ -1897,11 +2066,24 @@ def make_admission_wedge_poller(scheduler: Scheduler):
                 logger.warning("%s #1028i history unavailable: %s", ADMISSION_WEDGE, e)
         elif not alarm:
             scheduler._wedge_census_dumped = False
+        # NF D-HANG 1011: the first-alarm / class stack is taken BEFORE the recovery attempt (the
+        # state the wedge is in, not the one after a post); the UNRECOVERED escalation needs the
+        # recovery status and is taken after it (each reason is written once per wedge).
+        try:
+            _wedge_stack_poll(scheduler, alarm, detail, None)
+        except Exception as e:  # noqa: BLE001 - a watchdog must not die
+            logger.warning("%s poll failed: %s", WEDGE_STACK, e)
         try:
             driver.step(alarm)
         except Exception as e:  # noqa: BLE001 - a watchdog must not die
             logger.error("%s RECOVERY: attempt wrapper failed: %s", ADMISSION_WEDGE, e)
-        _publish(alarm, detail, driver.recovery_status())
+        _recovery = driver.recovery_status()
+        _publish(alarm, detail, _recovery)
+        try:
+            _wedge_stack_poll(scheduler, alarm, detail, _recovery)
+            _forward_hang_poll(scheduler)
+        except Exception as e:  # noqa: BLE001 - a watchdog must not die
+            logger.warning("%s/%s poll failed: %s", WEDGE_STACK, FORWARD_HANG, e)
         return bool(alarm)
 
     return _poll_once
@@ -1959,6 +2141,12 @@ def create_admission_wedge_watchdog(
     of what the ladder did when it is.
     """
 
+    # NF D-HANG 1011: this runs in Scheduler.__init__, i.e. on the scheduler thread; the stack
+    # dump (write_scheduler_stack) reads that thread's frame by this ident.
+    try:
+        scheduler._wedge_sched_thread_ident = threading.get_ident()
+    except AttributeError:  # a slotted stand-in: the dump falls back to the main thread
+        pass
     poll = make_admission_wedge_poller(scheduler)
     # the metal proof of FLLIPER_ADMISSION_WEDGE_RECOVERY_SECONDS (27B LS12
     # da8464b9f0; NF registry default 2.0 since SCHALTER-HALBPORT 1002): the
