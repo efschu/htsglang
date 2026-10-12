@@ -80,7 +80,7 @@
  "profile": {
   "file": "tools/release/profconv/nf-gguf-d.env",
   "note": "in-tree profile (profconv), not a rig snapshot; the test pins its sha256: regenerate the golden when the profile moves",
-  "sha256": "fd02f53839ad19889f0b84d14167939f967908d0ba09f8ac5af0f8020bd5fc07"
+  "sha256": "9762b7cd9453d80bff19fc7715a33f63e7d3e9210a50310a7bc81f5af05a5768"
  },
  "profile_base": {
   "file": "tools/release/profconv/nf-gguf.env",

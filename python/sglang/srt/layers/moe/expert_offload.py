@@ -5391,12 +5391,46 @@ class MoEExpertOffloadCache:
         pool_index = self._spill_pool_index
         resident_ids = self.planner.resident_ids
         host_row = []
+        gaps = []
         for e in range(E):
             resident = (e < R) if resident_ids is None else (e in resident_ids)
             if resident:
                 host_row.append(-1)
+            elif pool_index is None:
+                host_row.append(e - R)
             else:
-                host_row.append(int(pool_index[e]) if pool_index is not None else e - R)
+                try:
+                    host_row.append(int(pool_index[e]))
+                except (KeyError, IndexError):
+                    # the very lookup that raised ``KeyError: 87`` at the stage-A boot; collected so the abort below
+                    # can name every missing expert (``pool_index`` is a dict, or a list indexed by expert id)
+                    gaps.append(e)
+                    host_row.append(-1)
+        if gaps:
+            # G13: every non-resident expert must name the host row it is read from (the safetensors / store path
+            # builds the map over ALL its cold experts). A gap is an expert no tier holds; the old ``KeyError: 87``
+            # said neither which tier nor how many (the 12.10. stage-A boot: all three ranks, first forward).
+            delegated = getattr(self.planner, "delegated_ids", None) or frozenset()
+            deleg = [e for e in gaps if e in delegated]
+            other = [e for e in gaps if e not in delegated]
+            parts = []
+            if deleg:
+                parts.append(
+                    f"{len(deleg)} delegated to a peer rank's host tier (#394; pool mode has no cold-tier path, "
+                    f"first {deleg[:8]})"
+                )
+            if other:
+                parts.append(
+                    f"{len(other)} in neither the resident set nor this rank's host/store tier index "
+                    f"(first {other[:8]})"
+                )
+            raise RuntimeError(
+                f"MoE expert pool layer {getattr(getattr(self, 'layer', None), 'layer_id', '?')}: {len(gaps)} of {E} local experts are "
+                f"not resident and have no host row in the pool map (resident {R}, map rows "
+                f"{len(pool_index)}): " + "; ".join(parts) + ". Every non-resident expert row needs a store/pool "
+                "entry, written by the staging door that built this layer; a gap means that door left the expert in "
+                "no tier."
+            )
         hot_slot_of = (
             dict(self.planner.resident_slot)
             if self.planner.resident_slot is not None

@@ -265,6 +265,76 @@ def _gguf_local_count(layer) -> Optional[int]:
     return None
 
 
+_COLD_SHARD_NOTE_LOGGED = False
+
+
+def door_cold_shard(layer):
+    """The #394 cold shard this door plans with: ALWAYS ``None`` (G13).
+
+    WHY.  ``plan_load_time_staging(cold_shard=ctx)`` keeps only this rank's link-proportional share of its own cold
+    experts (``plan.spill_ids``) and records the rest as ``plan.delegated_ids`` -- "a peer's host tier holds them".
+    The streaming door builds that peer tier (``FusedMoE._gguf_cold_tier_owner``: a shared segment, a manifest, a
+    resolver); THIS door never did.  It wrote only ``plan.spill_ids`` into the store / private pool and then
+    "released the delegated experts without a copy" -- so with ``SGLANG_MOE_COLD_TIER_SHM=1`` (the NF profile sets it)
+    and a link ratio from the card probe, 105 / 58 / 56 cold experts per rank (TP0 / TP1 / TP2 of the 12.10.2026
+    stage-A boot) were held by NO tier.  The store index (``_moe_offload_store_index``) then named only the owned
+    share, and the pool layout (``MoEExpertOffloadCache._pool_layout``) died with ``KeyError`` on the first
+    non-resident expert nobody owned (local 87 / 73 / 84), in the first CUDA-graph warm-up forward.
+
+    A shared cold tier cannot be added here either: the pool graph mode (``SGLANG_MOE_OFFLOAD_GRAPH_MODE=pool``,
+    the D form) refuses a cold tier by name (``install_pool``: "pool mode has no shared cold tier (#394) path"), and
+    the shared store IS the host tier of this door -- one file for both groups, one slot per cold expert from the
+    Karte, readable by every rank.  Delegation inside it has no meaning.  So the safetensors / Marlin presplit
+    contract holds here too (it passes no cold shard at any production call site, ``refuse_cold_shard_at_repack_door``):
+    EVERY non-resident expert of the layer is written to the store (or the private pool), and
+    ``_moe_offload_store_index`` / the frozen layout name every one of them.
+
+    The context is still asked for, once per layer as before, so a malformed ``SGLANG_MOE_HOST_SHARD_RATIO`` stays a
+    hard error and the operator is told ONCE (a WARNING line) that the share was not applied.  A decision from the
+    environment and the group size only, i.e. the same on every rank.
+    """
+    ctx = layer._gguf_cold_shard_context()
+    if ctx is None:
+        return None
+    global _COLD_SHARD_NOTE_LOGGED
+    if not _COLD_SHARD_NOTE_LOGGED:
+        _COLD_SHARD_NOTE_LOGGED = True
+        try:
+            describe = ctx.ratio.describe()
+        except Exception:  # noqa: BLE001 -- a log line must never fail a load
+            describe = "ratio not describable"
+        logger.warning(
+            "%s G13: the #394 cold-expert host shard (%s) is NOT applied by the Platztausch / store door: every "
+            "non-resident expert of a layer is staged into this door's own tier (shared store or private pool). "
+            "Delegating a share to a peer's host tier needs the shared cold tier, which this door does not build and "
+            "the pool graph mode refuses; a delegated expert would be held by no tier (KeyError in the pool layout).",
+            MARKER, describe,
+        )
+    return None
+
+
+def assert_cold_tier_complete(layer_id, attr: str, plan, store_index=None) -> None:
+    """The map invariant of the safetensors / store path, checked at LOAD: every non-resident expert of the layer has
+    a row in this door's tier -- ``plan.delegated_ids`` empty, and (store) the index names exactly ``plan.spill_ids``.
+
+    A violation is a named refusal with the expert ids and the tier, raised before the layer is half-staged; the
+    alternative is the ``KeyError`` of the first forward that asks the pool layout for an expert nobody holds."""
+    if plan.delegated_ids:
+        raise GGUFPresplitRefused(
+            f"{MARKER}: layer {layer_id} {attr}: {len(plan.delegated_ids)} cold experts are delegated to a peer rank's "
+            f"host tier (first {list(plan.delegated_ids[:8])}), but this door builds no shared cold tier -- no tier "
+            f"would hold them (G13)"
+        )
+    if store_index is not None:
+        have, want = set(store_index), set(plan.spill_ids)
+        if have != want:
+            raise GGUFPresplitRefused(
+                f"{MARKER}: layer {layer_id} {attr}: the shared store index names {len(have)} cold experts but the "
+                f"plan stages {len(want)}; without a store row: {sorted(want - have)[:8]}, "
+                f"row without a staged expert: {sorted(have - want)[:8]} (shared store tier, G13)"
+            )
+
+
 def _plan_for(layer, count: int):
     """The layer's plan (cached: both tensors of a layer share it and the Karte is asked once)."""
     from sglang.srt.layers.moe import expert_offload as eo
@@ -281,7 +351,7 @@ def _plan_for(layer, count: int):
         layer,
         int(count),
         float(frac),
-        cold_shard=layer._gguf_cold_shard_context(),
+        cold_shard=door_cold_shard(layer),
         # the pre-G4 door's own pin: the trailing pad of the #82 shard (every foreign token routes to it)
         fallback_pinned=((int(count) - 1,) if sharded else ()),
     )
@@ -346,6 +416,8 @@ def presplit_gguf_param(layer, attr: str, param, source):
         return None
     R, buf_slots = plan.resident_count, plan.buffer_slots
     store_rows = eo._expert_store_rows_for(layer, plan)
+    # G13: the pool layout needs a row for EVERY non-resident expert; refuse a plan / index that cannot give one
+    assert_cold_tier_complete(layer_id, attr, plan, store_rows[4] if store_rows is not None else None)
     seat_x = _seat_vram.presplit_seat_rows(layer)
     if store_rows is not None:
         layer._moe_offload_store_index = dict(store_rows[4])
@@ -410,9 +482,8 @@ def presplit_gguf_param(layer, attr: str, param, source):
             if local not in rows_w:
                 drop(local)
         freed_host = len(plan.spill_ids) * row_bytes  # this rank's own rows of the shared file
-    # delegated cold experts (#394) belong to a peer's tier: released without a copy
-    for expert_id in plan.delegated_ids:
-        drop(expert_id)
+    # (G13) no delegated cold experts reach here: ``assert_cold_tier_complete`` above refused a plan that has some,
+    # and ``door_cold_shard`` never asks the planner for any. The pre-G13 loop released them without a copy.
 
     # 4. publication: the flip's name for the bank, the cache's stash
     if n_praefix is None:

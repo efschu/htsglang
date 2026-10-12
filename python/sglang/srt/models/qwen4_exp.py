@@ -3682,6 +3682,13 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                         )
                         weight_loader(param, loaded_weight)
                     else:
+                        # G13 (stage-A boot 12.10.2026): on a Form A WORKER (rank-tp-ratio 0) this line is
+                        # EXPECTED for every dense tensor -- embed_tokens, lm_head, attention, GDN, hyper-
+                        # connection, PLE, shared expert (1230 lines per worker, 0 on the host rank). The
+                        # worker builds only routed experts + router (rank_role.worker_keeps_parameter); the
+                        # safetensors loader never reads such tensors (weight_name_needed above), the GGUF
+                        # stream delivers them all and they end here. Not an error: no routed expert and no
+                        # router name is among them (test_gguf_g13_cold_tier_pool_map_1012).
                         logger.warning(
                             "Parameter %s not found while loading Qwen4-Exp VL weights",
                             name,

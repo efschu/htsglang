@@ -39,6 +39,7 @@ import sys
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import gguf as gguf_lib
 import numpy as np
@@ -567,12 +568,82 @@ class TestLoadGuard(CustomTestCase):
 
     def test_prepare_calls_the_guard_even_when_the_kernel_module_is_unavailable(self):
         self.G.IQ3S_WHEEL_GRID_FIXED = False
-        self.G._iq_mmq_kernels = lambda: None
-        try:
+        # G13: ``mock.patch.object`` puts the module function back. The G12 form (``G._iq_mmq_kernels = ...`` then
+        # ``del G._iq_mmq_kernels``) DELETED the module-level ``def`` -- every later caller in the process (here:
+        # ``TestGpuDecodeForms.setUpClass`` -> ``iq_mmq_prepare``) got ``NameError: name '_iq_mmq_kernels' is not defined``.
+        with mock.patch.object(self.G, "_iq_mmq_kernels", lambda: None):
             with self.assertRaises(RuntimeError):
                 self.G.iq_mmq_prepare(21)
-        finally:
-            del self.G._iq_mmq_kernels  # restores the module function
+
+    def test_the_module_function_is_still_there_after_the_patched_test(self):
+        """The G12 defect, pinned: after the test above the real ``_iq_mmq_kernels`` must exist and be the original."""
+        original = self.G._iq_mmq_kernels
+        self.G.IQ3S_WHEEL_GRID_FIXED = False
+        with mock.patch.object(self.G, "_iq_mmq_kernels", lambda: None):
+            self.assertIsNot(self.G._iq_mmq_kernels, original)
+        self.assertIs(self.G._iq_mmq_kernels, original)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+#: gather budget of one reference chunk, in fp32 elements (2**28 = 1 GiB): the NF production form needs 32.8 M per token
+_MOE_REF_CHUNK_ELEMS = 1 << 28
+
+
+def moe_reference(x, wd1, wd2, tw, ids, chunk_tokens: int | None = None):
+    """The fused-MoE reference (two GEMMs + silu_and_mul + weighted sum, float32, gguf-py weights), computed in token
+    chunks.  Each token's result depends on that token alone, so chunking only bounds the memory of the expert gather
+    (``wd1[ids]`` is [chunk, top_k, 2 * inter, K]); it does not change a single expected value.
+
+    x [m, K], wd1 [E, 2 * inter, K], wd2 [E, K, inter], tw [m, top_k], ids [m, top_k] -> [m, K]."""
+    m, top_k = int(ids.shape[0]), int(ids.shape[1])
+    inter = int(wd1.shape[1]) // 2
+    if chunk_tokens is None:
+        per_token = top_k * int(wd1.shape[1]) * int(wd1.shape[2])
+        chunk_tokens = max(1, _MOE_REF_CHUNK_ELEMS // per_token)
+    out = []
+    for lo in range(0, m, chunk_tokens):
+        hi = min(m, lo + chunk_tokens)
+        sel = ids[lo:hi].long()
+        h1 = torch.einsum("tk,tjnk->tjn", x[lo:hi].float(), wd1[sel])
+        h = torch.nn.functional.silu(h1[..., :inter]) * h1[..., inter:]
+        out.append((torch.einsum("tjk,tjnk->tjn", h, wd2[sel]) * tw[lo:hi].float()[..., None]).sum(1))
+    return torch.cat(out, dim=0)
+
+
+class TestMoeReferenceChunking(CustomTestCase):
+    """CPU: the chunked reference is the one-shot reference (G13, harness fix for the sm86 OOM of m = 200)."""
+
+    def _case(self, m, E=6, top_k=3, K=16, inter=8, seed=0):
+        g = torch.Generator().manual_seed(seed)
+        x = torch.randn((m, K), generator=g)
+        wd1 = torch.randn((E, 2 * inter, K), generator=g)
+        wd2 = torch.randn((E, K, inter), generator=g)
+        ids = torch.topk(torch.rand((m, E), generator=g), top_k, dim=1).indices.to(torch.int32)
+        tw = torch.softmax(torch.randn((m, top_k), generator=g), -1)
+        return x, wd1, wd2, tw, ids
+
+    @staticmethod
+    def _one_shot(x, wd1, wd2, tw, ids):
+        inter = wd1.shape[1] // 2
+        h1 = torch.einsum("tk,tjnk->tjn", x.float(), wd1[ids.long()])
+        h = torch.nn.functional.silu(h1[..., :inter]) * h1[..., inter:]
+        return (torch.einsum("tjk,tjnk->tjn", h, wd2[ids.long()]) * tw.float()[..., None]).sum(1)
+
+    def test_chunked_equals_one_shot_for_every_chunk_size(self):
+        args = self._case(m=37)
+        want = self._one_shot(*args)
+        for chunk in (1, 2, 5, 36, 37, 1000, None):
+            with self.subTest(chunk=chunk):
+                got = moe_reference(*args, chunk_tokens=chunk)
+                self.assertEqual(tuple(got.shape), tuple(want.shape))
+                torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-6)
+
+    def test_the_default_chunk_keeps_the_nf_production_gather_under_a_gigabyte_of_elements(self):
+        per_token = 10 * 1280 * 2560  # top_k x (gate+up rows) x K, the NF form
+        chunk = max(1, _MOE_REF_CHUNK_ELEMS // per_token)
+        self.assertGreaterEqual(chunk, 1)
+        self.assertLessEqual(chunk * per_token * 4, 1 << 30)  # fp32 bytes of the biggest gather
+        self.assertLess(chunk, 200)  # the one-shot 200-token gather (24.41 GiB) is gone
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -662,9 +733,9 @@ class TestGpuDecodeForms(CustomTestCase):
         ids = torch.topk(torch.rand((m, E), device=self.dev), top_k, dim=1).indices.to(torch.int32)
         tw = torch.softmax(torch.randn((m, top_k), device=self.dev), -1).to(torch.bfloat16)
         y = self.G.fused_moe_gguf(x, w1, w2, tw, ids, IQ3_S, qd, "silu").float()
-        h1 = torch.einsum("tk,tjnk->tjn", x.float(), wd1[ids.long()])
-        h = torch.nn.functional.silu(h1[..., :640]) * h1[..., 640:]
-        ref = (torch.einsum("tjk,tjnk->tjn", h, wd2[ids.long()]) * tw.float()[..., None]).sum(1)
+        # G13: the reference in TOKEN CHUNKS (``moe_reference``): the one-shot gather ``wd1[ids]`` is
+        # m x top_k x 1280 x 2560 fp32 = 24.41 GiB at m = 200 and did not fit a 20 GB card.
+        ref = moe_reference(x, wd1, wd2, tw, ids)
         self.assertTrue(torch.isfinite(y).all())
         return y, ref
 

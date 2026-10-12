@@ -119,7 +119,7 @@ class TestProfile(unittest.TestCase):
         self.assertEqual(_argv_value(self.li.argv, "--model"), _argv_value(self.base.argv, "--model"))
         self.assertEqual(_argv_value(self.li.argv, "--tokenizer-path"), _argv_value(self.base.argv, "--tokenizer-path"))
 
-    def test_the_required_paths_name_sibling_draft_dir_draft_file_config_and_store(self):
+    def test_the_required_paths_name_sibling_draft_dir_draft_file_and_config_but_not_the_store(self):
         raw = _read(PROFILE)
         block = raw.split("PROFILE_REQUIRED_PATHS=(")[1].split("\n)\n")[0]
         for need in (
@@ -130,10 +130,13 @@ class TestProfile(unittest.TestCase):
             '"$PROFILE_DRAFT_DIR"',
             '"$PROFILE_DRAFT"',
             '"$PROFILE_DRAFT_DIR/config.json"',
-            '"$NF_STORE_DIR"',
         ):
             self.assertIn(need, block)
         self.assertNotIn("safetensors", block)
+        # G13 (stage-A boot 12.10.): the store directory is CREATED by preflight_state (entrypoint.sh:712), AFTER
+        # preflight_model (:711) checked these paths, and /mnt/nf-experts is a fresh tmpfs in the container -- required,
+        # it can never exist ("refuse MODEL"). It stays in the argv below, where the launcher reads it.
+        self.assertNotIn("NF_STORE_DIR", block)
         for flag in ("--env-p", "--env-d"):  # NF_STORE_DIR is not a PROFILE_* variable: read it where the launcher gets it
             self.assertIn("SGLANG_MOE_EXPERT_STORE_DIR=/mnt/nf-experts/gguf", _argv_value(self.li.argv, flag).replace("FLLIPER_", "SGLANG_"))
 
