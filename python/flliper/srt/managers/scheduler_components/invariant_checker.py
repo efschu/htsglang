@@ -58,6 +58,10 @@ logger = logging.getLogger(__name__)
 # Number of recent busy-check messages buffered for the level-1 dump-on-leak path.
 BUSY_MEM_CHECK_LOG_RING_SIZE = 1000
 
+#: nf-poolleak-1011: 1-in-N log rate of the idle leak report; the value
+#: ``raise_error_or_warn`` has always defaulted to (utils/common.py).
+LEAK_WARN_LOG_INTERVAL = 1000
+
 
 def idle_mamba_check_every(*, group: str, every: int) -> int:
     """D-IDLE-MAMBA-1007: on how many idle passes the Mamba pool ledger runs
@@ -128,6 +132,12 @@ class SchedulerInvariantChecker:
     idle_mamba_check_every: int = 1
     #: idle passes seen, for :meth:`take_idle_mamba_turn`
     idle_mamba_passes: int = 0
+    #: nf-poolleak-1011 (Commit B): the terms of the LAST full-pool ledger
+    #: evaluation, ``(available, evictable, protected, session_held, uncached,
+    #: withheld, total, page_size)`` in TOKENS, so ``_report_leak`` can name the
+    #: overshoot in pages without re-deriving the ledger. None until the first
+    #: evaluation.
+    last_full_ledger: Optional[tuple] = None
 
     def _allocator(self):
         """The KV allocator AS BOUND RIGHT NOW.
@@ -303,6 +313,16 @@ class SchedulerInvariantChecker:
         withheld = int(getattr(allocator, "residency_withheld_slots", 0) or 0)
 
         def _ledger(available: int) -> Tuple[bool, str]:
+            self.last_full_ledger = (
+                available,
+                full_evictable_size,
+                protected,
+                session_held,
+                uncached,
+                withheld,
+                total,
+                max(1, int(getattr(allocator, "page_size", 1) or 1)),
+            )
             return self._check_pool_invariant(
                 "full",
                 available,
@@ -974,21 +994,72 @@ class SchedulerInvariantChecker:
                 msg,
             )
 
+    def leak_detail_due(self) -> bool:
+        """Whether the NEXT ``_report_leak`` writes its full report (and the
+        caller may therefore pay for the tree census that goes with it).
+
+        STRICT=0: always (the pre-existing behaviour, untouched). STRICT=1 is
+        warn-and-continue (:meth:`_report_leak`): a leak that PERSISTS is seen on
+        every idle pass, so the report -- and the O(nodes) census the idle path
+        runs before it -- follows the same 1-in-``LEAK_WARN_LOG_INTERVAL`` rule
+        ``raise_error_or_warn`` has always used for the non-strict counter."""
+        if not envs.FLLIPER_ENABLE_STRICT_MEM_CHECK_DURING_IDLE.get():
+            return True
+        return getattr(self, "count_memory_leak_warnings", 0) % LEAK_WARN_LOG_INTERVAL == 0
+
+    def _leak_ledger_fields(self) -> str:
+        """``overshoot_pages= free= evictable= total= ...`` of the last full-pool
+        ledger evaluation. ``overshoot`` is accounted - total in pages, SIGNED:
+        ``+`` = a surplus (a page owned twice, the 11.10. NF shape), ``-`` = a
+        deficit (rows nobody owns)."""
+        led = getattr(self, "last_full_ledger", None)
+        if led is None:
+            return "ledger=UNKNOWN (no full-pool evaluation yet)"
+        available, evictable, protected, session_held, uncached, withheld, total, page = led
+        delta = available + evictable + protected + session_held + uncached + withheld - total
+        pages = delta // page if delta % page == 0 else round(delta / page, 2)
+        return (
+            f"overshoot_pages={pages:+} (overshoot_tokens={delta:+}, page_size={page}) "
+            f"free={available} evictable={evictable} protected={protected} "
+            f"session_held={session_held} uncached={uncached} withheld={withheld} "
+            f"total={total}"
+        )
+
     def _report_leak(self, pool_name: str, token_msg: str):
+        strict = envs.FLLIPER_ENABLE_STRICT_MEM_CHECK_DURING_IDLE.get()
         msg = f"{pool_name} memory leak detected! {token_msg}"
         # POOLLEAK-INSTR (3), FLLIPER_PDFLIP_POOLLEAK_INSTR (default off): the
         # leaked full ids minus the KvRowCap-withheld ids -- the rows nobody
         # owns, by id (y9nf6 b3: 92800 listed = 92672 withheld + 128). Log only.
         from flliper.srt.pdflip import poolleak_instr
 
-        if poolleak_instr.enabled():
+        if poolleak_instr.enabled() and (not strict or self.leak_detail_due()):
             line = poolleak_instr.unwithheld_leak_ids(self._allocator(), self.tree_cache)
             if line:
                 logger.error("%s", line)
                 msg += "\n" + line
+        if strict:
+            # USER ORDER 11.10.2026 ("er soll warnen und weitermachen"): THE LEAK
+            # CHECK NEVER KILLS THE SERVER. The idle ledger used to raise here
+            # (ValueError -> RANK_EXCEPTION -> group death: NF int24e died twice
+            # on 11.10. over ONE double-owned 64-token page). STRICT=1 now writes
+            # the full ledger as a WARNING and returns; the caller's idle pass
+            # goes on. No threshold, no new env: the same counter and the same
+            # 1-in-LEAK_WARN_LOG_INTERVAL log rate as the non-strict path, so a
+            # persistent leak is one line per interval, not one per idle pass.
+            n = getattr(self, "count_memory_leak_warnings", 0) + 1
+            raise_error_or_warn(
+                self,
+                False,
+                "count_memory_leak_warnings",
+                f"PDFLIP-POOL-LEAK WARN n={n} {self._leak_ledger_fields()} "
+                f"(STRICT_MEM_CHECK_DURING_IDLE=1: warn and continue, "
+                f"user order 11.10.2026) | {msg}",
+            )  # log_interval = raise_error_or_warn's default == LEAK_WARN_LOG_INTERVAL (pinned by a test)
+            return
         raise_error_or_warn(
             self,
-            envs.FLLIPER_ENABLE_STRICT_MEM_CHECK_DURING_IDLE.get(),
+            strict,
             "count_memory_leak_warnings",
             msg,
         )
