@@ -4406,7 +4406,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     # paid, and its parent becomes the next leaf.
                     # (ROOM-VOTE 1011: the same check the vote prices it with --
                     # the claim just failed, so host room 0)
-                    if _sf.peel_route(self, node, host_room=0) == _sf.ROUTE_UD_DROP:
+                    # Fix round 3 (review): the state can change since the
+                    # top-of-function L3 check -- the #1426 drain above clears
+                    # ``ongoing_write_through``, a store ack sets ``l3_present``,
+                    # the claim's own ARENA-DROP side effects clear host
+                    # children. The route is therefore re-read here and BOTH
+                    # drop routes are taken: an l3_present node that has become
+                    # droppable gets ROUTE_L3_DROP (never UD_DROP).
+                    _route = _sf.peel_route(self, node, host_room=0)
+                    if _route == _sf.ROUTE_L3_DROP:
+                        self._l3_drop_leaf(node, tracker)
+                    elif _route == _sf.ROUTE_UD_DROP:
                         if node.children:
                             # UD-H: the leaf's only children are host-only nodes
                             self._ud_clear_host_children(node)
