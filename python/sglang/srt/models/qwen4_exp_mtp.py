@@ -160,6 +160,37 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
                 use_attn_tp_group=get_server_args().enable_dp_lm_head,
             )
         self.logits_processor = LogitsProcessor(config)
+        # G15: an inference-only model carries no trainable parameter.
+        self.freeze_parameters()
+
+    def freeze_parameters(self) -> None:
+        """``requires_grad_(False)`` on every parameter of the draft.
+
+        G15 (metal G14 stage A, D.log:10214-10302): the draft-extend CUDA-graph
+        warm-up died in ``memory_pool.py:4559`` ``cache_v.div_(v_scale)`` with
+        "Output 0 of ViewBackward0 is a view and is being modified inplace".
+        Cause: this module builds the MTP input fusion from plain
+        ``nn.Linear`` (``fc_embedding``, ``fc_hidden``, ``fc``) -- whose weight
+        is ``requires_grad=True`` by default, unlike every sglang linear
+        (``ModelWeightParameter`` / ``GGUFUninitializedParameter`` are built
+        ``requires_grad=False``) -- and the capture warm-up runs the draft
+        forward WITHOUT ``inference_mode`` (``eagle_draft_extend_cuda_graph_
+        runner.py:478``). The fused hidden state therefore carries a grad_fn,
+        every torch-native op downstream keeps it (the GGUF dense/dequant
+        ``x @ w.T`` at M > 8 is one), and the k/v the attention backend writes
+        into the fp8 KV pool are in-place-divided split views of a grad
+        tensor. The GemmaRMSNorm / Qwen4Exp norm weights and the Linear biases
+        are default-``True`` too. No parameter of a served model is ever
+        trained, so the loader-side invariant is "all False": stated once here
+        for the draft, re-stated after ``load_weights`` (a post-load pass may
+        register a fresh ``Parameter``). Values are untouched.
+        """
+        self.requires_grad_(False)
+
+    def load_weights(self, weights, is_mtp: bool = False):
+        loaded = super().load_weights(weights, is_mtp=is_mtp)
+        self.freeze_parameters()
+        return loaded
 
     def _init_pre_fc_norms(self, config: PretrainedConfig) -> None:
         self.pre_fc_norm_embedding = GemmaRMSNorm(
