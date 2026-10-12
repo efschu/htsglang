@@ -1813,8 +1813,10 @@ def _rank_label(scheduler: Scheduler) -> str:
 #                  ADMISSION-WEDGE-UNRECOVERED. Bounded: each reason once per wedge, and
 #                  WEDGE_STACK_MAX_PER_PROCESS dumps per process.
 #   FORWARD-HANG   the rank's `forward_ct` has stood still for FORWARD_HANG_SECONDS while
-#                  `cur_batch_for_debug` is set (a batch was handed to the loop and no
-#                  forward completed) -- whatever the queue says. This is the signal the rank
+#                  `cur_batch_for_debug` is set (inside that batch's forward, OR between
+#                  iterations with the previous batch still set: `forward_ct` is bumped at
+#                  the START of a forward, `cur_batch_for_debug` is rewritten only after
+#                  planning -- the stack dump says which) -- whatever the queue says. This is the signal the rank
 #                  that ran ahead (TP0) was missing. Logged once per frozen counter value,
 #                  with the same stack dump (reason `forward-hang`).
 #
@@ -1933,8 +1935,12 @@ def check_forward_hang_once(
             f"forward_ct={ct} has not moved for {frozen:.1f}s while a batch is set "
             f"(mode={mode} bs={bs}); queued={len(scheduler.waiting_queue)} "
             f"running={len(scheduler.running_batch.reqs)} arm={arm}: this rank has "
-            "handed a batch to its loop and no forward completed -- a rank waiting in a "
-            "collective for peers that never arrive looks exactly like this"
+            "a batch set (cur_batch_for_debug) and forward_ct frozen: either inside the "
+            "forward of that batch, OR stuck between iterations (e.g. in the admission pass) "
+            "with the previous iteration's batch still set -- cur_batch_for_debug is only "
+            "rewritten after planning, forward_ct is bumped at the START of a forward. The "
+            "stack dump below says which. A rank waiting in a collective for peers that never "
+            "arrive looks exactly like this"
         )
     except Exception as e:  # noqa: BLE001 - a watchdog must not die
         return False, f"check failed: {type(e).__name__}: {e}"
