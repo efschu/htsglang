@@ -20159,7 +20159,11 @@ class Scheduler(
                 # worlds have opposite fixes and the term alone cannot tell
                 # them apart. Diagnostics only; the raise below is unchanged.
                 census = getattr(self.tree_cache, "leak_census_str", None)
-                if callable(census):
+                # nf-poolleak-1011: STRICT=1 warns and continues, so a persistent
+                # leak reaches this point on EVERY idle pass; the O(nodes) census
+                # follows the report's own 1-in-N rate (always, with STRICT=0).
+                _due = getattr(self.invariant_checker, "leak_detail_due", None)
+                if callable(census) and (_due is None or _due()):
                     try:
                         logger.error("%s", census())
                     except Exception as exc:  # noqa: BLE001
