@@ -84,6 +84,8 @@ TRIGGER = "lane"
 MARK_PARK_LANE = "WEG2-PARK (lane)"  # sch:10151 pattern: ``WEG2-PARK n=...`` with the trigger in the marker
 #: FIX 4: the head-of-step park of a lane-held continuation waits for a launched chunk to drain; one line per (request, floor epoch)
 MARK_PARK_WAIT = "WEG2 LANE-P PARK-WAIT"
+#: FIX 5: an aborted request leaves the per-rid told ledger of this rank (the lane resume comes back under the same rid)
+MARK_TOLD_FORGET = "WEG2 LANE-P TOLD-FORGET"
 
 
 # ---------------------------------------------------------------------------
@@ -545,6 +547,37 @@ def note_parked(sched: Any, req: Any, *, span: int, total: int) -> int:
         0 if st is None else st.floor, 0 if st is None else st.epoch, forward_ct_of(sched),
     )
     return n
+
+
+def forget_aborted_told(sched: Any, recv_req: Any) -> Optional[dict]:
+    """FIX 5 (NF metal 6, probe 2b lage (a): ``Weg2StoreToldMismatch`` on PP1/PP2 at the lane resume): the front's ``LANE-P-TAKE`` aborts the
+    parked request on every stage; this rank drops what PP0's told left in its ledger for that rid, so the resumed request (same rid, new
+    object) starts from nothing instead of from the first instance's told.  The mechanics, the evidence and the rank-uniformity argument are on
+    :func:`sglang.srt.managers.weg2_store_told.forget_aborted`.
+
+    Only on the lane path (``active()``: switch on, group P, park on) and only when the told form is armed; every other boot returns here
+    without a look at the ledger (R1).  One line when something was dropped.  Returns what was dropped (None = nothing / not armed)."""
+    if not active():
+        return None
+    from sglang.srt.managers import weg2_store_told as _told
+
+    abort_all = bool(getattr(recv_req, "abort_all", False))
+    try:
+        dropped = _told.forget_aborted(sched, getattr(recv_req, "rid", None), abort_all=abort_all)
+    except Exception:  # noqa: BLE001 -- ledger bookkeeping never blocks an abort; a stale entry ends loud (#1400), named by this warning
+        logger.warning("%s FAILED rid=%s: the told ledger of this rank was NOT cleaned", MARK_TOLD_FORGET,
+                       getattr(recv_req, "rid", None), exc_info=True)
+        return None
+    if not dropped:
+        return None
+    n = getattr(sched, "_weg2_lane_told_forget_n", 0) + 1
+    sched._weg2_lane_told_forget_n = n
+    logger.info(
+        "%s n=%d pp=%s rids=%s: the abort took these rids out of the told ledger of this rank (a re-queue under the same rid is a new request "
+        "and must not inherit the first instance's told; early=read-ahead told seen, told=admitted told)",
+        MARK_TOLD_FORGET, n, _pp(sched)[1], dropped,
+    )
+    return dropped
 
 
 @contextmanager
