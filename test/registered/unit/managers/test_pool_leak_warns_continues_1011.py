@@ -40,6 +40,7 @@ register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 PS = 64
 POOL = PS * 64  # 64 pages
 MARKER = "PDFLIP-POOL-LEAK WARN"
+REQ_MARKER = "PDFLIP-REQ-POOL-LEAK WARN"
 
 
 class _Tree:
@@ -184,6 +185,64 @@ class TestStrictLeakWarnsAndContinues1011(CustomTestCase):
         self.assertFalse(leak)
 
 
+def _checker_with_req_slot_leak():
+    """KV ledger balanced, but one request slot is out of the free list and held by nobody
+    (session_held=0): the ``_check_req_pool`` ledger disagrees (free 1 + held 0 != total 2)."""
+    chk, ps = _checker(evictable_tokens=40 * PS)
+    chk.req_to_token_pool.free_slots.pop()
+    return chk, ps
+
+
+class TestReqPoolLeakWarnsAndContinues1011(CustomTestCase):
+    """Review nf-poolleak-1011 R1 finding 1: ``_check_req_pool`` runs in the SAME idle leak pass
+    right after ``_report_leak`` and still raised under STRICT=1 -- the user order ("der
+    Leck-Check darf den Server NIE toeten") must hold for the request-slot ledger too."""
+
+    def test_strict_req_slot_leak_warns_and_does_not_raise(self):
+        """RED WITH THE RAISE BACK: ValueError -> RANK_EXCEPTION."""
+        chk, ps = _checker_with_req_slot_leak()
+        self.assertFalse(chk._check_all_pools(ps)[0], "the KV ledger itself is balanced")
+        with envs.FLLIPER_ENABLE_STRICT_MEM_CHECK_DURING_IDLE.override(True):
+            with self.assertLogs(level=logging.WARNING) as cm:
+                chk._check_req_pool()  # must not raise
+        text = "\n".join(cm.output)
+        self.assertIn(REQ_MARKER, text)
+        self.assertIn("free_slots=1", text)
+        self.assertIn("session_held=0", text)
+        self.assertIn("expected_total=2", text)
+        self.assertIn("req_to_token_pool memory leak detected!", text, "original message stays")
+        self.assertEqual(chk.count_req_pool_leak_warnings, 1)
+
+    def test_non_strict_req_slot_leak_is_the_unchanged_path(self):
+        chk, _ = _checker_with_req_slot_leak()
+        with envs.FLLIPER_ENABLE_STRICT_MEM_CHECK_DURING_IDLE.override(False):
+            with self.assertLogs(level=logging.WARNING) as cm:
+                chk._check_req_pool()
+        text = "\n".join(cm.output)
+        self.assertNotIn(REQ_MARKER, text)
+        self.assertIn("req_to_token_pool memory leak detected!available_size=1", text)
+        self.assertEqual(chk.count_req_pool_leak_warnings, 1)
+
+    def test_balanced_req_pool_reports_nothing_under_strict(self):
+        chk, _ = _checker(evictable_tokens=40 * PS)
+        with envs.FLLIPER_ENABLE_STRICT_MEM_CHECK_DURING_IDLE.override(True):
+            chk._check_req_pool()
+        self.assertEqual(chk.count_req_pool_leak_warnings, 0)
+
+    def test_persistent_req_slot_leak_is_one_line_per_interval(self):
+        chk, _ = _checker_with_req_slot_leak()
+        passes = 2 * LEAK_WARN_LOG_INTERVAL + 5
+        with envs.FLLIPER_ENABLE_STRICT_MEM_CHECK_DURING_IDLE.override(True):
+            with self.assertLogs(level=logging.WARNING) as cm:
+                for _ in range(passes):
+                    chk._check_req_pool()
+        lines = [o for o in cm.output if REQ_MARKER in o]
+        self.assertEqual(len(lines), 3, lines)  # n=1, n=1001, n=2001
+        self.assertEqual(chk.count_req_pool_leak_warnings, passes)
+        self.assertIn("n=1 ", lines[0])
+        self.assertIn(f"n={LEAK_WARN_LOG_INTERVAL + 1} ", lines[1])
+
+
 class TestSchedulerLoopGoesOnAfterALeak1011(CustomTestCase):
     """The REAL ``Scheduler.on_idle`` over a mock ``self``: the leak pass is followed by the
     rest of the idle housekeeping, on every pass, and the loop is never left by an exception."""
@@ -216,6 +275,35 @@ class TestSchedulerLoopGoesOnAfterALeak1011(CustomTestCase):
         self.assertEqual(chk.count_memory_leak_warnings, passes)
         self.assertEqual(sched.maybe_sleep_on_idle.call_count, passes, "the pass ran to its end")
         self.assertEqual(sched.publish_load_snapshot.call_count, passes)
+
+    def test_on_idle_survives_a_req_slot_leak_under_strict_and_finishes_every_pass(self):
+        """KV ledger balanced, request-slot ledger leaking: the idle pass reaches its end."""
+        from flliper.srt.managers.scheduler import Scheduler
+
+        chk, ps = _checker_with_req_slot_leak()
+        sched = self._idle_self(chk, ps)
+        passes = 5
+        with envs.FLLIPER_ENABLE_STRICT_MEM_CHECK_DURING_IDLE.override(True):
+            with self.assertLogs(level=logging.WARNING):
+                for _ in range(passes):
+                    Scheduler.on_idle(sched)  # RED with the raise back: ValueError on pass 1
+        self.assertEqual(chk.count_req_pool_leak_warnings, passes)
+        self.assertEqual(sched.maybe_sleep_on_idle.call_count, passes)
+        self.assertEqual(sched.publish_load_snapshot.call_count, passes)
+
+    def test_on_idle_survives_both_ledgers_leaking_under_strict(self):
+        from flliper.srt.managers.scheduler import Scheduler
+
+        chk, ps = _checker(evictable_tokens=41 * PS)  # KV surplus ...
+        chk.req_to_token_pool.free_slots.pop()  # ... AND a request slot nobody owns
+        sched = self._idle_self(chk, ps)
+        with envs.FLLIPER_ENABLE_STRICT_MEM_CHECK_DURING_IDLE.override(True):
+            with self.assertLogs(level=logging.WARNING) as cm:
+                Scheduler.on_idle(sched)
+        text = "\n".join(cm.output)
+        self.assertIn(MARKER, text)
+        self.assertIn(REQ_MARKER, text)
+        self.assertEqual(sched.maybe_sleep_on_idle.call_count, 1)
 
     def test_on_idle_pays_the_tree_census_only_when_the_line_is_written(self):
         from flliper.srt.managers.scheduler import Scheduler
