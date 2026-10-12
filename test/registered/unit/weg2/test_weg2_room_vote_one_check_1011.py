@@ -15,19 +15,24 @@ THE DEATH. NF int24e @ 6c53a955c7, P log boot_weg2_dkrnfint4h6ablxcw3spmlrhlvwba
     leaves 1->1``, 40136 ``PR AGREED-ABOVE-LOCAL where=loadback need=92352 agreed=140416
     local=19968``, then the traceback ``AgreedRoomShort ... avail=19008 evictable=121408
     evicted=960 avail_after=19968`` -> RANK-DEATH.
-WHAT PAID NODE 181 IN THE VOTE. The old walk's UD branch: its host-child test saw only children
-that were host-only AT VOTE TIME; 194/195 were still device nodes, so the test was vacuously true
--- their demotion by the peel (host-locked) is what blocked the drop. The old BACKUP branch
-(``budget >= tokens``) cannot pay 181 at a host room below 120448 (log: at most 876 of its 1882
-pages had a slot, ~56064 tokens; the vote's actual host_free is unbelegt). So the death shapes
-below run at realistic host rooms (0 and 56064 < X_TOKENS) as well as at a huge one.
+WHAT IS BELEGT: agreed - avail_after = 140416 - 19968 = 120448 = node 181 (the vote counted
+everything reported; the peel paid all but 181); 181 was un-backed + l3_present, its backup
+claim was refused, no UD drop was logged; 194/195 were demoted by the peel after the peel's own
+write-back (``WRITE-BACK DRAIN`` -> ``EVICT backuped=True``) and carried a MAMBA host lock.
+WHAT IS UNBELEGT: why 181 could not drop at the peel. H1: the host lock on the demoted children
+(its timing relative to the pass-top vote is not in the log; ``load_back`` takes its own host
+lock before ``local_pp_room``); H2: 181 in flight in ``ongoing_write_through`` (publish sweep in
+the same pass); H3: the host room the vote priced the backup with. The ``_death_shape`` tests
+below build the children ALREADY backed and ALREADY host-locked at vote time -- that is H1 with
+the lock visible to the vote, which the log does not show (it suggests the children were
+un-backed when the peel began). ``VoteToPeelWindow`` builds the cases the vote cannot see.
 Third instance of "room estimate != peel" (PR 24ed9b508b, PR-ARENA c59353374a, UD-H bff5913a62
-were the earlier special cases).
+were the earlier special cases; Room-Short 1008 is a different mechanism of the same stop).
 
 THE FIX. ``pp_slot_fidelity.device_exit_route`` is the one check; ``estimate_payable`` and
 ``UnifiedRadixCache._evict_device_leaf`` both ask it. The walk carries ``clr`` up the tree
 (``demoted_node_clearable``: a demoted, host-locked child is not clearable, so its parent is not
-droppable); an l3_present node that is droppable leaves the device without an arena claim
+droppable; guaranteed only for the state the vote sees); an l3_present node that is droppable leaves the device without an arena claim
 (L3_DROP). Mutants: the old walk (``_old_estimate_payable``) and the walk with ONLY the
 host-lock term of the clr propagation reverted (``_no_clr_propagation``).
 
@@ -295,7 +300,7 @@ class DeathShape(unittest.TestCase):
             self.assertEqual(walked, delivered, "host_free=%d" % host_free)
 
     def test_mutant_no_clr_propagation_overpays_at_realistic_host_room(self):
-        """RED with ONLY the clr propagation reverted (the proven root): the walk pays X (120448
+        """RED with ONLY the clr propagation reverted (H1 with the lock visible at vote time): the walk pays X (120448
         + parent) although the peel delivers just the two host-locked children (960-style)."""
         for host_free in REALISTIC_HOST_ROOMS + (BIG,):
             t, _ = _death_shape()
@@ -441,6 +446,126 @@ class L3OnlyNode(unittest.TestCase):
             t, p, x = self._tree()
             self.assertEqual(SF.peel_route(t, x), SF.ROUTE_BACKUP)
             self.assertEqual(t.peel(request=X_TOKENS), 0)
+
+
+# ---- the window the vote cannot see ------------------------------------------------------
+class VoteToPeelWindow(unittest.TestCase):
+    """The vote reads the tree at the pass top; the peel runs later in the same pass. A host lock
+    or an in-flight write that appears in between makes the vote over-count. NOT closed by the
+    shared check (UNBELEGT whether it is what killed 092933); ``AgreedRoomShort`` stays the stop
+    and names the window (``vote_payable`` vs ``walk_now``, ``unpaid=[...]``)."""
+
+    AVAIL0 = 19008
+
+    def setUp(self):
+        self._env = mock.patch.dict(os.environ, {SF.ENV: "1"})
+        self._env.start()
+        self.addCleanup(self._env.stop)
+
+    def _unbacked_children_shape(self, **kw):
+        """P (backed) <- X (device, un-backed, l3_present) <- c1 <- c2 (device, UN-BACKED at vote
+        time: the log's reading of 194/195). The peel backs them up (claim_ok for them) and
+        demotes them."""
+        t = _Tree(claim_ok=True, **kw)
+        p = _Node(t.root_node, device=4096)
+        p.component_data[FULL].host_value = list(range(4096))
+        x = _Node(p, device=X_TOKENS, l3=True)
+        c1 = _Node(x, device=CHILD)
+        c2 = _Node(c1, device=CHILD)
+        t.arm()
+        # the claim of X itself is refused (full arena); the children's backups succeed
+        real = t.write_backup
+
+        def write_backup(node, write_back=False, kv_only_if_mamba_refused=False):
+            if node is x:
+                t.claims += 1
+                return 0
+            return real(node, write_back=write_back, kv_only_if_mamba_refused=kv_only_if_mamba_refused)
+
+        t.write_backup = write_backup
+        return t, (p, x, c1, c2)
+
+    def _load_back(self, t, vote_payable):
+        """The real ``local_pp_room`` with PP0's cap = the vote's room."""
+        freed = {"n": 0}
+        t.token_to_kv_pool_allocator = types.SimpleNamespace(available_size=lambda: self.AVAIL0 + freed["n"])
+        t.evictable_size = lambda: 2 * CHILD + X_TOKENS + 4096
+
+        def evict(params):
+            tracker = {FULL: 0}
+            FullComponent._peel(types.SimpleNamespace(cache=t, component_type=FULL),
+                                params.num_tokens, tracker)
+            freed["n"] += tracker[FULL]
+            return types.SimpleNamespace(num_tokens_evicted=tracker[FULL])
+
+        t.evict = evict
+        setattr(t, "weg2_pp_room_cap", self.AVAIL0 + vote_payable)
+        return SF.local_pp_room(t, self.AVAIL0 + 2 * CHILD + 1000, floor=self.AVAIL0)
+
+    def test_unlocked_unbacked_children_the_vote_and_the_peel_agree(self):
+        """No late change: the vote pays children + X (L3 drop after the children are backed up
+        and demoted, nothing locked) and the peel delivers the same."""
+        t, (p, x, c1, c2) = self._unbacked_children_shape()
+        walked = t.vote(host_free=BIG)
+        delivered = t.peel()
+        self.assertEqual(walked, delivered)
+        self.assertEqual(delivered, 2 * CHILD + X_TOKENS + 4096)
+
+    def test_host_lock_after_the_vote_the_stop_fires_and_names_the_window(self):
+        """H1 with a LATE lock: the children are un-backed at vote time (the vote counts them
+        clearable and pays X); between vote and peel a host lock lands on them (e.g. the
+        load-back's own anchor lock). The peel pays only the children: AgreedRoomShort -- the
+        stop is the answer for this window, and its message carries the evidence."""
+        t, (p, x, c1, c2) = self._unbacked_children_shape()
+        walked = t.vote(host_free=BIG)
+        PR.note_vote(t, walked)
+        self.assertEqual(walked, 2 * CHILD + X_TOKENS + 4096, "the vote at the pass top pays X")
+        for c in (c1, c2):   # ... the lock appears after the vote
+            c.component_data[FULL].host_lock_ref = 1
+        with self.assertRaises(SF.AgreedRoomShort) as cm:
+            self._load_back(t, walked)
+        msg = str(cm.exception)
+        self.assertIn("PR AGREED-ROOM SHORT", msg)
+        self.assertIn("vote_payable=%d" % walked, msg)
+        self.assertIn("walk_now=%d" % 0, msg)   # fresh walk after the peel: nothing payable left
+        self.assertIn("%d:%d:children_not_clearable" % (x.id, X_TOKENS), msg)
+
+    def test_write_in_flight_after_the_vote_the_stop_fires_and_names_the_window(self):
+        """H2: X is un-backed and droppable at vote time; a write of X is issued later in the
+        pass (publish sweep). The peel cannot drop it (floor reads ``node_in_flight``)."""
+        t, (p, x, c1, c2) = self._unbacked_children_shape()
+        walked = t.vote(host_free=BIG)
+        PR.note_vote(t, walked)
+        t.ongoing_write_through[x.id] = object()   # issued after the vote
+        with self.assertRaises(SF.AgreedRoomShort) as cm:
+            self._load_back(t, walked)
+        msg = str(cm.exception)
+        self.assertIn("vote_payable=%d" % walked, msg)
+        self.assertIn("%d:%d:write_in_flight" % (x.id, X_TOKENS), msg)
+
+    def test_diagnostic_names_the_locked_demoted_child(self):
+        t, (p, x, c1, c2) = self._unbacked_children_shape()
+        c1.component_data[FULL].host_lock_ref = 1
+        c1.component_data[FULL].host_value = list(range(CHILD))   # backed + host-locked
+        c2.component_data[FULL].host_value = list(range(CHILD))
+        txt = PR.vote_diagnostic(t)
+        self.assertIn("unpaid=[", txt)
+        self.assertIn(":paid_not_clearable:host_locked", txt)
+        self.assertIn("vote_payable=unknown", txt)
+
+    def test_diagnostic_never_breaks_the_stop(self):
+        class Broken:
+            @property
+            def root_node(self):
+                raise RuntimeError("boom")
+        self.assertIn("vote_diagnostic_failed=RuntimeError", PR.vote_diagnostic(Broken()))
+
+    def test_trace_does_not_change_the_walk(self):
+        for seed in range(50):
+            t = _gen(random.Random(30_000 + seed), claim_ok=False)
+            a = t.vote(host_free=0)
+            b = PR.estimate_payable(t, local_floor=True, host_free=0, trace=[])
+            self.assertEqual(a, b, "seed %d" % seed)
 
 
 # ---- the derived check: walk == peel over generated trees ---------------------------------

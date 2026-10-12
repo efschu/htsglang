@@ -189,14 +189,15 @@ def local_pp_room(tree, kv_tokens: int, floor: int, rid=None) -> Optional[bool]:
     elif agreed is not None:
         # the stages agreed this load-back fits; this one cannot pay it. A local
         # refusal would start it on the peers alone (#1004) -- stop by name.
-        from sglang.srt.weg2.pp_room_vote import agreed_short
+        from sglang.srt.weg2.pp_room_vote import agreed_short, vote_diagnostic
 
         n = agreed_short("loadback", rid, kv_tokens, agreed, avail1)
         raise AgreedRoomShort(
             f"PR AGREED-ROOM SHORT rid={rid} kv_tokens={kv_tokens} agreed={agreed} "
             f"avail={avail0} evictable={evictable} evicted={evicted} avail_after={avail1} "
             f"(n={n}): the stages agreed this pass can hold the load-back and this "
-            "stage cannot; refusing alone would start it on the peers only (#1004)"
+            "stage cannot; refusing alone would start it on the peers only (#1004)."
+            + vote_diagnostic(tree)
         )
     else:
         n = _sampled(tree, "_weg2_sf_room_residual")
@@ -275,36 +276,55 @@ def unbacked_drop_allowed(tree, node) -> bool:
 #
 # THE DEATH. PP0's vote paid node 181 (120448 tokens) -- ``agreed=140416 =
 # avail 19008 + reported 121408`` -- and the peel paid 960
-# (``AgreedRoomShort ... evicted=960 avail_after=19968``). Node 181 was a device
-# leaf-to-be, not backed (``backuped=False``) with two device children 194/195
-# (960 tokens, backed). What the log shows (P.log 40117-40135):
-#   * the peel demoted 195 and 194 first (``#1469 EVICT node=195/194
-#     backuped=True``); both carry a MAMBA host lock (``HOSTLOCK-LRU-SKIP
-#     node=195/194 ct=MAMBA host_lock_ref=1``: a load-back reads their host rows);
-#   * node 181 then could neither be backed up (``#1421 BACKUP-REFUSED
-#     why=arena_claim node=181``; the first claim found ``ARENA-DROP need=1006
-#     freed=0``: no free slot, only 876 of its 1882 pages could have had one) nor
-#     dropped (UD-H cannot clear host-locked children);
-#   * ``delivered=960 leaves 1->1``.
-# The OLD walk paid 181 over its UD branch: its host-child test saw only the
-# children that were host-only AT VOTE TIME; 194/195 were still device nodes then,
-# so the test was vacuously true. Their demotion by the peel, host-locked, is what
-# blocked the drop. The old backup branch (``budget >= tokens``) cannot have paid
-# 181 at the realistic host room (<= 56064 tokens; unbelegt: the vote's actual
-# host_free value is not in the log). Ten seconds earlier W3-ARENA SPILL
-# (``released_pages=1882 nodes=1``) had released the node's L2 copy
-# (``l3_present``): that is why it was un-backed and why the arena was full -- a
-# precondition, not the counting error. Third instance of "room estimate !=
-# peel" (PR 24ed9b508b, UD-H bff5913a62 int19, PR-ARENA c59353374a int22): each
-# was patched by one more special case in the walk.
+# (``AgreedRoomShort ... evicted=960 avail_after=19968``).
 #
-# THE ROOT. The walk and the peel read different things for "this node will be
-# gone / clearable once its children left". The walk now carries per node
-# ``clr`` (gone, or a host-only node UD-H could clear afterwards) and a node that
-# the peel DEMOTES counts as clearable only when ``demoted_node_clearable``: no
-# host lock, children clearable. That is the very test ``host_node_local_ok``
-# applies once the node IS host-only. A node's drop (UD / L3) needs all its
-# children ``clr``.
+# BELEGT (P.log of boot ..._6c53a955c7_1011_092933, PP0):
+#   * agreed - avail_after = 140416 - 19968 = 120448 = node 181 exactly: the vote
+#     counted all of ``reported`` and the peel paid everything but 181. The binding
+#     number is PP0's OWN measurement (avail + reported to the token), not a stale
+#     follower fact (that is Room-Short 1008, see below).
+#   * 181: un-backed, ``l3_present`` after ``W3-ARENA SPILL released_pages=1882``
+#     (39846, 09:39:32); at the peel ``#1421 BACKUP-REFUSED why=arena_claim node=181``
+#     x2 (40132-40134, ``ARENA-DROP need=1006 freed=0``); no ``EVICT-UNBACKED-DROP``
+#     (0 in the boot), so the drop did not happen.
+#   * 194/195: their Full and aux host copies left at 09:39:32 (39853/39855
+#     ``AUX-HOST-WITH-FULL ... released=1``). In the death pass the peel ran
+#     ``#1465 WRITE-BACK DRAIN`` -> ``#1469 EVICT node=195/194 backuped=True`` ->
+#     ``HOSTLOCK-LRU-SKIP ct=MAMBA host_lock_ref=1``: the peel's own backup preceded
+#     the demotion (so they were NOT backed when the peel began; whether they were
+#     when the vote ran is unbelegt), and the demoted nodes carried a MAMBA host lock.
+#   * 181's children 194/195 (960 tokens) were paid; ``EVICT-FRONTIER-CENSUS leaves 1->1``.
+#
+# UNBELEGT -- WHY 181 COULD NOT LEAVE AT THE PEEL. The log does not name it. Candidates:
+#   H1  the demoted children carried a host lock (``HOSTLOCK-LRU-SKIP``), so UD-H could not
+#       clear them and 181 could not drop. WHEN the lock appeared (before or after the vote)
+#       is not in the log. Code fact: ``load_back`` takes ``inc_host_lock_ref`` of its own
+#       anchor (unified_radix_cache.py:6781) BEFORE ``local_pp_room`` (6905), i.e. after the
+#       pass-top vote; whether 194/195 lie on that anchor path is unbelegt.
+#   H2  181 was in ``ongoing_write_through`` at the peel (``PUBLISH-SWEEP unbacked=3
+#       issued=3`` in the same pass, 40101; node ids not logged; the analysis report's own
+#       hypothesis) -- the drop floor reads ``node_in_flight``.
+#   H3  the host room the vote priced a backup with was spent/refused (host_free unbelegt).
+# What this commit guarantees: for the tree state the vote SEES (pass top) the vote and the
+# peel ask ONE function; a fresh walk equals the peel then (property tests). It does NOT
+# close a state change between the vote and the peel (H1 with a late lock, H2 with a late
+# write): the vote then over-counts, and ``AgreedRoomShort`` stays the stop for it. The stop
+# now prints ``vote_payable`` next to ``walk_now`` and the refused nodes
+# (``pp_room_vote.vote_diagnostic``): the next occurrence names the window instead of a guess.
+#
+# Earlier instances of "room estimate != peel": PP-ROOM-VOTE 24ed9b508b (int19 13:37:49 PP2),
+# UD-H bff5913a62 (int19), PR-ARENA c59353374a (int22 18:34:20 PP1); and a different
+# mechanism of the same stop, Room-Short 1008 (desk/nf-room-short-1008): a FOLLOWER's fact
+# goes stale (``FACT_MAX_AGE_PASSES=8``; ``RoomBook.cap`` subtracts only PP0-started batches),
+# counted as ``PR AGREED-ABOVE-LOCAL where=pass`` (5 of them, 64-128 tokens on PP1/PP2 in
+# this boot, none fatal). This commit does not touch it.
+#
+# WHAT THE WALK DOES NOW. It carries per node ``clr`` (gone, or a host-only node UD-H could
+# clear afterwards); a node the peel DEMOTES counts as clearable only when
+# ``demoted_node_clearable``: no host lock, children clearable -- the test
+# ``host_node_local_ok`` applies once the node IS host-only; a node's drop (UD / L3) needs
+# all its children ``clr``. (Not proven to be the cause of 092933, but it is the rule the
+# peel applies; the walk must not count what that rule refuses.)
 #
 # THE RULE. A device leaf leaves the device by exactly one of these routes, and
 # BOTH sides ask this one function (the peel with ``host_room=None``: the claim
@@ -319,9 +339,9 @@ def unbacked_drop_allowed(tree, node) -> bool:
 #            nobody; the peel tries it, the vote prices it by ``host_room``. The
 #            vote does not price a claim for an l3_present node (conservative:
 #            its slots were freed by the spill under claim pressure; a payable
-#            under-count only refuses, an over-count kills). This is NOT the
-#            proven cause of 092933 (that is the ``clr`` propagation above); it
-#            is kept so the L3 route is the one the vote offers such a node.
+#            under-count only refuses, an over-count kills). Not a proven cause of
+#            092933 (H3 above is unbelegt); kept so the L3 route is the one the
+#            vote offers such a node.
 #   UD_DROP  not backed, claim refused: dropped on the local-PP floor (UD / UD-H).
 #   DELETE   write_through: deleted, only without surviving children (#841).
 #
@@ -390,6 +410,24 @@ def device_exit_route(node, *, write_back: bool, local_floor: bool, ongoing, hos
     if not l3 and int(host_room) >= int(tokens):
         return ROUTE_BACKUP
     return ROUTE_UD_DROP if droppable else None
+
+
+def route_refusal(node, *, write_back: bool, local_floor: bool, ongoing, children_clearable: bool,
+                  surviving_children: bool) -> str:
+    """Why :func:`device_exit_route` returned None (diagnostics only): the terms of the
+    refusal, '+'-joined."""
+    if not write_back:
+        return "write_through_with_children" if surviving_children else "none"
+    why = []
+    if not local_floor:
+        why.append("no_local_floor")
+    if node_in_flight(ongoing, node):
+        why.append("write_in_flight")
+    if node_host_locked(node):
+        why.append("host_locked")
+    if not children_clearable:
+        why.append("children_not_clearable")
+    return "+".join(why) or "none"
 
 
 def peel_route(tree, node, *, host_room: Optional[int] = None) -> Optional[str]:
