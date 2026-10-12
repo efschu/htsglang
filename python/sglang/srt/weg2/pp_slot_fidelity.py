@@ -275,17 +275,36 @@ def unbacked_drop_allowed(tree, node) -> bool:
 #
 # THE DEATH. PP0's vote paid node 181 (120448 tokens) -- ``agreed=140416 =
 # avail 19008 + reported 121408`` -- and the peel paid 960
-# (``AgreedRoomShort ... evicted=960 avail_after=19968``). 10 s before, the W3
-# arena spill had released node 181's L2 copy for a 64-page claim (``released_pages=1882
-# nodes=1``, the node stays on the device, ``l3_present``). The vote priced its
-# leaving as a BACKUP into the arena slots that very spill had just freed
-# (``backup_room_tokens``); the peel's real claim was refused
-# (``#1421 BACKUP-REFUSED why=arena_claim node=181``) and the drop (UD) did not
-# apply (its host-only children could not be cleared: one test in the vote's
-# walk, another in the peel). Third instance of "room estimate != peel" after PR
-# (24ed9b508b, the walk paid a node the peel could not) and PR-ARENA
-# (c59353374a, the walk read the arena's gauge, not its free slots); each was
-# patched by one more special case in the walk.
+# (``AgreedRoomShort ... evicted=960 avail_after=19968``). Node 181 was a device
+# leaf-to-be, not backed (``backuped=False``) with two device children 194/195
+# (960 tokens, backed). What the log shows (P.log 40117-40135):
+#   * the peel demoted 195 and 194 first (``#1469 EVICT node=195/194
+#     backuped=True``); both carry a MAMBA host lock (``HOSTLOCK-LRU-SKIP
+#     node=195/194 ct=MAMBA host_lock_ref=1``: a load-back reads their host rows);
+#   * node 181 then could neither be backed up (``#1421 BACKUP-REFUSED
+#     why=arena_claim node=181``; the first claim found ``ARENA-DROP need=1006
+#     freed=0``: no free slot, only 876 of its 1882 pages could have had one) nor
+#     dropped (UD-H cannot clear host-locked children);
+#   * ``delivered=960 leaves 1->1``.
+# The OLD walk paid 181 over its UD branch: its host-child test saw only the
+# children that were host-only AT VOTE TIME; 194/195 were still device nodes then,
+# so the test was vacuously true. Their demotion by the peel, host-locked, is what
+# blocked the drop. The old backup branch (``budget >= tokens``) cannot have paid
+# 181 at the realistic host room (<= 56064 tokens; unbelegt: the vote's actual
+# host_free value is not in the log). Ten seconds earlier W3-ARENA SPILL
+# (``released_pages=1882 nodes=1``) had released the node's L2 copy
+# (``l3_present``): that is why it was un-backed and why the arena was full -- a
+# precondition, not the counting error. Third instance of "room estimate !=
+# peel" (PR 24ed9b508b, UD-H bff5913a62 int19, PR-ARENA c59353374a int22): each
+# was patched by one more special case in the walk.
+#
+# THE ROOT. The walk and the peel read different things for "this node will be
+# gone / clearable once its children left". The walk now carries per node
+# ``clr`` (gone, or a host-only node UD-H could clear afterwards) and a node that
+# the peel DEMOTES counts as clearable only when ``demoted_node_clearable``: no
+# host lock, children clearable. That is the very test ``host_node_local_ok``
+# applies once the node IS host-only. A node's drop (UD / L3) needs all its
+# children ``clr``.
 #
 # THE RULE. A device leaf leaves the device by exactly one of these routes, and
 # BOTH sides ask this one function (the peel with ``host_room=None``: the claim
@@ -297,10 +316,12 @@ def unbacked_drop_allowed(tree, node) -> bool:
 #            made or priced. Same legality as the UD drop (local-PP floor, no write
 #            in flight, host-only subtree clearable).
 #   BACKUP   not backed, write_back: a claim into the host room. Certain for
-#            nobody; the peel tries it, the vote prices it by ``host_room``. NOT
-#            for an l3_present node in the vote: its slots were released by the
-#            tree itself under claim pressure, pricing a re-claim of them is the
-#            092933 over-count.
+#            nobody; the peel tries it, the vote prices it by ``host_room``. The
+#            vote does not price a claim for an l3_present node (conservative:
+#            its slots were freed by the spill under claim pressure; a payable
+#            under-count only refuses, an over-count kills). This is NOT the
+#            proven cause of 092933 (that is the ``clr`` propagation above); it
+#            is kept so the L3 route is the one the vote offers such a node.
 #   UD_DROP  not backed, claim refused: dropped on the local-PP floor (UD / UD-H).
 #   DELETE   write_through: deleted, only without surviving children (#841).
 #
@@ -324,6 +345,15 @@ def host_node_local_ok(node) -> bool:
         return False
     return not any(int(getattr(cd, "lock_ref", 0) or 0) > 0 or int(getattr(cd, "host_lock_ref", 0) or 0) > 0
                    for cd in (getattr(node, "component_data", None) or ()))
+
+
+def demoted_node_clearable(node, children_clearable: bool) -> bool:
+    """A device node the peel DEMOTES (backed) is, afterwards, a host-only node:
+    UD-H of its parent may clear it iff ``host_node_local_ok`` then holds -- no
+    host lock (a load-back reads its host rows) and its children clearable. The
+    vote's walk asks this where the peel will ask ``host_node_local_ok`` (int24e
+    092933: nodes 194/195, demoted, MAMBA host_lock_ref=1, blocked 181's drop)."""
+    return bool(children_clearable) and not node_host_locked(node)
 
 
 def host_children_clearable(node) -> bool:
