@@ -29,8 +29,11 @@ its FREE slots, PR-ARENA int22), spilled to L3 and dropped without a claim
 (ROOM-VOTE 1011), or dropped on the local-PP floor (UD/UD-H: no write-through in
 flight, host-only children clearable); a locked node or an unpayable child stops
 its whole chain. HOW a node leaves is decided by ONE function the peel asks too
-(``pp_slot_fidelity.device_exit_route``; int24e 09:39:42Z: the vote paid a spilled
-node the peel could not -- ``AgreedRoomShort``). It is capped by PW's measured wall
+(``pp_slot_fidelity.device_exit_route``), and whether a node's children let it be
+dropped is carried up the walk (``clr``: a demoted, host-locked child is NOT
+clearable; int24e 09:39:42Z: the vote paid node 181 over its UD branch because its
+children, demoted by the peel and host-locked, still looked clearable --
+``AgreedRoomShort``). It is capped by PW's measured wall
 (``payable_evictable_or``). The walk is O(nodes) (86 nodes on PP2 at 13:37:49) and
 its time rides the fact (``sim_us``).
 
@@ -148,7 +151,7 @@ def estimate_payable(tree, *, local_floor: bool, host_free: int) -> int:
         elif route in sf.DROP_ROUTES:
             state[id(n)] = (paid + tokens, True, True)  # gone: nothing hangs below it
         else:  # demoted / backed up: a host-only node afterwards
-            state[id(n)] = (paid + tokens, True, children_clr and not sf.node_host_locked(n))
+            state[id(n)] = (paid + tokens, True, sf.demoted_node_clearable(n, children_clr))
     return sum(state[id(c)][0] for c in root.children.values() if id(c) in state)
 
 

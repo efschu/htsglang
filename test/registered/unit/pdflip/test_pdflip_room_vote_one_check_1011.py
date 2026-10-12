@@ -2,25 +2,34 @@
 """ROOM-VOTE 1011: the PP room vote and the peel ask ONE evictability check.
 
 THE DEATH. NF int24e @ 6c53a955c7, P log boot_weg2_dkrnfint4h6ablxcw3spmlrhlvwbar1dauer10110929_
-6c53a955c7_1011_092933.P.log, PP0 09:39:42Z (lines 40125-40177):
-  * 09:39:32 (39845-39846) ``W3-ARENA SPILL n=8 need=64 released_pages=1882 nodes=1`` -- the
-    spill takes node 181 (120448 tokens) its L2 copy; the node stays on the device,
-    ``l3_present``, not backed (backup_room_tokens now reads the freed slots as host room);
-  * 09:39:42 (40132-40134) ``#1421 BACKUP-REFUSED why=arena_claim node=181 tokens=120448`` x2
-    (try + retry), no EVICT-UNBACKED-DROP, no UD-H (0 in the whole boot);
+6c53a955c7_1011_092933.P.log, PP0 09:39:42Z (lines 40117-40177):
+  * 09:39:32 (39846) ``W3-ARENA SPILL n=8 need=64 released_pages=1882 nodes=1`` -- the spill
+    takes node 181 (120448 tokens) its L2 copy; the node stays on the device, ``l3_present``,
+    not backed. That is why it is un-backed and why the arena is full -- a precondition;
+  * 40117-40124 the peel demotes its device children 195 and 194 (``#1469 EVICT node=195/194
+    backuped=True``); both carry a MAMBA host lock (``HOSTLOCK-LRU-SKIP ... host_lock_ref=1``);
+  * 40125 ``#1427 ARENA-DROP n=77 need=1006 freed=0`` (no free arena slot), 40132-40134
+    ``#1421 BACKUP-REFUSED why=arena_claim node=181 tokens=120448`` x2; no UD drop (UD-H cannot
+    clear host-locked children);
   * 40135 ``EVICT-FRONTIER-CENSUS request=73344 delivered_before=960 reported_evictable=120448
-    on_frontier=120448 leaves 1->1``, 40136 ``PR AGREED-ABOVE-LOCAL where=loadback need=92352
-    agreed=140416 local=19968``, 40137ff the traceback ``AgreedRoomShort ... avail=19008
-    evictable=121408 evicted=960 avail_after=19968`` -> RANK-DEATH.
-The vote (``agreed = avail 19008 + reported 121408``) priced node 181 as a backup into the slots
-its own spill had freed; the peel's real claim was refused and the node stayed (its host-only
-children -- demoted by this very peel, host-locked -- blocked the UD drop; WHICH of the two
-blockers it was is not readable from the log: unverified). Third instance of "room estimate !=
-peel" (PR 24ed9b508b, PR-ARENA c59353374a, UD-H bff5913a62 were the earlier special cases).
+    leaves 1->1``, 40136 ``PR AGREED-ABOVE-LOCAL where=loadback need=92352 agreed=140416
+    local=19968``, then the traceback ``AgreedRoomShort ... avail=19008 evictable=121408
+    evicted=960 avail_after=19968`` -> RANK-DEATH.
+WHAT PAID NODE 181 IN THE VOTE. The old walk's UD branch: its host-child test saw only children
+that were host-only AT VOTE TIME; 194/195 were still device nodes, so the test was vacuously true
+-- their demotion by the peel (host-locked) is what blocked the drop. The old BACKUP branch
+(``budget >= tokens``) cannot pay 181 at a host room below 120448 (log: at most 876 of its 1882
+pages had a slot, ~56064 tokens; the vote's actual host_free is unverified). So the death shapes
+below run at realistic host rooms (0 and 56064 < X_TOKENS) as well as at a huge one.
+Third instance of "room estimate != peel" (PR 24ed9b508b, PR-ARENA c59353374a, UD-H bff5913a62
+were the earlier special cases).
 
 THE FIX. ``pp_slot_fidelity.device_exit_route`` is the one check; ``estimate_payable`` and
-``UnifiedRadixCache._evict_device_leaf`` both ask it. An l3_present node leaves the device
-without an arena claim (L3_DROP); the vote never prices a re-claim for it.
+``UnifiedRadixCache._evict_device_leaf`` both ask it. The walk carries ``clr`` up the tree
+(``demoted_node_clearable``: a demoted, host-locked child is not clearable, so its parent is not
+droppable); an l3_present node that is droppable leaves the device without an arena claim
+(L3_DROP). Mutants: the old walk (``_old_estimate_payable``) and the walk with ONLY the
+host-lock term of the clr propagation reverted (``_no_clr_propagation``).
 
 Driven through the REAL ``estimate_payable``, ``_evict_device_leaf``, ``_ud_clear_host_children``,
 ``_l3_drop_leaf``, ``FullComponent._peel`` and ``local_pp_room``; the tree's I/O steps are stubs.
@@ -229,6 +238,16 @@ def _old_estimate_payable(tree, *, local_floor, host_free):
     return sum(state[id(c)][0] for c in root.children.values() if id(c) in state)
 
 
+def _no_clr_propagation():
+    """MUTANT: only the clr propagation reverted -- a demoted node counts as clearable
+    whatever its host lock says (the vote's walk as the old host-child test saw it)."""
+    return mock.patch.object(SF, "demoted_node_clearable", lambda node, children_clearable: bool(children_clearable))
+
+
+# the vote's host room: realistic values (an arena that is full / a few slots free) and a huge one
+REALISTIC_HOST_ROOMS = (0, 56064)
+
+
 # ---- the 092933 shape ---------------------------------------------------------------------
 X_TOKENS = 120448   # 'tokens=120448'
 CHILD = 4096
@@ -265,6 +284,34 @@ class DeathShape(unittest.TestCase):
         self.assertGreaterEqual(t.claims, 1, "the peel still TRIES the claim for the blocked node")
         self.assertEqual(t.dropped, [])
 
+    def test_realistic_host_room_vote_and_peel_agree(self):
+        """The log's shape: the vote's host room is BELOW the node (full arena). Walk == peel."""
+        for host_free in REALISTIC_HOST_ROOMS:
+            self.assertLess(host_free, X_TOKENS)
+            t, _ = _death_shape()
+            walked = t.vote(host_free=host_free)
+            delivered = t.peel()
+            self.assertEqual(delivered, 2 * CHILD, host_free)
+            self.assertEqual(walked, delivered, "host_free=%d" % host_free)
+
+    def test_mutant_no_clr_propagation_overpays_at_realistic_host_room(self):
+        """RED with ONLY the clr propagation reverted (the proven root): the walk pays X (120448
+        + parent) although the peel delivers just the two host-locked children (960-style)."""
+        for host_free in REALISTIC_HOST_ROOMS + (BIG,):
+            t, _ = _death_shape()
+            with _no_clr_propagation():
+                mutant = t.vote(host_free=host_free)
+            delivered = t.peel()
+            self.assertEqual(mutant, 2 * CHILD + X_TOKENS + 4096, "host_free=%d" % host_free)
+            self.assertGreater(mutant, delivered, "host_free=%d" % host_free)
+
+    def test_mutant_old_counting_overpays_at_realistic_host_room(self):
+        """RED on 6c53a955c7 at host rooms below the node (UD branch, children seen as device)."""
+        for host_free in REALISTIC_HOST_ROOMS:
+            t, _ = _death_shape()
+            old = _old_estimate_payable(t, local_floor=True, host_free=host_free)
+            self.assertGreater(old, t.peel(), "host_free=%d" % host_free)
+
     def test_mutant_old_counting_overpays_the_node(self):
         """RED on 6c53a955c7: the old walk counts X (backup priced by the freed slots)."""
         t, _ = _death_shape()
@@ -278,7 +325,7 @@ class DeathShape(unittest.TestCase):
         Old counting -> AgreedRoomShort (the 092933 text); shared check -> a named refusal."""
         avail0 = 19008
 
-        def run(estimate):
+        def run(estimate, host_free=BIG, mutant=None):
             t, _ = _death_shape()
             freed = {"n": 0}
             alloc = types.SimpleNamespace(available_size=lambda: avail0 + freed["n"])
@@ -293,7 +340,8 @@ class DeathShape(unittest.TestCase):
                 return types.SimpleNamespace(num_tokens_evicted=tracker[FULL])
 
             t.evict = evict
-            room = avail0 + estimate(t, local_floor=True, host_free=BIG)
+            with (mutant() if mutant else mock.MagicMock()):
+                room = avail0 + estimate(t, local_floor=True, host_free=host_free)
             setattr(t, "pdflip_pp_room_cap", room)  # PP0's cap R_m = the vote's room
             need = avail0 + 2 * CHILD + 1000     # more than the peel can pay, less than the old room
             return SF.local_pp_room(t, need, floor=avail0), t, room
@@ -305,6 +353,15 @@ class DeathShape(unittest.TestCase):
         verdict, t, room = run(PR.estimate_payable)
         self.assertEqual(room, avail0 + 2 * CHILD)
         self.assertIs(verdict, False, "agreed R_m < need: every stage refuses, no stop")
+        for host_free in REALISTIC_HOST_ROOMS:
+            # realistic host room: the walk without the clr propagation dies the 092933 death ...
+            with self.assertRaises(SF.AgreedRoomShort) as cm:
+                run(PR.estimate_payable, host_free=host_free, mutant=_no_clr_propagation)
+            self.assertIn("PR AGREED-ROOM SHORT", str(cm.exception))
+            # ... the shared check does not
+            verdict, t, room = run(PR.estimate_payable, host_free=host_free)
+            self.assertEqual(room, avail0 + 2 * CHILD)
+            self.assertIs(verdict, False)
 
     def test_clearable_children_let_the_node_leave_without_a_claim(self):
         """Same shape, the children's host copies NOT locked: UD-H clears them, X is dropped (L3).
