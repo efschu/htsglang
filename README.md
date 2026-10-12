@@ -6,11 +6,11 @@ project is called fLLiper from release 0.1.0 on. The Python package is `flliper`
 `FLLIPER_*`, the P/D-flip subsystem is `pdflip` (`FLLIPER_PDFLIP_*`, `--pdflip-*`, log markers `PDFLIP-*`).
 
 > **Status: release candidate RC3.** Release 0.1.0 is prepared in the repository. RC3 is the state of the integration branches
-> `desk/flliper-27b-int-1014` (27B line) and `desk/flliper-nf-int-1013` (Flash-Next line): RC2 (the vision rebuild: the vision tower
+> `desk/flliper-27b-int-1015` (27B line) and `desk/flliper-nf-int-1014` (Flash-Next line): RC2 (the vision rebuild: the vision tower
 > borrows weights instead of KV, standard in the 27B release profiles, not on the NF line; plus the post-vision fixes of both lines) plus the
 > pool-leak fix (the idle leak check warns instead of killing the server), the wedge instrument, the W17 host-pressure line and, on the NF line,
-> the room-vote and the D-WALL-HEAD class fix, with the catalog `e0a35ed0...` (2705 entries, 136 edges). RC3 is **not** the final 0.1.0:
-> acceptance boots on the metal are open and the pool-leak fix itself is not proven on the metal (release notes, section 5). The image is
+> the room-vote and the D-WALL-HEAD class fix, with the catalog `9e2267e9...` (2705 entries, 136 edges). RC3 is **not** the final 0.1.0:
+> acceptance boots on the metal are open (no fLLiper image has booted); the pool-leak fix has metal evidence only from images of the old name (release notes, section 5). The image is
 > **not published** yet; pushing the tree to `github.com/efschu/fLLiper` and the image to `ghcr.io` are user gates.
 
 ## What is in it
