@@ -2871,7 +2871,35 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             result = self.insert(insert_params)
 
             # Free unaligned tail (the tail hand-off above has its rows)
-            self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
+            #
+            # POOL-LEAK ROOT 11.10. (nf-poolleak-wurzel-1011): NEVER BELOW THE
+            # TREE-OWNED PREFIX. A P chunked-prefill PARK (process_pending_pdflip_park
+            # -> release_kv_cache(is_insert=True)) finishes a request whose
+            # committed length equals its last chunk end. cache_unfinished_req
+            # filed that chunk with the EXACT bigram key (next prompt token, N
+            # units) and moved `cache_protected_len` to N; this finish key is
+            # built from the committed ids alone, so under bigram keys it has N-1
+            # units and page alignment drops the WHOLE last page. The tail free
+            # below then handed that page -- already owned by the tree node of
+            # the previous insert -- to the free list: one page in the tree AND
+            # on the free list (+64 tokens in the idle ledger, a later alloc can
+            # hand it to a second owner). Same premise as the truncation branch
+            # above (`free_start = max(effective_cache_len, cache_protected_len)`):
+            # what lies below the protected length is the tree's, not ours.
+            #
+            # FLOOR, NOT CEIL (planer-nfpoolleak-1011 review): the tree files only
+            # whole pages, so it owns [0, floor_page(cache_protected_len)). The
+            # tail [floor_page(cpl), cpl) of a NON-aligned cpl (writers other
+            # than cache_unfinished_req -- truncate_prefix_to, the PP-admission
+            # stamps -- may leave one; the assert in cache_unfinished_req allows
+            # cpl up to page_size-1 above the tree-owned length) is the
+            # request's own page: rounding UP would skip that page and leak it.
+            # For the park case cpl == N is page aligned and floor == ceil.
+            _tail_free_start = max(
+                page_aligned_len,
+                int(req.cache_protected_len or 0) // self.page_size * self.page_size,
+            )
+            self.token_to_kv_pool_allocator.free(kv_indices[_tail_free_start:])
             if _PDFLIP_END_ANCHOR:
                 # fnFL2 H63d: the probe asks for the anchor at or below N-1 of
                 # the PROMPT, not of the retained key -- on the truncated ids
