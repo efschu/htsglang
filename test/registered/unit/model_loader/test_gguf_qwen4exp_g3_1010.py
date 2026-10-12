@@ -345,7 +345,11 @@ def test_indexer_halves_fuse_q_rows_then_k_rows(tiny):
     base = "mtp.layers.0.self_attn.indexer.index_qk_proj"
     assert not any(".__q" in n or ".__k" in n for n in out)
     assert int(out[base + ".qweight_type"].item()) == int(Q.BF16)
-    assert np.array_equal(out[base + ".qweight"].numpy(), bf16_bytes(ref.t["idx"]))
+    fused = out[base + ".qweight"]
+    # G14: BF16 arrives as bf16 VALUES of the element shape (was: the raw uint8 payload, the metal shape error), the draft's
+    # indexer included -- its payload bytes are unchanged
+    assert fused.dtype == torch.bfloat16 and fused.shape[1] == H
+    assert np.array_equal(fused.contiguous().view(torch.uint8).numpy(), bf16_bytes(ref.t["idx"]))
 
 
 def test_experts_of_the_draft_block_go_to_mtp_layers_0(tiny):

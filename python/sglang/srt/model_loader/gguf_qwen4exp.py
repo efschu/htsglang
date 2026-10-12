@@ -1084,6 +1084,9 @@ class Qwen4ExpGGUFAdapter(Qwen35GGUFAdapter):
             slot[half] = weight
             if len(slot) == 2:
                 # converter L156-L157: q = rows [:n_q], k = rows [n_q:]
+                # G14: both halves are BF16 VALUES here (the iterator views the unquantized payload in its own dtype,
+                # weight_utils.gguf_quant_weights_iterator), so this cat is [640, 2560] bf16. Until G14 it was uint8
+                # [640, 5120] (raw bytes) and the first forward through index_qk_proj died on the metal.
                 yield key + _FINAL, torch.cat([slot["q"], slot["k"]], dim=0)
                 del idx_data[key]
 

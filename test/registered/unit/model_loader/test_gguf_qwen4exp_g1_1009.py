@@ -470,12 +470,15 @@ def test_indexer_fusion_is_q_rows_then_k_rows_with_one_type_marker(tiny):
     assert int(out[base + ".qweight_type"].item()) == int(Q.BF16)
     fused = out[base + ".qweight"]
     n_q = IDX_HEADS * IDX_DIM
-    assert fused.shape[0] == n_q + IDX_DIM
-    want = bf16_bytes(ref.t["l3.idx"])  # q rows first, then k rows
-    assert np.array_equal(fused.numpy(), want)
+    # G14: a BF16 tensor arrives as bf16 VALUES of the element shape [640, 2560] (the metal shape error was uint8
+    # [640, 5120] = the raw payload). This test pinned the bytes and never ran apply; the apply test is
+    # test_gguf_g14_bf16_dense_payload_1012.py
+    assert fused.dtype == torch.bfloat16 and tuple(fused.shape) == (n_q + IDX_DIM, H)
+    want = bf16_bytes(ref.t["l3.idx"])  # q rows first, then k rows (the GGUF payload)
+    assert np.array_equal(fused.contiguous().view(torch.uint8).numpy(), want)
     # swapped halves must not pass
     swapped = bf16_bytes(torch.cat([ref.t["l3.idx"][n_q:], ref.t["l3.idx"][:n_q]]))
-    assert not np.array_equal(fused.numpy(), swapped)
+    assert not np.array_equal(fused.contiguous().view(torch.uint8).numpy(), swapped)
 
 
 def test_hyper_connection_tensors_load_as_dense_module_params(tiny):

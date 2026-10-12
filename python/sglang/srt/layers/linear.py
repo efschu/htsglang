@@ -370,6 +370,25 @@ def _quant_block_aligned_units(
 
 
 
+def _gguf_input_dim_units(wtype, loaded_weight: torch.Tensor) -> Tuple[int, int]:
+    """``(block_size, type_size)`` of the input dim of a GGUF qweight.
+
+    A quantized tensor is block BYTES (uint8): ``GGML_QUANT_SIZES``. An
+    UNQUANTIZED F16/BF16/F32 tensor that reached this module as real values
+    (the iterator hands it over in its own dtype and element shape, G14) has
+    one element per unit: reading its element count as bytes would halve the
+    input width (``GGML_QUANT_SIZES[BF16]`` is ``(1, 2)``)."""
+    import gguf as _gguf
+
+    if loaded_weight.dtype != torch.uint8 and wtype in (
+        _gguf.GGMLQuantizationType.F32,
+        _gguf.GGMLQuantizationType.F16,
+        _gguf.GGMLQuantizationType.BF16,
+    ):
+        return 1, 1
+    return _gguf.GGML_QUANT_SIZES[wtype]
+
+
 def _declare_gguf_src_rows(param, shard_id, components) -> None:
     """G1 (weg2 exchange): record which checkpoint rows this rank copied for a
     GGUF shard -- ``(component, full rows, row start, rows)`` per component, in
@@ -2191,7 +2210,7 @@ class RowParallelLinear(LinearBase):
                 import gguf as _gguf
 
                 wtype = _gguf.GGMLQuantizationType(self.qweight_type.weight_type)
-                block_size, type_size = _gguf.GGML_QUANT_SIZES[wtype]
+                block_size, type_size = _gguf_input_dim_units(wtype, loaded_weight)
                 total_bytes = loaded_weight.shape[input_dim]
                 in_features = total_bytes // type_size * block_size
                 my_elems = tp_partition_size(
