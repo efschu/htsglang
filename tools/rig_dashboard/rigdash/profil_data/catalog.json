@@ -85857,15 +85857,15 @@
   "curated": 121,
   "unexplained": 601
  },
- "tree_rev": "27b=a6115ca656+nf=b6c426cb5c",
+ "tree_rev": "27b=d067897349+nf=d0db2b8b76",
  "trees": {
   "27b": {
    "entries": 2642,
-   "rev": "a6115ca656"
+   "rev": "d067897349"
   },
   "nf": {
    "entries": 2507,
-   "rev": "b6c426cb5c"
+   "rev": "d0db2b8b76"
   }
  },
  "warnungen": []
