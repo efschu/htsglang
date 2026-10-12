@@ -33,8 +33,14 @@ load-back of ``schedule_policy.add_one_req`` has an exit AFTER the group ADMIT t
 rank-local -- a worker whose load-back finds no device room returns NO_TOKEN alone
 (WEG2-LOADBACK-WAIT) while the host admits. ``HolPass.head`` is then set on that worker
 only; with the group MIN entered "iff the head is queued" only the workers entered it and
-the host went on into the forward -- the 3-rank picture of the 11.10. 10:25:45Z D hang
-(TP0 in the extend forward, TP1/TP2 inside the admission pass). So now EVERY rank enters
+the host went on into the forward -- that is the 3-rank picture of the 11.10. 10:25:45Z D hang
+(TP0 in the extend forward, TP1/TP2 inside the admission pass), READ as a possible hang
+shape, UNBELEGT as its cause: on a Form A group (NF D, ``--rank-role host,worker,worker``)
+the extend-set riegel (H105, ``FormAAdmissionSplit`` in tp_match_floor.py) runs in the
+admission pass BEFORE this MIN, so a worker whose extend set lacks the host's rid raises
+there and never reaches the MIN; for weg2-0-15 the analysis
+(deskq/done/nf-haenger-admission-wedge-1011.md) rules this path out (host_hit=0). The shape
+applies off Form A or behind a missing riegel. So now EVERY rank enters
 the MIN once per pass (``pick_unservable_head`` is called whenever D-HOL is on, a
 replicated condition) and the local verdict -- "I have a head, it is queued, my wall says
 unservable" plus a 24-bit tag of the head's rid -- is the payload. The answer is taken
