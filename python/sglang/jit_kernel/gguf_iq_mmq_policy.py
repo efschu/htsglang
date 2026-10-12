@@ -10,6 +10,11 @@ What lives here (so desk tests drive every branch without a GPU and ``gguf.py`` 
 The kernels themselves are ``csrc/gguf_iq_mmq/`` (sglang PR #36122, vendored, see the file heads) and the JIT glue is
 ``gguf_iq_mmq.py``.
 
+G12 (2026-10-12) -- IQ3_S on the decode / dequant paths. The sgl-kernel WHEEL (ggml_dequantize, dense MMVQ, MoE moe_vec) decodes IQ3_S
+with ggml's pre-final ``iq3xs_grid`` (grid value 15 -> 15.5, +3.3 % on ~1/8 of the weights; the JIT kernels were fixed in G11). A wheel built
+from the G12 source carries the marker op ``ggml_iq3s_grid_ggml`` (``IQ3S_WHEEL_MARKER_OP``); a wheel without it must not be used for IQ3_S:
+``iq3s_wheel_blocked`` is the rule, the routing it implies (JIT MMQ for every M, torch dequant above M = 16) lives in srt/layers/quantization/gguf.py.
+
 Switches (both new, listed in the G6 report):
 
     SGLANG_GGUF_IQ_MMQ                       default ON  -- ``0`` switches the IQ MMQ kernels off (every shape then takes
@@ -128,6 +133,34 @@ def blackwell_refusal(
         f"sources carry the #28784 __byte_perm workaround, not yet proven on this rig; set {ENV_FIX_VERIFIED}=1 to "
         f"run the metal test, otherwise the MoE stays on moe_vec"
     )
+
+
+#: G12: op registered by the sgl-kernel build whose IQ3_S kernels use the ggml-format grid (csrc/quantization/gguf/iq3s_grid_ggml.cuh).
+IQ3S_WHEEL_MARKER_OP = "ggml_iq3s_grid_ggml"
+#: G12: the named load line when the wheel lacks the marker and IQ3_S is routed to the JIT kernels / torch dequant.
+IQ3S_DECODE_LOAD_LINE = "IQ3_S decode via JIT (wheel grid off by one)"
+
+
+def iq3s_wheel_blocked(type_id: int, wheel_grid_fixed: bool) -> bool:
+    """G12: True when ``type_id`` is IQ3_S and the installed sgl-kernel wheel lacks the ggml-grid marker (so its IQ3_S kernels are wrong)."""
+    return int(type_id) == IQ3_S and not wheel_grid_fixed
+
+
+def dense_iq3s_window_ok(num_tokens: int) -> bool:
+    """G12: dense IQ3_S through the JIT MMQ when the wheel MMVQ is blocked: every M the MMQ is flat-priced for (1 <= M <= 16)."""
+    return 1 <= num_tokens <= IQ_MMQ_MAX_BATCH_SIZE
+
+
+def moe_mmq_decode_shape_ok(num_tokens: int, num_experts: int, top_k: int) -> bool:
+    """G12: MoE IQ3_S through the JIT MMQ when the wheel moe_vec is blocked: ANY token count (decode, MTP verify, prefill).
+
+    Only the launch limit of the kernel remains (one four-assignment block per grid.y step); the PR's performance gates
+    (``IQ_MOE_MMQ_MIN_TOKENS``, ``IQ_MOE_MMQ_MIN_ASSIGNMENTS_PER_EXPERT``) are about speed against the old path, and here the old path is wrong.
+    """
+    if num_tokens < 1:
+        return False
+    max_num_tokens_padded = num_tokens * top_k + (num_experts + 1) * (IQ_MOE_MMQ_BLOCK_SIZE - 1)
+    return max_num_tokens_padded <= CUDA_MAX_GRID_Y * IQ_MOE_MMQ_BLOCK_SIZE
 
 
 def k_aligned(type_id: int, input_size: int) -> bool:

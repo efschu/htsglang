@@ -122,6 +122,11 @@ def prepare(type_id: int) -> bool:
     return True
 
 
+def state_text(type_id: int) -> str:
+    """G12: why ``type_id`` is not ready on this device (named refusal / failure / not prepared), "ready" when it is."""
+    return _STATE.get((get_jit_cuda_arch().target_name, int(type_id)), "not prepared (iq_mmq_prepare was not called for this type)")
+
+
 def is_ready(type_id: int) -> bool:
     """Per-forward check: a dictionary lookup, never a build."""
     if not _STATE:

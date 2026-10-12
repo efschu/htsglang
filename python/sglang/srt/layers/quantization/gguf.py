@@ -303,6 +303,43 @@ if MXFP4_NATIVE:
 _IQ_MMQ_TYPES = _iq_policy.IQ_MMQ_TYPES
 _iq_mmq_mod = None
 
+# ---------------------------------------------------------------------------------------------------------------------
+# G12 (GGUF-NF, 2026-10-12): IQ3_S on the decode / dequant paths.
+#
+# The sgl-kernel wheel decodes IQ3_S with ggml's pre-final ``iq3xs_grid`` (csrc/quantization/gguf/ggml-common.h; the grid value 15 is the byte 62,
+# so it becomes 15.5 instead of 15: +3.3 % on ~1/8 of the weights). It sits in ``ggml_dequantize``, the dense MMVQ (``ggml_mul_mat_vec_a8``) and the MoE
+# MMVQ (``ggml_moe_a8_vec`` = moe_vec): every IQ3_S path that is not the G6 JIT MMQ. G11 fixed the JIT kernels (prefill, M >= 128); G12 fixes the wheel
+# SOURCE (iq3s_grid_ggml.cuh + the marker op ``ggml_iq3s_grid_ggml``) and, for a wheel that does not carry the marker yet, takes IQ3_S off the wheel:
+#   * dense   M <= 16      -> the JIT MMQ (``_iq_dense_mmq_selected``: the MMVQ lower bound falls away for IQ3_S)
+#   * dense   M  > 16      -> torch dequant (``jit_kernel/gguf_iq3s_dequant.py``, gguf-py arithmetic) + GEMM, chunked in rows
+#   * MoE     any M        -> the JIT MoE MMQ (``_iq_moe_mmq_selected``: the PR's speed gates fall away for IQ3_S); pairs it cannot take fall to the
+#                             per-token loop, never to moe_vec
+#   * embedding rows       -> torch dequant
+# Cost of the detour (unmeasured on metal): MoE decode on the 4-assignment MMQ tile instead of moe_vec, dense M > 16 and embedding on torch ops instead of
+# the CUDA dequant. A wheel with the marker restores every pre-G12 branch unchanged. If the JIT cannot serve IQ3_S (SGLANG_GGUF_IQ_MMQ=0, the Blackwell
+# nvcc gate, a failed build) the load REFUSES (``IQ3S-WHEEL-GRID``) instead of decoding wrong weights.
+def _iq3s_wheel_grid_fixed() -> bool:
+    """Whether the INSTALLED sgl-kernel wheel carries the ggml-grid IQ3_S kernels (marker op existence, like ``_mxfp4_kernels_present``)."""
+    try:
+        return hasattr(torch.ops.sgl_kernel, _iq_policy.IQ3S_WHEEL_MARKER_OP)
+    except Exception:
+        return False
+
+
+IQ3S_WHEEL_GRID_FIXED = _iq3s_wheel_grid_fixed()
+_iq3s_load_line_logged = False
+
+
+def _iq3s_wheel_blocked(qweight_type) -> bool:
+    """True for IQ3_S while the installed wheel has the off-by-one grid: no wheel kernel may touch such a weight."""
+    return _iq_policy.iq3s_wheel_blocked(qweight_type, IQ3S_WHEEL_GRID_FIXED)
+
+
+def _iq3s_dequant_mod():
+    from sglang.jit_kernel import gguf_iq3s_dequant
+
+    return gguf_iq3s_dequant
+
 
 def _iq_mmq_kernels():
     """The G6 JIT glue module, imported on first use; None off CUDA or when it cannot be imported."""
@@ -326,10 +363,37 @@ def iq_mmq_prepare(*qweight_types) -> None:
     if not wanted:
         return
     mod = _iq_mmq_kernels()
-    if mod is None:
+    if mod is not None:
+        for t in sorted(wanted):
+            mod.prepare(t)
+    _iq3s_load_guard(wanted)
+
+
+def _iq3s_load_guard(wanted) -> None:
+    """G12 load-time rule for IQ3_S while the wheel grid is off by one: the JIT kernel must be ready (named load line), else refuse the load."""
+    global _iq3s_load_line_logged
+    if _iq_policy.IQ3_S not in wanted or IQ3S_WHEEL_GRID_FIXED:
         return
-    for t in sorted(wanted):
-        mod.prepare(t)
+    if _iq_mmq_ready(_iq_policy.IQ3_S):
+        if _is_cuda:
+            _iq3s_dequant_mod().prepare(torch.device("cuda", torch.cuda.current_device()))
+        if not _iq3s_load_line_logged:
+            _iq3s_load_line_logged = True
+            logger.warning(
+                "%s: the sgl-kernel wheel has no %s marker (its IQ3_S grid value 15 is 15.5, +3.3 %% on ~1/8 of the weights) -- dense M <= 16 and "
+                "MoE of every M run the JIT MMQ, dense M > 16 and embedding rows a torch dequant; a wheel built from a G12 tree restores the "
+                "wheel kernels",
+                _iq_policy.IQ3S_DECODE_LOAD_LINE,
+                _iq_policy.IQ3S_WHEEL_MARKER_OP,
+            )
+        return
+    mod = _iq_mmq_mod
+    why = mod.state_text(_iq_policy.IQ3_S) if mod else "the IQ MMQ JIT module is not available on this rank"
+    raise RuntimeError(
+        "IQ3S-WHEEL-GRID: this checkpoint has IQ3_S weights, the installed sgl-kernel wheel decodes them wrong (no "
+        f"{_iq_policy.IQ3S_WHEEL_MARKER_OP} marker: grid value 15 -> 15.5, +3.3 % on ~1/8 of the weights) and the JIT IQ3_S kernel is not ready: "
+        f"{why}. Enable the JIT ({_iq_policy.ENV_ENABLE}=1, nvcc available, not CUDA 13.2.0/13.2.1 on sm_12x) or install a wheel built from a G12 tree."
+    )
 
 
 def _iq_mmq_ready(qweight_type) -> bool:
@@ -345,12 +409,18 @@ def _iq_dense_mmq_selected(x: torch.Tensor, qweight: torch.Tensor, qweight_type:
     """Dense IQ MMQ window (PR #36122): mmvq_safe < M <= 16, K aligned, kernel armed. False for every non-IQ type."""
     if qweight_type not in _IQ_MMQ_TYPES:
         return False
+    # G12: IQ3_S with the off-by-one wheel grid has no MMVQ to leave the small M to -> the JIT MMQ takes 1 <= M <= 16
+    shape_ok = (
+        _iq_policy.dense_iq3s_window_ok(x.shape[0])
+        if _iq3s_wheel_blocked(qweight_type)
+        else _iq_policy.dense_mmq_shape_ok(x.shape[0], mmvq_safe)
+    )
     return (
         x.dim() == 2
         and x.dtype in (torch.float16, torch.bfloat16)
         and qweight.dim() == 2
         and qweight.dtype == torch.uint8
-        and _iq_policy.dense_mmq_shape_ok(x.shape[0], mmvq_safe)
+        and shape_ok
         and _iq_policy.k_aligned(qweight_type, x.shape[1])
         and _iq_rows_contiguous(qweight)
         and _iq_mmq_ready(qweight_type)
@@ -375,7 +445,11 @@ def _iq_moe_mmq_selected(
         return False
     num_tokens = x.shape[0]
     num_experts, n13, _ = w1.shape
-    if not _iq_policy.moe_mmq_shape_ok(num_tokens, num_experts, topk_ids.shape[1]):
+    # G12: an IQ3_S side with the off-by-one wheel grid has no moe_vec to leave the small token counts to -> only the launch limit gates it
+    if _iq3s_wheel_blocked(qweight_type) or _iq3s_wheel_blocked(qweight_type2):
+        if not _iq_policy.moe_mmq_decode_shape_ok(num_tokens, num_experts, topk_ids.shape[1]):
+            return False
+    elif not _iq_policy.moe_mmq_shape_ok(num_tokens, num_experts, topk_ids.shape[1]):
         return False
     for qtype, k in ((qweight_type, x.shape[1]), (qweight_type2, n13 // 2)):
         if qtype in _IQ_MMQ_TYPES:
@@ -1199,6 +1273,31 @@ def _mul_mat_dequant_chunked(
     return torch.cat(outs, dim=1) if len(outs) > 1 else outs[0]
 
 
+#: G12: rows of an IQ3_S weight are dequantised in torch in chunks of at most this many output elements (bounds the int64 index temporaries).
+_IQ3S_TORCH_DEQUANT_CHUNK_ELEMS = 1 << 24
+
+
+def _iq3s_dequant_rows(qweight: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """IQ3_S rows -> weights of ``dtype`` through the torch dequant (gguf-py arithmetic), chunked in rows."""
+    mod = _iq3s_dequant_mod()
+    rows, row_bytes = qweight.shape
+    cols = row_bytes // mod.IQ3_S_BLOCK_BYTES * mod.QK_K
+    per = max(_IQ3S_TORCH_DEQUANT_CHUNK_ELEMS // cols, 1)
+    if rows <= per:
+        return mod.dequantize_iq3_s(qweight, dtype)
+    return torch.cat([mod.dequantize_iq3_s(qweight[r0 : r0 + per], dtype) for r0 in range(0, rows, per)], dim=0)
+
+
+def _mul_mat_iq3s_dequant(x: torch.Tensor, qweight: torch.Tensor) -> torch.Tensor:
+    """G12: x @ dequant(qweight).T for IQ3_S without the wheel kernel: dequant and GEMM chunk by chunk (never the whole weight at once)."""
+    mod = _iq3s_dequant_mod()
+    rows, row_bytes = qweight.shape
+    cols = row_bytes // mod.IQ3_S_BLOCK_BYTES * mod.QK_K
+    per = max(_IQ3S_TORCH_DEQUANT_CHUNK_ELEMS // cols, 1)
+    outs = [x @ mod.dequantize_iq3_s(qweight[r0 : r0 + per], x.dtype).T for r0 in range(0, rows, per)]
+    return torch.cat(outs, dim=1) if len(outs) > 1 else outs[0]
+
+
 def fused_mul_mat_gguf(
     x: torch.Tensor, qweight: torch.Tensor, qweight_type: int, on_path=None
 ) -> torch.Tensor:
@@ -1241,6 +1340,8 @@ def fused_mul_mat_gguf(
     if (
         x.shape[0] <= mmvq_safe
         and qweight_type in MMVQ_QUANT_TYPES
+        # G12: the wheel MMVQ decodes IQ3_S with the off-by-one grid -> never for IQ3_S until the wheel carries the marker
+        and not _iq3s_wheel_blocked(qweight_type)
         # #72 shape-aware dispatch: reroute wide-K / M>=8 K-quant shapes to
         # MMQ on sm<9 devices (see _kquant_prefers_mmq).
         and not _kquant_prefers_mmq(x.shape[0], qweight, qweight_type)
@@ -1280,7 +1381,10 @@ def fused_mul_mat_gguf(
         # sized KV budget (t69/boot4_oom.log). Chunk it through the
         # persistent workspace instead; outside capture the fresh-allocation
         # fallback stays byte-identical (e.g. large logprob prefills).
-        if (
+        if _iq3s_wheel_blocked(qweight_type):
+            # G12: the wheel's ggml_dequantize has the off-by-one IQ3_S grid; the torch dequant is the gguf-py arithmetic, chunked in rows
+            y = _mul_mat_iq3s_dequant(x, qweight)
+        elif (
             _is_cuda
             and shape[0] * shape[1] * x.dtype.itemsize > _dequant_ws_cap_bytes()
             and _dequant_supports_out()
@@ -1471,7 +1575,12 @@ def fused_moe_gguf(
         )
         # TODO(FlamingoPg): maybe we can use moe_sum_reduce here?
         moe_sum(out, out_hidden_states)
-    elif qweight_type2 in MMVQ_QUANT_TYPES and qweight_type in MMVQ_QUANT_TYPES:
+    elif (
+        qweight_type2 in MMVQ_QUANT_TYPES
+        and qweight_type in MMVQ_QUANT_TYPES
+        # G12: the wheel moe_vec decodes IQ3_S with the off-by-one grid -> a pair with IQ3_S the JIT MoE MMQ cannot take goes to the per-token loop
+        and not (_iq3s_wheel_blocked(qweight_type) or _iq3s_wheel_blocked(qweight_type2))
+    ):
         num_tokens, _ = x.shape
         E, N, _ = w1.shape
         top_k = topk_ids.shape[1]
@@ -1527,6 +1636,10 @@ def apply_gguf_embedding(
         x_flat = x.flatten()
         assert hidden_size == qweight.shape[1] // type_size * block_size
         quant = torch.index_select(qweight, dim=0, index=x_flat)
+        if _iq3s_wheel_blocked(qweight_type):
+            # G12: the wheel's ggml_dequantize has the off-by-one IQ3_S grid -> torch dequant of the gathered rows (gguf-py arithmetic)
+            dequant = _iq3s_dequant_rows(quant, dtype or torch.float16)
+            return dequant.view(*x.shape, hidden_size)
         dequant = ggml_dequantize(
             quant, qweight_type, hidden_size, x_flat.shape[0], dtype
         )

@@ -61,15 +61,20 @@ NF_GGUF_DIR = Path(
 )
 
 # sha256 of the UNCHANGED sgl-kernel GGUF sources at base c651892375 -- G6 must not touch any of them.
+# G12 (2026-10-12) changed THREE of them on purpose (IQ3_S grid in the wheel source, see test_gguf_iq3s_wheel_1012.py): dequantize.cuh, vecdotq.cuh and
+# gguf_kernel.cu (include + marker op) carry their G12 hashes below; their G6-base hashes were
+# dequantize.cuh 28aeb052e48158c1606dd3755e06ba6737eaf6065b7c74fa9ad03d8a203ae2a4, vecdotq.cuh 0e1bb0cc1be73e06760a0c9538cc94a9d3d8e5381b008215dc3b31da77b5a95c,
+# gguf_kernel.cu c81d758382fb71dbba02fde6ff22c1dee872c8e94bec5986014ee19e4521338b. ggml-common.h (the JIT header is a verbatim prefix of it) and the other
+# four files are still the base.
 BASE_SHA256 = {
     "ggml-common.h": "788004323faaf8017db4aa3a55c65325691ae106e91876a049ed93e43a47a215",
-    "dequantize.cuh": "28aeb052e48158c1606dd3755e06ba6737eaf6065b7c74fa9ad03d8a203ae2a4",
+    "dequantize.cuh": "3cdddecec0d2e4faf9a37bf8a323fb516adb05bf2d0b0ab3c2b3503953266356",  # G12
     "mmq.cuh": "f45d9cb48d24ffea631bcb302532f35781a2f76f22f3f91262f70225fcc23f76",
     "mmvq.cuh": "834a024377c7deacff177fddd5727b39a1a1302f63e6a63d54f1f4602c37dfdb",
     "moe.cuh": "01b6cbd5a46c3a6fd9e26ea68650e32242ee49e75a423919c125836f63d6945f",
     "moe_vec.cuh": "ee6c024771ace60055002dace94d882ce56750558f617cdfafe4a6172e8260cd",
-    "vecdotq.cuh": "0e1bb0cc1be73e06760a0c9538cc94a9d3d8e5381b008215dc3b31da77b5a95c",
-    "gguf_kernel.cu": "c81d758382fb71dbba02fde6ff22c1dee872c8e94bec5986014ee19e4521338b",
+    "vecdotq.cuh": "9b612b26028888f25ce5e6ca92745ed28e1003a54a9e8deebef67934cae2bc01",  # G12
+    "gguf_kernel.cu": "91e0fc693bac2eaa2d241d4f3d648c4cd4d0deaf820b34706f57a278cece8786",  # G12
 }
 PR_DIFF_SHA256 = "cf93506bd6b55eca441794007b1d5e92f6a66bf5f0524f288f460f1418bcee38"
 NEW_FILES = [
@@ -408,6 +413,9 @@ class TestDispatch(CustomTestCase):
         self.put = put
         put("_is_cuda", True)
         put("_has_sgl_gguf_kernels", True)
+        # G12: these tests describe the dispatch on a wheel whose IQ3_S kernels are right (marker op present); the marker-absent dispatch
+        # (IQ3_S off the wheel kernels) is test_gguf_iq3s_wheel_1012.py.
+        put("IQ3S_WHEEL_GRID_FIXED", True)
         put("_iq_mmq_mod", _install_fake_iq_module(G, {20, 21, 23}, self.calls))
         put("_mmvq_safe_for_device", lambda: 2)
         put("_ggml_dequantize_ws", lambda w, t, n, k, dt: self.calls.append(("dequant", int(t))) or torch.zeros(n, k, dtype=dt))
