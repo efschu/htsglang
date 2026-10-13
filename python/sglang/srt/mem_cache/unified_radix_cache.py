@@ -6666,11 +6666,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             _t_iss = time.perf_counter()
             if _full_arena and self._weg2_full_arena_refuses(node):
                 _issue_s += time.perf_counter() - _t_iss
+                if _r12.role() is not None:
+                    # FLUSHFAST: the Form A shadow gets every refusal the claim
+                    # would have recorded -- the skip only spares the claim
+                    self._weg2_note_skipped_arena_refusal(node)
                 stats["refused"] += 1
+                stats["arena_refused"] = stats.get("arena_refused", 0) + 1
                 stats["arena_full_skipped"] = stats.get("arena_full_skipped", 0) + 1
                 continue
-            if _full_arena_armed:
-                self._weg2_sweep_last_refusal = None   # this attempt's own refusal reason only
+            # this attempt's own refusal reason only (FLUSHFAST: reset on every
+            # path, the sweep now counts the arena refusals of every attempt)
+            self._weg2_sweep_last_refusal = None
             try:
                 got = self.write_backup(node)
             except Exception as e:  # noqa: BLE001 -- the sweep must not kill the flush
@@ -6682,6 +6688,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 stats["issued"] += 1
             else:
                 stats["refused"] += 1
+                if self._weg2_sweep_last_refusal == "arena_claim":
+                    # FLUSHFAST: refused for want of KV-arena room (also through the
+                    # parent rule: the topmost un-backed ancestor's claim was refused)
+                    stats["arena_refused"] = stats.get("arena_refused", 0) + 1
                 _full_arena = _full_arena or (
                     _full_arena_armed and self._weg2_sweep_last_refusal == "arena_claim")
         stats["walked"] = _walked
@@ -6718,14 +6728,39 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         return stats
 
     def _weg2_full_arena_skip_armed(self) -> bool:
-        """SWEEP-FULL-ARENA gate, fixed for one sweep: the switch, no Form A
-        shadow (R12 mirrors every refusal TP0 records onto its workers), and
-        no D park recording its arena refusals (HY, park_hold_yield)."""
+        """SWEEP-FULL-ARENA gate, fixed for one sweep: the switch and no D park
+        recording its arena refusals (HY, park_hold_yield).
+
+        FLUSHFAST (NF int24g, D>P epochs 105/115 of boot 1012_185900): the
+        Form A shadow (R12) no longer disarms the skip. It did, because R12
+        mirrors every refusal TP0 records onto its workers -- and a skipped
+        claim recorded nothing. The skip now makes that record itself
+        (:meth:`_weg2_note_skipped_arena_refusal`), so group D, which always
+        runs the shadow, pays one futile claim per sweep instead of one per
+        un-backed node (66 x ~45 ms x 4 rounds x 2 legs = 12.5 s per leg)."""
         return (
             envs.SGLANG_WEG2_ENABLE_SWEEP_FULL_ARENA_SKIP.get()
             and self._weg2_park_track is None
-            and _r12.role() is None
         )
+
+    def _weg2_note_skipped_arena_refusal(self, node) -> None:
+        """The refusals ``write_backup(node)`` would have noted had its claim
+        run (R12 ``record_state`` / ``worker_short`` through ``_1421_refused``):
+        ``arena_claim`` on the topmost un-backed ancestor, whose claim is the
+        one refused, then ``parent_unbacked`` on each node of the chain below
+        it down to ``node``, in the order the recursion unwinds."""
+        chain = []
+        top = node
+        while (
+            top.parent is not self.root_node
+            and not top.parent.backuped
+            and not top.parent.l3_present
+        ):
+            chain.append(top)
+            top = top.parent
+        self._1421_refused("arena_claim", top)
+        for n in reversed(chain):
+            self._1421_refused("parent_unbacked", n)
 
     def _weg2_full_arena_refuses(self, node) -> bool:
         """SWEEP-FULL-ARENA (NF boot 1007_2142): once this sweep's KV arena
