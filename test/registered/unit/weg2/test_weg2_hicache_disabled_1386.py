@@ -184,6 +184,15 @@ class _HermeticMainBase(unittest.TestCase):
 
     def setUp(self):
         super().setUp()
+        # HOSTWARN2 review finding 1 (13.10.2026): with W20/W21 only warning,
+        # launcher.main now runs past the ledger and exports
+        # SGLANG_PINNED_HOST_RESERVE_LEDGER_GIB/_SOURCE (launcher.py, "ONE
+        # pinned-host reserve"). Snapshot the whole environment and restore it
+        # after each test (cleanups run after tearDown), so later tests in the
+        # same process read the native reserve, not this file's mocked host.
+        _env_patch = mock.patch.dict(os.environ)
+        _env_patch.start()
+        self.addCleanup(_env_patch.stop)
         self._old_replay_env = os.environ.get(nvml_registry.ENV_NVML_REPLAY)
         os.environ[nvml_registry.ENV_NVML_REPLAY] = _NVML_REPLAY_JSON
         self._shm_tmp = tempfile.mkdtemp(prefix="weg2-1386-empty-shm-")
