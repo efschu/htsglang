@@ -6512,7 +6512,7 @@
      "source": {
       "file": "weg2/launcher.py",
       "kind": "argparse",
-      "line": 22267
+      "line": 22286
      }
     }
    },
@@ -7081,7 +7081,7 @@
      "source": {
       "file": "weg2/launcher.py",
       "kind": "argparse",
-      "line": 22271
+      "line": 22290
      }
     }
    },
@@ -11291,7 +11291,7 @@
      "source": {
       "file": "weg2/launcher.py",
       "kind": "argparse",
-      "line": 22323
+      "line": 22342
      }
     }
    },
@@ -18155,6 +18155,37 @@
    "text": "",
    "type": "int"
   },
+  "--p-gc-freeze": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": [
+    "off",
+    "on"
+   ],
+   "cost": "",
+   "default": null,
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "Group P: 'on' = every P scheduler calls gc.freeze() once after boot (all CUDA graphs captured), so gen-2 collections no longer walk the boot objects (NF 13.10.: 4.4-5.4 s PP0/PP1 collections inside flips). 'off' (default) = no env from this flag; the nextflash profile turns the switch on for P and D by default (--env-p/--env-d SGLANG_WEG2_GC_FREEZE=0 = off there).",
+   "id": "--p-gc-freeze",
+   "kind": "flag",
+   "level": "experte",
+   "name": "--p-gc-freeze",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "baum": "nf",
+    "file": "weg2/launcher.py",
+    "kind": "argparse",
+    "line": 22899
+   },
+   "status": "geerntet",
+   "text": "",
+   "type": "str"
+  },
   "--p-hicache-write-policy": {
    "baeume": [
     "27b",
@@ -18205,7 +18236,7 @@
      "source": {
       "file": "weg2/launcher.py",
       "kind": "argparse",
-      "line": 23758
+      "line": 23784
      }
     }
    },
@@ -18909,7 +18940,7 @@
      "source": {
       "file": "weg2/launcher.py",
       "kind": "argparse",
-      "line": 23030
+      "line": 23056
      }
     }
    },
@@ -26907,7 +26938,7 @@
      "source": {
       "file": "weg2/launcher.py",
       "kind": "argparse",
-      "line": 23405
+      "line": 23431
      }
     }
    },
@@ -27160,7 +27191,7 @@
     "baum": "nf",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23575
+    "line": 23601
    },
    "status": "kuratiert",
    "text": "Names the census row from which a card is priced that is not in the census file by UUID: list <live>=<census UUID>, <live> = card UUID, nvml<N> or class (RTX3080). Without an entry the start borrows the heaviest row of the same class (otherwise of the whole census) and refuses that as HW-BORROWED until force is set.",
@@ -28298,7 +28329,7 @@
      "source": {
       "file": "weg2/launcher.py",
       "kind": "argparse",
-      "line": 22468
+      "line": 22487
      }
     }
    },
@@ -85984,25 +86015,25 @@
    "abweichung": 45,
    "beide": 2461,
    "nur_27b": 180,
-   "nur_nf": 50
+   "nur_nf": 51
   },
-  "entries": 2709,
+  "entries": 2710,
   "envs": 1831,
   "erklaert": 305,
-  "flags": 863,
-  "geerntet": 1678,
+  "flags": 864,
+  "geerntet": 1679,
   "kuratiert": 124,
   "unerklaert": 602
  },
- "tree_rev": "27b=02123ee2ef+nf=49df6ed8e6+lanes-default-on",
+ "tree_rev": "27b=02123ee2ef+nf=0ea6d17efd+gcfreeze-1013",
  "trees": {
   "27b": {
    "entries": 2641,
    "rev": "02123ee2ef"
   },
   "nf": {
-   "entries": 2511,
-   "rev": "49df6ed8e6+lanes-default-on"
+   "entries": 2512,
+   "rev": "0ea6d17efd+gcfreeze-1013"
   }
  },
  "warnungen": []
