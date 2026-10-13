@@ -32,6 +32,11 @@ ENV = "SGLANG_WEG2_PROGRESS_BEACON"
 SUBDIR = "progress"
 _FMT = "<qqqq"
 _SIZE = struct.calcsize(_FMT)
+#: PRIORITY LANES 1008 (L1, weg2/lanes.py): with SGLANG_WEG2_LANES=1 the file is 16 bytes longer --
+#: ``(lane_floor, lane_epoch)`` the rank last saw, after the 32 bytes above. Every reader of the 32 bytes
+#: reads on unchanged; with the switch off the file stays 32 bytes.
+_LANE_FMT = "<qq"
+_LANE_SIZE = struct.calcsize(_LANE_FMT)
 #: a forward running longer than this is not progress (the scheduler
 #: watchdog's own bound is 300 s; a 262k extend measured <= 60 s).
 BUSY_BOUND_S = 120.0
@@ -48,6 +53,16 @@ def beacon_dir(tag: str = "", env=None) -> str:
 
     base = arena_dir(tag, env)
     return os.path.join(base, SUBDIR) if base else ""
+
+
+def _lanes_on() -> bool:
+    """SGLANG_WEG2_LANES (weg2/lanes.py); a beacon never fails on it."""
+    try:
+        from sglang.srt.weg2 import lanes
+
+        return bool(lanes.enabled())
+    except Exception:  # noqa: BLE001
+        return False
 
 
 class _Writer:
@@ -70,9 +85,10 @@ class _Writer:
             os.makedirs(d, exist_ok=True)
             path = os.path.join(d, f"{group}-pid{os.getpid()}.bin")
             fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+            size = _SIZE + (_LANE_SIZE if _lanes_on() else 0)  # PRIORITY LANES 1008 (L1): +16 bytes only with the switch on
             try:
-                os.ftruncate(fd, _SIZE)
-                self.mm = mmap.mmap(fd, _SIZE)
+                os.ftruncate(fd, size)
+                self.mm = mmap.mmap(fd, size)
             finally:
                 os.close(fd)
             struct.pack_into(_FMT, self.mm, 0, 0, 0, 0, os.getpid())
@@ -96,6 +112,18 @@ class _Writer:
             pass
 
 
+    def beat_lane(self, floor: int, epoch: int) -> None:
+        """PRIORITY LANES 1008 (L1): the lane floor/epoch this rank last saw (trailer after the 32 bytes).
+        No trailer (switch off, file of 32 bytes) = nothing written."""
+        mm = self._open()
+        if mm is None or len(mm) < _SIZE + _LANE_SIZE:
+            return
+        try:
+            struct.pack_into(_LANE_FMT, mm, _SIZE, int(floor), int(epoch))
+        except Exception:  # noqa: BLE001
+            pass
+
+
 _W = _Writer()
 
 
@@ -105,6 +133,12 @@ def beat_start(forward_ct: int) -> None:
 
 def beat_done(forward_ct: int) -> None:
     _W.beat(forward_ct, False)
+
+
+def beat_lane(floor: int, epoch: int) -> None:
+    """PRIORITY LANES 1008 (L1): record the lane floor/epoch the rank saw (parts L2 / L3 call it where the
+    rank takes a new floor). A no-op unless SGLANG_WEG2_LANES=1."""
+    _W.beat_lane(floor, epoch)
 
 
 def read_group(directory: str, group: str, sid: int,
@@ -128,6 +162,31 @@ def read_group(directory: str, group: str, sid: int,
     return out
 
 
+def read_group_lane(directory: str, group: str, sid: int,
+                    session_of: Optional[Callable[[int], Optional[int]]] = None) -> Dict[int, Tuple[int, int]]:
+    """PRIORITY LANES 1008 (L1): ``{pid: (lane_floor, lane_epoch)}`` of the group's LIVE ranks whose beacon
+    file carries the lane trailer (switch on); a rank with a 32-byte file is absent."""
+    if not directory or not sid:
+        return {}
+    if session_of is None:
+        from sglang.srt.weg2.front_health import pid_session as session_of
+    out: Dict[int, Tuple[int, int]] = {}
+    for path in glob.glob(os.path.join(directory, f"{group}-pid*.bin")):
+        try:
+            with open(path, "rb") as fh:
+                raw = fh.read(_SIZE + _LANE_SIZE)
+            if len(raw) < _SIZE + _LANE_SIZE:
+                continue
+            pid = struct.unpack_from(_FMT, raw, 0)[3]
+            floor, epoch = struct.unpack_from(_LANE_FMT, raw, _SIZE)
+        except Exception:  # noqa: BLE001
+            continue
+        if session_of(int(pid)) != int(sid):
+            continue
+        out[int(pid)] = (int(floor), int(epoch))
+    return out
+
+
 def progress(prev: Dict[int, Tuple[int, int, int]], cur: Dict[int, Tuple[int, int, int]],
              now_ns: Optional[int] = None, bound_s: float = BUSY_BOUND_S) -> Optional[str]:
     """Why the group shows progress (a short reason), or None."""
@@ -138,6 +197,28 @@ def progress(prev: Dict[int, Tuple[int, int, int]], cur: Dict[int, Tuple[int, in
             return f"forward_ct {p[0]}->{ct} (pid {pid})"
         if ts > td and (now_ns - ts) < bound_s * 1e9:
             return f"in forward {ct} for {(now_ns - ts) / 1e9:.1f}s (pid {pid})"
+    return None
+
+
+def lane_hold(front_floor: int, front_epoch: int,
+              group_lane: Optional[Dict[int, Tuple[int, int]]] = None,
+              held: bool = False, acked: bool = False) -> Optional[str]:
+    """PRIORITY LANES 1008 (L4): why a group that shows NO forward progress is on a LANE HOLD and not stalled.
+
+    A group whose requests all wait behind a higher lane runs no forward: ``forward_ct`` stands, nothing is in
+    forward -- the picture a watchdog (W17 / H86 / the front's leg-1 stall) reads as a stall. It is a hold when
+    the front keeps the lane floor above 0, the front holds requests of this group below it (``held``: parked on
+    D, in flight on P, or waiting for it) AND the group knows the floor: either a rank's beacon trailer (written
+    by L2 / L3 with :func:`beat_lane`) shows the front's epoch, or the front's floor RPC to the group was
+    acknowledged (``acked``; a group without the trailer, 32-byte files, is read through the RPC alone).
+    Returns a short reason or None (None = no hold: the stall reading stands)."""
+    if not held or int(front_floor) <= 0:
+        return None
+    for pid, (floor, epoch) in sorted((group_lane or {}).items()):
+        if int(epoch) == int(front_epoch) and int(floor) == int(front_floor):
+            return f"lane-hold floor={int(floor)} epoch={int(epoch)} (pid {pid})"
+    if acked:
+        return f"lane-hold floor={int(front_floor)} epoch={int(front_epoch)} (floor RPC acknowledged)"
     return None
 
 

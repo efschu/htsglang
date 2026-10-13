@@ -160,6 +160,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightVersionReqInput,
     VertexGenerateReqInput,
     VramBudgetReqInput,
+    Weg2LaneFloorReqInput,
     Weg2ParkRunningReqInput,
     Weg2ParkWindowReqInput,
 )
@@ -1441,8 +1442,39 @@ async def weg2_park_running(obj: Annotated[Weg2ParkRunningReqInput, Body()], req
     seq_marks = getattr(ret, "weg2_seq_hash", None)  # SEQ-HASH (02.10.)
     if seq_marks:
         body["weg2_seq_hash"] = dict(seq_marks)
+    if getattr(ret, "lane", False):
+        # PRIORITY LANES 1008 (L2): the answer of a rids / hold park carries "lane" (+ why a rid was not parked)
+        body["lane"] = True
+        body["skipped"] = dict(getattr(ret, "lane_skipped", None) or {})
     return ORJSONResponse(
         body,
+        status_code=200 if ret.success else HTTPStatus.CONFLICT,
+    )
+
+
+@app.api_route("/weg2/lane_floor", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def weg2_lane_floor(obj: Annotated[Weg2LaneFloorReqInput, Body()], request: Request):
+    """PRIORITY LANES 1008 (L2 + L3, one route for both groups): the front's floor. Group P: PP0 stamps it into the
+    PP-room vote so every stage applies it in the same pass (weg2/lanes_p.py). Group D: Body {"floor": <int>, "epoch": <int>}; answer
+    200 {"success", "floor", "epoch", "requeued": [rid, ...], "held": <n>, "message"} -- the floor and epoch in
+    force, the held lane parks this call re-queued (oldest first) and the holds still standing. D's admission
+    lets in only requests with priority >= floor; a request parked with hold="lane" (POST /weg2/park_running
+    with "rids") comes back when the floor falls to its lane. 409 when refused (SGLANG_WEG2_LANES off on this
+    server, or a stale epoch). Names: weg2/lanes.py RPC_LANE_FLOOR."""
+    try:
+        ret = await _global_state.tokenizer_manager.weg2_lane_floor(obj)
+    except Exception as e:
+        return _create_error_response(e)
+    return ORJSONResponse(
+        {
+            "success": ret.success,
+            "floor": ret.floor,
+            "epoch": ret.epoch,
+            "requeued": list(ret.requeued),
+            "held": ret.held,
+            "message": ret.message,
+        },
         status_code=200 if ret.success else HTTPStatus.CONFLICT,
     )
 

@@ -492,6 +492,11 @@ class AnthropicMessagesRequest(BaseModel):
     #: under a fresh uuid, the abort matched nothing, and PP1/PP2 kept it in
     #: their waiting queues -> W3 at the next flip.
     rid: Optional[str] = None
+    #: PRIORITY LANES 1008 (L1, weg2/lanes.py): the request's lane, as on ``/v1/chat/completions``
+    #: (``priority``; no number = lane 0, a higher number is a higher lane). DECLARED for the reason
+    #: ``rid`` is: undeclared, ``extra="ignore"`` drops it silently. The adapter forwards it only with
+    #: ``SGLANG_WEG2_LANES=1``; off, it is dropped here exactly as before the field existed.
+    priority: Optional[int] = None
     #: RANKSTATS-S3 DASHBOARD-GRAFIKEN Feld 2: as on ``/v1/chat/completions``,
     #: the caller asks for the cached-token tier split (answered in
     #: ``sglext.cached_tokens_details``). Declared for the reason ``rid`` is:
@@ -505,6 +510,26 @@ class AnthropicMessagesRequest(BaseModel):
     #: group disagreed about the namespace.
     cache_salt: Optional[str] = None
     extra_key: Optional[str] = None
+
+    @field_validator("priority", mode="before")
+    @classmethod
+    def _priority_never_refuses(cls, v: Any) -> Optional[int]:
+        """PRIORITY LANES 1008 (L1): a malformed ``priority`` (text, fraction, bool, NaN, list) is dropped
+        (None), never refused: before the field was declared ``extra="ignore"`` swallowed it and the
+        request ran, and that must stay true with SGLANG_WEG2_LANES=0. Whole numbers pass (an integral
+        float or a digit string too); the lane arithmetic (negative -> 0) is the front's and the adapter's."""
+        if v is None or isinstance(v, bool):
+            return None
+        if isinstance(v, int):
+            return v
+        try:
+            if isinstance(v, float):
+                return int(v) if v == v and v not in (float("inf"), float("-inf")) and v == int(v) else None
+            if isinstance(v, str):
+                return int(v.strip())
+        except (ValueError, OverflowError):
+            return None
+        return None
 
     @field_validator("model")
     @classmethod

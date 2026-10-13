@@ -10,6 +10,10 @@ replicated state, so every rank moves the same requests at the same point.
 
 Entry points (all no-ops off group D / with nothing parked):
   park_running   -- ``POST /weg2/park_running`` (front, before D's sleep)
+  park_rids      -- PRIORITY LANES 1008 (L2): ``park_running`` with ``rids`` (+ ``hold="lane"``): only
+                    those running requests leave, no sleep follows, the others keep decoding
+  lane_floor     -- PRIORITY LANES 1008 (L2): ``POST /weg2/lane_floor`` -- the floor of D's admission;
+                    a fall of the floor re-queues the held lane parks in arrival order
   hold_late_arrival -- H91c3: a hand-off reaching D after the park is held
   hold_parked    -- the sleep leg's dormant point (weight_updater)
   park_tick      -- every pass: a park whose sleep never came re-queues
@@ -32,7 +36,7 @@ import time
 from typing import Optional
 
 from sglang.srt.managers import weg2_resumable_depth
-from sglang.srt.weg2 import d_park_draft, d_park_read, d_seats, park_hold_yield, park_retract_split
+from sglang.srt.weg2 import d_lane, d_park_draft, d_park_read, d_seats, park_hold_yield, park_retract_split
 from sglang.srt.weg2 import handback_claim as _hb
 from sglang.srt.weg2 import poolleak_instr as _poolleak
 from sglang.srt.weg2 import mamba_arena_displace as _mad_park
@@ -128,6 +132,12 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
     reason = str(getattr(recv_req, "reason", "") or "")
     if str(getattr(recv_req, "youngest", "") or ""):
         return park_youngest(sched, recv_req)
+    # PRIORITY LANES 1008 (L2): ``rids`` / ``hold`` name a LANE park (only those requests, no sleep
+    # follows); an empty body of both is the flip park below, untouched.
+    lane_rids = [str(r) for r in (getattr(recv_req, "rids", None) or []) if str(r)]
+    lane_hold = str(getattr(recv_req, "hold", "") or "")
+    if lane_rids or lane_hold:
+        return park_rids(sched, recv_req, rids=lane_rids, hold=lane_hold)
     if not d_seats.d_flip_park_active():
         return Weg2ParkRunningReqOutput(
             success=False, parked=[], epoch=epoch,
@@ -137,7 +147,7 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
     parked = parked_list(sched)
     if getattr(sched, "weg2_dormant", False):
         return Weg2ParkRunningReqOutput(
-            success=True, parked=[str(r.rid) for r in parked], epoch=epoch,
+            success=True, parked=[str(r.rid) for r in parked if not d_lane.lane_held(r)], epoch=epoch,
             message="group D is dormant: nothing runs, the listed requests were parked earlier",
         )
     if getattr(sched, "anchor_tails", None):
@@ -276,7 +286,9 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
     # whole park, D decoded the parked requests again while the front, told
     # they were parked, flipped (quiesce never idle -> W3). Rank-local
     # monotonic, like every stamp here; park_tick MIN-reduces the verdict.
-    for req in sched.weg2_d_parked:
+    # PRIORITY LANES 1008 (L2): a lane hold keeps its own stamp and is no part of this flip park's answer
+    _flip_list = [r for r in sched.weg2_d_parked if not d_lane.lane_held(r)]
+    for req in _flip_list:
         setattr(req, d_seats.SINCE_ATTR, now)
     sched._weg2_d_park_slept = False
     # PARK-SETTLE: the settle is in the park list now (above), so nothing
@@ -284,14 +296,14 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
     late_hold = bool(late_hold_armed)
     setattr(sched, LATE_HOLD_ATTR, now if late_hold else None)
     setattr(sched, FLIP_PARK_OPEN_ATTR, epoch)  # CAPPARK-FLIP-HOLD: until the sleep / awake re-queue
-    rids = [str(r.rid) for r in sched.weg2_d_parked if d_seats.park_site(r) is not None]
-    held = [str(r.rid) for r in sched.weg2_d_parked if d_seats.park_site(r) is None]
+    rids = [str(r.rid) for r in _flip_list if d_seats.park_site(r) is not None]
+    held = [str(r.rid) for r in _flip_list if d_seats.park_site(r) is None]
     # #59b: the depth each parked request resumes from, after the retraction
     # above retained its span (every rank parks the same list).
     _ph("l3mark")
     resumable = weg2_resumable_depth.park_depths(
         getattr(sched, "tree_cache", None),
-        [r for r in sched.weg2_d_parked if d_seats.park_site(r) is not None],
+        [r for r in _flip_list if d_seats.park_site(r) is not None],
         getattr(sched, "ps", None),
     )
     _ph("depth")
@@ -330,6 +342,433 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
     )
 
 
+def _land_inflight(sched, keep_chunked=None) -> None:
+    """The in-flight batch lands first (park_running's shape): its result is processed, an extend batch
+    joins the running batch. This landing IS the chunk boundary of a chunked prefill: the launched chunk is
+    over, ``inflight_middle_chunks`` is back to 0, nothing is running on the request's rows.
+
+    LANES FIX 1 (metal jjbbrx probe 3): ``keep_chunked`` = the chunked request that is NOT being parked. It
+    stays the chunked request, so it is excluded from the merge exactly as ``get_next_batch_to_run`` excludes it
+    (``chunked_req_to_exclude.add(self.chunked_req)``); merged with a prefill that is not finished it would
+    decode from an incomplete prompt. ``None`` (the flip park's and upstream ``pause_generation``'s shape) merges
+    everything: the chunked request is then a member of the running batch and the caller retracts it."""
+    if sched.enable_overlap and sched.last_batch and sched.result_queue:
+        tmp_batch, tmp_result = sched.result_queue.popleft()
+        sched.process_batch_result(tmp_batch, tmp_result)
+    last = sched.last_batch
+    if last and last.forward_mode.is_extend():
+        last.filter_batch(chunked_req_to_exclude=[keep_chunked] if keep_chunked is not None else [])
+        if not last.is_empty():
+            if sched.running_batch.is_empty():
+                sched.running_batch = last
+            else:
+                sched.running_batch.merge_batch(last)
+    sched.last_batch = None
+
+
+def _unmerge_chunk(sched, chunk) -> None:
+    """LANES FIX 1b (review round 1): ``park_rids`` of the chunked request merged it into the running batch
+    (``_land_inflight(keep_chunked=None)``). Every return BEFORE the retract must undo that merge: the unfinished
+    prefill would otherwise decode in ``running_batch`` while ``sched.chunked_req`` keeps chunking it (double
+    membership). Taking it out again restores exactly what ``get_next_batch_to_run`` would have made of the
+    landing (the chunked request is excluded from the merge). No-op when it is not in the batch."""
+    rb = sched.running_batch
+    if chunk is None or rb.is_empty() or not any(r is chunk for r in rb.reqs):
+        return
+    rb.filter_batch(chunked_req_to_exclude=[chunk])
+
+
+def _retract_subset(sched, reqs, sel) -> list:
+    """Retract exactly ``reqs[i] for i in sel`` RETAINING their spans (``release_req(retain=True)`` per request,
+    then one ``filter_batch(keep_indices=...)`` -- the shape of ``retract_decode`` and of SA (3)'s
+    ``_displace_at``). The requests not selected stay in the running batch and keep decoding."""
+    batch = sched.running_batch
+    chosen = set(sel)
+    for k, idx in enumerate(sel):
+        batch.release_req(idx, len(sel) - k, sched.server_args, retain=True)
+    batch.filter_batch(keep_indices=[i for i in range(len(reqs)) if i not in chosen])
+    return [reqs[i] for i in sel]
+
+
+def _release_outside_chunk(sched, req):
+    """LANES FIX 1: retract a chunked prefill request that is NOT a member of any batch (the pass after its last
+    chunk ran a decode batch, so ``last_batch`` carried no extend batch to merge it from): the rows go back to the
+    tree with ``is_insert=True`` (``release_req(retain=True)``, the same call the batch retract makes) and the
+    request is reset for the retract. Its previous chunk was stashed at the head of that pass
+    (``get_next_batch_to_run``). Returns the request."""
+    from sglang.srt.managers.schedule_batch import release_req as _release_req
+
+    _release_req(
+        req=req, remaing_req_count=1, server_args=sched.server_args,
+        req_to_token_pool=sched.req_to_token_pool,
+        token_to_kv_pool_allocator=sched.token_to_kv_pool_allocator,
+        tree_cache=sched.tree_cache, hisparse_coordinator=getattr(sched, "hisparse_coordinator", None),
+        retain=True,
+    )
+    return req
+
+
+def park_rids(sched, recv_req, *, rids, hold: str = ""):
+    """PRIORITY LANES 1008 (L2), plan section 2 "D (Decode)": ``park_running`` with ``rids`` -- retract ONLY
+    these running requests, RETAINING their span (KV, the node's GDN/Mamba anchor, the draft rows) with a forced
+    host write-through, exactly as the flip park does for all of them; NO sleep follows and NOTHING else is
+    touched: the other running requests decode on, the queue stays as it is, no late hold and no flip-park
+    window is opened (``LATE_HOLD_ATTR`` / ``FLIP_PARK_OPEN_ATTR`` stay as they were).
+
+    ``hold="lane"`` marks every parked request with :data:`d_lane.LANE_HOLD_ATTR`: it takes part in neither
+    the 30-s awake re-queue nor the #248h capacity re-queue nor the sleep's dormant hold, and is not
+    preferred by ``order_waiting``, until ``lane_floor`` re-queues it (floor <= its lane). Without ``hold``
+    the parked requests are an ordinary flip-site park (the 30-s re-queue brings them back). The park site
+    is ``flip``: on the re-queue the request resumes first, oldest first, as soon as it fits.
+
+    A CHUNKED PREFILL on D (plan section 0/1: "Prefill wird an der CHUNK-GRENZE geparkt"): the RPC runs on the
+    scheduler thread between two passes, so no chunk of it is launched; the in-flight one lands first
+    (:func:`_land_inflight`) -- that landing is the chunk boundary. The request is then retracted like a decode
+    seat, its span of finished chunks retained (page-aligned, ``WEG2-D-PARK RETAINED retained=N of M``; the rest
+    is computed at the resume) and -- the part the first Lane park missed -- ``sched.chunked_req`` is released
+    with it (``None``: the next ``get_next_batch_to_run`` reads ``chunked_req.extend_range``, which the retract
+    reset). A chunked request of ANOTHER lane stays the chunked request and is kept out of the merge.
+
+    Answered like the flip park (``parked`` = the rids that left the batch, ``held`` = requested rids that
+    only wait on D and are kept back by the floor alone) plus ``lane=True`` and ``lane_skipped`` (requested
+    rid -> why it was not parked). Refused (nothing parked) when the switch ``SGLANG_WEG2_LANES`` is off, off
+    group D, ``hold`` is unknown or given without ``rids``, anchor tails are present, or -- under
+    speculative decoding, where only the BACK of the batch may leave -- the rids are not the batch's tail."""
+    from sglang.srt.managers.io_struct import Weg2ParkRunningReqOutput
+    from sglang.srt.mem_cache.base_prefix_cache import FORCE_HOST_WRITE_THROUGH_ATTR
+    from sglang.srt.weg2 import lanes
+
+    epoch = int(getattr(recv_req, "epoch", 0) or 0)
+
+    def _out(ok, parked, msg, held=(), skipped=None, resumable=None):
+        return Weg2ParkRunningReqOutput(
+            success=ok, parked=list(parked), held=list(held), epoch=epoch, message=msg,
+            weg2_resumable_depth=dict(resumable or {}), lane=True, lane_skipped=dict(skipped or {}),
+        )
+
+    if hold not in ("", d_lane.HOLD_LANE):
+        return _out(False, [], f"W-PARK refused: unknown hold {hold!r} (only 'lane') -- nothing parked")
+    if hold and not rids:
+        return _out(False, [], "W-PARK refused: hold=lane needs rids -- nothing parked")
+    if not lanes.enabled():
+        return _out(False, [], "W-PARK refused: rids/hold need SGLANG_WEG2_LANES=1 on this server -- "
+                               "nothing parked")
+    if not d_seats.d_flip_park_active():
+        return _out(False, [], "W-PARK refused: not group D (or SGLANG_WEG2_D_PARK=0, or neither the "
+                               "standard form nor SGLANG_WEG2_D_PARK_IMMEDIATE) -- nothing parked")
+    want = [str(r) for r in rids]
+    if getattr(sched, "weg2_dormant", False):
+        return _out(True, [], "group D is dormant: nothing runs, nothing parked",
+                    skipped={r: "dormant" for r in want})
+    if getattr(sched, "anchor_tails", None):
+        return _out(False, [], "W-PARK refused: anchor tails present (a P-group structure) -- nothing parked")
+    t0 = time.perf_counter()
+    # LANES FIX 4 (minor, NF metal 5 probe 5: LANE-PREEMPT floor=1 902 ms for 3 decodes, the park body 815 ms, no phase in the log): the
+    # phases of this park on the scheduler thread, one line after the park(lane) line (log only; the flip park has the same in
+    # WEG2-FLIPCYCLE stage=park sub=)
+    _pt = [t0]
+    _pk: list = []
+
+    def _ph(name):
+        now_ = time.perf_counter()
+        _pk.append((name, (now_ - _pt[0]) * 1000.0))
+        _pt[0] = now_
+
+    wanted = set(want)
+    chunk = getattr(sched, "chunked_req", None)
+    park_chunk = chunk is not None and str(getattr(chunk, "rid", "")) in wanted
+    _land_inflight(sched, keep_chunked=None if (park_chunk or chunk is None) else chunk)
+    _ph("land")
+    if not sched.running_batch.is_empty():
+        sched.running_batch.filter_batch()
+    running_batch = sched.running_batch
+    reqs = list(running_batch.reqs) if not running_batch.is_empty() else []
+    sel = [i for i, r in enumerate(reqs) if str(r.rid) in wanted]
+    running_ids = {str(reqs[i].rid) for i in sel}
+    parked = parked_list(sched)
+    queued_ids = {str(getattr(q, "rid", "")) for q in list(getattr(sched, "waiting_queue", None) or [])
+                  + list(getattr(sched, "weg2_dormant_hold", None) or [])
+                  + list(getattr(sched, "weg2_post_wake_settle", None) or [])}
+    chunk_id = str(getattr(chunk, "rid", "")) if chunk is not None else None
+    skipped, held_ids, already = {}, [], []
+    # LANES FIX 2 (metal 180335): a requested rid that only waits in ``waiting_queue`` is taken into the lane hold below
+    # (it used to be named ``held`` and left in the queue: a request the floor keeps out of admission forever, and the
+    # queue is an idle term of D's flush -- the D->P quiesce never saw an idle group).
+    wq_ids = {str(getattr(q, "rid", "")) for q in list(getattr(sched, "waiting_queue", None) or [])}
+    queued_take: list = []
+    outside = None  # the chunked request to park that is in no batch (see _release_outside_chunk)
+    for rid in want:
+        if rid in running_ids:
+            continue
+        if any(str(r.rid) == rid for r in parked):
+            already.append(rid)
+        elif rid in wq_ids and not (chunk is not None and rid == str(getattr(chunk, "rid", ""))):
+            queued_take.append(rid)
+        elif rid in queued_ids:
+            held_ids.append(rid)
+        elif chunk_id is not None and rid == chunk_id:
+            if int(getattr(chunk, "inflight_middle_chunks", 0) or 0) > 0 or getattr(chunk, "req_pool_idx", 0) is None:
+                # a chunk of it still writes its rows (cannot be after the landing) or it holds none yet
+                skipped[rid] = "in a chunked prefill on D with a chunk in flight or no rows yet: asked again"
+            else:
+                outside = chunk
+        else:
+            skipped[rid] = "not running here (finished or not admitted)"
+    if not hold:
+        held_ids.extend(queued_take)  # no lane hold asked: a queued rid stays only queued (named, as before)
+        queued_take = []
+    if hold:
+        # a request the flip park already holds, asked for a lane hold: it waits for its floor from now on
+        for r in parked:
+            if str(r.rid) in already:
+                d_lane.mark_hold(r)
+    spec = not (getattr(running_batch, "spec_algorithm", None) is None
+                or running_batch.spec_algorithm.is_none())
+    if spec and sel and sel != list(range(len(reqs) - len(sel), len(reqs))):
+        # SPEC BACK-ONLY REMOVAL INVARIANT (kv_session_offload.spec_decline_non_back_spill): only the back of
+        # the batch may leave under speculative decoding -- named, nothing parked, the front asks again
+        if park_chunk:
+            _unmerge_chunk(sched, chunk)  # nothing parked: the chunk goes back to being only chunked_req
+        return _out(False, [], "W-PARK refused: the rids are not the back of the batch under speculative "
+                               "decoding -- nothing parked, the front asks again",
+                    held=held_ids, skipped=skipped)
+    if not sel and outside is None:
+        if park_chunk:
+            _unmerge_chunk(sched, chunk)
+        moved_ids = _take_queued(sched, queued_take, held_ids)
+        return _out(True, already + moved_ids,
+                    "nothing to retract: no requested rid is running here" if not moved_ids
+                    else "nothing to retract; %d queued request(s) taken into the lane hold" % len(moved_ids),
+                    held=held_ids, skipped=skipped)
+    sel_reqs = [reqs[i] for i in sel] + ([outside] if outside is not None else [])
+    rest = [r for i, r in enumerate(reqs) if i not in set(sel)]
+    for req in sel_reqs:
+        setattr(req, FORCE_HOST_WRITE_THROUGH_ATTR, True)
+        setattr(req, _mad_park.PARK_REQ_ATTR, True)
+        setattr(req, d_park_read.RETAINED_ATTR, None)
+    _ph("select")
+    d_park_draft.save_parked(sched, sel_reqs, site=d_seats.SITE_FLIP)
+    rearmed = rearm_window_draft_cold(sched, sel_reqs)
+    _ph("draft")
+    _park_end(sched, sel_reqs, also_live=rest)
+    _ph("end")
+    park_hold_yield.begin(getattr(sched, "tree_cache", None))
+    _pl_before = _poolleak.park_snapshot(sched, sel_reqs, phase="before-retract", epoch=epoch)
+    def _retract_all_wanted():
+        out = _retract_subset(sched, reqs, sel) if sel else []
+        if outside is not None:
+            out.append(_release_outside_chunk(sched, outside))
+        return out
+
+    retracted = park_retract_split.run_split(getattr(sched, "tree_cache", None), _retract_all_wanted, epoch)
+    _ph("retract")
+    # LANES FIX 1 (metal jjbbrx probe 3): the chunked request left with the retract -- the scheduler must not
+    # keep pointing at it (the next pass reads ``chunked_req.extend_range.end``, None after the retract: the
+    # AttributeError that killed D). The flip park does the same (``sched.chunked_req = None``).
+    chunk_parked = chunk is not None and any(r is chunk for r in retracted)
+    if chunk_parked:
+        sched.chunked_req = None
+    _poolleak.park_snapshot(sched, sel_reqs, phase="after-retract", epoch=epoch)
+    running_batch.batch_is_full = False
+    now = time.monotonic()
+    for req in retracted:
+        d_seats.mark_parked(req, d_seats.SITE_FLIP, epoch=epoch, now=now)
+        if hold:
+            d_lane.mark_hold(req)
+        sched._969ad_note_retract(req, "weg2_park_running")
+        _hb.note_origin(req.rid, _hb.ORIGIN_PARK)  # ZR: the resume computes 0 tokens again
+        d_park_read.clear_read_cycle(req)  # a new read cycle (the flip park's rule)
+        if d_park_read.stamp_parked(req) is not None:
+            logger.info("WEG2-D-PARK RETAINED rid=%s %s", str(req.rid), d_park_read.describe(req))
+    sched.weg2_d_parked = list(parked) + d_seats.park_running_order(retracted)
+    park_hold_yield.settle(sched, retracted=retracted, parked=sched.weg2_d_parked)
+    try:
+        from sglang.srt.weg2 import park_l3
+
+        park_l3.mark_parked(sched, retracted)  # #248: kept by ORDER (a flip may follow before the floor falls)
+    except Exception:  # noqa: BLE001 - the order is an improvement, never a wall
+        logger.warning("#248 PARK-MARK failed", exc_info=True)
+    resumable = weg2_resumable_depth.park_depths(
+        getattr(sched, "tree_cache", None), list(retracted), getattr(sched, "ps", None))
+    if resumable:
+        bigram = bool(getattr(getattr(sched, "tree_cache", None), "is_eagle", False))
+        for req in retracted:
+            before = d_park_read.read_cap(req)
+            if d_park_read.clamp_to_resumable(
+                req, resumable.get(str(req.rid)), is_bigram=bigram
+            ) is not None:
+                logger.info("WEG2-D-PARK READ=RESUMABLE rid=%s cap %s -> %s",
+                            str(req.rid), before, d_park_read.describe(req))
+    _poolleak.ledger_line(sched, epoch=epoch, before=_pl_before)
+    parked_ids = [str(r.rid) for r in retracted]
+    _ph("rest")
+    logger.info(
+        "%s rids=%s ms=%.0f epoch=%d floor=%d hold=%s running_left=%d held=%s skipped=%s chunk_boundary=%d -- "
+        "retracted with the span retained and a forced host write-through, no sleep follows, the others decode "
+        "on (chunk_boundary=1: a chunked prefill was parked at its chunk border and released as the chunked "
+        "request)%s",
+        lanes.MARK_D_PARK_PARK, parked_ids, (time.perf_counter() - t0) * 1000.0, epoch,
+        d_lane.floor_of(sched), hold or "-", len(rest), held_ids, skipped or "-", 1 if chunk_parked else 0,
+        (" (DFlash window draft: %d resume(s) re-armed like a fresh hand-off)" % rearmed if rearmed else ""),
+    )
+    logger.info(
+        "%s n=%d ms=%.0f epoch=%d sub=%s -- the phases of the park(lane) line above on the scheduler thread (land = the in-flight batch "
+        "lands, select, draft = draft rows saved, end = the END state of each request gathered as park tail parts, retract = "
+        "cache_finished_req with the forced write-through (see WEG2-PARK-RETRACT-SPLIT), rest = marks, L3 order, resumable depths)",
+        lanes.MARK_D_PARK_PHASES, len(retracted), (time.perf_counter() - t0) * 1000.0, epoch,
+        ",".join("%s:%.0f" % kv for kv in _pk),
+    )
+    moved_ids = _take_queued(sched, queued_take, held_ids)
+    return _out(True, already + parked_ids + moved_ids,
+                "parked %d (lane), %d queued taken into the lane hold, %d only queued, %d skipped"
+                % (len(parked_ids), len(moved_ids), len(held_ids), len(skipped)),
+                held=held_ids, skipped=skipped, resumable=resumable)
+
+
+def lane_floor(sched, recv_req):
+    """PRIORITY LANES 1008 (L2): ``POST /weg2/lane_floor {floor, epoch}`` (``lanes.RPC_LANE_FLOOR``) on
+    group D -- the floor of D's admission. The scheduler's admission lets in only requests with
+    ``priority >= floor`` (``Scheduler._weg2_lane_skip``); a request below it waits in the queue (or in its
+    lane hold) and is no victim and no reason for a displacement. Every lane hold whose lane is AT OR ABOVE
+    the new floor is re-queued in ARRIVAL order (oldest first, its age untouched) at the queue head --
+    ``lanes.MARK_D_PARK_REQUEUE`` -- and resumes before anything else.
+
+    Epoch rule: the front counts every floor change (``LaneState.set_floor``); a body with an epoch below the
+    one this scheduler holds -- or the same epoch and another floor -- is STALE and refused (nothing changes);
+    the same epoch and the same floor is a no-op; ``{"floor": 0, "epoch": 0}`` is the front's (re)start and is
+    always taken. Answered with the floor / epoch now in force, the re-queued rids and the number of holds
+    still standing. Off: a refusal naming the switch; off group D: success, nothing applied (P's half is the
+    P side of the plan)."""
+    from sglang.srt.managers.io_struct import Weg2LaneFloorReqOutput
+    from sglang.srt.weg2 import lanes, progress_beacon
+
+    floor = max(0, int(getattr(recv_req, "floor", 0) or 0))
+    epoch = int(getattr(recv_req, "epoch", 0) or 0)
+
+    def _out(ok, msg, requeued=()):
+        n_held = sum(1 for r in (getattr(sched, "weg2_d_parked", None) or []) if d_lane.lane_held(r))
+        return Weg2LaneFloorReqOutput(
+            success=ok, floor=d_lane.floor_of(sched), epoch=d_lane.epoch_of(sched),
+            requeued=list(requeued), held=n_held, message=msg,
+        )
+
+    if not lanes.enabled():
+        return _out(False, "W-LANE refused: /weg2/lane_floor needs SGLANG_WEG2_LANES=1 on this server")
+    if str(os.environ.get(d_seats.GROUP_ENV, "")).strip().upper() != "D":
+        return _out(True, "not group D: the floor is not applied here (D's admission only)")
+    cur_f, cur_e = d_lane.floor_of(sched), d_lane.epoch_of(sched)
+    if (floor, epoch) == (cur_f, cur_e):
+        return _out(True, "floor unchanged")
+    reset = floor == 0 and epoch == 0
+    if not reset and (epoch < cur_e or (epoch == cur_e and floor != cur_f)):
+        logger.warning("WEG2-D-LANE floor STALE floor=%d epoch=%d (held: floor=%d epoch=%d): refused", floor, epoch,
+                       cur_f, cur_e)
+        return _out(False, f"W-LANE refused: stale epoch {epoch} (held {cur_e}) -- nothing changed")
+    setattr(sched, d_lane.FLOOR_ATTR, floor)
+    setattr(sched, d_lane.EPOCH_ATTR, epoch)
+    progress_beacon.beat_lane(floor, epoch)  # the watchdogs read a hold, not a stall
+    requeued = _lane_requeue(sched, floor, cur_f, epoch)
+    logger.info("%s %d->%d epoch=%d->%d requeued=%d held_left=%d -- D admits lanes >= %d only",
+                d_lane.MARK_D_FLOOR, cur_f, floor, cur_e, epoch, len(requeued),
+                sum(1 for r in (getattr(sched, "weg2_d_parked", None) or []) if d_lane.lane_held(r)), floor)
+    return _out(True, "floor %d->%d, %d re-queued" % (cur_f, floor, len(requeued)), requeued)
+
+
+def _lane_requeue(sched, floor: int, was: int, epoch: int) -> list:
+    """The lane holds whose lane is at or above ``floor`` leave the hold: re-queued at the queue head in
+    ARRIVAL order (``d_seats.park_running_order``: the front arrival / ``kv_arrival_seq`` the request has
+    always carried -- the hold changed neither), the hold cleared. Returns their rids, oldest first."""
+    from sglang.srt.weg2 import lanes
+
+    parked = getattr(sched, "weg2_d_parked", None) or []
+    out = [r for r in parked if d_lane.lane_held(r) and d_lane.lane_of_req(r) >= floor]
+    if not out:
+        return []
+    ids = {id(r) for r in out}
+    sched.weg2_d_parked = [r for r in parked if id(r) not in ids]
+    ordered = d_seats.park_running_order(out)
+    for req in ordered:
+        d_lane.clear_hold(req)
+        sched._add_request_to_queue(req, is_retracted=True)
+    _to_queue_head(sched, ordered)
+    logger.info("%s n=%d rids=%s floor=%d->%d epoch=%d -- the held lane parks of lanes >= %d resume first, "
+                "oldest first (arrival order, their age kept)", lanes.MARK_D_PARK_REQUEUE, len(ordered),
+                [str(r.rid) for r in ordered], was, floor, epoch, floor)
+    return [str(r.rid) for r in ordered]
+
+
+def _take_queued(sched, queued_take, held_ids) -> list:
+    """The lane park's queued rids (:func:`hold_queued` with ``rids``): the ids moved into the hold; a named rid that D's
+    OWN floor does not hold (the floor RPC and the park RPC travel side by side, the park may be served first) stays
+    queued and is named ``held`` -- the pass rule takes it as soon as the floor stands."""
+    if not queued_take:
+        return []
+    moved = [str(r.rid) for r in hold_queued(sched, rids=queued_take)]
+    held_ids.extend(r for r in queued_take if r not in moved)
+    return moved
+
+
+def hold_queued(sched, rids=None) -> list:
+    """LANES FIX 2 (metal jjbbrx 18:03:35Z, probe 2b: server stop W3 Weg2DrainWitnessDisagreement).  A request that is
+    below D's lane floor and only WAITS in ``waiting_queue`` (a hand-off that reached D after its P leg, a late
+    arrival, a request the wake released) is taken out of the queue into the LANE HOLD -- ``weg2_d_parked`` with
+    :data:`d_lane.LANE_HOLD_ATTR`, the place a retracted lane park already sits in.  One definition of "held" on D.
+
+    Why: the admission skip (``Scheduler._weg2_lane_skip``) kept such a request in ``waiting_queue`` for as long as the
+    floor stood, and ``Scheduler.is_fully_idle`` counts the queue -- so the D->P flip's quiesce polled ``/flush_cache``
+    -> 400 ``not-idle because: waiting_queue`` for 22 s while the front, which books every lane-held rid out of its
+    flip ledger, saw nothing to wait for (and, with an empty ledger, no flip park to send): ``front ledger []
+    (outstanding ['weg2-6-18']) vs group(D) flush_cache -> Flush cache failed`` -> W3, the server stopped.  The held
+    request owns no device rows (the admission skip comes before the match); the park list is what the flip park and
+    the sleep already move such a request through (``park_running`` takes ``queued`` into ``weg2_d_parked``).
+
+    ``rids`` None = the per-pass rule (every queued request of a lane below the floor, floor > 0: called from
+    ``get_next_batch_to_run``); a list = those of the named queued rids that D's floor holds (the front's lane park RPC
+    asked for them).  Never a request of a lane at or above D's floor: the higher lane is not blocked, and a hold that no
+    floor change ends would lose the request.
+    Group D, awake, ``SGLANG_WEG2_LANES=1`` only (else ``[]``).  Replicated: the queue, the floor and the switch are
+    group-uniform, so every rank moves the same requests at the same pass.  Returns the requests moved, oldest first.
+    The hold ends where every lane hold ends: ``lane_floor`` re-queues it at the queue head when the floor falls to
+    its lane (the re-intake prefetches it from the store like any retracted park)."""
+    from sglang.srt.weg2 import lanes
+
+    if not lanes.enabled() or not d_seats.d_flip_park_active() or getattr(sched, "weg2_dormant", False):
+        return []
+    queue = list(getattr(sched, "waiting_queue", None) or [])
+    if not queue:
+        return []
+    if rids is None:
+        floor = d_lane.floor_of(sched)
+        if floor <= 0:
+            return []
+        take = [q for q in queue if d_lane.lane_of_req(q) < floor]
+    else:
+        # named by the front's lane park RPC: only what D's own floor holds -- a request its admission would let in must
+        # never enter a hold nothing ends (the hold ends on a floor CHANGE: ``lane_floor``); the floor RPC and the park RPC
+        # travel side by side, so a park served first leaves the request queued and the pass rule takes it with the floor
+        want = {str(r) for r in rids}
+        take = [q for q in queue if str(getattr(q, "rid", "")) in want and d_lane.below_floor(sched, q)]
+    if not take:
+        return []
+    ids = {id(q) for q in take}
+    sched.waiting_queue = [q for q in queue if id(q) not in ids]
+    ordered = d_seats.park_running_order(take)
+    for req in ordered:
+        d_lane.mark_hold(req)
+    sched.weg2_d_parked = list(parked_list(sched)) + ordered
+    try:
+        from sglang.srt.weg2 import park_l3
+
+        park_l3.mark_parked(sched, ordered)  # #248: kept by ORDER over a flip that may follow before the floor falls
+    except Exception:  # noqa: BLE001 - the order is an improvement, never a wall
+        logger.warning("#248 PARK-MARK failed", exc_info=True)
+    logger.info("%s n=%d rids=%s floor=%d via=%s -- requests below D's floor that only waited in the queue are in "
+                "the lane hold now (not an idle blocker any more; they leave it when the floor falls to their lane)",
+                d_lane.MARK_D_HOLD_QUEUED, len(ordered), [str(r.rid) for r in ordered], d_lane.floor_of(sched),
+                "rpc" if rids is not None else "pass")
+    return ordered
+
+
 def hold_late_arrival(sched, req) -> bool:
     """H91c3-2: a NEW request (never a re-queue) that reaches D between
     ``park_running`` and the sleep joins the park's list as held (no park
@@ -351,7 +790,7 @@ def hold_late_arrival(sched, req) -> bool:
     return True
 
 
-def _park_end(sched, running, *, reduce_min=None) -> int:
+def _park_end(sched, running, *, reduce_min=None, also_live=()) -> int:
     """F4 (#259 4c, SGLANG_WEG2_ENABLE_D_PARK_END): every rank writes its
     part of each running request's END state (weg2/tail_handoff
     ``publish_park_end``) -- the resume adopts it as E2's skip instead of
@@ -366,7 +805,10 @@ def _park_end(sched, running, *, reduce_min=None) -> int:
     tp_rank = int(getattr(ps, "tp_rank", getattr(sched, "tp_rank", 0)) or 0)
     tp_size = int(getattr(ps, "tp_size", getattr(sched, "tp_size", 1)) or 1)
     # leak (29.09.): the parts of rids D no longer holds leave before new ones come
-    n_reaped, reaped = th.reap_orphan_parks(_live_rids(sched, running), f"{th.PARK_PART}{tp_rank}")
+    live = _live_rids(sched, running)
+    # PRIORITY LANES 1008 (L2): a lane park leaves the other requests of the batch running; they are live
+    live.update(str(getattr(r, "rid", "")) for r in also_live)
+    n_reaped, reaped = th.reap_orphan_parks(live, f"{th.PARK_PART}{tp_rank}")
     if n_reaped:
         logger.info("F4 PARK-REAP files=%d rids=%s (parts of rids D no longer holds)",
                     n_reaped, list(reaped))
@@ -494,7 +936,10 @@ def hold_parked(sched, *, hold_armed: bool) -> int:
     awake pass re-queues them."""
     setattr(sched, LATE_HOLD_ATTR, None)  # H91c3-2: the sleep closes the late hold
     setattr(sched, FLIP_PARK_OPEN_ATTR, None)  # CAPPARK-FLIP-HOLD: ... and the flip park
-    parked = list(getattr(sched, "weg2_d_parked", None) or [])
+    all_parked = list(getattr(sched, "weg2_d_parked", None) or [])
+    # PRIORITY LANES 1008 (L2): a lane hold waits for its floor, not for the wake -- it stays in the list
+    lane_kept = [r for r in all_parked if d_lane.lane_held(r)]
+    parked = [r for r in all_parked if not d_lane.lane_held(r)] if lane_kept else all_parked
     if not parked:
         return 0
     if not hold_armed:
@@ -513,7 +958,7 @@ def hold_parked(sched, *, hold_armed: bool) -> int:
     # W50 holds of that boot were re-queued at once, the second one of a phase
     # (weg2-62-182) held.
     sched._weg2_d_park_slept = False
-    sched.weg2_d_parked = []
+    sched.weg2_d_parked = lane_kept
     for req in parked:
         # PARK-SETTLE: held over the sleep, a folded settle request is hold work
         # like the rest -- the wake's #1471 verdict reads it again.
@@ -548,6 +993,13 @@ def park_tick(sched) -> int:
     parked = getattr(sched, "weg2_d_parked", None)
     if not parked or getattr(sched, "weg2_dormant", False):
         return 0
+    # PRIORITY LANES 1008 (L2): a lane hold takes part in neither the awake re-queue (30 s) nor the #248h
+    # capacity re-queue -- it leaves the hold when the floor falls to its lane (``lane_floor``)
+    lane_kept = [r for r in parked if d_lane.lane_held(r)]
+    if lane_kept:
+        parked = [r for r in parked if not d_lane.lane_held(r)]
+        if not parked:
+            return 0
     due = bool(getattr(sched, "_weg2_d_park_slept", False))
     if not due:
         local = d_seats.awake_requeue_due(
@@ -557,9 +1009,9 @@ def park_tick(sched) -> int:
     if not due:
         if _flip_park_holds_capacity(sched, parked):
             return 0
-        return _capacity_requeue(sched, parked)
+        return _capacity_requeue(sched, parked, lane_kept)
     moved = list(parked)
-    sched.weg2_d_parked = []
+    sched.weg2_d_parked = lane_kept
     sched._weg2_d_park_slept = False
     setattr(sched, LATE_HOLD_ATTR, None)  # H91c3-2: the re-queue closes the late hold
     setattr(sched, FLIP_PARK_OPEN_ATTR, None)  # CAPPARK-FLIP-HOLD: ... and the flip park
@@ -611,7 +1063,7 @@ def _flip_park_holds_capacity(sched, parked) -> bool:
     return True
 
 
-def _capacity_requeue(sched, parked) -> int:
+def _capacity_requeue(sched, parked, lane_kept=()) -> int:
     """#248h: the capacity-parked requests (``resume_via_p.park_for_capacity``)
     re-join the queue head as soon as the arena holds their re-read -- the
     other parked requests keep waiting for their P leg / the awake bound.
@@ -626,7 +1078,7 @@ def _capacity_requeue(sched, parked) -> int:
     if not moved:
         return 0
     ids = {id(r) for r in moved}
-    sched.weg2_d_parked = [r for r in parked if id(r) not in ids]
+    sched.weg2_d_parked = [r for r in parked if id(r) not in ids] + list(lane_kept)
     for req in moved:
         setattr(req, _rvp.CAPPARK_AT_ATTR, None)  # a re-park stamps it again
         sched._add_request_to_queue(req, is_retracted=True)
@@ -780,6 +1232,43 @@ def _lift_holds_when_idle(sched) -> None:
                    [r for r in released])
 
 
+def _lanes_on() -> bool:
+    from sglang.srt.weg2 import lanes
+
+    return bool(lanes.enabled())
+
+
+def _lane_of_rid(waiting, rid):
+    for q in waiting:
+        if str(getattr(q, "rid", "")) == str(rid):
+            return d_lane.lane_of_req(q)
+    return 0
+
+
+def _lane_pool(sched, reqs, older_rid, waiting, lanes_on):
+    """PRIORITY LANES 1008 (L2): the running requests a displacement for ``older_rid`` may take as victims --
+    never one of a HIGHER lane than the waiter's (plan section 2, D: ``displace_for_age`` and the
+    ARRIVAL-SEAT victim). Off: ``reqs``, the very list."""
+    if not lanes_on:
+        return reqs
+    lane = _lane_of_rid(waiting, older_rid)
+    return [r for r in reqs if d_lane.lane_of_req(r) <= lane]
+
+
+def _displace_candidate(sched, _sa, waiting, reqs, lanes_on):
+    """``(older_waiting, youngest_running)`` of SA (3). Off: ``seat_age.displace_victim`` over the whole queue
+    and batch, as before. On: the oldest waiter (admissible: the caller filtered the floor) that has a victim
+    among the running requests of ITS lane or below."""
+    if not lanes_on:
+        return _sa.displace_victim([str(q.rid) for q in waiting], [str(r.rid) for r in reqs], True)
+    for q in sorted(waiting, key=lambda w: _sa.rid_age(str(w.rid))):
+        pool = [str(r.rid) for r in reqs if d_lane.lane_of_req(r) <= d_lane.lane_of_req(q)]
+        cand = _sa.displace_victim([str(q.rid)], pool, True)
+        if cand is not None:
+            return cand
+    return None
+
+
 def displace_for_age(sched, running_batch) -> Optional[str]:
     """SA (3) (#244, the user's design): an older request waits on D while
     every seat is held and a YOUNGER one runs -> the youngest running one is
@@ -823,10 +1312,15 @@ def displace_for_age(sched, running_batch) -> Optional[str]:
     except Exception:  # noqa: BLE001
         pass
     waiting = [q for q in sched.waiting_queue if d_seats.park_site(q) != d_seats.SITE_PRESSURE]
+    lanes_on = _lanes_on()
+    if lanes_on:
+        # PRIORITY LANES 1008 (L2): a waiter the floor keeps out cannot be admitted -- no reason to
+        # displace anybody for it
+        waiting = [q for q in waiting if d_lane.admissible_for_displace(sched, q)]
     trigger = "seat"
     pair = None
     if cap and len(reqs) >= int(cap):
-        cand = _sa.displace_victim([str(q.rid) for q in waiting], [str(r.rid) for r in reqs], True)
+        cand = _displace_candidate(sched, _sa, waiting, reqs, lanes_on)
         if cand is not None:
             # NF review of 2d49cd45bf: the seat trigger freed a seat without asking
             # whether the older one then FITS the KV -- a victim for nothing, against the
@@ -834,7 +1328,8 @@ def displace_for_age(sched, running_batch) -> Optional[str]:
             # The KV half is rank-local, so it goes through the group MIN like the KV
             # trigger (the precondition -- full seats, a candidate -- is replicated,
             # so every rank enters the collective).
-            local = kv_displace_would_fit(sched, cand[0], reqs, seat=True, view=no_token_view)
+            local = kv_displace_would_fit(sched, cand[0], _lane_pool(sched, reqs, cand[0], waiting, lanes_on),
+                                          seat=True, view=no_token_view)
             gm = getattr(sched, "_weg2_group_min_flags", None)
             agreed = bool(gm([local])[0]) if callable(gm) else bool(local)
             if agreed:
@@ -846,7 +1341,7 @@ def displace_for_age(sched, running_batch) -> Optional[str]:
         # read through the group MIN (_weg2_group_min_flags), entered by every
         # rank because the precondition is the same on every rank -- so the
         # group displaces only when EVERY rank refused (RAENGE-NIE-UNEINS).
-        cand = _sa.displace_victim([str(q.rid) for q in waiting], [str(r.rid) for r in reqs], True)
+        cand = _displace_candidate(sched, _sa, waiting, reqs, lanes_on)
         if cand is not None:
             local = no_token_rid is not None and _sa.rid_age(no_token_rid) <= _sa.rid_age(cand[0])
             if local:
@@ -854,7 +1349,8 @@ def displace_for_age(sched, running_batch) -> Optional[str]:
                 # wenn der ältere nicht draufpasst. nicht pauschal den jüngeren verdrängen" --
                 # only when displacing the youngest seats is ENOUGH for the older one (and it
                 # does not already fit); else nobody leaves and the backfill stays.
-                local = kv_displace_would_fit(sched, cand[0], reqs, view=no_token_view)
+                local = kv_displace_would_fit(sched, cand[0], _lane_pool(sched, reqs, cand[0], waiting, lanes_on),
+                                              view=no_token_view)
             gm = getattr(sched, "_weg2_group_min_flags", None)
             agreed = bool(gm([local])[0]) if callable(gm) else bool(local)
             if agreed:
@@ -973,6 +1469,11 @@ def park_youngest(sched, recv_req):
     if spec and idx != len(reqs) - 1:
         return _out(False, [], f"{rid} is not the back of the batch under speculative decoding: "
                                "refused, the front asks again")
+    if _lanes_on() and d_lane.lane_of_req(reqs[idx]) > d_lane.floor_of(sched):
+        # PRIORITY LANES 1008 (L2): never a victim of a lane above the floor (the active lane is the
+        # highest the front has released; a request above it is a floor still in flight)
+        return _out(False, [], f"{rid} is in lane {d_lane.lane_of_req(reqs[idx])}, above the floor "
+                               f"{d_lane.floor_of(sched)}: refused, nothing parked")
     _displace_at(sched, running_batch, reqs, idx)
     n = getattr(sched, "_weg2_asr_parked", 0) + 1
     sched._weg2_asr_parked = n
@@ -1324,9 +1825,16 @@ def admission(sched, running_batch):
     if not d_seats.d_park_active():
         settle = []
     pending = settle + list(getattr(sched, "weg2_dormant_hold", None) or [])
+    gate_waiting = sched.waiting_queue
+    if d_lane.floor_of(sched) > 0:
+        # PRIORITY LANES 1008 (L2): a request the floor keeps out (its lane is below the floor) is not
+        # admitted this pass whatever the park says (``Scheduler._weg2_lane_skip``), so the barrier does not
+        # wait for it and it holds no seat: the requests of the lane that runs are not held behind it
+        gate_waiting = [r for r in gate_waiting if not d_lane.below_floor(sched, r)]
+        pending = [r for r in pending if not d_lane.below_floor(sched, r)]
     avail = sched.uniform_min_avail() if book.margin_tokens >= 0 else None
     gate = d_seats.admission_gate(
-        sched.waiting_queue,
+        gate_waiting,
         running=list(running_batch.reqs),
         pending_outside=pending,
         avail_tokens=avail,

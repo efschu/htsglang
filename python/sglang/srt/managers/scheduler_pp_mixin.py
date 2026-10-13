@@ -6333,6 +6333,9 @@ class SchedulerPPMixin:
         # PP0 forms R_m for this pass (stamped on list m below). Non-blocking on
         # both ends, no collective (#1268's rule).
         self._weg2_pp_room_pass_hook()
+        # PRIORITY LANES 1008 (L3, weg2/lanes_p.py): PP0 applies the newest lane floor at the top of THIS pass and stamps
+        # it on list m below; nothing without an RPC.
+        self._weg2_lane_floor_pass_hook()
 
         # #631 REQ-TRACE (bounded): the check-2 wedge's open question is
         # where a relayed request dies between the consumed chain hop and
@@ -6440,6 +6443,11 @@ class SchedulerPPMixin:
                 from sglang.srt.weg2 import pp_room_vote as _pr
 
                 _wire_reqs = _pr.stamp_cap(_wire_reqs, self._weg2_pr_verdict)
+            # PRIORITY LANES 1008 (L3): the lane floor rides list m beside R_m; nothing without one.
+            if self.pp_group.is_first_rank and self.__dict__.get("_weg2_lane_stamp") is not None:
+                from sglang.srt.weg2 import pp_room_vote as _pr
+
+                _wire_reqs = _pr.stamp_lane_floor(_wire_reqs, self._weg2_lane_stamp)
             try:  # #1460: when did PP0 put a Weg-2 control request on the chain?
                 _ctrl = [type(r).__name__ for r in (_wire_reqs or ())
                          if type(r).__name__ in ("FlushCacheReqInput", "ReleaseMemoryOccupationReqInput",
@@ -6475,6 +6483,12 @@ class SchedulerPPMixin:
             _pr_tree = self.__dict__.get("tree_cache")
             if _pr_tree is not None:
                 _pr.apply_cap(_pr_tree, _pr_cap)
+            # PRIORITY LANES 1008 (L3): the lane floor off list m, applied in THIS pass as PP0 applied it.
+            recv_reqs, _lane_stamp = _pr.absorb_lane_floor(recv_reqs)
+            if _lane_stamp is not None:
+                from sglang.srt.weg2 import lanes_p as _lanes_p
+
+                _lanes_p.apply_follower(self, _lane_stamp)
         # z30j: a follower applies PP0's flush verdicts (already forwarded
         # onward above) to the flushes it parked, before this pass's dispatch.
         if not self.pp_group.is_first_rank:
@@ -6504,6 +6518,18 @@ class SchedulerPPMixin:
     # #1268 fix 1c: the idle vote travels home on the ring lap
     # ------------------------------------------------------------------
 
+    def _weg2_lane_floor_pass_hook(self: Scheduler) -> None:
+        """PRIORITY LANES 1008 (L3): PP0's step of the lane-floor vote -- take the newest ``/weg2/lane_floor`` value, apply
+        it in this pass and set the stamp for list m (``weg2/lanes_p.pp0_pass``).  A follower does nothing here: it applies
+        the stamp it takes off list m.  No state (switch off / no RPC yet): nothing."""
+        if int(getattr(self.ps, "pp_size", 1) or 1) <= 1 or not self.pp_group.is_first_rank:
+            return
+        if self.__dict__.get("_weg2_lane_p") is None:
+            return
+        from sglang.srt.weg2 import lanes_p as _lanes_p
+
+        _lanes_p.pp0_pass(self)
+
     def _weg2_pp_room_pass_hook(self: Scheduler) -> None:
         """PR: one non-blocking step of the PP room vote (weg2/pp_room_vote.py)."""
         if int(getattr(self.ps, "pp_size", 1) or 1) <= 1 or not self._weg2_vote_is_wire_rank():
@@ -6530,9 +6556,13 @@ class SchedulerPPMixin:
             book.note_batches(self.__dict__.get("mbs") or ())
             verdict = None
             if book.absorb(channel.harvest()) or book.facts:
+                from sglang.srt.weg2 import lanes_p as _lanes_p
+
+                _lf, _le = _lanes_p.echo(self)
                 own = _pr.follower_fact(
                     tree=tree, allocator=self.token_to_kv_pool_allocator, rank=0,
                     executed=int(self.forward_ct), local_floor=local_floor,
+                    lane_floor=_lf, lane_epoch=_le,
                 )
                 verdict = book.cap(own.room)
             # R_m for THIS pass: applied here and stamped on list m (below)
@@ -6548,9 +6578,13 @@ class SchedulerPPMixin:
         if sender is None:
             sender = self._weg2_pr_sender = _pr.FollowerSender()
         now = time.monotonic()
+        from sglang.srt.weg2 import lanes_p as _lanes_p
+
+        _lf, _le = _lanes_p.echo(self)
         fact = _pr.follower_fact(
             tree=tree, allocator=self.token_to_kv_pool_allocator, rank=int(self.ps.pp_rank),
             executed=int(self.forward_ct), local_floor=local_floor,
+            lane_floor=_lf, lane_epoch=_le,
         )
         sender.offer(fact, now)
         sender.flush(channel, now)
