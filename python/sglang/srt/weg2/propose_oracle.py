@@ -360,11 +360,41 @@ def _module_state_guard(prefix: str = "sglang."):
 _MISSING = object()
 
 
+def _roomy_statvfs(prefixes: Sequence[str]):
+    """``os.statvfs`` that reports the store disk as EMPTY (free = total) for paths under ``prefixes``.
+
+    The launcher's L3 DISK-SUM verdict (``launcher.py:8171``, ``ok`` vs ``WARN ... SHORT by``) and the W57 store plan
+    (``:7410``) read the free space of the filesystem the store root is on.  In a dry run that root is a private dir of
+    the oracle's scratch, i.e. on whatever disk the TMPDIR of the caller lives on: measured 2026-10-13, 58 GB free on the
+    rig LXC against 184.4 GB needed turned ``ok`` into ``WARN`` and six goldens red without a plan change.  The free
+    figure is a LIVE-BOX reading (masked in the comparison), but here it flips a VERDICT word, so masking the number is
+    not enough: the dry run is asked "does the plan fit a disk that has room", and the disk fit of a real box is the
+    dashboard's/hw_fit's question, not the oracle's.  ``f_blocks`` and ``f_frsize`` stay real (the total is printed)."""
+    import types
+
+    real = os.statvfs
+    roots = tuple(os.path.abspath(p) for p in prefixes if p)
+
+    def statvfs(path):
+        st = real(path)
+        try:
+            ap = os.path.abspath(os.fspath(path))
+        except TypeError:
+            return st
+        if not any(ap == r or ap.startswith(r + os.sep) for r in roots):
+            return st
+        attrs = {n: getattr(st, n) for n in dir(st) if n.startswith("f_")}
+        attrs["f_bfree"] = attrs["f_bavail"] = attrs["f_blocks"]
+        return types.SimpleNamespace(**attrs)
+
+    return statvfs
+
+
 def run_dry_run(launcher_argv: Sequence[str], devices: Sequence[Mapping[str, Any]], *, tree: str,
                 env: Optional[Mapping[str, str]] = None, force: bool = False, tag: str = ORACLE_TAG,
                 scratch: Optional[str] = None, replay_path: Optional[str] = None,
                 keep_scratch: bool = False, farm_root: str = "",
-                evidence_dir: Optional[str] = None) -> DryRunResult:
+                evidence_dir: Optional[str] = None, roomy_store_disk: bool = True) -> DryRunResult:
     """Run ``launcher.main(["--tree", tree, "--tag", tag, "--dry-run", (--force), *launcher_argv])`` hermetically.
 
     * ``devices``: replay rows (:func:`replay_from_hardware_profile` / :func:`replay_from_catalog` / the fixture),
@@ -380,6 +410,8 @@ def run_dry_run(launcher_argv: Sequence[str], devices: Sequence[Mapping[str, Any
       environment is NOT touched: the group env lines of the plan stay those of the golden), and the
       text is normalised back to the live path, so a run on an overlay dir (the live dir's entries + one more log) is
       comparable to the golden -- that is how the test proves the golden does not move when the dir grows.
+    * ``roomy_store_disk`` (default True): the filesystem of the store root reports all of its space free
+      (:func:`_roomy_statvfs`), so the L3 disk verdict does not depend on the disk of the machine the oracle runs on.
     * The module state ``refusals`` is reset before and after.
 
     ``launcher.main`` may raise (a refusal): that is a RESULT (``exc_type``), not an error of the oracle.  Only a failure
@@ -419,6 +451,8 @@ def run_dry_run(launcher_argv: Sequence[str], devices: Sequence[Mapping[str, Any
                 mock.patch.object(launcher, "CGROUP_ROOT", cg), \
                 mock.patch.object(launcher, "STORE_ROOT", store_root), mock.patch.object(launcher, "STORE_ROOT_TOLD", True), \
                 mock.patch.object(launcher, "EVIDENCE_DIR", ev_new), _module_state_guard(), \
+                (mock.patch.object(os, "statvfs", _roomy_statvfs((scratch, store_root))) if roomy_store_disk
+                 else contextlib.nullcontext()), \
                 _patched_default_args(launcher, {orig_roots[0]: shm, orig_roots[1]: meminfo, orig_roots[2]: cg,
                                                  orig_roots[3]: store_root, live_evidence: ev_new}):
             refusals.arm(False)
@@ -916,7 +950,7 @@ def run_profile(env_path: str, devices: Sequence[Mapping[str, Any]], *, tree: st
                 scratch: Optional[str] = None, farm_root: str = DEFAULT_FARM_ROOT,
                 siblings: Mapping[str, Sequence[str]] = DEFAULT_MODEL_SIBLINGS,
                 asset_dirs: Sequence[str] = DEFAULT_ASSET_DIRS, evidence_dir: Optional[str] = None,
-                snapshots: Optional[Mapping[str, str]] = None) -> ProfileRun:
+                snapshots: Optional[Mapping[str, str]] = None, roomy_store_disk: bool = True) -> ProfileRun:
     """Release profile -> launcher dry run on ``devices``: :func:`profile_launch_input`, the model name farms for model
     dirs that are empty on this box, :func:`run_dry_run`.  The ``plan_dump.py`` recipe as one call.
 
@@ -991,7 +1025,7 @@ def run_profile(env_path: str, devices: Sequence[Mapping[str, Any]], *, tree: st
         notes.append("--weg2-xchg-census-foreign added (the census names the registry path, the farm is another path)")
     final = pre + argv + list(extra_args)
     res = run_dry_run(final, devices, tree=tree, env=env, force=force, tag=tag, scratch=scratch, farm_root=farm_root,
-                      evidence_dir=evidence_dir)
+                      evidence_dir=evidence_dir, roomy_store_disk=roomy_store_disk)
     return ProfileRun(res, li, final, notes)
 
 

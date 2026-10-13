@@ -82,6 +82,7 @@ import os
 import pathlib
 import subprocess
 import tempfile
+import types
 import unittest
 
 import pytest
@@ -641,6 +642,35 @@ class TestDryRunGolden(unittest.TestCase):
         self.assertIn(name, run.result.raw)                       # the overlay really was the evidence dir of the run
         self.assertNotIn(td, run.result.text)                     # ... and the text is normalised back to the live path
         _assert_zero_diff(self, "plan_27b_flip_n3.txt", run)
+
+    def test_roomy_statvfs_shim_only_touches_the_store_paths(self):
+        real = os.statvfs
+        with tempfile.TemporaryDirectory(prefix="ap0-statvfs-") as td:
+            shim = O._roomy_statvfs([td])
+            inside, outside = shim(td), shim(os.path.dirname(td) + "/")
+            self.assertEqual(inside.f_bavail, real(td).f_blocks)
+            self.assertEqual(inside.f_bfree, real(td).f_blocks)
+            self.assertEqual((inside.f_blocks, inside.f_frsize), (real(td).f_blocks, real(td).f_frsize))
+            self.assertEqual(outside.f_bavail, real(os.path.dirname(td) + "/").f_bavail)   # a path outside: the real reading
+
+    def test_l3_disk_verdict_does_not_depend_on_the_disk_of_the_box(self):
+        """The L3 DISK-SUM line flips ``ok`` -> ``WARN ... SHORT by`` with the free space of the filesystem the scratch store
+        lives on (58 GB free against 184.4 GB needed on the rig LXC, 2026-10-13).  A nearly full disk under the run must
+        leave the dump at the golden (0 diff), and with the shim off the SAME box state really changes the line."""
+        from unittest import mock
+
+        real = os.statvfs
+
+        def full_disk(path):
+            st = real(path)
+            return types.SimpleNamespace(**{n: getattr(st, n) for n in dir(st) if n.startswith("f_")} | {"f_bavail": 1, "f_bfree": 1})
+
+        with mock.patch.object(os, "statvfs", full_disk):
+            run = _dump_of("nf-int4-h6-abl", O.read_replay(REPLAY_REF))
+            _assert_zero_diff(self, "plan_nf_abl_n3.txt", run)
+            raw = _dump_of("nf-int4-h6-abl", O.read_replay(REPLAY_REF), roomy_store_disk=False).result.raw
+        self.assertIn("L3-PERSIST DISK-SUM WARN", raw)
+        self.assertIn("L3-PERSIST DISK-SUM ok", run.result.raw)
 
     @_NEEDS_27B_DUAL
     def test_27b_dual_dump_equals_golden(self):
