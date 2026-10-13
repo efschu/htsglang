@@ -196,7 +196,7 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
         every GGUF rank before it loaded a byte (TP1/TP2: the solo-placement
         shadow ranks build the draft on ``meta``, no ``load_weights`` at all,
         ``model_runner.py:2437``; TP0 builds it the same lazy way through the
-        GGUF loader, ``loader.py:2733``). A lazy parameter is skipped here:
+        GGUF loader, ``loader.py:2705``). A lazy parameter is skipped here:
         it is already ``requires_grad=False`` by construction (the sweep test
         pins every loader site), ``materialize`` keeps the flag when it turns
         the object into a plain ``Parameter``, and the call after
