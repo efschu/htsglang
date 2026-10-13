@@ -1885,16 +1885,22 @@ def test_server_args_rejects_negative_budget():
         raise AssertionError("negative budget must be rejected")
 
 
-def test_server_args_rejects_budget_beyond_physical_ram():
+def test_server_args_warns_about_a_budget_beyond_physical_ram():
+    # HOSTWARN2 (13.10.2026, user rule 06.10.: no refusal on host RAM): this was
+    # ``..._rejects_budget_beyond_physical_ram`` (ValueError). The plausibility check still
+    # judges the budget; the verdict is a HOST-RAM-WARN line and the boot goes on.
+    import unittest
+
     import psutil
 
     huge = psutil.virtual_memory().total / (1024**3) * 4
-    try:
-        _validate(_fake_server_args(kv_session_offload_host_ram_gib=huge))
-    except ValueError as e:
-        assert "host-ram-gib" in str(e)
-    else:
-        raise AssertionError("budget beyond physical RAM must be rejected")
+    with unittest.TestCase().assertLogs(
+        "sglang.srt.mem_cache.pinned_host_budget", level="WARNING"
+    ) as cm:
+        _validate(_fake_server_args(kv_session_offload_host_ram_gib=huge))  # must not raise
+    text = "\n".join(cm.output)
+    assert "HOST-RAM-WARN PINNED --kv-session-offload-host-ram-gib" in text
+    assert "host-ram-gib" in text
 
 
 def test_server_args_accepts_a_small_plausible_budget():

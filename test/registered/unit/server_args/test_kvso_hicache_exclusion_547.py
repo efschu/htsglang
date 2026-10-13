@@ -234,7 +234,7 @@ class TestParseTimePricing(unittest.TestCase):
     def test_ratio_only_has_no_parse_time_number(self):
         self.assertIsNone(hicache_configured_host_bytes(0, 4))
 
-    def test_the_launcher_refuses_a_jointly_impossible_pair(self):
+    def test_the_launcher_warns_about_a_jointly_impossible_pair(self):
         """End-to-end through ServerArgs, on a FIXED machine size so the result
         does not depend on whatever RAM the test box happens to have free.
 
@@ -245,19 +245,25 @@ class TestParseTimePricing(unittest.TestCase):
         precisely what #547 refused the pair for.
         """
         fixed = (120 * _GIB, 100 * _GIB)
+        # HOSTWARN2 (13.10.2026, user rule 06.10.: no refusal on host RAM): the SUM is still judged
+        # (red against a per-post check), but the verdict is a HOST-RAM-WARN line, not a ValueError.
         with mock.patch(
             "sglang.srt.memtier.profile.host_memory_bytes_for_pinning",
             return_value=fixed,
-        ):
+        ), self.assertLogs(
+            "sglang.srt.mem_cache.pinned_host_budget", level="WARNING"
+        ) as cm:
             msg = _handle(
                 env={"KVSO_ALLOW_HICACHE": "1"},
                 hicache_size=60,  # GB, absolute
                 kv_session_offload_host_ram_gib=60,  # GiB, node-wide
             )
-        self.assertIsNotNone(msg)
-        self.assertIn("Pinned host RAM over-committed", msg)
-        self.assertIn("--hicache-size", msg)
-        self.assertIn("--kv-session-offload-host-ram-gib", msg)
+        self.assertIsNone(msg)
+        text = "\n".join(cm.output)
+        self.assertIn("HOST-RAM-WARN PINNED", text)
+        self.assertIn("Pinned host RAM over-committed", text)
+        self.assertIn("--hicache-size", text)
+        self.assertIn("--kv-session-offload-host-ram-gib", text)
 
 
 class TestTheForcedWriteThroughSeamIsNowReachable(unittest.TestCase):

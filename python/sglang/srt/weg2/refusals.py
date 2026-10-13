@@ -9,7 +9,8 @@ der werte aufhebt und trotzdem startet".
   each lifted refusal is printed as ``FORCED-PAST <CODE> <reason>``; and a forced boot WRITES NO RECORDS
   (``host_ledger.append_measured_record`` returns without writing): what it measures lies outside the
   promise the planner made, and must never calibrate a later boot.
-* Two classes, each with its reason (see :data:`REGISTER`):
+* Three classes, each with its reason (see :data:`REGISTER`; ``warnt`` is HOSTWARN2, 13.10.2026: a code that used to
+  refuse host RAM and now only prints ``HOST-RAM-WARN``, never consulted by :func:`refuse_value`):
     - ``wert``            a VALUE refusal: the planner or the launcher judges numbers (capacity, VRAM, host
                           memory, calibration of the inventory, card count).  Force starts with these numbers.
     - ``nicht_forcebar``  NOT a value judgement: someone else's occupation of a card or of /dev/shm, a missing or
@@ -39,7 +40,12 @@ MARKER = "FORCED-PAST"
 
 CLASS_VALUE = "wert"
 CLASS_HARD = "nicht_forcebar"
-CLASS_LABEL = {CLASS_VALUE: "value refusal (forceable)", CLASS_HARD: "not forceable"}
+#: HOSTWARN2 (13.10.2026, user rule 06.10. "KEINE Verweigerung wegen Host-RAM"): the code is NOT a refusal any more --
+#: the launcher prints ``HOST-RAM-WARN <code> ...`` with the full numbers and the boot goes on. Listed so a reader of
+#: the register finds the old code and what became of it; never consulted by :func:`refuse_value`.
+CLASS_WARN = "warnt"
+CLASS_LABEL = {CLASS_VALUE: "value refusal (forceable)", CLASS_HARD: "not forceable",
+               CLASS_WARN: "warns only (no refusal)"}
 
 
 @dataclass(frozen=True)
@@ -63,6 +69,10 @@ def _v(code, title, why, source, by, consequence):
 
 def _h(code, title, why, source, by):
     return Refusal(code, CLASS_HARD, title, why, source, by, "")
+
+
+def _w(code, title, why, source, by, consequence):
+    return Refusal(code, CLASS_WARN, title, why, source, by, consequence)
 
 
 REGISTER: Tuple[Refusal, ...] = (
@@ -90,10 +100,12 @@ REGISTER: Tuple[Refusal, ...] = (
        "weg2/xchg_residency.py resolve_census; launcher.load_xchg_census_for_cards", "launcher",
        "The exchange peak is calculated from the borrowed row (the boot log carries FORCED-PAST HW-BORROWED). To be expected: peak "
        "over- or underestimated; a card that is too small keeps refusing through W71 (peak against the NVML sum)."),
-    _v("HOST-MEM", "Host memory below the threshold",
-       "A threshold (host_ledger preflight, MemAvailable >= 40 GiB) against a measured value: capacity, not a fault.",
-       "launcher.host_preflight", "launcher",
-       "The start runs with less free host memory. To be expected: OOM kill of the container when the cache grows."),
+    _v("HOST-DISK", "Free disk under the preflight floor",
+       "host_ledger_preflight.sh refuses when / has under 100 GiB free (the HiCache file backend writes there): a threshold against a "
+       "measured value, capacity of the DISK. HOSTWARN2: split off from HOST-MEM, which was the same exit code for RAM and disk; the "
+       "user rule 06.10. frees host RAM, not disk.",
+       "launcher.host_preflight (REFUSED: only N GiB free on /)", "launcher",
+       "The start runs with less free disk. To be expected: a full disk under the HiCache store."),
     _v("D-BUDGET", "Group D: memory plan unsolvable (rank solver)",
        "The D rank solver has calculated and reports that its target sizes (KV, experts, rests) do not fit into the cards: "
        "capacity; the numbers stay available for the start.",
@@ -127,6 +139,13 @@ REGISTER: Tuple[Refusal, ...] = (
        "Threshold of the profile against the measured host value: capacity.",
        "docker/entrypoint.sh (MEMORY)", "entrypoint",
        "The start runs with less free host memory (see HOST-MEM)."),
+    # ------------------------------------------------------------------ warns only
+    _w("HOST-MEM", "Host memory below the threshold (WARNS since 13.10.2026)",
+       "User rule 06.10.: no refusal on host RAM. The host_ledger preflight (script floor) and the launcher's own MemAvailable >= 40 GiB "
+       "floor print HOST-RAM-WARN HOST-MEM with the numbers; the host ledger itself (W20 / W21 / W87 / W97) and the pinned-host "
+       "registry warn the same way. A threshold against a measured value is capacity, and the OOM killer is the arbiter.",
+       "launcher.host_preflight; host_ledger.choose(warn_only=True); mem_cache/pinned_host_budget.warn_pinned_host", "launcher",
+       "The start runs with less free host memory. To be expected: OOM kill of the container when the cache grows."),
     # ------------------------------------------------------------------ not forceable
     _h("HW-TOPOLOGY", "Card count outside 2..8: there is no flip topology at all",
        "Not a value refusal: topology.plan_topology knows no topology for N outside [MIN_CARDS, MAX_CARDS_BAR1] (P/D form, BAR1 window, "
@@ -182,7 +201,12 @@ def value_codes() -> List[str]:
 
 
 def hard_codes() -> List[str]:
-    return [r.code for r in REGISTER if not r.forcebar]
+    return [r.code for r in REGISTER if r.klass == CLASS_HARD]
+
+
+def warn_codes() -> List[str]:
+    """Codes that used to refuse and now only warn (HOSTWARN2)."""
+    return [r.code for r in REGISTER if r.klass == CLASS_WARN]
 
 
 # ---------------------------------------------------------------------------
