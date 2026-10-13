@@ -22968,7 +22968,7 @@ def run_scheduler_process(
         # the optional gc.freeze() (SGLANG_WEG2_GC_FREEZE=1); both off by default.
         from sglang.srt.weg2.gc_instrument import arm_after_boot as _weg2_gc_arm
 
-        _weg2_gc_arm(server_args, tp_rank)
+        _weg2_gc_arm(server_args, tp_rank, pp_rank=pp_rank)
         # #1054: a MEASUREMENT run keeps the window open past this point. The
         # boot-bounded window is right for the resident posts and blind to the
         # transient one that killed boot 24 -- the GDN extend allocation only
