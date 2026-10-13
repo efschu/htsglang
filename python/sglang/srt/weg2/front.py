@@ -11370,6 +11370,9 @@ class Front:
             cands = [q for q in self._asr_live_p_cands()
                      if getattr(q, "rid", None) != rid
                      and (pbound or fits.get(getattr(q, "rid", None)) is True)]
+            if pbound and cands:
+                # the seat gate's held rest flips nothing yet: no flip is foreseeable for it
+                cands = Front._pbound_seat_hold(self, cands, time.time())[0]
         except Exception:  # noqa: BLE001 - a reading never blocks the route
             return False
         if not cands:
@@ -11675,6 +11678,9 @@ class Front:
                 return True, True, None
             return False, not self.admit_d, None
         if envs.SGLANG_WEG2_PBOUND_FLIP_NOW.get():
+            cands, _held = Front._pbound_seat_hold(self, cands, now)
+            if not cands:
+                return False, not self.admit_d, None  # only the seat gate's rest is queued: D decodes first
             return self._asr_pbound_flip_now(cands, x_tok, now)
         if age_plan:
             return await self._arrival_seat_step_age(cands, x_tok, now)
@@ -11743,6 +11749,77 @@ class Front:
                         "the next free seat in arrival order", _asr.MARKER, p.rid, v, why_wait,
                         int(getattr(p, "est_uncached", 0) or 0), x_tok, taken, n, why)
         return False, not self.admit_d, None
+
+    # ------------------------------------------------------------------ PBOUND x SEAT GATE
+    # NF int24f3 13.10. (nf-flip-halt-analyse-1013): 43 of 45 long D->P "halts" were a
+    # P<->D pendulum with no decode round on D. The DECODE-COLLECT SEAT GATE caps a P
+    # phase at the free D seats and leaves the rest queued ON PURPOSE (D is full: it
+    # decodes first); the P->D flip's DONE-KICK then ran PBOUND-FLIP-NOW for exactly
+    # that rest ("never needs a D seat, no dwell") 0.1-1.9 s after D woke. The two
+    # rules cancelled each other: two flips per capped P phase, 0 decode tokens.
+    # Fix: what the gate left in the queue is HELD while D has no free seat; it is
+    # released by the first free D seat or by the existing wait bound (d_wait_bound_s,
+    # else w_s) -- no new timer, no switch. New P-bound arrivals (anything not in the
+    # queue when the capped P phase ended) are not held: PBOUND-FLIP-NOW is unchanged.
+
+    def _pbound_hold_arm(self, dc_cap: int, dispatched: int, stalled: bool = False) -> None:
+        """End of a P phase: remember the queue entries the SEAT GATE's cap left
+        behind (``_dc_cap`` > 0 and the cap was the binding one -- not the H91 phase
+        cap, not an intake stall). Every P phase overwrites the record."""
+        self.__dict__.pop("_pbound_seat_held", None)
+        if stalled or int(dc_cap or 0) <= 0:
+            return
+        mx = int(getattr(self, "p_phase_max_requests", 0) or 0)
+        if mx > 0 and int(dc_cap) > mx:
+            return  # the H91 phase cap bound first: not the gate's rest
+        if not phase_policy.phase_cap_reached(int(dispatched or 0), int(dc_cap)):
+            return  # the queue is what the cap did not stop (pool budget, empty ...)
+        rids = [p.rid for p in self.queue
+                if not p.fut.done() and not getattr(p, "intake_stalled", False)
+                and not getattr(p, "client_gone", False)]
+        if rids:
+            self.__dict__["_pbound_seat_held"] = {"rids": set(rids), "t": time.time(),
+                                                   "epoch": int(self.epoch), "told": False}
+
+    def _pbound_seat_hold(self, cands: List["Pending"], now: float) -> Tuple[List["Pending"], List["Pending"]]:
+        """``(candidates PBOUND may act on, candidates held by the seat gate)``.
+        Nothing recorded (the default path) -> ``(cands, [])`` untouched. A held
+        entry is released -- and PBOUND-FLIP-NOW acts as before -- by the first
+        free D seat (ARRIVAL-SEAT's own count) or by the wait bound."""
+        rec = self.__dict__.get("_pbound_seat_held")
+        if not rec:
+            return list(cands), []
+        if getattr(self, "awake", None) != "D" or float(getattr(self, "t_awake", 0.0) or 0.0) < float(rec["t"]):
+            return list(cands), []  # not the D phase that follows the capped P phase
+        queued = {p.rid for p in self.queue if not p.fut.done()}
+        rec["rids"] = rec["rids"] & queued
+        if not rec["rids"]:
+            self.__dict__.pop("_pbound_seat_held", None)
+            return list(cands), []
+        held = [c for c in cands if c.rid in rec["rids"]]
+        if not held:
+            return list(cands), []
+        taken, n = self._arrival_seat_taken()
+        free = max(0, int(n) - int(taken))
+        bound = self.d_wait_bound_s if self.d_wait_bound_s > 0 else float(self.w_s)
+        waited = _asr.oldest_wait_s([c.t_arrive for c in held], self.t_awake, now)
+        why = "free_seat" if free > 0 else ("wait_bound" if _asr.bound_fired(waited, bound) else None)
+        rids = sorted(rec["rids"])
+        if why is not None:
+            self.__dict__.pop("_pbound_seat_held", None)
+            self.counters["pbound_seat_hold_released_" + why] += 1
+            logger.info("WEG2 PBOUND-SEAT-HOLD-RELEASED why=%s rids=%s free_seats=%d taken=%d n=%d waited_s=%.1f "
+                        "bound_s=%.1f epoch=%d -- the rest the seat gate left behind may flip D->P now",
+                        why, rids[:8], free, taken, n, float(waited or 0.0), float(bound), self.epoch)
+            return list(cands), []
+        if not rec["told"]:
+            rec["told"] = True
+            self.counters["pbound_held_by_seat_gate"] += 1
+            logger.warning("WEG2 PBOUND-HELD-BY-SEAT-GATE rids=%s free_seats=%d taken=%d n=%d epoch=%d "
+                           "waited_s=%.1f bound_s=%.1f -- no PBOUND-FLIP-NOW: the seat gate held these back "
+                           "because D is full; D decodes until a seat frees or the wait bound fires",
+                           rids[:8], free, taken, n, self.epoch, float(waited or 0.0), float(bound))
+        return [c for c in cands if c.rid not in rec["rids"]], held
 
     def _asr_pbound_flip_now(self, cands: List["Pending"], x_tok: int,
                              now: float) -> Tuple[bool, bool, Optional["Pending"]]:
@@ -16805,6 +16882,7 @@ class Front:
                 # DECODE-COLLECT SEAT GATE: the flip that brought P here was armed
                 # for the free D seats -- P prefills at most that many this phase
                 _dc_cap = int(self.__dict__.pop("_dc_p_cap", 0) or 0)
+                self.__dict__.pop("_pbound_seat_held", None)  # PENDEL-FLIP: a new P phase, a new record
                 _max_dispatch = self.p_phase_max_requests
                 if _dc_cap > 0:
                     _max_dispatch = min(_max_dispatch, _dc_cap) if _max_dispatch else _dc_cap
@@ -16832,6 +16910,9 @@ class Front:
                     cap_exempt=(self._p_phase_short_rides
                                 if envs.SGLANG_WEG2_ENABLE_P_PHASE_SHORT_RIDES.get() and _dc_cap <= 0
                                 else None))
+                # PENDEL-FLIP: what the seat gate's cap left in the queue is held while D is full
+                Front._pbound_hold_arm(self, _dc_cap, int(_phase_stats.get("dispatched", 0) or 0),
+                                       stalled=bool(self._p_intake_stalled))
                 if _phase_stats.get("short_rides"):
                     self.counters["p_phase_short_rides"] += _phase_stats["short_rides"]
                     logger.info(
