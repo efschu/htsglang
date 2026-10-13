@@ -6462,6 +6462,49 @@ def arm_terms_line(arm) -> str:
     )
 
 
+#: HOSTWARN2 (13.10.2026): the readable name each host-ledger refusal carries on its
+#: ``HOST-RAM-WARN`` line once it WARNS. Deliberately NOT the exception class names
+#: (``Weg2HostLedgerRefused`` ...): those are what death watchers and log greps read as
+#: "the launcher refused the boot", and a warning must not look like one (same rule as
+#: ``HOST_WARN_MARKER`` above).
+_HOST_WARN_NAMES = {
+    "W20": "HostLedgerUnfunded",
+    "W21": "HostRunPeakUnfunded",
+    "W97": "HostDeviationUnaccepted",
+}
+
+
+def host_warn_line(code: str, name: str, text: str, tail: str = "") -> str:
+    """One ``HOST-RAM-WARN <code> <name> -- <text>`` line (HOSTWARN2).
+
+    ``tail`` is appended after ``-- `` and says what the boot does instead. The line
+    never carries the old refusal vocabulary in its HEAD (``Weg2...Refused``): see
+    :data:`_HOST_WARN_NAMES`.
+    """
+    return f"{HOST_WARN_MARKER} {code} {name} -- {text}" + (f" -- {tail}" if tail else "")
+
+
+_HOST_WARN_ONLY_TAIL = (
+    "WARNING ONLY: the boot goes on (user rule 06.10.: no refusal on host RAM; an OOM "
+    "kill is the accepted risk). Every price on the ladder is unchanged"
+)
+
+
+def _host_warn_or_raise(exc: Exception, warn_only: bool, lines: List[str]) -> None:
+    """``raise exc`` (the pure verdict) or, under ``warn_only``, append its warning line.
+
+    The text is the exception's first line with its ``Wnn Weg2...Refused: `` head
+    split off; the ladder table that follows a ``\n`` is already in ``lines``.
+    """
+    if not warn_only:
+        raise exc
+    first = str(exc).split("\n", 1)[0]
+    head, _, text = first.partition(": ")
+    code = head.split(" ", 1)[0]
+    lines.append(host_warn_line(
+        code, _HOST_WARN_NAMES.get(code, "HostLedger"), text, _HOST_WARN_ONLY_TAIL + "."))
+
+
 def choose(
     memtotal_bytes: int,
     memavail_bytes: int,
@@ -6557,6 +6600,14 @@ def choose(
     # hand-off (charged) and the shmem no class names (printed, ungebucht).
     census: Optional[Dict[str, object]] = None,
     memhist_run_only: bool = False,
+    # 13.10.2026 (NF HOSTWARN2, user rule 06.10. "KEINE Verweigerung wegen
+    # Host-RAM ... man laesst es darauf ankommen, ob es OOM geht"): an INTERNAL
+    # parameter, NOT a user switch -- the launcher and the CLI pass True, a pure
+    # caller (tests, the ladder's own cap advice) keeps the old raising verdict.
+    # True: an unfundable ladder (W20 / W21) and the W97 deviation refusals
+    # become ``HOST-RAM-WARN`` lines in the returned ``lines`` and the MOST
+    # FRUGAL arm comes back. Not one price changes: the table is the same.
+    warn_only: bool = False,
 ) -> Tuple[Arm, Optional[float], List[str]]:
     """Walk the ladder; return (arm, reap headroom GiB, printed lines) or W20/W21.
 
@@ -6979,7 +7030,7 @@ def choose(
         # the refusal it replaces name the same terms.
         if not ok and _deviation_armed and predicted is not None:
             if predicted >= watermark_gib:
-                raise Weg2HostDeviationRefused(
+                _w97 = Weg2HostDeviationRefused(
                     f"W97 Weg2HostDeviationRefused: --host-ledger-deviation cannot "
                     f"accept a predicted run peak of {predicted:.2f} GiB, which is AT "
                     f"OR ABOVE the observed reap watermark {watermark_gib:.2f} GiB. "
@@ -6997,8 +7048,9 @@ def choose(
                     f"fields, from the one producer, so the refusal and the arm "
                     f"it refused can be compared field by field."
                 )
+                _host_warn_or_raise(_w97, warn_only, lines)
             if float(riegel_gib) > hard_bound_gib:
-                raise Weg2HostDeviationRefused(
+                _w97 = Weg2HostDeviationRefused(
                     f"W97 Weg2HostDeviationRefused: --host-riegel-gib "
                     f"{float(riegel_gib):.2f} is ABOVE the hard bound "
                     f"{hard_bound_gib:.2f} GiB it is supposed to latch beneath. A "
@@ -7006,6 +7058,7 @@ def choose(
                     f"crossed; it is decoration, and the rule asks for a runtime "
                     f"latch, not a number."
                 )
+                _host_warn_or_raise(_w97, warn_only, lines)
             lines.append(
                 f"WEG2-HOST-LEDGER DEVIATION reason=\"{deviation_reason}\" "
                 f"predicted_run_peak={predicted:.2f} hard_bound={hard_bound_gib:.2f} "
@@ -7018,7 +7071,8 @@ def choose(
                 f"WITH a number and a runtime latch, never silently. NOTHING IS "
                 f"RE-PRICED: every term above is the one the ladder computed, the "
                 f"ring dimensioning and the manifest guard are untouched, and the "
-                f"runtime guard (W22) still tears down at the latch."
+                f"runtime guard (W22) still warns at the latch (HOST-RAM-WARN, "
+                f"it no longer tears down: user rule 06.10.)."
             )
             ok = True
         if moments_ok and not peak_ok:
@@ -7200,8 +7254,9 @@ def choose(
             "term it used to carry (6 GiB on boot weg2sb5g), so an arm that refused for "
             "the store's sake alone no longer refuses at all."
         )
+        _unfunded: Optional[Exception] = None
         if peak_bound_any:
-            raise Weg2HostRunPeakRefused(
+            _unfunded = Weg2HostRunPeakRefused(
                 "W21 Weg2HostRunPeakRefused: an arm funds both moments and the HARD BOUND "
                 f"{hard_bound_gib:.2f} GiB (reap point {watermark_gib:.2f} GiB minus margin "
                 f"{margin.total_gib:.2f} GiB = {margin.terms()}) still binds "
@@ -7214,7 +7269,7 @@ def choose(
                 f"{levers}\n" + table
             )
         cap_advice = ""
-        if s_gb_d is not None and d_cap_terms:
+        if _unfunded is None and s_gb_d is not None and d_cap_terms:
             def _ok(sd: int) -> bool:
                 try:
                     a = price(
@@ -7271,17 +7326,32 @@ def choose(
                     f"shortfall the #1317 window layer existed to compensate, "
                     f"which is what this ticket deleted."
                 )
-        raise Weg2HostLedgerRefused(
-            "W20 Weg2HostLedgerRefused: no arm of the ladder funds both moments on this "
-            "box (the store is NOT in this test any more -- #1236 put it on disk) "
-            f"(host weights term = {priced[0].terms['host_ring_gib']:.2f} GiB at the run "
-            f"moment, span 1 = {priced[0].terms['host_ring_span1_gib']:.2f} GiB at the launch "
-            f"moment; {ring_provenance or 'no provenance passed'}). "
-            "The INT8 checkpoint has only the cpu-backup wake path (W4), and the ledger "
-            f"will not shrink another term silently. {outcome}. {levers}"
-            f"{cap_advice}\n"
-            + table
-        )
+        if _unfunded is None:
+            _unfunded = Weg2HostLedgerRefused(
+                "W20 Weg2HostLedgerRefused: no arm of the ladder funds both moments on this "
+                "box (the store is NOT in this test any more -- #1236 put it on disk) "
+                f"(host weights term = {priced[0].terms['host_ring_gib']:.2f} GiB at the run "
+                f"moment, span 1 = {priced[0].terms['host_ring_span1_gib']:.2f} GiB at the launch "
+                f"moment; {ring_provenance or 'no provenance passed'}). "
+                "The INT8 checkpoint has only the cpu-backup wake path (W4), and the ledger "
+                f"will not shrink another term silently. {outcome}. {levers}"
+                f"{cap_advice}\n"
+                + table
+            )
+        # HOSTWARN2: the pure verdict raises; the launcher/CLI path (warn_only)
+        # prints it as a HOST-RAM-WARN line and boots the MOST FRUGAL arm -- the
+        # last rung, the one with the smallest host posts. Whether it really fits
+        # is what the OOM killer decides, not this ledger (user rule 06.10.).
+        _host_warn_or_raise(_unfunded, warn_only, lines)
+        chosen = frugal
+        lines.append(host_warn_line(
+            "W20" if not peak_bound_any else "W21", "FrugalArmChosen",
+            f"no arm funds the host budget; booting the most frugal rung "
+            f"S={frugal.s_gb} GB M={frugal.m_mib} MiB "
+            f"launch_leftover={frugal.launch_leftover_gib:.2f} GiB "
+            f"run_leftover={frugal.run_leftover_gib:.2f} GiB "
+            f"predicted_run_peak={_gib_or_none(frugal.predicted_run_peak_gib())} "
+            f"hard_bound={hard_bound_gib:.2f} GiB reap={watermark_gib:.2f} GiB"))
     chosen_peak = chosen.predicted_run_peak_gib()
     headroom = None if chosen_peak is None else hard_bound_gib - chosen_peak
     lines.append(
@@ -7448,6 +7518,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             cg_ceiling_source=ceiling_source,
             cg_oom_kill=cg["oom_kill"],
             measured_record=read_measured_record(ns.measured_record) if ns.measured_record else None,
+            # HOSTWARN2: this CLI is a start script's preflight; an unfundable
+            # host ladder warns (HOST-RAM-WARN W20/W21) and exits 0 with the most
+            # frugal arm. Other refusals (unmeasured term, identity) still exit 2.
+            warn_only=True,
         )
     except (Weg2HostLedgerRefused, Weg2HostRunPeakRefused) as e:
         print(str(e))

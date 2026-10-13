@@ -68,13 +68,18 @@ class StagingTierIsPricedTest(CustomTestCase):
         args = _run(hicache_size=2)
         self.assertEqual(args.hicache_size, 2)
 
-    def test_a_tier_that_cannot_fit_is_refused(self):
+    def test_a_tier_that_cannot_fit_warns(self):
         """THE FALSIFIER. Before this, no parse-time check priced the host tier
         on a boot without kv-session-offload -- any size at all was accepted
-        and the failure surfaced as an OOM kill in a worker."""
-        with self.assertRaises(ValueError) as ctx:
+        and the failure surfaced as an OOM kill in a worker.
+
+        HOSTWARN2 (13.10.2026, user rule 06.10.: no refusal on host RAM): the check
+        still PRICES the tier and says so, as a ``HOST-RAM-WARN PINNED`` line instead
+        of a ValueError; the boot goes on and the pool is attempted."""
+        with self.assertLogs("sglang.srt.mem_cache.pinned_host_budget", level="WARNING") as cm:
             _run(hicache_size=200)
-        message = str(ctx.exception)
+        message = "\n".join(cm.output)
+        self.assertIn("HOST-RAM-WARN PINNED", message)
         self.assertIn("--hicache-size", message)
         self.assertIn("PINNED", message)
 
@@ -83,23 +88,23 @@ class StagingTierIsPricedTest(CustomTestCase):
         times; a per-rank figure checked against machine-wide RAM would accept
         the three-rank boot that cannot fit."""
         self.assertIsNotNone(_run(hicache_size=30, tp_size=1, pp_size=1))
-        with self.assertRaises(ValueError) as ctx:
+        with self.assertLogs("sglang.srt.mem_cache.pinned_host_budget", level="WARNING") as cm:
             _run(hicache_size=30, tp_size=1, pp_size=3)
-        self.assertIn("3 rank(s)", str(ctx.exception))
+        self.assertIn("3 rank(s)", "\n".join(cm.output))
 
     def test_tensor_parallel_ranks_count_too(self):
         """Each TP rank holds its own host-pool shard, exactly as each PP stage
         does. Counting only the PP stages would under-count a TP boot."""
-        with self.assertRaises(ValueError):
+        with self.assertLogs("sglang.srt.mem_cache.pinned_host_budget", level="WARNING"):
             _run(hicache_size=30, tp_size=3, pp_size=1)
 
     def test_the_spill_pool_is_summed_with_it(self):
         """The check is JOINT or it is not a check: two pools that each fit and
         together do not are the whole reason the launcher-side guard exists."""
         self.assertIsNotNone(_run(hicache_size=40))
-        with self.assertRaises(ValueError) as ctx:
+        with self.assertLogs("sglang.srt.mem_cache.pinned_host_budget", level="WARNING") as cm:
             _run(hicache_size=40, kv_session_offload_host_ram_gib=60)
-        self.assertIn("--kv-session-offload-host-ram-gib", str(ctx.exception))
+        self.assertIn("--kv-session-offload-host-ram-gib", "\n".join(cm.output))
 
     def test_no_honest_host_number_means_no_guard(self):
         """`pinned_host_memory_bytes` returns (None, None) when it cannot get an
