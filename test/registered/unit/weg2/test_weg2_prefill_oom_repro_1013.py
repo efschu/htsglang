@@ -165,5 +165,92 @@ class TypedExceptionTest(unittest.TestCase):
         self.assertGreaterEqual(e.evict_asked, 0)
 
 
+# ---------------------------------------------------------------------------
+# (C) the load-back entrance: AgreedRoomShort (NF 13.10.2026 18:30:21Z, int24f6 0ea6d17efd, P.log 1012731-1012800)
+# ---------------------------------------------------------------------------
+
+
+class _LockRes:
+    delta = 0
+
+    def __init__(self, name, log):
+        self.name, self.log = name, log
+
+    def to_dec_params(self):
+        return self.name
+
+
+def _incident_load_back_tree(*, agreed=191744, avail=92032, delivered=64, kv_tokens=92288, evictable=99712):
+    """The real ``UnifiedRadixCache.load_back`` on a stub ``self``: rid weg2-302-1956 loads 92288 rows back, the stages agreed
+    191744 (= avail + every evictable row), this pool holds 92032 + 99712 evictable of which the peel pays 64."""
+    from sglang.srt.mem_cache.unified_cache_components.tree_component import BASE_COMPONENT_TYPE
+    from sglang.srt.weg2 import pp_slot_fidelity as SF
+
+    log = []
+    state = {"avail": avail}
+    kv_xfer = types.SimpleNamespace(host_indices=list(range(kv_tokens)), nodes_to_load=())
+    base = types.SimpleNamespace(build_hicache_transfers=lambda node, phase, **k: [kv_xfer])
+
+    def evict(params):
+        got = min(delivered, params.num_tokens)
+        state["avail"] += got
+        return types.SimpleNamespace(num_tokens_evicted=got)
+
+    tree = types.SimpleNamespace(
+        cache_controller=object(), components={BASE_COMPONENT_TYPE: base}, _components_tuple=(),
+        load_back_threshold=0, uniform_avail_floor=avail, weg2_pp_room_cap=agreed,
+        token_to_kv_pool_allocator=types.SimpleNamespace(available_size=lambda: state["avail"]),
+        evictable_size=lambda: evictable, evict=evict,
+        inc_host_lock_ref=lambda n: _LockRes("host", log), inc_lock_ref=lambda n: _LockRes("dev", log),
+        dec_lock_ref=lambda n, p: log.append(("dec_lock_ref", p)),
+        dec_host_lock_ref=lambda n, p: log.append(("dec_host_lock_ref", p)),
+        _1424_verify_load_chain=lambda *a, **k: None, _build_sidecar_transfers=lambda *a, **k: [],
+    )
+    setattr(tree, SF.FLOOR_LOCAL_PP_ATTR, True)
+    return tree, log
+
+
+class LoadBackAgreedRoomShortTest(unittest.TestCase):
+    def setUp(self):
+        self._env = os.environ.pop("SGLANG_WEG2_PP_SLOT_FIDELITY", None)
+
+    def tearDown(self):
+        if self._env is not None:
+            os.environ["SGLANG_WEG2_PP_SLOT_FIDELITY"] = self._env
+
+    def _run(self, **kw):
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        tree, log = _incident_load_back_tree(**kw)
+        req = types.SimpleNamespace(rid="weg2-302-1956")
+        node = types.SimpleNamespace(id=1)
+        try:
+            return UnifiedRadixCache.load_back(tree, node, None, req=req), log
+        except Exception as e:  # noqa: BLE001
+            return e, log
+
+    def test_the_incident_raises_with_its_terms_and_leaves_no_lock_behind(self):
+        """THE REPRO. RED on 0ea6d17efd: the exception carries no terms (no .kv_tokens) and load_back left both lock refs
+        taken -- a rank that does not die (the retreat) would leak them. GREEN: terms + both refs unwound."""
+        from sglang.srt.weg2.pp_slot_fidelity import AgreedRoomShort
+
+        exc, log = self._run()
+        self.assertIsInstance(exc, AgreedRoomShort)
+        self.assertIsInstance(exc, RuntimeError)
+        self.assertIn("PR AGREED-ROOM SHORT rid=weg2-302-1956 kv_tokens=92288 agreed=191744 avail=92032 evictable=99712 "
+                      "evicted=64 avail_after=92096", str(exc))
+        self.assertEqual((exc.kv_tokens, exc.agreed, exc.avail, exc.evictable, exc.evicted, exc.avail_after),
+                         (92288, 191744, 92032, 99712, 64, 92096))
+        self.assertEqual(sorted(x for x in log if isinstance(x, tuple)),
+                         [("dec_host_lock_ref", "host"), ("dec_lock_ref", "dev")])
+
+    def test_a_peel_that_delivers_loads_in_this_pass_as_before(self):
+        res, log = self._run(delivered=256)
+        self.assertIsInstance(res, Exception)  # past the room check the stub has no cache_controller.load: that is the proof
+        from sglang.srt.weg2.pp_slot_fidelity import AgreedRoomShort
+
+        self.assertNotIsInstance(res, AgreedRoomShort)
+
+
 if __name__ == "__main__":
     unittest.main()

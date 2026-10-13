@@ -362,6 +362,7 @@ from sglang.srt.planner import transient_census as _transient_census
 from sglang.srt.weg2 import tail_handoff
 from sglang.srt.weg2 import p_intake as _p_intake
 from sglang.srt.weg2 import prefill_oom_retreat as _prefill_oom_retreat  # fix 43: Prefill-OOM = retreat, not death
+from sglang.srt.weg2.pp_slot_fidelity import AgreedRoomShort  # PREFILL-OOM-RETREAT, load-back entrance
 from sglang.srt.mem_cache.common import (
     PrefillOutOfPages,  # PREFILL-OOM-RETREAT (weg2/prefill_oom_retreat.py)
     cap_above_evictable,  # F1 (nf-next-1006-01)
@@ -16402,6 +16403,11 @@ class Scheduler(
             )
             self.anchor_tails = _tail_readd.kept
 
+        # PREFILL-OOM-RETREAT: the continuation this pass starts with. ``add_chunked_req`` returns None for the LAST chunk
+        # of a continuation (``self.chunked_req`` is None afterwards although the request is in ``can_run_list``), so the
+        # retreat cannot recognise it as carried from the attribute after the fact.
+        _oom_carried_before = self.chunked_req
+
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
             # #1317 C4: THE WINDOW CURSOR IS THIS ROUND, AND THE CURSOR IS THE
@@ -17600,6 +17606,15 @@ class Scheduler(
                         _arl = self._weg2_gnbp_addreq = []
                     _arl.append((str(getattr(req, "rid", "?")), (time.perf_counter() - _ar_t0) * 1000.0,
                                  int(getattr(req, "host_hit_length", 0) or 0)))
+            except AgreedRoomShort as _ars:
+                # PREFILL-OOM-RETREAT, load-back entrance (NF 13.10. 18:30:21Z): this stage's pool is below the room the stages
+                # agreed for the load-back. ``load_back`` has unwound its locks. PP0 of group P, where the followers execute
+                # PP0's row, leaves the load-back undone for the pass (the row names nothing of it); everything else raises
+                # as before (#1004: no stage refuses alone).
+                _lb_verdict = _prefill_oom_retreat.retreat_loadback(self, _ars, req, adder)
+                if _lb_verdict is None:
+                    raise
+                res = AddReqResult.OTHER if _lb_verdict == _prefill_oom_retreat.ABORT else AddReqResult.NO_TOKEN
             except PPScheduleRefused as exc:
                 # NAMED, NOT FOLDED IN (the #797 practice for a sibling with a
                 # different root): requests admitted EARLIER in this same loop
@@ -18194,7 +18209,9 @@ class Scheduler(
             # batch's launch and before anything of this pass went to a follower, so the pass can be taken back as if
             # it had admitted nothing -- the server lives, the wall is read by the next pass. Out of scope (follower,
             # TP group, D, switch off, retreat failed): re-raise, the rank dies exactly as before.
-            if not _prefill_oom_retreat.retreat(self, _oom, new_batch, can_run_list, adder):
+            if not _prefill_oom_retreat.retreat(
+                self, _oom, new_batch, can_run_list, adder, carried_before=_oom_carried_before
+            ):
                 raise
             self._admission_decline_note = "prefill_oom_retreat"
             return None, running_batch

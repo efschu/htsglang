@@ -79261,6 +79261,37 @@
    "text": "Pure observation log: after every park D writes additional log lines about the memory row bookkeeping; on a memory leak alarm the orphaned row numbers are appended. Changes no behavior. Default off. Pure diagnostics. Unverified: dependency on another switch.",
    "type": "EnvBool"
   },
+  "SGLANG_WEG2_PP_ROOM_OWN_WALK": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "fix 43: PP0 sizes a pass on its own walk when no follower fact is fresh (default on; ``0`` = publish nothing, as before). Only taken where the followers execute PP0's row (``prefill_oom_retreat.followers_execute_row``).",
+   "id": "SGLANG_WEG2_PP_ROOM_OWN_WALK",
+   "kind": "env",
+   "lesestellen": [
+    "weg2/pp_room_vote.py:372"
+   ],
+   "level": "experte",
+   "name": "SGLANG_WEG2_PP_ROOM_OWN_WALK",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "baum": "nf",
+    "file": "weg2/pp_room_vote.py",
+    "kind": "os.environ",
+    "line": 372
+   },
+   "status": "geerntet",
+   "text": "",
+   "type": "os.environ"
+  },
   "SGLANG_WEG2_PP_SLOT_FIDELITY": {
    "baeume": [
     "27b",
@@ -79413,6 +79444,130 @@
     "file": "managers/scheduler.py",
     "kind": "os.environ",
     "line": 779
+   },
+   "status": "unerklaert",
+   "text": "",
+   "type": "os.environ"
+  },
+  "SGLANG_WEG2_PREFILL_OOM_FAST_ABORT": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "",
+   "id": "SGLANG_WEG2_PREFILL_OOM_FAST_ABORT",
+   "kind": "env",
+   "lesestellen": [
+    "weg2/prefill_oom_retreat.py:109"
+   ],
+   "level": "experte",
+   "name": "SGLANG_WEG2_PREFILL_OOM_FAST_ABORT",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "baum": "nf",
+    "file": "weg2/prefill_oom_retreat.py",
+    "kind": "os.environ",
+    "line": 109
+   },
+   "status": "unerklaert",
+   "text": "",
+   "type": "os.environ"
+  },
+  "SGLANG_WEG2_PREFILL_OOM_HOLD_S": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "",
+   "id": "SGLANG_WEG2_PREFILL_OOM_HOLD_S",
+   "kind": "env",
+   "lesestellen": [
+    "weg2/prefill_oom_retreat.py:115"
+   ],
+   "level": "experte",
+   "name": "SGLANG_WEG2_PREFILL_OOM_HOLD_S",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "baum": "nf",
+    "file": "weg2/prefill_oom_retreat.py",
+    "kind": "os.environ",
+    "line": 115
+   },
+   "status": "unerklaert",
+   "text": "",
+   "type": "os.environ"
+  },
+  "SGLANG_WEG2_PREFILL_OOM_RETREAT": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "",
+   "id": "SGLANG_WEG2_PREFILL_OOM_RETREAT",
+   "kind": "env",
+   "lesestellen": [
+    "weg2/prefill_oom_retreat.py:92"
+   ],
+   "level": "experte",
+   "name": "SGLANG_WEG2_PREFILL_OOM_RETREAT",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "baum": "nf",
+    "file": "weg2/prefill_oom_retreat.py",
+    "kind": "os.environ",
+    "line": 92
+   },
+   "status": "unerklaert",
+   "text": "",
+   "type": "os.environ"
+  },
+  "SGLANG_WEG2_PREFILL_OOM_RETRIES": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "",
+   "id": "SGLANG_WEG2_PREFILL_OOM_RETRIES",
+   "kind": "env",
+   "lesestellen": [
+    "weg2/prefill_oom_retreat.py:98"
+   ],
+   "level": "experte",
+   "name": "SGLANG_WEG2_PREFILL_OOM_RETRIES",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "baum": "nf",
+    "file": "weg2/prefill_oom_retreat.py",
+    "kind": "os.environ",
+    "line": 98
    },
    "status": "unerklaert",
    "text": "",
@@ -82495,7 +82650,7 @@
      "source": {
       "file": "managers/scheduler.py",
       "kind": "os.environ",
-      "line": 923
+      "line": 926
      }
     }
    },
@@ -85984,25 +86139,25 @@
    "abweichung": 45,
    "beide": 2461,
    "nur_27b": 180,
-   "nur_nf": 50
+   "nur_nf": 55
   },
-  "entries": 2709,
-  "envs": 1831,
+  "entries": 2714,
+  "envs": 1836,
   "erklaert": 305,
   "flags": 863,
-  "geerntet": 1678,
+  "geerntet": 1679,
   "kuratiert": 124,
-  "unerklaert": 602
+  "unerklaert": 606
  },
- "tree_rev": "27b=02123ee2ef+nf=49df6ed8e6+lanes-default-on",
+ "tree_rev": "27b=02123ee2ef+nf=0ea6d17efd+prefilloom-fix2",
  "trees": {
   "27b": {
    "entries": 2641,
    "rev": "02123ee2ef"
   },
   "nf": {
-   "entries": 2511,
-   "rev": "49df6ed8e6+lanes-default-on"
+   "entries": 2516,
+   "rev": "0ea6d17efd+prefilloom-fix2"
   }
  },
  "warnungen": []
