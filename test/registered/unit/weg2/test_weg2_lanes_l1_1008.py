@@ -38,6 +38,14 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 WEG2 = os.path.join(HERE, "..", "..", "..", "..", "python", "sglang", "srt", "weg2")
 
 
+@pytest.fixture(autouse=True)
+def _lanes_switch_pinned_off_int24f5(monkeypatch):
+    """int24f5: SGLANG_WEG2_LANES is ON by default now (user word 13.10.2026).  The tests of this file were written against "unset = off" and
+    name the switch state explicitly wherever they need it on; the unset state is pinned to the old value so the switch-off tests keep
+    testing the ``=0`` path.  The new default itself is pinned in test_weg2_lanes_default_on_1013.py."""
+    monkeypatch.setenv("SGLANG_WEG2_LANES", "0")
+
+
 class _Req:
     def __init__(self, path, payload):
         self.path = path
@@ -109,11 +117,14 @@ def test_the_names_l2_to_l4_are_written_against():
         "SGLANG_WEG2_LANES", "SGLANG_WEG2_LANE_KEEPALIVE_S", "SGLANG_WEG2_LANE_PREEMPT_CHUNK_TOKENS")
 
 
-def test_env_defaults_and_readers():
-    assert envs.SGLANG_WEG2_LANES.get() is False
+def test_env_defaults_and_readers(monkeypatch):
+    monkeypatch.delenv("SGLANG_WEG2_LANES", raising=False)   # the file pins "unset" to 0 (autouse fixture): look at the real default
+    assert envs.SGLANG_WEG2_LANES.get() is True               # int24f5: ON by default (was False up to int24f4)
     assert envs.SGLANG_WEG2_LANE_KEEPALIVE_S.get() == 15
     assert envs.SGLANG_WEG2_LANE_PREEMPT_CHUNK_TOKENS.get() == 0
-    assert (LN.enabled(), LN.keepalive_s(), LN.preempt_chunk_tokens()) == (False, 15, 0)
+    assert (LN.enabled(), LN.keepalive_s(), LN.preempt_chunk_tokens()) == (True, 15, 0)
+    monkeypatch.setenv("SGLANG_WEG2_LANES", "0")
+    assert LN.enabled() is False
     with envs.SGLANG_WEG2_LANES.override(True), envs.SGLANG_WEG2_LANE_KEEPALIVE_S.override(7), \
             envs.SGLANG_WEG2_LANE_PREEMPT_CHUNK_TOKENS.override(2048):
         assert (LN.enabled(), LN.keepalive_s(), LN.preempt_chunk_tokens()) == (True, 7, 2048)

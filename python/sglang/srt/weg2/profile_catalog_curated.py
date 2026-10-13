@@ -307,7 +307,7 @@ CURATED: Dict[str, Dict[str, object]] = {
         "depends": [_d("--rank-moe-ratio", "braucht", 'The distribution by index.', "text")]},
     "SGLANG_WEG2_LANES": {
         "kind": "env", "group": 'Other', "level": "experte", "planner_derived": False,
-        "text": "Priority lanes: a request carries an integer 'priority' (no number = lane 0, a higher number is a higher lane, the same number is the same lane). With 1 the front reads the field, keeps the active lane (lane_floor), the count of its changes (lane_epoch) and the requests per lane, and shows them in state.json (front.lane_floor, front.lane_epoch, front.lanes); the Anthropic adapter forwards 'priority'. Default 0: the front does not read 'priority', and no lane field appears in state.json, the request book or a log line.",
+        "text": "Priority lanes: a request carries an integer 'priority' (no number = lane 0, a higher number is a higher lane, the same number is the same lane). With 1 the front reads the field, keeps the active lane (lane_floor), the count of its changes (lane_epoch) and the requests per lane, and shows them in state.json (front.lane_floor, front.lane_epoch, front.lanes); the Anthropic adapter forwards 'priority'. Default 1 on the NF line (since int24f5, user word 13.10.2026): with every request in lane 0 (no 'priority', or 0) nothing is displaced -- no lane action, no RPC to P or D. 0 = off: the front does not read 'priority', and no lane field appears in state.json, the request book or a log line.",
         "gain": "", "cost": "",
         "depends": [],
         "satz_quelle": "environ.py comment above SGLANG_WEG2_LANES and weg2/lanes.py (PLAN-PRIO-LANES-1008, part L1: field and state only; the displacing controller is part L4)"},

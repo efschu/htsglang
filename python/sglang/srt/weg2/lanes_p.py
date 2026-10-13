@@ -555,9 +555,15 @@ def forget_aborted_told(sched: Any, recv_req: Any) -> Optional[dict]:
     object) starts from nothing instead of from the first instance's told.  The mechanics, the evidence and the rank-uniformity argument are on
     :func:`sglang.srt.managers.weg2_store_told.forget_aborted`.
 
-    Only on the lane path (``active()``: switch on, group P, park on) and only when the told form is armed; every other boot returns here
+    Only on the lane path (``active()``: switch on, group P, park on, and a lane state on this rank: int24f5) and only when the told form is armed; every other boot returns here
     without a look at the ledger (R1).  One line when something was dropped.  Returns what was dropped (None = nothing / not armed)."""
     if not active():
+        return None
+    if state_of(sched) is None:
+        # INT24F5 (lanes default on): no lane traffic has ever reached this rank (no floor RPC on PP0, no stamp on a follower), so every
+        # request so far is lane 0 and the abort is the default path's -- the told ledger is left exactly as the int24f4 Dauerstand leaves
+        # it (user word 13.10.2026: lane 0 only behaves like the Dauerstand).  A lane-held request's abort (LANE-P-TAKE) always comes
+        # after a floor, i.e. after this state exists on every stage (on_rpc on PP0, apply_follower on PP1/PP2).
         return None
     from sglang.srt.managers import weg2_store_told as _told
 

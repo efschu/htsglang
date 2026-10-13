@@ -145,6 +145,11 @@ class _Stage:
         self.running_mbs = []
         self.mbs = []
         self.kv_session_offload = None
+        # int24f5 (lanes default on): the told forget runs only on a rank a lane floor has reached (a lane state exists: PP0 by the RPC,
+        # PP1/PP2 by the stamp) -- the metal-6 sequence has one, so the stage carries it
+        from sglang.srt.weg2 import lanes_p as _lp
+
+        _lp.state_of(self, create=True)
 
     def _weg2_abort_dormant_hold(self, recv_req):
         pass
