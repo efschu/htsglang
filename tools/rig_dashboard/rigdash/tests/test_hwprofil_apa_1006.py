@@ -444,13 +444,54 @@ class TestScripts(unittest.TestCase):
 
     def test_scripts_wire_the_buttons_and_the_collapsed_catalog(self):
         js = open(os.path.join(STATIC, "hwprofil.js"), encoding="utf-8").read()
-        for needle in ('data-act="recapture"', 'data-act="issue"', 'data-act="copy"', "/recapture", "/issue", "Neu erfassen", "Issue-Text (Hardwareprofil)"):
+        for needle in ('data-act="recapture"', 'data-act="issue"', 'data-act="hwp-copy"', 'data-act="hwp-issue-close"', "/recapture", "/issue", "Neu erfassen", "Issue-Text (Hardwareprofil)"):
             self.assertIn(needle, js)
         self.assertNotIn("eval(", js)
         self.assertNotIn("setInterval", js)
         pj = open(os.path.join(STATIC, "profil.js"), encoding="utf-8").read()
+        # Befund 1: hwprofil.js haengt unter der Wurzel von profil.js; kein Knopfname darf dort ebenfalls bedient werden.
+        import re
+        mine = set(re.findall(r'data-act="([\w-]+)"', js))
+        theirs = set(re.findall(r'a === "([\w-]+)"', pj))
+        self.assertEqual(mine & theirs, set(), "gleiche data-act in hwprofil.js und profil.js")
+        self.assertNotIn('data-act="copy"', js)
         for needle in ("weitere Karten (Datenblatt, ohne Messraten)", 'data-act="cadd-id"', "c.preset", 'data-fold="cmore"'):
             self.assertIn(needle, pj)
+
+    def test_copy_button_copies_the_redacted_issue_text_and_does_not_bubble_to_the_profile_root(self):
+        """Befund 1 (Browser-Verhalten mit Attrappen): ein Klick auf Kopieren schreibt genau den Issue-Text und endet am Block."""
+        node = _node()
+        if not node:
+            self.skipTest("weder node noch bun vorhanden")
+        script = r"""
+const H = require(process.argv[1]);
+const writes = [];
+Object.defineProperty(globalThis, "navigator", { value: { clipboard: { writeText: async (t) => { writes.push(t); } } }, configurable: true, writable: true });
+global.fetch = async (u) => ({ status: 200, text: async () => JSON.stringify(String(u).endsWith("/issue") ? { ok: true, text: "REDIGIERT" } : { ok: true, profile: { cards: [] }, persist: { enabled: true } }) });
+let click = null;
+const el = { innerHTML: "", addEventListener: (n, f) => { if (n === "click") click = f; }, querySelector: () => null };
+// Wurzel von profil.js: bedient data-act="copy" mit dem Env-Export
+const root = { got: [] };
+async function fire(act) {
+  let stopped = false;
+  const e = { target: { getAttribute: (k) => (k === "data-act" ? act : null) }, stopPropagation: () => { stopped = true; } };
+  await click(e);
+  if (!stopped) root.got.push(act);   // ohne stopPropagation wuerde profil.js den Klick sehen
+}
+(async () => {
+  H.mount(el, {});
+  await new Promise((r) => setTimeout(r, 10));
+  await fire("issue");
+  await fire("hwp-copy");
+  await fire("hwp-issue-close");
+  process.stdout.write(JSON.stringify({ writes, leaked: root.got }));
+})();
+"""
+        out = subprocess.run([node, "-e", script, os.path.join(STATIC, "hwprofil.js")], capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        res = json.loads(out.stdout)
+        self.assertEqual(res["writes"], ["REDIGIERT"])
+        self.assertEqual(res["leaked"], [])
 
 
 if __name__ == "__main__":

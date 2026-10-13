@@ -197,7 +197,7 @@
       const issue = st.issue == null ? "" : '<div class="hwp"><h4>Issue-Text: Hardwareprofil</h4><p class="hwp-msg">Markdown zum Einfügen in ein GitHub-Issue. Geheimnisse und Pfade des Rechners sind entfernt; '
         + 'UUID und PCI-Bus der Karten stehen drin, damit die Messwerte zuzuordnen sind.</p>'
         + '<textarea class="hwp-issue" readonly spellcheck="false" aria-label="Issue-Text Hardwareprofil">' + esc(st.issue) + "</textarea>"
-        + '<div class="hwp-bar"><button type="button" data-act="copy">In die Zwischenablage kopieren</button> <button type="button" data-act="issue-close">Schließen</button></div></div>';
+        + '<div class="hwp-bar"><button type="button" data-act="hwp-copy">In die Zwischenablage kopieren</button> <button type="button" data-act="hwp-issue-close">Schließen</button></div></div>';
       el.innerHTML = bar + render(r, {}) + issue;
     }
     el.addEventListener("change", (e) => {
@@ -209,14 +209,16 @@
     el.addEventListener("click", async (e) => {
       const act = e.target && e.target.getAttribute && e.target.getAttribute("data-act");
       if (!act) return;
+      // Der Knoten hängt im Profil-Reiter unter dessen Wurzel (profil.js bedient dort einen Knopf gleichen Namens wie früher "copy": Env-Export).  Nichts von hier darf dort ankommen.
+      if (e.stopPropagation) e.stopPropagation();
       if (act === "refresh") return refresh();
-      if (act === "issue-close") { st.issue = null; return paint(); }
+      if (act === "hwp-issue-close") { st.issue = null; return paint(); }
       if (act === "issue") {
         const j = await call(api + "/issue");
         st.issue = j.ok ? j.text : null; st.msg = j.ok ? "" : (j.error || "Issue-Text nicht verfügbar");
         return paint();
       }
-      if (act === "copy") {
+      if (act === "hwp-copy") {
         const ta = el.querySelector && el.querySelector("textarea.hwp-issue");
         try {
           if (typeof navigator !== "undefined" && navigator.clipboard && navigator.clipboard.writeText) await navigator.clipboard.writeText(st.issue || "");
