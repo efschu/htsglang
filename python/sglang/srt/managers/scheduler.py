@@ -361,7 +361,9 @@ from sglang.srt.rank_role import this_rank_is_form_a_worker
 from sglang.srt.planner import transient_census as _transient_census
 from sglang.srt.weg2 import tail_handoff
 from sglang.srt.weg2 import p_intake as _p_intake
+from sglang.srt.weg2 import prefill_oom_retreat as _prefill_oom_retreat  # fix 43: Prefill-OOM = retreat, not death
 from sglang.srt.mem_cache.common import (
+    PrefillOutOfPages,  # PREFILL-OOM-RETREAT (weg2/prefill_oom_retreat.py)
     cap_above_evictable,  # F1 (nf-next-1006-01)
     publish_cap_blind_gap,  # F1 (nf-next-1006-01)
     release_admission_acquired_mamba_slot,
@@ -10182,6 +10184,8 @@ class Scheduler(
         req = getattr(self, "chunked_req", None)
         if req is None or not getattr(req, "weg2_pool_parked", False):
             return
+        if getattr(req, "_weg2_oom_abort_pending", False):
+            return  # PREFILL-OOM-RETREAT: its 503 is on the request wire; requeueing it now would race the abort of the other stages
         if getattr(req, "finished", lambda: False)() or req.req_pool_idx is None:
             req.weg2_pool_parked = False
             return
@@ -10305,7 +10309,13 @@ class Scheduler(
         self.chunked_req = None
         self._pending_chunked_abort_req = None
         self._pending_chunked_abort_delay = 0
-        self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
+        # PREFILL-OOM-RETREAT: an origin-relayed abort that names its reason (the 503 the front re-routes on) keeps it;
+        # every other chunked abort answers as before.
+        _reason = getattr(self, "_pending_chunked_abort_reason", None)
+        self._pending_chunked_abort_reason = None
+        self.ipc_channels.send_to_tokenizer.send_output(
+            AbortReq(rid=req.rid) if _reason is None else AbortReq(rid=req.rid, finished_reason=_reason), req
+        )
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
 
     def _build_hisparse_decode_batch(self, reqs):
@@ -18177,7 +18187,20 @@ class Scheduler(
         new_batch.weg2_twin_bounds = _weg2_twin_anchor.batch_bounds(
             can_run_list, self.waiting_queue, page=self.page_size
         )
-        new_batch.prepare_for_extend()
+        try:
+            new_batch.prepare_for_extend()
+        except PrefillOutOfPages as _oom:
+            # PREFILL-OOM-RETREAT (NF 13.10. 11:59:14Z, fix 43): the paged extend found no pages. This is BEFORE the
+            # batch's launch and before anything of this pass went to a follower, so the pass can be taken back as if
+            # it had admitted nothing -- the server lives, the wall is read by the next pass. Out of scope (follower,
+            # TP group, D, switch off, retreat failed): re-raise, the rank dies exactly as before.
+            if not _prefill_oom_retreat.retreat(self, _oom, new_batch, can_run_list, adder):
+                raise
+            self._admission_decline_note = "prefill_oom_retreat"
+            return None, running_batch
+        _oom_ledger = getattr(self, "_weg2_prefill_oom_ledger", None)
+        if _oom_ledger is not None:
+            _oom_ledger.clear_batch(can_run_list)  # a rid that got through has no retreat history
         _wk_t4 = time.perf_counter()
         if getattr(self, "_weg2_post_wake_pass_n", None) is not None:
             self._weg2_gnbp_ms = (
@@ -22085,6 +22108,9 @@ class Scheduler(
     def _abort_request_now(self, recv_req: AbortReq):
         # weg2xsn288: an abort ends the intake-stall hold and the reported
         # mark of that rid on THIS rank (the requeued rid returns next phase).
+        _oom_ledger = getattr(self, "_weg2_prefill_oom_ledger", None)
+        if _oom_ledger is not None:
+            _oom_ledger.forget(None if recv_req.abort_all else recv_req.rid)
         _watch = getattr(self, "_weg2_intake_watch", None)
         if _watch is not None:
             try:
@@ -22095,6 +22121,7 @@ class Scheduler(
         if (chunked_req := self.chunked_req) is not None:
             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
                 self._pending_chunked_abort_req = chunked_req
+                self._pending_chunked_abort_reason = getattr(recv_req, "finished_reason", None)
                 from sglang.srt.weg2.pp_abort import chunked_abort_delay, row_authority_of
                 _row_791c = row_authority_of(self)
                 self._pending_chunked_abort_delay = chunked_abort_delay(

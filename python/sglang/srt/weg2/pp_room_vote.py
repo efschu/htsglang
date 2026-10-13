@@ -100,18 +100,37 @@ def _locked(node) -> bool:
     return any(cd.lock_ref > 0 for cd in node.component_data)
 
 
-def _host_clearable(node, state: Dict[int, Tuple[int, bool]]) -> bool:
+def _remnant_clearable(node, state: Dict[int, Tuple[int, bool, bool]]) -> bool:
+    """A node that STAYS in the tree as a host-only node after the peel (or already is one) and that UD-H may remove
+    from the host: backed, no device/host lock, every child clearable too (``_ud_clear_host_children``'s all-or-nothing
+    test, taken on every descendant)."""
+    if any(cd.lock_ref > 0 or cd.host_lock_ref > 0 for cd in node.component_data):
+        return False
+    return all(state.get(id(c), (0, False, False))[2] for c in node.children.values())
+
+
+def _host_clearable(node, state: Dict[int, Tuple[int, bool, bool]]) -> bool:
     """A host-only node UD-H may remove: backed, no device/host lock, every
     child clearable (``_ud_clear_host_children``'s all-or-nothing test)."""
     if not node.evicted or not node.backuped:
         return False
-    if any(cd.lock_ref > 0 or cd.host_lock_ref > 0 for cd in node.component_data):
-        return False
-    return all(state.get(id(c), (0, False))[1] for c in node.children.values())
+    return _remnant_clearable(node, state)
 
 
 def estimate_payable(tree, *, local_floor: bool, host_free: int) -> int:
-    """Device tokens ONE peel can pay (see the module docstring)."""
+    """Device tokens ONE peel can pay (see the module docstring).
+
+    THE PEEL'S ORDER IS THE MODEL (fix 43, NF 13.10. 11:59:14Z). The peel takes device leaves first; a leaf that is
+    backed (or backs up into the host room still free) is DEMOTED -- it stays in the tree as a host-only node -- and a
+    write_back leaf the arena refuses is DROPPED on the local-PP floor, which needs every host-only child below it
+    removable by UD-H (``_ud_clear_host_children``: any lock below leaves the subtree untouched) and no write-through
+    in flight. So a device child that the peel DEMOTES is, one step later, a HOST child of its parent -- and the
+    parent's drop depends on it being host-removable. The walk used to test that only for children that were host-only
+    already: leaf [6193] (135872 rows, un-backable) had two device children [6194]/[6195] that the tail write-through
+    had just backed; with no host child at walk time ``all([])`` was True and 135872 counted payable, while the real peel
+    demoted the two children first, found them host-locked (the held end anchor), could not clear them and paid 320 of
+    3200 -> ``Prefill out of memory``. Each node now carries ``(paid, ok, clear)``: ``clear`` is whether what it
+    leaves behind (nothing when dropped, a host node when demoted) is removable by its parent's UD-H."""
     from sglang.srt.mem_cache.unified_cache_components.tree_component import (
         BASE_COMPONENT_TYPE as ct,
     )
@@ -125,33 +144,38 @@ def estimate_payable(tree, *, local_floor: bool, host_free: int) -> int:
         n = stack.pop()
         order.append(n)
         stack.extend(n.children.values())
-    state: Dict[int, Tuple[int, bool]] = {}
+    state: Dict[int, Tuple[int, bool, bool]] = {}
     budget = max(0, int(host_free))
     for n in reversed(order):  # children before their parent
         if n is root:
             continue
         value = n.component_data[ct].value
         if value is None:
-            state[id(n)] = (0, _host_clearable(n, state))
+            hc = _host_clearable(n, state)
+            state[id(n)] = (0, hc, hc)
             continue
         dev = [c for c in n.children.values() if c.component_data[ct].value is not None]
-        host = [c for c in n.children.values() if c.component_data[ct].value is None]
         paid = sum(state[id(c)][0] for c in dev)
         if _locked(n) or not all(state[id(c)][1] for c in dev):
-            state[id(n)] = (paid, False)
+            state[id(n)] = (paid, False, False)
             continue
         tokens = len(value)
+        demoted = False
         if n.backuped:
-            ok = True
+            ok, demoted = True, True
         elif write_back and budget >= tokens:
             budget -= tokens
-            ok = True
+            ok, demoted = True, True
         elif write_back:
+            # UD / UD-H: the drop needs every child it will have AFTER the peel -- the host children it has now and the
+            # device children the peel demotes first -- removable from the host
             ok = (local_floor and getattr(n, "id", None) not in ongoing
-                  and all(state[id(c)][1] for c in host))
+                  and all(state[id(c)][2] for c in n.children.values()))
         else:
-            ok = not host  # write_through deletes; #841 refuses with children
-        state[id(n)] = (paid + (tokens if ok else 0), ok)
+            ok = not [c for c in n.children.values() if c.component_data[ct].value is None]
+        # what this node leaves behind for ITS parent's UD-H: nothing when dropped, a backed host node when demoted
+        clear = (_remnant_clearable(n, state) if demoted else True) if ok else False
+        state[id(n)] = (paid + (tokens if ok else 0), ok, clear)
     return sum(state[id(c)][0] for c in root.children.values() if id(c) in state)
 
 
@@ -329,6 +353,28 @@ def set_cap(tree, cap: Optional[int]) -> None:
     if cap is None and getattr(tree, PP_ROOM_CAP_ATTR, None) is None:
         return  # nothing agreed, nothing written: byte-identical
     setattr(tree, PP_ROOM_CAP_ATTR, None if cap is None else int(cap))
+
+
+def own_walk_enabled(env=None) -> bool:
+    """PP0 caps its own pass on its own walk when no follower fact is fresh (fix 43). ``0`` = the old publish-nothing."""
+    import os
+
+    e = os.environ if env is None else env
+    return (e.get("SGLANG_WEG2_PP_ROOM_OWN_WALK", "") or "").strip().lower() not in ("0", "false", "no", "off")
+
+
+def note_own_only(tree, cap: int, book: "RoomBook", own_fundable: int) -> None:
+    """PP0: name its own-walk cap when it binds below the reported-evictable fundable reading."""
+    if int(cap) >= int(own_fundable):
+        return
+    book.log_n += 1
+    n = book.log_n
+    if n <= 8 or (n & (n - 1)) == 0:
+        logger.warning(
+            "PR PP-ROOM-CAP own_walk cap=%d own_fundable=%d (n=%d): no fresh follower fact -- PP0 sizes this "
+            "pass on what its own peel can pay (the walk), not on the reported evictable count",
+            int(cap), int(own_fundable), n,
+        )
 
 
 def apply_cap(tree, cap: Optional[int]) -> None:

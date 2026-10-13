@@ -473,8 +473,12 @@ class EveryPrefillAllocPathHasTheNetTest(unittest.TestCase):
         for fn in (mc.alloc_token_slots, mc.alloc_paged_token_slots_extend):
             with self.subTest(site=fn.__name__):
                 src = inspect.getsource(fn)
+                # PREFILL-OOM fix 43: the paged extend raises the typed PrefillOutOfPages (a RuntimeError subclass)
+                raise_at = min(
+                    i for i in (src.find("raise RuntimeError"), src.find("raise PrefillOutOfPages")) if i >= 0
+                )
                 self.assertLess(
                     src.index("_attempt_extend_relief"),
-                    src.index("raise RuntimeError"),
+                    raise_at,
                     "relief after the raise is relief that never runs",
                 )
