@@ -394,6 +394,28 @@ def set_cap(tree, cap: Optional[int]) -> None:
     setattr(tree, PP_ROOM_CAP_ATTR, None if cap is None else int(cap))
 
 
+def own_walk_enabled(env=None) -> bool:
+    """PP0 caps its own pass on its own walk when no follower fact is fresh (fix 43). ``0`` = the old publish-nothing."""
+    import os
+
+    e = os.environ if env is None else env
+    return (e.get("SGLANG_WEG2_PP_ROOM_OWN_WALK", "") or "").strip().lower() not in ("0", "false", "no", "off")
+
+
+def note_own_only(tree, cap: int, book: "RoomBook", own_fundable: int) -> None:
+    """PP0: name its own-walk cap when it binds below the reported-evictable fundable reading."""
+    if int(cap) >= int(own_fundable):
+        return
+    book.log_n += 1
+    n = book.log_n
+    if n <= 8 or (n & (n - 1)) == 0:
+        logger.warning(
+            "PR PP-ROOM-CAP own_walk cap=%d own_fundable=%d (n=%d): no fresh follower fact -- PP0 sizes this "
+            "pass on what its own peel can pay (the walk), not on the reported evictable count",
+            int(cap), int(own_fundable), n,
+        )
+
+
 def apply_cap(tree, cap: Optional[int]) -> None:
     """A follower, pass m: R_m on its tree; its own pool under R_m at the
     pass top is the residual, counted (``PR AGREED-ABOVE-LOCAL where=pass``)."""

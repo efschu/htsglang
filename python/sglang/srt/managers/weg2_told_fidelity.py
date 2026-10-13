@@ -168,4 +168,46 @@ def pp0_verdict(scheduler, req, told: int, absolute: bool = True) -> tuple:
         "the followers adopt (rc12k27 b1: W27 start split 512 vs 16895)",
         str(getattr(req, "rid", "?")), int(told), int(depth), int(own), n,
     )
+    _reprice_after_fallback(scheduler, req)
     return 0, own
+
+
+def _reprice_after_fallback(scheduler, req) -> Optional[str]:
+    """Fix 43 (PREFILL-OOM, NF 13.10. weg2-587-1256): the front priced this request SHORT (uncached=165 of 148965) and
+    the fallback above turned it into a full prefill from 0 -- nothing re-priced it, so it walked chunk by chunk into the
+    pool's wall. Price it again HERE, against the room this pool can actually give (the intake verdict on the whole
+    uncached length, with PR's agreed room and the measured wall in the terms), and NAME the verdict: ``#TF REPRICE``.
+
+    Named and stamped only (``req._tf_reprice`` = the verdict): the answer 503 / re-route needs an un-admission or a relay
+    on the Admit's publication seam, which is not this function's; the admitted request's first retreat
+    (``weg2/prefill_oom_retreat``) reads the same verdict on its REMAINING need and answers the stall at once instead of
+    after N passes. Never raises."""
+    try:
+        from sglang.srt.weg2 import p_intake as _pi
+        from sglang.srt.weg2.intake_stall import intake_verdict
+
+        ids = getattr(req, "full_untruncated_fill_ids", None)
+        if ids is None or len(ids) == 0:
+            ids = getattr(req, "origin_input_ids", None)
+        tree = getattr(scheduler, "tree_cache", None)
+        terms = _pi.pool_terms(tree, getattr(tree, "token_to_kv_pool_allocator", None))
+        if ids is None or terms is None:
+            return None
+        free, evictable, inflight = terms
+        need = len(ids)
+        pool = int(getattr(scheduler, "max_total_num_tokens", 0) or 0)
+        v = intake_verdict(need_tokens=need, pool_tokens=pool, free_tokens=free,
+                           evictable_tokens=evictable, inflight=inflight)
+        try:
+            req._tf_reprice = v
+        except Exception:  # noqa: BLE001
+            pass
+        logger.warning(
+            "#TF REPRICE rid=%s need=%d (whole prompt, told=0) free=%d evictable_payable=%d pool=%d inflight=%s "
+            "-> %s (the front priced this request on its told prefix; after the fallback it is a full prefill)",
+            str(getattr(req, "rid", "?")), need, free, evictable, pool, bool(inflight), v,
+        )
+        return v
+    except Exception as exc:  # noqa: BLE001 - an instrument never breaks the verdict
+        logger.warning("#TF REPRICE skipped for rid=%s: %r", str(getattr(req, "rid", "?")), exc)
+        return None
