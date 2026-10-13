@@ -94,6 +94,16 @@ MARK_SSE_OPEN = "WEG2 LANE-SSE-OPEN"
 MARK_GROUP_DEAD = "WEG2 LANE-GROUP-DEAD"
 #: how often the lane loop reads the boot lifecycle while it holds streams
 DEATH_CHECK_S = 1.0
+#: LANES RESUMEQ (metal int24f6 13:38:51Z, 13:41:41Z): D answered the floor RPC of a LANE-RESUME with the lane holds it
+#: re-queued (and ran them again); the front takes them into its book as D work (a RESUME-VIA-P record of such a rid is
+#: withdrawn: D continues the stream itself, there is no P leg to wait for)
+MARK_D_RESUMED = "WEG2 LANE-D-RESUMED"
+#: the D->P quiesce found D running work the front's ledger did not count (the lane hold had ended on D, the book had not
+#: followed): one park RPC for it instead of waiting for the decode to end
+MARK_QUIESCE_PARK = "WEG2 LANE-QUIESCE-PARK"
+#: the P->D quiesce found legs on P that the front's ledger leaves out (lane hold) and P does not run: aborted by rid
+#: (a leg parked in P's waiting queue is not idle for the witness: W3)
+MARK_QUIESCE_ABORT = "WEG2 LANE-QUIESCE-ABORT"
 
 
 def enabled() -> bool:
@@ -179,6 +189,11 @@ class LaneCtl:
         self.death_announced = False
         self.lock: Optional[asyncio.Lock] = None
         self.kick_evt: Optional[asyncio.Event] = None
+        #: LANES RESUMEQ: set when the floor RPC to D that is in flight has been answered AND its ``requeued`` list is in
+        #: the front's book (:func:`settle`); a fresh Event per RPC, None before the first one
+        self.d_sync: Optional[asyncio.Event] = None
+        #: LANES RESUMEQ: rid -> real time D re-queued it from its lane hold (the front's book follows D's answer)
+        self.d_resumed: "collections.OrderedDict[str, float]" = collections.OrderedDict()
 
     # ---- helpers ----
     def mark_held(self, rid: str) -> None:
@@ -202,6 +217,7 @@ class LaneCtl:
         self.gate_done.pop(r, None)
         self.arriving.pop(r, None)
         self.reprefill.discard(r)
+        self.d_resumed.pop(r, None)
         for k in [k for k, h in self.held.items() if h.p.rid == r]:
             self.held.pop(k, None)
 
@@ -586,8 +602,20 @@ async def sync_floor(fr: Any, force: bool = False, now: Optional[float] = None) 
     if not todo:
         return
     body = {_ln.RPC_KEY_FLOOR: want[0], _ln.RPC_KEY_EPOCH: want[1]}
+    # LANES RESUMEQ: a flip park must not decide while D's answer to this RPC is on the wire -- D re-queues its lane holds
+    # when it takes the floor (and runs them at once), and the book follows its answer (:func:`d_requeued`)
+    d_evt: Optional[asyncio.Event] = None
+    if any(g.name == "D" for g in todo):
+        d_evt = lc.d_sync = asyncio.Event()
 
     async def one(g: Any) -> None:
+        try:
+            await one_rpc(g)
+        finally:
+            if g.name == "D" and d_evt is not None:
+                d_evt.set()
+
+    async def one_rpc(g: Any) -> None:
         try:
             code, text = await fr.rpc(g, _ln.RPC_LANE_FLOOR, body, 10 if g.name == fr.awake else 2)
         except Exception as e:  # noqa: BLE001
@@ -596,6 +624,8 @@ async def sync_floor(fr: Any, force: bool = False, now: Optional[float] = None) 
             if want == (ls.lane_floor, ls.lane_epoch):
                 lc.acked[g.name] = want
             fr.counters["lane_floor_rpc"] += 1
+            if g.name == "D":
+                d_requeued(fr, lc, _requeued_of(text))
             return
         if code in (404, 501):
             lc.unsupported.add(g.name)
@@ -611,6 +641,148 @@ async def sync_floor(fr: Any, force: bool = False, now: Optional[float] = None) 
                            g.name, code, want[0], want[1], str(text)[:120])
 
     await asyncio.gather(*(one(g) for g in todo))
+
+
+def _requeued_of(text: Any) -> List[str]:
+    """``requeued`` of D's answer to ``/weg2/lane_floor`` (the held lane parks the call re-queued, oldest first); [] for an
+    answer without one (an old D, an empty body, a P)."""
+    try:
+        import json
+
+        got = json.loads(text) if isinstance(text, (str, bytes, bytearray)) else text
+        rids = got.get("requeued") if isinstance(got, dict) else None
+        return [str(r) for r in (rids or ())]
+    except Exception:  # noqa: BLE001 -- an old / empty answer: nothing to book
+        return []
+
+
+def d_requeued(fr: Any, lc: LaneCtl, rids: List[str]) -> int:
+    """LANES RESUMEQ (metal int24f6 13:38:51Z, the 50.5-s quiesce): D took the floor, re-queued the lane holds of the new floor
+    lane and RAN them again.  The front booked some of them as lane parks (``_resume`` pops those from ``_d_parked``) -- and
+    others not at all: a request D put into the hold ITSELF (``hold_queued``, per pass) stands in no front register, and when it
+    is a RESUME-VIA-P rid (``_rvp_inflight``: "D holds it, a P leg prefills it") ``_flip_ledger`` keeps it out of the flip
+    ledger as "held by D, nothing running".  D now runs it: the flip's park saw ``running=0`` (PARK-IMMEDIATE "nothing
+    running"), sent no park RPC, and the D->P quiesce polled ``/flush_cache`` 400 for the whole decode (4 606 tokens, 50 s).
+
+    The book follows D's answer: for every re-queued rid the front still holds open, the RESUME-VIA-P record ends (D
+    continues the stream itself; its P-only leg -- queued, held, or an early leg on a dormant P -- is withdrawn, an early
+    leg on P is aborted by rid: left alone it is a ghost in P's waiting queue, W3 at the next P->D flip, 13:41:41Z).  Were D
+    to refuse the request again, it writes a new needs-p record and the front queues a new P leg for it (``_rvp_take``), as
+    for every RESUME-VIA-P rid.  Returns how many rids were booked."""
+    if not rids:
+        return 0
+    D = fr.groups["D"]
+    mine = [r for r in rids if r in D.outstanding]
+    if not mine:
+        return 0
+    n_rvp = n_leg = n_early = 0
+    for r in mine:
+        lc.parked_d.pop(r, None)
+        lc.dormant.pop(r, None)
+        fr._d_parked.pop(r, None)
+        lc.d_resumed.pop(r, None)
+        lc.d_resumed[r] = time.time()
+        was_rvp, legs, early = fr._rvp_withdraw(r, "lane-d-resumed")
+        n_rvp += 1 if was_rvp else 0
+        n_leg += legs
+        n_early += early
+    while len(lc.d_resumed) > KEPT:
+        lc.d_resumed.popitem(last=False)
+    fr._park_stuck().release(mine)  # they run: no park streak to watch
+    fr.counters["lane_d_resumed"] += len(mine)
+    fr.counters["lane_d_resumed_rvp"] += n_rvp
+    logger.warning("%s n=%d rids=%s rvp_records_ended=%d p_legs_withdrawn=%d early_legs_aborted=%d -- D took the floor and "
+                   "re-queued these lane holds; they run on D again, so the front books them as D work (a flip's park "
+                   "and its drain see them); a RESUME-VIA-P record of one ends: D continues the stream itself, no P "
+                   "leg is waited for", MARK_D_RESUMED, len(mine), mine[:8], n_rvp, n_leg, n_early)
+    _changed(fr)
+    return len(mine)
+
+
+async def settle(fr: Any) -> None:
+    """LANES RESUMEQ: wait for the floor RPC to D that is in flight (the resume's) to be answered and booked.  Returns at
+    once without a lane controller, without such an RPC, or when it has been answered; bounded by the RPC's own timeout."""
+    lc = fr.__dict__.get("_lane_ctl_obj")
+    evt = lc.d_sync if lc is not None else None
+    if evt is not None and not evt.is_set():
+        await evt.wait()
+
+
+def touched(fr: Any) -> bool:
+    """A lane has acted on this boot (a request was held / parked for one, or the floor stands): the quiesce nets below
+    only exist for those states -- a boot that never saw a lane runs the old quiesce."""
+    if not enabled():
+        return False
+    lc = fr.__dict__.get("_lane_ctl_obj")
+    if lc is None:
+        return False
+    return bool(lc.ever_held or lc.d_resumed or fr._lane_state().lane_floor > 0)
+
+
+async def quiesce_net(fr: Any, g: Any, st: Dict[str, Any]) -> None:
+    """LANES RESUMEQ: called by ``Front.quiesce`` after a poll that answered NOT idle.  ``st`` is the quiesce's own scratch
+    (one action per quiesce and group).  Only after a lane acted (:func:`touched`), only when the front's flip ledger of the
+    group is EMPTY -- the drain has waited for everything the book counts, so what keeps the group busy now is work the book
+    does not know:
+
+    * group D: running requests (``/get_server_info`` ``weg2_decode_progress.running``) -> ONE park RPC, the flip's own
+      park (no rids: D parks what runs; lane holds are already parked).  The quiesce then ends when D has parked, not when
+      the decodes have run out (metal 13:38:51Z: 50.5 s).
+    * group P: legs in ``outstanding`` that the ledger leaves out (lane-held, floor > 0) and P does not run -- they wait in P's
+      waiting queue behind its own floor, which is not idle for the witness, and the witness reads "front drained, rank not
+      idle" (W3 STOP, metal 13:41:41Z, two ghost legs of requests that had ended on D) -> ``/abort_request`` by rid, then
+      they leave ``outstanding``.  At the P->D flip the drain pool is over, so no live leg is among them."""
+    if not touched(fr) or st.get("done"):
+        return
+    st["n"] = n = int(st.get("n", 0)) + 1
+    if g.name == "D" and n not in (1, 20, 100):
+        return  # D's running count is a /get_server_info read (blocking between two passes): a few samples per quiesce
+    try:
+        ledger = list(fr._flip_ledger(g))
+    except Exception:  # noqa: BLE001 -- a partial front
+        return
+    if ledger:
+        return
+    if g.name == "D":
+        if getattr(fr, "_park_unsupported", False):
+            return
+        try:
+            prog = await fr._weg2_decode_progress(g)
+        except Exception:  # noqa: BLE001 -- an unreadable counter is an absence: the old quiesce
+            return
+        running = int((prog or {}).get("running", 0) or 0)
+        if running <= 0:
+            return
+        st["done"] = True
+        t_park = time.time()
+        body = _pp.park_body(getattr(fr, "epoch", 0), getattr(fr, "d_wait_bound_s", 0.0), reason="quiesce-unbooked")
+        try:
+            code, text = await fr.rpc(g, _pp.PARK_PATH, body, _pp.PARK_TIMEOUT_S)
+        except Exception as e:  # noqa: BLE001
+            code, text = 0, f"{type(e).__name__}: {e}"
+        verdict, got, why = _pp.park_verdict(code, text)
+        known = [r for r in got if r in g.outstanding]
+        if verdict == _pp.PARK_PARKED:
+            for r in known:  # the flip park's own book (stamped before the RPC, as ``_wait_bound_park`` does)
+                fr._d_parked[r] = t_park
+        fr.counters["lane_quiesce_park"] += 1
+        logger.warning("%s group=D running=%d status=%d parked=%s -- the D->P quiesce found running work the flip ledger did "
+                       "not count (it was a lane hold that ended on D while the book still excluded it): parked by one "
+                       "RPC instead of waiting for the decode to end", MARK_QUIESCE_PARK, running, code, known[:8])
+        return
+    if g.name == "P":
+        left = list(g.outstanding)  # the ledger is empty: everything still outstanding is left out of it
+        if not left:
+            return
+        st["done"] = True
+        res = await asyncio.gather(*(fr.rpc(g, "/abort_request", {"rid": r}, 30) for r in left), return_exceptions=True)
+        bad = [r for r, x in zip(left, res) if isinstance(x, BaseException) or (isinstance(x, tuple) and x[0] != 200)]
+        for r in left:
+            g.outstanding.pop(r, None)
+        fr.counters["lane_quiesce_abort"] += len(left)
+        logger.warning("%s group=P rids=%s abort_failed=%d -- the P->D quiesce found legs on P that the ledger leaves out "
+                       "(held for a lane, or ghosts of requests that ended): P does not run them below its floor and "
+                       "they are not idle for the witness; aborted by rid", MARK_QUIESCE_ABORT, left[:8], len(bad))
 
 
 def _restore_held(fr: Any, lc: LaneCtl, floor: int, now: float) -> Tuple[int, int]:
