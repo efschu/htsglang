@@ -45,6 +45,14 @@ _SRT = os.path.dirname(os.path.dirname(ds.__file__))
 
 
 @pytest.fixture(autouse=True)
+def _lanes_switch_pinned_off_int24f5(monkeypatch):
+    """int24f5: SGLANG_WEG2_LANES is ON by default now (user word 13.10.2026).  The tests of this file were written against "unset = off" and
+    name the switch state explicitly wherever they need it on; the unset state is pinned to the old value so the switch-off tests keep
+    testing the ``=0`` path.  The new default itself is pinned in test_weg2_lanes_default_on_1013.py."""
+    monkeypatch.setenv("SGLANG_WEG2_LANES", "0")
+
+
+@pytest.fixture(autouse=True)
 def _group_d(monkeypatch):
     monkeypatch.setenv("SGLANG_WEG2_GROUP", "D")
     monkeypatch.delenv(ds.PARK_ENV, raising=False)

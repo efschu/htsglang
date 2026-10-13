@@ -1119,9 +1119,16 @@ class Envs:
     # same lane); between lanes the rule is strict displacement. 1 = the front reads the field,
     # keeps lane_floor / lane_epoch / per-lane counters (state.json front.lane_floor,
     # front.lane_epoch, front.lanes) and the Anthropic adapter forwards `priority`.
-    # Off (default) = the front does not read `priority`, no lane field in state.json, the
-    # request book or a log line. Read by the front and by both groups (the env is inherited).
-    SGLANG_WEG2_LANES = EnvBool(False)
+    # DEFAULT ON since int24f5 (user word 13.10.2026: lanes "muss im boot defaultmaessig an
+    # sein"; NF line only -- this environ.py is the NF tree's). With every request in lane 0
+    # (no `priority`, or 0) nothing displaces anything: no LANE-* action, no RPC to the groups,
+    # no park, routing as without lanes (test_weg2_lanes_default_on_1013). The only visible
+    # differences with lane 0 only: state.json front.lane_floor / lane_epoch / lanes, a `lane`
+    # key in request-book rows, a 48-byte progress beacon. =0 is the old path: the front does
+    # not read `priority`, no lane field in state.json, the request book or a log line. Read by
+    # the front and by both groups (the env is inherited; the code default reaches the ranks
+    # without a profile line).
+    SGLANG_WEG2_LANES = EnvBool(True)
     # PRIORITY LANES 1008: seconds between the keepalive comment lines (`: lane-hold floor=N`)
     # the front writes into a held SSE stream. Used only with SGLANG_WEG2_LANES=1 (the sender
     # is part L4 of the plan; part L1 only declares the value).

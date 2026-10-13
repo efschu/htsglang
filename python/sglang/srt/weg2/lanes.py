@@ -7,7 +7,7 @@ displacement, inside a lane everything stays as it is today.  THIS MODULE HAS NO
 reads the field, holds ``lane_floor`` / ``lane_epoch`` / the per-lane counters and fixes the spelling of
 every marker, env name and RPC name, so L2-L4 are written against names that cannot drift.
 
-THE SWITCH.  ``SGLANG_WEG2_LANES`` (default 0).  Off, nothing in this module is reached from a request
+THE SWITCH.  ``SGLANG_WEG2_LANES`` (default 1 since int24f5, user word 13.10.2026; 0 = off).  Off, nothing in this module is reached from a request
 path: the front does not read ``priority``, writes no lane field into state.json / the request book / a
 log line, and the Anthropic adapter does not forward the field (it drops it, as it always did).
 
@@ -77,7 +77,7 @@ LANE_MAX = 2**31 - 1
 # ---------------------------------------------------------------------------
 
 def enabled() -> bool:
-    """``SGLANG_WEG2_LANES`` (default off)."""
+    """``SGLANG_WEG2_LANES`` (default ON since int24f5; ``=0`` is off)."""
     from sglang.srt.environ import envs
 
     return bool(envs.SGLANG_WEG2_LANES.get())

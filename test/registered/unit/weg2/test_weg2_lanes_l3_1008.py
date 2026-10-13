@@ -26,6 +26,8 @@ import os
 import pickle
 import types
 import unittest
+
+import pytest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -49,6 +51,14 @@ N_TOK = 99000
 # ---------------------------------------------------------------------------
 # harness: the real adder, a PP stage stand-in, the lane switch
 # ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _lanes_switch_pinned_off_int24f5(monkeypatch):
+    """int24f5: SGLANG_WEG2_LANES is ON by default now (user word 13.10.2026).  The tests of this file were written against "unset = off" and
+    name the switch state explicitly wherever they need it on; the unset state is pinned to the old value so the switch-off tests keep
+    testing the ``=0`` path.  The new default itself is pinned in test_weg2_lanes_default_on_1013.py."""
+    monkeypatch.setenv("SGLANG_WEG2_LANES", "0")
+
 
 def _tree_cache():
     tc = MagicMock()
@@ -515,7 +525,8 @@ class SwitchOffTest(unittest.TestCase):
         self.assertEqual(lanes_p.echo(s0), (-1, -1))
 
     def test_the_switch_off_rpc_is_ignored(self):
-        old = os.environ.pop("SGLANG_WEG2_LANES", None)
+        old = os.environ.get("SGLANG_WEG2_LANES")
+        os.environ["SGLANG_WEG2_LANES"] = "0"   # int24f5: unset is ON now -- the switch-off path is the explicit 0
         try:
             os.environ["SGLANG_WEG2_GROUP"] = "P"
             s0 = _stage(0)
@@ -526,6 +537,8 @@ class SwitchOffTest(unittest.TestCase):
             os.environ.pop("SGLANG_WEG2_GROUP", None)
             if old is not None:
                 os.environ["SGLANG_WEG2_LANES"] = old
+            else:
+                os.environ.pop("SGLANG_WEG2_LANES", None)
 
     def test_group_d_and_a_parkless_p_take_no_floor(self):
         with _LanesOn():
