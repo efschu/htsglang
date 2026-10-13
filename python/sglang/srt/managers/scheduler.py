@@ -20285,6 +20285,7 @@ class Scheduler(
                 try:
                     _spill_tc._weg2_flush_spill = True
                     with _weg2_own_work():
+                        _prev_pending = None  # FLUSHFAST: in-flight count of the round before
                         for _round in (range(64) if not _memo_hit else ()):
                             _stats = _sweep(max_issue=256) or {}
                             _issued += int(_stats.get("issued", 0) or 0)
@@ -20306,6 +20307,44 @@ class Scheduler(
                                     _weg2_flush_nonblock.sweep_memo_set(
                                         self, self.tree_cache)
                                 break
+                            # FLUSHFAST (NF int24g, D>P epochs 105/115, boot
+                            # 1012_185900: 28-30 s instead of ~3 s): a round that
+                            # issued nothing, left EVERY un-backed node refused for
+                            # want of KV-arena room, AND saw no write land since the
+                            # round before (in-flight count not lower after the wait
+                            # below) is a stuck round: nothing moved that could free
+                            # a slot, so the next round repeats it. Measured on D TP0:
+                            # 66/36 nodes refused, in_flight stuck at 48/31, four
+                            # rounds x ~3 s per leg, the rest lost at the reset anyway
+                            # (ANCHOR-LOST at=flush). Progress-aware on purpose
+                            # (review flushfast-1012 finding 1): the sleep leg of the
+                            # same boot ran 0/2/3/0/0 issued with in_flight 16 -> 3 --
+                            # an all-refused round 0 followed by rounds that landed
+                            # writes and published 5 nodes. So round 0 never stops
+                            # here (it has no round before it to compare with), and a
+                            # round whose wait let writes land goes on. Writes in
+                            # flight are NOT dropped: the join after the loop, the
+                            # sleep leg's drain and #1470b still take them. Rank-local
+                            # like the break above (no collective in this loop; a rank
+                            # that stops early waits in the group verdict).
+                            _pend_now = int(_stats.get("pending", 0) or 0)
+                            if (_prev_pending is not None
+                                    and _pend_now >= _prev_pending
+                                    and int(_stats.get("issued", 0) or 0) == 0
+                                    and int(_stats.get("unbacked", 0) or 0) > 0
+                                    and int(_stats.get("arena_refused", 0) or 0)
+                                    >= int(_stats.get("unbacked", 0) or 0)):
+                                logger.info(
+                                    "#1470 FLUSH-PUBLISH ARENA-FULL-STOP round=%d unbacked=%s "
+                                    "arena_refused=%s issued=0 in_flight=%s (round before: %s): every "
+                                    "un-backed node was refused by the full KV arena and no write landed "
+                                    "during the wait, the loop ends instead of waiting for a slot that "
+                                    "does not free (in-flight writes are joined by the steps after the "
+                                    "loop and by the sleep leg, not dropped)",
+                                    _round, _stats.get("unbacked"), _stats.get("arena_refused"),
+                                    _pend_now, _prev_pending)
+                                break
+                            _prev_pending = _pend_now
                             if _wc is not None:
                                 _wc(write_back=True)  # free the pins, then sweep again
                             if int(_stats.get("issued", 0) or 0) == 0 and _round >= 3:
