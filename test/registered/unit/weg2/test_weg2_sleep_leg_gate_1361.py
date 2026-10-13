@@ -113,17 +113,22 @@ class TheCallSiteIsWiredNotJustThePureFunction(CustomTestCase):
         self.assertLess(gather - call, 1200,
                         "the gate drifted away from the leg it guards")
 
-    def test_executing_the_call_site_refuses_on_the_xsn25_numbers(self):
-        """Not a source assertion: the method is CALLED and must raise."""
+    def test_executing_the_call_site_warns_on_the_xsn25_numbers(self):
+        """Not a source assertion: the method is CALLED. 12.10.2026 (NF W98
+        HOST-WARN, user rule 06.10.): it used to raise and refuse the leg; the
+        pure function still computes the deficit, the call site WARNS and the
+        leg runs (the numbers are in the warning)."""
+        import collections
         import tempfile
 
         with tempfile.TemporaryDirectory() as td:
             f_ = self._front(td, XSN25_NEED)
+            f_.counters = collections.Counter()
             with mock.patch.object(hl, "read_cgroup_pressure",
                                    return_value={"file_gib": 60.0 + XSN25_CUSHION,
                                                  "shmem_gib": 60.0}):
-                with self.assertRaises(hl.Weg2SleepLegCushionDeficit):
-                    f_._sleep_leg_gate("D")
+                self.assertIsNone(f_._sleep_leg_gate("D"))
+            self.assertEqual(f_.counters["host_sleep_leg_warn"], 1)
 
     def test_executing_the_call_site_passes_on_the_xsn26_numbers(self):
         import tempfile
