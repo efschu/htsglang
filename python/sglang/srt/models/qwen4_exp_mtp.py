@@ -7,6 +7,7 @@ from typing import Optional
 
 import torch
 from torch import nn
+from torch.nn.parameter import is_lazy
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_pp_group
@@ -184,8 +185,29 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
         trained, so the loader-side invariant is "all False": stated once here
         for the draft, re-stated after ``load_weights`` (a post-load pass may
         register a fresh ``Parameter``). Values are untouched.
+
+        G16 (metal G15 stage A attempt 5, D.log:6139-6187, 13.10. 07:33:57Z):
+        ``Module.requires_grad_`` raises ``ValueError: Attempted to use an
+        uninitialized parameter`` on a ``GGUFUninitializedParameter`` -- and a
+        GGUF-quantized draft is BORN with those: ``GGUFLinearMethod.
+        create_weights`` registers every ``qweight`` lazy (``gguf.py:1722``,
+        ``requires_grad=False`` explicitly) and only ``load_weights``
+        materializes it. So the G15 call in ``__init__`` killed the draft on
+        every GGUF rank before it loaded a byte (TP1/TP2: the solo-placement
+        shadow ranks build the draft on ``meta``, no ``load_weights`` at all,
+        ``model_runner.py:2437``; TP0 builds it the same lazy way through the
+        GGUF loader, ``loader.py:2733``). A lazy parameter is skipped here:
+        it is already ``requires_grad=False`` by construction (the sweep test
+        pins every loader site), ``materialize`` keeps the flag when it turns
+        the object into a plain ``Parameter``, and the call after
+        ``load_weights`` sees the then-materialized object and freezes it
+        like any other. A shadow's lazy parameters stay lazy for good -- that
+        rank never runs a draft forward, hence no autograd graph either.
         """
-        self.requires_grad_(False)
+        for p in self.parameters():
+            if is_lazy(p):
+                continue
+            p.requires_grad_(False)
 
     def load_weights(self, weights, is_mtp: bool = False):
         loaded = super().load_weights(weights, is_mtp=is_mtp)
