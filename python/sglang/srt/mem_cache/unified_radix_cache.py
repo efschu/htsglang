@@ -7046,7 +7046,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # PR (weg2/pp_room_vote.py): under the stages' agreed R_m, at most R_m
         floor = _sf.agreed_floor(self, floor)
         if kv_tokens > floor:
-            if _sf.local_pp_room(self, kv_tokens, floor, getattr(req, "rid", None)):
+            try:
+                _room = _sf.local_pp_room(self, kv_tokens, floor, getattr(req, "rid", None))
+            except _sf.AgreedRoomShort:
+                # PREFILL-OOM-RETREAT (NF 13.10. 18:30:21Z): nothing was transferred yet -- unwind the two lock refs taken
+                # above, exactly as every other refusal exit of this function does, so that the seat that can take the
+                # pass back (weg2/prefill_oom_retreat.retreat_loadback) finds the tree as it was. Where nobody retreats
+                # the exception still propagates and the rank stops as before.
+                self.dec_lock_ref(best_match_node, ancestor_lock_params)
+                self.dec_host_lock_ref(best_match_node, host_anchor_params)
+                raise
+            if _room:
                 # A group of one's floor IS this rank's available_size():
                 # re-read after the eviction, it clears the load-back.
                 floor = int(self.token_to_kv_pool_allocator.available_size())
