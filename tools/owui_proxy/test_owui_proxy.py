@@ -269,3 +269,78 @@ def test_held_request_gets_x_forwarded_for_too(tmp_path):
             await brun.cleanup()
         return seen
     assert asyncio.run(go()) == ["10.9.9.9, 127.0.0.1"]
+
+
+async def _stream_through_proxy(chat_handler, tmp_path):
+    """One streaming request through the proxy to a backend whose chat endpoint is chat_handler; returns the raw
+    client lines and how often the backend was asked."""
+    calls = []
+
+    async def chat(request):
+        calls.append(await request.json())
+        return await chat_handler(request)
+    up = web.Application()
+    up.router.add_get("/v1/models", FakeBackend().models)
+    up.router.add_post("/v1/chat/completions", chat)
+    brun, bport = await _serve(up)
+    cfg = owui_proxy.Cfg("http://127.0.0.1:%d" % bport, 10, 0.2, 0.1, str(tmp_path / "m.json"), 4)
+    prun, pport = await _serve(owui_proxy.build_app(cfg))
+    lines = []
+    try:
+        async with aiohttp.ClientSession() as s:
+            body = {"model": "x", "stream": True, "messages": [{"role": "user", "content": "hi"}]}
+            async with s.post("http://127.0.0.1:%d/v1/chat/completions" % pport, json=body) as r:
+                async for line in r.content:
+                    if line.strip():
+                        lines.append(line.strip())
+    finally:
+        await prun.cleanup()
+        await brun.cleanup()
+    return lines, calls
+
+
+def test_upstream_4xx_is_not_resumed_and_reaches_the_client(tmp_path):
+    """13.10.: OpenWebUI sent 971518 tokens, the front refused with 400; the proxy resumed it 6x and then sent a bare
+    [DONE] -- an empty answer. A refusal is permanent: one request, the front's reason as an SSE error."""
+    reason = "The input (971518 tokens) is longer than the model's context length (262144 tokens)."
+
+    async def refuse(request):
+        return web.json_response({"error": {"message": reason, "type": "BadRequestError", "param": None,
+                                            "code": 400}}, status=400)
+    lines, calls = asyncio.run(_stream_through_proxy(refuse, tmp_path))
+    assert len(calls) == 1
+    err = json.loads(lines[0][5:])["error"]
+    assert (err["message"], err["code"], err["type"]) == (reason, 400, "upstream_rejected")
+    assert lines[-1] == b"data: [DONE]"
+
+
+def test_upstream_429_is_still_resumed(tmp_path):
+    async def busy_then_ok(request):
+        if len(seen) == 0:
+            seen.append(1)
+            return web.Response(status=429, text="busy")
+        resp = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+        await resp.prepare(request)
+        await resp.write(b'data: {"id": "a", "choices": [{"index": 0, "delta": {"content": "ok"}, '
+                         b'"finish_reason": "stop"}]}\n\ndata: [DONE]\n\n')
+        return resp
+    seen = []
+    lines, calls = asyncio.run(_stream_through_proxy(busy_then_ok, tmp_path))
+    assert len(calls) == 2 and not any(b'"error"' in ln for ln in lines)
+
+
+def test_front_keepalive_comments_reach_the_client(tmp_path):
+    """13.10.: a request parked behind a higher lane gets SSE comments from the front; dropping them let the client's
+    read timeout cut a held stream."""
+    async def parked_then_answer(request):
+        resp = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+        await resp.prepare(request)
+        for _ in range(3):
+            await resp.write(b": keepalive\n\n")
+            await asyncio.sleep(0.01)
+        await resp.write(b'data: {"id": "a", "choices": [{"index": 0, "delta": {"content": "ok"}, '
+                         b'"finish_reason": "stop"}]}\n\ndata: [DONE]\n\n')
+        return resp
+    lines, calls = asyncio.run(_stream_through_proxy(parked_then_answer, tmp_path))
+    assert lines.count(b": keepalive") == 3 and len(calls) == 1
+    assert lines.index(b": keepalive") < next(i for i, ln in enumerate(lines) if ln.startswith(b"data: {"))

@@ -192,6 +192,16 @@ class Proxy:
                 # 01.10.: a closed client used to count as a backend break -> 6 resumes against a dead socket.
                 log.info("stream %s: client gone (%s), not resuming", st.id, e)
                 return resp
+            except UpstreamRejected as e:
+                # 13.10.: a 4xx (e.g. 400 context too long) is permanent; resuming it 6x ended in a bare [DONE],
+                # an empty answer in OpenWebUI. Tell the client the front's own reason instead.
+                log.warning("stream %s rejected by upstream (%s), not resuming", st.id, e)
+                try:
+                    await _sse(resp, {"error": {"message": e.message(), "type": "upstream_rejected",
+                                                "code": e.status}})
+                except ClientGone:
+                    return resp
+                break
             except (aiohttp.ClientError, asyncio.TimeoutError, ConnectionError) as e:
                 log.warning("stream %s broke (%s)", st.id, e)
                 done = False
@@ -208,10 +218,18 @@ class Proxy:
         async with self.session.post(self.cfg.upstream + "/v1/chat/completions", json=req_body,
                                      headers={"X-Forwarded-For": xff} if xff else None) as r:
             if r.status != 200:
-                raise aiohttp.ClientError("upstream %d: %s" % (r.status, (await r.text())[:200]))
+                text = await r.text()
+                if 400 <= r.status < 500 and r.status not in (408, 429):
+                    raise UpstreamRejected(r.status, text)
+                raise aiohttp.ClientError("upstream %d: %s" % (r.status, text[:200]))
             finished = False
             async for line in r.content:
                 line = line.strip()
+                if line.startswith(b":"):
+                    # 13.10.: the front's keepalive comments (a request parked behind a higher lane) go on to the
+                    # client, so its read timeout does not cut a held stream.
+                    await _write(resp, line + b"\n\n")
+                    continue
                 if not line.startswith(b"data:"):
                     continue
                 data = line[5:].strip()
@@ -231,6 +249,21 @@ class Proxy:
                 if fin:
                     finished = True
             return finished
+
+
+class UpstreamRejected(Exception):
+    """The front answered 4xx (not 408/429): the request itself is refused, another backend would refuse it too."""
+
+    def __init__(self, status: int, text: str):
+        super().__init__("upstream %d: %s" % (status, text[:300]))
+        self.status = status
+        self.text = text
+
+    def message(self) -> str:
+        try:
+            return str(json.loads(self.text)["error"]["message"])
+        except (ValueError, KeyError, TypeError):
+            return self.text[:500] or "upstream %d" % self.status
 
 
 class StreamState:
