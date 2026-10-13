@@ -339,15 +339,25 @@ def size_host_pools(
         f"over {KV_MULTIPLE_OF_S} x S (PP 2S + TP pin 6S) -> S_ledger={s_ledger} GB"
     )
     if s_ledger < 1:
-        raise SizingRefused(
-            f"{REFUSED_PREFIX}: ledger cap leaves no KV budget: memavail "
+        # HOSTWARN2 (13.10.2026, user rule 06.10. "KEINE Verweigerung wegen Host-RAM ...
+        # man laesst es darauf ankommen, ob es OOM geht"): this used to raise
+        # SizingRefused. The ledger cap says no whole GB of S is fundable on this host
+        # budget; the sizing now WARNS with the same numbers and sizes the SMALLEST pool
+        # the arithmetic can express, S = 1 GB (one GB of S pins KV_MULTIPLE_OF_S GB).
+        # Nothing else is shrunk or invented. The pool-geometry floors below (rows >= the
+        # G10 floor, anchors >= the anchor floor) are NOT host-RAM verdicts and still refuse.
+        lines.append(
+            f"HOST-RAM-WARN WEG1 LedgerNoKvBudget -- #1068 WEG1 SIZING: "
+            f"ledger cap leaves no KV budget: memavail "
             f"{memavail_bytes / GB:.2f} GB - floor {floor_txt} - "
             f"reserve {reserve_bytes / GB:.2f} GB ({reserve_src}) - load transient "
             f"{LOAD_TRANSIENT_BYTES / GB:.2f} GB - anchors {anchors_bytes / GB:.2f} GB "
             f"= {kv_budget / GB:.2f} GB < {KV_MULTIPLE_OF_S} GB (one GB of S costs "
-            f"{KV_MULTIPLE_OF_S} GB pinned). No fallback: free host RAM or lower "
-            "WEG1_MAMBA_HOST_MIB by name."
+            f"{KV_MULTIPLE_OF_S} GB pinned) -- WARNING ONLY: sizing S_ledger=1 GB and going on "
+            "(user rule 06.10.: no refusal on host RAM; an OOM kill is the accepted risk). "
+            "Free host RAM or lower WEG1_MAMBA_HOST_MIB by name to fund a real pool."
         )
+        s_ledger = 1
     ledger_rows = rows_of(s_ledger, cell_pp0_bytes)
     floor_rows = int(max_running_requests) * int(chunked_prefill_size)
     if ledger_rows < floor_rows:

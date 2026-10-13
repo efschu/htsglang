@@ -88,15 +88,18 @@ class TheDefaultIsTheMeasuredMargin(_CleanEnv):
 
 class TheLedgerBooksTheWallThePoolsEnforce(_CleanEnv):
     def _pool_admitted(self, nonreclaim_gib):
+        # HOSTWARN2 (13.10.2026, user rule 06.10.): an over-commit is a HOST-RAM-WARN now, not a
+        # ValueError. "Admitted" keeps its meaning for this test: the pool check issued NO warning.
+        warned = []
         with mock.patch.object(phb, "pinned_host_memory_bytes",
-                               return_value=(CAP, CAP - int(nonreclaim_gib * GIB))):
+                               return_value=(CAP, CAP - int(nonreclaim_gib * GIB))), \
+                mock.patch.object(phb, "warn_pinned_host",
+                                  side_effect=lambda err, where: warned.append(err)):
             try:
                 phb.check_and_register_pinned_post(
                     name="V4 paged host pool qsa_indexer", flag="--hicache-size",
                     requested_bytes=POOLS, reserve_bytes=None)
-                return True
-            except ValueError:
-                return False
+                return not warned
             finally:
                 phb.clear_registered_posts()
 

@@ -7853,13 +7853,18 @@ class Front:
         return (time.monotonic() if now is None else now) - t
 
     async def host_watermark_sampler(self) -> None:
-        """#1269 / standing order 2026-09-08: THE HOST THRESHOLD IS NEVER CROSSED.
+        """#1269 / standing order 2026-09-08, SUPERSEDED 12.10.2026: the host watermark WARNS.
 
         Reads the cgroup's own ``memory.current`` -- the quantity the reaper
         watches -- and when it crosses the HARD BOUND (reap watermark minus the
-        named margin) performs a CONTROLLED TEARDOWN down the same path a
-        killer takes (:meth:`do_stop`).  Never "accept the risk", never a
-        silent restart.
+        named margin) it prints ``HOST-RAM-WARN W22 ...`` (once per episode, a
+        reminder every ``HOST_WARN_REMIND_S``, ``CLEARED`` on recovery). It does
+        NOT tear down: the CONTROLLED TEARDOWN through :meth:`do_stop` that the
+        2026-09-08 order introduced ("never accept the risk") was replaced by the
+        user rule of 06.10. -- no refusal and no stop on host RAM, the OOM killer
+        is the arbiter. The same holds for the rate latch (W98) riding this loop.
+        The passage below describes WHY the check exists, not what it does on a
+        breach.
 
         The order exists because that offer was made and taken: base weg2sb4
         stood green at 95.92 -> 96.36 -> 96.47 GiB against a 95.90 GiB reap

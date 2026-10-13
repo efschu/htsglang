@@ -505,13 +505,15 @@ class TestFlipImagePinBudget(_FlipImagePinBase):
             lambda: (int(total_gb * 1e9), int(available_gb * 1e9)),
         )
 
-    def test_t_g1_4_over_commit_refuses_before_allocating(self):
-        """T-G1-4: the gate is asked FIRST, and it names what it saw.
+    def test_t_g1_4_over_commit_warns_then_the_allocation_decides(self):
+        """T-G1-4 (HOSTWARN2, 13.10.2026, user rule 06.10.: no refusal on host RAM).
 
-        Can-fail two ways, both asserted: registering the post AFTER the
-        allocation would let a refused configuration allocate first (the
-        allocator counter), and a refusal without the numbers is not
-        actionable (the message).
+        Was ``..._over_commit_refuses_before_allocating``: the #721 gate raised and the buffer
+        was never allocated. The gate is still asked FIRST and still names what it saw, but its
+        verdict is a ``HOST-RAM-WARN PINNED`` line; the allocation is then ATTEMPTED and its own
+        failure (``test_t_g1_4_failed_allocation_takes_its_post_back``, T-G1-12f/g) is the only
+        refusal left. Can-fail two ways: a gate that raised again would never reach the
+        allocator, and a warning without the numbers is not actionable.
         """
         calls = []
 
@@ -519,18 +521,21 @@ class TestFlipImagePinBudget(_FlipImagePinBase):
             calls.append(int(nbytes))
             return torch.zeros(int(nbytes), dtype=torch.uint8)
 
-        with self._budget(64.0, 12.0):
+        want = 1 << 20
+        with self._budget(64.0, 1.0):          # 1 GB available against the 10 GiB OS reserve: over-commit
             with mock.patch.object(weights_arena, "_alloc_pinned_pin_buffer", _alloc):
-                with self.assertRaises(weights_arena.WeightsArenaError) as ctx:
-                    weights_arena.create_flip_image_pin(3 * (1024**3))
-        self.assertEqual(calls, [], "the buffer was allocated before the gate ran")
-        msg = str(ctx.exception)
-        self.assertIn("#809 FLIP IMAGE PIN REFUSED", msg)
-        self.assertIn(weights_arena.FLIP_IMAGE_PIN_POST_NAME, msg)
-        self.assertIn("reserve", msg)
-        self.assertIn("available", msg)
-        self.assertIsNone(weights_arena.flip_image_pin())
-        self.assertEqual([p.name for p in pinned_host_budget.registered_posts()], [])
+                with self.assertLogs(pinned_host_budget.logger.name, level="WARNING") as cm:
+                    pin = weights_arena.create_flip_image_pin(want)
+        self.assertEqual(calls, [want], "the allocation was not attempted after the warning")
+        text = "\n".join(cm.output)
+        self.assertIn("HOST-RAM-WARN PINNED " + weights_arena.FLIP_IMAGE_PIN_POST_NAME, text)
+        self.assertIn("reserve", text)
+        self.assertIn("available", text)
+        self.assertIs(pin, weights_arena.flip_image_pin())
+        self.assertIn(
+            weights_arena.FLIP_IMAGE_PIN_POST_NAME,
+            [p.name for p in pinned_host_budget.registered_posts()],
+        )
 
     def test_t_g1_4_fits_registers_the_post(self):
         """T-G1-4 (GREEN pin): a pin that fits is a NAMED post in the ledger."""
@@ -1329,24 +1334,31 @@ class TestFlipImagePinGroupAdmission(_FlipImagePinBase):
             "next admission as though its bytes were resident (#729/#550)",
         )
 
-    def test_t_g1_12b_a_local_refusal_reaches_the_group_first(self):
-        """A rank that cannot fit must still arrive at the collective.
+    def test_t_g1_12b_a_local_over_commit_warns_and_the_group_still_votes(self):
+        """A rank whose ledger over-commits must still arrive at the collective.
 
-        Raising before the reduce is the divergence itself: this rank dies
-        while its peers wait in a reduce that will never complete.
+        HOSTWARN2 (13.10.2026): the local ledger verdict is a warning now, so it can no longer
+        be the rank-local refusal this test used to pin (``seen == [False]``). What must still
+        hold is the property behind it: the rank does not skip the group verdict -- BOTH reduces
+        are consulted, this rank's ledger vote is ``True`` (it warns, it does not refuse), and
+        a real allocation failure on any rank is what the second vote carries (T-G1-12f/g).
         """
         calls = []
         seen = []
-        with self._budget(64.0, 12.0):
-            with self._seam(seen, False):
+        want = 1 << 20
+        with self._budget(64.0, 1.0):
+            with self._seam(seen, True):
                 with self._allocator(calls):
-                    with self.assertRaises(weights_arena.WeightsArenaError):
-                        weights_arena.create_flip_image_pin(3 * (1024**3))
+                    with self.assertLogs(
+                        pinned_host_budget.logger.name, level="WARNING"
+                    ) as cm:
+                        pin = weights_arena.create_flip_image_pin(want)
         self.assertEqual(
-            seen, [False], "this rank raised without reaching the group verdict"
+            seen, [True, True], "this rank skipped a group verdict after its warning"
         )
-        self.assertEqual(calls, [])
-        self.assertEqual([p.name for p in pinned_host_budget.registered_posts()], [])
+        self.assertEqual(calls, [want])
+        self.assertIn("HOST-RAM-WARN PINNED", "\n".join(cm.output))
+        self.assertIs(pin, weights_arena.flip_image_pin())
 
     def test_t_g1_12c_a_group_that_agrees_admits_the_pin(self):
         """GREEN arm: BOTH reduces are consulted on the success path too.

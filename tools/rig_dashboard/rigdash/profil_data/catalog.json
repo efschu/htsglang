@@ -6512,7 +6512,7 @@
      "source": {
       "file": "weg2/launcher.py",
       "kind": "argparse",
-      "line": 22191
+      "line": 22267
      }
     }
    },
@@ -7081,7 +7081,7 @@
      "source": {
       "file": "weg2/launcher.py",
       "kind": "argparse",
-      "line": 22195
+      "line": 22271
      }
     }
    },
@@ -11287,11 +11287,11 @@
     },
     "nf": {
      "default": null,
-     "help": "PROFIL-EDITOR S1: start although the planner/launcher REFUSES the VALUES (capacity, VRAM, host memory, card count, calibration of the inventory -- the 'wert' class of weg2/refusals.py). Every refusal passed is printed as 'FORCED-PAST <CODE> <reason>'. A forced boot writes NO records. NOT lifted: the occupation check (another process or window on a card), a missing or broken model/file, an unsupported architecture. Container: FLLIPER_FORCE=1. On the NF tree only the codes the register lists as wired (HW-COUNT, HW-UNCALIBRATED, HOST-MEM) are lifted; the planner's flip-path refusals keep refusing.",
+     "help": "PROFIL-EDITOR S1: start although the planner/launcher REFUSES the VALUES (capacity, VRAM, card count, calibration of the inventory, disk floor -- the 'wert' class of weg2/refusals.py). Every refusal passed is printed as 'FORCED-PAST <CODE> <reason>'. A forced boot writes NO records. NOT lifted: the occupation check (another process or window on a card), a missing or broken model/file, an unsupported architecture. HOST RAM is not refused at all any more (HOSTWARN2, user rule 06.10.): the host ledger, the preflight and the pinned-host registry print 'HOST-RAM-WARN ...' and the boot goes on, with or without --force. Container: FLLIPER_FORCE=1. On the NF tree only the codes the register lists as wired (HW-COUNT, HW-UNCALIBRATED, HOST-DISK) are lifted; the planner's flip-path refusals keep refusing.",
      "source": {
       "file": "weg2/launcher.py",
       "kind": "argparse",
-      "line": 22247
+      "line": 22323
      }
     }
    },
@@ -18205,7 +18205,7 @@
      "source": {
       "file": "weg2/launcher.py",
       "kind": "argparse",
-      "line": 23680
+      "line": 23758
      }
     }
    },
@@ -18909,7 +18909,7 @@
      "source": {
       "file": "weg2/launcher.py",
       "kind": "argparse",
-      "line": 22952
+      "line": 23030
      }
     }
    },
@@ -26907,7 +26907,7 @@
      "source": {
       "file": "weg2/launcher.py",
       "kind": "argparse",
-      "line": 23327
+      "line": 23405
      }
     }
    },
@@ -27160,7 +27160,7 @@
     "baum": "nf",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23497
+    "line": 23575
    },
    "status": "kuratiert",
    "text": "Names the census row from which a card is priced that is not in the census file by UUID: list <live>=<census UUID>, <live> = card UUID, nvml<N> or class (RTX3080). Without an entry the start borrows the heaviest row of the same class (otherwise of the whole census) and refuses that as HW-BORROWED until force is set.",
@@ -28298,7 +28298,7 @@
      "source": {
       "file": "weg2/launcher.py",
       "kind": "argparse",
-      "line": 22390
+      "line": 22468
      }
     }
    },
@@ -65724,7 +65724,7 @@
      "source": {
       "file": "weg2/front.py",
       "kind": "os.environ",
-      "line": 4092
+      "line": 4110
      }
     }
    },
@@ -75097,7 +75097,7 @@
      "source": {
       "file": "server_args.py",
       "kind": "os.environ",
-      "line": 14739
+      "line": 14752
      }
     }
    },
@@ -82362,7 +82362,7 @@
      "source": {
       "file": "managers/scheduler.py",
       "kind": "os.environ",
-      "line": 920
+      "line": 921
      }
     }
    },
@@ -83692,7 +83692,7 @@
      "source": {
       "file": "weg2/vision_rank_runner.py",
       "kind": "os.environ",
-      "line": 1141
+      "line": 1179
      }
     }
    },
@@ -83778,7 +83778,7 @@
      "source": {
       "file": "weg2/front.py",
       "kind": "os.environ",
-      "line": 4197
+      "line": 4215
      }
     }
    },
@@ -85861,7 +85861,7 @@
   "kuratiert": 121,
   "unerklaert": 602
  },
- "tree_rev": "27b=02123ee2ef+nf=04bca74219",
+ "tree_rev": "27b=02123ee2ef+nf=2c8db9c8e5+hostwarn2",
  "trees": {
   "27b": {
    "entries": 2641,
@@ -85869,7 +85869,7 @@
   },
   "nf": {
    "entries": 2508,
-   "rev": "04bca74219"
+   "rev": "2c8db9c8e5+hostwarn2"
   }
  },
  "warnungen": []

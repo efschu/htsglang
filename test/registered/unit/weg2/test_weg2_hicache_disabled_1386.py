@@ -184,6 +184,15 @@ class _HermeticMainBase(unittest.TestCase):
 
     def setUp(self):
         super().setUp()
+        # HOSTWARN2 review finding 1 (13.10.2026): with W20/W21 only warning,
+        # launcher.main now runs past the ledger and exports
+        # SGLANG_PINNED_HOST_RESERVE_LEDGER_GIB/_SOURCE (launcher.py, "ONE
+        # pinned-host reserve"). Snapshot the whole environment and restore it
+        # after each test (cleanups run after tearDown), so later tests in the
+        # same process read the native reserve, not this file's mocked host.
+        _env_patch = mock.patch.dict(os.environ)
+        _env_patch.start()
+        self.addCleanup(_env_patch.stop)
         self._old_replay_env = os.environ.get(nvml_registry.ENV_NVML_REPLAY)
         os.environ[nvml_registry.ENV_NVML_REPLAY] = _NVML_REPLAY_JSON
         self._shm_tmp = tempfile.mkdtemp(prefix="weg2-1386-empty-shm-")
@@ -608,8 +617,14 @@ class TheFiveTestsAboveAreActuallyHermeticNow(_HermeticMainBase):
 
     def test_a_too_small_mocked_host_actually_refuses_the_ladder(self):
         """Proves `main` reads the MOCKED `MEMINFO_PATH`/`CGROUP_ROOT`, not
-        the real box: a deliberately too-small fake host must refuse to
-        fund even the frugal end of this file's own arm ladder."""
+        the real box: a deliberately too-small fake host must fail to
+        fund even the frugal end of this file's own arm ladder.
+
+        HOSTWARN2 (13.10.2026, user rule 06.10.: no refusal on host RAM): the
+        ladder's verdict is a ``HOST-RAM-WARN W20/W21`` line now and the boot
+        goes on, so the seam is proved by THAT line in the output (a real
+        15+ GiB box could never print it for a 2 GiB mock), and by the absence
+        of the old host-ledger exception."""
         tiny = tempfile.mkdtemp(prefix="weg2-1390-tiny-host-")
         meminfo = os.path.join(tiny, "meminfo")
         with open(meminfo, "w") as f:
@@ -632,11 +647,13 @@ class TheFiveTestsAboveAreActuallyHermeticNow(_HermeticMainBase):
         with mock.patch.object(launcher, "MEMINFO_PATH", meminfo), \
              mock.patch.object(launcher, "CGROUP_ROOT", cg):
             rc, out, exc = self.run_main(_main_argv("t1390mem"))
-        self.assertIsNotNone(
-            exc, "a 2 GiB fake host must refuse this file's own arm ladder "
-            "-- if it does not, main() is reading the real host instead of "
-            "the mock")
-        self.assertIsInstance(
+        self.assertTrue(
+            "HOST-RAM-WARN W20 HostLedgerUnfunded" in out
+            or "HOST-RAM-WARN W21 HostRunPeakUnfunded" in out,
+            "a 2 GiB fake host must fail to fund this file's own arm ladder "
+            "-- if no HOST-RAM-WARN names it, main() is reading the real host "
+            "instead of the mock")
+        self.assertNotIsInstance(
             exc, (host_ledger.Weg2HostLedgerRefused,
                   host_ledger.Weg2HostRunPeakRefused))
 
