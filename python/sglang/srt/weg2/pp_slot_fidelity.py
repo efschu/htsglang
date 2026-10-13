@@ -143,7 +143,23 @@ def agreed_floor(tree, floor: int) -> int:
 
 
 class AgreedRoomShort(RuntimeError):
-    """PR: this stage cannot hold a load-back the stages agreed it can."""
+    """PR: this stage cannot hold a load-back the stages agreed it can.
+
+    A ``RuntimeError`` on purpose (every catcher that expects the loud stop keeps it, with the message of before). The
+    terms ride on the exception so the one seat that can still take the pass back (PP0 of group P, on the form where the
+    followers execute its row: ``weg2/prefill_oom_retreat.retreat_loadback``) decides on numbers, not on text. NF 13.10.
+    18:30:21Z (``..._0ea6d17efd_1013_134832.P.log`` 1012731-1012800): agreed 191744, avail 92032, evictable 99712, the
+    peel paid 64 -- the rest sat behind one un-payable frontier leaf."""
+
+    def __init__(self, message, *, rid=None, kv_tokens=0, agreed=0, avail=0, evictable=0, evicted=0, avail_after=0):
+        super().__init__(message)
+        self.rid = rid
+        self.kv_tokens = int(kv_tokens)
+        self.agreed = int(agreed)
+        self.avail = int(avail)
+        self.evictable = int(evictable)
+        self.evicted = int(evicted)
+        self.avail_after = int(avail_after)
 
 
 def local_pp_room(tree, kv_tokens: int, floor: int, rid=None) -> Optional[bool]:
@@ -196,7 +212,9 @@ def local_pp_room(tree, kv_tokens: int, floor: int, rid=None) -> Optional[bool]:
             f"PR AGREED-ROOM SHORT rid={rid} kv_tokens={kv_tokens} agreed={agreed} "
             f"avail={avail0} evictable={evictable} evicted={evicted} avail_after={avail1} "
             f"(n={n}): the stages agreed this pass can hold the load-back and this "
-            "stage cannot; refusing alone would start it on the peers only (#1004)"
+            "stage cannot; refusing alone would start it on the peers only (#1004)",
+            rid=rid, kv_tokens=kv_tokens, agreed=agreed, avail=avail0, evictable=evictable, evicted=evicted,
+            avail_after=avail1,
         )
     else:
         n = _sampled(tree, "_weg2_sf_room_residual")

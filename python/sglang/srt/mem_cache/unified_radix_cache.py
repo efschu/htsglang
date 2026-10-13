@@ -1008,6 +1008,52 @@ def _form_a_note_loaded(tree, rows: int) -> None:
         )
 
 
+_UD_REFUSED_LAST_T: dict = {}
+_UD_REFUSED_N = [0]
+
+
+def _ud_refused_note(tree, node, _sf) -> None:
+    """PREFILL-OOM instrument (NF 13.10. 11:59:14Z, leaf [6193] 135872 rows): a write_back leaf whose backup was
+    refused AND that could not be dropped stays on the device with everything behind it -- and neither UD nor UD-H
+    said a word, so the reason was only reconstructed by exclusion. One line per reason per second (time-based, not
+    count-based: the count rule went silent minutes before the death), naming the node, its size, the floor/ongoing
+    terms and the first child that blocked UD-H (device-locked / host-locked / on device / un-backed).
+
+    A module function, not a method: several hermetic tests borrow ``_evict_device_leaf`` onto bare namespaces."""
+    try:
+        floor = bool(getattr(tree, _sf.FLOOR_LOCAL_PP_ATTR, False))
+        ongoing = getattr(node, "id", None) in (getattr(tree, "ongoing_write_through", None) or {})
+        udh = getattr(tree, "_ud_h_refusal", None)
+        if not _sf.enabled():
+            why = "switch_off"
+        elif not floor:
+            why = "not_local_pp_floor"
+        elif ongoing:
+            why = "write_through_in_flight"
+        elif node.children and udh is not None:
+            why = "host_children:" + udh[0]
+        elif node.children:
+            why = "children_left"
+        else:
+            why = "unknown"
+        key = why.split(":", 1)[0]
+        now = time.monotonic()
+        _UD_REFUSED_N[0] += 1
+        n = _UD_REFUSED_N[0]
+        if now - _UD_REFUSED_LAST_T.get(key, -1e9) < 1.0:
+            return
+        _UD_REFUSED_LAST_T[key] = now
+        logger.warning(
+            "UD-REFUSED n=%d why=%s node=%s tokens=%d children=%d holder=%s floor_local_pp=%s "
+            "write_through_in_flight=%s (a write_back leaf the arena refused to back up could not be dropped "
+            "either; it and everything behind it stay on the device)",
+            n, why, getattr(node, "id", "?"), len(getattr(node, "key", []) or []), len(node.children),
+            udh[1] if udh else None, floor, ongoing,
+        )
+    except Exception:  # noqa: BLE001 - an instrument never refuses harder
+        pass
+
+
 class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     #: HY (weg2/park_hold_yield.py): the retained nodes whose backup the arena
     #: refused (#1421 arena_claim) during a D park's retraction; None = no
@@ -4405,11 +4451,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     # paid, and its parent becomes the next leaf.
                     from sglang.srt.weg2 import pp_slot_fidelity as _sf
 
+                    self._ud_h_refusal = None
                     if _sf.unbacked_drop_floor(self, node) and node.children:
                         # UD-H: the leaf's only children are host-only nodes
                         self._ud_clear_host_children(node)
                     if _sf.unbacked_drop_allowed(self, node):
                         self._ud_drop_unbacked_leaf(node, tracker)
+                    else:
+                        _ud_refused_note(self, node, _sf)
                     return
                 self.writing_check(write_back=True)
                 self._evict_to_host(node, tracker)
@@ -4470,11 +4519,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         below leaves the subtree untouched. True when no child is left."""
         order = []
         stack = list(node.children.values())
+        self._ud_h_refusal = None
         while stack:
             d = stack.pop()
             if not d.evicted or not d.backuped:
+                # PREFILL-OOM instrument: the reason was silent (13.10. 11:59:14Z, [6193])
+                self._ud_h_refusal = (
+                    "child_on_device" if not d.evicted else "child_unbacked", getattr(d, "id", "?"))
                 return False
             if any(cd.lock_ref > 0 or cd.host_lock_ref > 0 for cd in d.component_data):
+                self._ud_h_refusal = (
+                    "child_device_locked" if any(cd.lock_ref > 0 for cd in d.component_data)
+                    else "child_host_locked", getattr(d, "id", "?"))
                 return False
             order.append(d)
             stack.extend(d.children.values())
@@ -4484,6 +4540,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if not attached:
                 continue  # a cascade above already removed it
             if not self._is_host_leaf(d):
+                self._ud_h_refusal = ("child_not_host_leaf", getattr(d, "id", "?"))
                 break
             self._evict_host_leaf(d, host_tracker)
         left = len(node.children)
@@ -4565,7 +4622,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             per = UnifiedRadixCache._1421_per_why = {}
         key = why.split(":", 1)[0]
         k = per[key] = per.get(key, 0) + 1
-        if k <= 24 or k % 256 == 0:
+        # PREFILL-OOM (13.10., P PP0 11:59:14Z): the count rule alone went silent per reason after 24 lines (the last
+        # BACKUP-REFUSED before the death was 11:55:51) -- a refusal 3 minutes before the wall left no line. One line per
+        # reason per second on top of the count rule, so the rate is read from the log and a late refusal is never absent.
+        _now_1421 = time.monotonic()
+        _last_1421 = getattr(UnifiedRadixCache, "_1421_last_t", None)
+        if _last_1421 is None:
+            _last_1421 = UnifiedRadixCache._1421_last_t = {}
+        _timed_1421 = _now_1421 - _last_1421.get(key, -1e9) >= 1.0
+        if _timed_1421:
+            _last_1421[key] = _now_1421
+        if k <= 24 or k % 256 == 0 or _timed_1421:
             try:
                 p = node.parent
                 logger.warning(
@@ -6923,7 +6990,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # PR (weg2/pp_room_vote.py): under the stages' agreed R_m, at most R_m
         floor = _sf.agreed_floor(self, floor)
         if kv_tokens > floor:
-            if _sf.local_pp_room(self, kv_tokens, floor, getattr(req, "rid", None)):
+            try:
+                _room = _sf.local_pp_room(self, kv_tokens, floor, getattr(req, "rid", None))
+            except _sf.AgreedRoomShort:
+                # PREFILL-OOM-RETREAT (NF 13.10. 18:30:21Z): nothing was transferred yet -- unwind the two lock refs taken
+                # above, exactly as every other refusal exit of this function does, so that the seat that can take the
+                # pass back (weg2/prefill_oom_retreat.retreat_loadback) finds the tree as it was. Where nobody retreats
+                # the exception still propagates and the rank stops as before.
+                self.dec_lock_ref(best_match_node, ancestor_lock_params)
+                self.dec_host_lock_ref(best_match_node, host_anchor_params)
+                raise
+            if _room:
                 # A group of one's floor IS this rank's available_size():
                 # re-read after the eviction, it clears the load-back.
                 floor = int(self.token_to_kv_pool_allocator.available_size())

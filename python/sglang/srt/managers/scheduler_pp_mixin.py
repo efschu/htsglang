@@ -6555,7 +6555,18 @@ class SchedulerPPMixin:
             book.begin_pass()
             book.note_batches(self.__dict__.get("mbs") or ())
             verdict = None
-            if book.absorb(channel.harvest()) or book.facts:
+            own_only = None
+            _have_facts = book.absorb(channel.harvest()) or book.facts
+            # fix 43 / review blocker 1: PP0 may size a pass on its OWN walk, unstamped, only where the followers execute
+            # its row (pp_row_carrier_present's law). Carrierless (NF group P: '#631 ROW AUTHORITY DISABLED') PP1/PP2 plan
+            # their chunk width from their own pool and see no cap: a cap on PP0 alone is a W27/#1233 width divergence
+            # built into the default path, exactly under pressure.
+            _own_walk = False
+            if local_floor and _pr.own_walk_enabled():
+                from sglang.srt.weg2 import prefill_oom_retreat as _oom_retreat
+
+                _own_walk = _oom_retreat.followers_execute_row(self)
+            if _have_facts or _own_walk:
                 from sglang.srt.weg2 import lanes_p as _lanes_p
 
                 _lf, _le = _lanes_p.echo(self)
@@ -6564,13 +6575,22 @@ class SchedulerPPMixin:
                     executed=int(self.forward_ct), local_floor=local_floor,
                     lane_floor=_lf, lane_epoch=_le,
                 )
-                verdict = book.cap(own.room)
+                if _have_facts:
+                    verdict = book.cap(own.room)
+                if verdict is None and _own_walk:
+                    # fix 43 (PREFILL-OOM): PP0 sizes the pass on its OWN walk when no follower fact is fresh. It
+                    # used to publish nothing then, and fundable/rem_total read the reported evictable count.
+                    # Local only, never stamped on list m: a follower's cap stays what the vote made it.
+                    own_only = int(own.room)
             # R_m for THIS pass: applied here and stamped on list m (below)
             self._weg2_pr_verdict = verdict
             _pr.set_cap(tree, None)
             if verdict is not None:
                 _pr.note_binding(verdict, fundable_extend_tokens(tree), book)
                 _pr.set_cap(tree, verdict.cap)
+            elif own_only is not None:
+                _pr.note_own_only(tree, own_only, book, fundable_extend_tokens(tree))
+                _pr.set_cap(tree, own_only)
             return
         if not local_floor:
             return
