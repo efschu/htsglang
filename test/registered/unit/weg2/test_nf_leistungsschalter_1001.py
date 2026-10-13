@@ -37,6 +37,8 @@ PROFILE_P = {
     # SWITCH-DEFAULTS 1004: nf-int4-h6-abl.env NF_ENV_P (P only)
     "SGLANG_WEG2_ENABLE_PREFILL_FETCH_OVERLAP": "1",
     "SGLANG_WEG2_ENABLE_TARGETED_PREWARM": "1",
+    # GC-FREEZE 1013: the boot heap leaves the collector after boot (P and D)
+    "SGLANG_WEG2_GC_FREEZE": "1",
 }
 PROFILE_D = {
     "SGLANG_WEG2_TAIL_KEEP_MIB": "512",
@@ -58,6 +60,9 @@ PROFILE_D = {
     "SGLANG_WEG2_ENABLE_TAIL_STAGE_EARLY": "1",
     "SGLANG_WEG2_RESUME_WARM_FINISH": "1",
     "SGLANG_WEG2_TAIL_STAGE_WORKER": "1",
+    # GC-FREEZE 1013: freeze as on P, and the GC warning armed on D (P has had it since 30.09.)
+    "SGLANG_WEG2_GC_FREEZE": "1",
+    "SGLANG_WEG2_GC_WARN_SECS": "0.5",
 }
 #: a per-group value that overrides the row's form-wide default on ONE group
 #: (the row's global value is what the other group runs): STORE_SHORT_TAIL, row
