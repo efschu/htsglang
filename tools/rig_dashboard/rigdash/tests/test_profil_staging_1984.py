@@ -29,7 +29,7 @@ SCRIPT = os.path.join(os.path.dirname(HERE), "deploy", "stage_profil_modules.sh"
 REQUIRED = [
     "weg2/profile_json.py", "weg2/refusals.py", "weg2/profile_catalog.py", "weg2/profile_catalog_curated.py", "weg2/model_profile.py",
     "weg2/card_identity.py", "weg2/topology.py", "rigmon/hardware_profile.py", "planner/profile_couplings.py", "planner/expert_residency.py",
-    "planner/pp_cut.py"]
+    "planner/pp_cut.py", "weg2/hw_sim.py"]
 ROOTS = ["python/sglang/__init__.py", "python/sglang/srt/planner/__init__.py", "python/sglang/srt/weg2/__init__.py", "python/sglang/srt/rigmon/__init__.py"]   # srt/ ohne __init__ wie im echten Repo
 
 
@@ -43,6 +43,35 @@ def write(repo, rel, text="x = 1\n"):
     os.makedirs(os.path.dirname(p), exist_ok=True)
     with open(p, "w") as fh:
         fh.write(text)
+
+
+HWSCRIPT = os.path.join(os.path.dirname(HERE), "deploy", "stage_hwprofil.sh")
+
+
+class StagingListsCarryHwSim(unittest.TestCase):
+    """AP-A: ``weg2/hw_sim.py`` (SM-Zahl "Datenblatt") muss in beiden Staging-Skripten stehen, sonst bleibt sm_count im gestagten Baum 'nicht gemessen'."""
+
+    def test_both_staging_scripts_name_hw_sim(self):
+        for script in (SCRIPT, HWSCRIPT):
+            with open(script) as fh:
+                self.assertIn("weg2/hw_sim.py", fh.read(), script)
+
+    def test_stage_hwprofil_copies_hw_sim_and_the_staged_tree_yields_the_datasheet_sm(self):
+        tmp = tempfile.mkdtemp(prefix="pf_apa_hw_")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        repo_root = git(os.path.dirname(HERE), "rev-parse", "--show-toplevel")
+        src = os.path.join(repo_root, "python", "sglang", "srt")
+        dst = os.path.join(tmp, "python", "sglang", "srt")
+        for rel in ("rigmon/hardware_profile.py", "weg2/card_identity.py", "weg2/hw_sim.py"):
+            os.makedirs(os.path.dirname(os.path.join(dst, rel)), exist_ok=True)
+            shutil.copy(os.path.join(src, rel), os.path.join(dst, rel))
+        code = ("import importlib.util,sys;p=sys.argv[1];s=importlib.util.spec_from_file_location('hp',p);m=importlib.util.module_from_spec(s);"
+                "sys.modules['hp']=m;s.loader.exec_module(m);"
+                "print(m.hw_sim_datasheet({'name':'NVIDIA GeForce RTX 5090','cc':[12,0],'total_mib':32607}).get('sm_count'))")
+        out = subprocess.run([sys.executable, "-c", code, os.path.join(dst, "rigmon", "hardware_profile.py")],
+                             capture_output=True, text=True, timeout=60)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(out.stdout.strip(), "170", out.stdout + out.stderr)
 
 
 class Staging(unittest.TestCase):

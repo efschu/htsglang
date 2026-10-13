@@ -31,10 +31,11 @@ root=${RIGDASH_STAGE_ROOT:-/opt/rigdash/kartenplan}
 mode=check
 rev=""
 
+#: (weg2/hw_sim.py: SM-Zahl "Datenblatt" des Hardwareprofils, hardware_profile._load_hw_sim laedt es relativ zum Baum)
 #: relativ zu python/sglang/srt/ -- alles, was Dashboard-Prozess (per Dateipfad) und Kindprozess (per import) fuer den Editor brauchen
 REQUIRED=(
   weg2/profile_json.py weg2/refusals.py weg2/profile_catalog.py weg2/profile_catalog_curated.py
-  weg2/model_profile.py weg2/card_identity.py weg2/topology.py
+  weg2/model_profile.py weg2/card_identity.py weg2/topology.py weg2/hw_sim.py
   rigmon/hardware_profile.py
   planner/profile_couplings.py planner/expert_residency.py planner/pp_cut.py
 )
