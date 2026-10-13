@@ -101,11 +101,15 @@ class TheHiCachePoolsReadTheConfiguredReserve(CustomTestCase):
             if saved is not None:
                 os.environ[phb.PINNED_HOST_RESERVE_ENV] = saved
 
-    def test_unset_is_the_native_ten_gib_and_refuses_as_before(self):
-        with self.assertRaises(ValueError) as cm:
+    def test_unset_is_the_native_ten_gib_and_judges_as_before(self):
+        # HOSTWARN2 (13.10.2026, user rule 06.10.: no refusal on host RAM): the verdict is the same
+        # and carries the same numbers -- it is printed as HOST-RAM-WARN PINNED instead of raised.
+        with self.assertLogs(phb.logger.name, level="WARNING") as cm:
             self._register({})
-        self.assertIn("10.74 GB OS reserve", str(cm.exception))
-        self.assertIn("default 10 GiB", str(cm.exception))
+        text = "\n".join(cm.output)
+        self.assertIn("HOST-RAM-WARN PINNED", text)
+        self.assertIn("10.74 GB OS reserve", text)
+        self.assertIn("default 10 GiB", text)
 
 
 if __name__ == "__main__":

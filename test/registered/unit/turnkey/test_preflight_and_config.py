@@ -226,7 +226,8 @@ class TestPreflight(CustomTestCase):
              dict(cards=lambda: [PF.CardObs(U1, "RTX 3080", 20 << 30, 20 << 30),
                                  PF.CardObs(U2, "RTX 5090", 32 << 30, 1 << 30)],
                   procs_on=lambda u: {4242: 30 << 30})),
-            (RF.REFUSE_HOST_HEADROOM, dict(mem_available_bytes=lambda: 1 << 30)),
+            # HOSTWARN2 (13.10.2026, user rule 06.10.): REFUSE_HOST_HEADROOM is not raised by any check
+            # any more -- host RAM warns (see test_host_headroom_warns_instead_of_refusing).
             (RF.REFUSE_PORT_BUSY, dict(port_busy=lambda p: True)),
             (RF.REFUSE_PATH_MISSING, dict(path_exists=lambda p: False)),
         ]
@@ -261,9 +262,18 @@ class TestPreflight(CustomTestCase):
 
     def test_all_refusals_reported_not_just_the_first(self):
         c = cfg()
+        # HOSTWARN2: host RAM no longer refuses, so the second refusal is a missing path
         rs = PF.run_all(c, probes(port_busy=lambda p: True,
-                                  mem_available_bytes=lambda: 1))
+                                  path_exists=lambda p: False))
         self.assertGreaterEqual(len(rs), 2)
+
+    def test_host_headroom_warns_instead_of_refusing(self):
+        """HOSTWARN2 (13.10.2026, user rule 06.10.: no refusal on host RAM). Was
+        ``REFUSE_HOST_HEADROOM`` in ``test_every_failure_mode_is_reachable_and_named``."""
+        c = cfg("\n[preflight]\nhost_headroom_gib = 15\n")
+        names = [r.name for r in PF.run_all(c, probes(mem_available_bytes=lambda: 1 << 30))]
+        self.assertNotIn(RF.REFUSE_HOST_HEADROOM, names)
+        self.assertEqual(names, [])
 
     def test_expect_name_mismatch_catches_a_swapped_card(self):
         c = C.loads(BASE.replace('label = "b"',
