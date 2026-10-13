@@ -41,6 +41,7 @@ import gc
 import inspect
 import json
 import logging
+import collections
 import os
 import re
 import tempfile
@@ -176,6 +177,7 @@ class TheGateParsesOncePerFileVersion(_NoNvml):
     def _stub(self):
         f = F.Front.__new__(F.Front)
         f.measured_record = self.path
+        f.counters = collections.Counter()   # 12.10.2026 HOST-WARN: the gate counts its warning
         return f
 
     def test_repeated_gates_parse_the_unchanged_sidecar_once(self):
@@ -207,8 +209,11 @@ class TheGateParsesOncePerFileVersion(_NoNvml):
             hl.append_measured_record(self.path, {
                 "group": "D", "boot_tag": "newer", "at": "2026-09-30T00:00:00Z",
                 "rss_shmem_gib": 60.0, "shmem_delta_gib": 4.32})
-            with self.assertRaises(hl.Weg2SleepLegCushionDeficit):
-                f._sleep_leg_gate("D")                           # 4.32 GiB need > 2.0
+            # 12.10.2026 (NF W98 HOST-WARN): the NEW 4.32 GiB need > 2.0 cushion used
+            # to raise Weg2SleepLegCushionDeficit; the gate now WARNS and counts it,
+            # which is the same proof that it graded the NEW newest entry.
+            self.assertIsNone(f._sleep_leg_gate("D"))
+            self.assertEqual(f.counters["host_sleep_leg_warn"], 1)
 
     def test_the_view_answers_exactly_what_the_ledger_reader_answers(self):
         _write_sidecar(self.path, n=1200)
