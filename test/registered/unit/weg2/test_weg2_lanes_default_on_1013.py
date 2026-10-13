@@ -108,6 +108,19 @@ def _rpc_sequence(group):
     return [e for e in group.timeline if e.startswith("rpc:")]
 
 
+def _rpc_sequence_without_flip_park(group):
+    """As _rpc_sequence, without the flip's own park (``weg2/park_running`` with neither rids nor hold).
+
+    13.10.: whether a D>P flip still finds running decodes on the fake D (and so sends the flip park) is timing of
+    the fake group, in both switch settings -- 1 of 3 runs differed in exactly this one entry. A lane park always names
+    rids and/or hold="lane" and is asserted empty on its own (_lane_parks), so dropping only the bare flip park here
+    keeps the lane-0 comparison exact."""
+    seq = _rpc_sequence(group)
+    if not any(b.get("rids") or b.get("hold") for b in group.park_bodies):
+        seq = [e for e in seq if e != "rpc:weg2/park_running"]
+    return seq
+
+
 # ------------------------------------------------------------------ 1. the default
 def test_the_code_default_is_on_and_the_env_decides_when_it_is_set():
     with _switch(None):
@@ -231,7 +244,7 @@ def _run_p_phase(switch, caplog):
             out["p_gen"], out["d_gen"] = sorted(h.p.gen_marks), sorted(h.d.gen_marks)
             first = h.p.timeline.index("rpc:release_memory_occupation") if "rpc:release_memory_occupation" in h.p.timeline else -1
             out["p_before_first_flip"] = len([e for e in h.p.timeline[:first] if e.startswith("gen:")])
-            out["p_rpc"], out["d_rpc"] = _rpc_sequence(h.p), _rpc_sequence(h.d)
+            out["p_rpc"], out["d_rpc"] = _rpc_sequence(h.p), _rpc_sequence_without_flip_park(h.d)
             out["floor_rpc"] = (list(h.p.floor_bodies), list(h.d.floor_bodies), _lane_parks(h.d))
             out["counters"] = _lane_counters(h.front)
             out["epoch"] = h.front.epoch
