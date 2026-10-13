@@ -365,6 +365,27 @@ _MISSING = object()
 SYNTHETIC_STORE_DISK_BYTES = 2350 * 2**30
 
 
+#: identity the oracle's store filesystem reports (:func:`_synthetic_fs_of`): the rig's ZFS root dataset, which the goldens
+#: pin (``W57 STORE-DISK WARN store on zfs ... fs=zfs mount=/``).
+SYNTHETIC_STORE_FS = ("/", "zfs", "spinning/subvol-999-disk-0")
+
+
+def _synthetic_fs_of(prefixes: Sequence[str], real):
+    """``launcher.fs_of`` that answers :data:`SYNTHETIC_STORE_FS` for the store paths (when no ``mounts_text`` is given),
+    so the W57 line (``fs=<type> mount=<mnt>`` and the ``fs_refused`` branch) does not depend on which filesystem the
+    TMPDIR of the caller is on (measured 2026-10-13: tmpfs -> ``STORE-DISK ok`` instead of the golden's ``WARN``)."""
+    roots = tuple(os.path.abspath(p) for p in prefixes if p)
+
+    def fs_of(path, mounts_text=None):
+        if mounts_text is None:
+            ap = os.path.abspath(str(path or "/"))
+            if any(ap == r or ap.startswith(r + os.sep) for r in roots):
+                return SYNTHETIC_STORE_FS
+        return real(path, mounts_text)
+
+    return fs_of
+
+
 def _roomy_statvfs(prefixes: Sequence[str]):
     """``os.statvfs`` that reports the store disk as a FIXED, EMPTY synthetic disk for paths under ``prefixes``.
 
@@ -422,7 +443,7 @@ def run_dry_run(launcher_argv: Sequence[str], devices: Sequence[Mapping[str, Any
       text is normalised back to the live path, so a run on an overlay dir (the live dir's entries + one more log) is
       comparable to the golden -- that is how the test proves the golden does not move when the dir grows.
     * ``roomy_store_disk`` (default True): the filesystem of the store root reports all of its space free
-      (:func:`_roomy_statvfs`), so the L3 disk verdict does not depend on the disk of the machine the oracle runs on.
+      (:func:`_roomy_statvfs`: fixed synthetic geometry) and has a fixed identity (:func:`_synthetic_fs_of`: zfs, mount /), so the L3 disk verdict and the W57 line do not depend on the disk or filesystem of the machine the oracle runs on.
     * The module state ``refusals`` is reset before and after.
 
     ``launcher.main`` may raise (a refusal): that is a RESULT (``exc_type``), not an error of the oracle.  Only a failure
@@ -464,6 +485,8 @@ def run_dry_run(launcher_argv: Sequence[str], devices: Sequence[Mapping[str, Any
                 mock.patch.object(launcher, "EVIDENCE_DIR", ev_new), _module_state_guard(), \
                 (mock.patch.object(os, "statvfs", _roomy_statvfs((scratch, store_root))) if roomy_store_disk
                  else contextlib.nullcontext()), \
+                (mock.patch.object(launcher, "fs_of", _synthetic_fs_of((scratch, store_root), launcher.fs_of))
+                 if roomy_store_disk else contextlib.nullcontext()), \
                 _patched_default_args(launcher, {orig_roots[0]: shm, orig_roots[1]: meminfo, orig_roots[2]: cg,
                                                  orig_roots[3]: store_root, live_evidence: ev_new}):
             refusals.arm(False)

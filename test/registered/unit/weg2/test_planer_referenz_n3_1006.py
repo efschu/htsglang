@@ -655,6 +655,14 @@ class TestDryRunGolden(unittest.TestCase):
             self.assertEqual(inside.f_frsize, real(td).f_frsize)
             self.assertEqual(outside.f_bavail, real(os.path.dirname(td) + "/").f_bavail)   # a path outside: the real reading
 
+    def test_synthetic_fs_of_only_touches_the_store_paths(self):
+        with tempfile.TemporaryDirectory(prefix="ap0-fsof-") as td:
+            calls = []
+            shim = O._synthetic_fs_of([td], lambda p, m=None: calls.append((p, m)) or ("/x", "tmpfs", "s"))
+            self.assertEqual(shim(os.path.join(td, "a")), O.SYNTHETIC_STORE_FS)
+            self.assertEqual(shim(os.path.dirname(td)), ("/x", "tmpfs", "s"))                 # outside: the real answer
+            self.assertEqual(shim(td, "tmpfs /a tmpfs rw 0 0"), ("/x", "tmpfs", "s"))         # explicit mounts_text: untouched
+
     def test_l3_disk_verdict_does_not_depend_on_the_disk_of_the_box(self):
         """The L3 DISK-SUM line flips ``ok`` -> ``WARN ... SHORT by`` with the free space of the filesystem the scratch store
         lives on (58 GB free against 184.4 GB needed on the rig LXC, 2026-10-13).  A nearly full disk under the run must
@@ -673,8 +681,11 @@ class TestDryRunGolden(unittest.TestCase):
         with mock.patch.object(os, "statvfs", full_disk):
             run = _dump_of("nf-int4-h6-abl", O.read_replay(REPLAY_REF))
             _assert_zero_diff(self, "plan_nf_abl_n3.txt", run)
-            raw = _dump_of("nf-int4-h6-abl", O.read_replay(REPLAY_REF), roomy_store_disk=False).result.raw
-        self.assertIn("L3-PERSIST DISK-SUM WARN", raw)
+            off = _dump_of("nf-int4-h6-abl", O.read_replay(REPLAY_REF), roomy_store_disk=False).result
+        # with the shim off the SAME box state changes the outcome: on a zfs store root the DISK-SUM line says WARN, on a
+        # filesystem the space check applies to (tmpfs, xfs) the W57 plan refuses (20 GiB total < 171.7 GiB needed)
+        self.assertTrue("L3-PERSIST DISK-SUM WARN" in off.raw or off.exc_type == "Weg2StoreDiskRefused",
+                        (off.exc_type, off.raw[-300:]))
         self.assertIn("L3-PERSIST DISK-SUM ok", run.result.raw)
 
     @_NEEDS_27B_DUAL
