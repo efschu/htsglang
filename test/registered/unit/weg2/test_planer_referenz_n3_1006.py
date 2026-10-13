@@ -648,9 +648,11 @@ class TestDryRunGolden(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="ap0-statvfs-") as td:
             shim = O._roomy_statvfs([td])
             inside, outside = shim(td), shim(os.path.dirname(td) + "/")
-            self.assertEqual(inside.f_bavail, real(td).f_blocks)
-            self.assertEqual(inside.f_bfree, real(td).f_blocks)
-            self.assertEqual((inside.f_blocks, inside.f_frsize), (real(td).f_blocks, real(td).f_frsize))
+            want_blocks = O.SYNTHETIC_STORE_DISK_BYTES // real(td).f_frsize
+            self.assertEqual(inside.f_blocks, want_blocks)         # fixed synthetic geometry, not the real fs total
+            self.assertEqual(inside.f_bavail, want_blocks)
+            self.assertEqual(inside.f_bfree, want_blocks)
+            self.assertEqual(inside.f_frsize, real(td).f_frsize)
             self.assertEqual(outside.f_bavail, real(os.path.dirname(td) + "/").f_bavail)   # a path outside: the real reading
 
     def test_l3_disk_verdict_does_not_depend_on_the_disk_of_the_box(self):
@@ -663,7 +665,10 @@ class TestDryRunGolden(unittest.TestCase):
 
         def full_disk(path):
             st = real(path)
-            return types.SimpleNamespace(**{n: getattr(st, n) for n in dir(st) if n.startswith("f_")} | {"f_bavail": 1, "f_bfree": 1})
+            # a SMALL and nearly full disk: total 20 GiB (< max_size + min_free = 184.4 GB, W57 would refuse), 1 block free
+            small = (20 * 2**30) // st.f_frsize
+            return types.SimpleNamespace(**{n: getattr(st, n) for n in dir(st) if n.startswith("f_")}
+                                         | {"f_blocks": small, "f_bavail": 1, "f_bfree": 1})
 
         with mock.patch.object(os, "statvfs", full_disk):
             run = _dump_of("nf-int4-h6-abl", O.read_replay(REPLAY_REF))

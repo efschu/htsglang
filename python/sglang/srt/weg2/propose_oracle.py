@@ -359,9 +359,14 @@ def _module_state_guard(prefix: str = "sglang."):
 
 _MISSING = object()
 
+#: total (= free) size the oracle's store disk reports (:func:`_roomy_statvfs`).  2350 GiB is the figure the goldens pin
+#: (``which has <free> 2350.00 GiB free of``-line, the rig LXC's store disk when they were taken); it is a constant now,
+#: not a reading of the box.
+SYNTHETIC_STORE_DISK_BYTES = 2350 * 2**30
+
 
 def _roomy_statvfs(prefixes: Sequence[str]):
-    """``os.statvfs`` that reports the store disk as EMPTY (free = total) for paths under ``prefixes``.
+    """``os.statvfs`` that reports the store disk as a FIXED, EMPTY synthetic disk for paths under ``prefixes``.
 
     The launcher's L3 DISK-SUM verdict (``launcher.py:8171``, ``ok`` vs ``WARN ... SHORT by``) and the W57 store plan
     (``:7410``) read the free space of the filesystem the store root is on.  In a dry run that root is a private dir of
@@ -369,7 +374,11 @@ def _roomy_statvfs(prefixes: Sequence[str]):
     rig LXC against 184.4 GB needed turned ``ok`` into ``WARN`` and six goldens red without a plan change.  The free
     figure is a LIVE-BOX reading (masked in the comparison), but here it flips a VERDICT word, so masking the number is
     not enough: the dry run is asked "does the plan fit a disk that has room", and the disk fit of a real box is the
-    dashboard's/hw_fit's question, not the oracle's.  ``f_blocks`` and ``f_frsize`` stay real (the total is printed)."""
+    dashboard's/hw_fit's question, not the oracle's.  The TOTAL is just as box-dependent as the free figure: the W57 store
+    plan (``:7410``) refuses (``Weg2StoreDiskRefused``) when ``max_size + min_free`` (184.4 GB) does not fit the filesystem
+    and prints the total (``which has .. GiB free of <total>``).  Measured 2026-10-13 with ``TMPDIR`` on a 26 GB tmpfs: all
+    goldens refused.  So the geometry is synthetic: ``f_blocks = SYNTHETIC_STORE_DISK_BYTES / f_frsize``, free = total,
+    independent of the real filesystem.  Only ``f_frsize`` (the unit, never printed) stays real."""
     import types
 
     real = os.statvfs
@@ -384,7 +393,9 @@ def _roomy_statvfs(prefixes: Sequence[str]):
         if not any(ap == r or ap.startswith(r + os.sep) for r in roots):
             return st
         attrs = {n: getattr(st, n) for n in dir(st) if n.startswith("f_")}
-        attrs["f_bfree"] = attrs["f_bavail"] = attrs["f_blocks"]
+        frsize = int(attrs.get("f_frsize") or 4096)
+        attrs["f_frsize"] = frsize
+        attrs["f_blocks"] = attrs["f_bfree"] = attrs["f_bavail"] = SYNTHETIC_STORE_DISK_BYTES // frsize
         return types.SimpleNamespace(**attrs)
 
     return statvfs
