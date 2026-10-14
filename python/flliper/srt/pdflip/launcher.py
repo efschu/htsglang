@@ -2374,6 +2374,16 @@ def d_reshard_env() -> Dict[str, str]:
 #: boot-time objects leave the collector's generations.  'off' (default) = no env.
 D_GC_FREEZE_DEFAULT = "off"
 
+#: --p-gc-freeze (NF 13.10., boot b60520f01d: a gen-2 GC over the ~1.12 M never-frozen
+#: boot objects stood PP0/PP1 still 4.4-5.4 s inside a flip once the cold heap was
+#: swapped out; ``done/nf-flip-langsam-analyse-1013.md``).  'on' = every P scheduler
+#: calls gc.freeze() once after boot, as --d-gc-freeze does for D.  'off' (default) =
+#: no env from this flag.  The nextflash row turns the switch on for BOTH groups by
+#: default (form.NEXTFLASH_GROUP_SWITCH_DEFAULTS -> --env-p/--env-d
+#: FLLIPER_PDFLIP_GC_FREEZE=1; ``--env-p/--env-d FLLIPER_PDFLIP_GC_FREEZE=0`` = the old
+#: path); the qwen27b row states nothing.
+P_GC_FREEZE_DEFAULT = "off"
+
 
 def apply_p_gc_warn_default(ns) -> Optional[str]:
     """30.09. (NF y3z ep52: PP0 stood still 5.4 s process-wide at the first
@@ -2390,6 +2400,15 @@ def apply_p_gc_warn_default(ns) -> Optional[str]:
     return (f"PDFLIP-GC P warn: --env-p {_gci.WARN_ENV}={_gci.P_GC_WARN_DEFAULT_S:g} (every P "
             f"scheduler logs a GC collection over {_gci.P_GC_WARN_DEFAULT_S:g} s after boot; "
             f"--env-p {_gci.WARN_ENV}=0 = off)")
+
+
+def p_gc_env(ns) -> Dict[str, str]:
+    """Group P's environment for --p-gc-freeze; {} under 'off'."""
+    from flliper.srt.pdflip import gc_instrument as _gci
+
+    if str(getattr(ns, "p_gc_freeze", P_GC_FREEZE_DEFAULT) or P_GC_FREEZE_DEFAULT) != "on":
+        return {}
+    return {_gci.FREEZE_ENV: "1"}
 
 
 def d_gc_env(ns) -> Dict[str, str]:
@@ -22788,6 +22807,13 @@ def build_parser() -> argparse.ArgumentParser:
              "graphs captured), so gen-2 collections no longer walk the boot objects (agent FR "
              "26.09.: ~0.5 s single-rank D-round stalls). 'off' (default) = no env.")
     ap.add_argument(
+        "--p-gc-freeze", choices=["off", "on"], default=P_GC_FREEZE_DEFAULT,
+        help="Group P: 'on' = every P scheduler calls gc.freeze() once after boot (all CUDA "
+             "graphs captured), so gen-2 collections no longer walk the boot objects (NF "
+             "13.10.: 4.4-5.4 s PP0/PP1 collections inside flips). 'off' (default) = no env "
+             "from this flag; the nextflash profile turns the switch on for P and D by default "
+             "(--env-p/--env-d FLLIPER_PDFLIP_GC_FREEZE=0 = off there).")
+    ap.add_argument(
         "--d-reshard-presets", default="auto", metavar="SPEC",
         help="Only with --d-reshard wake: 'auto' (= dec), desk names 'dec,pf,rc9', or "
              "explicit MLP unit vectors 'name=u0:u1:u2;name2=...' (sum = the MLP units, "
@@ -26307,6 +26333,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 if p_prefill_graph_bucket() else "",
             )
         )
+    env_p.update(p_gc_env(ns))  # --p-gc-freeze: {} under 'off'
     # --p-chunk-policy: {} under 'fixed' (env byte-identical).
     env_p.update(p_chunk_policy_env())
     # --p-layer-split: {} under 'static' (env byte-identical).

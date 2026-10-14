@@ -46,6 +46,16 @@ def freeze_gc(enable_cudagraph_gc: bool):
     gc.collect()
     should_freeze = not enable_cudagraph_gc
     if should_freeze:
+        # NF 13.10.: a rank whose boot heap is already frozen (pdflip/gc_instrument,
+        # FLLIPER_PDFLIP_GC_FREEZE) must not be unfrozen by a later capture --
+        # gc.unfreeze() hands the WHOLE permanent generation back and the
+        # collect after it walks ~1.1 M objects (the 5 s stall, inside a flip).
+        # Nothing frozen (every other line, 27B included) = the old path.
+        from flliper.srt.pdflip.gc_instrument import permanent_generation_populated
+
+        if permanent_generation_populated():
+            should_freeze = False
+    if should_freeze:
         gc.freeze()
     try:
         yield
