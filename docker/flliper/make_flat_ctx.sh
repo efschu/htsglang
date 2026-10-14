@@ -653,7 +653,13 @@ done
 say "   seed 27b $(find "$PART/assets/arb-seed-27b" -type f | wc -l) files, nf $(find "$PART/assets/arb-seed-nf" -type f | wc -l); profile data 27b $(ls "$PART/assets/profiles/27b" | wc -l), nf $(ls "$PART/assets/profiles/nf" | wc -l) ($(du -sh --apparent-size "$PART/assets/profiles" | cut -f1))"
 
 say "6/8 tools and the $(echo $PROFILES | wc -w) whitelisted profiles"
-cp -p "$HERE/entrypoint.sh" "$HERE/healthcheck.sh" "$HERE/prebuild_jit.py" "$HERE/delta_prebuild.py" "$HERE/delta_postcheck.py" "$PART/tools/" || fail "tools"
+cp -p "$HERE/entrypoint.sh" "$HERE/prebuild_jit.py" "$HERE/delta_prebuild.py" "$HERE/delta_postcheck.py" "$PART/tools/" || fail "tools"
+# RC4 (RC3 acceptance m3): the image healthcheck is TREE-versioned. It used to come from the host directory $HERE (a live file whose
+# state at build time decided the image: the old ctx/flat-0.1.0-* contexts carry a version without the FLIP-ORDER skip and make a
+# healthy NF server "sticky unhealthy"). HEALTHCHECK_SRC overrides the tree copy (selftests only).
+HC_SRC=${HEALTHCHECK_SRC:-$SELF_DIR/healthcheck.sh}
+[ -f "$HC_SRC" ] || fail "healthcheck.sh missing next to make_flat_ctx.sh ($HC_SRC)"
+cp -p "$HC_SRC" "$PART/tools/healthcheck.sh" || fail "tools/healthcheck.sh"
 for pr in $PROFILES; do
   cp -p "$(pf "$pr")" "$PART/tools/profiles/$pr.env" || fail "profile $pr"
   st=$(eff_status "$pr"); ist=$(img_status "$pr")

@@ -345,6 +345,7 @@ RUN mkdir -p /etc/htsglang \
     && cp /opt/htsglang/src-27b/docker/htsglang-chat_template.jinja /etc/htsglang/chat_template.jinja \
     && install -m 0755 /opt/htsglang/src-27b/docker/htsglang-entrypoint.sh /usr/local/bin/htsglang-entrypoint.sh
 COPY tools/entrypoint.sh /opt/htsglang/entrypoint.sh
+# the healthcheck is docker/flliper/healthcheck.sh of the tree (make_flat_ctx.sh copies it into tools/), not a host file
 COPY tools/healthcheck.sh /opt/htsglang/healthcheck.sh
 COPY BUILD_INFO.json /opt/htsglang/BUILD_INFO.json
 COPY BUILD_INFO-27b.json BUILD_INFO-nf.json /opt/htsglang/
