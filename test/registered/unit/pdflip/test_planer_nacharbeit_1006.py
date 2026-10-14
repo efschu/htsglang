@@ -91,7 +91,7 @@ class TestSupplement(unittest.TestCase):
 
     def test_w64_three_dual_cases_each_get_their_own_wording(self):
         """Nacharbeit 1006 Runde 6, Befund 3: kein Dual / Dual ohne Messung / Dual mit Messung INFEASIBLE / Meldung ohne Gewichtsvektor sind vier Woerter,
-        nicht zwei (launcher.py:17246, :17253-17254, :17354-17358, dual_w64.py:117)."""
+        nicht zwei (launcher.py:17330, :17337-17338, :17438-17442, dual_w64.py:117)."""
         neutral = PV.budget_verdict("W64-OPPOINT", level="run", text=W64_MSG, force_state=PV.BLOCKED)
         without = PV.budget_verdict("W64-OPPOINT", level="run", force_state=PV.BLOCKED,
                           text=W64_MSG + " | W64-DUAL: no measured dual-share D log of m with weights [20, 12, 8] under /x; the model verdict stands")
@@ -112,11 +112,11 @@ class TestSupplement(unittest.TestCase):
         self.assertIn("measured dual D log confirms", measured["title"])
         self.assertNotIn("without a measured", measured["title"] + measured["consequence"] + measured["class_reason"])
         self.assertIn("confirms", measured["consequence"])
-        self.assertRegex(measured["quelle"], r"17354-17358.*dual_w64\.py:117")
+        self.assertRegex(measured["quelle"], r"17438-17442.*dual_w64\.py:117")
         # Meldung ohne Gewichtsvektor: keine Suche, also nicht "without a measured dual D log"
         self.assertNotIn("without a measured", no_vector["title"] + no_vector["consequence"])
         self.assertIn("without weight vector", no_vector["title"])
-        self.assertRegex(no_vector["quelle"], r"17246")
+        self.assertRegex(no_vector["quelle"], r"17330")
         self.assertEqual(len({neutral["title"], without["title"], measured["title"], no_vector["title"]}), 4)
 
     @unittest.skipUnless(O.pdflip_module_exists("dual_w64"),
