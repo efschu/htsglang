@@ -840,6 +840,11 @@ class Envs:
     # JOIN_CAP_S is the emergency brake. 0 = the fixed bound.
     SGLANG_WEG2_L3FILL_JOIN_LIVENESS = EnvBool(True)
     SGLANG_WEG2_L3FILL_JOIN_CAP_S = EnvFloat(60.0)
+    # SELF-EVICT / SELF-JOIN (NF h16 15:34:27, P PP1, weg2-10-86): a fill
+    # never evicts the stems of the read it is filling, and a JOINED stem this
+    # process itself holds is taken over and read at once. 0 = off.
+    SGLANG_WEG2_L3FILL_PROTECT_READ = EnvBool(True)
+    SGLANG_WEG2_L3FILL_SELF_JOIN_TAKEOVER = EnvBool(True)
     # STORE_REFUSE_FS (W57, user 28.09.: "L3 gehoert auf XFS, nie ZFS"): a
     # real boot whose store directory lives on one of these filesystems
     # (/proc/mounts) is refused by name -- the container layer (overlay) or

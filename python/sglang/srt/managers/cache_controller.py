@@ -3805,7 +3805,15 @@ class HiCacheController:
         if _need:
             _fill_fn = getattr(self.storage_backend, "arena_fill_from_disk", None)
             if callable(_fill_fn):
-                _got = _fill_fn(pool.arena, [stems[i] for i in _need], int(pool._page_bytes), prefix=True)
+                # SELF-EVICT (NF h16 15:34:27, P PP1, weg2-10-86): the fill's
+                # room eviction took this very read's kept pages (#248e
+                # ORDERED-EVICT victims=[weg2-10-86 ... lowest_page=1024]) --
+                # the pages its next batch reads. Every stem of the operation
+                # is protected for the fill (pins + this read).
+                from sglang.srt.mem_cache.hicache_storage import fill_protect_scope
+
+                with fill_protect_scope(self.storage_backend, operation):
+                    _got = _fill_fn(pool.arena, [stems[i] for i in _need], int(pool._page_bytes), prefix=True)
                 _fills = dict(zip(_need, _got))
         _tf1 = time.perf_counter()
         _rs["l3fill"] = _rs.get("l3fill", 0.0) + (_tf1 - _tf) * 1000.0
