@@ -89,3 +89,98 @@ def pick_unservable_head(
         head.rid, need, int(available), int(tree.evictable_size()), _payable(tree),
     )
     return head
+
+
+# ---------------------------------------------------------------------------
+# PW-W (NF h14 ba1d5becd7, D 14:50:53-14:56:52Z, weg2-2-21): the STRUCTURAL
+# wedge -- a second way into the same W50 exit.
+#
+# weg2-2-21 (lane 1, 163616 tokens, prefix host-backed after D evicted the
+# device copy one pass earlier) was refused by the attention host's H105 gate
+# 1151 times in 317 s: ``host=NO_TOKEN host_price=167776 host_budget=33536``,
+# nothing running, the same two numbers on every refusal. PW-R above never
+# fired: it needs the BACKUP WALL (the host arena refusing backups) and asks
+# each rank's own device view, while the Form A workers price the same head
+# at 4704 (their bookkeeping tree holds the prefix as device rows) -- so the
+# group MIN of the local verdict was False every time. H106's watch never
+# fired either: it is built only for the host-broadcast form, and this group
+# runs the token cut (gather form). The lane floor 1 held every lane-0
+# request behind the head: the whole server stood.
+#
+# THE RULE: the group-DECIDED gate tuple ``(rid, code, price, budget)`` of the
+# pass (``Scheduler._form_a_admission_follow_fn`` ``last_verdict``: the
+# broadcast / gather result, identical on every rank) refuses the pass's HOL
+# head with ``price > budget`` while nothing runs, and the SAME
+# (rid, price, budget) has done so for ``SGLANG_WEG2_D_WEDGE_REROUTE_N``
+# consecutive evaluations: the head is answered with the named W50 refusal
+# (extent = the decided price), the front re-routes it through P and the
+# floor's lane runs on. Every input is replicated (the decided tuple, the
+# queue, the running set), the counter is advanced on every rank in the same
+# evaluation, so the verdict needs no collective. An admit, another head, a
+# running request or a moved number resets it. 0 = off.
+# ---------------------------------------------------------------------------
+
+STRUCT_MARK = "WEG2 D-WEDGE-HEAD"
+_STATE_ATTR = "_weg2_wedge_head_state"
+
+
+def wedge_reroute_n() -> int:
+    import os
+
+    raw = os.environ.get("SGLANG_WEG2_D_WEDGE_REROUTE_N", "64") or "64"
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 64
+
+
+def pick_structural_wedge_head(
+    *,
+    sched: Any,
+    head_rid: Optional[str],
+    waiting: Sequence[Any],
+    verdict: Optional[tuple],
+    running_empty: bool,
+    limit: Optional[int] = None,
+) -> Optional[Any]:
+    """The HOL head a structurally refused gate has held for ``limit``
+    consecutive evaluations, or None. ``verdict``: the group-decided
+    ``(rid, code, price, budget)`` of this pass's last gate call."""
+    n_lim = wedge_reroute_n() if limit is None else int(limit)
+    if n_lim <= 0 or head_rid is None:
+        return None
+    st = getattr(sched, _STATE_ATTR, None)
+    ok = (
+        verdict is not None
+        and len(verdict) >= 4
+        and str(verdict[0]) == str(head_rid)
+        and str(verdict[1]) != "ADMIT"
+        and running_empty
+    )
+    try:
+        price, budget = int(verdict[2]), int(verdict[3])
+    except (TypeError, ValueError, IndexError):
+        ok = False
+        price = budget = 0
+    if not ok or price <= budget:
+        setattr(sched, _STATE_ATTR, None)
+        return None
+    key = (str(head_rid), price, budget)
+    if st is None or st[0] != key:
+        st = [key, 0]
+    st[1] += 1
+    setattr(sched, _STATE_ATTR, st)
+    if st[1] < n_lim:
+        return None
+    head = next((q for q in waiting if str(q.rid) == str(head_rid)), None)
+    setattr(sched, _STATE_ATTR, None)
+    if head is None:
+        return None
+    logger.warning(
+        "%s rid=%s code=%s price=%d budget=%d refusals=%d running=0: the group's "
+        "admission gate refused the queue head with a price above its budget and "
+        "nothing running for %d consecutive evaluations -- answered W50, the front "
+        "re-routes it through P so the lanes behind it run on",
+        STRUCT_MARK, head.rid, verdict[1], price, budget, n_lim, n_lim,
+    )
+    return head
