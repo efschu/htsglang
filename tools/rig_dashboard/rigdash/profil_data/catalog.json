@@ -2035,6 +2035,26 @@
    "type": "str"
   },
   "--d-gc-freeze": {
+   "abweichung": {
+    "27b": {
+     "default": null,
+     "help": "Group D: 'on' = every D scheduler calls gc.freeze() once after boot (all CUDA graphs captured), so gen-2 collections no longer walk the boot objects (agent FR 26.09.: ~0.5 s single-rank D-round stalls). 'off' (default) = no env from this flag; the profile rows (qwen27b, nextflash) turn the switch on by default (--env-d FLLIPER_PDFLIP_GC_FREEZE=0 = off).",
+     "source": {
+      "file": "pdflip/launcher.py",
+      "kind": "argparse",
+      "line": 23519
+     }
+    },
+    "nf": {
+     "default": null,
+     "help": "Group D: 'on' = every D scheduler calls gc.freeze() once after boot (all CUDA graphs captured), so gen-2 collections no longer walk the boot objects (agent FR 26.09.: ~0.5 s single-rank D-round stalls). 'off' (default) = no env.",
+     "source": {
+      "file": "pdflip/launcher.py",
+      "kind": "argparse",
+      "line": 22804
+     }
+    }
+   },
    "trees": [
     "27b",
     "nf"
@@ -2049,7 +2069,7 @@
    "depends": [],
    "gain": "",
    "group": "",
-   "help": "Group D: 'on' = every D scheduler calls gc.freeze() once after boot (all CUDA graphs captured), so gen-2 collections no longer walk the boot objects (agent FR 26.09.: ~0.5 s single-rank D-round stalls). 'off' (default) = no env.",
+   "help": "Group D: 'on' = every D scheduler calls gc.freeze() once after boot (all CUDA graphs captured), so gen-2 collections no longer walk the boot objects (agent FR 26.09.: ~0.5 s single-rank D-round stalls). 'off' (default) = no env from this flag; the profile rows (qwen27b, nextflash) turn the switch on by default (--env-d FLLIPER_PDFLIP_GC_FREEZE=0 = off).",
    "id": "--d-gc-freeze",
    "kind": "flag",
    "level": "expert",
@@ -18098,6 +18118,26 @@
    "type": "int"
   },
   "--p-gc-freeze": {
+   "abweichung": {
+    "27b": {
+     "default": null,
+     "help": "Group P: 'on' = every P scheduler calls gc.freeze() once after boot (all CUDA graphs captured), so gen-2 collections no longer walk the boot objects (NF 13.10.: 4.4-5.4 s PP0/PP1 collections inside flips). 'off' (default) = no env from this flag; the profile rows (qwen27b, nextflash) turn the switch on for P and D by default (--env-p/--env-d FLLIPER_PDFLIP_GC_FREEZE=0 = off there).",
+     "source": {
+      "file": "pdflip/launcher.py",
+      "kind": "argparse",
+      "line": 23524
+     }
+    },
+    "nf": {
+     "default": null,
+     "help": "Group P: 'on' = every P scheduler calls gc.freeze() once after boot (all CUDA graphs captured), so gen-2 collections no longer walk the boot objects (NF 13.10.: 4.4-5.4 s PP0/PP1 collections inside flips). 'off' (default) = no env from this flag; the nextflash profile turns the switch on for P and D by default (--env-p/--env-d FLLIPER_PDFLIP_GC_FREEZE=0 = off there).",
+     "source": {
+      "file": "pdflip/launcher.py",
+      "kind": "argparse",
+      "line": 22809
+     }
+    }
+   },
    "bare": false,
    "choices": [
     "off",
@@ -18108,7 +18148,7 @@
    "depends": [],
    "gain": "",
    "group": "",
-   "help": "Group P: 'on' = every P scheduler calls gc.freeze() once after boot (all CUDA graphs captured), so gen-2 collections no longer walk the boot objects (NF 13.10.: 4.4-5.4 s PP0/PP1 collections inside flips). 'off' (default) = no env from this flag; the nextflash profile turns the switch on for P and D by default (--env-p/--env-d FLLIPER_PDFLIP_GC_FREEZE=0 = off there).",
+   "help": "Group P: 'on' = every P scheduler calls gc.freeze() once after boot (all CUDA graphs captured), so gen-2 collections no longer walk the boot objects (NF 13.10.: 4.4-5.4 s PP0/PP1 collections inside flips). 'off' (default) = no env from this flag; the profile rows (qwen27b, nextflash) turn the switch on for P and D by default (--env-p/--env-d FLLIPER_PDFLIP_GC_FREEZE=0 = off there).",
    "id": "--p-gc-freeze",
    "kind": "flag",
    "level": "expert",
@@ -48904,7 +48944,7 @@
    "kind": "env",
    "lesestellen": [
     "layers/moe/expert_store.py:97",
-    "pdflip/form.py:1873"
+    "pdflip/form.py:1883"
    ],
    "level": "expert",
    "name": "FLLIPER_MOE_EXPERT_STORE_DIR",
@@ -74221,7 +74261,7 @@
     "managers/pdflip_d_hostgap.py:113",
     "mem_cache/unified_radix_cache.py:716",
     "mem_cache/unified_radix_cache.py:756",
-    "pdflip/form.py:1295"
+    "pdflip/form.py:1305"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_FORM",
@@ -75144,11 +75184,11 @@
    "bare": false,
    "choices": null,
    "cost": "With off the host RAM is no longer protected (wording of the start warning).",
-   "default": "\"on\"",
+   "default": "\"off\"",
    "depends": [],
    "gain": "",
    "group": "Watchdogs",
-   "help": "Host-RAM guards of the front (user decision 06.10.): ON/OFF per guard, separately. on (default; on/1/true/yes) = the existing do_stop. off (off/0/false/no) = the guard no longer stops (the line stays, \"NOT stopping\") and the front start writes a loud WARNING \"HOST GUARD W22/W98 AUS: Host-RAM ist nicht mehr geschuetzt\". The thresholds (--host-riegel-gib, host_ledger mark) are untouched. A typo reads as on. W22 = HostWatermarkBreached (level), W98 = HostRateLatched (rate).",
+   "help": "Host-RAM guards of the front (user decision 06.10.): ON/OFF per guard, separately. off (default since RC4 fix round 1, user rule 06.10. \"keine Verweigerung wegen Host-RAM, nur warnen\"; off/0/false/no) = the guard does not stop: HOST-RAM-WARN episode lines, and the front start writes the WARNING \"HOST GUARD W22/W98 AUS: Host-RAM ist nicht mehr geschuetzt\". on (on/1/true/yes, explicit only) = the do_stop of RC3. The thresholds (--host-riegel-gib, host_ledger mark) are untouched. A typo reads as on. W22 = HostWatermarkBreached (level), W98 = HostRateLatched (rate).",
    "id": "FLLIPER_PDFLIP_HOST_GUARD_W22",
    "kind": "env",
    "level": "expert",
@@ -75163,7 +75203,7 @@
     "line": 2748
    },
    "status": "curated",
-   "text": "27B tree only. W22 HostWatermarkBreached (host RAM level) stops the front. Text value on/off (on/1/true/yes, off/0/false/no), default on. With off the verdict is logged (\"HOST GUARD W22 AUS: NOT stopping\", throttled), NOTHING is stopped; at front start a loud WARNING \"HOST GUARD W22 AUS: Host-RAM ist nicht mehr geschützt\" appears. A typo counts as on. The threshold (--host-riegel-gib, host_ledger mark) stays unchanged.",
+   "text": "27B tree only. W22 HostWatermarkBreached (host RAM level). Text value on/off (on/1/true/yes, off/0/false/no), default off since RC4 fix round 1 (user rule 06.10.: host RAM warns, it never stops): the breach is logged as HOST-RAM-WARN episode lines, NOTHING is stopped, and at front start a loud WARNING \"HOST GUARD W22 AUS: Host-RAM ist nicht mehr geschützt\" appears. With on the breach stops the front (RC3 behaviour). A typo counts as on. The threshold (--host-riegel-gib, host_ledger mark) stays unchanged.",
    "type": "EnvStr"
   },
   "FLLIPER_PDFLIP_HOST_GUARD_W98": {
@@ -75173,7 +75213,7 @@
    "bare": false,
    "choices": null,
    "cost": "With off the host RAM is no longer protected (wording of the start warning).",
-   "default": "\"on\"",
+   "default": "\"off\"",
    "depends": [],
    "gain": "",
    "group": "Watchdogs",
@@ -75192,7 +75232,7 @@
     "line": 2749
    },
    "status": "curated",
-   "text": "27B tree only. W98 HostRateLatched (rate latch), switchable separately from W22; otherwise like W22 (text value on/off, default on; with off WARNING \"HOST GUARD W98 AUS: Host-RAM ist nicht mehr geschützt\"). With off the W22 level test continues in the same tick.",
+   "text": "27B tree only. W98 HostRateLatched (rate latch), switchable separately from W22; otherwise like W22 (text value on/off, default off since RC4 fix round 1: HOST-RAM-WARN episode lines and the WARNING \"HOST GUARD W98 AUS: Host-RAM ist nicht mehr geschützt\"; with on the latch stops the front). With off the W22 level test continues in the same tick.",
    "type": "EnvStr"
   },
   "FLLIPER_PDFLIP_HOT_HANDOVER": {
@@ -86194,7 +86234,7 @@
  "schema": "flliper.catalog/1",
  "stats": {
   "trees": {
-   "abweichung": 45,
+   "abweichung": 47,
    "beide": 2463,
    "nur_27b": 180,
    "nur_nf": 54
@@ -86207,15 +86247,15 @@
   "curated": 124,
   "unexplained": 606
  },
- "tree_rev": "27b=8b01654cb9+nf=59b4057da3",
+ "tree_rev": "27b=bc4924f6d8+nf=cddaa3ecbd",
  "trees": {
   "27b": {
    "entries": 2643,
-   "rev": "8b01654cb9"
+   "rev": "bc4924f6d8"
   },
   "nf": {
    "entries": 2517,
-   "rev": "59b4057da3"
+   "rev": "cddaa3ecbd"
   }
  },
  "warnungen": []
