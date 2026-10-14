@@ -196,6 +196,7 @@ from flliper.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     VramBudgetReqInput,
     VramBudgetReqOutput,
+    PdFlipLaneFloorReqInput,
     PdFlipParkRunningReqInput,
     PdFlipParkWindowReqInput,
     sock_send,
@@ -4000,6 +4001,7 @@ class Scheduler(
                 (SessionCheckpointReqInput, self.handle_session_checkpoint),
                 (VramBudgetReqInput, self.handle_vram_budget),
                 (PdFlipParkRunningReqInput, self.handle_pdflip_park_running),
+                (PdFlipLaneFloorReqInput, self.handle_pdflip_lane_floor),
                 (PdFlipParkWindowReqInput, self.handle_pdflip_park_window),
                 (PdFlipVisionVerdict, self.handle_pdflip_vision_verdict),
                 (PlePrefetchHintReqInput, self.handle_ple_prefetch_hint),
@@ -6514,10 +6516,27 @@ class Scheduler(
         before D's sleep (d_park_runtime.park_running)."""
         from flliper.srt.pdflip import d_park_runtime, park_window_gate
 
-        park_window_gate.clear(self, "park")  # the window fired: its deadline is spent
+        if not (getattr(recv_req, "rids", None) or getattr(recv_req, "hold", "")):
+            # a LANE park (rids / hold, PRIORITY LANES 1008 L2) opens no flip: the collect window stays
+            park_window_gate.clear(self, "park")  # the window fired: its deadline is spent
         return d_park_runtime.park_running(
             self, recv_req, late_hold_armed=_pdflip_dormant_admit_armed()
         )
+
+    def handle_pdflip_lane_floor(self, recv_req):
+        """PRIORITY LANES 1008 (L2): ``POST /pdflip/lane_floor`` -- the floor of D's admission
+        (d_park_runtime.lane_floor); a fall of the floor re-queues the held lane parks it lets in."""
+        from flliper.srt.pdflip import d_park_runtime
+
+        return d_park_runtime.lane_floor(self, recv_req)
+
+    def _pdflip_lane_skip(self, req):
+        """PRIORITY LANES 1008 (L2): the census key when D's floor keeps ``req`` out of this admission pass
+        (its lane is below the floor), else None. Floor 0 (the switch off, or no lane held back) is None
+        for every request -- the loop reads exactly what it read before."""
+        from flliper.srt.pdflip import d_lane
+
+        return d_lane.SKIP_KEY if d_lane.below_floor(self, req) else None
 
     def handle_pdflip_park_window(self, recv_req) -> None:
         """PARK-WINDOW-GATE: the front's open collect window (deadline and D's
@@ -16727,6 +16746,11 @@ class Scheduler(
             if _burst_hold is not None:  # fnFL2 H42b: the burst is still assembling
                 _note_skip("pdflip_burst_assembly", req.rid)
                 continue
+            if getattr(self, "pdflip_lane_floor", 0):  # PRIORITY LANES 1008 (L2): the floor of D's admission
+                _lane_skip = self._pdflip_lane_skip(req)
+                if _lane_skip is not None:
+                    _note_skip(_lane_skip, req.rid)
+                    continue
             if _d_park_gate is not None:  # H91b: parked first, newcomers wait
                 # AP: the parked requests already admitted THIS pass hold no seat
                 _d_skip = _d_park_gate.skip(req, admitted=[str(_r.rid) for _r in adder.can_run_list],

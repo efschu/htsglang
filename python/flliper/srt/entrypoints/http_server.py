@@ -160,6 +160,7 @@ from flliper.srt.managers.io_struct import (
     UpdateWeightVersionReqInput,
     VertexGenerateReqInput,
     VramBudgetReqInput,
+    PdFlipLaneFloorReqInput,
     PdFlipParkRunningReqInput,
     PdFlipParkWindowReqInput,
 )
@@ -1441,8 +1442,38 @@ async def pdflip_park_running(obj: Annotated[PdFlipParkRunningReqInput, Body()],
     seq_marks = getattr(ret, "pdflip_seq_hash", None)  # SEQ-HASH (02.10.)
     if seq_marks:
         body["pdflip_seq_hash"] = dict(seq_marks)
+    if getattr(ret, "lane", False):
+        # PRIORITY LANES 1008 (L2): the answer of a rids / hold park carries "lane" (+ why a rid was not parked)
+        body["lane"] = True
+        body["skipped"] = dict(getattr(ret, "lane_skipped", None) or {})
     return ORJSONResponse(
         body,
+        status_code=200 if ret.success else HTTPStatus.CONFLICT,
+    )
+
+
+@app.api_route("/pdflip/lane_floor", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def pdflip_lane_floor(obj: Annotated[PdFlipLaneFloorReqInput, Body()], request: Request):
+    """PRIORITY LANES 1008 (L2): the front's floor for group D. Body {"floor": <int>, "epoch": <int>}; answer
+    200 {"success", "floor", "epoch", "requeued": [rid, ...], "held": <n>, "message"} -- the floor and epoch in
+    force, the held lane parks this call re-queued (oldest first) and the holds still standing. D's admission
+    lets in only requests with priority >= floor; a request parked with hold="lane" (POST /pdflip/park_running
+    with "rids") comes back when the floor falls to its lane. 409 when refused (FLLIPER_PDFLIP_LANES off on this
+    server, or a stale epoch). Names: pdflip/lanes.py RPC_LANE_FLOOR."""
+    try:
+        ret = await _global_state.tokenizer_manager.pdflip_lane_floor(obj)
+    except Exception as e:
+        return _create_error_response(e)
+    return ORJSONResponse(
+        {
+            "success": ret.success,
+            "floor": ret.floor,
+            "epoch": ret.epoch,
+            "requeued": list(ret.requeued),
+            "held": ret.held,
+            "message": ret.message,
+        },
         status_code=200 if ret.success else HTTPStatus.CONFLICT,
     )
 
