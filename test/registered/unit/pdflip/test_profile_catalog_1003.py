@@ -193,7 +193,13 @@ class Build(unittest.TestCase):
             # this tree alone.  What is tagged with THIS tree's label must be exactly this tree's harvest: when the tree moves (flag, env, os.environ
             # read site), this check goes red = rebuild catalog.json (command and tree revisions are in the commit message of the file).
             self.assertEqual(sorted(shipped["trees"]), ["27b", "nf"])
-            self.assertEqual(shipped["stats"]["curated"], st["curated"])
+            # RC4: the shipped file is built with ONE curated table (the NF generator's); curated entries that only the OTHER tree knows (the NF-only lane
+            # environment variables: trees ["nf"], absent from this tree's environ.py, so absent from its table: test_every_curated_name_exists) are not this
+            # tree's. Everything else must match in number.
+            other = "27b" if TREE == "nf" else "nf"
+            foreign = [n for n, e in shipped["entries"].items() if e.get("status") == "curated" and n not in CU.CURATED]
+            self.assertTrue(all(shipped["entries"][n].get("trees") == [other] for n in foreign), foreign)
+            self.assertEqual(shipped["stats"]["curated"] - len(foreign), st["curated"])
             here = PC._harvest(os.path.join(PDFLIP, "launcher.py"), os.path.join(SRT, "environ.py"), os.path.join(SRT, "server_args.py"), SRT)
             tagged = {n for n, e in shipped["entries"].items() if TREE in e.get("trees", [])}
             self.assertEqual(tagged, set(here))
