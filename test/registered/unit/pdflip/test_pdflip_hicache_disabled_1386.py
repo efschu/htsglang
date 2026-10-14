@@ -608,8 +608,14 @@ class TheFiveTestsAboveAreActuallyHermeticNow(_HermeticMainBase):
 
     def test_a_too_small_mocked_host_actually_refuses_the_ladder(self):
         """Proves `main` reads the MOCKED `MEMINFO_PATH`/`CGROUP_ROOT`, not
-        the real box: a deliberately too-small fake host must refuse to
-        fund even the frugal end of this file's own arm ladder."""
+        the real box: a deliberately too-small fake host must fail to
+        fund even the frugal end of this file's own arm ladder.
+
+        HOSTWARN2 (13.10.2026, user rule 06.10.: no refusal on host RAM): the
+        ladder's verdict is a ``HOST-RAM-WARN W20/W21`` line now and the boot
+        goes on, so the seam is proved by THAT line in the output (a real
+        15+ GiB box could never print it for a 2 GiB mock), and by the absence
+        of the old host-ledger exception."""
         tiny = tempfile.mkdtemp(prefix="pdflip-1390-tiny-host-")
         meminfo = os.path.join(tiny, "meminfo")
         with open(meminfo, "w") as f:
@@ -632,11 +638,13 @@ class TheFiveTestsAboveAreActuallyHermeticNow(_HermeticMainBase):
         with mock.patch.object(launcher, "MEMINFO_PATH", meminfo), \
              mock.patch.object(launcher, "CGROUP_ROOT", cg):
             rc, out, exc = self.run_main(_main_argv("t1390mem"))
-        self.assertIsNotNone(
-            exc, "a 2 GiB fake host must refuse this file's own arm ladder "
-            "-- if it does not, main() is reading the real host instead of "
-            "the mock")
-        self.assertIsInstance(
+        self.assertTrue(
+            "HOST-RAM-WARN W20 HostLedgerUnfunded" in out
+            or "HOST-RAM-WARN W21 HostRunPeakUnfunded" in out,
+            "a 2 GiB fake host must fail to fund this file's own arm ladder "
+            "-- if no HOST-RAM-WARN names it, main() is reading the real host "
+            "instead of the mock")
+        self.assertNotIsInstance(
             exc, (host_ledger.PdFlipHostLedgerRefused,
                   host_ledger.PdFlipHostRunPeakRefused))
 

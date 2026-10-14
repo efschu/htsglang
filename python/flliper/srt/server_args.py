@@ -8188,7 +8188,12 @@ class ServerArgs:
                     self.kv_session_offload_host_ram_gib, _total, _available
                 )
                 if _err is not None:
-                    raise ValueError(_err)
+                    # HOSTWARN2 (user rule 06.10.): warn, the pool is attempted.
+                    from flliper.srt.mem_cache.pinned_host_budget import (
+                        warn_pinned_host,
+                    )
+
+                    warn_pinned_host(_err, "--kv-session-offload-host-ram-gib")
         if self.kv_session_offload_block_size <= 0:
             raise ValueError(
                 "--kv-session-offload-block-size must be > 0; got "
@@ -8401,7 +8406,12 @@ class ServerArgs:
                     _available,
                 )
                 if _err is not None:
-                    raise ValueError(_err)
+                    # HOSTWARN2 (user rule 06.10.): warn, the pools are attempted.
+                    from flliper.srt.mem_cache.pinned_host_budget import (
+                        warn_pinned_host,
+                    )
+
+                    warn_pinned_host(_err, "HiCache host tier + kv-session-offload")
             if os.environ.get("KVSO_ALLOW_HICACHE", "0") != "1":
                 raise ValueError(
                     "--enable-kv-session-offload x --enable-hierarchical-cache"
@@ -9075,7 +9085,10 @@ class ServerArgs:
         total_bytes, available_bytes = pinned_host_memory_bytes()
         err = joint_pinned_host_error(posts, total_bytes, available_bytes)
         if err is not None:
-            raise ValueError(err)
+            # HOSTWARN2 (user rule 06.10.): warn, the staging tier is attempted.
+            from flliper.srt.mem_cache.pinned_host_budget import warn_pinned_host
+
+            warn_pinned_host(err, "HiCache staging host tier")
         # #809 G1-C6: the incoming-image pin is NAMED on this line, and the
         # split between naming it here and PRICING it at boot is the honest
         # division rather than a gap.

@@ -176,7 +176,7 @@ class Hint(unittest.TestCase):
     def test_duplicate_codes_listed_once_and_nf_gets_its_honest_note(self):
         h = self.hint(["PROFIL-STATUS", "PROFIL-STATUS"], line="nf")
         self.assertEqual(len(h["force_codes"]), 1)
-        self.assertIn("only HW-COUNT, HW-UNCALIBRATED and HOST-MEM", h["line_note"])
+        self.assertIn("only HW-COUNT, HW-UNCALIBRATED and HOST-DISK", h["line_note"])  # HOSTWARN2: host RAM warns, HOST-MEM left the list
         self.assertEqual(self.hint(["PROFIL-STATUS"], line="27b")["line_note"], "")
 
     def test_the_example_is_valid_bash_continuation_no_comment_behind_a_backslash(self):

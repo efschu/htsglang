@@ -93,14 +93,20 @@ class TheAdmissionChargesEveryRegisteredPost(unittest.TestCase):
         register_pinned_post(
             PinnedHostPost(name="existing", flag="--existing", nbytes=30 * _GB)
         )
+        # HOSTWARN2 (13.10.2026, user rule 06.10.): the SUM is still judged, the verdict is a
+        # ``HOST-RAM-WARN PINNED`` warning (was ValueError) and the post is registered.
         with self._with_host(64, 10):
-            with self.assertRaises(ValueError) as ctx:
+            with self.assertLogs(
+                "flliper.srt.mem_cache.pinned_host_budget", level="WARNING"
+            ) as cm:
                 check_and_register_pinned_post(
                     name="newcomer", flag="--newcomer", requested_bytes=20 * _GB
                 )
-        msg = str(ctx.exception)
+        msg = "\n".join(cm.output)
+        self.assertIn("HOST-RAM-WARN PINNED newcomer", msg)
         self.assertIn("existing", msg)
         self.assertIn("newcomer", msg)
+        self.assertIn("newcomer", [p.name for p in registered_posts()])
 
     def test_the_same_post_alone_is_admitted(self):
         """Can-fail proof: 20 GB fits 40 GB, so the refusal above is the SUM."""
@@ -124,10 +130,14 @@ class TheAdmissionChargesEveryRegisteredPost(unittest.TestCase):
             check_and_register_pinned_post(
                 name="first", flag="--first", requested_bytes=20 * _GB
             )
-            with self.assertRaises(ValueError):
+            # HOSTWARN2: the second post SEES the first (the warning names both) -- no raise
+            with self.assertLogs(
+                "flliper.srt.mem_cache.pinned_host_budget", level="WARNING"
+            ) as cm:
                 check_and_register_pinned_post(
                     name="second", flag="--second", requested_bytes=25 * _GB
                 )
+            self.assertIn("first", "\n".join(cm.output))
 
     def test_an_unreadable_host_figure_does_not_refuse(self):
         """Refusing to guess beats refusing a boot on a fabricated number."""
