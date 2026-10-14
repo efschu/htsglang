@@ -86,6 +86,14 @@ class PdFlipPpRoomFact(msgspec.Struct, frozen=True):
     sim_us: float = 0.0
 
 
+class PdFlipPpRoomFactLane(PdFlipPpRoomFact, frozen=True):
+    """PRIORITY LANES 1008 (L3): the same fact plus the lane floor / epoch the sending stage APPLIES.  Only a stage that
+    holds lane state sends this subclass; a boot without lanes sends the plain fact, wire unchanged."""
+
+    lane_floor: int = -1
+    lane_epoch: int = -1
+
+
 class CapVerdict(msgspec.Struct, frozen=True):
     cap: int
     rank: int
@@ -213,7 +221,8 @@ def backup_room_tokens(pool) -> int:
         return 0
 
 
-def follower_fact(*, tree, allocator, rank: int, executed: int, local_floor: bool) -> PdFlipPpRoomFact:
+def follower_fact(*, tree, allocator, rank: int, executed: int, local_floor: bool,
+                  lane_floor: int = -1, lane_epoch: int = -1) -> PdFlipPpRoomFact:
     from flliper.srt.mem_cache.common import payable_evictable_or
 
     available = int(allocator.available_size())
@@ -226,6 +235,10 @@ def follower_fact(*, tree, allocator, rank: int, executed: int, local_floor: boo
     sim_us = (time.perf_counter() - t0) * 1e6
     payable = max(0, min(walked, walled))
     note_vote(tree, payable)  # diagnostics: what the AgreedRoomShort stop compares a fresh walk to
+    if int(lane_epoch) >= 0:
+        return PdFlipPpRoomFactLane(rank=int(rank), executed=int(executed), room=available + payable,
+                                  available=available, payable=payable, reported=reported, sim_us=sim_us,
+                                  lane_floor=int(lane_floor), lane_epoch=int(lane_epoch))
     return PdFlipPpRoomFact(rank=int(rank), executed=int(executed), room=available + payable,
                           available=available, payable=payable, reported=reported, sim_us=sim_us)
 
@@ -326,6 +339,17 @@ class RoomBook:
     def begin_pass(self) -> None:
         self.pass_no += 1
 
+    def lane_echo(self) -> Dict[int, Tuple[int, int]]:
+        """PRIORITY LANES 1008 (L3): ``{rank: (lane_floor, lane_epoch)}`` each fresh follower fact says it applies (only
+        facts that carry lane state).  PP0 reads whether every stage stands on one epoch."""
+        out: Dict[int, Tuple[int, int]] = {}
+        for rank, (f, seen) in sorted(self.facts.items()):
+            if self.pass_no - seen > FACT_MAX_AGE_PASSES:
+                continue
+            if isinstance(f, PdFlipPpRoomFactLane):
+                out[int(rank)] = (int(f.lane_floor), int(f.lane_epoch))
+        return out
+
     def note_batches(self, batches: Iterable[Any]) -> None:
         for b in batches:
             ct = getattr(b, "forward_iter", None) if b is not None else None
@@ -399,6 +423,32 @@ def absorb_cap(recv_reqs) -> Tuple[list, Optional[int]]:
         return recv_reqs, None  # the list untouched: byte-identical
     rest = [r for r in recv_reqs if not isinstance(r, PdFlipPpRoomCap)]
     return rest, int(caps[-1].cap)
+
+
+class PdFlipPpLaneFloor(msgspec.Struct, frozen=True):
+    """PRIORITY LANES 1008 (L3): the lane floor every stage applies in pass m, riding list m of the request chain beside
+    ``PdFlipPpRoomCap`` (PP0 applies it in pass m and stamps the standing value; a follower takes it off after relaying).
+    ``PR LANE-FLOOR floor=N epoch=E`` is logged by each stage when its applied value changes."""
+
+    floor: int
+    epoch: int
+
+
+def stamp_lane_floor(wire_reqs, stamp: Optional["PdFlipPpLaneFloor"]) -> list:
+    """PP0, before the chain send: list m carries the lane floor (nothing without one: byte-identical)."""
+    out = list(wire_reqs or ())
+    if stamp is not None:
+        out.append(stamp)
+    return out
+
+
+def absorb_lane_floor(recv_reqs) -> Tuple[list, Optional["PdFlipPpLaneFloor"]]:
+    """A follower, after relaying list m: take the lane floor off it (None when absent; the list untouched then)."""
+    marks = [r for r in (recv_reqs or ()) if isinstance(r, PdFlipPpLaneFloor)]
+    if not marks:
+        return recv_reqs, None
+    rest = [r for r in recv_reqs if not isinstance(r, PdFlipPpLaneFloor)]
+    return rest, marks[-1]
 
 
 def note_binding(verdict: Optional[CapVerdict], own_fundable: int, book: RoomBook) -> None:

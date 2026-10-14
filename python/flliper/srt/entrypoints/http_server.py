@@ -162,6 +162,7 @@ from flliper.srt.managers.io_struct import (
     VramBudgetReqInput,
     PdFlipLaneFloorReqInput,
     PdFlipParkRunningReqInput,
+    PdFlipLaneFloorReqInput,
     PdFlipParkWindowReqInput,
 )
 from flliper.srt.managers.multi_tokenizer_mixin import (
@@ -1489,6 +1490,19 @@ async def pdflip_park_window(obj: Annotated[PdFlipParkWindowReqInput, Body()], r
     except Exception as e:
         return _create_error_response(e)
     return ORJSONResponse({"sent": True, "left_ms": obj.left_ms}, status_code=200)
+
+
+@app.api_route("/pdflip/lane_floor", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def pdflip_lane_floor(obj: Annotated[PdFlipLaneFloorReqInput, Body()], request: Request):
+    """PRIORITY LANES 1008: the Weg-2 front's lane floor for this group (body {"floor": int, "epoch": int}).
+    One-way to the scheduler; group P: PP0 stamps it into the PP-room vote so every stage applies it in the same
+    pass (pdflip/lanes_p.py); group D reads it in its admission. Without FLLIPER_PDFLIP_LANES=1 the scheduler ignores it."""
+    try:
+        _global_state.tokenizer_manager._dispatch_to_scheduler(obj)
+    except Exception as e:
+        return _create_error_response(e)
+    return ORJSONResponse({"sent": True, "floor": obj.floor, "epoch": obj.epoch}, status_code=200)
 
 
 @app.api_route("/pdflip/ple_prefetch_hint", methods=["POST"])

@@ -240,6 +240,7 @@ from flliper.srt.managers import pdflip_flush_nonblock as _pdflip_flush_nonblock
 from flliper.srt.pdflip import fork_anchor as _pdflip_fork
 from flliper.srt.pdflip import twin_anchor as _pdflip_twin_anchor  # TWIN ANCHOR (y4a 16-28)
 from flliper.srt.pdflip import d_park_read as _pdflip_park_read  # PARK-RETAIN READ
+from flliper.srt.pdflip import lanes_p as _lanes_p  # PRIORITY LANES 1008 (L3): the P-side lane floor
 from flliper.srt.pdflip import resume_via_p as _pdflip_rvp  # RESUME-VIA-P
 from flliper.srt.pdflip import d_wall_head as _pdflip_d_wall_head  # PW-R
 from flliper.srt.pdflip import d_head_hold as _pdflip_d_head_hold  # DQH
@@ -4003,6 +4004,7 @@ class Scheduler(
                 (PdFlipParkRunningReqInput, self.handle_pdflip_park_running),
                 (PdFlipLaneFloorReqInput, self.handle_pdflip_lane_floor),
                 (PdFlipParkWindowReqInput, self.handle_pdflip_park_window),
+                (PdFlipLaneFloorReqInput, self.handle_pdflip_lane_floor),
                 (PdFlipVisionVerdict, self.handle_pdflip_vision_verdict),
                 (PlePrefetchHintReqInput, self.handle_ple_prefetch_hint),
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
@@ -6544,6 +6546,14 @@ class Scheduler(
         from flliper.srt.pdflip import park_window_gate
 
         park_window_gate.note(self, recv_req)
+
+    def handle_pdflip_lane_floor(self, recv_req) -> None:
+        """PRIORITY LANES 1008 (L3, pdflip/lanes_p.py): ``POST /pdflip/lane_floor``. Group P: PP0 records the value for its
+        next pass (it stamps it on the PP-room vote, every stage applies it in the same pass), PP1/PP2 ignore the
+        request itself. Ignored without FLLIPER_PDFLIP_LANES=1. No reply."""
+        from flliper.srt.pdflip import lanes_p
+
+        lanes_p.on_rpc(self, recv_req)
 
     def pdflip_d_hold_parked(self) -> int:
         """H91b: the sleep leg's dormant point -- parked requests enter the
@@ -10170,9 +10180,16 @@ class Scheduler(
         if getattr(req, "finished", lambda: False)() or req.req_pool_idx is None:
             req.pdflip_pool_parked = False
             return
+        # PRIORITY LANES 1008 (L3, pdflip/lanes_p.py): the trigger is the lane floor, not the pool. The rows go back whether
+        # or not anybody waits (the floor holds the whole lane), and only while the floor still stands above the lane.
+        _lane_park = _lanes_p.park_is_lane(req)
+        if _lane_park and not _lanes_p.park_still_due(self, req):
+            req.pdflip_pool_parked = False  # the floor fell before the rows went back: the park is void
+            req.pdflip_lane_parked = False
+            return
         if int(getattr(req, "inflight_middle_chunks", 0) or 0) > 0:
             return  # a launched chunk still writes its rows; try next step
-        if not getattr(self, "waiting_queue", None):
+        if not _lane_park and not getattr(self, "waiting_queue", None):
             return  # nobody to make room for: keep the in-place park (#679)
         try:
             from flliper.srt.pdflip.park import park_active
@@ -10193,6 +10210,10 @@ class Scheduler(
         req.reset_for_retract()
         self.chunked_req = None
         self._add_request_to_queue(req, is_retracted=True)
+        if _lane_park:
+            # the request keeps `pdflip_lane_parked` (the admission loop skips it while the floor stands above its lane)
+            _lanes_p.note_parked(self, req, span=span, total=len(getattr(req, "origin_input_ids", ()) or ()))
+            return
         n = getattr(self, "_pdflip_park_n", 0) + 1
         self._pdflip_park_n = n
         logger.info(
@@ -16286,6 +16307,9 @@ class Scheduler(
         # H105: on a Form A group the attention host's gate verdict is the
         # group's (None elsewhere: every gate in add_one_req stays rank-local).
         adder.form_a_admission_follow = self._form_a_admission_follow_fn()
+        # PRIORITY LANES 1008 (L3): this pass's lane floor (and the lane chunk) for the adder; nothing is written without
+        # lane state (no RPC / switch off), so the adder keeps its class defaults.
+        _lanes_p.configure_adder(self, adder)
         # ED (rc12o b1): on a Form A group only the host's vote decides (H105);
         # a worker keeps the reported evictable count so its local extend
         # arithmetic is the pre-ED one (mem_cache/evict_frontier_census.py).
@@ -16603,7 +16627,8 @@ class Scheduler(
                                 count,
                             )
                         self.chunked_req.truncate_prefix_to(told)
-                self.chunked_req = adder.add_chunked_req(self.chunked_req)
+                with _lanes_p.chunk_scope(adder, self.chunked_req):
+                    self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
         # #959 THE RESIDENCY FACT, STAMPED WHERE IT IS SETTLED. Both branches
         # above leave `self.chunked_req` final for this pass -- the seam
@@ -16741,8 +16766,14 @@ class Scheduler(
         from flliper.srt.pdflip import hol_overtake as _hol_mod
 
         _hol = _hol_mod.HolPass(self)
+        # PRIORITY LANES 1008 (L3): while the floor stands above a request's lane the rank that owns the admission truth
+        # (PP0 / non-PP; a follower executes PP0's named schedule and never skips by lane) does not admit it. 0 = off.
+        _lane_floor = _lanes_p.floor_for_pass(self) if _lanes_p.owns_admission(self) else 0
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
+            if _lane_floor and _lanes_p.holds(_lanes_p.req_lane(req), _lane_floor):
+                _note_skip("pdflip_lane_held", req.rid)
+                continue
             if _burst_hold is not None:  # fnFL2 H42b: the burst is still assembling
                 _note_skip("pdflip_burst_assembly", req.rid)
                 continue
@@ -17535,10 +17566,11 @@ class Scheduler(
 
             try:
                 _ar_t0 = time.perf_counter()  # xsn325: host cost per admission
-                res = adder.add_one_req(
-                    req,
-                    truncation_align_size=self.truncation_align_size,
-                )
+                with _lanes_p.chunk_scope(adder, req):  # L3: a lower lane's chunk is smaller while a higher lane waits
+                    res = adder.add_one_req(
+                        req,
+                        truncation_align_size=self.truncation_align_size,
+                    )
                 if getattr(self, "_pdflip_post_wake_pass_n", None) is not None:
                     _arl = getattr(self, "_pdflip_gnbp_addreq", None)
                     if _arl is None:
