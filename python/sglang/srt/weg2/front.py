@@ -10908,11 +10908,21 @@ class Front:
         D = self.groups.get("D") if isinstance(self.groups, dict) else None
         if D is None:
             return 0
-        # LANES FIX 1014 (NF 10:29:36-10:30:15Z): a granted SHORT that D PARKED (lane park, PARK-IMMEDIATE) or holds
-        # for RESUME-VIA-P is not prefilling.  D.outstanding kept those rows alive forever (54-149/54-150 parked
-        # by the lane preempt before their first content) -> _dc_d_busy() always True -> every arrival on an idle
-        # D sat the full d_check.  The book reads what D really runs, the same ledger _dc_decoding() reads.
-        return book.pending_tokens(now=time.time(), live=set(self._flip_ledger(D)))
+        # LANES FIX 1014 (NF 10:29:36-10:30:15Z, 10:54:33Z): a granted SHORT that D PARKED (lane park,
+        # PARK-IMMEDIATE), holds for RESUME-VIA-P, or that waits below a raised lane floor is not prefilling.
+        # Counted, it made _dc_d_busy() True on an idle D (54-149/54-150 parked before their first content; the
+        # boot burst 0-2..0-9 held behind lane-1 0-11) -> every arrival sat the full d_check.  Such rows are
+        # skipped (kept: they count again once D runs them).
+        running = set(self._flip_ledger(D))
+        ls = self.__dict__.get("_lane_state_obj")
+        floor = int(getattr(ls, "lane_floor", 0) or 0) if ls is not None else 0
+
+        def _idle(rid: str) -> bool:
+            if rid in D.outstanding and rid not in running:
+                return True
+            return floor > 0 and ls.lane_for(rid) < floor
+
+        return book.pending_tokens(now=time.time(), live=D.outstanding, idle=_idle)
 
     def _d_carried_tokens(self) -> int:
         """X-SUM-PRICE (user 05.10. "pending token werden gesammelt und als
