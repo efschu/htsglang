@@ -129,6 +129,70 @@ def _read_stages(operation) -> dict:
 
 _READ_STAGES_N = [0]
 
+# ---------------------------------------------------------------------------
+# ARENA-CHAIN (NF 14.10. 07:29:33Z, ArenaChainMismatch #1424 on P PP0): REF, THEN RECHECK
+# ---------------------------------------------------------------------------
+# The L3 fill hands out COMPLETE slots with NO reference ("no reference taken yet",
+# ``arena_fill_from_disk``); the reader references them afterwards, and
+# ``arena_ref_slots(+1)`` takes a reference on any COMPLETE *or CLAIMED* slot without
+# looking at its key (arena.c: "#1427 CLAIMED slots take refs too"). In the window
+# between the fill and the reference another rank's full-arena claim runs the clock
+# (>= 256 slots per round) and re-claims the freed slots for ITS stems: the reference
+# then succeeds on a slot that belongs to another page, and the node's rows address
+# that slot until ``verify_load_chain`` kills the rank ("key slot -1 (state 0)").
+# The rule of the Linux page cache (mm/filemap.c: speculative ``folio_try_get`` then
+# re-load the index entry, ``folio_put`` and retry on a mismatch) applies verbatim:
+# first reference, then look the key up again, and keep the reference only where the
+# stem still names THIS slot, COMPLETE. After the reference the clock cannot take the
+# slot any more (it skips refcount != 0), so the check is stable.
+ENV_REF_RECHECK = "SGLANG_WEG2_ARENA_REF_RECHECK"
+_REF_RECHECK_N = [0, 0]  # prefixes cut by the recheck, pages given back
+
+
+def arena_ref_recheck_enabled(env=None) -> bool:
+    """Default ON (``0``/``false``/``no``/``off`` = the read path of before)."""
+    e = os.environ if env is None else env
+    return (e.get(ENV_REF_RECHECK, "") or "").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _arena_first_unproven(arena, stems, idxs, slots):
+    """``(position, (found_slot, found_state))`` of the first page (position in
+    ``idxs``) whose stem no longer names the slot that was just referenced for it as a
+    COMPLETE slot; ``(-1, None)`` = every page still proven. ONE ``find`` over the
+    referenced pages."""
+    import numpy as _np
+
+    n = len(idxs)
+    if n == 0:
+        return -1, None
+    fs, st = arena.find_slots_np([stems[int(i)] for i in idxs])
+    fs = _np.asarray(fs, dtype=_np.int64)
+    st = _np.asarray(st)
+    if int(fs.shape[0]) != n:  # a find that answers another count proves nothing: nothing is proven
+        return 0, (-1, 0)
+    ok = (fs == _np.asarray(slots, dtype=_np.int64)) & (st == 2)
+    bad = _np.flatnonzero(~ok)
+    if not bad.size:
+        return -1, None
+    b = int(bad[0])
+    return b, (int(fs[b]), int(st[b]))
+
+
+def _arena_note_recheck_cut(where: str, page: int, stem: str, slot: int, found, given_back: int) -> None:
+    _REF_RECHECK_N[0] += 1
+    _REF_RECHECK_N[1] += int(given_back)
+    k = _REF_RECHECK_N[0]
+    if k <= 16 or (k & (k - 1)) == 0:
+        logger.warning(
+            "#1424 ARENA-REF RECHECK CUT n=%d where=%s page=%d stem=%s slot=%d found=(slot=%d,state=%d) "
+            "given_back=%d total_given_back=%d: the reference took a slot that no longer holds this page's "
+            "key (cleared and re-claimed between the find/fill and the reference); the references from this "
+            "page on are returned and the read's prefix ends here -- the page is read again, never loaded "
+            "from another page's slot",
+            k, where, int(page), str(stem)[:48], int(slot), int(found[0]), int(found[1]), int(given_back),
+            _REF_RECHECK_N[1])
+
+
 
 def _read_stages_line(operation, total_ms: float) -> None:
     """One ``WEG2-READ-STAGES`` line per read (the first 16, then every read
@@ -3741,6 +3805,7 @@ class HiCacheController:
         _fs, _st = pool.arena.find_slots_np(stems)  # Posten 2 (18.09.): numpy, no 520k-tuple list
         _rs = _read_stages(operation)
         _rs["find"] = _rs.get("find", 0.0) + (time.perf_counter() - _t0) * 1000.0
+        _recheck = arena_ref_recheck_enabled()  # ARENA-CHAIN: reference, then look the key up again
         _ta = time.perf_counter()
         # #257 (a): pages the probe HOLDS are read from the held slot -- the
         # probe's reference becomes the read's, no second reference is taken
@@ -3769,6 +3834,26 @@ class HiCacheController:
             _need = _fs[:lead][~_hm[:lead]]
             got = pool.arena.ref_slots_np(_need, +1) if _need.size else 0
             if got == int(_need.size):
+                if _recheck and _need.size:
+                    # ARENA-CHAIN: a reference takes any COMPLETE or CLAIMED slot, key unseen -- the
+                    # key must still name this slot, COMPLETE, or the page is not ours
+                    _li = _np.flatnonzero(~_hm[:lead])
+                    _bp, _fd = _arena_first_unproven(pool.arena, stems, _li, _fs[_li])
+                    if _bp >= 0:
+                        _cut = int(_li[_bp])
+                        _back = _fs[_cut:lead][~_hm[_cut:lead]]
+                        pool.arena.ref_slots_np(_back, -1)
+                        _arena_note_recheck_cut("lead", _cut, stems[_cut], int(_fs[_cut]), _fd, int(_back.size))
+                        # the pages from the cut on were found before whatever moved them: find them again
+                        # (a fill below reads them from the L3 when they are gone, a fresh find refs them
+                        # once more -- and is rechecked once more)
+                        _fs = _np.asarray(_fs, dtype=_np.int64).copy()
+                        _st = _np.asarray(_st).copy()
+                        _f2, _s2 = pool.arena.find_slots_np(list(stems[_cut:]))
+                        _nh = ~_hm[_cut:]
+                        _fs[_cut:][_nh] = _np.asarray(_f2, dtype=_np.int64)[_nh]
+                        _st[_cut:][_nh] = _np.asarray(_s2)[_nh]
+                        lead = _cut
                 slots = _fs[:lead].tolist()
             else:
                 pool.arena.ref_slots_np(_need, -1)  # undo the partial refs, take the slow path
@@ -3800,6 +3885,19 @@ class HiCacheController:
                 _end = i  # evicted between find and ref: the prefix ends here
                 break
             _need.append(i)
+        if _recheck and _pre:
+            # ARENA-CHAIN: the pages found past the lead and referenced ahead of the fill (EG review (b)):
+            # the fill's arena-full clock cannot take them, but the clock of ANOTHER rank could have, between
+            # the find and the reference -- the key must still name the slot
+            _pi = sorted(_pre)
+            _bp, _fd = _arena_first_unproven(pool.arena, stems, _pi, [_pre[i] for i in _pi])
+            if _bp >= 0:
+                _cut = _pi[_bp]
+                _back = [_pre.pop(i) for i in _pi[_bp:]]
+                pool.arena.ref_slots_np(_np.asarray(_back, dtype=_np.int64), -1)
+                _arena_note_recheck_cut("pre", _cut, stems[_cut], int(_back[0]), _fd, len(_back))
+                _end = min(_end, _cut)
+                _need = [i for i in _need if i < _end]
         _fills = {}
         _tf = time.perf_counter()
         if _need:
@@ -3810,6 +3908,7 @@ class HiCacheController:
         _tf1 = time.perf_counter()
         _rs["l3fill"] = _rs.get("l3fill", 0.0) + (_tf1 - _tf) * 1000.0
         _rs["l3fill_pages"] = _rs.get("l3fill_pages", 0) + len(_need)
+        _fill_idx = []
         for i in range(lead, _end):
             if _hm[i]:
                 slots.append(int(_fs[i]))  # #257: held since the probe
@@ -3822,6 +3921,20 @@ class HiCacheController:
             if fill is None or pool.arena.ref_slots([fill], +1) != 1:
                 break  # not on disk / evicted between fill and ref: the prefix ends here
             slots.append(fill)
+            _fill_idx.append(i)
+        if _recheck and _fill_idx:
+            # ARENA-CHAIN (NF 14.10. 07:29:33Z, P PP0): the fill hands the slots out WITHOUT a reference; between
+            # the fill and this reference another rank's full-arena claim (>= 256 slots per clock round) can have
+            # cleared and re-claimed them, and the reference above takes a CLAIMED slot of another stem without a
+            # key check. Look the stems up again: only a slot the stem still names, COMPLETE, is kept.
+            _bp, _fd = _arena_first_unproven(pool.arena, stems, _fill_idx, [slots[i] for i in _fill_idx])
+            if _bp >= 0:
+                _cut = _fill_idx[_bp]
+                _back = [slots[j] for j in range(_cut, len(slots)) if not _hm[j]]
+                if _back:
+                    pool.arena.ref_slots_np(_np.asarray(_back, dtype=_np.int64), -1)
+                _arena_note_recheck_cut("fill", _cut, stems[_cut], int(slots[_cut]), _fd, len(_back))
+                del slots[_cut:]
         if _pre:
             # referenced ahead, past where the prefix ended: given back
             pool.arena.ref_slots_np(_np.asarray(list(_pre.values()), dtype=_np.int64), -1)

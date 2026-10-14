@@ -102,9 +102,14 @@ def _arena_ctl(found):
     from sglang.srt.managers import cache_controller as cc
 
     class _A:
+        # ARENA-CHAIN (14.10.): the read looks the stems up again after the reference -- answer by stem, and let the
+        # fill below complete the page under its stem
+        by_stem = {"s%d" % i: (s, t) for i, (s, t) in enumerate(found)}
+
         def find_slots_np(self, stems):
-            return (np.asarray([s for s, _ in found], dtype=np.int64),
-                    np.asarray([t for _, t in found], dtype=np.int8))
+            got = [self.by_stem.get(st, (-1, 0)) for st in stems]
+            return (np.asarray([s for s, _ in got], dtype=np.int64),
+                    np.asarray([t for _, t in got], dtype=np.int8))
 
         def ref_slots_np(self, a, d):
             return len(a)
@@ -112,8 +117,16 @@ def _arena_ctl(found):
         def ref_slots(self, s, d):
             return 1
 
-    backend = types.SimpleNamespace(arena_fill_from_disk=lambda ar, st, nb, prefix=False: [900 + i for i in range(len(st))])
-    pool = types.SimpleNamespace(arena_read=True, arena=_A(), _page_bytes=64,
+    arena = _A()
+
+    def _fill(ar, st, nb, prefix=False):
+        out = [900 + i for i in range(len(st))]
+        for stem, slot in zip(st, out):
+            arena.by_stem[stem] = (slot, 2)
+        return out
+
+    backend = types.SimpleNamespace(arena_fill_from_disk=_fill)
+    pool = types.SimpleNamespace(arena_read=True, arena=arena, _page_bytes=64,
                                  ensure_bound=lambda be, role: True, resolve_rows=lambda hi, s: None)
     ctl = types.SimpleNamespace(mem_pool_host=pool, storage_backend=backend, page_size=1)
     op = types.SimpleNamespace(probe_pins=None, completed_tokens=0, n=0, request_id="r1")

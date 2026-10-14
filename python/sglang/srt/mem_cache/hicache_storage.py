@@ -3693,9 +3693,17 @@ class HiCacheFile(HiCacheStorage):
             _theirs = {int(j[0]) for j in joined} | {int(f[0]) for f in still_full} | set(_being_written)
             _hard = next((i for i, _st in cand
                           if out[i] is None and i not in _mine and i not in _theirs), n)
-            _past = [t[1] for t in todo if t[0] > _hard]
-            if _past:
-                _free_named(arena, _past, "l3fill_past_prefix")
+            _past_t = [t for t in todo if t[0] > _hard]
+            if _past_t:
+                # ARENA-CHAIN (NF 14.10. 07:29:33Z): freed by GENERATION, like l3fill_complete_refused below and
+                # #1427r on D. ``free_slots`` frees a slot in ANY state -- a claim another rank joined and completed
+                # meanwhile went with it, together with the page a reader had found COMPLETE; free_if_gen only
+                # gives up a slot that is still this fill's CLAIMED claim under the generation it took.
+                _fg_past = getattr(arena, "free_if_gen", None)
+                if callable(_fg_past):
+                    _fg_past([t[1] for t in _past_t], [t[2] for t in _past_t], reason="l3fill_past_prefix")
+                else:
+                    _free_named(arena, [t[1] for t in _past_t], "l3fill_past_prefix")
                 todo = [t for t in todo if t[0] < _hard]
         stats = {"filled": 0, "todo": 0, "threads": 0}
         self._arena_fill_read_todo(arena, todo, int(total_bytes), out, stats)

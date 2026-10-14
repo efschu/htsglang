@@ -135,16 +135,21 @@ def test_the_parallel_read_equals_the_serial_read(tmp_path, monkeypatch):
 
 
 class _PoolArena:
-    """The pool's arena as _arena_page_get sees it: find/ref over fixed state."""
+    """The pool's arena as _arena_page_get sees it: find/ref over fixed state.
+
+    ARENA-CHAIN (14.10.): the read looks the stems up AGAIN after a reference (the key must still name the slot),
+    so the double answers by stem ("s<i>" -> (slot, state)) and learns the slots a fill completes."""
 
     def __init__(self, found, evicted=()):
         self.found = found
+        self.by_stem = {"s%d" % i: (s, t) for i, (s, t) in enumerate(found)}
         self.evicted = set(evicted)
         self.refs = []
 
     def find_slots_np(self, stems):
-        return (np.asarray([s for s, _ in self.found], dtype=np.int64),
-                np.asarray([t for _, t in self.found], dtype=np.int8))
+        got = [self.by_stem.get(st, (-1, 0)) for st in stems]
+        return (np.asarray([s for s, _ in got], dtype=np.int64),
+                np.asarray([t for _, t in got], dtype=np.int8))
 
     def ref_slots_np(self, a, delta):
         a = [int(x) for x in a]
@@ -170,6 +175,9 @@ def _controller(found, fill_ok, evicted=()):
         fills.append(list(stems))
         seen_refs.append(list(arena.refs))
         out = [1000 + int(st[1:]) if int(st[1:]) in fill_ok else None for st in stems]
+        for st, o in zip(stems, out):
+            if o is not None:
+                arena.by_stem[st] = (o, 2)  # the fill completed the page under its stem
         if prefix and None in out:  # the storage stops at the first gap
             k = out.index(None)
             out[k:] = [None] * (len(out) - k)
