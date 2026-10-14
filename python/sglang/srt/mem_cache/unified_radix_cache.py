@@ -5887,9 +5887,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             pool = _w3_anchor_spill_pool(pool)
             if pool is None:
                 return 0
-        if _r12.role() is not None:
+        if _r12.role() is not None and not (
+            envs.SGLANG_WEG2_W3_SPILL_FORM_A_CUT.get() and _r12.cut_role() is not None
+        ):
             # Form A: a worker's host rows mirror TP0's verdicts (R12); the
-            # spill stays on the groups without the shadow protocol
+            # spill stays on the groups without the shadow protocol.
+            # LANEPARK-YIELD-1014: under the token cut a worker's host rows ARE
+            # the page's bytes (R12 (d)) and the group-equal arena order below
+            # decides on every rank alike -- the spill runs there.
             return 0
         now = time.monotonic()
         if now < getattr(self, "_w3_spill_quiet_until", 0.0):
@@ -5972,6 +5977,25 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 k, int(need_pages), released, spilled, len(cands), secured, written, lost,
                 self._w3_spill_ref_free(pool, released_slots))
         return released
+
+    def weg2_spill_for_read(self, need_pages: int) -> int:
+        """LANEPARK-YIELD-1014: room in the arena for a store read that ended
+        short of what the store holds (NF h16 weg2-8-68: L3-FILL ROOM-WAIT
+        stems=730 claimed=0 four times while the lane park's retained spans,
+        still on the device, held 5840 of 6485 slots as host copies). The W3
+        spill releases such copies (L3 copy first) so the re-issued read can
+        claim. Called on the scheduler thread, on every rank of the group (the
+        drain's group-synced record); 0 when there is no arena or nothing to
+        release."""
+        if int(need_pages) <= 0:
+            return 0
+        try:
+            pool = self._weg2_direct_pool()
+        except Exception:  # noqa: BLE001 - no pool readable: nothing to spill
+            return 0
+        if pool is None:
+            return 0
+        return int(self._w3_arena_spill(pool, int(need_pages), claimer=None) or 0)
 
     def _w3_spill_keys(self, pool, nodes) -> "_W3SpillKeys":
         """The group-equal order of spill candidates (see ``_w3_arena_spill``):
