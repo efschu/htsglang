@@ -106,6 +106,7 @@ logger = logging.getLogger(__name__)
 
 from flliper.srt.managers.pdflip_pass_timer import read_ms as _pt_read
 from flliper.srt.managers import pdflip_p_overlap as _pov
+from flliper.srt.pdflip import pp_void_pass as _pp_void_pass  # FIXES Nr. 45: group-wide void pass (void proxy frame)
 
 
 def _1463_timed(attr: str):
@@ -4716,6 +4717,8 @@ class SchedulerPPMixin:
                 # agree on. See `_pp_void_own_batch` (the incoming-wire twin
                 # was deleted with the void relay, #1072).
                 self._pp_note_chunked_req_before_admission(mb_id)
+                # FIXES Nr. 45: the waiting queue's order before this pass's plan (a void restores it on every rank)
+                _pp_void_pass.snapshot_queue(self)
                 # #947 THE RING SITE, and the whole reason this instrument
                 # exists. This line runs on EVERY iteration of the PP body --
                 # voided ones included -- and `get_next_batch_to_run` directly
@@ -5101,6 +5104,9 @@ class SchedulerPPMixin:
                 # before #798 for that reason alone; it acts on nothing.
                 _1000_upstream_moved_on(self, mb_id)
                 self._pp_void_pass_without_upstream_launch(mb_id)
+                # FIXES Nr. 45 PP-VOID-PASS: a load-back refusal on the carrierless form discards the whole planned pass HERE
+                # (own-void + the slot's frame becomes a void frame), before anything of it is sent or launched.
+                _pp_void_pass.after_plan(self, mb_id)
 
                 # #795 PP ADMISSION UNIFORMITY, RELOCATED: emit/forward this
                 # pass's admission decision HERE, immediately after
@@ -5267,16 +5273,26 @@ class SchedulerPPMixin:
                 # neither state is constructible: nothing is owed unless the
                 # sender has a batch, and then it always sends.
                 pp_proxy_tensors = None
-                if cur_batch:
+                if cur_batch or _pp_void_pass.owes_frame(self):
                     # #631 ROW AUTHORITY: on a row-driven pass the frame was
                     # already taken BEFORE the plan (it is what the plan was
                     # built from); receiving again here would consume the NEXT
                     # pass's frame -- the corpse-R dual (two consumes against
                     # a debt of one).
-                    pp_proxy_tensors = (
-                        _pre_proxy
-                        if _pre_proxy is not None
-                        else self._pp_recv_proxy_tensors(mb_id)
+                    #
+                    # FIXES Nr. 45: the frame of this slot is the group's common abort point. A VOID frame discards the
+                    # pass here on every stage that holds a batch for it (cur_batch -> None, no launch, the same statement is
+                    # owed to the next stage); a stage that unwound its own plan still takes the frame it owes (one frame
+                    # per pass, never a second blocking receive against a debt of one).
+                    cur_batch, pp_proxy_tensors = _pp_void_pass.at_receive(
+                        self,
+                        mb_id,
+                        cur_batch,
+                        lambda: (
+                            _pre_proxy
+                            if _pre_proxy is not None
+                            else self._pp_recv_proxy_tensors(mb_id)
+                        ),
                     )
                 next_pp_outputs = None
                 next_batch_result = None
@@ -5733,6 +5749,23 @@ class SchedulerPPMixin:
                             )
                         if _pov.p_host_overlap_on():
                             _pov.note_proxy_send(self, self.send_proxy_work)
+                    else:
+                        # FIXES Nr. 45: no batch but a void statement: the next stage waits for a frame in this slot --
+                        # the void frame is that frame (no tensors, the ordinary stamp).
+                        _pp_void_pass.send_owed_frame(
+                            self,
+                            mb_id,
+                            lambda _frame, _mb: setattr(
+                                self,
+                                "send_proxy_work",
+                                self._pp_send_dict_to_next_stage(
+                                    _frame,
+                                    async_send=True,
+                                    msg_type="proxy",
+                                    stamp=self._pp_proxy_stamp(_mb, None),
+                                ),
+                            ),
+                        )
                 elif cur_batch and _pov.p_host_overlap_on():
                     # P-HOST-OVERLAP (pdflip_p_overlap.py, item 2): THE LAST RANK
                     # FENCES ITS SCHEDULE STREAM ON THIS FORWARD, device-side,
@@ -5756,6 +5789,9 @@ class SchedulerPPMixin:
                 # i.e. across a whole sleep served at the top of the next pass.
                 result = None
                 self.pp_outputs = next_pp_outputs
+                if self.pp_group.is_last_rank:
+                    # FIXES Nr. 45: the last stage owes nobody a frame (and sends no output for a slot without a batch)
+                    _pp_void_pass.take_out(self)
 
                 # #788: flush THIS pass's request-chain send only after
                 # everything else this rank owed its peers this iteration is
@@ -11047,6 +11083,12 @@ class SchedulerPPMixin:
         # entry SURVIVES THE WIRE; it does not show one is safe to compute
         # on.
         stamp = raw.pop("__stamp__", None) if isinstance(raw, dict) else None
+        # FIXES Nr. 45 PP-VOID-PASS: a VOID frame (the upstream stage discarded this pass) carries no hidden states. The
+        # statement is popped here (before anything maps over the dict); the identity check below (slot, epoch) judges the
+        # void frame like any frame, and only after it the statement is handed to the event loop
+        # (`_pp_void_pass.take_incoming`) and `None` is returned -- a void frame is only ever taken by `at_receive`, whose
+        # caller does not launch on it.
+        _void_stmt = _pp_void_pass.pop_from_frame(raw)
         # #968/#1035 POPPED UNDER THE SAME LAW AS THE STAMP ABOVE, and for the
         # identical reason: what stays in `raw` becomes a PPProxyTensors and is
         # mapped over by the slice path (`v[key]` for EVERY entry) and by the
@@ -11177,6 +11219,10 @@ class SchedulerPPMixin:
         # identity across a cutover.
         epoch = pp_flip_epoch_of(self)
         if stamp is None or mb_id < 0 or pp_proxy_stamp_names_pass(stamp, mb_id, epoch):
+            if _void_stmt is not None:
+                self._pp_last_recv_admission_decision = None
+                _pp_void_pass.note_incoming(self, _void_stmt)
+                return None
             # #791c: THE STAMP IS RIGHT AND THE MESSAGE IS STILL WRONG. Every
             # identity above answers "which PASS is this from"; none answers
             # "which BATCH is it of". A retraction this rank performed at the

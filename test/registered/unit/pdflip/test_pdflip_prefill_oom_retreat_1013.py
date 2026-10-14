@@ -105,7 +105,9 @@ def _adder(new_chunked=None):
 class RetreatTest(unittest.TestCase):
     def setUp(self):
         self._env = {k: os.environ.get(k) for k in (R.ENV, R.ENV_RETRIES, R.ENV_FAST_ABORT, R.GROUP_ENV, "FLLIPER_PDFLIP_PARK",
-                                                    "FLLIPER_PP_ROW_AUTHORITY")}
+                                                    "FLLIPER_PP_ROW_AUTHORITY", "FLLIPER_PDFLIP_PP_VOID_PASS_ENABLE")}
+        # Nr. 43 tests: the ROW form and the old refusals of the carrierless form. The void-pass FRAME form (Nr. 45) has its own file.
+        os.environ["FLLIPER_PDFLIP_PP_VOID_PASS_ENABLE"] = "0"
         os.environ.pop("FLLIPER_PP_ROW_AUTHORITY", None)
         os.environ.pop(R.ENV_FAST_ABORT, None)
         os.environ[R.GROUP_ENV] = "P"
@@ -508,7 +510,8 @@ def _short(**kw):
 class LoadBackRetreatTest(unittest.TestCase):
     def setUp(self):
         self._env = {k: os.environ.get(k) for k in (R.ENV, R.ENV_RETRIES, R.ENV_HOLD, R.ENV_FAST_ABORT, R.GROUP_ENV,
-                                                    "FLLIPER_PP_ROW_AUTHORITY")}
+                                                    "FLLIPER_PP_ROW_AUTHORITY", "FLLIPER_PDFLIP_PP_VOID_PASS_ENABLE")}
+        os.environ["FLLIPER_PDFLIP_PP_VOID_PASS_ENABLE"] = "0"  # Nr. 43 form; the void-pass FRAME form (Nr. 45) has its own file
         os.environ[R.GROUP_ENV] = "P"
         for k in (R.ENV, R.ENV_RETRIES, R.ENV_HOLD, R.ENV_FAST_ABORT, "FLLIPER_PP_ROW_AUTHORITY"):
             os.environ.pop(k, None)
@@ -954,7 +957,7 @@ class SourceMutantsTest(unittest.TestCase):
                       "test_a_pending_abort_on_a_last_chunk_is_taken_back_without_a_second_answer"])
 
     def test_mk_the_retreat_ignores_the_form(self):
-        self._killed("    if not followers_execute_row(sched):\n        return False, \"no_row_carrier\"\n", "",
+        self._killed("    elif not followers_execute_row(sched) and not frame_ok:\n        return False, \"no_row_carrier\"\n", "",
                      ["test_carrierless_the_typed_exception_propagates_and_nothing_of_the_pass_is_touched"])
 
     def test_mb_the_aborted_continuation_is_not_marked_pending(self):
@@ -970,7 +973,7 @@ class SourceMutantsTest(unittest.TestCase):
                      ["test_the_continuation_is_parked_in_place_and_the_pass_is_voided"])
 
     def test_me_the_aborted_continuation_is_offered_to_the_rows_back_park(self):
-        self._killed("_park_in_place(carried, flag=not (v == ABORT and blamed is carried))", "_park_in_place(carried)",
+        self._killed("_park_in_place(carried, flag=not (v == ABORT and blamed is carried) and not frame)", "_park_in_place(carried)",
                      ["test_an_aborted_continuation_is_not_parked_rows_back_and_is_never_answered_twice"])
 
     def test_mf_a_pending_abort_is_answered_again(self):

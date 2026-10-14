@@ -60,6 +60,14 @@ A write-through in flight is the candidate for the transient form of this wall (
 it frees the leaf within a few hundred ms, which is shorter than N back-to-back passes. So while a write-through is in flight
 the N retreats do not end in a 503 before ``FLLIPER_PDFLIP_PREFILL_OOM_HOLD_S`` (default 5 s) have passed since the first one.
 
+THE CARRIERLESS FORM (NF group P today) -- FIXES Nr. 45, :mod:`flliper.srt.pdflip.pp_void_pass`. There the retreat is taken too,
+but as a GROUP-WIDE VOID PASS: the rank that cannot pay unwinds its plan and the slot's proxy frame becomes a VOID FRAME
+(``pp_void_pass``) that every stage executes at its receive, before its launch; a load-back refusal discards the whole planned
+pass (the followers would admit the skipped request themselves). A follower that raises first unwinds its plan the same way and
+takes the frame it owes (void frame = consistent; real frame = ``VoidPassLate``, stop by name). The N-then-503 verdict stays
+PP0's alone (ORIGIN-ABORT on the request wire). Switch ``FLLIPER_PDFLIP_PP_VOID_PASS_ENABLE`` (default on); off, the carrierless form is
+refused as it was (``NOT TAKEN (no_row_carrier)``).
+
 Switch ``FLLIPER_PDFLIP_PREFILL_OOM_RETREAT`` (default on; ``0`` = the raise of before)."""
 
 from __future__ import annotations
@@ -240,17 +248,26 @@ def followers_execute_row(sched) -> bool:
 
 
 def applies(sched, adder=None, can_run_list=()) -> Tuple[bool, str]:
-    """(True, '') when this seat may retreat; else (False, why) and the caller re-raises."""
+    """(True, '') when this seat may retreat; else (False, why) and the caller re-raises.
+
+    Two forms: the ROW form (PP0 only; no frame = nothing planned, Nr. 43) and the FRAME form (carrierless group P: the void
+    frame of ``pp_void_pass`` carries the retreat to the followers; PP0 AND the followers may unwind their own plan)."""
     if not enabled():
         return False, "switch_off"
     if str(os.environ.get(GROUP_ENV, "")).strip().upper() != "P":
         return False, "not_group_p"
     ps = getattr(sched, "ps", None)
-    if ps is None or int(getattr(ps, "pp_rank", 0) or 0) != 0:
+    if ps is None:
         return False, "not_pp0"
     if int(getattr(ps, "tp_size", 1) or 1) != 1:
         return False, "tp_group"
-    if not followers_execute_row(sched):
+    from flliper.srt.pdflip import pp_void_pass as _vp
+
+    frame_ok = _vp.frame_carrier(sched)[0]
+    if int(getattr(ps, "pp_rank", 0) or 0) != 0:
+        if not frame_ok:
+            return False, "not_pp0"
+    elif not followers_execute_row(sched) and not frame_ok:
         return False, "no_row_carrier"
     from flliper.srt.pdflip.pp_slot_fidelity import FLOOR_LOCAL_PP_ATTR
 
@@ -265,6 +282,17 @@ def applies(sched, adder=None, can_run_list=()) -> Tuple[bool, str]:
     if getattr(sched, "anchor_tails", None):
         return False, "anchor_tails"
     return True, ""
+
+
+def frame_form(sched) -> bool:
+    """True when the retreat of this seat rides the void frame (carrierless P). Only meaningful after ``applies``."""
+    from flliper.srt.pdflip import pp_void_pass as _vp
+
+    return _vp.frame_carrier(sched)[0]
+
+
+def _rank(sched) -> int:
+    return int(getattr(getattr(sched, "ps", None), "pp_rank", 0) or 0)
 
 
 def _inflight(sched) -> bool:
@@ -386,6 +414,20 @@ def _answer_abort(sched, req, message: str, *, queued_elsewhere: bool) -> None:
         logger.warning("%s rid=%s: releasing the store read raised", MARK, req.rid, exc_info=True)
 
 
+def _frame_void(sched, *, cause: str, rid, need, free, count: int, abort: bool) -> None:
+    """FRAME form: the retreat is a statement for the whole group (``pp_void_pass``). PP0 owes it on the slot's frame; a
+    follower that unwound its own plan owes itself the frame of the slot (void = consistent, real = stop by name)."""
+    from flliper.srt.pdflip import pp_void_pass as _vp
+
+    stmt = _vp.make_statement(sched, cause=cause, rid=rid, need=need, free=free, tries=count, abort=abort)
+    if _rank(sched) == 0:
+        _vp.set_out(sched, stmt)
+        _vp.log_marker(sched, stmt, "origin")
+    else:
+        _vp.owe_frame(sched, stmt)
+        _vp.log_marker(sched, stmt, "follower-first")
+
+
 def retreat(sched, exc, new_batch, can_run_list: List[Any], adder, carried_before=None) -> bool:
     """Take the pass back. True = retreated (the caller returns ``None, running_batch``); False = out of scope or the
     retreat itself failed -- the caller re-raises ``exc`` and the rank dies as before.
@@ -401,6 +443,7 @@ def retreat(sched, exc, new_batch, can_run_list: List[Any], adder, carried_befor
             logger.error("%s NOT TAKEN (%s): the typed Prefill-out-of-memory propagates -- need=%d free=%d "
                          "evictable_paid=%d", MARK, why, exc.need, exc.free, exc.evictable_paid)
         return False
+    frame = frame_form(sched)
     ledger = getattr(sched, "_pdflip_prefill_oom_ledger", None)
     if ledger is None:
         ledger = sched._pdflip_prefill_oom_ledger = RetreatLedger()
@@ -426,6 +469,8 @@ def retreat(sched, exc, new_batch, can_run_list: List[Any], adder, carried_befor
             _park_in_place(carried, flag=False)
             logger.warning("%s rid=%s need=%d free=%d evictable_paid=%d: the pass is taken back, the abort is pending",
                            MARK, carried.rid, exc.need, exc.free, exc.evictable_paid)
+            if frame:
+                _frame_void(sched, cause="prefill_oom", rid=carried.rid, need=exc.need, free=exc.free, count=0, abort=True)
             return True
         except Exception:  # noqa: BLE001
             logger.exception("%s FAILED for rid=%s: the original Prefill-out-of-memory is re-raised", MARK, carried.rid)
@@ -439,6 +484,8 @@ def retreat(sched, exc, new_batch, can_run_list: List[Any], adder, carried_befor
         elapsed=ledger.elapsed(blamed.rid) if blamed is not None else 0.0, hold=hold_s(),
         wt_inflight=_wt_inflight(sched), fast_abort=fast_abort_enabled(),
     )
+    if _rank(sched) != 0:
+        v, vwhy = RETRY, ""  # the 503 is the origin's verdict alone (ORIGIN-ABORT on the request wire); a follower only unwinds
     try:
         _void_decision(sched, can_run_list)
         if carried is not None:
@@ -451,7 +498,10 @@ def retreat(sched, exc, new_batch, can_run_list: List[Any], adder, carried_befor
                 carried.inflight_middle_chunks -= 1  # counted for a chunk that never launched
             # an aborted continuation is NOT offered to the head-of-step rows-back park: that park would requeue it
             # while the abort of the other stages still has to land (a W27 split of PP0 against the followers)
-            _park_in_place(carried, flag=not (v == ABORT and blamed is carried))
+            # FRAME form: no rows-back flag. ``process_pending_pdflip_park`` would give PP0's rows back and requeue the
+            # continuation on PP0 ALONE, while the followers keep it as their chunked request (their own-void parks without
+            # the flag): a rank split. The followers' state after the void is the in-place park, and so is PP0's.
+            _park_in_place(carried, flag=not (v == ABORT and blamed is carried) and not frame)
             if v == ABORT and blamed is carried:
                 carried._pdflip_oom_abort_pending = True
         if new_chunked is not None and chunked is new_chunked:
@@ -465,7 +515,14 @@ def retreat(sched, exc, new_batch, can_run_list: List[Any], adder, carried_befor
                 continue
             _give_back_fresh(sched, req)
             given_back.append(req)
-        _requeue_front(sched, given_back)
+        if frame:
+            # FRAME form: the followers' own-void parks at the tail and every rank restores the pre-plan order (the void is
+            # "the pass never happened"); a front-move here would be a PP0-only order -- a rank split next pass
+            from flliper.srt.pdflip import pp_void_pass as _vp
+
+            _vp.restore_queue_order(sched)
+        else:
+            _requeue_front(sched, given_back)
         if v == ABORT and blamed is not None:
             ledger.aborts += 1
             _rem = _remaining_need(blamed)
@@ -485,6 +542,9 @@ def retreat(sched, exc, new_batch, can_run_list: List[Any], adder, carried_befor
                 "continuation parked in place" if carried is not None else
                 "fresh request(s) given back to the queue",
             )
+        if frame:
+            _frame_void(sched, cause="prefill_oom", rid=getattr(blamed, "rid", "?"), need=exc.need, free=exc.free,
+                        count=count, abort=(v == ABORT))
         return True
     except Exception:  # noqa: BLE001 -- a retreat that cannot complete must not leave a half state alive
         logger.exception("%s FAILED for rid=%s: the original Prefill-out-of-memory is re-raised",
@@ -521,6 +581,16 @@ def retreat_loadback(sched, exc, req, adder) -> Optional[str]:
         )
         terms = types.SimpleNamespace(need=exc.kv_tokens, free=exc.avail_after, evictable_reported=exc.evictable,
                                       evictable_paid=exc.evicted)
+        if _rank(sched) != 0:
+            v, vwhy = RETRY, ""  # a follower only unwinds; the 503 is the origin's verdict alone
+        if frame_form(sched):
+            # FRAME form: the followers plan from their own queue and would admit and load back what PP0 skips -- the WHOLE
+            # pass is discarded after the plan (``pp_void_pass.after_plan``), not only this request
+            from flliper.srt.pdflip import pp_void_pass as _vp
+
+            setattr(sched, _vp.AFTER_PLAN_ATTR, _vp.make_statement(
+                sched, cause=_vp.CAUSE_LOADBACK, rid=req.rid, need=exc.kv_tokens, free=exc.avail_after, tries=count,
+                abort=(v == ABORT)))
         if v != ABORT:
             logger.warning(
                 "%s rid=%s need=%d free=%d evictable_paid=%d retries=%d (of %d) where=loadback agreed=%d "
@@ -541,6 +611,12 @@ def retreat_loadback(sched, exc, req, adder) -> Optional[str]:
         return ABORT
     except Exception:  # noqa: BLE001 -- a retreat that cannot complete must not leave a half state alive
         logger.exception("%s FAILED where=loadback rid=%s: AgreedRoomShort is re-raised", MARK, getattr(req, "rid", "?"))
+        try:
+            from flliper.srt.pdflip import pp_void_pass as _vp
+
+            setattr(sched, _vp.AFTER_PLAN_ATTR, None)  # the pass is not discarded: the rank stops as before
+        except Exception:  # noqa: BLE001
+            pass
         return None
 
 
