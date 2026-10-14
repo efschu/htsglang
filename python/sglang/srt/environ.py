@@ -1135,6 +1135,16 @@ class Envs:
     # canonical page identity, equal on every rank), then the node id. No
     # collective, no reserve. Off = the node-id order, byte for byte.
     SGLANG_WEG2_W3_SPILL_GROUP_ORDER = EnvBool(True)
+    # LANEPARK-YIELD-1014 (NF h16 a2cfc77f76, D TP0): the W3 arena spill (host copies of DEVICE-resident
+    # nodes leave L2 after their L3 copy) never ran on group D -- it returned 0 under every Form A role.
+    # Under the token cut every rank's host rows are real arena bytes and the spill's group-equal arena order
+    # decides alike on every rank, so the guard has no ground there. 15:27:38 the lane park's forced
+    # write-through put 5 retained lane-0 spans into the arena (park_kept=5840 of 6485), the lane-1 read of
+    # weg2-8-68 found it FULL (L3-FILL ROOM-WAIT stems=730 claimed=0, 4 x 5 s); 15:32:44 every backup of the
+    # parked spans was refused (#1421 arena_claim / parent_unbacked) -> D-WALL-HEAD payable_evictable=0 -> W50
+    # for weg2-10-90. On: the spill runs on a Form A group under the token cut, at a refused claim and before
+    # a store read that ended short of what the store holds is re-issued. Off: the old guard.
+    SGLANG_WEG2_W3_SPILL_FORM_A_CUT = EnvBool(True)
     # WAKE-READ-SEAT-GATE (NF arena fix 14.10.): the #248f gate held hold reads
     # up to the whole KV arena (6466 of 6485 pages pinned, 231 CAPACITY-WAIT in
     # one boot) -- D's own retain/park backup and its L3 fills found no slot.

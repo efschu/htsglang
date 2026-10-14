@@ -15506,6 +15506,21 @@ class Scheduler(
                 "record reports a page-floored shortfall",
                 rid, delivered, deliverable, deliverable - delivered, n,
             )
+        if deliverable > delivered and envs.SGLANG_WEG2_W3_SPILL_FORM_A_CUT.get():
+            # LANEPARK-YIELD-1014 (NF h16 weg2-8-68): the store HOLDS the rest;
+            # the read ended short because the arena had no room for the L3 fill
+            # (L3-FILL ROOM-WAIT stems=730 claimed=0, 4 x 5 s). Make room for the
+            # re-issue now: host copies of device-resident nodes leave L2 (each
+            # with its L3 copy first). Every rank runs this on the same synced
+            # record; the spill's arena order is group-equal.
+            _spill = getattr(getattr(self, "tree_cache", None), "weg2_spill_for_read", None)
+            if callable(_spill):
+                try:
+                    _pg = max(1, int(getattr(self.tree_cache, "page_size", 1) or 1))
+                    _spilled = _spill(-(-(deliverable - delivered) // _pg))
+                    req._weg2_read_spilled = int(getattr(req, "_weg2_read_spilled", 0) or 0) + int(_spilled)
+                except Exception:  # noqa: BLE001 - room-making never breaks the drain
+                    logger.warning("LANEPARK-YIELD read spill failed rid=%s", rid, exc_info=True)
         return self._apply_prefetch_deferral(req, _VERDICT_STORE_SHORT, site="drain")
 
     def _prefetch_done_for(self, req: Req, drained: Dict[str, bool]) -> bool:
