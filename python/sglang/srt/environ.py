@@ -2465,6 +2465,17 @@ class Envs:
     # END anchor behind it is not cut off by ``parent_unbacked``. Acts only on
     # nodes marked by ``park_running``; no park = byte for byte as before.
     SGLANG_WEG2_PARK_END_ANCHOR_FIRST = EnvBool(True)
+    # LANE-ANCHOR-RANK (NF h13 84e787ec96, D TP0 14:35:34, weg2-24-181): a
+    # lane park of lane-0 requests (LANE-PREEMPT for an arriving lane-1
+    # request) spilled the arriving request's own resume anchor (MAMBA-ARENA
+    # DISPLACE why=park_first depth=148992) to make room for lane-0 park
+    # chains; D then refused the lane-1 request (#904 MambaComponent absent,
+    # X-GATE W31) and it went to P for a full prefill. A node carries the
+    # highest lane that finished through it (weg2_lane); a mamba-arena claim
+    # (park chain, flush spill, last resort) may only displace anchors of a
+    # lane at or below the claimer's, lowest lane first. Lanes off: every node
+    # is lane 0, the order is the old one byte for byte. 0 = off.
+    SGLANG_WEG2_LANE_ANCHOR_RANK = EnvBool(True)
     # Per-request mamba checkpoint diagnostics: log match length, resume
     # length, checkpoint node/slot and cache-insert positions so a
     # nondeterministic resume (or a checkpoint at a wrong position) can be
