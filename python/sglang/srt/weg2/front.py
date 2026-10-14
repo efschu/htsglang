@@ -11092,6 +11092,20 @@ class Front:
                 return "P"
             if route in ("D", "P") and self._dc_st()["wid"] != wid:
                 return self._dc_st()["route"] if self._dc_st()["route"] == "P" else route
+            if self._dc_st()["wid"] != wid:
+                # COLLECT-LANE 1014 (NF h10 13:31:53.933 weg2-18-143, 13:33:14.341 weg2-20-151): THIS
+                # window was released by another caller (the controller's _arrival_seat_step/park
+                # check) and a new arrival re-opened the next window before this SHORT's 50-ms poll
+                # -- its poll then read "hold" and it sat in the NEXT window, while the release had
+                # booked it as D prefill (grant at the release): D idle, its own row as `carried`
+                # put the next set over X, 15 s to P. The wid moved = its window released: the
+                # route is that release's (P is sticky for the phase, so not-P means D).
+                rel = "P" if self._dc_st()["route"] == "P" else "D"
+                self.counters["decode_collect_short_release_seen"] += 1
+                logger.info("WEG2 DECODE-COLLECT short-release rid=%s route=%s now=%s epoch=%d -- its window "
+                            "was released by another caller; the SHORT follows that release, not the next "
+                            "window", rid, rel, route, self.epoch)
+                return rel
             if route is None:
                 return None
             await asyncio.sleep(0.05)
