@@ -80,7 +80,7 @@ class _Cancel(Exception):
     pass
 
 
-def _drive_sampler(f, readings, step_s=0.5, t0=1_000_000.0):
+def _drive_sampler(f, readings, step_s=0.5, t0=1_000_000.0, guards="off"):
     """Run ``Front.host_watermark_sampler`` over ``readings`` (one per tick).
 
     Returns ``(stop_calls, log_records)``. The clock advances ``step_s`` per
@@ -88,6 +88,10 @@ def _drive_sampler(f, readings, step_s=0.5, t0=1_000_000.0):
     reading. ``do_stop`` is replaced by a recorder that also performs the one
     thing a real stop does to the state (``state = STOP``), so "not in STOP" is
     a measured fact of the run and not an assumption.
+
+    27B line (RC4 port): the front's W22/W98 guards are switched by ``FLLIPER_PDFLIP_HOST_GUARD_W22`` / ``_W98`` (user
+    decision 06.10., default ``on`` = the verdict and ``do_stop`` of before). The NF warn behaviour is the switch OFF
+    state here, so the warn tests run with ``guards="off"``; ``guards="on"`` is the 27B default.
     """
     stop_calls = []
     clock = {"t": t0, "i": 0}
@@ -120,7 +124,8 @@ def _drive_sampler(f, readings, step_s=0.5, t0=1_000_000.0):
         except _Cancel:
             pass
 
-    with mock.patch.object(hl, "read_cgroup_pressure", fake_pressure), \
+    with mock.patch.dict(os.environ, {"FLLIPER_PDFLIP_HOST_GUARD_W22": guards, "FLLIPER_PDFLIP_HOST_GUARD_W98": guards}), \
+         mock.patch.object(hl, "read_cgroup_pressure", fake_pressure), \
          mock.patch.object(hl, "read_cgroup", lambda *a, **k: {"current": 1}), \
          mock.patch.object(hl, "read_cgroup_anon_bytes", lambda *a, **k: None), \
          mock.patch.object(hl, "arena_fill_gib", lambda *a, **k: None), \
@@ -353,6 +358,28 @@ class TheLatchArithmeticIsUnchangedForOtherCallers(CustomTestCase):
             self.assertIn(token, lb)
 
 
+class The27BSwitchesKeepTheirDefaultStop(CustomTestCase):
+    """RC4 port decision (27B line): the user's guard switches (06.10.) own the stop; ON (the default) is the old
+    verdict mode byte for byte, OFF is the NF host-warn mode of the tests above."""
+
+    def test_w98_switch_on_still_stops_on_the_int24g_reading(self):
+        f = _front()
+        stop_calls, lines = _drive_sampler(f, _int24g_series(), guards="on")
+        self.assertEqual(stop_calls, ["W98 PdFlipHostRateLatched"])
+        self.assertFalse([l for l in lines["warning"] if MARKER in l], lines["warning"][:3])
+
+    def test_w22_switch_on_still_stops_over_the_bound(self):
+        over, under = TheLevelGuardWarnsToo()._over()
+        f = _front()
+        stop_calls, lines = _drive_sampler(f, [under] * 2 + [over] * 60, guards="on")
+        self.assertEqual(stop_calls, ["W22 PdFlipHostWatermarkBreached"])
+
+    def test_the_switch_decides_the_latch_mode(self):
+        src = inspect.getsource(front_mod.Front.host_watermark_sampler)
+        self.assertIn("warn_only=not _w98_on", src)
+        self.assertIn("warn_only=not _w22_on", src)
+
+
 class TheVramAndRankDeathStopsAreStillStops(CustomTestCase):
     """R1 / the danger direction: only the two host-RAM guards lost their stop."""
 
@@ -367,11 +394,12 @@ class TheVramAndRankDeathStopsAreStillStops(CustomTestCase):
                 names.append(node.args[0].value)
         return names
 
-    def test_no_host_ram_literal_reaches_do_stop(self):
-        names = self._do_stop_names()
-        for n in names:
-            self.assertNotIn("HostRateLatched", n)
-            self.assertNotIn("HostWatermarkBreached", n)
+    def test_the_host_ram_stops_are_behind_the_guard_switches_only(self):
+        """27B line: the two host-RAM stops stay, each in a branch of its switch (``_w98_on`` / ``_w22_on``)."""
+        src = inspect.getsource(front_mod.Front.host_watermark_sampler)
+        self.assertEqual(src.count("self.do_stop("), 2)
+        self.assertIn("if _w98_on:", src)
+        self.assertIn("if _w22_on:", src)
 
     def test_the_vram_rankdeath_drain_and_identity_stops_remain(self):
         names = self._do_stop_names()
@@ -394,10 +422,9 @@ class TheVramAndRankDeathStopsAreStillStops(CustomTestCase):
             f.do_stop("W19 DormantResidueRefused", "measured D_c exceeds the reserve")
         self.assertEqual(f.state, "STOP")
 
-    def test_the_guard_loop_has_no_do_stop_call(self):
+    def test_the_guard_loop_stops_only_behind_its_switches(self):
         src = inspect.getsource(front_mod.Front.host_watermark_sampler)
-        self.assertNotIn("self.do_stop(", src)
-        self.assertIn("warn_only=True", src)
+        self.assertEqual(src.count("self.do_stop("), 2)
 
 
 if __name__ == "__main__":
