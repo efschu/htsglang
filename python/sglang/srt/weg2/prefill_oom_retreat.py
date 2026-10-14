@@ -552,6 +552,16 @@ def retreat(sched, exc, new_batch, can_run_list: List[Any], adder, carried_befor
         return False
 
 
+ENV_LBV_SHORT_STOP = "SGLANG_WEG2_LBV_SHORT_STOP"
+
+
+def lbv_short_stop_enabled(env=None) -> bool:
+    """NF-RANG-AUDIT 1014 (S4): an ``LB-VERDICT SHORT`` is a named group stop, never a retreat. Default ON; ``0`` = the
+    retreat of before (PP0 voids the pass while the followers have already spent the verdict and loaded H->D)."""
+    e = os.environ if env is None else env
+    return (e.get(ENV_LBV_SHORT_STOP, "") or "").strip().lower() not in ("0", "false", "no", "off")
+
+
 def retreat_loadback(sched, exc, req, adder) -> Optional[str]:
     """The load-back entrance of the same wall. ``exc`` is the ``AgreedRoomShort`` that ``load_back`` raised for ``req``
     (its two lock refs are already unwound). Returns ``None`` = not taken (out of scope / failed: the caller re-raises and
@@ -559,7 +569,21 @@ def retreat_loadback(sched, exc, req, adder) -> Optional[str]:
     is answered 503 (``WEG2-INTAKE-STALL``) and dropped from PP0's queue, its drop relayed to every stage.
 
     PP0 only, on the form where the followers execute PP0's row (``applies``): the row of this pass names nothing of the
-    request, so no stage loads it back -- the stages discard the load-back TOGETHER, none refuses alone (#1004)."""
+    request, so no stage loads it back -- the stages discard the load-back TOGETHER, none refuses alone (#1004).
+
+    NOT TAKEN for an ``LB-VERDICT SHORT`` (``exc.lb_verdict_short``, NF-RANG-AUDIT 1014 S4): PP0's verdict for the rid
+    was distributed over the chain in the pass before and the stages that could pay have ``consume``d it and loaded H->D
+    in THIS pass. A void here undoes the pass on PP0 alone (RETRY, the verdict kept) while the followers keep the loaded
+    rows and a spent verdict: next pass PP0 admits alone, the followers hold -> #1233 one pass later. A distributed
+    verdict that its decider takes back is a detected divergence of the walls: the group stops by name
+    (raenge-nie-uneins), exactly what the h16 fix states for this case."""
+    if getattr(exc, "lb_verdict_short", False) and lbv_short_stop_enabled():
+        logger.error("%s NOT TAKEN where=loadback (lb_verdict_short): PP0's load-back verdict for rid=%s was distributed "
+                     "and spent on the stages that could pay (need=%d free=%d); a void would leave PP0 and the followers "
+                     "in different states -- AgreedRoomShort propagates, the group stops by name (raenge-nie-uneins)",
+                     MARK, getattr(req, "rid", "?"), int(getattr(exc, "kv_tokens", 0) or 0),
+                     int(getattr(exc, "avail_after", 0) or 0))
+        return None
     ok, why = applies(sched, adder, getattr(adder, "can_run_list", ()) or ())
     if not ok:
         if why != "not_group_p":

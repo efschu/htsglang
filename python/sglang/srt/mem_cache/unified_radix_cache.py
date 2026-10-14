@@ -7137,6 +7137,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     "with every evictable row freed; refusing alone would start it on the peers only (#1004) "
                     "-- the group stops by name (raenge-nie-uneins)",
                     rid=_lbv_rid, kv_tokens=kv_tokens, agreed=int(floor), avail=_avail, avail_after=_avail,
+                    lb_verdict_short=True,  # NF-RANG-AUDIT 1014 (S4): never retreated into a void pass
                 )
         if floor < kv_tokens:
             # weg2xsn285 (18.09.): THE FLOOR REFUSED AND NOBODY EVICTED. Group
