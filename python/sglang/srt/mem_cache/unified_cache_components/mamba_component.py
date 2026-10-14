@@ -2063,7 +2063,7 @@ class MambaComponent(TreeComponent):
                     insert_result.mamba_exist = True
                 return
 
-            if (envs.SGLANG_WEG2_TREE_REPAIR_AUX_HOST.get()
+            if (envs.SGLANG_WEG2_AUX_HOST_LAW.get()
                     and target_node.component_data[ComponentType.FULL].host_value is None):
                 # AUX-HOST-LAW (NF h17 15:51:02): the read's anchor (arena slot
                 # or ANCHOR-BYPASS staging row) never lands on a node without a
