@@ -6762,6 +6762,12 @@ class Scheduler(
                 torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MIN, group=group)
                 return [int(x) for x in t.tolist()]
         except Exception as exc:  # noqa: BLE001
+            # NF-RANG-AUDIT 1014 Fix 3 (B2): a failed group verdict is a named stop, never the local flags
+            from sglang.srt.weg2 import group_min_strict as _gms
+
+            if _gms.enabled():
+                logger.error("%s flags n=%d (%s: %s)", _gms.MARK, len(vals), type(exc).__name__, exc)
+                raise _gms.failed("flags", len(vals), exc) from exc
             logger.info("#1471 group verdict n/a (%s: %s) -- local flags used", type(exc).__name__, exc)
         return vals
 
@@ -6936,6 +6942,12 @@ class Scheduler(
                 torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MIN, group=group)
                 return [int(x) for x in t.tolist()]
         except Exception as exc:  # noqa: BLE001
+            # NF-RANG-AUDIT 1014 Fix 3 (B2): a failed group verdict is a named stop, never the local values
+            from sglang.srt.weg2 import group_min_strict as _gms
+
+            if _gms.enabled():
+                logger.error("%s ints n=%d (%s: %s)", _gms.MARK, len(vals), type(exc).__name__, exc)
+                raise _gms.failed("ints", len(vals), exc) from exc
             logger.info("#1479 group min n/a (%s: %s) -- local values used", type(exc).__name__, exc)
         return vals
 

@@ -151,7 +151,8 @@ class AgreedRoomShort(RuntimeError):
     18:30:21Z (``..._0ea6d17efd_1013_134832.P.log`` 1012731-1012800): agreed 191744, avail 92032, evictable 99712, the
     peel paid 64 -- the rest sat behind one un-payable frontier leaf."""
 
-    def __init__(self, message, *, rid=None, kv_tokens=0, agreed=0, avail=0, evictable=0, evicted=0, avail_after=0):
+    def __init__(self, message, *, rid=None, kv_tokens=0, agreed=0, avail=0, evictable=0, evicted=0, avail_after=0,
+                 lb_verdict_short=False):
         super().__init__(message)
         self.rid = rid
         self.kv_tokens = int(kv_tokens)
@@ -160,6 +161,10 @@ class AgreedRoomShort(RuntimeError):
         self.evictable = int(evictable)
         self.evicted = int(evicted)
         self.avail_after = int(avail_after)
+        #: NF-RANG-AUDIT 1014 (S4): True = ``LB-VERDICT SHORT`` -- PP0's load-back verdict for this rid was already
+        #: distributed over the chain and spent on the stages that could pay. Such a short is never retreated into a
+        #: void pass (``prefill_oom_retreat.retreat_loadback``): the group stops by name.
+        self.lb_verdict_short = bool(lb_verdict_short)
 
 
 def local_pp_room(tree, kv_tokens: int, floor: int, rid=None) -> Optional[bool]:

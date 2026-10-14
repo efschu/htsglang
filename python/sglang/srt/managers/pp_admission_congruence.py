@@ -2865,6 +2865,38 @@ def execute_scheduled_prefix(req, tree_cache, scheduled_prefix_len: int) -> int:
     # #1175 (E2): whether the poll ever drove the progress check, so the
     # expiry text can say what it does and does not measure.
     _drove_ever = False
+    # NF-RANG-AUDIT 1014 (S5 x LB-VERDICT): this load-back EXECUTES PP0's row,
+    # so the LB-VERDICT gate in `load_back` must not hold it for a verdict PP0
+    # never sent (the follower's host hit is not PP0's on the layer-split
+    # form). Set for exactly this materialisation, cleared on every exit --
+    # writer, reader (`pp_loadback_verdict.gated`) and deleter share one
+    # straight-line stretch, the only lifecycle shape such a flag is safe under.
+    from sglang.srt.weg2 import pp_loadback_verdict as _lbv_row
+
+    try:
+        setattr(req, _lbv_row.ROW_ATTR, True)
+    except Exception:  # noqa: BLE001 -- a slotted stand-in: the gate then decides as before
+        pass
+    try:
+        return _materialise_scheduled_prefix(
+            req, tree_cache, scheduled, deficit, local, bound_s, started, storage_on, _die, loaded_total, _drove_ever
+        )
+    finally:
+        try:
+            setattr(req, _lbv_row.ROW_ATTR, False)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _materialise_scheduled_prefix(
+    req, tree_cache, scheduled, deficit, local, bound_s, started, storage_on, _die, loaded_total, _drove_ever
+) -> int:
+    """The materialisation loop of :func:`execute_scheduled_prefix` (split out so the
+    row flag above is set and cleared around exactly this stretch)."""
+    from sglang.srt.mem_cache.base_prefix_cache import InitLoadBackParams
+
+    import torch
+
     while True:
         best = getattr(req, "best_match_node", None)
         if best is not None:
