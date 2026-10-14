@@ -17128,6 +17128,12 @@ class Scheduler(
                     self, req, _note_skip, weg2_store_told.admission
                 )
                 if _told_loaded is None:
+                    if weg2_store_told.held_barrier(self, req):
+                        # W27-HELD-STOP (NF h16g 17:49:53Z): a told rid held for a
+                        # tree short of PP0's told is a BARRIER -- overtaking it
+                        # planned [weg2-0-9, weg2-1-11] against PP0's three.
+                        _note_skip("w27_held_barrier", req.rid)
+                        break
                     continue
             if self.enable_hicache_storage and _pp_group:
                 # #1066: PP0 DOES WAIT NOW -- and only PP0. The #969Z verdict

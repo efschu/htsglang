@@ -70,7 +70,8 @@ otherwise; the ack stream does not exist. Followers follow the wire, never
 their own env (the #1416e rule): a follower acks only read-aheads that carry
 ``ack``, and releases only on an Admit that carries ``fallback``.
 
-SWITCH ``SGLANG_WEG2_TOLD_GROUP_FALLBACK`` (default off), read once on PP0,
+SWITCH ``SGLANG_WEG2_TOLD_GROUP_FALLBACK`` (unset = the profile row: ON on
+nextflash since 14.10., off on qwen27b), read once on PP0,
 effective only with ``SGLANG_WEG2_TOLD_PACED`` on: only there does PP0 hold
 admission back until an Admit.
 """
@@ -124,7 +125,7 @@ _LOG_EVERY = 256
 
 def env_on() -> bool:
     # RG 26.09.: unset = the registry row (weg2/form.py PREFIX_SWITCHES; PF is
-    # off on every row -- unproven on metal).
+    # on on the nextflash row since 14.10., off on qwen27b).
     from sglang.srt.weg2.form import prefix_switch_armed
 
     return prefix_switch_armed(ENV_FALLBACK)

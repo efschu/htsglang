@@ -155,6 +155,14 @@ class Weg2StoreToldMismatch(RuntimeError):
     """This rank's own store read does not reproduce PP0's told count."""
 
 
+class Weg2FollowerToldUnreachable(Weg2StoreToldMismatch):
+    """W27-HELD-STOP (NF h16g 14.10. 17:49:53Z): a follower holds a rid PP0
+    admitted at told, its tree stays short after the bounded re-read, and no
+    rank-uniform answer can arrive (no PF ack channel, no re-read in flight).
+    Planning on would set a batch PP0 did not send -- the group stops HERE,
+    by name, instead of at the #1233 WIDTH GUARD one forward later."""
+
+
 def env_armed() -> bool:
     return os.environ.get(ENV_ARMED, "1").strip().lower() not in (
         "0",
@@ -1732,6 +1740,82 @@ def forget_unreached(scheduler, rid) -> None:
         named.discard(str(rid))
 
 
+#: W27-HELD-STOP (NF h16g 14.10. 17:49:53Z, P.log ``..._1014_174538``
+#: 12223-12251; default ON, ``0`` = the hold as before): PP1 held weg2-0-10
+#: (``W27-UNIFORM FOLLOWER HELD ... route=none``) and its admission loop went
+#: on -- ``#969N ADMIT fwd_ct=15 bs=2 extend=5723 rids=[weg2-0-9,weg2-1-11]``
+#: against PP0's ``bs=3 extend=16283 rids=[weg2-0-9,weg2-1-11,weg2-0-10]`` --
+#: and died one forward later in the ``#1233 #631 WIDTH GUARD``. Two rules:
+#:  (a) BARRIER: a held told rid ends this follower's admission loop (nothing
+#:      behind it is admitted this pass). Every OTHER reason PP0 does not seat
+#:      an admitted told rid in a pass (budget, a load-back wait -- NO_TOKEN,
+#:      LB-VERDICT) ends PP0's loop there too, so the barrier is the only
+#:      follower choice that can match PP0; ``continue`` overtook the rid.
+#:  (b) UNRESOLVABLE = STOP: without the PF ack channel (``route=none``) no
+#:      uniform answer can ever reach the hold; once no re-read of the rid is
+#:      in flight any more the follower stops the group by name
+#:      (:class:`Weg2FollowerToldUnreachable`) instead of planning a batch.
+ENV_HELD_STOP = "SGLANG_WEG2_W27_HELD_STOP"
+
+
+def held_stop_on(env=None) -> bool:
+    env = os.environ if env is None else env
+    return str(env.get(ENV_HELD_STOP, "1") or "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def held_barrier(scheduler, req) -> bool:
+    """W27-HELD-STOP (a): True = ``req`` is held on this follower for a tree
+    short of PP0's told (item 180), and the admission loop must END here
+    instead of admitting what stands behind it."""
+    if not held_stop_on():
+        return False
+    try:
+        if is_pp0(scheduler):
+            return False
+    except Exception:  # noqa: BLE001 - a stand-in without ps
+        return False
+    rid = _rid(req)
+    if reach_unresolved(scheduler, rid) is None:
+        return False
+    n = getattr(scheduler, "_w27u_barrier_n", 0) + 1
+    scheduler._w27u_barrier_n = n
+    if n <= 8 or n % 256 == 0:
+        logger.error(
+            "W27-HELD-STOP BARRIER rank pp=%s rid=%s (n=%d): this rank holds a told rid its tree "
+            "does not reach -- the admission loop ends here; nothing behind it is admitted "
+            "(a follower that overtakes a rid PP0 seats plans a batch PP0 never sent)",
+            getattr(getattr(scheduler, "ps", None), "pp_rank", "?"), _rt(rid), n,
+        )
+    return True
+
+
+def _reread_in_flight(scheduler, rid: str) -> bool:
+    tree = getattr(scheduler, "tree_cache", None)
+    ongoing = getattr(tree, "prefetch_is_ongoing", None)
+    if not callable(ongoing):
+        return False
+    try:
+        return bool(ongoing(str(rid)))
+    except Exception:  # noqa: BLE001 - unreadable: no read to wait for
+        return False
+
+
+def _held_stop_if_unresolvable(scheduler, rid: str, told: int, live: int, route: str, site: str) -> None:
+    """W27-HELD-STOP (b): raise the named stop when nothing can resolve the
+    hold rank-uniformly any more."""
+    if not held_stop_on() or route == _fb.ROUTE_PF:
+        return
+    if _reread_in_flight(scheduler, rid):
+        return  # the bounded re-read is still landing: the barrier holds, the next visit asks again
+    raise Weg2FollowerToldUnreachable(
+        f"#1233 W27-HELD-STOP rank pp={scheduler.ps.pp_rank} rid={_rt(rid)} told={int(told)} "
+        f"live={int(live)} site={site} route={route}: PP0 admitted this rid at told, this rank's "
+        f"tree stays short after the bounded re-read and no PF ack channel exists (no rank-uniform "
+        f"told=0 can arrive) -- planning on would set a batch PP0 did not send (the #1233 WIDTH "
+        f"GUARD one forward later). Stopping the group by name (raenge-nie-uneins)."
+    )
+
+
 def follower_hold_unreached(scheduler, req, site: str) -> bool:
     """W27-UNIFORM (item 180): True = this follower's tree is STILL short of
     PP0's told after the bounded re-read, and it must not seat the request
@@ -1766,8 +1850,10 @@ def follower_hold_unreached(scheduler, req, site: str) -> bool:
             scheduler.ps.pp_rank, _rt(rid), t, live, site, route, n,
             "PF ack queued: PP0 answers told=0 for all ranks"
             if route == _fb.ROUTE_PF
-            else "no PF ack channel on this boot: no uniform answer can arrive, the #1233 W27 guard stays the stop",
+            else "no PF ack channel on this boot: no uniform answer can arrive -- W27-HELD-STOP "
+                 "stops the group once no re-read is in flight",
         )
+    _held_stop_if_unresolvable(scheduler, rid, t, live, route, site)
     return True
 
 

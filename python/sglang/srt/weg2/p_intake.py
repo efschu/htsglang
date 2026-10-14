@@ -161,6 +161,17 @@ def _drop_reach_state(scheduler, rid: str) -> None:
         named.discard(rid)
 
 
+def _st_stop_types() -> tuple:
+    """The named stops ``_reach_kept`` must let through (its catch-all keeps a
+    failing PROBE from breaking the admission, never a stop)."""
+    try:
+        from sglang.srt.managers.weg2_store_told import Weg2StoreToldMismatch
+
+        return (Weg2StoreToldMismatch,)
+    except Exception:  # noqa: BLE001 - a double without the module
+        return ()
+
+
 def _reach_kept(scheduler, req, entry: "_Kept") -> bool:
     """W27-UNIFORM (open point (a) of item 025): the verdict kept across visits
     was checked against the follower's live tree when it was made; between that
@@ -185,6 +196,8 @@ def _reach_kept(scheduler, req, entry: "_Kept") -> bool:
             if fresh > 0:
                 entry.credit = fresh
         return bool(_st.follower_hold_unreached(scheduler, req, "kept"))
+    except _st_stop_types():
+        raise  # W27-HELD-STOP: the named group stop is no probe failure
     except Exception:  # noqa: BLE001 - a probe never breaks the admission
         logger.warning("W27-UNIFORM kept-verdict reach check skipped for rid=%s",
                        str(getattr(req, "rid", "")), exc_info=True)

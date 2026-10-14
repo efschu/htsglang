@@ -127,6 +127,10 @@ def _env(monkeypatch):
     monkeypatch.setenv(m.ENV_FOLLOWER_EARLY_READ, "1")
     monkeypatch.setattr(m, "_absolute_armed", lambda: True)
     monkeypatch.delenv("SGLANG_WEG2_DUAL_SHARE", raising=False)
+    # the item-180 hold mechanics (re-read, hold, re-ask) as they were; the
+    # W27-HELD-STOP rules on top (barrier, route=none stop) are pinned in
+    # test_weg2_w27_held_stop_1014.py
+    monkeypatch.setenv(m.ENV_HELD_STOP, "0")
 
 
 def _follower_admits(stage, req, early=True):
