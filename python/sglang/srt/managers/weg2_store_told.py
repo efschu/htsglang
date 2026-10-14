@@ -254,6 +254,67 @@ def _completed_prefix(tree, rid: str) -> int:
     return int(tree.prefetch_loaded_tokens_by_reqid.get(rid, 0) or 0)
 
 
+
+#: P-HELD-REREAD-1014 (NF h17 38c6d40239, P 15:59:22-25, weg2-1-11, 94454
+#: tokens): PP0's read ended SHORT although the store held the whole span
+#: (``#1157 PREFETCH REAPED requested_pages=1475 hit_pages=1475
+#: completed=52480 elapsed=2.49s``; ``WEG2-SHORT-READ HELD``). The reap was no
+#: timeout -- the read had finished (``PROBE-HOLD released reason=read-end``);
+#: sibling L3 fills had recycled slots it was filling (``L3-FILL LATE-COMPLETE
+#: REFUSED statuses=[3]``), so its landed prefix stopped at page 822 (PP2 at
+#: 83) while PP1 landed all 1475. PP0 told 52480 at once and P recomputed
+#: 41920 tokens the store held. Now: a terminated read short of a span the
+#: store holds is re-read by PP0 BEFORE the told (the rid stays held), while
+#: each re-read moves PP0's record and at most this many times; then the told
+#: goes out as before. PP0 decides alone (the followers follow the wire), so
+#: no rank can split. 0 = off.
+P_HELD_REREAD_ENV = "SGLANG_WEG2_P_HELD_SHORT_REREAD"
+
+
+def _p_held_reread_max() -> int:
+    try:
+        return max(0, int(os.environ.get(P_HELD_REREAD_ENV, "2") or "2"))
+    except (TypeError, ValueError):
+        return 2
+
+
+def _p_held_short_reread(scheduler, tree, req, rid: str) -> bool:
+    """P-HELD-REREAD-1014: True when PP0 re-issued ``rid``'s store read (the
+    caller keeps it held and publishes nothing this pass)."""
+    cap = _p_held_reread_max()
+    if cap <= 0:
+        return False
+    from sglang.srt.weg2 import short_read as _sr
+
+    if not _sr._HELD.get(str(rid), False):
+        return False
+    have = _completed_prefix(tree, rid)
+    n = int(getattr(req, "_weg2_p_held_reread_n", 0) or 0)
+    if n >= cap or not _sr.reread_now(req, have):
+        return False
+    fn = getattr(scheduler, "_prefetch_kvcache", None)
+    if not callable(fn):
+        return False
+    _sr.note_reissue(req, have)
+    req._weg2_p_held_reread_n = n + 1
+    try:
+        verdict = str(fn(req))
+    except Exception as exc:  # noqa: BLE001 - a re-read never takes the pass down
+        logger.warning("WEG2 P-HELD-REREAD rid=%s re-issue raised %s: %s", _rt(rid), type(exc).__name__, exc)
+        return False
+    issued = verdict.startswith("issued")
+    k = getattr(scheduler, "_p_held_reread_n", 0) + 1
+    scheduler._p_held_reread_n = k
+    if k <= 32 or k % 128 == 0:
+        logger.info(
+            "WEG2 P-HELD-REREAD rid=%s n=%d/%d have=%d verdict=%s (k=%d): the read ended short "
+            "of a span the store holds -- PP0 re-reads before its told (reading beats "
+            "recomputing); the told follows the re-read's record",
+            _rt(rid), n + 1, cap, have, verdict, k)
+    if not issued:
+        _sr.forget(rid)
+    return issued
+
 def _rid(req) -> str:
     return str(getattr(req, "rid", ""))
 
@@ -1076,6 +1137,8 @@ def pp0_publish(scheduler, recv_reqs: List) -> List:
             continue
         if not tree.check_prefetch_progress(rid):
             continue
+        if _p_held_short_reread(scheduler, tree, req, rid):
+            continue  # P-HELD-REREAD-1014: still held, the told follows the re-read
         twin = _twin.take_pp0_twin(scheduler, rid)
         told, absolute = _pp0_told_any(scheduler, tree, req, rid, twin)
         _ple_admit_at_told(scheduler, req, told, absolute)
@@ -1582,6 +1645,8 @@ def _pp0_publish_paced(scheduler, recv_reqs: List) -> List:
             continue
         if not tree.check_prefetch_progress(rid):
             continue
+        if _p_held_short_reread(scheduler, tree, req, rid):
+            continue  # P-HELD-REREAD-1014: still held, the told follows the re-read
         twin = _twin.take_pp0_twin(scheduler, rid)
         told, absolute = _pp0_told_any(scheduler, tree, req, rid, twin)
         _ple_admit_at_told(scheduler, req, told, absolute)
