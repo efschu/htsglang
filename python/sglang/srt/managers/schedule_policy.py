@@ -1636,6 +1636,35 @@ class PrefillAdder:
             return budget
         return effective_rem_total_tokens(budget, self.commitment_ledger)
 
+    _WEG2_BUDGET_PARTS_N = [0]
+
+    def _weg2_note_budget_parts(self, req, price, budget) -> None:
+        """PW-W instrument (NF h14 14:50:53, weg2-2-21: ``host_price=167776
+        host_budget=33536`` for 317 s with nothing running): the terms the
+        refusing budget is made of, so the next wedge names which one held the
+        rows. Observation only, rate-limited, never raises."""
+        n = self._WEG2_BUDGET_PARTS_N[0] = self._WEG2_BUDGET_PARTS_N[0] + 1
+        if not (n <= 20 or n % 256 == 0):
+            return
+        try:
+            alloc = self.token_to_kv_pool_allocator
+            parts = {
+                "available": int(alloc.available_size()),
+                "evictable": int(self.tree_cache.evictable_size()),
+                "offset": int(self.rem_total_token_offset),
+                "dcp_deficit": int(self.dcp_avail_deficit or 0),
+                "fundable_floor": self.fundable_extend_floor,
+                "ledger": (int(self.commitment_ledger.outstanding_tokens())
+                           if getattr(self, "commitment_ledger", None) is not None else None),
+                "prefix": len(req.prefix_indices),
+                "host_hit": int(getattr(req, "host_hit_length", 0) or 0),
+            }
+        except Exception as e:  # noqa: BLE001 - an instrument never breaks the gate
+            parts = {"unreadable": type(e).__name__}
+        logger.info("WEG2 GATE-BUDGET-PARTS rid=%s price=%s budget=%s %s (n=%d)",
+                    getattr(req, "rid", "?"), price, budget,
+                    " ".join("%s=%s" % kv for kv in parts.items()), n)
+
     @property
     def rem_swa_tokens(self):
         return (
@@ -2992,6 +3021,7 @@ class PrefillAdder:
                 ):
                     _gate = AddReqResult.NO_TOKEN
                     self._note_lifetime_refusal(req, total_tokens, _rem_total)
+                    self._weg2_note_budget_parts(req, total_tokens, _rem_total)
 
             if _gate is None and self.is_hybrid_swa:
                 swa_needed = self._swa_budget_for_req(

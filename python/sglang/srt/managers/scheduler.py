@@ -17817,6 +17817,25 @@ class Scheduler(
             if _wall_head is not None:
                 _x_refused.append(_wall_head)
                 _wall_rows = {id(_wall_head): _weg2_d_wall_head.device_need_rows(_wall_head)}
+            else:
+                # PW-W (weg2/d_wall_head.py): the structural wedge -- the
+                # group-DECIDED gate tuple refuses the head with price > budget
+                # and nothing running, evaluation after evaluation
+                _fa_fn = getattr(adder, "form_a_admission_follow", None)
+                _rb = getattr(self, "running_batch", None)
+                _wedge_head = _weg2_d_wall_head.pick_structural_wedge_head(
+                    sched=self,
+                    head_rid=_hol.head,
+                    waiting=self.waiting_queue,
+                    verdict=getattr(_fa_fn, "last_verdict", None),
+                    running_empty=bool(
+                        (_rb is None or _rb.is_empty())
+                        and getattr(self, "chunked_req", None) is None
+                    ),
+                )
+                if _wedge_head is not None:
+                    _x_refused.append(_wedge_head)
+                    _wall_rows = {id(_wedge_head): int(_fa_fn.last_verdict[2])}
         if _x_refused:
             self._weg2_answer_x_refusals(_x_refused, _head_inputs, wall_rows=_wall_rows)
         if _v_refused:
