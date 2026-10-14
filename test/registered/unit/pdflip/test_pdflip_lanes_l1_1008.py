@@ -9,7 +9,7 @@ What is pinned (all hermetic, no GPU, no network):
   state.json / the request book / ``request_done`` / any log line, the Anthropic adapter drops the field as before;
 * ``pdflip/lanes.py``: names fixed for L2-L4 (markers, the RPC), ``LaneState`` (floor, epoch, counters, no controller);
 * the progress beacon's lane trailer (16 bytes behind the 32 only with the switch on);
-* the catalog entries (CURATED) and the two edges K135/K136.
+* the catalog entries (CURATED) and the two edges K137/K138 (K135/K136 are the W3 host-leaf and X-SUM-PRICE edges of the renamed tree).
 """
 from __future__ import annotations
 
@@ -431,7 +431,7 @@ def test_catalog_entries_and_edges_for_the_three_envs():
         assert hasattr(envs, n), n
     with open(os.path.join(PDFLIP, "kantenkatalog_1004.json"), encoding="utf-8") as fh:
         kanten = {k["id"]: k for k in json.load(fh)["kanten"]}
-    for kid, von in (("K135", "FLLIPER_PDFLIP_LANE_KEEPALIVE_S"), ("K136", "FLLIPER_PDFLIP_LANE_PREEMPT_CHUNK_TOKENS")):
+    for kid, von in (("K137", "FLLIPER_PDFLIP_LANE_KEEPALIVE_S"), ("K138", "FLLIPER_PDFLIP_LANE_PREEMPT_CHUNK_TOKENS")):
         k = kanten[kid]
         assert (k["von"], k["nach"], k["rel"]) == (von, "FLLIPER_PDFLIP_LANES", "requires")
         # the lane envs exist on the NF line only (27B 84d04adae1 has none): the edge documents NF code only

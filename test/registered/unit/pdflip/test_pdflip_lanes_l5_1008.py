@@ -190,7 +190,7 @@ class BodiesMeetTheEndpointsTest(unittest.TestCase):
 
 class LaneEnvsAreNfOnlyInTheCatalogTest(unittest.TestCase):
     """The lane envs exist on the NF line only (the 27B revision 84d04adae1 has none of them).  The shipped catalog
-    must say so (entries and edges K135/K136 carry trees ['nf']), else the dashboard offers a switch on 27B that has
+    must say so (entries and edges K137/K138 carry trees ['nf']), else the dashboard offers a switch on 27B that has
     no effect.  CAN-FAIL: the catalog rebuilt from 27B archive + hand-applied L1 hunk listed ['27b', 'nf']."""
 
     NAMES = ("FLLIPER_PDFLIP_LANES", "FLLIPER_PDFLIP_LANE_KEEPALIVE_S", "FLLIPER_PDFLIP_LANE_PREEMPT_CHUNK_TOKENS")
@@ -209,14 +209,14 @@ class LaneEnvsAreNfOnlyInTheCatalogTest(unittest.TestCase):
             self.assertEqual(cat["entries"][name]["trees"], ["nf"], name)
             self.assertEqual(cat["entries"][name]["source"]["tree"], "nf", name)
 
-    def test_edges_k135_k136_name_only_the_nf_tree(self):
+    def test_edges_k137_k138_name_only_the_nf_tree(self):
         import json
 
         here = os.path.dirname(os.path.abspath(__file__))
         path = os.path.join(here, "..", "..", "..", "..", "python", "flliper", "srt", "pdflip", "kantenkatalog_1004.json")
         with open(path, encoding="utf-8") as fh:
             kanten = {k["id"]: k for k in json.load(fh)["kanten"]}
-        for kid in ("K135", "K136"):
+        for kid in ("K137", "K138"):
             self.assertEqual(kanten[kid].get("trees"), ["nf"], kid)
         for name in self.NAMES[1:]:
             deps = self._catalog()["entries"][name]["depends"]
