@@ -80641,14 +80641,23 @@
    "default": "True",
    "depends": [
     {
-     "beleg": null,
-     "belegt": false,
+     "baeume": [
+      "nf"
+     ],
+     "beleg": {
+      "anker": "SGLANG_WEG2_PRIO_AS_AGE = EnvBool(True)",
+      "aufloesung": "andere_linie",
+      "datei": "python/sglang/srt/environ.py",
+      "zeile": 1201,
+      "zeile_hinweis": 1201
+     },
+     "belegt": true,
      "calc": "text",
      "effect": "The front reads 'priority' only with the lanes switch on.",
-     "kante": "",
-     "quelle": "kuratiert",
+     "kante": "K138",
+     "quelle": "katalog+kuratiert",
      "rel": "braucht",
-     "satz": "",
+     "satz": "Priority as age (default on) acts only with SGLANG_WEG2_LANES=1: without the lane switch the front does not read 'priority', so there is nothing to order by and the value does nothing (prio_age.enabled = lanes AND prio_as_age).",
      "to": "SGLANG_WEG2_LANES",
      "to_kind": "env",
      "wert": null
@@ -87211,7 +87220,7 @@
   "beleg_aufloesung": {
    "problem": [],
    "status": {
-    "andere_linie": 5,
+    "andere_linie": 6,
     "eindeutig": 120,
     "nah": 12
    }
@@ -87220,7 +87229,7 @@
    "27b": {
     "problem": [],
     "status": {
-     "andere_linie": 5,
+     "andere_linie": 6,
      "eindeutig": 120,
      "nah": 12
     }
@@ -87229,7 +87238,7 @@
     "problem": [],
     "status": {
      "andere_linie": 44,
-     "eindeutig": 83,
+     "eindeutig": 84,
      "nah": 10
     }
    }
@@ -87237,9 +87246,9 @@
   "datei": "kantenkatalog_1004.json",
   "geladen": true,
   "grund": "",
-  "kanten_belegt": 137,
-  "kanten_gesamt": 137,
-  "kanten_ohne_beleg": 26,
+  "kanten_belegt": 138,
+  "kanten_gesamt": 138,
+  "kanten_ohne_beleg": 25,
   "neu": 86,
   "rel_abweichend": [
    "K12",
@@ -87249,7 +87258,7 @@
   ],
   "schema": "flliper.kanten/1",
   "uebersprungen_ohne_von": [],
-  "verschmolzen": 51,
+  "verschmolzen": 52,
   "verworfen": 0,
   "wertbedingt": 22,
   "ziel_unbekannt": 0
@@ -87279,7 +87288,7 @@
   "kuratiert": 125,
   "unerklaert": 619
  },
- "tree_rev": "27b=02123ee2ef+nf=75e3ee8abd+lbv-deadlock-e23abfcb05+prio-alter-fa99a484ae+h16m-int-1014",
+ "tree_rev": "27b=02123ee2ef+nf=75e3ee8abd+lbv-deadlock-e23abfcb05+prio-alter-fa99a484ae+w3-drain-e7cfda7fbe+h16m-int-1014",
  "trees": {
   "27b": {
    "entries": 2641,
@@ -87287,7 +87296,7 @@
   },
   "nf": {
    "entries": 2552,
-   "rev": "75e3ee8abd+lbv-deadlock-e23abfcb05+prio-alter-fa99a484ae+h16m-int-1014"
+   "rev": "75e3ee8abd+lbv-deadlock-e23abfcb05+prio-alter-fa99a484ae+w3-drain-e7cfda7fbe+h16m-int-1014"
   }
  },
  "warnungen": []
