@@ -56,6 +56,7 @@ from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
+    Weg2LivenessHoldOutput,
     BaseBatchReq,
     BaseReq,
     BatchEmbeddingOutput,
@@ -754,12 +755,21 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # For handling case when scheduler skips detokenizer and forwards back to the tokenizer manager, we ignore it.
                 (HealthCheckOutput, lambda x: None),
                 (ActiveRanksOutput, self.update_active_ranks),
+                # LIVEPARK (14.10.): group D's held set -> the stream watchdogs
+                (Weg2LivenessHoldOutput, self._handle_weg2_liveness_hold),
             ]
         )
         self.init_communicators(self.server_args)
 
         self.sampling_params_class = SamplingParams
         self.signal_handler_class = SignalHandler
+
+    def _handle_weg2_liveness_hold(self, recv_obj: Weg2LivenessHoldOutput) -> None:
+        """LIVEPARK (14.10.): install the scheduler's held set; a parked D
+        request is not a silent consumer (srt/liveness/hold.py)."""
+        from sglang.srt.liveness.hold import global_hold_registry
+
+        global_hold_registry().replace(recv_obj.held or ())
 
     async def generate_request(
         self,

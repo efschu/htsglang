@@ -42,6 +42,7 @@ from typing import (
 
 from sglang.srt.liveness.classes import EndpointClass
 from sglang.srt.liveness.grace import ClaimKind, ResourceClaim
+from sglang.srt.liveness.hold import global_hold_registry
 from sglang.srt.liveness.watchdog import (
     ConsumerGone,
     ConsumerWatchdog,
@@ -174,11 +175,19 @@ def guard_generate_stream(
                 # leave the others held.
                 logger.warning("liveness abort failed for rid %s: %s", rid, exc)
 
+    holds = global_hold_registry()
+
+    def held() -> bool:
+        # LIVEPARK: a request the server parked on purpose is not a silent
+        # consumer -- the clock runs from its resumption (hold.py)
+        return holds.any_held(ids)
+
     watchdog = ConsumerWatchdog(
         job_id=f"stream-{ids[0]}",
         policy=policy,
         release=release,
         claims=claims_for_rids(ids),
+        held=held,
     )
     return guard_streaming_response(response, watchdog)
 

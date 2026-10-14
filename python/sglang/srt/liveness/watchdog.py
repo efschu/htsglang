@@ -154,6 +154,9 @@ class LivenessState:
     declared_dead: bool = False
     declared_dead_at: float | None = None
     in_grace: bool = False
+    #: LIVEPARK: the server holds the request on purpose (a D park); the
+    #: silence clock is paused and restarts at the resumption (hold.py)
+    held: bool = False
 
     def silent_for(self, now: float | None = None) -> float:
         return (now if now is not None else time.monotonic()) - self.last_progress_at
@@ -167,6 +170,7 @@ class LivenessState:
             "silent_for_s": round(self.silent_for(now), 3),
             "declared_dead": self.declared_dead,
             "in_grace": self.in_grace,
+            "held": self.held,
         }
 
 
@@ -193,8 +197,15 @@ class ConsumerWatchdog:
         clock: Callable[[], float] | None = None,
         claims: Iterable[ResourceClaim] = (),
         registry: AttachmentRegistry | None = None,
+        held: Callable[[], bool] | None = None,
     ) -> None:
         self.job_id = job_id
+        #: LIVEPARK: "does the SERVER hold this request on purpose right now"
+        #: (hold.py). While it answers True the silence is the producer's, not
+        #: the consumer's: the clock is paused and starts again at the
+        #: resumption. None = every silence counts (the pre-LIVEPARK watchdog).
+        self._held = held
+        self._held_since: float | None = None
         self.policy = policy
         self._release = release
         self._clock = clock or time.monotonic
@@ -318,6 +329,8 @@ class ConsumerWatchdog:
                     return
                 except asyncio.TimeoutError:
                     pass
+                if self._held is not None and self._hold_tick():
+                    continue
                 silent = self.state.silent_for(self._clock())
                 if silent >= timeout:
                     await self._declare_dead(silent, timeout)
@@ -333,6 +346,49 @@ class ConsumerWatchdog:
                     self._set_phase(AttachmentPhase.GRACE, silent)
         except asyncio.CancelledError:
             raise
+
+    def _hold_tick(self) -> bool:
+        """LIVEPARK: True while the server holds the request on purpose.
+
+        Held: the clock is pinned to now (so it restarts at the resumption,
+        never counting the park) and a grace entered before the park is left.
+        Not held (or a predicate that fails -- fail toward the old watchdog):
+        False, and the ordinary silence check runs.
+        """
+        try:
+            held = bool(self._held())
+        except Exception:  # noqa: BLE001 - a broken predicate must not pin a stream
+            held = False
+        now = self._clock()
+        if held:
+            if self._held_since is None:
+                self._held_since = now
+                self.state.held = True
+                logger.info(
+                    "job %s: LIVENESS-HOLD on -- the server holds the request on "
+                    "purpose (D park / lane hold / RESUME-VIA-P / dormant / wake "
+                    "read); silence clock paused at %.1fs (limit %.1fs for %s)",
+                    self.job_id,
+                    self.state.silent_for(now),
+                    self.state.timeout_s or 0.0,
+                    self.state.endpoint_class,
+                )
+            self.state.last_progress_at = now
+            if self.state.in_grace:
+                self.state.in_grace = False
+                self._set_phase(AttachmentPhase.ACTIVE, 0.0)
+            return True
+        if self._held_since is not None:
+            logger.info(
+                "job %s: LIVENESS-HOLD off after %.1fs -- resumed; the silence "
+                "clock restarts now",
+                self.job_id,
+                now - self._held_since,
+            )
+            self._held_since = None
+            self.state.held = False
+            self.state.last_progress_at = now
+        return False
 
     async def _declare_dead(self, silent: float, timeout: float) -> None:
         self.state.declared_dead = True

@@ -197,6 +197,7 @@ from sglang.srt.managers.io_struct import (
     VramBudgetReqInput,
     VramBudgetReqOutput,
     Weg2LaneFloorReqInput,
+    Weg2LivenessHoldOutput,
     Weg2ParkRunningReqInput,
     Weg2ParkWindowReqInput,
     sock_send,
@@ -1404,6 +1405,47 @@ def _weg2_device_idle(sched) -> bool:
     if getattr(sched, "enable_overlap", False) and len(getattr(sched, "result_queue", ()) or ()):
         return False
     return getattr(sched, "chunked_req", None) is None
+
+
+def _weg2_liveness_hold_publish(sched) -> bool:
+    """LIVEPARK (14.10.): publish the requests group D holds ON PURPOSE --
+    flip / lane / RESUME-VIA-P parks (``weg2_d_parked``), the #1443 dormant
+    hold (``weg2_dormant_hold``) and the #1471 wake read
+    (``weg2_post_wake_settle``) -- to the tokenizer, whose LLM-stream
+    liveness watchdog then pauses the silence clock of those streams and
+    restarts it at the resumption (srt/liveness/hold.py). Without it the
+    watchdog took a parked stream for a dead client after 90 s and aborted
+    it (NF 1014_073255 D.log Z.403857, front 503 Z.27137).
+
+    Called once per loop iteration from ``Scheduler.process_input_requests``
+    (every loop family); a module function, so the partial schedulers the
+    unit tests drive through that method need no new attribute. Sends only
+    when the set changed: on a server that never parks, a few attribute reads
+    and nothing else. The whole set each time (replace semantics), so a
+    dropped notice heals at the next change. Never raises into the loop.
+    Returns whether a notice was sent. Multi-HTTP-worker mode (no worker ipc
+    to route a one-way notice to) publishes nothing: the old watchdog."""
+    try:
+        if int(getattr(getattr(sched, "server_args", None), "tokenizer_worker_num", 1) or 1) > 1:
+            return False
+        last = getattr(sched, "_weg2_liveness_hold_sent", None)
+        rids = set()
+        for attr in ("weg2_d_parked", "weg2_dormant_hold", "weg2_post_wake_settle"):
+            for r in getattr(sched, attr, None) or ():
+                rid = getattr(r, "rid", None)
+                if rid:
+                    rids.add(str(rid))
+        if not rids and not last:
+            return False
+        cur = frozenset(rids)
+        if cur == last:
+            return False
+        sched._weg2_liveness_hold_sent = cur
+        sched.ipc_channels.send_to_tokenizer.send_output(Weg2LivenessHoldOutput(held=sorted(cur)))
+        return True
+    except Exception as e:  # noqa: BLE001 -- a lost notice heals at the next change
+        logger.warning("LIVEPARK hold notice not sent (%s: %s)", type(e).__name__, e)
+        return False
 
 
 def _weg2_resume_warm_tick(sched) -> int:
@@ -4496,6 +4538,8 @@ class Scheduler(
         # watchdog thread (it silenced PP0's detector on 2026-08-22).
         _t_in = time.perf_counter()  # #1476b: name the untimed tail of this method
         drain_recovery_request(self)
+        # LIVEPARK (14.10.): D's held set to the stream watchdogs, on change only
+        _weg2_liveness_hold_publish(self)
         _t_rec_ms = (time.perf_counter() - _t_in) * 1000.0
         # #969 §W3: take PP0's flip decision off the stream before anything
         # else looks at the list. THIS site is the one place every loop family
