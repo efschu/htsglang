@@ -1145,6 +1145,18 @@ class Envs:
     # for weg2-10-90. On: the spill runs on a Form A group under the token cut, at a refused claim and before
     # a store read that ended short of what the store holds is re-issued. Off: the old guard.
     SGLANG_WEG2_W3_SPILL_FORM_A_CUT = EnvBool(True)
+    # SETTLE-UNIFORM-1014 (NF h18 fe799c4d6e, D 16:23:24 gloo 'op.preamble.length <= op.nbytes. 8 vs 4'):
+    # the #1471 settle skipped the progress check (a collective) of a member whose rank-local writer
+    # action was wait/decide. On: every rank checks every non-capwait member; the action only shapes the
+    # vote. Off: the old skip.
+    SGLANG_WEG2_SETTLE_UNIFORM_CHECK = EnvBool(True)
+    # PREFETCH-RID-NET-1014: the termination collective of a store read carries the rid's fingerprint
+    # (two slots under the same MAX: h and -h). Ranks that reached it for DIFFERENT rids see max != min
+    # alike, and the group STOPS by name on every rank (RuntimeError 'PREFETCH-RID-MISMATCH ... rids=...';
+    # user law raenge-nie-uneins-crash-stop, 29.08.: a detected rank disagreement is a stop, never a
+    # 'not done' and on) -- instead of a reap that mixes two rids' numbers and a later gloo abort with no
+    # name. Off: the 3-slot form.
+    SGLANG_WEG2_PREFETCH_RID_NET = EnvBool(True)
     # WAKE-READ-SEAT-GATE (NF arena fix 14.10.): the #248f gate held hold reads
     # up to the whole KV arena (6466 of 6485 pages pinned, 231 CAPACITY-WAIT in
     # one boot) -- D's own retain/park backup and its L3 fills found no slot.

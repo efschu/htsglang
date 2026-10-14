@@ -1204,6 +1204,15 @@ def _weg2_producer_wake_verdict(sched, req) -> str:
     return "complete"
 
 
+def _prefetch_rid_stop():
+    """PREFETCH-RID-NET-1014: the exception class of the named group stop (lazy: the
+    radix cache module is not imported at scheduler import time). The settle's
+    'never die on a top-up' handlers re-raise it -- raenge-nie-uneins-crash-stop."""
+    from sglang.srt.mem_cache.unified_radix_cache import PrefetchRidMismatch
+
+    return PrefetchRidMismatch
+
+
 def _weg2_settle_writer_action(sched, req) -> str:
     """P4b: the settle hold's action for one parked request (weg2/settle_writer):
     ``poll`` (unchanged 2 s re-read) until the read was seen short once, then
@@ -6980,6 +6989,8 @@ class Scheduler(
         for req in hold:
             try:
                 due.append(1 if _refetch(req, now, allow_reissue=False) == "due" else 0)
+            except _prefetch_rid_stop():  # PREFETCH-RID-NET-1014: a named group stop is never swallowed
+                raise
             except Exception as exc:  # noqa: BLE001 -- the hold must never die on a top-up
                 logger.info("#1456 HOLD-REFETCH rid=%s n/a (%s: %s)", str(getattr(req, "rid", "?")),
                             type(exc).__name__, exc)
@@ -6993,6 +7004,8 @@ class Scheduler(
             try:
                 if _refetch(req, now, allow_reissue=True) == "reissued":
                     reissued += 1
+            except _prefetch_rid_stop():  # PREFETCH-RID-NET-1014: a named group stop is never swallowed
+                raise
             except Exception as exc:  # noqa: BLE001 -- the hold must never die on a top-up
                 logger.info("#1456 HOLD-REFETCH rid=%s n/a (%s: %s)", str(getattr(req, "rid", "?")),
                             type(exc).__name__, exc)
@@ -7079,11 +7092,26 @@ class Scheduler(
         # (1) in the due vote and votes separately whether it has no writer; the group skips
         # the re-read only when EVERY rank decides. One collective: [due..., decide...].
         _pre, _dec = [], []
+        _uniform_check = envs.SGLANG_WEG2_SETTLE_UNIFORM_CHECK.get()
         for req, _act in zip(settle, _acts):
             if _act == "capwait":
                 _pre.append(0)  # 1537b: waits for arena room, no re-read, no release
                 _dec.append(0)
                 continue
+            if _act in ("wait", "decide") and _uniform_check:
+                # SETTLE-UNIFORM-1014 (NF h18 fe799c4d6e, D 16:23:23-24, gloo abort): the action is a
+                # RANK-LOCAL view (the writer directory, ``_1471_short`` from this rank's own record), and
+                # ``_refetch`` carries the progress check's collectives. TP0 alone had weg2-10-28 at
+                # "reread" then "decide" and skipped its check; its next collective (weg2-12-29) met the
+                # workers' 10-28 (TP0 '#905 ... req=weg2-12-29 completed=96256 min_synced=62848'), TP0
+                # deferred and re-issued 12-29 alone, the prefetch threads fell out of step -> "8 vs 4".
+                # The progress check runs on every rank for every member; only the VOTE follows the act.
+                try:
+                    _refetch(req, now, allow_reissue=False)
+                except _prefetch_rid_stop():  # PREFETCH-RID-NET-1014: a named group stop is never swallowed
+                    raise
+                except Exception:  # noqa: BLE001 -- the vote below stays the act's
+                    pass
             if _act == "wait":
                 _pre.append(0)  # a writer at work: a re-read cannot see pages still being written
                 _dec.append(0)
@@ -7097,6 +7125,8 @@ class Scheduler(
                 req._1456_last = 0.0  # the ack is the clock, not the 2 s timer
             try:
                 _pre.append(1 if _refetch(req, now, allow_reissue=False) == "due" else 0)
+            except _prefetch_rid_stop():  # PREFETCH-RID-NET-1014: a named group stop is never swallowed
+                raise
             except Exception:  # noqa: BLE001
                 _pre.append(0)
         _gmin0 = getattr(self, "_weg2_group_min_flags", None) or functools.partial(Scheduler._weg2_group_min_flags, self)
@@ -7113,6 +7143,8 @@ class Scheduler(
                 state = _refetch(req, now, allow_reissue=bool(_ok))
                 if state == "due":
                     state = "wait"
+            except _prefetch_rid_stop():  # PREFETCH-RID-NET-1014: a named group stop is never swallowed
+                raise
             except Exception as exc:  # noqa: BLE001
                 logger.info("#1471 SETTLE rid=%s n/a (%s: %s)", str(getattr(req, "rid", "?")),
                             type(exc).__name__, exc)
