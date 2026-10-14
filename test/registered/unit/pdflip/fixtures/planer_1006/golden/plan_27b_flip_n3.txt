@@ -1,5 +1,6 @@
 # argv_n=70 rc=0 exc=None: 
 PDFLIP-GC P warn: --env-p FLLIPER_PDFLIP_GC_WARN_SECS=0.5 (every P scheduler logs a GC collection over 0.5 s after boot; --env-p FLLIPER_PDFLIP_GC_WARN_SECS=0 = off)
+PDFLIP-LEISTUNGSSCHALTER registry qwen27b (default on after the metal proof; a stated --env-p/--env-d or exported value wins): P:FLLIPER_PDFLIP_GC_FREEZE=1 D:FLLIPER_PDFLIP_GC_FREEZE=1
 D-EIGENTUM MISS-RECORD (#239 S3f, PR): --env-d FLLIPER_PDFLIP_OWNED_MISS_RECORD=/spinning/evidence-665-f1/records/pdflip (D ranks write paired prefill miss records at their sleep; the owned solve reads them as RECORD from K=16 paired forwards per rank)
 PDFLIP-PREFIX-SWITCHES (registry fields, RG 26.09.; P, D and front get one value; FLLIPER_PDFLIP_TOLD_ABSOLUTE follows TOLD_PROBE_TREE_KEY unless set): FLLIPER_ANTHROPIC_INLINE_SYSTEM_IN_PLACE=1 (profile qwen27b), FLLIPER_PDFLIP_TOLD_PROBE_TREE_KEY=1 (profile qwen27b), FLLIPER_PDFLIP_TOLD_PACED=1 (profile qwen27b), FLLIPER_PDFLIP_P_TWIN_DEFER=1 (profile qwen27b), FLLIPER_PDFLIP_FRONT_SPAN_INFLIGHT=1 (profile qwen27b), FLLIPER_PDFLIP_TOLD_GROUP_FALLBACK=1 (profile qwen27b)
 PDFLIP-PROFILE-ARG-DEFAULTS (registry row qwen27b; unset flags only, a given flag wins): p_prefill_graph=512, p_trim_end_anchor=True, p_host_overlap=True, d_token_placement='bandwidth'

@@ -9,8 +9,8 @@ project is called fLLiper from release 0.1.0 on. The Python package is `flliper`
 > `desk/flliper-27b-int-1016` (27B line) and `desk/flliper-nf-int-1015` (Flash-Next line): RC3 (the vision rebuild, the pool-leak fix, the wedge instrument,
 > the W17 host-pressure line and, on the NF line, the room-vote and the D-WALL-HEAD class fix) plus the fixes of the NF steady-state line: on the NF line
 > priority lanes (default on), the host-RAM guards that warn instead of stopping, the flush and seat-gate fixes, the boot-heap freeze, the prefill-OOM retreat and the
-> group-wide void pass; on the 27B line the subset its tree reaches (collect-P, early-leg cap, host-RAM warnings behind the existing guard switches, boot-heap freeze
-> off by default). Catalog `82ad4dcc...` (2715 entries, 138 edges). RC4 is **not** the final 0.1.0:
+> group-wide void pass; on the 27B line the subset its tree reaches (collect-P, early-leg cap, host-RAM warnings behind the existing guard switches (default off = warn), boot-heap freeze
+> on by default). Catalog `8cc42e79...` (2715 entries, 138 edges). RC4 is **not** the final 0.1.0:
 > acceptance boots on the metal are open (no fLLiper image has booted); the pool-leak fix has metal evidence only from images of the old name (release notes, section 5). The image is
 > **not published** yet; pushing the tree to `github.com/efschu/fLLiper` and the image to `ghcr.io` are user gates.
 
