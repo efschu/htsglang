@@ -484,8 +484,10 @@ def test_vram_refusal_sites_of_the_launcher_are_untouched():
     # NF tree: only the gates BEFORE the flip path are wired to --force; D-BUDGET / P-CARD / WAKE-CREDIT are plain raises here
     assert counts == {"D-BUDGET": 0, "P-CARD": 0, "WAKE-CREDIT": 0, "HW-COUNT": 2, "HW-UNCALIBRATED": 1,
                       "HW-BORROWED": 1}, counts
-    # 92 `raise PdFlipLaunchRefused` on 2c8db9c8e5; HOSTWARN2 adds exactly one (the preflight script without a verdict)
-    assert src.count("raise PdFlipLaunchRefused") == 93
+    # renamed tree: 91 `raise PdFlipLaunchRefused` on the RC3 head b208fab8c5 (the source tree counted 92 on 2c8db9c8e5: the kit's
+    # rewrite of the old tree's two same-line raise texts leaves one `raise` less); HOSTWARN2 adds exactly one (the preflight script
+    # without a verdict) -> 92
+    assert src.count("raise PdFlipLaunchRefused") == 92
 
 
 def test_a_foreign_process_on_a_card_still_refuses(monkeypatch):
