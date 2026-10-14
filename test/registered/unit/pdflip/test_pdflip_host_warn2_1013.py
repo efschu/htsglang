@@ -346,7 +346,7 @@ def test_the_force_help_says_host_ram_is_not_refused():
     src = open(launcher.__file__, encoding="utf-8").read()
     i = src.index('"--force", action="store_true"')
     h = src[i:i + 2500]
-    assert "HOST RAM is not refused at all any more" in h and "(HW-COUNT, HW-UNCALIBRATED, HOST-DISK)" in h
+    assert "HOST RAM is not refused at all any more" in h  # 27B line: the --force list of wired codes is longer than the NF tree's
 
 
 # =========================================================================== pinned-host registry
@@ -470,7 +470,7 @@ def test_turnkey_host_headroom_warns_and_does_not_refuse(capsys):
 
 
 def test_vram_and_card_codes_keep_their_classes():
-    for c in ("D-BUDGET", "P-CARD", "WAKE-CREDIT", "PP-CUT", "HW-UNCALIBRATED", "HW-COUNT", "HW-BORROWED"):
+    for c in ("D-BUDGET", "P-CARD", "WAKE-CREDIT", "PP-CUT", "HW-UNCALIBRATED", "HW-COUNT"):  # 27B register: no HW-BORROWED entry
         assert refusals.by_code(c).klass == refusals.CLASS_VALUE, c
     for c in ("KARTE-BELEGT", "HW-ARCH", "HW-TOPOLOGY", "SHM-BELEGT", "PORT-BELEGT"):
         assert refusals.by_code(c).klass == refusals.CLASS_HARD, c
@@ -481,11 +481,10 @@ def test_vram_refusal_sites_of_the_launcher_are_untouched():
     src = open(launcher.__file__, encoding="utf-8").read()
     counts = {c: len(re.findall(r'refuse_value\(\s*"%s"' % re.escape(c), src))
               for c in ("D-BUDGET", "P-CARD", "WAKE-CREDIT", "HW-COUNT", "HW-UNCALIBRATED", "HW-BORROWED")}
-    # NF tree: only the gates BEFORE the flip path are wired to --force; D-BUDGET / P-CARD / WAKE-CREDIT are plain raises here
-    assert counts == {"D-BUDGET": 0, "P-CARD": 0, "WAKE-CREDIT": 0, "HW-COUNT": 2, "HW-UNCALIBRATED": 1,
-                      "HW-BORROWED": 1}, counts
-    # 92 `raise PdFlipLaunchRefused` on 2c8db9c8e5; HOSTWARN2 adds exactly one (the preflight script without a verdict)
-    assert src.count("raise PdFlipLaunchRefused") == 93
+    # 27B line: counted on the RC3 head 524a880606 (the base of this port); all of them stay as they were
+    assert counts == {'D-BUDGET': 1, 'P-CARD': 2, 'WAKE-CREDIT': 2, 'HW-COUNT': 2, 'HW-UNCALIBRATED': 1, 'HW-BORROWED': 0}, counts
+    # 97 `raise PdFlipLaunchRefused` on 524a880606; HOSTWARN2 adds exactly one (the preflight script without a verdict)
+    assert src.count("raise PdFlipLaunchRefused") == 98
 
 
 def test_a_foreign_process_on_a_card_still_refuses(monkeypatch):
@@ -523,7 +522,8 @@ def _do_stop_names(path):
 def test_the_fronts_vram_and_rank_death_stops_are_untouched():
     names = _do_stop_names(os.path.join(os.path.dirname(launcher.__file__), "front.py"))
     # the host-RAM stops are gone (HOSTWARN, 12.10.) ...
-    assert "W22" not in names and "W98" not in names
+    # 27B line: the two host-RAM stops stay, each behind its guard switch (FLLIPER_PDFLIP_HOST_GUARD_W22 / _W98, default on)
+    assert names.count("W22") == 1 and names.count("W98") == 1, names
     # ... the VRAM / rank-death ones are all still there
     for code, n in (("W17", 3), ("W19", 1), ("W4", 4), ("W2", 1), ("W3", 2), ("W9", 1)):
         assert names.count(code) == n, (code, names.count(code), names)

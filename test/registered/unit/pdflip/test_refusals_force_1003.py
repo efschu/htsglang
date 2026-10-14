@@ -138,7 +138,8 @@ class EntrypointWiring(Base):
         self.assertIn("plain launcher call", R.SCOPE_ENTRYPOINT_ONLY)
         self.assertEqual(pub["HW-COUNT"]["wired_at"], "launcher+entrypoint")
         self.assertEqual(pub["HW-UNCALIBRATED"]["wired_at"], "launcher+entrypoint")
-        self.assertEqual(pub["HOST-MEM"]["wired_at"], "launcher")
+        self.assertEqual(pub["HOST-DISK"]["wired_at"], "launcher")
+        self.assertIsNone(pub["HOST-MEM"]["wired_at"])      # HOSTWARN2: host RAM warns, nothing to lift
         self.assertEqual(pub["PP-CUT"]["wired_at"], "none")         # forcebar by class, wired nowhere: still refuses
         for c in ("HW-ARCH", "KARTE-BELEGT", "HW-TOPOLOGY"):
             self.assertIsNone(pub[c]["wired_at"], c)
