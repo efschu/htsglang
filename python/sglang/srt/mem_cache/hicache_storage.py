@@ -180,24 +180,92 @@ def fill_join_wait_ms(joined_stems: int = 0) -> int:
     return int(min(cap, max(base, int(joined_stems) * per_page)))
 
 
+def join_liveness_on() -> bool:
+    """JOIN-LIVENESS (14.10.): the JOIN / ROOM waits follow the holder's
+    progress instead of a fixed bound. 0 = the fixed bound."""
+    try:
+        return bool(envs.SGLANG_WEG2_L3FILL_JOIN_LIVENESS.get())
+    except Exception:  # noqa: BLE001 - no switch: the fixed bound
+        return False
+
+
+def join_noprogress_cap_ms() -> int:
+    """JOIN-LIVENESS: the emergency brake -- a wait ends after this long even
+    while its stems keep moving (``SGLANG_WEG2_L3FILL_JOIN_CAP_S``, 60)."""
+    try:
+        return max(0, int(float(envs.SGLANG_WEG2_L3FILL_JOIN_CAP_S.get()) * 1000.0))
+    except Exception:  # noqa: BLE001
+        return 60000
+
+
+def _join_signature(arena, slots) -> dict:
+    """slot -> claim generation (``claim_info``); empty when the arena cannot say."""
+    info = getattr(arena, "claim_info", None)
+    if not callable(info) or not slots:
+        return {}
+    try:
+        return {int(t[0]): int(t[1]) for t in info([int(s) for s in slots])}
+    except Exception:  # noqa: BLE001 - an instrument, never a gate
+        return {}
+
+
 def _await_fill_joins(arena, stems, joined, wait_ms: int) -> dict:
     """L3FILL-JOINED (2): poll the JOINED stems until another writer's claim
     turns COMPLETE (same answer as claim status 2: complete, usable) or the
-    wait is spent. Returns {index: slot} of those that completed."""
+    wait is spent. Returns {index: slot} of those that completed.
+
+    JOIN-LIVENESS (NF h16 a2cfc77f76, P 15:34:27-32, weg2-10-86): the wait was
+    a fixed bound. PP0 waited 5005 ms for 190 stems PP1 held
+    (``holders=[1904/1ms/pid778/l3fill ...]``, pid778 = PP1, which itself sat
+    in a 5-s JOIN-WAIT on the same claims); at 5 s PP1 reaped them stale and
+    read them itself (``#1433 190 of 190``), PP0 had just given up, its batch
+    missed (``ARENA-GET MISS find=(slot=1904,state=1)``), its read ended at
+    65536, the told cut to 65280 and 26624 tokens were re-prefilled. Now the
+    wait follows the holders: any of its stems completing, or a claim taken
+    over / re-claimed (slot or generation moved), is progress and restarts the
+    idle clock; the wait ends when nothing moved for ``max(bound, stale age)``
+    -- the caller's stale reap (``SGLANG_WEG2_L3FILL_STALE_CLAIM_S``) then
+    breaks a stalled or dead holder's claim and reads the page itself -- or at
+    the emergency cap (``SGLANG_WEG2_L3FILL_JOIN_CAP_S``) however much moves.
+    Fetching back beats recomputing. ``SGLANG_WEG2_L3FILL_JOIN_LIVENESS=0``:
+    the fixed bound."""
     find = getattr(arena, "find_slots", None)
     if not joined or wait_ms <= 0 or not callable(find):
         return {}
     pend = {int(i): stems[int(i)] for i, _s, _g in joined}
     done = {}
     t0 = time.perf_counter()
-    deadline = t0 + wait_ms / 1000.0
+    live = join_liveness_on()
+    idle_s = max(int(wait_ms), fill_stale_claim_ms()) / 1000.0
+    cap_s = max(idle_s, join_noprogress_cap_ms() / 1000.0)
+    deadline = t0 + (cap_s if live else wait_ms / 1000.0)
+    last_move = t0
+    seen: dict = {}
+    polls = moves = 0
     while pend:
         keys = list(pend)
+        now_slots = {}
         for i, (slot, state) in zip(keys, find([pend[i] for i in keys])):
             if int(slot) >= 0 and int(state) == 2:
                 done[i] = int(slot)
                 pend.pop(i)
-        if not pend or time.perf_counter() >= deadline:
+            else:
+                now_slots[i] = int(slot)
+        now = time.perf_counter()
+        if live:
+            moved = len(keys) != len(now_slots)
+            if not moved and polls % 8 == 0:
+                gens = _join_signature(arena, [s for s in now_slots.values() if s >= 0])
+                sig = {i: (s, gens.get(s)) for i, s in now_slots.items()}
+                moved = bool(seen) and any(seen.get(i) not in (None, v) for i, v in sig.items())
+                seen = sig
+            if moved:
+                last_move = now
+                moves += 1
+        polls += 1
+        if not pend or now >= deadline:
+            break
+        if live and now - last_move >= idle_s:
             break
         time.sleep(0.005)
     _JOIN_WAIT_N[0] += 1
@@ -206,10 +274,13 @@ def _await_fill_joins(arena, stems, joined, wait_ms: int) -> dict:
     k = _JOIN_WAIT_N[0]
     if k <= 16 or (k & (k - 1)) == 0 or pend:
         logger.info("L3-FILL JOIN-WAIT n=%d stems=%d completed=%d still_claimed=%d waited_ms=%.0f "
-                    "bound_ms=%d totals=%d/%d (a JOINED stem another writer completed inside the "
-                    "wait is read from L2 instead of ending the prefix; prefetch io thread only)",
+                    "bound_ms=%d liveness=%d moves=%d idle_ms=%.0f (a JOINED stem another writer "
+                    "completed inside the wait is read from L2 instead of ending the prefix; the "
+                    "wait follows the holder's progress, a stalled holder is reaped by the caller) "
+                    "totals=%d/%d",
                     k, len(joined), len(done), len(pend), (time.perf_counter() - t0) * 1000.0,
-                    int(wait_ms), _JOIN_WAIT_N[2], _JOIN_WAIT_N[1])
+                    int(wait_ms), int(live), moves, (time.perf_counter() - last_move) * 1000.0,
+                    _JOIN_WAIT_N[2], _JOIN_WAIT_N[1])
     return done
 
 
@@ -3639,7 +3710,8 @@ class HiCacheFile(HiCacheStorage):
             # Those references go within seconds (complete 5981 at 12:04:45).
             # Bounded, prefetch io thread only: evict + claim again until a
             # slot comes or the wait is spent; what gets a slot is read now.
-            _room = self._await_fill_room(arena, still_full, int(total_bytes), out, joined)
+            _room = self._await_fill_room(arena, still_full, int(total_bytes), out, joined,
+                                          stats=stats)
             if _room:
                 self._arena_fill_read_todo(arena, _room, int(total_bytes), out, stats)
         if joined:
@@ -3703,7 +3775,7 @@ class HiCacheFile(HiCacheStorage):
                 return i
         return n
 
-    def _await_fill_room(self, arena, still_full, total_bytes: int, out, joined) -> list:
+    def _await_fill_room(self, arena, still_full, total_bytes: int, out, joined, stats=None) -> list:
         """ROOM-WAIT: re-evict and re-claim the stems that found the arena FULL
         until each gets a slot or ``fill_room_wait_ms()`` is spent. Returns the
         fresh claims (todo entries); a stem another writer claimed meanwhile
@@ -3715,9 +3787,19 @@ class HiCacheFile(HiCacheStorage):
         pend = list(still_full)
         got = []
         t0 = time.perf_counter()
-        deadline = t0 + wait_ms / 1000.0
+        # JOIN-LIVENESS: while slots keep coming the wait goes on (idle bound
+        # = the room bound, emergency cap SGLANG_WEG2_L3FILL_JOIN_CAP_S), and
+        # each round's fresh claims are READ AT ONCE -- a claim held unread
+        # through the rest of the wait is exactly what a peer's JOIN-WAIT
+        # sits on (P 15:34:27-32 weg2-10-86).
+        live = join_liveness_on() and stats is not None
+        deadline = t0 + (max(wait_ms, join_noprogress_cap_ms()) if live else wait_ms) / 1000.0
+        last_move = t0
+        read_now = 0
         rounds = 0
         while pend and time.perf_counter() < deadline:
+            if live and time.perf_counter() - last_move >= wait_ms / 1000.0:
+                break
             time.sleep(0.025)
             rounds += 1
             try:
@@ -3745,6 +3827,12 @@ class HiCacheFile(HiCacheStorage):
                     joined.append((i, slot, gen))
                 elif status == 4:
                     nxt.append((i, st))
+            if live and (len(nxt) < len(pend)):
+                last_move = time.perf_counter()
+            if live and got:
+                self._arena_fill_read_todo(arena, got, int(total_bytes), out, stats)
+                read_now += len(got)
+                got = []
             pend = nxt
         _ROOM_WAIT_N[0] += 1
         k = _ROOM_WAIT_N[0]
@@ -3752,7 +3840,7 @@ class HiCacheFile(HiCacheStorage):
             logger.info("L3-FILL ROOM-WAIT n=%d stems=%d claimed=%d still_full=%d rounds=%d waited_ms=%.0f "
                         "bound_ms=%d (the arena was FULL for these stems: evict + claim again instead of "
                         "ending the prefix; prefetch io thread only)",
-                        k, len(still_full), len(got), len(pend), rounds,
+                        k, len(still_full), len(got) + read_now, len(pend), rounds,
                         (time.perf_counter() - t0) * 1000.0, int(wait_ms))
         return got
 

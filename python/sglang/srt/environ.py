@@ -833,6 +833,13 @@ class Envs:
     # writer is refused by name, status 6) and the fill claims the stem fresh.
     # y4a: 29 stems JOINED for >= 6 s blocked D and P. 0 = never.
     SGLANG_WEG2_L3FILL_STALE_CLAIM_S = EnvFloat(5.0)
+    # JOIN-LIVENESS (NF h16 15:34:27-32, weg2-10-86): the JOIN / ROOM waits
+    # follow progress -- a completed stem or a claim taken over restarts the
+    # idle clock; nothing moving for max(bound, STALE_CLAIM_S) ends the wait
+    # (the stale reap then breaks the claim and reads the page itself);
+    # JOIN_CAP_S is the emergency brake. 0 = the fixed bound.
+    SGLANG_WEG2_L3FILL_JOIN_LIVENESS = EnvBool(True)
+    SGLANG_WEG2_L3FILL_JOIN_CAP_S = EnvFloat(60.0)
     # STORE_REFUSE_FS (W57, user 28.09.: "L3 gehoert auf XFS, nie ZFS"): a
     # real boot whose store directory lives on one of these filesystems
     # (/proc/mounts) is refused by name -- the container layer (overlay) or
