@@ -7093,7 +7093,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         from sglang.srt.weg2 import pp_loadback_verdict as _lbv
 
         _lbv_rid = getattr(req, "rid", None)
-        _lbv_gated = _lbv_rid is not None and _lbv.armed(self)
+        # NF-RANG-AUDIT 1014: a load-back that EXECUTES PP0's row (Fix B row authority,
+        # execute_scheduled_prefix) is not gated -- the row is the verdict (pp_loadback_verdict.gated)
+        _lbv_gated = _lbv_rid is not None and _lbv.gated(self, req)
         if _lbv_gated and not _lbv.released(self, _lbv_rid):
             def _lbv_fits() -> bool:
                 if kv_tokens <= floor:

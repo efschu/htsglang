@@ -528,8 +528,10 @@ class ModelProfile:
     #: Fix B (weg2/p_row_authority.py): SGLANG_WEG2_P_ROW_AUTHORITY, the #631
     #: row form on group P (effective on pp>1 only). Operator 27.09.: the
     #: default turns only after a clean metal proof under agent load -- met by
-    #: w109290020 (29.09.), qwen27b on since; nextflash off. An explicit env
-    #: wins (=0 turns the 27B row off).
+    #: w109290020 (29.09.), qwen27b on since; nextflash on since 14.10. (NF
+    #: rang-audit S5: the carrierless form's followers planned from their own
+    #: pools; its metal proof is the next NF boot's K0-K3). An explicit env
+    #: wins (=0 turns the row off).
     p_row_authority: bool = False
     #: VRAM-GRUNDGESETZ (user 19.09. / 29.09.: no reserve, only measured
     #: transients; desk/27b-no-reserve-0929, weg2/budget_rest.py): group D's
@@ -1014,6 +1016,16 @@ PROFILES: Dict[str, ModelProfile] = {
         p_twin_defer=True,
         front_span_inflight=False,
         told_group_fallback=False,
+        # NF-RANG-AUDIT 1014 (nf-rang-audit-1014.md S5): on the carrierless P
+        # form (PP3, TP=1 per stage) '#631 ROW AUTHORITY DISABLED' let every
+        # follower plan from its OWN pool through every rank-local gate of
+        # add_one_req; the class #1233/#1004/W27 was closed one term at a time
+        # (six deaths 14.10.). Fix B is the mechanism "PP0 decides, the
+        # followers execute its row" and was off here only for want of an NF
+        # metal proof (user rule 14.10.: features are on, weaknesses get fixed).
+        # The LB-VERDICT gate yields to an executed row (SGLANG_WEG2_LBV_ROW_YIELD).
+        # An explicit SGLANG_WEG2_P_ROW_AUTHORITY=0 still wins.
+        p_row_authority=True,
         # SCHALTER-HALBPORT 1002 (audit section 6): every NF boot runs
         # --weg2-vision transient (nf-int4.env:229); the row said off. It is the
         # launcher default for an unset flag (vision_arg_default below).

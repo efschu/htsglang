@@ -37,6 +37,22 @@ The price is one pass of latency per host load-back on this form.
 Switch ``SGLANG_WEG2_PP_LOADBACK_VERDICT`` (default on); ``0`` = the rank-local
 room verdict as before. Armed only where the floor is the local-PP floor
 (``pp_slot_fidelity.FLOOR_LOCAL_PP_ATTR``) and the stage has a pp rank > 1 group.
+
+THE ROW IS PP0'S VERDICT (NF-RANG-AUDIT 1014, S5 x Fix B). With the #631 row
+authority on (``weg2/p_row_authority.py``, nextflash since 14.10.) a follower
+executes PP0's admission row: ``execute_scheduled_prefix`` materialises exactly
+the scheduled prefix from this stage's host tier (``init_load_back`` ->
+``load_back``). On the layer-split form the host hit is NOT rank-uniform
+(schedule_policy: PP0 may hold the prefix on the device while a follower holds
+it only on the host), so PP0 never raised ``hold`` for that rid and never sent
+a verdict -- the gate below would hold the follower's materialisation until
+its bound and stop it (``#968 PREFIX MATERIALISATION SHORTFALL``) while PP0
+proceeds: a split made by the gate itself. A load-back that EXECUTES a
+forwarded row therefore passes the gate (``gated`` is False while
+``ROW_ATTR`` is set on the request); the row already is the one decision, and
+a stage that cannot execute it stops by name in the materialisation station.
+Switch ``SGLANG_WEG2_LBV_ROW_YIELD`` (default on); ``0`` = the gate holds a
+row-executed load-back as before (the split).
 """
 
 from __future__ import annotations
@@ -53,6 +69,11 @@ MARK = "LB-VERDICT"
 _STATE_ATTR = "_weg2_lbv_state"
 _RELEASED_CAP = 4096
 _LOG_FIRST = 16
+#: NF-RANG-AUDIT 1014: the gate yields to a load-back that executes PP0's row.
+ROW_YIELD_ENV = "SGLANG_WEG2_LBV_ROW_YIELD"
+#: request attribute, True only while ``execute_scheduled_prefix`` materialises
+#: a forwarded row (set and cleared by that station, one straight-line stretch).
+ROW_ATTR = "_weg2_lbv_row_executed"
 
 
 @dataclass
@@ -104,6 +125,26 @@ def armed(tree) -> bool:
 
     return (enabled() and state(tree) is not None
             and bool(getattr(tree, FLOOR_LOCAL_PP_ATTR, False)))
+
+
+def row_yield_enabled() -> bool:
+    return (os.environ.get(ROW_YIELD_ENV, "1") or "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def row_executed(req) -> bool:
+    """True while ``req``'s load-back executes a forwarded row (PP0's decision)."""
+    return bool(getattr(req, ROW_ATTR, False))
+
+
+def gated(tree, req) -> bool:
+    """Does the LB-VERDICT gate apply to THIS load-back? Armed on this tree, the
+    request named, and -- NF-RANG-AUDIT 1014 -- not a load-back that executes
+    PP0's row: the row is the verdict, the station stops by name on a shortfall."""
+    if req is None or getattr(req, "rid", None) is None or not armed(tree):
+        return False
+    if row_yield_enabled() and row_executed(req):
+        return False
+    return True
 
 
 def absorb(tree, verdict: Weg2PpLoadbackVerdict) -> None:
