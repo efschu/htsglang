@@ -290,6 +290,19 @@ def below_floor(sched, req) -> bool:
     Replicated inputs (the floor RPC every rank applied, the request's own field)."""
     if not _floor_on():
         return False
+    # H16M-INT 1014 (merge of WAKE-READ-FLOOR with PRIO-AS-AGE): the lane FLOOR exists only in the floor
+    # mode of 1008.  With priority acting as age (user decision 14.10. 18:27Z: priority is a sort key, no
+    # lane floor / hold / preempt) the ONE place that decides whether a floor may act is
+    # ``prio_age.floor_mode()`` -- this read follows it instead of reading a floor attribute that the
+    # refused /weg2/lane_floor RPC can never raise there.  Replicated input (env, same on every rank;
+    # the start check WEG2 MODE-PARITY names a mixed boot).
+    try:
+        from sglang.srt.weg2 import prio_age as _pa
+
+        if not _pa.floor_mode():
+            return False
+    except Exception:  # noqa: BLE001 - floor_mode itself never raises; no read = no floor
+        return False
     try:
         from sglang.srt.weg2 import d_lane
 

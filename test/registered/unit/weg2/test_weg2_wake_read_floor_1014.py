@@ -27,6 +27,11 @@ from sglang.srt.weg2 import d_lane, park_l3  # noqa: E402
 def _group_d(monkeypatch):
     monkeypatch.setenv("SGLANG_WEG2_GROUP", "D")
     monkeypatch.delenv(park_l3.FLOOR_ENV, raising=False)
+    # h16m 1014: the floor exists only in the lane FLOOR mode of 1008 (prio_age.floor_mode); this file is that mode's
+    # acceptance, pinned like the other lane files of PRIO-AS-AGE.  The age mode (production default) is
+    # test_weg2_h16m_int_1014.py: the wake read never waits on a floor there.
+    monkeypatch.setenv("SGLANG_WEG2_LANES", "1")
+    monkeypatch.setenv("SGLANG_WEG2_PRIO_AS_AGE", "0")
     with envs.SGLANG_WEG2_ENABLE_PARK_L3.override(True):
         yield
 

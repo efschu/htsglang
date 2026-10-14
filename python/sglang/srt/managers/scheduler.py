@@ -4940,6 +4940,13 @@ class Scheduler(
             self.pp_flip_counters = _prow.build_counters(self)
             self.pp_chain_receiver = _prow.build_chain_receiver(self, self.pp_flip_counters)
             _prow.start_check(self)
+        # WEG2 MODE-PARITY (h16m 1014, N4): every rank of a Weg-2 group states
+        # its priority mode once (no collective); the front compares the
+        # groups' published mode with its own and stops by name on a mismatch.
+        if os.environ.get("SGLANG_WEG2_GROUP", "").strip().upper() in ("P", "D"):
+            from sglang.srt.weg2 import mode_parity as _mode_parity
+
+            _mode_parity.log_rank(self)
         # WEG2 VISION (user design 2026-09-24): PP0 of a transient P group
         # encodes images in its OWN process, on its KV tail, before the
         # admission (weg2/vision_rank_runner.py). False on every other boot
@@ -11582,12 +11589,28 @@ class Scheduler(
         # the divergence class #1158 ends -- it raises, never degrades.
         if getattr(self, "enable_priority_scheduling", False):
             return
-        if str(os.environ.get("SGLANG_WEG2_GROUP", "")).strip().upper() not in ("P", "D"):
+        _grp = str(os.environ.get("SGLANG_WEG2_GROUP", "")).strip().upper()
+        if _grp not in ("P", "D"):
             return
         from sglang.srt.weg2 import prio_age as _pa
 
         if not _pa.enabled():
             return
+        # N5 (review nf-prio-alter 1014): on group P a stage sorts only where
+        # its order cannot become a per-stage plan -- a single stage
+        # (pp_size==1), or the row form where the followers EXECUTE PP0's row
+        # (``followers_execute_row``: PP0's sort reaches them through the
+        # row's entries, their own sort is overruled by
+        # ``order_batch_by_schedule``).  On the carrierless form every stage
+        # plans for itself and a stage-local sort would assume equal queues
+        # per pass; there P's order stays the front's ``pick`` alone.  The
+        # predicate reads the form fixed at init (switch + ROW_ONLY_ATTR), the
+        # same on every stage of one boot.
+        if _grp == "P":
+            from sglang.srt.weg2.prefill_oom_retreat import followers_execute_row
+
+            if not followers_execute_row(self):
+                return
         q = self.waiting_queue
         ordered = _pa.lane_sorted(q, on=True)
         if any(a is not b for a, b in zip(ordered, q)):
@@ -14450,11 +14473,28 @@ class Scheduler(
         )
         if tp_size > 1 and group_match is None:
             self._weg2_x_abstained = getattr(self, "_weg2_x_abstained", 0) + 1
-            if self._weg2_x_abstained <= 5 or self._weg2_x_abstained % 64 == 0:
+            # N3 (review nf-prio-alter 1014), COUNTED, not changed: PRIO-AS-AGE
+            # can lift a p>0 rid from outside the W9 canon (the 32 smallest
+            # rids, tp_head_congruence.canonical_head_rids) to the queue head;
+            # the gate abstains for it (group-uniform: the canon is the rid
+            # SET's). Extending the canon by priority would change the slot
+            # map of the head reduce -- not done here; this counter is the
+            # metal reading that decides whether it is needed.
+            try:
+                _prio = int(getattr(req, "priority", 0) or 0)
+            except (TypeError, ValueError):
+                _prio = 0
+            if _prio > 0:
+                self._weg2_x_abstained_prio = getattr(self, "_weg2_x_abstained_prio", 0) + 1
+            if (self._weg2_x_abstained <= 5 or self._weg2_x_abstained % 64 == 0
+                    or (_prio > 0 and (self._weg2_x_abstained_prio <= 5
+                                       or self._weg2_x_abstained_prio % 64 == 0))):
                 logger.info(
                     "WEG2 X-GATE rid=%s uncached=? X=%d replicated_term=False "
-                    "verdict=abstain_no_group_match occurrence=%d",
+                    "verdict=abstain_no_group_match occurrence=%d priority=%d "
+                    "prio_occurrence=%d",
                     str(getattr(req, "rid", "?")), x, self._weg2_x_abstained,
+                    _prio, getattr(self, "_weg2_x_abstained_prio", 0),
                 )
             return False
         uncached = self.weg2_uncached_extent(req, head_inputs)
@@ -21439,6 +21479,14 @@ class Scheduler(
 
             ret["weg2_kv"]["decode_clip"] = d_decode_clip()
         except Exception:  # noqa: BLE001 -- an instrument never breaks the info route
+            pass
+        # WEG2 MODE-PARITY (h16m 1014, N4): this group's priority mode for the
+        # front's start check (weg2/mode_parity.py). A reading, the front decides.
+        try:
+            from sglang.srt.weg2 import mode_parity as _mode_parity
+
+            ret[_mode_parity.INFO_KEY] = _mode_parity.local_mode()
+        except Exception:  # noqa: BLE001 -- absent block = the front stops by name
             pass
         # #287: the effective figure is the limiter's floating value. Without
         # a ceiling the limiter holds max_running_requests, so this key keeps

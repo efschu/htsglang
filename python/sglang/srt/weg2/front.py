@@ -6178,6 +6178,9 @@ class Front:
         app["launcher_prewarm"] = asyncio.create_task(self._prewarm_launcher_import())
         if self.x_exact:
             app["x_exact"] = asyncio.create_task(self._x_exact_boot())
+        # WEG2 MODE-PARITY (h16m 1014, N4): one priority mode on front, P and D
+        # -- the front's own line now, the groups' read until both answered.
+        app["mode_parity"] = asyncio.create_task(self._mode_parity_boot())
         # H78: the same move for the flip path's small lazy imports (wake_credit
         # alone put ~5 ms into x175's first FLIP-ORDER) and for the sidecar the
         # sleep-leg gate reads at every flip (18-47 ms of JSON on the loop).
@@ -6354,6 +6357,66 @@ class Front:
                     "for the front tokenizer; a boot-start arrival is never priced by chars/3 "
                     "because the tokenizer was loading)", rid, (time.monotonic() - t0) * 1000.0,
                     ft.state)
+
+    #: WEG2 MODE-PARITY: the pause between two reads of a group that has not answered yet
+    MODE_PARITY_RETRY_S = 10.0
+
+    async def _mode_parity_boot(self) -> None:
+        """WEG2 MODE-PARITY (h16m 1014, review nf-prio-alter N4): the front states
+        its priority mode (``SGLANG_WEG2_LANES`` / ``SGLANG_WEG2_PRIO_AS_AGE``),
+        reads each group's published mode off ``/get_server_info``
+        (``internal_states[0].weg2_mode``, weg2/mode_parity.py) -- retried until
+        BOTH groups answered, a dormant group answers at the latest when it is
+        woken -- and compares once. Equal: ``WEG2 MODE-PARITY OK``. Different,
+        or a group that answers without the block: the named front stop
+        ``W-MODE-PARITY`` (a detected disagreement stops; it is never served
+        around). The front is the one decider; the groups only report.
+        ``SGLANG_WEG2_MODE_PARITY_CHECK=0``: the lines, no stop."""
+        from sglang.srt.weg2 import mode_parity as _mp
+
+        try:
+            own = _mp.local_mode()
+        except Exception as e:  # noqa: BLE001 - the front cannot read its own switches: nothing to compare
+            logger.error("%s role=front unreadable (%s: %s) -- no start check", _mp.MARK, type(e).__name__, e)
+            return
+        logger.info("%s role=front %s raw=%s", _mp.MARK, _mp._fmt(own),
+                    {k: os.environ.get(k) for k in _mp.SWITCHES})
+        stop_on = (os.environ.get("SGLANG_WEG2_MODE_PARITY_CHECK", "1") or "1").strip().lower() not in (
+            "0", "false", "no", "off")
+        got: Dict[str, Optional[Dict[str, Any]]] = {}
+        tries = 0
+        t0 = time.monotonic()
+        while True:
+            tries += 1
+            for name in ("P", "D"):
+                if name in got or name not in self.groups:
+                    continue
+                g = self.groups[name]
+                try:
+                    async with self.session.get(f"{g.url}/get_server_info",
+                                                timeout=ClientTimeout(total=10)) as r:
+                        body = await r.json() if r.status == 200 else None
+                except Exception:  # noqa: BLE001 -- group not up / asleep; retried
+                    body = None
+                answered, mode = _mp.mode_of_info(body)
+                if answered:
+                    got[name] = mode
+            if all(n in got for n in ("P", "D") if n in self.groups):
+                break
+            if tries % 6 == 1:
+                logger.info("%s waiting for %s (try %d, %.0f s)", _mp.MARK,
+                            [n for n in ("P", "D") if n in self.groups and n not in got],
+                            tries, time.monotonic() - t0)
+            await asyncio.sleep(self.MODE_PARITY_RETRY_S)
+        ok, line = _mp.verdict_line(own, got)
+        self.counters["mode_parity_checked"] += 1
+        if ok:
+            logger.info("%s", line)
+            return
+        self.counters["mode_parity_mismatch"] += 1
+        logger.error("%s", line)
+        if stop_on:
+            self.do_stop(_mp.STOP_NAME, line)
 
     async def _x_exact_boot_load(self) -> None:
         """Load D's rendering stack into the front, off the event loop.
