@@ -261,6 +261,66 @@ def _lane_sorted(hold) -> list:
     return sorted(list(hold or ()), key=lambda r: -_lane(r))
 
 
+#: WAKE-READ-FLOOR-1014 (NF h17 38c6d40239, D TP0 15:48:07-54, weg2-2-55): D took floor 1 at
+#: 15:48:07 (the lane-1 image turn), and at the P->D wake 15:48:09 ``#248 WAKE-READ issued=5
+#: ['weg2-2-30', 'weg2-2-31', 'weg2-2-44', 'weg2-2-45', 'weg2-2-47'] ... in_flight_pages=6309
+#: arena_slots=6485`` -- five lane-0 hold reads the floor would not seat took the whole arena; the
+#: lane-1 read of weg2-2-55 found it pinned (ARENA-REF-HOLDERS 15:48:31 tree_in_use=5848
+#: arena_pinned=6323 of 6323), read 0 / 128 / 24640 of 192512 in 43 s and went W31 -> W50 -> P
+#: (P read all 192512 in 8.9 s). On: a hold read below D's floor waits (CAPWAIT, parked in the
+#: settle) until the floor falls to its lane; 0 = the old issue.
+FLOOR_ENV = "SGLANG_WEG2_WAKE_READ_LANE_FLOOR"
+FLOOR_MARK = "#248f WAKE-READ FLOOR-WAIT"
+
+
+def _floor_on() -> bool:
+    return (os.environ.get(FLOOR_ENV, "1") or "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _req_lane(req) -> int:
+    try:
+        return int(getattr(req, "priority", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def below_floor(sched, req) -> bool:
+    """WAKE-READ-FLOOR-1014: ``req``'s lane is below D's lane floor -- D would not
+    seat it, so its hold read would only take arena room from the floor lane.
+    Replicated inputs (the floor RPC every rank applied, the request's own field)."""
+    if not _floor_on():
+        return False
+    try:
+        from sglang.srt.weg2 import d_lane
+
+        floor = d_lane.floor_of(sched)
+    except Exception:  # noqa: BLE001 - no floor readable: nothing held back
+        return False
+    return floor > 0 and _req_lane(req) < floor
+
+
+def _hold_below_floor(sched, reqs, where: str) -> list:
+    """Split off the reads below the floor: they wait as capacity waiters (the
+    settle re-offers them every tick, :func:`issue_capacity_waiters`)."""
+    keep, held = [], []
+    for req in reqs:
+        (held if below_floor(sched, req) else keep).append(req)
+    for req in held:
+        setattr(req, CAPWAIT_ATTR, True)
+    if held:
+        try:
+            from sglang.srt.weg2 import d_lane
+
+            floor = d_lane.floor_of(sched)
+        except Exception:  # noqa: BLE001
+            floor = -1
+        logger.info("%s n=%d where=%s floor=%d rids=%s (hold reads below D's lane floor wait, parked in "
+                    "the settle, until the floor falls to their lane: the floor lane's reads get the "
+                    "arena -- WAKE-READ-FLOOR-1014)", FLOOR_MARK, len(held), where, floor,
+                    [(str(r.rid), _req_lane(r)) for r in held])
+    return keep
+
+
 def issue_deferred_reads(sched, hold) -> list:
     """``#1443 DORMANT-RELEASE``: issue the store read of every held request
     whose intake only looked it up, in hold order. Every rank runs this at
@@ -284,6 +344,7 @@ def issue_deferred_reads(sched, hold) -> list:
     input is replicated (request lengths, hold order, the shared arena's
     geometry), so every rank decides alike."""
     reqs = [r for r in _lane_sorted(hold) if deferred(r)]
+    reqs = _hold_below_floor(sched, reqs, "issue")
     if not reqs:
         return []
     cap = arena_capacity(sched) if arena_gate_on() else None
@@ -319,6 +380,7 @@ def issue_capacity_waiters(sched, settle) -> list:
     admitted (queued: their load-back has not freed the arena yet). Returns those issued;
     their settle clock restarts now (waiting is not reading)."""
     waiters = [r for r in _lane_sorted(settle) if capacity_waiting(r)]  # LANES HOTFIX 1014: highest lane first
+    waiters = [r for r in waiters if not below_floor(sched, r)]  # WAKE-READ-FLOOR-1014: not while the floor holds it
     if not waiters:
         return []
     cap = arena_capacity(sched) if arena_gate_on() else None
