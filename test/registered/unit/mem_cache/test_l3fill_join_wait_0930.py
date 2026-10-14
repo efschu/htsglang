@@ -93,3 +93,36 @@ def test_a_claim_that_never_completes_is_a_miss_after_the_bound(tmp_path):
     assert out[0] is not None and out[1] is None and out[2] is None
     assert 0.07 <= took < 2.0
     assert arena.claim_info([slot])[0][5] == 1       # the other writer's claim untouched
+
+
+def test_own_claims_are_filled_before_the_join_wait(tmp_path):
+    """STORE-SHORT (NF h6 11:17:38, weg2-4-17): two ranks with CROSS claims.
+    The peer completes its claim (p1) only once OUR claim (p2) is complete --
+    as a peer does that itself waits on our stems before filling its own.
+    Before the fix this fill waited out the bound with p2 unfilled, so the
+    peer never finished: the prefix ended at p1 (1024 of 3168 pages)."""
+    be, arena, slot, gen = _setup(tmp_path)
+
+    def peer():
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            (_s, state), = arena.find_slots(["p2"])
+            if int(state) == 2:
+                assert arena.complete_slots([slot], [gen], [(0, TOTAL)]) == [1]
+                return
+            time.sleep(0.005)
+
+    threading.Thread(target=peer).start()
+    with envs.SGLANG_WEG2_L3FILL_JOIN_WAIT_MS.override(300):
+        out = _run_on("hicache-prefetch-io-0", lambda: HiCacheFile.arena_fill_from_disk(
+            be, arena, ["p0", "p1", "p2"], TOTAL, prefix=True))
+    assert out[0] is not None and out[1] == slot and out[2] is not None
+
+
+def test_the_wait_is_priced_on_the_joined_stems():
+    with envs.SGLANG_WEG2_L3FILL_JOIN_WAIT_MS.override(300):
+        assert _run_on("hicache-prefetch-io-0", lambda: hs.fill_join_wait_ms(1)) == 300
+        assert _run_on("hicache-prefetch-io-0", lambda: hs.fill_join_wait_ms(385)) == 770
+        assert _run_on("hicache-prefetch-io-0", lambda: hs.fill_join_wait_ms(5000)) == 3000
+    with envs.SGLANG_WEG2_L3FILL_JOIN_WAIT_MS.override(0):
+        assert _run_on("hicache-prefetch-io-0", lambda: hs.fill_join_wait_ms(385)) == 0
