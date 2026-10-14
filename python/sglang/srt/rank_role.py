@@ -468,7 +468,7 @@ SEAM_LIST: Tuple[Seam, ...] = (
         anchors=(
             ("managers/cache_controller.py", 1853,
              "Weighted uneven-DCP HiCache storage requires page_size == 1"),
-            ("mem_cache/hicache_storage.py", 5360,
+            ("mem_cache/hicache_storage.py", 5448,
              "class FormAWorkerNullStorage"),
         ),
     ),

@@ -85,7 +85,9 @@ def test_the_scheduler_thread_never_waits(tmp_path):
 
 def test_a_claim_that_never_completes_is_a_miss_after_the_bound(tmp_path):
     be, arena, slot, gen = _setup(tmp_path)
-    with envs.SGLANG_WEG2_L3FILL_JOIN_WAIT_MS.override(80):
+    # JOIN-LIVENESS: the idle bound is max(bound, stale age); no stale reap here
+    with envs.SGLANG_WEG2_L3FILL_JOIN_WAIT_MS.override(80), \
+            envs.SGLANG_WEG2_L3FILL_STALE_CLAIM_S.override(0.0):
         t0 = time.perf_counter()
         out = _run_on("hicache-prefetch-io-1", lambda: HiCacheFile.arena_fill_from_disk(
             be, arena, ["p0", "p1", "p2"], TOTAL, prefix=True))
@@ -196,7 +198,8 @@ def test_an_inflight_page_off_the_prefetch_thread_is_still_a_gap(tmp_path):
 def test_an_inflight_page_that_never_completes_ends_the_prefix_after_the_bound(tmp_path):
     be, arena, slot, gen = _setup_inflight(tmp_path)
     with envs.SGLANG_WEG2_L3FILL_JOIN_WAIT_MS.override(80), \
-            envs.SGLANG_WEG2_L3FILL_JOIN_WAIT_PER_PAGE_MS.override(0.0):
+            envs.SGLANG_WEG2_L3FILL_JOIN_WAIT_PER_PAGE_MS.override(0.0), \
+            envs.SGLANG_WEG2_L3FILL_STALE_CLAIM_S.override(0.0):
         t0 = time.perf_counter()
         out = _run_on("hicache-prefetch-io-1", lambda: HiCacheFile.arena_fill_from_disk(
             be, arena, ["p0", "p1", "p2"], TOTAL, prefix=True))
@@ -234,3 +237,112 @@ def test_a_room_wait_claim_lost_to_a_peer_is_awaited_not_dropped(tmp_path):
         out = _run_on("hicache-prefetch-io-0", lambda: HiCacheFile.arena_fill_from_disk(
             be, arena, ["p0"], TOTAL, prefix=True))
     assert out[0] == box["slot"]
+
+
+
+# ---- JOIN-LIVENESS (NF h16 a2cfc77f76, P 15:34:27-32, weg2-10-86) ---------------
+
+
+def _setup_many(tmp_path, n):
+    root = tmp_path / "store"
+    root.mkdir()
+    names = ["q%d" % i for i in range(n)]
+    for s_ in names:
+        (root / (s_ + ".bin")).write_bytes(b"\x55" * TOTAL)
+    arena = ShmArena(str(tmp_path / "kv.bin"), TOTAL, 2 * n + 4)
+    claims = arena.claim_slots(names[1:], [TOTAL] * (n - 1))   # a peer holds all but q0
+    assert all(st == 0 for _s, st, _g in claims)
+    return _backend(str(root)), arena, names, claims
+
+
+def _complete_one_by_one(arena, claims, every_s):
+    def run():
+        for slot, _st, gen in claims:
+            time.sleep(every_s)
+            arena.complete_slots([slot], [gen], [(0, TOTAL)])
+    th = threading.Thread(target=run)
+    th.start()
+    return th
+
+
+def test_a_holder_that_keeps_completing_is_waited_for_past_the_bound(tmp_path):
+    """The peer completes one page every 80 ms for ~0.5 s; the idle bound is
+    150 ms. A fixed bound ends the prefix after 150 ms, the live wait gets all."""
+    be, arena, names, claims = _setup_many(tmp_path, 7)
+    th = _complete_one_by_one(arena, claims, 0.08)
+    with envs.SGLANG_WEG2_L3FILL_JOIN_WAIT_MS.override(150), \
+            envs.SGLANG_WEG2_L3FILL_JOIN_WAIT_PER_PAGE_MS.override(0.0), \
+            envs.SGLANG_WEG2_L3FILL_STALE_CLAIM_S.override(0.0), \
+            envs.SGLANG_WEG2_L3FILL_JOIN_LIVENESS.override(True):
+        out = _run_on("hicache-prefetch-io-0", lambda: HiCacheFile.arena_fill_from_disk(
+            be, arena, names, TOTAL, prefix=True))
+    th.join(5)
+    assert all(o is not None for o in out), out
+
+
+def test_the_fixed_bound_with_liveness_off_ends_early(tmp_path):
+    be, arena, names, claims = _setup_many(tmp_path, 7)
+    th = _complete_one_by_one(arena, claims, 0.08)
+    with envs.SGLANG_WEG2_L3FILL_JOIN_WAIT_MS.override(150), \
+            envs.SGLANG_WEG2_L3FILL_JOIN_WAIT_PER_PAGE_MS.override(0.0), \
+            envs.SGLANG_WEG2_L3FILL_STALE_CLAIM_S.override(0.0), \
+            envs.SGLANG_WEG2_L3FILL_JOIN_LIVENESS.override(False):
+        out = _run_on("hicache-prefetch-io-0", lambda: HiCacheFile.arena_fill_from_disk(
+            be, arena, names, TOTAL, prefix=True))
+    th.join(5)
+    assert out[0] is not None and any(o is None for o in out)
+
+
+def test_a_holder_that_never_moves_ends_at_the_idle_bound_not_the_cap(tmp_path):
+    be, arena, names, _claims = _setup_many(tmp_path, 3)
+    with envs.SGLANG_WEG2_L3FILL_JOIN_WAIT_MS.override(100), \
+            envs.SGLANG_WEG2_L3FILL_JOIN_WAIT_PER_PAGE_MS.override(0.0), \
+            envs.SGLANG_WEG2_L3FILL_STALE_CLAIM_S.override(0.0), \
+            envs.SGLANG_WEG2_L3FILL_JOIN_CAP_S.override(30.0), \
+            envs.SGLANG_WEG2_L3FILL_JOIN_LIVENESS.override(True):
+        t0 = time.perf_counter()
+        out = _run_on("hicache-prefetch-io-0", lambda: HiCacheFile.arena_fill_from_disk(
+            be, arena, names, TOTAL, prefix=True))
+        took = time.perf_counter() - t0
+    assert out[0] is not None and out[1] is None
+    assert 0.09 <= took < 2.0
+
+
+def test_a_stalled_holder_is_reaped_after_the_stale_age_and_read(tmp_path):
+    """No progress for the stale age: the caller's stale reap breaks the
+    claim and this fill reads the page itself -- fetching back, not a miss."""
+    be, arena, names, _claims = _setup_many(tmp_path, 3)
+    with envs.SGLANG_WEG2_L3FILL_JOIN_WAIT_MS.override(50), \
+            envs.SGLANG_WEG2_L3FILL_JOIN_WAIT_PER_PAGE_MS.override(0.0), \
+            envs.SGLANG_WEG2_L3FILL_STALE_CLAIM_S.override(0.2), \
+            envs.SGLANG_WEG2_L3FILL_JOIN_LIVENESS.override(True):
+        out = _run_on("hicache-prefetch-io-0", lambda: HiCacheFile.arena_fill_from_disk(
+            be, arena, names, TOTAL, prefix=True))
+    assert all(o is not None for o in out), out
+
+
+def test_room_wait_keeps_going_while_slots_come_and_reads_them_at_once(tmp_path):
+    """Two FULL stems; one slot frees at 60 ms, the next at 230 ms; the room
+    bound is 200 ms. The live wait takes both (idle restarts at the first)."""
+    root = tmp_path / "store"
+    root.mkdir()
+    for s_ in ("r0", "r1"):
+        (root / (s_ + ".bin")).write_bytes(b"\x66" * TOTAL)
+    arena = ShmArena(str(tmp_path / "kv.bin"), TOTAL, 2)
+    occ = arena.claim_slots(["o0", "o1"], [TOTAL, TOTAL])
+    be = _backend(str(root))
+
+    def free_later():
+        time.sleep(0.06)
+        arena.free_slots([occ[0][0]], reason="test")
+        time.sleep(0.17)
+        arena.free_slots([occ[1][0]], reason="test")
+
+    th = threading.Thread(target=free_later)
+    th.start()
+    with envs.SGLANG_WEG2_L3FILL_ROOM_WAIT_MS.override(200), \
+            envs.SGLANG_WEG2_L3FILL_JOIN_LIVENESS.override(True):
+        out = _run_on("hicache-prefetch-io-0", lambda: HiCacheFile.arena_fill_from_disk(
+            be, arena, ["r0", "r1"], TOTAL, prefix=True))
+    th.join(5)
+    assert out[0] is not None and out[1] is not None, out
