@@ -3209,6 +3209,15 @@ class Envs:
     # On: the QSA index page of a KV page that is on disk is never the victim; it leaves together with its KV page.
     # Off: byte-identical old path (every file its own LRU entry).
     SGLANG_HICACHE_L3_SIDECAR_PAIR_EVICT = EnvBool(True)
+    # L3-READ-RECENCY-1014 (NF h13, D.log 14:22:55 TP0 'HiCacheFile EVICTION-BG reclaimed 7546953728 B'): the
+    # storage owner rebuilds its LRU from snapshot + journal lines (C/E: write times) and, since the 28.09.
+    # journal index, never walks st_mtime again -- so a page the SIBLING group only READS (P's leg-1 store
+    # read of a prefix D serves from its device; utime lands on the inode only) stays at its write time and is
+    # the first victim. On: every read hit also journals a ``T`` (touch) line, at most one per page and writer
+    # per SGLANG_HICACHE_L3_JOURNAL_TOUCH_S, and the owner's wake / attach move a touched page to MRU.
+    # Off: byte-identical old journal (R/C/A/E only).
+    SGLANG_HICACHE_L3_JOURNAL_TOUCH = EnvBool(True)
+    SGLANG_HICACHE_L3_JOURNAL_TOUCH_S = EnvFloat(30.0)
     SGLANG_HICACHE_FILE_BACKEND_MIN_FREE_SPACE = EnvStr("0")
     # Enable client-side metadata caching to optimize filesystem checks (e.g. for Lustre/NFS/FUSE)
     SGLANG_HICACHE_FILE_BACKEND_ENABLE_METADATA_CACHE = EnvBool(False)

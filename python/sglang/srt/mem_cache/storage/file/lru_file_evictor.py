@@ -1185,6 +1185,7 @@ class LRUFileEvictor:
         bumped the inode through its open fd, and a second syscall here would
         be a second GIL hand-off per page for nothing.
         """
+        self._journal_touch(suffixed_key)
         if not self._eviction_enabled:
             return
         if mtime:
@@ -1206,6 +1207,36 @@ class LRUFileEvictor:
             else:
                 self._lru[suffixed_key] = size
                 self._total_bytes += size
+
+    def _journal_touch(self, suffixed_key: str) -> None:
+        """L3-READ-RECENCY-1014: a read hit as a ``T`` journal line, so the
+        storage OWNER (it rebuilds its LRU from journal lines at wake and never
+        walks st_mtime since the 28.09. journal index) sees the SIBLING's reads.
+        NF h13 14:22:55: D's owner reclaimed 7.5 GB oldest-first while the
+        prefix P had read at 14:21:32 (124928 tokens of a vision session D
+        serves from its device) still stood at its write time -- P's probe at
+        14:25:49 found 88 leading pages instead of 196. At most one line per
+        page and writer per SGLANG_HICACHE_L3_JOURNAL_TOUCH_S. Never raises."""
+        jn = getattr(self, "_journal", None)
+        if jn is None:
+            return
+        try:
+            if not envs.SGLANG_HICACHE_L3_JOURNAL_TOUCH.get():
+                return
+            now = time.time()
+            seen = self.__dict__.get("_journal_touched")
+            if seen is None:
+                seen = self.__dict__["_journal_touched"] = OrderedDict()
+            last = seen.get(suffixed_key)
+            if last is not None and now - last < float(envs.SGLANG_HICACHE_L3_JOURNAL_TOUCH_S.get()):
+                return
+            seen[suffixed_key] = now
+            seen.move_to_end(suffixed_key, last=True)
+            while len(seen) > 65536:
+                seen.popitem(last=False)
+            jn.write("T", now, 0, suffixed_key)
+        except Exception:  # noqa: BLE001 -- a recency line is never a reason to fail a read
+            return
 
     def _touch_mtime(self, tensor_path: str) -> None:
         """Record the recency where the SIBLING owner can read it (N2).
@@ -1718,10 +1749,16 @@ class LRUFileEvictor:
         names a page whose file is gone is harmless: the index only ever COUNTS
         and UNLINKS (FileNotFoundError is a drop), the read path never asks it.
         """
-        added = removed = 0
+        added = removed = touched = 0
         with self._lock:
             c = dict(getattr(self, "_scan_census", None) or _EMPTY_CENSUS)
             for _t, op, size, stem in records:
+                if op == "T":
+                    # L3-READ-RECENCY-1014: the sibling READ this page -- newest end of the LRU
+                    if stem in self._lru and stem not in self._pending_writes:
+                        self._lru.move_to_end(stem, last=True)
+                        touched += 1
+                    continue
                 if op not in ("C", "E"):
                     continue  # R/A: intents, resolved by their C/A (or at the next load)
                 indexed = (not self._scan_suffixes) or stem.endswith(self._scan_suffixes)
@@ -1804,6 +1841,8 @@ class LRUFileEvictor:
             f"{len(self._journal_reader.state)} journal(s), +{added}/-{removed} files, "
             f"{census['indexed_entries']} of {census['seen_entries']} files indexed, "
             f"{(time.monotonic() - t0) * 1000:.0f} ms (no directory walk)"
+            + (f"; read-recency: {touched} page(s) the other writers read moved to MRU "
+               f"(L3-READ-RECENCY-1014)" if touched else "")
         )
         return census
 
