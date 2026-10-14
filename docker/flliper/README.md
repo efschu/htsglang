@@ -46,3 +46,5 @@ not a success: nothing behind it was compared.
 
 Apply the gpu-arb patch `f0b-gpu-arb-1007-v2` FIRST: `release_profile_gate.py` of the unpatched rig is red on converted profiles
 (27B-L15, DUAL-MPS look for the old names).
+
+The image healthcheck (`healthcheck.sh`) is tree-versioned: `make_flat_ctx.sh` copies `docker/flliper/healthcheck.sh` (the 12.10. 16:39 version with the `PDFLIP-FLIP-ORDER` / `PDFLIP-LAUNCH` skips) into the context, no longer the host file `/spinning/gpu-arb/docker/healthcheck.sh` (RC3 acceptance m3). Build a fresh context for every image; the old `ctx/flat-0.1.0-*` contexts carry a healthcheck without the skip.
