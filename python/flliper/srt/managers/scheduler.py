@@ -20306,6 +20306,34 @@ class Scheduler(
                                     _pdflip_flush_nonblock.sweep_memo_set(
                                         self, self.tree_cache)
                                 break
+                            # FLUSHFAST (NF int24g, D>P epochs 105/115, boot
+                            # 1012_185900: 28-30 s instead of ~3 s): a round that
+                            # issued nothing and left EVERY un-backed node refused
+                            # for want of KV-arena room cannot be followed by one
+                            # that does -- the wait below joins the write-throughs
+                            # (writing_check), which hold no arena slot this sweep
+                            # could take, and the store writes in flight
+                            # (hicache_backup) are not joined by it at all. Measured
+                            # on D TP0: 66/36 nodes refused, in_flight stuck at 48/31,
+                            # four rounds x ~3 s per leg, rounds 2-4 issued 1/0/0,
+                            # the rest lost at the reset anyway (ANCHOR-LOST at=flush).
+                            # Writes in flight are NOT dropped here: the join after the
+                            # loop, the sleep leg's drain and #1470b still take them.
+                            # Rank-local like the break above (no collective in this
+                            # loop; a rank that stops early waits in the group verdict).
+                            if (int(_stats.get("issued", 0) or 0) == 0
+                                    and int(_stats.get("unbacked", 0) or 0) > 0
+                                    and int(_stats.get("arena_refused", 0) or 0)
+                                    >= int(_stats.get("unbacked", 0) or 0)):
+                                logger.info(
+                                    "#1470 FLUSH-PUBLISH ARENA-FULL-STOP round=%d unbacked=%s "
+                                    "arena_refused=%s issued=0 in_flight=%s: every un-backed node was "
+                                    "refused by the full KV arena, the loop ends instead of waiting "
+                                    "for writes that free no slot (in-flight writes are joined by "
+                                    "the steps after the loop and by the sleep leg, not dropped)",
+                                    _round, _stats.get("unbacked"), _stats.get("arena_refused"),
+                                    _stats.get("pending"))
+                                break
                             if _wc is not None:
                                 _wc(write_back=True)  # free the pins, then sweep again
                             if int(_stats.get("issued", 0) or 0) == 0 and _round >= 3:

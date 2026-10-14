@@ -174,17 +174,33 @@ class TestAFullArenaIsClaimedOncePerSweep(CustomTestCase):
         self.assertEqual(stats["issued"], 2 * CHAIN)
         self.assertNotIn("arena_full_skipped", stats)
 
-    def test_a_recording_d_park_and_the_form_a_shadow_keep_every_claim(self):
+    def test_a_recording_d_park_keeps_every_claim(self):
         cache = _tree()
         pool = _DirectPool(room=())
         cache._pdflip_park_track = {}
         _sweep(cache, pool, on=True)
         self.assertEqual(len(pool.claims), 2 * CHAIN, "HY records every refused park backup")
-        cache2 = _tree()
-        pool2 = _DirectPool(room=())
-        with mock.patch.object(form_a_host_shadow, "role", lambda: "host"):
-            _sweep(cache2, pool2, on=True)
-        self.assertEqual(len(pool2.claims), 2 * CHAIN, "R12 mirrors every refusal TP0 records")
+
+    def test_the_form_a_shadow_skips_too_and_gets_every_refusal_recorded(self):
+        """FLUSHFAST (NF int24g): R12 no longer disarms the skip (group D always
+        runs the shadow, so it never engaged there); the skip records the
+        refusals R12 mirrors to its workers itself -- the same (node, why)
+        records as the claims made, one claim instead of one per node."""
+        recs = {}
+        for on in (False, True):
+            cache = _tree()
+            pool = _DirectPool(room=())
+            got = []
+            with mock.patch.object(form_a_host_shadow, "role", lambda: "host"), \
+                    mock.patch.object(form_a_host_shadow, "record_state",
+                                      lambda t, node, why="", got=got: got.append((node.id, why))):
+                _sweep(cache, pool, on=on)
+            base = min(n.id for n in cache._collect_all_nodes() if n is not cache.root_node)
+            recs[on] = ([(i - base, w) for i, w in got], len(pool.claims))
+        self.assertEqual(recs[False][1], 2 * CHAIN)
+        self.assertEqual(recs[True][1], 1)
+        self.assertEqual(recs[True][0], recs[False][0])
+        self.assertTrue(recs[True][0], "the shadow was told")
 
     def test_a_w3_spill_that_releases_room_gets_the_claim(self):
         """A spill that frees room keeps every node's claim, exactly as with the
