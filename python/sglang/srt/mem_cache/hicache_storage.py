@@ -3706,8 +3706,8 @@ class HiCacheFile(HiCacheStorage):
         """ROOM-WAIT: re-evict and re-claim the stems that found the arena FULL
         until each gets a slot or ``fill_room_wait_ms()`` is spent. Returns the
         fresh claims (todo entries); a stem another writer claimed meanwhile
-        joins ``joined``'s bookkeeping by being unclaimed at once (a miss here,
-        as before); one that raced in COMPLETE lands in ``out``."""
+        is unclaimed at once and APPENDED to ``joined`` (the caller's JOIN wait
+        runs next and awaits it); one that raced in COMPLETE lands in ``out``."""
         wait_ms = fill_room_wait_ms()
         if wait_ms <= 0 or not still_full:
             return []
@@ -3731,7 +3731,17 @@ class HiCacheFile(HiCacheStorage):
                 elif status == 2:
                     out[i] = slot
                 elif status == 1:
+                    # TF2 (NF h13 84e787ec96, P 14:18:00, weg2-10-82): the
+                    # slot this wait's eviction freed went to a PEER rank
+                    # filling the SAME stem (PP2 pid854 claimed the 32-slot
+                    # mamba arena's slot, PP0/PP1 got status 1). Dropped
+                    # here, PP0's anchor read missed -- #904
+                    # MambaComponent:absent=58944, #TF told=0, full prefill
+                    # of 59163 although all 921 KV pages had landed. A join
+                    # is awaited like every other one (the caller's JOIN
+                    # wait, which runs after this one).
                     _unclaim_fill_joins(arena, [(i, slot, gen)])
+                    joined.append((i, slot, gen))
                 elif status == 4:
                     nxt.append((i, st))
             pend = nxt
