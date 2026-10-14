@@ -66,7 +66,7 @@ def test_refetch_one_answers_due_without_side_effects_when_reissue_is_not_allowe
 def test_settle_and_wake_paths_take_the_same_form():
     src = open(sch.__file__).read()
     i = src.index("def _weg2_post_wake_settle_tick")
-    blk = src[i:i + 9000]  # SETTLE-UNIFORM-1014 lengthened the tick
+    blk = src[i:i + 6000]
     assert "allow_reissue=False" in blk and "_agreed_due" in blk
     j = src.index("def _weg2_release_dormant_hold")
     assert "allow_reissue=False" in src[j:j + 4000]

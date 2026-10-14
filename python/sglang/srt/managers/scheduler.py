@@ -7079,24 +7079,11 @@ class Scheduler(
         # (1) in the due vote and votes separately whether it has no writer; the group skips
         # the re-read only when EVERY rank decides. One collective: [due..., decide...].
         _pre, _dec = [], []
-        _uniform_check = envs.SGLANG_WEG2_SETTLE_UNIFORM_CHECK.get()
         for req, _act in zip(settle, _acts):
             if _act == "capwait":
                 _pre.append(0)  # 1537b: waits for arena room, no re-read, no release
                 _dec.append(0)
                 continue
-            if _act in ("wait", "decide") and _uniform_check:
-                # SETTLE-UNIFORM-1014 (NF h18 fe799c4d6e, D 16:23:23-24, gloo abort): the action is a
-                # RANK-LOCAL view (the writer directory, ``_1471_short`` from this rank's own record), and
-                # ``_refetch`` carries the progress check's collectives. TP0 alone had weg2-10-28 at
-                # "reread" then "decide" and skipped its check; its next collective (weg2-12-29) met the
-                # workers' 10-28 (TP0 '#905 ... req=weg2-12-29 completed=96256 min_synced=62848'), TP0
-                # deferred and re-issued 12-29 alone, the prefetch threads fell out of step -> "8 vs 4".
-                # The progress check runs on every rank for every member; only the VOTE follows the act.
-                try:
-                    _refetch(req, now, allow_reissue=False)
-                except Exception:  # noqa: BLE001 -- the vote below stays the act's
-                    pass
             if _act == "wait":
                 _pre.append(0)  # a writer at work: a re-read cannot see pages still being written
                 _dec.append(0)
