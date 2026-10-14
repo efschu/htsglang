@@ -939,6 +939,13 @@ class PPAdmissionCongruenceGuard:
         """
         return self._unresolved_rounds.get(rid, 0)
 
+    def forget_offer(self, rid) -> None:
+        """PREFILL-OOM-RETREAT (pdflip/prefill_oom_retreat.py): PP0 built an offer for ``rid`` and the pass was taken
+        back BEFORE it was sent (the paged extend found no pages). An offer no rank ever saw is not a re-offer
+        without progress, so it leaves no streak -- three retreats must not escalate a request the pool simply could
+        not pay yet. Counting stays what it was for every offer that was sent."""
+        self._offer_streak.pop(rid, None)
+
     def note_offer(self, rid: str, told: int) -> bool:
         """#944c RECORD ONE OFFER. True iff `rid` has now exceeded the cap.
 

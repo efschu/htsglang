@@ -486,6 +486,34 @@ def _residency_withheld_note(allocator) -> str:
     )
 
 
+class PrefillOutOfPages(RuntimeError):
+    """The paged extend allocation of a PREFILL batch found no pages (NF 13.10. 11:59:14Z).
+
+    A ``RuntimeError`` on purpose: every other catcher (the PP followers, the
+    D group, any test that expects ``RuntimeError``) keeps dying exactly as before,
+    with the message of before. What the type adds is the TERMS, so the one
+    scheduler seat that can still retreat (PP0 of group P on the local-PP floor,
+    ``pdflip/prefill_oom_retreat.py``) decides on numbers instead of parsing text:
+
+    * ``need``: pages' worth of tokens the allocation asked for (``num_tokens``),
+    * ``free``: ``allocator.available_size()`` after the peel,
+    * ``evictable_reported``: what the tree still reports evictable,
+    * ``evictable_paid``: what the peel actually delivered to the pool
+      (the ``delivered`` receipt, 320 of 3200 in the specimen).
+
+    Raised BEFORE the batch is launched and before anything is sent to a
+    follower (``alloc_for_extend`` runs inside ``prepare_for_extend``)."""
+
+    def __init__(self, message, *, need=0, free=0, evictable_reported=0,
+                 evictable_paid=0, evict_asked=0):
+        super().__init__(message)
+        self.need = int(need)
+        self.free = int(free)
+        self.evictable_reported = int(evictable_reported)
+        self.evictable_paid = int(evictable_paid)
+        self.evict_asked = int(evict_asked)
+
+
 def _eviction_shortfall_note(tree_cache, asked: int, evicted: int) -> str:
     """One clause naming the promise-versus-delivery gap, or ''.
 
@@ -1694,7 +1722,28 @@ def alloc_paged_token_slots_extend(
         logger.error(error_msg)
         if tree_cache is not None:
             tree_cache.pretty_print()
-        raise RuntimeError(error_msg)
+        _free_now = _evictable_now = -1
+        try:
+            _free_now = int(allocator.available_size())
+        except Exception:  # noqa: BLE001 - the terms are a diagnosis, never a new failure
+            pass
+        for _name in ("full_evictable_size", "evictable_size"):
+            _g = getattr(tree_cache, _name, None)
+            if _g is None:
+                continue
+            try:
+                _evictable_now = int(_g())
+                break
+            except Exception:  # noqa: BLE001
+                continue
+        raise PrefillOutOfPages(
+            error_msg,
+            need=num_tokens,
+            free=_free_now,
+            evictable_reported=_evictable_now,
+            evictable_paid=delivered,
+            evict_asked=evict_asked,
+        )
 
     return (out_cache_loc, state) if backup_state else out_cache_loc
 
