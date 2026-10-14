@@ -2491,6 +2491,13 @@ class Envs:
     # END anchor behind it is not cut off by ``parent_unbacked``. Acts only on
     # nodes marked by ``park_running``; no park = byte for byte as before.
     SGLANG_WEG2_PARK_END_ANCHOR_FIRST = EnvBool(True)
+    # TREE-REPAIR / AUX-HOST-LAW (NF h17 38c6d40239, D TP0 15:51:02, "node
+    # 248/243/251 mamba host present but Full.host_value=None" killed D from
+    # on_idle): a Mamba host state never lands on a node without a Full host
+    # copy (backup / prefetch attach refuse it), and the sanity check repairs
+    # that one violation (state released, loud WEG2 TREE-REPAIR line) instead
+    # of raising. Every other violation stays fatal. 0 = the old behaviour.
+    SGLANG_WEG2_TREE_REPAIR_AUX_HOST = EnvBool(True)
     # LANE-ANCHOR-RANK (NF h13 84e787ec96, D TP0 14:35:34, weg2-24-181): a
     # lane park of lane-0 requests (LANE-PREEMPT for an arriving lane-1
     # request) spilled the arriving request's own resume anchor (MAMBA-ARENA

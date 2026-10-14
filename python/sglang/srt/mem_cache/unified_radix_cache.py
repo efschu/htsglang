@@ -4181,11 +4181,24 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     "pin covers a load-back or a running request; the caller "
                     "must select an unlocked node, never free under the pin."
                 )
+        _fcd = (node.component_data[BASE_COMPONENT_TYPE]
+                if comp.component_type == BASE_COMPONENT_TYPE else None)
         if (
-            target == EvictLayer.HOST
-            and comp.component_type == BASE_COMPONENT_TYPE
-            and node.component_data[BASE_COMPONENT_TYPE].host_value is not None
-            and node.component_data[BASE_COMPONENT_TYPE].value is not None
+            _fcd is not None
+            and _fcd.host_value is not None
+            and (
+                (target == EvictLayer.HOST and _fcd.value is not None)
+                # h17 (NF 38c6d40239 D TP0 15:51:02, nodes 248/243/251): the
+                # Full host copy also leaves where the node holds NO device KV
+                # (an internal host-only node keeps living for its children,
+                # target HOST or ALL). Its Mamba host state stayed; a later
+                # insert revived Full.value over it -> "mamba host present but
+                # Full.host_value=None". The aux host goes first here too.
+                or (
+                    EvictLayer.HOST in target
+                    and envs.SGLANG_WEG2_TREE_REPAIR_AUX_HOST.get()
+                )
+            )
         ):
             _evict_aux_host_before_full_host(self, node, tracker)
         device_freed, host_freed = comp.evict_component(node, target=target)
@@ -12564,6 +12577,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # ── PART 2: Per-node state machine and leaf qualification ──
         expected_dev_leaves: set[UnifiedTreeNode] = set()
         expected_hst_leaves: set[UnifiedTreeNode] = set()
+        # TREE-REPAIR (NF h17 38c6d40239, D TP0 15:51:02): "node 248/243/251
+        # mamba host present but Full.host_value=None" killed the server from
+        # on_idle. A Mamba host state without a Full host copy is repairable:
+        # the state is released (slot back to its pool, host LRU detached,
+        # the R12 record carries the drop to the workers) -- the node keeps
+        # its device KV, a later match recomputes the state. Every other
+        # violation stays fatal. SGLANG_WEG2_TREE_REPAIR_AUX_HOST=0: fatal.
+        _repair = bool(envs.SGLANG_WEG2_TREE_REPAIR_AUX_HOST.get())
+        _repairable: list = []
 
         for node in all_nodes:
             if node is self.root_node:
@@ -12580,7 +12602,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 if cd.value is not None and not full_dev:
                     E(f"node {nid} {ct} device present but Full.value=None")
                 if cd.host_value is not None and not full_hst:
-                    E(f"node {nid} {ct} host present but Full.host_value=None")
+                    if _repair and ct == ComponentType.MAMBA and full_dev:
+                        _repairable.append(node)
+                    else:
+                        E(f"node {nid} {ct} host present but Full.host_value=None")
 
             # Every node must keep Full data on at least one layer.
             if not full_dev and not full_hst:
@@ -12761,6 +12786,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     f"[Ongoing] load_back node {nid} lock_ref={n.component_data[FCT].lock_ref}"
                 )
 
+        if _repairable:
+            self._weg2_tree_repair_aux_host(_repairable)
+
         # ── Result ──
         if errors:
             msg = (
@@ -12771,6 +12799,46 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             logger.error(msg)
             self.pretty_print()
             raise AssertionError(msg)
+
+    _weg2_tree_repair_n = 0
+
+    def _weg2_tree_repair_aux_host(self, nodes) -> int:
+        """TREE-REPAIR: release the Mamba host state of nodes that carry one
+        without a Full host copy (the law "aux host requires Full host").
+        A state a running load reads (host_lock_ref > 0) is left for the
+        next check -- never freed under a reader. Returns the repaired count.
+        Rank-local by design: on a Form A group the host's lower match only
+        lowers its head vote (the group takes the MIN, so the group refuses
+        or matches less, never splits) and the funnel's R12 record mirrors
+        the drop to the workers; on group P every stage follows PP0's told."""
+        comp = self.components.get(ComponentType.MAMBA)
+        if comp is None:
+            return 0
+        done = deferred = 0
+        ids = []
+        for node in nodes:
+            cd = node.component_data[ComponentType.MAMBA]
+            if cd.host_value is None:
+                continue
+            if int(getattr(cd, "host_lock_ref", 0) or 0) > 0:
+                deferred += 1
+                continue
+            rows = cd.host_value
+            try:
+                self._evict_component_and_detach_lru(node, comp, target=EvictLayer.HOST, tracker=None)
+                self._update_evictable_leaf_sets(node)
+            except Exception as exc:  # noqa: BLE001 - a repair never takes the server down
+                logger.error("WEG2 TREE-REPAIR node=%s release raised %r", getattr(node, "id", "?"), exc)
+                continue
+            done += 1
+            ids.append((getattr(node, "id", "?"), int(rows[0]) if rows.numel() else -1))
+        UnifiedRadixCache._weg2_tree_repair_n += done
+        logger.error(
+            "WEG2 TREE-REPAIR aux_host_without_full repaired=%d deferred_locked=%d total=%d nodes=%s "
+            "(a Mamba host state without a Full host copy: its row went back to the pool, the node "
+            "keeps its device KV; the server runs on -- the producing path is a bug to find)",
+            done, deferred, UnifiedRadixCache._weg2_tree_repair_n, ids[:16])
+        return done
 
     def _check_lru_linked_list(
         self,
