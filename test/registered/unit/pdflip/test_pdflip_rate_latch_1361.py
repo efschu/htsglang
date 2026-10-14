@@ -204,10 +204,14 @@ class TheLatchIsWIRED1361(CustomTestCase):
     def test_the_guard_loop_constructs_the_rate_latch(self):
         self.assertIn("host_ledger.RateLatch(", self._loop_src())
 
-    def test_it_is_fed_and_its_verdict_reaches_the_named_teardown(self):
+    def test_it_is_fed_and_its_verdict_is_a_warning_not_a_teardown(self):
+        # 12.10.2026 (NF W98 HOST-WARN, user rule 06.10.): the verdict used to
+        # reach `do_stop("W98 PdFlipHostRateLatched")`; it now reaches a WARNING.
         body = self._loop_src()
         self.assertIn("rate_latch.observe(", body)
-        self.assertIn('do_stop("W98 PdFlipHostRateLatched"', body)
+        self.assertNotIn('do_stop("W98 PdFlipHostRateLatched"', body)
+        self.assertIn("warn_only=True", body)
+        self.assertIn('logger.warning("%s", _line)', body)
         # ...and a GAP is reported but never torn down: the loop kept running,
         # it just could not look.
         self.assertIn("RATE-GAP", body)
@@ -433,11 +437,15 @@ class TheGuardRunsFromLAUNCHNotFromREADY1361a(CustomTestCase):
         self.assertIn("cushion_gib=", body)
         self.assertIn("shmem_gib=", body)
 
-    def test_a_latch_in_that_window_refuses_the_boot_by_name(self):
+    def test_a_latch_in_that_window_warns_and_the_boot_goes_on(self):
+        # 12.10.2026 (NF W98 HOST-WARN, user rule 06.10. "Ledger, Launcher und
+        # Startskripte warnen nur"): the launch guard used to refuse the boot by
+        # name (PdFlipLaunchHostLatched); it now warns.
         src = self._launcher_src()
-        self.assertIn("W98 PdFlipHostRateLatched (launch guard)", src)
+        self.assertNotIn("W98 PdFlipHostRateLatched (launch guard)", src)
         hand = src[src.index("_launch_guard.stop("):src.index("front_argv = front_argv_for(")]
-        self.assertIn("PdFlipHostLedgerRefused", hand)
+        self.assertNotIn("raise", hand)
+        self.assertNotIn("PdFlipHostLedgerRefused", hand)
 
     def test_it_is_a_thread_because_the_launcher_blocks(self):
         """`wait_ready` blocks for minutes; an asyncio task would never tick."""

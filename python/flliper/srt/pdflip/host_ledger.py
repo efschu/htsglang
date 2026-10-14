@@ -1254,6 +1254,19 @@ RATE_LATCH_CUSHION_RELEVANCE_GIB = 32.0
 #: reading through lxcfs) the reading is printed once and not latched.
 RATE_LATCH_FREE_POOL_GIB = 3.0
 
+#: W98 HOST-WARN (12.10.2026, user rule 06.10. "Es gilt KEINE Verweigerung wegen
+#: Host-RAM ... man laesst es darauf ankommen, ob es OOM geht"): the marker every
+#: host-RAM guard line carries once the guard WARNS instead of stopping. It is
+#: deliberately NOT the old verdict name (``W98 PdFlipHostRateLatched`` /
+#: ``W22 PdFlipHostWatermarkBreached``): those two strings are what death watchers
+#: and log greps read as "the front stopped", and a warning must not look like one.
+HOST_WARN_MARKER = "HOST-RAM-WARN"
+#: A new warn episode of the SAME guard is not printed sooner than this after the
+#: previous one (flapping across the floor must not become a log storm).
+HOST_WARN_MIN_INTERVAL_S = 30.0
+#: A level guard that stays above its bound repeats its warning at most this often.
+HOST_WARN_REMIND_S = 300.0
+
 
 def latch_free_pool(
     pr: Dict[str, Optional[float]],
@@ -1591,7 +1604,19 @@ class RateLatch:
         lookahead_s: float = RATE_LATCH_LOOKAHEAD_S,
         window_s: float = RATE_LATCH_WINDOW_S,
         gap_s: float = RATE_LATCH_GAP_S,
+        warn_only: bool = False,
     ) -> None:
+        #: W98 HOST-WARN: ``True`` = a latch WARNS (``HOST-RAM-WARN W98 ...``)
+        #: and re-arms when the condition clears; ``False`` = the old one-shot
+        #: stop verdict (``W98 PdFlipHostRateLatched``). The front and the launch
+        #: guard construct it with ``True`` (user rule 06.10.); the default keeps
+        #: the pure arithmetic's old words for every other caller and test.
+        self.warn_only = bool(warn_only)
+        self.warn_n = 0
+        self.warn_suppressed = 0
+        self._last_warn_t: Optional[float] = None
+        self._latched_kind: Optional[str] = None
+        self._latched_at: Optional[float] = None
         self.reap_mark_gib = float(reap_mark_gib)
         self.lookahead_s = float(lookahead_s)
         self.window_s = float(window_s)
@@ -1608,6 +1633,47 @@ class RateLatch:
         #: "rising" gate of the writers the latch cannot bound.
         self._last_unbounded_shmem: Optional[float] = None
         self._bounded_fill_noted = False
+
+    def _warn_suppressed(self, t_s: float) -> bool:
+        """W98 HOST-WARN: True = this episode is too soon after the last warning."""
+        if self._last_warn_t is not None and t_s - self._last_warn_t < HOST_WARN_MIN_INTERVAL_S:
+            self.warn_suppressed += 1
+            return True
+        return False
+
+    def _warn_latched(self, t_s: float, kind: str) -> None:
+        self.latched = True
+        self._latched_kind = kind
+        self._latched_at = t_s
+        self._last_warn_t = t_s
+        self.warn_n += 1
+
+    def _warn_recovery(self, t_s: float, cushion_gib: Optional[float]) -> Optional[str]:
+        """W98 HOST-WARN: leave the latched state when the CONDITION that set it is gone.
+
+        One warning per episode, and the episode ends on the measurement that
+        opened it: the cushion back at or above the floor (cushion form), or the
+        projection back below the mark (rate form). No reading -> stays latched
+        and silent; ``None`` is not "recovered".
+        """
+        if self._latched_kind == "cushion":
+            ok = cushion_gib is not None and float(cushion_gib) >= RATE_LATCH_CUSHION_FLOOR_GIB
+            what = (f"cushion={float(cushion_gib):.2f} GiB >= floor "
+                    f"{RATE_LATCH_CUSHION_FLOOR_GIB:.2f}") if ok else ""
+        else:
+            proj = self.projected_gib()
+            ok = proj is not None and proj < self.reap_mark_gib
+            what = (f"projected={proj:.2f} GiB < reap_mark {self.reap_mark_gib:.2f}") if ok else ""
+        if not ok:
+            return None
+        dur = (t_s - self._latched_at) if self._latched_at is not None else 0.0
+        self.latched = False
+        self._latched_kind = None
+        return (
+            f"{HOST_WARN_MARKER} W98 CLEARED: {what} after {dur:.1f} s "
+            f"(warn_n={self.warn_n}, suppressed={self.warn_suppressed}) -- the next "
+            f"episode warns again"
+        )
 
     def rate_gib_per_s(self) -> Optional[float]:
         """The WORST consecutive slope inside the trailing window, or ``None``.
@@ -1712,6 +1778,8 @@ class RateLatch:
                 f"mark; a hole during a leg is a FINDING, not silence"
             )
         if self.latched:
+            if self.warn_only:
+                return self._warn_recovery(t_s, cushion_gib)
             return None
         proj = self.projected_gib()
         rate = self.rate_gib_per_s() or 0.0
@@ -1807,6 +1875,26 @@ class RateLatch:
                             f"printed once, the unbounded writers keep the latch"
                         )
                 else:
+                    if self.warn_only:
+                        if self._warn_suppressed(t_s):
+                            return None
+                        self._warn_latched(t_s, "cushion")
+                        return (
+                            f"{HOST_WARN_MARKER} W98 HostRateLatched: cushion="
+                            f"{float(cushion_gib):.2f} GiB BELOW the floor "
+                            f"{RATE_LATCH_CUSHION_FLOOR_GIB:.2f} while shmem is STILL "
+                            f"RISING (now={nonreclaim_gib:.2f} GiB, shmem="
+                            f"{float(shmem_gib):.2f}, headroom={headroom:.2f} GiB <= "
+                            f"relevance {RATE_LATCH_CUSHION_RELEVANCE_GIB:.2f}, "
+                            f"mark={mark:.2f}, free={'n/a' if free_gib is None else format(float(free_gib), '.2f')} "
+                            f"GiB ({free_source}), gaps_seen={len(self.gaps)}, "
+                            f"warn_n={self.warn_n}, suppressed={self.warn_suppressed}) "
+                            f"-- WARNING ONLY: the server goes on, nothing is stopped and "
+                            f"no request is answered 503 (user rule 06.10.: no refusal "
+                            f"on host RAM; an OOM kill is the accepted risk). Printed "
+                            f"once per episode, re-armed when the cushion is back at "
+                            f"the floor"
+                        )
                     self.latched = True
                     return (
                         f"W98 PdFlipHostRateLatched: cushion={float(cushion_gib):.2f} "
@@ -1839,6 +1927,19 @@ class RateLatch:
             return None
         if proj is None or proj < self.reap_mark_gib:
             return None
+        if self.warn_only:
+            if self._warn_suppressed(t_s):
+                return None
+            self._warn_latched(t_s, "rate")
+            return (
+                f"{HOST_WARN_MARKER} W98 HostRateLatched: projected={proj:.2f} GiB "
+                f"reap_mark={self.reap_mark_gib:.2f} GiB rate={rate:+.2f} GiB/s "
+                f"lookahead_s={self.lookahead_s:.0f} now={nonreclaim_gib:.2f} GiB "
+                f"gaps_seen={len(self.gaps)}{_bounded} warn_n={self.warn_n} "
+                f"suppressed={self.warn_suppressed} -- WARNING ONLY: the server goes "
+                f"on, nothing is stopped (user rule 06.10.; an OOM kill is the "
+                f"accepted risk). Printed once per episode"
+            )
         self.latched = True
         return (
             f"W98 PdFlipHostRateLatched: projected={proj:.2f} GiB "
@@ -1854,6 +1955,45 @@ class RateLatch:
         )
 
 
+class HostWarnEpisode:
+    """Throttle for a LEVEL guard that warns instead of stopping (12.10.2026).
+
+    ``update(active, now)`` is called once per check with "is the guard's
+    condition true right now" and answers when a line is due: ``"enter"`` on the
+    first true check of an episode, ``"remind"`` while it stays true (at most
+    every ``remind_s``), ``"clear"`` on the first false check after a true one,
+    ``None`` otherwise. One line per state change plus a bounded reminder is the
+    whole log volume of a guard that used to stop the server: no storm.
+    """
+
+    def __init__(self, remind_s: float = HOST_WARN_REMIND_S) -> None:
+        self.remind_s = float(remind_s)
+        self.active = False
+        self.n = 0
+        self.t_enter: Optional[float] = None
+        self._t_last: Optional[float] = None
+
+    def update(self, active: bool, now: float) -> Optional[str]:
+        if active:
+            if not self.active:
+                self.active = True
+                self.n += 1
+                self.t_enter = float(now)
+                self._t_last = float(now)
+                return "enter"
+            if self._t_last is not None and now - self._t_last >= self.remind_s:
+                self._t_last = float(now)
+                return "remind"
+            return None
+        if self.active:
+            self.active = False
+            return "clear"
+        return None
+
+    def duration_s(self, now: float) -> float:
+        return 0.0 if self.t_enter is None else max(0.0, float(now) - self.t_enter)
+
+
 def watermark_breach_verdict(
     current_bytes: int,
     margin: Optional[Margin] = None,
@@ -1864,8 +2004,13 @@ def watermark_breach_verdict(
     file_reclaimable_gib: Optional[float] = None,
     anon_preboot_bytes: Optional[int] = None,
     composition: Optional[Dict[str, Optional[float]]] = None,
+    warn_only: bool = False,
 ) -> Optional[str]:
     """The runtime check, in NON-RECLAIMABLE currency (#1269 fix 3).
+
+    ``warn_only`` (12.10.2026, user rule 06.10.): the SAME arithmetic, but the
+    line is a ``HOST-RAM-WARN W22`` warning that says nothing is torn down. The
+    front passes ``True``; the default keeps the old verdict words.
 
     Returns the verdict LINE when the bound is crossed, else None. Pure, so it
     is testable against a synthetic memory.stat with no processes involved.
@@ -1918,6 +2063,18 @@ def watermark_breach_verdict(
                 f" SPLIT flliper={sg:.2f} foreign={fo:.2f} GiB anon [{src}]"
                 f" -- {'FOREIGN desk load' if fo > sg else 'flliper'} dominates."
             )
+    if warn_only:
+        return (
+            f"{HOST_WARN_MARKER} W22 HostWatermark current={tested:.2f} "
+            f"watermark={w:.2f} margin={m.runtime_total_gib:.2f} "
+            f"({m.terms('runtime')}); graded against the RUNTIME bound "
+            f"{bound:.2f} GiB, crossed by {tested - bound:.2f} GiB in {currency} "
+            f"currency [raw memory.current={current:.2f}{cache}].{split} "
+            f"WARNING ONLY: the server goes on, nothing is stopped and no request "
+            f"is answered 503 (user rule 06.10.: no refusal on host RAM; the "
+            f"2026-09-08 teardown order is superseded for host RAM, an OOM kill is "
+            f"the accepted risk)."
+        )
     return (
         f"W22 PdFlipHostWatermarkBreached current={tested:.2f} watermark={w:.2f} "
         f"margin={m.runtime_total_gib:.2f} ({m.terms('runtime')}); "
