@@ -164,12 +164,12 @@ def _wake_key(sched):
     return int(seq) + (1 if getattr(sched, "weg2_dormant", False) else 0)
 
 
-def _in_flight_pages(sched, reqs) -> int:
-    """Pages of this wake's hold reads that still hold the arena: issued and
-    still in the hold / settle, or released to the waiting queue and not yet
-    admitted (the admission's load-back releases the references). Replicated:
-    the settle, the hold and the queue's hold-released requests are the
-    group's, the pages are request lengths."""
+def _in_flight(sched, reqs):
+    """(pages, requests) of this wake's hold reads that still hold the arena:
+    issued and still in the hold / settle, or released to the waiting queue
+    and not yet admitted (the admission's load-back releases the references).
+    Replicated: the settle, the hold and the queue's hold-released requests
+    are the group's, the pages are request lengths."""
     seen, total = set(), 0
     for r in reqs or ():
         if issued(r) and not capacity_waiting(r):
@@ -183,7 +183,70 @@ def _in_flight_pages(sched, reqs) -> int:
         if pages > 0 and getattr(r, WAKE_ATTR, None) == wake:
             seen.add(id(r))
             total += pages
-    return total
+    return total, len(seen)
+
+
+def _in_flight_pages(sched, reqs) -> int:
+    """Pages of this wake's hold reads that still hold the arena (see
+    :func:`_in_flight`)."""
+    return _in_flight(sched, reqs)[0]
+
+
+def seat_gate_on() -> bool:
+    try:
+        from sglang.srt.environ import envs
+
+        return bool(envs.SGLANG_WEG2_WAKE_READ_SEAT_GATE.get())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _batch_rids(batch) -> set:
+    return {id(r) for r in (getattr(batch, "reqs", None) or ())}
+
+
+def seat_room(sched):
+    """NF arena fix (14.10.): how many MORE hold reads may hold the arena for
+    a seat -- D's seats (``max_running_requests``) minus the requests that
+    already run (the running batch, plus the batch of this pass and the last
+    one while the extend has not merged yet) minus the flip-parked requests
+    waiting in the queue (they resume first; the SB admission gate keeps their
+    seats the same way, d_seats.admission_gate ``seat_room``). ``None`` = no
+    gate: off, no seat count known (a stock resume, a fixture), not group D.
+    Every input is replicated -- the same server_args on every rank, the
+    running / current / last batches and the waiting queue are the TP group's
+    one schedule -- so every rank decides alike."""
+    if not seat_gate_on() or not _group_d():
+        return None
+    try:
+        cap = int(getattr(sched, "max_running_requests", 0) or
+                  getattr(getattr(sched, "server_args", None), "max_running_requests", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+    if cap <= 0:
+        return None
+    running = set()
+    for name in ("running_batch", "cur_batch", "last_batch"):
+        running |= _batch_rids(getattr(sched, name, None))
+    from sglang.srt.weg2 import d_seats
+
+    parked = sum(1 for r in list(getattr(sched, "waiting_queue", None) or ())
+                 if d_seats.park_site(r) is not None and not int(getattr(r, PAGES_ATTR, 0) or 0))
+    return cap - len(running) - parked
+
+
+def _no_seat_yet(room, in_req: int) -> bool:
+    """The seat gate's verdict for ONE more read: no seat is left for it. The
+    reads that hold the arena (``in_req`` requests: issued, no seat yet) are
+    the ones that get the free seats next; a read beyond ``room`` waits until
+    a seat frees. ``room`` None = no gate. Not a reserve: nothing is kept back
+    for anything else, the arena is only not pinned for requests that cannot
+    run yet."""
+    return room is not None and in_req >= max(int(room), 0)
+
+
+def _seat_note(room, in_req: int) -> str:
+    return "" if room is None else " seat_room=%d reading=%d" % (int(room), int(in_req))
 
 
 def _lane_sorted(hold) -> list:
@@ -226,24 +289,26 @@ def issue_deferred_reads(sched, hold) -> list:
     cap = arena_capacity(sched) if arena_gate_on() else None
     if cap is None:
         return _issue(sched, reqs)
-    in_flight = _in_flight_pages(sched, hold)
+    in_flight, in_req = _in_flight(sched, hold)
+    room = seat_room(sched)
     go, wait = [], []
     for req in reqs:
         need = read_pages(sched, req)
-        if wait or (in_flight > 0 and in_flight + need > cap):
+        if wait or (in_flight > 0 and in_flight + need > cap) or _no_seat_yet(room, in_req):
             setattr(req, CAPWAIT_ATTR, True)
             wait.append(req)
             continue
         setattr(req, CAPWAIT_ATTR, False)
         in_flight += need
+        in_req += 1
         go.append(req)
     out = _issue(sched, go)
     if wait:
-        logger.info("%s n=%d waiting=%s in_flight_pages=%d arena_slots=%d (the older hold reads of "
+        logger.info("%s n=%d waiting=%s in_flight_pages=%d arena_slots=%d%s (the older hold reads of "
                     "this wake hold the arena: these wait parked in the #1471 settle, oldest "
                     "first, instead of reading short and evicting their own kept pages)",
                     CAPWAIT_MARK, len(wait), [(str(r.rid), read_pages(sched, r)) for r in wait],
-                    in_flight, cap)
+                    in_flight, cap, _seat_note(room, in_req))
     return out
 
 
@@ -257,13 +322,17 @@ def issue_capacity_waiters(sched, settle) -> list:
     if not waiters:
         return []
     cap = arena_capacity(sched) if arena_gate_on() else None
-    in_flight = _in_flight_pages(sched, settle)
+    in_flight, in_req = _in_flight(sched, settle)
+    room = seat_room(sched)
     go = []
     for req in waiters:
         need = read_pages(sched, req)
         if cap is not None and in_flight > 0 and in_flight + need > cap:
             break
+        if _no_seat_yet(room, in_req):
+            break
         in_flight += need
+        in_req += 1
         go.append(req)
     if not go:
         return []
@@ -273,10 +342,10 @@ def issue_capacity_waiters(sched, settle) -> list:
     now = time.monotonic()
     for req in go:
         req._1471_since = now
-    logger.info("%s n=%d rids=%s in_flight_pages=%d arena_slots=%s still_waiting=%d (an older hold read "
+    logger.info("%s n=%d rids=%s in_flight_pages=%d arena_slots=%s still_waiting=%d%s (an older hold read "
                 "was admitted and freed its arena room: the next ones in arrival order read now)",
                 CAPISSUE_MARK, len(go), [(str(r.rid), read_pages(sched, r)) for r in go],
-                in_flight, cap, len(waiters) - len(go))
+                in_flight, cap, len(waiters) - len(go), _seat_note(room, in_req))
     return out
 
 

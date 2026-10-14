@@ -5744,9 +5744,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         node as it is). Pages of running requests qualify as long as they are
         written (no pending write, no host lock of a load in flight).
 
-        Deterministic order (node id, oldest first) so the PP ranks, whose
-        trees are replicas, release the same nodes -- a slot is free only when
-        every rank's reference is gone. Returns the pages released here."""
+        GROUP-EQUAL ORDER (NF arena fix 14.10., SGLANG_WEG2_W3_SPILL_GROUP_ORDER): a slot is
+        free only when EVERY rank's reference is gone, and the PP ranks' trees
+        are NOT replicas (P.log:15554 PP0 candidates=31 x 64 pages, PP1
+        candidates=9 x 208-256 pages; every PP0 spill ended ``ARENA-DROP
+        freed=0``) -- node ids say nothing across ranks. The order is therefore
+        read from what all ranks share, the arena: a candidate's key is
+        (lowest reader-reference count over its slots, lowest slot id, node id).
+        A slot is the canonical page identity (one page, one slot, for every
+        rank that holds it); the reference count prefers the pages a peer has
+        already begun to release, so the last rank to let go frees the slot.
+        No collective, no reserve, no new state: every rank orders by the same
+        header it reads. Returns the pages released here."""
         if pool is None or getattr(pool, "arena", None) is None:
             return 0
         if not hasattr(pool, "secure_rows_to_l3"):
@@ -5794,9 +5803,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if int(hv.min()) < int(getattr(pool, "staging_rows", 0)):
                 continue   # staging rows are not arena slots
             cands.append(node)
-        cands.sort(key=lambda x: x.id)
+        keys = self._w3_spill_keys(pool, cands)
+        cands.sort(key=lambda x: keys[id(x)])
         released = secured = written = lost = 0
         spilled = 0
+        released_slots = []
         for node in cands:
             if released >= want:
                 break
@@ -5807,6 +5818,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 continue
             secured += int(sec.get("on_disk", 0))
             written += int(sec.get("written", 0))
+            released_slots.extend(keys.slots_of(node))
             _dev, host_freed = self._evict_component_and_detach_lru(
                 node, base, target=EvictLayer.HOST, tracker=None)
             self.evictable_host_leaves.discard(node)
@@ -5831,10 +5843,36 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if k <= 8 or k % 64 == 0 or lost:
             logger.info(
                 "W3-ARENA SPILL n=%d need=%d released_pages=%d nodes=%d candidates=%d "
-                "l3=on_disk:%d,written:%d lost=%d (a finished page leaves L2 only with "
-                "its L3 copy; the node stays on the device, l3_present)",
-                k, int(need_pages), released, spilled, len(cands), secured, written, lost)
+                "l3=on_disk:%d,written:%d lost=%d ref_free=%s (a finished page leaves L2 only with "
+                "its L3 copy; the node stays on the device, l3_present; ref_free = of the slots "
+                "this spill let go, those NO rank references any more -- the clock takes them; "
+                "group-equal order: fewest peer references first, then slot id)",
+                k, int(need_pages), released, spilled, len(cands), secured, written, lost,
+                self._w3_spill_ref_free(pool, released_slots))
         return released
+
+    def _w3_spill_keys(self, pool, nodes) -> "_W3SpillKeys":
+        """The group-equal order of spill candidates (see ``_w3_arena_spill``):
+        ``keys[id(node)]`` = (0, fewest references over the node's slots, lowest
+        slot, node id); a node whose rows name no arena slot (a fixture pool, a
+        pool without the header read) sorts after, in node-id order -- the old
+        order. One header read for all candidates. Switch
+        ``SGLANG_WEG2_W3_SPILL_GROUP_ORDER`` off: node-id order for all."""
+        return _W3SpillKeys(pool, nodes, group=bool(envs.SGLANG_WEG2_W3_SPILL_GROUP_ORDER.get()))
+
+    def _w3_spill_ref_free(self, pool, slots) -> str:
+        """``free/total`` of the slots this spill released: reference count 0
+        after the release (instrument; "-" when the arena has no header read)."""
+        arena = getattr(pool, "arena", None)
+        reader = getattr(arena, "slot_refs", None)
+        uniq = sorted(set(int(s) for s in slots))
+        if not callable(reader) or not uniq:
+            return "-"
+        try:
+            refs = reader(uniq)
+        except Exception:  # noqa: BLE001 - an instrument never breaks the spill
+            return "-"
+        return "%d/%d" % (sum(1 for r in refs if int(r) == 0), len(uniq))
 
     def _weg2_write_or_abort(self, node, device_value, aux_xfers, pre, ring):
         """The controller write of `write_backup`. #1424f (rc12p P-PP0
@@ -12612,6 +12650,79 @@ def _full_arena_suffix(stats: dict) -> str:
         return ""
     return (" arena_full_skipped=%d (SWEEP-FULL-ARENA: counted refused without the claim -- "
             "the KV arena has no room for them after this sweep's arena_claim refusal)" % n)
+
+
+class _W3SpillKeys:
+    """Sort keys of W3 spill candidates, read from the shared arena (see
+    ``UnifiedRadixCache._w3_arena_spill``, GROUP-EQUAL ORDER).
+
+    key(node) = (0, min reader references over its slots, min slot, node id)
+    when the node's host rows name arena slots and the arena can read its
+    headers (``slot_refs``); (0, 0, min slot, id) when it cannot (the slot is
+    still the canonical page identity); (1, 0, 0, id) when the rows name no
+    slot at all (a fixture pool): node-id order, as before. ``keys[id(node)]``
+    is the key, ``slots_of(node)`` the slots (computed on demand, only for the
+    nodes a spill releases).
+
+    One vectorised pass for all candidates (1500 nodes x 64 pages: the per-node
+    form measured 112 ms in the scheduler thread; this is one concatenation,
+    one unique, one header read of the distinct slots)."""
+
+    def __init__(self, pool, nodes, group: bool = True):
+        self._pool = pool
+        self._key = {}
+        if not group or not nodes:
+            for node in nodes:
+                self._key[id(node)] = (0, 0, 0, node.id)
+            return
+        try:
+            self._vector_keys(pool, nodes)
+        except Exception:  # noqa: BLE001 - an order never breaks the spill: the old order
+            logger.warning("W3-ARENA SPILL: the group-equal order is unavailable, node-id order", exc_info=True)
+            for node in nodes:
+                self._key[id(node)] = (0, 0, 0, node.id)
+
+    def _vector_keys(self, pool, nodes) -> None:
+        from sglang.srt.mem_cache.pool_host.arena_pool import _arena_mask, _psz
+
+        n = len(nodes)
+        hvs = [node.component_data[BASE_COMPONENT_TYPE].host_value.reshape(-1).cpu().to(torch.int64)
+               for node in nodes]
+        lens = torch.tensor([int(h.numel()) for h in hvs], dtype=torch.int64)
+        cat = torch.cat(hvs)
+        owner = torch.repeat_interleave(torch.arange(n, dtype=torch.int64), lens)
+        keep = _arena_mask(pool, cat)
+        S, P = int(pool.staging_rows), _psz(pool)
+        slots = (cat[keep] - S) // P
+        owner = owner[keep]
+        big = torch.iinfo(torch.int64).max
+        min_slot = torch.full((n,), big, dtype=torch.int64).scatter_reduce(
+            0, owner, slots, reduce="amin", include_self=True)
+        min_refs = torch.zeros(n, dtype=torch.int64)
+        reader = getattr(getattr(pool, "arena", None), "slot_refs", None)
+        if callable(reader) and slots.numel():
+            uniq, inv = torch.unique(slots, return_inverse=True)
+            refs_u = torch.tensor([int(r) for r in reader(uniq.tolist())], dtype=torch.int64)
+            min_refs = torch.full((n,), big, dtype=torch.int64).scatter_reduce(
+                0, owner, refs_u[inv], reduce="amin", include_self=True)
+        ms, mr = min_slot.tolist(), min_refs.tolist()
+        for i, node in enumerate(nodes):
+            if ms[i] == big:
+                self._key[id(node)] = (1, 0, 0, node.id)       # no arena slot named
+            else:
+                self._key[id(node)] = (0, 0 if mr[i] == big else mr[i], ms[i], node.id)
+
+    def __getitem__(self, node_id):
+        return self._key[node_id]
+
+    def slots_of(self, node):
+        from sglang.srt.mem_cache.pool_host.arena_pool import arena_ref_slots
+
+        try:
+            return [int(x) for x in arena_ref_slots(
+                self._pool, node.component_data[BASE_COMPONENT_TYPE].host_value).tolist()]
+        except Exception:  # noqa: BLE001 - an instrument
+            return []
 
 
 def _w3_anchor_spill_pool(pool):

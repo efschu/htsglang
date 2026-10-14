@@ -76,6 +76,11 @@ def test_the_census_names_the_oldest_open_claim(tmp_path, caplog, monkeypatch):
     assert (oc["slot"], oc["role"], oc["gen"], oc["claimed"], oc["pid"]) == (old, ha.ROLE_L3FILL, gen, 2,
                                                                             os.getpid())
     assert oc["age_ms"] >= 40
+    # NF arena fix 14.10.: the census is ON by default (60 s), so the arena's own
+    # init already started its thread; stop that one, then start the fast one
+    _default = ha._CENSUS_THREADS.pop(os.path.realpath(arena.path), None)
+    if _default is not None:
+        _default.set()
     monkeypatch.setenv(ha.ENV_REF_CENSUS_S, "0.05")
     with caplog.at_level(logging.INFO, logger=ha.__name__):
         ha._start_ref_census(arena)
