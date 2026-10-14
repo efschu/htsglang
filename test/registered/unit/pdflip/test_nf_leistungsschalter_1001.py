@@ -34,6 +34,8 @@ PROFILE_P = {
     "FLLIPER_UNEVEN_MOE_EXPERT_SHARD": "1",
     "FLLIPER_HC_MIXER_INT8": "1",
     "FLLIPER_WEIGHT_LOADER_COALESCE_MIB": "32",
+    # GC-FREEZE 1013 (RC4 port): the boot heap leaves the collector after boot (P and D); the nextflash row writes it
+    "FLLIPER_PDFLIP_GC_FREEZE": "1",
 }
 PROFILE_D = {
     "FLLIPER_PDFLIP_TAIL_KEEP_MIB": "512",
@@ -49,6 +51,9 @@ PROFILE_D = {
     "FLLIPER_PDFLIP_ENABLE_D_PARK_END": "1",
     "FLLIPER_HC_MIXER_INT8": "1",
     "FLLIPER_WEIGHT_LOADER_COALESCE_MIB": "32",
+    # GC-FREEZE 1013 (RC4 port): freeze as on P, and the GC warning armed on D (P has had it since 30.09.)
+    "FLLIPER_PDFLIP_GC_FREEZE": "1",
+    "FLLIPER_PDFLIP_GC_WARN_SECS": "0.5",
 }
 FORM_A_D = "--max-total-tokens 262144 --rank-role host,worker,worker --rank-tp-ratio 1,0,0"
 
