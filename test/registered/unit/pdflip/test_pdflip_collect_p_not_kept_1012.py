@@ -20,6 +20,9 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 from test_pdflip_arrival_seat_rule_0929 import _front  # noqa: E402
 
+from flliper.srt.managers.scheduler_components import weight_updater as _wu  # noqa: E402,F401
+from flliper.srt.pdflip import front as F  # noqa: E402
+
 import pytest  # noqa: E402
 
 # RC4 port to the 27B line: the four seat-level tests below set the case up through the X-SUM-PRICE in-flight book
@@ -28,9 +31,6 @@ import pytest  # noqa: E402
 # ``test_handler_*`` tests at the end of this file, which run on both lines.
 _needs_price_book = pytest.mark.skipif(not hasattr(F.Front, "_d_pf_book"),
                                        reason="X-SUM-PRICE in-flight book is NF-only; covered by the test_handler_* tests")
-
-from flliper.srt.managers.scheduler_components import weight_updater as _wu  # noqa: E402,F401
-from flliper.srt.pdflip import front as F  # noqa: E402
 
 X_LIVE = 8095
 
