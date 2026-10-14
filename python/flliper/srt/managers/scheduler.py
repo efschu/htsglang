@@ -6593,6 +6593,13 @@ class Scheduler(
 
         return d_park_runtime.park_tick(self)
 
+    def _pdflip_d_lane_hold_queued(self) -> int:
+        """PRIORITY LANES fix 2: the queued requests below D's lane floor enter the lane hold
+        (d_park_runtime.hold_queued); every rank moves the same ones (queue and floor are replicated)."""
+        from flliper.srt.pdflip import d_park_runtime
+
+        return len(d_park_runtime.hold_queued(self))
+
     def _pdflip_d_park_note_retracted(self, retracted_reqs) -> int:
         from flliper.srt.pdflip import d_park_runtime
 
@@ -12180,6 +12187,10 @@ class Scheduler(
         self.process_pending_pdflip_park()  # Punkt 2 (18.09.)
         if getattr(self, "pdflip_d_parked", None):
             self._pdflip_d_park_tick()  # H91b
+        if getattr(self, "pdflip_lane_floor", 0):
+            # PRIORITY LANES fix 2 (metal 180335): a queued request below D's floor goes into the lane hold, so the
+            # queue (an idle term) holds nothing the floor keeps out. Floor 0 (the default, switch off) never gets here.
+            self._pdflip_d_lane_hold_queued()
         _pdflip_resume_warm_tick(self)  # RW: experts of the resumes, after the legs, never waited for
         if getattr(self, "pdflip_post_wake_settle", None):
             self._pdflip_post_wake_settle_tick()  # #1471

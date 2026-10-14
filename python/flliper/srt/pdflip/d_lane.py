@@ -34,6 +34,8 @@ LANE_HOLD_ATTR = "_pdflip_lane_hold"
 MARK_D_FLOOR = "PDFLIP-D-LANE floor"
 #: the scheduler's census key of a request the floor keeps out of an admission pass
 SKIP_KEY = "pdflip_lane_floor"
+#: LANES FIX 2: a queued request below the floor taken into the lane hold (``d_park_runtime.hold_queued``)
+MARK_D_HOLD_QUEUED = "PDFLIP-D-LANE hold-queued"
 
 
 def lane_of_req(req: Any) -> int:
