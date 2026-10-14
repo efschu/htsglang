@@ -56,6 +56,7 @@ MARK_DEFER = "PDFLIP LANE-DEFER"          # a higher lane arrives during a flip:
 MARK_REPREFILL = "PDFLIP LANE-REPREFILL"  # resume found no prefix: the request is prefilled again via P (must count 0 on metal)
 MARK_D_PARK_PARK = "PDFLIP-D-PARK park(lane)"        # D side: rids parked for a lane, hold="lane"
 MARK_D_PARK_REQUEUE = "PDFLIP-D-PARK requeue(lane)"  # D side: held parks requeued in arrival order on a floor fall
+MARK_D_PARK_PHASES = "PDFLIP-D-PARK lane-park-phases"  # D side (fix 4): the phases of one park(lane) line, log only
 MARK_PR_FLOOR = "PR LANE-FLOOR"          # P side: the floor stamped into the PP-room vote
 #: the warning of a ``priority`` the front had to correct (negative / not a whole number / out of range)
 MARK_FIELD = "PDFLIP LANE-FIELD"

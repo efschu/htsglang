@@ -46,6 +46,15 @@ stages share: a batch is planned identically on every stage, a stamp is read bef
 named, never silently applied one batch off).  Until then the in-flight chunks of the lower lane run on all stages identically;
 a higher lane waits at most FLOOR_LEAD_BATCHES batches (one chunk) on each stage.
 
+FIX 4 (NF metal 5 @ 8bfd25d842, probe 2b lage (i), reproduced twice): the hold was right on every stage (``PR LANE-FLOOR`` eff=at=stamped+1, #1004 = 0)
+but no ``PDFLIP-PARK (lane)`` ever appeared: the held continuation kept its rows until the front aborted it (``LANE-P-TAKE``).  Root:
+the batch builder counted ``chunked_req.inflight_middle_chunks += 1`` for the held continuation in the pass that admitted the higher
+lane, though no chunk of it was launched, and the park waits for that count to reach 0 (:func:`held_without_seat`).  The park itself
+was never the problem; ``p_take`` of the front (lane_ctl) is the designed complement (it takes the parked leg out of P's waiting queue
+before the P->D flip), not a replacement.  A higher lane that needs its OWN chunked slot (more than one chunk) is refused while the held
+continuation occupies ``chunked_req`` (``chunked_req_outstanding``): only the park frees it.  :func:`note_park_wait` names the count
+that still holds the rows back.
+
 WHY THE VOTE WAY CARRIES AND ``PdFlipParkReq`` STAYS UNWIRED.  ``PdFlipParkReq`` (``pdflip/park.py``) would name a request to
 tear down on every rank at the head of the same step.  What the lane needs uniform is the DECISION (park / do not run the
 next chunk), and that is a function of (floor_m, request lane) -- both uniform per pass through the stamp.  The moment the
@@ -73,6 +82,8 @@ LANE_PARKED_ATTR = "pdflip_lane_parked"  # the in-place / rows-back park of this
 TRIGGER = "lane"
 
 MARK_PARK_LANE = "PDFLIP-PARK (lane)"  # sch:10151 pattern: ``PDFLIP-PARK n=...`` with the trigger in the marker
+#: FIX 4: the head-of-step park of a lane-held continuation waits for a launched chunk to drain; one line per (request, floor epoch)
+MARK_PARK_WAIT = "PDFLIP LANE-P PARK-WAIT"
 
 
 # ---------------------------------------------------------------------------
@@ -483,17 +494,55 @@ def park_still_due(sched: Any, req: Any) -> bool:
     return holds(req_lane(req), floor_for_pass(sched))
 
 
+def held_without_seat(req: Any, can_run_list: Iterable[Any]) -> bool:
+    """FIX 4 (NF metal 5, probe 2b lage (i): no ``PDFLIP-PARK (lane)`` on P, ever): ``req`` is the chunked continuation that the lane
+    floor holds IN PLACE in this pass and it is NOT in the batch the pass built -- no chunk of it was launched, so the batch builder
+    (``Scheduler._get_new_batch_prefill_raw``) must not count one for it.
+
+    It used to: ``self.chunked_req.inflight_middle_chunks += 1`` ran for every non-empty batch while a chunked request existed.  In the pass
+    that starts the hold the higher lane is admitted (the batch is non-empty), the held continuation was counted for a chunk that never
+    ran, and nothing ever gave that count back (the result processor decrements the requests of ``batch.reqs`` only).  The head-of-step
+    park waits for ``inflight_middle_chunks == 0`` -- it returned at every step until the front aborted the request.  The same leaked
+    count turned the FINAL chunk of a continuation that resumed in place into a "middle chunk" (``inflight_middle_chunks <= 0`` is the
+    "prefill finished" test of ``process_batch_result_prefill``): no first token, ever.
+
+    Only a LANE hold qualifies (``pdflip_lane_parked`` is True): the pressure park (#679) and every other continuation keep the old
+    accounting (R1).  A held continuation that the forwarded schedule names runs a chunk, is in ``can_run_list`` and is counted as ever."""
+    if getattr(req, LANE_PARKED_ATTR, False) is not True:
+        return False
+    return not any(r is req for r in (can_run_list or ()))
+
+
+def note_park_wait(sched: Any, req: Any) -> None:
+    """FIX 4 instrument: a lane-held continuation could not give its rows back because ``inflight_middle_chunks`` > 0 (a launched chunk
+    still writes them).  One line per (request, floor epoch): the next metal run reads the count that held the park back, and a
+    ``PDFLIP-PARK (lane)`` within the pipeline depth after it (3 passes) says it drained.  No such line, or a count that never moves, is the
+    leak of fix 4 again (or its sibling)."""
+    st = getattr(sched, STATE_ATTR, None)
+    epoch = 0 if st is None else int(st.epoch)
+    key = (str(getattr(req, "rid", "?")), epoch)
+    if getattr(sched, "_pdflip_lane_park_wait_key", None) == key:
+        return
+    sched._pdflip_lane_park_wait_key = key
+    logger.info(
+        "%s rid=%s inflight=%d floor=%d epoch=%d fwd_ct=%s: the lane floor holds this continuation in place but a launched chunk still "
+        "writes its rows (inflight_middle_chunks); the rows go back at the first step after it drained",
+        MARK_PARK_WAIT, key[0], int(getattr(req, "inflight_middle_chunks", 0) or 0), 0 if st is None else st.floor, epoch,
+        forward_ct_of(sched),
+    )
+
+
 def note_parked(sched: Any, req: Any, *, span: int, total: int) -> int:
     """The ``PDFLIP-PARK (lane) n=...`` marker (``sch:10151`` pattern).  Returns n."""
     n = getattr(sched, "_pdflip_park_lane_n", 0) + 1
     sched._pdflip_park_lane_n = n
     st = getattr(sched, STATE_ATTR, None)
     logger.info(
-        "%s n=%d rid=%s span=%d of %d lane=%d floor=%d epoch=%d: rows given back to the tree (evictable, "
+        "%s n=%d rid=%s span=%d of %d lane=%d floor=%d epoch=%d fwd_ct=%s: rows given back to the tree (evictable, "
         "is_insert=True), request back at the head of the queue of its lane; resume by prefix match when the floor "
         "falls to its lane, admitted whole",
         MARK_PARK_LANE, n, getattr(req, "rid", "?"), int(span), int(total), req_lane(req),
-        0 if st is None else st.floor, 0 if st is None else st.epoch,
+        0 if st is None else st.floor, 0 if st is None else st.epoch, forward_ct_of(sched),
     )
     return n
 
