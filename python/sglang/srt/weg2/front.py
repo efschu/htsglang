@@ -5166,6 +5166,14 @@ class Front:
                                "one ends the stream by name", r.get("attempt"), rid,
                                int(r.get("d_extent") or 0))
         if reqs:
+            if _lanes.enabled():
+                # LANEHOLD-FLIP-1014 (NF h13 weg2-20-119, 14:25:49,541-543): a P-only leg queued here for a
+                # request BELOW the floor is held NOW, in this synchronous step. The controller pass ran its
+                # lane sweep (_lane_reconcile) BEFORE this take, and its ARRIVAL-SEAT step read the queue 2 ms
+                # later: PBOUND-FLIP-NOW + PARK-IMMEDIATE flipped D->P for a lane-0 leg under floor 1 (the lane
+                # loop's own tick sweep came after the flip had begun). Same class as LANES FIX 2. Held, it
+                # comes back through _restore_held when the floor falls to its lane.
+                _lctl.sweep(self)
             self._kick_controller("arrival")
         return len(reqs)
 
@@ -16789,6 +16797,11 @@ class Front:
                 await Front._lane_reconcile(self, "controller")
                 self._hl_sweep()  # #243 seam: lost hand-offs of waiting rids -> P
                 self._rvp_take()
+                if _lanes.enabled():
+                    # LANEHOLD-FLIP-1014: the two takes above queue P legs AFTER the reconcile's sweep -- the
+                    # invariant "nothing below the floor in queue/_ready_for_d" is restored before this pass
+                    # reads the queue for a flip, a park or a P batch.
+                    _lctl.sweep(self)
                 if self.awake == "D":
                     D = self.groups["D"]
                     _now = time.time()
