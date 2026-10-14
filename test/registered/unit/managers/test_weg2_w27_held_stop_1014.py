@@ -423,7 +423,12 @@ def test_scheduler_breaks_on_the_held_barrier():
 
     src = inspect.getsource(S)
     i = src.index("_told_loaded = _p_intake.told_admission(")
-    window = src[i:i + 700]
-    assert re.search(r"if _told_loaded is None:\s+if weg2_store_told\.held_barrier\(self, req\):", window), window
-    j = window.index("held_barrier")
-    assert window.index("break", j) < window.index("continue", j)
+    window = src[i:i + 900]
+    # NF-FOLLOWER-ROUND 1014 (C2): the answer to "no verdict" moved into
+    # ``p_intake.told_pending_gate``; without a row in hand it is this barrier unchanged.
+    assert re.search(r"if _told_loaded is None:\s+(#[^\n]*\n\s+)*_told_gate = _p_intake\.told_pending_gate\(", window), window
+    assert "weg2_store_told.held_barrier" in window, window
+    assert window.index("GATE_BREAK:") < window.index("break") < window.index("GATE_SKIP:") < window.index("continue")
+    gsrc = inspect.getsource(p_intake.told_pending_gate)
+    j = gsrc.index("if held_barrier(scheduler, req):")
+    assert gsrc.index("return GATE_BREAK", j) < gsrc.index("return GATE_SKIP", j)

@@ -137,6 +137,106 @@ def told_admission(
     return credit
 
 
+#: NF-FOLLOWER-ROUND 1014 C2 switch (default ON); ``0`` = the told gate holds a
+#: row-named rid on the follower as before (e7cfda7fbe).
+TOLD_ROW_YIELD_ENV = "SGLANG_WEG2_TOLD_ROW_YIELD"
+ROW_NAMED = "named"
+ROW_NOT_NAMED = "not_named"
+
+
+def told_row_yield_enabled() -> bool:
+    import os
+
+    return (os.environ.get(TOLD_ROW_YIELD_ENV, "1") or "1").strip().lower() not in (
+        "0", "false", "no", "off")
+
+
+def told_row_verdict(scheduler, req) -> Optional[str]:
+    """C2 (NF-FOLLOWER-ROUND 1014, inventory B4): does the told gate of THIS
+    follower stand under PP0's executed row?
+
+    ``None``: no row in hand (PP0, a non-PP rank, a follower without the row
+    authority, the switch off) -- the gate decides as before. Otherwise the row
+    IS the membership verdict, exactly as for the LB-VERDICT gate since
+    31aa655fff (``pp_loadback_verdict.gated`` yields to ``ROW_ATTR``):
+
+    * ``ROW_NAMED`` -- the row names the rid: the gate yields, the rid goes to
+      the row's admission arm with PP0's told; a read this rank still lacks is
+      materialised by ``execute_scheduled_prefix`` on its bounded clock, which
+      stops the group BY NAME when it cannot (#968 station) -- never a skip
+      that leaves the follower's batch one rid short of PP0's (PPScheduleRefused
+      / #1004, the rank-local veto over a row that raenge-nie-uneins forbids).
+    * ``ROW_NOT_NAMED`` -- the row does not name it: the row's own arm skips it
+      (``pp_not_named``); a held rid is NO barrier here (W27-HELD-STOP guards a
+      follower that plans its own membership, which a row-executing one does
+      not) -- breaking on it would cut the row's rids behind it."""
+    if not told_row_yield_enabled():
+        return None
+    ps = getattr(scheduler, "ps", None)
+    if ps is None or int(getattr(ps, "pp_size", 1) or 1) <= 1:
+        return None
+    if int(getattr(ps, "pp_rank", 0) or 0) == 0:
+        return None
+    incoming = getattr(scheduler, "_pp_admission_incoming_effective", None)
+    if incoming is None:
+        return None
+    rid = getattr(req, "rid", None)
+    return ROW_NAMED if rid in incoming else ROW_NOT_NAMED
+
+
+def note_told_row_yield(scheduler, req, verdict: str) -> None:
+    """The C2 instrument: one bounded line per yield (``TOLD-ROW-YIELD``)."""
+    n = getattr(scheduler, "_weg2_told_row_yield_n", 0) + 1
+    scheduler._weg2_told_row_yield_n = n
+    if n <= _LOG_FIRST or n % _LOG_EVERY == 0:
+        rid = str(getattr(req, "rid", ""))
+        told_map = getattr(scheduler, "_weg2_store_told", None) or {}
+        logger.info(
+            "TOLD-ROW-YIELD rank pp=%s rid=%s row=%s told_here=%s kept=%s (n=%d): the "
+            "told gate held this rid on this follower; PP0's executed row is the "
+            "verdict (C2, like LBV_ROW_YIELD) -- the row decides, the station "
+            "materialises or stops by name",
+            getattr(getattr(scheduler, "ps", None), "pp_rank", "?"), rid, verdict,
+            told_map.get(rid), rid in (getattr(scheduler, KEPT_ATTR, None) or {}), n,
+        )
+
+
+GATE_ADMIT = "admit"
+GATE_SKIP = "skip"
+GATE_BREAK = "break"
+
+
+def told_pending_gate(
+    scheduler,
+    req,
+    note_skip: Callable[[str, Any], None],
+    held_barrier: Callable[[Any, Any], bool],
+) -> str:
+    """The #1400 told gate's answer when :func:`told_admission` returned None
+    (no verdict this visit): ``GATE_ADMIT``, ``GATE_SKIP`` or ``GATE_BREAK``.
+
+    ``held_barrier`` is ``weg2_store_told.held_barrier`` (passed in: this module
+    stays light). Without a row in hand (:func:`told_row_verdict` None) this is
+    the gate of e7cfda7fbe exactly: the W27 barrier ends the loop, else the rid
+    is skipped. With PP0's executed row in hand (C2) a rid the row NAMES is
+    admitted -- the row's told and the materialisation station govern it, the
+    credit stays None as for any uncredited rid -- and one it does not name is
+    skipped and is no barrier."""
+    row = told_row_verdict(scheduler, req)
+    if row == ROW_NAMED:
+        note_told_row_yield(scheduler, req, row)
+        return GATE_ADMIT
+    if row == ROW_NOT_NAMED:
+        return GATE_SKIP
+    if held_barrier(scheduler, req):
+        # W27-HELD-STOP (NF h16g 17:49:53Z): a told rid held for a tree short
+        # of PP0's told is a BARRIER -- overtaking it planned [weg2-0-9,
+        # weg2-1-11] against PP0's three.
+        note_skip("w27_held_barrier", getattr(req, "rid", None))
+        return GATE_BREAK
+    return GATE_SKIP
+
+
 def _is_follower_twin(scheduler, rid: str) -> bool:
     try:
         from sglang.srt.managers import weg2_store_told as _st
