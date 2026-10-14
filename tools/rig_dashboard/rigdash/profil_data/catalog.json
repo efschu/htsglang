@@ -80981,6 +80981,38 @@
    "text": "",
    "type": "EnvInt"
   },
+  "SGLANG_WEG2_P_FOLLOWER_ROUND": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"1\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "NF-FOLLOWER-ROUND 1014 switch (default ON, user rule 14.10.: new features are on); ``0`` = e7cfda7fbe byte for byte: no round on a frameless cycle, the #1268 vote runs its four single drains.",
+   "id": "SGLANG_WEG2_P_FOLLOWER_ROUND",
+   "kind": "env",
+   "lesestellen": [
+    "managers/scheduler_pp_mixin.py:4336",
+    "managers/scheduler_pp_mixin.py:4459"
+   ],
+   "level": "experte",
+   "name": "SGLANG_WEG2_P_FOLLOWER_ROUND",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "baum": "nf",
+    "file": "managers/scheduler_pp_mixin.py",
+    "kind": "os.environ",
+    "line": 4336
+   },
+   "status": "geerntet",
+   "text": "",
+   "type": "os.environ"
+  },
   "SGLANG_WEG2_P_HELD_SHORT_REREAD": {
    "baeume": [
     "nf"
@@ -84659,6 +84691,37 @@
    "text": "",
    "type": "EnvBool"
   },
+  "SGLANG_WEG2_TOLD_ROW_YIELD": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"1\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "NF-FOLLOWER-ROUND 1014 C2 switch (default ON); ``0`` = the told gate holds a row-named rid on the follower as before (e7cfda7fbe).",
+   "id": "SGLANG_WEG2_TOLD_ROW_YIELD",
+   "kind": "env",
+   "lesestellen": [
+    "weg2/p_intake.py:150"
+   ],
+   "level": "experte",
+   "name": "SGLANG_WEG2_TOLD_ROW_YIELD",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "baum": "nf",
+    "file": "weg2/p_intake.py",
+    "kind": "os.environ",
+    "line": 150
+   },
+   "status": "geerntet",
+   "text": "",
+   "type": "os.environ"
+  },
   "SGLANG_WEG2_TORCH_CACHE_CAP": {
    "baeume": [
     "27b",
@@ -87278,25 +87341,25 @@
    "abweichung": 47,
    "beide": 2461,
    "nur_27b": 180,
-   "nur_nf": 91
+   "nur_nf": 93
   },
-  "entries": 2750,
-  "envs": 1871,
+  "entries": 2752,
+  "envs": 1873,
   "erklaert": 305,
   "flags": 864,
-  "geerntet": 1701,
+  "geerntet": 1703,
   "kuratiert": 125,
   "unerklaert": 619
  },
- "tree_rev": "27b=02123ee2ef+nf=75e3ee8abd+lbv-deadlock-e23abfcb05+prio-alter-fa99a484ae+w3-drain-e7cfda7fbe+h16m-int-1014",
+ "tree_rev": "27b=02123ee2ef+nf=75e3ee8abd+lbv-deadlock-e23abfcb05+prio-alter-fa99a484ae+w3-drain-e7cfda7fbe+follower-round-b76e5fce79+h16m-int-1014",
  "trees": {
   "27b": {
    "entries": 2641,
    "rev": "02123ee2ef"
   },
   "nf": {
-   "entries": 2552,
-   "rev": "75e3ee8abd+lbv-deadlock-e23abfcb05+prio-alter-fa99a484ae+w3-drain-e7cfda7fbe+h16m-int-1014"
+   "entries": 2554,
+   "rev": "75e3ee8abd+lbv-deadlock-e23abfcb05+prio-alter-fa99a484ae+w3-drain-e7cfda7fbe+follower-round-b76e5fce79+h16m-int-1014"
   }
  },
  "warnungen": []
