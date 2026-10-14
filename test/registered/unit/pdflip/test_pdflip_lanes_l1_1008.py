@@ -423,7 +423,8 @@ def test_catalog_entries_and_edges_for_the_three_envs():
     for kid, von in (("K135", "FLLIPER_PDFLIP_LANE_KEEPALIVE_S"), ("K136", "FLLIPER_PDFLIP_LANE_PREEMPT_CHUNK_TOKENS")):
         k = kanten[kid]
         assert (k["von"], k["nach"], k["rel"]) == (von, "FLLIPER_PDFLIP_LANES", "requires")
-        assert k["evidence"]["file"] == "python/flliper/srt/environ.py" and "trees" not in k
+        # the lane envs exist on the NF line only (27B 84d04adae1 has none): the edge documents NF code only
+        assert k["evidence"]["file"] == "python/flliper/srt/environ.py" and k["trees"] == ["nf"]
 
 
 def test_the_launch_snapshot_shows_the_lane_envs_without_a_launcher_change():
