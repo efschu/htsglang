@@ -249,6 +249,7 @@ from sglang.srt.weg2 import progress_beacon as _weg2_beacon  # FP forward-progre
 from sglang.srt.weg2.d_lead_probe import build_d_lead_probe  # D-LEAD-MS-1007
 from sglang.srt.weg2.vision_verdict import Weg2VisionVerdict  # H125f vision verdict on the chain
 from sglang.srt.weg2.pp_loadback_verdict import Weg2PpLoadbackVerdict  # LB-VERDICT-1014 on the chain
+from sglang.srt.weg2 import pp_loadback_verdict as _weg2_lbv  # LBV-ADMIT (h16h 19:33:48Z)
 from sglang.srt.weg2 import extend_trim as _weg2_extend_trim  # rc12g extend chunk cap
 from sglang.srt.weg2 import d_seat_vram as _weg2_d_seat_vram  # D-MEM-SCHED stage between wakes
 from sglang.srt.weg2 import d_transient_lend as _weg2_d_transient_lend  # D-TRANSIENT-LEND
@@ -365,6 +366,7 @@ from sglang.srt.weg2 import tail_handoff
 from sglang.srt.weg2 import p_intake as _p_intake
 from sglang.srt.weg2 import prefill_oom_retreat as _prefill_oom_retreat  # fix 43: Prefill-OOM = retreat, not death
 from sglang.srt.weg2.pp_slot_fidelity import AgreedRoomShort  # PREFILL-OOM-RETREAT, load-back entrance
+from sglang.srt.mem_cache.pool_host.arena_pool import ArenaChainMismatch  # ARENA-CHAIN: a refused load-back chain is a void pass
 from sglang.srt.mem_cache.common import (
     PrefillOutOfPages,  # PREFILL-OOM-RETREAT (weg2/prefill_oom_retreat.py)
     cap_above_evictable,  # F1 (nf-next-1006-01)
@@ -918,6 +920,25 @@ def _weg2_store_short_tail_x(sched) -> int:
 #: seconds (every rank marks off the group-synced record in the same pass);
 #: not counted while this group sleeps (P can still publish then, xsn344).
 STORE_SHORT_MAX_CYCLES_ENV = "SGLANG_WEG2_STORE_SHORT_MAX_CYCLES"
+#: STORE-HELD-DECIDE-1014 (NF h16 a2cfc77f76, D TP0 15:27:55-15:28:16, weg2-8-68): the
+#: store-short wait exists for a WRITER still filling the store (P's asynchronous
+#: write-through). A read that ended short of what the store ALREADY holds
+#: (``deliverable`` = the store's hit, #248h) and did not grow on its re-read has no
+#: writer to wait for: 64576 of 175872 held, four identical 5.2-s re-reads, 21 s of a
+#: stalled D before the fallback. On (default): one re-read without growth decides.
+#: 0: the bound of SGLANG_WEG2_STORE_SHORT_MAX_CYCLES alone, as before.
+STORE_HELD_DECIDE_ENV = "SGLANG_WEG2_STORE_SHORT_HELD_DECIDE"
+
+
+def _weg2_store_held_short(req) -> bool:
+    """STORE-HELD-DECIDE-1014: the store holds more than this request's read
+    delivered (the shortfall is not a missing write). Group-uniform: both terms
+    are the group-synced END-vote reading the drain wrote (HFB)."""
+    if (os.environ.get(STORE_HELD_DECIDE_ENV, "1") or "1").strip().lower() in ("0", "false", "no", "off"):
+        return False
+    delivered = int(getattr(req, "_weg2_store_delivered", 0) or 0)
+    held = int(getattr(req, "_weg2_store_deliverable", 0) or 0)
+    return held > delivered > 0
 
 
 def _weg2_store_short_max_cycles() -> int:
@@ -1030,8 +1051,11 @@ def _weg2_store_short_fallback(sched, req, reason: str, span, site: str) -> Opti
         return None
     cycles = _weg2_store_short_cycle(sched, req)
     settled = _weg2_settled_this_wake(sched, req)
-    # WT: no writer after this wake's settle -- the first short read decides
-    bound = 0 if settled else _weg2_store_short_max_cycles()
+    held = _weg2_store_held_short(req)
+    # WT: no writer after this wake's settle -- the first short read decides;
+    # STORE-HELD-DECIDE-1014: the store already holds what the read missed --
+    # the first re-read without growth decides
+    bound = 0 if settled else (1 if held else _weg2_store_short_max_cycles())
     if cycles <= bound:
         return None
     x = _weg2_store_short_tail_x(sched)
@@ -1044,7 +1068,8 @@ def _weg2_store_short_fallback(sched, req, reason: str, span, site: str) -> Opti
         # `_weg2_store_short_reroute`.
         return _weg2_store_short_reroute(
             sched, req, span=span, site=site, cause="over_x",
-            detail=f"cycles={cycles} bound={bound}",
+            detail=f"cycles={cycles} bound={bound}"
+            + (f" store_held={int(getattr(req, '_weg2_store_deliverable', 0) or 0)}" if held else ""),
         )
     from sglang.srt.mem_cache.match_refusal_census import (
         note_prefetch_gate as _note_prefetch_gate,
@@ -1056,7 +1081,8 @@ def _weg2_store_short_fallback(sched, req, reason: str, span, site: str) -> Opti
     sched._weg2_store_short_fallbacks = getattr(sched, "_weg2_store_short_fallbacks", 0) + 1
     logger.warning(
         "PREFETCH-DEFER-FALLBACK rid=%s delivered=%d tail=%d X=%d cycles=%d "
-        "bound=%d reason=" + ("settled_no_writer" if settled else "no_writer_progress")
+        "bound=%d reason=" + ("settled_no_writer" if settled
+                              else "store_held_no_growth" if held else "no_writer_progress")
         + " span=%s site=%s n=%d -- the store "
         "read terminated short %d times in a row without delivering more; no "
         "writer is filling the tail, so the matched prefix is taken and D "
@@ -17715,13 +17741,27 @@ class Scheduler(
                 # slice lived, and where the offer's only deleter was lost in
                 # e0bc96008e.
 
+            # LBV-ADMIT (NF h16h 19:33:48Z, weg2/pp_loadback_verdict.admit_holds): on the
+            # carrierless form no stage admits a request before PP0's verdict for it was
+            # absorbed at this pass's intake -- the gate keys on the admission, not on this
+            # stage's own host hit (PP0 admitted weg2-70-656 from its device, PP1/PP2 held
+            # it for a load-back verdict that never came: ring wait). After every deferral
+            # above, so PP0 releases only what it would admit; skipped like a deferral.
+            _lbv_held = False
             try:
                 _ar_t0 = time.perf_counter()  # xsn325: host cost per admission
-                with _lanes_p.chunk_scope(adder, req):  # L3: a lower lane's chunk is smaller while a higher lane waits
-                    res = adder.add_one_req(
-                        req,
-                        truncation_align_size=self.truncation_align_size,
-                    )
+                if _weg2_lbv.admit_holds(self, req):
+                    _lbv_held = True
+                    res = AddReqResult.OTHER
+                else:
+                    try:
+                        with _lanes_p.chunk_scope(adder, req):  # L3: a lower lane's chunk is smaller while a higher lane waits
+                            res = adder.add_one_req(
+                                req,
+                                truncation_align_size=self.truncation_align_size,
+                            )
+                    finally:
+                        _weg2_lbv.admit_done(req)
                 if getattr(self, "_weg2_post_wake_pass_n", None) is not None:
                     _arl = getattr(self, "_weg2_gnbp_addreq", None)
                     if _arl is None:
@@ -17737,6 +17777,16 @@ class Scheduler(
                 if _lb_verdict is None:
                     raise
                 res = AddReqResult.OTHER if _lb_verdict == _prefill_oom_retreat.ABORT else AddReqResult.NO_TOKEN
+            except ArenaChainMismatch as _acm:
+                # ARENA-CHAIN (NF 14.10. 07:29:33Z, P PP0 ``#1424 CHAIN MISMATCH node=460 page=174``): ``load_back`` refused a chain page
+                # nothing proves ("the LAST latch"; the proof_cut vote that cuts the match before it runs in the TP group D only) --
+                # before any device allocation, its host lock unwound. Same shape as the AgreedRoomShort above: the request is skipped,
+                # the pass is voided group-wide, the page leaves this rank's host tier, the rank lives. Out of scope (tp group, D) or
+                # switched off (SGLANG_WEG2_ARENA_CHAIN_VOID=0): the exception stops the rank as before.
+                _cm_verdict = _prefill_oom_retreat.retreat_chain_mismatch(self, _acm, req, adder)
+                if _cm_verdict is None:
+                    raise
+                res = AddReqResult.OTHER if _cm_verdict == _prefill_oom_retreat.ABORT else AddReqResult.NO_TOKEN
             except PPScheduleRefused as exc:
                 # NAMED, NOT FOLDED IN (the #797 practice for a sibling with a
                 # different root): requests admitted EARLIER in this same loop
@@ -17893,6 +17943,12 @@ class Scheduler(
                                     res.name,
                                     count,
                                 )
+                if _lbv_held:
+                    # LBV-ADMIT: a deferral, not a stop -- the loop goes on (every stage
+                    # skips the same unreleased rids; PP0-only deferrals above cannot make
+                    # a follower stop one request earlier than PP0)
+                    _note_skip("weg2_lbv_unreleased", req.rid)
+                    continue
                 _note_skip(f"add_result_{res.name}", req.rid)
                 if _hol_go_on:
                     continue

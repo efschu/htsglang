@@ -4194,11 +4194,24 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     "pin covers a load-back or a running request; the caller "
                     "must select an unlocked node, never free under the pin."
                 )
+        _fcd = (node.component_data[BASE_COMPONENT_TYPE]
+                if comp.component_type == BASE_COMPONENT_TYPE else None)
         if (
-            target == EvictLayer.HOST
-            and comp.component_type == BASE_COMPONENT_TYPE
-            and node.component_data[BASE_COMPONENT_TYPE].host_value is not None
-            and node.component_data[BASE_COMPONENT_TYPE].value is not None
+            _fcd is not None
+            and _fcd.host_value is not None
+            and (
+                (target == EvictLayer.HOST and _fcd.value is not None)
+                # h17 (NF 38c6d40239 D TP0 15:51:02, nodes 248/243/251): the
+                # Full host copy also leaves where the node holds NO device KV
+                # (an internal host-only node keeps living for its children,
+                # target HOST or ALL). Its Mamba host state stayed; a later
+                # insert revived Full.value over it -> "mamba host present but
+                # Full.host_value=None". The aux host goes first here too.
+                or (
+                    EvictLayer.HOST in target
+                    and envs.SGLANG_WEG2_AUX_HOST_LAW.get()
+                )
+            )
         ):
             _evict_aux_host_before_full_host(self, node, tracker)
         device_freed, host_freed = comp.evict_component(node, target=target)
@@ -6949,6 +6962,30 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return False
         return pool.claim_would_refuse(top.hash_value)
 
+    def weg2_lbv_pp0_room(self, kv_tokens: int, rid=None) -> bool:
+        """LBV-ADMIT (weg2/pp_loadback_verdict.admit_holds): PP0's room verdict for its
+        OWN load-back of a request it is about to release -- the same decision the
+        ``load_back`` seam's ``_lbv_fits`` takes (the published floor, the Form A
+        floor, the agreed R_m, then the local-PP eviction of the shortfall), asked at
+        the admission gate instead of inside the load. PP0 only; its answer is the
+        group's verdict."""
+        kv_tokens = int(kv_tokens)
+        floor = getattr(self, "uniform_avail_floor", None)
+        if floor is None:
+            raise RuntimeError(
+                "#1045 UNIFORM FLOOR ABSENT AT LB-VERDICT ADMIT: PP0 must decide whether "
+                f"{kv_tokens} token(s) of host load-back fit and the group availability floor "
+                f"was never published for this iteration (rid={rid}); deciding from the local "
+                "free space is the rank-divergent path #1045 forbids"
+            )
+        floor = _form_a_load_back_floor(self, floor, kv_tokens, rid)
+        from sglang.srt.weg2 import pp_slot_fidelity as _sf
+
+        floor = _sf.agreed_floor(self, floor)
+        if kv_tokens <= floor:
+            return True
+        return bool(_sf.local_pp_room(self, kv_tokens, floor, rid))
+
     def load_back(
         self,
         best_match_node: UnifiedTreeNode,
@@ -7120,7 +7157,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # NF-RANG-AUDIT 1014: a load-back that EXECUTES PP0's row (Fix B row authority,
         # execute_scheduled_prefix) is not gated -- the row is the verdict (pp_loadback_verdict.gated)
         _lbv_gated = _lbv_rid is not None and _lbv.gated(self, req)
-        if _lbv_gated and not _lbv.released(self, _lbv_rid):
+        # LBV-ADMIT (h16h 19:33:48Z): on the carrierless form the verdict was spent by the
+        # admission gate for exactly this admission (pp_loadback_verdict.live)
+        if _lbv_gated and not _lbv.live(self, req):
             def _lbv_fits() -> bool:
                 if kv_tokens <= floor:
                     return True

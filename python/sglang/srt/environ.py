@@ -833,6 +833,18 @@ class Envs:
     # writer is refused by name, status 6) and the fill claims the stem fresh.
     # y4a: 29 stems JOINED for >= 6 s blocked D and P. 0 = never.
     SGLANG_WEG2_L3FILL_STALE_CLAIM_S = EnvFloat(5.0)
+    # JOIN-LIVENESS (NF h16 15:34:27-32, weg2-10-86): the JOIN / ROOM waits
+    # follow progress -- a completed stem or a claim taken over restarts the
+    # idle clock; nothing moving for max(bound, STALE_CLAIM_S) ends the wait
+    # (the stale reap then breaks the claim and reads the page itself);
+    # JOIN_CAP_S is the emergency brake. 0 = the fixed bound.
+    SGLANG_WEG2_L3FILL_JOIN_LIVENESS = EnvBool(True)
+    SGLANG_WEG2_L3FILL_JOIN_CAP_S = EnvFloat(60.0)
+    # SELF-EVICT / SELF-JOIN (NF h16 15:34:27, P PP1, weg2-10-86): a fill
+    # never evicts the stems of the read it is filling, and a JOINED stem this
+    # process itself holds is taken over and read at once. 0 = off.
+    SGLANG_WEG2_L3FILL_PROTECT_READ = EnvBool(True)
+    SGLANG_WEG2_L3FILL_SELF_JOIN_TAKEOVER = EnvBool(True)
     # STORE_REFUSE_FS (W57, user 28.09.: "L3 gehoert auf XFS, nie ZFS"): a
     # real boot whose store directory lives on one of these filesystems
     # (/proc/mounts) is refused by name -- the container layer (overlay) or
@@ -2496,6 +2508,15 @@ class Envs:
     # END anchor behind it is not cut off by ``parent_unbacked``. Acts only on
     # nodes marked by ``park_running``; no park = byte for byte as before.
     SGLANG_WEG2_PARK_END_ANCHOR_FIRST = EnvBool(True)
+    # AUX-HOST-LAW (NF h17 38c6d40239, D TP0 15:51:02, "node 248/243/251
+    # mamba host present but Full.host_value=None" killed D from on_idle):
+    # construction, never repair -- the Full host copy leaving a node takes its
+    # aux host states first also when the node holds no device KV (the
+    # internal host-only node lives on for its children; a later insert
+    # revived Full.value over a kept Mamba host state), and a read's anchor
+    # never lands on a node without a Full host copy. The sanity check stays
+    # fatal (raenge-nie-uneins-crash-stop). 0 = the old behaviour.
+    SGLANG_WEG2_AUX_HOST_LAW = EnvBool(True)
     # LANE-ANCHOR-RANK (NF h13 84e787ec96, D TP0 14:35:34, weg2-24-181): a
     # lane park of lane-0 requests (LANE-PREEMPT for an arriving lane-1
     # request) spilled the arriving request's own resume anchor (MAMBA-ARENA

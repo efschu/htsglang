@@ -82,7 +82,7 @@ class _Req:
         return self._d.get(k, default)
 
 
-def _front(src, store_depth, awake="D", state="flipping", flip_dst="P"):
+def _front(src, store_depth, awake="D", state="flipping", flip_dst="P", credit_epoch=20, d_slept_epoch=None):
     f = Front("http://p", "http://d", awake, "t", "", 0, 0, {}, 45.0, tp_prefill_max_tokens=X)
     f.state = state
     f.admit_d = False
@@ -91,10 +91,13 @@ def _front(src, store_depth, awake="D", state="flipping", flip_dst="P"):
 
     async def fake_price(rid, path, payload, text, remainder, est_prompt, multimodal=False):
         return SimpleNamespace(pending=N - CREDIT, n=N, known=True, credit=CREDIT, src=src,
-                               store_depth=store_depth, mm=True, mm_cached=True,
+                               store_depth=store_depth, credit_epoch=credit_epoch,
+                               mm=True, mm_cached=True,
                                image_end=21089, d_reach=CREDIT, d_floor=N - 32)
 
     f._x_exact_price = fake_price
+    if d_slept_epoch is not None:
+        f._d_slept_epoch = d_slept_epoch
     f._pb_register = lambda *a, **k: None
     f._early_flip_maybe = lambda *a, **k: None
     return f
@@ -174,3 +177,48 @@ def test_a_d_presence_only_short_d_lost_goes_to_p_with_the_flag_cleared():
     p = _pending("held", 1.0, skip_leg1=True, short_kept=True, d_direct=True, d_presence_only=True)
     f._to_p_batch(p, "test")
     assert not p.d_presence_only and not p.short_kept and not p.d_direct
+
+
+# ---- SHORTHOLD-EPOCH-1014 (NF h17 38c6d40239, weg2-2-55) ------------------------------------------
+# 15:48:05 SHORT-HOLD-D on a d_served_anchor credit from an epoch D had slept after; 15:48:07-11 a flip
+# P->D for it alone; D's store read delivered nothing usable in 43 s; 15:48:54 W31 -> W50 -> flip D->P;
+# P served it with cached_tokens=192512 in 8.94 s. TTFT 62.4 s.
+
+def test_d_credit_unslept_rule():
+    assert F.d_credit_unslept(20, None)          # D never slept
+    assert F.d_credit_unslept(20, 19)            # D slept BEFORE it served the credit
+    assert not F.d_credit_unslept(20, 20)        # D slept in the epoch it served it (the flip that began it)
+    assert not F.d_credit_unslept(2, 4)          # weg2-2-55: served in 2, D slept since
+    assert not F.d_credit_unslept(None, None)    # unknown epoch: not provable
+
+
+def test_weg2_2_55_a_credit_d_slept_on_goes_to_ps_batch(caplog):
+    caplog.set_level(logging.INFO)
+    f = _front("d_served_anchor", 0, credit_epoch=2, d_slept_epoch=4)
+    queued, ready = _arrive(f)
+    assert ready == [] and len(queued) == 1, "P's batch: P reads the prefix from the store"
+    assert not queued[0].d_presence_only
+    assert f.counters["short_hold_d_stale"] == 1 and f.counters["short_hold_d"] == 0
+    assert any("WEG2 SHORT-HOLD-D STALE rid=" in m for m in caplog.messages)
+    assert any("WEG2 SHORT-TO-P rid=" in m for m in caplog.messages)
+
+
+def test_an_unknown_credit_epoch_is_not_held():
+    f = _front("d_seq_anchor", 0, credit_epoch=None)
+    queued, ready = _arrive(f)
+    assert ready == [] and len(queued) == 1
+
+
+def test_a_credit_of_the_current_wake_is_still_held():
+    f = _front("d_served_anchor", 0, credit_epoch=20, d_slept_epoch=19)
+    queued, ready = _arrive(f)
+    assert queued == [] and len(ready) == 1 and ready[0].d_presence_only
+
+
+def test_the_d_sleep_leg_records_its_epoch():
+    import inspect
+
+    src = inspect.getsource(Front)
+    i = src.index('self._flip_stage = "sleep-kv"')
+    blk = src[i:i + 600]
+    assert 'if src == "D":' in blk and '"_d_slept_epoch"' in blk and "int(self.epoch)" in blk

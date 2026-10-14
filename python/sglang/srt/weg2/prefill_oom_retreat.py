@@ -562,9 +562,74 @@ def lbv_short_stop_enabled(env=None) -> bool:
     return (e.get(ENV_LBV_SHORT_STOP, "") or "").strip().lower() not in ("0", "false", "no", "off")
 
 
-def retreat_loadback(sched, exc, req, adder) -> Optional[str]:
+ENV_CHAIN = "SGLANG_WEG2_ARENA_CHAIN_VOID"
+CHAIN_MARK = "ARENA-CHAIN-VOID"
+
+
+def chain_void_enabled(env=None) -> bool:
+    """ARENA-CHAIN (NF 14.10. 07:29:33Z): a refused load-back chain (``ArenaChainMismatch``) on group P is a void pass, not a
+    rank death. Default ON; ``0`` = the raise of before (the rank stops)."""
+    e = os.environ if env is None else env
+    return (e.get(ENV_CHAIN, "") or "").strip().lower() not in ("0", "false", "no", "off")
+
+
+def chain_abort_message(rid: Any, exc, count: int, why: str) -> str:
+    """The 503 of a request whose load-back chain stayed unprovable after N voids. Carries the intake-stall mark, so the
+    front requeues exactly this request for the next phase of this group (as it does for a pool that could not pay)."""
+    from sglang.srt.weg2.intake_stall import STALL_MARK
+
+    return (
+        f"{STALL_MARK} rid={rid} {CHAIN_MARK} page={getattr(exc, 'page', None)} retries={int(count)} why={why} -- a host "
+        f"page of this request's match is not proven against its tokens (its arena slot belongs to another page); the "
+        f"pass was voided {int(count)} time(s) and the page stays unprovable; the front requeues exactly this request"
+    )
+
+
+def retreat_chain_mismatch(sched, exc, req, adder) -> Optional[str]:
+    """ARENA-CHAIN (NF 14.10. 07:29:33Z, ``..._065207.P.log`` PP0 ``#1424 CHAIN MISMATCH node=460 page=174 of 848 bad=256: key slot
+    -1 (state 0)``, rank death): the proof of a load-back chain (``verify_load_chain``, "the LAST latch") refused it. On group P
+    nobody cuts the match before it (the ``proof_cut`` vote runs in the TP group D only), so the exception used to leave the
+    scheduler uncaught and the rank stopped. It is a load-back refusal of the same shape as ``AgreedRoomShort``: raised before
+    any device allocation, the host lock released by ``load_back`` -- so the same retreat takes it: the request is skipped for
+    the pass and the pass is voided group-wide (frame form), every stage decides alike (RAENGE-NIE-UNEINS), the N-then-503
+    verdict stays PP0's alone. ``None`` = not taken (switch off / out of scope): the caller re-raises, the rank stops as before.
+
+    Port onto the h16 line (h18port 1014): the h18 ``weg2_cut_unproven_chain`` is NOT here -- it cut the node out of THIS
+    rank's host tier alone, a rank-local repair that moves this stage's host reach against its peers (NF-RANG-AUDIT S11). The
+    page is not cut: the next read re-proves it (#1424 ARENA-REF RECHECK) and the N-then-503 verdict ends a page that stays
+    unprovable. And NOT TAKEN while PP0's distributed load-back verdict for this rid is released on this stage (the S4 shape of
+    ``lb_verdict_short``): the stages that hold it load back in THIS pass, a void here would leave them split -- named stop."""
+    if not chain_void_enabled():
+        logger.error("%s NOT TAKEN (switch_off %s=0): ArenaChainMismatch propagates -- rid=%s page=%s", CHAIN_MARK, ENV_CHAIN,
+                     getattr(req, "rid", "?"), getattr(exc, "page", None))
+        return None
+    if lbv_short_stop_enabled() and _lb_verdict_released(sched, req):
+        logger.error("%s NOT TAKEN where=chain (lb_verdict_released): PP0's load-back verdict for rid=%s is released on this "
+                     "stage (page=%s); the stages that hold it load back in this pass, a void would leave them split -- "
+                     "ArenaChainMismatch propagates, the group stops by name (raenge-nie-uneins)", CHAIN_MARK,
+                     getattr(req, "rid", "?"), getattr(exc, "page", None))
+        return None
+    return retreat_loadback(sched, exc, req, adder, chain=True)
+
+
+def _lb_verdict_released(sched, req) -> bool:
+    """h18port: is PP0's distributed LB-VERDICT for ``req`` live on this stage (gated and released, not yet consumed)?
+    ``verify_load_chain`` runs before the verdict gate in ``load_back``, so a refused chain can meet a released verdict."""
+    try:
+        from sglang.srt.weg2 import pp_loadback_verdict as _lbv
+
+        tree = getattr(sched, "tree_cache", None)
+        rid = getattr(req, "rid", None)
+        # LBV-ADMIT: on the carrierless form the admission gate spends the release for exactly this admission (live)
+        return bool(tree is not None and rid is not None and _lbv.gated(tree, req) and _lbv.live(tree, req))
+    except Exception:  # noqa: BLE001 -- unknown = assume released: the stop is the safe direction
+        return True
+
+
+def retreat_loadback(sched, exc, req, adder, chain: bool = False) -> Optional[str]:
     """The load-back entrance of the same wall. ``exc`` is the ``AgreedRoomShort`` that ``load_back`` raised for ``req``
-    (its two lock refs are already unwound). Returns ``None`` = not taken (out of scope / failed: the caller re-raises and
+    (its two lock refs are already unwound); with ``chain`` the ``ArenaChainMismatch`` of ``load_back`` (the host lock is
+    unwound, the device lock was never taken: :func:`retreat_chain_mismatch`). Returns ``None`` = not taken (out of scope / failed: the caller re-raises and
     the rank stops as before), ``RETRY`` = the request is skipped for this pass and stays queued, ``ABORT`` = the request
     is answered 503 (``WEG2-INTAKE-STALL``) and dropped from PP0's queue, its drop relayed to every stage.
 
@@ -587,9 +652,9 @@ def retreat_loadback(sched, exc, req, adder) -> Optional[str]:
     ok, why = applies(sched, adder, getattr(adder, "can_run_list", ()) or ())
     if not ok:
         if why != "not_group_p":
-            logger.error("%s NOT TAKEN where=loadback (%s): AgreedRoomShort propagates -- rid=%s need=%d free=%d "
-                         "evictable=%d evicted=%d", MARK, why, getattr(req, "rid", "?"), exc.kv_tokens, exc.avail_after,
-                         exc.evictable, exc.evicted)
+            logger.error("%s NOT TAKEN where=loadback (%s): %s propagates -- rid=%s need=%d free=%d "
+                         "evictable=%d evicted=%d", MARK, why, type(exc).__name__, getattr(req, "rid", "?"), exc.kv_tokens,
+                         exc.avail_after, exc.evictable, exc.evicted)
         return None
     try:
         ledger = getattr(sched, "_weg2_prefill_oom_ledger", None)
@@ -613,8 +678,8 @@ def retreat_loadback(sched, exc, req, adder) -> Optional[str]:
             from sglang.srt.weg2 import pp_void_pass as _vp
 
             setattr(sched, _vp.AFTER_PLAN_ATTR, _vp.make_statement(
-                sched, cause=_vp.CAUSE_LOADBACK, rid=req.rid, need=exc.kv_tokens, free=exc.avail_after, tries=count,
-                abort=(v == ABORT)))
+                sched, cause=_vp.CAUSE_CHAIN if chain else _vp.CAUSE_LOADBACK, rid=req.rid, need=exc.kv_tokens,
+                free=exc.avail_after, tries=count, abort=(v == ABORT)))
         if v != ABORT:
             logger.warning(
                 "%s rid=%s need=%d free=%d evictable_paid=%d retries=%d (of %d) where=loadback agreed=%d "
@@ -623,8 +688,11 @@ def retreat_loadback(sched, exc, req, adder) -> Optional[str]:
                 MARK, req.rid, exc.kv_tokens, exc.avail_after, exc.evicted, count, retries, exc.agreed, exc.evictable,
                 _wt_inflight(sched))
             return RETRY
-        msg = abort_message(req.rid, terms, count, vwhy,
-                            too_large_pool=pool_tokens if (pool_tokens > 0 and exc.kv_tokens > pool_tokens) else 0)
+        if chain:
+            msg = chain_abort_message(req.rid, exc, count, vwhy)
+        else:
+            msg = abort_message(req.rid, terms, count, vwhy,
+                                too_large_pool=pool_tokens if (pool_tokens > 0 and exc.kv_tokens > pool_tokens) else 0)
         logger.error("%s rid=%s need=%d free=%d evictable_paid=%d retries=%d where=loadback -> ABORT 503 (%s): %s",
                      MARK, req.rid, exc.kv_tokens, exc.avail_after, exc.evicted, count, vwhy, msg)
         ledger.aborts += 1
@@ -634,7 +702,7 @@ def retreat_loadback(sched, exc, req, adder) -> Optional[str]:
         _answer_abort(sched, req, msg, queued_elsewhere=False)
         return ABORT
     except Exception:  # noqa: BLE001 -- a retreat that cannot complete must not leave a half state alive
-        logger.exception("%s FAILED where=loadback rid=%s: AgreedRoomShort is re-raised", MARK, getattr(req, "rid", "?"))
+        logger.exception("%s FAILED where=loadback rid=%s: %s is re-raised", MARK, getattr(req, "rid", "?"), type(exc).__name__)
         try:
             from sglang.srt.weg2 import pp_void_pass as _vp
 

@@ -45,6 +45,48 @@ def _free_named(arena, slots, reason: str) -> None:
     free_named(arena, slots, reason)
 
 
+def ref_at_land_on() -> bool:
+    """REF-AT-LAND-1014 (env SGLANG_WEG2_L3FILL_REF_AT_LAND, default on)."""
+    return (os.environ.get("SGLANG_WEG2_L3FILL_REF_AT_LAND", "1") or "1").strip().lower() not in (
+        "0", "false", "no", "off")
+
+
+class _RefOnLand(list):
+    """REF-AT-LAND-1014: the fill's answer list -- a slot written into it is
+    referenced at once (``ref_slots +1``; refused = no longer COMPLETE ->
+    None), a referenced slot overwritten or set to None is released. The
+    references left in the list belong to the caller."""
+
+    def __init__(self, arena, n: int):
+        super().__init__([None] * n)
+        self._arena = arena
+        self.refused = 0
+
+    def __setitem__(self, i, v):
+        old = list.__getitem__(self, i)
+        if v is not None and v == old:
+            return
+        if v is not None:
+            try:
+                ok = int(self._arena.ref_slots([int(v)], +1)) == 1
+            except Exception:  # noqa: BLE001 - no reference, no slot
+                ok = False
+            if not ok:
+                self.refused += 1
+                v = None
+        if old is not None:
+            try:
+                self._arena.ref_slots([int(old)], -1)
+            except Exception:  # noqa: BLE001
+                pass
+        list.__setitem__(self, i, v)
+
+    def release_all(self) -> None:
+        for i in range(len(self)):
+            if list.__getitem__(self, i) is not None:
+                self[i] = None
+
+
 _FILL_ORPHAN_N = [0, 0]  # fills that reaped, slots reaped
 _FILL_JOIN_N = [0, 0]  # fills that met a live writer's claim, stems
 
@@ -143,6 +185,103 @@ _JOIN_WAIT_N = [0, 0, 0]   # waits, stems waited for, stems that completed in th
 
 _ROOM_WAIT_N = [0]
 
+#: SELF-EVICT: the stems of the read this io thread is filling right now
+_FILL_CTX = threading.local()
+
+
+class fill_protect_scope:
+    """SELF-EVICT (NF h16 a2cfc77f76, P PP1 15:34:27, weg2-10-86): while a
+    read's fill runs, its own stems (the whole operation, every batch) are
+    kept out of the fill's room eviction -- evicting page X of a read to load
+    page Y of the same read is circular. ``SGLANG_WEG2_L3FILL_PROTECT_READ=0``:
+    off. Never raises."""
+
+    def __init__(self, backend, operation):
+        self.backend, self.operation = backend, operation
+        self.prev = None
+
+    def __enter__(self):
+        self.prev = getattr(_FILL_CTX, "protect", None)
+        stems = None
+        try:
+            if envs.SGLANG_WEG2_L3FILL_PROTECT_READ.get():
+                op = self.operation
+                stems = getattr(op, "_weg2_protect_stems", None)
+                if stems is None:
+                    from sglang.srt.managers.cache_controller import weg2_suffixed_stems
+
+                    stems = list(weg2_suffixed_stems(self.backend, list(op.hash_value)))
+                    op._weg2_protect_stems = stems
+        except Exception:  # noqa: BLE001 - no protection, the old eviction
+            stems = None
+        _FILL_CTX.protect = stems
+        return self
+
+    def __exit__(self, *exc):
+        _FILL_CTX.protect = self.prev
+        return False
+
+
+def fill_protected_stems() -> list:
+    return list(getattr(_FILL_CTX, "protect", None) or ())
+
+
+_SELF_JOIN_N = [0, 0]
+
+
+def _take_over_self_joins(arena, stems, joined, total_bytes: int):
+    """SELF-JOIN (NF h16 15:34:27, P PP1, weg2-10-86): a JOINED stem whose
+    holder is THIS process (``claim_info`` pid == own pid) has no other reader
+    to wait for -- PP1 sat 5001 ms in a JOIN-WAIT on 190 of its own claims
+    (``holders=[1904/1ms/pid778/l3fill ...]``, pid778 = PP1) and PP0 waited
+    on the same claims. The claim is taken over at once (quarantined at age 0,
+    generation-safe: a late completion of the old claim is refused) and the
+    stem claimed fresh, so this fill reads it NOW. Returns ``(fresh todo
+    entries, the joins that stay)``. ``SGLANG_WEG2_L3FILL_SELF_JOIN_TAKEOVER=0``:
+    off."""
+    if not joined:
+        return [], joined
+    try:
+        if not envs.SGLANG_WEG2_L3FILL_SELF_JOIN_TAKEOVER.get():
+            return [], joined
+    except Exception:  # noqa: BLE001
+        return [], joined
+    info = getattr(arena, "claim_info", None)
+    q = getattr(arena, "quarantine_stale", None)
+    if not callable(info) or not callable(q):
+        return [], joined
+    import os as _os
+
+    me = _os.getpid()
+    try:
+        pids = {int(t[0]): int(t[3]) for t in info([int(s) for _, s, _ in joined if int(s) >= 0])}
+    except Exception:  # noqa: BLE001
+        return [], joined
+    own = [j for j in joined if int(j[1]) >= 0 and pids.get(int(j[1])) == me]
+    if not own:
+        return [], joined
+    st = q([int(s) for _, s, _ in own], [int(g) for _, _, g in own], 0)
+    taken = [own[k] for k, v in enumerate(st) if int(v) == 1]
+    taken_i = {int(j[0]) for j in taken}
+    fresh = []
+    for (i, _s, _g), (slot, status, gen) in zip(
+            taken, _fill_claim(arena, [stems[int(i)] for i, _s, _g in taken], int(total_bytes))):
+        if int(status) == 0:
+            fresh.append((int(i), int(slot), int(gen), stems[int(i)]))
+        elif int(status) == 1:
+            _unclaim_fill_joins(arena, [(int(i), int(slot), int(gen))])
+            taken_i.discard(int(i))   # someone else holds it now: an ordinary join
+    rest = [j for j in joined if int(j[0]) not in {f[0] for f in fresh}]
+    _SELF_JOIN_N[0] += 1
+    _SELF_JOIN_N[1] += len(fresh)
+    k = _SELF_JOIN_N[0]
+    if k <= 16 or (k & (k - 1)) == 0:
+        logger.warning(
+            "L3-FILL SELF-JOIN n=%d own=%d taken=%d reclaimed=%d total=%d pid=%d (this process "
+            "holds the claims it joined: no other reader to wait for -- taken over and read now)",
+            k, len(own), len(taken), len(fresh), _SELF_JOIN_N[1], me)
+    return fresh, rest
+
 
 def fill_room_wait_ms() -> int:
     """ROOM-WAIT: how long a prefetch io thread's fill may wait for arena room
@@ -180,36 +319,142 @@ def fill_join_wait_ms(joined_stems: int = 0) -> int:
     return int(min(cap, max(base, int(joined_stems) * per_page)))
 
 
-def _await_fill_joins(arena, stems, joined, wait_ms: int) -> dict:
+def join_liveness_on() -> bool:
+    """JOIN-LIVENESS (14.10.): the JOIN / ROOM waits follow the holder's
+    progress instead of a fixed bound. 0 = the fixed bound."""
+    try:
+        return bool(envs.SGLANG_WEG2_L3FILL_JOIN_LIVENESS.get())
+    except Exception:  # noqa: BLE001 - no switch: the fixed bound
+        return False
+
+
+def join_noprogress_cap_ms() -> int:
+    """JOIN-LIVENESS: the emergency brake -- a wait ends after this long even
+    while its stems keep moving (``SGLANG_WEG2_L3FILL_JOIN_CAP_S``, 60)."""
+    try:
+        return max(0, int(float(envs.SGLANG_WEG2_L3FILL_JOIN_CAP_S.get()) * 1000.0))
+    except Exception:  # noqa: BLE001
+        return 60000
+
+
+def _join_signature(arena, slots) -> dict:
+    """slot -> claim generation (``claim_info``); empty when the arena cannot say."""
+    info = getattr(arena, "claim_info", None)
+    if not callable(info) or not slots:
+        return {}
+    try:
+        return {int(t[0]): int(t[1]) for t in info([int(s) for s in slots])}
+    except Exception:  # noqa: BLE001 - an instrument, never a gate
+        return {}
+
+
+def join_idle_ms() -> int:
+    """JOIN-IDLE-1014: how long a JOIN wait sits without any move of its
+    holders before the caller breaks the claims and reads itself (env
+    SGLANG_WEG2_L3FILL_JOIN_IDLE_MS, default 1000; 0 = the old bound
+    max(wait, stale age))."""
+    try:
+        return max(0, int(os.environ.get("SGLANG_WEG2_L3FILL_JOIN_IDLE_MS", "1000") or "1000"))
+    except (TypeError, ValueError):
+        return 1000
+
+
+def _await_fill_joins(arena, stems, joined, wait_ms: int, vanished=None) -> dict:
     """L3FILL-JOINED (2): poll the JOINED stems until another writer's claim
     turns COMPLETE (same answer as claim status 2: complete, usable) or the
-    wait is spent. Returns {index: slot} of those that completed."""
+    wait is spent. Returns {index: slot} of those that completed.
+
+    JOIN-LIVENESS (NF h16 a2cfc77f76, P 15:34:27-32, weg2-10-86): the wait was
+    a fixed bound. PP0 waited 5005 ms for 190 stems PP1 held
+    (``holders=[1904/1ms/pid778/l3fill ...]``, pid778 = PP1, which itself sat
+    in a 5-s JOIN-WAIT on the same claims); at 5 s PP1 reaped them stale and
+    read them itself (``#1433 190 of 190``), PP0 had just given up, its batch
+    missed (``ARENA-GET MISS find=(slot=1904,state=1)``), its read ended at
+    65536, the told cut to 65280 and 26624 tokens were re-prefilled. Now the
+    wait follows the holders: any of its stems completing, or a claim taken
+    over / re-claimed (slot or generation moved), is progress and restarts the
+    idle clock; the wait ends when nothing moved for ``max(bound, stale age)``
+    -- the caller's stale reap (``SGLANG_WEG2_L3FILL_STALE_CLAIM_S``) then
+    breaks a stalled or dead holder's claim and reads the page itself -- or at
+    the emergency cap (``SGLANG_WEG2_L3FILL_JOIN_CAP_S``) however much moves.
+    Fetching back beats recomputing. ``SGLANG_WEG2_L3FILL_JOIN_LIVENESS=0``:
+    the fixed bound."""
     find = getattr(arena, "find_slots", None)
     if not joined or wait_ms <= 0 or not callable(find):
         return {}
     pend = {int(i): stems[int(i)] for i, _s, _g in joined}
     done = {}
     t0 = time.perf_counter()
-    deadline = t0 + wait_ms / 1000.0
+    live = join_liveness_on()
+    _idle_ms = join_idle_ms() if (live and vanished is not None) else 0   # IN-FLIGHT keeps its bound
+    idle_s = (_idle_ms if _idle_ms > 0 else max(int(wait_ms), fill_stale_claim_ms())) / 1000.0
+    cap_s = max(idle_s, join_noprogress_cap_ms() / 1000.0)
+    # JOIN-IDLE-1014 (NF h18 fe799c4d6e P 16:18:13-18, weg2-0-2): a JOINED stem
+    # that is no longer in the arena at all (its holder filled it and it was
+    # evicted again, or the claim was freed) can never turn COMPLETE -- PP0
+    # and PP1 polled 322 such stems for 5 s (``completed=0 still_claimed=322
+    # moves=0``) and cut the read at 297 of 1440 pages. Absent twice in a row:
+    # handed back to the caller (``vanished``), which claims and reads it.
+    absent: dict = {}
+    deadline = t0 + (cap_s if live else wait_ms / 1000.0)
+    last_move = t0
+    seen: dict = {}
+    polls = moves = 0
     while pend:
         keys = list(pend)
+        now_slots = {}
         for i, (slot, state) in zip(keys, find([pend[i] for i in keys])):
             if int(slot) >= 0 and int(state) == 2:
                 done[i] = int(slot)
                 pend.pop(i)
-        if not pend or time.perf_counter() >= deadline:
+            elif vanished is not None and int(slot) < 0:
+                absent[i] = absent.get(i, 0) + 1
+                if absent[i] >= 2:
+                    pend.pop(i)
+                    vanished.append(i)
+            else:
+                absent.pop(i, None)
+                now_slots[i] = int(slot)
+        now = time.perf_counter()
+        if live:
+            moved = len(keys) != len(now_slots) and len(pend) < len(keys)
+            if not moved and polls % 8 == 0:
+                gens = _join_signature(arena, [s for s in now_slots.values() if s >= 0])
+                sig = {i: (s, gens.get(s)) for i, s in now_slots.items()}
+                moved = bool(seen) and any(seen.get(i) not in (None, v) for i, v in sig.items())
+                seen = sig
+            if moved:
+                last_move = now
+                moves += 1
+        polls += 1
+        if not pend or now >= deadline:
+            break
+        if live and now - last_move >= idle_s:
             break
         time.sleep(0.005)
     _JOIN_WAIT_N[0] += 1
     _JOIN_WAIT_N[1] += len(joined)
     _JOIN_WAIT_N[2] += len(done)
     k = _JOIN_WAIT_N[0]
-    if k <= 16 or (k & (k - 1)) == 0 or pend:
-        logger.info("L3-FILL JOIN-WAIT n=%d stems=%d completed=%d still_claimed=%d waited_ms=%.0f "
-                    "bound_ms=%d totals=%d/%d (a JOINED stem another writer completed inside the "
-                    "wait is read from L2 instead of ending the prefix; prefetch io thread only)",
-                    k, len(joined), len(done), len(pend), (time.perf_counter() - t0) * 1000.0,
-                    int(wait_ms), _JOIN_WAIT_N[2], _JOIN_WAIT_N[1])
+    _van = len(vanished) if vanished is not None else 0
+    if k <= 16 or (k & (k - 1)) == 0 or pend or _van:
+        # JOIN-IDLE-1014: a wait that ends with claims left names their holders
+        # (slot/age/pid/role/generation/open writers) -- read at the metal
+        _holders = ""
+        if pend:
+            try:
+                _rows = [(i, s_, g_) for i, s_, g_ in joined if int(i) in pend]
+                _holders = _join_owner_text(arena, _rows)
+            except Exception:  # noqa: BLE001 - an instrument never raises
+                _holders = ""
+        logger.info("L3-FILL JOIN-WAIT n=%d stems=%d completed=%d still_claimed=%d vanished=%d "
+                    "waited_ms=%.0f bound_ms=%d liveness=%d moves=%d idle_ms=%.0f idle_bound_ms=%.0f "
+                    "(a JOINED stem another writer completed inside the wait is read from L2 instead "
+                    "of ending the prefix; the wait follows the holder's progress, a stalled holder "
+                    "is reaped by the caller, a vanished stem is claimed and read) totals=%d/%d%s",
+                    k, len(joined), len(done), len(pend), _van, (time.perf_counter() - t0) * 1000.0,
+                    int(wait_ms), int(live), moves, (time.perf_counter() - last_move) * 1000.0,
+                    idle_s * 1000.0, _JOIN_WAIT_N[2], _JOIN_WAIT_N[1], _holders)
     return done
 
 
@@ -227,13 +472,18 @@ def fill_stale_claim_ms() -> int:
         return 0
 
 
-def _reap_stale_live_joins(arena, stems, joined, total_bytes: int) -> list:
+def _reap_stale_live_joins(arena, stems, joined, total_bytes: int, min_ms_override=None,
+                           out=None) -> list:
     """L3FILL-JOINED (3): the JOINED stems whose holder delivered no byte for
     ``SGLANG_WEG2_L3FILL_STALE_CLAIM_S`` are taken from their keys (quarantine,
     generation-safe) and claimed fresh by this fill. Returns the new todo
     entries (index, slot, generation, stem) -- read from disk like any fresh
     claim. y4a ep36: 29 such stems ended a 1070-page prefix read at 146."""
     min_ms = fill_stale_claim_ms()
+    if min_ms_override is not None and min_ms > 0:
+        # JOIN-IDLE-1014: the join wait saw no move of these holders for its
+        # idle bound -- that bound, not the stale age, breaks the claims
+        min_ms = max(1, min(min_ms, int(min_ms_override)))
     q = getattr(arena, "quarantine_stale", None)
     if not joined or min_ms <= 0 or not callable(q):
         return []
@@ -244,6 +494,11 @@ def _reap_stale_live_joins(arena, stems, joined, total_bytes: int) -> list:
     owners = _join_owner_text(arena, joined)
     st = q([int(s) for _, s, _ in joined], [int(g) for _, _, g in joined], min_ms)
     reaped = [joined[k] for k, v in enumerate(st) if int(v) == 1]
+    if min_ms_override is not None:
+        # JOIN-IDLE-1014: status 2 = the joined claim's generation moved or it
+        # is no longer CLAIMED (filled and evicted, freed): nothing to break,
+        # the stem is claimed again below (COMPLETE meanwhile -> read from L2)
+        reaped += [joined[k] for k, v in enumerate(st) if int(v) == 2]
     if not reaped:
         return []
     fresh = []
@@ -251,6 +506,8 @@ def _reap_stale_live_joins(arena, stems, joined, total_bytes: int) -> list:
             reaped, _fill_claim(arena, [stems[int(i)] for i, _s, _g in reaped], int(total_bytes))):
         if int(status) == 0:
             fresh.append((int(i), int(slot), int(gen), stems[int(i)]))
+        elif int(status) == 2 and out is not None:
+            out[int(i)] = int(slot)
         elif int(status) == 1:
             _unclaim_fill_joins(arena, [(int(i), int(slot), int(gen))])
     _STALE_REAP_N[0] += 1
@@ -3516,7 +3773,7 @@ class HiCacheFile(HiCacheStorage):
         return False
 
     def arena_fill_from_disk(self, arena, stems, total_bytes: int, prefix: bool = False,
-                             room_wait: bool = True):
+                             room_wait: bool = True, take_ref: bool = False):
         """#1433: the L3 -> L2 return path. For every stem that is NOT in the
         arena but IS on disk: claim a slot, read the whole canonical page from
         the disk store straight into the slot, complete it. Returns one entry
@@ -3529,9 +3786,19 @@ class HiCacheFile(HiCacheStorage):
         ``prefix=True`` (EG review of L3-FAST, (a)): the stems are a PREFIX
         walk -- nothing past the first page that can not be had (not on disk,
         or a claim that yields no slot) is claimed or read; claims already
-        taken past it are freed unread. The answer for those stems is None."""
+        taken past it are freed unread. The answer for those stems is None.
+
+        ``take_ref=True`` (REF-AT-LAND-1014): every slot is REFERENCED the moment
+        it lands in the answer (own fill completed, a join completed, raced in
+        COMPLETE) and the reference is the caller's; a slot that cannot be
+        referenced any more is answered None. Before, the answer carried no
+        reference until the caller's walk -- while this fill still waited on
+        its joins (up to seconds), another rank's arena clock took the pages it
+        had just completed (NF h18 fe799c4d6e P 16:18:13, weg2-0-2: PP2 filled
+        322 + joined 405, landed 297 of 1440; PP0/PP1 polled the vanished
+        stems 5 s; 74212 tokens recomputed)."""
         n = len(stems)
-        out = [None] * n
+        out = _RefOnLand(arena, n) if (take_ref and ref_at_land_on()) else [None] * n
         if n == 0:
             return out
         try:
@@ -3564,6 +3831,21 @@ class HiCacheFile(HiCacheStorage):
                     if i not in _bw and out[i] is None]
         else:
             cand = [(i, st) for i, st in enumerate(stems) if st in on_disk]
+        # SELF-JOIN root (NF h16 weg2-10-86): the C claim (arena_claim) answers
+        # JOIN for ANY key already CLAIMED -- its own included -- so a stem
+        # that appears twice in one fill would be claimed fresh once and then
+        # JOINED to itself and waited on. One claim per stem; a repeat takes
+        # the first one's answer.
+        _dups: dict = {}
+        _first: dict = {}
+        _uniq = []
+        for i, st in cand:
+            if st in _first:
+                _dups[i] = _first[st]
+            else:
+                _first[st] = i
+                _uniq.append((i, st))
+        cand = _uniq
         todo = []
         joined = []
         still_full = []
@@ -3613,6 +3895,10 @@ class HiCacheFile(HiCacheStorage):
             # fill writes nothing into it, so its open-writer mark goes at once
             # -- left behind, the slot could never be reaped nor complete
             _unclaim_fill_joins(arena, joined)
+            # SELF-JOIN: claims this process holds are taken over and read now
+            _self_fresh, joined = _take_over_self_joins(arena, stems, joined, int(total_bytes))
+            if _self_fresh:
+                todo.extend(_self_fresh)
         if prefix and todo:
             # (a): the first stem that neither raced in complete, nor got a
             # claim, nor is being filled by another writer ends the prefix --
@@ -3622,9 +3908,17 @@ class HiCacheFile(HiCacheStorage):
             _theirs = {int(j[0]) for j in joined} | {int(f[0]) for f in still_full} | set(_being_written)
             _hard = next((i for i, _st in cand
                           if out[i] is None and i not in _mine and i not in _theirs), n)
-            _past = [t[1] for t in todo if t[0] > _hard]
-            if _past:
-                _free_named(arena, _past, "l3fill_past_prefix")
+            _past_t = [t for t in todo if t[0] > _hard]
+            if _past_t:
+                # ARENA-CHAIN (NF 14.10. 07:29:33Z): freed by GENERATION, like l3fill_complete_refused below and
+                # #1427r on D. ``free_slots`` frees a slot in ANY state -- a claim another rank joined and completed
+                # meanwhile went with it, together with the page a reader had found COMPLETE; free_if_gen only
+                # gives up a slot that is still this fill's CLAIMED claim under the generation it took.
+                _fg_past = getattr(arena, "free_if_gen", None)
+                if callable(_fg_past):
+                    _fg_past([t[1] for t in _past_t], [t[2] for t in _past_t], reason="l3fill_past_prefix")
+                else:
+                    _free_named(arena, [t[1] for t in _past_t], "l3fill_past_prefix")
                 todo = [t for t in todo if t[0] < _hard]
         stats = {"filled": 0, "todo": 0, "threads": 0}
         self._arena_fill_read_todo(arena, todo, int(total_bytes), out, stats)
@@ -3639,19 +3933,29 @@ class HiCacheFile(HiCacheStorage):
             # Those references go within seconds (complete 5981 at 12:04:45).
             # Bounded, prefetch io thread only: evict + claim again until a
             # slot comes or the wait is spent; what gets a slot is read now.
-            _room = self._await_fill_room(arena, still_full, int(total_bytes), out, joined)
+            _room = self._await_fill_room(arena, still_full, int(total_bytes), out, joined,
+                                          stats=stats)
             if _room:
                 self._arena_fill_read_todo(arena, _room, int(total_bytes), out, stats)
         if joined:
             # L3FILL-JOINED (2): wait (bounded, prefetch io thread only) for the
             # other writer instead of ending the prefix at its page
-            _waited = _await_fill_joins(arena, stems, joined, fill_join_wait_ms(len(joined)))
+            _vanished: list = []
+            _waited = _await_fill_joins(arena, stems, joined, fill_join_wait_ms(len(joined)),
+                                        vanished=_vanished if join_idle_ms() > 0 else None)
             for i, s_ in _waited.items():
                 out[i] = s_
+            # JOIN-IDLE-1014: a stem gone from the arena is claimed and read
+            # here (generation 'moved' -> the reap below claims it again)
             joined = [j for j in joined if int(j[0]) not in _waited]
             # L3FILL-JOINED (3): a holder with no byte for the stale bound loses
-            # the stem; this fill claims it fresh and reads it from disk
-            _fresh = _reap_stale_live_joins(arena, stems, joined, int(total_bytes))
+            # the stem; this fill claims it fresh and reads it from disk.
+            # JOIN-IDLE-1014: after the join wait's idle bound (default 1 s
+            # without a move) -- never cut on a claim nobody fills.
+            _fresh = _reap_stale_live_joins(
+                arena, stems, joined, int(total_bytes),
+                min_ms_override=(join_idle_ms() if (join_liveness_on() and join_idle_ms() > 0) else None),
+                out=out)
             if _fresh:
                 self._arena_fill_read_todo(arena, _fresh, int(total_bytes), out, stats)
         if _being_written:
@@ -3660,6 +3964,8 @@ class HiCacheFile(HiCacheStorage):
                                    fill_join_wait_ms(len(_being_written)))
             for i, s_ in _w.items():
                 out[i] = s_
+        for i, f in _dups.items():
+            out[i] = out[f]
         if prefix:
             _stop = next((i for i in range(_gap) if out[i] is None), _gap)
             for i in range(_stop + 1, n):
@@ -3703,7 +4009,7 @@ class HiCacheFile(HiCacheStorage):
                 return i
         return n
 
-    def _await_fill_room(self, arena, still_full, total_bytes: int, out, joined) -> list:
+    def _await_fill_room(self, arena, still_full, total_bytes: int, out, joined, stats=None) -> list:
         """ROOM-WAIT: re-evict and re-claim the stems that found the arena FULL
         until each gets a slot or ``fill_room_wait_ms()`` is spent. Returns the
         fresh claims (todo entries); a stem another writer claimed meanwhile
@@ -3715,9 +4021,19 @@ class HiCacheFile(HiCacheStorage):
         pend = list(still_full)
         got = []
         t0 = time.perf_counter()
-        deadline = t0 + wait_ms / 1000.0
+        # JOIN-LIVENESS: while slots keep coming the wait goes on (idle bound
+        # = the room bound, emergency cap SGLANG_WEG2_L3FILL_JOIN_CAP_S), and
+        # each round's fresh claims are READ AT ONCE -- a claim held unread
+        # through the rest of the wait is exactly what a peer's JOIN-WAIT
+        # sits on (P 15:34:27-32 weg2-10-86).
+        live = join_liveness_on() and stats is not None
+        deadline = t0 + (max(wait_ms, join_noprogress_cap_ms()) if live else wait_ms) / 1000.0
+        last_move = t0
+        read_now = 0
         rounds = 0
         while pend and time.perf_counter() < deadline:
+            if live and time.perf_counter() - last_move >= wait_ms / 1000.0:
+                break
             time.sleep(0.025)
             rounds += 1
             try:
@@ -3745,6 +4061,12 @@ class HiCacheFile(HiCacheStorage):
                     joined.append((i, slot, gen))
                 elif status == 4:
                     nxt.append((i, st))
+            if live and (len(nxt) < len(pend)):
+                last_move = time.perf_counter()
+            if live and got:
+                self._arena_fill_read_todo(arena, got, int(total_bytes), out, stats)
+                read_now += len(got)
+                got = []
             pend = nxt
         _ROOM_WAIT_N[0] += 1
         k = _ROOM_WAIT_N[0]
@@ -3752,7 +4074,7 @@ class HiCacheFile(HiCacheStorage):
             logger.info("L3-FILL ROOM-WAIT n=%d stems=%d claimed=%d still_full=%d rounds=%d waited_ms=%.0f "
                         "bound_ms=%d (the arena was FULL for these stems: evict + claim again instead of "
                         "ending the prefix; prefetch io thread only)",
-                        k, len(still_full), len(got), len(pend), rounds,
+                        k, len(still_full), len(got) + read_now, len(pend), rounds,
                         (time.perf_counter() - t0) * 1000.0, int(wait_ms))
         return got
 
@@ -3839,6 +4161,7 @@ class HiCacheFile(HiCacheStorage):
                 keep = list(getattr(pins, "pinned_stems", lambda: [])())
             except Exception:  # noqa: BLE001
                 keep = []
+        keep += fill_protected_stems()   # SELF-EVICT: the read being filled
         cands = self._arena_evict_candidates(arena, int(want), int(need), keep)
         if not cands:
             return 0

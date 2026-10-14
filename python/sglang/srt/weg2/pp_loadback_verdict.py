@@ -95,6 +95,15 @@ MARK = "LB-VERDICT"
 _STATE_ATTR = "_weg2_lbv_state"
 _RELEASED_CAP = 4096
 _LOG_FIRST = 16
+#: LBV-ADMIT (h16h 19:33:48Z): the gate keys on the admission on the carrierless form.
+ADMIT_ENV = "SGLANG_WEG2_LBV_ADMIT"
+#: request attribute, True only while ``add_one_req`` runs the admission PP0's
+#: verdict released in this pass (set by :func:`admit_holds`, cleared by
+#: :func:`admit_done` around exactly that call -- one straight-line stretch).
+ADMIT_ATTR = "_weg2_lbv_admit_pass"
+#: LBV-ADMIT instrument: HOLD is printed once per rid and stage (the h16h HOLD /
+#: RELEASE lines fell silent behind one shared 16-line cap hours before the case).
+_HELD_SAID_CAP = 4096
 #: NF-RANG-AUDIT 1014: the gate yields to a load-back that executes PP0's row.
 ROW_YIELD_ENV = "SGLANG_WEG2_LBV_ROW_YIELD"
 #: request attribute, True only while ``execute_scheduled_prefix`` materialises
@@ -113,7 +122,7 @@ class Weg2PpLoadbackVerdict:
 
 
 class _State:
-    __slots__ = ("pp0", "released", "sent", "out", "said")
+    __slots__ = ("pp0", "released", "sent", "out", "said", "carrierless", "held_said", "pass_lb")
 
     def __init__(self, pp0: bool) -> None:
         self.pp0 = bool(pp0)
@@ -121,6 +130,13 @@ class _State:
         self.sent: set = set()
         self.out: List[str] = []
         self.said = 0
+        #: LBV-ADMIT: the boot form, read once (None = not read yet)
+        self.carrierless: Optional[bool] = None
+        #: LBV-ADMIT: rids whose HOLD this stage already printed
+        self.held_said: set = set()
+        #: LBV-ADMIT (PP0): load-back tokens released since the last intake -- a second
+        #: load-back verdict of the same pass is judged on top of the first one's rows
+        self.pass_lb = 0
 
 
 def enabled() -> bool:
@@ -229,17 +245,20 @@ def absorb(tree, verdict: Weg2PpLoadbackVerdict) -> None:
         return
     st.released.add(str(verdict.rid))
     st.sent.discard(str(verdict.rid))
+    st.held_said.discard(str(verdict.rid))
     if len(st.released) > _RELEASED_CAP:
         st.released.pop()
-    if st.said < _LOG_FIRST:
-        st.said += 1
-        logger.info("%s RELEASE rid=%s pp0=%s (PP0's load-back verdict absorbed: every stage loads it in "
-                    "this pass)", MARK, verdict.rid, st.pp0)
+    # LBV-ADMIT: one line per absorbed verdict and stage (no shared cap: the h16h case
+    # fell behind a 16-line cap and its absence read as "no verdict was ever sent")
+    logger.info("%s RELEASE rid=%s pp0=%s (PP0's verdict absorbed: every stage admits / loads it in "
+                "this pass)", MARK, verdict.rid, st.pp0)
 
 
 def take(tree) -> List[Weg2PpLoadbackVerdict]:
     """PP0's origin hook: the verdicts decided since the last intake."""
     st = state(tree)
+    if st is not None:
+        st.pass_lb = 0  # LBV-ADMIT: a new intake, a new pass of load-back verdicts
     if st is None or not st.out:
         return []
     items = [Weg2PpLoadbackVerdict(rid=r) for r in st.out]
@@ -276,7 +295,168 @@ def hold(tree, rid, kv_tokens: int, fits_on_pp0) -> None:
             logger.info("%s VERDICT rid=%s kv_tokens=%d ok (on the wire at the next intake; PP0 holds it until "
                         "then like every stage -- one decision, one pass, every stage)", MARK, rid, int(kv_tokens))
         return
-    if st.said < _LOG_FIRST:
-        st.said += 1
+    if rid not in st.held_said:  # LBV-ADMIT instrument: once per rid and stage, no shared cap
+        if len(st.held_said) >= _HELD_SAID_CAP:
+            st.held_said.clear()
+        st.held_said.add(rid)
         logger.info("%s HOLD rid=%s kv_tokens=%d (a follower loads a host hit only in the pass that absorbs "
                     "PP0's verdict; its own room decides nothing)", MARK, rid, int(kv_tokens))
+
+
+# ---------------------------------------------------------------------------
+# LBV-ADMIT: the gate keys on the admission on the carrierless form (h16h)
+# ---------------------------------------------------------------------------
+#
+# LBV-ADMIT (NF h16h 853534a9ff, P, 14.10. 19:33:48Z, deadman 19:36, P.log
+# ``..._853534a9ff_1014_180031`` 293940-294223). THE SAME HOLE ON THE CARRIERLESS
+# FORM ITSELF. The gate's TRIGGER was rank-local: a stage holds iff IT has a host
+# hit, PP0 sends a verdict iff PP0 has one. weg2-70-656 is the twin of -657
+# (shared 98144 tokens). -657's load-back made PP0's copy of the shared prefix
+# device-resident (PP0 evicted node 726 only), while PP1/PP2 evicted 741/742/743
+# to make room for it -- 3584 tokens of -656's prefix stayed host-only there:
+#
+#   PP0  MATCH-CENSUS-DEEP rid=-656 reached=98112 -> no load-back, no hold, no
+#        verdict -> ``#969N ADMIT slot=1 fwd_ct=113 rids=[weg2-70-656]``
+#   PP1/PP2  MATCH-CENSUS-DEEP reached=94528 prefix=98112, MAMBA-HOST-RESUME "this
+#        match triggers load_back" -> gate holds (``#queue-req: 1``) for a verdict
+#        that never comes; HOLD/RELEASE silent past their 16-line cap
+#
+# The slot-1 batch exists on PP0 only: PP1/PP2 never post the frame receive (no
+# batch), PP2 never sends slot 1's output, PP0 blocks in ``recv_object[src=2]``
+# (``PP-RECV-OBJ ... awaiting_size``, 30/60/90/120 s), its next chain send never
+# leaves, PP1/PP2 block in their chain receive (``ADMISSION-WEDGE RECOVERY ... NOT
+# CONSUMED``). A ring wait whose first edge is the gate's own split.
+#
+# THE RULE, rank-uniform by construction: on the carrierless form (``followers
+# plan for themselves``, :func:`admit_armed`) the gate keys on the ADMISSION, not
+# on the stage's own host hit. No stage admits a request (first admission from the
+# waiting queue) before PP0's verdict for it was absorbed at this pass's intake;
+# PP0 decides it where it would admit the request (after every PP0-only deferral
+# of the admission loop), from its own room when PP0 itself loads back, and puts it
+# on the wire at the next intake; the absorbing pass is the admission pass on every
+# stage (:func:`admit_holds`, spent there on every stage alike). A stage whose own
+# load-back then cannot be paid stops by name in ``load_back`` (``LB-VERDICT
+# SHORT``) as before. The row form is untouched (the row is the verdict). Price:
+# one PP0 pass per first admission on the carrierless form. Switch
+# ``SGLANG_WEG2_LBV_ADMIT`` (default on); ``0`` = the load-back-only trigger (the
+# h16h split).
+
+
+def admit_enabled() -> bool:
+    return (os.environ.get(ADMIT_ENV, "1") or "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _carrierless(sched, st: _State) -> bool:
+    """Do the followers plan for themselves on this boot form (no #631 row)?
+    Read once: the form is fixed at start (``p_row_authority.start_check``)."""
+    if st.carrierless is None:
+        try:
+            from sglang.srt.weg2.prefill_oom_retreat import followers_execute_row
+
+            st.carrierless = not followers_execute_row(sched)
+        except Exception:  # noqa: BLE001 -- unreadable form: the gate holds (the safe direction)
+            st.carrierless = True
+    return bool(st.carrierless)
+
+
+def admit_armed(sched) -> bool:
+    """LBV-ADMIT applies on this stage: the load-back gate is armed (P, pp > 1, the
+    local-PP floor), the switch is on, and the followers plan for themselves."""
+    tree = getattr(sched, "tree_cache", None)
+    st = state(tree)
+    if st is None or not admit_enabled() or not armed(tree):
+        return False
+    return _carrierless(sched, st)
+
+
+def _pp0_load_back_tokens(req) -> int:
+    """The rows PP0's own admission of ``req`` would load back (0 = none): the
+    state-aligned extent of its match, never below the raw host hit."""
+    try:
+        from sglang.srt.managers.pp_admission_congruence import LOAD_BACK_EXTENT_ATTR
+    except Exception:  # noqa: BLE001
+        LOAD_BACK_EXTENT_ATTR = "pp_load_back_extent"
+    ext = int(getattr(req, LOAD_BACK_EXTENT_ATTR, 0) or 0)
+    if ext <= 0:
+        return 0
+    return max(ext, int(getattr(req, "host_hit_length", 0) or 0))
+
+
+def admit_holds(sched, req, pp0_room=None) -> bool:
+    """The admission gate, called on EVERY stage right before ``add_one_req`` (after
+    every deferral of the admission loop). True = this stage does not admit ``req``
+    in this pass (the loop skips it, as any deferral does).
+
+    * released at this pass's intake -> the verdict is spent HERE on every stage
+      alike, ``ADMIT_ATTR`` marks the admission (``load_back`` reads it as the
+      release, :func:`live`) and the request goes on (False);
+    * not released, PP0 -> PP0 decides: no own load-back -> the verdict goes on
+      the wire at the next intake; an own load-back -> only when PP0's room holds
+      it on top of the pass's earlier load-back verdicts (``pp0_room``, default the
+      tree's ``weg2_lbv_pp0_room``: the seam's floor, the agreed R_m, the local-PP
+      eviction). Either way PP0 holds the request like every stage (True);
+    * not released, follower -> holds (True); its own room or host hit decides
+      nothing."""
+    if req is None or not admit_armed(sched):
+        return False
+    rid = getattr(req, "rid", None)
+    if rid is None:
+        return False
+    tree = sched.tree_cache
+    st = state(tree)
+    rid = str(rid)
+    if rid in st.released:
+        st.released.discard(rid)
+        try:
+            setattr(req, ADMIT_ATTR, True)
+        except Exception:  # noqa: BLE001 -- a slotted stand-in: load_back then holds as before
+            pass
+        return False
+    if st.pp0:
+        if rid not in st.sent:
+            kv = _pp0_load_back_tokens(req)
+            ok = True
+            if kv > 0:
+                room = pp0_room if pp0_room is not None else getattr(tree, "weg2_lbv_pp0_room", None)
+                if room is None:
+                    # never "no verdict, forever" (that is the h16h silence): a tree that cannot answer
+                    # PP0's room is a construction violation and stops by name
+                    raise RuntimeError(f"{MARK} ADMIT rid={rid}: PP0 must decide a {kv}-token load-back but "
+                                       f"{type(tree).__name__} has no weg2_lbv_pp0_room")
+                ok = bool(room(kv + int(st.pass_lb), rid))
+            if ok:
+                st.pass_lb += kv
+                st.sent.add(rid)
+                st.out.append(rid)
+                logger.info("%s VERDICT rid=%s kv_tokens=%d kind=%s ok (on the wire at the next intake; PP0 holds it "
+                            "until then like every stage -- one decision, one pass, every stage; LBV-ADMIT)", MARK, rid,
+                            kv, "loadback" if kv > 0 else "admit")
+        return True
+    if rid not in st.held_said:
+        if len(st.held_said) >= _HELD_SAID_CAP:
+            st.held_said.clear()
+        st.held_said.add(rid)
+        logger.info("%s HOLD rid=%s kind=admit (a follower admits a request only in the pass that absorbs PP0's "
+                    "verdict; its own host hit or room decides nothing -- LBV-ADMIT)", MARK, rid)
+    return True
+
+
+def admit_done(req) -> None:
+    """End of the admission call: the mark is spent (deleter of :data:`ADMIT_ATTR`)."""
+    if req is not None and getattr(req, ADMIT_ATTR, False):
+        try:
+            setattr(req, ADMIT_ATTR, False)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def admitted_now(req) -> bool:
+    return bool(getattr(req, ADMIT_ATTR, False))
+
+
+def live(tree, req) -> bool:
+    """Is PP0's verdict for ``req`` live on this stage for THIS load-back -- released
+    and not yet spent, or spent by the admission gate for exactly this admission?"""
+    if req is None:
+        return False
+    return admitted_now(req) or released(tree, getattr(req, "rid", None))
