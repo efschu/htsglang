@@ -126,3 +126,33 @@ def test_the_wait_is_priced_on_the_joined_stems():
         assert _run_on("hicache-prefetch-io-0", lambda: hs.fill_join_wait_ms(5000)) == 3000
     with envs.SGLANG_WEG2_L3FILL_JOIN_WAIT_MS.override(0):
         assert _run_on("hicache-prefetch-io-0", lambda: hs.fill_join_wait_ms(385)) == 0
+
+
+def test_a_full_arena_waits_for_room_instead_of_ending_the_prefix(tmp_path):
+    """ROOM-WAIT (NF h8 12:04:14, weg2-0-10): the stems that find the arena
+    FULL are claimed again once a slot frees (here: 60 ms later), instead of
+    ending the prefix (884 of 1853 pages, the files all on disk)."""
+    root = tmp_path / "store"
+    root.mkdir()
+    for s in ("p0", "p1"):
+        (root / (s + ".bin")).write_bytes(b"\x22" * TOTAL)
+    arena = ShmArena(str(tmp_path / "kv.bin"), TOTAL, 2)
+    occ = arena.claim_slots(["o0", "o1"], [TOTAL, TOTAL])     # someone else's pages fill it
+    assert [st for _s, st, _g in occ] == [0, 0]
+    be = _backend(str(root))
+
+    def free_later():
+        time.sleep(0.06)
+        arena.free_slots([occ[0][0], occ[1][0]], reason="test")
+
+    threading.Thread(target=free_later).start()
+    with envs.SGLANG_WEG2_L3FILL_ROOM_WAIT_MS.override(1000):
+        out = _run_on("hicache-prefetch-io-0", lambda: HiCacheFile.arena_fill_from_disk(
+            be, arena, ["p0", "p1"], TOTAL, prefix=True))
+    assert out[0] is not None and out[1] is not None
+
+
+def test_no_room_wait_off_the_prefetch_thread():
+    with envs.SGLANG_WEG2_L3FILL_ROOM_WAIT_MS.override(1000):
+        assert hs.fill_room_wait_ms() == 0
+        assert _run_on("hicache-prefetch-io-2", hs.fill_room_wait_ms) == 1000

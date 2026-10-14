@@ -141,6 +141,20 @@ PREFETCH_IO_THREAD_PREFIX = "hicache-prefetch-io"
 _JOIN_WAIT_N = [0, 0, 0]   # waits, stems waited for, stems that completed in the wait
 
 
+_ROOM_WAIT_N = [0]
+
+
+def fill_room_wait_ms() -> int:
+    """ROOM-WAIT: how long a prefetch io thread's fill may wait for arena room
+    (0 on every other thread, and with SGLANG_WEG2_L3FILL_ROOM_WAIT_MS=0)."""
+    if not threading.current_thread().name.startswith(PREFETCH_IO_THREAD_PREFIX):
+        return 0
+    try:
+        return max(0, int(envs.SGLANG_WEG2_L3FILL_ROOM_WAIT_MS.get()))
+    except Exception:  # noqa: BLE001 - no switch, no wait
+        return 0
+
+
 def fill_join_wait_ms(joined_stems: int = 0) -> int:
     """L3FILL-JOINED (2): how long this thread's fill may wait for a JOINED stem.
 
@@ -3536,6 +3550,7 @@ class HiCacheFile(HiCacheStorage):
             cand = [(i, st) for i, st in enumerate(stems) if st in on_disk]
         todo = []
         joined = []
+        still_full = []
         if cand:
             _reap_orphans_before_fill(arena, [st for _, st in cand])
             claims = _fill_claim(arena, [st for _, st in cand], int(total_bytes))
@@ -3556,6 +3571,7 @@ class HiCacheFile(HiCacheStorage):
                     self._arena_evict_to_disk(arena, max(256, len(full)), need=len(full))
                 except Exception:  # noqa: BLE001
                     pass
+                still_full = []
                 for (i, st), (slot, status, gen) in zip(
                         full, _fill_claim(arena, [st for _, st in full], int(total_bytes))):
                     if status == 0:
@@ -3564,6 +3580,8 @@ class HiCacheFile(HiCacheStorage):
                         out[i] = slot
                     elif status == 1:
                         joined.append((i, slot, gen))
+                    elif status == 4:
+                        still_full.append((i, st))
         # STORE-SHORT (NF h6 3393a6aa21, P 11:17:38, weg2-4-17, 3168 pages in
         # the store, 1024 read): the JOIN wait used to run BEFORE this fill
         # read its OWN claims. Two ranks with cross claims (PP0 held 202 stems,
@@ -3585,7 +3603,7 @@ class HiCacheFile(HiCacheStorage):
             # claims past it are freed unread
             todo.sort(key=lambda t: t[0])
             _mine = {t[0] for t in todo}
-            _theirs = {int(j[0]) for j in joined}
+            _theirs = {int(j[0]) for j in joined} | {int(f[0]) for f in still_full}
             _hard = next((i for i, _st in cand
                           if out[i] is None and i not in _mine and i not in _theirs), n)
             _past = [t[1] for t in todo if t[0] > _hard]
@@ -3594,6 +3612,20 @@ class HiCacheFile(HiCacheStorage):
                 todo = [t for t in todo if t[0] < _hard]
         stats = {"filled": 0, "todo": 0, "threads": 0}
         self._arena_fill_read_todo(arena, todo, int(total_bytes), out, stats)
+        if still_full:
+            # ROOM-WAIT (NF h8 2b27c61d48, P PP0 12:04:14, weg2-0-10, 1853
+            # pages in the store, 884 read): ten boot-start reads filled the
+            # 6485-slot arena (complete 0 -> 6484 in 27 s); the 140 stems of
+            # this batch that found it FULL got no slot from the evictor
+            # (every page referenced by a read or pinned by a running
+            # load-back, ``ARENA-EVICT need=140``) and ended the prefix --
+            # 62272 tokens re-prefilled although every file was on disk.
+            # Those references go within seconds (complete 5981 at 12:04:45).
+            # Bounded, prefetch io thread only: evict + claim again until a
+            # slot comes or the wait is spent; what gets a slot is read now.
+            _room = self._await_fill_room(arena, still_full, int(total_bytes), out, joined)
+            if _room:
+                self._arena_fill_read_todo(arena, _room, int(total_bytes), out, stats)
         if joined:
             # L3FILL-JOINED (2): wait (bounded, prefetch io thread only) for the
             # other writer instead of ending the prefix at its page
@@ -3621,6 +3653,49 @@ class HiCacheFile(HiCacheStorage):
                         "ms=%.0f pages_per_s=%.0f", stats["filled"], stats["todo"], k, stats["threads"], ms,
                         stats["filled"] / max(1e-6, ms / 1000.0))
         return out
+
+    def _await_fill_room(self, arena, still_full, total_bytes: int, out, joined) -> list:
+        """ROOM-WAIT: re-evict and re-claim the stems that found the arena FULL
+        until each gets a slot or ``fill_room_wait_ms()`` is spent. Returns the
+        fresh claims (todo entries); a stem another writer claimed meanwhile
+        joins ``joined``'s bookkeeping by being unclaimed at once (a miss here,
+        as before); one that raced in COMPLETE lands in ``out``."""
+        wait_ms = fill_room_wait_ms()
+        if wait_ms <= 0 or not still_full:
+            return []
+        pend = list(still_full)
+        got = []
+        t0 = time.perf_counter()
+        deadline = t0 + wait_ms / 1000.0
+        rounds = 0
+        while pend and time.perf_counter() < deadline:
+            time.sleep(0.025)
+            rounds += 1
+            try:
+                self._arena_evict_to_disk(arena, max(256, len(pend)), need=len(pend))
+            except Exception:  # noqa: BLE001
+                pass
+            nxt = []
+            for (i, st), (slot, status, gen) in zip(
+                    pend, _fill_claim(arena, [st for _, st in pend], int(total_bytes))):
+                if status == 0:
+                    got.append((i, slot, gen, st))
+                elif status == 2:
+                    out[i] = slot
+                elif status == 1:
+                    _unclaim_fill_joins(arena, [(i, slot, gen)])
+                elif status == 4:
+                    nxt.append((i, st))
+            pend = nxt
+        _ROOM_WAIT_N[0] += 1
+        k = _ROOM_WAIT_N[0]
+        if k <= 16 or (k & (k - 1)) == 0 or pend:
+            logger.info("L3-FILL ROOM-WAIT n=%d stems=%d claimed=%d still_full=%d rounds=%d waited_ms=%.0f "
+                        "bound_ms=%d (the arena was FULL for these stems: evict + claim again instead of "
+                        "ending the prefix; prefetch io thread only)",
+                        k, len(still_full), len(got), len(pend), rounds,
+                        (time.perf_counter() - t0) * 1000.0, int(wait_ms))
+        return got
 
     def _arena_fill_read_todo(self, arena, todo, total_bytes: int, out, stats) -> None:
         """#1433: read this fill's OWN claims from disk into their slots and
