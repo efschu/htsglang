@@ -471,7 +471,7 @@ class TestDumpTools(unittest.TestCase):
     def test_mask_live_box_masks_exactly_the_listed_readings(self):
         line = ("LIVE nonreclaim=4.67 raw_current=13.10 file_reclaimable=8.00 GiB | c_max=5.00 GiB size=5.03 GiB | "
                 "memavail=113.33 GiB anon=4.67 GiB shmem=0.00 GiB | free=264.1 GiB | which has 247.5 GiB free of | "
-                "against 264.1 GB free on | foreign_load_now=0.00 GiB | /dev/shm/weg2-xchg-1791275135/x | "
+                "against 264.1 GB free on -- SHORT by 150.3 GB | H2c STORE-IDENTITY id=1b2b0e1bae59af461c814646 | foreign_load_now=0.00 GiB | /dev/shm/weg2-xchg-1791275135/x | "
                 "WEG2-DRY-RUN-BOX-STATE at=2026-10-06T08:25:35Z | budget 26064 MiB total 32607 | "
                 "1295 Budget-Loesungen in 0.2 s\n"
                 "  W65 Weg2MeasuredAnchor: no anchor, heuristic path stands: no boot_*.D.log of this form: "

@@ -73,7 +73,7 @@
    "source": "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-Flash-Next-GGUF-unsloth/UD-IQ4_XS (3 .gguf parts, headers) + /spinning/llm_stuff/club-3090/models-cache/Qwen3.8-Flash-Next-NVFP4-nvidia (config.json, tokenizer files) -- the directory tools/release/make_nf_gguf_sibling.sh builds"
   }
  },
- "date": "2026-10-10",
+ "date": "2026-10-14",
  "golden": "plan_nf_gguf_d_n3.txt",
  "launcher_line": "nf",
  "note": "G8 D-only profile nf-gguf-d (stage A of the metal order). Header snapshots as for plan_nf_gguf_n3 (sibling) plus the draft DIRECTORY (propose_oracle snapshot of Qwen3.8-Flash-Next-GGUF-unsloth-draft: config.json copied, the MTP file as its header). Regenerate: `propose_oracle golden --profile <abs>/tools/release/profconv/nf-gguf-d.env --replay <nvml_devices_1378.json> --tree <abs worktree> --checkpoint-snapshot <sibling snapshot> --checkpoint-snapshot <draft dir snapshot> --out golden/nf/plan_nf_gguf_d_n3.txt` (the tree must be an ABSOLUTE path: a relative one is replaced by <TREE> in every dot of the dump). propose_oracle.run_profile stands in for the --tokenizer-path directory by its snapshot even where the real directory exists (G8): the rig sibling directory appeared on the dev box on 10.10. 18:43 and without that the golden would carry the real path.",
@@ -87,7 +87,8 @@
   "note": "sourced by nf-gguf-d.env (which sources nf.env)",
   "sha256": "154c2a891a68bc9f0d262abbfd332c4b7a653d0e9019227335610af50ae4fda9"
  },
+ "regenerated": "ggufb 14.10.2026 (G series merged onto int24f8 f4afb10f28): regenerated on the merged tree. Differences to the previous golden: (1) merge effect: the int24f gcfreeze registry default (P:/D:SGLANG_WEG2_GC_FREEZE=1 in WEG2-LEISTUNGSSCHALTER and the group envs); (2) BOX STATE, identical on the G16 head 12b375f3dc dumped on the same box the same day: corridor floors MEASURED-P -> UNMEASURED-FALLBACK (the phase_footprint cache of the box), the P budgets / pool tokens that follow from them, the L3 DISK-SUM line (free disk). Verified by dumping the G16 head on this box: 13 diff lines to the merged dump (GC_FREEZE + DISK-SUM).",
  "replay": "fixtures/xchg_launch_replay_0911/nvml_devices_1378.json",
  "schema": "planer-ap0-golden-provenance/1",
- "tree": "desk/planer-ggufg8-1010 (base desk/nf-gguf-1009 @ 855367ef0c + G8)"
+ "tree": "desk/planer-ggufb-1014 (desk/nf-int24f8-1013 f4afb10f28 + desk/nf-gguf-1018 12b375f3dc, merge --no-ff)"
 }

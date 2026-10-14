@@ -68,7 +68,7 @@
    "source": "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-Flash-Next-GGUF-unsloth/UD-IQ4_XS (3 .gguf parts, headers) + /spinning/llm_stuff/club-3090/models-cache/Qwen3.8-Flash-Next-NVFP4-nvidia (config.json, tokenizer files) -- the directory tools/release/make_nf_gguf_sibling.sh builds"
   }
  },
- "date": "2026-10-10",
+ "date": "2026-10-14",
  "golden": "plan_nf_gguf_n3.txt",
  "launcher_line": "nf",
  "note": "GGUF header snapshots taken read-only on the dev box (the files are visible there): the bytes up to the tensor-data region of each part (GGUFReader.data_offset), no tensor byte read; config.json and tokenizer files of Qwen3.8-Flash-Next-NVFP4-nvidia. Regenerate: propose_oracle snapshot (python call with source=, see the commit message), then `propose_oracle golden --profile tools/release/profconv/nf-gguf.env --replay <nvml_devices_1378.json> --checkpoint-snapshot <sibling snapshot> --checkpoint-snapshot <MTP snapshot> --out golden/nf/plan_nf_gguf_n3.txt`.",
@@ -82,8 +82,8 @@
   "note": "sourced by nf-gguf.env",
   "sha256": "551d40ebc5f3728648bd271d4f0e058823548f0765f58c450912ec95d24e804c"
  },
+ "regenerated": "G7 10.10.2026: only the expert-store identity moved (094d948f308c5ef9381757b5 -> 853c707b895a9937c4a42443: G4's GGUF layout tag + header digest now enter compute_identity, G5's golden predates the G4 merge; lines 193, 247, 248); profile sha256 changed by the HTSGLANG_DRAFT override of G3's PROFILE_DRAFT line | ggufb 14.10.2026 (G series merged onto int24f8 f4afb10f28): regenerated on the merged tree. Differences to the previous golden: (1) merge effect: the int24f gcfreeze registry default (P:/D:SGLANG_WEG2_GC_FREEZE=1 in WEG2-LEISTUNGSSCHALTER and the group envs); (2) BOX STATE, identical on the G16 head 12b375f3dc dumped on the same box the same day: corridor floors MEASURED-P -> UNMEASURED-FALLBACK (the phase_footprint cache of the box), the P budgets / pool tokens that follow from them, the L3 DISK-SUM line (free disk). Verified by dumping the G16 head on this box: 13 diff lines to the merged dump (GC_FREEZE + DISK-SUM).",
  "replay": "fixtures/xchg_launch_replay_0911/nvml_devices_1378.json",
  "schema": "planer-ap0-golden-provenance/1",
- "tree": "desk/nf-gguf-1009 (G7 integration: NF int24b 17c8582d2d + G1-G6 merged)",
- "regenerated": "G7 10.10.2026: only the expert-store identity moved (094d948f308c5ef9381757b5 -> 853c707b895a9937c4a42443: G4's GGUF layout tag + header digest now enter compute_identity, G5's golden predates the G4 merge; lines 193, 247, 248); profile sha256 changed by the HTSGLANG_DRAFT override of G3's PROFILE_DRAFT line"
+ "tree": "desk/planer-ggufb-1014 (desk/nf-int24f8-1013 f4afb10f28 + desk/nf-gguf-1018 12b375f3dc, merge --no-ff)"
 }
