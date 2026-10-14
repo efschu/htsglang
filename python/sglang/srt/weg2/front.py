@@ -5094,6 +5094,7 @@ class Front:
                 v_path, v_payload = body
                 v_payload = dict(v_payload)
                 v_payload["rid"] = rid
+                Front._lane_payload(self, rid, v_payload)  # LANEHOLD 1014: P must see the lane the front booked
                 p = Pending(rid=rid, path=v_path, payload=v_payload, text=f"\x00rvp:{rid}",
                             t_arrive=now, fut=asyncio.get_event_loop().create_future(),
                             est_prompt=len(ids), est_uncached=int(r.get("d_extent") or len(ids)),
@@ -5103,6 +5104,10 @@ class Front:
             else:
                 payload = {"rid": rid, "input_ids": ids,
                            "sampling_params": {"max_new_tokens": 1, "temperature": 0.0}}
+                # LANEHOLD 1014 (NF metal f4afb10f28, weg2-139-485): the P-only leg is built here, not copied from a client body, so
+                # it carried no ``priority``: P's Req was lane 0 and its lane hold (``lane < floor``) took the very lane that holds
+                # the floor (``loop_skips(weg2_lane_held=1)``). The lane the front booked goes into the payload.
+                Front._lane_payload(self, rid, payload)
                 # Q-530 SALT-ISOLATION: P prefills D's context in the rid's own
                 # namespace -- D reads it back under that key (D's needs-P record,
                 # else the arrival's note). Without it P's pages land under None.
@@ -7407,6 +7412,18 @@ class Front:
         """The lane noted for ``rid`` (0 when none: switch off, or a rid the front never noted)."""
         ls = self.__dict__.get("_lane_state_obj")
         return 0 if ls is None else ls.lane_for(rid)
+
+    def _lane_payload(self, rid: Any, payload: dict, lane: Optional[int] = None) -> dict:
+        """LANEHOLD 1014: write the lane of ``rid`` into a payload the front BUILDS for P (``priority``, the field the scheduler's
+        ``Req.priority`` is read from). A lane-0 request keeps the field absent (byte-identical to the switch-off payload); the
+        switch off returns before it looks. P's lane hold is ``lane < floor``: a leg that reaches P without its lane is lane 0 and is
+        held by a floor its own request raised. Returns ``payload`` (mutated in place)."""
+        if not _lanes.enabled() or not isinstance(payload, dict):
+            return payload
+        n = Front._lane_for(self, rid) if lane is None else int(lane)
+        if n > 0 and payload.get(_lanes.FIELD) != n:
+            payload[_lanes.FIELD] = n
+        return payload
 
     def _lane_end(self, rid: Any) -> None:
         """The rid ended (the generate handler's end): its lane note goes."""
@@ -12511,6 +12528,15 @@ class Front:
         else:
             payload["max_tokens"] = 1
             payload.pop("max_completion_tokens", None)
+        if _lanes.enabled():
+            # LANEHOLD 1014 (net): every P leg reaches P as the lane the front booked for it. A leg of lane n > 0 whose payload does not
+            # say so is lane 0 on P and is held by its own floor (lane < floor) -- written here and named, never silently held.
+            _bn = int(getattr(p, "lane", 0) or 0)
+            if _bn > 0 and _lanes.lane_of(payload) != _bn:
+                logger.warning("%s rid=%s lane=%d payload_priority=%r path=%s -- the P leg's payload did not carry the lane the front booked "
+                               "(a leg of the floor lane would reach P as lane 0 and be held by the floor it raised): written before the POST",
+                               _lanes.MARK_LEG_PRIORITY, p.rid, _bn, payload.get(_lanes.FIELD), p.path)
+                payload[_lanes.FIELD] = _bn
         g.outstanding[p.rid] = time.time()
         t0 = time.time()
         Front._req_book(self).leg1_dispatch(p.rid, t0)  # DASHBOARD-IPC: queue_ms ends, p_prefill starts

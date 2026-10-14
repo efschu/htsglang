@@ -58,6 +58,9 @@ MARK_D_PARK_PARK = "WEG2-D-PARK park(lane)"        # D side: rids parked for a l
 MARK_D_PARK_REQUEUE = "WEG2-D-PARK requeue(lane)"  # D side: held parks requeued in arrival order on a floor fall
 MARK_D_PARK_PHASES = "WEG2-D-PARK lane-park-phases"  # D side (fix 4): the phases of one park(lane) line, log only
 MARK_PR_FLOOR = "PR LANE-FLOOR"          # P side: the floor stamped into the PP-room vote
+#: LANEHOLD 1014: a P leg whose payload lacked the lane the front booked for it -- written before the POST (a floor-lane leg that
+#: would reach P as lane 0 is held by its own floor)
+MARK_LEG_PRIORITY = "WEG2 LANE-LEG-PRIORITY"
 #: the warning of a ``priority`` the front had to correct (negative / not a whole number / out of range)
 MARK_FIELD = "WEG2 LANE-FIELD"
 
