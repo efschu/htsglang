@@ -50,6 +50,8 @@ import time
 from dataclasses import dataclass
 from typing import Mapping as _Map, Optional
 
+from sglang.srt.weg2.host_pause import PauseAwareDeadline
+
 logger = logging.getLogger(__name__)
 
 ENV_ON = "SGLANG_WEG2_BAR1_LANES"
@@ -274,6 +276,8 @@ def take_flag(d: str, kind: str, seq, g: int, timeout_s: float,
     t0 = time.perf_counter()
     n = 0
     next_tick = t0 + SPILL_TICK_S
+    # W68: the hot poll's slice is ~20 us; a host freeze shows as one huge gap
+    dl = PauseAwareDeadline(timeout_s, 0.05, what="bar1-flag", clock=time.perf_counter)
     while True:
         if on_tick is not None and time.perf_counter() >= next_tick:
             next_tick = time.perf_counter() + SPILL_TICK_S
@@ -287,7 +291,7 @@ def take_flag(d: str, kind: str, seq, g: int, timeout_s: float,
         except FileNotFoundError:
             pass
         n += 1
-        if time.perf_counter() - t0 > timeout_s:
+        if dl.left() < 0:
             return None
         if on_slow is not None and time.perf_counter() - t0 > SLOW_WAIT_S:
             on_slow()
@@ -375,15 +379,16 @@ class SocketCredits:
     def _read(self, n: int, timeout_s: float) -> Optional[bytes]:
         buf = b""
         t_wait0 = time.monotonic()
-        deadline = t_wait0 + float(timeout_s)
         slow_sent = False
         # W109b (02.10., NF y6u): a depositor's wait asks its cycle question
         # every SPILL_TICK_S -- with the old 0.5-s socket slice the metal path
         # (credits=sock) asked only every 0.5 s whatever SPILL_TICK_S said.
         # Waits without a tick question keep the 0.5-s slice.
         slice_s = SPILL_TICK_S if self.on_tick is not None else 0.5
+        # W68 (NF 14.10. 12:17Z): a host freeze is not the peer's time
+        dl = PauseAwareDeadline(timeout_s, slice_s, what="bar1-sock")
         while len(buf) < n:
-            left = deadline - time.monotonic()
+            left = dl.left()
             if left <= 0:
                 return None
             self.sock.settimeout(min(left, slice_s))
@@ -933,10 +938,10 @@ class Bar1Lanes:
         """Wait until every spilled tag of every lane is fed (the sleep leg's
         end, after the last pause -- nothing on this rank blocks a waker any
         more). Returns "" or the feeders' refusals."""
-        deadline = time.monotonic() + float(budget_s)
+        dl = PauseAwareDeadline(budget_s, 0.5, what="w109b-backlog")
         with self.backlog_cv:
             while self.backlog:
-                left = deadline - time.monotonic()
+                left = dl.left()
                 if left <= 0:
                     return (f"W109b backlog: {sorted(self.backlog)} still feeding after "
                             f"{budget_s:.0f} s")
@@ -985,13 +990,13 @@ class Bar1Lanes:
         if order_key is None:
             return True
         key = (int(order_key[0]), int(order_key[1]))
-        deadline = time.monotonic() + float(timeout_s)
+        dl = PauseAwareDeadline(timeout_s, 0.5, what="lane-turn")
         with self.turn_cv:
             while True:
                 pend = self.turn.get(lane_key) or set()
                 if key not in pend or min(pend) == key:
                     return True
-                left = deadline - time.monotonic()
+                left = dl.left()
                 if left <= 0:
                     return False
                 self.turn_cv.wait(min(left, 0.5))
