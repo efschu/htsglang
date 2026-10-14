@@ -233,7 +233,7 @@ class Catalog(unittest.TestCase):
         # "ohne Beleg" = kuratierte Kanten ohne Katalogkante: 24 im Kern der 27B-Linie; der NF-eigene kuratierte Eintrag --pdflip-xchg-census-map (nur NF-Baum) traegt
         # eine weitere (braucht --pdflip-xchg-census), ist der Katalog aus dem NF-Kern gebaut (Neubau NF-Linie 07.10.), sind es 25
         nf_census_map = cat["entries"].get("--pdflip-xchg-census-map", {}).get("status") == "curated"
-        self.assertEqual((k["edges_total"], k["verschmolzen"], k["neu"], k["edges_without_evidence"]), (136, 51, 85, 25 if nf_census_map else 24))
+        self.assertEqual((k["edges_total"], k["verschmolzen"], k["neu"], k["edges_without_evidence"]), (138, 51, 87, 25 if nf_census_map else 24))
         deps = [d for e in cat["entries"].values() for d in e["depends"]]
         self.assertTrue(all("belegt" in d and "to_kind" in d for d in deps))
         self.assertTrue(any(d["to_kind"] == "refusal" for d in deps))
