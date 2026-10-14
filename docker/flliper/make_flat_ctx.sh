@@ -240,6 +240,19 @@ else
   ok "deadman from the revision: $DM_SRC ($([ "$_dm_prog" -gt 0 ] && echo "PROGRESS-STALL" || echo "no PROGRESS-STALL"))"
 fi
 [ "$_sf_death" -gt 0 ] && [ "$_sf_rank" = 0 ] && blocker "state_file.py has note_rank_death but no writer \"rank\" in WRITERS"
+# 1c. Container entrypoint + healthcheck from the revision (14.10. image probe build; RC3 acceptance m3/m9): the image's
+# /opt/htsglang/{entrypoint,healthcheck}.sh come from the tree being built (shared assets: from --rev, the 27B tree of a Duo,
+# like the deadman), not from the live copies in $HERE -- otherwise the healthcheck is whatever $HERE holds at build time (a
+# reused older ctx shipped the version without the FLIP-ORDER skip: a healthy NF server went sticky unhealthy). A revision
+# without its own copy ships the host copy with a WARN (a failure under --check).
+EP_SRC=""; HC_SRC=""
+for _p in docker/flliper/entrypoint.sh docker/pdflip-release/entrypoint.sh; do
+  "${G[@]}" cat-file -e "$REV:$_p" 2>/dev/null && { EP_SRC=$_p; break; }
+done
+"${G[@]}" cat-file -e "$REV:docker/flliper/healthcheck.sh" 2>/dev/null && HC_SRC=docker/flliper/healthcheck.sh
+say "   container tools: entrypoint ${EP_SRC:-HOST copy $HERE/entrypoint.sh}, healthcheck ${HC_SRC:-HOST copy $HERE/healthcheck.sh}"
+[ -n "$EP_SRC" ] || warn "revision ${SHA10} carries no entrypoint.sh (docker/flliper/, docker/pdflip-release/) -- the ctx ships the HOST copy $HERE/entrypoint.sh (not tree-versioned)"
+[ -n "$HC_SRC" ] || warn "revision ${SHA10} carries no docker/flliper/healthcheck.sh -- the ctx ships the HOST copy $HERE/healthcheck.sh (not tree-versioned)"
 if [ "$DUO" = 1 ] && [ -n "${NF_SF:-}" ]; then   # item 600: the NF slot's own state_file.py must carry what the shared deadman needs
   _nf_prog=$(printf '%s\n' "$NF_SF" | grep -c '"progress-check"'); _nf_rank=$(printf '%s\n' "$NF_SF" | grep -cE '^WRITERS = .*"rank"')
   if [ "$_dm_prog" -gt 0 ] && [ "$_nf_prog" = 0 ]; then blocker "the shared deadman calls 'state_file.py progress-check', the NF tree's state_file.py has none"
@@ -480,7 +493,7 @@ say "     assets/wheels/        <- $(basename "$KW_FILE") (${KW_SHA:0:12})"
 say "     assets/fi-wheels/     <- flashinfer_python 0.7.0 (${FIPY_SHA:0:12}), flashinfer_cubin 0.7.0 (${FICUBIN_SHA:0:12})"
 say "     assets/flashinfer_modules.txt (52), assets/tvm-ffi/ (EMPTY), assets/nvidia-open-595/ (EMPTY, WITH_NV_HEADERS=0)"
 say "     assets/devtools/ (boot_deadman.sh <- ${DM_SRC:-host copy}, host_ledger_preflight.sh mem_timeseries.sh), assets/arb-seed-{27b,nf}/, assets/profiles/{27b,nf}/"
-say "     tools/{entrypoint.sh,healthcheck.sh,prebuild_jit.py,delta_prebuild.py,delta_postcheck.py}, tools/profiles/ ($(echo $PROFILES | wc -w) whitelisted)"
+say "     tools/{entrypoint.sh,healthcheck.sh} <- ${EP_SRC:-host}/${HC_SRC:-host}; tools/{prebuild_jit.py,delta_prebuild.py,delta_postcheck.py} <- host $HERE; tools/profiles/ ($(echo $PROFILES | wc -w) whitelisted)"
 say "     tools/kernels.txt     <- union list above ($N_ALL lines)"
 say "     BUILD_INFO.json (layout flat, release $REL, revision ${SHA10}, pins), BUILD_INFO-{27b,nf}.json, MANIFEST.sha256"
 sec "7. Build command (Proxmox host; host_build.sh route with IMAGE= and the flat Dockerfile)"
@@ -518,7 +531,7 @@ else for ph in __FLLIPER_VERSION__ __FLLIPER_SOURCE__ __FLLIPER_PLACEHOLDERS__ _
        grep -q "=$ph\$" "$DFF" || blocker "Dockerfile.flliper lacks the bake point ARG ...=$ph"; done
      ok "Dockerfile.flliper present ($(grep -c '^RUN ' "$DFF") RUN, bake points 4/4)"
      if [ "$DUO" = 1 ] && ! grep -q '^ARG ALLOW_DUO_TREES=0$' "$DFF"; then blocker "DUO: Dockerfile.flliper lacks ARG ALLOW_DUO_TREES (FLAT-2 would FATAL) -- install Dockerfile.flliper.new_600"; fi; fi
-grep -q 'FLLIPER_PROFILE' "$HERE/entrypoint.sh" || relblock "B2: entrypoint.sh reads HTSGLANG_PROFILE only; README promises FLLIPER_PROFILE, MODE=pdflip, /var/lib/flliper -- RENAME step 5"
+{ if [ -n "$EP_SRC" ]; then "${G[@]}" show "$REV:$EP_SRC"; else cat "$HERE/entrypoint.sh"; fi; } | grep -q 'FLLIPER_PROFILE' || relblock "B2: entrypoint.sh reads HTSGLANG_PROFILE only; README promises FLLIPER_PROFILE, MODE=pdflip, /var/lib/flliper -- RENAME step 5"
 # --check (F0-G): the offline gate -- a WARN is a failure here, and so is a pre-rename profile name in a renamed tree (those are blockers in --plan already)
 if [ "$CHECK" = 1 ] && [ "${#WARNS[@]}" -gt 0 ]; then for w in "${WARNS[@]}"; do blocker "check: warning is a failure: $w"; done; fi
 say "   warnings: ${#WARNS[@]}; blockers: ${#BLOCKERS[@]}; release blockers (ctx allowed): ${#RELBLOCKERS[@]}"
@@ -653,7 +666,15 @@ done
 say "   seed 27b $(find "$PART/assets/arb-seed-27b" -type f | wc -l) files, nf $(find "$PART/assets/arb-seed-nf" -type f | wc -l); profile data 27b $(ls "$PART/assets/profiles/27b" | wc -l), nf $(ls "$PART/assets/profiles/nf" | wc -l) ($(du -sh --apparent-size "$PART/assets/profiles" | cut -f1))"
 
 say "6/8 tools and the $(echo $PROFILES | wc -w) whitelisted profiles"
-cp -p "$HERE/entrypoint.sh" "$HERE/healthcheck.sh" "$HERE/prebuild_jit.py" "$HERE/delta_prebuild.py" "$HERE/delta_postcheck.py" "$PART/tools/" || fail "tools"
+cp -p "$HERE/prebuild_jit.py" "$HERE/delta_prebuild.py" "$HERE/delta_postcheck.py" "$PART/tools/" || fail "tools"
+TOOLS_FROM=""
+for _t in entrypoint healthcheck; do   # section 1c: from the revision when it carries them, else the host copy
+  _s=$([ "$_t" = entrypoint ] && echo "$EP_SRC" || echo "$HC_SRC")
+  if [ -n "$_s" ]; then "${G[@]}" show "$REV:$_s" > "$PART/tools/$_t.sh" || fail "$_t $REV:$_s"; _f="$SHA10:$_s"
+  else cp -p "$HERE/$_t.sh" "$PART/tools/" || fail "$_t host copy"; _f="host:$HERE/$_t.sh"; fi
+  chmod 0755 "$PART/tools/$_t.sh"; TOOLS_FROM+="$_t=$_f md5=$(md5sum < "$PART/tools/$_t.sh" | cut -d' ' -f1) "
+done
+say "   container tools: $TOOLS_FROM"
 for pr in $PROFILES; do
   cp -p "$(pf "$pr")" "$PART/tools/profiles/$pr.env" || fail "profile $pr"
   st=$(eff_status "$pr"); ist=$(img_status "$pr")
@@ -712,7 +733,7 @@ DRV=$(awk '/NVRM version/{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+\.[0-9]+\.[0-9]+$/)
 REL_JSON=$(printf '%s\n' "${RELBLOCKERS[@]}")
 PRS=$(for pr in $PROFILES; do printf '%s=%s\n' "$pr" "$(img_status "$pr")"; done)
 KL=$(for l in "${KLISTS[@]}"; do basename "$l"; done)
-FLAT_DUO=$DUO FLAT_REV_NF=$REV_NF FLAT_BRANCH_NF=$BRANCH_NF FLAT_PUSH_NF="${PUSH_STATE_NF:-$PUSH_STATE}" FLAT_LOCK_FOLD=$LOCK_FOLD FLAT_MEMPROF=$MEMPROF FLAT_DM_FROM=$DM_FROM FLAT_DM_MD5=$DM_MD5 FLAT_SF_SRC=$SF_SRC python3 - "$PART" "$REL" "$CU" "$REV" "$BRANCH" "$PUSH_STATE" "$SINCE" "$REF_VENV" "$LOCKW" "$KW_SHA" "$(basename "$KW_FILE")" \
+FLAT_DUO=$DUO FLAT_REV_NF=$REV_NF FLAT_BRANCH_NF=$BRANCH_NF FLAT_PUSH_NF="${PUSH_STATE_NF:-$PUSH_STATE}" FLAT_LOCK_FOLD=$LOCK_FOLD FLAT_MEMPROF=$MEMPROF FLAT_DM_FROM=$DM_FROM FLAT_DM_MD5=$DM_MD5 FLAT_SF_SRC=$SF_SRC FLAT_TOOLS_FROM="$TOOLS_FROM" python3 - "$PART" "$REL" "$CU" "$REV" "$BRANCH" "$PUSH_STATE" "$SINCE" "$REF_VENV" "$LOCKW" "$KW_SHA" "$(basename "$KW_FILE")" \
           "$DRV" "$STAGE_B" "$PKG" "$SOURCE" "$PLACEHOLDERS" "$TAG" "$TAG2" "$REL_JSON" "$PRS" "$KL" "$FIM" <<'PYW' || fail "BUILD_INFO"
 import hashlib, json, os, pathlib, re, sys, time, glob, base64
 (out, rel, cu, rev, branch, push, since, venv, lock, kwsha, kwname, drv, stage_b, pkg, source, ph, tag, tag2,
@@ -760,6 +781,7 @@ bi = {"layout": "duo", "build": "flat", "release": rel, "cuda": cu, "created_utc
       "mem_profile": os.environ.get("FLAT_MEMPROF", "full"),
       "deadman": {"from": os.environ.get("FLAT_DM_FROM"), "md5": os.environ.get("FLAT_DM_MD5"),
                   "state_file": os.environ.get("FLAT_SF_SRC") or None},
+      "container_tools": os.environ.get("FLAT_TOOLS_FROM", "").strip(),
       "release_blockers": [l for l in relb.splitlines() if l]}
 (o / "BUILD_INFO.json").write_text(json.dumps(bi, indent=1))
 PYW
