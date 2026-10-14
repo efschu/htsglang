@@ -7,6 +7,9 @@
 #           full Dockerfile never had this step; until now only the delta images carried these kernels.
 #   FLAT-4  fLLiper labels (OCI + io.github.efschu.flliper.*), revision label = the plain 40-hex SHA; no htsglang.* labels.
 #   FLAT-5  B4 placeholders (source repo, version scheme) are baked by make_flat_ctx.sh; the build refuses an unbaked file.
+#   FLAT-6  (14.10.) step 3a: FlashInfer JIT seed -- the JIT cache of an existing image (make_flat_ctx.sh --fi-seed-from, default ON)
+#           enters before step 3b; content-identical deps get the seed's mtimes back, so ninja keeps every seeded module and step 3b
+#           (plus the 13 'fi' lines of 6b, fp4_gemm_cutlass_sm120 among them) builds only what really differs. Empty seed = old path.
 # F0-G (08.10., renamed trees): the image is built from the RENAMED trees (python/flliper, srt/pdflip). Runtime-only variables the image bakes
 #   (barlink NV source, launch dump, planner files) carry the renamed spelling FLLIPER_*; a legacy spelling in the image ENV would make every
 #   process log the compat DEPRECATED line. The five variables the ENTRYPOINT reads under the legacy spelling (SGLANG_WEG2_VENV,
@@ -140,6 +143,34 @@ RUN --mount=type=cache,target=/root/.cache/pip,id=htsglang-pip \
     python -c "import importlib.metadata as m, torch; \
 v = {d: m.version(d) for d in ('torch', 'triton', 'flashinfer-python', 'nvidia-cutlass-dsl', 'nvidia-nccl-cu13', 'apache-tvm-ffi')}; print(v); \
 assert torch.__version__.startswith('${TORCH_EXPECT}'), torch.__version__; assert torch.version.cuda.startswith('13.'), torch.version.cuda"
+
+# --- 3a. FLAT-6: FlashInfer-JIT-Saat aus einem vorhandenen Image (14.10., Bau leichter und kuerzer) -------------------------
+# assets/fi-seed/ (make_flat_ctx.sh --fi-seed-from <image>, Default AN; Export per fi_seed_export.sh): flashinfer/ = der
+# JIT-Cache des Saat-Images MIT seinen mtimes, DEPS.manifest = "<sha256> <mtime> <pfad>" je Header/Quelle ausserhalb des Caches,
+# die die .ninja_deps der Module nennen. FlashInfer entscheidet ueber einen JIT-Neubau NUR per ninja (jit/core.py: "freshness of
+# the JIT-path .so is owned by ninja's dependency scan"), ninja nur per mtime -- und pip schreibt jede Datei mit der
+# INSTALLATIONSZEIT, also waere nach Schritt 2b jedes Saat-Modul veraltet. Darum hier, NACH allen Schritten, die solche
+# Dateien installieren (apt 1, pip 2/2b), und VOR 3b: jede Dep, deren INHALT gleich dem der Saat ist, bekommt die mtime der Saat
+# zurueck (= der Zustand, in dem ninja in der Saat "no work to do" meldete); eine Dep mit anderem Inhalt behaelt ihre neue
+# mtime, und ninja baut in 3b genau die Module neu, die sie einbinden. Kein Modul wird ungeprueft uebernommen: 3b ruft fuer
+# jedes Manifest-Modul weiter spec.build() (ninja) und prueft die gencode-Flags (--strict); D1 prueft den Cache zur Laufzeit.
+# Leere Saat (assets/fi-seed/flashinfer/.keep, DEPS.manifest leer) = der alte Weg, 3b baut alles.
+COPY assets/fi-seed/flashinfer/ /root/.cache/flashinfer/
+COPY assets/fi-seed/DEPS.manifest assets/fi-seed/PROVENANCE.txt /opt/htsglang/fi-seed/
+RUN set -eu; M=/opt/htsglang/fi-seed/DEPS.manifest; rm -f /root/.cache/flashinfer/.keep; \
+    if [ ! -s "$M" ]; then echo "FI-SEED: none (empty assets/fi-seed) -> step 3b builds every FlashInfer module"; exit 0; fi; \
+    ok=0; bad=0; \
+    while read -r h t f; do \
+      case "$h" in ''|'#'*) continue ;; esac; \
+      if [ -f "$f" ] && [ "$(sha256sum < "$f" | cut -c1-64)" = "$h" ]; then touch -d "@$t" "$f"; ok=$((ok + 1)); \
+      else bad=$((bad + 1)); echo "FI-SEED: dep differs from the seed or is missing (its modules rebuild in 3b): $f"; fi; \
+    done < "$M"; \
+    n=0; d=0; \
+    for b in /root/.cache/flashinfer/*/*/cached_ops/*/; do \
+      [ -f "$b/build.ninja" ] || continue; n=$((n + 1)); \
+      if ! ninja -C "$b" -f build.ninja -n 2>/dev/null | grep -q 'no work to do'; then d=$((d + 1)); echo "FI-SEED: rebuild in 3b: $b"; fi; \
+    done; \
+    echo "FI-SEED: modules=$n fresh=$((n - d)) rebuild=$d deps=$((ok + bad)) adopted=$ok differ=$bad ($(grep -E '^(lock_sha256|flashinfer_python|nvcc)=' /opt/htsglang/fi-seed/PROVENANCE.txt | tr '\n' ' '))"
 
 # --- 3b. FlashInfer-Vorbau VOR dem Quellbaum und VOR dem sgl-kernel-Wheel (RELEASE_PLAN §7.1) -------------------
 # Der teure Teil des Vorbaus (FlashInfer 86 + 120f, ~36 von 38,7 min am 25.09.) braucht nur das venv (flashinfer, torch
@@ -396,6 +427,9 @@ ARG FLLIPER_VERSION=__FLLIPER_VERSION__
 ARG FLLIPER_SOURCE=__FLLIPER_SOURCE__
 ARG FLLIPER_PLACEHOLDERS=__FLLIPER_PLACEHOLDERS__
 ARG FLLIPER_LOCK_SHA256=__FLLIPER_LOCK_SHA256__
+# FLAT-6: the FlashInfer JIT seed (make_flat_ctx.sh bakes "<image>@<id12>", or "none"); declared here, not at step 3a, so it stays
+# out of the cache key of every RUN before the labels.
+ARG FI_SEED_FROM=none
 ARG CUDA_BASE
 RUN set -eu; for v in "${FLLIPER_VERSION}" "${FLLIPER_SOURCE}" "${FLLIPER_PLACEHOLDERS}" "${FLLIPER_LOCK_SHA256}"; do \
       case "$v" in __*__) echo "FATAL (FLAT-5): Dockerfile not baked by make_flat_ctx.sh ($v)"; exit 1;; esac; done; \
@@ -423,6 +457,7 @@ LABEL org.opencontainers.image.title="fLLiper" \
       io.github.efschu.flliper.driver.expected="595.58.03" \
       io.github.efschu.flliper.lock.sha256="${FLLIPER_LOCK_SHA256}" \
       io.github.efschu.flliper.build="flat" \
+      io.github.efschu.flliper.fi_seed="${FI_SEED_FROM}" \
       io.github.efschu.flliper.placeholders="${FLLIPER_PLACEHOLDERS}"
 
 # 30000 Server (MODE=server), 8780 Planner, 8770 rigmon, 30030 pdflip front (MODE=pdflip, alias MODE=weg2).

@@ -11,6 +11,8 @@
 #            [--release <version>] [--cu cu130] [--since 2026-09-01] [--no-split]
 #            [--kernels <list> ...] [--profiles "<name> ..."] [--source <url>] [--allow-unpushed]
 #            [--host] [--emit-kernels] [--no-hash] [--accepted "27b nf"] [--mem-profile auto|full|nf]
+#            [--fi-seed-from <image> | --no-fi-seed]   FLAT-6 (14.10.): FlashInfer JIT seed, DEFAULT ON (htsglang:cu130-weg2-rc12g-27b-nf-flat)
+#                                                (see "FI SEED" below)
 #            [--profiles-from-tree <checkout>]   F0-G: take the profiles from <checkout>/docker/flliper/{profiles_release,profiles} (the converted
 #                                                set that travels WITH the tree; env PROFILE_OVERLAY / PROFILE_RIG do the same one by one)
 #   --mem-profile nf: build NEXT TO a running boot (NF Dauerbetrieb): builder cap 16g, 8 CPUs, the prebuild concurrency is
@@ -38,6 +40,16 @@
 #     Acceptance and publication use the SPLIT image (its id is what host_publish_flliper.sh binds).
 # Exit: --plan 0 = no blocker, 3 = blockers named (BLOCKER lines); --write 0 = ctx created (release blockers may remain,
 # listed), 3 = refused by a ctx blocker (nothing kept); 2 = usage.
+#
+# FI SEED (FLAT-6, 14.10., report deskq/done/flliper-bau-v2-1014.md): --write exports the FlashInfer JIT cache of an EXISTING
+# image on the Proxmox host into assets/fi-seed/ (fi_seed_export.sh next to this script, fed into ONE read-only
+# `docker run -i --rm --network none --memory 1g` of that image -- no build, no GPU, ~30 s), together with DEPS.manifest
+# (sha256 + mtime of every header the cached modules' ninja deps logs name). Dockerfile.flliper step 3a restores the seed mtime
+# of every content-identical dep, so ninja keeps the seeded modules and step 3b / the 6b 'fi' lines build only what differs.
+# Default ON (user order 14.10.: new features on): seed image FI_SEED_IMAGE (env) or --fi-seed-from, default
+# htsglang:cu130-weg2-rc12g-27b-nf-flat (FlashInfer 0.7.0@2f3bc5ac, lock ae10b55f, 65 modules = 52-row manifest + 13 'fi' lines).
+# --no-fi-seed (explicit) = the old path. A failed export is a WARN and leaves the seed empty (the build stays correct, only
+# slower); FI_SEED_REQUIRED=1 makes it a write failure. --plan/--check never start a container (--plan --host only inspects).
 #
 # DEADMAN (30.09., as make_delta_ctx.sh 0930dm): assets/devtools/boot_deadman.sh comes from THE REVISION being built
 # (scripts/<pdflip|weg2>/devtools/boot_deadman.sh), not from the host -- deadman and state_file.py (both slots = the
@@ -81,6 +93,8 @@ PROFILE_RIG=${PROFILE_RIG:-$HERE/profiles}     # F0-G: the rig-table dir the non
 pf(){ if [ -f "$PROFILE_OVERLAY/$1.env" ]; then echo "$PROFILE_OVERLAY/$1.env"; else echo "$PROFILE_RIG/$1.env"; fi; }
 MIN_REV=b3180fb493c02d4a27ae4108a4bccaf3f7719c17   # operator 26.09.: b3180fb493 or newer
 ARB=/spinning/gpu-arb
+FI_SEED_IMAGE_DEFAULT=htsglang:cu130-weg2-rc12g-27b-nf-flat
+FI_SEED_IMAGE=${FI_SEED_IMAGE:-$FI_SEED_IMAGE_DEFAULT}; FI_SEED=1
 KERNEL_LISTS_DEFAULT="delta_kernels_rc10u.txt delta_kernels_rc9dwin.txt delta_kernels_rc9f.txt delta_kernels_rc9c.txt delta_kernels_rc9b.txt delta_kernels_rc9.txt"
 
 PLAN=0; WRITE=0; CHECK=0; REV_IN=${FLAT_REV:-}; BRANCH=""; REV_NF_IN=${FLAT_REV_NF:-}; BRANCH_NF_IN=""; SPLIT=1; REL=""; CU=cu130; KLISTS=(); PROFILES=$PROFILES_DEFAULT; HOST=0; EMIT=0; HASH=1
@@ -109,7 +123,9 @@ while [ $# -gt 0 ]; do
     --host) HOST=1; shift ;;
     --emit-kernels) EMIT=1; shift ;;
     --no-hash) HASH=0; shift ;;
-    -h|--help) sed -n '2,32p' "$0"; exit 0 ;;
+    --fi-seed-from) FI_SEED_IMAGE=$2; FI_SEED=1; shift 2 ;;
+    --no-fi-seed) FI_SEED=0; shift ;;
+    -h|--help) sed -n '2,34p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -124,6 +140,7 @@ if [ -z "$SOURCE" ]; then SOURCE=https://github.com/efschu/fLLiper; fi
 PLACEHOLDERS=$( [ "${#PH[@]}" -gt 0 ] && echo "${PH[*]} (B4, user decision pending)" || echo none )
 [ "${#KLISTS[@]}" -gt 0 ] || for k in $KERNEL_LISTS_DEFAULT; do KLISTS+=("$HERE/$k"); done
 case "$REL" in *[!A-Za-z0-9._-]*|"") echo "release '$REL' is not a valid docker tag part" >&2; exit 2 ;; esac
+case "$FI_SEED_IMAGE" in *[!A-Za-z0-9._:/@-]*|"") echo "--fi-seed-from '$FI_SEED_IMAGE' is not an image reference" >&2; exit 2 ;; esac
 
 G=(git --no-optional-locks -c safe.directory='*' -C "$REPO")
 BLOCKERS=(); WARNS=()
@@ -356,6 +373,20 @@ if [ -d /root/.cache/tvm-ffi ]; then
   say "   rig tvm-ffi cache: $n entries ($n13 link cudart 13, $n12 link cudart 12). Seed policy: NO rig seed in the image --"
   say "     names hash the JIT sources, and the renamed/translated tree changes them; the image builds its own entries from the list"
 fi
+# FLAT-6: FlashInfer JIT seed (exported in --write; --plan only names it, --plan --host inspects the image)
+SELF_DIR0=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+if [ "$FI_SEED" = 1 ]; then
+  [ -f "$SELF_DIR0/fi_seed_export.sh" ] || blocker "FI seed: $SELF_DIR0/fi_seed_export.sh missing (next to this script) -- or --no-fi-seed"
+  say "   FlashInfer JIT seed (FLAT-6, default ON): $FI_SEED_IMAGE -> assets/fi-seed/ (cache + DEPS.manifest), step 3a restores the seed"
+  say "     mtimes of content-identical deps; seeded modules stay fresh in 3b/6b, differing deps rebuild only their modules"
+  if [ "$HOST" = 1 ]; then
+    SEEDI=$(timeout 30 ssh -o BatchMode=yes -o ConnectTimeout=10 proxmox "docker image inspect --format '{{.Id}} {{range \$k, \$v := .Config.Labels}}{{if eq \$k \"htsglang.flashinfer\" \"io.github.efschu.flliper.flashinfer\"}}{{\$v}}{{end}}{{end}}' '$FI_SEED_IMAGE'" 2>/dev/null)
+    case "$SEEDI" in sha256:*) ok "seed image present: ${SEEDI:7:12} (FlashInfer label ${SEEDI#* })" ;;
+      *) warn "FI seed image $FI_SEED_IMAGE not on the host -- --write would leave the seed empty (full FlashInfer prebuild)" ;; esac
+  fi
+else
+  say "   FlashInfer JIT seed: OFF (--no-fi-seed) -- step 3b builds all $(grep -cv '^#' "$FIM" 2>/dev/null || echo '?') manifest modules, 6b its 13 'fi' lines"
+fi
 if [ -d /root/.triton/cache ]; then
   say "   rig Triton cache: $(ls /root/.triton/cache | wc -l) entries (~6.4 GB). Seed policy: NOT in the image (host_acceptance.sh seed ->"
   say "     \$ACC/triton volume, as today); keys hash the kernel source text, so a renamed-tree seed must come from its first metal boot"
@@ -480,6 +511,8 @@ if [ "$MEMPROF" = nf ]; then
 else
   say "     time: 40-60 min (rc8b 29 min at 16/6 with a warm cache; FI prebuild 14-18 min, step 6b 5-7 min, export+load ~8 min)"
 fi
+[ "$FI_SEED" = 1 ] && say "     FI seed (FLAT-6): with every seeded module fresh, step 3b is a no-op pass (~1-3 min, ~1 GiB per module worker) and the"
+[ "$FI_SEED" = 1 ] && say "       6b 'fi' lines (fp4_gemm_cutlass_sm120 included) are hits -- the FlashInfer peak and its time drop out (ESTIMATE, report flliper-bau-v2-1014)"
 
 # --- 6. The context it would create, the build, tag and labels ------------------------------------------------------
 CTX=$HERE/ctx/flat-${REL}-${SHA10}-${CU}$([ "$MEMPROF" = nf ] && echo -nf)
@@ -492,6 +525,7 @@ say "     lock/requirements.lock (pip freeze of $REF_VENV, without sglang-kernel
 say "     assets/wheels/        <- $(basename "$KW_FILE") (${KW_SHA:0:12})"
 say "     assets/fi-wheels/     <- flashinfer_python 0.7.0 (${FIPY_SHA:0:12}), flashinfer_cubin 0.7.0 (${FICUBIN_SHA:0:12})"
 say "     assets/flashinfer_modules.txt (52), assets/tvm-ffi/ (EMPTY), assets/nvidia-open-595/ (EMPTY, WITH_NV_HEADERS=0)"
+say "     assets/fi-seed/       <- $([ "$FI_SEED" = 1 ] && echo "FlashInfer JIT cache + DEPS.manifest + PROVENANCE.txt of $FI_SEED_IMAGE (FLAT-6)" || echo "EMPTY (--no-fi-seed)")"
 say "     assets/devtools/ (boot_deadman.sh <- ${DM_SRC:-host copy}, host_ledger_preflight.sh mem_timeseries.sh), assets/arb-seed-{27b,nf}/, assets/profiles/{27b,nf}/"
 say "     tools/{entrypoint.sh,healthcheck.sh} <- ${EP_SRC:-host}/${HC_SRC:-host}; tools/{prebuild_jit.py,delta_prebuild.py,delta_postcheck.py} <- host $HERE; tools/profiles/ ($(echo $PROFILES | wc -w) whitelisted)"
 say "     tools/kernels.txt     <- union list above ($N_ALL lines)"
@@ -551,7 +585,7 @@ cleanup(){ if [ "$DONE" != 1 ]; then case "$PART" in "$HERE"/ctx/flat-*.partial)
 trap cleanup EXIT
 fail(){ say "WRITE FAILED: $* -- partial ctx removed, nothing kept"; exit 3; }
 sec "WRITE $OUT"
-mkdir -p "$PART"/{lock,assets/wheels,assets/fi-wheels,assets/devtools,assets/tvm-ffi,assets/nvidia-open-595,assets/profiles/27b,assets/profiles/nf,tools/profiles} \
+mkdir -p "$PART"/{lock,assets/wheels,assets/fi-wheels,assets/fi-seed/flashinfer,assets/devtools,assets/tvm-ffi,assets/nvidia-open-595,assets/profiles/27b,assets/profiles/nf,tools/profiles} \
   "$PART"/assets/arb-seed-27b/weg2/calib "$PART"/assets/arb-seed-nf/weg2/calib || fail "mkdir"
 
 say "1/8 tree ${SHA10}: src-27b/ = shallow fetch since $SINCE, src-nf/ = $([ "$DUO" = 1 ] && echo "own shallow fetch of ${REV_NF:0:10} (DUO)" || echo "copy (ONE tree, both slots)")"
@@ -637,6 +671,42 @@ echo "empty: image built without NV headers (WITH_NV_HEADERS=0, user F6)" > "$PA
 { echo "# barlink lines again, built into the NF slot's TORCH_EXTENSIONS_DIR (Dockerfile.flliper step 6b)"
   printf '%s\n' "$UNION" | grep -E '^barlink ' || true; } > "$PART/tools/kernels-nf.txt"
 say "   kernels.txt $N_ALL lines ($(printf '%s\n' "$UNION" | grep -cE '(^|[[:space:]])MAX_JOBS=' || true) heavy), kernels-nf.txt $(grep -cE '^barlink ' "$PART/tools/kernels-nf.txt" || true) lines"
+# FLAT-6: FlashInfer JIT seed. ONE read-only container of the seed image on the host (no build, no GPU, no network); the tar
+# keeps the cache mtimes (ninja decides freshness by mtime). Failure -> WARN + empty seed (FI_SEED_REQUIRED=1: write failure).
+FS=$PART/assets/fi-seed; FI_SEED_FROM=none; FI_SEED_JSON='{"from": "none"}'
+seed_empty(){ rm -rf "$FS/flashinfer" && mkdir -p "$FS/flashinfer" && echo "empty: no FlashInfer JIT seed ($1) -- step 3b builds every module" > "$FS/flashinfer/.keep"
+  : > "$FS/DEPS.manifest"; echo "seed=none reason=$1" > "$FS/PROVENANCE.txt"; FI_SEED_JSON="{\"from\": \"none\", \"reason\": \"$1\"}"; }
+if [ "$FI_SEED" = 1 ]; then
+  SID=$(timeout 30 ssh -o BatchMode=yes -o ConnectTimeout=10 proxmox "docker image inspect --format '{{.Id}}' '$FI_SEED_IMAGE'" 2>/dev/null)
+  if [ "${SID:0:7}" != sha256: ]; then
+    [ "${FI_SEED_REQUIRED:-0}" = 1 ] && fail "FI seed image $FI_SEED_IMAGE not on the host (FI_SEED_REQUIRED=1)"
+    warn "FI seed image $FI_SEED_IMAGE not on the host -- seed EMPTY, step 3b builds every module"; seed_empty "image missing"
+  elif ! timeout 600 ssh -o BatchMode=yes -o ConnectTimeout=10 proxmox \
+         "docker run -i --rm --network none --memory 1g --memory-swap 1g --cpus 2 --entrypoint /bin/bash '$SID' -s" \
+         < "$SELF_DIR0/fi_seed_export.sh" 2> "$PART/fi-seed-export.err" | tar -xpf - -C "$FS" \
+       || [ ! -s "$FS/DEPS.manifest" ] || ! grep -q '^stale_in_seed=0$' "$FS/PROVENANCE.txt"; then
+    sed 's/^/     /' "$PART/fi-seed-export.err" 2>/dev/null | tail -5
+    [ "${FI_SEED_REQUIRED:-0}" = 1 ] && fail "FI seed export from $FI_SEED_IMAGE failed or the seed is stale in itself (FI_SEED_REQUIRED=1)"
+    warn "FI seed export from $FI_SEED_IMAGE failed or the seed is stale in itself -- seed EMPTY, step 3b builds every module"; seed_empty "export failed"
+  else
+    sed 's/^/     /' "$PART/fi-seed-export.err"
+    FI_SEED_FROM="$FI_SEED_IMAGE@${SID:7:12}"
+    pv(){ sed -n "s/^$1=//p" "$FS/PROVENANCE.txt"; }
+    nmod=$(find "$FS/flashinfer" -name build.ninja | wc -l)
+    # provenance vs this ctx: informative (step 3a checks every dep by CONTENT, which is the authority); a mismatch is named
+    m_lock=$([ "$(pv lock_sha256)" = "$LOCKW" ] && echo true || echo false)
+    m_ovr=$([ "$(pv overrides_sha256)" = "$(sha256sum < "$PART/lock/overrides.txt" | cut -c1-64)" ] && echo true || echo false)
+    m_fim=$([ "$(pv flashinfer_modules_sha256)" = "$(sha256sum < "$PART/assets/flashinfer_modules.txt" | cut -c1-64)" ] && echo true || echo false)
+    m_fi=$(pv flashinfer_python | grep -q "sha256=$FIPY_SHA" && echo true || echo false)
+    for x in "lock:$m_lock" "overrides:$m_ovr" "flashinfer_modules:$m_fim" "flashinfer_wheel:$m_fi"; do
+      [ "${x#*:}" = true ] || warn "FI seed provenance: ${x%%:*} of $FI_SEED_IMAGE differs from this ctx -- modules whose deps differ rebuild in step 3b"; done
+    FI_SEED_JSON="{\"from\": \"$FI_SEED_FROM\", \"modules\": $nmod, \"deps\": $(pv deps), \"stale_in_seed\": $(pv stale_in_seed), \"cache_bytes\": $(pv cache_bytes), \"nvcc\": \"$(pv nvcc)\", \"match\": {\"lock\": $m_lock, \"overrides\": $m_ovr, \"flashinfer_modules\": $m_fim, \"flashinfer_wheel\": $m_fi}}"
+    ok "FI seed $FI_SEED_FROM: $nmod modules, $(pv deps) deps, $(du -sh "$FS/flashinfer" | cut -f1); provenance lock=$m_lock overrides=$m_ovr modules=$m_fim wheel=$m_fi"
+  fi
+  rm -f "$PART/fi-seed-export.err"
+else
+  seed_empty "--no-fi-seed"
+fi
 
 say "5/8 rig tools, ARB seed per slot, profile data"
 for f in host_ledger_preflight.sh mem_timeseries.sh; do cp -p "$ARB/devtools/$f" "$PART/assets/devtools/" || fail "devtools $f"; done
@@ -700,6 +770,8 @@ sed -e "s#^ARG FLLIPER_VERSION=__FLLIPER_VERSION__\$#ARG FLLIPER_VERSION=$REL#" 
     -e "s#^ARG FLLIPER_LOCK_SHA256=__FLLIPER_LOCK_SHA256__\$#ARG FLLIPER_LOCK_SHA256=$LOCKW#" \
     "$DFF" > "$PART/Dockerfile"
 grep -q '__FLLIPER_' "$PART/Dockerfile" && fail "Dockerfile: unbaked __FLLIPER_ point left"
+grep -q '^ARG FI_SEED_FROM=none$' "$PART/Dockerfile" || fail "Dockerfile.flliper has no 'ARG FI_SEED_FROM=none' (FLAT-6 step 3a missing)"
+sed -i -e "s#^ARG FI_SEED_FROM=none\$#ARG FI_SEED_FROM=$FI_SEED_FROM#" "$PART/Dockerfile"
 if [ "$DUO" = 1 ]; then   # item 600: FLAT-2 (REV_27B == REV_NF) is lifted only for a Duo ctx, by this bake
   grep -q '^ARG ALLOW_DUO_TREES=0$' "$PART/Dockerfile" || fail "DUO: Dockerfile.flliper has no 'ARG ALLOW_DUO_TREES=0' (install Dockerfile.flliper.new_600)"
   sed -i -e 's#^ARG ALLOW_DUO_TREES=0$#ARG ALLOW_DUO_TREES=1#' "$PART/Dockerfile"
@@ -733,7 +805,7 @@ DRV=$(awk '/NVRM version/{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+\.[0-9]+\.[0-9]+$/)
 REL_JSON=$(printf '%s\n' "${RELBLOCKERS[@]}")
 PRS=$(for pr in $PROFILES; do printf '%s=%s\n' "$pr" "$(img_status "$pr")"; done)
 KL=$(for l in "${KLISTS[@]}"; do basename "$l"; done)
-FLAT_DUO=$DUO FLAT_REV_NF=$REV_NF FLAT_BRANCH_NF=$BRANCH_NF FLAT_PUSH_NF="${PUSH_STATE_NF:-$PUSH_STATE}" FLAT_LOCK_FOLD=$LOCK_FOLD FLAT_MEMPROF=$MEMPROF FLAT_DM_FROM=$DM_FROM FLAT_DM_MD5=$DM_MD5 FLAT_SF_SRC=$SF_SRC FLAT_TOOLS_FROM="$TOOLS_FROM" python3 - "$PART" "$REL" "$CU" "$REV" "$BRANCH" "$PUSH_STATE" "$SINCE" "$REF_VENV" "$LOCKW" "$KW_SHA" "$(basename "$KW_FILE")" \
+FLAT_DUO=$DUO FLAT_REV_NF=$REV_NF FLAT_BRANCH_NF=$BRANCH_NF FLAT_PUSH_NF="${PUSH_STATE_NF:-$PUSH_STATE}" FLAT_LOCK_FOLD=$LOCK_FOLD FLAT_MEMPROF=$MEMPROF FLAT_DM_FROM=$DM_FROM FLAT_DM_MD5=$DM_MD5 FLAT_SF_SRC=$SF_SRC FLAT_TOOLS_FROM="$TOOLS_FROM" FLAT_FI_SEED="$FI_SEED_JSON" python3 - "$PART" "$REL" "$CU" "$REV" "$BRANCH" "$PUSH_STATE" "$SINCE" "$REF_VENV" "$LOCKW" "$KW_SHA" "$(basename "$KW_FILE")" \
           "$DRV" "$STAGE_B" "$PKG" "$SOURCE" "$PLACEHOLDERS" "$TAG" "$TAG2" "$REL_JSON" "$PRS" "$KL" "$FIM" <<'PYW' || fail "BUILD_INFO"
 import hashlib, json, os, pathlib, re, sys, time, glob, base64
 (out, rel, cu, rev, branch, push, since, venv, lock, kwsha, kwname, drv, stage_b, pkg, source, ph, tag, tag2,
@@ -782,6 +854,7 @@ bi = {"layout": "duo", "build": "flat", "release": rel, "cuda": cu, "created_utc
       "deadman": {"from": os.environ.get("FLAT_DM_FROM"), "md5": os.environ.get("FLAT_DM_MD5"),
                   "state_file": os.environ.get("FLAT_SF_SRC") or None},
       "container_tools": os.environ.get("FLAT_TOOLS_FROM", "").strip(),
+      "fi_seed": json.loads(os.environ.get("FLAT_FI_SEED") or '{"from": "none"}'),
       "release_blockers": [l for l in relb.splitlines() if l]}
 (o / "BUILD_INFO.json").write_text(json.dumps(bi, indent=1))
 PYW
