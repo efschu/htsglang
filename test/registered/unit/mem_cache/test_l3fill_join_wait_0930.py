@@ -156,3 +156,51 @@ def test_no_room_wait_off_the_prefetch_thread():
     with envs.SGLANG_WEG2_L3FILL_ROOM_WAIT_MS.override(1000):
         assert hs.fill_room_wait_ms() == 0
         assert _run_on("hicache-prefetch-io-2", hs.fill_room_wait_ms) == 1000
+
+
+def _setup_inflight(tmp_path):
+    root = tmp_path / "store"
+    root.mkdir()
+    for s in ("p0", "p2"):                          # p1 is NOT on disk ...
+        (root / (s + ".bin")).write_bytes(b"\x33" * TOTAL)
+    arena = ShmArena(str(tmp_path / "kv.bin"), TOTAL, 16)
+    [(slot, status, gen)] = arena.claim_slots(["p1"], [TOTAL])   # ... another writer is putting it into L2
+    assert status == 0
+    return _backend(str(root)), arena, slot, gen
+
+
+def test_a_page_being_written_into_the_arena_is_awaited_not_a_gap(tmp_path):
+    """IN-FLIGHT (NF h8 12:40:58, weg2-18-52): D's flip-time publish was
+    writing the session's pages into the arena when P's early read walked
+    them; not on disk yet -> the walk ended at 47 of 632 pages."""
+    be, arena, slot, gen = _setup_inflight(tmp_path)
+
+    def finish_later():
+        time.sleep(0.05)
+        assert arena.complete_slots([slot], [gen], [(0, TOTAL)]) == [1]
+
+    threading.Thread(target=finish_later).start()
+    with envs.SGLANG_WEG2_L3FILL_JOIN_WAIT_MS.override(300):
+        out = _run_on("hicache-prefetch-io-0", lambda: HiCacheFile.arena_fill_from_disk(
+            be, arena, ["p0", "p1", "p2"], TOTAL, prefix=True))
+    assert out[0] is not None and out[1] == slot and out[2] is not None
+
+
+def test_an_inflight_page_off_the_prefetch_thread_is_still_a_gap(tmp_path):
+    be, arena, slot, gen = _setup_inflight(tmp_path)
+    with envs.SGLANG_WEG2_L3FILL_JOIN_WAIT_MS.override(300):
+        out = HiCacheFile.arena_fill_from_disk(be, arena, ["p0", "p1", "p2"], TOTAL, prefix=True)
+    assert out[0] is not None and out[1] is None and out[2] is None
+
+
+def test_an_inflight_page_that_never_completes_ends_the_prefix_after_the_bound(tmp_path):
+    be, arena, slot, gen = _setup_inflight(tmp_path)
+    with envs.SGLANG_WEG2_L3FILL_JOIN_WAIT_MS.override(80), \
+            envs.SGLANG_WEG2_L3FILL_JOIN_WAIT_PER_PAGE_MS.override(0.0):
+        t0 = time.perf_counter()
+        out = _run_on("hicache-prefetch-io-1", lambda: HiCacheFile.arena_fill_from_disk(
+            be, arena, ["p0", "p1", "p2"], TOTAL, prefix=True))
+        took = time.perf_counter() - t0
+    assert out[0] is not None and out[1] is None and out[2] is None
+    assert 0.07 <= took < 2.0
+    assert arena.claim_info([slot])[0][5] == 1       # the writer's claim untouched
