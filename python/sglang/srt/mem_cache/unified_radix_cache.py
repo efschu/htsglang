@@ -2958,6 +2958,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self._weg2_cap_after_insert()
             self._weg2_handoff_write(req, radix_key)
             self._weg2_mark_park_end(req, radix_key)   # PARK-END-ANCHOR-FIRST (park_running only)
+            self._weg2_stamp_lane(req, radix_key)      # LANE-ANCHOR-RANK (lane >= 1 only)
             self._weg2_publish_at_retain(req, radix_key)
         else:
             self.token_to_kv_pool_allocator.free(kv_indices[req.cache_protected_len :])
@@ -5302,6 +5303,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return
         end = chain[-1]
         end.weg2_park_end = True
+        if self.weg2_lane_rank_on():
+            # LANE-ANCHOR-RANK: the chain claims with the PARKED request's lane
+            # (a lane park holds lanes below the floor), not with the higher
+            # lane of a session that shares its nodes
+            from sglang.srt.weg2 import d_lane as _dl
+
+            _pl = _dl.lane_of_req(req)
+            for n in chain:
+                prev = n.__dict__.get("weg2_park_lane")
+                n.weg2_park_lane = _pl if prev is None else max(int(prev), _pl)
         ends = self.__dict__.get("_weg2_park_end_nodes")
         if ends is None:
             ends = self._weg2_park_end_nodes = []
@@ -5313,6 +5324,39 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             str(getattr(req, "rid", "?"))[:16], getattr(end, "id", "?"),
             self.weg2_node_depth(end), len(chain), len(ends),
         )
+
+    def weg2_lane_rank_on(self) -> bool:
+        return bool(envs.SGLANG_WEG2_LANE_ANCHOR_RANK.get())
+
+    def _weg2_stamp_lane(self, req, radix_key) -> None:
+        """LANE-ANCHOR-RANK: every node of a lane >= 1 request's finished
+        sequence carries the highest lane that finished through it, so a
+        lower lane's park cannot spill it (``_weg2_claim_lane``). Lane 0 (and
+        lanes off) stamps nothing -- the walk is paid only by the lanes it
+        protects. Replicated scheduling: every rank stamps the same nodes."""
+        if not self.weg2_lane_rank_on():
+            return
+        from sglang.srt.weg2 import d_lane as _dl
+
+        lane = _dl.lane_of_req(req)
+        if lane <= 0:
+            return
+        for n in self._weg2_chain_nodes_strict(radix_key):
+            if _mad.lane_of_node(n) < lane:
+                n.weg2_lane = lane
+
+    def _weg2_claim_lane(self, node, park: bool = False):
+        """LANE-ANCHOR-RANK: the lane a mamba-arena claim of ``node`` competes
+        with (``None`` = the rule is off: the pickers keep their old order).
+        A park-chain claim (``park``) competes with the parked request's lane
+        (``weg2_park_lane``); any other with the node's own finished lane."""
+        if not self.weg2_lane_rank_on():
+            return None
+        if park:
+            pl = node.__dict__.get("weg2_park_lane")
+            if pl is not None:
+                return int(pl)
+        return _mad.lane_of_node(node)
 
     def _weg2_chain_nodes_strict(self, radix_key) -> list:
         """``_weg2_chain_nodes`` without the swallow: a lookup that raises
@@ -5388,9 +5432,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                                   include_untagged=True)
         cands = [a for a in cands if a.node is not node]
         victim = _mad.pick_park_victim(cands, chain_ids=self._weg2_park_chain(),
-                                       claimer_is_end=bool(node.weg2_park_end))
+                                       claimer_is_end=bool(node.weg2_park_end),
+                                       claimer_lane=self._weg2_claim_lane(node, park=True))
         if victim is None or not victim.slots:
-            victim = self._weg2_last_resort_victim(node, mp)
+            victim = self._weg2_last_resort_victim(node, mp, park=True)
         depth = _mad.ancestor_path(target=node, root=self.root_node)[1]
         if victim is None or not victim.slots:
             logger.warning("WEG2 PARK-END-ANCHOR-FIRST SPILL node=%s depth=%s end=%s victim=none (no releasable "
@@ -5443,6 +5488,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return False
         tree = _mad.tree_anchors(root=self.root_node, anchor_of=lambda n: self._weg2_anchor_of(n, mp))
         tree = [a for a in tree if a.node is not node]
+        tree = _mad.lane_filter(tree, self._weg2_claim_lane(node))   # LANE-ANCHOR-RANK
         victim = _mad.pick_foreign_victim(tree, rid="")
         if victim is None or not victim.slots:
             victim = self._weg2_last_resort_victim(node, mp)
@@ -5485,7 +5531,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return True, None
         return True, mp.settled_anchor_slots(hv)
 
-    def _weg2_last_resort_victim(self, node, mp):
+    def _weg2_last_resort_victim(self, node, mp, park: bool = False):
         """MAMBA-LAST-RESORT (``SGLANG_WEG2_MAMBA_SPILL_LAST_RESORT``, default
         on since 09.10.): the anchor a full arena's claim may spill when the H19 /
         PARK-END-ANCHOR-FIRST rules found none (NF int22, D TP0 boot
@@ -5504,7 +5550,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             anchor_of=lambda n: self._weg2_anchor_of(n, mp, allow_end=True),
             include_untagged=True)
         cands = [a for a in cands if a.node is not node]
-        return _mad.pick_last_resort_victim(cands, chain_ids=self._weg2_park_chain())
+        return _mad.pick_last_resort_victim(cands, chain_ids=self._weg2_park_chain(),
+                                            claimer_lane=self._weg2_claim_lane(node, park=park))
 
     def _weg2_full_victim(self, node, rid, owned, mp):
         """FULL: the request's own shallowest anchor; a request with none to

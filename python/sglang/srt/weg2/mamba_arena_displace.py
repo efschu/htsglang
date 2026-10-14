@@ -223,22 +223,44 @@ def park_chain_ids(end_nodes: Iterable[object]) -> set:
     return out
 
 
-def pick_park_victim(candidates: Iterable[OwnedAnchor], *, chain_ids: set, claimer_is_end: bool):
+def lane_of_node(node) -> int:
+    """LANE-ANCHOR-RANK: the highest lane that finished through ``node``
+    (``weg2_lane``, stamped at the finish insert); 0 when untagged."""
+    try:
+        return max(0, int(getattr(node, "weg2_lane", 0) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def lane_filter(candidates: Iterable[OwnedAnchor], claimer_lane: Optional[int]) -> list:
+    """LANE-ANCHOR-RANK: the candidates a claimer of ``claimer_lane`` may
+    displace -- never an anchor of a higher lane. ``None`` = no lane rule."""
+    cands = list(candidates)
+    if claimer_lane is None:
+        return cands
+    return [a for a in cands if lane_of_node(a.node) <= int(claimer_lane)]
+
+
+def pick_park_victim(candidates: Iterable[OwnedAnchor], *, chain_ids: set, claimer_is_end: bool,
+                     claimer_lane: Optional[int] = None):
     """The anchor a park-chain claim may spill: a releasable one OFF the park
     chain, shallowest first (node id breaks the tie: the ranks' trees are
     replicas); for the END node of the chain, with none off the chain, the
     shallowest releasable park-chain INTERMEDIATE (never another END node).
     None = nothing may be spilled."""
-    pool = [a for a in candidates if a.slots is not None]
+    pool = [a for a in lane_filter(candidates, claimer_lane) if a.slots is not None]
     off = [a for a in pool if id(a.node) not in chain_ids]
     if not off and claimer_is_end:
         off = [a for a in pool if not getattr(a.node, "weg2_park_end", False)]
     if not off:
         return None
-    return min(off, key=lambda a: (a.depth, getattr(a.node, "id", 0)))
+    if claimer_lane is None:
+        return min(off, key=lambda a: (a.depth, getattr(a.node, "id", 0)))
+    return min(off, key=lambda a: (lane_of_node(a.node), a.depth, getattr(a.node, "id", 0)))
 
 
-def pick_last_resort_victim(candidates: Iterable[OwnedAnchor], *, chain_ids: set):
+def pick_last_resort_victim(candidates: Iterable[OwnedAnchor], *, chain_ids: set,
+                            claimer_lane: Optional[int] = None):
     """MAMBA-LAST-RESORT (``SGLANG_WEG2_MAMBA_SPILL_LAST_RESORT``): the anchor a
     claim may spill when ``pick_foreign_victim`` / ``pick_park_victim`` found
     none -- every other slot of the arena holds a request's END or deepest
@@ -248,7 +270,10 @@ def pick_last_resort_victim(candidates: Iterable[OwnedAnchor], *, chain_ids: set
     that worked. ``candidates`` come from ``tree_anchors`` with the END anchors
     offered (``slots`` None = still pinned: pending write, host lock, direct
     rows). None = nothing may be spilled."""
-    pool = [a for a in candidates if a.slots is not None and id(a.node) not in chain_ids]
+    pool = [a for a in lane_filter(candidates, claimer_lane)
+            if a.slots is not None and id(a.node) not in chain_ids]
     if not pool:
         return None
-    return min(pool, key=lambda a: (a.depth, getattr(a.node, "id", 0)))
+    if claimer_lane is None:
+        return min(pool, key=lambda a: (a.depth, getattr(a.node, "id", 0)))
+    return min(pool, key=lambda a: (lane_of_node(a.node), a.depth, getattr(a.node, "id", 0)))
