@@ -37,6 +37,14 @@ WAKE_4_11 = (76193, 73600, 76192, 12288)
 
 
 @pytest.fixture(autouse=True)
+def _store_held_decide_pinned_off_1014(monkeypatch):
+    """STORE-HELD-DECIDE-1014 (default on) decides a store-held short read at its first re-read without growth.
+    The cases of this file pin the SGLANG_WEG2_STORE_SHORT_MAX_CYCLES bound itself, so they run with the switch
+    off; the new rule is pinned in test_weg2_store_held_decide_1014.py."""
+    monkeypatch.setenv("SGLANG_WEG2_STORE_SHORT_HELD_DECIDE", "0")
+
+
+@pytest.fixture(autouse=True)
 def _nf_profile(monkeypatch):
     monkeypatch.setenv("SGLANG_WEG2_STORE_SHORT_TAIL", "0")
     monkeypatch.delenv("SGLANG_WEG2_STORE_SHORT_MAX_CYCLES", raising=False)

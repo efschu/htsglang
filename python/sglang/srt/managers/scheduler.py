@@ -917,6 +917,25 @@ def _weg2_store_short_tail_x(sched) -> int:
 #: seconds (every rank marks off the group-synced record in the same pass);
 #: not counted while this group sleeps (P can still publish then, xsn344).
 STORE_SHORT_MAX_CYCLES_ENV = "SGLANG_WEG2_STORE_SHORT_MAX_CYCLES"
+#: STORE-HELD-DECIDE-1014 (NF h16 a2cfc77f76, D TP0 15:27:55-15:28:16, weg2-8-68): the
+#: store-short wait exists for a WRITER still filling the store (P's asynchronous
+#: write-through). A read that ended short of what the store ALREADY holds
+#: (``deliverable`` = the store's hit, #248h) and did not grow on its re-read has no
+#: writer to wait for: 64576 of 175872 held, four identical 5.2-s re-reads, 21 s of a
+#: stalled D before the fallback. On (default): one re-read without growth decides.
+#: 0: the bound of SGLANG_WEG2_STORE_SHORT_MAX_CYCLES alone, as before.
+STORE_HELD_DECIDE_ENV = "SGLANG_WEG2_STORE_SHORT_HELD_DECIDE"
+
+
+def _weg2_store_held_short(req) -> bool:
+    """STORE-HELD-DECIDE-1014: the store holds more than this request's read
+    delivered (the shortfall is not a missing write). Group-uniform: both terms
+    are the group-synced END-vote reading the drain wrote (HFB)."""
+    if (os.environ.get(STORE_HELD_DECIDE_ENV, "1") or "1").strip().lower() in ("0", "false", "no", "off"):
+        return False
+    delivered = int(getattr(req, "_weg2_store_delivered", 0) or 0)
+    held = int(getattr(req, "_weg2_store_deliverable", 0) or 0)
+    return held > delivered > 0
 
 
 def _weg2_store_short_max_cycles() -> int:
@@ -1029,8 +1048,11 @@ def _weg2_store_short_fallback(sched, req, reason: str, span, site: str) -> Opti
         return None
     cycles = _weg2_store_short_cycle(sched, req)
     settled = _weg2_settled_this_wake(sched, req)
-    # WT: no writer after this wake's settle -- the first short read decides
-    bound = 0 if settled else _weg2_store_short_max_cycles()
+    held = _weg2_store_held_short(req)
+    # WT: no writer after this wake's settle -- the first short read decides;
+    # STORE-HELD-DECIDE-1014: the store already holds what the read missed --
+    # the first re-read without growth decides
+    bound = 0 if settled else (1 if held else _weg2_store_short_max_cycles())
     if cycles <= bound:
         return None
     x = _weg2_store_short_tail_x(sched)
@@ -1043,7 +1065,8 @@ def _weg2_store_short_fallback(sched, req, reason: str, span, site: str) -> Opti
         # `_weg2_store_short_reroute`.
         return _weg2_store_short_reroute(
             sched, req, span=span, site=site, cause="over_x",
-            detail=f"cycles={cycles} bound={bound}",
+            detail=f"cycles={cycles} bound={bound}"
+            + (f" store_held={int(getattr(req, '_weg2_store_deliverable', 0) or 0)}" if held else ""),
         )
     from sglang.srt.mem_cache.match_refusal_census import (
         note_prefetch_gate as _note_prefetch_gate,
@@ -1055,7 +1078,8 @@ def _weg2_store_short_fallback(sched, req, reason: str, span, site: str) -> Opti
     sched._weg2_store_short_fallbacks = getattr(sched, "_weg2_store_short_fallbacks", 0) + 1
     logger.warning(
         "PREFETCH-DEFER-FALLBACK rid=%s delivered=%d tail=%d X=%d cycles=%d "
-        "bound=%d reason=" + ("settled_no_writer" if settled else "no_writer_progress")
+        "bound=%d reason=" + ("settled_no_writer" if settled
+                              else "store_held_no_growth" if held else "no_writer_progress")
         + " span=%s site=%s n=%d -- the store "
         "read terminated short %d times in a row without delivering more; no "
         "writer is filling the tail, so the matched prefix is taken and D "
