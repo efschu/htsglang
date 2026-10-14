@@ -125,6 +125,7 @@ from sglang.srt.mem_cache.pinned_host_budget import (
     unregister_pinned_post,
 )
 from sglang.srt.weg2 import weight_exchange as wx
+from sglang.srt.weg2.host_pause import PauseAwareDeadline
 from sglang.srt.weg2 import weight_exchange_region as xr
 from sglang.srt.weg2 import weight_exchange_transport as tp
 from sglang.srt.weg2 import xchg_bounce as xb
@@ -3214,9 +3215,10 @@ def run_ring_collect(descs, ops, *, sems, stream, card: int, lane_key: str,
                 dep = first_dep
             else:
                 tw0 = time.perf_counter()
-                deadline = time.monotonic() + float(budget_s)
+                # W68 (NF 14.10. 12:17Z): a host freeze is not the peer's time
+                _dl = PauseAwareDeadline(budget_s, 0.2, what="seq-ring")
                 got = False
-                while time.monotonic() < deadline:
+                while _dl.left() > 0:
                     if sems.diagonal_timedwait(int(card), _SEQ_SLOT, "full", 0.2):
                         got = True
                         break
@@ -4041,9 +4043,11 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
                 label = (f"piece {i} {name!r} tag={tag!r} nbytes={nbytes} "
                          f"window={window_off}")
                 _tw0 = time.perf_counter()
-                deadline = _time.monotonic() + float(budget_s)
+                # W68 (NF 14.10. 12:17Z, "c2/weights_15: budget expired at
+                # unit 0" after a 117-s host freeze): pause time is given back
+                _dl = PauseAwareDeadline(budget_s, 0.2, what="seq-collect")
                 got = False
-                while _time.monotonic() < deadline:
+                while _dl.left() > 0:
                     # weg2xsn91: BLOCK on the semaphore in 0.2 s slices
                     if _is_diagonal:
                         _got = sems.diagonal_timedwait(int(card), _SEQ_SLOT,

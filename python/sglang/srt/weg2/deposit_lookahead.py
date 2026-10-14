@@ -44,6 +44,8 @@ import threading
 import time
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
+from sglang.srt.weg2.host_pause import PauseAwareDeadline
+
 logger = logging.getLogger(__name__)
 
 LINE = "WEG2-H111B"
@@ -119,7 +121,8 @@ class LaneLookahead:
         """Wait until every lane has finished tag ``index``; re-raise the first
         lane refusal of this or an earlier tag. Returns the ms waited."""
         t0 = self._clock()
-        deadline = t0 + self.budget_s
+        # W68 (NF 14.10. 12:17Z): a host freeze is not the lanes' time
+        dl = PauseAwareDeadline(self.budget_s, 1.0, what="h111b-join", clock=self._clock)
         with self._cv:
             while True:
                 failed = self._first_failure(upto=index)
@@ -128,7 +131,7 @@ class LaneLookahead:
                     raise exc
                 if all((lane, index) in self._done for lane in self.lanes):
                     break
-                left = deadline - self._clock()
+                left = dl.left()
                 if left <= 0:
                     missing = [f"p{lane}" for lane in self.lanes if (lane, index) not in self._done]
                     raise LaneLookaheadError(
