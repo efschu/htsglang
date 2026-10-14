@@ -6597,10 +6597,6 @@ def choose(
     # hand-off (charged) and the shmem no class names (printed, ungebucht).
     census: Optional[Dict[str, object]] = None,
     memhist_run_only: bool = False,
-    # VISION-WEIGHTS AP4: host image of the displaced weights (--pdflip-vision-place weights), TRANSIENT (0 at launch
-    # and between images). A NAMED, PRINTED post only (ARM line, PDFLIP-HOST): in NO sum, so it never moves predicted_run_peak_gib, run_leftover,
-    # the chosen arm, W20 or W21 (host-RAM rule 06.10.: warning, never refusal). Last parameter.
-    vision_victim_host_gib: float = 0.0,
     # 13.10.2026 (NF HOSTWARN2, user rule 06.10. "KEINE Verweigerung wegen
     # Host-RAM ... man laesst es darauf ankommen, ob es OOM geht"): an INTERNAL
     # parameter, NOT a user switch -- the launcher and the CLI pass True, a pure
@@ -6609,6 +6605,10 @@ def choose(
     # become ``HOST-RAM-WARN`` lines in the returned ``lines`` and the MOST
     # FRUGAL arm comes back. Not one price changes: the table is the same.
     warn_only: bool = False,
+    # VISION-WEIGHTS AP4: host image of the displaced weights (--pdflip-vision-place weights), TRANSIENT (0 at launch
+    # and between images). A NAMED, PRINTED post only (ARM line, PDFLIP-HOST): in NO sum, so it never moves predicted_run_peak_gib, run_leftover,
+    # the chosen arm, W20 or W21 (host-RAM rule 06.10.: warning, never refusal). Last parameter.
+    vision_victim_host_gib: float = 0.0,
 ) -> Tuple[Arm, Optional[float], List[str]]:
     """Walk the ladder; return (arm, reap headroom GiB, printed lines) or W20/W21.
 
