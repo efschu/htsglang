@@ -905,3 +905,14 @@ class WiringTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# PRIO-AS-AGE 1014 (user decision 14.10.2026, weg2/prio_age.py): SGLANG_WEG2_PRIO_AS_AGE is ON by default and switches the
+# lane FLOOR of 1008 off (priority acts as age).  The tests of this file pin the floor machinery itself, i.e. the mode OFF
+# ("Modus AUS: altes Verhalten"); the new default is pinned in test_weg2_prio_as_age_1014.py.
+import pytest as _pytest_prio_age  # noqa: E402
+
+
+@_pytest_prio_age.fixture(autouse=True)
+def _prio_as_age_off_floor_mode_1014(monkeypatch):
+    monkeypatch.setenv("SGLANG_WEG2_PRIO_AS_AGE", "0")
