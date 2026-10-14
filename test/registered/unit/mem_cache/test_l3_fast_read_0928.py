@@ -260,14 +260,29 @@ class _BusyArena(_Arena):
         return out
 
 
-def test_prefix_fill_frees_claims_past_a_page_it_cannot_have_unread(tmp_path):
+def test_prefix_fill_reads_its_own_claims_past_a_joined_page(tmp_path):
+    # STORE-SHORT (NF h6 11:17:38, weg2-4-17): a page another writer is
+    # filling (JOINED) no longer ends the fill BEFORE this fill read its own
+    # claims -- the peer may be waiting on exactly those (cross claims). The
+    # read's answer still ends at the page it could not have; the pages past
+    # it are COMPLETE in the arena for the next reader, no claim stays open.
     be, stems = _store(tmp_path, 20)
     a = _BusyArena("s00005", n_slots=64)
     out = hs.HiCacheFile.arena_fill_from_disk(be, a, stems, PAGE, prefix=True)
     assert [s is not None for s in out] == [True] * 5 + [False] * 15
+    assert sorted(a.state) == stems[:5] + stems[6:] and not a.claimed
+    assert len(a.free) == 64 - 19
+
+
+def test_prefix_fill_frees_nothing_past_a_page_not_on_disk(tmp_path):
+    # a page that is NOT on disk still ends the walk: nothing past it is claimed
+    be, stems = _store(tmp_path, 20)
+    os.remove(be._existing_path(stems[5]))
+    a = _Arena(n_slots=64)
+    out = hs.HiCacheFile.arena_fill_from_disk(be, a, stems, PAGE, prefix=True)
+    assert [s is not None for s in out] == [True] * 5 + [False] * 15
     assert sorted(a.state) == stems[:5] and not a.claimed
-    assert len(a.free) == 64 - 5                    # the 14 claims past it went back
-    assert not a.buf[5:].any()                      # ... unread (the bytes of the first 5 only)
+    assert not a.buf[5:].any()
 
 
 def test_found_l2_pages_are_referenced_before_the_fill():
