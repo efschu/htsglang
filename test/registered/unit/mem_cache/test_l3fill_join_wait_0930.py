@@ -123,7 +123,7 @@ def test_the_wait_is_priced_on_the_joined_stems():
     with envs.SGLANG_WEG2_L3FILL_JOIN_WAIT_MS.override(300):
         assert _run_on("hicache-prefetch-io-0", lambda: hs.fill_join_wait_ms(1)) == 300
         assert _run_on("hicache-prefetch-io-0", lambda: hs.fill_join_wait_ms(385)) == 770
-        assert _run_on("hicache-prefetch-io-0", lambda: hs.fill_join_wait_ms(5000)) == 3000
+        assert _run_on("hicache-prefetch-io-0", lambda: hs.fill_join_wait_ms(5000)) == 5000  # cap = stale-claim age (14.10.)
     with envs.SGLANG_WEG2_L3FILL_JOIN_WAIT_MS.override(0):
         assert _run_on("hicache-prefetch-io-0", lambda: hs.fill_join_wait_ms(385)) == 0
 

@@ -807,10 +807,12 @@ class Envs:
     # first miss, so one JOINED page cut a 1070-page prefix at 146 (the rest
     # re-prefilled). Only on the prefetch io threads (hicache-prefetch-io-<k>);
     # the scheduler, flip and decode threads never wait. 0 = the pre-0930 form.
-    # 1500 (NF h10 14.10. 13:25:02, weg2-4-82): the floor must cover the WRITER's batch, not our count of
-    # joined stems -- 3 joined stems at the head of a 1024-page fill (l3fill_ms=447) gave bound_ms=300 and cut a
-    # 127k prefix at 19k. The wait ends the moment the writer completes, so a higher floor only costs a stuck one.
-    SGLANG_WEG2_L3FILL_JOIN_WAIT_MS = EnvInt(1500)
+    # 5000 (user 14.10. ~13:40Z: "cache zurueckholen ist 100x effizienter als neu rechnen"; NF h10 13:25:02
+    # weg2-4-82: 3 joined stems at the head of a 1024-page fill gave bound_ms=300 and cut a 127k prefix at 19k,
+    # 108k re-prefilled ~25 s against ~1 s of read). The wait is NOT a budget for a live writer: it ends the moment
+    # the writer completes, and only a writer that stopped is cut -- at the stale-claim age
+    # (L3FILL_STALE_CLAIM_S, 5 s), the one rule for 'this writer is dead'. Floor = cap = that age.
+    SGLANG_WEG2_L3FILL_JOIN_WAIT_MS = EnvInt(5000)
     # STORE-SHORT (NF h6 11:17:38, weg2-4-17): a claimer fills its whole
     # batch and completes it at once -- 385 stems took 460 ms (837 pages/s
     # under the read storm), so a flat 300 ms ended the prefix 160 ms early.
@@ -818,13 +820,13 @@ class Envs:
     # PER_PAGE_MS), at most JOIN_WAIT_MAX_MS. A dead or stalled writer is
     # still cut by L3FILL_STALE_CLAIM_S. PER_PAGE_MS=0 = the flat form.
     SGLANG_WEG2_L3FILL_JOIN_WAIT_PER_PAGE_MS = EnvFloat(2.0)
-    SGLANG_WEG2_L3FILL_JOIN_WAIT_MAX_MS = EnvInt(3000)
+    SGLANG_WEG2_L3FILL_JOIN_WAIT_MAX_MS = EnvInt(5000)
     # ROOM-WAIT (NF h8 12:04:14, weg2-0-10): an L3 -> L2 fill whose stems find
     # the shared arena FULL (every slot referenced by a read or pinned by a
     # running load-back) evicts + claims again every 25 ms for at most this
     # long instead of ending the prefix there. Prefetch io threads only.
     # 0 = the pre-1014 form (the prefix ends at the first FULL stem).
-    SGLANG_WEG2_L3FILL_ROOM_WAIT_MS = EnvInt(1500)
+    SGLANG_WEG2_L3FILL_ROOM_WAIT_MS = EnvInt(5000)  # 14.10.: as the join wait -- reading beats re-prefilling; a stuck arena is cut at the stale age
     # L3FILL_STALE_CLAIM_S (L3FILL-JOINED (3), 30.09.): a claim whose writer is
     # alive but delivered no byte for this long is taken from its key
     # (arena_quarantine_stale, generation-safe: a late completion of the old
