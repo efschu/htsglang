@@ -3543,9 +3543,24 @@ class HiCacheFile(HiCacheStorage):
         # claim/read/complete per page. The claim statuses and what a page
         # yields are exactly the per-page loop's; only the calls are batched.
         t0 = time.perf_counter()
+        _being_written = []
         if prefix:
             _gap = next((i for i, st in enumerate(stems) if st not in on_disk), n)
-            cand = [(i, st) for i, st in enumerate(stems[:_gap])]
+            # IN-FLIGHT (NF h8 12:40:58, P PP0, weg2-18-52, 632 pages in the
+            # store index, 47 read): P's early read during the D->P flip met
+            # pages D's flip-time publish sweep was writing into the arena at
+            # that moment (ARENA-CLAIM-OPEN claimed_by=D2 joined=D0+D1+D2
+            # role=host-write covered=0 age_ms=113) -- not on disk yet, so the
+            # walk ended at the first of them (3008 tokens, 41080 re-prefilled;
+            # D read the same span 21 s later). A page that is not on disk but
+            # CLAIMED in the arena by a live writer is awaited like a JOINED
+            # stem (bounded, prefetch io thread only) instead of ending the walk.
+            if _gap < n and fill_join_wait_ms() > 0:
+                _gap = self._fill_extend_past_inflight(arena, stems, on_disk, _gap, out,
+                                                       _being_written)
+            _bw = set(_being_written)
+            cand = [(i, st) for i, st in enumerate(stems[:_gap])
+                    if i not in _bw and out[i] is None]
         else:
             cand = [(i, st) for i, st in enumerate(stems) if st in on_disk]
         todo = []
@@ -3603,7 +3618,7 @@ class HiCacheFile(HiCacheStorage):
             # claims past it are freed unread
             todo.sort(key=lambda t: t[0])
             _mine = {t[0] for t in todo}
-            _theirs = {int(j[0]) for j in joined} | {int(f[0]) for f in still_full}
+            _theirs = {int(j[0]) for j in joined} | {int(f[0]) for f in still_full} | set(_being_written)
             _hard = next((i for i, _st in cand
                           if out[i] is None and i not in _mine and i not in _theirs), n)
             _past = [t[1] for t in todo if t[0] > _hard]
@@ -3638,11 +3653,16 @@ class HiCacheFile(HiCacheStorage):
             _fresh = _reap_stale_live_joins(arena, stems, joined, int(total_bytes))
             if _fresh:
                 self._arena_fill_read_todo(arena, _fresh, int(total_bytes), out, stats)
+        if _being_written:
+            # IN-FLIGHT: the other writer's pages, awaited after this fill's own
+            _w = _await_fill_joins(arena, stems, [(i, -1, 0) for i in _being_written],
+                                   fill_join_wait_ms(len(_being_written)))
+            for i, s_ in _w.items():
+                out[i] = s_
         if prefix:
-            _stop = next((i for i, _st in cand if out[i] is None), n)
-            for i, _st in cand:
-                if i > _stop:
-                    out[i] = None   # landed past a hole: COMPLETE in the arena, not this read's
+            _stop = next((i for i in range(_gap) if out[i] is None), _gap)
+            for i in range(_stop + 1, n):
+                out[i] = None   # landed past a hole: COMPLETE in the arena, not this read's
         if not stats["todo"]:
             return out
         k = getattr(self, "_1433_n", 0) + 1
@@ -3653,6 +3673,34 @@ class HiCacheFile(HiCacheStorage):
                         "ms=%.0f pages_per_s=%.0f", stats["filled"], stats["todo"], k, stats["threads"], ms,
                         stats["filled"] / max(1e-6, ms / 1000.0))
         return out
+
+    def _fill_extend_past_inflight(self, arena, stems, on_disk, gap: int, out, being_written) -> int:
+        """IN-FLIGHT: walk on past ``gap`` over the stems that are not on disk
+        but CLAIMED in the arena by a live writer (state 1) -- their indices go
+        to ``being_written``; one that turned COMPLETE meanwhile lands in
+        ``out``. Returns the new gap: the first stem that is neither on disk,
+        nor complete, nor being written."""
+        n = len(stems)
+        find = getattr(arena, "find_slots", None)
+        if not callable(find):
+            return gap
+        missing = [i for i in range(gap, n) if stems[i] not in on_disk]
+        try:
+            states = find([stems[i] for i in missing])
+        except Exception:  # noqa: BLE001 - no answer, the old gap
+            return gap
+        state_of = {i: (int(sl), int(stt)) for i, (sl, stt) in zip(missing, states)}
+        for i in range(gap, n):
+            if stems[i] in on_disk:
+                continue
+            slot, state = state_of.get(i, (-1, 0))
+            if slot >= 0 and state == 2:
+                out[i] = slot          # completed by its writer since the caller looked
+            elif slot >= 0 and state == 1:
+                being_written.append(i)
+            else:
+                return i
+        return n
 
     def _await_fill_room(self, arena, still_full, total_bytes: int, out, joined) -> list:
         """ROOM-WAIT: re-evict and re-claim the stems that found the arena FULL
