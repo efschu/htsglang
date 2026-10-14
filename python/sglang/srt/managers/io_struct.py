@@ -1707,6 +1707,17 @@ class Weg2LaneFloorReqOutput(BaseReq, kw_only=True):
     message: str = ""
 
 
+class Weg2LivenessHoldOutput(BaseReq, kw_only=True):
+    """LIVEPARK (14.10.): scheduler -> tokenizer, one-way. The WHOLE set of
+    request ids group D holds on purpose right now (``weg2_d_parked`` +
+    ``weg2_dormant_hold`` + ``weg2_post_wake_settle``: flip park, lane park,
+    RESUME-VIA-P hold, dormant hold, wake read). Sent only when the set
+    changes; replace semantics (``liveness/hold.py``). The LLM-stream liveness
+    watchdog pauses its silence clock for these rids."""
+
+    held: List[str] = []
+
+
 class Weg2ParkWindowReqInput(BaseReq, kw_only=True):
     """PARK-WINDOW-GATE (29.09.): the front's open collect window, ``POST
     /weg2/park_window`` to group D -- ``left_ms`` until the window's deadline
