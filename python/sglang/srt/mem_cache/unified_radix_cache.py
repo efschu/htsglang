@@ -10117,6 +10117,44 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
         return True
 
+    def drain_backup_acks_uncoordinated(self) -> int:
+        """NF-W3-DRAIN 1014 (h16l 75e3ee8abd, boot ..._1014_204509, W3 at
+        20:50:22): drain the STORAGE-BACKUP ACKS of THIS rank, and nothing else,
+        for the #1268 vote of a follower that runs no planned pass.
+
+        WHY IT EXISTS. The storage-write acks (``cc.ack_backup_queue``, the
+        ``hicache_backup(n)`` idle clause) leave ``ongoing_backup`` only in
+        ``_drain_backup``, which the round drain (``check_hicache_events`` ->
+        ``drain_storage_control_queues``) runs -- on a PLANNED pass. Under the
+        row authority a follower's frameless cycle skips the plan. On NF the
+        vote's own write-through drain (``weg2_writethrough_drain_on_idle_vote``)
+        acks the last pass's direct writes, and each ack issues the QSA-index
+        sidecar store write (``#106S SIDECAR-WRITE-ISSUED``, fnFL2x62): three
+        backups on PP1 and PP2 at 20:48:52, acked by the backup thread within
+        milliseconds, drained by nobody -- 90 s of ``hicache_backup(3)``, every
+        /flush_cache refused, W3.
+
+        WHEN IT IS SAFE. Exactly where :meth:`drain_prefetch_revokes_uncoordinated`
+        is: the round drain needs no agreement with a peer
+        (:meth:`_drain_agreement_is_collective` False -- group P, TP 1, PP 3), so
+        this does what the follower's next round would do with the backup ack
+        queue, without waiting for a round that never comes. ``_drain_backup``
+        touches only this rank's own state (H74, #737). Revokes and releases are
+        NOT drained here. Anywhere else (attention group > 1) it does nothing and
+        returns -1 -- the unchanged behaviour. Returns the number of
+        ``ongoing_backup`` entries the drain retired."""
+        if self._drain_agreement_is_collective():
+            return -1
+        before = len(getattr(self, "ongoing_backup", None) or ())
+        self._drain_storage_control_queues_impl(
+            n_revoke=0,
+            n_backup=None,
+            n_release=0,
+            extra_release_counts=None,
+            log_metrics=False,
+        )
+        return before - len(getattr(self, "ongoing_backup", None) or ())
+
     def _drain_storage_control_queues_impl(
         self,
         n_revoke: Optional[int],
