@@ -7085,14 +7085,38 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # None = not that form, False = the residual: the path below unchanged.
         from sglang.srt.weg2 import pp_slot_fidelity as _sf
 
-        # PR (weg2/pp_room_vote.py): under the stages' agreed R_m, at most R_m
-        floor = _sf.agreed_floor(self, floor)
         # LB-VERDICT-1014 (NF h16 17:30:29Z #1004, weg2/pp_loadback_verdict.py): on the carrierless
         # PP form the load-back's pass is PP0's decision, distributed over the request chain --
         # never each stage's own room verdict.
         from sglang.srt.weg2 import pp_loadback_verdict as _lbv
 
         _lbv_rid = getattr(req, "rid", None)
+        if _lbv.row_room_applies(self, req):
+            # NF-968-ROWLB 1014 (h16j 19:43:19Z / 19:49:41Z, PP1 '#968 PREFIX MATERIALISATION
+            # SHORTFALL'): this load-back EXECUTES PP0's row -- PP0 already decided AND loaded it in
+            # the row's pass. No room verdict is taken here: not the agreed R (the cap this stage
+            # holds now rides a LATER list than the row's pass and already carries PP0's own charge
+            # for this very load-back -- it refused 118592 against 34560 while 153216 were free),
+            # not the published floor, never refuse-this-pass. The stage makes its own room for the
+            # decision (upstream HiRadixCache.load_back: evict, then load) or stops by name.
+            _rr_ok, _rr_a0, _rr_ev, _rr_evd, _rr_a1 = _lbv.row_room(self, kv_tokens, _lbv_rid)
+            if not _rr_ok:
+                self.dec_lock_ref(best_match_node, ancestor_lock_params)
+                self.dec_host_lock_ref(best_match_node, host_anchor_params)
+                raise _sf.AgreedRoomShort(
+                    f"{_lbv.MARK} ROW-ROOM SHORT rid={_lbv_rid} kv_tokens={kv_tokens} avail={_rr_a0} "
+                    f"evictable={_rr_ev} evicted={_rr_evd} avail_after={_rr_a1}: this stage executes PP0's "
+                    "row, PP0 has loaded this prefix in the row's pass, and this stage cannot hold it even "
+                    "with every evictable row freed -- refusing would leave it a pass behind PP0 (#968 / "
+                    "#1004); the group stops by name (raenge-nie-uneins)",
+                    rid=_lbv_rid, kv_tokens=kv_tokens, agreed=0, avail=_rr_a0, evictable=_rr_ev,
+                    evicted=_rr_evd, avail_after=_rr_a1,
+                    lb_verdict_short=True,  # never retreated into a void pass (prefill_oom_retreat)
+                )
+            floor = _rr_a1
+        else:
+            # PR (weg2/pp_room_vote.py): under the stages' agreed R_m, at most R_m
+            floor = _sf.agreed_floor(self, floor)
         # NF-RANG-AUDIT 1014: a load-back that EXECUTES PP0's row (Fix B row authority,
         # execute_scheduled_prefix) is not gated -- the row is the verdict (pp_loadback_verdict.gated)
         _lbv_gated = _lbv_rid is not None and _lbv.gated(self, req)

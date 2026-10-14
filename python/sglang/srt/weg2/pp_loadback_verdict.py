@@ -53,6 +53,32 @@ forwarded row therefore passes the gate (``gated`` is False while
 a stage that cannot execute it stops by name in the materialisation station.
 Switch ``SGLANG_WEG2_LBV_ROW_YIELD`` (default on); ``0`` = the gate holds a
 row-executed load-back as before (the split).
+
+THE ROW CARRIES THE ROOM TOO (NF-968-ROWLB 1014). Passing the gate was not
+enough: behind it ``load_back`` still took a room verdict of its own for the
+row it executes. On h16j (73f6a4e110) PP1 died twice at the first/second
+request after the boot (19:43:19Z weg2-0-1, 19:49:41Z weg2-0-2): ``WEG2-LOADBACK-
+EVICT kv_tokens=118592 floor=34560 ... this pass refuses`` while its own pool
+had 153216 free (``#1045 FLOOR PUBLISHED`` the same pass). The 34560 is the
+agreed R (``weg2_pp_room_cap``, ``pp_slot_fidelity.agreed_floor``) this stage
+held at that moment: PP0 stamps R on list m', the follower executes the row of
+PP0's EARLIER pass m (the proxy ring lags the request chain by the pipeline
+depth), and PP0's R_m' is its own room AFTER it loaded this very prefix in pass
+m (``binding_rank=0``). ``local_pp_room`` answered "every stage refuses this
+pass" (``kv_tokens > agreed``) -- PP0 had not refused, it had loaded -- and the
+xsn285 refuse-this-pass returned False; ``#968`` stopped the group (with the
+GDN-anchor text, because the mamba transfer had been BUILT before the refusal).
+
+THE RULE: a load-back that executes PP0's row (``row_room_applies``: armed,
+the yield on, ``ROW_ATTR`` set) takes NO room verdict. PP0 decided it on R_m of
+the row's own pass, which already folded in every follower's fact. The stage
+makes its own room on its live pool -- evict the shortfall, load in this pass,
+exactly upstream ``HiRadixCache.load_back`` (``evict`` then ``load``) -- and
+when even every evictable row does not cover it, the group stops by name
+(``LB-VERDICT ROW-ROOM SHORT``, ``AgreedRoomShort(lb_verdict_short=True)``:
+never retreated into a void pass). No refuse-and-continue, no R from another
+pass. Switch ``SGLANG_WEG2_LBV_ROW_ROOM`` (default on); ``0`` = the room verdict
+of 73f6a4e110 (the death).
 """
 
 from __future__ import annotations
@@ -60,7 +86,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +100,8 @@ ROW_YIELD_ENV = "SGLANG_WEG2_LBV_ROW_YIELD"
 #: request attribute, True only while ``execute_scheduled_prefix`` materialises
 #: a forwarded row (set and cleared by that station, one straight-line stretch).
 ROW_ATTR = "_weg2_lbv_row_executed"
+#: NF-968-ROWLB 1014: a row-executed load-back makes its own room, no room verdict (``row_room``).
+ROW_ROOM_ENV = "SGLANG_WEG2_LBV_ROW_ROOM"
 
 
 @dataclass
@@ -145,6 +173,53 @@ def gated(tree, req) -> bool:
     if row_yield_enabled() and row_executed(req):
         return False
     return True
+
+
+def row_room_enabled() -> bool:
+    return (os.environ.get(ROW_ROOM_ENV, "1") or "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def row_room_applies(tree, req) -> bool:
+    """NF-968-ROWLB 1014: does THIS load-back execute PP0's row on the local-PP floor form, so that it takes no room
+    verdict of its own (``row_room``)? The exact scope in which ``gated`` yields to the row: armed (the floor is this
+    stage's own value, a tp group of one under pp > 1 -- evicting here cannot split a replica group), the yield on,
+    and ``ROW_ATTR`` set by the materialisation station. An own-plan load-back is untouched."""
+    if req is None or getattr(req, "rid", None) is None:
+        return False
+    if not (row_room_enabled() and row_yield_enabled() and row_executed(req)):
+        return False
+    return armed(tree)
+
+
+def row_room(tree, kv_tokens: int, rid=None) -> Tuple[bool, int, int, int, int]:
+    """Make this stage's room for a row-executed load-back on its LIVE pool: evict the shortfall (never more), read the
+    pool again. Returns ``(ok, avail, evictable, evicted, avail_after)``; ``ok`` = ``avail_after >= kv_tokens``. Decides
+    nothing: the caller loads on ``ok`` and stops the group by name otherwise."""
+    from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+
+    kv_tokens = int(kv_tokens)
+    alloc = tree.token_to_kv_pool_allocator
+    avail0 = int(alloc.available_size())
+    evictable = int(tree.evictable_size())
+    evicted = 0
+    short = kv_tokens - avail0
+    if short > 0 and evictable > 0:
+        res = tree.evict(EvictParams(num_tokens=min(short, evictable)))
+        evicted = int(getattr(res, "num_tokens_evicted", 0) or 0)
+    avail1 = int(alloc.available_size())
+    ok = avail1 >= kv_tokens
+    try:
+        n = int(getattr(tree, "_weg2_lbv_row_room_n", 0) or 0) + 1
+        setattr(tree, "_weg2_lbv_row_room_n", n)
+    except Exception:  # noqa: BLE001 -- a slotted double
+        n = 1
+    if not ok or n <= _LOG_FIRST or (n & (n - 1)) == 0:
+        (logger.info if ok else logger.error)(
+            "%s ROW-ROOM rid=%s kv_tokens=%d avail=%d evictable=%d evicted=%d avail_after=%d ok=%s (n=%d): this stage "
+            "executes PP0's row -- no room verdict of its own (no agreed R of another pass, no refuse-this-pass); "
+            "it makes the room on its live pool and loads in this pass, or the group stops by name",
+            MARK, rid, kv_tokens, avail0, evictable, evicted, avail1, ok, n)
+    return ok, avail0, evictable, evicted, avail1
 
 
 def absorb(tree, verdict: Weg2PpLoadbackVerdict) -> None:

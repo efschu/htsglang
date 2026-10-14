@@ -2921,6 +2921,19 @@ def _materialise_scheduled_prefix(
             if applied != deficit and bool(
                 getattr(req, "mamba_loadback_anchor_adopted", False)
             ):
+                if applied == 0:
+                    # NF-968-ROWLB 1014: the mamba component sets the flag when
+                    # it BUILDS its transfer, before load_back's room/threshold
+                    # exits; a load-back that returned nothing planted nothing.
+                    # Stop as before, but name what happened (h16j 19:43:19Z
+                    # read "GDN anchor at a depth" for a room refusal).
+                    raise _die(
+                        loaded_total,
+                        "load-back refused before any transfer ran (applied=0; "
+                        "the GDN anchor flag is set when the transfer is BUILT, "
+                        "nothing was planted) -- this rank did not execute the "
+                        "row's prefix that PP0 holds",
+                    )
                 raise _die(
                     loaded_total + applied,
                     "load-back adopted a GDN anchor at a depth the schedule "
