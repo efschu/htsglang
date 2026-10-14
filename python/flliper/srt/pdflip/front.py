@@ -5198,6 +5198,56 @@ class Front:
         if getattr(self, "_rvp_ended", None) is not None:
             self._rvp_ended.pop(rid, None)
 
+    def _rvp_drop_leg(self, q: "Pending", why: str) -> bool:
+        """LANES RESUMEQ: a RESUME-VIA-P Pending leaves the books (its stream ended, or D continues the stream itself): its
+        LEG1-EARLY, if one is still in flight, is cancelled and the rid is aborted on P by name -- the same as the
+        client-gone / abort paths do for a Pending that leaves the queue (Q-1368).  True = a leg stood on P."""
+        on_p = Front._leg1_early_cancel(self, q, why)
+        if on_p:
+            self.counters["rvp_orphan_early_cancel"] += 1
+            logger.warning("PDFLIP RVP-ORPHAN-LEG rid=%s why=%s -- the early leg 1 of a RESUME-VIA-P Pending that left the books "
+                           "was still on P: cancelled and aborted by rid (left alone it is a ghost in P's waiting queue)",
+                           q.rid, why)
+            try:
+                t = asyncio.ensure_future(self.rpc(self.groups["P"], "/abort_request", {"rid": q.rid}, 30))
+            except RuntimeError:  # no running loop (a sync caller): the quiesce net decides
+                return True
+            tasks = self.__dict__.setdefault("_rvp_orphan_abort_tasks", set())
+            tasks.add(t)
+            t.add_done_callback(tasks.discard)
+        return on_p
+
+    def _rvp_withdraw(self, rid: str, why: str) -> Tuple[bool, int, int]:
+        """LANES RESUMEQ: D continues the stream of ``rid`` itself (it re-queued the lane hold the stream stood in and runs
+        it): the RESUME-VIA-P record ends.  Drops the queued / lane-held P-only legs of the rid (an early leg on P is
+        aborted), and the rid leaves ``_rvp_inflight`` -- ``_flip_ledger`` counts it as D work again.  Returns (was a RESUME-VIA-P
+        rid, P-only legs dropped, early legs aborted on P).  Nothing for a rid without a record."""
+        if getattr(self, "_rvp_dir", None) is None:
+            return False, 0, 0
+        was = rid in self._rvp_inflight
+        legs = early = 0
+        for q in list(self.queue):
+            if getattr(q, "resume_via_p", False) and q.rid == rid:
+                for i, x in enumerate(self.queue):  # BY IDENTITY (Pending.__eq__ compares fields)
+                    if x is q:
+                        del self.queue[i]
+                        break
+                early += 1 if Front._rvp_drop_leg(self, q, why) else 0
+                if not q.fut.done():
+                    q.fut.set_result(None)
+                legs += 1
+        lc = self.__dict__.get("_lane_ctl_obj")
+        for k, h in (list(lc.held.items()) if lc is not None else ()):
+            q = h.p
+            if getattr(q, "resume_via_p", False) and q.rid == rid:
+                lc.held.pop(k, None)
+                early += 1 if Front._rvp_drop_leg(self, q, why) else 0
+                if not q.fut.done():
+                    q.fut.set_result(None)
+                legs += 1
+        self._rvp_inflight.discard(rid)
+        return was, legs, early
+
     def _rvp_stream_end(self, rid: str) -> None:
         """ROS-1P (NF rc12p: pdflip-10-44 ran 3x on P, pdflip-10-42 2x, 44.6 s of P
         for finished streams; WAIT-BOUND named pdflip-10-42 2 min after it was
@@ -5218,9 +5268,26 @@ class Front:
             if getattr(q, "resume_via_p", False) and q.rid == rid:
                 self.queue.remove(q)
                 self._rvp_inflight.discard(rid)
+                if _lanes.enabled():
+                    # LANES RESUMEQ (metal int24f6 13:41:41Z, W3): the Pending's LEG1-EARLY (posted at the D->P flip's begin)
+                    # stood on P; dropping the Pending left it there, a ghost in P's waiting queue that P's lane floor
+                    # skipped and the P->D witness read as "rank not idle"
+                    Front._rvp_drop_leg(self, q, "rvp-stream-end")
                 if not q.fut.done():
                     q.fut.set_result(None)
                 dropped += 1
+        if _lanes.enabled():
+            # a RESUME-VIA-P leg held for a lane (lane_ctl.held) of an ended stream would be put back by the resume
+            lc = self.__dict__.get("_lane_ctl_obj")
+            for k, h in (list(lc.held.items()) if lc is not None else ()):
+                q = h.p
+                if getattr(q, "resume_via_p", False) and q.rid == rid:
+                    lc.held.pop(k, None)
+                    self._rvp_inflight.discard(rid)
+                    Front._rvp_drop_leg(self, q, "rvp-stream-end")
+                    if not q.fut.done():
+                        q.fut.set_result(None)
+                    dropped += 1
         if self._rvp_dir:
             try:
                 os.remove(os.path.join(self._rvp_dir, f"{rid}.json"))
@@ -5495,6 +5562,10 @@ class Front:
             return "already"
         self._park_attempt_epoch = self.epoch
         D = self.groups["D"]
+        if _lanes.enabled():
+            # LANES RESUMEQ: a LANE-RESUME's floor RPC to D is on the wire -- D re-queues its lane holds when it takes the
+            # floor and runs them; the park must see them in the ledger (the book follows D's answer, lane_ctl.d_requeued)
+            await _lctl.settle(self)
         running = self._flip_ledger(D)
         self.admit_d = False
         now = time.time()
@@ -14367,6 +14438,7 @@ class Front:
         polls = 0
         pending_polls = 0
         t_pending = None
+        _lane_net: Dict[str, Any] = {}
         while time.time() - t0 < QUIESCE_DEADLINE_S:
             code, body = await self.rpc(g, "/flush_cache", None, 60)
             polls += 1
@@ -14387,6 +14459,15 @@ class Front:
                         poll_s * 1000.0)
                 return True, body
             last = body
+            if _lanes.enabled():
+                # LANES RESUMEQ: what keeps the group busy after the drain is work the book does not know (a lane hold that
+                # ended on D, ghost legs on P): one park / one abort, not the end of the decode or a W3 (pdflip/lane_ctl.quiesce_net)
+                try:
+                    await _lctl.quiesce_net(self, g, _lane_net)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:  # noqa: BLE001 -- a net never fails the quiesce
+                    logger.warning("PDFLIP LANE quiesce net failed: %r -- the quiesce goes on", e)
             if pending_s is not None and QUIESCE_PENDING_MARK in str(body or ""):
                 # QUIESCE-PENDING: the lap is on the ring -- its landing is read by
                 # the next poll, so that poll goes out at once (#1268 unchanged:
