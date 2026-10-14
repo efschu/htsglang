@@ -807,7 +807,10 @@ class Envs:
     # first miss, so one JOINED page cut a 1070-page prefix at 146 (the rest
     # re-prefilled). Only on the prefetch io threads (hicache-prefetch-io-<k>);
     # the scheduler, flip and decode threads never wait. 0 = the pre-0930 form.
-    SGLANG_WEG2_L3FILL_JOIN_WAIT_MS = EnvInt(300)
+    # 1500 (NF h10 14.10. 13:25:02, weg2-4-82): the floor must cover the WRITER's batch, not our count of
+    # joined stems -- 3 joined stems at the head of a 1024-page fill (l3fill_ms=447) gave bound_ms=300 and cut a
+    # 127k prefix at 19k. The wait ends the moment the writer completes, so a higher floor only costs a stuck one.
+    SGLANG_WEG2_L3FILL_JOIN_WAIT_MS = EnvInt(1500)
     # STORE-SHORT (NF h6 11:17:38, weg2-4-17): a claimer fills its whole
     # batch and completes it at once -- 385 stems took 460 ms (837 pages/s
     # under the read storm), so a flat 300 ms ended the prefix 160 ms early.
