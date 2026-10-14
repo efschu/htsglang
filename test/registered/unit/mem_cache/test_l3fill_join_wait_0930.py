@@ -9,6 +9,7 @@ import os
 import shutil
 import threading
 import time
+import types
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
@@ -22,6 +23,15 @@ from sglang.srt.mem_cache.storage.file.hicache_arena import ShmArena
 pytestmark = pytest.mark.skipif(shutil.which("gcc") is None, reason="needs gcc")
 
 TOTAL = 4096
+
+
+@pytest.fixture(autouse=True)
+def _foreign_writer_is_simulated_in_process():
+    """The 'other writer' of these tests is this very process (its claims
+    carry our pid), so the SELF-JOIN takeover is off unless a test turns it
+    on to test exactly that."""
+    with envs.SGLANG_WEG2_L3FILL_SELF_JOIN_TAKEOVER.override(False):
+        yield
 
 
 def _backend(root):
@@ -346,3 +356,71 @@ def test_room_wait_keeps_going_while_slots_come_and_reads_them_at_once(tmp_path)
             be, arena, ["r0", "r1"], TOTAL, prefix=True))
     th.join(5)
     assert out[0] is not None and out[1] is not None, out
+
+
+# ---- SELF-JOIN / SELF-EVICT (NF h16 a2cfc77f76, P PP1 15:34:27, weg2-10-86) ------
+
+
+def test_a_join_on_this_process_own_claim_is_taken_over_at_once(tmp_path):
+    """PP1 joined 190 claims its own pid held (holders=[1904/1ms/pid778 ...])
+    and waited 5001 ms. A claim this process holds has no other reader to wait
+    for: it is taken over and read now -- no wait, no stale age."""
+    be, arena, slot, gen = _setup(tmp_path)       # p1 claimed by THIS process, never completed
+    with envs.SGLANG_WEG2_L3FILL_JOIN_WAIT_MS.override(5000), \
+            envs.SGLANG_WEG2_L3FILL_JOIN_LIVENESS.override(True), \
+            envs.SGLANG_WEG2_L3FILL_SELF_JOIN_TAKEOVER.override(True):
+        t0 = time.perf_counter()
+        out = _run_on("hicache-prefetch-io-0", lambda: HiCacheFile.arena_fill_from_disk(
+            be, arena, ["p0", "p1", "p2"], TOTAL, prefix=True))
+        took = time.perf_counter() - t0
+    assert all(o is not None for o in out), out
+    assert took < 1.0, took
+
+
+def test_self_join_takeover_off_waits_as_before(tmp_path):
+    be, arena, slot, gen = _setup(tmp_path)
+    with envs.SGLANG_WEG2_L3FILL_JOIN_WAIT_MS.override(80), \
+            envs.SGLANG_WEG2_L3FILL_STALE_CLAIM_S.override(0.0), \
+            envs.SGLANG_WEG2_L3FILL_SELF_JOIN_TAKEOVER.override(False):
+        out = _run_on("hicache-prefetch-io-0", lambda: HiCacheFile.arena_fill_from_disk(
+            be, arena, ["p0", "p1", "p2"], TOTAL, prefix=True))
+    assert out[0] is not None and out[1] is None
+
+
+def test_a_stem_twice_in_one_fill_is_claimed_once_and_never_self_joined(tmp_path):
+    root = tmp_path / "store"
+    root.mkdir()
+    for s_ in ("d0", "d1"):
+        (root / (s_ + ".bin")).write_bytes(b"\x77" * TOTAL)
+    arena = ShmArena(str(tmp_path / "kv.bin"), TOTAL, 8)
+    be = _backend(str(root))
+    with envs.SGLANG_WEG2_L3FILL_JOIN_WAIT_MS.override(5000), \
+            envs.SGLANG_WEG2_L3FILL_SELF_JOIN_TAKEOVER.override(False):
+        t0 = time.perf_counter()
+        out = _run_on("hicache-prefetch-io-0", lambda: HiCacheFile.arena_fill_from_disk(
+            be, arena, ["d0", "d1", "d1"], TOTAL, prefix=True))
+        took = time.perf_counter() - t0
+    assert out[1] is not None and out[2] == out[1] and out[0] is not None
+    assert took < 1.0, "a repeated stem must not wait on its own claim"
+
+
+def test_the_read_being_filled_is_kept_out_of_the_fill_eviction(monkeypatch):
+    seen = {}
+
+    def _cands(arena, want, need, pin_stems):
+        seen["keep"] = list(pin_stems)
+        return []
+
+    monkeypatch.setattr(HiCacheFile, "_arena_evict_candidates", staticmethod(_cands))
+    be = object.__new__(HiCacheFile)
+    be.pins = None
+    op = types.SimpleNamespace(hash_value=["a", "b"], _weg2_protect_stems=["a.s", "b.s"])
+    with envs.SGLANG_WEG2_L3FILL_PROTECT_READ.override(True):
+        with hs.fill_protect_scope(be, op):
+            HiCacheFile._arena_evict_to_disk(be, types.SimpleNamespace(slots=64), 4, need=4)
+        assert hs.fill_protected_stems() == []
+    assert seen["keep"] == ["a.s", "b.s"]
+    with envs.SGLANG_WEG2_L3FILL_PROTECT_READ.override(False):
+        with hs.fill_protect_scope(be, op):
+            HiCacheFile._arena_evict_to_disk(be, types.SimpleNamespace(slots=64), 4, need=4)
+    assert seen["keep"] == []

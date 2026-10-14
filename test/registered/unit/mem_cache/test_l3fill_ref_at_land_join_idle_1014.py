@@ -69,7 +69,10 @@ def _run_on(thread_name, fn):
 def _env(monkeypatch):
     monkeypatch.delenv("SGLANG_WEG2_L3FILL_REF_AT_LAND", raising=False)
     monkeypatch.delenv("SGLANG_WEG2_L3FILL_JOIN_IDLE_MS", raising=False)
-    yield
+    # h18port: the 'holder' of these tests is this very process (its claims carry our pid); with the SELF-JOIN
+    # takeover (e937898ced) on it would be taken over at once -- off, so the holder stands for a FOREIGN rank
+    with envs.SGLANG_WEG2_L3FILL_SELF_JOIN_TAKEOVER.override(False):
+        yield
 
 
 def _evict_all_unreferenced(arena):
@@ -165,3 +168,25 @@ def test_a_claim_nobody_fills_is_broken_after_the_idle_bound_and_read(tmp_path, 
 def test_idle_bound_off_keeps_the_stale_age(tmp_path, monkeypatch):
     monkeypatch.setenv("SGLANG_WEG2_L3FILL_JOIN_IDLE_MS", "0")
     assert hs.join_idle_ms() == 0
+
+
+def test_h16h_weg2_58_558_a_stalled_holder_costs_one_idle_bound_not_the_5s_join_wait(tmp_path, caplog):
+    """h16h 853534a9ff P 19:21:06-11, weg2-58-558: PP2 read its 807 pages in 214 ms (l3fill 140 ms); PP0/PP1
+    joined the same claims and sat out the 5-s bound (``JOIN-WAIT stems=217 completed=105 still_claimed=112
+    waited_ms=5004`` / ``stems=161 completed=0 still_claimed=161 waited_ms=5002``), READ-STAGES l3fill_ms
+    5109/5136. With the metal's JOIN bound (5000 ms): claims nobody moves are broken after the idle bound
+    (1 s) and read by the joiner -- every page lands, well under the 5 s."""
+    stems = tuple("q%d" % i for i in range(16))
+    be, arena = _setup(tmp_path, stems=stems, slots=64)
+    held = arena.claim_slots(list(stems[4:12]), [TOTAL] * 8)    # a foreign holder that never fills
+    assert all(int(st) == 0 for _s, st, _g in held)
+    t0 = time.perf_counter()
+    with envs.SGLANG_WEG2_L3FILL_JOIN_WAIT_MS.override(5000), \
+            envs.SGLANG_WEG2_L3FILL_JOIN_LIVENESS.override(True), caplog.at_level(logging.INFO):
+        out = _run_on("hicache-prefetch-io-0", lambda: HiCacheFile.arena_fill_from_disk(
+            be, arena, list(stems), TOTAL, prefix=True, take_ref=True))
+    took = time.perf_counter() - t0
+    assert all(s is not None for s in out), out
+    assert took < 3.0, f"{took:.2f}s -- the metal sat 5.0 s"
+    line = [r.getMessage() for r in caplog.records if "L3-FILL JOIN-WAIT" in r.getMessage()][-1]
+    assert "idle_bound_ms=1000" in line and "still_claimed=8" in line, line

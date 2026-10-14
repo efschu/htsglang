@@ -185,6 +185,103 @@ _JOIN_WAIT_N = [0, 0, 0]   # waits, stems waited for, stems that completed in th
 
 _ROOM_WAIT_N = [0]
 
+#: SELF-EVICT: the stems of the read this io thread is filling right now
+_FILL_CTX = threading.local()
+
+
+class fill_protect_scope:
+    """SELF-EVICT (NF h16 a2cfc77f76, P PP1 15:34:27, weg2-10-86): while a
+    read's fill runs, its own stems (the whole operation, every batch) are
+    kept out of the fill's room eviction -- evicting page X of a read to load
+    page Y of the same read is circular. ``SGLANG_WEG2_L3FILL_PROTECT_READ=0``:
+    off. Never raises."""
+
+    def __init__(self, backend, operation):
+        self.backend, self.operation = backend, operation
+        self.prev = None
+
+    def __enter__(self):
+        self.prev = getattr(_FILL_CTX, "protect", None)
+        stems = None
+        try:
+            if envs.SGLANG_WEG2_L3FILL_PROTECT_READ.get():
+                op = self.operation
+                stems = getattr(op, "_weg2_protect_stems", None)
+                if stems is None:
+                    from sglang.srt.managers.cache_controller import weg2_suffixed_stems
+
+                    stems = list(weg2_suffixed_stems(self.backend, list(op.hash_value)))
+                    op._weg2_protect_stems = stems
+        except Exception:  # noqa: BLE001 - no protection, the old eviction
+            stems = None
+        _FILL_CTX.protect = stems
+        return self
+
+    def __exit__(self, *exc):
+        _FILL_CTX.protect = self.prev
+        return False
+
+
+def fill_protected_stems() -> list:
+    return list(getattr(_FILL_CTX, "protect", None) or ())
+
+
+_SELF_JOIN_N = [0, 0]
+
+
+def _take_over_self_joins(arena, stems, joined, total_bytes: int):
+    """SELF-JOIN (NF h16 15:34:27, P PP1, weg2-10-86): a JOINED stem whose
+    holder is THIS process (``claim_info`` pid == own pid) has no other reader
+    to wait for -- PP1 sat 5001 ms in a JOIN-WAIT on 190 of its own claims
+    (``holders=[1904/1ms/pid778/l3fill ...]``, pid778 = PP1) and PP0 waited
+    on the same claims. The claim is taken over at once (quarantined at age 0,
+    generation-safe: a late completion of the old claim is refused) and the
+    stem claimed fresh, so this fill reads it NOW. Returns ``(fresh todo
+    entries, the joins that stay)``. ``SGLANG_WEG2_L3FILL_SELF_JOIN_TAKEOVER=0``:
+    off."""
+    if not joined:
+        return [], joined
+    try:
+        if not envs.SGLANG_WEG2_L3FILL_SELF_JOIN_TAKEOVER.get():
+            return [], joined
+    except Exception:  # noqa: BLE001
+        return [], joined
+    info = getattr(arena, "claim_info", None)
+    q = getattr(arena, "quarantine_stale", None)
+    if not callable(info) or not callable(q):
+        return [], joined
+    import os as _os
+
+    me = _os.getpid()
+    try:
+        pids = {int(t[0]): int(t[3]) for t in info([int(s) for _, s, _ in joined if int(s) >= 0])}
+    except Exception:  # noqa: BLE001
+        return [], joined
+    own = [j for j in joined if int(j[1]) >= 0 and pids.get(int(j[1])) == me]
+    if not own:
+        return [], joined
+    st = q([int(s) for _, s, _ in own], [int(g) for _, _, g in own], 0)
+    taken = [own[k] for k, v in enumerate(st) if int(v) == 1]
+    taken_i = {int(j[0]) for j in taken}
+    fresh = []
+    for (i, _s, _g), (slot, status, gen) in zip(
+            taken, _fill_claim(arena, [stems[int(i)] for i, _s, _g in taken], int(total_bytes))):
+        if int(status) == 0:
+            fresh.append((int(i), int(slot), int(gen), stems[int(i)]))
+        elif int(status) == 1:
+            _unclaim_fill_joins(arena, [(int(i), int(slot), int(gen))])
+            taken_i.discard(int(i))   # someone else holds it now: an ordinary join
+    rest = [j for j in joined if int(j[0]) not in {f[0] for f in fresh}]
+    _SELF_JOIN_N[0] += 1
+    _SELF_JOIN_N[1] += len(fresh)
+    k = _SELF_JOIN_N[0]
+    if k <= 16 or (k & (k - 1)) == 0:
+        logger.warning(
+            "L3-FILL SELF-JOIN n=%d own=%d taken=%d reclaimed=%d total=%d pid=%d (this process "
+            "holds the claims it joined: no other reader to wait for -- taken over and read now)",
+            k, len(own), len(taken), len(fresh), _SELF_JOIN_N[1], me)
+    return fresh, rest
+
 
 def fill_room_wait_ms() -> int:
     """ROOM-WAIT: how long a prefetch io thread's fill may wait for arena room
@@ -3734,6 +3831,21 @@ class HiCacheFile(HiCacheStorage):
                     if i not in _bw and out[i] is None]
         else:
             cand = [(i, st) for i, st in enumerate(stems) if st in on_disk]
+        # SELF-JOIN root (NF h16 weg2-10-86): the C claim (arena_claim) answers
+        # JOIN for ANY key already CLAIMED -- its own included -- so a stem
+        # that appears twice in one fill would be claimed fresh once and then
+        # JOINED to itself and waited on. One claim per stem; a repeat takes
+        # the first one's answer.
+        _dups: dict = {}
+        _first: dict = {}
+        _uniq = []
+        for i, st in cand:
+            if st in _first:
+                _dups[i] = _first[st]
+            else:
+                _first[st] = i
+                _uniq.append((i, st))
+        cand = _uniq
         todo = []
         joined = []
         still_full = []
@@ -3783,6 +3895,10 @@ class HiCacheFile(HiCacheStorage):
             # fill writes nothing into it, so its open-writer mark goes at once
             # -- left behind, the slot could never be reaped nor complete
             _unclaim_fill_joins(arena, joined)
+            # SELF-JOIN: claims this process holds are taken over and read now
+            _self_fresh, joined = _take_over_self_joins(arena, stems, joined, int(total_bytes))
+            if _self_fresh:
+                todo.extend(_self_fresh)
         if prefix and todo:
             # (a): the first stem that neither raced in complete, nor got a
             # claim, nor is being filled by another writer ends the prefix --
@@ -3848,6 +3964,8 @@ class HiCacheFile(HiCacheStorage):
                                    fill_join_wait_ms(len(_being_written)))
             for i, s_ in _w.items():
                 out[i] = s_
+        for i, f in _dups.items():
+            out[i] = out[f]
         if prefix:
             _stop = next((i for i in range(_gap) if out[i] is None), _gap)
             for i in range(_stop + 1, n):
@@ -4043,6 +4161,7 @@ class HiCacheFile(HiCacheStorage):
                 keep = list(getattr(pins, "pinned_stems", lambda: [])())
             except Exception:  # noqa: BLE001
                 keep = []
+        keep += fill_protected_stems()   # SELF-EVICT: the read being filled
         cands = self._arena_evict_candidates(arena, int(want), int(need), keep)
         if not cands:
             return 0

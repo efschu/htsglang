@@ -3904,15 +3904,23 @@ class HiCacheController:
         if _need:
             _fill_fn = getattr(self.storage_backend, "arena_fill_from_disk", None)
             if callable(_fill_fn):
-                # REF-AT-LAND-1014: the fill references every page as it lands;
-                # those references are ours (taken below instead of a ref here)
-                try:
-                    _got = _fill_fn(pool.arena, [stems[i] for i in _need], int(pool._page_bytes),
-                                    prefix=True, take_ref=True)
-                    _fills_reffed = bool(getattr(_got, "_arena", None) is not None)
-                except TypeError:   # a backend without the keyword
-                    _got = _fill_fn(pool.arena, [stems[i] for i in _need], int(pool._page_bytes), prefix=True)
-                    _fills_reffed = False
+                # SELF-EVICT (NF h16 15:34:27, P PP1, weg2-10-86; h16h 19:21:06 PP2, weg2-58-558): the fill's
+                # room eviction took this very read's kept pages (#248e ORDERED-EVICT victims=[weg2-10-86 ...
+                # lowest_page=1024]; victims=[weg2-58-555 ... lowest_page=807] = the sibling turn's held pages,
+                # the same stems this read had found in L2 -- every stage's walk then ended at page 807). Every
+                # stem of the operation is protected for the fill (pins + this read).
+                from sglang.srt.mem_cache.hicache_storage import fill_protect_scope
+
+                with fill_protect_scope(self.storage_backend, operation):
+                    # REF-AT-LAND-1014: the fill references every page as it lands;
+                    # those references are ours (taken below instead of a ref here)
+                    try:
+                        _got = _fill_fn(pool.arena, [stems[i] for i in _need], int(pool._page_bytes),
+                                        prefix=True, take_ref=True)
+                        _fills_reffed = bool(getattr(_got, "_arena", None) is not None)
+                    except TypeError:   # a backend without the keyword
+                        _got = _fill_fn(pool.arena, [stems[i] for i in _need], int(pool._page_bytes), prefix=True)
+                        _fills_reffed = False
                 _fills = dict(zip(_need, list(_got)))
         _tf1 = time.perf_counter()
         _rs["l3fill"] = _rs.get("l3fill", 0.0) + (_tf1 - _tf) * 1000.0
