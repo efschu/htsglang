@@ -20,6 +20,15 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 from test_pdflip_arrival_seat_rule_0929 import _front  # noqa: E402
 
+import pytest  # noqa: E402
+
+# RC4 port to the 27B line: the four seat-level tests below set the case up through the X-SUM-PRICE in-flight book
+# (``Front._d_pf_book``, an NF-only feature: 0 hits in the 27B tree). The same behaviour -- DECODE-COLLECT's route=P
+# is final, a fitting set is served by D, SK still keeps a gate-held SHORT -- is pinned on the real handler by the
+# ``test_handler_*`` tests at the end of this file, which run on both lines.
+_needs_price_book = pytest.mark.skipif(not hasattr(F.Front, "_d_pf_book"),
+                                       reason="X-SUM-PRICE in-flight book is NF-only; covered by the test_handler_* tests")
+
 from flliper.srt.managers.scheduler_components import weight_updater as _wu  # noqa: E402,F401
 from flliper.srt.pdflip import front as F  # noqa: E402
 
@@ -42,6 +51,7 @@ def _d_prefilling(tokens):
     return f
 
 
+@_needs_price_book
 def test_a_sum_over_x_tells_the_caller_it_is_the_sum_rules_p(monkeypatch):
     """11724 in flight + 7871 arriving > X=8095: the seat is refused and the refusal is NAMED
     ``collect_p`` -- the caller cannot tell it from a held gate otherwise."""
@@ -53,6 +63,7 @@ def test_a_sum_over_x_tells_the_caller_it_is_the_sum_rules_p(monkeypatch):
     assert refused == ["collect_p"]
 
 
+@_needs_price_book
 def test_a_set_that_fits_is_served_by_d_and_carries_no_marker(monkeypatch):
     """5140 in flight + 800 arriving <= X: D takes it. ``collect_p`` must not degrade to
     always-true (that would send every collected SHORT to P)."""
@@ -64,6 +75,7 @@ def test_a_set_that_fits_is_served_by_d_and_carries_no_marker(monkeypatch):
     assert refused == []
 
 
+@_needs_price_book
 def test_a_later_single_arrival_in_the_released_p_phase_is_named_too(monkeypatch):
     """The 663 case at the seat: the phase's route stays ``P`` after the release, so a later arrival
     priced under X ALONE (800 << 8095) gets the same named refusal -- it is not a D seat's to give."""
@@ -78,6 +90,7 @@ def test_a_later_single_arrival_in_the_released_p_phase_is_named_too(monkeypatch
     assert later == ["collect_p"]
 
 
+@_needs_price_book
 def test_a_phase_that_moved_while_waiting_is_not_the_sum_rules_verdict(monkeypatch):
     """``_decode_collect_short`` also answers "P" when the epoch changed under the waiting SHORT. That
     is the old SK fall-through, not a sum verdict: no ``collect_p`` (the new epoch's state has no route)."""

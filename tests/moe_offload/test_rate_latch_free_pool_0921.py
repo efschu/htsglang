@@ -58,9 +58,5 @@ def test_front_stops_only_on_the_latch_verdict():
     assert fr.latch_line_is_verdict("W98 PdFlipHostRateLatched: cushion=0.14 GiB BELOW", calm) is True
     assert fr.latch_line_is_verdict("anything", types.SimpleNamespace(latched=True)) is True
     src = inspect.getsource(fr.Front)
-    # 12.10.2026 (NF W98 HOST-WARN, user rule 06.10.): the verdict no longer
-    # stops the front either. The loop tells a printed-once NOTE (no marker: info)
-    # from a warning (HOST-RAM-WARN: warning), and nothing in it calls do_stop.
-    assert 'elif _line is not None and host_ledger.HOST_WARN_MARKER not in _line:' in src
-    assert 'self.do_stop("W98 PdFlipHostRateLatched"' not in src
-    assert 'self.do_stop("W98' not in src
+    assert 'elif _line is not None and not latch_line_is_verdict(_line, rate_latch):' in src
+    assert src.index('not latch_line_is_verdict(_line, rate_latch)') < src.index('self.do_stop("W98 PdFlipHostRateLatched", _line)')

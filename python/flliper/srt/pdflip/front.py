@@ -8083,8 +8083,7 @@ class Front:
                         # the episode ended: the warning state re-armed
                         self.counters["host_rate_cleared"] += 1
                         logger.info("%s", _line)
-                    elif (_line is not None and host_ledger.HOST_WARN_MARKER not in _line
-                          and not latch_line_is_verdict(_line, rate_latch)):
+                    elif _line is not None and not latch_line_is_verdict(_line, rate_latch):
                         # fnFL2 v24 (21.09.): the latch also RETURNS its
                         # printed-once notes (CUSHION-BELOW-FLOOR NOT-LATCHED /
                         # FREE-POOL-ABSORBS); the launcher's guard grades the
