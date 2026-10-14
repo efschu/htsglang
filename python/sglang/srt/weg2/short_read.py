@@ -34,9 +34,24 @@ _N = [0]
 PROGRESS_ATTR = "_weg2_short_read_have"
 
 
+#: P-HELD-REREAD-1014: rids whose read ended short of what the store holds
+#: (hit > completed), the span need not be whole -- PP0 re-reads before its told
+_MORE: Dict[str, bool] = {}
+
+
+def store_holds_more(rid: str) -> bool:
+    return bool(_MORE.get(str(rid), False))
+
+
 def note_reap(rid: str, requested_pages: int, hit_pages: int, completed_tokens: int, page_size: int) -> None:
     """At the reap: remember whether a short read's span was held by the store."""
     rid = str(rid)
+    if int(hit_pages) * max(1, int(page_size)) > int(completed_tokens):
+        _MORE[rid] = True
+        while len(_MORE) > KEEP:
+            _MORE.pop(next(iter(_MORE)))
+    else:
+        _MORE.pop(rid, None)
     short = int(completed_tokens) < int(requested_pages) * max(1, int(page_size))
     held = short and int(requested_pages) > 0 and int(hit_pages) >= int(requested_pages)
     if held:
@@ -70,3 +85,4 @@ def note_reissue(req, have: int) -> None:
 
 def forget(rid: str) -> None:
     _HELD.pop(str(rid), None)
+    _MORE.pop(str(rid), None)

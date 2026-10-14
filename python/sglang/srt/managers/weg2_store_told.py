@@ -256,15 +256,17 @@ def _completed_prefix(tree, rid: str) -> int:
 
 
 #: P-HELD-REREAD-1014 (NF h17 38c6d40239, P 15:59:22-25, weg2-1-11, 94454
-#: tokens): PP0's read ended SHORT although the store held the whole span
+#: tokens): PP0's read ended SHORT although the store held the span
 #: (``#1157 PREFETCH REAPED requested_pages=1475 hit_pages=1475
 #: completed=52480 elapsed=2.49s``; ``WEG2-SHORT-READ HELD``). The reap was no
 #: timeout -- the read had finished (``PROBE-HOLD released reason=read-end``);
 #: sibling L3 fills had recycled slots it was filling (``L3-FILL LATE-COMPLETE
 #: REFUSED statuses=[3]``), so its landed prefix stopped at page 822 (PP2 at
 #: 83) while PP1 landed all 1475. PP0 told 52480 at once and P recomputed
-#: 41920 tokens the store held. Now: a terminated read short of a span the
-#: store holds is re-read by PP0 BEFORE the told (the rid stays held), while
+#: 41920 tokens the store held (h18 weg2-0-2: hit 1440 of 1456 pages,
+#: completed 19008, 74212 recomputed; weg2-4-18: completed=0 of 1061 hit=1061).
+#: Now: a terminated read short of what the store holds (hit > completed) is
+#: re-read by PP0 BEFORE the told (the rid stays held), while
 #: each re-read moves PP0's record and at most this many times; then the told
 #: goes out as before. PP0 decides alone (the followers follow the wire), so
 #: no rank can split. 0 = off.
@@ -286,11 +288,12 @@ def _p_held_short_reread(scheduler, tree, req, rid: str) -> bool:
         return False
     from sglang.srt.weg2 import short_read as _sr
 
-    if not _sr._HELD.get(str(rid), False):
+    if not _sr.store_holds_more(rid):
         return False
     have = _completed_prefix(tree, rid)
     n = int(getattr(req, "_weg2_p_held_reread_n", 0) or 0)
-    if n >= cap or not _sr.reread_now(req, have):
+    # each re-read must have moved PP0's record past the previous one
+    if n >= cap or have <= int(getattr(req, _sr.PROGRESS_ATTR, -1)):
         return False
     fn = getattr(scheduler, "_prefetch_kvcache", None)
     if not callable(fn):
