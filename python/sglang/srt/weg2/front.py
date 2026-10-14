@@ -12504,6 +12504,15 @@ class Front:
         payload = dict(p.payload)
         payload.pop("stream", None)
         payload.pop("stream_options", None)
+        # LANES HOTFIX 1014 (NF 09:07Z weg2-145-486): a front-built leg (RESUME-VIA-P /generate, its early leg) carried
+        # no "priority"; P read it as lane 0 below the floor and held the floor lane's own leg (weg2_lane_held) --
+        # every lane hung.  The leg carries the lane the front noted for its rid.
+        try:
+            _lane = int(getattr(p, "lane", 0) or 0) or Front._lane_for(self, p.rid)
+            if _lane > 0 and payload.get(_lanes.FIELD) is None:
+                payload[_lanes.FIELD] = int(_lane)
+        except Exception:  # noqa: BLE001 -- never the leg's fault
+            pass
         if p.path == "/generate":
             sp = dict(payload.get("sampling_params") or {})
             sp["max_new_tokens"] = 1
