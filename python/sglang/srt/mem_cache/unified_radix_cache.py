@@ -7219,6 +7219,65 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 str(getattr(req, "rid", "?")), int(total), int(proven), cut, n)
         return cut
 
+    def weg2_cut_unproven_chain(self, node, page=None) -> dict:
+        """ARENA-CHAIN (NF 14.10. 07:29:33Z, P PP0, ``ArenaChainMismatch`` node=460 page=174 of 848): cut a host
+        chain node whose pages nothing proves out of the HOST tier, so the next match does not meet it again.
+
+        Called by ``weg2/prefill_oom_retreat.retreat_chain_mismatch`` on the rank whose load-back was refused (the
+        pass is voided group-wide there; this rank's tree is the one that holds the unproven rows). Without this the
+        next pass matches the same node, ``verify_load_chain`` refuses it again, and after N voids the request is
+        answered 503 for a page that stays broken. NODE granularity, deliberately: the node and its host-only
+        subtree leave the host (``_ud_clear_host_children`` + ``_evict_host_leaf``, the proven host eviction -- the
+        rows' slot references go back with the release, which balances the references the read took), including the
+        pages of the node that ARE proven; their copies live in the L3 (the next match reads them there, or the
+        tokens are prefilled). All or nothing: a host lock, a device lock, or a child on the device refuses the cut
+        and leaves the tree as it was -- the retreat's N-then-503 verdict then ends it. Returns
+        ``{cut, why, nodes, tokens}``."""
+        res = {"cut": False, "why": "", "nodes": 0, "tokens": 0}
+        try:
+            if node is None or node is self.root_node:
+                res["why"] = "no_node"
+                return res
+            parent = getattr(node, "parent", None)
+            if parent is None or not any(c is node for c in parent.children.values()):
+                res.update(cut=True, why="already_gone")  # a cascade above removed it: nothing left to meet
+                return res
+            if not node.evicted or not node.backuped:
+                res["why"] = "not_host_only"  # a device copy answers the match; the host rows are not what is loaded
+                return res
+            if any(cd.lock_ref > 0 or cd.host_lock_ref > 0 for cd in node.component_data):
+                res["why"] = "node_locked"  # checked BEFORE the subtree goes: all or nothing
+                return res
+            below = 0
+            if node.children:
+                stack = list(node.children.values())
+                while stack:
+                    d = stack.pop()
+                    below += 1
+                    stack.extend(d.children.values())
+                if not self._ud_clear_host_children(node):
+                    res["why"] = "children:%s:%s" % tuple(getattr(self, "_ud_h_refusal", None) or ("?", "?"))
+                    return res
+            if not self._is_host_leaf(node):
+                res["why"] = "not_host_leaf"  # a host lock (a prefetch or a load holds it) keeps it
+                return res
+            tracker = {ct: 0 for ct in self.tree_components}
+            self._evict_host_leaf(node, tracker)
+            res.update(cut=True, nodes=1 + below, tokens=int(tracker.get(BASE_COMPONENT_TYPE, 0)))
+            return res
+        except Exception as exc:  # noqa: BLE001 - a cut that fails leaves the tree; the retreat's verdict decides
+            res["why"] = "raised:%s:%s" % (type(exc).__name__, exc)
+            return res
+        finally:
+            n = getattr(UnifiedRadixCache, "_arena_chain_cut_n", 0) + 1
+            UnifiedRadixCache._arena_chain_cut_n = n
+            if n <= 24 or (n & (n - 1)) == 0:
+                logger.warning(
+                    "#1424 ARENA-CHAIN CUT n=%d node=%s page=%s cut=%s why=%s nodes=%d host_tokens=%d: the host "
+                    "chain node holding a page nothing proves leaves the host tier (its pages are in the L3 or are "
+                    "re-prefilled); the pass was voided group-wide, the request stays queued",
+                    n, getattr(node, "id", "?"), page, res["cut"], res["why"] or "-", res["nodes"], res["tokens"])
+
     def _build_sidecar_transfers(
         self,
         phase: CacheTransferPhase,

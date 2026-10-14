@@ -44485,7 +44485,7 @@
      "source": {
       "file": "mem_cache/pool_host/arena_pool.py",
       "kind": "os.environ",
-      "line": 1057
+      "line": 1095
      }
     }
    },
@@ -64503,6 +64503,38 @@
    "text": "",
    "type": "EnvBool"
   },
+  "SGLANG_WEG2_ARENA_CHAIN_VOID": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "",
+   "id": "SGLANG_WEG2_ARENA_CHAIN_VOID",
+   "kind": "env",
+   "lesestellen": [
+    "weg2/prefill_oom_retreat.py:563",
+    "weg2/prefill_oom_retreat.py:589"
+   ],
+   "level": "experte",
+   "name": "SGLANG_WEG2_ARENA_CHAIN_VOID",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "baum": "nf",
+    "file": "weg2/prefill_oom_retreat.py",
+    "kind": "os.environ",
+    "line": 563
+   },
+   "status": "unerklaert",
+   "text": "",
+   "type": "os.environ"
+  },
   "SGLANG_WEG2_ARENA_FROM_LEDGER": {
    "baeume": [
     "27b",
@@ -64722,6 +64754,37 @@
     "line": 538
    },
    "status": "unerklaert",
+   "text": "",
+   "type": "os.environ"
+  },
+  "SGLANG_WEG2_ARENA_REF_RECHECK": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "--------------------------------------------------------------------------- ARENA-CHAIN (NF 14.10. 07:29:33Z, ArenaChainMismatch #1424 on P PP0): REF, THEN RECHECK --------------------------------------------------------------------------- The L3 fill hands out COMPLETE slots with NO reference (\"no reference taken yet\", ``arena_fill_from_disk``); the reader references them afterwards, and ``arena_ref_slots(+1)`` takes a reference on any COMPLETE *or CLAIMED* slot without looking at its key (arena.c: \"#1427 CLAIMED slots take refs too\"). In the window between the fill and the reference another rank's full-arena claim runs the clock (>= 256 slots per round) and re-claims the freed slots for ITS stems: the reference then succeeds on a slot that belongs to another page, and the node's rows address that slot until ``verify_load_chain`` kills the rank (\"key slot -1 (state 0)\"). The rule of the Linux page cache (mm/filemap.c: speculative ``folio_try_get`` then re-load the index entry, ``folio_put`` and retry on a mismatch) applies verbatim: first reference, then look the key up again, and keep the reference only where the stem still names THIS slot, COMPLETE. After the reference the clock cannot take the slot any more (it skips refcount != 0), so the check is stable.",
+   "id": "SGLANG_WEG2_ARENA_REF_RECHECK",
+   "kind": "env",
+   "lesestellen": [
+    "managers/cache_controller.py:155"
+   ],
+   "level": "experte",
+   "name": "SGLANG_WEG2_ARENA_REF_RECHECK",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "baum": "nf",
+    "file": "managers/cache_controller.py",
+    "kind": "os.environ",
+    "line": 155
+   },
+   "status": "geerntet",
    "text": "",
    "type": "os.environ"
   },
@@ -79370,7 +79433,7 @@
    "id": "SGLANG_WEG2_PP_VOID_PASS_ENABLE",
    "kind": "env",
    "lesestellen": [
-    "weg2/pp_void_pass.py:77"
+    "weg2/pp_void_pass.py:79"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_PP_VOID_PASS_ENABLE",
@@ -79380,7 +79443,7 @@
     "baum": "nf",
     "file": "weg2/pp_void_pass.py",
     "kind": "os.environ",
-    "line": 77
+    "line": 79
    },
    "status": "unerklaert",
    "text": "",
@@ -82712,7 +82775,7 @@
      "source": {
       "file": "managers/scheduler.py",
       "kind": "os.environ",
-      "line": 926
+      "line": 927
      }
     }
    },
@@ -86201,25 +86264,25 @@
    "abweichung": 45,
    "beide": 2461,
    "nur_27b": 180,
-   "nur_nf": 57
+   "nur_nf": 59
   },
-  "entries": 2716,
-  "envs": 1837,
+  "entries": 2718,
+  "envs": 1839,
   "erklaert": 305,
   "flags": 864,
-  "geerntet": 1680,
+  "geerntet": 1681,
   "kuratiert": 124,
-  "unerklaert": 607
+  "unerklaert": 608
  },
- "tree_rev": "27b=02123ee2ef+nf=0ea6d17efd+gcfreeze+laneresumeq+prefilloom+voidpass-1013",
+ "tree_rev": "27b=02123ee2ef+nf=0ea6d17efd+gcfreeze+laneresumeq+prefilloom+voidpass-1013+arenachain-1014",
  "trees": {
   "27b": {
    "entries": 2641,
    "rev": "02123ee2ef"
   },
   "nf": {
-   "entries": 2518,
-   "rev": "0ea6d17efd+gcfreeze+laneresumeq+prefilloom+voidpass-1013"
+   "entries": 2520,
+   "rev": "0ea6d17efd+gcfreeze+laneresumeq+prefilloom+voidpass-1013+arenachain-1014"
   }
  },
  "warnungen": []

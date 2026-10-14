@@ -155,7 +155,44 @@ _CHAIN_REPAIRED_N = [0]
 class ArenaChainMismatch(RuntimeError):
     """#1424: a load-back chain addresses arena rows that neither form whole
     pages nor can be proven against the page keys -- loading them could put
-    another page's KV under these tokens, so the load is refused by name."""
+    another page's KV under these tokens, so the load is refused by name.
+
+    ARENA-CHAIN (NF 14.10. 07:29:33Z, P PP0, node=460 page=174 of 848): the
+    terms ride on the exception so the one seat that can take the pass back
+    (``weg2/prefill_oom_retreat.retreat_chain_mismatch``: group-wide void pass
+    plus cutting the unproven pages out of the tree) decides on numbers, not on
+    text. ``page`` = the first unproven page counted from the chain's first page
+    (``None`` = unknown), ``node`` / ``node_page`` = the chain node that holds it
+    and the page's offset inside that node. The message is the one of before."""
+
+    def __init__(self, message="", *, page=None, node=None, node_page=None):
+        super().__init__(message)
+        self.page = None if page is None else int(page)
+        self.node = node
+        self.node_page = None if node_page is None else int(node_page)
+        # the load-back terms of AgreedRoomShort, so one retreat reads both (no room verdict here: all zero)
+        self.rid = None
+        self.kv_tokens = 0
+        self.agreed = 0
+        self.avail = 0
+        self.evictable = 0
+        self.evicted = 0
+        self.avail_after = 0
+
+
+def _chain_node_of_page(nodes, keys_of, page):
+    """``(node, offset inside the node)`` of chain page ``page`` (counted from the
+    chain's first page); a page past the end names the last node."""
+    if page is None or not nodes:
+        return None, None
+    left = int(page)
+    for n in nodes:
+        k = len(list(keys_of(n) or ()))
+        if left < k:
+            return n, left
+        left -= k
+    last = nodes[-1]
+    return last, max(0, len(list(keys_of(last) or ())) - 1)
 
 
 def _rows_page_clean(P: int, rows: torch.Tensor) -> bool:
@@ -493,7 +530,8 @@ def verify_load_chain(pool, nodes, host_indices, rows_of, stems_of, *, keys_of=N
     plans, stop, _total = _chain_plan(pool, nodes, rows_of, stems_of, keys_of, own_hash,
                                       p_chain, page0, prior0)
     if stop is not None:
-        raise ArenaChainMismatch(stop[1] + " -- the load is refused")
+        _n, _np_ = _chain_node_of_page(nodes, keys_of, stop[0])
+        raise ArenaChainMismatch(stop[1] + " -- the load is refused", page=stop[0], node=_n, node_page=_np_)
     fixed = [w for p in plans for w in p["fixed"]]
     rekeyed = [w for p in plans for w in p["rekeyed"]]
     if not fixed and not rekeyed:
