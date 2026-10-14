@@ -808,6 +808,14 @@ class Envs:
     # re-prefilled). Only on the prefetch io threads (hicache-prefetch-io-<k>);
     # the scheduler, flip and decode threads never wait. 0 = the pre-0930 form.
     SGLANG_WEG2_L3FILL_JOIN_WAIT_MS = EnvInt(300)
+    # STORE-SHORT (NF h6 11:17:38, weg2-4-17): a claimer fills its whole
+    # batch and completes it at once -- 385 stems took 460 ms (837 pages/s
+    # under the read storm), so a flat 300 ms ended the prefix 160 ms early.
+    # The wait is priced on the joined stems: max(JOIN_WAIT_MS, stems x
+    # PER_PAGE_MS), at most JOIN_WAIT_MAX_MS. A dead or stalled writer is
+    # still cut by L3FILL_STALE_CLAIM_S. PER_PAGE_MS=0 = the flat form.
+    SGLANG_WEG2_L3FILL_JOIN_WAIT_PER_PAGE_MS = EnvFloat(2.0)
+    SGLANG_WEG2_L3FILL_JOIN_WAIT_MAX_MS = EnvInt(3000)
     # L3FILL_STALE_CLAIM_S (L3FILL-JOINED (3), 30.09.): a claim whose writer is
     # alive but delivered no byte for this long is taken from its key
     # (arena_quarantine_stale, generation-safe: a late completion of the old
