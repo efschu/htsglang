@@ -3515,7 +3515,8 @@ class HiCacheFile(HiCacheStorage):
             return False
         return False
 
-    def arena_fill_from_disk(self, arena, stems, total_bytes: int, prefix: bool = False):
+    def arena_fill_from_disk(self, arena, stems, total_bytes: int, prefix: bool = False,
+                             room_wait: bool = True):
         """#1433: the L3 -> L2 return path. For every stem that is NOT in the
         arena but IS on disk: claim a slot, read the whole canonical page from
         the disk store straight into the slot, complete it. Returns one entry
@@ -3627,7 +3628,7 @@ class HiCacheFile(HiCacheStorage):
                 todo = [t for t in todo if t[0] < _hard]
         stats = {"filled": 0, "todo": 0, "threads": 0}
         self._arena_fill_read_todo(arena, todo, int(total_bytes), out, stats)
-        if still_full:
+        if still_full and room_wait:
             # ROOM-WAIT (NF h8 2b27c61d48, P PP0 12:04:14, weg2-0-10, 1853
             # pages in the store, 884 read): ten boot-start reads filled the
             # 6485-slot arena (complete 0 -> 6484 in 27 s); the 140 stems of
