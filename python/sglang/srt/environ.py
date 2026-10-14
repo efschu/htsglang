@@ -2495,6 +2495,11 @@ class Envs:
     # lane at or below the claimer's, lowest lane first. Lanes off: every node
     # is lane 0, the order is the old one byte for byte. 0 = off.
     SGLANG_WEG2_LANE_ANCHOR_RANK = EnvBool(True)
+    # e1 ANCHOR-ONLY READ (NF h13 14:35:36, weg2-24-181): the match reached
+    # the KV but no node carried a Mamba state (the anchor sat in L3 only):
+    # the GDN-holding rank reads only that anchor blob and attaches it as the
+    # node's host Mamba value (MAMBA-HOST-RESUME). 0 = off.
+    SGLANG_WEG2_ANCHOR_ONLY_READ = EnvBool(True)
     # Per-request mamba checkpoint diagnostics: log match length, resume
     # length, checkpoint node/slot and cache-insert positions so a
     # nondeterministic resume (or a checkpoint at a wrong position) can be
