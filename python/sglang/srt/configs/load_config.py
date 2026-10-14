@@ -173,8 +173,16 @@ def resolve_draft_load_format(server_args: Any, draft_model_path: Optional[str])
     draft ``ModelConfig.model_path``; an in-checkpoint MTP head resolves to
     the target file and keeps ``gguf``).
 
-    Byte-identical for every target that is not GGUF when the flag is unset:
-    the inherited object itself is returned, not a copy or a normalised form.
+    * NF-GGUF G3: a draft that IS a GGUF file beside a target that is not
+      (the unsloth ``mtp-Qwen3.8-Flash-Next-*.gguf`` head next to an INT4/NVFP4
+      safetensors target) loads ``gguf`` -- the inherited ``auto`` would hand a
+      ``.gguf`` file to ``DefaultModelLoader``, which reads safetensors
+      directories. ``configs/model_config.py`` already BUILDS such a drafter
+      quantized (``quantization = "gguf"``); this is the matching loader half.
+
+    Byte-identical for every target that is not GGUF when the flag is unset and
+    the draft is not a GGUF file: the inherited object itself is returned, not a
+    copy or a normalised form.
     """
     explicit = getattr(server_args, "speculative_draft_load_format", None)
     if explicit is not None:
@@ -182,6 +190,15 @@ def resolve_draft_load_format(server_args: Any, draft_model_path: Optional[str])
     inherited = getattr(server_args, "load_format", LoadFormat.AUTO)
     name = getattr(inherited, "value", inherited)
     if not isinstance(name, str) or name.lower() != LoadFormat.GGUF.value:
+        if (
+            isinstance(name, str)
+            and name.lower() == LoadFormat.AUTO.value
+            and draft_model_path
+        ):
+            from sglang.srt.utils.hf_transformers_utils import check_gguf_file
+
+            if check_gguf_file(draft_model_path):
+                return LoadFormat.GGUF.value
         return inherited
     if not draft_model_path:
         return inherited

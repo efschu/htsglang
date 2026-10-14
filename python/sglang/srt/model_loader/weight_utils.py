@@ -2485,6 +2485,38 @@ def gguf_dense_payload(tensor: torch.Tensor, weight_type) -> torch.Tensor:
     return tensor
 
 
+def gguf_dequantize_payload(payload: torch.Tensor, qtype) -> torch.Tensor:
+    """Dense float tensor (model element shape) from one ``.qweight`` payload.
+
+    Dtype-aware consumer counterpart of ``gguf_dense_payload`` (G14 fix round 1).
+    Since G14 the iterator hands an UNQUANTIZED F16/BF16 ``.qweight`` over as a
+    tensor of VALUES in its own dtype (torch bfloat16 has no ``.numpy()``);
+    before, it was raw uint8 bytes with the last dim doubled. A consumer that
+    dequantizes through numpy unconditionally therefore raises
+    ``TypeError: Got unsupported ScalarType BFloat16`` on a BF16 payload
+    (mtp.fc / eh_proj, embed_tokens / lm_head under SGLANG_GGUF_DENSE_VOCAB=1,
+    DeepSeek-V4 compressor projections). Rule here:
+
+    * unquantized type (F32/F16/BF16): the payload is viewed / passed as the
+      tensor of its own dtype -- no numpy, no conversion (callers ``.to`` the
+      target dtype). Raw uint8 bytes (an older producer) are re-viewed too.
+    * quantized type: the gguf-py numpy reference dequantizer on the block bytes.
+    """
+    import gguf
+    from gguf.quants import dequantize
+
+    gt = gguf.GGMLQuantizationType(int(qtype))
+    if gt in (
+        gguf.GGMLQuantizationType.F32,
+        gguf.GGMLQuantizationType.F16,
+        gguf.GGMLQuantizationType.BF16,
+    ):
+        if payload.dtype == torch.uint8 and gt.name == "F32":
+            return payload.contiguous().view(torch.float32)
+        return gguf_dense_payload(payload, gt)
+    return torch.from_numpy(dequantize(payload.numpy(), gt).copy())
+
+
 def gguf_quant_weights_iterator(
     gguf_file: str, gguf_to_hf_name_map: Dict[str, str]
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
@@ -2603,6 +2635,7 @@ def gguf_quant_weights_iterator(
     # is behind keeps its own pages until it passes them itself.
     dropper = make_stream_page_dropper(shard_paths, readers)
     previous_origin: Optional[Tuple[int, int]] = None
+    dense_valued: List[Tuple[str, str, Tuple[int, ...]]] = []  # G14: F16/BF16 tensors handed over as values
     try:
         for tensor, origin in zip(all_tensors, tensor_origin):
             if previous_origin is not None:
@@ -2668,10 +2701,33 @@ def gguf_quant_weights_iterator(
                     param = torch.tensor(
                         repacked_gguf_bytes(source_type, weight, tensor_name)
                     )
+                    # G14: an UNQUANTIZED F16/BF16 tensor that goes to a
+                    # quantized-resident module is a matrix of VALUES, not
+                    # block bytes. Every consumer of such a ``.qweight``
+                    # (fused_mul_mat_gguf's ``x @ qweight.T``, torch.embedding,
+                    # _cast_dense_qweight, the flat shard container) takes the
+                    # tensor in its own dtype and element shape. gguf-py hands
+                    # F16 back that way, but BF16 as uint8 with the last
+                    # dimension doubled -- [640, 2560] arrived as [640, 5120]
+                    # and died in the first forward through the QSA indexer
+                    # (metal G13 stage A). View it as what it is; a quantized
+                    # type (block bytes) is not touched.
+                    if weight_type.name in ("F16", "BF16"):
+                        param = gguf_dense_payload(param, weight_type)
+                        dense_valued.append((name, weight_type.name, tuple(param.shape)))
                     yield name, param
 
         if previous_origin is not None:
             dropper.consume(*previous_origin)
+        if dense_valued:
+            logger.info(
+                "G14 GGUF-DENSE-PAYLOAD: %d unquantized F16/BF16 tensor(s) handed to quantized-resident modules as values "
+                "in their own dtype, not as raw bytes (first: %s %s %s)",
+                len(dense_valued),
+                dense_valued[0][0],
+                dense_valued[0][1],
+                list(dense_valued[0][2]),
+            )
     finally:
         dropper.close()
 

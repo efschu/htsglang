@@ -479,6 +479,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("ggml_mxfp4_native() -> int");
   m.impl("ggml_mxfp4_native", &ggml_mxfp4_native);
 
+  // GGUF-NF G12: capability probe, op EXISTENCE = the IQ3_S kernels of this build decode with the ggml-format grid. Old wheels
+  // lack the op, so the python dispatch routes IQ3_S through the JIT kernels (grid fixed in G11) on them.
+  m.def("ggml_iq3s_grid_ggml() -> int");
+  m.impl("ggml_iq3s_grid_ggml", &ggml_iq3s_grid_ggml);
+
   /*
    * From csrc/mamba
    */

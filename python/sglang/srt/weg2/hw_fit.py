@@ -171,8 +171,16 @@ def derive_profile(config_path: str, *, profile: str, derived_from: str = "") ->
     from sglang.srt.weg2 import model_profile as M
 
     cfg, _src = M.load_config(config_path)
-    t = M.text_config(cfg)
     w = M.estimate_weights_from_config(cfg)
+    return _fit_profile_from(cfg, w, profile=profile, derived_from=derived_from or config_path)
+
+
+def _fit_profile_from(cfg, w, *, profile: str, derived_from: str) -> FitProfile:
+    """The FitProfile of a config ``cfg`` and a weight table ``w`` (the keys of
+    ``model_profile.estimate_weights_from_config``: formula-derived, or -- G5 -- read off a header)."""
+    from sglang.srt.weg2 import model_profile as M
+
+    t = M.text_config(cfg)
     fams = M.layer_families(t)
     kv_heads = M._int(t.get("num_key_value_heads"), M._int(t.get("num_attention_heads")))
     head_dim = M._int(t.get("head_dim"), M._int(t.get("hidden_size")) // max(1, M._int(t.get("num_attention_heads"))))
@@ -184,7 +192,7 @@ def derive_profile(config_path: str, *, profile: str, derived_from: str = "") ->
     n_exp = max((M._int(t.get(k)) for k in ("num_experts", "num_local_experts", "n_routed_experts", "moe_num_experts")),
                 default=0)
     return FitProfile(
-        profile=profile, weight_format=str(w["format"]), derived_from=derived_from or config_path,
+        profile=profile, weight_format=str(w["format"]), derived_from=derived_from,
         n_layers=len(fams), layer_families=tuple("attn" if f == M.FAM_ATTN else "gdn" for f in fams),
         layer_dense_mib=tuple(round(b / MIB, 4) for b in w["layer_bytes"]),
         layer_expert_mib=tuple(round(b / MIB, 4) for b in w["layer_expert_bytes"]),
@@ -193,6 +201,45 @@ def derive_profile(config_path: str, *, profile: str, derived_from: str = "") ->
         disk_mib=round((w["ple_bytes"] + w["ngram_bytes"]) / MIB, 4), kv_bytes_per_token_per_attn_layer=kv,
         mamba_mib_per_slot_per_linear_layer=round((ms["total"] / MIB) if ms else 0.0, 4),
         extend_rate_mib_per_row=M.extend_rate_mib_per_row(cfg))
+
+
+def derive_profile_from_header(model_path: str, *, profile: str, derived_from: str = "") -> FitProfile:
+    """NF-GGUF G5: the FitProfile of a checkpoint read from its HEADERS, not from the config's formulas.
+
+    A UD GGUF mixes quant types across layers, so ``estimate_weights_from_config`` (one format for the
+    whole model) cannot state its bytes; the header states every tensor's exact size and
+    ``model_profile.estimate`` already puts them per layer (``layer_bytes``, ``layer_expert_bytes``).
+    The geometry (families, KV heads, mamba, experts) comes from the sibling ``config.json`` when one
+    sits next to the file, else from the GGUF keys (``config_from_gguf``). ``model_path`` is a ``.gguf``
+    file (any part of a split set) or a directory."""
+    from sglang.srt.weg2 import model_profile as M
+
+    est = M.estimate(model_path, allow_config_only=False)
+    try:
+        cfg, _src = M.load_config(model_path)
+    except M.ModelProfileError:
+        if not os.path.isfile(model_path):
+            raise
+        td, gkv, _files = M.scan_gguf_set(model_path)
+        cfg, _notes = M.config_from_gguf(gkv, td)
+    ew = est["weights"]
+
+    def _val(key: str, default=0.0):
+        node = ew.get(key)
+        return node["v"] if isinstance(node, dict) and "v" in node else default
+
+    ple = ew.get("ple") or {}
+    ple_layers = (ple.get("per_layer_bytes") or {}).get("v") or []
+    ngram = (ple.get("ngram_table_bytes") or {}).get("v") or 0
+    w = {
+        "format": str(est["format"]["v"]),
+        "layer_bytes": [float(x) for x in _val("layer_bytes", [])],
+        "layer_expert_bytes": [float(x) for x in _val("layer_expert_bytes", [])],
+        "embed_bytes": float(_val("embed_bytes")), "lm_head_bytes": float(_val("lm_head_bytes")),
+        "mtp_bytes": float(_val("mtp_bytes")), "visual_bytes": float(_val("visual_bytes")),
+        "ple_bytes": float(sum(ple_layers)), "ngram_bytes": float(ngram),
+    }
+    return _fit_profile_from(cfg, w, profile=profile, derived_from=derived_from or model_path)
 
 
 def dump_profile(p: FitProfile) -> str:

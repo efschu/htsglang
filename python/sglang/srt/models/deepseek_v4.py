@@ -3590,12 +3590,11 @@ def _gguf_dequantize(
     qweight: torch.Tensor, qweight_type: torch.Tensor, dtype: torch.dtype
 ) -> torch.Tensor:
     """Unpack one GGUF payload into a dense tensor of *dtype*."""
-    import gguf
-    from gguf.quants import dequantize
+    from sglang.srt.model_loader.weight_utils import gguf_dequantize_payload
 
-    qtype = gguf.GGMLQuantizationType(int(qweight_type.item()))
-    dense = torch.from_numpy(dequantize(qweight.numpy(), qtype).copy())
-    return dense.to(dtype)
+    # dtype-aware (G14 fix round 1): an unquantized BF16/F16 payload is a typed
+    # tensor (no numpy for bf16), a quantized one goes through gguf-py.
+    return gguf_dequantize_payload(qweight, int(qweight_type.item())).to(dtype)
 
 
 def _compressor_bucket_complete(bucket: dict) -> bool:

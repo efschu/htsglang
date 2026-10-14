@@ -1,0 +1,15 @@
+{
+ "files": [
+  {
+   "gz": true,
+   "kind": "header",
+   "name": "mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf",
+   "sha256_header": "85b40be410e28e9e07bad48062b9fb8db0e3d837658a4bfd999f7f20e58836a6",
+   "size": 2786568256
+  }
+ ],
+ "name": "MTP",
+ "schema": "planer-oracle-checkpoint-snapshot/1",
+ "skipped_dirs": [],
+ "source": "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-Flash-Next-GGUF-unsloth/MTP (shared-Q8_0 file only)"
+}

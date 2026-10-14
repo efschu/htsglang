@@ -797,6 +797,11 @@ int64_t ggml_mmvq_kq_tuned();
 // DEQUANT_TYPES / MMVQ_QUANT_TYPES / MMQ_QUANT_TYPES.
 int64_t ggml_mxfp4_native();
 
+// GGUF-NF G12: returns 1 on a build whose IQ3_S dequantize / MMVQ / moe_vec kernels decode with the ggml-format grid
+// (iq3s_grid_ggml.cuh: grid value 15 -> 15). Older wheels lack the op entirely and carry the pre-final iq3xs_grid (15 -> 15.5,
+// +3.3 % on about 1/8 of the IQ3_S weights); the python side keeps IQ3_S off the wheel kernels on those.
+int64_t ggml_iq3s_grid_ggml();
+
 /*
  * From csrc/spatial
  */

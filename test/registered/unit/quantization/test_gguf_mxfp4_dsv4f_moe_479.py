@@ -140,6 +140,10 @@ class _KernelSpy:
 def _drive_moe(module, qtype13: int, qtype2: int, num_tokens: int = 1):
     """Run ``fused_moe_gguf`` on a mixed pair and report the kernels it hit."""
     hidden, inter, experts, top_k = 64, 32, 4, 2
+    # G12: the pairs pinned here have an IQ3_S w13 on layer 26 (see the head of this file). These tests describe the dispatch on a wheel whose IQ3_S
+    # kernels are right (marker op ggml_iq3s_grid_ggml present); on a wheel without it IQ3_S never reaches the wheel kernels -- that dispatch is
+    # test_gguf_iq3s_wheel_1012.py. (Other DSv4F note: until the wheel is rebuilt, layer 26's IQ3_S gate/up decode off the wheel moe_vec.)
+    module.IQ3S_WHEEL_GRID_FIXED = True
     x = torch.zeros(num_tokens, hidden, dtype=torch.float16)
     # Shapes only have to be self-consistent: every kernel is a recorder.
     w1 = torch.zeros(experts, 2 * inter, hidden, dtype=torch.uint8)

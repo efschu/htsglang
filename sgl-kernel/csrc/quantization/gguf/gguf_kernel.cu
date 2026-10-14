@@ -10,6 +10,7 @@
 #include "utils.h"
 
 #include "ggml-common.h"
+#include "iq3s_grid_ggml.cuh"  // G12: IQ3_S grid in the ggml format (see the header)
 #include "vecdotq.cuh"
 #include "dequantize.cuh"
 #include "mmvq.cuh"
@@ -117,6 +118,15 @@ int64_t ggml_mmvq_kq_tuned() {
 // side, exactly like ggml_mmvq_kq_tuned: a probe taking no tensor cannot be
 // routed by the dispatcher, but its registration alone identifies the build.
 int64_t ggml_mxfp4_native() {
+  return 1;
+}
+
+// GGUF-NF G12 marker (see sgl_kernel_ops.h): schema-detectable capability probe, detected by op EXISTENCE on the python side
+// exactly like ggml_mxfp4_native. Its registration alone says: THIS build decodes IQ3_S with the ggml-format grid
+// (iq3s_grid_ggml.cuh, grid value 15 -> 15, not 15.5) in ggml_dequantize, the dense MMVQ and the MoE MMVQ (moe_vec). A wheel
+// without the op carries the old iq3xs_grid and decodes every IQ3_S grid value 15 as 15.5 (+3.3 % on ~1/8 of the weights); the
+// python dispatch (srt/layers/quantization/gguf.py) then keeps IQ3_S off the wheel.
+int64_t ggml_iq3s_grid_ggml() {
   return 1;
 }
 

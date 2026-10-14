@@ -38,6 +38,9 @@ _FAMILIES: Tuple[Tuple[str, str, str], ...] = (
     ("qwen35", "sglang.srt.model_loader.gguf_qwen35", "Qwen35GGUFAdapter"),
     ("gemma4", "sglang.srt.model_loader.gguf_gemma4", "Gemma4GGUFAdapter"),
     ("deepseek4", "sglang.srt.model_loader.gguf_deepseek4", "Deepseek4GGUFAdapter"),
+    # Qwen3.8-Flash-Next (GGUF arch qwen4exp; gguf-py 0.19.0 does not know it,
+    # the adapter carries its own name table -- NF-GGUF AP G1)
+    ("qwen4exp", "sglang.srt.model_loader.gguf_qwen4exp", "Qwen4ExpGGUFAdapter"),
 )
 
 # (module_path, attribute) of checkpoints that need the sibling config.json but
@@ -291,10 +294,13 @@ def reconcile_sibling_config(config, gguf_file: str, arch: str) -> None:
     # One pass over the tensor directory: the embedding shape (for the vocab
     # check) and the recurrent-block set (for layer_types) both come from it.
     embd = None
+    ple_table = None
     recurrent = set()
     for tensor in iter_gguf_tensors(shard_paths):
         if tensor.name == "token_embd.weight":
             embd = tensor
+        elif tensor.name == "per_layer_token_embd.weight":
+            ple_table = tensor
         elif "ssm" in tensor.name or "conv1d" in tensor.name:
             idx = _gguf_layer_index(tensor.name)
             if idx is not None:
@@ -320,6 +326,32 @@ def reconcile_sibling_config(config, gguf_file: str, arch: str) -> None:
     if n_blocks is not None:
         n_blocks -= kv("nextn_predict_layers") or 0
     n_config = getattr(text_config, "num_hidden_layers", None)
+
+    if arch == "qwen4exp":
+        # NF-GGUF AP G1: the format's own metadata (experts, hyper connections,
+        # QSA indexer, PLE, GDN dims) against the borrowed sibling config --
+        # the generic checks above only know the attention geometry. Named
+        # (W173 on the launcher side) instead of a late shape error in the
+        # loader.
+        from sglang.srt.model_loader import gguf_qwen4exp
+
+        text_dict = {
+            k: getattr(text_config, k, None) for k in gguf_qwen4exp.META_CONFIG_KEYS
+        }
+        mismatches.extend(
+            gguf_qwen4exp.qwen4exp_meta_mismatches(
+                text_dict,
+                gguf_qwen4exp.read_qwen4exp_kv(gguf_file),
+                n_blocks_backbone=(
+                    None
+                    if kv("block_count") is None
+                    else kv("block_count") - (kv("nextn_predict_layers") or 0)
+                ),
+                ple_table_rows=(
+                    None if ple_table is None else int(ple_table.shape[-1])
+                ),
+            )
+        )
 
     if mismatches:
         raise ValueError(

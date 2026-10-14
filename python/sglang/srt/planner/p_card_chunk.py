@@ -59,6 +59,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import msgspec
 
 from sglang.srt.name_compat import tolerant_compile
+from sglang.srt.planner import expert_layer_rows as _elr
 
 MIB = float(1 << 20)
 GIB_IN_MIB = 1024.0
@@ -1014,7 +1015,7 @@ def row_card_cost_from_boots(
     Schranke. Nie unter dem Zeilenbild ``L x Zeile``.
     """
     n = len(reference.stage_layers)
-    img = [int(reference.stage_layers[s]) * float(row_mib) for s in range(n)]
+    img = [_elr.stage_total(row_mib, reference.stage_layers, s) for s in range(n)]
     ref0: Dict[int, float] = {}
     for _name, text in reference_boots:
         for s, d in headroom_by_chunk_index(text).items():
@@ -1137,7 +1138,12 @@ def p_card_reference_from_logs(
                 t = t_meas[p0.peak_mib]
             else:
                 t, _src = transient_mib(support, s, c)
-            h0 = p0.headroom_mib + rows * int(stage_layers[s]) * float(row_mib) + kv + t
+            # NF-GGUF G5: a per-layer row vector prices the stage's own slice; a scalar keeps
+            # the exact pre-G5 product (rows x layers x row, same float order)
+            _img = (rows * _elr.stage_total(row_mib, stage_layers, s)
+                    if _elr.is_layer_vector(row_mib)
+                    else rows * int(stage_layers[s]) * float(row_mib))
+            h0 = p0.headroom_mib + _img + kv + t
             co = co_tenant_at(dl[name], s, p0.t) if with_co else None
             if with_co and co is None:
                 raise ValueError(
@@ -1478,7 +1484,7 @@ def solve_p_card(
     last_idx = n_chunks - 1
     out: List[PCardFit] = []
     for s in range(n):
-        layer_mib = int(stage_layers[s]) * float(row_mib)
+        layer_mib = _elr.stage_total(row_mib, stage_layers, s)
         rows = _er.buffer_rows(
             local_experts=int(num_experts),
             fraction=float(fractions[s]),

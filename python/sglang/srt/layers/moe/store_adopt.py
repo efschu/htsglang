@@ -165,12 +165,21 @@ def _compute(layer) -> FrozenSet[int]:
     from sglang.srt.layers.moe import expert_map as _em
     from sglang.srt.layers.moe import expert_store as _es
     from sglang.srt.layers.moe.cold_tier_fetch import layer_key_for
-    from sglang.srt.layers.moe.expert_offload import _layer_expert_window
+    from sglang.srt.layers.moe.expert_offload import (
+        _gguf_trailing_pad_window,
+        _layer_expert_window_ex,
+    )
 
     karte = _es.expert_map()
-    fenster = _layer_expert_window(layer)
+    fenster = _layer_expert_window_ex(layer)
     layer_id = getattr(layer, "layer_id", None)
     E = int(getattr(layer, "num_local_experts", 0) or 0)
+    gguf_win = _gguf_trailing_pad_window(layer)
+    if gguf_win is not None:
+        # G4: GGUF's own shard. Its tensors are not materialized when the
+        # adoption is armed, and ``num_local_experts`` is the GLOBAL count: the
+        # local space is the owned range plus the trailing pad.
+        E = int(gguf_win[1]) - int(gguf_win[0]) + 1
     if fenster is None or layer_id is None or E <= 0:
         return frozenset()
     lo, pad = fenster
@@ -179,7 +188,7 @@ def _compute(layer) -> FrozenSet[int]:
     if lay is None:
         return frozenset()
     resident = {int(g) for g in lay[2]}
-    attrs = expert_attrs(layer)
+    attrs = GGUF_EXPERT_ATTRS if gguf_win is not None else expert_attrs(layer)
     if not attrs:
         return frozenset()
     snap = snapshot_rows(_es.store_dir())
@@ -202,6 +211,14 @@ def _compute(layer) -> FrozenSet[int]:
 
 
 ADOPT_OK_ATTR = "_moe_store_adopt_ok"
+
+#: G4: the expert-major tensors a GGUF MoE layer presplits (the store's attributes), by name -- the parameters
+#: are still uninitialized when the adoption is armed. Same two names ``FusedMoE._finish_gguf_moe_offload_staging``
+#: demands, and both are in ``MoEExpertOffloadCache.EXPERT_TENSOR_ATTRS``.
+GGUF_EXPERT_ATTRS = ("w13_qweight", "w2_qweight")
+# G4 NOTE: the GGUF branches of ``_compute`` / ``repack_rows`` and the adoption in ``gguf_presplit`` are NOT armed on
+# a real boot: only ``discount_expected`` sets ``ADOPT_OK_ATTR`` and only the compressed-tensors scheme calls it. A
+# GGUF layer therefore never vetoes. Arming it needs the expected-count discount (``gguf_presplit`` module docstring).
 
 
 def discount_expected(layer, expected: Dict[str, int], owned: int) -> Dict[str, int]:
@@ -249,15 +266,22 @@ def repack_rows(layer, num_experts: int):
     vg = getattr(layer, "_moe_store_adopt_vetoed_global", None)
     if not vg:
         return None
-    from sglang.srt.layers.moe.expert_offload import _layer_expert_window
+    from sglang.srt.layers.moe.expert_offload import (
+        PAD_LEAD,
+        _layer_expert_window_ex,
+        _pad_local_index,
+    )
 
-    fenster = _layer_expert_window(layer)
+    fenster = _layer_expert_window_ex(layer)
     if fenster is None:
         return None
     lo, pad = fenster
-    first = 1 if pad else 0
+    # the pad row is kept wherever it sits: row 0 for the generic shard (as
+    # before), the LAST row for GGUF's own shard (G4)
+    pad_row = _pad_local_index(pad, int(num_experts))
+    first = 1 if pad == PAD_LEAD else 0
     keep = [e for e in range(int(num_experts))
-            if e < first or (int(lo) + e - first) not in vg]
+            if e == pad_row or (int(lo) + e - first) not in vg]
     if len(keep) == int(num_experts):
         return None
     return keep

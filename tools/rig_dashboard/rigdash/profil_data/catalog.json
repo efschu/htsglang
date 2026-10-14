@@ -6512,7 +6512,7 @@
      "source": {
       "file": "weg2/launcher.py",
       "kind": "argparse",
-      "line": 22286
+      "line": 22435
      }
     }
    },
@@ -7081,7 +7081,7 @@
      "source": {
       "file": "weg2/launcher.py",
       "kind": "argparse",
-      "line": 22290
+      "line": 22439
      }
     }
    },
@@ -11291,7 +11291,7 @@
      "source": {
       "file": "weg2/launcher.py",
       "kind": "argparse",
-      "line": 22342
+      "line": 22491
      }
     }
    },
@@ -14850,7 +14850,49 @@
    "choices": null,
    "cost": "",
    "default": "auto",
-   "depends": [],
+   "depends": [
+    {
+     "beleg": {
+      "anker": "f\"W163 Weg2TokenizerRefused: {model} is a {arch} GGUF, whose tokenizer \"",
+      "aufloesung": "eindeutig",
+      "datei": "python/sglang/srt/weg2/launcher.py",
+      "zeile": 14028,
+      "zeile_hinweis": 14280
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "A GGUF checkpoint of an architecture the server reads from sibling files (qwen4exp, qwen35, gemma4, deepseek4) has its tokenizer ONLY there: without tokenizer files next to the .gguf the start is refused (W163) -- pass --tokenizer-path <dir with this model's tokenizer>. The format is read from the .gguf --model file when --load-format is auto.",
+     "kante": "K138",
+     "quelle": "katalog",
+     "rel": "braucht",
+     "satz": "A GGUF checkpoint of an architecture the server reads from sibling files (qwen4exp, qwen35, gemma4, deepseek4) has its tokenizer ONLY there: without tokenizer files next to the .gguf the start is refused (W163) -- pass --tokenizer-path <dir with this model's tokenizer>. The format is read from the .gguf --model file when --load-format is auto.",
+     "to": "--tokenizer-path",
+     "to_kind": "flag",
+     "wert": "gguf"
+    },
+    {
+     "baeume": [
+      "nf"
+     ],
+     "beleg": {
+      "anker": "SCHALTER-HALBPORT 1002: an UNSET ``--weg2-vision`` takes the registry",
+      "aufloesung": "andere_linie",
+      "datei": "python/sglang/srt/weg2/launcher.py",
+      "zeile": 14687,
+      "zeile_hinweis": 14687
+     },
+     "belegt": true,
+     "calc": "text",
+     "effect": "A GGUF export without an mmproj file (the unsloth Qwen3.8-Flash-Next export has none) has no vision tower to load: it needs --weg2-vision off. An UNSET --weg2-vision takes the registry row's value (nextflash: transient), so the profile has to state off.",
+     "kante": "K139",
+     "quelle": "katalog",
+     "rel": "braucht",
+     "satz": "A GGUF export without an mmproj file (the unsloth Qwen3.8-Flash-Next export has none) has no vision tower to load: it needs --weg2-vision off. An UNSET --weg2-vision takes the registry row's value (nextflash: transient), so the profile has to state off.",
+     "to": "--weg2-vision",
+     "to_kind": "flag",
+     "wert": "gguf"
+    }
+   ],
    "gain": "",
    "group": "",
    "help": "The format of the model weights to load. \"auto\" will try to load the weights in the safetensors format and fall back to the pytorch bin format if safetensors format is not available. \"pt\" will load the weights in the pytorch bin format. \"safetensors\" will load the weights in the safetensors format. \"npcache\" will load the weights in pytorch format and store a numpy cache to speed up the loading. \"dummy\" will initialize the weights with random values, which is mainly for profiling.\"gguf\" will load the weights in the gguf format. \"bitsandbytes\" will load the weights using bitsandbytes quantization.\"layered\" loads weights layer by layer so that one can quantize a layer before loading another to make the peak memory envelope smaller.",
@@ -18180,7 +18222,7 @@
     "baum": "nf",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 22899
+    "line": 23048
    },
    "status": "geerntet",
    "text": "",
@@ -18236,7 +18278,7 @@
      "source": {
       "file": "weg2/launcher.py",
       "kind": "argparse",
-      "line": 23784
+      "line": 23933
      }
     }
    },
@@ -18940,7 +18982,7 @@
      "source": {
       "file": "weg2/launcher.py",
       "kind": "argparse",
-      "line": 23056
+      "line": 23205
      }
     }
    },
@@ -26938,7 +26980,7 @@
      "source": {
       "file": "weg2/launcher.py",
       "kind": "argparse",
-      "line": 23431
+      "line": 23580
      }
     }
    },
@@ -27191,7 +27233,7 @@
     "baum": "nf",
     "file": "weg2/launcher.py",
     "kind": "argparse",
-    "line": 23601
+    "line": 23750
    },
    "status": "kuratiert",
    "text": "Names the census row from which a card is priced that is not in the census file by UUID: list <live>=<census UUID>, <live> = card UUID, nvml<N> or class (RTX3080). Without an entry the start borrows the heaviest row of the same class (otherwise of the whole census) and refuses that as HW-BORROWED until force is set.",
@@ -28329,7 +28371,7 @@
      "source": {
       "file": "weg2/launcher.py",
       "kind": "argparse",
-      "line": 22487
+      "line": 22636
      }
     }
    },
@@ -86143,8 +86185,8 @@
   "beleg_aufloesung": {
    "problem": [],
    "status": {
-    "andere_linie": 5,
-    "eindeutig": 120,
+    "andere_linie": 6,
+    "eindeutig": 121,
     "nah": 12
    }
   },
@@ -86152,8 +86194,8 @@
    "27b": {
     "problem": [],
     "status": {
-     "andere_linie": 5,
-     "eindeutig": 120,
+     "andere_linie": 6,
+     "eindeutig": 121,
      "nah": 12
     }
    },
@@ -86161,7 +86203,7 @@
     "problem": [],
     "status": {
      "andere_linie": 44,
-     "eindeutig": 83,
+     "eindeutig": 85,
      "nah": 10
     }
    }
@@ -86169,10 +86211,10 @@
   "datei": "kantenkatalog_1004.json",
   "geladen": true,
   "grund": "",
-  "kanten_belegt": 137,
-  "kanten_gesamt": 137,
+  "kanten_belegt": 139,
+  "kanten_gesamt": 139,
   "kanten_ohne_beleg": 25,
-  "neu": 86,
+  "neu": 88,
   "rel_abweichend": [
    "K12",
    "K19",
@@ -86183,7 +86225,7 @@
   "uebersprungen_ohne_von": [],
   "verschmolzen": 51,
   "verworfen": 0,
-  "wertbedingt": 22,
+  "wertbedingt": 24,
   "ziel_unbekannt": 0
  },
  "launcher_raise_sites": 97,
@@ -86211,7 +86253,7 @@
   "kuratiert": 124,
   "unerklaert": 607
  },
- "tree_rev": "27b=02123ee2ef+nf=0ea6d17efd+gcfreeze+laneresumeq+prefilloom+voidpass-1013",
+ "tree_rev": "27b=02123ee2ef+nf=f4afb10f28+nf-gguf-1018-12b375f3dc-1014",
  "trees": {
   "27b": {
    "entries": 2641,
@@ -86219,7 +86261,7 @@
   },
   "nf": {
    "entries": 2518,
-   "rev": "0ea6d17efd+gcfreeze+laneresumeq+prefilloom+voidpass-1013"
+   "rev": "f4afb10f28+nf-gguf-1018-12b375f3dc-1014"
   }
  },
  "warnungen": []
