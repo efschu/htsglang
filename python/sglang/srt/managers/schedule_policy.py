@@ -1058,7 +1058,7 @@ def _form_a_stale_vote_gate(adder, req, follow) -> AddReqResult | None:
     return None
 
 
-def _h105d_cut_load_back_room(adder, req) -> bool:
+def _h105d_cut_load_back_room(adder, req, evict: bool = True) -> bool:
     """H105d (NF y9nf6 rc12z30y9nf6, 191228abc5, D log boot_weg2_dkrnfint4h6abl
     bar1dauer10040608 ~158218-158410, 06:32:52Z, weg2-32-93): may THIS rank
     vote ADMIT for a request whose host hit it must load back?
@@ -1122,7 +1122,12 @@ def _h105d_cut_load_back_room(adder, req) -> bool:
     # peel measured is not asked again -- the count the peel can PAY decides.
     payable = min(reported, payable_evictable_or(tc, tc.evictable_size))
     evicted = 0
-    if payable > 0 and need <= available + payable:
+    if not evict:
+        # H105f (NF h14 14:50:53, weg2-0-3): the DRY vote -- may this rank make
+        # the room? Nothing is evicted before the group has said ADMIT.
+        if need <= available + payable:
+            return True
+    elif payable > 0 and need <= available + payable:
         res = tc.evict(EvictParams(num_tokens=min(payable, need - available)))
         # evict() returns None on some caches (as read by H105c/H106 too)
         evicted = int(getattr(res, "num_tokens_evicted", 0) or 0)
@@ -1143,6 +1148,25 @@ def _h105d_cut_load_back_room(adder, req) -> bool:
             reported, payable, adder.rem_total_tokens, n,
         )
     return False
+
+
+def _h105f_on() -> bool:
+    """H105f: vote before evicting (token cut only -- H105d is a no-op off it)."""
+    import os
+
+    from sglang.srt.rank_role import form_a_token_cut_active
+
+    if (os.environ.get("SGLANG_WEG2_H105F_VOTE_BEFORE_EVICT", "1") or "1").strip().lower() in (
+            "0", "false", "no", "off"):
+        return False
+    return bool(form_a_token_cut_active())
+
+
+def _h105f_confirm_due(group_gate, armed: bool) -> bool:
+    """H105f: the second (confirming) gather runs exactly when the first one
+    returned the group's ADMIT -- a group-uniform fact, so every rank enters it
+    alike. ``armed`` is group-uniform too (switch + the installed token cut)."""
+    return bool(armed) and group_gate is None
 
 
 def _h110_int(v) -> int:
@@ -3047,7 +3071,22 @@ class PrefillAdder:
                 # H105d: under the token cut every rank's gate is REAL and is
                 # gathered (MIN) BEFORE any load-back -- so this rank's gate
                 # must already know whether it can pay its OWN load-back rows.
-                if _gate is None and not _h105d_cut_load_back_room(self, req):
+                # H105f (NF h14 ba1d5becd7, D TP0 14:50:53, weg2-0-3): H105d
+                # evicted THIS rank's room before the gather -- TP0 freed the
+                # device copy of weg2-2-20's 163k session (#1469 EVICT
+                # node=43/42/38/37/36), then a worker's own gate refused
+                # (WORKER-GATE code=NO_TOKEN price=83239 budget=33536) and the
+                # request stayed queued; the session's next turn (weg2-2-21)
+                # found its prefix host-only and wedged the server 317 s. Now a
+                # DRY vote (room makeable here?), the gather, and only on the
+                # group's ADMIT the eviction plus a second gather confirming
+                # the room. Both gathers are entered by every rank alike (the
+                # first's verdict is the group's).
+                # SGLANG_WEG2_H105F_VOTE_BEFORE_EVICT=0: the old order.
+                _h105f = _h105f_on()
+                if _gate is None and not _h105d_cut_load_back_room(
+                    self, req, evict=not _h105f
+                ):
                     _gate = AddReqResult.NO_TOKEN
                 # H105: after every rank-local gate and BEFORE the load-back
                 # (and the tail-adopt vote behind it) -- the one point every
@@ -3057,6 +3096,14 @@ class PrefillAdder:
                 _gate = _fa_follow(
                     req, _gate, int(total_tokens), int(self.rem_total_tokens)
                 )
+                if _h105f_confirm_due(_gate, _h105f):
+                    _room = _h105d_cut_load_back_room(self, req, evict=True)
+                    _gate = _fa_follow(
+                        req,
+                        None if _room else AddReqResult.NO_TOKEN,
+                        int(total_tokens),
+                        int(self.rem_total_tokens),
+                    )
                 _fa_host_first = False
             if _gate is not None:
                 return _gate
