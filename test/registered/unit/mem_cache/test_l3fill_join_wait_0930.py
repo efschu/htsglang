@@ -204,3 +204,33 @@ def test_an_inflight_page_that_never_completes_ends_the_prefix_after_the_bound(t
     assert out[0] is not None and out[1] is None and out[2] is None
     assert 0.07 <= took < 2.0
     assert arena.claim_info([slot])[0][5] == 1       # the writer's claim untouched
+
+
+def test_a_room_wait_claim_lost_to_a_peer_is_awaited_not_dropped(tmp_path):
+    """TF2 (NF h13 14:18:00, weg2-10-82): the slot the room wait freed went
+    to a PEER rank filling the SAME stem (status 1). Dropped, PP0's mamba
+    anchor read missed and #TF sent told=0 (full prefill of 59163)."""
+    root = tmp_path / "store"
+    root.mkdir()
+    (root / "p0.bin").write_bytes(b"\x44" * TOTAL)
+    arena = ShmArena(str(tmp_path / "kv.bin"), TOTAL, 1)
+    [(occ, st0, _g0)] = arena.claim_slots(["o0"], [TOTAL])       # the arena is FULL
+    assert st0 == 0
+    be = _backend(str(root))
+    box = {}
+
+    def peer():
+        time.sleep(0.008)
+        arena.free_slots([occ], reason="test")
+        [(slot, status, gen)] = arena.claim_slots(["p0"], [TOTAL])  # the peer wins the slot
+        assert status == 0
+        box["slot"] = slot
+        time.sleep(0.08)
+        assert arena.complete_slots([slot], [gen], [(0, TOTAL)]) == [1]
+
+    threading.Thread(target=peer).start()
+    with envs.SGLANG_WEG2_L3FILL_ROOM_WAIT_MS.override(1000), \
+            envs.SGLANG_WEG2_L3FILL_JOIN_WAIT_MS.override(1000):
+        out = _run_on("hicache-prefetch-io-0", lambda: HiCacheFile.arena_fill_from_disk(
+            be, arena, ["p0"], TOTAL, prefix=True))
+    assert out[0] == box["slot"]
