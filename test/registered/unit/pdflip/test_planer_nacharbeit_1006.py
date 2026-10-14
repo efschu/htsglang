@@ -155,7 +155,7 @@ class TestSupplement(unittest.TestCase):
             self.assertEqual(anchor in lsrc, has_dual, anchor)
 
     @unittest.skipUnless(O.launcher_line() == O.LINE_27B,
-                         "the cited line numbers (xchg_residency.py:711-723, launcher.py:16997-17363) are those of the 27B launcher line; "
+                         "the cited line numbers (xchg_residency.py:711-723, launcher.py:17081-17447) are those of the 27B launcher line; "
                          "this tree's launcher line is %r (the anchors are proved by test_the_cited_anchors_exist_in_the_launcher_sources_of_this_tree)"
                          % O.launcher_line())
     def test_the_cited_lines_hold_the_launcher_text(self):
@@ -171,11 +171,11 @@ class TestSupplement(unittest.TestCase):
         self.assertIn("W71 PdFlipXchgResidencyUnarmable: the exchange's predicted VRAM residency", span(xl, 711, 723))
         self.assertIn("--pdflip-weight-source ring", span(xl, 711, 723))
         self.assertIn("def load_census", span(xl, 313, 316))
-        self.assertIn("W64 PdFlipTpOperatingPointInfeasible: position", span(ll, 16997, 17003))
-        self.assertIn("W64-DUAL: no measured dual-share D log", span(ll, 17255, 17256))
-        self.assertIn("if mine and dual_layout:", span(ll, 17353, 17353))        # Override nur im Dual ...
-        self.assertIn("raise PdFlipLaunchRefused(mine[0]", span(ll, 17362, 17365))  # ... die Verweigerung gilt in jeder Form
-        self.assertIn("if not dual_layout or not str(refusal).startswith", span(ll, 17244, 17244))
+        self.assertIn("W64 PdFlipTpOperatingPointInfeasible: position", span(ll, 17081, 17087))
+        self.assertIn("W64-DUAL: no measured dual-share D log", span(ll, 17339, 17340))
+        self.assertIn("if mine and dual_layout:", span(ll, 17437, 17437))        # Override nur im Dual ...
+        self.assertIn("raise PdFlipLaunchRefused(mine[0]", span(ll, 17446, 17449))  # ... die Verweigerung gilt in jeder Form
+        self.assertIn("if not dual_layout or not str(refusal).startswith", span(ll, 17328, 17328))
         for w in PV.SUPPLEMENT_CODES.values():
             for m in re.finditer(r"(\w+/)?[\w.]+\.py:(\d+)(?:-(\d+))?", w["quelle"]):
                 self.assertGreater(int(m.group(2)), 0)
