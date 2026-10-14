@@ -783,7 +783,15 @@ _MC = "/spinning/llm_stuff/club-3090/models-cache/"
 #:     the pread stream reads it).
 #:   D_PARK_END (F4) z30w-park flip time median 7.06 -> 5.13 s, D.
 #:   CUT_WORKER_END (F4b) z30u part A 2.01 s under the cut, D.
+#:   GC_FREEZE (NF 13.10., boot b60520f01d, GC-FREEZE 1013): the boot heap
+#:     (~1.12 M gen-2 objects) leaves the collector after boot on P AND D --
+#:     4.4-5.4 s gen-2 passes on PP0/PP1 stood the flip legs still (11 of 455
+#:     flips over 6 s, max 9.2 s). Metal proof pending; qwen27b states nothing.
+#:   GC_WARN_SECS 0.5 on D (same boot): P has armed the warning since 30.09.
+#:     (launcher apply_p_gc_warn_default); D had no instrument, the D-side
+#:     legs_barrier 3-4 s stalls stayed "probably, not proven".
 _NF_LS_BOTH: Dict[str, str] = {
+    "FLLIPER_PDFLIP_GC_FREEZE": "1",
     "FLLIPER_PDFLIP_TAIL_KEEP_MIB": "512",
     "FLLIPER_PDFLIP_PLE_STATE_HANDOFF": "1",
     "FLLIPER_UNEVEN_MOE_EXPERT_SHARD": "1",
@@ -798,6 +806,7 @@ NEXTFLASH_GROUP_SWITCH_DEFAULTS: Dict[str, Dict[str, str]] = {
         "FLLIPER_PDFLIP_QSA_ROWS_FUSED_EAGER": "1",
     }),
     "D": dict(_NF_LS_BOTH, **{
+        "FLLIPER_PDFLIP_GC_WARN_SECS": "0.5",
         "FLLIPER_PDFLIP_FORM_A_PLE_FULL_VOCAB": "1",
         "FLLIPER_PDFLIP_PLE_STAGE_BEHIND_REPLAY": "1",
         "FLLIPER_PDFLIP_PLE_STAGE_AUTONOMOUS": "1",
