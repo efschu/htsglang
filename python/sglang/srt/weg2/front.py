@@ -2915,6 +2915,26 @@ def p_phase_arrival(awake: str, state: str, flip_dst: Optional[str]) -> bool:
     return awake == "P"
 
 
+def d_presence_only_short(src: Optional[str], tokens: int, store_depth: int, x: int) -> bool:
+    """VISION-SHORT-1014 (NF h13 weg2-20-129, 14:25:49): a SHORT that arrives
+    in a P phase joins P's batch (P-BATCH-ALL) on the premise that P reads its
+    prefix from the shared store. False premise when the credit is D's OWN
+    (``src`` d_leg2_cached / d_served_epoch / d_served_anchor / d_seq_anchor /
+    d_inflight) and the arrival's store probe proves too little: P would
+    prefill ``tokens - store_depth`` > X (weg2-20-129: credit 133696
+    src=d_served_anchor, store depth 0, P prefilled 134240 tokens in 39.6 s,
+    TTFT 50.5 s; D held the prefix on device across every flip of that
+    session). True = keep it for D. An image request's probe stops at its
+    first image, so an image-cached request with D-only credit is always
+    D's. A store-backed D credit (y6x: D's sleep flush published it, the
+    probe sees it) stays P's, as P-BATCH-ALL says."""
+    if not src or not str(src).startswith("d_"):
+        return False
+    if int(x) <= 0:
+        return False
+    return int(tokens) - max(0, int(store_depth)) > int(x)
+
+
 def _short_keep_enabled(env=None) -> bool:
     """SK: ``SGLANG_WEG2_SHORT_KEEP_PRESENCE`` (default on; 0 = a SHORT that
     falls through is queued BATCH and prefilled on P, as before)."""
@@ -3729,6 +3749,12 @@ class Pending:
     #: admission when a flip lay between. P-BATCH-ALL (02.10.): never while
     #: P is awake; a P drain gives a kept SHORT its leg 1 back.
     short_kept: bool = False
+    #: VISION-SHORT-1014 (NF h13 weg2-20-129): a SHORT whose credit is D's OWN
+    #: (src d_*) and which the shared store cannot serve to P (the arrival's
+    #: store probe leaves P more than X to prefill) -- kept for D even in a P
+    #: phase: P-BATCH-ALL's premise ("the prefix read from the shared store")
+    #: does not hold for it. P's drain never takes it (_p_batch_takes_d_prefill).
+    d_presence_only: bool = False
     #: SK: the front epoch the price was taken in.
     price_epoch: int = -1
     #: SK-X (W35 class, NF rc12t weg2-6-30): D refused this kept SHORT before
@@ -6602,6 +6628,9 @@ class Front:
         from types import SimpleNamespace
 
         return SimpleNamespace(pending=pending, n=c.n, known=known, credit=credit, src=src,
+                               # VISION-SHORT-1014: what the shared store proved at arrival
+                               # (an image request: probed only up to its first image)
+                               store_depth=int(l3),
                                mm=mm is not None, mm_cached=mm_cached,
                                image_end=(mm.image_end if mm is not None else 0),
                                d_reach=d_reach, d_floor=d_floor)
@@ -7032,6 +7061,7 @@ class Front:
         p.short_kept = False
         p.skip_leg1 = False
         p.d_direct = False
+        p.d_presence_only = False
         self.queue.append(p)
         self.counters["short_kept_to_p"] += 1
         return True
@@ -7743,6 +7773,7 @@ class Front:
         p.short_kept = False
         p.d_direct = False
         p.leg1_done = False
+        p.d_presence_only = False
         self.counters["p_batch_from_d"] += 1
         logger.info("WEG2 P-BATCH-TAKES rid=%s was=%s where=%s est_uncached=%d epoch=%d (P is awake: "
                     "its whole prefill runs on P, the prefix read from the shared store; D gets it "
@@ -7764,6 +7795,9 @@ class Front:
             for p in ready:
                 if (getattr(p, "d_direct", False) and not getattr(p, "resume_via_p", False)
                         and not getattr(p, "p_only", False)
+                        # VISION-SHORT-1014: D's own presence, the store cannot give it to P
+                        and not (getattr(p, "d_presence_only", False)
+                                 and getattr(p, "short_kept", False))
                         and (getattr(p, "fut", None) is None or not p.fut.done())):
                     moved.append(p)
                 else:
@@ -10234,6 +10268,17 @@ class Front:
         _sk = (short_ok and _short_keep_enabled() and int(store_span or 0) > 0
                and not short_refused and presence_src not in ("", "none", None)
                and not _p_phase and _pb_to_p is None and not _collect_p)
+        # VISION-SHORT-1014: in a P phase a SHORT whose credit only D holds (the
+        # store probe leaves P more than X) is kept for D, not taken into P's batch
+        _d_hold = bool(
+            short_ok and _p_phase and _short_keep_enabled() and _xx is not None
+            and int(store_span or 0) > 0 and not short_refused
+            and _pb_to_p is None and not _collect_p
+            and d_presence_only_short(presence_src, int(_xx.n),
+                                      int(getattr(_xx, "store_depth", 0) or 0),
+                                      int(self.tp_prefill_max_tokens)))
+        if _d_hold:
+            _sk = True
         if _pb_to_p is not None:
             # PRICE-BARRIER: priced beside a LONG that flips D to P -- the SHORT
             # joins that P phase's batch (leg 1 on P, prefix from the shared
@@ -10243,6 +10288,17 @@ class Front:
                         "uncached=%d waited_ms=%.0f -- a LONG over X was priced beside this SHORT: "
                         "it joins P's batch with it (no D extend, no park; SGLANG_WEG2_PRICE_BARRIER)",
                         rid, _pb_to_p[0], int(_pb_to_p[1]), remainder, _pb_waited_ms)
+        elif _d_hold:
+            self.counters["short_hold_d"] += 1
+            logger.info("WEG2 SHORT-HOLD-D rid=%s: SHORT verdict (uncached=%d presence=%d src=%s) "
+                        "arrived while P is %s -- KEPT for D, not P's batch: the credit is D's own "
+                        "and the shared store holds store_depth=%d of tokens=%d, so P would prefill "
+                        "%d > X=%d (mm=%d; VISION-SHORT-1014, NF h13 weg2-20-129)",
+                        rid, remainder, store_span, presence_src,
+                        "awake" if self.awake == "P" else "waking",
+                        int(getattr(_xx, "store_depth", 0) or 0), int(_xx.n),
+                        int(_xx.n) - int(getattr(_xx, "store_depth", 0) or 0),
+                        int(self.tp_prefill_max_tokens), int(bool(getattr(_xx, "mm", False))))
         elif _p_phase and short_ok:
             # L4/R-10: law 1 read literally means every arrival during a P
             # drain is queued BATCH, SHORT ones included.  Counted here,
@@ -10288,7 +10344,15 @@ class Front:
         if _pb_to_p is not None:
             p.d_eligible = False  # PRICE-BARRIER: it rides the LONG's P phase, never handed back to D
         Front._lane_stamp(self, p)  # PRIORITY LANES 1008 (L4): original arrival + hold as clock offset
-        if _sk and self.awake == "D" and self.admit_d and self.state == "serving":
+        if _d_hold:
+            # VISION-SHORT-1014: D's admission line (like SHORT-IN-FLIP); P's drain
+            # leaves it there (d_presence_only), D re-prices it at its admission
+            # (SK, a flip lies between) and sends it to P only if D lost it
+            p.d_presence_only = True
+            p.d_direct = True
+            self._ready_for_d.append(p)
+            self._sync_batch_gate()
+        elif _sk and self.awake == "D" and self.admit_d and self.state == "serving":
             # SK: D is awake -- the kept SHORT waits in D's own admission line,
             # BEHIND the batch work that held the gate (no overtaking, no flip
             # to P for it, no leg 1).

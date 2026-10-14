@@ -79,10 +79,10 @@ class Wiring(unittest.TestCase):
 
     def test_fall_through_keeps_a_measured_d_presence(self):
         i = self.src.index("_sk = (short_ok and _short_keep_enabled() and int(store_span or 0) > 0")
-        blk = self.src[i:i + 6000]
+        blk = self.src[i:i + 9000]
         # P-BATCH-ALL (02.10.): the per-rid line names P's batch, not a keep
         self.assertIn("WEG2 SHORT-TO-P rid=%s", blk)
-        self.assertIn("and not _p_phase)", blk)
+        self.assertIn("and not _p_phase and _pb_to_p is None", blk)  # PRICE-BARRIER/COLLECT-P extended the term
         self.assertIn("skip_leg1=_sk, short_kept=_sk, price_epoch=int(self.epoch)", blk)
         self.assertIn('if _sk and self.awake == "D" and self.admit_d and self.state == "serving":', blk)
         self.assertIn("self._ready_for_d.append(p)", blk)
