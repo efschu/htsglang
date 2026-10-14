@@ -65,13 +65,14 @@ from flliper.srt.mem_cache import pinned_host_budget as m
 post = m.PinnedHostPost("read buffers", "--hicache-size", int({DEMAND_GB} * {GB}))
 err = m.joint_pinned_host_error([post], int({TOTAL_GB} * {GB}), int({AVAILABLE_GB} * {GB}))
 m.clear_registered_posts()
-admitted = True
+# HOSTWARN2 (13.10.2026, user rule 06.10.): an over-commit no longer raises, it WARNS
+# (warn_pinned_host); "admitted" therefore means "no warning was issued for the post".
+warned = []
 with mock.patch.object(m, "pinned_host_memory_bytes",
-                       return_value=(int({TOTAL_GB} * {GB}), int({AVAILABLE_GB} * {GB}))):
-    try:
-        m.check_and_register_pinned_post("read buffers", "--hicache-size", int({DEMAND_GB} * {GB}))
-    except ValueError:
-        admitted = False
+                       return_value=(int({TOTAL_GB} * {GB}), int({AVAILABLE_GB} * {GB}))), \
+        mock.patch.object(m, "warn_pinned_host", side_effect=lambda e, w: warned.append(e)):
+    m.check_and_register_pinned_post("read buffers", "--hicache-size", int({DEMAND_GB} * {GB}))
+admitted = not warned
 print(json.dumps({{"reserve": m.pinned_host_reserve_bytes(), "err": err, "admitted": admitted}}))
 """
 

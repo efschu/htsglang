@@ -76,12 +76,20 @@ def test_an_explicit_reserve_still_wins_and_says_so(monkeypatch):
 def test_the_runtime_registry_reads_the_env_at_call_time(monkeypatch):
     B.reset_pinned_posts_for_tests() if hasattr(B, "reset_pinned_posts_for_tests") else None
     monkeypatch.setattr(B, "pinned_host_memory_bytes", lambda: (int(82e9), int(8.7e9)))
+    # HOSTWARN2 (13.10.2026, user rule 06.10.): the verdict is a warning now, not a ValueError; the env
+    # knob still decides WHETHER it is issued (the same numbers: 8.7 GB available, 0.54 GB asked).
+    warned = []
+    monkeypatch.setattr(B, "warn_pinned_host", lambda err, where: warned.append(err))
     monkeypatch.delenv(ENV, raising=False)
-    with pytest.raises(ValueError):
+    try:
         B.check_and_register_pinned_post("hicache-read-buffers", "--hicache-size", int(0.54e9))
+        assert len(warned) == 1 and "OS reserve" in warned[0]
+    finally:
+        B.unregister_pinned_post("hicache-read-buffers")
     monkeypatch.setenv(ENV, "2")
     try:
         B.check_and_register_pinned_post("hicache-read-buffers", "--hicache-size", int(0.54e9))
+        assert len(warned) == 1        # admitted silently under the lowered reserve
     finally:
         B.unregister_pinned_post("hicache-read-buffers")
 

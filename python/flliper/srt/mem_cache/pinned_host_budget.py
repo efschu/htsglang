@@ -170,6 +170,34 @@ def _format_posts(posts: Sequence[PinnedHostPost]) -> str:
     )
 
 
+#: HOSTWARN2 (13.10.2026, user rule 06.10. "KEINE Verweigerung wegen Host-RAM ... man laesst
+#: es darauf ankommen, ob es OOM geht"): the marker of a host-RAM verdict that WARNS. The same
+#: spelling as ``pdflip.host_ledger.HOST_WARN_MARKER`` -- restated here because this module sits
+#: below ``pdflip`` (mem_cache must not import the launcher's package); a test pins both strings.
+HOST_WARN_MARKER = "HOST-RAM-WARN"
+
+
+def warn_pinned_host(err: str, where: str) -> None:
+    """Print a pinned-host budget verdict as a warning instead of raising it (HOSTWARN2).
+
+    ``err`` is the message :func:`joint_pinned_host_error` (or a sibling such as
+    ``kv_session_offload.host_ram_budget_error``) built, with every post named and the
+    numbers in it; ``where`` names the call site. The caller goes on and ATTEMPTS the
+    allocation: when the real ``cudaHostAlloc`` / ``mmap`` then fails, that is a genuine
+    allocation error from the OS, not a budget verdict made up here.
+
+    Rank-uniform by construction: it never raises, so no rank can vote differently from a
+    peer on a number that shrinks as the ranks pin (the NCCL-hang class the module
+    docstring names).
+    """
+    logger.warning(
+        "%s PINNED %s -- %s -- WARNING ONLY: the allocation is attempted anyway (user rule "
+        "06.10.: no refusal on host RAM; an OOM kill is the accepted risk). If the real "
+        "allocation fails, that failure is the verdict.",
+        HOST_WARN_MARKER, where, " ".join(str(err).split()),
+    )
+
+
 def joint_pinned_host_error(
     posts: Sequence[PinnedHostPost],
     total_bytes: Optional[int],
@@ -310,7 +338,11 @@ def check_and_register_pinned_post(
     requested_bytes: int,
     reserve_bytes: Optional[int] = None,
 ) -> None:
-    """Admit ``requested_bytes`` for ``name``, or raise naming every post.
+    """Admit ``requested_bytes`` for ``name``; over-commit WARNS (HOSTWARN2), it does not raise.
+
+    Used to raise ``ValueError`` naming every post; since 13.10.2026 the same message is
+    printed as ``HOST-RAM-WARN PINNED <name> ...`` and the post is registered, the real
+    allocation is attempted and its own failure is the verdict (user rule 06.10.).
 
     Replaces the per-pool ``psutil.virtual_memory()`` checks. Two changes over
     what each site did alone: the availability figure is the lxcfs-safe one,
@@ -387,7 +419,11 @@ def check_and_register_pinned_post(
         reserve_bytes,
     )
     if err is not None:
-        raise ValueError(err)
+        # HOSTWARN2: warn, register the post and let the real allocation decide.
+        # The post MUST still be registered, or the next pool's demand would be
+        # credited too little (#550/#729: a registered post that never allocates is
+        # taken back by `revert_pinned_posts_on_failure` when the allocation raises).
+        warn_pinned_host(err, name)
     register_pinned_post(post)
 
 

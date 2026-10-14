@@ -7171,22 +7171,70 @@ def stale_deadman_sweep(log: Log, ports: Sequence[int], dry: bool) -> None:
                     pass
 
 
+def split_preflight_refusals(text: str) -> Tuple[List[str], List[str]]:
+    """``(ram_lines, other_lines)``: the ``REFUSED:`` lines of ``host_ledger_preflight.sh``
+    split by cause (HOSTWARN2, 13.10.2026).
+
+    The script (outside the tree, ``devtools/host_ledger_preflight.sh``) has two verdicts
+    and ONE exit code: ``REFUSED: MemAvailable ...`` (host RAM under its floor) and
+    ``REFUSED: only N GiB free on /`` (DISK under 100 GiB). The user rule 06.10. covers host
+    RAM only, so the launcher reads the script's own log and lets only the RAM lines through
+    as warnings; a disk line stays a refusal. The split is by the script's own wording
+    (``MemAvailable``), not by guess: a ``REFUSED:`` line that does not name it is ``other``.
+    """
+    ram: List[str] = []
+    other: List[str] = []
+    for ln in text.splitlines():
+        if not ln.startswith("REFUSED:"):
+            continue
+        (ram if "MemAvailable" in ln else other).append(ln.strip())
+    return ram, other
+
+
 def host_preflight(log: Log, tag: str, dry: bool) -> None:
+    """The host preflight: the script, then the launcher's own 40 GiB MemAvailable floor.
+
+    HOSTWARN2 (13.10.2026, user rule 06.10. "KEINE Verweigerung wegen Host-RAM ... man laesst
+    es darauf ankommen, ob es OOM geht"): BOTH host-RAM floors WARN now (``HOST-RAM-WARN
+    HOST-MEM ...``, full numbers, the boot goes on). What still refuses: a disk verdict of the
+    script (``HOST-DISK``, forceable) and a script that failed without any verdict line
+    (cannot be told from a broken tool; ``PdFlipLaunchRefused``). VRAM and card refusals are not here.
+    """
     if dry:
         log("DRY-RUN: host_ledger_preflight.sh not run")
         return
-    rc = subprocess.run([HOST_PREFLIGHT, f"{GPU_ARB}/preflight_weg2_{tag}.log"]).returncode
+    pre_log = f"{GPU_ARB}/preflight_weg2_{tag}.log"
+    rc = subprocess.run([HOST_PREFLIGHT, pre_log]).returncode
+    warns = 0
     if rc != 0:
-        refusals.refuse_value("HOST-MEM", "BOOT REFUSED by the host-ledger preflight (#721 floor) -- see its log",
-                              PdFlipLaunchRefused, log)
+        try:
+            with open(pre_log, encoding="utf-8", errors="replace") as fh:
+                ram_lines, other_lines = split_preflight_refusals(fh.read())
+        except OSError:
+            ram_lines, other_lines = [], []
+        if other_lines:
+            refusals.refuse_value("HOST-DISK", "BOOT REFUSED by the host-ledger preflight (disk floor, NOT host RAM) -- "
+                                  + " | ".join(other_lines) + f" -- see {pre_log}", PdFlipLaunchRefused, log)
+        if not ram_lines and not other_lines:
+            raise PdFlipLaunchRefused(
+                f"host-ledger preflight {HOST_PREFLIGHT} exited {rc} without a REFUSED verdict in {pre_log}: "
+                "a broken or missing script is not a host-RAM verdict and does not boot silently")
+        if ram_lines:
+            warns += 1
+            log(f"{host_ledger.HOST_WARN_MARKER} HOST-MEM PreflightScriptFloor -- {' | '.join(ram_lines)} "
+                f"-- WARNING ONLY: the boot goes on (user rule 06.10.: no refusal on host RAM; an OOM kill is "
+                f"the accepted risk); the script's own log: {pre_log}")
     mi = host_ledger.read_meminfo()
     avail_gib = mi["MemAvailable"] / host_ledger.GIB
     if avail_gib < 40:
+        warns += 1
         top = subprocess.run(["ps", "-eo", "rss,pid,comm", "--sort=-rss"], capture_output=True, text=True).stdout.splitlines()[:8]
-        refusals.refuse_value("HOST-MEM", f"free -g available {avail_gib:.1f} GiB < 40 GiB; top RSS holders (NOT killed):\n" + "\n".join(top),
-                              PdFlipLaunchRefused, log)
+        log(f"{host_ledger.HOST_WARN_MARKER} HOST-MEM Preflight40GiB -- free -g available {avail_gib:.1f} GiB < 40 GiB; "
+            "top RSS holders (NOT killed):\n" + "\n".join(top)
+            + " -- WARNING ONLY: the boot goes on (user rule 06.10.: no refusal on host RAM; an OOM kill is the accepted risk)")
     oom = open("/sys/fs/cgroup/memory.events").read()
-    log(f"host preflight PASS: MemAvailable {avail_gib:.1f} GiB; cgroup memory.events baseline: {' '.join(oom.split())}")
+    log(f"host preflight {'PASS' if not warns else 'CONTINUED (host-RAM warnings=%d)' % warns}: "
+        f"MemAvailable {avail_gib:.1f} GiB; cgroup memory.events baseline: {' '.join(oom.split())}")
     # SWAP READINESS (26.09.): the ledger's currencies assume a swapless cgroup;
     # name the swap state once per boot and WARN when pages already moved out.
     swap_line, _swap_warn = host_ledger.swap_state_line()
@@ -12789,9 +12837,12 @@ def choose_host_ledger(
 ) -> Tuple[host_ledger.Arm, Optional[float], List[str], Dict[str, Optional[int]]]:
     """THE LAUNCHER'S ONE LEDGER CALL SITE: read the host, price the ladder.
 
-    Returns ``(arm, reap headroom GiB, printed lines, the cgroup reading)`` or raises
-    :class:`host_ledger.PdFlipHostLedgerRefused` -- ``main`` only logs the lines
-    and carries the reading into the boot state.
+    Returns ``(arm, reap headroom GiB, printed lines, the cgroup reading)`` -- ``main`` only logs
+    the lines and carries the reading into the boot state. HOSTWARN2 (13.10.2026, user rule
+    06.10.): the host-RAM VERDICTS (W20 no arm funds, W21 run peak, W87 pinned arm, W97
+    deviation) are ``HOST-RAM-WARN`` lines among ``lines`` and the most frugal (or the pinned)
+    arm comes back; what still raises :class:`host_ledger.PdFlipHostLedgerRefused` is a number
+    that does not exist (unmeasured term, record identity, half-cited prior boot).
 
     #1233 fix 5: the reaper watches the CGROUP, so the ledger reads it.  The
     ``oom_kill`` value goes in as the boot's PRE-BOOT BASELINE of a cumulative,
@@ -13171,27 +13222,33 @@ def choose_host_ledger(
         # flag's help text).
         ring_absent_by_design=_ring_absent_by_design_kw,
     )
+    # HOSTWARN2 (13.10.2026, user rule 06.10.): the ledger WARNS, it does not refuse.
+    # `warn_only=True` turns W20/W21/W97 into HOST-RAM-WARN lines and returns the
+    # priced arm; the other host-ledger refusals (an unmeasured term, a record
+    # identity mismatch, a half-cited prior boot) are about a number that does not
+    # exist, not about how much RAM the box has, and still raise.
+    ledger_kw["warn_only"] = True
     if pin_m_mib and int(pin_m_mib) > 0:
         # #1317/#1318 THE PINNED ARM IS PRICED, NOT ASSUMED. The ladder is run
         # with exactly one rung, so a pinned arm is scored by the identical
-        # model choose() applies to DEFAULT_ARMS -- and refused by name when
-        # it does not fund, which is what keeps this a pin rather than a way
-        # past the ledger. The HOST-SCHWELLE law admits no "accept the risk"
-        # branch here.
-        try:
-            arm, reap_headroom_gib, lines = host_ledger.choose(
-                mi["MemTotal"], mi["MemAvailable"],
-                arms=[(int(pin_s_gb) if pin_s_gb else 1, int(pin_m_mib))], **ledger_kw,
-            )
-        except host_ledger.PdFlipHostLedgerRefused as e:
-            raise host_ledger.PdFlipHostLedgerRefused(
-                f"W87 PdFlipPinnedArmRefused: --pin-ledger-arm-m {int(pin_m_mib)} "
-                f"was priced by the ladder itself (S={int(pin_s_gb) if pin_s_gb else 1} M={int(pin_m_mib)}) and "
-                f"is not fundable: {e}. A pin selects among arms the ledger "
-                "would fund; it is not a way past the ledger's verdict, and the "
-                "host-threshold law admits no accept-the-risk branch. Pin a "
-                "smaller M, or drop the pin and let choose() ladder."
-            ) from e
+        # model choose() applies to DEFAULT_ARMS. HOSTWARN2: an unfundable pinned
+        # arm used to be re-raised here as W87 PdFlipPinnedArmRefused; it is now the
+        # same price with a HOST-RAM-WARN W87 line in front of it, and the pin boots.
+        arm, reap_headroom_gib, lines = host_ledger.choose(
+            mi["MemTotal"], mi["MemAvailable"],
+            arms=[(int(pin_s_gb) if pin_s_gb else 1, int(pin_m_mib))], **ledger_kw,
+        )
+        _unfunded_pin = [ln for ln in lines
+                         if ln.startswith(f"{host_ledger.HOST_WARN_MARKER} W2")
+                         and "Unfunded" in ln.split(" -- ", 1)[0]]
+        if _unfunded_pin:
+            lines = list(lines) + [
+                f"{host_ledger.HOST_WARN_MARKER} W87 PinnedArmUnfunded -- --pin-ledger-arm-m {int(pin_m_mib)} "
+                f"(S={int(pin_s_gb) if pin_s_gb else 1} M={int(pin_m_mib)}) was priced by the ladder itself and is "
+                f"not fundable ({len(_unfunded_pin)} ledger warning line(s) above name the binding terms) -- "
+                "WARNING ONLY: the pinned arm boots (user rule 06.10.: no refusal on host RAM; an OOM kill is "
+                "the accepted risk)."
+            ]
         lines = list(lines) + [
             f"PDFLIP-LEDGER ARM PINNED by --pin-ledger-arm-m/-s: S={int(pin_s_gb) if pin_s_gb else 1} M={int(pin_m_mib)} "
             f"launch={arm.launch_leftover_gib:.2f} GiB "
@@ -22786,11 +22843,13 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument(
         "--force", action="store_true",
-        help="PROFIL-EDITOR S1: start although the planner/launcher REFUSES the VALUES (capacity, VRAM, host memory, "
-             "card count, calibration of the inventory -- the 'value' class of pdflip/refusals.py). Every refusal passed "
+        help="PROFIL-EDITOR S1: start although the planner/launcher REFUSES the VALUES (capacity, VRAM, "
+             "card count, calibration of the inventory, disk floor -- the 'value' class of pdflip/refusals.py). Every refusal passed "
              "is printed as 'FORCED-PAST <CODE> <reason>'. A forced boot writes NO records. NOT lifted: the occupation "
              "check (another process or window on a card), a missing or broken model/file, an unsupported "
-             "architecture. Container: FLLIPER_FORCE=1.")
+             "architecture. HOST RAM is not refused at all any more (HOSTWARN2, user rule 06.10.): the host ledger, "
+             "the preflight and the pinned-host registry print 'HOST-RAM-WARN ...' and the boot goes on, with or "
+             "without --force. Container: FLLIPER_FORCE=1.")
     ap.add_argument(
         "--profile-inventory", default="",
         help="HW-GENERIC 1002: the card inventory (calibration-class labels in card order, "

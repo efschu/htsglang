@@ -25,9 +25,11 @@ suggestion.
 from __future__ import annotations
 
 import dataclasses
+import logging
 import os
 import shutil
 import socket
+import sys
 from typing import Callable, Dict, List, Optional, Sequence
 
 from flliper.srt.turnkey.config import StackConfig, assert_repo_stable
@@ -36,7 +38,6 @@ from flliper.srt.turnkey.refusal import (
     REFUSE_CARD_CENSUS,
     REFUSE_CARD_UNKNOWN_UUID,
     REFUSE_DISK_HEADROOM,
-    REFUSE_HOST_HEADROOM,
     REFUSE_PATH_MISSING,
     REFUSE_PORT_BUSY,
     REFUSE_WHEEL_DIST_SHADOW,
@@ -453,10 +454,17 @@ def check_host_headroom(cfg: StackConfig, p: Probes) -> Optional[Refusal]:
         return None
     got = p.mem_available_bytes()
     if got < want * GIB:
-        return refuse(REFUSE_HOST_HEADROOM, "MemAvailable",
-                      f"{got / GIB:.1f} GiB", f">= {want} GiB",
-                      remedy="a boot that starts short of host RAM dies in "
-                             "weight load, after paying for it")
+        # HOSTWARN2 (13.10.2026, user rule 06.10. "KEINE Verweigerung wegen Host-RAM ...
+        # man laesst es darauf ankommen, ob es OOM geht"): the host-RAM headroom WARNS, it
+        # no longer refuses the turnkey boot. Same numbers as the refusal carried; a warning
+        # on stderr and in the log, then the next check. REFUSE_HOST_HEADROOM stays defined
+        # (the catalogue of codes is unchanged) but no check raises it any more.
+        msg = (f"HOST-RAM-WARN TURNKEY HostHeadroom -- MemAvailable {got / GIB:.1f} GiB "
+               f"< {want} GiB -- WARNING ONLY: the boot goes on (user rule 06.10.: no refusal "
+               "on host RAM; a boot that starts short of host RAM may die in weight load, "
+               "an OOM kill is the accepted risk)")
+        logging.getLogger(__name__).warning("%s", msg)
+        print(msg, file=sys.stderr)
     return None
 
 

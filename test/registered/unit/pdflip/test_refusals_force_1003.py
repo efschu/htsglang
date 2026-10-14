@@ -61,15 +61,18 @@ class Register(Base):
         codes = [r.code for r in R.REGISTER]
         self.assertEqual(len(codes), len(set(codes)))
         for r in R.REGISTER:
-            self.assertIn(r.klass, (R.CLASS_VALUE, R.CLASS_HARD))
+            self.assertIn(r.klass, (R.CLASS_VALUE, R.CLASS_HARD, R.CLASS_WARN))
             self.assertGreater(len(r.why_class), 40, r.code)
             self.assertTrue(r.source and r.enforced_by, r.code)
 
     def test_what_the_user_named_is_not_forceable(self):
         for c in ("HW-ARCH", "HW-TOPOLOGY", "KARTE-BELEGT", "SHM-BELEGT", "MODELL-FEHLT", "PORT-BELEGT"):
             self.assertFalse(R.by_code(c).forcebar, c)
-        for c in ("HW-COUNT", "HW-UNCALIBRATED", "D-BUDGET", "P-CARD", "HOST-MEM", "WAKE-CREDIT"):
+        for c in ("HW-COUNT", "HW-UNCALIBRATED", "D-BUDGET", "P-CARD", "HOST-DISK", "WAKE-CREDIT"):
             self.assertTrue(R.by_code(c).forcebar, c)
+        # HOSTWARN2 (13.10.2026): HOST-MEM is not a refusal any more -- it warns (user rule 06.10.)
+        self.assertFalse(R.by_code("HOST-MEM").forcebar)
+        self.assertEqual(R.by_code("HOST-MEM").klass, R.CLASS_WARN)
 
     def test_the_register_does_not_claim_more_than_the_launcher_does(self):
         with open(LAUNCHER_SRC, encoding="utf-8") as fh:
@@ -78,9 +81,10 @@ class Register(Base):
         self.assertTrue(wired)
         for c in wired:
             self.assertIsNotNone(R.by_code(c), c)
-            self.assertTrue(R.by_code(c).forcebar, c)               # a hard code is never consulted for Force
-        for c in ("HW-COUNT", "HW-UNCALIBRATED", "HOST-MEM", "D-BUDGET", "WAKE-CREDIT", "P-CARD"):
+            self.assertTrue(R.by_code(c).forcebar, c)               # a hard (or warn) code is never consulted for Force
+        for c in ("HW-COUNT", "HW-UNCALIBRATED", "HOST-DISK", "D-BUDGET", "WAKE-CREDIT", "P-CARD"):
             self.assertIn(c, wired)
+        self.assertNotIn("HOST-MEM", wired)         # HOSTWARN2: host RAM warns, it is not consulted for Force
         pub = {r["code"]: r for r in R.public_register(wired)}
         self.assertTrue(pub["HW-COUNT"]["wired"])
         self.assertFalse(pub["PP-CUT"]["wired"])                   # forcebar by class, not yet wired: said so
@@ -183,8 +187,8 @@ class Switch(Base):
     def test_sink_gets_every_forced_refusal(self):
         got = []
         R.arm(True, sink=lambda c, t: got.append((c, t)))
-        R.refuse_value("HOST-MEM", "low", L.PdFlipLaunchRefused)
-        self.assertEqual(got, [("HOST-MEM", "low")])
+        R.refuse_value("HOST-DISK", "low", L.PdFlipLaunchRefused)
+        self.assertEqual(got, [("HOST-DISK", "low")])
 
 
 class LauncherWiring(Base):

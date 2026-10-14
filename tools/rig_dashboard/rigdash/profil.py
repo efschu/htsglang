@@ -185,7 +185,7 @@ def force_hint(dry, register: List[dict], line: str = "") -> dict:
            "records_note": ("A force boot writes no records; its measured values do not count as accepted." if force else ""),
            "line_note": ""}
     if force and str(line) == "nf":
-        out["line_note"] = ("Line nf: the launcher there overrides only HW-COUNT, HW-UNCALIBRATED and HOST-MEM; the entrypoint codes (PROFIL-STATUS, SHM, STORE, MEMAVAIL) apply there too.")
+        out["line_note"] = ("Line nf: the launcher there overrides only HW-COUNT, HW-UNCALIBRATED and HOST-DISK (host RAM is not refused by the launcher at all: it warns, HOST-RAM-WARN); the entrypoint codes (PROFIL-STATUS, SHM, STORE, MEMAVAIL) apply there too.")
     return out
 
 

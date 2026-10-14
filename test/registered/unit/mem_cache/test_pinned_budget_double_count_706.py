@@ -46,11 +46,13 @@ from flliper.srt.mem_cache.pinned_host_budget import (
     clear_registered_posts,
     joint_pinned_host_error,
     register_pinned_post,
+    registered_posts,
 )
 from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5)
 
+PINNED_LOGGER = pinned_host_budget.logger.name
 GB = 10**9
 #: The PP0 refusal, to the same precision the log printed it.
 IMAGES_GB = (18.06, 17.12)
@@ -117,32 +119,33 @@ class TheSpecimenNoLongerRefuses(unittest.TestCase):
             requested_bytes=int(TIER_GB * GB),
         )  # must not raise
 
-    def test_a_genuinely_impossible_tier_is_still_refused(self):
-        """CAN-FAIL: crediting must not disable the guard.
-
-        A tier larger than the real free memory has to fail, or this change
-        would have replaced a false refusal with no protection at all -- which
-        is the worse defect, since pinned memory is non-swappable on this box.
-        """
+    def test_a_genuinely_impossible_tier_now_warns_and_is_registered(self):
+        """HOSTWARN2 (13.10.2026, user rule 06.10.: no refusal on host RAM). This was
+        ``..._is_still_refused`` (ValueError). The guard still JUDGES -- crediting must
+        not disable it -- but the verdict is a ``HOST-RAM-WARN PINNED`` line; the post is
+        registered and the real allocation (cudaHostAlloc) is what can still fail."""
         self._register_images()
-        with self.assertRaises(ValueError) as cm:
+        with self.assertLogs(PINNED_LOGGER, level="WARNING") as cm:
             check_and_register_pinned_post(
                 name="MHATokenToKVPoolHost",
                 flag="--hicache-size / --hicache-ratio",
                 requested_bytes=400 * GB,
-            )
-        self.assertIn("over-committed", str(cm.exception))
+            )  # must not raise
+        text = "\n".join(cm.output)
+        self.assertIn("HOST-RAM-WARN PINNED MHATokenToKVPoolHost", text)
+        self.assertIn("over-committed", text)
+        self.assertIn("MHATokenToKVPoolHost", [p.name for p in registered_posts()])
 
-    def test_the_refusal_still_prices_every_post(self):
+    def test_the_warning_still_prices_every_post(self):
         """The module's rule: an operator must see which flag to lower."""
         self._register_images()
-        with self.assertRaises(ValueError) as cm:
+        with self.assertLogs(PINNED_LOGGER, level="WARNING") as cm:
             check_and_register_pinned_post(
                 name="MHATokenToKVPoolHost",
                 flag="--hicache-size / --hicache-ratio",
                 requested_bytes=400 * GB,
             )
-        msg = str(cm.exception)
+        msg = "\n".join(cm.output)
         self.assertIn("phase-flip host weight image #1", msg)
         self.assertIn("--enable-phase-flip", msg)
         self.assertIn("--hicache-size", msg)
@@ -150,15 +153,16 @@ class TheSpecimenNoLongerRefuses(unittest.TestCase):
     def test_the_post_being_weighed_is_not_credited_to_itself(self):
         """The new post is not yet allocated, so it must stay pure demand.
 
-        Crediting it too would make the guard admit anything.
-        """
+        Crediting it too would make the guard admit anything (HOSTWARN2: it would stay
+        silent instead of warning)."""
         clear_registered_posts()
-        with self.assertRaises(ValueError):
+        with self.assertLogs(PINNED_LOGGER, level="WARNING") as cm:
             check_and_register_pinned_post(
                 name="solo",
                 flag="--hicache-size",
                 requested_bytes=10_000 * GB,
             )
+        self.assertIn("HOST-RAM-WARN PINNED solo", "\n".join(cm.output))
 
     def test_first_post_in_a_process_is_unaffected(self):
         """With nothing registered, credit is zero and behaviour is identical."""
