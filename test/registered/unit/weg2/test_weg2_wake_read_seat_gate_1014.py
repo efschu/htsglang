@@ -221,3 +221,124 @@ def test_the_seat_room_reads_no_rank_identity_and_no_pool_state():
     banned = {"tp_rank", "rank", "attn_tp_rank", "dp_rank", "local_rank", "free_pages", "available_size",
               "evictable_size"}
     assert not (seen & banned), sorted(seen & banned)
+
+
+# ---------------------------------------------------------------------------
+# FIX ROUND 2 (review finding 2): the seat gate on top of the Dauerstand lanes hotfix b6c0d6f42d
+# ("D's wake reads go highest lane first": issue_deferred_reads, issue_capacity_waiters and
+# note_hold_order walk _lane_sorted(hold)). "The next seats" of the gate are the first requests of THAT
+# walk: highest lane first, hold (arrival) order inside a lane -- the order D's priority scheduling
+# admits them in. The tests below pin the combined code with mixed lanes.
+# ---------------------------------------------------------------------------
+
+
+def _laned(spec, pages=600):
+    """spec = [(rid, lane), ...] in arrival order; a lane-0 request carries no priority at all."""
+    out = []
+    for rid, lane in spec:
+        r = _req(rid, pages)
+        if lane:
+            r.priority = lane
+        out.append(r)
+    return out
+
+
+MIXED = [("a0", 0), ("b0", 0), ("c0", 0), ("d1", 1), ("e0", 0), ("f0", 0), ("g1", 1), ("h0", 0)]
+
+
+def test_mixed_lanes_the_free_seats_go_to_the_highest_lane_first_then_arrival():
+    """3 free seats, 8 held in arrival order a0 b0 c0 d1 e0 f0 g1 h0: the seats are d1, g1 (lane 1,
+    arrival order inside the lane) and a0 (the oldest lane-0). The five others wait, named."""
+    h = _sched(running=SEATS - 3)
+    hold = _laned(MIXED)
+    out = park_l3.issue_deferred_reads(h, hold)
+    assert [r.rid for r in out] == ["d1", "g1", "a0"]
+    assert h.issued == ["d1", "g1", "a0"]
+    assert [r.rid for r in hold if park_l3.capacity_waiting(r)] == ["b0", "c0", "e0", "f0", "h0"]
+    assert sum(park_l3.read_pages(h, r) for r in out) == 3 * 600, "only the next seats pin the arena"
+
+
+def test_mixed_lanes_no_lower_lane_overtakes_a_waiting_higher_lane():
+    """The page gate stops the walk at the first read that does not fit: everything BEHIND it in the
+    lane order waits with it -- a lane-0 request never overtakes a waiting lane-1 request."""
+    h = _sched()
+    hold = [_req("small0", 10), _req("big1", 9000), _req("small1", 10)]
+    hold[1].priority = 1
+    hold[2].priority = 1
+    # big1 (lane 1) is walked first and reads alone (the lone-read rule); small1 and small0 wait behind it
+    out = park_l3.issue_deferred_reads(h, hold)
+    assert [r.rid for r in out] == ["big1"]
+    assert park_l3.capacity_waiting(hold[2]) and park_l3.capacity_waiting(hold[0])
+
+
+def test_mixed_lanes_the_settle_waiter_issue_is_lane_first_with_the_seat_gate():
+    """The settle tick: one seat frees, three waiters (arrival w0-a, w0-b lane 0; w1-c lane 1): the lane-1
+    waiter reads, not the oldest one; the next freed seat takes the oldest lane-0 waiter."""
+    h = _sched(running=SEATS)            # no free seat: nothing is issued
+    waiters = _laned([("w0-a", 0), ("w0-b", 0), ("w1-c", 1)])
+    for w in waiters:
+        setattr(w, park_l3.CAPWAIT_ATTR, True)
+    h.weg2_post_wake_settle = list(waiters)
+    assert park_l3.issue_capacity_waiters(h, h.weg2_post_wake_settle) == []
+    h.running_batch.reqs.pop()           # one seat frees
+    out = park_l3.issue_capacity_waiters(h, h.weg2_post_wake_settle)
+    assert [r.rid for r in out] == ["w1-c"], "lane first, not the oldest"
+    assert park_l3.capacity_waiting(waiters[0]) and park_l3.capacity_waiting(waiters[1])
+    h.running_batch.reqs.pop()           # a second seat frees (the read of w1-c is in flight and holds one)
+    h.running_batch.reqs.pop()
+    out = park_l3.issue_capacity_waiters(h, h.weg2_post_wake_settle)
+    assert [r.rid for r in out][:1] == ["w0-a"], "inside the lane the arrival order stays"
+
+
+def test_mixed_lanes_the_keep_order_is_the_seat_order(monkeypatch):
+    """The order the kept pages leave the arena (note_hold_order -> handoff_pending read order) is the
+    SAME walk as the order the seats are given in: a seat holder is never the ORDERED-EVICT victim of
+    a request that waits for a seat."""
+    from sglang.srt.weg2 import handoff_pending as hp
+
+    seen = []
+    monkeypatch.setattr(hp, "note_read_order", lambda rids: seen.append(list(rids)))
+    hold = _laned(MIXED)
+    park_l3.note_hold_order(hold)
+    h = _sched(running=SEATS - 3)
+    out = park_l3.issue_deferred_reads(h, hold)
+    assert seen and seen[0][:3] == [r.rid for r in out], (seen, [r.rid for r in out])
+    assert seen[0] == ["d1", "g1", "a0", "b0", "c0", "e0", "f0", "h0"]
+
+
+def test_mixed_lanes_the_decision_is_the_same_on_every_rank():
+    """Three TP ranks with the same schedule and the same lanes (priority is the request's own field,
+    every rank gets it with the body): the same reads, the same order, the same waiters."""
+    ranks = [_sched(running=2) for _ in range(3)]
+    holds = [_laned(MIXED) for _ in range(3)]
+    for h, hold in zip(ranks, holds):
+        park_l3.issue_deferred_reads(h, hold)
+    assert ranks[0].issued == ranks[1].issued == ranks[2].issued == ["d1", "g1", "a0", "b0"]
+    waiting = [[r.rid for r in hold if park_l3.capacity_waiting(r)] for hold in holds]
+    assert waiting[0] == waiting[1] == waiting[2] == ["c0", "e0", "f0", "h0"]
+
+
+def test_mixed_lanes_same_lane_keeps_arrival_order_and_lane_zero_needs_no_field():
+    """No priority anywhere (a stock resume) = the pure arrival order of the gate before the hotfix."""
+    h = _sched()
+    hold = _hold(10)
+    out = park_l3.issue_deferred_reads(h, hold)
+    assert [r.rid for r in out] == [r.rid for r in hold[:6]]
+    assert [r.rid for r in park_l3._lane_sorted(hold)] == [r.rid for r in hold]
+
+
+def test_the_lane_order_reads_nothing_but_the_requests_own_priority():
+    import ast
+    import inspect
+    import textwrap
+
+    seen = set()
+    for node in ast.walk(ast.parse(textwrap.dedent(inspect.getsource(park_l3._lane_sorted)))):
+        if isinstance(node, ast.Attribute):
+            seen.add(node.attr)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            seen.add(node.value)
+    banned = {"tp_rank", "rank", "attn_tp_rank", "dp_rank", "local_rank", "free_pages", "available_size",
+              "evictable_size", "tree_cache"}
+    assert not (seen & banned), sorted(seen & banned)
+    assert "priority" in seen
