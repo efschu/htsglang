@@ -54,6 +54,14 @@ NOW = 1_000_000.0
 
 
 # ------------------------------------------------------------------ helpers
+@pytest.fixture(autouse=True)
+def _lanes_switch_pinned_off_int24f5(monkeypatch):
+    """int24f5: FLLIPER_PDFLIP_LANES is ON by default now (user word 13.10.2026).  The tests of this file were written against "unset = off" and
+    name the switch state explicitly wherever they need it on; the unset state is pinned to the old value so the switch-off tests keep
+    testing the ``=0`` path.  The new default itself is pinned in test_pdflip_lanes_default_on_1013.py."""
+    monkeypatch.setenv("FLLIPER_PDFLIP_LANES", "0")
+
+
 class Rpc:
     """The front's ``rpc`` stub: records every call, answers like L2 / L3 are specified to."""
 

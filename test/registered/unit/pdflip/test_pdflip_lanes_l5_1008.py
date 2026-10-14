@@ -21,6 +21,8 @@ import ast
 import os
 import types
 import unittest
+
+import pytest
 from types import SimpleNamespace
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
@@ -30,6 +32,14 @@ from flliper.srt.managers import scheduler as sch  # noqa: E402
 from flliper.srt.pdflip import d_lane, lanes, lanes_p  # noqa: E402
 
 _SRT = os.path.join(os.path.dirname(io.__file__), "..")
+
+
+@pytest.fixture(autouse=True)
+def _lanes_switch_pinned_off_int24f5(monkeypatch):
+    """int24f5: FLLIPER_PDFLIP_LANES is ON by default now (user word 13.10.2026).  The tests of this file were written against "unset = off" and
+    name the switch state explicitly wherever they need it on; the unset state is pinned to the old value so the switch-off tests keep
+    testing the ``=0`` path.  The new default itself is pinned in test_pdflip_lanes_default_on_1013.py."""
+    monkeypatch.setenv("FLLIPER_PDFLIP_LANES", "0")
 
 
 def _src(*parts):
@@ -140,6 +150,7 @@ class HandlerBehaviourTest(unittest.TestCase):
 
     def test_switch_off_is_a_refusal_naming_the_switch_and_no_state(self):
         old = {k: os.environ.pop(k, None) for k in _Env.KEYS}
+        os.environ["FLLIPER_PDFLIP_LANES"] = "0"   # int24f5: unset is ON now -- the switch-off path is the explicit 0
         try:
             s = _stage(0)
             out = sch.Scheduler.handle_pdflip_lane_floor(s, io.PdFlipLaneFloorReqInput(floor=1, epoch=1))

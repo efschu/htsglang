@@ -38,6 +38,14 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 PDFLIP = os.path.join(HERE, "..", "..", "..", "..", "python", "flliper", "srt", "pdflip")
 
 
+@pytest.fixture(autouse=True)
+def _lanes_switch_pinned_off_int24f5(monkeypatch):
+    """int24f5: FLLIPER_PDFLIP_LANES is ON by default now (user word 13.10.2026).  The tests of this file were written against "unset = off" and
+    name the switch state explicitly wherever they need it on; the unset state is pinned to the old value so the switch-off tests keep
+    testing the ``=0`` path.  The new default itself is pinned in test_pdflip_lanes_default_on_1013.py."""
+    monkeypatch.setenv("FLLIPER_PDFLIP_LANES", "0")
+
+
 class _Req:
     def __init__(self, path, payload):
         self.path = path
@@ -109,11 +117,14 @@ def test_the_names_l2_to_l4_are_written_against():
         "FLLIPER_PDFLIP_LANES", "FLLIPER_PDFLIP_LANE_KEEPALIVE_S", "FLLIPER_PDFLIP_LANE_PREEMPT_CHUNK_TOKENS")
 
 
-def test_env_defaults_and_readers():
-    assert envs.FLLIPER_PDFLIP_LANES.get() is False
+def test_env_defaults_and_readers(monkeypatch):
+    monkeypatch.delenv("FLLIPER_PDFLIP_LANES", raising=False)   # the file pins "unset" to 0 (autouse fixture): look at the real default
+    assert envs.FLLIPER_PDFLIP_LANES.get() is True               # int24f5: ON by default (was False up to int24f4)
     assert envs.FLLIPER_PDFLIP_LANE_KEEPALIVE_S.get() == 15
     assert envs.FLLIPER_PDFLIP_LANE_PREEMPT_CHUNK_TOKENS.get() == 0
-    assert (LN.enabled(), LN.keepalive_s(), LN.preempt_chunk_tokens()) == (False, 15, 0)
+    assert (LN.enabled(), LN.keepalive_s(), LN.preempt_chunk_tokens()) == (True, 15, 0)
+    monkeypatch.setenv("FLLIPER_PDFLIP_LANES", "0")
+    assert LN.enabled() is False
     with envs.FLLIPER_PDFLIP_LANES.override(True), envs.FLLIPER_PDFLIP_LANE_KEEPALIVE_S.override(7), \
             envs.FLLIPER_PDFLIP_LANE_PREEMPT_CHUNK_TOKENS.override(2048):
         assert (LN.enabled(), LN.keepalive_s(), LN.preempt_chunk_tokens()) == (True, 7, 2048)
