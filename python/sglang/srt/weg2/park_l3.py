@@ -249,6 +249,18 @@ def _seat_note(room, in_req: int) -> str:
     return "" if room is None else " seat_room=%d reading=%d" % (int(room), int(in_req))
 
 
+def _lane_sorted(hold) -> list:
+    """LANES HOTFIX 1014 (NF h6 11:21:06Z, weg2-15-30 lane 1 read LAST and the ORDERED-EVICT victim of five
+    lane-held lane-0 reads): the hold is read -- and its kept pages leave the arena -- highest lane first;
+    inside a lane the hold order stays.  ``priority`` is the request's own field, so every rank sorts alike."""
+    def _lane(r) -> int:
+        try:
+            return int(getattr(r, "priority", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+    return sorted(list(hold or ()), key=lambda r: -_lane(r))
+
+
 def issue_deferred_reads(sched, hold) -> list:
     """``#1443 DORMANT-RELEASE``: issue the store read of every held request
     whose intake only looked it up, in hold order. Every rank runs this at
@@ -271,7 +283,7 @@ def issue_deferred_reads(sched, hold) -> list:
     count, no reserve; nothing here runs in a decode or a flip leg. Every
     input is replicated (request lengths, hold order, the shared arena's
     geometry), so every rank decides alike."""
-    reqs = [r for r in list(hold or ()) if deferred(r)]
+    reqs = [r for r in _lane_sorted(hold) if deferred(r)]
     if not reqs:
         return []
     cap = arena_capacity(sched) if arena_gate_on() else None
@@ -306,7 +318,7 @@ def issue_capacity_waiters(sched, settle) -> list:
     them beside the issued reads still in the settle or released and not yet
     admitted (queued: their load-back has not freed the arena yet). Returns those issued;
     their settle clock restarts now (waiting is not reading)."""
-    waiters = [r for r in list(settle or ()) if capacity_waiting(r)]
+    waiters = [r for r in _lane_sorted(settle) if capacity_waiting(r)]  # LANES HOTFIX 1014: highest lane first
     if not waiters:
         return []
     cap = arena_capacity(sched) if arena_gate_on() else None
@@ -383,7 +395,7 @@ def note_hold_order(hold) -> None:
     try:
         from sglang.srt.weg2 import handoff_pending as _hp
 
-        _hp.note_read_order([str(getattr(r, "rid", "") or "") for r in (hold or ())])
+        _hp.note_read_order([str(getattr(r, "rid", "") or "") for r in _lane_sorted(hold)])
     except Exception:  # noqa: BLE001 - the order is an improvement, never a wall
         logger.warning("#248e hold order not noted", exc_info=True)
 

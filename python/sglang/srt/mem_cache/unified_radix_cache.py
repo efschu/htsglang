@@ -8690,8 +8690,32 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             can_terminate = False
 
         operation_terminated = operation.is_terminated()
+        # SA-RACE (NF bc35462240, PP0 10:31:31-34, weg2-56-163): a SHORT read
+        # marks the operation terminated inside the KV transfer, and only
+        # AFTERWARDS does the io thread read the recurrent state at the
+        # deepest landed anchor (_short_read_anchor_transfer, extra_ms=371)
+        # and set pool_transfers_done. The MAX above let `terminated` reap
+        # in between: `_weg2_short_anchor_pages` was still None, #257 fell
+        # back to the store's PRESENCE answer (89472), the stateless prefix
+        # was inserted, PP0's walk refused it (#904 MambaComponent:absent),
+        # #TF put told=0 on the wire -> 142861-token full prefill. Measured
+        # in that boot: 3/3 #TF fallbacks reaped before the SA line, 7/7
+        # SA-before-reap resumed at the anchor. A read whose component pools
+        # are still being transferred holds the termination (same slot as
+        # the H45 tail hold, so the group holds uniformly), bounded by the
+        # operation's own timeout budget.
+        _sa_pending = bool(
+            getattr(operation, "pool_transfers", None)
+            and not getattr(operation, "pool_transfers_done", True)
+            and getattr(operation, "read_start_time", None) is not None
+            and not self._prefetch_timeout_check_linear_func(operation)
+        )
         states = torch.tensor(
-            [1 - int(can_terminate), int(operation_terminated), int(bool(tail_hold))],
+            [
+                1 - int(can_terminate),
+                int(operation_terminated),
+                int(bool(tail_hold) or _sa_pending),
+            ],
             dtype=torch.int,
         )
         self._all_reduce_attn_groups(
