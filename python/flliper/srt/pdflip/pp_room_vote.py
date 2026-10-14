@@ -394,12 +394,21 @@ def set_cap(tree, cap: Optional[int]) -> None:
     setattr(tree, PP_ROOM_CAP_ATTR, None if cap is None else int(cap))
 
 
+#: fix 43: PP0 sizes a pass on its own walk when no follower fact is fresh (default on; ``0`` = publish nothing, as before).
+#: Only taken where the followers execute PP0's row (``prefill_oom_retreat.followers_execute_row``).
+ENV_OWN_WALK = "FLLIPER_PDFLIP_PP_ROOM_OWN_WALK"
+
+
 def own_walk_enabled(env=None) -> bool:
-    """PP0 caps its own pass on its own walk when no follower fact is fresh (fix 43). ``0`` = the old publish-nothing."""
+    """PP0 caps its own pass on its own walk when no follower fact is fresh (fix 43). ``0`` = the old publish-nothing.
+
+    The switch is necessary, not sufficient: the cap is never stamped on list m, so it is only taken where the followers
+    execute PP0's row (``prefill_oom_retreat.followers_execute_row``, checked at the call site in
+    ``SchedulerPPMixin._pdflip_pp_room_pass_hook``). Carrierless, a PP0-only cap is a chunk-width divergence (W27/#1233)."""
     import os
 
     e = os.environ if env is None else env
-    return (e.get("FLLIPER_PDFLIP_PP_ROOM_OWN_WALK", "") or "").strip().lower() not in ("0", "false", "no", "off")
+    return (e.get(ENV_OWN_WALK, "") or "").strip().lower() not in ("0", "false", "no", "off")
 
 
 def note_own_only(tree, cap: int, book: "RoomBook", own_fundable: int) -> None:

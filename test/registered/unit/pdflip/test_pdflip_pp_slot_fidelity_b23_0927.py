@@ -487,7 +487,8 @@ class Wiring(CustomTestCase):
 
         src = open(urc.__file__).read()
         i = src.index("if floor < kv_tokens:")
-        self.assertIn("_sf.local_pp_room(self, kv_tokens, floor", src[i - 700:i])
+        # the window grew with the PREFILL-OOM-RETREAT try/except (lock unwind) around the call: same order, wider text
+        self.assertIn("_sf.local_pp_room(self, kv_tokens, floor", src[i - 1700:i])
 
 
 if __name__ == "__main__":
