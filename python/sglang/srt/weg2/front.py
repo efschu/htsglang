@@ -10926,6 +10926,16 @@ class Front:
             return 0
         return self._d_carried_tokens()
 
+    def _dc_lane_raised(self) -> bool:
+        """LANES HOTFIX 3 1014 (NF 10:24-10:30Z: every lane-1 prefill on D waited the full 7.5 s d_check with
+        n=1 while lane 0 was parked, lanes{0:{running_d:0, parked:6}}): with the floor raised every lower lane is
+        parked -- there are no decodes to protect, and the raised lane is the interactive one. No collect window."""
+        try:
+            ls = self.__dict__.get("_lane_state_obj")
+            return bool(_lanes.enabled() and ls is not None and int(ls.lane_floor) > 0)
+        except Exception:  # noqa: BLE001 -- never the route's fault
+            return False
+
     def _dc_d_busy(self) -> bool:
         """D decodes, or prefills a granted SHORT: the arrivals collect."""
         return self._dc_decoding() or self._dc_carried() > 0
@@ -10945,6 +10955,8 @@ class Front:
         window is off or D was not decoding when the prefill arrived."""
         win = self._dc_window_s()
         if win <= 0.0:
+            return None
+        if Front._dc_lane_raised(self):
             return None
         st = self._dc_st()
         if st["route"] == "P":
@@ -11056,6 +11068,8 @@ class Front:
         route BATCH, the flip takes it)."""
         win = self._dc_window_s()
         if win <= 0.0:
+            return None
+        if Front._dc_lane_raised(self):
             return None
         st = self._dc_st()
         if st["route"] == "P":
