@@ -10908,7 +10908,11 @@ class Front:
         D = self.groups.get("D") if isinstance(self.groups, dict) else None
         if D is None:
             return 0
-        return book.pending_tokens(now=time.time(), live=D.outstanding)
+        # LANES FIX 1014 (NF 10:29:36-10:30:15Z): a granted SHORT that D PARKED (lane park, PARK-IMMEDIATE) or holds
+        # for RESUME-VIA-P is not prefilling.  D.outstanding kept those rows alive forever (54-149/54-150 parked
+        # by the lane preempt before their first content) -> _dc_d_busy() always True -> every arrival on an idle
+        # D sat the full d_check.  The book reads what D really runs, the same ledger _dc_decoding() reads.
+        return book.pending_tokens(now=time.time(), live=set(self._flip_ledger(D)))
 
     def _d_carried_tokens(self) -> int:
         """X-SUM-PRICE (user 05.10. "pending token werden gesammelt und als
