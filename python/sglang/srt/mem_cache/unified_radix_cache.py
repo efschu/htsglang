@@ -1012,6 +1012,19 @@ _UD_REFUSED_LAST_T: dict = {}
 _UD_REFUSED_N = [0]
 
 
+class PrefetchRidMismatch(RuntimeError):
+    """PREFETCH-RID-NET-1014: the ranks met in a store read's termination
+    collective for different rids -- a named group stop (raenge-nie-uneins)."""
+
+
+def _prefetch_rid_fingerprint(rid: str) -> int:
+    """PREFETCH-RID-NET-1014: a positive 30-bit fingerprint of a rid, the same on
+    every rank (crc32 of the utf-8 bytes; no process-salted hash)."""
+    import zlib
+
+    return int(zlib.crc32(str(rid).encode("utf-8", "replace")) & 0x3FFFFFFF) + 1
+
+
 def _ud_refused_note(tree, node, _sf) -> None:
     """PREFILL-OOM instrument (NF 13.10. 11:59:14Z, leaf [6193] 135872 rows): a write_back leaf whose backup was
     refused AND that could not be dropped stays on the device with everything behind it -- and neither UD nor UD-H
@@ -8757,19 +8770,38 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             and getattr(operation, "read_start_time", None) is not None
             and not self._prefetch_timeout_check_linear_func(operation)
         )
-        states = torch.tensor(
-            [
-                1 - int(can_terminate),
-                int(operation_terminated),
-                int(bool(tail_hold) or _sa_pending),
-            ],
-            dtype=torch.int,
-        )
+        _rid_net = bool(envs.SGLANG_WEG2_PREFETCH_RID_NET.get())
+        _rid = str(getattr(operation, "request_id", "") or "")
+        _rid_h = _prefetch_rid_fingerprint(_rid) if _rid_net else 0
+        _vals = [
+            1 - int(can_terminate),
+            int(operation_terminated),
+            int(bool(tail_hold) or _sa_pending),
+        ]
+        if _rid_net:
+            # PREFETCH-RID-NET-1014: the rid rides the SAME MAX (h and -h): max == min on every
+            # rank iff every rank reached this collective for the same rid
+            _vals += [_rid_h, -_rid_h]
+        states = torch.tensor(_vals, dtype=torch.int)
         self._all_reduce_attn_groups(
             states,
             torch.distributed.ReduceOp.MAX,
             label="can_terminate_prefetch",
         )
+        if _rid_net and (int(states[3].item()) != -int(states[4].item())):
+            # every rank sees the same max/min pair, so every rank stops here alike -- the user law
+            # raenge-nie-uneins-crash-stop (29.08.): a detected rank disagreement is a named STOP,
+            # never a 'not done' and on
+            _gmax, _gmin = int(states[3].item()), -int(states[4].item())
+            msg = (
+                "PREFETCH-RID-MISMATCH rids=[local=%s h=%d group_max_h=%d group_min_h=%d] -- the ranks "
+                "reached the store read's termination collective (can_terminate_prefetch) for DIFFERENT "
+                "rids: a rank-local skip before a group collective (NF h18 16:23:24, the gloo abort this "
+                "replaces). Ranks never disagree: the group stops here, by name, on every rank."
+                % (_rid, _rid_h, _gmax, _gmin)
+            )
+            logger.error(msg)
+            raise PrefetchRidMismatch(msg)
         can_terminate = states[0].item() == 0
         operation_terminated = states[1].item() == 1
         done = can_terminate or operation_terminated
