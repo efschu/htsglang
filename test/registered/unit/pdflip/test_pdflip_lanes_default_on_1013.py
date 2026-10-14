@@ -333,3 +333,35 @@ def test_the_served_front_starts_the_lane_loop_only_with_the_switch_on():
     src = inspect.getsource(fr)
     i = src.index('app["lane_ctl"] = asyncio.create_task(_lctl.loop(self))')
     assert "if _lanes.enabled():" in src[i - 200:i]
+
+
+# ------------------------------------------------------------------ 6. earlycap x lanes (the merge's one shared surface in the P-phase begin)
+def test_a_lane_held_early_leg_frees_its_place_under_the_earlycap_seat_cap():
+    """int24f earlycap (``_leg1_early_limit``: the seat gate's cap minus the early legs in flight IN THE QUEUE) and the lanes' DEFER/hold path
+    (``lane_ctl._cancel_early``: the held Pending leaves ``queue`` and its early leg is cancelled by ``_leg1_early_cancel``) meet at
+    ``Pending._leg1_early``.  Both intents: the cap counts the early legs of the queue, and a lane-held one no longer counts."""
+    from flliper.srt.pdflip import lane_ctl as LC
+    from test_pdflip_lanes_l4_1008 import _pend
+
+    async def body():
+        with _switch(None):
+            f = _front("D")
+            f.p_concurrency = 4
+            f._dc_p_cap = 2                                   # the seat gate's cap for this D>P flip
+            a, b = _pend(f, "pdflip-0-1", 0, 100.0), _pend(f, "pdflip-0-2", 0, 101.0)
+            for p in (a, b):
+                p._leg1_early = asyncio.ensure_future(asyncio.sleep(30))
+                f.queue.append(p)
+            assert Front._leg1_early_limit(f) == 0            # cap 2, two early legs in flight: no third
+            f.groups["P"].outstanding[a.rid] = 100.0
+            lc = LC.ctl(f)
+            assert LC._cancel_early(f, lc, a, 102.0, when="hold", target=1) is True      # the lane takes the early leg back
+            f.queue.remove(a)                                 # held out of the queue (what lane_ctl does with a held Pending)
+            assert a._leg1_early is None
+            assert Front._leg1_early_limit(f) == 1            # one early leg left in flight: the cap has room for one more
+            for p in (a, b):
+                t = p._leg1_early
+                if t is not None:
+                    t.cancel()
+            await asyncio.sleep(0)
+    asyncio.run(body())
