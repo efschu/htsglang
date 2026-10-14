@@ -2372,10 +2372,10 @@ D_GC_FREEZE_DEFAULT = "off"
 #: boot objects stood PP0/PP1 still 4.4-5.4 s inside a flip once the cold heap was
 #: swapped out; ``done/nf-flip-langsam-analyse-1013.md``).  'on' = every P scheduler
 #: calls gc.freeze() once after boot, as --d-gc-freeze does for D.  'off' (default) =
-#: no env from this flag.  The nextflash row turns the switch on for BOTH groups by
-#: default (form.NEXTFLASH_GROUP_SWITCH_DEFAULTS -> --env-p/--env-d
+#: no env from this flag.  The nextflash and qwen27b rows turn the switch on for BOTH
+#: groups by default (form.*_GROUP_SWITCH_DEFAULTS -> --env-p/--env-d
 #: FLLIPER_PDFLIP_GC_FREEZE=1; ``--env-p/--env-d FLLIPER_PDFLIP_GC_FREEZE=0`` = the old
-#: path); the qwen27b row states nothing.
+#: path; RC4 fix round 1, user order 14.10.: new features default ON).
 P_GC_FREEZE_DEFAULT = "off"
 
 
@@ -14450,7 +14450,7 @@ def apply_profile_group_switch_defaults(ns, environ: Optional[Mapping[str, str]]
     build_env hands every group), is left alone -- an explicit value always
     wins, =0 turns the switch off. Written INTO the group env so every reader
     (the D solve, the ranks; build_env applies --env-* last) sees ONE value.
-    Returns the line naming what was written, or None (qwen27b: nothing)."""
+    Returns the line naming what was written, or None (qwen27b: GC_FREEZE only)."""
     row = pdflip_form.profile_row(getattr(ns, "profile", None))
     rows = dict(getattr(row, "group_switch_defaults", None) or {}) if row is not None else {}
     if not rows:
@@ -23520,13 +23520,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--d-gc-freeze", choices=["off", "on"], default=D_GC_FREEZE_DEFAULT,
         help="Group D: 'on' = every D scheduler calls gc.freeze() once after boot (all CUDA "
              "graphs captured), so gen-2 collections no longer walk the boot objects (agent FR "
-             "26.09.: ~0.5 s single-rank D-round stalls). 'off' (default) = no env.")
+             "26.09.: ~0.5 s single-rank D-round stalls). 'off' (default) = no env from this flag; the profile rows (qwen27b, nextflash) turn the switch on by default (--env-d FLLIPER_PDFLIP_GC_FREEZE=0 = off).")
     ap.add_argument(
         "--p-gc-freeze", choices=["off", "on"], default=P_GC_FREEZE_DEFAULT,
         help="Group P: 'on' = every P scheduler calls gc.freeze() once after boot (all CUDA "
              "graphs captured), so gen-2 collections no longer walk the boot objects (NF "
              "13.10.: 4.4-5.4 s PP0/PP1 collections inside flips). 'off' (default) = no env "
-             "from this flag; the nextflash profile turns the switch on for P and D by default "
+             "from this flag; the profile rows (qwen27b, nextflash) turn the switch on for P and D by default "
              "(--env-p/--env-d FLLIPER_PDFLIP_GC_FREEZE=0 = off there).")
     ap.add_argument(
         "--d-reshard-presets", default="auto", metavar="SPEC",

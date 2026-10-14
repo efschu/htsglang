@@ -90,8 +90,9 @@ def _drive_sampler(f, readings, step_s=0.5, t0=1_000_000.0, guards="off"):
     a measured fact of the run and not an assumption.
 
     27B line (RC4 port): the front's W22/W98 guards are switched by ``FLLIPER_PDFLIP_HOST_GUARD_W22`` / ``_W98`` (user
-    decision 06.10., default ``on`` = the verdict and ``do_stop`` of before). The NF warn behaviour is the switch OFF
-    state here, so the warn tests run with ``guards="off"``; ``guards="on"`` is the 27B default.
+    decision 06.10.). RC4 fix round 1: the default is ``off`` = the NF warn behaviour (user rule 06.10.: no host-RAM
+    refusal); ``on`` (explicit) = the verdict and ``do_stop`` of RC3. ``guards=None`` leaves both variables unset, so
+    the code default decides.
     """
     stop_calls = []
     clock = {"t": t0, "i": 0}
@@ -124,7 +125,8 @@ def _drive_sampler(f, readings, step_s=0.5, t0=1_000_000.0, guards="off"):
         except _Cancel:
             pass
 
-    with mock.patch.dict(os.environ, {"FLLIPER_PDFLIP_HOST_GUARD_W22": guards, "FLLIPER_PDFLIP_HOST_GUARD_W98": guards}), \
+    _guard_env = {} if guards is None else {"FLLIPER_PDFLIP_HOST_GUARD_W22": guards, "FLLIPER_PDFLIP_HOST_GUARD_W98": guards}
+    with mock.patch.dict(os.environ, _guard_env), \
          mock.patch.object(hl, "read_cgroup_pressure", fake_pressure), \
          mock.patch.object(hl, "read_cgroup", lambda *a, **k: {"current": 1}), \
          mock.patch.object(hl, "read_cgroup_anon_bytes", lambda *a, **k: None), \
@@ -132,6 +134,9 @@ def _drive_sampler(f, readings, step_s=0.5, t0=1_000_000.0, guards="off"):
          mock.patch.object(front_mod, "time", fake_front_time), \
          mock.patch.object(front_mod.asyncio, "sleep", fake_sleep), \
          mock.patch.object(f, "do_stop", fake_do_stop):
+        if guards is None:  # inside patch.dict: restored on exit
+            for _k in ("FLLIPER_PDFLIP_HOST_GUARD_W22", "FLLIPER_PDFLIP_HOST_GUARD_W98"):
+                os.environ.pop(_k, None)
         with mock.patch.object(front_mod.logger, "warning") as w, \
              mock.patch.object(front_mod.logger, "info") as i, \
              mock.patch.object(front_mod.logger, "error") as e:
@@ -358,9 +363,29 @@ class TheLatchArithmeticIsUnchangedForOtherCallers(CustomTestCase):
             self.assertIn(token, lb)
 
 
-class The27BSwitchesKeepTheirDefaultStop(CustomTestCase):
-    """RC4 port decision (27B line): the user's guard switches (06.10.) own the stop; ON (the default) is the old
-    verdict mode byte for byte, OFF is the NF host-warn mode of the tests above."""
+class The27BSwitchesDefaultToWarning(CustomTestCase):
+    """RC4 fix round 1 (27B line): the user's guard switches (06.10.) own the stop. The host-RAM rule of 06.10. (warn,
+    never refuse) is younger than the switches and makes OFF the default: with both variables unset the front warns
+    exactly like the NF line; an explicit ON is the old verdict mode byte for byte."""
+
+    def test_default_without_the_switch_variables_warns_and_never_stops(self):
+        f = _front()
+        stop_calls, lines = _drive_sampler(f, _int24g_series(), guards=None)
+        self.assertEqual(stop_calls, [], f"the front stopped itself on host RAM by default: {stop_calls}")
+        self.assertNotEqual(f.state, "STOP")
+        self.assertTrue([l for l in lines["warning"] if MARKER in l and " W98 " in l], lines["warning"][:3])
+
+    def test_default_without_the_switch_variables_does_not_stop_over_the_level_bound(self):
+        over, under = TheLevelGuardWarnsToo()._over()
+        f = _front()
+        stop_calls, lines = _drive_sampler(f, [under] * 2 + [over] * 60, guards=None)
+        self.assertEqual(stop_calls, [])
+        self.assertTrue([l for l in lines["warning"] if MARKER in l and " W22 " in l], lines["warning"][:3])
+
+    def test_the_declared_defaults_are_off(self):
+        from flliper.srt.environ import envs
+        self.assertEqual((envs.FLLIPER_PDFLIP_HOST_GUARD_W22.default, envs.FLLIPER_PDFLIP_HOST_GUARD_W98.default),
+                         ("off", "off"))
 
     def test_w98_switch_on_still_stops_on_the_int24g_reading(self):
         f = _front()

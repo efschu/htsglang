@@ -11,7 +11,7 @@ a Python generation-2 collection on that rank's scheduler.  Upstream arms
   scheduler is up (boot-time collections during weight load are not the
   question).  Default 0.0 -> nothing, as upstream.
 * ``FLLIPER_PDFLIP_GC_FREEZE=1`` (launcher ``--d-gc-freeze on`` / ``--p-gc-freeze
-  on``, and the nextflash row's group switch defaults for P and D): one
+  on``, and the nextflash and qwen27b rows' group switch defaults for P and D): one
   ``gc.freeze()`` at the same point -- after every runner in the process has
   captured its CUDA graphs -- so later gen-2 passes no longer walk the boot
   objects.  Unset (default) -> nothing.

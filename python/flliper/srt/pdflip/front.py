@@ -8005,10 +8005,10 @@ class Front:
         # warning marker is ``HOST-RAM-WARN`` (host_ledger.HOST_WARN_MARKER),
         # once per episode, re-armed on recovery.
         # RC4 port of NF HOST-WARN (user rule 06.10.): the guard switches (user decision 06.10., 27B line) are read FIRST
-        # and decide the mode. Switch ON (default) = the verdict mode of before, byte for byte (do_stop below); switch OFF
-        # = the HOST-RAM-WARN episode mode of the NF line (one warning per episode, a CLEARED line, the front goes on).
-        # Nutzerentscheid 06.10.: W22 and W98 are switched SEPARATELY (FLLIPER_PDFLIP_HOST_GUARD_W22 / _W98, default on =
-        # the do_stop below, byte for byte). Off = the line is logged but the front is not stopped.
+        # and decide the mode. Switch OFF (default since RC4 fix round 1) = the HOST-RAM-WARN episode mode of the NF line (one warning
+        # per episode, a CLEARED line, the front goes on); switch ON (explicit) = the verdict mode of RC3, byte for byte (do_stop below).
+        # Nutzerentscheid 06.10.: W22 and W98 are switched SEPARATELY (FLLIPER_PDFLIP_HOST_GUARD_W22 / _W98, default off = warn;
+        # on = the do_stop below, byte for byte). Off = the line is logged but the front is not stopped.
         _w22_on = guard_switches.flag_on(envs.FLLIPER_PDFLIP_HOST_GUARD_W22)
         _w98_on = guard_switches.flag_on(envs.FLLIPER_PDFLIP_HOST_GUARD_W98)
         for _gname, _gon in (("W22", _w22_on), ("W98", _w98_on)):
@@ -8174,7 +8174,7 @@ class Front:
                     if _w22_ev in ("enter", "remind"):
                         self.counters["host_watermark_breach"] += 1
                         if _w22_on:
-                            # switch ON (default, user decision 06.10.): the controlled teardown of before, unchanged
+                            # switch ON (explicit, user decision 06.10.): the controlled teardown of before, unchanged
                             logger.error("%s", verdict)
                             self.do_stop("W22 PdFlipHostWatermarkBreached", verdict)
                             return

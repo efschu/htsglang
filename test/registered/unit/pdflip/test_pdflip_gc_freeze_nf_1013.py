@@ -13,7 +13,7 @@ Pinned here, without a GPU:
 * a later CUDA-graph capture does not unfreeze it (``base_cuda_graph_runner.freeze_gc`` --
   ``gc.unfreeze()`` would hand the boot heap back and collect it inside a flip);
 * the launcher side: ``--p-gc-freeze``, the nextflash row's group defaults (freeze on P and
-  D, GC warning on D), qwen27b untouched, a stated ``=0`` wins;
+  D, GC warning on D), the qwen27b row freezes P and D too (RC4 fix round 1), a stated ``=0`` wins;
 * the GC warning is armed on D (a real ``gc.callbacks`` entry).
 """
 
@@ -228,13 +228,16 @@ def test_nextflash_freezes_p_and_d_by_default_and_warns_on_d():
     assert G.WARN_ENV not in p
 
 
-def test_qwen27b_states_nothing():
+def test_qwen27b_freezes_p_and_d_by_default_but_arms_no_warning():
+    """RC4 fix round 1 (user order 14.10.: new features default ON): the model-neutral freeze is on for the 27B
+    too; the D warning stays the NF row's own entry."""
     row = F.PROFILES[Q]
     flat = str(dict(getattr(row, "group_switch_defaults", {}) or {}))
-    assert G.FREEZE_ENV not in flat and G.WARN_ENV not in flat
-    assert _group_env(Q, "P") == {} and _group_env(Q, "D") == {}
-    # and no form-wide default reaches the 27B
+    assert G.FREEZE_ENV in flat and G.WARN_ENV not in flat
+    assert _group_env(Q, "P") == {G.FREEZE_ENV: "1"} and _group_env(Q, "D") == {G.FREEZE_ENV: "1"}
+    # no form-wide default reaches either line: the switch is a per-group env of the row
     assert G.FREEZE_ENV not in F.PROFILE_SWITCH_DEFAULTS.get(Q, {})
+    assert G.FREEZE_ENV not in F.PROFILE_SWITCH_DEFAULTS.get(NF, {})
 
 
 @pytest.mark.parametrize("attr,group", [("env_p", "P"), ("env_d", "D")])

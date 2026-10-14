@@ -570,12 +570,12 @@ CURATED: Dict[str, Dict[str, object]] = {
         "satz_quelle": "WML Z. 18 (Abschnitt A)", "depends": []},
     "FLLIPER_PDFLIP_HOST_GUARD_W22": {
         "kind": "env", "group": 'Watchdogs', "level": "expert", "planner_derived": False,
-        "text": '27B tree only. W22 HostWatermarkBreached (host RAM level) stops the front. Text value on/off (on/1/true/yes, off/0/false/no), default on. With off the verdict is logged ("HOST GUARD W22 AUS: NOT stopping", throttled), NOTHING is stopped; at front start a loud WARNING "HOST GUARD W22 AUS: Host-RAM ist nicht mehr geschützt" appears. A typo counts as on. The threshold (--host-riegel-gib, host_ledger mark) stays unchanged.',
+        "text": '27B tree only. W22 HostWatermarkBreached (host RAM level). Text value on/off (on/1/true/yes, off/0/false/no), default off since RC4 fix round 1 (user rule 06.10.: host RAM warns, it never stops): the breach is logged as HOST-RAM-WARN episode lines, NOTHING is stopped, and at front start a loud WARNING "HOST GUARD W22 AUS: Host-RAM ist nicht mehr geschützt" appears. With on the breach stops the front (RC3 behaviour). A typo counts as on. The threshold (--host-riegel-gib, host_ledger mark) stays unchanged.',
         "gain": "", "cost": 'With off the host RAM is no longer protected (wording of the start warning).',
         "satz_quelle": "WML Z. 19 (Abschnitt A); 27B-eigen WML Z. 39 (Abschnitt D, Punkt 1)", "depends": []},
     "FLLIPER_PDFLIP_HOST_GUARD_W98": {
         "kind": "env", "group": 'Watchdogs', "level": "expert", "planner_derived": False,
-        "text": '27B tree only. W98 HostRateLatched (rate latch), switchable separately from W22; otherwise like W22 (text value on/off, default on; with off WARNING "HOST GUARD W98 AUS: Host-RAM ist nicht mehr geschützt"). With off the W22 level test continues in the same tick.',
+        "text": '27B tree only. W98 HostRateLatched (rate latch), switchable separately from W22; otherwise like W22 (text value on/off, default off since RC4 fix round 1: HOST-RAM-WARN episode lines and the WARNING "HOST GUARD W98 AUS: Host-RAM ist nicht mehr geschützt"; with on the latch stops the front). With off the W22 level test continues in the same tick.',
         "gain": "", "cost": 'With off the host RAM is no longer protected (wording of the start warning).',
         "satz_quelle": "WML Z. 20 (Abschnitt A); 27B-eigen WML Z. 39 (Abschnitt D, Punkt 1)", "depends": []},
     "FLLIPER_ADMISSION_WEDGE_SECONDS": {

@@ -7,7 +7,8 @@ default ON on the registry row ``nextflash`` with the value the running profile
 (nf-h91-dpr-sa-vis-adopt-st-cut-vsync-odx-2b-swr-e2cut-z30y2-arr-wre-ta-dh-ml-ef-
 rwf-pfo-pw-hc-tse-srw-tsw-dres.env) gave each GROUP; the launcher writes them into
 --env-p/--env-d (a stated or exported value wins) and takes --d-kv-token-cut owned
-as the row's default. The qwen27b row stays byte-identical. Class (d): the NaN
+as the row's default. The qwen27b row carries the model-neutral GC_FREEZE only (RC4 fix round 1: new
+features default ON, user order 14.10.), nothing else. Class (d): the NaN
 guards' wave/fetch checks are diagnostics and default OFF.
 """
 
@@ -77,9 +78,10 @@ class TestRegistryRows(CustomTestCase):
         self.assertEqual(dict(row.group_switch_defaults["D"]), PROFILE_D)
         self.assertEqual(row.d_kv_token_cut, "owned")
 
-    def test_qwen27b_row_is_unchanged(self):
+    def test_qwen27b_row_carries_the_gc_freeze_only(self):
         row = F.PROFILES[F.PROFILE_QWEN27B]
-        self.assertEqual(dict(row.group_switch_defaults), {})
+        self.assertEqual({g: dict(v) for g, v in row.group_switch_defaults.items()},
+                         {"P": {"FLLIPER_PDFLIP_GC_FREEZE": "1"}, "D": {"FLLIPER_PDFLIP_GC_FREEZE": "1"}})
         self.assertEqual(row.d_kv_token_cut, F.KV_TOKEN_CUT_OFF)
 
     def test_switch_defaults_do_not_carry_them(self):
@@ -120,10 +122,20 @@ class TestLauncherGroupDefaults(CustomTestCase):
         self.assertIsNone(L.apply_profile_group_switch_defaults(ns, environ=_clean_environ()))
         self.assertEqual((ns.env_p, ns.env_d), (env_p, env_d))
 
-    def test_qwen27b_envs_byte_identical(self):
+    def test_qwen27b_envs_get_the_gc_freeze_and_nothing_else(self):
         ns = _ns(F.PROFILE_QWEN27B, env_p="A=1", env_d="B=2;C=3")
-        self.assertIsNone(L.apply_profile_group_switch_defaults(ns, environ=_clean_environ()))
-        self.assertEqual((ns.env_p, ns.env_d), ("A=1", "B=2;C=3"))
+        line = L.apply_profile_group_switch_defaults(ns, environ=_clean_environ())
+        self.assertIn(L.GROUP_SWITCH_DEFAULTS_MARKER, line)
+        self.assertEqual((ns.env_p, ns.env_d), ("A=1;FLLIPER_PDFLIP_GC_FREEZE=1", "B=2;C=3;FLLIPER_PDFLIP_GC_FREEZE=1"))
+
+    def test_qwen27b_gc_freeze_stated_zero_or_exported_wins(self):
+        ns = _ns(F.PROFILE_QWEN27B, env_p="FLLIPER_PDFLIP_GC_FREEZE=0", env_d="B=2")
+        L.apply_profile_group_switch_defaults(ns, environ=_clean_environ())
+        self.assertEqual(ns.env_p, "FLLIPER_PDFLIP_GC_FREEZE=0")
+        ns = _ns(F.PROFILE_QWEN27B, env_p="", env_d="")
+        env = dict(_clean_environ(), FLLIPER_PDFLIP_GC_FREEZE="0")
+        self.assertIsNone(L.apply_profile_group_switch_defaults(ns, environ=env))
+        self.assertEqual((ns.env_p, ns.env_d), ("", ""))
 
 
 class TestLauncherTokenCutDefault(CustomTestCase):

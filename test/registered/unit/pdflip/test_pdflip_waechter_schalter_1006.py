@@ -108,8 +108,10 @@ class TestReaders(_Clean):
             envs.FLLIPER_PDFLIP_ENABLE_CONTROLLER_DEAD_STOP,
         ):
             self.assertIs(e.default, True, e.name)
+        # RC4 fix round 1: the host-RAM rule of 06.10. (warn, never refuse) is younger than the guard switches, so
+        # the 27B default of both guards is off (HOST-RAM-WARN); on is an explicit value
         self.assertEqual(
-            (envs.FLLIPER_PDFLIP_HOST_GUARD_W22.default, envs.FLLIPER_PDFLIP_HOST_GUARD_W98.default), ("on", "on"))
+            (envs.FLLIPER_PDFLIP_HOST_GUARD_W22.default, envs.FLLIPER_PDFLIP_HOST_GUARD_W98.default), ("off", "off"))
 
     def test_nonpositive_and_garbage_thresholds_are_the_default_never_zero(self):
         for bad in ("0", "-3", "nan", "inf", "abc", ""):
@@ -677,19 +679,26 @@ class TestHostGuards(_Clean):
                     p.stop()
         return stops, cap.output
 
-    def test_default_both_on_stops_on_the_rate_latch_first_exactly_as_before(self):
+    def test_default_both_off_warns_and_never_stops(self):
+        """RC4 fix round 1: with both variables unset the front does not stop on host RAM (user rule 06.10.)."""
         stops, log = self._run()
+        self.assertEqual(stops, [])
+        self.assertTrue(any("HOST GUARD W22 AUS" in m and "nicht mehr geschuetzt" in m for m in log))
+        self.assertTrue(any("HOST GUARD W98 AUS" in m and "nicht mehr geschuetzt" in m for m in log))
+
+    def test_explicit_both_on_stops_on_the_rate_latch_first_exactly_as_in_rc3(self):
+        stops, log = self._run(FLLIPER_PDFLIP_HOST_GUARD_W22="on", FLLIPER_PDFLIP_HOST_GUARD_W98="on")
         self.assertEqual(stops, ["W98 PdFlipHostRateLatched"])
-        self.assertFalse(any("HOST GUARD" in m for m in log), "default boot log carries no new line")
+        self.assertFalse(any("HOST GUARD" in m for m in log), "an explicit on carries no new line")
 
     def test_w98_off_leaves_w22_armed(self):
-        stops, log = self._run(FLLIPER_PDFLIP_HOST_GUARD_W98="off")
+        stops, log = self._run(FLLIPER_PDFLIP_HOST_GUARD_W22="on", FLLIPER_PDFLIP_HOST_GUARD_W98="off")
         self.assertEqual(stops, ["W22 PdFlipHostWatermarkBreached"])
         self.assertTrue(any("HOST GUARD W98 AUS: Host-RAM ist nicht mehr geschuetzt" in m for m in log))
         self.assertFalse(any("HOST GUARD W22 AUS" in m for m in log))
 
     def test_w22_off_leaves_w98_armed(self):
-        stops, log = self._run(FLLIPER_PDFLIP_HOST_GUARD_W22="0")
+        stops, log = self._run(FLLIPER_PDFLIP_HOST_GUARD_W22="0", FLLIPER_PDFLIP_HOST_GUARD_W98="on")
         self.assertEqual(stops, ["W98 PdFlipHostRateLatched"])
         self.assertTrue(any("HOST GUARD W22 AUS: Host-RAM ist nicht mehr geschuetzt" in m for m in log))
 

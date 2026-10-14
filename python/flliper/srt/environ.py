@@ -2740,13 +2740,13 @@ class Envs:
     FLLIPER_ADMISSION_WEDGE_MODE = EnvStr("act")
     # PREFILL-LIVELOCK (report only, never recovery): log (default) | off (no livelock verdict). Unknown word = log.
     FLLIPER_PREFILL_LIVELOCK_MODE = EnvStr("log")
-    # Host-RAM guards of the front (user decision 06.10.): ON/OFF per guard, separately. on (default; on/1/true/yes) = the
-    # existing do_stop. off (off/0/false/no) = the guard no longer stops (the line stays, "NOT stopping") and the front
-    # start writes a loud WARNING "HOST GUARD W22/W98 AUS: Host-RAM ist nicht mehr geschuetzt". The thresholds
-    # (--host-riegel-gib, host_ledger mark) are untouched. A typo reads as on. W22 = HostWatermarkBreached (level),
-    # W98 = HostRateLatched (rate).
-    FLLIPER_PDFLIP_HOST_GUARD_W22 = EnvStr("on")
-    FLLIPER_PDFLIP_HOST_GUARD_W98 = EnvStr("on")
+    # Host-RAM guards of the front (user decision 06.10.): ON/OFF per guard, separately. off (default since RC4 fix round 1,
+    # user rule 06.10. "keine Verweigerung wegen Host-RAM, nur warnen"; off/0/false/no) = the guard does not stop: HOST-RAM-WARN
+    # episode lines, and the front start writes the WARNING "HOST GUARD W22/W98 AUS: Host-RAM ist nicht mehr geschuetzt". on
+    # (on/1/true/yes, explicit only) = the do_stop of RC3. The thresholds (--host-riegel-gib, host_ledger mark) are untouched.
+    # A typo reads as on. W22 = HostWatermarkBreached (level), W98 = HostRateLatched (rate).
+    FLLIPER_PDFLIP_HOST_GUARD_W22 = EnvStr("off")
+    FLLIPER_PDFLIP_HOST_GUARD_W98 = EnvStr("off")
 
     # #788: per-rank admission-verdict trace. OFF by default -- it exists to
     # convert a MECHANISM proof into a captured value on one instrumented

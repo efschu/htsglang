@@ -651,8 +651,8 @@ class ModelProfile:
     #: ``--env-d`` unless that group's env or the launcher's own environment
     #: already states it (an explicit value always wins; launcher
     #: ``apply_profile_group_switch_defaults``), so the D solve and the ranks
-    #: read ONE value -- the torch_cache_cap / H95 pattern. {} = none (the
-    #: qwen27b row: its groups stay byte-identical).
+    #: read ONE value -- the torch_cache_cap / H95 pattern. {} = none; the
+    #: qwen27b row carries GC_FREEZE only (QWEN27B_GROUP_SWITCH_DEFAULTS).
     group_switch_defaults: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
     #: #239 --d-kv-token-cut: the launcher's DEFAULT for an unset flag on this
     #: row (launcher ``apply_profile_d_kv_token_cut_default``, applied before
@@ -765,7 +765,7 @@ _MC = "/spinning/llm_stuff/club-3090/models-cache/"
 #: dres.env) gave each group -- the row :attr:`ModelProfile.group_switch_defaults`
 #: of nextflash. Every reader below is an NF-only path (QSA attention, PLE,
 #: Form A, expert offload, the MTP tail hand-off) or reached only through this
-#: row; the qwen27b row carries none.
+#: row; the qwen27b row carries only the model-neutral GC_FREEZE (QWEN27B_GROUP_SWITCH_DEFAULTS).
 #:   P_TAIL_FOLD (H63/H63d) x177 burst 22.80 s (x176 27.01 s, -16 %), P only.
 #:   TAIL_KEEP_MIB 512 (H63b) x177, P+D (the inventory names 512 for nextflash).
 #:   PLE_STATE_HANDOFF (H63c) x177 digest P==D installed=yes, P+D.
@@ -786,7 +786,8 @@ _MC = "/spinning/llm_stuff/club-3090/models-cache/"
 #:   GC_FREEZE (NF 13.10., boot b60520f01d, GC-FREEZE 1013): the boot heap
 #:     (~1.12 M gen-2 objects) leaves the collector after boot on P AND D --
 #:     4.4-5.4 s gen-2 passes on PP0/PP1 stood the flip legs still (11 of 455
-#:     flips over 6 s, max 9.2 s). Metal proof pending; qwen27b states nothing.
+#:     flips over 6 s, max 9.2 s). Metal proof pending; the qwen27b row states the
+#:     same value (RC4 fix round 1, user order 14.10.: new features default ON).
 #:   GC_WARN_SECS 0.5 on D (same boot): P has armed the warning since 30.09.
 #:     (launcher apply_p_gc_warn_default); D had no instrument, the D-side
 #:     legs_barrier 3-4 s stalls stayed "probably, not proven".
@@ -816,6 +817,14 @@ NEXTFLASH_GROUP_SWITCH_DEFAULTS: Dict[str, Dict[str, str]] = {
         "FLLIPER_PDFLIP_ENABLE_CUT_WORKER_END": "1",
         "FLLIPER_PDFLIP_ENABLE_D_PARK_END": "1",
     }),
+}
+
+#: RC4 fix round 1 (user order 14.10. "Neue Features immer eingeschaltet"): the gen-2 GC pass over the never-frozen
+#: boot heap is model-neutral, so the qwen27b row freezes it on P and D too (FLLIPER_PDFLIP_GC_FREEZE=1 into
+#: --env-p/--env-d; a stated ``=0`` or an exported value wins). Nothing else of the NF table applies to the 27B.
+QWEN27B_GROUP_SWITCH_DEFAULTS: Dict[str, Dict[str, str]] = {
+    "P": {"FLLIPER_PDFLIP_GC_FREEZE": "1"},
+    "D": {"FLLIPER_PDFLIP_GC_FREEZE": "1"},
 }
 
 
@@ -871,6 +880,7 @@ PROFILES: Dict[str, ModelProfile] = {
         # 11cadf67a3. The S2 row carried the port's shipped default (3c9bfeff95
         # off) and described the 27B best form wrongly (UN6 docker check).
         repack_outside_pool=True,
+        group_switch_defaults=QWEN27B_GROUP_SWITCH_DEFAULTS,
         formats={
             "int8": WeightFormat("int8", note="compressed-tensors W8A8",
                                  checkpoint=_MC + "Qwen3.8-27B-INT8-gdncov-vocabembed"),
