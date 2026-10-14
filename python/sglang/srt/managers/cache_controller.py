@@ -3899,12 +3899,21 @@ class HiCacheController:
                 _end = min(_end, _cut)
                 _need = [i for i in _need if i < _end]
         _fills = {}
+        _fills_reffed = False
         _tf = time.perf_counter()
         if _need:
             _fill_fn = getattr(self.storage_backend, "arena_fill_from_disk", None)
             if callable(_fill_fn):
-                _got = _fill_fn(pool.arena, [stems[i] for i in _need], int(pool._page_bytes), prefix=True)
-                _fills = dict(zip(_need, _got))
+                # REF-AT-LAND-1014: the fill references every page as it lands;
+                # those references are ours (taken below instead of a ref here)
+                try:
+                    _got = _fill_fn(pool.arena, [stems[i] for i in _need], int(pool._page_bytes),
+                                    prefix=True, take_ref=True)
+                    _fills_reffed = bool(getattr(_got, "_arena", None) is not None)
+                except TypeError:   # a backend without the keyword
+                    _got = _fill_fn(pool.arena, [stems[i] for i in _need], int(pool._page_bytes), prefix=True)
+                    _fills_reffed = False
+                _fills = dict(zip(_need, list(_got)))
         _tf1 = time.perf_counter()
         _rs["l3fill"] = _rs.get("l3fill", 0.0) + (_tf1 - _tf) * 1000.0
         _rs["l3fill_pages"] = _rs.get("l3fill_pages", 0) + len(_need)
@@ -3918,10 +3927,17 @@ class HiCacheController:
                 continue
             # #1433: not in the L2 -- the L3 fill above read it (or not)
             fill = _fills.get(i)
-            if fill is None or pool.arena.ref_slots([fill], +1) != 1:
+            if fill is None or (not _fills_reffed and pool.arena.ref_slots([fill], +1) != 1):
                 break  # not on disk / evicted between fill and ref: the prefix ends here
             slots.append(fill)
             _fill_idx.append(i)
+            if _fills_reffed:
+                _fills.pop(i, None)   # its reference moved into the read
+        if _fills_reffed:
+            # REF-AT-LAND-1014: landed past where the prefix ended -- given back
+            _left = [int(v) for v in _fills.values() if v is not None]
+            if _left:
+                pool.arena.ref_slots_np(_np.asarray(_left, dtype=_np.int64), -1)
         if _recheck and _fill_idx:
             # ARENA-CHAIN (NF 14.10. 07:29:33Z, P PP0): the fill hands the slots out WITHOUT a reference; between
             # the fill and this reference another rank's full-arena claim (>= 256 slots per clock round) can have

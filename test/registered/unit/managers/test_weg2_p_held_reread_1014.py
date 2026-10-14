@@ -49,8 +49,10 @@ def _req(rid="weg2-1-11"):
 def _clean(monkeypatch):
     monkeypatch.delenv(T.P_HELD_REREAD_ENV, raising=False)
     SR._HELD.clear()
+    SR._MORE.clear()
     yield
     SR._HELD.clear()
+    SR._MORE.clear()
 
 
 def _reap_h17(rid="weg2-1-11"):
@@ -87,7 +89,8 @@ def test_full_read_or_store_short_is_not_reread():
     SR.note_reap("weg2-1-11", requested_pages=1475, hit_pages=1475, completed_tokens=1475 * 64, page_size=64)
     s, req = _Sched(), _req()
     assert T._p_held_short_reread(s, _Tree(1475 * 64), req, req.rid) is False
-    SR.note_reap("weg2-1-11", requested_pages=1475, hit_pages=900, completed_tokens=52480, page_size=64)
+    # the store holds no more than the read delivered: nothing to re-read
+    SR.note_reap("weg2-1-11", requested_pages=1475, hit_pages=820, completed_tokens=52480, page_size=64)
     assert T._p_held_short_reread(s, _Tree(52480), req, req.rid) is False
     assert s.calls == []
 
@@ -118,3 +121,17 @@ def test_both_pp0_publish_loops_reread_before_the_told():
         assert a < b < c, fn.__name__
     for fn in (T._follower_absorb_impl, T._follower_admit):
         assert "_p_held_short_reread" not in inspect.getsource(fn)
+
+
+def test_h18_store_short_of_the_span_but_more_than_the_read_is_reread():
+    """h18 weg2-0-2: hit 1440 of 1456 pages (the span is not whole), completed
+    19008 -- the store still held 73152 tokens more: re-read."""
+    SR.note_reap("weg2-0-2", requested_pages=1456, hit_pages=1440, completed_tokens=19008, page_size=64)
+    s, req = _Sched(), _req("weg2-0-2")
+    assert T._p_held_short_reread(s, _Tree(19008), req, req.rid) is True
+
+
+def test_h18_weg2_4_18_completed_zero_is_reread():
+    SR.note_reap("weg2-4-18", requested_pages=1061, hit_pages=1061, completed_tokens=0, page_size=64)
+    s, req = _Sched(), _req("weg2-4-18")
+    assert T._p_held_short_reread(s, _Tree(0), req, req.rid) is True
