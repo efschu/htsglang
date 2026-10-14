@@ -113,6 +113,7 @@ DECISION_FILES = {
     "docker/README.htsglang.md": "F0-I: the htsglang container README carries the sleep notice (names the old project) and documents the product layer",
     "docker/flliper/Dockerfile.flliper": "F0-G: the recipe bakes the five variables the DOUBLE-READING entrypoint reads under the legacy spelling (header comment, "
                                          "lines 10-14) and names the old layout in comments; /opt|/var/lib/htsglang paths are the product layer (phase 2b)",
+    "docker/flliper/healthcheck.sh": "RC4 (RC3 acceptance m3): the image healthcheck is tree-versioned and a DOUBLE READER of the log markers (the `(WEG2|PDFLIP)` alternations, the old marker names quoted in its comments are what the old-name images wrote)",
     "docker/flliper/make_flat_ctx.sh": "F0-G: the context builder must also recognise a PRE-rename tree (RENAMED=0 branch, B1/B6 gates name SGLANG_*/--weg2-*)",
     "docker/flliper/host_publish_flliper.sh": "F0-G: the publish gate refuses tag parts that carry an old name (probe|sglang|weg2|htsglang)",
     "docker/flliper/host_publish_flliper_selftest.sh": "F0-G: selftest of the publish gate builds a pre-rename tree on purpose",
