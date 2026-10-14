@@ -1179,6 +1179,14 @@ class Envs:
     # the front and by both groups (the env is inherited; the code default reaches the ranks
     # without a profile line).
     SGLANG_WEG2_LANES = EnvBool(True)
+    # PRIO-AS-AGE 1014 (user decision 14.10.2026 18:27Z, weg2/prio_age.py): `priority` acts as AGE --
+    # every age order/comparison (D seats, SEAT-AGE displacement, the KV rule "oldest first", decode
+    # admission, the P queue and batch order, wake reads, D refill) uses the pair (priority desc,
+    # arrival asc); every wait CLOCK keeps the real arrival. With it on, the lane FLOOR of 1008
+    # (LANE-PREEMPT, LANE-RAISE/RESUME, LANE-WAITER-HOLD, the lane hold of P legs, D's lane park) is
+    # never entered; a P-bound request with priority > 0 ends a DECODE-COLLECT window at once.
+    # DEFAULT ON; acts only with SGLANG_WEG2_LANES=1. =0 is the lane floor of 1008 unchanged.
+    SGLANG_WEG2_PRIO_AS_AGE = EnvBool(True)
     # PRIORITY LANES 1008: seconds between the keepalive comment lines (`: lane-hold floor=N`)
     # the front writes into a held SSE stream. Used only with SGLANG_WEG2_LANES=1 (the sender
     # is part L4 of the plan; part L1 only declares the value).

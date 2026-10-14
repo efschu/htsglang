@@ -284,7 +284,7 @@ def test_flip_begin_names_the_lane_held_share_of_outstanding_and_the_ledger(lane
 
 def test_the_flip_begin_line_gets_the_note_only_with_the_switch_on():
     src = open(os.path.join(_SRT, "weg2", "front.py")).read()
-    assert '_lctl.flip_begin_note(self, S) if _lanes.enabled() else "")' in src
+    assert '_lctl.flip_begin_note(self, S) if _lctl.enabled() else "")' in src  # PRIO-AS-AGE 1014: floor mode
     assert 'logger.info("WEG2-FLIP begin epoch=%d sleep=%s wake=%s outstanding=%d queue=%d%s"' in src
 
 
@@ -489,3 +489,14 @@ def test_the_default_chunk_env_does_not_prevent_the_p_chunk_park_and_a_set_one_d
         assert LN.preempt_chunk_tokens() == 4096
         members, req, out = _run_chunk_decision(s)
         assert members == [] and req.weg2_lane_parked                 # the park is the floor's, not the cap's
+
+
+# PRIO-AS-AGE 1014 (user decision 14.10.2026, weg2/prio_age.py): SGLANG_WEG2_PRIO_AS_AGE is ON by default and switches the
+# lane FLOOR of 1008 off (priority acts as age).  The tests of this file pin the floor machinery itself, i.e. the mode OFF
+# ("Modus AUS: altes Verhalten"); the new default is pinned in test_weg2_prio_as_age_1014.py.
+import pytest as _pytest_prio_age  # noqa: E402
+
+
+@_pytest_prio_age.fixture(autouse=True)
+def _prio_as_age_off_floor_mode_1014(monkeypatch):
+    monkeypatch.setenv("SGLANG_WEG2_PRIO_AS_AGE", "0")

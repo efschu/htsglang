@@ -11543,6 +11543,30 @@ class Scheduler(
         except Exception:  # noqa: BLE001 - a key may never break the order arm
             return None
 
+    def _weg2_prio_age_order(self) -> None:
+        """PRIO-AS-AGE 1014: ``waiting_queue`` with the higher priority first,
+        stable inside a priority (``prio_age.lane_sorted``). Only on a Weg-2
+        group (SGLANG_WEG2_GROUP P or D) and not under upstream
+        ``--enable-priority-scheduling`` (its own sort ran in calc_priority).
+        Every input is replicated -- the queue the group agreed on and each
+        request's own ``priority`` -- so every rank sorts alike (raenge-nie-
+        uneins); a different order on one rank is what the #791b ballot
+        digest of the queue head detects."""
+        # No except: an order this rank could not form while its peers did is
+        # the divergence class #1158 ends -- it raises, never degrades.
+        if getattr(self, "enable_priority_scheduling", False):
+            return
+        if str(os.environ.get("SGLANG_WEG2_GROUP", "")).strip().upper() not in ("P", "D"):
+            return
+        from sglang.srt.weg2 import prio_age as _pa
+
+        if not _pa.enabled():
+            return
+        q = self.waiting_queue
+        ordered = _pa.lane_sorted(q, on=True)
+        if any(a is not b for a, b in zip(ordered, q)):
+            q[:] = ordered
+
     def _apply_uniform_head_order(
         self, head_inputs: Optional[tp_head_congruence.UniformHeadInputs]
     ) -> None:
@@ -16208,6 +16232,12 @@ class Scheduler(
         # queue, same policy, different order -- and a different order is a
         # different batch.
         self._apply_uniform_head_order(_head_inputs)
+        # PRIO-AS-AGE 1014 (weg2/prio_age.py): on a Weg-2 group a higher
+        # `priority` is OLDER than every lower one -- a STABLE sort by the
+        # request's own (replicated) priority field, so inside a priority the
+        # group order just agreed on stands exactly; P's batch order and D's
+        # admission order follow it. Off / no priority: the queue untouched.
+        self._weg2_prio_age_order()
         # H91b: on group D the parked requests come first and hold the seats
         # they return to (weg2/d_seats.admission_gate); None = stock loop.
         _d_park_gate = self._weg2_d_park_admission(running_batch)

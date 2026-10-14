@@ -40,6 +40,7 @@ from sglang.srt.weg2 import d_lane, d_park_draft, d_park_read, d_seats, park_hol
 from sglang.srt.weg2 import handback_claim as _hb
 from sglang.srt.weg2 import poolleak_instr as _poolleak
 from sglang.srt.weg2 import mamba_arena_displace as _mad_park
+from sglang.srt.weg2 import prio_age as _pa  # PRIO-AS-AGE 1014: the order key and the floor-mode gate
 
 logger = logging.getLogger(__name__)
 
@@ -450,9 +451,10 @@ def park_rids(sched, recv_req, *, rids, hold: str = ""):
         return _out(False, [], f"W-PARK refused: unknown hold {hold!r} (only 'lane') -- nothing parked")
     if hold and not rids:
         return _out(False, [], "W-PARK refused: hold=lane needs rids -- nothing parked")
-    if not lanes.enabled():
-        return _out(False, [], "W-PARK refused: rids/hold need SGLANG_WEG2_LANES=1 on this server -- "
-                               "nothing parked")
+    if not _pa.floor_mode():
+        # PRIO-AS-AGE 1014: priority acts as age -- no lane park exists (the floor never rises)
+        return _out(False, [], "W-PARK refused: rids/hold need SGLANG_WEG2_LANES=1 and SGLANG_WEG2_PRIO_AS_AGE=0 "
+                               "on this server (priority acts as age: no lane park) -- nothing parked")
     if not d_seats.d_flip_park_active():
         return _out(False, [], "W-PARK refused: not group D (or SGLANG_WEG2_D_PARK=0, or neither the "
                                "standard form nor SGLANG_WEG2_D_PARK_IMMEDIATE) -- nothing parked")
@@ -652,8 +654,10 @@ def lane_floor(sched, recv_req):
             requeued=list(requeued), held=n_held, message=msg,
         )
 
-    if not lanes.enabled():
-        return _out(False, "W-LANE refused: /weg2/lane_floor needs SGLANG_WEG2_LANES=1 on this server")
+    if not _pa.floor_mode():
+        # PRIO-AS-AGE 1014: priority acts as age -- the lane floor is never applied
+        return _out(False, "W-LANE refused: /weg2/lane_floor needs SGLANG_WEG2_LANES=1 and SGLANG_WEG2_PRIO_AS_AGE=0 "
+                           "on this server (priority acts as age: no floor)")
     if str(os.environ.get(d_seats.GROUP_ENV, "")).strip().upper() != "D":
         return _out(True, "not group D: the floor is not applied here (D's admission only)")
     cur_f, cur_e = d_lane.floor_of(sched), d_lane.epoch_of(sched)
@@ -732,8 +736,8 @@ def hold_queued(sched, rids=None) -> list:
     its lane (the re-intake prefetches it from the store like any retracted park)."""
     from sglang.srt.weg2 import lanes
 
-    if not lanes.enabled() or not d_seats.d_flip_park_active() or getattr(sched, "weg2_dormant", False):
-        return []
+    if not _pa.floor_mode() or not d_seats.d_flip_park_active() or getattr(sched, "weg2_dormant", False):
+        return []  # PRIO-AS-AGE 1014: no lane hold while priority acts as age
     queue = list(getattr(sched, "waiting_queue", None) or [])
     if not queue:
         return []
@@ -1138,10 +1142,13 @@ def _apply_park_defer(sched) -> int:
             # SA: each deferred request goes before the first waiting request
             # YOUNGER than it (the rest keeps the group's order) -- it moves in
             # as soon as the older ones leave, never behind younger arrivals.
-            for r in _sa.by_age(mine):
-                a = _sa.rid_age(r.rid)
+            # PRIO-AS-AGE 1014: "younger" / "oldest first" by the order key (priority desc, age asc)
+            def _ok(q):
+                return _sa.order_key(getattr(q, "rid", ""), _pa.lane_of_req(q))
+            for r in sorted(mine, key=_ok):
+                a = _ok(r)
                 k = next((i for i, q in enumerate(rest) if d_seats.park_site(q) is None
-                          and _sa.rid_age(getattr(q, "rid", "")) > a), len(rest))
+                          and _ok(q) > a), len(rest))
                 rest.insert(k, r)
             sched.waiting_queue = rest
         else:
@@ -1233,9 +1240,19 @@ def _lift_holds_when_idle(sched) -> None:
 
 
 def _lanes_on() -> bool:
-    from sglang.srt.weg2 import lanes
+    """The lane FLOOR rules of 1008 on D (victim pools by lane, the floor's admission filter, the park refusal
+    above the floor). PRIO-AS-AGE 1014 (default on): off -- priority acts as AGE through the order key instead
+    (``seat_age``/``prio_age``)."""
+    return _pa.floor_mode()
 
-    return bool(lanes.enabled())
+
+def _prio_lane_map(*seqs):
+    """PRIO-AS-AGE 1014: rid -> priority of the given request lists (the request's own replicated field)."""
+    m = {}
+    for seq in seqs:
+        for r in seq or ():
+            m[str(getattr(r, "rid", ""))] = _pa.lane_of_req(r)
+    return m
 
 
 def _lane_of_rid(waiting, rid):
@@ -1260,7 +1277,11 @@ def _displace_candidate(sched, _sa, waiting, reqs, lanes_on):
     and batch, as before. On: the oldest waiter (admissible: the caller filtered the floor) that has a victim
     among the running requests of ITS lane or below."""
     if not lanes_on:
-        return _sa.displace_victim([str(q.rid) for q in waiting], [str(r.rid) for r in reqs], True)
+        # PRIO-AS-AGE 1014: oldest waiter / youngest runner by the order key -- exactly one victim, the
+        # youngest of the lowest priority, and only for a waiter older by that key
+        _lm = _prio_lane_map(waiting, reqs)
+        return _sa.displace_victim([str(q.rid) for q in waiting], [str(r.rid) for r in reqs], True,
+                                   lane_of=lambda rid: _lm.get(str(rid), 0))
     for q in sorted(waiting, key=lambda w: _sa.rid_age(str(w.rid))):
         pool = [str(r.rid) for r in reqs if d_lane.lane_of_req(r) <= d_lane.lane_of_req(q)]
         cand = _sa.displace_victim([str(q.rid)], pool, True)
@@ -1343,7 +1364,9 @@ def displace_for_age(sched, running_batch) -> Optional[str]:
         # group displaces only when EVERY rank refused (RAENGE-NIE-UNEINS).
         cand = _displace_candidate(sched, _sa, waiting, reqs, lanes_on)
         if cand is not None:
-            local = no_token_rid is not None and _sa.rid_age(no_token_rid) <= _sa.rid_age(cand[0])
+            _lm = _prio_lane_map(sched.waiting_queue, reqs)  # PRIO-AS-AGE 1014: compared by the order key
+            local = no_token_rid is not None and not _sa.is_older(
+                cand[0], no_token_rid, lane_of=lambda rid: _lm.get(str(rid), 0))
             if local:
                 # user 30.09. (verbatim): "natürlich muss ein jüngerer nur verdrängt werden,
                 # wenn der ältere nicht draufpasst. nicht pauschal den jüngeren verdrängen" --
@@ -1686,8 +1709,12 @@ def kv_displace_would_fit(sched, older_rid: str, running, seat: bool = False, vi
     older = next((q for q in getattr(sched, "waiting_queue", ()) or () if str(q.rid) == str(older_rid)), None)
     if older is None:
         return False
-    young = sorted((r for r in running if _sa.rid_age(str(r.rid)) > _sa.rid_age(str(older_rid))),
-                   key=lambda r: _sa.rid_age(str(r.rid)), reverse=True)
+    # PRIO-AS-AGE 1014: "younger than the older one" and "youngest first" by the order key
+    _on = _pa.enabled()
+    _k_old = _pa.key(_pa.lane_of_req(older), _sa.rid_age(str(older_rid)), on=_on)
+    young = sorted((r for r in running
+                    if _pa.key(_pa.lane_of_req(r), _sa.rid_age(str(r.rid)), on=_on) > _k_old),
+                   key=lambda r: _pa.key(_pa.lane_of_req(r), _sa.rid_age(str(r.rid)), on=_on), reverse=True)
     basis = "legacy"
     # PW: under the backup wall a victim's retained KV goes back to the tree and
     # is as unpayable as the rest -- only its decode reserve comes free.
