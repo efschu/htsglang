@@ -1749,6 +1749,24 @@ def leg1_early_candidates(queue, limit: int) -> list:
     return out
 
 
+def leg1_early_limit(queue, p_concurrency: int, dc_cap: int) -> int:
+    """How many LEG1-EARLY legs the flip may post now.
+
+    No seat-gate cap armed (``dc_cap`` 0: PBOUND-FLIP-NOW, fairness, gate off):
+    ``p_concurrency``, as before. A cap armed (DECODE-COLLECT SEAT GATE,
+    ``_dc_p_cap`` = the free D seats, or 1 from the age plan): the P phase will
+    prefill at most that many, oldest first, so a leg posted beyond it keeps
+    running on P after the phase ended and the next P->D drain waits for it
+    (NF int24g: 9 of 69 P->D drains 0.8-9.4 s, every one an early leg over
+    the cap). The cap counts the early legs already in flight in the queue."""
+    limit = max(0, int(p_concurrency))
+    cap = int(dc_cap or 0)
+    if cap <= 0:
+        return limit
+    inflight = sum(1 for p in list(queue) if getattr(p, "_leg1_early", None) is not None)
+    return min(limit, max(0, cap - inflight))
+
+
 def leg1_input_ids_on(env: Optional[Mapping[str, str]] = None) -> bool:
     env = os.environ if env is None else env
     return str(env.get(LEG1_INPUT_IDS_ENV, "") or "").strip().lower() not in ("0", "false", "no", "off")
@@ -10087,12 +10105,26 @@ class Front:
         # DP-NACHLAUF: the trigger was queued after the begin -- its leg 1 goes to
         # the dormant P now, as the begin would have posted it
         if leg1_early_on() and not getattr(self, "dual_kv_ledgers", False):
-            for _ep in leg1_early_candidates(self.queue, self.p_concurrency):
+            _lim = Front._leg1_early_limit(self)
+            for _ep in leg1_early_candidates(self.queue, _lim):
                 _ep._leg1_early = asyncio.ensure_future(self.leg1(_ep))
                 self.counters["leg1_early"] += 1
                 logger.info("PDFLIP LEG1-EARLY rid=%s epoch=%d (posted at the EARLY-FLIP go, before "
                             "the first sleep RPC)", _ep.rid, self.epoch)
         return True
+
+    def _leg1_early_limit(self) -> int:
+        """LEG1-EARLY: how many legs this D->P flip may post. Reads (never pops)
+        the SEAT GATE's cap -- the pop stays in the P phase -- so the early legs
+        are the ones the P phase will dispatch; without a cap it is
+        ``p_concurrency`` as before."""
+        cap = int(self.__dict__.get("_dc_p_cap", 0) or 0)
+        limit = leg1_early_limit(self.queue, self.p_concurrency, cap)
+        if cap > 0:
+            logger.info("PDFLIP LEG1-EARLY seat-cap=%d limit=%d p_concurrency=%d queue=%d epoch=%d -- no early "
+                        "leg beyond what the P phase dispatches", cap, limit, self.p_concurrency,
+                        len(self.queue), self.epoch)
+        return limit
 
     def _early_flip_abort(self, h, src: str, dst: str) -> None:
         """EARLY-FLIP: nothing slept -- D is awake and serving again, the flip's
@@ -14036,6 +14068,9 @@ class Front:
         self._flip_stage = "drain"
         self._flip_marks["drain"] = time.time()
         logger.info("PDFLIP-FLIP begin epoch=%d sleep=%s wake=%s outstanding=%d queue=%d", self.epoch, src, dst, len(S.outstanding), len(self.queue))
+        if src == "P" and S.outstanding:
+            # drain witnesses by name (NF int24g: a long P->D drain was an early leg over the seat cap)
+            logger.info("PDFLIP-FLIP outstanding epoch=%d sleep=P rids=%s", self.epoch, sorted(S.outstanding))
         _dk = self.__dict__.pop("_done_kick_at", None)
         if _dk is not None and src == "D" and _dk[0] == self.epoch:
             # DONE-KICK: how long the done -> begin took (the controller's pass,
@@ -14128,7 +14163,8 @@ class Front:
                     pass
             # DP-NACHLAUF: leg 1 of the queue head goes to the dormant P now
             if leg1_early_on() and not getattr(self, "dual_kv_ledgers", False):
-                for _ep in leg1_early_candidates(self.queue, self.p_concurrency):
+                _lim = Front._leg1_early_limit(self)
+                for _ep in leg1_early_candidates(self.queue, _lim):
                     _ep._leg1_early = asyncio.ensure_future(self.leg1(_ep))
                     self.counters["leg1_early"] += 1
                     logger.info("PDFLIP LEG1-EARLY rid=%s epoch=%d (posted at the D->P flip's begin; "
