@@ -2915,6 +2915,19 @@ def p_phase_arrival(awake: str, state: str, flip_dst: Optional[str]) -> bool:
     return awake == "P"
 
 
+def d_credit_unslept(credit_epoch: Optional[int], d_slept_epoch: Optional[int]) -> bool:
+    """SHORTHOLD-EPOCH-1014 (NF h17 weg2-2-55): a D credit still stands on D's DEVICE
+    only while D has not slept since it served it -- every D sleep flushes the KV
+    and the wake answers "pools cleared, radix tree KEPT". ``credit_epoch``: the front
+    epoch the credit's entry was served in (None: unknown -> not provable -> False);
+    ``d_slept_epoch``: the epoch of D's last KV release (None: D never slept)."""
+    if credit_epoch is None:
+        return False
+    if d_slept_epoch is None:
+        return True
+    return int(d_slept_epoch) < int(credit_epoch)
+
+
 def d_presence_only_short(src: Optional[str], tokens: int, store_depth: int, x: int) -> bool:
     """VISION-SHORT-1014 (NF h13 weg2-20-129, 14:25:49): a SHORT that arrives
     in a P phase joins P's batch (P-BATCH-ALL) on the premise that P reads its
@@ -6605,6 +6618,13 @@ class Front:
         # read off the spans AFTER the price was taken; it feeds log lines only
         win = None if isolated else self.tspans.last_winner
         entry_rid, entry_src = (win[1], win[2]) if win else ("-", "-")
+        # SHORTHOLD-EPOCH-1014: the front epoch in which D served the credit's entry
+        # (None: no entry -- a seq mark, a namespaced price)
+        _credit_ep = None
+        if win is not None and win[0] is not None:
+            _ent = (getattr(self.tspans, "entries", None) or {}).get(win[0])
+            if _ent is not None and len(_ent) > 3 and _ent[3] is not None:
+                _credit_ep = int(_ent[3])
         self._x_exact_rid[rid] = (pending, c.n, src,
                                   (entry_rid, entry_src, (win[0] or "-")[:12] if win else "-"))
         while len(self._x_exact_rid) > 4096:
@@ -6639,6 +6659,7 @@ class Front:
                                # VISION-SHORT-1014: what the shared store proved at arrival
                                # (an image request: probed only up to its first image)
                                store_depth=int(l3),
+                               credit_epoch=_credit_ep,
                                mm=mm is not None, mm_cached=mm_cached,
                                image_end=(mm.image_end if mm is not None else 0),
                                d_reach=d_reach, d_floor=d_floor)
@@ -10285,6 +10306,17 @@ class Front:
             and d_presence_only_short(presence_src, int(_xx.n),
                                       int(getattr(_xx, "store_depth", 0) or 0),
                                       int(self.tp_prefill_max_tokens)))
+        if _d_hold and not d_credit_unslept(getattr(_xx, "credit_epoch", None),
+                                            self.__dict__.get("_d_slept_epoch")):
+            # SHORTHOLD-EPOCH-1014 (NF h17 weg2-2-55, 15:48:05-11): D slept since it served
+            # the credit -- its device copy is gone, D would read the prefix back from the
+            # store like P (P: 192512 tokens in 8.9 s) after a flip back of its own
+            self.counters["short_hold_d_stale"] += 1
+            logger.info("WEG2 SHORT-HOLD-D STALE rid=%s src=%s credit_epoch=%s d_slept_epoch=%s -- D slept "
+                        "since it served this credit (its device copy is gone): P's batch, the prefix from "
+                        "the store (SHORTHOLD-EPOCH-1014)", rid, presence_src,
+                        getattr(_xx, "credit_epoch", None), self.__dict__.get("_d_slept_epoch"))
+            _d_hold = False
         if _d_hold:
             _sk = True
         if _pb_to_p is not None:
@@ -15132,6 +15164,11 @@ class Front:
         t0 = time.time()
         self._flip_stage = "sleep-kv"
         self._flip_marks["sleep-kv"] = time.time()
+        if src == "D":
+            # SHORTHOLD-EPOCH-1014: from this moment D's device copy is gone (the KV
+            # release flushes; the wake answers "pools cleared, radix tree KEPT") --
+            # a D credit of this epoch or older is no reason to keep a SHORT for D
+            self.__dict__["_d_slept_epoch"] = int(self.epoch)
         # #1428 (xsn188): the KV legs went out on the shared pooled session
         # with no epoch, so a stale keep-alive connection ("Server disconnected",
         # got_response=False) had no retry and killed the boot at the first
