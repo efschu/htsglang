@@ -1099,6 +1099,25 @@ class Envs:
     # Q-697c (a), without its dual gate. Off = the old silent stop, byte for
     # byte.
     SGLANG_WEG2_ENABLE_W3_SPILL_ANCHOR_POOL = EnvBool(False)
+    # W3-GROUP-ORDER (NF arena fix 14.10., desk/nf-arenafix-1014): the W3 spill
+    # ordered its candidates by node id and assumed the PP ranks' trees were
+    # replicas -- they are not (P.log:15554 PP0 31 candidates x 64 pages, PP1 9
+    # x 208-256), so every PP0 spill ended ARENA-DROP freed=0: a slot is free
+    # only when every rank's reference is gone, and each rank let go of other
+    # slots. On: the order is read from the shared arena -- fewest reader
+    # references first (the pages a peer already let go), then the slot id (the
+    # canonical page identity, equal on every rank), then the node id. No
+    # collective, no reserve. Off = the node-id order, byte for byte.
+    SGLANG_WEG2_W3_SPILL_GROUP_ORDER = EnvBool(True)
+    # WAKE-READ-SEAT-GATE (NF arena fix 14.10.): the #248f gate held hold reads
+    # up to the whole KV arena (6466 of 6485 pages pinned, 231 CAPACITY-WAIT in
+    # one boot) -- D's own retain/park backup and its L3 fills found no slot.
+    # On: beside the page gate a hold read is issued only for as many requests
+    # as D has free seats for (seats = --max-running-requests, minus running
+    # requests, minus the requests whose read already holds the arena and have
+    # no seat yet), in hold/arrival order; the rest wait named in the #1471
+    # settle and read when a seat frees. No reserve. Off = the page gate alone.
+    SGLANG_WEG2_WAKE_READ_SEAT_GATE = EnvBool(True)
     # MAMBA-LAST-RESORT (NF int22, D TP0 boot 1008_171755 17:51:57): the D
     # mamba anchor arena (32 slots, 6 staging) held only END and deepest
     # anchors, so the flush / park-first spill found victim=none (`#1427

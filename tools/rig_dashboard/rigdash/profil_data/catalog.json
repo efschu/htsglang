@@ -29686,7 +29686,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2552
+      "line": 2571
      }
     }
    },
@@ -29741,7 +29741,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2542
+    "line": 2561
    },
    "status": "geerntet",
    "text": "",
@@ -29764,7 +29764,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2588
+      "line": 2607
      }
     }
    },
@@ -38483,7 +38483,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 4661
+    "line": 4680
    },
    "status": "unerklaert",
    "text": "",
@@ -38801,7 +38801,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 4660
+    "line": 4679
    },
    "status": "geerntet",
    "text": "",
@@ -39354,7 +39354,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2223
+    "line": 2242
    },
    "status": "geerntet",
    "text": "",
@@ -39377,7 +39377,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2563
+      "line": 2582
      }
     }
    },
@@ -39546,7 +39546,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2567
+      "line": 2586
      }
     }
    },
@@ -39746,7 +39746,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2000
+    "line": 2019
    },
    "status": "geerntet",
    "text": "",
@@ -43632,6 +43632,26 @@
    "type": "os.environ"
   },
   "SGLANG_HICACHE_ARENA_REF_CENSUS_S": {
+   "abweichung": {
+    "27b": {
+     "default": "\"0\"",
+     "help": "Instrument (default 0 = off): every N seconds a daemon thread logs the arena's reference census (ShmArena.ref_census) -- how many COMPLETE slots a reader reference pins, over the whole boot. Off the round path: the strided header read of a 720k-slot arena is ~15 ms (desk), numpy releases the GIL.",
+     "source": {
+      "file": "mem_cache/storage/file/hicache_arena.py",
+      "kind": "os.environ",
+      "line": 160
+     }
+    },
+    "nf": {
+     "default": null,
+     "help": "Instrument (default 60 = ON since the NF arena fix of 14.10.; 0 = off, any other value = that period): every N seconds a daemon thread logs the arena's reference census (ShmArena.ref_census) -- how many COMPLETE slots a reader reference pins, over the whole boot -- and the holder classes of every provider (ARENA-REF-HOLDERS). Off the round path: the strided header read of a 720k-slot arena is ~15 ms (desk), numpy releases the GIL. It was off by default and only in ``profile_instr_env``, so the boot of 14.10. 03:00-04:50Z had no census at the REFUSED moments (nf-arena-voll-analyse-1014 section 2): every holder statement of that analysis was derived from the resets. An instrument only -- no round, no decision reads it.",
+     "source": {
+      "file": "mem_cache/storage/file/hicache_arena.py",
+      "kind": "os.environ",
+      "line": 157
+     }
+    }
+   },
    "baeume": [
     "27b",
     "nf"
@@ -47705,7 +47725,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2232
+    "line": 2251
    },
    "status": "geerntet",
    "text": "",
@@ -47733,7 +47753,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2237
+    "line": 2256
    },
    "status": "geerntet",
    "text": "",
@@ -48761,7 +48781,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 3413
+    "line": 3432
    },
    "status": "kuratiert",
    "text": "H88: Umgebungsform von --moe-act-int8 on: die int4-Experten (compressed-tensors WNA16, MoE) rechnen mit int8-Aktivierungen (W4A8) statt mit 16-Bit-Aktivierungen (W4A16). Standard aus; einer der beiden Schalter genügt. Dieser Baum hat das W4A8-MoE-Schema (CompressedTensorsWNA16A8MoE, H88-B): mit dem Schalter an wählt die Schema-Auswahl es für die int4-Expertenschichten auf CUDA (dynamische int8-Aktivierung je Token, Marlin-W4A8-Kernel); zusammen mit --moe-runner-backend triton bricht der Start mit RuntimeError ab. Ein Baum ohne das Schema bräche mit dem Text ab: MOE-ACT-INT8 requested but no W4A8 MoE scheme in this tree.",
@@ -53884,7 +53904,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1726
+    "line": 1745
    },
    "status": "geerntet",
    "text": "",
@@ -65432,7 +65452,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1665
+    "line": 1684
    },
    "status": "erklaert",
    "text": "Protection against a mutual blockade when waking D to P: two groups wait in a circle for memory room. On: the waiting part counts its own waiting from the start of the wait; the resolution (swapping the rest out to host RAM) begins after about 0.1 s instead of about 0.6 s. Off: only after the wait flag has gone up after 0.5 s. Default off (preparation/experiment, \"Default off until metal A/B\"). According to the code necessary before SGLANG_OPT_WEG2_DRAFT_PARK_SKIP_UNCHANGED (is off) goes on again. Related: SGLANG_WEG2_BAR1_SPILL_GRACE_S (0.1 s). Acts only for the sending side. Not verified individually on the metal. No user value recognizable.",
@@ -66057,7 +66077,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 1979
+      "line": 1998
      }
     }
    },
@@ -71149,7 +71169,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 3696
+      "line": 3715
      }
     }
    },
@@ -71430,7 +71450,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2083
+      "line": 2102
      }
     }
    },
@@ -71508,7 +71528,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4368
+      "line": 4387
      }
     }
    },
@@ -71615,7 +71635,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2581
+      "line": 2600
      }
     }
    },
@@ -71720,7 +71740,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1863
+    "line": 1882
    },
    "status": "erklaert",
    "text": "Collect rule for short requests when D is prefilling instead of decoding: on, a short request (that would go to D by itself) that was granted to D and has not yet delivered a first token counts as work on D. The next short requests that arrive meanwhile are collected for the window (SGLANG_WEG2_DECODE_COLLECT_WINDOW_S) and priced as a SUM together with those open tokens against the X limit; what does not fit goes to the P batch. Off: the old blind path, every short request is checked alone against X and an idle D takes all of them (six shorts of 6239 tokens within one second: 37k tokens prefilled on D, about 53 s). Default on in the NF tree (since 10.10.; metal int23xsum2 09.10.: 6 x 5200 on an idle D, one seat on D, five to the P batch). With the collect window at 0 (SGLANG_WEG2_DECODE_COLLECT_WINDOW_S) only the collecting is off; the booking still prices the queue-take of waiting shorts and the short drain.",
@@ -71978,7 +71998,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2103
+    "line": 2122
    },
    "status": "geerntet",
    "text": "",
@@ -72236,7 +72256,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2007
+    "line": 2026
    },
    "status": "geerntet",
    "text": "",
@@ -72259,7 +72279,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2572
+      "line": 2591
      }
     }
    },
@@ -72481,7 +72501,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4348
+      "line": 4367
      }
     }
    },
@@ -73226,7 +73246,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2018
+    "line": 2037
    },
    "status": "geerntet",
    "text": "",
@@ -73254,7 +73274,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2013
+    "line": 2032
    },
    "status": "geerntet",
    "text": "",
@@ -73809,7 +73829,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 1244
+      "line": 1263
      }
     }
    },
@@ -73863,7 +73883,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1247
+    "line": 1266
    },
    "status": "geerntet",
    "text": "",
@@ -75751,7 +75771,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4468
+      "line": 4487
      }
     }
    },
@@ -76966,7 +76986,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1131
+    "line": 1150
    },
    "status": "kuratiert",
    "text": "Priority lanes: a request carries an integer 'priority' (no number = lane 0, a higher number is a higher lane, the same number is the same lane). With 1 the front reads the field, keeps the active lane (lane_floor), the count of its changes (lane_epoch) and the requests per lane, and shows them in state.json (front.lane_floor, front.lane_epoch, front.lanes); the Anthropic adapter forwards 'priority'. Default 1 on the NF line (since int24f5, user word 13.10.2026): with every request in lane 0 (no 'priority', or 0) nothing is displaced -- no lane action, no RPC to P or D. 0 = off: the front does not read 'priority', and no lane field appears in state.json, the request book or a log line.",
@@ -77083,7 +77103,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1135
+    "line": 1154
    },
    "status": "kuratiert",
    "text": "Seconds between the keepalive comment lines (': lane-hold floor=N') the front writes into a held SSE stream. Default 15. Used only with SGLANG_WEG2_LANES=1; the sender is part L4 of the lane plan, part L1 only declares the value.",
@@ -77164,7 +77184,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1139
+    "line": 1158
    },
    "status": "kuratiert",
    "text": "The P-side prefill chunk size in tokens while a higher lane waits; 0 (default) = the normal chunk. Used only with SGLANG_WEG2_LANES=1; part L3 of the lane plan reads it, part L1 only declares the value.",
@@ -77730,7 +77750,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1112
+    "line": 1131
    },
    "status": "geerntet",
    "text": "",
@@ -78032,7 +78052,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4277
+      "line": 4296
      }
     }
    },
@@ -78593,7 +78613,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2448
+    "line": 2467
    },
    "status": "erklaert",
    "text": "If a paused (parked) request is to continue later and the room for Mamba anchors in host RAM is full, its re-entry point gets priority: other intermediate states without a park reference are swapped to disk first, so that the entry point of the parked request is not lost. Off: the old way; parked requests can lose their entry point and recompute. Without a park nothing changes. Acts only on nodes that are marked as parked. Default on. Unverified: dependency on another switch; whether the user should change it (only the decision \"stays on\" of 05.10. ~17:47Z is verified); benefit on the metal (according to the report \"active, effect not shown\").",
@@ -78742,7 +78762,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1925
+    "line": 1944
    },
    "status": "geerntet",
    "text": "",
@@ -78799,7 +78819,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1948
+    "line": 1967
    },
    "status": "geerntet",
    "text": "",
@@ -81947,7 +81967,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 1703
+      "line": 1722
      }
     }
    },
@@ -84416,6 +84436,34 @@
    "text": "",
    "type": "os.environ"
   },
+  "SGLANG_WEG2_W3_SPILL_GROUP_ORDER": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "True",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "W3-GROUP-ORDER (NF arena fix 14.10., desk/nf-arenafix-1014): the W3 spill ordered its candidates by node id and assumed the PP ranks' trees were replicas -- they are not (P.log:15554 PP0 31 candidates x 64 pages, PP1 9 x 208-256), so every PP0 spill ended ARENA-DROP freed=0: a slot is free only when every rank's reference is gone, and each rank let go of other slots. On: the order is read from the shared arena -- fewest reader references first (the pages a peer already let go), then the slot id (the canonical page identity, equal on every rank), then the node id. No collective, no reserve. Off = the node-id order, byte for byte.",
+   "id": "SGLANG_WEG2_W3_SPILL_GROUP_ORDER",
+   "kind": "env",
+   "level": "experte",
+   "name": "SGLANG_WEG2_W3_SPILL_GROUP_ORDER",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "baum": "nf",
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 1111
+   },
+   "status": "geerntet",
+   "text": "",
+   "type": "EnvBool"
+  },
   "SGLANG_WEG2_WAKE_COHORT": {
    "baeume": [
     "27b",
@@ -84849,6 +84897,34 @@
     "file": "environ.py",
     "kind": "environ",
     "line": 976
+   },
+   "status": "geerntet",
+   "text": "",
+   "type": "EnvBool"
+  },
+  "SGLANG_WEG2_WAKE_READ_SEAT_GATE": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "True",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "WAKE-READ-SEAT-GATE (NF arena fix 14.10.): the #248f gate held hold reads up to the whole KV arena (6466 of 6485 pages pinned, 231 CAPACITY-WAIT in one boot) -- D's own retain/park backup and its L3 fills found no slot. On: beside the page gate a hold read is issued only for as many requests as D has free seats for (seats = --max-running-requests, minus running requests, minus the requests whose read already holds the arena and have no seat yet), in hold/arrival order; the rest wait named in the #1471 settle and read when a seat frees. No reserve. Off = the page gate alone.",
+   "id": "SGLANG_WEG2_WAKE_READ_SEAT_GATE",
+   "kind": "env",
+   "level": "experte",
+   "name": "SGLANG_WEG2_WAKE_READ_SEAT_GATE",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "baum": "nf",
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 1120
    },
    "status": "geerntet",
    "text": "",
@@ -85418,7 +85494,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4455
+      "line": 4474
      }
     }
    },
@@ -86198,28 +86274,28 @@
  "schema": "flliper.catalog/1",
  "stats": {
   "baeume": {
-   "abweichung": 45,
+   "abweichung": 46,
    "beide": 2461,
    "nur_27b": 180,
-   "nur_nf": 57
+   "nur_nf": 59
   },
-  "entries": 2716,
-  "envs": 1837,
+  "entries": 2718,
+  "envs": 1839,
   "erklaert": 305,
   "flags": 864,
-  "geerntet": 1680,
+  "geerntet": 1682,
   "kuratiert": 124,
   "unerklaert": 607
  },
- "tree_rev": "27b=02123ee2ef+nf=0ea6d17efd+gcfreeze+laneresumeq+prefilloom+voidpass-1013",
+ "tree_rev": "27b=02123ee2ef+nf=0ea6d17efd+gcfreeze+laneresumeq+prefilloom+voidpass+arenafix-1014",
  "trees": {
   "27b": {
    "entries": 2641,
    "rev": "02123ee2ef"
   },
   "nf": {
-   "entries": 2518,
-   "rev": "0ea6d17efd+gcfreeze+laneresumeq+prefilloom+voidpass-1013"
+   "entries": 2520,
+   "rev": "0ea6d17efd+gcfreeze+laneresumeq+prefilloom+voidpass+arenafix-1014"
   }
  },
  "warnungen": []

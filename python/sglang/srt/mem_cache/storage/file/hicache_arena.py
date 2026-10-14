@@ -105,11 +105,18 @@ class RefLedger:
 
 _LEDGERS: dict = {}
 
-#: Instrument (default 0 = off): every N seconds a daemon thread logs the
-#: arena's reference census (ShmArena.ref_census) -- how many COMPLETE slots a
-#: reader reference pins, over the whole boot. Off the round path: the strided
-#: header read of a 720k-slot arena is ~15 ms (desk), numpy releases the GIL.
+#: Instrument (default 60 = ON since the NF arena fix of 14.10.; 0 = off, any
+#: other value = that period): every N seconds a daemon thread logs the arena's
+#: reference census (ShmArena.ref_census) -- how many COMPLETE slots a reader
+#: reference pins, over the whole boot -- and the holder classes of every
+#: provider (ARENA-REF-HOLDERS). Off the round path: the strided header read of
+#: a 720k-slot arena is ~15 ms (desk), numpy releases the GIL. It was off by
+#: default and only in ``profile_instr_env``, so the boot of 14.10. 03:00-04:50Z
+#: had no census at the REFUSED moments (nf-arena-voll-analyse-1014 section 2):
+#: every holder statement of that analysis was derived from the resets. An
+#: instrument only -- no round, no decision reads it.
 ENV_REF_CENSUS_S = "SGLANG_HICACHE_ARENA_REF_CENSUS_S"
+REF_CENSUS_DEFAULT_S = "60"
 _CENSUS_THREADS: dict = {}
 #: #1424e: the reference HOLDERS of this process, per class, next to the census
 #: (weak methods: a provider never keeps its tree alive). A provider is called
@@ -147,7 +154,7 @@ def _holder_lines(arena) -> list:
 
 def _start_ref_census(arena: "ShmArena") -> None:
     try:
-        every = float(os.environ.get(ENV_REF_CENSUS_S, "0") or 0)
+        every = float(os.environ.get(ENV_REF_CENSUS_S, REF_CENSUS_DEFAULT_S) or 0)
     except ValueError:
         every = 0.0
     if every <= 0:
@@ -161,6 +168,14 @@ def _start_ref_census(arena: "ShmArena") -> None:
         def _run():
             n = 0
             while not stop.wait(every):
+                if getattr(getattr(arena, "_mm", None), "closed", False):
+                    # the arena was unmapped (shutdown, a test's tmp arena): the
+                    # census ends instead of logging 'failed' every period --
+                    # it is on by default now (REF_CENSUS_DEFAULT_S)
+                    with _lock:
+                        if _CENSUS_THREADS.get(key) is stop:
+                            _CENSUS_THREADS.pop(key, None)
+                    return
                 n += 1
                 try:
                     pinned, refs, complete = arena.ref_census()

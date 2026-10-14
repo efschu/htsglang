@@ -130,24 +130,31 @@ def _eligible(cache: Any, node: Any, pool: Any, skip: set) -> bool:
 
 
 def spill_host_only(cache: Any, pool: Any, want: int, page_size: int, skip: set) -> Dict[str, int]:
-    """Spill host-only H-leaves until ``want`` pages were released here (node-id
-    order). Returns the counts; the log line names them (27B loop, no census)."""
+    """Spill host-only H-leaves until ``want`` pages were released here (group-equal
+    order, see ``UnifiedRadixCache._w3_arena_spill``; node-id order where the
+    arena names no slot). Returns the counts; the log line names them (27B loop, no census)."""
     from sglang.srt.mem_cache.unified_radix_cache import BASE_COMPONENT_TYPE
 
     P = max(1, int(page_size or 1))
     heap = []
     refused: Dict[str, int] = {}
+    eligible = []
     for n in cache._collect_all_nodes():
         r = _reason(cache, n, pool, skip)
         if r is None:
-            heap.append((n.id, n))
+            eligible.append(n)
         elif r != "root":
             refused[r] = refused.get(r, 0) + 1
+    # NF arena fix (14.10.): the order is the W3 spill's group-equal one (fewest
+    # reader references, then slot id, then node id) -- see _w3_arena_spill; a
+    # leaf the arena names no slot for keeps the node-id order
+    keys = cache._w3_spill_keys(pool, eligible)
+    heap = [(keys[id(n)], n.id, n) for n in eligible]
     candidates = len(heap)
     heapq.heapify(heap)
     released = leaves = unsecured = on_disk = written = stale = 0
     while heap and released < want:
-        _id, node = heapq.heappop(heap)
+        _key, _id, node = heapq.heappop(heap)
         if not _eligible(cache, node, pool, skip):
             stale += 1
             continue
@@ -164,7 +171,7 @@ def spill_host_only(cache: Any, pool: Any, want: int, page_size: int, skip: set)
         released += int(tracker.get(BASE_COMPONENT_TYPE, 0)) // P
         leaves += 1
         if parent is not None and parent is not cache.root_node and _eligible(cache, parent, pool, skip):
-            heapq.heappush(heap, (parent.id, parent))
+            heapq.heappush(heap, (cache._w3_spill_keys(pool, [parent])[id(parent)], parent.id, parent))
     _N["calls"] += 1
     k = _N["calls"]
     if k <= 8 or k % 64 == 0 or unsecured:
