@@ -4262,6 +4262,64 @@ def weg2_writethrough_drain_on_idle_vote(self) -> int:
     return drained
 
 
+_BAV_N = [0]
+
+
+def weg2_backup_ack_drain_on_idle_vote(self) -> int:
+    """STORAGE-BACKUP LIVENESS (NF h16l 75e3ee8abd, boot
+    dkrnfint4h6ablxcw3spmlrhlvwbar1dauer10142044 ..._1014_204509, W3 20:50:22):
+    the third twin of :func:`weg2_loadback_drain_on_idle_vote` and
+    :func:`weg2_writethrough_drain_on_idle_vote`.
+
+    P.log 20:48:52: weg2-0-1's last pass left three direct write-throughs in
+    flight on PP1 and PP2. The P->D quiesce's first #1268 lap ran the
+    write-through drain on each follower (``WEG2-WRITETHROUGH-DRAIN-ON-VOTE
+    drained=3``); each ack completed its arena slot (``#1427 DIRECT-WRITE ACK``)
+    and issued the QSA-index sidecar store write (``#106S SIDECAR-WRITE-ISSUED
+    op=1..3``) -- three entries in ``ongoing_backup``. Their acks land in
+    ``ack_backup_queue`` within milliseconds, but only ``_drain_backup`` (in the
+    round drain of ``check_hicache_events``, i.e. a PLANNED pass) retires them,
+    and a follower under the row authority plans no frameless cycle (PLAN
+    BYPASS; ``#1028 HICACHE-ROUND`` ran n=1 on PP1/PP2 in the whole boot). Every
+    lap from epoch 2 to 6697 voted ``hicache_backup(3)`` on PP1/PP2, PP0 refused
+    every /flush_cache, the parked follower flush waited for a ``passed`` its own
+    vote prevented, and the front stopped the group: ``W3
+    Weg2DrainWitnessDisagreement`` with an empty, CORRECT front ledger.
+
+    The drain is rank-local where the round drain is local anyway
+    (``UnifiedRadixCache.drain_backup_acks_uncoordinated``: nothing when the
+    attention group > 1). It runs AFTER the write-through drain, because that
+    drain is what issues the sidecar backups. Nothing is waited on: a backup the
+    store has not acked yet stays and votes not-idle, the next lap drains it.
+    Returns the drained count."""
+    tc = getattr(self, "tree_cache", None)
+    pending = getattr(tc, "ongoing_backup", None)
+    if not pending or int(getattr(getattr(self, "ps", None), "pp_rank", 0) or 0) == 0:
+        return 0
+    drain = getattr(tc, "drain_backup_acks_uncoordinated", None)
+    if not callable(drain):
+        return 0
+    try:
+        from sglang.srt.weg2 import p_row_authority as _prow
+
+        if not _prow.applies(self) or not self._pp_microbatches_drained():
+            return 0
+        drained = int(drain())
+    except Exception:  # noqa: BLE001 - the drain never blocks the vote
+        logger.warning("WEG2-BACKUP-ACK-DRAIN-ON-VOTE raised; the slot votes on the undrained state",
+                       exc_info=True)
+        return 0
+    if drained > 0:
+        _BAV_N[0] += 1
+        if _BAV_N[0] <= 16 or _BAV_N[0] % 256 == 0:
+            logger.info("WEG2-BACKUP-ACK-DRAIN-ON-VOTE pp_rank=%d drained=%d left=%d (n=%d): the "
+                        "follower's acked storage backups (the #106S sidecar writes its own "
+                        "write-through drain issued), retired at the #1268 vote -- a frameless "
+                        "cycle skips the round drain that retires them", int(self.ps.pp_rank),
+                        drained, len(getattr(tc, "ongoing_backup", None) or ()), _BAV_N[0])
+    return max(drained, 0)
+
+
 class SchedulerPPMixin:
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
@@ -6733,6 +6791,9 @@ class SchedulerPPMixin:
         weg2_791c_release_on_idle_vote(self, vote)
         weg2_loadback_drain_on_idle_vote(self)
         weg2_writethrough_drain_on_idle_vote(self)
+        # NF-W3-DRAIN 1014: after the write-through drain -- its acks issue the
+        # #106S sidecar backups this one retires once the store acked them.
+        weg2_backup_ack_drain_on_idle_vote(self)
         if attach_slot(vote, rank, self.is_fully_idle(), ", ".join(self.idle_blockers()) or "none"):
             log_verdict(vote, rank)
 
