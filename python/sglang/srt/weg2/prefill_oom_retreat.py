@@ -620,7 +620,8 @@ def _lb_verdict_released(sched, req) -> bool:
 
         tree = getattr(sched, "tree_cache", None)
         rid = getattr(req, "rid", None)
-        return bool(tree is not None and rid is not None and _lbv.gated(tree, req) and _lbv.released(tree, rid))
+        # LBV-ADMIT: on the carrierless form the admission gate spends the release for exactly this admission (live)
+        return bool(tree is not None and rid is not None and _lbv.gated(tree, req) and _lbv.live(tree, req))
     except Exception:  # noqa: BLE001 -- unknown = assume released: the stop is the safe direction
         return True
 

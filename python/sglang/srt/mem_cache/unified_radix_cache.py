@@ -6962,6 +6962,30 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return False
         return pool.claim_would_refuse(top.hash_value)
 
+    def weg2_lbv_pp0_room(self, kv_tokens: int, rid=None) -> bool:
+        """LBV-ADMIT (weg2/pp_loadback_verdict.admit_holds): PP0's room verdict for its
+        OWN load-back of a request it is about to release -- the same decision the
+        ``load_back`` seam's ``_lbv_fits`` takes (the published floor, the Form A
+        floor, the agreed R_m, then the local-PP eviction of the shortfall), asked at
+        the admission gate instead of inside the load. PP0 only; its answer is the
+        group's verdict."""
+        kv_tokens = int(kv_tokens)
+        floor = getattr(self, "uniform_avail_floor", None)
+        if floor is None:
+            raise RuntimeError(
+                "#1045 UNIFORM FLOOR ABSENT AT LB-VERDICT ADMIT: PP0 must decide whether "
+                f"{kv_tokens} token(s) of host load-back fit and the group availability floor "
+                f"was never published for this iteration (rid={rid}); deciding from the local "
+                "free space is the rank-divergent path #1045 forbids"
+            )
+        floor = _form_a_load_back_floor(self, floor, kv_tokens, rid)
+        from sglang.srt.weg2 import pp_slot_fidelity as _sf
+
+        floor = _sf.agreed_floor(self, floor)
+        if kv_tokens <= floor:
+            return True
+        return bool(_sf.local_pp_room(self, kv_tokens, floor, rid))
+
     def load_back(
         self,
         best_match_node: UnifiedTreeNode,
@@ -7109,7 +7133,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # NF-RANG-AUDIT 1014: a load-back that EXECUTES PP0's row (Fix B row authority,
         # execute_scheduled_prefix) is not gated -- the row is the verdict (pp_loadback_verdict.gated)
         _lbv_gated = _lbv_rid is not None and _lbv.gated(self, req)
-        if _lbv_gated and not _lbv.released(self, _lbv_rid):
+        # LBV-ADMIT (h16h 19:33:48Z): on the carrierless form the verdict was spent by the
+        # admission gate for exactly this admission (pp_loadback_verdict.live)
+        if _lbv_gated and not _lbv.live(self, req):
             def _lbv_fits() -> bool:
                 if kv_tokens <= floor:
                     return True
