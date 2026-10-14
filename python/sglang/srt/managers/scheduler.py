@@ -248,6 +248,7 @@ from sglang.srt.weg2 import d_head_hold as _weg2_d_head_hold  # DQH
 from sglang.srt.weg2 import progress_beacon as _weg2_beacon  # FP forward-progress beacon
 from sglang.srt.weg2.d_lead_probe import build_d_lead_probe  # D-LEAD-MS-1007
 from sglang.srt.weg2.vision_verdict import Weg2VisionVerdict  # H125f vision verdict on the chain
+from sglang.srt.weg2.pp_loadback_verdict import Weg2PpLoadbackVerdict  # LB-VERDICT-1014 on the chain
 from sglang.srt.weg2 import extend_trim as _weg2_extend_trim  # rc12g extend chunk cap
 from sglang.srt.weg2 import d_seat_vram as _weg2_d_seat_vram  # D-MEM-SCHED stage between wakes
 from sglang.srt.weg2 import d_transient_lend as _weg2_d_transient_lend  # D-TRANSIENT-LEND
@@ -1177,6 +1178,24 @@ def _weg2_producer_wake_verdict(sched, req) -> str:
                     "answered zero; one final read of the store at the wake, no park "
                     "(P computes what the store lacks)", str(rid), span, verdict, n)
     return "complete"
+
+
+def _lbv_compose(sched, other):
+    """LB-VERDICT-1014: PP0's load-back verdicts join the origin's extra requests (after the vision verdicts and
+    aborts, which lead); armed here on every stage, the verdicts are produced on PP0 only."""
+    from sglang.srt.weg2 import pp_loadback_verdict as _lbv
+
+    if not _lbv.arm(sched):
+        return other
+    if int(getattr(getattr(sched, "ps", None), "pp_rank", 0) or 0) != 0:
+        return other
+
+    def _hook():
+        out = list(other() or ()) if other is not None else []
+        out.extend(_lbv.take(getattr(sched, "tree_cache", None)))
+        return out
+
+    return _hook
 
 
 def _prefetch_rid_stop():
@@ -4076,6 +4095,7 @@ class Scheduler(
                 (Weg2LaneFloorReqInput, self.handle_weg2_lane_floor),
                 (Weg2ParkWindowReqInput, self.handle_weg2_park_window),
                 (Weg2VisionVerdict, self.handle_weg2_vision_verdict),
+                (Weg2PpLoadbackVerdict, self.handle_weg2_pp_loadback_verdict),
                 (PlePrefetchHintReqInput, self.handle_ple_prefetch_hint),
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
@@ -4999,7 +5019,8 @@ class Scheduler(
             # the origin so every rank drops the same rids in the same pass.
             # W27 RID-SPLIT: then PP0's intake-stall drops (vision leads).
             origin_extra_reqs_hook=_ioa.origin_hook(
-                self._weg2_intake_origin_aborts, _vision_origin_aborts
+                self._weg2_intake_origin_aborts,
+                _lbv_compose(self, _vision_origin_aborts),
             ),
         )
 
@@ -6577,6 +6598,13 @@ class Scheduler(
     # ---- H91 Teil B: D seats -- the park and its resume ---------------------
     # Delegation only (large-class-style): the bookkeeping moves live in
     # weg2/d_park_runtime.py, the verdicts in weg2/d_seats.py.
+
+    def handle_weg2_pp_loadback_verdict(self, recv_req):
+        """LB-VERDICT-1014: PP0's load-back verdict, dispatched on every PP stage."""
+        from sglang.srt.weg2.pp_loadback_verdict import absorb
+
+        absorb(getattr(self, "tree_cache", None), recv_req)
+        return None
 
     def handle_weg2_vision_verdict(self, recv_req):
         """H125f: PP0's vision verdict, dispatched on every PP stage."""

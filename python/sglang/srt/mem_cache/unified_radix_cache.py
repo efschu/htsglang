@@ -7087,6 +7087,27 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         # PR (weg2/pp_room_vote.py): under the stages' agreed R_m, at most R_m
         floor = _sf.agreed_floor(self, floor)
+        # LB-VERDICT-1014 (NF h16 17:30:29Z #1004, weg2/pp_loadback_verdict.py): on the carrierless
+        # PP form the load-back's pass is PP0's decision, distributed over the request chain --
+        # never each stage's own room verdict.
+        from sglang.srt.weg2 import pp_loadback_verdict as _lbv
+
+        _lbv_rid = getattr(req, "rid", None)
+        _lbv_gated = _lbv_rid is not None and _lbv.armed(self)
+        if _lbv_gated and not _lbv.released(self, _lbv_rid):
+            def _lbv_fits() -> bool:
+                if kv_tokens <= floor:
+                    return True
+                return bool(_sf.local_pp_room(self, kv_tokens, floor, _lbv_rid))
+
+            try:
+                _lbv.hold(self, _lbv_rid, kv_tokens, _lbv_fits)
+            finally:
+                self.dec_lock_ref(best_match_node, ancestor_lock_params)
+                self.dec_host_lock_ref(best_match_node, host_anchor_params)
+            if req is not None:
+                req._h105e_floor_refused = True  # H105e: waits like a floor refusal
+            return False
         if kv_tokens > floor:
             try:
                 _room = _sf.local_pp_room(self, kv_tokens, floor, getattr(req, "rid", None))
@@ -7102,6 +7123,19 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 # A group of one's floor IS this rank's available_size():
                 # re-read after the eviction, it clears the load-back.
                 floor = int(self.token_to_kv_pool_allocator.available_size())
+            elif _lbv_gated:
+                # LB-VERDICT-1014: PP0 released this load-back for THIS pass on every stage; a stage
+                # that cannot pay it may not refuse alone (#1004) -- it stops by name.
+                _avail = int(self.token_to_kv_pool_allocator.available_size())
+                self.dec_lock_ref(best_match_node, ancestor_lock_params)
+                self.dec_host_lock_ref(best_match_node, host_anchor_params)
+                raise _sf.AgreedRoomShort(
+                    f"{_lbv.MARK} SHORT rid={_lbv_rid} kv_tokens={kv_tokens} floor={floor} avail_after={_avail}: PP0 "
+                    "released this load-back for this pass on every stage and this stage cannot hold it even "
+                    "with every evictable row freed; refusing alone would start it on the peers only (#1004) "
+                    "-- the group stops by name (raenge-nie-uneins)",
+                    rid=_lbv_rid, kv_tokens=kv_tokens, agreed=int(floor), avail=_avail, avail_after=_avail,
+                )
         if floor < kv_tokens:
             # weg2xsn285 (18.09.): THE FLOOR REFUSED AND NOBODY EVICTED. Group
             # D held three finished 98k prompts (retained, backed up,
@@ -7143,6 +7177,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return False
 
         # Load H→D
+        if _lbv_gated:
+            _lbv.consume(self, _lbv_rid)  # LB-VERDICT-1014: the released load-back runs in this pass
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
         device_indices = self.cache_controller.load(
