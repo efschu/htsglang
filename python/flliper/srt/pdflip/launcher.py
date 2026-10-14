@@ -12256,11 +12256,18 @@ class LaunchGuard:
 
     def __init__(self, log, reap_mark_gib: float, period_s: float = 0.5) -> None:
         self._log = log
-        self._latch = host_ledger.RateLatch(reap_mark_gib=reap_mark_gib)
+        # 12.10.2026 (NF W98 HOST-WARN, user rule 06.10.): "Ledger, Launcher und
+        # Startskripte warnen nur" -- this guard used to hand a W98 verdict to
+        # main(), which raised PdFlipLaunchHostLatched and tore the spawned groups
+        # down. It now warns (marker HOST-RAM-WARN W98) and the boot goes on.
+        self._latch = host_ledger.RateLatch(reap_mark_gib=reap_mark_gib, warn_only=True)
         self._period = float(period_s)
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        #: kept for the call sites that still read it; since 12.10.2026 always
+        #: ``None`` -- the guard no longer produces a verdict that stops a boot.
         self.verdict: Optional[str] = None
+        self.warns = 0
         self.ticks = 0
 
     def start(self) -> "LaunchGuard":
@@ -12300,8 +12307,9 @@ class LaunchGuard:
                     self.ticks += 1
                     if line is not None:
                         self._log(line)
-                        if "W98" in line and self.verdict is None:
-                            self.verdict = line
+                        if (host_ledger.HOST_WARN_MARKER in line
+                                and "CLEARED" not in line and "RATE-GAP" not in line):
+                            self.warns += 1
             except Exception as e:  # noqa: BLE001 -- a guard never kills its host
                 self._log(f"PDFLIP-HOST LAUNCH-GUARD read failed: {e}")
             self._stop.wait(self._period)
@@ -12312,7 +12320,7 @@ class LaunchGuard:
             self._thread.join(timeout=2.0)
         self._log(
             f"PDFLIP-HOST LAUNCH-GUARD disarmed ticks={self.ticks} "
-            f"verdict={'none' if self.verdict is None else 'W98 LATCHED'}"
+            f"warns={self.warns} (warn-only, nothing was stopped)"
             + (f" ({why})" if why else "")
         )
         return self.verdict
@@ -28186,24 +28194,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # #1361a: the front is up from here on and carries the same latch on the
     # same terms, so the launcher-side guard hands over rather than doubling.
     if _launch_guard is not None:
-        _lg_verdict = _launch_guard.stop("front takes over")
-        if _lg_verdict is not None:
-            # #1361 21a-fix: BOTH TYPES, and the second one is what tears the
-            # already-spawned ranks down. This raise sits AFTER
-            # launch_group(spec_p) and launch_group(spec_d) -- both groups are
-            # live -- and only `PdFlipLaunchRefused` runs through the teardown
-            # funnel. Raising a bare `PdFlipHostLedgerRefused` here stopped the
-            # boot by name and left six rank processes holding the cards, which
-            # is the exact class #1294 and #1248 exist to catch; both ratchets
-            # caught it. The precedent is #1294's own
-            # `PdFlipChunkCardMismatch(PdFlipLaunchRefused, ValueError)`: widen the
-            # CLASS, do not rewrite the raise site, so every existing
-            # `except host_ledger.PdFlipHostLedgerRefused` keeps catching it too.
-            raise PdFlipLaunchHostLatched(
-                "W98 PdFlipHostRateLatched (launch guard): the host cushion was "
-                "exhausted while the dormant image was still being written, in the "
-                "window the front's own loop does not cover. " + _lg_verdict
-            )
+        # 12.10.2026 (NF W98 HOST-WARN): hand over only. The guard WARNS (marker
+        # HOST-RAM-WARN W98) and never returns a verdict that stops the boot, so
+        # the old `PdFlipLaunchHostLatched` raise that stood here is gone (the class
+        # stays defined: it is part of the refusal tuple and of old test imports).
+        _launch_guard.stop("front takes over")
     front_argv = front_argv_for(
         py, store_dir, spec_p.pid, spec_d.pid, dc_expect_d, cards, ns, chunk_count,
         carrier_max_tokens, p_bs, d_bs, x_tokens, flip_min_work_tokens, idle_layout_front,

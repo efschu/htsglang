@@ -7992,15 +7992,16 @@ class Front:
         # blindness, not another sampler's. A built-but-unwired guard is the
         # #464 / #1017 class; the ratchet on that is
         # `test_the_guard_loop_constructs_the_rate_latch`.
-        rate_latch = host_ledger.RateLatch(
-            reap_mark_gib=host_ledger.OBSERVED_REAP_NONRECLAIM_BYTES / host_ledger.GIB
-        )
-        # #1361: the latch is only useful FASTER than the level test. 0.5 s is
-        # the slow end of the ordered 200-500 ms band and still ten times the
-        # cadence that went blind; the level verdict keeps its own period, so
-        # nothing about W22 changes.
-        rate_period_s = min(0.5, float(self.host_watermark_period_s))
-        _level_due = 0.0
+        # 12.10.2026 (NF W98 HOST-WARN, user rule 06.10. "KEINE Verweigerung wegen
+        # Host-RAM ... man laesst es darauf ankommen, ob es OOM geht"): the latch
+        # and the W22 level test WARN and the front goes on. int24g
+        # (dauer10121858, 22:37:44Z) stopped itself on cushion=0.38 < 1.50 with
+        # shmem rising and answered six requests 503; that stop is gone. The
+        # warning marker is ``HOST-RAM-WARN`` (host_ledger.HOST_WARN_MARKER),
+        # once per episode, re-armed on recovery.
+        # RC4 port of NF HOST-WARN (user rule 06.10.): the guard switches (user decision 06.10., 27B line) are read FIRST
+        # and decide the mode. Switch ON (default) = the verdict mode of before, byte for byte (do_stop below); switch OFF
+        # = the HOST-RAM-WARN episode mode of the NF line (one warning per episode, a CLEARED line, the front goes on).
         # Nutzerentscheid 06.10.: W22 and W98 are switched SEPARATELY (FLLIPER_PDFLIP_HOST_GUARD_W22 / _W98, default on =
         # the do_stop below, byte for byte). Off = the line is logged but the front is not stopped.
         _w22_on = guard_switches.flag_on(envs.FLLIPER_PDFLIP_HOST_GUARD_W22)
@@ -8012,6 +8013,17 @@ class Front:
                     "%s breach is logged but the front is NOT stopped; the threshold itself is unchanged",
                     _gname, _gname, _gname)
         _guard_off_seen = {"W22": 0, "W98": 0}
+        rate_latch = host_ledger.RateLatch(
+            reap_mark_gib=host_ledger.OBSERVED_REAP_NONRECLAIM_BYTES / host_ledger.GIB,
+            warn_only=not _w98_on,
+        )
+        w22_episode = host_ledger.HostWarnEpisode()
+        # #1361: the latch is only useful FASTER than the level test. 0.5 s is
+        # the slow end of the ordered 200-500 ms band and still ten times the
+        # cadence that went blind; the level verdict keeps its own period, so
+        # nothing about W22 changes.
+        rate_period_s = min(0.5, float(self.host_watermark_period_s))
+        _level_due = 0.0
         while True:
             try:
                 # #1361: the FAST half, every tick. `read_cgroup_pressure` is
@@ -8062,7 +8074,12 @@ class Front:
                         # look. #1361.
                         self.counters["host_rate_gap"] += 1
                         logger.warning("%s", _line)
-                    elif _line is not None and not latch_line_is_verdict(_line, rate_latch):
+                    elif _line is not None and host_ledger.HOST_WARN_MARKER in _line and "CLEARED" in _line:
+                        # the episode ended: the warning state re-armed
+                        self.counters["host_rate_cleared"] += 1
+                        logger.info("%s", _line)
+                    elif (_line is not None and host_ledger.HOST_WARN_MARKER not in _line
+                          and not latch_line_is_verdict(_line, rate_latch)):
                         # fnFL2 v24 (21.09.): the latch also RETURNS its
                         # printed-once notes (CUSHION-BELOW-FLOOR NOT-LATCHED /
                         # FREE-POOL-ABSORBS); the launcher's guard grades the
@@ -8071,22 +8088,31 @@ class Front:
                         self.counters["host_rate_note"] += 1
                         logger.info("%s", _line)
                     elif _line is not None:
+                        # W98 HOST-WARN: the old answer here was `do_stop("W98
+                        # PdFlipHostRateLatched")` (STOP, 503 for every request in
+                        # flight, final). The user rule of 06.10. replaces it:
+                        # the full numbers go to the log once per episode and the
+                        # front serves on.
                         self.counters["host_rate_latch"] += 1
-                        if _w98_on:
-                            logger.error("%s", _line)
-                            # SAME NAMED TEARDOWN PATH AS W22. The projection is a
-                            # different question from the level, but the answer to
-                            # both is the controlled teardown the user ordered on
-                            # 2026-09-08 -- never a kernel kill, never a silent
-                            # restart, never "accept the risk".
-                            self.do_stop("W98 PdFlipHostRateLatched", _line)
-                            return
-                        # Nutzerentscheid 06.10.: W98 switched off -- named, throttled, no stop; the level test below
-                        # (W22, its own switch) still runs this tick.
-                        _guard_off_seen["W98"] += 1
-                        if _guard_off_seen["W98"] <= 12 or _guard_off_seen["W98"] % 120 == 0:
-                            logger.error("HOST GUARD W98 AUS: NOT stopping (n=%d) -- %s",
-                                         _guard_off_seen["W98"], _line)
+                        if host_ledger.HOST_WARN_MARKER in _line:
+                            # switch OFF (warn_only latch): the episode line, once per episode (NF HOST-WARN)
+                            logger.warning("%s", _line)
+                        else:
+                            if _w98_on:
+                                logger.error("%s", _line)
+                                # SAME NAMED TEARDOWN PATH AS W22. The projection is a
+                                # different question from the level, but the answer to
+                                # both is the controlled teardown the user ordered on
+                                # 2026-09-08 -- never a kernel kill, never a silent
+                                # restart, never "accept the risk".
+                                self.do_stop("W98 PdFlipHostRateLatched", _line)
+                                return
+                            # Nutzerentscheid 06.10.: W98 switched off -- named, throttled, no stop; the level test below
+                            # (W22, its own switch) still runs this tick.
+                            _guard_off_seen["W98"] += 1
+                            if _guard_off_seen["W98"] <= 12 or _guard_off_seen["W98"] % 120 == 0:
+                                logger.error("HOST GUARD W98 AUS: NOT stopping (n=%d) -- %s",
+                                             _guard_off_seen["W98"], _line)
                 _now = time.time()
                 if _now < _level_due:
                     await asyncio.sleep(rate_period_s)
@@ -8132,18 +8158,33 @@ class Front:
                             k[:-4]: v for k, v in pr.items()
                             if k.endswith("_gib") and k != "nonreclaim_gib"
                         },
+                        warn_only=not _w22_on,
                     )
-                    if verdict is not None:
+                    # W22 HOST-WARN (12.10.2026, user rule 06.10.): the level
+                    # breach WARNS -- on entering, every HOST_WARN_REMIND_S while
+                    # it lasts, and once when it clears -- and the front serves
+                    # on. The old answer was `do_stop("W22
+                    # PdFlipHostWatermarkBreached")`.
+                    _w22_now = time.time()
+                    _w22_ev = w22_episode.update(verdict is not None, _w22_now)
+                    if _w22_ev in ("enter", "remind"):
                         self.counters["host_watermark_breach"] += 1
-                        logger.error("%s", verdict)
-                        if not _w22_on:
-                            _guard_off_seen["W22"] += 1
-                            if _guard_off_seen["W22"] <= 12 or _guard_off_seen["W22"] % 12 == 0:
-                                logger.error("HOST GUARD W22 AUS: NOT stopping (n=%d) -- %s",
-                                             _guard_off_seen["W22"], verdict)
-                        else:
+                        if _w22_on:
+                            # switch ON (default, user decision 06.10.): the controlled teardown of before, unchanged
+                            logger.error("%s", verdict)
                             self.do_stop("W22 PdFlipHostWatermarkBreached", verdict)
                             return
+                        logger.warning(
+                            "%s [%s n=%d lasted_s=%.0f]", verdict, _w22_ev,
+                            w22_episode.n, w22_episode.duration_s(_w22_now))
+                    elif _w22_ev == "clear":
+                        self.counters["host_watermark_cleared"] += 1
+                        logger.info(
+                            "%s W22 CLEARED: non-reclaimable pressure is back under "
+                            "the runtime bound after %.0f s (episodes=%d) -- the "
+                            "next breach warns again",
+                            host_ledger.HOST_WARN_MARKER,
+                            w22_episode.duration_s(_w22_now), w22_episode.n)
             except Exception:  # noqa: BLE001 - a guard may never kill the front
                 logger.exception("host_watermark_sampler")
             # #1361: the loop now ticks at the LATCH's cadence; the level test
@@ -13772,8 +13813,29 @@ class Front:
         except Exception:  # noqa: BLE001
             cushion = None
         need, src = self._sleep_leg_need_gib(group)
-        host_ledger.refuse_sleep_leg_deficit(
-            cushion, need, margin_gib=0.0, source=src, group=str(group))
+        try:
+            host_ledger.refuse_sleep_leg_deficit(
+                cushion, need, margin_gib=0.0, source=src, group=str(group))
+        except host_ledger.PdFlipSleepLegCushionDeficit:
+            # W100 HOST-WARN (12.10.2026, user rule 06.10.): the pure function
+            # still computes the verdict, but the leg is NOT refused any more.
+            # The old call let the exception escape into the flip -> W4
+            # CONTROLLER-DEAD stop on a host-RAM reading. Now: one warning per
+            # group per HOST_WARN_REMIND_S with the full numbers, the leg runs.
+            self.counters["host_sleep_leg_warn"] += 1
+            _now = time.monotonic()
+            _last = self.__dict__.setdefault("_w100_warn_t", {})
+            if _now - _last.get(str(group), -1e18) >= host_ledger.HOST_WARN_REMIND_S:
+                _last[str(group)] = _now
+                logger.warning(
+                    "%s W100 SleepLegCushion: group %s's sleep leg would write "
+                    "need_gib=%.2f GiB of page cache and only cushion_gib=%.2f GiB "
+                    "is reclaimable (margin=0.00, source=%s) -- deficit %.2f GiB. "
+                    "WARNING ONLY: the leg runs, the flip is not refused (user "
+                    "rule 06.10.: no refusal on host RAM; an OOM kill is the "
+                    "accepted risk)",
+                    host_ledger.HOST_WARN_MARKER, group, float(need),
+                    float(cushion), src, float(need) - float(cushion))
 
     def sample_dormant_image(self, group: str, shmem_before: Optional[int],
                              vram_residue_mib: Optional[Dict[str, int]] = None,
