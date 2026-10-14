@@ -4194,11 +4194,24 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     "pin covers a load-back or a running request; the caller "
                     "must select an unlocked node, never free under the pin."
                 )
+        _fcd = (node.component_data[BASE_COMPONENT_TYPE]
+                if comp.component_type == BASE_COMPONENT_TYPE else None)
         if (
-            target == EvictLayer.HOST
-            and comp.component_type == BASE_COMPONENT_TYPE
-            and node.component_data[BASE_COMPONENT_TYPE].host_value is not None
-            and node.component_data[BASE_COMPONENT_TYPE].value is not None
+            _fcd is not None
+            and _fcd.host_value is not None
+            and (
+                (target == EvictLayer.HOST and _fcd.value is not None)
+                # h17 (NF 38c6d40239 D TP0 15:51:02, nodes 248/243/251): the
+                # Full host copy also leaves where the node holds NO device KV
+                # (an internal host-only node keeps living for its children,
+                # target HOST or ALL). Its Mamba host state stayed; a later
+                # insert revived Full.value over it -> "mamba host present but
+                # Full.host_value=None". The aux host goes first here too.
+                or (
+                    EvictLayer.HOST in target
+                    and envs.SGLANG_WEG2_AUX_HOST_LAW.get()
+                )
+            )
         ):
             _evict_aux_host_before_full_host(self, node, tracker)
         device_freed, host_freed = comp.evict_component(node, target=target)
