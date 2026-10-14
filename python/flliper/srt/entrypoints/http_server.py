@@ -162,7 +162,6 @@ from flliper.srt.managers.io_struct import (
     VramBudgetReqInput,
     PdFlipLaneFloorReqInput,
     PdFlipParkRunningReqInput,
-    PdFlipLaneFloorReqInput,
     PdFlipParkWindowReqInput,
 )
 from flliper.srt.managers.multi_tokenizer_mixin import (
@@ -1456,7 +1455,8 @@ async def pdflip_park_running(obj: Annotated[PdFlipParkRunningReqInput, Body()],
 @app.api_route("/pdflip/lane_floor", methods=["POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def pdflip_lane_floor(obj: Annotated[PdFlipLaneFloorReqInput, Body()], request: Request):
-    """PRIORITY LANES 1008 (L2): the front's floor for group D. Body {"floor": <int>, "epoch": <int>}; answer
+    """PRIORITY LANES 1008 (L2 + L3, one route for both groups): the front's floor. Group P: PP0 stamps it into the
+    PP-room vote so every stage applies it in the same pass (pdflip/lanes_p.py). Group D: Body {"floor": <int>, "epoch": <int>}; answer
     200 {"success", "floor", "epoch", "requeued": [rid, ...], "held": <n>, "message"} -- the floor and epoch in
     force, the held lane parks this call re-queued (oldest first) and the holds still standing. D's admission
     lets in only requests with priority >= floor; a request parked with hold="lane" (POST /pdflip/park_running
@@ -1490,19 +1490,6 @@ async def pdflip_park_window(obj: Annotated[PdFlipParkWindowReqInput, Body()], r
     except Exception as e:
         return _create_error_response(e)
     return ORJSONResponse({"sent": True, "left_ms": obj.left_ms}, status_code=200)
-
-
-@app.api_route("/pdflip/lane_floor", methods=["POST"])
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def pdflip_lane_floor(obj: Annotated[PdFlipLaneFloorReqInput, Body()], request: Request):
-    """PRIORITY LANES 1008: the Weg-2 front's lane floor for this group (body {"floor": int, "epoch": int}).
-    One-way to the scheduler; group P: PP0 stamps it into the PP-room vote so every stage applies it in the same
-    pass (pdflip/lanes_p.py); group D reads it in its admission. Without FLLIPER_PDFLIP_LANES=1 the scheduler ignores it."""
-    try:
-        _global_state.tokenizer_manager._dispatch_to_scheduler(obj)
-    except Exception as e:
-        return _create_error_response(e)
-    return ORJSONResponse({"sent": True, "floor": obj.floor, "epoch": obj.epoch}, status_code=200)
 
 
 @app.api_route("/pdflip/ple_prefetch_hint", methods=["POST"])

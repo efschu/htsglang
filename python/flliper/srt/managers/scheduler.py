@@ -4021,7 +4021,6 @@ class Scheduler(
                 (PdFlipParkRunningReqInput, self.handle_pdflip_park_running),
                 (PdFlipLaneFloorReqInput, self.handle_pdflip_lane_floor),
                 (PdFlipParkWindowReqInput, self.handle_pdflip_park_window),
-                (PdFlipLaneFloorReqInput, self.handle_pdflip_lane_floor),
                 (PdFlipVisionVerdict, self.handle_pdflip_vision_verdict),
                 (PlePrefetchHintReqInput, self.handle_ple_prefetch_hint),
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
@@ -6543,10 +6542,15 @@ class Scheduler(
         )
 
     def handle_pdflip_lane_floor(self, recv_req):
-        """PRIORITY LANES 1008 (L2): ``POST /pdflip/lane_floor`` -- the floor of D's admission
-        (d_park_runtime.lane_floor); a fall of the floor re-queues the held lane parks it lets in."""
-        from flliper.srt.pdflip import d_park_runtime
+        """PRIORITY LANES 1008 (L2 + L3, merged in L5): ``POST /pdflip/lane_floor`` -- ONE handler for both groups.
+        Group D (L2): the floor of D's admission (d_park_runtime.lane_floor); a fall of the floor re-queues the
+        held lane parks it lets in. Group P (L3, pdflip/lanes_p.py): PP0 records the value for its next pass and
+        stamps it on the PP-room vote, every stage applies it in the same pass; PP1/PP2 ignore the request
+        itself. Both halves return at once when they are not their group's; the reply (one, from rank 0 -- the
+        only rank with a real sender) is the L2 output on either group."""
+        from flliper.srt.pdflip import d_park_runtime, lanes_p
 
+        lanes_p.on_rpc(self, recv_req)
         return d_park_runtime.lane_floor(self, recv_req)
 
     def _pdflip_lane_skip(self, req):
@@ -6563,14 +6567,6 @@ class Scheduler(
         from flliper.srt.pdflip import park_window_gate
 
         park_window_gate.note(self, recv_req)
-
-    def handle_pdflip_lane_floor(self, recv_req) -> None:
-        """PRIORITY LANES 1008 (L3, pdflip/lanes_p.py): ``POST /pdflip/lane_floor``. Group P: PP0 records the value for its
-        next pass (it stamps it on the PP-room vote, every stage applies it in the same pass), PP1/PP2 ignore the
-        request itself. Ignored without FLLIPER_PDFLIP_LANES=1. No reply."""
-        from flliper.srt.pdflip import lanes_p
-
-        lanes_p.on_rpc(self, recv_req)
 
     def pdflip_d_hold_parked(self) -> int:
         """H91b: the sleep leg's dormant point -- parked requests enter the

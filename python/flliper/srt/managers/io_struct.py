@@ -1687,7 +1687,9 @@ class PdFlipLaneFloorReqInput(BaseReq, kw_only=True):
     """PRIORITY LANES 1008 (L2/L3, ``pdflip/lanes.py`` ``RPC_LANE_FLOOR``): the front's floor -- ``POST
     /pdflip/lane_floor`` with ``{"floor": <int>, "epoch": <int>}``. Group D: its admission lets in only requests
     with ``priority >= floor`` and re-queues the held lane parks of the lanes now let in, oldest first.
-    Needs FLLIPER_PDFLIP_LANES=1."""
+    Group P (part L3): PP0 takes it at the top of its next pass and stamps it on the PP-room vote
+    (``pp_room_vote.PdFlipPpLaneFloor``), every stage applies it in the same pass. ONE class, ONE route, ONE
+    dispatcher entry for both groups (L5: L2 and L3 had each defined their own). Needs FLLIPER_PDFLIP_LANES=1."""
 
     floor: int = 0
     epoch: int = 0
@@ -1717,17 +1719,6 @@ class PdFlipParkWindowReqInput(BaseReq, kw_only=True):
     a_ms: float = 0.0
     b_ms: float = 0.0
     c_ms: float = 0.0
-
-
-class PdFlipLaneFloorReqInput(BaseReq, kw_only=True):
-    """PRIORITY LANES 1008 (plan deskq/PLAN-PRIO-LANES-1008.md, pdflip/lanes.py ``RPC_LANE_FLOOR``): the front's lane
-    floor, ``POST /pdflip/lane_floor`` to a group -- ``{"floor": int, "epoch": int}``.  No reply.  Group P (part L3): PP0
-    takes it at the top of its next pass and stamps it on the PP-room vote (``pp_room_vote.PdFlipPpLaneFloor``), every
-    stage applies it in the same pass; group D (part L2) reads it in its admission.  Ignored without
-    ``FLLIPER_PDFLIP_LANES=1``."""
-
-    floor: int = 0
-    epoch: int = 0
 
 
 class PlePrefetchHintReqInput(BaseReq, kw_only=True):
