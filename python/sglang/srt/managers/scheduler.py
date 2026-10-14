@@ -365,6 +365,7 @@ from sglang.srt.weg2 import tail_handoff
 from sglang.srt.weg2 import p_intake as _p_intake
 from sglang.srt.weg2 import prefill_oom_retreat as _prefill_oom_retreat  # fix 43: Prefill-OOM = retreat, not death
 from sglang.srt.weg2.pp_slot_fidelity import AgreedRoomShort  # PREFILL-OOM-RETREAT, load-back entrance
+from sglang.srt.mem_cache.pool_host.arena_pool import ArenaChainMismatch  # ARENA-CHAIN: a refused load-back chain is a void pass
 from sglang.srt.mem_cache.common import (
     PrefillOutOfPages,  # PREFILL-OOM-RETREAT (weg2/prefill_oom_retreat.py)
     cap_above_evictable,  # F1 (nf-next-1006-01)
@@ -17737,6 +17738,16 @@ class Scheduler(
                 if _lb_verdict is None:
                     raise
                 res = AddReqResult.OTHER if _lb_verdict == _prefill_oom_retreat.ABORT else AddReqResult.NO_TOKEN
+            except ArenaChainMismatch as _acm:
+                # ARENA-CHAIN (NF 14.10. 07:29:33Z, P PP0 ``#1424 CHAIN MISMATCH node=460 page=174``): ``load_back`` refused a chain page
+                # nothing proves ("the LAST latch"; the proof_cut vote that cuts the match before it runs in the TP group D only) --
+                # before any device allocation, its host lock unwound. Same shape as the AgreedRoomShort above: the request is skipped,
+                # the pass is voided group-wide, the page leaves this rank's host tier, the rank lives. Out of scope (tp group, D) or
+                # switched off (SGLANG_WEG2_ARENA_CHAIN_VOID=0): the exception stops the rank as before.
+                _cm_verdict = _prefill_oom_retreat.retreat_chain_mismatch(self, _acm, req, adder)
+                if _cm_verdict is None:
+                    raise
+                res = AddReqResult.OTHER if _cm_verdict == _prefill_oom_retreat.ABORT else AddReqResult.NO_TOKEN
             except PPScheduleRefused as exc:
                 # NAMED, NOT FOLDED IN (the #797 practice for a sibling with a
                 # different root): requests admitted EARLIER in this same loop
