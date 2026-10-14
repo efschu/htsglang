@@ -8001,6 +8001,13 @@ class Scheduler(
         # needs; a redundant re-match is simply not taken.
         if rematch:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
+            # e1 ANCHOR-ONLY READ: KV in the tree, its Mamba anchor only in the
+            # store -- the GDN rank reads the blob, attaches it and re-matches
+            # (MAMBA-HOST-RESUME); rank-local, no collective (the head vote's
+            # MIN keeps the group where a rank's read failed)
+            _aor = getattr(self.tree_cache, "weg2_anchor_only_read", None)
+            if callable(_aor) and _aor(req) > 0:
+                req.init_next_round_input(self.tree_cache, cow_mamba=False)
         last_host_node = req.last_host_node
         # RANK-LOCAL: `backuped` means "full KV present in THIS rank's host
         # pool", and uneven DCP gives the ranks host pools of different sizes,

@@ -5702,6 +5702,128 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self.weg2_node_depth(end), len(chain), len(ends),
         )
 
+    # ---- ANCHOR-ONLY READ (e1, 14.10.) --------------------------------------
+
+    _weg2_anchor_only_n = 0
+
+    def _weg2_kv_chain_end(self, token_ids, extra_key, depth: int):
+        """The node at exactly ``depth`` tokens on the key path of
+        ``token_ids`` (the preceding match split the tree there), or None.
+        Full-child steps only -- nothing is split, nothing validated."""
+        key = RadixKey(token_ids=token_ids, extra_key=extra_key)
+        key, _ = key.maybe_to_bigram_view(self.is_eagle)
+        key = key.page_aligned(self.page_size)
+        node, cum = self.root_node, 0
+        while cum < int(depth) and len(key) > 0:
+            ck = key.child_key(self.page_size)
+            child = node.children.get(ck)
+            if child is None:
+                return None
+            n = child.key.match(key, page_size=self.page_size)
+            if n < len(child.key):
+                return None
+            cum += n
+            node = child
+            key = key[n:]
+        return node if cum == int(depth) and node is not self.root_node else None
+
+    def weg2_anchor_only_read(self, req) -> int:
+        """e1 ANCHOR-ONLY READ (NF h13 84e787ec96, D 14:35:36, weg2-24-181):
+        the match walked the KV to ``key_match_depth`` (148992) but refused
+        every node for a missing Mamba state (#904 MambaComponent:absent) --
+        a lower lane's park had spilled that anchor to L3 (DISPLACE
+        why=park_first, on_disk=1) while the KV stayed in the tree. The
+        store held the anchor but not the KV (D's pages were device-only),
+        so the ordinary prefetch could not deliver it either; W31, W50, P
+        prefilled 149125 tokens.
+
+        Here the GDN-holding rank reads ONLY that blob -- the node's last
+        page hash is its key, the existing mamba-pool transfer and
+        ``batch_get_v2`` carry it (arena in place, L3 fill, or the
+        ANCHOR-BYPASS staging row when the arena is full) -- and attaches it
+        as the node's host Mamba value (the PREFETCH-ANCHOR-ATTACH form). The
+        next match accepts it (MAMBA-HOST-RESUME) and the load-back moves the
+        state only. No new collective: a rank without GDN state never reads
+        (its walk suspends the mamba rule), and the group's head vote stays
+        the MIN of the ranks' matches, so a rank whose read failed keeps the
+        group where it was. Returns the attached depth, 0 for none.
+        ``SGLANG_WEG2_ANCHOR_ONLY_READ=0``: off."""
+        if not envs.SGLANG_WEG2_ANCHOR_ONLY_READ.get():
+            return 0
+        cc = self.cache_controller
+        backend = getattr(cc, "storage_backend", None) if cc is not None else None
+        if backend is None or not hasattr(backend, "batch_get_v2"):
+            return 0
+        try:
+            from sglang.srt.managers.cache_controller import rank_holds_gdn_state
+
+            if not rank_holds_gdn_state(cc):
+                return 0
+        except Exception:  # noqa: BLE001 - an unanswerable rank form reads nothing
+            return 0
+        comp = (getattr(self, "components", None) or {}).get(ComponentType.MAMBA)
+        mp = getattr(comp, "_mamba_pool_host", None)
+        if mp is None or not callable(getattr(mp, "alloc_read", None)):
+            return 0
+        kmd = int(getattr(req, "key_match_depth", 0) or 0)
+        sad = int(getattr(req, "state_anchor_depth", 0) or 0)
+        if kmd <= sad or kmd < int(self.page_size):
+            return 0
+        if getattr(req, "_weg2_aor_tried", None) == kmd:
+            return 0  # one read per depth: a miss is not re-read on every re-issue
+        try:
+            req._weg2_aor_tried = kmd
+        except Exception:  # noqa: BLE001
+            pass
+        node = self._weg2_kv_chain_end(
+            req.full_untruncated_fill_ids, getattr(req, "extra_key", None), kmd)
+        if node is None:
+            return 0
+        cd = node.component_data[ComponentType.MAMBA]
+        if cd.value is not None or (cd.host_value is not None and cd.host_value.numel() > 0):
+            return 0  # the node has a state: nothing to read
+        last_hash = node.get_last_hash_value()
+        if last_hash is None:
+            return 0
+        host_indices = mp.alloc_read(1)
+        if host_indices is None:
+            return 0
+        from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy
+
+        transfer = PoolTransfer(
+            name=PoolName.MAMBA,
+            host_indices=host_indices,
+            keys=[last_hash],
+            hit_policy=PoolHitPolicy.TRAILING_PAGES,
+        )
+        ok = False
+        try:
+            ok = bool((backend.batch_get_v2([transfer]) or {}).get(PoolName.MAMBA, [False])[0])
+        except Exception:  # noqa: BLE001 - a failed read is an unread anchor
+            logger.warning("e1 ANCHOR-ONLY READ failed rid=%s", getattr(req, "rid", "?"), exc_info=True)
+            ok = False
+        idx = transfer.host_indices
+        if not ok or (callable(getattr(mp, "is_placeholder", None)) and mp.is_placeholder(int(idx[0]))):
+            try:
+                mp.free(idx)
+            except Exception:  # noqa: BLE001
+                pass
+            ok = False
+        if ok:
+            cd.host_value = idx.clone()
+            if cd.value is None:
+                host_lru = self.host_lru_lists[ComponentType.MAMBA]
+                if not host_lru.in_list(node):
+                    host_lru.insert_mru(node)
+        UnifiedRadixCache._weg2_anchor_only_n += 1
+        n = UnifiedRadixCache._weg2_anchor_only_n
+        if n <= 16 or n % 64 == 0:
+            logger.info(
+                "WEG2 ANCHOR-ONLY-READ n=%d rid=%s depth=%d anchor_was=%d attached=%d row=%s "
+                "(the KV was in the tree, its Mamba anchor only in the store: only the blob is read)",
+                n, getattr(req, "rid", "?"), kmd, sad, int(ok), int(idx[0]) if ok else -1)
+        return kmd if ok else 0
+
     def weg2_lane_rank_on(self) -> bool:
         return bool(envs.SGLANG_WEG2_LANE_ANCHOR_RANK.get())
 
