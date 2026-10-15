@@ -64792,7 +64792,7 @@
    "id": "SGLANG_WEG2_ARENA_REF_RECHECK",
    "kind": "env",
    "lesestellen": [
-    "managers/cache_controller.py:155"
+    "managers/cache_controller.py:156"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_ARENA_REF_RECHECK",
@@ -64802,7 +64802,7 @@
     "baum": "nf",
     "file": "managers/cache_controller.py",
     "kind": "os.environ",
-    "line": 155
+    "line": 156
    },
    "status": "geerntet",
    "text": "",
@@ -83993,6 +83993,37 @@
    "text": "",
    "type": "EnvBool"
   },
+  "SGLANG_WEG2_TAIL_CONSUME_ON_FULL": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "TAIL-CONSUME-ON-FULL (NF h16h 853534a9ff, boot _211215, D 00:49:44-45, weg2-182-1661, the h48 pendulum, 106 s over P three times): D's FIRST wake read was reaped SHORT (TP2 ``READ-STAGES pages=810 of 1417`` -- the arena reap race, ``LATE-COMPLETE statuses=[3]`` the same second; group END 51840), and THIS reap's ``agree`` ran the H63b receipt -- ``WEG2-TAIL-CONSUMED removed_files=4/2``. The #1456 HOLD-REFETCH then read every page (``completed_synced=90688``) but its re-staging found nothing (``TAIL-READY verdict=no_parts``): the 13-token tail was not adoptable, ``#x38 SETTLE-TAIL ... record-short`` -> D-NORECOMPUTE -> W50-REROUTE -> P prefilled the 90701 tokens again. The receipt's premise -- \"nothing reads the files again\" -- is false for a SHORT reap: the settle re-reads and re-stages. Now the files leave only at a FULL reap; a short reap DEFERS the receipt (rid remembered, named), released by the next full reap, by the admission (``plan_adopt``: the parts were read or given up), by an abort (``drop``), or -- bounded -- when the deferred set overflows. ``full`` is computed from the group-synced reap values (Form A MIN), so every rank of the group defers or consumes alike. ``SGLANG_WEG2_TAIL_CONSUME_ON_FULL=0``: the receipt at every reap, as before.",
+   "id": "SGLANG_WEG2_TAIL_CONSUME_ON_FULL",
+   "kind": "env",
+   "lesestellen": [
+    "weg2/tail_adopt.py:1337"
+   ],
+   "level": "experte",
+   "name": "SGLANG_WEG2_TAIL_CONSUME_ON_FULL",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "baum": "nf",
+    "file": "weg2/tail_adopt.py",
+    "kind": "os.environ",
+    "line": 1337
+   },
+   "status": "geerntet",
+   "text": "",
+   "type": "os.environ"
+  },
   "SGLANG_WEG2_TAIL_FIT_ON_COMPUTE": {
    "baeume": [
     "27b",
@@ -87341,25 +87372,25 @@
    "abweichung": 47,
    "beide": 2461,
    "nur_27b": 180,
-   "nur_nf": 93
+   "nur_nf": 94
   },
-  "entries": 2752,
-  "envs": 1873,
+  "entries": 2753,
+  "envs": 1874,
   "erklaert": 305,
   "flags": 864,
-  "geerntet": 1703,
+  "geerntet": 1704,
   "kuratiert": 125,
   "unerklaert": 619
  },
- "tree_rev": "27b=02123ee2ef+nf=75e3ee8abd+lbv-deadlock-e23abfcb05+prio-alter-fa99a484ae+w3-drain-e7cfda7fbe+follower-round-b76e5fce79+h16m-int-1014",
+ "tree_rev": "27b=02123ee2ef+nf=75e3ee8abd+lbv-deadlock-e23abfcb05+prio-alter-fa99a484ae+w3-drain-e7cfda7fbe+follower-round-b76e5fce79+h16m-int-1014+readdepth-60ad6ba20a+h16n-int-1015",
  "trees": {
   "27b": {
    "entries": 2641,
    "rev": "02123ee2ef"
   },
   "nf": {
-   "entries": 2554,
-   "rev": "75e3ee8abd+lbv-deadlock-e23abfcb05+prio-alter-fa99a484ae+w3-drain-e7cfda7fbe+follower-round-b76e5fce79+h16m-int-1014"
+   "entries": 2555,
+   "rev": "75e3ee8abd+lbv-deadlock-e23abfcb05+prio-alter-fa99a484ae+w3-drain-e7cfda7fbe+follower-round-b76e5fce79+h16m-int-1014+readdepth-60ad6ba20a+h16n-int-1015"
   }
  },
  "warnungen": []
