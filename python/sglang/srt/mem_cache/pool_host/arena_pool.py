@@ -2277,7 +2277,10 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                     l3_state[2] += int(sec.get("lost", 0))
                 else:
                     l3_state[2] += len(cands)
-                free_named(arena, [c[0] for c in cands], "claim_room")
+                # ARENA-FREE-GEN (READ-DEPTH 1014): only this evictor's candidates, generation-bound
+                from sglang.srt.mem_cache.storage.file.hicache_arena import free_evicted_named
+
+                free_evicted_named(arena, [c[0] for c in cands], "claim_room")
                 stems = getattr(arena, "_stems", None)
                 if isinstance(stems, dict):
                     for c in cands:

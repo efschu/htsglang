@@ -3843,7 +3843,10 @@ class HiCacheFile(HiCacheStorage):
         if not cands:
             return 0
         moved = self.arena_secure_to_disk(arena, cands, writer="evict_clock")["written"]
-        _free_named(arena, [c[0] for c in cands], "evict_to_disk")
+        # ARENA-FREE-GEN (READ-DEPTH 1014): only this evictor's candidates, generation-bound
+        from sglang.srt.mem_cache.storage.file.hicache_arena import free_evicted_named
+
+        free_evicted_named(arena, [c[0] for c in cands], "evict_to_disk")
         arena.reap_stale()
         stems = getattr(arena, "_stems", {})
         for c in cands:

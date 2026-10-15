@@ -37,7 +37,7 @@
 #define S_COMPLETE 2u
 #define S_EVICTING 3u
 #define S_QUARANTINE 4u
-#define S_REAPING 5u     /* READ-DEPTH 1014 (port of 27B dae863c7c8 (1)): transient, held by arena_reap_stale_aged only */
+#define S_REAPING 5u     /* READ-DEPTH 1014 (port of 27B dae863c7c8 (1)): transient and private -- held by arena_reap_stale_aged / arena_free_evicting while they reset the header */
 #define TOMB (~0ULL)
 #define KV_IVALS 64      /* interval capacity for slots <= 1 MiB */
 #define BLOB_IVALS 8192  /* interval capacity for larger slots (mamba blobs) */
@@ -1035,6 +1035,54 @@ int64_t arena_reap_stale_aged(uint8_t *base, int64_t min_age_ms) {
         sh->key_lo = 0; sh->key_hi = 0;
         sh->generation++;
         atomic_store(&sh->state, S_FREE);
+        freed++;
+    }
+    return freed;
+}
+
+/* ARENA-FREE-GEN (READ-DEPTH 1014, second guard beside the aged reap): the
+ * generation of each slot, read by the evictor right after
+ * arena_evict_candidates (its candidates are EVICTING: nobody but an aged
+ * reaper moves them). */
+int64_t arena_slot_gens(uint8_t *base, int64_t n, const int64_t *slots, int64_t *gens) {
+    ArenaHeader *h = hdr(base);
+    for (int64_t i = 0; i < n; i++) {
+        gens[i] = -1;
+        if (slots[i] < 0 || (uint64_t)slots[i] >= h->slots) continue;
+        gens[i] = (int64_t)slot_hdr(base, (uint64_t)slots[i])->generation;
+    }
+    return n;
+}
+
+/* ARENA-FREE-GEN: an evictor frees ITS candidates only -- a slot still
+ * EVICTING under the generation it was chosen in. A slot reaped (generation
+ * moved, FREE/REAPING) or re-claimed since (CLAIMED/COMPLETE under a new
+ * owner) is never freed by the old evictor: the h16h death 01:09:10
+ * (ArenaChainMismatch bad=47 'key slot -1 (state 0)') was arena_free_slots
+ * freeing a COMPLETE, referenced page of PP0 that sat in a slot the live
+ * evictor still had on its list. The slot is taken privately (S_REAPING)
+ * while its header is reset, then FREE. status per slot: 1 = freed,
+ * 2 = generation moved (refused), 3 = not EVICTING any more (refused),
+ * 0 = bad slot. Returns the number freed. */
+int64_t arena_free_evicting(uint8_t *base, int64_t n, const int64_t *slots, const int64_t *gens,
+                            int8_t *status) {
+    ArenaHeader *h = hdr(base);
+    int64_t freed = 0;
+    for (int64_t i = 0; i < n; i++) {
+        status[i] = 0;
+        if (slots[i] < 0 || (uint64_t)slots[i] >= h->slots) continue;
+        SlotHeader *sh = slot_hdr(base, (uint64_t)slots[i]);
+        if ((int64_t)sh->generation != gens[i]) { status[i] = 2; continue; }
+        uint32_t expect = S_EVICTING;
+        if (!atomic_compare_exchange_strong(&sh->state, &expect, S_REAPING)) { status[i] = 3; continue; }
+        if ((int64_t)sh->generation != gens[i]) { atomic_store(&sh->state, S_EVICTING); status[i] = 2; continue; }
+        /* the evictor unlinked the index cell and took the slot out of
+         * n_complete (arena_evict_candidates); the key words go, the
+         * generation moves so a late completion on it is refused */
+        sh->key_lo = 0; sh->key_hi = 0;
+        sh->generation++;
+        atomic_store(&sh->state, S_FREE);
+        status[i] = 1;
         freed++;
     }
     return freed;
