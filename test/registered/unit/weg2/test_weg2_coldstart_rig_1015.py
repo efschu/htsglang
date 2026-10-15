@@ -1498,7 +1498,7 @@ S9_PAGE = 64
 S9_SLOTS = 96
 
 
-class _CD7:
+class _CD9:
     def __init__(self, value=None, host_value=None):
         self.value = value
         self.host_value = host_value
@@ -1517,9 +1517,9 @@ class _Node9:
         self.l3_present = False
         self.key = list(range(tokens))
         self.slots = []
-        self.component_data = [_CD7(torch.arange(tokens, dtype=torch.int64) if tokens else None,
+        self.component_data = [_CD9(torch.arange(tokens, dtype=torch.int64) if tokens else None,
                                     torch.arange(tokens, dtype=torch.int64) if (tokens and host) else None),
-                               _CD7(), _CD7()]
+                               _CD9(), _CD9()]
         if parent is not None:
             parent.children[self.id] = self
 
@@ -1532,7 +1532,7 @@ class _Node9:
         return self.component_data[0].host_value is not None
 
 
-class _SpillPool7:
+class _SpillPool9:
     """The anchor pool the spill talks to: every page it is asked about is on disk already (the write-behind
     secured it -- 'l3=on_disk:3232,written:0'); no header read (node-id order, the tree's fallback)."""
 
@@ -1553,10 +1553,10 @@ def _s9_stage_cls():
     missing = [n for n in names if not hasattr(C, n)]
     if missing:
         raise RigError(f"UnifiedRadixCache lacks {missing}")
-    return type("_Stage7", (_Stage7Base,), {n: getattr(C, n) for n in names})
+    return type("_Stage9", (_Stage9Base,), {n: getattr(C, n) for n in names})
 
 
-class _Stage7Base:
+class _Stage9Base:
     """One follower P stage: its own tree (tp group of one under pp 3 -> the local-PP floor) on the shared arena."""
 
     W3_SPILL_MIN_PAGES = 64
@@ -1716,7 +1716,7 @@ def test_S9_arena_full_pinned_row_room(tmp_path, monkeypatch):
             raise RigError("the pinned arena granted a claim -- the scenario's premise is gone")
         st.root_node.children.pop(small.id)
         try:
-            st._w3_arena_spill(_SpillPool7(), 3, claimer=None)
+            st._w3_arena_spill(_SpillPool9(), 3, claimer=None)
         except Exception as exc:  # noqa: BLE001
             raise RigError(f"_w3_arena_spill cannot run on the rig stage: {exc!r}")
         if not n208.backuped and arena.slot_refs(n208.slots)[0] != 1:
