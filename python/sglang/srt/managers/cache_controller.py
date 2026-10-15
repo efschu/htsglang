@@ -47,6 +47,7 @@ from sglang.srt.mem_cache.hicache_collective import (
 )
 from sglang.srt.mem_cache.weg2_store_gates import check_mamba_blob_present
 from sglang.srt.mem_cache import probe_hold as _probe_hold
+from sglang.srt.weg2 import read_depth as _rd  # READ-DEPTH 1014 (C5)
 
 
 # #1402: module-level on purpose -- the harness doubles bind curated
@@ -3736,6 +3737,7 @@ class HiCacheController:
             # An honest miss instead.
             return 0
         _t0 = time.perf_counter()
+        _rd_base = int(getattr(operation, "completed_tokens", 0) or 0) // max(1, int(getattr(self, "page_size", 1) or 1))  # READ-DEPTH: this batch's first page (instrument: never raises)
         stems = weg2_suffixed_stems(self.storage_backend, hash_values)  # Posten 2: suffix memoised per key class
         import numpy as _np
         _fs, _st = pool.arena.find_slots_np(stems)  # Posten 2 (18.09.): numpy, no 520k-tuple list
@@ -3798,15 +3800,19 @@ class HiCacheController:
                     _pre[i] = s_
                     continue
                 _end = i  # evicted between find and ref: the prefix ends here
+                _rd.note_cut(operation, _rd_base + i, _rd.L2_EVICTED_BEFORE_REF)  # READ-DEPTH
                 break
             _need.append(i)
         _fills = {}
+        _why = {}
         _tf = time.perf_counter()
         if _need:
             _fill_fn = getattr(self.storage_backend, "arena_fill_from_disk", None)
             if callable(_fill_fn):
+                _rd.fill_reasons_reset()
                 _got = _fill_fn(pool.arena, [stems[i] for i in _need], int(pool._page_bytes), prefix=True)
                 _fills = dict(zip(_need, _got))
+                _why = {_need[k]: c for k, c in _rd.fill_reasons_take().items() if k < len(_need)}
         _tf1 = time.perf_counter()
         _rs["l3fill"] = _rs.get("l3fill", 0.0) + (_tf1 - _tf) * 1000.0
         _rs["l3fill_pages"] = _rs.get("l3fill_pages", 0) + len(_need)
@@ -3820,6 +3826,8 @@ class HiCacheController:
             # #1433: not in the L2 -- the L3 fill above read it (or not)
             fill = _fills.get(i)
             if fill is None or pool.arena.ref_slots([fill], +1) != 1:
+                _rd.note_cut(operation, _rd_base + i,  # READ-DEPTH: why the walk ends here
+                             _why.get(i, _rd.FILL_NONE) if fill is None else _rd.FILL_EVICTED_BEFORE_REF)
                 break  # not on disk / evicted between fill and ref: the prefix ends here
             slots.append(fill)
         if _pre:
@@ -3909,6 +3917,7 @@ class HiCacheController:
         prefix_keys = operation.prefix_keys
         for i in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
             if operation.is_terminated():
+                _rd.note_cut(operation, i, _rd.TERMINATED)  # READ-DEPTH
                 # #1068 (A12.4): a stop or a revoke lands at the next batch
                 # boundary (~4 MiB), never after one more storage read. The
                 # per-page increment below would refuse anyway; checking
@@ -4075,6 +4084,8 @@ class HiCacheController:
                 self._page_transfer(operation)
                 operation.read_end_time = time.monotonic()
                 _read_stages_line(operation, (operation.read_end_time - operation.read_start_time) * 1000.0)
+                _rd.line(operation, self.page_size, getattr(self, "pp_rank", "?"),  # READ-DEPTH (C5)
+                         (operation.read_end_time - operation.read_start_time) * 1000.0)
                 _note_l3_read(self, operation)  # RANK-TIMING: rankstats cache.l3 / prefetch
                 # #257: what the read did not take, the probe gives back
                 _probe_hold.release(operation, getattr(self, "mem_pool_host", None), 0, reason="read-end")

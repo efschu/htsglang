@@ -280,6 +280,38 @@ def _note_late_complete(slots, statuses) -> None:
                        k, list(slots)[:4], sorted(set(int(x) for x in statuses)), _LATE_COMPLETE_N[1])
 
 
+def _read_depth_fill_reasons(stems, on_disk, out, joined, still_full, being_written, stats,
+                             gap) -> None:
+    """READ-DEPTH 1014 (C5): why the fill gave no slot for a stem -- recorded
+    on this thread for ``_arena_page_get``'s ``WEG2-READ-DEPTH`` line (the
+    ``L3-FILL`` lines themselves are rate limited per process). An instrument:
+    never raises, decides nothing."""
+    try:
+        from sglang.srt.weg2 import read_depth as _rd
+
+        _rd.fill_reasons_reset()
+        for i, why in (stats.get("why") or {}).items():
+            if out[int(i)] is None:
+                _rd.fill_reason(int(i), why)
+        for j in joined or ():
+            if out[int(j[0])] is None:
+                _rd.fill_reason(int(j[0]), _rd.JOIN_UNFINISHED)
+        for f in still_full or ():
+            if out[int(f[0])] is None:
+                _rd.fill_reason(int(f[0]), _rd.ARENA_FULL)
+        for i in being_written or ():
+            if out[int(i)] is None:
+                _rd.fill_reason(int(i), _rd.INFLIGHT_UNFINISHED)
+        if gap is not None and int(gap) < len(stems) and out[int(gap)] is None:
+            _rd.fill_reason(int(gap), _rd.NOT_ON_DISK)
+        elif gap is None:
+            for i, st in enumerate(stems):
+                if out[i] is None and st not in on_disk:
+                    _rd.fill_reason(i, _rd.NOT_ON_DISK)
+    except Exception:  # noqa: BLE001 - an instrument never breaks a fill
+        pass
+
+
 def _fill_claim(arena, stems, total_bytes: int):
     """The fill's claims, stamped with the l3fill role (L3FILL-JOINED); a
     hermetic fake arena without the keyword claims as before."""
@@ -3660,6 +3692,8 @@ class HiCacheFile(HiCacheStorage):
                                    fill_join_wait_ms(len(_being_written)))
             for i, s_ in _w.items():
                 out[i] = s_
+        _read_depth_fill_reasons(stems, on_disk, out, joined, still_full, _being_written,
+                                 stats, _gap if prefix else None)
         if prefix:
             _stop = next((i for i in range(_gap) if out[i] is None), _gap)
             for i in range(_stop + 1, n):
@@ -3779,8 +3813,13 @@ class HiCacheFile(HiCacheStorage):
                     filled += 1
                 elif c in (3, 6):
                     late.append((todo[k][1], int(c)))   # reaped / recycled under us: not ours
+                    stats.setdefault("why", {})[todo[k][0]] = "late_complete"   # READ-DEPTH
                 else:
                     bad.append((todo[k][1], todo[k][2]))
+                    stats.setdefault("why", {})[todo[k][0]] = "read_failed"   # READ-DEPTH
+        for k, r in enumerate(rc):
+            if r != 0:
+                stats.setdefault("why", {})[todo[k][0]] = "read_failed"   # READ-DEPTH
         if late:
             _note_late_complete([s for s, _ in late], [c for _, c in late])
         if bad:
