@@ -1619,7 +1619,7 @@ class _PfRing:
         return None
 
 
-class Guards5:
+class Guards7:
     @staticmethod
     def held_prefix(ring, rid, held, what):
         """G7: every stage proved ``held`` tokens of ``rid`` (its read ended at ``held``) -> every rank admits at
@@ -1703,11 +1703,11 @@ def s7_case_b(monkeypatch, dt=3.3, passes=10, grace="5.5"):
 
 def test_S7_pf_frist_against_pass_cadence(monkeypatch):
     """h64 case A and B, each its own ring: G1 + G7 on the admission of the rid."""
-    Guards5.held_prefix(s7_case_a(monkeypatch), RID_A, TOLD_A, "case A (stale early record, satisfied locally, 2.2 s passes)")
+    Guards7.held_prefix(s7_case_a(monkeypatch), RID_A, TOLD_A, "case A (stale early record, satisfied locally, 2.2 s passes)")
 
 
 def test_S7b_pf_frist_two_hop_ack_in_long_passes(monkeypatch):
-    Guards5.held_prefix(s7_case_b(monkeypatch), RID_B, TOLD_B, "case B (equal reads, 3.3 s passes, PP2 two hops down)")
+    Guards7.held_prefix(s7_case_b(monkeypatch), RID_B, TOLD_B, "case B (equal reads, 3.3 s passes, PP2 two hops down)")
 
 
 # =====================================================================================================================
@@ -1730,6 +1730,7 @@ def test_S7b_pf_frist_two_hop_ack_in_long_passes(monkeypatch):
 # own lapse clock (``_d_parked`` stamped at t_park before a 54 s RPC), the PLE-warm GIL hold (C), the load-back.
 
 PARK_S_RANKS = (31.3, 30.9, 31.1)       # epoch 90: stage=park ms=31311 on TP0, TP1/TP2 within a second of it
+HY_SETTLE_S = 21.7                      # ... of which yield:21732 (hy.settle), l3mark:9334 (park_l3.mark_parked) the rest
 
 
 class _RankClock:
@@ -1892,10 +1893,13 @@ def _enter(g, rank):
     g.rtime.tl.clock = g.clocks[rank]
 
 
-def s8_slow_park(g, monkeypatch, durations=PARK_S_RANKS, stamp_at_start=False):
+def s8_slow_park(g, monkeypatch, durations=PARK_S_RANKS):
     """epoch 90 on a TP3 D group: nothing running, one settle request (weg2-88-1053, its read short), two queued behind
-    (weg2-88-1054, weg2-89-1056). The park's phases after the retraction take ``durations[rank]`` s (the storm: the HY
-    settle stands for yield + l3mark). Returns (scheds, answered[rank]); then the passes after the answer."""
+    (weg2-88-1054, weg2-89-1056). The park's phases after the retraction take ``durations[rank]`` s on that rank's own
+    monotonic clock, split like the metal's ``sub=...yield:21732,l3mark:9334``: ``HY_SETTLE_S`` in ``hy.settle`` (the
+    yield phase) and the rest in ``park_l3.mark_parked`` (#248 PARK-MARK), each a wrapper around the REAL function.
+    A stamp taken anywhere before the answer is therefore stale by the time ``park_running`` returns -- not only one
+    taken at the retraction. Returns (scheds, answered[rank]); then the passes after the answer."""
     from sglang.srt.managers.io_struct import Weg2ParkRunningReqInput
 
     rt, ds, hy = g.rt, g.ds, g.hy
@@ -1903,12 +1907,27 @@ def s8_slow_park(g, monkeypatch, durations=PARK_S_RANKS, stamp_at_start=False):
     real_settle = hy.settle
     scheds = [_DSched(r, group, waiting=[_dreq("weg2-88-1054", 2), _dreq("weg2-89-1056", 3)],
                       settle=[_dreq("weg2-88-1053", 1)]) for r in range(3)]
+    try:
+        from sglang.srt.weg2 import park_l3 as l3
+        real_mark = l3.mark_parked
+    except (ImportError, AttributeError):
+        l3 = real_mark = None
+    ran = {"settle": [0] * 3, "mark": [0] * 3}
 
     def slow(sched, *, retracted, parked):
-        g.clocks[sched.rank].t += durations[sched.rank]       # this rank's own monotonic clock: the phases take time
+        share = min(HY_SETTLE_S, durations[sched.rank]) if l3 is not None else durations[sched.rank]
+        g.clocks[sched.rank].t += share                       # the yield phase: HY settle's stat walk under the storm
+        ran["settle"][sched.rank] += 1
         return real_settle(sched, retracted=retracted, parked=parked)
 
     monkeypatch.setattr(hy, "settle", slow)
+    if l3 is not None:
+        def slow_mark(sched, parked, *a, **k):
+            g.clocks[sched.rank].t += max(0.0, durations[sched.rank] - HY_SETTLE_S)   # #248 PARK-MARK (l3mark)
+            ran["mark"][sched.rank] += 1
+            return real_mark(sched, parked, *a, **k)
+
+        monkeypatch.setattr(l3, "mark_parked", slow_mark)
     answered = [None] * 3
 
     def park(r):
@@ -1921,6 +1940,9 @@ def s8_slow_park(g, monkeypatch, durations=PARK_S_RANKS, stamp_at_start=False):
         return out
 
     _run_ranks(3, park)
+    if ran["settle"] != [1, 1, 1] or (l3 is not None and ran["mark"] != [1, 1, 1]):
+        raise RigError(f"RIG-FEHLER: the park's phases did not run once on every rank (settle {ran['settle']}, "
+                       f"mark {ran['mark']}) -- the rig would measure nothing")
     return scheds, answered
 
 
@@ -1948,14 +1970,23 @@ class Guards8:
         want = ["weg2-88-1053", "weg2-88-1054", "weg2-89-1056"]
         if parked0 != want:
             raise RigError(f"{what}: the park holds {parked0}, expected {want}")
+        # the rank-local stamps differ by up to ``spread`` s (each rank's own clock stamped at its own answer): inside
+        # the window [t_ans + bound - spread, t_ans + bound) SOME ranks' local verdict is "due" and some are not. Only
+        # the group MIN (``_weg2_group_min_flags``) makes every rank act alike -- a rank-local verdict re-queues on
+        # some ranks alone (G1 RAENGE-NIE-UNEINS, R2). The tick inside the window is where that is measured.
+        spread = max(answered) - min(answered)
+        tick_in_window = t_ans + bound - min(0.2, spread / 2.0)
         for label, at, may_requeue in (
                 ("the pass right after the answer", t_ans, False),
                 (f"{bound - 1.0:.0f} s after the answer", t_ans + bound - 1.0, False),
+                (f"{bound - (t_ans + bound - tick_in_window):.1f} s after the answer (inside the ranks' disagreement "
+                 f"window: some rank-local stamps are already {bound:.0f} s old, others not)", tick_in_window, False),
                 (f"{bound + 1.0:.0f} s after the answer (the safety net)", t_ans + bound + 1.0, True)):
             moved = _tick_all(g, scheds, at)
             if len(set(moved)) != 1:
                 raise LawViolation("G1 RAENGE-NIE-UNEINS",
-                                   f"{what}: {label}: the D ranks re-queued {moved} requests (group MIN verdict)")
+                                   f"{what}: {label}: the D ranks re-queued {moved} requests (the group MIN verdict "
+                                   "did not decide for every rank alike)")
             if may_requeue:
                 if moved[0] == 0:
                     raise LawViolation("G8 PARK-SELF-UNDO",
@@ -2078,9 +2109,11 @@ def test_selfcheck_S7_wall_frist_and_late_settle_are_the_h64_fallback_a(monkeypa
 
 
 def test_selfcheck_S7b_wall_frist_without_the_pass_floor_is_the_h64_fallback_b(monkeypatch):
-    """SELF-CHECK case B: the Frist counts wall time alone, the ack stream is only drained under a paced rid."""
+    """SELF-CHECK case B: the Frist counts wall time alone (pass floor off). ONLY the pass floor is turned back here:
+    the ACK-DRAIN switch is NOT part of this self-check on purpose -- in S7b the pass floor keeps the rid open and PP0
+    keeps harvesting, so ``TOLD_ACK_DRAIN=0`` alone changes nothing (mutant R4 survives; ACK-DRAIN is an uncovered
+    fix, see the report 'Grenzen')."""
     monkeypatch.setenv("SGLANG_WEG2_TOLD_FALLBACK_MIN_PASSES", "0")
-    monkeypatch.setenv("SGLANG_WEG2_TOLD_ACK_DRAIN", "0")
     with pytest.raises(LawViolation, match="G7"):
         test_S7b_pf_frist_two_hop_ack_in_long_passes(monkeypatch)
 
@@ -2099,6 +2132,40 @@ def test_selfcheck_S8_stamp_before_the_phases_is_the_epoch90_death(d_group, monk
             return float(d_group.clocks[sched.rank].t)
 
         monkeypatch.setattr(rt, "park_answer_stamp", early)
+    with pytest.raises(LawViolation, match="G8"):
+        test_S8_slow_d_park_does_not_undo_itself(d_group, monkeypatch)
+
+
+def test_selfcheck_S8_rank_local_verdict_is_the_g1_divergence(d_group, monkeypatch):
+    """SELF-CHECK (the runner's mutant R2 as a monkeypatch): ``park_tick`` decides from the RANK-LOCAL clock verdict, no
+    group MIN (``_weg2_group_min_flags`` returns what it was given). The rank-local stamps differ by 0.4 s, so the tick
+    inside that window re-queues on some ranks alone: G1. On a tree without ``park_answer_stamp`` the scenario is
+    G8-red already and the self-check accepts either law."""
+    monkeypatch.setattr(_DSched, "_weg2_group_min_flags", lambda self, flags: [1 if f else 0 for f in flags])
+    law = "G1" if hasattr(d_group.rt, "park_answer_stamp") else "G1|G8"
+    with pytest.raises(LawViolation, match=law):
+        test_S8_slow_d_park_does_not_undo_itself(d_group, monkeypatch)
+
+
+def test_selfcheck_S8_stamp_after_the_yield_phase_is_still_the_epoch90_death(d_group, monkeypatch):
+    """SELF-CHECK (the runner's mutant R3): the awake clock stamped right after the HY settle (``_ph("yield")``) instead of
+    at the answer -- before #248 PARK-MARK (9.3 s on the metal), #59b and the clamp. The partial reversal of the
+    flipstall fix A: a rig that stalls only the HY phase would stay green on it."""
+    rt, ds, hy = d_group.rt, d_group.ds, d_group.hy
+    if not hasattr(rt, "park_answer_stamp"):
+        pytest.skip("n/a: this tree has no park_answer_stamp (the scenario is red on it already)")
+    real_settle = hy.settle
+
+    def stamp_after_yield(sched, *, retracted, parked):
+        out = real_settle(sched, retracted=retracted, parked=parked)
+        now = d_group.clocks[sched.rank].t
+        for req in sched.weg2_d_parked:
+            setattr(req, ds.SINCE_ATTR, now)
+        setattr(sched, rt.LATE_HOLD_ATTR, now)
+        return out
+
+    monkeypatch.setattr(hy, "settle", stamp_after_yield)
+    monkeypatch.setattr(rt, "park_answer_stamp", lambda sched, flip_list, *, late_hold: float(d_group.clocks[sched.rank].t))
     with pytest.raises(LawViolation, match="G8"):
         test_S8_slow_d_park_does_not_undo_itself(d_group, monkeypatch)
 

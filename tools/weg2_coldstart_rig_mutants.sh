@@ -3,6 +3,7 @@
 #
 #   tools/weg2_coldstart_rig_mutants.sh <SHA|ref>        (the target tree must CONTAIN the fixes: h16o2 364ab5de5d)
 #
+# NOT covered by any mutant: ACK-DRAIN (TOLD_ACK_DRAIN off, R4 survives: the pass floor keeps the rid open in S7b) and GROUP-FLOOR.
 # A scratch worktree (.claude/worktrees/coldstart-mut-<sha10>) is made at the SHA; per mutant ONE fix is turned back in
 # the SOURCE (not by an env switch), the rig runs there (tools/weg2_coldstart_rig.sh <dir>), the expected scenarios must
 # be ROT, the file is restored. A mutant whose scenarios stay GRUEN means the rig measures nothing for that fix.
@@ -42,6 +43,16 @@ MUTANTS = [
      '    tree._all_reduce_attn_groups(t, torch.distributed.ReduceOp.MIN, label="park_hold_yield_facts")\n',
      '    if refused:\n        tree._all_reduce_attn_groups(t, torch.distributed.ReduceOp.MIN, label="park_hold_yield_facts")\n',
      ["S8c_"]),
+    # R2 (review 1015): park_tick without the group MIN -- the rank-local clock verdict decides alone (G1)
+    ("R2 park_tick decides from the rank-local clock, no group MIN", RT,
+     "        due = bool(sched._weg2_group_min_flags([local])[0])\n",
+     "        due = bool(local)\n", ["S8_"]),
+    # R3 (review 1015): the awake clock stamped right after the HY yield phase instead of at the answer (partial
+    # reversal of flipstall fix A: before #248 PARK-MARK, #59b and the clamp)
+    ("R3 awake clock stamped right after the yield phase, park_answer_stamp stamps nothing", RT,
+     '    _ph("yield")\n',
+     '    _ph("yield")\n    for _r in sched.weg2_d_parked:\n        setattr(_r, d_seats.SINCE_ATTR, time.monotonic())\n'
+     '    setattr(sched, LATE_HOLD_ATTR, time.monotonic() if late_hold_armed else None)\n', ["S8_"]),
 ]
 # M8a also needs park_answer_stamp not to restamp later: neutralise its two writes
 M8A_EXTRA = (RT, "    for req in flip_list:\n        setattr(req, d_seats.SINCE_ATTR, answered)\n"
@@ -73,10 +84,10 @@ for name, f, old, new, want in MUTANTS:
     if src.count(old) != 1:
         print(f"  PATCH-FEHLER {name}: anchor found {src.count(old)}x in {f}"); sys.exit(2)
     open(path, "w").write(src.replace(old, new))
-    if name.startswith("M8a"):
+    if name.startswith(("M8a", "R3")):
         p2 = os.path.join(wt, M8A_EXTRA[0]); s2 = open(p2).read()
         if s2.count(M8A_EXTRA[1]) != 1:
-            print("  PATCH-FEHLER M8a extra anchor"); git("checkout", "--", "."); sys.exit(2)
+            print(f"  PATCH-FEHLER {name.split()[0]} extra anchor"); git("checkout", "--", "."); sys.exit(2)
         open(p2, "w").write(s2.replace(M8A_EXTRA[1], M8A_EXTRA[2]))
     rc, rows, txt = rig()
     open(os.path.join(out, f"{label}.{name.split()[0]}.txt"), "w").write(txt)
