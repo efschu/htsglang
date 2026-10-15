@@ -172,7 +172,7 @@ def test_mutant_case_78_784_old_reap_cuts_the_fill(tmp_path, monkeypatch):
     assert out[0] is None                               # LATE-COMPLETE 3: the prefix ends at page 0
 
 
-def _death_0109(tmp_path, reap):
+def _death_0109(tmp_path, reap, gen_free=False):
     """The h16h death 01:09:10 (PP0, weg2-208-1751): ``ArenaChainMismatch #1424
     CHAIN MISMATCH node=1958 page=201 of 1505 bad=47: key slot -1 (state 0)``.
     PP0's fill landed and REFERENCED all 1552 pages (READ-STAGES pages=1552);
@@ -191,7 +191,10 @@ def _death_0109(tmp_path, reap):
     if mine:
         assert arena.complete_slots([s for s, _ in mine], [g for _, g in mine], [(0, TOTAL)]) == [1] * len(mine)
         assert arena.ref_slots([s for s, _ in mine], +1) == len(mine)   # the walk's reference: the tree names them
-    arena.free_slots([c[0] for c in cands], reason="evict_to_disk")      # A finishes (no check)
+    if gen_free:
+        arena.free_evicted([c[0] for c in cands], reason="evict_to_disk")   # A finishes, generation-bound
+    else:
+        arena.free_slots([c[0] for c in cands], reason="evict_to_disk")      # A finishes (no check)
     return mine, stems, arena
 
 
@@ -213,3 +216,29 @@ def test_mutant_death_0109_old_reap_unlinks_a_referenced_page(tmp_path):
     mine, stems, arena = _death_0109(tmp_path, _old_reap)
     assert len(mine) == 4
     assert [arena.find_slots([st])[0] for st in stems] == [(-1, 0)] * 4
+
+
+def test_gen_bound_free_closes_death_0109_even_with_the_instant_reap(tmp_path, caplog):
+    """ARENA-FREE-GEN, the second guard: even if a reap takes a live
+    evictor's candidates (the old instant reap here), the evictor's free is
+    refused for every slot that is no longer ITS candidate -- PP0's referenced
+    pages keep their keys, the refusal is named."""
+    import logging
+
+    from sglang.srt.mem_cache.storage.file import hicache_arena as ha
+
+    before = ha._FREE_EVICTED_REFUSED[1]
+    with caplog.at_level(logging.WARNING, logger=ha.__name__):
+        mine, stems, arena = _death_0109(tmp_path, _old_reap, gen_free=True)
+    assert len(mine) == 4                                      # the reap race happened
+    assert [arena.find_slots([st])[0] for st in stems] == [(s, 2) for s, _ in mine]
+    assert ha._FREE_EVICTED_REFUSED[1] == before + 4
+    assert any("ARENA-FREE-EVICTED REFUSED" in r.getMessage() for r in caplog.records)
+
+
+def test_gen_bound_free_frees_its_own_candidates(tmp_path):
+    arena = _full_arena(tmp_path)
+    cands = arena.evict_candidates(3)
+    assert arena.free_evicted([c[0] for c in cands], reason="evict_to_disk") == 3
+    claims = arena.claim_slots(["a", "b", "c"], [TOTAL] * 3)
+    assert sorted(c[0] for c in claims) == sorted(c[0] for c in cands) and all(c[1] == 0 for c in claims)
