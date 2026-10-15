@@ -269,7 +269,9 @@ def test_lane_0_only_across_a_p_phase_and_its_flips_routing_and_log_equal_the_sw
         assert r["status"] == [200] * 9
         assert r["floor_rpc"] == ([], [], []) and r["counters"] == {}      # (flip parks carry no rids / hold: see _lane_parks)
         assert r["lane_lines"] == [], r["lane_lines"]
-        assert r["p_before_first_flip"] == 6          # rule 1 of the phase policy (cap 6) is untouched
+        # DOUBLE FLIP 1015: the phase cap (6) never strands a request that needs P (X is 0 here: every one of the nine
+        # does), so the phase takes all nine before its flip -- the old 6 left three for a PARK-IMMEDIATE the moment D woke
+        assert r["p_before_first_flip"] == 9
     assert on["floor"] == (0, 0)
     assert (on["p_gen"], on["d_gen"], on["p_rpc"], on["d_rpc"], on["epoch"], on["resume_handoff"]) == \
            (off["p_gen"], off["d_gen"], off["p_rpc"], off["d_rpc"], off["epoch"], off["resume_handoff"])

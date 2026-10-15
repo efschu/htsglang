@@ -12483,6 +12483,51 @@ class Front:
         x = int(getattr(self, "tp_prefill_max_tokens", 0) or 0)
         return 0 <= int(_g("est_uncached", 0) or 0) <= x
 
+    def _p_phase_needs_p(self, p: "Pending") -> bool:
+        """DOUBLE-FLIP (flipqueue 1015, user reprimand 15.10.): a queued request the immediate park would
+        flip D back to P for -- :func:`phase_policy.immediate_park_trigger`'s OWN reader (over X, P-only,
+        refused over X by D, routed to P on a smaller X_busy), never one whose leg 1 is done.
+
+        The P phase may not end with such a request left in the queue: the P->D flip's DONE-KICK fires
+        PARK-IMMEDIATE for it at once (``awake_s=0.0``: D decoded not one token, 11 of 26 doubles in the h16r/
+        h16p boots of 15.10.). The phase cap used to strand it while YOUNGER SHORTs rode past the cap
+        (``_p_phase_short_rides``) -- 11:04:50Z the LONG weg2-0-7 (7199 > X 5713, waited 36 s) stayed behind
+        three younger SHORTs; 12:16:23Z weg2-28-76 (1258 uncached, routed LONG on X_busy 1205, so no SHORT)
+        behind three more. One predicate for both readers (the park trigger and the phase end)."""
+        if getattr(p, "client_gone", False):
+            return False
+        fut = getattr(p, "fut", None)
+        if fut is not None and fut.done():
+            return False
+        x = int(getattr(self, "tp_prefill_max_tokens", 0) or 0)
+        return phase_policy.immediate_park_trigger([p], x) is not None
+
+    def _p_phase_cap_exempt(self, p: "Pending") -> bool:
+        """What the P phase cap never strands: a SHORT (FLIPCYCLE H5, D would otherwise prefill it after the
+        flip) AND a request that needs P (:meth:`_p_phase_needs_p`, which would flip D straight back).
+        ``_p_drain_pool`` takes the exempt ones oldest first (PRIO-AS-AGE: the order key), so a SHORT never
+        rides past an older LONG."""
+        return Front._p_phase_short_rides(self, p) or Front._p_phase_needs_p(self, p)
+
+    def _p_end_over_x_left(self, stalled: bool, dc_cap: int, k10_only: bool) -> None:
+        """Instrument, no verdict: the P phase ends with requests in the queue that need P. After the cap
+        exemption only three reasons are left, each a refusal of P or of D's seat count, not of the phase
+        cap: ``stall`` (P's intake refused the head -- its pool, defect 1), ``seat-gate`` (D is full: the
+        DECODE-COLLECT cap, PBOUND-HELD-BY-SEAT-GATE holds the rest) and ``k10-rvp-only``. ``other`` is a
+        defect to read. Counted per cause (``p_end_over_x_left_<cause>``), one line per phase."""
+        left = [p for p in list(self.queue) if Front._p_phase_needs_p(self, p)]
+        if not left:
+            return
+        cause = ("stall" if stalled else "seat-gate" if int(dc_cap or 0) > 0
+                 else "k10-rvp-only" if k10_only else "state" if self.state != "serving" else "other")
+        key = "p_end_over_x_left_" + cause.replace("-", "_")
+        self.counters[key] = self.counters.get(key, 0) + 1
+        logger.warning("WEG2 P-END-OVER-X-LEFT epoch=%d cause=%s n=%d rids=%s uncached=%s X=%d queue=%d -- the P "
+                       "phase ends with request(s) over X still queued for P (the park fires for them as soon as "
+                       "D wakes: a double flip)", self.epoch, cause, len(left), [p.rid for p in left][:6],
+                       [int(getattr(p, "est_uncached", 0) or 0) for p in left][:6],
+                       int(getattr(self, "tp_prefill_max_tokens", 0) or 0), len(self.queue))
+
     def _asr_queued_short_to_d(self, live_q: List["Pending"], now: float) -> List["Pending"]:
         """ARRIVAL-SEAT: every queued SHORT whose own route verdict was SHORT
         (``d_eligible``: uncached <= X, no vision stage, never re-queued) goes
@@ -17483,7 +17528,8 @@ class Front:
                           (lambda q, pred: Front._prio_pick(self, q, pred)) if _prio_age.enabled() else None),
                     # FLIPCYCLE H5: the phase cap never strands a SHORT
                     # (the seat gate's cap is hard: a SHORT needs a D seat too)
-                    cap_exempt=(self._p_phase_short_rides
+                    # DOUBLE-FLIP 1015: nor a request that needs P (the park's own reader)
+                    cap_exempt=(self._p_phase_cap_exempt
                                 if envs.SGLANG_WEG2_ENABLE_P_PHASE_SHORT_RIDES.get() and _dc_cap <= 0
                                 else None))
                 # K9 P-DRAIN-EARLY-SETTLE: the early legs P is prefilling anyway are settled here, in "serving",
@@ -17581,6 +17627,8 @@ class Front:
                     # H91 part C rule 3: so are the ones D parked on the wait
                     # bound -- their clients are waiting for D to resume them,
                     # under --idle-layout P as well.
+                    if self.queue:
+                        Front._p_end_over_x_left(self, bool(self._p_intake_stalled), _dc_cap, _k10_only)
                     await self.flip("P", "D")
                 elif self._idle_disposition("P", at_rest=True) == "flip":
                     await self.flip("P", "D")
