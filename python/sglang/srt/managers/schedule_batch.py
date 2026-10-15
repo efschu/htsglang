@@ -1526,6 +1526,11 @@ class Req(ReqDllmMixin):
         # construction is on the per-request path. The two are pinned together
         # by test_kv_spill_class_unit.test_req_defaults_to_normal.
         self.spill_class = "normal"
+        # FRONT-X-MIT (15.10., weg2/front_x.py): the Weg-2 front's decision X and
+        # priced uncached for this D-direct leg 2, stamped by the scheduler from
+        # the request. None = nothing carried (the static X gate alone).
+        self.weg2_front_x = None
+        self.weg2_front_priced = None
 
         # For incremental decoding
         # ----- | --------- read_ids -------|

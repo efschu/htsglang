@@ -32,6 +32,7 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.code_completion_parser import (
     generate_completion_prompt_from_request,
 )
+from sglang.srt.weg2 import front_x as weg2_front_x
 from sglang.utils import convert_json_schema_to_str
 
 if TYPE_CHECKING:
@@ -136,6 +137,10 @@ class OpenAIServingCompletion(OpenAIServingBase):
             custom_logit_processor=request.custom_logit_processor,
             images_config=getattr(request, "images_config", None),
         )
+
+        # FRONT-X-MIT (15.10., weg2/front_x.py): the Weg-2 front's decision X for a
+        # D-direct leg 2 arrives in two request headers; no header = untouched.
+        weg2_front_x.stamp_request(adapted_request, raw_request)
 
         return adapted_request, request
 
