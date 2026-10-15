@@ -74,6 +74,42 @@ SWITCH ``SGLANG_WEG2_TOLD_GROUP_FALLBACK`` (unset = the profile row: ON on
 nextflash since 14.10., off on qwen27b), read once on PP0,
 effective only with ``SGLANG_WEG2_TOLD_PACED`` on: only there does PP0 hold
 admission back until an Admit.
+
+H64 (NF h16n 17c2563647, boot ..._1015_042125, P 04:30:45 weg2-6-44 and
+04:31:14 weg2-8-47 -- 130k tokens recomputed the store held). Three parts,
+each PP0-only or wire-following, so no rank can leave its peers:
+
+* FRIST-PASSES (``SGLANG_WEG2_TOLD_FALLBACK_MIN_PASSES``, default pp_size+1;
+  0 = the wall Frist alone). The Frist was WALL time, but an ack can only
+  move in PASSES: the read-ahead reaches stage k k hops down the request
+  chain, the follower acks in the pass that absorbs it, and PP0 takes the ack
+  in two of its own passes (the size frame, then the payload irecv it posts
+  only on seeing the size -- gloo completes a send only against a posted
+  receive). While P recomputes, one pass is 3-7 s (PP0 pass_ms=5201 and 6879,
+  PP1/PP2 ``CHAIN-RECV blocked 2131 ms``): the 2.16 s / 9.88 s Frists expired
+  after one / three PP0 passes, before any ack could have arrived. The Frist
+  now passes only once the wall time is up AND PP0 has run ``MIN_PASSES``
+  passes since the read-ahead -- a PP0-local count; nobody else decides.
+* ACK-DRAIN (``SGLANG_WEG2_TOLD_ACK_DRAIN``, default on). PP0 harvested the
+  ack stream only while it had a paced rid open; an ack whose size frame was
+  taken in the deciding pass left its payload unposted, the follower's send
+  never completed and every later ack of that follower queued behind it --
+  PP2's weg2-8-47 ack surfaced 3.5 min later as ``PF TOLD-ACK LATE``. PP0 now
+  polls the standing frames on every pass once the stream exists (a flag read
+  per follower).
+* GROUP-FLOOR (``SGLANG_WEG2_TOLD_GROUP_FLOOR``, default on). An ack != told
+  used to mean told=0. When EVERY follower acked and all acks name the SAME
+  depth ``m`` with ``0 < m < told`` -- each ack is that stage's own resumable
+  reach (``own_prefix``: rank_resumable / OVER-UNRESUMABLE / NO-ROOM) -- and
+  PP0's own TF verdict admits ``m``, PP0 admits ``m`` for every rank:
+  ``Admit(m)`` with the wire marker ``floor`` (instance attribute, armed path
+  only). Every rank applies it alike (``apply_floor``): no read is released,
+  the credit is popped with the span pin kept, the rid is SATISFIED at ``m``
+  -- the admission caps its match at ``m`` and the row materialises it. Acks
+  that differ from each other, an ack of 0 or above told, a missing ack at the
+  Frist, or PP0's TF refusing ``m``: told=0 as before. The floor is the
+  group-agreed minimum each stage PROVES it holds; a stage that acked more
+  than ``m`` proved nothing about ``m``, so differing acks are never floored.
 """
 
 from __future__ import annotations
@@ -115,6 +151,12 @@ HARVEST_MAX_PER_SRC = 8
 REASON_ACKS = "acks"
 REASON_MISMATCH = "mismatch"
 REASON_FRIST = "frist"
+#: H64 GROUP-FLOOR: every follower acked the same depth below told
+REASON_FLOOR = "floor"
+WIRE_FLOOR = "floor"
+ENV_MIN_PASSES = "SGLANG_WEG2_TOLD_FALLBACK_MIN_PASSES"
+ENV_ACK_DRAIN = "SGLANG_WEG2_TOLD_ACK_DRAIN"
+ENV_FLOOR = "SGLANG_WEG2_TOLD_GROUP_FLOOR"
 #: item 180: where a follower's re-ask of PP0 went (follower_reask)
 ROUTE_PF = "pf-ack"
 ROUTE_NONE = "none"
@@ -145,6 +187,36 @@ def frist_s(window_s: float) -> float:
     grace = _env_float(ENV_GRACE_S, GRACE_S_DEFAULT)
     cap = _env_float(ENV_CAP_S, CAP_S_DEFAULT)
     return min(cap, max(0.0, float(window_s)) + grace)
+
+
+def _env_switch(name: str) -> bool:
+    raw = (os.environ.get(name, "1") or "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def ack_drain_on() -> bool:
+    """H64 ACK-DRAIN (default on): PP0 polls the ack stream on every pass."""
+    return _env_switch(ENV_ACK_DRAIN)
+
+
+def floor_on() -> bool:
+    """H64 GROUP-FLOOR (default on): equal acks below told admit that depth."""
+    return _env_switch(ENV_FLOOR)
+
+
+def min_passes(pp_size: int) -> int:
+    """H64 FRIST-PASSES: PP0 passes after the read-ahead before the Frist may
+    fire. Default pp_size + 1: pp_size - 1 chain hops to the last follower,
+    then the two PP0 passes that take its ack (size frame, payload frame).
+    0 = the wall Frist alone (pre-H64)."""
+    default = max(0, int(pp_size) + 1)
+    raw = (os.environ.get(ENV_MIN_PASSES, "") or "").strip()
+    if not raw:
+        return default
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return default
 
 
 def deadline(published_at: float, own_read_s: float, window_s: float) -> float:
@@ -325,6 +397,11 @@ class _Open:
     told: int
     deadline: float
     acks: Dict[int, int] = field(default_factory=dict)
+    #: H64 FRIST-PASSES: PP0's pass number at the read-ahead (-1 = unknown:
+    #: the wall Frist alone, as a caller without a pass count had it)
+    published_pass: int = -1
+    #: H64: the Frist was held by the pass floor at least once (named once)
+    frist_held: bool = False
 
 
 def _pp0_open_map(scheduler) -> Dict[str, _Open]:
@@ -334,11 +411,20 @@ def _pp0_open_map(scheduler) -> Dict[str, _Open]:
     return d
 
 
-def pp0_open(scheduler, rid: str, told: int, published_at: float, own_read_s: float, window_s: float) -> float:
+def pp0_open(scheduler, rid: str, told: int, published_at: float, own_read_s: float, window_s: float,
+             published_pass: Optional[int] = None) -> float:
     """PP0 put a paced read-ahead with ``ack`` on the wire for ``rid``."""
     dl = deadline(published_at, own_read_s, window_s)
-    _pp0_open_map(scheduler)[str(rid)] = _Open(told=int(told), deadline=dl)
+    _pp0_open_map(scheduler)[str(rid)] = _Open(
+        told=int(told), deadline=dl,
+        published_pass=-1 if published_pass is None else int(published_pass),
+    )
     return dl - float(published_at)
+
+
+def pp0_has_stream(scheduler) -> bool:
+    """H64 ACK-DRAIN: the ack stream exists on PP0 (its frames were posted)."""
+    return getattr(scheduler, "_weg2_fb_channel", None) is not None and ack_drain_on()
 
 
 def pp0_forget(scheduler, rid: str) -> None:
@@ -477,17 +563,63 @@ def pp0_harvest(scheduler) -> int:
     return n
 
 
-def pp0_decide(scheduler, rid: str, now: float) -> Optional[Tuple[int, str]]:
-    """``None`` = keep waiting; else ``(told to admit, reason)``."""
+def _floor_candidate(o: _Open) -> Optional[int]:
+    """H64 GROUP-FLOOR: the one depth every ack so far names, when it lies in
+    (0, told); None = no floor is possible (differing acks, 0, over told)."""
+    vals = set(int(v) for v in o.acks.values())
+    if len(vals) != 1:
+        return None
+    m = next(iter(vals))
+    return m if 0 < m < int(o.told) else None
+
+
+def _frist_due(scheduler, rid: str, o: _Open, now: float, pass_n: Optional[int]) -> bool:
+    """The wall Frist AND (H64) the PP0 pass floor since the read-ahead."""
+    if now < o.deadline:
+        return False
+    if pass_n is None or o.published_pass < 0:
+        return True
+    need = min_passes(int(scheduler.ps.pp_size))
+    done = int(pass_n) - int(o.published_pass)
+    if done >= need:
+        return True
+    if not o.frist_held:
+        o.frist_held = True
+        n = _bump(scheduler, "_pf_frist_held_n")
+        if _say(n):
+            logger.info(
+                "PF TOLD-FRIST HELD rid=%s told=%d passes=%d/%d acks=%s (n=%d): the wall Frist is "
+                "up but PP0 has not run the passes an ack needs to reach it (chain hops + size "
+                "+ payload frame) -- the verdict waits for the passes, not for the clock",
+                rid, o.told, done, need, dict(o.acks), n,
+            )
+    return False
+
+
+def pp0_decide(scheduler, rid: str, now: float, pass_n: Optional[int] = None) -> Optional[Tuple[int, str]]:
+    """``None`` = keep waiting; else ``(told to admit, reason)``. ``pass_n`` =
+    PP0's current pass number (H64 FRIST-PASSES; None = the wall Frist alone).
+    PP0-local facts only: the acks it holds, its clock, its pass count."""
     o = _pp0_open_map(scheduler).get(str(rid))
     if o is None:
         return 0, REASON_FRIST  # untracked paced rid: the always-uniform answer
     followers = range(1, int(scheduler.ps.pp_size))
+    complete = all(r in o.acks for r in followers)
     if any(own != o.told for own in o.acks.values()):
-        return 0, REASON_MISMATCH
-    if all(r in o.acks for r in followers):
+        if not floor_on():
+            return 0, REASON_MISMATCH
+        m = _floor_candidate(o)
+        if m is None:
+            return 0, REASON_MISMATCH
+        if complete:
+            return m, REASON_FLOOR
+        # a floor is still possible: wait for the missing acks (bounded by the Frist)
+        if _frist_due(scheduler, rid, o, now, pass_n):
+            return 0, REASON_FRIST
+        return None
+    if complete:
         return o.told, REASON_ACKS
-    if now >= o.deadline:
+    if _frist_due(scheduler, rid, o, now, pass_n):
         return 0, REASON_FRIST
     return None
 
@@ -508,6 +640,16 @@ def pp0_note_verdict(scheduler, rid: str, told: int, told_final: int, reason: st
                 rid, told, now - published_at, acks, n,
             )
         return
+    if reason == REASON_FLOOR and int(told_final) > 0:
+        n = _bump(scheduler, "_pf_floor_n")
+        if n <= 32 or n % _LOG_EVERY == 0:
+            logger.warning(
+                "PF TOLD-FLOOR rid=%s told=%d -> %d after=%.2fs acks=%s (n=%d): every follower "
+                "proved the same depth below told and PP0's own tree admits it -- PP0 admits "
+                "that depth for EVERY rank (floor marker) instead of told=0",
+                rid, told, int(told_final), now - published_at, acks, n,
+            )
+        return
     n = _bump(scheduler, "_pf_fallback_n")
     if n <= 32 or n % _LOG_EVERY == 0:
         logger.warning(
@@ -517,6 +659,36 @@ def pp0_note_verdict(scheduler, rid: str, told: int, told_final: int, reason: st
             "STORE-TOLD WAIT EXCEEDED / MISMATCH",
             rid, told, reason, now - published_at, acks,
             int(scheduler.ps.pp_size) - 1, n,
+        )
+
+
+def apply_floor(scheduler, rid: str, floor: int) -> None:
+    """H64 GROUP-FLOOR on THIS rank -- PP0 at its verdict, a follower at the
+    ``Admit(floor, floor=1)`` it absorbs; the same steps on every rank. The
+    rid is SATISFIED at ``floor``: nothing is released (the rows ARE the held
+    prefix), this rank's loaded credit is popped with the span pin kept (the
+    #1417 pin stays until the rid leaves the queue, as for any told), no read
+    is awaited, and the admission caps its match at ``floor`` (its told). A
+    follower twin keeps its mark, so its admission still checks its live tree
+    at ``floor`` (W27-UNIFORM) exactly as at any absolute told."""
+    from sglang.srt.managers import weg2_store_told as _st
+
+    rid = str(rid)
+    follower_forget(scheduler, rid)
+    try:
+        _st._pop_credit_keep_pin(scheduler.tree_cache, rid)
+    except Exception:  # noqa: BLE001 - bookkeeping; the satisfied mark decides
+        pass
+    sat = getattr(scheduler, "_weg2_store_told_satisfied", None)
+    if sat is None:
+        sat = scheduler._weg2_store_told_satisfied = {}
+    sat[rid] = int(floor)
+    n = _bump(scheduler, "_pf_floor_applied_n")
+    if n <= 32 or n % _LOG_EVERY == 0:
+        logger.info(
+            "PF TOLD-FLOOR APPLIED rank pp=%s rid=%s floor=%d (n=%d): satisfied at PP0's floor, "
+            "nothing released, admits at that depth like every rank",
+            getattr(scheduler.ps, "pp_rank", "?"), rid, int(floor), n,
         )
 
 
