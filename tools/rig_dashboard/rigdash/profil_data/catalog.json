@@ -65894,7 +65894,7 @@
      "source": {
       "file": "weg2/front.py",
       "kind": "os.environ",
-      "line": 4287
+      "line": 4323
      }
     }
    },
@@ -75996,6 +75996,37 @@
    "text": "Maximum age in seconds (default 2) up to which an idle vote of PP0 still counts.",
    "type": "EnvFloat"
   },
+  "SGLANG_WEG2_INTAKE_BACKUP_INFLIGHT": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "K9b: an open store backup of the tree is in flight for the intake verdict (default ON, ``0`` = off).",
+   "id": "SGLANG_WEG2_INTAKE_BACKUP_INFLIGHT",
+   "kind": "env",
+   "lesestellen": [
+    "weg2/p_intake.py:369"
+   ],
+   "level": "experte",
+   "name": "SGLANG_WEG2_INTAKE_BACKUP_INFLIGHT",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "baum": "nf",
+    "file": "weg2/p_intake.py",
+    "kind": "os.environ",
+    "line": 369
+   },
+   "status": "geerntet",
+   "text": "",
+   "type": "os.environ"
+  },
   "SGLANG_WEG2_JOIN_PREWARM": {
    "baeume": [
     "27b",
@@ -78975,7 +79006,7 @@
    "id": "SGLANG_WEG2_MODE_PARITY_CHECK",
    "kind": "env",
    "lesestellen": [
-    "weg2/front.py:6386"
+    "weg2/front.py:6422"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_MODE_PARITY_CHECK",
@@ -78985,7 +79016,7 @@
     "baum": "nf",
     "file": "weg2/front.py",
     "kind": "os.environ",
-    "line": 6386
+    "line": 6422
    },
    "status": "unerklaert",
    "text": "",
@@ -81151,6 +81182,37 @@
    "status": "geerntet",
    "text": "",
    "type": "EnvInt"
+  },
+  "SGLANG_WEG2_P_DRAIN_EARLY_SETTLE": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "K9 P-DRAIN-EARLY-SETTLE (NF h16r 15.10. 11:52:21-11:54:11Z, death DEADMAN_FLIP_STALL; precursor 11:26:01-11:26:23Z): the D->P flip posts leg 1 EARLY for the queued requests (\"P holds it dormant, its store prefetch runs beside the legs\") -- and P prefills them on its own. When the drain ends before it reaches them (a P-INTAKE-STALL of another request, the phase / seat-gate cap), those legs are still running on P: the P->D flip begins with them OUTSTANDING (``WEG2-FLIP outstanding ... rids=['weg2-86-231', 'weg2-86-233', 'weg2-86-237']``) and its drain stage waits for P's prefills (47.6 s / 51.9 s walls) under the flip-stall bound (4x the last flip, 24.5 s) -> WEG2-FLIP STALL -> the deadman kills the boot. The legs run whether the phase ends or not; so the drain itself settles every queued request whose early leg is posted (``one(p)`` awaits it, ``on_done`` hands it to D as any other leg) BEFORE the phase ends. The flip then begins with nothing of this phase left on P. Default ON; ``0`` = the old exit.",
+   "id": "SGLANG_WEG2_P_DRAIN_EARLY_SETTLE",
+   "kind": "env",
+   "lesestellen": [
+    "weg2/front.py:3515"
+   ],
+   "level": "experte",
+   "name": "SGLANG_WEG2_P_DRAIN_EARLY_SETTLE",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "baum": "nf",
+    "file": "weg2/front.py",
+    "kind": "os.environ",
+    "line": 3515
+   },
+   "status": "geerntet",
+   "text": "",
+   "type": "os.environ"
   },
   "SGLANG_WEG2_P_FOLLOWER_ROUND": {
    "baeume": [
@@ -85445,7 +85507,7 @@
      "source": {
       "file": "weg2/front.py",
       "kind": "os.environ",
-      "line": 4392
+      "line": 4428
      }
     }
    },
@@ -87664,25 +87726,25 @@
    "abweichung": 47,
    "beide": 2461,
    "nur_27b": 180,
-   "nur_nf": 104
+   "nur_nf": 106
   },
-  "entries": 2763,
-  "envs": 1884,
+  "entries": 2765,
+  "envs": 1886,
   "erklaert": 305,
   "flags": 864,
-  "geerntet": 1710,
+  "geerntet": 1712,
   "kuratiert": 125,
   "unerklaert": 623
  },
- "tree_rev": "27b=02123ee2ef+nf=75e3ee8abd+lbv-deadlock-e23abfcb05+prio-alter-fa99a484ae+w3-drain-e7cfda7fbe+follower-round-b76e5fce79+h16m-int-1014+readdepth-60ad6ba20a+h16n-int-1015+h54-park-join-1015+chainkey-a2-83f974259f+h64-toldfallback-de76a8dc18+h16o-int-1015+flipstall-31764c30e0+arenafull-231a47b449+h16p-int-1015",
+ "tree_rev": "27b=02123ee2ef+nf=75e3ee8abd+lbv-deadlock-e23abfcb05+prio-alter-fa99a484ae+w3-drain-e7cfda7fbe+follower-round-b76e5fce79+h16m-int-1014+readdepth-60ad6ba20a+h16n-int-1015+h54-park-join-1015+chainkey-a2-83f974259f+h64-toldfallback-de76a8dc18+h16o-int-1015+flipstall-31764c30e0+arenafull-231a47b449+h16p-int-1015+k9-intakestall-1015",
  "trees": {
   "27b": {
    "entries": 2641,
    "rev": "02123ee2ef"
   },
   "nf": {
-   "entries": 2565,
-   "rev": "75e3ee8abd+lbv-deadlock-e23abfcb05+prio-alter-fa99a484ae+w3-drain-e7cfda7fbe+follower-round-b76e5fce79+h16m-int-1014+readdepth-60ad6ba20a+h16n-int-1015+h54-park-join-1015+chainkey-a2-83f974259f+h64-toldfallback-de76a8dc18+h16o-int-1015+flipstall-31764c30e0+arenafull-231a47b449+h16p-int-1015"
+   "entries": 2567,
+   "rev": "75e3ee8abd+lbv-deadlock-e23abfcb05+prio-alter-fa99a484ae+w3-drain-e7cfda7fbe+follower-round-b76e5fce79+h16m-int-1014+readdepth-60ad6ba20a+h16n-int-1015+h54-park-join-1015+chainkey-a2-83f974259f+h64-toldfallback-de76a8dc18+h16o-int-1015+flipstall-31764c30e0+arenafull-231a47b449+h16p-int-1015+k9-intakestall-1015"
   }
  },
  "warnungen": []
