@@ -131,6 +131,16 @@ def estimate_payable(tree, *, local_floor: bool, host_free: int) -> int:
     demoted the two children first, found them host-locked (the held end anchor), could not clear them and paid 320 of
     3200 -> ``Prefill out of memory``. Each node now carries ``(paid, ok, clear)``: ``clear`` is whether what it
     leaves behind (nothing when dropped, a host node when demoted) is removable by its parent's UD-H."""
+    state = payable_state(tree, local_floor=local_floor, host_free=host_free)
+    root = tree.root_node
+    return sum(state[id(c)][0] for c in root.children.values() if id(c) in state)
+
+
+def payable_state(tree, *, local_floor: bool, host_free: int) -> Dict[int, Tuple[int, bool, bool]]:
+    """The walk of :func:`estimate_payable`, per node: ``{id(node): (paid, ok, clear)}`` -- ``paid`` the device
+    tokens one peel pays in the node's subtree, ``ok`` whether the node itself leaves the device, ``clear`` whether
+    what it leaves behind is removable by its parent's UD-H. ARENAFULL-1015: the W3 spill reads ``clear`` of a
+    candidate's children to keep the candidate payable (``W3-KEEP-PAYABLE``)."""
     from sglang.srt.mem_cache.unified_cache_components.tree_component import (
         BASE_COMPONENT_TYPE as ct,
     )
@@ -176,7 +186,7 @@ def estimate_payable(tree, *, local_floor: bool, host_free: int) -> int:
         # what this node leaves behind for ITS parent's UD-H: nothing when dropped, a backed host node when demoted
         clear = (_remnant_clearable(n, state) if demoted else True) if ok else False
         state[id(n)] = (paid + (tokens if ok else 0), ok, clear)
-    return sum(state[id(c)][0] for c in root.children.values() if id(c) in state)
+    return state
 
 
 def backup_room_tokens(pool) -> int:

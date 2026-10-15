@@ -855,6 +855,9 @@ def _satisfied_resumable(scheduler, req, rid: str, told: int) -> int:
         return told
     if res is None or int(res) >= told:
         return told
+    # H64-AUFLAGE 1 (B1, ARENAFULL-1015): GROUP-FLOOR admits equal follower acks below told AT that depth --
+    # the reach acked here must be one this rank can also LOAD BACK, or a floor m runs into ROW-ROOM SHORT
+    res = _room_own(scheduler, req, rid, int(res))
     n = _bump(scheduler, "_pf_ack_satisfied_unresumable_n")
     if n <= 32 or n % _LOG_EVERY == 0:
         logger.warning(
@@ -902,7 +905,8 @@ def _resumable_own(scheduler, req, rid: str, own: int) -> int:
             "every rank instead of admitting a prefix this rank cannot materialise",
             getattr(scheduler.ps, "pp_rank", "?"), str(rid), own, int(res), n,
         )
-    return int(res)
+    # H64-AUFLAGE 1 (B1, ARENAFULL-1015): the reach below own is what GROUP-FLOOR may admit -- room-checked too
+    return _room_own(scheduler, req, rid, int(res))
 
 
 def _loadback_rows(scheduler, req, told: int) -> Optional[int]:
@@ -928,6 +932,31 @@ def _loadback_rows(scheduler, req, told: int) -> Optional[int]:
         return None
 
 
+def _ack_evictable(tree) -> int:
+    """ACK-ROOM-PAYABLE (ARENAFULL-1015, NF h16n 07:30:35 PP1 weg2-16-53): the evictable part of the ack's room is
+    what ONE peel can pay -- the PR walk (``pp_room_vote.estimate_payable``: locked chains, un-backable leaves with
+    host-locked children and the free arena room for backups all counted as the peel meets them), capped by the
+    tree's reported size. The reported size alone said 255040 where the peel paid 48192, and the ack let PP0 admit a
+    load-back this stage could not hold. Off (``SGLANG_WEG2_ACK_ROOM_PAYABLE=0``) or unreadable walk: the reported
+    evictable size, as before. Read-only."""
+    reported = int(tree.evictable_size())
+    try:
+        from sglang.srt.environ import envs
+
+        if not envs.SGLANG_WEG2_ACK_ROOM_PAYABLE.get():
+            return reported
+        from sglang.srt.weg2 import pp_room_vote as _pr
+        from sglang.srt.weg2 import pp_slot_fidelity as _sf
+
+        cc = getattr(tree, "cache_controller", None)
+        host_free = _pr.backup_room_tokens(getattr(cc, "mem_pool_host", None) if cc is not None else None)
+        walked = _pr.estimate_payable(tree, local_floor=bool(getattr(tree, _sf.FLOOR_LOCAL_PP_ATTR, False)),
+                                      host_free=host_free)
+        return max(0, min(reported, int(walked)))
+    except Exception:  # noqa: BLE001 - no walk: the reported size
+        return reported
+
+
 def _room_own(scheduler, req, rid: str, own: int) -> int:
     """ACK-ROOM (dual1k dkr27bnvfp4dual1kbar1fs10010950, PP1 09:55:20Z, rid
     weg2-0-10, a fork twin): the follower's read reproduced told=16383 and its
@@ -945,7 +974,7 @@ def _room_own(scheduler, req, rid: str, own: int) -> int:
     try:
         tree = scheduler.tree_cache
         alloc = getattr(tree, "token_to_kv_pool_allocator", None)
-        room = int(alloc.available_size()) + int(tree.evictable_size())
+        room = int(alloc.available_size()) + _ack_evictable(tree)
     except Exception:  # noqa: BLE001 - no allocator readable: no verdict
         return own
     if room >= int(rows):

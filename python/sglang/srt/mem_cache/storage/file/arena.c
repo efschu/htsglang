@@ -1142,7 +1142,17 @@ int64_t arena_reap_partial(uint8_t *base, int64_t min_age_ms, int64_t *out, int6
          * in the same call and is never taken here */
         if ((w >> 16) == 0 || (w & W_OPEN) != 0) continue;
         uint32_t t = atomic_load(&sh->touched_ms);
-        if ((uint32_t)(now - t) < (uint32_t)min_age_ms) continue;
+        /* ARENAFULL-1015 (NF h16n boot 070103, mamba arena of 32 slots: 'claimed=1
+         * oldest=slot 20/274319ms/pid788/host-write/g1/open0', D saw the same claim
+         * 241 s old): the age was read off touched_ms, which EVERY JOIN refreshes --
+         * a reader that joins the stem, waits and gives the claim up again (open
+         * back to 0) kept the orphan young for ever, and it blocked every fill of
+         * its stem. With no writer open nobody can still merge a byte: the age is
+         * the time without BYTE progress (progress_ms: the fresh claim or the last
+         * merge), the clock the census names. touched_ms stays the race guard
+         * below (a join between this read and the CAS moves it). */
+        uint32_t p = atomic_load(&sh->progress_ms);
+        if ((uint32_t)(now - p) < (uint32_t)min_age_ms) continue;
         uint32_t expect = S_CLAIMED;
         if (!atomic_compare_exchange_strong(&sh->state, &expect, S_EVICTING)) continue;
         if (atomic_load(&sh->refcount) != 0 || atomic_load(&sh->writers) != w

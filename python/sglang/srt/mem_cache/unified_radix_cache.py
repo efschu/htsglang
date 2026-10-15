@@ -4437,6 +4437,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 self.cache_controller is not None
                 and self.cache_controller.write_policy == "write_back"
             ):
+                # L3-DROP (NF h16n 1015 07:30:35 PP1 node=208 / 07:11:54 PP1 node=107):
+                # a W3-spilled node (l3_present, no host copy) is store-backed --
+                # its device rows leave without a new arena claim.
+                if UnifiedRadixCache._weg2_l3_drop(self, node, tracker):
+                    return
                 # P-FUND (rc12k 10:51:00, PP0, weg2-10-53 16384 @32768): the
                 # admission counts every unlocked device token as fundable
                 # (common.fundable_extend_tokens), and this peel is what has
@@ -4481,7 +4486,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     self._ud_h_refusal = None
                     if _sf.unbacked_drop_floor(self, node) and node.children:
                         # UD-H: the leaf's only children are host-only nodes
-                        self._ud_clear_host_children(node)
+                        if not self._ud_clear_host_children(node) and UnifiedRadixCache._weg2_ud_ack_drain_on():
+                            # ARENAFULL-1015 (07:11:54 PP1 node=107 holder=108): a child the peel just
+                            # demoted is host-locked by its OWN store write -- drain its acks, once more
+                            if UnifiedRadixCache._weg2_l3_drop_ack_drain(self, node) >= 0:
+                                self._ud_clear_host_children(node)
                     if _sf.unbacked_drop_allowed(self, node):
                         self._ud_drop_unbacked_leaf(node, tracker)
                     else:
@@ -4581,6 +4590,136 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 node.id, len(order), host_tracker.get(BASE_COMPONENT_TYPE, 0), left, n,
             )
         return left == 0
+
+    def _weg2_l3_drop(self, node: UnifiedTreeNode, tracker: dict[ComponentType, int]) -> bool:
+        """L3-DROP (NF h16n 17c2563647, deaths 1015 07:11:54 and 07:30:35, both PP1).
+
+        THE DEATH. Under arena pressure ``_w3_arena_spill`` released the Full host copy of
+        DEVICE-resident nodes on ONE stage (``W3-ARENA SPILL ... l3=on_disk:3232 ref_free=0/3232``:
+        the peers still referenced the slots, nothing came free) and marked them ``l3_present`` --
+        "store-backed", as its docstring says. This evictor did not read that mark: the node is
+        ``backuped=False``, so it asked ``write_backup`` for a NEW arena claim (``#1421
+        BACKUP-REFUSED why=arena_claim node=208 tokens=206848 parent_is_root=True``), every refusal
+        spilled the next node (the cascade: 117 refusals in boot 070103), and the UD drop was refused
+        on a host-locked host-only child (``UD-REFUSED why=host_children:child_host_locked node=208
+        holder=211``). 206848 device tokens stayed, PP1 could not hold PP0's row (``LB-VERDICT ROW-ROOM
+        SHORT kv=209472 evictable=255040 evicted=48192``) and the group stopped; at 07:11:54 the same
+        shape behind node 107 (``behind_device_child=205312``) gave PrefillOutOfPages.
+
+        THE RULE. A write_back device leaf whose KV is in L3 (``l3_present``) needs no L2 copy to
+        leave the device: on the local-PP floor (tp group of one -- the tree is this stage's own, a
+        rank-local drop splits no replica) it is dropped like UD, WITHOUT a claim (no refusal, no next
+        spill). Its host-only children leave the host first (UD-H). A child host-locked by its own L3
+        write (``ongoing_backup``) is not a holder that stays: its acks are drained on this rank
+        (``drain_backup_acks_uncoordinated``, group P only) for at most
+        ``SGLANG_WEG2_L3_DROP_ACK_WAIT_MS`` and UD-H runs once more. Any other lock keeps the node
+        (named ``L3-DROP REFUSED``), and the old path runs unchanged. Memory integrity on this stage
+        only -- what a stage executes is PP0's row, untouched. ``SGLANG_WEG2_L3_DROP=0``: the old path."""
+        if not getattr(node, "l3_present", False) or node.backuped:
+            return False
+        if not UnifiedRadixCache._weg2_ud_ack_drain_on():
+            return False
+        from sglang.srt.weg2 import pp_slot_fidelity as _sf
+
+        if not _sf.unbacked_drop_floor(self, node):
+            return False
+        waited_ms = 0.0
+        if node.children:
+            self._ud_h_refusal = None
+            if not self._ud_clear_host_children(node):
+                waited_ms = UnifiedRadixCache._weg2_l3_drop_ack_drain(self, node)
+                if waited_ms >= 0:
+                    self._ud_clear_host_children(node)
+        if not _sf.unbacked_drop_allowed(self, node):
+            udh = getattr(self, "_ud_h_refusal", None)
+            k = getattr(UnifiedRadixCache, "_weg2_l3_drop_refused_n", 0) + 1
+            UnifiedRadixCache._weg2_l3_drop_refused_n = k
+            if k <= 16 or (k & (k - 1)) == 0:
+                logger.warning(
+                    "L3-DROP REFUSED n=%d node=%s tokens=%d children=%d why=%s holder=%s holder_source=%s "
+                    "ack_wait_ms=%.0f (an l3_present device leaf could not leave: a host-only child below is held "
+                    "by something that is not its own L3 write -- the old path runs)",
+                    k, getattr(node, "id", "?"), len(getattr(node, "key", []) or []), len(node.children),
+                    udh[0] if udh else "children_left", udh[1] if udh else None,
+                    UnifiedRadixCache._weg2_hostlock_source(self, udh[1] if udh else None), max(0.0, waited_ms))
+            return False
+        base = BASE_COMPONENT_TYPE
+        before = int(tracker.get(base, 0))
+        self._ud_drop_unbacked_leaf(node, tracker)
+        k = getattr(UnifiedRadixCache, "_weg2_l3_drop_n", 0) + 1
+        UnifiedRadixCache._weg2_l3_drop_n = k
+        if k <= 32 or (k & (k - 1)) == 0:
+            logger.warning(
+                "L3-DROP n=%d node=%s tokens=%d freed=%d ack_wait_ms=%.0f (a store-backed device leaf -- "
+                "l3_present, its arena copy spilled -- left the device without a new arena claim; the KV "
+                "comes back from L3)",
+                k, getattr(node, "id", "?"), len(getattr(node, "key", []) or []),
+                int(tracker.get(base, 0)) - before, max(0.0, waited_ms))
+        return True
+
+    @staticmethod
+    def _weg2_ud_ack_drain_on() -> bool:
+        """The store-write ack drain of UD-H (L3-DROP and the plain UD drop) is
+        on with ``SGLANG_WEG2_L3_DROP`` (default on)."""
+        try:
+            return bool(envs.SGLANG_WEG2_L3_DROP.get())
+        except Exception:  # noqa: BLE001 - a hermetic tree without the env field: default on
+            return True
+
+    def _weg2_hostlock_source(self, node_id) -> str:
+        """L3-DROP instrument: what holds the host lock of node ``node_id`` --
+        ``l3_write`` (its own store write, ``ongoing_backup``), ``prefetch``
+        (a store read registered on it), ``unknown`` otherwise."""
+        if node_id is None:
+            return "-"
+        try:
+            for n, _p in (getattr(self, "ongoing_backup", None) or {}).values():
+                if getattr(n, "id", None) == node_id:
+                    return "l3_write"
+            for info in (getattr(self, "ongoing_prefetch", None) or {}).values():
+                if getattr(info[0], "id", None) == node_id:
+                    return "prefetch"
+        except Exception:  # noqa: BLE001 - an instrument never raises
+            return "unreadable"
+        return "unknown"
+
+    def _weg2_l3_drop_ack_drain(self, node: UnifiedTreeNode) -> float:
+        """L3-DROP: the host-only nodes below ``node`` that are host-locked by
+        their OWN store write get their acks drained on this rank, bounded by
+        ``SGLANG_WEG2_L3_DROP_ACK_WAIT_MS`` (default 2000). Returns the ms
+        waited, or -1 when nothing below is held by a store write (no drain
+        can help) or the drain is not local (an attention group > 1)."""
+        held = []
+        stack = list(node.children.values())
+        while stack:
+            d = stack.pop()
+            if any(cd.host_lock_ref > 0 for cd in d.component_data):
+                held.append(d)
+            stack.extend(d.children.values())
+        if not held:
+            return -1.0
+        ob = getattr(self, "ongoing_backup", None) or {}
+        writing = {id(n) for n, _p in ob.values()}
+        if not all(id(d) in writing for d in held):
+            return -1.0   # a holder that is not a store write: no drain frees it (UD-H stays refused)
+        drain = getattr(self, "drain_backup_acks_uncoordinated", None)
+        if not callable(drain):
+            return -1.0
+        try:
+            bound_ms = max(0, int(envs.SGLANG_WEG2_L3_DROP_ACK_WAIT_MS.get()))
+        except Exception:  # noqa: BLE001
+            bound_ms = 2000
+        t0 = time.perf_counter()
+        while True:
+            if int(drain()) < 0:
+                return -1.0
+            if not any(any(cd.host_lock_ref > 0 for cd in d.component_data) for d in held):
+                break
+            waited = (time.perf_counter() - t0) * 1000.0
+            if waited >= bound_ms:
+                break
+            time.sleep(0.005)
+        return (time.perf_counter() - t0) * 1000.0
 
     def _ud_drop_unbacked_leaf(
         self, node: UnifiedTreeNode, tracker: dict[ComponentType, int]
@@ -5809,6 +5948,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             skip.add(id(n))   # the claimer's own chain: its parent rule reads backed/l3_present
             n = n.parent
         cands = []
+        keep_payable = UnifiedRadixCache._w3_keep_payable_state(self)
+        kept_payable = 0
         for node in self._collect_all_nodes():
             if node is self.root_node or id(node) in skip:
                 continue
@@ -5816,6 +5957,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             hv = cd.host_value
             if hv is None or cd.value is None or hv.numel() == 0:
                 continue   # host-only nodes stay: their host copy is their only copy on P
+            if keep_payable is not None and not all(
+                    keep_payable.get(id(c), (0, False, False))[2] for c in node.children.values()):
+                # W3-KEEP-PAYABLE (ARENAFULL-1015, 07:30:30 PP1 node=208): without its host copy this node
+                # leaves the device only by the drop, and the drop needs every child below removable from
+                # the host -- one is not (host-locked / device-locked): the spill would pin 206848 tokens
+                kept_payable += 1
+                continue
             if node.id in self.ongoing_write_through:
                 continue   # pending write: the slots are not COMPLETE yet
             if any(int(getattr(c, "host_lock_ref", 0) or 0) > 0 for c in node.component_data):
@@ -5869,13 +6017,38 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if k <= 8 or k % 64 == 0 or lost:
             logger.info(
                 "W3-ARENA SPILL n=%d need=%d released_pages=%d nodes=%d candidates=%d "
-                "l3=on_disk:%d,written:%d lost=%d ref_free=%s (a finished page leaves L2 only with "
+                "l3=on_disk:%d,written:%d lost=%d ref_free=%s kept_payable=%d (a finished page leaves L2 only with "
                 "its L3 copy; the node stays on the device, l3_present; ref_free = of the slots "
                 "this spill let go, those NO rank references any more -- the clock takes them; "
-                "group-equal order: fewest peer references first, then slot id)",
+                "group-equal order: fewest peer references first, then slot id; kept_payable = device nodes "
+                "not spilled because their drop could not clear a host-only child now)",
                 k, int(need_pages), released, spilled, len(cands), secured, written, lost,
-                self._w3_spill_ref_free(pool, released_slots))
+                self._w3_spill_ref_free(pool, released_slots), kept_payable)
         return released
+
+    def _w3_keep_payable_state(self):
+        """W3-KEEP-PAYABLE (ARENAFULL-1015): the payable walk's per-node state
+        (``pp_room_vote.payable_state``) when the spill must keep its candidates
+        droppable -- on the local-PP floor, switch on; None = no filter (off the
+        floor, switch off, or the walk is unreadable: the spill as before)."""
+        try:
+            if not envs.SGLANG_WEG2_W3_SPILL_KEEP_PAYABLE.get():
+                return None
+        except Exception:  # noqa: BLE001 - a hermetic tree without the env field: default on
+            pass
+        from sglang.srt.weg2 import pp_slot_fidelity as _sf
+
+        if not _sf.enabled() or not getattr(self, _sf.FLOOR_LOCAL_PP_ATTR, False):
+            return None
+        try:
+            from sglang.srt.weg2 import pp_room_vote as _pr
+
+            return _pr.payable_state(self, local_floor=True, host_free=0)
+        except Exception as exc:  # noqa: BLE001 - no walk: the spill as before, named once
+            if not getattr(self, "_w3_keep_payable_warned", False):
+                self._w3_keep_payable_warned = True
+                logger.warning("W3-KEEP-PAYABLE walk failed (%r): the spill takes every candidate", exc)
+            return None
 
     def _w3_spill_keys(self, pool, nodes) -> "_W3SpillKeys":
         """The group-equal order of spill candidates (see ``_w3_arena_spill``):
