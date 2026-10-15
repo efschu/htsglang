@@ -1136,6 +1136,9 @@ class PPAdmissionCongruenceGuard:
     #: whereas losing a RECENT one would reopen the livelock.
     PREFIX_FLOOR_SLOTS = 512
 
+    #: MEMRANK-1015: cap on `_1059_observed` (rid -> smallest coverage promise).
+    OBSERVED_SLOTS = 4096
+
     def prefix_len_for(
         self, rid: str, candidate_prefix_len: int, *, prefix_key: Optional[int] = None
     ) -> int:
@@ -1242,6 +1245,15 @@ class PPAdmissionCongruenceGuard:
         prev = self._1059_observed.get(rid)
         value = int(observed)
         self._1059_observed[rid] = value if prev is None else min(prev, value)
+        # MEMRANK-1015: this table was fed once per rid and never retired (no pop
+        # site anywhere): one entry per request for the life of the process.
+        # Bounded like `_offer_prefix_key`: oldest INSERTED rid out first. A rid
+        # that old is long finished (4096 newer rids came after it); losing its
+        # entry reads as "no fact" in `uniform_prefix_for`, the documented safe
+        # direction (no adoption, never a local substitute). Fed and read on
+        # PP0 only (the one decider), so the eviction cannot differ between ranks.
+        while len(self._1059_observed) > self.OBSERVED_SLOTS:
+            self._1059_observed.pop(next(iter(self._1059_observed)))
 
     def uniform_prefix_for(self, rid):
         """#1059 SITE 2: the MIN over the promises that came home for this rid.
