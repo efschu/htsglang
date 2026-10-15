@@ -12,7 +12,9 @@ Groups
   b_*  D's gate, with the real numbers (admit / W31 / boundary / static ceiling / resume / switch)
   c_*  the W50 message stays parseable by the front (``_d_refusal_extent`` / ``is_x_refusal``)
   d_*  the front: decision sites record the X, the D-direct leg posts the headers, other legs none
-  e_*  the plumbing is complete (request objects carry the two fields on every hop)
+  e_*  the plumbing is complete (request objects carry the two fields on every hop); e3-e5 run the REAL hop code
+  f_*  the native /generate route stamps the headers like chat/completions (the front forwards /generate to D too)
+  g_*  hand-over X (D-SHORT-DRAIN, busy D) and the capacity-park vote on the effective limit, as behaviour
 
 Hermetic: ``CUDA_VISIBLE_DEVICES=""``, no model, no GPU.
 """
@@ -356,3 +358,273 @@ def test_e2_tokenizer_scheduler_and_serving_layers_pass_the_fields_on():
     assert 'req.weg2_front_x = getattr(recv_req, "weg2_front_x", None)' in inspect.getsource(sched_mod)
     for mod in (chat, comp):
         assert "weg2_front_x.stamp_request(adapted_request, raw_request)" in inspect.getsource(mod)
+
+
+# ============================================================================ e_ plumbing as BEHAVIOUR (review dx-r2 A2)
+# The source-substring checks above stay as a cheap pin, but a line AFTER the copy that sets the field to None
+# (mutant R3) or a ``... if False else None`` (R4) leaves every substring in place and switches the gate off. These
+# tests run the REAL hop code and read the field at the far end.
+class _FixtureTokenizer:
+    name_or_path = "front-x-fixture"
+
+    def encode(self, text, add_special_tokens=False):
+        return [ord(c) for c in text] + [0]
+
+
+def _tokenized(front_x_=1010, priced=237):
+    """GenerateReqInput -> the real ``TokenizerManager._create_tokenized_object`` on a stub self."""
+    from unittest.mock import MagicMock
+
+    from sglang.srt.managers.io_struct import GenerateReqInput
+    from sglang.srt.managers.tokenizer_manager import TokenizerManager
+    from sglang.srt.sampling.sampling_params import SamplingParams
+
+    obj = GenerateReqInput(text="hi", sampling_params={}, weg2_front_x=front_x_, weg2_front_priced=priced)
+    obj.normalize_batch_and_arguments()
+    stub = SimpleNamespace(
+        preferred_sampling_params=None,
+        sampling_params_class=SamplingParams,
+        tokenizer=_FixtureTokenizer(),
+        model_config=SimpleNamespace(vocab_size=250000),
+        server_args=SimpleNamespace(reasoning_parser=None, model_path="front-x-fixture",
+                                    disaggregation_transfer_backend="none"),
+        fake_bootstrap_room_counter=0,
+        rid_to_state={obj.rid: SimpleNamespace(time_stats=MagicMock())},
+    )
+    return TokenizerManager._create_tokenized_object(stub, obj, "hi", [1, 2, 3])
+
+
+def _scheduler_req(tokenized):
+    """TokenizedGenerateReqInput -> the real ``Scheduler._handle_generate_request_impl`` on a partial double;
+    returns the ``Req`` it queues."""
+    from unittest.mock import MagicMock
+
+    from sglang.srt.disaggregation.utils import DisaggregationMode
+
+    queued = []
+    s = MagicMock()
+    s.weg2_dormant = False
+    s.session_handover_runtime = None
+    s.server_args = SimpleNamespace(enable_session_radix_cache=False, disaggregation_bootstrap_port=None,
+                                    max_kv_per_request=0, allow_auto_truncate=False)
+    s.model_config = SimpleNamespace(vocab_size=250000, hf_eos_token_id=[2], context_len=4096)
+    s.disaggregation_mode = DisaggregationMode.NULL
+    s.spec_algorithm = SimpleNamespace(is_dflash_family=lambda: False)
+    s._cross_schedule_mode = False
+    s.metrics_reporter = SimpleNamespace(enable_metrics=False)
+    s.dllm_config = None
+    s.tokenizer = _FixtureTokenizer()
+    s.max_req_input_len = 4096
+    s.grammar_manager.process_req_with_grammar.return_value = False
+    s._add_request_to_queue.side_effect = queued.append
+    Scheduler._handle_generate_request_impl(s, tokenized)
+    assert len(queued) == 1, queued
+    return queued[0]
+
+
+def test_e3_tokenizer_manager_hop_keeps_the_carrier():
+    t = _tokenized(1010, 237)
+    assert (t.weg2_front_x, t.weg2_front_priced) == (1010, 237)
+    t0 = _tokenized(None, None)
+    assert (t0.weg2_front_x, t0.weg2_front_priced) == (None, None)
+
+
+@pytest.fixture
+def _published_server_args():
+    """``Req.is_prefill_only`` reads the published ServerArgs (speculative_algorithm): publish the two fields it reads
+    for the test and restore the process-global slot after (the slot is shared with other test files)."""
+    from sglang.srt.runtime_context import get_context, reset_context
+
+    ctx = get_context()
+    saved = ctx._server_args
+    ctx.set_server_args(SimpleNamespace(speculative_algorithm=None, strip_thinking_cache=False))
+    try:
+        yield
+    finally:
+        if saved is None:
+            reset_context()
+        else:
+            ctx.set_server_args(saved)
+
+
+def test_e4_scheduler_hop_puts_the_carrier_on_the_req(_published_server_args):
+    req = _scheduler_req(_tokenized(1010, 237))
+    assert req.weg2_front_x == 1010 and req.weg2_front_priced == 237
+
+
+def test_e5_the_carrier_survives_the_whole_intake_and_reaches_the_gate(caplog, _published_server_args):
+    """tokenizer hop -> scheduler hop -> D's gate: the request the front priced on X=1010 is refused at
+    front_x + page, the same request without the carrier is admitted (static 12288)."""
+    carried = _scheduler_req(_tokenized(1010, 237))
+    carried.output_ids = []
+    carried.prefix_indices = []
+    carried.full_untruncated_fill_ids = list(range(1500))
+    carried.host_hit_length = 0
+    refused, line = _verdict(caplog, _stub(), carried)
+    assert refused is True and "front_x=1010" in line and "limit=1074" in line
+    plain = _scheduler_req(_tokenized(None, None))
+    plain.output_ids = []
+    plain.prefix_indices = []
+    plain.full_untruncated_fill_ids = list(range(1500))
+    plain.host_hit_length = 0
+    assert _verdict(caplog, _stub(), plain)[0] is False
+
+
+# ============================================================================ f_ the native /generate route (review dx-r2 A1)
+def _generate_route(headers, stream=False):
+    """Run the real ``http_server.generate_request`` on a stub tokenizer manager; return the object the
+    tokenizer manager was handed."""
+    import asyncio
+    import sys
+    import types
+
+    # ``http_server`` pulls in an audio helper that imports ``soundfile`` at module level; the CPU unit image may not
+    # carry it. Provide an empty module for the duration of the import only (never leave a fake behind for other tests).
+    _fake = None
+    try:
+        import soundfile  # noqa: F401
+    except ImportError:
+        _fake = sys.modules.setdefault("soundfile", types.ModuleType("soundfile"))
+    try:
+        import sglang.srt.entrypoints.http_server as http_server
+    finally:
+        if _fake is not None and sys.modules.get("soundfile") is _fake:
+            del sys.modules["soundfile"]
+    from sglang.srt.managers.io_struct import GenerateReqInput
+
+    seen = []
+
+    class _TM:
+        def generate_request(self, obj, request):
+            seen.append(obj)
+
+            async def _gen():
+                yield {"text": "ok"}
+
+            return _gen()
+
+        def create_abort_task(self, obj):
+            return None
+
+    obj = GenerateReqInput(text="hi", sampling_params={}, stream=stream)
+    obj.normalize_batch_and_arguments()
+    old = http_server._global_state
+    http_server._global_state = SimpleNamespace(tokenizer_manager=_TM())
+    try:
+        asyncio.run(http_server.generate_request(obj, SimpleNamespace(headers=headers)))
+    finally:
+        http_server._global_state = old
+    assert len(seen) == 1
+    return seen[0]
+
+
+def test_f1_native_generate_stamps_the_front_x_headers():
+    """The front forwards /generate to D (FORWARD_PATHS): a header on it must reach the request object."""
+    assert "/generate" in front_mod.FORWARD_PATHS
+    obj = _generate_route({"x-weg2-front-x": "1010", "x-weg2-front-priced": "237"})
+    assert (obj.weg2_front_x, obj.weg2_front_priced) == (1010, 237)
+
+
+def test_f2_native_generate_without_headers_is_untouched_and_a_bad_header_is_absent():
+    obj = _generate_route({})
+    assert (obj.weg2_front_x, obj.weg2_front_priced) == (None, None)
+    bad = _generate_route({"x-weg2-front-x": "abc"})
+    assert (bad.weg2_front_x, bad.weg2_front_priced) == (None, None)
+
+
+def test_f3_native_generate_switch_off_stamps_nothing(monkeypatch):
+    monkeypatch.setenv("SGLANG_WEG2_FRONT_X_CARRY", "0")
+    obj = _generate_route({"x-weg2-front-x": "1010"})
+    assert obj.weg2_front_x is None
+
+
+# ============================================================================ g_ hand-over X and park vote as BEHAVIOUR (A3, A4)
+def test_g1_d_short_drain_on_a_busy_d_stamps_the_busy_band_floor_not_the_x_in_force():
+    """Review dx-r2 A3 (mutant R7). D decodes others (x_split + _d_holds_work): the drain was decided on X_busy
+    (the band floor), so each request must carry THAT X -- stamping the X in force would let D compute up to the
+    idle X for a drain that was priced on the busy one. Analogue of d5 (QUEUED-SHORT)."""
+    import asyncio
+    import time
+
+    f = Front("http://p", "http://d", "D", "dx-r2", "", 0, 0, {}, 45.0,
+              tp_prefill_max_tokens=6733, d_short_drain_tokens=6733)
+    f.x_split = True
+    f._d_holds_work = lambda: True
+    f._x_band_floor = lambda: 1010
+
+    async def body():
+        for i, n in enumerate((200, 300)):
+            fut = asyncio.get_running_loop().create_future()
+            f.queue.append(front_mod.Pending(f"s{i}", "/generate", {}, "x", time.time(), fut,
+                                             est_prompt=n, est_uncached=n, d_eligible=True))
+        return f._d_short_drain(time.time()), list(f._ready_for_d)
+
+    moved, ready = asyncio.run(body())
+    assert moved == 2
+    assert [p.x_decision[0] for p in ready] == [1010, 1010], "busy D: the drain's X is X_busy, not the X in force (6733)"
+
+
+def test_g2_d_short_drain_on_an_idle_d_stamps_the_x_in_force():
+    import asyncio
+    import time
+
+    f = Front("http://p", "http://d", "D", "dx-r2", "", 0, 0, {}, 45.0,
+              tp_prefill_max_tokens=6733, d_short_drain_tokens=6733)
+    f.x_split = True
+    f._d_holds_work = lambda: False
+    f._x_band_floor = lambda: 1010
+    f._x_quiet = lambda now: True
+
+    async def body():
+        fut = asyncio.get_running_loop().create_future()
+        f.queue.append(front_mod.Pending("s0", "/generate", {}, "x", time.time(), fut,
+                                         est_prompt=300, est_uncached=300, d_eligible=True))
+        return f._d_short_drain(time.time()), list(f._ready_for_d)
+
+    moved, ready = asyncio.run(body())
+    assert moved == 1 and ready[0].x_decision[0] == 6733
+
+
+def _cappark_req(front_x_):
+    """A streamed request whose store read ended short: total 6000, the store holds 1000 of it (5000 short)."""
+    req = _req(prompt=6000, cached=0, front_x_=front_x_, priced=237 if front_x_ else None)
+    req.stream = True
+    req.priority = 0
+    req._weg2_store_short_fallback = True
+    req._weg2_store_delivered = 500
+    req._weg2_store_deliverable = 1000
+    req.time_stats = SimpleNamespace(trace_ctx=SimpleNamespace(abort=lambda **k: None))
+    return req
+
+
+def _cappark_run(monkeypatch, front_x_):
+    monkeypatch.setenv("SGLANG_WEG2_GROUP", "D")
+    parked, kept = [], []
+    monkeypatch.setattr(sched_mod._weg2_rvp, "park_for_capacity", lambda sched, req, d_extent, x: parked.append((req.rid, x)))
+    monkeypatch.setattr(sched_mod._weg2_rvp, "keep_on_d", lambda sched, req, d_extent, x: kept.append((req.rid, x)))
+    stub, sent = _answer_stub()
+    req = _cappark_req(front_x_)
+    stub.waiting_queue = [req]
+    stub._weg2_answer_x_refusals([req], None)
+    return parked, kept, sent
+
+
+def test_g3_capacity_park_votes_on_the_effective_limit_not_the_static_x(monkeypatch):
+    """Review dx-r2 A4 (mutant R5). The front priced the request on X=1010, so D's gate refuses it above 1074. Its
+    store read ended 5000 tokens short of the whole context. With the STATIC X (12288) the capacity-park vote
+    would say "a whole read fits" and park it -- but the whole read still misses the front limit: parked, re-read,
+    re-gated, W31 again, a D-internal loop until SGLANG_WEG2_RVP_CAPACITY_PARK_S. On the effective limit the read
+    does not fit, so it is NOT parked: it takes the refusal path (RESUME-VIA-P for a stream, W50 by name otherwise)."""
+    parked, kept, sent = _cappark_run(monkeypatch, front_x_=1010)
+    assert parked == [], "a request refused at front_x + page must not capacity-park on the static X"
+    # a streamed request goes to RESUME-VIA-P (keep_on_d, limit 1074), a non-stream one gets W50 by name: exactly one of the two
+    assert len(kept) + len(sent) == 1, (kept, sent)
+    if kept:
+        assert kept[0][1] == 1074, "RESUME-VIA-P is told the effective limit, not the static X"
+
+
+def test_g4_the_same_request_without_the_carrier_still_parks_for_capacity(monkeypatch):
+    """Positive control for g3: without the carrier the effective limit IS the static X, the whole read fits
+    (5000 <= 12288) and the #248h park happens exactly as before -- so g3 discriminates the limit, not the setup."""
+    parked, kept, sent = _cappark_run(monkeypatch, front_x_=None)
+    assert parked == [("weg2-40-127", STATIC_X)] and kept == [] and sent == []

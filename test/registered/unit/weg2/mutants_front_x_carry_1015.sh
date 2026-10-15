@@ -16,6 +16,12 @@
 #   MK  the W50 body loses the sentence the front parses ("extent after prefix") -> the front cannot price the re-route
 #   ML  the serving layer does not stamp the headers on the request            -> headers parsed, then dropped
 #   MM  a malformed / zero X header is read as X=0 (refuse everything)         -> one bad header refuses every prefill
+# review dx-r2 (A1..A5), the four that survived the first test set + the /generate route:
+#   MR3 the scheduler resets req.weg2_front_x after the copy                   -> the gate falls back to the static X, no line
+#   MR4 the tokenizer manager drops the field (``obj.weg2_front_x if False``)   -> same, one hop earlier
+#   MR5 the capacity-park vote runs on the static X                            -> park / re-read / re-gate loop on D until the park bound
+#   MR7 D-SHORT-DRAIN stamps the X in force instead of its own (busy) X        -> a busy-D drain may compute up to the idle X
+#   MS  the native /generate route does not stamp the headers (A1)             -> a D-direct /generate is bounded by the static X alone
 set -u
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -24,12 +30,18 @@ FX=$ROOT/python/sglang/srt/weg2/front_x.py
 FR=$ROOT/python/sglang/srt/weg2/front.py
 SC=$ROOT/python/sglang/srt/managers/scheduler.py
 CH=$ROOT/python/sglang/srt/entrypoints/openai/serving_chat.py
+TM=$ROOT/python/sglang/srt/managers/tokenizer_manager.py
+HS=$ROOT/python/sglang/srt/entrypoints/http_server.py
 TESTS=test/registered/unit/weg2/test_weg2_front_x_carry_1015.py
 GED=${GED:-/spinning/gpu-arb/pytest_gedeckelt.sh}
 
 BAK_DIR=$(mktemp -d)
 cp "$FX" "$BAK_DIR/fx.py"; cp "$FR" "$BAK_DIR/fr.py"; cp "$SC" "$BAK_DIR/sc.py"; cp "$CH" "$BAK_DIR/ch.py"
-restore() { cp "$BAK_DIR/fx.py" "$FX"; cp "$BAK_DIR/fr.py" "$FR"; cp "$BAK_DIR/sc.py" "$SC"; cp "$BAK_DIR/ch.py" "$CH"; }
+cp "$TM" "$BAK_DIR/tm.py"; cp "$HS" "$BAK_DIR/hs.py"
+restore() {
+  cp "$BAK_DIR/fx.py" "$FX"; cp "$BAK_DIR/fr.py" "$FR"; cp "$BAK_DIR/sc.py" "$SC"; cp "$BAK_DIR/ch.py" "$CH"
+  cp "$BAK_DIR/tm.py" "$TM"; cp "$BAK_DIR/hs.py" "$HS"
+}
 trap restore EXIT
 
 run_suite() { (cd "$ROOT" && "$GED" "$TESTS" -x -p no:warnings >/dev/null 2>&1); }
@@ -86,6 +98,19 @@ check MM "$FX" '    if not x:
     return x, priced' '    if x is None:
         return 0, priced
     return x, priced'
+
+check MR3 "$SC" '            req.weg2_front_priced = getattr(recv_req, "weg2_front_priced", None)
+' '            req.weg2_front_priced = getattr(recv_req, "weg2_front_priced", None)
+            req.weg2_front_x = None
+'
+check MR4 "$TM" '                weg2_front_x=obj.weg2_front_x,
+' '                weg2_front_x=obj.weg2_front_x if False else None,
+'
+check MR5 "$SC" '                    r, _weg2_front_x.resolve_limit(r, x, getattr(self, "page_size", None))[0], sched=self' '                    r, x, sched=self'
+check MR7 "$FR" "            Front._stamp_x_decision(p, x)  # FRONT-X-MIT: the drain's X" "            Front._stamp_x_decision(p, self.tp_prefill_max_tokens)  # FRONT-X-MIT: the drain's X"
+check MS "$HS" '    weg2_front_x.stamp_request(obj, request)
+' '    pass
+'
 
 echo "survivors=$survivors"
 exit $survivors
