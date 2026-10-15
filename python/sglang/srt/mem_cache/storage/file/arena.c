@@ -243,7 +243,12 @@ static int quarantine_release(uint8_t *base, uint64_t slot) {
     if (atomic_load(&sh->state) != S_QUARANTINE) return 0;
     if ((atomic_load(&sh->writers) & W_OPEN) != 0 || atomic_load(&sh->refcount) != 0) return 0;
     uint32_t expect = S_QUARANTINE;
-    if (!atomic_compare_exchange_strong(&sh->state, &expect, S_EVICTING)) return 0;
+    /* A2 B-F (nf-chainkey-a2-review-1015): the transient is the PRIVATE
+     * S_REAPING, not the public S_EVICTING -- arena_free_slots and the aged
+     * EVICTING reaper (F1) take EVICTING, and their FREE could land between
+     * the generation bump below and the FREE store, on top of the next
+     * claimer's slot. S_REAPING is skipped by both. */
+    if (!atomic_compare_exchange_strong(&sh->state, &expect, S_REAPING)) return 0;
     sh->n_ivals = 0;
     sh->generation++;
     atomic_store(&sh->writers, 0u);

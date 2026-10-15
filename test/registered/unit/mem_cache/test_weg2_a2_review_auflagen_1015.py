@@ -149,3 +149,27 @@ def test_every_stage_late_tombstones_the_anchor_alike(tmp_path):
         out.append((_tree()._a2_mamba_lost(node, mp, mhv), cd.host_value is None))
     assert arena_a.slot_refs([slot]) == [0]
     assert out == [(True, True), (True, True)], out
+
+
+# ------------------------------------------------------------------ B-F ---------------------------------
+
+
+def test_quarantine_release_passes_through_the_private_reaping_state():
+    src = open(os.path.join(os.path.dirname(ha.__file__), "arena.c")).read()
+    body = re.search(r"static int quarantine_release\(.*?\n}\n", src, re.S).group(0)
+    assert "S_REAPING" in body and "&expect, S_EVICTING" not in body, body
+
+
+def test_quarantine_release_still_frees_and_moves_the_generation(tmp_path):
+    arena = _arena(tmp_path, 1)
+    (s, st, g), = arena.claim_slots(["Q"], [TOTAL], role=ha.ROLE_HOST_WRITE)
+    assert arena.complete_slots([s], [g], [(0, HALF)]) == [0]
+    assert arena.ref_slots([s], +1) == 1
+    assert arena.quarantine_host_write([s], [g]) == [1]
+    g_q = int(arena.slot_gens_np([s])[0])
+    assert arena.ref_slots([s], -1) == 1
+    assert arena.claim_census([s])[0]["state"] == 0
+    assert int(arena.slot_gens_np([s])[0]) == g_q + 1
+    assert arena.stats()["claimed"] == 0
+    (s2, st2, _g2), = arena.claim_slots(["R"], [TOTAL])
+    assert s2 == s and st2 == 0, "the freed slot is claimable again"
