@@ -37,6 +37,7 @@
 #define S_COMPLETE 2u
 #define S_EVICTING 3u
 #define S_QUARANTINE 4u
+#define S_REAPING 5u     /* READ-DEPTH 1014 (port of 27B dae863c7c8 (1)): transient, held by arena_reap_stale_aged only */
 #define TOMB (~0ULL)
 #define KV_IVALS 64      /* interval capacity for slots <= 1 MiB */
 #define BLOB_IVALS 8192  /* interval capacity for larger slots (mamba blobs) */
@@ -603,6 +604,10 @@ int64_t arena_evict_candidates(uint8_t *base, int64_t want, int64_t *slots, uint
         /* unlink from the index (ZR-1: the cell of THIS slot, under the index lock) */
         index_unlink(base, sh->key_lo, s);
         atomic_fetch_sub(&h->n_complete, 1);
+        /* READ-DEPTH 1014: the EVICTING transition is stamped -- the reaper
+         * judges an EVICTING slot stale only by its age, never while its
+         * (live) evictor may still be copying it to disk and freeing it. */
+        atomic_store(&sh->touched_ms, mono_ms());
         slots[got] = (int64_t)s;
         klo[got] = sh->key_lo;
         khi[got] = sh->key_hi;
@@ -937,7 +942,15 @@ void arena_free_slots(uint8_t *base, int64_t n, const int64_t *slots) {
     ArenaHeader *h = hdr(base);
     for (int64_t i = 0; i < n; i++) {
         SlotHeader *sh = slot_hdr(base, (uint64_t)slots[i]);
-        uint32_t prev = atomic_exchange(&sh->state, S_FREE);
+        /* READ-DEPTH 1014: a slot the aged reaper holds (S_REAPING) is the
+         * reaper's to free -- never clobbered here (its FREE could otherwise
+         * land on top of the next claimer's CLAIMED). */
+        uint32_t prev = atomic_load(&sh->state);
+        int took = 0;
+        while (prev != S_REAPING) {
+            if (atomic_compare_exchange_weak(&sh->state, &prev, S_FREE)) { took = 1; break; }
+        }
+        if (!took) continue;
         /* xsn342: unlink the index cell (the evictor does; free did not),
          * else the next claim of this key finds a stale cell and is handed
          * a slot it does not own. */
@@ -982,23 +995,55 @@ int64_t arena_drop_unreferenced(uint8_t *base, int64_t n, const int64_t *slots, 
     return dropped;
 }
 
-/* Reap CLAIMED slots older than `max_generation_age` writes of the clock:
- * a rank that died mid-write leaves a CLAIMED slot behind. Cheap form: a
- * CLAIMED slot whose index entry is tombstoned or missing is freed. Returns
- * the number freed. Called by the sweeper. */
-int64_t arena_reap_stale(uint8_t *base) {
+/* Reap EVICTING slots whose evictor died: a rank that died between
+ * arena_evict_candidates and arena_free_slots leaves EVICTING slots behind.
+ *
+ * READ-DEPTH 1014 (NF h16h 853534a9ff P, port of 27B dae863c7c8 (1)): EVERY
+ * process called this after its OWN eviction (HiCacheFile._arena_evict_to_disk)
+ * and freed every EVICTING slot with refcount 0 AT ONCE -- including the
+ * candidates another LIVE process (PP0/PP1/PP2 fill one P arena) was still
+ * copying to disk. The next L3 fill claimed such a slot fresh (the reap did
+ * not move the generation), the live evictor's own arena_free_slots then freed
+ * the fill's claim (generation++), and the fill's completion came back 3:
+ * 'L3-FILL LATE-COMPLETE REFUSED statuses=[3]' -- PP0 22:30:02 (weg2-51-579,
+ * landed=300 of 1556), PP1 22:47:16 (weg2-68-683, 770 slots, PP0/PP1 landed 0),
+ * PP0+PP2 22:59:50 (weg2-78-784, 263 slots on PP0, landed=761 of 1148). Each
+ * refused completion ends that stage's prefix walk, rank by rank; the stem's
+ * index cell went with the free, so a joiner polled a vanished stem for the
+ * 5-s JOIN-WAIT. The evictor also copied the slot's NEW bytes to the OLD
+ * stem's L3 file when that page was not on disk yet.
+ * Now only a slot EVICTING for at least `min_age_ms` (stamped at the
+ * transition) is stale; it is taken privately (S_REAPING) and the generation
+ * moves on, so a late completion on it is refused. Returns the number freed. */
+int64_t arena_reap_stale_aged(uint8_t *base, int64_t min_age_ms) {
     ArenaHeader *h = hdr(base);
+    uint32_t now = mono_ms();
     int64_t freed = 0;
     for (uint64_t s = 0; s < h->slots; s++) {
         SlotHeader *sh = slot_hdr(base, s);
         if (atomic_load(&sh->state) != S_EVICTING) continue;
         if (atomic_load(&sh->refcount) != 0) continue;
-        /* an EVICTING slot nobody freed: its evictor died */
+        uint32_t t = atomic_load(&sh->touched_ms);
+        if (min_age_ms > 0 && (uint32_t)(now - t) < (uint32_t)min_age_ms) continue;
+        uint32_t expect = S_EVICTING;
+        if (!atomic_compare_exchange_strong(&sh->state, &expect, S_REAPING)) continue;
+        if (atomic_load(&sh->touched_ms) != t || atomic_load(&sh->refcount) != 0) {
+            atomic_store(&sh->state, S_EVICTING);
+            continue;
+        }
+        /* an EVICTING slot nobody freed for min_age_ms: its evictor died */
         sh->key_lo = 0; sh->key_hi = 0;
+        sh->generation++;
         atomic_store(&sh->state, S_FREE);
         freed++;
     }
     return freed;
+}
+
+/* the historical entry point: the default stale age */
+#define ARENA_REAP_STALE_MS 60000
+int64_t arena_reap_stale(uint8_t *base) {
+    return arena_reap_stale_aged(base, ARENA_REAP_STALE_MS);
 }
 
 /* #231 (rc12m-dpr 09271152, P mamba arena 32 slots): a slot is COMPLETE only

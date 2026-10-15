@@ -394,6 +394,8 @@ def _load_lib() -> Optional[ctypes.CDLL]:
             lib.arena_drop_unreferenced.argtypes = [p_u8, i64, p_i64, p_i8]
             lib.arena_reap_stale.restype = i64
             lib.arena_reap_stale.argtypes = [p_u8]
+            lib.arena_reap_stale_aged.restype = i64
+            lib.arena_reap_stale_aged.argtypes = [p_u8, i64]
             lib.arena_reap_partial.restype = i64
             lib.arena_reap_partial.argtypes = [p_u8, i64, p_i64, i64]
             lib.arena_unclaim.restype = i64
@@ -1004,8 +1006,15 @@ class ShmArena:
         out = (ctypes.c_int8 * n)()
         return int(self._lib.arena_drop_unreferenced(self._base, n, c, out))
 
-    def reap_stale(self) -> int:
-        return int(self._lib.arena_reap_stale(self._base))
+    def reap_stale(self, min_age_s: Optional[float] = None) -> int:
+        """Free EVICTING slots whose evictor died. READ-DEPTH 1014 (port of
+        27B dae863c7c8 (1)): only slots EVICTING for at least ``min_age_s``
+        (default: arena.c ARENA_REAP_STALE_MS, 60 s) -- a LIVE evictor's
+        candidates (another P stage mid ``arena_secure_to_disk``) are never
+        taken; the reaped slot's generation moves on."""
+        if min_age_s is None:
+            return int(self._lib.arena_reap_stale(self._base))
+        return int(self._lib.arena_reap_stale_aged(self._base, int(float(min_age_s) * 1e3)))
 
     def reap_partial(self, min_age_s: float, cap: int = 64) -> list[int]:
         """#231: free CLAIMED direct-write slots no writer can still come to
