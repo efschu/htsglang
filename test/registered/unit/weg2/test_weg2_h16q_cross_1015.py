@@ -49,7 +49,12 @@ class _P:
 
 
 def _run(coro):
-    return asyncio.new_event_loop().run_until_complete(coro)
+    # H16Q review A5: bounded -- a mutant that waits forever goes RED, never hangs the lock
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(asyncio.wait_for(coro, 5.0))
+    finally:
+        loop.close()
 
 
 async def _drain_then_settle(queue, *, rvp_only, max_dispatch=0, settle=True):

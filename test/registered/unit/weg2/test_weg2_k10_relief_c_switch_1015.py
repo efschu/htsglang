@@ -1,11 +1,11 @@
-"""K10 SEAT-RELIEF trigger (c) on its own switch (h16q integration, 15.10.).
+"""K10 SEAT-RELIEF trigger (c) on its own switch, default OFF (h16q review A1, user word, 15.10.).
 
 (c) = under AGE PLAN the seat gate's hold past SGLANG_WEG2_K10_HOLD_MAX_S (15 s after the DECODE-COLLECT release) or
-the oldest waiter past the wait bound -> park D's running decodes + flip, P takes the oldest one. It parks decodes
-that are running (D decoding on), which rubs against the user's "kein Massenparken" (14.10.); the user decides about
-it. So (c) has its own switch, SGLANG_WEG2_K10_RELIEF_P_WAIT, default ON (new features on, user order 14.10.).
-OFF = (c) never fires; (a) (a RESUME-VIA-P leg holds its seat) and (b) (no D token for SGLANG_WEG2_K10_STALL_S) stay
-exactly as before. The (c) cases themselves are test_weg2_k10_seat_relief_1015.py (switch at its default).
+the oldest waiter past the wait bound -> park D's running decodes + flip, P takes the oldest one. It parks decodes D
+is still running: a plaster against "kein Massenparken" (14.10.), not a fix -- the user's word turns it OFF in the
+code (what the user switched off stays off), and the seat-gate cause fix (desk/nf-h16q-seatgate-1015) deletes it.
+SGLANG_WEG2_K10_RELIEF_P_WAIT: 0 / unset = (c) never fires; (a) RESUME-VIA-P and (b) no-D-token stay exactly as
+before. 1 = (c) as on 1c337d79a3 (its cases: test_weg2_k10_seat_relief_1015.py, which switches it on).
 Hermetic, no CUDA.
 """
 from __future__ import annotations
@@ -30,16 +30,20 @@ from sglang.srt.environ import envs  # noqa: E402
 SW = "SGLANG_WEG2_K10_RELIEF_P_WAIT"
 
 
-def test_relief_c_switch_defaults_on(monkeypatch):
+def _default(monkeypatch, **kw):
+    _k10(monkeypatch, **kw)
+    monkeypatch.delenv(SW, raising=False)        # the code default decides
+
+
+def test_relief_c_switch_defaults_off(monkeypatch):
     monkeypatch.delenv(SW, raising=False)
-    assert envs.SGLANG_WEG2_K10_RELIEF_P_WAIT.get() is True
+    assert envs.SGLANG_WEG2_K10_RELIEF_P_WAIT.get() is False
 
 
 @pytest.mark.parametrize("latency_s", MEASURED_LATENCY_S)
-def test_relief_c_off_the_hold_bound_never_flips(monkeypatch, latency_s):
-    """Default ON fires at 15.0-15.5 s (test_k10_repro_...); OFF: the gate holds as on 226aad7105."""
-    _k10(monkeypatch)
-    monkeypatch.setenv(SW, "0")
+def test_relief_c_default_the_hold_bound_never_flips(monkeypatch, latency_s):
+    """The default holds the gate as on 226aad7105 (no pauschal park of running decodes)."""
+    _default(monkeypatch)
     f, now = _full_gate()
     t = 0.0
     while t < latency_s:
@@ -49,9 +53,8 @@ def test_relief_c_off_the_hold_bound_never_flips(monkeypatch, latency_s):
     assert f.counters["k10_seat_relief_p_wait"] == 0
 
 
-def test_relief_c_off_the_wait_bound_never_flips(monkeypatch):
-    _k10(monkeypatch, hold="0")
-    monkeypatch.setenv(SW, "0")
+def test_relief_c_default_the_wait_bound_never_flips(monkeypatch):
+    _default(monkeypatch, hold="0")
     f, now = _full_gate()
     for t in (0.0, 29.0, 31.0, 90.0):                     # the oldest waiter passes the 60 s bound at +30 s
         f._ipc_out_book().token("r1", now + t)
@@ -59,9 +62,23 @@ def test_relief_c_off_the_wait_bound_never_flips(monkeypatch):
     assert f.counters["k10_seat_relief_p_wait"] == 0
 
 
-def test_relief_c_off_keeps_a(monkeypatch):
+def test_relief_c_switched_on_fires_at_the_hold_bound(monkeypatch):
     _k10(monkeypatch)
-    monkeypatch.setenv(SW, "0")
+    monkeypatch.setenv(SW, "1")
+    f, now = _full_gate()
+    fired = None
+    t = 0.0
+    while t < 30.0 and fired is None:
+        f._ipc_out_book().token("r1", now + t)
+        if _step(f, now + t)[0]:
+            fired = t
+        t += 0.5
+    assert fired is not None and 15.0 <= fired < 15.5
+    assert f.counters["k10_seat_relief_p_wait"] == 1
+
+
+def test_relief_c_default_keeps_a(monkeypatch):
+    _default(monkeypatch)
     f, now = _full_gate()
     leg = _rvp("weg2-10-51", now - 5.0)
     f.queue.append(leg)
@@ -69,10 +86,9 @@ def test_relief_c_off_keeps_a(monkeypatch):
     assert f.counters["k10_seat_relief_rvp_seat_held"] == 1 and Front._k10_rvp_only(f)
 
 
-def test_relief_c_off_keeps_b(monkeypatch):
-    """With (c) off the 15 s hold bound is no trigger any more: (b) alone decides, as with hold=0."""
-    _k10(monkeypatch)                                     # hold at its default 15 s: only (c) reads it
-    monkeypatch.setenv(SW, "0")
+def test_relief_c_default_keeps_b(monkeypatch):
+    """With (c) off the 15 s hold bound is no trigger: (b) alone decides, as with hold=0."""
+    _default(monkeypatch)                                 # hold at its default 15 s: only (c) reads it
     f, now = _full_gate()
     f.d_wait_bound_s = 3600.0
     assert _step(f, now) == (False, False, None)           # the clock starts

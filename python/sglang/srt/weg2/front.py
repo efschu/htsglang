@@ -11392,9 +11392,10 @@ class Front:
             release, or the oldest queued request waited for P past the wait bound (``d_wait_bound_s``,
             measured as the phase policy does: now - max(arrival, D phase start)) -- D decoding on or
             not: the same park + flip, P prefilling the oldest one (``_dc_p_cap`` 1, AGE PLAN's
-            displacement cap). Own switch ``SGLANG_WEG2_K10_RELIEF_P_WAIT`` (default on; 0 = (c) never
-            fires, (a) and (b) unchanged): it parks decodes D is still running, which the user weighs
-            against "kein Massenparken" (14.10.) -- his decision, so it is switchable alone.
+            displacement cap). Own switch ``SGLANG_WEG2_K10_RELIEF_P_WAIT``, default OFF by user word
+            (h16q review A1): it parks decodes D is still running -- a plaster against "kein
+            Massenparken" (14.10.), not a fix; off = (c) never fires, (a) and (b) unchanged. Deleted
+            when the seat-gate cause fix lands.
 
         At most once per D epoch (the park's own one-attempt rule carries the
         same epoch). None = not applicable, the gate's rules run as before."""

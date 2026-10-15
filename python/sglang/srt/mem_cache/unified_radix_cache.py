@@ -5992,7 +5992,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     #: refusal does not walk the tree again for this long
     W3_SPILL_EMPTY_BACKOFF_S = 0.5
 
-    def _w3_arena_spill(self, pool, need_pages: int, claimer=None) -> int:
+    def _w3_arena_spill(self, pool, need_pages: int, claimer=None, max_secure_pages: int = 0) -> int:
         """W3-ARENA (kvs2 0929, bs2 x 240k, P PP0 12:30:55): the arena was
         full, and every COMPLETE slot carried THIS tree's reference
         (ARENA-REF-HOLDERS tree=5419 of 5461 slots, tree_in_use=0). The claim's
@@ -6092,10 +6092,20 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         released = secured = written = lost = unpaired = 0
         spilled = 0
         released_slots = []
+        # H16Q review A3: ``max_secure_pages`` > 0 bounds the pages handed to the SYNCHRONOUS L3 write of this call
+        # (TP0's FORMA-REQUEST runs on D's scheduler thread before the broadcast the workers wait at). A node whose
+        # pages do not fit the rest of the budget is passed over (counted, named by the caller); 0 = no bound.
+        cap_used = cap_skipped = 0
         for node in cands:
             if released >= want:
                 break
             hv = node.component_data[BASE_COMPONENT_TYPE].host_value
+            if max_secure_pages > 0:
+                _np = -(-int(hv.numel()) // P)
+                if cap_used + _np > int(max_secure_pages):
+                    cap_skipped += 1
+                    continue
+                cap_used += _np
             sec = pool.secure_rows_to_l3(hv)
             _unp = int(sec.get("unpaired", 0)) if UnifiedRadixCache._weg2_l3_present_strict() else 0
             if int(sec.get("lost", 0)) or _unp or not int(sec.get("pages", 0)):
@@ -6130,6 +6140,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if _hos.armed(self):
                 released += _hos.spill_host_only(
                     self, pool, max(int(need_pages) - released, self.W3_SPILL_MIN_PAGES), P, skip)["released"]
+        self._w3_spill_cap_used, self._w3_spill_cap_skipped = cap_used, cap_skipped
         k = getattr(self, "_w3_spill_n", 0) + 1
         self._w3_spill_n = k
         if released == 0:
@@ -6206,9 +6217,21 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         need = _r12.take_spill_request(arena)
         if need <= 0:
             return 0
-        got = self._w3_arena_spill(pool, need)
-        logger.info("W3-ARENA FORMA-REQUEST need=%d released_pages=%d (a worker's claim was refused; "
-                    "TP0 spilled, the workers follow at this broadcast)", need, got)
+        # H16Q review A3: at most SGLANG_WEG2_W3_FORMA_SPILL_MAX_PAGES pages go through the synchronous L3 write of
+        # this call (the workers wait at the broadcast behind it); what is left, the worker asks again at its next
+        # refused claim. ms = the whole call, the metal abort criterion (> 200 ms) reads it.
+        try:
+            cap = max(0, int(envs.SGLANG_WEG2_W3_FORMA_SPILL_MAX_PAGES.get()))
+        except Exception:  # noqa: BLE001 - a hermetic tree without the field: the review's bound
+            cap = 128
+        self._w3_spill_cap_used = self._w3_spill_cap_skipped = 0   # an early return (backoff) reports 0, not the last call
+        t0 = time.monotonic()
+        got = self._w3_arena_spill(pool, need, max_secure_pages=cap)
+        ms = (time.monotonic() - t0) * 1000.0
+        logger.info("W3-ARENA FORMA-REQUEST need=%d released_pages=%d secure_pages=%d cap=%d over_cap_nodes=%d "
+                    "ms=%.1f (a worker's claim was refused; TP0 spilled, the workers follow at this broadcast)",
+                    need, got, int(getattr(self, "_w3_spill_cap_used", 0)), cap,
+                    int(getattr(self, "_w3_spill_cap_skipped", 0)), ms)
         return got
 
     def _weg2_write_or_abort(self, node, device_value, aux_xfers, pre, ring):

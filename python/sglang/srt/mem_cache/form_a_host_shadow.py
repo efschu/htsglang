@@ -622,6 +622,7 @@ def apply(tree: Any, events: List, seq: int = 0) -> Dict[str, int]:
                 c["spill"] += 1
             else:
                 c[out] += 1
+                _spill_diverged(node, h, depth, out, seq)
             continue
         if r != "worker":
             continue
@@ -648,6 +649,22 @@ def apply(tree: Any, events: List, seq: int = 0) -> Dict[str, int]:
         logger.error("R12 SHADOW-UNRECONCILABLE %d node(s): TP0 dropped host of a node "
                      "that is device-evicted and interior here", c["unreconcilable"])
     return c
+
+
+def _spill_diverged(node: Any, h: Any, depth: Any, out: str, seq: int) -> None:
+    """H16Q review A2 (law raenge-nie-uneins): a worker that cannot apply TP0's SPILL (``short`` / ``anchor`` /
+    ``deleted`` / ``unreconcilable``) now disagrees with TP0 on this node's host copy -- TP0 freed its host rows
+    and marked it ``l3_present``, this worker did not (``deleted``: it even dropped a node TP0 keeps on the
+    device). Named at EVERY occurrence (never the rate-limited APPLIED counter): the metal count must be 0; if it
+    is not, the named group stop follows in the next batch (a stop now, at an unknown rate, would be a new death
+    button without a measurement)."""
+    n = _S.counts.get("spill_diverged", 0) + 1
+    _S.counts["spill_diverged"] = n
+    logger.warning(
+        "R12 SPILL-DIVERGED seq=%d rid=%s node=%s depth=%s hash=%s out=%s (n=%d): TP0 spilled this node (host "
+        "rows freed, l3_present) and this worker could not apply it -- the ranks now disagree on its host copy",
+        int(seq), str(getattr(node, "rid", None) or "-"), getattr(node, "id", "?"), depth,
+        str(h)[:16], out, n)
 
 
 def _reconcile(tree: Any, node: Any, exists: int, kv: int, m: int) -> str:

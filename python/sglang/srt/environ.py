@@ -2096,11 +2096,16 @@ class Envs:
     # themselves 2.0-3.3 s. 15 s = the collect window: a D phase keeps >= window + hold = 30 s. 0 = only
     # the wait bound (d_wait_bound_s) releases the hold.
     SGLANG_WEG2_K10_HOLD_MAX_S = EnvFloat(15.0)
-    # K10 (c) on its OWN switch (h16q integration 15.10.): (c) parks the decodes D is still running and flips
-    # (P takes the oldest), which rubs against the user's "kein Massenparken" (14.10.); he decides about it.
-    # On (default, new features on) = (c) as above; 0 = (c) never fires -- neither the hold bound nor the wait
-    # bound on this path --, (a) and (b) unchanged. Marker: 'WEG2 K10-SEAT-RELIEF why=p_wait'.
-    SGLANG_WEG2_K10_RELIEF_P_WAIT = EnvBool(True)
+    # K10 (c) on its OWN switch, default OFF -- USER WORD (h16q review A1, 15.10.): (c) parks the decodes D is still
+    # running and flips (P takes the oldest); it is a plaster against "kein Massenparken" (14.10.), not a fix. What
+    # the user switched off stays off. 1 = (c) as on 1c337d79a3 (hold bound 15 s / wait bound); 0 (default) = (c)
+    # never fires, (a) and (b) unchanged. (c) is deleted when the seat-gate cause fix lands
+    # (desk/nf-h16q-seatgate-1015). Marker: 'WEG2 K10-SEAT-RELIEF why=p_wait'.
+    SGLANG_WEG2_K10_RELIEF_P_WAIT = EnvBool(False)
+    # W3-FORMA (h16q review A3): pages one FORMA-REQUEST may hand to the SYNCHRONOUS L3 write on D's TP0 scheduler
+    # thread before the broadcast the workers wait at (128 x 768 KiB ~ 96 MB). A node larger than what is left is
+    # passed over and counted (over_cap_nodes=). 0 = no bound (as on 1c337d79a3).
+    SGLANG_WEG2_W3_FORMA_SPILL_MAX_PAGES = EnvInt(128)
     # X-EXACT: tokenizer path override (tests, or a front without a group
     # reachable); empty = the group's own server_args.tokenizer_path.
     SGLANG_WEG2_FRONT_TOKENIZER_PATH = EnvStr("")

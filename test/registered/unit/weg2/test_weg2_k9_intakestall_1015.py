@@ -29,6 +29,10 @@ from sglang.srt.weg2 import p_intake as PI
 from sglang.srt.weg2.intake_stall import INTAKE_FITS, INTAKE_IMPOSSIBLE, INTAKE_WAITS, intake_verdict
 
 
+#: H16Q review A5: every awaited settle is bounded -- a mutant that waits forever goes RED, never hangs
+K9_TIMEOUT_S = 5.0
+
+
 @pytest.fixture(autouse=True)
 def _env(monkeypatch):
     for k in (F.ENV_P_DRAIN_EARLY_SETTLE, PI.ENV_INTAKE_BACKUP_INFLIGHT):
@@ -96,7 +100,7 @@ def test_k9_the_drain_settles_the_posted_early_legs_before_the_phase_ends():
             asyncio.ensure_future(finish())
             return await F._settle_posted_early_legs(q, _one_reader(), done.append)
 
-        n = loop.run_until_complete(main())
+        n = loop.run_until_complete(asyncio.wait_for(main(), K9_TIMEOUT_S))
         assert n == 3
         assert [p.rid for p in done] == ["weg2-86-231", "weg2-86-233", "weg2-86-237"], "queue order kept"
         assert all(p.leg1_done for p in done)
@@ -113,7 +117,7 @@ def test_k9_a_settled_leg_that_stalls_is_read_like_the_drain_reads_it():
         for f in futs.values():
             f.set_result(True)
         done = []
-        loop.run_until_complete(F._settle_posted_early_legs(q, _one_reader({"weg2-86-233"}), done.append))
+        loop.run_until_complete(asyncio.wait_for(F._settle_posted_early_legs(q, _one_reader({"weg2-86-233"}), done.append), K9_TIMEOUT_S))
         assert [p.rid for p in done if p.intake_stalled] == ["weg2-86-233"]  # the real on_done skips it (requeued)
     finally:
         loop.close()
@@ -128,8 +132,8 @@ def test_k9_skip_leaves_a_lane_held_leg_and_identity_not_equality_decides():
         a, b, c = _P("x", f1), _P("x", f2), _P("held", loop.create_future())
         q = collections.deque([a, c, b])
         done = []
-        n = loop.run_until_complete(F._settle_posted_early_legs(q, _one_reader(), done.append,
-                                                                 skip=lambda p: p.rid == "held"))
+        n = loop.run_until_complete(asyncio.wait_for(F._settle_posted_early_legs(q, _one_reader(), done.append,
+                                                                 skip=lambda p: p.rid == "held"), K9_TIMEOUT_S))
         assert n == 2 and done[0] is a and done[1] is b
         assert list(q) == [c]
     finally:
@@ -140,7 +144,7 @@ def test_k9_nothing_posted_is_a_no_op():
     loop = asyncio.new_event_loop()
     try:
         q = collections.deque([_P("a"), _P("b")])
-        assert loop.run_until_complete(F._settle_posted_early_legs(q, _one_reader(), lambda p: None)) == 0
+        assert loop.run_until_complete(asyncio.wait_for(F._settle_posted_early_legs(q, _one_reader(), lambda p: None), K9_TIMEOUT_S)) == 0
         assert [p.rid for p in q] == ["a", "b"]
     finally:
         loop.close()
@@ -223,3 +227,95 @@ def test_k9b_mutant_the_term_dropped_is_caught(monkeypatch):
 
     monkeypatch.setattr(PI, "pool_terms", no_backup_term)
     assert _verdict(_tree_11_47(3)) == INTAKE_IMPOSSIBLE, "the mutant (backups ignored) answers the 11:47 stall"
+
+
+# ---------------------------------------------------------------------------
+# H16Q review A5: the WIRING by behaviour -- the real Front controller, a P phase ended by its cap
+# ---------------------------------------------------------------------------
+
+
+def _flip_begins(caplog, sleep):
+    import re
+
+    out = []
+    for r in caplog.records:
+        m = re.match(r"WEG2-FLIP begin epoch=\d+ sleep=(\w) wake=\w outstanding=(\d+)", r.getMessage())
+        if m and m.group(1) == sleep:
+            out.append(int(m.group(2)))
+    return out
+
+
+def _run_capped_p_phase_with_a_posted_early_leg(monkeypatch, caplog, serve_all=True):
+    """The 11:26 shape on the real controller: P awake, the phase cap 1 ends the drain while the next queued request's
+    leg 1 is posted early (P prefills it anyway). Returns (P->D flip-begin outstanding counts, front counters, the
+    posted rid, P's timeline)."""
+    import logging
+
+    from test_weg2_phase_policy_h91c import Harness, _until
+
+    orig = F._p_drain_pool
+    box = {}
+
+    async def pool_then_post(queue, *a, **k):
+        r = await orig(queue, *a, **k)
+        front = box.get("front")
+        if front is not None and "rid" not in box and queue:
+            p = queue[0]   # what the D->P begin's LEG1-EARLY does: P runs this leg while the phase ends
+            p._leg1_early = asyncio.ensure_future(front.leg1(p))
+            F.Front._leg1_early_watch(front, p)
+            box["rid"] = p.rid
+        return r
+
+    monkeypatch.setattr(F, "_p_drain_pool", pool_then_post)
+    caplog.clear()
+    caplog.set_level(logging.INFO, logger="weg2.front")
+
+    async def body():
+        async with Harness(awake="P", p_concurrency=4, d_bs=8, p_phase_max_requests=1) as h:
+            box["front"] = h.front
+            h.p.delay = 0.4
+            tasks = [h.post(f"k{i}") for i in range(3)]
+            # the P->D flip quiesced P (flush_cache) and the posted leg (P's 2nd generate) has ended
+            assert await _until(lambda: "rpc:flush_cache" in h.p.timeline
+                                and (not serve_all
+                                     or len([e for e in h.p.timeline if e.startswith("done:")]) >= 2), 20)
+            if serve_all:
+                results = await asyncio.wait_for(asyncio.gather(*tasks), 40)
+                assert [s for s, _ in results] == [200] * 3
+            return dict(h.front.counters), list(h.p.timeline)
+
+    counters, timeline = asyncio.run(asyncio.wait_for(body(), 60))
+    return _flip_begins(caplog, "P"), counters, box.get("rid"), timeline
+
+
+def _posted_done_before_quiesce(timeline):
+    gens = [e[4:] for e in timeline if e.startswith("gen:")]
+    posted = gens[1] if len(gens) > 1 else None        # P's second leg 1 is the posted early one (cap 1)
+    if posted is None or ("done:" + posted) not in timeline:
+        return False, posted                           # not finished at all (the old exit: cut by the W3 stop)
+    return timeline.index("done:" + posted) < timeline.index("rpc:flush_cache"), posted
+
+
+def test_k9_front_p_phase_settles_the_posted_early_leg_before_the_p_to_d_flip(monkeypatch, caplog):
+    """RED with the settle call dead (review mutant K9-settle-off): the P->D flip begins and quiesces P while the
+    posted leg is still running there -- the drain/quiesce the flip-stall bound killed at 11:52 (on the fake P a
+    W3 witness disagreement)."""
+    begins, counters, rid, timeline = _run_capped_p_phase_with_a_posted_early_leg(monkeypatch, caplog)
+    assert rid is not None, "the scenario posted no early leg (the cap did not leave a queued request)"
+    before, posted = _posted_done_before_quiesce(timeline)
+    assert before, f"P was quiesced while the posted leg {posted} ran: {timeline}"
+    assert begins and begins[0] == 0, f"P->D flip began with outstanding={begins} (posted {rid})"
+    assert counters.get("p_drain_early_settled", 0) >= 1
+    assert sorted(e for e in timeline if e.startswith("gen:")) == ["gen:k0", "gen:k1", "gen:k2"], \
+        "the settled leg ran once on P, never a second leg 1"
+
+
+def test_k9_front_switch_off_is_the_old_exit(monkeypatch, caplog):
+    """The counter-case on the same controller: settle off -> P is quiesced for the flip with the posted leg still
+    running on it."""
+    monkeypatch.setenv(F.ENV_P_DRAIN_EARLY_SETTLE, "0")
+    _, counters, rid, timeline = _run_capped_p_phase_with_a_posted_early_leg(monkeypatch, caplog, serve_all=False)
+    assert rid is not None
+    before, posted = _posted_done_before_quiesce(timeline)
+    assert not before, f"the old exit let {posted} finish before the quiesce: {timeline}"
+    assert counters.get("p_drain_early_settled", 0) == 0

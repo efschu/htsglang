@@ -29686,7 +29686,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2696
+      "line": 2701
      }
     }
    },
@@ -29741,7 +29741,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2686
+    "line": 2691
    },
    "status": "geerntet",
    "text": "",
@@ -29764,7 +29764,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2732
+      "line": 2737
      }
     }
    },
@@ -38483,7 +38483,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 4805
+    "line": 4810
    },
    "status": "unerklaert",
    "text": "",
@@ -38801,7 +38801,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 4804
+    "line": 4809
    },
    "status": "geerntet",
    "text": "",
@@ -39354,7 +39354,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2347
+    "line": 2352
    },
    "status": "geerntet",
    "text": "",
@@ -39377,7 +39377,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2707
+      "line": 2712
      }
     }
    },
@@ -39546,7 +39546,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2711
+      "line": 2716
      }
     }
    },
@@ -39746,7 +39746,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2124
+    "line": 2129
    },
    "status": "geerntet",
    "text": "",
@@ -47725,7 +47725,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2356
+    "line": 2361
    },
    "status": "geerntet",
    "text": "",
@@ -47753,7 +47753,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2361
+    "line": 2366
    },
    "status": "geerntet",
    "text": "",
@@ -48781,7 +48781,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 3557
+    "line": 3562
    },
    "status": "kuratiert",
    "text": "H88: Umgebungsform von --moe-act-int8 on: die int4-Experten (compressed-tensors WNA16, MoE) rechnen mit int8-Aktivierungen (W4A8) statt mit 16-Bit-Aktivierungen (W4A16). Standard aus; einer der beiden Schalter genügt. Dieser Baum hat das W4A8-MoE-Schema (CompressedTensorsWNA16A8MoE, H88-B): mit dem Schalter an wählt die Schema-Auswahl es für die int4-Expertenschichten auf CUDA (dynamische int8-Aktivierung je Token, Marlin-W4A8-Kernel); zusammen mit --moe-runner-backend triton bricht der Start mit RuntimeError ab. Ein Baum ohne das Schema bräche mit dem Text ab: MOE-ACT-INT8 requested but no W4A8 MoE scheme in this tree.",
@@ -65163,7 +65163,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2581
+    "line": 2586
    },
    "status": "geerntet",
    "text": "",
@@ -71319,7 +71319,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 3840
+      "line": 3845
      }
     }
    },
@@ -71631,7 +71631,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2207
+      "line": 2212
      }
     }
    },
@@ -71709,7 +71709,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4512
+      "line": 4517
      }
     }
    },
@@ -71816,7 +71816,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2725
+      "line": 2730
      }
     }
    },
@@ -72179,7 +72179,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2227
+    "line": 2232
    },
    "status": "geerntet",
    "text": "",
@@ -72437,7 +72437,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2131
+    "line": 2136
    },
    "status": "geerntet",
    "text": "",
@@ -72460,7 +72460,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2716
+      "line": 2721
      }
     }
    },
@@ -72682,7 +72682,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4492
+      "line": 4497
      }
     }
    },
@@ -73427,7 +73427,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2142
+    "line": 2147
    },
    "status": "geerntet",
    "text": "",
@@ -73455,7 +73455,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2137
+    "line": 2142
    },
    "status": "geerntet",
    "text": "",
@@ -76125,11 +76125,11 @@
    "bare": false,
    "choices": null,
    "cost": "",
-   "default": "True",
+   "default": "False",
    "depends": [],
    "gain": "",
    "group": "",
-   "help": "K10 (c) on its OWN switch (h16q integration 15.10.): (c) parks the decodes D is still running and flips (P takes the oldest), which rubs against the user's \"kein Massenparken\" (14.10.); he decides about it. On (default, new features on) = (c) as above; 0 = (c) never fires -- neither the hold bound nor the wait bound on this path --, (a) and (b) unchanged. Marker: 'WEG2 K10-SEAT-RELIEF why=p_wait'.",
+   "help": "K10 (c) on its OWN switch, default OFF -- USER WORD (h16q review A1, 15.10.): (c) parks the decodes D is still running and flips (P takes the oldest); it is a plaster against \"kein Massenparken\" (14.10.), not a fix. What the user switched off stays off. 1 = (c) as on 1c337d79a3 (hold bound 15 s / wait bound); 0 (default) = (c) never fires, (a) and (b) unchanged. (c) is deleted when the seat-gate cause fix lands (desk/nf-h16q-seatgate-1015). Marker: 'WEG2 K10-SEAT-RELIEF why=p_wait'.",
    "id": "SGLANG_WEG2_K10_RELIEF_P_WAIT",
    "kind": "env",
    "level": "experte",
@@ -76140,7 +76140,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2103
+    "line": 2104
    },
    "status": "geerntet",
    "text": "",
@@ -76219,7 +76219,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4612
+      "line": 4617
      }
     }
    },
@@ -77908,7 +77908,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2592
+    "line": 2597
    },
    "status": "geerntet",
    "text": "",
@@ -79129,7 +79129,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4421
+      "line": 4426
      }
     }
    },
@@ -79721,7 +79721,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2572
+    "line": 2577
    },
    "status": "erklaert",
    "text": "If a paused (parked) request is to continue later and the room for Mamba anchors in host RAM is full, its re-entry point gets priority: other intermediate states without a park reference are swapped to disk first, so that the entry point of the parked request is not lost. Off: the old way; parked requests can lose their entry point and recompute. Without a park nothing changes. Acts only on nodes that are marked as parked. Default on. Unverified: dependency on another switch; whether the user should change it (only the decision \"stays on\" of 05.10. ~17:47Z is verified); benefit on the metal (according to the report \"active, effect not shown\").",
@@ -84857,7 +84857,7 @@
    "id": "SGLANG_WEG2_TOLD_ACK_DRAIN",
    "kind": "env",
    "lesestellen": [
-    "managers/weg2_told_fallback.py:204"
+    "managers/weg2_told_fallback.py:205"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_TOLD_ACK_DRAIN",
@@ -84867,7 +84867,7 @@
     "baum": "nf",
     "file": "managers/weg2_told_fallback.py",
     "kind": "os.environ",
-    "line": 204
+    "line": 205
    },
    "status": "unerklaert",
    "text": "",
@@ -84888,7 +84888,7 @@
    "id": "SGLANG_WEG2_TOLD_ANCHOR_ACKS",
    "kind": "env",
    "lesestellen": [
-    "managers/weg2_told_fallback.py:215"
+    "managers/weg2_told_fallback.py:216"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_TOLD_ANCHOR_ACKS",
@@ -84898,7 +84898,7 @@
     "baum": "nf",
     "file": "managers/weg2_told_fallback.py",
     "kind": "os.environ",
-    "line": 215
+    "line": 216
    },
    "status": "geerntet",
    "text": "",
@@ -85015,7 +85015,7 @@
    "id": "SGLANG_WEG2_TOLD_FALLBACK_MIN_PASSES",
    "kind": "env",
    "lesestellen": [
-    "managers/weg2_told_fallback.py:224"
+    "managers/weg2_told_fallback.py:225"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_TOLD_FALLBACK_MIN_PASSES",
@@ -85025,7 +85025,7 @@
     "baum": "nf",
     "file": "managers/weg2_told_fallback.py",
     "kind": "os.environ",
-    "line": 224
+    "line": 225
    },
    "status": "unerklaert",
    "text": "",
@@ -85139,7 +85139,7 @@
    "id": "SGLANG_WEG2_TOLD_GROUP_FLOOR",
    "kind": "env",
    "lesestellen": [
-    "managers/weg2_told_fallback.py:209"
+    "managers/weg2_told_fallback.py:210"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_TOLD_GROUP_FLOOR",
@@ -85149,7 +85149,7 @@
     "baum": "nf",
     "file": "managers/weg2_told_fallback.py",
     "kind": "os.environ",
-    "line": 209
+    "line": 210
    },
    "status": "unerklaert",
    "text": "",
@@ -86086,6 +86086,34 @@
    "status": "geerntet",
    "text": "",
    "type": "os.environ"
+  },
+  "SGLANG_WEG2_W3_FORMA_SPILL_MAX_PAGES": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "128",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "W3-FORMA (h16q review A3): pages one FORMA-REQUEST may hand to the SYNCHRONOUS L3 write on D's TP0 scheduler thread before the broadcast the workers wait at (128 x 768 KiB ~ 96 MB). A node larger than what is left is passed over and counted (over_cap_nodes=). 0 = no bound (as on 1c337d79a3).",
+   "id": "SGLANG_WEG2_W3_FORMA_SPILL_MAX_PAGES",
+   "kind": "env",
+   "level": "experte",
+   "name": "SGLANG_WEG2_W3_FORMA_SPILL_MAX_PAGES",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "baum": "nf",
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 2108
+   },
+   "status": "geerntet",
+   "text": "",
+   "type": "EnvInt"
   },
   "SGLANG_WEG2_W3_SPILL_GROUP_ORDER": {
    "baeume": [
@@ -87204,7 +87232,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4599
+      "line": 4604
      }
     }
    },
@@ -87987,25 +88015,25 @@
    "abweichung": 47,
    "beide": 2461,
    "nur_27b": 180,
-   "nur_nf": 115
+   "nur_nf": 116
   },
-  "entries": 2774,
-  "envs": 1895,
+  "entries": 2775,
+  "envs": 1896,
   "erklaert": 305,
   "flags": 864,
-  "geerntet": 1718,
+  "geerntet": 1719,
   "kuratiert": 125,
   "unerklaert": 626
  },
- "tree_rev": "27b=02123ee2ef+nf=75e3ee8abd+lbv-deadlock-e23abfcb05+prio-alter-fa99a484ae+w3-drain-e7cfda7fbe+follower-round-b76e5fce79+h16m-int-1014+readdepth-60ad6ba20a+h16n-int-1015+h54-park-join-1015+chainkey-a2-83f974259f+h64-toldfallback-de76a8dc18+h16o-int-1015+arenafull-1015+h16p-nachbesserung-1015+k9-intakestall-81cb306fd0+b5-anchoracks-618c3fa130+k11-grain-f4cf3a0681+k10-1c337d79a3+k10c-switch-h16q+presence-53af2a98e1",
+ "tree_rev": "27b=02123ee2ef+nf=75e3ee8abd+lbv-deadlock-e23abfcb05+prio-alter-fa99a484ae+w3-drain-e7cfda7fbe+follower-round-b76e5fce79+h16m-int-1014+readdepth-60ad6ba20a+h16n-int-1015+h54-park-join-1015+chainkey-a2-83f974259f+h64-toldfallback-de76a8dc18+h16o-int-1015+arenafull-1015+h16p-nachbesserung-1015+k9-intakestall-81cb306fd0+b5-anchoracks-618c3fa130+k11-grain-f4cf3a0681+k10-1c337d79a3+k10c-switch-h16q+presence-53af2a98e1+h16q-review-auflagen",
  "trees": {
   "27b": {
    "entries": 2641,
    "rev": "02123ee2ef"
   },
   "nf": {
-   "entries": 2576,
-   "rev": "75e3ee8abd+lbv-deadlock-e23abfcb05+prio-alter-fa99a484ae+w3-drain-e7cfda7fbe+follower-round-b76e5fce79+h16m-int-1014+readdepth-60ad6ba20a+h16n-int-1015+h54-park-join-1015+chainkey-a2-83f974259f+h64-toldfallback-de76a8dc18+h16o-int-1015+arenafull-1015+h16p-nachbesserung-1015+k9-intakestall-81cb306fd0+b5-anchoracks-618c3fa130+k11-grain-f4cf3a0681+k10-1c337d79a3+k10c-switch-h16q+presence-53af2a98e1"
+   "entries": 2577,
+   "rev": "75e3ee8abd+lbv-deadlock-e23abfcb05+prio-alter-fa99a484ae+w3-drain-e7cfda7fbe+follower-round-b76e5fce79+h16m-int-1014+readdepth-60ad6ba20a+h16n-int-1015+h54-park-join-1015+chainkey-a2-83f974259f+h64-toldfallback-de76a8dc18+h16o-int-1015+arenafull-1015+h16p-nachbesserung-1015+k9-intakestall-81cb306fd0+b5-anchoracks-618c3fa130+k11-grain-f4cf3a0681+k10-1c337d79a3+k10c-switch-h16q+presence-53af2a98e1+h16q-review-auflagen"
   }
  },
  "warnungen": []

@@ -39,6 +39,9 @@ Front = front_mod.Front
 def _k10(monkeypatch, stall="60", hold=None):
     _on(monkeypatch)
     monkeypatch.delenv("SGLANG_WEG2_K10_SEAT_RELIEF", raising=False)  # default on
+    # (c) is OFF by default since the h16q review (A1, user word): the (c) tests here pin its behaviour when it is
+    # switched on; the default-off half is test_weg2_k10_relief_c_switch_1015.py
+    monkeypatch.setenv("SGLANG_WEG2_K10_RELIEF_P_WAIT", "1")
     monkeypatch.setenv("SGLANG_WEG2_K10_STALL_S", stall)
     if hold is None:
         monkeypatch.delenv("SGLANG_WEG2_K10_HOLD_MAX_S", raising=False)  # default 15 s
