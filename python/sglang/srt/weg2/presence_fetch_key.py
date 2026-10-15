@@ -28,8 +28,8 @@ TWO DIFFERENCES between the probe and the fetch, both measured:
    was blind wherever it ran, on both groups. The #1416d told probe fixed the
    same class for ITS question (weg2_store_told._probe_key); this one was left.
 
-2. SPAN. The probe asked ``page_hashes[:STORAGE_BATCH_SIZE]`` (1024 pages =
-   65536 tokens) while the fetch's v2 query (``_storage_hit_query``) asks the
+2. SPAN. The probe asked ``page_hashes[:STORAGE_BATCH_SIZE]`` (NF:
+   ``SGLANG_HICACHE_STORAGE_BATCH=1024`` pages = 65536 tokens; default 128) while the fetch's v2 query (``_storage_hit_query``) asks the
    WHOLE span in one ``batch_exists_v2``. A trailing pool (the mamba anchor)
    whose deepest blob lies beyond page 1024 -- weg2-0-6's L3 anchor at 208320
    is page 3208 of its span -- clamps the first 1024 pages to 0: absent,
@@ -82,7 +82,10 @@ def span_key(tree_cache, req, tokens, env=None):
 
 def hash_input(token_ids):
     """What ``get_hash_str`` hashes: a ``RadixKey`` as is (it carries its
-    bigram flag and namespace), a plain sequence as the pre-1015 id list."""
+    bigram flag and namespace), a plain sequence as the pre-1015 id list.
+    Not a decision: ``list(RadixKey)`` yields the bigram pairs and hashes alike
+    (mutant M1b survives by equivalence); the key itself spares materialising
+    ~200k tuples per probe (42.8 vs 50.7 ms at 211k tokens)."""
     from sglang.srt.mem_cache.radix_cache import RadixKey
 
     return token_ids if isinstance(token_ids, RadixKey) else list(token_ids)
