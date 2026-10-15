@@ -81003,6 +81003,37 @@
    "text": "",
    "type": "os.environ"
   },
+  "SGLANG_WEG2_PRESENCE_FETCH_KEY": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"1\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "",
+   "id": "SGLANG_WEG2_PRESENCE_FETCH_KEY",
+   "kind": "env",
+   "lesestellen": [
+    "weg2/presence_fetch_key.py:62"
+   ],
+   "level": "experte",
+   "name": "SGLANG_WEG2_PRESENCE_FETCH_KEY",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "baum": "nf",
+    "file": "weg2/presence_fetch_key.py",
+    "kind": "os.environ",
+    "line": 62
+   },
+   "status": "unerklaert",
+   "text": "",
+   "type": "os.environ"
+  },
   "SGLANG_WEG2_PRICE_BARRIER": {
    "baeume": [
     "27b",
@@ -87956,25 +87987,25 @@
    "abweichung": 47,
    "beide": 2461,
    "nur_27b": 180,
-   "nur_nf": 114
+   "nur_nf": 115
   },
-  "entries": 2773,
-  "envs": 1894,
+  "entries": 2774,
+  "envs": 1895,
   "erklaert": 305,
   "flags": 864,
   "geerntet": 1718,
   "kuratiert": 125,
-  "unerklaert": 625
+  "unerklaert": 626
  },
- "tree_rev": "27b=02123ee2ef+nf=75e3ee8abd+lbv-deadlock-e23abfcb05+prio-alter-fa99a484ae+w3-drain-e7cfda7fbe+follower-round-b76e5fce79+h16m-int-1014+readdepth-60ad6ba20a+h16n-int-1015+h54-park-join-1015+chainkey-a2-83f974259f+h64-toldfallback-de76a8dc18+h16o-int-1015+arenafull-1015+h16p-nachbesserung-1015+k9-intakestall-81cb306fd0+b5-anchoracks-618c3fa130+k11-grain-f4cf3a0681+k10-1c337d79a3+k10c-switch-h16q",
+ "tree_rev": "27b=02123ee2ef+nf=75e3ee8abd+lbv-deadlock-e23abfcb05+prio-alter-fa99a484ae+w3-drain-e7cfda7fbe+follower-round-b76e5fce79+h16m-int-1014+readdepth-60ad6ba20a+h16n-int-1015+h54-park-join-1015+chainkey-a2-83f974259f+h64-toldfallback-de76a8dc18+h16o-int-1015+arenafull-1015+h16p-nachbesserung-1015+k9-intakestall-81cb306fd0+b5-anchoracks-618c3fa130+k11-grain-f4cf3a0681+k10-1c337d79a3+k10c-switch-h16q+presence-53af2a98e1",
  "trees": {
   "27b": {
    "entries": 2641,
    "rev": "02123ee2ef"
   },
   "nf": {
-   "entries": 2575,
-   "rev": "75e3ee8abd+lbv-deadlock-e23abfcb05+prio-alter-fa99a484ae+w3-drain-e7cfda7fbe+follower-round-b76e5fce79+h16m-int-1014+readdepth-60ad6ba20a+h16n-int-1015+h54-park-join-1015+chainkey-a2-83f974259f+h64-toldfallback-de76a8dc18+h16o-int-1015+arenafull-1015+h16p-nachbesserung-1015+k9-intakestall-81cb306fd0+b5-anchoracks-618c3fa130+k11-grain-f4cf3a0681+k10-1c337d79a3+k10c-switch-h16q"
+   "entries": 2576,
+   "rev": "75e3ee8abd+lbv-deadlock-e23abfcb05+prio-alter-fa99a484ae+w3-drain-e7cfda7fbe+follower-round-b76e5fce79+h16m-int-1014+readdepth-60ad6ba20a+h16n-int-1015+h54-park-join-1015+chainkey-a2-83f974259f+h64-toldfallback-de76a8dc18+h16o-int-1015+arenafull-1015+h16p-nachbesserung-1015+k9-intakestall-81cb306fd0+b5-anchoracks-618c3fa130+k11-grain-f4cf3a0681+k10-1c337d79a3+k10c-switch-h16q+presence-53af2a98e1"
   }
  },
  "warnungen": []
