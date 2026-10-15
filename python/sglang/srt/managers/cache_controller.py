@@ -4515,8 +4515,14 @@ class HiCacheController:
                 from sglang.srt.mem_cache.utils import namespace_root_hash
 
                 last_hash = namespace_root_hash(extra_key)
+            # MAMBA-ANCHOR 1015 (weg2/presence_fetch_key.py): a RadixKey (the
+            # fetch's bigram key, built by the caller) is hashed as is -- the
+            # id list of the pre-1015 call hashed the unigram chain nobody
+            # writes (weg2-0-6: R13 EMPTY KV PREFIX, 208338 tokens recomputed).
+            from sglang.srt.weg2 import presence_fetch_key as _pfk
+
             page_hashes = self.get_hash_str(
-                list(token_ids), last_hash, page_size=self.page_size
+                _pfk.hash_input(token_ids), last_hash, page_size=self.page_size
             )
             if not page_hashes:
                 return 0
@@ -4529,6 +4535,10 @@ class HiCacheController:
             batch = page_hashes[:STORAGE_BATCH_SIZE]
             pool_transfers = self._presence_pool_transfers()
             if pool_transfers:
+                # MAMBA-ANCHOR 1015: the anchor-clamped question over the
+                # WHOLE span, as the fetch's v2 query asks it -- an anchor
+                # beyond page 1024 no longer clamps the first batch to 0.
+                batch = _pfk.v2_batch(page_hashes, STORAGE_BATCH_SIZE)
                 try:
                     return int(
                         self.storage_backend.batch_exists_v2(
