@@ -470,40 +470,40 @@ def test_the_fill_posts_before_it_waits():
 
 
 # --- the real geometry of the boot's cases ------------------------------------------------------------
-# 6485 slots, the need of the ``L3-FILL ROOM-WAIT stems=`` line of PP0, the holders of the nearest
-# ``ARENA-REF-HOLDERS`` census (tree / tree_in_use / the rest). ``live`` = pages pinned by running requests,
-# loads and parks: nothing a tree spill can hand back. Boots ..._226aad7105_1015_{115748,122948,124245,133855,163552}.
+# 6485 slots, the need of the ``L3-FILL ROOM-WAIT stems=`` line of PP0 (claimed=0: not one free slot, so the
+# arena is FULL at that moment) and the pages the nearest ``ARENA-REF-HOLDERS`` census puts on the trees. The
+# rest of the full arena is held by what a tree spill cannot hand back (running requests' pages, loads, other
+# reads' claims, parks). Boots ..._226aad7105_1015_{115748,122948,124245}.
 SLOTS = 6485
 
-#            case (boot rid)            stems tree  live  every stem of the read must land?
+#            case (boot rid, time of the cut)   stems  tree-held (spillable by the P tree)
 GEOMETRY = [
-    ("124245 weg2-4-25 12:52:35",         970, 6485,    0, True),    # tree=6478 tree_in_use=0 (PP1/PP2)
-    ("124245 weg2-0-4 12:47:32",          892, 5364,  659, True),
-    ("115748 weg2-0-6 12:01:09",          384, 5807,   30, True),
-    ("122948 weg2-0-12 12:35:06",        1024, 5262,   47, True),    # three reads of 1024 asked in the same second
-    ("122948 weg2-3-25 12:37:16",         964, 6147,  252, True),
-    ("115748 weg2-3-29 12:05:02",         851, 6186,    0, True),
-    ("115748 weg2-5-34 12:06:37",         634, 4047, 2297, True),    # 2297 pages live (running requests)
-    ("124245 weg2-70-293 13:35:39",       977,    0, 6485, False),   # tree=0 inuse=2258: nothing to hand back
+    ("124245 weg2-4-25 12:52:35",                970, 6478),     # tree=6478 tree_in_use=0 on PP1/PP2
+    ("124245 weg2-0-4 12:47:32",                 892, 5364),
+    ("115748 weg2-0-6 12:01:09",                 384, 5807),
+    ("122948 weg2-0-12 12:35:06",               1024, 4347),     # three reads of 1024/339/1396 asked in the same second
+    ("122948 weg2-3-25 12:37:16",                964, 3032),
+    ("115748 weg2-3-29 12:05:02",                851, 5804),
+    ("115748 weg2-5-34 12:06:37",                634, 4047),     # 2297 more pages live (running requests)
+    ("124245 weg2-70-293 13:35:39",              977,    0),     # tree=0, tree_in_use=2258, parks: nothing to hand back
 ]
 
 
-@pytest.mark.parametrize("case,stems_n,tree_n,live_n,must_land", GEOMETRY, ids=[g[0] for g in GEOMETRY])
-def test_the_boots_cases_at_their_real_geometry(tmp_path, caplog, case, stems_n, tree_n, live_n, must_land):
-    """The read of every case of the boots at 6485 slots and the census' holders: where the trees hold the room
-    (tree spillable, the rest live) the whole read lands; where the live holders alone fill the arena, the
-    cut is the physical case and names itself."""
+@pytest.mark.parametrize("case,stems_n,tree_n", GEOMETRY, ids=[g[0] for g in GEOMETRY])
+def test_the_boots_cases_at_their_real_geometry(tmp_path, caplog, case, stems_n, tree_n):
+    """The read of every case of the boots at 6485 slots, the arena FULL (the ROOM-WAIT line says claimed=0): where
+    the tree holds at least the need, the whole read lands; where live holders alone fill the arena, the cut is
+    the physical case and names itself."""
     stems = [f"r{i}" for i in range(stems_n)]
     be, arena = _setup(tmp_path, stems, slots=SLOTS)
     held = _fill_arena_with_tree_pages(arena, tree_n, tag="tree") if tree_n else []
-    if live_n:
-        _fill_arena_with_tree_pages(arena, SLOTS - len(held) if live_n >= SLOTS - len(held) else live_n, tag="live")
-    # the rest of the arena (neither tree nor live) stays FREE only where the census says so: tree + live < slots
+    _fill_arena_with_tree_pages(arena, SLOTS - tree_n, tag="live")      # the rest: referenced by nobody who can spill
+    assert _rr().census(arena)["claimed"] == 0
     tree = _TreeSim(arena, held)
     with _Scheduler(tree), _ov("SGLANG_WEG2_READ_ROOM_WAIT_MS", 2000), caplog.at_level(logging.INFO):
         out = _read(be, arena, stems)
     landed = sum(1 for s in out if s is not None)
-    if must_land:
+    if tree_n >= stems_n:
         assert landed == len(stems), (case, landed, tree.spills)
     else:
         assert landed < len(stems)
