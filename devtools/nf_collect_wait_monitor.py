@@ -24,8 +24,19 @@
 # 'Prefill batch, #new-seq' (wird am ENDE des Chunks gestempelt, hier 13:13:04 = ausserhalb des Fensters). Jetzt zaehlen zusaetzlich:
 #   - 'Decode rank batch ... t: <epoch> ... bs: N' (N>=1)  jede Runde, mit exakter Epoche
 #   - '#969 EXTENT'                                         Beginn jedes Extend/Prefill-Chunks (Zeilenstempel = Start)
-#   - 'WEG2-VRAM-PEAK ... phase=chunk ... t0_unix_ms/t_unix_ms'  das Chunk-Intervall (Ueberlappung mit dem Fenster)
-# Gemessen gegen alle 15.10.-Boots (1320 Releases, 1043 dcheck): 0 echte D-Leerlauf-Wartezeiten; der alte Monitor meldete 2 (beide Fehlalarm).
+#   - 'WEG2-VRAM-PEAK ... phase=chunk ... t_unix_ms'            das Chunk-ENDE (exakt), Beginn aus dem EIGENEN EXTENT (siehe unten)
+#
+# 15.10. RUNDE 2 (Review NEIN, deskq/done/nf-core-collect-1015-review.md): die Runde-1-Fassung war blind fuer die echte Klasse (route=D, D leer,
+# 14.10. 10:29:45Z / 10:30:14Z / 10:54:41Z): sie zaehlte das EXTENT der FREIGEGEBENEN Menge selbst (+1 s nach dem Release) und las t0_unix_ms
+# als Chunk-Beginn. Regeln jetzt (Gesetz: D-Arbeit zaehlt nur, wenn sie BEGONNEN hat, BEVOR der Release fiel, und nicht zur freigegebenen Menge gehoert):
+#   - Stempel der D-Zeilen sind auf die SEKUNDE ABGERUNDET (wirkliche Zeit in [s, s+1)). Ein Punktzeuge zaehlt nur, wenn s + 1 <= release
+#     (sicher VOR dem Release); nach dem Release gibt es keine Toleranz mehr. Nur 'Decode rank batch ... t:' hat eine exakte Epoche
+#     (Rundenbeginn): zaehlt in [release-waited, release].
+#   - 't0_unix_ms' ist NICHT der Chunk-Beginn, sondern das Ende des vorigen Messfensters des VRAM-Instruments (schliesst die Leerlaufzeit vor dem
+#     Chunk ein). Der Chunk-Beginn kommt aus dem EIGENEN '#969 EXTENT' derselben Menge: die chunk-Zeile folgt im D-Log ihrem EXTENT, Zuordnung
+#     ueber die Zeilenzahl (rows == Summe der EXTENT-Zeilen, an 419 von 419 Paaren zweier Boots gemessen). Ohne Paar kein Intervall.
+#   - Zeugen, deren rid zur freigegebenen Menge gehoert (D-ADMIT dieser rid [release, release+2 s] im Front-Log), zaehlen nie.
+# Gemessen: siehe deskq/done/nf-core-collect-1015.md, Abschnitt Runde 2.
 import argparse, calendar, collections, glob, os, re, sys, time
 
 EVID = "/spinning/docker-acceptance/nf/evidence"
@@ -35,7 +46,9 @@ PID = "/spinning/gpu-arb/deskq/wacht/nf_collect_wait_monitor.pid"
 DAYS = 14
 STOPFILE = "/spinning/docker-acceptance/nf/nf_dauer_stop"   # Planer 14.10.: ab dieser Datei ist D fuer Neuaufnahmen zu (admit_d=False) => Releases nicht pruefen
 WAIT_MIN = 2.0            # ab so vielen Sekunden Sammelwartezeit wird geprueft
-SLACK_S = 1.0             # Fenster-Toleranz (D-Log hat ganze Sekunden)
+SLACK_S = 1.0             # nur NACH VORNE (Fensterbeginn): D-Log-Stempel sind auf die Sekunde abgerundet. Nach dem Release keine Toleranz.
+STAMP_S = 1.0             # Stempel s bedeutet wirkliche Zeit in [s, s+1): ein Punktzeuge liegt nur dann SICHER vor dem Release, wenn s + STAMP_S <= release
+ADMIT_AFTER_S = 2.0       # D-ADMIT einer rid bis so lange nach dem Release = die rid gehoert zur freigegebenen Menge
 CHUNK_MIN_OVERLAP_S = 0.5  # Chunk-Intervall muss das Wartefenster mind. so lange ueberlappen, um als D-Arbeit zu zaehlen
 SETTLE_S = 6.0            # so lange auf D-Log-Zeilen nach dem Release warten, bevor entschieden wird
 DIGEST_S = 1800
@@ -48,14 +61,17 @@ RE_SEAT = re.compile(r"WEG2 DECODE-COLLECT seat-gate hold taken=\d+ n=\d+ epoch=
 RE_LHOLD = re.compile(r"^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d),(\d{3})\] .*WEG2 LANE-ARRIVE rid=\S+ .*action=hold")
 RE_LRESUME = re.compile(r"^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d),(\d{3})\] .*WEG2 LANE-RESUME floor=")
 RE_WAITSEAT = re.compile(r"^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d),(\d{3})\] .*WEG2 ARRIVAL-SEAT rid=\S+ verdict=wait_seat")
-RE_ADMIT = re.compile(r"^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d),(\d{3})\] .*WEG2 D-ADMIT rid=")
+RE_ADMIT = re.compile(r"^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d),(\d{3})\] .*WEG2 D-ADMIT rid=(\S+)")
 RE_PPRE = re.compile(r"^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) PP0\] Prefill batch, #new-seq: (\d+)")
 RE_DEC = re.compile(r"^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) TP0\] Decode batch, #running-req: (\d+)")
 RE_PRE = re.compile(r"^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) TP0\] Prefill batch, #new-seq: (\d+)")
 # D-BUSY-ZEUGEN (15.10.): per-round / per-chunk instruments of TP0 (see header)
 RE_RDEC = re.compile(r"^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) TP0\] Decode rank batch, rank: 0, #round: \d+, t: ([\d.]+), bs: (\d+)")
-RE_EXT = re.compile(r"^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) TP0\] #969 EXTENT n=\d+ fwd=\d+ reqs=")
-RE_CHUNK = re.compile(r"^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) TP0\] WEG2-VRAM-PEAK rank=0 phase=chunk .*?t0_unix_ms=(\d+) t_unix_ms=(\d+)")
+RE_EXT = re.compile(r"^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) TP0\] #969 EXTENT n=\d+ fwd=\d+ reqs=(\[.*\])")
+RE_EXT_REQ = re.compile(r"\('([^']*)',\s*\d+,\s*\d+,\s*\d+,\s*(\d+)\)")   # (rid, cached, total, cached, rows)
+RE_RANKPF = re.compile(r"^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) TP0\] Prefill rank batch, #new-token: (\d+), #cached-token: \d+, #chunks: \d+, gpu-ms: ([\d.]+)")
+# t0_unix_ms is read by nobody on purpose (it is the START of the instrument's window, not of the chunk; may be 'na')
+RE_CHUNK = re.compile(r"^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) TP0\] WEG2-VRAM-PEAK rank=0 phase=chunk rows=(\d+) .*?t_unix_ms=(\d+)")
 
 
 def now_z():
@@ -69,8 +85,13 @@ def ts(s, ms=0):
 class Mon:
     def __init__(self, dry):
         self.dry = dry
-        self.busy = collections.deque()      # (epoch_s, kind) D war beschaeftigt (Decode N>=1 / Prefill N>=1)
-        self.busy_iv = collections.deque()   # (von_epoch_s, bis_epoch_s, kind) Chunk-Intervalle (D-BUSY-ZEUGEN 15.10.)
+        self.history_s = 7200.0              # so lange (im Takt des D-Logs) bleiben D-Zeugen im Speicher; --replay: unbegrenzt (Runde 2: ein Replay
+                                             # las das D-Log vorab komplett und beschnitt dann alles, was vor dem Log-ENDE minus 2 h lag)
+        self.busy = collections.deque()      # (epoch_s, kind, rids) D war beschaeftigt (Decode N>=1 / Prefill N>=1); rids nur beim EXTENT
+        self.busy_iv = collections.deque()   # (extent_stempel, chunk_ende, rids) Chunk-Intervalle (Beginn aus dem eigenen EXTENT, Runde 2)
+        self.last_ext = None                 # (stempel, rows_summe, rids) des juengsten EXTENT, wartet auf seine chunk-Zeile
+        self.last_chunk = None               # (intervall-eintrag, rows) der juengsten chunk-Zeile, wartet auf ihre 'Prefill rank batch'-Zeile
+        self.admits = collections.deque()    # (epoch_s, rid) D-ADMIT aus dem Front-Log (Zugehoerigkeit zur freigegebenen Menge)
         self.d_last = 0.0                    # juengster D-Log-Zeitstempel
         self.win, self.dchk = 15.0, 7.5
         self.stop_t = None                   # epoch der Stop-Datei (mtime), solange sie existiert
@@ -115,35 +136,89 @@ class Mon:
             t = float(m.group(2))
             self.d_last = max(self.d_last, t)
             if int(m.group(3)) >= 1:
-                self.busy.append((t, "decode-round"))
+                self.busy.append((t, "decode-round", ()))
             return
         m = RE_EXT.match(line)
         if m:
             t = ts(m.group(1))
             self.d_last = max(self.d_last, t)
-            self.busy.append((t, "extend"))
+            reqs = RE_EXT_REQ.findall(m.group(2))
+            rids = tuple(r for r, _ in reqs)
+            self.busy.append((t, "extend", rids))
+            self.last_ext = (t, sum(int(n) for _, n in reqs), rids)
             return
         m = RE_CHUNK.match(line)
         if m:
-            a, b = int(m.group(2)) / 1000.0, int(m.group(3)) / 1000.0
             self.d_last = max(self.d_last, ts(m.group(1)))
-            if b > a:
-                self.busy_iv.append((a, b, "chunk"))
+            b, ext, rows, self.last_ext = int(m.group(3)) / 1000.0, self.last_ext, int(m.group(2)), None
+            # (1) the chunk END is exact (t_unix_ms): D worked up to b -> a point witness (exact epoch, like a decode round).
+            # (2) an interval needs a START, and every start here is an UPPER bound of the true start (so [S, b] lies inside the real busy
+            #     time, never beyond it): the stamp of the chunk's OWN #969 EXTENT + 1 s (the stamp is floored; rows == sum of the extent's
+            #     rows pairs them) and/or b - gpu-ms of its 'Prefill rank batch' line (below). Neither available -> no interval, the end
+            #     point still counts. NEVER t0_unix_ms (= start of the instrument's window, may precede the chunk by minutes or be 'na').
+            #     The #969 probe is throttled in the code (schedule_batch.py: n <= 400 or n % 64 == 0), so after ~400 extends of a boot
+            #     most chunks have no EXTENT line at all -- the rank-batch duration is the start source that does not run out.
+            rids = ext[2] if ext is not None and ext[1] == rows else ()
+            self.busy.append((b, "chunk-end", rids))
+            entry = [ext[0] + STAMP_S if rids and b > ext[0] else None, b, rids]
+            self.busy_iv.append(entry)
+            self.last_chunk = (entry, rows)
+            return
+        m = RE_RANKPF.match(line)
+        if m:
+            t = ts(m.group(1))
+            self.d_last = max(self.d_last, t)
+            lc, self.last_chunk = self.last_chunk, None
+            if lc is not None and lc[1] == int(m.group(2)):
+                entry = lc[0]
+                s2 = entry[1] - float(m.group(3)) / 1000.0
+                entry[0] = s2 if entry[0] is None else min(entry[0], s2)
+            # the rank-batch line itself is no witness (its end-stamp is the legacy 'Prefill batch' line's job); it only dates the chunk start
             return
         m = RE_DEC.match(line)
         if m:
             t = ts(m.group(1))
             self.d_last = max(self.d_last, t)
             if int(m.group(2)) >= 1:
-                self.busy.append((t, "decode"))
+                self.busy.append((t, "decode", ()))
             return
         m = RE_PRE.match(line)
         if m:
             t = ts(m.group(1))
             self.d_last = max(self.d_last, t)
             if int(m.group(2)) >= 1:
-                self.busy.append((t, "prefill"))
+                self.busy.append((t, "prefill", ()))
                 self.d_pf.append(t)
+
+    def d_work(self, t, waited):
+        """D work that BEGAN before the release at `t` (and is not the released set itself), as a Counter of witness kinds.
+
+        Window = [t-waited, t]. D-log stamps are floored to the second (true time in [s, s+1)), so a point witness counts only when
+        s + STAMP_S <= t (certainly before the release) and s >= t-waited-SLACK_S. Exact epochs ('Decode rank batch' t: = round start,
+        chunk end t_unix_ms) count in [t-waited, t] (a chunk end needs CHUNK_MIN_OVERLAP_S inside the window). A chunk interval [S, end]
+        (S = an upper bound of its true start, see feed_d) must overlap the window by CHUNK_MIN_OVERLAP_S. Witnesses of rids that were
+        D-ADMITted in [t, t+ADMIT_AFTER_S] (the released set) never count.
+        """
+        w0 = t - waited
+        released = {r for ta, r in self.admits if t <= ta <= t + ADMIT_AFTER_S}
+        kinds = collections.Counter()
+        for bt, k, rids in self.busy:
+            if rids and released and set(rids) <= released:
+                continue
+            if k == "decode-round":
+                ok = w0 <= bt <= t
+            elif k == "chunk-end":
+                ok = w0 + CHUNK_MIN_OVERLAP_S <= bt <= t
+            else:
+                ok = w0 - SLACK_S <= bt and bt + STAMP_S <= t
+            if ok:
+                kinds[k] += 1
+        for a, b, rids in self.busy_iv:
+            if a is None or (rids and released and set(rids) <= released):
+                continue
+            if min(b, t) - max(a, w0) >= CHUNK_MIN_OVERLAP_S:
+                kinds["chunk"] += 1
+        return kinds
 
     def feed_p(self, line):
         m = RE_PPRE.match(line)
@@ -177,7 +252,9 @@ class Mon:
             return
         m = RE_ADMIT.match(line)
         if m:
-            self.d_pf.append(ts(m.group(1), int(m.group(2))))
+            ta = ts(m.group(1), int(m.group(2)))
+            self.d_pf.append(ta)
+            self.admits.append((ta, m.group(3)))
             return
         m = RE_REL.match(line)
         if not m:
@@ -298,22 +375,20 @@ class Mon:
 
     def settle(self, force=False):
         keep = []
-        horizon = self.busy[-1][0] if self.busy else 0.0
-        while self.busy and self.busy[0][0] < time.time() - 7200:   # nur 2 h Rueckblick halten
+        ref = self.d_last or time.time()          # the D log's own clock (live: ~now; replay of an old log: its end), never the wall clock
+        while self.busy and self.busy[0][0] < ref - self.history_s:   # nur 2 h Rueckblick halten
             self.busy.popleft()
-        while self.busy_iv and self.busy_iv[0][1] < time.time() - 7200:
+        while self.busy_iv and self.busy_iv[0][1] < ref - self.history_s:
             self.busy_iv.popleft()
+        while self.admits and self.admits[0][0] < ref - self.history_s:
+            self.admits.popleft()
         for t, waited, f, src, wall in self.pending:
             ready = force or self.d_last >= t + 1.0 or time.time() - wall >= SETTLE_S
             if not ready:
                 keep.append((t, waited, f, src, wall))
                 continue
-            lo, hi = t - waited - SLACK_S, t + SLACK_S
-            kinds = collections.Counter(k for bt, k in self.busy if lo <= bt <= hi)
-            # Chunk-Intervall: nur ECHTE Ueberlappung mit dem Wartefenster [release-waited, release] zaehlt (ohne die +-1 s Toleranz der
-            # Punktzeugen): ein Intervall, das das Fenster nur streift, ist kein Beleg (13:33:13.537 Chunk-Ende vs Fenster ab 13:33:13.40
-            # am 14.10. 13:33:29Z, D danach 16 s phase=idle). Mindestueberlappung CHUNK_MIN_OVERLAP_S.
-            kinds.update(k for a, b, k in self.busy_iv if min(b, t) - max(a, t - waited) >= CHUNK_MIN_OVERLAP_S)
+            lo, hi = t - waited - SLACK_S, t
+            kinds = self.d_work(t, waited)
             if kinds:
                 self.stats["justified"] += 1
                 self.stats["justified_s"] += waited
@@ -450,6 +525,7 @@ def run_live():
 
 def run_replay(front):
     mon = Mon(dry=True)
+    mon.history_s = float("inf")
     dpath = front[:-len("front.log")] + "D.log"
     with open(dpath, "r", errors="replace") as f:
         read_new(f, mon.feed_d, limit=10**9)
