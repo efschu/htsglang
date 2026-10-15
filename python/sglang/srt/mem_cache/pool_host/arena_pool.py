@@ -2312,7 +2312,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         Rows of a pending (un-acked) write are not COMPLETE and are skipped
         (``arena_ref_slots``' own rule). Returns ``{pages, on_disk, written,
         lost}``; the caller releases the rows only when ``lost`` is 0."""
-        out = {"pages": 0, "on_disk": 0, "written": 0, "lost": 0}
+        out = {"pages": 0, "on_disk": 0, "written": 0, "lost": 0, "unpaired": 0, "sidecar_absent": 0}
         arena = getattr(self, "arena", None)
         if arena is None or host_indices is None:
             return out
@@ -2328,7 +2328,9 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         # key 0/0: arena_secure_to_disk names the page by the slot header's
         # stem (arena.slot_stem), the same name the clock evict writes under
         sec = secure(arena, [(int(s), 0, 0, total) for s in slots.tolist()])
-        for k in ("on_disk", "written", "lost"):
+        # H16P-NACHBESSERUNG A2: `unpaired` (a KV page held back for want of its QSA index: NOT on disk) and
+        # `sidecar_absent` are passed on -- the caller must not read them as a complete copy
+        for k in ("on_disk", "written", "lost", "unpaired", "sidecar_absent"):
             out[k] = int(sec.get(k, 0))
         ArenaMHAHostPool._257_written_to_l3 = (
             getattr(ArenaMHAHostPool, "_257_written_to_l3", 0) + out["written"])

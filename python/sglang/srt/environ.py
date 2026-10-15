@@ -1157,6 +1157,15 @@ class Envs:
     # L3-DROP: how long a host-only child held by its OWN store write may have its acks drained on this
     # rank before the drop is refused by name (ms; 0 = drain once, no wait).
     SGLANG_WEG2_L3_DROP_ACK_WAIT_MS = EnvInt(2000)
+    # H16P-NACHBESSERUNG E1 (Opus review of ARENAFULL-1015, B3): L3-DROP only where the arena would refuse the
+    # node's backup claim anyway (backup_room_tokens < tokens, no claim attempt). With room the node is demoted
+    # to L2 as before (L2 hits stay, the peel agrees with the payable walk). Off = L3-DROP whenever l3_present.
+    SGLANG_WEG2_L3_DROP_ONLY_UNDER_PRESSURE = EnvBool(True)
+    # H16P-NACHBESSERUNG A2 (review B2): l3_present is set only for a COMPLETE store write. _drain_backup sets it
+    # only when operation.completed_tokens covers every page (a partial / stale-refused / skipped write does
+    # not), and a W3 / host-only spill that sees unpaired pages (KV page without its QSA index, not written)
+    # treats them like lost (no release, no l3_present). Off = every ack sets it, unpaired is ignored.
+    SGLANG_WEG2_L3_PRESENT_STRICT = EnvBool(True)
     # ARENAFULL-1015 W3-KEEP-PAYABLE: on the local-PP floor the W3 spill never releases the host copy of a
     # device node whose drop it would make impossible right now (a host-only descendant that UD-H could not
     # clear). Off = every written device node is a candidate, as before.
