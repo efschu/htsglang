@@ -363,6 +363,9 @@ def test_noroom_120446_green_the_ack_waits_for_the_room_and_names_the_full_reach
     assert "PF TOLD-ACK ROOM-DEFER RELEASED rank pp=1 rid=weg2-0-3" in text
     assert "PF TOLD-ACK NO-ROOM" not in text
     assert "weg2-0-3" not in fb._fstate(f.sched).registered
+    # the release leaves no deferral state behind (a later read of the same rid starts clean)
+    assert "weg2-0-3" not in fb._fstate(f.sched).deferred
+    assert "weg2-0-3" not in (getattr(f.sched, "_weg2_fb_room_defer_seen", None) or set())
     # PP0: both followers' acks are told: admitted in full
     s = types.SimpleNamespace(ps=types.SimpleNamespace(pp_size=3, pp_rank=0))
     _open(s, "weg2-0-3", 184768, {1: 184768, 2: 184768})
