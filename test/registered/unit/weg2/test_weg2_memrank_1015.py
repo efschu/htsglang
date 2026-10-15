@@ -279,3 +279,23 @@ def test_malloc_split_tells_use_from_free():
     use2, _ = mr.read_malloc()
     assert use2 > use + 50 * (1 << 20)
     del big
+
+
+def test_pp_pending_sends_gauge_counts_unjoined_work_lists():
+    sched = types.SimpleNamespace(
+        waiting_queue=[], running_batch=types.SimpleNamespace(reqs=[]),
+        _pp_pending_sends={3: [["w1"], ["w2"]], 4: [["w3"]]},
+    )
+    kv = _kv(mr.MemRankProbe("PP1", group="P", rank=1, kind="scheduler", owner=sched).line())
+    assert kv["n_pp_pending_sends"] == "3"
+    # a TP rank has no such table: absent, not -1
+    tp = types.SimpleNamespace(waiting_queue=[], running_batch=types.SimpleNamespace(reqs=[]))
+    assert "n_pp_pending_sends" not in _kv(mr.MemRankProbe("TP0", group="D", rank=0, kind="scheduler", owner=tp).line())
+
+
+def test_malloc_keep_field_is_the_top_of_heap_release_size():
+    kv = _kv(mr.MemRankProbe("PP0", group="P", rank=0).line())
+    if kv["malloc_use_mib"] == "-1":
+        pytest.skip("no mallinfo2 on this libc")
+    assert float(kv["malloc_keep_mib"]) >= 0
+    assert float(kv["malloc_keep_mib"]) <= float(kv["malloc_free_mib"]) + 1.0

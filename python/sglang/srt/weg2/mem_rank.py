@@ -125,7 +125,8 @@ def read_malloc() -> Optional[Tuple[int, int]]:
 
     in_use = ``uordblks + hblkhd`` (arenas + mmapped chunks), free = ``fordblks``
     (free chunks the allocator still holds -- what ``malloc_trim`` could hand
-    back, or what fragmentation keeps)."""
+    back, or what fragmentation keeps). ``read_malloc_keep`` has ``keepcost``:
+    the free space at the TOP of the heap, what a trim can release at once."""
     global _MALLINFO2
     try:
         if _MALLINFO2 is False:
@@ -137,10 +138,14 @@ def read_malloc() -> Optional[Tuple[int, int]]:
         if _MALLINFO2 is None:
             return None
         mi = _MALLINFO2()
+        _LAST_KEEPCOST[0] = int(mi.keepcost)
         return int(mi.uordblks) + int(mi.hblkhd), int(mi.fordblks)
     except Exception:  # noqa: BLE001 -- an instrument never takes a process down
         _MALLINFO2 = None
         return None
+
+
+_LAST_KEEPCOST = [-1]  # keepcost of the last read_malloc() (bytes), -1 = none
 
 
 def read_pyblocks() -> int:
@@ -329,6 +334,8 @@ SCHEDULER_GAUGES: Tuple[Tuple[str, Callable[[Any], Any]], ...] = (
     ("ongoing_wt", _tree_len("ongoing_write_through")),
     ("ongoing_lb", _tree_len("ongoing_load_back")),
     ("ongoing_backup", _tree_len("ongoing_backup")),
+    # PP only: sends posted and not yet joined (bounded by the lap drain; a growth here is a leak)
+    ("pp_pending_sends", lambda s: sum(len(v) for v in list(s._pp_pending_sends.values()))),
 )
 FRONT_GAUGES: Tuple[Tuple[str, Callable[[Any], Any]], ...] = tuple(
     (n, (lambda o, a=a: len(getattr(o, a))))
@@ -455,8 +462,10 @@ class MemRankProbe:
                 d_anon, st.get("Threads", -1), majflt, d_maj, read_pyblocks()),
         ]
         ma = read_malloc()
-        parts.append("malloc_use_mib=%s malloc_free_mib=%s" % (
-            ("%.1f" % (ma[0] / MIB), "%.1f" % (ma[1] / MIB)) if ma else ("-1", "-1")))
+        ma_u, ma_f = (("%.1f" % (ma[0] / MIB)), ("%.1f" % (ma[1] / MIB))) if ma else ("-1", "-1")
+        keep = _LAST_KEEPCOST[0]
+        parts.append("malloc_use_mib=%s malloc_free_mib=%s malloc_keep_mib=%s" % (
+            ma_u, ma_f, "%.1f" % (keep / MIB) if ma and keep >= 0 else "-1"))
         pt = read_pinned_torch()
         pp = read_pinned_posts()
         pt_a, pt_r = (("%.1f" % (pt[0] / MIB)), ("%.1f" % (pt[1] / MIB))) if pt else ("-1", "-1")
