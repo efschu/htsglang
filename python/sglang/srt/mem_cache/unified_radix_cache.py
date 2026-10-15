@@ -7980,6 +7980,44 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             out.append(t)
         return out
 
+    def _k12_unreal_host_rows(self, node: UnifiedTreeNode) -> int:
+        """K12 (index 72085): how many of ``node``'s KV host ids are NOT real
+        rows of the KV host pool -- the A2 ORPHAN id (``settle_lost_rows``:
+        ``id_space`` = staging + arena tokens + PLACEHOLDERS, deliberately
+        outside every pool) or a read placeholder. Such a page carries no host
+        bytes, so a store write of it reads a row nobody owns: D TP0 13:35:33Z
+        ``A2 LOST-ROWS ... orphaned=24`` and 0.2 s later the publish of the same
+        node read QSA mirror row 72085 = (4096 + 6485*64 + 2**22) / 64 of a
+        6549-row mirror (IndexError, backup thread dead, W120 at the sleep).
+        0 for a pool without the arena bounds (nothing to compare against)."""
+        cc = getattr(self, "cache_controller", None)
+        pool = getattr(cc, "mem_pool_host", None) if cc is not None else None
+        S = getattr(pool, "staging_rows", None)
+        A = getattr(pool, "arena_tokens", None)
+        if not isinstance(S, int) or not isinstance(A, int) or getattr(pool, "arena", None) is None:
+            return 0
+        hv = node.component_data[BASE_COMPONENT_TYPE].host_value
+        if hv is None or hv.numel() == 0:
+            return 0
+        return int((hv.reshape(-1).to("cpu", dtype=torch.int64) >= S + A).sum())
+
+    def _k12_refuse_unreal_backup(self, node: UnifiedTreeNode, site: str) -> bool:
+        """True = the store write of ``node`` is refused by name (K12)."""
+        bad = UnifiedRadixCache._k12_unreal_host_rows(self, node)
+        if not bad:
+            return False
+        n = getattr(UnifiedRadixCache, "_k12_orphan_refused_n", 0) + 1
+        UnifiedRadixCache._k12_orphan_refused_n = n
+        if n <= 16 or (n & (n - 1)) == 0:
+            logger.warning(
+                "K12 ORPHAN-ROWS BACKUP REFUSED site=%s node=%s rows_bad=%d of %d n=%d: the node "
+                "holds A2-orphaned (or placeholder) host ids -- pages with no host bytes; no store "
+                "write is issued for it (its L3 copy is the key's own COMPLETE slot or none)",
+                site, getattr(node, "id", "?"), bad,
+                int(node.component_data[BASE_COMPONENT_TYPE].host_value.numel()), n,
+            )
+        return True
+
     def _weg2_write_plain_sidecars(self, node: UnifiedTreeNode) -> None:
         """fnFL2x62: a direct write completes the KV page in the arena and the
         mamba blob / draft page in THEIR arenas, and the write-through ack then
@@ -7992,6 +8030,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         builds, filtered by :meth:`_plain_sidecar_transfers`."""
         cc = self.cache_controller
         if not self.enable_storage or cc is None or not node.backuped:
+            return
+        if UnifiedRadixCache._k12_refuse_unreal_backup(self, node, "plain_sidecars"):
             return
         comp_xfers: dict[ComponentType, list[PoolTransfer]] = {}
         for comp in self._components_tuple:
@@ -8062,6 +8102,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     "skips=%s (denominator: every write_backup_storage call)",
                     _why, getattr(node, "id", "?"), len(node.key), _calls, _skips,
                 )
+            return
+
+        if UnifiedRadixCache._k12_refuse_unreal_backup(self, node, "write_backup_storage"):
             return
 
         # Weighted uneven-DCP owner mode (task #60): each rank's host pool only
