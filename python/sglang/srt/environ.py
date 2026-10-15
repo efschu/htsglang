@@ -827,6 +827,17 @@ class Envs:
     # long instead of ending the prefix there. Prefetch io threads only.
     # 0 = the pre-1014 form (the prefix ends at the first FULL stem).
     SGLANG_WEG2_L3FILL_ROOM_WAIT_MS = EnvInt(5000)  # 14.10.: as the join wait -- reading beats re-prefilling; a stuck arena is cut at the stale age
+    # READ-ROOM 1015 (NF h16p, user order 15.10.: zero avoidable tokens; boots ..._226aad7105_1015_*, P, 46 PP0
+    # ``WEG2-READ-DEPTH cause=arena_full`` cuts, weg2-4-25 12:52:35: 977 stems, claimed=0 after the 5 s room
+    # wait, ``tree=6478 tree_in_use=0``): a fill that finds the arena FULL after the clock posts its need next
+    # to the arena; every PP rank's scheduler (check_hicache_events) hands back L3-backed tree copies
+    # (``_w3_arena_spill``) for the deficit. Default ON; 0 = the old fill (no post, the 5 s room wait).
+    # READ_ROOM_WAIT_MS = the room wait's idle bound while the request is armed (more than three scheduler rounds
+    # of a 2-3 s chunk forward, below the told Frist cap of 12 s so a wait never outlives the group's patience);
+    # REPOST_MS = pace of a fill's repeated posts.
+    SGLANG_WEG2_READ_ROOM = EnvBool(True)
+    SGLANG_WEG2_READ_ROOM_WAIT_MS = EnvInt(10000)
+    SGLANG_WEG2_READ_ROOM_REPOST_MS = EnvInt(1500)
     # L3FILL_STALE_CLAIM_S (L3FILL-JOINED (3), 30.09.): a claim whose writer is
     # alive but delivered no byte for this long is taken from its key
     # (arena_quarantine_stale, generation-safe: a late completion of the old

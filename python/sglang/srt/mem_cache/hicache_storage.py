@@ -22,6 +22,7 @@ from sglang.srt.mem_cache.canonical_page_store import (
 )
 from sglang.srt.weg2 import moe_act_switch as _moe_act_switch
 from sglang.srt.weg2 import prefix_trace as _prefix_trace
+from sglang.srt.weg2 import read_room as _read_room
 from sglang.srt.mem_cache.weg2_store_gates import (
     owner_write_covers_whole_file,
     writes_shared_keys,
@@ -4091,6 +4092,10 @@ class HiCacheFile(HiCacheStorage):
             # Those references go within seconds (complete 5981 at 12:04:45).
             # Bounded, prefetch io thread only: evict + claim again until a
             # slot comes or the wait is spent; what gets a slot is read now.
+            # READ-ROOM 1015: the clock found nothing -- every slot carries a tree/hold reference. Ask the trees
+            # (every PP rank's scheduler) for the deficit before and while this fill waits; the read is never cut
+            # at a full arena that holds L3-backed copies (weg2/read_room.py).
+            _read_room.post(arena, len(still_full), site="fill")
             _room = self._await_fill_room(arena, still_full, int(total_bytes), out, joined,
                                           stats=stats)
             if _room:
@@ -4212,15 +4217,21 @@ class HiCacheFile(HiCacheStorage):
         # through the rest of the wait is exactly what a peer's JOIN-WAIT
         # sits on (P 15:34:27-32 weg2-10-86).
         live = join_liveness_on() and stats is not None
-        deadline = t0 + (max(wait_ms, join_noprogress_cap_ms()) if live else wait_ms) / 1000.0
+        # READ-ROOM 1015: with the room request armed (group P) the idle bound is the request's own wait -- one
+        # scheduler round of a chunk forward on three stages is longer than 5 s of nothing
+        idle_ms = _read_room.wait_idle_ms(wait_ms, arena)
+        deadline = t0 + (max(idle_ms, join_noprogress_cap_ms()) if live else idle_ms) / 1000.0
         last_move = t0
         read_now = 0
         rounds = 0
+        _served0 = _read_room._ST.served
         while pend and time.perf_counter() < deadline:
-            if live and time.perf_counter() - last_move >= wait_ms / 1000.0:
+            if live and time.perf_counter() - last_move >= idle_ms / 1000.0:
                 break
             time.sleep(0.025)
             rounds += 1
+            if rounds % 40 == 0:
+                _read_room.post(arena, len(pend), site="room_wait")   # paced inside; a lost post is re-asked
             try:
                 self._arena_evict_to_disk(arena, max(256, len(pend)), need=len(pend))
             except Exception:  # noqa: BLE001
@@ -4255,6 +4266,8 @@ class HiCacheFile(HiCacheStorage):
             pend = nxt
         _ROOM_WAIT_N[0] += 1
         k = _ROOM_WAIT_N[0]
+        if pend:
+            _read_room.note_short(arena, len(pend), rounds, (time.perf_counter() - t0) * 1000.0, _served0)
         if k <= 16 or (k & (k - 1)) == 0 or pend:
             logger.info("L3-FILL ROOM-WAIT n=%d stems=%d claimed=%d still_full=%d rounds=%d waited_ms=%.0f "
                         "bound_ms=%d (the arena was FULL for these stems: evict + claim again instead of "

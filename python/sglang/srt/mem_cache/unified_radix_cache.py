@@ -35,6 +35,7 @@ from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.distributed.utils import uneven_dcp_active
 from sglang.srt.environ import envs
 from sglang.srt.weg2 import prefix_trace as _prefix_trace
+from sglang.srt.weg2.read_room import tick as _read_room_tick
 from sglang.srt.weg2 import tail_adopt, tail_handoff
 from sglang.srt.weg2 import short_read as _weg2_short_read
 from sglang.srt.weg2 import d_park_read as _weg2_park_read
@@ -12011,6 +12012,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             pass
         _timing_every = _hicache_round_timing_every()
         _t0 = time.perf_counter() if _timing_every else 0.0
+        # READ-ROOM 1015: a fill short of arena slots asked (the shared request file next to the arena); this
+        # rank hands back L3-backed tree copies for it. One dict-free check per round when nothing was posted.
+        _read_room_tick(self)
         # Reap the previous round's PP-sync sends before issuing new ones.
         self._drain_async_work()
         _h49_t = time.perf_counter()
