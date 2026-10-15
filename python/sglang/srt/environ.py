@@ -1150,6 +1150,21 @@ class Envs:
     # canonical page identity, equal on every rank), then the node id. No
     # collective, no reserve. Off = the node-id order, byte for byte.
     SGLANG_WEG2_W3_SPILL_GROUP_ORDER = EnvBool(True)
+    # ARENAFULL-1015 (NF h16n deaths 07:11:54 / 07:30:35, PP1): L3-DROP -- a write_back device leaf whose KV
+    # is in L3 (l3_present: its arena copy spilled) leaves the device on the local-PP floor without a new
+    # arena claim (UD drop, host-only children via UD-H). Off = the old claim-first path.
+    SGLANG_WEG2_L3_DROP = EnvBool(True)
+    # L3-DROP: how long a host-only child held by its OWN store write may have its acks drained on this
+    # rank before the drop is refused by name (ms; 0 = drain once, no wait).
+    SGLANG_WEG2_L3_DROP_ACK_WAIT_MS = EnvInt(2000)
+    # ARENAFULL-1015 W3-KEEP-PAYABLE: on the local-PP floor the W3 spill never releases the host copy of a
+    # device node whose drop it would make impossible right now (a host-only descendant that UD-H could not
+    # clear). Off = every written device node is a candidate, as before.
+    SGLANG_WEG2_W3_SPILL_KEEP_PAYABLE = EnvBool(True)
+    # ARENAFULL-1015 ACK-ROOM-PAYABLE: a follower's told ack measures its load-back room as free rows plus
+    # what ONE peel can pay (pp_room_vote walk), not the tree's reported evictable size (07:30:35: reported
+    # 255040, paid 48192). Off = available + evictable_size, as before.
+    SGLANG_WEG2_ACK_ROOM_PAYABLE = EnvBool(True)
     # SETTLE-UNIFORM-1014 (NF h18 fe799c4d6e, D 16:23:24 gloo 'op.preamble.length <= op.nbytes. 8 vs 4'):
     # the #1471 settle skipped the progress check (a collective) of a member whose rank-local writer
     # action was wait/decide. On: every rank checks every non-capwait member; the action only shapes the
