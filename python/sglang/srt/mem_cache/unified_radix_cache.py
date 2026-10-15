@@ -9,6 +9,7 @@ import threading
 import time
 import weakref
 
+from sglang.srt.mem_cache import weg2_backup_guard as _k12_guard
 from sglang.srt.managers.weg2_pass_timer import timed as _pass_timed
 from sglang.srt.managers import weg2_p_overlap as _weg2_p_overlap
 from array import array
@@ -10565,6 +10566,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             for operation in _drain_queue(cc.ack_backup_queue, n_backup):
                 drained += 1
                 entry = self.ongoing_backup.pop(operation.id, None)
+                if entry is not None and _k12_guard.is_failed(operation):
+                    # K12: the write did not land (an exception in its body, or
+                    # the group's sleep verdict abandoned it). No l3_present --
+                    # #1317 C2: an issued write that never landed must not
+                    # license a free -- and no rebind/transit release: the host
+                    # rows stay the only copy until the node leaves normally.
+                    node, lock_params = entry
+                    self.dec_host_lock_ref(node, lock_params)
+                    entry = None
                 if entry is not None:
                     node, lock_params = entry
                     if _parts is not None:
