@@ -157,6 +157,11 @@ WIRE_FLOOR = "floor"
 ENV_MIN_PASSES = "SGLANG_WEG2_TOLD_FALLBACK_MIN_PASSES"
 ENV_ACK_DRAIN = "SGLANG_WEG2_TOLD_ACK_DRAIN"
 ENV_FLOOR = "SGLANG_WEG2_TOLD_GROUP_FLOOR"
+#: B5 ANCHOR-ACKS (NF h16p 226aad7105, 15.10. 12:04:24 / 12:16:46Z): a follower's ack carries the resumable anchor
+#: depths below its reach; PP0 floors at the deepest depth EVERY stage (itself included) can resume from.
+ENV_ANCHOR_ACKS = "SGLANG_WEG2_TOLD_ANCHOR_ACKS"
+#: at most this many anchor depths per ack entry (deepest first)
+ANCHOR_ACKS_MAX = 16
 #: item 180: where a follower's re-ask of PP0 went (follower_reask)
 ROUTE_PF = "pf-ack"
 ROUTE_NONE = "none"
@@ -204,6 +209,12 @@ def floor_on() -> bool:
     return _env_switch(ENV_FLOOR)
 
 
+def anchor_acks_on() -> bool:
+    """B5 ANCHOR-ACKS (default on): acks carry the resumable anchors below the reach; the floor is the deepest
+    depth common to every stage. ``0`` = H64's equal-acks floor alone."""
+    return _env_switch(ENV_ANCHOR_ACKS)
+
+
 def min_passes(pp_size: int) -> int:
     """H64 FRIST-PASSES: PP0 passes after the read-ahead before the Frist may
     fire. Default pp_size + 1: pp_size - 1 chain hops to the last follower,
@@ -238,7 +249,11 @@ def _bump(obj, attr: str) -> int:
 @dataclass
 class Weg2ToldReadAck:
     """Follower -> PP0 on ``WEG2_TOLD_ACK_TAG``: the reads this rank has
-    terminated since its last ack, as ``(rid, own_prefix)``."""
+    terminated since its last ack, as ``(rid, own_prefix)`` -- or, B5
+    ANCHOR-ACKS, ``(rid, own_prefix, anchors)``: ``anchors`` = the depths below
+    ``own_prefix`` this rank can ALSO resume from (state-bearing boundaries on
+    its matched path, deepest first). The same message, a longer entry; PP0
+    reads both forms."""
 
     rank: int
     seq: int
@@ -402,6 +417,8 @@ class _Open:
     published_pass: int = -1
     #: H64: the Frist was held by the pass floor at least once (named once)
     frist_held: bool = False
+    #: B5 ANCHOR-ACKS: per follower rank, the anchor depths below its ack
+    anchors: Dict[int, Tuple[int, ...]] = field(default_factory=dict)
 
 
 def _pp0_open_map(scheduler) -> Dict[str, _Open]:
@@ -534,7 +551,9 @@ def pp0_harvest(scheduler) -> int:
         if not isinstance(ack, Weg2ToldReadAck):
             logger.warning("PF TOLD-ACK object %s on the ack stream dropped", type(ack).__name__)
             continue
-        for rid, own in ack.reads:
+        for entry in ack.reads:
+            rid, own = entry[0], entry[1]
+            anchors = tuple(int(a) for a in entry[2]) if len(entry) > 2 and entry[2] else ()
             o = open_map.get(str(rid))
             if o is None:
                 # item 220: a follower's re-ask (item 180) of a rid PP0
@@ -555,6 +574,7 @@ def pp0_harvest(scheduler) -> int:
                     )
                 continue
             o.acks[int(ack.rank)] = int(own)
+            o.anchors[int(ack.rank)] = anchors
             n += 1
     if n:
         k = _bump(scheduler, "_pf_ack_harvest_n")
@@ -563,14 +583,50 @@ def pp0_harvest(scheduler) -> int:
     return n
 
 
+def common_depths(o: _Open) -> List[int]:
+    """B5: the depths in (0, told) EVERY acked follower can resume from -- its ack plus the anchors it sent below
+    it -- deepest first. Without anchors (switch off, an old entry) each follower contributes its ack alone, i.e.
+    H64's equal-acks floor."""
+    told = int(o.told)
+    common: Optional[set] = None
+    for rank, own in o.acks.items():
+        mine = {int(own)}
+        if anchor_acks_on():
+            mine |= {int(a) for a in o.anchors.get(rank, ()) if 0 < int(a) and (int(own) <= 0 or int(a) <= int(own))}
+        common = mine if common is None else (common & mine)
+    if not common:
+        return []
+    return sorted((d for d in common if 0 < d < told), reverse=True)
+
+
 def _floor_candidate(o: _Open) -> Optional[int]:
-    """H64 GROUP-FLOOR: the one depth every ack so far names, when it lies in
-    (0, told); None = no floor is possible (differing acks, 0, over told)."""
-    vals = set(int(v) for v in o.acks.values())
-    if len(vals) != 1:
-        return None
-    m = next(iter(vals))
-    return m if 0 < m < int(o.told) else None
+    """H64 GROUP-FLOOR: the deepest depth every ack names (B5: every ack or one of its anchors), when it lies in
+    (0, told); None = no floor is possible (no common depth, 0, over told)."""
+    depths = common_depths(o)
+    return depths[0] if depths else None
+
+
+def pp0_floor_below(scheduler, rid: str, req, below: int, absolute: bool) -> int:
+    """B5: PP0's own tree refused the floor ``below`` (TF). The next deeper common depth PP0 ITSELF can resume from
+    (``weg2_told_fidelity.pp0_admissible`` at that depth, no side effect), else 0. PP0 alone decides; the followers
+    proved every candidate by acking it. Read before ``pp0_note_verdict`` pops the open entry."""
+    if not anchor_acks_on():
+        return 0
+    o = _pp0_open_map(scheduler).get(str(rid))
+    if o is None:
+        return 0
+    try:
+        from sglang.srt.managers import weg2_told_fidelity as _tf
+    except Exception:  # noqa: BLE001
+        return 0
+    for d in common_depths(o):
+        if d >= int(below):
+            continue
+        depth = _tf.absolute_depth(req, d, absolute)
+        own = _tf.pp0_admissible(scheduler, req, depth)
+        if own is not None and int(own) >= depth:
+            return int(d)
+    return 0
 
 
 def _frist_due(scheduler, rid: str, o: _Open, now: float, pass_n: Optional[int]) -> bool:
@@ -719,7 +775,7 @@ def release_own_read(scheduler, rid: str) -> None:
 class _FState:
     expect: Dict[str, int] = field(default_factory=dict)  # rid -> read-ahead told
     registered: Dict[str, Any] = field(default_factory=dict)  # rid -> req
-    outbox: List[Tuple[str, int]] = field(default_factory=list)
+    outbox: List[Tuple[Any, ...]] = field(default_factory=list)
     seq: int = 0
 
 
@@ -991,6 +1047,71 @@ def _room_own(scheduler, req, rid: str, own: int) -> int:
     return 0
 
 
+def _path_anchor_depths(tree, node) -> List[int]:
+    """B5: the state-bearing boundaries on the path root..``node``, deepest first, in KEY units (the walk's
+    ``cum_tokens``): every node the tree's own match validators accept (mamba's ``is_resume_candidate`` among them --
+    the predicate ``_state_anchor_depth`` reads off, never a second rule). Read-only."""
+    comps = getattr(tree, "_components_tuple", None)
+    root = getattr(tree, "root_node", None)
+    if not comps or node is None or root is None:
+        return []
+    device_only = getattr(tree, "cache_controller", None) is None
+    validators = tuple(c.create_match_validator(match_device_only=device_only) for c in comps)
+    path = []
+    n = node
+    while n is not None and n is not root:
+        path.append(n)
+        n = n.parent
+    depth = sum(len(x.key) for x in path)
+    out: List[int] = []
+    for x in path:  # deepest first
+        try:
+            if all(v(x, depth) for v in validators):
+                out.append(int(depth))
+        except Exception:  # noqa: BLE001 - a node a validator cannot read is no anchor
+            pass
+        depth -= len(x.key)
+    return out
+
+
+def ack_anchors(scheduler, req, rid: str, own: int, told: int) -> List[int]:
+    """B5 ANCHOR-ACKS: the depths below ``own`` (and below ``told``) this rank can resume ``rid`` from AND load
+    back -- the anchors on its matched path to ``max(own, told)``, room-checked like the ack itself (H64-AUFLAGE 1:
+    a floor this rank cannot load back would run into ROW-ROOM SHORT). Deepest first, at most ``ANCHOR_ACKS_MAX``.
+    No probe = none (the ack alone, as before). Read-only."""
+    try:
+        tree = getattr(scheduler, "tree_cache", None)
+        match = getattr(tree, "match_prefix", None)
+        ids = getattr(req, "full_untruncated_fill_ids", None)
+        if ids is None or len(ids) == 0:
+            ids = getattr(req, "origin_input_ids", None)
+        if tree is None or not callable(match) or ids is None or len(ids) == 0:
+            return []
+        from sglang.srt.managers.weg2_store_told import _probe_key
+        from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
+
+        reach = max(int(own), int(told))
+        if reach <= 0:
+            return []
+        key, _bigram = _probe_key(scheduler, req, ids, reach)
+        mr = match(MatchPrefixParams(key=key))
+        node = getattr(mr, "best_match_node", None)
+        cap = int(own) if int(own) > 0 else int(told)
+        depths = [d for d in _path_anchor_depths(tree, node) if 0 < d < int(told) and (d < cap or int(own) <= 0)]
+    except Exception:  # noqa: BLE001 - a probe never breaks the ack
+        return []
+    out: List[int] = []
+    for d in depths:
+        if int(own) > 0 and d == int(own):
+            continue
+        if _room_own(scheduler, req, rid, d) != d:
+            continue  # this depth's load-back does not fit: not a depth this rank proves
+        out.append(int(d))
+        if len(out) >= ANCHOR_ACKS_MAX:
+            break
+    return out
+
+
 def _progress_free(tree) -> bool:
     fn = getattr(tree, "prefetch_progress_is_collective_free", None)
     if callable(fn):
@@ -1028,7 +1149,11 @@ def follower_pump(scheduler) -> None:
                 continue  # short: the told-limited read acks when it ends
         req = st.registered.pop(rid)
         st.expect.pop(rid, None)
-        st.outbox.append((rid, own_prefix(scheduler, req, rid, told)))
+        own = own_prefix(scheduler, req, rid, told)
+        if anchor_acks_on():
+            st.outbox.append((rid, own, tuple(ack_anchors(scheduler, req, rid, own, told))))
+        else:
+            st.outbox.append((rid, own))
     ch = _channel(scheduler)
     if not st.outbox:
         ch.pump()
