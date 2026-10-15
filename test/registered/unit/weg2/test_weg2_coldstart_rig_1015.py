@@ -29,7 +29,9 @@ SCENARIOS (one test each, ``test_S<n>_...``; the runner ``tools/weg2_coldstart_r
       + G4c: the D writer node's reference on its old slot survives P's take-over                 red under M1 (A2 1015)
   S5  a vision request over P (row form): every stage admits it in the same pass               self-check by mutant
   S6  LB-VERDICT burst with a late-starting twin on the carrierless form (19:33 hang)          red on 853534a9ff
-  S7  arena full and pinned by the peers, a 210k load-back executed on a follower (h16n 07:30:35) red on 4f58ca0256,
+  S9  (test_S9_arena_full_pinned_row_room; S7/S8 are reserved for the PF-frist / slow D park scenarios of
+      desk/nf-coldstart-rig-s7s8-1015, so the two branches merge without a name clash)
+      arena full and pinned by the peers, a 210k load-back executed on a follower (h16n 07:30:35) red on 4f58ca0256,
       17c2563647 and 853534a9ff (the defect is latent since 8f2fe84949; h16h never refused a P claim at the metal)
       + G5 ROW-ROOM: the follower pays the room PP0's row needs (no ROW-ROOM SHORT, no PrefillOutOfPages)
 
@@ -1478,7 +1480,7 @@ def test_selfcheck_S6_lbv_admit_off_is_the_ring_wait(carrierless, monkeypatch):
 
 
 # =====================================================================================================================
-# S7 -- the shared arena full and pinned by the peers, a 210k load-back executed on a follower (NF h16n 07:30:35)
+# S9 -- the shared arena full and pinned by the peers, a 210k load-back executed on a follower (NF h16n 07:30:35)
 # =====================================================================================================================
 #
 # Metal (boot ..._17c2563647_1015_071520.P.log, PP1): the arena (6485 slots) complete and referenced by every stage
@@ -1491,9 +1493,9 @@ def test_selfcheck_S6_lbv_admit_off_is_the_ring_wait(carrierless, monkeypatch):
 # _is_device_leaf / _is_host_leaf (and whatever this tree's eviction calls by name, e.g. L3-DROP). MODELLED: the
 # stage tree's nodes and I/O (store write ack queue, the demotion), the peel's leaf order (smallest first).
 
-S7_NODE208, S7_TAIL, S7_OTHER, S7_FREE, S7_NEED = 206848, 231, 48192, 4096, 209472
-S7_PAGE = 64
-S7_SLOTS = 96
+S9_NODE208, S9_TAIL, S9_OTHER, S9_FREE, S9_NEED = 206848, 231, 48192, 4096, 209472
+S9_PAGE = 64
+S9_SLOTS = 96
 
 
 class _CD7:
@@ -1504,11 +1506,11 @@ class _CD7:
         self.host_lock_ref = 0
 
 
-class _Node7:
+class _Node9:
     _ids = itertools.count(200)
 
     def __init__(self, parent, tokens, *, host=False, label=""):
-        self.id = next(_Node7._ids)
+        self.id = next(_Node9._ids)
         self.label = label
         self.parent = parent
         self.children = {}
@@ -1544,7 +1546,7 @@ class _SpillPool7:
         return {"pages": n, "on_disk": n, "written": 0, "lost": 0}
 
 
-def _s7_stage_cls():
+def _s9_stage_cls():
     URC = _urc_mod()
     C = URC.UnifiedRadixCache
     names = ("_evict_device_leaf", "_is_device_leaf", "_is_host_leaf", "_ud_clear_host_children", "_w3_arena_spill")
@@ -1564,7 +1566,7 @@ class _Stage7Base:
         from sglang.srt.weg2 import pp_slot_fidelity as SF
 
         self.arena = arena
-        self.root_node = _Node7(None, 0, label="root")
+        self.root_node = _Node9(None, 0, label="root")
         self.root_node.component_data[0].value = torch.empty(0, dtype=torch.int64)
         self.cache_controller = SimpleNamespace(write_policy="write_back")
         self.ongoing_write_through = {}
@@ -1613,8 +1615,8 @@ class _Stage7Base:
 
     def write_backup(self, node, write_back=False, kv_only_if_mamba_refused=False):
         """The backup IS an arena claim (_weg2_direct_claim -> alloc_write): claimed for real on the shared arena."""
-        pages = max(1, len(node.key) // S7_PAGE)
-        stems = [f"s7-backup-{node.id}-{i}" for i in range(pages)]
+        pages = max(1, len(node.key) // S9_PAGE)
+        stems = [f"s9-backup-{node.id}-{i}" for i in range(pages)]
         got = self.arena.claim_slots(stems, [1024] * pages)
         self.backup_claims.append([st for _s, st, _g in got])
         fresh = [(s, g) for s, st, g in got if st == 0]
@@ -1678,38 +1680,38 @@ class _Stage7Base:
         return tracker[B]
 
 
-def _s7_pinned_arena(tmp_path):
+def _s9_pinned_arena(tmp_path):
     """The shared arena: every slot COMPLETE and referenced by the peers (PP0/PP2/D) -- 'complete=6294 pinned=6292'."""
     _need_gcc()
     from sglang.srt.mem_cache.storage.file.hicache_arena import ShmArena
 
-    path = str(tmp_path / "arena-s7.bin")
-    arena = ShmArena(path, 1024, S7_SLOTS)
-    peers = ShmArena(path, 1024, S7_SLOTS)
-    stems = [f"s7-page-{i}" for i in range(S7_SLOTS)]
-    got = arena.claim_slots(stems, [1024] * S7_SLOTS)
+    path = str(tmp_path / "arena-s9.bin")
+    arena = ShmArena(path, 1024, S9_SLOTS)
+    peers = ShmArena(path, 1024, S9_SLOTS)
+    stems = [f"s9-page-{i}" for i in range(S9_SLOTS)]
+    got = arena.claim_slots(stems, [1024] * S9_SLOTS)
     slots = [s for s, _st, _g in got]
-    assert arena.complete_slots(slots, [g for _s, _st, g in got], [(0, 1024)] * S7_SLOTS) == [1] * S7_SLOTS
-    assert peers.ref_slots(slots, +1) == S7_SLOTS
+    assert arena.complete_slots(slots, [g for _s, _st, g in got], [(0, 1024)] * S9_SLOTS) == [1] * S9_SLOTS
+    assert peers.ref_slots(slots, +1) == S9_SLOTS
     return arena, peers, slots
 
 
-def test_S7_arena_full_pinned_210k_loadback_on_a_follower(tmp_path, monkeypatch):
+def test_S9_arena_full_pinned_row_room(tmp_path, monkeypatch):
     """Node 208 (206848 tokens) and its tail on the follower's device, both backed into the pinned arena; a small
     backup is refused and the spill takes 208's host copy; the tail's store write is in flight when the peel
     demotes it; PP0's row needs 209472 rows on this stage (4096 free). G5: the peel pays them."""
     monkeypatch.setenv("SGLANG_WEG2_SF", "1")
-    arena, peers, slots = _s7_pinned_arena(tmp_path)
+    arena, peers, slots = _s9_pinned_arena(tmp_path)
     try:
-        Stage = _s7_stage_cls()
+        Stage = _s9_stage_cls()
         st = Stage(arena)
-        n208 = _Node7(st.root_node, S7_NODE208, host=True, label="208")
-        tail = _Node7(n208, S7_TAIL, host=True, label="211")
-        other = _Node7(st.root_node, S7_OTHER, host=True, label="other")
+        n208 = _Node9(st.root_node, S9_NODE208, host=True, label="208")
+        tail = _Node9(n208, S9_TAIL, host=True, label="211")
+        other = _Node9(st.root_node, S9_OTHER, host=True, label="other")
         n208.slots, tail.slots, other.slots = slots[:48], slots[48:50], slots[50:80]
         assert arena.ref_slots(n208.slots + tail.slots + other.slots, +1) == 80   # this stage's tree references
         # 07:30:30: a 192-token backup (weg2-17-57) is refused -- the arena has no free slot
-        small = _Node7(st.root_node, 192, label="215")
+        small = _Node9(st.root_node, 192, label="215")
         if st.write_backup(small) != 0:
             raise RigError("the pinned arena granted a claim -- the scenario's premise is gone")
         st.root_node.children.pop(small.id)
@@ -1722,7 +1724,7 @@ def test_S7_arena_full_pinned_210k_loadback_on_a_follower(tmp_path, monkeypatch)
         # the tail's store write (written back after the spill) is in flight when the peel comes
         st.store_write(tail, op=77)
         # PP0's row: load-back of 209472 rows on this stage, 4096 free -> the peel must pay the rest
-        need = S7_NEED - S7_FREE
+        need = S9_NEED - S9_FREE
         try:
             paid = st.peel(need)
         except LawViolation:
@@ -1735,7 +1737,7 @@ def test_S7_arena_full_pinned_210k_loadback_on_a_follower(tmp_path, monkeypatch)
         peers.close()
 
 
-def test_selfcheck_S7_l3_drop_off_is_row_room_short(tmp_path, monkeypatch):
+def test_selfcheck_S9_l3_drop_off_is_row_room_short(tmp_path, monkeypatch):
     """With the L3-DROP switch off the store-backed node takes the claim-first path again -> G5 red."""
     from sglang.srt.mem_cache import unified_radix_cache as URC
 
@@ -1743,4 +1745,4 @@ def test_selfcheck_S7_l3_drop_off_is_row_room_short(tmp_path, monkeypatch):
         pytest.skip("n/a: this tree has no L3-DROP to switch off")
     monkeypatch.setenv("SGLANG_WEG2_L3_DROP", "0")
     with pytest.raises(LawViolation, match="G5"):
-        test_S7_arena_full_pinned_210k_loadback_on_a_follower(tmp_path, monkeypatch)
+        test_S9_arena_full_pinned_row_room(tmp_path, monkeypatch)
