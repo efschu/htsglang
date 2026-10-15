@@ -117,6 +117,8 @@ from __future__ import annotations
 import logging
 import os
 import pickle
+import sys
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -162,6 +164,29 @@ ENV_FLOOR = "SGLANG_WEG2_TOLD_GROUP_FLOOR"
 ENV_ANCHOR_ACKS = "SGLANG_WEG2_TOLD_ANCHOR_ACKS"
 #: at most this many anchor depths per ack entry (deepest first)
 ANCHOR_ACKS_MAX = 16
+#: T2 WAIT-PROGRESS (NF h16p 226aad7105, 15.10.: the 4 ``reason=frist`` cases, 365k tokens): a missing ack is LAG,
+#: not absence. Every late ack the log shows (PP2 weg2-33-81 own=121344 at +6 s, PP2 weg2-4-25 own=43392 at +4 s) named
+#: EXACTLY told -- PP0 had thrown the whole prefix away for an ack that was on its way. The Frist stays the bound of an
+#: IDLE box (the #699 wedge clock runs while nothing serves); while the box is SERVING -- the detector that guards that
+#: very clock (``invariant_checker.admission_wedge_verdict``, at the alarm threshold less ``ENV_WAIT_MARGIN_S``) would
+#: not call it wedged -- PP0 keeps waiting: the chain lag that held the ack IS the serving work. ``ENV_WAIT_HARD_S``
+#: from the read-ahead bounds a dead stream (frist_hard).
+ENV_WAIT_PROGRESS = "SGLANG_WEG2_TOLD_WAIT_PROGRESS"
+ENV_WAIT_HARD_S = "SGLANG_WEG2_TOLD_WAIT_HARD_S"
+ENV_WAIT_MARGIN_S = "SGLANG_WEG2_TOLD_WAIT_MARGIN_S"
+WAIT_HARD_S_DEFAULT = 60.0
+WAIT_MARGIN_S_DEFAULT = 5.0
+REASON_FRIST_HARD = "frist_hard"
+#: T2 ROOM-DEFER (same boots, weg2-0-3 12:46:20 / weg2-0-10 12:33:29): ``PF TOLD-ACK NO-ROOM loadback_rows=184768
+#: room=162176`` acked 0 and PP0 re-prefilled 185k the store held. The room was short because a RUNNING prefill held
+#: 100k rows ("full token usage: 0.38", one batch later 0.06): a shortage that lasts as long as that request. A follower
+#: whose room would suffice once the rows other requests hold are released keeps its ack back (PP0 reads a missing ack
+#: as lag and waits, WAIT-PROGRESS) and acks the real reach when the room is there. Not enough even then (rows >
+#: room + locked): the ack says 0 as before (B5's anchors below still apply).
+ENV_ROOM_DEFER = "SGLANG_WEG2_TOLD_ROOM_DEFER"
+#: a deferred ack re-reads the room at most this often (seconds)
+ROOM_DEFER_RECHECK_S = 0.05
+_perf = time.perf_counter
 #: item 180: where a follower's re-ask of PP0 went (follower_reask)
 ROUTE_PF = "pf-ack"
 ROUTE_NONE = "none"
@@ -213,6 +238,17 @@ def anchor_acks_on() -> bool:
     """B5 ANCHOR-ACKS (default on): acks carry the resumable anchors below the reach; the floor is the deepest
     depth common to every stage. ``0`` = H64's equal-acks floor alone."""
     return _env_switch(ENV_ANCHOR_ACKS)
+
+
+def wait_progress_on() -> bool:
+    """T2 WAIT-PROGRESS (default on): a late ack is waited for while the box serves (see ENV_WAIT_PROGRESS)."""
+    return _env_switch(ENV_WAIT_PROGRESS)
+
+
+def room_defer_on() -> bool:
+    """T2 ROOM-DEFER (default on): a follower whose load-back room is short only while other requests hold rows
+    defers its ack instead of acking 0 (see ENV_ROOM_DEFER)."""
+    return _env_switch(ENV_ROOM_DEFER)
 
 
 def min_passes(pp_size: int) -> int:
@@ -419,6 +455,10 @@ class _Open:
     frist_held: bool = False
     #: B5 ANCHOR-ACKS: per follower rank, the anchor depths below its ack
     anchors: Dict[int, Tuple[int, ...]] = field(default_factory=dict)
+    #: T2 WAIT-PROGRESS: PP0's clock at the read-ahead, the moment the wait began (None = never waited), its passes
+    published_at: float = 0.0
+    waited_since: Optional[float] = None
+    wait_n: int = 0
 
 
 def _pp0_open_map(scheduler) -> Dict[str, _Open]:
@@ -435,6 +475,7 @@ def pp0_open(scheduler, rid: str, told: int, published_at: float, own_read_s: fl
     _pp0_open_map(scheduler)[str(rid)] = _Open(
         told=int(told), deadline=dl,
         published_pass=-1 if published_pass is None else int(published_pass),
+        published_at=float(published_at),
     )
     return dl - float(published_at)
 
@@ -652,6 +693,63 @@ def _frist_due(scheduler, rid: str, o: _Open, now: float, pass_n: Optional[int])
     return False
 
 
+def _wait_hard_s() -> float:
+    return _env_float(ENV_WAIT_HARD_S, WAIT_HARD_S_DEFAULT)
+
+
+def box_serving(scheduler) -> Tuple[bool, str]:
+    """T2 WAIT-PROGRESS: True = the #699 admission-wedge detector, asked at its alarm threshold less
+    ``ENV_WAIT_MARGIN_S``, would NOT call this box wedged -- something serves (a decode round runs) or progressed
+    lately (a first token, a retired prefill chunk). It is the verdict the wedge guard itself uses, on the clocks it
+    reads (``last_first_token_progress_time`` / ``last_prefill_progress_time``), not a second rule. PP0-local; no clock
+    or no queue to read = (False, ...): the Frist stands, as before."""
+    try:
+        # the scheduler imports the module at its top (scheduler.py); a process that did not has no wedge guard to
+        # ask -- and must not pay the first import (torch & co.) inside PP0's pass
+        _ic = sys.modules.get("sglang.srt.managers.scheduler_components.invariant_checker")
+        if _ic is None:
+            return False, "invariant_checker not loaded"
+        queued = len(scheduler.waiting_queue)
+        running = len(scheduler.running_batch.reqs)
+        first = float(scheduler.last_first_token_progress_time)
+        threshold = max(1.0, float(_ic._wedge_alarm_threshold()) - _env_float(ENV_WAIT_MARGIN_S, WAIT_MARGIN_S_DEFAULT))
+        now = _perf()
+        prefill_stamp = getattr(scheduler, "last_prefill_progress_time", None)
+        since_prefill = None if prefill_stamp is None else now - float(prefill_stamp)
+        alarm, detail = _ic.admission_wedge_verdict(
+            queued, running, now - first, threshold=threshold, seconds_since_prefill_progress=since_prefill,
+        )
+    except Exception as exc:  # noqa: BLE001 - no clock to read: no proof of progress
+        return False, f"no progress clock: {exc!r}"
+    return (not alarm), detail
+
+
+def _frist_verdict(scheduler, rid: str, o: _Open, now: float, pass_n: Optional[int]) -> Optional[Tuple[int, str]]:
+    """The acks are not all in. ``None`` = keep waiting (the Frist is not due, or T2 WAIT-PROGRESS: it is due but the
+    box is serving -- the late ack is chain lag, and the lag IS the serving work); else ``(0, reason)``."""
+    if not _frist_due(scheduler, rid, o, now, pass_n):
+        return None
+    if not wait_progress_on():
+        return 0, REASON_FRIST
+    serving, detail = box_serving(scheduler)
+    if not serving:
+        return 0, REASON_FRIST
+    if now - o.published_at >= _wait_hard_s():
+        return 0, REASON_FRIST_HARD
+    if o.waited_since is None:
+        o.waited_since = float(now)
+    o.wait_n += 1
+    if o.wait_n == 1:
+        n = _bump(scheduler, "_pf_wait_n")
+        if _say(n):
+            logger.info(
+                "PF TOLD-WAIT rid=%s told=%d after=%.2fs acks=%s (n=%d): the Frist is up but the box is serving "
+                "(%s) -- a missing ack is chain lag, PP0 keeps the rid and waits for it instead of told=0",
+                rid, o.told, now - o.published_at, dict(o.acks), n, detail[:160],
+            )
+    return None
+
+
 def pp0_decide(scheduler, rid: str, now: float, pass_n: Optional[int] = None) -> Optional[Tuple[int, str]]:
     """``None`` = keep waiting; else ``(told to admit, reason)``. ``pass_n`` =
     PP0's current pass number (H64 FRIST-PASSES; None = the wall Frist alone).
@@ -669,15 +767,11 @@ def pp0_decide(scheduler, rid: str, now: float, pass_n: Optional[int] = None) ->
             return 0, REASON_MISMATCH
         if complete:
             return m, REASON_FLOOR
-        # a floor is still possible: wait for the missing acks (bounded by the Frist)
-        if _frist_due(scheduler, rid, o, now, pass_n):
-            return 0, REASON_FRIST
-        return None
+        # a floor is still possible: wait for the missing acks (bounded by the Frist, T2: by progress)
+        return _frist_verdict(scheduler, rid, o, now, pass_n)
     if complete:
         return o.told, REASON_ACKS
-    if _frist_due(scheduler, rid, o, now, pass_n):
-        return 0, REASON_FRIST
-    return None
+    return _frist_verdict(scheduler, rid, o, now, pass_n)
 
 
 def pp0_note_verdict(scheduler, rid: str, told: int, told_final: int, reason: str, now: float, published_at: float) -> None:
@@ -687,6 +781,16 @@ def pp0_note_verdict(scheduler, rid: str, told: int, told_final: int, reason: st
         # item 220: PP0 admitted at told; until it seats the rid, a follower's
         # late re-ask can still switch it to told=0 (pp0_retract_due)
         _admitted_map(scheduler)[str(rid)] = int(told_final)
+    if o is not None and o.waited_since is not None:
+        # T2 WAIT-PROGRESS: the proof marker -- what used to be told=0 reason=frist ended with a verdict that keeps the
+        # prefix (``kept`` > 0) or, named, still fell back
+        n_w = _bump(scheduler, "_pf_waited_n")
+        if n_w <= 32 or n_w % _LOG_EVERY == 0:
+            logger.info(
+                "PF TOLD-WAITED rid=%s told=%d -> %d reason=%s waited=%.2fs polls=%d acks=%s (n=%d): the verdict "
+                "came after the Frist while the box served", rid, told, int(told_final), reason,
+                now - o.waited_since, o.wait_n, acks, n_w,
+            )
     if reason == REASON_ACKS:
         n = _bump(scheduler, "_pf_admit_acks_n")
         if _say(n):
@@ -777,6 +881,8 @@ class _FState:
     registered: Dict[str, Any] = field(default_factory=dict)  # rid -> req
     outbox: List[Tuple[Any, ...]] = field(default_factory=list)
     seq: int = 0
+    #: T2 ROOM-DEFER: rid -> (first deferred at, next re-check at), perf clock
+    deferred: Dict[str, Tuple[float, float]] = field(default_factory=dict)
 
 
 def _fstate(scheduler, create: bool = False) -> Optional[_FState]:
@@ -829,6 +935,9 @@ def follower_forget(scheduler, rid: str) -> None:
     rid = str(rid)
     st.expect.pop(rid, None)
     st.registered.pop(rid, None)
+    st.deferred.pop(rid, None)
+    _room_defer_map(scheduler).pop(rid, None)
+    (getattr(scheduler, "_weg2_fb_room_defer_seen", None) or set()).discard(rid)
     if st.outbox:
         st.outbox = [e for e in st.outbox if e[0] != rid]
 
@@ -1013,7 +1122,28 @@ def _ack_evictable(tree) -> int:
         return reported
 
 
-def _room_own(scheduler, req, rid: str, own: int) -> int:
+def _room_defer_map(scheduler) -> Dict[str, Tuple[int, int, int]]:
+    d = getattr(scheduler, "_weg2_fb_room_defer", None)
+    if d is None:
+        d = scheduler._weg2_fb_room_defer = {}
+    return d
+
+
+def room_deferred(scheduler, rid: str) -> Optional[Tuple[int, int, int]]:
+    """T2 ROOM-DEFER: ``(rows, room, locked)`` when the LAST ``_room_own`` of ``rid`` found the room short only for as
+    long as other requests hold rows (``room + locked >= rows``); else None. Read once per ack formation."""
+    return _room_defer_map(scheduler).pop(str(rid), None)
+
+
+def _locked_rows(scheduler, available: int, evictable: int) -> int:
+    """Rows other requests hold on this stage's device pool: ``max_total_num_tokens - (available + evictable)`` --
+    the very ``num_used`` the scheduler's ``full token usage`` line prints (h16p: 0.38 = 99.6k rows at the NO-ROOM
+    ack, 0.06 one batch later). They return to the pool when those requests finish. 0 = not readable."""
+    total = int(getattr(scheduler, "max_total_num_tokens", 0) or 0)
+    return max(0, total - int(available) - int(evictable)) if total > 0 else 0
+
+
+def _room_own(scheduler, req, rid: str, own: int, mark: bool = True) -> int:
     """ACK-ROOM (dual1k dkr27bnvfp4dual1kbar1fs10010950, PP1 09:55:20Z, rid
     weg2-0-10, a fork twin): the follower's read reproduced told=16383 and its
     tree could resume there (host KV + anchor), but the head was HOST-only on
@@ -1023,18 +1153,47 @@ def _room_own(scheduler, req, rid: str, own: int) -> int:
     so #968 followed at once. The ack names 0 when this rank cannot hold the
     told's load-back even with every evictable row freed: PP0 answers told=0
     for EVERY rank (a rank-agreed re-prefill, chunked from 0) instead of a
-    group death. Read-only (nothing evicted here); no probe = no verdict."""
+    group death. Read-only (nothing evicted here); no probe = no verdict.
+
+    T2 ROOM-DEFER (NF h16p 226aad7105, PP1/PP2 weg2-0-3 12:46:20 ``loadback_rows=184768 room=162176``, weg2-0-10
+    12:33:29 ``188928 / 129472``): the 0 re-prefilled what the store held on EVERY stage -- for a shortage that was a
+    RUNNING request's rows (usage 0.38, then 0.06 one batch later). When room + the rows others hold would suffice,
+    the shortage is transient: the call still returns 0 (nothing may be loaded back NOW), but with ``mark`` it
+    records ``(rows, room, locked)`` for ``room_deferred`` -- the ack is then held back instead of sent as 0."""
+    if mark:
+        _room_defer_map(scheduler).pop(str(rid), None)
     rows = _loadback_rows(scheduler, req, own)
     if not rows:
         return own
     try:
         tree = scheduler.tree_cache
         alloc = getattr(tree, "token_to_kv_pool_allocator", None)
-        room = int(alloc.available_size()) + _ack_evictable(tree)
+        available = int(alloc.available_size())
+        reported = int(tree.evictable_size())
+        room = available + _ack_evictable(tree)
     except Exception:  # noqa: BLE001 - no allocator readable: no verdict
         return own
     if room >= int(rows):
         return own
+    locked = _locked_rows(scheduler, available, reported)
+    transient = bool(room_defer_on() and room + locked >= int(rows))
+    if mark and transient:
+        _room_defer_map(scheduler)[str(rid)] = (int(rows), int(room), int(locked))
+        seen = getattr(scheduler, "_weg2_fb_room_defer_seen", None)
+        if seen is None:
+            seen = scheduler._weg2_fb_room_defer_seen = set()
+        if str(rid) in seen:
+            return 0  # named on the first formation; a re-check every pass would only repeat it
+        seen.add(str(rid))
+        n = _bump(scheduler, "_pf_ack_room_defer_n")
+        if _say(n):
+            logger.warning(
+                "PF TOLD-ACK ROOM-DEFER rank pp=%s rid=%s told=%d loadback_rows=%d room=%d locked=%d (n=%d): the "
+                "load-back does not fit while other requests hold %d rows but fits once they are released -- the "
+                "ack is held back (PP0 waits for it, it does not answer told=0) and goes out when the room is there",
+                getattr(scheduler.ps, "pp_rank", "?"), str(rid), own, int(rows), room, locked, n, locked,
+            )
+        return 0
     n = _bump(scheduler, "_pf_ack_no_room_n")
     if n <= 32 or n % _LOG_EVERY == 0:
         logger.warning(
@@ -1104,7 +1263,7 @@ def ack_anchors(scheduler, req, rid: str, own: int, told: int) -> List[int]:
     for d in depths:
         if int(own) > 0 and d == int(own):
             continue
-        if _room_own(scheduler, req, rid, d) != d:
+        if _room_own(scheduler, req, rid, d, mark=False) != d:
             continue  # this depth's load-back does not fit: not a depth this rank proves
         out.append(int(d))
         if len(out) >= ANCHOR_ACKS_MAX:
@@ -1147,9 +1306,31 @@ def follower_pump(scheduler) -> None:
 
             if not _st.follower_early_settle_now(scheduler, st.registered[rid], rid, told):
                 continue  # short: the told-limited read acks when it ends
-        req = st.registered.pop(rid)
-        st.expect.pop(rid, None)
+        req = st.registered[rid]
+        # T2 ROOM-DEFER: a deferred rid re-reads its room at most every ROOM_DEFER_RECHECK_S
+        _held = st.deferred.get(rid)
+        if _held is not None and _perf() < _held[1]:
+            continue
         own = own_prefix(scheduler, req, rid, told)
+        _dfr = room_deferred(scheduler, rid) if room_defer_on() else None
+        if _dfr is not None:
+            # the room is short only while other requests hold rows: no ack yet -- PP0 reads the missing ack as lag
+            # and waits (WAIT-PROGRESS); the real reach goes out when the room is there. The read stays registered.
+            _now = _perf()
+            st.deferred[rid] = (_held[0] if _held is not None else _now, _now + ROOM_DEFER_RECHECK_S)
+            continue
+        if _held is not None:
+            n_r = _bump(scheduler, "_pf_ack_room_deferred_released_n")
+            if _say(n_r):
+                logger.info(
+                    "PF TOLD-ACK ROOM-DEFER RELEASED rank pp=%s rid=%s told=%d own=%d after=%.2fs (n=%d): the "
+                    "room is there, the ack goes out with the real reach", getattr(scheduler.ps, "pp_rank", "?"),
+                    rid, told, int(own), _perf() - _held[0], n_r,
+                )
+        st.deferred.pop(rid, None)
+        (getattr(scheduler, "_weg2_fb_room_defer_seen", None) or set()).discard(rid)
+        st.registered.pop(rid, None)
+        st.expect.pop(rid, None)
         if anchor_acks_on():
             st.outbox.append((rid, own, tuple(ack_anchors(scheduler, req, rid, own, told))))
         else:

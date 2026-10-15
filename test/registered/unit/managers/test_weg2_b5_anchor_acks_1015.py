@@ -180,10 +180,34 @@ def test_ack_anchors_respect_told_own_and_the_room(monkeypatch):
     from sglang.srt.managers import weg2_store_told as st
 
     monkeypatch.setattr(st, "_probe_key", lambda *a, **k: (None, False))
-    monkeypatch.setattr(fb, "_room_own", lambda sched, req, rid, d: d)
+    monkeypatch.setattr(fb, "_room_own", lambda sched, req, rid, d, **kw: d)
     assert fb.ack_anchors(sched, req, "r", 107584, 117184) == [67584, 32768]
-    monkeypatch.setattr(fb, "_room_own", lambda sched, req, rid, d: d if d <= 40000 else 0)
+    monkeypatch.setattr(fb, "_room_own", lambda sched, req, rid, d, **kw: d if d <= 40000 else 0)
     assert fb.ack_anchors(sched, req, "r", 107584, 117184) == [32768]
+
+
+def test_ack_anchors_room_probes_never_mark_a_room_defer(monkeypatch):
+    """T2 ROOM-DEFER: only the own depth's room shortage may hold an ack back; a short ANCHOR is just not a depth
+    this rank proves (B5), so its probe must run with mark=False."""
+    root = _Node(0, None, True)
+    a = _Node(32768, root, True)
+    c = _Node(40000, a, True)
+    tree = types.SimpleNamespace(_components_tuple=(_Comp(),), root_node=root, cache_controller=object(),
+                                 match_prefix=lambda params: types.SimpleNamespace(best_match_node=c))
+    sched = types.SimpleNamespace(tree_cache=tree, ps=types.SimpleNamespace(pp_rank=1))
+    req = types.SimpleNamespace(rid="r", full_untruncated_fill_ids=list(range(120000)), extra_key=None)
+    from sglang.srt.managers import weg2_store_told as st
+
+    monkeypatch.setattr(st, "_probe_key", lambda *a, **k: (None, False))
+    marks = []
+
+    def spy(sched_, req_, rid_, d, mark=True):
+        marks.append(mark)
+        return d
+
+    monkeypatch.setattr(fb, "_room_own", spy)
+    assert fb.ack_anchors(sched, req, "r", 107584, 117184)
+    assert marks and not any(marks)
 
 
 def test_follower_pump_sends_the_long_entry(monkeypatch):
