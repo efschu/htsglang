@@ -1672,6 +1672,15 @@ class Envs:
     # the extend shrinks, an INLINE walk of 500 ms is back on the critical
     # path. The census is a leak instrument: switch it on by name when hunting.
     SGLANG_WEG2_SLEEP_HEAP_CENSUS = EnvInt(Weg2HeapCensus.OFF)
+    # MEMRANK-1015: one WEG2-MEM-RANK line per process (P PP0-2, D TP0-2, front,
+    # tokenizer manager, detokenizer) every SGLANG_WEG2_MEM_RANK_S seconds: RSS /
+    # RssAnon / RssShmem / VmLck / VmSwap, Python blocks vs glibc in-use/free,
+    # pinned host bytes, the sizes of the long-lived per-request tables
+    # (weg2/mem_rank.py). Local (/proc + len()), no collective, never raises.
+    # Default ON; 0 = off. Host MemAvailable 1.6-2.3 GiB at NF: the growth of
+    # anon (~4 GiB in 2.5 h) had no per-process series before this line.
+    SGLANG_WEG2_MEM_RANK = EnvBool(True)
+    SGLANG_WEG2_MEM_RANK_S = EnvFloat(60.0)
     # MAMBA_ARENA_RID_ANCHORS (H19, fnFL2x130): arena mamba anchors one
     # request may hold per rank; its next, deeper anchor displaces its
     # shallowest one, and a node the full arena refuses releases one more

@@ -390,6 +390,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Init request dispatcher
         self.init_request_dispatcher()
 
+        # MEMRANK-1015: this process's memory line (local reads only, never raises)
+        from sglang.srt.weg2 import mem_rank
+
+        mem_rank.start("tokenizer", group=os.environ.get("SGLANG_WEG2_GROUP", ""), kind="tokenizer", owner=self)
+
     def init_model_config(self):
         server_args = self.server_args
         model_config_class = getattr(self, "model_config_class", ModelConfig)

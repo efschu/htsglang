@@ -2571,6 +2571,24 @@ class Scheduler(
             if int(getattr(self.ps, "pp_size", 1) or 1) > 1
             else int(getattr(self.ps, "attn_tp_rank", -1) or 0),
         )
+        # MEMRANK-1015: the per-process memory line (RSS/anon/shmem/pinned, glibc
+        # in-use vs free, the per-request tables). A daemon thread, local reads
+        # only -- no collective, no state written, nothing decided from it.
+        from sglang.srt.weg2 import mem_rank
+
+        _pp = int(getattr(self.ps, "pp_size", 1) or 1) > 1
+        _mr = (
+            int(getattr(self.ps, "pp_rank", -1) or 0)
+            if _pp
+            else int(getattr(self.ps, "attn_tp_rank", -1) or 0)
+        )
+        mem_rank.start(
+            ("PP" if _pp else "TP") + str(_mr),
+            group=os.environ.get("SGLANG_WEG2_GROUP", ""),
+            rank=_mr,
+            kind="scheduler",
+            owner=self,
+        )
         # #1262 (2): set by `_idle_census_control_hold` when a control message
         # was already queued at the moment `on_idle` wanted to run its pool
         # census, cleared by `process_input_requests` -- the one function every

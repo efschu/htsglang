@@ -528,6 +528,10 @@ def run_detokenizer_process(
     manager = None
     try:
         manager = detokenizer_manager_class(server_args, port_args)
+        # MEMRANK-1015: this process's memory line (local reads only, never raises)
+        from sglang.srt.weg2 import mem_rank
+
+        mem_rank.start("detokenizer", group=os.environ.get("SGLANG_WEG2_GROUP", ""), kind="detokenizer", owner=manager)
         if server_args.tokenizer_worker_num == 1:
             manager.event_loop()
         else:

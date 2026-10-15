@@ -18193,6 +18193,10 @@ def main():
                   d_park_immediate=args.d_park_immediate == "on",
                   x_mode=args.x_mode, x_curves=args.x_curves,
                   x_curves_beyond=args.x_curves_beyond)
+    # MEMRANK-1015: the front's own memory line (local /proc reads + len() of its tables, no RPC)
+    from sglang.srt.weg2 import mem_rank
+
+    mem_rank.start("front", group="F", rank=0, kind="front", owner=front, log=logger.info)
     front.d_residue_context_tokens = int(getattr(args, "d_residue_context_tokens", 0) or 0)
     # #1269 fix 3: the pre-boot anon baseline the watermark's currency is split
     # against. Kept from weg2/idle-anon-0908.
