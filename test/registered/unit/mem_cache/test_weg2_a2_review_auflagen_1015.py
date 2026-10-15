@@ -77,3 +77,75 @@ def test_a_pool_without_the_settle_is_named(tmp_path, caplog):
     caplog.set_level("ERROR")
     t._a2_settle_lost(types.SimpleNamespace(id=7), types.SimpleNamespace(), None, torch.tensor([S]))
     assert "A2 LOST-ROWS SETTLE UNREACHABLE" in caplog.text
+
+
+# ------------------------------------------------------------------ B-B ---------------------------------
+
+
+def _stage(tmp_path, ext):
+    a = _arena(tmp_path, 4)
+    mp = _pool(a, extents=(ext,))
+    mp._arena_page_tokens = 1
+    mp.arena_tokens = a.slots
+    return a, mp
+
+
+def _tree():
+    from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+    t = object.__new__(UnifiedRadixCache)
+    lru = types.SimpleNamespace(in_list=lambda n: False, remove_node=lambda n: None)
+    t.host_lru_lists = {ComponentType.MAMBA: lru}
+    return t
+
+
+def _anchor_node(mhv):
+    from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType
+
+    cd = types.SimpleNamespace(host_value=mhv)
+    return types.SimpleNamespace(id=1, component_data={ComponentType.MAMBA: cd}), cd
+
+
+def _two_stage_anchor(tmp_path):
+    """Two PP stages host-write their layer extents of ONE mamba anchor slot."""
+    arena_a, mp_a = _stage(tmp_path, (0, HALF))
+    arena_b, mp_b = _stage(tmp_path, (HALF, HALF))
+    (slot, st, gen), = arena_a.claim_slots(["m"], [TOTAL], role=ha.ROLE_HOST_WRITE)
+    (slot_b, st_b, gen_b), = arena_b.claim_slots(["m"], [TOTAL], role=ha.ROLE_HOST_WRITE)
+    assert (slot_b, gen_b) == (slot, gen) and st == 0 and st_b == 1
+    for mp in (mp_a, mp_b):
+        mp._pending_mask[slot] = True
+        mp._pending_gen[slot] = gen
+    return arena_a, mp_a, mp_b, slot, gen
+
+
+def test_mixed_stage_acks_decide_the_anchor_alike(tmp_path):
+    """Stage A acks before the take-over (status 0, reference), stage B after (status 6, none):
+    both keep the anchor -- A's reference pins the slot, it cannot be recycled."""
+    arena_a, mp_a, mp_b, slot, gen = _two_stage_anchor(tmp_path)
+    mhv_a, mhv_b = torch.tensor([S + slot]), torch.tensor([S + slot])
+    mp_a.complete_write(mhv_a)                                      # A: 0, reference taken
+    assert _arena(tmp_path, 4).quarantine_host_write([slot], [gen]) == [1]
+    node_a, cd_a = _anchor_node(mhv_a)
+    lost_a = _tree()._a2_mamba_lost(node_a, mp_a, mhv_a)
+    mp_b.complete_write(mhv_b)                                      # B: 6, no reference
+    node_b, cd_b = _anchor_node(mhv_b)
+    lost_b = _tree()._a2_mamba_lost(node_b, mp_b, mhv_b)
+    assert arena_a.slot_refs([slot]) == [1], "A's reference pins the slot"
+    assert (lost_a, lost_b) == (False, False), f"asymmetric: A kept={not lost_a}, B kept={not lost_b}"
+    assert cd_a.host_value is not None and cd_b.host_value is not None
+
+
+def test_every_stage_late_tombstones_the_anchor_alike(tmp_path):
+    """Both stages ack after the take-over (both 6, no reference anywhere): both tombstone."""
+    arena_a, mp_a, mp_b, slot, gen = _two_stage_anchor(tmp_path)
+    assert _arena(tmp_path, 4).quarantine_host_write([slot], [gen]) == [1]
+    out = []
+    for mp in (mp_a, mp_b):
+        mhv = torch.tensor([S + slot])
+        mp.complete_write(mhv)
+        node, cd = _anchor_node(mhv)
+        out.append((_tree()._a2_mamba_lost(node, mp, mhv), cd.host_value is None))
+    assert arena_a.slot_refs([slot]) == [0]
+    assert out == [(True, True), (True, True)], out

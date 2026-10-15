@@ -6090,6 +6090,29 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         rows = mhv.reshape(-1)
         if not any((int(r) - S) in lost for r in rows.tolist()):
             return False
+        # A2 B-B (nf-chainkey-a2-review-1015, raenge-nie-uneins): ONE P anchor
+        # slot carries every PP stage's layer extents; after a take-over the
+        # stages that acked before it got 0 (a reference), the later ones 6.
+        # Deciding by the LOCAL ack status tombstoned on the late stages only
+        # -- the P trees disagreed on the anchor. Decide by the SHARED slot
+        # state instead: a lost slot that still carries a reference cannot be
+        # recycled, every stage keeps the anchor (as before A2); only a slot
+        # nobody references (every stage late) is tombstoned -- on every
+        # stage alike, since every stage then got 6.
+        lost_slots = sorted({int(r) - S for r in rows.tolist() if (int(r) - S) in lost})
+        try:
+            refs = list(mp.arena.slot_refs(lost_slots))
+        except Exception:  # noqa: BLE001 -- no shared refcount readable: keep the old rule
+            refs = [0] * len(lost_slots)
+        if any(int(c) > 0 for c in refs):
+            n = getattr(UnifiedRadixCache, "_a2_mamba_kept_n", 0) + 1
+            UnifiedRadixCache._a2_mamba_kept_n = n
+            if n <= 16 or (n & (n - 1)) == 0:
+                logger.warning("A2 LOST-ANCHOR KEPT node=%s slots=%s refs=%s n=%d -- this stage's anchor "
+                               "write was late, but another writer's reference pins the slot: kept like "
+                               "every stage (shared state, not the local ack)", getattr(node, "id", "?"),
+                               lost_slots, refs, n)
+            return False
         keep = self._a2_rows_not_lost(mp, rows, lost)
         if keep.numel():
             mp.free(keep)
