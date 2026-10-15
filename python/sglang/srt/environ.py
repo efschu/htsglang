@@ -1681,6 +1681,11 @@ class Envs:
     # anon (~4 GiB in 2.5 h) had no per-process series before this line.
     SGLANG_WEG2_MEM_RANK = EnvBool(True)
     SGLANG_WEG2_MEM_RANK_S = EnvFloat(60.0)
+    # MEMRANK-1015: the bounded idle malloc_trim of IdleCensus (>= 8 MiB of anon
+    # growth over the lowest reading since the last trim, at most once per
+    # census period, only while the group is idle). It was dead code (trimmed=0
+    # in 378 lines of boot ...042125). Default ON; 0 = off.
+    SGLANG_WEG2_IDLE_TRIM = EnvBool(True)
     # MAMBA_ARENA_RID_ANCHORS (H19, fnFL2x130): arena mamba anchors one
     # request may hold per rank; its next, deeper anchor displaces its
     # shallowest one, and a node the full arena refuses releases one more

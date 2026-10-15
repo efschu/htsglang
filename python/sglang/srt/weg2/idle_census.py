@@ -57,6 +57,16 @@ def _read_status() -> dict:
     return out
 
 
+def _trim_enabled() -> bool:
+    """``SGLANG_WEG2_IDLE_TRIM`` (default ON): the bounded idle malloc_trim."""
+    try:
+        from sglang.srt.environ import envs
+
+        return bool(envs.SGLANG_WEG2_IDLE_TRIM.get())
+    except Exception:  # noqa: BLE001 - an instrument may never break the loop
+        return os.environ.get("SGLANG_WEG2_IDLE_TRIM", "1").strip().lower() not in ("0", "false", "off", "no")
+
+
 def _malloc_trim() -> Optional[bool]:
     """glibc malloc_trim(0). None when the symbol is unavailable (musl, etc.)."""
     try:
@@ -101,6 +111,11 @@ class IdleCensus:
         if self._last_t is None:
             self._last_t, self._last_rounds = now, self.rounds
             self._last_anon_kib = _read_status().get("RssAnon")
+            # MEMRANK-1015: seed the trim baseline (see below); keep the lower one
+            if self._last_anon_kib is not None and (
+                self._anon_at_trim is None or self._last_anon_kib < self._anon_at_trim
+            ):
+                self._anon_at_trim = self._last_anon_kib
             return None
         elapsed = now - self._last_t
         if elapsed < self.period_s:
@@ -115,9 +130,17 @@ class IdleCensus:
             d_per_min = (anon_kib - self._last_anon_kib) / 1024.0 / (elapsed / 60.0)
 
         # #1269: trim only when this rank actually grew since the last trim.
+        # MEMRANK-1015: the baseline is the LOWEST anon seen since the last
+        # trim (a sleep's own malloc_trim lowers it too). The pre-fix form
+        # compared against ``_anon_at_trim`` that stayed None until a trim had
+        # run -- base == the current reading, growth always 0, the trim could
+        # never fire: ``trimmed=0`` in all 378 idle lines of boot ...042125
+        # while the P ranks grew +0.8 / +1.8 / +0.9 MiB/min at idle and every
+        # sleep's trim handed 100-250 MiB back.
         if anon_kib is not None:
-            base = self._anon_at_trim if self._anon_at_trim is not None else anon_kib
-            if (anon_kib - base) / 1024.0 >= WEG2_TRIM_MIN_GROWTH_MIB:
+            if self._anon_at_trim is None or anon_kib < self._anon_at_trim:
+                self._anon_at_trim = anon_kib
+            if (anon_kib - self._anon_at_trim) / 1024.0 >= WEG2_TRIM_MIN_GROWTH_MIB and _trim_enabled():
                 if _malloc_trim():
                     self._trimmed += 1
                 self._anon_at_trim = _read_status().get("RssAnon", anon_kib)
