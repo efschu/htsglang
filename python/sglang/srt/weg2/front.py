@@ -1203,6 +1203,24 @@ def x_requeue_capped(x_requeues: int) -> bool:
     return int(x_requeues) > X_REQUEUE_CAP
 
 
+#: MEMRANK-1015: entries of the front's per-rid X-requeue table. The table had one
+#: increment site and no retire site: one entry per refused rid for the life of the
+#: front. Oldest inserted rid out first, like ``_x_exact_rid`` (4096).
+X_REQUEUES_SLOTS = 4096
+
+
+def bump_x_requeues(table: dict, rid: str, slots: int = X_REQUEUES_SLOTS) -> int:
+    """Count one more X-requeue of ``rid`` in ``table`` (bounded) and return the count.
+
+    The count of a rid is read back only within its own lifetime (a handful of
+    passes, ``X_REQUEUE_CAP``); a rid 4096 newer rids behind is long served."""
+    n = table.get(rid, 0) + 1
+    table[rid] = n
+    while len(table) > slots:
+        table.pop(next(iter(table)))
+    return n
+
+
 def leg1_early_candidates(queue, limit: int) -> list:
     """The queue head the P drain would dispatch first (at most ``limit``):
     a leg 1 to run (not CARRIER-EXCEEDS, not D-direct), its client still
@@ -13990,8 +14008,7 @@ class Front:
         The counter is per rid and has exactly ONE increment site, here, so
         the "never a third pass" bound cannot be widened by a second writer.
         """
-        n = self._x_requeues.get(rid, 0) + 1
-        self._x_requeues[rid] = n
+        n = bump_x_requeues(self._x_requeues, rid)
         if pending is not None:
             pending.x_requeues = n
         self.counters["W50_Weg2TpPrefillExceeded"] += 1
