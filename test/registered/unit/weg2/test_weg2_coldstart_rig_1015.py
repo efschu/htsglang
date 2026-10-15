@@ -1408,6 +1408,717 @@ def test_S6_lbv_burst_late_twin_carrierless(carrierless):
 
 
 # =====================================================================================================================
+# S7 -- PF Frist against the pass cadence (h16n 17c2563647, h64: "PF TOLD-FALLBACK ... reason=frist" on held reads)
+# =====================================================================================================================
+# The PF group fallback (told := 0 when a follower's read is late) counted WALL time while the acks it waits for travel
+# in PASSES: a follower acks in its pass, one chain hop per stage, and the gloo ack takes two PP0 harvests (size frame,
+# then the payload receive PP0 posts only on seeing the size). With 3-7 s passes (a 16k-chunk prefill on PP0) the
+# Frist ran out with every stage holding the SAME depth -- 130432 tokens recomputed although the store held them.
+#   case A (weg2-6-44) a follower's early read said 93440 (read at intake, before the twin sibling was published), the
+#          told-limited settle found the span LOCALLY (96640) and issued no read, but answered "short": its ack waited
+#          for a read that never came, i.e. for the next follower pass -- one chain hop behind PP0's Frist.
+#   case B (weg2-8-47) all three stages read 33792 alike; the 9.9 s Frist expired after three PP0 passes with
+#          acks={1: 33792}, PP2's ack still on the wire; PP0 had no paced rid left and stopped harvesting.
+# Law G7 HELD-PREFIX: every stage proved the same depth (read = told) -> the admission depth of EVERY rank is told
+# (never the group fallback 0, never a depth the stages do not share: G1). PP0 decides, the followers follow the wire.
+# The Ring (a PP3 ring double: pass k plans PP0's pass k - pp_rank, PP0 publishes at the top of its pass, the
+# followers absorb one pass per hop later) and the two-step gloo stream are the ones of the h64 tests, carried here so
+# the copy runs in trees that do not have them. Every H64 switch is looked up by NAME and never set: the tree's own
+# defaults decide (on 17c2563647 there are none -> the h16n behaviour -> red by behaviour).
+
+_PF_PAGE = 64
+
+
+class _PfClock:
+    def __init__(self):
+        self.t = 0.0
+
+    def __call__(self):
+        return self.t
+
+
+class _PfLedgerTree:
+    """Store reads that terminate at a wall-clock time, with the row ledger of the in-flight reads."""
+
+    def __init__(self, clock):
+        self.clock = clock
+        self.ongoing = {}
+        self.completed = self._prefetch_completed_tokens = {}
+        self.loaded = {}
+        self.op_refs = 0
+        self.released = []
+        self.is_eagle = False
+
+    def start_read(self, rid, tokens, duration):
+        rows = -(-int(tokens) // _PF_PAGE)
+        self.ongoing[rid] = (self.clock() + duration, int(tokens), rows)
+        self.op_refs += rows
+
+    def check_prefetch_progress(self, rid):
+        op = self.ongoing.get(rid)
+        if op is None:
+            return True
+        done_at, tokens, rows = op
+        if self.clock() < done_at:
+            return False
+        del self.ongoing[rid]
+        self.op_refs -= rows
+        self.completed[rid] = tokens
+        self.loaded[rid] = tokens
+        return True
+
+    def completed_prefetch_tokens(self, rid):
+        return self.completed.get(rid)
+
+    @property
+    def prefetch_loaded_tokens_by_reqid(self):
+        return self.loaded
+
+    def pop_prefetch_loaded_tokens(self, rid):
+        return self.loaded.pop(rid, 0)
+
+    def release_aborted_request(self, rid):
+        self.released.append(rid)
+        self.loaded.pop(rid, None)
+        self.completed.pop(rid, None)
+        op = self.ongoing.pop(rid, None)
+        if op is not None:
+            self.op_refs -= op[2]
+
+    def prefetch_progress_is_collective_free(self):
+        return True
+
+
+class _PfStage:
+    def __init__(self, pp_rank, clock, prompts, read_s):
+        self.ps = SimpleNamespace(pp_rank=pp_rank, pp_size=3, tp_size=1)
+        self.enable_hicache_storage = True
+        self.pp_flip_counters = None
+        self.tree_cache = _PfLedgerTree(clock)
+        self.waiting_queue = []
+        self.prompts = prompts
+        self.read_s = read_s
+        self.admitted = []      # (planned PP0 pass, rid, told cap, credit)
+
+    def _prefetch_kvcache(self, req, rematch=True, limit_tokens=None):
+        hit = self.prompts.get(req.rid, 0)
+        if limit_tokens is not None:
+            hit = min(hit, int(limit_tokens))
+        dur = self.read_s.get(req.rid, 0.0)
+        if hit <= 0 or dur is None:
+            return "declined:store_absent"
+        self.tree_cache.start_read(req.rid, hit, dur)
+        return "issued"
+
+
+class _GlooLike:
+    """The gloo ack stream, one step per PP0 harvest per follower: an ack is posted (size on the wire), its size is
+    taken on PP0's next harvest (the payload receive is posted then), its payload on the harvest after; the follower's
+    send stays in flight until PP0 posted that payload receive."""
+
+    def __init__(self):
+        self.q = {1: [], 2: []}
+        self.harvests = 0
+
+
+class _FollowerEnd:
+    def __init__(self, g, rank):
+        self.g, self.rank = g, rank
+
+    def _inflight(self):
+        q = self.g.q[self.rank]
+        return bool(q) and q[-1][1] == 0
+
+    def send_nowait(self, ack):
+        if self._inflight():
+            return False
+        self.g.q[self.rank].append([ack, 0])
+        return True
+
+    def pump(self):
+        return not self._inflight()
+
+
+class _Pp0End:
+    def __init__(self, g):
+        self.g = g
+
+    def harvest(self):
+        self.g.harvests += 1
+        out = []
+        for _r, q in self.g.q.items():
+            if not q:
+                continue
+            if q[0][1] == 0:
+                q[0][1] = 1
+            else:
+                out.append(q.pop(0)[0])
+        return out
+
+
+class _PfRing:
+    def __init__(self, m, monkeypatch, prompts, read_s_by_rank, dt):
+        self.m, self.dt = m, dt
+        self.clock = _PfClock()
+        monkeypatch.setattr(m, "_clock", self.clock)
+        self.stages = [_PfStage(r, self.clock, prompts, read_s_by_rank[r]) for r in range(3)]
+        self.gloo = _GlooLike()
+        self.stages[0]._weg2_fb_channel = _Pp0End(self.gloo)
+        for s in self.stages[1:]:
+            s._weg2_fb_channel = _FollowerEnd(self.gloo, s.ps.pp_rank)
+        for s in self.stages:
+            if not m.armed(s):
+                pytest.skip("n/a: the NF form of this tree does not arm the PF told fallback")
+        self.wire, self.pass_n = {}, 0
+        self.sleeps = {0: 0.0, 1: 0.0, 2: 0.0}
+        self._in = None
+
+        def _sleep(sec):
+            self.sleeps[self._in] += sec
+            self.clock.t += sec
+
+        monkeypatch.setattr(m.time, "sleep", _sleep)
+
+    def arrive(self, rid):
+        for s in self.stages:
+            r = SimpleNamespace(rid=rid, prefetch_deferred=None)
+            s.waiting_queue.append(r)
+            self.m.intake(s, r, lambda gate: None)
+
+    def step(self):
+        m, k = self.m, self.pass_n
+        self.wire[k] = m.pp0_publish(self.stages[0], [])
+        for s in self.stages[1:]:
+            src = k - s.ps.pp_rank
+            if src >= 0:
+                m.follower_absorb(s, list(self.wire.get(src, [])))
+        for s in self.stages:
+            self._in = s.ps.pp_rank
+            for r in list(s.waiting_queue):
+                credit = m.admission(s, r, lambda kind, rid: None)
+                if credit is None:
+                    continue
+                s.waiting_queue.remove(r)
+                s.admitted.append((k - s.ps.pp_rank, r.rid, getattr(r, "_weg2_prefix_cap", None), credit))
+        self.pass_n += 1
+        self.clock.t += self.dt
+
+    def run(self, passes):
+        for _ in range(passes):
+            self.step()
+
+    def plans(self, rid):
+        return [[a[:3] for a in s.admitted if a[1] == rid] for s in self.stages]
+
+    def told(self, rid):
+        """The depth PP0 told the group for ``rid`` (the absolute twin told on the first PF wire object)."""
+        for k in sorted(self.wire):
+            for o in self.wire[k]:
+                if getattr(o, "rid", None) == rid and hasattr(o, "told"):
+                    return int(o.told)
+        return None
+
+
+class Guards5:
+    @staticmethod
+    def held_prefix(ring, rid, held, what):
+        """G7: every stage proved ``held`` tokens of ``rid`` (its read ended at ``held``) -> every rank admits at
+        ``held`` (one plan, all stages -- G1 -- and never the group fallback 0 over a depth they all hold)."""
+        plans = ring.plans(rid)
+        Guards.same_admission(0, [p for p in plans], f"PF told admission of {rid}")
+        if any(len(p) != 1 for p in plans):
+            raise LawViolation("G1 RAENGE-NIE-UNEINS", f"{what}: {rid} not admitted exactly once on every stage in "
+                                                       f"the passes run: {plans}")
+        cap = plans[0][0][2]
+        if cap != held:
+            fb = getattr(ring.stages[0], "_pf_fallback_n", 0)
+            raise LawViolation(
+                "G7 HELD-PREFIX",
+                f"{what}: every stage held {held} tokens of {rid}, the group admitted {cap} on all ranks "
+                f"(PF TOLD-FALLBACK fired {fb}x on PP0, acks it saw: {getattr(ring.stages[0], '_pf_admit_acks_n', 0)}) "
+                f"-- {held - (cap or 0)} cached tokens ignored (CACHE-HIT IGNORIERT), recomputed")
+
+
+def _pf_modules():
+    try:
+        from sglang.srt.managers import weg2_store_told as m
+        from sglang.srt.managers import weg2_told_fallback as fb
+    except ImportError:
+        pytest.skip("n/a: this tree has no PF told fallback")
+    return m, fb
+
+
+def _pf_ring(monkeypatch, prompts, reads, dt):
+    m, fb = _pf_modules()
+    # the form decides what is armed (nf_form fixture); the twin told is absolute on the NF row (TREE_KEY)
+    if not m._absolute_armed():
+        pytest.skip("n/a: the NF form of this tree does not run the absolute twin told")
+    return m, fb, _PfRing(m, monkeypatch, prompts, reads, dt)
+
+
+RID_A, TOLD_A, STALE_A = "weg2-6-44", 96640, 93440
+RID_B, TOLD_B = "weg2-8-47", 33792
+
+
+def s7_case_a(monkeypatch, dt=2.2, passes=12):
+    """weg2-6-44: PP0's absolute twin told 96640 (head == told, window 0 -> the Frist is the 2 s grace); every
+    follower's early read ended at the STALE 93440 (read at intake before the sibling published), its told-limited
+    settle finds the span locally (MATCH-CENSUS-DEEP reached=96640) and issues no read. Passes are DT s long."""
+    reads = {r: {RID_A: 0.1} for r in range(3)}
+    m, fb, ring = _pf_ring(monkeypatch, {RID_A: 0}, reads, dt)
+    pp0 = ring.stages[0]
+
+    def pp0_read(req, rematch=True, limit_tokens=None):
+        req._prefetch_registered_prefix_len = TOLD_A      # TWIN-REGISTER head=96640 verdict=declined:too_short
+        return "declined:too_short"
+
+    pp0._prefetch_kvcache = pp0_read
+    for s in ring.stages[1:]:
+        def fol_read(req, rematch=True, limit_tokens=None, tree=s.tree_cache):
+            if limit_tokens is None:                        # the early read at intake: stale 93440, done at once
+                tree.start_read(req.rid, STALE_A, 0.0)
+                return "issued"
+            return "declined:too_short"                     # #915 PREFETCH REFUSED reason=too_short need=0
+
+        s._prefetch_kvcache = fol_read
+    ring.arrive(RID_A)
+    for s in ring.stages[1:]:
+        for r in s.waiting_queue:
+            r.host_hit_length = TOLD_A
+    ring.run(passes)
+    return ring
+
+
+def s7_case_b(monkeypatch, dt=3.3, passes=10, grace="5.5"):
+    """weg2-8-47: all three stages read 33792 alike (0.1 s), passes are DT s (a 16k chunk of someone else's
+    recompute on PP0), the grace is sized so that the wall Frist lapses at PP0's fourth pass after the read-ahead
+    -- when PP2's ack has only had its size frame taken."""
+    reads = {r: {RID_B: 0.1} for r in range(3)}
+    monkeypatch.setenv("SGLANG_WEG2_TOLD_FALLBACK_GRACE_S", grace)
+    m, fb, ring = _pf_ring(monkeypatch, {RID_B: TOLD_B}, reads, dt)
+    ring.arrive(RID_B)
+    ring.run(passes)
+    return ring
+
+
+def test_S7_pf_frist_against_pass_cadence(monkeypatch):
+    """h64 case A and B, each its own ring: G1 + G7 on the admission of the rid."""
+    Guards5.held_prefix(s7_case_a(monkeypatch), RID_A, TOLD_A, "case A (stale early record, satisfied locally, 2.2 s passes)")
+
+
+def test_S7b_pf_frist_two_hop_ack_in_long_passes(monkeypatch):
+    Guards5.held_prefix(s7_case_b(monkeypatch), RID_B, TOLD_B, "case B (equal reads, 3.3 s passes, PP2 two hops down)")
+
+
+# =====================================================================================================================
+# S8 -- slow D park (h16n 17c2563647, D epoch 90, 06:56-06:57Z host swap storm: the park undid itself, W3)
+# =====================================================================================================================
+# Metal: the front sent /weg2/park_running to D, D's park took 31.3 s on the scheduler thread (HY settle's L3 stat walk
+# 21.7 s although nothing was refused, #248 mark 9.3 s). ``park_running`` had stamped the awake re-queue clock
+# (``d_seats.SINCE_ATTR``, bound 30 s, read by ``park_tick``) right after the retraction, AHEAD of those phases: when the
+# answer left, the stamp was 31 s old and the very next pass (same second) re-queued the whole park. D decoded the parked
+# requests again (a 205760-token load-back held the scheduler thread 72 s) while the front, told they were parked, began
+# the D->P flip: its drain witness got no /get_server_info answer -> W3 Weg2DrainWitnessUnreachable.
+#   S8  (A) a 31 s park on a TP3 D group (real ``park_running`` / ``park_tick`` on three rank threads, rank-local
+#           monotonic clocks, a group-MIN collective between them): no parked request leaves the park before the
+#           awake bound has run since the ANSWER; every rank agrees (G1); the net still works afterwards.
+#   S8b (B) a park that retracted and refused nothing walks no L3 on any rank (real ``park_hold_yield.settle``: the
+#           stat walk is the leaf that costs the 21.7 s); a park where ONE rank refused makes EVERY rank walk and vote
+#           the same collectives (a rank that skips a vote its peers enter hangs the group).
+# Law G8 PARK-SELF-UNDO: a park does not end before its answer has been out for the awake bound -- the bound measures
+# the front's time, never the park's own duration. G9 PARK-WALK: a clean park walks nothing. NOT modelled: the front's
+# own lapse clock (``_d_parked`` stamped at t_park before a 54 s RPC), the PLE-warm GIL hold (C), the load-back.
+
+PARK_S_RANKS = (31.3, 30.9, 31.1)       # epoch 90: stage=park ms=31311 on TP0, TP1/TP2 within a second of it
+
+
+class _RankClock:
+    def __init__(self, t=1000.0):
+        self.t = float(t)
+
+    def monotonic(self):
+        return self.t
+
+    def time(self):
+        return self.t
+
+    def perf_counter(self):
+        return self.t
+
+
+class _RankTime:
+    """Stand-in for the ``time`` module of ``d_park_runtime``: every rank thread reads its own clock."""
+
+    def __init__(self):
+        self.tl = threading.local()
+
+    def _c(self):
+        return self.tl.clock
+
+    def monotonic(self):
+        return self._c().monotonic()
+
+    def time(self):
+        return self._c().time()
+
+    def perf_counter(self):
+        return self._c().perf_counter()
+
+
+class _GroupCollective:
+    """A MIN all-reduce over the D ranks (barrier based). A rank that enters one collective more or fewer than its
+    peers breaks the barrier: the real group would hang -- RED (G1), never repaired."""
+
+    def __init__(self, n, timeout=4.0):
+        self.n, self.timeout = n, timeout
+        self.barrier = threading.Barrier(n, timeout=timeout)
+        self.slots = [None] * n
+
+    def reduce(self, rank, values, label):
+        try:
+            self.slots[rank] = list(values)
+            self.barrier.wait()
+            out = [min(col) for col in zip(*self.slots)]
+            self.barrier.wait()
+            return out
+        except threading.BrokenBarrierError:
+            raise LawViolation(
+                "G1 RAENGE-NIE-UNEINS",
+                f"collective {label!r}: the ranks did not enter the same collectives (rank {rank} waited "
+                f"{self.timeout:.0f} s for its peers) -- on the metal a hung group")
+
+
+class _DBatch:
+    def __init__(self, reqs):
+        self.reqs = list(reqs)
+        self.batch_is_full = True
+
+    def is_empty(self):
+        return not self.reqs
+
+    def filter_batch(self, **_kw):
+        pass
+
+    def retract_all(self, server_args, offload_kv=True, retain=False):
+        out, self.reqs = self.reqs, []
+        return out
+
+
+def _dreq(rid, seq):
+    return types.SimpleNamespace(rid=rid, kv_arrival_seq=seq, origin_input_ids=[0] * 10, output_ids=[0] * 3,
+                                 is_fast_lane=False, spill_class=None)
+
+
+class _DSched:
+    """The scheduler state ``d_park_runtime`` moves on one D rank, nothing more (the h91c2 stand-in)."""
+
+    def __init__(self, rank, group, running=(), waiting=(), settle=()):
+        from collections import deque
+
+        self.rank = rank
+        self.running_batch = _DBatch(running)
+        self.waiting_queue = list(waiting)
+        self.weg2_post_wake_settle = list(settle)
+        self.last_batch = None
+        self.enable_overlap = False
+        self.result_queue = deque()
+        self.chunked_req = None
+        self.anchor_tails = []
+        self.server_args = types.SimpleNamespace(max_running_requests=6)
+        self.weg2_dormant = False
+        self.enable_hicache_storage = False
+        self.sent = []
+        self.group = group
+        self.ipc_channels = types.SimpleNamespace(
+            send_to_tokenizer=types.SimpleNamespace(send_output=lambda o, r: self.sent.append(o)))
+
+    def _969ad_note_retract(self, req, site):
+        pass
+
+    def _add_request_to_queue(self, req, is_retracted=False):
+        self.waiting_queue.append(req)
+
+    def _weg2_group_min_flags(self, flags):
+        return [1 if v else 0 for v in self.group.reduce(self.rank, [1 if f else 0 for f in flags], "group_min_flags")]
+
+    def uniform_min_avail(self):
+        return 0
+
+
+def _run_ranks(n, fn):
+    """Run ``fn(rank)`` on n threads; the first exception of any rank is re-raised, the results returned in rank order."""
+    out, errs = [None] * n, []
+
+    def body(r):
+        try:
+            out[r] = fn(r)
+        except BaseException as exc:  # noqa: BLE001
+            errs.append((r, exc))
+
+    ts = [threading.Thread(target=body, args=(r,), daemon=True) for r in range(n)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join(60)
+    if errs:
+        errs.sort(key=lambda e: (not isinstance(e[1], LawViolation), e[0]))
+        raise errs[0][1]
+    return out
+
+
+def _d_modules():
+    try:
+        from sglang.srt.weg2 import d_park_runtime as rt
+        from sglang.srt.weg2 import d_seats as ds
+        from sglang.srt.weg2 import park_hold_yield as hy
+    except ImportError:
+        pytest.skip("n/a: this tree has no D park runtime")
+    return rt, ds, hy
+
+
+@pytest.fixture
+def d_group(monkeypatch):
+    """Group D (the launcher's SGLANG_WEG2_GROUP), the rank-local clocks in place of ``d_park_runtime.time``."""
+    rt, ds, hy = _d_modules()
+    monkeypatch.setenv("SGLANG_WEG2_GROUP", "D")
+    monkeypatch.delenv(ds.PARK_ENV, raising=False)
+    monkeypatch.delenv(ds.RESUME_MARGIN_ENV, raising=False)
+    rtime = _RankTime()
+    monkeypatch.setattr(rt, "time", rtime)
+    return SimpleNamespace(rt=rt, ds=ds, hy=hy, rtime=rtime, clocks=[_RankClock() for _ in range(3)])
+
+
+def _enter(g, rank):
+    g.rtime.tl.clock = g.clocks[rank]
+
+
+def s8_slow_park(g, monkeypatch, durations=PARK_S_RANKS, stamp_at_start=False):
+    """epoch 90 on a TP3 D group: nothing running, one settle request (weg2-88-1053, its read short), two queued behind
+    (weg2-88-1054, weg2-89-1056). The park's phases after the retraction take ``durations[rank]`` s (the storm: the HY
+    settle stands for yield + l3mark). Returns (scheds, answered[rank]); then the passes after the answer."""
+    from sglang.srt.managers.io_struct import Weg2ParkRunningReqInput
+
+    rt, ds, hy = g.rt, g.ds, g.hy
+    group = _GroupCollective(3)
+    real_settle = hy.settle
+    scheds = [_DSched(r, group, waiting=[_dreq("weg2-88-1054", 2), _dreq("weg2-89-1056", 3)],
+                      settle=[_dreq("weg2-88-1053", 1)]) for r in range(3)]
+
+    def slow(sched, *, retracted, parked):
+        g.clocks[sched.rank].t += durations[sched.rank]       # this rank's own monotonic clock: the phases take time
+        return real_settle(sched, retracted=retracted, parked=parked)
+
+    monkeypatch.setattr(hy, "settle", slow)
+    answered = [None] * 3
+
+    def park(r):
+        _enter(g, r)
+        out = rt.park_running(scheds[r], Weg2ParkRunningReqInput(epoch=90, reason="immediate-over-x"),
+                              late_hold_armed=True)
+        if not out.success:
+            raise RigError(f"park_running refused on this tree: {out.message}")
+        answered[r] = g.clocks[r].t
+        return out
+
+    _run_ranks(3, park)
+    return scheds, answered
+
+
+def _tick_all(g, scheds, at):
+    """One pass at the common instant ``at`` (a pass starts when the slowest rank is through; ranks stand in the
+    group-MIN collective of ``park_tick``): returns the number of requests each rank re-queued."""
+    for c in g.clocks:
+        c.t = at
+
+    def tick(r):
+        _enter(g, r)
+        return g.rt.park_tick(scheds[r])
+
+    return _run_ranks(3, tick)
+
+
+class Guards8:
+    @staticmethod
+    def park_not_undone(g, scheds, answered, bound, what):
+        """G8 + G1 over the passes after the answer: every pass is a common instant; a parked request leaves the park
+        only once ``bound`` s of the FRONT's time have run since the last rank answered; all ranks agree on it; and the
+        safety net (the sleep never came) still re-queues it right after the bound."""
+        t_ans = max(answered)
+        parked0 = sorted(str(r.rid) for r in scheds[0].weg2_d_parked)
+        want = ["weg2-88-1053", "weg2-88-1054", "weg2-89-1056"]
+        if parked0 != want:
+            raise RigError(f"{what}: the park holds {parked0}, expected {want}")
+        for label, at, may_requeue in (
+                ("the pass right after the answer", t_ans, False),
+                (f"{bound - 1.0:.0f} s after the answer", t_ans + bound - 1.0, False),
+                (f"{bound + 1.0:.0f} s after the answer (the safety net)", t_ans + bound + 1.0, True)):
+            moved = _tick_all(g, scheds, at)
+            if len(set(moved)) != 1:
+                raise LawViolation("G1 RAENGE-NIE-UNEINS",
+                                   f"{what}: {label}: the D ranks re-queued {moved} requests (group MIN verdict)")
+            if may_requeue:
+                if moved[0] == 0:
+                    raise LawViolation("G8 PARK-SELF-UNDO",
+                                       f"{what}: the park was never re-queued {label} -- the safety net is gone")
+            elif moved[0]:
+                raise LawViolation(
+                    "G8 PARK-SELF-UNDO",
+                    f"{what}: {label}: every D rank re-queued the parked requests ({moved[0]} each) although the "
+                    f"answer had been out for {at - t_ans:.1f} s of a {bound:.0f} s bound (the park itself took "
+                    f"{', '.join(f'{d:.1f}' for d in PARK_S_RANKS)} s): D decodes them again while the front, told "
+                    "they are parked, flips -- W3 Weg2DrainWitnessUnreachable (epoch 90)")
+
+
+def test_S8_slow_d_park_does_not_undo_itself(d_group, monkeypatch):
+    """A 31 s park on a TP3 D group: neither the very next pass nor the pass 29 s later may re-queue it."""
+    scheds, answered = s8_slow_park(d_group, monkeypatch)
+    bound = d_group.ds.awake_requeue_s()
+    Guards8.park_not_undone(d_group, scheds, answered, bound, "epoch 90 (31 s park under the swap storm)")
+
+
+class _CountingTree:
+    """The UnifiedRadixCache surface ``park_hold_yield.settle`` touches on one rank; the collectives go through the
+    group, every one is counted by label."""
+
+    def __init__(self, rank, group, refused=None):
+        self.rank, self.group = rank, group
+        self._weg2_park_track = None
+        self.refused = refused or {}
+        self.votes = []
+
+    def _weg2_arena_pools(self):
+        from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType
+
+        return {ComponentType.FULL: types.SimpleNamespace(arena=None)}
+
+    def _all_reduce_attn_groups(self, t, op, label=""):
+        self.votes.append(label)
+        t.copy_(torch.tensor(self.group.reduce(self.rank, t.tolist(), label), dtype=t.dtype))
+
+    def _barrier_attn_groups(self, label=""):
+        self.votes.append("barrier:" + label)
+
+
+def s8b_park_walks(g, monkeypatch, refusing_rank=None):
+    """Per rank: ``hy.settle`` over the park of epoch 90 (three held requests, nothing retracted). The L3 stat walk
+    (``held_facts``, the leaf that cost 21.7 s) is counted and advances the rank clock by 7.2 s per held request.
+    ``refusing_rank``: that rank's backups were refused by the arena (need 13 > the 12 on-disk pages (3 spans x 4): the refusal
+    stands, but every collective of the verdict is entered). Returns (walks per rank, votes per rank)."""
+    hy = g.hy
+    group = _GroupCollective(3)
+    walks = [[] for _ in range(3)]
+    trees = [_CountingTree(r, group) for r in range(3)]
+
+    def facts(tree, rid):
+        walks[tree.rank].append(rid)
+        g.clocks[tree.rank].t += 7.2
+        return 4, 4
+
+    monkeypatch.setattr(hy, "held_facts", facts)
+    monkeypatch.setattr(hy, "need_pages", lambda tree, refused: 13 if refused else 0)
+
+    def settle(r):
+        _enter(g, r)
+        tree = trees[r]
+        hy.begin(tree)
+        tree._weg2_park_track = {1: object()} if r == refusing_rank else {}
+        parked = [types.SimpleNamespace(rid=x) for x in ("weg2-88-1053", "weg2-88-1054", "weg2-89-1056")]
+        return hy.settle(types.SimpleNamespace(tree_cache=tree), retracted=[], parked=parked)
+
+    verdicts = _run_ranks(3, settle)
+    return walks, [t.votes for t in trees], verdicts
+
+
+def test_S8b_clean_park_walks_no_l3(d_group, monkeypatch):
+    """Nothing refused anywhere: no rank stats a single held page (G9), and all ranks vote alike (G1)."""
+    walks, votes, verdicts = s8b_park_walks(d_group, monkeypatch)
+    if any(walks):
+        raise LawViolation(
+            "G9 PARK-WALK",
+            f"a park that retracted and refused nothing walked L3 for {[len(w) for w in walks]} held span(s) per rank "
+            f"({7.2 * max(len(w) for w in walks):.1f} s on the metal's epoch 90: yield:21732 of a 31.3 s park); "
+            f"verdicts {verdicts}")
+    if any(v != votes[0] for v in votes):
+        raise LawViolation("G1 RAENGE-NIE-UNEINS", f"the ranks voted different collectives: {votes}")
+
+
+def test_S8c_one_refusing_rank_makes_every_rank_walk_and_vote(d_group, monkeypatch):
+    """One rank's backups refused: the first vote's MIN is the same everywhere, so EVERY rank walks its held spans
+    and enters the same further collectives (a rank skipping a vote its peers enter hangs the group)."""
+    walks, votes, verdicts = s8b_park_walks(d_group, monkeypatch, refusing_rank=1)
+    if any(len(w) != 3 for w in walks):
+        raise LawViolation("G1 RAENGE-NIE-UNEINS",
+                           f"rank 1 refused, the walks per rank were {[len(w) for w in walks]} (all must walk 3)")
+    if any(v != votes[0] for v in votes):
+        raise LawViolation("G1 RAENGE-NIE-UNEINS", f"the ranks voted different collectives: {votes}")
+    if len(set(verdicts)) != 1:
+        raise LawViolation("G1 RAENGE-NIE-UNEINS", f"the ranks reached different verdicts: {verdicts}")
+
+#: switches the S7/S8 scenarios or their self-checks set (a separate fixture, so the tree's defaults decide in every test)
+RIG_ENVS_S7S8 = (
+    # S7 (h64): the PF Frist counted in passes, the satisfied settle's ack, the ack drain, the group floor
+    "SGLANG_WEG2_TOLD_FALLBACK_MIN_PASSES", "SGLANG_WEG2_PF_SETTLE_ACK_NOW", "SGLANG_WEG2_TOLD_ACK_DRAIN",
+    "SGLANG_WEG2_TOLD_GROUP_FLOOR", "SGLANG_WEG2_TOLD_FALLBACK_GRACE_S", "SGLANG_WEG2_FOLLOWER_EARLY_READ",
+    # S8 (flipstall): the awake re-queue bound of a flip park and the park hold yield switch
+    "SGLANG_WEG2_D_PARK_AWAKE_REQUEUE_S", "SGLANG_WEG2_ENABLE_PARK_HOLD_YIELD")
+
+
+@pytest.fixture(autouse=True)
+def _clean_env_s7s8(monkeypatch):
+    for k in RIG_ENVS_S7S8:
+        monkeypatch.delenv(k, raising=False)
+
+
+def test_selfcheck_S7_wall_frist_and_late_settle_are_the_h64_fallback_a(monkeypatch):
+    """SELF-CHECK case A: the pass floor of the Frist and the settle's immediate ack both off = the h16n code."""
+    monkeypatch.setenv("SGLANG_WEG2_TOLD_FALLBACK_MIN_PASSES", "0")
+    monkeypatch.setenv("SGLANG_WEG2_PF_SETTLE_ACK_NOW", "0")
+    with pytest.raises(LawViolation, match="G7"):
+        test_S7_pf_frist_against_pass_cadence(monkeypatch)
+
+
+def test_selfcheck_S7b_wall_frist_without_the_pass_floor_is_the_h64_fallback_b(monkeypatch):
+    """SELF-CHECK case B: the Frist counts wall time alone, the ack stream is only drained under a paced rid."""
+    monkeypatch.setenv("SGLANG_WEG2_TOLD_FALLBACK_MIN_PASSES", "0")
+    monkeypatch.setenv("SGLANG_WEG2_TOLD_ACK_DRAIN", "0")
+    with pytest.raises(LawViolation, match="G7"):
+        test_S7b_pf_frist_two_hop_ack_in_long_passes(monkeypatch)
+
+
+def test_selfcheck_S8_stamp_before_the_phases_is_the_epoch90_death(d_group, monkeypatch):
+    """SELF-CHECK: the awake re-queue clock stamped at the START of the park (before its phases) instead of at its
+    answer -- the h16n code. Where the tree has ``park_answer_stamp`` it is replaced by that; on a tree without it
+    the scenario is red anyway and the self-check passes trivially."""
+    rt, ds = d_group.rt, d_group.ds
+    t_start = d_group.clocks[0].t
+    if hasattr(rt, "park_answer_stamp"):
+        def early(sched, flip_list, *, late_hold):
+            for req in flip_list:
+                setattr(req, ds.SINCE_ATTR, t_start)
+            setattr(sched, rt.LATE_HOLD_ATTR, t_start if late_hold else None)
+            return float(d_group.clocks[sched.rank].t)
+
+        monkeypatch.setattr(rt, "park_answer_stamp", early)
+    with pytest.raises(LawViolation, match="G8"):
+        test_S8_slow_d_park_does_not_undo_itself(d_group, monkeypatch)
+
+
+def test_selfcheck_S8b_walk_before_the_vote_is_the_epoch90_yield(d_group, monkeypatch):
+    """SELF-CHECK: the L3 stat walk gathered BEFORE the first vote on every park (the h16n ``settle``)."""
+    hy = d_group.hy
+    real = hy.settle
+
+    def walk_first(sched, *, retracted, parked):
+        for r in parked:
+            hy.held_facts(sched.tree_cache, str(r.rid))
+        return real(sched, retracted=retracted, parked=parked)
+
+    monkeypatch.setattr(hy, "settle", walk_first)
+    with pytest.raises(LawViolation, match="G9"):
+        test_S8b_clean_park_walks_no_l3(d_group, monkeypatch)
+
+
+# =====================================================================================================================
 # SELF-CHECKS: every guard fires on the mutant of the decision that closed its death (a rig that cannot go red
 # measures nothing). On a tree where the scenario is red anyway, the self-check passes trivially.
 # =====================================================================================================================
