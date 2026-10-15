@@ -30,13 +30,18 @@
 # 14.10. 10:29:45Z / 10:30:14Z / 10:54:41Z): sie zaehlte das EXTENT der FREIGEGEBENEN Menge selbst (+1 s nach dem Release) und las t0_unix_ms
 # als Chunk-Beginn. Regeln jetzt (Gesetz: D-Arbeit zaehlt nur, wenn sie BEGONNEN hat, BEVOR der Release fiel, und nicht zur freigegebenen Menge gehoert):
 #   - Stempel der D-Zeilen sind auf die SEKUNDE ABGERUNDET (wirkliche Zeit in [s, s+1)). Ein Punktzeuge zaehlt nur, wenn s + 1 <= release
-#     (sicher VOR dem Release); nach dem Release gibt es keine Toleranz mehr. Nur 'Decode rank batch ... t:' hat eine exakte Epoche
+#     (sicher VOR dem Release) UND s >= Fensterbeginn (sicher im Fenster, RUNDE 3: SLACK_S = 0.0); nach dem Release keine Toleranz. Nur 'Decode rank batch ... t:' hat eine exakte Epoche
 #     (Rundenbeginn): zaehlt in [release-waited, release].
 #   - 't0_unix_ms' ist NICHT der Chunk-Beginn, sondern das Ende des vorigen Messfensters des VRAM-Instruments (schliesst die Leerlaufzeit vor dem
 #     Chunk ein). Der Chunk-Beginn kommt aus dem EIGENEN '#969 EXTENT' derselben Menge: die chunk-Zeile folgt im D-Log ihrem EXTENT, Zuordnung
 #     ueber die Zeilenzahl (rows == Summe der EXTENT-Zeilen, an 419 von 419 Paaren zweier Boots gemessen). Ohne Paar kein Intervall.
 #   - Zeugen, deren rid zur freigegebenen Menge gehoert (D-ADMIT dieser rid [release, release+2 s] im Front-Log), zaehlen nie.
-# Gemessen: siehe deskq/done/nf-core-collect-1015.md, Abschnitt Runde 2.
+# 15.10. RUNDE 3 (Review r2 JA_MIT_AUFLAGE, deskq/done/nf-core-collect-1015-review-r2.md): die Vorwaerts-Toleranz SLACK_S=1.0 am Fensterbeginn liess am
+# ENDE gestempelte Zeugen ('Prefill batch', 'Decode batch') aus [w0-1, w0) als D-Arbeit im Fenster gelten (26 echte Faelle der Klasse verschluckt,
+# 14.10. bc35462240 10:23:07Z, a4856f6e5d 09:42:21Z). Jetzt "sicher im Fenster" auf BEIDEN Seiten. Zweites Kriterium (Review Abschnitt 3):
+# 'D wurde im Fenster leer' bei stage in (dcheck, window): letzte sichere D-Arbeit > D_IDLE_TAIL_S vor dem Release und kein Chunk ohne Beginn,
+# der ueber den Release laeuft.
+# Gemessen: siehe deskq/done/nf-core-collect-1015.md, Abschnitt Runde 2 und 3.
 import argparse, calendar, collections, glob, os, re, sys, time
 
 EVID = "/spinning/docker-acceptance/nf/evidence"
@@ -46,8 +51,11 @@ PID = "/spinning/gpu-arb/deskq/wacht/nf_collect_wait_monitor.pid"
 DAYS = 14
 STOPFILE = "/spinning/docker-acceptance/nf/nf_dauer_stop"   # Planer 14.10.: ab dieser Datei ist D fuer Neuaufnahmen zu (admit_d=False) => Releases nicht pruefen
 WAIT_MIN = 2.0            # ab so vielen Sekunden Sammelwartezeit wird geprueft
-SLACK_S = 1.0             # nur NACH VORNE (Fensterbeginn): D-Log-Stempel sind auf die Sekunde abgerundet. Nach dem Release keine Toleranz.
+SLACK_S = 0.0             # RUNDE 3 (Review r2, HOCH): KEINE Toleranz am Fensterbeginn. Ein Stempel s liegt in [s, s+1); ein End-Stempel
+                          # ('Prefill batch', 'Decode batch') mit s < w0 kann ganz VOR dem Fenster liegen => zaehlt nur bei s >= w0 (sicher im Fenster).
 STAMP_S = 1.0             # Stempel s bedeutet wirkliche Zeit in [s, s+1): ein Punktzeuge liegt nur dann SICHER vor dem Release, wenn s + STAMP_S <= release
+D_IDLE_TAIL_S = 3.0       # RUNDE 3, zweites Kriterium: so lange darf D vor dem Release schon ruhen (d-idle p99 der Front 1,28 s + Stempelgenauigkeit 1 s)
+CHUNK_RUN_MAX_S = 15.0    # a chunk END without a paired begin counts as 'running over the release' only if it falls within this long after it (longest chunk seen ~11 s)
 ADMIT_AFTER_S = 2.0       # D-ADMIT einer rid bis so lange nach dem Release = die rid gehoert zur freigegebenen Menge
 CHUNK_MIN_OVERLAP_S = 0.5  # Chunk-Intervall muss das Wartefenster mind. so lange ueberlappen, um als D-Arbeit zu zaehlen
 SETTLE_S = 6.0            # so lange auf D-Log-Zeilen nach dem Release warten, bevor entschieden wird
@@ -194,7 +202,7 @@ class Mon:
         """D work that BEGAN before the release at `t` (and is not the released set itself), as a Counter of witness kinds.
 
         Window = [t-waited, t]. D-log stamps are floored to the second (true time in [s, s+1)), so a point witness counts only when
-        s + STAMP_S <= t (certainly before the release) and s >= t-waited-SLACK_S. Exact epochs ('Decode rank batch' t: = round start,
+        s + STAMP_S <= t (certainly before the release) and s >= t-waited-SLACK_S (SLACK_S = 0: certainly inside the window, round 3). Exact epochs ('Decode rank batch' t: = round start,
         chunk end t_unix_ms) count in [t-waited, t] (a chunk end needs CHUNK_MIN_OVERLAP_S inside the window). A chunk interval [S, end]
         (S = an upper bound of its true start, see feed_d) must overlap the window by CHUNK_MIN_OVERLAP_S. Witnesses of rids that were
         D-ADMITted in [t, t+ADMIT_AFTER_S] (the released set) never count.
@@ -219,6 +227,46 @@ class Mon:
             if min(b, t) - max(a, w0) >= CHUNK_MIN_OVERLAP_S:
                 kinds["chunk"] += 1
         return kinds
+
+    def d_tail(self, t):
+        """RUNDE 3, second criterion ('D wurde im Fenster leer, Front hielt weiter'): (last, running) for a release at `t`.
+
+        last = an UPPER bound of the time of the last D work that certainly happened before the release (released set excluded):
+        a decode round / a chunk end at its exact epoch, a floored point witness at s + STAMP_S (its true time is in [s, s+1)), a
+        chunk interval at min(end, t). running = a chunk that is not over at the release: one whose own begin is known to lie
+        before the release and whose end lies after it, a chunk END after the release WITHOUT a paired begin (it may well have begun
+        before the release -- the doubt always goes to 'D worked', never to an alarm), or the open EXTENT of a chunk whose line has
+        not been written yet (live, the chunk line is end-stamped). The front answers a D gone idle with stage=d-idle after
+        p50 0.13 s / p99 1.28 s; a tail beyond D_IDLE_TAIL_S with nothing running is a hold on an idle D."""
+        released = {r for ta, r in self.admits if t <= ta <= t + ADMIT_AFTER_S}
+        last, running = None, False
+
+        def upd(x):
+            nonlocal last
+            last = x if last is None else max(last, x)
+
+        for bt, k, rids in self.busy:
+            if rids and released and set(rids) <= released:
+                continue
+            if k in ("decode-round", "chunk-end"):
+                if bt <= t:
+                    upd(bt)
+            elif bt + STAMP_S <= t:
+                upd(bt + STAMP_S)
+        for a, b, rids in self.busy_iv:
+            if rids and released and set(rids) <= released:
+                continue
+            if a is None:
+                running = running or t < b <= t + CHUNK_RUN_MAX_S
+            elif a <= t:
+                if b > t:
+                    running = running or b <= t + CHUNK_RUN_MAX_S
+                else:
+                    upd(b)
+        le = self.last_ext
+        if le is not None and t - 30.0 <= le[0] and le[0] + STAMP_S <= t and not (le[2] and released and set(le[2]) <= released):
+            running = True
+        return last, running
 
     def feed_p(self, line):
         m = RE_PPRE.match(line)
@@ -392,6 +440,8 @@ class Mon:
             if kinds:
                 self.stats["justified"] += 1
                 self.stats["justified_s"] += waited
+                if f["stage"] in ("dcheck", "window"):
+                    self._d_went_idle(t, waited, f, src)
                 continue
             self.stats["idle_waits"] += 1
             self.stats["idle_wait_s"] += waited
@@ -403,15 +453,35 @@ class Mon:
                         f["p_bound"], f["epoch"], time.strftime("%H:%M:%S", time.gmtime(lo)), time.strftime("%H:%M:%S", time.gmtime(hi)), src))
         self.pending = keep
 
+    def _d_went_idle(self, t, waited, f, src):
+        """Second criterion (round 3): D worked in the window but fell idle D_IDLE_TAIL_S or more before the release, nothing running."""
+        last, running = self.d_tail(t)
+        if last is None or running or t - last <= D_IDLE_TAIL_S:
+            return
+        tail = t - last
+        if f["p_bound"]:
+            # a P-bound set collects for P by design (review r2, 15.10. 11:52:08Z: route=P stage=window p_bound=True): counted, no message to the Planer
+            self.stats["d_leer_p_bound"] += 1
+            self.say("D wurde im Fenster leer (p_bound=True, nur gezaehlt): release um %s waited_s=%.1f, letzte sichere D-Arbeit %.1f s vor dem Release; Quelle %s"
+                     % (time.strftime("%H:%M:%SZ", time.gmtime(t)), waited, tail, src), planer=False)
+            return
+        self.stats["d_leer"] += 1
+        self.stats["d_leer_s"] += tail
+        self.say("BEFUND D wurde im Fenster leer, Front hielt weiter: release um %s waited_s=%.1f n=%d tokens=%d X=%d route=%s stage=%s p_bound=%s epoch=%d -- "
+                 "die letzte sichere D-Arbeit (Runde / Chunk-Ende / Stempel+1 s) liegt %.1f s vor dem Release (Schwelle %.1f s), kein Chunk laeuft ueber den Release; "
+                 "die Front haette bei leerem D mit stage=d-idle sofort freigeben muessen (p99 1,3 s); Quelle %s (Front-Zeile 'DECODE-COLLECT release', D.log desselben Boots)"
+                 % (time.strftime("%H:%M:%SZ", time.gmtime(t)), waited, f["n"], f["tokens"], f["X"], f["route"], f["stage"], f["p_bound"],
+                    f["epoch"], tail, D_IDLE_TAIL_S, src))
+
     def digest(self, final=False):
         s = self.stats
         txt = ("%s: Releases=%d, davon Wartezeit>=%.1fs=%d | begruendet (D rechnete)=%d (%.0f s) | OHNE GRUND (D idle)=%d (%.0f s verschenkt) | "
                "Gesamtwartezeit aller Releases=%.0f s | route D=%d P=%d | Regelverstoesse R1 zu frueh=%d R2 zu spaet=%d R3 D falsch=%d R4 P falsch=%d | "
-               "Ankunft D: ok %d / verfehlt %d | Ankunft P: ok %d / verfehlt %d | Fenster ohne Inhalt (n=0)=%d (%.0f s) | Lane gehalten (kein R2)=%d (%.0f s) | Sitzwarte D (kein F-D)=%d, aufgeloest %d, Summe %.0f s, max %.0f s | im Stopp ausgenommen=%d | unterdrueckte Einzelzeilen=%d"
+               "Ankunft D: ok %d / verfehlt %d | Ankunft P: ok %d / verfehlt %d | Fenster ohne Inhalt (n=0)=%d (%.0f s) | D im Fenster leer geworden (Front hielt weiter)=%d (%.0f s; p_bound nur gezaehlt: %d) | Lane gehalten (kein R2)=%d (%.0f s) | Sitzwarte D (kein F-D)=%d, aufgeloest %d, Summe %.0f s, max %.0f s | im Stopp ausgenommen=%d | unterdrueckte Einzelzeilen=%d"
                % ("ABSCHLUSS" if final else "DIGEST", s["releases"], WAIT_MIN, s["checked"], s["justified"], s["justified_s"],
                   s["idle_waits"], s["idle_wait_s"], s["wait_total_s"], s["route_D"], s["route_P"], s["rule_R1-ZU-FRUEH"], s["rule_R2-ZU-SPAET"],
                   s["rule_R3-D-FALSCH"], s["rule_R4-P-FALSCH"], s["follow_ok_D"], s["follow_miss_D"], s["follow_ok_P"], s["follow_miss_P"],
-                  s["fenster_ohne_inhalt"], s["fenster_ohne_inhalt_s"], s["lane_gehalten"], s["lane_gehalten_s"], s["sitzwarte_D"], s["sitzwarte_aufgeloest"], s["sitzwarte_s"], s["sitzwarte_max_s"], s["stopp_ausgenommen"], self.suppressed))
+                  s["fenster_ohne_inhalt"], s["fenster_ohne_inhalt_s"], s["d_leer"], s["d_leer_s"], s["d_leer_p_bound"], s["lane_gehalten"], s["lane_gehalten_s"], s["sitzwarte_D"], s["sitzwarte_aufgeloest"], s["sitzwarte_s"], s["sitzwarte_max_s"], s["stopp_ausgenommen"], self.suppressed))
         self.suppressed = 0
         line = "[%s] NF-MONITOR COLLECT-WARTEZEIT: %s" % (now_z(), txt)
         if self.dry:
