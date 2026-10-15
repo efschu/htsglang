@@ -17,7 +17,7 @@ WHAT IT DOES.  A daemon thread per process wakes every
     WEG2-MEM-RANK role=PP0 group=P rank=0 pid=.. up_s=.. rss_mib=.. anon_mib=..
         shmem_mib=.. file_mib=.. lck_mib=.. swap_mib=.. rss_peak_mib=..
         d_anon_mib_min=+.. threads=.. majflt=.. d_majflt=.. pyblocks=..
-        malloc_use_mib=.. malloc_free_mib=.. pin_torch_mib=.. pin_posts_mib=..
+        malloc_use_mib=.. malloc_free_mib=.. pin_torch_mib=.. pin_torch_held_mib=.. pin_posts_mib=..
         <structure gauges: n_tree_dev=.. n_tail_jobs=.. ...> top=name:len,..
         cost_ms=..
 
@@ -29,9 +29,11 @@ WHAT IT DOES.  A daemon thread per process wakes every
   ``malloc_free_mib`` (glibc ``mallinfo2``: bytes in use vs free-but-held) tell
   a LEAK (blocks and in-use grow) from FRAGMENTATION (in-use flat, free grows,
   anon grows) -- the one question a plain RssAnon series cannot answer.
-* ``pin_torch_mib``: torch's pinned-host caching allocator (allocated /
-  reserved); ``pin_posts_mib``: the sum of the process's registered pinned
-  host posts (``pinned_host_budget``).
+* ``pin_torch_mib`` / ``pin_torch_held_mib``: torch's pinned-host caching allocator,
+  USED (``active_bytes.current``) / HELD (``allocated_bytes.current`` = active +
+  cached); an absent key prints ``-1``, never 0.  ``pin_posts_mib``: the sum of the
+  process's registered PLANNED pinned host posts (``pinned_host_budget``,
+  ``requested_bytes``), not the bytes actually pinned.
 * structure gauges: the long-lived tables that could grow with requests or
   flips -- radix tree nodes (device / host LRU lists), the tail registry,
   tail hand-off writers/captures, hand-back claims, PLE pending, anchors, A2
@@ -155,17 +157,30 @@ def read_pyblocks() -> int:
         return -1
 
 
-def read_pinned_torch() -> Optional[Tuple[int, int]]:
-    """``(allocated, reserved)`` bytes of torch's pinned-host caching allocator.
+#: the real keys of torch 2.11's pinned-HOST caching allocator
+#: (``torch.cuda.memory.host_memory_stats``): ``active_bytes.current`` = bytes of the
+#: blocks checked out to callers (what is USED), ``allocated_bytes.current`` = bytes of
+#: pinned blocks the allocator OWNS (active + cached = what is HELD).  The host
+#: allocator has NO ``reserved_bytes`` (that key exists only on the device allocator).
+PIN_TORCH_ACTIVE_KEY = "active_bytes.current"
+PIN_TORCH_HELD_KEY = "allocated_bytes.current"
 
-    Only when torch is already imported (never imports it); an empty dict (no
-    pinned allocation yet, CPU-only torch) reads as ``(0, 0)``."""
+
+def read_pinned_torch() -> Optional[Tuple[int, int]]:
+    """``(active, held)`` bytes of torch's pinned-host caching allocator, or None.
+
+    ``-1`` in a slot = that key is absent (an empty dict -- no pinned allocation yet,
+    CPU-only torch -- or a torch whose key names changed): never a default 0, which
+    would look like a plausible reading.  Only when torch is already imported (never
+    imports it)."""
     torch = sys.modules.get("torch")
     if torch is None:
         return None
     try:
         st = torch.cuda.memory.host_memory_stats()
-        return (int(st.get("allocated_bytes.current", 0)), int(st.get("reserved_bytes.current", 0)))
+        act = st.get(PIN_TORCH_ACTIVE_KEY)
+        held = st.get(PIN_TORCH_HELD_KEY)
+        return (int(act) if act is not None else -1, int(held) if held is not None else -1)
     except Exception:  # noqa: BLE001
         return None
 
@@ -311,7 +326,13 @@ def _ledger_held(_: Any = None) -> int:
         if not led.lock.acquire(False):
             return -1
         try:
-            total += int(led.held.sum())
+            # MEMRANK-1015 A7: a numpy VIEW of the CPU tensor (shared memory, no copy):
+            # numpy's sum is single-threaded, torch's ``.sum()`` may start an OMP team
+            # from this daemon thread.
+            try:
+                total += int(led.held.numpy().sum(dtype="int64"))
+            except Exception:  # noqa: BLE001 -- no numpy view: the tensor sum
+                total += int(led.held.sum())
         finally:
             led.lock.release()
     return total
@@ -468,9 +489,10 @@ class MemRankProbe:
             ma_u, ma_f, "%.1f" % (keep / MIB) if ma and keep >= 0 else "-1"))
         pt = read_pinned_torch()
         pp = read_pinned_posts()
-        pt_a, pt_r = (("%.1f" % (pt[0] / MIB)), ("%.1f" % (pt[1] / MIB))) if pt else ("-1", "-1")
-        parts.append("pin_torch_mib=%s pin_torch_rsvd_mib=%s pin_posts_mib=%s" % (
-            pt_a, pt_r, "%.1f" % (pp / MIB) if pp is not None else "-1"))
+        pt_a, pt_h = (tuple(("%.1f" % (v / MIB)) if v >= 0 else "-1" for v in pt)
+                      if pt else ("-1", "-1"))
+        parts.append("pin_torch_mib=%s pin_torch_held_mib=%s pin_posts_mib=%s" % (
+            pt_a, pt_h, "%.1f" % (pp / MIB) if pp is not None else "-1"))
         for name, val in self._gauges():
             parts.append("n_%s=%s" % (name, val))
         top = top_containers(self.owner) if self.owner is not None else []

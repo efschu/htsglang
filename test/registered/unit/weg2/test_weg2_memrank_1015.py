@@ -179,11 +179,18 @@ def test_readers_never_raise_on_unreadable_proc(tmp_path):
 
 
 def test_probe_makes_no_collective(monkeypatch):
-    """The line is local: a torch.distributed call anywhere in it is a failure."""
+    """The line is local: a torch.distributed call anywhere in it is a failure.
+
+    Calls are RECORDED (a raise inside a ``try/except`` would be swallowed); the sglang
+    group layer (parallel_state getters, GroupCoordinator methods) is covered too, and the
+    source check is AST-based -- see test_weg2_memrank_nachbesserung_1015.py (A5)."""
     torch = pytest.importorskip("torch")
     import torch.distributed as dist
 
+    calls = []
+
     def _boom(*a, **k):
+        calls.append("dist")
         raise AssertionError("WEG2-MEM-RANK must not enter a collective")
 
     for name in ("all_reduce", "all_gather", "all_gather_object", "broadcast", "barrier", "reduce",
@@ -192,9 +199,11 @@ def test_probe_makes_no_collective(monkeypatch):
             monkeypatch.setattr(dist, name, _boom)
     p = mr.MemRankProbe("PP2", group="P", rank=2)
     assert p.line().startswith(mr.MARKER)
+    assert calls == []
     # and the module does not even import the collective API
     src = open(mr.__file__).read()
     assert "torch.distributed" not in src.replace("``torch.distributed``", "")
+    assert "parallel_state" not in src and "GroupCoordinator" not in src
     assert "import zmq" not in src and "requests." not in src
 
 

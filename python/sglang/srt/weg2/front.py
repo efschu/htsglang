@@ -1205,7 +1205,9 @@ def x_requeue_capped(x_requeues: int) -> bool:
 
 #: MEMRANK-1015: entries of the front's per-rid X-requeue table. The table had one
 #: increment site and no retire site: one entry per refused rid for the life of the
-#: front. Oldest inserted rid out first, like ``_x_exact_rid`` (4096).
+#: front. Now retired at the rid's end (``retire_x_requeues``, the generate handler's
+#: ``finally``); this cap is only the BACKSTOP. Oldest inserted rid out first, like
+#: ``_x_exact_rid`` (4096).
 X_REQUEUES_SLOTS = 4096
 
 
@@ -1219,6 +1221,14 @@ def bump_x_requeues(table: dict, rid: str, slots: int = X_REQUEUES_SLOTS) -> int
     while len(table) > slots:
         table.pop(next(iter(table)))
     return n
+
+
+def retire_x_requeues(table: dict, rid: Any) -> bool:
+    """MEMRANK-1015 A4: the rid ended (the generate handler's end): its X-requeue count goes.
+
+    The retire point; ``X_REQUEUES_SLOTS`` stays only as the backstop for an end that
+    never reaches the handler's ``finally``. Front-only table, no rank involved."""
+    return table.pop(rid, None) is not None
 
 
 def leg1_early_candidates(queue, limit: int) -> list:
@@ -9277,6 +9287,7 @@ class Front:
                 if rid:
                     self._ipc_out_book().end(rid)
                     Front._lane_end(self, rid)  # PRIORITY LANES 1008 (L1): the lane note goes with the rid
+                    retire_x_requeues(self._x_requeues, rid)  # MEMRANK-1015 A4: the rid-end retire (cap = backstop)
                     try:  # DASHBOARD-IPC: request_done (+ an open park) -- never the answer's fault
                         Front._rb_done(self, rid, status)
                     except Exception as e:  # noqa: BLE001
@@ -17962,6 +17973,13 @@ def start_host_census_sampler(record: str, key: str, store_dir: str,
             time.sleep(period_s)
             try:
                 c = _hc.sample_live(store_dir=store_dir, arena_booked_widths=widths)
+                # MEMRANK-1015 A3: the live probe itself (per role, cgroup anon/shmem),
+                # before the max-merge keeps only the peak: the series that says WHICH
+                # process grew (server_main, compile workers, PLE workers included)
+                try:
+                    logger.info("%s", _hc.live_line(key, c))
+                except Exception:  # noqa: BLE001 -- a log line never skips the merge below
+                    pass
                 ent = _hc.merge_into_record(record, key, c, boot=boot)
                 logger.info("%s", _hc.census_line(key, _hc.ledger_terms(ent)))
             except Exception as exc:  # noqa: BLE001 -- an instrument never kills the front

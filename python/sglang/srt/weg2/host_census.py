@@ -671,6 +671,28 @@ def census_line(key: str, terms: Mapping[str, object]) -> str:
     return line
 
 
+LIVE_MARKER = "WEG2-HOST-CENSUS-LIVE"
+
+
+def live_line(key: str, census: Mapping[str, object]) -> str:
+    """MEMRANK-1015 A3: the UNMERGED live probe of one :func:`sample_live` as a log line.
+
+    ``merge_into_record`` keeps only the all-time / per-boot MAXIMA, so the live
+    series (what each role holds NOW) was thrown away after every tick. This line
+    keeps it: Pss_Anon GiB per role -- every cgroup process, so also the
+    ``inductor_compile_worker`` and ``ple_pread_worker`` processes the per-rank
+    WEG2-MEM-RANK line does not cover -- plus the cgroup anon / shmem. Pure
+    formatting of a dict the sampler already measured: reads nothing, decides
+    nothing."""
+    roles = dict(census.get("roles_anon_gib") or {})
+    rl = " ".join(f"{r}={float(v):.3f}" for r, v in sorted(roles.items()))
+    return (f"{LIVE_MARKER} key={key} at={census.get('at', '?')} "
+            f"cg_anon_gib={float(census.get('cg_anon_gib') or 0.0):.3f} "
+            f"cg_shmem_gib={float(census.get('cg_shmem_gib') or 0.0):.3f} "
+            f"skipped_pids={int(census.get('skipped_pids') or 0)} "
+            f"roles_anon_gib[{rl or 'none'}]")
+
+
 def _main(argv: Optional[Sequence[str]] = None) -> int:
     """Seed/extend the record from a creep_*.jsonl row (the boot is gone, its
     census is not): --from-creep FILE --name SUBSTR --store-gib X --key K

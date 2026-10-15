@@ -1136,7 +1136,8 @@ class PPAdmissionCongruenceGuard:
     #: whereas losing a RECENT one would reopen the livelock.
     PREFIX_FLOOR_SLOTS = 512
 
-    #: MEMRANK-1015: cap on `_1059_observed` (rid -> smallest coverage promise).
+    #: MEMRANK-1015: BACKSTOP cap on `_1059_observed` (rid -> smallest coverage promise);
+    #: the retire point is `retire_request` (request end / abort).
     OBSERVED_SLOTS = 4096
 
     def prefix_len_for(
@@ -1245,15 +1246,41 @@ class PPAdmissionCongruenceGuard:
         prev = self._1059_observed.get(rid)
         value = int(observed)
         self._1059_observed[rid] = value if prev is None else min(prev, value)
-        # MEMRANK-1015: this table was fed once per rid and never retired (no pop
-        # site anywhere): one entry per request for the life of the process.
-        # Bounded like `_offer_prefix_key`: oldest INSERTED rid out first. A rid
-        # that old is long finished (4096 newer rids came after it); losing its
-        # entry reads as "no fact" in `uniform_prefix_for`, the documented safe
-        # direction (no adoption, never a local substitute). Fed and read on
-        # PP0 only (the one decider), so the eviction cannot differ between ranks.
+        # MEMRANK-1015: this table was fed once per rid and never retired. The
+        # RETIRE point is `retire_request` (request end / abort, PP0 only). This cap
+        # is only the BACKSTOP for a rid whose end never reached it. Read the
+        # direction correctly: `uniform_prefix_for() is None` means PP0's OWN number
+        # stands (the pre-#1059 behaviour that killed boot 27: a prefix a follower
+        # does not hold), so evicting the entry of a LIVE rid is the UNSAFE
+        # direction -- not the safe one. It is practically unreachable (it needs
+        # 4096 newer rids inside one request's lifetime), and `min()` above does
+        # not move a key to the end, so the oldest INSERTED rid goes first. Fed
+        # and read on PP0 only (the one decider): the eviction cannot differ
+        # between ranks.
         while len(self._1059_observed) > self.OBSERVED_SLOTS:
             self._1059_observed.pop(next(iter(self._1059_observed)))
+
+    def retire_request(self, rid, *, prefix: bool = False) -> int:
+        """MEMRANK-1015 A4: the request ENDED (finished, or aborted): its #1059
+        coverage promise goes. Returns the number of entries dropped.
+
+        ``rid=None`` drops all (an abort-all); ``prefix=True`` is the abort's
+        prefix semantics. PP0-only by construction: only PP0 feeds
+        `note_observed_coverage`, so on a follower the table does not exist and
+        this is a no-op -- it decides nothing and writes nothing a rank reads."""
+        obs = getattr(self, "_1059_observed", None)
+        if not obs:
+            return 0
+        if rid is None:
+            n = len(obs)
+            obs.clear()
+            return n
+        if prefix:
+            hit = [r for r in obs if str(r).startswith(str(rid))]
+            for r in hit:
+                obs.pop(r, None)
+            return len(hit)
+        return 1 if obs.pop(rid, None) is not None else 0
 
     def uniform_prefix_for(self, rid):
         """#1059 SITE 2: the MIN over the promises that came home for this rid.

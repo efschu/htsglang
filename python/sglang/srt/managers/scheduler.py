@@ -19942,6 +19942,13 @@ class Scheduler(
             self.batch_result_processor.process_batch_result_idle(batch, result)
 
         self.metrics_reporter.log_batch_result_stats(batch, result)
+        # MEMRANK-1015 A4: a finished request's #1059 coverage promise is retired
+        # (the table exists on PP0 only, so on a follower this is a no-op).
+        _adm_guard = getattr(self, "_pp_admission_guard", None)
+        if _adm_guard is not None:
+            for _fin in batch.reqs:
+                if _fin.finished():
+                    _adm_guard.retire_request(_fin.rid)
         # nf-pd-post: a skip batch's #639 ballot is decided after its result
         # (P's token) went out (layers/dcp/prefix_lens_check.resolve_deferred)
         if _prefix_lens_check.has_deferred():
@@ -22424,6 +22431,11 @@ class Scheduler(
         self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
 
     def _abort_request_now(self, recv_req: AbortReq):
+        # MEMRANK-1015 A4: an aborted request's #1059 coverage promise is retired
+        # (PP0-only table; a no-op elsewhere; prefix semantics like the other ledgers).
+        _adm_guard = getattr(self, "_pp_admission_guard", None)
+        if _adm_guard is not None:
+            _adm_guard.retire_request(None if recv_req.abort_all else recv_req.rid, prefix=True)
         # weg2xsn288: an abort ends the intake-stall hold and the reported
         # mark of that rid on THIS rank (the requeued rid returns next phase).
         _oom_ledger = getattr(self, "_weg2_prefill_oom_ledger", None)
