@@ -22336,7 +22336,7 @@ class Scheduler(
         import time as _time
 
         from sglang.srt.managers.corridor_guard import GROUP_ENV
-        from sglang.srt.weg2.intake_stall import IntakeStallWatch
+        from sglang.srt.weg2.intake_stall import IntakeStallWatch, work_in_flight
 
         if str(os.environ.get(GROUP_ENV, "")).strip().upper() != "P":
             return
@@ -22356,6 +22356,17 @@ class Scheduler(
         watch = getattr(self, "_weg2_intake_watch", None)
         if watch is None:
             watch = self._weg2_intake_watch = IntakeStallWatch()
+        # NF design defect 1 (15.10.): the stall's premise -- "nothing runs, so nothing will ever free a token" -- is read HERE,
+        # for every caller (adder NO_TOKEN, seat gate, prefetch-pending, wedge hand-off). The callers test only the running
+        # batch, the chunked continuation and the anchor tails; on a PP ring the finishing request's LAST chunk is a launched
+        # pass whose result PP0 has not consumed (``_pp_launched_pending``): its rows are locked and the followers have not
+        # republished their room. A refusal while anything is in flight is a WAIT and restarts the hold (h16r 11:47:19
+        # held_s=2.8, 11:52:21 2.6, h16p 13:58:24 5.6: the first pass after the finish named the stall).
+        _busy = work_in_flight(self)
+        if _busy:
+            watch.progress()
+            _p_intake.note_stall_deferred(self, req, _busy, note)
+            return
         need, rem_total, cur_rem = -1, -1, -1
         try:
             need = len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
@@ -22381,6 +22392,9 @@ class Scheduler(
         if _too_large:
             from sglang.srt.weg2.intake_stall import TOO_LARGE_MARK
             _extra = f"{_extra} {TOO_LARGE_MARK} pool_tokens={_pool}"
+        else:
+            # a stall at IDLE is a deviation from the design (a request that fits the pool always fits): name the term
+            _extra = f"{_extra} {_p_intake.stall_cause(self, need, _pool)}"
         message = watch.observe(
             rid=str(req.rid), need_tokens=need, rem_total_tokens=rem_total,
             cur_rem_tokens=cur_rem, running_empty=True, now=_time.monotonic(),

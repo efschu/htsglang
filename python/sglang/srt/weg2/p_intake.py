@@ -415,6 +415,72 @@ def pool_terms(tree, alloc):
     return free, evictable, inflight
 
 
+def stall_cause(scheduler, need_tokens: int, pool_tokens: int) -> str:
+    """NF design defect 1 (15.10.2026): the NAMED reason of a stall that survived the in-flight premise (nothing runs on this
+    stage, the hold is over). The design says a request that fits the pool always fits -- finished rows are evictable -- so
+    the stall at idle is a deviation, and which term stands for it decides the fix:
+
+    * ``estimator``: free + reported evictable cover the request and nothing is locked; the payability estimators (ED
+      deliverable, PR room cap, the measured unpayable wall) are what refuse it. THE deviation: rows that exist are not counted.
+    * ``locked``: only the locked (protected) rows would cover it, with nothing in flight: a lock holder that is not running.
+    * ``pool``: free + evictable + protected cannot cover it at all.
+    * ``unread``: the terms could not be read (a stand-in); never raises.
+
+    Format ``cause=<c> free=<n> evict=<n> prot=<n> deliv=<n|-> cap=<n|-> bk=<open backups> flight=0``: compact, because the
+    front keeps the first 300 characters of the refusal in its own log."""
+    tree = getattr(scheduler, "tree_cache", None)
+    alloc = getattr(scheduler, "token_to_kv_pool_allocator", None)
+    try:
+        free = int(alloc.available_size())
+        evict = int(tree.evictable_size())
+    except Exception:  # noqa: BLE001 - diagnostics never raise
+        return "cause=unread"
+
+    def _int_or_none(fn):
+        try:
+            v = fn()
+            return None if isinstance(v, bool) or not isinstance(v, int) else int(v)
+        except Exception:  # noqa: BLE001
+            return None
+
+    prot = _int_or_none(getattr(tree, "protected_size", lambda: None)) or 0
+    # looked up on the type, as ``mem_cache.common.deliverable_evictable_or`` does: a duck-typed stand-in answers every getattr
+    dfn = getattr(type(tree), "deliverable_evictable_size", None)
+    deliv = _int_or_none(lambda: dfn(tree)) if callable(dfn) else None
+    cap = getattr(tree, "weg2_pp_room_cap", None)
+    cap = int(cap) if isinstance(cap, int) and not isinstance(cap, bool) else None
+    try:
+        backups = len(getattr(tree, "ongoing_backup", None) or ())
+    except Exception:  # noqa: BLE001
+        backups = 0
+    need = int(need_tokens)
+    if free + evict >= need:
+        cause = "estimator"
+    elif free + evict + prot >= need:
+        cause = "locked"
+    else:
+        cause = "pool"
+    return (f"cause={cause} free={free} evict={evict} prot={prot} "
+            f"deliv={'-' if deliv is None else deliv} cap={'-' if cap is None else cap} bk={backups} flight=0")
+
+
+def note_stall_deferred(scheduler, req, busy: str, note: str = "") -> None:
+    """The in-flight premise held a refusal back (``WEG2 INTAKE-STALL-DEFERRED``): the metal count of the defect. Bounded
+    (the first eight, then every power of two); never raises."""
+    try:
+        n = getattr(scheduler, "_weg2_intake_deferred_n", 0) + 1
+        scheduler._weg2_intake_deferred_n = n
+        if n <= _LOG_FIRST or (n & (n - 1)) == 0:
+            logger.info(
+                "WEG2 INTAKE-STALL-DEFERRED rid=%s in_flight=%s %s (n=%d): the refusal is a WAIT -- this stage still runs "
+                "(a launched PP pass whose result is not consumed, a chunk, anchor tails); the hold starts at the first "
+                "idle pass, and the finishing request's rows are counted by then",
+                str(getattr(req, "rid", "")), busy, note or "gate=adder_no_token", n,
+            )
+    except Exception:  # noqa: BLE001 - an instrument never blocks the admission
+        pass
+
+
 def intake_phase_verdict(scheduler, rid: str, need_tokens: int,
                          pool_tokens: int, gate: str) -> Optional[str]:
     """INTAKE_FITS / INTAKE_WAITS (not a stall: the request stays queued and
@@ -475,7 +541,9 @@ __all__ = [
     "KEPT_ATTR",
     "forget",
     "intake_phase_verdict",
+    "note_stall_deferred",
     "pool_terms",
     "settle_told",
+    "stall_cause",
     "told_admission",
 ]

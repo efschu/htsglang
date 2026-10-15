@@ -75,6 +75,37 @@ def intake_verdict(*, need_tokens: int, pool_tokens: int, free_tokens: int,
     return INTAKE_IMPOSSIBLE
 
 
+def work_in_flight(scheduler) -> str:
+    """NF design defect 1 (15.10.2026): what still RUNS on this stage -- ``""`` when nothing does.
+
+    The stall's premise is "nothing runs, so nothing will ever free a token". On a PP ring that is more than an empty
+    ``running_batch``: the LAST chunk of the finishing request is a launched pass whose result this rank has not consumed
+    yet (``_pp_launched_pending``, the same authority the #1020 void guard and the flip quiescence read). Its rows are locked
+    until it returns, and the follower stages publish their room only after they have processed it. PP0 passes only when
+    the ring delivers, so the refusal inside that window and the first pass after it are seconds apart: h16r 11:47:19
+    ``held_s=2.8``, 11:52:21 ``2.6``, h16p 13:58:24 ``5.6`` (rows locked by the in-flight pass: protected=173760,
+    evictable=0). A refusal while anything runs is a WAIT; the hold begins at the first pass that finds the stage idle.
+
+    Reads only, tolerant of stand-ins that carry none of the terms (they run nothing)."""
+    rb = getattr(scheduler, "running_batch", None)
+    try:
+        if rb is not None and not rb.is_empty():
+            return "running_batch"
+    except Exception:  # noqa: BLE001 - an unreadable batch is not a running one here (xsn272 doubles)
+        pass
+    if getattr(scheduler, "chunked_req", None) is not None:
+        return "chunked_req"
+    if getattr(scheduler, "anchor_tails", None):
+        return "anchor_tails"
+    pending = getattr(scheduler, "_pp_launched_pending", None)
+    if pending:
+        try:
+            return "pp_launched_pending=" + str(sorted(int(i) for i in pending))
+        except Exception:  # noqa: BLE001
+            return "pp_launched_pending"
+    return ""
+
+
 class IntakeStallWatch:
     """Observe the adder's NO_TOKEN refusals; name a stall once."""
 
