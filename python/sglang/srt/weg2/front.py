@@ -3498,6 +3498,42 @@ def _lane_take_waits(pred) -> bool:
         return False
 
 
+#: K9 P-DRAIN-EARLY-SETTLE (NF h16r 15.10. 11:52:21-11:54:11Z, death DEADMAN_FLIP_STALL; precursor 11:26:01-11:26:23Z):
+#: the D->P flip posts leg 1 EARLY for the queued requests ("P holds it dormant, its store prefetch runs beside the
+#: legs") -- and P prefills them on its own. When the drain ends before it reaches them (a P-INTAKE-STALL of another
+#: request, the phase / seat-gate cap), those legs are still running on P: the P->D flip begins with them OUTSTANDING
+#: (``WEG2-FLIP outstanding ... rids=['weg2-86-231', 'weg2-86-233', 'weg2-86-237']``) and its drain stage waits for
+#: P's prefills (47.6 s / 51.9 s walls) under the flip-stall bound (4x the last flip, 24.5 s) -> WEG2-FLIP STALL ->
+#: the deadman kills the boot. The legs run whether the phase ends or not; so the drain itself settles every queued
+#: request whose early leg is posted (``one(p)`` awaits it, ``on_done`` hands it to D as any other leg) BEFORE the
+#: phase ends. The flip then begins with nothing of this phase left on P. Default ON; ``0`` = the old exit.
+ENV_P_DRAIN_EARLY_SETTLE = "SGLANG_WEG2_P_DRAIN_EARLY_SETTLE"
+
+
+def p_drain_early_settle_enabled(env=None) -> bool:
+    e = os.environ if env is None else env
+    return (e.get(ENV_P_DRAIN_EARLY_SETTLE, "") or "").strip().lower() not in ("0", "false", "no", "off")
+
+
+async def _settle_posted_early_legs(queue, one, on_done, skip=None) -> int:
+    """K9: take every queued item whose early leg 1 is posted (``_leg1_early`` set) out of ``queue`` (by identity,
+    queue order kept for the rest), await them through ``one`` (the drain's own reader: success -> ``on_done``, an
+    intake stall -> requeued at the head by ``one``, a failure -> answered) and run ``on_done`` in queue order.
+    ``skip(item)`` True leaves an item where it is (a lane-held leg). Returns how many were settled."""
+    picked = [q for q in list(queue)
+              if getattr(q, "_leg1_early", None) is not None and not (skip is not None and skip(q))]
+    if not picked:
+        return 0
+    ids = {id(q) for q in picked}
+    kept = [q for q in list(queue) if id(q) not in ids]
+    queue.clear()
+    queue.extend(kept)
+    done = await asyncio.gather(*(one(q) for q in picked))
+    for q in done:
+        on_done(q)
+    return len(picked)
+
+
 async def _p_drain_pool(queue, limit: int, one, on_done, may_dispatch,
                         max_dispatch: int = 0, cost=None, budget: int = 0,
                         stats: Optional[Dict[str, int]] = None,
@@ -17319,6 +17355,19 @@ class Front:
                     cap_exempt=(self._p_phase_short_rides
                                 if envs.SGLANG_WEG2_ENABLE_P_PHASE_SHORT_RIDES.get() and _dc_cap <= 0
                                 else None))
+                # K9 P-DRAIN-EARLY-SETTLE: the early legs P is prefilling anyway are settled here, in "serving",
+                # not in the P->D flip's drain under the flip-stall bound (h16r 11:52:25Z death, 11:26:01Z hang)
+                if p_drain_early_settle_enabled() and self.state == "serving":
+                    _n_settled = await _settle_posted_early_legs(
+                        self.queue, one, _on_leg1_done,
+                        skip=((lambda q: Front._lane_p_held(self, q)) if _lctl.enabled() else None))
+                    if _n_settled:
+                        self.counters["p_drain_early_settled"] = (
+                            self.counters.get("p_drain_early_settled", 0) + _n_settled)
+                        logger.info("WEG2 P-DRAIN-EARLY-SETTLE epoch=%d settled=%d stalled=%s queue=%d -- leg(s) "
+                                    "P was already prefilling (posted at the D->P begin) are awaited in this phase, "
+                                    "never left outstanding for the P->D flip's drain (K9)", self.epoch,
+                                    _n_settled, bool(self._p_intake_stalled), len(self.queue))
                 # PENDEL-FLIP: what the seat gate's cap left in the queue is held while D is full
                 Front._pbound_hold_arm(self, _dc_cap, int(_phase_stats.get("dispatched", 0) or 0),
                                        stalled=bool(self._p_intake_stalled))
