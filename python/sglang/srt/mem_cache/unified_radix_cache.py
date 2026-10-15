@@ -9040,7 +9040,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         _probed, _hit_tokens = self._reap_annotation_from_packed(packed)
         _hit_end = int(_hit_tokens)
         _hit_tokens = _hp1_end_unpack(_eb, int(_hit_tokens))
-        tail_adopt.agree(req_id, int(packed[_REAP_SLOT_TAIL_VOTE].item()))
+        # TAIL-CONSUME-ON-FULL (h48 weg2-182-1661): the H63b receipt only at a
+        # FULL reap -- judged on the GROUP-SYNCED END and hit (the reduced
+        # vector above: one verdict on every rank of the group), never on this
+        # rank's completed_tokens / _hit_tokens_local
+        tail_adopt.agree(
+            req_id, int(packed[_REAP_SLOT_TAIL_VOTE].item()),
+            full=tail_adopt.reap_full(int(min_completed_tokens), int(_hit_tokens), bool(_probed)),
+            completed_synced=int(min_completed_tokens), hit_synced=int(_hit_tokens),
+        )
         # #257 (b): a read that ended short keeps only what a recurrent anchor
         # can resume -- the KV above the group's deepest reachable anchor is
         # neither loaded nor inserted (vision boot 0928, weg2-4-27: 14016 KV

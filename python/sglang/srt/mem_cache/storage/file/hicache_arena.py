@@ -319,6 +319,32 @@ def claim_open_text(stem: str, row: dict) -> str:
                 row["age_ms"], row["pid"], CLAIM_ROLES.get(row["role"], str(row["role"])), row["state"]))
 
 
+#: ARENA-FREE-GEN: refused evictor frees (lines, slots)
+_FREE_EVICTED_REFUSED = [0, 0]
+#: ARENA-FREE-GEN: this process's open eviction candidates per arena file:
+#: slot -> generation at the choice (every ShmArena object of one path shares it)
+_EVICT_GENS: dict = {}
+
+
+def _evict_gens_for(path: str) -> dict:
+    key = os.path.realpath(str(path))
+    d = _EVICT_GENS.get(key)
+    if d is None:
+        d = _EVICT_GENS.setdefault(key, {})
+    return d
+
+
+def free_evicted_named(arena, slots, reason: str) -> None:
+    """ARENA-FREE-GEN: an evictor's free of its own candidates -- generation
+    bound where the arena knows it (``ShmArena.free_evicted``); a hermetic
+    arena without it frees as before."""
+    fe = getattr(arena, "free_evicted", None)
+    if callable(fe):
+        fe(slots, reason=reason)
+    else:
+        free_named(arena, slots, reason)
+
+
 def free_named(arena, slots, reason: str) -> None:
     """#1427s: ``arena.free_slots(slots, reason=reason)`` for every caller; a
     hermetic fake arena without the keyword frees as before."""
@@ -394,6 +420,12 @@ def _load_lib() -> Optional[ctypes.CDLL]:
             lib.arena_drop_unreferenced.argtypes = [p_u8, i64, p_i64, p_i8]
             lib.arena_reap_stale.restype = i64
             lib.arena_reap_stale.argtypes = [p_u8]
+            lib.arena_reap_stale_aged.restype = i64
+            lib.arena_reap_stale_aged.argtypes = [p_u8, i64]
+            lib.arena_slot_gens.restype = i64
+            lib.arena_slot_gens.argtypes = [p_u8, i64, p_i64, p_i64]
+            lib.arena_free_evicting.restype = i64
+            lib.arena_free_evicting.argtypes = [p_u8, i64, p_i64, p_i64, p_i8]
             lib.arena_reap_partial.restype = i64
             lib.arena_reap_partial.argtypes = [p_u8, i64, p_i64, i64]
             lib.arena_unclaim.restype = i64
@@ -611,7 +643,50 @@ class ShmArena:
         c_keep = (keep.ctypes.data_as(ctypes.POINTER(ctypes.c_uint64)) if n_keep
                   else (ctypes.c_uint64 * 1)())
         got = self._lib.arena_evict_candidates(self._base, want, slots, lo, hi, tot, c_keep, n_keep)
+        if got > 0:
+            # ARENA-FREE-GEN: remember each candidate's generation -- the
+            # evictor's free (free_evicted) frees only an unchanged one
+            gens = (ctypes.c_int64 * got)()
+            self._lib.arena_slot_gens(self._base, got, slots, gens)
+            eg = _evict_gens_for(self.path)
+            for i in range(got):
+                eg[int(slots[i])] = int(gens[i])
         return [(int(slots[i]), int(lo[i]), int(hi[i]), int(tot[i])) for i in range(got)]
+
+    def free_evicted(self, slots: Sequence[int], reason: str = "evict") -> int:
+        """ARENA-FREE-GEN: free this process's eviction candidates -- each only
+        while still EVICTING under the generation ``evict_candidates`` saw.
+        A refused slot (reaped, or re-claimed by a new owner since) is never
+        freed; it is counted and named (``ARENA-FREE-EVICTED REFUSED``). A
+        slot this arena object never handed out as a candidate takes the old
+        free. Returns the number freed."""
+        eg = _evict_gens_for(self.path)
+        known, legacy = [], []
+        for s_ in slots:
+            g = eg.pop(int(s_), None)
+            (known if g is not None else legacy).append((int(s_), g))
+        if legacy:
+            self.free_slots([s_ for s_, _ in legacy], reason=reason)
+        if not known:
+            return len(legacy)
+        n = len(known)
+        c = (ctypes.c_int64 * n)(*[s_ for s_, _ in known])
+        g = (ctypes.c_int64 * n)(*[int(x) for _, x in known])
+        st = (ctypes.c_int8 * n)()
+        freed = int(self._lib.arena_free_evicting(self._base, n, c, g, st))
+        refused = [(known[i][0], int(st[i])) for i in range(n) if int(st[i]) != 1]
+        if refused:
+            _FREE_EVICTED_REFUSED[0] += 1
+            _FREE_EVICTED_REFUSED[1] += len(refused)
+            k = _FREE_EVICTED_REFUSED[0]
+            if k <= 16 or (k & (k - 1)) == 0:
+                logger.warning(
+                    "ARENA-FREE-EVICTED REFUSED n=%d reason=%s refused=%d of %d total=%d slots=%s statuses=%s "
+                    "(2 = generation moved, 3 = not EVICTING: the slot is no longer this evictor's candidate -- "
+                    "reaped or re-claimed by a new owner -- and is never freed under that owner)",
+                    k, reason, len(refused), n, _FREE_EVICTED_REFUSED[1],
+                    [s_ for s_, _ in refused[:4]], sorted({x for _, x in refused}))
+        return freed + len(legacy)
 
     # -- Stufe 3 (#1424): address pages in place --------------------------
     def find_slots(self, stems: Sequence[str]) -> list[tuple[int, int]]:
@@ -1004,8 +1079,15 @@ class ShmArena:
         out = (ctypes.c_int8 * n)()
         return int(self._lib.arena_drop_unreferenced(self._base, n, c, out))
 
-    def reap_stale(self) -> int:
-        return int(self._lib.arena_reap_stale(self._base))
+    def reap_stale(self, min_age_s: Optional[float] = None) -> int:
+        """Free EVICTING slots whose evictor died. READ-DEPTH 1014 (port of
+        27B dae863c7c8 (1)): only slots EVICTING for at least ``min_age_s``
+        (default: arena.c ARENA_REAP_STALE_MS, 60 s) -- a LIVE evictor's
+        candidates (another P stage mid ``arena_secure_to_disk``) are never
+        taken; the reaped slot's generation moves on."""
+        if min_age_s is None:
+            return int(self._lib.arena_reap_stale(self._base))
+        return int(self._lib.arena_reap_stale_aged(self._base, int(float(min_age_s) * 1e3)))
 
     def reap_partial(self, min_age_s: float, cap: int = 64) -> list[int]:
         """#231: free CLAIMED direct-write slots no writer can still come to

@@ -43,6 +43,34 @@ def enabled(env=None) -> bool:
     return raw not in ("0", "false", "no", "off")
 
 
+def refresh_delivered(req: Any, record: Any) -> bool:
+    """TAIL-CONSUME-ON-FULL companion (h48 weg2-182-1661, D 00:49:44-45): the
+    witness ``_weg2_store_delivered`` is written by the STORE-SHORT arm only
+    for an INCOMPLETE record -- the first, short wake read left 51840 there,
+    the #1456 HOLD-REFETCH then landed every page (``completed_synced=90688``)
+    and nothing updated it: D-NORECOMPUTE priced 90701 - 51840 = 38861 tokens
+    (``would_compute=38861``) instead of the 13-token tail an agreed E2 window
+    adopts, and W50-REROUTE sent the request to P a second time. Before the
+    release asks :func:`d_would_compute`, the witness follows the record's
+    same quantity the STORE-SHORT arm writes (``scheduler`` #1324 arm: the
+    reduced END ``synced_end`` on a Form A END-vote read -- one value on every
+    rank --, else ``materialized``), and only for a terminated store read whose
+    record is no longer incomplete; never downwards. True = raised."""
+    old = getattr(req, "_weg2_store_delivered", None)
+    if old is None or record is None:
+        return False
+    if int(getattr(record, "deliverable", 0) or 0) <= 0 or getattr(record, "is_incomplete", True):
+        return False
+    se = getattr(record, "synced_end", None)
+    now = int(se) if se is not None else int(getattr(record, "materialized", 0) or 0)
+    if now <= int(old):
+        return False
+    req._weg2_store_delivered = now
+    logger.info("%s WITNESS rid=%s delivered %d -> %d (the record's group-agreed completion after a re-read; "
+                "the short read's witness was stale)", MARK, str(getattr(req, "rid", "?")), int(old), now)
+    return True
+
+
 def d_would_compute(req: Any) -> int:
     """Tokens D's extend would compute for ``req`` after its short read
     (0 = whole read, no short-read stamp, or an agreed tail that adopts)."""
