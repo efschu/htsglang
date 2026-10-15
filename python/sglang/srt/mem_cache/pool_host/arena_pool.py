@@ -220,8 +220,163 @@ def _chain_clean(P: int, rows: torch.Tensor) -> bool:
 #: A2 CHAIN-KEY: [fast-path proofs run, fast-path proofs that failed and went to the full proof]
 _CHAIN_KEY_N = [0, 0]
 
+# --------------------------------------------------------------------------------------------------
+# A2 VOTE-CACHE (nf-chainkey-a2-review-1015 B-C, nf-a2cost-1015)
+# --------------------------------------------------------------------------------------------------
+#
+# COST. The A2 key proof (``_chain_keys_hold``: stems -> ``find_slots_np``, hashed in C) ran in EVERY
+# scheduler pass of the D usable vote, once per waiting rid with a host chain
+# (``tp_match_floor.form_a_usable_votes`` -> ``admission_probe`` -> ``proof_cut`` ->
+# ``weg2_chain_proof_depth`` -> ``provable_pages``), on TP0 and on the KV-owning workers: ~0.85..1.0 us
+# per page, i.e. ~+1.1 ms per 100k chain and pass (6 waiting 128k wakes ~ +10 ms per decode step).
+#
+# WHAT IS CACHED. Only a POSITIVE proof, and only as a FACT ABOUT THE SHARED ARENA, never as a verdict:
+#   "key K_i named slot s_i, COMPLETE, at generation g_i" for every page i of the chain.
+# The arena (arena.c) guarantees, per slot: its key is stamped when the slot is claimed (generation++),
+# the index cell of that key is unlinked only AFTER the state left COMPLETE (evict / quarantine / free
+# all CAS the state first), and COMPLETE is never re-entered inside a generation. Hence
+#       state(s_i) == COMPLETE  and  generation(s_i) == g_i   ==>   find(K_i) == s_i, COMPLETE
+# exactly what the full proof re-derives by hashing. A hit READS THE ARENA AGAIN (one strided header
+# read for the states, one C call for the generations, no strings): the cache never returns an old
+# verdict, it re-validates a remembered key->slot binding against the live arena at call time.
+#
+# A HIT NEEDS ALL OF (otherwise: the full proof, i.e. exactly the pre-cache behaviour):
+#   * the chain's keys equal the remembered ones (list compare, no hashing),
+#   * the chain's rows equal the remembered ones (tensor compare),
+#   * every slot is COMPLETE now (states read first) and
+#   * every slot still carries the remembered generation (read second: a generation only moves forward,
+#     so a match proves the state read belongs to that generation).
+# FILL: the generations are read BEFORE and AFTER the full proof and stored only when they did not move
+# across it (and every slot is COMPLETE after it): the proof and the generation then describe one
+# generation of every slot.
+#
+# RANK AGREEMENT (raenge-nie-uneins-crash-stop). This verdict feeds the usable vote (group MIN).
+# A hit returns exactly what the full proof would return at the same instant (the equivalence above),
+# so a rank with a warm cache and a rank with a cold one vote the same from the same arena state; the
+# cache changes the COST of the vote, never its value, and adds no rank-local input. Any error in the
+# cache path falls back to the full proof (never an exception into the vote, never a different value).
+# The arena itself is shared and read at slightly different instants by every rank with or without the
+# cache -- the group MIN (and the load-time proof below) already stands behind that, unchanged.
+# NOT cached: ``verify_load_chain`` (the proof right before a transfer stays the full ``find`` every
+# time), the ``_chain_shifted`` / ``_chain_clean`` tests of a call that misses, any negative result.
+#
+# Limits, named: a slot generation is 32 bit (arena.c ``uint32_t generation``); a hit could only be
+# wrong after 2^32 recycles of ONE slot inside the lifetime of one entry (<= 128 entries, LRU). A live
+# re-initialisation of the arena file under a running process would reset the generations; the arena
+# is created before any rank attaches (the operator clears the store with the NF down).
 
-def _chain_keys_hold(pool, nodes, rows: torch.Tensor, stems_of, keys_of) -> bool:
+ENV_VOTE_CACHE = "SGLANG_WEG2_A2_VOTE_CACHE"          # default ON; result-neutral (cost only)
+VOTE_CACHE_MAX = 128                                    # >= 32 head rids x 4
+
+#: A2 VOTE-CACHE census (process-wide): hits / full proofs run for the vote / entries stored /
+#: invalidations by cause / fallbacks after a cache error / cumulative microseconds of both paths
+_VOTE_CACHE_N = {"hit": 0, "full": 0, "fill": 0, "unfilled_race": 0, "changed": 0, "state_moved": 0,
+                 "gen_moved": 0, "error": 0, "evicted": 0, "hit_us": 0.0, "full_us": 0.0}
+
+
+def vote_cache_stats() -> dict:
+    """The A2 VOTE-CACHE census (copy)."""
+    return dict(_VOTE_CACHE_N)
+
+
+def _vote_cache_enabled() -> bool:
+    return os.environ.get(ENV_VOTE_CACHE, "1").strip().lower() not in ("0", "false", "off", "no", "")
+
+
+class _VoteKeyCache:
+    """Remembered POSITIVE key proofs of one pool's arena (see the block comment above)."""
+
+    __slots__ = ("d",)
+
+    def __init__(self):
+        from collections import OrderedDict
+        self.d = OrderedDict()
+
+    @staticmethod
+    def sig(keys):
+        return (keys[0], keys[-1], len(keys))
+
+    def drop(self, sig, why):
+        if self.d.pop(sig, None) is not None:
+            _VOTE_CACHE_N[why] += 1
+
+    def hit(self, arena, ar: torch.Tensor, keys) -> bool:
+        """True only when the remembered proof of exactly this chain still holds on the live arena."""
+        if not keys:
+            return False
+        sig = self.sig(keys)
+        e = self.d.get(sig)
+        if e is None:
+            return False
+        ekeys, ear, eslots, egens = e
+        if ekeys != keys or not torch.equal(ear, ar):
+            self.drop(sig, "changed")
+            return False
+        import numpy as np
+        states, gens = arena.slot_state_gens_np(eslots)     # states first, generations second
+        if not bool((states == 2).all()):
+            self.drop(sig, "state_moved")
+            return False
+        if not np.array_equal(gens, egens):
+            self.drop(sig, "gen_moved")
+            return False
+        self.d.move_to_end(sig)
+        return True
+
+    def store(self, keys, ar, eslots, egens):
+        sig = self.sig(keys)
+        self.d[sig] = (list(keys), ar, eslots, egens)
+        self.d.move_to_end(sig)
+        _VOTE_CACHE_N["fill"] += 1
+        while len(self.d) > VOTE_CACHE_MAX:
+            self.d.popitem(last=False)
+            _VOTE_CACHE_N["evicted"] += 1
+
+
+def _vote_cache_of(pool):
+    """The pool's vote cache, or None when it is switched off or the arena cannot serve it."""
+    if not _vote_cache_enabled():
+        return None
+    arena = getattr(pool, "arena", None)
+    if arena is None or not hasattr(arena, "slot_state_gens_np"):
+        return None
+    vc = getattr(pool, "_a2_vote_cache", None)
+    if vc is None:
+        vc = _VoteKeyCache()
+        try:
+            pool._a2_vote_cache = vc
+        except Exception:  # noqa: BLE001 -- a pool that takes no attribute just runs uncached
+            return None
+    return vc
+
+
+def _flat_keys(nodes, keys_of):
+    keys = []
+    for n in nodes:
+        keys.extend(str(k) for k in (keys_of(n) or ()))
+    return keys
+
+
+def _vote_cache_log(why: str) -> None:
+    n = _VOTE_CACHE_N
+    tot = n["hit"] + n["full"]
+    k = n["fill"] + n["gen_moved"] + n["state_moved"] + n["changed"] + n["error"]
+    if why == "hit":
+        if n["hit"] not in (1, 64) and n["hit"] % 8192:
+            return
+    elif k > 16 and (k & (k - 1)):
+        return
+    logger.info(
+        "A2 VOTE-CACHE %s hits=%d full=%d (of %d vote proofs) fill=%d unfilled_race=%d invalidated: "
+        "changed=%d state=%d gen=%d error=%d evicted=%d mean_us hit=%.0f full=%.0f -- a hit re-reads the "
+        "live arena (states, generations) against the remembered key->slot proof; the load-time proof "
+        "stays the full find",
+        why, n["hit"], n["full"], tot, n["fill"], n["unfilled_race"], n["changed"], n["state_moved"],
+        n["gen_moved"], n["error"], n["evicted"],
+        n["hit_us"] / max(1, n["hit"]), n["full_us"] / max(1, n["full"]))
+
+
+def _chain_keys_hold(pool, nodes, rows: torch.Tensor, stems_of, keys_of, *, vote=None, keys=None) -> bool:
     """A2 CHAIN-KEY (nf-h54-review-1015 B1): the clean-chain fast path of
     ``provable_pages`` / ``verify_load_chain``, PROVEN. ``rows`` are the chain's
     arena rows (host ids - S), already whole distinct pages (``_chain_clean``).
@@ -240,27 +395,53 @@ def _chain_keys_hold(pool, nodes, rows: torch.Tensor, stems_of, keys_of) -> bool
     and the load put the other key's KV under these tokens -- silently. Whole
     pages say nothing about WHOSE page it is; only the key does.
 
+    ``vote``: the pool's ``_VoteKeyCache`` when this is the usable VOTE's proof
+    (``provable_pages``): a success is remembered as a key->slot->generation fact
+    (A2 VOTE-CACHE above). The load-time proof (``verify_load_chain``) passes None
+    and is always the full ``find``. ``keys``: the chain's flat keys when the
+    caller already built them.
+
     Without an arena there is nothing to prove against (unchanged)."""
     arena = getattr(pool, "arena", None)
     if arena is None or not hasattr(arena, "find_slots_np"):
         return True
     P = _psz(pool)
-    keys = []
-    for n in nodes:
-        keys.extend(str(k) for k in (keys_of(n) or ()))
+    if keys is None:
+        keys = _flat_keys(nodes, keys_of)
     first = (rows.view(-1, P)[:, 0] if P > 1 else rows).to(torch.int64)
     _CHAIN_KEY_N[0] += 1
     ok = len(keys) == int(first.numel())
     bad_at = None
     if ok and keys:
         import numpy as np
-        slots, states = arena.find_slots_np(stems_of(keys))
         want = (first // P).numpy() if P > 1 else first.numpy()
+        g0 = None
+        if vote is not None:
+            try:
+                g0 = arena.slot_state_gens_np(want)[1]       # BEFORE the proof (see FILL above)
+            except Exception:  # noqa: BLE001 -- a cache error is a cost, never a different value
+                _VOTE_CACHE_N["error"] += 1
+                g0 = None
+        t0 = time.perf_counter()
+        slots, states = arena.find_slots_np(stems_of(keys))
+        if vote is not None:
+            _VOTE_CACHE_N["full"] += 1
+            _VOTE_CACHE_N["full_us"] += (time.perf_counter() - t0) * 1e6
         good = (np.asarray(slots, dtype=np.int64) == want) & (np.asarray(states) == 2)
         ok = bool(good.all())
         if not ok:
             j = int(np.argmin(good))
             bad_at = (j, int(want[j]), int(slots[j]), int(states[j]))
+        elif vote is not None and g0 is not None:
+            try:
+                s1, g1 = arena.slot_state_gens_np(want)      # AFTER the proof
+                if np.array_equal(g0, g1) and bool((s1 == 2).all()):
+                    vote.store(keys, rows, np.asarray(want, dtype=np.int64).copy(), g1)
+                    _vote_cache_log("fill")
+                else:
+                    _VOTE_CACHE_N["unfilled_race"] += 1      # a slot moved under the proof: not remembered
+            except Exception:  # noqa: BLE001
+                _VOTE_CACHE_N["error"] += 1
     if not ok:
         _CHAIN_KEY_N[1] += 1
         k = _CHAIN_KEY_N[1]
@@ -577,9 +758,27 @@ def provable_pages(pool, nodes, rows_of, stems_of, *, keys_of=None, own_hash=Non
     rows = torch.cat([rows_of(n).reshape(-1) for n in nodes])
     total = int(rows.numel()) // P
     ar = rows.to("cpu", dtype=torch.int64) - S
-    if not _chain_shifted(nodes, keys_of, p_chain, page0) and _chain_clean(P, ar) \
-            and _chain_keys_hold(pool, nodes, ar, stems_of, keys_of):   # A2 CHAIN-KEY
-        return total, total
+    if not _chain_shifted(nodes, keys_of, p_chain, page0):
+        vote = _vote_cache_of(pool)
+        keys = None
+        if vote is not None:
+            # A2 VOTE-CACHE (nf-a2cost-1015): the vote's proof re-validates a remembered key->slot
+            # proof against the live arena instead of hashing the chain again (see the block above)
+            try:
+                keys = _flat_keys(nodes, keys_of)
+                t0 = time.perf_counter()
+                if vote.hit(pool.arena, ar, keys):
+                    _VOTE_CACHE_N["hit"] += 1
+                    _VOTE_CACHE_N["hit_us"] += (time.perf_counter() - t0) * 1e6
+                    _vote_cache_log("hit")
+                    return total, total
+            except Exception:  # noqa: BLE001 -- a cache error is a cost, never a different value
+                _VOTE_CACHE_N["error"] += 1
+                _vote_cache_log("error")
+                vote = None
+        if _chain_clean(P, ar) and _chain_keys_hold(pool, nodes, ar, stems_of, keys_of,
+                                                    vote=vote, keys=keys):   # A2 CHAIN-KEY
+            return total, total
     _plans, stop, total = _chain_plan(pool, nodes, rows_of, stems_of, keys_of, own_hash,
                                       p_chain, page0, prior0)
     return (total if stop is None else int(stop[0])), total

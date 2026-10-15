@@ -850,6 +850,30 @@ class ShmArena:
         st = u32.reshape(self.slots, hb // 4)[:, 0]
         return [int(st[int(s)]) if 0 <= int(s) < self.slots else -1 for s in slots]
 
+    def slot_state_gens_np(self, slots):
+        """A2 VOTE-CACHE: ``(states, gens)`` of these slots, numpy int64 each
+        (-1 for a slot out of range), no key hashing, no strings: one strided
+        header read plus the ``arena_slot_gens`` call.
+
+        ORDER IS THE CONTRACT: the states are read FIRST, the generations
+        AFTER. A generation only moves forward, so ``gen(after) == G`` proves
+        ``gen(before) == G`` too -- a state read ahead of a matching
+        generation belongs to that very generation. (The other order would
+        pair a stale generation with the state of a recycled slot.)"""
+        import numpy as np
+        a = np.ascontiguousarray(np.asarray(slots, dtype=np.int64))
+        states = np.full(a.shape, -1, dtype=np.int64)
+        if a.shape[0]:
+            ok = (a >= 0) & (a < self.slots)
+            out = (ctypes.c_int64 * 6)()
+            self._lib.arena_layout(self.slots, self.slot_bytes, out)
+            hb, hoff = int(out[0]), int(out[3])
+            u32 = np.frombuffer(self._mm, dtype=np.uint32, count=self.slots * hb // 4, offset=hoff)
+            col = u32.reshape(self.slots, hb // 4)[:, 0]
+            states[ok] = col[a[ok]]
+            del col, u32          # a live view would pin the mmap against close()
+        return states, self.slot_gens_np(a)
+
     def slot_gens_np(self, slots):
         """A2: the generation of each slot (-1 out of range), numpy int64 --
         one C call (arena_slot_gens). The reference ledger stamps every
