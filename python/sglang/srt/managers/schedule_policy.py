@@ -2082,6 +2082,36 @@ class PrefillAdder:
             return None
         return self.scheduled_extents.get(req.rid)
 
+    def _weg2_chunk_grain(self) -> int:
+        """K11: where the end of a chunk that stays chunked may land -- the
+        end-anchor grain (`_weg2_end_anchor_grain`): the QSA compress ratio or
+        page on a QSA pool, 1 everywhere else. An allocator without
+        `get_kvcache` (a desk double) is not a QSA pool."""
+        alloc = getattr(self, "token_to_kv_pool_allocator", None)
+        if alloc is None or not callable(getattr(alloc, "get_kvcache", None)):
+            return 1
+        return int(_weg2_end_anchor_grain(alloc, int(getattr(self, "page_size", 1) or 1)))
+
+    def _weg2_floor_chunk_to_grain(self, start: int, length: int) -> int:
+        """K11: shorten a TRUNCATED chunk [start, start+length) so its end is a
+        grain multiple; 0 means the budget does not reach the next boundary
+        (the caller parks). Unchanged when the grain is 1."""
+        g = self._weg2_chunk_grain()
+        if g <= 1:
+            return int(length)
+        end = (int(start) + int(length)) // g * g
+        return max(0, end - int(start))
+
+    def _weg2_park_chunked_in_place(self, req: Req) -> None:
+        """K11's copy of the #679 park (`if grant <= 0:` in add_chunked_req,
+        kept inline there because test_weg2_park_xsn303 pins its text): the
+        request keeps its place at the chunk boundary (`Range(prefix,
+        prefix)`); under the weg2 park the scheduler turns it into a rows-back
+        park at the head of the next step (Punkt 2)."""
+        req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices))
+        if _weg2_park_on():
+            req.weg2_pool_parked = True
+
     def _weg2_end_anchor_split(self, req: Req, start: int, length: int):
         """#1233 END-OF-PREFILL ANCHOR: (length, forced_chunked).
 
@@ -2649,6 +2679,34 @@ class PrefillAdder:
         truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
         if truncated:
+            # K11 (NF h16p 226aad7105, P.log 29069/29397, 15.10. 12:39:42Z):
+            # a budget-bound continuation (rem_total_tokens 9586 at a 94 % PP0
+            # pool) ended at 58546, so the NEXT chunk's prefix split a QSA
+            # group (58546 % 4 == 2) and `_qsa_build_write_plan`'s
+            # `prefix_lens % ratio` device assert took PP0 down. The end of a
+            # chunk that stays chunked lands on the same grain as the
+            # end-anchor cut (fnFL2x14); 1 off QSA, so nothing changes there.
+            # PP0 decides it here and its rows carry the extent: a follower
+            # that is told runs `_add_scheduled_req` above and never reaches
+            # this line, so every stage gets the same end.
+            new_len = self._weg2_floor_chunk_to_grain(
+                len(req.prefix_indices), new_len
+            )
+            if new_len <= 0:
+                # The budget does not reach the next grain boundary: the #679
+                # park, not a chunk that would poison the next prefix.
+                self._weg2_park_chunked_in_place(req)
+                logger.warning(
+                    "chunked prefill PARKED (K11 QSA-CHUNK-GRAIN): rid=%s "
+                    "prefix=%d budget=%d does not reach the next grain "
+                    "boundary (grain %d). The request keeps its place and is "
+                    "retried when memory frees.",
+                    getattr(req, "rid", "?"),
+                    len(req.prefix_indices),
+                    int(_rem_tokens),
+                    self._weg2_chunk_grain(),
+                )
+                return req
             # P-FORK-CUT: end this chunk at the shared-prefix fork when that is free.
             new_len = _weg2_p_fork_cut.apply(
                 self, req, len(req.prefix_indices), new_len, "add_chunked_req"
@@ -2840,6 +2898,11 @@ class PrefillAdder:
 
             # Chunked prefill
             trunc_len = self.rem_chunk_tokens
+            # K11: a chunk that stays chunked ends on the QSA grain (1 off QSA);
+            # a leftover rem_chunk_tokens from an earlier admission is not one.
+            trunc_len = self._weg2_floor_chunk_to_grain(0, trunc_len)
+            if trunc_len <= 0:
+                return AddReqResult.OTHER
 
             assert len(req.prefix_indices) == 0
             req.set_extend_range(
