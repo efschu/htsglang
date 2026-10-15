@@ -134,7 +134,9 @@ def test_the_reap_passes_the_reduced_values():
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
     src = inspect.getsource(UnifiedRadixCache.check_prefetch_progress)
-    assert "reap_full(int(min_completed_tokens), int(_hit_tokens), bool(_probed))" in src
+    # H16N-REVIEW 1015: the RAW reduced ENDS (bit-identical on every rank), not the
+    # per-rank unpacked counts (test_weg2_h16n_review_1015)
+    assert "reap_full(int(_synced_end), int(_hit_end), bool(_probed))" in src
     i = src.index("reap_full(")
     assert "_hit_tokens_local" not in src[i:i + 200]
     assert src.index("_reap_annotation_from_packed(packed)") < i

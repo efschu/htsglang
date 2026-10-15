@@ -9043,10 +9043,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # TAIL-CONSUME-ON-FULL (h48 weg2-182-1661): the H63b receipt only at a
         # FULL reap -- judged on the GROUP-SYNCED END and hit (the reduced
         # vector above: one verdict on every rank of the group), never on this
-        # rank's completed_tokens / _hit_tokens_local
+        # rank's completed_tokens / _hit_tokens_local.
+        # H16N-REVIEW 1015 (raenge-nie-uneins): judged on the RAW reduced ENDS
+        # (_synced_end, _hit_end) -- bit-identical on every rank. The unpacked
+        # counts subtract THIS rank's HP1 end base and clamp at 0: on a Form A
+        # group (TP0 base 0, the workers 32704) with the length-space probe MIN
+        # (hit 896) a worker reads hit 0 -> full=True while TP0 reads
+        # completed < 896 -> full=False; the workers would remove the shared
+        # tail files TP0 defers. E_end >= H_end is TP0's own verdict (base 0).
         tail_adopt.agree(
             req_id, int(packed[_REAP_SLOT_TAIL_VOTE].item()),
-            full=tail_adopt.reap_full(int(min_completed_tokens), int(_hit_tokens), bool(_probed)),
+            full=tail_adopt.reap_full(int(_synced_end), int(_hit_end), bool(_probed)),
             completed_synced=int(min_completed_tokens), hit_synced=int(_hit_tokens),
         )
         # #257 (b): a read that ended short keeps only what a recurrent anchor
