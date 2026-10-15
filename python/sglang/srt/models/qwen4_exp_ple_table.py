@@ -1096,6 +1096,26 @@ def ple_row_pages(table: "CheckpointMappedPleTable", rows) -> list:
     return [int(p) << _PAGE_SHIFT for p in ordered.tolist()]
 
 
+#: FLIPSTALL-1015: the page touch of :func:`warm_ple_rows`. ``ctypes.memmove``
+#: is a CFUNCTYPE: ctypes RELEASES the GIL around the call, so a major fault
+#: inside it blocks only this thread. ``ctypes.string_at`` (the touch before)
+#: is a PYFUNCTYPE (``_string_at = PYFUNCTYPE(...)``) and HOLDS the GIL through
+#: the fault: on NF h16n D TP0 (06:56:07-06:57:02Z, host swap storm) the warm
+#: thread touched 6049 cold pages in 55270 ms (~9 ms per fault, all of it with
+#: the GIL), and the scheduler thread of the same process -- the one that
+#: answers /get_server_info, takes the park RPC and enters every group
+#: collective -- ran only between faults. The TP1/TP2 intake of weg2-88-1054
+#: then waited 12.7 s for TP0 (``#1474 INTAKE total_ms=12688/13037`` against
+#: TP0's 365).
+_PAGE_TOUCH = ctypes.memmove
+
+
+def _touch_page(addr: int, scratch) -> None:
+    """Fault one byte of ``addr`` into this mapping (page cache + PTE) without
+    holding the GIL while the kernel serves the fault."""
+    _PAGE_TOUCH(scratch, ctypes.c_void_p(addr), 1)
+
+
 def warm_ple_rows(table: "CheckpointMappedPleTable", rows, max_pages: int,
                   deadline_s: float = _PLE_WARM_DEADLINE_S) -> dict:
     """Fault the pages of ``rows`` into this process's mapping. Every page is
@@ -1109,6 +1129,7 @@ def warm_ple_rows(table: "CheckpointMappedPleTable", rows, max_pages: int,
     if max_pages > 0:
         pages = pages[: int(max_pages)]
     vec = (ctypes.c_ubyte * 1)()
+    scratch = (ctypes.c_ubyte * 1)()
     warm = cold = unmapped = touched = 0
     for addr in pages:
         state = _mincore_page(addr, vec)
@@ -1121,7 +1142,7 @@ def warm_ple_rows(table: "CheckpointMappedPleTable", rows, max_pages: int,
         cold += 1
         if _time.monotonic() - t0 > deadline_s:
             continue
-        ctypes.string_at(addr, 1)  # the fault: page cache + this mapping's PTE
+        _touch_page(addr, scratch)  # the fault: page cache + this mapping's PTE, GIL released
         touched += 1
     return {
         "rows": int(torch.as_tensor(rows).numel()),

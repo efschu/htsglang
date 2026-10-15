@@ -1681,6 +1681,11 @@ class Weg2ParkRunningReqOutput(BaseReq, kw_only=True):
     lane: bool = False
     #: lane park only: {requested rid: why it was not parked}
     lane_skipped: Dict[str, str] = {}
+    #: FLIPSTALL-1015: wall clock (time.time()) of the moment the flip park
+    #: answered -- D's awake re-queue clock starts there (d_park_runtime.
+    #: park_answer_stamp); the front starts its lapse clock there too. 0.0 =
+    #: not stamped (old D, lane park, refusal): the front keeps its pre-RPC stamp.
+    answered_at: float = 0.0
 
 
 class Weg2LaneFloorReqInput(BaseReq, kw_only=True):

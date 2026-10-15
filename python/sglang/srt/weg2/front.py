@@ -5731,8 +5731,10 @@ class Front:
         late: List[str] = []
         if phase_policy.park_late_hold(code, text):
             late = [r for r in self._flip_ledger(D) if r not in rids]
+        # FLIPSTALL-1015: the lapse clock starts where D's re-queue clock does (its answer)
+        t_lapse = phase_policy.park_lapse_stamp(t_park, phase_policy.park_answered_at(code, text), time.time())
         for r in known + late:
-            self._d_parked[r] = t_park
+            self._d_parked[r] = t_lapse
         _ps = getattr(self, "_park_stuck", None)  # #287 NEED0 (c): the streak, as IPC
         if _ps is not None:
             _ps().note_park(known + late)

@@ -108,6 +108,41 @@ def rearm_window_draft_cold(sched, reqs) -> int:
     return n
 
 
+def park_answer_stamp(sched, flip_list, *, late_hold: bool) -> float:
+    """FLIPSTALL-1015 (NF h16n 17c2563647, D epoch 90, 06:56:31-06:57:02Z):
+    the awake re-queue clock of a flip park (``d_seats.SINCE_ATTR``, read by
+    ``park_tick`` against ``SGLANG_WEG2_D_PARK_AWAKE_REQUEUE_S`` = 30 s) and
+    the late hold's clock start when the park ANSWERS -- the front can begin
+    the sleep only after it has the answer. Before, both were stamped right
+    after the retraction, ahead of the park's own phases (HY settle, #248
+    PARK-MARK, #59b depths). Under a host swap storm those phases took 31 s
+    (``WEG2-FLIPCYCLE stage=park ms=31311 sub=...yield:21732,l3mark:9334``),
+    the stamp was 31 s old when ``park_running`` returned, and the very next
+    pass re-queued the whole park (``WEG2-D-PARK requeue (awake)`` 06:57:02,
+    same second as the answer): D admitted weg2-88-1054 and blocked its
+    scheduler thread 72 s in that request's load-back (``WEG2-POST-WAKE-PASS
+    schedule_ms=72024 init_new_ms=66794``) while the front, told the requests
+    were parked, began the D->P flip -- its drain witness got no
+    /get_server_info answer for 12 s: ``WEG2 STOP W3
+    Weg2DrainWitnessUnreachable``. The park undid itself; the bound measured
+    the park's own duration, not the front's.
+
+    Replicated: every rank stamps its own monotonic clock at the end of the
+    same park; ``park_tick`` MIN-reduces the verdict over the group as before
+    (weg2xsn296), so no rank decides alone.
+
+    Returns the same moment on the wall clock (``time.time()``; the front runs
+    on the same host): the answer carries it (``answered_at``) and the front
+    starts its own lapse clock for the parked rids there
+    (``phase_policy.park_lapse_stamp``) -- D and front lapse together again."""
+    answered = time.monotonic()
+    answered_wall = time.time()
+    for req in flip_list:
+        setattr(req, d_seats.SINCE_ATTR, answered)
+    setattr(sched, LATE_HOLD_ATTR, answered if late_hold else None)
+    return float(answered_wall)
+
+
 def park_running(sched, recv_req, *, late_hold_armed: bool = False):
     """Retract every running D request RETAINING its span (KV, the node's
     GDN/Mamba anchor, the draft rows) with a forced host write-through -- the
@@ -289,13 +324,12 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
     # monotonic, like every stamp here; park_tick MIN-reduces the verdict.
     # PRIORITY LANES 1008 (L2): a lane hold keeps its own stamp and is no part of this flip park's answer
     _flip_list = [r for r in sched.weg2_d_parked if not d_lane.lane_held(r)]
-    for req in _flip_list:
-        setattr(req, d_seats.SINCE_ATTR, now)
     sched._weg2_d_park_slept = False
     # PARK-SETTLE: the settle is in the park list now (above), so nothing
     # releases into the queue behind the park's back -- the late hold holds.
+    # FLIPSTALL-1015: the clock of both (SINCE, LATE_HOLD) is stamped where
+    # the park ANSWERS (park_answer_stamp, below), not here.
     late_hold = bool(late_hold_armed)
-    setattr(sched, LATE_HOLD_ATTR, now if late_hold else None)
     setattr(sched, FLIP_PARK_OPEN_ATTR, epoch)  # CAPPARK-FLIP-HOLD: until the sleep / awake re-queue
     rids = [str(r.rid) for r in _flip_list if d_seats.park_site(r) is not None]
     held = [str(r.rid) for r in _flip_list if d_seats.park_site(r) is None]
@@ -323,6 +357,7 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
     _ph("clamp")
     # POOLLEAK-INSTR (2): the idle equation after the park, a line, never a raise
     _poolleak.ledger_line(sched, epoch=epoch, before=_pl_before)
+    answered_at = park_answer_stamp(sched, _flip_list, late_hold=late_hold)
     logger.info("WEG2-FLIPCYCLE stage=park epoch=%d n=%d ms=%.0f floor_ms=%d sub=%s (H3: the park's "
                 "phases on the scheduler thread; floor = the END-state D2H)", epoch, len(retracted),
                 (time.perf_counter() - _t_park0) * 1000.0, 30 * max(1, len(retracted)) // 3 or 10,
@@ -339,7 +374,7 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
     return Weg2ParkRunningReqOutput(
         success=True, parked=rids, held=held, epoch=epoch, late_hold=late_hold,
         message="parked %d, queued behind them %d" % (len(rids), len(held)),
-        weg2_resumable_depth=resumable,
+        weg2_resumable_depth=resumable, answered_at=answered_at,
     )
 
 
