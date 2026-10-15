@@ -10692,8 +10692,21 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     # store read may recycle those rows. Set on the ack and
                     # never on the issue -- an issued write that never landed
                     # would license a free that loses the KV.
-                    if UnifiedRadixCache._weg2_store_ack_complete(self, operation):
+                    _ack_ok = UnifiedRadixCache._weg2_store_ack_complete(self, operation)
+                    _cut = _r12.cut_role()
+                    # K12/H1: on a Form A group l3_present is the GROUP's
+                    # completeness, decided by TP0 and mirrored (R12 L3 event)
+                    # -- never a rank-local ack: TP0 sets it on its complete
+                    # ack (no cut) or on the complete page (cut: every owner
+                    # wrote, the rebind below); a worker only from TP0's event.
+                    # Off R12 (role None) A2's rank-local reading stands.
+                    _h1 = _r12.l3_group_on() and _r12.role() is not None
+                    if not _h1:
+                        if _ack_ok:
+                            node.l3_present = True
+                    elif _r12.role() == "host" and _cut is None and _ack_ok:
                         node.l3_present = True
+                        _r12.record_l3(self, node)
                     self.dec_host_lock_ref(node, lock_params)
                     if _parts is not None:
                         _tn1 = time.perf_counter()
@@ -10702,17 +10715,21 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     # page is complete only when every owner wrote. A worker
                     # keeps its rows until TP0's verdict; TP0 rebinds a
                     # complete page (REBIND) or waits for it.
-                    _cut = _r12.cut_role()
                     if _cut == "worker":
                         _r12.worker_keeps(self, "store-ack-cut", node)
                     elif self._weg2_rebind_host_to_arena(node):
                         # #1424: the rows now ARE the arena slots
                         if _cut == "host":
                             _r12.record_rebind(self, node)
+                            if _h1 and _ack_ok:
+                                # H1: the page is complete (every owner wrote)
+                                node.l3_present = True
+                                _r12.record_l3(self, node)
                     elif _cut == "host" and _r12.await_complete(
                         self, node,
                         fallback_transit=bool(getattr(node, "_weg2_chain_piece", False)
                                               or self._weg2_host_is_transit()),
+                        l3_ok=bool(_h1 and _ack_ok),
                     ):
                         pass
                     elif getattr(node, "_weg2_chain_piece", False) or self._weg2_host_is_transit():
