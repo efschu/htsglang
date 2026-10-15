@@ -561,6 +561,8 @@ def test_a_beat_without_progress_keeps_its_progress_clock(monkeypatch):
     _beat(s, 1, 2.0)  # same room, same locked
     _beat(s, 1, 3.0, room=100000)  # a wobble DOWN is no progress
     assert (o.beats[1].at, o.beats[1].progress_at) == (3.0, 1.0)
+    _beat(s, 1, 3.5)  # ... and the way back UP to the best seen is none either
+    assert (o.beats[1].at, o.beats[1].progress_at) == (3.5, 1.0)
     _beat(s, 1, 4.0, locked=90000)  # the rows others hold shrank
     assert o.beats[1].progress_at == 4.0
     _beat(s, 1, 5.0, locked=95000)  # back up: no progress against the best seen
@@ -813,7 +815,28 @@ def test_the_ring_red_without_the_lifesign_the_same_wait_ends_in_frist_hard(monk
     assert _uniform(ring, RID_L) == 0
 
 
-def _deferring_ring(monkeypatch, room_at, **env):
+def test_the_ring_a_follower_that_stops_beating_is_cut_off_20s_after_its_last_beat(monkeypatch):
+    """The stamps of a beat are on PP0's pass clock (pp0_publish hands ``now`` to pp0_harvest): PP1 beats until
+    t=10 and dies, PP2 beats on -- hard bound 20 s: told=0 for every rank at ~30 s, not at the absolute ceiling."""
+    real_pump = fb.follower_pump
+
+    def pump(sched):
+        if sched.ps.pp_rank == 1 and ring_box["ring"].clock() >= 10.0:
+            return  # PP1 is dead
+        return real_pump(sched)
+
+    ring_box = {}
+    monkeypatch.setattr(fb, "follower_pump", pump)
+    ring_box["ring"] = ring = _deferring_ring(
+        monkeypatch, room_at=1e9, run=300, box=ring_box, **{fb.ENV_WAIT_HARD_S: "20"}
+    )
+    assert _admits(ring) == [(0, 1, None)]
+    assert _uniform(ring, RID_L) == 0
+    verdict_at = ring.stages[0].admitted[0][0] * 0.5  # PP0's pass index x DT
+    assert 28.0 <= verdict_at <= 36.0, verdict_at
+
+
+def _deferring_ring(monkeypatch, room_at, run=400, box=None, **env):
     for k, v in {fb.ENV_FALLBACK: "1", "SGLANG_WEG2_TOLD_ABSOLUTE": "1", **env}.items():
         monkeypatch.setenv(k, v)
     monkeypatch.setattr(m, "_absolute_armed", lambda: True)
@@ -833,8 +856,10 @@ def _deferring_ring(monkeypatch, room_at, **env):
         return 0
 
     monkeypatch.setattr(fb, "_room_own", fake_room)
+    if box is not None:
+        box["ring"] = ring
     ring.arrive(RID_L)
-    ring.run(400)
+    ring.run(run)
     return ring
 
 
