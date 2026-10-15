@@ -12,7 +12,8 @@ parked host writer). After every cycle the LAW GUARDS run (``Guards``):
   G1 every stage admits the same rids at the same depth in every pass (RAENGE-NIE-UNEINS);
   G2 every ack, revoke and release queue of every stage is empty after N frameless cycles;
   G3 the idle vote turns true once the work is done (no W3);
-  G4 no referenced arena page loses its key; a read lands what it was told to land.
+  G4 no referenced arena page loses its key; a read lands what it was told to land; a live writer's reference on
+     its claim survives a take-over (G4c, the slot keeps its generation).
 
 A guard that fires is a group stop by name -- the rig never repairs, never retries, never compensates (hard user
 law raenge-nie-uneins-crash-stop): a detected disagreement is RED, full stop.
@@ -25,6 +26,7 @@ SCENARIOS (one test each, ``test_S<n>_...``; the runner ``tools/weg2_coldstart_r
   S4a arena reap race: a live evictor's candidates reaped, PP0 fills + references them         red without F1 (01:09 death)
   S4b a D clock evicts PP0's landed pages before PP0 references them                           red without REF-AT-LAND (case 8)
   S4c D parks with forced host write-through, P reads the same stems from L3 seconds later     h54 (16/16 JOIN-WAIT tears)
+      + G4c: the D writer node's reference on its old slot survives P's take-over                 red under M1 (A2 1015)
   S5  a vision request over P (row form): every stage admits it in the same pass               self-check by mutant
   S6  LB-VERDICT burst with a late-starting twin on the carrierless form (19:33 hang)          red on 853534a9ff
 
@@ -163,6 +165,24 @@ class Guards:
             raise LawViolation("G4 REFERENCED-PAGE-KEY",
                                f"{len(lost)} referenced page(s) lost their key (stem, slot, find=(slot,state)): {lost[:6]}"
                                " -- the load-back's chain proof fails: ArenaChainMismatch #1424 'key slot -1 (state 0)'")
+
+    @staticmethod
+    def writer_ref_kept(arena, held, what):
+        """G4c (nf-h54-review-1015 Auflage 3): a writer node's reference on its claim survives a take-over -- the
+        old slot keeps its generation (never freed, never recycled) and its reference while the writer lives.
+        ``held`` = [(slot, generation)] the writer process referenced."""
+        if not held:
+            return
+        slots = [int(s) for s, _ in held]
+        census = arena.claim_census(slots)
+        refs = arena.slot_refs(slots) if hasattr(arena, "slot_refs") else [None] * len(slots)
+        lost = [(s, g, c["gen"], c["state"], r) for (s, g), c, r in zip(held, census, refs)
+                if c["gen"] != int(g) or (r is not None and r < 1)]
+        if lost:
+            raise LawViolation("G4 WRITER-REF",
+                               f"{what}: {len(lost)} of {len(held)} slot(s) the live writer references lost it "
+                               f"(slot, gen held, gen now, state now, refs now): {lost[:6]} -- the take-over freed a "
+                               "referenced slot; the writer's node now addresses whatever the slot holds next")
 
     @staticmethod
     def landed_full(landed, want, what):
@@ -1067,10 +1087,12 @@ def _d_parks(path, slots, stems, ready, release, mode):
     and D's group goes dormant after the flip D->P -- the claims stay CLAIMED, the writer stays alive.
 
     ``mode``: ``park_refs`` -- the parked requests hold their host pages (a reader reference per slot);
-    ``tp_merges`` -- TP0 merged its extent at once, TP1's merges trickle in during P's read (each one refreshes the
+    ``tp_merges`` -- TP0 merged its extent at once and its node references the partial slot (``complete_write``
+    references status <= 2), TP1's merges trickle in during P's read (each one refreshes the
     claim's progress, metal: ``ARENA-REF-CENSUS-CLAIM claimed=200 oldest=3603/10583ms/pid857/host-write/g76/open0``
     13 s after the park), TP2 is dormant before its own -- the slot never turns COMPLETE;
-    ``none`` -- open claims, no reference, no merge (the control)."""
+    ``none`` -- open claims, no reference, no merge (the control).
+    ``ready`` receives ``(fresh claims, [(slot, generation) the writer references])`` (G4c WRITER-REF)."""
     try:
         from sglang.srt.mem_cache.storage.file import hicache_arena as ha
 
@@ -1082,11 +1104,17 @@ def _d_parks(path, slots, stems, ready, release, mode):
         for slot, _g in fresh:
             arena.slot_view(slot, TOTAL)[:TOTAL] = b"\x11" * TOTAL
         third = TOTAL // 3
+        held = []
         if mode == "park_refs" and fresh:
             arena.ref_slots([s for s, _ in fresh], +1)
+            held = list(fresh)
         if mode == "tp_merges" and fresh:
-            arena.complete_slots([s for s, _ in fresh], [g for _, g in fresh], [(0, third)])      # TP0
-        ready.send(len(fresh))
+            st = arena.complete_slots([s for s, _ in fresh], [g for _, g in fresh], [(0, third)])      # TP0
+            took = [f for f, x in zip(fresh, st) if int(x) <= 2]       # complete_write: its node's reference
+            if took:
+                arena.ref_slots([s for s, _ in took], +1)
+            held = took
+        ready.send((len(fresh), held))
         if mode == "tp_merges":
             k = 0
             while not release.poll(0.04):                                                    # TP1, one slot a tick
@@ -1120,8 +1148,10 @@ def _s4c(tmp_path, monkeypatch, mode):
     try:
         if not r_ready.poll(30):
             raise RigError("D's park process did not claim in 30 s")
-        claimed = r_ready.recv()
+        claimed, d_held = r_ready.recv()
         assert claimed == len(overlap), f"D claimed {claimed} of {len(overlap)}"
+        if mode in ("park_refs", "tp_merges") and len(d_held) != claimed:
+            raise RigError(f"D's writer referenced {len(d_held)} of its {claimed} claims")
         time.sleep(0.3)                                                 # 3 s after the park, scaled
         from sglang.srt.mem_cache.hicache_storage import PREFETCH_IO_THREAD_PREFIX
 
@@ -1150,6 +1180,7 @@ def _s4c(tmp_path, monkeypatch, mode):
         Guards.landed_full(len(refs), len(stems), f"P's L3 read after D's park (waited {waited:.2f} s, "
                                                   f"{len(overlap)} stems under D's host-write claims)")
         Guards.keys_kept(arena, refs)
+        Guards.writer_ref_kept(arena, d_held, f"D's writer node after P's read (mode {mode})")
     finally:
         try:
             w_rel.send(1)
@@ -1169,8 +1200,9 @@ def test_S4c_d_park_host_write_then_p_l3_read(tmp_path, monkeypatch):
 
 
 def test_S4c3_d_park_tp_merges_trickle_then_p_l3_read(tmp_path, monkeypatch):
-    """S4c, second reading of the metal: no reference, but D's TP ranks merge their extents of the host-write claims
-    at different times (TP2 dormant before its own): the claims stay CLAIMED and their progress keeps moving."""
+    """S4c, second reading of the metal: D's TP ranks merge their extents of the host-write claims at different times
+    (TP2 dormant before its own): the claims stay CLAIMED, their progress keeps moving, and TP0's node references the
+    partial slot it merged into (``complete_write``, status <= 2). G4c: that reference survives P's take-over."""
     _s4c(tmp_path, monkeypatch, mode="tp_merges")
 
 
