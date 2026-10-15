@@ -244,11 +244,17 @@ def test_a_cache_error_falls_back_to_the_full_proof(tmp_path):
     def boom(slots):
         raise RuntimeError("header view gone")
 
+    real = arena.slot_state_gens_np
+    assert _provable(pool, nodes) == (4, 4)                       # warm: an entry exists
     arena.slot_state_gens_np = boom
-    assert _provable(pool, nodes) == (4, 4)
-    assert _provable(pool, nodes) == (4, 4), "never an exception into the vote, never another value"
+    assert _provable(pool, nodes) == (4, 4), "the HIT path fails: the full proof answers, no exception into the vote"
     st = ap.vote_cache_stats()
-    assert st["error"] >= 2 and st["hit"] == 0
+    assert st["error"] >= 2 and st["hit"] == 0, st                # the hit's error + the fill's error
+    arena.slot_state_gens_np = real
+    pool._a2_vote_cache.d.clear()
+    arena.slot_state_gens_np = boom
+    assert _provable(pool, nodes) == (4, 4)                       # cold: only the fill path fails
+    assert _provable(pool, nodes) == (4, 4), "never an exception into the vote, never another value"
 
     # a broken chain still cuts through the error path
     nodes[1].hash_value[1] = "zz"
