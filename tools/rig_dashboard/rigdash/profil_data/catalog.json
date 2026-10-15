@@ -29686,7 +29686,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2652
+      "line": 2666
      }
     }
    },
@@ -29741,7 +29741,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2642
+    "line": 2656
    },
    "status": "geerntet",
    "text": "",
@@ -29764,7 +29764,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2688
+      "line": 2702
      }
     }
    },
@@ -38483,7 +38483,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 4761
+    "line": 4775
    },
    "status": "unerklaert",
    "text": "",
@@ -38801,7 +38801,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 4760
+    "line": 4774
    },
    "status": "geerntet",
    "text": "",
@@ -39354,7 +39354,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2303
+    "line": 2317
    },
    "status": "geerntet",
    "text": "",
@@ -39377,7 +39377,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2663
+      "line": 2677
      }
     }
    },
@@ -39546,7 +39546,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2667
+      "line": 2681
      }
     }
    },
@@ -39746,7 +39746,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2080
+    "line": 2094
    },
    "status": "geerntet",
    "text": "",
@@ -47725,7 +47725,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2312
+    "line": 2326
    },
    "status": "geerntet",
    "text": "",
@@ -47753,7 +47753,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2317
+    "line": 2331
    },
    "status": "geerntet",
    "text": "",
@@ -48781,7 +48781,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 3513
+    "line": 3527
    },
    "status": "kuratiert",
    "text": "H88: Umgebungsform von --moe-act-int8 on: die int4-Experten (compressed-tensors WNA16, MoE) rechnen mit int8-Aktivierungen (W4A8) statt mit 16-Bit-Aktivierungen (W4A16). Standard aus; einer der beiden Schalter genügt. Dieser Baum hat das W4A8-MoE-Schema (CompressedTensorsWNA16A8MoE, H88-B): mit dem Schalter an wählt die Schema-Auswahl es für die int4-Expertenschichten auf CUDA (dynamische int8-Aktivierung je Token, Marlin-W4A8-Kernel); zusammen mit --moe-runner-backend triton bricht der Start mit RuntimeError ab. Ein Baum ohne das Schema bräche mit dem Text ab: MOE-ACT-INT8 requested but no W4A8 MoE scheme in this tree.",
@@ -53904,7 +53904,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1806
+    "line": 1820
    },
    "status": "geerntet",
    "text": "",
@@ -65135,7 +65135,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2537
+    "line": 2551
    },
    "status": "geerntet",
    "text": "",
@@ -65543,7 +65543,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1745
+    "line": 1759
    },
    "status": "erklaert",
    "text": "Protection against a mutual blockade when waking D to P: two groups wait in a circle for memory room. On: the waiting part counts its own waiting from the start of the wait; the resolution (swapping the rest out to host RAM) begins after about 0.1 s instead of about 0.6 s. Off: only after the wait flag has gone up after 0.5 s. Default off (preparation/experiment, \"Default off until metal A/B\"). According to the code necessary before SGLANG_OPT_WEG2_DRAFT_PARK_SKIP_UNCHANGED (is off) goes on again. Related: SGLANG_WEG2_BAR1_SPILL_GRACE_S (0.1 s). Acts only for the sending side. Not verified individually on the metal. No user value recognizable.",
@@ -66168,7 +66168,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2059
+      "line": 2073
      }
     }
    },
@@ -71260,7 +71260,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 3796
+      "line": 3810
      }
     }
    },
@@ -71572,7 +71572,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2163
+      "line": 2177
      }
     }
    },
@@ -71650,7 +71650,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4468
+      "line": 4482
      }
     }
    },
@@ -71757,7 +71757,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2681
+      "line": 2695
      }
     }
    },
@@ -71862,7 +71862,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1943
+    "line": 1957
    },
    "status": "erklaert",
    "text": "Collect rule for short requests when D is prefilling instead of decoding: on, a short request (that would go to D by itself) that was granted to D and has not yet delivered a first token counts as work on D. The next short requests that arrive meanwhile are collected for the window (SGLANG_WEG2_DECODE_COLLECT_WINDOW_S) and priced as a SUM together with those open tokens against the X limit; what does not fit goes to the P batch. Off: the old blind path, every short request is checked alone against X and an idle D takes all of them (six shorts of 6239 tokens within one second: 37k tokens prefilled on D, about 53 s). Default on in the NF tree (since 10.10.; metal int23xsum2 09.10.: 6 x 5200 on an idle D, one seat on D, five to the P batch). With the collect window at 0 (SGLANG_WEG2_DECODE_COLLECT_WINDOW_S) only the collecting is off; the booking still prices the queue-take of waiting shorts and the short drain.",
@@ -72120,7 +72120,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2183
+    "line": 2197
    },
    "status": "geerntet",
    "text": "",
@@ -72378,7 +72378,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2087
+    "line": 2101
    },
    "status": "geerntet",
    "text": "",
@@ -72401,7 +72401,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2672
+      "line": 2686
      }
     }
    },
@@ -72623,7 +72623,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4448
+      "line": 4462
      }
     }
    },
@@ -73368,7 +73368,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2098
+    "line": 2112
    },
    "status": "geerntet",
    "text": "",
@@ -73396,7 +73396,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2093
+    "line": 2107
    },
    "status": "geerntet",
    "text": "",
@@ -75910,6 +75910,34 @@
    "text": "",
    "type": "EnvInt"
   },
+  "SGLANG_WEG2_IDLE_TRIM": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "True",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "MEMRANK-1015: the bounded idle malloc_trim of IdleCensus (>= 8 MiB of anon growth over the lowest reading since the last trim, at most once per census period, only while the group is idle). It was dead code (trimmed=0 in 378 lines of boot ...042125). Default ON; 0 = off.",
+   "id": "SGLANG_WEG2_IDLE_TRIM",
+   "kind": "env",
+   "level": "experte",
+   "name": "SGLANG_WEG2_IDLE_TRIM",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "baum": "nf",
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 1688
+   },
+   "status": "geerntet",
+   "text": "",
+   "type": "EnvBool"
+  },
   "SGLANG_WEG2_IDLE_VOTE_NO_REWANT": {
    "baeume": [
     "27b",
@@ -76017,7 +76045,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4568
+      "line": 4582
      }
     }
    },
@@ -77594,7 +77622,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2548
+    "line": 2562
    },
    "status": "geerntet",
    "text": "",
@@ -78740,6 +78768,62 @@
    "text": "",
    "type": "os.environ"
   },
+  "SGLANG_WEG2_MEM_RANK": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "True",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "MEMRANK-1015: one WEG2-MEM-RANK line per process (P PP0-2, D TP0-2, front, tokenizer manager, detokenizer) every SGLANG_WEG2_MEM_RANK_S seconds: RSS / RssAnon / RssShmem / VmLck / VmSwap, Python blocks vs glibc in-use/free, pinned host bytes, the sizes of the long-lived per-request tables (weg2/mem_rank.py). Local (/proc + len()), no collective, never raises. Default ON; 0 = off. Host MemAvailable 1.6-2.3 GiB at NF: the growth of anon (~4 GiB in 2.5 h) had no per-process series before this line.",
+   "id": "SGLANG_WEG2_MEM_RANK",
+   "kind": "env",
+   "level": "experte",
+   "name": "SGLANG_WEG2_MEM_RANK",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "baum": "nf",
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 1682
+   },
+   "status": "geerntet",
+   "text": "",
+   "type": "EnvBool"
+  },
+  "SGLANG_WEG2_MEM_RANK_S": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "60.0",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "",
+   "id": "SGLANG_WEG2_MEM_RANK_S",
+   "kind": "env",
+   "level": "experte",
+   "name": "SGLANG_WEG2_MEM_RANK_S",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "baum": "nf",
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 1683
+   },
+   "status": "unerklaert",
+   "text": "",
+   "type": "EnvFloat"
+  },
   "SGLANG_WEG2_METRICS_MODEL": {
    "baeume": [
     "27b",
@@ -78815,7 +78899,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4377
+      "line": 4391
      }
     }
    },
@@ -79407,7 +79491,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2528
+    "line": 2542
    },
    "status": "erklaert",
    "text": "If a paused (parked) request is to continue later and the room for Mamba anchors in host RAM is full, its re-entry point gets priority: other intermediate states without a park reference are swapped to disk first, so that the entry point of the parked request is not lost. Off: the old way; parked requests can lose their entry point and recompute. Without a park nothing changes. Acts only on nodes that are marked as parked. Default on. Unverified: dependency on another switch; whether the user should change it (only the decision \"stays on\" of 05.10. ~17:47Z is verified); benefit on the metal (according to the report \"active, effect not shown\").",
@@ -79556,7 +79640,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2005
+    "line": 2019
    },
    "status": "geerntet",
    "text": "",
@@ -79613,7 +79697,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2028
+    "line": 2042
    },
    "status": "geerntet",
    "text": "",
@@ -82966,7 +83050,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 1783
+      "line": 1797
      }
     }
    },
@@ -86769,7 +86853,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4555
+      "line": 4569
      }
     }
    },
@@ -87552,25 +87636,25 @@
    "abweichung": 47,
    "beide": 2461,
    "nur_27b": 180,
-   "nur_nf": 100
+   "nur_nf": 103
   },
-  "entries": 2759,
-  "envs": 1880,
+  "entries": 2762,
+  "envs": 1883,
   "erklaert": 305,
   "flags": 864,
-  "geerntet": 1706,
+  "geerntet": 1708,
   "kuratiert": 125,
-  "unerklaert": 623
+  "unerklaert": 624
  },
- "tree_rev": "27b=02123ee2ef+nf=75e3ee8abd+lbv-deadlock-e23abfcb05+prio-alter-fa99a484ae+w3-drain-e7cfda7fbe+follower-round-b76e5fce79+h16m-int-1014+readdepth-60ad6ba20a+h16n-int-1015+h54-park-join-1015+chainkey-a2-83f974259f+h64-toldfallback-de76a8dc18+h16o-int-1015+flipstall-31764c30e0+h16o2-int-1015",
+ "tree_rev": "27b=02123ee2ef+nf=75e3ee8abd+lbv-deadlock-e23abfcb05+prio-alter-fa99a484ae+w3-drain-e7cfda7fbe+follower-round-b76e5fce79+h16m-int-1014+readdepth-60ad6ba20a+h16n-int-1015+h54-park-join-1015+chainkey-a2-83f974259f+h64-toldfallback-de76a8dc18+h16o-int-1015+flipstall-31764c30e0+h16o2-int-1015+memrank-1015",
  "trees": {
   "27b": {
    "entries": 2641,
    "rev": "02123ee2ef"
   },
   "nf": {
-   "entries": 2561,
-   "rev": "75e3ee8abd+lbv-deadlock-e23abfcb05+prio-alter-fa99a484ae+w3-drain-e7cfda7fbe+follower-round-b76e5fce79+h16m-int-1014+readdepth-60ad6ba20a+h16n-int-1015+h54-park-join-1015+chainkey-a2-83f974259f+h64-toldfallback-de76a8dc18+h16o-int-1015+flipstall-31764c30e0+h16o2-int-1015"
+   "entries": 2564,
+   "rev": "75e3ee8abd+lbv-deadlock-e23abfcb05+prio-alter-fa99a484ae+w3-drain-e7cfda7fbe+follower-round-b76e5fce79+h16m-int-1014+readdepth-60ad6ba20a+h16n-int-1015+h54-park-join-1015+chainkey-a2-83f974259f+h64-toldfallback-de76a8dc18+h16o-int-1015+flipstall-31764c30e0+h16o2-int-1015+memrank-1015"
   }
  },
  "warnungen": []
