@@ -120,19 +120,20 @@ def test_a3_live_line_carries_roles_and_cgroup_terms():
     assert "roles_anon_gib[none]" in hc.live_line("k", {})
 
 
-def test_a3_sampler_logs_the_live_probe_each_tick(monkeypatch, caplog):
+def test_a3_sampler_logs_the_live_probe_each_tick(monkeypatch, caplog, tmp_path):
     from sglang.srt.weg2 import front
 
     census = {"at": "t", "cg_anon_gib": 1.0, "cg_shmem_gib": 2.0, "skipped_pids": 0,
               "roles_anon_gib": {"server_main": 0.5}}
     ticks = []
     first_done = threading.Event()
-    park = threading.Event()
+    park = threading.Event()  # never set: the daemon thread stays parked after tick 1 (it must not run on
+    #                           with the REAL sample_live / merge_into_record once the monkeypatch is undone)
 
     def _sample(**kw):
         ticks.append(1)
         if len(ticks) > 1:
-            park.wait(5)  # park the daemon thread after the first tick
+            park.wait(3600)
         return census
 
     monkeypatch.setattr(hc, "sample_live", _sample)
@@ -145,9 +146,8 @@ def test_a3_sampler_logs_the_live_probe_each_tick(monkeypatch, caplog):
 
     monkeypatch.setattr(hc, "census_line", _census_line)
     with caplog.at_level(logging.INFO):
-        th = front.start_host_census_sampler("rec.json", "k", "/nonexistent", [], period_s=0.01)
+        th = front.start_host_census_sampler(str(tmp_path / "rec.json"), "k", str(tmp_path), [], period_s=0.01)
         assert first_done.wait(5)
-        park.set()
     assert th.daemon
     msgs = [r.getMessage() for r in caplog.records]
     live = [m for m in msgs if m.startswith(hc.LIVE_MARKER)]
@@ -156,7 +156,7 @@ def test_a3_sampler_logs_the_live_probe_each_tick(monkeypatch, caplog):
     assert msgs.index(live[0]) < msgs.index("WEG2-HOST-CENSUS merged-line")
 
 
-def test_a3_a_failing_live_line_does_not_skip_the_merge(monkeypatch, caplog):
+def test_a3_a_failing_live_line_does_not_skip_the_merge(monkeypatch, caplog, tmp_path):
     from sglang.srt.weg2 import front
 
     merged = threading.Event()
@@ -166,7 +166,7 @@ def test_a3_a_failing_live_line_does_not_skip_the_merge(monkeypatch, caplog):
     def _sample(**kw):
         n.append(1)
         if len(n) > 1:
-            park.wait(5)
+            park.wait(3600)  # parked for good (see the sibling test)
         return {}
 
     def _merge(*a, **k):
@@ -182,9 +182,8 @@ def test_a3_a_failing_live_line_does_not_skip_the_merge(monkeypatch, caplog):
         raise ValueError("format")
 
     monkeypatch.setattr(hc, "live_line", _bad)
-    front.start_host_census_sampler("rec.json", "k", "/nonexistent", [], period_s=0.01)
+    front.start_host_census_sampler(str(tmp_path / "rec.json"), "k", str(tmp_path), [], period_s=0.01)
     assert merged.wait(5)
-    park.set()
 
 
 # ------------------------------------------------------------------ A4
