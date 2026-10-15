@@ -861,6 +861,11 @@ int64_t arena_ref_slots(uint8_t *base, int64_t n, const int64_t *slots, int32_t 
             atomic_store(&sh->clock_bit, 1);
         } else if (delta < 0) {
             if (atomic_load(&sh->refcount) > 0) atomic_fetch_sub(&sh->refcount, 1); else continue;
+            /* A2 (nf-h54-review-1015 B5): the last reference of a QUARANTINE
+             * slot with no open writer frees it now (the release the late
+             * completion does) -- before, it sat in n_claimed until the next
+             * join reap's sweep. quarantine_release re-checks both counts. */
+            if (atomic_load(&sh->state) == S_QUARANTINE) quarantine_release(base, (uint64_t)slots[i]);
         }
         done++;
     }
@@ -1202,6 +1207,10 @@ int64_t arena_unclaim(uint8_t *base, int64_t n, const int64_t *slots, const int6
         if ((int64_t)sh->generation != gens[i]) continue;
         writer_done(sh);
         free_if_abandoned(base, (uint64_t)slots[i]);
+        /* A2 (nf-h54-review-1015 B5): a join given up on a QUARANTINE slot was
+         * its last open writer -- the slot goes now if nobody references it
+         * (the release the late completion does), not at the next sweep */
+        quarantine_release(base, (uint64_t)slots[i]);
         done++;
     }
     return done;
@@ -1233,6 +1242,18 @@ int64_t arena_release_claims(uint8_t *base, int64_t n, const int64_t *slots, con
         if ((int64_t)sh->generation != gens[i]) continue;
         uint32_t st = atomic_load(&sh->state);
         if (st == S_COMPLETE) { writer_done(sh); status[i] = 1; continue; }
+        if (st == S_QUARANTINE) {
+            /* A2 (nf-h54-review-1015 B5): the claim was taken from its key
+             * (H54 take-over / JOIN-IDLE reap) before this writer gave it up.
+             * The writer is resolved like a late completion (writer_done; the
+             * last one out frees it when nobody references it) -- before, it
+             * stayed open until the sweep's backstop. Never a hard free here:
+             * other writers and readers may still hold the slot. */
+            writer_done(sh);
+            quarantine_release(base, (uint64_t)slots[i]);
+            status[i] = 1;
+            continue;
+        }
         if (st != S_CLAIMED) continue;
         uint32_t w = atomic_load(&sh->writers);
         if ((w >> 16) > 1u) {

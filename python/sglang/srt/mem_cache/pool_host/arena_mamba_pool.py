@@ -319,6 +319,7 @@ class ArenaMambaPoolHost(MambaPoolHost):
     _evict_for_claim = ArenaMHAHostPool._evict_for_claim     # H81: the claim's room, no disk I/O
     release_tree_rows = ArenaMHAHostPool.release_tree_rows   # H81: the tree reset's release
     complete_write = ArenaMHAHostPool.complete_write
+    take_lost_slots = ArenaMHAHostPool.take_lost_slots   # A2: the anchors a late ack lost
     abort_write = ArenaMHAHostPool.abort_write
     _slots_of = ArenaMHAHostPool._slots_of
     # xsn356: the borrowed _claim/complete_write/abort_write call these too

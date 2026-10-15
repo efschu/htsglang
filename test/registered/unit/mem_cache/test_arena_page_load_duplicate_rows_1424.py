@@ -145,7 +145,8 @@ def test_two_piece_chain_that_is_whole_pages_passes_on_shape_alone():
     a, b, c = _node(1, ["a"], [0]), _node(2, ["b"], [2]), _node(3, ["c"], [1])  # piece 1 = a+b, piece 2 = c
     host = torch.cat([a.host_value, b.host_value, c.host_value])
     out = ap.verify_load_chain(pool, [a, b, c], host, rows_of=lambda n: n.host_value, stems_of=lambda h: h)
-    assert out is host and arena.finds == 0, "a clean chain costs no arena lookup"
+    # A2 CHAIN-KEY (nf-h54-review-1015 B1): one batched key lookup per clean chain
+    assert out is host and arena.finds == 1, "a clean chain costs one arena lookup"
 
 
 def test_metal_shape_second_piece_on_a_foreign_slot_is_repointed_and_loads_its_own_bytes():
@@ -238,7 +239,7 @@ def test_two_requests_sharing_the_second_piece_merge_into_duplicates_the_gather_
     chain1 = [_node(1, ["a"], [0]), _node(3, ["c"], [1])]
     chain2 = [_node(2, ["b"], [2]), _node(3, ["c"], [1])]
     h1, h2 = _verify(pool, chain1), _verify(pool, chain2)
-    assert arena.finds == 0
+    assert arena.finds == 2   # A2 CHAIN-KEY: one batched key lookup per clean chain
     rows, order = (torch.cat([h1, h2]) - S).sort()
     dev = torch.arange(4 * P)[order]
     dp = _device(4 * P)

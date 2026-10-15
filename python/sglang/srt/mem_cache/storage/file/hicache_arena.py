@@ -73,30 +73,64 @@ class RefLedger:
         import torch
 
         self.held = torch.zeros(int(slots), dtype=torch.int32)
+        # A2 (nf-h54-review-1015 B1, second arm): the slot GENERATION the held
+        # references were taken in (-1 = none recorded). A slot recycled
+        # behind the ledger (a hard free resets the C refcount with the claim)
+        # leaves references here that no longer exist; they are never applied
+        # to the slot's next owner.
+        self.gen = torch.full((int(slots),), -1, dtype=torch.int64)
         self.lock = threading.Lock()
         self.refused = 0
+        self.refused_gen = 0   # A2: releases refused because the slot's generation moved
+        self.gen_reset = 0     # A2: held references dropped because the slot's generation moved
 
-    def took(self, slots) -> None:
+    def took(self, slots, gens=None) -> None:
         import torch
 
         t = torch.as_tensor(slots, dtype=torch.int64).reshape(-1)
-        t = t[t >= 0]
+        keep = t >= 0
+        t = t[keep]
         if t.numel():
             with self.lock:
+                if gens is not None:
+                    g = torch.as_tensor(gens, dtype=torch.int64).reshape(-1)[keep]
+                    stale = (self.gen[t] != g) & (self.held[t] > 0)
+                    if bool(stale.any()):
+                        su = torch.unique(t[stale])
+                        self.gen_reset += int(self.held[su].sum())
+                        self.held[su] = 0
+                    self.gen[t] = g
                 self.held.index_add_(0, t, torch.ones(t.numel(), dtype=torch.int32))
 
-    def allow_release(self, slots):
+    def allow_release(self, slots, gens=None):
         """The multiset of `slots` this process may release (each at most as
-        often as it holds a reference there); the ledger is debited for it."""
+        often as it holds a reference there); the ledger is debited for it.
+
+        A2: with ``gens`` (the slots' CURRENT generation) a reference counts
+        only in the generation it was taken in -- a slot whose generation
+        moved since holds none of this process's references any more (they
+        went with the old generation), so a release there is refused and the
+        stale count dropped instead of taking a reference the next owner's
+        readers hold."""
         import torch
 
         t = torch.as_tensor(slots, dtype=torch.int64).reshape(-1)
-        t = t[t >= 0]
+        keep = t >= 0
+        t = t[keep]
         if t.numel() == 0:
             return t
         with self.lock:
-            uq, cnt = torch.unique(t, return_counts=True)
+            uq, inv, cnt = torch.unique(t, return_inverse=True, return_counts=True)
             have = self.held[uq]
+            if gens is not None:
+                g = torch.as_tensor(gens, dtype=torch.int64).reshape(-1)[keep]
+                gu = torch.empty_like(uq).scatter_(0, inv, g)
+                moved = (self.gen[uq] >= 0) & (self.gen[uq] != gu)
+                if bool(moved.any()):
+                    self.gen_reset += int(have[moved].sum())
+                    self.refused_gen += int(cnt[moved].sum())
+                    self.held[uq[moved]] = 0
+                    have = torch.where(moved, torch.zeros_like(have), have)
             allow = torch.minimum(cnt.to(torch.int32), have)
             self.held[uq] = have - allow
             self.refused += int((cnt - allow).sum())
@@ -182,12 +216,15 @@ def _start_ref_census(arena: "ShmArena") -> None:
                     led = arena._ledger
                     logger.info(
                         "ARENA-REF-CENSUS n=%d path=%s slots=%d complete=%d pinned=%d refs=%d "
-                        "own_held=%s own_refused=%s (pinned = COMPLETE slots a reader "
-                        "reference keeps from eviction, all ranks; own_* = this process's "
-                        "ledger, SGLANG_HICACHE_ARENA_QUEUE_REFS)",
+                        "own_held=%s own_refused=%s own_refused_gen=%s own_gen_reset=%s (pinned = "
+                        "COMPLETE slots a reader reference keeps from eviction, all ranks; own_* = this "
+                        "process's ledger, SGLANG_HICACHE_ARENA_QUEUE_REFS; *_gen = A2: references of a "
+                        "slot generation that moved, never applied to the next owner)",
                         n, arena.path, arena.slots, complete, pinned, refs,
                         int(led.held.sum()) if led is not None else "-",
                         led.refused if led is not None else "-",
+                        getattr(led, "refused_gen", "-") if led is not None else "-",
+                        getattr(led, "gen_reset", "-") if led is not None else "-",
                     )
                 except Exception as exc:  # noqa: BLE001 - an instrument never raises
                     logger.info("ARENA-REF-CENSUS n=%d failed: %r", n, exc)
@@ -750,7 +787,7 @@ class ShmArena:
         if self._ledger is not None:
             took = a[ok == 1]
             if took.shape[0]:
-                self._ledger.took(took)
+                self._ledger.took(took, self.slot_gens_np(took))   # A2: generation-stamped
         return ok
 
     def _ref_ledgered(self, a, delta: int) -> int:
@@ -762,7 +799,10 @@ class ShmArena:
         cannot name is leaked rather than ever released twice."""
         import numpy as np
         if delta < 0:
-            a = self._ledger.allow_release(a).numpy()
+            # A2: generation-exact -- the slots' current generation is read while
+            # this process still holds what it releases (a held reference pins
+            # the slot; a moved generation means the reference is already gone)
+            a = self._ledger.allow_release(a, self.slot_gens_np(a)).numpy()
             if a.shape[0] == 0:
                 return 0
         n = int(a.shape[0])
@@ -770,7 +810,7 @@ class ShmArena:
                                              a.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
                                              int(delta)))
         if delta > 0 and done == int(np.count_nonzero(a >= 0)):
-            self._ledger.took(a)
+            self._ledger.took(a, self.slot_gens_np(a))   # A2: generation-stamped
         return done
 
     def ref_census(self):
@@ -797,6 +837,31 @@ class ShmArena:
         u32 = np.frombuffer(self._mm, dtype=np.uint32, count=self.slots * hb // 4, offset=hoff)
         ref = u32.reshape(self.slots, hb // 4)[:, 1]
         return [int(ref[int(s)]) if 0 <= int(s) < self.slots else 0 for s in slots]
+
+    def slot_states(self, slots) -> list[int]:
+        """A2: the header state of these slots (0 free, 1 claimed, 2 complete,
+        3 evicting, 4 quarantine, 5 reaping) -- one strided header read, for
+        the rare re-point path (``arena_pool._old_slot_still_ours``)."""
+        import numpy as np
+        out = (ctypes.c_int64 * 6)()
+        self._lib.arena_layout(self.slots, self.slot_bytes, out)
+        hb, hoff = int(out[0]), int(out[3])
+        u32 = np.frombuffer(self._mm, dtype=np.uint32, count=self.slots * hb // 4, offset=hoff)
+        st = u32.reshape(self.slots, hb // 4)[:, 0]
+        return [int(st[int(s)]) if 0 <= int(s) < self.slots else -1 for s in slots]
+
+    def slot_gens_np(self, slots):
+        """A2: the generation of each slot (-1 out of range), numpy int64 --
+        one C call (arena_slot_gens). The reference ledger stamps every
+        reference it records with it (``RefLedger``)."""
+        import numpy as np
+        a = np.ascontiguousarray(np.asarray(slots, dtype=np.int64))
+        g = np.empty(a.shape, dtype=np.int64)
+        if a.shape[0]:
+            self._lib.arena_slot_gens(self._base, int(a.shape[0]),
+                                      a.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
+                                      g.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)))
+        return g
 
     def find_states(self, stems: Sequence[str]) -> list[int]:
         """#1439: the states only (0 absent/free, 1 claimed, 2 complete), by stem, hashed in C."""

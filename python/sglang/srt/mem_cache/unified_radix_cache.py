@@ -5953,20 +5953,27 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 if mp is not None and mrows is not None and mrows.numel() and mp.is_arena_id(int(mrows.min())):
                     try:
                         mp.complete_write(mrows)
-                        mp.free(mrows)
+                        # A2: a lost anchor took no reference -- nothing to give back there
+                        keep = self._a2_rows_not_lost(mp, mrows, self._a2_take_lost(mp))
+                        if keep.numel():
+                            mp.free(keep)
+                        secured = keep.numel() == mrows.numel()
                     except Exception as exc:  # noqa: BLE001
                         logger.warning("ANCHOR-ONLY (store) complete raised: %r", exc)
                     else:
-                        node.weg2_anchor_secured = True
+                        if secured:
+                            node.weg2_anchor_secured = True
                 return True
             mhv = node.component_data[ComponentType.MAMBA].host_value
             if mp is not None and mhv is not None and mhv.numel() and mp.is_arena_id(int(mhv.min())):
                 try:
                     mp.complete_write(mhv)
+                    lost_anchor = self._a2_mamba_lost(node, mp, mhv)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("ANCHOR-ONLY complete raised: %r", exc)
                 else:
-                    self._weg2_release_inner_anchor(node, mp)
+                    if not lost_anchor:
+                        self._weg2_release_inner_anchor(node, mp)
             return True
         pool = getattr(cc, "mem_pool_host", None)
         if getattr(pool, "arena", None) is None:
@@ -5981,6 +5988,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 dpool.complete_write(hv)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("#1427 draft complete raised: %r", exc)
+        # A2: the pages this write LOST (late ack after a take-over: no
+        # reference) leave their old slot NOW -- re-pointed or orphaned in place
+        self._a2_settle_lost(node, pool, dpool, hv)
         (getattr(self, "_weg2_direct_mamba_rows", None) or {}).pop(node.id, None)
         mp = self._weg2_mamba_pool()
         if mp is not None and len(node.component_data) > int(ComponentType.MAMBA):
@@ -5988,16 +5998,108 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if mhv is not None and mhv.numel() and mp.is_arena_id(int(mhv.min())):
                 try:
                     mp.complete_write(mhv)
+                    lost_anchor = self._a2_mamba_lost(node, mp, mhv)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("#1427 mamba complete raised: %r", exc)
                 else:
-                    self._weg2_release_inner_anchor(node, mp)
+                    if not lost_anchor:
+                        self._weg2_release_inner_anchor(node, mp)
         node.l3_present = True
         n = getattr(self, "_1427_direct_n", 0) + 1
         self._1427_direct_n = n
         if n <= 8 or n % 256 == 0:
             logger.info("#1427 DIRECT-WRITE ACK node=%s pages=%d completed_for_all=%d (n=%d)",
                         getattr(node, "id", "?"), int(hv.numel()), done, n)
+        return True
+
+    # -- A2 (nf-h54-review-1015 B1): rows of a LOST write never stay on the old slot ---------------
+
+    @staticmethod
+    def _a2_take_lost(pool) -> set:
+        take = getattr(pool, "take_lost_slots", None)
+        return set(take()) if callable(take) else set()
+
+    @staticmethod
+    def _a2_rows_not_lost(pool, rows, lost: set):
+        """The rows of ``rows`` (P = 1 ids) whose slot was not lost."""
+        if not lost:
+            return rows
+        S = int(pool.staging_rows)
+        keep = torch.tensor([(int(r) - S) not in lost for r in rows.reshape(-1).tolist()], dtype=torch.bool)
+        return rows.reshape(-1)[keep]
+
+    def _a2_settle_lost(self, node, pool, dpool, hv) -> None:
+        """A2: the KV pages ``complete_write`` lost leave their old slot at the
+        ack (``ArenaMHAHostPool.settle_lost_rows``: re-pointed to the key's
+        COMPLETE slot, else orphaned), the draft pool's row map follows them,
+        and the draft's own lost pages lose their row map entries (a draft row
+        on a recycled slot would load another key's draft KV and give its
+        reference back on release). Host bookkeeping only; never raises."""
+        try:
+            row_slot = getattr(dpool, "row_slot", None) if dpool is not None else None
+            if row_slot is not None:
+                dlost = self._a2_take_lost(dpool)
+                if dlost:
+                    S = int(dpool.staging_rows)
+                    for r in (hv.reshape(-1).cpu() - S).tolist():
+                        if row_slot.get(int(r), -1) in dlost:
+                            row_slot.pop(int(r), None)
+            settle = getattr(pool, "settle_lost_rows", None)
+            if not callable(settle):
+                return
+            res = settle(hv, getattr(node, "hash_value", None))
+            if row_slot is not None and res.get("moved"):
+                S = int(dpool.staging_rows)
+                give = set()
+                atok = int(getattr(dpool, "arena_tokens", 0) or 0)
+                for old, new in res["moved"]:
+                    ds = row_slot.pop(int(old) - S, None)
+                    if ds is None:
+                        continue
+                    if 0 <= int(new) - S < atok:
+                        row_slot[int(new) - S] = ds   # re-pointed: the draft row follows its KV row
+                    else:
+                        give.add(int(ds))             # orphaned: the draft page has no KV page any more
+                if give:
+                    gl = sorted(give)
+                    gl = [s_ for s_, pend in zip(gl, dpool._pend_has(gl)) if not pend]
+                    if gl:
+                        dpool.arena.ref_slots(gl, -1)
+        except Exception as exc:  # noqa: BLE001 -- an ack is never broken by the settle
+            logger.warning("A2 LOST-ROWS settle raised on node %s: %r", getattr(node, "id", "?"), exc)
+
+    def _a2_mamba_lost(self, node, mp, mhv) -> bool:
+        """A2: the node's mamba anchor whose write was LOST (late ack, no
+        reference) is tombstoned at the ack -- its other rows (if any) give
+        their reference back, the host value goes, the host LRU forgets the
+        node. A mamba anchor has no key proof at the load: a row on a recycled
+        slot would hand another key's state to the wake. Returns True when
+        the anchor was tombstoned."""
+        lost = self._a2_take_lost(mp)
+        if not lost:
+            return False
+        S = int(mp.staging_rows)
+        rows = mhv.reshape(-1)
+        if not any((int(r) - S) in lost for r in rows.tolist()):
+            return False
+        keep = self._a2_rows_not_lost(mp, rows, lost)
+        if keep.numel():
+            mp.free(keep)
+        cd = node.component_data[ComponentType.MAMBA]
+        cd.host_value = None
+        try:
+            lru = self.host_lru_lists[ComponentType.MAMBA]
+            if lru.in_list(node):
+                lru.remove_node(node)
+        except Exception:  # noqa: BLE001 -- no host LRU on this tree
+            pass
+        n = getattr(UnifiedRadixCache, "_a2_mamba_lost_n", 0) + 1
+        UnifiedRadixCache._a2_mamba_lost_n = n
+        if n <= 16 or (n & (n - 1)) == 0:
+            logger.warning("A2 LOST-ANCHOR node=%s rows=%d lost=%d n=%d -- the anchor's write lost its "
+                           "claim before the ack (no reference): tombstoned, never loaded from a slot "
+                           "that may be recycled", getattr(node, "id", "?"), int(rows.numel()),
+                           int(rows.numel() - keep.numel()), n)
         return True
 
     def _weg2_release_inner_anchor(self, node, mp) -> bool:

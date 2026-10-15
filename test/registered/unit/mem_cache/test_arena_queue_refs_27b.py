@@ -457,7 +457,7 @@ class TheMutantsAreCaught(_ArenaCase):
 
     def test_mutant_no_ledger_gate_double_release(self):
         with mock.patch.object(ha.RefLedger, "allow_release",
-                               lambda self, slots: torch.as_tensor(slots, dtype=torch.int64).reshape(-1)):
+                               lambda self, slots, gens=None: torch.as_tensor(slots, dtype=torch.int64).reshape(-1)):
             got = _scenario_double_queued_span(self)
         self.assertNotEqual(got, [1, 1, 1, 1], "mutant survived: B's reference was not taken")
         self.assertEqual(got, [0, 0, 0, 0])
