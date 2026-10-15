@@ -35,7 +35,29 @@ THE FIX (this file + three seams):
 
 Scope: the local-PP floor (group P: the tree is this rank's own, UD-H's scope -- a TP group's replicas never
 edit rank-locally); ``armed`` says so. Switch ``SGLANG_WEG2_READ_ROOM`` (default on); 0 = the old fill byte
-for byte (no post, the 5 s room wait, no extra lines)."""
+for byte (no post, the 5 s room wait, no extra lines).
+
+READ-ROOM-D (follow-up, same day). The arena is ONE file shared by group P and group D, and a slot is free only
+when no rank of EITHER group holds it. The P stages served the request; group D never did -- ``armed`` was the
+local-PP floor only, and ``_w3_arena_spill`` returns 0 under R12 (``form_a_host_shadow``: on a Form A D group a
+worker's host rows mirror TP0's verdicts). Boot ..._226aad7105_1015_124245, weg2-70-293 (13:35:34-39): the read
+found ``pinned=6485 of 6485 refs=21495``; P held ``own_held=2258`` per stage (3 x 2258 = 6774), the rest was D's
+tree: ``ARENA-REF-HOLDERS`` on D TP0/TP1/TP2 (13:35:42) ``tree=3215 tree_in_use=1692 own_held=4907`` -- the
+host copies of D's live tree and of the spans of the requests D had just parked (``WEG2-D-PARK park_running
+... span retained, forced host write-through``, ``#248 PARK-DEMOTE ... l3_pages=996``: every page already on
+the L3 disk). D gives them back only at its sleep's reset (``#1427 RESET-RELEASE``); until then nobody on D
+answered a room request.
+
+Now D answers, as a GROUP: TP0 (R12 role ``host``) decides and serves (:func:`form_a_spill`): a device-resident
+node's host copy leaves L2 only after ``secure_rows_to_l3`` gave every page an L3 copy (``lost`` != 0 keeps it),
+aux host rows first and the KV rows last (the #248 LOADED-HOST-RELEASE rule, the tree invariant "aux requires
+Full"), and the node's R12 STATE verdict rides the next ``tp<-reqs`` broadcast -- every worker drops the same
+rows (``form_a_host_shadow._reconcile``), never by its own decision. A worker posts and waits like every rank
+(the same bound on every rank of the group) but never serves. A node holding a Mamba anchor on the host is not
+touched: a parked request reads its anchors exactly as before, and the KV pages it gave back are read again by
+stem (L2 while the slot still holds them, else the L3 copy written before the release) -- the park's resume
+reads the whole span to its last anchor, from the store, never short and never recomputed. Host-only nodes
+stay (their arena copy is the one the sleep reset gives back). Same switch."""
 
 from __future__ import annotations
 
@@ -79,6 +101,9 @@ class _State:
     res_t = 0.0
     open_t = 0.0
     poll_t = 0.0
+    role: Optional[str] = None
+    role_t = -1e9
+    d_spills = 0
 
 
 _ST = _State
@@ -127,16 +152,46 @@ def _repost_ms() -> int:
         return 1500
 
 
-def armed(cache: Any) -> bool:
-    """This tree serves room requests: the switch is on and it is a local-PP tree (group P)."""
-    if not enabled():
-        return False
+def _local_pp(cache: Any) -> bool:
     try:
         from sglang.srt.weg2 import pp_slot_fidelity as _sf
 
         return bool(_sf.enabled() and getattr(cache, _sf.FLOOR_LOCAL_PP_ATTR, False))
     except Exception:  # noqa: BLE001
         return False
+
+
+def form_a_role() -> Optional[str]:
+    """READ-ROOM-D: the R12 role of this rank on a Form A TP group (``"host"`` = TP0, the group's one decider;
+    ``"worker"``), None elsewhere. Group-uniform: the installed role plan and the switch are the same on every
+    rank. Read at most once a second (the plan is installed at boot; ``tick`` runs ~1500 rounds/s idle)."""
+    t = time.monotonic()
+    if t - _ST.role_t < 1.0:
+        return _ST.role
+    _ST.role_t = t
+    try:
+        from sglang.srt.mem_cache import form_a_host_shadow as _r12
+
+        _ST.role = _r12.role()
+    except Exception:  # noqa: BLE001 - no plan readable = not a Form A group
+        _ST.role = None
+    return _ST.role
+
+
+def armed(cache: Any) -> bool:
+    """This rank takes part in room requests (posts, waits the longer bound): the switch is on and the tree is a
+    local-PP tree (group P) or a rank of a Form A TP group (group D: TP0 and its workers alike)."""
+    if not enabled():
+        return False
+    return _local_pp(cache) or form_a_role() in ("host", "worker")
+
+
+def serves(cache: Any) -> bool:
+    """This rank ANSWERS room requests: a local-PP tree (its own tree), or TP0 of a Form A group (the decision of
+    the whole group; the workers follow its R12 verdicts). A Form A worker never releases on its own."""
+    if not enabled():
+        return False
+    return _local_pp(cache) or form_a_role() == "host"
 
 
 # --- the arena's own numbers -------------------------------------------------------------------------
@@ -304,6 +359,9 @@ def tick(cache: Any) -> int:
             arena = _ST.arena = getattr(cache._weg2_direct_pool(), "arena", None)
         if arena is None:
             return 0
+        if not serves(cache):
+            # READ-ROOM-D: a Form A worker posts and waits (``served`` above), TP0 answers for the group
+            return 0
         # poll the request file at most every 20 ms: an idle P stage runs ~1500 rounds/s, a loaded one a round per
         # 2-3 s; 64 struct reads per round would be pure overhead in the first case and late by nothing in the second
         t_poll = time.monotonic()
@@ -337,7 +395,11 @@ def serve(cache: Any, pool: Any, arena: Any, need: int) -> int:
                         "clock=%d (the clock already has the room)", MARK, n, int(need), c["slots"],
                         c["complete"], c["claimed"], c["pinned"], c["free"], c["clock"])
         return 0
-    released = int(cache._w3_arena_spill(pool, d) or 0)
+    if form_a_role() == "host":
+        # READ-ROOM-D: TP0 of a Form A group decides for the group (R12 verdicts carry it to the workers)
+        released = int(form_a_spill(cache, pool, d) or 0)
+    else:
+        released = int(cache._w3_arena_spill(pool, d) or 0)
     _ST.spilled_pages += released
     after = census(arena)
     if n <= 32 or n % 16 == 0 or released == 0:
@@ -347,6 +409,107 @@ def serve(cache: Any, pool: Any, arena: Any, need: int) -> int:
                     MARK, n, int(need), d, released, (time.perf_counter() - t0) * 1000.0, c["slots"],
                     c["complete"], c["claimed"], c["pinned"], c["free"], c["clock"], after["complete"],
                     after["pinned"])
+    return released
+
+
+def form_a_spill(cache: Any, pool: Any, need_pages: int) -> int:
+    """READ-ROOM-D, TP0 of a Form A D group only: hand back up to ``max(need, W3_SPILL_MIN_PAGES)`` pages of the
+    tree's L3-backed host copies for the GROUP. Candidates are device-resident nodes with a KV host copy (the
+    device keeps the KV, ``l3_present`` names the store copy): no host lock (a load in flight), no pending write,
+    no aux state on the host only, NO Mamba anchor on the host (the anchors of a parked request stay as they
+    are), not staging rows. Order: the group-equal key of ``_w3_spill_keys`` (pages a P stage already let go of
+    first -- the last holder frees the slot). Per node: ``secure_rows_to_l3`` first (``lost`` != 0 or no page
+    COMPLETE keeps the node), then aux host rows, then the KV host rows, then the R12 STATE verdict -- every
+    worker drops the same rows at the next broadcast. Returns the pages released on TP0."""
+    from sglang.srt.mem_cache import form_a_host_shadow as _r12
+
+    if _r12.role() != "host":
+        return 0   # never rank-local: a worker follows TP0's verdicts, a non-Form-A tree has its own spill
+    from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType
+    from sglang.srt.mem_cache.unified_radix_cache import BASE_COMPONENT_TYPE, EvictLayer
+
+    if not hasattr(pool, "secure_rows_to_l3"):
+        # the hybrid HostPoolGroup forwards the claim calls only: the arena pool is its anchor host pool -- the
+        # resolution of W3-ANCHOR-POOL, here under READ-ROOM's own switch: the NF profiles set
+        # SGLANG_WEG2_ENABLE_W3_SPILL_ANCHOR_POOL for group P only (NF_ENV_P), D would stop here for good
+        host = getattr(getattr(pool, "anchor_entry", None), "host_pool", None)
+        pool = host if host is not None and hasattr(host, "secure_rows_to_l3") else None
+        if pool is None:
+            _ST.d_spills += 1
+            if _ST.d_spills <= 8 or _ST.d_spills % 64 == 0:
+                logger.warning("%s D-SPILL STOP no_spill_pool need=%d (no host pool with secure_rows_to_l3)",
+                               MARK, int(need_pages))
+            return 0
+    t0 = time.perf_counter()
+    root = cache.root_node
+    want = max(int(need_pages), int(getattr(cache, "W3_SPILL_MIN_PAGES", 64)))
+    P = max(1, int(getattr(cache, "page_size", 1) or 1))
+    mamba = getattr(ComponentType, "MAMBA", None)
+    comps = tuple(cache._components_tuple)
+    base = next((c for c in comps if c.component_type == BASE_COMPONENT_TYPE), None)
+    if base is None:
+        return 0
+    aux = [c for c in comps if c.component_type != BASE_COMPONENT_TYPE]
+    staging = int(getattr(pool, "staging_rows", 0) or 0)
+    owt = getattr(cache, "ongoing_write_through", None) or {}
+    skip = {"anchor": 0, "busy": 0, "aux_host_only": 0, "host_only": 0}
+    cands = []
+    for node in cache._collect_all_nodes():
+        if node is root:
+            continue
+        cd = node.component_data[BASE_COMPONENT_TYPE]
+        hv = cd.host_value
+        if hv is None or hv.numel() == 0:
+            continue
+        if cd.value is None or getattr(node, "evicted", False):
+            skip["host_only"] += 1
+            continue
+        if mamba is not None and node.component_data[mamba].host_value is not None:
+            skip["anchor"] += 1
+            continue
+        if node.id in owt or getattr(node, "write_through_pending_id", None) is not None \
+                or any(int(getattr(c, "host_lock_ref", 0) or 0) > 0 for c in node.component_data):
+            skip["busy"] += 1
+            continue
+        if any(node.component_data[c.component_type].host_value is not None
+               and node.component_data[c.component_type].value is None for c in aux):
+            skip["aux_host_only"] += 1
+            continue
+        if int(hv.min()) < staging:
+            continue
+        cands.append(node)
+    keys = cache._w3_spill_keys(pool, cands)
+    cands.sort(key=lambda x: keys[id(x)])
+    released = nodes = unsecured = on_disk = written = 0
+    for node in cands:
+        if released >= want:
+            break
+        hv = node.component_data[BASE_COMPONENT_TYPE].host_value
+        sec = pool.secure_rows_to_l3(hv)
+        if int(sec.get("lost", 0)) or not int(sec.get("pages", 0)):
+            unsecured += 1
+            continue
+        on_disk += int(sec.get("on_disk", 0))
+        written += int(sec.get("written", 0))
+        for c in aux:   # aux first: never an aux host row without the KV row
+            if node.component_data[c.component_type].host_value is not None:
+                cache._evict_component_and_detach_lru(node, c, target=EvictLayer.HOST, tracker=None)
+        _dev, host_freed = cache._evict_component_and_detach_lru(node, base, target=EvictLayer.HOST, tracker=None)
+        cache.evictable_host_leaves.discard(node)
+        node.l3_present = True
+        _r12.record_state(cache, node, why="read-room")
+        released += int(host_freed or 0) // P
+        nodes += 1
+    _ST.d_spills += 1
+    k = _ST.d_spills
+    if k <= 32 or k % 16 == 0 or released == 0:
+        logger.info("%s D-SPILL n=%d need=%d want=%d released_pages=%d nodes=%d candidates=%d unsecured_kept=%d "
+                    "l3=on_disk:%d,written:%d kept=anchor:%d,busy:%d,aux_host_only:%d,host_only:%d ms=%.0f (Form A "
+                    "TP0 decides for group D: an L3-backed host copy of D's tree leaves L2, the device keeps the "
+                    "KV, the R12 STATE verdict drops the workers' rows at the next broadcast; anchors untouched)",
+                    MARK, k, int(need_pages), want, released, nodes, len(cands), unsecured, on_disk, written,
+                    skip["anchor"], skip["busy"], skip["aux_host_only"], skip["host_only"],
+                    (time.perf_counter() - t0) * 1000.0)
     return released
 
 
@@ -366,7 +529,7 @@ def note_short(arena: Any, stems: int, rounds: int, waited_ms: float, served_bef
                        "(this read's pages stay on the disk and are prefilled again -- named, counted: "
                        "unserved = no scheduler round answered in the wait; served_nothing_to_spill = no tree "
                        "copy was spillable (live reads/loads pin the arena); served_peers_hold = this rank "
-                       "let go, another PP rank did not)",
+                       "let go, another rank of group P or D did not)",
                        MARK, k, int(stems), int(rounds), float(waited_ms), cls, posted, _ST.served,
                        _ST.spilled_pages, c["slots"], c["complete"], c["claimed"], c["pinned"], c["refs"])
 
@@ -387,3 +550,6 @@ def reset_for_tests() -> None:
     _ST.seq = 0
     _ST.arena = None
     _ST.res_t = _ST.open_t = _ST.poll_t = 0.0
+    _ST.role = None
+    _ST.role_t = -1e9
+    _ST.d_spills = 0
