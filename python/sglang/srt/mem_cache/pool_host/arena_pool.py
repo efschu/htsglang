@@ -242,10 +242,14 @@ _CHAIN_KEY_N = [0, 0]
 #
 # A HIT NEEDS ALL OF (otherwise: the full proof, i.e. exactly the pre-cache behaviour):
 #   * the chain's keys equal the remembered ones (list compare, no hashing),
-#   * the chain's rows equal the remembered ones (tensor compare),
+#   * the chain's rows equal the clean row sequence built from the remembered slots (tensor compare;
+#     a proven chain is whole consecutive distinct pages, so its rows ARE ``slot * P + lane`` -- the
+#     entry therefore keeps the slots, not the token rows),
 #   * every slot is COMPLETE now (states read first) and
 #   * every slot still carries the remembered generation (read second: a generation only moves forward,
 #     so a match proves the state read belongs to that generation).
+# READ ORDER is a tested contract (``ShmArena.slot_state_gens_np``: states first, generations second;
+# mutant R1_SWAP in mutants_a2cost_1015.sh).
 # FILL: the generations are read BEFORE and AFTER the full proof and stored only when they did not move
 # across it (and every slot is COMPLETE after it): the proof and the generation then describe one
 # generation of every slot.
@@ -260,6 +264,32 @@ _CHAIN_KEY_N = [0, 0]
 # NOT cached: ``verify_load_chain`` (the proof right before a transfer stays the full ``find`` every
 # time), the ``_chain_shifted`` / ``_chain_clean`` tests of a call that misses, any negative result.
 #
+# MEMORY (named, per entry and per pool): an entry holds the flat key list (the strings are shared with
+# the radix nodes while those live; counted at ``sys.getsizeof`` + 8 B list slot each, ~120 B per page
+# for the 64-hex keys), the slots and the generations (int64, 8 B each) = ~136 B per page, i.e. ~0.27 MB
+# per 128k-token chain at P=64 (2000 pages), ~0.54 MB per 262k chain. It does NOT hold the token rows
+# (8 B per TOKEN = 64x the slot list at P=64; the first version kept them: ~1 MiB per 128k chain). The
+# price: a hit rebuilds the clean row sequence from the slots, measured ~+0.04 ms per 100k tokens.
+# Bounds: VOTE_CACHE_MAX entries AND VOTE_CACHE_MAX_BYTES estimated bytes (default 64 MiB) per cache
+# (one cache per host pool object, i.e. per pool and per process: TP0 and each KV worker on D; the
+# KV pool is the only pool that reaches ``provable_pages`` with an arena today). The oldest entries
+# (LRU) go first; a single entry larger than the byte bound stays (it is the newest, one chain).
+# A chain that GROWS creates a new entry (the signature carries its last key and length); the old one
+# ages out through LRU/the byte bound. Gauge: ``vote_cache_stats()["bytes"]`` (process-wide sum).
+#
+# ASSUMPTION (B5, nf-a2cost-1015 review): a hit compares KEY STRINGS, the full proof hashes
+# ``stems_of(keys)``. Both are the same statement only while ``stems_of`` is a fixed function of the
+# keys for one pool: the backend suffix is built once in ``__init__`` and ``provable_pages`` is reached
+# only through ``_1424_chain_args`` (one ``stems_of`` per pool). A pool whose stems changed over its
+# lifetime (suffix swapped at runtime) would have to drop ``pool._a2_vote_cache`` at that moment.
+#
+# COST OF A MISS (B4): a miss that fills costs the full proof PLUS two extra arena reads
+# (``slot_state_gens_np`` before and after the proof, measured ~0.02 ms each per 1600 pages = 100k tokens at
+# P=64, no hashing: ~+4% on a ~1 ms full proof).
+# A rid whose chain changes in EVERY pass pays that on top of A2 each time and never hits: expect
+# ``fill`` ~ ``full`` there; healthy operation is ``hit`` >> ``full`` with ``fill`` ~ ``full``
+# (every full proof of a stable chain fills once).
+#
 # Limits, named: a slot generation is 32 bit (arena.c ``uint32_t generation``); a hit could only be
 # wrong after 2^32 recycles of ONE slot inside the lifetime of one entry (<= 128 entries, LRU). A live
 # re-initialisation of the arena file under a running process would reset the generations; the arena
@@ -267,11 +297,13 @@ _CHAIN_KEY_N = [0, 0]
 
 ENV_VOTE_CACHE = "SGLANG_WEG2_A2_VOTE_CACHE"          # default ON; result-neutral (cost only)
 VOTE_CACHE_MAX = 128                                    # >= 32 head rids x 4
+VOTE_CACHE_MAX_BYTES = 64 << 20                         # estimated bytes per cache (see MEMORY above)
 
 #: A2 VOTE-CACHE census (process-wide): hits / full proofs run for the vote / entries stored /
 #: invalidations by cause / fallbacks after a cache error / cumulative microseconds of both paths
 _VOTE_CACHE_N = {"hit": 0, "full": 0, "fill": 0, "unfilled_race": 0, "changed": 0, "state_moved": 0,
-                 "gen_moved": 0, "error": 0, "evicted": 0, "hit_us": 0.0, "full_us": 0.0}
+                 "gen_moved": 0, "error": 0, "evicted": 0, "evicted_bytes": 0, "bytes": 0,
+                 "hit_us": 0.0, "full_us": 0.0}
 
 
 def vote_cache_stats() -> dict:
@@ -286,21 +318,43 @@ def _vote_cache_enabled() -> bool:
 class _VoteKeyCache:
     """Remembered POSITIVE key proofs of one pool's arena (see the block comment above)."""
 
-    __slots__ = ("d",)
+    __slots__ = ("d", "bytes")
 
     def __init__(self):
         from collections import OrderedDict
         self.d = OrderedDict()
+        self.bytes = 0
 
     @staticmethod
     def sig(keys):
         return (keys[0], keys[-1], len(keys))
 
+    @staticmethod
+    def entry_bytes(keys, eslots, egens) -> int:
+        """Estimated resident bytes of one entry (key strings + list slots + slots + generations)."""
+        import sys
+        return len(keys) * (sys.getsizeof(keys[0]) + 8) + int(eslots.nbytes) + int(egens.nbytes)
+
+    def _pop(self, sig):
+        e = self.d.pop(sig, None)
+        if e is not None:
+            self.bytes -= e[3]
+            _VOTE_CACHE_N["bytes"] -= e[3]
+        return e
+
     def drop(self, sig, why):
-        if self.d.pop(sig, None) is not None:
+        if self._pop(sig) is not None:
             _VOTE_CACHE_N[why] += 1
 
-    def hit(self, arena, ar: torch.Tensor, keys) -> bool:
+    @staticmethod
+    def rows_of_slots(eslots, P: int) -> torch.Tensor:
+        """The arena rows (host id - S) of a CLEAN chain on these slots: whole consecutive pages."""
+        s = torch.from_numpy(eslots)
+        if P == 1:
+            return s
+        return (s[:, None] * P + torch.arange(P, dtype=torch.int64)[None, :]).reshape(-1)
+
+    def hit(self, arena, ar: torch.Tensor, keys, P: int) -> bool:
         """True only when the remembered proof of exactly this chain still holds on the live arena."""
         if not keys:
             return False
@@ -308,8 +362,8 @@ class _VoteKeyCache:
         e = self.d.get(sig)
         if e is None:
             return False
-        ekeys, ear, eslots, egens = e
-        if ekeys != keys or not torch.equal(ear, ar):
+        ekeys, eslots, egens, _nb = e
+        if ekeys != keys or not torch.equal(self.rows_of_slots(eslots, P), ar):
             self.drop(sig, "changed")
             return False
         import numpy as np
@@ -323,13 +377,19 @@ class _VoteKeyCache:
         self.d.move_to_end(sig)
         return True
 
-    def store(self, keys, ar, eslots, egens):
+    def store(self, keys, eslots, egens):
         sig = self.sig(keys)
-        self.d[sig] = (list(keys), ar, eslots, egens)
-        self.d.move_to_end(sig)
+        self._pop(sig)
+        nb = self.entry_bytes(keys, eslots, egens)
+        self.d[sig] = (list(keys), eslots, egens, nb)
+        self.bytes += nb
+        _VOTE_CACHE_N["bytes"] += nb
         _VOTE_CACHE_N["fill"] += 1
-        while len(self.d) > VOTE_CACHE_MAX:
-            self.d.popitem(last=False)
+        while len(self.d) > 1 and (len(self.d) > VOTE_CACHE_MAX or self.bytes > VOTE_CACHE_MAX_BYTES):
+            if len(self.d) <= VOTE_CACHE_MAX:
+                _VOTE_CACHE_N["evicted_bytes"] += 1
+            old = next(iter(self.d))
+            self._pop(old)
             _VOTE_CACHE_N["evicted"] += 1
 
 
@@ -368,11 +428,11 @@ def _vote_cache_log(why: str) -> None:
         return
     logger.info(
         "A2 VOTE-CACHE %s hits=%d full=%d (of %d vote proofs) fill=%d unfilled_race=%d invalidated: "
-        "changed=%d state=%d gen=%d error=%d evicted=%d mean_us hit=%.0f full=%.0f -- a hit re-reads the "
+        "changed=%d state=%d gen=%d error=%d evicted=%d (bytes-bound %d) bytes=%d mean_us hit=%.0f full=%.0f -- a hit re-reads the "
         "live arena (states, generations) against the remembered key->slot proof; the load-time proof "
         "stays the full find",
         why, n["hit"], n["full"], tot, n["fill"], n["unfilled_race"], n["changed"], n["state_moved"],
-        n["gen_moved"], n["error"], n["evicted"],
+        n["gen_moved"], n["error"], n["evicted"], n["evicted_bytes"], n["bytes"],
         n["hit_us"] / max(1, n["hit"]), n["full_us"] / max(1, n["full"]))
 
 
@@ -436,7 +496,7 @@ def _chain_keys_hold(pool, nodes, rows: torch.Tensor, stems_of, keys_of, *, vote
             try:
                 s1, g1 = arena.slot_state_gens_np(want)      # AFTER the proof
                 if np.array_equal(g0, g1) and bool((s1 == 2).all()):
-                    vote.store(keys, rows, np.asarray(want, dtype=np.int64).copy(), g1)
+                    vote.store(keys, np.asarray(want, dtype=np.int64).copy(), g1)
                     _vote_cache_log("fill")
                 else:
                     _VOTE_CACHE_N["unfilled_race"] += 1      # a slot moved under the proof: not remembered
@@ -767,7 +827,7 @@ def provable_pages(pool, nodes, rows_of, stems_of, *, keys_of=None, own_hash=Non
             try:
                 keys = _flat_keys(nodes, keys_of)
                 t0 = time.perf_counter()
-                if vote.hit(pool.arena, ar, keys):
+                if vote.hit(pool.arena, ar, keys, P):
                     _VOTE_CACHE_N["hit"] += 1
                     _VOTE_CACHE_N["hit_us"] += (time.perf_counter() - t0) * 1e6
                     _vote_cache_log("hit")

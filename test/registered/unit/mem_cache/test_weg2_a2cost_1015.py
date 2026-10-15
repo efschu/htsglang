@@ -15,6 +15,9 @@ What this file pins:
   * a cache error is a cost, never a value (fallback to the full proof);
   * only positive proofs are remembered, bounded (LRU), switchable (default ON);
   * a foreign key is never loaded: ``verify_load_chain`` ignores the cache entirely;
+  * the READ ORDER of ``slot_state_gens_np`` (states first, generations second) and the position of the
+    lookup inside the ``not _chain_shifted`` branch are pinned (review nf-a2cost-1015 B1/B2);
+  * MEMORY: an entry holds slots and generations, not the token rows; a byte bound evicts LRU (B3);
   * RANK AGREEMENT: a warm rank, a cold rank and a cache-less rank vote identically over a random
     arena history (the group MIN is the same whatever each rank's cache holds).
 """
@@ -32,7 +35,7 @@ import torch
 
 from sglang.srt.mem_cache.pool_host import arena_pool as ap
 
-from test_weg2_chainkey_a2_1015 import TOTAL, _arena, _node, _pool, _provable, _publish, _rows, _verify
+from test_weg2_chainkey_a2_1015 import P, TOTAL, _arena, _node, _pool, _provable, _publish, _rows, _verify
 
 pytestmark = pytest.mark.skipif(shutil.which("gcc") is None, reason="needs gcc")
 
@@ -190,9 +193,9 @@ def test_rows_changed_is_a_miss_at_the_cache(tmp_path):
     vc = pool._a2_vote_cache
     keys = ["a", "b"]
     ar = torch.cat([n.host_value for n in nodes]) - 16
-    assert vc.hit(arena, ar, keys) is True
+    assert vc.hit(arena, ar, keys, P) is True
     other = torch.cat([_rows([slot_of["b"], slot_of["a"]])]) - 16
-    assert vc.hit(arena, other, keys) is False, "same keys on other rows is not the remembered chain"
+    assert vc.hit(arena, other, keys, P) is False, "same keys on other rows is not the remembered chain"
     assert ap.vote_cache_stats()["changed"] == 1
 
 
@@ -423,3 +426,114 @@ def test_slot_state_gens_np_values_and_out_of_range(tmp_path):
     st2, gn2 = arena.slot_state_gens_np([slot_of["a"]])
     assert st2.tolist() == [0] and gn2.tolist() != gn.tolist()[:1], "free moves the generation"
     arena._mm.close()          # raises BufferError when a numpy view still pins the mapping
+
+
+# ------------------------------------------------------------------ review nf-a2cost-1015 B1/B2/B3 ---------
+
+
+class _LibHook:
+    """Forwards to the real ctypes lib; runs ``fire`` once right BEFORE the next ``arena_layout`` call
+    (``slot_state_gens_np`` calls ``arena_layout`` immediately before it reads the states)."""
+
+    def __init__(self, lib, fire):
+        object.__setattr__(self, "_real", lib)
+        object.__setattr__(self, "_fire", fire)
+        object.__setattr__(self, "armed", False)
+
+    def __getattr__(self, name):
+        real = getattr(object.__getattribute__(self, "_real"), name)
+        if name != "arena_layout":
+            return real
+
+        def wrapped(*a):
+            if object.__getattribute__(self, "armed"):
+                object.__setattr__(self, "armed", False)
+                object.__getattribute__(self, "_fire")()
+            return real(*a)
+        return wrapped
+
+
+def test_recycle_between_the_two_reads_of_a_hit_is_never_a_hit(tmp_path):
+    """B1: a slot is recycled for another key exactly between the generation read and the state read of a
+    wrong-order implementation (generations first): the stale generation would be paired with the new
+    COMPLETE state = a false hit on a foreign key. With the contract order (states first) the state read
+    sees the recycled slot's state AND the generation read sees the new generation -> miss -> the full
+    proof cuts at page 2. (Mutant R1_SWAP.)"""
+    arena = _arena(tmp_path, 4)
+    nodes, slot_of = _chain(arena, ["a", "b", "c", "d"], per_node=2)
+    pool = _pool(arena)
+    assert _provable(pool, nodes) == (4, 4)
+    assert _provable(pool, nodes) == (4, 4) and ap.vote_cache_stats()["hit"] == 1
+
+    def recycle():
+        arena.free_slots([slot_of["c"]])
+        (sy, st, gy), = arena.claim_slots(["Y"], [TOTAL])
+        assert sy == slot_of["c"] and st == 0
+        assert arena.complete_slots([sy], [gy], [(0, TOTAL)]) == [1]
+
+    hook = _LibHook(arena._lib, recycle)
+    arena._lib = hook
+    object.__setattr__(hook, "armed", True)
+    got = _provable(pool, nodes)
+    assert got == (2, 4), f"stale generation paired with a recycled slot's state: {got}"
+
+
+def test_a_shifted_chain_never_takes_the_cache(tmp_path):
+    """B2: the same rows+keys proven (and remembered) for one request; another request whose P chain names
+    page 'b' at another depth (shifted) must take the full #1424 plan, never the remembered proof: the
+    entry is not keyed by ``p_chain``/``page0``, so the lookup must stay INSIDE the ``not _chain_shifted``
+    branch. (Mutant R2b_SHIFT_TRY.)"""
+    arena = _arena(tmp_path, 8)
+    nodes, _ = _chain(arena, ["a", "b", "c", "d"], per_node=2)
+    pool = _pool(arena)
+    assert _provable(pool, nodes) == (4, 4)
+    assert _provable(pool, nodes) == (4, 4) and ap.vote_cache_stats()["hit"] == 1
+    ref = ap.provable_pages(pool, nodes, rows_of=lambda n: n.host_value, stems_of=lambda h: list(h),
+                            p_chain=["a", "x", "b", "y"], page0=0)
+    assert ap.vote_cache_stats()["hit"] == 1, "a shifted chain consulted the vote cache"
+    assert ref != (4, 4), f"a shifted chain was proven whole: {ref}"
+
+
+def test_an_entry_holds_slots_not_token_rows(tmp_path):
+    """B3: per page the entry keeps the slot and the generation (8 B each) plus the key; the token rows
+    (P x 8 B per page) are rebuilt from the slots at a hit. The bytes gauge follows store/drop."""
+    arena = _arena(tmp_path, 16)
+    keys = [f"k{i}" for i in range(12)]
+    nodes, _ = _chain(arena, keys, per_node=4)
+    pool = _pool(arena)
+    assert _provable(pool, nodes) == (12, 12)
+    vc = pool._a2_vote_cache
+    (ekeys, eslots, egens, nb), = vc.d.values()
+    assert eslots.shape == (12,) and egens.shape == (12,) and eslots.dtype == np.int64
+    assert nb == vc.entry_bytes(keys, eslots, egens) and nb == vc.bytes == ap.vote_cache_stats()["bytes"]
+    assert not any(isinstance(x, torch.Tensor) for x in (ekeys, eslots, egens)), "no token-row tensor in an entry"
+    assert nb == 12 * (__import__("sys").getsizeof("k0") + 8) + 12 * 8 + 12 * 8, "slots + generations + keys only"
+    # the rebuilt rows are exactly the chain's arena rows
+    ar = torch.cat([n.host_value for n in nodes]) - 16
+    assert torch.equal(vc.rows_of_slots(eslots, P), ar)
+    assert _provable(pool, nodes) == (12, 12) and ap.vote_cache_stats()["hit"] == 1
+    sig = vc.sig(keys)
+    vc.drop(sig, "changed")
+    assert vc.bytes == 0 and ap.vote_cache_stats()["bytes"] == 0
+
+
+def test_the_byte_bound_evicts_the_oldest_entries(tmp_path, monkeypatch):
+    """B3: besides the entry count the cache is bounded by estimated bytes; the oldest entries go first,
+    the newest entry always stays (one chain)."""
+    arena = _arena(tmp_path, 32)
+    pool = _pool(arena)
+    slot_of = _publish(arena, [f"k{i}" for i in range(24)])
+    chains = [[_node(i * 8, [f"k{j}" for j in range(i * 8, i * 8 + 8)],
+                     _rows([slot_of[f"k{j}"] for j in range(i * 8, i * 8 + 8)]))] for i in range(3)]
+    assert _provable(pool, chains[0]) == (8, 8)
+    one = pool._a2_vote_cache.bytes
+    monkeypatch.setattr(ap, "VOTE_CACHE_MAX_BYTES", int(one * 2.5))
+    assert _provable(pool, chains[1]) == (8, 8) and _provable(pool, chains[2]) == (8, 8)
+    vc = pool._a2_vote_cache
+    assert len(vc.d) == 2 and vc.bytes <= int(one * 2.5)
+    assert set(s[0] for s in vc.d) == {"k8", "k16"}, "the oldest entry went"
+    st = ap.vote_cache_stats()
+    assert st["evicted"] == 1 and st["evicted_bytes"] == 1 and st["bytes"] == vc.bytes, st
+    monkeypatch.setattr(ap, "VOTE_CACHE_MAX_BYTES", 1)          # smaller than one entry: the newest stays
+    assert _provable(pool, chains[0]) == (8, 8)
+    assert len(vc.d) == 1 and next(iter(vc.d))[0] == "k0"
