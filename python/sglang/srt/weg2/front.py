@@ -6545,6 +6545,16 @@ class Front:
                         rid, type(e).__name__, str(e)[:160])
             return 0, "none"
         self.counters["l3_index_probes"] += 1
+        # ZERO-ANCHOR 1015: the arrival's anchored depth and KV depth, kept for
+        # the type-A split of this rid's P leg (P-REUSE-GAP); bounded
+        try:
+            _pr = self.__dict__.setdefault("_za_presence", collections.OrderedDict())
+            _pg = int(d.tokens) // max(1, int(d.pages)) if int(d.pages) > 0 else 0
+            _pr[rid] = (int(d.tokens), int(getattr(d, "kv_pages", 0) or 0) * _pg if _pg else int(d.tokens))
+            while len(_pr) > 4096:
+                _pr.popitem(last=False)
+        except Exception:  # noqa: BLE001 -- an instrument never breaks a price
+            pass
         if d.tokens > 0:
             logger.info("WEG2 L3-INDEX-PRESENCE rid=%s tier=%s depth=%d pages=%d l3_pages=%d "
                         "kv_pages=%d tokens=%d probe_ms=%.1f probe=%s asked=%d (the shared L2/L3 "
@@ -12964,6 +12974,25 @@ class Front:
         self.counters["p_prefill_requests"] += 1
         self.counters["p_prefix_tokens_in_store"] += max(0, int(p.store_span_est))
         self.counters["p_prefix_tokens_reused"] += max(0, int(leg1_cached_tokens))
+        # ZERO-ANCHOR 1015: the epoch line carries no rid -- this one names
+        # the rid, the epoch and what each term of its forgone share cost
+        try:
+            from sglang.srt.weg2 import claim_line as _claim_line
+
+            _est, _ct = max(0, int(p.store_span_est)), max(0, int(leg1_cached_tokens))
+            if _claim_line.enabled() and _est > _ct:
+                _pres, _pkv = (self.__dict__.get("_za_presence") or {}).get(p.rid, (0, 0))
+                _g = _claim_line.reuse_gap(_est, _pres, _pkv, _ct)
+                logger.info("WEG2 P-REUSE-GAP epoch=%d rid=%s est=%d presence=%d presence_kv=%d "
+                            "cached=%d forgone=%d read_short=%d kv_above_anchor=%d "
+                            "est_over_store=%d (the P-PREFIX-REUSE share of this rid: read_short = "
+                            "anchored store depth the read did not land, kv_above_anchor = KV the "
+                            "store held above its deepest anchor, est_over_store = the text-span "
+                            "estimate above all the store held)",
+                            int(self.epoch), p.rid, _est, int(_pres), int(_pkv), _ct, _est - _ct,
+                            _g["read_short"], _g["kv_above_anchor"], _g["est_over_store"])
+        except Exception:  # noqa: BLE001 -- an instrument never breaks a leg
+            pass
 
     # -- USAGE-TRUE (weg2/usage_true.py) -------------------------------------
     def _p_leg_note(self, rid: str, prompt_tokens: int, cached_tokens: int,

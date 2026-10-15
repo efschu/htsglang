@@ -9379,6 +9379,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     "claim cut to %d (n=%d)",
                     req_id, int(min_completed_tokens), len(hash_value) * self.page_size,
                     _anchored, _cut, _257n)
+            # ZERO-ANCHOR 1015: every cut, per rid, with what it cost against
+            # what the short landing cost (the #257 line above stops at 16)
+            from sglang.srt.weg2 import claim_line as _claim_line
+            from sglang.srt.weg2 import read_depth as _rd
+
+            _claim_line.anchor_cut(
+                req_id, getattr(self, "pp_rank", "?"), int(min_completed_tokens),
+                len(hash_value) * self.page_size, _anchored, _cut,
+                landing=_rd.cut_of(operation),
+            )
             min_completed_tokens = _cut
 
         # #1157: THE REAP IS A LINE. `probed` / `hit_pages` are the GROUP's
