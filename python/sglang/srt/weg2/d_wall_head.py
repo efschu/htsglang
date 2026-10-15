@@ -184,3 +184,80 @@ def pick_structural_wedge_head(
         STRUCT_MARK, head.rid, verdict[1], price, budget, n_lim, n_lim,
     )
     return head
+
+
+# ---------------------------------------------------------------------------
+# PW-F (NF h16p K10 15.10. 12:21:52-12:27:33Z, D TP0-2): the NO-FUND wedge --
+# a third way into the same W50 exit.
+#
+# 7 queued, 0 running, every pass the HOL head refused NO_TOKEN by the H105d
+# cut (``FORM-A-CUT LOAD-BACK ROOM ... evicted=0``), the peel delivering 0
+# (``EVICT-FRONTIER-CENSUS delivered=0 reported_evictable=516288``,
+# ``ARENA-DROP freed=0`` x3366) -- for six minutes. PW-R did not fire after
+# 12:12:57: its local verdict reads ``payable_evictable``, a rank-local memo
+# with a 2 s TTL and a rank-local key (evict_frontier_census.UNPAYABLE_TTL_S),
+# so the group MIN was never True on all ranks at once (H105d 12:24:02 TP0
+# payable=516288, 12:23:44 TP1 payable=0). PW-W did not fire: the H105 gate's
+# budget (rem_total_tokens 521280) holds the unpayable evictable, price <=
+# budget. H106 did not fire: the host said ADMIT, the NO_TOKEN came from the cut.
+#
+# THE RULE: a pass whose group-D HOL head was refused (``_hol.head``, the same
+# rid on every rank), with nothing running and nothing admitted (the built set
+# is the host's after the H105 riegel), advances one counter; any other pass
+# resets it. After ``SGLANG_WEG2_D_NOFUND_REROUTE_N`` consecutive such passes
+# the CURRENT head is answered with the named W50 (extent = its device rows)
+# and the count starts again. Every input is replicated -- no tree reading, no
+# clock -- so every rank answers the same head in the same pass without a
+# collective. 0 = off.
+# ---------------------------------------------------------------------------
+
+NOFUND_MARK = "WEG2 D-NOFUND-HEAD"
+_NOFUND_ATTR = "_weg2_nofund_head_state"
+
+
+def nofund_reroute_n() -> int:
+    import os
+
+    raw = os.environ.get("SGLANG_WEG2_D_NOFUND_REROUTE_N", "64") or "64"
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 64
+
+
+def reset_nofund(sched: Any) -> None:
+    """A pass that was not a no-fund pass (an admit, no refused head, a run)."""
+    if getattr(sched, _NOFUND_ATTR, None) is not None:
+        setattr(sched, _NOFUND_ATTR, None)
+
+
+def pick_nofund_head(
+    *,
+    sched: Any,
+    head_rid: Optional[str],
+    waiting: Sequence[Any],
+    running_empty: bool,
+    admitted_n: int,
+    limit: Optional[int] = None,
+) -> Optional[Any]:
+    """The HOL head to answer W50 after ``limit`` consecutive no-fund passes, or
+    None. Inputs replicated only (see the rule above)."""
+    n_lim = nofund_reroute_n() if limit is None else int(limit)
+    if n_lim <= 0 or head_rid is None or not running_empty or int(admitted_n or 0) > 0:
+        reset_nofund(sched)
+        return None
+    n = int(getattr(sched, _NOFUND_ATTR, None) or 0) + 1
+    setattr(sched, _NOFUND_ATTR, n)
+    if n < n_lim:
+        return None
+    setattr(sched, _NOFUND_ATTR, None)
+    head = next((q for q in waiting if str(q.rid) == str(head_rid)), None)
+    if head is None:
+        return None
+    logger.warning(
+        "%s rid=%s need_rows=%d passes=%d running=0 admitted=0 queued=%d: the group-D head was refused "
+        "with nothing running and nothing admitted for %d consecutive passes (the peel pays nothing: "
+        "backup wall) -- answered W50, the front re-routes it through P and the flip clears D's tree",
+        NOFUND_MARK, head.rid, device_need_rows(head), n, len(waiting), n_lim,
+    )
+    return head

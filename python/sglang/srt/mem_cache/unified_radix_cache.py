@@ -6034,9 +6034,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             pool = _w3_anchor_spill_pool(pool)
             if pool is None:
                 return 0
-        if _r12.role() is not None:
-            # Form A: a worker's host rows mirror TP0's verdicts (R12); the
-            # spill stays on the groups without the shadow protocol
+        _role = _r12.role()
+        if _role == "worker":
+            # Form A: a worker never decides a host drop of its own (R12). Its
+            # need goes to TP0, which spills and sends SPILL -- every rank then
+            # gives its reference back (metal dual15: the spill never ran on
+            # the D group, 215 ARENA-DROP freed=0, the head request looped;
+            # NF h16p K10 15.10. 12:21Z: D tree=3692+2499 of 6191 slots, the
+            # same wall, 3366 ARENA-DROP freed=0 in 6 min)
+            _r12.request_spill(getattr(pool, "arena", None), need_pages)
             return 0
         now = time.monotonic()
         if now < getattr(self, "_w3_spill_quiet_until", 0.0):
@@ -6098,6 +6104,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 lost += int(sec.get("lost", 0))
                 unpaired += _unp
                 continue
+            if _role == "host" and int(sec.get("pages", 0)) < len(getattr(node, "hash_value", None) or ()):
+                # Form A: a page some owner has not finished is not COMPLETE and
+                # got no L3 copy -- the whole node stays until every page has one
+                continue
             secured += int(sec.get("on_disk", 0))
             written += int(sec.get("written", 0))
             released_slots.extend(keys.slots_of(node))
@@ -6105,6 +6115,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 node, base, target=EvictLayer.HOST, tracker=None)
             self.evictable_host_leaves.discard(node)
             node.l3_present = True
+            if _role == "host":
+                _r12.record_spill(self, node)   # every worker gives its reference back too
             released += int(host_freed or 0) // P
             spilled += 1
         if released < int(need_pages):
@@ -6180,6 +6192,24 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         except Exception:  # noqa: BLE001 - an instrument never breaks the spill
             return "-"
         return "%d/%d" % (sum(1 for r in refs if int(r) == 0), len(uniq))
+
+    def _w3_forma_serve_requests(self) -> int:
+        """TP0 on Form A, at its broadcast (``form_a_host_shadow.attach``): a
+        worker's refused arena claim left its need next to the arena; spill
+        for it. The SPILL events of this call ride the same broadcast."""
+        if _r12.role() != "host":
+            return 0
+        pool = self._weg2_direct_pool()
+        arena = getattr(pool, "arena", None)
+        if arena is None:
+            return 0
+        need = _r12.take_spill_request(arena)
+        if need <= 0:
+            return 0
+        got = self._w3_arena_spill(pool, need)
+        logger.info("W3-ARENA FORMA-REQUEST need=%d released_pages=%d (a worker's claim was refused; "
+                    "TP0 spilled, the workers follow at this broadcast)", need, got)
+        return got
 
     def _weg2_write_or_abort(self, node, device_value, aux_xfers, pre, ring):
         """The controller write of `write_backup`. #1424f (rc12p P-PP0

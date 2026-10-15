@@ -18062,6 +18062,7 @@ class Scheduler(
         # a flip nothing on D can bring. `_hol.head` is the pass's first NO_TOKEN
         # (the same rid on every rank), so the group MIN inside is entered alike.
         _wall_rows = None
+        _nofund_seen = False
         if _hol.head is not None:
             _wall_head = _weg2_d_wall_head.pick_unservable_head(
                 head_rid=_hol.head,
@@ -18092,6 +18093,25 @@ class Scheduler(
                 if _wedge_head is not None:
                     _x_refused.append(_wedge_head)
                     _wall_rows = {id(_wedge_head): int(_fa_fn.last_verdict[2])}
+                else:
+                    # PW-F (K10, weg2/d_wall_head.py): the no-fund wedge -- a refused
+                    # head, nothing running, nothing admitted, pass after pass
+                    _nofund_seen = True
+                    _nf_head = _weg2_d_wall_head.pick_nofund_head(
+                        sched=self,
+                        head_rid=_hol.head,
+                        waiting=self.waiting_queue,
+                        running_empty=bool(
+                            (_rb is None or _rb.is_empty())
+                            and getattr(self, "chunked_req", None) is None
+                        ),
+                        admitted_n=len(adder.can_run_list),
+                    )
+                    if _nf_head is not None:
+                        _x_refused.append(_nf_head)
+                        _wall_rows = {id(_nf_head): _weg2_d_wall_head.device_need_rows(_nf_head)}
+        if not _nofund_seen:
+            _weg2_d_wall_head.reset_nofund(self)
         if _x_refused:
             self._weg2_answer_x_refusals(_x_refused, _head_inputs, wall_rows=_wall_rows)
         if _v_refused:
