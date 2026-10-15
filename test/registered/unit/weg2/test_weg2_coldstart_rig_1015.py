@@ -29,6 +29,9 @@ SCENARIOS (one test each, ``test_S<n>_...``; the runner ``tools/weg2_coldstart_r
       + G4c: the D writer node's reference on its old slot survives P's take-over                 red under M1 (A2 1015)
   S5  a vision request over P (row form): every stage admits it in the same pass               self-check by mutant
   S6  LB-VERDICT burst with a late-starting twin on the carrierless form (19:33 hang)          red on 853534a9ff
+  S7  arena full and pinned by the peers, a 210k load-back executed on a follower (h16n 07:30:35) red on 4f58ca0256,
+      17c2563647 and 853534a9ff (the defect is latent since 8f2fe84949; h16h never refused a P claim at the metal)
+      + G5 ROW-ROOM: the follower pays the room PP0's row needs (no ROW-ROOM SHORT, no PrefillOutOfPages)
 
 WHAT IS REAL. The tree's own code wherever the death lived: the frameless branch of ``_event_loop_pp_body`` is cut
 out of THIS tree's source and executed (so whatever the tree runs there runs here); every ``_weg2_vote_*`` hook, the
@@ -94,7 +97,8 @@ def _group_stop(exc: BaseException):
 RIG_ENVS = ("SGLANG_WEG2_P_FOLLOWER_ROUND", "SGLANG_WEG2_TOLD_ROW_YIELD", "SGLANG_WEG2_P_ROW_AUTHORITY",
             "SGLANG_WEG2_LBV_ROW_ROOM", "SGLANG_WEG2_LBV_ROW_YIELD", "SGLANG_WEG2_LBV_ADMIT",
             "SGLANG_WEG2_PP_LOADBACK_VERDICT", "SGLANG_WEG2_L3FILL_REF_AT_LAND", "SGLANG_WEG2_L3FILL_JOIN_LIVENESS",
-            "SGLANG_WEG2_L3FILL_JOIN_IDLE_MS", "SGLANG_WEG2_L3FILL_SELF_JOIN_TAKEOVER")
+            "SGLANG_WEG2_L3FILL_JOIN_IDLE_MS", "SGLANG_WEG2_L3FILL_SELF_JOIN_TAKEOVER", "SGLANG_WEG2_L3_DROP",
+            "SGLANG_WEG2_L3_DROP_ACK_WAIT_MS", "SGLANG_WEG2_W3_SPILL_KEEP_PAYABLE", "SGLANG_WEG2_SF")
 
 
 @pytest.fixture(autouse=True)
@@ -183,6 +187,15 @@ class Guards:
                                f"{what}: {len(lost)} of {len(held)} slot(s) the live writer references lost it "
                                f"(slot, gen held, gen now, state now, refs now): {lost[:6]} -- the take-over freed a "
                                "referenced slot; the writer's node now addresses whatever the slot holds next")
+
+    @staticmethod
+    def row_room(paid, need, what):
+        """G5 (ARENAFULL-1015): a follower executing PP0's row pays the room the row needs -- else the metal stop
+        'LB-VERDICT ROW-ROOM SHORT' (07:30:35) / PrefillOutOfPages (07:11:54) ends the group."""
+        if paid < need:
+            raise LawViolation("G5 ROW-ROOM",
+                               f"{what}: the peel paid {paid} of the {need} rows PP0's row needs -- "
+                               "LB-VERDICT ROW-ROOM SHORT, the group stops by name")
 
     @staticmethod
     def landed_full(landed, want, what):
@@ -1462,3 +1475,272 @@ def test_selfcheck_S6_lbv_admit_off_is_the_ring_wait(carrierless, monkeypatch):
     monkeypatch.setenv("SGLANG_WEG2_LBV_ADMIT", "0")
     with pytest.raises(LawViolation, match="G1"):
         test_S6_lbv_burst_late_twin_carrierless(carrierless)
+
+
+# =====================================================================================================================
+# S7 -- the shared arena full and pinned by the peers, a 210k load-back executed on a follower (NF h16n 07:30:35)
+# =====================================================================================================================
+#
+# Metal (boot ..._17c2563647_1015_071520.P.log, PP1): the arena (6485 slots) complete and referenced by every stage
+# (P census 07:29:57 complete=6294 pinned=6292 refs=18876); a 3-page backup refused -> W3-ARENA SPILL released node
+# 208's host copy (3232 pages, ref_free=0/3232: PP0/PP2 still held them), node 208 stays on the device l3_present;
+# the peel demotes its tail, whose store write host-locks it; '#1421 BACKUP-REFUSED why=arena_claim node=208',
+# 'UD-REFUSED why=host_children:child_host_locked node=208 holder=211' -> 'LB-VERDICT ROW-ROOM SHORT kv=209472
+# avail=4096 evictable=255040 evicted=48192' -> group stop. REAL here: the C arena (gcc, the claim of the refused
+# backup, the peers' references), UnifiedRadixCache._w3_arena_spill / _evict_device_leaf / _ud_clear_host_children /
+# _is_device_leaf / _is_host_leaf (and whatever this tree's eviction calls by name, e.g. L3-DROP). MODELLED: the
+# stage tree's nodes and I/O (store write ack queue, the demotion), the peel's leaf order (smallest first).
+
+S7_NODE208, S7_TAIL, S7_OTHER, S7_FREE, S7_NEED = 206848, 231, 48192, 4096, 209472
+S7_PAGE = 64
+S7_SLOTS = 96
+
+
+class _CD7:
+    def __init__(self, value=None, host_value=None):
+        self.value = value
+        self.host_value = host_value
+        self.lock_ref = 0
+        self.host_lock_ref = 0
+
+
+class _Node7:
+    _ids = itertools.count(200)
+
+    def __init__(self, parent, tokens, *, host=False, label=""):
+        self.id = next(_Node7._ids)
+        self.label = label
+        self.parent = parent
+        self.children = {}
+        self.l3_present = False
+        self.key = list(range(tokens))
+        self.slots = []
+        self.component_data = [_CD7(torch.arange(tokens, dtype=torch.int64) if tokens else None,
+                                    torch.arange(tokens, dtype=torch.int64) if (tokens and host) else None),
+                               _CD7(), _CD7()]
+        if parent is not None:
+            parent.children[self.id] = self
+
+    @property
+    def evicted(self):
+        return self.parent is not None and self.component_data[0].value is None
+
+    @property
+    def backuped(self):
+        return self.component_data[0].host_value is not None
+
+
+class _SpillPool7:
+    """The anchor pool the spill talks to: every page it is asked about is on disk already (the write-behind
+    secured it -- 'l3=on_disk:3232,written:0'); no header read (node-id order, the tree's fallback)."""
+
+    staging_rows = 0
+
+    def __init__(self):
+        self.arena = object()
+
+    def secure_rows_to_l3(self, host_indices):
+        n = int(host_indices.numel())
+        return {"pages": n, "on_disk": n, "written": 0, "lost": 0}
+
+
+def _s7_stage_cls():
+    URC = _urc_mod()
+    C = URC.UnifiedRadixCache
+    names = ("_evict_device_leaf", "_is_device_leaf", "_is_host_leaf", "_ud_clear_host_children", "_w3_arena_spill")
+    missing = [n for n in names if not hasattr(C, n)]
+    if missing:
+        raise RigError(f"UnifiedRadixCache lacks {missing}")
+    return type("_Stage7", (_Stage7Base,), {n: getattr(C, n) for n in names})
+
+
+class _Stage7Base:
+    """One follower P stage: its own tree (tp group of one under pp 3 -> the local-PP floor) on the shared arena."""
+
+    W3_SPILL_MIN_PAGES = 64
+    W3_SPILL_EMPTY_BACKOFF_S = 0.5
+
+    def __init__(self, arena):
+        from sglang.srt.weg2 import pp_slot_fidelity as SF
+
+        self.arena = arena
+        self.root_node = _Node7(None, 0, label="root")
+        self.root_node.component_data[0].value = torch.empty(0, dtype=torch.int64)
+        self.cache_controller = SimpleNamespace(write_policy="write_back")
+        self.ongoing_write_through = {}
+        self.ongoing_backup = {}
+        self.ongoing_prefetch = {}
+        self.ack_queue = []
+        self.tree_components = (_urc_mod().BASE_COMPONENT_TYPE,)
+        base = SimpleNamespace(component_type=_urc_mod().BASE_COMPONENT_TYPE)
+        self.components = {_urc_mod().BASE_COMPONENT_TYPE: base}
+        self._components_tuple = (base,)
+        self.evictable_host_leaves = set()
+        self.evictable_device_leaves = set()
+        self.page_size = 1
+        self.backup_claims = []
+        SF.mark_floor_scope(self, True)
+
+    # ---- the tree surface the real methods touch ------------------------------------------------------------
+    def _collect_all_nodes(self):
+        out, stack = [], [self.root_node]
+        while stack:
+            n = stack.pop()
+            out.append(n)
+            stack.extend(n.children.values())
+        return out
+
+    def _w3_spill_keys(self, pool, nodes):
+        keys = {id(n): (1, 0, 0, n.id) for n in nodes}
+
+        class _K(dict):
+            def slots_of(self, node):
+                return list(node.slots)
+
+        return _K(keys)
+
+    def _w3_spill_ref_free(self, pool, slots):
+        refs = self.arena.slot_refs(sorted(set(slots))) if slots else []
+        return f"{sum(1 for r in refs if r == 0)}/{len(refs)}"
+
+    def _evict_component_and_detach_lru(self, node, comp, target=None, tracker=None):
+        """The spill's host release (#1407 transit, KV layer): this stage's references go back to the arena."""
+        hv = node.component_data[0].host_value
+        if node.slots:
+            self.arena.ref_slots(node.slots, -1)
+        node.component_data[0].host_value = None
+        return 0, 0 if hv is None else int(hv.numel())
+
+    def write_backup(self, node, write_back=False, kv_only_if_mamba_refused=False):
+        """The backup IS an arena claim (_weg2_direct_claim -> alloc_write): claimed for real on the shared arena."""
+        pages = max(1, len(node.key) // S7_PAGE)
+        stems = [f"s7-backup-{node.id}-{i}" for i in range(pages)]
+        got = self.arena.claim_slots(stems, [1024] * pages)
+        self.backup_claims.append([st for _s, st, _g in got])
+        fresh = [(s, g) for s, st, g in got if st == 0]
+        if fresh:
+            self.arena.release_claims([s for s, _ in fresh], [g for _, g in fresh])
+        return 0 if any(st == 4 for _s, st, _g in got) else len(node.key)
+
+    def writing_check(self, write_back=False):
+        return None
+
+    def _evict_to_host(self, node, tracker):
+        """GPU -> CPU demotion of a backed leaf (the node stays, host-only)."""
+        tracker[_urc_mod().BASE_COMPONENT_TYPE] += len(node.component_data[0].value)
+        node.component_data[0].value = None
+
+    def _evict_host_leaf(self, node, tracker):
+        assert self._is_host_leaf(node)
+        if node.slots:
+            self.arena.ref_slots(node.slots, -1)
+        node.parent.children.pop(node.id)
+
+    def _ud_drop_unbacked_leaf(self, node, tracker):
+        assert not node.children, "#841: an un-backed node with children is never dropped"
+        tracker[_urc_mod().BASE_COMPONENT_TYPE] += len(node.component_data[0].value)
+        node.parent.children.pop(node.id)
+
+    def _update_evictable_leaf_sets(self, node):
+        pass
+
+    def drain_backup_acks_uncoordinated(self):
+        n = 0
+        while self.ack_queue:
+            op = self.ack_queue.pop(0)
+            node, _p = self.ongoing_backup.pop(op)
+            node.l3_present = True
+            node.component_data[0].host_lock_ref = max(0, node.component_data[0].host_lock_ref - 1)
+            n += 1
+        return n
+
+    # ---- the scenario's own steps -----------------------------------------------------------------------------
+    def store_write(self, node, op):
+        """write_backup_storage: the node's host lock until its ack is drained; the backup thread acked it."""
+        node.component_data[0].host_lock_ref += 1
+        self.ongoing_backup[op] = (node, None)
+        self.ack_queue.append(op)
+
+    def peel(self, want):
+        """The eviction: device leaves smallest first, until ``want`` rows are paid or a round pays nothing."""
+        B = _urc_mod().BASE_COMPONENT_TYPE
+        tracker = {B: 0}
+        while tracker[B] < want:
+            leaves = sorted((n for n in self._collect_all_nodes() if self._is_device_leaf(n)),
+                            key=lambda n: (len(n.key), n.id))
+            before = tracker[B]
+            for n in leaves:
+                self._evict_device_leaf(n, tracker)
+                if tracker[B] >= want:
+                    break
+            if tracker[B] == before:
+                break
+        return tracker[B]
+
+
+def _s7_pinned_arena(tmp_path):
+    """The shared arena: every slot COMPLETE and referenced by the peers (PP0/PP2/D) -- 'complete=6294 pinned=6292'."""
+    _need_gcc()
+    from sglang.srt.mem_cache.storage.file.hicache_arena import ShmArena
+
+    path = str(tmp_path / "arena-s7.bin")
+    arena = ShmArena(path, 1024, S7_SLOTS)
+    peers = ShmArena(path, 1024, S7_SLOTS)
+    stems = [f"s7-page-{i}" for i in range(S7_SLOTS)]
+    got = arena.claim_slots(stems, [1024] * S7_SLOTS)
+    slots = [s for s, _st, _g in got]
+    assert arena.complete_slots(slots, [g for _s, _st, g in got], [(0, 1024)] * S7_SLOTS) == [1] * S7_SLOTS
+    assert peers.ref_slots(slots, +1) == S7_SLOTS
+    return arena, peers, slots
+
+
+def test_S7_arena_full_pinned_210k_loadback_on_a_follower(tmp_path, monkeypatch):
+    """Node 208 (206848 tokens) and its tail on the follower's device, both backed into the pinned arena; a small
+    backup is refused and the spill takes 208's host copy; the tail's store write is in flight when the peel
+    demotes it; PP0's row needs 209472 rows on this stage (4096 free). G5: the peel pays them."""
+    monkeypatch.setenv("SGLANG_WEG2_SF", "1")
+    arena, peers, slots = _s7_pinned_arena(tmp_path)
+    try:
+        Stage = _s7_stage_cls()
+        st = Stage(arena)
+        n208 = _Node7(st.root_node, S7_NODE208, host=True, label="208")
+        tail = _Node7(n208, S7_TAIL, host=True, label="211")
+        other = _Node7(st.root_node, S7_OTHER, host=True, label="other")
+        n208.slots, tail.slots, other.slots = slots[:48], slots[48:50], slots[50:80]
+        assert arena.ref_slots(n208.slots + tail.slots + other.slots, +1) == 80   # this stage's tree references
+        # 07:30:30: a 192-token backup (weg2-17-57) is refused -- the arena has no free slot
+        small = _Node7(st.root_node, 192, label="215")
+        if st.write_backup(small) != 0:
+            raise RigError("the pinned arena granted a claim -- the scenario's premise is gone")
+        st.root_node.children.pop(small.id)
+        try:
+            st._w3_arena_spill(_SpillPool7(), 3, claimer=None)
+        except Exception as exc:  # noqa: BLE001
+            raise RigError(f"_w3_arena_spill cannot run on the rig stage: {exc!r}")
+        if not n208.backuped and arena.slot_refs(n208.slots)[0] != 1:
+            raise RigError("the spill freed 208's slots although the peers reference them")
+        # the tail's store write (written back after the spill) is in flight when the peel comes
+        st.store_write(tail, op=77)
+        # PP0's row: load-back of 209472 rows on this stage, 4096 free -> the peel must pay the rest
+        need = S7_NEED - S7_FREE
+        try:
+            paid = st.peel(need)
+        except LawViolation:
+            raise
+        except Exception as exc:  # noqa: BLE001 - the tree stopped by name
+            raise _group_stop(exc) from exc
+        Guards.row_room(paid, need, "follower PP1 executing weg2-16-53's row (kv=209472, avail=4096)")
+    finally:
+        arena.close()
+        peers.close()
+
+
+def test_selfcheck_S7_l3_drop_off_is_row_room_short(tmp_path, monkeypatch):
+    """With the L3-DROP switch off the store-backed node takes the claim-first path again -> G5 red."""
+    from sglang.srt.mem_cache import unified_radix_cache as URC
+
+    if not hasattr(URC.UnifiedRadixCache, "_weg2_l3_drop"):
+        pytest.skip("n/a: this tree has no L3-DROP to switch off")
+    monkeypatch.setenv("SGLANG_WEG2_L3_DROP", "0")
+    with pytest.raises(LawViolation, match="G5"):
+        test_S7_arena_full_pinned_210k_loadback_on_a_follower(tmp_path, monkeypatch)
