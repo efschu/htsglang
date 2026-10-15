@@ -6046,6 +6046,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                             row_slot.pop(int(r), None)
             settle = getattr(pool, "settle_lost_rows", None)
             if not callable(settle):
+                # A2 B-A: an arena pool without the settle is a wiring gap (the
+                # HostPoolGroup forward was missing), never a silent no-op
+                n = getattr(UnifiedRadixCache, "_a2_settle_missing_n", 0) + 1
+                UnifiedRadixCache._a2_settle_missing_n = n
+                if n <= 4 or (n & (n - 1)) == 0:
+                    logger.error("A2 LOST-ROWS SETTLE UNREACHABLE pool=%s node=%s (n=%d): the host pool "
+                                 "offers no settle_lost_rows -- lost pages stay on their old slot",
+                                 type(pool).__name__, getattr(node, "id", "?"), n)
                 return
             res = settle(hv, getattr(node, "hash_value", None))
             if row_slot is not None and res.get("moved"):

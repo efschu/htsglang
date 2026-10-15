@@ -2265,8 +2265,12 @@ class HostPoolGroup:
 
     def __getattr__(self, name):
         # only reached for attributes the group does not define itself
+        # A2 B-A (nf-chainkey-a2-review-1015): the ack's lost-page settle
+        # (unified_radix_cache._a2_settle_lost) asks the HostPoolGroup for
+        # take_lost_slots / settle_lost_rows -- without them here it got None
+        # and silently settled nothing on every hybrid (NF) host rank.
         if name in ("alloc_read", "alloc_write", "complete_write", "abort_write", "pin_slots",
-                    "claim_would_refuse"):
+                    "claim_would_refuse", "take_lost_slots", "settle_lost_rows"):
             fn = getattr(self.anchor_entry.host_pool, name, None)
             if callable(fn):
                 return fn
