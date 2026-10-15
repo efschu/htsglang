@@ -1442,6 +1442,9 @@ async def weg2_park_running(obj: Annotated[Weg2ParkRunningReqInput, Body()], req
     seq_marks = getattr(ret, "weg2_seq_hash", None)  # SEQ-HASH (02.10.)
     if seq_marks:
         body["weg2_seq_hash"] = dict(seq_marks)
+    answered_at = float(getattr(ret, "answered_at", 0.0) or 0.0)  # FLIPSTALL-1015
+    if answered_at > 0.0:
+        body["answered_at"] = answered_at
     if getattr(ret, "lane", False):
         # PRIORITY LANES 1008 (L2): the answer of a rids / hold park carries "lane" (+ why a rid was not parked)
         body["lane"] = True
