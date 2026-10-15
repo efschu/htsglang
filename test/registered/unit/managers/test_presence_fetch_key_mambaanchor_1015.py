@@ -107,7 +107,7 @@ class TestTheMechanism(CustomTestCase):
         self.assertEqual(g.d_last_hash, g.chain[g.dev // PS - 1])
         cont = get_hash_str(RadixKey(g.ids[g.dev : g.fork + 1], is_bigram=True),
                             g.d_last_hash, page_size=PS)
-        self.assertEqual(cont, g.chain[g.dev // PS :])
+        self.assertTrue(cont == g.chain[g.dev // PS :], "chain continues")
 
     def test_unigram_ids_meet_no_store_key(self):
         # true on both sides of the fix: the pre-1015 probe input
@@ -122,7 +122,9 @@ class TestTheMechanism(CustomTestCase):
         req = types.SimpleNamespace(extra_key=None, last_host_node=None)
         probe = get_hash_str(pfk.span_key(tree, req, g.span()), g.d_last_hash, page_size=PS)
         fetch_key = RadixKey(g.span(), extra_key=None, is_bigram=True).page_aligned(PS)
-        self.assertEqual(probe, get_hash_str(fetch_key, g.d_last_hash, page_size=PS))
+        # (plain bool: a 3300-key list diff under the retry wrapper takes minutes)
+        self.assertTrue(probe == get_hash_str(fetch_key, g.d_last_hash, page_size=PS),
+                        "the probe hashes what the fetch reads")
 
 
 class TestStorePresencePages(CustomTestCase):
@@ -136,10 +138,13 @@ class TestStorePresencePages(CustomTestCase):
         self.assertGreater(len(g.store.asked[-1]), STORAGE_BATCH_SIZE)
 
     def test_key_form_alone_matters(self):
-        # anchor inside the first batch: the key form decides (mutant M1)
-        g = _Geo(anchor=3008 + 500 * PS)
+        # anchor INSIDE the first batch (STORAGE_BATCH_SIZE: 128 by default, NF
+        # SGLANG_HICACHE_STORAGE_BATCH=1024), so the span term plays no part:
+        # the key form alone decides (M2 leaves this green, the id list is 0)
+        k = STORAGE_BATCH_SIZE // 2
+        g = _Geo(anchor=3008 + k * PS)
         ctl = _controller(g.store)
-        self.assertEqual(ctl.store_presence_pages(self._key(g), g.d_last_hash, None), 500)
+        self.assertEqual(ctl.store_presence_pages(self._key(g), g.d_last_hash, None), k)
         self.assertEqual(ctl.store_presence_pages(g.span(), g.d_last_hash, None), 0)
 
     def test_dense_v1_question_keeps_the_first_batch(self):
@@ -158,8 +163,9 @@ class TestStorePresencePages(CustomTestCase):
             self.assertIs(type(span), list)
             pages = _controller(g.store).store_presence_pages(span, g.d_last_hash, None)
         self.assertEqual(pages, 0)
-        self.assertEqual(g.store.asked[-1],
-                         get_hash_str(list(g.span()), g.d_last_hash, page_size=PS)[:STORAGE_BATCH_SIZE])
+        self.assertTrue(g.store.asked[-1]
+                        == get_hash_str(list(g.span()), g.d_last_hash, page_size=PS)[:STORAGE_BATCH_SIZE],
+                        "switch off: the unigram chain's first batch, as before")
 
     def test_no_anchor_on_the_path_stays_absent(self):
         # KV without state is no hit (S1/FIX-3: they stand or fall together)
