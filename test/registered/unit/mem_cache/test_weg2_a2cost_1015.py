@@ -249,12 +249,13 @@ def test_a_cache_error_falls_back_to_the_full_proof(tmp_path):
     arena.slot_state_gens_np = boom
     assert _provable(pool, nodes) == (4, 4), "the HIT path fails: the full proof answers, no exception into the vote"
     st = ap.vote_cache_stats()
-    assert st["error"] >= 2 and st["hit"] == 0, st                # the hit's error + the fill's error
+    assert st["error"] == 1 and st["hit"] == 0, st                # the hit's error; the proof then runs uncached
     arena.slot_state_gens_np = real
     pool._a2_vote_cache.d.clear()
     arena.slot_state_gens_np = boom
     assert _provable(pool, nodes) == (4, 4)                       # cold: only the fill path fails
     assert _provable(pool, nodes) == (4, 4), "never an exception into the vote, never another value"
+    assert ap.vote_cache_stats()["error"] == 3 and len(pool._a2_vote_cache.d) == 0   # the fill's g0 failed twice: nothing stored
 
     # a broken chain still cuts through the error path
     nodes[1].hash_value[1] = "zz"
