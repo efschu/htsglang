@@ -28,7 +28,8 @@ a stage before its launch (no output, no forward-side send). So the common abort
 * the verdict "N voids for the same request -> 503" is PP0's alone and rides the request wire (``intake_origin_abort`` ORIGIN-ABORT:
   every stage drops the rid at the same list position); the void frame says ``abort=1`` so the followers hold the request in place
   (``_weg2_oom_abort_pending``) until the abort lands;
-* a LOAD-BACK refusal (``AgreedRoomShort``, add_one_req) on the frame form voids the WHOLE pass, not the one request: a follower
+* a LOAD-BACK refusal (``AgreedRoomShort``, add_one_req; ARENA-CHAIN: also ``ArenaChainMismatch`` = a chain page nothing proves,
+  cause ``chain_mismatch``) on the frame form voids the WHOLE pass, not the one request: a follower
   plans from its own queue and would admit and load back the request PP0 skipped (the 18:30/19:36/20:11 pass skew). The request is
   skipped in the loop as before (``NO_TOKEN``), the pass is planned to its end, and the event loop discards it as a whole right
   after the plan (``after_plan``: own-void + void frame) -- the unwinding is the proven own-void, not a second implementation.
@@ -62,6 +63,7 @@ GROUP_ENV = "SGLANG_WEG2_GROUP"
 
 CAUSE_PREFILL = "prefill_oom"
 CAUSE_LOADBACK = "agreed_room_short"
+CAUSE_CHAIN = "chain_mismatch"  # ARENA-CHAIN: a load-back chain page nothing proves (ArenaChainMismatch, NF 14.10. 07:29:33Z)
 
 #: scheduler attributes (rank-local, one pass wide)
 OUT_ATTR = "_pp_void_pass_out"  # statement to put on the frame this rank owes downstream in this slot
