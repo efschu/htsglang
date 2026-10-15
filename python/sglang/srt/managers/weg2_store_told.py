@@ -414,6 +414,19 @@ def follower_early_settle_now(scheduler, req, rid: str, told: int) -> bool:
 #: byte-identical to before).
 OVER_UNRESUMABLE = "over_unresumable"
 
+#: H64 SETTLE-ACK-NOW (default on; 0 = "short" whatever the registration did,
+#: pre-H64): a short early read whose told-limited registration issued no read
+#: -- the tree already held told (satisfied) or the store had nothing to give
+#: (declined) -- acks at once instead of waiting for a read that never started.
+ENV_SETTLE_ACK_NOW = "SGLANG_WEG2_PF_SETTLE_ACK_NOW"
+SHORT_SATISFIED = "short_satisfied"
+SHORT_DECLINED = "short_declined"
+
+
+def settle_ack_now_on(env=None) -> bool:
+    env = os.environ if env is None else env
+    return str(env.get(ENV_SETTLE_ACK_NOW, "1") or "1").strip().lower() not in ("0", "false", "no", "off")
+
 
 def _over_resumable_at_told(scheduler, req, told: int, own: int) -> bool:
     """True = this rank can resume ``req`` at ``told`` (or no probe/verdict):
@@ -458,7 +471,9 @@ def follower_early_settle(scheduler, req, told: int, own: int, absolute: bool = 
     :func:`_over_resumable_at_told`), ``"refuse"`` (a span-relative told the
     read overshot: #1400's MISMATCH refusal follows in the admission),
     ``"short"`` (register the #1400 told-limited read now; the admission then
-    waits for it)."""
+    waits for it) -- or, H64, ``SHORT_SATISFIED`` / ``SHORT_DECLINED`` when
+    that registration issued no read (the tree held told / nothing to read):
+    nothing to wait for, the PF ack goes in this pass."""
     rid = _rid(req)
     tree = scheduler.tree_cache
     if int(own) == int(told):
@@ -481,7 +496,19 @@ def follower_early_settle(scheduler, req, told: int, own: int, absolute: bool = 
         _pop_credit_keep_pin(tree, rid)
     except Exception:  # noqa: BLE001
         pass
-    _follower_register(scheduler, req, told, early=False)
+    verdict = _follower_register(scheduler, req, told, early=False)
+    if settle_ack_now_on() and not str(verdict).startswith("issued"):
+        # H64 SETTLE-ACK-NOW (NF h16n, PP1/PP2 04:30:43 weg2-6-44): the early
+        # read's record was stale (93440: read at intake, before the twin's
+        # sibling published) while the tree already held told -- the
+        # told-limited registration found it LOCALLY ("FOLLOWER SATISFIED
+        # LOCALLY local_prefix=96640") and issued nothing. "short" promised an
+        # ack "when the read ends" for a read that never started: the ack
+        # slipped to the next follower pass, which came only with PP0's
+        # fallback (CHAIN-RECV blocked 2131 ms). Nothing is in flight, so the
+        # ack goes now: satisfied -> own_prefix's satisfied probe (told when
+        # this rank can resume there), declined -> the record, PP0 decides.
+        return SHORT_SATISFIED if str(verdict).startswith("satisfied") else SHORT_DECLINED
     return "short"
 
 
@@ -1518,7 +1545,14 @@ def _pp0_publish_paced(scheduler, recv_reqs: List) -> List:
     held: Dict[str, Any] = scheduler._weg2_store_held
     pacing = _pacing(scheduler)
     fb_watch = bool(getattr(scheduler, "_weg2_told_fallback_on", False)) and _fb.pp0_watching(scheduler)
+    # H64 ACK-DRAIN: once the ack stream exists PP0 polls it on every pass --
+    # an ack whose size frame landed in the deciding pass must not strand its
+    # payload (and every later ack of that follower) until the next paced rid.
+    fb_drain = bool(getattr(scheduler, "_weg2_told_fallback_on", False)) and _fb.pp0_has_stream(scheduler)
     if not held and not pacing and not fb_watch:
+        if fb_drain:
+            # nothing to decide: only take what landed (late acks are named)
+            _fb.pp0_harvest(scheduler)
         return recv_reqs
     told_map: Dict[str, int] = scheduler._weg2_store_told
     tree = scheduler.tree_cache
@@ -1529,7 +1563,7 @@ def _pp0_publish_paced(scheduler, recv_reqs: List) -> List:
     scheduler._weg2_told_pass_n = pass_n
     fb_on = bool(getattr(scheduler, "_weg2_told_fallback_on", False))
     fb_parked = set()
-    if fb_on and (pacing or fb_watch):
+    if fb_on and (pacing or fb_watch or fb_drain):
         # PF: the followers' read acks that have landed (no wait), BEFORE
         # the verdicts below read them.
         _fb.pp0_harvest(scheduler)
@@ -1573,19 +1607,28 @@ def _pp0_publish_paced(scheduler, recv_reqs: List) -> List:
             # PF: PP0 alone decides -- told once every follower's read
             # reproduced it, told=0 for every rank on a short read or at the
             # Frist. Never the window's guess.
-            verdict = _fb.pp0_decide(scheduler, rid, now)
+            verdict = _fb.pp0_decide(scheduler, rid, now, pass_n=pass_n)
             if verdict is None:
                 continue
             told_final, reason = verdict
             if told_final > 0:
                 # TF: the Admit is PP0's own admission -- told=0 for every rank
                 # when PP0's tree cannot resume at it (weg2_told_fidelity).
+                # H64 GROUP-FLOOR: the same check at the floor depth.
                 _tf_told, _ = _tf.pp0_verdict(scheduler, p.req, told_final, p.absolute)
                 if _tf_told != told_final:
                     told_final, reason = _tf_told, "told_fidelity"
             pacing.pop(rid, None)
             _fb.pp0_note_verdict(scheduler, rid, p.told, told_final, reason, now, p.published_at)
             admit = Weg2StoreAdmit(rid=rid, told=told_final)
+            if reason == _fb.REASON_FLOOR and 0 < told_final < p.told:
+                # H64 GROUP-FLOOR: every follower proved told_final, PP0's TF
+                # admits it -- the same depth for EVERY rank, nothing released.
+                _fb.apply_floor(scheduler, rid, told_final)
+                setattr(admit, _fb.WIRE_FLOOR, 1)
+                told_map[rid] = told_final
+                out.append(admit)
+                continue
             if told_final != p.told:
                 # PP0's own read is released like a follower's: its record
                 # said told, its admission now compares 0 with 0.
@@ -1685,7 +1728,7 @@ def _pp0_publish_paced(scheduler, recv_reqs: List) -> List:
             # PF: ask the followers for their read state (wire marker, set
             # only here) and start the Frist.
             setattr(ahead, _fb.WIRE_ACK, 1)
-            _frist = _fb.pp0_open(scheduler, rid, told, now, own_read_s, window)
+            _frist = _fb.pp0_open(scheduler, rid, told, now, own_read_s, window, published_pass=pass_n)
             n_fb = getattr(scheduler, "_pf_open_n", 0) + 1
             scheduler._pf_open_n = n_fb
             if n_fb <= _LOG_FIRST or n_fb % _LOG_EVERY == 0:
@@ -1714,10 +1757,15 @@ def _follower_admit(scheduler, item: Weg2StoreAdmit) -> None:
     rid = str(item.rid)
     told = int(item.told)
     fallback = bool(getattr(item, _fb.WIRE_FALLBACK, 0))
+    floor = bool(getattr(item, _fb.WIRE_FLOOR, 0))
     if fallback:
         # PF: PP0 switched this rid to told=0 for every rank -- cut this
         # rank's read (abort path: rows, lock, reader references) first.
         _fb.follower_release(scheduler, rid)
+    elif floor and told > 0:
+        # H64 GROUP-FLOOR: PP0 admitted the depth every follower proved --
+        # satisfied at it, nothing released (the same steps PP0 took).
+        _fb.apply_floor(scheduler, rid, told)
     elif getattr(scheduler, "_weg2_fb_follower", None) is not None:
         _fb.follower_forget(scheduler, rid)
     early = _early(scheduler)
@@ -1729,7 +1777,7 @@ def _follower_admit(scheduler, item: Weg2StoreAdmit) -> None:
         # no read-ahead reached this request (it was not queued yet): register
         # now; admission then waits for it as the single-phase form does.
         _follower_register(scheduler, req, told)
-    if ahead is not None and int(ahead) != told and not fallback:
+    if ahead is not None and int(ahead) != told and not fallback and not floor:
         logger.warning(
             "#1416e PACED-ADMIT rid=%s told=%d differs from the read-ahead %d; admission "
             "compares against the admitted value", _rt(rid), told, int(ahead),
