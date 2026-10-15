@@ -11392,7 +11392,9 @@ class Front:
             release, or the oldest queued request waited for P past the wait bound (``d_wait_bound_s``,
             measured as the phase policy does: now - max(arrival, D phase start)) -- D decoding on or
             not: the same park + flip, P prefilling the oldest one (``_dc_p_cap`` 1, AGE PLAN's
-            displacement cap).
+            displacement cap). Own switch ``SGLANG_WEG2_K10_RELIEF_P_WAIT`` (default on; 0 = (c) never
+            fires, (a) and (b) unchanged): it parks decodes D is still running, which the user weighs
+            against "kein Massenparken" (14.10.) -- his decision, so it is switchable alone.
 
         At most once per D epoch (the park's own one-attempt rule carries the
         same epoch). None = not applicable, the gate's rules run as before."""
@@ -11413,7 +11415,8 @@ class Front:
         hold_s = max(0.0, now - float(t_rel)) if (st.get("route") == "P" and t_rel is not None) else 0.0
         if rvp:
             why = "rvp_seat_held"
-        elif _asr.age_plan_enabled() and (_asr.bound_fired(p_wait, bound) or (0.0 < hold_max <= hold_s)):
+        elif (envs.SGLANG_WEG2_K10_RELIEF_P_WAIT.get() and _asr.age_plan_enabled()
+              and (_asr.bound_fired(p_wait, bound) or (0.0 < hold_max <= hold_s))):
             # (c) the wait bound the hold line names ("waits for a seat or the wait bound") and the phase
             # policy states (d_wait_bound_s: a request waiting for P longer parks D's decodes and flips) --
             # under AGE PLAN nothing on this path enforced it (h16p boot 1242: epoch 30 weg2-30-76 waited

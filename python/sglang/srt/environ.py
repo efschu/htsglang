@@ -2096,6 +2096,11 @@ class Envs:
     # themselves 2.0-3.3 s. 15 s = the collect window: a D phase keeps >= window + hold = 30 s. 0 = only
     # the wait bound (d_wait_bound_s) releases the hold.
     SGLANG_WEG2_K10_HOLD_MAX_S = EnvFloat(15.0)
+    # K10 (c) on its OWN switch (h16q integration 15.10.): (c) parks the decodes D is still running and flips
+    # (P takes the oldest), which rubs against the user's "kein Massenparken" (14.10.); he decides about it.
+    # On (default, new features on) = (c) as above; 0 = (c) never fires -- neither the hold bound nor the wait
+    # bound on this path --, (a) and (b) unchanged. Marker: 'WEG2 K10-SEAT-RELIEF why=p_wait'.
+    SGLANG_WEG2_K10_RELIEF_P_WAIT = EnvBool(True)
     # X-EXACT: tokenizer path override (tests, or a front without a group
     # reachable); empty = the group's own server_args.tokenizer_path.
     SGLANG_WEG2_FRONT_TOKENIZER_PATH = EnvStr("")
