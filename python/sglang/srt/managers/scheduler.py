@@ -7248,7 +7248,10 @@ class Scheduler(
 
             if _dnr.enabled() and release:
                 _rel2 = []
+                _recs = getattr(getattr(self, "tree_cache", None), "prefetch_loaded_tokens_by_reqid", None) or {}
                 for _r, _s, _l in release:
+                    # TAIL-CONSUME-ON-FULL companion: a re-read that completed raises the stale witness
+                    _dnr.refresh_delivered(_r, _recs.get(str(_r.rid)))
                     _rem = _dnr.d_would_compute(_r)
                     if _rem > 0 and _dnr.divert(self, _r, _rem):
                         continue
