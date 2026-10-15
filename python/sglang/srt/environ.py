@@ -845,6 +845,16 @@ class Envs:
     # process itself holds is taken over and read at once. 0 = off.
     SGLANG_WEG2_L3FILL_PROTECT_READ = EnvBool(True)
     SGLANG_WEG2_L3FILL_SELF_JOIN_TAKEOVER = EnvBool(True)
+    # H54 PARK-JOIN 1015 (NF h16h, 16 of 16 JOIN-WAIT tears after a park /
+    # wake): a JOINED stem whose holder is a HOST-WRITE claim that did not
+    # complete inside the join wait, on a page L3 holds, is taken from its key
+    # whatever its references and byte progress (arena_quarantine_host_write)
+    # and read from L3 by this fill; a stem a peer stage took over first is
+    # awaited, not dropped. JOIN_HELD_LOG: one 'L3-FILL JOIN-HELD' line per
+    # wait that ends with claims left -- refs, merged/joined writers, open,
+    # coverage and the quarantine verdict of each held slot. 0 = off.
+    SGLANG_WEG2_L3FILL_HOST_WRITE_TAKEOVER = EnvBool(True)
+    SGLANG_WEG2_L3FILL_JOIN_HELD_LOG = EnvBool(True)
     # STORE_REFUSE_FS (W57, user 28.09.: "L3 gehoert auf XFS, nie ZFS"): a
     # real boot whose store directory lives on one of these filesystems
     # (/proc/mounts) is refused by name -- the container layer (overlay) or

@@ -473,7 +473,7 @@ def fill_stale_claim_ms() -> int:
 
 
 def _reap_stale_live_joins(arena, stems, joined, total_bytes: int, min_ms_override=None,
-                           out=None) -> list:
+                           out=None, verdicts=None) -> list:
     """L3FILL-JOINED (3): the JOINED stems whose holder delivered no byte for
     ``SGLANG_WEG2_L3FILL_STALE_CLAIM_S`` are taken from their keys (quarantine,
     generation-safe) and claimed fresh by this fill. Returns the new todo
@@ -493,6 +493,8 @@ def _reap_stale_live_joins(arena, stems, joined, total_bytes: int, min_ms_overri
         pass
     owners = _join_owner_text(arena, joined)
     st = q([int(s) for _, s, _ in joined], [int(g) for _, _, g in joined], min_ms)
+    if verdicts is not None:
+        verdicts.extend(int(v) for v in st)   # H54: the JOIN-HELD line names them
     reaped = [joined[k] for k, v in enumerate(st) if int(v) == 1]
     if min_ms_override is not None:
         # JOIN-IDLE-1014: status 2 = the joined claim's generation moved or it
@@ -520,6 +522,130 @@ def _reap_stale_live_joins(arena, stems, joined, total_bytes: int, min_ms_overri
             "-- generation kept, a late completion of the old writer is refused by name; the "
             "stem is read from disk into a fresh slot)",
             k, len(joined), len(reaped), len(fresh), _STALE_REAP_N[1], min_ms, owners)
+    return fresh
+
+
+_JOIN_HELD_N = [0]
+_HOST_WRITE_TAKEOVER_N = [0, 0, 0]   # lines, stems taken over, stems re-joined
+#: H54: the quarantine_stale verdicts by name (arena.c)
+_QUARANTINE_WHY = {0: "young", 1: "taken", 2: "moved", 3: "referenced"}
+JOIN_HELD_K = 8
+
+
+def _join_held_text(arena, rows, verdicts=None) -> str:
+    """H54 PARK-JOIN 1015 (instrument): per held join slot
+    ``slot/g<gen>/<role>/pid<pid>/tag=<owner>/refs=<n>/merged=<tags>/joined=<tags>/open<n>/cov=<covered>of<total>/<age>ms``
+    for the first ``JOIN_HELD_K``, plus the counts over all held slots of
+    references > 0, open writers > 0, role host-write and -- given the reap's
+    ``quarantine_stale`` answers -- each verdict by name. The two readings of
+    h54 (a writer's node references the partial claim / late extents keep it
+    young) are told apart by ``refs`` and ``age``; the missing writer by
+    ``merged`` against the group's tags (P r -> P<r>, D r -> D<r>). Never
+    raises, decides nothing."""
+    census = getattr(arena, "claim_census", None)
+    refs_fn = getattr(arena, "slot_refs", None)
+    if not callable(census) or not rows:
+        return ""
+    try:
+        from sglang.srt.mem_cache.storage.file.hicache_arena import CLAIM_ROLES, writer_tags_text
+
+        slots = [int(s) for _, s, _ in rows]
+        cen = census(slots)
+        refs = list(refs_fn(slots)) if callable(refs_fn) else [-1] * len(slots)
+    except Exception:  # noqa: BLE001 - an instrument never raises
+        return ""
+    parts = []
+    for c, r in list(zip(cen, refs))[:JOIN_HELD_K]:
+        parts.append("%d/g%d/%s/pid%d/tag=%s/refs=%d/merged=%s/joined=%s/open%d/cov=%dof%d/%dms" % (
+            c["slot"], c["gen"], CLAIM_ROLES.get(c["role"], str(c["role"])), c["pid"],
+            writer_tags_text(1 << (c["owner_tag"] & 31)), int(r), writer_tags_text(c["merged"]),
+            writer_tags_text(c["joined"]), c["open"], c["covered"], c["total"], c["age_ms"]))
+    by_v = {}
+    for v in (verdicts or ()):
+        k = _QUARANTINE_WHY.get(int(v), str(int(v)))
+        by_v[k] = by_v.get(k, 0) + 1
+    return " held=%d referenced=%d open=%d host_write=%d verdicts=%s slots=[%s%s]" % (
+        len(cen), sum(1 for r in refs if int(r) > 0), sum(1 for c in cen if c["open"] > 0),
+        sum(1 for c in cen if c["role"] == 2),
+        ",".join("%s:%d" % kv for kv in sorted(by_v.items())) or "-",
+        " ".join(parts), " ..." if len(cen) > JOIN_HELD_K else "")
+
+
+def _note_join_held(arena, rows, verdicts, phase: str) -> None:
+    """H54: one ``L3-FILL JOIN-HELD`` line per join wait that ends with claims
+    left (not rate limited -- the event is the h54 class). Switch
+    ``SGLANG_WEG2_L3FILL_JOIN_HELD_LOG`` (default on)."""
+    try:
+        if not rows or not envs.SGLANG_WEG2_L3FILL_JOIN_HELD_LOG.get():
+            return
+    except Exception:  # noqa: BLE001
+        return
+    _JOIN_HELD_N[0] += 1
+    logger.warning("L3-FILL JOIN-HELD n=%d phase=%s pid=%d stems=%d%s (H54: the claims a join wait left "
+                   "behind -- refs > 0 = a writer's node references the partial claim, a young age = "
+                   "extents still trickle in; merged names the writers that wrote)",
+                   _JOIN_HELD_N[0], phase, os.getpid(), len(rows), _join_held_text(arena, rows, verdicts))
+
+
+def host_write_takeover_on() -> bool:
+    try:
+        return bool(envs.SGLANG_WEG2_L3FILL_HOST_WRITE_TAKEOVER.get())
+    except Exception:  # noqa: BLE001 - no switch: on (the env default)
+        return True
+
+
+def _take_over_host_write_joins(arena, stems, joined, total_bytes: int, out, rejoined) -> list:
+    """H54 PARK-JOIN 1015: the JOINED stems the join wait and the stale reap
+    left -- every one is on disk (the fill only claims what L3 holds) -- whose
+    holder is a HOST-WRITE claim are taken from their keys regardless of
+    references and byte progress (``quarantine_host_write``) and claimed fresh
+    by this fill, which reads the canonical page from L3. A host-write claim
+    that did not complete inside the wait is either missing a writer for good
+    (one rank refused / dropped its backup, a dormant group -- each merged
+    writer references the partial slot, so ``quarantine_stale`` refuses it for
+    ever) or slower than the disk; either way L3 has the bytes now.
+    A stem a peer stage took over first (status 2 here, its fresh claim then
+    JOINED) is appended to ``rejoined`` for one more bounded wait -- a peer's
+    fresh L3 fill completes in milliseconds -- instead of ending this stage's
+    prefix. Returns the fresh todo entries (index, slot, generation, stem).
+    Arena integrity, not a rank decision: the read depth stays the group's
+    told; the old slot is never freed while referenced or written."""
+    if not joined or not host_write_takeover_on():
+        return []
+    q = getattr(arena, "quarantine_host_write", None)
+    if not callable(q):
+        return []
+    try:
+        st = q([int(s) for _, s, _ in joined], [int(g) for _, _, g in joined])
+    except Exception:  # noqa: BLE001 - no take-over, the old cut
+        return []
+    taken = [joined[k] for k, v in enumerate(st) if int(v) in (1, 2)]
+    if not taken:
+        return []
+    fresh = []
+    n_rejoin = 0
+    for (i, _s, _g), (slot, status, gen) in zip(
+            taken, _fill_claim(arena, [stems[int(i)] for i, _s, _g in taken], int(total_bytes))):
+        if int(status) == 0:
+            fresh.append((int(i), int(slot), int(gen), stems[int(i)]))
+        elif int(status) == 2:
+            out[int(i)] = int(slot)
+        elif int(status) == 1:
+            _unclaim_fill_joins(arena, [(int(i), int(slot), int(gen))])
+            rejoined.append((int(i), int(slot), int(gen)))
+            n_rejoin += 1
+    _HOST_WRITE_TAKEOVER_N[0] += 1
+    _HOST_WRITE_TAKEOVER_N[1] += sum(1 for v in st if int(v) == 1)
+    _HOST_WRITE_TAKEOVER_N[2] += n_rejoin
+    logger.warning(
+        "L3-FILL HOST-WRITE-TAKEOVER n=%d stems=%d taken=%d moved=%d not_host_write=%d reclaimed=%d "
+        "rejoined=%d totals=%d/%d pid=%d (H54: a host-write claim that did not complete inside the join "
+        "wait was taken from its key whatever its references and byte progress -- the old slot stays "
+        "quarantined while referenced or written, a late completion of its writers answers 6; the "
+        "page is read from L3 into a fresh slot)",
+        _HOST_WRITE_TAKEOVER_N[0], len(joined), sum(1 for v in st if int(v) == 1),
+        sum(1 for v in st if int(v) == 2), sum(1 for v in st if int(v) == 4), len(fresh), n_rejoin,
+        _HOST_WRITE_TAKEOVER_N[1], _HOST_WRITE_TAKEOVER_N[2], os.getpid())
     return fresh
 
 
@@ -3973,7 +4099,8 @@ class HiCacheFile(HiCacheStorage):
             # L3FILL-JOINED (2): wait (bounded, prefetch io thread only) for the
             # other writer instead of ending the prefix at its page
             _vanished: list = []
-            _waited = _await_fill_joins(arena, stems, joined, fill_join_wait_ms(len(joined)),
+            _join_wait = fill_join_wait_ms(len(joined))
+            _waited = _await_fill_joins(arena, stems, joined, _join_wait,
                                         vanished=_vanished if join_idle_ms() > 0 else None)
             for i, s_ in _waited.items():
                 out[i] = s_
@@ -3984,12 +4111,36 @@ class HiCacheFile(HiCacheStorage):
             # the stem; this fill claims it fresh and reads it from disk.
             # JOIN-IDLE-1014: after the join wait's idle bound (default 1 s
             # without a move) -- never cut on a claim nobody fills.
+            _verdicts: list = []
             _fresh = _reap_stale_live_joins(
                 arena, stems, joined, int(total_bytes),
                 min_ms_override=(join_idle_ms() if (join_liveness_on() and join_idle_ms() > 0) else None),
-                out=out)
+                out=out, verdicts=_verdicts)
             if _fresh:
                 self._arena_fill_read_todo(arena, _fresh, int(total_bytes), out, stats)
+            # H54 PARK-JOIN 1015: what the wait and the reap left. Named first
+            # (JOIN-HELD: refs, merged writers, verdict per slot), then a
+            # host-write holder loses the stem whatever its references and
+            # byte progress -- L3 holds the page -- and a stem a peer stage
+            # took over first is awaited once instead of ending the prefix.
+            _fresh_i = {int(f[0]) for f in _fresh}
+            _held = [j for j in joined if out[int(j[0])] is None and int(j[0]) not in _fresh_i]
+            if _held and _join_wait > 0:
+                # only after a join wait that ran (prefetch io thread): every
+                # other caller keeps the immediate miss and never takes over
+                _note_join_held(arena, _held, [v for j, v in zip(joined, _verdicts)
+                                               if out[int(j[0])] is None and int(j[0]) not in _fresh_i]
+                                if len(_verdicts) == len(joined) else None, "after_reap")
+                _rejoined: list = []
+                _hw = _take_over_host_write_joins(arena, stems, _held, int(total_bytes), out, _rejoined)
+                if _hw:
+                    self._arena_fill_read_todo(arena, _hw, int(total_bytes), out, stats)
+                if _rejoined:
+                    for i, s_ in _await_fill_joins(arena, stems, _rejoined,
+                                                   fill_join_wait_ms(len(_rejoined))).items():
+                        out[i] = s_
+                _hw_i = {int(f[0]) for f in _hw}
+                joined = [j for j in joined if out[int(j[0])] is None and int(j[0]) not in _hw_i]
         if _being_written:
             # IN-FLIGHT: the other writer's pages, awaited after this fill's own
             _w = _await_fill_joins(arena, stems, [(i, -1, 0) for i in _being_written],

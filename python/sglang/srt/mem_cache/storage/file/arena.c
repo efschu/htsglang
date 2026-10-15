@@ -1596,6 +1596,61 @@ int64_t arena_quarantine_stale(uint8_t *base, int64_t n, const int64_t *slots, c
     return done;
 }
 
+/* ------------------------------------------------------------------------
+ * H54 PARK-JOIN 1015 (NF h16h 853534a9ff, boots 1014_211215 / 1015_011215:
+ * 16 of 16 JOIN-WAIT tears 3-45 s after a park / wake, 67-100k tokens each;
+ * every claim census that names the held claims names role host-write, open0
+ * -- pid857 = P PP0, pid2659 = D TP0). A HOST-WRITE claim completes only when
+ * EVERY writer of the page merged its extents (P: one layer shard per PP
+ * stage; D Form A: the token owners TP1/TP2, TP0 claims share 0). Each writer
+ * decides its own backup (a refused claim, a dropped write, a dormant group),
+ * and each writer that merged keeps a reader reference on the partial slot
+ * (ArenaMHAHostPool.complete_write references status <= 2, partial included).
+ * Such a claim is CLAIMED for good: arena_quarantine_stale answers 3
+ * (referenced) for as long as a writer's node lives and 0 (young) while late
+ * extents trickle in -- the JOIN-IDLE reap and the SELF-JOIN take-over both
+ * refuse, and the reader's prefix ends at the claim although L3 holds every
+ * byte of the page.
+ * This entry takes such a claim away from its KEY regardless of references
+ * and byte progress -- only a host-write claim of the caller's generation:
+ * the index cell is unlinked (the next claim of the stem gets a fresh slot,
+ * which the reader fills from L3), the old slot keeps generation, writers and
+ * references and is QUARANTINE -- never freed while referenced or written
+ * (quarantine_release, quarantine_sweep), a late completion answers 6 (named
+ * by the writer, bytes discarded, no reference taken), a reference request
+ * on it is refused (arena_ref_slots takes COMPLETE / CLAIMED only).
+ * status per slot: 1 quarantined, 2 generation moved / not CLAIMED,
+ * 4 not a host-write claim (left alone).
+ * ------------------------------------------------------------------------ */
+#define ROLE_HOST_WRITE_C 2u
+int64_t arena_quarantine_host_write(uint8_t *base, int64_t n, const int64_t *slots, const int64_t *gens,
+                                    int8_t *status) {
+    ArenaHeader *h = hdr(base);
+    uint32_t now = mono_ms();
+    int64_t done = 0;
+    for (int64_t i = 0; i < n; i++) {
+        status[i] = 2;
+        if (slots[i] < 0 || (uint64_t)slots[i] >= h->slots) continue;
+        SlotHeader *sh = slot_hdr(base, (uint64_t)slots[i]);
+        if ((int64_t)sh->generation != gens[i]) continue;
+        if (atomic_load(&sh->state) != S_CLAIMED) continue;
+        if (sh->owner_role != ROLE_HOST_WRITE_C) { status[i] = 4; continue; }
+        uint32_t expect = S_CLAIMED;
+        if (!atomic_compare_exchange_strong(&sh->state, &expect, S_QUARANTINE)) continue;
+        if ((int64_t)sh->generation != gens[i]) {
+            atomic_store(&sh->state, S_CLAIMED);   /* moved under us: leave it */
+            continue;
+        }
+        index_unlink(base, sh->key_lo, (uint64_t)slots[i]);
+        sh->key_lo = 0; sh->key_hi = 0;
+        atomic_store(&sh->touched_ms, now);   /* quarantine start, for the backstop */
+        quarantine_release(base, (uint64_t)slots[i]);   /* nobody open, nobody holding: free at once */
+        status[i] = 1;
+        done++;
+    }
+    return done;
+}
+
 /* free QUARANTINE slots nobody holds any more, and -- backstop -- those
  * quarantined longer than backstop_ms (their writer never came back).
  * Returns the number freed. */

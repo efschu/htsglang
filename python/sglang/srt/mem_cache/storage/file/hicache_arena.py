@@ -469,6 +469,8 @@ def _load_lib() -> Optional[ctypes.CDLL]:
             lib.arena_quarantine_stale.argtypes = [p_u8, i64, p_i64, p_i64, i64, p_i8]
             lib.arena_quarantine_sweep.restype = i64
             lib.arena_quarantine_sweep.argtypes = [p_u8, i64]
+            lib.arena_quarantine_host_write.restype = i64
+            lib.arena_quarantine_host_write.argtypes = [p_u8, i64, p_i64, p_i64, p_i8]
             lib.arena_free_if_gen.restype = i64
             lib.arena_free_if_gen.argtypes = [p_u8, i64, p_i64, p_i64, p_i8]
             lib.arena_set_writer_tag.restype = None
@@ -889,6 +891,21 @@ class ShmArena:
         c_g = (ctypes.c_int64 * n)(*[int(g) for g in gens])
         st = (ctypes.c_int8 * n)()
         self._lib.arena_quarantine_stale(self._base, n, c_sl, c_g, int(min_age_ms), st)
+        return list(st)
+
+    def quarantine_host_write(self, slots: Sequence[int], gens: Sequence[int]) -> list[int]:
+        """H54 PARK-JOIN 1015: take HOST-WRITE claims away from their keys
+        regardless of references and byte progress (arena.c
+        ``arena_quarantine_host_write``; generation-checked, the old slot is
+        never freed while referenced or written). Per slot 1 quarantined,
+        2 generation moved / not claimed, 4 not a host-write claim."""
+        n = len(slots)
+        if n == 0:
+            return []
+        c_sl = (ctypes.c_int64 * n)(*[int(s) for s in slots])
+        c_g = (ctypes.c_int64 * n)(*[int(g) for g in gens])
+        st = (ctypes.c_int8 * n)()
+        self._lib.arena_quarantine_host_write(self._base, n, c_sl, c_g, st)
         return list(st)
 
     def quarantine_sweep(self, backstop_ms: int) -> int:
