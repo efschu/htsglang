@@ -68774,7 +68774,7 @@
      "source": {
       "file": "managers/weg2_store_told.py",
       "kind": "os.environ",
-      "line": 422
+      "line": 435
      }
     }
    },
@@ -74470,7 +74470,7 @@
    "id": "SGLANG_WEG2_FOLLOWER_REACH_TOLD",
    "kind": "env",
    "lesestellen": [
-    "managers/weg2_store_told.py:1774"
+    "managers/weg2_store_told.py:1822"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_FOLLOWER_REACH_TOLD",
@@ -74480,7 +74480,7 @@
     "baum": "nf",
     "file": "managers/weg2_store_told.py",
     "kind": "os.environ",
-    "line": 1774
+    "line": 1822
    },
    "status": "geerntet",
    "text": "",
@@ -79726,6 +79726,37 @@
    "text": "",
    "type": "os.environ"
   },
+  "SGLANG_WEG2_PF_SETTLE_ACK_NOW": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"1\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "H64 SETTLE-ACK-NOW (default on; 0 = \"short\" whatever the registration did, pre-H64): a short early read whose told-limited registration issued no read -- the tree already held told (satisfied) or the store had nothing to give (declined) -- acks at once instead of waiting for a read that never started.",
+   "id": "SGLANG_WEG2_PF_SETTLE_ACK_NOW",
+   "kind": "env",
+   "lesestellen": [
+    "managers/weg2_store_told.py:428"
+   ],
+   "level": "experte",
+   "name": "SGLANG_WEG2_PF_SETTLE_ACK_NOW",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "baum": "nf",
+    "file": "managers/weg2_store_told.py",
+    "kind": "os.environ",
+    "line": 428
+   },
+   "status": "geerntet",
+   "text": "",
+   "type": "os.environ"
+  },
   "SGLANG_WEG2_PLE_ADMIT_HINT": {
    "baeume": [
     "27b",
@@ -84379,6 +84410,37 @@
    "text": "",
    "type": "os.environ"
   },
+  "SGLANG_WEG2_TOLD_ACK_DRAIN": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": null,
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "",
+   "id": "SGLANG_WEG2_TOLD_ACK_DRAIN",
+   "kind": "env",
+   "lesestellen": [
+    "managers/weg2_told_fallback.py:199"
+   ],
+   "level": "experte",
+   "name": "SGLANG_WEG2_TOLD_ACK_DRAIN",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "baum": "nf",
+    "file": "managers/weg2_told_fallback.py",
+    "kind": "os.environ",
+    "line": 199
+   },
+   "status": "unerklaert",
+   "text": "",
+   "type": "os.environ"
+  },
   "SGLANG_WEG2_TOLD_CLAMP_REUSE": {
    "baeume": [
     "27b",
@@ -84470,6 +84532,37 @@
     "file": "managers/weg2_told_fallback.py",
     "kind": "os.environ",
     "line": 140
+   },
+   "status": "unerklaert",
+   "text": "",
+   "type": "os.environ"
+  },
+  "SGLANG_WEG2_TOLD_FALLBACK_MIN_PASSES": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "",
+   "id": "SGLANG_WEG2_TOLD_FALLBACK_MIN_PASSES",
+   "kind": "env",
+   "lesestellen": [
+    "managers/weg2_told_fallback.py:213"
+   ],
+   "level": "experte",
+   "name": "SGLANG_WEG2_TOLD_FALLBACK_MIN_PASSES",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "baum": "nf",
+    "file": "managers/weg2_told_fallback.py",
+    "kind": "os.environ",
+    "line": 213
    },
    "status": "unerklaert",
    "text": "",
@@ -84567,6 +84660,37 @@
    "status": "unerklaert",
    "text": "",
    "type": "EnvBool"
+  },
+  "SGLANG_WEG2_TOLD_GROUP_FLOOR": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": null,
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "",
+   "id": "SGLANG_WEG2_TOLD_GROUP_FLOOR",
+   "kind": "env",
+   "lesestellen": [
+    "managers/weg2_told_fallback.py:204"
+   ],
+   "level": "experte",
+   "name": "SGLANG_WEG2_TOLD_GROUP_FLOOR",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "baum": "nf",
+    "file": "managers/weg2_told_fallback.py",
+    "kind": "os.environ",
+    "line": 204
+   },
+   "status": "unerklaert",
+   "text": "",
+   "type": "os.environ"
   },
   "SGLANG_WEG2_TOLD_PACED": {
    "baeume": [
@@ -85484,7 +85608,7 @@
    "id": "SGLANG_WEG2_W27_HELD_STOP",
    "kind": "env",
    "lesestellen": [
-    "managers/weg2_store_told.py:1831"
+    "managers/weg2_store_told.py:1879"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_W27_HELD_STOP",
@@ -85494,7 +85618,7 @@
     "baum": "nf",
     "file": "managers/weg2_store_told.py",
     "kind": "os.environ",
-    "line": 1831
+    "line": 1879
    },
    "status": "geerntet",
    "text": "",
@@ -87372,25 +87496,25 @@
    "abweichung": 47,
    "beide": 2461,
    "nur_27b": 180,
-   "nur_nf": 94
+   "nur_nf": 98
   },
-  "entries": 2753,
-  "envs": 1874,
+  "entries": 2757,
+  "envs": 1878,
   "erklaert": 305,
   "flags": 864,
-  "geerntet": 1704,
+  "geerntet": 1705,
   "kuratiert": 125,
-  "unerklaert": 619
+  "unerklaert": 622
  },
- "tree_rev": "27b=02123ee2ef+nf=75e3ee8abd+lbv-deadlock-e23abfcb05+prio-alter-fa99a484ae+w3-drain-e7cfda7fbe+follower-round-b76e5fce79+h16m-int-1014+readdepth-60ad6ba20a+h16n-int-1015",
+ "tree_rev": "27b=02123ee2ef+nf=75e3ee8abd+lbv-deadlock-e23abfcb05+prio-alter-fa99a484ae+w3-drain-e7cfda7fbe+follower-round-b76e5fce79+h16m-int-1014+readdepth-60ad6ba20a+h16n-int-1015+h64-toldfallback-de76a8dc18",
  "trees": {
   "27b": {
    "entries": 2641,
    "rev": "02123ee2ef"
   },
   "nf": {
-   "entries": 2555,
-   "rev": "75e3ee8abd+lbv-deadlock-e23abfcb05+prio-alter-fa99a484ae+w3-drain-e7cfda7fbe+follower-round-b76e5fce79+h16m-int-1014+readdepth-60ad6ba20a+h16n-int-1015"
+   "entries": 2559,
+   "rev": "75e3ee8abd+lbv-deadlock-e23abfcb05+prio-alter-fa99a484ae+w3-drain-e7cfda7fbe+follower-round-b76e5fce79+h16m-int-1014+readdepth-60ad6ba20a+h16n-int-1015+h64-toldfallback-de76a8dc18"
   }
  },
  "warnungen": []
