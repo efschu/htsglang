@@ -280,6 +280,15 @@ def _p_held_reread_max() -> int:
         return 2
 
 
+#: ZERO-ANCHOR 1015 (Typ A): the hint trigger of the held re-read. 0 = off.
+P_HINT_REREAD_ENV = "SGLANG_WEG2_P_HINT_REREAD"
+
+
+def p_hint_reread_on(env=None) -> bool:
+    v = (env if env is not None else os.environ).get(P_HINT_REREAD_ENV, "1")
+    return str(v).strip().lower() not in ("0", "false", "no", "off", "")
+
+
 def _p_held_short_reread(scheduler, tree, req, rid: str) -> bool:
     """P-HELD-REREAD-1014: True when PP0 re-issued ``rid``'s store read (the
     caller keeps it held and publishes nothing this pass)."""
@@ -288,9 +297,26 @@ def _p_held_short_reread(scheduler, tree, req, rid: str) -> bool:
         return False
     from sglang.srt.weg2 import short_read as _sr
 
-    if not _sr.store_holds_more(rid):
-        return False
     have = _completed_prefix(tree, rid)
+    why = "store"
+    if not _sr.store_holds_more(rid):
+        # ZERO-ANCHOR 1015 (Typ A): the store held no more at the read, but D
+        # was measured to hold more (the front's hint) -- D's flush publishes
+        # it at the flip; re-read after the flush, i.e. once PP0 is awake
+        _ps = int(getattr(scheduler, "page_size", 0) or getattr(tree, "page_size", 1) or 1)
+        if not (p_hint_reread_on() and _sr.hint_beyond(rid, have, _ps)):
+            return False
+        why = "hint"
+        if getattr(scheduler, "weg2_dormant", False):
+            k = getattr(scheduler, "_p_hint_wait_n", 0) + 1
+            scheduler._p_hint_wait_n = k
+            if k <= 32 or k % 128 == 0:
+                logger.info(
+                    "WEG2 P-HINT-REREAD WAIT rid=%s have=%d hint=%d (k=%d): the read ended below "
+                    "the depth D was measured to hold; D's flush publishes it at this flip -- "
+                    "PP0 holds the told until it is awake, then re-reads once",
+                    _rt(rid), have, _sr.hint_tokens(rid), k)
+            return True
     n = int(getattr(req, "_weg2_p_held_reread_n", 0) or 0)
     # each re-read must have moved PP0's record past the previous one
     if n >= cap or have <= int(getattr(req, _sr.PROGRESS_ATTR, -1)):
@@ -310,10 +336,11 @@ def _p_held_short_reread(scheduler, tree, req, rid: str) -> bool:
     scheduler._p_held_reread_n = k
     if k <= 32 or k % 128 == 0:
         logger.info(
-            "WEG2 P-HELD-REREAD rid=%s n=%d/%d have=%d verdict=%s (k=%d): the read ended short "
-            "of a span the store holds -- PP0 re-reads before its told (reading beats "
-            "recomputing); the told follows the re-read's record",
-            _rt(rid), n + 1, cap, have, verdict, k)
+            "WEG2 P-HELD-REREAD rid=%s n=%d/%d have=%d verdict=%s why=%s hint=%d (k=%d): the read "
+            "ended short of a span the store holds (why=store) or of the depth D was measured to "
+            "hold (why=hint) -- PP0 re-reads before its told (reading beats recomputing); the "
+            "told follows the re-read's record",
+            _rt(rid), n + 1, cap, have, verdict, why, _sr.hint_tokens(rid), k)
     if not issued:
         _sr.forget(rid)
     return issued

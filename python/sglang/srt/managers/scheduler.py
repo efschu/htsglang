@@ -8596,6 +8596,11 @@ class Scheduler(
         admitting PLE gather (PP1/PP2, group D)."""
         from sglang.srt.models.qwen4_exp_ple_admit import admit_ple_hint
 
+        # ZERO-ANCHOR 1015 (Typ A): the depth D was measured to hold -- PP0's
+        # held re-read compares its read with it (weg2_store_told)
+        from sglang.srt.weg2 import short_read as _za_sr
+
+        _za_sr.note_hint(recv_req.rid, getattr(recv_req, "start_hint", -1))
         admit_ple_hint(
             recv_req.rid,
             recv_req.input_ids,
