@@ -2123,6 +2123,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # resets below take back -- releasing them later would free twice.
         self._weg2_cap_deferred = {}
         self._weg2_cap_tail = None
+        # F1 review B1: the W3 room set's debts name nodes of the tree being destroyed, whose arena
+        # references the release above gave back -- paying them later would free twice
+        from sglang.srt.weg2 import w3_room_set as _w3rs_reset
+
+        _w3rs_reset.forget(self)
         if getattr(self, "cache_controller", None) is not None and _r12.role() is not None:
             _r12.on_tree_reset(self)  # R12: no host verdict outlives its nodes
         self.root_node = UnifiedTreeNode(self.tree_components)
@@ -6269,7 +6274,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # F1: a PP group spills ONE slot set -- PP0 decides from the arena order, every stage
             # gives back exactly these slots (a slot frees only when all stages let go)
             _rel = _w3rs.spill(self, pool, int(need_pages), want, released_out, claimer=claimer)
-            if _rel == 0 and not _w3rs.undecided(self):
+            if _rel == 0 and _w3rs.backoff_ok(self):
                 # review F1 A4: an UNDECIDED spill (PP0 waits for a follower's acknowledgement, a
                 # follower holds debts of PP0's set) is no empty answer -- no backoff
                 self._w3_spill_quiet_until = now + self.W3_SPILL_EMPTY_BACKOFF_S
@@ -6286,8 +6291,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         cands = []
         keep_payable = UnifiedRadixCache._w3_keep_payable_state(self)
         kept_payable = 0
+        told_head = UnifiedRadixCache._told_head_ids(self)
+        kept_told = 0
         for node in self._collect_all_nodes():
             if node is self.root_node or id(node) in skip:
+                continue
+            if id(node) in told_head:
+                kept_told += 1    # A7 TOLD-HEAD: the head above an open told's pinned span keeps its host copy
                 continue
             cd = node.component_data[BASE_COMPONENT_TYPE]
             hv = cd.host_value
@@ -6382,14 +6392,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if k <= 8 or k % 64 == 0 or lost or unpaired:
             logger.info(
                 "W3-ARENA SPILL n=%d need=%d released_pages=%d nodes=%d candidates=%d "
-                "l3=on_disk:%d,written:%d lost=%d unpaired=%d incomplete=%d ref_free=%s kept_payable=%d "
+                "l3=on_disk:%d,written:%d lost=%d unpaired=%d incomplete=%d ref_free=%s kept_payable=%d kept_told=%d "
                 "(incomplete = nodes kept because a slot is not COMPLETE yet, no loss; a finished page leaves L2 only with "
                 "its L3 copy; the node stays on the device, l3_present; ref_free = of the slots "
                 "this spill let go, those NO rank references any more -- the clock takes them; "
                 "group-equal order: fewest peer references first, then slot id; kept_payable = device nodes "
                 "not spilled because their drop could not clear a host-only child now)",
                 k, int(need_pages), released, spilled, len(cands), secured, written, lost, unpaired, incomplete,
-                self._w3_spill_ref_free(pool, released_slots), kept_payable)
+                self._w3_spill_ref_free(pool, released_slots), kept_payable, kept_told)
         if released_out is not None:
             released_out.extend(released_slots)
         return released
@@ -10841,6 +10851,26 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         while len(pins) > self._PREFETCH_SPAN_PINS_MAX:
             self._unpin_prefetched_span(next(iter(pins)))
         return len(held)
+
+    def _told_head_ids(self) -> set:
+        """A7 TOLD-HEAD (weg2-106-554 class, review F1 A7, 16.10.): ids of the nodes ABOVE every #1417
+        pinned span -- from the span's top node's parent (``stop_at``, the matched head end) up to the
+        root. The span pin host-locks deepest..below stop_at only; a device-resident head node kept its
+        host copy only by chance: the W3 spill released it (``l3_present``), a later device eviction
+        before the admission left the read's told prefix short. These nodes are no spill candidate
+        while their rid's told is open (the pin is released at admission / abort / reset)."""
+        pins = getattr(self, "_prefetch_span_pins", None)
+        out = set()
+        if not pins:
+            return out
+        for held in pins.values():
+            if not held:
+                continue
+            n = getattr(held[-1][0], "parent", None)
+            while n is not None and n is not self.root_node and id(n) not in out:
+                out.add(id(n))
+                n = n.parent
+        return out
 
     def _unpin_prefetched_span(self, req_id: str) -> int:
         pins = getattr(self, "_prefetch_span_pins", None)
