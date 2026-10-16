@@ -1041,4 +1041,6 @@ Heads before: 27B `desk/flliper-27b-int-1016` @ 671961d63b, NF `desk/flliper-nf-
 
 **Catalog.** Built once as the union with the generator of the NF head (two runs byte-equal, key order by `catalog_order_merge_1008.py`, `--rev-27b 6dcee97340`, `--rev-nf a33135c9b7`): sha256 `b60205cfc18ed843eeb3a53b68e545aae5117d57bacb50b68ef54de881b546ca`; 2790 entries, 139 edges (merged 52, new 87, without evidence 25), edge anchors NF 84 / 10 / 45 (other line), 27B tree file 122 / 12.
 
+**Port 2.** The source head moved to `1f4b3e73d4` (5c51b91fa2 + a skip of the two K9 front scenarios whose premise the flip queue removes); ported by the kit rule (`drive.py 1f4b3e73d4`, one file, byte-equal).
+
 **Not proven.** No metal and no boot of a fLLiper image in this round; the h16s code is proven on the NF metal under the old name, the port by tests only.
