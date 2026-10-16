@@ -178,7 +178,10 @@ def test_the_scheduler_wires_the_hook_only_when_the_stage_is_armed():
     src = inspect.getsource(Scheduler.init_request_receiver)
     # W27 RID-SPLIT (04.10.): the vision hook is composed with PP0's intake-
     # stall relay and LEADS it; with no relay the composition IS this hook.
-    assert "_ioa.origin_hook(\n                self._pdflip_intake_origin_aborts, _vision_origin_aborts\n            )" in src
+    # LB-VERDICT-1014 (source 853534a9ff): PP0's load-back verdicts join behind
+    # the vision verdicts (_lbv_compose returns the vision hook itself when the
+    # verdict is not armed or the stage is not PP0), so vision still leads.
+    assert "_ioa.origin_hook(\n                self._pdflip_intake_origin_aborts,\n                _lbv_compose(self, _vision_origin_aborts),\n            )" in src
     assert "_vision_origin_aborts = None" in src
     assert 'os.environ.get("FLLIPER_PDFLIP_VISION", "").strip() == "transient"' in src
 
