@@ -11207,11 +11207,27 @@ class Front:
         return _decode_collect_window_s()
 
     def _dc_decoding(self) -> bool:
-        """D is awake, serving and runs decodes (parked ones excluded)."""
+        """D is awake, serving and a DECODE stands on it: a rid of D's flip ledger (parked, lane-parked and
+        RESUME-VIA-P rids are out of it, ``_flip_ledger``) whose D prefill is over.
+
+        NODECODE 1015 (user law, DECODE-COLLECT core: "Sammeln nur, solange auf D ein Decode ansteht"): a rid
+        D still PREFILLS -- an open row of the X-SUM-PRICE book (granted SHORT / d_direct hand-over, no first
+        content yet) -- is ``carried``, not a decode. Counted here, it held the arrival the full d_check_s on a
+        D with no decode at all (NF 15.10. 06:38:41,256 hold n=1 tokens=2572 X=5760 next to weg2-86-985 alone,
+        release 06:38:48,756 waited_s=7.5 route=D stage=dcheck; 07:08:13,651 the same next to weg2-4-14).
+        Switch SGLANG_WEG2_ENABLE_DECODE_COLLECT_PREFILL_BUSY off: no book, the ledger alone (as before)."""
         if not (self.awake == "D" and self.state == "serving"):
             return False
         D = self.groups.get("D") if isinstance(self.groups, dict) else None
-        return bool(D is not None and self._flip_ledger(D))
+        if D is None:
+            return False
+        ledger = self._flip_ledger(D)
+        if not ledger:
+            return False
+        book = self.__dict__.get("_d_pf")
+        if book is None or not envs.SGLANG_WEG2_ENABLE_DECODE_COLLECT_PREFILL_BUSY.get():
+            return True
+        return any(not book.is_open(rid=r) for r in ledger)
 
     def _d_pf_book(self) -> "_dpf.DPrefillInflight":
         return self.__dict__.setdefault("_d_pf", _dpf.DPrefillInflight())
@@ -11262,7 +11278,9 @@ class Front:
         return self._d_carried_tokens()
 
     def _dc_d_busy(self) -> bool:
-        """D decodes, or prefills a granted SHORT: the arrivals collect."""
+        """D decodes, or prefills a granted SHORT: the arrivals are priced as a SET (X-SUM-PRICE, ``carried`` in the sum).
+        Only a decode lets the set WAIT (``_decode_collect``: ``decoding``); with ``carried`` alone the set is
+        decided at once -- the sum fits under X -> D, else P (NODECODE 1015)."""
         return self._dc_decoding() or self._dc_carried() > 0
 
     def _dc_st(self) -> dict:
@@ -11312,7 +11330,11 @@ class Front:
         tokens = sum(unc) + carried
         set_fits = _sp.fits(carried=carried, tokens=sum(unc), limit=x_tok)
         waited = max(0.0, now - st["t_open"])
-        decoding = self._dc_d_busy()
+        # NODECODE 1015 (user law: collecting only while a DECODE stands on D): ``carried`` (D prefills a granted
+        # SHORT / hand-over) prices the set but never holds it -- with no decode the stage is d-idle and the sum
+        # decides now (fits under X -> D, else P). Was ``_dc_d_busy()`` (and a still-prefilling rid counted as a
+        # decode): 15.10. 06:38:48Z and 07:08:21Z waited the full d_check_s=7.5 s with nothing on D but that prefill.
+        decoding = self._dc_decoding()
         p_bound = any(phase_policy.immediate_park_trigger([p], x_tok) is not None
                       or bool(getattr(p, "p_only", False)) for p in fresh)
         try:
@@ -11354,6 +11376,13 @@ class Front:
         if route == "D" and envs.SGLANG_WEG2_ENABLE_DECODE_COLLECT_PREFILL_BUSY.get():
             for _rid, (_t, _u) in st["shorts"].items():  # X-SUM-PRICE: priced as a set, now booked as one
                 self._d_pf_book().grant(rid=_rid, tokens=int(_u), now=now)
+        # NODECODE 1015: the route of THIS window, by its id -- a SHORT of it whose poll comes after a LATER window
+        # already released (with no decode on D the next set is decided at once) follows its own release, not the
+        # phase's current (sticky P) route (``_decode_collect_short``)
+        _wr = st.setdefault("wid_route", {})
+        _wr[st["wid"]] = route
+        for _k in [k for k in _wr if k < st["wid"] - 64]:
+            del _wr[_k]
         st.update(route=route, t_rel=now, t_open=None, shorts={}, wid=st["wid"] + 1,
                   rel_rids=[p.rid for p in fresh])  # route D: the set _dc_hand_to_d moves
         self.counters["decode_collect_release_" + route] += 1
@@ -11384,20 +11413,28 @@ class Front:
         wid, epoch = st["wid"], self.epoch
         deadline = now + win + float(getattr(self, "drain_deadline_s", 30.0) or 30.0)
         while time.time() < deadline:
+            wid_before = self._dc_st()["wid"]
             route = self._decode_collect(time.time())
             if self.epoch != epoch or not (self.awake == "D" and self.state == "serving"):
                 return "P"
-            if route in ("D", "P") and self._dc_st()["wid"] != wid:
-                return self._dc_st()["route"] if self._dc_st()["route"] == "P" else route
             if self._dc_st()["wid"] != wid:
+                # NODECODE 1015: the route of ITS window's release (``wid_route``), never the phase's current one.
+                # With no decode on D the next window is decided at once; a P there made the phase sticky before
+                # this poll ran, and "sticky P = my release was P" sent a SHORT its own release had booked as D
+                # prefill (the grant at the release) to P as well -- its row then stood twice in the sums.
+                own = (self._dc_st().get("wid_route") or {}).get(wid)
+                if own is None:  # no record (cannot happen past a release of this epoch): as before
+                    own = "P" if self._dc_st()["route"] == "P" else "D"
+                if wid_before == wid and route in ("D", "P"):
+                    return own  # this poll released its own window
+                rel = own
                 # COLLECT-LANE 1014 (NF h10 13:31:53.933 weg2-18-143, 13:33:14.341 weg2-20-151): THIS
                 # window was released by another caller (the controller's _arrival_seat_step/park
                 # check) and a new arrival re-opened the next window before this SHORT's 50-ms poll
                 # -- its poll then read "hold" and it sat in the NEXT window, while the release had
                 # booked it as D prefill (grant at the release): D idle, its own row as `carried`
                 # put the next set over X, 15 s to P. The wid moved = its window released: the
-                # route is that release's (P is sticky for the phase, so not-P means D).
-                rel = "P" if self._dc_st()["route"] == "P" else "D"
+                # route is that release's (``own`` above, by the window's id).
                 self.counters["decode_collect_short_release_seen"] += 1
                 logger.info("WEG2 DECODE-COLLECT short-release rid=%s route=%s now=%s epoch=%d -- its window "
                             "was released by another caller; the SHORT follows that release, not the next "
@@ -13559,6 +13596,8 @@ class Front:
                     _det_on = request.path in CACHED_TIER_ASK_PATHS and r.status == 200
                     _tclock = _ut.TokenClock()
                     _want_rsn = getattr(getattr(self, "ftok", None), "_tok", None) is not None
+                    # NODECODE 1015 A1: the X-SUM-PRICE row is still open when the head had no content
+                    _pf_row = {"open": not _has_content}
 
                     def _details(obj: dict, reading) -> Dict[str, Dict[str, Any]]:
                         _pc = usage_fix["p"]
@@ -13614,6 +13653,22 @@ class Front:
                         if anth is not None:
                             anth.feed(chunk)
                         if stream_has_content(chunk, request.path):
+                            if _pf_row["open"] and r.status == 200:
+                                # NODECODE 1015 A1: a stream committed WITHOUT content (Anthropic lookahead gave up
+                                # after message_start + 7 pings while D still prefilled / held it parked) gets its
+                                # first content HERE. D's prefill is over now: close the X-SUM-PRICE row once, or
+                                # the rid stays ``carried`` (not a decode, _dc_decoding) for its whole decode (NF
+                                # cfeb2896c1_1013_045811 weg2-198-622: kept=committed, 173 tokens, no FIRST-CONTENT;
+                                # 337 of 18759 booked SHORT legs 13.-15.10.).
+                                _pf_row["open"] = False
+                                _book = self._d_pf_book()
+                                _was_open = _book.is_open(rid=rid)
+                                _book.done(rid=rid)  # X-SUM-PRICE: first content (in the body) = prefill over
+                                if _was_open:  # named only where a row really stood (P->D hand-offs have none)
+                                    self.counters["leg2_first_content_body"] += 1
+                                    logger.info("WEG2 LEG2-FIRST-CONTENT-BODY rid=%s epoch=%d leg2_ms=%.0f (first "
+                                                "content after the committed head; X-SUM-PRICE row closed here)",
+                                                rid, self.epoch, (time.time() - t0) * 1000.0)
                             _t_tok = time.time()
                             if usage_fix["open"]:
                                 _tclock.note(_t_tok)  # USAGE-DETAILS: the token stream's gaps

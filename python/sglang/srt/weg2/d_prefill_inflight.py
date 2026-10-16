@@ -45,6 +45,11 @@ class DPrefillInflight:
     def done(self, *, rid: str) -> None:
         self._rows.pop(rid, None)
 
+    def is_open(self, *, rid: str) -> bool:
+        """D's prefill of ``rid`` is not over: granted and no first content yet (NODECODE 1015: such a rid in D's
+        ledger is ``carried``, not a decode -- ``Front._dc_decoding``)."""
+        return rid in self._rows
+
     def pending_tokens(self, *, now: float, live: Container[str],
                        idle: Optional[Callable[[str], bool]] = None) -> int:
         """Sum of the open rows. A row in leg 2 lives while D still holds the

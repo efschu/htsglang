@@ -372,7 +372,9 @@ def test_decode_collect_window_opens_at_the_real_oldest_and_a_p1_long_ends_it_no
         with mock.patch.object(F, "_decode_collect_window_s", lambda: 15.0), \
              mock.patch.object(Front, "_dc_window_s", lambda self: 15.0), \
              mock.patch.object(Front, "_dc_d_busy", lambda self: True), \
+             mock.patch.object(Front, "_dc_decoding", lambda self: True), \
              mock.patch.object(Front, "_dc_carried", lambda self: 0):
+            # D DECODES (NODECODE 1015: the hold reads _dc_decoding, not _dc_d_busy -- only a decode lets a set wait)
             st = f._dc_st()
             st["t_rel"] = now - 100
             old_short = _p(f, "s0", 0, now - 3, est_uncached=10)
