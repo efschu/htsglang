@@ -2202,6 +2202,11 @@ class AbortReq(BaseReq, kw_only=True):
     # The finished reason data (from BaseFinishReason.to_json())
     finished_reason: Optional[FinishReasonDict] = None
     abort_message: Optional[str] = None
+    # K14 (weg2.pp_abort): PP0's group verdict on a forwarded abort under the
+    # #631 row authority -- True = a frame PP0 sent names the rid, so a
+    # follower that still queues it holds the abort until that frame admits
+    # it; False = no frame names it; None = not stamped (today's path).
+    weg2_pp0_admitted: Optional[bool] = None
 
     def __post_init__(self):
         # FIXME: This is a hack to keep the same with the old code

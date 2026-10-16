@@ -4133,7 +4133,10 @@ def weg2_791c_release_on_idle_vote(self, vote) -> None:
     ``_weg2_vote_attach_own_slot`` on stand-ins that are no Scheduler; every
     read here is a ``getattr`` with a default, so a stand-in returns at once."""
     req = getattr(self, "_pending_chunked_abort_req", None)
-    if req is None or int(getattr(self.ps, "pp_rank", 0) or 0) == 0:
+    # K14: a held waiting-queue abort (weg2.pp_abort) is released by the same
+    # vote -- an idle PP0 sends no frame that could still admit it.
+    held = getattr(self, "_weg2_pp_held_waiting_aborts", None)
+    if (req is None and not held) or int(getattr(self.ps, "pp_rank", 0) or 0) == 0:
         return
     try:
         from sglang.srt.weg2 import p_row_authority as _prow
@@ -4147,6 +4150,8 @@ def weg2_791c_release_on_idle_vote(self, vote) -> None:
         return
     self._791c_pp0_drained = True
     try:
+        if held:
+            self._weg2_resolve_waiting_aborts(pp0_drained=True)
         self.process_pending_chunked_abort()
     finally:
         self._791c_pp0_drained = False
@@ -5359,6 +5364,14 @@ class SchedulerPPMixin:
                 # FIXES Nr. 45 PP-VOID-PASS: a load-back refusal on the carrierless form discards the whole planned pass HERE
                 # (own-void + the slot's frame becomes a void frame), before anything of it is sent or launched.
                 _pp_void_pass.after_plan(self, mb_id)
+                # K14: a waiting-queue abort this follower held because PP0 had
+                # already admitted the request is applied HERE, right after the
+                # plan that executed PP0's frame admitting it and before the
+                # launch -- the request runs the pass PP0 runs and gets PP0's
+                # to_finish (or the #791C chunked verdict), never a pass more or
+                # less (weg2.pp_abort). One getattr while nothing is held.
+                if getattr(self, "_weg2_pp_held_waiting_aborts", None):
+                    self._weg2_resolve_waiting_aborts()
 
                 # #795 PP ADMISSION UNIFORMITY, RELOCATED: emit/forward this
                 # pass's admission decision HERE, immediately after
@@ -6726,6 +6739,13 @@ class SchedulerPPMixin:
             # decided last pass at the front of the wire (weg2/flush_verdict.py).
             if self.pp_group.is_first_rank:
                 _wire_reqs = _flush_verdict.pp0_wire(self, _wire_reqs)
+                # K14: PP0's group verdict on each forwarded abort (does a
+                # frame it sent name the rid?) rides the AbortReq itself --
+                # stamped here, before the send and before PP0 applies it.
+                if any(type(r).__name__ == "AbortReq" for r in (_wire_reqs or ())):
+                    from sglang.srt.weg2 import pp_abort as _pp_abort_k14
+
+                    _wire_reqs = _pp_abort_k14.pp0_stamp_aborts(self, _wire_reqs)
             # PR (weg2/pp_room_vote.py): R_m rides list m; nothing without one.
             if self.pp_group.is_first_rank and self.__dict__.get("_weg2_pr_verdict") is not None:
                 from sglang.srt.weg2 import pp_room_vote as _pr
