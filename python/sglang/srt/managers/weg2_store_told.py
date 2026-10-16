@@ -1566,7 +1566,7 @@ def _pp0_publish_paced(scheduler, recv_reqs: List) -> List:
     if fb_on and (pacing or fb_watch or fb_drain):
         # PF: the followers' read acks that have landed (no wait), BEFORE
         # the verdicts below read them.
-        _fb.pp0_harvest(scheduler)
+        _fb.pp0_harvest(scheduler, now)
         fb_parked = _parked(scheduler)
     out: List[Any] = []
     if fb_on and fb_watch:

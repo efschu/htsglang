@@ -117,6 +117,7 @@ from __future__ import annotations
 import logging
 import os
 import pickle
+import sys
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -163,6 +164,54 @@ ENV_FLOOR = "SGLANG_WEG2_TOLD_GROUP_FLOOR"
 ENV_ANCHOR_ACKS = "SGLANG_WEG2_TOLD_ANCHOR_ACKS"
 #: at most this many anchor depths per ack entry (deepest first)
 ANCHOR_ACKS_MAX = 16
+#: T2 WAIT-PROGRESS (NF h16p 226aad7105, 15.10.: the 4 ``reason=frist`` cases, 365k tokens): a missing ack is LAG,
+#: not absence. Every late ack the log shows (PP2 weg2-33-81 own=121344 at +6 s, PP2 weg2-4-25 own=43392 at +4 s) named
+#: EXACTLY told -- PP0 had thrown the whole prefix away for an ack that was on its way. The Frist stays the bound of an
+#: IDLE box (the #699 wedge clock runs while nothing serves); while the box is SERVING -- the detector that guards that
+#: very clock (``invariant_checker.admission_wedge_verdict``, at the alarm threshold less ``ENV_WAIT_MARGIN_S``) would
+#: not call it wedged -- PP0 keeps waiting: the chain lag that held the ack IS the serving work. ``ENV_WAIT_HARD_S``
+#: from the read-ahead bounds a dead stream (frist_hard).
+ENV_WAIT_PROGRESS = "SGLANG_WEG2_TOLD_WAIT_PROGRESS"
+ENV_WAIT_HARD_S = "SGLANG_WEG2_TOLD_WAIT_HARD_S"
+ENV_WAIT_MARGIN_S = "SGLANG_WEG2_TOLD_WAIT_MARGIN_S"
+WAIT_HARD_S_DEFAULT = 60.0
+WAIT_MARGIN_S_DEFAULT = 5.0
+REASON_FRIST_HARD = "frist_hard"
+#: T2 ROOM-DEFER (same boots, weg2-0-3 12:46:20 / weg2-0-10 12:33:29): ``PF TOLD-ACK NO-ROOM loadback_rows=184768
+#: room=162176`` acked 0 and PP0 re-prefilled 185k the store held. The room was short because a RUNNING prefill held
+#: 100k rows ("full token usage: 0.38", one batch later 0.06): a shortage that lasts as long as that request. A follower
+#: whose room would suffice once the rows other requests hold are released keeps its ack back (PP0 reads a missing ack
+#: as lag and waits, WAIT-PROGRESS) and acks the real reach when the room is there. Not enough even then (rows >
+#: room + locked): the ack says 0 as before (B5's anchors below still apply).
+ENV_ROOM_DEFER = "SGLANG_WEG2_TOLD_ROOM_DEFER"
+#: a deferred ack re-reads the room at most this often (seconds)
+ROOM_DEFER_RECHECK_S = 0.05
+#: T2 DEFER-LIFESIGN (review A1, B1): the hard bound of a wait is a LIFESIGN, not 60 s of wall clock from the read-ahead.
+#: A follower that defers its ack sends a defer entry in the ack message it already has (``(rid, 0, (), ("defer", rows,
+#: room, locked, unpayable))`` -- B5 lengthened the same entry; no new wire message) at most every
+#: ``ENV_DEFER_BEAT_S``. PP0 counts the hard bound (``ENV_WAIT_HARD_S``) from the last beat of every rank whose ack is
+#: still missing; a rank that neither acked nor beats is counted from the read-ahead as before (dead = frist_hard).
+#: ``ENV_WAIT_ABS_S`` is the absolute ceiling against a follower that beats forever (mutual waiting, a leak).
+ENV_DEFER_LIFESIGN = "SGLANG_WEG2_TOLD_DEFER_LIFESIGN"
+ENV_DEFER_BEAT_S = "SGLANG_WEG2_TOLD_DEFER_BEAT_S"
+ENV_WAIT_ABS_S = "SGLANG_WEG2_TOLD_WAIT_ABS_S"
+DEFER_BEAT_S_DEFAULT = 1.0
+#: a beat younger than this many beat periods is "live" (the follower defers NOW)
+DEFER_LIVE_BEATS = 4
+WAIT_ABS_S_DEFAULT = 300.0
+REASON_FRIST_ABS = "frist_abs"
+#: the marker of a defer entry (entry[3][0]); it is a lifesign, never an ack
+DEFER_MARK = "defer"
+#: T2 ROOM-DEFER-UNPAYABLE (review A2, B2): room + locked + unpayable == the whole pool, so on a pool that holds the
+#: told at all the shortage is ALWAYS one of two transient things: rows other requests hold, or evictable rows no peel
+#: can pay YET (the backups they need wait for arena slots -- the full-arena state). Both defer; the second is the
+#: class the user's order names (a full L2 arena is no reason). It is bounded by PROGRESS (room grows), not by serving.
+ENV_ROOM_DEFER_UNPAYABLE = "SGLANG_WEG2_TOLD_ROOM_DEFER_UNPAYABLE"
+#: hourly census line (K2): cause=arena_full reads and ARENA-CLAIM REFUSED against what the waits pin
+ENV_HOURLY_S = "SGLANG_WEG2_TOLD_CENSUS_S"
+HOURLY_S_DEFAULT = 3600.0
+_perf = time.perf_counter
+_mono = time.monotonic
 #: item 180: where a follower's re-ask of PP0 went (follower_reask)
 ROUTE_PF = "pf-ack"
 ROUTE_NONE = "none"
@@ -214,6 +263,27 @@ def anchor_acks_on() -> bool:
     """B5 ANCHOR-ACKS (default on): acks carry the resumable anchors below the reach; the floor is the deepest
     depth common to every stage. ``0`` = H64's equal-acks floor alone."""
     return _env_switch(ENV_ANCHOR_ACKS)
+
+
+def wait_progress_on() -> bool:
+    """T2 WAIT-PROGRESS (default on): a late ack is waited for while the box serves (see ENV_WAIT_PROGRESS)."""
+    return _env_switch(ENV_WAIT_PROGRESS)
+
+
+def defer_lifesign_on() -> bool:
+    """T2 DEFER-LIFESIGN (default on): see ENV_DEFER_LIFESIGN."""
+    return _env_switch(ENV_DEFER_LIFESIGN)
+
+
+def room_defer_unpayable_on() -> bool:
+    """T2 ROOM-DEFER-UNPAYABLE (default on): see ENV_ROOM_DEFER_UNPAYABLE."""
+    return _env_switch(ENV_ROOM_DEFER_UNPAYABLE)
+
+
+def room_defer_on() -> bool:
+    """T2 ROOM-DEFER (default on): a follower whose load-back room is short only while other requests hold rows
+    defers its ack instead of acking 0 (see ENV_ROOM_DEFER)."""
+    return _env_switch(ENV_ROOM_DEFER)
 
 
 def min_passes(pp_size: int) -> int:
@@ -409,6 +479,22 @@ def _channel(scheduler):
 
 
 @dataclass
+class _Beat:
+    """T2 DEFER-LIFESIGN: a follower's last defer entry, on PP0's clock. ``progress_at`` = the last beat that showed
+    progress (the room grew, or the rows others hold / the unpayable evictable shrank; the first beat counts)."""
+
+    at: float
+    progress_at: float
+    rows: int
+    room: int
+    locked: int
+    unpayable: int
+    n: int = 1
+    #: the shortage is unpayable evictable (room + locked < rows): bounded by progress even while the box serves
+    unpayable_class: bool = False
+
+
+@dataclass
 class _Open:
     told: int
     deadline: float
@@ -420,6 +506,12 @@ class _Open:
     frist_held: bool = False
     #: B5 ANCHOR-ACKS: per follower rank, the anchor depths below its ack
     anchors: Dict[int, Tuple[int, ...]] = field(default_factory=dict)
+    #: T2 WAIT-PROGRESS: PP0's clock at the read-ahead, the moment the wait began (None = never waited), its passes
+    published_at: float = 0.0
+    waited_since: Optional[float] = None
+    wait_n: int = 0
+    #: T2 DEFER-LIFESIGN: per follower rank whose ack is still missing, its last defer beat
+    beats: Dict[int, "_Beat"] = field(default_factory=dict)
 
 
 def _pp0_open_map(scheduler) -> Dict[str, _Open]:
@@ -436,6 +528,7 @@ def pp0_open(scheduler, rid: str, told: int, published_at: float, own_read_s: fl
     _pp0_open_map(scheduler)[str(rid)] = _Open(
         told=int(told), deadline=dl,
         published_pass=-1 if published_pass is None else int(published_pass),
+        published_at=float(published_at),
     )
     return dl - float(published_at)
 
@@ -544,9 +637,81 @@ def pp0_retract_applied(scheduler, rid: str, told: int, own: int) -> None:
         )
 
 
-def pp0_harvest(scheduler) -> int:
-    """Take every ack that has landed off the standing receives (no wait)."""
+def _census_now(scheduler) -> Dict[str, int]:
+    out: Dict[str, int] = {}
+    try:
+        rd = sys.modules.get("sglang.srt.weg2.read_depth")
+        out["arena_full_reads"] = int((rd.census() if rd is not None else {}).get("arena_full", 0))
+    except Exception:  # noqa: BLE001
+        out["arena_full_reads"] = -1
+    try:
+        ap = sys.modules.get("sglang.srt.mem_cache.pool_host.arena_pool")
+        out["arena_claim_refused"] = int(getattr(getattr(ap, "ArenaMHAHostPool", None), "_1427_full_n", 0) or 0)
+    except Exception:  # noqa: BLE001
+        out["arena_claim_refused"] = -1
+    for key, attr in (
+        ("waited", "_pf_waited_n"), ("wait_started", "_pf_wait_n"), ("room_defer", "_pf_ack_room_defer_n"),
+        ("no_room", "_pf_ack_no_room_n"), ("fallback", "_pf_fallback_n"),
+    ):
+        out[key] = int(getattr(scheduler, attr, 0) or 0)
+    return out
+
+
+def census_tick(scheduler) -> None:
+    """Review A3 (K2): once per ``ENV_HOURLY_S`` (default an hour) one line with the DELTA since the last line of
+    the reads cut for ``cause=arena_full``, the ``ARENA-CLAIM REFUSED`` count and the waits / defers / fallbacks of
+    this stage -- the same line on h16p (without the T2 terms) is the comparison: do the longer L2 pins of a wait push
+    other reads into arena_full? Never raises."""
+    try:
+        now = _mono()
+        st = getattr(scheduler, "_pf_census", None)
+        cur = _census_now(scheduler)
+        if st is None:
+            scheduler._pf_census = (now, cur)
+            return
+        t0, prev = st
+        if now - t0 < _env_float(ENV_HOURLY_S, HOURLY_S_DEFAULT):
+            return
+        scheduler._pf_census = (now, cur)
+        logger.info(
+            "PF TOLD-CENSUS rank pp=%s window=%.0fs %s totals=%s: reads cut for cause=arena_full and "
+            "ARENA-CLAIM REFUSED per window -- compare with h16p (T2 waits pin the span's L2 slots longer)",
+            getattr(getattr(scheduler, "ps", None), "pp_rank", "?"), now - t0,
+            {k: cur[k] - prev.get(k, 0) for k in cur}, cur,
+        )
+    except Exception:  # noqa: BLE001 - an instrument never breaks a pass
+        return
+
+
+def _note_beat(o: Optional[_Open], rank: int, body: Any, now: float) -> None:
+    if o is None or rank in o.acks:
+        return
+    try:
+        rows, room, locked, unpayable = (int(x) for x in tuple(body)[1:5])
+    except Exception:  # noqa: BLE001 - a malformed beat is no lifesign
+        return
+    prev = o.beats.get(rank)
+    if prev is None:
+        o.beats[rank] = _Beat(
+            at=now, progress_at=now, rows=rows, room=room, locked=locked, unpayable=unpayable,
+            unpayable_class=room + locked < rows,
+        )
+        return
+    better = room > prev.room or locked < prev.locked or unpayable < prev.unpayable
+    o.beats[rank] = _Beat(
+        at=now, progress_at=now if better else prev.progress_at, rows=rows,
+        # the best of each term seen, so a wobble does not read as progress next time
+        room=max(room, prev.room), locked=min(locked, prev.locked), unpayable=min(unpayable, prev.unpayable),
+        n=prev.n + 1, unpayable_class=room + locked < rows,
+    )
+
+
+def pp0_harvest(scheduler, now: Optional[float] = None) -> int:
+    """Take every ack that has landed off the standing receives (no wait). ``now`` = PP0's monotonic clock of the
+    pass (the clock ``pp0_decide`` reads its ``published_at`` on); a defer beat is stamped with it."""
     open_map = _pp0_open_map(scheduler)
+    now = _mono() if now is None else float(now)
+    census_tick(scheduler)
     n = 0
     for ack in _channel(scheduler).harvest():
         if not isinstance(ack, Weg2ToldReadAck):
@@ -554,6 +719,11 @@ def pp0_harvest(scheduler) -> int:
             continue
         for entry in ack.reads:
             rid, own = entry[0], entry[1]
+            if len(entry) > 3 and entry[3] and entry[3][0] == DEFER_MARK:
+                # T2 DEFER-LIFESIGN: not an ack -- the follower lives and defers; PP0 only notes it. A beat for a
+                # rid PP0 decided (or never opened) changes nothing and is not a late ack.
+                _note_beat(open_map.get(str(rid)), int(ack.rank), entry[3], now)
+                continue
             anchors = tuple(int(a) for a in entry[2]) if len(entry) > 2 and entry[2] else ()
             o = open_map.get(str(rid))
             if o is None:
@@ -576,6 +746,7 @@ def pp0_harvest(scheduler) -> int:
                 continue
             o.acks[int(ack.rank)] = int(own)
             o.anchors[int(ack.rank)] = anchors
+            o.beats.pop(int(ack.rank), None)  # the ack ends the deferral of that rank
             n += 1
     if n:
         k = _bump(scheduler, "_pf_ack_harvest_n")
@@ -653,6 +824,150 @@ def _frist_due(scheduler, rid: str, o: _Open, now: float, pass_n: Optional[int])
     return False
 
 
+def _wait_hard_s() -> float:
+    return _env_float(ENV_WAIT_HARD_S, WAIT_HARD_S_DEFAULT)
+
+
+def box_serving(scheduler) -> Tuple[bool, str]:
+    """T2 WAIT-PROGRESS: True = the #699 admission-wedge detector, asked at its alarm threshold less
+    ``ENV_WAIT_MARGIN_S``, would NOT call this box wedged -- something serves (a decode round runs) or progressed
+    lately (a first token, a retired prefill chunk). It is the verdict the wedge guard itself uses, on the clocks it
+    reads (``last_first_token_progress_time`` / ``last_prefill_progress_time``), not a second rule. PP0-local; no clock
+    or no queue to read = (False, ...): the Frist stands, as before."""
+    try:
+        # the scheduler imports the module at its top (scheduler.py); a process that did not has no wedge guard to
+        # ask -- and must not pay the first import (torch & co.) inside PP0's pass
+        _ic = sys.modules.get("sglang.srt.managers.scheduler_components.invariant_checker")
+        if _ic is None:
+            return False, "invariant_checker not loaded"
+        queued = len(scheduler.waiting_queue)
+        running = len(scheduler.running_batch.reqs)
+        first = float(scheduler.last_first_token_progress_time)
+        threshold = max(1.0, float(_ic._wedge_alarm_threshold()) - _env_float(ENV_WAIT_MARGIN_S, WAIT_MARGIN_S_DEFAULT))
+        now = _perf()
+        prefill_stamp = getattr(scheduler, "last_prefill_progress_time", None)
+        since_prefill = None if prefill_stamp is None else now - float(prefill_stamp)
+        alarm, detail = _ic.admission_wedge_verdict(
+            queued, running, now - first, threshold=threshold, seconds_since_prefill_progress=since_prefill,
+        )
+    except Exception as exc:  # noqa: BLE001 - no clock to read: no proof of progress
+        return False, f"no progress clock: {exc!r}"
+    return (not alarm), detail
+
+
+def _wake_floor(scheduler, now: float) -> float:
+    """The moment of the last sleep wake, on the clock of ``now`` (-inf = none): a wait that spans a sleep is not
+    aged by the sleep (review point 4)."""
+    wake = getattr(scheduler, "_weg2_last_wake_t", None)
+    if wake is None:
+        return float("-inf")
+    try:
+        age = _perf() - float(wake)
+    except Exception:  # noqa: BLE001
+        return float("-inf")
+    return float(now) - age if age >= 0 else float("-inf")
+
+
+def _lifesign(scheduler, o: _Open, now: float, serving: bool) -> Tuple[float, bool, str]:
+    """T2 DEFER-LIFESIGN: ``(oldest lifesign over the ranks whose ack is missing, any of them defers NOW, text)``.
+    A rank that beats counts from its last beat -- while the box serves (the chain moves, the rows come back); from
+    its last PROGRESS beat when the box idles or when its shortage is unpayable evictable (nothing but a growing
+    room helps). A rank without a beat (an ack on its way, or dead) counts from the read-ahead, as before. The wake
+    of a sleep is a floor for all."""
+    floor = max(float(o.published_at), _wake_floor(scheduler, now))
+    live = False
+    oldest: Optional[float] = None
+    parts: List[str] = []
+    stale = DEFER_LIVE_BEATS * _env_float(ENV_DEFER_BEAT_S, DEFER_BEAT_S_DEFAULT)
+    try:
+        pp_size = int(scheduler.ps.pp_size)
+    except Exception:  # noqa: BLE001
+        pp_size = 1 + len(o.acks)
+    for r in range(1, pp_size):
+        if r in o.acks:
+            continue
+        b = o.beats.get(r) if defer_lifesign_on() else None
+        if b is None:
+            sign = floor
+        else:
+            by_progress = (not serving) or b.unpayable_class
+            sign = max(floor, b.progress_at if by_progress else b.at)
+            if now - b.at <= stale:
+                live = True
+            parts.append(
+                f"pp{r}:beats={b.n} rows={b.rows} room={b.room} locked={b.locked} unpayable={b.unpayable} "
+                f"beat_age={now - b.at:.1f}s progress_age={now - b.progress_at:.1f}s"
+            )
+        oldest = sign if oldest is None else min(oldest, sign)
+    return (floor if oldest is None else oldest), live, "; ".join(parts)
+
+
+def _wait_context(scheduler, rid: str) -> str:
+    """Review A3: what a wait costs at the metal -- the L2 slots the rid's pinned span holds on this stage, the queue
+    and the named idle blockers (a flip / sleep / seat gate waits for them, K10)."""
+    slots = _pinned_slots(scheduler, rid)
+    try:
+        queued = len(scheduler.waiting_queue)
+    except Exception:  # noqa: BLE001
+        queued = -1
+    blockers = "n/a"
+    fn = getattr(scheduler, "idle_blockers", None)
+    if callable(fn):
+        try:
+            blockers = ",".join(str(b) for b in fn())[:160] or "none"
+        except Exception:  # noqa: BLE001
+            blockers = "n/a"
+    return f"pinned_l2_slots={slots} queued={queued} idle_blockers=[{blockers}]"
+
+
+def _pinned_slots(scheduler, rid: str) -> int:
+    """L2 arena slots held by the pinned span of ``rid`` on this stage (-1 = not readable). An instrument."""
+    try:
+        from sglang.srt.weg2 import park_hold_yield as _phy
+
+        tree = scheduler.tree_cache
+        pool = _phy._kv_pool(tree)
+        if pool is None:
+            return -1
+        return sum(len(_phy._node_slots(pool, n)) for n in _phy._span_nodes(tree, rid))
+    except Exception:  # noqa: BLE001 - an instrument never breaks a verdict
+        return -1
+
+
+def _frist_verdict(scheduler, rid: str, o: _Open, now: float, pass_n: Optional[int]) -> Optional[Tuple[int, str]]:
+    """The acks are not all in. ``None`` = keep waiting (the Frist is not due, or T2 WAIT-PROGRESS: it is due but the
+    box is serving -- the late ack is chain lag, and the lag IS the serving work -- or a follower defers); else
+    ``(0, reason)``. The hard bound hangs on lifesigns (DEFER-LIFESIGN), the absolute ceiling on the read-ahead."""
+    if not _frist_due(scheduler, rid, o, now, pass_n):
+        return None
+    if not wait_progress_on():
+        return 0, REASON_FRIST
+    serving, detail = box_serving(scheduler)
+    oldest, live, beats = _lifesign(scheduler, o, now, serving)
+    if not serving and not live:
+        return 0, REASON_FRIST
+    hard = _wait_hard_s()
+    floor = max(float(o.published_at), _wake_floor(scheduler, now))
+    if now - floor >= max(hard, _env_float(ENV_WAIT_ABS_S, WAIT_ABS_S_DEFAULT)):
+        return 0, REASON_FRIST_ABS
+    if now - oldest >= hard:
+        return 0, REASON_FRIST_HARD
+    if o.waited_since is None:
+        o.waited_since = float(now)
+    o.wait_n += 1
+    if o.wait_n == 1:
+        n = _bump(scheduler, "_pf_wait_n")
+        if _say(n):
+            logger.info(
+                "PF TOLD-WAIT rid=%s told=%d after=%.2fs acks=%s (n=%d): the Frist is up but the box is serving "
+                "(%s)%s -- a missing ack is chain lag or a deferring follower, PP0 keeps the rid and waits for it "
+                "instead of told=0; %s",
+                rid, o.told, now - o.published_at, dict(o.acks), n, detail[:160],
+                f" defer[{beats}]" if beats else "", _wait_context(scheduler, rid),
+            )
+    return None
+
+
 def pp0_decide(scheduler, rid: str, now: float, pass_n: Optional[int] = None) -> Optional[Tuple[int, str]]:
     """``None`` = keep waiting; else ``(told to admit, reason)``. ``pass_n`` =
     PP0's current pass number (H64 FRIST-PASSES; None = the wall Frist alone).
@@ -670,15 +985,11 @@ def pp0_decide(scheduler, rid: str, now: float, pass_n: Optional[int] = None) ->
             return 0, REASON_MISMATCH
         if complete:
             return m, REASON_FLOOR
-        # a floor is still possible: wait for the missing acks (bounded by the Frist)
-        if _frist_due(scheduler, rid, o, now, pass_n):
-            return 0, REASON_FRIST
-        return None
+        # a floor is still possible: wait for the missing acks (bounded by the Frist, T2: by progress)
+        return _frist_verdict(scheduler, rid, o, now, pass_n)
     if complete:
         return o.told, REASON_ACKS
-    if _frist_due(scheduler, rid, o, now, pass_n):
-        return 0, REASON_FRIST
-    return None
+    return _frist_verdict(scheduler, rid, o, now, pass_n)
 
 
 def pp0_note_verdict(scheduler, rid: str, told: int, told_final: int, reason: str, now: float, published_at: float) -> None:
@@ -688,6 +999,17 @@ def pp0_note_verdict(scheduler, rid: str, told: int, told_final: int, reason: st
         # item 220: PP0 admitted at told; until it seats the rid, a follower's
         # late re-ask can still switch it to told=0 (pp0_retract_due)
         _admitted_map(scheduler)[str(rid)] = int(told_final)
+    if o is not None and o.waited_since is not None:
+        # T2 WAIT-PROGRESS: the proof marker -- what used to be told=0 reason=frist ended with a verdict that keeps the
+        # prefix (``kept`` > 0) or, named, still fell back
+        n_w = _bump(scheduler, "_pf_waited_n")
+        if n_w <= 32 or n_w % _LOG_EVERY == 0:
+            logger.info(
+                "PF TOLD-WAITED rid=%s told=%d -> %d reason=%s waited=%.2fs polls=%d acks=%s beats=%s (n=%d): the "
+                "verdict came after the Frist while the box served; %s", rid, told, int(told_final), reason,
+                now - o.waited_since, o.wait_n, acks, {r: b.n for r, b in o.beats.items()}, n_w,
+                _wait_context(scheduler, rid),
+            )
     if reason == REASON_ACKS:
         n = _bump(scheduler, "_pf_admit_acks_n")
         if _say(n):
@@ -827,6 +1149,8 @@ class _FState:
     registered: Dict[str, Any] = field(default_factory=dict)  # rid -> req
     outbox: List[Tuple[Any, ...]] = field(default_factory=list)
     seq: int = 0
+    #: T2 ROOM-DEFER: rid -> (first deferred at, next re-check at, last defer beat at, beats sent), perf clock
+    deferred: Dict[str, Tuple[float, float, float, int]] = field(default_factory=dict)
 
 
 def _fstate(scheduler, create: bool = False) -> Optional[_FState]:
@@ -879,6 +1203,9 @@ def follower_forget(scheduler, rid: str) -> None:
     rid = str(rid)
     st.expect.pop(rid, None)
     st.registered.pop(rid, None)
+    st.deferred.pop(rid, None)
+    _room_defer_map(scheduler).pop(rid, None)
+    (getattr(scheduler, "_weg2_fb_room_defer_seen", None) or set()).discard(rid)
     if st.outbox:
         st.outbox = [e for e in st.outbox if e[0] != rid]
 
@@ -1063,7 +1390,30 @@ def _ack_evictable(tree) -> int:
         return reported
 
 
-def _room_own(scheduler, req, rid: str, own: int) -> int:
+def _room_defer_map(scheduler) -> Dict[str, Tuple[int, int, int, int]]:
+    d = getattr(scheduler, "_weg2_fb_room_defer", None)
+    if d is None:
+        d = scheduler._weg2_fb_room_defer = {}
+    return d
+
+
+def room_deferred(scheduler, rid: str) -> Optional[Tuple[int, int, int, int]]:
+    """T2 ROOM-DEFER: ``(rows, room, locked, unpayable)`` when the LAST ``_room_own`` of ``rid`` found the room short
+    only transiently -- while other requests hold rows (``room + locked >= rows``) or, ROOM-DEFER-UNPAYABLE, while
+    evictable rows wait for a peel nobody can pay yet (``room + locked + unpayable`` = the pool >= rows); else None.
+    Read once per ack formation."""
+    return _room_defer_map(scheduler).pop(str(rid), None)
+
+
+def _locked_rows(scheduler, available: int, evictable: int) -> int:
+    """Rows other requests hold on this stage's device pool: ``max_total_num_tokens - (available + evictable)`` --
+    the very ``num_used`` the scheduler's ``full token usage`` line prints (h16p: 0.38 = 99.6k rows at the NO-ROOM
+    ack, 0.06 one batch later). They return to the pool when those requests finish. 0 = not readable."""
+    total = int(getattr(scheduler, "max_total_num_tokens", 0) or 0)
+    return max(0, total - int(available) - int(evictable)) if total > 0 else 0
+
+
+def _room_own(scheduler, req, rid: str, own: int, mark: bool = True) -> int:
     """ACK-ROOM (dual1k dkr27bnvfp4dual1kbar1fs10010950, PP1 09:55:20Z, rid
     weg2-0-10, a fork twin): the follower's read reproduced told=16383 and its
     tree could resume there (host KV + anchor), but the head was HOST-only on
@@ -1073,18 +1423,60 @@ def _room_own(scheduler, req, rid: str, own: int) -> int:
     so #968 followed at once. The ack names 0 when this rank cannot hold the
     told's load-back even with every evictable row freed: PP0 answers told=0
     for EVERY rank (a rank-agreed re-prefill, chunked from 0) instead of a
-    group death. Read-only (nothing evicted here); no probe = no verdict."""
+    group death. Read-only (nothing evicted here); no probe = no verdict.
+
+    T2 ROOM-DEFER (NF h16p 226aad7105, PP1/PP2 weg2-0-3 12:46:20 ``loadback_rows=184768 room=162176``, weg2-0-10
+    12:33:29 ``188928 / 129472``): the 0 re-prefilled what the store held on EVERY stage -- for a shortage that was a
+    RUNNING request's rows (usage 0.38, then 0.06 one batch later). When room + the rows others hold would suffice,
+    the shortage is transient: the call still returns 0 (nothing may be loaded back NOW), but with ``mark`` it
+    records ``(rows, room, locked)`` for ``room_deferred`` -- the ack is then held back instead of sent as 0."""
+    if mark:
+        _room_defer_map(scheduler).pop(str(rid), None)
     rows = _loadback_rows(scheduler, req, own)
     if not rows:
         return own
     try:
         tree = scheduler.tree_cache
         alloc = getattr(tree, "token_to_kv_pool_allocator", None)
-        room = int(alloc.available_size()) + _ack_evictable(tree)
+        available = int(alloc.available_size())
+        reported = int(tree.evictable_size())
+        room = available + _ack_evictable(tree)
     except Exception:  # noqa: BLE001 - no allocator readable: no verdict
         return own
     if room >= int(rows):
         return own
+    locked = _locked_rows(scheduler, available, reported)
+    # review A2 (B2): room + locked + unpayable == the pool. ``unpayable`` = reported evictable rows no peel pays yet
+    # (the backups they need wait for arena slots: the FULL-ARENA state). A pool that holds the told at all gets it
+    # once those clear -- transient, like the rows other requests hold. Only a told that exceeds the pool (or a pool
+    # that is unreadable) is permanent.
+    unpayable = max(0, int(reported) - (room - int(available)))
+    total = int(getattr(scheduler, "max_total_num_tokens", 0) or 0)
+    transient = bool(
+        room_defer_on()
+        and (room + locked >= int(rows) or (room_defer_unpayable_on() and total > 0 and int(rows) <= total))
+    )
+    if mark and transient:
+        _room_defer_map(scheduler)[str(rid)] = (int(rows), int(room), int(locked), int(unpayable))
+        seen = getattr(scheduler, "_weg2_fb_room_defer_seen", None)
+        if seen is None:
+            seen = scheduler._weg2_fb_room_defer_seen = set()
+        if str(rid) in seen:
+            return 0  # named on the first formation; a re-check every pass would only repeat it
+        seen.add(str(rid))
+        n = _bump(scheduler, "_pf_ack_room_defer_n")
+        if _say(n):
+            logger.warning(
+                "PF TOLD-ACK ROOM-DEFER rank pp=%s rid=%s told=%d loadback_rows=%d room=%d locked=%d unpayable=%d "
+                "class=%s (n=%d): the load-back does not fit now but fits once the %d rows other requests hold are "
+                "released%s -- the ack is held back (a defer beat tells PP0 this rank lives; PP0 waits, it does not "
+                "answer told=0) and goes out when the room is there",
+                getattr(scheduler.ps, "pp_rank", "?"), str(rid), own, int(rows), room, locked, unpayable,
+                "locked" if room + locked >= int(rows) else "unpayable", n, locked,
+                "" if room + locked >= int(rows) else f" and the {unpayable} evictable rows no peel pays yet clear "
+                "(the full-arena state: their backups wait for arena slots)",
+            )
+        return 0
     n = _bump(scheduler, "_pf_ack_no_room_n")
     if n <= 32 or n % _LOG_EVERY == 0:
         logger.warning(
@@ -1154,7 +1546,7 @@ def ack_anchors(scheduler, req, rid: str, own: int, told: int) -> List[int]:
     for d in depths:
         if int(own) > 0 and d == int(own):
             continue
-        if _room_own(scheduler, req, rid, d) != d:
+        if _room_own(scheduler, req, rid, d, mark=False) != d:
             continue  # this depth's load-back does not fit: not a depth this rank proves
         out.append(int(d))
         if len(out) >= ANCHOR_ACKS_MAX:
@@ -1178,6 +1570,7 @@ def follower_pump(scheduler) -> None:
     st = _fstate(scheduler)
     if st is None:
         return
+    census_tick(scheduler)
     tree = scheduler.tree_cache
     free = None
     for rid in list(st.registered):
@@ -1197,9 +1590,44 @@ def follower_pump(scheduler) -> None:
 
             if not _st.follower_early_settle_now(scheduler, st.registered[rid], rid, told):
                 continue  # short: the told-limited read acks when it ends
-        req = st.registered.pop(rid)
-        st.expect.pop(rid, None)
+        req = st.registered[rid]
+        # T2 ROOM-DEFER: a deferred rid re-reads its room at most every ROOM_DEFER_RECHECK_S
+        _held = st.deferred.get(rid)
+        if _held is not None and _perf() < _held[1]:
+            continue
         own = own_prefix(scheduler, req, rid, told)
+        _dfr = room_deferred(scheduler, rid) if room_defer_on() else None
+        if _dfr is not None:
+            # the room is short only transiently: no ack yet -- PP0 reads the missing ack as lag and waits
+            # (WAIT-PROGRESS); the real reach goes out when the room is there. The read stays registered. DEFER-
+            # LIFESIGN: a defer entry in the ack message tells PP0 this rank lives and what it waits for.
+            _now = _perf()
+            _beat_at = _held[2] if _held is not None else float("-inf")
+            _beats = _held[3] if _held is not None else 0
+            if defer_lifesign_on() and _now - _beat_at >= _env_float(ENV_DEFER_BEAT_S, DEFER_BEAT_S_DEFAULT):
+                st.outbox = [e for e in st.outbox if e[0] != rid]
+                st.outbox.append((rid, 0, (), (DEFER_MARK,) + tuple(int(x) for x in _dfr)))
+                _beat_at = _now
+                _beats += 1
+            st.deferred[rid] = (
+                _held[0] if _held is not None else _now, _now + ROOM_DEFER_RECHECK_S, _beat_at, _beats,
+            )
+            continue
+        if _held is not None:
+            n_r = _bump(scheduler, "_pf_ack_room_deferred_released_n")
+            if _say(n_r):
+                logger.info(
+                    "PF TOLD-ACK ROOM-DEFER RELEASED rank pp=%s rid=%s told=%d own=%d after=%.2fs beats=%d (n=%d): "
+                    "the room is there, the ack goes out with the real reach; %s",
+                    getattr(scheduler.ps, "pp_rank", "?"), rid, told, int(own), _perf() - _held[0],
+                    int(_held[3]), n_r, _wait_context(scheduler, rid),
+                )
+        st.deferred.pop(rid, None)
+        (getattr(scheduler, "_weg2_fb_room_defer_seen", None) or set()).discard(rid)
+        st.registered.pop(rid, None)
+        st.expect.pop(rid, None)
+        # the real ack replaces any defer beat still waiting to go out for this rid
+        st.outbox = [e for e in st.outbox if e[0] != rid]
         if anchor_acks_on():
             st.outbox.append((rid, own, tuple(ack_anchors(scheduler, req, rid, own, told))))
         else:
