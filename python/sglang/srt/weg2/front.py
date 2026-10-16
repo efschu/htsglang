@@ -13601,6 +13601,8 @@ class Front:
                     _det_on = request.path in CACHED_TIER_ASK_PATHS and r.status == 200
                     _tclock = _ut.TokenClock()
                     _want_rsn = getattr(getattr(self, "ftok", None), "_tok", None) is not None
+                    # NODECODE 1015 A1: the X-SUM-PRICE row is still open when the head had no content
+                    _pf_row = {"open": not _has_content}
 
                     def _details(obj: dict, reading) -> Dict[str, Dict[str, Any]]:
                         _pc = usage_fix["p"]
@@ -13656,6 +13658,22 @@ class Front:
                         if anth is not None:
                             anth.feed(chunk)
                         if stream_has_content(chunk, request.path):
+                            if _pf_row["open"] and r.status == 200:
+                                # NODECODE 1015 A1: a stream committed WITHOUT content (Anthropic lookahead gave up
+                                # after message_start + 7 pings while D still prefilled / held it parked) gets its
+                                # first content HERE. D's prefill is over now: close the X-SUM-PRICE row once, or
+                                # the rid stays ``carried`` (not a decode, _dc_decoding) for its whole decode (NF
+                                # cfeb2896c1_1013_045811 weg2-198-622: kept=committed, 173 tokens, no FIRST-CONTENT;
+                                # 337 of 18759 booked SHORT legs 13.-15.10.).
+                                _pf_row["open"] = False
+                                _book = self._d_pf_book()
+                                _was_open = _book.is_open(rid=rid)
+                                _book.done(rid=rid)  # X-SUM-PRICE: first content (in the body) = prefill over
+                                if _was_open:  # named only where a row really stood (P->D hand-offs have none)
+                                    self.counters["leg2_first_content_body"] += 1
+                                    logger.info("WEG2 LEG2-FIRST-CONTENT-BODY rid=%s epoch=%d leg2_ms=%.0f (first "
+                                                "content after the committed head; X-SUM-PRICE row closed here)",
+                                                rid, self.epoch, (time.time() - t0) * 1000.0)
                             _t_tok = time.time()
                             if usage_fix["open"]:
                                 _tclock.note(_t_tok)  # USAGE-DETAILS: the token stream's gaps
