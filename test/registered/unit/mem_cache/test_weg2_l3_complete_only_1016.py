@@ -89,12 +89,59 @@ def test_k10_device_round_keeps_a_node_with_a_half_page(group):
     assert not (g.store / "zz_sfx.bin").exists()
 
 
-def test_switch_off_is_the_old_path(group, monkeypatch):
-    monkeypatch.setenv("SGLANG_WEG2_L3_COMPLETE_ONLY", "0")
+def test_no_header_read_is_fail_closed(group, monkeypatch):
+    """Review A4: no switch back onto the wrong-KV path; an arena without ``slot_states`` secures
+    nothing (fail-closed, was fail-open)."""
+    monkeypatch.setenv("SGLANG_WEG2_L3_COMPLETE_ONLY", "0")          # the old switch is gone
     g = group
     rows = _half_page(g)
-    sec = g.p0.secure_rows_to_l3(rows)
-    assert sec["incomplete"] == 0
+    assert g.p0.secure_rows_to_l3(rows)["incomplete"] == 1
+    full = g.n0[0].component_data[FULL].host_value
+    monkeypatch.setattr(type(g.a0), "slot_states", None, raising=False)
+    sec = g.p0.secure_rows_to_l3(full)
+    assert sec["incomplete"] == 1 and sec["lost"] >= 1 and sec["written"] == 0, sec
+
+
+def test_review_p1_incomplete_node_does_not_eat_the_forma_cap(group):
+    """Review A1 (probe P1): the half-page node carries only TP0's reference, so the group-equal order
+    put it FIRST; the FORMA cap counted its page before secure_rows_to_l3 refused it and the complete
+    nodes behind it were passed over (released 0, cap_used 1, cap_skipped 7). Now it is no candidate."""
+    import unittest.mock as mock
+
+    from sglang.srt.mem_cache import form_a_host_shadow as R
+
+    g = group
+    leaf = g.n0[-1]
+    rows = _half_page(g)
+    sl = [int(s) for s, _ in g.a0.find_slots(g.p0._stems(["zz"]))]
+    assert g.a0.ref_slots(sl, +1) == 1               # TP0's complete_write took the node's reference
+    leaf.hash_value = ["zz"]
+    leaf.component_data[FULL].host_value = rows
+    with mock.patch.object(R, "role", lambda: "host"):
+        R.register_tree(g.t0)
+        got = g.t0._w3_arena_spill(g.p0, 1, max_secure_pages=1)
+    spilled = [n for n in g.n0[:-1] if n.component_data[FULL].host_value is None]
+    assert got >= 1 and spilled, (got, g.t0._w3_spill_cap_used, g.t0._w3_spill_cap_skipped)
+    assert leaf.component_data[FULL].host_value is not None
+
+
+def test_review_p3_the_sink_refuses_a_claimed_slot_for_every_writer(group):
+    """Review A2 (probe P3): the flush/park mamba spills call arena_secure_to_disk directly on
+    'settled' slots (this rank's pending set only) -- the sink wrote the CLAIMED half slot."""
+    g = group
+    _half_page(g)
+    sl = [int(s) for s, _ in g.a0.find_slots(g.p0._stems(["zz"]))]
+    for writer in ("flush_spill", "park_first_spill", "claim_room"):
+        sec = g.p0._backend.arena_secure_to_disk(g.a0, [(sl[0], 0, 0, W.PAGE)], writer=writer)
+        assert sec["written"] == 0 and sec["on_disk"] == 0 and sec["incomplete"] == 1 and sec["lost"] == 1, sec
+    assert not (g.store / "zz_sfx.bin").exists()
+
+
+def test_the_sink_still_writes_a_complete_slot(group):
+    g = group
+    sl = [int(s) for s, _ in g.a0.find_slots(g.p0._stems(g.n0[0].hash_value))]
+    sec = g.p0._backend.arena_secure_to_disk(g.a0, [(sl[0], 0, 0, W.PAGE)], writer="flush_spill")
+    assert sec.get("incomplete", 0) == 0 and sec["lost"] == 0 and sec["on_disk"] + sec["written"] == 1, sec
 
 
 def test_mixed_node_one_half_page_counts_lost(group):
@@ -104,3 +151,24 @@ def test_mixed_node_one_half_page_counts_lost(group):
     rows_full = g.n0[0].component_data[FULL].host_value
     sec = g.p0.secure_rows_to_l3(torch.cat([rows_full, rows_half]))
     assert sec["pages"] == 2 and sec["incomplete"] == 1 and sec["lost"] >= 1, sec
+
+
+def test_host_leaf_round_counts_a_half_page_leaf_incomplete_not_unsecured(group):
+    """Review A1/A5 for spill_host_only: a host-only leaf whose slot is not COMPLETE is no candidate;
+    the line names it ``incomplete`` (no loss), the leaf keeps its host copy."""
+    from sglang.srt.weg2 import host_only_spill as H
+
+    g = group
+    leaf = g.n0[-1]
+    rows = _half_page(g)
+    leaf.hash_value = ["zz"]
+    cd = leaf.component_data[FULL]
+    cd.host_value = rows
+    cd.value = None
+    for n in g.n0[:-1]:
+        n.component_data[FULL].host_value = None
+    assert H._reason(g.t0, leaf, g.p0, set()) is None, H._reason(g.t0, leaf, g.p0, set())
+    got = H.spill_host_only(g.t0, g.p0, 1, W.PAGE_TOKENS if hasattr(W, "PAGE_TOKENS") else 1, set())
+    assert got["incomplete"] == 1 and got["unsecured"] == 0 and got["released"] == 0, got
+    assert cd.host_value is not None
+    assert not (g.store / "zz_sfx.bin").exists()

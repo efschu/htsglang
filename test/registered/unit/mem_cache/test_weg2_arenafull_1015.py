@@ -846,7 +846,7 @@ class SecureRowsPassUnpairedTest(unittest.TestCase):
         from sglang.srt.mem_cache.pool_host import arena_pool as ap
 
         pool = types.SimpleNamespace(
-            arena=types.SimpleNamespace(slot_bytes=64), _page_bytes=64,
+            arena=types.SimpleNamespace(slot_bytes=64, slot_states=lambda sl: [2] * len(sl)), _page_bytes=64,  # L3-COMPLETE A4: fail-closed without the header read
             _backend=types.SimpleNamespace(arena_secure_to_disk=lambda arena, cands: {
                 "on_disk": 1, "written": 0, "lost": 0, "unpaired": 2, "sidecar_absent": 3}))
         with mock.patch.object(ap, "arena_ref_slots", lambda p, h: torch.tensor([5, 6, 7])):

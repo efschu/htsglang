@@ -6273,6 +6273,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 continue   # staging rows are not arena slots
             cands.append(node)
         keys = self._w3_spill_keys(pool, cands)
+        # L3-COMPLETE review A1: a node with a slot not COMPLETE is treated like a pending write -- not a
+        # candidate (before the order and the FORMA cap: the cap counts only nodes secure_rows_to_l3 can take)
+        incomplete = sum(1 for c in cands if keys.incomplete(c))
+        if incomplete:
+            cands = [c for c in cands if not keys.incomplete(c)]
         cands.sort(key=lambda x: keys[id(x)])
         released = secured = written = lost = unpaired = 0
         spilled = 0
@@ -6296,7 +6301,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if int(sec.get("lost", 0)) or _unp or not int(sec.get("pages", 0)):
                 # A2 (h16p review B2): an unpaired page (KV without its QSA index) is NOT in L3 -- like lost:
                 # no release of the host copy, no l3_present
-                lost += int(sec.get("lost", 0))
+                _inc = int(sec.get("incomplete", 0))
+                lost += int(sec.get("lost", 0)) - _inc      # review A5: a not-yet-COMPLETE page is no loss
+                incomplete += 1 if _inc else 0
                 unpaired += _unp
                 continue
             if _role == "host" and int(sec.get("pages", 0)) < len(getattr(node, "hash_value", None) or ()):
@@ -6334,12 +6341,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if k <= 8 or k % 64 == 0 or lost or unpaired:
             logger.info(
                 "W3-ARENA SPILL n=%d need=%d released_pages=%d nodes=%d candidates=%d "
-                "l3=on_disk:%d,written:%d lost=%d unpaired=%d ref_free=%s kept_payable=%d (a finished page leaves L2 only with "
+                "l3=on_disk:%d,written:%d lost=%d unpaired=%d incomplete=%d ref_free=%s kept_payable=%d "
+                "(incomplete = nodes kept because a slot is not COMPLETE yet, no loss; a finished page leaves L2 only with "
                 "its L3 copy; the node stays on the device, l3_present; ref_free = of the slots "
                 "this spill let go, those NO rank references any more -- the clock takes them; "
                 "group-equal order: fewest peer references first, then slot id; kept_payable = device nodes "
                 "not spilled because their drop could not clear a host-only child now)",
-                k, int(need_pages), released, spilled, len(cands), secured, written, lost, unpaired,
+                k, int(need_pages), released, spilled, len(cands), secured, written, lost, unpaired, incomplete,
                 self._w3_spill_ref_free(pool, released_slots), kept_payable)
         if released_out is not None:
             released_out.extend(released_slots)
@@ -13674,9 +13682,19 @@ class _W3SpillKeys:
     def __init__(self, pool, nodes, group: bool = True):
         self._pool = pool
         self._key = {}
+        # L3-COMPLETE review A1 (16.10.): ids of the nodes one of whose arena slots is not COMPLETE in the
+        # shared header -- like a pending write: no spill candidate (the cap is not spent on a node
+        # secure_rows_to_l3 refuses, the complete nodes behind it are not passed over)
+        self._incomplete = set()
         if not group or not nodes:
             for node in nodes:
                 self._key[id(node)] = (0, 0, 0, node.id)
+            if nodes:
+                try:
+                    slots, owner = self._slot_owner(pool, nodes)
+                    self._mark_incomplete(pool, nodes, slots, owner)
+                except Exception:  # noqa: BLE001 - fail closed: nothing provably complete
+                    self._incomplete = {id(nd) for nd in nodes}
             return
         try:
             self._vector_keys(pool, nodes)
@@ -13685,7 +13703,8 @@ class _W3SpillKeys:
             for node in nodes:
                 self._key[id(node)] = (0, 0, 0, node.id)
 
-    def _vector_keys(self, pool, nodes) -> None:
+    @staticmethod
+    def _slot_owner(pool, nodes):
         from sglang.srt.mem_cache.pool_host.arena_pool import _arena_mask, _psz
 
         n = len(nodes)
@@ -13696,18 +13715,44 @@ class _W3SpillKeys:
         owner = torch.repeat_interleave(torch.arange(n, dtype=torch.int64), lens)
         keep = _arena_mask(pool, cat)
         S, P = int(pool.staging_rows), _psz(pool)
-        slots = (cat[keep] - S) // P
-        owner = owner[keep]
+        return (cat[keep] - S) // P, owner[keep]
+
+    def _mark_incomplete(self, pool, nodes, slots, owner, uniq=None, inv=None) -> None:
+        """One header read (``slot_states``) of the distinct slots; a node with a slot not in state 2
+        (COMPLETE) is incomplete. An arena without the read marks nothing (``secure_rows_to_l3`` refuses
+        such pages fail-closed); an unreadable header marks every node with a slot."""
+        states_fn = getattr(getattr(pool, "arena", None), "slot_states", None)
+        if not callable(states_fn) or not slots.numel():
+            return
+        if uniq is None:
+            uniq, inv = torch.unique(slots, return_inverse=True)
+        try:
+            st_u = torch.tensor([int(x) for x in states_fn(uniq.tolist())], dtype=torch.int64)
+        except Exception:  # noqa: BLE001 - unreadable header = not provably complete
+            st_u = torch.full((int(uniq.numel()),), -1, dtype=torch.int64)
+        bad = (st_u[inv] != 2).to(torch.int64)
+        hit = torch.zeros(len(nodes), dtype=torch.int64).scatter_reduce(
+            0, owner, bad, reduce="amax", include_self=True)
+        self._incomplete = {id(nodes[i]) for i in torch.nonzero(hit).reshape(-1).tolist()}
+
+    def incomplete(self, node) -> bool:
+        return id(node) in self._incomplete
+
+    def _vector_keys(self, pool, nodes) -> None:
+        n = len(nodes)
+        slots, owner = self._slot_owner(pool, nodes)
         big = torch.iinfo(torch.int64).max
         min_slot = torch.full((n,), big, dtype=torch.int64).scatter_reduce(
             0, owner, slots, reduce="amin", include_self=True)
         min_refs = torch.zeros(n, dtype=torch.int64)
         reader = getattr(getattr(pool, "arena", None), "slot_refs", None)
+        uniq = inv = None
         if callable(reader) and slots.numel():
             uniq, inv = torch.unique(slots, return_inverse=True)
             refs_u = torch.tensor([int(r) for r in reader(uniq.tolist())], dtype=torch.int64)
             min_refs = torch.full((n,), big, dtype=torch.int64).scatter_reduce(
                 0, owner, refs_u[inv], reduce="amin", include_self=True)
+        self._mark_incomplete(pool, nodes, slots, owner, uniq, inv)
         ms, mr = min_slot.tolist(), min_refs.tolist()
         for i, node in enumerate(nodes):
             if ms[i] == big:

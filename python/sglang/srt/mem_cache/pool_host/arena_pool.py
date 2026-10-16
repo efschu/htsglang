@@ -1249,11 +1249,6 @@ def _select_rows_async(t: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     return t.index_select(0, index_to_device_async(pos, t.device))
 
 
-def _l3_complete_only_on() -> bool:
-    return os.environ.get("SGLANG_WEG2_L3_COMPLETE_ONLY", "1").strip().lower() not in (
-        "0", "false", "no", "off", "")
-
-
 _L3_COMPLETE_N = [0]
 
 
@@ -2348,21 +2343,20 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         # header: its bytes are half a page. It is neither written to L3 nor counted as secured
         # (``incomplete`` adds to ``lost``: every caller keeps the node -- the K10 device round, the
         # W3 host-leaf round). An on-disk file of the same stem does not make it secured either.
-        # SGLANG_WEG2_L3_COMPLETE_ONLY=0 = the old path.
+        # No switch (review A1/A4 16.10.: a switch back onto a proven wrong-KV path is no feature);
+        # an arena without the header read is fail-closed (nothing provably complete).
         slot_list = [int(s) for s in slots.tolist()]
         out["incomplete"] = 0
-        if _l3_complete_only_on():
-            states_fn = getattr(arena, "slot_states", None)
-            if callable(states_fn):
-                try:
-                    states = states_fn(slot_list)
-                except Exception:  # noqa: BLE001 - unreadable header = not provably complete
-                    states = [-1] * len(slot_list)
-                keep = [s for s, st in zip(slot_list, states) if int(st) == 2]
-                out["incomplete"] = len(slot_list) - len(keep)
-                if out["incomplete"]:
-                    _l3_complete_note(out["incomplete"], len(slot_list))
-                slot_list = keep
+        states_fn = getattr(arena, "slot_states", None)
+        try:
+            states = states_fn(slot_list) if callable(states_fn) else [-1] * len(slot_list)
+        except Exception:  # noqa: BLE001 - unreadable header = not provably complete
+            states = [-1] * len(slot_list)
+        keep = [s for s, st in zip(slot_list, states) if int(st) == 2]
+        out["incomplete"] = len(slot_list) - len(keep)
+        if out["incomplete"]:
+            _l3_complete_note(out["incomplete"], len(slot_list))
+        slot_list = keep
         if not slot_list:
             out["lost"] = out["incomplete"]
             return out
@@ -2373,7 +2367,9 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         # `sidecar_absent` are passed on -- the caller must not read them as a complete copy
         for k in ("on_disk", "written", "lost", "unpaired", "sidecar_absent"):
             out[k] = int(sec.get(k, 0))
+        # the sink's own CLAIMED lock (review A2) adds to both: its ``lost`` already carries it
         out["lost"] += out["incomplete"]
+        out["incomplete"] += int(sec.get("incomplete", 0))
         ArenaMHAHostPool._257_written_to_l3 = (
             getattr(ArenaMHAHostPool, "_257_written_to_l3", 0) + out["written"])
         return out

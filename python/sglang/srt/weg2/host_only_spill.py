@@ -161,7 +161,10 @@ def spill_host_only(cache: Any, pool: Any, want: int, page_size: int, skip: set,
     # reader references, then slot id, then node id) -- see _w3_arena_spill; a
     # leaf the arena names no slot for keeps the node-id order
     keys = cache._w3_spill_keys(pool, eligible)
-    heap = [(keys[id(n)], n.id, n) for n in eligible]
+    # L3-COMPLETE review A1 (16.10.): a leaf with a slot not COMPLETE in the shared header is no
+    # candidate (like a pending write) -- counted apart as ``incomplete``, never as a loss
+    incomplete = sum(1 for n in eligible if _incomplete(keys, n))
+    heap = [(keys[id(n)], n.id, n) for n in eligible if not _incomplete(keys, n)]
     candidates = len(heap)
     heapq.heapify(heap)
     released = leaves = unsecured = on_disk = written = stale = 0
@@ -172,9 +175,12 @@ def spill_host_only(cache: Any, pool: Any, want: int, page_size: int, skip: set,
             continue
         cd = node.component_data[BASE_COMPONENT_TYPE]
         sec = pool.secure_rows_to_l3(cd.host_value)
+        if int(sec.get("incomplete", 0)):
+            incomplete += 1               # a slot turned out not COMPLETE: kept, no loss (review A5)
+            continue
         if (int(sec.get("lost", 0)) or int(sec.get("pages", 0)) != len(node.hash_value)
                 or (int(sec.get("unpaired", 0)) and _strict())):
-            unsecured += 1                # no L3 copy for every page, or a page not COMPLETE: it stays
+            unsecured += 1                # no L3 copy for every page: it stays
             continue
         on_disk += int(sec.get("on_disk", 0))
         written += int(sec.get("written", 0))
@@ -187,16 +193,26 @@ def spill_host_only(cache: Any, pool: Any, want: int, page_size: int, skip: set,
         released += int(tracker.get(BASE_COMPONENT_TYPE, 0)) // P
         leaves += 1
         if parent is not None and parent is not cache.root_node and _eligible(cache, parent, pool, skip):
-            heapq.heappush(heap, (cache._w3_spill_keys(pool, [parent])[id(parent)], parent.id, parent))
+            _pk = cache._w3_spill_keys(pool, [parent])
+            if _incomplete(_pk, parent):
+                incomplete += 1
+            else:
+                heapq.heappush(heap, (_pk[id(parent)], parent.id, parent))
     _N["calls"] += 1
     k = _N["calls"]
     if k <= 8 or k % 64 == 0 or unsecured:
         top = sorted(refused.items(), key=lambda kv: -kv[1])[:4]
         logger.info(
-            "%s n=%d want=%d released_pages=%d leaves=%d candidates=%d unsecured_kept=%d stale=%d "
+            "%s n=%d want=%d released_pages=%d leaves=%d candidates=%d unsecured_kept=%d incomplete=%d stale=%d "
             "l3=on_disk:%d,written:%d refused=%s (a host-only leaf leaves L2 only with its L3 copy "
-            "for every page; port of the 27B Q-697c spill, local-PP floor only)",
-            MARK, k, int(want), released, leaves, candidates, unsecured, stale, on_disk, written,
+            "for every page; incomplete = leaves kept because a slot is not COMPLETE yet, no loss; "
+            "port of the 27B Q-697c spill, local-PP floor only)",
+            MARK, k, int(want), released, leaves, candidates, unsecured, incomplete, stale, on_disk, written,
             ",".join("%s:%d" % kv for kv in top) or "-")
     return {"released": released, "leaves": leaves, "candidates": candidates,
-            "unsecured": unsecured}
+            "unsecured": unsecured, "incomplete": incomplete}
+
+
+def _incomplete(keys: Any, node: Any) -> bool:
+    fn = getattr(keys, "incomplete", None)
+    return bool(fn(node)) if callable(fn) else False

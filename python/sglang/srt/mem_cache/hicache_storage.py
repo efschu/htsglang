@@ -4485,6 +4485,30 @@ class HiCacheFile(HiCacheStorage):
         stems = getattr(arena, "_stems", {})
         todo = []
         cand_stems = {}
+        # L3-COMPLETE review A2 (16.10.): the CLAIMED lock sits in the sink, for every writer
+        # (park_first_spill, flush_spill, last resort, K15 save): a slot in state 1 holds the bytes of
+        # the owners that merged so far -- half a page. It is neither written nor counted as on disk
+        # (an old file of its stem is no copy of it): ``incomplete``, added to ``lost`` (every caller
+        # keeps its node). State 3 (EVICTING, the clock's candidates) stays allowed. An unreadable
+        # header is fail-closed; an arena without the read (fixtures) keeps the old path.
+        out["incomplete"] = 0
+        states_fn = getattr(arena, "slot_states", None)
+        if callable(states_fn):
+            _slots = [int(c[0]) for c in cands]
+            try:
+                _st = [int(x) for x in states_fn(_slots)]
+            except Exception:  # noqa: BLE001 - unreadable = not provably finished
+                _st = [1] * len(_slots)
+            _claimed = {sl for sl, st in zip(_slots, _st) if st == 1}
+            if _claimed:
+                out["incomplete"] = sum(1 for c in cands if int(c[0]) in _claimed)
+                out["lost"] += out["incomplete"]
+                cands = [c for c in cands if int(c[0]) not in _claimed]
+                self._arena_claimed_n = getattr(self, "_arena_claimed_n", 0) + 1
+                if self._arena_claimed_n <= 16 or self._arena_claimed_n % 256 == 0:
+                    logger.warning("L3-COMPLETE-SINK n=%d writer=%s incomplete=%d: a CLAIMED slot (an "
+                                   "owner's share missing) is neither written to L3 nor counted on disk",
+                                   self._arena_claimed_n, writer, out["incomplete"])
         for slot, lo, hi, total in cands:
             stem = stems.get((lo, hi)) or arena.slot_stem(slot) or None
             cand_stems[slot] = stem
