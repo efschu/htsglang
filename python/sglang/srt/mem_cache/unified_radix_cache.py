@@ -9,6 +9,7 @@ import threading
 import time
 import weakref
 
+from sglang.srt.mem_cache import weg2_backup_guard as _k12_guard
 from sglang.srt.managers.weg2_pass_timer import timed as _pass_timed
 from sglang.srt.managers import weg2_p_overlap as _weg2_p_overlap
 from array import array
@@ -8039,6 +8040,44 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             out.append(t)
         return out
 
+    def _k12_unreal_host_rows(self, node: UnifiedTreeNode) -> int:
+        """K12 (index 72085): how many of ``node``'s KV host ids are NOT real
+        rows of the KV host pool -- the A2 ORPHAN id (``settle_lost_rows``:
+        ``id_space`` = staging + arena tokens + PLACEHOLDERS, deliberately
+        outside every pool) or a read placeholder. Such a page carries no host
+        bytes, so a store write of it reads a row nobody owns: D TP0 13:35:33Z
+        ``A2 LOST-ROWS ... orphaned=24`` and 0.2 s later the publish of the same
+        node read QSA mirror row 72085 = (4096 + 6485*64 + 2**22) / 64 of a
+        6549-row mirror (IndexError, backup thread dead, W120 at the sleep).
+        0 for a pool without the arena bounds (nothing to compare against)."""
+        cc = getattr(self, "cache_controller", None)
+        pool = getattr(cc, "mem_pool_host", None) if cc is not None else None
+        S = getattr(pool, "staging_rows", None)
+        A = getattr(pool, "arena_tokens", None)
+        if not isinstance(S, int) or not isinstance(A, int) or getattr(pool, "arena", None) is None:
+            return 0
+        hv = node.component_data[BASE_COMPONENT_TYPE].host_value
+        if hv is None or hv.numel() == 0:
+            return 0
+        return int((hv.reshape(-1).to("cpu", dtype=torch.int64) >= S + A).sum())
+
+    def _k12_refuse_unreal_backup(self, node: UnifiedTreeNode, site: str) -> bool:
+        """True = the store write of ``node`` is refused by name (K12)."""
+        bad = UnifiedRadixCache._k12_unreal_host_rows(self, node)
+        if not bad:
+            return False
+        n = getattr(UnifiedRadixCache, "_k12_orphan_refused_n", 0) + 1
+        UnifiedRadixCache._k12_orphan_refused_n = n
+        if n <= 16 or (n & (n - 1)) == 0:
+            logger.warning(
+                "K12 ORPHAN-ROWS BACKUP REFUSED site=%s node=%s rows_bad=%d of %d n=%d: the node "
+                "holds A2-orphaned (or placeholder) host ids -- pages with no host bytes; no store "
+                "write is issued for it (its L3 copy is the key's own COMPLETE slot or none)",
+                site, getattr(node, "id", "?"), bad,
+                int(node.component_data[BASE_COMPONENT_TYPE].host_value.numel()), n,
+            )
+        return True
+
     def _weg2_write_plain_sidecars(self, node: UnifiedTreeNode) -> None:
         """fnFL2x62: a direct write completes the KV page in the arena and the
         mamba blob / draft page in THEIR arenas, and the write-through ack then
@@ -8051,6 +8090,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         builds, filtered by :meth:`_plain_sidecar_transfers`."""
         cc = self.cache_controller
         if not self.enable_storage or cc is None or not node.backuped:
+            return
+        if UnifiedRadixCache._k12_refuse_unreal_backup(self, node, "plain_sidecars"):
             return
         comp_xfers: dict[ComponentType, list[PoolTransfer]] = {}
         for comp in self._components_tuple:
@@ -8121,6 +8162,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     "skips=%s (denominator: every write_backup_storage call)",
                     _why, getattr(node, "id", "?"), len(node.key), _calls, _skips,
                 )
+            return
+
+        if UnifiedRadixCache._k12_refuse_unreal_backup(self, node, "write_backup_storage"):
             return
 
         # Weighted uneven-DCP owner mode (task #60): each rank's host pool only
@@ -10733,6 +10777,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             for operation in _drain_queue(cc.ack_backup_queue, n_backup):
                 drained += 1
                 entry = self.ongoing_backup.pop(operation.id, None)
+                if entry is not None and _k12_guard.is_failed(operation):
+                    # K12: the write did not land (an exception in its body, or
+                    # the group's sleep verdict abandoned it). No l3_present --
+                    # #1317 C2: an issued write that never landed must not
+                    # license a free -- and no rebind/transit release: the host
+                    # rows stay the only copy until the node leaves normally.
+                    node, lock_params = entry
+                    self.dec_host_lock_ref(node, lock_params)
+                    entry = None
                 if entry is not None:
                     node, lock_params = entry
                     if _parts is not None:
@@ -10742,8 +10795,21 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     # store read may recycle those rows. Set on the ack and
                     # never on the issue -- an issued write that never landed
                     # would license a free that loses the KV.
-                    if UnifiedRadixCache._weg2_store_ack_complete(self, operation):
+                    _ack_ok = UnifiedRadixCache._weg2_store_ack_complete(self, operation)
+                    _cut = _r12.cut_role()
+                    # K12/H1: on a Form A group l3_present is the GROUP's
+                    # completeness, decided by TP0 and mirrored (R12 L3 event)
+                    # -- never a rank-local ack: TP0 sets it on its complete
+                    # ack (no cut) or on the complete page (cut: every owner
+                    # wrote, the rebind below); a worker only from TP0's event.
+                    # Off R12 (role None) A2's rank-local reading stands.
+                    _h1 = _r12.l3_group_on() and _r12.role() is not None
+                    if not _h1:
+                        if _ack_ok:
+                            node.l3_present = True
+                    elif _r12.role() == "host" and _cut is None and _ack_ok:
                         node.l3_present = True
+                        _r12.record_l3(self, node)
                     self.dec_host_lock_ref(node, lock_params)
                     if _parts is not None:
                         _tn1 = time.perf_counter()
@@ -10752,17 +10818,21 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     # page is complete only when every owner wrote. A worker
                     # keeps its rows until TP0's verdict; TP0 rebinds a
                     # complete page (REBIND) or waits for it.
-                    _cut = _r12.cut_role()
                     if _cut == "worker":
                         _r12.worker_keeps(self, "store-ack-cut", node)
                     elif self._weg2_rebind_host_to_arena(node):
                         # #1424: the rows now ARE the arena slots
                         if _cut == "host":
                             _r12.record_rebind(self, node)
+                            if _h1 and _ack_ok:
+                                # H1: the page is complete (every owner wrote)
+                                node.l3_present = True
+                                _r12.record_l3(self, node)
                     elif _cut == "host" and _r12.await_complete(
                         self, node,
                         fallback_transit=bool(getattr(node, "_weg2_chain_piece", False)
                                               or self._weg2_host_is_transit()),
+                        l3_ok=bool(_h1 and _ack_ok),
                     ):
                         pass
                     elif getattr(node, "_weg2_chain_piece", False) or self._weg2_host_is_transit():
