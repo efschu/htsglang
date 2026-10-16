@@ -9,6 +9,8 @@ import subprocess
 import sys
 
 RR = "python/sglang/srt/weg2/read_room.py"
+UR = "python/sglang/srt/mem_cache/unified_radix_cache.py"
+FS = "python/sglang/srt/mem_cache/form_a_host_shadow.py"
 TEST = "test/registered/unit/mem_cache/test_weg2_read_room_d_1015.py"
 
 MUTANTS = [
@@ -28,9 +30,8 @@ MUTANTS = [
     ("D6 a node holding a Mamba anchor on the host is released", RR,
      "        if mamba is not None and node.component_data[mamba].host_value is not None:\n"
      "            skip[\"anchor\"] += 1\n            continue\n", ""),
-    ("D7 a page without an L3 copy is released", RR,
-     '        if int(sec.get("lost", 0)) or not int(sec.get("pages", 0)):\n',
-     '        if not int(sec.get("pages", 0)):\n'),
+    # D7 ("lost" check removed in form_a_spill) is EQUIVALENT since review readroomd: l3_complete checks lost too
+    # (N3/N4 cover that rule)
     ("D8 no L3 copy is made before the release", RR,
      "        sec = pool.secure_rows_to_l3(hv)\n", '        sec = {"pages": 1, "lost": 0}\n'),
     ("D9 a busy node (host lock / pending write) is released", RR,
@@ -46,6 +47,29 @@ MUTANTS = [
     ("D12 the want is ignored (everything goes)", RR,
      "        if released >= want:\n            break\n        hv = node.component_data[BASE_COMPONENT_TYPE].host_value\n",
      "        hv = node.component_data[BASE_COMPONENT_TYPE].host_value\n"),
+    ("N1 TP0 serves inside the round (review readroomd B2)", RR,
+     '        if not serves(cache) or form_a_role() == "host":\n', '        if not serves(cache):\n'),
+    ("N2 the workers never learn l3_present (B1)", RR, "        _r12.record_l3(cache, node)\n", ""),
+    ("N3 an unpaired page counts as copied (B3)", RR,
+     '    if int(sec.get("lost", 0)) or int(sec.get("unpaired", 0)):\n        return False\n', ""),
+    ("N4 a page neither on disk nor written counts as copied (B3)", RR,
+     '    return pages > 0 and pages == need and int(sec.get("on_disk", 0)) + int(sec.get("written", 0)) == need',
+     '    return pages > 0 and pages == need'),
+    ("N5 a node with children is spilled (B4)", RR,
+     '        if node.children:\n            # review readroomd B4', '        if False:\n            # review readroomd B4'),
+    ("N6 a node with a Mamba device state is spilled (B4)", RR,
+     "        if mamba is not None and node.component_data[mamba].value is not None:\n            # review readroomd B4",
+     "        if False:\n            # review readroomd B4"),
+    ("N7 no L3-DROP on Form A (B4)", UR,
+     "            return UnifiedRadixCache._weg2_l3_drop_forma(self, node, tracker)\n", "            return False\n"),
+    ("N8 attach does not serve (B2)", FS, "            _read_room.serve_at_broadcast(_S.tree)\n", "            pass\n"),
+    ("N9 attach does not release what TP0 decided (B2)", FS, "        _read_room.flush_forma_pending()\n",
+     "        pass\n"),
+    ("N10 the shared W3 spill releases without a complete L3 copy (B3)", UR,
+     "            if not _read_room_l3_complete(node, sec):\n", "            if False:\n"),
+    ("N11 TP0 releases inside the pass, not at the broadcast (B2)", RR,
+     "        _ST.d_pending.append((cache, node, hv))\n",
+     "        _ST.d_pending.append((cache, node, hv))\n        flush_forma_pending()\n"),
 ]
 
 
