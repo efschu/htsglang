@@ -521,7 +521,12 @@ def serve(cache: Any, pool: Any, arena: Any, need: int, read_key: Any = None) ->
     c["mine_pinned"] = mine
     n = _ST.served + 1
     _ST.served = n
+    # ROOM-VERDICTS 1016 (F2): this rank's answer goes into the shared file -- the fills end a wait no rank can
+    # answer on that fact (weg2/room_verdicts.py), not on their idle bound
+    from sglang.srt.weg2 import room_verdicts as _rv
+
     if d <= 0:
+        _rv.note_verdict(arena, 0, _rv.transient_blocked(cache), False)
         _ST.served_empty += 1
         if n <= 16 or n % 64 == 0:
             logger.info("%s SERVE n=%d need=%d deficit=0 slots=%d complete=%d claimed=%d pinned=%d free=%d "
@@ -530,10 +535,12 @@ def serve(cache: Any, pool: Any, arena: Any, need: int, read_key: Any = None) ->
                         c["complete"], c["claimed"], c["pinned"], c["free"], c["clock"], mine)
         return 0
     slots: List[int] = []
+    _quiet = _rv.spill_quiet(cache)     # read BEFORE the spill: in its empty backoff it answers 0 without looking
     if _spill_takes_out(cache):
         released = int(cache._w3_arena_spill(pool, d, released_out=slots) or 0)
     else:
         released = int(cache._w3_arena_spill(pool, d) or 0)
+    _rv.note_verdict(arena, released, _rv.transient_blocked(cache), _quiet)
     _note_released(read_key, arena, slots)
     _ST.spilled_pages += released
     _ST.serve_log.append((n, released))

@@ -39,6 +39,26 @@ MUTANTS = [
     ("F3g the arrival number is ignored (registration order)", ARB,
      "    return (k if k else (1 << 62) + _A.first_seen[h], _A.first_seen[h])",
      "    return (_A.first_seen[h], 0)", T_F3),
+    # F2 ROOM-VERDICTS: a wait no P rank can answer ends on that fact
+    ("F2r RED: the base behaviour (verdicts switched off = the old wait byte for byte)", RV,
+     "def enabled() -> bool:\n    raw = (os.environ.get(ENV, \"\") or \"\").strip().lower()\n",
+     "def enabled() -> bool:\n    return False\n    raw = (os.environ.get(ENV, \"\") or \"\").strip().lower()\n", T_F2),
+    ("F2a one rank's answer is enough", RV, "    if len(fresh) < pp_size:\n        return None\n", "", T_F2),
+    ("F2b a write in flight does not hold the wait", RV,
+     "    if any(r or tr or q for _p, _t, r, tr, q in fresh.values()):",
+     "    if any(r or q for _p, _t, r, tr, q in fresh.values()):", T_F2),
+    ("F2c a spill in its backoff counts as having looked", RV,
+     "    if any(r or tr or q for _p, _t, r, tr, q in fresh.values()):",
+     "    if any(r or tr for _p, _t, r, tr, q in fresh.values()):", T_F2),
+    ("F2d answers from before the last progress count", RV, "        if v[1] > int(since_ms):\n", "        if True:\n",
+     T_F2),
+    ("F2e the serve writes no verdict", RR,
+     "    _rv.note_verdict(arena, released, _rv.transient_blocked(cache), _quiet)\n", "", T_F2),
+    ("F2f the fill never asks", HS, "                ev = _room_verdicts.futile(arena, rv[0])\n",
+     "                ev = None\n", T_F2),
+    ("F2g transient ignores the load-back host lock", RV,
+     "                    or any(int(getattr(cd, \"host_lock_ref\", 0) or 0) > 0 for cd in node.component_data)):",
+     "                    or False):", T_F2),
 ]
 
 
