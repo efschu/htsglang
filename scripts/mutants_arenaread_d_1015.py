@@ -51,11 +51,9 @@ MUTANTS = [
      '        if not serves(cache) or form_a_role() == "host":\n', '        if not serves(cache):\n'),
     ("N2 the workers never learn l3_present (B1)", RR, "        _r12.record_l3(cache, node)\n", ""),
     ("N3 an unpaired page counts as copied (B3)", RR,
-     '    if int(sec.get("unpaired", 0)):\n        return False\n    pages = int(sec.get("pages", 0))',
-     '    pages = int(sec.get("pages", 0))'),
+     "    if unpaired and _l3_strict():\n        return False\n", ""),
     ("N4 a page neither on disk nor written counts as copied (B3)", RR,
-     '    return pages > 0 and pages == need and int(sec.get("on_disk", 0)) + int(sec.get("written", 0)) == need',
-     '    return pages > 0 and pages == need'),
+     "    return pages > 0 and pages == need and copied == need", "    return pages > 0 and pages == need"),
     ("N5 a node with children is spilled (B4)", RR,
      '        if node.children:\n            # review readroomd B4', '        if False:\n            # review readroomd B4'),
     ("N6 a node with a Mamba device state is spilled (B4)", RR,
@@ -71,6 +69,34 @@ MUTANTS = [
     ("N11 TP0 releases inside the pass, not at the broadcast (B2)", RR,
      "        _ST.d_pending.append((cache, node, hv))\n",
      "        _ST.d_pending.append((cache, node, hv))\n        flush_forma_pending()\n"),
+    # review readroomd2: the reviewer's R2M1-R2M4 (guards of the Form A L3-DROP) as source mutants, and the round's own
+    ("R2M1 the Form A drop ignores children", UR,
+     "        if node.children or node.id in self.ongoing_write_through \\\n",
+     "        if node.id in self.ongoing_write_through \\\n"),
+    ("R2M2 the Form A drop takes a Mamba device anchor", UR,
+     "        if mamba is not None and node.component_data[mamba].value is not None:\n            return False   # an anchor",
+     "        if False:\n            return False   # an anchor"),
+    ("R2M3 the Form A drop ignores a write in flight", UR,
+     "        if node.children or node.id in self.ongoing_write_through \\\n"
+     "                or getattr(node, \"write_through_pending_id\", None) is not None:\n            return False\n"
+     "        if any(int(getattr(cd, \"lock_ref\"",
+     "        if node.children:\n            return False\n        if any(int(getattr(cd, \"lock_ref\""),
+    ("R2M4 the drop ignores l3_present", UR,
+     "        if not getattr(node, \"l3_present\", False) or node.backuped:\n            return False\n"
+     "        if not UnifiedRadixCache._weg2_ud_ack_drain_on():\n            return False\n        from sglang.srt.weg2 import pp_slot_fidelity as _sf\n\n        if _r12.role()",
+     "        if node.backuped:\n            return False\n"
+     "        if not UnifiedRadixCache._weg2_ud_ack_drain_on():\n            return False\n        from sglang.srt.weg2 import pp_slot_fidelity as _sf\n\n        if _r12.role()"),
+    ("R2N1 an unkeyed node is a candidate (A2)", RR,
+     "        if _r12.node_key(node) is None:\n            # review readroomd2 A2", "        if False:\n            # review readroomd2 A2"),
+    ("R2N2 the flush releases an unkeyed node (A2)", RR,
+     "                or _r12.node_key(node) is None      # review readroomd2 A2", "                or False      # review readroomd2 A2"),
+    ("R2N3 the page count follows STRICT (A3)", RR,
+     "    return pages > 0 and pages == need and copied == need", "    return pages > 0 and (pages == need and copied == need or not _l3_strict())"),
+    ("R2N4 a pending READ-ROOM STATE is not named (A4)", FS,
+     "            _rrstate_diverged(node, h, depth, out, seq)\n", "            pass\n"),
+    ("R2N5 no verdict when the release fails (A7)", RR,
+     "        try:\n            out += _release(cache, node, base, aux) // P\n        finally:\n",
+     "        if True:\n            out += _release(cache, node, base, aux) // P\n        if True:\n"),
 ]
 
 

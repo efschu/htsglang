@@ -351,7 +351,7 @@ def test_tp0_releases_only_l3_backed_childless_device_copies_through_the_real_fu
     assert _released(tp0) == [1] and _released(worker) == [1], (_released(tp0), _released(worker))
     assert tp0._t_nodes[1].l3_present and worker._t_nodes[1].l3_present
     kinds = [(e[0], e[1]) for e in v[0].events]
-    assert (R12.STATE, "h1_7") in kinds and (R12.L3, "h1_7") in kinds, kinds
+    assert (R12.RRSTATE, "h1_7") in kinds and (R12.L3, "h1_7") in kinds, kinds
 
 
 def types_ns(**kw):
@@ -609,3 +609,264 @@ def test_at_the_broadcast_only_childless_anchorless_nodes_go(tmp_path, roles):
     assert rr.post(arena, 24, read_id=9)
     _broadcast(roles, tp0, worker)
     assert _released(tp0) == _released(worker) == [1], (_released(tp0), _released(worker))
+
+
+# --- review readroomd2 (wf_06e24d8f-8f0): the reviewer's probes R2_1-R2_4, R2_5b, R2_6, R2_7, R2_8, taken over
+# unchanged (R2_5, the open pending window, stays out: it is named, not stopped -- review A4 -- and R2_5b pins that
+# the window closes). Source: /spinning/wt-rev2-readroomd-1016/.../test_rev2_arenaread_d_1016.py
+
+def _store(tmp_path, n):
+    root = tmp_path / "store"
+    root.mkdir(exist_ok=True)
+    for s in range(n):
+        (root / f"s{s}.bin").write_bytes(b"\x01")
+    return str(root), {s: f"s{s}" for s in range(n)}
+
+
+def _attached(t, node):
+    return R12._attached(node) and any(c is node for c in node.parent.children.values())
+
+
+def _store_backed_leaf_with(tmp_path, roles, extra=None):
+    """TP0 tree with node 1 (8 tokens) l3_present, no host copy (the state after a READ-ROOM-D spill), write_back."""
+    me = threading.current_thread().name
+    roles.now[me] = "host"
+    t = _real_d_tree([(1, list(range(8)))], None, "tp0")
+    t.cache_controller = _WbController()
+    n = t._t_nodes[1]
+    n.component_data[FULL].host_value = None
+    n.l3_present = True
+    if extra is not None:
+        extra(t, n)
+
+    def no_claim(*a, **k):
+        return 0
+
+    t.write_backup = no_claim
+    return t, n
+
+
+def test_R2_1_forma_drop_never_orphans_a_host_only_child(tmp_path, roles):
+    """A device leaf may carry host-only children (_is_device_leaf looks at device children only). The Form A
+    L3-DROP must not delete such a node -- its children would be cut off the tree (#841)."""
+    def add_host_child(t, n):
+        t.insert(InsertParams(key=RadixKey(list(range(1, 13)), None),
+                              value=t._t_alloc.alloc(12).to(dtype=torch.int64)))
+        child = next(iter(n.children.values()))
+        child.component_data[FULL].host_value = torch.tensor([90, 91, 92, 93], dtype=torch.int64)
+        child.component_data[FULL].value = None
+    t, n = _store_backed_leaf_with(tmp_path, roles, add_host_child)
+    assert n.children
+    tracker = {ct: 0 for ct in t.tree_components}
+    dropped = UnifiedRadixCache._weg2_l3_drop(t, n, tracker)
+    assert not dropped and _attached(t, n), (dropped, _attached(t, n))
+
+
+def test_R2_2_forma_drop_never_takes_a_mamba_anchor(tmp_path, roles):
+    """D-NORECOMPUTE: a node carrying a Mamba state on the device leaves the device only with a backup."""
+    def add_anchor(t, n):
+        n.component_data[MAMBA].value = torch.tensor([4], dtype=torch.int64)
+    t, n = _store_backed_leaf_with(tmp_path, roles, add_anchor)
+    tracker = {ct: 0 for ct in t.tree_components}
+    dropped = UnifiedRadixCache._weg2_l3_drop(t, n, tracker)
+    assert not dropped and _attached(t, n)
+
+
+def test_R2_3_forma_drop_waits_for_a_write_in_flight(tmp_path, roles):
+    def busy(t, n):
+        t.ongoing_write_through[4711] = (n, None, [n])
+        n.write_through_pending_id = 4711
+    t, n = _store_backed_leaf_with(tmp_path, roles, busy)
+    tracker = {ct: 0 for ct in t.tree_components}
+    dropped = UnifiedRadixCache._weg2_l3_drop(t, n, tracker)
+    t.ongoing_write_through.clear()
+    assert not dropped and _attached(t, n)
+
+
+def test_R2_4_forma_drop_never_takes_a_node_that_is_not_in_the_store(tmp_path, roles):
+    """D-NORECOMPUTE: an un-backed device leaf WITHOUT l3_present has its KV nowhere else -- never dropped."""
+    def not_in_l3(t, n):
+        n.l3_present = False
+    t, n = _store_backed_leaf_with(tmp_path, roles, not_in_l3)
+    tracker = {ct: 0 for ct in t.tree_components}
+    dropped = UnifiedRadixCache._weg2_l3_drop(t, n, tracker)
+    assert not dropped and _attached(t, n)
+
+
+def test_R2_6_an_unkeyed_node_is_never_released_without_a_verdict(tmp_path, roles):
+    """record_state / record_l3 drop an unkeyed node silently (no hash_value: 'unkeyed state' warning, no event).
+    l3_complete takes need = pages when hash_value is empty -- so TP0 would drop the host rows and set l3_present
+    while no verdict reaches the worker."""
+    rr = _rr()
+    me = threading.current_thread().name
+    root, stem_of = _store(tmp_path, 8)
+    spans = [(1, list(range(8)))]
+    tp0 = _real_d_tree(spans, None, "tp0")
+    worker = _real_d_tree(spans, None, "worker")
+    for t in (tp0, worker):
+        t._t_nodes[1].hash_value = None
+    roles.now[me] = "host"
+    rr.form_a_spill(tp0, _Pool(None, stem_of, root), 1)
+    _broadcast(roles, tp0, worker)
+    a, b = tp0._t_nodes[1], worker._t_nodes[1]
+    assert (a.backuped, a.l3_present) == (b.backuped, b.l3_present), ((a.backuped, a.l3_present),
+                                                                      (b.backuped, b.l3_present))
+
+
+class _PartialPool(_Pool):
+    """secure_rows_to_l3 as for a node with 2 of 8 pages not COMPLETE (an owner's write unfinished): they drop out
+    of ``pages``; lost 0, unpaired 0."""
+
+    def secure_rows_to_l3(self, hv):
+        return {"pages": 6, "on_disk": 6, "written": 0, "lost": 0, "unpaired": 0}
+
+
+def test_R2_7_strict_off_never_releases_a_node_with_unfinished_pages(tmp_path, roles):
+    """SGLANG_WEG2_L3_PRESENT_STRICT=0 is H16P A2's switch for UNPAIRED pages. With it off, l3_complete returns
+    ``pages > 0`` -- the page-count check (a page some owner has not finished) goes too, in form_a_spill only
+    (_w3_arena_spill keeps its Form A ``pages < len(hash_value)`` check, spill_host_only its ``pages != len``)."""
+    rr = _rr()
+    me = threading.current_thread().name
+    root, stem_of = _store(tmp_path, 8)
+    tp0 = _real_d_tree([(1, list(range(8)))], None, "tp0")
+    roles.now[me] = "host"
+    with envs.SGLANG_WEG2_L3_PRESENT_STRICT.override(False):
+        got = rr.form_a_spill(tp0, _PartialPool(None, stem_of, root), 1)
+        rr.flush_forma_pending()
+    assert got == 0 and not tp0._t_nodes[1].l3_present, (got, tp0._t_nodes[1].l3_present)
+
+
+def test_R2_5b_the_window_closes_when_the_pending_state_applies(tmp_path, roles):
+    """Companion of R2_5 (expected GREEN): the next broadcast after the worker's lock is gone applies the pending
+    STATE; the worker's host leaf is deleted -> both trees agree again. The difference lives exactly one pending
+    window long."""
+    rr = _rr()
+    me = threading.current_thread().name
+    root, stem_of = _store(tmp_path, 8)
+    spans = [(1, list(range(8)))]
+    tp0 = _real_d_tree(spans, None, "tp0")
+    worker = _real_d_tree(spans, None, "worker")
+    roles.now[me] = "host"
+    rr.form_a_spill(tp0, _Pool(None, stem_of, root), 1)
+    wn = worker._t_nodes[1]
+    wn.component_data[FULL].host_lock_ref = 1
+    _broadcast(roles, tp0, worker)
+    wn.component_data[FULL].host_lock_ref = 0
+    for t, role in ((tp0, "host"), (worker, "worker")):
+        roles.now[me] = role
+        t.cache_controller = _WbController()
+        t.write_backup = lambda *a, **k: 0
+        t._evict_device_leaf(t._t_nodes[1], {ct: 0 for ct in t.tree_components})
+    _broadcast(roles, tp0, worker)          # empty verdict list: the worker re-applies its pending STATE
+    assert _attached(tp0, tp0._t_nodes[1]) == _attached(worker, wn) is False
+
+
+class _DirectPool:
+    """The arena KV host pool as ``_weg2_direct_complete`` reads it at a worker's own direct-write ack: the page is
+    NOT completed for all owners yet (metal h16q2 D: ``#1427 DIRECT-WRITE ACK node=32 ... completed_for_all=0`` on
+    TP1)."""
+    staging_rows = 0
+    arena = object()
+
+    def complete_write(self, hv):
+        return 0
+
+    def settle_lost_rows(self, hv, hashes):
+        return {}
+
+
+class _DirectCC:
+    write_policy = "write_back"
+
+    def __init__(self):
+        self.mem_pool_host = _DirectPool()
+
+
+def test_R2_8_a_worker_never_drops_a_device_leaf_tp0_keeps(tmp_path, roles):
+    """THE #791b SHAPE, new with _weg2_l3_drop_forma. Per-rank arena claims (K10: 'TP1's claims needed 1409 pages,
+    TP0's only 12'): TP0's backup of node 1 was refused (#1421 -> record_state, 'a worker may back it up'), the
+    worker's own direct write landed. At the worker's OWN ack the real ``_weg2_direct_complete`` sets
+    ``l3_present = True`` unconditionally (line 6386; completed_for_all=0) -- the writer K12b H1 did not route over
+    R12. TP0's STATE (kv=0) then drops the worker's host rows. Both nodes: device-resident, un-backed; l3_present
+    TP0 False, worker True. Device eviction at a full arena: TP0 asks write_backup (refused) and KEEPS the device
+    rows, the worker takes the Form A L3-DROP and FREES them. Before 844e0aea3e both kept them."""
+    me = threading.current_thread().name
+    spans = [(1, list(range(8)))]
+    tp0 = _real_d_tree(spans, None, "tp0")
+    worker = _real_d_tree(spans, None, "worker")
+    a, b = tp0._t_nodes[1], worker._t_nodes[1]
+    a.component_data[FULL].host_value = None            # TP0's claim was refused: no host copy on TP0
+    roles.now[me] = "worker"
+    worker.cache_controller = _DirectCC()
+    UnifiedRadixCache._weg2_direct_complete(worker, b)   # the worker's own direct-write ack
+    roles.now[me] = "host"
+    tp0.cache_controller = _WbController()
+    UnifiedRadixCache._1421_refused(tp0, "arena_claim", a)   # R12: TP0 sends its state (no KV host)
+    _broadcast(roles, tp0, worker)
+    state = ((a.backuped, a.l3_present), (b.backuped, b.l3_present))
+    freed = {}
+    for t, role in ((tp0, "host"), (worker, "worker")):
+        roles.now[me] = role
+        t.cache_controller = _WbController()
+        t.write_backup = lambda *a_, **k: 0             # the full arena refuses every new claim
+        tracker = {ct: 0 for ct in t.tree_components}
+        t._evict_device_leaf(t._t_nodes[1], tracker)
+        freed[role] = tracker[FULL]
+    assert freed["host"] == freed["worker"], (state, freed)
+
+
+def test_a_failing_release_still_sends_the_verdict_of_what_was_done(tmp_path, roles):
+    """Review readroomd2 A7: an exception inside the release (after the aux host state went) still sends the
+    READ-ROOM STATE, which reads the node's ACTUAL flags -- TP0 never changes alone."""
+    import pytest
+
+    rr = _rr()
+    roles.now[threading.current_thread().name] = "host"
+    root = tmp_path / "store"
+    root.mkdir()
+    for s_ in range(8):
+        (root / f"s{s_}.bin").write_bytes(b"\x01")
+    tp0 = _real_d_tree([(1, list(range(8)))], None, "tp0", aux=True)
+    node = tp0._t_nodes[1]
+    node.component_data[SWA].value = torch.tensor([1], dtype=torch.int64)
+    node.component_data[SWA].host_value = torch.tensor([9], dtype=torch.int64)
+    rr.form_a_spill(tp0, _Pool(None, {s_: f"s{s_}" for s_ in range(8)}, str(root)), 1)
+    real = UnifiedRadixCache._evict_component_and_detach_lru
+
+    def boom(self_, n, comp, target=EvictLayer.DEVICE, tracker=None):
+        if getattr(comp, "component_type", comp) == FULL:
+            raise RuntimeError("release failed")
+        return real(self_, n, comp, target=target, tracker=tracker)
+
+    with mock.patch.object(UnifiedRadixCache, "_evict_component_and_detach_lru", boom), \
+            pytest.raises(RuntimeError):
+        rr.flush_forma_pending()
+    events = [e for e in R12._S.ledger if e[0] == R12.RRSTATE]
+    assert events and events[-1][4] == 1, (events, "the verdict says what TP0 holds: KV host rows still there")
+    assert not node.l3_present and not any(e[0] == R12.L3 for e in R12._S.ledger)
+
+
+def test_a_read_room_state_that_stays_pending_on_a_worker_is_named(tmp_path, roles, caplog):
+    """Review readroomd2 A4: the worker's node is busy at consume (its own store write) -- the READ-ROOM STATE stays
+    pending and is NAMED (READ-ROOM-STATE-DIVERGED out=pending); the next broadcast applies it."""
+    import logging
+
+    rr = _rr()
+    me = threading.current_thread().name
+    root = tmp_path / "store"
+    root.mkdir()
+    for s_ in range(8):
+        (root / f"s{s_}.bin").write_bytes(b"\x01")
+    spans = [(1, list(range(8)))]
+    tp0 = _real_d_tree(spans, None, "tp0")
+    worker = _real_d_tree(spans, None, "worker")
+    roles.now[me] = "host"
+    rr.form_a_spill(tp0, _Pool(None, {s_: f"s{s_}" for s_ in range(8)}, str(root)), 1)
+    worker._t_nodes[1].component_data[FULL].host_lock_ref = 1
+    with caplog.at_level(logging.WARNING):
+        _broadcast(roles, tp0, worker)
+    msgs = [r.getMessage() for r in caplog.records if "READ-ROOM-STATE-DIVERGED" in r.getMessage()]
+    assert msgs and "out=pending" in msgs[-1], msgs
+    worker._t_nodes[1].component_data[FULL].host_lock_ref = 0
+    _broadcast(roles, tp0, worker)
+    assert _released(worker) == [1]
