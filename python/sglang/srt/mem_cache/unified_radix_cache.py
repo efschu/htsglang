@@ -5889,7 +5889,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     #: refusal does not walk the tree again for this long
     W3_SPILL_EMPTY_BACKOFF_S = 0.5
 
-    def _w3_arena_spill(self, pool, need_pages: int, claimer=None) -> int:
+    def _w3_arena_spill(self, pool, need_pages: int, claimer=None, released_out=None) -> int:
         """W3-ARENA (kvs2 0929, bs2 x 240k, P PP0 12:30:55): the arena was
         full, and every COMPLETE slot carried THIS tree's reference
         (ARENA-REF-HOLDERS tree=5419 of 5461 slots, tree_in_use=0). The claim's
@@ -5921,7 +5921,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         rank that holds it); the reference count prefers the pages a peer has
         already begun to release, so the last rank to let go frees the slot.
         No collective, no reserve, no new state: every rank orders by the same
-        header it reads. Returns the pages released here."""
+        header it reads. Returns the pages released here; ``released_out`` (a
+        list) gets the arena slots whose reference this rank let go (READ-ROOM
+        review A3: a re-post of the same read never spills again for them)."""
         if pool is None or getattr(pool, "arena", None) is None:
             return 0
         if not hasattr(pool, "secure_rows_to_l3"):
@@ -6010,7 +6012,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
             if _hos.armed(self):
                 released += _hos.spill_host_only(
-                    self, pool, max(int(need_pages) - released, self.W3_SPILL_MIN_PAGES), P, skip)["released"]
+                    self, pool, max(int(need_pages) - released, self.W3_SPILL_MIN_PAGES), P, skip,
+                    released_out=released_out)["released"]
         k = getattr(self, "_w3_spill_n", 0) + 1
         self._w3_spill_n = k
         if released == 0:
@@ -6025,6 +6028,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 "not spilled because their drop could not clear a host-only child now)",
                 k, int(need_pages), released, spilled, len(cands), secured, written, lost,
                 self._w3_spill_ref_free(pool, released_slots), kept_payable)
+        if released_out is not None:
+            released_out.extend(released_slots)
         return released
 
     def _w3_keep_payable_state(self):

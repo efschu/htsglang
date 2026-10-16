@@ -129,7 +129,8 @@ def _eligible(cache: Any, node: Any, pool: Any, skip: set) -> bool:
     return _reason(cache, node, pool, skip) is None
 
 
-def spill_host_only(cache: Any, pool: Any, want: int, page_size: int, skip: set) -> Dict[str, int]:
+def spill_host_only(cache: Any, pool: Any, want: int, page_size: int, skip: set,
+                    released_out: Optional[list] = None) -> Dict[str, int]:
     """Spill host-only H-leaves until ``want`` pages were released here (group-equal
     order, see ``UnifiedRadixCache._w3_arena_spill``; node-id order where the
     arena names no slot). Returns the counts; the log line names them (27B loop, no census)."""
@@ -165,6 +166,9 @@ def spill_host_only(cache: Any, pool: Any, want: int, page_size: int, skip: set)
             continue
         on_disk += int(sec.get("on_disk", 0))
         written += int(sec.get("written", 0))
+        if released_out is not None:
+            # READ-ROOM review A3: the slots this leaf's rows name, read before the leaf goes
+            released_out.extend(cache._w3_spill_keys(pool, [node]).slots_of(node))
         parent = node.parent
         tracker = {ct: 0 for ct in cache.tree_components}
         cache._evict_host_leaf(node, tracker)

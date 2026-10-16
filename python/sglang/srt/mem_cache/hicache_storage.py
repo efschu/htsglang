@@ -4095,9 +4095,11 @@ class HiCacheFile(HiCacheStorage):
             # READ-ROOM 1015: the clock found nothing -- every slot carries a tree/hold reference. Ask the trees
             # (every PP rank's scheduler) for the deficit before and while this fill waits; the read is never cut
             # at a full arena that holds L3-backed copies (weg2/read_room.py).
-            _read_room.post(arena, len(still_full), site="fill")
+            # review A3: one read id per fill, carried by every re-post (a peer rank never spills twice for it)
+            _rr_id = _read_room.new_read_id(stems)
+            _read_room.post(arena, len(still_full), site="fill", read_id=_rr_id)
             _room = self._await_fill_room(arena, still_full, int(total_bytes), out, joined,
-                                          stats=stats)
+                                          stats=stats, read_id=_rr_id)
             if _room:
                 self._arena_fill_read_todo(arena, _room, int(total_bytes), out, stats)
         if joined:
@@ -4199,7 +4201,7 @@ class HiCacheFile(HiCacheStorage):
                 return i
         return n
 
-    def _await_fill_room(self, arena, still_full, total_bytes: int, out, joined, stats=None) -> list:
+    def _await_fill_room(self, arena, still_full, total_bytes: int, out, joined, stats=None, read_id=None) -> list:
         """ROOM-WAIT: re-evict and re-claim the stems that found the arena FULL
         until each gets a slot or ``fill_room_wait_ms()`` is spent. Returns the
         fresh claims (todo entries); a stem another writer claimed meanwhile
@@ -4225,13 +4227,37 @@ class HiCacheFile(HiCacheStorage):
         read_now = 0
         rounds = 0
         _served0 = _read_room._ST.served
+        # review A1: an armed room wait is a lifesign of this read (PP0's told Frist does not age it as idleness)
+        _rr_iv = _read_room.room_wait_begin(arena)
+        try:
+            pend, got, read_now, rounds = self._await_fill_room_loop(
+                arena, pend, got, int(total_bytes), out, joined, stats, live, idle_ms, deadline, last_move,
+                read_now, rounds, read_id)
+        finally:
+            _read_room.room_wait_end(_rr_iv)
+        _ROOM_WAIT_N[0] += 1
+        k = _ROOM_WAIT_N[0]
+        if pend:
+            _read_room.note_short(arena, len(pend), rounds, (time.perf_counter() - t0) * 1000.0, _served0)
+        if k <= 16 or (k & (k - 1)) == 0 or pend:
+            logger.info("L3-FILL ROOM-WAIT n=%d stems=%d claimed=%d still_full=%d rounds=%d waited_ms=%.0f "
+                        "bound_ms=%d (the arena was FULL for these stems: evict + claim again instead of "
+                        "ending the prefix; prefetch io thread only)",
+                        k, len(still_full), len(got) + read_now, len(pend), rounds,
+                        (time.perf_counter() - t0) * 1000.0, int(wait_ms))
+        return got
+
+    def _await_fill_room_loop(self, arena, pend, got, total_bytes, out, joined, stats, live, idle_ms, deadline,
+                              last_move, read_now, rounds, read_id):
+        """The rounds of ``_await_fill_room`` (split out so the room-wait lifesign closes in a ``finally``)."""
         while pend and time.perf_counter() < deadline:
             if live and time.perf_counter() - last_move >= idle_ms / 1000.0:
                 break
             time.sleep(0.025)
             rounds += 1
             if rounds % 40 == 0:
-                _read_room.post(arena, len(pend), site="room_wait")   # paced inside; a lost post is re-asked
+                # paced inside; a lost post is re-asked; the same read id (review A3)
+                _read_room.post(arena, len(pend), site="room_wait", read_id=read_id)
             try:
                 self._arena_evict_to_disk(arena, max(256, len(pend)), need=len(pend))
             except Exception:  # noqa: BLE001
@@ -4264,17 +4290,7 @@ class HiCacheFile(HiCacheStorage):
                 read_now += len(got)
                 got = []
             pend = nxt
-        _ROOM_WAIT_N[0] += 1
-        k = _ROOM_WAIT_N[0]
-        if pend:
-            _read_room.note_short(arena, len(pend), rounds, (time.perf_counter() - t0) * 1000.0, _served0)
-        if k <= 16 or (k & (k - 1)) == 0 or pend:
-            logger.info("L3-FILL ROOM-WAIT n=%d stems=%d claimed=%d still_full=%d rounds=%d waited_ms=%.0f "
-                        "bound_ms=%d (the arena was FULL for these stems: evict + claim again instead of "
-                        "ending the prefix; prefetch io thread only)",
-                        k, len(still_full), len(got) + read_now, len(pend), rounds,
-                        (time.perf_counter() - t0) * 1000.0, int(wait_ms))
-        return got
+        return pend, got, read_now, rounds
 
     def _arena_fill_read_todo(self, arena, todo, total_bytes: int, out, stats) -> None:
         """#1433: read this fill's OWN claims from disk into their slots and

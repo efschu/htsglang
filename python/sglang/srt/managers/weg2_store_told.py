@@ -1424,6 +1424,16 @@ PACE_CAP_S_DEFAULT = 10.0
 _clock = time.monotonic
 
 
+def _read_room_lifesign(since: float, until: float) -> float:
+    """READ-ROOM review A1: seconds of [since, until] PP0 spent in armed room waits (0 when READ-ROOM is absent)."""
+    try:
+        from sglang.srt.weg2 import read_room as _rr
+
+        return float(_rr.lifesign_s(since, until))
+    except Exception:  # noqa: BLE001 - no ledger: the old Frist
+        return 0.0
+
+
 def _paced_env() -> bool:
     # RG 26.09.: unset = the registry row (weg2/form.py PREFIX_SWITCHES).
     from sglang.srt.weg2.form import prefix_switch_armed
@@ -1711,7 +1721,8 @@ def _pp0_publish_paced(scheduler, recv_reqs: List) -> List:
         _extra = {"absolute": absolute, "keys_digest": _pp0_keys_digest(req)}
         _fork = _pp0_fork(scheduler, req, rid)
         held.pop(rid, None)
-        own_read_s = now - intake_t.pop(rid, now)
+        _intake = intake_t.pop(rid, now)
+        own_read_s = now - _intake
         if told <= 0:
             # nothing to read on any rank: single-phase, as before
             told_map[rid] = told
@@ -1739,7 +1750,18 @@ def _pp0_publish_paced(scheduler, recv_reqs: List) -> List:
             # PF: ask the followers for their read state (wire marker, set
             # only here) and start the Frist.
             setattr(ahead, _fb.WIRE_ACK, 1)
-            _frist = _fb.pp0_open(scheduler, rid, told, now, own_read_s, window, published_pass=pass_n)
+            # READ-ROOM review A1: PP0's armed room waits inside this rid's reads are a lifesign (see deadline)
+            _room_s = _read_room_lifesign(_intake, now)
+            _frist = _fb.pp0_open(scheduler, rid, told, now, own_read_s, window, published_pass=pass_n,
+                                  room_wait_s=_room_s)
+            if _room_s > 0.0:
+                n_rl = getattr(scheduler, "_rr_lifesign_n", 0) + 1
+                scheduler._rr_lifesign_n = n_rl
+                if n_rl <= _LOG_FIRST or n_rl % _LOG_EVERY == 0:
+                    logger.info(
+                        "READ-ROOM TOLD-LIFESIGN rid=%s told=%d own_read=%.2fs room_wait=%.2fs frist=%.2fs (n=%d): "
+                        "PP0's armed room waits are a lifesign of the read -- the intake+TOTAL clamp of the Frist "
+                        "moves by them (capped by the absolute ceiling)", rid, told, own_read_s, _room_s, _frist, n_rl)
             n_fb = getattr(scheduler, "_pf_open_n", 0) + 1
             scheduler._pf_open_n = n_fb
             if n_fb <= _LOG_FIRST or n_fb % _LOG_EVERY == 0:
