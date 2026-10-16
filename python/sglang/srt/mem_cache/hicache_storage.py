@@ -4406,8 +4406,12 @@ class HiCacheFile(HiCacheStorage):
         if os.environ.get("SGLANG_WEG2_L3_REFRESH_KEPT", "1").strip().lower() in ("0", "false", "no", "off", ""):
             return 0
         ev = getattr(self, "_evictor", None)
-        if ev is None or not stems:
+        # review anchor0 B1: only the eviction OWNER keeps an LRU -- on every
+        # other rank (PP1/PP2, TP1/TP2, the sibling group) touch is a no-op, so
+        # nothing is computed there at all
+        if ev is None or not stems or not getattr(ev, "enabled", False):
             return 0
+        lru = getattr(ev, "_lru", None)
         n = 0
         for stem in dict.fromkeys(stems):
             group = [stem]
@@ -4416,8 +4420,14 @@ class HiCacheFile(HiCacheStorage):
             except Exception:  # noqa: BLE001 - no sidecar map, the page alone
                 pass
             for st in group:
+                if not mtime and lru is not None and st not in lru:
+                    # the in-memory form (claim room, scheduler thread) promotes
+                    # tracked entries only -- adopting an untracked file is an
+                    # os.stat, and this form does no disk I/O
+                    continue
                 try:
-                    ev.touch(st, self._existing_path(st), mtime=mtime)
+                    # the path is computed (_sharded_path), never stat'ed
+                    ev.touch(st, self._sharded_path(st), mtime=mtime)
                     n += 1
                 except Exception:  # noqa: BLE001 - recency is best effort
                     continue
@@ -4491,8 +4501,10 @@ class HiCacheFile(HiCacheStorage):
             self._ensure_shard_dir(path)
             todo.append((stem, slot, total, path))
         # ZERO-ANCHOR 1015: a page leaving L2 because L3 holds it makes that copy
-        # the only one -- MRU for this owner's LRU (in memory: the claim room runs
-        # on the scheduler thread, no disk I/O there -- H81)
+        # the only one -- MRU in the OWNER's LRU (victim promotion for every L2
+        # clearing with an L3 copy, not only kept spans). Owner rank only; the
+        # in-memory form promotes tracked entries only and touches no file
+        # (path computed, no stat, no utime) -- review anchor0 B1
         out["refreshed"] = self._l3_refresh_kept(_relied, mtime=False)
         if todo and pio is not None:
             statuses = pio.write_pages(

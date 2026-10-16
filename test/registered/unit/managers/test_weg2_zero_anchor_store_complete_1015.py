@@ -350,3 +350,32 @@ def test_every_evicted_l3_file_is_named(tmp_path, monkeypatch, caplog, _awake_ga
     assert any(m.startswith("L3-EVICT-FILE SUMMARY") and "suppressed=" in m for m in caplog.messages)
     first = lines[0]
     assert stems[0] in first or twins[0] in first, "the oldest file goes first and is named"
+
+
+# --- review anchor0 Auflage 2 (B1): owner only, no stat on the scheduler form ---
+
+@pytestmark_gcc
+def test_refresh_on_a_non_owner_rank_does_nothing(tmp_path, monkeypatch, _awake_gate):
+    qs, be, stems, twins, young = _parked_on_old_copies(tmp_path, monkeypatch)
+    monkeypatch.setattr(type(be._evictor), "enabled", property(lambda self: False))
+    called = []
+    monkeypatch.setattr(be, "_l3_sidecar_stems", lambda s: called.append(s) or [])
+    assert be._l3_refresh_kept(stems, mtime=False) == 0
+    assert called == [], "a non-owner computes nothing"
+
+
+@pytestmark_gcc
+def test_claim_room_refresh_touches_no_file(tmp_path, monkeypatch, _awake_gate):
+    """The in-memory form (claim room, scheduler thread): computed paths, no
+    _existing_path / os.stat / utime, tracked entries only."""
+    import os as _os
+
+    qs, be, stems, twins, young = _parked_on_old_copies(tmp_path, monkeypatch)
+    monkeypatch.setattr(be, "_existing_path", lambda st: (_ for _ in ()).throw(AssertionError("stat path")))
+    real_stat, real_utime = _os.stat, _os.utime
+    io = []
+    monkeypatch.setattr(_os, "stat", lambda p, *a, **k: (io.append(("stat", p)), real_stat(p, *a, **k))[1])
+    monkeypatch.setattr(_os, "utime", lambda p, *a, **k: (io.append(("utime", p)), real_utime(p, *a, **k))[1])
+    n = be._l3_refresh_kept(stems + ["not-tracked-stem" + qs.SFX], mtime=False)
+    assert n == 2 * qs.PAGES and io == []
+    assert set(_oldest(be, qs.PAGES)) == set(young)
