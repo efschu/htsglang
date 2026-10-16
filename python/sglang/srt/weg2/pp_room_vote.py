@@ -74,6 +74,10 @@ class Weg2PpRoomFact(msgspec.Struct, frozen=True):
     payable: int
     reported: int
     sim_us: float = 0.0
+    #: ``forward_iter`` of the newest pass whose RESULT this stage has processed (``process_batch_result``: its rows are
+    #: freed / its finish applied). ``executed`` counts forwards; this counts consumed results, the event that releases the
+    #: rows a finishing request locked (review A1 of the intake fix). Wire-compatible: -1 = a sender without it.
+    processed: int = -1
 
 
 class Weg2PpRoomFactLane(Weg2PpRoomFact, frozen=True):
@@ -229,7 +233,7 @@ def backup_room_tokens(pool) -> int:
 
 
 def follower_fact(*, tree, allocator, rank: int, executed: int, local_floor: bool,
-                  lane_floor: int = -1, lane_epoch: int = -1) -> Weg2PpRoomFact:
+                  lane_floor: int = -1, lane_epoch: int = -1, processed: int = -1) -> Weg2PpRoomFact:
     from sglang.srt.mem_cache.common import payable_evictable_or
 
     available = int(allocator.available_size())
@@ -244,21 +248,24 @@ def follower_fact(*, tree, allocator, rank: int, executed: int, local_floor: boo
     if int(lane_epoch) >= 0:
         return Weg2PpRoomFactLane(rank=int(rank), executed=int(executed), room=available + payable,
                                   available=available, payable=payable, reported=reported, sim_us=sim_us,
+                                  processed=int(processed),
                                   lane_floor=int(lane_floor), lane_epoch=int(lane_epoch))
     return Weg2PpRoomFact(rank=int(rank), executed=int(executed), room=available + payable,
-                          available=available, payable=payable, reported=reported, sim_us=sim_us)
+                          available=available, payable=payable, reported=reported, sim_us=sim_us,
+                          processed=int(processed))
 
 
 class FollowerSender:
     """Sends a fact when it changed, else at most every ``RESEND_S``."""
 
     def __init__(self) -> None:
-        self.last: Optional[Tuple[int, int]] = None
+        self.last: Optional[Tuple[int, int, int]] = None
         self.last_t = 0.0
         self.pending: Optional[Weg2PpRoomFact] = None
 
     def offer(self, fact: Weg2PpRoomFact, now: float) -> bool:
-        key = (fact.room, fact.executed)
+        # ``processed`` is part of the key: a consumed result that moves no room is still news to PP0 (review A1).
+        key = (fact.room, fact.executed, fact.processed)
         if key == self.last and now - self.last_t < RESEND_S:
             return False
         self.pending = fact
@@ -270,7 +277,7 @@ class FollowerSender:
             return False
         if not channel.send_nowait(self.pending):
             return False
-        self.last = (self.pending.room, self.pending.executed)
+        self.last = (self.pending.room, self.pending.executed, self.pending.processed)
         self.last_t = now
         self.pending = None
         return True
@@ -334,6 +341,42 @@ class RoomBook:
                 self.facts[int(f.rank)] = (f, self.pass_no)
                 n += 1
         return n
+
+    def unprocessed(self, picked_up_ct: int) -> List[Tuple[int, int]]:
+        """``[(rank, processed)]`` -- every follower whose FRESH fact has not yet processed the pass PP0 picked up last.
+
+        The ring-wide half of "does something still run" (review A1 of the intake fix). PP0 consumed pass ``picked_up_ct``
+        (``forward_iter``); a follower whose newest fact stands below it has not applied that result, so the rows the pass
+        locked are still locked there and its room is the room from BEFORE the pass. The event that ends it is the follower's
+        own next fact (``processed >= picked_up_ct``): no timer, no threshold. A follower without a fresh fact counts as
+        nothing (a silent one must not hold PP0 for ever; the book's own ageing, ``FACT_MAX_AGE_PASSES``, is the way out), and
+        so does a sender without the field (``processed == -1``). Reads only."""
+        out: List[Tuple[int, int]] = []
+        if int(picked_up_ct) < 0:
+            return out
+        for rank, (f, seen) in sorted(self.facts.items()):
+            if self.pass_no - seen > FACT_MAX_AGE_PASSES:
+                continue
+            p = int(getattr(f, "processed", -1))
+            if p >= 0 and p < int(picked_up_ct):
+                out.append((int(rank), p))
+        return out
+
+    def cap_source(self) -> str:
+        """Where PP0's current cap came from, for ``WEG2 INTAKE-RESUMED``: ``fact(rank,executed,processed)`` of the binding
+        fresh follower fact, ``aged`` (facts exist, none fresh), ``own_only`` / ``none`` (no follower fact at all; the caller
+        tells the two apart by the cap itself). Reads only."""
+        if not self.facts:
+            return "own_only"
+        best = None
+        for rank, (f, seen) in sorted(self.facts.items()):
+            if self.pass_no - seen > FACT_MAX_AGE_PASSES:
+                continue
+            if best is None or int(f.room) < int(best.room):
+                best = f
+        if best is None:
+            return "aged"
+        return f"fact({int(best.rank)},{int(best.executed)},{int(getattr(best, 'processed', -1))})"
 
     def cap(self, own_room: Optional[int] = None) -> Optional[CapVerdict]:
         """R_m = MIN(PP0's own payable room now, each fresh follower fact minus
