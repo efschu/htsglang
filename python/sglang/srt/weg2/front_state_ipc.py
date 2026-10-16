@@ -288,7 +288,6 @@ class OutstandingBook:
         #: one. Their rows say so (``stream`` 0, ``no_token_s`` None) instead of
         #: reading "no token for N s" out of a blindness.
         self.nonstream: set = set()
-        self.last_any: float = 0.0
 
     def arrive(self, rid, now: float) -> None:
         self.arrival.setdefault(str(rid), float(now))
@@ -301,10 +300,6 @@ class OutstandingBook:
 
     def token(self, rid, now: float) -> None:
         self.last_tok[str(rid)] = float(now)
-        # K10 SEAT-RELIEF: the newest token of ANY request -- monotonic, a finished
-        # rid's row leaving does not move it back (the front's D progress clock)
-        if float(now) > self.last_any:
-            self.last_any = float(now)
 
     def end(self, rid) -> None:
         self.arrival.pop(str(rid), None)

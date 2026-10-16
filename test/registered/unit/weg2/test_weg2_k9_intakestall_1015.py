@@ -159,7 +159,7 @@ def test_k9_wiring_the_drain_settles_after_the_pool_and_before_the_flip_decision
     src = inspect.getsource(F.Front)
     i_pool = src.index("passes = await _p_drain_pool(")
     i_settle = src.index("await _settle_posted_early_legs(")
-    i_hold = src.index("Front._pbound_hold_arm(self, _dc_cap")
+    i_hold = src.index("if _phase_stats.get(\"short_rides\"):", i_settle)
     assert i_pool < i_settle < i_hold
     seg = src[i_pool:i_hold]
     assert "p_drain_early_settle_enabled()" in seg and 'self.state == "serving"' in seg

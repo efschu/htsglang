@@ -348,30 +348,29 @@ def test_the_served_front_starts_the_lane_loop_only_with_the_switch_on():
     assert "if _lctl.enabled():" in src[i - 200:i]  # PRIO-AS-AGE 1014: the lane loop is the FLOOR controller
 
 
-# ------------------------------------------------------------------ 6. earlycap x lanes (the merge's one shared surface in the P-phase begin)
-def test_a_lane_held_early_leg_frees_its_place_under_the_earlycap_seat_cap():
-    """int24f earlycap (``_leg1_early_limit``: the seat gate's cap minus the early legs in flight IN THE QUEUE) and the lanes' DEFER/hold path
-    (``lane_ctl._cancel_early``: the held Pending leaves ``queue`` and its early leg is cancelled by ``_leg1_early_cancel``) meet at
-    ``Pending._leg1_early``.  Both intents: the cap counts the early legs of the queue, and a lane-held one no longer counts."""
+# ------------------------------------------------------------------ 6. early legs x lanes (the shared surface in the P-phase begin)
+def test_a_lane_held_early_leg_leaves_the_queue_and_its_early_leg_is_cancelled():
+    """The lanes' DEFER/hold path (``lane_ctl._cancel_early``: the held Pending leaves ``queue`` and its early leg is
+    cancelled by ``_leg1_early_cancel``) meets LEG1-EARLY at ``Pending._leg1_early``. (The seat-gate cap that used to
+    count these legs is gone, SEAT-AT-HAND-OFF 15.10.: the early candidates are the queue head up to p_concurrency.)"""
     from sglang.srt.weg2 import lane_ctl as LC
+    from sglang.srt.weg2.front import leg1_early_candidates
     from test_weg2_lanes_l4_1008 import _pend
 
     async def body():
         with _switch(None):
             f = _front("D")
             f.p_concurrency = 4
-            f._dc_p_cap = 2                                   # the seat gate's cap for this D>P flip
             a, b = _pend(f, "weg2-0-1", 0, 100.0), _pend(f, "weg2-0-2", 0, 101.0)
             for p in (a, b):
                 p._leg1_early = asyncio.ensure_future(asyncio.sleep(30))
                 f.queue.append(p)
-            assert Front._leg1_early_limit(f) == 0            # cap 2, two early legs in flight: no third
             f.groups["P"].outstanding[a.rid] = 100.0
             lc = LC.ctl(f)
             assert LC._cancel_early(f, lc, a, 102.0, when="hold", target=1) is True      # the lane takes the early leg back
             f.queue.remove(a)                                 # held out of the queue (what lane_ctl does with a held Pending)
             assert a._leg1_early is None
-            assert Front._leg1_early_limit(f) == 1            # one early leg left in flight: the cap has room for one more
+            assert leg1_early_candidates(f.queue, f.p_concurrency) == []   # b already has its early leg in flight
             for p in (a, b):
                 t = p._leg1_early
                 if t is not None:
