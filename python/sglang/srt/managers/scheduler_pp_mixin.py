@@ -1576,6 +1576,9 @@ def pp_flip_forget_ring_scoped_slots(holder) -> None:
     # #1020 void guard) does a membership test, and an empty set is the
     # truth on a ring that has just been rebuilt from zero.
     holder._pp_launched_pending = set()
+    # Review A1 (intake fix): the consumed-pass mark belongs to the ring that was just rebuilt, too: passes retracted at the
+    # cutover are never consumed by the followers, and PP0 must not wait for a result that will not come.
+    holder._pp_last_processed_ct = -1
     # #1225: and the BATCHES those slots owe, keyed by slot. Same
     # lifecycle as the set above and reset here for the same reason --
     # an entry that outlived a ring rebuild would name a slot of the
@@ -5846,6 +5849,14 @@ class SchedulerPPMixin:
                         getattr(self, "_pp_launched_pending", set()).discard(
                             next_mb_id
                         )
+                        # Review A1 (intake fix): the event that releases the rows of a finished pass is its RESULT being
+                        # consumed, on every rank. Remember the newest consumed pass: PP0 reads it as "the last pass I picked
+                        # up" (``intake_stall.work_in_flight``), a follower sends it as ``processed`` in its room fact.
+                        _ct_done = getattr(self.mbs[next_mb_id], "forward_iter", None)
+                        if isinstance(_ct_done, int):
+                            self._pp_last_processed_ct = max(
+                                int(getattr(self, "_pp_last_processed_ct", -1)), _ct_done
+                            )
                         # #1225: the batch has DELIVERED, so it is no longer
                         # owed and must leave the register in the same step.
                         # A delivered batch left here would be retracted a
@@ -6862,6 +6873,7 @@ class SchedulerPPMixin:
                     tree=tree, allocator=self.token_to_kv_pool_allocator, rank=0,
                     executed=int(self.forward_ct), local_floor=local_floor,
                     lane_floor=_lf, lane_epoch=_le,
+                    processed=int(getattr(self, "_pp_last_processed_ct", -1)),
                 )
                 if _have_facts:
                     verdict = book.cap(own.room)
@@ -6893,6 +6905,7 @@ class SchedulerPPMixin:
             tree=tree, allocator=self.token_to_kv_pool_allocator, rank=int(self.ps.pp_rank),
             executed=int(self.forward_ct), local_floor=local_floor,
             lane_floor=_lf, lane_epoch=_le,
+            processed=int(getattr(self, "_pp_last_processed_ct", -1)),
         )
         sender.offer(fact, now)
         sender.flush(channel, now)

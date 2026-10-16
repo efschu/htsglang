@@ -17986,6 +17986,8 @@ class Scheduler(
                 # slot into a batch. `req.session` is kept as a second, weaker
                 # term: it costs nothing and it is upstream's own contract.
                 added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
+                if added:
+                    _p_intake.note_intake_resumed(self, req, adder)  # review A2: names an admission out of a wait
                 if not added:
                     # init_next_round_input() may stage deferred Mamba COW/clear
                     # metadata before add_one_req() rejects the request.
@@ -22362,11 +22364,6 @@ class Scheduler(
         # pass whose result PP0 has not consumed (``_pp_launched_pending``): its rows are locked and the followers have not
         # republished their room. A refusal while anything is in flight is a WAIT and restarts the hold (h16r 11:47:19
         # held_s=2.8, 11:52:21 2.6, h16p 13:58:24 5.6: the first pass after the finish named the stall).
-        _busy = work_in_flight(self)
-        if _busy:
-            watch.progress()
-            _p_intake.note_stall_deferred(self, req, _busy, note)
-            return
         need, rem_total, cur_rem = -1, -1, -1
         try:
             need = len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
@@ -22381,6 +22378,13 @@ class Scheduler(
         # requeueing (the requeue loop killed xsn291).
         _pool = int(getattr(self, "max_total_num_tokens", 0) or 0)
         _too_large = bool(_pool > 0 and need > _pool)
+        # Review A3: a request that cannot fit the pool however long it waits is named at once -- waiting for in-flight work
+        # (which can never make it fit) would defer a refusal that is already certain.
+        _busy = "" if _too_large else work_in_flight(self)
+        if _busy:
+            watch.progress()
+            _p_intake.note_stall_deferred(self, req, _busy, note)
+            return
         _extra = note or "gate=adder_no_token"
         # H91a: the stall is only what no row of this phase can fund; a
         # request that fits free + evictable stays queued (no 503, no flip).
@@ -22389,16 +22393,19 @@ class Scheduler(
         ) in (_p_intake.INTAKE_FITS, _p_intake.INTAKE_WAITS):
             watch.progress()
             return
+        _extra_arg = _extra
         if _too_large:
             from sglang.srt.weg2.intake_stall import TOO_LARGE_MARK
-            _extra = f"{_extra} {TOO_LARGE_MARK} pool_tokens={_pool}"
+            _extra_arg = f"{_extra} {TOO_LARGE_MARK} pool_tokens={_pool}"
         else:
-            # a stall at IDLE is a deviation from the design (a request that fits the pool always fits): name the term
-            _extra = f"{_extra} {_p_intake.stall_cause(self, need, _pool)}"
+            # a stall at IDLE is a deviation from the design (a request that fits the pool always fits): name the term.
+            # Review A4: read lazily -- ``observe`` calls it only when the stall is NAMED (the cause walks the evict frontier).
+            def _extra_arg(_gate=_extra, _need=need, _pool=_pool):
+                return f"{_gate} {_p_intake.stall_cause(self, _need, _pool)}"
         message = watch.observe(
             rid=str(req.rid), need_tokens=need, rem_total_tokens=rem_total,
             cur_rem_tokens=cur_rem, running_empty=True, now=_time.monotonic(),
-            extra=_extra,
+            extra=_extra_arg,
             # xsn275: the admission-wedge detector already waited >= 20 s
             # with nothing running; its verdict needs no second hold here.
             # xsn291: a too-large request needs no hold either.

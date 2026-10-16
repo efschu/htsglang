@@ -29,7 +29,7 @@ rows stays queued and is admitted in order (weg2/p_intake.py).
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Optional
 
 #: The refusal's name; the front matches on it in the leg-1 error text.
 STALL_MARK = "WEG2-INTAKE-STALL"
@@ -86,6 +86,9 @@ def work_in_flight(scheduler) -> str:
     ``held_s=2.8``, 11:52:21 ``2.6``, h16p 13:58:24 ``5.6`` (rows locked by the in-flight pass: protected=173760,
     evictable=0). A refusal while anything runs is a WAIT; the hold begins at the first pass that finds the stage idle.
 
+    The ring is more than PP0 (review A1): the last term asks the followers whether they have consumed the pass PP0 picked
+    up last (:func:`_ring_unprocessed`).
+
     Reads only, tolerant of stand-ins that carry none of the terms (they run nothing)."""
     rb = getattr(scheduler, "running_batch", None)
     try:
@@ -103,7 +106,29 @@ def work_in_flight(scheduler) -> str:
             return "pp_launched_pending=" + str(sorted(int(i) for i in pending))
         except Exception:  # noqa: BLE001
             return "pp_launched_pending"
-    return ""
+    return _ring_unprocessed(scheduler)
+
+
+def _ring_unprocessed(scheduler) -> str:
+    """The RING term of :func:`work_in_flight` (review A1): ``""`` or ``ring_unprocessed=<rank,...>``.
+
+    PP0's own pass being consumed is not the end of the work: the followers free the finished request's rows only when THEY
+    consume its result and say so in their next room fact (``Weg2PpRoomFact.processed``). h16r 11:47 / 11:52 / 11:09: PP0
+    had picked the pass up, PP1 consumed it 35-45 ms later; in between the facts showed the pre-finish room. The event that
+    ends the wait is the follower's fact (``processed >= the pass PP0 picked up last``). No timer, no threshold, no env: a
+    follower without a FRESH fact counts as nothing (``RoomBook`` ageing), so a silent one cannot hold PP0 for ever.
+
+    Reads only; a stage without a book (every stage but PP0, a stand-in) runs nothing here."""
+    book = getattr(scheduler, "_weg2_pr_book", None)
+    if book is None:
+        return ""
+    try:
+        behind = book.unprocessed(int(getattr(scheduler, "_pp_last_processed_ct", -1)))
+    except Exception:  # noqa: BLE001 - an unreadable book is not a running follower (it must never hold a stall for ever)
+        return ""
+    if not behind:
+        return ""
+    return "ring_unprocessed=" + ",".join(str(r) for r, _p in behind)
 
 
 class IntakeStallWatch:
@@ -147,7 +172,7 @@ class IntakeStallWatch:
 
     def observe(self, *, rid: str, need_tokens: int, rem_total_tokens: int,
                 cur_rem_tokens: int, running_empty: bool, now: float,
-                extra: str = "", immediate: bool = False) -> Optional[str]:
+                extra: Any = "", immediate: bool = False) -> Optional[str]:
         """One refusal of ``rid`` with nothing admitted this pass -- the
         adder's NO_TOKEN, or (xsn273) the seat gate in front of the adder:
         ``get_num_allocatable_reqs(0) <= 0`` while the parked, prefilled
@@ -170,6 +195,13 @@ class IntakeStallWatch:
             return None
         self._reported.add(rid)
         self.stalls += 1
+        if callable(extra):
+            # review A4: the cause is a walk over the evict frontier; it is read only when the stall is NAMED, not on every
+            # refusal of the hold
+            try:
+                extra = str(extra())
+            except Exception:  # noqa: BLE001 - a diagnostic never blocks the answer
+                extra = ""
         return (
             f"{STALL_MARK} rid={rid} need_tokens={int(need_tokens)} "
             f"rem_total_tokens={int(rem_total_tokens)} cur_rem_tokens={int(cur_rem_tokens)} "
