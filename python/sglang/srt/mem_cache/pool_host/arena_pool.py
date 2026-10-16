@@ -1249,6 +1249,23 @@ def _select_rows_async(t: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     return t.index_select(0, index_to_device_async(pos, t.device))
 
 
+def _l3_complete_only_on() -> bool:
+    return os.environ.get("SGLANG_WEG2_L3_COMPLETE_ONLY", "1").strip().lower() not in (
+        "0", "false", "no", "off", "")
+
+
+_L3_COMPLETE_N = [0]
+
+
+def _l3_complete_note(incomplete: int, pages: int) -> None:
+    _L3_COMPLETE_N[0] += 1
+    n = _L3_COMPLETE_N[0]
+    if n <= 32 or n % 256 == 0:
+        logger.warning("L3-COMPLETE-ONLY n=%d incomplete=%d of %d pages: a slot not COMPLETE in the shared "
+                       "header (an owner's share missing) is neither written to L3 nor counted as secured -- "
+                       "the node keeps its host copy", n, incomplete, pages)
+
+
 class ArenaMHAHostPool(MHATokenToKVPoolHost):
     """MHA host pool whose rows beyond the staging ring are arena slots."""
 
@@ -2325,13 +2342,38 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
             out["lost"] = out["pages"]
             return out
         total = int(getattr(self, "_page_bytes", 0) or getattr(arena, "slot_bytes", 0) or 0)
+        # L3-COMPLETE (review K15b B1/A1, 16.10.): arena_ref_slots excludes only THIS rank's pending
+        # set; complete_write takes a slot out of it on status 0 too (merged, not full) -- under the
+        # token cut TP0's ack comes ~45 s before the workers'. Such a slot is CLAIMED in the shared
+        # header: its bytes are half a page. It is neither written to L3 nor counted as secured
+        # (``incomplete`` adds to ``lost``: every caller keeps the node -- the K10 device round, the
+        # W3 host-leaf round). An on-disk file of the same stem does not make it secured either.
+        # SGLANG_WEG2_L3_COMPLETE_ONLY=0 = the old path.
+        slot_list = [int(s) for s in slots.tolist()]
+        out["incomplete"] = 0
+        if _l3_complete_only_on():
+            states_fn = getattr(arena, "slot_states", None)
+            if callable(states_fn):
+                try:
+                    states = states_fn(slot_list)
+                except Exception:  # noqa: BLE001 - unreadable header = not provably complete
+                    states = [-1] * len(slot_list)
+                keep = [s for s, st in zip(slot_list, states) if int(st) == 2]
+                out["incomplete"] = len(slot_list) - len(keep)
+                if out["incomplete"]:
+                    _l3_complete_note(out["incomplete"], len(slot_list))
+                slot_list = keep
+        if not slot_list:
+            out["lost"] = out["incomplete"]
+            return out
         # key 0/0: arena_secure_to_disk names the page by the slot header's
         # stem (arena.slot_stem), the same name the clock evict writes under
-        sec = secure(arena, [(int(s), 0, 0, total) for s in slots.tolist()])
+        sec = secure(arena, [(s, 0, 0, total) for s in slot_list])
         # H16P-NACHBESSERUNG A2: `unpaired` (a KV page held back for want of its QSA index: NOT on disk) and
         # `sidecar_absent` are passed on -- the caller must not read them as a complete copy
         for k in ("on_disk", "written", "lost", "unpaired", "sidecar_absent"):
             out[k] = int(sec.get(k, 0))
+        out["lost"] += out["incomplete"]
         ArenaMHAHostPool._257_written_to_l3 = (
             getattr(ArenaMHAHostPool, "_257_written_to_l3", 0) + out["written"])
         return out
