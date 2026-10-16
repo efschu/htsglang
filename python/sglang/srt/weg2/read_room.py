@@ -106,6 +106,8 @@ class _State:
     role: Optional[str] = None
     role_t = -1e9
     d_spills = 0
+    #: review readroomd B2: (tree, node, host rows) TP0 decided to spill, released at the broadcast
+    d_pending: List[Tuple[Any, Any, Any]] = []
     #: review A3: per logical read id the pages THIS rank released for it, as (slot, stem) -- a post of the same read
     #: (a re-post, or a peer rank's fill of it) counts those a peer still holds as room on its way
     released: Dict[Any, Tuple[float, List[Tuple[int, str]]]] = {}
@@ -455,8 +457,9 @@ def tick(cache: Any) -> int:
             _forget_other_maps(arena)
         if arena is None:
             return 0
-        if not serves(cache):
-            # READ-ROOM-D: a Form A worker posts and waits (``served`` above), TP0 answers for the group
+        if not serves(cache) or form_a_role() == "host":
+            # READ-ROOM-D: a Form A worker posts and waits (``served`` above); TP0 answers for the group at its
+            # broadcast (``serve_at_broadcast``, review readroomd B2), never inside the round
             return 0
         # poll the request file at most every 20 ms: an idle P stage runs ~1500 rounds/s, a loaded one a round per
         # 2-3 s; 64 struct reads per round would be pure overhead in the first case and late by nothing in the second
@@ -591,6 +594,76 @@ def serve(cache: Any, pool: Any, arena: Any, need: int, read_key: Any = None) ->
     return released
 
 
+def l3_complete(node: Any, sec: Dict[str, int]) -> bool:
+    """Review readroomd B3: ``secure_rows_to_l3`` proved that EVERY page of ``node`` has an L3 copy -- no page lost,
+    none unpaired (the QS pair gate wrote nothing), the COMPLETE pages are all the node's pages (``len(hash_value)``;
+    a page some owner has not finished drops out of ``pages``) and each is on disk or was written now."""
+    if int(sec.get("lost", 0)) or int(sec.get("unpaired", 0)):
+        return False
+    pages = int(sec.get("pages", 0))
+    hv = getattr(node, "hash_value", None)
+    need = len(hv) if hv else pages
+    return pages > 0 and pages == need and int(sec.get("on_disk", 0)) + int(sec.get("written", 0)) == need
+
+
+def flush_forma_pending() -> int:
+    """Review readroomd B1/B2: TP0, in ``form_a_host_shadow.attach`` right before the broadcast: the host copies
+    ``form_a_spill`` decided (L3 copy proven) leave L2 now, ``l3_present`` is set, and the R12 verdicts (STATE: the
+    KV host rows are gone; L3: the node is store-present) ride THIS broadcast -- every worker applies both before
+    the pass's admission. A node that changed since the decision (gone, other host rows, busy) keeps its copy.
+    Returns the pages released."""
+    todo, _ST.d_pending = list(_ST.d_pending), []
+    if not todo:
+        return 0
+    from sglang.srt.mem_cache import form_a_host_shadow as _r12
+    from sglang.srt.mem_cache.unified_radix_cache import BASE_COMPONENT_TYPE, EvictLayer
+
+    out = 0
+    for cache, node, hv in todo:
+        comps = tuple(cache._components_tuple)
+        base = next((c for c in comps if c.component_type == BASE_COMPONENT_TYPE), None)
+        aux = [c for c in comps if c.component_type != BASE_COMPONENT_TYPE]
+        cd = node.component_data[BASE_COMPONENT_TYPE]
+        owt = getattr(cache, "ongoing_write_through", None) or {}
+        if (base is None or cd.host_value is not hv or cd.value is None or node.children
+                or not _r12._attached(node) or node.id in owt
+                or getattr(node, "write_through_pending_id", None) is not None
+                or any(int(getattr(c, "host_lock_ref", 0) or 0) > 0 for c in node.component_data)):
+            continue
+        P = max(1, int(getattr(cache, "page_size", 1) or 1))
+        for c in aux:   # aux first: never an aux host row without the KV row
+            if node.component_data[c.component_type].host_value is not None:
+                cache._evict_component_and_detach_lru(node, c, target=EvictLayer.HOST, tracker=None)
+        _dev, host_freed = cache._evict_component_and_detach_lru(node, base, target=EvictLayer.HOST, tracker=None)
+        cache.evictable_host_leaves.discard(node)
+        node.l3_present = True
+        _r12.record_state(cache, node, why="read-room")
+        # review readroomd B1: l3_present is TP0's group verdict -- every worker sets it from this event (K12b)
+        _r12.record_l3(cache, node)
+        out += int(host_freed or 0) // P
+    return out
+
+
+def serve_at_broadcast(tree: Any) -> int:
+    """Review readroomd B2/B5: Form A TP0 serves room requests HERE, from ``form_a_host_shadow.attach`` right before
+    the ``tp<-reqs`` broadcast (the K10 wire) -- its host drops and the R12 verdict that mirrors them reach every
+    worker before any admission of the pass; never from ``check_hicache_events``. No broadcast (sleep drain) = no
+    service. Never raises."""
+    try:
+        if form_a_role() != "host" or not enabled():
+            return 0
+        pool = tree._weg2_direct_pool()
+        arena = getattr(pool, "arena", None)
+        if arena is None:
+            return 0
+        _ST.arena = arena
+        _ST.armed = True
+        return serve_unseen(tree, pool, arena)
+    except Exception:  # noqa: BLE001 - a room request never breaks the broadcast
+        logger.warning("%s serve_at_broadcast raised", MARK, exc_info=True)
+        return 0
+
+
 def form_a_spill(cache: Any, pool: Any, need_pages: int, released_out: Optional[list] = None) -> int:
     """READ-ROOM-D, TP0 of a Form A D group only: hand back up to ``max(need, W3_SPILL_MIN_PAGES)`` pages of the
     tree's L3-backed host copies for the GROUP. Candidates are device-resident nodes with a KV host copy (the
@@ -646,6 +719,16 @@ def form_a_spill(cache: Any, pool: Any, need_pages: int, released_out: Optional[
         if mamba is not None and node.component_data[mamba].host_value is not None:
             skip["anchor"] += 1
             continue
+        if mamba is not None and node.component_data[mamba].value is not None:
+            # review readroomd B4: a node carrying a Mamba state leaves the device only whole (L3-DROP below would
+            # drop the anchor with it) -- the anchors of D stay where they are
+            skip["anchor"] += 1
+            continue
+        if node.children:
+            # review readroomd B4: a spilled node must be able to leave the device without a new arena claim; the
+            # Form A L3-DROP (UnifiedRadixCache._weg2_l3_drop) drops a CHILDLESS store-backed leaf only
+            skip["children"] = skip.get("children", 0) + 1
+            continue
         if node.id in owt or getattr(node, "write_through_pending_id", None) is not None \
                 or any(int(getattr(c, "host_lock_ref", 0) or 0) > 0 for c in node.component_data):
             skip["busy"] += 1
@@ -668,18 +751,19 @@ def form_a_spill(cache: Any, pool: Any, need_pages: int, released_out: Optional[
         if int(sec.get("lost", 0)) or not int(sec.get("pages", 0)):
             unsecured += 1
             continue
+        if not l3_complete(node, sec):
+            # review readroomd B3: every page of the node needs its L3 copy (on disk or written now); an unpaired
+            # page (QS gate) or a page no owner finished is not in the store -- the node keeps its host copy
+            unsecured += 1
+            continue
         on_disk += int(sec.get("on_disk", 0))
         written += int(sec.get("written", 0))
         if released_out is not None:
             released_out.extend(keys.slots_of(node))
-        for c in aux:   # aux first: never an aux host row without the KV row
-            if node.component_data[c.component_type].host_value is not None:
-                cache._evict_component_and_detach_lru(node, c, target=EvictLayer.HOST, tracker=None)
-        _dev, host_freed = cache._evict_component_and_detach_lru(node, base, target=EvictLayer.HOST, tracker=None)
-        cache.evictable_host_leaves.discard(node)
-        node.l3_present = True
-        _r12.record_state(cache, node, why="read-room")
-        released += int(host_freed or 0) // P
+        # review readroomd B2: decided and secured now, RELEASED at the broadcast (flush_forma_pending in attach) --
+        # like an R12 TRANSIT, no rank's tree changes inside the pass
+        _ST.d_pending.append((cache, node, hv))
+        released += int(hv.numel()) // P
         nodes += 1
     _ST.d_spills += 1
     k = _ST.d_spills
@@ -737,6 +821,7 @@ def reset_for_tests() -> None:
     _ST.role = None
     _ST.role_t = -1e9
     _ST.d_spills = 0
+    _ST.d_pending = []
     _ST.released = {}
     _ST.serve_log = deque(maxlen=4096)
     _ST.waits = deque(maxlen=512)

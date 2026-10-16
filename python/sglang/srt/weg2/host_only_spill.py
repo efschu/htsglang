@@ -176,6 +176,11 @@ def spill_host_only(cache: Any, pool: Any, want: int, page_size: int, skip: set,
                 or (int(sec.get("unpaired", 0)) and _strict())):
             unsecured += 1                # no L3 copy for every page, or a page not COMPLETE: it stays
             continue
+        from sglang.srt.weg2.read_room import l3_complete as _l3_complete
+
+        if not _l3_complete(node, sec):
+            unsecured += 1                # review readroomd B3: a page neither on disk nor written now: it stays
+            continue
         on_disk += int(sec.get("on_disk", 0))
         written += int(sec.get("written", 0))
         if released_out is not None:

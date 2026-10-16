@@ -37,6 +37,7 @@ from sglang.srt.distributed.utils import uneven_dcp_active
 from sglang.srt.environ import envs
 from sglang.srt.weg2 import prefix_trace as _prefix_trace
 from sglang.srt.weg2.read_room import tick as _read_room_tick
+from sglang.srt.weg2.read_room import l3_complete as _read_room_l3_complete
 from sglang.srt.weg2 import tail_adopt, tail_handoff
 from sglang.srt.weg2 import short_read as _weg2_short_read
 from sglang.srt.weg2 import d_park_read as _weg2_park_read
@@ -4632,6 +4633,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return False
         from sglang.srt.weg2 import pp_slot_fidelity as _sf
 
+        if _r12.role() is not None and _r12.l3_group_on():
+            return UnifiedRadixCache._weg2_l3_drop_forma(self, node, tracker)
         if not _sf.unbacked_drop_floor(self, node):
             return False
         if not UnifiedRadixCache._weg2_l3_drop_under_pressure(self, node):
@@ -4668,6 +4671,36 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 "comes back from L3)",
                 k, getattr(node, "id", "?"), len(getattr(node, "key", []) or []),
                 int(tracker.get(base, 0)) - before, max(0.0, waited_ms))
+        return True
+
+    def _weg2_l3_drop_forma(self, node: UnifiedTreeNode, tracker: dict[ComponentType, int]) -> bool:
+        """READ-ROOM-D, review readroomd B4: on a Form A group (R12) a store-backed device leaf -- ``l3_present``
+        (TP0's group verdict, mirrored by the K12b L3 event), no host copy (the R12 STATE dropped it on every
+        rank) -- leaves the device WITHOUT a new arena claim, like L3-DROP on the local-PP floor. The rule reads
+        only tree state every rank holds alike after the same broadcast (l3_present, backuped, children, the
+        node's write-through and its device lock), never a rank-local room figure: so every rank of the group
+        takes the same decision in the same pass (no #791b split). A leaf with children or a write in flight
+        keeps the old path. Returns True when the node was dropped."""
+        if node.children or node.id in self.ongoing_write_through \
+                or getattr(node, "write_through_pending_id", None) is not None:
+            return False
+        if any(int(getattr(cd, "lock_ref", 0) or 0) > 0 for cd in node.component_data):
+            return False
+        mamba = getattr(ComponentType, "MAMBA", None)
+        if mamba is not None and node.component_data[mamba].value is not None:
+            return False   # an anchor on the device leaves only with a backup (D keeps its anchors)
+        base = BASE_COMPONENT_TYPE
+        before = int(tracker.get(base, 0))
+        self._ud_drop_unbacked_leaf(node, tracker)
+        k = getattr(UnifiedRadixCache, "_weg2_l3_drop_forma_n", 0) + 1
+        UnifiedRadixCache._weg2_l3_drop_forma_n = k
+        if k <= 32 or (k & (k - 1)) == 0:
+            logger.warning(
+                "L3-DROP FORMA n=%d node=%s tokens=%d freed=%d role=%s (a store-backed D device leaf -- l3_present by "
+                "TP0's verdict, no host copy on any rank -- left the device without a new arena claim; every rank "
+                "of the group decides the same from the same tree)",
+                k, getattr(node, "id", "?"), len(getattr(node, "key", []) or []),
+                int(tracker.get(base, 0)) - before, _r12.role())
         return True
 
     @staticmethod
@@ -6122,6 +6155,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if _role == "host" and int(sec.get("pages", 0)) < len(getattr(node, "hash_value", None) or ()):
                 # Form A: a page some owner has not finished is not COMPLETE and
                 # got no L3 copy -- the whole node stays until every page has one
+                continue
+            if not _read_room_l3_complete(node, sec):
+                # review readroomd B3 (every role): released only when EVERY page of the node has its L3 copy --
+                # the COMPLETE pages are all the node's pages and each is on disk or was written now
                 continue
             secured += int(sec.get("on_disk", 0))
             written += int(sec.get("written", 0))

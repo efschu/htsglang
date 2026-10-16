@@ -522,6 +522,18 @@ def attach(recv_reqs: List) -> List:
         except Exception as exc:  # noqa: BLE001 -- a failed spill keeps every reference
             if _note("spill_serve_error", 16):
                 logger.warning("R12 W3-SPILL serve failed: %r (every rank keeps its references)", exc)
+    # READ-ROOM-D (review readroomd B2): a P read's room request is served HERE, right before the broadcast, never
+    # inside the round; the decided host drops are applied on TP0 now and their verdicts (STATE + L3) ride this
+    # broadcast -- every rank's tree changes before the same admission
+    try:
+        from sglang.srt.weg2 import read_room as _read_room
+
+        if _S.tree is not None:
+            _read_room.serve_at_broadcast(_S.tree)
+        _read_room.flush_forma_pending()
+    except Exception as exc:  # noqa: BLE001 -- a room request never breaks the broadcast
+        if _note("read_room_serve_error", 16):
+            logger.warning("R12 READ-ROOM serve failed: %r (every rank keeps its references)", exc)
     if not _S.ledger:
         return recv_reqs
     _S.seq += 1
