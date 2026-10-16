@@ -280,6 +280,68 @@ def _p_held_reread_max() -> int:
         return 2
 
 
+#: ZERO-ANCHOR 1015 (Typ A): the hint trigger of the held re-read. 0 = off.
+P_HINT_REREAD_ENV = "SGLANG_WEG2_P_HINT_REREAD"
+
+#: ZERO-ANCHOR 1015 (3), boot 133855 weg2-5-52: D re-parked the request at
+#: the D->P flip's begin (13:50:19.4, front SEQ-MARK where=park depth=110720)
+#: and its flush ran NONBLOCK (``#1470 FLUSH-PUBLISH issued=5 unbacked_left=5
+#: ... B1 NONBLOCK: the sleep leg drains them``, park anchor to L3 13:50:20);
+#: P's LEG1-EARLY read, issued at the same flip begin and held dormant
+#: (#1443), probed the store mid-flush: ``#1028B kv=1730 claimed=27
+#: caps={qsa_indexer: 47, mamba: 27}`` -> P prefilled 108999 tokens D had
+#: loaded at 13:49:42 (``completed=110656``). No hint (RESUME-VIA-P leg).
+#: Now a read issued while PP0 was dormant is marked; at its told PP0 asks
+#: the store once, AWAKE (the sleeping group's flush is drained before the
+#: wake), and re-reads when the store now holds a page or more past the
+#: record. PP0 decides; the followers follow the told. 0 = off.
+P_WAKE_PROBE_ENV = "SGLANG_WEG2_P_WAKE_PROBE"
+WAKE_PROBE_ATTR = "_weg2_read_dormant"
+
+
+def p_wake_probe_on(env=None) -> bool:
+    v = (env if env is not None else os.environ).get(P_WAKE_PROBE_ENV, "1")
+    return str(v).strip().lower() not in ("0", "false", "no", "off", "")
+
+
+def _wake_store_depth(scheduler, req, have: int):
+    """The store's anchored depth of ``req``'s prompt now, in tokens (the
+    #1416c/d full-span question with the fetch's key form); None = not
+    askable. Logged once per dormant read."""
+    try:
+        cc = getattr(scheduler, "cache_controller", None) or getattr(
+            getattr(scheduler, "tree_cache", None), "cache_controller", None)
+        ids = getattr(req, "origin_input_ids", None)
+        if cc is None or not callable(getattr(cc, "get_hash_str", None)) or not ids:
+            return None
+        page_size = int(getattr(cc, "page_size", 1) or 1)
+        if _tree_key_probe_armed():
+            key, _bigram = _probe_key(scheduler, req, ids, len(ids))
+            pages = _anchored_pages_full_span(cc, key, page_size, handoff_keys=_handoff_chain(req))
+        else:
+            pages = _anchored_pages_full_span(cc, list(ids), page_size,
+                                              extra_key=getattr(req, "extra_key", None))
+        if pages is None:
+            return None
+        depth = int(pages) * page_size
+        k = getattr(scheduler, "_p_wake_probe_n", 0) + 1
+        scheduler._p_wake_probe_n = k
+        if k <= 32 or k % 128 == 0 or depth > int(have):
+            logger.info("WEG2 P-WAKE-PROBE rid=%s have=%d store_now=%d (k=%d): the read ran during the "
+                        "flip; awake, the store %s", _rt(_rid(req)), int(have), depth, k,
+                        "holds more -- PP0 re-reads before its told" if depth > int(have)
+                        else "holds no more -- the told stands")
+        return depth
+    except Exception as exc:  # noqa: BLE001 - a probe never stops the told
+        logger.warning("WEG2 P-WAKE-PROBE rid=%s unavailable: %r", _rt(_rid(req)), exc)
+        return None
+
+
+def p_hint_reread_on(env=None) -> bool:
+    v = (env if env is not None else os.environ).get(P_HINT_REREAD_ENV, "1")
+    return str(v).strip().lower() not in ("0", "false", "no", "off", "")
+
+
 def _p_held_short_reread(scheduler, tree, req, rid: str) -> bool:
     """P-HELD-REREAD-1014: True when PP0 re-issued ``rid``'s store read (the
     caller keeps it held and publishes nothing this pass)."""
@@ -288,9 +350,39 @@ def _p_held_short_reread(scheduler, tree, req, rid: str) -> bool:
         return False
     from sglang.srt.weg2 import short_read as _sr
 
-    if not _sr.store_holds_more(rid):
-        return False
     have = _completed_prefix(tree, rid)
+    why = "store"
+    if not _sr.store_holds_more(rid):
+        # ZERO-ANCHOR 1015 (Typ A): the store held no more at the read, but D
+        # was measured to hold more (the front's hint) -- D's flush publishes
+        # it at the flip; re-read after the flush, i.e. once PP0 is awake
+        _ps = int(getattr(scheduler, "page_size", 0) or getattr(tree, "page_size", 1) or 1)
+        if p_hint_reread_on() and _sr.hint_beyond(rid, have, _ps):
+            why = "hint"
+        elif p_wake_probe_on() and getattr(req, WAKE_PROBE_ATTR, None) is not None:
+            # ZERO-ANCHOR 1015 (3): a read issued DURING the flip (#1443) raced
+            # the sleeping group's flush -- ask the store once, awake
+            if getattr(scheduler, "weg2_dormant", False):
+                why = "wake_probe"
+            else:
+                depth = _wake_store_depth(scheduler, req, have)
+                setattr(req, WAKE_PROBE_ATTR, None)   # once per dormant read
+                if depth is None or int(depth) - int(have) < _ps:
+                    return False
+                why = "wake_probe"
+                _sr.note_hint(rid, int(depth))   # the record the re-read must reach
+        else:
+            return False
+        if getattr(scheduler, "weg2_dormant", False):
+            k = getattr(scheduler, "_p_hint_wait_n", 0) + 1
+            scheduler._p_hint_wait_n = k
+            if k <= 32 or k % 128 == 0:
+                logger.info(
+                    "WEG2 P-HINT-REREAD WAIT rid=%s have=%d hint=%d (k=%d): the read ended below "
+                    "the depth D was measured to hold; D's flush publishes it at this flip -- "
+                    "PP0 holds the told until it is awake, then re-reads once",
+                    _rt(rid), have, _sr.hint_tokens(rid), k)
+            return True
     n = int(getattr(req, "_weg2_p_held_reread_n", 0) or 0)
     # each re-read must have moved PP0's record past the previous one
     if n >= cap or have <= int(getattr(req, _sr.PROGRESS_ATTR, -1)):
@@ -310,10 +402,11 @@ def _p_held_short_reread(scheduler, tree, req, rid: str) -> bool:
     scheduler._p_held_reread_n = k
     if k <= 32 or k % 128 == 0:
         logger.info(
-            "WEG2 P-HELD-REREAD rid=%s n=%d/%d have=%d verdict=%s (k=%d): the read ended short "
-            "of a span the store holds -- PP0 re-reads before its told (reading beats "
-            "recomputing); the told follows the re-read's record",
-            _rt(rid), n + 1, cap, have, verdict, k)
+            "WEG2 P-HELD-REREAD rid=%s n=%d/%d have=%d verdict=%s why=%s hint=%d (k=%d): the read "
+            "ended short of a span the store holds (why=store) or of the depth D was measured to "
+            "hold (why=hint) -- PP0 re-reads before its told (reading beats recomputing); the "
+            "told follows the re-read's record",
+            _rt(rid), n + 1, cap, have, verdict, why, _sr.hint_tokens(rid), k)
     if not issued:
         _sr.forget(rid)
     return issued

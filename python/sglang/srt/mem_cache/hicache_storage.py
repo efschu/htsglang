@@ -4420,6 +4420,48 @@ class HiCacheFile(HiCacheStorage):
             cands += _hp.evict_ordered(arena, order, need - len(cands), protect_lo=protect, site="l3fill")
         return cands
 
+    def _l3_refresh_kept(self, stems, mtime: bool = True) -> int:
+        """ZERO-ANCHOR 1015 (weg2-40-179, boot 133855): D parked the sequence at
+        14:09-14:10 (``#248 PARK-DEMOTE pool=kv pages=1832 written=8
+        l3_pages=1832`` -- 1824 pages relied on copies already on disk, none
+        refreshed), the arena then freed the kept slots against those copies
+        (#248 stage ii), and the L3 LRU (``EVICTION-BG ... toward cap 150 GB``
+        at 14:12 and 14:20) took the oldest files: at the resume P's claim
+        found the KV only up to the shared fork (``#1028B kv=865``), the
+        private tail gone from BOTH tiers. A copy that becomes the only copy of
+        a kept page is the youngest the store has: touch it and its QSA twin.
+        Returns how many stems were refreshed. Switch
+        ``SGLANG_WEG2_L3_REFRESH_KEPT`` (default ON)."""
+        if os.environ.get("SGLANG_WEG2_L3_REFRESH_KEPT", "1").strip().lower() in ("0", "false", "no", "off", ""):
+            return 0
+        ev = getattr(self, "_evictor", None)
+        # review anchor0 B1: only the eviction OWNER keeps an LRU -- on every
+        # other rank (PP1/PP2, TP1/TP2, the sibling group) touch is a no-op, so
+        # nothing is computed there at all
+        if ev is None or not stems or not getattr(ev, "enabled", False):
+            return 0
+        lru = getattr(ev, "_lru", None)
+        n = 0
+        for stem in dict.fromkeys(stems):
+            group = [stem]
+            try:
+                group += list(self._l3_sidecar_stems([stem]) or ())
+            except Exception:  # noqa: BLE001 - no sidecar map, the page alone
+                pass
+            for st in group:
+                if not mtime and lru is not None and st not in lru:
+                    # the in-memory form (claim room, scheduler thread) promotes
+                    # tracked entries only -- adopting an untracked file is an
+                    # os.stat, and this form does no disk I/O
+                    continue
+                try:
+                    # the path is computed (_sharded_path), never stat'ed
+                    ev.touch(st, self._sharded_path(st), mtime=mtime)
+                    n += 1
+                except Exception:  # noqa: BLE001 - recency is best effort
+                    continue
+        return n
+
     def arena_secure_to_disk(self, arena, cands, writer: str = "claim_room") -> dict:
         """#257 (d): give every EVICTING candidate ``(slot, key_lo, key_hi,
         total)`` an L3 copy before its slot is freed -- the disk half of
@@ -4451,6 +4493,7 @@ class HiCacheFile(HiCacheStorage):
         # keeps its copy; a new one is written only with its QSA index)
         allowed, pair = self._l3_pair_gate(
             arena, [st for st in cand_stems.values() if st and st not in on_disk], writer)
+        _relied: list = []
         for slot, lo, hi, total in cands:
             stem = cand_stems.get(slot)
             if stem is None:
@@ -4466,6 +4509,7 @@ class HiCacheFile(HiCacheStorage):
                 continue
             if stem in on_disk:
                 out["on_disk"] += 1
+                _relied.append(stem)
                 continue
             if stem not in allowed:
                 # QS: its QSA index is in neither tier -- the KV page alone in
@@ -4485,6 +4529,12 @@ class HiCacheFile(HiCacheStorage):
                 continue
             self._ensure_shard_dir(path)
             todo.append((stem, slot, total, path))
+        # ZERO-ANCHOR 1015: a page leaving L2 because L3 holds it makes that copy
+        # the only one -- MRU in the OWNER's LRU (victim promotion for every L2
+        # clearing with an L3 copy, not only kept spans). Owner rank only; the
+        # in-memory form promotes tracked entries only and touches no file
+        # (path computed, no stat, no utime) -- review anchor0 B1
+        out["refreshed"] = self._l3_refresh_kept(_relied, mtime=False)
         if todo and pio is not None:
             statuses = pio.write_pages(
                 [t[3] for t in todo], [int(t[2]) for t in todo],
@@ -4662,6 +4712,9 @@ class HiCacheFile(HiCacheStorage):
         on_disk = self._stat_stems(stems)
         todo = [s for s in stems if s not in on_disk]
         out["on_disk"] = len(stems) - len(todo)
+        # ZERO-ANCHOR 1015: the kept span now RELIES on these copies (stage ii
+        # frees its slots without I/O) -- they and their QSA twins become MRU
+        out["refreshed"] = self._l3_refresh_kept([s for s in stems if s in on_disk], mtime=True)
         if not todo:
             return out
         from sglang.srt.mem_cache.storage.file.pageio import load as _load_pageio
