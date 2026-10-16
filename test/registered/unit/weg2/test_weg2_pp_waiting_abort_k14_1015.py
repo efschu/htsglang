@@ -143,6 +143,7 @@ def _specimen(monkeypatch, *, chunked=False):
     pp0 = _stage(monkeypatch, 0)
     r0 = _req()
     pp0.mbs[SLOT] = _batch(r0)                         # #969N ADMIT slot=2, launched
+    pp0._pp_launched_batches = {SLOT: pp0.mbs[SLOT]}   # #1225: launched, not delivered
     if chunked:
         pp0.chunked_req = r0
     fol = [_stage(monkeypatch, r) for r in (1, 2)]
@@ -276,6 +277,7 @@ def test_abort_on_d_tp_only_unchanged(monkeypatch):
 def test_pass_aligned_form_neither_stamps_nor_holds(monkeypatch):
     pp0 = _stage(monkeypatch, 0, row_authority=False)
     pp0.mbs[SLOT] = _batch(_req())
+    pp0._pp_launched_batches = {SLOT: pp0.mbs[SLOT]}
     abort = _stamp(pp0, [AbortReq(rid=RID)])[0]
     assert abort.weg2_pp0_admitted is None, "no row authority: PP0 stamps nothing"
     st = _stage(monkeypatch, 1, row_authority=False)
@@ -303,13 +305,132 @@ def test_other_queued_requests_untouched_by_a_held_abort(monkeypatch):
 
 def test_pp0_admitted_reads_the_inflight_set():
     a = _req()
-    s = types.SimpleNamespace(chunked_req=None, mbs=[None, _batch(a), None], running_mbs=[],
-                              running_batch=None, last_batch=None, waiting_queue=[_req(OTHER)])
+    s = types.SimpleNamespace(chunked_req=None, _pp_launched_batches={1: _batch(a)},
+                              waiting_queue=[_req(OTHER)])
     assert pp_abort.pp0_admitted(s, RID) is True
     assert pp_abort.pp0_admitted(s, OTHER) is False, "queued on PP0 = not admitted"
-    s2 = types.SimpleNamespace(chunked_req=a, mbs=[], running_mbs=[], running_batch=_batch(),
-                               last_batch=None)
+    s2 = types.SimpleNamespace(chunked_req=a, _pp_launched_batches={})
     assert pp_abort.pp0_admitted(s2, RID) is True
+    # A1: a COMPLETED slot (mbs / last_batch / running) is not a frame in flight
+    s3 = types.SimpleNamespace(chunked_req=None, _pp_launched_batches={}, mbs=[None, None, _batch(a)],
+                               last_batch=_batch(a), running_batch=_batch(a), running_mbs=[_batch(a)])
+    assert pp_abort.pp0_admitted(s3, RID) is False
+
+
+# ----------------------------------------------------------------------------- Nachbesserung (nf-review-k14-1016)
+
+
+def _completed_then_requeued(monkeypatch):
+    """A1 shape: weg2-164-2265 ran on every rank (slot 2 delivered: popped from
+    _pp_launched_batches, but mbs[2] / last_batch still hold the completed batch),
+    then was requeued on every rank (#968b requeue, void park, retreat); then the abort."""
+    pp0 = _stage(monkeypatch, 0)
+    done = _batch(_req())
+    pp0.mbs[SLOT] = done
+    pp0.last_batch = done
+    pp0._pp_launched_batches = {}
+    pp0.waiting_queue = [_req()]
+    fol = [_stage(monkeypatch, r) for r in (1, 2)]
+    for st in fol:
+        st.mbs[SLOT] = _batch(_req())
+        st.waiting_queue = [_req()]
+    abort = _stamp(pp0, [AbortReq(rid=RID)])[0]
+    S.abort_request(pp0, abort)
+    for st in fol:
+        S.abort_request(st, abort)
+    return pp0, fol, abort
+
+
+def test_a1_completed_slot_and_requeued_rid_stamps_false_and_leaves_no_zombie(monkeypatch):
+    pp0, fol, abort = _completed_then_requeued(monkeypatch)
+    assert abort.weg2_pp0_admitted is False
+    assert pp0.waiting_queue == []
+    for st in fol:
+        assert st.waiting_queue == [] and st.sent == [RID], "dropped at receipt, like PP0"
+        assert not getattr(st, pp_abort.HELD_ATTR, None), "no zombie hold"
+
+
+def test_a1_mutant_inflight_reads_completed_batches_is_caught(monkeypatch):
+    """The pre-A1 form (mbs / last_batch counted) stamps True and leaves a zombie hold."""
+    def _old(s):
+        out = []
+        for b in list(getattr(s, "mbs", None) or ()) + [getattr(s, "last_batch", None)]:
+            out += list(getattr(b, "reqs", None) or ()) if b is not None else []
+        return out
+
+    monkeypatch.setattr(pp_abort, "pp0_inflight_reqs", _old)
+    _, fol, abort = _completed_then_requeued(monkeypatch)
+    assert abort.weg2_pp0_admitted is True
+    assert any(getattr(st, pp_abort.HELD_ATTR, None) for st in fol), "MUTANT: zombie expected"
+    for st in fol:                                     # 50 frameless passes: the zombie stays
+        for _ in range(50):
+            st._weg2_resolve_waiting_aborts()
+    assert all(RID in getattr(st, pp_abort.HELD_ATTR) for st in fol)
+
+
+def _busy_vote_then_frame(monkeypatch):
+    _, fol, (r0, r1, r2) = _specimen(monkeypatch)
+    out = []
+    for st, r in zip(fol, (r1, r2)):
+        st._pp_microbatches_drained = lambda: True
+        st._791c_pp0_drained = False
+        busy = types.SimpleNamespace(slots=[(0, 0, "running"), (st.ps.pp_rank, 0, "queue")])
+        for _ in range(3):
+            ppm.weg2_791c_release_on_idle_vote(st, busy)
+        kept = st.waiting_queue == [r] and RID in getattr(st, pp_abort.HELD_ATTR, {}) and st.sent == []
+        try:
+            ok = all(_probe(monkeypatch, st, [_frame([RID])]) for _ in range(ROW_DEFER_LAP_CAP + 2))
+        except PpRowDeferCapExceeded:
+            ok = False
+        if ok:
+            _plan_admits(st, r)
+        out.append((kept, ok, r.to_finish is not None))
+    return out
+
+
+def test_a2_idle_release_with_busy_pp0_keeps_the_hold(monkeypatch):
+    for kept, ok, fin in _busy_vote_then_frame(monkeypatch):
+        assert kept, "a BUSY PP0 in the vote must not release the hold"
+        assert ok, "the frame naming the rid stays executable"
+        assert fin, "and the admitting plan applies PP0's abort"
+
+
+def test_a2_mutant_r2_release_on_busy_pp0_is_caught(monkeypatch):
+    monkeypatch.setattr(pp_abort, "pp0_idle_in_vote", lambda slots: True)
+    res = _busy_vote_then_frame(monkeypatch)
+    assert not all(ok for _, ok, _ in res), "MUTANT R2 survived: release on busy PP0 must be #1180"
+
+
+def _second_abort(monkeypatch):
+    _, fol, (r0, r1, r2) = _specimen(monkeypatch)
+    st, r = fol[0], r1
+    S.abort_request(st, AbortReq(rid=RID, weg2_pp0_admitted=False))   # a later, unstamped/False abort
+    try:
+        ok = all(_probe(monkeypatch, st, [_frame([RID])]) for _ in range(ROW_DEFER_LAP_CAP + 2))
+    except PpRowDeferCapExceeded:
+        ok = False
+    return st, r, ok
+
+
+def test_second_abort_joins_the_open_hold(monkeypatch):
+    st, r, ok = _second_abort(monkeypatch)
+    assert ok and st.waiting_queue == [r] and st.sent == []
+    _plan_admits(st, r)
+    assert r.to_finish is not None and not getattr(st, pp_abort.HELD_ATTR, None)
+
+
+def test_mutant_second_abort_pops_at_receipt_is_caught(monkeypatch):
+    real = pp_abort.hold_waiting_abort
+
+    def _no_join(s, recv_req):
+        held = getattr(s, pp_abort.HELD_ATTR, None)
+        if held and getattr(recv_req, "weg2_pp0_admitted", None) is not True:
+            return False                               # the pre-defence form: no join
+        return real(s, recv_req)
+
+    monkeypatch.setattr(pp_abort, "hold_waiting_abort", _no_join)
+    _, _, ok = _second_abort(monkeypatch)
+    assert not ok, "MUTANT survived: a second abort popping at receipt must be #1180"
 
 
 def test_verdict_table():

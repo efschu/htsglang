@@ -176,9 +176,15 @@ def _matches(rid, target: str, abort_all: bool) -> bool:
 
 
 def pp0_inflight_reqs(scheduler):
-    """Every request PP0 has admitted and not yet retired: the microbatches
-    (launched and resident), the running and last batch, the chunked request.
-    ``getattr`` throughout -- a stand-in answers what it has."""
+    """Every request a frame PP0 sent names and whose pass has not come back:
+    the batches of ``_pp_launched_batches`` (set at the launch on every rank,
+    popped when the slot's result is consumed -- #1225) plus the chunked
+    request (its next chunk's frame is still PP0's to send). NOT ``mbs`` /
+    ``last_batch``: both keep a COMPLETED batch until the slot is planned
+    again, and a rid that ran everywhere and was requeued everywhere (#968b
+    requeue, void park, retreat) would read admitted -- the followers would
+    hold an abort no frame ever ends (nf-review-k14-1016 A1). ``getattr``
+    throughout -- a stand-in answers what it has."""
     seen, out = set(), []
 
     def _add(r):
@@ -187,10 +193,7 @@ def pp0_inflight_reqs(scheduler):
             out.append(r)
 
     _add(getattr(scheduler, "chunked_req", None))
-    batches = list(getattr(scheduler, "mbs", None) or ())
-    batches += list(getattr(scheduler, "running_mbs", None) or ())
-    batches += [getattr(scheduler, "running_batch", None), getattr(scheduler, "last_batch", None)]
-    for b in batches:
+    for b in list((getattr(scheduler, "_pp_launched_batches", None) or {}).values()):
         for r in (getattr(b, "reqs", None) or ()) if b is not None else ():
             _add(r)
     return out
@@ -241,10 +244,24 @@ def hold_waiting_abort(scheduler, recv_req) -> bool:
             return False
         if getattr(recv_req, "abort_all", False):
             return False
+        rid = str(getattr(recv_req, "rid", "") or "")
+        if not rid:
+            return False
+        open_holds = [k for k in (getattr(scheduler, HELD_ATTR, None) or {})
+                      if _matches(k, rid, False)]
+        if open_holds and unadmitted_here(scheduler, rid):
+            # A second abort of a rid whose hold is open JOINS the hold
+            # (nf-review-k14-1016 defence): the first abort already carried
+            # PP0's "a frame names it"; popping now on a later stamp would
+            # reopen #1180 for the frame still on its way.
+            logger.info(
+                "WEG2-PP-WAITING-ABORT joined rid=%s pp_rank=%s stamp=%s: a hold for it is "
+                "open -- this abort is settled with it (K14)",
+                rid, getattr(ps, "pp_rank", "?"), getattr(recv_req, "weg2_pp0_admitted", None))
+            return True
         if getattr(recv_req, "weg2_pp0_admitted", None) is not True:
             return False
-        rid = str(getattr(recv_req, "rid", "") or "")
-        if not rid or row_authority_of(scheduler) is False:
+        if row_authority_of(scheduler) is False:
             return False
         queued = unadmitted_here(scheduler, rid)
         if not queued:
