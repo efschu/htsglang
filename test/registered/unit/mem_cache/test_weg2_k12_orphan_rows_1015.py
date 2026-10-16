@@ -201,3 +201,13 @@ def test_the_belt_at_row_num_host_pages_returns_false_without_raising():
     last = SimpleNamespace(name="qsa_indexer", keys=["k"],
                            host_indices=torch.arange((MIRROR_ROWS - 1) * PAGE, MIRROR_ROWS * PAGE))
     assert fn(backend, [last]) == {"qsa_indexer": [True]}
+
+
+def test_the_first_id_past_the_real_rows_is_refused():
+    """Review M1 (``>`` for ``>=``): id S + A is the first non-row (the first
+    read placeholder) -- refused even when it is the only one."""
+    hv = torch.arange(STAGING, STAGING + 2 * PAGE)
+    hv[PAGE] = STAGING + ARENA_TOKENS
+    t = _Tree()
+    t.write_backup_storage(_node(hv))
+    assert t.writes == []

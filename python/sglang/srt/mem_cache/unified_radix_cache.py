@@ -6272,7 +6272,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 logger.warning("#1427 draft complete raised: %r", exc)
         # A2: the pages this write LOST (late ack after a take-over: no
         # reference) leave their old slot NOW -- re-pointed or orphaned in place
-        self._a2_settle_lost(node, pool, dpool, hv)
+        orphaned = int(self._a2_settle_lost(node, pool, dpool, hv) or 0)
         (getattr(self, "_weg2_direct_mamba_rows", None) or {}).pop(node.id, None)
         mp = self._weg2_mamba_pool()
         if mp is not None and len(node.component_data) > int(ComponentType.MAMBA):
@@ -6286,13 +6286,88 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 else:
                     if not lost_anchor:
                         self._weg2_release_inner_anchor(node, mp)
-        node.l3_present = True
+        UnifiedRadixCache._k12_direct_l3_verdict(self, node, orphaned)
         n = getattr(self, "_1427_direct_n", 0) + 1
         self._1427_direct_n = n
         if n <= 8 or n % 256 == 0:
             logger.info("#1427 DIRECT-WRITE ACK node=%s pages=%d completed_for_all=%d (n=%d)",
                         getattr(node, "id", "?"), int(hv.numel()), done, n)
         return True
+
+    def _k12_direct_l3_verdict(self, node, orphaned: int) -> None:
+        """K12c review A3 (nf-review-k12c-1016): ``l3_present`` after a direct
+        write's ack.
+
+        * Pages ``settle_lost_rows`` ORPHANED (A2: the write lost its key, the
+          key has no COMPLETE slot) are NOT in L3 and their host rows carry no
+          bytes -- the device copy is the only one. No ``l3_present`` then
+          (SGLANG_WEG2_L3_PRESENT_STRICT; switch off = the old unconditional
+          mark), so L3-DROP never drops that device copy, and the node is
+          REPUBLISHED from it (:meth:`_k12_republish_orphaned`).
+        * On a Form A group (R12, H1) the mark is TP0's verdict: TP0 sets it
+          and sends the R12 L3 event (``record_l3``); a worker never sets it
+          from its own ack. Off R12 the rank's own ack decides, as before.
+        """
+        strict = UnifiedRadixCache._weg2_l3_present_strict()
+        if orphaned and strict:
+            n = getattr(UnifiedRadixCache, "_k12_orphan_direct_n", 0) + 1
+            UnifiedRadixCache._k12_orphan_direct_n = n
+            if n <= 16 or (n & (n - 1)) == 0:
+                logger.warning(
+                    "K12 A2-ORPHAN DIRECT-ACK node=%s orphaned_pages=%d n=%d: no l3_present -- the "
+                    "device copy is the only copy of those pages; republish from it",
+                    getattr(node, "id", "?"), int(orphaned), n,
+                )
+            UnifiedRadixCache._k12_republish_orphaned(self, node, int(orphaned))
+            return
+        _role = _r12.role()
+        if _r12.l3_group_on() and _role is not None:
+            if _role == "host":
+                node.l3_present = True
+                _r12.record_l3(self, node)
+            return  # worker: TP0's L3 event sets it
+        node.l3_present = True
+
+    def _k12_republish_orphaned(self, node, orphaned: int) -> bool:
+        """K12c review A3: give the orphaned node's host layer back so the node
+        is an un-backed DEVICE node again -- the publish sweep then writes it
+        from the device copy like any other (a fresh host copy, a fresh store
+        write), instead of the A2 loss ending as a recompute at the next read.
+
+        Group-uniform, never rank-local: on a Form A group only TP0 (R12
+        host) decides -- it releases and sends its node STATE (``record_state``)
+        at the next ``tp<-reqs`` broadcast, where every worker reconciles to it
+        (drops its host rows; the device copy stays) before any request of the
+        pass. A worker does nothing on its own ack. A pipeline-parallel tree
+        (P, pp > 1, no R12) does not republish: a stage-local host drop would
+        part the stages' trees; the node keeps no l3_present (L3-DROP spares
+        its device copy) and A2's load proof re-points or stops by name.
+        A release that cannot run (host lock held, device copy already gone)
+        leaves the node as it is. The orphan ids themselves are never freed
+        (ArenaMHAHostPool.free touches neither staging nor arena for them).
+        No timer, no new collective. Returns True when the host layer was
+        given back on this rank."""
+        role = _r12.role()
+        if role == "worker":
+            return False
+        if role is None and int(getattr(self, "pp_size", 1) or 1) > 1:
+            return False
+        self._weg2_release_chain_piece_host(node)
+        released = node.component_data[BASE_COMPONENT_TYPE].host_value is None
+        if released:
+            node.l3_present = False
+            if role == "host":
+                _r12.record_state(self, node, why="k12-orphan-republish")
+            n = getattr(UnifiedRadixCache, "_k12_republish_n", 0) + 1
+            UnifiedRadixCache._k12_republish_n = n
+            if n <= 16 or (n & (n - 1)) == 0:
+                logger.warning(
+                    "K12 A2-ORPHAN REPUBLISH node=%s orphaned_pages=%d role=%s n=%d: host layer "
+                    "given back%s; the publish sweep writes the node from its device copy",
+                    getattr(node, "id", "?"), int(orphaned), role or "-", n,
+                    " (R12 STATE: every worker follows at the next broadcast)" if role == "host" else "",
+                )
+        return released
 
     # -- A2 (nf-h54-review-1015 B1): rows of a LOST write never stay on the old slot ---------------
 
@@ -6310,13 +6385,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         keep = torch.tensor([(int(r) - S) not in lost for r in rows.reshape(-1).tolist()], dtype=torch.bool)
         return rows.reshape(-1)[keep]
 
-    def _a2_settle_lost(self, node, pool, dpool, hv) -> None:
+    def _a2_settle_lost(self, node, pool, dpool, hv) -> int:
         """A2: the KV pages ``complete_write`` lost leave their old slot at the
         ack (``ArenaMHAHostPool.settle_lost_rows``: re-pointed to the key's
         COMPLETE slot, else orphaned), the draft pool's row map follows them,
         and the draft's own lost pages lose their row map entries (a draft row
         on a recycled slot would load another key's draft KV and give its
-        reference back on release). Host bookkeeping only; never raises."""
+        reference back on release). Host bookkeeping only; never raises.
+        Returns the number of pages ORPHANED on this rank (K12c review A3)."""
         try:
             row_slot = getattr(dpool, "row_slot", None) if dpool is not None else None
             if row_slot is not None:
@@ -6337,7 +6413,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                                  "offers no settle_lost_rows -- lost pages stay on their old slot",
                                  type(pool).__name__, getattr(node, "id", "?"), n)
                 return
-            res = settle(hv, getattr(node, "hash_value", None))
+            res = settle(hv, getattr(node, "hash_value", None)) or {}
             if row_slot is not None and res.get("moved"):
                 S = int(dpool.staging_rows)
                 give = set()
@@ -6355,8 +6431,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     gl = [s_ for s_, pend in zip(gl, dpool._pend_has(gl)) if not pend]
                     if gl:
                         dpool.arena.ref_slots(gl, -1)
+            return int(res.get("orphaned", 0) or 0)
         except Exception as exc:  # noqa: BLE001 -- an ack is never broken by the settle
             logger.warning("A2 LOST-ROWS settle raised on node %s: %r", getattr(node, "id", "?"), exc)
+        return 0
 
     def _a2_mamba_lost(self, node, mp, mhv) -> bool:
         """A2: the node's mamba anchor whose write was LOST (late ack, no
