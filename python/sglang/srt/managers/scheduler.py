@@ -7282,7 +7282,8 @@ class Scheduler(
             else:
                 keep.append(req)
         # D-NORECOMPUTE (user law 02.10.): a released SHORT read whose tail no
-        # agreed F4/E2 window adopts goes through RESUME-VIA-P, never to D's extend
+        # agreed F4/E2 window adopts goes through RESUME-VIA-P, never to D's extend --
+        # unless it is a D-direct leg within its front X (X-GESETZ F-D 16.10., law 4)
         try:
             from sglang.srt.weg2 import d_norecompute as _dnr
 
@@ -7292,8 +7293,9 @@ class Scheduler(
                 for _r, _s, _l in release:
                     # TAIL-CONSUME-ON-FULL companion: a re-read that completed raises the stale witness
                     _dnr.refresh_delivered(_r, _recs.get(str(_r.rid)))
+                    # X-GESETZ F-D (16.10.): a D-direct leg under its X is D's own extend
                     _rem = _dnr.d_would_compute(_r)
-                    if _rem > 0 and _dnr.divert(self, _r, _rem):
+                    if _rem > 0 and not _dnr.d_direct_extends(self, _r, _rem) and _dnr.divert(self, _r, _rem):
                         continue
                     _rel2.append((_r, _s, _l))
                 release = _rel2
