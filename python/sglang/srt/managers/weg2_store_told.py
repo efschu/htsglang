@@ -1566,7 +1566,7 @@ def _pp0_publish_paced(scheduler, recv_reqs: List) -> List:
     if fb_on and (pacing or fb_watch or fb_drain):
         # PF: the followers' read acks that have landed (no wait), BEFORE
         # the verdicts below read them.
-        _fb.pp0_harvest(scheduler)
+        _fb.pp0_harvest(scheduler, now)
         fb_parked = _parked(scheduler)
     out: List[Any] = []
     if fb_on and fb_watch:
@@ -1617,7 +1617,18 @@ def _pp0_publish_paced(scheduler, recv_reqs: List) -> List:
                 # H64 GROUP-FLOOR: the same check at the floor depth.
                 _tf_told, _ = _tf.pp0_verdict(scheduler, p.req, told_final, p.absolute)
                 if _tf_told != told_final:
-                    told_final, reason = _tf_told, "told_fidelity"
+                    # B5 ANCHOR-ACKS (NF h16p 12:16:46Z weg2-22-70: told 117184, acks 107584/107584, PP0 admissible
+                    # 67584 -> told=0, 117k re-prefilled): the next deeper depth every follower proved AND PP0's own
+                    # tree resumes from -- one PP0 decision, the floor marker carries it to every rank.
+                    _alt = _fb.pp0_floor_below(scheduler, rid, p.req, told_final, p.absolute)
+                    if _alt > 0:
+                        logger.warning(
+                            "PF TOLD-FLOOR TF-RETRY rid=%s told=%d refused=%d -> %d: PP0's tree cannot resume at "
+                            "the floor, the next depth every stage proved and PP0 resumes from is admitted for "
+                            "EVERY rank (B5 anchor acks)", _rt(rid), p.told, told_final, _alt)
+                        told_final, reason = _alt, _fb.REASON_FLOOR
+                    else:
+                        told_final, reason = _tf_told, "told_fidelity"
             pacing.pop(rid, None)
             _fb.pp0_note_verdict(scheduler, rid, p.told, told_final, reason, now, p.published_at)
             admit = Weg2StoreAdmit(rid=rid, told=told_final)

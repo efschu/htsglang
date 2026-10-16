@@ -224,7 +224,7 @@ def test_case_a_settle_acks_in_the_absorbing_pass(monkeypatch):
         def spy(self, ack, orig=orig, sent=sent):
             ok = orig(self, ack)
             if ok:
-                for rid, _own in ack.reads:
+                for rid, _own, *_anchors in ack.reads:  # B5: the entry may carry anchors
                     sent.setdefault((self.rank, rid), ring_box[0].pass_n)
             return ok
 

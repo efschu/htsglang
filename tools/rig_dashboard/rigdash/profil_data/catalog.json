@@ -74498,7 +74498,7 @@
    "id": "SGLANG_WEG2_FOLLOWER_REACH_TOLD",
    "kind": "env",
    "lesestellen": [
-    "managers/weg2_store_told.py:1822"
+    "managers/weg2_store_told.py:1833"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_FOLLOWER_REACH_TOLD",
@@ -74508,7 +74508,7 @@
     "baum": "nf",
     "file": "managers/weg2_store_told.py",
     "kind": "os.environ",
-    "line": 1822
+    "line": 1833
    },
    "status": "geerntet",
    "text": "",
@@ -84565,7 +84565,7 @@
    "id": "SGLANG_WEG2_TOLD_ACK_DRAIN",
    "kind": "env",
    "lesestellen": [
-    "managers/weg2_told_fallback.py:199"
+    "managers/weg2_told_fallback.py:204"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_TOLD_ACK_DRAIN",
@@ -84575,9 +84575,40 @@
     "baum": "nf",
     "file": "managers/weg2_told_fallback.py",
     "kind": "os.environ",
-    "line": 199
+    "line": 204
    },
    "status": "unerklaert",
+   "text": "",
+   "type": "os.environ"
+  },
+  "SGLANG_WEG2_TOLD_ANCHOR_ACKS": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": null,
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "B5 ANCHOR-ACKS (NF h16p 226aad7105, 15.10. 12:04:24 / 12:16:46Z): a follower's ack carries the resumable anchor depths below its reach; PP0 floors at the deepest depth EVERY stage (itself included) can resume from.",
+   "id": "SGLANG_WEG2_TOLD_ANCHOR_ACKS",
+   "kind": "env",
+   "lesestellen": [
+    "managers/weg2_told_fallback.py:215"
+   ],
+   "level": "experte",
+   "name": "SGLANG_WEG2_TOLD_ANCHOR_ACKS",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "baum": "nf",
+    "file": "managers/weg2_told_fallback.py",
+    "kind": "os.environ",
+    "line": 215
+   },
+   "status": "geerntet",
    "text": "",
    "type": "os.environ"
   },
@@ -84692,7 +84723,7 @@
    "id": "SGLANG_WEG2_TOLD_FALLBACK_MIN_PASSES",
    "kind": "env",
    "lesestellen": [
-    "managers/weg2_told_fallback.py:213"
+    "managers/weg2_told_fallback.py:224"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_TOLD_FALLBACK_MIN_PASSES",
@@ -84702,7 +84733,7 @@
     "baum": "nf",
     "file": "managers/weg2_told_fallback.py",
     "kind": "os.environ",
-    "line": 213
+    "line": 224
    },
    "status": "unerklaert",
    "text": "",
@@ -84816,7 +84847,7 @@
    "id": "SGLANG_WEG2_TOLD_GROUP_FLOOR",
    "kind": "env",
    "lesestellen": [
-    "managers/weg2_told_fallback.py:204"
+    "managers/weg2_told_fallback.py:209"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_TOLD_GROUP_FLOOR",
@@ -84826,7 +84857,7 @@
     "baum": "nf",
     "file": "managers/weg2_told_fallback.py",
     "kind": "os.environ",
-    "line": 204
+    "line": 209
    },
    "status": "unerklaert",
    "text": "",
@@ -85748,7 +85779,7 @@
    "id": "SGLANG_WEG2_W27_HELD_STOP",
    "kind": "env",
    "lesestellen": [
-    "managers/weg2_store_told.py:1879"
+    "managers/weg2_store_told.py:1890"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_W27_HELD_STOP",
@@ -85758,7 +85789,7 @@
     "baum": "nf",
     "file": "managers/weg2_store_told.py",
     "kind": "os.environ",
-    "line": 1879
+    "line": 1890
    },
    "status": "geerntet",
    "text": "",
@@ -87664,25 +87695,25 @@
    "abweichung": 47,
    "beide": 2461,
    "nur_27b": 180,
-   "nur_nf": 104
+   "nur_nf": 105
   },
-  "entries": 2763,
-  "envs": 1884,
+  "entries": 2764,
+  "envs": 1885,
   "erklaert": 305,
   "flags": 864,
-  "geerntet": 1710,
+  "geerntet": 1711,
   "kuratiert": 125,
   "unerklaert": 623
  },
- "tree_rev": "27b=02123ee2ef+nf=75e3ee8abd+lbv-deadlock-e23abfcb05+prio-alter-fa99a484ae+w3-drain-e7cfda7fbe+follower-round-b76e5fce79+h16m-int-1014+readdepth-60ad6ba20a+h16n-int-1015+h54-park-join-1015+chainkey-a2-83f974259f+h64-toldfallback-de76a8dc18+h16o-int-1015+flipstall-31764c30e0+arenafull-231a47b449+h16p-int-1015",
+ "tree_rev": "27b=02123ee2ef+nf=75e3ee8abd+lbv-deadlock-e23abfcb05+prio-alter-fa99a484ae+w3-drain-e7cfda7fbe+follower-round-b76e5fce79+h16m-int-1014+readdepth-60ad6ba20a+h16n-int-1015+h54-park-join-1015+chainkey-a2-83f974259f+h64-toldfallback-de76a8dc18+h16o-int-1015+flipstall-31764c30e0+arenafull-231a47b449+h16p-int-1015+b5-anchoracks-1015",
  "trees": {
   "27b": {
    "entries": 2641,
    "rev": "02123ee2ef"
   },
   "nf": {
-   "entries": 2565,
-   "rev": "75e3ee8abd+lbv-deadlock-e23abfcb05+prio-alter-fa99a484ae+w3-drain-e7cfda7fbe+follower-round-b76e5fce79+h16m-int-1014+readdepth-60ad6ba20a+h16n-int-1015+h54-park-join-1015+chainkey-a2-83f974259f+h64-toldfallback-de76a8dc18+h16o-int-1015+flipstall-31764c30e0+arenafull-231a47b449+h16p-int-1015"
+   "entries": 2566,
+   "rev": "75e3ee8abd+lbv-deadlock-e23abfcb05+prio-alter-fa99a484ae+w3-drain-e7cfda7fbe+follower-round-b76e5fce79+h16m-int-1014+readdepth-60ad6ba20a+h16n-int-1015+h54-park-join-1015+chainkey-a2-83f974259f+h64-toldfallback-de76a8dc18+h16o-int-1015+flipstall-31764c30e0+arenafull-231a47b449+h16p-int-1015+b5-anchoracks-1015"
   }
  },
  "warnungen": []
