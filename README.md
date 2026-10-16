@@ -5,13 +5,12 @@ fLLiper is an LLM inference server for mismatched GPUs, derived from [SGLang](ht
 project is called fLLiper from release 0.1.0 on. The Python package is `flliper`, the runtime environment variables are
 `FLLIPER_*`, the P/D-flip subsystem is `pdflip` (`FLLIPER_PDFLIP_*`, `--pdflip-*`, log markers `PDFLIP-*`).
 
-> **Status: release candidate RC4.** Release 0.1.0 is prepared in the repository. RC4 is the state of the integration branches
-> `desk/flliper-27b-int-1016` (27B line) and `desk/flliper-nf-int-1015` (Flash-Next line): RC3 (the vision rebuild, the pool-leak fix, the wedge instrument,
-> the W17 host-pressure line and, on the NF line, the room-vote and the D-WALL-HEAD class fix) plus the fixes of the NF steady-state line: on the NF line
-> priority lanes (default on), the host-RAM guards that warn instead of stopping, the flush and seat-gate fixes, the boot-heap freeze, the prefill-OOM retreat and the
-> group-wide void pass; on the 27B line the subset its tree reaches (collect-P, early-leg cap, host-RAM warnings behind the existing guard switches (default off = warn), boot-heap freeze
-> on by default). Catalog `8cc42e79...` (2715 entries, 138 edges). RC4 is **not** the final 0.1.0:
-> acceptance boots on the metal are open (no fLLiper image has booted); the pool-leak fix has metal evidence only from images of the old name (release notes, section 5). The image is
+> **Status: release candidate RC5.** Release 0.1.0 is prepared in the repository. RC5 is the state of the integration branches
+> `desk/flliper-27b-int-1017` (27B line) and `desk/flliper-nf-int-1016` (Flash-Next line): on the NF line the code of the NF steady state h16s (the line the NF metal runs:
+> priority lanes with priority as age, row authority on the PP prefill group, the told / READ-ROOM / ZERO-ANCHOR line, the seat taken at the hand-off,
+> the host-RAM guards that warn instead of stopping, the boot-heap freeze, the prefill-OOM retreat and the group-wide void pass), on the 27B line the RC4 code;
+> both lines with the build fixes (git-lfs-clean fixtures, FlashInfer JIT seed). Catalog `b60205cf...` (2790 entries, 139 edges). RC5 is **not** the final 0.1.0:
+> acceptance boots on the metal are open (no fLLiper image has booted); the NF code is proven on the metal only under the old name (release notes, sections 4f and 5). The image is
 > **not published** yet; pushing the tree to `github.com/efschu/fLLiper` and the image to `ghcr.io` are user gates.
 
 ## What is in it
