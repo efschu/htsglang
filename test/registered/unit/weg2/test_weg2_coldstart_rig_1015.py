@@ -2652,10 +2652,15 @@ def s10_client_abort_during_row_frame(monkeypatch, *, pp0_admitted=True, chunked
     r0 = _req10()
     if pp0_admitted:
         pp0.mbs[S10_SLOT] = SimpleNamespace(reqs=[r0])           # #969N ADMIT slot=2, launched
+        pp0._pp_launched_batches = {S10_SLOT: pp0.mbs[S10_SLOT]}   # #1225: launched, not delivered
         if chunked:
             pp0.chunked_req = r0
     else:
-        pp0.waiting_queue = [r0]                                 # still queued on PP0: no frame names it
+        # still queued on PP0: no frame names it; slot 2 holds a COMPLETED batch of it (delivered, requeued
+        # everywhere -- #968b / void park / retreat): mbs and last_batch keep it, _pp_launched_batches does not
+        done = SimpleNamespace(reqs=[_req10()])
+        pp0.mbs[S10_SLOT], pp0.last_batch, pp0._pp_launched_batches = done, done, {}
+        pp0.waiting_queue = [r0]
     fol = [_s10_stage(monkeypatch, r) for r in range(1, WORLD)]
     reqs = [_req10() for _ in fol]
     for st, r in zip(fol, reqs):
