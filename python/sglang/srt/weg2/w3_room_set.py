@@ -233,6 +233,10 @@ class _Ctx:
             self.keep_payable = UnifiedRadixCache._w3_keep_payable_state(cache)
         except Exception:  # noqa: BLE001 - unreadable walk: no filter (the old spill's behaviour)
             self.keep_payable = None
+        try:
+            self.told = UnifiedRadixCache._told_head_ids(cache)   # A7 TOLD-HEAD
+        except Exception:  # noqa: BLE001 - a hand-built tree without the pins
+            self.told = set()
         self.cap_left = page_cap() if cap is None else int(cap)
         self.tried: Set[int] = set()
         self.capped = 0
@@ -249,8 +253,8 @@ def _device_candidate(cache: Any, node: Any, pool: Any, ctx: Optional[_Ctx] = No
 
     if node is cache.root_node:
         return False
-    if ctx is not None and id(node) in ctx.skip:
-        return False
+    if ctx is not None and (id(node) in ctx.skip or id(node) in ctx.told):
+        return False                  # the claimer's chain / the head above an open told's span (A7)
     cd = node.component_data[BASE_COMPONENT_TYPE]
     hv = cd.host_value
     if hv is None or cd.value is None or hv.numel() == 0:
