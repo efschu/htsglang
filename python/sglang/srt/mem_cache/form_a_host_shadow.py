@@ -103,6 +103,10 @@ SPILL = "spill"
 #: complete page) -- every worker sets ``l3_present`` from this, never from its
 #: own ack, so no rank reads a different ``l3_present`` for the same node
 L3 = "l3"
+#: READ-ROOM-D (review readroomd2 A4): TP0 released a node's KV host rows for a P read -- applied on a worker
+#: exactly like STATE, but an apply that ends ``pending`` or ``deleted`` is NAMED at every occurrence
+#: (READ-ROOM-STATE-DIVERGED), like SPILL-DIVERGED: in that window the trees differ
+RRSTATE = "rrstate"
 
 #: #239 S4b part 4: broadcasts TP0 waits for an incomplete token-cut page
 #: before it falls back to the ack's pre-cut decision (a write of every owner
@@ -318,7 +322,7 @@ def record_state(tree: Any, node: Any, why: str = "") -> None:
         _S.absent.add(k)
     else:
         _S.absent.discard(k)
-    _S.ledger.append((STATE, k[0], k[1], exists, kv, m))
+    _S.ledger.append((RRSTATE if why == "read-room" else STATE, k[0], k[1], exists, kv, m))
 
 
 def _pkey(e) -> tuple:
@@ -543,7 +547,7 @@ def attach(recv_reqs: List) -> List:
     if n:
         kinds = [e[0] for e in v.events]
         logger.info("R12 HOST-VERDICT SENT seq=%d events=%d transit=%d state=%d rebind=%d spill=%d l3=%d (n=%d)",
-                    v.seq, len(v.events), kinds.count(TRANSIT), kinds.count(STATE),
+                    v.seq, len(v.events), kinds.count(TRANSIT), kinds.count(STATE) + kinds.count(RRSTATE),
                     kinds.count(REBIND), kinds.count(SPILL), kinds.count(L3), n)
     return [v] + list(recv_reqs)
 
@@ -689,6 +693,8 @@ def apply(tree: Any, events: List, seq: int = 0) -> Dict[str, int]:
         if out == "pending":
             _S.pending[(h, int(depth))] = e
         c[out] += 1
+        if kind == RRSTATE and out in ("pending", "deleted", "short", "unreconcilable"):
+            _rrstate_diverged(node, h, depth, out, seq)
     n = _note("applied")
     if n and (events or any(c[k] for k in ("transit", "kv", "anchor", "deleted", "rebind", "spill"))):
         logger.info(
@@ -724,6 +730,20 @@ def _spill_diverged(node: Any, h: Any, depth: Any, out: str, seq: int) -> None:
         "rows freed, l3_present) and this worker could not apply it -- the ranks now disagree on its host copy",
         int(seq), str(getattr(node, "rid", None) or "-"), getattr(node, "id", "?"), depth,
         str(h)[:16], out, n)
+
+
+def _rrstate_diverged(node: Any, h: Any, depth: Any, out: str, seq: int) -> None:
+    """READ-ROOM-D (review readroomd2 A4): a worker that cannot apply TP0's READ-ROOM STATE at once. ``pending``:
+    the node is busy here (under the token cut its own store write holds the rows) -- until the next broadcast
+    applies it, TP0 has no host copy and this worker has one, so a device eviction in that window takes TP0's
+    Form A L3-DROP and this worker's demotion; ``deleted``: this worker dropped a node TP0 keeps. Named at EVERY
+    occurrence (no stop, no timer): the metal count says how often the window opens."""
+    n = _S.counts.get("rrstate_diverged", 0) + 1
+    _S.counts["rrstate_diverged"] = n
+    logger.warning(
+        "R12 READ-ROOM-STATE-DIVERGED seq=%d node=%s depth=%s hash=%s out=%s (n=%d): TP0 released this node's KV "
+        "host rows for a P read and this worker could not follow at once -- the ranks differ on its host copy "
+        "until the verdict applies", int(seq), getattr(node, "id", "?"), depth, str(h)[:16], out, n)
 
 
 def _reconcile(tree: Any, node: Any, exists: int, kv: int, m: int) -> str:

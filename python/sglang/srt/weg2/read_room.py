@@ -609,15 +609,16 @@ def l3_complete(node: Any, sec: Dict[str, int]) -> bool:
     a page some owner has not finished drops out of ``pages``) and each is on disk or was written now."""
     if int(sec.get("lost", 0)):
         return False
-    if not _l3_strict():
-        # SGLANG_WEG2_L3_PRESENT_STRICT=0 (H16P A2's switch): the old rule, byte for byte -- lost=0 and a page at all
-        return int(sec.get("pages", 0)) > 0
-    if int(sec.get("unpaired", 0)):
+    # review readroomd2 A3: only the UNPAIRED rule follows SGLANG_WEG2_L3_PRESENT_STRICT (H16P A2's switch -- off: a
+    # KV page held back for its QSA index counts as copied, as before A2); the page count never does
+    unpaired = int(sec.get("unpaired", 0))
+    if unpaired and _l3_strict():
         return False
     pages = int(sec.get("pages", 0))
     hv = getattr(node, "hash_value", None)
     need = len(hv) if hv else pages
-    return pages > 0 and pages == need and int(sec.get("on_disk", 0)) + int(sec.get("written", 0)) == need
+    copied = int(sec.get("on_disk", 0)) + int(sec.get("written", 0)) + (0 if _l3_strict() else unpaired)
+    return pages > 0 and pages == need and copied == need
 
 
 def flush_forma_pending() -> int:
@@ -632,6 +633,16 @@ def flush_forma_pending() -> int:
     from sglang.srt.mem_cache import form_a_host_shadow as _r12
     from sglang.srt.mem_cache.unified_radix_cache import BASE_COMPONENT_TYPE, EvictLayer
 
+    def _release(cache, node, base, aux) -> int:
+        """The host copy of ``node`` leaves L2 (real funnel), ``l3_present`` set; returns host rows freed."""
+        for c in aux:   # aux first: never an aux host row without the KV row
+            if node.component_data[c.component_type].host_value is not None:
+                cache._evict_component_and_detach_lru(node, c, target=EvictLayer.HOST, tracker=None)
+        _dev, host_freed = cache._evict_component_and_detach_lru(node, base, target=EvictLayer.HOST, tracker=None)
+        cache.evictable_host_leaves.discard(node)
+        node.l3_present = True
+        return int(host_freed or 0)
+
     out = 0
     for cache, node, hv in todo:
         comps = tuple(cache._components_tuple)
@@ -640,21 +651,22 @@ def flush_forma_pending() -> int:
         cd = node.component_data[BASE_COMPONENT_TYPE]
         owt = getattr(cache, "ongoing_write_through", None) or {}
         if (base is None or cd.host_value is not hv or cd.value is None or node.children
+                or _r12.node_key(node) is None      # review readroomd2 A2: no verdict could reach the workers
                 or not _r12._attached(node) or node.id in owt
                 or getattr(node, "write_through_pending_id", None) is not None
                 or any(int(getattr(c, "host_lock_ref", 0) or 0) > 0 for c in node.component_data)):
             continue
         P = max(1, int(getattr(cache, "page_size", 1) or 1))
-        for c in aux:   # aux first: never an aux host row without the KV row
-            if node.component_data[c.component_type].host_value is not None:
-                cache._evict_component_and_detach_lru(node, c, target=EvictLayer.HOST, tracker=None)
-        _dev, host_freed = cache._evict_component_and_detach_lru(node, base, target=EvictLayer.HOST, tracker=None)
-        cache.evictable_host_leaves.discard(node)
-        node.l3_present = True
-        _r12.record_state(cache, node, why="read-room")
-        # review readroomd B1: l3_present is TP0's group verdict -- every worker sets it from this event (K12b)
-        _r12.record_l3(cache, node)
-        out += int(host_freed or 0) // P
+        l3_before = bool(getattr(node, "l3_present", False))
+        try:
+            out += _release(cache, node, base, aux) // P
+        finally:
+            # review readroomd2 A7: the verdict goes out whatever the release did -- STATE reads the node's ACTUAL
+            # host flags, so a partial release is mirrored as it is, never left on TP0 alone
+            _r12.record_state(cache, node, why="read-room")
+            if node.l3_present and not l3_before:
+                # review readroomd B1: l3_present is TP0's group verdict -- every worker sets it from this event
+                _r12.record_l3(cache, node)
     return out
 
 
@@ -736,7 +748,7 @@ def form_a_spill(cache: Any, pool: Any, need_pages: int, released_out: Optional[
         if mamba is not None and node.component_data[mamba].value is not None:
             # review readroomd B4: a node carrying a Mamba state leaves the device only whole (L3-DROP below would
             # drop the anchor with it) -- the anchors of D stay where they are
-            skip["anchor"] += 1
+            skip["anchor_dev"] = skip.get("anchor_dev", 0) + 1
             continue
         if node.children:
             # review readroomd B4: a spilled node must be able to leave the device without a new arena claim; the
@@ -752,6 +764,11 @@ def form_a_spill(cache: Any, pool: Any, need_pages: int, released_out: Optional[
             skip["aux_host_only"] += 1
             continue
         if int(hv.min()) < staging:
+            continue
+        if _r12.node_key(node) is None:
+            # review readroomd2 A2: an unkeyed node gets no R12 verdict (record_state/record_l3 drop it) -- TP0
+            # alone would change; it is no candidate
+            skip["unkeyed"] = skip.get("unkeyed", 0) + 1
             continue
         cands.append(node)
     keys = cache._w3_spill_keys(pool, cands)
@@ -783,11 +800,13 @@ def form_a_spill(cache: Any, pool: Any, need_pages: int, released_out: Optional[
     k = _ST.d_spills
     if k <= 32 or k % 16 == 0 or released == 0:
         logger.info("%s D-SPILL n=%d need=%d want=%d released_pages=%d nodes=%d candidates=%d unsecured_kept=%d "
-                    "l3=on_disk:%d,written:%d kept=anchor:%d,busy:%d,aux_host_only:%d,host_only:%d ms=%.0f (Form A "
+                    "l3=on_disk:%d,written:%d kept=anchor:%d,anchor_dev:%d,children:%d,unkeyed:%d,busy:%d,"
+                    "aux_host_only:%d,host_only:%d ms=%.0f (Form A "
                     "TP0 decides for group D: an L3-backed host copy of D's tree leaves L2, the device keeps the "
                     "KV, the R12 STATE verdict drops the workers' rows at the next broadcast; anchors untouched)",
                     MARK, k, int(need_pages), want, released, nodes, len(cands), unsecured, on_disk, written,
-                    skip["anchor"], skip["busy"], skip["aux_host_only"], skip["host_only"],
+                    skip["anchor"], skip.get("anchor_dev", 0), skip.get("children", 0), skip.get("unkeyed", 0),
+                    skip["busy"], skip["aux_host_only"], skip["host_only"],
                     (time.perf_counter() - t0) * 1000.0)
     return released
 

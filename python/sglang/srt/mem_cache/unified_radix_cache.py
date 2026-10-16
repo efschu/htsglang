@@ -4675,12 +4675,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def _weg2_l3_drop_forma(self, node: UnifiedTreeNode, tracker: dict[ComponentType, int]) -> bool:
         """READ-ROOM-D, review readroomd B4: on a Form A group (R12) a store-backed device leaf -- ``l3_present``
-        (TP0's group verdict, mirrored by the K12b L3 event), no host copy (the R12 STATE dropped it on every
-        rank) -- leaves the device WITHOUT a new arena claim, like L3-DROP on the local-PP floor. The rule reads
-        only tree state every rank holds alike after the same broadcast (l3_present, backuped, children, the
-        node's write-through and its device lock), never a rank-local room figure: so every rank of the group
-        takes the same decision in the same pass (no #791b split). A leaf with children or a write in flight
-        keeps the old path. Returns True when the node was dropped."""
+        (TP0's group verdict, mirrored by the K12b L3 event; since K12c A3 57fa93fb08 no rank sets it from its own
+        direct-write ack), no host copy (the R12 STATE dropped it) -- leaves the device WITHOUT a new arena claim,
+        like L3-DROP on the local-PP floor. The rule reads only tree state (l3_present, backuped, children, the
+        node's write-through and its device lock), never a rank-local room figure: every rank of the group takes the
+        same decision once it has APPLIED the same verdict (review readroomd2 B2). A verdict a worker could not apply
+        at once (STATE ``pending`` while its own store write holds the rows) leaves one window in which TP0 drops
+        and that worker demotes; it closes at the next broadcast and is named (READ-ROOM-STATE-DIVERGED /
+        SPILL-DIVERGED). A leaf with children or a write in flight keeps the old path. Returns True when the node
+        was dropped."""
         if node.children or node.id in self.ongoing_write_through \
                 or getattr(node, "write_through_pending_id", None) is not None:
             return False
