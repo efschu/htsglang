@@ -5705,11 +5705,20 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         cands = _mad.tree_anchors(root=self.root_node, anchor_of=lambda n: self._weg2_anchor_of(n, mp),
                                   include_untagged=True)
         cands = [a for a in cands if a.node is not node]
+        # K15c review A1 (16.10., boot 1016_103428 10:42:16 TP0 DISPLACE why=park_first node=59
+        # dropped=0): the park spill takes the same victims -- on the Form A host only ref-free ones
+        _rf = UnifiedRadixCache._k15c_ref_free_filter(arena) if _r12.role() == "host" else None
+        _shared = set()
+        if _rf is not None:
+            _shared.update(id(a.node) for a in cands if not _rf(a))
+            cands = [a for a in cands if _rf(a)]
         victim = _mad.pick_park_victim(cands, chain_ids=self._weg2_park_chain(),
                                        claimer_is_end=bool(node.weg2_park_end),
                                        claimer_lane=self._weg2_claim_lane(node, park=True))
         if victim is None or not victim.slots:
-            victim = self._weg2_last_resort_victim(node, mp, park=True)
+            victim = self._weg2_last_resort_victim(node, mp, park=True, ref_free=_rf, shared_out=_shared)
+        if (victim is None or not victim.slots) and _shared:
+            UnifiedRadixCache._k15c_note_no_free(node, _shared)
         depth = _mad.ancestor_path(target=node, root=self.root_node)[1]
         if victim is None or not victim.slots:
             logger.warning("WEG2 PARK-END-ANCHOR-FIRST SPILL node=%s depth=%s end=%s victim=none (no releasable "
@@ -5724,15 +5733,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                            victim.depth, sec)
             return False
         st = self._weg2_anchor_ledger.of(victim.rid)
-        self._weg2_release_anchor(victim, mp, st, why="park_first", for_rid="park")
+        dropped = int(self._weg2_release_anchor(victim, mp, st, why="park_first", for_rid="park") or 0)
         n = getattr(UnifiedRadixCache, "_weg2_park_spill_n", 0) + 1
         UnifiedRadixCache._weg2_park_spill_n = n
+        # K15c review A2: "took a slot" only when the release dropped one; else named honestly, False
         logger.info("WEG2 PARK-END-ANCHOR-FIRST SPILL n=%d node=%s depth=%s end=%s victim_node=%s victim_rid=%s "
-                    "victim_depth=%d on_disk=%d written=%d (the park chain took a slot; the victim's anchor is on L3)",
+                    "victim_depth=%d on_disk=%d written=%d dropped=%d (%s)",
                     n, getattr(node, "id", "?"), depth, bool(node.weg2_park_end), victim.node.id,
                     str(victim.rid)[:16] or "-", victim.depth, int(sec.get("on_disk", 0) or 0),
-                    int(sec.get("written", 0) or 0))
-        return True
+                    int(sec.get("written", 0) or 0), dropped,
+                    "the park chain took a slot; the victim's anchor is on L3" if dropped > 0 else
+                    "released, slot still referenced by another process -- no slot freed; the victim's anchor is on L3")
+        return dropped > 0
 
     #: FLUSH-SPILL: anchors spilled to L3 and freed at sleep flushes (per process)
     _weg2_flush_spill_n = 0
@@ -5774,13 +5786,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if victim is None or not victim.slots:
             victim = self._weg2_last_resort_victim(node, mp, ref_free=_rf, shared_out=_shared)
         if (victim is None or not victim.slots) and _shared:
-            UnifiedRadixCache._k15c_shared_n = getattr(UnifiedRadixCache, "_k15c_shared_n", 0) + 1
-            k = UnifiedRadixCache._k15c_shared_n
-            if k <= 32 or k % 256 == 0:
-                logger.warning("K15C SPILL-NO-FREE-VICTIM node=%s shared=%d (n=%d): every releasable anchor "
-                               "slot is also referenced by another process (P's stages / a reader) -- releasing "
-                               "ours would free no slot, so none is released", getattr(node, "id", "?"),
-                               len(_shared), k)
+            UnifiedRadixCache._k15c_note_no_free(node, _shared)
         if victim is None or not victim.slots:
             logger.warning("WEG2 MAMBA-ARENA FLUSH-SPILL node=%s depth=%s victim=none (no releasable "
                            "intermediate anchor in the tree -- the node stays un-backed, named)",
@@ -5797,15 +5803,21 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                            "could not be secured (%s)", victim.node.id, victim.depth, sec)
             return False
         st = self._weg2_anchor_ledger.of(victim.rid)
-        self._weg2_release_anchor(victim, mp, st, why="flush_spill", for_rid="flush")
+        dropped = int(self._weg2_release_anchor(victim, mp, st, why="flush_spill", for_rid="flush") or 0)
         UnifiedRadixCache._weg2_flush_spill_n += 1
+        # K15c review A2 (boot 1016_103428 10:59:57 DISPLACE dropped=0 then "its slot freed"): the
+        # success line only when the release dropped a slot; True only then (the caller's retry
+        # claim would be refused again otherwise)
         logger.info("WEG2 MAMBA-ARENA FLUSH-SPILL n=%d node=%s victim_rid=%s victim_node=%s depth=%d "
-                    "on_disk=%d written=%d (sleep flush: the victim's anchor is on L3, its slot freed "
-                    "for the un-backed node -- no anchor lost, no D recompute after the wake)",
+                    "on_disk=%d written=%d dropped=%d (%s)",
                     UnifiedRadixCache._weg2_flush_spill_n, getattr(node, "id", "?"), str(victim.rid),
                     victim.node.id, victim.depth, int(sec.get("on_disk", 0) or 0),
-                    int(sec.get("written", 0) or 0))
-        return True
+                    int(sec.get("written", 0) or 0), dropped,
+                    "sleep flush: the victim's anchor is on L3, its slot freed for the un-backed node -- no "
+                    "anchor lost, no D recompute after the wake" if dropped > 0 else
+                    "released, slot still referenced by another process -- no slot freed; the victim's "
+                    "anchor is on L3")
+        return dropped > 0
 
     # -- K15 (NF h16q2 1cfbf32584, boot _215812, D, weg2-56-530) ---------------
     #: anchors kept by an eviction-time spill / lost at eviction (per process)
@@ -5973,6 +5985,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 return False
         return _free
 
+    @staticmethod
+    def _k15c_note_no_free(node, shared) -> None:
+        UnifiedRadixCache._k15c_shared_n = getattr(UnifiedRadixCache, "_k15c_shared_n", 0) + 1
+        k = UnifiedRadixCache._k15c_shared_n
+        if k <= 32 or k % 256 == 0:
+            logger.warning("K15C SPILL-NO-FREE-VICTIM node=%s shared=%d (n=%d): every releasable anchor "
+                           "slot is also referenced by another process (P's stages / a reader) -- releasing "
+                           "ours would free no slot, so none is released", getattr(node, "id", "?"),
+                           len(shared), k)
+
     def _weg2_last_resort_victim(self, node, mp, park: bool = False, ref_free=None, shared_out=None):
         """MAMBA-LAST-RESORT (``SGLANG_WEG2_MAMBA_SPILL_LAST_RESORT``, default
         on since 09.10.): the anchor a full arena's claim may spill when the H19 /
@@ -6009,10 +6031,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         tree = _mad.tree_anchors(root=self.root_node, anchor_of=lambda n: self._weg2_anchor_of(n, mp))
         return _mad.pick_foreign_victim(tree, rid=rid)
 
-    def _weg2_release_anchor(self, victim, mp, st, why: str, for_rid: str) -> None:
+    def _weg2_release_anchor(self, victim, mp, st, why: str, for_rid: str) -> int:
         """Release this rank's reference on the victim's anchor (the node keeps
         its KV; its mamba host value goes, as the host LRU would do) and drop
-        the slot once no rank references it."""
+        the slot once no rank references it. Returns the slots dropped (K15c
+        review A2: 0 = another process still references them, no slot freed)."""
         comp = self.components[ComponentType.MAMBA]
         self._evict_component_and_detach_lru(victim.node, comp, target=EvictLayer.HOST, tracker=None)
         self._update_evictable_leaf_sets(victim.node)
@@ -6029,6 +6052,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if n <= 16 or n % 64 == 0 or victim.rid != for_rid:
             logger.info("WEG2 MAMBA-ARENA DISPLACE n=%d why=%s for_rid=%s victim_rid=%s node=%s depth=%d dropped=%d",
                         n, why, for_rid, victim.rid, victim.node.id, victim.depth, dropped)
+        return int(dropped or 0)
 
     def _weg2_note_anchor_claim(self, node, rid, st, ok: bool, held: int, depth: int, cap: int, mp) -> None:
         if ok:

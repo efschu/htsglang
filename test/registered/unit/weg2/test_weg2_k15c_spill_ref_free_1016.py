@@ -57,7 +57,13 @@ def _tree(anchors, refs, monkeypatch):
     t._weg2_anchor_of = lambda n, mp, allow_end=False: (True, None)
     t._weg2_claim_lane = lambda node, park=False: None
     t._weg2_park_chain = lambda: set()
-    t._weg2_release_anchor = lambda victim, mp, st, why, for_rid: released.append(victim.node.id)
+    t.WEG2_PARK_SPILL_TRIES = 3
+
+    def _release(victim, mp, st, why, for_rid):
+        # K15c review A2: the release returns the slots it dropped (0 while another process references one)
+        released.append(victim.node.id)
+        return int(all(arena.refs.get(int(x), 0) <= 1 for x in victim.slots))
+    t._weg2_release_anchor = _release
     t._weg2_last_resort_victim = types.MethodType(U.UnifiedRadixCache._weg2_last_resort_victim, t)
     return t, mp, secured, released
 
@@ -83,7 +89,8 @@ def test_no_ref_free_victim_releases_nothing_and_names_it(monkeypatch, caplog):
 def test_switch_off_is_the_old_choice(monkeypatch):
     monkeypatch.setenv("SGLANG_WEG2_SPILL_REF_FREE", "0")
     t, mp, secured, released = _tree(METAL, {3: 4, 7: 4, 11: 1}, monkeypatch)
-    assert U.UnifiedRadixCache._weg2_flush_spill_room(t, types.SimpleNamespace(id=97), mp) is True
+    # K15c review A2: the shared victim is released but frees no slot -- no success, named honestly
+    assert U.UnifiedRadixCache._weg2_flush_spill_room(t, types.SimpleNamespace(id=97), mp) is False
     assert released == [53]
 
 
@@ -99,5 +106,68 @@ def test_off_form_a_host_the_old_choice_stands(monkeypatch):
     """P's stages each hold one reference on the shared slot: there 'refs <= 1' is not the group's share."""
     monkeypatch.setattr(U._r12, "role", lambda: None)
     t, mp, secured, released = _tree(METAL, {3: 4, 7: 4, 11: 1}, monkeypatch)
-    assert U.UnifiedRadixCache._weg2_flush_spill_room(t, types.SimpleNamespace(id=97), mp) is True
+    U.UnifiedRadixCache._weg2_flush_spill_room(t, types.SimpleNamespace(id=97), mp)
     assert released == [53]
+
+
+def _park_tree(monkeypatch, refs):
+    t, mp, secured, released = _tree(METAL, refs, monkeypatch)
+    monkeypatch.setattr(U._mad, "pick_park_victim",
+                        lambda c, chain_ids, claimer_is_end, claimer_lane: min(c, key=lambda a: a.depth) if c else None)
+    node = types.SimpleNamespace(id=97, weg2_park_end=True)
+    node.__dict__["_weg2_park_spill_tries"] = 0
+    return t, mp, secured, released, node
+
+
+def test_review_a1_park_spill_on_form_a_host_takes_the_d_only_victim(monkeypatch):
+    """K15c review A1 (boot 1016_103428 10:42:16 TP0 ``DISPLACE why=park_first node=59 dropped=0``):
+    the PARK-END-ANCHOR-FIRST spill took the shared shallow victim (53) -- now the D-only one (83).
+    RED on d5ef021983 (released == [53])."""
+    t, mp, secured, released, node = _park_tree(monkeypatch, {3: 4, 7: 4, 11: 1})
+    assert U.UnifiedRadixCache._weg2_park_spill_room(t, node, mp) is True
+    assert released == [83] and secured == [[11]], released
+
+
+def test_review_a1_park_spill_without_a_free_victim_names_it(monkeypatch, caplog):
+    t, mp, secured, released, node = _park_tree(monkeypatch, {3: 4, 7: 4, 11: 2})
+    with caplog.at_level(logging.WARNING):
+        assert U.UnifiedRadixCache._weg2_park_spill_room(t, node, mp) is False
+    assert released == [] and secured == []
+    assert any("K15C SPILL-NO-FREE-VICTIM" in m for m in caplog.messages)
+
+
+def test_review_a3_foreign_branch_filtered(monkeypatch):
+    """K15c review A3 (probe test_foreign_branch_filtered): pick_foreign_victim offers a candidate --
+    the filter there must hold (kills the surviving mutant 'tree=[a for a in tree if _rf(a)]' removed)."""
+    t, mp, secured, released = _tree(METAL, {3: 4, 7: 4, 11: 1}, monkeypatch)
+    monkeypatch.setattr(U._mad, "pick_foreign_victim",
+                        lambda tr, rid: min(tr, key=lambda a: a.depth) if tr else None)
+    assert U.UnifiedRadixCache._weg2_flush_spill_room(t, types.SimpleNamespace(id=97), mp) is True
+    assert released == [83]
+
+
+def test_review_a2_flush_spill_without_a_dropped_slot_is_no_success(monkeypatch, caplog):
+    """K15c review A2 (boot 1016_103428 10:59:57 ``DISPLACE n=29 dropped=0`` then ``FLUSH-SPILL ... its
+    slot freed``): a reader takes a reference between the filter and drop_unreferenced -- the release
+    drops nothing; the line says so and the spill returns False."""
+    t, mp, secured, released = _tree(METAL, {3: 4, 7: 4, 11: 1}, monkeypatch)
+    t._weg2_release_anchor = lambda victim, mp, st, why, for_rid: (released.append(victim.node.id), 0)[1]
+    with caplog.at_level(logging.INFO):
+        assert U.UnifiedRadixCache._weg2_flush_spill_room(t, types.SimpleNamespace(id=97), mp) is False
+    assert released == [83]
+    assert any("slot still referenced" in m and "dropped=0" in m for m in caplog.messages)
+    assert not any("its slot freed" in m for m in caplog.messages)
+
+
+def test_review_a2_release_anchor_returns_dropped(monkeypatch):
+    from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType
+
+    monkeypatch.setattr(U._r12, "role", lambda: None)
+    t = types.SimpleNamespace(components={ComponentType.MAMBA: object()},
+                              _evict_component_and_detach_lru=lambda *a, **k: (0, 0),
+                              _update_evictable_leaf_sets=lambda n: None)
+    st = types.SimpleNamespace(displaced_share=0, displaced_full=0, dropped=0)
+    victim = OwnedAnchor(node=types.SimpleNamespace(id=5), depth=10, rid="r", slots=(1, 2))
+    for dropped in (0, 2):
+        mp = types.SimpleNamespace(drop_unreferenced=lambda slots, d=dropped: d)
+        assert U.UnifiedRadixCache._weg2_release_anchor(t, victim, mp, st, why="flush_spill", for_rid="flush") == dropped
