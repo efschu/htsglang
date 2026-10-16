@@ -7897,6 +7897,15 @@ class Scheduler(
         request's verdict rather than the boot's running total, in the fixed
         attribution order `PREFETCH_DECLINE_ORDER`.
         """
+        # ROOM-ARBITER PRIO 1016: the request's priority for the fill's room-wait order (PRIO = ALTER: priority
+        # descending, then arrival); process-local, read by the prefetch io thread when its fill registers
+        try:
+            from sglang.srt.weg2 import prio_age as _pa
+            from sglang.srt.weg2 import room_wait_arbiter as _arbiter
+
+            _arbiter.note_priority(req.rid, _pa.lane_of_req(req))
+        except Exception:  # noqa: BLE001 - an order hint never breaks the intake
+            pass
         # #1068 (slice 4): the denominator sits at the FUNCTION boundary, not
         # at one call site: the A12.2 retry (`_retry_deferred_prefetches`) and
         # the #946 escape enter here too, and a denominator that missed them

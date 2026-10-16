@@ -152,7 +152,9 @@ class _Fill:
         return self.box["out"]
 
 
-def test_11_27_the_younger_fill_yields_and_the_oldest_lands_inside_the_bound(tmp_path):
+def test_11_27_the_younger_fill_yields_and_the_oldest_lands_inside_the_bound(tmp_path, monkeypatch):
+    # F3 alone: F2 (ROOM-VERDICTS) would end the younger fill's futile wait by itself and hide a missing announcement
+    monkeypatch.setenv("SGLANG_WEG2_ROOM_VERDICTS", "0")
     young = [f"y{i}" for i in range(12)]
     old = [f"o{i}" for i in range(8)]
     be, arena = _setup(tmp_path, young + old, slots=32)
@@ -267,3 +269,28 @@ def test_the_controller_names_the_fills_request_on_the_io_thread():
         cc.weg2_suffixed_stems = orig
     assert seen and all(r == "weg2-9-77" for r in seen), seen
     assert ARB.current_rid() is None, "the scope ends with the fill"
+
+
+def test_prio_1016_priority_descending_then_arrival(tmp_path):
+    """PRIO = ALTER (prio_age.key): a younger request of priority 1 is OLDER than every request of priority 0; inside
+    one priority the arrival number decides."""
+    be, arena = _setup(tmp_path, ["a"], slots=8)
+    tree = _Tree(arena)
+    RR.tick(tree)
+    ARB.note_priority("weg2-5-90", 0)
+    ARB.note_priority("weg2-5-95", 1)
+    ARB.note_priority("weg2-5-97", 1)
+    for rid in ("weg2-5-90", "weg2-5-95", "weg2-5-97"):
+        ARB.register(arena, rid)
+    assert ARB.decide(arena) == (ARB.rid_hash("weg2-5-95"), 96)
+    assert sorted(pr for _h, _k, _p, pr in ARB.registrations(arena)) == [0, 1, 1], "the slot carries the priority"
+
+
+def test_prio_1016_the_intake_notes_the_requests_priority():
+    """The seam: ``Scheduler._prefetch_kvcache`` names the request's priority before it registers the read."""
+    import inspect
+
+    from sglang.srt.managers.scheduler import Scheduler
+
+    src = inspect.getsource(Scheduler._prefetch_kvcache)
+    assert "_arbiter.note_priority(req.rid, _pa.lane_of_req(req))" in src

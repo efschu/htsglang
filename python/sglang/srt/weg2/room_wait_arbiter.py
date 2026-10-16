@@ -45,8 +45,9 @@ ENV = "SGLANG_WEG2_ROOM_ARBITER"
 #: header: magic, owner rid hash, owner age key, announcing pid, announce seq, announce t_ms, pp_size, reserved
 _HDR = struct.Struct("<QQQQQQQQ")
 _MAGIC = 0x52304F4D32524F31
-#: wait registrations: rid hash, age key (0 = none parsed), pid, t_ms (refreshed by the waiting fill), active
-_W = struct.Struct("<QQQQQ")
+#: wait registrations: rid hash, age key (0 = none parsed), pid, t_ms (refreshed by the waiting fill), active,
+#: priority (PRIO 1016: the request's ``priority`` as the front normalised it; 0 = none)
+_W = struct.Struct("<QQQQQQ")
 _WAIT_SLOTS = 64
 _W_OFF = _HDR.size
 _SIZE_F3 = _W_OFF + _WAIT_SLOTS * _W.size
@@ -58,6 +59,7 @@ _RID_N = re.compile(r"-(\d+)$")
 
 
 class _State:
+    prio: Dict[str, int] = {}
     pp_rank: Optional[int] = None
     pp_size: int = 0
     maps: Dict[str, Optional[mmap.mmap]] = {}
@@ -103,6 +105,23 @@ def fill_scope(rid: Any) -> Iterator[None]:
 
 def current_rid() -> Optional[str]:
     return getattr(_TL, "rid", None)
+
+
+def note_priority(rid: Any, prio: int) -> None:
+    """PRIO 1016: the scheduler's intake (``_prefetch_kvcache``) names the request's priority; the fill of that
+    request registers it (every rank: the field is the same broadcast request on every rank)."""
+    try:
+        p = max(0, int(prio or 0))
+    except (TypeError, ValueError):
+        p = 0
+    with _LOCK:
+        _A.prio[str(rid)] = p
+        while len(_A.prio) > 4096:
+            _A.prio.pop(next(iter(_A.prio)))
+
+
+def priority_of(rid: Any) -> int:
+    return int(_A.prio.get(str(rid), 0))
 
 
 # --- the shared file ---------------------------------------------------------------------------------
@@ -190,7 +209,7 @@ def _wait_slot(m: mmap.mmap, me: int, h: int) -> int:
     now = _now_ms()
     for s in range(_WAIT_SLOTS):
         off = _W_OFF + s * _W.size
-        wh, _k, pid, t, act = _W.unpack(m[off:off + _W.size])
+        wh, _k, pid, t, act, _p = _W.unpack(m[off:off + _W.size])
         if pid == me and wh == h:
             return s
         if free is None and (not act or now - t > _STALE_MS):
@@ -210,7 +229,7 @@ def register(arena: Any, rid: str) -> Optional[int]:
     with _LOCK:
         s = _wait_slot(m, me, h)
         off = _W_OFF + s * _W.size
-        m[off:off + _W.size] = _W.pack(h, age_key(rid), me, _now_ms(), 1)
+        m[off:off + _W.size] = _W.pack(h, age_key(rid), me, _now_ms(), 1, priority_of(rid))
     return s
 
 
@@ -223,15 +242,15 @@ def unregister(arena: Any, slot: Optional[int], rid: str) -> None:
     off = _W_OFF + int(slot) * _W.size
     with _LOCK:
         try:
-            wh, _k, pid, _t, _a = _W.unpack(m[off:off + _W.size])
+            wh, _k, pid, _t, _a, _p = _W.unpack(m[off:off + _W.size])
             if pid == os.getpid() and wh == rid_hash(rid):
-                m[off:off + _W.size] = _W.pack(0, 0, 0, 0, 0)
+                m[off:off + _W.size] = _W.pack(0, 0, 0, 0, 0, 0)
         except (ValueError, struct.error):
             pass
 
 
-def registrations(arena: Any) -> List[Tuple[int, int, int]]:
-    """``[(rid hash, age key, pid)]`` of the live wait registrations of every rank."""
+def registrations(arena: Any) -> List[Tuple[int, int, int, int]]:
+    """``[(rid hash, age key, pid, priority)]`` of the live wait registrations of every rank."""
     m = mapped(arena, create=False)
     if m is None:
         return []
@@ -240,12 +259,12 @@ def registrations(arena: Any) -> List[Tuple[int, int, int]]:
     for s in range(_WAIT_SLOTS):
         off = _W_OFF + s * _W.size
         try:
-            h, k, pid, t, act = _W.unpack(m[off:off + _W.size])
+            h, k, pid, t, act, pr = _W.unpack(m[off:off + _W.size])
         except (ValueError, struct.error):
             continue
         if not act or not h or now - t > _STALE_MS or not _alive(int(pid)):
             continue
-        out.append((int(h), int(k), int(pid)))
+        out.append((int(h), int(k), int(pid), int(pr)))
     return out
 
 
@@ -264,15 +283,19 @@ def is_pp0() -> bool:
     return _A.pp_rank == 0
 
 
-def _order_key(h: int, k: int) -> Tuple[int, int]:
-    """The front's arrival number when the rid carries one; an unnumbered rid sorts after every numbered one, in the
-    order PP0 first saw it registered (PP0's own order -- one decision either way)."""
+def _order_key(h: int, k: int, prio: int = 0) -> Tuple[Any, int]:
+    """PRIO = ALTER (weg2/prio_age.key, user law 14.10.): priority descending, then age -- the front's arrival
+    number when the rid carries one; an unnumbered rid sorts after every numbered one of its priority, in the order
+    PP0 first saw it registered (PP0's own order -- one decision either way)."""
+    from sglang.srt.weg2 import prio_age as _pa
+
     if h not in _A.first_seen:
         _A.seen_n += 1
         _A.first_seen[h] = _A.seen_n
         if len(_A.first_seen) > 4096:
             _A.first_seen.pop(next(iter(_A.first_seen)))
-    return (k if k else (1 << 62) + _A.first_seen[h], _A.first_seen[h])
+    age = k if k else (1 << 62) + _A.first_seen[h]
+    return (_pa.key(prio, age), _A.first_seen[h])
 
 
 def decide(arena: Any) -> Optional[Tuple[int, int]]:
@@ -290,7 +313,7 @@ def decide(arena: Any) -> Optional[Tuple[int, int]]:
             with _LOCK:
                 m[0:_HDR.size] = _HDR.pack(_MAGIC, 0, 0, os.getpid(), _A.seq, _now_ms(), _A.pp_size, 0)
         return None
-    h, k = min(((h, k) for h, k, _p in regs), key=lambda hk: _order_key(*hk))
+    h, k, _pr = min(((h, k, pr) for h, k, _p, pr in regs), key=lambda hkp: _order_key(*hkp))
     _A.seq += 1
     with _LOCK:
         m[0:_HDR.size] = _HDR.pack(_MAGIC, h, k, os.getpid(), _A.seq, _now_ms(), _A.pp_size, 0)
@@ -301,7 +324,7 @@ def decide(arena: Any) -> Optional[Tuple[int, int]]:
         if n <= 32 or n % 64 == 0:
             logger.info("%s OWNER n=%d owner=%x age=%d waiting=%d ranks=%s (PP0 decides: only the oldest request's "
                         "fill waits for arena room, every other fill ends its wait at once)", MARK, n, h, k,
-                        len(regs), sorted({p for _h, _k, p in regs}))
+                        len(regs), sorted({p for _h, _k, p, _pr in regs}))
     return h, k
 
 
@@ -356,6 +379,7 @@ def reset_for_tests() -> None:
         _A.maps = {}
     _A.pp_rank = None
     _A.pp_size = 0
+    _A.prio = {}
     _A.first_seen = {}
     _A.seen_n = 0
     _A.announced = (0, 0)
