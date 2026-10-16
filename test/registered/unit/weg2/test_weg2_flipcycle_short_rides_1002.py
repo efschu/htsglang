@@ -86,7 +86,7 @@ class ThePredicateIsTheQueuedShortFilter(unittest.TestCase):
         import inspect
 
         src = inspect.getsource(front)
-        self.assertIn("cap_exempt=(self._p_phase_cap_exempt", src)
+        self.assertIn("cap_exempt=Front._p_phase_cap_exempt_for(self, _dc_cap)", src)
         self.assertIn("WEG2-FLIPCYCLE stage=d_prefill_after_flip", src)
 
 

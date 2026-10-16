@@ -12509,12 +12509,28 @@ class Front:
         rides past an older LONG."""
         return Front._p_phase_short_rides(self, p) or Front._p_phase_needs_p(self, p)
 
+    def _p_phase_cap_exempt_for(self, dc_cap: int):
+        """The pool's ``cap_exempt`` for a P phase whose seat gate is ``dc_cap`` (flipqueue 1015, review A1/A3).
+
+        * ``dc_cap > 0`` (DECODE-COLLECT seat gate: ``p-cap`` = the free D seats): ``None`` -- that cap is hard,
+          nothing rides past it, a SHORT needs a D seat too. The only place this is decided; a test holds it.
+        * else a request that NEEDS P always rides past the phase cap -- NOT behind a feature switch (a defect
+          fix does not hang on FLIPCYCLE H5): with ``SGLANG_WEG2_ENABLE_P_PHASE_SHORT_RIDES`` on the exempt are
+          SHORT or needs-P (:meth:`_p_phase_cap_exempt`), off only the needs-P ones (:meth:`_p_phase_needs_p`)."""
+        if int(dc_cap or 0) > 0:
+            return None
+        if envs.SGLANG_WEG2_ENABLE_P_PHASE_SHORT_RIDES.get():
+            return lambda p: Front._p_phase_cap_exempt(self, p)
+        return lambda p: Front._p_phase_needs_p(self, p)
+
     def _p_end_over_x_left(self, stalled: bool, dc_cap: int, k10_only: bool) -> None:
         """Instrument, no verdict: the P phase ends with requests in the queue that need P. After the cap
         exemption only three reasons are left, each a refusal of P or of D's seat count, not of the phase
         cap: ``stall`` (P's intake refused the head -- its pool, defect 1), ``seat-gate`` (D is full: the
         DECODE-COLLECT cap, PBOUND-HELD-BY-SEAT-GATE holds the rest) and ``k10-rvp-only``. ``other`` is a
-        defect to read. Counted per cause (``p_end_over_x_left_<cause>``), one line per phase."""
+        defect to read. Counted per cause (``p_end_over_x_left_<cause>``), one line per phase.
+        PRECEDENCE when several hold (documented, tested): ``stall`` > ``seat-gate`` > ``k10-rvp-only`` >
+        ``state`` > ``other`` -- a stall is the first refusal (P's own intake), the seat count only the next."""
         left = [p for p in list(self.queue) if Front._p_phase_needs_p(self, p)]
         if not left:
             return
@@ -16462,12 +16478,13 @@ class Front:
         line, line_src = self._x_cost_line_of(self._d_cost_rows, self._d_cost_all,
                                               self._x_cost_seed)
         price, price_src = Front._flip_round_trip_price(self)  # class-bound: tests drive it on a namespace
-        cap = float(self.p_phase_max_requests) if self.p_phase_max_requests else float("inf")
+        # flipqueue 1015 (review A4): no clamp to p_phase_max_requests -- a request that needs P rides past the
+        # phase cap (_p_phase_cap_exempt_for), so the phase's real k is the measured one, not min(cap, k).
         if self._p_phase_k:
-            k = min(cap, max(1.0, statistics.mean(self._p_phase_k)))
+            k = max(1.0, statistics.mean(self._p_phase_k))
             k_src = f"live:mean-of-{len(self._p_phase_k)}"
         elif self._x_cost_seed is not None and float(self._x_cost_seed.get("k", 0) or 0) >= 1.0:
-            k = min(cap, float(self._x_cost_seed["k"]))
+            k = float(self._x_cost_seed["k"])
             k_src = "record"
         else:
             k, k_src = 1.0, "none(1=no-amortisation)"
@@ -16603,7 +16620,7 @@ class Front:
         cap = int(self.tp_prefill_max_tokens)
         v = _xcurves.x_verdict_from_curves(
             depth=int(depth), open_requests=int(k_flip), curves=setup.curves, cap=cap,
-            max_k=float(self.p_phase_max_requests) if self.p_phase_max_requests else None,
+            max_k=None,  # flipqueue 1015 (review A4): needs-P riders are never capped by the phase cap
             beyond=setup.beyond)
         self._x_curve_last = v
         self.counters["x_curve_verdicts"] += 1
@@ -16641,8 +16658,9 @@ class Front:
         ctx = getattr(self, "_x_solve_ctx", None)
         if not x_k_flip_enabled() or ctx is None or int(k_flip) <= 1:
             return x1
-        cap = float(self.p_phase_max_requests) if self.p_phase_max_requests else float("inf")
-        k = min(cap, float(k_flip))
+        # flipqueue 1015 (review A4): every rider of this flip needs P and so rides past the phase cap
+        # (_p_phase_cap_exempt_for): k is the flip's real rider count, not min(p_phase_max_requests, k_flip).
+        k = float(k_flip)
         x_star, why = phase_policy.solve_x_cost_line(
             price_s=ctx["price"], k=k, line=ctx["line"], r_p=ctx["r_p"],
             prefix_tokens=ctx["prefix"], line_p=ctx["line_p"])
@@ -17529,9 +17547,8 @@ class Front:
                     # FLIPCYCLE H5: the phase cap never strands a SHORT
                     # (the seat gate's cap is hard: a SHORT needs a D seat too)
                     # DOUBLE-FLIP 1015: nor a request that needs P (the park's own reader)
-                    cap_exempt=(self._p_phase_cap_exempt
-                                if envs.SGLANG_WEG2_ENABLE_P_PHASE_SHORT_RIDES.get() and _dc_cap <= 0
-                                else None))
+                    # review A1/A3: the choice (seat gate hard, switch-independent needs-P) lives in one method
+                    cap_exempt=Front._p_phase_cap_exempt_for(self, _dc_cap))
                 # K9 P-DRAIN-EARLY-SETTLE: the early legs P is prefilling anyway are settled here, in "serving",
                 # not in the P->D flip's drain under the flip-stall bound (h16r 11:52:25Z death, 11:26:01Z hang)
                 if p_drain_early_settle_enabled() and self.state == "serving":
@@ -17627,8 +17644,7 @@ class Front:
                     # H91 part C rule 3: so are the ones D parked on the wait
                     # bound -- their clients are waiting for D to resume them,
                     # under --idle-layout P as well.
-                    if self.queue:
-                        Front._p_end_over_x_left(self, bool(self._p_intake_stalled), _dc_cap, _k10_only)
+                    Front._p_end_over_x_left(self, bool(self._p_intake_stalled), _dc_cap, _k10_only)
                     await self.flip("P", "D")
                 elif self._idle_disposition("P", at_rest=True) == "flip":
                     await self.flip("P", "D")

@@ -212,20 +212,117 @@ class TestTheInstrument:
         F.Front._p_end_over_x_left(f, stalled, dc, k10)
         assert f.counters == {"p_end_over_x_left_" + cause: 1}
 
+    @pytest.mark.parametrize("stalled,dc,k10,state,cause", [
+        (True, 3, False, "serving", "stall"),            # stall + seat gate: the stall wins (documented precedence)
+        (True, 0, True, "flipping", "stall"), (False, 3, True, "flipping", "seat_gate"),
+        (False, 0, True, "flipping", "k10_rvp_only")])
+    def test_precedence(self, loop, stalled, dc, k10, state, cause):
+        f = self._f([_real_pending(loop, "l", 9000)], state=state)
+        F.Front._p_end_over_x_left(f, stalled, dc, k10)
+        assert f.counters == {"p_end_over_x_left_" + cause: 1}
+
     def test_silent_when_nothing_needs_p(self, loop):
         f = self._f([_real_pending(loop, "s", 20, d_eligible=True)])
         F.Front._p_end_over_x_left(f, False, 0, False)
         assert f.counters == {}
 
 
+class TestSeatGateStaysHard:
+    """Review A1: the seat gate's cap (``max_dispatch=_dc_cap``) is hard -- no exemption rides past it."""
+
+    def test_for_dc_cap_positive_there_is_no_exemption(self, loop):
+        f = _front(5713)
+        assert F.Front._p_phase_cap_exempt_for(f, 3) is None
+        assert callable(F.Front._p_phase_cap_exempt_for(f, 0))
+
+    def test_pool_leaves_the_over_x_rest_under_the_seat_gate(self, loop):
+        f = _front(5713)
+        mk = lambda: [_real_pending(loop, f"l{i}", 9000) for i in range(4)] + [_real_pending(loop, "s", 20, d_eligible=True)]
+        done, left, _ = _drain(mk(), 2, F.Front._p_phase_cap_exempt_for(f, 2), limit=2)   # _dc_cap = 2 seats
+        assert done == ["l0", "l1"] and left == ["l2", "l3", "s"]
+        done, left, _ = _drain(mk(), 2, F.Front._p_phase_cap_exempt_for(f, 0), limit=2)   # no seat gate
+        assert left == [] and len(done) == 5
+
+    def test_controller_asks_the_one_method_with_the_seat_cap(self):
+        assert "cap_exempt=Front._p_phase_cap_exempt_for(self, _dc_cap)" in inspect.getsource(F)
+
+
+class TestSwitchDoesNotHoldTheDefectFix:
+    """Review A3: with FLIPCYCLE H5 (SHORT_RIDES) off the needs-P exemption stays, only the SHORT ride goes."""
+
+    def test_switch_off_over_x_rides_short_does_not(self, loop, monkeypatch):
+        from sglang.srt.environ import envs
+        f = _front(5713)
+        mk = lambda: ([_real_pending(loop, f"l{i}", 9000) for i in range(6)]
+                      + [_real_pending(loop, "over-x", 7199), _real_pending(loop, "short", 25, d_eligible=True)])
+        monkeypatch.setattr(envs.SGLANG_WEG2_ENABLE_P_PHASE_SHORT_RIDES, "get", lambda: False)
+        done, left, _ = _drain(mk(), 6, F.Front._p_phase_cap_exempt_for(f, 0), limit=6)
+        assert "over-x" in done and left == ["short"]
+        monkeypatch.setattr(envs.SGLANG_WEG2_ENABLE_P_PHASE_SHORT_RIDES, "get", lambda: True)
+        done, left, _ = _drain(mk(), 6, F.Front._p_phase_cap_exempt_for(f, 0), limit=6)
+        assert left == [] and "short" in done
+
+    def test_switch_off_still_holds_the_seat_gate(self, monkeypatch):
+        from sglang.srt.environ import envs
+        monkeypatch.setattr(envs.SGLANG_WEG2_ENABLE_P_PHASE_SHORT_RIDES, "get", lambda: False)
+        assert F.Front._p_phase_cap_exempt_for(_front(5713), 2) is None
+
+
+class TestXReadersFollowThePhase:
+    """Review A4: riders that need P are not clamped to p_phase_max_requests in the X readers."""
+
+    def _ns(self, k_flip_hist=None):
+        ns = types.SimpleNamespace(
+            tp_prefill_max_tokens=8000, p_phase_max_requests=6, counters=collections.Counter(),
+            _x_k_hist=(1.0, "none"),
+            _x_solve_ctx=dict(price=12.0, line={"a_ms": 1728.0, "b_ms": 1.018, "c_ms": 0.0, "n": 40, "n_lo": 182,
+                                              "n_hi": 2353, "prefix_med": 0},
+                              r_p=None, prefix=0, line_p={"a_ms": 1403.0, "b_ms": 0.068, "c_ms": 0.0, "n": 60,
+                                                          "n_lo": 512, "n_hi": 16384}, floor=512, ceiling=12288))
+        return ns
+
+    def test_x_for_flip_uses_the_real_rider_count(self):
+        ns = self._ns()
+        x9 = F.Front._x_for_flip(ns, 9)
+        x6 = F.Front._x_for_flip(ns, 6)
+        assert 512 < x9 < x6 < 8000          # 133855: k_flip 7..9 used to be clamped to 6 (the same X)
+
+    def test_x_cost_inputs_mean_not_clamped(self):
+        ns = types.SimpleNamespace(
+            p_phase_max_requests=6, _p_phase_k=collections.deque([9, 9, 9], maxlen=8), _x_cost_seed=None,
+            _d_cost_rows=(), _d_cost_all=(), _x_cost_line_of=lambda *a: (None, "none"))
+        ns._park_warm_legs_ms = lambda: (None, None, None, "t")
+        ns._park_rt_seed = None
+        F.Front._x_cost_inputs(ns)
+        assert ns._x_k_hist[0] == 9.0            # was min(6, 9) = 6
+
+    def test_curve_verdict_gets_no_max_k(self):
+        src = inspect.getsource(F.Front._x_route_of)
+        assert "max_k=None" in src and "max_k=float(self.p_phase_max_requests" not in src
+        code = lambda fn: "\n".join(l for l in inspect.getsource(fn).splitlines() if not l.lstrip().startswith("#"))
+        assert "self.p_phase_max_requests" not in code(F.Front._x_for_flip)
+        assert "self.p_phase_max_requests" not in code(F.Front._x_cost_inputs)
+
+
 class TestWiring:
     def test_controller_passes_the_combined_predicate_and_marks_the_end(self):
         src = inspect.getsource(F)
-        assert "cap_exempt=(self._p_phase_cap_exempt" in src
+        assert "cap_exempt=Front._p_phase_cap_exempt_for(self, _dc_cap)" in src
         assert "cap_exempt=(self._p_phase_short_rides" not in src
         i = src.index("Front._p_end_over_x_left(self, bool(self._p_intake_stalled)")
         assert 'await self.flip("P", "D")' in src[i:i + 400]  # the marker sits right before the P->D flip
 
-    def test_short_rides_switch_still_gates_both(self):
+    def test_marker_is_unconditional_before_the_flip(self):
+        """Review A2: for EVERY non-empty queue, not only a stall -- same indentation as the flip, no ``if`` ahead."""
+        src = inspect.getsource(F)
+        i = src.index("Front._p_end_over_x_left(self, bool(self._p_intake_stalled)")
+        line_start = src.rfind("\n", 0, i) + 1
+        indent = src[line_start:i]
+        assert indent.strip() == ""
+        flip = src.index('await self.flip("P", "D")', i)
+        assert src[src.rfind("\n", 0, flip) + 1:flip] == indent
+        assert "_p_intake_stalled:" not in src[line_start - 120:line_start]
+
+    def test_short_rides_switch_default_on(self):
         from sglang.srt.environ import envs
         assert envs.SGLANG_WEG2_ENABLE_P_PHASE_SHORT_RIDES.get()
