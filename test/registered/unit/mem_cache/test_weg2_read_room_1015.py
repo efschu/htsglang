@@ -40,7 +40,10 @@ IO = "hicache-prefetch-io-0"
 
 class _NoRoom:
     """The BASE tree (226aad7105) has no ``weg2/read_room.py``: a stand-in that does nothing, so the scenarios run the
-    base behaviour (the fill never asks, nobody serves) and go red by BEHAVIOUR, not by an ImportError."""
+    base behaviour (the fill never asks, nobody serves) and go red by BEHAVIOUR, not by an ImportError (review A4:
+    the census/deficit read the arena header like the real module, so a geometry case reaches its read)."""
+
+    _ST = types.SimpleNamespace(armed=False, arena=None, served=0, posted=0, spilled_pages=0, poll_t=0.0)
 
     @staticmethod
     def tick(cache):
@@ -49,6 +52,50 @@ class _NoRoom:
     @staticmethod
     def reset_for_tests():
         return None
+
+    @staticmethod
+    def census(arena):
+        st = arena.stats()
+        out = {"slots": int(st["slots"]), "complete": int(st["complete"]), "claimed": int(st["claimed"]),
+               "pinned": -1, "refs": -1}
+        try:
+            pinned, refs, _c = arena.ref_census()
+            out["pinned"], out["refs"] = int(pinned), int(refs)
+        except Exception:  # noqa: BLE001
+            pass
+        return out
+
+    @staticmethod
+    def deficit(arena, need):
+        c = _NoRoom.census(arena)
+        free = c["slots"] - c["complete"] - c["claimed"]
+        clock = (c["complete"] - c["pinned"]) if c["pinned"] >= 0 else 0
+        c["free"], c["clock"] = free, clock
+        return max(0, int(need) - max(0, free) - max(0, clock)), c
+
+    @staticmethod
+    def post(arena, need, **kw):
+        return False
+
+    @staticmethod
+    def serve(cache, pool, arena, need, **kw):
+        return 0
+
+    @staticmethod
+    def serve_unseen(cache, pool, arena, seen=None):
+        return 0
+
+    @staticmethod
+    def _unseen(arena, seen=None):
+        return 0
+
+    @staticmethod
+    def wait_idle_ms(default_ms, arena=None):
+        return int(default_ms)
+
+    @staticmethod
+    def lifesign_s(since, until):
+        return 0.0
 
 
 def _rr():
@@ -108,11 +155,13 @@ class _TreeSim:
     def _weg2_direct_pool(self):
         return types.SimpleNamespace(arena=self.arena)
 
-    def _w3_arena_spill(self, pool, need_pages, claimer=None):
+    def _w3_arena_spill(self, pool, need_pages, claimer=None, released_out=None):
         take = self.held[: max(int(need_pages), 64)]
         del self.held[: len(take)]
         if take:
             self.arena.ref_slots(take, -1)
+        if released_out is not None:
+            released_out.extend(take)
         self.spills.append(len(take))
         return len(take)
 
@@ -275,13 +324,14 @@ def test_two_ranks_whose_pids_collide_modulo_64_do_not_share_a_slot(tmp_path):
 
     rr = _rr()
     m = mmap.mmap(-1, rr._SIZE)
-    a, _ = rr._pick_slot(m, 5, 100)
-    m[a * rr._REC.size:(a + 1) * rr._REC.size] = rr._REC.pack(1, 100, rr._now_ms(), 5)
-    b, _ = rr._pick_slot(m, 69, 50)
+    a = rr._pick_slot(m, 5, 7)
+    m[a * rr._REC.size:(a + 1) * rr._REC.size] = rr._REC.pack(7, 100, rr._now_ms(), 5)
+    b = rr._pick_slot(m, 69, 7)
     assert a != b
-    m[b * rr._REC.size:(b + 1) * rr._REC.size] = rr._REC.pack(1, 50, rr._now_ms(), 69)
-    assert rr._pick_slot(m, 5, 10)[0] == a, "the same process keeps its slot"
-    assert rr._pick_slot(m, 5, 10)[1] == 100, "a second post within 3 s keeps the larger need"
+    m[b * rr._REC.size:(b + 1) * rr._REC.size] = rr._REC.pack(7, 50, rr._now_ms(), 69)
+    assert rr._pick_slot(m, 5, 7) == a, "the same read of the same process keeps its slot (a re-post)"
+    c = rr._pick_slot(m, 5, 8)
+    assert c not in (a, b), "a second read of the same process takes its own slot: needs add up (review B5)"
 
 
 def test_a_stale_request_is_not_served(tmp_path):
@@ -302,8 +352,9 @@ def test_re_posts_are_paced(tmp_path):
     be, arena = _setup(tmp_path, ["r0"], slots=16)
     rr = _rr()
     _armed(arena)
-    assert rr.post(arena, 10)
-    assert not rr.post(arena, 10), "paced by SGLANG_WEG2_READ_ROOM_REPOST_MS"
+    assert rr.post(arena, 10, read_id=7)
+    assert not rr.post(arena, 10, read_id=7), "a re-post of the same read is paced by SGLANG_WEG2_READ_ROOM_REPOST_MS"
+    assert rr.post(arena, 10, read_id=8), "another read is not paced by the first one's posts"
 
 
 def test_switch_off_is_the_old_fill(tmp_path):
@@ -530,9 +581,7 @@ def test_three_pp_ranks_each_hold_the_page_and_the_slot_is_free_only_after_all_t
         seen = {}
         pool = tr._weg2_direct_pool()
         while not stop.is_set():
-            n = rr._unseen(arena, seen)
-            if n > 0:
-                rr.serve(tr, pool, arena, n)
+            rr.serve_unseen(tr, pool, arena, seen)     # one read at a time, its own ledger (review A3)
             time.sleep(0.02)
 
     peers = [threading.Thread(target=peer, args=(t,), name=f"peer{i}") for i, t in enumerate(trees[1:])]
@@ -555,11 +604,11 @@ def test_the_poll_of_the_request_file_is_paced(tmp_path):
     tree = _TreeSim(arena, [])
     rr = _rr()
     calls = []
-    real = rr._unseen
-    rr._unseen = lambda a, seen=None: (calls.append(1), 0)[1]
+    real = rr._unseen_reads
+    rr._unseen_reads = lambda a, seen=None: (calls.append(1), [])[1]
     try:
         for _ in range(200):
             rr.tick(tree)
     finally:
-        rr._unseen = real
+        rr._unseen_reads = real
     assert 1 <= len(calls) <= 3, len(calls)
