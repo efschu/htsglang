@@ -8543,6 +8543,9 @@ class Scheduler(
             # wake no longer flushes (SGLANG_WEG2_WAKE_FLUSH=0), so nothing of
             # it is lost.  The tree was flushed at the sleep leg.
             if getattr(self, "weg2_dormant", False) and _weg2_dormant_admit_armed():
+                # ZERO-ANCHOR 1015 (3): its store read runs during the flip --
+                # PP0 asks the store once more, awake, before its told
+                req._weg2_read_dormant = True
                 hold = getattr(self, "weg2_dormant_hold", None)
                 if hold is None:
                     hold = self.weg2_dormant_hold = []
