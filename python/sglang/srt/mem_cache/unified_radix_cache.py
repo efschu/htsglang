@@ -5763,9 +5763,24 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         tree = _mad.tree_anchors(root=self.root_node, anchor_of=lambda n: self._weg2_anchor_of(n, mp))
         tree = [a for a in tree if a.node is not node]
         tree = _mad.lane_filter(tree, self._weg2_claim_lane(node))   # LANE-ANCHOR-RANK
+        # K15c: only on the Form A host (D TP0) is "one reference" this group's whole share --
+        # the workers hold no mamba slot; P's stages each hold one, so there the old rule stands
+        _rf = UnifiedRadixCache._k15c_ref_free_filter(arena) if _r12.role() == "host" else None
+        _shared = set()
+        if _rf is not None:
+            _shared.update(id(a.node) for a in tree if not _rf(a))
+            tree = [a for a in tree if _rf(a)]
         victim = _mad.pick_foreign_victim(tree, rid="")
         if victim is None or not victim.slots:
-            victim = self._weg2_last_resort_victim(node, mp)
+            victim = self._weg2_last_resort_victim(node, mp, ref_free=_rf, shared_out=_shared)
+        if (victim is None or not victim.slots) and _shared:
+            UnifiedRadixCache._k15c_shared_n = getattr(UnifiedRadixCache, "_k15c_shared_n", 0) + 1
+            k = UnifiedRadixCache._k15c_shared_n
+            if k <= 32 or k % 256 == 0:
+                logger.warning("K15C SPILL-NO-FREE-VICTIM node=%s shared=%d (n=%d): every releasable anchor "
+                               "slot is also referenced by another process (P's stages / a reader) -- releasing "
+                               "ours would free no slot, so none is released", getattr(node, "id", "?"),
+                               len(_shared), k)
         if victim is None or not victim.slots:
             logger.warning("WEG2 MAMBA-ARENA FLUSH-SPILL node=%s depth=%s victim=none (no releasable "
                            "intermediate anchor in the tree -- the node stays un-backed, named)",
@@ -5926,7 +5941,39 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return True, None
         return True, mp.settled_anchor_slots(hv)
 
-    def _weg2_last_resort_victim(self, node, mp, park: bool = False):
+    @staticmethod
+    def k15c_ref_free_on() -> bool:
+        return os.environ.get("SGLANG_WEG2_SPILL_REF_FREE", "1").strip().lower() not in (
+            "0", "false", "no", "off", "")
+
+    @staticmethod
+    def _k15c_ref_free_filter(arena):
+        """K15c (h16s 1f4b3e73d4, boot 1016_103428, D TP0 10:41:55): the K15 save's spill released
+        victim node 53 (depth 2688) and node 58 (depth 52992) -- ``MAMBA-ARENA DISPLACE ...
+        dropped=0`` -- and the retry was refused again (``#1421 mamba_claim``, ``WEG2-ANCHOR-LOST
+        at=evict`` node 97 depth 123904 / node 102 depth 118208). The mamba arena is SHARED with
+        group P (``ARENA-REF-CENSUS arena-58834944 refs=47 own_held=20``; P's stages hold the
+        shallow prefix anchors, ``own_held=9`` each): releasing D's reference on a slot P also
+        references frees no slot. A victim is taken only when every one of its slots has exactly
+        one reader reference (ours) -- its release frees the slot. None = no filter (switch off
+        or the arena has no reference reader)."""
+        if not UnifiedRadixCache.k15c_ref_free_on():
+            return None
+        reader = getattr(arena, "slot_refs", None)
+        if not callable(reader):
+            return None
+
+        def _free(a) -> bool:
+            slots = list(getattr(a, "slots", None) or ())
+            if not slots:
+                return False
+            try:
+                return all(int(r) <= 1 for r in reader(slots))
+            except Exception:  # noqa: BLE001 - unreadable = not provably free
+                return False
+        return _free
+
+    def _weg2_last_resort_victim(self, node, mp, park: bool = False, ref_free=None, shared_out=None):
         """MAMBA-LAST-RESORT (``SGLANG_WEG2_MAMBA_SPILL_LAST_RESORT``, default
         on since 09.10.): the anchor a full arena's claim may spill when the H19 /
         PARK-END-ANCHOR-FIRST rules found none (NF int22, D TP0 boot
@@ -5945,6 +5992,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             anchor_of=lambda n: self._weg2_anchor_of(n, mp, allow_end=True),
             include_untagged=True)
         cands = [a for a in cands if a.node is not node]
+        if ref_free is not None:
+            if shared_out is not None:
+                shared_out.update(id(a.node) for a in cands if not ref_free(a))
+            cands = [a for a in cands if ref_free(a)]
         return _mad.pick_last_resort_victim(cands, chain_ids=self._weg2_park_chain(),
                                             claimer_lane=self._weg2_claim_lane(node, park=park))
 
