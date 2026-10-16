@@ -166,19 +166,24 @@ def test_a_granted_short_below_a_raised_lane_floor_is_not_d_prefilling(monkeypat
 
 
 def test_the_same_granted_shorts_do_count_when_d_runs_them(monkeypatch):
-    """Control (both directions): running (not parked) or at/above the floor, the granted SHORTs ARE D's prefill -> hold, sum counts."""
+    """Control (both directions): running (not parked) or at/above the floor, the granted SHORTs ARE D's prefill -> they price the
+    set (sum counts). NODECODE 1015 (user law: collecting only while a DECODE stands on D): they no longer HOLD it -- D runs only
+    these two prefills, no decode, so the set is decided at once: 253 + 647 = 900 <= X -> D now (was: "hold"); and the sum is
+    what decides -- 253 + 6100 = 6353 > X -> P now, although 6100 alone fits."""
     _on(monkeypatch)
-    f = _front(running=["weg2-54-149", "weg2-54-150"], n=6, kv={"available": 400000, "evictable": 0})
-    f.tp_prefill_max_tokens = 6283
-    f.__dict__["_lane_state_obj"] = types.SimpleNamespace(lane_floor=1, lane_for=lambda rid: 1)
-    _grant(f, "weg2-54-149", 31)
-    _grant(f, "weg2-54-150", 222)
-    t0 = time.time()
-    f.t_awake = t0 - 60.0
-    f.queue = [_pending("weg2-54-154", 647, t0)]
-    assert f._d_pf_pending_tokens() == 253
-    assert f._dc_d_busy()
-    assert f._decode_collect(t0 + 0.1) == "hold"
+    for arrival, route in ((647, "D"), (6100, "P")):
+        f = _front(running=["weg2-54-149", "weg2-54-150"], n=6, kv={"available": 400000, "evictable": 0})
+        f.tp_prefill_max_tokens = 6283
+        f.__dict__["_lane_state_obj"] = types.SimpleNamespace(lane_floor=1, lane_for=lambda rid: 1)
+        _grant(f, "weg2-54-149", 31)
+        _grant(f, "weg2-54-150", 222)
+        t0 = time.time()
+        f.t_awake = t0 - 60.0
+        f.queue = [_pending("weg2-54-154", arrival, t0)]
+        assert f._d_pf_pending_tokens() == 253
+        assert f._dc_d_busy() and not f._dc_decoding()
+        assert f._decode_collect(t0 + 0.1) == route, arrival
+        assert f.counters["decode_collect_hold"] == 0
 
 
 def test_only_the_parked_short_of_a_mixed_book_drops_out(monkeypatch):
