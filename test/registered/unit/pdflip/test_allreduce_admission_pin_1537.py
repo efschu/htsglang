@@ -455,6 +455,7 @@ def test_p5_the_x_refusal_vote_is_entered_only_behind_the_replicated_preconditio
         "FLLIPER_PDFLIP_GROUP",
         "_pdflip_store_short_fallback",
         "multimodal_inputs",
+        "priority",  # LANES HOTFIX 2 (source bc35462240): a raised lane skips the park -- the request's own field, replicated
         "stream",
     ], attrs
 
