@@ -229,3 +229,124 @@ def test_refresh_switch_off(tmp_path, monkeypatch, _awake_gate):
     out = be.arena_copy_to_disk(be._arenas[qs.KV_TOTAL], stems)
     assert out.get("refreshed") == 0
     assert set(_oldest(be, 2 * qs.PAGES)) == set(stems) | set(twins)
+
+
+# --- (3) weg2-5-52: a read issued during the flip is asked again, awake -------
+
+class _StoreNow:
+    """The store's anchored answer at the wake (batch_exists_v2 over the span)."""
+
+    def __init__(self, pages):
+        self.pages = pages
+        self.asked = []
+
+    def batch_exists_v2(self, keys, transfers, extra):
+        self.asked.append(len(keys))
+        return types.SimpleNamespace(kv_hit_pages=min(self.pages, len(keys)))
+
+
+def _cc(pages):
+    return types.SimpleNamespace(
+        page_size=PAGE, storage_backend=_StoreNow(pages),
+        get_hash_str=lambda ids, root, page_size=PAGE: [f"h{i}" for i in range(len(ids) // page_size)],
+        _presence_pool_transfers=lambda: [types.SimpleNamespace(name="mamba")],
+    )
+
+
+def _dormant_req(rid, n_ids):
+    req = types.SimpleNamespace(rid=rid, origin_input_ids=list(range(n_ids)), extra_key=None)
+    setattr(req, T.WAKE_PROBE_ATTR, True)
+    return req
+
+
+@pytest.fixture
+def _plain_probe(monkeypatch):
+    monkeypatch.setattr(T, "_tree_key_probe_armed", lambda: False)
+    monkeypatch.delenv(T.P_WAKE_PROBE_ENV, raising=False)
+
+
+def test_weg2_5_52_dormant_read_is_asked_again_awake(_plain_probe):
+    """P read 1728 tokens mid-flush (``kv=1730 claimed=27``); awake the store
+    holds D's 110656 (1729 pages): PP0 re-reads before the told."""
+    rid = "weg2-5-52"
+    _reap_whole(rid, 1728)
+    req = _dormant_req(rid, 110727)
+    asleep = _Sched(dormant=True)
+    asleep.cache_controller = _cc(1729)
+    assert T._p_held_short_reread(asleep, _Tree(1728), req, rid) is True     # held, not asked
+    assert asleep.calls == [] and asleep.cache_controller.storage_backend.asked == []
+    awake = _Sched(dormant=False)
+    awake.cache_controller = asleep.cache_controller
+    assert T._p_held_short_reread(awake, _Tree(1728), req, rid) is True
+    assert awake.calls == [rid]
+    assert awake.cache_controller.storage_backend.asked == [110727 // PAGE]  # one full-span question
+    _reap_whole(rid, 110656)                       # the re-read landed D's span
+    assert T._p_held_short_reread(awake, _Tree(110656), req, rid) is False   # -> the told
+    assert awake.calls == [rid]
+
+
+def test_dormant_read_the_store_still_short_asks_once_then_tells(_plain_probe):
+    rid = "weg2-5-53"
+    _reap_whole(rid, 1728)
+    req = _dormant_req(rid, 110727)
+    s = _Sched(dormant=False)
+    s.cache_controller = _cc(27)                   # the store holds no more than the read
+    assert T._p_held_short_reread(s, _Tree(1728), req, rid) is False
+    assert T._p_held_short_reread(s, _Tree(1728), req, rid) is False
+    assert s.calls == [] and s.cache_controller.storage_backend.asked == [110727 // PAGE]
+
+
+def test_an_awake_read_is_never_probed(_plain_probe):
+    rid = "weg2-9-1"
+    _reap_whole(rid, 1728)
+    req = types.SimpleNamespace(rid=rid, origin_input_ids=list(range(110727)), extra_key=None)
+    s = _Sched(dormant=False)
+    s.cache_controller = _cc(1729)
+    assert T._p_held_short_reread(s, _Tree(1728), req, rid) is False
+    assert s.cache_controller.storage_backend.asked == []
+
+
+def test_wake_probe_switch_off(_plain_probe, monkeypatch):
+    monkeypatch.setenv(T.P_WAKE_PROBE_ENV, "0")
+    rid = "weg2-5-52"
+    _reap_whole(rid, 1728)
+    s = _Sched(dormant=False)
+    s.cache_controller = _cc(1729)
+    assert T._p_held_short_reread(s, _Tree(1728), _dormant_req(rid, 110727), rid) is False
+
+
+def test_the_dormant_hold_marks_the_read():
+    import inspect
+
+    from sglang.srt.managers.scheduler import Scheduler
+
+    src = inspect.getsource(Scheduler)
+    i = src.index("req._weg2_read_dormant = True")
+    j = src.index("hold.append(req)", i)
+    assert i < j and "if getattr(self, \"weg2_dormant\", False) and _weg2_dormant_admit_armed():" in src[i - 400:i]
+
+
+# --- (4) L3-EVICT-FILE: every evicted L3 file is named --------------------
+
+@pytestmark_gcc
+def test_every_evicted_l3_file_is_named(tmp_path, monkeypatch, caplog, _awake_gate):
+    import logging
+
+    qs, be, stems, twins, young = _parked_on_old_copies(tmp_path, monkeypatch)
+    monkeypatch.setenv("SGLANG_HICACHE_L3_EVICT_FILE_LOG", "3")
+    ev = be._evictor
+    with caplog.at_level(logging.INFO):
+        with ev._lock:
+            ev._evict_locked(0, target=ev._directory_bytes_locked() - 1)   # one victim's worth
+            ev._evict_locked(0, target=0)                                   # everything
+    lines = [m for m in caplog.messages if m.startswith("L3-EVICT-FILE stem=")]
+    assert lines and all(" age_s=" in m and " why=cap " in m for m in lines)
+    assert any(" comp=kv " in m for m in lines)
+    import collections
+    import re as _re
+
+    per_run = collections.Counter(_re.search(r" run=(\d+) ", m).group(1) for m in lines)
+    assert len(per_run) == 2 and max(per_run.values()) <= 3                 # capped per run
+    assert any(m.startswith("L3-EVICT-FILE SUMMARY") and "suppressed=" in m for m in caplog.messages)
+    first = lines[0]
+    assert stems[0] in first or twins[0] in first, "the oldest file goes first and is named"
