@@ -10421,6 +10421,11 @@ class Scheduler(
         is excluded from streaming and its logprob offset is still accounted).
         Mirrors ``handle_bootstrap_failure``.
         """
+        # K14: a held waiting-queue abort whose request an earlier plan admitted
+        # is applied first (it may register the chunked abort read below). The
+        # PP loop already settles them right after each plan; this is the
+        # fallback for every other loop. Via the class: bare-namespace harnesses.
+        Scheduler._weg2_resolve_waiting_aborts(self)
         req = self._pending_chunked_abort_req
         if req is None:
             return
@@ -22233,12 +22238,17 @@ class Scheduler(
 
 
     def abort_request(self, recv_req: AbortReq):
-        # #1233 (WEG 2, S0): aborts are never deferred any more. The
-        # deferral existed because an abort applied on one rank before its
-        # peers diverged the replicated live set MID-LAYOUT-CHANGE; there is
-        # no in-process layout change to be mid-way through. This is the
-        # direct call every boot without the flip already made.
-        deferred = False
+        # #1233 (WEG 2, S0): aborts are never deferred for a layout change any
+        # more. K14 (NF h16p 15.10. 21:52:38Z, weg2-164-2265): a PP follower
+        # under the #631 row authority defers ONE kind -- the abort of a request
+        # it still queues while PP0 already admitted it (PP0's verdict rides
+        # the forwarded AbortReq, weg2.pp_abort). Popping it here let PP0's
+        # frame name a rid this rank no longer had: #1180, group death. The
+        # whole abort is held (no side effect) and applied right after the plan
+        # that admits it (weg2.pp_abort.resolve_waiting_aborts).
+        from sglang.srt.weg2 import pp_abort as _pp_abort_k14
+
+        deferred = _pp_abort_k14.hold_waiting_abort(self, recv_req)
         # #801 CORROBORATION MARKER, and it exists because its absence was
         # unreadable. An abort applied on one rank before its peers diverges
         # the replicated live set -- pin 4 says exactly that, one comment up --
@@ -22269,6 +22279,14 @@ class Scheduler(
             getattr(recv_req, "abort_all", None),
             deferred,
         )
+        if deferred:
+            return  # K14: applied by weg2.pp_abort.resolve_waiting_aborts
+        Scheduler._abort_request_apply(self, recv_req)  # via the class: bare-namespace harnesses
+
+    def _abort_request_apply(self, recv_req: AbortReq):
+        """The abort itself, every side effect included. ``abort_request`` at
+        receipt, or K14's ``resolve_waiting_aborts`` after the plan that
+        admitted a held request (never held twice: it calls this directly)."""
         # fnFL2 H43: an aborted request's first-chunk PLE admission is dropped
         from sglang.srt.models.qwen4_exp_ple_admit import drop_ple_admission
 
@@ -22277,6 +22295,19 @@ class Scheduler(
             abort_all=bool(getattr(recv_req, "abort_all", False)),
         )
         self._abort_request_now(recv_req)
+
+    def _weg2_resolve_waiting_aborts(self, pp0_drained: bool = False) -> int:
+        """K14: settle this follower's held waiting-queue aborts (one getattr
+        while none is held). See weg2.pp_abort.resolve_waiting_aborts."""
+        if not getattr(self, "_weg2_pp_held_waiting_aborts", None):
+            return 0
+        from sglang.srt.weg2 import pp_abort as _pp_abort_k14
+
+        return _pp_abort_k14.resolve_waiting_aborts(
+            self,
+            lambda r: Scheduler._abort_request_apply(self, r),
+            pp0_drained=pp0_drained,
+        )
 
     def _weg2_rearm_defer_tick(self, batch) -> None:
         """H31b: start / promote the deferred Platztausch extra rows
