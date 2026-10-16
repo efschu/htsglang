@@ -6067,6 +6067,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if not hashes or dv is None or len(hashes) * int(self.page_size) != int(dv.numel()):
             self._1421_refused("direct_no_hashes", node)
             return False
+        try:  # F1: a follower applies PP0's newest slot set before it claims
+            from sglang.srt.weg2 import w3_room_set as _w3rs
+
+            _w3rs.apply_if_new(self, pool)
+        except Exception:  # noqa: BLE001 - room making never breaks a claim
+            logger.warning("W3-ROOM-SET apply failed", exc_info=True)
         pre = pool.alloc_write(hashes)
         if pre is None and self._w3_arena_spill(pool, len(hashes), claimer=node) > 0:
             # W3-ARENA: the spill handed this rank's references back; the
@@ -6233,6 +6239,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if now < getattr(self, "_w3_spill_quiet_until", 0.0):
             return 0
         want = max(int(need_pages), self.W3_SPILL_MIN_PAGES)
+        from sglang.srt.weg2 import w3_room_set as _w3rs
+
+        if _w3rs.armed(self):
+            # F1: a PP group spills ONE slot set -- PP0 decides from the arena order, every stage
+            # gives back exactly these slots (a slot frees only when all stages let go)
+            _rel = _w3rs.spill(self, pool, int(need_pages), want, released_out)
+            if _rel == 0:
+                self._w3_spill_quiet_until = now + self.W3_SPILL_EMPTY_BACKOFF_S
+            return _rel
         base = self.components.get(BASE_COMPONENT_TYPE)
         if base is None:
             return 0

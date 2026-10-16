@@ -131,6 +131,8 @@ def _reason(cache: Any, node: Any, pool: Any, skip: set) -> Optional[str]:
         for c in _aux_components(cache)
     ):
         return "aux_host_only"            # an aux state lives on the host only (anchor, park_l3)
+    if any(node.component_data[c.component_type].value is not None for c in _aux_components(cache)):
+        return "aux_device_value"         # K15b A4: _evict_host_leaf(ALL) would free a live device state
     if int(hv.min()) < int(getattr(pool, "staging_rows", 0)):
         return "staging"                  # staging rows are not arena slots
     return None
