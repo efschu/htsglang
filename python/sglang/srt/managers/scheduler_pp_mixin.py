@@ -9981,18 +9981,19 @@ class SchedulerPPMixin:
                     _peek = pp_admission_decision_from_wire(
                         {_ADMISSION_DECISION_PAYLOAD_KEY: _row_raw}
                     )
-                    _known = {
-                        getattr(r, "rid", None) for r in self.waiting_queue
-                    }
-                    _known.add(getattr(getattr(self, "chunked_req", None), "rid", None))
+                    # ROW-PROBE-TAILS (NF h16s 1016_150003 15:13:26, PP1 weg2-6-94, #1180 death): the
+                    # probe enumerated its OWN four places (waiting queue, chunked_req, the slot's
+                    # chunked req, running batch) and missed the fifth, the END-ANCHOR tails
+                    # (fnFL2 H42 ``anchor_tails``): PP1 minted the 4-token tail of weg2-6-94 at
+                    # slot 1 (ANCHOR-TAILS minted_rids=weg2-6-94) exactly like PP0, PP0's slot-2
+                    # row re-added it -- and the probe called a rid this rank holds "not
+                    # locatable" until the lap cap. The shared enumeration (#946
+                    # ``pp_request_locations``: every place a request can live) is the one
+                    # source; the named slot's chunked req stays on top of it.
+                    _known = set(pp_request_locations(self))
                     _known.add(
                         getattr(pp_chunked_req_for_slot(self, mb_id), "rid", None)
                     )
-                    for _r in (
-                        getattr(getattr(self, "running_batch", None), "reqs", None)
-                        or ()
-                    ):
-                        _known.add(getattr(_r, "rid", None))
                     _missing = [
                         e.rid
                         for e in _peek.entries
