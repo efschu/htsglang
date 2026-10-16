@@ -10,6 +10,11 @@ rid=weg2-12-39 epoch=14 via=d_direct': D prefilled 954 tokens after the P->D fli
 Fix: a D-prefill leg (no P leg 1) that D holds unstarted at a park and whose
 stream is still in the lookahead is handed back -- its leg closes, D's hold is
 aborted by name, P's batch takes it.
+
+X-GESETZ F-X (user 16.10.): only a leg the front did NOT price under X is handed
+back; a leg priced under X stays held on D (kept=x_law) and D extends it after
+the flip (law 4, F-D). The y6x leg below is driven through leg2 directly with
+no front price, so it still exercises the hand-back path.
 """
 from __future__ import annotations
 
@@ -145,15 +150,19 @@ def test_only_d_prefill_legs_in_the_lookahead_are_handed_back(caplog):
     f.epoch = 3
     f.tp_prefill_max_tokens = X
     f._rvp_state = lambda: None
-    f._rvp_requeue, f._front_price = {}, {"a": 200}
-    f._leg2_lookahead = {"a", "handoff"}
-    f._d_prefill_legs = {"a": 0.0, "committed": 0.0}   # 'handoff' is an after_p leg
-    out = f._park_handback(["a", "handoff", "committed", "a"])
+    # X-GESETZ F-X (16.10.): a leg priced under X ('s') stays held on D (kept=x_law), D extends it after
+    # the flip; only a leg not priced under X ('a') is handed back to P (was: every lookahead leg)
+    f._rvp_requeue, f._front_price = {}, {"a": X + 1, "s": 200}
+    f._leg2_lookahead = {"a", "s", "handoff"}
+    f._d_prefill_legs = {"a": 0.0, "s": 0.0, "committed": 0.0}   # 'handoff' is an after_p leg
+    out = f._park_handback(["a", "s", "handoff", "committed", "a"])
     assert out == ["a"]
     assert f._rvp_requeue["a"]["reason"] == F.PARK_HANDBACK_REASON
-    assert "handoff" not in f._rvp_requeue and "committed" not in f._rvp_requeue
+    assert "handoff" not in f._rvp_requeue and "committed" not in f._rvp_requeue and "s" not in f._rvp_requeue
     assert f.counters["park_handback_committed"] == 1
+    assert f.counters["park_handback_x_law"] == 1
     assert any("WEG2 PARK-HANDBACK rid=committed kept=committed" in m for m in caplog.messages)
+    assert any("WEG2 PARK-HANDBACK rid=s kept=x_law price=200 X=%d" % X in m for m in caplog.messages)
 
 
 def test_the_park_answers_held_list_is_read():

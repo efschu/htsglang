@@ -336,8 +336,11 @@ class TestCombinationWithSeatAtHandOff:
                     tasks.append(h.post(mark, chars))
                     await asyncio.sleep(0.05)  # arrival order = age order
                 assert await _until(lambda: "rpc:release_memory_occupation" in h.p.timeline, 30)
-                assert sorted(_gens_before_first_release(h)) == ["gen:L1", "gen:L2", "gen:L3", "gen:S1"], \
+                # X-GESETZ F-X (16.10.): the SHORT S1 is held for D, no leg 1 on P (was: rode the cap)
+                assert sorted(_gens_before_first_release(h)) == ["gen:L1", "gen:L2", "gen:L3"], \
                     h.p.timeline
+                assert any(getattr(q, "rid", "").endswith("S1") or getattr(q, "text", "").endswith("S1")
+                           for q in h.front._ready_for_d) or h.front.counters["short_hold_d"] == 1
                 assert await _until(lambda: h.front.awake == "D" and h.front.state == "serving", 20)
                 await asyncio.sleep(1.5)
                 assert "rpc:release_memory_occupation" not in h.d.timeline, h.d.timeline  # no D->P flip back

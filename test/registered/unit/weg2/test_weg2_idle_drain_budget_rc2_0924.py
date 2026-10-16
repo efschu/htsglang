@@ -117,11 +117,20 @@ def test_a_short_that_ds_budget_refused_is_queued_but_not_drain_eligible():
 
 def test_a_short_queued_by_the_phase_stays_drain_eligible():
     async def body():
+        # X-GESETZ F-X (16.10., lifts P-BATCH-ALL for SHORTs): a SHORT that arrives while P is awake is
+        # no longer queued for P at all -- it is held in D's line (d_direct), which is what the drain was
+        # for; it stays D-eligible and never gets a leg 1 on P
         f = _front(awake="P", d_short_drain_tokens=4096)
-        p, task = await _route(f, REFUSED_TOKENS)
+        task = asyncio.ensure_future(f.handle_generate(_Req(_text_payload(REFUSED_TOKENS))))
+        for _ in range(500):
+            await asyncio.sleep(0)
+            if f._ready_for_d or f.queue or task.done():
+                break
+        held = list(f._ready_for_d)
         await _drop(task)
-        assert p is not None and p.d_eligible is True, (
-            "a SHORT that arrived while P was awake is exactly what the drain is for")
+        assert not f.queue, "no leg 1 on P for a SHORT"
+        assert len(held) == 1 and held[0].d_eligible is True and held[0].d_direct and held[0].skip_leg1, (
+            "a SHORT that arrived while P was awake is held for D")
 
     asyncio.run(body())
 

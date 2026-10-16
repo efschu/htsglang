@@ -11,8 +11,8 @@ wall 19.1 s. Agent load 01./02.10.: ~1 such case per 1000 arrivals.
 
 Switch SGLANG_WEG2_PRICE_BARRIER (default on). Marker 'WEG2 PRICE-BARRIER'.
 
-PINNED: the N5x boot-start pair goes to P as a group and D does no extend for
-the SHORT; a SHORT beside a candidate that ends SHORT loses at most that
+PINNED: the N5x boot-start pair: the LONG goes to P, D does no extend for the
+SHORT and (X-GESETZ F-X 16.10.) the SHORT is held for D, no leg 1 on P; a SHORT beside a candidate that ends SHORT loses at most that
 count time and goes to D as before; nothing in flight costs nothing; a sibling
 that never reaches its verdict (client gone) is not waited for; full seats /
 P awake / switch off keep today's path. Hermetic, CPU, no HTTP.
@@ -147,14 +147,15 @@ def test_red_n5x_boot_start_pair_goes_to_p_as_a_group_and_d_does_no_extend(caplo
     with caplog.at_level(logging.INFO, logger="weg2.front"):
         asyncio.run(_run(f, [SHORT, LONG], release_after=0.05))
     assert f.d_legs == [], f"D extended {f.d_legs} -- the SHORT took a D seat beside the LONG"
-    queued = {p.rid: p for p in f.queue}
-    assert len(queued) == 2, [p.rid for p in f.queue]
-    short_p = [p for p in f.queue if p.est_prompt == 25][0]
-    assert short_p.d_eligible is False and short_p.skip_leg1 is False, "it rides P's batch"
+    # X-GESETZ F-X (16.10.): the LONG goes to P, the SHORT is HELD for D (no D extend the
+    # flip would park, and no leg 1 on P either -- was "rides P's batch" under P-BATCH-ALL)
+    assert len(f.queue) == 1 and f.queue[0].est_prompt != 25, [p.rid for p in f.queue]
+    short_p = [p for p in f._ready_for_d if p.est_prompt == 25][0]
+    assert short_p.d_eligible is False and short_p.skip_leg1 is True and short_p.d_direct is True
     assert f.counters["price_barrier_to_p"] == 1
     lines = _lines(caplog)
     assert any("outcome=to_p" in l and "siblings=1" in l for l in lines), lines
-    assert any("outcome=to_p sibling=" in l and "sibling_uncached=74148" in l and "waited_ms=" in l
+    assert any("outcome=hold_d sibling=" in l and "sibling_uncached=74148" in l and "waited_ms=" in l
                for l in lines), lines
     assert sum(1 for r in caplog.records if r.getMessage().startswith("WEG2 X-EXACT-HOLD")) == 2
 
@@ -221,7 +222,8 @@ def test_full_seats_and_an_awake_p_keep_their_paths(caplog):
     with caplog.at_level(logging.INFO, logger="weg2.front"):
         asyncio.run(_run(g, [SHORT, LONG], release_after=0.05))
     assert g.d_legs == [] and g.counters["price_barrier_waits"] == 0
-    assert g.counters["short_behind_p"] == 1
+    # X-GESETZ F-X (16.10.): P awake -> the SHORT is held for D (was SHORT-TO-P, short_behind_p)
+    assert g.counters["short_hold_d"] == 1 and g.counters.get("short_behind_p", 0) == 0
 
 
 def test_the_candidate_rule():

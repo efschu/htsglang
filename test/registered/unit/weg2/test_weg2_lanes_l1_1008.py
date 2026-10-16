@@ -70,7 +70,7 @@ def _front(awake="D"):
 
 
 def _arrive(payload, path="/v1/chat/completions"):
-    """One request handed to the front while D flips to P: it is queued for P (the plan's Pending)."""
+    """One request handed to the front while D flips to P: its Pending (held for D since X-GESETZ F-X)."""
     async def go():
         f = _front("D")
         f.state = "flipping"
@@ -84,7 +84,9 @@ def _arrive(payload, path="/v1/chat/completions"):
             await asyncio.wait_for(asyncio.shield(task), timeout=0.5)
         except asyncio.TimeoutError:
             pass
-        out = (f, list(f.queue))
+        # X-GESETZ F-X (16.10.): the SHORT (2300 chars) is held in D's line, not queued for P -- the
+        # plan's Pending is the same object either way
+        out = (f, list(f.queue) + list(f._ready_for_d))
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
         return out

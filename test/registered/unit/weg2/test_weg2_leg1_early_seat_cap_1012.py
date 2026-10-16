@@ -27,8 +27,9 @@ _spec.loader.exec_module(_d)
 
 
 def _pend(rid):
+    # X-GESETZ F-X (16.10.): the waiting requests are P-bound (over X) -- a SHORT D owns gets no early leg 1 on P
     return F.Pending(rid=rid, path="/v1/chat/completions", payload={"messages": []}, text="x",
-                     t_arrive=time.time(), fut=None)
+                     t_arrive=time.time(), fut=None, est_prompt=10 ** 6, est_uncached=10 ** 6)
 
 
 def _dp_flip(n_queue, p_concurrency=6):
@@ -68,7 +69,8 @@ def test_both_post_sites_use_the_queue_head_up_to_p_concurrency():
     flip = inspect.getsource(F.Front.flip)
     gate = inspect.getsource(F.Front._early_flip_gate)
     for src in (flip, gate):
-        assert "leg1_early_candidates(self.queue, self.p_concurrency)" in src
+        assert "leg1_early_candidates(self.queue, self.p_concurrency," in src
+        assert "skip=lambda q: Front._x_law_d_short(self, q))" in src  # X-GESETZ F-X: no early leg for a SHORT
         assert "_leg1_early_limit" not in src and "_dc_p_cap" not in src
 
 

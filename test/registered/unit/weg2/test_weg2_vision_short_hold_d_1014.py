@@ -9,8 +9,11 @@ PARTITION ... claimed=0 by=mamba'), prefilled all 134240 tokens in 39.6 s, TTFT
 50.5 s, every lane-0 request parked meanwhile. D held the prefix on device
 across every flip of that session (cached_device=134208 at weg2-22-130).
 
-A SHORT whose credit only D holds stays for D; a store-backed one (y6x,
-test_weg2_p_batch_all_1002) still joins P's batch.
+A SHORT whose credit only D holds stays for D. X-GESETZ F-X (16.10.): a
+store-backed SHORT is held for D as well (was: joined P's batch, y6x,
+test_weg2_p_batch_all_1002) -- under X D prefills it; only the stale D-only
+credit (SHORTHOLD-EPOCH, D slept since) is re-priced as the LONG it is and goes
+to P.
 """
 from __future__ import annotations
 
@@ -135,19 +138,21 @@ def test_weg2_20_129_is_kept_for_d_not_ps_batch(caplog):
     assert not any("WEG2 SHORT-TO-P rid=" in m for m in caplog.messages)
 
 
-def test_a_store_credited_short_still_joins_ps_batch(caplog):
+def test_a_store_credited_short_is_held_for_d_too(caplog):
+    # X-GESETZ F-X (16.10.): under X D prefills it -- was SHORT-TO-P (P-BATCH-ALL)
     caplog.set_level(logging.INFO)
     f = _front("l3_index", CREDIT)
     queued, ready = _arrive(f)
-    assert ready == [] and len(queued) == 1
-    assert not queued[0].d_presence_only and not queued[0].skip_leg1
-    assert any("WEG2 SHORT-TO-P rid=" in m for m in caplog.messages)
+    assert queued == [] and len(ready) == 1
+    assert not ready[0].d_presence_only and ready[0].skip_leg1 and ready[0].d_direct
+    assert any("WEG2 SHORT-HOLD-D rid=" in m and "why=x_law" in m for m in caplog.messages)
+    assert not any("WEG2 SHORT-TO-P rid=" in m for m in caplog.messages)
 
 
-def test_a_d_credit_the_store_backs_still_joins_ps_batch():
+def test_a_d_credit_the_store_backs_is_held_for_d_too():
     f = _front("d_leg2_cached", N - 500)
     queued, ready = _arrive(f)
-    assert ready == [] and len(queued) == 1 and not queued[0].d_presence_only
+    assert queued == [] and len(ready) == 1 and not ready[0].d_presence_only
 
 
 # ---- the P drain leaves it ----------------------------------------------------------
@@ -166,9 +171,10 @@ def test_the_p_drain_does_not_take_a_d_presence_only_short():
     kept = _pending("kept", 8.0, skip_leg1=True, short_kept=True, d_direct=True)
     f._ready_for_d.extend([held, kept])
     n = f._p_batch_takes_d_prefill()
-    assert n == 1
-    assert [p.rid for p in f._ready_for_d] == ["held"]
-    assert [p.rid for p in f.queue] == ["kept"]
+    # X-GESETZ F-X (16.10.): neither is taken -- both are SHORTs D prefills (was: kept -> P)
+    assert n == 0
+    assert [p.rid for p in f._ready_for_d] == ["held", "kept"]
+    assert list(f.queue) == []
     assert held.d_presence_only and held.short_kept and held.d_direct
 
 
@@ -198,9 +204,13 @@ def test_weg2_2_55_a_credit_d_slept_on_goes_to_ps_batch(caplog):
     queued, ready = _arrive(f)
     assert ready == [] and len(queued) == 1, "P's batch: P reads the prefix from the store"
     assert not queued[0].d_presence_only
+    # X-GESETZ F-X: the void SHORT price is replaced by the realised extent -- a LONG, so the
+    # P drain's sweep (which holds SHORTs for D) leaves it with P
+    assert queued[0].est_uncached == N and not queued[0].skip_leg1
+    assert not Front._x_law_d_short(f, queued[0])
     assert f.counters["short_hold_d_stale"] == 1 and f.counters["short_hold_d"] == 0
     assert any("WEG2 SHORT-HOLD-D STALE rid=" in m for m in caplog.messages)
-    assert any("WEG2 SHORT-TO-P rid=" in m for m in caplog.messages)
+    assert not any("WEG2 SHORT-TO-P rid=" in m for m in caplog.messages)
 
 
 def test_an_unknown_credit_epoch_is_not_held():

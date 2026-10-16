@@ -90,8 +90,9 @@ def test_y4y_a_short_arriving_during_the_flip_to_d_is_queued_for_d(caplog):
     assert any("SHORT-IN-FLIP" in m and "verdict=d_prefill" in m for m in caplog.messages)
 
 
-def test_the_flip_to_p_keeps_the_old_path():
-    """A SHORT arriving while D flips to P still goes to P's queue (P is next)."""
+def test_the_flip_to_p_holds_a_short_for_d():
+    """A SHORT arriving while D flips to P is held for D (X-GESETZ F-X 16.10.: no leg 1 on P for a request
+    under X; was "still goes to P's queue (P is next)" under P-BATCH-ALL)."""
     async def go():
         f = _front("D")
         f.state = "flipping"
@@ -112,7 +113,7 @@ def test_the_flip_to_p_keeps_the_old_path():
 
     with _asr_on():
         queued, ready = asyncio.run(go())
-    assert len(queued) == 1 and ready == []
+    assert queued == [] and len(ready) == 1 and ready[0].d_direct and ready[0].skip_leg1
 
 
 def _pending(rid, age_s, d_eligible=True, uncached=775):

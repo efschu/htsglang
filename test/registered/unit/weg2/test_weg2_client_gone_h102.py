@@ -32,7 +32,9 @@ from sglang.srt.environ import envs
 from sglang.srt.weg2 import front as fr
 from sglang.srt.weg2.front import Front
 
-PROMPT = "a short agent turn"
+# X-GESETZ F-X (16.10.): the rig drives the P queue / P leg 1 with P awake. A SHORT arriving while P is awake
+# is held for D since 16.10. (no leg 1 on P), so the turn is LONG: ~6000 tokens > the rig's X = 4096
+PROMPT = "a long agent turn " * 1000
 
 
 class _Lines(logging.Handler):
@@ -260,7 +262,7 @@ def test_p_slot_wait_hang_up_skips_leg1():
     # the drain's `one` reads the flag before it POSTs leg 1
     src = open(fr.__file__).read()
     i = src.index("async def one(p: Pending) -> Pending:")
-    blk = src[i:i + 1200]   # DP-NACHLAUF 02.10.: the early-leg await sits between them
+    blk = src[i:i + 1700]   # DP-NACHLAUF 02.10.: the early-leg await sits between them; X-GESETZ F-X 16.10.: the hold-for-D guard heads one()
     assert blk.index("if p.client_gone:") < blk.index("await self.leg1(p)")
     assert blk.index("if p.client_gone:") < blk.index("await _early")
     j = src.index("def _on_leg1_done(p: Pending)")

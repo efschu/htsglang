@@ -166,8 +166,11 @@ def test_early_legs_are_posted_for_what_the_p_phase_takes():
         p.d_direct = p.client_gone = False
         p._leg1_early = None
     assert [p.rid for p in front_mod.leg1_early_candidates(q, 6)] == ["a", "b", "c"]
+    # X-GESETZ F-X (16.10.): a SHORT D owns gets no early leg 1 on P
+    assert [p.rid for p in front_mod.leg1_early_candidates(q, 6, skip=lambda p: p.rid == "b")] == ["a", "c"]
     src = inspect.getsource(front_mod)
-    assert src.count("leg1_early_candidates(self.queue, self.p_concurrency)") == 2
+    assert src.count("leg1_early_candidates(self.queue, self.p_concurrency,") == 2
+    assert src.count("skip=lambda q: Front._x_law_d_short(self, q))") == 2
 
 
 # ------------------------------------------------------------------ A1: the P phase with a FULL D (behaviour, controller)
@@ -235,9 +238,10 @@ def test_a1_no_seat_cap_and_no_stranded_needs_p_with_a_full_d_and_a_longer_queue
 
 
 def test_a1_a_short_rides_the_p_phase_with_a_full_d_as_cap_exempt():
-    """Cap 2, three LONG and one SHORT queued, D full: the two LONG take the cap, the SHORT rides as cap_exempt
-    (FLIPCYCLE H5) and so does the third LONG (over X: it needs P, flipqueue 1015) -- 4 legs before the flip,
-    whatever D's seats say. RED when the exemption needs a free seat (MD)."""
+    """Cap 2, three LONG and one SHORT arriving, D full: the two LONG take the cap, the third LONG rides as
+    cap_exempt (over X: it needs P, flipqueue 1015) -- 3 legs before the flip, whatever D's seats say. X-GESETZ
+    F-X (16.10.): the SHORT is held for D at its arrival, no leg 1 on P (was: rode as cap_exempt, FLIPCYCLE H5).
+    RED when the exemption needs a free seat (MD)."""
     from test_weg2_phase_policy_h91c import Harness, _until
 
     async def body():
@@ -247,8 +251,9 @@ def test_a1_a_short_rides_the_p_phase_with_a_full_d_as_cap_exempt():
             tasks = [h.post("L1", 15000), h.post("L2", 15000), h.post("L3", 15000), h.post("S1", 20)]
             assert await _until(lambda: "rpc:release_memory_occupation" in h.p.timeline, 30)
             before = _gens_before_first_release(h)
-            assert sorted(before) == ["gen:L1", "gen:L2", "gen:L3", "gen:S1"], h.p.timeline
-            assert h.front.counters["p_phase_short_rides"] == 2  # the pool's ride count: S1 and L3 past the cap
+            assert sorted(before) == ["gen:L1", "gen:L2", "gen:L3"], h.p.timeline
+            assert h.front.counters["p_phase_short_rides"] == 1  # the pool's ride count: L3 past the cap
+            assert h.front.counters["short_hold_d"] == 1  # S1: held for D (X-GESETZ 16.10.)
             for t in tasks:
                 t.cancel()
 

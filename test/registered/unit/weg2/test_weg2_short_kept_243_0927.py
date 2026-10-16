@@ -80,8 +80,10 @@ class Wiring(unittest.TestCase):
     def test_fall_through_keeps_a_measured_d_presence(self):
         i = self.src.index("_sk = (short_ok and _short_keep_enabled() and int(store_span or 0) > 0")
         blk = self.src[i:i + 9000]
-        # P-BATCH-ALL (02.10.): the per-rid line names P's batch, not a keep
-        self.assertIn("WEG2 SHORT-TO-P rid=%s", blk)
+        # X-GESETZ F-X (16.10., lifts P-BATCH-ALL of 02.10. for SHORTs): a SHORT in a P
+        # phase is held for D -- the per-rid line names the keep and why, no SHORT-TO-P
+        self.assertIn("WEG2 SHORT-HOLD-D rid=%s why=%s", blk)
+        self.assertNotIn("WEG2 SHORT-TO-P rid=", self.src)
         self.assertIn("and not _p_phase and _pb_to_p is None", blk)  # PRICE-BARRIER/COLLECT-P extended the term
         self.assertIn("skip_leg1=_sk, short_kept=_sk, price_epoch=int(self.epoch)", blk)
         self.assertIn('if _sk and self.awake == "D" and self.admit_d and self.state == "serving":', blk)
@@ -107,10 +109,12 @@ class Wiring(unittest.TestCase):
         self.assertLess(b, blk.index("p = _q"))
         self.assertLess(b, blk.index("await self._d_seat.acquire()"))
 
-    def test_p_drain_gives_a_kept_short_its_leg1(self):
-        # P-BATCH-ALL (02.10.): P is awake -- a kept SHORT is prefilled on P;
-        # law 02.10.: CARRIER-EXCEEDS is deleted -- no skip of leg 1 in a P drain at all
+    def test_p_drain_gives_a_kept_short_its_leg1_only_over_x(self):
+        # X-GESETZ F-X (16.10.): a kept SHORT under X is held for D in a P drain; only one
+        # re-priced over X gets its leg 1 on P. law 02.10.: CARRIER-EXCEEDS is deleted.
+        h = self.src.index("if Front._x_law_d_short(self, p):")
         a = self.src.index('self._to_p_batch(p, "drain")')
+        self.assertLess(h, a)
         self.assertNotIn("if p.skip_leg1:  # route CARRIER-EXCEEDS: no leg 1, D prefills once", self.src)
         self.assertGreater(a, 0)
 
