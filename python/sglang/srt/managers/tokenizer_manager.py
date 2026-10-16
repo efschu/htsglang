@@ -1463,6 +1463,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 priority=obj.priority,
                 lane=obj.lane,
                 spill_class=obj.spill_class,
+                weg2_front_x=obj.weg2_front_x,
+                weg2_front_priced=obj.weg2_front_priced,
                 extra_key=obj.extra_key,
                 routing_key=obj.routing_key,
                 token_type_ids=token_type_ids,

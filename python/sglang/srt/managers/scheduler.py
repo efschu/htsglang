@@ -243,6 +243,7 @@ from sglang.srt.weg2 import twin_anchor as _weg2_twin_anchor  # TWIN ANCHOR (y4a
 from sglang.srt.weg2 import d_park_read as _weg2_park_read  # PARK-RETAIN READ
 from sglang.srt.weg2 import lanes_p as _lanes_p  # PRIORITY LANES 1008 (L3): the P-side lane floor
 from sglang.srt.weg2 import resume_via_p as _weg2_rvp  # RESUME-VIA-P
+from sglang.srt.weg2 import front_x as _weg2_front_x  # FRONT-X-MIT: the front's decision X at D's X gate
 from sglang.srt.weg2 import d_wall_head as _weg2_d_wall_head  # PW-R
 from sglang.srt.weg2 import d_head_hold as _weg2_d_head_hold  # DQH
 from sglang.srt.weg2 import progress_beacon as _weg2_beacon  # FP forward-progress beacon
@@ -7651,6 +7652,11 @@ class Scheduler(
             _spill_class = getattr(recv_req, "spill_class", None)
             if _spill_class is not None:
                 req.spill_class = _spill_class
+            # FRONT-X-MIT (15.10., weg2/front_x.py): the front's decision X for this
+            # D-direct leg 2, read by `_weg2_x_refuses`. A field of the broadcast
+            # request, so every TP rank holds the same value (MUST NOT 7).
+            req.weg2_front_x = getattr(recv_req, "weg2_front_x", None)
+            req.weg2_front_priced = getattr(recv_req, "weg2_front_priced", None)
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
@@ -14562,10 +14568,18 @@ class Scheduler(
         # `_weg2_host_carry_tokens` stays: the #1246 carrier bound still reads
         # D's own #915 line, and it is the term the acceptance checks against
         # cap x share.
-        verdict = "W31" if uncached > x else "admit"
+        # FRONT-X-MIT (15.10.): the limit is the front's decision X (+ one page of
+        # rounding) when the request carries it, never above the static X.
+        # `X=` stays the STATIC value (the old readers of this line parse it);
+        # `front_x=`/`front_priced=`/`limit=` name what the verdict compared to.
+        limit, _front_x, _front_priced = _weg2_front_x.resolve_limit(req, x, getattr(self, "page_size", None))
+        verdict = "W31" if uncached > limit else "admit"
         logger.info(
-            "WEG2 X-GATE rid=%s uncached=%d X=%d replicated_term=%s verdict=%s",
+            "WEG2 X-GATE rid=%s uncached=%d X=%d replicated_term=%s verdict=%s "
+            "front_x=%s front_priced=%s limit=%d",
             str(getattr(req, "rid", "?")), uncached, x, term, verdict,
+            "-" if _front_x is None else _front_x,
+            "-" if _front_priced is None else _front_priced, limit,
         )
         if verdict == "admit":
             _weg2_rvp.clear_capacity_park(req)  # #248h: its re-read landed
@@ -14615,9 +14629,18 @@ class Scheduler(
         # group's; the local terms are MIN-reduced like every park release).
         _cap_park = [False] * len(refused)
         if any(_weg2_rvp.capacity_park_precondition(r) for r in refused):  # replicated terms
-            _cap_local = [_weg2_rvp.capacity_park_candidate(r, x, sched=self) for r in refused]
+            _cap_local = [
+                _weg2_rvp.capacity_park_candidate(
+                    r, _weg2_front_x.resolve_limit(r, x, getattr(self, "page_size", None))[0], sched=self
+                )
+                for r in refused
+            ]
             _cap_park = [bool(f) for f in self._weg2_group_min_flags(_cap_local)]
+        x_static = x
         for _i, req in enumerate(refused):
+            # FRONT-X-MIT (15.10.): the bound this request was refused against is the
+            # front's decision X (+ one page) when it carried one, else the static X.
+            x, _front_x, _front_priced = _weg2_front_x.resolve_limit(req, x_static, getattr(self, "page_size", None))
             if wall_rows is not None and id(req) in wall_rows:
                 uncached = int(wall_rows[id(req)])
             else:
@@ -14652,12 +14675,23 @@ class Scheduler(
                 f"prefix matching is {uncached}. Refused by name so the caller re-routes it "
                 f"through the prefill group -- never prefilled here silently."
             )
+            if _front_x is not None:
+                message += (
+                    f" FRONT-X: the front dispatched this request on X={_front_x} "
+                    f"(priced {'?' if _front_priced is None else _front_priced}); "
+                    f"limit = min(static {x_static}, front X + one page)."
+                )
             if wall_rows is not None and id(req) in wall_rows:
                 message += (
                     " D-WALL-HEAD: the extent is the device rows this request needs; the "
                     "host arena takes no backup, so nothing D holds can leave the device."
                 )
-            logger.warning("W50 Weg2TpPrefillExceeded rid=%s uncached=%d X=%d", req.rid, uncached, x)
+            logger.warning(
+                "W50 Weg2TpPrefillExceeded rid=%s uncached=%d X=%d front_x=%s front_priced=%s",
+                req.rid, uncached, x,
+                "-" if _front_x is None else _front_x,
+                "-" if _front_priced is None else _front_priced,
+            )
             # #Q0/#991 THE THIRD EXIT. A request refused here was matched
             # first, and the match may have drawn a COW resume slot
             # (`MambaComponent.finalize_match_result`). It never reaches

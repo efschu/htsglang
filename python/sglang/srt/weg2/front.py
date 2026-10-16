@@ -171,6 +171,7 @@ from sglang.srt.weg2 import prio_age as _prio_age  # PRIO-AS-AGE 1014: priority 
 from sglang.srt.weg2 import front_requests as _frq  # front.flip / d_activity / ttft_by_via / request_done
 from sglang.srt.weg2 import front_metrics as _fmet  # weg2_req Influx push (TSDB-DELTA 1c, default off)
 from sglang.srt.weg2 import d_prefill_inflight as _dpf  # X-SUM-PRICE on the arrival path
+from sglang.srt.weg2 import front_x as _front_x  # FRONT-X-MIT: the decision X rides with the D leg
 from sglang.srt.weg2 import sum_price as _sp  # X-SUM-PRICE: the one rule
 
 logger = logging.getLogger("weg2.front")
@@ -3850,6 +3851,12 @@ class Pending:
     #: could take it. Read by ``_flip_economics_ok`` under
     #: SGLANG_WEG2_VISION_FLIP_URGENT.
     p_only: bool = False
+    #: FRONT-X-MIT (15.10.): ``(X, priced uncached)`` of the LAST decision that handed this
+    #: request to D (arrival verdict, QUEUED-SHORT, D-SHORT-DRAIN, X-IDLE-REGRANT,
+    #: DECODE-COLLECT to-d). Kept ON the request, not on the front: the hand-over sites write
+    #: nothing else on the front (test_weg2_x_sum_price_flip_unchanged_1503). Read once, where
+    #: the D-direct leg 2 is started (:meth:`handle_generate`).
+    x_decision: Optional[Tuple[int, Optional[int]]] = None
     #: MM-XPRICE: one past the image positions in the front's exact ids (0 =
     #: no image or not priced exactly); a P-only request whose store credit
     #: reaches it is re-priced as text (``_x_exact_reprice_queue``).
@@ -5152,6 +5159,61 @@ class Front:
         self._front_price[str(rid)] = int(uncached)
         while len(self._front_price) > 4096:
             self._front_price.pop(next(iter(self._front_price)))
+
+    #: FRONT-X-MIT: decision records kept (bounded, oldest out)
+    X_DECISIONS_KEPT = 4096
+
+    def _note_x_decision(self, rid: str, x: int, priced: Optional[int] = None) -> None:
+        """FRONT-X-MIT (15.10.): the X of the decision that hands ``rid`` to D (and what
+        it priced), recorded where the decision is made and read where the D leg is
+        posted (:meth:`_front_x_headers`). The LAST decision of a rid stands: a queued
+        SHORT priced at arrival (X_k) and sent later by QUEUED-SHORT (X in force) is
+        bounded by the second."""
+        try:
+            d = self.__dict__.setdefault("_x_decision", {})
+            d[str(rid)] = (int(x), None if priced is None else int(priced))
+            while len(d) > Front.X_DECISIONS_KEPT:
+                d.pop(next(iter(d)))
+        except (TypeError, ValueError):
+            pass
+
+    @staticmethod
+    def _stamp_x_decision(p: "Pending", x: int, priced: Optional[int] = None) -> None:
+        """FRONT-X-MIT: record on the request the X of the decision handing it to D.
+        ``priced`` defaults to its current ``est_uncached``. Never raises."""
+        try:
+            p.x_decision = (int(x), int(getattr(p, "est_uncached", 0) or 0) if priced is None else int(priced))
+        except (TypeError, ValueError, AttributeError):
+            pass
+
+    def _front_x_headers(self, rid: str, pending: Optional["Pending"], single_prefill: bool) -> Dict[str, str]:
+        """FRONT-X-MIT: the request headers of a D-DIRECT leg 2 -- ``{}`` for any other.
+
+        A leg 2 that follows P's leg 1 (``pending`` set, not ``d_direct``) reads P's
+        KV back and prefills ~nothing; a single-prefill leg carries no X law: neither
+        carries a decision X. For a D-direct leg the decision X is the last recorded
+        one (:meth:`_note_x_decision`); a rid no decision site recorded is bounded by
+        the X IN FORCE now (``tp_prefill_max_tokens``) -- the upper bound of every X
+        the front ever decides with -- so no path is left to the static ceiling."""
+        if single_prefill or (pending is not None and not getattr(pending, "d_direct", False)):
+            return {}
+        rec = (self.__dict__.get("_x_decision") or {}).pop(str(rid), None)
+        if rec is not None:
+            x, priced = rec
+        else:
+            x = int(getattr(self, "tp_prefill_max_tokens", 0) or 0)
+            priced = None
+        if priced is None:
+            priced = (int(getattr(pending, "est_uncached", 0) or 0) if pending is not None
+                      else (self.__dict__.get("_front_price") or {}).get(str(rid)))
+        hdr = _front_x.request_headers(x, priced)
+        if hdr:
+            self.counters["front_x_carried"] += 1
+            logger.info("WEG2 FRONT-X rid=%s front_x=%d front_priced=%s static_x=%d%s (the decision X rides with the D-direct "
+                        "leg; D refuses by name above front_x + one page)", rid, int(x),
+                        "-" if priced is None else priced, int(getattr(self, "tp_prefill_max_tokens", 0) or 0),
+                        "" if rec is not None else " src=x_in_force")
+        return hdr
 
     def _rvp_take(self) -> int:
         """Take D's needs-P requests and queue a P-only leg 1 for each. One
@@ -10425,6 +10487,7 @@ class Front:
                 self._d_pf_book().done(rid=rid)  # X-SUM-PRICE: the provisional booking of the collect gate
             if seat is not None:
                 self._d_pf_book().grant(rid=rid, tokens=remainder, now=time.time())  # X-SUM-PRICE
+                Front._note_x_decision(self, rid, x_route, remainder)  # FRONT-X-MIT: the verdict's X (X-ROUTE line)
                 if self.x_split:
                     self._note_x_grant(
                         rid, self._x_band_floor() if _x_busy_at_grant else x_route,
@@ -10580,6 +10643,7 @@ class Front:
         if _pb_to_p is not None:
             p.d_eligible = False  # PRICE-BARRIER: it rides the LONG's P phase, never handed back to D
         Front._lane_stamp(self, p)  # PRIORITY LANES 1008 (L4): original arrival + hold as clock offset
+        Front._stamp_x_decision(p, x_route, remainder)  # FRONT-X-MIT: the arrival verdict's X; a later hand-over re-decides
         if _d_hold:
             # VISION-SHORT-1014: D's admission line (like SHORT-IN-FLIP); P's drain
             # leaves it there (d_presence_only), D re-prices it at its admission
@@ -10632,6 +10696,8 @@ class Front:
         except Exception as e:  # noqa: BLE001
             return web.json_response({"error": f"{type(e).__name__}: {e}"}, status=503)
         self._mark_posted(p)
+        if p.d_direct and getattr(p, "x_decision", None) is not None:
+            Front._note_x_decision(self, rid, *p.x_decision)  # FRONT-X-MIT: the hand-over's X rides with leg 2
         if p.d_direct:
             # 27B idle policy (b): handed to D by the SHORT drain -- no leg 1 ran,
             # so leg 2 is the SHORT route's (its X refusal re-queues it for P).
@@ -10879,6 +10945,7 @@ class Front:
         self.queue.clear()
         for p in moved:
             p.d_direct = True
+            Front._stamp_x_decision(p, x_idle)  # FRONT-X-MIT: the X this hand-over was decided on
             if p.x_deferred:  # USAGE-DETAILS: the band request is served on D after all
                 self._usage_route_note(p.rid, "x_short", self.epoch)
             self._ready_for_d.append(p)
@@ -11567,6 +11634,7 @@ class Front:
             except ValueError:
                 continue
             p.d_direct = True
+            Front._stamp_x_decision(p, x)  # FRONT-X-MIT: the collect release's X
             if _g(p, "x_deferred", False) and hasattr(self, "_usage_route_note"):
                 self._usage_route_note(p.rid, "x_short", self.epoch)  # USAGE: served on D after all
             self._ready_for_d.append(p)
@@ -12533,6 +12601,7 @@ class Front:
             except ValueError:
                 continue
             p.d_direct = True
+            Front._stamp_x_decision(p, x)  # FRONT-X-MIT: QUEUED-SHORT's X (the line's X=)
             self._ready_for_d.append(p)
             self.counters["arrival_seat_d_prefill"] += 1
             self.counters["arrival_seat_queue_to_d"] += 1
@@ -13500,8 +13569,13 @@ class Front:
             # the client gets it only if it asked itself (strip below).
             _strip_tier = not cached_tier_asked(payload) and request.path in CACHED_TIER_ASK_PATHS
             _d_body = Front._send_ids_body(self, rid, payload, pending, single_prefill)
+            # FRONT-X-MIT (15.10.): a D-direct leg carries the X of its dispatch decision
+            # (+ what was priced); D's X gate refuses by name above it. Other legs: {}.
+            _fx_headers = Front._front_x_headers(self, rid, pending, single_prefill)
+            _post_kw = {"headers": _fx_headers} if _fx_headers else {}  # no kwarg = the old call byte for byte
             async with self.session.post(f"{g.url}{request.path}",
-                                         json=with_cached_tier_ask(_d_body, request.path)) as r:
+                                         json=with_cached_tier_ask(_d_body, request.path),
+                                         **_post_kw) as r:
                 # FIX 2 (round 1): LAW 4's RE-ROUTE IS DECIDED BEFORE THE
                 # RESPONSE IS COMMITTED, ON BOTH WIRE SHAPES.  The check used
                 # to sit below the `if stream:` branch, which returns; so for
@@ -17118,6 +17192,7 @@ class Front:
         self.queue.clear()
         for p in moved:
             p.d_direct = True
+            Front._stamp_x_decision(p, x)  # FRONT-X-MIT: the drain's X
             self._ready_for_d.append(p)
         self._sync_batch_gate()
         self.counters["d_short_drain_requests"] += len(moved)

@@ -1971,6 +1971,13 @@ class Envs:
     # is in flight; otherwise it is routed with the start X (to P). NF D is
     # bs1, so a burst served serially on D would be slower than P's batch.
     SGLANG_WEG2_X_SOLO_WINDOW_MS = EnvInt(250)
+    # FRONT-X-MIT (15.10., NF boot 124245 report nf-core-dx-1015): the front's
+    # decision X (+ what it priced) rides with the D-direct leg 2 in two request
+    # headers and D's X gate (W31) checks the REALISED uncached extent against
+    # min(static X, front X + one page) -- named refusal instead of a silent
+    # compute between the front's X and the static 12288. Read on the front
+    # (send) and on D (check). Off on either end = the static gate byte for byte.
+    SGLANG_WEG2_FRONT_X_CARRY = EnvBool(True)
     # X-SUM-PRICE on the arrival path (user 09.10.): a D that is PREFILLING a
     # granted SHORT counts as busy for DECODE-COLLECT, and what it still has
     # to prefill is carried into the collected set's sum. Off = collect only

@@ -285,6 +285,12 @@ class GenerateReqInput:
     # nothing infers a class from traffic. Unset -> the server-wide default
     # (--kv-session-offload-default-spill-class, itself "normal").
     spill_class: Optional[str] = None
+    # FRONT-X-MIT (15.10., weg2/front_x.py): the X of the Weg-2 front's dispatch
+    # decision for this D-direct leg 2 and what it priced at that decision (tokens).
+    # Set only from the x-weg2-front-x / x-weg2-front-priced request headers; None =
+    # nothing carried, D's static X gate is the only gate.
+    weg2_front_x: Optional[int] = None
+    weg2_front_priced: Optional[int] = None
     # Extra cache key for classifying the request (e.g. cache_salt)
     extra_key: Optional[Union[List[str], str]] = None
 
@@ -784,6 +790,8 @@ class GenerateReqInput:
             priority=self.priority,
             lane=self.lane,
             spill_class=self.spill_class,
+            weg2_front_x=self.weg2_front_x,
+            weg2_front_priced=self.weg2_front_priced,
             extra_key=self.extra_key[i] if self.extra_key is not None else None,
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
@@ -874,6 +882,12 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # Resolved to a concrete class by the tokenizer manager; None only reaches
     # the scheduler on internal paths that bypass it (treated as "normal").
     spill_class: Optional[str] = None
+
+    # FRONT-X-MIT (15.10.): the front's decision X / priced uncached for a D-direct
+    # leg 2 (weg2/front_x.py). Rides this object to the scheduler on every TP rank
+    # (rank 0 broadcasts it), so the gate's limit is the group's.
+    weg2_front_x: Optional[int] = None
+    weg2_front_priced: Optional[int] = None
 
     # Extra cache key for classifying the request (e.g. cache_salt)
     extra_key: Optional[str] = None
