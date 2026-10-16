@@ -225,6 +225,7 @@ class Catalog(unittest.TestCase):
         cat = json.load(open(os.path.join(os.path.dirname(HERE), "profil_data", "catalog.json"), encoding="utf-8"))
         k = cat["kanten"]
         self.assertTrue(k["geladen"])
+        # RC5 (16.10.): the shipped catalog is the union with the RC5 NF head: + K139 (FLLIPER_PDFLIP_PRIO_AS_AGE requires FLLIPER_PDFLIP_LANES, NF edge file only, trees ["nf"]): it merges with the curated edge of the entry: 139 edges, merged 51 -> 52, new stays 87.
         # F0-H round 4b (11.10.): + K136 (FLLIPER_PDFLIP_ENABLE_DECODE_COLLECT_PREFILL_BUSY, NF edge file only, trees ["nf"]; the shipped catalog is the union with the NF line of round 4b, sha 080fddd9): 136 edges, new 84 -> 85 (merged stays 51). The 27B tree's own edge file keeps its count.
         # F0-H round 3 (10.10.): + K132-K134 (VISION-WEIGHTS AP4: --pdflip-vision-place weights requires transient / excludes VISION_ASYNC / kvtail+auto excluded with --dual-layout), the W3 edge is K135 now (the lines' edge files carry the same 131 + 3 edges, the NF file the W3 edge behind them): 135 edges, new 81 -> 84, on both lines.
         # F0-I 09.10.: the shipped catalog is the union of both lines and carries K132 (FLLIPER_PDFLIP_ENABLE_W3_SPILL_HOST_LEAVES requires ..._W3_SPILL_ANCHOR_POOL, trees nf): 132 edges, new 80 -> 81, on both lines (the 27B tree's own kantenkatalog_1004.json stays at 131 edges, its tests pin the file).
@@ -233,7 +234,7 @@ class Catalog(unittest.TestCase):
         # "ohne Beleg" = kuratierte Kanten ohne Katalogkante: 24 im Kern der 27B-Linie; der NF-eigene kuratierte Eintrag --pdflip-xchg-census-map (nur NF-Baum) traegt
         # eine weitere (braucht --pdflip-xchg-census), ist der Katalog aus dem NF-Kern gebaut (Neubau NF-Linie 07.10.), sind es 25
         nf_census_map = cat["entries"].get("--pdflip-xchg-census-map", {}).get("status") == "curated"
-        self.assertEqual((k["edges_total"], k["verschmolzen"], k["neu"], k["edges_without_evidence"]), (138, 51, 87, 25 if nf_census_map else 24))
+        self.assertEqual((k["edges_total"], k["verschmolzen"], k["neu"], k["edges_without_evidence"]), (139, 52, 87, 25 if nf_census_map else 24))
         deps = [d for e in cat["entries"].values() for d in e["depends"]]
         self.assertTrue(all("belegt" in d and "to_kind" in d for d in deps))
         self.assertTrue(any(d["to_kind"] == "refusal" for d in deps))
