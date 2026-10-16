@@ -807,6 +807,27 @@ def _load_blob(path: str, gz: bool) -> bytes:
         return fh.read()
 
 
+#: checkpoint files whose NAME git reads as its own control file. Stored verbatim under that name, a checkpoint's
+#: ``.gitattributes`` (every HF repo has one: ``*.gz filter=lfs``, ``model.safetensors.index.json filter=lfs``) marks the
+#: snapshot's own committed blobs as LFS objects -- on any box whose git has the lfs filter configured the fixture tree is
+#: then "modified" right after checkout (14.10.: host_build.sh refused the flat image ctx with "src-27b/ nicht sauber").
+#: Such a file is stored as ``<name>.snapshot``; the manifest keeps the real name and the materialised stub is unchanged.
+_SNAPSHOT_GIT_NAMES = (".gitattributes", ".gitignore", ".gitmodules")
+
+
+def _blob_name(fn: str) -> str:
+    """The file name a snapshot stores the copy of checkpoint file ``fn`` under (see ``_SNAPSHOT_GIT_NAMES``)."""
+    return fn + ".snapshot" if fn in _SNAPSHOT_GIT_NAMES else fn
+
+
+def _snapshot_blob_path(files_dir: str, fn: str, gz: bool) -> str:
+    """Path of the stored copy of ``fn``; a snapshot written before the escape (verbatim name) is still read."""
+    p = os.path.join(files_dir, _blob_name(fn))
+    if p != os.path.join(files_dir, fn) and not os.path.exists(p + (".gz" if gz else "")):
+        return os.path.join(files_dir, fn)
+    return p
+
+
 def snapshot_checkpoint(model_dir: str, out_dir: str, *, name: Optional[str] = None, source: Optional[str] = None) -> str:
     """Record what the launcher's dry run reads of a checkpoint directory, WITHOUT the weights: every ``*.safetensors``
     file as its header bytes (``8 + N``: the length word and the JSON) plus its size, every small other file verbatim,
@@ -849,7 +870,7 @@ def snapshot_checkpoint(model_dir: str, out_dir: str, *, name: Optional[str] = N
                             **({"gz": True} if gz else {})})
         elif size <= SNAPSHOT_COPY_MAX or fn.endswith(".safetensors.index.json"):
             with open(path, "rb") as fh:
-                gz = _store_blob(os.path.join(files_dir, fn), fh.read())
+                gz = _store_blob(os.path.join(files_dir, _blob_name(fn)), fh.read())
             entries.append({"name": fn, "size": size, "kind": "copy", **({"gz": True} if gz else {})})
         else:
             entries.append({"name": fn, "size": size, "kind": "zero"})
@@ -880,7 +901,7 @@ def materialize_checkpoint(snapshot_dir: str, dest_parent: str) -> str:
         gz = bool(e.get("gz"))
         if e["kind"] == "copy":
             with open(out, "wb") as fh:
-                fh.write(_load_blob(os.path.join(snapshot_dir, "files", e["name"]), gz))
+                fh.write(_load_blob(_snapshot_blob_path(os.path.join(snapshot_dir, "files"), e["name"], gz), gz))
         else:
             with open(out, "wb") as fh:
                 if e["kind"] == "header":
