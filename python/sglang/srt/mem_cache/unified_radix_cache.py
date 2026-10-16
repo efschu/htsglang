@@ -5787,6 +5787,101 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     int(sec.get("written", 0) or 0))
         return True
 
+    # -- K15 (NF h16q2 1cfbf32584, boot _215812, D, weg2-56-530) ---------------
+    #: anchors kept by an eviction-time spill / lost at eviction (per process)
+    _k15_saved_n = 0
+    _k15_lost_n = 0
+
+    @staticmethod
+    def k15_anchor_save_on() -> bool:
+        return os.environ.get("SGLANG_WEG2_EVICT_ANCHOR_SAVE", "1").strip().lower() not in (
+            "0", "false", "no", "off", "")
+
+    def _weg2_evict_spill_room(self, node, mp) -> bool:
+        """K15: the flush's spill room (an L3-secured foreign INTERMEDIATE
+        anchor leaves the arena, :meth:`_weg2_flush_spill_room`) for an
+        eviction that would otherwise drop ``node``'s anchor -- once per node
+        and rank (the H19 FULL rule: a slot frees after the last rank's
+        release)."""
+        if not UnifiedRadixCache.k15_anchor_save_on() or getattr(node, "_weg2_evict_spilled", False):
+            return False
+        node._weg2_evict_spilled = True
+        try:
+            return bool(self._weg2_flush_spill_room(node, mp))
+        except Exception as exc:  # noqa: BLE001 - no room = the old drop, named by the caller
+            logger.warning("K15 EVICT-SPILL node=%s raised %s: %s", getattr(node, "id", "?"),
+                           type(exc).__name__, exc)
+            return False
+
+    def weg2_save_anchor_before_tombstone(self, node) -> bool:
+        """K15 (weg2-56-530, 00:21:41-00:22:06): the device mamba eviction
+        TOMBSTONES an internal node's anchor (mamba_component.drive_eviction,
+        ``target=DEVICE``); without a host copy the state is gone. weg2-56-528
+        resumed at 73984 (``MATCH-CENSUS-DEEP reached=73984 accepted=73984``)
+        and extended past it to its end anchor 74752 -- 73984 became internal;
+        the follow-up weg2-56-530 forked at 74560 (``key_match_depth=74560``)
+        and found the deepest anchor at 65536 (``#1040 anchor_depth=65536``,
+        ``FA PREFETCH-FROM-ANCHOR anchor=65536``): D computed 9787 tokens where
+        the front had priced 1339 (``verdict=short_mispriced``). The mamba
+        arena was full and pinned by D's own tree (``ARENA-REF-CENSUS
+        arena-58834944 complete=32 pinned=32 own_held=31``), so no host copy
+        could be made the ordinary way.
+
+        Now the anchor is backed up before the tombstone: the node's own backup
+        (anchor-only when its KV is backed, else the full write-back backup --
+        the contiguous-backup parent rule stands), with the spill room when the
+        arena refuses, and the write is joined (``writing_check(write_back=
+        True)``, the leaf eviction's own synchronous form) so the device state
+        is copied before it is freed. True = a host copy exists now. A refusal
+        that no spill can serve is NAMED (``WEG2-ANCHOR-LOST at=evict``) and
+        the tombstone goes ahead as before (the admission must be served).
+        Rank: the same rank-local eviction as the leaf branch; on Form A only
+        the attention host holds recurrent state."""
+        cd = node.component_data[ComponentType.MAMBA]
+        if cd.host_value is not None:
+            return True
+        cc = self.cache_controller
+        if (cc is None or getattr(cc, "write_policy", None) != "write_back"
+                or not UnifiedRadixCache.k15_anchor_save_on()):
+            return False
+        if getattr(node, "_weg2_capped", False) or node.write_through_pending_id is not None:
+            return False   # the per-path cap took it by design / a write is already in flight
+        written = 0
+        for attempt in range(2):
+            try:
+                if node.backuped:
+                    written = self.write_backup_anchor_only(node)
+                else:
+                    written = self.write_backup(node, write_back=True)
+            except Exception as exc:  # noqa: BLE001 - the tombstone below is the old path
+                logger.warning("K15 ANCHOR-SAVE node=%s raised %s: %s", getattr(node, "id", "?"),
+                               type(exc).__name__, exc)
+                written = 0
+            if written or attempt:
+                break
+            mp = self._weg2_mamba_pool()
+            if mp is None or not self._weg2_evict_spill_room(node, mp):
+                break
+        if written:
+            self.writing_check(write_back=True)
+        ok = node.component_data[ComponentType.MAMBA].host_value is not None
+        if ok:
+            UnifiedRadixCache._k15_saved_n += 1
+            n = UnifiedRadixCache._k15_saved_n
+            if n <= 32 or n % 256 == 0:
+                logger.info("K15 ANCHOR-SAVED n=%d node=%s depth=%d (the device mamba eviction keeps this "
+                            "internal anchor on the host instead of tombstoning it)",
+                            n, getattr(node, "id", "?"), self.weg2_node_depth(node))
+        else:
+            UnifiedRadixCache._k15_lost_n += 1
+            n = UnifiedRadixCache._k15_lost_n
+            if n <= 32 or n % 256 == 0:
+                logger.warning("WEG2-ANCHOR-LOST at=evict n=%d node=%s depth=%d backuped=%s why=%s (the "
+                               "internal anchor had no host copy and none could be made -- tombstoned)",
+                               n, getattr(node, "id", "?"), self.weg2_node_depth(node), node.backuped,
+                               getattr(self, "_weg2_sweep_last_refusal", "?"))
+        return ok
+
     def _weg2_anchor_of(self, n, mp, allow_end=False):
         """(held, slots): an arena anchor sits on `n`; its slots when this rank
         may release it (settled write, no host lock, not the end anchor --
@@ -5926,6 +6021,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if mxfer is not None:
             mp = self._weg2_mamba_pool()
             mrows = self._weg2_mamba_claim(node, mp, hashes[-1]) if mp is not None else None
+            if mrows is None and mp is not None and kv_only_if_mamba_refused \
+                    and self._weg2_evict_spill_room(node, mp):
+                # K15: an eviction that would go KV-only first frees a slot by
+                # spilling an L3-secured foreign intermediate anchor
+                mrows = mp.alloc_write([hashes[-1]])
             if (mrows is None and mp is not None and not kv_only_if_mamba_refused
                     and not getattr(node, "weg2_park_end", False) and self._weg2_park_first_node(node)):
                 # PARK-END-ANCHOR-FIRST: an INTERMEDIATE of a park chain that

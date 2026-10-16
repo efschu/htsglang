@@ -1097,6 +1097,16 @@ class MambaComponent(TreeComponent):
                     _1469_note("HOLD-END-ANCHOR", node=x.id)
                     x = x_next
                     continue
+                # K15: an internal anchor without a host copy is backed up
+                # before its device state goes (weg2-56-530: 73984 lost here)
+                _save = getattr(self.cache, "weg2_save_anchor_before_tombstone", None)
+                if callable(_save) and x.component_data[ct].host_value is None:
+                    _save(x)
+                    if not lru.in_list(x) or x.component_data[ct].value is None:
+                        x = x_next if lru.in_list(x_next) else lru.get_lru_no_lock()
+                        continue
+                    if x_next is not None and not lru.in_list(x_next):
+                        x_next = lru.get_lru_no_lock()
                 self.cache._evict_component_and_detach_lru(
                     x, self, target=EvictLayer.DEVICE, tracker=tracker
                 )
