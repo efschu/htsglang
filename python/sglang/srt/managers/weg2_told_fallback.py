@@ -301,10 +301,22 @@ def min_passes(pp_size: int) -> int:
         return default
 
 
-def deadline(published_at: float, own_read_s: float, window_s: float) -> float:
+def deadline(published_at: float, own_read_s: float, window_s: float, room_wait_s: float = 0.0) -> float:
+    """The Frist: ``min(published + frist_s(window), intake + TOTAL_S)``, never before publication.
+
+    READ-ROOM (review A1 of arenaread, coupled to T2 DEFER-LIFESIGN): ``room_wait_s`` = the time PP0's own reads
+    of this rid spent inside ARMED room waits (``read_room.lifesign_s``: a named, bounded wait on a full arena
+    whose holders were asked to hand back L3-backed copies) -- a lifesign of the read, not idleness, exactly like
+    a follower's defer beat. The ``intake + TOTAL_S`` clamp (the #699 wedge clock, which only logs) moves by it,
+    capped by told2's absolute ceiling ``SGLANG_WEG2_TOLD_WAIT_ABS_S``; without it 3 reads x 10 s of room wait put
+    the Frist BEFORE the publication and the acks on their way met ``told=0 reason=frist`` (124245 weg2-4-25:
+    reads 5114/7748/10032 ms, ``PF TOLD-FALLBACK told=43392 -> 0 reason=frist after=0.16s``). 0 (no armed wait,
+    READ-ROOM off) = the old Frist, byte for byte."""
     total = _env_float(ENV_TOTAL_S, TOTAL_S_DEFAULT)
     intake_at = float(published_at) - max(0.0, float(own_read_s))
-    return max(float(published_at), min(float(published_at) + frist_s(window_s), intake_at + total))
+    room = min(max(0.0, float(room_wait_s)), max(0.0, float(own_read_s)),
+               _env_float(ENV_WAIT_ABS_S, WAIT_ABS_S_DEFAULT))
+    return max(float(published_at), min(float(published_at) + frist_s(window_s), intake_at + total + room))
 
 
 def _say(n: int) -> bool:
@@ -522,9 +534,9 @@ def _pp0_open_map(scheduler) -> Dict[str, _Open]:
 
 
 def pp0_open(scheduler, rid: str, told: int, published_at: float, own_read_s: float, window_s: float,
-             published_pass: Optional[int] = None) -> float:
-    """PP0 put a paced read-ahead with ``ack`` on the wire for ``rid``."""
-    dl = deadline(published_at, own_read_s, window_s)
+             published_pass: Optional[int] = None, room_wait_s: float = 0.0) -> float:
+    """PP0 put a paced read-ahead with ``ack`` on the wire for ``rid``. ``room_wait_s``: see :func:`deadline`."""
+    dl = deadline(published_at, own_read_s, window_s, room_wait_s)
     _pp0_open_map(scheduler)[str(rid)] = _Open(
         told=int(told), deadline=dl,
         published_pass=-1 if published_pass is None else int(published_pass),

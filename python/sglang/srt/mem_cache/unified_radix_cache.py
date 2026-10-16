@@ -36,6 +36,7 @@ from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.distributed.utils import uneven_dcp_active
 from sglang.srt.environ import envs
 from sglang.srt.weg2 import prefix_trace as _prefix_trace
+from sglang.srt.weg2.read_room import tick as _read_room_tick
 from sglang.srt.weg2 import tail_adopt, tail_handoff
 from sglang.srt.weg2 import short_read as _weg2_short_read
 from sglang.srt.weg2 import d_park_read as _weg2_park_read
@@ -5993,7 +5994,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     #: refusal does not walk the tree again for this long
     W3_SPILL_EMPTY_BACKOFF_S = 0.5
 
-    def _w3_arena_spill(self, pool, need_pages: int, claimer=None, max_secure_pages: int = 0) -> int:
+    def _w3_arena_spill(self, pool, need_pages: int, claimer=None, released_out=None,
+                        max_secure_pages: int = 0) -> int:
         """W3-ARENA (kvs2 0929, bs2 x 240k, P PP0 12:30:55): the arena was
         full, and every COMPLETE slot carried THIS tree's reference
         (ARENA-REF-HOLDERS tree=5419 of 5461 slots, tree_in_use=0). The claim's
@@ -6025,7 +6027,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         rank that holds it); the reference count prefers the pages a peer has
         already begun to release, so the last rank to let go frees the slot.
         No collective, no reserve, no new state: every rank orders by the same
-        header it reads. Returns the pages released here."""
+        header it reads. Returns the pages released here; ``released_out`` (a
+        list) gets the arena slots whose reference this rank let go (READ-ROOM
+        review A3: a re-post of the same read never spills again for them)."""
         if pool is None or getattr(pool, "arena", None) is None:
             return 0
         if not hasattr(pool, "secure_rows_to_l3"):
@@ -6140,7 +6144,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
             if _hos.armed(self):
                 released += _hos.spill_host_only(
-                    self, pool, max(int(need_pages) - released, self.W3_SPILL_MIN_PAGES), P, skip)["released"]
+                    self, pool, max(int(need_pages) - released, self.W3_SPILL_MIN_PAGES), P, skip,
+                    released_out=released_out)["released"]
         self._w3_spill_cap_used, self._w3_spill_cap_skipped = cap_used, cap_skipped
         k = getattr(self, "_w3_spill_n", 0) + 1
         self._w3_spill_n = k
@@ -6156,6 +6161,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 "not spilled because their drop could not clear a host-only child now)",
                 k, int(need_pages), released, spilled, len(cands), secured, written, lost, unpaired,
                 self._w3_spill_ref_free(pool, released_slots), kept_payable)
+        if released_out is not None:
+            released_out.extend(released_slots)
         return released
 
     def _w3_keep_payable_state(self):
@@ -12243,6 +12250,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             pass
         _timing_every = _hicache_round_timing_every()
         _t0 = time.perf_counter() if _timing_every else 0.0
+        # READ-ROOM 1015: a fill short of arena slots asked (the shared request file next to the arena); this
+        # rank hands back L3-backed tree copies for it. One dict-free check per round when nothing was posted.
+        _read_room_tick(self)
         # Reap the previous round's PP-sync sends before issuing new ones.
         self._drain_async_work()
         _h49_t = time.perf_counter()
