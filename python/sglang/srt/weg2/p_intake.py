@@ -358,6 +358,17 @@ def settle_told(scheduler, waiting_queue: Iterable[Any]) -> int:
     return len(gone)
 
 
+#: K9b: an open store backup of the tree is in flight for the intake verdict (default ON, ``0`` = off).
+ENV_INTAKE_BACKUP_INFLIGHT = "SGLANG_WEG2_INTAKE_BACKUP_INFLIGHT"
+
+
+def intake_backup_inflight_enabled(env=None) -> bool:
+    import os as _os
+
+    e = _os.environ if env is None else env
+    return (e.get(ENV_INTAKE_BACKUP_INFLIGHT, "") or "").strip().lower() not in ("0", "false", "no", "off")
+
+
 def pool_terms(tree, alloc):
     """(free, evictable, inflight) as the adder funds an extend, or None when
     the terms cannot be read (a desk double): the caller then keeps the
@@ -385,6 +396,14 @@ def pool_terms(tree, alloc):
     inflight = bool(getattr(tree, "ongoing_write_through", None)) or bool(
         getattr(tree, "ongoing_load_back", None)
     )
+    if not inflight and intake_backup_inflight_enabled():
+        # K9b INTAKE-BACKUP-INFLIGHT (NF h16r 15.10. 11:47:19Z, 7 double flips in 45 min): the stall's premise is
+        # "nothing runs, nothing frees". At the refusal P's own store backups of the hand-off it had JUST finished
+        # were still open (``hicache_backup(3)`` on PP0, WEG2-INTAKE-STALL-CENSUS tracked_evictable=157632 rows of
+        # weg2-74-212 against pool_avail=104512): their acks are what makes those rows payable again. While a
+        # backup of this tree is open the refusal is a WAIT, not the stall -- bounded by the backups themselves;
+        # once they are done the ordinary verdict (and its 1 s hold) decides. ``0`` = the old term.
+        inflight = bool(getattr(tree, "ongoing_backup", None))
     # PR (weg2/pp_room_vote.py; mem_cache.common.PP_ROOM_CAP_ATTR, read by its
     # literal name -- this module stays light): the room every PP stage can
     # pay. A P that runs empty with a head no stage can hold is then the stall.

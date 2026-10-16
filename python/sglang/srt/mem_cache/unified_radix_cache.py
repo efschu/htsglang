@@ -2413,8 +2413,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         start_time = time.perf_counter()
         tracker = {ct: 0 for ct in self.tree_components}
 
-        for component in self._components_tuple:
-            component.drive_eviction(params=params, tracker=tracker)
+        # H16P-NACHBESSERUNG A1: ONE ack-drain wait budget per eviction chain (this evict() call, the
+        # outermost one): L3-DROP and the UD branch of every leaf of the peel draw on the same budget.
+        _depth = getattr(self, "_weg2_l3_chain_depth", 0)
+        if _depth == 0:
+            UnifiedRadixCache._weg2_l3_drain_budget_reset(self)
+        self._weg2_l3_chain_depth = _depth + 1
+        try:
+            for component in self._components_tuple:
+                component.drive_eviction(params=params, tracker=tracker)
+        finally:
+            self._weg2_l3_chain_depth = _depth
 
         if (
             self.cache_controller is not None
@@ -4624,6 +4633,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         if not _sf.unbacked_drop_floor(self, node):
             return False
+        if not UnifiedRadixCache._weg2_l3_drop_under_pressure(self, node):
+            return False   # E1: the arena has room for this node's claim -- demote it (L2 hits stay)
         waited_ms = 0.0
         if node.children:
             self._ud_h_refusal = None
@@ -4667,6 +4678,74 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         except Exception:  # noqa: BLE001 - a hermetic tree without the env field: default on
             return True
 
+    @staticmethod
+    def _weg2_l3_present_strict() -> bool:
+        """A2 (``SGLANG_WEG2_L3_PRESENT_STRICT``, default on)."""
+        try:
+            return bool(envs.SGLANG_WEG2_L3_PRESENT_STRICT.get())
+        except Exception:  # noqa: BLE001 - a hermetic tree without the env field: default on
+            return True
+
+    @staticmethod
+    def _weg2_store_ack_complete(self, operation) -> bool:
+        """A2 (h16p review B2): an acked store write proves L3 holds the node only when it wrote EVERY page --
+        ``operation.completed_tokens >= len(operation.hash_value) * page_size``. The ack comes also for a
+        partial write (disk watchdog, a failed batch), a skipped one (``backup_skip``) and for a stale
+        operation the backup thread refused and acked anyway (``operation_is_stale``: completed_tokens 0);
+        under the arena the same ack frees the host rows, so a node marked l3_present on such an ack would be
+        an L3-DROP candidate with no L3 copy. An operation that names no pages or no page size (a hermetic
+        stand-in) counts as complete. Switch off: every ack."""
+        if not UnifiedRadixCache._weg2_l3_present_strict():
+            return True
+        hv = getattr(operation, "hash_value", None)
+        ps = getattr(self, "page_size", None)
+        if ps is None:
+            ps = getattr(getattr(self, "cache_controller", None), "page_size", None)
+        if hv is None or not ps:
+            return True
+        return int(getattr(operation, "completed_tokens", 0) or 0) >= len(hv) * int(ps)
+
+    @staticmethod
+    def _weg2_l3_drop_pressure_on() -> bool:
+        """E1 (``SGLANG_WEG2_L3_DROP_ONLY_UNDER_PRESSURE``, default on)."""
+        try:
+            return bool(envs.SGLANG_WEG2_L3_DROP_ONLY_UNDER_PRESSURE.get())
+        except Exception:  # noqa: BLE001 - a hermetic tree without the env field: default on
+            return True
+
+    def _weg2_l3_drop_under_pressure(self, node: UnifiedTreeNode) -> bool:
+        """E1 (h16p review, B3): L3-DROP only where the arena would refuse this node's backup claim anyway --
+        ``backup_room_tokens(pool) < tokens`` (the walk's own host-room figure, ``pp_room_vote``; no claim
+        attempt). With room the node is DEMOTED to L2 as before: no refusal cascade to stop, the L2 hit stays,
+        and the peel agrees with the payable walk (it counts a demote there). Switch off: always under
+        pressure (the arenafull behaviour). Unreadable room reads 0 = under pressure (the drop, as before)."""
+        if not UnifiedRadixCache._weg2_l3_drop_pressure_on():
+            return True
+        try:
+            from sglang.srt.weg2 import pp_room_vote as _pr
+
+            cc = getattr(self, "cache_controller", None)
+            room = int(_pr.backup_room_tokens(getattr(cc, "mem_pool_host", None) if cc is not None else None))
+        except Exception:  # noqa: BLE001 - no reading: no room assumed (the drop)
+            return True
+        return room < len(getattr(node, "key", []) or [])
+
+    @staticmethod
+    def _weg2_l3_drain_budget_reset(self) -> None:
+        """A1: a new eviction chain (outermost ``evict()``) starts with nothing spent. A stall mark
+        (``_weg2_l3_drain_stalled_until``) survives the reset: see :meth:`_weg2_l3_drain_budget_left`."""
+        self._weg2_l3_drain_spent_ms = 0.0
+
+    @staticmethod
+    def _weg2_l3_drain_budget_left(self, bound_ms: int) -> float:
+        """A1 (h16p review B1): the wait budget left in this eviction chain, ms. The sum of all ack-drain
+        waits of one ``evict()`` call (L3-DROP and the UD branch, every leaf of the peel, both peel passes)
+        is <= ``SGLANG_WEG2_L3_DROP_ACK_WAIT_MS``. After a drain ran into its timeout the store is stalled:
+        until ``bound`` ms have passed (the next scheduler passes) every drain runs ONCE without waiting."""
+        if time.monotonic() < getattr(self, "_weg2_l3_drain_stalled_until", 0.0):
+            return 0.0
+        return max(0.0, float(bound_ms) - float(getattr(self, "_weg2_l3_drain_spent_ms", 0.0)))
+
     def _weg2_hostlock_source(self, node_id) -> str:
         """L3-DROP instrument: what holds the host lock of node ``node_id`` --
         ``l3_write`` (its own store write, ``ongoing_backup``), ``prefetch``
@@ -4674,12 +4753,22 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if node_id is None:
             return "-"
         try:
+            own, node, prefetch = 0, None, False
             for n, _p in (getattr(self, "ongoing_backup", None) or {}).values():
                 if getattr(n, "id", None) == node_id:
-                    return "l3_write"
+                    own += 1
+                    node = n
             for info in (getattr(self, "ongoing_prefetch", None) or {}).values():
                 if getattr(info[0], "id", None) == node_id:
-                    return "prefetch"
+                    prefetch = True
+            if own and not prefetch:
+                # E2: a lock above the node's own open store writes is somebody else's too
+                ref = max((int(getattr(cd, "host_lock_ref", 0) or 0) for cd in node.component_data), default=0)
+                return "l3_write" if ref <= own else "mixed"
+            if own and prefetch:
+                return "mixed"
+            if prefetch:
+                return "prefetch"
         except Exception:  # noqa: BLE001 - an instrument never raises
             return "unreadable"
         return "unknown"
@@ -4700,9 +4789,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if not held:
             return -1.0
         ob = getattr(self, "ongoing_backup", None) or {}
-        writing = {id(n) for n, _p in ob.values()}
-        if not all(id(d) in writing for d in held):
-            return -1.0   # a holder that is not a store write: no drain frees it (UD-H stays refused)
+        writes: dict[int, int] = {}
+        for n, _p in ob.values():
+            writes[id(n)] = writes.get(id(n), 0) + 1
+        for d in held:
+            # E2 (h16p review B8): the drain frees a child only when its host lock IS its own open store writes
+            # (one lock reference per write). A lock above that count is a prefetch / pin / load-back too --
+            # no ack frees it, and waiting for one is a wait for nothing.
+            if max(int(cd.host_lock_ref) for cd in d.component_data) != writes.get(id(d), 0):
+                return -1.0
         drain = getattr(self, "drain_backup_acks_uncoordinated", None)
         if not callable(drain):
             return -1.0
@@ -4710,17 +4805,26 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             bound_ms = max(0, int(envs.SGLANG_WEG2_L3_DROP_ACK_WAIT_MS.get()))
         except Exception:  # noqa: BLE001
             bound_ms = 2000
+        # A1: the wait comes out of the chain's budget; an empty budget still drains once, without waiting
+        budget_ms = UnifiedRadixCache._weg2_l3_drain_budget_left(self, bound_ms)
         t0 = time.perf_counter()
+        timed_out = False
         while True:
             if int(drain()) < 0:
                 return -1.0
             if not any(any(cd.host_lock_ref > 0 for cd in d.component_data) for d in held):
                 break
             waited = (time.perf_counter() - t0) * 1000.0
-            if waited >= bound_ms:
+            if waited >= budget_ms:
+                timed_out = budget_ms > 0
                 break
             time.sleep(0.005)
-        return (time.perf_counter() - t0) * 1000.0
+        waited_ms = (time.perf_counter() - t0) * 1000.0
+        self._weg2_l3_drain_spent_ms = float(getattr(self, "_weg2_l3_drain_spent_ms", 0.0)) + waited_ms
+        if timed_out:
+            # the backup thread did not ack within the budget: stalled -- no more waiting for `bound` ms
+            self._weg2_l3_drain_stalled_until = time.monotonic() + bound_ms / 1000.0
+        return waited_ms
 
     def _ud_drop_unbacked_leaf(
         self, node: UnifiedTreeNode, tracker: dict[ComponentType, int]
@@ -5889,7 +5993,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     #: refusal does not walk the tree again for this long
     W3_SPILL_EMPTY_BACKOFF_S = 0.5
 
-    def _w3_arena_spill(self, pool, need_pages: int, claimer=None, released_out=None) -> int:
+    def _w3_arena_spill(self, pool, need_pages: int, claimer=None, released_out=None,
+                        max_secure_pages: int = 0) -> int:
         """W3-ARENA (kvs2 0929, bs2 x 240k, P PP0 12:30:55): the arena was
         full, and every COMPLETE slot carried THIS tree's reference
         (ARENA-REF-HOLDERS tree=5419 of 5461 slots, tree_in_use=0). The claim's
@@ -5933,9 +6038,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             pool = _w3_anchor_spill_pool(pool)
             if pool is None:
                 return 0
-        if _r12.role() is not None:
-            # Form A: a worker's host rows mirror TP0's verdicts (R12); the
-            # spill stays on the groups without the shadow protocol
+        _role = _r12.role()
+        if _role == "worker":
+            # Form A: a worker never decides a host drop of its own (R12). Its
+            # need goes to TP0, which spills and sends SPILL -- every rank then
+            # gives its reference back (metal dual15: the spill never ran on
+            # the D group, 215 ARENA-DROP freed=0, the head request looped;
+            # NF h16p K10 15.10. 12:21Z: D tree=3692+2499 of 6191 slots, the
+            # same wall, 3366 ARENA-DROP freed=0 in 6 min)
+            _r12.request_spill(getattr(pool, "arena", None), need_pages)
             return 0
         now = time.monotonic()
         if now < getattr(self, "_w3_spill_quiet_until", 0.0):
@@ -5982,16 +6093,34 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             cands.append(node)
         keys = self._w3_spill_keys(pool, cands)
         cands.sort(key=lambda x: keys[id(x)])
-        released = secured = written = lost = 0
+        released = secured = written = lost = unpaired = 0
         spilled = 0
         released_slots = []
+        # H16Q review A3: ``max_secure_pages`` > 0 bounds the pages handed to the SYNCHRONOUS L3 write of this call
+        # (TP0's FORMA-REQUEST runs on D's scheduler thread before the broadcast the workers wait at). A node whose
+        # pages do not fit the rest of the budget is passed over (counted, named by the caller); 0 = no bound.
+        cap_used = cap_skipped = 0
         for node in cands:
             if released >= want:
                 break
             hv = node.component_data[BASE_COMPONENT_TYPE].host_value
+            if max_secure_pages > 0:
+                _np = -(-int(hv.numel()) // P)
+                if cap_used + _np > int(max_secure_pages):
+                    cap_skipped += 1
+                    continue
+                cap_used += _np
             sec = pool.secure_rows_to_l3(hv)
-            if int(sec.get("lost", 0)) or not int(sec.get("pages", 0)):
+            _unp = int(sec.get("unpaired", 0)) if UnifiedRadixCache._weg2_l3_present_strict() else 0
+            if int(sec.get("lost", 0)) or _unp or not int(sec.get("pages", 0)):
+                # A2 (h16p review B2): an unpaired page (KV without its QSA index) is NOT in L3 -- like lost:
+                # no release of the host copy, no l3_present
                 lost += int(sec.get("lost", 0))
+                unpaired += _unp
+                continue
+            if _role == "host" and int(sec.get("pages", 0)) < len(getattr(node, "hash_value", None) or ()):
+                # Form A: a page some owner has not finished is not COMPLETE and
+                # got no L3 copy -- the whole node stays until every page has one
                 continue
             secured += int(sec.get("on_disk", 0))
             written += int(sec.get("written", 0))
@@ -6000,6 +6129,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 node, base, target=EvictLayer.HOST, tracker=None)
             self.evictable_host_leaves.discard(node)
             node.l3_present = True
+            if _role == "host":
+                _r12.record_spill(self, node)   # every worker gives its reference back too
             released += int(host_freed or 0) // P
             spilled += 1
         if released < int(need_pages):
@@ -6014,19 +6145,20 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 released += _hos.spill_host_only(
                     self, pool, max(int(need_pages) - released, self.W3_SPILL_MIN_PAGES), P, skip,
                     released_out=released_out)["released"]
+        self._w3_spill_cap_used, self._w3_spill_cap_skipped = cap_used, cap_skipped
         k = getattr(self, "_w3_spill_n", 0) + 1
         self._w3_spill_n = k
         if released == 0:
             self._w3_spill_quiet_until = now + self.W3_SPILL_EMPTY_BACKOFF_S
-        if k <= 8 or k % 64 == 0 or lost:
+        if k <= 8 or k % 64 == 0 or lost or unpaired:
             logger.info(
                 "W3-ARENA SPILL n=%d need=%d released_pages=%d nodes=%d candidates=%d "
-                "l3=on_disk:%d,written:%d lost=%d ref_free=%s kept_payable=%d (a finished page leaves L2 only with "
+                "l3=on_disk:%d,written:%d lost=%d unpaired=%d ref_free=%s kept_payable=%d (a finished page leaves L2 only with "
                 "its L3 copy; the node stays on the device, l3_present; ref_free = of the slots "
                 "this spill let go, those NO rank references any more -- the clock takes them; "
                 "group-equal order: fewest peer references first, then slot id; kept_payable = device nodes "
                 "not spilled because their drop could not clear a host-only child now)",
-                k, int(need_pages), released, spilled, len(cands), secured, written, lost,
+                k, int(need_pages), released, spilled, len(cands), secured, written, lost, unpaired,
                 self._w3_spill_ref_free(pool, released_slots), kept_payable)
         if released_out is not None:
             released_out.extend(released_slots)
@@ -6078,6 +6210,36 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         except Exception:  # noqa: BLE001 - an instrument never breaks the spill
             return "-"
         return "%d/%d" % (sum(1 for r in refs if int(r) == 0), len(uniq))
+
+    def _w3_forma_serve_requests(self) -> int:
+        """TP0 on Form A, at its broadcast (``form_a_host_shadow.attach``): a
+        worker's refused arena claim left its need next to the arena; spill
+        for it. The SPILL events of this call ride the same broadcast."""
+        if _r12.role() != "host":
+            return 0
+        pool = self._weg2_direct_pool()
+        arena = getattr(pool, "arena", None)
+        if arena is None:
+            return 0
+        need = _r12.take_spill_request(arena)
+        if need <= 0:
+            return 0
+        # H16Q review A3: at most SGLANG_WEG2_W3_FORMA_SPILL_MAX_PAGES pages go through the synchronous L3 write of
+        # this call (the workers wait at the broadcast behind it); what is left, the worker asks again at its next
+        # refused claim. ms = the whole call, the metal abort criterion (> 200 ms) reads it.
+        try:
+            cap = max(0, int(envs.SGLANG_WEG2_W3_FORMA_SPILL_MAX_PAGES.get()))
+        except Exception:  # noqa: BLE001 - a hermetic tree without the field: the review's bound
+            cap = 128
+        self._w3_spill_cap_used = self._w3_spill_cap_skipped = 0   # an early return (backoff) reports 0, not the last call
+        t0 = time.monotonic()
+        got = self._w3_arena_spill(pool, need, max_secure_pages=cap)
+        ms = (time.monotonic() - t0) * 1000.0
+        logger.info("W3-ARENA FORMA-REQUEST need=%d released_pages=%d secure_pages=%d cap=%d over_cap_nodes=%d "
+                    "ms=%.1f (a worker's claim was refused; TP0 spilled, the workers follow at this broadcast)",
+                    need, got, int(getattr(self, "_w3_spill_cap_used", 0)), cap,
+                    int(getattr(self, "_w3_spill_cap_skipped", 0)), ms)
+        return got
 
     def _weg2_write_or_abort(self, node, device_value, aux_xfers, pre, ring):
         """The controller write of `write_backup`. #1424f (rc12p P-PP0
@@ -10580,7 +10742,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     # store read may recycle those rows. Set on the ack and
                     # never on the issue -- an issued write that never landed
                     # would license a free that loses the KV.
-                    node.l3_present = True
+                    if UnifiedRadixCache._weg2_store_ack_complete(self, operation):
+                        node.l3_present = True
                     self.dec_host_lock_ref(node, lock_params)
                     if _parts is not None:
                         _tn1 = time.perf_counter()

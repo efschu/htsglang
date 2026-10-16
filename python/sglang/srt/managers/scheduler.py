@@ -1699,10 +1699,15 @@ def _weg2_store_presence(
     # extra_key) -- the unsalted chain is another tenant's pages.
     _ek = getattr(req, "extra_key", None)
     _ns = {"extra_key": _ek} if _ek is not None else {}
+    # MAMBA-ANCHOR 1015 (weg2/presence_fetch_key.py): the span in the fetch's
+    # key form -- the bigram RadixKey on every Weg-2 tree, not the id list
+    from sglang.srt.weg2 import presence_fetch_key as _pfk
+
+    _span = _pfk.span_key(getattr(sched, "tree_cache", None), req, tokens)
     if keys:
-        pages = probe(tokens, last_hash, prefix_keys, page_keys=keys, **_ns)
+        pages = probe(_span, last_hash, prefix_keys, page_keys=keys, **_ns)
     else:
-        pages = probe(tokens, last_hash, prefix_keys, **_ns)
+        pages = probe(_span, last_hash, prefix_keys, **_ns)
     present = bool(pages)
     req._pp_store_presence_cache = (key, present)
     tree = getattr(sched, "tree_cache", None)
@@ -1721,10 +1726,11 @@ def _weg2_store_presence(
     if n <= 64 or n % 256 == 0 or (src == "handoff" and not present):
         logger.info(
             "H108 PRESENCE-PROBE rid=%s keys=%s covered=%d span_tokens=%d matched=%d "
-            "pages=%d present=%s (n=%d): the #950 verdict this rank carries into the "
+            "pages=%d present=%s form=%s (n=%d): the #950 verdict this rank carries into the "
             "#580 vote, asked with the keys the fetch reads with",
             str(getattr(req, "rid", "?")), src, len(keys) if keys else 0,
-            len(tokens), int(matched_len), int(pages or 0), present, n,
+            len(tokens), int(matched_len), int(pages or 0), present,
+            "bigram" if getattr(_span, "is_bigram", False) else "ids", n,
         )
     return present
 
@@ -14133,7 +14139,11 @@ class Scheduler(
                     # Q-460 SALT-ISOLATION: the request's namespace
                     _ek = getattr(req, "extra_key", None)
                     _ns = {"extra_key": _ek} if _ek is not None else {}
-                    pages = int(probe(span, last_hash, prefix_keys, **_ns) or 0)
+                    # MAMBA-ANCHOR 1015: the fetch's key form (bigram RadixKey)
+                    from sglang.srt.weg2 import presence_fetch_key as _pfk
+
+                    pages = int(probe(_pfk.span_key(self.tree_cache, req, span),
+                                      last_hash, prefix_keys, **_ns) or 0)
                     req._weg2_store_match_cache = (key, pages)
                 # The probe counts PAGES; the arm votes TOKENS, because the
                 # extent it prices is a token count. Clamped to the span so a
@@ -18062,6 +18072,7 @@ class Scheduler(
         # a flip nothing on D can bring. `_hol.head` is the pass's first NO_TOKEN
         # (the same rid on every rank), so the group MIN inside is entered alike.
         _wall_rows = None
+        _nofund_seen = False
         if _hol.head is not None:
             _wall_head = _weg2_d_wall_head.pick_unservable_head(
                 head_rid=_hol.head,
@@ -18092,6 +18103,25 @@ class Scheduler(
                 if _wedge_head is not None:
                     _x_refused.append(_wedge_head)
                     _wall_rows = {id(_wedge_head): int(_fa_fn.last_verdict[2])}
+                else:
+                    # PW-F (K10, weg2/d_wall_head.py): the no-fund wedge -- a refused
+                    # head, nothing running, nothing admitted, pass after pass
+                    _nofund_seen = True
+                    _nf_head = _weg2_d_wall_head.pick_nofund_head(
+                        sched=self,
+                        head_rid=_hol.head,
+                        waiting=self.waiting_queue,
+                        running_empty=bool(
+                            (_rb is None or _rb.is_empty())
+                            and getattr(self, "chunked_req", None) is None
+                        ),
+                        admitted_n=len(adder.can_run_list),
+                    )
+                    if _nf_head is not None:
+                        _x_refused.append(_nf_head)
+                        _wall_rows = {id(_nf_head): _weg2_d_wall_head.device_need_rows(_nf_head)}
+        if not _nofund_seen:
+            _weg2_d_wall_head.reset_nofund(self)
         if _x_refused:
             self._weg2_answer_x_refusals(_x_refused, _head_inputs, wall_rows=_wall_rows)
         if _v_refused:

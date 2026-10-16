@@ -2002,6 +2002,7 @@ def follower_hold_unreached(scheduler, req, site: str) -> bool:
             else "no PF ack channel on this boot: no uniform answer can arrive -- W27-HELD-STOP "
                  "stops the group once no re-read is in flight",
         )
+    _fb.floor_then_w27(scheduler, rid, "HELD", t, live)  # H16Q A4 tripwire (named, no stop)
     _held_stop_if_unresolvable(scheduler, rid, t, live, route, site)
     return True
 
@@ -2099,6 +2100,7 @@ def follower_reach_told(scheduler, req, told: int, own: int, site: str = "admiss
         scheduler.ps.pp_rank, _rt(rid), int(told), int(own), int(live), site, n,
         int(live), int(told),
     )
+    _fb.floor_then_w27(scheduler, rid, "SHORT", int(told), int(live))  # H16Q A4 tripwire (named, no stop)
     try:
         _pop_credit_keep_pin(tree, rid)
     except Exception:  # noqa: BLE001

@@ -291,7 +291,9 @@ def test_collectp_on_a_full_d_the_gate_keeps_its_own_no_seat_path(monkeypatch):
     does not add a second path; nothing flips without a displacement plan."""
     _on(monkeypatch)
     f, now, q = _pendel()
-    f.t_awake = now - 60.0
+    # K10 1015: 30 s into the D phase, below the wait bound -- at the bound the hold now flips
+    # (K10-SEAT-RELIEF (c), test_weg2_k10_seat_relief_1015.py); this test pins the hold below it
+    f.t_awake = now - 30.0
     f.__dict__["_pbound_seat_held"]["t"] = f.t_awake - 0.5
     f.queue.append(_pending("fresh", 87000, now - 16.0))
     f._arrival_seat_age_verdict = lambda *a, **k: None

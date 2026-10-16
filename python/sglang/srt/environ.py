@@ -1168,6 +1168,15 @@ class Envs:
     # L3-DROP: how long a host-only child held by its OWN store write may have its acks drained on this
     # rank before the drop is refused by name (ms; 0 = drain once, no wait).
     SGLANG_WEG2_L3_DROP_ACK_WAIT_MS = EnvInt(2000)
+    # H16P-NACHBESSERUNG E1 (Opus review of ARENAFULL-1015, B3): L3-DROP only where the arena would refuse the
+    # node's backup claim anyway (backup_room_tokens < tokens, no claim attempt). With room the node is demoted
+    # to L2 as before (L2 hits stay, the peel agrees with the payable walk). Off = L3-DROP whenever l3_present.
+    SGLANG_WEG2_L3_DROP_ONLY_UNDER_PRESSURE = EnvBool(True)
+    # H16P-NACHBESSERUNG A2 (review B2): l3_present is set only for a COMPLETE store write. _drain_backup sets it
+    # only when operation.completed_tokens covers every page (a partial / stale-refused / skipped write does
+    # not), and a W3 / host-only spill that sees unpaired pages (KV page without its QSA index, not written)
+    # treats them like lost (no release, no l3_present). Off = every ack sets it, unpaired is ignored.
+    SGLANG_WEG2_L3_PRESENT_STRICT = EnvBool(True)
     # ARENAFULL-1015 W3-KEEP-PAYABLE: on the local-PP floor the W3 spill never releases the host copy of a
     # device node whose drop it would make impossible right now (a host-only descendant that UD-H could not
     # clear). Off = every written device node is a candidate, as before.
@@ -2083,6 +2092,31 @@ class Envs:
     # wait bound parks the youngest running decode, which frees one. Marker
     # 'WEG2 DECODE-COLLECT seat-gate'. 0 = route P flips at once, as before.
     SGLANG_WEG2_DECODE_COLLECT_SEAT_GATE = EnvBool(True)
+    # K10 SEAT-RELIEF (NF h16p 15.10. 12:21Z, 6 min stand with D running 0, queue 7): the seat gate held
+    # every D->P flip (taken 7..11 of 6) while D could serve nothing -- and only a flip clears D's tree
+    # (ARENA-REF RESET-RELEASE). On: (a) a queued RESUME-VIA-P leg holds its D seat already (D kept the
+    # stream) and passes the gate, P dispatches only such legs; (b) the gate held for
+    # SGLANG_WEG2_K10_STALL_S without one D token: the wait-bound park + flip, P dispatching only
+    # seat-holding legs (none = an empty round trip). At most once per D epoch. The seat count is
+    # never re-derived. Off = the gate as before, byte for byte.
+    SGLANG_WEG2_K10_SEAT_RELIEF = EnvBool(True)
+    SGLANG_WEG2_K10_STALL_S = EnvFloat(60.0)
+    # K10 (c): under AGE PLAN a route-P set the seat gate holds this long after its DECODE-COLLECT release
+    # flips (park + flip, P takes the oldest one), once per D epoch -- D decoding on or not. Measured on
+    # h16p (boots 124245 / 133855): release -> flip 21.7 / 26.4 / 27.7 / 45.9 / 52.9 / 73.5 s, flips
+    # themselves 2.0-3.3 s. 15 s = the collect window: a D phase keeps >= window + hold = 30 s. 0 = only
+    # the wait bound (d_wait_bound_s) releases the hold.
+    SGLANG_WEG2_K10_HOLD_MAX_S = EnvFloat(15.0)
+    # K10 (c) on its OWN switch, default OFF -- USER WORD (h16q review A1, 15.10.): (c) parks the decodes D is still
+    # running and flips (P takes the oldest); it is a plaster against "kein Massenparken" (14.10.), not a fix. What
+    # the user switched off stays off. 1 = (c) as on 1c337d79a3 (hold bound 15 s / wait bound); 0 (default) = (c)
+    # never fires, (a) and (b) unchanged. (c) is deleted when the seat-gate cause fix lands
+    # (desk/nf-h16q-seatgate-1015). Marker: 'WEG2 K10-SEAT-RELIEF why=p_wait'.
+    SGLANG_WEG2_K10_RELIEF_P_WAIT = EnvBool(False)
+    # W3-FORMA (h16q review A3): pages one FORMA-REQUEST may hand to the SYNCHRONOUS L3 write on D's TP0 scheduler
+    # thread before the broadcast the workers wait at (128 x 768 KiB ~ 96 MB). A node larger than what is left is
+    # passed over and counted (over_cap_nodes=). 0 = no bound (as on 1c337d79a3).
+    SGLANG_WEG2_W3_FORMA_SPILL_MAX_PAGES = EnvInt(128)
     # X-EXACT: tokenizer path override (tests, or a front without a group
     # reachable); empty = the group's own server_args.tokenizer_path.
     SGLANG_WEG2_FRONT_TOKENIZER_PATH = EnvStr("")

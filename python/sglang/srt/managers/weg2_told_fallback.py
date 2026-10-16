@@ -1074,6 +1074,7 @@ def apply_floor(scheduler, rid: str, floor: int) -> None:
     if sat is None:
         sat = scheduler._weg2_store_told_satisfied = {}
     sat[rid] = int(floor)
+    note_floor_applied(scheduler, rid, int(floor))
     n = _bump(scheduler, "_pf_floor_applied_n")
     if n <= 32 or n % _LOG_EVERY == 0:
         logger.info(
@@ -1081,6 +1082,54 @@ def apply_floor(scheduler, rid: str, floor: int) -> None:
             "nothing released, admits at that depth like every rank",
             getattr(scheduler.ps, "pp_rank", "?"), rid, int(floor), n,
         )
+
+
+#: H16Q review A4 (metal tripwire, B5 M1): a B5 anchor shallower than the #1417 span pin is not pinned -- evicted
+#: between the ack and the admission, the follower's tree falls short of the floor (W27-UNIFORM SHORT, then HELD).
+#: Not a silent fault (W27 names it, its guard stops the group), but a new way into that class: a W27 SHORT/HELD
+#: for a rid within this many seconds after its TOLD-FLOOR is named once per (rid, kind). No stop, no decision.
+FLOOR_W27_WINDOW_S = 30.0
+
+
+def note_floor_applied(scheduler, rid: str, floor: int, now: Optional[float] = None) -> None:
+    """A4: remember the floor this rank applied for ``rid`` (bookkeeping only; never raises)."""
+    try:
+        m = getattr(scheduler, "_weg2_floor_w27_watch", None)
+        if not isinstance(m, dict):
+            m = scheduler._weg2_floor_w27_watch = {}
+        t = time.time() if now is None else float(now)
+        if len(m) > 256:
+            for k in [k for k, v in m.items() if t - v[1] > FLOOR_W27_WINDOW_S]:
+                m.pop(k, None)
+        m[str(rid)] = (int(floor), t, set())
+    except Exception:  # noqa: BLE001 - an instrument
+        pass
+
+
+def floor_then_w27(scheduler, rid: str, kind: str, told: int, live: int, now: Optional[float] = None) -> bool:
+    """A4: called at the W27-UNIFORM SHORT / HELD lines; names a W27 that follows a TOLD-FLOOR of the same rid
+    within ``FLOOR_W27_WINDOW_S``. True = named. Never raises, never decides."""
+    try:
+        m = getattr(scheduler, "_weg2_floor_w27_watch", None)
+        ent = m.get(str(rid)) if isinstance(m, dict) else None
+        if ent is None:
+            return False
+        floor, t_floor, named = ent
+        t = time.time() if now is None else float(now)
+        if t - t_floor > FLOOR_W27_WINDOW_S or kind in named:
+            return False
+        named.add(kind)
+        n = _bump(scheduler, "_pf_floor_w27_n")
+        logger.warning(
+            "PF TOLD-FLOOR-THEN-W27 rank pp=%s rid=%s floor=%d w27=%s told=%d live=%d after_s=%.1f (n=%d): this "
+            "rank's tree fell short of the floor PP0 set from the acks -- a B5 anchor above the span pin left the "
+            "tree between ack and admit (review M1); named, no stop -- metal count must be 0",
+            getattr(getattr(scheduler, "ps", None), "pp_rank", "?"), str(rid), int(floor), kind, int(told),
+            int(live), t - t_floor, n,
+        )
+        return True
+    except Exception:  # noqa: BLE001 - an instrument never breaks the admission
+        return False
 
 
 def release_own_read(scheduler, rid: str) -> None:

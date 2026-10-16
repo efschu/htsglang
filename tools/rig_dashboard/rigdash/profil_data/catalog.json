@@ -29686,7 +29686,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2667
+      "line": 2701
      }
     }
    },
@@ -29741,7 +29741,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2657
+    "line": 2691
    },
    "status": "geerntet",
    "text": "",
@@ -29764,7 +29764,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2703
+      "line": 2737
      }
     }
    },
@@ -38483,7 +38483,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 4776
+    "line": 4810
    },
    "status": "unerklaert",
    "text": "",
@@ -38801,7 +38801,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 4775
+    "line": 4809
    },
    "status": "geerntet",
    "text": "",
@@ -39354,7 +39354,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2318
+    "line": 2352
    },
    "status": "geerntet",
    "text": "",
@@ -39377,7 +39377,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2678
+      "line": 2712
      }
     }
    },
@@ -39546,7 +39546,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2682
+      "line": 2716
      }
     }
    },
@@ -39746,7 +39746,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2095
+    "line": 2129
    },
    "status": "geerntet",
    "text": "",
@@ -47725,7 +47725,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2327
+    "line": 2361
    },
    "status": "geerntet",
    "text": "",
@@ -47753,7 +47753,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2332
+    "line": 2366
    },
    "status": "geerntet",
    "text": "",
@@ -48781,7 +48781,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 3528
+    "line": 3562
    },
    "status": "kuratiert",
    "text": "H88: Umgebungsform von --moe-act-int8 on: die int4-Experten (compressed-tensors WNA16, MoE) rechnen mit int8-Aktivierungen (W4A8) statt mit 16-Bit-Aktivierungen (W4A16). Standard aus; einer der beiden Schalter genügt. Dieser Baum hat das W4A8-MoE-Schema (CompressedTensorsWNA16A8MoE, H88-B): mit dem Schalter an wählt die Schema-Auswahl es für die int4-Expertenschichten auf CUDA (dynamische int8-Aktivierung je Token, Marlin-W4A8-Kernel); zusammen mit --moe-runner-backend triton bricht der Start mit RuntimeError ab. Ein Baum ohne das Schema bräche mit dem Text ab: MOE-ACT-INT8 requested but no W4A8 MoE scheme in this tree.",
@@ -53904,7 +53904,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1821
+    "line": 1830
    },
    "status": "geerntet",
    "text": "",
@@ -64516,7 +64516,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1167
+    "line": 1176
    },
    "status": "geerntet",
    "text": "",
@@ -65163,7 +65163,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2552
+    "line": 2586
    },
    "status": "geerntet",
    "text": "",
@@ -65571,7 +65571,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1760
+    "line": 1769
    },
    "status": "erklaert",
    "text": "Protection against a mutual blockade when waking D to P: two groups wait in a circle for memory room. On: the waiting part counts its own waiting from the start of the wait; the resolution (swapping the rest out to host RAM) begins after about 0.1 s instead of about 0.6 s. Off: only after the wait flag has gone up after 0.5 s. Default off (preparation/experiment, \"Default off until metal A/B\"). According to the code necessary before SGLANG_OPT_WEG2_DRAFT_PARK_SKIP_UNCHANGED (is off) goes on again. Related: SGLANG_WEG2_BAR1_SPILL_GRACE_S (0.1 s). Acts only for the sending side. Not verified individually on the metal. No user value recognizable.",
@@ -65894,7 +65894,7 @@
      "source": {
       "file": "weg2/front.py",
       "kind": "os.environ",
-      "line": 4287
+      "line": 4339
      }
     }
    },
@@ -66196,7 +66196,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2074
+      "line": 2083
      }
     }
    },
@@ -70931,6 +70931,37 @@
    "text": "",
    "type": "EnvInt"
   },
+  "SGLANG_WEG2_D_NOFUND_REROUTE_N": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"64\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "",
+   "id": "SGLANG_WEG2_D_NOFUND_REROUTE_N",
+   "kind": "env",
+   "lesestellen": [
+    "weg2/d_wall_head.py:221"
+   ],
+   "level": "experte",
+   "name": "SGLANG_WEG2_D_NOFUND_REROUTE_N",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "baum": "nf",
+    "file": "weg2/d_wall_head.py",
+    "kind": "os.environ",
+    "line": 221
+   },
+   "status": "unerklaert",
+   "text": "",
+   "type": "os.environ"
+  },
   "SGLANG_WEG2_D_NORECOMPUTE": {
    "baeume": [
     "27b",
@@ -71288,7 +71319,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 3811
+      "line": 3845
      }
     }
    },
@@ -71600,7 +71631,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2178
+      "line": 2212
      }
     }
    },
@@ -71678,7 +71709,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4483
+      "line": 4517
      }
     }
    },
@@ -71785,7 +71816,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2696
+      "line": 2730
      }
     }
    },
@@ -71890,7 +71921,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1958
+    "line": 1967
    },
    "status": "erklaert",
    "text": "Collect rule for short requests when D is prefilling instead of decoding: on, a short request (that would go to D by itself) that was granted to D and has not yet delivered a first token counts as work on D. The next short requests that arrive meanwhile are collected for the window (SGLANG_WEG2_DECODE_COLLECT_WINDOW_S) and priced as a SUM together with those open tokens against the X limit; what does not fit goes to the P batch. Off: the old blind path, every short request is checked alone against X and an idle D takes all of them (six shorts of 6239 tokens within one second: 37k tokens prefilled on D, about 53 s). Default on in the NF tree (since 10.10.; metal int23xsum2 09.10.: 6 x 5200 on an idle D, one seat on D, five to the P batch). With the collect window at 0 (SGLANG_WEG2_DECODE_COLLECT_WINDOW_S) only the collecting is off; the booking still prices the queue-take of waiting shorts and the short drain.",
@@ -72148,7 +72179,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2198
+    "line": 2232
    },
    "status": "geerntet",
    "text": "",
@@ -72406,7 +72437,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2102
+    "line": 2136
    },
    "status": "geerntet",
    "text": "",
@@ -72429,7 +72460,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2687
+      "line": 2721
      }
     }
    },
@@ -72651,7 +72682,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4463
+      "line": 4497
      }
     }
    },
@@ -73396,7 +73427,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2113
+    "line": 2147
    },
    "status": "geerntet",
    "text": "",
@@ -73424,7 +73455,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2108
+    "line": 2142
    },
    "status": "geerntet",
    "text": "",
@@ -73979,7 +74010,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 1339
+      "line": 1348
      }
     }
    },
@@ -74033,7 +74064,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1342
+    "line": 1351
    },
    "status": "geerntet",
    "text": "",
@@ -75996,6 +76027,37 @@
    "text": "Maximum age in seconds (default 2) up to which an idle vote of PP0 still counts.",
    "type": "EnvFloat"
   },
+  "SGLANG_WEG2_INTAKE_BACKUP_INFLIGHT": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "K9b: an open store backup of the tree is in flight for the intake verdict (default ON, ``0`` = off).",
+   "id": "SGLANG_WEG2_INTAKE_BACKUP_INFLIGHT",
+   "kind": "env",
+   "lesestellen": [
+    "weg2/p_intake.py:369"
+   ],
+   "level": "experte",
+   "name": "SGLANG_WEG2_INTAKE_BACKUP_INFLIGHT",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "baum": "nf",
+    "file": "weg2/p_intake.py",
+    "kind": "os.environ",
+    "line": 369
+   },
+   "status": "geerntet",
+   "text": "",
+   "type": "os.environ"
+  },
   "SGLANG_WEG2_JOIN_PREWARM": {
    "baeume": [
     "27b",
@@ -76028,6 +76090,118 @@
    "text": "",
    "type": "os.environ"
   },
+  "SGLANG_WEG2_K10_HOLD_MAX_S": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "15.0",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "K10 (c): under AGE PLAN a route-P set the seat gate holds this long after its DECODE-COLLECT release flips (park + flip, P takes the oldest one), once per D epoch -- D decoding on or not. Measured on h16p (boots 124245 / 133855): release -> flip 21.7 / 26.4 / 27.7 / 45.9 / 52.9 / 73.5 s, flips themselves 2.0-3.3 s. 15 s = the collect window: a D phase keeps >= window + hold = 30 s. 0 = only the wait bound (d_wait_bound_s) releases the hold.",
+   "id": "SGLANG_WEG2_K10_HOLD_MAX_S",
+   "kind": "env",
+   "level": "experte",
+   "name": "SGLANG_WEG2_K10_HOLD_MAX_S",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "baum": "nf",
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 2098
+   },
+   "status": "geerntet",
+   "text": "",
+   "type": "EnvFloat"
+  },
+  "SGLANG_WEG2_K10_RELIEF_P_WAIT": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "False",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "K10 (c) on its OWN switch, default OFF -- USER WORD (h16q review A1, 15.10.): (c) parks the decodes D is still running and flips (P takes the oldest); it is a plaster against \"kein Massenparken\" (14.10.), not a fix. What the user switched off stays off. 1 = (c) as on 1c337d79a3 (hold bound 15 s / wait bound); 0 (default) = (c) never fires, (a) and (b) unchanged. (c) is deleted when the seat-gate cause fix lands (desk/nf-h16q-seatgate-1015). Marker: 'WEG2 K10-SEAT-RELIEF why=p_wait'.",
+   "id": "SGLANG_WEG2_K10_RELIEF_P_WAIT",
+   "kind": "env",
+   "level": "experte",
+   "name": "SGLANG_WEG2_K10_RELIEF_P_WAIT",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "baum": "nf",
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 2104
+   },
+   "status": "geerntet",
+   "text": "",
+   "type": "EnvBool"
+  },
+  "SGLANG_WEG2_K10_SEAT_RELIEF": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "True",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "K10 SEAT-RELIEF (NF h16p 15.10. 12:21Z, 6 min stand with D running 0, queue 7): the seat gate held every D->P flip (taken 7..11 of 6) while D could serve nothing -- and only a flip clears D's tree (ARENA-REF RESET-RELEASE). On: (a) a queued RESUME-VIA-P leg holds its D seat already (D kept the stream) and passes the gate, P dispatches only such legs; (b) the gate held for SGLANG_WEG2_K10_STALL_S without one D token: the wait-bound park + flip, P dispatching only seat-holding legs (none = an empty round trip). At most once per D epoch. The seat count is never re-derived. Off = the gate as before, byte for byte.",
+   "id": "SGLANG_WEG2_K10_SEAT_RELIEF",
+   "kind": "env",
+   "level": "experte",
+   "name": "SGLANG_WEG2_K10_SEAT_RELIEF",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "baum": "nf",
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 2091
+   },
+   "status": "geerntet",
+   "text": "",
+   "type": "EnvBool"
+  },
+  "SGLANG_WEG2_K10_STALL_S": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "60.0",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "",
+   "id": "SGLANG_WEG2_K10_STALL_S",
+   "kind": "env",
+   "level": "experte",
+   "name": "SGLANG_WEG2_K10_STALL_S",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "baum": "nf",
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 2092
+   },
+   "status": "unerklaert",
+   "text": "",
+   "type": "EnvFloat"
+  },
   "SGLANG_WEG2_K7_DWELL_IDLE_SKIP": {
    "abweichung": {
     "27b": {
@@ -76045,7 +76219,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4583
+      "line": 4617
      }
     }
    },
@@ -77382,6 +77556,34 @@
    "text": "",
    "type": "EnvInt"
   },
+  "SGLANG_WEG2_L3_DROP_ONLY_UNDER_PRESSURE": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "True",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "H16P-NACHBESSERUNG E1 (Opus review of ARENAFULL-1015, B3): L3-DROP only where the arena would refuse the node's backup claim anyway (backup_room_tokens < tokens, no claim attempt). With room the node is demoted to L2 as before (L2 hits stay, the peel agrees with the payable walk). Off = L3-DROP whenever l3_present.",
+   "id": "SGLANG_WEG2_L3_DROP_ONLY_UNDER_PRESSURE",
+   "kind": "env",
+   "level": "experte",
+   "name": "SGLANG_WEG2_L3_DROP_ONLY_UNDER_PRESSURE",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "baum": "nf",
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 1163
+   },
+   "status": "geerntet",
+   "text": "",
+   "type": "EnvBool"
+  },
   "SGLANG_WEG2_L3_EPOCH": {
    "baeume": [
     "27b",
@@ -77482,6 +77684,34 @@
    "status": "unerklaert",
    "text": "",
    "type": "os.environ"
+  },
+  "SGLANG_WEG2_L3_PRESENT_STRICT": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "True",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "H16P-NACHBESSERUNG A2 (review B2): l3_present is set only for a COMPLETE store write. _drain_backup sets it only when operation.completed_tokens covers every page (a partial / stale-refused / skipped write does not), and a W3 / host-only spill that sees unpaired pages (KV page without its QSA index, not written) treats them like lost (no release, no l3_present). Off = every ack sets it, unpaired is ignored.",
+   "id": "SGLANG_WEG2_L3_PRESENT_STRICT",
+   "kind": "env",
+   "level": "experte",
+   "name": "SGLANG_WEG2_L3_PRESENT_STRICT",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "baum": "nf",
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 1168
+   },
+   "status": "geerntet",
+   "text": "",
+   "type": "EnvBool"
   },
   "SGLANG_WEG2_L3_WRITE_BEHIND_ANCHOR_MIN_MIB": {
    "baeume": [
@@ -77650,7 +77880,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1218
+    "line": 1227
    },
    "status": "kuratiert",
    "text": "Priority lanes: a request carries an integer 'priority' (no number = lane 0, a higher number is a higher lane, the same number is the same lane). With 1 the front reads the field, keeps the active lane (lane_floor), the count of its changes (lane_epoch) and the requests per lane, and shows them in state.json (front.lane_floor, front.lane_epoch, front.lanes); the Anthropic adapter forwards 'priority'. Default 1 on the NF line (since int24f5, user word 13.10.2026): with every request in lane 0 (no 'priority', or 0) nothing is displaced -- no lane action, no RPC to P or D. 0 = off: the front does not read 'priority', and no lane field appears in state.json, the request book or a log line.",
@@ -77678,7 +77908,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2563
+    "line": 2597
    },
    "status": "geerntet",
    "text": "",
@@ -77795,7 +78025,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1230
+    "line": 1239
    },
    "status": "kuratiert",
    "text": "Seconds between the keepalive comment lines (': lane-hold floor=N') the front writes into a held SSE stream. Default 15. Used only with SGLANG_WEG2_LANES=1; the sender is part L4 of the lane plan, part L1 only declares the value.",
@@ -77876,7 +78106,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1234
+    "line": 1243
    },
    "status": "kuratiert",
    "text": "The P-side prefill chunk size in tokens while a higher lane waits; 0 (default) = the normal chunk. Used only with SGLANG_WEG2_LANES=1; part L3 of the lane plan reads it, part L1 only declares the value.",
@@ -78597,7 +78827,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1199
+    "line": 1208
    },
    "status": "geerntet",
    "text": "",
@@ -78899,7 +79129,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4392
+      "line": 4426
      }
     }
    },
@@ -78975,7 +79205,7 @@
    "id": "SGLANG_WEG2_MODE_PARITY_CHECK",
    "kind": "env",
    "lesestellen": [
-    "weg2/front.py:6386"
+    "weg2/front.py:6438"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_MODE_PARITY_CHECK",
@@ -78985,7 +79215,7 @@
     "baum": "nf",
     "file": "weg2/front.py",
     "kind": "os.environ",
-    "line": 6386
+    "line": 6438
    },
    "status": "unerklaert",
    "text": "",
@@ -79491,7 +79721,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2543
+    "line": 2577
    },
    "status": "erklaert",
    "text": "If a paused (parked) request is to continue later and the room for Mamba anchors in host RAM is full, its re-entry point gets priority: other intermediate states without a park reference are swapped to disk first, so that the entry point of the parked request is not lost. Off: the old way; parked requests can lose their entry point and recompute. Without a park nothing changes. Acts only on nodes that are marked as parked. Default on. Unverified: dependency on another switch; whether the user should change it (only the decision \"stays on\" of 05.10. ~17:47Z is verified); benefit on the metal (according to the report \"active, effect not shown\").",
@@ -79640,7 +79870,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2020
+    "line": 2029
    },
    "status": "geerntet",
    "text": "",
@@ -79697,7 +79927,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2043
+    "line": 2052
    },
    "status": "geerntet",
    "text": "",
@@ -80429,7 +80659,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1179
+    "line": 1188
    },
    "status": "geerntet",
    "text": "",
@@ -80773,6 +81003,37 @@
    "text": "",
    "type": "os.environ"
   },
+  "SGLANG_WEG2_PRESENCE_FETCH_KEY": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"1\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "",
+   "id": "SGLANG_WEG2_PRESENCE_FETCH_KEY",
+   "kind": "env",
+   "lesestellen": [
+    "weg2/presence_fetch_key.py:62"
+   ],
+   "level": "experte",
+   "name": "SGLANG_WEG2_PRESENCE_FETCH_KEY",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "baum": "nf",
+    "file": "weg2/presence_fetch_key.py",
+    "kind": "os.environ",
+    "line": 62
+   },
+   "status": "unerklaert",
+   "text": "",
+   "type": "os.environ"
+  },
   "SGLANG_WEG2_PRICE_BARRIER": {
    "baeume": [
     "27b",
@@ -80848,7 +81109,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1226
+    "line": 1235
    },
    "status": "kuratiert",
    "text": "Priority acts as AGE (user decision 14.10.2026): every age order and comparison -- D seats, SEAT-AGE displacement, the KV rule 'oldest first', decode admission, the P queue and batch order, wake reads, D refill -- uses the pair (priority descending, arrival ascending); a request of priority p+1 is older than every request of priority p, inside a priority the real arrival decides. Every wait clock keeps the real arrival. With 1 (default) the lane floor (LANE-PREEMPT, LANE-RAISE/RESUME, LANE-WAITER-HOLD, the P-leg hold, D's lane park) is never entered, and a request with priority > 0 that needs a prefill on P ends a DECODE-COLLECT window at once. Acts only with SGLANG_WEG2_LANES=1. 0 = the lane floor of PLAN-PRIO-LANES-1008.",
@@ -81151,6 +81412,37 @@
    "status": "geerntet",
    "text": "",
    "type": "EnvInt"
+  },
+  "SGLANG_WEG2_P_DRAIN_EARLY_SETTLE": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "K9 P-DRAIN-EARLY-SETTLE (NF h16r 15.10. 11:52:21-11:54:11Z, death DEADMAN_FLIP_STALL; precursor 11:26:01-11:26:23Z): the D->P flip posts leg 1 EARLY for the queued requests (\"P holds it dormant, its store prefetch runs beside the legs\") -- and P prefills them on its own. When the drain ends before it reaches them (a P-INTAKE-STALL of another request, the phase / seat-gate cap), those legs are still running on P: the P->D flip begins with them OUTSTANDING (``WEG2-FLIP outstanding ... rids=['weg2-86-231', 'weg2-86-233', 'weg2-86-237']``) and its drain stage waits for P's prefills (47.6 s / 51.9 s walls) under the flip-stall bound (4x the last flip, 24.5 s) -> WEG2-FLIP STALL -> the deadman kills the boot. The legs run whether the phase ends or not; so the drain itself settles every queued request whose early leg is posted (``one(p)`` awaits it, ``on_done`` hands it to D as any other leg) BEFORE the phase ends. The flip then begins with nothing of this phase left on P. Default ON; ``0`` = the old exit.",
+   "id": "SGLANG_WEG2_P_DRAIN_EARLY_SETTLE",
+   "kind": "env",
+   "lesestellen": [
+    "weg2/front.py:3531"
+   ],
+   "level": "experte",
+   "name": "SGLANG_WEG2_P_DRAIN_EARLY_SETTLE",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "baum": "nf",
+    "file": "weg2/front.py",
+    "kind": "os.environ",
+    "line": 3531
+   },
+   "status": "geerntet",
+   "text": "",
+   "type": "os.environ"
   },
   "SGLANG_WEG2_P_FOLLOWER_ROUND": {
    "baeume": [
@@ -83050,7 +83342,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 1798
+      "line": 1807
      }
     }
    },
@@ -83426,7 +83718,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1172
+    "line": 1181
    },
    "status": "geerntet",
    "text": "",
@@ -84565,7 +84857,7 @@
    "id": "SGLANG_WEG2_TOLD_ACK_DRAIN",
    "kind": "env",
    "lesestellen": [
-    "managers/weg2_told_fallback.py:204"
+    "managers/weg2_told_fallback.py:205"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_TOLD_ACK_DRAIN",
@@ -84575,7 +84867,7 @@
     "baum": "nf",
     "file": "managers/weg2_told_fallback.py",
     "kind": "os.environ",
-    "line": 204
+    "line": 205
    },
    "status": "unerklaert",
    "text": "",
@@ -84596,7 +84888,7 @@
    "id": "SGLANG_WEG2_TOLD_ANCHOR_ACKS",
    "kind": "env",
    "lesestellen": [
-    "managers/weg2_told_fallback.py:215"
+    "managers/weg2_told_fallback.py:216"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_TOLD_ANCHOR_ACKS",
@@ -84606,7 +84898,7 @@
     "baum": "nf",
     "file": "managers/weg2_told_fallback.py",
     "kind": "os.environ",
-    "line": 215
+    "line": 216
    },
    "status": "geerntet",
    "text": "",
@@ -84723,7 +85015,7 @@
    "id": "SGLANG_WEG2_TOLD_FALLBACK_MIN_PASSES",
    "kind": "env",
    "lesestellen": [
-    "managers/weg2_told_fallback.py:224"
+    "managers/weg2_told_fallback.py:225"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_TOLD_FALLBACK_MIN_PASSES",
@@ -84733,7 +85025,7 @@
     "baum": "nf",
     "file": "managers/weg2_told_fallback.py",
     "kind": "os.environ",
-    "line": 224
+    "line": 225
    },
    "status": "unerklaert",
    "text": "",
@@ -84847,7 +85139,7 @@
    "id": "SGLANG_WEG2_TOLD_GROUP_FLOOR",
    "kind": "env",
    "lesestellen": [
-    "managers/weg2_told_fallback.py:209"
+    "managers/weg2_told_fallback.py:210"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_TOLD_GROUP_FLOOR",
@@ -84857,7 +85149,7 @@
     "baum": "nf",
     "file": "managers/weg2_told_fallback.py",
     "kind": "os.environ",
-    "line": 209
+    "line": 210
    },
    "status": "unerklaert",
    "text": "",
@@ -85476,7 +85768,7 @@
      "source": {
       "file": "weg2/front.py",
       "kind": "os.environ",
-      "line": 4392
+      "line": 4444
      }
     }
    },
@@ -85795,6 +86087,34 @@
    "text": "",
    "type": "os.environ"
   },
+  "SGLANG_WEG2_W3_FORMA_SPILL_MAX_PAGES": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "128",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "W3-FORMA (h16q review A3): pages one FORMA-REQUEST may hand to the SYNCHRONOUS L3 write on D's TP0 scheduler thread before the broadcast the workers wait at (128 x 768 KiB ~ 96 MB). A node larger than what is left is passed over and counted (over_cap_nodes=). 0 = no bound (as on 1c337d79a3).",
+   "id": "SGLANG_WEG2_W3_FORMA_SPILL_MAX_PAGES",
+   "kind": "env",
+   "level": "experte",
+   "name": "SGLANG_WEG2_W3_FORMA_SPILL_MAX_PAGES",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "baum": "nf",
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 2108
+   },
+   "status": "geerntet",
+   "text": "",
+   "type": "EnvInt"
+  },
   "SGLANG_WEG2_W3_SPILL_GROUP_ORDER": {
    "baeume": [
     "nf"
@@ -85845,7 +86165,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1163
+    "line": 1172
    },
    "status": "geerntet",
    "text": "",
@@ -86342,7 +86662,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 1188
+    "line": 1197
    },
    "status": "geerntet",
    "text": "",
@@ -86912,7 +87232,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4570
+      "line": 4604
      }
     }
    },
@@ -87695,25 +88015,25 @@
    "abweichung": 47,
    "beide": 2461,
    "nur_27b": 180,
-   "nur_nf": 105
+   "nur_nf": 116
   },
-  "entries": 2764,
-  "envs": 1885,
+  "entries": 2775,
+  "envs": 1896,
   "erklaert": 305,
   "flags": 864,
-  "geerntet": 1711,
+  "geerntet": 1719,
   "kuratiert": 125,
-  "unerklaert": 623
+  "unerklaert": 626
  },
- "tree_rev": "27b=02123ee2ef+nf=75e3ee8abd+lbv-deadlock-e23abfcb05+prio-alter-fa99a484ae+w3-drain-e7cfda7fbe+follower-round-b76e5fce79+h16m-int-1014+readdepth-60ad6ba20a+h16n-int-1015+h54-park-join-1015+chainkey-a2-83f974259f+h64-toldfallback-de76a8dc18+h16o-int-1015+flipstall-31764c30e0+arenafull-231a47b449+h16p-int-1015+b5-anchoracks-1015",
+ "tree_rev": "27b=02123ee2ef+nf=75e3ee8abd+lbv-deadlock-e23abfcb05+prio-alter-fa99a484ae+w3-drain-e7cfda7fbe+follower-round-b76e5fce79+h16m-int-1014+readdepth-60ad6ba20a+h16n-int-1015+h54-park-join-1015+chainkey-a2-83f974259f+h64-toldfallback-de76a8dc18+h16o-int-1015+arenafull-1015+h16p-nachbesserung-1015+k9-intakestall-81cb306fd0+b5-anchoracks-618c3fa130+k11-grain-f4cf3a0681+k10-1c337d79a3+k10c-switch-h16q+presence-53af2a98e1+h16q-review-auflagen",
  "trees": {
   "27b": {
    "entries": 2641,
    "rev": "02123ee2ef"
   },
   "nf": {
-   "entries": 2566,
-   "rev": "75e3ee8abd+lbv-deadlock-e23abfcb05+prio-alter-fa99a484ae+w3-drain-e7cfda7fbe+follower-round-b76e5fce79+h16m-int-1014+readdepth-60ad6ba20a+h16n-int-1015+h54-park-join-1015+chainkey-a2-83f974259f+h64-toldfallback-de76a8dc18+h16o-int-1015+flipstall-31764c30e0+arenafull-231a47b449+h16p-int-1015+b5-anchoracks-1015"
+   "entries": 2577,
+   "rev": "75e3ee8abd+lbv-deadlock-e23abfcb05+prio-alter-fa99a484ae+w3-drain-e7cfda7fbe+follower-round-b76e5fce79+h16m-int-1014+readdepth-60ad6ba20a+h16n-int-1015+h54-park-join-1015+chainkey-a2-83f974259f+h64-toldfallback-de76a8dc18+h16o-int-1015+arenafull-1015+h16p-nachbesserung-1015+k9-intakestall-81cb306fd0+b5-anchoracks-618c3fa130+k11-grain-f4cf3a0681+k10-1c337d79a3+k10c-switch-h16q+presence-53af2a98e1+h16q-review-auflagen"
   }
  },
  "warnungen": []
