@@ -280,6 +280,68 @@ def test_review_A3_a_younger_fill_that_holds_nothing_is_no_hold_and_wait(tmp_pat
     assert not any("ROOM-ARBITER YIELD" in r.getMessage() for r in caplog.records)
 
 
+def _shared_prefix(tmp_path, n=8):
+    stems = [f"s{i}" for i in range(n)]
+    be, arena = _setup(tmp_path, stems, slots=16)
+    spillable = _pin_pages(arena, 16)                       # nothing free
+    tree = _Tree(arena, held=spillable)
+
+    tree.go = False
+
+    def spill_one(pool, need_pages, claimer=None, released_out=None):
+        if not tree.go:
+            return 0                                        # no room before both reads wait and PP0 announced
+        take = tree.held[:1]
+        del tree.held[:1]
+        if take:
+            arena.ref_slots(take, -1)
+        return len(take)
+
+    tree._w3_arena_spill = spill_one
+    tree._w3_spill_quiet_until = time.monotonic() + 30.0   # no futility: the room comes, only later
+    return stems, be, arena, tree
+
+
+def _owner_then_younger(be, arena, tree, stems, younger_first=False):
+    with _Scheduler(tree):
+        if younger_first:                                   # the younger REQUEST registers first: its deadline is first
+            fy = _Fill(be, arena, "weg2-8-12", stems, "hicache-prefetch-io-1").start()
+            time.sleep(0.05)
+            fo = _Fill(be, arena, "weg2-8-11", stems, "hicache-prefetch-io-2").start()
+        else:
+            fo = _Fill(be, arena, "weg2-8-11", stems, "hicache-prefetch-io-2").start()
+            time.sleep(0.05)
+            fy = _Fill(be, arena, "weg2-8-12", stems, "hicache-prefetch-io-1").start()
+        time.sleep(0.2)                                     # both wait holding nothing; PP0 announced the owner
+        tree.go = True
+        out_o = fo.join()
+        out_y = fy.join()
+    return fo, fy, sum(1 for s in out_o if s is not None), sum(1 for s in out_y if s is not None)
+
+
+def test_re_review_adefer_a_deferred_fill_waits_out_an_owner_that_progresses_past_the_idle_bound(tmp_path):
+    """Probe P8 shape: same prefix, the younger read holds nothing and defers to the owner; room trickles (a page per
+    serve) so the owner progresses longer than the idle bound. The deferred rounds are a lifesign (A-DEFER): the
+    younger read lands what the owner landed instead of ending short at the idle bound."""
+    stems, be, arena, tree = _shared_prefix(tmp_path)
+    with envs.SGLANG_WEG2_READ_ROOM_WAIT_MS.override(1500), envs.SGLANG_WEG2_READ_ROOM_REPOST_MS.override(300):
+        fo, fy, lo, ly = _owner_then_younger(be, arena, tree, stems)
+    assert lo == len(stems), lo
+    assert fo.t1 - fo.t0 > 1.5, "the owner progressed longer than the idle bound (the shape of the probe)"
+    assert ly == lo, (ly, lo)
+
+
+def test_re_review_adefer_a_deferred_fill_ended_by_its_deadline_takes_what_the_owner_completed(tmp_path):
+    """The deadline (join cap) ends the waits while the younger still defers: its LAST claim round takes the stems
+    the owner completed (complete) or still fills (join) -- never zero for a prefix the owner landed."""
+    stems, be, arena, tree = _shared_prefix(tmp_path)
+    with envs.SGLANG_WEG2_READ_ROOM_WAIT_MS.override(1500), envs.SGLANG_WEG2_READ_ROOM_REPOST_MS.override(300), \
+            envs.SGLANG_WEG2_L3FILL_JOIN_CAP_S.override(1.0):
+        fo, fy, lo, ly = _owner_then_younger(be, arena, tree, stems, younger_first=True)
+    assert 0 < lo < len(stems), lo
+    assert ly > 0, "the deferred read ended at its deadline with none of the stems the owner had completed"
+
+
 def test_review_A4_a_terminated_operation_ends_the_wait_and_leaves_the_arbitration(tmp_path):
     stems = [f"r{i}" for i in range(4)]
     be, arena = _setup(tmp_path, stems, slots=8)

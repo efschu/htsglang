@@ -12593,9 +12593,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             pass
         _timing_every = _hicache_round_timing_every()
         _t0 = time.perf_counter() if _timing_every else 0.0
-        # READ-ROOM 1015: a fill short of arena slots asked (the shared request file next to the arena); this
-        # rank hands back L3-backed tree copies for it. One dict-free check per round when nothing was posted.
-        _read_room_tick(self)
         # Reap the previous round's PP-sync sends before issuing new ones.
         self._drain_async_work()
         _h49_t = time.perf_counter()
@@ -12625,6 +12622,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     self._hc_parts = None
                     _parts["cpu"] = time.thread_time() - _parts.pop("_cpu0")
             _HOST_COST.drain_ms += (time.perf_counter() - _h49_t) * 1000.0
+        # READ-ROOM 1015: a fill short of arena slots asked (the shared request file next to the arena); this
+        # rank hands back L3-backed tree copies for it. One dict-free check per round when nothing was posted.
+        # pgap re-review A-GB (h16t): AFTER the release drain -- a reaped read's arena references come back through
+        # host_mem_release in that drain; a give-back record cleared before it left an instant with 0/0/0 verdicts
+        # while the references were still on their way.
+        _read_room_tick(self)
         _t2 = time.perf_counter() if _timing_every else 0.0
         if self.enable_storage_metrics and self.storage_metrics_collector is not None:
             self.storage_metrics_collector.log_storage_metrics(

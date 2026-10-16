@@ -291,7 +291,7 @@ def unbacked_census(tree_cache) -> dict:
 _UNBACKED_N = [0, 0]   # resets seen, resets with un-backed KV
 
 
-def note_unbacked_at_reset(tree_cache, site: str = "flush") -> dict:
+def note_unbacked_at_reset(tree_cache, site: str = "flush", paused: int = -1, open_ms: float = -1.0) -> dict:
     """F5c: one line per reset that drops un-backed KV (and the denominator every 64th clean reset), so the store
     loss of a sleep reset is measured, never silent."""
     c = unbacked_census(tree_cache)
@@ -300,7 +300,9 @@ def note_unbacked_at_reset(tree_cache, site: str = "flush") -> dict:
         _UNBACKED_N[1] += 1
     if c["nodes"] or _UNBACKED_N[0] % 64 == 1:
         (logger.warning if c["nodes"] else logger.info)(
-            "%s site=%s nodes=%d tokens=%d pending=%d ids=%s resets=%d with_unbacked=%d (device KV neither on the "
-            "host nor in the store goes with this reset -- a later request recomputes it)",
-            LINE_UNBACKED, site, c["nodes"], c["tokens"], c["pending"], c["ids"], _UNBACKED_N[0], _UNBACKED_N[1])
+            "%s site=%s nodes=%d tokens=%d pending=%d ids=%s resets=%d with_unbacked=%d paused_sweeps=%d "
+            "quiesce_open_ms=%.0f (device KV neither on the host nor in the store goes with this reset -- a later "
+            "request recomputes it; paused_sweeps = bubble sweeps the open quiesce left to the #1470 loop)",
+            LINE_UNBACKED, site, c["nodes"], c["tokens"], c["pending"], c["ids"], _UNBACKED_N[0], _UNBACKED_N[1],
+            int(paused), float(open_ms))
     return c

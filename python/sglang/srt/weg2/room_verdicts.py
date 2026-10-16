@@ -240,6 +240,14 @@ def reap_givebacks(arena: Any, cache: Any) -> int:
     #257 cut released what lay beyond the anchor) -- the record goes. Returns the records cleared."""
     if not _S.givebacks:
         return 0
+    # pgap re-review A-GB: the reap only QUEUES the release (append_host_mem_release); the references return when the
+    # queue is drained (every round, or every N-th under the gated drain) -- not before
+    q = getattr(getattr(cache, "cache_controller", None), "host_mem_release_queue", None)
+    try:
+        if q is not None and not q.empty():
+            return 0
+    except Exception:  # noqa: BLE001
+        return 0
     ongoing = getattr(cache, "ongoing_prefetch", None)
     done = [rid for rid in list(_S.givebacks) if ongoing is None or rid not in ongoing]
     if not done:

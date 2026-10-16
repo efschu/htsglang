@@ -79,7 +79,7 @@ def test_the_flush_opens_the_quiesce_names_the_unbacked_and_closes_it_at_the_res
 
     src = inspect.getsource(Scheduler.flush_cache)
     assert src.index("_f5_bubble.quiesce_begin(self)") < src.index('_sweep = getattr(self.tree_cache, "publish_unbacked_sweep"')
-    i_note = src.index("note_unbacked_at_reset(self.tree_cache")
+    i_note = src.index("_weg2_flush_nonblock.note_unbacked_at_reset(")
     assert i_note < src.index("self.tree_cache.reset()"), "named BEFORE the reset drops it"
     assert src.index('_f5_bubble.quiesce_end(self, "reset")') < src.index("self.tree_cache.reset()")
 
@@ -120,13 +120,15 @@ def test_unbacked_census_names_device_kv_that_is_neither_on_the_host_nor_in_the_
     assert line and "nodes=%d" % c2["nodes"] in line[-1] and "tokens=%d" % c2["tokens"] in line[-1], line
 
 
-def test_every_rank_opens_the_quiesce_where_it_receives_the_poll_and_the_sleep_leg_ends_it():
-    """A follower only forwards /flush_cache (CTRL-RECV -> CTRL-FWD, P.log 11:29:08 PP1) and never runs flush_cache
-    per poll -- in the window PP1 was the blocking rank: the quiesce must open at the intake on every rank."""
+def test_re_review_a_follower_keeps_its_bubble_publisher_until_a_proof_exists(monkeypatch):
+    """pgap re-review A-F5a / A-F5a-Folger: the follower hook sat on the frozen/slots SchedulerRequestReceiver (the
+    setter raised, ``except: pass`` swallowed it) and a follower pause needs a proof that nothing goes un-backed into
+    the sleep reset that a bubble sweep would have backed -- until then ONLY PP0 pauses (flush_cache runs the #1470
+    sweep on every poll there). A follower never runs flush_cache per poll: its bubble publisher keeps sweeping."""
     from sglang.srt.managers.scheduler_components import request_receiver as rr
 
-    src = inspect.getsource(rr)
-    i = src.index("#1458 CTRL-RECV kind=%s")
-    j = src.index("_f5_bubble.quiesce_begin(self)")
-    k = src.index('_f5_bubble.quiesce_end(self, "sleep")')
-    assert i < j and i < k
+    assert "quiesce_begin" not in inspect.getsource(rr)
+    monkeypatch.setenv(BP.ENV, "1")
+    follower = _sched()                               # nobody opened a quiesce on it: polls are only forwarded
+    _idle_loop(monkeypatch, follower, 2.0)
+    assert follower.tree_cache.sweeps > 0

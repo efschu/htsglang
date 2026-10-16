@@ -314,3 +314,28 @@ def test_review_A2_another_requests_holding_fill_blocks_futility(tmp_path, monke
     assert RV.futile(arena, since, pp_size=1, rid="weg2-8-1") is None
     assert RV.futile(arena, since, pp_size=1, rid="weg2-8-2") is not None, "its own holding does not count"
     assert RV.futile(arena, since, pp_size=1, rid="weg2-8-1", ignore_holders=True) is not None
+
+
+def test_re_review_agb_the_read_room_tick_runs_after_the_release_drain():
+    """Probe P9: the reap only queues the release (append_host_mem_release); the references return in the drain."""
+    import inspect
+
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+    src = inspect.getsource(UnifiedRadixCache.check_hicache_events)
+    assert src.find("_read_room_tick(self)") > src.find("drain_storage_control_queues") >= 0
+
+
+def test_re_review_agb_a_give_back_stays_while_its_release_is_queued(tmp_path, monkeypatch):
+    _need_module()
+    import queue as _q
+
+    be, arena = _setup(tmp_path, ["a"], slots=8)
+    monkeypatch.setattr(ARB, "_alive", lambda pid: True)
+    RV.note_giveback(arena, "weg2-1-9", 8)
+    rq = _q.Queue()
+    rq.put(object())                                     # the reaped read's release, not drained yet
+    tree = types.SimpleNamespace(ongoing_prefetch={}, cache_controller=types.SimpleNamespace(host_mem_release_queue=rq))
+    assert RV.reap_givebacks(arena, tree) == 0 and RV.givebacks(arena)
+    rq.get()                                             # drained
+    assert RV.reap_givebacks(arena, tree) == 1 and not RV.givebacks(arena)

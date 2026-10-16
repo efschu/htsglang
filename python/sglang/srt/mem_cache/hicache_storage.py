@@ -4283,6 +4283,7 @@ class HiCacheFile(HiCacheStorage):
         progress and BEFORE this claim round with nothing released, nothing in flight, no room seen. Progress moves
         ``since``. The idle bound stays as the lifesign limit."""
         _op = _arbiter.current_op()
+        _deferred_any = False
         while pend and time.perf_counter() < deadline:
             if live and time.perf_counter() - last_move >= idle_ms / 1000.0:
                 break
@@ -4303,6 +4304,10 @@ class HiCacheFile(HiCacheStorage):
                 # paced inside; a lost post is re-asked; the same read id (review A3)
                 _read_room.post(arena, len(pend), site="room_wait", read_id=read_id)
             if _defer:
+                # pgap re-review A-DEFER: the older owner still waits (registered) -- a deferred round is a lifesign of
+                # this wait (bounded by its deadline), never idleness that ends it short of stems the owner fills
+                last_move = time.perf_counter()
+                _deferred_any = True
                 continue
             try:
                 self._arena_evict_to_disk(arena, max(256, len(pend)), need=len(pend))
@@ -4359,6 +4364,27 @@ class HiCacheFile(HiCacheStorage):
                 if ev:
                     rv[1] = ev
                     break
+        if pend and _deferred_any:
+            # pgap re-review A-DEFER: a fill that deferred to an older owner makes ONE last claim round before it ends
+            # with stems pending -- what the owner completed meanwhile lands (complete), what it still fills is
+            # joined, a free slot is claimed
+            nxt = []
+            for (i, st), (slot, status, gen) in zip(
+                    pend, _fill_claim(arena, [st for _, st in pend], int(total_bytes))):
+                if status == 0:
+                    got.append((i, slot, gen, st))
+                elif status == 2:
+                    out[i] = slot
+                elif status == 1:
+                    _unclaim_fill_joins(arena, [(i, slot, gen)])
+                    joined.append((i, slot, gen))
+                else:
+                    nxt.append((i, st))
+            if live and got:
+                self._arena_fill_read_todo(arena, got, int(total_bytes), out, stats)
+                read_now += len(got)
+                got = []
+            pend = nxt
         return pend, got, read_now, rounds
 
     def _arena_fill_read_todo(self, arena, todo, total_bytes: int, out, stats) -> None:

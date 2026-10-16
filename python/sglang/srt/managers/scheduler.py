@@ -20859,7 +20859,12 @@ class Scheduler(
             # F5c (NF-PGAP 1016): what goes into this reset un-backed, named (measured, never silent)
             if self.enable_hierarchical_cache:
                 try:
-                    _weg2_flush_nonblock.note_unbacked_at_reset(self.tree_cache, site="flush")
+                    _weg2_flush_nonblock.note_unbacked_at_reset(
+                        self.tree_cache, site="flush",
+                        paused=int(getattr(self, "_weg2_quiesce_paused", 0) or 0)
+                        if getattr(self, "_weg2_quiesce_open", False) else 0,
+                        open_ms=(time.monotonic() - float(getattr(self, "_weg2_quiesce_t0", time.monotonic()))) * 1000.0
+                        if getattr(self, "_weg2_quiesce_open", False) else 0.0)
                 except Exception:  # noqa: BLE001 - an instrument never blocks the reset
                     logger.warning("#1470 FLUSH-UNBACKED census raised", exc_info=True)
             _f5_bubble.quiesce_end(self, "reset")

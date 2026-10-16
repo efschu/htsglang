@@ -262,21 +262,6 @@ class SchedulerRequestReceiver:
                                 _k, self.ps.pp_rank, self.ps.attn_tp_rank, time.time())
         except Exception:  # noqa: BLE001 -- an instrument never breaks the intake
             pass
-        # F5a (NF-PGAP 1016): EVERY rank sees each quiesce poll here (a follower only forwards /flush_cache and
-        # answers through the #1268 lap -- it never runs flush_cache per poll): the quiesce opens on every rank, the
-        # bubble publisher pauses; the sleep leg (or a launched batch) ends it
-        try:
-            _kinds = {type(_r).__name__ for _r in (recv_reqs or ())}
-            if _kinds & {"FlushCacheReqInput", "ReleaseMemoryOccupationReqInput"}:
-                from sglang.srt.managers import weg2_bubble_publish as _f5_bubble
-
-                _rb = getattr(self, "running_batch", None)
-                if "ReleaseMemoryOccupationReqInput" in _kinds:
-                    _f5_bubble.quiesce_end(self, "sleep")
-                elif _rb is None or _rb.is_empty():
-                    _f5_bubble.quiesce_begin(self)
-        except Exception:  # noqa: BLE001 -- a publisher pause never breaks the intake
-            pass
 
         # #631 automatic phase policy. The arm rides the SAME chain a
         # manual POST /phase_flip uses, because forwarding it is what
