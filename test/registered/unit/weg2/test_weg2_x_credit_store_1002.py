@@ -66,7 +66,17 @@ def _front(epoch=7, awake="P"):
     f.tspans = TokenSpans(agent_span=True)
     f.ftok = _Tok()
     f._x_exact_rid = collections.OrderedDict()
+    # K15-FRONT (16.10.): a P-flush presence is credited at the store probe's proof -- here the
+    # store proves every page (the y6y anchors were in the store)
+    f.store_probe = _FullProbe()
     return f
+
+
+class _FullProbe:
+    def depth(self, ids, **kw):
+        import types as _t
+
+        return _t.SimpleNamespace(tokens=int(ids.size) // 64 * 64)
 
 
 # ---- weg2-8-13: P's END-ANCHOR is a store prefix once P's flush ran -------------

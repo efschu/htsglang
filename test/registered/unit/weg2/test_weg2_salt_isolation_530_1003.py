@@ -241,7 +241,8 @@ def test_p_flush_skips_a_namespaced_leg():
         tspans=ts, ftok=ft, counters=collections.Counter(),
         _ns_ek={"a": (True, "probe-A"), "b": (True, None)},
         epoch=1, _x_exact_reprice_queue=lambda why: None,
-        _mm_persist_anchor=lambda *a: None, _mm_persist_flush=lambda: None)
+        _mm_persist_anchor=lambda *a: None, _mm_persist_flush=lambda: None,
+        store_probe=SimpleNamespace(depth=lambda i, **k: SimpleNamespace(tokens=int(i.size))))
     fake._ns_isolated = lambda rid: F.Front._ns_isolated(fake, rid)
     assert F.Front._p_flush_store_presence(fake) == 1
     assert fed == [300] and fake.counters["store_presence_ns_isolated"] == 1

@@ -5937,6 +5937,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         else:
             UnifiedRadixCache._k15_lost_n += 1
             n = UnifiedRadixCache._k15_lost_n
+            # K15-FRONT: an anchor lost at eviction is a D loss the front must hear of -- kept for the
+            # next sleep answer (``anchors_lost``, the flush ledger), where the front retracts the
+            # presence credit standing on it (PRESENCE-ANCHOR-LOST)
+            _lost = self.__dict__.setdefault("_weg2_evict_lost_depths", [])
+            if len(_lost) < 4096:
+                _lost.append(int(self.weg2_node_depth(node)))
             if n <= 32 or n % 256 == 0:
                 logger.warning("WEG2-ANCHOR-LOST at=evict n=%d node=%s depth=%d backuped=%s why=%s (the "
                                "internal anchor had no host copy and none could be made -- tombstoned)",
@@ -5944,6 +5950,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                                getattr(self, "_k15_last_refusal", None)
                                or getattr(self, "_weg2_sweep_last_refusal", None) or "?")
         return ok
+
+    def weg2_take_evict_lost(self) -> list:
+        """K15-FRONT: the anchor depths lost at eviction since the last sleep answer, cleared on read."""
+        out = list(self.__dict__.get("_weg2_evict_lost_depths", None) or ())
+        self._weg2_evict_lost_depths = []
+        return out
 
     def _weg2_anchor_of(self, n, mp, allow_end=False):
         """(held, slots): an arena anchor sits on `n`; its slots when this rank

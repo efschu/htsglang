@@ -103,6 +103,25 @@ class _Tok:
                 list(self.keys.get(t, KEYS)))
 
 
+
+class _ProvenStore:
+    """K15-FRONT (16.10.): the P flush's presence is credited at the store probe's proof -- the store
+    holds every page the flush published (as on the metal once the write-through landed)."""
+
+    def depth(self, ids, **kw):
+        import types as _t
+
+        return _t.SimpleNamespace(tokens=int(ids.size))
+
+
+def _flush(f, *a):
+    old = f.__dict__.get("store_probe")
+    f.store_probe = _ProvenStore()
+    try:
+        return f._p_flush_store_presence(*a)
+    finally:
+        f.store_probe = old
+
 def _front(awake="D"):
     f = object.__new__(F.Front)
     f.counters = collections.Counter()
@@ -131,7 +150,7 @@ def _serve_first_turn(f):
     """turn 1: five unseen images -> fallback, P serves the prompt and flushes"""
     assert _price(f, "weg2-0-1", "t1") is None
     f._p_leg1_store_note("weg2-0-1", "t1", REAL_1)
-    assert f._p_flush_store_presence() == 1
+    assert _flush(f) == 1
 
 
 # ---- the helpers -----------------------------------------------------------------------

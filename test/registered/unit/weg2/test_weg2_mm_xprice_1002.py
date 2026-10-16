@@ -85,6 +85,25 @@ class _Tok:
                 [_key()])
 
 
+
+class _ProvenStore:
+    """K15-FRONT (16.10.): the P flush's presence is credited at the store probe's proof -- the store
+    holds every page the flush published (as on the metal once the write-through landed)."""
+
+    def depth(self, ids, **kw):
+        import types as _t
+
+        return _t.SimpleNamespace(tokens=int(ids.size))
+
+
+def _flush(f, *a):
+    old = f.__dict__.get("store_probe")
+    f.store_probe = _ProvenStore()
+    try:
+        return f._p_flush_store_presence(*a)
+    finally:
+        f.store_probe = old
+
 def _front(awake="D"):
     f = object.__new__(F.Front)
     f.counters = collections.Counter()
@@ -112,7 +131,7 @@ def _serve_needle(f):
     """weg2-0-1: fresh image -> fallback; P serves it (73112) and sleeps (flush)."""
     assert _price(f, "weg2-0-1", "t1") is None
     f._p_leg1_store_note("weg2-0-1", "t1", 73112)  # learns the image's token count first
-    assert f._p_flush_store_presence() == 1
+    assert _flush(f) == 1
 
 
 # ---- the helpers -----------------------------------------------------------------------
@@ -181,7 +200,7 @@ def test_a_queued_p_only_image_request_is_released_at_the_store_presence(caplog)
                   est_uncached=76654, p_only=True)
     f.queue.append(p)
     f._p_leg1_store_note("weg2-0-1", "t1", 73112)
-    f._p_flush_store_presence()
+    _flush(f)
     assert not p.p_only, "its image is in the store: no flip of its own"
     assert p.est_uncached == 24 and p.mm_image_end == 71024
     assert any("W102 Weg2VisionStage rid=weg2-1-5 image-cached at reprice" in m

@@ -752,6 +752,54 @@ def anchors_lost(body: str) -> List[int]:
     return sorted(set(out))
 
 
+def store_presence_probed_on(env=None) -> bool:
+    """K15-FRONT: a P-flush store presence is credited only at the depth the front's store probe
+    proves (``SGLANG_WEG2_STORE_PRESENCE_PROBED``, default on)."""
+    return (os.environ if env is None else env).get(
+        "SGLANG_WEG2_STORE_PRESENCE_PROBED", "1").strip().lower() not in ("0", "false", "no", "off", "")
+
+
+def retract_refused_credit(spans: Any, ids: Any, d_depth: int, page: int = 64, max_iter: int = 8) -> List[str]:
+    """K15-FRONT (boot 1016_103428, W50-REROUTE x_refusal weg2-80-497 front_price=14 d_extent=220878,
+    weg2-83-503 front_price=28 d_extent=220892): D refused at its X gate because it resumes far
+    below the front's credit -- a loss on D (anchor/KV gone) the front never heard of. The entries
+    that credited this prompt above D's measured resume depth (``prompt - d_extent``) are dropped,
+    so the next turn of the sequence is priced from what D can deliver, not routed SHORT again.
+    Returns the dropped keys."""
+    if spans is None or ids is None or getattr(ids, "size", 0) == 0:
+        return []
+    pend = getattr(spans, "pending", None)
+    entries = getattr(spans, "entries", None)
+    if not callable(pend) or entries is None:
+        return []
+    gone = []
+    for _ in range(max(1, int(max_iter))):
+        _p, credit, _k, _src = pend(ids)
+        if int(credit) <= int(d_depth) + int(page):
+            break
+        win = getattr(spans, "last_winner", None)
+        key = win[0] if win else None
+        if key is None:
+            # a SEQ-HASH mark won: forget the mark at the credited depth
+            seq_credit = getattr(spans, "seq_credit", None)
+            drop_seq = getattr(spans, "drop_seq_depths", None)
+            if callable(seq_credit) and callable(drop_seq):
+                depth, _plen = seq_credit(ids)
+                if int(depth) > int(d_depth) and drop_seq({int(depth)}):
+                    gone.append("seq:%d" % int(depth))
+                    continue
+            break
+        for table in ("entries", "depth_caps", "raw_depths", "store_keys"):
+            t = getattr(spans, table, None)
+            if isinstance(t, dict):
+                t.pop(key, None)
+        unflag = getattr(spans, "_unflag_inflight", None)
+        if unflag is not None:
+            unflag(key)
+        gone.append(key)
+    return gone
+
+
 def retract_lost_anchors(spans: Any, depths: Sequence[int]) -> List[str]:
     """ANCHOR-LOST: drop every presence entry whose credit stood on an
     anchor D's sleep dropped -- its #59 depth cap (or, without a cap, its
@@ -8242,6 +8290,32 @@ class Front:
             n_eff = min(int(ids.size), int(pt)) if int(pt) > 0 else int(ids.size)
             if ts.own_anchor(n_eff) in lost_set:
                 continue
+            if store_presence_probed_on():
+                # K15-FRONT (h111 weg2-114-865, 07:24:26): P's END-ANCHOR 95552 of weg2-114-862
+                # was credited unprobed ('STORE-PRESENCE src=p_flush'), the re-price dropped
+                # 865 from 7649 to 161, D's store read ended at 88192 and D computed 7521. A
+                # credit stands on what the store PROVES: the front's own store probe, capped.
+                _sp = self.__dict__.get("store_probe")
+                if _sp is None:
+                    self.counters["store_presence_unprobed"] += 1
+                    continue
+                try:
+                    _d = int(_sp.depth(ids[:n_eff]).tokens)
+                except Exception:  # noqa: BLE001 -- no proof, no credit
+                    self.counters["store_presence_probe_failed"] += 1
+                    continue
+                if _d < ts.own_anchor(n_eff):
+                    self.counters["store_presence_capped"] += 1
+                    logger.info("WEG2 STORE-PRESENCE-CAP rid=%s end_anchor=%d store_depth=%d (P's flush "
+                                "reported the anchor, the store proves less -- credited at the proof)",
+                                rid, ts.own_anchor(n_eff), _d)
+                    if _d > 0:
+                        anchor = ts.record_store_depth(ids, _d, source="store_anchor")
+                        if anchor > 0:
+                            n += 1
+                            tokens += anchor
+                            rids.append(f"{rid}:{anchor}")
+                    continue
             anchor = ts.record_store_anchor(ids, pt, source="store_anchor")
             if anchor > 0:
                 n += 1
@@ -14264,6 +14338,20 @@ class Front:
             (" (P never ran for this rid: not W35, the regular P reroute)"
              if n > 1 and not terminal else ""))
         self._rvp_state()
+        try:  # K15-FRONT: D resumes below the credit -- retract the credit at D's measured depth
+            _ts = getattr(self, "tspans", None)
+            _text = getattr(pending, "text", None) if pending is not None else None
+            _ids = self.ftok.ids_for(_text) if (_ts is not None and _text) else None
+            if _ids is not None and d_extent is not None:
+                _gone = retract_refused_credit(_ts, _ids, max(0, int(_ids.size) - int(d_extent)),
+                                               page=int(getattr(self, "page_size", 64) or 64))
+                if _gone:
+                    self.counters["x_refusal_credit_retracted"] += len(_gone)
+                    logger.warning("WEG2 X-REFUSAL-CREDIT-RETRACT rid=%s d_depth=%d entries=%d (D resumes "
+                                   "below the front's credit: the entries that priced it are dropped)",
+                                   rid, max(0, int(_ids.size) - int(d_extent)), len(_gone))
+        except Exception:  # noqa: BLE001 -- a retraction never breaks the reroute
+            logger.warning("WEG2 X-REFUSAL-CREDIT-RETRACT failed rid=%s", rid, exc_info=True)
         logger.warning(
             "WEG2 W50-REROUTE rid=%s front_price=%s d_extent=%s reason=x_refusal path=fresh n=%d "
             "verdict=%s -- refused before the first byte: re-routed through P (leg 1, then leg 2)",

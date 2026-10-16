@@ -130,7 +130,9 @@ def _boot_y7o(store_dir):
     f = _front(store_dir, probe_depth=0)
     assert _price(f, "weg2-10-10") is None
     f._p_leg1_store_note("weg2-10-10", "t", 727)
+    f.store_probe = _Probe(10 ** 6)       # K15-FRONT: the flush's presence at the store's proof
     assert f._p_flush_store_presence() == 1
+    f.store_probe = _Probe(0)
     return f
 
 

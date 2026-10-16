@@ -13297,6 +13297,20 @@ class Scheduler(
                     "TP0's own probe is the group's authority) n=%d", _n,
                 )
             return
+        # K15-FRONT: anchors the D phase lost at EVICTION (WEG2-ANCHOR-LOST at=evict) ride the same
+        # answer -- the front retracts the credit standing on them (every D loss path, not only the flush)
+        take_ev = getattr(self.tree_cache, "weg2_take_evict_lost", None)
+        try:
+            ev = [int(d) for d in (take_ev() if callable(take_ev) else ()) if int(d) > 0]
+        except Exception:  # noqa: BLE001 - an instrument never blocks a flush
+            ev = []
+        if ev:
+            ledger = getattr(self, "_weg2_anchors_lost", None)
+            if ledger is None:
+                ledger = self._weg2_anchors_lost = []
+            ledger.extend(ev)
+            logger.warning("WEG2-ANCHOR-LOST at=evict carried n=%d depths=%s (lost during the phase; the "
+                           "front retracts presence credit at these depths)", len(ev), sorted(set(ev))[:16])
         try:
             lost = probe()
         except Exception as exc:  # noqa: BLE001 - an instrument never blocks a flush

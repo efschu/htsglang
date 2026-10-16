@@ -95,6 +95,25 @@ class _Tok:
                 [_key()])
 
 
+
+class _ProvenStore:
+    """K15-FRONT (16.10.): the P flush's presence is credited at the store probe's proof -- the store
+    holds every page the flush published (as on the metal once the write-through landed)."""
+
+    def depth(self, ids, **kw):
+        import types as _t
+
+        return _t.SimpleNamespace(tokens=int(ids.size))
+
+
+def _flush(f, *a):
+    old = f.__dict__.get("store_probe")
+    f.store_probe = _ProvenStore()
+    try:
+        return f._p_flush_store_presence(*a)
+    finally:
+        f.store_probe = old
+
 def _front(page, awake="D"):
     f = object.__new__(F.Front)
     f.counters = collections.Counter()
@@ -123,7 +142,7 @@ def _serve_on_p(f, rid, t, n):
     publishes the END-ANCHOR page_floor(n) (STORE-PRESENCE src=p_flush)."""
     assert _price(f, rid, t) is None
     f._p_leg1_store_note(rid, t, n)
-    assert f._p_flush_store_presence() == 1
+    assert _flush(f) == 1
 
 
 # ---- the pure reach ---------------------------------------------------------------------
@@ -224,7 +243,7 @@ def test_reprice_keeps_a_queued_image_request_p_only_inside_the_floor_page(caplo
     assert _price(f, "weg2-2-6", "s-repeat") is None, "queued before the image was learned"
     p = _queued(f, "weg2-2-6", "s-repeat")
     f._p_leg1_store_note("weg2-0-3", "s", 128)
-    f._p_flush_store_presence()
+    _flush(f)
     assert p.mm_image_end == 110
     assert p.p_only, "D's admission floor (64) lies inside the image"
     assert not any("image-cached at reprice" in m for m in caplog.messages)
@@ -236,7 +255,7 @@ def test_reprice_still_releases_on_page_one():
     assert _price(f, "weg2-18-24", "s-repeat") is None
     p = _queued(f, "weg2-18-24", "s-repeat")
     f._p_leg1_store_note("weg2-16-23", "s", 128)
-    f._p_flush_store_presence()
+    _flush(f)
     assert not p.p_only
 
 
