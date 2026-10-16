@@ -174,6 +174,7 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
 )
 from sglang.srt.managers.shutdown_gate import ServerShuttingDown
 from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
+from sglang.srt.weg2 import front_x as weg2_front_x  # FRONT-X-MIT: the native /generate stamps the front's decision X too
 from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.observability.trace import (
     process_tracing_init,
@@ -1188,6 +1189,10 @@ async def generate_request(obj: GenerateReqInput, request: Request):
     note_serving_activity()
     if envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get():
         apply_header_overrides(obj, request.headers)
+    # FRONT-X-MIT (15.10., review dx-r2 A1): the front forwards /generate to D as well
+    # (front.py FORWARD_PATHS), so the native route stamps the decision X like chat and
+    # completions do -- otherwise a D-direct /generate is bounded by the static X alone.
+    weg2_front_x.stamp_request(obj, request)
     if obj.stream:
 
         async def stream_results() -> AsyncIterator[bytes]:
@@ -1442,6 +1447,9 @@ async def weg2_park_running(obj: Annotated[Weg2ParkRunningReqInput, Body()], req
     seq_marks = getattr(ret, "weg2_seq_hash", None)  # SEQ-HASH (02.10.)
     if seq_marks:
         body["weg2_seq_hash"] = dict(seq_marks)
+    answered_at = float(getattr(ret, "answered_at", 0.0) or 0.0)  # FLIPSTALL-1015
+    if answered_at > 0.0:
+        body["answered_at"] = answered_at
     if getattr(ret, "lane", False):
         # PRIORITY LANES 1008 (L2): the answer of a rids / hold park carries "lane" (+ why a rid was not parked)
         body["lane"] = True

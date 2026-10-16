@@ -51,26 +51,15 @@ REPEAT_S = 8.0
 JOIN_S = 2.0
 
 
-def dump_stacks(fh, title: str, skip_ident: Optional[int] = None, only_ident: Optional[int] = None,
-                max_frames: Optional[int] = None) -> None:
-    """Every thread's stack via ``sys._current_frames()`` (under the GIL); ``skip_ident`` left out.
-
-    ``only_ident`` (NF D-HANG 1011): write just that thread (the scheduler thread, for the wedge
-    watchdog); ``max_frames``: keep only the innermost N frames of each stack. Both default to the
-    old behaviour."""
+def dump_stacks(fh, title: str, skip_ident: Optional[int] = None) -> None:
+    """Every thread's stack via ``sys._current_frames()`` (under the GIL); ``skip_ident`` left out."""
     names = {t.ident: t.name for t in threading.enumerate()}
     out = [title]
     for ident, frame in sys._current_frames().items():
         if ident == skip_ident:
             continue
-        if only_ident is not None and ident != only_ident:
-            continue
         out.append("Thread 0x%016x (%s) (most recent call last):" % (ident, names.get(ident, "?")))
-        stack = traceback.format_stack(frame)
-        if max_frames is not None and len(stack) > max_frames:
-            out.append("  ... %d outer frame(s) omitted ..." % (len(stack) - max_frames))
-            stack = stack[-max_frames:]
-        out.extend(line.rstrip("\n") for line in stack)
+        out.extend(line.rstrip("\n") for line in traceback.format_stack(frame))
         out.append("")
     fh.write("\n".join(out) + "\n")
     fh.flush()

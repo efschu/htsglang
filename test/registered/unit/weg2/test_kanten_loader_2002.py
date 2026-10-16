@@ -1,7 +1,7 @@
 """Auftrag 2002 C: der Kantenkatalog (kantenkatalog_1004.json) wird gelesen und mit ``CURATED[...]["depends"]`` verschmolzen.
 
 Gepinnt (Nutzerentscheid 05.10., Variante A: Loader + Verschmelzung, KEINE Regelauswertung im Editor):
-  * Jede der 137 Katalogkanten steht danach in ``entries[von]["depends"]`` (mit ``kante``-ID, ``beleg``, ``satz``); 51 verschmolzen, 86 neu (AP-G 06.10.: K62-K108 neu, alle ohne kuratierte Zwillingskante; AP-H1: K109-K116 Dual-ENV-Tabelle, neu; Katalog-Neubau 07.10.: K117-K131 neu; H88-E 07.10.: K132-K133 neu; H88-F 08.10.: K134 neu; X-SUM-PRICE 10.10.: K135 neu).
+  * Jede der 138 Katalogkanten steht danach in ``entries[von]["depends"]`` (mit ``kante``-ID, ``beleg``, ``satz``); 52 verschmolzen, 86 neu (AP-G 06.10.: K62-K108 neu, alle ohne kuratierte Zwillingskante; AP-H1: K109-K116 Dual-ENV-Tabelle, neu; Katalog-Neubau 07.10.: K117-K131 neu; H88-E 07.10.: K132-K133 neu; H88-F 08.10.: K134 neu; X-SUM-PRICE 10.10.: K135 neu; h16m 14.10.: K138 PRIO-AS-AGE -> LANES verschmilzt mit der kuratierten Kante von fa99a484ae).
   * Die 24 kuratierten Kanten ohne Katalogkante bleiben und sind ``belegt: False`` ("ohne Beleg"), nicht geloescht.
   * Weicht die Beziehungsart ab, bleibt die kuratierte und ``rel_katalog`` traegt die andere (kein stilles Ueberschreiben).
   * ``to_kind`` kennzeichnet das Ziel (flag/env/var/ablehnung/unbekannt): ein Chip zeigt nie stumm ins Leere.
@@ -72,9 +72,9 @@ class RealCatalog(unittest.TestCase):
     def test_status_block_counts(self):
         k = self.cat["kanten"]
         self.assertTrue(k["geladen"])
-        self.assertEqual((k["kanten_gesamt"], k["verschmolzen"], k["neu"]), (137, 51, 86))
+        self.assertEqual((k["kanten_gesamt"], k["verschmolzen"], k["neu"]), (138, 52, 86))
         self.assertEqual(k["kanten_ohne_beleg"], OHNE_BELEG)
-        self.assertEqual(k["kanten_belegt"], 137)
+        self.assertEqual(k["kanten_belegt"], 138)
         self.assertEqual(k["uebersprungen_ohne_von"], [])
         self.assertEqual(k["ziel_unbekannt"], ZIEL_UNBEKANNT)
         self.assertEqual(k["wertbedingt"], 22)

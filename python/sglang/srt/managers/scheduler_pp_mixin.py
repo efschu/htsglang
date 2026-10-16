@@ -1576,6 +1576,9 @@ def pp_flip_forget_ring_scoped_slots(holder) -> None:
     # #1020 void guard) does a membership test, and an empty set is the
     # truth on a ring that has just been rebuilt from zero.
     holder._pp_launched_pending = set()
+    # Review A1 (intake fix): the consumed-pass mark belongs to the ring that was just rebuilt, too: passes retracted at the
+    # cutover are never consumed by the followers, and PP0 must not wait for a result that will not come.
+    holder._pp_last_processed_ct = -1
     # #1225: and the BATCHES those slots owe, keyed by slot. Same
     # lifecycle as the set above and reset here for the same reason --
     # an entry that outlived a ring rebuild would name a slot of the
@@ -4133,7 +4136,10 @@ def weg2_791c_release_on_idle_vote(self, vote) -> None:
     ``_weg2_vote_attach_own_slot`` on stand-ins that are no Scheduler; every
     read here is a ``getattr`` with a default, so a stand-in returns at once."""
     req = getattr(self, "_pending_chunked_abort_req", None)
-    if req is None or int(getattr(self.ps, "pp_rank", 0) or 0) == 0:
+    # K14: a held waiting-queue abort (weg2.pp_abort) is released by the same
+    # vote -- an idle PP0 sends no frame that could still admit it.
+    held = getattr(self, "_weg2_pp_held_waiting_aborts", None)
+    if (req is None and not held) or int(getattr(self.ps, "pp_rank", 0) or 0) == 0:
         return
     try:
         from sglang.srt.weg2 import p_row_authority as _prow
@@ -4147,6 +4153,8 @@ def weg2_791c_release_on_idle_vote(self, vote) -> None:
         return
     self._791c_pp0_drained = True
     try:
+        if held:
+            self._weg2_resolve_waiting_aborts(pp0_drained=True)
         self.process_pending_chunked_abort()
     finally:
         self._791c_pp0_drained = False
@@ -4260,6 +4268,252 @@ def weg2_writethrough_drain_on_idle_vote(self) -> int:
                         "the #1465 drain that polled them", int(self.ps.pp_rank),
                         drained, len(getattr(tc, "ongoing_write_through", None) or ()), _WTV_N[0])
     return drained
+
+
+_BAV_N = [0]
+
+
+def weg2_backup_ack_drain_on_idle_vote(self) -> int:
+    """STORAGE-BACKUP LIVENESS (NF h16l 75e3ee8abd, boot
+    dkrnfint4h6ablxcw3spmlrhlvwbar1dauer10142044 ..._1014_204509, W3 20:50:22):
+    the third twin of :func:`weg2_loadback_drain_on_idle_vote` and
+    :func:`weg2_writethrough_drain_on_idle_vote`.
+
+    P.log 20:48:52: weg2-0-1's last pass left three direct write-throughs in
+    flight on PP1 and PP2. The P->D quiesce's first #1268 lap ran the
+    write-through drain on each follower (``WEG2-WRITETHROUGH-DRAIN-ON-VOTE
+    drained=3``); each ack completed its arena slot (``#1427 DIRECT-WRITE ACK``)
+    and issued the QSA-index sidecar store write (``#106S SIDECAR-WRITE-ISSUED
+    op=1..3``) -- three entries in ``ongoing_backup``. Their acks land in
+    ``ack_backup_queue`` within milliseconds, but only ``_drain_backup`` (in the
+    round drain of ``check_hicache_events``, i.e. a PLANNED pass) retires them,
+    and a follower under the row authority plans no frameless cycle (PLAN
+    BYPASS; ``#1028 HICACHE-ROUND`` ran n=1 on PP1/PP2 in the whole boot). Every
+    lap from epoch 2 to 6697 voted ``hicache_backup(3)`` on PP1/PP2, PP0 refused
+    every /flush_cache, the parked follower flush waited for a ``passed`` its own
+    vote prevented, and the front stopped the group: ``W3
+    Weg2DrainWitnessDisagreement`` with an empty, CORRECT front ledger.
+
+    The drain is rank-local where the round drain is local anyway
+    (``UnifiedRadixCache.drain_backup_acks_uncoordinated``: nothing when the
+    attention group > 1). It runs AFTER the write-through drain, because that
+    drain is what issues the sidecar backups. Nothing is waited on: a backup the
+    store has not acked yet stays and votes not-idle, the next lap drains it.
+    Returns the drained count."""
+    tc = getattr(self, "tree_cache", None)
+    pending = getattr(tc, "ongoing_backup", None)
+    if not pending or int(getattr(getattr(self, "ps", None), "pp_rank", 0) or 0) == 0:
+        return 0
+    drain = getattr(tc, "drain_backup_acks_uncoordinated", None)
+    if not callable(drain):
+        return 0
+    try:
+        from sglang.srt.weg2 import p_row_authority as _prow
+
+        if not _prow.applies(self) or not self._pp_microbatches_drained():
+            return 0
+        drained = int(drain())
+    except Exception:  # noqa: BLE001 - the drain never blocks the vote
+        logger.warning("WEG2-BACKUP-ACK-DRAIN-ON-VOTE raised; the slot votes on the undrained state",
+                       exc_info=True)
+        return 0
+    if drained > 0:
+        _BAV_N[0] += 1
+        if _BAV_N[0] <= 16 or _BAV_N[0] % 256 == 0:
+            logger.info("WEG2-BACKUP-ACK-DRAIN-ON-VOTE pp_rank=%d drained=%d left=%d (n=%d): the "
+                        "follower's acked storage backups (the #106S sidecar writes its own "
+                        "write-through drain issued), retired at the #1268 vote -- a frameless "
+                        "cycle skips the round drain that retires them", int(self.ps.pp_rank),
+                        drained, len(getattr(tc, "ongoing_backup", None) or ()), _BAV_N[0])
+    return max(drained, 0)
+
+
+#: NF-FOLLOWER-ROUND 1014 switch (default ON, user rule 14.10.: new features are on);
+#: ``0`` = e7cfda7fbe byte for byte: no round on a frameless cycle, the #1268 vote
+#: runs its four single drains.
+FOLLOWER_ROUND_ENV = "SGLANG_WEG2_P_FOLLOWER_ROUND"
+_FR_N = [0, 0]  # [rounds, rounds that drained something]
+
+
+class FollowerRoundRefused(RuntimeError):
+    """The named stop of :func:`weg2_follower_round` (a form whose round would
+    carry a collective or a peer wait)."""
+
+
+def follower_round_enabled() -> bool:
+    return (os.environ.get(FOLLOWER_ROUND_ENV, "1") or "1").strip().lower() not in (
+        "0", "false", "no", "off")
+
+
+def _follower_round_census(tc) -> tuple:
+    """(write_through, load_back, revoke, backup, release, extra, prefetch) of THIS
+    rank: what a planned pass's round would drain. Host-side lengths only."""
+    cc = getattr(tc, "cache_controller", None)
+
+    def _q(name):
+        q = getattr(cc, name, None)
+        try:
+            return int(q.qsize()) if q is not None else 0
+        except Exception:  # noqa: BLE001 - a census never breaks the round
+            return 0
+
+    try:
+        extra = sum(int(q.qsize()) for q in
+                    (getattr(cc, "extra_host_mem_release_queues", None) or {}).values())
+    except Exception:  # noqa: BLE001
+        extra = 0
+    return (
+        len(getattr(tc, "ongoing_write_through", None) or ()),
+        len(getattr(tc, "ongoing_load_back", None) or ()),
+        _q("prefetch_revoke_queue"),
+        _q("ack_backup_queue"),
+        _q("host_mem_release_queue"),
+        extra,
+        len(getattr(tc, "ongoing_prefetch", None) or ()),
+    )
+
+
+def _follower_round_tree_call(tc):
+    """The tree's own per-round poll, where it is the #737 form (rank-local ack
+    counting, ``_drain_agreement_is_collective`` known): ``check_hicache_events``.
+    None for a tree without it -- a stand-in of the lap tests, or a tree whose
+    round carries the legacy MIN reduce + PP sync (HiRadixCache): the single
+    drains of e7cfda7fbe stay in charge there, unchanged."""
+    call = getattr(tc, "check_hicache_events", None)
+    if not callable(call):
+        return None
+    if not callable(getattr(tc, "_count_ready_acks", None)):
+        return None
+    if not callable(getattr(tc, "_drain_agreement_is_collective", None)):
+        return None
+    return call
+
+
+def weg2_follower_round(self, site: str = "frameless") -> bool:
+    """NF-FOLLOWER-ROUND 1014 (inventory done/nf-row-inventar-1014.md, C1): a
+    follower of group P runs, on every cycle WITHOUT a frame, the same HiCache
+    housekeeping round a planned pass runs -- and nothing else.
+
+    WHY. Under the row authority (31aa655fff) a frameless follower cycle skips the
+    plan (PLAN BYPASS), and with the plan it skipped the whole housekeeping of
+    ``_get_new_batch_prefill_raw``: ``check_hicache_events`` (write-through and
+    load-back acks, then the storage control queues: prefetch REVOKES, storage
+    BACKUP acks, host RELEASES, extra-pool releases), the deferred-prefetch retry
+    and the prefetch progress drain. Upstream sglang runs that round on EVERY
+    stage in EVERY iteration (``get_next_batch_to_run`` on each PP rank); it was
+    never meant to depend on having a batch. Two images died of single missing
+    drains today (#968 75e3ee8abd, W3 e7cfda7fbe); four single drains in the
+    #1268 vote covered only the quiesce, and every new queue would have needed a
+    fifth. This is the one round, the same functions, for every queue.
+
+    WHAT IT DECIDES: NOTHING. Every queue it empties holds work this rank has
+    ALREADY been told to do or has already finished (an acked event, an acked
+    store write, a probe's own revoke answer, rows already given back); the
+    drains retire it on this rank's own tree and pool, in this rank's own queue
+    order. No membership, no extent, no abort, no park, no timeout, no evict
+    choice, no admission -- those stay PP0's (row) or the next planned pass's.
+    What changes on this rank afterwards is what it REPORTS (idle slot, PR room
+    fact, PF ack): votes PP0 folds into its own verdict.
+
+    NO COLLECTIVE. Refused by name (``FOLLOWER-ROUND REFUSED``) where the round
+    would carry one: an attention group > 1 (the storage drain MIN-reduces the
+    queue sizes, ``check_prefetch_progress`` reduces) -- a group collective
+    triggered from a rank-local point is the #580 class -- and pending PP-sync
+    sends (a peer wait). On group P (TP 1, PP 3) none of them exist.
+
+    ``site``: ``frameless`` = the ``_row_skip_plan`` branch of the loop body (the
+    bypass itself is the proof that this pass plans nothing); ``vote`` = the
+    #1268 slot attach (needs the row authority, like the single drains it
+    replaces). Returns True iff the round ran."""
+    ps = getattr(self, "ps", None)
+    if ps is None or int(getattr(ps, "pp_size", 1) or 1) <= 1:
+        return False
+    if int(getattr(ps, "pp_rank", 0) or 0) == 0:
+        return False
+    if not follower_round_enabled():
+        return False
+    if site != "frameless":
+        try:
+            from sglang.srt.weg2 import p_row_authority as _prow
+
+            if not _prow.applies(self):
+                return False
+        except Exception:  # noqa: BLE001 - no row module: the unchanged path
+            return False
+    tc = getattr(self, "tree_cache", None)
+    if tc is None:
+        return False
+    attn_world = max(int(getattr(ps, "attn_tp_size", 1) or 1),
+                     int(getattr(ps, "attn_cp_size", 1) or 1))
+    collective = False
+    agree = getattr(tc, "_drain_agreement_is_collective", None)
+    if callable(agree):
+        collective = bool(agree())
+    reduce_world = 1
+    rw = getattr(tc, "_attn_reduce_world", None)
+    if callable(rw):
+        try:
+            reduce_world = int(rw())
+        except Exception:  # noqa: BLE001 - an unreadable world is not world 1
+            reduce_world = 2
+    if attn_world > 1 or collective or reduce_world > 1:
+        raise FollowerRoundRefused(
+            "FOLLOWER-ROUND REFUSED (NF-FOLLOWER-ROUND 1014, #580 class): this "
+            f"follower (pp_rank={int(ps.pp_rank)}, site={site}) has attn world "
+            f"{attn_world}, drain agreement collective={collective}, reduce world "
+            f"{reduce_world}. Its housekeeping round would trigger a group "
+            "collective from a rank-local point. The round is built for group P "
+            "(TP 1, PP 3); a form with an attention group > 1 under the row "
+            f"authority needs a group-aligned round first. {FOLLOWER_ROUND_ENV}=0 "
+            "restores the single vote drains of e7cfda7fbe."
+        )
+    if getattr(tc, "work_list", None):
+        raise FollowerRoundRefused(
+            "FOLLOWER-ROUND REFUSED (NF-FOLLOWER-ROUND 1014): "
+            f"{len(tc.work_list)} PP-sync send(s) pending on pp_rank="
+            f"{int(ps.pp_rank)}; reaping them waits on a peer's receive, which a "
+            "frameless cycle may not do. Group P issues none (no _pp_sync caller "
+            "on the #737 tree) -- this is a form the round was not built for."
+        )
+    before = _follower_round_census(tc)
+    tree_round = _follower_round_tree_call(tc)
+    if tree_round is not None:
+        if getattr(self, "enable_hierarchical_cache", False):
+            tree_round()
+            # #811: the planned pass releases the anchor pins whose write-through
+            # ack just drained (only the running batch; no-op unless armed).
+            release_pins = getattr(tc, "release_acked_anchor_pins", None)
+            running = getattr(self, "running_batch", None)
+            if callable(release_pins) and running is not None:
+                release_pins(getattr(running, "reqs", ()) or ())
+    else:
+        # A tree without the #737 round (a stand-in, HiRadixCache): the single
+        # drains of e7cfda7fbe, each with its own guards, unchanged.
+        weg2_loadback_drain_on_idle_vote(self)
+        weg2_writethrough_drain_on_idle_vote(self)
+        weg2_backup_ack_drain_on_idle_vote(self)
+    if getattr(self, "enable_hicache_storage", False):
+        retry = getattr(self, "_retry_deferred_prefetches", None)
+        if callable(retry):
+            retry()
+        # #1272 orphan collector included; the verdict map is discarded on
+        # purpose -- no memo is planted (`_pass_prefetch_verdicts` stays the
+        # planned pass's own).
+        self._drain_prefetch_progress()
+    after = _follower_round_census(tc)
+    _FR_N[0] += 1
+    self._weg2_follower_rounds = int(getattr(self, "_weg2_follower_rounds", 0)) + 1
+    if before != after:
+        _FR_N[1] += 1
+        if _FR_N[1] <= 16 or _FR_N[1] % 256 == 0:
+            logger.info(
+                "FOLLOWER-ROUND pp_rank=%d site=%s n=%d drained_rounds=%d "
+                "[wt,lb,rev,bak,rel,extra,pf] before=%s after=%s: a follower's "
+                "housekeeping round on a cycle that plans nothing (NF-FOLLOWER-ROUND "
+                "1014; the planned pass runs the same round)",
+                int(ps.pp_rank), site, _FR_N[0], _FR_N[1], list(before), list(after),
+            )
+    return True
 
 
 class SchedulerPPMixin:
@@ -4982,6 +5236,12 @@ class SchedulerPPMixin:
                     # (#1020 guard, #1153 sibling sweep).
                     self._pp_null_frameless_slot(mb_id)
                     pp_bulletin.clear_after_plan(self)
+                    # NF-FOLLOWER-ROUND 1014: no plan, but the same housekeeping
+                    # round the plan runs (acks, revokes, backups, releases,
+                    # prefetch progress) -- upstream runs it on every stage
+                    # every iteration; skipping it with the plan left the
+                    # follower's queues to the next frame (A1-A8, #968, W3).
+                    weg2_follower_round(self, site="frameless")
                 elif _pre_proxy is not None:
                     _dn2 = getattr(self, "_pp_row_deliver_trace_n", 0)
                     _prow_t0 = time.perf_counter()  # Fix B P-ROW-COST
@@ -5107,6 +5367,14 @@ class SchedulerPPMixin:
                 # FIXES Nr. 45 PP-VOID-PASS: a load-back refusal on the carrierless form discards the whole planned pass HERE
                 # (own-void + the slot's frame becomes a void frame), before anything of it is sent or launched.
                 _pp_void_pass.after_plan(self, mb_id)
+                # K14: a waiting-queue abort this follower held because PP0 had
+                # already admitted the request is applied HERE, right after the
+                # plan that executed PP0's frame admitting it and before the
+                # launch -- the request runs the pass PP0 runs and gets PP0's
+                # to_finish (or the #791C chunked verdict), never a pass more or
+                # less (weg2.pp_abort). One getattr while nothing is held.
+                if getattr(self, "_weg2_pp_held_waiting_aborts", None):
+                    self._weg2_resolve_waiting_aborts()
 
                 # #795 PP ADMISSION UNIFORMITY, RELOCATED: emit/forward this
                 # pass's admission decision HERE, immediately after
@@ -5594,6 +5862,14 @@ class SchedulerPPMixin:
                         getattr(self, "_pp_launched_pending", set()).discard(
                             next_mb_id
                         )
+                        # Review A1 (intake fix): the event that releases the rows of a finished pass is its RESULT being
+                        # consumed, on every rank. Remember the newest consumed pass: PP0 reads it as "the last pass I picked
+                        # up" (``intake_stall.work_in_flight``), a follower sends it as ``processed`` in its room fact.
+                        _ct_done = getattr(self.mbs[next_mb_id], "forward_iter", None)
+                        if isinstance(_ct_done, int):
+                            self._pp_last_processed_ct = max(
+                                int(getattr(self, "_pp_last_processed_ct", -1)), _ct_done
+                            )
                         # #1225: the batch has DELIVERED, so it is no longer
                         # owed and must leave the register in the same step.
                         # A delivered batch left here would be retracted a
@@ -6474,6 +6750,13 @@ class SchedulerPPMixin:
             # decided last pass at the front of the wire (weg2/flush_verdict.py).
             if self.pp_group.is_first_rank:
                 _wire_reqs = _flush_verdict.pp0_wire(self, _wire_reqs)
+                # K14: PP0's group verdict on each forwarded abort (does a
+                # frame it sent name the rid?) rides the AbortReq itself --
+                # stamped here, before the send and before PP0 applies it.
+                if any(type(r).__name__ == "AbortReq" for r in (_wire_reqs or ())):
+                    from sglang.srt.weg2 import pp_abort as _pp_abort_k14
+
+                    _wire_reqs = _pp_abort_k14.pp0_stamp_aborts(self, _wire_reqs)
             # PR (weg2/pp_room_vote.py): R_m rides list m; nothing without one.
             if self.pp_group.is_first_rank and self.__dict__.get("_weg2_pr_verdict") is not None:
                 from sglang.srt.weg2 import pp_room_vote as _pr
@@ -6610,6 +6893,7 @@ class SchedulerPPMixin:
                     tree=tree, allocator=self.token_to_kv_pool_allocator, rank=0,
                     executed=int(self.forward_ct), local_floor=local_floor,
                     lane_floor=_lf, lane_epoch=_le,
+                    processed=int(getattr(self, "_pp_last_processed_ct", -1)),
                 )
                 if _have_facts:
                     verdict = book.cap(own.room)
@@ -6641,6 +6925,7 @@ class SchedulerPPMixin:
             tree=tree, allocator=self.token_to_kv_pool_allocator, rank=int(self.ps.pp_rank),
             executed=int(self.forward_ct), local_floor=local_floor,
             lane_floor=_lf, lane_epoch=_le,
+            processed=int(getattr(self, "_pp_last_processed_ct", -1)),
         )
         sender.offer(fact, now)
         sender.flush(channel, now)
@@ -6719,20 +7004,44 @@ class SchedulerPPMixin:
                 "run with tp_size > 1 on P (#1028, stated as a residual risk in "
                 "the fix-1b docstring and now enforced)."
             )
-        if getattr(self, "enable_hicache_storage", False):
-            try:
-                self._drain_prefetch_progress()
-            except Exception as exc:  # noqa: BLE001 - a collection may not kill the vote
-                logger.warning(
-                    "#1272 orphan collection before the idle slot raised %r; the "
-                    "slot is attached on the uncollected state (which votes "
-                    "not-idle and names its blocker, rather than sleeping)",
-                    exc,
-                )
         rank = int(self.ps.pp_rank)
+        # #791C stays its own: it needs PP0's idle slot on this vote -- a
+        # verdict, not housekeeping. Before the round, so the round retires
+        # what the release queued.
         weg2_791c_release_on_idle_vote(self, vote)
-        weg2_loadback_drain_on_idle_vote(self)
-        weg2_writethrough_drain_on_idle_vote(self)
+        # NF-FOLLOWER-ROUND 1014: under the row authority the vote runs the ONE
+        # housekeeping round (the same one every frameless cycle runs; the #1272
+        # orphan collector is its prefetch drain). A refusal of the round (attn
+        # world > 1) is a named stop, not a vote on the uncollected state.
+        _round_ran = False
+        try:
+            _round_ran = weg2_follower_round(self, site="vote")
+        except FollowerRoundRefused:
+            raise
+        except Exception as exc:  # noqa: BLE001 - housekeeping may not kill the vote
+            _round_ran = True
+            logger.warning(
+                "NF-FOLLOWER-ROUND at the #1268 vote raised %r; the slot is attached "
+                "on the undrained state (which votes not-idle and names its blocker)",
+                exc,
+            )
+        if not _round_ran:
+            # e7cfda7fbe, unchanged: no row authority (or the switch is 0).
+            if getattr(self, "enable_hicache_storage", False):
+                try:
+                    self._drain_prefetch_progress()
+                except Exception as exc:  # noqa: BLE001 - a collection may not kill the vote
+                    logger.warning(
+                        "#1272 orphan collection before the idle slot raised %r; the "
+                        "slot is attached on the uncollected state (which votes "
+                        "not-idle and names its blocker, rather than sleeping)",
+                        exc,
+                    )
+            weg2_loadback_drain_on_idle_vote(self)
+            weg2_writethrough_drain_on_idle_vote(self)
+            # NF-W3-DRAIN 1014: after the write-through drain -- its acks issue the
+            # #106S sidecar backups this one retires once the store acked them.
+            weg2_backup_ack_drain_on_idle_vote(self)
         if attach_slot(vote, rank, self.is_fully_idle(), ", ".join(self.idle_blockers()) or "none"):
             log_verdict(vote, rank)
 

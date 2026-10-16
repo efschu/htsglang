@@ -107,7 +107,13 @@ MARK_QUIESCE_ABORT = "WEG2 LANE-QUIESCE-ABORT"
 
 
 def enabled() -> bool:
-    return _ln.enabled()
+    """The lane FLOOR controller runs: ``SGLANG_WEG2_LANES`` on AND ``SGLANG_WEG2_PRIO_AS_AGE`` off.  PRIO-AS-AGE 1014
+    (weg2/prio_age.py, default on): priority acts as age, so the floor never rises -- no LANE-PREEMPT, no
+    LANE-RAISE/RESUME, no LANE-WAITER-HOLD, no P-leg hold, no D lane park.  Every front hook of this controller
+    tests this function (not ``lanes.enabled()``, which still gates READING the field)."""
+    from sglang.srt.weg2 import prio_age as _pa
+
+    return _pa.floor_mode()
 
 
 def clock_t(p: Any, default: Optional[float] = None) -> float:

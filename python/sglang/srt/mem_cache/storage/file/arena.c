@@ -37,6 +37,7 @@
 #define S_COMPLETE 2u
 #define S_EVICTING 3u
 #define S_QUARANTINE 4u
+#define S_REAPING 5u     /* READ-DEPTH 1014 (port of 27B dae863c7c8 (1)): transient and private -- held by arena_reap_stale_aged / arena_free_evicting while they reset the header */
 #define TOMB (~0ULL)
 #define KV_IVALS 64      /* interval capacity for slots <= 1 MiB */
 #define BLOB_IVALS 8192  /* interval capacity for larger slots (mamba blobs) */
@@ -242,7 +243,12 @@ static int quarantine_release(uint8_t *base, uint64_t slot) {
     if (atomic_load(&sh->state) != S_QUARANTINE) return 0;
     if ((atomic_load(&sh->writers) & W_OPEN) != 0 || atomic_load(&sh->refcount) != 0) return 0;
     uint32_t expect = S_QUARANTINE;
-    if (!atomic_compare_exchange_strong(&sh->state, &expect, S_EVICTING)) return 0;
+    /* A2 B-F (nf-chainkey-a2-review-1015): the transient is the PRIVATE
+     * S_REAPING, not the public S_EVICTING -- arena_free_slots and the aged
+     * EVICTING reaper (F1) take EVICTING, and their FREE could land between
+     * the generation bump below and the FREE store, on top of the next
+     * claimer's slot. S_REAPING is skipped by both. */
+    if (!atomic_compare_exchange_strong(&sh->state, &expect, S_REAPING)) return 0;
     sh->n_ivals = 0;
     sh->generation++;
     atomic_store(&sh->writers, 0u);
@@ -603,6 +609,10 @@ int64_t arena_evict_candidates(uint8_t *base, int64_t want, int64_t *slots, uint
         /* unlink from the index (ZR-1: the cell of THIS slot, under the index lock) */
         index_unlink(base, sh->key_lo, s);
         atomic_fetch_sub(&h->n_complete, 1);
+        /* READ-DEPTH 1014: the EVICTING transition is stamped -- the reaper
+         * judges an EVICTING slot stale only by its age, never while its
+         * (live) evictor may still be copying it to disk and freeing it. */
+        atomic_store(&sh->touched_ms, mono_ms());
         slots[got] = (int64_t)s;
         klo[got] = sh->key_lo;
         khi[got] = sh->key_hi;
@@ -856,6 +866,11 @@ int64_t arena_ref_slots(uint8_t *base, int64_t n, const int64_t *slots, int32_t 
             atomic_store(&sh->clock_bit, 1);
         } else if (delta < 0) {
             if (atomic_load(&sh->refcount) > 0) atomic_fetch_sub(&sh->refcount, 1); else continue;
+            /* A2 (nf-h54-review-1015 B5): the last reference of a QUARANTINE
+             * slot with no open writer frees it now (the release the late
+             * completion does) -- before, it sat in n_claimed until the next
+             * join reap's sweep. quarantine_release re-checks both counts. */
+            if (atomic_load(&sh->state) == S_QUARANTINE) quarantine_release(base, (uint64_t)slots[i]);
         }
         done++;
     }
@@ -937,7 +952,15 @@ void arena_free_slots(uint8_t *base, int64_t n, const int64_t *slots) {
     ArenaHeader *h = hdr(base);
     for (int64_t i = 0; i < n; i++) {
         SlotHeader *sh = slot_hdr(base, (uint64_t)slots[i]);
-        uint32_t prev = atomic_exchange(&sh->state, S_FREE);
+        /* READ-DEPTH 1014: a slot the aged reaper holds (S_REAPING) is the
+         * reaper's to free -- never clobbered here (its FREE could otherwise
+         * land on top of the next claimer's CLAIMED). */
+        uint32_t prev = atomic_load(&sh->state);
+        int took = 0;
+        while (prev != S_REAPING) {
+            if (atomic_compare_exchange_weak(&sh->state, &prev, S_FREE)) { took = 1; break; }
+        }
+        if (!took) continue;
         /* xsn342: unlink the index cell (the evictor does; free did not),
          * else the next claim of this key finds a stale cell and is handed
          * a slot it does not own. */
@@ -982,23 +1005,103 @@ int64_t arena_drop_unreferenced(uint8_t *base, int64_t n, const int64_t *slots, 
     return dropped;
 }
 
-/* Reap CLAIMED slots older than `max_generation_age` writes of the clock:
- * a rank that died mid-write leaves a CLAIMED slot behind. Cheap form: a
- * CLAIMED slot whose index entry is tombstoned or missing is freed. Returns
- * the number freed. Called by the sweeper. */
-int64_t arena_reap_stale(uint8_t *base) {
+/* Reap EVICTING slots whose evictor died: a rank that died between
+ * arena_evict_candidates and arena_free_slots leaves EVICTING slots behind.
+ *
+ * READ-DEPTH 1014 (NF h16h 853534a9ff P, port of 27B dae863c7c8 (1)): EVERY
+ * process called this after its OWN eviction (HiCacheFile._arena_evict_to_disk)
+ * and freed every EVICTING slot with refcount 0 AT ONCE -- including the
+ * candidates another LIVE process (PP0/PP1/PP2 fill one P arena) was still
+ * copying to disk. The next L3 fill claimed such a slot fresh (the reap did
+ * not move the generation), the live evictor's own arena_free_slots then freed
+ * the fill's claim (generation++), and the fill's completion came back 3:
+ * 'L3-FILL LATE-COMPLETE REFUSED statuses=[3]' -- PP0 22:30:02 (weg2-51-579,
+ * landed=300 of 1556), PP1 22:47:16 (weg2-68-683, 770 slots, PP0/PP1 landed 0),
+ * PP0+PP2 22:59:50 (weg2-78-784, 263 slots on PP0, landed=761 of 1148). Each
+ * refused completion ends that stage's prefix walk, rank by rank; the stem's
+ * index cell went with the free, so a joiner polled a vanished stem for the
+ * 5-s JOIN-WAIT. The evictor also copied the slot's NEW bytes to the OLD
+ * stem's L3 file when that page was not on disk yet.
+ * Now only a slot EVICTING for at least `min_age_ms` (stamped at the
+ * transition) is stale; it is taken privately (S_REAPING) and the generation
+ * moves on, so a late completion on it is refused. Returns the number freed. */
+int64_t arena_reap_stale_aged(uint8_t *base, int64_t min_age_ms) {
     ArenaHeader *h = hdr(base);
+    uint32_t now = mono_ms();
     int64_t freed = 0;
     for (uint64_t s = 0; s < h->slots; s++) {
         SlotHeader *sh = slot_hdr(base, s);
         if (atomic_load(&sh->state) != S_EVICTING) continue;
         if (atomic_load(&sh->refcount) != 0) continue;
-        /* an EVICTING slot nobody freed: its evictor died */
+        uint32_t t = atomic_load(&sh->touched_ms);
+        if (min_age_ms > 0 && (uint32_t)(now - t) < (uint32_t)min_age_ms) continue;
+        uint32_t expect = S_EVICTING;
+        if (!atomic_compare_exchange_strong(&sh->state, &expect, S_REAPING)) continue;
+        if (atomic_load(&sh->touched_ms) != t || atomic_load(&sh->refcount) != 0) {
+            atomic_store(&sh->state, S_EVICTING);
+            continue;
+        }
+        /* an EVICTING slot nobody freed for min_age_ms: its evictor died */
         sh->key_lo = 0; sh->key_hi = 0;
+        sh->generation++;
         atomic_store(&sh->state, S_FREE);
         freed++;
     }
     return freed;
+}
+
+/* ARENA-FREE-GEN (READ-DEPTH 1014, second guard beside the aged reap): the
+ * generation of each slot, read by the evictor right after
+ * arena_evict_candidates (its candidates are EVICTING: nobody but an aged
+ * reaper moves them). */
+int64_t arena_slot_gens(uint8_t *base, int64_t n, const int64_t *slots, int64_t *gens) {
+    ArenaHeader *h = hdr(base);
+    for (int64_t i = 0; i < n; i++) {
+        gens[i] = -1;
+        if (slots[i] < 0 || (uint64_t)slots[i] >= h->slots) continue;
+        gens[i] = (int64_t)slot_hdr(base, (uint64_t)slots[i])->generation;
+    }
+    return n;
+}
+
+/* ARENA-FREE-GEN: an evictor frees ITS candidates only -- a slot still
+ * EVICTING under the generation it was chosen in. A slot reaped (generation
+ * moved, FREE/REAPING) or re-claimed since (CLAIMED/COMPLETE under a new
+ * owner) is never freed by the old evictor: the h16h death 01:09:10
+ * (ArenaChainMismatch bad=47 'key slot -1 (state 0)') was arena_free_slots
+ * freeing a COMPLETE, referenced page of PP0 that sat in a slot the live
+ * evictor still had on its list. The slot is taken privately (S_REAPING)
+ * while its header is reset, then FREE. status per slot: 1 = freed,
+ * 2 = generation moved (refused), 3 = not EVICTING any more (refused),
+ * 0 = bad slot. Returns the number freed. */
+int64_t arena_free_evicting(uint8_t *base, int64_t n, const int64_t *slots, const int64_t *gens,
+                            int8_t *status) {
+    ArenaHeader *h = hdr(base);
+    int64_t freed = 0;
+    for (int64_t i = 0; i < n; i++) {
+        status[i] = 0;
+        if (slots[i] < 0 || (uint64_t)slots[i] >= h->slots) continue;
+        SlotHeader *sh = slot_hdr(base, (uint64_t)slots[i]);
+        if ((int64_t)sh->generation != gens[i]) { status[i] = 2; continue; }
+        uint32_t expect = S_EVICTING;
+        if (!atomic_compare_exchange_strong(&sh->state, &expect, S_REAPING)) { status[i] = 3; continue; }
+        if ((int64_t)sh->generation != gens[i]) { atomic_store(&sh->state, S_EVICTING); status[i] = 2; continue; }
+        /* the evictor unlinked the index cell and took the slot out of
+         * n_complete (arena_evict_candidates); the key words go, the
+         * generation moves so a late completion on it is refused */
+        sh->key_lo = 0; sh->key_hi = 0;
+        sh->generation++;
+        atomic_store(&sh->state, S_FREE);
+        status[i] = 1;
+        freed++;
+    }
+    return freed;
+}
+
+/* the historical entry point: the default stale age */
+#define ARENA_REAP_STALE_MS 60000
+int64_t arena_reap_stale(uint8_t *base) {
+    return arena_reap_stale_aged(base, ARENA_REAP_STALE_MS);
 }
 
 /* #231 (rc12m-dpr 09271152, P mamba arena 32 slots): a slot is COMPLETE only
@@ -1039,7 +1142,17 @@ int64_t arena_reap_partial(uint8_t *base, int64_t min_age_ms, int64_t *out, int6
          * in the same call and is never taken here */
         if ((w >> 16) == 0 || (w & W_OPEN) != 0) continue;
         uint32_t t = atomic_load(&sh->touched_ms);
-        if ((uint32_t)(now - t) < (uint32_t)min_age_ms) continue;
+        /* ARENAFULL-1015 (NF h16n boot 070103, mamba arena of 32 slots: 'claimed=1
+         * oldest=slot 20/274319ms/pid788/host-write/g1/open0', D saw the same claim
+         * 241 s old): the age was read off touched_ms, which EVERY JOIN refreshes --
+         * a reader that joins the stem, waits and gives the claim up again (open
+         * back to 0) kept the orphan young for ever, and it blocked every fill of
+         * its stem. With no writer open nobody can still merge a byte: the age is
+         * the time without BYTE progress (progress_ms: the fresh claim or the last
+         * merge), the clock the census names. touched_ms stays the race guard
+         * below (a join between this read and the CAS moves it). */
+        uint32_t p = atomic_load(&sh->progress_ms);
+        if ((uint32_t)(now - p) < (uint32_t)min_age_ms) continue;
         uint32_t expect = S_CLAIMED;
         if (!atomic_compare_exchange_strong(&sh->state, &expect, S_EVICTING)) continue;
         if (atomic_load(&sh->refcount) != 0 || atomic_load(&sh->writers) != w
@@ -1109,6 +1222,10 @@ int64_t arena_unclaim(uint8_t *base, int64_t n, const int64_t *slots, const int6
         if ((int64_t)sh->generation != gens[i]) continue;
         writer_done(sh);
         free_if_abandoned(base, (uint64_t)slots[i]);
+        /* A2 (nf-h54-review-1015 B5): a join given up on a QUARANTINE slot was
+         * its last open writer -- the slot goes now if nobody references it
+         * (the release the late completion does), not at the next sweep */
+        quarantine_release(base, (uint64_t)slots[i]);
         done++;
     }
     return done;
@@ -1140,6 +1257,18 @@ int64_t arena_release_claims(uint8_t *base, int64_t n, const int64_t *slots, con
         if ((int64_t)sh->generation != gens[i]) continue;
         uint32_t st = atomic_load(&sh->state);
         if (st == S_COMPLETE) { writer_done(sh); status[i] = 1; continue; }
+        if (st == S_QUARANTINE) {
+            /* A2 (nf-h54-review-1015 B5): the claim was taken from its key
+             * (H54 take-over / JOIN-IDLE reap) before this writer gave it up.
+             * The writer is resolved like a late completion (writer_done; the
+             * last one out frees it when nobody references it) -- before, it
+             * stayed open until the sweep's backstop. Never a hard free here:
+             * other writers and readers may still hold the slot. */
+            writer_done(sh);
+            quarantine_release(base, (uint64_t)slots[i]);
+            status[i] = 1;
+            continue;
+        }
         if (st != S_CLAIMED) continue;
         uint32_t w = atomic_load(&sh->writers);
         if ((w >> 16) > 1u) {
@@ -1497,6 +1626,61 @@ int64_t arena_quarantine_stale(uint8_t *base, int64_t n, const int64_t *slots, c
         sh->key_lo = 0; sh->key_hi = 0;
         atomic_store(&sh->touched_ms, now);   /* quarantine start, for the backstop */
         quarantine_release(base, (uint64_t)slots[i]);   /* nobody open: free at once */
+        status[i] = 1;
+        done++;
+    }
+    return done;
+}
+
+/* ------------------------------------------------------------------------
+ * H54 PARK-JOIN 1015 (NF h16h 853534a9ff, boots 1014_211215 / 1015_011215:
+ * 16 of 16 JOIN-WAIT tears 3-45 s after a park / wake, 67-100k tokens each;
+ * every claim census that names the held claims names role host-write, open0
+ * -- pid857 = P PP0, pid2659 = D TP0). A HOST-WRITE claim completes only when
+ * EVERY writer of the page merged its extents (P: one layer shard per PP
+ * stage; D Form A: the token owners TP1/TP2, TP0 claims share 0). Each writer
+ * decides its own backup (a refused claim, a dropped write, a dormant group),
+ * and each writer that merged keeps a reader reference on the partial slot
+ * (ArenaMHAHostPool.complete_write references status <= 2, partial included).
+ * Such a claim is CLAIMED for good: arena_quarantine_stale answers 3
+ * (referenced) for as long as a writer's node lives and 0 (young) while late
+ * extents trickle in -- the JOIN-IDLE reap and the SELF-JOIN take-over both
+ * refuse, and the reader's prefix ends at the claim although L3 holds every
+ * byte of the page.
+ * This entry takes such a claim away from its KEY regardless of references
+ * and byte progress -- only a host-write claim of the caller's generation:
+ * the index cell is unlinked (the next claim of the stem gets a fresh slot,
+ * which the reader fills from L3), the old slot keeps generation, writers and
+ * references and is QUARANTINE -- never freed while referenced or written
+ * (quarantine_release, quarantine_sweep), a late completion answers 6 (named
+ * by the writer, bytes discarded, no reference taken), a reference request
+ * on it is refused (arena_ref_slots takes COMPLETE / CLAIMED only).
+ * status per slot: 1 quarantined, 2 generation moved / not CLAIMED,
+ * 4 not a host-write claim (left alone).
+ * ------------------------------------------------------------------------ */
+#define ROLE_HOST_WRITE_C 2u
+int64_t arena_quarantine_host_write(uint8_t *base, int64_t n, const int64_t *slots, const int64_t *gens,
+                                    int8_t *status) {
+    ArenaHeader *h = hdr(base);
+    uint32_t now = mono_ms();
+    int64_t done = 0;
+    for (int64_t i = 0; i < n; i++) {
+        status[i] = 2;
+        if (slots[i] < 0 || (uint64_t)slots[i] >= h->slots) continue;
+        SlotHeader *sh = slot_hdr(base, (uint64_t)slots[i]);
+        if ((int64_t)sh->generation != gens[i]) continue;
+        if (atomic_load(&sh->state) != S_CLAIMED) continue;
+        if (sh->owner_role != ROLE_HOST_WRITE_C) { status[i] = 4; continue; }
+        uint32_t expect = S_CLAIMED;
+        if (!atomic_compare_exchange_strong(&sh->state, &expect, S_QUARANTINE)) continue;
+        if ((int64_t)sh->generation != gens[i]) {
+            atomic_store(&sh->state, S_CLAIMED);   /* moved under us: leave it */
+            continue;
+        }
+        index_unlink(base, sh->key_lo, (uint64_t)slots[i]);
+        sh->key_lo = 0; sh->key_hi = 0;
+        atomic_store(&sh->touched_ms, now);   /* quarantine start, for the backstop */
+        quarantine_release(base, (uint64_t)slots[i]);   /* nobody open, nobody holding: free at once */
         status[i] = 1;
         done++;
     }

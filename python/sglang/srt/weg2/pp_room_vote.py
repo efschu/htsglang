@@ -25,19 +25,9 @@ allocated). ``payable`` is what ONE peel can pay without knowing the wall: a
 post-order walk (:func:`estimate_payable`) that pays a device node only when every
 device child is paid and the node itself can leave -- backed (demote), backed up
 into the host room still free (:func:`backup_room_tokens`: on an arena-bound pool
-its FREE slots, PR-ARENA int22), spilled to L3 and dropped without a claim
-(ROOM-VOTE 1011), or dropped on the local-PP floor (UD/UD-H: no write-through in
-flight, host-only children clearable); a locked node or an unpayable child stops
-its whole chain. HOW a node leaves is decided by ONE function the peel asks too
-(``pp_slot_fidelity.device_exit_route``), and whether a node's children let it be
-dropped is carried up the walk (``clr``: a demoted, host-locked child is NOT
-clearable). WHAT THIS DOES NOT CLOSE: the walk reads the tree at the PASS TOP; a host
-lock or an in-flight write that appears later in the same pass (the load-back takes its
-own ``inc_host_lock_ref`` before ``local_pp_room``) is invisible to it and the peel then
-pays less than the vote said -- ``AgreedRoomShort`` stays the stop, and its message now
-carries the vote's payable next to a fresh walk (``vote_diagnostic``). Whether that
-window is what killed int24e 09:39:42Z is UNBELEGT (see pp_slot_fidelity, ROOM-VOTE 1011).
-The room is capped by PW's measured wall
+its FREE slots, PR-ARENA int22), or dropped on the local-PP floor (UD/UD-H: no
+write-through in flight, host-only children clearable); a locked node or an
+unpayable child stops its whole chain. It is capped by PW's measured wall
 (``payable_evictable_or``). The walk is O(nodes) (86 nodes on PP2 at 13:37:49) and
 its time rides the fact (``sim_us``).
 
@@ -84,6 +74,10 @@ class Weg2PpRoomFact(msgspec.Struct, frozen=True):
     payable: int
     reported: int
     sim_us: float = 0.0
+    #: ``forward_iter`` of the newest pass whose RESULT this stage has processed (``process_batch_result``: its rows are
+    #: freed / its finish applied). ``executed`` counts forwards; this counts consumed results, the event that releases the
+    #: rows a finishing request locked (review A1 of the intake fix). Wire-compatible: -1 = a sender without it.
+    processed: int = -1
 
 
 class Weg2PpRoomFactLane(Weg2PpRoomFact, frozen=True):
@@ -110,24 +104,50 @@ def _locked(node) -> bool:
     return any(cd.lock_ref > 0 for cd in node.component_data)
 
 
-def estimate_payable(tree, *, local_floor: bool, host_free: int, trace: Optional[list] = None) -> int:
+def _remnant_clearable(node, state: Dict[int, Tuple[int, bool, bool]]) -> bool:
+    """A node that STAYS in the tree as a host-only node after the peel (or already is one) and that UD-H may remove
+    from the host: backed, no device/host lock, every child clearable too (``_ud_clear_host_children``'s all-or-nothing
+    test, taken on every descendant)."""
+    if any(cd.lock_ref > 0 or cd.host_lock_ref > 0 for cd in node.component_data):
+        return False
+    return all(state.get(id(c), (0, False, False))[2] for c in node.children.values())
+
+
+def _host_clearable(node, state: Dict[int, Tuple[int, bool, bool]]) -> bool:
+    """A host-only node UD-H may remove: backed, no device/host lock, every
+    child clearable (``_ud_clear_host_children``'s all-or-nothing test)."""
+    if not node.evicted or not node.backuped:
+        return False
+    return _remnant_clearable(node, state)
+
+
+def estimate_payable(tree, *, local_floor: bool, host_free: int) -> int:
     """Device tokens ONE peel can pay (see the module docstring).
 
-    ``trace`` (diagnostics only, never read by the walk): a list the walk appends
-    ``(node id, tokens, reason)`` to for every device node that is NOT paid or is paid
-    but not clearable afterwards.
+    THE PEEL'S ORDER IS THE MODEL (fix 43, NF 13.10. 11:59:14Z). The peel takes device leaves first; a leaf that is
+    backed (or backs up into the host room still free) is DEMOTED -- it stays in the tree as a host-only node -- and a
+    write_back leaf the arena refuses is DROPPED on the local-PP floor, which needs every host-only child below it
+    removable by UD-H (``_ud_clear_host_children``: any lock below leaves the subtree untouched) and no write-through
+    in flight. So a device child that the peel DEMOTES is, one step later, a HOST child of its parent -- and the
+    parent's drop depends on it being host-removable. The walk used to test that only for children that were host-only
+    already: leaf [6193] (135872 rows, un-backable) had two device children [6194]/[6195] that the tail write-through
+    had just backed; with no host child at walk time ``all([])`` was True and 135872 counted payable, while the real peel
+    demoted the two children first, found them host-locked (the held end anchor), could not clear them and paid 320 of
+    3200 -> ``Prefill out of memory``. Each node now carries ``(paid, ok, clear)``: ``clear`` is whether what it
+    leaves behind (nothing when dropped, a host node when demoted) is removable by its parent's UD-H."""
+    state = payable_state(tree, local_floor=local_floor, host_free=host_free)
+    root = tree.root_node
+    return sum(state[id(c)][0] for c in root.children.values() if id(c) in state)
 
-    ROOM-VOTE 1011: how a node leaves is NOT decided here. Every device node asks
-    ``pp_slot_fidelity.device_exit_route`` -- the function the peel asks too
-    (``UnifiedRadixCache._evict_device_leaf``): backed (demote), spilled to L3
-    (drop without a claim), a claim priced by the host room still free, the UD
-    drop. Per node the walk keeps ``(paid, ok, clr)``: tokens paid in its subtree,
-    whether the node itself can leave, and whether it is gone or a clearable
-    host-only node afterwards (what its parent's UD / L3 drop needs of it)."""
+
+def payable_state(tree, *, local_floor: bool, host_free: int) -> Dict[int, Tuple[int, bool, bool]]:
+    """The walk of :func:`estimate_payable`, per node: ``{id(node): (paid, ok, clear)}`` -- ``paid`` the device
+    tokens one peel pays in the node's subtree, ``ok`` whether the node itself leaves the device, ``clear`` whether
+    what it leaves behind is removable by its parent's UD-H. ARENAFULL-1015: the W3 spill reads ``clear`` of a
+    candidate's children to keep the candidate payable (``W3-KEEP-PAYABLE``)."""
     from sglang.srt.mem_cache.unified_cache_components.tree_component import (
         BASE_COMPONENT_TYPE as ct,
     )
-    from sglang.srt.weg2 import pp_slot_fidelity as sf
 
     root = tree.root_node
     cc = getattr(tree, "cache_controller", None)
@@ -143,43 +163,34 @@ def estimate_payable(tree, *, local_floor: bool, host_free: int, trace: Optional
     for n in reversed(order):  # children before their parent
         if n is root:
             continue
-        kids = list(n.children.values())
-        children_clr = all(state[id(c)][2] for c in kids)
         value = n.component_data[ct].value
         if value is None:
-            clr = sf.host_node_local_ok(n) and children_clr
-            state[id(n)] = (0, clr, clr)
+            hc = _host_clearable(n, state)
+            state[id(n)] = (0, hc, hc)
             continue
-        dev = [c for c in kids if c.component_data[ct].value is not None]
-        host = [c for c in kids if c.component_data[ct].value is None]
+        dev = [c for c in n.children.values() if c.component_data[ct].value is not None]
         paid = sum(state[id(c)][0] for c in dev)
         if _locked(n) or not all(state[id(c)][1] for c in dev):
             state[id(n)] = (paid, False, False)
-            if trace is not None:
-                trace.append((getattr(n, "id", "?"), len(value),
-                              "device_locked" if _locked(n) else "child_unpaid"))
             continue
         tokens = len(value)
-        route = sf.device_exit_route(
-            n, write_back=write_back, local_floor=local_floor, ongoing=ongoing, host_room=budget,
-            children_clearable=children_clr, surviving_children=bool(host), tokens=tokens)
-        if route == sf.ROUTE_BACKUP:
+        demoted = False
+        if n.backuped:
+            ok, demoted = True, True
+        elif write_back and budget >= tokens:
             budget -= tokens
-        if route is None:
-            state[id(n)] = (paid, False, False)
-            if trace is not None:
-                trace.append((getattr(n, "id", "?"), tokens, sf.route_refusal(
-                    n, write_back=write_back, local_floor=local_floor, ongoing=ongoing,
-                    children_clearable=children_clr, surviving_children=bool(host))))
-        elif route in sf.DROP_ROUTES:
-            state[id(n)] = (paid + tokens, True, True)  # gone: nothing hangs below it
-        else:  # demoted / backed up: a host-only node afterwards
-            clr = sf.demoted_node_clearable(n, children_clr)
-            state[id(n)] = (paid + tokens, True, clr)
-            if trace is not None and not clr:
-                trace.append((getattr(n, "id", "?"), tokens, "paid_not_clearable:" + (
-                    "host_locked" if sf.node_host_locked(n) else "children_not_clearable")))
-    return sum(state[id(c)][0] for c in root.children.values() if id(c) in state)
+            ok, demoted = True, True
+        elif write_back:
+            # UD / UD-H: the drop needs every child it will have AFTER the peel -- the host children it has now and the
+            # device children the peel demotes first -- removable from the host
+            ok = (local_floor and getattr(n, "id", None) not in ongoing
+                  and all(state[id(c)][2] for c in n.children.values()))
+        else:
+            ok = not [c for c in n.children.values() if c.component_data[ct].value is None]
+        # what this node leaves behind for ITS parent's UD-H: nothing when dropped, a backed host node when demoted
+        clear = (_remnant_clearable(n, state) if demoted else True) if ok else False
+        state[id(n)] = (paid + (tokens if ok else 0), ok, clear)
+    return state
 
 
 def backup_room_tokens(pool) -> int:
@@ -222,7 +233,7 @@ def backup_room_tokens(pool) -> int:
 
 
 def follower_fact(*, tree, allocator, rank: int, executed: int, local_floor: bool,
-                  lane_floor: int = -1, lane_epoch: int = -1) -> Weg2PpRoomFact:
+                  lane_floor: int = -1, lane_epoch: int = -1, processed: int = -1) -> Weg2PpRoomFact:
     from sglang.srt.mem_cache.common import payable_evictable_or
 
     available = int(allocator.available_size())
@@ -234,60 +245,27 @@ def follower_fact(*, tree, allocator, rank: int, executed: int, local_floor: boo
     walked = estimate_payable(tree, local_floor=local_floor, host_free=host_free)
     sim_us = (time.perf_counter() - t0) * 1e6
     payable = max(0, min(walked, walled))
-    note_vote(tree, payable)  # diagnostics: what the AgreedRoomShort stop compares a fresh walk to
     if int(lane_epoch) >= 0:
         return Weg2PpRoomFactLane(rank=int(rank), executed=int(executed), room=available + payable,
                                   available=available, payable=payable, reported=reported, sim_us=sim_us,
+                                  processed=int(processed),
                                   lane_floor=int(lane_floor), lane_epoch=int(lane_epoch))
     return Weg2PpRoomFact(rank=int(rank), executed=int(executed), room=available + payable,
-                          available=available, payable=payable, reported=reported, sim_us=sim_us)
-
-
-#: tree attribute: the payable PP0/follower measured at this pass's top (diagnostics)
-VOTE_PAYABLE_ATTR = "weg2_pp_room_vote_payable"
-
-
-def note_vote(tree, payable: int) -> None:
-    """Remember what this pass's vote counted as payable, for ``vote_diagnostic``."""
-    try:
-        setattr(tree, VOTE_PAYABLE_ATTR, int(payable))
-    except Exception:  # noqa: BLE001 -- a slotted double
-        pass
-
-
-def vote_diagnostic(tree, limit: int = 6) -> str:
-    """Text for the AgreedRoomShort stop: the payable the vote counted at the pass top next
-    to a FRESH walk of the tree as it is now, and the nodes the fresh walk refuses (id:tokens:
-    reason). A vote far above the fresh walk is the pass-top-to-peel window (a host lock or
-    an in-flight write that appeared after the vote); equal numbers point elsewhere. Never
-    raises: the stop it decorates must stay the stop."""
-    try:
-        from sglang.srt.weg2.pp_slot_fidelity import FLOOR_LOCAL_PP_ATTR
-
-        cc = getattr(tree, "cache_controller", None)
-        host_free = backup_room_tokens(getattr(cc, "mem_pool_host", None) if cc is not None else None)
-        trace: list = []
-        now = estimate_payable(tree, local_floor=bool(getattr(tree, FLOOR_LOCAL_PP_ATTR, False)),
-                               host_free=host_free, trace=trace)
-        vote = getattr(tree, VOTE_PAYABLE_ATTR, None)
-        shown = ",".join("%s:%s:%s" % t for t in trace[:int(limit)])
-        return (f" vote_payable={vote if vote is not None else 'unknown'} walk_now={now} "
-                f"host_free_now={host_free} unpaid=[{shown}]"
-                f"{'+%d more' % (len(trace) - int(limit)) if len(trace) > int(limit) else ''}")
-    except Exception as e:  # noqa: BLE001
-        return f" vote_diagnostic_failed={type(e).__name__}"
+                          available=available, payable=payable, reported=reported, sim_us=sim_us,
+                          processed=int(processed))
 
 
 class FollowerSender:
     """Sends a fact when it changed, else at most every ``RESEND_S``."""
 
     def __init__(self) -> None:
-        self.last: Optional[Tuple[int, int]] = None
+        self.last: Optional[Tuple[int, int, int]] = None
         self.last_t = 0.0
         self.pending: Optional[Weg2PpRoomFact] = None
 
     def offer(self, fact: Weg2PpRoomFact, now: float) -> bool:
-        key = (fact.room, fact.executed)
+        # ``processed`` is part of the key: a consumed result that moves no room is still news to PP0 (review A1).
+        key = (fact.room, fact.executed, fact.processed)
         if key == self.last and now - self.last_t < RESEND_S:
             return False
         self.pending = fact
@@ -299,7 +277,7 @@ class FollowerSender:
             return False
         if not channel.send_nowait(self.pending):
             return False
-        self.last = (self.pending.room, self.pending.executed)
+        self.last = (self.pending.room, self.pending.executed, self.pending.processed)
         self.last_t = now
         self.pending = None
         return True
@@ -363,6 +341,42 @@ class RoomBook:
                 self.facts[int(f.rank)] = (f, self.pass_no)
                 n += 1
         return n
+
+    def unprocessed(self, picked_up_ct: int) -> List[Tuple[int, int]]:
+        """``[(rank, processed)]`` -- every follower whose FRESH fact has not yet processed the pass PP0 picked up last.
+
+        The ring-wide half of "does something still run" (review A1 of the intake fix). PP0 consumed pass ``picked_up_ct``
+        (``forward_iter``); a follower whose newest fact stands below it has not applied that result, so the rows the pass
+        locked are still locked there and its room is the room from BEFORE the pass. The event that ends it is the follower's
+        own next fact (``processed >= picked_up_ct``): no timer, no threshold. A follower without a fresh fact counts as
+        nothing (a silent one must not hold PP0 for ever; the book's own ageing, ``FACT_MAX_AGE_PASSES``, is the way out), and
+        so does a sender without the field (``processed == -1``). Reads only."""
+        out: List[Tuple[int, int]] = []
+        if int(picked_up_ct) < 0:
+            return out
+        for rank, (f, seen) in sorted(self.facts.items()):
+            if self.pass_no - seen > FACT_MAX_AGE_PASSES:
+                continue
+            p = int(getattr(f, "processed", -1))
+            if p >= 0 and p < int(picked_up_ct):
+                out.append((int(rank), p))
+        return out
+
+    def cap_source(self) -> str:
+        """Where PP0's current cap came from, for ``WEG2 INTAKE-RESUMED``: ``fact(rank,executed,processed)`` of the binding
+        fresh follower fact, ``aged`` (facts exist, none fresh), ``own_only`` / ``none`` (no follower fact at all; the caller
+        tells the two apart by the cap itself). Reads only."""
+        if not self.facts:
+            return "own_only"
+        best = None
+        for rank, (f, seen) in sorted(self.facts.items()):
+            if self.pass_no - seen > FACT_MAX_AGE_PASSES:
+                continue
+            if best is None or int(f.room) < int(best.room):
+                best = f
+        if best is None:
+            return "aged"
+        return f"fact({int(best.rank)},{int(best.executed)},{int(getattr(best, 'processed', -1))})"
 
     def cap(self, own_room: Optional[int] = None) -> Optional[CapVerdict]:
         """R_m = MIN(PP0's own payable room now, each fresh follower fact minus

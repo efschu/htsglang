@@ -43,6 +43,17 @@ logger = logging.getLogger(__name__)
 
 
 _STATE_LOAD_N = 0
+_BYPASS_N = [0]
+
+#: ANCHOR-BYPASS (14.10.): an anchor blob the mamba arena has no slot for is
+#: read from L3 into a host staging row instead of being a miss. Unset = on;
+#: 0/false/no/off = the arena-only read (a full arena is a miss after the wait).
+ENV_ANCHOR_BYPASS = "SGLANG_WEG2_MAMBA_ANCHOR_BYPASS"
+
+
+def anchor_bypass_on(env=None) -> bool:
+    env = os.environ if env is None else env
+    return str(env.get(ENV_ANCHOR_BYPASS, "1") or "1").strip().lower() not in ("0", "false", "no", "off")
 
 
 def _arena_state_load_block_bytes() -> int:
@@ -308,6 +319,7 @@ class ArenaMambaPoolHost(MambaPoolHost):
     _evict_for_claim = ArenaMHAHostPool._evict_for_claim     # H81: the claim's room, no disk I/O
     release_tree_rows = ArenaMHAHostPool.release_tree_rows   # H81: the tree reset's release
     complete_write = ArenaMHAHostPool.complete_write
+    take_lost_slots = ArenaMHAHostPool.take_lost_slots   # A2: the anchors a late ack lost
     abort_write = ArenaMHAHostPool.abort_write
     _slots_of = ArenaMHAHostPool._slots_of
     # xsn356: the borrowed _claim/complete_write/abort_write call these too
@@ -464,16 +476,48 @@ class ArenaMambaPoolHost(MambaPoolHost):
         found = self.arena.find_slots(stems)
         out = []
         for i, (slot, state) in enumerate(found):
+            bypass_row = None
             if slot < 0 or state != 2:
                 # #1433: the L3 return path -- a blob on disk is read straight
                 # into a fresh slot and completed.
                 fill = getattr(backend, "arena_fill_from_disk", None)
-                f = fill(self.arena, [stems[i]], int(self._page_bytes))[0] if callable(fill) else None
+                if callable(fill):
+                    # ANCHOR-BYPASS: with a staging row in hand the fill does
+                    # not wait for arena room -- a FULL arena reads past it
+                    bypass_row = self._bypass_row()
+                    try:
+                        f = fill(self.arena, [stems[i]], int(self._page_bytes),
+                                 room_wait=bypass_row is None)[0]
+                    except TypeError:  # a backend without the switch
+                        f = fill(self.arena, [stems[i]], int(self._page_bytes))[0]
+                else:
+                    f = None
                 if f is not None:
                     slot, state = f, 2
             if slot >= 0 and state == 2 and self.arena.ref_slots([slot], +1) == 1:
+                if bypass_row is not None:
+                    super().free(bypass_row)
                 host_indices[i] = self.staging_rows + slot
                 out.append(True)
+            elif bypass_row is not None:
+                # ANCHOR-BYPASS (NF h13 84e787ec96, D TP0 14:16:17, weg2-10-82):
+                # the 32-slot mamba arena was full of the lane-held requests'
+                # PARK anchors (PARK-DEMOTE pool=anchor, DISPLACE why=park_first);
+                # every lane resume waited the 5 s ROOM-WAIT (rounds=196,
+                # claimed=0), D's store vote was 0 (X-GATE store=0 W31) and the
+                # request went to P for a full prefill although its 921 KV pages
+                # AND its anchor were on disk. The blob is read from L3 straight
+                # into a host STAGING row (the pre-arena row path: this rank's
+                # extents via HiCacheFile.get -> _get_canonical_slice) -- None =
+                # the per-key read of the caller fills it; a failed read releases
+                # the row with the transfer's host indices like any miss.
+                host_indices[i] = int(bypass_row[0])
+                _BYPASS_N[0] += 1
+                if _BYPASS_N[0] <= 16 or _BYPASS_N[0] % 256 == 0:
+                    logger.info("WEG2 ANCHOR-BYPASS n=%d stem=%s row=%d (the mamba arena had no slot: "
+                                "the anchor blob is read from L3 into a host staging row)",
+                                _BYPASS_N[0], stems[i][:24], int(bypass_row[0]))
+                out.append(None)
             else:
                 # #1427d (xsn190): NOT in the arena = an honest miss, exactly
                 # as the KV pages (#1424 `_arena_page_get`): the arena is the
@@ -483,6 +527,16 @@ class ArenaMambaPoolHost(MambaPoolHost):
                 # still writing) -- the prefix is recomputed, nothing crashes.
                 out.append(False)
         return out
+
+    def _bypass_row(self):
+        """ANCHOR-BYPASS: one free host staging row (the pre-arena row path),
+        or None (switch off, or every staging row in use)."""
+        if not anchor_bypass_on():
+            return None
+        try:
+            return super().alloc(1)
+        except Exception:  # noqa: BLE001 - no row, the old miss
+            return None
 
     # -- transfers -------------------------------------------------------------------
     def _split(self, host_indices: torch.Tensor):

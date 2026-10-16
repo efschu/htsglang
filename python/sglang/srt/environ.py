@@ -807,13 +807,65 @@ class Envs:
     # first miss, so one JOINED page cut a 1070-page prefix at 146 (the rest
     # re-prefilled). Only on the prefetch io threads (hicache-prefetch-io-<k>);
     # the scheduler, flip and decode threads never wait. 0 = the pre-0930 form.
-    SGLANG_WEG2_L3FILL_JOIN_WAIT_MS = EnvInt(300)
+    # 5000 (user 14.10. ~13:40Z: "cache zurueckholen ist 100x effizienter als neu rechnen"; NF h10 13:25:02
+    # weg2-4-82: 3 joined stems at the head of a 1024-page fill gave bound_ms=300 and cut a 127k prefix at 19k,
+    # 108k re-prefilled ~25 s against ~1 s of read). The wait is NOT a budget for a live writer: it ends the moment
+    # the writer completes, and only a writer that stopped is cut -- at the stale-claim age
+    # (L3FILL_STALE_CLAIM_S, 5 s), the one rule for 'this writer is dead'. Floor = cap = that age.
+    SGLANG_WEG2_L3FILL_JOIN_WAIT_MS = EnvInt(5000)
+    # STORE-SHORT (NF h6 11:17:38, weg2-4-17): a claimer fills its whole
+    # batch and completes it at once -- 385 stems took 460 ms (837 pages/s
+    # under the read storm), so a flat 300 ms ended the prefix 160 ms early.
+    # The wait is priced on the joined stems: max(JOIN_WAIT_MS, stems x
+    # PER_PAGE_MS), at most JOIN_WAIT_MAX_MS. A dead or stalled writer is
+    # still cut by L3FILL_STALE_CLAIM_S. PER_PAGE_MS=0 = the flat form.
+    SGLANG_WEG2_L3FILL_JOIN_WAIT_PER_PAGE_MS = EnvFloat(2.0)
+    SGLANG_WEG2_L3FILL_JOIN_WAIT_MAX_MS = EnvInt(5000)
+    # ROOM-WAIT (NF h8 12:04:14, weg2-0-10): an L3 -> L2 fill whose stems find
+    # the shared arena FULL (every slot referenced by a read or pinned by a
+    # running load-back) evicts + claims again every 25 ms for at most this
+    # long instead of ending the prefix there. Prefetch io threads only.
+    # 0 = the pre-1014 form (the prefix ends at the first FULL stem).
+    SGLANG_WEG2_L3FILL_ROOM_WAIT_MS = EnvInt(5000)  # 14.10.: as the join wait -- reading beats re-prefilling; a stuck arena is cut at the stale age
+    # READ-ROOM 1015 (NF h16p, user order 15.10.: zero avoidable tokens; boots ..._226aad7105_1015_*, P, 46 PP0
+    # ``WEG2-READ-DEPTH cause=arena_full`` cuts, weg2-4-25 12:52:35: 977 stems, claimed=0 after the 5 s room
+    # wait, ``tree=6478 tree_in_use=0``): a fill that finds the arena FULL after the clock posts its need next
+    # to the arena; every PP rank's scheduler (check_hicache_events) hands back L3-backed tree copies
+    # (``_w3_arena_spill``) for the deficit. Default ON; 0 = the old fill (no post, the 5 s room wait).
+    # READ_ROOM_WAIT_MS = the room wait's idle bound while the request is armed (more than three scheduler rounds
+    # of a 2-3 s chunk forward, below the told Frist cap of 12 s so a wait never outlives the group's patience);
+    # REPOST_MS = pace of a fill's repeated posts.
+    SGLANG_WEG2_READ_ROOM = EnvBool(True)
+    SGLANG_WEG2_READ_ROOM_WAIT_MS = EnvInt(10000)
+    SGLANG_WEG2_READ_ROOM_REPOST_MS = EnvInt(1500)
     # L3FILL_STALE_CLAIM_S (L3FILL-JOINED (3), 30.09.): a claim whose writer is
     # alive but delivered no byte for this long is taken from its key
     # (arena_quarantine_stale, generation-safe: a late completion of the old
     # writer is refused by name, status 6) and the fill claims the stem fresh.
     # y4a: 29 stems JOINED for >= 6 s blocked D and P. 0 = never.
     SGLANG_WEG2_L3FILL_STALE_CLAIM_S = EnvFloat(5.0)
+    # JOIN-LIVENESS (NF h16 15:34:27-32, weg2-10-86): the JOIN / ROOM waits
+    # follow progress -- a completed stem or a claim taken over restarts the
+    # idle clock; nothing moving for max(bound, STALE_CLAIM_S) ends the wait
+    # (the stale reap then breaks the claim and reads the page itself);
+    # JOIN_CAP_S is the emergency brake. 0 = the fixed bound.
+    SGLANG_WEG2_L3FILL_JOIN_LIVENESS = EnvBool(True)
+    SGLANG_WEG2_L3FILL_JOIN_CAP_S = EnvFloat(60.0)
+    # SELF-EVICT / SELF-JOIN (NF h16 15:34:27, P PP1, weg2-10-86): a fill
+    # never evicts the stems of the read it is filling, and a JOINED stem this
+    # process itself holds is taken over and read at once. 0 = off.
+    SGLANG_WEG2_L3FILL_PROTECT_READ = EnvBool(True)
+    SGLANG_WEG2_L3FILL_SELF_JOIN_TAKEOVER = EnvBool(True)
+    # H54 PARK-JOIN 1015 (NF h16h, 16 of 16 JOIN-WAIT tears after a park /
+    # wake): a JOINED stem whose holder is a HOST-WRITE claim that did not
+    # complete inside the join wait, on a page L3 holds, is taken from its key
+    # whatever its references and byte progress (arena_quarantine_host_write)
+    # and read from L3 by this fill; a stem a peer stage took over first is
+    # awaited, not dropped. JOIN_HELD_LOG: one 'L3-FILL JOIN-HELD' line per
+    # wait that ends with claims left -- refs, merged/joined writers, open,
+    # coverage and the quarantine verdict of each held slot. 0 = off.
+    SGLANG_WEG2_L3FILL_HOST_WRITE_TAKEOVER = EnvBool(True)
+    SGLANG_WEG2_L3FILL_JOIN_HELD_LOG = EnvBool(True)
     # STORE_REFUSE_FS (W57, user 28.09.: "L3 gehoert auf XFS, nie ZFS"): a
     # real boot whose store directory lives on one of these filesystems
     # (/proc/mounts) is refused by name -- the container layer (overlay) or
@@ -1099,6 +1151,61 @@ class Envs:
     # Q-697c (a), without its dual gate. Off = the old silent stop, byte for
     # byte.
     SGLANG_WEG2_ENABLE_W3_SPILL_ANCHOR_POOL = EnvBool(False)
+    # W3-GROUP-ORDER (NF arena fix 14.10., desk/nf-arenafix-1014): the W3 spill
+    # ordered its candidates by node id and assumed the PP ranks' trees were
+    # replicas -- they are not (P.log:15554 PP0 31 candidates x 64 pages, PP1 9
+    # x 208-256), so every PP0 spill ended ARENA-DROP freed=0: a slot is free
+    # only when every rank's reference is gone, and each rank let go of other
+    # slots. On: the order is read from the shared arena -- fewest reader
+    # references first (the pages a peer already let go), then the slot id (the
+    # canonical page identity, equal on every rank), then the node id. No
+    # collective, no reserve. Off = the node-id order, byte for byte.
+    SGLANG_WEG2_W3_SPILL_GROUP_ORDER = EnvBool(True)
+    # ARENAFULL-1015 (NF h16n deaths 07:11:54 / 07:30:35, PP1): L3-DROP -- a write_back device leaf whose KV
+    # is in L3 (l3_present: its arena copy spilled) leaves the device on the local-PP floor without a new
+    # arena claim (UD drop, host-only children via UD-H). Off = the old claim-first path.
+    SGLANG_WEG2_L3_DROP = EnvBool(True)
+    # L3-DROP: how long a host-only child held by its OWN store write may have its acks drained on this
+    # rank before the drop is refused by name (ms; 0 = drain once, no wait).
+    SGLANG_WEG2_L3_DROP_ACK_WAIT_MS = EnvInt(2000)
+    # H16P-NACHBESSERUNG E1 (Opus review of ARENAFULL-1015, B3): L3-DROP only where the arena would refuse the
+    # node's backup claim anyway (backup_room_tokens < tokens, no claim attempt). With room the node is demoted
+    # to L2 as before (L2 hits stay, the peel agrees with the payable walk). Off = L3-DROP whenever l3_present.
+    SGLANG_WEG2_L3_DROP_ONLY_UNDER_PRESSURE = EnvBool(True)
+    # H16P-NACHBESSERUNG A2 (review B2): l3_present is set only for a COMPLETE store write. _drain_backup sets it
+    # only when operation.completed_tokens covers every page (a partial / stale-refused / skipped write does
+    # not), and a W3 / host-only spill that sees unpaired pages (KV page without its QSA index, not written)
+    # treats them like lost (no release, no l3_present). Off = every ack sets it, unpaired is ignored.
+    SGLANG_WEG2_L3_PRESENT_STRICT = EnvBool(True)
+    # ARENAFULL-1015 W3-KEEP-PAYABLE: on the local-PP floor the W3 spill never releases the host copy of a
+    # device node whose drop it would make impossible right now (a host-only descendant that UD-H could not
+    # clear). Off = every written device node is a candidate, as before.
+    SGLANG_WEG2_W3_SPILL_KEEP_PAYABLE = EnvBool(True)
+    # ARENAFULL-1015 ACK-ROOM-PAYABLE: a follower's told ack measures its load-back room as free rows plus
+    # what ONE peel can pay (pp_room_vote walk), not the tree's reported evictable size (07:30:35: reported
+    # 255040, paid 48192). Off = available + evictable_size, as before.
+    SGLANG_WEG2_ACK_ROOM_PAYABLE = EnvBool(True)
+    # SETTLE-UNIFORM-1014 (NF h18 fe799c4d6e, D 16:23:24 gloo 'op.preamble.length <= op.nbytes. 8 vs 4'):
+    # the #1471 settle skipped the progress check (a collective) of a member whose rank-local writer
+    # action was wait/decide. On: every rank checks every non-capwait member; the action only shapes the
+    # vote. Off: the old skip.
+    SGLANG_WEG2_SETTLE_UNIFORM_CHECK = EnvBool(True)
+    # PREFETCH-RID-NET-1014: the termination collective of a store read carries the rid's fingerprint
+    # (two slots under the same MAX: h and -h). Ranks that reached it for DIFFERENT rids see max != min
+    # alike, and the group STOPS by name on every rank (RuntimeError 'PREFETCH-RID-MISMATCH ... rids=...';
+    # user law raenge-nie-uneins-crash-stop, 29.08.: a detected rank disagreement is a stop, never a
+    # 'not done' and on) -- instead of a reap that mixes two rids' numbers and a later gloo abort with no
+    # name. Off: the 3-slot form.
+    SGLANG_WEG2_PREFETCH_RID_NET = EnvBool(True)
+    # WAKE-READ-SEAT-GATE (NF arena fix 14.10.): the #248f gate held hold reads
+    # up to the whole KV arena (6466 of 6485 pages pinned, 231 CAPACITY-WAIT in
+    # one boot) -- D's own retain/park backup and its L3 fills found no slot.
+    # On: beside the page gate a hold read is issued only for as many requests
+    # as D has free seats for (seats = --max-running-requests, minus running
+    # requests, minus the requests whose read already holds the arena and have
+    # no seat yet), in hold/arrival order; the rest wait named in the #1471
+    # settle and read when a seat frees. No reserve. Off = the page gate alone.
+    SGLANG_WEG2_WAKE_READ_SEAT_GATE = EnvBool(True)
     # MAMBA-LAST-RESORT (NF int22, D TP0 boot 1008_171755 17:51:57): the D
     # mamba anchor arena (32 slots, 6 staging) held only END and deepest
     # anchors, so the flush / park-first spill found victim=none (`#1427
@@ -1129,6 +1236,14 @@ class Envs:
     # the front and by both groups (the env is inherited; the code default reaches the ranks
     # without a profile line).
     SGLANG_WEG2_LANES = EnvBool(True)
+    # PRIO-AS-AGE 1014 (user decision 14.10.2026 18:27Z, weg2/prio_age.py): `priority` acts as AGE --
+    # every age order/comparison (D seats, SEAT-AGE displacement, the KV rule "oldest first", decode
+    # admission, the P queue and batch order, wake reads, D refill) uses the pair (priority desc,
+    # arrival asc); every wait CLOCK keeps the real arrival. With it on, the lane FLOOR of 1008
+    # (LANE-PREEMPT, LANE-RAISE/RESUME, LANE-WAITER-HOLD, the lane hold of P legs, D's lane park) is
+    # never entered; a P-bound request with priority > 0 ends a DECODE-COLLECT window at once.
+    # DEFAULT ON; acts only with SGLANG_WEG2_LANES=1. =0 is the lane floor of 1008 unchanged.
+    SGLANG_WEG2_PRIO_AS_AGE = EnvBool(True)
     # PRIORITY LANES 1008: seconds between the keepalive comment lines (`: lane-hold floor=N`)
     # the front writes into a held SSE stream. Used only with SGLANG_WEG2_LANES=1 (the sender
     # is part L4 of the plan; part L1 only declares the value).
@@ -1856,6 +1971,13 @@ class Envs:
     # is in flight; otherwise it is routed with the start X (to P). NF D is
     # bs1, so a burst served serially on D would be slower than P's batch.
     SGLANG_WEG2_X_SOLO_WINDOW_MS = EnvInt(250)
+    # FRONT-X-MIT (15.10., NF boot 124245 report nf-core-dx-1015): the front's
+    # decision X (+ what it priced) rides with the D-direct leg 2 in two request
+    # headers and D's X gate (W31) checks the REALISED uncached extent against
+    # min(static X, front X + one page) -- named refusal instead of a silent
+    # compute between the front's X and the static 12288. Read on the front
+    # (send) and on D (check). Off on either end = the static gate byte for byte.
+    SGLANG_WEG2_FRONT_X_CARRY = EnvBool(True)
     # X-SUM-PRICE on the arrival path (user 09.10.): a D that is PREFILLING a
     # granted SHORT counts as busy for DECODE-COLLECT, and what it still has
     # to prefill is carried into the collected set's sum. Off = collect only
@@ -1969,14 +2091,10 @@ class Envs:
     # und flippt"), P takes all of it. 0 or >= WINDOW_S = no intermediate
     # check (the window routes the set by its amount).
     SGLANG_WEG2_DECODE_COLLECT_D_CHECK_S = EnvFloat(7.5)
-    # DECODE-COLLECT SEAT GATE (user 02.10. ~20:25Z: no prefill on P while D has
-    # no room for it; filling prefills for free seats stay allowed): the
-    # collect window's route P flips only while D has a free seat after the
-    # flip back, and the P phase then dispatches at most that many requests
-    # (oldest first). No free seat: the set keeps waiting; the ARRIVAL-SEAT
-    # wait bound parks the youngest running decode, which frees one. Marker
-    # 'WEG2 DECODE-COLLECT seat-gate'. 0 = route P flips at once, as before.
-    SGLANG_WEG2_DECODE_COLLECT_SEAT_GATE = EnvBool(True)
+    # W3-FORMA (h16q review A3): pages one FORMA-REQUEST may hand to the SYNCHRONOUS L3 write on D's TP0 scheduler
+    # thread before the broadcast the workers wait at (128 x 768 KiB ~ 96 MB). A node larger than what is left is
+    # passed over and counted (over_cap_nodes=). 0 = no bound (as on 1c337d79a3).
+    SGLANG_WEG2_W3_FORMA_SPILL_MAX_PAGES = EnvInt(128)
     # X-EXACT: tokenizer path override (tests, or a front without a group
     # reachable); empty = the group's own server_args.tokenizer_path.
     SGLANG_WEG2_FRONT_TOKENIZER_PATH = EnvStr("")
@@ -2446,6 +2564,26 @@ class Envs:
     # END anchor behind it is not cut off by ``parent_unbacked``. Acts only on
     # nodes marked by ``park_running``; no park = byte for byte as before.
     SGLANG_WEG2_PARK_END_ANCHOR_FIRST = EnvBool(True)
+    # AUX-HOST-LAW (NF h17 38c6d40239, D TP0 15:51:02, "node 248/243/251
+    # mamba host present but Full.host_value=None" killed D from on_idle):
+    # construction, never repair -- the Full host copy leaving a node takes its
+    # aux host states first also when the node holds no device KV (the
+    # internal host-only node lives on for its children; a later insert
+    # revived Full.value over a kept Mamba host state), and a read's anchor
+    # never lands on a node without a Full host copy. The sanity check stays
+    # fatal (raenge-nie-uneins-crash-stop). 0 = the old behaviour.
+    SGLANG_WEG2_AUX_HOST_LAW = EnvBool(True)
+    # LANE-ANCHOR-RANK (NF h13 84e787ec96, D TP0 14:35:34, weg2-24-181): a
+    # lane park of lane-0 requests (LANE-PREEMPT for an arriving lane-1
+    # request) spilled the arriving request's own resume anchor (MAMBA-ARENA
+    # DISPLACE why=park_first depth=148992) to make room for lane-0 park
+    # chains; D then refused the lane-1 request (#904 MambaComponent absent,
+    # X-GATE W31) and it went to P for a full prefill. A node carries the
+    # highest lane that finished through it (weg2_lane); a mamba-arena claim
+    # (park chain, flush spill, last resort) may only displace anchors of a
+    # lane at or below the claimer's, lowest lane first. Lanes off: every node
+    # is lane 0, the order is the old one byte for byte. 0 = off.
+    SGLANG_WEG2_LANE_ANCHOR_RANK = EnvBool(True)
     # Per-request mamba checkpoint diagnostics: log match length, resume
     # length, checkpoint node/slot and cache-insert positions so a
     # nondeterministic resume (or a checkpoint at a wrong position) can be

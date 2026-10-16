@@ -661,6 +661,11 @@ def evict_ordered(arena, keep: Keep, n: int, *, eligible=None, protect_lo=None, 
     idx = victim_order(keep)
     if eligible is not None:
         idx = idx[np.asarray(eligible, dtype=bool)[idx]]
+    if protect_lo is not None and len(protect_lo):
+        # h18port (SELF-EVICT, h16h weg2-58-558): a protected key (the pins, the read being filled) is never a
+        # VICTIM either -- before, ``protect_lo`` only guarded the keys that were not chosen, and a kept page
+        # that was also this read's own (the sibling turn's hold = the same stems) was taken from the tail
+        idx = idx[~np.isin(keep.keys[idx], np.asarray(protect_lo, dtype=np.uint64))]
     idx = _present(arena, keep, idx)
     guard = keep.keys if protect_lo is None or not len(protect_lo) else np.union1d(
         keep.keys, np.asarray(protect_lo, dtype=np.uint64))

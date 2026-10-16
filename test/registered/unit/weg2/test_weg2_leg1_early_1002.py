@@ -46,9 +46,8 @@ def test_candidates_are_the_drains_head():
 def test_flip_posts_and_drain_awaits_the_early_leg():
     flip = inspect.getsource(F.Front.flip)
     i = flip.index('if src == "D" and dst == "P":')
-    # 12.10.: the limit is p_concurrency, capped by the seat gate's cap when one is armed
-    assert "leg1_early_candidates(self.queue, _lim)" in flip[i:i + 6000]
-    assert "Front._leg1_early_limit(self)" in flip[i:i + 6000]
+    # 15.10.: the limit is p_concurrency (the seat gate's cap is gone, SEAT-AT-HAND-OFF)
+    assert "leg1_early_candidates(self.queue, self.p_concurrency)" in flip[i:i + 6000]
     assert "_ep._leg1_early = asyncio.ensure_future(self.leg1(_ep))" in flip
     assert "WEG2 LEG1-EARLY rid=%s epoch=%d" in flip
     src = inspect.getsource(F.Front)

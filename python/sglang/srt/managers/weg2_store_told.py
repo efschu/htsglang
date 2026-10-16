@@ -155,6 +155,14 @@ class Weg2StoreToldMismatch(RuntimeError):
     """This rank's own store read does not reproduce PP0's told count."""
 
 
+class Weg2FollowerToldUnreachable(Weg2StoreToldMismatch):
+    """W27-HELD-STOP (NF h16g 14.10. 17:49:53Z): a follower holds a rid PP0
+    admitted at told, its tree stays short after the bounded re-read, and no
+    rank-uniform answer can arrive (no PF ack channel, no re-read in flight).
+    Planning on would set a batch PP0 did not send -- the group stops HERE,
+    by name, instead of at the #1233 WIDTH GUARD one forward later."""
+
+
 def env_armed() -> bool:
     return os.environ.get(ENV_ARMED, "1").strip().lower() not in (
         "0",
@@ -245,6 +253,163 @@ def _completed_prefix(tree, rid: str) -> int:
             return int(value)
     return int(tree.prefetch_loaded_tokens_by_reqid.get(rid, 0) or 0)
 
+
+
+#: P-HELD-REREAD-1014 (NF h17 38c6d40239, P 15:59:22-25, weg2-1-11, 94454
+#: tokens): PP0's read ended SHORT although the store held the span
+#: (``#1157 PREFETCH REAPED requested_pages=1475 hit_pages=1475
+#: completed=52480 elapsed=2.49s``; ``WEG2-SHORT-READ HELD``). The reap was no
+#: timeout -- the read had finished (``PROBE-HOLD released reason=read-end``);
+#: sibling L3 fills had recycled slots it was filling (``L3-FILL LATE-COMPLETE
+#: REFUSED statuses=[3]``), so its landed prefix stopped at page 822 (PP2 at
+#: 83) while PP1 landed all 1475. PP0 told 52480 at once and P recomputed
+#: 41920 tokens the store held (h18 weg2-0-2: hit 1440 of 1456 pages,
+#: completed 19008, 74212 recomputed; weg2-4-18: completed=0 of 1061 hit=1061).
+#: Now: a terminated read short of what the store holds (hit > completed) is
+#: re-read by PP0 BEFORE the told (the rid stays held), while
+#: each re-read moves PP0's record and at most this many times; then the told
+#: goes out as before. PP0 decides alone (the followers follow the wire), so
+#: no rank can split. 0 = off.
+P_HELD_REREAD_ENV = "SGLANG_WEG2_P_HELD_SHORT_REREAD"
+
+
+def _p_held_reread_max() -> int:
+    try:
+        return max(0, int(os.environ.get(P_HELD_REREAD_ENV, "2") or "2"))
+    except (TypeError, ValueError):
+        return 2
+
+
+#: ZERO-ANCHOR 1015 (Typ A): the hint trigger of the held re-read. 0 = off.
+P_HINT_REREAD_ENV = "SGLANG_WEG2_P_HINT_REREAD"
+
+#: ZERO-ANCHOR 1015 (3), boot 133855 weg2-5-52: D re-parked the request at
+#: the D->P flip's begin (13:50:19.4, front SEQ-MARK where=park depth=110720)
+#: and its flush ran NONBLOCK (``#1470 FLUSH-PUBLISH issued=5 unbacked_left=5
+#: ... B1 NONBLOCK: the sleep leg drains them``, park anchor to L3 13:50:20);
+#: P's LEG1-EARLY read, issued at the same flip begin and held dormant
+#: (#1443), probed the store mid-flush: ``#1028B kv=1730 claimed=27
+#: caps={qsa_indexer: 47, mamba: 27}`` -> P prefilled 108999 tokens D had
+#: loaded at 13:49:42 (``completed=110656``). No hint (RESUME-VIA-P leg).
+#: Now a read issued while PP0 was dormant is marked; at its told PP0 asks
+#: the store once, AWAKE (the sleeping group's flush is drained before the
+#: wake), and re-reads when the store now holds a page or more past the
+#: record. PP0 decides; the followers follow the told. 0 = off.
+P_WAKE_PROBE_ENV = "SGLANG_WEG2_P_WAKE_PROBE"
+WAKE_PROBE_ATTR = "_weg2_read_dormant"
+
+
+def p_wake_probe_on(env=None) -> bool:
+    v = (env if env is not None else os.environ).get(P_WAKE_PROBE_ENV, "1")
+    return str(v).strip().lower() not in ("0", "false", "no", "off", "")
+
+
+def _wake_store_depth(scheduler, req, have: int):
+    """The store's anchored depth of ``req``'s prompt now, in tokens (the
+    #1416c/d full-span question with the fetch's key form); None = not
+    askable. Logged once per dormant read."""
+    try:
+        cc = getattr(scheduler, "cache_controller", None) or getattr(
+            getattr(scheduler, "tree_cache", None), "cache_controller", None)
+        ids = getattr(req, "origin_input_ids", None)
+        if cc is None or not callable(getattr(cc, "get_hash_str", None)) or not ids:
+            return None
+        page_size = int(getattr(cc, "page_size", 1) or 1)
+        if _tree_key_probe_armed():
+            key, _bigram = _probe_key(scheduler, req, ids, len(ids))
+            pages = _anchored_pages_full_span(cc, key, page_size, handoff_keys=_handoff_chain(req))
+        else:
+            pages = _anchored_pages_full_span(cc, list(ids), page_size,
+                                              extra_key=getattr(req, "extra_key", None))
+        if pages is None:
+            return None
+        depth = int(pages) * page_size
+        k = getattr(scheduler, "_p_wake_probe_n", 0) + 1
+        scheduler._p_wake_probe_n = k
+        if k <= 32 or k % 128 == 0 or depth > int(have):
+            logger.info("WEG2 P-WAKE-PROBE rid=%s have=%d store_now=%d (k=%d): the read ran during the "
+                        "flip; awake, the store %s", _rt(_rid(req)), int(have), depth, k,
+                        "holds more -- PP0 re-reads before its told" if depth > int(have)
+                        else "holds no more -- the told stands")
+        return depth
+    except Exception as exc:  # noqa: BLE001 - a probe never stops the told
+        logger.warning("WEG2 P-WAKE-PROBE rid=%s unavailable: %r", _rt(_rid(req)), exc)
+        return None
+
+
+def p_hint_reread_on(env=None) -> bool:
+    v = (env if env is not None else os.environ).get(P_HINT_REREAD_ENV, "1")
+    return str(v).strip().lower() not in ("0", "false", "no", "off", "")
+
+
+def _p_held_short_reread(scheduler, tree, req, rid: str) -> bool:
+    """P-HELD-REREAD-1014: True when PP0 re-issued ``rid``'s store read (the
+    caller keeps it held and publishes nothing this pass)."""
+    cap = _p_held_reread_max()
+    if cap <= 0:
+        return False
+    from sglang.srt.weg2 import short_read as _sr
+
+    have = _completed_prefix(tree, rid)
+    why = "store"
+    if not _sr.store_holds_more(rid):
+        # ZERO-ANCHOR 1015 (Typ A): the store held no more at the read, but D
+        # was measured to hold more (the front's hint) -- D's flush publishes
+        # it at the flip; re-read after the flush, i.e. once PP0 is awake
+        _ps = int(getattr(scheduler, "page_size", 0) or getattr(tree, "page_size", 1) or 1)
+        if p_hint_reread_on() and _sr.hint_beyond(rid, have, _ps):
+            why = "hint"
+        elif p_wake_probe_on() and getattr(req, WAKE_PROBE_ATTR, None) is not None:
+            # ZERO-ANCHOR 1015 (3): a read issued DURING the flip (#1443) raced
+            # the sleeping group's flush -- ask the store once, awake
+            if getattr(scheduler, "weg2_dormant", False):
+                why = "wake_probe"
+            else:
+                depth = _wake_store_depth(scheduler, req, have)
+                setattr(req, WAKE_PROBE_ATTR, None)   # once per dormant read
+                if depth is None or int(depth) - int(have) < _ps:
+                    return False
+                why = "wake_probe"
+                _sr.note_hint(rid, int(depth))   # the record the re-read must reach
+        else:
+            return False
+        if getattr(scheduler, "weg2_dormant", False):
+            k = getattr(scheduler, "_p_hint_wait_n", 0) + 1
+            scheduler._p_hint_wait_n = k
+            if k <= 32 or k % 128 == 0:
+                logger.info(
+                    "WEG2 P-HINT-REREAD WAIT rid=%s have=%d hint=%d (k=%d): the read ended below "
+                    "the depth D was measured to hold; D's flush publishes it at this flip -- "
+                    "PP0 holds the told until it is awake, then re-reads once",
+                    _rt(rid), have, _sr.hint_tokens(rid), k)
+            return True
+    n = int(getattr(req, "_weg2_p_held_reread_n", 0) or 0)
+    # each re-read must have moved PP0's record past the previous one
+    if n >= cap or have <= int(getattr(req, _sr.PROGRESS_ATTR, -1)):
+        return False
+    fn = getattr(scheduler, "_prefetch_kvcache", None)
+    if not callable(fn):
+        return False
+    _sr.note_reissue(req, have)
+    req._weg2_p_held_reread_n = n + 1
+    try:
+        verdict = str(fn(req))
+    except Exception as exc:  # noqa: BLE001 - a re-read never takes the pass down
+        logger.warning("WEG2 P-HELD-REREAD rid=%s re-issue raised %s: %s", _rt(rid), type(exc).__name__, exc)
+        return False
+    issued = verdict.startswith("issued")
+    k = getattr(scheduler, "_p_held_reread_n", 0) + 1
+    scheduler._p_held_reread_n = k
+    if k <= 32 or k % 128 == 0:
+        logger.info(
+            "WEG2 P-HELD-REREAD rid=%s n=%d/%d have=%d verdict=%s why=%s hint=%d (k=%d): the read "
+            "ended short of a span the store holds (why=store) or of the depth D was measured to "
+            "hold (why=hint) -- PP0 re-reads before its told (reading beats recomputing); the "
+            "told follows the re-read's record",
+            _rt(rid), n + 1, cap, have, verdict, why, _sr.hint_tokens(rid), k)
+    if not issued:
+        _sr.forget(rid)
+    return issued
 
 def _rid(req) -> str:
     return str(getattr(req, "rid", ""))
@@ -342,6 +507,19 @@ def follower_early_settle_now(scheduler, req, rid: str, told: int) -> bool:
 #: byte-identical to before).
 OVER_UNRESUMABLE = "over_unresumable"
 
+#: H64 SETTLE-ACK-NOW (default on; 0 = "short" whatever the registration did,
+#: pre-H64): a short early read whose told-limited registration issued no read
+#: -- the tree already held told (satisfied) or the store had nothing to give
+#: (declined) -- acks at once instead of waiting for a read that never started.
+ENV_SETTLE_ACK_NOW = "SGLANG_WEG2_PF_SETTLE_ACK_NOW"
+SHORT_SATISFIED = "short_satisfied"
+SHORT_DECLINED = "short_declined"
+
+
+def settle_ack_now_on(env=None) -> bool:
+    env = os.environ if env is None else env
+    return str(env.get(ENV_SETTLE_ACK_NOW, "1") or "1").strip().lower() not in ("0", "false", "no", "off")
+
 
 def _over_resumable_at_told(scheduler, req, told: int, own: int) -> bool:
     """True = this rank can resume ``req`` at ``told`` (or no probe/verdict):
@@ -386,7 +564,9 @@ def follower_early_settle(scheduler, req, told: int, own: int, absolute: bool = 
     :func:`_over_resumable_at_told`), ``"refuse"`` (a span-relative told the
     read overshot: #1400's MISMATCH refusal follows in the admission),
     ``"short"`` (register the #1400 told-limited read now; the admission then
-    waits for it)."""
+    waits for it) -- or, H64, ``SHORT_SATISFIED`` / ``SHORT_DECLINED`` when
+    that registration issued no read (the tree held told / nothing to read):
+    nothing to wait for, the PF ack goes in this pass."""
     rid = _rid(req)
     tree = scheduler.tree_cache
     if int(own) == int(told):
@@ -409,7 +589,19 @@ def follower_early_settle(scheduler, req, told: int, own: int, absolute: bool = 
         _pop_credit_keep_pin(tree, rid)
     except Exception:  # noqa: BLE001
         pass
-    _follower_register(scheduler, req, told, early=False)
+    verdict = _follower_register(scheduler, req, told, early=False)
+    if settle_ack_now_on() and not str(verdict).startswith("issued"):
+        # H64 SETTLE-ACK-NOW (NF h16n, PP1/PP2 04:30:43 weg2-6-44): the early
+        # read's record was stale (93440: read at intake, before the twin's
+        # sibling published) while the tree already held told -- the
+        # told-limited registration found it LOCALLY ("FOLLOWER SATISFIED
+        # LOCALLY local_prefix=96640") and issued nothing. "short" promised an
+        # ack "when the read ends" for a read that never started: the ack
+        # slipped to the next follower pass, which came only with PP0's
+        # fallback (CHAIN-RECV blocked 2131 ms). Nothing is in flight, so the
+        # ack goes now: satisfied -> own_prefix's satisfied probe (told when
+        # this rank can resume there), declined -> the record, PP0 decides.
+        return SHORT_SATISFIED if str(verdict).startswith("satisfied") else SHORT_DECLINED
     return "short"
 
 
@@ -1068,6 +1260,8 @@ def pp0_publish(scheduler, recv_reqs: List) -> List:
             continue
         if not tree.check_prefetch_progress(rid):
             continue
+        if _p_held_short_reread(scheduler, tree, req, rid):
+            continue  # P-HELD-REREAD-1014: still held, the told follows the re-read
         twin = _twin.take_pp0_twin(scheduler, rid)
         told, absolute = _pp0_told_any(scheduler, tree, req, rid, twin)
         _ple_admit_at_told(scheduler, req, told, absolute)
@@ -1323,6 +1517,16 @@ PACE_CAP_S_DEFAULT = 10.0
 _clock = time.monotonic
 
 
+def _read_room_lifesign(since: float, until: float) -> float:
+    """READ-ROOM review A1: seconds of [since, until] PP0 spent in armed room waits (0 when READ-ROOM is absent)."""
+    try:
+        from sglang.srt.weg2 import read_room as _rr
+
+        return float(_rr.lifesign_s(since, until))
+    except Exception:  # noqa: BLE001 - no ledger: the old Frist
+        return 0.0
+
+
 def _paced_env() -> bool:
     # RG 26.09.: unset = the registry row (weg2/form.py PREFIX_SWITCHES).
     from sglang.srt.weg2.form import prefix_switch_armed
@@ -1444,7 +1648,14 @@ def _pp0_publish_paced(scheduler, recv_reqs: List) -> List:
     held: Dict[str, Any] = scheduler._weg2_store_held
     pacing = _pacing(scheduler)
     fb_watch = bool(getattr(scheduler, "_weg2_told_fallback_on", False)) and _fb.pp0_watching(scheduler)
+    # H64 ACK-DRAIN: once the ack stream exists PP0 polls it on every pass --
+    # an ack whose size frame landed in the deciding pass must not strand its
+    # payload (and every later ack of that follower) until the next paced rid.
+    fb_drain = bool(getattr(scheduler, "_weg2_told_fallback_on", False)) and _fb.pp0_has_stream(scheduler)
     if not held and not pacing and not fb_watch:
+        if fb_drain:
+            # nothing to decide: only take what landed (late acks are named)
+            _fb.pp0_harvest(scheduler)
         return recv_reqs
     told_map: Dict[str, int] = scheduler._weg2_store_told
     tree = scheduler.tree_cache
@@ -1455,10 +1666,10 @@ def _pp0_publish_paced(scheduler, recv_reqs: List) -> List:
     scheduler._weg2_told_pass_n = pass_n
     fb_on = bool(getattr(scheduler, "_weg2_told_fallback_on", False))
     fb_parked = set()
-    if fb_on and (pacing or fb_watch):
+    if fb_on and (pacing or fb_watch or fb_drain):
         # PF: the followers' read acks that have landed (no wait), BEFORE
         # the verdicts below read them.
-        _fb.pp0_harvest(scheduler)
+        _fb.pp0_harvest(scheduler, now)
         fb_parked = _parked(scheduler)
     out: List[Any] = []
     if fb_on and fb_watch:
@@ -1499,19 +1710,39 @@ def _pp0_publish_paced(scheduler, recv_reqs: List) -> List:
             # PF: PP0 alone decides -- told once every follower's read
             # reproduced it, told=0 for every rank on a short read or at the
             # Frist. Never the window's guess.
-            verdict = _fb.pp0_decide(scheduler, rid, now)
+            verdict = _fb.pp0_decide(scheduler, rid, now, pass_n=pass_n)
             if verdict is None:
                 continue
             told_final, reason = verdict
             if told_final > 0:
                 # TF: the Admit is PP0's own admission -- told=0 for every rank
                 # when PP0's tree cannot resume at it (weg2_told_fidelity).
+                # H64 GROUP-FLOOR: the same check at the floor depth.
                 _tf_told, _ = _tf.pp0_verdict(scheduler, p.req, told_final, p.absolute)
                 if _tf_told != told_final:
-                    told_final, reason = _tf_told, "told_fidelity"
+                    # B5 ANCHOR-ACKS (NF h16p 12:16:46Z weg2-22-70: told 117184, acks 107584/107584, PP0 admissible
+                    # 67584 -> told=0, 117k re-prefilled): the next deeper depth every follower proved AND PP0's own
+                    # tree resumes from -- one PP0 decision, the floor marker carries it to every rank.
+                    _alt = _fb.pp0_floor_below(scheduler, rid, p.req, told_final, p.absolute)
+                    if _alt > 0:
+                        logger.warning(
+                            "PF TOLD-FLOOR TF-RETRY rid=%s told=%d refused=%d -> %d: PP0's tree cannot resume at "
+                            "the floor, the next depth every stage proved and PP0 resumes from is admitted for "
+                            "EVERY rank (B5 anchor acks)", _rt(rid), p.told, told_final, _alt)
+                        told_final, reason = _alt, _fb.REASON_FLOOR
+                    else:
+                        told_final, reason = _tf_told, "told_fidelity"
             pacing.pop(rid, None)
             _fb.pp0_note_verdict(scheduler, rid, p.told, told_final, reason, now, p.published_at)
             admit = Weg2StoreAdmit(rid=rid, told=told_final)
+            if reason == _fb.REASON_FLOOR and 0 < told_final < p.told:
+                # H64 GROUP-FLOOR: every follower proved told_final, PP0's TF
+                # admits it -- the same depth for EVERY rank, nothing released.
+                _fb.apply_floor(scheduler, rid, told_final)
+                setattr(admit, _fb.WIRE_FLOOR, 1)
+                told_map[rid] = told_final
+                out.append(admit)
+                continue
             if told_final != p.told:
                 # PP0's own read is released like a follower's: its record
                 # said told, its admission now compares 0 with 0.
@@ -1574,6 +1805,8 @@ def _pp0_publish_paced(scheduler, recv_reqs: List) -> List:
             continue
         if not tree.check_prefetch_progress(rid):
             continue
+        if _p_held_short_reread(scheduler, tree, req, rid):
+            continue  # P-HELD-REREAD-1014: still held, the told follows the re-read
         twin = _twin.take_pp0_twin(scheduler, rid)
         told, absolute = _pp0_told_any(scheduler, tree, req, rid, twin)
         _ple_admit_at_told(scheduler, req, told, absolute)
@@ -1581,7 +1814,8 @@ def _pp0_publish_paced(scheduler, recv_reqs: List) -> List:
         _extra = {"absolute": absolute, "keys_digest": _pp0_keys_digest(req)}
         _fork = _pp0_fork(scheduler, req, rid)
         held.pop(rid, None)
-        own_read_s = now - intake_t.pop(rid, now)
+        _intake = intake_t.pop(rid, now)
+        own_read_s = now - _intake
         if told <= 0:
             # nothing to read on any rank: single-phase, as before
             told_map[rid] = told
@@ -1609,7 +1843,18 @@ def _pp0_publish_paced(scheduler, recv_reqs: List) -> List:
             # PF: ask the followers for their read state (wire marker, set
             # only here) and start the Frist.
             setattr(ahead, _fb.WIRE_ACK, 1)
-            _frist = _fb.pp0_open(scheduler, rid, told, now, own_read_s, window)
+            # READ-ROOM review A1: PP0's armed room waits inside this rid's reads are a lifesign (see deadline)
+            _room_s = _read_room_lifesign(_intake, now)
+            _frist = _fb.pp0_open(scheduler, rid, told, now, own_read_s, window, published_pass=pass_n,
+                                  room_wait_s=_room_s)
+            if _room_s > 0.0:
+                n_rl = getattr(scheduler, "_rr_lifesign_n", 0) + 1
+                scheduler._rr_lifesign_n = n_rl
+                if n_rl <= _LOG_FIRST or n_rl % _LOG_EVERY == 0:
+                    logger.info(
+                        "READ-ROOM TOLD-LIFESIGN rid=%s told=%d own_read=%.2fs room_wait=%.2fs frist=%.2fs (n=%d): "
+                        "PP0's armed room waits are a lifesign of the read -- the intake+TOTAL clamp of the Frist "
+                        "moves by them (capped by the absolute ceiling)", rid, told, own_read_s, _room_s, _frist, n_rl)
             n_fb = getattr(scheduler, "_pf_open_n", 0) + 1
             scheduler._pf_open_n = n_fb
             if n_fb <= _LOG_FIRST or n_fb % _LOG_EVERY == 0:
@@ -1638,10 +1883,15 @@ def _follower_admit(scheduler, item: Weg2StoreAdmit) -> None:
     rid = str(item.rid)
     told = int(item.told)
     fallback = bool(getattr(item, _fb.WIRE_FALLBACK, 0))
+    floor = bool(getattr(item, _fb.WIRE_FLOOR, 0))
     if fallback:
         # PF: PP0 switched this rid to told=0 for every rank -- cut this
         # rank's read (abort path: rows, lock, reader references) first.
         _fb.follower_release(scheduler, rid)
+    elif floor and told > 0:
+        # H64 GROUP-FLOOR: PP0 admitted the depth every follower proved --
+        # satisfied at it, nothing released (the same steps PP0 took).
+        _fb.apply_floor(scheduler, rid, told)
     elif getattr(scheduler, "_weg2_fb_follower", None) is not None:
         _fb.follower_forget(scheduler, rid)
     early = _early(scheduler)
@@ -1653,7 +1903,7 @@ def _follower_admit(scheduler, item: Weg2StoreAdmit) -> None:
         # no read-ahead reached this request (it was not queued yet): register
         # now; admission then waits for it as the single-phase form does.
         _follower_register(scheduler, req, told)
-    if ahead is not None and int(ahead) != told and not fallback:
+    if ahead is not None and int(ahead) != told and not fallback and not floor:
         logger.warning(
             "#1416e PACED-ADMIT rid=%s told=%d differs from the read-ahead %d; admission "
             "compares against the admitted value", _rt(rid), told, int(ahead),
@@ -1732,6 +1982,82 @@ def forget_unreached(scheduler, rid) -> None:
         named.discard(str(rid))
 
 
+#: W27-HELD-STOP (NF h16g 14.10. 17:49:53Z, P.log ``..._1014_174538``
+#: 12223-12251; default ON, ``0`` = the hold as before): PP1 held weg2-0-10
+#: (``W27-UNIFORM FOLLOWER HELD ... route=none``) and its admission loop went
+#: on -- ``#969N ADMIT fwd_ct=15 bs=2 extend=5723 rids=[weg2-0-9,weg2-1-11]``
+#: against PP0's ``bs=3 extend=16283 rids=[weg2-0-9,weg2-1-11,weg2-0-10]`` --
+#: and died one forward later in the ``#1233 #631 WIDTH GUARD``. Two rules:
+#:  (a) BARRIER: a held told rid ends this follower's admission loop (nothing
+#:      behind it is admitted this pass). Every OTHER reason PP0 does not seat
+#:      an admitted told rid in a pass (budget, a load-back wait -- NO_TOKEN,
+#:      LB-VERDICT) ends PP0's loop there too, so the barrier is the only
+#:      follower choice that can match PP0; ``continue`` overtook the rid.
+#:  (b) UNRESOLVABLE = STOP: without the PF ack channel (``route=none``) no
+#:      uniform answer can ever reach the hold; once no re-read of the rid is
+#:      in flight any more the follower stops the group by name
+#:      (:class:`Weg2FollowerToldUnreachable`) instead of planning a batch.
+ENV_HELD_STOP = "SGLANG_WEG2_W27_HELD_STOP"
+
+
+def held_stop_on(env=None) -> bool:
+    env = os.environ if env is None else env
+    return str(env.get(ENV_HELD_STOP, "1") or "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def held_barrier(scheduler, req) -> bool:
+    """W27-HELD-STOP (a): True = ``req`` is held on this follower for a tree
+    short of PP0's told (item 180), and the admission loop must END here
+    instead of admitting what stands behind it."""
+    if not held_stop_on():
+        return False
+    try:
+        if is_pp0(scheduler):
+            return False
+    except Exception:  # noqa: BLE001 - a stand-in without ps
+        return False
+    rid = _rid(req)
+    if reach_unresolved(scheduler, rid) is None:
+        return False
+    n = getattr(scheduler, "_w27u_barrier_n", 0) + 1
+    scheduler._w27u_barrier_n = n
+    if n <= 8 or n % 256 == 0:
+        logger.error(
+            "W27-HELD-STOP BARRIER rank pp=%s rid=%s (n=%d): this rank holds a told rid its tree "
+            "does not reach -- the admission loop ends here; nothing behind it is admitted "
+            "(a follower that overtakes a rid PP0 seats plans a batch PP0 never sent)",
+            getattr(getattr(scheduler, "ps", None), "pp_rank", "?"), _rt(rid), n,
+        )
+    return True
+
+
+def _reread_in_flight(scheduler, rid: str) -> bool:
+    tree = getattr(scheduler, "tree_cache", None)
+    ongoing = getattr(tree, "prefetch_is_ongoing", None)
+    if not callable(ongoing):
+        return False
+    try:
+        return bool(ongoing(str(rid)))
+    except Exception:  # noqa: BLE001 - unreadable: no read to wait for
+        return False
+
+
+def _held_stop_if_unresolvable(scheduler, rid: str, told: int, live: int, route: str, site: str) -> None:
+    """W27-HELD-STOP (b): raise the named stop when nothing can resolve the
+    hold rank-uniformly any more."""
+    if not held_stop_on() or route == _fb.ROUTE_PF:
+        return
+    if _reread_in_flight(scheduler, rid):
+        return  # the bounded re-read is still landing: the barrier holds, the next visit asks again
+    raise Weg2FollowerToldUnreachable(
+        f"#1233 W27-HELD-STOP rank pp={scheduler.ps.pp_rank} rid={_rt(rid)} told={int(told)} "
+        f"live={int(live)} site={site} route={route}: PP0 admitted this rid at told, this rank's "
+        f"tree stays short after the bounded re-read and no PF ack channel exists (no rank-uniform "
+        f"told=0 can arrive) -- planning on would set a batch PP0 did not send (the #1233 WIDTH "
+        f"GUARD one forward later). Stopping the group by name (raenge-nie-uneins)."
+    )
+
+
 def follower_hold_unreached(scheduler, req, site: str) -> bool:
     """W27-UNIFORM (item 180): True = this follower's tree is STILL short of
     PP0's told after the bounded re-read, and it must not seat the request
@@ -1766,8 +2092,11 @@ def follower_hold_unreached(scheduler, req, site: str) -> bool:
             scheduler.ps.pp_rank, _rt(rid), t, live, site, route, n,
             "PF ack queued: PP0 answers told=0 for all ranks"
             if route == _fb.ROUTE_PF
-            else "no PF ack channel on this boot: no uniform answer can arrive, the #1233 W27 guard stays the stop",
+            else "no PF ack channel on this boot: no uniform answer can arrive -- W27-HELD-STOP "
+                 "stops the group once no re-read is in flight",
         )
+    _fb.floor_then_w27(scheduler, rid, "HELD", t, live)  # H16Q A4 tripwire (named, no stop)
+    _held_stop_if_unresolvable(scheduler, rid, t, live, route, site)
     return True
 
 
@@ -1864,6 +2193,7 @@ def follower_reach_told(scheduler, req, told: int, own: int, site: str = "admiss
         scheduler.ps.pp_rank, _rt(rid), int(told), int(own), int(live), site, n,
         int(live), int(told),
     )
+    _fb.floor_then_w27(scheduler, rid, "SHORT", int(told), int(live))  # H16Q A4 tripwire (named, no stop)
     try:
         _pop_credit_keep_pin(tree, rid)
     except Exception:  # noqa: BLE001

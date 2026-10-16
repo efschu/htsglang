@@ -329,6 +329,9 @@ def test_the_worker_keeps_its_rows_at_the_store_ack():
     ranks = _ranks()
     with _switch(True):
         _each(ranks, lambda r: r.ack_store_writes())
+        assert _same(ranks) == {NODE: (1, 1), 2 * NODE: (1, 1), 3 * NODE: (1, 1)}
+        # K12/H1: a worker's l3_present is TP0's verdict, mirrored at the broadcast
+        _broadcast(ranks)
     assert _same(ranks) == {NODE: (1, 1), 2 * NODE: (1, 1), 3 * NODE: (1, 1)}
     assert all(n.l3_present for r in ranks for n in r.nodes())
 

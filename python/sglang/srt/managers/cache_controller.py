@@ -31,6 +31,7 @@ import psutil
 import torch
 
 from sglang.srt.mem_cache.hicache_drain_budget import coalesce_host_releases
+from sglang.srt.mem_cache import weg2_backup_guard as _k12_guard
 from sglang.srt.mem_cache.hicache_phase_guard import device_tier_disarmed
 from sglang.srt.mem_cache.hicache_storage import (
     STORAGE_BATCH_SIZE,
@@ -47,6 +48,7 @@ from sglang.srt.mem_cache.hicache_collective import (
 )
 from sglang.srt.mem_cache.weg2_store_gates import check_mamba_blob_present
 from sglang.srt.mem_cache import probe_hold as _probe_hold
+from sglang.srt.weg2 import read_depth as _rd  # READ-DEPTH 1014 (C5)
 
 
 # #1402: module-level on purpose -- the harness doubles bind curated
@@ -128,6 +130,70 @@ def _read_stages(operation) -> dict:
 
 
 _READ_STAGES_N = [0]
+
+# ---------------------------------------------------------------------------
+# ARENA-CHAIN (NF 14.10. 07:29:33Z, ArenaChainMismatch #1424 on P PP0): REF, THEN RECHECK
+# ---------------------------------------------------------------------------
+# The L3 fill hands out COMPLETE slots with NO reference ("no reference taken yet",
+# ``arena_fill_from_disk``); the reader references them afterwards, and
+# ``arena_ref_slots(+1)`` takes a reference on any COMPLETE *or CLAIMED* slot without
+# looking at its key (arena.c: "#1427 CLAIMED slots take refs too"). In the window
+# between the fill and the reference another rank's full-arena claim runs the clock
+# (>= 256 slots per round) and re-claims the freed slots for ITS stems: the reference
+# then succeeds on a slot that belongs to another page, and the node's rows address
+# that slot until ``verify_load_chain`` kills the rank ("key slot -1 (state 0)").
+# The rule of the Linux page cache (mm/filemap.c: speculative ``folio_try_get`` then
+# re-load the index entry, ``folio_put`` and retry on a mismatch) applies verbatim:
+# first reference, then look the key up again, and keep the reference only where the
+# stem still names THIS slot, COMPLETE. After the reference the clock cannot take the
+# slot any more (it skips refcount != 0), so the check is stable.
+ENV_REF_RECHECK = "SGLANG_WEG2_ARENA_REF_RECHECK"
+_REF_RECHECK_N = [0, 0]  # prefixes cut by the recheck, pages given back
+
+
+def arena_ref_recheck_enabled(env=None) -> bool:
+    """Default ON (``0``/``false``/``no``/``off`` = the read path of before)."""
+    e = os.environ if env is None else env
+    return (e.get(ENV_REF_RECHECK, "") or "").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _arena_first_unproven(arena, stems, idxs, slots):
+    """``(position, (found_slot, found_state))`` of the first page (position in
+    ``idxs``) whose stem no longer names the slot that was just referenced for it as a
+    COMPLETE slot; ``(-1, None)`` = every page still proven. ONE ``find`` over the
+    referenced pages."""
+    import numpy as _np
+
+    n = len(idxs)
+    if n == 0:
+        return -1, None
+    fs, st = arena.find_slots_np([stems[int(i)] for i in idxs])
+    fs = _np.asarray(fs, dtype=_np.int64)
+    st = _np.asarray(st)
+    if int(fs.shape[0]) != n:  # a find that answers another count proves nothing: nothing is proven
+        return 0, (-1, 0)
+    ok = (fs == _np.asarray(slots, dtype=_np.int64)) & (st == 2)
+    bad = _np.flatnonzero(~ok)
+    if not bad.size:
+        return -1, None
+    b = int(bad[0])
+    return b, (int(fs[b]), int(st[b]))
+
+
+def _arena_note_recheck_cut(where: str, page: int, stem: str, slot: int, found, given_back: int) -> None:
+    _REF_RECHECK_N[0] += 1
+    _REF_RECHECK_N[1] += int(given_back)
+    k = _REF_RECHECK_N[0]
+    if k <= 16 or (k & (k - 1)) == 0:
+        logger.warning(
+            "#1424 ARENA-REF RECHECK CUT n=%d where=%s page=%d stem=%s slot=%d found=(slot=%d,state=%d) "
+            "given_back=%d total_given_back=%d: the reference took a slot that no longer holds this page's "
+            "key (cleared and re-claimed between the find/fill and the reference); the references from this "
+            "page on are returned and the read's prefix ends here -- the page is read again, never loaded "
+            "from another page's slot",
+            k, where, int(page), str(stem)[:48], int(slot), int(found[0]), int(found[1]), int(given_back),
+            _REF_RECHECK_N[1])
+
 
 
 def _read_stages_line(operation, total_ms: float) -> None:
@@ -3736,11 +3802,13 @@ class HiCacheController:
             # An honest miss instead.
             return 0
         _t0 = time.perf_counter()
+        _rd_base = int(getattr(operation, "completed_tokens", 0) or 0) // max(1, int(getattr(self, "page_size", 1) or 1))  # READ-DEPTH: this batch's first page (instrument: never raises)
         stems = weg2_suffixed_stems(self.storage_backend, hash_values)  # Posten 2: suffix memoised per key class
         import numpy as _np
         _fs, _st = pool.arena.find_slots_np(stems)  # Posten 2 (18.09.): numpy, no 520k-tuple list
         _rs = _read_stages(operation)
         _rs["find"] = _rs.get("find", 0.0) + (time.perf_counter() - _t0) * 1000.0
+        _recheck = arena_ref_recheck_enabled()  # ARENA-CHAIN: reference, then look the key up again
         _ta = time.perf_counter()
         # #257 (a): pages the probe HOLDS are read from the held slot -- the
         # probe's reference becomes the read's, no second reference is taken
@@ -3769,6 +3837,26 @@ class HiCacheController:
             _need = _fs[:lead][~_hm[:lead]]
             got = pool.arena.ref_slots_np(_need, +1) if _need.size else 0
             if got == int(_need.size):
+                if _recheck and _need.size:
+                    # ARENA-CHAIN: a reference takes any COMPLETE or CLAIMED slot, key unseen -- the
+                    # key must still name this slot, COMPLETE, or the page is not ours
+                    _li = _np.flatnonzero(~_hm[:lead])
+                    _bp, _fd = _arena_first_unproven(pool.arena, stems, _li, _fs[_li])
+                    if _bp >= 0:
+                        _cut = int(_li[_bp])
+                        _back = _fs[_cut:lead][~_hm[_cut:lead]]
+                        pool.arena.ref_slots_np(_back, -1)
+                        _arena_note_recheck_cut("lead", _cut, stems[_cut], int(_fs[_cut]), _fd, int(_back.size))
+                        # the pages from the cut on were found before whatever moved them: find them again
+                        # (a fill below reads them from the L3 when they are gone, a fresh find refs them
+                        # once more -- and is rechecked once more)
+                        _fs = _np.asarray(_fs, dtype=_np.int64).copy()
+                        _st = _np.asarray(_st).copy()
+                        _f2, _s2 = pool.arena.find_slots_np(list(stems[_cut:]))
+                        _nh = ~_hm[_cut:]
+                        _fs[_cut:][_nh] = _np.asarray(_f2, dtype=_np.int64)[_nh]
+                        _st[_cut:][_nh] = _np.asarray(_s2)[_nh]
+                        lead = _cut
                 slots = _fs[:lead].tolist()
             else:
                 pool.arena.ref_slots_np(_need, -1)  # undo the partial refs, take the slow path
@@ -3798,18 +3886,53 @@ class HiCacheController:
                     _pre[i] = s_
                     continue
                 _end = i  # evicted between find and ref: the prefix ends here
+                _rd.note_cut(operation, _rd_base + i, _rd.L2_EVICTED_BEFORE_REF)  # READ-DEPTH
                 break
             _need.append(i)
+        if _recheck and _pre:
+            # ARENA-CHAIN: the pages found past the lead and referenced ahead of the fill (EG review (b)):
+            # the fill's arena-full clock cannot take them, but the clock of ANOTHER rank could have, between
+            # the find and the reference -- the key must still name the slot
+            _pi = sorted(_pre)
+            _bp, _fd = _arena_first_unproven(pool.arena, stems, _pi, [_pre[i] for i in _pi])
+            if _bp >= 0:
+                _cut = _pi[_bp]
+                _back = [_pre.pop(i) for i in _pi[_bp:]]
+                pool.arena.ref_slots_np(_np.asarray(_back, dtype=_np.int64), -1)
+                _arena_note_recheck_cut("pre", _cut, stems[_cut], int(_back[0]), _fd, len(_back))
+                _end = min(_end, _cut)
+                _need = [i for i in _need if i < _end]
         _fills = {}
+        _fills_reffed = False
+        _why = {}
         _tf = time.perf_counter()
         if _need:
             _fill_fn = getattr(self.storage_backend, "arena_fill_from_disk", None)
             if callable(_fill_fn):
-                _got = _fill_fn(pool.arena, [stems[i] for i in _need], int(pool._page_bytes), prefix=True)
-                _fills = dict(zip(_need, _got))
+                # SELF-EVICT (NF h16 15:34:27, P PP1, weg2-10-86; h16h 19:21:06 PP2, weg2-58-558): the fill's
+                # room eviction took this very read's kept pages (#248e ORDERED-EVICT victims=[weg2-10-86 ...
+                # lowest_page=1024]; victims=[weg2-58-555 ... lowest_page=807] = the sibling turn's held pages,
+                # the same stems this read had found in L2 -- every stage's walk then ended at page 807). Every
+                # stem of the operation is protected for the fill (pins + this read).
+                from sglang.srt.mem_cache.hicache_storage import fill_protect_scope
+
+                _rd.fill_reasons_reset()
+                with fill_protect_scope(self.storage_backend, operation):
+                    # REF-AT-LAND-1014: the fill references every page as it lands;
+                    # those references are ours (taken below instead of a ref here)
+                    try:
+                        _got = _fill_fn(pool.arena, [stems[i] for i in _need], int(pool._page_bytes),
+                                        prefix=True, take_ref=True)
+                        _fills_reffed = bool(getattr(_got, "_arena", None) is not None)
+                    except TypeError:   # a backend without the keyword
+                        _got = _fill_fn(pool.arena, [stems[i] for i in _need], int(pool._page_bytes), prefix=True)
+                        _fills_reffed = False
+                _fills = dict(zip(_need, list(_got)))
+                _why = {_need[k]: c for k, c in _rd.fill_reasons_take().items() if k < len(_need)}
         _tf1 = time.perf_counter()
         _rs["l3fill"] = _rs.get("l3fill", 0.0) + (_tf1 - _tf) * 1000.0
         _rs["l3fill_pages"] = _rs.get("l3fill_pages", 0) + len(_need)
+        _fill_idx = []
         for i in range(lead, _end):
             if _hm[i]:
                 slots.append(int(_fs[i]))  # #257: held since the probe
@@ -3819,9 +3942,33 @@ class HiCacheController:
                 continue
             # #1433: not in the L2 -- the L3 fill above read it (or not)
             fill = _fills.get(i)
-            if fill is None or pool.arena.ref_slots([fill], +1) != 1:
+            if fill is None or (not _fills_reffed and pool.arena.ref_slots([fill], +1) != 1):
+                _rd.note_cut(operation, _rd_base + i,  # READ-DEPTH: why the walk ends here
+                             _why.get(i, _rd.FILL_NONE) if fill is None else _rd.FILL_EVICTED_BEFORE_REF)
                 break  # not on disk / evicted between fill and ref: the prefix ends here
             slots.append(fill)
+            _fill_idx.append(i)
+            if _fills_reffed:
+                _fills.pop(i, None)   # its reference moved into the read
+        if _fills_reffed:
+            # REF-AT-LAND-1014: landed past where the prefix ended -- given back
+            _left = [int(v) for v in _fills.values() if v is not None]
+            if _left:
+                pool.arena.ref_slots_np(_np.asarray(_left, dtype=_np.int64), -1)
+        if _recheck and _fill_idx:
+            # ARENA-CHAIN (NF 14.10. 07:29:33Z, P PP0): the fill hands the slots out WITHOUT a reference; between
+            # the fill and this reference another rank's full-arena claim (>= 256 slots per clock round) can have
+            # cleared and re-claimed them, and the reference above takes a CLAIMED slot of another stem without a
+            # key check. Look the stems up again: only a slot the stem still names, COMPLETE, is kept.
+            _bp, _fd = _arena_first_unproven(pool.arena, stems, _fill_idx, [slots[i] for i in _fill_idx])
+            if _bp >= 0:
+                _cut = _fill_idx[_bp]
+                _back = [slots[j] for j in range(_cut, len(slots)) if not _hm[j]]
+                if _back:
+                    pool.arena.ref_slots_np(_np.asarray(_back, dtype=_np.int64), -1)
+                _arena_note_recheck_cut("fill", _cut, stems[_cut], int(slots[_cut]), _fd, len(_back))
+                _rd.note_cut(operation, _rd_base + _cut, _rd.ARENA_CHAIN_RECHECK)  # READ-DEPTH
+                del slots[_cut:]
         if _pre:
             # referenced ahead, past where the prefix ended: given back
             pool.arena.ref_slots_np(_np.asarray(list(_pre.values()), dtype=_np.int64), -1)
@@ -3909,6 +4056,7 @@ class HiCacheController:
         prefix_keys = operation.prefix_keys
         for i in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
             if operation.is_terminated():
+                _rd.note_cut(operation, i, _rd.TERMINATED)  # READ-DEPTH
                 # #1068 (A12.4): a stop or a revoke lands at the next batch
                 # boundary (~4 MiB), never after one more storage read. The
                 # per-page increment below would refuse anyway; checking
@@ -4075,6 +4223,8 @@ class HiCacheController:
                 self._page_transfer(operation)
                 operation.read_end_time = time.monotonic()
                 _read_stages_line(operation, (operation.read_end_time - operation.read_start_time) * 1000.0)
+                _rd.line(operation, self.page_size, getattr(self, "pp_rank", "?"),  # READ-DEPTH (C5)
+                         (operation.read_end_time - operation.read_start_time) * 1000.0)
                 _note_l3_read(self, operation)  # RANK-TIMING: rankstats cache.l3 / prefetch
                 # #257: what the read did not take, the probe gives back
                 _probe_hold.release(operation, getattr(self, "mem_pool_host", None), 0, reason="read-end")
@@ -4366,8 +4516,14 @@ class HiCacheController:
                 from sglang.srt.mem_cache.utils import namespace_root_hash
 
                 last_hash = namespace_root_hash(extra_key)
+            # MAMBA-ANCHOR 1015 (weg2/presence_fetch_key.py): a RadixKey (the
+            # fetch's bigram key, built by the caller) is hashed as is -- the
+            # id list of the pre-1015 call hashed the unigram chain nobody
+            # writes (weg2-0-6: R13 EMPTY KV PREFIX, 208338 tokens recomputed).
+            from sglang.srt.weg2 import presence_fetch_key as _pfk
+
             page_hashes = self.get_hash_str(
-                list(token_ids), last_hash, page_size=self.page_size
+                _pfk.hash_input(token_ids), last_hash, page_size=self.page_size
             )
             if not page_hashes:
                 return 0
@@ -4380,6 +4536,10 @@ class HiCacheController:
             batch = page_hashes[:STORAGE_BATCH_SIZE]
             pool_transfers = self._presence_pool_transfers()
             if pool_transfers:
+                # MAMBA-ANCHOR 1015: the anchor-clamped question over the
+                # WHOLE span, as the fetch's v2 query asks it -- an anchor
+                # beyond page 1024 no longer clamps the first batch to 0.
+                batch = _pfk.v2_batch(page_hashes, STORAGE_BATCH_SIZE)
                 try:
                     return int(
                         self.storage_backend.batch_exists_v2(
@@ -5077,48 +5237,60 @@ class HiCacheController:
                 operation = self.backup_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
-
-                # W35 CLASS 4: the durable-corruption gate. Checked HERE, on
-                # the consumer thread, immediately before the persist and
-                # after the operation has been dequeued -- the one point where
-                # this operation's fate is decided. See `operation_is_stale`
-                # for why a stale backup is REFUSED rather than routed.
-                # Acked either way: an unacked operation stalls the queue, and
-                # a declined backup is a correct non-persist, exactly as
-                # `backup_skip` already is.
-                if operation_is_stale(self, operation, "backup"):
+                # K12: an operation the group's sleep verdict abandoned is
+                # acked unwritten at dequeue; any other is EXECUTING from here
+                # on, and an exception in its body no longer ends this thread
+                # (D TP0 13:35:33Z: an IndexError in _page_backup killed it,
+                # its two backups were never acked -> W120 10 s later).
+                if not _k12_guard.begin(self, operation):
                     self.ack_backup_queue.put(operation)
                     continue
+                try:
+                    # W35 CLASS 4: the durable-corruption gate. Checked HERE, on
+                    # the consumer thread, immediately before the persist and
+                    # after the operation has been dequeued -- the one point where
+                    # this operation's fate is decided. See `operation_is_stale`
+                    # for why a stale backup is REFUSED rather than routed.
+                    # Acked either way: an unacked operation stalls the queue, and
+                    # a declined backup is a correct non-persist, exactly as
+                    # `backup_skip` already is.
+                    if operation_is_stale(self, operation, "backup"):
+                        self.ack_backup_queue.put(operation)
+                        continue
 
-                if not self.backup_skip:
-                    # Capacity watchdog: rate-limited inside the backend, so this
-                    # is cheap per operation. A backend that has stopped writing
-                    # (out of disk) still runs the backup: the individual page
-                    # writes turn into refusals, which the ack path already
-                    # treats as a partial backup, so the caller sees a cache
-                    # miss rather than a stalled queue.
-                    self.storage_backend.check_disk_space()
-                    # #1061: stamp every key this operation hands to the store
-                    # with the #719 binding generation it was OPENED under --
-                    # the stamp `StorageOperation.__init__` already carries
-                    # (the existing carrier; no second scheme). This is the
-                    # producer-phase ledger's only production writer; disarmed
-                    # it records nothing. Placed BEFORE `_page_backup` so a
-                    # partial backup can only OVER-stamp: a stamped-but-
-                    # unwritten key reads as a store miss later, never as a
-                    # wrongly-attributed phase.
-                    try:
-                        from sglang.srt.mem_cache.producer_phase_census import (
-                            note_backup_keys,
-                        )
+                    if not self.backup_skip:
+                        # Capacity watchdog: rate-limited inside the backend, so this
+                        # is cheap per operation. A backend that has stopped writing
+                        # (out of disk) still runs the backup: the individual page
+                        # writes turn into refusals, which the ack path already
+                        # treats as a partial backup, so the caller sees a cache
+                        # miss rather than a stalled queue.
+                        self.storage_backend.check_disk_space()
+                        # #1061: stamp every key this operation hands to the store
+                        # with the #719 binding generation it was OPENED under --
+                        # the stamp `StorageOperation.__init__` already carries
+                        # (the existing carrier; no second scheme). This is the
+                        # producer-phase ledger's only production writer; disarmed
+                        # it records nothing. Placed BEFORE `_page_backup` so a
+                        # partial backup can only OVER-stamp: a stamped-but-
+                        # unwritten key reads as a store miss later, never as a
+                        # wrongly-attributed phase.
+                        try:
+                            from sglang.srt.mem_cache.producer_phase_census import (
+                                note_backup_keys,
+                            )
 
-                        note_backup_keys(
-                            getattr(operation, "hash_value", None),
-                            getattr(operation, "binding_generation", None),
-                        )
-                    except Exception:  # noqa: BLE001 - never break the backup thread
-                        pass
-                    self._page_backup(operation)
+                            note_backup_keys(
+                                getattr(operation, "hash_value", None),
+                                getattr(operation, "binding_generation", None),
+                            )
+                        except Exception:  # noqa: BLE001 - never break the backup thread
+                            pass
+                        self._page_backup(operation)
+                except Exception as exc:  # noqa: BLE001 - K12: the consumer survives
+                    _k12_guard.fail(operation, exc)
+                finally:
+                    _k12_guard.end(self, operation)
                 self.ack_backup_queue.put(operation)
 
             except Empty:

@@ -466,9 +466,9 @@ SEAM_LIST: Tuple[Seam, ...] = (
         "(weg2.launcher.refuse_unwired_token_cut). Open, performance only: "
         "tail adopt per owner (the loadback path covers it).",
         anchors=(
-            ("managers/cache_controller.py", 1789,
+            ("managers/cache_controller.py", 1854,
              "Weighted uneven-DCP HiCache storage requires page_size == 1"),
-            ("mem_cache/hicache_storage.py", 5157,
+            ("mem_cache/hicache_storage.py", 5868,
              "class FormAWorkerNullStorage"),
         ),
     ),

@@ -95,6 +95,14 @@ TRANSIT = "transit"
 STATE = "state"
 #: #239 S4b part 4: TP0 rebound a COMPLETE token-cut page -- every worker does
 REBIND = "rebind"
+#: W3-ARENA on Form A (metal dual15): TP0 spilled a node's finished pages to L3
+#: and gave its KV host rows back; every worker gives its own back and marks
+#: the node store-present (``l3_present``) -- the same parent rule everywhere
+SPILL = "spill"
+#: K12/H1: TP0 holds the node in L3 (its complete ack, or under the cut the
+#: complete page) -- every worker sets ``l3_present`` from this, never from its
+#: own ack, so no rank reads a different ``l3_present`` for the same node
+L3 = "l3"
 
 #: #239 S4b part 4: broadcasts TP0 waits for an incomplete token-cut page
 #: before it falls back to the ack's pre-cut decision (a write of every owner
@@ -313,6 +321,38 @@ def record_state(tree: Any, node: Any, why: str = "") -> None:
     _S.ledger.append((STATE, k[0], k[1], exists, kv, m))
 
 
+def _pkey(e) -> tuple:
+    """The pending slot of an event: one per node key -- a newer TRANSIT /
+    STATE / REBIND supersedes an older one -- and a SEPARATE slot for L3, which
+    is a fact about the store, not a host decision: a TRANSIT or REBIND of the
+    same node in the same pass must not drop it."""
+    k = (e[1], int(e[2]))
+    return k + (L3,) if e[0] == L3 else k
+
+
+def l3_group_on(env=None) -> bool:
+    """K12/H1 switch ``SGLANG_WEG2_L3_PRESENT_GROUP`` (default ON): on a Form A
+    group ``l3_present`` follows TP0's verdict on every rank."""
+    v = (env if env is not None else os.environ).get("SGLANG_WEG2_L3_PRESENT_GROUP", "1")
+    return str(v).strip().lower() not in ("0", "false", "no", "off", "")
+
+
+def record_l3(tree: Any, node: Any) -> bool:
+    """K12/H1, TP0: it set ``l3_present`` on ``node`` (group-complete). Every
+    worker sets it at the next broadcast. False = not keyable (logged; the
+    workers then keep l3_present False for this node -- conservative)."""
+    k = node_key(node)
+    if k is None:
+        if _note("unkeyed_l3"):
+            logger.warning("R12 HOST-VERDICT unkeyed l3 node=%s (the workers keep "
+                           "l3_present False)", getattr(node, "id", "?"))
+        return False
+    register_tree(tree)
+    _announce("host")
+    _S.ledger.append((L3, k[0], k[1], 1, 1, 0))
+    return True
+
+
 def record_rebind(tree: Any, node: Any) -> bool:
     """#239 S4b part 4, TP0 under the cut: it rebound a COMPLETE page to the
     arena; every worker rebinds the same node at the next broadcast (until
@@ -329,7 +369,87 @@ def record_rebind(tree: Any, node: Any) -> bool:
     return True
 
 
-def await_complete(tree: Any, node: Any, fallback_transit: bool) -> bool:
+def record_spill(tree: Any, node: Any) -> bool:
+    """W3-ARENA, TP0 on Form A: it secured ``node``'s pages to L3 and released
+    its KV host rows (the node stays on the device, ``l3_present``). Every
+    worker does the same at the next broadcast -- an arena slot is free only
+    once EVERY rank's reference is gone. False = not keyable (logged)."""
+    k = node_key(node)
+    if k is None:
+        if _note("unkeyed_spill"):
+            logger.warning("R12 HOST-VERDICT unkeyed spill node=%s (the workers keep "
+                           "their references)", getattr(node, "id", "?"))
+        return False
+    register_tree(tree)
+    _announce("host")
+    _kv, m = _host_flags(node)
+    _S.ledger.append((SPILL, k[0], k[1], 1, 0, m))
+    return True
+
+
+# ------------------------------------------ W3 spill requests (worker -> TP0)
+#: metal dual15 (...09301211): the arena was full, TP1's claims needed 1409
+#: pages, TP0's only 12 -- the rank that CAN decide a spill (TP0) was not the
+#: one short of room. A worker leaves its need next to the shared arena file;
+#: TP0 reads it at its next broadcast. Host bookkeeping, no collective; a lost
+#: update only waits for the worker's next refusal (it recurs every pass).
+SPILL_REQ_SUFFIX = ".w3need"
+
+
+def _req_path(arena: Any) -> Optional[str]:
+    path = getattr(arena, "path", None)
+    return (str(path) + SPILL_REQ_SUFFIX) if path else None
+
+
+def request_spill(arena: Any, pages: int) -> bool:
+    """A worker: its arena claim for ``pages`` pages was refused."""
+    path = _req_path(arena)
+    if path is None or int(pages) <= 0:
+        return False
+    import struct
+
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            raw = os.pread(fd, 8, 0)
+            cur = struct.unpack("<q", raw)[0] if len(raw) == 8 else 0
+            if int(pages) > cur:
+                os.pwrite(fd, struct.pack("<q", int(pages)), 0)
+        finally:
+            os.close(fd)
+    except OSError:
+        return False
+    n = _note("spill_request", 64)
+    if n:
+        logger.info("R12 W3-SPILL-REQUEST pages=%d (this worker's arena claim was refused; "
+                    "TP0 decides the spill at its next broadcast) n=%d", int(pages), n)
+    return True
+
+
+def take_spill_request(arena: Any) -> int:
+    """TP0: the largest pending worker need (pages), cleared."""
+    path = _req_path(arena)
+    if path is None:
+        return 0
+    import struct
+
+    try:
+        fd = os.open(path, os.O_RDWR)
+    except OSError:
+        return 0
+    try:
+        raw = os.pread(fd, 8, 0)
+        cur = struct.unpack("<q", raw)[0] if len(raw) == 8 else 0
+        if cur:
+            os.pwrite(fd, struct.pack("<q", 0), 0)
+        return max(0, int(cur))
+    except OSError:
+        return 0
+    finally:
+        os.close(fd)
+
+
+def await_complete(tree: Any, node: Any, fallback_transit: bool, l3_ok: bool = False) -> bool:
     """#239 S4b part 4, TP0 under the cut: its ack came while the page was not
     complete in the arena (an owner's write still in flight). Wait for the
     page instead of deciding on TP0's own ack. False = not keyable -> the
@@ -339,7 +459,7 @@ def await_complete(tree: Any, node: Any, fallback_transit: bool) -> bool:
         return False
     register_tree(tree)
     _announce("host")
-    _S.rebind_wait[k] = [node, 0, bool(fallback_transit)]
+    _S.rebind_wait[k] = [node, 0, bool(fallback_transit), bool(l3_ok)]
     return True
 
 
@@ -350,13 +470,18 @@ def _retry_rebinds() -> None:
     if tree is None or not _S.rebind_wait:
         return
     for k, ent in list(_S.rebind_wait.items()):
-        node, waited, fallback = ent
+        node, waited, fallback = ent[0], ent[1], ent[2]
+        l3_ok = bool(ent[3]) if len(ent) > 3 else False
         if not _attached(node) or node.component_data[int(_base_ct())].host_value is None:
             del _S.rebind_wait[k]  # the node or its host life went another way
             continue
         if tree._weg2_rebind_host_to_arena(node):
             del _S.rebind_wait[k]
             _S.ledger.append((REBIND, k[0], k[1], 1, 1, 0))
+            if l3_ok:
+                # K12/H1: the page completed -- l3_present on every rank
+                node.l3_present = True
+                _S.ledger.append((L3, k[0], k[1], 1, 1, 0))
             n = _note("rebind_late", 256)
             if n:
                 logger.info("R12 CUT-REBIND node=%s depth=%d after %d pass(es) (every owner "
@@ -390,6 +515,13 @@ def attach(recv_reqs: List) -> List:
     """Origin (TP0), right before the broadcast: put the pass's verdict FIRST."""
     if _S.rebind_wait:
         _retry_rebinds()  # #239 S4b part 4: pages that completed since
+    serve = getattr(_S.tree, "_w3_forma_serve_requests", None)
+    if serve is not None:
+        try:
+            serve()  # W3 on Form A: a worker's refused claim -> TP0's spill, SPILL events below
+        except Exception as exc:  # noqa: BLE001 -- a failed spill keeps every reference
+            if _note("spill_serve_error", 16):
+                logger.warning("R12 W3-SPILL serve failed: %r (every rank keeps its references)", exc)
     if not _S.ledger:
         return recv_reqs
     _S.seq += 1
@@ -398,9 +530,9 @@ def attach(recv_reqs: List) -> List:
     n = _note("sent")
     if n:
         kinds = [e[0] for e in v.events]
-        logger.info("R12 HOST-VERDICT SENT seq=%d events=%d transit=%d state=%d rebind=%d (n=%d)",
+        logger.info("R12 HOST-VERDICT SENT seq=%d events=%d transit=%d state=%d rebind=%d spill=%d l3=%d (n=%d)",
                     v.seq, len(v.events), kinds.count(TRANSIT), kinds.count(STATE),
-                    kinds.count(REBIND), n)
+                    kinds.count(REBIND), kinds.count(SPILL), kinds.count(L3), n)
     return [v] + list(recv_reqs)
 
 
@@ -424,7 +556,7 @@ def consume(recv_reqs: Optional[List], tree: Any = None) -> Optional[List]:
     if t is None:
         # no tree has touched HiCache yet on this rank: keep for the next pass
         for e in events:
-            _S.pending[(e[1], int(e[2]))] = e
+            _S.pending[_pkey(e)] = e
         return rest
     apply(t, events, seq=verdicts[-1].seq)
     return rest
@@ -479,9 +611,9 @@ def apply(tree: Any, events: List, seq: int = 0) -> Dict[str, int]:
     r = role()
     cut = cut_role() is not None
     c = dict(transit=0, kv=0, anchor=0, deleted=0, short=0, missing=0,
-             pending=0, unreconcilable=0, noop=0, rebind=0, rebind_miss=0)
+             pending=0, unreconcilable=0, noop=0, rebind=0, rebind_miss=0, spill=0)
     for e in events:
-        _S.pending[(e[1], int(e[2]))] = e  # a newer event for the key supersedes
+        _S.pending[_pkey(e)] = e  # a newer event for the key supersedes (L3 has its own slot)
     if not _S.pending:
         return c
     work = list(_S.pending.values())
@@ -504,6 +636,12 @@ def apply(tree: Any, events: List, seq: int = 0) -> Dict[str, int]:
             tree._weg2_release_chain_piece_host(node)
             c["transit" if _host_flags(node) != before else "noop"] += 1
             continue
+        if kind == L3:
+            if r != "worker":
+                continue  # TP0 set it before it sent the event
+            node.l3_present = True
+            c["l3"] = c.get("l3", 0) + 1
+            continue
         if kind == REBIND:
             if r != "worker":
                 continue  # TP0 rebound before it sent the event
@@ -518,6 +656,21 @@ def apply(tree: Any, events: List, seq: int = 0) -> Dict[str, int]:
                 # a miss is this rank's pool, not the page -- keep the rows
                 c["rebind_miss"] += 1
             continue
+        if kind == SPILL:
+            if r != "worker":
+                continue  # TP0 spilled before it sent the event
+            out = _reconcile(tree, node, 1, 0, m)
+            if out == "pending":
+                _S.pending[(h, int(depth))] = e
+                c["pending"] += 1
+                continue
+            if out in ("kv", "noop"):
+                node.l3_present = True  # the parent rule reads backed/l3_present: as on TP0
+                c["spill"] += 1
+            else:
+                c[out] += 1
+                _spill_diverged(node, h, depth, out, seq)
+            continue
         if r != "worker":
             continue
         out = _reconcile(tree, node, exists, kv, m)
@@ -525,13 +678,13 @@ def apply(tree: Any, events: List, seq: int = 0) -> Dict[str, int]:
             _S.pending[(h, int(depth))] = e
         c[out] += 1
     n = _note("applied")
-    if n and (events or any(c[k] for k in ("transit", "kv", "anchor", "deleted", "rebind"))):
+    if n and (events or any(c[k] for k in ("transit", "kv", "anchor", "deleted", "rebind", "spill"))):
         logger.info(
             "R12 HOST-VERDICT APPLIED seq=%d role=%s events=%d transit=%d kv_dropped=%d "
             "anchor_dropped=%d deleted=%d short=%d missing=%d pending=%d unreconcilable=%d "
-            "rebind=%d (n=%d)",
+            "rebind=%d spill=%d (n=%d)",
             seq, r, len(events), c["transit"], c["kv"], c["anchor"], c["deleted"], c["short"],
-            c["missing"], c["pending"], c["unreconcilable"], c["rebind"], n)
+            c["missing"], c["pending"], c["unreconcilable"], c["rebind"], c["spill"], n)
     if c["rebind_miss"] and _note("rebind_miss", 16):
         logger.warning("R12 CUT-REBIND-MISS %d node(s): TP0 rebound a complete page, this "
                        "worker's pool could not -- it keeps its own rows (same tree shape)",
@@ -543,6 +696,22 @@ def apply(tree: Any, events: List, seq: int = 0) -> Dict[str, int]:
         logger.error("R12 SHADOW-UNRECONCILABLE %d node(s): TP0 dropped host of a node "
                      "that is device-evicted and interior here", c["unreconcilable"])
     return c
+
+
+def _spill_diverged(node: Any, h: Any, depth: Any, out: str, seq: int) -> None:
+    """H16Q review A2 (law raenge-nie-uneins): a worker that cannot apply TP0's SPILL (``short`` / ``anchor`` /
+    ``deleted`` / ``unreconcilable``) now disagrees with TP0 on this node's host copy -- TP0 freed its host rows
+    and marked it ``l3_present``, this worker did not (``deleted``: it even dropped a node TP0 keeps on the
+    device). Named at EVERY occurrence (never the rate-limited APPLIED counter): the metal count must be 0; if it
+    is not, the named group stop follows in the next batch (a stop now, at an unknown rate, would be a new death
+    button without a measurement)."""
+    n = _S.counts.get("spill_diverged", 0) + 1
+    _S.counts["spill_diverged"] = n
+    logger.warning(
+        "R12 SPILL-DIVERGED seq=%d rid=%s node=%s depth=%s hash=%s out=%s (n=%d): TP0 spilled this node (host "
+        "rows freed, l3_present) and this worker could not apply it -- the ranks now disagree on its host copy",
+        int(seq), str(getattr(node, "rid", None) or "-"), getattr(node, "id", "?"), depth,
+        str(h)[:16], out, n)
 
 
 def _reconcile(tree: Any, node: Any, exists: int, kv: int, m: int) -> str:

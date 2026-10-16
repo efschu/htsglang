@@ -75,6 +75,7 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.weg2 import front_x as weg2_front_x
 from sglang.srt.weg2 import handoff as weg2_handoff
 
 if TYPE_CHECKING:
@@ -817,6 +818,10 @@ class OpenAIServingChat(OpenAIServingBase):
             return_prompt_token_ids=request.return_prompt_token_ids,
             clamp_max_new_tokens=request.clamp_max_tokens,
         )
+
+        # FRONT-X-MIT (15.10., weg2/front_x.py): the Weg-2 front's decision X for a
+        # D-direct leg 2 arrives in two request headers; no header = untouched.
+        weg2_front_x.stamp_request(adapted_request, raw_request)
 
         return adapted_request, request
 
