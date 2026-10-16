@@ -6267,8 +6267,21 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             from sglang.srt.weg2 import host_only_spill as _hos
 
             if _hos.armed(self):
-                released += _hos.spill_host_only(
-                    self, pool, max(int(need_pages) - released, self.W3_SPILL_MIN_PAGES), P, skip)["released"]
+                if _role == "host":
+                    # K15b: TP0's host-leaf drops go to the workers like its
+                    # evict_host (R12 state at the broadcast) -- never rank-local
+                    self._r12_rec = []
+                try:
+                    released += _hos.spill_host_only(
+                        self, pool, max(int(need_pages) - released, self.W3_SPILL_MIN_PAGES), P, skip)["released"]
+                finally:
+                    if _role == "host":
+                        _rec, self._r12_rec = (self._r12_rec or []), None
+                        _seen = set()
+                        for _n in _rec:
+                            if id(_n) not in _seen:
+                                _seen.add(id(_n))
+                                _r12.record_state(self, _n, why="w3_host_leaf")
         self._w3_spill_cap_used, self._w3_spill_cap_skipped = cap_used, cap_skipped
         k = getattr(self, "_w3_spill_n", 0) + 1
         self._w3_spill_n = k

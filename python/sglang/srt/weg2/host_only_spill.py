@@ -48,12 +48,36 @@ MARK = "W3-HOST-LEAF SPILL"
 _N = {"calls": 0}
 
 
+#: K15b (NF h16q2, boot 1016_051456, D TP0 06:25:38, weg2-66-470): the D>P sleep flush
+#: ended ``#1470 FLUSH-PUBLISH ARENA-FULL-STOP unbacked=54 arena_refused=54`` (TP1/TP2
+#: ``unbacked_left=59``) while ``W3-ARENA SPILL ... candidates=0`` -- the KV arena was held
+#: by D's HOST-ONLY nodes, which the device round never takes and this host-leaf round
+#: only took on the local-PP floor. The reset dropped weg2-66-458's tail (KV 56512..65024
+#: and its end anchor, ``#1421 arena_claim depth=57472/66240/66304`` on the workers); the
+#: follow-up resumed at the store's 56512 and computed 8779 instead of 1739. On a Form A
+#: group TP0 decides the host-leaf spill and every worker mirrors it (R12 state event at
+#: the broadcast, the ``evict_host`` path). Switch ``SGLANG_WEG2_W3_HOST_LEAF_FORMA``
+#: (default on).
+FORMA_ENV = "SGLANG_WEG2_W3_HOST_LEAF_FORMA"
+
+
+def forma_on() -> bool:
+    import os
+
+    return os.environ.get(FORMA_ENV, "1").strip().lower() not in ("0", "false", "no", "off", "")
+
+
 def armed(cache: Any) -> bool:
     from sglang.srt.environ import envs
     from sglang.srt.weg2 import pp_slot_fidelity as _sf
 
     if not envs.SGLANG_WEG2_ENABLE_W3_SPILL_HOST_LEAVES.get():
         return False
+    if forma_on():
+        from sglang.srt.mem_cache import form_a_host_shadow as _r12
+
+        if _r12.role() == "host":
+            return True   # K15b: TP0 decides, the workers mirror (R12)
     return bool(_sf.enabled() and getattr(cache, _sf.FLOOR_LOCAL_PP_ATTR, False))
 
 
