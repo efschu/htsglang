@@ -401,6 +401,11 @@ def tick(cache: Any) -> int:
     """Once per scheduler round (``check_hicache_events``): arm state + serve what was posted. Never raises."""
     try:
         _ST.rounds += 1
+        # F1 review A4: the PP group's slot set is applied (and the debts retried) in every round, at most
+        # every 20 ms -- not only at a backup claim (an idle P stage claims nothing)
+        from sglang.srt.weg2 import w3_room_set as _w3rs
+
+        _w3rs.tick(cache)
         _ST.armed = armed(cache)    # per round: a handful of getattr/env reads; the floor mark moves per iteration
         if not _ST.armed:
             return 0
