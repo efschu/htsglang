@@ -41,6 +41,9 @@ from sglang.srt.mem_cache.pool_host.arena_pool import (
 
 logger = logging.getLogger(__name__)
 
+#: MAMBA-STAGING-HWM: the period of the instrument's line while staging rows are used
+MAMBA_STAGING_HWM_LOG_S = 60.0
+
 
 _STATE_LOAD_N = 0
 _BYPASS_N = [0]
@@ -534,7 +537,7 @@ class ArenaMambaPoolHost(MambaPoolHost):
         if not anchor_bypass_on():
             return None
         try:
-            return super().alloc(1)
+            return self._stg_alloc(1, "bypass")  # MAMBA-STAGING-HWM: counted as the bypass path
         except Exception:  # noqa: BLE001 - no row, the old miss
             return None
 
@@ -860,10 +863,10 @@ class ArenaMambaPoolHost(MambaPoolHost):
     # -- allocator -------------------------------------------------------------------
     def free(self, indices: torch.Tensor) -> int:
         if self.arena is None:
-            return super().free(indices)
+            return self._stg_note_free(indices) or super().free(indices)
         idx = indices.cpu() if torch.is_tensor(indices) else torch.as_tensor(indices)
         S, A = self.staging_rows, self.arena_slots
-        staging = idx[idx < S]
+        staging = idx[idx < S]; self._stg_note_free(staging)
         rows = (idx[(idx >= S) & (idx < S + A)] - S).tolist()
         freed = 0
         if staging.numel():
@@ -887,3 +890,74 @@ class ArenaMambaPoolHost(MambaPoolHost):
                 self.arena.ref_slots(keep, -1)
             freed += len(rows)
         return freed
+
+    # -- MAMBA-STAGING-HWM (16.10.): how many staging rows [0, S) are really used ------
+    # The staging rows carry ANCHOR-BYPASS reads (a full arena), transfers without a
+    # pre-claimed arena id and whatever the flush takes that way; the arena carries
+    # the backups. This instrument names the real need (Planer 16.10.: the staging is
+    # sized from it): the highest number of rows in use at once, the highest row id,
+    # allocations per path (bypass / transfer / flush) and refusals per path. Logged
+    # when the high-water mark rises, every MAMBA_STAGING_HWM_LOG_S (60 s) on use,
+    # and at every reset (clear). Reads nothing a rank decides on.
+    def _stg_state(self) -> dict:
+        st = getattr(self, "_stg", None)
+        if st is None:
+            st = self._stg = {"in_use": set(), "hwm": 0, "max_row": -1, "t": time.monotonic(),
+                              "alloc": {"bypass": 0, "transfer": 0, "flush": 0},
+                              "refused": {"bypass": 0, "transfer": 0, "flush": 0}}
+        return st
+
+    def _stg_line(self, why: str) -> None:
+        st = self._stg_state()
+        st["t"] = time.monotonic()
+        logger.info(
+            "MAMBA-STAGING-HWM %s staging=%d in_use=%d hwm=%d max_row=%d alloc bypass=%d transfer=%d flush=%d "
+            "refused bypass=%d transfer=%d flush=%d (staging rows [0,S) of the mamba anchor host pool; the arena "
+            "carries the backups)",
+            why, int(getattr(self, "staging_rows", self.size)), len(st["in_use"]), st["hwm"], st["max_row"],
+            st["alloc"]["bypass"], st["alloc"]["transfer"], st["alloc"]["flush"],
+            st["refused"]["bypass"], st["refused"]["transfer"], st["refused"]["flush"],
+        )
+
+    def _stg_alloc(self, need_size: int, path: str):
+        rows = MambaPoolHost.alloc(self, need_size)
+        try:
+            st = self._stg_state()
+            if rows is None:
+                st["refused"][path] += 1
+            else:
+                ids = [int(x) for x in rows.tolist()]
+                st["alloc"][path] += len(ids)
+                st["in_use"].update(ids)
+                st["max_row"] = max([st["max_row"]] + ids)
+                if len(st["in_use"]) > st["hwm"]:
+                    st["hwm"] = len(st["in_use"])
+                    self._stg_line("new-hwm path=%s" % path)
+                    return rows
+            if time.monotonic() - st["t"] >= MAMBA_STAGING_HWM_LOG_S:
+                self._stg_line("periodic")
+        except Exception:  # noqa: BLE001 - an instrument never breaks an allocation
+            pass
+        return rows
+
+    def alloc(self, need_size: int):
+        """MAMBA-STAGING-HWM: every staging allocation that is not a bypass read is
+        a transfer without a pre-claimed arena id -- 'flush' while the tree's flush
+        spill mark is on (set on this pool by the radix cache when it hands it out)."""
+        return self._stg_alloc(need_size, "flush" if getattr(self, "_weg2_flush_tag", False) else "transfer")
+
+    def _stg_note_free(self, indices) -> None:
+        try:
+            st = self._stg_state()
+            ids = indices.tolist() if torch.is_tensor(indices) else list(indices)
+            st["in_use"].difference_update(int(x) for x in ids)
+        except Exception:  # noqa: BLE001 - an instrument never breaks a free
+            pass
+        return None
+
+    def clear(self):
+        super().clear()
+        st = getattr(self, "_stg", None)
+        if st is not None:
+            self._stg_line("reset")
+            st["in_use"].clear()

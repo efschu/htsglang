@@ -38,6 +38,21 @@ _WRITE_BACK_STAGING_PAGE_CHUNK = 64
 
 
 def sync_fixed_hicache_size(size: int, host_size: int) -> int:
+    return _sync_fixed_hicache_reduce(size, host_size, "min")
+
+
+def sync_fixed_hicache_floor(floor: int, host_size: int) -> int:
+    """MAMBA-ANCHOR-FLOOR (16.10.): the group MAX of a per-rank slot FLOOR, over
+    exactly the group (and under exactly the gate) that ``sync_fixed_hicache_size``
+    MIN-syncs the slot count in. The floor ``device_slots + max_running + 1``
+    mixes a rank-local device read into the term (phase_flip_boot.py names it
+    the one predicate that genuinely diverges across ranks), so the count the
+    group agrees on must clear the LARGEST floor of the group, or one rank
+    would still sit under its own floor."""
+    return _sync_fixed_hicache_reduce(floor, host_size, "max")
+
+
+def _sync_fixed_hicache_reduce(size: int, host_size: int, op: str) -> int:
     """Sync fixed-size HiCache token capacity across ranks with unequal
     bytes/token.
 
@@ -89,14 +104,15 @@ def sync_fixed_hicache_size(size: int, host_size: int) -> int:
     tensor = torch.tensor(size, dtype=torch.int64)
     torch.distributed.all_reduce(
         tensor,
-        op=torch.distributed.ReduceOp.MIN,
+        op=torch.distributed.ReduceOp.MAX if op == "max" else torch.distributed.ReduceOp.MIN,
         group=group,
     )
     synced_size = int(tensor.item())
 
     if synced_size != size:
         logger.info(
-            "Sync fixed-size HiCache host token capacity from %d to %d.",
+            "Sync fixed-size HiCache host %s from %d to %d.",
+            "slot floor (group MAX)" if op == "max" else "token capacity",
             size,
             synced_size,
         )
