@@ -2123,6 +2123,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # resets below take back -- releasing them later would free twice.
         self._weg2_cap_deferred = {}
         self._weg2_cap_tail = None
+        # F1 review B1: the W3 room set's debts name nodes of the tree being destroyed, whose arena
+        # references the release above gave back -- paying them later would free twice
+        from sglang.srt.weg2 import w3_room_set as _w3rs_reset
+
+        _w3rs_reset.forget(self)
         if getattr(self, "cache_controller", None) is not None and _r12.role() is not None:
             _r12.on_tree_reset(self)  # R12: no host verdict outlives its nodes
         self.root_node = UnifiedTreeNode(self.tree_components)
@@ -6269,7 +6274,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # F1: a PP group spills ONE slot set -- PP0 decides from the arena order, every stage
             # gives back exactly these slots (a slot frees only when all stages let go)
             _rel = _w3rs.spill(self, pool, int(need_pages), want, released_out, claimer=claimer)
-            if _rel == 0 and not _w3rs.undecided(self):
+            if _rel == 0 and _w3rs.backoff_ok(self):
                 # review F1 A4: an UNDECIDED spill (PP0 waits for a follower's acknowledgement, a
                 # follower holds debts of PP0's set) is no empty answer -- no backoff
                 self._w3_spill_quiet_until = now + self.W3_SPILL_EMPTY_BACKOFF_S

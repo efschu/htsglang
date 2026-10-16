@@ -227,12 +227,13 @@ def test_review_p6_followers_first_then_one_tick_frees_the_slot(pp3, monkeypatch
 
     pools, trees, nodes, store = pp3
     p0, a0 = pools[0]
-    monkeypatch.setattr(RR, "deficit", lambda arena, need: (int(need), {"slots": 8, "complete": 0, "claimed": 0,
+    monkeypatch.setattr(_rr(), "deficit", lambda arena, need: (int(need), {"slots": 8, "complete": 0, "claimed": 0,
                                                                         "pinned": 0, "free": 0, "clock": 0}))
     for t in trees:
         t._w3_spill_quiet_until = 0.0
     for r in (1, 2, 0):
         RR.serve(trees[r], pools[r][0], pools[r][1], 1, read_key=("x", 1))
+    assert not any(t._w3_spill_quiet_until > 0 for t in trees[1:]), "a follower sat in the empty backoff (B6)"
     for r in (1, 2):
         assert RS.apply_if_new(trees[r], pools[r][0]) is not None
     gen, slots = RS.read(a0)
@@ -288,3 +289,194 @@ def test_review_a4_wiring_every_read_room_round_ticks_the_room_set(monkeypatch):
     c = object()
     RR.tick(c)
     assert seen == [c]
+
+
+# --- F1b review (JA MIT AUFLAGE, 16.10.): B1-B6, reviewer probes Q1-Q7 of /spinning/wt-rev-f1b-1016 ----------
+
+RR = None
+
+
+def _rr():
+    from sglang.srt.weg2 import read_room
+    return read_room
+
+
+def test_review_f1b_q1_a_used_up_cap_is_no_cap_off(pp3, monkeypatch):
+    """CAP 1: PP0 applies a set of 3 single-page nodes; the cap must hold at 1 page per call."""
+    monkeypatch.setenv(RS.CAP_ENV, "1")
+    pools, trees, nodes, store = pp3
+    p0, a0 = pools[0]
+    s = {_slot(a0, p0, h) for h in ("a1", "a2", "a3")}
+    # a1..a3 on PP0 are a chain a0->a1->a2->a3; a3 is a host leaf? use a device-node release instead
+    r = RS.apply(trees[0], p0, s)
+    print("apply", r)
+    assert r["nodes"] <= 1, "cap_left reached exactly 0 and then the cap no longer applied: %r" % (r,)
+
+
+def test_review_f1b_q2_a_raising_apply_still_acks_and_pp0_decides_again(pp3, monkeypatch):
+    """A follower whose apply raises (deterministically) never acknowledges; PP0 then never decides again."""
+    pools, trees, nodes, store = pp3
+    p0, a0 = pools[0]
+    trees[0]._w3_arena_spill(p0, 1)
+    g1 = RS.read(a0)[0]
+    p1 = pools[1][0]
+
+    def boom(hv):
+        raise OSError("L3 write failed")
+    monkeypatch.setattr(p1, "secure_rows_to_l3", boom)
+    for _ in range(3):
+        try:
+            RS.apply_if_new(trees[1], p1)
+        except OSError:
+            pass
+    RS.apply_if_new(trees[2], pools[2][0])
+    gens = []
+    for _ in range(3):
+        trees[0]._w3_spill_quiet_until = 0.0
+        trees[0]._w3_arena_spill(p0, 1)
+        gens.append(RS.read(a0)[0])
+    print("g1", g1, "gens", gens, "undecided", RS.undecided(trees[0]))
+    assert gens[-1] > g1, "PP0 frozen: a follower that cannot apply never acks, no timeout"
+
+
+def test_review_f1b_q3_a_debt_on_a_readopted_slot_is_dropped(pp3):
+    """PP1's a0 is locked when PP0's set arrives (debt). PP0 then adopts a0 again (new request).
+    When PP1's request ends, the debt still releases PP1's host copy although the slot gains no room."""
+    pools, trees, nodes, store = pp3
+    (p0, a0), (p1, a1) = pools[0], pools[1]
+    n_a0 = [n for n in nodes[1] if n.key == ["a0"]][0]
+    n_a0.component_data[FULL].lock_ref = 1
+    trees[0]._w3_arena_spill(p0, 1)
+    assert _slot(a0, p0, "a0") in RS.read(a0)[1]
+    RS.apply_if_new(trees[1], p1)
+    RS.apply_if_new(trees[2], pools[2][0])
+    assert _refs(a0, p0, ["a0"]) == [1]
+    F._mirror(trees[0], p0, a0, [["a0"]])           # PP0 re-adopts a0 (fresh request)
+    assert _refs(a0, p0, ["a0"]) == [2]
+    n_a0.component_data[FULL].lock_ref = 0
+    r = RS.apply_if_new(trees[1], p1)
+    print("r", r, "refs", _refs(a0, p0, ["a0"]), "pp1 host", n_a0.component_data[FULL].host_value is not None)
+    assert n_a0.component_data[FULL].host_value is not None, \
+        "debt released PP1's host copy of a slot PP0 had re-adopted (no room gained)"
+
+
+def test_review_f1b_q4_an_idle_round_walks_nothing(pp3, monkeypatch):
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+    pools, trees, nodes, store = pp3
+    calls = []
+    monkeypatch.setattr(UnifiedRadixCache, "_w3_keep_payable_state", lambda self: calls.append(1) or None)
+    for r in (0, 1, 2):
+        for _ in range(5):
+            RS.apply_if_new(trees[r], pools[r][0])
+    print("keep-payable walks with no set and no debts:", len(calls))
+    assert len(calls) == 0, "every 20 ms tick builds _Ctx (full payable walk) even with nothing to do"
+
+
+def test_review_f1b_q5_a_host_locked_debt_is_decided(pp3, monkeypatch):
+    """PP1's a0 is host-locked (told span of the waiting read). After PP0's set, PP1's spill is
+    UNDECIDED for as long as the lock holds -> F2 can never call the wait futile."""
+    pools, trees, nodes, store = pp3
+    (p0, a0), (p1, a1) = pools[0], pools[1]
+    for n in nodes[1]:
+        n.component_data[FULL].host_lock_ref = 1
+    trees[0]._w3_arena_spill(p0, 1)
+    out = []
+    for _ in range(4):
+        trees[1]._w3_spill_quiet_until = 0.0
+        rel = trees[1]._w3_arena_spill(p1, 1)
+        out.append((rel, RS.undecided(trees[1])))
+    print("pp1 spills", out, "debts", len(trees[1]._w3_room_debt))
+    assert not out[-1][1], "a debt blocked by the read's own host lock keeps the follower UNDECIDED"
+
+
+def test_review_f1b_q6_followers_first_then_tick_no_backoff(pp3, monkeypatch):
+    """Original probe P6 + one follower READ-ROOM tick (RS.tick path with the 20 ms gate)."""
+    pools, trees, nodes, store = pp3
+    p0, a0 = pools[0]
+    monkeypatch.setattr(_rr(), "deficit", lambda arena, need: (int(need), {"slots": 8, "complete": 0, "claimed": 0,
+                                                                        "pinned": 0, "free": 0, "clock": 0}))
+    for t in trees:
+        t._w3_spill_quiet_until = 0.0
+    rel = {}
+    for r in (1, 2, 0):
+        rel[r] = _rr().serve(trees[r], pools[r][0], pools[r][1], 1, read_key=("x", 1))
+    quiet = [t._w3_spill_quiet_until > 0 for t in trees]
+    for r in (1, 2):
+        trees[r]._weg2_direct_pool = (lambda p: (lambda: p))(pools[r][0])
+        trees[r]._w3_room_tick_t = 0.0
+        RS.tick(trees[r])
+    gen, slots = RS.read(a0)
+    print("rel", rel, "quiet", quiet, "gen", gen, "slots", slots, "refs", a0.slot_refs(slots))
+    assert slots and all(int(x) == 0 for x in a0.slot_refs(slots))
+    assert not any(quiet[1:]), "a follower sat in the empty backoff"
+
+
+def test_review_f1b_q7_a_reset_trees_debt_never_frees_twice(pp3):
+    """PP1's a0 is a debt (locked). Then the tree is reset (flip / P sleep flush): _reset_full gives the old
+    tree's arena references back (release_tree_rows, host_value left set) and swaps the root, but it does not
+    clear _w3_room_debt. PP1 adopts a0 again under the NEW root. The next 20 ms tick pays the stale debt:
+    the dead node's host rows are freed a second time -> the new holder's reference is taken off."""
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedTreeNode
+    pools, trees, nodes, store = pp3
+    (p0, a0), (p1, a1) = pools[0], pools[1]
+    t1 = trees[1]
+    n_a0 = [n for n in nodes[1] if n.key == ["a0"]][0]
+    n_a0.component_data[FULL].lock_ref = 1
+    trees[0]._w3_arena_spill(p0, 1)
+    RS.apply_if_new(t1, p1)
+    RS.apply_if_new(trees[2], pools[2][0])
+    assert id(n_a0) in t1._w3_room_debt
+    # --- reset as _reset_full does it: refs back (host_value stays), new root, sets/write-throughs fresh
+    stack = list(t1.root_node.children.values())
+    while stack:
+        n = stack.pop()
+        stack.extend(n.children.values())
+        hv = n.component_data[FULL].host_value
+        if hv is not None:
+            p1.release_tree_rows(hv)
+    new_root = UnifiedTreeNode((FULL,))
+    new_root.component_data[FULL].lock_ref = 1
+    new_root.component_data[FULL].value = []
+    t1.root_node = new_root
+    t1.evictable_host_leaves = set()
+    t1.ongoing_write_through = {}
+    n_a0.component_data[FULL].lock_ref = 0          # the dead tree's request ended
+    # PP1 adopts a0 again under the new tree
+    fresh = F._mirror(t1, p1, a1, [["a0"]])
+    before = _refs(a0, p0, ["a0"])
+    r = RS.apply_if_new(t1, p1)
+    after = _refs(a0, p0, ["a0"])
+    print("before", before, "apply", r, "after", after, "debts", len(t1._w3_room_debt))
+    assert after == before, "a stale debt from the reset tree released the NEW holder's reference"
+
+
+
+def test_review_f1b_b1_wiring_the_tree_reset_forgets_the_debts():
+    import inspect
+
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+    assert "forget(self)" in inspect.getsource(UnifiedRadixCache._reset_full)
+
+
+def test_review_f1b_b1_forget_clears_the_debt_list(pp3):
+    pools, trees, nodes, store = pp3
+    t1 = trees[1]
+    t1._w3_room_debt = {1: (object(), frozenset({1}), 1, "running")}
+    RS.forget(t1)
+    assert not RS._debts(t1)
+
+
+def test_review_f1b_b3_pp0_decides_anew_after_the_wait_bound(pp3, monkeypatch):
+    """A follower never acknowledges (dead round, stuck apply): PP0 decides again after WAIT_TIMEOUT_S."""
+    pools, trees, nodes, store = pp3
+    p0, a0 = pools[0]
+    trees[0]._w3_arena_spill(p0, 1)
+    g1 = RS.read(a0)[0]
+    trees[0]._w3_spill_quiet_until = 0.0
+    trees[0]._w3_arena_spill(p0, 1)
+    assert RS.read(a0)[0] == g1                    # inside the bound: waits
+    monkeypatch.setattr(RS, "WAIT_TIMEOUT_S", 0.0)
+    trees[0]._w3_spill_quiet_until = 0.0
+    trees[0]._w3_arena_spill(p0, 1)
+    assert RS.read(a0)[0] == g1 + 1
