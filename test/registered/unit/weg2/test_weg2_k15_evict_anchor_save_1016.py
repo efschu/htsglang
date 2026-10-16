@@ -113,6 +113,8 @@ def _tree(written_seq, spill_ok=True):
         w = seq.pop(0) if seq else 0
         if w:
             node._landed = True
+        else:
+            t._k15_last_refusal = t.refusal     # what #1421 names (default: the mamba arena)
         return w
 
     def _wc(write_back=False):
@@ -128,7 +130,8 @@ def _tree(written_seq, spill_ok=True):
     t._weg2_flush_spill_room = lambda node, mp: (t.calls.append("spill"), spill_ok)[1]
     t._weg2_evict_spill_room = types.MethodType(UnifiedRadixCache._weg2_evict_spill_room, t)
     t.weg2_node_depth = lambda node: node.depth
-    t._weg2_sweep_last_refusal = "mamba_claim"
+    t._weg2_sweep_last_refusal = None
+    t.refusal = "mamba_claim"
     t.nodes = []
     return t
 
@@ -190,3 +193,112 @@ def test_pfund_kv_only_tries_the_spill_room_first():
     a = src.index("self._weg2_evict_spill_room(node, mp)")
     b = src.index("# P-FUND: the eviction needs this node's KV rows")
     assert a < b
+
+
+
+# --- review K15 (wf_37a4dbeb-6e1) Auflagen A1-A5: the reviewer's probes R1-R5, taken over ---
+
+from sglang.srt.mem_cache import form_a_host_shadow as _r12  # noqa: E402
+
+
+@pytest.mark.parametrize("reason", ["arena_claim", "mamba_pin", "anchor_only_pin", "write_none"])
+def test_a1_only_a_mamba_arena_refusal_spills(reason):
+    """R1: boot _215812 D TP0 had 38 non-mamba refusals (arena_claim 21, anchor_only_pin 17), P 51
+    arena_claim -- a spill there cannot serve the retry and costs the victim its host anchor."""
+    t, n = _tree([0, 0]), _node(7, ANCHOR_TOMBSTONED)
+    t.refusal = reason
+    assert _save(t, n) is False
+    assert "spill" not in t.calls and t.calls == ["backup"]
+
+
+@pytest.mark.parametrize("reason", ["mamba_claim", "anchor_only_claim"])
+def test_a1_mamba_arena_refusals_do_spill(reason):
+    t, n = _tree([0, 1]), _node(7, ANCHOR_TOMBSTONED)
+    t.refusal = reason
+    assert _save(t, n) is True and t.calls == ["backup", "spill", "backup", "join"]
+
+
+def test_a2_p_with_pp_stages_saves_without_spill(caplog):
+    """B2: on P (PP3) the mamba slot is shared by the stages; a stage-local spill frees nothing."""
+    t, n = _tree([0, 0]), _node(7, ANCHOR_TOMBSTONED)
+    t.pp_size, t.pp_rank = 3, 1
+    with caplog.at_level(logging.INFO):
+        assert _save(t, n) is False
+    assert "spill" not in t.calls and t.calls == ["backup"]
+    assert any("K15 EVICT-SPILL SKIPPED pp_size=3 pp_rank=1" in m for m in caplog.messages)
+
+
+def test_a3_form_a_worker_names_no_loss(monkeypatch, caplog):
+    """R2: a Form A worker has no mamba arena (anchor_only_no_arena, 43x per worker in the boot)."""
+    monkeypatch.setattr(_r12, "role", lambda: "worker")
+    t, n = _tree([0, 0]), _node(7, ANCHOR_TOMBSTONED, backuped=True)
+    t._weg2_mamba_pool = lambda: None
+    lost0 = UnifiedRadixCache._k15_lost_n
+    with caplog.at_level(logging.WARNING):
+        assert _save(t, n) is False
+    assert not any("WEG2-ANCHOR-LOST at=evict" in m for m in caplog.messages)
+    assert UnifiedRadixCache._k15_lost_n == lost0 and t.calls == []
+
+
+def _drive_with(nodes, save, request=None):
+    evicted, order = [], list(nodes)
+    lru = types.SimpleNamespace(
+        get_lru_no_lock=lambda: order[0] if order else None,
+        get_prev_no_lock=lambda x: (order[order.index(x) + 1]
+                                    if x in order and order.index(x) + 1 < len(order) else None),
+        in_list=lambda x: x is not None and x in order,
+    )
+
+    def _evict(x, comp, target=None, tracker=None):
+        if getattr(x, "_pinned", False):
+            raise ValueError("#904: refusing to free MAMBA device rows of node %s while lock_ref=1" % x.id)
+        evicted.append(x.id)
+        x.component_data["mamba"].value = None
+        order.remove(x)
+        tracker["mamba"] += 1
+
+    cache = types.SimpleNamespace(lru_lists={"mamba": lru}, evictable_device_leaves=[],
+                                  _evict_component_and_detach_lru=_evict,
+                                  _cascade_evict=lambda x, comp, tracker: None,
+                                  weg2_save_anchor_before_tombstone=lambda x: save(x, order))
+    comp = types.SimpleNamespace(cache=cache, component_type="mamba")
+    tracker = {"mamba": 0}
+    MambaComponent.drive_eviction(comp, types.SimpleNamespace(mamba_num=request or len(nodes)), tracker)
+    return evicted
+
+
+def test_a5_r3_pinned_after_save_is_not_tombstoned():
+    """R3 (#904 guard): the save's anchor-only backup pins `a` (inc_lock_ref) -- no tombstone."""
+    a, b = _node(1, 1000), _node(2, 2000)
+
+    def save(x, order):
+        if x is a:
+            x._pinned = True
+            order.remove(x)
+        return False
+
+    assert _drive_with([a, b], save) == [2]
+
+
+def test_r4_walk_terminates_when_every_save_takes_its_node_off():
+    nodes = [_node(i, 1000 * i) for i in range(1, 9)]
+
+    def save(x, order):
+        x._pinned = True
+        order.remove(x)
+        return False
+
+    assert _drive_with(nodes, save) == []
+
+
+def test_a4_r5_successor_taken_off_by_the_save_does_not_end_the_walk():
+    """R5: request 2; the save of `a` pins `b` -- the walk goes on at the LRU end AFTER a's tombstone."""
+    a, b, c = _node(1, 1000), _node(2, 2000), _node(3, 3000)
+
+    def save(x, order):
+        if x is a and b in order:
+            b._pinned = True
+            order.remove(b)
+        return False
+
+    assert _drive_with([a, b, c], save, request=2) == [1, 3]

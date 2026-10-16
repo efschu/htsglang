@@ -4869,6 +4869,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         """#1421 instrument (boot xsn172): the publish sweep printed refused=34
         with in_flight=2 for 90 s and the drain hit W3 -- write_backup said 0
         silently. Name the branch, rate-limited."""
+        # K15 review A1: the save reads WHICH pool refused (only a mamba-arena
+        # refusal can be served by a spill)
+        self._k15_last_refusal = str(why).split(":", 1)[0]
         try:
             _role = _r12.role()
             if _role == "host":
@@ -5806,6 +5809,19 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if not UnifiedRadixCache.k15_anchor_save_on() or getattr(node, "_weg2_evict_spilled", False):
             return False
         node._weg2_evict_spilled = True
+        if int(getattr(self, "pp_size", 1) or 1) > 1:
+            # K15 review A2/B2: on P (PP>1) the mamba arena slot is SHARED by the
+            # stages (drop_unreferenced frees it at the last releaser) -- a
+            # stage-local spill frees no slot but removes the victim's host
+            # anchor on this stage alone (the stages' anchors diverge, B5 lowers
+            # the told). Skipped, named; the save itself stays.
+            UnifiedRadixCache._k15_pp_skip_n = getattr(UnifiedRadixCache, "_k15_pp_skip_n", 0) + 1
+            k = UnifiedRadixCache._k15_pp_skip_n
+            if k <= 16 or k % 256 == 0:
+                logger.info("K15 EVICT-SPILL SKIPPED pp_size=%d pp_rank=%s node=%s (n=%d): a stage-local "
+                            "spill frees no shared mamba slot on P -- the anchor save is tried without it",
+                            int(self.pp_size), getattr(self, "pp_rank", "?"), getattr(node, "id", "?"), k)
+            return False
         try:
             return bool(self._weg2_flush_spill_room(node, mp))
         except Exception as exc:  # noqa: BLE001 - no room = the old drop, named by the caller
@@ -5846,8 +5862,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return False
         if getattr(node, "_weg2_capped", False) or node.write_through_pending_id is not None:
             return False   # the per-path cap took it by design / a write is already in flight
+        if _r12.role() == "worker":
+            # K15 review A3/B3: a Form A worker holds no recurrent state and no
+            # mamba arena -- TP0 decides and saves; the worker names no loss
+            return False
         written = 0
         for attempt in range(2):
+            self._k15_last_refusal = None
+            self._weg2_sweep_last_refusal = None
             try:
                 if node.backuped:
                     written = self.write_backup_anchor_only(node)
@@ -5858,6 +5880,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                                type(exc).__name__, exc)
                 written = 0
             if written or attempt:
+                break
+            # K15 review A1/B1: only a refusal BY THE MAMBA ARENA can be served by
+            # a spill -- after a KV arena_claim, a pin budget or a write_none the
+            # retry cannot succeed and the victim's host anchor would go for nothing
+            why = getattr(self, "_k15_last_refusal", None) or getattr(self, "_weg2_sweep_last_refusal", None)
+            if why not in ("mamba_claim", "anchor_only_claim"):
                 break
             mp = self._weg2_mamba_pool()
             if mp is None or not self._weg2_evict_spill_room(node, mp):
@@ -5879,7 +5907,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 logger.warning("WEG2-ANCHOR-LOST at=evict n=%d node=%s depth=%d backuped=%s why=%s (the "
                                "internal anchor had no host copy and none could be made -- tombstoned)",
                                n, getattr(node, "id", "?"), self.weg2_node_depth(node), node.backuped,
-                               getattr(self, "_weg2_sweep_last_refusal", "?"))
+                               getattr(self, "_k15_last_refusal", None)
+                               or getattr(self, "_weg2_sweep_last_refusal", None) or "?")
         return ok
 
     def _weg2_anchor_of(self, n, mp, allow_end=False):
