@@ -207,33 +207,110 @@ def test_futility_needs_every_p_rank_and_a_looking_spill(tmp_path, monkeypatch):
     monkeypatch.setattr(ARB, "_alive", lambda pid: True)
     since = ARB.now_ms()
     time.sleep(0.01)
-    RV.note_verdict(arena, 0, 0, False, pid=101)
-    RV.note_verdict(arena, 0, 0, False, pid=102)
+    RV.note_verdict(arena, 0, 0, False, pid=101, refs=0)
+    RV.note_verdict(arena, 0, 0, False, pid=102, refs=0)
     assert RV.futile(arena, since, pp_size=3) is None, "PP2 has not answered"
-    RV.note_verdict(arena, 0, 0, True, pid=103)
+    RV.note_verdict(arena, 0, 0, True, pid=103, refs=0)
     assert RV.futile(arena, since, pp_size=3) is None, "PP2's spill was in its backoff: it did not look"
-    RV.note_verdict(arena, 0, 0, False, pid=103)
+    RV.note_verdict(arena, 0, 0, False, pid=103, refs=0)
     assert RV.futile(arena, since, pp_size=3) is not None
-    RV.note_verdict(arena, 5, 0, False, pid=102)
+    RV.note_verdict(arena, 5, 0, False, pid=102, refs=0)
     assert RV.futile(arena, since, pp_size=3) is None, "PP1 released pages: room may come"
-    RV.note_verdict(arena, 0, 1, False, pid=102)
-    assert RV.futile(arena, since, pp_size=3) is None, "PP1 has a write in flight"
-    RV.note_verdict(arena, 0, 0, False, pid=102)
+    RV.note_verdict(arena, 0, 1, False, pid=102, refs=0)
+    assert RV.futile(arena, since, pp_size=3) is None, "PP1 has I/O in flight"
+    RV.note_verdict(arena, 0, 0, False, pid=102, refs=0)
     later = ARB.now_ms() + 5
     assert RV.futile(arena, later, pp_size=3) is None, "answers older than the last progress do not count"
 
 
-def test_transient_counts_only_host_backed_nodes_with_io_in_flight(tmp_path):
+def test_review_P4_a_serve_that_finds_room_never_ends_a_wait(tmp_path):
+    """Review A1 (probe P4): serve with deficit<=0 (8 free slots, need 4) wrote released=0 -> futile."""
     _need_module()
     be, arena = _setup(tmp_path, ["a"], slots=8)
-    t = _Tree(arena)
+    tree = _Tree(arena)
+    RR.tick(tree)
+    since = ARB.now_ms()
+    time.sleep(0.01)
+    RR.serve(tree, tree._weg2_direct_pool(), arena, 4, read_key=1)
+    assert RV.futile(arena, since, pp_size=1) is None
+
+
+def test_review_A1_only_answers_before_the_last_claim_round_count(tmp_path, monkeypatch):
+    _need_module()
+    be, arena = _setup(tmp_path, ["a"], slots=8)
+    monkeypatch.setattr(ARB, "_alive", lambda pid: True)
+    since = ARB.now_ms()
+    time.sleep(0.01)
+    claim_round = ARB.now_ms()
+    time.sleep(0.01)
+    RV.note_verdict(arena, 0, 0, False, pid=101, refs=0)          # answered AFTER the claim round started
+    assert RV.futile(arena, since, pp_size=1, until_ms=claim_round) is None, "no claim round ran after the answer"
+    assert RV.futile(arena, since, pp_size=1, until_ms=ARB.now_ms()) is not None
+
+
+def test_review_A2_a_pending_give_back_is_room_on_its_way(tmp_path, monkeypatch):
+    _need_module()
+    be, arena = _setup(tmp_path, ["a"], slots=8)
+    monkeypatch.setattr(ARB, "_alive", lambda pid: True)
+    since = ARB.now_ms()
+    time.sleep(0.01)
+    RV.note_verdict(arena, 0, 0, False, pid=101, refs=0)
+    RV.note_giveback(arena, "weg2-1-9", 8)
+    assert RV.futile(arena, since, pp_size=1) is None, "a yielded fill's references are on their way back"
+    tree = types.SimpleNamespace(ongoing_prefetch={"weg2-1-9": object()})
+    assert RV.reap_givebacks(arena, tree) == 0, "not reaped yet: the record stays"
+    tree.ongoing_prefetch = {}
+    assert RV.reap_givebacks(arena, tree) == 1 and not RV.givebacks(arena)
+    assert RV.futile(arena, since, pp_size=1) is not None
+
+
+def test_review_foreign_references_block_futility(tmp_path, monkeypatch):
+    """A slot frees only when EVERY holder lets go -- group D's references are no P rank's to answer for."""
+    _need_module()
+    be, arena = _setup(tmp_path, ["a"], slots=8)
+    _pin_pages(arena, 4)
+    monkeypatch.setattr(ARB, "_alive", lambda pid: True)
+    since = ARB.now_ms()
+    time.sleep(0.01)
+    RV.note_verdict(arena, 0, 0, False, pid=101, refs=1)           # P holds 1 of the 4 references
+    assert RV.futile(arena, since, pp_size=1) is None
+    RV.note_verdict(arena, 0, 0, False, pid=101, refs=4)
+    assert RV.futile(arena, since, pp_size=1) is not None
+    RV.note_verdict(arena, 0, 0, False, pid=101, refs=-1)          # no ledger: unknown
+    assert RV.futile(arena, since, pp_size=1) is None
+
+
+def test_review_A7_transient_is_an_o1_census_with_running_chunks_counted(tmp_path):
+    _need_module()
+    t = types.SimpleNamespace(ongoing_write_through={}, ongoing_backup={}, ongoing_load_back={},
+                              component_protected_size_={"full": 0})
     assert RV.transient_blocked(t) == 0
-    t.ongoing_write_through = {7: object()}
+    t.ongoing_backup = {1: object()}
     assert RV.transient_blocked(t) == 1
-    t.ongoing_write_through = {}
-    t.nodes[1].component_data.comps[0].host_lock_ref = 1      # a load-back reads these rows
+    t.ongoing_backup = {}
+    t.component_protected_size_ = {"full": 4096}                    # a running chunk's request holds a device lock
     assert RV.transient_blocked(t) == 1
-    t.nodes[1].component_data.comps[0].host_lock_ref = 0
-    t.nodes[1].component_data.comps[0].host_value = None       # no host copy: pins nothing
-    t.ongoing_write_through = {7: object()}
-    assert RV.transient_blocked(t) == 0
+    t.component_protected_size_ = {"full": 0}
+    t.ongoing_load_back = {7: object()}
+    assert RV.transient_blocked(t) == 1
+    # the cost the review asked for, measured: O(1), independent of the tree size
+    t.ongoing_load_back = {}
+    t0 = time.perf_counter()
+    for _ in range(20000):
+        RV.transient_blocked(t)
+    per_us = (time.perf_counter() - t0) / 20000 * 1e6
+    assert per_us < 50, per_us
+
+
+def test_review_A2_another_requests_holding_fill_blocks_futility(tmp_path, monkeypatch):
+    """A waiting fill of ANOTHER request that holds landed references is room the arbitration can still free."""
+    _need_module()
+    be, arena = _setup(tmp_path, ["a"], slots=8)
+    monkeypatch.setattr(ARB, "_alive", lambda pid: True)
+    since = ARB.now_ms()
+    time.sleep(0.01)
+    RV.note_verdict(arena, 0, 0, False, pid=101, refs=0)
+    ARB.register(arena, "weg2-8-2", held=8)
+    assert RV.futile(arena, since, pp_size=1, rid="weg2-8-1") is None
+    assert RV.futile(arena, since, pp_size=1, rid="weg2-8-2") is not None, "its own holding does not count"
+    assert RV.futile(arena, since, pp_size=1, rid="weg2-8-1", ignore_holders=True) is not None

@@ -424,6 +424,10 @@ def tick(cache: Any) -> int:
         _ST.poll_t = t_poll
         # ROOM-ARBITER 1016 (F3): PP0 announces which waiting request's fill may wait (the oldest); no-op elsewhere
         _arbiter.decide(arena)
+        # review A2: a yielded fill's give-back is room on its way until its read is reaped on this rank
+        from sglang.srt.weg2 import room_verdicts as _rv
+
+        _rv.reap_givebacks(arena, cache)
         return serve_unseen(cache, None, arena)
     except Exception:  # noqa: BLE001 - a room request never breaks the round
         logger.warning("%s tick raised", MARK, exc_info=True)
@@ -526,7 +530,9 @@ def serve(cache: Any, pool: Any, arena: Any, need: int, read_key: Any = None) ->
     from sglang.srt.weg2 import room_verdicts as _rv
 
     if d <= 0:
-        _rv.note_verdict(arena, 0, _rv.transient_blocked(cache), False)
+        # review A1: room is there (free + clock) or on its way (this rank let go of it for the read and a peer still
+        # holds it) -- never an answer that ends a wait
+        _rv.note_verdict(arena, 0, _rv.transient_blocked(cache), False, room_seen=True)
         _ST.served_empty += 1
         if n <= 16 or n % 64 == 0:
             logger.info("%s SERVE n=%d need=%d deficit=0 slots=%d complete=%d claimed=%d pinned=%d free=%d "

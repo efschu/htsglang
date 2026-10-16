@@ -64,16 +64,22 @@ def _backend(root):
 class _Tree:
     """PP0's tree: nothing it holds is spillable (the live-holder case of 11:27, ``served_nothing_to_spill``)."""
 
-    def __init__(self, arena, pp_rank=0, pp_size=1):
+    def __init__(self, arena, pp_rank=0, pp_size=1, held=()):
         self.arena = arena
         self.pp_rank, self.pp_size = pp_rank, pp_size
+        self.ongoing_prefetch = {}         # the reads in flight on this rank (a yielded read stays until its reap)
+        self.held = list(held)             # spillable tree copies (the 11:12:06 host-leaf spill), empty = live holders
         setattr(self, SF.FLOOR_LOCAL_PP_ATTR, True)
 
     def _weg2_direct_pool(self):
         return types.SimpleNamespace(arena=self.arena)
 
     def _w3_arena_spill(self, pool, need_pages, claimer=None, released_out=None):
-        return 0
+        take = self.held[: max(int(need_pages), 4)]
+        del self.held[: len(take)]
+        if take:
+            self.arena.ref_slots(take, -1)
+        return len(take)
 
 
 class _Scheduler:
@@ -152,30 +158,175 @@ class _Fill:
         return self.box["out"]
 
 
-def test_11_27_the_younger_fill_yields_and_the_oldest_lands_inside_the_bound(tmp_path, monkeypatch):
-    # F3 alone: F2 (ROOM-VERDICTS) would end the younger fill's futile wait by itself and hide a missing announcement
-    monkeypatch.setenv("SGLANG_WEG2_ROOM_VERDICTS", "0")
+def _run_pair(be, arena, tree, young, old, third=None, reap_after=0.4):
+    """The younger read lands what the free slots allow and waits; the older one arrives and waits. Production
+    configuration: ROOM-ARBITER and ROOM-VERDICTS both on. A yielded younger read stays in ``ongoing_prefetch`` until
+    its reap, which gives its landed references back ``reap_after`` s later (a scheduler round on every rank)."""
+    with _Scheduler(tree):
+        tree.ongoing_prefetch["weg2-7-12"] = object()
+        fy = _Fill(be, arena, "weg2-7-12", young, "hicache-prefetch-io-1").start()
+        time.sleep(0.4)
+        fo = _Fill(be, arena, "weg2-7-11", old, "hicache-prefetch-io-2").start()
+        out_y = fy.join()
+        landed_y = [s for s in out_y if s is not None]
+        ft = None
+        if third:
+            time.sleep(0.15)
+            ft = _Fill(be, arena, "weg2-7-13", third, "hicache-prefetch-io-3").start()
+        time.sleep(reap_after)
+        arena.ref_slots(landed_y, -1)        # the reap's #257 cut of the younger short read
+        tree.ongoing_prefetch.pop("weg2-7-12", None)
+        if ft is not None:
+            ft.join()
+        out_o = fo.join()
+    return fy, fo, landed_y, sum(1 for s in out_o if s is not None)
+
+
+def test_11_27_the_younger_fill_yields_and_the_oldest_lands(tmp_path, caplog):
+    """Both switches on (the production default). The younger read holds 8 landed references and gains nothing:
+    proven hold-and-wait -> it yields; its give-back is room on its way, so the older read is NOT futile meanwhile
+    (review A2) and lands everything once the reap gave the references back."""
     young = [f"y{i}" for i in range(12)]
     old = [f"o{i}" for i in range(8)]
     be, arena = _setup(tmp_path, young + old, slots=32)
     _pin_pages(arena, 24)                                   # live holders nothing can spill: 8 slots free
     tree = _Tree(arena)
+    tree._w3_spill_quiet_until = time.monotonic() + 0.6    # the younger's own wait is not futile before the older comes
+    # the younger's proof of hold-and-wait is a fresh answer round after the backoff -- a repost away (300 ms here)
+    with envs.SGLANG_WEG2_READ_ROOM_REPOST_MS.override(300), caplog.at_level("INFO"):
+        fy, fo, landed_y, landed_o = _run_pair(be, arena, tree, young, old)
+    assert len(landed_y) == 8
+    assert landed_o == len(old), landed_o
+    assert fy.t1 - fo.t0 < 1.5, "the younger fill held its pages after the older one began to wait"
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("ROOM-ARBITER YIELD" in m for m in msgs)
+
+
+def test_review_P7_a_third_fill_posting_meanwhile_does_not_make_the_oldest_futile(tmp_path):
+    young = [f"y{i}" for i in range(12)]
+    old = [f"o{i}" for i in range(8)]
+    third = [f"t{i}" for i in range(4)]
+    be, arena = _setup(tmp_path, young + old + third, slots=32)
+    _pin_pages(arena, 24)
+    tree = _Tree(arena)
+    tree._w3_spill_quiet_until = time.monotonic() + 0.45
+    fy, fo, landed_y, landed_o = _run_pair(be, arena, tree, young, old, third=third, reap_after=0.25)
+    assert landed_o == len(old), "the oldest's wait ended futile while the yielded references were on their way"
+
+
+def test_review_A3_pairs_of_11_12_12_both_land_when_the_room_comes(tmp_path, caplog):
+    """11:12:12 / 11:13:22 (boot 103428): concurrent waits that ENDED WELL (still_full=0), the room came from the
+    trees' spill. The younger has progress and must not be sent away."""
+    young = [f"y{i}" for i in range(12)]
+    old = [f"o{i}" for i in range(8)]
+    be, arena = _setup(tmp_path, young + old, slots=32)
+    spillable = _pin_pages(arena, 24)
+    tree = _Tree(arena, held=spillable)
+    with caplog.at_level("INFO"):
+        fy, fo, landed_y, landed_o = _run_pair(be, arena, tree, young, old, reap_after=0.0)
+    assert len(landed_y) == len(young), len(landed_y)
+    assert landed_o == len(old)
+    assert not any("ROOM-ARBITER YIELD" in r.getMessage() for r in caplog.records)
+
+
+def test_review_A3_trickling_room_keeps_the_younger_fill_waiting(tmp_path, caplog):
+    """11:12:06 shape: the trees' spill hands room back in pieces (a few pages per serve, a serve per post): the
+    younger read gains slots between long rounds without progress -- room comes, so it is no hold-and-wait."""
+    young = [f"y{i}" for i in range(16)]
+    old = [f"o{i}" for i in range(4)]
+    be, arena = _setup(tmp_path, young + old, slots=24)
+    spillable = _pin_pages(arena, 20)                       # 4 slots free; the rest comes 4 pages per serve
+    tree = _Tree(arena, held=spillable)
+
+    def spill_four(pool, need_pages, claimer=None, released_out=None):
+        take = tree.held[:4]
+        del tree.held[:4]
+        if take:
+            arena.ref_slots(take, -1)
+        return len(take)
+
+    tree._w3_arena_spill = spill_four
+    with envs.SGLANG_WEG2_READ_ROOM_REPOST_MS.override(300), caplog.at_level("INFO"):
+        fy, fo, landed_y, landed_o = _run_pair(be, arena, tree, young, old, reap_after=0.0)
+    assert not any("ROOM-ARBITER YIELD" in r.getMessage() for r in caplog.records)
+    assert len(landed_y) == len(young), len(landed_y)
+
+
+def test_review_A3_an_ended_owner_sends_nobody_away(tmp_path):
+    """PP0's header still names an owner whose fills ended (until PP0's next round): no fill yields to it."""
+    be, arena = _setup(tmp_path, ["a"], slots=8)
+    tree = _Tree(arena)
+    RR.tick(tree)
+    since = ARB.now_ms()
+    time.sleep(0.01)
+    slot = ARB.register(arena, "weg2-4-10")
+    ARB.register(arena, "weg2-4-11")
+    assert ARB.decide(arena)[0] == ARB.rid_hash("weg2-4-10")
+    assert not ARB.may_wait(arena, "weg2-4-11", since_ms=since)
+    ARB.unregister(arena, slot, "weg2-4-10")                 # the owner's fill ended; PP0 has not decided again
+    assert ARB.may_wait(arena, "weg2-4-11", since_ms=since)
+
+
+def test_review_A3_a_younger_fill_that_holds_nothing_is_no_hold_and_wait(tmp_path, caplog):
+    young = [f"y{i}" for i in range(4)]
+    old = [f"o{i}" for i in range(4)]
+    be, arena = _setup(tmp_path, young + old, slots=16)
+    _pin_pages(arena, 16)                                   # nothing free: the younger lands nothing
+    tree = _Tree(arena)
+    tree._w3_spill_quiet_until = time.monotonic() + 5.0    # no futility either: only the arbiter could end it
+    with envs.SGLANG_WEG2_READ_ROOM_WAIT_MS.override(800), caplog.at_level("INFO"):
+        fy, fo, landed_y, landed_o = _run_pair(be, arena, tree, young, old, reap_after=0.0)
+    assert not landed_y
+    assert not any("ROOM-ARBITER YIELD" in r.getMessage() for r in caplog.records)
+
+
+def test_review_A4_a_terminated_operation_ends_the_wait_and_leaves_the_arbitration(tmp_path):
+    stems = [f"r{i}" for i in range(4)]
+    be, arena = _setup(tmp_path, stems, slots=8)
+    _pin_pages(arena, 8)
+    tree = _Tree(arena)
+    tree._w3_spill_quiet_until = time.monotonic() + 5.0
+    op = types.SimpleNamespace(flag=False)
+    op.is_terminated = lambda: op.flag
+    box = {}
+
+    def run():
+        with ARB.fill_scope("weg2-2-20", op):
+            t0 = time.monotonic()
+            box["out"] = HiCacheFile.arena_fill_from_disk(be, arena, stems, TOTAL, prefix=True, take_ref=True)
+            box["s"] = time.monotonic() - t0
+
     with _Scheduler(tree):
-        fy = _Fill(be, arena, "weg2-7-12", young, "hicache-prefetch-io-1").start()
-        time.sleep(0.4)                                     # the younger read landed 8 and waits for 4 more
-        fo = _Fill(be, arena, "weg2-7-11", old, "hicache-prefetch-io-2").start()
-        out_y = fy.join()
-        # the reap's #257 cut of the younger short read: its landed references go back
-        landed_y = [s for s in out_y if s is not None]
-        assert len(landed_y) == 8, out_y
-        arena.ref_slots(landed_y, -1)
-        out_o = fo.join()
-    landed_o = sum(1 for s in out_o if s is not None)
-    o_wait = fo.t1 - fo.t0
-    y_after_o = fy.t1 - fo.t0
-    assert landed_o == len(old), (landed_o, o_wait)
-    assert y_after_o < 1.5, f"the younger fill held its pages {y_after_o:.2f}s after the older one began to wait"
-    assert o_wait < 2.0, f"the older fill waited {o_wait:.2f}s (bound {BOUND_MS} ms)"
+        th = threading.Thread(target=run, name="hicache-prefetch-io-0")
+        th.start()
+        time.sleep(0.3)
+        assert any(h == ARB.rid_hash("weg2-2-20") for h, _k, _p, _pr in ARB.registrations(arena))
+        op.flag = True                                       # the client aborted: the read is terminated
+        th.join(10)
+    assert box["s"] < 1.0, box["s"]
+    assert not any(h == ARB.rid_hash("weg2-2-20") for h, _k, _p, _pr in ARB.registrations(arena))
+
+
+def test_review_P5_a_newcomer_registered_during_pp0s_read_is_not_sent_away(tmp_path, monkeypatch):
+    be, arena = _setup(tmp_path, ["a"], slots=8)
+    tree = _Tree(arena, pp_rank=0, pp_size=3)
+    RR.tick(tree)
+    ARB.register(arena, "weg2-3-50")
+    real = ARB.registrations
+    box = {}
+
+    def regs_then_newcomer(a):
+        out = real(a)
+        box["slot"] = ARB.register(arena, "weg2-3-40")       # older newcomer registers right after PP0's read
+        box["since"] = ARB.now_ms()
+        time.sleep(0.003)
+        return out
+
+    monkeypatch.setattr(ARB, "registrations", regs_then_newcomer)
+    ARB._A.pp_rank = 0
+    assert ARB.decide(arena)[0] == ARB.rid_hash("weg2-3-50")
+    monkeypatch.setattr(ARB, "registrations", real)
+    assert ARB.may_wait(arena, "weg2-3-40", since_ms=box["since"])
 
 
 def test_a_follower_acts_on_pp0s_announcement_only(tmp_path):

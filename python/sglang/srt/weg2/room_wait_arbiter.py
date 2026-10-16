@@ -46,8 +46,9 @@ ENV = "SGLANG_WEG2_ROOM_ARBITER"
 _HDR = struct.Struct("<QQQQQQQQ")
 _MAGIC = 0x52304F4D32524F31
 #: wait registrations: rid hash, age key (0 = none parsed), pid, t_ms (refreshed by the waiting fill), active,
-#: priority (PRIO 1016: the request's ``priority`` as the front normalised it; 0 = none)
-_W = struct.Struct("<QQQQQQ")
+#: priority (PRIO 1016: the request's ``priority`` as the front normalised it; 0 = none), held (review 1016: the
+#: landed references this fill holds -- potential room another fill's futility must not ignore)
+_W = struct.Struct("<QQQQQQQ")
 _WAIT_SLOTS = 64
 _W_OFF = _HDR.size
 _SIZE_F3 = _W_OFF + _WAIT_SLOTS * _W.size
@@ -93,14 +94,30 @@ def age_key(rid: Any) -> int:
 # --- the fill's request (prefetch io thread) ---------------------------------------------------------
 
 @contextlib.contextmanager
-def fill_scope(rid: Any) -> Iterator[None]:
-    """``_arena_page_get`` names the request of the fill it runs on this thread."""
-    prev = getattr(_TL, "rid", None)
+def fill_scope(rid: Any, op: Any = None) -> Iterator[None]:
+    """``_arena_page_get`` names the request of the fill it runs on this thread, and its PrefetchOperation (review
+    A4: a terminated operation -- abort, release, reset -- ends the room wait and leaves the arbitration)."""
+    prev, prev_op = getattr(_TL, "rid", None), getattr(_TL, "op", None)
     _TL.rid = None if rid is None else str(rid)
+    _TL.op = op
     try:
         yield
     finally:
-        _TL.rid = prev
+        _TL.rid, _TL.op = prev, prev_op
+
+
+def current_op() -> Any:
+    return getattr(_TL, "op", None)
+
+
+def op_terminated(op: Any) -> bool:
+    fn = getattr(op, "is_terminated", None)
+    if not callable(fn):
+        return False
+    try:
+        return bool(fn())
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def current_rid() -> Optional[str]:
@@ -209,7 +226,7 @@ def _wait_slot(m: mmap.mmap, me: int, h: int) -> int:
     now = _now_ms()
     for s in range(_WAIT_SLOTS):
         off = _W_OFF + s * _W.size
-        wh, _k, pid, t, act, _p = _W.unpack(m[off:off + _W.size])
+        wh, _k, pid, t, act, _p, _hd = _W.unpack(m[off:off + _W.size])
         if pid == me and wh == h:
             return s
         if free is None and (not act or now - t > _STALE_MS):
@@ -219,7 +236,7 @@ def _wait_slot(m: mmap.mmap, me: int, h: int) -> int:
     return free if free is not None else oldest[0]
 
 
-def register(arena: Any, rid: str) -> Optional[int]:
+def register(arena: Any, rid: str, held: int = 0) -> Optional[int]:
     """The fill of ``rid`` waits (or keeps waiting) for room: (re)write its registration, refreshed per round.
     The caller keeps :func:`now_ms` of its FIRST registration (``may_wait(since_ms=)``)."""
     m = mapped(arena, create=True)
@@ -229,7 +246,7 @@ def register(arena: Any, rid: str) -> Optional[int]:
     with _LOCK:
         s = _wait_slot(m, me, h)
         off = _W_OFF + s * _W.size
-        m[off:off + _W.size] = _W.pack(h, age_key(rid), me, _now_ms(), 1, priority_of(rid))
+        m[off:off + _W.size] = _W.pack(h, age_key(rid), me, _now_ms(), 1, priority_of(rid), max(0, int(held)))
     return s
 
 
@@ -242,9 +259,9 @@ def unregister(arena: Any, slot: Optional[int], rid: str) -> None:
     off = _W_OFF + int(slot) * _W.size
     with _LOCK:
         try:
-            wh, _k, pid, _t, _a, _p = _W.unpack(m[off:off + _W.size])
+            wh, _k, pid, _t, _a, _p, _hd = _W.unpack(m[off:off + _W.size])
             if pid == os.getpid() and wh == rid_hash(rid):
-                m[off:off + _W.size] = _W.pack(0, 0, 0, 0, 0, 0)
+                m[off:off + _W.size] = _W.pack(0, 0, 0, 0, 0, 0, 0)
         except (ValueError, struct.error):
             pass
 
@@ -259,12 +276,32 @@ def registrations(arena: Any) -> List[Tuple[int, int, int, int]]:
     for s in range(_WAIT_SLOTS):
         off = _W_OFF + s * _W.size
         try:
-            h, k, pid, t, act, pr = _W.unpack(m[off:off + _W.size])
+            h, k, pid, t, act, pr, _hd = _W.unpack(m[off:off + _W.size])
         except (ValueError, struct.error):
             continue
         if not act or not h or now - t > _STALE_MS or not _alive(int(pid)):
             continue
         out.append((int(h), int(k), int(pid), int(pr)))
+    return out
+
+
+def holders(arena: Any, exclude_rid: Optional[str] = None) -> List[Tuple[int, int, int]]:
+    """``[(rid hash, pid, held)]`` of live waiting fills of OTHER requests that hold landed references -- room the
+    arbitration can still free (the younger one yields), so no wait is futile while one exists (review 1016)."""
+    m = mapped(arena, create=False)
+    if m is None:
+        return []
+    skip = rid_hash(exclude_rid) if exclude_rid is not None else None
+    now, out = _now_ms(), []
+    for s in range(_WAIT_SLOTS):
+        off = _W_OFF + s * _W.size
+        try:
+            h, _k, pid, t, act, _pr, hd = _W.unpack(m[off:off + _W.size])
+        except (ValueError, struct.error):
+            continue
+        if not act or not h or not hd or h == skip or now - t > _STALE_MS or not _alive(int(pid)):
+            continue
+        out.append((int(h), int(pid), int(hd)))
     return out
 
 
@@ -303,6 +340,7 @@ def decide(arena: Any) -> Optional[Tuple[int, int]]:
     nobody waits. Returns the announced ``(rid hash, age key)`` (None = nobody waits / not PP0 / not mapped)."""
     if not enabled() or not is_pp0():
         return None
+    t_dec = _now_ms()   # review A5: stamped BEFORE the read -- a fill registering after it was not seen
     regs = registrations(arena)
     m = mapped(arena, create=True)
     if m is None:
@@ -311,12 +349,12 @@ def decide(arena: Any) -> Optional[Tuple[int, int]]:
         if _A.announced != (0, 0):
             _A.announced = (0, 0)
             with _LOCK:
-                m[0:_HDR.size] = _HDR.pack(_MAGIC, 0, 0, os.getpid(), _A.seq, _now_ms(), _A.pp_size, 0)
+                m[0:_HDR.size] = _HDR.pack(_MAGIC, 0, 0, os.getpid(), _A.seq, t_dec, _A.pp_size, 0)
         return None
     h, k, _pr = min(((h, k, pr) for h, k, _p, pr in regs), key=lambda hkp: _order_key(*hkp))
     _A.seq += 1
     with _LOCK:
-        m[0:_HDR.size] = _HDR.pack(_MAGIC, h, k, os.getpid(), _A.seq, _now_ms(), _A.pp_size, 0)
+        m[0:_HDR.size] = _HDR.pack(_MAGIC, h, k, os.getpid(), _A.seq, t_dec, _A.pp_size, 0)
     if (h, k) != _A.announced:
         _A.announced = (h, k)
         _A.announces += 1
@@ -354,6 +392,8 @@ def may_wait(arena: Any, rid: Optional[str], since_ms: Optional[int] = None) -> 
         return True
     if since_ms is not None and o[3] <= int(since_ms):
         return True
+    if not any(h == o[0] for h, _k, _p, _pr in registrations(arena)):
+        return True   # the owner's fills no longer wait (ended / aborted): no announcement to yield to
     return False
 
 
@@ -387,3 +427,4 @@ def reset_for_tests() -> None:
     _A.ended_young = 0
     _A.announces = 0
     _TL.rid = None
+    _TL.op = None

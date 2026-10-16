@@ -4238,7 +4238,7 @@ class HiCacheFile(HiCacheStorage):
         _arb = None
         _arb_rid = _arbiter.current_rid()
         if _rr_iv is not None and _arb_rid is not None and _arbiter.enabled():
-            _arb = [_arbiter.register(arena, _arb_rid), _arb_rid, False, _arbiter.now_ms()]
+            _arb = [_arbiter.register(arena, _arb_rid), _arb_rid, False, _arbiter.now_ms(), False, 0]
         # ROOM-VERDICTS 1016 (F2): [since t_ms (the post, then each progress), evidence] -- armed waits only
         _rv = None
         if _rr_iv is not None and _room_verdicts.enabled():
@@ -4252,9 +4252,12 @@ class HiCacheFile(HiCacheStorage):
             if _rv is not None and _rv[1]:
                 _room_verdicts.note_futile(len(pend), (time.perf_counter() - t0) * 1000.0, _rv[1])
             if _arb is not None:
-                _arbiter.unregister(arena, _arb[0], _arb_rid)
                 if _arb[2]:
+                    # review A2: the yielded fill's landed references come back at its reap -- room on its way;
+                    # recorded BEFORE the registration (its held count) goes, so no instant shows neither
+                    _room_verdicts.note_giveback(arena, _arb_rid, _arb[5])
                     _arbiter.note_ended_young(arena, _arb_rid, len(pend))
+                _arbiter.unregister(arena, _arb[0], _arb_rid)
         _ROOM_WAIT_N[0] += 1
         k = _ROOM_WAIT_N[0]
         if pend:
@@ -4270,34 +4273,42 @@ class HiCacheFile(HiCacheStorage):
     def _await_fill_room_loop(self, arena, pend, got, total_bytes, out, joined, stats, live, idle_ms, deadline,
                               last_move, read_now, rounds, read_id, arb=None, rv=None):
         """The rounds of ``_await_fill_room`` (split out so the room-wait lifesign closes in a ``finally``).
-        ``arb`` = ``[wait slot, rid, yielded, registered t_ms]`` of ROOM-ARBITER (F3, weg2/room_wait_arbiter.py):
-        refreshed per round; the wait ends the round PP0 -- having seen this fill's registration -- announces another
-        (older) request as the one that waits (``yielded`` set). Only the oldest request's fill waits for room.
-        ``rv`` = ``[since t_ms, evidence]`` of ROOM-VERDICTS (F2, weg2/room_verdicts.py): the wait ends the round
-        every P rank has answered after ``since`` with nothing released and nothing in flight; progress moves
+        ``arb`` = ``[wait slot, rid, yielded, registered t_ms, terminated, held]`` of ROOM-ARBITER (F3,
+        weg2/room_wait_arbiter.py); ``rv`` = ``[since t_ms, evidence]`` of ROOM-VERDICTS (F2, weg2/room_verdicts.py).
+        Per round (review 1016 A1-A4): a terminated operation ends the wait (A4); then the claim round -- joins on
+        stems another writer fills included; a round WITHOUT progress may end the wait in two ways only:
+        (A3) PROVEN hold-and-wait -- this fill holds landed references, its claim round gained nothing, and PP0,
+        having seen its registration, announced an older request whose fill still waits: it yields and records its
+        give-back (A2: room on its way until the reap); (A1) futility -- every P rank answered after the last
+        progress and BEFORE this claim round with nothing released, nothing in flight, no room seen. Progress moves
         ``since``. The idle bound stays as the lifesign limit."""
+        _op = _arbiter.current_op()
         while pend and time.perf_counter() < deadline:
             if live and time.perf_counter() - last_move >= idle_ms / 1000.0:
                 break
+            if _op is not None and _arbiter.op_terminated(_op):
+                if arb is not None:
+                    arb[4] = True
+                break
+            _defer = False
             if arb is not None:
-                if not _arbiter.may_wait(arena, arb[1], since_ms=arb[3]):
-                    arb[2] = True
-                    break
-                arb[0] = _arbiter.register(arena, arb[1])
-            if rv is not None:
-                ev = _room_verdicts.futile(arena, rv[0])
-                if ev:
-                    rv[1] = ev
-                    break
+                _held0 = sum(1 for x in out if x is not None) + len(got)
+                arb[0] = _arbiter.register(arena, arb[1], _held0)
+                # an older request, announced by PP0 after this fill registered, still waits: a fill that holds
+                # nothing does not compete for its room this round (PRIO = ALTER); it keeps its place and waits
+                _defer = _held0 == 0 and not _arbiter.may_wait(arena, arb[1], since_ms=arb[3])
             time.sleep(0.025)
             rounds += 1
             if rounds % 40 == 0:
                 # paced inside; a lost post is re-asked; the same read id (review A3)
                 _read_room.post(arena, len(pend), site="room_wait", read_id=read_id)
+            if _defer:
+                continue
             try:
                 self._arena_evict_to_disk(arena, max(256, len(pend)), need=len(pend))
             except Exception:  # noqa: BLE001
                 pass
+            _t_claim = _arbiter.now_ms()
             nxt = []
             for (i, st), (slot, status, gen) in zip(
                     pend, _fill_claim(arena, [st for _, st in pend], int(total_bytes))):
@@ -4319,15 +4330,35 @@ class HiCacheFile(HiCacheStorage):
                     joined.append((i, slot, gen))
                 elif status == 4:
                     nxt.append((i, st))
+            _progress = len(nxt) < len(pend) or bool(got)
             if live and (len(nxt) < len(pend)):
                 last_move = time.perf_counter()
-            if rv is not None and (len(nxt) < len(pend) or got):
+            if rv is not None and _progress:
                 rv[0] = _arbiter.now_ms()
+            _held = sum(1 for x in out if x is not None) + len(got)
             if live and got:
                 self._arena_fill_read_todo(arena, got, int(total_bytes), out, stats)
                 read_now += len(got)
                 got = []
             pend = nxt
+            if not pend or _progress:
+                continue
+            if arb is not None and _held > 0 and not _arbiter.may_wait(arena, arb[1], since_ms=arb[3]):
+                # review A3: hold-and-wait is PROVEN only by this fill's own futility evidence -- every P rank answered
+                # after its last progress (and before this claim round) with nothing released, nothing in flight, no
+                # room seen, no give-back pending: room that trickles in (a spill per serve) keeps it waiting. Without
+                # ROOM-VERDICTS (switch off) a round without progress is all the evidence there is.
+                if rv is None or _room_verdicts.futile(arena, rv[0], until_ms=_t_claim, rid=arb[1],
+                                                       ignore_holders=True):
+                    arb[2] = True
+                    arb[5] = _held
+                    break
+            if rv is not None:
+                ev = _room_verdicts.futile(arena, rv[0], until_ms=_t_claim,
+                                           rid=arb[1] if arb is not None else _arbiter.current_rid())
+                if ev:
+                    rv[1] = ev
+                    break
         return pend, got, read_now, rounds
 
     def _arena_fill_read_todo(self, arena, todo, total_bytes: int, out, stats) -> None:
