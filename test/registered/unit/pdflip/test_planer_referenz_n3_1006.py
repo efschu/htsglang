@@ -626,6 +626,37 @@ class TestCheckpointSnapshot(unittest.TestCase):
             with self.assertRaises(FileNotFoundError):
                 O.snapshot_checkpoint(td, os.path.join(td, "out"))
 
+    def test_a_checkpoint_gitattributes_is_stored_escaped_and_rebuilt_verbatim(self):
+        """14.10. image probe build: a checkpoint's ``.gitattributes`` stored under its own name made git treat the snapshot's
+        blobs as LFS objects (host_build.sh: "src-27b/ nicht sauber"). Stored as ``.gitattributes.snapshot``; the stub has the
+        real name and bytes; a snapshot written before the escape (verbatim name) still rebuilds."""
+        attrs = b"*.gz filter=lfs diff=lfs merge=lfs -text\nmodel.safetensors.index.json filter=lfs diff=lfs merge=lfs -text\n"
+        with tempfile.TemporaryDirectory(prefix="ap0-snap-") as td:
+            src = os.path.join(td, "Some-Model")
+            os.makedirs(src)
+            for fn, data in (("config.json", b'{"a": 1}'), (".gitattributes", attrs), (".gitignore", b"*.bin\n")):
+                with open(os.path.join(src, fn), "wb") as fh:
+                    fh.write(data)
+            snap = O.snapshot_checkpoint(src, os.path.join(td, "snap"))
+            stored = sorted(os.listdir(os.path.join(snap, "files")))
+            self.assertEqual(stored, [".gitattributes.snapshot", ".gitignore.snapshot", "config.json"])
+            names = sorted(e["name"] for e in O.read_snapshot_manifest(snap)["files"])
+            self.assertEqual(names, [".gitattributes", ".gitignore", "config.json"])
+            stub = O.materialize_checkpoint(snap, os.path.join(td, "farm"))
+            self.assertEqual(sorted(os.listdir(stub)), names)
+            self.assertEqual(_read(os.path.join(stub, ".gitattributes")), attrs.decode())
+            # the old layout (verbatim name in files/) still materialises
+            os.rename(os.path.join(snap, "files", ".gitattributes.snapshot"), os.path.join(snap, "files", ".gitattributes"))
+            stub = O.materialize_checkpoint(snap, os.path.join(td, "farm2"))
+            self.assertEqual(_read(os.path.join(stub, ".gitattributes")), attrs.decode())
+
+    def test_no_committed_snapshot_carries_a_git_control_file(self):
+        """No file named .gitattributes/.gitignore/.gitmodules below a committed snapshot: git would apply it to the fixture."""
+        for name, d in _snapshots().items():
+            for dp, _dirs, fs in os.walk(d):
+                bad = sorted(set(fs) & set(O._SNAPSHOT_GIT_NAMES))
+                self.assertEqual(bad, [], "%s: %s" % (dp, bad))
+
     def test_committed_snapshots_are_well_formed(self):
         """Whatever snapshot is committed rebuilds, and its headers fit their recorded sizes (nothing truncated)."""
         for name, d in _snapshots().items():
