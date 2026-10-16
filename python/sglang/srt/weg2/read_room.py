@@ -594,11 +594,25 @@ def serve(cache: Any, pool: Any, arena: Any, need: int, read_key: Any = None) ->
     return released
 
 
+def _l3_strict() -> bool:
+    try:
+        from sglang.srt.environ import envs
+
+        return bool(envs.SGLANG_WEG2_L3_PRESENT_STRICT.get())
+    except Exception:  # noqa: BLE001 - a hermetic tree without the field: default on
+        return True
+
+
 def l3_complete(node: Any, sec: Dict[str, int]) -> bool:
     """Review readroomd B3: ``secure_rows_to_l3`` proved that EVERY page of ``node`` has an L3 copy -- no page lost,
     none unpaired (the QS pair gate wrote nothing), the COMPLETE pages are all the node's pages (``len(hash_value)``;
     a page some owner has not finished drops out of ``pages``) and each is on disk or was written now."""
-    if int(sec.get("lost", 0)) or int(sec.get("unpaired", 0)):
+    if int(sec.get("lost", 0)):
+        return False
+    if not _l3_strict():
+        # SGLANG_WEG2_L3_PRESENT_STRICT=0 (H16P A2's switch): the old rule, byte for byte -- lost=0 and a page at all
+        return int(sec.get("pages", 0)) > 0
+    if int(sec.get("unpaired", 0)):
         return False
     pages = int(sec.get("pages", 0))
     hv = getattr(node, "hash_value", None)
