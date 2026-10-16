@@ -199,52 +199,48 @@ class TestPoolPlanStillHoldsTheHead:
 
 
 class TestTheInstrument:
+    """After SEAT-AT-HAND-OFF (seatgate dbecd49737) the causes ``seat-gate`` and ``k10-rvp-only`` have no object:
+    the gate and K10 are removed, so the instrument names ``stall`` > ``state`` > ``other``."""
+
     def _f(self, queue, state="serving"):
         return types.SimpleNamespace(queue=collections.deque(queue), state=state, epoch=7, counters={},
                                      tp_prefill_max_tokens=5713)
 
-    @pytest.mark.parametrize("stalled,dc,k10,state,cause", [
-        (True, 0, False, "serving", "stall"), (False, 3, False, "serving", "seat_gate"),
-        (False, 0, True, "serving", "k10_rvp_only"), (False, 0, False, "flipping", "state"),
-        (False, 0, False, "serving", "other")])
-    def test_causes(self, loop, stalled, dc, k10, state, cause):
+    @pytest.mark.parametrize("stalled,state,cause", [
+        (True, "serving", "stall"), (False, "flipping", "state"), (False, "serving", "other")])
+    def test_causes(self, loop, stalled, state, cause):
         f = self._f([_real_pending(loop, "l", 9000)], state=state)
-        F.Front._p_end_over_x_left(f, stalled, dc, k10)
+        F.Front._p_end_over_x_left(f, stalled)
         assert f.counters == {"p_end_over_x_left_" + cause: 1}
 
-    @pytest.mark.parametrize("stalled,dc,k10,state,cause", [
-        (True, 3, False, "serving", "stall"),            # stall + seat gate: the stall wins (documented precedence)
-        (True, 0, True, "flipping", "stall"), (False, 3, True, "flipping", "seat_gate"),
-        (False, 0, True, "flipping", "k10_rvp_only")])
-    def test_precedence(self, loop, stalled, dc, k10, state, cause):
-        f = self._f([_real_pending(loop, "l", 9000)], state=state)
-        F.Front._p_end_over_x_left(f, stalled, dc, k10)
-        assert f.counters == {"p_end_over_x_left_" + cause: 1}
+    def test_precedence_stall_over_state(self, loop):
+        """Review A2 (Md): stall and a front leaving "serving" at once -> ``stall`` (P's own refusal comes first)."""
+        f = self._f([_real_pending(loop, "l", 9000)], state="flipping")
+        F.Front._p_end_over_x_left(f, True)
+        assert f.counters == {"p_end_over_x_left_stall": 1}
 
     def test_silent_when_nothing_needs_p(self, loop):
         f = self._f([_real_pending(loop, "s", 20, d_eligible=True)])
-        F.Front._p_end_over_x_left(f, False, 0, False)
+        F.Front._p_end_over_x_left(f, False)
         assert f.counters == {}
 
 
-class TestSeatGateStaysHard:
-    """Review A1: the seat gate's cap (``max_dispatch=_dc_cap``) is hard -- no exemption rides past it."""
+class TestOnSeatAtHandOff:
+    """Merge with desk/nf-h16q-seatgate-1015 @ dbecd49737: the P phase carries no D seat cap any more, so review A1
+    ("the seat gate's cap stays hard against the exemption") has no object -- there is no seat cap to ride past.
+    What holds instead: the exemption never depends on D's seats, and is never switched off."""
 
-    def test_for_dc_cap_positive_there_is_no_exemption(self, loop):
-        f = _front(5713)
-        assert F.Front._p_phase_cap_exempt_for(f, 3) is None
-        assert callable(F.Front._p_phase_cap_exempt_for(f, 0))
+    def test_the_exemption_is_never_none(self, monkeypatch):
+        from sglang.srt.environ import envs
+        for on in (True, False):
+            monkeypatch.setattr(envs.SGLANG_WEG2_ENABLE_P_PHASE_SHORT_RIDES, "get", lambda on=on: on)
+            assert callable(F.Front._p_phase_cap_exempt_pred(_front(5713)))
 
-    def test_pool_leaves_the_over_x_rest_under_the_seat_gate(self, loop):
-        f = _front(5713)
-        mk = lambda: [_real_pending(loop, f"l{i}", 9000) for i in range(4)] + [_real_pending(loop, "s", 20, d_eligible=True)]
-        done, left, _ = _drain(mk(), 2, F.Front._p_phase_cap_exempt_for(f, 2), limit=2)   # _dc_cap = 2 seats
-        assert done == ["l0", "l1"] and left == ["l2", "l3", "s"]
-        done, left, _ = _drain(mk(), 2, F.Front._p_phase_cap_exempt_for(f, 0), limit=2)   # no seat gate
-        assert left == [] and len(done) == 5
-
-    def test_controller_asks_the_one_method_with_the_seat_cap(self):
-        assert "cap_exempt=Front._p_phase_cap_exempt_for(self, _dc_cap)" in inspect.getsource(F)
+    def test_no_seat_condition_left_in_the_p_phase(self):
+        src = inspect.getsource(F)
+        assert "_dc_cap" not in src and "_k10_only" not in src and "_p_phase_cap_exempt_for" not in src
+        assert "cap_exempt=Front._p_phase_cap_exempt_pred(self))" in src
+        assert "cap_exempt=(self._p_phase_short_rides" not in src  # seatgate's side of the conflict lost
 
 
 class TestSwitchDoesNotHoldTheDefectFix:
@@ -256,16 +252,101 @@ class TestSwitchDoesNotHoldTheDefectFix:
         mk = lambda: ([_real_pending(loop, f"l{i}", 9000) for i in range(6)]
                       + [_real_pending(loop, "over-x", 7199), _real_pending(loop, "short", 25, d_eligible=True)])
         monkeypatch.setattr(envs.SGLANG_WEG2_ENABLE_P_PHASE_SHORT_RIDES, "get", lambda: False)
-        done, left, _ = _drain(mk(), 6, F.Front._p_phase_cap_exempt_for(f, 0), limit=6)
+        done, left, _ = _drain(mk(), 6, F.Front._p_phase_cap_exempt_pred(f), limit=6)
         assert "over-x" in done and left == ["short"]
         monkeypatch.setattr(envs.SGLANG_WEG2_ENABLE_P_PHASE_SHORT_RIDES, "get", lambda: True)
-        done, left, _ = _drain(mk(), 6, F.Front._p_phase_cap_exempt_for(f, 0), limit=6)
+        done, left, _ = _drain(mk(), 6, F.Front._p_phase_cap_exempt_pred(f), limit=6)
         assert left == [] and "short" in done
 
-    def test_switch_off_still_holds_the_seat_gate(self, monkeypatch):
-        from sglang.srt.environ import envs
-        monkeypatch.setattr(envs.SGLANG_WEG2_ENABLE_P_PHASE_SHORT_RIDES, "get", lambda: False)
-        assert F.Front._p_phase_cap_exempt_for(_front(5713), 2) is None
+    def test_the_cap_still_binds_what_neither_rides_nor_needs_p(self, loop):
+        """The H91 cap is not dead: a request below X that is no SHORT and not routed to P stays for the next
+        phase (it does not make the park fire, so leaving it is no double flip)."""
+        f = _front(5713)
+        q = [_real_pending(loop, f"l{i}", 9000) for i in range(2)] + [_real_pending(loop, "mid", 3000)]
+        done, left, _ = _drain(q, 1, F.Front._p_phase_cap_exempt_pred(f), limit=1)
+        assert done == ["l0", "l1"] and left == ["mid"]
+        assert phase_policy.immediate_park_trigger([q[2]], 5713) is None
+
+
+class TestReenter:
+    """DOUBLE-FLIP 1015 on SEAT-AT-HAND-OFF: a request that needs P and reached the queue after the pool's last
+    dispatch keeps P for one more pass instead of a P->D flip the immediate park undoes. One re-entry per rid
+    (no timer); a stall or a front leaving "serving" never re-enters."""
+
+    def _f(self, queue, state="serving"):
+        return types.SimpleNamespace(queue=collections.deque(queue), state=state, epoch=7, counters={},
+                                     tp_prefill_max_tokens=5713)
+
+    def test_a_late_needs_p_arrival_reenters_once(self, loop):
+        f = self._f([_real_pending(loop, "late", 9000)])
+        assert F.Front._p_phase_reenter(f, False) is True
+        assert f.counters == {"p_phase_reenter": 1}
+        # the same rid still left after its pass: refused by something else -> flip, the instrument names it
+        assert F.Front._p_phase_reenter(f, False) is False
+        F.Front._p_end_over_x_left(f, False)
+        assert f.counters["p_end_over_x_left_other"] == 1
+
+    def test_a_second_late_arrival_earns_its_own_pass(self, loop):
+        f = self._f([_real_pending(loop, "a", 9000)])
+        assert F.Front._p_phase_reenter(f, False)
+        f.queue.append(_real_pending(loop, "b", 9000))
+        assert F.Front._p_phase_reenter(f, False)
+        assert not F.Front._p_phase_reenter(f, False)
+
+    @pytest.mark.parametrize("stalled,state", [(True, "serving"), (False, "flipping"), (False, "stopping")])
+    def test_stall_or_not_serving_never_reenters(self, loop, stalled, state):
+        f = self._f([_real_pending(loop, "l", 9000)], state=state)
+        assert F.Front._p_phase_reenter(f, stalled) is False
+        assert f.counters == {}
+
+    def test_nothing_that_needs_p_never_reenters(self, loop):
+        f = self._f([_real_pending(loop, "s", 20, d_eligible=True), _real_pending(loop, "mid", 3000)])
+        assert F.Front._p_phase_reenter(f, False) is False
+
+    def test_wiring_reenter_before_the_marker_and_reset_at_the_flip(self):
+        src = inspect.getsource(F)
+        i = src.index("if Front._p_phase_reenter(self, bool(self._p_intake_stalled)):")
+        blk = src[i:i + 400]
+        assert blk.index("continue") < blk.index("Front._p_end_over_x_left(self, bool(self._p_intake_stalled))")
+        assert blk.index("self._p_reenter_rids = set()") < blk.index('await self.flip("P", "D")')
+
+
+class TestCombinationWithSeatAtHandOff:
+    """The merge flipqueue x seatgate on the REAL controller (harness of test_weg2_phase_policy_h91c, D full the
+    13:05:10 way of test_weg2_seat_at_handoff_1015): cap 2, three LONG over X and one SHORT queued while every D
+    seat is held and 5 prefilled requests wait for D.
+
+    * seatgate: no seat cap on the P phase -- P prefills although D is full;
+    * flipqueue: the H91 cap strands no request that needs P -- all 4 legs before the P->D flip;
+    * no double flip: after the P->D flip D is not released again (no D->P) while nothing new arrives, and the
+      instrument stays silent (no P-END-OVER-X-LEFT of any cause).
+    RED on 3b1e746e0e (seat gate + cap: L3 left), RED on seatgate dbecd49737 alone (cap: L3 left), GREEN merged."""
+
+    def test_full_d_cap_2_all_needs_p_ride_and_no_flip_back(self):
+        from test_weg2_phase_policy_h91c import Harness, _until
+        from test_weg2_seat_at_handoff_1015 import (_fill_d_and_queue_ready, _full_d_harness_kwargs,
+                                                     _gens_before_first_release)
+
+        async def body():
+            async with Harness(**_full_d_harness_kwargs(p_phase_max_requests=2)) as h:
+                h.p.delay = 0.3
+                await _fill_d_and_queue_ready(h)
+                tasks = []
+                for mark, chars in (("L1", 15000), ("L2", 15000), ("L3", 15000), ("S1", 20)):
+                    tasks.append(h.post(mark, chars))
+                    await asyncio.sleep(0.05)  # arrival order = age order
+                assert await _until(lambda: "rpc:release_memory_occupation" in h.p.timeline, 30)
+                assert sorted(_gens_before_first_release(h)) == ["gen:L1", "gen:L2", "gen:L3", "gen:S1"], \
+                    h.p.timeline
+                assert await _until(lambda: h.front.awake == "D" and h.front.state == "serving", 20)
+                await asyncio.sleep(1.5)
+                assert "rpc:release_memory_occupation" not in h.d.timeline, h.d.timeline  # no D->P flip back
+                assert not [k for k in h.front.counters if str(k).startswith("p_end_over_x_left_")], \
+                    dict(h.front.counters)
+                for t in tasks:
+                    t.cancel()
+
+        asyncio.run(body())
 
 
 class TestXReadersFollowThePhase:
@@ -307,7 +388,7 @@ class TestXReadersFollowThePhase:
 class TestWiring:
     def test_controller_passes_the_combined_predicate_and_marks_the_end(self):
         src = inspect.getsource(F)
-        assert "cap_exempt=Front._p_phase_cap_exempt_for(self, _dc_cap)" in src
+        assert "cap_exempt=Front._p_phase_cap_exempt_pred(self))" in src
         assert "cap_exempt=(self._p_phase_short_rides" not in src
         i = src.index("Front._p_end_over_x_left(self, bool(self._p_intake_stalled)")
         assert 'await self.flip("P", "D")' in src[i:i + 400]  # the marker sits right before the P->D flip

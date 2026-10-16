@@ -2073,34 +2073,6 @@ class Envs:
     # und flippt"), P takes all of it. 0 or >= WINDOW_S = no intermediate
     # check (the window routes the set by its amount).
     SGLANG_WEG2_DECODE_COLLECT_D_CHECK_S = EnvFloat(7.5)
-    # DECODE-COLLECT SEAT GATE (user 02.10. ~20:25Z: no prefill on P while D has
-    # no room for it; filling prefills for free seats stay allowed): the
-    # collect window's route P flips only while D has a free seat after the
-    # flip back, and the P phase then dispatches at most that many requests
-    # (oldest first). No free seat: the set keeps waiting; the ARRIVAL-SEAT
-    # wait bound parks the youngest running decode, which frees one. Marker
-    # 'WEG2 DECODE-COLLECT seat-gate'. 0 = route P flips at once, as before.
-    SGLANG_WEG2_DECODE_COLLECT_SEAT_GATE = EnvBool(True)
-    # K10 SEAT-RELIEF (NF h16p 15.10. 12:21Z, 6 min stand with D running 0, queue 7): the seat gate held
-    # every D->P flip (taken 7..11 of 6) while D could serve nothing -- and only a flip clears D's tree
-    # (ARENA-REF RESET-RELEASE). On: (a) a queued RESUME-VIA-P leg holds its D seat already (D kept the
-    # stream) and passes the gate, P dispatches only such legs; (b) the gate held for
-    # SGLANG_WEG2_K10_STALL_S without one D token: the wait-bound park + flip, P dispatching only
-    # seat-holding legs (none = an empty round trip). At most once per D epoch. The seat count is
-    # never re-derived. Off = the gate as before, byte for byte.
-    SGLANG_WEG2_K10_SEAT_RELIEF = EnvBool(True)
-    SGLANG_WEG2_K10_STALL_S = EnvFloat(60.0)
-    # K10 (c): under AGE PLAN a route-P set the seat gate holds this long after its DECODE-COLLECT release
-    # flips (park + flip, P takes the oldest one), once per D epoch -- D decoding on or not. Measured on
-    # h16p (boots 124245 / 133855): release -> flip 21.7 / 26.4 / 27.7 / 45.9 / 52.9 / 73.5 s, flips
-    # themselves 2.0-3.3 s. 15 s = the collect window: a D phase keeps >= window + hold = 30 s. 0 = only
-    # the wait bound (d_wait_bound_s) releases the hold.
-    SGLANG_WEG2_K10_HOLD_MAX_S = EnvFloat(15.0)
-    # K10 (c) on its OWN switch (h16q integration 15.10.): (c) parks the decodes D is still running and flips
-    # (P takes the oldest), which rubs against the user's "kein Massenparken" (14.10.); he decides about it.
-    # On (default, new features on) = (c) as above; 0 = (c) never fires -- neither the hold bound nor the wait
-    # bound on this path --, (a) and (b) unchanged. Marker: 'WEG2 K10-SEAT-RELIEF why=p_wait'.
-    SGLANG_WEG2_K10_RELIEF_P_WAIT = EnvBool(True)
     # X-EXACT: tokenizer path override (tests, or a front without a group
     # reachable); empty = the group's own server_args.tokenizer_path.
     SGLANG_WEG2_FRONT_TOKENIZER_PATH = EnvStr("")

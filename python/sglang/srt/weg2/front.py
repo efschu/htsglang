@@ -1218,40 +1218,6 @@ def leg1_early_candidates(queue, limit: int) -> list:
     return out
 
 
-def k10_rvp_queued(queue) -> bool:
-    """K10 SEAT-RELIEF: a RESUME-VIA-P leg (its D seat held) still waits in ``queue``."""
-    return any(getattr(p, "resume_via_p", False) and not (getattr(p, "fut", None) is not None and p.fut.done())
-               for p in list(queue))
-
-
-def k10_rvp_pick(queue, pred=None):
-    """K10 SEAT-RELIEF, the P drain's ``pick``: the first RESUME-VIA-P leg ``pred``
-    accepts, in queue (arrival) order; None when there is none (the drain's
-    ``may_dispatch`` has already stopped then)."""
-    for i, p in enumerate(list(queue)):
-        if getattr(p, "resume_via_p", False) and (pred is None or pred(p)):
-            return i
-    return None
-
-
-def leg1_early_limit(queue, p_concurrency: int, dc_cap: int) -> int:
-    """How many LEG1-EARLY legs the flip may post now.
-
-    No seat-gate cap armed (``dc_cap`` 0: PBOUND-FLIP-NOW, fairness, gate off):
-    ``p_concurrency``, as before. A cap armed (DECODE-COLLECT SEAT GATE,
-    ``_dc_p_cap`` = the free D seats, or 1 from the age plan): the P phase will
-    prefill at most that many, oldest first, so a leg posted beyond it keeps
-    running on P after the phase ended and the next P->D drain waits for it
-    (NF int24g: 9 of 69 P->D drains 0.8-9.4 s, every one an early leg over
-    the cap). The cap counts the early legs already in flight in the queue."""
-    limit = max(0, int(p_concurrency))
-    cap = int(dc_cap or 0)
-    if cap <= 0:
-        return limit
-    inflight = sum(1 for p in list(queue) if getattr(p, "_leg1_early", None) is not None)
-    return min(limit, max(0, cap - inflight))
-
-
 def request_text(payload: dict, tools_first: Optional[bool] = None) -> str:
     """The prompt as ONE string, for the span estimate and the ledger.
 
@@ -3517,7 +3483,7 @@ def _lane_take_waits(pred) -> bool:
 #: K9 P-DRAIN-EARLY-SETTLE (NF h16r 15.10. 11:52:21-11:54:11Z, death DEADMAN_FLIP_STALL; precursor 11:26:01-11:26:23Z):
 #: the D->P flip posts leg 1 EARLY for the queued requests ("P holds it dormant, its store prefetch runs beside the
 #: legs") -- and P prefills them on its own. When the drain ends before it reaches them (a P-INTAKE-STALL of another
-#: request, the phase / seat-gate cap), those legs are still running on P: the P->D flip begins with them OUTSTANDING
+#: request, the H91 phase cap), those legs are still running on P: the P->D flip begins with them OUTSTANDING
 #: (``WEG2-FLIP outstanding ... rids=['weg2-86-231', 'weg2-86-233', 'weg2-86-237']``) and its drain stage waits for
 #: P's prefills (47.6 s / 51.9 s walls) under the flip-stall bound (4x the last flip, 24.5 s) -> WEG2-FLIP STALL ->
 #: the deadman kills the boot. The legs run whether the phase ends or not; so the drain itself settles every queued
@@ -5455,8 +5421,10 @@ class Front:
                 return None
             if dc == "P":
                 live = [q for q in self.queue if not q.fut.done()]
-                if not live or not self._dc_p_seat_gate(now):
-                    return None  # SEAT GATE: no free seat on D -> no prefill on P
+                if not live:
+                    return None
+                # SEAT-AT-HAND-OFF (15.10.): route P flips at the release -- P computes, the hand-off to D is what
+                # needs a seat (d_admitter, the queue on D by priority = age); see _decode_collect
                 return Front._prio_sorted(self, live)[0]  # PRIO-AS-AGE 1014: the head by the order key
         p = phase_policy.immediate_park_trigger(self.queue, int(self.tp_prefill_max_tokens))
         if p is None:
@@ -10968,27 +10936,13 @@ class Front:
         # DP-NACHLAUF: the trigger was queued after the begin -- its leg 1 goes to
         # the dormant P now, as the begin would have posted it
         if leg1_early_on() and not getattr(self, "dual_kv_ledgers", False):
-            _lim = Front._leg1_early_limit(self)
-            for _ep in Front._k10_early_filter(self, leg1_early_candidates(self.queue, _lim)):
+            for _ep in leg1_early_candidates(self.queue, self.p_concurrency):
                 _ep._leg1_early = asyncio.ensure_future(self.leg1(_ep))
                 Front._leg1_early_watch(self, _ep)  # Q-1368: its verdict is always read
                 self.counters["leg1_early"] += 1
                 logger.info("WEG2 LEG1-EARLY rid=%s epoch=%d (posted at the EARLY-FLIP go, before "
                             "the first sleep RPC)", _ep.rid, self.epoch)
         return True
-
-    def _leg1_early_limit(self) -> int:
-        """LEG1-EARLY: how many legs this D->P flip may post. Reads (never pops)
-        the SEAT GATE's cap -- the pop stays in the P phase -- so the early legs
-        are the ones the P phase will dispatch; without a cap it is
-        ``p_concurrency`` as before."""
-        cap = int(self.__dict__.get("_dc_p_cap", 0) or 0)
-        limit = leg1_early_limit(self.queue, self.p_concurrency, cap)
-        if cap > 0:
-            logger.info("WEG2 LEG1-EARLY seat-cap=%d limit=%d p_concurrency=%d queue=%d epoch=%d -- no early "
-                        "leg beyond what the P phase dispatches", cap, limit, self.p_concurrency,
-                        len(self.queue), self.epoch)
-        return limit
 
     def _early_flip_abort(self, h, src: str, dst: str) -> None:
         """EARLY-FLIP: nothing slept -- D is awake and serving again, the flip's
@@ -11246,7 +11200,20 @@ class Front:
         """DECODE-COLLECT, the one decision site: ``"hold"`` while the window
         is open, ``"D"``/``"P"`` once it released (``"P"`` stays for the rest
         of this D phase -- the flip takes everything queued), ``None`` when the
-        window is off or D was not decoding when the prefill arrived."""
+        window is off or D was not decoding when the prefill arrived.
+
+        SEAT-AT-HAND-OFF (user 15.10., design not policy): route ``"P"`` flips at the
+        release, whatever D's seat count says. P computes the prefill and hands it
+        over; only the HAND-OFF to D needs a seat, and that wait is the queue on D
+        (``_ready_for_d``, ``d_admitter``: priority = age, the head never skipped).
+        The DECODE-COLLECT SEAT GATE of 02.10. asked the seat at the release, and its
+        count (``_arrival_seat_taken``) includes ``_ready_for_d`` -- D's own wait
+        queue -- so under load it was closed for as long as anything waited for D
+        (boots 110016 / 124245 / 133855: 49 holds, ``taken`` > n in 27 of them, 12 of
+        them 20..74 s release -> flip with P idle; 119 P phases capped at the free
+        seats, 95 of them ended with ``queue_left`` > 0 -- one more flip each), and
+        the relief valves built on top (PBOUND-SEAT-HOLD 13.10., K10 (a)/(b)/(c)
+        15.10.). Gate, cap and valves are gone."""
         win = self._dc_window_s()
         if win <= 0.0:
             return None
@@ -11316,164 +11283,6 @@ class Front:
         logger.info("WEG2 DECODE-COLLECT release n=%d tokens=%d X=%d waited_s=%.1f route=%s stage=%s p_bound=%s "
                     "epoch=%d", n, tokens, x_tok, waited, route, stage, p_bound, self.epoch)
         return route
-
-    def _dc_p_seat_gate(self, now: float) -> bool:
-        """DECODE-COLLECT SEAT GATE (user 02.10. ~20:25Z): may the collected set
-        flip to P now? Only while D has a free seat after the flip back
-        (ARRIVAL-SEAT's own count: running minus parked, hand-offs, ready,
-        grants); the P phase then dispatches at most that many (``_dc_p_cap``,
-        oldest first). False: no seat -- the set keeps waiting."""
-        if not envs.SGLANG_WEG2_DECODE_COLLECT_SEAT_GATE.get():
-            return True
-        taken, n = self._arrival_seat_taken()
-        free = max(0, int(n) - int(taken))
-        st = self._dc_st()
-        if free <= 0:
-            if st.get("seat_hold_wid") != st["wid"]:
-                st["seat_hold_wid"] = st["wid"]
-                self.counters["decode_collect_seat_hold"] += 1
-                logger.info("WEG2 DECODE-COLLECT seat-gate hold taken=%d n=%d epoch=%d -- route P, but D has no "
-                            "free seat: no prefill on P; the set waits for a seat or the wait bound",
-                            taken, n, self.epoch)
-            return False
-        self._dc_p_cap = free
-        if st.get("seat_flip_wid") != st["wid"]:
-            st["seat_flip_wid"] = st["wid"]
-            self.counters["decode_collect_seat_flip"] += 1
-            logger.info("WEG2 DECODE-COLLECT seat-gate flip free=%d taken=%d n=%d epoch=%d -- P prefills at most "
-                        "%d (the free seats), oldest first", free, taken, n, self.epoch, free)
-        return True
-
-    async def _dc_no_seat_step(self, D: "Group", live_q: List["Pending"], bound: float,
-                               now: float) -> Tuple[bool, bool, Optional["Pending"]]:
-        """SEAT GATE, route P without a free D seat: no flip of its own. The
-        ARRIVAL-SEAT room rules decide -- AGE PLAN: the oldest one's
-        displacement plan (the fewest youngest decodes park, then it flips with
-        P capped at one); else (c): past the wait bound the youngest running
-        decode parks and frees a seat for the next tick.
-
-        K10 SEAT-RELIEF first (:meth:`_k10_seat_relief`)."""
-        _k10 = Front._k10_seat_relief(self, live_q, now)
-        if _k10 is not None:
-            return _k10
-        if _asr.age_plan_enabled():
-            x_tok = int(self.tp_prefill_max_tokens)
-            cands = [q for q in live_q if phase_policy.immediate_park_trigger([q], x_tok) is not None] or live_q
-            res = await self._arrival_seat_step_age(cands, x_tok, now)
-            if res[0] and res[2] is not None:
-                self._dc_p_cap = 1  # the displacement made room for one
-            return res
-        st = self._asr_st()
-        wait_s = _asr.oldest_wait_s([_lctl.clock_t(p) for p in live_q] + Front._asr_waiter_clocks(self, st),
-                                    self.t_awake, now)
-        if _asr.bound_fired(wait_s, bound):
-            await self._arrival_seat_park_youngest(D, wait_s, bound, now)
-        return False, not self.admit_d, None
-
-    def _k10_seat_relief(self, live_q: List["Pending"],
-                         now: float) -> Optional[Tuple[bool, bool, Optional["Pending"]]]:
-        """K10 SEAT-RELIEF (NF h16p 15.10. 12:21-12:27Z): the SEAT GATE held every
-        D->P flip -- ``taken`` 7..11 of 6, D's own queue counted as seats -- while D
-        served nothing (backup wall: running 0, queue 7, 3366x ARENA-DROP freed=0),
-        and only a flip clears D's tree (``ARENA-REF RESET-RELEASE``). Under AGE
-        PLAN the wait bound's park was unreachable (``SEAT-AGE-PLAN plan=none``),
-        and the P-only legs of the two requests D had handed back (W50 ->
-        RESUME-VIA-P, weg2-10-51 / -21-67) waited at the gate although D held
-        their seats. Front-only decision, the seat count is never re-derived:
-
-        (a) a queued RESUME-VIA-P leg holds its D seat already (D kept the stream,
-            ``_flip_ledger`` drops it, RVP-DRAIN): it needs no new one -- the flip
-            goes, P dispatches only such legs (``_dc_p_rvp_only_epoch``);
-        (b) the gate held ``SGLANG_WEG2_K10_STALL_S`` with not one D token
-            (``OutstandingBook.last_any`` unmoved): the wait-bound park + flip,
-            P dispatching only seat-holding legs (none: an empty round trip, which
-            still clears D's tree);
-        (c) under AGE PLAN: the hold outlived ``SGLANG_WEG2_K10_HOLD_MAX_S`` since the DECODE-COLLECT
-            release, or the oldest queued request waited for P past the wait bound (``d_wait_bound_s``,
-            measured as the phase policy does: now - max(arrival, D phase start)) -- D decoding on or
-            not: the same park + flip, P prefilling the oldest one (``_dc_p_cap`` 1, AGE PLAN's
-            displacement cap). Own switch ``SGLANG_WEG2_K10_RELIEF_P_WAIT`` (default on; 0 = (c) never
-            fires, (a) and (b) unchanged): it parks decodes D is still running, which the user weighs
-            against "kein Massenparken" (14.10.) -- his decision, so it is switchable alone.
-
-        At most once per D epoch (the park's own one-attempt rule carries the
-        same epoch). None = not applicable, the gate's rules run as before."""
-        if not envs.SGLANG_WEG2_K10_SEAT_RELIEF.get():
-            return None
-        if self.__dict__.get("_k10_relief_epoch") == self.epoch:
-            return None  # once per D epoch: never a pendulum
-        rvp = [q for q in live_q if getattr(q, "resume_via_p", False)]
-        st = self._dc_st()
-        why = None
-        bound = self.d_wait_bound_s if self.d_wait_bound_s > 0 else float(self.w_s)
-        p_wait = _asr.oldest_wait_s([_lctl.clock_t(p) for p in live_q], self.t_awake, now)
-        try:
-            hold_max = max(0.0, float(envs.SGLANG_WEG2_K10_HOLD_MAX_S.get() or 0.0))
-        except (TypeError, ValueError):
-            hold_max = 0.0
-        t_rel = st.get("t_rel")
-        hold_s = max(0.0, now - float(t_rel)) if (st.get("route") == "P" and t_rel is not None) else 0.0
-        if rvp:
-            why = "rvp_seat_held"
-        elif (envs.SGLANG_WEG2_K10_RELIEF_P_WAIT.get() and _asr.age_plan_enabled()
-              and (_asr.bound_fired(p_wait, bound) or (0.0 < hold_max <= hold_s))):
-            # (c) the wait bound the hold line names ("waits for a seat or the wait bound") and the phase
-            # policy states (d_wait_bound_s: a request waiting for P longer parks D's decodes and flips) --
-            # under AGE PLAN nothing on this path enforced it (h16p boot 1242: epoch 30 weg2-30-76 waited
-            # 90.6 s, D decoding all along). AGE PLAN off: the classic (c) below parks the youngest, as before.
-            # And the hold itself is bounded (SGLANG_WEG2_K10_HOLD_MAX_S after the DECODE-COLLECT release):
-            # 6 release -> flip latencies of 21.7..73.5 s on two h16p boots, all with D decoding on
-            why = "p_wait"
-        else:
-            prog = float(getattr(self._ipc_out_book(), "last_any", 0.0) or 0.0)
-            rec = st.get("k10_hold")
-            if rec is None or rec[0] != self.epoch or rec[1] != prog:
-                st["k10_hold"] = (self.epoch, prog, now)  # a new D phase or a D token: the clock restarts
-                return None
-            try:
-                stall_s = float(envs.SGLANG_WEG2_K10_STALL_S.get() or 0.0)
-            except (TypeError, ValueError):
-                stall_s = 0.0
-            if stall_s <= 0.0 or now - float(rec[2]) < stall_s:
-                return None
-            why = "no_d_progress"
-        st.pop("k10_hold", None)
-        self.__dict__["_k10_relief_epoch"] = self.epoch
-        if why == "p_wait":
-            # the wait bound's flip: P prefills the oldest one (AGE PLAN's own displacement cap, 1) --
-            # a D seat over n for one phase, once per D epoch
-            self.__dict__.pop("_dc_p_rvp_only_epoch", None)
-            self._dc_p_cap = 1
-        else:
-            self.__dict__["_dc_p_rvp_only_epoch"] = self.epoch
-            self._dc_p_cap = max(1, len(rvp))  # armed cap: no SHORT rides; the rvp-only pick decides who goes
-        self.counters["k10_seat_relief_" + why] += 1
-        taken, n = self._arrival_seat_taken()
-        head = min(rvp, key=lambda q: float(getattr(q, "t_arrive", now) or now)) if rvp else None
-        logger.warning("WEG2 K10-SEAT-RELIEF why=%s rvp_legs=%d rids=%s taken=%d n=%d queued=%d p_wait_s=%.1f "
-                       "bound_s=%.0f hold_s=%.1f hold_max_s=%.0f epoch=%d -- the seat gate holds, %s: park + flip "
-                       "now, P dispatches %s (the seat count stays as it is; once per D epoch)",
-                       why, len(rvp), [q.rid for q in rvp][:6], taken, n, len(live_q), float(p_wait or 0.0),
-                       bound, hold_s, hold_max, self.epoch,
-                       {"rvp_seat_held": "D already holds these requests' seats",
-                        "p_wait": "a P-bound set waited past the hold bound or the wait bound",
-                        "no_d_progress": "D made no token progress for the stall bound"}[why],
-                       "the oldest one" if why == "p_wait" else "only legs whose D seat is held")
-        return True, True, head
-
-    def _k10_early_filter(self, cands: list) -> list:
-        """K10 SEAT-RELIEF (a)/(b): the flip the relief fired posts LEG1-EARLY only for RESUME-VIA-P
-        legs -- the P phase of that flip dispatches nothing else (a head leg posted early would run on
-        P beyond it). Any other flip: ``cands`` unchanged."""
-        if not Front._k10_rvp_only(self):
-            return cands
-        return [p for p in cands if getattr(p, "resume_via_p", False)]
-
-    def _k10_rvp_only(self) -> bool:
-        """K10 (a)/(b): the flip from the D epoch the relief fired in -- its leg-1
-        posting (same epoch) and its P phase (epoch + 1) take only RESUME-VIA-P legs."""
-        e = self.__dict__.get("_dc_p_rvp_only_epoch")
-        return e is not None and int(e) in (int(self.epoch), int(self.epoch) - 1)
 
     async def _decode_collect_short(self, rid: str, uncached: int) -> Optional[str]:
         """DECODE-COLLECT for a SHORT arrival on the D seat path: ``None`` = no
@@ -11885,9 +11694,6 @@ class Front:
             cands = [q for q in self._asr_live_p_cands()
                      if getattr(q, "rid", None) != rid
                      and (pbound or fits.get(getattr(q, "rid", None)) is True)]
-            if pbound and cands:
-                # the seat gate's held rest flips nothing yet: no flip is foreseeable for it
-                cands = Front._pbound_seat_hold(self, cands, time.time())[0]
         except Exception:  # noqa: BLE001 - a reading never blocks the route
             return False
         if not cands:
@@ -12154,8 +11960,6 @@ class Front:
         if dc == "P":
             if not live_q:
                 return False, not self.admit_d, None  # the released SHORTs are on their way to the queue
-            if not self._dc_p_seat_gate(now):
-                return await self._dc_no_seat_step(D, live_q, bound, now)
             head = Front._prio_sorted(self, live_q,  # PRIO-AS-AGE 1014: the head by the order key
                                       t_of=lambda q: float(getattr(q, "t_arrive", now) or now))[0]
             if st["flip_rid"] != head.rid:
@@ -12200,9 +12004,6 @@ class Front:
                 return True, True, None
             return False, not self.admit_d, None
         if envs.SGLANG_WEG2_PBOUND_FLIP_NOW.get():
-            cands, _held = Front._pbound_seat_hold(self, cands, now)
-            if not cands:
-                return False, not self.admit_d, None  # only the seat gate's rest is queued: D decodes first
             return self._asr_pbound_flip_now(cands, x_tok, now)
         if age_plan:
             return await self._arrival_seat_step_age(cands, x_tok, now)
@@ -12272,77 +12073,6 @@ class Front:
                         "the next free seat in arrival order", _asr.MARKER, p.rid, v, why_wait,
                         int(getattr(p, "est_uncached", 0) or 0), x_tok, taken, n, why)
         return False, not self.admit_d, None
-
-    # ------------------------------------------------------------------ PBOUND x SEAT GATE
-    # NF int24f3 13.10. (nf-flip-halt-analyse-1013): 43 of 45 long D->P "halts" were a
-    # P<->D pendulum with no decode round on D. The DECODE-COLLECT SEAT GATE caps a P
-    # phase at the free D seats and leaves the rest queued ON PURPOSE (D is full: it
-    # decodes first); the P->D flip's DONE-KICK then ran PBOUND-FLIP-NOW for exactly
-    # that rest ("never needs a D seat, no dwell") 0.1-1.9 s after D woke. The two
-    # rules cancelled each other: two flips per capped P phase, 0 decode tokens.
-    # Fix: what the gate left in the queue is HELD while D has no free seat; it is
-    # released by the first free D seat or by the existing wait bound (d_wait_bound_s,
-    # else w_s) -- no new timer, no switch. New P-bound arrivals (anything not in the
-    # queue when the capped P phase ended) are not held: PBOUND-FLIP-NOW is unchanged.
-
-    def _pbound_hold_arm(self, dc_cap: int, dispatched: int, stalled: bool = False) -> None:
-        """End of a P phase: remember the queue entries the SEAT GATE's cap left
-        behind (``_dc_cap`` > 0 and the cap was the binding one -- not the H91 phase
-        cap, not an intake stall). Every P phase overwrites the record."""
-        self.__dict__.pop("_pbound_seat_held", None)
-        if stalled or int(dc_cap or 0) <= 0:
-            return
-        mx = int(getattr(self, "p_phase_max_requests", 0) or 0)
-        if mx > 0 and int(dc_cap) > mx:
-            return  # the H91 phase cap bound first: not the gate's rest
-        if not phase_policy.phase_cap_reached(int(dispatched or 0), int(dc_cap)):
-            return  # the queue is what the cap did not stop (pool budget, empty ...)
-        rids = [p.rid for p in self.queue
-                if not p.fut.done() and not getattr(p, "intake_stalled", False)
-                and not getattr(p, "client_gone", False)]
-        if rids:
-            self.__dict__["_pbound_seat_held"] = {"rids": set(rids), "t": time.time(),
-                                                   "epoch": int(self.epoch), "told": False}
-
-    def _pbound_seat_hold(self, cands: List["Pending"], now: float) -> Tuple[List["Pending"], List["Pending"]]:
-        """``(candidates PBOUND may act on, candidates held by the seat gate)``.
-        Nothing recorded (the default path) -> ``(cands, [])`` untouched. A held
-        entry is released -- and PBOUND-FLIP-NOW acts as before -- by the first
-        free D seat (ARRIVAL-SEAT's own count) or by the wait bound."""
-        rec = self.__dict__.get("_pbound_seat_held")
-        if not rec:
-            return list(cands), []
-        if getattr(self, "awake", None) != "D" or float(getattr(self, "t_awake", 0.0) or 0.0) < float(rec["t"]):
-            return list(cands), []  # not the D phase that follows the capped P phase
-        queued = {p.rid for p in self.queue if not p.fut.done()}
-        rec["rids"] = rec["rids"] & queued
-        if not rec["rids"]:
-            self.__dict__.pop("_pbound_seat_held", None)
-            return list(cands), []
-        held = [c for c in cands if c.rid in rec["rids"]]
-        if not held:
-            return list(cands), []
-        taken, n = self._arrival_seat_taken()
-        free = max(0, int(n) - int(taken))
-        bound = self.d_wait_bound_s if self.d_wait_bound_s > 0 else float(self.w_s)
-        waited = _asr.oldest_wait_s([c.t_arrive for c in held], self.t_awake, now)
-        why = "free_seat" if free > 0 else ("wait_bound" if _asr.bound_fired(waited, bound) else None)
-        rids = sorted(rec["rids"])
-        if why is not None:
-            self.__dict__.pop("_pbound_seat_held", None)
-            self.counters["pbound_seat_hold_released_" + why] += 1
-            logger.info("WEG2 PBOUND-SEAT-HOLD-RELEASED why=%s rids=%s free_seats=%d taken=%d n=%d waited_s=%.1f "
-                        "bound_s=%.1f epoch=%d -- the rest the seat gate left behind may flip D->P now",
-                        why, rids[:8], free, taken, n, float(waited or 0.0), float(bound), self.epoch)
-            return list(cands), []
-        if not rec["told"]:
-            rec["told"] = True
-            self.counters["pbound_held_by_seat_gate"] += 1
-            logger.warning("WEG2 PBOUND-HELD-BY-SEAT-GATE rids=%s free_seats=%d taken=%d n=%d epoch=%d "
-                           "waited_s=%.1f bound_s=%.1f -- no PBOUND-FLIP-NOW: the seat gate held these back "
-                           "because D is full; D decodes until a seat frees or the wait bound fires",
-                           rids[:8], free, taken, n, self.epoch, float(waited or 0.0), float(bound))
-        return [c for c in cands if c.rid not in rec["rids"]], held
 
     def _asr_pbound_flip_now(self, cands: List["Pending"], x_tok: int,
                              now: float) -> Tuple[bool, bool, Optional["Pending"]]:
@@ -12509,33 +12239,62 @@ class Front:
         rides past an older LONG."""
         return Front._p_phase_short_rides(self, p) or Front._p_phase_needs_p(self, p)
 
-    def _p_phase_cap_exempt_for(self, dc_cap: int):
-        """The pool's ``cap_exempt`` for a P phase whose seat gate is ``dc_cap`` (flipqueue 1015, review A1/A3).
+    def _p_phase_cap_exempt_pred(self):
+        """The pool's ``cap_exempt`` for the P phase (flipqueue 1015, review A3; on SEAT-AT-HAND-OFF 15.10.).
 
-        * ``dc_cap > 0`` (DECODE-COLLECT seat gate: ``p-cap`` = the free D seats): ``None`` -- that cap is hard,
-          nothing rides past it, a SHORT needs a D seat too. The only place this is decided; a test holds it.
-        * else a request that NEEDS P always rides past the phase cap -- NOT behind a feature switch (a defect
-          fix does not hang on FLIPCYCLE H5): with ``SGLANG_WEG2_ENABLE_P_PHASE_SHORT_RIDES`` on the exempt are
-          SHORT or needs-P (:meth:`_p_phase_cap_exempt`), off only the needs-P ones (:meth:`_p_phase_needs_p`)."""
-        if int(dc_cap or 0) > 0:
-            return None
+        A request that NEEDS P always rides past the phase cap -- NOT behind a feature switch (a defect fix does
+        not hang on FLIPCYCLE H5): with ``SGLANG_WEG2_ENABLE_P_PHASE_SHORT_RIDES`` on the exempt are SHORT or
+        needs-P (:meth:`_p_phase_cap_exempt`), off only the needs-P ones (:meth:`_p_phase_needs_p`). Never
+        ``None``: since SEAT-AT-HAND-OFF the P phase carries no D seat cap (the hand-off takes the seat,
+        ``d_admitter``), so there is no seat condition left to hold the exemption back (review A1 of flipqueue,
+        "the seat gate's cap stays hard", has no object any more -- the gate it protected is gone)."""
         if envs.SGLANG_WEG2_ENABLE_P_PHASE_SHORT_RIDES.get():
             return lambda p: Front._p_phase_cap_exempt(self, p)
         return lambda p: Front._p_phase_needs_p(self, p)
 
-    def _p_end_over_x_left(self, stalled: bool, dc_cap: int, k10_only: bool) -> None:
+    def _p_end_needs_p_left(self) -> List["Pending"]:
+        """The queued requests that need P (:meth:`_p_phase_needs_p`) -- what a P->D flip would leave for the
+        immediate park to flip straight back for."""
+        return [p for p in list(self.queue) if Front._p_phase_needs_p(self, p)]
+
+    def _p_phase_reenter(self, stalled: bool) -> bool:
+        """DOUBLE-FLIP 1015 on SEAT-AT-HAND-OFF: True = do NOT flip P->D now, take the next controller pass in P.
+
+        The pool takes every request that needs P while it runs (``cap_exempt``), so a needs-P request is left at
+        the flip only if it reached the queue after the pool's last dispatch (the K9 early-leg settle awaits in
+        between) -- flipping then makes D's DONE-KICK fire PARK-IMMEDIATE for it with ``awake_s=0.0``. P stays and
+        prefills it in the next pass instead (law 1: the phase ends on a queue P has nothing left to take from).
+        No timer: each rid earns ONE re-entry per P phase (``_p_reenter_rids``, cleared at the P->D flip); a rid
+        still left after its re-entry is refused by something else and the flip goes ahead with the instrument
+        naming it. A stall (P refused the head, defect 1) and a front leaving "serving" never re-enter."""
+        if stalled or self.state != "serving":
+            return False
+        seen = getattr(self, "_p_reenter_rids", None)
+        if seen is None:
+            seen = self._p_reenter_rids = set()
+        fresh = [p for p in Front._p_end_needs_p_left(self) if p.rid not in seen]
+        if not fresh:
+            return False
+        seen.update(p.rid for p in fresh)
+        self.counters["p_phase_reenter"] = self.counters.get("p_phase_reenter", 0) + 1
+        logger.info("WEG2 P-PHASE-REENTER epoch=%d n=%d rids=%s queue=%d -- request(s) that need P reached the "
+                    "queue after the pool's last dispatch: P takes them in the next pass, no P->D flip that the "
+                    "immediate park would undo (double flip)", self.epoch, len(fresh), [p.rid for p in fresh][:6],
+                    len(self.queue))
+        return True
+
+    def _p_end_over_x_left(self, stalled: bool) -> None:
         """Instrument, no verdict: the P phase ends with requests in the queue that need P. After the cap
-        exemption only three reasons are left, each a refusal of P or of D's seat count, not of the phase
-        cap: ``stall`` (P's intake refused the head -- its pool, defect 1), ``seat-gate`` (D is full: the
-        DECODE-COLLECT cap, PBOUND-HELD-BY-SEAT-GATE holds the rest) and ``k10-rvp-only``. ``other`` is a
-        defect to read. Counted per cause (``p_end_over_x_left_<cause>``), one line per phase.
-        PRECEDENCE when several hold (documented, tested): ``stall`` > ``seat-gate`` > ``k10-rvp-only`` >
-        ``state`` > ``other`` -- a stall is the first refusal (P's own intake), the seat count only the next."""
-        left = [p for p in list(self.queue) if Front._p_phase_needs_p(self, p)]
+        exemption and the re-entry (:meth:`_p_phase_reenter`) only one reason is expected: ``stall`` (P's intake
+        refused the head -- its pool, defect 1, desk/nf-h16q-intake-1015). ``state`` (the front left "serving")
+        and ``other`` (a rid still left after its re-entry) are defects to read. Since SEAT-AT-HAND-OFF the causes
+        ``seat-gate`` and ``k10-rvp-only`` have no object (the gate and K10 are removed). Counted per cause
+        (``p_end_over_x_left_<cause>``), one line per phase. PRECEDENCE (documented, tested): ``stall`` >
+        ``state`` > ``other``."""
+        left = Front._p_end_needs_p_left(self)
         if not left:
             return
-        cause = ("stall" if stalled else "seat-gate" if int(dc_cap or 0) > 0
-                 else "k10-rvp-only" if k10_only else "state" if self.state != "serving" else "other")
+        cause = "stall" if stalled else "state" if self.state != "serving" else "other"
         key = "p_end_over_x_left_" + cause.replace("-", "_")
         self.counters[key] = self.counters.get(key, 0) + 1
         logger.warning("WEG2 P-END-OVER-X-LEFT epoch=%d cause=%s n=%d rids=%s uncached=%s X=%d queue=%d -- the P "
@@ -15374,8 +15133,7 @@ class Front:
             self._ipc_dp_clock().begin(self.epoch, t_flip0, min(_live) if _live else None)
             # DP-NACHLAUF: leg 1 of the queue head goes to the dormant P now
             if leg1_early_on() and not getattr(self, "dual_kv_ledgers", False):
-                _lim = Front._leg1_early_limit(self)
-                for _ep in Front._k10_early_filter(self, leg1_early_candidates(self.queue, _lim)):
+                for _ep in leg1_early_candidates(self.queue, self.p_concurrency):
                     _ep._leg1_early = asyncio.ensure_future(self.leg1(_ep))
                     Front._leg1_early_watch(self, _ep)  # Q-1368: its verdict is always read
                     self.counters["leg1_early"] += 1
@@ -16479,7 +16237,7 @@ class Front:
                                               self._x_cost_seed)
         price, price_src = Front._flip_round_trip_price(self)  # class-bound: tests drive it on a namespace
         # flipqueue 1015 (review A4): no clamp to p_phase_max_requests -- a request that needs P rides past the
-        # phase cap (_p_phase_cap_exempt_for), so the phase's real k is the measured one, not min(cap, k).
+        # phase cap (_p_phase_cap_exempt_pred), so the phase's real k is the measured one, not min(cap, k).
         if self._p_phase_k:
             k = max(1.0, statistics.mean(self._p_phase_k))
             k_src = f"live:mean-of-{len(self._p_phase_k)}"
@@ -16659,7 +16417,7 @@ class Front:
         if not x_k_flip_enabled() or ctx is None or int(k_flip) <= 1:
             return x1
         # flipqueue 1015 (review A4): every rider of this flip needs P and so rides past the phase cap
-        # (_p_phase_cap_exempt_for): k is the flip's real rider count, not min(p_phase_max_requests, k_flip).
+        # (_p_phase_cap_exempt_pred): k is the flip's real rider count, not min(p_phase_max_requests, k_flip).
         k = float(k_flip)
         x_star, why = phase_policy.solve_x_cost_line(
             price_s=ctx["price"], k=k, line=ctx["line"], r_p=ctx["r_p"],
@@ -17511,22 +17269,12 @@ class Front:
                 # 29.5 s again -- the 3 s store probe was back on every
                 # second request).  The pool refills the moment ONE leg
                 # finishes, so P always has the next request queued.
-                # DECODE-COLLECT SEAT GATE: the flip that brought P here was armed
-                # for the free D seats -- P prefills at most that many this phase
-                _dc_cap = int(self.__dict__.pop("_dc_p_cap", 0) or 0)
-                # K10 SEAT-RELIEF: the flip the relief fired takes only seat-holding (RESUME-VIA-P) legs
-                _k10_only = Front._k10_rvp_only(self)
-                self.__dict__.pop("_dc_p_rvp_only_epoch", None)
-                self.__dict__.pop("_pbound_seat_held", None)  # PENDEL-FLIP: a new P phase, a new record
+                # SEAT-AT-HAND-OFF (15.10.): no D seat cap on this phase -- P prefills what is queued (H91 phase
+                # cap and P's pool budget below), the hand-off to D takes a seat (d_admitter, priority = age)
                 _max_dispatch = self.p_phase_max_requests
-                if _dc_cap > 0:
-                    _max_dispatch = min(_max_dispatch, _dc_cap) if _max_dispatch else _dc_cap
-                    logger.info("WEG2 DECODE-COLLECT seat-gate p-cap=%d epoch=%d queued=%d -- this P phase "
-                                "prefills at most the free D seats", _max_dispatch, self.epoch, len(self.queue))
                 passes = await _p_drain_pool(
                     self.queue, self.p_concurrency + _ahead, one, _on_leg1_done,
-                    lambda: (self.state == "serving" and not self._p_intake_stalled
-                             and (not _k10_only or k10_rvp_queued(self.queue))),
+                    lambda: self.state == "serving" and not self._p_intake_stalled,
                     # H91 part C rule 1: at most p_phase_max_requests leave the
                     # queue in this P phase, overlapping only as far as their
                     # est_prompt fits P's unified pool (0 = off, law 1 as before).
@@ -17542,13 +17290,11 @@ class Front:
                     lane_take=((lambda its, cancel: _lctl.p_take(self, its, cancel)) if _lctl.enabled() else None),
                     lane_take_wait=((lambda: _lctl.take_wait(self)) if _lctl.enabled() else None),
                     # PRIO-AS-AGE 1014: P takes its legs in the order key (priority desc, arrival asc)
-                    pick=((lambda q, pred: k10_rvp_pick(q, pred)) if _k10_only else
-                          (lambda q, pred: Front._prio_pick(self, q, pred)) if _prio_age.enabled() else None),
+                    pick=((lambda q, pred: Front._prio_pick(self, q, pred)) if _prio_age.enabled() else None),
                     # FLIPCYCLE H5: the phase cap never strands a SHORT
-                    # (the seat gate's cap is hard: a SHORT needs a D seat too)
-                    # DOUBLE-FLIP 1015: nor a request that needs P (the park's own reader)
-                    # review A1/A3: the choice (seat gate hard, switch-independent needs-P) lives in one method
-                    cap_exempt=Front._p_phase_cap_exempt_for(self, _dc_cap))
+                    # DOUBLE-FLIP 1015: nor a request that needs P (the park's own reader), switch-independent;
+                    # SEAT-AT-HAND-OFF: no seat cap on this phase, so no seat condition on the exemption either
+                    cap_exempt=Front._p_phase_cap_exempt_pred(self))
                 # K9 P-DRAIN-EARLY-SETTLE: the early legs P is prefilling anyway are settled here, in "serving",
                 # not in the P->D flip's drain under the flip-stall bound (h16r 11:52:25Z death, 11:26:01Z hang)
                 if p_drain_early_settle_enabled() and self.state == "serving":
@@ -17562,9 +17308,6 @@ class Front:
                                     "P was already prefilling (posted at the D->P begin) are awaited in this phase, "
                                     "never left outstanding for the P->D flip's drain (K9)", self.epoch,
                                     _n_settled, bool(self._p_intake_stalled), len(self.queue))
-                # PENDEL-FLIP: what the seat gate's cap left in the queue is held while D is full
-                Front._pbound_hold_arm(self, _dc_cap, int(_phase_stats.get("dispatched", 0) or 0),
-                                       stalled=bool(self._p_intake_stalled))
                 if _phase_stats.get("short_rides"):
                     self.counters["p_phase_short_rides"] += _phase_stats["short_rides"]
                     logger.info(
@@ -17644,7 +17387,10 @@ class Front:
                     # H91 part C rule 3: so are the ones D parked on the wait
                     # bound -- their clients are waiting for D to resume them,
                     # under --idle-layout P as well.
-                    Front._p_end_over_x_left(self, bool(self._p_intake_stalled), _dc_cap, _k10_only)
+                    if Front._p_phase_reenter(self, bool(self._p_intake_stalled)):
+                        continue
+                    Front._p_end_over_x_left(self, bool(self._p_intake_stalled))
+                    self._p_reenter_rids = set()
                     await self.flip("P", "D")
                 elif self._idle_disposition("P", at_rest=True) == "flip":
                     await self.flip("P", "D")

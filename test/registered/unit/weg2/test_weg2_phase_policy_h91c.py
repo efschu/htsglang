@@ -292,6 +292,12 @@ def test_main_flags_default_to_the_user_design():
 
 # ------------------------------------------------------ rule 1: the cap
 def test_rule1_a_p_phase_takes_at_most_six_then_flips_with_handoff_n():
+    """H91 part C rule 1 AMENDED by flipqueue 1015 (double flip P->D->P): the cap never strands a request that
+    NEEDS P (``Front._p_phase_cap_exempt_pred``). Here X = 10, so all nine (~1000 tokens each) are over X and need
+    P: the first phase takes all nine, the wake of D carries handoff_n=9, and no request is prefilled twice. Left
+    at the cap (the old form: 6, then 3 queued) they made D's DONE-KICK fire PARK-IMMEDIATE at once (11:04:50Z
+    weg2-0-7, awake_s=0.0). The cap still binds what neither rides nor needs P
+    (test_weg2_flipqueue_1015::test_the_cap_still_binds_what_neither_rides_nor_needs_p)."""
     async def body():
         async with Harness(awake="P", p_concurrency=8, d_bs=8,
                            p_phase_max_requests=6) as h:
@@ -300,13 +306,13 @@ def test_rule1_a_p_phase_takes_at_most_six_then_flips_with_handoff_n():
             assert await _until(lambda: "rpc:release_memory_occupation" in h.p.timeline, 20)
             first = _first(h.p.timeline, "rpc:release_memory_occupation")
             before = [e for e in h.p.timeline[:first] if e.startswith("gen:")]
-            assert len(before) == 6, h.p.timeline[:first]
+            assert len(before) == 9, h.p.timeline[:first]
             results = await asyncio.wait_for(asyncio.gather(*tasks), 40)
             assert [s for s, _ in results] == [200] * 9
             # rule 2: the wake of D carried the hand-off count on its kv resume
             kv = [b for b in h.d.resume_bodies if "kv_cache" in (b.get("tags") or [])]  # H6 (6b8913e519): the kv resume rides the weights leg
-            assert kv and kv[0].get("handoff_n") == 6 and kv[0].get("parked_n") == 0, kv
-            # the second P phase took the remaining three
+            assert kv and kv[0].get("handoff_n") == 9 and kv[0].get("parked_n") == 0, kv
+            # no second P phase was needed, and nothing was prefilled twice
             assert h.p.gen_marks.count("c8") == 1 and len(h.p.gen_marks) == 9
 
     asyncio.run(body())
