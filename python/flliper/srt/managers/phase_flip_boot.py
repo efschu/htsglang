@@ -2232,7 +2232,7 @@ def host_tier_of(tree):
     return getattr(controller, "mem_pool_host", None)
 
 
-def _hybrid_pin_entries(*, tp_runner, sa, kv_host, inner_pool, tp_device_pool, logger):
+def _hybrid_pin_entries(*, tp_runner, sa, kv_host, inner_pool, tp_device_pool, logger, pp_anchor_slots=0):
     """#871: the KV+MAMBA entry pair for the 'tp' staging pin, or None.
 
     MIRRORS ``build_hybrid_mamba_stack`` (hybrid_pool_assembler.py) rather than
@@ -2319,6 +2319,14 @@ def _hybrid_pin_entries(*, tp_runner, sa, kv_host, inner_pool, tp_device_pool, l
         # #1068: the SAME knob the assembler passes for the pp-side anchor
         # pool, MIN-synced inside MambaPoolHost -- one budget, both phases.
         anchor_host_mib=int(getattr(sa, "hicache_mamba_host_mib", 0) or 0),
+        # MAMBA-ANCHOR-FLOOR: the floor the post-build check below refuses
+        # under is applied at construction, on this path as on the assembler's.
+        max_running_requests=int(getattr(sa, "max_running_requests", 0) or 0),
+        # ...and the pp-side pool's group count is a floor term too: the two
+        # phases' anchor pools must hold the SAME count (#1068 TP PIN ANCHOR
+        # SLOT MISMATCH below), and the pp pool may have been raised to ITS
+        # floor at the assembler.
+        slot_floor_extra=int(pp_anchor_slots or 0),
     )
     entries = [
         build_pool_entry(
@@ -2956,6 +2964,9 @@ def build_phase_flip_host_pools(scheduler):
                 inner_pool=inner_pool,
                 tp_device_pool=tp_device_pool,
                 logger=logger,
+                pp_anchor_slots=int(getattr(getattr(
+                    (getattr(pp_host, "entry_map", None) or {}).get(PoolName.MAMBA), "host_pool", None),
+                    "anchor_synced_slots", 0) or 0),
             )
             if _hybrid is not None:
                 entries, mamba_host = _hybrid

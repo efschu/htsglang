@@ -309,6 +309,7 @@ from flliper.srt.mem_cache.pool_host.base import (
     fixed_host_pool_tokens,
     _WRITE_BACK_STAGING_PAGE_CHUNK,
     HICACHE_HOST_MEMORY_RESERVE_BYTES,
+    sync_fixed_hicache_floor,
     sync_fixed_hicache_size,
     synchronized,
 )
@@ -343,6 +344,31 @@ from flliper.srt.mem_cache.pinned_host_budget import (  # noqa: E402
 # non-zero count. That counter, not this constant, is what says the ceiling
 # binds.
 MAMBA_ANCHOR_HOST_AUTO_MULT: float = 1.0
+
+
+def mamba_anchor_slot_floor(device_slots: int, max_running_requests: int) -> int:
+    """MAMBA-ANCHOR-FLOOR (16.10.): the fewest host anchor slots a rank can run
+    with -- every device slot can be backed up (a sleep flush writes them all)
+    plus one per running request plus one. The same law phase_flip_boot.py has
+    refused under since #1068 ('--hicache-mamba-host-mib too small'), but there
+    only on the P rebind; measured boot 1016_103428: D-TP0 got 6 slots against
+    38 + 6 + 1 = 45, P 9 against 32 + 6 + 1 = 39 -- anchors lost at the D sleep
+    flush, X refusals, mini P prefills, flip ping-pong. 0 = the floor is not
+    knowable here (max_running_requests not given): no floor, named as such."""
+    if int(max_running_requests or 0) <= 0:
+        return 0
+    return int(device_slots) + int(max_running_requests) + 1
+
+
+def mamba_anchor_slot_floor_staging(max_running_requests: int) -> int:
+    """MAMBA-ANCHOR-FLOOR, arena form (ArenaMambaPoolHost): the staging rows only
+    carry ANCHOR-BYPASS reads and transfers without a pre-claimed arena id --
+    at most one per running request at a time, plus one. The device + running
+    + 1 law of the pre-arena row path moves to the shared mamba arena (launcher
+    MAMBA-ARENA-FLOOR). 0 = max_running_requests not given."""
+    if int(max_running_requests or 0) <= 0:
+        return 0
+    return int(max_running_requests) + 1
 
 
 class MambaBlobGeometryError(RuntimeError):
@@ -401,6 +427,8 @@ class MambaPoolHost(HostKVCache):
         layout: str = "layer_first",
         anchor_host_mib: int = 0,
         anchor_auto_mult: float = 1.0,
+        max_running_requests: int = 0,
+        slot_floor_extra: int = 0,
     ):
         self.device_pool = device_pool
         self.page_size = 1
@@ -532,6 +560,71 @@ class MambaPoolHost(HostKVCache):
                 f"auto(ratio={host_to_device_ratio} x mult={anchor_auto_mult})"
             )
             self.size = int(device_pool.size * host_to_device_ratio * anchor_auto_mult)
+
+        # MAMBA-ANCHOR-FLOOR (16.10., every construction site = every boot path:
+        # assembler on P and D, the phase-flip rebind, Form A and PP alike). A
+        # FIXED budget (MiB / GB) that buys fewer slots than the floor is RAISED
+        # to the floor -- never a refusal for host RAM (user rule 06.10.: host RAM
+        # warns), and argv no longer beats the code's own minimum. Rank-uniform:
+        # the fixed branches take the group MAX of the floor in the same group
+        # that MIN-synced the count (the slot count and the floor are then both
+        # group-wide); a rank without GDN state (0 B/slot, Form A worker) bids 0.
+        # The ratio branch derives from the synced device pool, so its floor is
+        # rank-invariant already and takes no extra collective.
+        # ARENA FORM (16.10., host 2.4 GB MemAvailable next to NF): on the
+        # ArenaMambaPoolHost every backup claims an ARENA slot (alloc_write; a
+        # refused claim takes no staging row), so the device + running + 1 law
+        # belongs to the arena (launcher MAMBA-ARENA-FLOOR), and the staging rows
+        # [0, S) only carry ANCHOR-BYPASS reads (one per anchor being read while
+        # the arena is full, freed when the arena resolves) and transfers without
+        # a pre-claimed id. Their floor is max_running + 1 bypass rows.
+        _arena_form = bool(getattr(type(self), "arena_read", False))
+        _floor = (
+            (
+                mamba_anchor_slot_floor_staging(max_running_requests)
+                if _arena_form
+                else mamba_anchor_slot_floor(device_pool.size, max_running_requests)
+            )
+            if self.size_per_token > 0 else 0
+        ) if int(max_running_requests or 0) > 0 else 0
+        _fixed_gate = int(anchor_host_mib) if anchor_host_mib and int(anchor_host_mib) > 0 else (
+            host_size if host_size > 0 else 0
+        )
+        if int(max_running_requests or 0) > 0 and _fixed_gate:
+            _floor = sync_fixed_hicache_floor(_floor, _fixed_gate)
+        if int(slot_floor_extra or 0) > _floor:
+            # a group-uniform count the caller must match (the phase-flip
+            # rebind passes the pp pool's synced count): no collective needed
+            _floor = int(slot_floor_extra)
+        _floor_before = int(self.size)
+        if _floor > 0 and self.size < _floor:
+            self.size = _floor
+            logger.warning(
+                "MAMBA-ANCHOR-FLOOR RAISED: source=%s bought %d host anchor slots, "
+                "the floor is %d (law here: %s = %d; group MAX; matched count %d) -> %d "
+                "slots, +%.1f MiB pinned on this rank (per_slot=%.2f MiB). A fixed budget "
+                "under the floor loses anchors; host RAM only warns, it never refuses this.",
+                _size_source,
+                _floor_before,
+                _floor,
+                ("arena form: staging = max_running_requests %d + 1 bypass rows" % int(max_running_requests))
+                if _arena_form else
+                ("device_slots %d + max_running_requests %d + 1" % (int(device_pool.size), int(max_running_requests))),
+                mamba_anchor_slot_floor_staging(max_running_requests) if _arena_form
+                else mamba_anchor_slot_floor(device_pool.size, max_running_requests),
+                int(slot_floor_extra or 0),
+                self.size,
+                (self.size - _floor_before) * self.size_per_token / (1024**2),
+                self.size_per_token / (1024**2),
+            )
+            _synced_suffix += f" floor_raised_from={_floor_before}"
+        _synced_suffix += (
+            (f" floor={_floor}" + (" (arena form: bypass rows)" if _arena_form else ""))
+            if _floor > 0 else " floor=skipped(max_running_requests unknown)"
+        )
+        #: the group-wide count before the R12 shadow rows and the page row --
+        #: what a second pool of the same group (phase-flip rebind) must match
+        self.anchor_synced_slots = int(self.size)
 
         # R12 (form_a_host_shadow): a Form A worker keeps its anchor rows as
         # byteless bookkeeping for as long as TP0 holds the anchor in its

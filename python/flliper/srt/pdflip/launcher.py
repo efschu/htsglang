@@ -25880,7 +25880,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # 29.09. (Planer post COLD_TIER_SHM): the tmpfs expert store, sized from the
     # map the ranks will load (dry-built here, re-priced below once written).
     _ledger_group_envs = [parse_group_env(getattr(ns, "env_d", "") or ""),
-                          parse_group_env(getattr(ns, "env_p", "") or "")]
+                          parse_group_env(getattr(ns, "env_p", "") or "")]; _ = hicache_disabled or log(mamba_arena_slots_into_groups(ns, _ledger_group_envs))  # MAMBA-ARENA-FLOOR 16.10.: raised before the ledger prices the arena (line-neutral: the catalog and tests cite launcher lines)
     _cold_tier_shm_gib, _cold_tier_line = cold_tier_shm_post(
         ns, ns.model, getattr(state, "p_stage_layers", None))
     log(_cold_tier_line)
@@ -27979,6 +27979,91 @@ def cli(argv: Optional[Sequence[str]] = None) -> int:
         raise
     boot_state_write(_say, event=("launcher_done", {"rc": rc}))
     return rc
+
+
+#: MAMBA-ARENA-FLOOR (16.10.): the most mamba state slots one running request can
+#: hold -- MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO 3 + the overlap ping-pong 2
+#: (model_runner_kv_cache_mixin._calculate_mamba_ratio), and the most
+#: mamba_pool_floor.mamba_slots_per_running_req returns (1 + 2 + 1 + 1). With the
+#: runtime's own safety margin, ceil(bs x 5 x 1.25) is an UPPER bound on the
+#: demand-driven device pool (_auto_mamba_demand_size = max(ceil(t*ratio*1.25),
+#: ratio, t*slots_per_req), then min(.., fit_cap)): measured D 1016_103428
+#: target_concurrency=6 ratio=5 safety=1.25 -> 38 = ceil(6 x 6.25). An upper bound
+#: over-sizes the arena, the safe direction (host RAM only warns).
+MAMBA_ARENA_SLOTS_PER_REQUEST_UPPER = 5
+MAMBA_ARENA_ENV = "FLLIPER_HICACHE_ARENA_MAMBA_SLOTS"
+
+
+def mamba_arena_group_floor(extra: str, bs_fallback) -> Tuple[int, int, int, str]:
+    """(floor, device_slots, max_running, source) of ONE group's share of the mamba
+    arena: device_slots + max_running + 1 -- the host anchor pool's law
+    (memory_pool_host.mamba_anchor_slot_floor), applied to the arena every
+    rank of both groups shares. device_slots = the group's own
+    --max-mamba-cache-size when its argv names one (the last value, as argparse),
+    else the upper bound of the demand-driven pool. (0, 0, 0, why) when the
+    group's concurrency is not knowable here."""
+    bs = _argv_scalar(extra or "", "--max-running-requests")
+    try:
+        bs = int(bs) if bs is not None else int(bs_fallback or 0)
+    except (TypeError, ValueError):
+        bs = 0
+    if bs <= 0:
+        return 0, 0, 0, "max_running_requests unknown"
+    mmc = _argv_scalar(extra or "", "--max-mamba-cache-size")
+    try:
+        dev, src = int(mmc), "--max-mamba-cache-size"
+    except (TypeError, ValueError):
+        dev = int(math.ceil(bs * MAMBA_ARENA_SLOTS_PER_REQUEST_UPPER * P_MAMBA_AUTO_SAFETY_MARGIN))
+        src = "demand upper bound ceil(%d x %d x %.2f)" % (bs, MAMBA_ARENA_SLOTS_PER_REQUEST_UPPER, P_MAMBA_AUTO_SAFETY_MARGIN)
+    return dev + bs + 1, dev, bs, src
+
+
+def mamba_arena_slots_into_groups(ns, group_envs) -> str:
+    """MAMBA-ARENA-FLOOR (16.10., boot 1016_124240: the shared mamba arena held 32
+    slots from a profile env, complete=32 of 32, D lost anchors at=evict
+    why=mamba_claim backuped=False). The ONE mamba arena is shared by every rank of
+    both groups, so its slot count must hold both groups' floors at once (P's
+    parked anchors and D's sleep flush coexist): floor = sum over the groups of
+    device_slots + max_running + 1. A value under it -- profile env, launcher
+    default, anything -- is RAISED to it in both group envs (the ranks and the
+    ledger then read the same number); never a refusal (host RAM warns). Returns
+    the line to log."""
+    groups = [("D", getattr(ns, "extra_d", "") or "", getattr(ns, "d_bs", None))]
+    if not bool(getattr(ns, "d_only", False)):
+        groups.insert(0, ("P", getattr(ns, "extra_p", "") or "", getattr(ns, "p_bs", None)))
+    parts, floor = [], 0
+    for name, extra, bs_fb in groups:
+        f, dev, bs, src = mamba_arena_group_floor(extra, bs_fb)
+        parts.append("%s: %s" % (name, ("device %d [%s] + running %d + 1 = %d" % (dev, src, bs, f)) if f else src))
+        floor += f
+    named = any(e and str(e.get(MAMBA_ARENA_ENV, "") or "") for e in (group_envs or ())) or bool(
+        str(os.environ.get(MAMBA_ARENA_ENV, "") or ""))
+    cur = int(float(_group_env_value(MAMBA_ARENA_ENV, group_envs, "140")))
+    if floor <= 0:
+        return "PDFLIP-MAMBA-ARENA-FLOOR skipped: %s (slots %d kept)" % ("; ".join(parts), cur)
+    if not named:
+        # nobody named a count: the arena gets the floor itself (computed, not the
+        # fixed launcher default 140 -- host RAM next to NF is the scarce side)
+        val = str(int(floor))
+        for attr in ("env_d", "env_p"):
+            setattr(ns, attr, set_group_env(str(getattr(ns, attr, "") or ""), MAMBA_ARENA_ENV, val))
+        for e in group_envs or ():
+            if e is not None:
+                e[MAMBA_ARENA_ENV] = val
+        return "PDFLIP-MAMBA-ARENA-FLOOR COMPUTED: %s=%d in both group envs (%s; one arena for both groups)" % (
+            MAMBA_ARENA_ENV, floor, "; ".join(parts))
+    if cur >= floor:
+        return "PDFLIP-MAMBA-ARENA-FLOOR ok: %s=%d >= floor %d (%s; one arena for both groups)" % (
+            MAMBA_ARENA_ENV, cur, floor, "; ".join(parts))
+    val = str(int(floor))
+    for attr in ("env_d", "env_p"):
+        setattr(ns, attr, set_group_env(str(getattr(ns, attr, "") or ""), MAMBA_ARENA_ENV, val))
+    for e in group_envs or ():
+        if e is not None:
+            e[MAMBA_ARENA_ENV] = val
+    return ("PDFLIP-MAMBA-ARENA-FLOOR RAISED: %s %d -> %d in both group envs (%s; one arena for both groups, "
+            "a count under the sum loses anchors at=evict why=mamba_claim). Host RAM only warns, it never "
+            "refuses this." % (MAMBA_ARENA_ENV, cur, floor, "; ".join(parts)))
 
 
 if __name__ == "__main__":

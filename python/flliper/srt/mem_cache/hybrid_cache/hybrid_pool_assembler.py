@@ -581,6 +581,9 @@ def build_hybrid_mamba_stack(
         # phase_flip_boot.py keeps mirroring the device pool exactly as its
         # ratio=1.0 says it does.
         anchor_auto_mult=MAMBA_ANCHOR_HOST_AUTO_MULT,
+        # MAMBA-ANCHOR-FLOOR: device_slots + max_running_requests + 1, raised
+        # inside the pool on every boot path (P and D, Form A and PP).
+        max_running_requests=int(getattr(server_args, "max_running_requests", 0) or 0),
     )
     entries = [
         build_pool_entry(

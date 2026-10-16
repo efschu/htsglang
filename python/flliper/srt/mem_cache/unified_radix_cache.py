@@ -5502,7 +5502,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 return None
         except Exception:  # noqa: BLE001
             return None
-        return mp
+        mp._pdflip_flush_tag = bool(getattr(self, "_pdflip_flush_spill", False)); return mp  # MAMBA-STAGING-HWM path tag (line-neutral)
 
     # -- fnFL2 H19: the arena keeps a request's DEEPEST anchors ----------------
     def _pdflip_mamba_claim(self, node, mp, last_hash):
