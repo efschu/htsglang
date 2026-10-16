@@ -154,3 +154,60 @@ def test_the_file_backend_refuses_an_out_of_range_mirror_row_by_name():
     ok = SimpleNamespace(name="qsa_indexer", keys=["k1"],
                          host_indices=torch.arange(STAGING, STAGING + PAGE))
     assert _file_batch_set_v2()(backend, [ok]) == {"qsa_indexer": [True]}
+
+
+# ---------------------------------------------------------------- review k12c A1
+def test_a_staging_node_is_written():
+    """Review M3: a node on STAGING rows [0, 2P) (every non-direct write-through
+    lands there) must still be written -- a guard that also flags rows < S would
+    silently drop every ordinary store write."""
+    t = _Tree()
+    t.write_backup_storage(_node(torch.arange(0, 2 * PAGE)))
+    assert len(t.writes) == 1 and 99 in t.ongoing_backup
+
+
+@pytest.mark.parametrize("where", ["first", "middle"])
+def test_an_orphan_in_the_first_or_a_middle_page_is_refused(where):
+    """Review M2/M4: the guard reads EVERY id, not one end of the node."""
+    real = lambda lo: torch.arange(lo, lo + PAGE)  # noqa: E731
+    orphan = torch.full((PAGE,), ORPHAN, dtype=torch.int64)
+    pages = [real(STAGING), real(STAGING + PAGE), real(STAGING + 2 * PAGE)]
+    pages[0 if where == "first" else 1] = orphan
+    t = _Tree()
+    t.write_backup_storage(_node(torch.cat(pages)))
+    assert t.writes == [] and t.ongoing_backup == {}
+
+
+def test_the_belt_at_row_num_host_pages_returns_false_without_raising():
+    """Review: the off-by-one direction -- row == num_host_pages (6549) is past
+    the mirror; row 6548 is its last real row."""
+    def page(s):
+        if s // PAGE >= MIRROR_ROWS:
+            raise IndexError(f"index {s // PAGE} is out of bounds for dimension 0 with size {MIRROR_ROWS}")
+        return torch.zeros(1)
+
+    mirror = SimpleNamespace(page_size=PAGE, slot_page_size=PAGE, num_host_pages=MIRROR_ROWS,
+                             get_data_pages=lambda starts: [page(s) for s in starts])
+    backend = SimpleNamespace(
+        registered_pools={"qsa_indexer": mirror},
+        _log_key=lambda name, key: f"{key}.{name}",
+        _batch_set_each=lambda keys, pages: [True] * len(keys),
+        _qsa_sidecar_trace=lambda *a, **k: None,
+    )
+    fn = _file_batch_set_v2()
+    at = SimpleNamespace(name="qsa_indexer", keys=["k"],
+                         host_indices=torch.arange(MIRROR_ROWS * PAGE, (MIRROR_ROWS + 1) * PAGE))
+    assert fn(backend, [at]) == {"qsa_indexer": [False]}
+    last = SimpleNamespace(name="qsa_indexer", keys=["k"],
+                           host_indices=torch.arange((MIRROR_ROWS - 1) * PAGE, MIRROR_ROWS * PAGE))
+    assert fn(backend, [last]) == {"qsa_indexer": [True]}
+
+
+def test_the_first_id_past_the_real_rows_is_refused():
+    """Review M1 (``>`` for ``>=``): id S + A is the first non-row (the first
+    read placeholder) -- refused even when it is the only one."""
+    hv = torch.arange(STAGING, STAGING + 2 * PAGE)
+    hv[PAGE] = STAGING + ARENA_TOKENS
+    t = _Tree()
+    t.write_backup_storage(_node(hv))
+    assert t.writes == []
