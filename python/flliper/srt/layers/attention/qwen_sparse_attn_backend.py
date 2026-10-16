@@ -43,6 +43,60 @@ from flliper.srt.model_executor.forward_batch_info import ForwardMode
 logger = logging.getLogger(__name__)
 
 
+def _host_ints(v, n: int):
+    """The first ``n`` entries of a host length vector as ints; None when the
+    batch carries none (or a device tensor, which would cost a sync)."""
+    if v is None:
+        return None
+    if isinstance(v, torch.Tensor):
+        if v.device.type != "cpu":
+            return None
+        v = v.tolist()
+    try:
+        out = [int(x) for x in list(v)[:n]]
+    except (TypeError, ValueError):
+        return None
+    return out if len(out) == n else None
+
+
+def qsa_prefix_grain_violations(forward_batch, ratio: int, n: int):
+    """K11: the rows whose extend prefix is not a multiple of the QSA compress
+    ratio, read from the HOST lengths only (no device sync). Same arithmetic
+    as the device write plan: ``prefix = max(seq_len - extend_len, 0)``; the
+    scheduler's ``extend_prefix_lens_cpu`` when the pair is missing. Returns
+    ``[(row, prefix), ...]``; empty when aligned or when no host lengths exist."""
+    r = int(ratio)
+    if r <= 1 or n <= 0:
+        return []
+    seq = _host_ints(getattr(forward_batch, "seq_lens_cpu", None), n)
+    ext = _host_ints(getattr(forward_batch, "extend_seq_lens_cpu", None), n)
+    if seq is not None and ext is not None:
+        prefixes = [max(s - e, 0) for s, e in zip(seq, ext)]
+    else:
+        prefixes = _host_ints(getattr(forward_batch, "extend_prefix_lens_cpu", None), n)
+        if prefixes is None:
+            return []
+    return [(i, p) for i, p in enumerate(prefixes) if p % r]
+
+
+def qsa_check_prefix_grain(forward_batch, ratio: int, n: int) -> None:
+    """K11 named stop BEFORE the write-plan kernels: an extend whose prefix
+    splits a compressed group raises here with the rid instead of reaching the
+    text-less device assert that killed NF h16p PP0 (15.10. 12:39:42Z)."""
+    bad = qsa_prefix_grain_violations(forward_batch, ratio, n)
+    if not bad:
+        return
+    rids = getattr(forward_batch, "rids", None) or []
+    row, prefix = bad[0]
+    rid = rids[row] if row < len(rids) else "?"
+    raise RuntimeError(
+        f"QSA-PREFIX-GRAIN rid={rid} prefix={prefix} ratio={int(ratio)} "
+        f"row={row} rows_bad={len(bad)}: an extend prefix splits a compressed "
+        "group -- the chunk before it ended off the grain (K11; the producer is "
+        "the scheduler's chunk end, PrefillAdder._pdflip_floor_chunk_to_grain)"
+    )
+
+
 _TRTLLM_SPARSE_PAGE_SIZE = 64
 
 
@@ -1132,7 +1186,8 @@ class QwenSparseAttnBackend(AttentionBackend):
         # The table width is a host-side bound;
         # assert on device so a short table fails loudly without a sync.
         torch._assert_async(
-            (end_blocks * compress_ratio <= token_slot_table.shape[1]).all()
+            (end_blocks * compress_ratio <= token_slot_table.shape[1]).all(),
+            "QSA-TABLE-WIDTH: end_blocks*ratio exceeds token_slot_table width",
         )
         counts = (end_blocks - start_blocks).clamp_min(0)
         ends = torch.cumsum(counts, 0)
@@ -1190,7 +1245,13 @@ class QwenSparseAttnBackend(AttentionBackend):
         # Prefix sharing is page-granular and the page is a ratio
         # multiple, so a matched prefix always covers whole groups. A
         # misaligned prefix would leave a shared group half-written.
-        torch._assert_async((prefix_lens % ratio == 0).all())
+        # K11: the HOST lengths name the row before any kernel runs; the device
+        # assert stays as the backstop for a batch without host lengths.
+        qsa_check_prefix_grain(forward_batch, ratio, int(lengths.numel()))
+        torch._assert_async(
+            (prefix_lens % ratio == 0).all(),
+            "QSA-PREFIX-GRAIN: an extend prefix splits a compressed group",
+        )
         # Each row spans at most ceil(extend_len / ratio) blocks, so the
         # token count and row count bound the plan without a sync.
         capacity = int(forward_batch.input_ids.numel()) // ratio + int(lengths.numel())

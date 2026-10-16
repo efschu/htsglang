@@ -177,14 +177,16 @@ def test_pages_beyond_ps_chain_are_proven_by_ds_own_key_chained_from_the_proven_
     assert torch.equal(host - S, _rows([1, 4, 7]) - S)
 
 
-def test_an_admissible_stored_key_keeps_its_slot_and_a_clean_chain_costs_no_lookup():
+def test_an_admissible_stored_key_keeps_its_slot_and_a_clean_chain_costs_one_lookup():
+    # A2 CHAIN-KEY (nf-h54-review-1015 B1): a clean chain proves its keys with ONE
+    # batched find per chain (was: no lookup at all -- the hole of B1)
     arena = _Arena(SLOT_OF)
     pool = _pool(arena)
     nodes = [_node(12, ["a1", "a2"]), _node(13, ["a3"]), _node(14, ["a4", "a5"])]
     host = torch.cat([n.host_value for n in nodes])
     out = ap.verify_load_chain(pool, nodes, host, rows_of=lambda n: n.host_value,
                                stems_of=lambda h: list(h), p_chain=CHAIN, page0=1, prior0="a0")
-    assert out is host and arena.finds == 0
+    assert out is host and arena.finds == 1
 
 
 def test_a_page_no_admissible_key_can_prove_is_a_named_stop_with_the_depth():

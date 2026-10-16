@@ -87,19 +87,21 @@ def test_a_d_that_prefills_a_granted_short_is_busy(monkeypatch):
 
 
 def test_the_second_short_of_a_burst_collects_and_the_sum_goes_to_p(monkeypatch):
-    """6239 in flight + 6239 arriving = 12478 > X=12288 -> P's batch."""
+    """6239 in flight + 6239 arriving = 12478 > X=12288 -> P's batch. NODECODE 1015 (user law: collecting only while a DECODE
+    stands on D): D only prefills "first", no decode -- the set is priced (the sum goes to P) but decided AT ONCE, not after
+    the window (was: ">= 0.25 s, it waited the window")."""
     _on(monkeypatch, window="0.3")
     monkeypatch.setenv("FLLIPER_PDFLIP_DECODE_COLLECT_D_CHECK_S", "0")
     f = _front(running=[], n=6, kv={"available": 400000, "evictable": 0})
     _idle_d_prefilling(f, 6239)
     t0 = time.time()
     assert asyncio.run(f._decode_collect_short("second", 6239)) == "P"
-    assert time.time() - t0 >= 0.25, "it waited the window, it did not overtake the set"
-    assert f.counters["decode_collect_release_P"] == 1
+    assert time.time() - t0 < 0.25, "no decode on D: decided at once, it did not wait the window"
+    assert f.counters["decode_collect_release_P"] == 1 and f.counters["decode_collect_hold"] == 0
 
 
 def test_a_small_second_short_fits_the_sum_and_goes_to_d(monkeypatch):
-    """6239 in flight + 800 arriving = 7039 <= X -> D, after the window."""
+    """6239 in flight + 800 arriving = 7039 <= X -> D (NODECODE 1015: at once -- no decode on D, no window wait)."""
     _on(monkeypatch, window="0.3")
     monkeypatch.setenv("FLLIPER_PDFLIP_DECODE_COLLECT_D_CHECK_S", "0")
     f = _front(running=[], n=6, kv={"available": 400000, "evictable": 0})

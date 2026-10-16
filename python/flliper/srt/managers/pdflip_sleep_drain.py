@@ -31,7 +31,7 @@ every rank at once (W120), which the leg wrapper turns into one W29 group stop
 from __future__ import annotations
 
 import time
-from typing import Callable, Collection, FrozenSet, Iterable, List, Sequence, Tuple
+from typing import Callable, Collection, FrozenSet, Iterable, List, Optional, Sequence, Tuple
 
 import msgspec
 
@@ -59,10 +59,29 @@ class SleepDrainVerdict(msgspec.Struct, frozen=True, kw_only=True):
     hicache_terms: int
     other_terms: int
     expired: bool
+    # K12: read only when the drain was given ``backup_executing`` (5-term
+    # vector); the defaults describe the old 3-term reading, which never
+    # abandons anything.
+    nonbackup_hicache_terms: int = -1
+    backup_executing: int = 0
 
     @property
     def idle(self) -> bool:
         return self.hicache_terms == 0 and self.other_terms == 0
+
+    @property
+    def abandonable(self) -> bool:
+        """K12: the bound expired and every term left in the group is a storage
+        backup nobody is writing right now -- the group may give up those store
+        copies and sleep instead of stopping (W120). Group-uniform: every field
+        is a MAX every rank read identically."""
+        return (
+            self.expired
+            and self.other_terms == 0
+            and self.hicache_terms > 0
+            and self.nonbackup_hicache_terms == 0
+            and self.backup_executing == 0
+        )
 
     @property
     def done(self) -> bool:
@@ -75,6 +94,39 @@ def local_drain_terms(blockers: Sequence[str], *, expired: bool) -> List[int]:
     """This rank's contribution: [hicache terms, other terms, expired]."""
     hicache = sum(1 for b in blockers if b.startswith("hicache"))
     return [hicache, len(blockers) - hicache, int(expired)]
+
+
+def local_drain_terms_k12(
+    blockers: Sequence[str], *, expired: bool, backup_executing: int
+) -> List[int]:
+    """K12: the 3-term vector plus [non-backup hicache terms, a backup is
+    executing on a live thread here]."""
+    base = local_drain_terms(blockers, expired=expired)
+    nonbackup = sum(
+        1 for b in blockers if b.startswith("hicache") and not b.startswith("hicache_backup")
+    )
+    return base + [nonbackup, int(bool(backup_executing))]
+
+
+def verdict_from_group(values: Sequence[int]) -> SleepDrainVerdict:
+    vals = [int(v) for v in values]
+    if len(vals) >= 5:
+        return SleepDrainVerdict(
+            hicache_terms=vals[0], other_terms=vals[1], expired=bool(vals[2]),
+            nonbackup_hicache_terms=vals[3], backup_executing=vals[4],
+        )
+    return SleepDrainVerdict(
+        hicache_terms=vals[0], other_terms=vals[1], expired=bool(vals[2])
+    )
+
+
+def sleep_abandon_backup_on(env=None) -> bool:
+    """K12 switch, ON by default (new features default on); identical on every
+    rank because the launcher sets one environment for the group."""
+    import os
+
+    v = (env if env is not None else os.environ).get("FLLIPER_PDFLIP_SLEEP_ABANDON_BACKUP", "1")
+    return str(v).strip().lower() not in ("0", "false", "no", "off", "")
 
 
 def hold_owned_prefetch(
@@ -183,23 +235,28 @@ def drain_until_group_verdict(
     clock: Callable[[], float] = time.monotonic,
     pause: Callable[[float], object] = time.sleep,
     poll_s: float = PDFLIP_SLEEP_DRAIN_POLL_S,
+    backup_executing: Optional[Callable[[], int]] = None,
 ) -> Tuple[SleepDrainVerdict, int]:
     """Poll ``check_hicache_events`` until the GROUP verdict says stop.
 
     ``group_max`` must reduce over the group ``check_hicache_events`` posts
     its collectives on; every rank then leaves the loop after the same number
-    of polls. Returns ``(verdict, polls)``.
+    of polls. Returns ``(verdict, polls)``. K12: with ``backup_executing``
+    (every rank of the group passes it, or none does) the reduced vector also
+    carries the terms ``SleepDrainVerdict.abandonable`` reads.
     """
     t0 = clock()
     polls = 0
     while True:
-        local = local_drain_terms(
-            list(idle_blockers()), expired=clock() - t0 >= bound_s
-        )
-        hicache, other, expired = group_max(local)
-        verdict = SleepDrainVerdict(
-            hicache_terms=int(hicache), other_terms=int(other), expired=bool(expired)
-        )
+        blockers = list(idle_blockers())
+        expired_local = clock() - t0 >= bound_s
+        if backup_executing is None:
+            local = local_drain_terms(blockers, expired=expired_local)
+        else:
+            local = local_drain_terms_k12(
+                blockers, expired=expired_local, backup_executing=backup_executing()
+            )
+        verdict = verdict_from_group(group_max(local))
         if verdict.done:
             return verdict, polls
         check_hicache_events()

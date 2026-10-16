@@ -281,6 +281,14 @@ def capacity_park_precondition(req) -> bool:
             return False
         if getattr(req, "multimodal_inputs", None) is not None:
             return False
+        # LANES HOTFIX 2 1014 (NF 09:33:44 pdflip-2-13, lane 1): a request of a raised lane does not wait out the
+        # capacity park (120 s while every lower lane is parked behind it) -- it goes to P at once (RESUME-VIA-P,
+        # measured 4.3 s).  The lane is replicated (the request's own field), so the group vote stays uniform.
+        try:
+            if int(getattr(req, "priority", 0) or 0) > 0:
+                return False
+        except (TypeError, ValueError):
+            pass
         return bool(getattr(req, "_pdflip_store_short_fallback", False))
     except Exception:  # noqa: BLE001
         return False

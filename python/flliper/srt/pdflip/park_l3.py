@@ -164,12 +164,12 @@ def _wake_key(sched):
     return int(seq) + (1 if getattr(sched, "pdflip_dormant", False) else 0)
 
 
-def _in_flight_pages(sched, reqs) -> int:
-    """Pages of this wake's hold reads that still hold the arena: issued and
-    still in the hold / settle, or released to the waiting queue and not yet
-    admitted (the admission's load-back releases the references). Replicated:
-    the settle, the hold and the queue's hold-released requests are the
-    group's, the pages are request lengths."""
+def _in_flight(sched, reqs):
+    """(pages, requests) of this wake's hold reads that still hold the arena:
+    issued and still in the hold / settle, or released to the waiting queue
+    and not yet admitted (the admission's load-back releases the references).
+    Replicated: the settle, the hold and the queue's hold-released requests
+    are the group's, the pages are request lengths."""
     seen, total = set(), 0
     for r in reqs or ():
         if issued(r) and not capacity_waiting(r):
@@ -183,7 +183,155 @@ def _in_flight_pages(sched, reqs) -> int:
         if pages > 0 and getattr(r, WAKE_ATTR, None) == wake:
             seen.add(id(r))
             total += pages
-    return total
+    return total, len(seen)
+
+
+def _in_flight_pages(sched, reqs) -> int:
+    """Pages of this wake's hold reads that still hold the arena (see
+    :func:`_in_flight`)."""
+    return _in_flight(sched, reqs)[0]
+
+
+def seat_gate_on() -> bool:
+    try:
+        from flliper.srt.environ import envs
+
+        return bool(envs.FLLIPER_PDFLIP_WAKE_READ_SEAT_GATE.get())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _batch_rids(batch) -> set:
+    return {id(r) for r in (getattr(batch, "reqs", None) or ())}
+
+
+def seat_room(sched):
+    """NF arena fix (14.10.): how many MORE hold reads may hold the arena for
+    a seat -- D's seats (``max_running_requests``) minus the requests that
+    already run (the running batch, plus the batch of this pass and the last
+    one while the extend has not merged yet) minus the flip-parked requests
+    waiting in the queue (they resume first; the SB admission gate keeps their
+    seats the same way, d_seats.admission_gate ``seat_room``). ``None`` = no
+    gate: off, no seat count known (a stock resume, a fixture), not group D.
+    Every input is replicated -- the same server_args on every rank, the
+    running / current / last batches and the waiting queue are the TP group's
+    one schedule -- so every rank decides alike."""
+    if not seat_gate_on() or not _group_d():
+        return None
+    try:
+        cap = int(getattr(sched, "max_running_requests", 0) or
+                  getattr(getattr(sched, "server_args", None), "max_running_requests", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+    if cap <= 0:
+        return None
+    running = set()
+    for name in ("running_batch", "cur_batch", "last_batch"):
+        running |= _batch_rids(getattr(sched, name, None))
+    from flliper.srt.pdflip import d_seats
+
+    parked = sum(1 for r in list(getattr(sched, "waiting_queue", None) or ())
+                 if d_seats.park_site(r) is not None and not int(getattr(r, PAGES_ATTR, 0) or 0))
+    return cap - len(running) - parked
+
+
+def _no_seat_yet(room, in_req: int) -> bool:
+    """The seat gate's verdict for ONE more read: no seat is left for it. The
+    reads that hold the arena (``in_req`` requests: issued, no seat yet) are
+    the ones that get the free seats next; a read beyond ``room`` waits until
+    a seat frees. ``room`` None = no gate. Not a reserve: nothing is kept back
+    for anything else, the arena is only not pinned for requests that cannot
+    run yet."""
+    return room is not None and in_req >= max(int(room), 0)
+
+
+def _seat_note(room, in_req: int) -> str:
+    return "" if room is None else " seat_room=%d reading=%d" % (int(room), int(in_req))
+
+
+def _lane_sorted(hold) -> list:
+    """LANES HOTFIX 1014 (NF h6 11:21:06Z, pdflip-15-30 lane 1 read LAST and the ORDERED-EVICT victim of five
+    lane-held lane-0 reads): the hold is read -- and its kept pages leave the arena -- highest lane first;
+    inside a lane the hold order stays.  ``priority`` is the request's own field, so every rank sorts alike."""
+    def _lane(r) -> int:
+        try:
+            return int(getattr(r, "priority", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+    return sorted(list(hold or ()), key=lambda r: -_lane(r))
+
+
+#: WAKE-READ-FLOOR-1014 (NF h17 38c6d40239, D TP0 15:48:07-54, pdflip-2-55): D took floor 1 at
+#: 15:48:07 (the lane-1 image turn), and at the P->D wake 15:48:09 ``#248 WAKE-READ issued=5
+#: ['pdflip-2-30', 'pdflip-2-31', 'pdflip-2-44', 'pdflip-2-45', 'pdflip-2-47'] ... in_flight_pages=6309
+#: arena_slots=6485`` -- five lane-0 hold reads the floor would not seat took the whole arena; the
+#: lane-1 read of pdflip-2-55 found it pinned (ARENA-REF-HOLDERS 15:48:31 tree_in_use=5848
+#: arena_pinned=6323 of 6323), read 0 / 128 / 24640 of 192512 in 43 s and went W31 -> W50 -> P
+#: (P read all 192512 in 8.9 s). On: a hold read below D's floor waits (CAPWAIT, parked in the
+#: settle) until the floor falls to its lane; 0 = the old issue.
+FLOOR_ENV = "FLLIPER_PDFLIP_WAKE_READ_LANE_FLOOR"
+FLOOR_MARK = "#248f WAKE-READ FLOOR-WAIT"
+
+
+def _floor_on() -> bool:
+    return (os.environ.get(FLOOR_ENV, "1") or "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _req_lane(req) -> int:
+    try:
+        return int(getattr(req, "priority", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def below_floor(sched, req) -> bool:
+    """WAKE-READ-FLOOR-1014: ``req``'s lane is below D's lane floor -- D would not
+    seat it, so its hold read would only take arena room from the floor lane.
+    Replicated inputs (the floor RPC every rank applied, the request's own field)."""
+    if not _floor_on():
+        return False
+    # H16M-INT 1014 (merge of WAKE-READ-FLOOR with PRIO-AS-AGE): the lane FLOOR exists only in the floor
+    # mode of 1008.  With priority acting as age (user decision 14.10. 18:27Z: priority is a sort key, no
+    # lane floor / hold / preempt) the ONE place that decides whether a floor may act is
+    # ``prio_age.floor_mode()`` -- this read follows it instead of reading a floor attribute that the
+    # refused /pdflip/lane_floor RPC can never raise there.  Replicated input (env, same on every rank;
+    # the start check PDFLIP MODE-PARITY names a mixed boot).
+    try:
+        from flliper.srt.pdflip import prio_age as _pa
+
+        if not _pa.floor_mode():
+            return False
+    except Exception:  # noqa: BLE001 - floor_mode itself never raises; no read = no floor
+        return False
+    try:
+        from flliper.srt.pdflip import d_lane
+
+        floor = d_lane.floor_of(sched)
+    except Exception:  # noqa: BLE001 - no floor readable: nothing held back
+        return False
+    return floor > 0 and _req_lane(req) < floor
+
+
+def _hold_below_floor(sched, reqs, where: str) -> list:
+    """Split off the reads below the floor: they wait as capacity waiters (the
+    settle re-offers them every tick, :func:`issue_capacity_waiters`)."""
+    keep, held = [], []
+    for req in reqs:
+        (held if below_floor(sched, req) else keep).append(req)
+    for req in held:
+        setattr(req, CAPWAIT_ATTR, True)
+    if held:
+        try:
+            from flliper.srt.pdflip import d_lane
+
+            floor = d_lane.floor_of(sched)
+        except Exception:  # noqa: BLE001
+            floor = -1
+        logger.info("%s n=%d where=%s floor=%d rids=%s (hold reads below D's lane floor wait, parked in "
+                    "the settle, until the floor falls to their lane: the floor lane's reads get the "
+                    "arena -- WAKE-READ-FLOOR-1014)", FLOOR_MARK, len(held), where, floor,
+                    [(str(r.rid), _req_lane(r)) for r in held])
+    return keep
 
 
 def issue_deferred_reads(sched, hold) -> list:
@@ -208,30 +356,33 @@ def issue_deferred_reads(sched, hold) -> list:
     count, no reserve; nothing here runs in a decode or a flip leg. Every
     input is replicated (request lengths, hold order, the shared arena's
     geometry), so every rank decides alike."""
-    reqs = [r for r in list(hold or ()) if deferred(r)]
+    reqs = [r for r in _lane_sorted(hold) if deferred(r)]
+    reqs = _hold_below_floor(sched, reqs, "issue")
     if not reqs:
         return []
     cap = arena_capacity(sched) if arena_gate_on() else None
     if cap is None:
         return _issue(sched, reqs)
-    in_flight = _in_flight_pages(sched, hold)
+    in_flight, in_req = _in_flight(sched, hold)
+    room = seat_room(sched)
     go, wait = [], []
     for req in reqs:
         need = read_pages(sched, req)
-        if wait or (in_flight > 0 and in_flight + need > cap):
+        if wait or (in_flight > 0 and in_flight + need > cap) or _no_seat_yet(room, in_req):
             setattr(req, CAPWAIT_ATTR, True)
             wait.append(req)
             continue
         setattr(req, CAPWAIT_ATTR, False)
         in_flight += need
+        in_req += 1
         go.append(req)
     out = _issue(sched, go)
     if wait:
-        logger.info("%s n=%d waiting=%s in_flight_pages=%d arena_slots=%d (the older hold reads of "
+        logger.info("%s n=%d waiting=%s in_flight_pages=%d arena_slots=%d%s (the older hold reads of "
                     "this wake hold the arena: these wait parked in the #1471 settle, oldest "
                     "first, instead of reading short and evicting their own kept pages)",
                     CAPWAIT_MARK, len(wait), [(str(r.rid), read_pages(sched, r)) for r in wait],
-                    in_flight, cap)
+                    in_flight, cap, _seat_note(room, in_req))
     return out
 
 
@@ -241,17 +392,22 @@ def issue_capacity_waiters(sched, settle) -> list:
     them beside the issued reads still in the settle or released and not yet
     admitted (queued: their load-back has not freed the arena yet). Returns those issued;
     their settle clock restarts now (waiting is not reading)."""
-    waiters = [r for r in list(settle or ()) if capacity_waiting(r)]
+    waiters = [r for r in _lane_sorted(settle) if capacity_waiting(r)]  # LANES HOTFIX 1014: highest lane first
+    waiters = [r for r in waiters if not below_floor(sched, r)]  # WAKE-READ-FLOOR-1014: not while the floor holds it
     if not waiters:
         return []
     cap = arena_capacity(sched) if arena_gate_on() else None
-    in_flight = _in_flight_pages(sched, settle)
+    in_flight, in_req = _in_flight(sched, settle)
+    room = seat_room(sched)
     go = []
     for req in waiters:
         need = read_pages(sched, req)
         if cap is not None and in_flight > 0 and in_flight + need > cap:
             break
+        if _no_seat_yet(room, in_req):
+            break
         in_flight += need
+        in_req += 1
         go.append(req)
     if not go:
         return []
@@ -261,10 +417,10 @@ def issue_capacity_waiters(sched, settle) -> list:
     now = time.monotonic()
     for req in go:
         req._1471_since = now
-    logger.info("%s n=%d rids=%s in_flight_pages=%d arena_slots=%s still_waiting=%d (an older hold read "
+    logger.info("%s n=%d rids=%s in_flight_pages=%d arena_slots=%s still_waiting=%d%s (an older hold read "
                 "was admitted and freed its arena room: the next ones in arrival order read now)",
                 CAPISSUE_MARK, len(go), [(str(r.rid), read_pages(sched, r)) for r in go],
-                in_flight, cap, len(waiters) - len(go))
+                in_flight, cap, len(waiters) - len(go), _seat_note(room, in_req))
     return out
 
 
@@ -314,7 +470,7 @@ def note_hold_order(hold) -> None:
     try:
         from flliper.srt.pdflip import handoff_pending as _hp
 
-        _hp.note_read_order([str(getattr(r, "rid", "") or "") for r in (hold or ())])
+        _hp.note_read_order([str(getattr(r, "rid", "") or "") for r in _lane_sorted(hold)])
     except Exception:  # noqa: BLE001 - the order is an improvement, never a wall
         logger.warning("#248e hold order not noted", exc_info=True)
 

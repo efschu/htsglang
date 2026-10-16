@@ -1279,7 +1279,8 @@ class LRUFileEvictor:
         # estimate rather than re-probing statvfs on every eviction.
         free = fs[1]
         self._evict_while(
-            lambda reclaimed: (free + reclaimed) - value_bytes < self.min_free_bytes
+            lambda reclaimed: (free + reclaimed) - value_bytes < self.min_free_bytes,
+            why="min_free",
         )
         # Re-probe: external writers may have changed free space meanwhile.
         fs = self._fs_stats()
@@ -2001,8 +2002,13 @@ class LRUFileEvictor:
         # these two must not disagree.
         tensor_path = self._path_for_stem(evict_stem)
         try:
+            try:
+                _mtime = os.stat(tensor_path).st_mtime   # L3-EVICT-FILE: the victim's age
+            except OSError:
+                _mtime = None
             os.remove(tensor_path)
             freed = evict_size
+            self._note_evicted_file(evict_stem, evict_size, _mtime)
             _idx = getattr(self, "l3_index", None)
             if _idx is not None:
                 try:
@@ -2054,8 +2060,14 @@ class LRUFileEvictor:
             if self._pins is not None and self._pins.is_pinned(tw):
                 continue
             try:
-                os.remove(self._path_for_stem(tw))
+                _tp = self._path_for_stem(tw)
+                try:
+                    _mt = os.stat(_tp).st_mtime
+                except OSError:
+                    _mt = None
+                os.remove(_tp)
                 freed += size
+                self._note_evicted_file(tw, size, _mt)   # L3-EVICT-FILE (with its KV page)
             except FileNotFoundError:
                 pass
             except OSError as e:
@@ -2089,7 +2101,32 @@ class LRUFileEvictor:
             "FLLIPER_HICACHE_L3_SIDECAR_PAIR_EVICT)", cur[0], cur[1],
         )
 
-    def _evict_while(self, should_continue) -> int:
+    def _note_evicted_file(self, stem: str, size: int, mtime) -> None:
+        """ZERO-ANCHOR 1015 (pdflip-40-179 / pdflip-5-52, boot 133855): the L3 LRU
+        took files of a parked span between its demote and its resume, and the
+        log could not name one of them -- ``EVICTION-BG reclaimed 8265510912 B``
+        is a sum. One line per evicted file (stem, component, age, reason, run),
+        capped per run (``FLLIPER_HICACHE_L3_EVICT_FILE_LOG``, default 64; 0 =
+        off), the rest counted in the run's ``L3-EVICT-FILE SUMMARY``."""
+        try:
+            n = self.__dict__.get("_evict_file_run_n", 0) + 1
+            self._evict_file_run_n = n
+            cap = int(os.environ.get("FLLIPER_HICACHE_L3_EVICT_FILE_LOG", "64") or 0)
+            if cap <= 0 or n > cap:
+                return
+            age = -1.0 if mtime is None else max(0.0, time.time() - float(mtime))
+            comp = "kv"
+            for tag in (".qsa_indexer", ".mamba", ".draft"):
+                if tag in stem:
+                    comp = tag[1:]
+                    break
+            logger.info("L3-EVICT-FILE stem=%s comp=%s bytes=%d age_s=%.0f why=%s run=%d n=%d (an L3 "
+                        "file left the store; capped at %d per run)", stem, comp, int(size), age,
+                        self.__dict__.get("_evict_why", "?"), self.__dict__.get("_evict_run_id", 0), n, cap)
+        except Exception:  # noqa: BLE001 - an instrument never stops an eviction
+            pass
+
+    def _evict_while(self, should_continue, why: str = "cap") -> int:
         """Evict oldest non-pending entries while ``should_continue(reclaimed)``.
 
         ``should_continue`` is passed the disk bytes reclaimed so far and returns
@@ -2099,6 +2136,23 @@ class LRUFileEvictor:
         """
         reclaimed = 0
         attempts_left = len(self._lru)
+        # L3-EVICT-FILE: one run = one call; its per-file lines are capped
+        self._evict_why = why
+        self._evict_run_id = self.__dict__.get("_evict_run_id", 0) + 1
+        self._evict_file_run_n = 0
+        try:
+            return self._evict_while_impl(should_continue, reclaimed, attempts_left)
+        finally:
+            _n = self.__dict__.get("_evict_file_run_n", 0)
+            try:
+                _cap = int(os.environ.get("FLLIPER_HICACHE_L3_EVICT_FILE_LOG", "64") or 0)
+            except ValueError:
+                _cap = 64
+            if _cap > 0 and _n > _cap:
+                logger.info("L3-EVICT-FILE SUMMARY run=%d why=%s files=%d logged=%d suppressed=%d",
+                            self._evict_run_id, why, _n, _cap, _n - _cap)
+
+    def _evict_while_impl(self, should_continue, reclaimed: int, attempts_left: int) -> int:
         while self._lru and attempts_left > 0 and should_continue(reclaimed):
             outcome, freed = self._evict_one_lru_locked()
             if outcome == "stop":
@@ -2241,7 +2295,7 @@ class LRUFileEvictor:
                                       and time.monotonic() - t_b < _BG_EVICT_BATCH_S)) \
                     and self._directory_bytes_locked() > target
 
-            got = self._evict_while(more)
+            got = self._evict_while(more, why="cap_bg")
             # A batch cut for a waiter has not shown that nothing is evictable.
             return before, got, (got == 0 and not cut[0] and self._directory_bytes_locked() > target)
 

@@ -198,5 +198,9 @@ def test_without_the_cut_the_pre_part4_path(monkeypatch):
         _write(arena, 2, NODE)
         _ack_one(ranks[0], ranks[0].node_at(NODE))
         with H._as_rank(ranks[0]):
-            assert m.attach(["x"]) == ["x"]  # nothing to broadcast
+            out = m.attach(["x"])
+        # nothing but K12/H1's L3 fact on the wire -- no REBIND, no TRANSIT
+        assert out[-1] == "x"
+        kinds = [e[0] for v in out if isinstance(v, m.FormAHostVerdict) for e in v.events]
+        assert set(kinds) <= {m.L3}, kinds
     assert ranks[0].rebound == [f"h{NODE}"]

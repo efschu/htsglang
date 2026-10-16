@@ -58,6 +58,14 @@ PASSES = [
 
 
 @pytest.fixture(autouse=True)
+def _store_held_decide_pinned_off_1014(monkeypatch):
+    """STORE-HELD-DECIDE-1014 (default on) decides a store-held short read at its first re-read without growth.
+    The cases of this file pin the FLLIPER_PDFLIP_STORE_SHORT_MAX_CYCLES bound itself, so they run with the switch
+    off; the new rule is pinned in test_pdflip_store_held_decide_1014.py."""
+    monkeypatch.setenv("FLLIPER_PDFLIP_STORE_SHORT_HELD_DECIDE", "0")
+
+
+@pytest.fixture(autouse=True)
 def _nf_profile(monkeypatch):
     monkeypatch.setenv("FLLIPER_PDFLIP_STORE_SHORT_TAIL", "0")
     monkeypatch.delenv(rc12y.MAX_CYCLES_ENV, raising=False)

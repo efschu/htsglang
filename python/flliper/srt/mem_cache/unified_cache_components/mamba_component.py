@@ -1097,10 +1097,24 @@ class MambaComponent(TreeComponent):
                     _1469_note("HOLD-END-ANCHOR", node=x.id)
                     x = x_next
                     continue
+                # K15: an internal anchor without a host copy is backed up
+                # before its device state goes (pdflip-56-530: 73984 lost here)
+                _save = getattr(self.cache, "pdflip_save_anchor_before_tombstone", None)
+                if callable(_save) and x.component_data[ct].host_value is None:
+                    _save(x)
+                    if not lru.in_list(x) or x.component_data[ct].value is None:
+                        # #904 guard: the save pinned it (off the LRU) -- never tombstone
+                        x = x_next if lru.in_list(x_next) else lru.get_lru_no_lock()
+                        continue
                 self.cache._evict_component_and_detach_lru(
                     x, self, target=EvictLayer.DEVICE, tracker=tracker
                 )
                 self.cache._cascade_evict(x, self, tracker)
+                # K15 review A4/B4: refresh the successor AFTER the tombstone (as the
+                # leaf branch does) -- a save that took it off the LRU restarts the
+                # walk at the LRU end, which is no longer x itself
+                if x_next is not None and not lru.in_list(x_next):
+                    x_next = lru.get_lru_no_lock()
                 x = x_next
 
     def acquire_component_lock(
@@ -2063,6 +2077,16 @@ class MambaComponent(TreeComponent):
                     insert_result.mamba_exist = True
                 return
 
+            if (envs.FLLIPER_PDFLIP_AUX_HOST_LAW.get()
+                    and target_node.component_data[ComponentType.FULL].host_value is None):
+                # AUX-HOST-LAW (NF h17 15:51:02): the read's anchor (arena slot
+                # or ANCHOR-BYPASS staging row) never lands on a node without a
+                # Full host copy -- released like any refused anchor
+                self.cache.cache_controller.append_host_mem_release(extra_pools=[transfer])
+                _note_aux_host_refused(target_node, "prefetch")
+                if insert_result is not None:
+                    insert_result.mamba_exist = True
+                return
             target_node.component_data[ct].host_value = host_indices.clone()
             if target_node.component_data[ct].value is None:
                 host_lru = self.cache.host_lru_lists[ct]
@@ -2145,3 +2169,17 @@ class MambaComponent(TreeComponent):
                 self.cache._cascade_evict(x, self, tracker, target=EvictLayer.HOST)
                 self.cache._update_evictable_leaf_sets(x)
             x = x_next
+
+
+_AUX_HOST_REFUSED_N = [0]
+
+
+def _note_aux_host_refused(node, site: str) -> None:
+    """AUX-HOST-LAW: one loud line per refused attach (first 16, then every 64th)."""
+    _AUX_HOST_REFUSED_N[0] += 1
+    n = _AUX_HOST_REFUSED_N[0]
+    if n <= 16 or n % 64 == 0:
+        logger.error(
+            "PDFLIP AUX-HOST-LAW refused site=%s node=%s n=%d: a Mamba host state was about to "
+            "land on a node without a Full host copy (sanity law 'aux host requires Full host'); "
+            "its rows went back to the pool", site, getattr(node, "id", "?"), n)

@@ -272,13 +272,14 @@ class ChunkRoomAfterLoadBackTest(unittest.TestCase):
             self.assertEqual(out[r], AddReqResult.NO_TOKEN, f"TP{r}: {out[r]}")
             self.assertEqual(adders[r].can_run_list, [])
             self.assertEqual(adders[r].tree_cache.load_backs, [])
-            # the room attempt now asks, BEFORE the vote, for the very 1408 the
+            # the room attempt (H105f: after the group's dry ADMIT, before the
+            # confirming gather) asks for the very 1408 the
             # chunk's allocation asked for after it (86464 + 2368 + 64 - 87488)
             self.assertEqual(
                 adders[r].tree_cache.evicts, [(KV_ROWS + CHUNK + PAGE - AVAILABLE, 0)]
             )
             self.assertEqual(KV_ROWS + CHUNK + PAGE - AVAILABLE, 1408)
-        self.assertEqual(gather.calls, {0: 1, 1: 1, 2: 1})
+        self.assertEqual(gather.calls, {0: 2, 1: 2, 2: 2})  # H105f: vote + confirm
         self.assertEqual(sp._H105D_REFUSED["n"], 3)
 
     def test_room_for_load_back_and_chunk_admits(self):

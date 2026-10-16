@@ -327,6 +327,12 @@ CURATED: Dict[str, Dict[str, object]] = {
         "gain": "", "cost": "",
         "depends": [],
         "satz_quelle": "environ.py comment above FLLIPER_PDFLIP_LANES and pdflip/lanes.py (PLAN-PRIO-LANES-1008, part L1: field and state only; the displacing controller is part L4)"},
+    "FLLIPER_PDFLIP_PRIO_AS_AGE": {
+        "kind": "env", "group": 'Other', "level": "expert", "planner_derived": False,
+        "text": "Priority acts as AGE (user decision 14.10.2026): every age order and comparison -- D seats, SEAT-AGE displacement, the KV rule 'oldest first', decode admission, the P queue and batch order, wake reads, D refill -- uses the pair (priority descending, arrival ascending); a request of priority p+1 is older than every request of priority p, inside a priority the real arrival decides. Every wait clock keeps the real arrival. With 1 (default) the lane floor (LANE-PREEMPT, LANE-RAISE/RESUME, LANE-WAITER-HOLD, the P-leg hold, D's lane park) is never entered, and a request with priority > 0 that needs a prefill on P ends a DECODE-COLLECT window at once. Acts only with FLLIPER_PDFLIP_LANES=1. 0 = the lane floor of PLAN-PRIO-LANES-1008.",
+        "gain": "A higher priority is served first without parking or holding any lower request.", "cost": "A lower priority waits behind every higher one (no displacement of running work beyond the one youngest of the lowest priority SEAT-AGE takes).",
+        "depends": [_d("FLLIPER_PDFLIP_LANES", "requires", "The front reads 'priority' only with the lanes switch on.", "text")],
+        "satz_quelle": "environ.py comment above FLLIPER_PDFLIP_PRIO_AS_AGE and pdflip/prio_age.py (PRIO-AS-AGE 1014)"},
     "FLLIPER_PDFLIP_LANE_KEEPALIVE_S": {
         "kind": "env", "group": 'Other', "level": "expert", "planner_derived": False,
         "text": "Seconds between the keepalive comment lines (': lane-hold floor=N') the front writes into a held SSE stream. Default 15. Used only with FLLIPER_PDFLIP_LANES=1; the sender is part L4 of the lane plan, part L1 only declares the value.",

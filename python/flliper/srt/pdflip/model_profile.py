@@ -1581,7 +1581,7 @@ FIELD_CLASS: Dict[str, Tuple[str, str]] = {
     "inline_system_in_place": ("policy", "RG/MZ Agentenlast-Präfixschalter: am Agentenlast-Boot bewiesen"),
     "told_probe_tree_key": ("policy", "RG/TK Agentenlast-Präfixschalter"), "told_paced": ("policy", "RG/PX2 Agentenlast-Präfixschalter"),
     "p_twin_defer": ("policy", "RG/TW Agentenlast-Präfixschalter"), "front_span_inflight": ("policy", "RG/#49-Rest"),
-    "told_group_fallback": ("policy", "RG/PF: 27B nach Boot z30y14"),
+    "told_group_fallback": ("policy", "RG/PF: NF an seit 14.10. (h16g WIDTH GUARD), 27B nach Boot z30y14"),
     "vision": ("policy", "Sichtturm: 27B 'transient', NF 'off' -- beide tragen ein vision_config, es ist eine Bootwahl"),
     "records": ("policy", "Schlüssel der Messquellen: 27B mit Zeilen-Linie, NF ohne"),
     "early_read_flags": ("policy", "#1235 Frühlese-Flags: 27B TP-D"), "group_env": ("policy", "Gruppen-Env: NF uneven-DCP"),

@@ -264,7 +264,8 @@ class Wiring(unittest.TestCase):
         src = open(F.__file__).read()
         i = src.index("    async def d_admitter(self)")
         blk = src[i:i + 9000]
-        self.assertIn("_ordered = _sa.by_age(self._ready_for_d)", blk)
+        # PRIO-AS-AGE 1014: the D line is ordered by the order key (priority desc, front arrival asc)
+        self.assertIn("_ordered = _sa.by_age(self._ready_for_d, lane_of=lambda q: Front._prio_lane(self, q))", blk)
         self.assertIn("PDFLIP SEAT-AGE BACKFILL", blk)
         self.assertLess(blk.index("SEAT-AGE BACKFILL"), blk.index("await self._d_seat.acquire()"))
 

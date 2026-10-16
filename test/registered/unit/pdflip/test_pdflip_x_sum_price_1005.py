@@ -1,7 +1,7 @@
 """X-SUM-PRICE (Nutzer 05.10.2026): X bounds what D prefills IN TOTAL.
 
-Boot 1005_063507, 06:42Z: the P phase's seat cap (``p-cap`` = free D seats)
-left the 12.2k SHORTs pdflip-8-32 / 8-34 / 8-37 in the queue. Back on D,
+Boot 1005_063507, 06:42Z: the P phase's seat cap (``p-cap`` = free D seats; the cap is
+gone since SEAT-AT-HAND-OFF 15.10., the SUM rule stays) left the 12.2k SHORTs pdflip-8-32 / 8-34 / 8-37 in the queue. Back on D,
 ``_asr_queued_short_to_d`` tested each of them ALONE against X=12288 (all
 passed) and D prefilled 36.7k fresh tokens in ~40 s with cached=0 -- the sum
 DECODE-COLLECT sends to P (``tokens > X`` -> route P). The queued path now

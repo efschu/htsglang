@@ -416,6 +416,9 @@
      "evidence": {"file": "python/flliper/srt/environ.py", "zeile": 1096, "anchor": "FLLIPER_PDFLIP_LANE_KEEPALIVE_S = EnvInt(15)"}, "trees": ["nf"]},
     {"id": "K138", "von": "FLLIPER_PDFLIP_LANE_PREEMPT_CHUNK_TOKENS", "nach": "FLLIPER_PDFLIP_LANES", "rel": "requires", "calc": "text", "value": null,
      "satz": "The P-side chunk size while a higher lane waits (0 = the normal chunk) is used only with FLLIPER_PDFLIP_LANES=1; without the lane switch the value does nothing.",
-     "evidence": {"file": "python/flliper/srt/environ.py", "zeile": 1100, "anchor": "FLLIPER_PDFLIP_LANE_PREEMPT_CHUNK_TOKENS = EnvInt(0)"}, "trees": ["nf"]}
+     "evidence": {"file": "python/flliper/srt/environ.py", "zeile": 1100, "anchor": "FLLIPER_PDFLIP_LANE_PREEMPT_CHUNK_TOKENS = EnvInt(0)"}, "trees": ["nf"]},
+    {"id": "K139", "von": "FLLIPER_PDFLIP_PRIO_AS_AGE", "nach": "FLLIPER_PDFLIP_LANES", "rel": "requires", "calc": "text", "value": null,
+     "satz": "Priority as age (default on) acts only with FLLIPER_PDFLIP_LANES=1: without the lane switch the front does not read 'priority', so there is nothing to order by and the value does nothing (prio_age.enabled = lanes AND prio_as_age).",
+     "evidence": {"file": "python/flliper/srt/environ.py", "zeile": 1201, "anchor": "FLLIPER_PDFLIP_PRIO_AS_AGE = EnvBool(True)"}, "trees": ["nf"]}
   ]
 }

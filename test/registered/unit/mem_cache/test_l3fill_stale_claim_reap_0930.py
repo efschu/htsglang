@@ -21,6 +21,18 @@ from flliper.srt.mem_cache import hicache_storage as hs
 from flliper.srt.mem_cache.hicache_storage import HiCacheFile
 from flliper.srt.mem_cache.storage.file.hicache_arena import ShmArena
 
+
+@pytest.fixture(autouse=True)
+def _foreign_writer_is_simulated_in_process():
+    """SELF-JOIN (14.10.): the 'live writer' of these tests is this very
+    process, so the self-join takeover is off -- it would (rightly) take the
+    claim over instead of treating it as a foreign holder."""
+    from flliper.srt.environ import envs as _envs
+
+    with _envs.FLLIPER_PDFLIP_L3FILL_SELF_JOIN_TAKEOVER.override(False):
+        yield
+
+
 pytestmark = pytest.mark.skipif(shutil.which("gcc") is None, reason="needs gcc")
 
 TOTAL = 4096

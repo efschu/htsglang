@@ -263,7 +263,8 @@ class TokenCutLoadBackRoomTest(unittest.TestCase):
             self.assertEqual(adders[r].can_run_list, [])
             # nobody loaded back: the vote came first and was NO_TOKEN
             self.assertEqual(adders[r].tree_cache.load_backs, [])
-            # the room attempt ran before the vote: shortfall asked, 7616 paid.
+            # H105f: the room attempt runs AFTER the group's (dry) ADMIT and the
+            # confirming gather refuses: shortfall asked, 7616 paid.
             # H110: the shortfall is the pass's rows -- the load-back plus the
             # 12647-token rest behind it (one chunk at width 16384) plus the
             # allocator's page (page_size=1 here)
@@ -271,7 +272,8 @@ class TokenCutLoadBackRoomTest(unittest.TestCase):
                 adders[r].tree_cache.evicts,
                 [(KV_ROWS + (EXTENT[0] + UNCACHED - KV_ROWS) + 1 - AVAILABLE, DELIVERED)],
             )
-        self.assertEqual(gather.calls, {0: 1, 1: 1, 2: 1})
+        # H105f: the dry vote's gather + the confirming one
+        self.assertEqual(gather.calls, {0: 2, 1: 2, 2: 2})
         self.assertEqual(_refused(), 3)
 
     def test_deliverable_room_admits_and_the_follow_load_back_serves(self):
@@ -292,7 +294,7 @@ class TokenCutLoadBackRoomTest(unittest.TestCase):
                     self.assertEqual([q.rid for q in adders[r].can_run_list], [RID])
                     self.assertEqual(adders[r].tree_cache.load_backs, seen)
                     self.assertEqual(len(reqs[r].prefix_indices), KV_ROWS)
-                self.assertEqual(gather.calls, {0: 1, 1: 1, 2: 1})
+                self.assertEqual(gather.calls, {0: 2, 1: 2, 2: 2})  # H105f: vote + confirm
                 self.assertIn(_refused(), (0, None))  # no refusal (None: a base without the counter)
 
     def test_one_tight_rank_refuses_for_the_group(self):
@@ -325,6 +327,95 @@ class TokenCutLoadBackRoomTest(unittest.TestCase):
             self.assertEqual(out[r], AddReqResult.NO_TOKEN, f"TP{r}: {out[r]}")
             self.assertEqual(adders[r].tree_cache.load_backs, [])
         self.assertEqual(_refused(), 1)
+
+
+class VoteBeforeEvictTest(unittest.TestCase):
+    """H105f (NF h14 ba1d5becd7, D 14:50:53, pdflip-0-3): TP0's own gate passed
+    and H105d evicted the device copy of another session (#1469 EVICT
+    node=43/42/38/37/36) BEFORE the gather; a worker's own gate then refused
+    (WORKER-GATE code=NO_TOKEN price=83239 budget=33536). Now nothing is
+    evicted on any rank unless the group said ADMIT."""
+
+    def setUp(self):
+        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+        if hasattr(sp, "_H105D_REFUSED"):
+            sp._H105D_REFUSED["n"] = 0
+
+    def _run(self, *, tight_worker_budget: bool, switch: str = "1", gather_timeout=None):
+        import os
+
+        gather = _Gather()
+        if gather_timeout is not None:
+            gather.barrier = threading.Barrier(3, timeout=gather_timeout)
+        out, adders, reqs = {}, {}, {}
+        with patch(TOKEN_CUT, return_value=True), \
+                patch.dict(os.environ, {"FLLIPER_PDFLIP_H105F_VOTE_BEFORE_EVICT": switch}):
+            for r in range(3):
+                adders[r] = _adder(r, gather, deliverable=REPORTED_EVICTABLE)
+                reqs[r] = _req(r)
+            if tight_worker_budget:
+                # TP1's own pool gate refuses before any room question
+                adders[1].tree_cache.evictable_size.side_effect = lambda: 0
+                adders[1].tree_cache.full_evictable_size.side_effect = lambda: 0
+
+            def _go(r):
+                try:
+                    out[r] = adders[r].add_one_req(reqs[r], truncation_align_size=None)
+                except BaseException as e:  # noqa: BLE001
+                    out[r] = e
+
+            with patch.object(
+                sp, "_pp_load_back_extent", side_effect=lambda q: q._h105d_extent
+            ), patch("flliper.srt.mem_cache.common.release_admission_acquired_mamba_slot"):
+                ts = [threading.Thread(target=_go, args=(r,)) for r in range(3)]
+                for t in ts:
+                    t.start()
+                for t in ts:
+                    t.join(30)
+        return out, adders, gather
+
+    def test_a_worker_refusal_leaves_the_host_tree_untouched(self):
+        out, adders, gather = self._run(tight_worker_budget=True)
+        for r in range(3):
+            self.assertEqual(out[r], AddReqResult.NO_TOKEN, f"TP{r}: {out[r]}")
+            self.assertEqual(adders[r].tree_cache.evicts, [], f"TP{r} evicted before the vote")
+            self.assertEqual(adders[r].tree_cache.load_backs, [])
+        self.assertEqual(gather.calls, {0: 1, 1: 1, 2: 1})  # no confirm after a refusal
+
+    def test_rank_equality_mutant_confirm_on_own_vote_splits_the_gathers(self):
+        """raenge-nie-uneins: the confirming gather is due on the GROUP's ADMIT
+        (the first gather's verdict, the same on every rank). Mutant: due on
+        THIS rank's own dry room vote -- TP0/TP2 (room makeable) enter a second
+        gather, TP1 (own gate refused) does not: the collective splits."""
+        own = threading.local()
+        real_room = sp._h105d_cut_load_back_room
+
+        def _room(adder, req, evict=True):
+            ok = real_room(adder, req, evict=evict)
+            if not evict:
+                own.vote = ok
+            return ok
+
+        def _mutant_due(group_gate, armed):
+            return bool(armed) and bool(getattr(own, "vote", False))
+
+        with patch.object(sp, "_h105d_cut_load_back_room", side_effect=_room), \
+                patch.object(sp, "_h105f_confirm_due", side_effect=_mutant_due):
+            out, _adders, gather = self._run(tight_worker_budget=True, gather_timeout=2)
+        self.assertNotEqual(len(set(gather.calls.values())), 1,
+                            f"the mutant must split the gathers: {gather.calls}")
+        self.assertTrue(any(isinstance(v, BaseException) for v in out.values()), out)
+        # the real rule on the same inputs: one gather on every rank, alike
+        out, _adders, gather = self._run(tight_worker_budget=True)
+        self.assertEqual(gather.calls, {0: 1, 1: 1, 2: 1})
+        self.assertEqual(set(out.values()), {AddReqResult.NO_TOKEN})
+
+    def test_switch_off_is_the_old_order(self):
+        out, adders, gather = self._run(tight_worker_budget=True, switch="0")
+        for r in range(3):
+            self.assertEqual(out[r], AddReqResult.NO_TOKEN, f"TP{r}: {out[r]}")
+        self.assertNotEqual(adders[0].tree_cache.evicts, [], "the old order evicts before the vote")
+        self.assertEqual(gather.calls, {0: 1, 1: 1, 2: 1})
 
 
 class LoadBackRowsTest(unittest.TestCase):

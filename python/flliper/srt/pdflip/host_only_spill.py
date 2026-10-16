@@ -57,6 +57,17 @@ def armed(cache: Any) -> bool:
     return bool(_sf.enabled() and getattr(cache, _sf.FLOOR_LOCAL_PP_ATTR, False))
 
 
+def _strict() -> bool:
+    """H16P-NACHBESSERUNG A2 (``FLLIPER_PDFLIP_L3_PRESENT_STRICT``): an unpaired page (KV without its QSA index) is
+    not in L3 -- the leaf stays, like on ``lost``."""
+    try:
+        from flliper.srt.environ import envs
+
+        return bool(envs.FLLIPER_PDFLIP_L3_PRESENT_STRICT.get())
+    except Exception:  # noqa: BLE001
+        return True
+
+
 def _leaf_reason(node: Any) -> str:
     """Why ``cache._is_host_leaf`` said no (the same checks in the same order, for the census only)."""
     if not getattr(node, "evicted", True):
@@ -129,42 +140,54 @@ def _eligible(cache: Any, node: Any, pool: Any, skip: set) -> bool:
     return _reason(cache, node, pool, skip) is None
 
 
-def spill_host_only(cache: Any, pool: Any, want: int, page_size: int, skip: set) -> Dict[str, int]:
-    """Spill host-only H-leaves until ``want`` pages were released here (node-id
-    order). Returns the counts; the log line names them (27B loop, no census)."""
+def spill_host_only(cache: Any, pool: Any, want: int, page_size: int, skip: set,
+                    released_out: Optional[list] = None) -> Dict[str, int]:
+    """Spill host-only H-leaves until ``want`` pages were released here (group-equal
+    order, see ``UnifiedRadixCache._w3_arena_spill``; node-id order where the
+    arena names no slot). Returns the counts; the log line names them (27B loop, no census)."""
     from flliper.srt.mem_cache.unified_radix_cache import BASE_COMPONENT_TYPE
 
     P = max(1, int(page_size or 1))
     heap = []
     refused: Dict[str, int] = {}
+    eligible = []
     for n in cache._collect_all_nodes():
         r = _reason(cache, n, pool, skip)
         if r is None:
-            heap.append((n.id, n))
+            eligible.append(n)
         elif r != "root":
             refused[r] = refused.get(r, 0) + 1
+    # NF arena fix (14.10.): the order is the W3 spill's group-equal one (fewest
+    # reader references, then slot id, then node id) -- see _w3_arena_spill; a
+    # leaf the arena names no slot for keeps the node-id order
+    keys = cache._w3_spill_keys(pool, eligible)
+    heap = [(keys[id(n)], n.id, n) for n in eligible]
     candidates = len(heap)
     heapq.heapify(heap)
     released = leaves = unsecured = on_disk = written = stale = 0
     while heap and released < want:
-        _id, node = heapq.heappop(heap)
+        _key, _id, node = heapq.heappop(heap)
         if not _eligible(cache, node, pool, skip):
             stale += 1
             continue
         cd = node.component_data[BASE_COMPONENT_TYPE]
         sec = pool.secure_rows_to_l3(cd.host_value)
-        if int(sec.get("lost", 0)) or int(sec.get("pages", 0)) != len(node.hash_value):
+        if (int(sec.get("lost", 0)) or int(sec.get("pages", 0)) != len(node.hash_value)
+                or (int(sec.get("unpaired", 0)) and _strict())):
             unsecured += 1                # no L3 copy for every page, or a page not COMPLETE: it stays
             continue
         on_disk += int(sec.get("on_disk", 0))
         written += int(sec.get("written", 0))
+        if released_out is not None:
+            # READ-ROOM review A3: the slots this leaf's rows name, read before the leaf goes
+            released_out.extend(cache._w3_spill_keys(pool, [node]).slots_of(node))
         parent = node.parent
         tracker = {ct: 0 for ct in cache.tree_components}
         cache._evict_host_leaf(node, tracker)
         released += int(tracker.get(BASE_COMPONENT_TYPE, 0)) // P
         leaves += 1
         if parent is not None and parent is not cache.root_node and _eligible(cache, parent, pool, skip):
-            heapq.heappush(heap, (parent.id, parent))
+            heapq.heappush(heap, (cache._w3_spill_keys(pool, [parent])[id(parent)], parent.id, parent))
     _N["calls"] += 1
     k = _N["calls"]
     if k <= 8 or k % 64 == 0 or unsecured:

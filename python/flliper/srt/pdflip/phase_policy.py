@@ -178,6 +178,38 @@ def lane_park_body(epoch: int, rids: Sequence[str], floor: int, lane_epoch: int)
     return body
 
 
+def park_answered_at(status: int, text: str) -> Optional[float]:
+    """FLIPSTALL-1015: D's flip park answer's ``answered_at`` (wall clock of
+    the moment D's park answered and started its re-queue clock); None when
+    absent, non-positive or unreadable (old D, failed park)."""
+    if status != 200:
+        return None
+    try:
+        js = json.loads(text)
+    except Exception:  # noqa: BLE001
+        return None
+    v = js.get("answered_at") if isinstance(js, dict) else None
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not v > 0:
+        return None
+    return float(v)
+
+
+def park_lapse_stamp(t_park: float, answered_at: Optional[float], t_recv: float) -> float:
+    """FLIPSTALL-1015: where the front's lapse clock (:func:`parked_lapsed`)
+    starts for the rids D parked. H91c3-1 stamps BEFORE the RPC so the front
+    lapses no later than D re-queues -- right while D's clock started in the
+    RPC. D's clock now starts when its park ANSWERS (``answered_at``; a park
+    took 31 s on NF h16n 06:56:31-06:57:02Z, and a pre-RPC stamp would lapse
+    the front 54 s early: it would count as running what D still holds). The
+    answer's moment, clamped into ``[t_park, t_recv]`` (same host clock; the
+    clamp only absorbs a skewed stamp), is no later than D's re-queue, which
+    fires once every D rank's stamp is ``PARK_REQUEUE_S`` old. Without the
+    field: ``t_park``, the H91c3-1 stamp."""
+    if answered_at is None:
+        return float(t_park)
+    return float(min(max(float(answered_at), float(t_park)), float(t_recv)))
+
+
 def parked_lapsed(t_parked: float, now: float) -> bool:
     """Part B re-queues a parked request no sleep followed after
     :data:`PARK_REQUEUE_S`; from then on it is running on D again. A lane park

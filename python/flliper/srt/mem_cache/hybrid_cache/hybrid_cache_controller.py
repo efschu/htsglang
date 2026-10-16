@@ -122,6 +122,7 @@ from flliper.srt.mem_cache.hicache_storage import (
 )
 from flliper.srt.mem_cache.memory_pool_host import PoolEntry
 from flliper.srt.pdflip import p_fork_cut
+from flliper.srt.pdflip import claim_line as _claim_line
 from flliper.srt.utils import get_device_module
 from flliper.srt.environ import envs
 
@@ -1174,6 +1175,11 @@ class HybridCacheController(BaseHiCacheController):
                 kv_uncapped=kv_hit_count,
             )
 
+        # ZERO-ANCHOR 1015: the claim's shortfall, per rid and never rate
+        # limited (#1028B carries no rid and stops after 40) -- an instrument
+        _claim_line.claim_short(
+            operation, hit_result, self.page_size, getattr(self, "pp_rank", "?")
+        )
         kv_hit_pages = hit_result.kv_hit_pages
         operation.pool_storage_result.update_kv_hit_pages(kv_hit_pages)
         # DP-NACHLAUF: PP0's told clamp reuses this anchor-clamped answer when

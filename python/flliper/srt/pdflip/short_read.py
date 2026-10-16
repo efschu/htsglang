@@ -34,9 +34,56 @@ _N = [0]
 PROGRESS_ATTR = "_pdflip_short_read_have"
 
 
+#: P-HELD-REREAD-1014: rids whose read ended short of what the store holds
+#: (hit > completed), the span need not be whole -- PP0 re-reads before its told
+_MORE: Dict[str, bool] = {}
+
+
+def store_holds_more(rid: str) -> bool:
+    return bool(_MORE.get(str(rid), False))
+
+
+#: ZERO-ANCHOR 1015 (Typ A, boot 133855 epoch 127, pdflip-126-651): the front's
+#: ``start_hint`` (PLE-HINT) is the depth D was MEASURED to hold for this prompt
+#: (``d_leg2_cached`` / ``d_seq_anchor``). D runs write_back: its un-backed tail
+#: (pdflip-126-628, cache_len 45824, store 38656) reaches the store only in the
+#: flip's flush (``PUBLISH-SWEEP unbacked=50 issued=37`` at 15:17:09.1) --
+#: the same second P's dormant read of 651 completed at the store's 38656. A
+#: read that ended below the hint is re-read once the flush is done (PP0 awake).
+_HINT: Dict[str, int] = {}
+
+
+def note_hint(rid, tokens) -> None:
+    """The front's start_hint for ``rid`` (tokens; < 0 = none)."""
+    try:
+        t = int(tokens)
+    except (TypeError, ValueError):
+        return
+    if rid is None or t <= 0:
+        return
+    _HINT[str(rid)] = t
+    while len(_HINT) > 4 * KEEP:
+        _HINT.pop(next(iter(_HINT)))
+
+
+def hint_tokens(rid) -> int:
+    return int(_HINT.get(str(rid), 0) or 0)
+
+
+def hint_beyond(rid, have: int, page_size: int) -> bool:
+    """The hint names at least one full page past ``have``."""
+    return hint_tokens(rid) - int(have) >= max(1, int(page_size))
+
+
 def note_reap(rid: str, requested_pages: int, hit_pages: int, completed_tokens: int, page_size: int) -> None:
     """At the reap: remember whether a short read's span was held by the store."""
     rid = str(rid)
+    if int(hit_pages) * max(1, int(page_size)) > int(completed_tokens):
+        _MORE[rid] = True
+        while len(_MORE) > KEEP:
+            _MORE.pop(next(iter(_MORE)))
+    else:
+        _MORE.pop(rid, None)
     short = int(completed_tokens) < int(requested_pages) * max(1, int(page_size))
     held = short and int(requested_pages) > 0 and int(hit_pages) >= int(requested_pages)
     if held:
@@ -70,3 +117,5 @@ def note_reissue(req, have: int) -> None:
 
 def forget(rid: str) -> None:
     _HELD.pop(str(rid), None)
+    _MORE.pop(str(rid), None)
+    _HINT.pop(str(rid), None)

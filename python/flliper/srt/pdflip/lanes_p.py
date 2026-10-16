@@ -313,8 +313,11 @@ def state_of(sched: Any, create: bool = False) -> Optional[LaneP]:
 
 
 def active() -> bool:
-    """The P-side lane rule runs: the switch is on AND this is group P with the park on (the lane park IS the park)."""
-    if not lanes.enabled():
+    """The P-side lane rule runs: the switch is on AND this is group P with the park on (the lane park IS the park).
+    PRIO-AS-AGE 1014 (``prio_age.floor_mode``): with priority acting as age the P side takes no floor at all."""
+    from flliper.srt.pdflip import prio_age as _pa
+
+    if not _pa.floor_mode():
         return False
     from flliper.srt.pdflip import park
 
@@ -323,8 +326,11 @@ def active() -> bool:
 
 def on_rpc(sched: Any, recv_req: Any) -> None:
     """``POST /pdflip/lane_floor`` reached this scheduler (``PdFlipLaneFloorReqInput``): PP0 records it for its next pass; a
-    non-PP boot applies it; PP1/PP2 ignore it (they get the value stamped).  Group D is part L2's."""
-    if not lanes.enabled():
+    non-PP boot applies it; PP1/PP2 ignore it (they get the value stamped).  Group D is part L2's.
+    PRIO-AS-AGE 1014: ignored while priority acts as age (the front sends none then)."""
+    from flliper.srt.pdflip import prio_age as _pa
+
+    if not _pa.floor_mode():
         return
     from flliper.srt.pdflip import park
 

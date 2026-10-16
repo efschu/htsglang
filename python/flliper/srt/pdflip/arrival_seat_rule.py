@@ -211,9 +211,30 @@ def kv_free(kv_reading: Optional[Mapping]) -> Optional[int]:
     return max(free, lad[0]) if lad is not None else free
 
 
+def _younger(head_arrival: float, running: Iterable[str], arrival_of: Mapping[str, float],
+             lane_of: Optional[Mapping[str, int]], head_lane: int) -> List[Tuple[tuple, str]]:
+    """PRIO-AS-AGE 1014 (pdflip/prio_age.py): the running rids YOUNGER than the head by the order key
+    ``(-priority, arrival)`` -- a lower priority is younger than every higher one, inside a priority the
+    arrival decides -- each with its key.  ``lane_of`` None = every rid priority 0 (the arrival order)."""
+    from flliper.srt.pdflip import prio_age as _pa
+
+    on = _pa.enabled() if lane_of is not None else False
+    lanes_ = lane_of or {}
+    k_head = _pa.key(int(head_lane or 0) if on else 0, float(head_arrival), on=on)
+    out = []
+    for r in running:
+        if r not in arrival_of:
+            continue
+        k = _pa.key(int(lanes_.get(r, 0) or 0) if on else 0, float(arrival_of[r]), on=on)
+        if k > k_head:
+            out.append((k, r))
+    return out
+
+
 def kv_displace_victim(head_arrival: Optional[float], running: Iterable[str],
                        arrival_of: Mapping[str, float], tokens_of: Mapping[str, int],
-                       deficit: int) -> Optional[str]:
+                       deficit: int, lane_of: Optional[Mapping[str, int]] = None,
+                       head_lane: int = 0) -> Optional[str]:
     """NF-STAU-KV (user rule #246, 27.09.: "strikte Ankunftsreihenfolge +
     KV-Backfill, Ältester rückt nach und verdrängt Jüngere"): the head's KV
     does not fit a free seat -> the running decode that ARRIVED last, and
@@ -225,11 +246,11 @@ def kv_displace_victim(head_arrival: Optional[float], running: Iterable[str],
     applies). Only when the younger ones' KV can cover the deficit at all --
     ``tokens_of`` is the front's LOWER bound (the prompt it priced), so a
     park that cannot make the head fit is never taken (no churn). A rid with
-    no arrival stamp counts as old."""
+    no arrival stamp counts as old.  PRIO-AS-AGE 1014: younger/youngest by the order key (``lane_of`` /
+    ``head_lane``) -- the victim is the youngest of the lowest priority, never a higher one than the head."""
     if head_arrival is None or int(deficit) <= 0:
         return None
-    younger = [(float(arrival_of[r]), r) for r in running
-               if r in arrival_of and float(arrival_of[r]) > float(head_arrival)]
+    younger = _younger(head_arrival, running, arrival_of, lane_of, head_lane)
     if not younger:
         return None
     if sum(max(0, int(tokens_of.get(r, 0) or 0)) for _, r in younger) < int(deficit):
@@ -249,7 +270,8 @@ def age_plan_enabled(env=None) -> bool:
 
 def displace_plan(head_arrival: Optional[float], seat_is_free: bool, deficit: int,
                   running: Iterable[str], arrival_of: Mapping[str, float],
-                  tokens_of: Mapping[str, int]) -> Optional[List[str]]:
+                  tokens_of: Mapping[str, int], lane_of: Optional[Mapping[str, int]] = None,
+                  head_lane: int = 0) -> Optional[List[str]]:
     """AGE PLAN (Nutzer 30.09. ~14:40Z: "der ältere ist immer bevorzugt ...
     sobald keine ältesten mehr da sind die den kv für den mittleren
     blockieren, wird der mittlere auf die karten gezogen und verdrängt ggf.
@@ -266,16 +288,15 @@ def displace_plan(head_arrival: Optional[float], seat_is_free: bool, deficit: in
     prompt it priced). The front only ADMITS by it (a non-empty plan hands the
     head to D); the displacement itself is D's alone
     (``d_park_runtime.displace_for_age`` / ``victims_needed`` on D's real KV).
-    A rid without an arrival stamp counts as old."""
+    A rid without an arrival stamp counts as old.  PRIO-AS-AGE 1014: "arrived after the head" and "youngest
+    first" are the order key (``lane_of`` / ``head_lane``)."""
     if head_arrival is None:
         return None
     need_seat = 0 if seat_is_free else 1
     deficit = max(0, int(deficit or 0))
     if need_seat == 0 and deficit == 0:
         return []
-    younger = sorted(((float(arrival_of[r]), r) for r in running
-                      if r in arrival_of and float(arrival_of[r]) > float(head_arrival)),
-                     reverse=True)
+    younger = sorted(_younger(head_arrival, running, arrival_of, lane_of, head_lane), reverse=True)
     out: List[str] = []
     freed = 0
     for _t, r in younger:
@@ -416,17 +437,30 @@ def oldest_wait_s(t_arrivals: Iterable[float], t_awake: float, now: float) -> Op
     return best
 
 
-def youngest_running(admit_t: Mapping[str, float], running: Iterable[str]) -> Optional[str]:
+def youngest_running(admit_t: Mapping[str, float], running: Iterable[str],
+                     lane_of: Optional[Mapping[str, int]] = None,
+                     than: Optional[tuple] = None) -> Optional[str]:
     """(c): the running decode admitted LAST to a D seat (#244's order). A rid
     with no admission stamp (resumed before this boot's stamps) counts as the
-    oldest -- it is never chosen over a stamped one."""
-    best, best_t = None, None
+    oldest -- it is never chosen over a stamped one.
+
+    PRIO-AS-AGE 1014: with ``lane_of`` the youngest is by the order key -- the last admitted of the LOWEST
+    priority; ``than`` (the oldest waiter's key) excludes every runner not younger than it, so a priority-0
+    waiter never parks a priority-1 decode."""
+    from flliper.srt.pdflip import prio_age as _pa
+
+    on = _pa.enabled() if lane_of is not None else False
+    lanes_ = lane_of or {}
+    best, best_k = None, None
     for rid in running:
         t = admit_t.get(rid)
         if t is None:
             continue
-        if best_t is None or t > best_t:
-            best, best_t = rid, t
+        k = _pa.key(int(lanes_.get(rid, 0) or 0) if on else 0, t, on=on)
+        if on and than is not None and k[0] < than[0]:
+            continue  # a higher priority than the waiter's: older by the key, never its victim
+        if best_k is None or k > best_k:
+            best, best_k = rid, k
     return best
 
 

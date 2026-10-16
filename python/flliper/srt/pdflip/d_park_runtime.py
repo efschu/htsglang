@@ -40,6 +40,7 @@ from flliper.srt.pdflip import d_lane, d_park_draft, d_park_read, d_seats, park_
 from flliper.srt.pdflip import handback_claim as _hb
 from flliper.srt.pdflip import poolleak_instr as _poolleak
 from flliper.srt.pdflip import mamba_arena_displace as _mad_park
+from flliper.srt.pdflip import prio_age as _pa  # PRIO-AS-AGE 1014: the order key and the floor-mode gate
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +106,41 @@ def rearm_window_draft_cold(sched, reqs) -> int:
             setattr(req, COLD_ARMED_ATTR, False)
             n += 1
     return n
+
+
+def park_answer_stamp(sched, flip_list, *, late_hold: bool) -> float:
+    """FLIPSTALL-1015 (NF h16n 17c2563647, D epoch 90, 06:56:31-06:57:02Z):
+    the awake re-queue clock of a flip park (``d_seats.SINCE_ATTR``, read by
+    ``park_tick`` against ``FLLIPER_PDFLIP_D_PARK_AWAKE_REQUEUE_S`` = 30 s) and
+    the late hold's clock start when the park ANSWERS -- the front can begin
+    the sleep only after it has the answer. Before, both were stamped right
+    after the retraction, ahead of the park's own phases (HY settle, #248
+    PARK-MARK, #59b depths). Under a host swap storm those phases took 31 s
+    (``PDFLIP-FLIPCYCLE stage=park ms=31311 sub=...yield:21732,l3mark:9334``),
+    the stamp was 31 s old when ``park_running`` returned, and the very next
+    pass re-queued the whole park (``PDFLIP-D-PARK requeue (awake)`` 06:57:02,
+    same second as the answer): D admitted pdflip-88-1054 and blocked its
+    scheduler thread 72 s in that request's load-back (``PDFLIP-POST-WAKE-PASS
+    schedule_ms=72024 init_new_ms=66794``) while the front, told the requests
+    were parked, began the D->P flip -- its drain witness got no
+    /get_server_info answer for 12 s: ``PDFLIP STOP W3
+    PdFlipDrainWitnessUnreachable``. The park undid itself; the bound measured
+    the park's own duration, not the front's.
+
+    Replicated: every rank stamps its own monotonic clock at the end of the
+    same park; ``park_tick`` MIN-reduces the verdict over the group as before
+    (weg2xsn296), so no rank decides alone.
+
+    Returns the same moment on the wall clock (``time.time()``; the front runs
+    on the same host): the answer carries it (``answered_at``) and the front
+    starts its own lapse clock for the parked rids there
+    (``phase_policy.park_lapse_stamp``) -- D and front lapse together again."""
+    answered = time.monotonic()
+    answered_wall = time.time()
+    for req in flip_list:
+        setattr(req, d_seats.SINCE_ATTR, answered)
+    setattr(sched, LATE_HOLD_ATTR, answered if late_hold else None)
+    return float(answered_wall)
 
 
 def park_running(sched, recv_req, *, late_hold_armed: bool = False):
@@ -288,13 +324,12 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
     # monotonic, like every stamp here; park_tick MIN-reduces the verdict.
     # PRIORITY LANES 1008 (L2): a lane hold keeps its own stamp and is no part of this flip park's answer
     _flip_list = [r for r in sched.pdflip_d_parked if not d_lane.lane_held(r)]
-    for req in _flip_list:
-        setattr(req, d_seats.SINCE_ATTR, now)
     sched._pdflip_d_park_slept = False
     # PARK-SETTLE: the settle is in the park list now (above), so nothing
     # releases into the queue behind the park's back -- the late hold holds.
+    # FLIPSTALL-1015: the clock of both (SINCE, LATE_HOLD) is stamped where
+    # the park ANSWERS (park_answer_stamp, below), not here.
     late_hold = bool(late_hold_armed)
-    setattr(sched, LATE_HOLD_ATTR, now if late_hold else None)
     setattr(sched, FLIP_PARK_OPEN_ATTR, epoch)  # CAPPARK-FLIP-HOLD: until the sleep / awake re-queue
     rids = [str(r.rid) for r in _flip_list if d_seats.park_site(r) is not None]
     held = [str(r.rid) for r in _flip_list if d_seats.park_site(r) is None]
@@ -322,6 +357,7 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
     _ph("clamp")
     # POOLLEAK-INSTR (2): the idle equation after the park, a line, never a raise
     _poolleak.ledger_line(sched, epoch=epoch, before=_pl_before)
+    answered_at = park_answer_stamp(sched, _flip_list, late_hold=late_hold)
     logger.info("PDFLIP-FLIPCYCLE stage=park epoch=%d n=%d ms=%.0f floor_ms=%d sub=%s (H3: the park's "
                 "phases on the scheduler thread; floor = the END-state D2H)", epoch, len(retracted),
                 (time.perf_counter() - _t_park0) * 1000.0, 30 * max(1, len(retracted)) // 3 or 10,
@@ -338,7 +374,7 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
     return PdFlipParkRunningReqOutput(
         success=True, parked=rids, held=held, epoch=epoch, late_hold=late_hold,
         message="parked %d, queued behind them %d" % (len(rids), len(held)),
-        pdflip_resumable_depth=resumable,
+        pdflip_resumable_depth=resumable, answered_at=answered_at,
     )
 
 
@@ -450,9 +486,10 @@ def park_rids(sched, recv_req, *, rids, hold: str = ""):
         return _out(False, [], f"W-PARK refused: unknown hold {hold!r} (only 'lane') -- nothing parked")
     if hold and not rids:
         return _out(False, [], "W-PARK refused: hold=lane needs rids -- nothing parked")
-    if not lanes.enabled():
-        return _out(False, [], "W-PARK refused: rids/hold need FLLIPER_PDFLIP_LANES=1 on this server -- "
-                               "nothing parked")
+    if not _pa.floor_mode():
+        # PRIO-AS-AGE 1014: priority acts as age -- no lane park exists (the floor never rises)
+        return _out(False, [], "W-PARK refused: rids/hold need FLLIPER_PDFLIP_LANES=1 and FLLIPER_PDFLIP_PRIO_AS_AGE=0 "
+                               "on this server (priority acts as age: no lane park) -- nothing parked")
     if not d_seats.d_flip_park_active():
         return _out(False, [], "W-PARK refused: not group D (or FLLIPER_PDFLIP_D_PARK=0, or neither the "
                                "standard form nor FLLIPER_PDFLIP_D_PARK_IMMEDIATE) -- nothing parked")
@@ -652,8 +689,10 @@ def lane_floor(sched, recv_req):
             requeued=list(requeued), held=n_held, message=msg,
         )
 
-    if not lanes.enabled():
-        return _out(False, "W-LANE refused: /pdflip/lane_floor needs FLLIPER_PDFLIP_LANES=1 on this server")
+    if not _pa.floor_mode():
+        # PRIO-AS-AGE 1014: priority acts as age -- the lane floor is never applied
+        return _out(False, "W-LANE refused: /pdflip/lane_floor needs FLLIPER_PDFLIP_LANES=1 and FLLIPER_PDFLIP_PRIO_AS_AGE=0 "
+                           "on this server (priority acts as age: no floor)")
     if str(os.environ.get(d_seats.GROUP_ENV, "")).strip().upper() != "D":
         return _out(True, "not group D: the floor is not applied here (D's admission only)")
     cur_f, cur_e = d_lane.floor_of(sched), d_lane.epoch_of(sched)
@@ -732,8 +771,8 @@ def hold_queued(sched, rids=None) -> list:
     its lane (the re-intake prefetches it from the store like any retracted park)."""
     from flliper.srt.pdflip import lanes
 
-    if not lanes.enabled() or not d_seats.d_flip_park_active() or getattr(sched, "pdflip_dormant", False):
-        return []
+    if not _pa.floor_mode() or not d_seats.d_flip_park_active() or getattr(sched, "pdflip_dormant", False):
+        return []  # PRIO-AS-AGE 1014: no lane hold while priority acts as age
     queue = list(getattr(sched, "waiting_queue", None) or [])
     if not queue:
         return []
@@ -1138,10 +1177,13 @@ def _apply_park_defer(sched) -> int:
             # SA: each deferred request goes before the first waiting request
             # YOUNGER than it (the rest keeps the group's order) -- it moves in
             # as soon as the older ones leave, never behind younger arrivals.
-            for r in _sa.by_age(mine):
-                a = _sa.rid_age(r.rid)
+            # PRIO-AS-AGE 1014: "younger" / "oldest first" by the order key (priority desc, age asc)
+            def _ok(q):
+                return _sa.order_key(getattr(q, "rid", ""), _pa.lane_of_req(q))
+            for r in sorted(mine, key=_ok):
+                a = _ok(r)
                 k = next((i for i, q in enumerate(rest) if d_seats.park_site(q) is None
-                          and _sa.rid_age(getattr(q, "rid", "")) > a), len(rest))
+                          and _ok(q) > a), len(rest))
                 rest.insert(k, r)
             sched.waiting_queue = rest
         else:
@@ -1233,9 +1275,19 @@ def _lift_holds_when_idle(sched) -> None:
 
 
 def _lanes_on() -> bool:
-    from flliper.srt.pdflip import lanes
+    """The lane FLOOR rules of 1008 on D (victim pools by lane, the floor's admission filter, the park refusal
+    above the floor). PRIO-AS-AGE 1014 (default on): off -- priority acts as AGE through the order key instead
+    (``seat_age``/``prio_age``)."""
+    return _pa.floor_mode()
 
-    return bool(lanes.enabled())
+
+def _prio_lane_map(*seqs):
+    """PRIO-AS-AGE 1014: rid -> priority of the given request lists (the request's own replicated field)."""
+    m = {}
+    for seq in seqs:
+        for r in seq or ():
+            m[str(getattr(r, "rid", ""))] = _pa.lane_of_req(r)
+    return m
 
 
 def _lane_of_rid(waiting, rid):
@@ -1260,7 +1312,11 @@ def _displace_candidate(sched, _sa, waiting, reqs, lanes_on):
     and batch, as before. On: the oldest waiter (admissible: the caller filtered the floor) that has a victim
     among the running requests of ITS lane or below."""
     if not lanes_on:
-        return _sa.displace_victim([str(q.rid) for q in waiting], [str(r.rid) for r in reqs], True)
+        # PRIO-AS-AGE 1014: oldest waiter / youngest runner by the order key -- exactly one victim, the
+        # youngest of the lowest priority, and only for a waiter older by that key
+        _lm = _prio_lane_map(waiting, reqs)
+        return _sa.displace_victim([str(q.rid) for q in waiting], [str(r.rid) for r in reqs], True,
+                                   lane_of=lambda rid: _lm.get(str(rid), 0))
     for q in sorted(waiting, key=lambda w: _sa.rid_age(str(w.rid))):
         pool = [str(r.rid) for r in reqs if d_lane.lane_of_req(r) <= d_lane.lane_of_req(q)]
         cand = _sa.displace_victim([str(q.rid)], pool, True)
@@ -1343,7 +1399,9 @@ def displace_for_age(sched, running_batch) -> Optional[str]:
         # group displaces only when EVERY rank refused (RAENGE-NIE-UNEINS).
         cand = _displace_candidate(sched, _sa, waiting, reqs, lanes_on)
         if cand is not None:
-            local = no_token_rid is not None and _sa.rid_age(no_token_rid) <= _sa.rid_age(cand[0])
+            _lm = _prio_lane_map(sched.waiting_queue, reqs)  # PRIO-AS-AGE 1014: compared by the order key
+            local = no_token_rid is not None and not _sa.is_older(
+                cand[0], no_token_rid, lane_of=lambda rid: _lm.get(str(rid), 0))
             if local:
                 # user 30.09. (verbatim): "natürlich muss ein jüngerer nur verdrängt werden,
                 # wenn der ältere nicht draufpasst. nicht pauschal den jüngeren verdrängen" --
@@ -1686,8 +1744,12 @@ def kv_displace_would_fit(sched, older_rid: str, running, seat: bool = False, vi
     older = next((q for q in getattr(sched, "waiting_queue", ()) or () if str(q.rid) == str(older_rid)), None)
     if older is None:
         return False
-    young = sorted((r for r in running if _sa.rid_age(str(r.rid)) > _sa.rid_age(str(older_rid))),
-                   key=lambda r: _sa.rid_age(str(r.rid)), reverse=True)
+    # PRIO-AS-AGE 1014: "younger than the older one" and "youngest first" by the order key
+    _on = _pa.enabled()
+    _k_old = _pa.key(_pa.lane_of_req(older), _sa.rid_age(str(older_rid)), on=_on)
+    young = sorted((r for r in running
+                    if _pa.key(_pa.lane_of_req(r), _sa.rid_age(str(r.rid)), on=_on) > _k_old),
+                   key=lambda r: _pa.key(_pa.lane_of_req(r), _sa.rid_age(str(r.rid)), on=_on), reverse=True)
     basis = "legacy"
     # PW: under the backup wall a victim's retained KV goes back to the tree and
     # is as unpayable as the rest -- only its decode reserve comes free.

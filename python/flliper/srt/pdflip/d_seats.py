@@ -164,6 +164,15 @@ def _arrival(req) -> float:
     return float("inf") if seq is None else float(seq)
 
 
+def _order_key(req, on: Optional[bool] = None):
+    """PRIO-AS-AGE 1014 (pdflip/prio_age.py): THE order of D -- ``(-priority, _arrival)`` with the mode on
+    (a higher priority is older than every lower one; inside a priority the arrival decides), ``(0,
+    _arrival)`` off.  Smaller = older.  Replicated: ``req.priority`` is the request's own field."""
+    from flliper.srt.pdflip import prio_age as _pa
+
+    return _pa.key(_pa.lane_of_req(req), _arrival(req), on=on)
+
+
 def _lane_held(req) -> bool:
     from flliper.srt.pdflip.d_lane import lane_held
 
@@ -188,8 +197,11 @@ def clear_park(req) -> None:
 
 
 def park_running_order(reqs: Iterable) -> List:
-    """The order a flip park keeps and the wake resumes: oldest first."""
-    return sorted(list(reqs), key=_arrival)
+    """The order a flip park keeps and the wake resumes: oldest first (PRIO-AS-AGE 1014: by the order key)."""
+    from flliper.srt.pdflip import prio_age as _pa
+
+    on = _pa.enabled()
+    return sorted(list(reqs), key=lambda r: _order_key(r, on=on))
 
 
 def retraction_order(reqs: Sequence, *, spec_active: bool) -> Optional[List[int]]:
@@ -219,9 +231,16 @@ def retraction_order(reqs: Sequence, *, spec_active: bool) -> Optional[List[int]
         # victim by SA, a 'preferred' one still parks first. No second age.
         from flliper.srt.managers.kv_session_offload import spill_class_rank
 
+        from flliper.srt.pdflip import prio_age as _pa
+
+        _on = _pa.enabled()
+
         def _sa_key(r):
+            # PRIO-AS-AGE 1014: the age term is the order key, negated (a higher priority is more
+            # protected, inside a priority the older one) -- no second age
+            k = _order_key(r, on=_on)
             return (spill_class_rank(r), 1 if getattr(r, "is_fast_lane", False) else 0,
-                    -_arrival(r))
+                    -k[0], -k[1])
 
         by_protection = sorted(range(n), key=lambda i: _sa_key(reqs[i]), reverse=True)
     else:
@@ -247,7 +266,12 @@ def order_waiting(waiting: Sequence) -> List:
     # waits for its floor, not for a seat, so it must not move ahead of the requests that can run
     parked = [r for r in waiting if park_site(r) is not None and not _lane_held(r)]
     rest = [r for r in waiting if park_site(r) is None or _lane_held(r)]
-    return park_running_order(parked) + rest
+    # PRIO-AS-AGE 1014: a higher priority is OLDER than every lower one, a parked one included -- a stable
+    # sort by priority only, so inside a priority the order above (parked first, then the group's order)
+    # stands exactly; ``priority`` is the request's own field, every rank sorts alike
+    from flliper.srt.pdflip import prio_age as _pa
+
+    return _pa.lane_sorted(park_running_order(parked) + rest)
 
 
 def head_of_queue(waiting: Sequence, reqs: Sequence) -> List:
@@ -270,6 +294,8 @@ class AdmissionGate:
     barrier: bool = False
     #: SA: the front-arrival age of the oldest parked request still waiting
     oldest_parked_age: Optional[float] = None
+    #: PRIO-AS-AGE 1014: that request's ORDER KEY ``(-priority, age)`` -- the barrier compares by it
+    oldest_parked_key: Optional[tuple] = None
     blocked: FrozenSet[str] = frozenset()
     note: str = ""
     #: AP (28.09.): the parked rids IN the queue that may resume this pass --
@@ -324,7 +350,10 @@ class AdmissionGate:
         from flliper.srt.pdflip import seat_age as _sa
 
         if _sa.enabled() and self.oldest_parked_age is not None:
-            if _arrival(req) < self.oldest_parked_age:
+            # PRIO-AS-AGE 1014: "older" by the order key (a higher priority passes a lower parked one)
+            ref = (self.oldest_parked_key if self.oldest_parked_key is not None
+                   else (0, self.oldest_parked_age))
+            if _order_key(req) < ref:
                 return None
         if self._backfill(admitted):
             return None
@@ -550,8 +579,8 @@ def admission_gate(
                 continue
             # the older one was admitted or is gone: the hold ends for good
             setattr(r, DISPLACED_FOR_ATTR, None)
-        mine = _arrival(r)
-        older_live = any(x is not r and _arrival(x) < mine for x in live)
+        mine = _order_key(r)  # PRIO-AS-AGE 1014: "older" by the order key
+        older_live = any(x is not r and _order_key(x) < mine for x in live)
         if not older_live:
             continue
         if resume_book is not None and avail_tokens is not None:
@@ -574,13 +603,16 @@ def admission_gate(
         + (f" held_for_older={held_for_older}" if held_for_older else "") + ")"
     )
     _waiting_parked = [r for r in parked_waiting if str(r.rid) not in blocked] or parked_waiting
-    oldest = min((_arrival(r) for r in _waiting_parked + parked_outside), default=None)
+    _oldest_req = min(_waiting_parked + parked_outside, key=_order_key, default=None)
+    oldest = None if _oldest_req is None else _arrival(_oldest_req)
+    oldest_key = None if _oldest_req is None else _order_key(_oldest_req)
     # SB (#1210): every request outside the queue (settle, dormant hold) keeps a seat
     room = (None if seats is None else
             int(seats) - len(running) - len(parked_waiting) - len(list(pending_outside)))
     return AdmissionGate(barrier=True, blocked=frozenset(blocked), note=note,
                          seat_room=room,
                          oldest_parked_age=oldest,
+                         oldest_parked_key=oldest_key,
                          parked_in_queue=frozenset(str(r.rid) for r in parked_waiting),
                          parked_outside=len(parked_outside),
                          deferred=deferred,

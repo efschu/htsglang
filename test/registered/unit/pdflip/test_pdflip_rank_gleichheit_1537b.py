@@ -551,7 +551,8 @@ def test_c2_control_without_the_group_ends_the_ranks_split_on_the_precondition(m
 def test_c3_the_replicated_half_reads_exactly_these_request_terms():
     """``capacity_park_precondition`` is the entry condition of the group vote: it must read only
     replicated terms. Its read set is pinned (switch, env group, stream, multimodal_inputs,
-    ``_pdflip_store_short_fallback``); a new rank-local read here turns this red."""
+    ``_pdflip_store_short_fallback``, and since lanes hotfix 2 bc35462240 the request's own ``priority``
+    lane field, which every rank receives with the request body); a new rank-local read here turns this red."""
     import ast
     import inspect
     import textwrap
@@ -562,10 +563,10 @@ def test_c3_the_replicated_half_reads_exactly_these_request_terms():
     reads = sorted(n.args[1].value for n in ast.walk(tree)
                    if isinstance(n, ast.Call) and getattr(n.func, "id", "") == "getattr"
                    and len(n.args) > 1 and isinstance(n.args[1], ast.Constant))
-    assert reads == ["_pdflip_store_short_fallback", "multimodal_inputs", "stream"], reads
+    assert reads == ["_pdflip_store_short_fallback", "multimodal_inputs", "priority", "stream"], reads
     calls = sorted(n.func.id for n in ast.walk(tree)
                    if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id != "getattr")
-    assert calls == ["bool", "bool", "capacity_park_on"], calls
+    assert calls == ["bool", "bool", "capacity_park_on", "int"], calls
 
 
 def test_c4_the_group_end_is_read_before_the_witness_term_is_written():

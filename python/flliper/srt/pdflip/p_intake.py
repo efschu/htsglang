@@ -137,6 +137,106 @@ def told_admission(
     return credit
 
 
+#: NF-FOLLOWER-ROUND 1014 C2 switch (default ON); ``0`` = the told gate holds a
+#: row-named rid on the follower as before (e7cfda7fbe).
+TOLD_ROW_YIELD_ENV = "FLLIPER_PDFLIP_TOLD_ROW_YIELD"
+ROW_NAMED = "named"
+ROW_NOT_NAMED = "not_named"
+
+
+def told_row_yield_enabled() -> bool:
+    import os
+
+    return (os.environ.get(TOLD_ROW_YIELD_ENV, "1") or "1").strip().lower() not in (
+        "0", "false", "no", "off")
+
+
+def told_row_verdict(scheduler, req) -> Optional[str]:
+    """C2 (NF-FOLLOWER-ROUND 1014, inventory B4): does the told gate of THIS
+    follower stand under PP0's executed row?
+
+    ``None``: no row in hand (PP0, a non-PP rank, a follower without the row
+    authority, the switch off) -- the gate decides as before. Otherwise the row
+    IS the membership verdict, exactly as for the LB-VERDICT gate since
+    31aa655fff (``pp_loadback_verdict.gated`` yields to ``ROW_ATTR``):
+
+    * ``ROW_NAMED`` -- the row names the rid: the gate yields, the rid goes to
+      the row's admission arm with PP0's told; a read this rank still lacks is
+      materialised by ``execute_scheduled_prefix`` on its bounded clock, which
+      stops the group BY NAME when it cannot (#968 station) -- never a skip
+      that leaves the follower's batch one rid short of PP0's (PPScheduleRefused
+      / #1004, the rank-local veto over a row that raenge-nie-uneins forbids).
+    * ``ROW_NOT_NAMED`` -- the row does not name it: the row's own arm skips it
+      (``pp_not_named``); a held rid is NO barrier here (W27-HELD-STOP guards a
+      follower that plans its own membership, which a row-executing one does
+      not) -- breaking on it would cut the row's rids behind it."""
+    if not told_row_yield_enabled():
+        return None
+    ps = getattr(scheduler, "ps", None)
+    if ps is None or int(getattr(ps, "pp_size", 1) or 1) <= 1:
+        return None
+    if int(getattr(ps, "pp_rank", 0) or 0) == 0:
+        return None
+    incoming = getattr(scheduler, "_pp_admission_incoming_effective", None)
+    if incoming is None:
+        return None
+    rid = getattr(req, "rid", None)
+    return ROW_NAMED if rid in incoming else ROW_NOT_NAMED
+
+
+def note_told_row_yield(scheduler, req, verdict: str) -> None:
+    """The C2 instrument: one bounded line per yield (``TOLD-ROW-YIELD``)."""
+    n = getattr(scheduler, "_pdflip_told_row_yield_n", 0) + 1
+    scheduler._pdflip_told_row_yield_n = n
+    if n <= _LOG_FIRST or n % _LOG_EVERY == 0:
+        rid = str(getattr(req, "rid", ""))
+        told_map = getattr(scheduler, "_pdflip_store_told", None) or {}
+        logger.info(
+            "TOLD-ROW-YIELD rank pp=%s rid=%s row=%s told_here=%s kept=%s (n=%d): the "
+            "told gate held this rid on this follower; PP0's executed row is the "
+            "verdict (C2, like LBV_ROW_YIELD) -- the row decides, the station "
+            "materialises or stops by name",
+            getattr(getattr(scheduler, "ps", None), "pp_rank", "?"), rid, verdict,
+            told_map.get(rid), rid in (getattr(scheduler, KEPT_ATTR, None) or {}), n,
+        )
+
+
+GATE_ADMIT = "admit"
+GATE_SKIP = "skip"
+GATE_BREAK = "break"
+
+
+def told_pending_gate(
+    scheduler,
+    req,
+    note_skip: Callable[[str, Any], None],
+    held_barrier: Callable[[Any, Any], bool],
+) -> str:
+    """The #1400 told gate's answer when :func:`told_admission` returned None
+    (no verdict this visit): ``GATE_ADMIT``, ``GATE_SKIP`` or ``GATE_BREAK``.
+
+    ``held_barrier`` is ``pdflip_store_told.held_barrier`` (passed in: this module
+    stays light). Without a row in hand (:func:`told_row_verdict` None) this is
+    the gate of e7cfda7fbe exactly: the W27 barrier ends the loop, else the rid
+    is skipped. With PP0's executed row in hand (C2) a rid the row NAMES is
+    admitted -- the row's told and the materialisation station govern it, the
+    credit stays None as for any uncredited rid -- and one it does not name is
+    skipped and is no barrier."""
+    row = told_row_verdict(scheduler, req)
+    if row == ROW_NAMED:
+        note_told_row_yield(scheduler, req, row)
+        return GATE_ADMIT
+    if row == ROW_NOT_NAMED:
+        return GATE_SKIP
+    if held_barrier(scheduler, req):
+        # W27-HELD-STOP (NF h16g 17:49:53Z): a told rid held for a tree short
+        # of PP0's told is a BARRIER -- overtaking it planned [pdflip-0-9,
+        # pdflip-1-11] against PP0's three.
+        note_skip("w27_held_barrier", getattr(req, "rid", None))
+        return GATE_BREAK
+    return GATE_SKIP
+
+
 def _is_follower_twin(scheduler, rid: str) -> bool:
     try:
         from flliper.srt.managers import pdflip_store_told as _st
@@ -159,6 +259,17 @@ def _drop_reach_state(scheduler, rid: str) -> None:
     named = getattr(scheduler, "_w27u_spent_named", None)
     if named:
         named.discard(rid)
+
+
+def _st_stop_types() -> tuple:
+    """The named stops ``_reach_kept`` must let through (its catch-all keeps a
+    failing PROBE from breaking the admission, never a stop)."""
+    try:
+        from flliper.srt.managers.pdflip_store_told import PdFlipStoreToldMismatch
+
+        return (PdFlipStoreToldMismatch,)
+    except Exception:  # noqa: BLE001 - a double without the module
+        return ()
 
 
 def _reach_kept(scheduler, req, entry: "_Kept") -> bool:
@@ -185,6 +296,8 @@ def _reach_kept(scheduler, req, entry: "_Kept") -> bool:
             if fresh > 0:
                 entry.credit = fresh
         return bool(_st.follower_hold_unreached(scheduler, req, "kept"))
+    except _st_stop_types():
+        raise  # W27-HELD-STOP: the named group stop is no probe failure
     except Exception:  # noqa: BLE001 - a probe never breaks the admission
         logger.warning("W27-UNIFORM kept-verdict reach check skipped for rid=%s",
                        str(getattr(req, "rid", "")), exc_info=True)
@@ -245,6 +358,17 @@ def settle_told(scheduler, waiting_queue: Iterable[Any]) -> int:
     return len(gone)
 
 
+#: K9b: an open store backup of the tree is in flight for the intake verdict (default ON, ``0`` = off).
+ENV_INTAKE_BACKUP_INFLIGHT = "FLLIPER_PDFLIP_INTAKE_BACKUP_INFLIGHT"
+
+
+def intake_backup_inflight_enabled(env=None) -> bool:
+    import os as _os
+
+    e = _os.environ if env is None else env
+    return (e.get(ENV_INTAKE_BACKUP_INFLIGHT, "") or "").strip().lower() not in ("0", "false", "no", "off")
+
+
 def pool_terms(tree, alloc):
     """(free, evictable, inflight) as the adder funds an extend, or None when
     the terms cannot be read (a desk double): the caller then keeps the
@@ -272,6 +396,14 @@ def pool_terms(tree, alloc):
     inflight = bool(getattr(tree, "ongoing_write_through", None)) or bool(
         getattr(tree, "ongoing_load_back", None)
     )
+    if not inflight and intake_backup_inflight_enabled():
+        # K9b INTAKE-BACKUP-INFLIGHT (NF h16r 15.10. 11:47:19Z, 7 double flips in 45 min): the stall's premise is
+        # "nothing runs, nothing frees". At the refusal P's own store backups of the hand-off it had JUST finished
+        # were still open (``hicache_backup(3)`` on PP0, PDFLIP-INTAKE-STALL-CENSUS tracked_evictable=157632 rows of
+        # pdflip-74-212 against pool_avail=104512): their acks are what makes those rows payable again. While a
+        # backup of this tree is open the refusal is a WAIT, not the stall -- bounded by the backups themselves;
+        # once they are done the ordinary verdict (and its 1 s hold) decides. ``0`` = the old term.
+        inflight = bool(getattr(tree, "ongoing_backup", None))
     # PR (pdflip/pp_room_vote.py; mem_cache.common.PP_ROOM_CAP_ATTR, read by its
     # literal name -- this module stays light): the room every PP stage can
     # pay. A P that runs empty with a head no stage can hold is then the stall.
@@ -281,6 +413,118 @@ def pool_terms(tree, alloc):
         free = min(free, total)
         evictable = total - free
     return free, evictable, inflight
+
+
+def stall_cause(scheduler, need_tokens: int, pool_tokens: int) -> str:
+    """NF design defect 1 (15.10.2026): the NAMED reason of a stall that survived the in-flight premise (nothing runs on this
+    stage, the hold is over). The design says a request that fits the pool always fits -- finished rows are evictable -- so
+    the stall at idle is a deviation, and which term stands for it decides the fix:
+
+    * ``estimator``: free + reported evictable cover the request and nothing is locked; the payability estimators (ED
+      deliverable, PR room cap, the measured unpayable wall) are what refuse it. THE deviation: rows that exist are not counted.
+    * ``locked``: only the locked (protected) rows would cover it, with nothing in flight: a lock holder that is not running.
+    * ``pool``: free + evictable + protected cannot cover it at all.
+    * ``unread``: the terms could not be read (a stand-in); never raises.
+
+    Format ``cause=<c> free=<n> evict=<n> prot=<n> deliv=<n|-> cap=<n|-> bk=<open backups> flight=0``: compact, because the
+    front keeps the first 300 characters of the refusal in its own log."""
+    tree = getattr(scheduler, "tree_cache", None)
+    alloc = getattr(scheduler, "token_to_kv_pool_allocator", None)
+    try:
+        free = int(alloc.available_size())
+        evict = int(tree.evictable_size())
+    except Exception:  # noqa: BLE001 - diagnostics never raise
+        return "cause=unread"
+
+    def _int_or_none(fn):
+        try:
+            v = fn()
+            return None if isinstance(v, bool) or not isinstance(v, int) else int(v)
+        except Exception:  # noqa: BLE001
+            return None
+
+    prot = _int_or_none(getattr(tree, "protected_size", lambda: None)) or 0
+    # looked up on the type, as ``mem_cache.common.deliverable_evictable_or`` does: a duck-typed stand-in answers every getattr
+    dfn = getattr(type(tree), "deliverable_evictable_size", None)
+    deliv = _int_or_none(lambda: dfn(tree)) if callable(dfn) else None
+    cap = getattr(tree, "pdflip_pp_room_cap", None)
+    cap = int(cap) if isinstance(cap, int) and not isinstance(cap, bool) else None
+    try:
+        backups = len(getattr(tree, "ongoing_backup", None) or ())
+    except Exception:  # noqa: BLE001
+        backups = 0
+    need = int(need_tokens)
+    if free + evict >= need:
+        cause = "estimator"
+    elif free + evict + prot >= need:
+        cause = "locked"
+    else:
+        cause = "pool"
+    return (f"cause={cause} free={free} evict={evict} prot={prot} "
+            f"deliv={'-' if deliv is None else deliv} cap={'-' if cap is None else cap} bk={backups} flight=0")
+
+
+def note_stall_deferred(scheduler, req, busy: str, note: str = "") -> None:
+    """The in-flight premise held a refusal back (``PDFLIP INTAKE-STALL-DEFERRED``): the metal count of the defect. Bounded
+    (the first eight, then every power of two); never raises."""
+    try:
+        n = getattr(scheduler, "_pdflip_intake_deferred_n", 0) + 1
+        scheduler._pdflip_intake_deferred_n = n
+        # review A2: remember WHICH request was held back, so its admission can be named (``note_intake_resumed``)
+        rids = getattr(scheduler, "_pdflip_intake_deferred_rids", None)
+        if rids is None:
+            rids = scheduler._pdflip_intake_deferred_rids = {}
+        rid = str(getattr(req, "rid", ""))
+        rids[rid] = rids.get(rid, 0) + 1
+        if n <= _LOG_FIRST or (n & (n - 1)) == 0:
+            logger.info(
+                "PDFLIP INTAKE-STALL-DEFERRED rid=%s in_flight=%s %s (n=%d): the refusal is a WAIT -- this stage still runs "
+                "(a launched PP pass whose result is not consumed, a chunk, anchor tails); the hold starts at the first "
+                "idle pass, and the finishing request's rows are counted by then",
+                str(getattr(req, "rid", "")), busy, note or "gate=adder_no_token", n,
+            )
+    except Exception:  # noqa: BLE001 - an instrument never blocks the admission
+        pass
+
+
+def note_intake_resumed(scheduler, req, adder=None) -> None:
+    """Review A2: a request that was held back (``PDFLIP INTAKE-STALL-DEFERRED``) is admitted now: one line naming what PP0 sized
+    the admission on, so the metal tells a fresh follower fact from an aged one (F2), and a follower OOM / W27 after an
+    admission out of a wait is attributable.
+
+    ``PDFLIP INTAKE-RESUMED rid= deferred_n= cap_src=fact(rank,executed,processed)|aged|own_only|none cap= rem_total=``.
+    Bounded like the deferral line (the first eight, then every power of two); the mark of the rid is consumed; reads only,
+    never raises."""
+    try:
+        rids = getattr(scheduler, "_pdflip_intake_deferred_rids", None)
+        if not rids:
+            return
+        rid = str(getattr(req, "rid", ""))
+        deferred_n = rids.pop(rid, 0)
+        if not deferred_n:
+            return
+        tree = getattr(scheduler, "tree_cache", None)
+        cap = getattr(tree, "pdflip_pp_room_cap", None)
+        cap = int(cap) if isinstance(cap, int) and not isinstance(cap, bool) else None
+        book = getattr(scheduler, "_pdflip_pr_book", None)
+        src = "none"
+        if cap is not None:
+            src = book.cap_source() if book is not None else "own_only"
+        elif book is not None and book.facts:
+            src = "aged"
+        try:
+            rem_total = int(adder.rem_total_tokens) if adder is not None else -1
+        except Exception:  # noqa: BLE001
+            rem_total = -1
+        n = getattr(scheduler, "_pdflip_intake_resumed_n", 0) + 1
+        scheduler._pdflip_intake_resumed_n = n
+        if n <= _LOG_FIRST or (n & (n - 1)) == 0:
+            logger.info(
+                "PDFLIP INTAKE-RESUMED rid=%s deferred_n=%d cap_src=%s cap=%s rem_total=%d (n=%d)",
+                rid, int(deferred_n), src, "-" if cap is None else cap, rem_total, n,
+            )
+    except Exception:  # noqa: BLE001 - an instrument never blocks the admission
+        pass
 
 
 def intake_phase_verdict(scheduler, rid: str, need_tokens: int,
@@ -326,6 +570,13 @@ def intake_phase_verdict(scheduler, rid: str, need_tokens: int,
 def forget(scheduler, rid: Optional[str]) -> None:
     """An abort (prefix semantics, None = all): the rid may be named again
     when it comes back in a later phase."""
+    deferred = getattr(scheduler, "_pdflip_intake_deferred_rids", None)
+    if deferred:
+        if rid is None:
+            deferred.clear()
+        else:
+            for r in [r for r in deferred if str(r).startswith(str(rid))]:
+                deferred.pop(r, None)
     named = getattr(scheduler, "_h91_intake_named", None)
     if not named:
         return
@@ -343,7 +594,10 @@ __all__ = [
     "KEPT_ATTR",
     "forget",
     "intake_phase_verdict",
+    "note_intake_resumed",
+    "note_stall_deferred",
     "pool_terms",
     "settle_told",
+    "stall_cause",
     "told_admission",
 ]

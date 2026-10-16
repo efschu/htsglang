@@ -555,7 +555,7 @@ async def test_arrive_registers_until_the_pending_is_stamped_and_holds_the_take_
 
 def test_the_switch_off_pool_call_passes_no_wait_and_the_default_pool_is_unchanged():
     src = open(os.path.join(_SRT, "pdflip", "front.py")).read()
-    assert "lane_take_wait=((lambda: _lctl.take_wait(self)) if _lanes.enabled() else None)," in src
+    assert "lane_take_wait=((lambda: _lctl.take_wait(self)) if _lctl.enabled() else None)," in src  # PRIO-AS-AGE 1014: floor mode
 
     async def run():
         queue = collections.deque()
@@ -573,3 +573,14 @@ def test_the_switch_off_pool_call_passes_no_wait_and_the_default_pool_is_unchang
         return seen
 
     assert asyncio.run(run()) == ["a", "b"]
+
+
+# PRIO-AS-AGE 1014 (user decision 14.10.2026, pdflip/prio_age.py): FLLIPER_PDFLIP_PRIO_AS_AGE is ON by default and switches the
+# lane FLOOR of 1008 off (priority acts as age).  The tests of this file pin the floor machinery itself, i.e. the mode OFF
+# ("Modus AUS: altes Verhalten"); the new default is pinned in test_pdflip_prio_as_age_1014.py.
+import pytest as _pytest_prio_age  # noqa: E402
+
+
+@_pytest_prio_age.fixture(autouse=True)
+def _prio_as_age_off_floor_mode_1014(monkeypatch):
+    monkeypatch.setenv("FLLIPER_PDFLIP_PRIO_AS_AGE", "0")

@@ -1,7 +1,7 @@
 """Auftrag 2002 C: der Kantenkatalog (kantenkatalog_1004.json) wird gelesen und mit ``CURATED[...]["depends"]`` verschmolzen.
 
 Gepinnt (Nutzerentscheid 05.10., Variante A: Loader + Verschmelzung, KEINE Regelauswertung im Editor):
-  * Jede der 138 Katalogkanten steht danach in ``entries[von]["depends"]`` (mit ``edge``-ID, ``evidence``, ``satz``); 51 verschmolzen, 87 neu (AP-G 06.10.: K62-K108 neu, alle ohne kuratierte Zwillingskante; AP-H1: K109-K116 Dual-ENV-Tabelle, neu; Catalog-Neubau 07.10.: K117-K131 neu; VISION-WEIGHTS AP4: K132-K134 neu; F0-H Runde 2: W3-Kante, jetzt K135, neu; X-SUM-PRICE 10.10.: K136 neu).
+  * Jede der 139 Katalogkanten steht danach in ``entries[von]["depends"]`` (mit ``edge``-ID, ``evidence``, ``satz``); 52 verschmolzen, 87 neu (AP-G 06.10.: K62-K108 neu, alle ohne kuratierte Zwillingskante; AP-H1: K109-K116 Dual-ENV-Tabelle, neu; Catalog-Neubau 07.10.: K117-K131 neu; VISION-WEIGHTS AP4: K132-K134 neu; F0-H Runde 2: W3-Kante, jetzt K135, neu; X-SUM-PRICE 10.10.: K136 neu; RC4: Lane-Kanten K137/K138 neu; RC5: K139 PRIO-AS-AGE -> LANES verschmilzt mit der kuratierten Kante (Quelle h16m K138)).
   * Die 24 kuratierten Kanten ohne Katalogkante bleiben und sind ``belegt: False`` ("ohne Beleg"), nicht geloescht.
   * Weicht die Beziehungsart ab, bleibt die kuratierte und ``rel_catalog`` traegt die andere (kein stilles Ueberschreiben).
   * ``to_kind`` kennzeichnet das Ziel (flag/env/var/refusal/unbekannt): ein Chip zeigt nie stumm ins Leere.
@@ -72,7 +72,7 @@ class RealCatalog(unittest.TestCase):
     def test_status_block_counts(self):
         k = self.cat["kanten"]
         self.assertTrue(k["geladen"])
-        self.assertEqual((k["edges_total"], k["verschmolzen"], k["neu"]), (138, 51, 87))
+        self.assertEqual((k["edges_total"], k["verschmolzen"], k["neu"]), (139, 52, 87))
         self.assertEqual(k["edges_without_evidence"], WITHOUT_EVIDENCE)
         self.assertEqual(k["kanten_belegt"], 138)
         self.assertEqual(k["uebersprungen_ohne_von"], [])

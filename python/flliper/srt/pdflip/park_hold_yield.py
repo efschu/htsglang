@@ -23,9 +23,10 @@ pass, over the same replicated lists):
 
 1. The tree records which retained nodes' backups the arena refused
    (``#1421 arena_claim``) while the park retracts.
-2. ONE group vote (MIN over the attention TP group, #59b's replicated-list
-   pattern): refused anywhere, the pages still missing (``need``, group MAX),
-   and per held candidate (the park list, minus what this park retracted,
+2. A group vote (MIN over the attention TP group, #59b's replicated-list
+   pattern): refused anywhere and the pages still missing (``need``, group
+   MAX); only when refused anywhere (FLIPSTALL-1015) a second vote, per held
+   candidate (the park list, minus what this park retracted,
    in its replicated order) the held pages with an L3 copy and whether its
    WHOLE held span has one (group MIN).
 3. ``need`` <= the on-disk pages of the eligible candidates: every rank gives
@@ -188,16 +189,30 @@ def settle(sched, *, retracted: Sequence, parked: Sequence) -> Optional[str]:
     refused = _end(tree)
     if not envs.FLLIPER_PDFLIP_ENABLE_PARK_HOLD_YIELD.get():
         return None
+    # FLIPSTALL-1015 (NF h16n 17c2563647, D epoch 90): the held facts are an
+    # L3 stat walk over every page of every held span (``held_facts`` ->
+    # ``_stat_stems``) on the scheduler thread. They were gathered BEFORE the
+    # vote, on every park -- also a clean one, which is nearly every park
+    # (1-2 s routinely: ``yield:2229``; 21.7 s under the 06:55Z host swap
+    # storm, ``yield:21732`` of a 31.3 s park that retracted NOTHING). Two
+    # votes now: (refused, need) first, two integers, unconditional on every
+    # rank; the walk and its vote only when some rank refused. The first
+    # vote's MIN is the same on every rank, so every rank takes the same
+    # branch and enters the same collectives (the Verdikt-Platz rule).
+    t = torch.tensor(pack_vote(refused=bool(refused), need=need_pages(tree, refused),
+                               on_disk=(), whole=()), dtype=torch.int64)
+    tree._all_reduce_attn_groups(t, torch.distributed.ReduceOp.MIN, label="park_hold_yield")
+    any_refused, need, _n, _w = unpack_vote(t.tolist())
+    if not any_refused:
+        return "clean"
     gone = {str(r.rid) for r in retracted}
     cands = [str(r.rid) for r in parked if str(r.rid) not in gone]
     facts = [held_facts(tree, rid) for rid in cands]
-    vec = pack_vote(refused=bool(refused), need=need_pages(tree, refused),
-                    on_disk=[d for _h, d in facts], whole=[h > 0 and d == h for h, d in facts])
-    t = torch.tensor(vec, dtype=torch.int64)
-    tree._all_reduce_attn_groups(t, torch.distributed.ReduceOp.MIN, label="park_hold_yield")
-    any_refused, need, on_disk, whole = unpack_vote(t.tolist())
-    if not any_refused:
-        return "clean"
+    t = torch.tensor(pack_vote(refused=True, need=need,
+                               on_disk=[d for _h, d in facts], whole=[h > 0 and d == h for h, d in facts]),
+                     dtype=torch.int64)
+    tree._all_reduce_attn_groups(t, torch.distributed.ReduceOp.MIN, label="park_hold_yield_facts")
+    _r, _need2, on_disk, whole = unpack_vote(t.tolist())
     held = sum(h for h, _d in facts)
     pick = choose(need=need, on_disk=on_disk, whole=whole)
     verdict = "stands" if pick is None else "yield"

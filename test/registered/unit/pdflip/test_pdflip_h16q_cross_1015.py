@@ -1,0 +1,186 @@
+# SPDX-License-Identifier: Apache-2.0
+"""NF-H16Q-INT 1015: the interactions no single block of the h16q integration could see.
+
+Blocks: K9 (P-DRAIN-EARLY-SETTLE, INTAKE-BACKUP-INFLIGHT), B5 (ANCHOR-ACKS), K11 (QSA chunk grain), K10 (PW-F, W3-FORMA;
+its SEAT-RELIEF valves a/b/c went with the seat gate, SEAT-AT-HAND-OFF 15.10.), presence (bigram probe), on h16p
+97e49033c2 (arenafull + A1/A2/E1/E2).
+
+Pinned here (hermetic, the tree's own functions, no CUDA):
+
+  X1  K9: the settle afterwards only AWAITS legs already posted (it never dispatches a fresh leg 1), so a request that was
+      not posted stays queued -- and a posted one is left neither on P nor in the queue: the P->D flip begins with
+      nothing outstanding.
+  X2  K9 x the H91 phase cap: a phase ended by the cap (``max_dispatch``) with early legs posted -- this flip's, or an
+      older one still in the queue -- settles every posted leg in the phase -> 0 posted legs left for the P->D drain
+      (the 11:52 death shape: phase ended by a cap with early legs running).
+  X3  K11 x B5: a B5 floor is a common tree-node depth; with the h16p numbers (87296, 67584, 107584 -- all on the 64
+      page grid) every floor is on the QSA grain and the next extend passes K11's host check; an off-grain floor (not
+      producible by a page-aligned tree) is stopped BY NAME (QSA-PREFIX-GRAIN with the rid), never by the text-less
+      device assert.
+  X4  B5 x arenafull A2: the anchor walk reads only the tree's match validators -- none of them (and not the B5 walk)
+      reads ``l3_present``, the one flag A2 changed; A2 therefore moves no anchor (tripwire on the source).
+"""
+from __future__ import annotations
+
+import asyncio
+import collections
+import inspect
+import os
+from types import SimpleNamespace
+
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+
+import pytest  # noqa: E402
+
+from flliper.srt.managers.scheduler_components import weight_updater as _wu  # noqa: E402,F401
+from flliper.srt.pdflip import front as front_mod  # noqa: E402
+
+
+class _P:
+    """The fields the pool and K9's settle read."""
+
+    def __init__(self, rid, posted=None):
+        self.rid = rid
+        self.fut = None
+        self._leg1_early = posted
+
+    def __repr__(self):
+        return f"_P({self.rid})"
+
+
+def _run(coro):
+    # H16Q review A5: bounded -- a mutant that waits forever goes RED, never hangs the lock
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(asyncio.wait_for(coro, 5.0))
+    finally:
+        loop.close()
+
+
+async def _drain_then_settle(queue, *, max_dispatch=0, settle=True):
+    """The P phase's two steps in the order the merged front runs them (_p_drain_pool, then K9's settle)."""
+    log = []
+    on_p = set()
+
+    async def one(p):
+        early = getattr(p, "_leg1_early", None)
+        if early is not None:
+            p._leg1_early = None
+            await early
+            log.append(("awaited", p.rid))
+        else:
+            on_p.add(p.rid)
+            await asyncio.sleep(0)
+            log.append(("fresh", p.rid))
+        on_p.discard(p.rid)
+        return p
+
+    done = []
+    await front_mod._p_drain_pool(
+        queue, 4, one, done.append,
+        lambda: True,
+        max_dispatch=max_dispatch)
+    if settle:
+        await front_mod._settle_posted_early_legs(queue, one, done.append)
+    return log, done
+
+
+def _posted(loop_result=None):
+    f = asyncio.get_event_loop().create_future()
+    f.set_result(loop_result)
+    return f
+
+
+def test_x1_k9_settle_never_dispatches_a_fresh_leg():
+    async def go():
+        first = _P("pdflip-first", posted=_posted())                      # the pool's one dispatch
+        unposted = _P("pdflip-shortx")                                    # nothing on P for it
+        posted_old = _P("pdflip-old-posted", posted=_posted())            # an early leg P is computing anyway
+        q = collections.deque([first, unposted, posted_old])
+        log, done = await _drain_then_settle(q, max_dispatch=1)
+        return log, done, q
+    log, done, q = _run(go())
+    assert ("awaited", "pdflip-old-posted") in log, "a posted early leg is settled in the phase"
+    assert ("fresh", "pdflip-shortx") not in log, "K9 must never start a leg the phase cap withheld"
+    assert [p.rid for p in q] == ["pdflip-shortx"]
+    assert not any(getattr(p, "_leg1_early", None) is not None for p in q), "nothing posted is left for the flip"
+
+
+def test_x1_without_k9_the_posted_leg_would_be_left_for_the_p_to_d_drain():
+    """The counter-case (K9 off): the posted leg stays queued with its early leg -- the 11:52 shape."""
+    async def go():
+        first = _P("pdflip-first", posted=_posted())
+        posted_old = _P("pdflip-old-posted", posted=_posted())
+        q = collections.deque([first, posted_old])
+        log, _ = await _drain_then_settle(q, max_dispatch=1, settle=False)
+        return log, q
+    log, q = _run(go())
+    assert [p.rid for p in q] == ["pdflip-old-posted"] and q[0]._leg1_early is not None
+
+
+def test_x2_a_phase_ended_by_the_h91_cap_settles_every_posted_leg():
+    async def go():
+        old = _P("pdflip-old", posted=_posted())                           # posted in an earlier flip, still queued
+        head = _P("pdflip-30-76", posted=_posted())                        # this flip's early leg
+        rest = _P("pdflip-30-77")
+        q = collections.deque([head, old, rest])
+        log, _ = await _drain_then_settle(q, max_dispatch=1)
+        return log, q
+    log, q = _run(go())
+    assert ("awaited", "pdflip-30-76") in log and ("awaited", "pdflip-old") in log
+    assert ("fresh", "pdflip-30-77") not in log, "the cap holds: no fresh dispatch beyond 1"
+    assert [p.rid for p in q] == ["pdflip-30-77"]
+    assert not any(getattr(p, "_leg1_early", None) is not None for p in q)
+
+
+# ------------------------------------------------------------------------------------------------- X3 K11 x B5
+
+def _open(told, acks, anchors):
+    from flliper.srt.managers import pdflip_told_fallback as fb
+    return fb._Open(told=told, deadline=0.0, acks=dict(acks), anchors={k: tuple(v) for k, v in anchors.items()})
+
+
+def _fb_batch(prefix, extend, rid):
+    return SimpleNamespace(seq_lens_cpu=[prefix + extend], extend_seq_lens_cpu=[extend], rids=[rid])
+
+
+@pytest.mark.parametrize("told,acks,anchors", [
+    (91712, {1: 91712, 2: 87296}, {1: (87296, 65536), 2: (65536,)}),     # mismatch 12:04:24 pdflip-3-27
+    (117184, {1: 107584, 2: 107584}, {1: (67584,), 2: (67584,)}),         # told_fidelity 12:16:46 pdflip-22-70
+])
+def test_x3_b5_floors_are_on_the_qsa_grain_and_pass_k11(monkeypatch, told, acks, anchors):
+    from flliper.srt.layers.attention import qwen_sparse_attn_backend as qsa
+    from flliper.srt.managers import pdflip_told_fallback as fb
+    monkeypatch.delenv(fb.ENV_ANCHOR_ACKS, raising=False)  # default on
+    depths = fb.common_depths(_open(told, acks, anchors))
+    assert depths, "B5 finds a common depth"
+    for d in depths:
+        assert d % 64 == 0 and d % 4 == 0
+        assert qsa.qsa_prefix_grain_violations(_fb_batch(d, 16384, "pdflip-x"), 4, 1) == []
+        qsa.qsa_check_prefix_grain(_fb_batch(d, 16384, "pdflip-x"), 4, 1)
+
+
+def test_x3_an_off_grain_floor_is_stopped_by_name_not_by_the_device_assert(monkeypatch):
+    from flliper.srt.layers.attention import qwen_sparse_attn_backend as qsa
+    from flliper.srt.managers import pdflip_told_fallback as fb
+    monkeypatch.delenv(fb.ENV_ANCHOR_ACKS, raising=False)
+    d = fb.common_depths(_open(91712, {1: 91712, 2: 87298}, {1: (87298,), 2: ()}))[0]  # not producible by a paged tree
+    assert d == 87298
+    with pytest.raises(RuntimeError, match=r"QSA-PREFIX-GRAIN rid=pdflip-3-27 prefix=87298"):
+        qsa.qsa_check_prefix_grain(_fb_batch(d, 4096, "pdflip-3-27"), 4, 1)
+
+
+# ------------------------------------------------------------------------------------------------- X4 B5 x A2
+
+def test_x4_the_b5_anchor_walk_and_every_match_validator_ignore_l3_present():
+    from flliper.srt.managers import pdflip_told_fallback as fb
+    from flliper.srt.mem_cache.unified_cache_components import full_component, mamba_component, swa_component
+    srcs = [inspect.getsource(fb._path_anchor_depths), inspect.getsource(fb.ack_anchors),
+            inspect.getsource(fb.common_depths)]
+    for mod in (full_component, mamba_component, swa_component):
+        for name, cls in inspect.getmembers(mod, inspect.isclass):
+            if cls.__module__ == mod.__name__ and "create_match_validator" in cls.__dict__:
+                srcs.append(inspect.getsource(cls.create_match_validator))
+    assert len(srcs) >= 6
+    assert not any("l3_present" in s for s in srcs), (
+        "an anchor rule now reads l3_present: re-check B5 against arenafull A2 (FLLIPER_PDFLIP_L3_PRESENT_STRICT)")

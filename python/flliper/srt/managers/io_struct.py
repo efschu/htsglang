@@ -285,6 +285,12 @@ class GenerateReqInput:
     # nothing infers a class from traffic. Unset -> the server-wide default
     # (--kv-session-offload-default-spill-class, itself "normal").
     spill_class: Optional[str] = None
+    # FRONT-X-MIT (15.10., pdflip/front_x.py): the X of the Weg-2 front's dispatch
+    # decision for this D-direct leg 2 and what it priced at that decision (tokens).
+    # Set only from the x-pdflip-front-x / x-pdflip-front-priced request headers; None =
+    # nothing carried, D's static X gate is the only gate.
+    weg2_front_x: Optional[int] = None
+    weg2_front_priced: Optional[int] = None
     # Extra cache key for classifying the request (e.g. cache_salt)
     extra_key: Optional[Union[List[str], str]] = None
 
@@ -784,6 +790,8 @@ class GenerateReqInput:
             priority=self.priority,
             lane=self.lane,
             spill_class=self.spill_class,
+            weg2_front_x=self.weg2_front_x,
+            weg2_front_priced=self.weg2_front_priced,
             extra_key=self.extra_key[i] if self.extra_key is not None else None,
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
@@ -874,6 +882,12 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # Resolved to a concrete class by the tokenizer manager; None only reaches
     # the scheduler on internal paths that bypass it (treated as "normal").
     spill_class: Optional[str] = None
+
+    # FRONT-X-MIT (15.10.): the front's decision X / priced uncached for a D-direct
+    # leg 2 (pdflip/front_x.py). Rides this object to the scheduler on every TP rank
+    # (rank 0 broadcasts it), so the gate's limit is the group's.
+    weg2_front_x: Optional[int] = None
+    weg2_front_priced: Optional[int] = None
 
     # Extra cache key for classifying the request (e.g. cache_salt)
     extra_key: Optional[str] = None
@@ -1681,6 +1695,11 @@ class PdFlipParkRunningReqOutput(BaseReq, kw_only=True):
     lane: bool = False
     #: lane park only: {requested rid: why it was not parked}
     lane_skipped: Dict[str, str] = {}
+    #: FLIPSTALL-1015: wall clock (time.time()) of the moment the flip park
+    #: answered -- D's awake re-queue clock starts there (d_park_runtime.
+    #: park_answer_stamp); the front starts its lapse clock there too. 0.0 =
+    #: not stamped (old D, lane park, refusal): the front keeps its pre-RPC stamp.
+    answered_at: float = 0.0
 
 
 class PdFlipLaneFloorReqInput(BaseReq, kw_only=True):
@@ -1705,6 +1724,17 @@ class PdFlipLaneFloorReqOutput(BaseReq, kw_only=True):
     #: lane holds still standing
     held: int = 0
     message: str = ""
+
+
+class PdFlipLivenessHoldOutput(BaseReq, kw_only=True):
+    """LIVEPARK (14.10.): scheduler -> tokenizer, one-way. The WHOLE set of
+    request ids group D holds on purpose right now (``pdflip_d_parked`` +
+    ``pdflip_dormant_hold`` + ``pdflip_post_wake_settle``: flip park, lane park,
+    RESUME-VIA-P hold, dormant hold, wake read). Sent only when the set
+    changes; replace semantics (``liveness/hold.py``). The LLM-stream liveness
+    watchdog pauses its silence clock for these rids."""
+
+    held: List[str] = []
 
 
 class PdFlipParkWindowReqInput(BaseReq, kw_only=True):
@@ -2186,6 +2216,11 @@ class AbortReq(BaseReq, kw_only=True):
     # The finished reason data (from BaseFinishReason.to_json())
     finished_reason: Optional[FinishReasonDict] = None
     abort_message: Optional[str] = None
+    # K14 (pdflip.pp_abort): PP0's group verdict on a forwarded abort under the
+    # #631 row authority -- True = a frame PP0 sent names the rid, so a
+    # follower that still queues it holds the abort until that frame admits
+    # it; False = no frame names it; None = not stamped (today's path).
+    pdflip_pp0_admitted: Optional[bool] = None
 
     def __post_init__(self):
         # FIXME: This is a hack to keep the same with the old code

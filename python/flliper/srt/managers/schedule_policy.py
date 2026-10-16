@@ -1058,7 +1058,7 @@ def _form_a_stale_vote_gate(adder, req, follow) -> AddReqResult | None:
     return None
 
 
-def _h105d_cut_load_back_room(adder, req) -> bool:
+def _h105d_cut_load_back_room(adder, req, evict: bool = True) -> bool:
     """H105d (NF y9nf6 rc12z30y9nf6, 191228abc5, D log boot_weg2_dkrnfint4h6abl
     bar1dauer10040608 ~158218-158410, 06:32:52Z, pdflip-32-93): may THIS rank
     vote ADMIT for a request whose host hit it must load back?
@@ -1122,7 +1122,12 @@ def _h105d_cut_load_back_room(adder, req) -> bool:
     # peel measured is not asked again -- the count the peel can PAY decides.
     payable = min(reported, payable_evictable_or(tc, tc.evictable_size))
     evicted = 0
-    if payable > 0 and need <= available + payable:
+    if not evict:
+        # H105f (NF h14 14:50:53, pdflip-0-3): the DRY vote -- may this rank make
+        # the room? Nothing is evicted before the group has said ADMIT.
+        if need <= available + payable:
+            return True
+    elif payable > 0 and need <= available + payable:
         res = tc.evict(EvictParams(num_tokens=min(payable, need - available)))
         # evict() returns None on some caches (as read by H105c/H106 too)
         evicted = int(getattr(res, "num_tokens_evicted", 0) or 0)
@@ -1143,6 +1148,25 @@ def _h105d_cut_load_back_room(adder, req) -> bool:
             reported, payable, adder.rem_total_tokens, n,
         )
     return False
+
+
+def _h105f_on() -> bool:
+    """H105f: vote before evicting (token cut only -- H105d is a no-op off it)."""
+    import os
+
+    from flliper.srt.rank_role import form_a_token_cut_active
+
+    if (os.environ.get("FLLIPER_PDFLIP_H105F_VOTE_BEFORE_EVICT", "1") or "1").strip().lower() in (
+            "0", "false", "no", "off"):
+        return False
+    return bool(form_a_token_cut_active())
+
+
+def _h105f_confirm_due(group_gate, armed: bool) -> bool:
+    """H105f: the second (confirming) gather runs exactly when the first one
+    returned the group's ADMIT -- a group-uniform fact, so every rank enters it
+    alike. ``armed`` is group-uniform too (switch + the installed token cut)."""
+    return bool(armed) and group_gate is None
 
 
 def _h110_int(v) -> int:
@@ -1636,6 +1660,35 @@ class PrefillAdder:
             return budget
         return effective_rem_total_tokens(budget, self.commitment_ledger)
 
+    _PDFLIP_BUDGET_PARTS_N = [0]
+
+    def _pdflip_note_budget_parts(self, req, price, budget) -> None:
+        """PW-W instrument (NF h14 14:50:53, pdflip-2-21: ``host_price=167776
+        host_budget=33536`` for 317 s with nothing running): the terms the
+        refusing budget is made of, so the next wedge names which one held the
+        rows. Observation only, rate-limited, never raises."""
+        n = self._PDFLIP_BUDGET_PARTS_N[0] = self._PDFLIP_BUDGET_PARTS_N[0] + 1
+        if not (n <= 20 or n % 256 == 0):
+            return
+        try:
+            alloc = self.token_to_kv_pool_allocator
+            parts = {
+                "available": int(alloc.available_size()),
+                "evictable": int(self.tree_cache.evictable_size()),
+                "offset": int(self.rem_total_token_offset),
+                "dcp_deficit": int(self.dcp_avail_deficit or 0),
+                "fundable_floor": self.fundable_extend_floor,
+                "ledger": (int(self.commitment_ledger.outstanding_tokens())
+                           if getattr(self, "commitment_ledger", None) is not None else None),
+                "prefix": len(req.prefix_indices),
+                "host_hit": int(getattr(req, "host_hit_length", 0) or 0),
+            }
+        except Exception as e:  # noqa: BLE001 - an instrument never breaks the gate
+            parts = {"unreadable": type(e).__name__}
+        logger.info("PDFLIP GATE-BUDGET-PARTS rid=%s price=%s budget=%s %s (n=%d)",
+                    getattr(req, "rid", "?"), price, budget,
+                    " ".join("%s=%s" % kv for kv in parts.items()), n)
+
     @property
     def rem_swa_tokens(self):
         return (
@@ -2028,6 +2081,36 @@ class PrefillAdder:
         if not self.scheduled_extents:
             return None
         return self.scheduled_extents.get(req.rid)
+
+    def _pdflip_chunk_grain(self) -> int:
+        """K11: where the end of a chunk that stays chunked may land -- the
+        end-anchor grain (`_pdflip_end_anchor_grain`): the QSA compress ratio or
+        page on a QSA pool, 1 everywhere else. An allocator without
+        `get_kvcache` (a desk double) is not a QSA pool."""
+        alloc = getattr(self, "token_to_kv_pool_allocator", None)
+        if alloc is None or not callable(getattr(alloc, "get_kvcache", None)):
+            return 1
+        return int(_pdflip_end_anchor_grain(alloc, int(getattr(self, "page_size", 1) or 1)))
+
+    def _pdflip_floor_chunk_to_grain(self, start: int, length: int) -> int:
+        """K11: shorten a TRUNCATED chunk [start, start+length) so its end is a
+        grain multiple; 0 means the budget does not reach the next boundary
+        (the caller parks). Unchanged when the grain is 1."""
+        g = self._pdflip_chunk_grain()
+        if g <= 1:
+            return int(length)
+        end = (int(start) + int(length)) // g * g
+        return max(0, end - int(start))
+
+    def _pdflip_park_chunked_in_place(self, req: Req) -> None:
+        """K11's copy of the #679 park (`if grant <= 0:` in add_chunked_req,
+        kept inline there because test_pdflip_park_xsn303 pins its text): the
+        request keeps its place at the chunk boundary (`Range(prefix,
+        prefix)`); under the pdflip park the scheduler turns it into a rows-back
+        park at the head of the next step (Punkt 2)."""
+        req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices))
+        if _pdflip_park_on():
+            req.pdflip_pool_parked = True
 
     def _pdflip_end_anchor_split(self, req: Req, start: int, length: int):
         """#1233 END-OF-PREFILL ANCHOR: (length, forced_chunked).
@@ -2596,6 +2679,34 @@ class PrefillAdder:
         truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
         if truncated:
+            # K11 (NF h16p 226aad7105, P.log 29069/29397, 15.10. 12:39:42Z):
+            # a budget-bound continuation (rem_total_tokens 9586 at a 94 % PP0
+            # pool) ended at 58546, so the NEXT chunk's prefix split a QSA
+            # group (58546 % 4 == 2) and `_qsa_build_write_plan`'s
+            # `prefix_lens % ratio` device assert took PP0 down. The end of a
+            # chunk that stays chunked lands on the same grain as the
+            # end-anchor cut (fnFL2x14); 1 off QSA, so nothing changes there.
+            # PP0 decides it here and its rows carry the extent: a follower
+            # that is told runs `_add_scheduled_req` above and never reaches
+            # this line, so every stage gets the same end.
+            new_len = self._pdflip_floor_chunk_to_grain(
+                len(req.prefix_indices), new_len
+            )
+            if new_len <= 0:
+                # The budget does not reach the next grain boundary: the #679
+                # park, not a chunk that would poison the next prefix.
+                self._pdflip_park_chunked_in_place(req)
+                logger.warning(
+                    "chunked prefill PARKED (K11 QSA-CHUNK-GRAIN): rid=%s "
+                    "prefix=%d budget=%d does not reach the next grain "
+                    "boundary (grain %d). The request keeps its place and is "
+                    "retried when memory frees.",
+                    getattr(req, "rid", "?"),
+                    len(req.prefix_indices),
+                    int(_rem_tokens),
+                    self._pdflip_chunk_grain(),
+                )
+                return req
             # P-FORK-CUT: end this chunk at the shared-prefix fork when that is free.
             new_len = _pdflip_p_fork_cut.apply(
                 self, req, len(req.prefix_indices), new_len, "add_chunked_req"
@@ -2787,6 +2898,11 @@ class PrefillAdder:
 
             # Chunked prefill
             trunc_len = self.rem_chunk_tokens
+            # K11: a chunk that stays chunked ends on the QSA grain (1 off QSA);
+            # a leftover rem_chunk_tokens from an earlier admission is not one.
+            trunc_len = self._pdflip_floor_chunk_to_grain(0, trunc_len)
+            if trunc_len <= 0:
+                return AddReqResult.OTHER
 
             assert len(req.prefix_indices) == 0
             req.set_extend_range(
@@ -2992,6 +3108,7 @@ class PrefillAdder:
                 ):
                     _gate = AddReqResult.NO_TOKEN
                     self._note_lifetime_refusal(req, total_tokens, _rem_total)
+                    self._pdflip_note_budget_parts(req, total_tokens, _rem_total)
 
             if _gate is None and self.is_hybrid_swa:
                 swa_needed = self._swa_budget_for_req(
@@ -3017,7 +3134,22 @@ class PrefillAdder:
                 # H105d: under the token cut every rank's gate is REAL and is
                 # gathered (MIN) BEFORE any load-back -- so this rank's gate
                 # must already know whether it can pay its OWN load-back rows.
-                if _gate is None and not _h105d_cut_load_back_room(self, req):
+                # H105f (NF h14 ba1d5becd7, D TP0 14:50:53, pdflip-0-3): H105d
+                # evicted THIS rank's room before the gather -- TP0 freed the
+                # device copy of pdflip-2-20's 163k session (#1469 EVICT
+                # node=43/42/38/37/36), then a worker's own gate refused
+                # (WORKER-GATE code=NO_TOKEN price=83239 budget=33536) and the
+                # request stayed queued; the session's next turn (pdflip-2-21)
+                # found its prefix host-only and wedged the server 317 s. Now a
+                # DRY vote (room makeable here?), the gather, and only on the
+                # group's ADMIT the eviction plus a second gather confirming
+                # the room. Both gathers are entered by every rank alike (the
+                # first's verdict is the group's).
+                # FLLIPER_PDFLIP_H105F_VOTE_BEFORE_EVICT=0: the old order.
+                _h105f = _h105f_on()
+                if _gate is None and not _h105d_cut_load_back_room(
+                    self, req, evict=not _h105f
+                ):
                     _gate = AddReqResult.NO_TOKEN
                 # H105: after every rank-local gate and BEFORE the load-back
                 # (and the tail-adopt vote behind it) -- the one point every
@@ -3027,6 +3159,14 @@ class PrefillAdder:
                 _gate = _fa_follow(
                     req, _gate, int(total_tokens), int(self.rem_total_tokens)
                 )
+                if _h105f_confirm_due(_gate, _h105f):
+                    _room = _h105d_cut_load_back_room(self, req, evict=True)
+                    _gate = _fa_follow(
+                        req,
+                        None if _room else AddReqResult.NO_TOKEN,
+                        int(total_tokens),
+                        int(self.rem_total_tokens),
+                    )
                 _fa_host_first = False
             if _gate is not None:
                 return _gate

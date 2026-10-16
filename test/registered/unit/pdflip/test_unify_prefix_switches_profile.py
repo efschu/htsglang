@@ -32,7 +32,9 @@ ALL = FIVE + (PF,)
 MZ = "FLLIPER_ANTHROPIC_INLINE_SYSTEM_IN_PLACE"
 #: NF-TK (HS 27.09.): the told trio the nextflash row carries.
 #: NF-MZ (29.09.): the in-place inline system render joins it (P == D == front).
-NF3 = ("FLLIPER_PDFLIP_TOLD_PROBE_TREE_KEY", "FLLIPER_PDFLIP_TOLD_PACED", "FLLIPER_PDFLIP_P_TWIN_DEFER", MZ)
+#: NF-PF (14.10., h16g #1233 WIDTH GUARD): PP0 decides told membership from the
+#: followers' acks -- PF joins the nextflash row (qwen27b keeps it off).
+NF3 = ("FLLIPER_PDFLIP_TOLD_PROBE_TREE_KEY", "FLLIPER_PDFLIP_TOLD_PACED", "FLLIPER_PDFLIP_P_TWIN_DEFER", MZ, PF)
 
 
 def _nf_on(name):
@@ -287,7 +289,7 @@ def test_profile_docker_owns_the_switches():
     n = {f.key: f.value for f in PD.registry_facts("nextflash", "int4-mixed")}
     for name in FIVE:
         assert q[f"_form {name}"] == "1" and n[f"_form {name}"] == ("1" if _nf_on(name) else "0")
-    assert q[f"_form {PF}"] == "0" and n[f"_form {PF}"] == "0"
+    assert q[f"_form {PF}"] == "0" and n[f"_form {PF}"] == "1"
     # a profile that drops the lines is registry-only, one that states 0 is a DIFF
     rows = PD.compare(PD.registry_facts("qwen27b", "int8"), {})
     assert ("_form FLLIPER_PDFLIP_TOLD_PACED", "1", "-", "registry-only") in rows

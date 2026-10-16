@@ -630,3 +630,14 @@ def test_the_http_body_of_a_flip_park_is_unchanged_and_a_lane_answer_adds_two_ke
     http = _read("entrypoints", "http_server.py")
     assert 'if getattr(ret, "lane", False):' in http
     assert 'body["lane"] = True' in http and 'body["skipped"]' in http
+
+
+# PRIO-AS-AGE 1014 (user decision 14.10.2026, pdflip/prio_age.py): FLLIPER_PDFLIP_PRIO_AS_AGE is ON by default and switches the
+# lane FLOOR of 1008 off (priority acts as age).  The tests of this file pin the floor machinery itself, i.e. the mode OFF
+# ("Modus AUS: altes Verhalten"); the new default is pinned in test_pdflip_prio_as_age_1014.py.
+import pytest as _pytest_prio_age  # noqa: E402
+
+
+@_pytest_prio_age.fixture(autouse=True)
+def _prio_as_age_off_floor_mode_1014(monkeypatch):
+    monkeypatch.setenv("FLLIPER_PDFLIP_PRIO_AS_AGE", "0")

@@ -206,13 +206,9 @@ EXPECTED_HELPER_REFS = {
     ("managers/scheduler.py", "Scheduler._pdflip_post_wake_settle_tick"): {"_pdflip_group_min_flags"},
     ("managers/scheduler.py", "Scheduler._pdflip_release_dormant_hold"): {"_pdflip_group_min_flags"},
     ("managers/scheduler.py", "Scheduler._pdflip_answer_x_refusals"): {"_pdflip_group_min_flags"},
-    # PW-R (pdflip/d_wall_head.py, NF int18 1008): one MIN per pass, entered by EVERY rank
-    # whenever D-HOL is on (`_hol.on` = switch + group D + pp_size 1, replicated). NF D-HANG
-    # 1011: the HOL head is rank-local (a worker's load-back can return NO_TOKEN alone after
-    # the group ADMIT), so it is the payload of the MIN, never its entry condition (the old
-    # "entered iff the head is queued" would leave the host in the forward -- a READING of
-    # the old guard, unbelegt as the cause of the 11.10. 10:25:45Z hang). Pinned by
-    # test_nf_dhang_group_collective_1011.
+    # PW-R (pdflip/d_wall_head.py, NF int18 1008): entered iff the pass's HOL head
+    # (its first NO_TOKEN on group D -- the Form A gather's verdict, the same rid on
+    # every rank) is still in the replicated waiting queue; one MIN per pass.
     ("managers/scheduler.py", "Scheduler._get_new_batch_prefill_raw"): {"_pdflip_group_min_flags"},
     ("pdflip/d_park_runtime.py", "park_tick"): {"_pdflip_group_min_flags"},
     ("pdflip/d_park_runtime.py", "_capacity_requeue"): {"_pdflip_group_min_flags"},
