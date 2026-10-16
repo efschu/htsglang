@@ -213,8 +213,12 @@ def test_a1_the_p_phase_takes_min_queue_and_cap_while_d_is_full():
     asyncio.run(body())
 
 
-def test_a1_the_cap_still_holds_with_a_full_d_and_a_longer_queue():
-    """The H91 cap is the only cap: 9 queued, cap 6 -> 6 in the first phase, the rest waits (min(len(queue), cap))."""
+def test_a1_no_seat_cap_and_no_stranded_needs_p_with_a_full_d_and_a_longer_queue():
+    """9 queued over X, cap 6, D full: all 9 go in the first phase. No seat cap (this file) and -- merged with
+    flipqueue 1015 -- the H91 cap never strands a request that NEEDS P (``_p_phase_cap_exempt_pred``): a rest over X
+    left at the P->D flip made D's DONE-KICK fire PARK-IMMEDIATE at once (double flip; review A5 (i) of this branch,
+    "H91 rest x PBOUND-FLIP-NOW without dwell"). The cap still binds what neither rides nor needs P
+    (test_weg2_flipqueue_1015::test_the_cap_still_binds_what_neither_rides_nor_needs_p)."""
     from test_weg2_phase_policy_h91c import Harness, _until
 
     async def body():
@@ -223,7 +227,7 @@ def test_a1_the_cap_still_holds_with_a_full_d_and_a_longer_queue():
             await _fill_d_and_queue_ready(h)
             tasks = [h.post("c%d" % i, 15000) for i in range(9)]
             assert await _until(lambda: "rpc:release_memory_occupation" in h.p.timeline, 30)
-            assert len(_gens_before_first_release(h)) == 6, h.p.timeline
+            assert len(_gens_before_first_release(h)) == 9, h.p.timeline
             for t in tasks:
                 t.cancel()
 
@@ -232,7 +236,8 @@ def test_a1_the_cap_still_holds_with_a_full_d_and_a_longer_queue():
 
 def test_a1_a_short_rides_the_p_phase_with_a_full_d_as_cap_exempt():
     """Cap 2, three LONG and one SHORT queued, D full: the two LONG take the cap, the SHORT rides as cap_exempt
-    (FLIPCYCLE H5) -- 3 legs before the flip, whatever D's seats say. RED when the exemption needs a free seat (MD)."""
+    (FLIPCYCLE H5) and so does the third LONG (over X: it needs P, flipqueue 1015) -- 4 legs before the flip,
+    whatever D's seats say. RED when the exemption needs a free seat (MD)."""
     from test_weg2_phase_policy_h91c import Harness, _until
 
     async def body():
@@ -242,8 +247,8 @@ def test_a1_a_short_rides_the_p_phase_with_a_full_d_as_cap_exempt():
             tasks = [h.post("L1", 15000), h.post("L2", 15000), h.post("L3", 15000), h.post("S1", 20)]
             assert await _until(lambda: "rpc:release_memory_occupation" in h.p.timeline, 30)
             before = _gens_before_first_release(h)
-            assert sorted(before) == ["gen:L1", "gen:L2", "gen:S1"], h.p.timeline
-            assert h.front.counters["p_phase_short_rides"] == 1
+            assert sorted(before) == ["gen:L1", "gen:L2", "gen:L3", "gen:S1"], h.p.timeline
+            assert h.front.counters["p_phase_short_rides"] == 2  # the pool's ride count: S1 and L3 past the cap
             for t in tasks:
                 t.cancel()
 
