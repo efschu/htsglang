@@ -225,6 +225,7 @@ class Catalog(unittest.TestCase):
         cat = json.load(open(os.path.join(os.path.dirname(HERE), "profil_data", "catalog.json"), encoding="utf-8"))
         k = cat["kanten"]
         self.assertTrue(k["geladen"])
+        # RC5 (16.10.): + K139 (FLLIPER_PDFLIP_PRIO_AS_AGE requires FLLIPER_PDFLIP_LANES, NF file only; K138 in the old NF chain, h16m): it merges with the curated edge of the entry: 139 edges, merged 51 -> 52, new stays 87.
         # RC4 (14.10.): + K137/K138 (Prio-Lanes L1 lane envs, NF file only; K136/K137 in the old NF chain, numbered behind the renamed tree's K136): 138 edges, new 85 -> 87.
         # F0-H round 4b (10.10.): + K136 (X-SUM-PRICE: DECODE_COLLECT_PREFILL_BUSY -> DECODE_COLLECT_WINDOW_S, NF file only; K135 in the old NF chain): 136 edges, new 84 -> 85.
         # F0-H round 3 (10.10.): + K132-K134 (VISION-WEIGHTS AP4: --pdflip-vision-place weights requires transient / excludes VISION_ASYNC / kvtail+auto excluded with --dual-layout), the W3 edge is K135 now (the lines' edge files carry the same 131 + 3 edges, the NF file the W3 edge behind them): 135 edges, new 81 -> 84, on both lines.
@@ -234,7 +235,7 @@ class Catalog(unittest.TestCase):
         # "ohne Beleg" = kuratierte Kanten ohne Katalogkante: 24 im Kern der 27B-Linie; der NF-eigene kuratierte Eintrag --pdflip-xchg-census-map (nur NF-Baum) traegt
         # eine weitere (braucht --pdflip-xchg-census), ist der Katalog aus dem NF-Kern gebaut (Neubau NF-Linie 07.10.), sind es 25
         nf_census_map = cat["entries"].get("--pdflip-xchg-census-map", {}).get("status") == "curated"
-        self.assertEqual((k["edges_total"], k["verschmolzen"], k["neu"], k["edges_without_evidence"]), (138, 51, 87, 25 if nf_census_map else 24))
+        self.assertEqual((k["edges_total"], k["verschmolzen"], k["neu"], k["edges_without_evidence"]), (139, 52, 87, 25 if nf_census_map else 24))
         deps = [d for e in cat["entries"].values() for d in e["depends"]]
         self.assertTrue(all("belegt" in d and "to_kind" in d for d in deps))
         self.assertTrue(any(d["to_kind"] == "refusal" for d in deps))

@@ -74,7 +74,7 @@ class RealCatalog(unittest.TestCase):
         self.assertTrue(k["geladen"])
         self.assertEqual((k["edges_total"], k["verschmolzen"], k["neu"]), (139, 52, 87))
         self.assertEqual(k["edges_without_evidence"], WITHOUT_EVIDENCE)
-        self.assertEqual(k["kanten_belegt"], 138)
+        self.assertEqual(k["kanten_belegt"], 139)
         self.assertEqual(k["uebersprungen_ohne_von"], [])
         self.assertEqual(k["ziel_unbekannt"], ZIEL_UNBEKANNT)
         self.assertEqual(k["wertbedingt"], 25)
