@@ -409,6 +409,9 @@ def tick(cache: Any) -> int:
         _ST.armed = armed(cache)    # per round: a handful of getattr/env reads; the floor mark moves per iteration
         if not _ST.armed:
             return 0
+        from sglang.srt.weg2 import room_wait_arbiter as _arbiter
+
+        _arbiter.note_role(cache)
         # the arena binds per phase (flip/rebind): re-resolve at most once a second, not per round
         t_now = time.monotonic()
         arena = _ST.arena
@@ -424,6 +427,12 @@ def tick(cache: Any) -> int:
         if t_poll - _ST.poll_t < _POLL_S:
             return 0
         _ST.poll_t = t_poll
+        # ROOM-ARBITER 1016 (F3): PP0 announces which waiting request's fill may wait (the oldest); no-op elsewhere
+        _arbiter.decide(arena)
+        # review A2: a yielded fill's give-back is room on its way until its read is reaped on this rank
+        from sglang.srt.weg2 import room_verdicts as _rv
+
+        _rv.reap_givebacks(arena, cache)
         return serve_unseen(cache, None, arena)
     except Exception:  # noqa: BLE001 - a room request never breaks the round
         logger.warning("%s tick raised", MARK, exc_info=True)
@@ -521,7 +530,14 @@ def serve(cache: Any, pool: Any, arena: Any, need: int, read_key: Any = None) ->
     c["mine_pinned"] = mine
     n = _ST.served + 1
     _ST.served = n
+    # ROOM-VERDICTS 1016 (F2): this rank's answer goes into the shared file -- the fills end a wait no rank can
+    # answer on that fact (weg2/room_verdicts.py), not on their idle bound
+    from sglang.srt.weg2 import room_verdicts as _rv
+
     if d <= 0:
+        # review A1: room is there (free + clock) or on its way (this rank let go of it for the read and a peer still
+        # holds it) -- never an answer that ends a wait
+        _rv.note_verdict(arena, 0, _rv.transient_blocked(cache), False, room_seen=True)
         _ST.served_empty += 1
         if n <= 16 or n % 64 == 0:
             logger.info("%s SERVE n=%d need=%d deficit=0 slots=%d complete=%d claimed=%d pinned=%d free=%d "
@@ -530,10 +546,16 @@ def serve(cache: Any, pool: Any, arena: Any, need: int, read_key: Any = None) ->
                         c["complete"], c["claimed"], c["pinned"], c["free"], c["clock"], mine)
         return 0
     slots: List[int] = []
+    _quiet = _rv.spill_quiet(cache)     # read BEFORE the spill: in its empty backoff it answers 0 without looking
     if _spill_takes_out(cache):
         released = int(cache._w3_arena_spill(pool, d, released_out=slots) or 0)
     else:
         released = int(cache._w3_arena_spill(pool, d) or 0)
+    # F1b x F2 (h16t): an UNDECIDED group spill (PP0 waits for a follower's acknowledgement, a follower still holds
+    # debts of PP0's set) answers like a spill that did not look -- room may still come, never a futility answer
+    from sglang.srt.weg2 import w3_room_set as _w3rs
+
+    _rv.note_verdict(arena, released, _rv.transient_blocked(cache), _quiet or _w3rs.undecided(cache))
     _note_released(read_key, arena, slots)
     _ST.spilled_pages += released
     _ST.serve_log.append((n, released))

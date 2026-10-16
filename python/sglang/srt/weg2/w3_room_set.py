@@ -477,7 +477,7 @@ def undecided(cache: Any) -> bool:
     """The last spill of this rank released nothing BECAUSE the group decision is still open (PP0 waits
     for a follower's acknowledgement, a follower still holds debts of PP0's set) -- not a verdict
     'nothing to release' (review A4: the room verdict must not end a wait on it)."""
-    return bool(cache.__dict__.get("_w3_room_undecided", False))
+    return bool(getattr(cache, "_w3_room_undecided", False))   # h16t merge review: robust for any cache object
 
 
 def spill(cache: Any, pool: Any, need_pages: int, want: int, released_out: Optional[list] = None,
