@@ -1097,10 +1097,24 @@ class MambaComponent(TreeComponent):
                     _1469_note("HOLD-END-ANCHOR", node=x.id)
                     x = x_next
                     continue
+                # K15: an internal anchor without a host copy is backed up
+                # before its device state goes (weg2-56-530: 73984 lost here)
+                _save = getattr(self.cache, "weg2_save_anchor_before_tombstone", None)
+                if callable(_save) and x.component_data[ct].host_value is None:
+                    _save(x)
+                    if not lru.in_list(x) or x.component_data[ct].value is None:
+                        # #904 guard: the save pinned it (off the LRU) -- never tombstone
+                        x = x_next if lru.in_list(x_next) else lru.get_lru_no_lock()
+                        continue
                 self.cache._evict_component_and_detach_lru(
                     x, self, target=EvictLayer.DEVICE, tracker=tracker
                 )
                 self.cache._cascade_evict(x, self, tracker)
+                # K15 review A4/B4: refresh the successor AFTER the tombstone (as the
+                # leaf branch does) -- a save that took it off the LRU restarts the
+                # walk at the LRU end, which is no longer x itself
+                if x_next is not None and not lru.in_list(x_next):
+                    x_next = lru.get_lru_no_lock()
                 x = x_next
 
     def acquire_component_lock(
