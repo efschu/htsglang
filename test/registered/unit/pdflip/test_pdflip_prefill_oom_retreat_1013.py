@@ -872,9 +872,7 @@ class MutantsTest(unittest.TestCase):
         from test_pdflip_prefill_oom_repro_1013 import WalkFollowsThePeelTest
 
         self._killed(WalkFollowsThePeelTest, ["test_6193_is_not_payable_when_the_children_it_needs_gone_are_host_locked"],
-                     # RC4 union with int24g (room-vote): the walk asks pp_slot_fidelity.demoted_node_clearable where the
-                     # source line's own walk asked pp_room_vote._remnant_clearable; same mutant, same test killed
-                     [mock.patch.object(SF, "demoted_node_clearable", lambda node, children_clearable: True)])
+                     [mock.patch.object(PR, "_remnant_clearable", lambda node, state: True)])
 
     def test_m9_the_carrierless_form_retreats_too(self):
         self._killed(RetreatTest, ["test_carrierless_the_typed_exception_propagates_and_nothing_of_the_pass_is_touched",
