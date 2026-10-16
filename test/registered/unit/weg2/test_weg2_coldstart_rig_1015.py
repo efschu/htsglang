@@ -14,6 +14,8 @@ parked host writer). After every cycle the LAW GUARDS run (``Guards``):
   G3 the idle vote turns true once the work is done (no W3);
   G4 no referenced arena page loses its key; a read lands what it was told to land; a live writer's reference on
      its claim survives a take-over (G4c, the slot keeps its generation).
+  G10 (S10) an abort PP0 decided reaches every stage on the same pass PP0 ran: no stage pops a rid a frame
+     still names (#1180), none computes on a rid PP0 aborted (leak), none releases it twice.
 
 A guard that fires is a group stop by name -- the rig never repairs, never retries, never compensates (hard user
 law raenge-nie-uneins-crash-stop): a detected disagreement is RED, full stop.
@@ -39,6 +41,10 @@ SCENARIOS (one test each, ``test_S<n>_...``; the runner ``tools/weg2_coldstart_r
       arena full and pinned by the peers, a 210k load-back executed on a follower (h16n 07:30:35) red on 4f58ca0256,
       17c2563647 and 853534a9ff (the defect is latent since 8f2fe84949; h16h never refused a P claim at the metal)
       + G5 ROW-ROOM: the follower pays the room PP0's row needs (no ROW-ROOM SHORT, no PrefillOutOfPages)
+  S10 K14: a client abort (H102) reaches the followers before PP0's row frame that names the rid (h16p
+      21:52:38Z weg2-164-2265, #1180 RANK_EXCEPTION)                                          red on 1cfbf32584 (h16q2)
+      (+ S10b PP0 had not admitted it, S10c chunked first chunk) -- G1 + G10 ABORT-UNIFORM: every stage that ran
+      the frame's pass carries PP0's abort, no stage keeps the rid queued or held afterwards
 
 WHAT IS REAL. The tree's own code wherever the death lived: the frameless branch of ``_event_loop_pp_body`` is cut
 out of THIS tree's source and executed (so whatever the tree runs there runs here); every ``_weg2_vote_*`` hook, the
@@ -2529,3 +2535,216 @@ def test_selfcheck_S9_l3_drop_off_is_row_room_short(tmp_path, monkeypatch):
     monkeypatch.setenv("SGLANG_WEG2_L3_DROP", "0")
     with pytest.raises(LawViolation, match="G5"):
         test_S9_arena_full_pinned_row_room(tmp_path, monkeypatch)
+
+
+# =====================================================================================================================
+# S10 -- K14: a client abort while PP0's row frame names the rid (NF h16p death 15.10. 21:52:38Z, weg2-164-2265)
+# =====================================================================================================================
+# PP0 admitted weg2-164-2265 into slot 2 (#969N ADMIT fwd_ct=346) and launched it; the front's H102 client-gone abort
+# reached PP0 one pass later, PP0 forwarded it (#1460 CTRL-FWD) and set to_finish on its in-flight request. The chain
+# delivered the AbortReq to PP1/PP2 BEFORE their slot-2 frame (two wires, no cross-wire order), they still queued the
+# rid and popped it at receipt; the frame then named a rid they no longer had: #631 ROW-PROBE DEFER x3 ->
+# PpRowDeferCapExceeded (#1180) -> RANK_EXCEPTION. Real code: ``Scheduler.abort_request`` / ``_abort_request_now`` /
+# ``process_pending_chunked_abort``, the probe ``SchedulerPPMixin._pp_proxy_frame_pending``, the PP0 stamp the tree's
+# ``_pp_forward_and_process_input_requests`` calls before its send (looked up by name in that source), and the
+# after-plan settle the tree's ``_event_loop_pp_body`` runs after ``_pp_void_pass.after_plan`` (looked up the same way).
+# Modelled: the plan's admission (the rid leaves the waiting queue into the slot's microbatch), no forward.
+#   G1  the slot-2 pass executes the same rids on every stage;
+#   G10 ABORT-UNIFORM: every stage that ran the pass carries PP0's abort on the rid (to_finish / chunked abort), and
+#       after the settle no stage keeps the rid queued or held (no live leftover = no KV/slot leak, no second release).
+
+S10_RID, S10_OTHER, S10_SLOT, S10_EPOCH = "weg2-164-2265", "weg2-164-2266", 2, 165
+
+
+class _Req10(SimpleNamespace):
+    __hash__ = object.__hash__
+    __eq__ = object.__eq__
+
+
+def _req10(rid=S10_RID):
+    return _Req10(rid=rid, to_finish=None, finished_reason=None, mamba_pool_idx=None, req_pool_idx=0,
+                  kv_committed_freed=True, finished=lambda: False,
+                  time_stats=SimpleNamespace(trace_ctx=SimpleNamespace(abort=lambda **k: None)))
+
+
+def _s10_modules():
+    from sglang.srt.managers import scheduler as SM
+    from sglang.srt.managers import scheduler_pp_mixin as PPM
+    from sglang.srt.managers.io_struct import AbortReq
+    from sglang.srt.weg2 import pp_abort as PA
+
+    for name in ("_pp_proxy_frame_pending", "_pp_forward_and_process_input_requests", "_event_loop_pp_body"):
+        if not hasattr(PPM.SchedulerPPMixin, name):
+            raise RigError(f"SchedulerPPMixin.{name} is gone -- S10 cannot drive this tree")
+    return SM, PPM, AbortReq, PA
+
+
+def _s10_wired():
+    """(stamp_fn or None, settle_after_plan) as THIS tree wires them."""
+    SM, PPM, _, PA = _s10_modules()
+    fwd = inspect.getsource(PPM.SchedulerPPMixin._pp_forward_and_process_input_requests)
+    send = "self.send_req_work = self._pp_send_pyobj_to_next_stage("
+    if send not in fwd:
+        raise RigError("the request-chain send is gone from _pp_forward_and_process_input_requests")
+    stamp = None
+    for name in [n for n in dir(PA) if "stamp" in n and "abort" in n and callable(getattr(PA, n))]:
+        if name in fwd and fwd.index(name) < fwd.index(send):
+            stamp = getattr(PA, name)
+    body = inspect.getsource(PPM.SchedulerPPMixin._event_loop_pp_body)
+    anchor = "_pp_void_pass.after_plan(self, mb_id)"
+    settle = False
+    if anchor in body:
+        tail = body[body.index(anchor):body.index(anchor) + 1500]
+        settle = "_weg2_resolve_waiting_aborts" in tail and hasattr(SM.Scheduler, "_weg2_resolve_waiting_aborts")
+    return stamp, settle
+
+
+def _s10_stage(monkeypatch, pp_rank):
+    SM, PPM, _, _ = _s10_modules()
+    monkeypatch.setattr(SM, "prepare_abort", lambda req, why: setattr(req, "aborted_why", why))
+    monkeypatch.setattr(SM, "release_kv_cache", lambda *a, **k: None)
+    S = SM.Scheduler
+    sent = []
+    st = SimpleNamespace(
+        ps=SimpleNamespace(pp_rank=pp_rank, pp_size=WORLD, tp_size=1),
+        chunked_req=None, _pending_chunked_abort_req=None, _pending_chunked_abort_delay=0,
+        _pp_scheduled_extents=lambda: None, waiting_queue=[], running_mbs=[None] * WORLD, mbs=[None] * WORLD,
+        running_batch=None, last_batch=None, kv_session_offload=None, disaggregation_mode=None,
+        enable_hicache_storage=False, grammar_manager=SimpleNamespace(abort_requests=lambda r: None),
+        _weg2_abort_dormant_hold=lambda r: 0, _weg2_d_park_abort=lambda r: 0,
+        tree_cache=SimpleNamespace(supports_mamba=lambda: False),
+        ipc_channels=SimpleNamespace(send_to_tokenizer=SimpleNamespace(send_output=lambda o, r: sent.append(o.rid))),
+        pp_group=object(), _pp_row_chain_owed=False, _pp_flip_epoch=lambda: S10_EPOCH,
+        _weg2_store_told_armed=False, _weg2_store_told={}, _weg2_store_held={}, sent=sent,
+    )
+    st._abort_request_now = lambda r: S._abort_request_now(st, r)
+    if hasattr(S, "_weg2_resolve_waiting_aborts"):
+        st._weg2_resolve_waiting_aborts = lambda pp0_drained=False: S._weg2_resolve_waiting_aborts(
+            st, pp0_drained=pp0_drained)
+    st.process_pending_chunked_abort = lambda: S.process_pending_chunked_abort(st)
+    return st
+
+
+def _s10_frame(rid):
+    _, PPM, _, _ = _s10_modules()
+    row = (rid, 0, 1, True, False, None, None, False, None, (), None)
+    return {"__stamp__": (S10_SLOT, 347, 265, S10_EPOCH, 347, (rid, 60736, 61001)),
+            PPM._ADMISSION_DECISION_PAYLOAD_KEY: (S10_SLOT, (row,))}
+
+
+def _s10_probe(monkeypatch, st, inbox):
+    _, PPM, _, _ = _s10_modules()
+    monkeypatch.setattr(PPM, "resolve_src", lambda group, x: 0)
+    monkeypatch.setattr(PPM, "typed_inbox", lambda group: {(0, "proxy"): inbox})
+    return PPM.SchedulerPPMixin._pp_proxy_frame_pending(st, S10_SLOT)
+
+
+def s10_client_abort_during_row_frame(monkeypatch, *, pp0_admitted=True, chunked=False):
+    """One P group, the 21:52:38 order. Raises LawViolation (red) or returns the stages (green)."""
+    SM, PPM, AbortReq, PA = _s10_modules()
+    from sglang.srt.weg2 import p_row_authority
+
+    if not p_row_authority.applies(SimpleNamespace(ps=SimpleNamespace(pp_size=WORLD, pp_rank=1))):
+        pytest.skip("n/a: the NF form of this tree runs P without the row authority (no row frame)")
+    S = SM.Scheduler
+    stamp, settle = _s10_wired()
+    pp0 = _s10_stage(monkeypatch, 0)
+    r0 = _req10()
+    if pp0_admitted:
+        pp0.mbs[S10_SLOT] = SimpleNamespace(reqs=[r0])           # #969N ADMIT slot=2, launched
+        if chunked:
+            pp0.chunked_req = r0
+    else:
+        pp0.waiting_queue = [r0]                                 # still queued on PP0: no frame names it
+    fol = [_s10_stage(monkeypatch, r) for r in range(1, WORLD)]
+    reqs = [_req10() for _ in fol]
+    for st, r in zip(fol, reqs):
+        st.waiting_queue = [r]                                   # chain hop landed, frame not yet consumed
+    wire = [AbortReq(rid=S10_RID)]                               # H102 client-gone
+    if stamp is not None:
+        wire = stamp(pp0, wire)                                  # #1460 CTRL-FWD (the tree's stamp, if wired)
+    try:
+        S.abort_request(pp0, wire[0])
+        for st in fol:
+            S.abort_request(st, wire[0])                         # chain before the slot-2 frame
+    except Exception as exc:  # noqa: BLE001
+        raise _group_stop(exc) from exc
+    frame_rid = S10_RID if pp0_admitted else S10_OTHER
+    executed = [[S10_RID] if pp0_admitted else []]
+    for st, r in zip(fol, reqs):
+        if not pp0_admitted:
+            st.waiting_queue.append(_req10(S10_OTHER))
+        inbox = [_s10_frame(frame_rid)]
+        try:
+            ok = False
+            for _ in range(8):                                   # past the #1180 lap cap
+                if _s10_probe(monkeypatch, st, inbox):
+                    ok = True
+                    break
+        except Exception as exc:  # noqa: BLE001 -- PpRowDeferCapExceeded: the 21:52:38 group stop
+            raise _group_stop(exc) from exc
+        if not ok:
+            raise LawViolation("G1 RAENGE-NIE-UNEINS", f"PP{st.ps.pp_rank} never executes the slot-2 frame")
+        # the plan executes PP0's row: the named rid leaves the waiting queue into the slot's microbatch
+        got = [q for q in st.waiting_queue if q.rid == frame_rid]
+        st.waiting_queue = [q for q in st.waiting_queue if q.rid != frame_rid]
+        st.mbs[S10_SLOT] = SimpleNamespace(reqs=got)
+        if chunked and got:
+            st.chunked_req = got[0]
+        if settle:
+            st._weg2_resolve_waiting_aborts()                    # the tree's after-plan settle
+        executed.append([q.rid for q in got] if pp0_admitted else [])
+    Guards.same_admission(f"slot {S10_SLOT} (rid {S10_RID})", [list(e) for e in executed],
+                          what="aborted rid in the frame's pass")
+    # G10: every stage carries PP0's abort, nothing of the rid is left queued or held
+    pp0_abort = r0.to_finish is not None or pp0._pending_chunked_abort_req is r0 or r0 not in pp0.waiting_queue
+    bad = []
+    for st, r in zip(fol, reqs):
+        carries = r.to_finish is not None or st._pending_chunked_abort_req is r
+        left = [q.rid for q in st.waiting_queue if q.rid == S10_RID]
+        held = dict(getattr(st, "_weg2_pp_held_waiting_aborts", None) or {})
+        if pp0_admitted and (not carries or left or held):
+            bad.append((f"PP{st.ps.pp_rank}", carries, left, sorted(held)))
+        if not pp0_admitted and (left or held):
+            bad.append((f"PP{st.ps.pp_rank}", "queued-after-abort", left, sorted(held)))
+    if not pp0_abort or bad:
+        raise LawViolation("G10 ABORT-UNIFORM",
+                           f"PP0 aborted={pp0_abort}; stages without PP0's abort on {S10_RID} "
+                           f"(stage, carries, still queued, still held): {bad} -- the follower would compute the "
+                           "rid PP0 finished (KV/slot leak) or release it a second time")
+    return pp0, fol
+
+
+def test_S10_client_abort_during_row_frame(monkeypatch):
+    """K14 (h16p 21:52:38Z): the abort reaches the followers before the frame that names the rid."""
+    s10_client_abort_during_row_frame(monkeypatch)
+
+
+def test_S10b_client_abort_pp0_had_not_admitted(monkeypatch):
+    """Gegenprobe: PP0 still queued the rid -- every stage drops it at receipt, the frame names another rid."""
+    s10_client_abort_during_row_frame(monkeypatch, pp0_admitted=False)
+
+
+def test_S10c_client_abort_during_chunked_row_frame(monkeypatch):
+    """The first chunk's frame names the rid: the followers' chunked abort follows PP0's schedule (#791C)."""
+    s10_client_abort_during_row_frame(monkeypatch, chunked=True)
+
+
+def test_selfcheck_S10_rank_local_pop_is_the_1180_death(monkeypatch):
+    """The abort applied rank-locally at receipt again -> the 21:52:38 group stop (#1180)."""
+    from sglang.srt.weg2 import pp_abort as PA
+
+    if hasattr(PA, "hold_waiting_abort"):
+        monkeypatch.setattr(PA, "hold_waiting_abort", lambda s, r: False)
+    with pytest.raises(LawViolation, match="GRUPPENSTOPP|G1"):
+        test_S10_client_abort_during_row_frame(monkeypatch)
+
+
+def test_selfcheck_S10_held_abort_never_applied_is_g10(monkeypatch):
+    """The held abort never applied after the admitting plan -> the follower computes the rid PP0 aborted (G10)."""
+    from sglang.srt.weg2 import pp_abort as PA
+
+    if hasattr(PA, "waiting_abort_verdict"):
+        monkeypatch.setattr(PA, "waiting_abort_verdict", lambda still, drained: "keep")
+    with pytest.raises(LawViolation, match="GRUPPENSTOPP|G1|G10"):
+        test_S10_client_abort_during_row_frame(monkeypatch)
