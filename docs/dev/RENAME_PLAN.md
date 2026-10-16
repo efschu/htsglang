@@ -1025,3 +1025,20 @@ Heads before: 27B `desk/flliper-27b-int-1015` @ 524a880606, NF `desk/flliper-nf-
 
 **Not proven.** No metal and no boot of a fLLiper image in this round; every fix of section 4e of the release notes is proven by tests only.
 
+## 8.27 F0-H round 6 (RC5), the NF steady state h16s (16.10.2026, NF line; build fixes on both lines)
+
+Heads before: 27B `desk/flliper-27b-int-1016` @ 671961d63b, NF `desk/flliper-nf-int-1015` @ 6bcc644778. Heads after: 27B `desk/flliper-27b-int-1017`, NF `desk/flliper-nf-int-1016` (SHAs: `git log` of the branches). RC5.
+
+**Source** (old naming scheme): the NF steady state `desk/nf-h16s-int-1016` @ 5c51b91fa2 = int24f8 `f4afb10f28` + 125 non-merge commits in 28 first-parent merges (h1 ... h16, Row-Authority h16p, h16q2, h16s). The RC4 source union `1ab5f9a0cf` (int24f8 + int24g) is not an ancestor; h16s does not carry int24g.
+
+**Procedure for a large delta.** One tool commit carries the delta (`b1aed7210f`, local branch `desk/flliper-rc5-srcdelta-1016`: tree = h16s, parent = `1ab5f9a0cf`); `drive.py` of the round-4c/5 tools ports it once (parent and fix version of every touched path through the kit, three-way merge into the tree, no hand renaming). 211 files: 115 merged clean, 94 new, 5 deleted, 3 conflicts (edge numbering: the source's K138 is **K139** here; the H88 test, not in this tree, skipped). TM +6 before the port (six German log / help units without a TM hit). The delta from the union to h16s removes int24g from the NF tree (wedge, room-vote, three minors) and restores prefilloom's own walk.
+
+**Byte proof.** 202 of 211 delta files equal the pipeline output of h16s; the other 9 differ only by the hunks the RC4 tree had against the pipeline output of the RC4 source, with the same hunk counts (`environ.py`, `hicache_storage.py`: H88 not in this tree; `scheduler.py`: one RC3 comment; `profile_catalog_curated.py`: the 27B switch text of RC4 fix round 1; `kantenkatalog_1004.json` and the three edge tests: numbering; `test_pdflip_lanes_l5_1008`: edge ids).
+
+**Hand steps (NF, one commit each):** edge-count pins K139 (1), RC4 hand step 5 reverted (2), vision wiring pin with the LB-VERDICT composition (3), capacity-park precondition pin with `priority` (4), redaction pin with `FLLIPER_PDFLIP_PRESENCE_FETCH_KEY` (5), planner golden `golden/nf/plan_nf_abl_n3.txt` with `FLLIPER_PDFLIP_TOLD_GROUP_FALLBACK=1` (6, dump before / after, only the stable lines). 3 to 5 are red on the h16s source as well.
+
+**Build fixes.** Both heads merge their build-fix branch (NF `6b3ade963e`, 27B `53fdd41aed`): one conflict each in `make_flat_ctx.sh`, resolved to the revision-based container-tool copy; `docker/flliper/` byte-equal on both heads. The 27B head gets the dashboard pins of the RC5 catalog (139 / 52 / 87, redaction list) and the documentation; no other 27B change.
+
+**Catalog.** Built once as the union with the generator of the NF head (two runs byte-equal, key order by `catalog_order_merge_1008.py`, `--rev-27b 6dcee97340`, `--rev-nf a33135c9b7`): sha256 `b60205cfc18ed843eeb3a53b68e545aae5117d57bacb50b68ef54de881b546ca`; 2790 entries, 139 edges (merged 52, new 87, without evidence 25), edge anchors NF 84 / 10 / 45 (other line), 27B tree file 122 / 12.
+
+**Not proven.** No metal and no boot of a fLLiper image in this round; the h16s code is proven on the NF metal under the old name, the port by tests only.
