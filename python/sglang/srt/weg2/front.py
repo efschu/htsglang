@@ -1204,16 +1204,19 @@ def x_requeue_capped(x_requeues: int) -> bool:
     return int(x_requeues) > X_REQUEUE_CAP
 
 
-def leg1_early_candidates(queue, limit: int) -> list:
+def leg1_early_candidates(queue, limit: int, skip=None) -> list:
     """The queue head the P drain would dispatch first (at most ``limit``):
     a leg 1 to run (not CARRIER-EXCEEDS, not D-direct), its client still
-    there, none already in flight."""
+    there, none already in flight. ``skip(p)`` True = not a P leg 1 either
+    (X-GESETZ F-X 16.10.: a SHORT D owns -- the drain's sweep holds it for D)."""
     out = []
     for p in list(queue):
         if len(out) >= max(0, int(limit)):
             break
         if (getattr(p, "skip_leg1", False) or getattr(p, "d_direct", False)
                 or getattr(p, "client_gone", False) or getattr(p, "_leg1_early", None) is not None):
+            continue
+        if skip is not None and skip(p):
             continue
         out.append(p)
     return out
@@ -2889,7 +2892,8 @@ def _eb_reroute_enabled(env=None) -> bool:
 
 
 def p_phase_arrival(awake: str, state: str, flip_dst: Optional[str]) -> bool:
-    """P-BATCH-ALL: an arrival in a P phase -- P awake (serving or flipping
+    """An arrival in a P phase (X-GESETZ F-X 16.10.: a SHORT arriving then is held
+    for D; was P-BATCH-ALL: it joined P's batch) -- P awake (serving or flipping
     away: the flip to D has not begun when ``flip_dst`` is not D), or D
     flipping to P. The cut-off is the begin of the P->D flip
     (``state == "flipping"`` and ``flip_dst == "D"``): from then on the
@@ -3789,8 +3793,9 @@ class Pending:
     #: SK (#243, NF rc12r weg2-12-39 / weg2-13-44): a SHORT verdict with a
     #: measured D presence that fell through to the queue IN A D PHASE (gate
     #: timeout, seats): kept for D -- no leg 1 -- and re-priced at its D
-    #: admission when a flip lay between. P-BATCH-ALL (02.10.): never while
-    #: P is awake; a P drain gives a kept SHORT its leg 1 back.
+    #: admission when a flip lay between. X-GESETZ F-X (16.10., lifts P-BATCH-ALL
+    #: of 02.10. for SHORTs): also every SHORT held for D in a P phase; a P drain
+    #: leaves it in D's line (only a re-price over X sends it to P).
     short_kept: bool = False
     #: VISION-SHORT-1014 (NF h13 weg2-20-129): a SHORT whose credit is D's OWN
     #: (src d_*) and which the shared store cannot serve to P (the arrival's
@@ -3798,6 +3803,14 @@ class Pending:
     #: phase: P-BATCH-ALL's premise ("the prefix read from the shared store")
     #: does not hold for it. P's drain never takes it (_p_batch_takes_d_prefill).
     d_presence_only: bool = False
+    #: X-GESETZ F-X (user 16.10. over the 12.10. X-SUM law): DECODE-COLLECT released this
+    #: request to P as part of a set whose SUM of SHORTs is over X with no P-bound member
+    #: (the pure X-SUM release). The only SHORT P still prefills; the P-phase hold for D
+    #: (:meth:`Front._x_law_d_short`) never takes it.
+    x_sum_p: bool = False
+    #: X-GESETZ F-X: the P drain's ``one`` held this SHORT for D (no leg 1); its ``_on_leg1_done``
+    #: appends it to D's line instead of counting a P prefill. Set and cleared inside one drain.
+    x_hold_drain: bool = False
     #: SK: the front epoch the price was taken in.
     price_epoch: int = -1
     #: SK-X (W35 class, NF rc12t weg2-6-30): D refused this kept SHORT before
@@ -7965,6 +7978,18 @@ class Front:
                                "unstarted but its stream is committed or not streamed -- it stays "
                                "held, D prefills it after the flip)", rid)
                 continue
+            # X-GESETZ F-X (user 16.10.): a D-prefill leg priced under X is D's -- it stays
+            # held (the lookahead keeps reading the one stream, ROS-1P) and D extends it after
+            # the flip (law 4; D-NORECOMPUTE lets a D-direct leg under its front X through,
+            # F-D). Only a leg the front did not price under X is handed back to P.
+            _fp = self._front_price.get(rid)
+            _x = int(self.tp_prefill_max_tokens or 0)
+            if _fp is not None and _x > 0 and 0 <= int(_fp) <= _x:
+                self.counters["park_handback_x_law"] = self.counters.get("park_handback_x_law", 0) + 1
+                logger.warning("WEG2 PARK-HANDBACK rid=%s kept=x_law price=%d X=%d (a D-prefill leg under X "
+                               "stays held on D, D extends it after the flip -- X-GESETZ 16.10., law 4; no "
+                               "leg 1 on P)", rid, int(_fp), _x)
+                continue
             self._rvp_requeue[rid] = {"rid": rid, "reason": PARK_HANDBACK_REASON,
                                       "d_extent": int(self._front_price.get(rid, 0) or 0),
                                       "x": int(self.tp_prefill_max_tokens)}
@@ -8018,6 +8043,11 @@ class Front:
         except Exception as e:  # noqa: BLE001
             return web.json_response({"error": f"{type(e).__name__}: {e}"}, status=503)
         self._mark_posted(p)
+        if p.d_direct:
+            # X-GESETZ F-X: held for D (no leg 1 ran) -- the D-direct leg 2, like the arrival's
+            if getattr(p, "x_decision", None) is not None:
+                Front._note_x_decision(self, rid, *p.x_decision)
+            return await self.leg2(request, rid, payload, text, stream, pending=None, seat=p.seat)
         return await self.leg2(request, rid, payload, text, stream, pending=p, seat=p.seat)
 
     def _to_p_batch(self, p: "Pending", where: str) -> None:
@@ -8035,14 +8065,64 @@ class Front:
                     "under the E2 contract, d_compute=0)", p.rid, was, where,
                     int(getattr(p, "est_uncached", 0) or 0), self.epoch)
 
+    def _x_law_d_short(self, p: "Pending") -> bool:
+        """X-GESETZ F-X (user 16.10.: "aktuell wird in P DEUTLICH unter der X-Schwelle geprefillt"):
+        ``p`` is D's by the X law -- a request under X that no rule binds to P. It is prefilled on D,
+        never given a leg 1 on P; in a P phase it is HELD for D (``_ready_for_d``, ``d_direct``).
+
+        P takes only: over X (:func:`phase_policy.needs_p` read WITHOUT the ``skip_leg1`` exemption --
+        a kept SHORT whose re-price went over X is P's), routed to P on a smaller X_busy (#246b),
+        ``x_deferred``, refused over X by D (W31, ``x_requeues``) or re-routed by name (``reroutes``),
+        ``p_only`` (an image, W102), RESUME-VIA-P, and the pure X-SUM release of DECODE-COLLECT
+        (``x_sum_p``, user 12.10.). A request whose leg 1 ran is a hand-over, not a prefill.
+        Replaces P-BATCH-ALL's "while P is awake every prefill is collected on P" (fc98fce9e2) for
+        SHORTs; reads ``Pending``'s fields by name (partial test doubles)."""
+        def _g(k, d=None):
+            return getattr(p, k, d)
+        if (_g("leg1_done", False) or _g("resume_via_p", False) or _g("p_only", False)
+                or _g("x_sum_p", False) or _g("intake_stalled", False) or _g("client_gone", False)
+                or _g("lane_p_taken", False) or int(_g("reroutes", 0) or 0) > 0
+                or _g("sk_void_seq") is not None):
+            return False  # sk_void_seq: D refused it before the first byte, only fresh D evidence re-prices it
+        fut = _g("fut")
+        if fut is not None and fut.done():
+            return False
+        x = int(getattr(self, "tp_prefill_max_tokens", 0) or 0)
+        if x <= 0:
+            return False
+        return not phase_policy.needs_p(
+            int(_g("est_uncached", 0) or 0), x, skip_leg1=False, leg1_done=False, p_only=False,
+            x_requeues=int(_g("x_requeues", 0) or 0), x_deferred=bool(_g("x_deferred", False)),
+            x_routed=int(_g("x_routed", 0) or 0))
+
+    def _x_hold_for_d(self, p: "Pending", where: str, append: bool = True) -> None:
+        """X-GESETZ F-X: ``p`` (a SHORT, :meth:`_x_law_d_short`) waits for D -- no leg 1 on P, D's own
+        admission line (``_ready_for_d``; the D admitter takes it by the order key PRIO-AS-AGE once D is
+        awake and re-prices a kept one, SK). ``append=False``: the caller appends it itself."""
+        p.d_direct = True
+        p.skip_leg1 = True
+        p.short_kept = True
+        p.leg1_done = False
+        self.counters["x_law_hold_d"] = self.counters.get("x_law_hold_d", 0) + 1
+        if append:
+            self._ready_for_d.append(p)
+            self._sync_batch_gate()
+        logger.info("WEG2 X-LAW-HOLD-D rid=%s where=%s est_uncached=%d X=%d awake=%s epoch=%d -- under X: "
+                    "D prefills it (X-GESETZ 16.10.), held in D's admission line, no leg 1 on P",
+                    p.rid, where, int(getattr(p, "est_uncached", 0) or 0), int(self.tp_prefill_max_tokens),
+                    self.awake, self.epoch)
+
     def _p_batch_takes_d_prefill(self) -> int:
-        """P-BATCH-ALL (user 02.10.): at the start of a P drain, every request
-        still waiting for a D PREFILL -- a D-phase decision (SK SHORT-KEPT,
-        D-SHORT-DRAIN, ARRIVAL-SEAT QUEUED-SHORT / SHORT-IN-FLIP, X-IDLE-REGRANT:
-        ``d_direct``, no leg 1 ran) that D did not admit before the D->P flip
-        -- leaves ``_ready_for_d`` for P's queue, in arrival order. Queued kept
-        SHORTs get their leg 1 back. A request P already prefilled
-        (``leg1_done``, not ``d_direct``) stays. Returns the number moved."""
+        """At the start of a P drain (X-GESETZ F-X, user 16.10.; was P-BATCH-ALL of 02.10.):
+
+        * from ``_ready_for_d`` P takes ONLY a D-direct entry (no leg 1 ran) that the X law binds to P
+          (over X, x_routed / x_deferred / x_requeues, :meth:`_x_law_d_short` False). Every SHORT stays
+          in D's line -- D prefills it after the flip back (was: every D-direct entry went to P);
+        * from the queue every SHORT D owns by the X law moves into D's line (held for D), so P's
+          drain never gives it a leg 1 (was: a queued kept SHORT got its leg 1 back).
+
+        ``p_only`` and RESUME-VIA-P entries stay where they are, as before. Returns the number of
+        entries that went to P's queue (the SHORTs moved to D are counted ``x_law_hold_d``)."""
         moved = []
         ready = getattr(self, "_ready_for_d", None)
         if ready:
@@ -8050,10 +8130,8 @@ class Front:
             for p in ready:
                 if (getattr(p, "d_direct", False) and not getattr(p, "resume_via_p", False)
                         and not getattr(p, "p_only", False)
-                        # VISION-SHORT-1014: D's own presence, the store cannot give it to P
-                        and not (getattr(p, "d_presence_only", False)
-                                 and getattr(p, "short_kept", False))
-                        and (getattr(p, "fut", None) is None or not p.fut.done())):
+                        and (getattr(p, "fut", None) is None or not p.fut.done())
+                        and not Front._x_law_d_short(self, p)):
                     moved.append(p)
                 else:
                     keep.append(p)
@@ -8066,12 +8144,14 @@ class Front:
                 self.queue.clear()
                 self.queue.extend(merged)
                 self._sync_batch_gate()
-        n = len(moved)
-        for p in self.queue:
-            if getattr(p, "short_kept", False):
-                self._to_p_batch(p, "queue")
-                n += 1
-        return n
+        held = [p for p in list(self.queue) if Front._x_law_d_short(self, p)]
+        for p in held:
+            try:
+                self.queue.remove(p)
+            except ValueError:
+                continue
+            Front._x_hold_for_d(self, p, "p_drain_start")
+        return len(moved)
 
     def _d_inflight_presence(self, rid: str, text: str, pending: Any, via: str) -> int:
         """X-CREDIT-INFLIGHT-1002 (switch SGLANG_WEG2_ENABLE_D_INFLIGHT_PRESENCE).
@@ -10502,79 +10582,80 @@ class Front:
         # tokens again on P for an uncached remainder of 186). It keeps its
         # queue place, skips leg 1 and waits for D; its D admission re-prices
         # it if a flip lay between (see _sk_admission_reprice).
-        # P-BATCH-ALL (user 02.10. ~07:45Z, strict phase batch): the SHORT
-        # price only decides whether a D phase wakes P. While P is awake or
-        # waking, EVERY prefill joins P's batch -- its prefix comes from the
-        # shared store (L2/L3, written by either group), never "kept for D"
-        # (y6x weg2-15-52: kept, D prefilled 207 tokens after the P->D flip
-        # with three decodes stalled behind it). SK keeps only a D-phase
-        # fall-through.
+        # X-GESETZ F-X (user 16.10.: "aktuell wird in P DEUTLICH unter der X-Schwelle
+        # geprefillt"): a request under X is prefilled on D. A SHORT that arrives while
+        # P is awake or waking (or beside a LONG that flips D to P, PRICE-BARRIER) is
+        # HELD for D -- D's admission line, no leg 1 on P -- and D prefills it after the
+        # flip back. P takes only over X, p_only and the pure X-SUM release. This lifts
+        # P-BATCH-ALL (02.10., fc98fce9e2: "while P is awake every prefill is collected
+        # on P") for SHORTs; its y6x cost (D prefills after the flip, decodes behind it)
+        # is the price the 16.10. order accepts.
         _p_phase = p_phase_arrival(self.awake, self.state, getattr(self, "_flip_dst", None))
         # X-SUM-PRICE (user 12.10.): DECODE-COLLECT released this SHORT's set to P (its sum is
         # over X). That verdict is final -- SK must not turn it into "kept for D": on 12.10.
         # 21:01:07Z four requests (sum 11724 > X 8095) were released route=P, SHORT-KEPT at once
         # and prefilled on D, and a fifth (7871, priced alone) followed: 19595 on D, X = 8095.
+        # X-GESETZ F-X: since 16.10. a release with a P-bound member hands its fitting SHORTs to
+        # D (``_decode_collect``), so "collect_p" now means the pure X-SUM release only.
         _collect_p = "collect_p" in short_refused
         if _collect_p:
             short_refused.remove("collect_p")  # not a D refusal: d_eligible / x_deferred keep their meaning
             self.counters["collect_p_not_kept"] += 1
-            logger.info("WEG2 COLLECT-P-QUEUED rid=%s uncached=%d X=%d epoch=%d: DECODE-COLLECT sent the "
-                        "set to P (sum over X) -- queued BATCH, the flip takes it; not SHORT-KEPT for D",
+            logger.info("WEG2 COLLECT-P-QUEUED rid=%s uncached=%d X=%d epoch=%d cause=x_sum: DECODE-COLLECT "
+                        "released this SHORT's set to P because the SUM of its SHORTs is over X with no "
+                        "P-bound member (user 12.10. X-SUM) -- queued BATCH, the flip takes it; not held for D",
                         rid, remainder, int(self.tp_prefill_max_tokens), self.epoch)
         _sk = (short_ok and _short_keep_enabled() and int(store_span or 0) > 0
                and not short_refused and presence_src not in ("", "none", None)
                and not _p_phase and _pb_to_p is None and not _collect_p)
-        # VISION-SHORT-1014: in a P phase a SHORT whose credit only D holds (the
-        # store probe leaves P more than X) is kept for D, not taken into P's batch
-        _d_hold = bool(
-            short_ok and _p_phase and _short_keep_enabled() and _xx is not None
-            and int(store_span or 0) > 0 and not short_refused
-            and _pb_to_p is None and not _collect_p
+        _x_hold = bool(short_ok and (_p_phase or _pb_to_p is not None)
+                       and not short_refused and not _collect_p)
+        # VISION-SHORT-1014: a credit only D holds (the store probe leaves P more than X)
+        _d_only = bool(
+            _x_hold and _xx is not None and int(store_span or 0) > 0
             and d_presence_only_short(presence_src, int(_xx.n),
                                       int(getattr(_xx, "store_depth", 0) or 0),
                                       int(self.tp_prefill_max_tokens)))
-        if _d_hold and not d_credit_unslept(getattr(_xx, "credit_epoch", None),
+        if _d_only and not d_credit_unslept(getattr(_xx, "credit_epoch", None),
                                             self.__dict__.get("_d_slept_epoch")):
             # SHORTHOLD-EPOCH-1014 (NF h17 weg2-2-55, 15:48:05-11): D slept since it served
-            # the credit -- its device copy is gone, D would read the prefix back from the
-            # store like P (P: 192512 tokens in 8.9 s) after a flip back of its own
+            # the credit -- its device copy is gone and the store holds less than tokens - X:
+            # the SHORT price is void, the realised extent is over X on either group -> LONG, P
             self.counters["short_hold_d_stale"] += 1
+            _stale_ext = int(_xx.n) - int(getattr(_xx, "store_depth", 0) or 0)
             logger.info("WEG2 SHORT-HOLD-D STALE rid=%s src=%s credit_epoch=%s d_slept_epoch=%s -- D slept "
-                        "since it served this credit (its device copy is gone): P's batch, the prefix from "
-                        "the store (SHORTHOLD-EPOCH-1014)", rid, presence_src,
-                        getattr(_xx, "credit_epoch", None), self.__dict__.get("_d_slept_epoch"))
-            _d_hold = False
+                        "since it served this credit (its device copy is gone): the extent is %d > X=%d on "
+                        "either group, so P's batch, the prefix from the store (SHORTHOLD-EPOCH-1014)", rid,
+                        presence_src, getattr(_xx, "credit_epoch", None), self.__dict__.get("_d_slept_epoch"),
+                        _stale_ext, int(self.tp_prefill_max_tokens))
+            remainder = max(int(remainder), _stale_ext)
+            short_ok = False
+            route = "long"
+            _x_hold = _d_only = False
+        _d_hold = _x_hold
         if _d_hold:
             _sk = True
         if _pb_to_p is not None:
-            # PRICE-BARRIER: priced beside a LONG that flips D to P -- the SHORT
-            # joins that P phase's batch (leg 1 on P, prefix from the shared
-            # store) instead of a D extend the flip would park at once.
+            # PRICE-BARRIER: priced beside a LONG that flips D to P -- no D extend
+            # the flip would park at once; X-GESETZ F-X: and no leg 1 on P either,
+            # the SHORT is held for D and D prefills it after the flip back.
             self.counters["price_barrier_to_p"] += 1
-            logger.info("WEG2 PRICE-BARRIER rid=%s outcome=to_p sibling=%s sibling_uncached=%d "
-                        "uncached=%d waited_ms=%.0f -- a LONG over X was priced beside this SHORT: "
-                        "it joins P's batch with it (no D extend, no park; SGLANG_WEG2_PRICE_BARRIER)",
+            logger.info("WEG2 PRICE-BARRIER rid=%s outcome=hold_d sibling=%s sibling_uncached=%d "
+                        "uncached=%d waited_ms=%.0f -- a LONG over X was priced beside this SHORT: it "
+                        "waits in D's line through that P phase (no D extend the flip would park, no "
+                        "leg 1 on P: X-GESETZ 16.10.; SGLANG_WEG2_PRICE_BARRIER)",
                         rid, _pb_to_p[0], int(_pb_to_p[1]), remainder, _pb_waited_ms)
         elif _d_hold:
             self.counters["short_hold_d"] += 1
-            logger.info("WEG2 SHORT-HOLD-D rid=%s: SHORT verdict (uncached=%d presence=%d src=%s) "
-                        "arrived while P is %s -- KEPT for D, not P's batch: the credit is D's own "
-                        "and the shared store holds store_depth=%d of tokens=%d, so P would prefill "
-                        "%d > X=%d (mm=%d; VISION-SHORT-1014, NF h13 weg2-20-129)",
-                        rid, remainder, store_span, presence_src,
+            logger.info("WEG2 SHORT-HOLD-D rid=%s why=%s: SHORT verdict (uncached=%d presence=%d src=%s) "
+                        "arrived while P is %s -- KEPT for D, no leg 1 on P: under X D prefills it "
+                        "(X-GESETZ 16.10.)%s", rid, "d_presence_only" if _d_only else "x_law",
+                        remainder, store_span, presence_src,
                         "awake" if self.awake == "P" else "waking",
-                        int(getattr(_xx, "store_depth", 0) or 0), int(_xx.n),
-                        int(_xx.n) - int(getattr(_xx, "store_depth", 0) or 0),
-                        int(self.tp_prefill_max_tokens), int(bool(getattr(_xx, "mm", False))))
-        elif _p_phase and short_ok:
-            # L4/R-10: law 1 read literally means every arrival during a P
-            # drain is queued BATCH, SHORT ones included.  Counted here,
-            # printed by the drain (n=0 printed too), never discovered.
-            self.counters["short_behind_p"] += 1
-            logger.info("WEG2 SHORT-TO-P rid=%s: SHORT verdict (uncached=%d presence=%d src=%s) "
-                        "arrived while P is %s -- joins P's batch (leg 1 on P, the prefix read "
-                        "from the shared store)", rid, remainder, store_span, presence_src,
-                        "awake" if self.awake == "P" else "waking")
+                        ("" if not _d_only else
+                         "; the credit is D's own and the shared store holds store_depth=%d of tokens=%d "
+                         "(mm=%d; VISION-SHORT-1014)" % (int(getattr(_xx, "store_depth", 0) or 0), int(_xx.n),
+                                                         int(bool(getattr(_xx, "mm", False))))))
         elif self.awake == "D" and not short_ok:
             # L5: a BATCH arrival during a D phase -- named and left; it is
             # served by the NEXT P phase, whose epoch this line names.
@@ -10609,14 +10690,16 @@ class Front:
                     # PRIORITY LANES 1008 (L1): the lane noted at the arrival (0 with the switch off)
                     lane=Front._lane_for(self, rid))
         if _pb_to_p is not None:
-            p.d_eligible = False  # PRICE-BARRIER: it rides the LONG's P phase, never handed back to D
+            p.d_eligible = False  # PRICE-BARRIER: held for D (below), not one of the queue's D hand-overs
+        if _collect_p:
+            p.x_sum_p = True  # X-GESETZ F-X: the pure X-SUM release -- P's, never held for D
         Front._lane_stamp(self, p)  # PRIORITY LANES 1008 (L4): original arrival + hold as clock offset
         Front._stamp_x_decision(p, x_route, remainder)  # FRONT-X-MIT: the arrival verdict's X; a later hand-over re-decides
         if _d_hold:
-            # VISION-SHORT-1014: D's admission line (like SHORT-IN-FLIP); P's drain
-            # leaves it there (d_presence_only), D re-prices it at its admission
-            # (SK, a flip lies between) and sends it to P only if D lost it
-            p.d_presence_only = True
+            # X-GESETZ F-X (and VISION-SHORT-1014): D's admission line (like SHORT-IN-FLIP);
+            # P's drain leaves it there, D re-prices it at its admission (SK, a flip lies
+            # between) and sends it to P only if D lost it
+            p.d_presence_only = bool(_d_only)
             p.d_direct = True
             self._ready_for_d.append(p)
             self._sync_batch_gate()
@@ -10628,10 +10711,11 @@ class Front:
             self._ready_for_d.append(p)
             self._sync_batch_gate()
             self.counters["short_kept_d"] += 1
-            logger.info("WEG2 SHORT-KEPT rid=%s uncached=%d presence=%d epoch=%d: the SHORT fell "
-                        "through (gate held / seats / phase) and waits for a D seat behind the batch "
-                        "work -- its D presence is kept, no leg 1 on P", rid, remainder, store_span,
-                        self.epoch)
+            logger.info("WEG2 SHORT-KEPT rid=%s uncached=%d presence=%d epoch=%d cause=%s: the SHORT fell "
+                        "through (cause: gate_timeout / phase / seat_wait / seats_full / h5b_flip_due / "
+                        "collect_p_bound) and waits for a D seat behind the batch work -- its D presence is "
+                        "kept, no leg 1 on P (X-GESETZ 16.10.: the P drain leaves it in D's line)", rid,
+                        remainder, store_span, self.epoch, Front._take_short_fall(self, rid))
         elif (_asr.enabled() and short_ok and not short_refused and self.state == "flipping"
               and getattr(self, "_flip_dst", None) == "D"):
             # y4y 17:05:48 (weg2-45-64/65, ~775 tokens each): a SHORT arriving
@@ -10654,8 +10738,9 @@ class Front:
         self._dp_mark(p, "long" if route == "long" else "batch")  # R28
         self._kick_controller("arrival")  # 27B flipfast F2 (no-op when off)
         self._arm_client_watch(request, rid, p)  # H102
-        logger.info("WEG2-ROUTE rid=%s BATCH queued (awake=%s admit_d=%s est_prompt=%d remainder=%d queue=%d)",
-                    rid, self.awake, self.admit_d, est_prompt, remainder, len(self.queue))
+        logger.info("WEG2-ROUTE rid=%s BATCH queued (awake=%s admit_d=%s est_prompt=%d remainder=%d queue=%d%s)",
+                    rid, self.awake, self.admit_d, est_prompt, remainder, len(self.queue),
+                    (" short_fall=%s" % Front._take_short_fall(self, rid)) if short_ok else "")
         self._maybe_ple_admit_hint(p)  # fnFL2 H43
         try:
             await fut  # leg 1 done and D awake
@@ -11013,7 +11098,8 @@ class Front:
         # DP-NACHLAUF: the trigger was queued after the begin -- its leg 1 goes to
         # the dormant P now, as the begin would have posted it
         if leg1_early_on() and not getattr(self, "dual_kv_ledgers", False):
-            for _ep in leg1_early_candidates(self.queue, self.p_concurrency):
+            for _ep in leg1_early_candidates(self.queue, self.p_concurrency,
+                                                   skip=lambda q: Front._x_law_d_short(self, q)):
                 _ep._leg1_early = asyncio.ensure_future(self.leg1(_ep))
                 Front._leg1_early_watch(self, _ep)  # Q-1368: its verdict is always read
                 self.counters["leg1_early"] += 1
@@ -11118,6 +11204,18 @@ class Front:
                     rid, ms, len(inflight), outcome, hit[0] if hit else "-")
         return hit, ms
 
+    def _note_short_fall(self, rid: str, cause: str) -> None:
+        """X-GESETZ F-X (16.10.): why a SHORT arrival got no D seat -- named by the SHORT-KEPT /
+        BATCH line that follows (the analysis found SHORT-KEPT promising "no leg 1 on P" with no
+        cause, and P-BATCH-TAKES breaking it 8 s later). Bounded, read once (``_take_short_fall``)."""
+        d = self.__dict__.setdefault("_short_fall", {})
+        d[str(rid)] = str(cause)
+        while len(d) > 1024:
+            d.pop(next(iter(d)))
+
+    def _take_short_fall(self, rid: str) -> str:
+        return (self.__dict__.get("_short_fall") or {}).pop(str(rid), "unknown")
+
     async def _acquire_short_seat(self, rid: str, est_tokens: int = 0,
                                   refused: Optional[List[str]] = None,
                                   max_tokens: Optional[int] = None,
@@ -11140,8 +11238,10 @@ class Front:
             self.counters["short_gate_timeout_to_batch"] += 1
             logger.warning("WEG2 SHORT-GATE rid=%s: queued BATCH work held the gate for %.0f s; "
                            "routing BATCH instead of overtaking it", rid, self.drain_deadline_s)
+            Front._note_short_fall(self, rid, "gate_timeout")
             return None
         if not (self.awake == "D" and self.admit_d and self.state == "serving"):
+            Front._note_short_fall(self, rid, "phase")
             return None
         if _decode_collect_window_s() > 0.0:
             # DECODE-COLLECT: D decodes -> this SHORT waits for the window; the
@@ -11152,26 +11252,35 @@ class Front:
                 # SK's old fall-through. The sum rule's own verdict is the released route of THIS
                 # epoch's state -- set when the window released over X, and kept for the rest of
                 # the D phase (so a later single arrival under X finds it too, NF 21:01:08Z 663).
-                if refused is not None and self._dc_st().get("route") == "P":
+                if (refused is not None and self._dc_st().get("route") == "P"
+                        and rid not in (self._dc_st().get("x_law_d") or {})):
+                    # X-GESETZ F-X: a SHORT the split kept for D (``x_law_d``) is no X-SUM verdict --
+                    # it falls through and is held for D (no leg 1 on P)
                     # the set's SUM went over X: this is not "D cannot take it now" (SK's
                     # fall-through) but the sum rule's verdict -- the caller must queue it
                     # BATCH for P, never keep it for D (NF int24g 12.10. 21:01:07Z)
                     refused.append("collect_p")
+                Front._note_short_fall(self, rid, "collect_p_bound" if rid in (self._dc_st().get("x_law_d") or {})
+                                       else "collect")
                 return None
             if not (self.awake == "D" and self.admit_d and self.state == "serving"):
+                Front._note_short_fall(self, rid, "phase")
                 return None
         if self._d_direct_yields(rid, uncached=uncached):
-            return None  # FLIPCYCLE H5b: the flip comes anyway -- ride P's batch
+            Front._note_short_fall(self, rid, "h5b_flip_due")
+            return None  # FLIPCYCLE H5b: the flip comes anyway -- wait for D after it (X-GESETZ: no leg 1 on P)
         if _asr.enabled():
             # ARRIVAL-SEAT (b): no seat free or D's KV short -> wait for the
             # next free seat in arrival order, never the P detour (H91c3-3's
             # SEATS-FULL -> BATCH is off with the rule).
             if not await self._arrival_seat_wait(rid, est_tokens, max_tokens, uncached=uncached):
+                Front._note_short_fall(self, rid, "seat_wait")
                 return None
         elif self._d_phase_seats_full(rid):
             # H91c3-3: D's seat cap n is full -- fall through to route BATCH
             # (the P queue, where the wait bound sees it), the return
             # contract this method already has.
+            Front._note_short_fall(self, rid, "seats_full")
             return None
         if self._d_token_budget_blocks(rid, est_tokens, await self._d_reading_if_armed()):
             # FIX 4a: the same aggregate bound the BATCH admitter obeys.  A
@@ -11180,13 +11289,16 @@ class Front:
             # contract this method already has for a held gate.
             if refused is not None:
                 refused.append("d_budget")
+            Front._note_short_fall(self, rid, "d_budget")
             return None
         if self._d_direct_yields(rid, uncached=uncached):
+            Front._note_short_fall(self, rid, "h5b_flip_due")
             return None  # FLIPCYCLE H5b: a P-bound request queued while it waited
         await self._d_seat.acquire()
         if (not (self.awake == "D" and self.admit_d and self.state == "serving")
                 or (not _asr.enabled() and self._d_phase_seats_full(rid, own_seat=True))):
             self._d_seat.release()
+            Front._note_short_fall(self, rid, "phase")
             return None
         return Seat(self, rid, "short", tokens=est_tokens)
 
@@ -11373,6 +11485,49 @@ class Front:
             route = "P"  # user ~19:13Z: "ansonsten wartet er auf die 15er grenze und flippt"
         else:
             route = "P" if (p_bound or not set_fits) else "D"
+        # X-GESETZ F-X (user 16.10.): route P splits the set -- P takes its P-bound members (over X,
+        # p_only, x_routed / x_deferred / x_requeues); the SHORTs that fit under X one by one and in
+        # their sum (``_sp.fits`` on top of ``carried``, oldest first by the order key) stay D's and
+        # are held for D (the P drain's sweep; a seat-path SHORT by ``x_law_d``), no leg 1 on P.
+        # The pure X-SUM release (no P-bound member, the SHORTs' sum over X, user 12.10.) stays P
+        # for the whole set; a SHORT the greedy fit leaves over is P's under the same sum rule.
+        _cause = "d"
+        if route == "P":
+            _seat_shorts = [(rid_, t_, u_) for rid_, (t_, u_) in st["shorts"].items()]
+            _q_shorts = [q for q in fresh if Front._x_law_d_short(self, q)]
+            if not p_bound and set_fits:
+                route, _cause = "D", "d"  # the 15-s bound with nothing P-bound: D prefills the set
+            elif not p_bound:
+                _cause = "x_sum"
+                for q in _q_shorts:
+                    q.x_sum_p = True
+            else:
+                _cause = "p_bound"
+                _members = sorted(
+                    [(_lctl.clock_t(q, now), q.rid, int(getattr(q, "est_uncached", 0) or 0), q) for q in _q_shorts]
+                    + [(t_, rid_, int(u_), None) for rid_, t_, u_ in _seat_shorts],
+                    key=lambda m: Front._prio_key(self, m[3] if m[3] is not None else m[1], m[0]))  # PRIO-AS-AGE
+                _d_tok, _d_rids, _p_left = 0, [], []
+                for _t, _rid, _u, _q in _members:
+                    if _u >= 0 and _sp.fits(carried=carried + _d_tok, tokens=_u, limit=x_tok):
+                        _d_tok += _u
+                        _d_rids.append(_rid)
+                    else:
+                        _p_left.append(_rid)
+                        if _q is not None:
+                            _q.x_sum_p = True  # left over by the sum: P's (user 12.10.)
+                _xl = st.setdefault("x_law_d", {})
+                for _rid in _d_rids:
+                    _xl[_rid] = st["wid"]
+                for _k in [k for k, w in _xl.items() if w < st["wid"] - 64]:
+                    del _xl[_k]
+                self.counters["decode_collect_split_d"] = (
+                    self.counters.get("decode_collect_split_d", 0) + len(_d_rids))
+                logger.info("WEG2 DECODE-COLLECT split route=P cause=p_bound p_rids=%s d_rids=%s d_tokens=%d "
+                            "p_left=%s carried=%d X=%d epoch=%d -- P takes the P-bound members; the SHORTs "
+                            "that fit under X stay D's, held for D through the P phase (X-GESETZ 16.10.)",
+                            [q.rid for q in fresh if not Front._x_law_d_short(self, q)][:6], _d_rids[:8],
+                            _d_tok, _p_left[:6], carried, x_tok, self.epoch)
         if route == "D" and envs.SGLANG_WEG2_ENABLE_DECODE_COLLECT_PREFILL_BUSY.get():
             for _rid, (_t, _u) in st["shorts"].items():  # X-SUM-PRICE: priced as a set, now booked as one
                 self._d_pf_book().grant(rid=_rid, tokens=int(_u), now=now)
@@ -11387,7 +11542,7 @@ class Front:
                   rel_rids=[p.rid for p in fresh])  # route D: the set _dc_hand_to_d moves
         self.counters["decode_collect_release_" + route] += 1
         logger.info("WEG2 DECODE-COLLECT release n=%d tokens=%d X=%d waited_s=%.1f route=%s stage=%s p_bound=%s "
-                    "epoch=%d", n, tokens, x_tok, waited, route, stage, p_bound, self.epoch)
+                    "cause=%s epoch=%d", n, tokens, x_tok, waited, route, stage, p_bound, _cause, self.epoch)
         return route
 
     async def _decode_collect_short(self, rid: str, uncached: int) -> Optional[str]:
@@ -11820,8 +11975,9 @@ class Front:
             return self._d_direct_yield_fetch_cost(rid, uncached)
         self.counters["d_direct_yield"] += 1
         logger.info("WEG2-FLIPCYCLE stage=park_wait rid=%s ms=0 floor_ms=0 yield=d_direct "
-                    "p_bound=%s epoch=%d (H5b: a D->P flip is foreseeable, this SHORT joins P's "
-                    "batch instead of a 1.2-3.8 s D pass the park would wait behind)",
+                    "p_bound=%s epoch=%d (H5b: a D->P flip is foreseeable, this SHORT waits for D "
+                    "after it -- held in D's line, no leg 1 on P (X-GESETZ 16.10.) -- instead of a "
+                    "1.2-3.8 s D pass the park would wait behind)",
                     rid, getattr(cands[0], "rid", "?"), self.epoch)
         return True
 
@@ -14380,6 +14536,8 @@ class Front:
             # arrival flipped 66 s later. Its leg 1 is ahead of it again, as
             # every other reroute path (HANDOFF-LOST, INTAKE-STALL) says.
             p.leg1_done = False
+            # X-GESETZ F-X: D refused it (W31) -- P's by the X law, also for a reused Pending
+            p.x_requeues = max(int(getattr(p, "x_requeues", 0) or 0), int(n))
             if getattr(p, "short_kept", False) or getattr(p, "sk_void_seq", None) is not None:
                 # SK-X (W35 class, NF rc12t weg2-6-30): D refused a kept SHORT
                 # before the first byte. Its presence expires with this
@@ -15291,7 +15449,8 @@ class Front:
             self._ipc_dp_clock().begin(self.epoch, t_flip0, min(_live) if _live else None)
             # DP-NACHLAUF: leg 1 of the queue head goes to the dormant P now
             if leg1_early_on() and not getattr(self, "dual_kv_ledgers", False):
-                for _ep in leg1_early_candidates(self.queue, self.p_concurrency):
+                for _ep in leg1_early_candidates(self.queue, self.p_concurrency,
+                                                   skip=lambda q: Front._x_law_d_short(self, q)):
                     _ep._leg1_early = asyncio.ensure_future(self.leg1(_ep))
                     Front._leg1_early_watch(self, _ep)  # Q-1368: its verdict is always read
                     self.counters["leg1_early"] += 1
@@ -17333,9 +17492,14 @@ class Front:
                     self.p_pool_tokens,
                     min(self.p_concurrency + _ahead, self.p_phase_max_requests or (self.p_concurrency + _ahead)))
                 async def one(p: Pending) -> Pending:
+                    if Front._x_law_d_short(self, p):
+                        # X-GESETZ F-X (16.10.): a SHORT that reached the drain after its sweep is D's --
+                        # no leg 1; _on_leg1_done puts it into D's line (``x_hold_drain``)
+                        Front._x_hold_for_d(self, p, "p_drain", append=False)
+                        p.x_hold_drain = True
+                        return p
                     if getattr(p, "short_kept", False) or p.skip_leg1:
-                        # P-BATCH-ALL: P is awake -- every prefill is P's (a
-                        # kept SHORT; no CARRIER-EXCEEDS skip any more, law 02.10.)
+                        # over X (a kept SHORT re-priced over X): P's leg 1
                         self._to_p_batch(p, "drain")
                     async with sem:
                         if p.client_gone:  # H102: its client left while it waited for a P slot
@@ -17405,6 +17569,14 @@ class Front:
                     if p.resume_via_p:
                         self._rvp_p_finished(p)
                         prefilled += 1
+                        return
+                    if getattr(p, "x_hold_drain", False):
+                        # X-GESETZ F-X: held for D by ``one`` -- D's line, no P prefill counted (never
+                        # resume_via_p / lane-taken / intake-stalled / client-gone: _x_law_d_short refused those)
+                        p.x_hold_drain = False
+                        if not p.fut.done():
+                            self._ready_for_d.append(p)
+                            self._sync_batch_gate()
                         return
                     _drain_uncached += int(p.est_uncached)
                     if not p.fut.done():
