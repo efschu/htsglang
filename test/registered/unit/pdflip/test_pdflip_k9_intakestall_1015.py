@@ -296,6 +296,11 @@ def _posted_done_before_quiesce(timeline):
     return timeline.index("done:" + posted) < timeline.index("rpc:flush_cache"), posted
 
 
+@pytest.mark.skip(reason="h16s (flipqueue a34ea8febe on seatgate): the P phase takes every request that needs P "
+                  "(Front._p_phase_cap_exempt_pred, no switch), so the cap no longer leaves a P request in the queue "
+                  "with a posted early leg -- the premise of this scenario. The remaining stranding path (a needs-P "
+                  "arrival after the pool's last dispatch, inside the K9 settle) is P-PHASE-REENTER, covered by "
+                  "test_pdflip_flipqueue_1015. Follow-up: rebuild this scenario as that late arrival.")
 def test_k9_front_p_phase_settles_the_posted_early_leg_before_the_p_to_d_flip(monkeypatch, caplog):
     """RED with the settle call dead (review mutant K9-settle-off): the P->D flip begins and quiesces P while the
     posted leg is still running there -- the drain/quiesce the flip-stall bound killed at 11:52 (on the fake P a
@@ -310,6 +315,11 @@ def test_k9_front_p_phase_settles_the_posted_early_leg_before_the_p_to_d_flip(mo
         "the settled leg ran once on P, never a second leg 1"
 
 
+@pytest.mark.skip(reason="h16s (flipqueue a34ea8febe on seatgate): the P phase takes every request that needs P "
+                  "(Front._p_phase_cap_exempt_pred, no switch), so the cap no longer leaves a P request in the queue "
+                  "with a posted early leg -- the premise of this scenario. The remaining stranding path (a needs-P "
+                  "arrival after the pool's last dispatch, inside the K9 settle) is P-PHASE-REENTER, covered by "
+                  "test_pdflip_flipqueue_1015. Follow-up: rebuild this scenario as that late arrival.")
 def test_k9_front_switch_off_is_the_old_exit(monkeypatch, caplog):
     """The counter-case on the same controller: settle off -> P is quiesced for the flip with the posted leg still
     running on it."""
