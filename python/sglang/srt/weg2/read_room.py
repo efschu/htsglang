@@ -404,6 +404,9 @@ def tick(cache: Any) -> int:
         _ST.armed = armed(cache)    # per round: a handful of getattr/env reads; the floor mark moves per iteration
         if not _ST.armed:
             return 0
+        from sglang.srt.weg2 import room_wait_arbiter as _arbiter
+
+        _arbiter.note_role(cache)
         # the arena binds per phase (flip/rebind): re-resolve at most once a second, not per round
         t_now = time.monotonic()
         arena = _ST.arena
@@ -419,6 +422,8 @@ def tick(cache: Any) -> int:
         if t_poll - _ST.poll_t < _POLL_S:
             return 0
         _ST.poll_t = t_poll
+        # ROOM-ARBITER 1016 (F3): PP0 announces which waiting request's fill may wait (the oldest); no-op elsewhere
+        _arbiter.decide(arena)
         return serve_unseen(cache, None, arena)
     except Exception:  # noqa: BLE001 - a room request never breaks the round
         logger.warning("%s tick raised", MARK, exc_info=True)

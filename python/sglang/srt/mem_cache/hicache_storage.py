@@ -23,6 +23,7 @@ from sglang.srt.mem_cache.canonical_page_store import (
 from sglang.srt.weg2 import moe_act_switch as _moe_act_switch
 from sglang.srt.weg2 import prefix_trace as _prefix_trace
 from sglang.srt.weg2 import read_room as _read_room
+from sglang.srt.weg2 import room_wait_arbiter as _arbiter
 from sglang.srt.mem_cache.weg2_store_gates import (
     owner_write_covers_whole_file,
     writes_shared_keys,
@@ -4229,12 +4230,22 @@ class HiCacheFile(HiCacheStorage):
         _served0 = _read_room._ST.served
         # review A1: an armed room wait is a lifesign of this read (PP0's told Frist does not age it as idleness)
         _rr_iv = _read_room.room_wait_begin(arena)
+        # ROOM-ARBITER 1016 (F3): the request of this fill registers its wait (every rank's file entry is what PP0
+        # decides the oldest from); only an armed wait (READ-ROOM serves this arena) with a named request
+        _arb = None
+        _arb_rid = _arbiter.current_rid()
+        if _rr_iv is not None and _arb_rid is not None and _arbiter.enabled():
+            _arb = [_arbiter.register(arena, _arb_rid), _arb_rid, False, _arbiter.now_ms()]
         try:
             pend, got, read_now, rounds = self._await_fill_room_loop(
                 arena, pend, got, int(total_bytes), out, joined, stats, live, idle_ms, deadline, last_move,
-                read_now, rounds, read_id)
+                read_now, rounds, read_id, arb=_arb)
         finally:
             _read_room.room_wait_end(_rr_iv)
+            if _arb is not None:
+                _arbiter.unregister(arena, _arb[0], _arb_rid)
+                if _arb[2]:
+                    _arbiter.note_ended_young(arena, _arb_rid, len(pend))
         _ROOM_WAIT_N[0] += 1
         k = _ROOM_WAIT_N[0]
         if pend:
@@ -4248,11 +4259,19 @@ class HiCacheFile(HiCacheStorage):
         return got
 
     def _await_fill_room_loop(self, arena, pend, got, total_bytes, out, joined, stats, live, idle_ms, deadline,
-                              last_move, read_now, rounds, read_id):
-        """The rounds of ``_await_fill_room`` (split out so the room-wait lifesign closes in a ``finally``)."""
+                              last_move, read_now, rounds, read_id, arb=None):
+        """The rounds of ``_await_fill_room`` (split out so the room-wait lifesign closes in a ``finally``).
+        ``arb`` = ``[wait slot, rid, yielded, registered t_ms]`` of ROOM-ARBITER (F3, weg2/room_wait_arbiter.py):
+        refreshed per round; the wait ends the round PP0 -- having seen this fill's registration -- announces another
+        (older) request as the one that waits (``yielded`` set). Only the oldest request's fill waits for room."""
         while pend and time.perf_counter() < deadline:
             if live and time.perf_counter() - last_move >= idle_ms / 1000.0:
                 break
+            if arb is not None:
+                if not _arbiter.may_wait(arena, arb[1], since_ms=arb[3]):
+                    arb[2] = True
+                    break
+                arb[0] = _arbiter.register(arena, arb[1])
             time.sleep(0.025)
             rounds += 1
             if rounds % 40 == 0:
