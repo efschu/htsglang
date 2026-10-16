@@ -7524,7 +7524,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 stats["skipped_pending"] += 1
                 continue
             _t_iss = time.perf_counter()
-            if _full_arena and self._weg2_full_arena_refuses(node):
+            # F5b MEMO-LITE (NF-PGAP 1016): a node whose LAST claim was refused for arena room is asked the room
+            # question (claim_would_refuse) before any claim, also as the sweep's first claim -- no futile partial
+            # claim + #1427r CLAIM-RELEASE + ARENA-DROP walk per sweep while the room is provably not there
+            _memo = UnifiedRadixCache._weg2_refused_memo(self)
+            _in_memo = _memo is not None and node.id in _memo
+            if (_full_arena or _in_memo) and self._weg2_full_arena_refuses(node):
+                if _in_memo:
+                    stats["memo_skipped"] = stats.get("memo_skipped", 0) + 1
+                    # the room is provably not there: the rest of this sweep asks by room too (SWEEP-FULL-ARENA)
+                    _full_arena = _full_arena or _full_arena_armed
                 _issue_s += time.perf_counter() - _t_iss
                 if _r12.role() is not None:
                     # FLUSHFAST: the Form A shadow gets every refusal the claim
@@ -7546,12 +7555,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             _issue_s += time.perf_counter() - _t_iss
             if got > 0:
                 stats["issued"] += 1
+                if _in_memo:
+                    _memo.pop(node.id, None)
             else:
                 stats["refused"] += 1
                 if self._weg2_sweep_last_refusal == "arena_claim":
                     # FLUSHFAST: refused for want of KV-arena room (also through the
                     # parent rule: the topmost un-backed ancestor's claim was refused)
                     stats["arena_refused"] = stats.get("arena_refused", 0) + 1
+                    if _memo is not None:   # F5b: remembered until a claim of it succeeds
+                        _memo[node.id] = True
+                        while len(_memo) > 4096:
+                            _memo.pop(next(iter(_memo)))
                 _full_arena = _full_arena or (
                     _full_arena_armed and self._weg2_sweep_last_refusal == "arena_claim")
         stats["walked"] = _walked
@@ -7621,6 +7636,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self._1421_refused("arena_claim", top)
         for n in reversed(chain):
             self._1421_refused("parent_unbacked", n)
+
+    @staticmethod
+    def _weg2_refused_memo(tree) -> Optional[dict]:
+        """F5b MEMO-LITE: node id -> True for nodes whose last claim was refused for arena room (None = switch
+        SGLANG_WEG2_SWEEP_REFUSED_MEMO off). Bounded (4096, oldest first out); a node id is never reused."""
+        if (os.environ.get("SGLANG_WEG2_SWEEP_REFUSED_MEMO", "1") or "1").strip().lower() in ("0", "false", "no", "off"):
+            return None
+        memo = tree.__dict__.get("_weg2_refused_memo_d")
+        if memo is None:
+            memo = tree.__dict__["_weg2_refused_memo_d"] = {}
+        return memo
 
     def _weg2_full_arena_refuses(self, node) -> bool:
         """SWEEP-FULL-ARENA (NF boot 1007_2142): once this sweep's KV arena

@@ -20714,12 +20714,16 @@ class Scheduler(
         # write-back drain), then reset.  SGLANG_HICACHE_FLUSH_PUBLISH_SWEEP=0
         # restores the old form.
         self._weg2_last_flush_refusal = ""  # QUIESCE-PENDING: only THIS flush's refusal names a lap
+        from sglang.srt.managers import weg2_bubble_publish as _f5_bubble
+
         if (
             self.enable_hierarchical_cache
             and os.environ.get("SGLANG_HICACHE_FLUSH_PUBLISH_SWEEP", "1") != "0"
             and self.running_batch.is_empty()
             and self.chunked_req is None and not getattr(self, "anchor_tails", None)
         ):
+            # F5a (NF-PGAP 1016): the quiesce is open -- the bubble publisher pauses, the #1470 loop publishes alone
+            _f5_bubble.quiesce_begin(self)
             _sweep = getattr(self.tree_cache, "publish_unbacked_sweep", None)
             _wc = getattr(self.tree_cache, "writing_check", None)
             if _sweep is not None:
@@ -20852,6 +20856,13 @@ class Scheduler(
             # second, D's store read short by 11776 tokens.  Join them first.
             self._weg2_join_store_writes_before_reset()
             self._weg2_note_lost_anchors()
+            # F5c (NF-PGAP 1016): what goes into this reset un-backed, named (measured, never silent)
+            if self.enable_hierarchical_cache:
+                try:
+                    _weg2_flush_nonblock.note_unbacked_at_reset(self.tree_cache, site="flush")
+                except Exception:  # noqa: BLE001 - an instrument never blocks the reset
+                    logger.warning("#1470 FLUSH-UNBACKED census raised", exc_info=True)
+            _f5_bubble.quiesce_end(self, "reset")
             self.cur_batch_for_debug = None
             self.last_batch = None
             if _weg2_release_reset_redundant(self, zero_kv):

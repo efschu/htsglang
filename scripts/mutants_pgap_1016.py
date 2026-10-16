@@ -15,6 +15,10 @@ HS = "python/sglang/srt/mem_cache/hicache_storage.py"
 CC = "python/sglang/srt/managers/cache_controller.py"
 T_F3 = "test/registered/unit/mem_cache/test_weg2_room_arbiter_1016.py"
 T_F2 = "test/registered/unit/mem_cache/test_weg2_room_verdicts_1016.py"
+T_F5 = "test/registered/unit/mem_cache/test_weg2_quiesce_publish_f5_1016.py"
+BPUB = "python/sglang/srt/managers/weg2_bubble_publish.py"
+UR = "python/sglang/srt/mem_cache/unified_radix_cache.py"
+NBK = "python/sglang/srt/managers/weg2_flush_nonblock.py"
 
 MUTANTS = [
     # F3 ROOM-ARBITER (+PRIO, + review 1016 A3/A4/A5)
@@ -87,6 +91,24 @@ MUTANTS = [
     ("A7b transient misses a running chunk's device lock", RV,
      "            n += sum(1 for v in prot.values() if int(v or 0) > 0)", "            n += 0", T_F2),
     ("Dref foreign references are ignored", RV, "        if int(refs_now) > sum(held):\n            return None\n", "", T_F2),
+    # F5 quiesce publish (a) bubble pause, (b) memo-lite, (c) FLUSH-UNBACKED
+    ("F5r RED: the base behaviour (bubble pause switched off)", BPUB,
+     "def quiesce_pause_on() -> bool:\n", "def quiesce_pause_on() -> bool:\n    return False\n", T_F5),
+    ("F5a the quiesce never opens", BPUB,
+     "    if not getattr(scheduler, \"_weg2_quiesce_open\", False):\n        scheduler._weg2_quiesce_open = True\n",
+     "    if False:\n        scheduler._weg2_quiesce_open = True\n", T_F5),
+    ("F5b a launched batch does not end the quiesce", BPUB,
+     "    if getattr(scheduler, \"_weg2_quiesce_open\", False):\n        quiesce_end(scheduler, \"batch\")\n", "", T_F5),
+    ("F5c memo-lite never consulted", UR,
+     "            _in_memo = _memo is not None and node.id in _memo\n", "            _in_memo = False\n", T_F5),
+    ("F5d memo-lite never records", UR, "                        _memo[node.id] = True\n", "                        pass\n", T_F5),
+    ("F5e a memo skip does not engage the sweep's full-arena mode", UR,
+     "                    _full_arena = _full_arena or _full_arena_armed\n                _issue_s", "                _issue_s", T_F5),
+    ("F5f the census counts backed nodes", NBK,
+     "        if node is root or getattr(node, \"evicted\", False) or getattr(node, \"backuped\", False) \\\n",
+     "        if node is root or getattr(node, \"evicted\", False) \\\n", T_F5),
+    ("F5g a follower's intake does not open the quiesce", "python/sglang/srt/managers/scheduler_components/request_receiver.py",
+     "                    _f5_bubble.quiesce_begin(self)\n", "                    pass\n", T_F5),
 ]
 
 
