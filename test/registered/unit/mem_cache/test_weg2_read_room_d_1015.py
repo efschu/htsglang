@@ -590,12 +590,11 @@ def test_at_the_broadcast_only_childless_anchorless_nodes_go(tmp_path, roles):
     and a node with a Mamba state on the device stay -- on TP0 and on the worker."""
     rr = _rr()
     me = threading.current_thread().name
+    be, arena = _setup(tmp_path, ["r0"], slots=8)          # creates <tmp>/store
     root = tmp_path / "store"
-    root.mkdir()
     spans = [(1, list(range(0, 8))), (101, list(range(8, 16))), (201, list(range(16, 24)))]
     for s_ in range(24):
         (root / f"s{s_}.bin").write_bytes(b"\x01")
-    be, arena = _setup(tmp_path, ["r0"], slots=8)
     _fill_arena_with_tree_pages(arena, 8, tag="live")
     tp0 = _real_d_tree(spans, None, "tp0")
     worker = _real_d_tree(spans, None, "worker")
