@@ -170,6 +170,135 @@ def test_early_legs_are_posted_for_what_the_p_phase_takes():
     assert src.count("leg1_early_candidates(self.queue, self.p_concurrency)") == 2
 
 
+# ------------------------------------------------------------------ A1: the P phase with a FULL D (behaviour, controller)
+
+def _full_d_harness_kwargs(**kw):
+    base = dict(awake="P", p_concurrency=8, d_bs=2, p_phase_max_requests=6, tp_prefill_max_tokens=4096)
+    base.update(kw)
+    return base
+
+
+async def _fill_d_and_queue_ready(h, ready=5):
+    """D full: every seat held (``seats_free() == 0``) and ``ready`` prefilled requests waiting in ``_ready_for_d``
+    (the 13:05:10 shape, boot 124245) -- the premise under which the old gate capped the P phase at the free seats."""
+    for _ in range(h.front.d_bs):
+        await h.front._d_seat.acquire()
+    assert h.front.seats_free() == 0
+    h.front._ready_for_d.extend(_bare_pending("rdy%d" % i) for i in range(ready))
+    assert len(h.front._ready_for_d) == ready
+
+
+def _gens_before_first_release(h):
+    tl = h.p.timeline
+    end = next((i for i, e in enumerate(tl) if e == "rpc:release_memory_occupation"), len(tl))
+    return [e for e in tl[:end] if e.startswith("gen:")]
+
+
+def test_a1_the_p_phase_takes_min_queue_and_cap_while_d_is_full():
+    """seats_free() == 0, _ready_for_d has 5 entries, 6 requests queue on P: the phase dispatches
+    min(len(queue), p_phase_max_requests) == 6. RED on a seat cap in the P phase (mutant MC: a cap of 1)."""
+    from test_weg2_phase_policy_h91c import Harness, _until
+
+    async def body():
+        async with Harness(**_full_d_harness_kwargs()) as h:
+            h.p.delay = 0.3
+            await _fill_d_and_queue_ready(h)
+            tasks = [h.post("c%d" % i, 15000) for i in range(6)]  # > X uncached each: no SHORT among them
+            assert await _until(lambda: len(h.p.gen_marks) >= 6 or "rpc:release_memory_occupation" in h.p.timeline, 20)
+            await asyncio.sleep(0.2)
+            assert len(_gens_before_first_release(h)) == min(6, 6), h.p.timeline
+            for t in tasks:
+                t.cancel()
+
+    asyncio.run(body())
+
+
+def test_a1_the_cap_still_holds_with_a_full_d_and_a_longer_queue():
+    """The H91 cap is the only cap: 9 queued, cap 6 -> 6 in the first phase, the rest waits (min(len(queue), cap))."""
+    from test_weg2_phase_policy_h91c import Harness, _until
+
+    async def body():
+        async with Harness(**_full_d_harness_kwargs()) as h:
+            h.p.delay = 0.3
+            await _fill_d_and_queue_ready(h)
+            tasks = [h.post("c%d" % i, 15000) for i in range(9)]
+            assert await _until(lambda: "rpc:release_memory_occupation" in h.p.timeline, 30)
+            assert len(_gens_before_first_release(h)) == 6, h.p.timeline
+            for t in tasks:
+                t.cancel()
+
+    asyncio.run(body())
+
+
+def test_a1_a_short_rides_the_p_phase_with_a_full_d_as_cap_exempt():
+    """Cap 2, three LONG and one SHORT queued, D full: the two LONG take the cap, the SHORT rides as cap_exempt
+    (FLIPCYCLE H5) -- 3 legs before the flip, whatever D's seats say. RED when the exemption needs a free seat (MD)."""
+    from test_weg2_phase_policy_h91c import Harness, _until
+
+    async def body():
+        async with Harness(**_full_d_harness_kwargs(p_phase_max_requests=2)) as h:
+            h.p.delay = 0.3
+            await _fill_d_and_queue_ready(h)
+            tasks = [h.post("L1", 15000), h.post("L2", 15000), h.post("L3", 15000), h.post("S1", 20)]
+            assert await _until(lambda: "rpc:release_memory_occupation" in h.p.timeline, 30)
+            before = _gens_before_first_release(h)
+            assert sorted(before) == ["gen:L1", "gen:L2", "gen:S1"], h.p.timeline
+            assert h.front.counters["p_phase_short_rides"] == 1
+            for t in tasks:
+                t.cancel()
+
+    asyncio.run(body())
+
+
+# ------------------------------------------------------------------ A2: the flip head is the order key's head
+
+def _collected_set(lanes_ages, running=6, ready=0, n=6):
+    """A route-P set past its collect window; ``lanes_ages`` = [(rid, lane, age_s)] stored in the given order."""
+    now = time.time()
+    f = _front(running=["r%d" % i for i in range(running)], n=n, bound=600.0)
+    f.t_awake = now - 60.0
+    f._ready_for_d = [_pending("rdy%d" % i, 3000, now - 100.0 + i) for i in range(ready)]
+    f.queue = []
+    for rid, lane, age in lanes_ages:
+        p = _pending(rid, 3000, now - age)
+        p.lane = lane
+        f.queue.append(p)
+    f._park_attempt_epoch = -1
+    return f, now
+
+
+def test_a2_the_flip_head_is_chosen_by_priority_desc_then_arrival_asc(monkeypatch):
+    """Three route-P requests, mixed priority and age, stored in a scrambled order: the head is the oldest of the
+    highest priority (never the oldest overall, never the youngest, never the first stored)."""
+    _on(monkeypatch)
+    f, now = _collected_set([("young_p1", 1, 10.0), ("old_p0", 0, 40.0), ("mid_p1", 1, 16.0)])
+    got = f._immediate_park_due(f.groups["D"], now)
+    assert got is not None and got.rid == "mid_p1"
+    # and the other call site agrees (the group's decision is one)
+    f2, now2 = _collected_set([("young_p1", 1, 10.0), ("old_p0", 0, 40.0), ("mid_p1", 1, 16.0)])
+    res = asyncio.run(f2._arrival_seat_step(f2.groups["D"], now2))
+    assert res[0] and res[2].rid == "mid_p1"
+
+
+def test_a2_equal_priority_the_oldest_arrival_leads_whatever_the_storage_order(monkeypatch):
+    _on(monkeypatch)
+    for order in ([("a", 0, 10.0), ("b", 0, 30.0), ("c", 0, 20.0)], [("b", 0, 30.0), ("c", 0, 20.0), ("a", 0, 10.0)]):
+        f, now = _collected_set(order)
+        assert f._immediate_park_due(f.groups["D"], now).rid == "b"
+
+
+def test_a2_ready_for_d_waiting_with_free_seats_is_no_reason_to_hold_the_release(monkeypatch):
+    """D's own wait queue (``_ready_for_d`` > 0) and seats free: route P still flips at the release (the queue on D
+    is served by d_admitter, not by holding P's release)."""
+    _on(monkeypatch)
+    f, now = _collected_set([("old", 0, 40.0), ("young", 0, 16.0)], running=2, ready=2)
+    assert f.seats_free() == 6 or f._arrival_seat_taken()[0] < 6  # the seats are not the question here
+    got = f._immediate_park_due(f.groups["D"], now)
+    assert got is not None and got.rid == "old"
+    f2, now2 = _collected_set([("old", 0, 40.0), ("young", 0, 16.0)], running=2, ready=2)
+    assert asyncio.run(f2._arrival_seat_step(f2.groups["D"], now2))[:2] == (True, True)
+
+
 # ------------------------------------------------------------------ route D stays a queue
 
 def test_a_route_d_seat_wait_is_a_real_queue_and_nothing_flips_or_parks(monkeypatch):
