@@ -5818,6 +5818,22 @@ class HiCacheFile(HiCacheStorage):
                 results[transfer.name] = [False] * len(keys)
                 continue
             starts = [int(host_indices[i * page_size]) for i in range(len(keys))]
+            # K12 (index 72085): a paged mirror has num_host_pages rows; an id
+            # past them (an A2 ORPHAN or placeholder KV id the transfer was
+            # derived from) is refused by name for this transfer instead of an
+            # IndexError in the backup thread.
+            _rows = getattr(host_pool, "num_host_pages", None)
+            _sps = getattr(host_pool, "slot_page_size", None)
+            if isinstance(_rows, int) and isinstance(_sps, int) and _sps > 0:
+                _bad = [s_ for s_ in starts if s_ < 0 or s_ // _sps >= _rows]
+                if _bad:
+                    logger.error(
+                        "K12 STORE-WRITE HOST INDEX OUT OF RANGE pool=%s rows=%d first_bad_row=%d "
+                        "bad_pages=%d of %d: no page of this transfer is written",
+                        transfer.name, _rows, _bad[0] // _sps, len(_bad), len(starts),
+                    )
+                    results[transfer.name] = [False] * len(keys)
+                    continue
             batched = getattr(host_pool, "get_data_pages", None)
             if batched is not None:
                 pages = batched(starts)

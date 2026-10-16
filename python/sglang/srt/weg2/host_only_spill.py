@@ -57,6 +57,17 @@ def armed(cache: Any) -> bool:
     return bool(_sf.enabled() and getattr(cache, _sf.FLOOR_LOCAL_PP_ATTR, False))
 
 
+def _strict() -> bool:
+    """H16P-NACHBESSERUNG A2 (``SGLANG_WEG2_L3_PRESENT_STRICT``): an unpaired page (KV without its QSA index) is
+    not in L3 -- the leaf stays, like on ``lost``."""
+    try:
+        from sglang.srt.environ import envs
+
+        return bool(envs.SGLANG_WEG2_L3_PRESENT_STRICT.get())
+    except Exception:  # noqa: BLE001
+        return True
+
+
 def _leaf_reason(node: Any) -> str:
     """Why ``cache._is_host_leaf`` said no (the same checks in the same order, for the census only)."""
     if not getattr(node, "evicted", True):
@@ -160,7 +171,8 @@ def spill_host_only(cache: Any, pool: Any, want: int, page_size: int, skip: set)
             continue
         cd = node.component_data[BASE_COMPONENT_TYPE]
         sec = pool.secure_rows_to_l3(cd.host_value)
-        if int(sec.get("lost", 0)) or int(sec.get("pages", 0)) != len(node.hash_value):
+        if (int(sec.get("lost", 0)) or int(sec.get("pages", 0)) != len(node.hash_value)
+                or (int(sec.get("unpaired", 0)) and _strict())):
             unsecured += 1                # no L3 copy for every page, or a page not COMPLETE: it stays
             continue
         on_disk += int(sec.get("on_disk", 0))

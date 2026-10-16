@@ -95,6 +95,10 @@ TRANSIT = "transit"
 STATE = "state"
 #: #239 S4b part 4: TP0 rebound a COMPLETE token-cut page -- every worker does
 REBIND = "rebind"
+#: K12/H1: TP0 holds the node in L3 (its complete ack, or under the cut the
+#: complete page) -- every worker sets ``l3_present`` from this, never from its
+#: own ack, so no rank reads a different ``l3_present`` for the same node
+L3 = "l3"
 
 #: #239 S4b part 4: broadcasts TP0 waits for an incomplete token-cut page
 #: before it falls back to the ack's pre-cut decision (a write of every owner
@@ -313,6 +317,38 @@ def record_state(tree: Any, node: Any, why: str = "") -> None:
     _S.ledger.append((STATE, k[0], k[1], exists, kv, m))
 
 
+def _pkey(e) -> tuple:
+    """The pending slot of an event: one per node key -- a newer TRANSIT /
+    STATE / REBIND supersedes an older one -- and a SEPARATE slot for L3, which
+    is a fact about the store, not a host decision: a TRANSIT or REBIND of the
+    same node in the same pass must not drop it."""
+    k = (e[1], int(e[2]))
+    return k + (L3,) if e[0] == L3 else k
+
+
+def l3_group_on(env=None) -> bool:
+    """K12/H1 switch ``SGLANG_WEG2_L3_PRESENT_GROUP`` (default ON): on a Form A
+    group ``l3_present`` follows TP0's verdict on every rank."""
+    v = (env if env is not None else os.environ).get("SGLANG_WEG2_L3_PRESENT_GROUP", "1")
+    return str(v).strip().lower() not in ("0", "false", "no", "off", "")
+
+
+def record_l3(tree: Any, node: Any) -> bool:
+    """K12/H1, TP0: it set ``l3_present`` on ``node`` (group-complete). Every
+    worker sets it at the next broadcast. False = not keyable (logged; the
+    workers then keep l3_present False for this node -- conservative)."""
+    k = node_key(node)
+    if k is None:
+        if _note("unkeyed_l3"):
+            logger.warning("R12 HOST-VERDICT unkeyed l3 node=%s (the workers keep "
+                           "l3_present False)", getattr(node, "id", "?"))
+        return False
+    register_tree(tree)
+    _announce("host")
+    _S.ledger.append((L3, k[0], k[1], 1, 1, 0))
+    return True
+
+
 def record_rebind(tree: Any, node: Any) -> bool:
     """#239 S4b part 4, TP0 under the cut: it rebound a COMPLETE page to the
     arena; every worker rebinds the same node at the next broadcast (until
@@ -329,7 +365,7 @@ def record_rebind(tree: Any, node: Any) -> bool:
     return True
 
 
-def await_complete(tree: Any, node: Any, fallback_transit: bool) -> bool:
+def await_complete(tree: Any, node: Any, fallback_transit: bool, l3_ok: bool = False) -> bool:
     """#239 S4b part 4, TP0 under the cut: its ack came while the page was not
     complete in the arena (an owner's write still in flight). Wait for the
     page instead of deciding on TP0's own ack. False = not keyable -> the
@@ -339,7 +375,7 @@ def await_complete(tree: Any, node: Any, fallback_transit: bool) -> bool:
         return False
     register_tree(tree)
     _announce("host")
-    _S.rebind_wait[k] = [node, 0, bool(fallback_transit)]
+    _S.rebind_wait[k] = [node, 0, bool(fallback_transit), bool(l3_ok)]
     return True
 
 
@@ -350,13 +386,18 @@ def _retry_rebinds() -> None:
     if tree is None or not _S.rebind_wait:
         return
     for k, ent in list(_S.rebind_wait.items()):
-        node, waited, fallback = ent
+        node, waited, fallback = ent[0], ent[1], ent[2]
+        l3_ok = bool(ent[3]) if len(ent) > 3 else False
         if not _attached(node) or node.component_data[int(_base_ct())].host_value is None:
             del _S.rebind_wait[k]  # the node or its host life went another way
             continue
         if tree._weg2_rebind_host_to_arena(node):
             del _S.rebind_wait[k]
             _S.ledger.append((REBIND, k[0], k[1], 1, 1, 0))
+            if l3_ok:
+                # K12/H1: the page completed -- l3_present on every rank
+                node.l3_present = True
+                _S.ledger.append((L3, k[0], k[1], 1, 1, 0))
             n = _note("rebind_late", 256)
             if n:
                 logger.info("R12 CUT-REBIND node=%s depth=%d after %d pass(es) (every owner "
@@ -398,9 +439,9 @@ def attach(recv_reqs: List) -> List:
     n = _note("sent")
     if n:
         kinds = [e[0] for e in v.events]
-        logger.info("R12 HOST-VERDICT SENT seq=%d events=%d transit=%d state=%d rebind=%d (n=%d)",
+        logger.info("R12 HOST-VERDICT SENT seq=%d events=%d transit=%d state=%d rebind=%d l3=%d (n=%d)",
                     v.seq, len(v.events), kinds.count(TRANSIT), kinds.count(STATE),
-                    kinds.count(REBIND), n)
+                    kinds.count(REBIND), kinds.count(L3), n)
     return [v] + list(recv_reqs)
 
 
@@ -424,7 +465,7 @@ def consume(recv_reqs: Optional[List], tree: Any = None) -> Optional[List]:
     if t is None:
         # no tree has touched HiCache yet on this rank: keep for the next pass
         for e in events:
-            _S.pending[(e[1], int(e[2]))] = e
+            _S.pending[_pkey(e)] = e
         return rest
     apply(t, events, seq=verdicts[-1].seq)
     return rest
@@ -481,7 +522,7 @@ def apply(tree: Any, events: List, seq: int = 0) -> Dict[str, int]:
     c = dict(transit=0, kv=0, anchor=0, deleted=0, short=0, missing=0,
              pending=0, unreconcilable=0, noop=0, rebind=0, rebind_miss=0)
     for e in events:
-        _S.pending[(e[1], int(e[2]))] = e  # a newer event for the key supersedes
+        _S.pending[_pkey(e)] = e  # a newer event for the key supersedes (L3 has its own slot)
     if not _S.pending:
         return c
     work = list(_S.pending.values())
@@ -503,6 +544,12 @@ def apply(tree: Any, events: List, seq: int = 0) -> Dict[str, int]:
             before = _host_flags(node)
             tree._weg2_release_chain_piece_host(node)
             c["transit" if _host_flags(node) != before else "noop"] += 1
+            continue
+        if kind == L3:
+            if r != "worker":
+                continue  # TP0 set it before it sent the event
+            node.l3_present = True
+            c["l3"] = c.get("l3", 0) + 1
             continue
         if kind == REBIND:
             if r != "worker":
