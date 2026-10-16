@@ -4643,15 +4643,47 @@ class SchedulerWeightUpdaterManager:
         # -- every poll agrees, as with the gate unset (see
         # UnifiedRadixCache.drain_gate_forced for why that stays rank-uniform).
         _forced = getattr(tc, "drain_gate_forced", None)
+        # K12: every rank of the group passes the same switch (one launcher
+        # environment), so the reduced vector has the same length everywhere.
+        from sglang.srt.mem_cache import weg2_backup_guard as _k12_guard
+        from sglang.srt.managers.weg2_sleep_drain import sleep_abandon_backup_on
+
+        _k12_on = sleep_abandon_backup_on()
+        _k12_exec = (lambda: _k12_guard.drain_state(tc)[1]) if _k12_on else None
+        _group_max = functools.partial(tc.hicache_group_max, label="weg2_sleep_drain")
         with (_forced() if callable(_forced) else nullcontext()):
             verdict, polls = drain_until_group_verdict(
                 idle_blockers=blockers,
                 check_hicache_events=tc.check_hicache_events,
-                group_max=functools.partial(
-                    tc.hicache_group_max, label="weg2_sleep_drain"
-                ),
+                group_max=_group_max,
                 bound_s=bound_s,
+                backup_executing=_k12_exec,
             )
+            if _k12_on and not verdict.idle and verdict.abandonable:
+                # K12 (NF h16p D 13:35:43Z): the group read the SAME verdict --
+                # only storage backups left, none executing on a live thread --
+                # so every rank gives up its store copies here and re-reads the
+                # group once (bound 0: one reduction, the same on every rank).
+                # A backup that started executing in between keeps the rank
+                # blocked and the W120 below stops the group as before.
+                _ab, _kept = _k12_guard.abandon(
+                    tc, why=f"sleep drain expired after {time.monotonic() - t0:.2f} s"
+                )
+                verdict, _polls2 = drain_until_group_verdict(
+                    idle_blockers=blockers,
+                    check_hicache_events=tc.check_hicache_events,
+                    group_max=_group_max,
+                    bound_s=0.0,
+                    backup_executing=_k12_exec,
+                )
+                polls += _polls2
+                logger.warning(
+                    "K12 SLEEP-DRAIN ABANDON: abandoned=%d kept_executing=%d on this "
+                    "rank; group verdict after the abandon %s -- %s",
+                    _ab, _kept, verdict,
+                    "the sleep goes on (store copies lost, no KV lost)" if verdict.idle
+                    else "still blocked: W120 stops the group by name",
+                )
         waited_s = time.monotonic() - t0
         now = list(blockers())
         if first or polls or not verdict.idle:

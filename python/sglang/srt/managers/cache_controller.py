@@ -31,6 +31,7 @@ import psutil
 import torch
 
 from sglang.srt.mem_cache.hicache_drain_budget import coalesce_host_releases
+from sglang.srt.mem_cache import weg2_backup_guard as _k12_guard
 from sglang.srt.mem_cache.hicache_phase_guard import device_tier_disarmed
 from sglang.srt.mem_cache.hicache_storage import (
     STORAGE_BATCH_SIZE,
@@ -5236,48 +5237,60 @@ class HiCacheController:
                 operation = self.backup_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
-
-                # W35 CLASS 4: the durable-corruption gate. Checked HERE, on
-                # the consumer thread, immediately before the persist and
-                # after the operation has been dequeued -- the one point where
-                # this operation's fate is decided. See `operation_is_stale`
-                # for why a stale backup is REFUSED rather than routed.
-                # Acked either way: an unacked operation stalls the queue, and
-                # a declined backup is a correct non-persist, exactly as
-                # `backup_skip` already is.
-                if operation_is_stale(self, operation, "backup"):
+                # K12: an operation the group's sleep verdict abandoned is
+                # acked unwritten at dequeue; any other is EXECUTING from here
+                # on, and an exception in its body no longer ends this thread
+                # (D TP0 13:35:33Z: an IndexError in _page_backup killed it,
+                # its two backups were never acked -> W120 10 s later).
+                if not _k12_guard.begin(self, operation):
                     self.ack_backup_queue.put(operation)
                     continue
+                try:
+                    # W35 CLASS 4: the durable-corruption gate. Checked HERE, on
+                    # the consumer thread, immediately before the persist and
+                    # after the operation has been dequeued -- the one point where
+                    # this operation's fate is decided. See `operation_is_stale`
+                    # for why a stale backup is REFUSED rather than routed.
+                    # Acked either way: an unacked operation stalls the queue, and
+                    # a declined backup is a correct non-persist, exactly as
+                    # `backup_skip` already is.
+                    if operation_is_stale(self, operation, "backup"):
+                        self.ack_backup_queue.put(operation)
+                        continue
 
-                if not self.backup_skip:
-                    # Capacity watchdog: rate-limited inside the backend, so this
-                    # is cheap per operation. A backend that has stopped writing
-                    # (out of disk) still runs the backup: the individual page
-                    # writes turn into refusals, which the ack path already
-                    # treats as a partial backup, so the caller sees a cache
-                    # miss rather than a stalled queue.
-                    self.storage_backend.check_disk_space()
-                    # #1061: stamp every key this operation hands to the store
-                    # with the #719 binding generation it was OPENED under --
-                    # the stamp `StorageOperation.__init__` already carries
-                    # (the existing carrier; no second scheme). This is the
-                    # producer-phase ledger's only production writer; disarmed
-                    # it records nothing. Placed BEFORE `_page_backup` so a
-                    # partial backup can only OVER-stamp: a stamped-but-
-                    # unwritten key reads as a store miss later, never as a
-                    # wrongly-attributed phase.
-                    try:
-                        from sglang.srt.mem_cache.producer_phase_census import (
-                            note_backup_keys,
-                        )
+                    if not self.backup_skip:
+                        # Capacity watchdog: rate-limited inside the backend, so this
+                        # is cheap per operation. A backend that has stopped writing
+                        # (out of disk) still runs the backup: the individual page
+                        # writes turn into refusals, which the ack path already
+                        # treats as a partial backup, so the caller sees a cache
+                        # miss rather than a stalled queue.
+                        self.storage_backend.check_disk_space()
+                        # #1061: stamp every key this operation hands to the store
+                        # with the #719 binding generation it was OPENED under --
+                        # the stamp `StorageOperation.__init__` already carries
+                        # (the existing carrier; no second scheme). This is the
+                        # producer-phase ledger's only production writer; disarmed
+                        # it records nothing. Placed BEFORE `_page_backup` so a
+                        # partial backup can only OVER-stamp: a stamped-but-
+                        # unwritten key reads as a store miss later, never as a
+                        # wrongly-attributed phase.
+                        try:
+                            from sglang.srt.mem_cache.producer_phase_census import (
+                                note_backup_keys,
+                            )
 
-                        note_backup_keys(
-                            getattr(operation, "hash_value", None),
-                            getattr(operation, "binding_generation", None),
-                        )
-                    except Exception:  # noqa: BLE001 - never break the backup thread
-                        pass
-                    self._page_backup(operation)
+                            note_backup_keys(
+                                getattr(operation, "hash_value", None),
+                                getattr(operation, "binding_generation", None),
+                            )
+                        except Exception:  # noqa: BLE001 - never break the backup thread
+                            pass
+                        self._page_backup(operation)
+                except Exception as exc:  # noqa: BLE001 - K12: the consumer survives
+                    _k12_guard.fail(operation, exc)
+                finally:
+                    _k12_guard.end(self, operation)
                 self.ack_backup_queue.put(operation)
 
             except Empty:
