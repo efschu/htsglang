@@ -169,8 +169,8 @@ async def _async(v):
 
 
 def test_net_the_wait_bound_fires_for_a_non_candidate(caplog):
-    """(3) a queued entry no rule takes (here: a SHORT D refused at arrival,
-    d_eligible False) past the bound fires it -> the flip to P takes it."""
+    """(3) a queued entry no rule takes (here: a SHORT D refused at arrival, d_eligible False) past the bound is
+    NAMED (WAIT-BOUND-ANY) -- SOLL R7/A8 (17.10.): it is no flip reason under X; it waits for D or rides a decided flip."""
     caplog.set_level(logging.WARNING)
 
     async def go():
@@ -184,7 +184,7 @@ def test_net_the_wait_bound_fires_for_a_non_candidate(caplog):
 
     with _asr_on():
         f, got, got2 = asyncio.run(go())
-    assert got == (True, True, None) and got2 == (True, True, None)
+    assert got == (False, False, None) and got2 == (False, False, None)
     assert len(f.queue) == 1
     lines = [m for m in caplog.messages if "WAIT-BOUND-ANY" in m]
     assert len(lines) == 1 and "weg2-45-66" in lines[0]

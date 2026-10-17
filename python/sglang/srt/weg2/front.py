@@ -17380,9 +17380,11 @@ class Front:
                             # once the singleton window is quiet -- a flip now would
                             # buy a round trip X* says does not pay.
                             continue
-                        if not self._flip_economics_ok(fairness_fired or self.admit_d):
-                            # (c) --d-hold-s bounds the economics hold (admit_d False only: a flip the front decided
-                            # earlier); a set-justified flip passed ``_set_flip_justified`` above and is not priced twice
+                        if self.admit_d:
+                            pass  # decided by a set verdict / the queue sum >= X above: not priced a second time
+                        elif not self._flip_economics_ok(fairness_fired):
+                            # (c) --d-hold-s bounds the economics hold: a flip the front closed D for earlier
+                            # (admission closed) is still priced as before
                             if not self._d_hold_expired("backlog", _now):
                                 continue
                         if not self._dwell_ok("D", "P", fairness_fired, work_exhausted=d_work_exhausted,
