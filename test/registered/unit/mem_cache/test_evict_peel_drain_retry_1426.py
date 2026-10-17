@@ -18,9 +18,15 @@ def _peel(written_seq, ongoing):
     t.ongoing_write_through = ongoing
     seq = list(written_seq)
     t.write_backup = lambda n, write_back=False, **kw: (calls.append("write"), seq.pop(0))[1]
-    t.writing_check = lambda write_back=False: calls.append("drain")
+    node = types.SimpleNamespace(backuped=False, evicted=False, id=1)
+
+    def drain(write_back=False):
+        calls.append("drain")
+        # the drain runs the acks: a node whose write was issued is backed on the host afterwards (K21)
+        node.backuped = any(written_seq[: calls.count("write")])
+
+    t.writing_check = drain
     t._evict_to_host = lambda n, tr: calls.append("evict")
-    node = types.SimpleNamespace(backuped=False, id=1)
     t._evict_device_leaf(node, {})
     return calls
 
