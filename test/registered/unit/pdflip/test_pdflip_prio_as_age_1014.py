@@ -362,21 +362,21 @@ def test_front_sorts_keep_t_arrive_and_the_waiter_stamps():
     assert sorted(clocks) == [NOW - 30, NOW - 1]                  # the stamps are the real arrivals
 
 
-def test_decode_collect_window_opens_at_the_real_oldest_and_a_p1_long_ends_it_now(caplog):
+def test_set_wait_opens_at_the_members_arrival_and_a_p1_long_ends_it_now(caplog, monkeypatch):
+    # SET SCHEDULER (SOLL v2): the wait is the set's T_halb; PRIO-AS-AGE's urgency (priority > 0 needing P) ends it at once
+    monkeypatch.setenv("FLLIPER_PDFLIP_HALF_FLIP_S", "4.5")
     caplog.set_level(logging.INFO, logger="pdflip.front")
 
     async def main(lane_of_long):
         f = _front("D")
         f.awake = "D"
         now = NOW
-        with mock.patch.object(F, "_decode_collect_window_s", lambda: 15.0), \
-             mock.patch.object(Front, "_dc_window_s", lambda self: 15.0), \
-             mock.patch.object(Front, "_dc_d_busy", lambda self: True), \
+        f.t_awake = NOW - 100.0
+        with mock.patch.object(Front, "_dc_d_busy", lambda self: True), \
              mock.patch.object(Front, "_dc_decoding", lambda self: True), \
-             mock.patch.object(Front, "_dc_carried", lambda self: 0):
-            # D DECODES (NODECODE 1015: the hold reads _dc_decoding, not _dc_d_busy -- only a decode lets a set wait)
-            st = f._dc_st()
-            st["t_rel"] = now - 100
+             mock.patch.object(Front, "_dc_carried", lambda self: 0), \
+             mock.patch.object(Front, "_set_seats_free", lambda self: 6):
+            st = f._set_st()
             old_short = _p(f, "s0", 0, now - 3, est_uncached=10)
             big = _p(f, "L", lane_of_long, now - 1, est_uncached=3 * X, est_prompt=3 * X)
             route = f._decode_collect(now, [old_short, big])
@@ -387,7 +387,7 @@ def test_decode_collect_window_opens_at_the_real_oldest_and_a_p1_long_ends_it_no
     assert any(m.startswith(PA.MARK_URGENT) and "site=decode-collect" in m for m in [r.getMessage() for r in caplog.records])
     route0, t_open0, n0 = asyncio.run(main(0))
     assert route0 == "hold" and n0 == 0
-    assert t_open0 == NOW - 3                                     # the window clock: the REAL oldest arrival
+    assert t_open0 == NOW - 1                                     # the set's clock: its first member's arrival
     with _mode(False):
         assert asyncio.run(main(1))[0] == "hold"
 

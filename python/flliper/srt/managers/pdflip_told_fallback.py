@@ -343,6 +343,38 @@ class PdFlipToldReadAck:
     reads: List[Tuple[str, int]] = field(default_factory=list)
 
 
+@dataclass
+class PdFlipStreamControl:
+    """K20 (17.10.): follower -> PP0 on any GlooAckChannel stream, consumed INSIDE the channel (never handed to a
+    caller). ``bye`` = this rank goes to sleep: it completes PP0's standing receive and PP0 does not re-arm it until
+    ``wake()``. ``beat`` = idle heartbeat: completes the standing receive so gloo's receive clock (7200 s from the
+    post) restarts long before it can fire."""
+
+    rank: int
+    kind: str  # "bye" | "beat"
+    #: K20d: sleep epoch of a bye (= the sender's wake count + 1); PP0 takes a bye only of ITS current epoch. -1 = none.
+    epoch: int = -1
+
+
+#: K20: an idle follower completes PP0's standing receive at least this often (s); 0 = off. Vorgabe AN. Far below the
+#: gloo timeout (7200 s) that killed PP0 at 00:36:54Z (boot 1016_172204: the last ack at 22:36:54Z re-armed the frame,
+#: P slept 22:36:57Z, nothing was ever sent again).
+ENV_HEARTBEAT_S = "FLLIPER_PDFLIP_PF_ACK_HEARTBEAT_S"
+HEARTBEAT_S_DEFAULT = 600.0
+#: K20: how long PP0 waits at sleep for the followers' byes (s). Far below the gloo timeout.
+ENV_SLEEP_COLLECT_S = "FLLIPER_PDFLIP_PF_TOLD_ACK_TIMEOUT_S"
+SLEEP_COLLECT_S_DEFAULT = 10.0
+ENV_WAKE_DRAIN_S = "FLLIPER_PDFLIP_PF_WAKE_DRAIN_S"
+WAKE_DRAIN_S_DEFAULT = 5.0
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
 # ---------------------------------------------------------------------------
 # transport
 # ---------------------------------------------------------------------------
@@ -378,6 +410,22 @@ class GlooAckChannel:
         #: misframed for good, so this follower sends nothing more (PP0's
         #: Frist answers told=0 for its reads from then on -- alive, slower).
         self.dead = False
+        #: K20: PP0 side: ranks that said bye (their standing frame is not re-armed until wake()); follower side:
+        #: monotonic time of the last post (heartbeat clock) and the bye sent flag.
+        self._sleeping: set = set()
+        self._last_post = time.monotonic()
+        self.byes_taken = 0
+        #: K20d: wakes seen by this rank (lockstep on every rank: one per resume leg); a bye is stamped wakes+1
+        self.wakes = 0
+        self.byes_stale = 0
+        #: K20b: follower: after its own bye NO send leaves until wake (a send without a posted receive blocks 7200 s)
+        self._gated = False
+        #: K20c: the bye could not be posted inside the budget (an earlier send still hangs): pump() posts it
+        self._bye_pending = False
+        self.held = 0
+        #: K20b: PP0: sleep_quiesce left byes missing -> wake() drains them before re-arming
+        self._bye_missing = False
+        self.beats_taken = 0
 
     @classmethod
     def for_scheduler(cls, scheduler) -> "GlooAckChannel":
@@ -385,11 +433,18 @@ class GlooAckChannel:
         return cls(group, int(scheduler.ps.pp_rank), _world_ranks(scheduler))
 
     # -- follower ------------------------------------------------------
-    def pump(self) -> bool:
+    def pump(self, beat: bool = True) -> bool:
         """True when nothing is in flight any more. A completed send is
-        joined (instantly: its flag is set) only to surface its error."""
+        joined (instantly: its flag is set) only to surface its error.
+        ``beat``: an idle follower posts the K20 heartbeat here (once per HEARTBEAT_S)."""
         if self._inflight is None:
-            return True
+            if beat and self._bye_pending:
+                self._bye_pending = False
+                if not self.send_nowait(PdFlipStreamControl(rank=self.pp_rank, kind="bye", epoch=self.wakes + 1)):
+                    self._bye_pending = True
+            elif beat and self._beat_due():
+                self.send_nowait(PdFlipStreamControl(rank=self.pp_rank, kind="beat"))
+            return self._inflight is None
         if not all(pw.completed for pw, _t in self._inflight):
             return False
         done, self._inflight = self._inflight, None
@@ -414,8 +469,12 @@ class GlooAckChannel:
         the ack left the outbox (posted, or dropped on a dead stream)."""
         if self.dead:
             return True
-        if not self.pump():
+        if self._gated and not (isinstance(ack, PdFlipStreamControl) and ack.kind == "bye"):
+            self.held += 1
             return False
+        if not self.pump(beat=False):
+            return False
+        self._last_post = time.monotonic()
         import numpy as np
         import torch
         import torch.distributed as dist
@@ -463,15 +522,97 @@ class GlooAckChannel:
             )
         return frame
 
+    def _beat_due(self) -> bool:
+        if self.dead or self.pp_rank == 0 or self._gated:
+            return False
+        hb = _env_float(ENV_HEARTBEAT_S, HEARTBEAT_S_DEFAULT)
+        return hb > 0 and time.monotonic() - self._last_post >= hb
+
+    def send_bye(self, budget_s: float) -> bool:
+        """Follower, at sleep: complete PP0's standing receive, then GATE every send until wake(). Bounded; True = the
+        bye has LEFT (PP0 received it). A bye still in flight at the budget stays in flight (PP0's frame is posted:
+        its wake() drain takes it) but the gate is closed either way."""
+        if self.dead or self.pp_rank == 0:
+            return True
+        end = time.monotonic() + budget_s
+        msg = PdFlipStreamControl(rank=self.pp_rank, kind="bye", epoch=self.wakes + 1)
+        while not self.send_nowait(msg):
+            if time.monotonic() >= end:
+                # an earlier send still hangs: the bye is NOT posted. Gate, but remember it; pump() posts it as soon
+                # as that send completes (K20c) -- PP0's receive must not stay posted through the sleep.
+                self._gated = True
+                self._bye_pending = True
+                return False
+            time.sleep(0.01)
+        self._gated = True
+        while not self.pump(beat=False):
+            if time.monotonic() >= end:
+                return False
+            time.sleep(0.01)
+        return True
+
+    def open_sends(self) -> int:
+        """Sends of this process not completed (in flight, blocked on a missing receive) -- a gated, held fact is
+        not a send but counts as held."""
+        if self._bye_pending:
+            return 1
+        if self._inflight is None:
+            return 0
+        return 0 if all(pw.completed for pw, _t in self._inflight) else 1
+
+    def open_receives(self) -> int:
+        """PP0: standing receives that are posted right now (a frame past IDLE and not COMPLETE)."""
+        n = 0
+        for f in self._frames.values():
+            if f.state in ("awaiting_size", "awaiting_data"):
+                n += 1
+        return n
+
+    def wake(self) -> None:
+        """Every rank: the group is awake again. Follower: the send gate opens. PP0: a bye that came after its
+        sleep budget is taken FIRST (bounded, ENV_WAKE_DRAIN_S) so no follower is 'asleep' through the awake phase;
+        then the frames are re-armed by the next harvest."""
+        self._gated = False
+        self._bye_pending = False
+        if self.pp_rank == 0:
+            if self._bye_missing:
+                end = time.monotonic() + _env_float(ENV_WAKE_DRAIN_S, WAKE_DRAIN_S_DEFAULT)
+                n = len(self.world_ranks) - 1
+                while len(self._sleeping) < n and time.monotonic() < end:
+                    self.harvest()
+                    time.sleep(0.005)
+                if len(self._sleeping) < n:
+                    logger.error("PDFLIP PP-RECEIVE-CENSUS at=wake %s: %d bye(s) still missing", self.label,
+                                 n - len(self._sleeping))
+            self._bye_missing = False
+            self._sleeping.clear()
+        self.wakes += 1  # K20d: after the drain (a late bye of THIS sleep is still current while draining)
+
     def harvest(self) -> List[Any]:
         out: List[Any] = []
         for r in range(1, len(self.world_ranks)):
+            if r in self._sleeping:
+                continue
             frame = self._frame(r)
             for _ in range(HARVEST_MAX_PER_SRC):
                 try:
                     if not frame.poll():
                         break
-                    out.append(frame.take())
+                    item = frame.take()
+                    if isinstance(item, PdFlipStreamControl):
+                        if item.kind == "bye" and item.epoch not in (-1, self.wakes + 1):
+                            self.byes_stale += 1
+                            logger.warning(
+                                "PDFLIP PP-RECEIVE-CENSUS %s: STALE bye from pp%d epoch=%d (PP0 expects %d) discarded; "
+                                "the follower is awake", self.label, r, item.epoch, self.wakes + 1)
+                            continue
+                        if item.kind == "bye":
+                            self._sleeping.add(r)
+                            self.byes_taken += 1
+                            break
+                        self.beats_taken += 1
+                        continue
+                    out.append(item)
                 except Exception as exc:  # noqa: BLE001 - the Frist covers it
                     self._error(f"receive[pp{r}]", exc)
                     break
@@ -1658,3 +1799,72 @@ def follower_pump(scheduler) -> None:
                 "PF TOLD-ACK SENT rank pp=%s seq=%d reads=%s (n=%d)",
                 scheduler.ps.pp_rank, ack.seq, list(ack.reads), n,
             )
+
+
+# ---------------------------------------------------------------------------
+# K20 (17.10.): the standing receives at sleep
+# ---------------------------------------------------------------------------
+
+#: scheduler attributes holding the GlooAckChannel of each stream (told-ack, pp-room)
+_STREAM_ATTRS = ("_pdflip_fb_channel", "_pdflip_pr_channel")
+
+
+def _streams(scheduler) -> List[GlooAckChannel]:
+    out = []
+    for a in _STREAM_ATTRS:
+        ch = getattr(scheduler, "__dict__", {}).get(a) if hasattr(scheduler, "__dict__") else getattr(scheduler, a, None)
+        if ch is not None:
+            out.append(ch)
+    return out
+
+
+def sleep_quiesce(scheduler, budget_s: Optional[float] = None) -> int:
+    """K20 root fix. PP0's standing ``ObjectRecvFrame`` on each ack stream is a posted gloo receive; gloo's clock on a
+    posted receive is the process-group timeout (7200 s here) and nothing ever stops it: boot 1016_172204 re-armed the
+    frame on the last ack of rid pdflip-178-2512 (22:36:54Z), P slept at 22:36:57Z, no pass ran, and at 00:36:54Z PP0
+    died on ``PF told-ack receive[pp1] ... Timed out waiting 7200000ms`` (the pp-room receive followed as a cascade).
+
+    At sleep every follower completes PP0's standing receive with a ``bye`` (its own rank, bounded), PP0 takes the byes
+    and does NOT re-arm those frames until ``wake``. PP0 decides, the followers only report: no rank-local abort.
+    Returns the number of receives still open on THIS rank (PP0; followers return 0). The census line is emitted by
+    every rank; ``open`` must be 0."""
+    budget = _env_float(ENV_SLEEP_COLLECT_S, SLEEP_COLLECT_S_DEFAULT) if budget_s is None else float(budget_s)
+    rank = int(scheduler.ps.pp_rank)
+    chans = _streams(scheduler)
+    if int(getattr(scheduler.ps, "pp_size", 1) or 1) <= 1 or not chans:
+        logger.info("PDFLIP PP-RECEIVE-CENSUS at=sleep rank=pp%d open=0 streams=0", rank)
+        return 0
+    t0 = time.monotonic()
+    open_n = 0
+    detail = []
+    if rank != 0:
+        for ch in chans:
+            ok = ch.send_bye(budget)
+            detail.append(f"{ch.label}:bye={'sent' if ok else 'UNSENT'},held={ch.held}")
+            if not ok:
+                open_n += 1
+    else:
+        end = t0 + budget
+        while True:
+            for ch in chans:
+                ch.harvest()  # byes are consumed inside the channel; an ack still in flight at sleep is dropped (PP0's Frist: told=0)
+            open_n = sum(ch.open_receives() for ch in chans)
+            if open_n == 0 or time.monotonic() >= end:
+                break
+            time.sleep(0.005)
+        for ch in chans:
+            ch._bye_missing = len(ch._sleeping) < len(ch.world_ranks) - 1
+        detail = [f"{ch.label}:open={ch.open_receives()},byes={ch.byes_taken},beats={ch.beats_taken}" for ch in chans]
+    open_sends = sum(ch.open_sends() for ch in chans)
+    logger.log(
+        logging.INFO if (open_n == 0 and open_sends == 0) else logging.ERROR,
+        "PDFLIP PP-RECEIVE-CENSUS at=sleep rank=pp%d open=%d open_sends=%d streams=%d waited_s=%.2f %s",
+        rank, open_n, open_sends, len(chans), time.monotonic() - t0, " ".join(detail),
+    )
+    return open_n + open_sends
+
+
+def wake(scheduler) -> None:
+    """PP0: re-arm the standing receives after the group woke (the next harvest posts them)."""
+    for ch in _streams(scheduler):
+        ch.wake()

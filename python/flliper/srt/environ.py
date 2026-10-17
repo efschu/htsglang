@@ -2081,7 +2081,17 @@ class Envs:
     # PBOUND-FLIP-NOW, the ARRIVAL-SEAT flip_now and the SHORT seat on D.
     # Marker 'PDFLIP DECODE-COLLECT hold|dcheck|release'. 0 = the old path, byte
     # for byte (whatever D_CHECK_S says).
-    FLLIPER_PDFLIP_DECODE_COLLECT_WINDOW_S = EnvFloat(15.0)
+    # SOLL v2 (17.10.): DEPRECATED, default 0 = the old window is OFF and nothing reads it any more -- the set
+    # scheduler (FLLIPER_PDFLIP_HALF_X_FRAC / FLLIPER_PDFLIP_HALF_FLIP_S below) replaced the 7.5 s / 15 s timers and the epoch
+    # rule (R7). Kept so a profile that still names it parses.
+    FLLIPER_PDFLIP_DECODE_COLLECT_WINDOW_S = EnvFloat(0.0)
+    # SET SCHEDULER (SOLL v2 R3, user 17.10. ~05:30Z "einfach als flag setzen wie lang halbeflipzeit dauer sein soll"):
+    # T_halb, the half flip time in seconds -- how long a halb/big request waits for company while D decodes.
+    # Never computed, only reported against the measured p90s (HALF-FLIP-CHECK, R10). 0 = no wait (decide at once).
+    FLLIPER_PDFLIP_HALF_FLIP_S = EnvFloat(4.5)
+    # SET SCHEDULER (SOLL v2 section 2): F_halb, halbX = F_halb x X(depth). A request with halbX <= uncached < X is
+    # "halb" (collects, R3); below it is "kurz" (D at once, R2).
+    FLLIPER_PDFLIP_HALF_X_FRAC = EnvFloat(0.5)
     # DECODE-COLLECT D-CHECK (user ~19:12Z: "es wird 7,5 gesammelt, wenn dann
     # gesammelt nicht mehr token anstehen, als X in D prefillen wuerde, dann
     # prefillt er in D die kleine menge ... auch diese zeit muss einstellbar

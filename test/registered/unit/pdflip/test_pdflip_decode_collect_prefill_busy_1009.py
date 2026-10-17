@@ -86,51 +86,6 @@ def test_a_d_that_prefills_a_granted_short_is_busy(monkeypatch):
     assert f._dc_carried() == 6239 and f._dc_d_busy()
 
 
-def test_the_second_short_of_a_burst_collects_and_the_sum_goes_to_p(monkeypatch):
-    """6239 in flight + 6239 arriving = 12478 > X=12288 -> P's batch. NODECODE 1015 (user law: collecting only while a DECODE
-    stands on D): D only prefills "first", no decode -- the set is priced (the sum goes to P) but decided AT ONCE, not after
-    the window (was: ">= 0.25 s, it waited the window")."""
-    _on(monkeypatch, window="0.3")
-    monkeypatch.setenv("FLLIPER_PDFLIP_DECODE_COLLECT_D_CHECK_S", "0")
-    f = _front(running=[], n=6, kv={"available": 400000, "evictable": 0})
-    _idle_d_prefilling(f, 6239)
-    t0 = time.time()
-    assert asyncio.run(f._decode_collect_short("second", 6239)) == "P"
-    assert time.time() - t0 < 0.25, "no decode on D: decided at once, it did not wait the window"
-    assert f.counters["decode_collect_release_P"] == 1 and f.counters["decode_collect_hold"] == 0
-
-
-def test_a_small_second_short_fits_the_sum_and_goes_to_d(monkeypatch):
-    """6239 in flight + 800 arriving = 7039 <= X -> D (NODECODE 1015: at once -- no decode on D, no window wait)."""
-    _on(monkeypatch, window="0.3")
-    monkeypatch.setenv("FLLIPER_PDFLIP_DECODE_COLLECT_D_CHECK_S", "0")
-    f = _front(running=[], n=6, kv={"available": 400000, "evictable": 0})
-    _idle_d_prefilling(f, 6239)
-    assert asyncio.run(f._decode_collect_short("second", 800)) == "D"
-    assert f.counters["decode_collect_release_D"] == 1
-
-
-def test_the_burst_of_six_sends_five_to_p_and_keeps_one_on_d(monkeypatch):
-    """The y6 acceptance burst, end to end through the seat: six 6239-token SHORTs
-    in one second on an idle D. Before: all six took a D seat (37k prefilled on D,
-    no DECODE-COLLECT line). Now the first is granted, the other five collect and
-    their sum (5 x 6239 + the 6239 in flight > X) releases them to P's batch."""
-    _on(monkeypatch, window="0.3")
-    monkeypatch.setenv("FLLIPER_PDFLIP_DECODE_COLLECT_D_CHECK_S", "0")
-    f = _front(running=[], n=6, kv={"available": 400000, "evictable": 0})
-    f.tp_prefill_max_tokens = X_LIVE
-
-    async def burst():
-        first = await f._acquire_short_seat("s0", 6300, uncached=6239)
-        assert first is not None
-        f._d_pf_book().grant(rid="s0", tokens=6239, now=time.time())  # the front's grant hook
-        return await asyncio.gather(*[f._acquire_short_seat(f"s{i}", 6300, uncached=6239)
-                                      for i in range(1, 6)])
-
-    assert asyncio.run(burst()) == [None] * 5
-    assert f.counters["decode_collect_release_P"] >= 1
-
-
 def test_a_simultaneous_burst_books_before_the_seat_not_after(monkeypatch):
     """NF int23xsum metal run 09.10. (6 x 5200 on an idle D, X=6008): all six
     arrivals read the book in the same loop turn; the grant used to be booked

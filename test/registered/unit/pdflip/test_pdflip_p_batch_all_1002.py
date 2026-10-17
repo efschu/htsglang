@@ -88,7 +88,7 @@ def test_pdflip_15_52_a_short_arriving_while_p_is_awake_gets_a_p_leg1(caplog):
     assert not p.skip_leg1 and not p.short_kept and not p.d_direct, \
         "P is awake: a normal leg 1 on P, never kept for a D prefill"
     assert not any("SHORT-BEHIND-P" in m for m in caplog.messages)
-    assert any("PDFLIP SHORT-TO-P rid=" in m and "joins P's batch" in m for m in caplog.messages)
+    assert any("PDFLIP SHORT-IN-P-PHASE rid=" in m and "joins P's batch" in m for m in caplog.messages)
 
 
 def test_a_short_arriving_while_d_flips_to_p_joins_ps_batch():
@@ -109,10 +109,10 @@ def test_the_d_phase_keep_is_unchanged():
 
 # ---- (2) queued for D at the D->P flip -> P's batch -----------------------------
 
-def _pending(rid, age_s, **kw):
+def _pending(rid, age_s, est_uncached=200, **kw):
     loop = asyncio.new_event_loop()
     return Pending(rid=rid, path="/generate", payload={}, text="x", t_arrive=time.time() - age_s,
-                   fut=loop.create_future(), est_prompt=1000, est_uncached=200, **kw)
+                   fut=loop.create_future(), est_prompt=1000, est_uncached=est_uncached, **kw)
 
 
 def test_prefill_queued_for_d_at_the_d_to_p_flip_goes_to_p(caplog):

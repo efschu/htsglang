@@ -41,8 +41,7 @@ MEASURED_LATENCY_S = [52.9, 73.5, 27.7, 26.4, 21.7, 45.9, 20.5, 29.7]
 
 def _on(monkeypatch):
     monkeypatch.setenv("FLLIPER_PDFLIP_ENABLE_ARRIVAL_SEAT_RULE", "1")
-    monkeypatch.setenv("FLLIPER_PDFLIP_DECODE_COLLECT_WINDOW_S", "15")
-    monkeypatch.delenv("FLLIPER_PDFLIP_DECODE_COLLECT_D_CHECK_S", raising=False)
+    monkeypatch.setenv("FLLIPER_PDFLIP_HALF_FLIP_S", "4.5")
     monkeypatch.delenv("FLLIPER_PDFLIP_ENABLE_ARRIVAL_SEAT_AGE_PLAN", raising=False)  # default on
     monkeypatch.delenv("FLLIPER_PDFLIP_PBOUND_FLIP_NOW", raising=False)              # default on
 
@@ -57,6 +56,8 @@ def _full_d_with_a_collected_set(running=6, ready=5, n=6, now=None):
     f._ready_for_d = [_pending("rdy%d" % i, 3000, now - 100.0 + i) for i in range(ready)]
     a, b = _pending("s1", 3000, now - 16.0), _pending("s2", 3000, now - 10.0)
     f.queue = [b, a]
+    # SET SCHEDULER: the collected set was decided route P (its SHORTs fell through to the queue, committed to the flip)
+    f._set_st()["go_p"] = {"s1", "s2"}
     f._park_attempt_epoch = -1
     return f, now, a
 
@@ -99,17 +100,6 @@ def test_the_immediate_park_path_flips_at_the_release_too(monkeypatch):
     got = f._immediate_park_due(f.groups["D"], now)
     assert got is head
     assert not f.__dict__.get("_dc_p_cap")
-
-
-def test_the_flip_decision_never_reads_the_seat_count(monkeypatch):
-    """Whatever ``taken`` is, the flip is the same: a counter that explodes would have held the gate."""
-    _on(monkeypatch)
-    f, now, head = _full_d_with_a_collected_set()
-    calls = []
-    real = f._arrival_seat_taken
-    f._arrival_seat_taken = lambda: (calls.append(1), real())[1]
-    assert _step(f, now) == (True, True, head)
-    assert calls == [], "route P: the seat count is not consulted on the way to the flip"
 
 
 def test_an_empty_queue_after_the_release_is_no_flip(monkeypatch):
@@ -268,6 +258,7 @@ def _collected_set(lanes_ages, running=6, ready=0, n=6):
         p = _pending(rid, 3000, now - age)
         p.lane = lane
         f.queue.append(p)
+    f._set_st()["go_p"] = {p.rid for p in f.queue}   # the decided set: committed to the flip
     f._park_attempt_epoch = -1
     return f, now
 
@@ -306,24 +297,6 @@ def test_a2_ready_for_d_waiting_with_free_seats_is_no_reason_to_hold_the_release
 
 # ------------------------------------------------------------------ route D stays a queue
 
-def test_a_route_d_seat_wait_is_a_real_queue_and_nothing_flips_or_parks(monkeypatch):
-    """Gegenprobe (NF-Sitz 14:28:52Z, pdflip-74-295): a collect set released route=D waits 106 s for a D seat
-    while 6 seats decode. A real queue: the REAL ``_decode_collect`` routes a small set (sum <= X, nothing P-bound,
-    past the D-check) to D, it goes to D's admission line, nothing flips, nothing parks -- the seat wait of a
-    request D itself takes is not touched by this change (and K10 (c), which never fired here, is gone)."""
-    _on(monkeypatch)
-    f, now, _ = _full_d_with_a_collected_set()
-    f.queue[:] = [_pending("short0", 300, now - 10.0), _pending("short1", 300, now - 9.0)]
-    handed = []
-    f._dc_hand_to_d = lambda now_: handed.append(now_)
-    for t in range(0, 121, 5):
-        res = _step(f, now + t)
-        assert res[0] is False, "route D never flips D->P"
-    assert f.counters["decode_collect_release_D"] == 1 and f.counters["decode_collect_release_P"] == 0
-    assert handed, "route D: the set goes to D's admission line (the queue)"
-    assert not [k for k in f.counters if "park" in k or "relief" in k]
-    assert f.counters["arrival_seat_flip_now"] == 0
-
 
 # ------------------------------------------------------------------ unchanged neighbours (were in the PBOUND-SEAT-HOLD file)
 
@@ -338,6 +311,7 @@ def test_pbound_flip_now_on_a_full_d_is_unchanged(monkeypatch):
 
 def test_a_d_direct_short_still_yields_to_a_p_bound_request(monkeypatch):
     _on(monkeypatch)
+    monkeypatch.setenv("FLLIPER_PDFLIP_HALF_FLIP_S", "0")   # the flip is DECIDED (a collecting set makes none foreseeable, R2)
     f = _front(running=["r%d" % i for i in range(6)], n=6, kv={"available": 400000, "evictable": 0})
     f.queue = [_pending("new", 87000, time.time() - 1.0)]
     assert f._d_direct_yields("short") is True

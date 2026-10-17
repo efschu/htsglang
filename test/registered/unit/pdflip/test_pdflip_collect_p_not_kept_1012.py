@@ -28,8 +28,7 @@ X_LIVE = 8095
 
 def _collecting(monkeypatch):
     monkeypatch.setenv("FLLIPER_PDFLIP_ENABLE_ARRIVAL_SEAT_RULE", "1")
-    monkeypatch.setenv("FLLIPER_PDFLIP_DECODE_COLLECT_WINDOW_S", "0.3")
-    monkeypatch.setenv("FLLIPER_PDFLIP_DECODE_COLLECT_D_CHECK_S", "0")
+    monkeypatch.setenv("FLLIPER_PDFLIP_HALF_FLIP_S", "0.3")
     monkeypatch.delenv("FLLIPER_PDFLIP_ENABLE_ARRIVAL_SEAT_AGE_PLAN", raising=False)
     monkeypatch.delenv("FLLIPER_PDFLIP_PBOUND_FLIP_NOW", raising=False)
     monkeypatch.delenv("FLLIPER_PDFLIP_ENABLE_DECODE_COLLECT_PREFILL_BUSY", raising=False)
@@ -64,18 +63,18 @@ def test_a_set_that_fits_is_served_by_d_and_carries_no_marker(monkeypatch):
     assert refused == []
 
 
-def test_a_later_single_arrival_in_the_released_p_phase_is_named_too(monkeypatch):
-    """The 663 case at the seat: the phase's route stays ``P`` after the release, so a later arrival
-    priced under X ALONE (800 << 8095) gets the same named refusal -- it is not a D seat's to give."""
+def test_a_later_single_arrival_after_the_release_is_its_own_class_not_the_phases(monkeypatch):
+    """SOLL v2 R7 (the 663 case, inverted): there is no epoch rule. After the set's release a later arrival priced
+    under X ALONE (800, kurz) is D's (R2) -- it is NOT named ``collect_p``; the committed rids are the set's alone."""
     _collecting(monkeypatch)
     f = _d_prefilling(5140)
     first: list = []
     assert asyncio.run(f._acquire_short_seat("second", 7900, first, uncached=7871)) is None
-    assert f._dc_st()["route"] == "P" and first == ["collect_p"]
+    assert "second" in f._set_st()["go_p"] and first == ["collect_p"]
     later: list = []
     seat = asyncio.run(f._acquire_short_seat("third", 900, later, uncached=800))
-    assert seat is None
-    assert later == ["collect_p"]
+    assert seat is not None, "kurz: D at once"
+    assert later == [] and "third" not in f._set_st()["go_p"]
 
 
 def test_a_phase_that_moved_while_waiting_is_not_the_sum_rules_verdict(monkeypatch):
@@ -84,13 +83,13 @@ def test_a_phase_that_moved_while_waiting_is_not_the_sum_rules_verdict(monkeypat
     _collecting(monkeypatch)
     f = _d_prefilling(5140)
 
-    async def moved(rid, unc):
+    async def moved(rid, unc, *a):
         f.epoch += 1
         return "P"
 
     f._decode_collect_short = moved
     refused: list = []
-    assert asyncio.run(f._acquire_short_seat("second", 900, refused, uncached=800)) is None
+    assert asyncio.run(f._acquire_short_seat("second", 5100, refused, uncached=5000)) is None   # halb: it joins the set
     assert refused == []
 
 
@@ -135,8 +134,7 @@ def _payload(uncached):
 
 
 def _handler_front(monkeypatch):
-    monkeypatch.setenv("FLLIPER_PDFLIP_DECODE_COLLECT_WINDOW_S", "0.4")
-    monkeypatch.setenv("FLLIPER_PDFLIP_DECODE_COLLECT_D_CHECK_S", "0")
+    monkeypatch.setenv("FLLIPER_PDFLIP_HALF_FLIP_S", "0.4")
     monkeypatch.delenv("FLLIPER_PDFLIP_ENABLE_ARRIVAL_SEAT_RULE", raising=False)
     monkeypatch.delenv("FLLIPER_PDFLIP_PRICE_BARRIER", raising=False)
 
@@ -198,7 +196,7 @@ def test_handler_set_over_x_is_queued_for_p_not_kept_for_d(monkeypatch, caplog):
     with caplog.at_level(logging.INFO, logger="pdflip.front"):
         asyncio.run(_drive(f, sizes))
     msgs = [r.getMessage() for r in caplog.records]
-    assert any("DECODE-COLLECT release" in m and "route=P" in m for m in msgs), msgs
+    assert any("SET-VERDICT" in m and "verdict=FLIP_P" in m for m in msgs), msgs
     assert not [m for m in msgs if m.startswith("PDFLIP SHORT-KEPT")], "released-to-P SHORT was kept for D"
     assert len([m for m in msgs if m.startswith("PDFLIP COLLECT-P-QUEUED")]) == 3
     assert len(f.queue) == 3 and all(not p.skip_leg1 and not p.short_kept and not p.d_direct for p in f.queue)
@@ -211,33 +209,39 @@ def test_handler_set_over_x_is_queued_for_p_not_kept_for_d(monkeypatch, caplog):
     assert f.counters["collect_p_not_kept"] == 3 and f.counters["short_kept_d"] == 0
 
 
-def test_handler_single_request_in_a_route_p_phase_follows_the_phase(monkeypatch, caplog):
-    """The 663 case: after the release (route P stays for the whole D phase, ``_decode_collect_short``
-    answers "P" at once), a later arrival priced UNDER X alone took the same exit and went to D --
-    19595 = 11724 + 7871 on D in that phase. It must queue for P too: the flip takes everything queued."""
+def test_handler_single_kurz_request_after_a_p_release_is_served_by_d(monkeypatch, caplog):
+    """SOLL v2 R7 inverts the 663 case: after the release (route P for the three halb SHORTs) a later arrival
+    priced UNDER halbX alone (900, kurz) is D's -- no epoch rule sends it to P."""
     f = _handler_front(monkeypatch)
     with caplog.at_level(logging.INFO, logger="pdflip.front"):
-        asyncio.run(_drive(f, [3000, 3000], settle=1.0))  # releases route P
-        assert f._dc_st()["route"] == "P"
-        asyncio.run(_drive(f, [900], settle=0.5))  # one request, 900 << X, same phase (same epoch)
+        asyncio.run(_drive(f, [3000, 3000], settle=1.0))  # the pair flips: FLIP_P
+        asyncio.run(_drive(f, [900], settle=0.5))  # one kurz request, same epoch
     msgs = [r.getMessage() for r in caplog.records]
     assert not [m for m in msgs if m.startswith("PDFLIP SHORT-KEPT")], msgs
-    assert len(f.queue) == 3 and list(f._ready_for_d) == [] and f.d_legs == []
-    assert [int(p.est_uncached) for p in f.queue].count(900) == 1
-    assert _d_direct_prefill_sum(f) == 0
+    assert len(f.queue) == 2 and f.d_legs and [int(p.est_uncached) for p in f.queue].count(900) == 0
+    assert any("verdict=D_NOW why=R2" in m and "classes=kurz" in m for m in msgs)
 
 
-def test_handler_a_fitting_set_is_still_served_by_d(monkeypatch, caplog):
-    """Control: a set whose sum fits X releases route=D, no COLLECT-P-QUEUED, D serves it (SK / D seat
-    path untouched)."""
+def test_handler_a_kurz_pair_is_served_by_d_at_once(monkeypatch, caplog):
+    """Control: requests under halbX are D's at once (R2) -- no COLLECT-P-QUEUED, no wait."""
     f = _handler_front(monkeypatch)
     with caplog.at_level(logging.INFO, logger="pdflip.front"):
         asyncio.run(_drive(f, [1000, 1000]))
     msgs = [r.getMessage() for r in caplog.records]
-    assert any("DECODE-COLLECT release" in m and "route=D" in m for m in msgs), msgs
     assert not [m for m in msgs if "COLLECT-P-QUEUED" in m]
     assert len(f.d_legs) == 2 and len(f.queue) == 0
     assert f.counters["collect_p_not_kept"] == 0
+
+
+def test_handler_a_halb_alone_is_served_by_d_after_t_half(monkeypatch, caplog):
+    """Control for R3: one halb SHORT waits T_halb (0.4 s here), then D takes it; no flip, no COLLECT-P-QUEUED."""
+    f = _handler_front(monkeypatch)
+    with caplog.at_level(logging.INFO, logger="pdflip.front"):
+        asyncio.run(_drive(f, [3000]))
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("SET-VERDICT" in m and "verdict=D_AFTER_TIMER" in m for m in msgs), msgs
+    assert not [m for m in msgs if "COLLECT-P-QUEUED" in m]
+    assert len(f.d_legs) == 1 and len(f.queue) == 0 and f.counters["collect_p_not_kept"] == 0
 
 
 def test_handler_sk_still_keeps_a_gate_held_short(monkeypatch, caplog):

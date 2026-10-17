@@ -680,8 +680,7 @@ def test_b2c_every_l_line_the_spec_names_is_present_with_its_denominators():
                                            "p_concurrency=", "passes=", "queue_at_exit="]),
         "L2": (front_src, "PDFLIP D-ADMIT rid=", ["seat=", "rank=", "oldest_wait_s=", "source="]),
         "L3": (front_src, "PDFLIP D-REFILL", ["freed_by=", "seats_free=", "queued_d="]),
-        # P-BATCH-ALL (02.10.): SHORT arrivals in a P phase join P's batch
-        "L4": (front_src, "PDFLIP SHORT-TO-P", ["epoch=", "n=", "oldest_wait_s="]),
+        # L4 (the per-drain "PDFLIP SHORT-TO-P epoch= n= oldest_wait_s=" line) is gone: SOLL v2 R7 removed SHORT-TO-P
         "L5": (front_src, "PDFLIP LATE-BATCH", ["deferred_to_epoch="]),
         "L9": (sched_src, "PDFLIP X-GATE", ["uncached=", "X=", "replicated_term=", "verdict="]),
         "L10": (front_src, "PDFLIP X-ROUTE", ["est_uncached=", "X=", "ESTIMATE"]),

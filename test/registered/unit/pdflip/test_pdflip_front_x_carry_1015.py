@@ -323,7 +323,7 @@ def test_d6_every_hand_over_site_records_its_x_and_the_post_carries_the_headers(
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             funcs[node.name] = ast.get_source_segment(src, node) or ""
-    for name in ("_asr_queued_short_to_d", "_dc_hand_to_d", "_x_idle_regrant", "_d_short_drain"):
+    for name in ("_asr_queued_short_to_d", "_x_idle_regrant", "_d_short_drain"):
         assert "_stamp_x_decision" in funcs[name], f"{name} hands a request to D without recording its X"
     leg2 = funcs["leg2"]
     assert "_front_x_headers" in leg2 and "**_post_kw" in leg2

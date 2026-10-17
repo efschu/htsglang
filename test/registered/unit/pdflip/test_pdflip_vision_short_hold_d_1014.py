@@ -132,7 +132,7 @@ def test_pdflip_20_129_is_kept_for_d_not_ps_batch(caplog):
     assert not p.p_only, "image-cached: priced as text"
     assert f.counters["short_hold_d"] == 1 and f.counters["short_behind_p"] == 0
     assert any("PDFLIP SHORT-HOLD-D rid=" in m and "src=d_served_anchor" in m for m in caplog.messages)
-    assert not any("PDFLIP SHORT-TO-P rid=" in m for m in caplog.messages)
+    assert not any("PDFLIP SHORT-IN-P-PHASE rid=" in m for m in caplog.messages)
 
 
 def test_a_store_credited_short_still_joins_ps_batch(caplog):
@@ -141,7 +141,7 @@ def test_a_store_credited_short_still_joins_ps_batch(caplog):
     queued, ready = _arrive(f)
     assert ready == [] and len(queued) == 1
     assert not queued[0].d_presence_only and not queued[0].skip_leg1
-    assert any("PDFLIP SHORT-TO-P rid=" in m for m in caplog.messages)
+    assert any("PDFLIP SHORT-IN-P-PHASE rid=" in m for m in caplog.messages)
 
 
 def test_a_d_credit_the_store_backs_still_joins_ps_batch():
@@ -152,10 +152,10 @@ def test_a_d_credit_the_store_backs_still_joins_ps_batch():
 
 # ---- the P drain leaves it ----------------------------------------------------------
 
-def _pending(rid, age_s, **kw):
+def _pending(rid, age_s, est_uncached=200, **kw):
     loop = asyncio.new_event_loop()
     return Pending(rid=rid, path="/generate", payload={}, text="x", t_arrive=time.time() - age_s,
-                   fut=loop.create_future(), est_prompt=1000, est_uncached=200, **kw)
+                   fut=loop.create_future(), est_prompt=1000, est_uncached=est_uncached, **kw)
 
 
 def test_the_p_drain_does_not_take_a_d_presence_only_short():
@@ -200,7 +200,7 @@ def test_pdflip_2_55_a_credit_d_slept_on_goes_to_ps_batch(caplog):
     assert not queued[0].d_presence_only
     assert f.counters["short_hold_d_stale"] == 1 and f.counters["short_hold_d"] == 0
     assert any("PDFLIP SHORT-HOLD-D STALE rid=" in m for m in caplog.messages)
-    assert any("PDFLIP SHORT-TO-P rid=" in m for m in caplog.messages)
+    assert any("PDFLIP SHORT-IN-P-PHASE rid=" in m for m in caplog.messages)
 
 
 def test_an_unknown_credit_epoch_is_not_held():

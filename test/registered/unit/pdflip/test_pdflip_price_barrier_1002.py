@@ -40,6 +40,13 @@ from flliper.srt.pdflip import front_tokens as FT  # noqa: E402
 X = 4096
 
 
+@pytest.fixture(autouse=True)
+def _legacy_price_barrier_machinery(monkeypatch):
+    """SOLL R2 (Review A h16u A2): under the set scheduler the barrier decides nothing (``Front.PRICE_BARRIER_DECIDES``
+    False; see test_pdflip_set_scheduler_1017 A2). This file pins the retained machinery itself, so it arms it."""
+    monkeypatch.setattr(F.Front, "PRICE_BARRIER_DECIDES", True)
+
+
 class _Req:
     def __init__(self, payload, path="/v1/messages"):
         self._p = payload
