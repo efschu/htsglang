@@ -6,7 +6,8 @@ ranks must notice a ONE-SIDED orphan in BOTH directions without a new collective
 * TP0 sends an R12 event "K21" at EVERY own orphan ack (also when the host release fails);
 * a worker stops by name (K21RankDivergence) when TP0 reports K21, it has no mark of its own and
   its STATE does not end in 'kv' (or no STATE follows);
-* a worker stops by name when it has its own mark and the next handover brings no K21.
+* V1 (S11): TP0 reports EVERY direct ack (orphaned=0|1); a worker pairs it with its own ack finding
+  per key (FIFO) and stops by name only when both exist and disagree (test_k21_ack_pairing_1017.py).
 
 Host + two workers, the REAL peel / ack / STATE code of test_k21_rank_agreement_1017.py.
 """
@@ -42,7 +43,7 @@ def _wire(r, orphan, release_fails=False):
     if orphan:
         r.writing_check = lambda write_back=False: U._k12_direct_l3_verdict(r, leaf, 1)
     else:
-        r.writing_check = lambda write_back=False: None  # a clean ack on this rank
+        r.writing_check = lambda write_back=False: U._k12_direct_l3_verdict(r, leaf, 0)  # a clean ack (V1: reported too)
     r._k12_republish_orphaned = lambda node, o, _r=r: U._k12_republish_orphaned(_r, node, o)
     if release_fails:
         r._weg2_release_chain_piece_host = lambda node: None
@@ -64,7 +65,7 @@ def _setup(orphans, release_fails_on_tp0=False):
 
 def _k21_sent(ranks):
     with T._as_rank(ranks[0]):
-        return [e for e in m._S.ledger if e[0] == m.K21]
+        return [e for e in m._S.ledger if e[0] == m.K21 and e[3] == 1]  # orphan verdicts
 
 
 def test_only_tp0_orphans_the_workers_stop_by_name():
@@ -80,7 +81,7 @@ def test_only_a_worker_orphans_the_next_handover_stops_it_by_name():
     ranks, leaves = _setup([False, True, False])
     with T._switch(True):
         T._each(ranks, _peel)
-        assert _k21_sent(ranks) == []  # TP0 did not orphan: no K21
+        assert _k21_sent(ranks) == []  # TP0 did not orphan: only a clean (orphaned=0) verdict
         with pytest.raises(m.K21RankDivergence):
             T._broadcast(ranks)
 

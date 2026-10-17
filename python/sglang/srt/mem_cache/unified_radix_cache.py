@@ -6633,13 +6633,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
           from its own ack. Off R12 the rank's own ack decides, as before.
         """
         strict = UnifiedRadixCache._weg2_l3_present_strict()
+        try:
+            # K21 ack pairing (V1): EVERY direct ack reports its finding (1 orphan / 0 clean);
+            # TP0 as an event, a worker into its own FIFO, judged once both exist
+            _r12.note_k21_ack(node, 1 if (orphaned and strict) else 0)
+        except Exception:  # noqa: BLE001 - instrument only
+            pass
         if orphaned and strict:
             # K21 A1: the group-uniform mark (every role) the write-back peel reads
             node._k21_orphan_ack = True
-            try:
-                _r12.note_k21_orphan(node)
-            except Exception:  # noqa: BLE001 - instrument only
-                pass
             n = getattr(UnifiedRadixCache, "_k12_orphan_direct_n", 0) + 1
             UnifiedRadixCache._k12_orphan_direct_n = n
             if n <= 16 or (n & (n - 1)) == 0:
