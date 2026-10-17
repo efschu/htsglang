@@ -43,7 +43,7 @@ from __future__ import annotations
 import json
 import os
 import statistics
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 # H91c3-3: imported with this module (the front imports it before its loop),
 # never lazily from `d_phase_seats` -- d_seats is stdlib-only at import time.
@@ -428,6 +428,10 @@ class SetMember:
     uncached: int
     t_arrive: float
     p_only: bool = False
+    #: H16V F1: the request's OWN uncached tokens at arrival when ``uncached`` was reduced by the prefix an earlier
+    #: member of the same session already brings (0 = ``uncached`` is the own figure). Classes follow the own figure
+    #: (R2: classified at arrival); S sums ``uncached``.
+    own_uncached: int = 0
 
 
 @dataclass(frozen=True)
@@ -459,7 +463,8 @@ def classify_arrival(uncached: int, x_tokens: int, half_frac: float, p_only: boo
 
 def set_verdict(members: Sequence[SetMember], *, x_tokens: int, half_frac: float, t_half_s: float,
                 now: float, t_open: Optional[float], d_decoding: bool, seats_free: int,
-                d_prefill_running_uncached: int = 0, new_since_last: int = 0) -> SetVerdict:
+                d_prefill_running_uncached: int = 0, new_since_last: int = 0,
+                class_x_tokens: Optional[int] = None) -> SetVerdict:
     """The set's verdict (SOLL R1, R3-R6, R8, R9). ``members`` are the collected halb/big requests (a kurz one never
     belongs to a set, R2). ``t_open`` is the stamp of the FIRST member (None: the oldest member's arrival) -- the
     timer starts there ONCE per set (R3), later members never restart it. ``S`` = sum of the members' uncached
@@ -470,14 +475,17 @@ def set_verdict(members: Sequence[SetMember], *, x_tokens: int, half_frac: float
     member or the timer's end flips; without a big member S >= X flips at once (R3), the timer's end with S < X
     sends the set to D (R3). A flip verdict is PARK_NO_SEAT when fewer free D seats than members (R5): the set is
     prefilled on P and parked, its decode starts from L2/L3 when a seat frees. ``new_since_last`` (members that
-    joined since the caller's last look) is informational: it only enters the ``why`` text."""
+    joined since the caller's last look) is informational: it only enters the ``why`` text. ``class_x_tokens`` (H16V
+    F2): the X the members are CLASSIFIED with (their own X at arrival, R2a) when ``x_tokens`` is the larger X of a set
+    of k members (P fixed costs of the further members included); default: ``x_tokens``."""
     x = int(x_tokens)
-    hx = half_x_of(x, half_frac)
+    xc = int(class_x_tokens) if class_x_tokens else x
+    hx = half_x_of(xc, half_frac)
     running = max(0, int(d_prefill_running_uncached))
     if not members:
         return SetVerdict(V_COLLECT, "empty", 0.0, running, hx)
     s = sum(max(0, int(m.uncached)) for m in members) + running
-    classes = [classify_arrival(m.uncached, x, half_frac, m.p_only) for m in members]
+    classes = [classify_arrival(m.own_uncached or m.uncached, xc, half_frac, m.p_only) for m in members]
     big = any(c in (CLASS_GROSS, CLASS_P_ONLY) for c in classes)
     t0 = float(t_open) if t_open is not None else min(float(m.t_arrive) for m in members)
     left = max(0.0, float(t_half_s) - (float(now) - t0))
@@ -508,6 +516,34 @@ def set_verdict(members: Sequence[SetMember], *, x_tokens: int, half_frac: float
     if left <= 0.0:
         return SetVerdict(V_D_AFTER_TIMER, "R3 T_halb over, S=%d < X=%d" % (s, x), 0.0, s, hx)
     return SetVerdict(V_COLLECT, "R3 S=%d < X=%d, %.1f s left" % (s, x, left), left, s, hx)
+
+
+def shared_prefix_discount(entries: Sequence[Tuple[str, int, int, float, str]],
+                           common: Callable[[str, str], int]) -> Dict[str, int]:
+    """H16V F1 (SOLL R1: S is the SUM of what P/D must NEW prefill): ``entries`` = ``(rid, uncached, depth, t_arrive,
+    session)``; returns ``{rid: uncached'}`` where a member of a session counts only what its EARLIER session members
+    do not already bring. Member B's uncached tokens are the positions ``[depth_B, N_B)``; an earlier member A of the
+    same session prefills ``[depth_A, N_A)``; the ids both prompts share (``common(A, B)``) cover
+    ``[max(depth_A, depth_B), common)`` of B -- computed once, not twice. The earliest member keeps its own figure;
+    several earlier members discount by the deepest of their overlaps (their covered ranges all start at B's own
+    credit, so the union is the longest). A session unknown here ("") or ``common`` failing (-1/0) discounts nothing."""
+    out: Dict[str, int] = {}
+    seen: List[Tuple[str, int, str]] = []
+    for rid, u, depth, _t, sess in sorted(entries, key=lambda e: e[3]):
+        u = max(0, int(u))
+        best = 0
+        if sess:
+            for arid, adepth, asess in seen:
+                if asess != sess:
+                    continue
+                try:
+                    c = int(common(arid, rid))
+                except Exception:  # noqa: BLE001 -- a missing prompt discounts nothing
+                    c = 0
+                best = max(best, c - max(int(adepth), int(depth)))
+        out[rid] = max(0, u - max(0, best))
+        seen.append((rid, int(depth), sess))
+    return out
 
 
 def _nearest_rank(vals: Sequence[float], q: float) -> float:

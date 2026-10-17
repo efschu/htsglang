@@ -114,6 +114,8 @@ def d_direct_extends(sched: Any, req: Any, rem: int) -> bool:
         from sglang.srt.weg2 import front_x as _fx
 
         fx, _priced = _fx.request_front_x(req)
+        if fx is None and int(rem) > 0:
+            return _resumed_tail_extends(sched, req, int(rem), _fx)
         if fx is None or int(rem) <= 0:
             return False
         static_x = int(getattr(getattr(sched, "server_args", None), "tp_prefill_max_tokens", 0) or 0)
@@ -125,6 +127,50 @@ def d_direct_extends(sched: Any, req: Any, rem: int) -> bool:
     logger.info("%s D-DIRECT-EXTEND rid=%s would_compute=%d front_x=%d limit=%d delivered=%s -- a D-direct "
                 "leg whose prefill never ran: D extends it under X (law 4, X-GESETZ 16.10.), not diverted "
                 "to P", MARK, str(getattr(req, "rid", "?")), int(rem), int(fx), limit,
+                getattr(req, "_weg2_store_delivered", None))
+    return True
+
+
+def _half_frac() -> float:
+    """``SGLANG_WEG2_HALF_X_FRAC`` (SOLL section 2, F_halb), the same flag the front classifies with."""
+    try:
+        from sglang.srt.environ import envs
+
+        return float(envs.SGLANG_WEG2_HALF_X_FRAC.get())
+    except Exception:  # noqa: BLE001
+        return 0.5
+
+
+def _resumed_tail_extends(sched: Any, req: Any, rem: int, _fx: Any) -> bool:
+    """H16V F3 (SCHEDULER-SOLL R2 + R7; NF h16u2 17.10.): a request that already decoded and D parked for a flip
+    comes back with a SHORT store read: its tail ``rem`` is D's own work when it is kurz -- under halbX of the X the
+    front priced the request on at its arrival (``weg2_front_x``, still carried by the Req; the first-admission gate
+    ignores it once output exists, front_x rule 3); a request without one (P hand-over, e.g. weg2-18-250: X came
+    from P's leg 1) is bounded by half of the static X. Five of the six h16u2 flips under X were exactly this: W50-REROUTE
+    ``store_short_after_flip`` with d_extent 77 / 693 / 1563 / 1926 / 2054 -> p_only -> a whole D->P flip and six
+    parked decodes for a few hundred tokens ("Kann D einen Request unter X nicht nehmen, ist das ein Defekt, kein
+    Flipgrund", R7). A tail of halbX or more stays on RESUME-VIA-P as before. Group-uniform: ``rem`` is the synced witness, ``weg2_front_x`` a field of the broadcast
+    request, the fraction and the static X launch/env values of every rank. The static X still bounds it."""
+    try:
+        static_x = int(getattr(getattr(sched, "server_args", None), "tp_prefill_max_tokens", 0) or 0)
+        if static_x > 0 and rem > static_x:
+            return False
+        x = getattr(req, _fx.ATTR_X, None)
+        src = "front_x"
+        if x is None or int(x) <= 0:
+            # no carried X: the request came back through a P hand-over (its leg 2 carries none, FRONT-X rule 1).
+            # The nearest X D knows is the static envelope: a tail under half of it (the same F_halb). D's own X gate
+            # (W31) still refuses a realised extent over the static X by name.
+            if static_x <= 0:
+                return False
+            x, src = static_x, "static_x"
+        if not rem < _half_frac() * int(x):
+            return False
+    except Exception:  # noqa: BLE001 -- unknown = the law as before (divert)
+        return False
+    logger.info("%s D-RESUME-EXTEND rid=%s would_compute=%d x=%d src=%s half_frac=%.2f delivered=%s -- a resumed "
+                "request whose tail is under halbX: D extends it itself (SOLL R2/R7), no flip for it",
+                MARK, str(getattr(req, "rid", "?")), int(rem), int(x), src, _half_frac(),
                 getattr(req, "_weg2_store_delivered", None))
     return True
 
