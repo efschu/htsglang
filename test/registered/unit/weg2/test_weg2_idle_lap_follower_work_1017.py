@@ -42,6 +42,10 @@ class _Case(CustomTestCase):
     def setUp(self):
         super().setUp()
         self.clock = g1268.FakeClock()
+        # the fake clock restarts at 5000 in every test: spans of an earlier test
+        # of this process would overlap its windows
+        del weg2_idle_vote._OWN_WORK_SPANS[:]
+        weg2_idle_vote._OWN_WORK_OPEN[0] = None
         p = mock.patch("time.monotonic", new=self.clock)
         p.start()
         self.addCleanup(p.stop)

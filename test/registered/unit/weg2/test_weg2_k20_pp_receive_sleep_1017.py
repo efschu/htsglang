@@ -190,7 +190,9 @@ class K20Case(unittest.TestCase):
         self.assertTrue(ch1._bye_pending)
         with cf.ThreadPoolExecutor(1) as ex:
             f0 = ex.submit(wtf.sleep_quiesce, self.s0, 8.0)  # late PP0 leg: posts, takes the hung ack, then the bye
-            t_end = time.time() + 8
+            # S9: PP0's leg ends at its own 8 s budget (rank 2 sends no bye in this loop), so the pump loop
+            # must outlive it: a loop deadline equal to that budget raced it (line 202 flaky on 18:xxZ gates)
+            t_end = time.time() + 8 + 10
             while not f0.done() and time.time() < t_end:
                 self.net.sender = 1
                 ch1.pump()
