@@ -2388,6 +2388,11 @@ class _Stage9Base:
             def slots_of(self, node):
                 return list(node.slots)
 
+            def incomplete(self, node):
+                # L3-COMPLETE (1995104e53): the rig stage's arena pages are all written (state 2);
+                # an unfinished node would be no spill candidate, the rig has none.
+                return False
+
         return _K(keys)
 
     def _w3_spill_ref_free(self, pool, slots):
