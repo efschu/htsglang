@@ -13,9 +13,12 @@ over X, an overrun never silent" was only enforced at the static ceiling.
 
 THE RULE
 --------
-1. The front hands the X of its dispatch decision (and the uncached amount it priced
-   at that decision) to D in two request headers, on the D-direct leg 2 only (no leg 1
-   ran: a request D reads back from P's hand-off prefills nothing and carries no X).
+1. The front hands the X of its dispatch decision, the uncached amount it priced at that
+   decision and halbX (F_halb x X, computed by the front, SOLL R11: never a rank-local flag)
+   to D in three request headers (x-weg2-front-x / -priced / -halfx) on EVERY hand-over to
+   D: the D-direct leg 2 and, since H16V S8 (A3), also the hand-over after P, at the depth D
+   continues from (priced 0).  D's resumed-tail extend reads only these carried values;
+   nothing carried = RESUME-VIA-P (no fixed 6144, no rank-env read).
 2. D's X gate refuses (W31, the same named 503 / the same return to P as above the
    static X) when the realised uncached extent exceeds ``front_x + tolerance``.  The
    static X stays the hard ceiling: ``limit = min(static_x, front_x + tolerance)``.
