@@ -362,6 +362,8 @@ HEARTBEAT_S_DEFAULT = 600.0
 #: K20: how long PP0 waits at sleep for the followers' byes (s). Far below the gloo timeout.
 ENV_SLEEP_COLLECT_S = "SGLANG_WEG2_PF_TOLD_ACK_TIMEOUT_S"
 SLEEP_COLLECT_S_DEFAULT = 10.0
+ENV_WAKE_DRAIN_S = "SGLANG_WEG2_PF_WAKE_DRAIN_S"
+WAKE_DRAIN_S_DEFAULT = 5.0
 
 
 def _env_float(name: str, default: float) -> float:
@@ -411,6 +413,11 @@ class GlooAckChannel:
         self._sleeping: set = set()
         self._last_post = time.monotonic()
         self.byes_taken = 0
+        #: K20b: follower: after its own bye NO send leaves until wake (a send without a posted receive blocks 7200 s)
+        self._gated = False
+        self.held = 0
+        #: K20b: PP0: sleep_quiesce left byes missing -> wake() drains them before re-arming
+        self._bye_missing = False
         self.beats_taken = 0
 
     @classmethod
@@ -451,6 +458,9 @@ class GlooAckChannel:
         the ack left the outbox (posted, or dropped on a dead stream)."""
         if self.dead:
             return True
+        if self._gated and not (isinstance(ack, Weg2StreamControl) and ack.kind == "bye"):
+            self.held += 1
+            return False
         if not self.pump(beat=False):
             return False
         self._last_post = time.monotonic()
@@ -502,22 +512,37 @@ class GlooAckChannel:
         return frame
 
     def _beat_due(self) -> bool:
-        if self.dead or self.pp_rank == 0:
+        if self.dead or self.pp_rank == 0 or self._gated:
             return False
         hb = _env_float(ENV_HEARTBEAT_S, HEARTBEAT_S_DEFAULT)
         return hb > 0 and time.monotonic() - self._last_post >= hb
 
     def send_bye(self, budget_s: float) -> bool:
-        """Follower, at sleep: complete PP0's standing receive. Bounded; True = posted."""
+        """Follower, at sleep: complete PP0's standing receive, then GATE every send until wake(). Bounded; True = the
+        bye has LEFT (PP0 received it). A bye still in flight at the budget stays in flight (PP0's frame is posted:
+        its wake() drain takes it) but the gate is closed either way."""
         if self.dead or self.pp_rank == 0:
             return True
         end = time.monotonic() + budget_s
         msg = Weg2StreamControl(rank=self.pp_rank, kind="bye")
         while not self.send_nowait(msg):
             if time.monotonic() >= end:
+                self._gated = True
+                return False
+            time.sleep(0.01)
+        self._gated = True
+        while not self.pump(beat=False):
+            if time.monotonic() >= end:
                 return False
             time.sleep(0.01)
         return True
+
+    def open_sends(self) -> int:
+        """Sends of this process not completed (in flight, blocked on a missing receive) -- a gated, held fact is
+        not a send but counts as held."""
+        if self._inflight is None:
+            return 0
+        return 0 if all(pw.completed for pw, _t in self._inflight) else 1
 
     def open_receives(self) -> int:
         """PP0: standing receives that are posted right now (a frame past IDLE and not COMPLETE)."""
@@ -528,8 +553,22 @@ class GlooAckChannel:
         return n
 
     def wake(self) -> None:
-        """PP0: the group is awake again; frames of sleeping ranks are re-armed by the next harvest."""
-        self._sleeping.clear()
+        """Every rank: the group is awake again. Follower: the send gate opens. PP0: a bye that came after its
+        sleep budget is taken FIRST (bounded, ENV_WAKE_DRAIN_S) so no follower is 'asleep' through the awake phase;
+        then the frames are re-armed by the next harvest."""
+        self._gated = False
+        if self.pp_rank == 0:
+            if self._bye_missing:
+                end = time.monotonic() + _env_float(ENV_WAKE_DRAIN_S, WAKE_DRAIN_S_DEFAULT)
+                n = len(self.world_ranks) - 1
+                while len(self._sleeping) < n and time.monotonic() < end:
+                    self.harvest()
+                    time.sleep(0.005)
+                if len(self._sleeping) < n:
+                    logger.error("WEG2 PP-RECEIVE-CENSUS at=wake %s: %d bye(s) still missing", self.label,
+                                 n - len(self._sleeping))
+            self._bye_missing = False
+            self._sleeping.clear()
 
     def harvest(self) -> List[Any]:
         out: List[Any] = []
@@ -1777,7 +1816,7 @@ def sleep_quiesce(scheduler, budget_s: Optional[float] = None) -> int:
     if rank != 0:
         for ch in chans:
             ok = ch.send_bye(budget)
-            detail.append(f"{ch.label}:bye={'sent' if ok else 'UNSENT'}")
+            detail.append(f"{ch.label}:bye={'sent' if ok else 'UNSENT'},held={ch.held}")
             if not ok:
                 open_n += 1
     else:
@@ -1789,13 +1828,16 @@ def sleep_quiesce(scheduler, budget_s: Optional[float] = None) -> int:
             if open_n == 0 or time.monotonic() >= end:
                 break
             time.sleep(0.005)
+        for ch in chans:
+            ch._bye_missing = len(ch._sleeping) < len(ch.world_ranks) - 1
         detail = [f"{ch.label}:open={ch.open_receives()},byes={ch.byes_taken},beats={ch.beats_taken}" for ch in chans]
+    open_sends = sum(ch.open_sends() for ch in chans)
     logger.log(
-        logging.INFO if open_n == 0 else logging.ERROR,
-        "WEG2 PP-RECEIVE-CENSUS at=sleep rank=pp%d open=%d streams=%d waited_s=%.2f %s",
-        rank, open_n, len(chans), time.monotonic() - t0, " ".join(detail),
+        logging.INFO if (open_n == 0 and open_sends == 0) else logging.ERROR,
+        "WEG2 PP-RECEIVE-CENSUS at=sleep rank=pp%d open=%d open_sends=%d streams=%d waited_s=%.2f %s",
+        rank, open_n, open_sends, len(chans), time.monotonic() - t0, " ".join(detail),
     )
-    return open_n
+    return open_n + open_sends
 
 
 def wake(scheduler) -> None:
