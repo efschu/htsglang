@@ -4513,6 +4513,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                         _ud_refused_note(self, node, _sf)
                     return
                 self.writing_check(write_back=True)
+                # K21 (NF h16u2 1017_132112, D-TP0 13:35:14Z node=142): the drain runs this
+                # node's own ack. An A2 ORPHAN (the claim lost its key; the device copy is
+                # the only copy) makes TP0 give the host layer back (K12 A2-ORPHAN REPUBLISH,
+                # R12 STATE to the workers): the node is an UN-backed device node again, and
+                # `_evict_to_host` (assert not evicted and backuped) killed the rank. Such a
+                # node stays on the device -- the publish sweep writes it from that copy; the
+                # peel frees nothing here and moves on (the caller's under-delivery check
+                # names a shortfall). TP0's own verdict, nothing rank-local is added.
+                if node.evicted or not node.backuped:
+                    UnifiedRadixCache._k21_note_skip(self, node)
+                    return
                 self._evict_to_host(node, tracker)
                 return
             else:
@@ -4555,6 +4566,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 self._iteratively_delete_tombstone_leaf(node, tracker)
                 return
         self._evict_to_host(node, tracker)
+
+    def _k21_note_skip(self, node: UnifiedTreeNode) -> None:
+        n = getattr(UnifiedRadixCache, "_k21_skip_n", 0) + 1
+        UnifiedRadixCache._k21_skip_n = n
+        if n <= 16 or (n & (n - 1)) == 0:
+            logger.warning(
+                "K21 EVICT-SKIP node=%s evicted=%s backuped=%s n=%d: the write-back drain took "
+                "the node's host layer back (A2 orphan republish) -- the node stays on the "
+                "device, the publish sweep writes it from there",
+                getattr(node, "id", "?"), bool(node.evicted), bool(node.backuped), n,
+            )
 
     def _ud_clear_host_children(self, node: UnifiedTreeNode) -> bool:
         """UD-H (NF int19 1008, P PP2 13:37:49Z; int18 12:53:27Z PP2 ``#1421 ...
