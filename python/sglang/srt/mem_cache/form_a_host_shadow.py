@@ -374,6 +374,14 @@ def note_k21_orphan(node: Any) -> None:  # kept for callers/tests of the old nam
     note_k21_ack(node, 1)
 
 
+def _k21_ctx(k: Tuple[str, int], own_finding=None, tp0_finding=None, extra_own: int = 0, extra_tp0: int = 0) -> str:
+    """S13 A3 (log only): the pairing state a K21 stop message names -- FIFO depth of this key on
+    the own side and on the TP0 side (``extra_*`` = the finding just popped), both findings
+    (orphaned 1|0, None = none yet) and the handover count."""
+    return (f" [fifo own={len(_S.k21_own.get(k) or ()) + extra_own} tp0={len(_S.k21_tp0.get(k) or ()) + extra_tp0} "
+            f"own_finding={own_finding} tp0_finding={tp0_finding} handover_n={_S.handover_n}]")
+
+
 def _k21_stop(msg: str) -> None:
     logger.error("K21 RANK-DIVERGENCE %s -- group stop (raenge-nie-uneins-crash-stop)", msg)
     raise K21RankDivergence("K21: " + msg)
@@ -404,14 +412,14 @@ def _k21_pair(k: Tuple[str, int]) -> None:
             if not has_state:
                 _k21_defer_stop(
                     f"TP0 orphaned node hash={str(k[0])[:16]} depth={k[1]} (kept on the device), this "
-                    "worker's ack was clean and no STATE follows: trees diverge")
+                    "worker's ack was clean and no STATE follows: trees diverge" + _k21_ctx(k, o, t, 1, 1))
             else:
                 _S.k21_expect.add(k)
         elif o and not t:
             _k21_defer_stop(
                 f"this worker's ack orphaned node hash={str(k[0])[:16]} depth={k[1]} but TP0's ack "
                 "of the same write was clean: the ranks' trees diverge (only this rank kept the "
-                "node on the device)")
+                "node on the device)" + _k21_ctx(k, o, t, 1, 1))
     if own is not None and not own:
         _S.k21_own.pop(k, None)
     if tp0 is not None and not tp0:
@@ -690,6 +698,15 @@ def on_tree_reset(tree: Any) -> None:
     if _S.ledger or _S.pending or _S.absent or _S.rebind_wait:
         logger.info("R12 HOST-VERDICT reset drops ledger=%d pending=%d rebind_wait=%d",
                     len(_S.ledger), len(_S.pending), len(_S.rebind_wait))
+    # S13 A3 (log only): every open K21 stop and open pairing the reset discards, one line
+    _open_own = sum(len(v) for v in _S.k21_own.values())
+    _open_tp0 = sum(len(v) for v in _S.k21_tp0.values())
+    if (_S.k21_stop_msg is not None or _open_own or _open_tp0 or _S.k21_inbox
+            or _S.k21_expect or _S.k21_confirmed):
+        logger.warning(
+            "K21 RESET-DROPS open_stop=%d open_own=%d open_tp0=%d inbox=%d expect=%d confirmed=%d "
+            "handover_n=%d stop_msg=%s", 1 if _S.k21_stop_msg is not None else 0, _open_own, _open_tp0,
+            len(_S.k21_inbox), len(_S.k21_expect), len(_S.k21_confirmed), _S.handover_n, _S.k21_stop_msg)
     _S.ledger = []
     _S.pending = {}
     _S.absent = set()
@@ -828,7 +845,8 @@ def apply(tree: Any, events: List, seq: int = 0) -> Dict[str, int]:
                 _k21_stop(
                     f"TP0 orphaned node={getattr(node, 'id', '?')} depth={depth} hash={str(h)[:16]} "
                     f"(kept on the device), this worker did not orphan it and its STATE apply ended "
-                    f"{out!r} instead of 'kv' (seq={int(seq)}): trees diverge")
+                    f"{out!r} instead of 'kv' (seq={int(seq)}): trees diverge"
+                    + _k21_ctx((h, int(depth)), 0, 1))
         elif (h, int(depth)) in _S.k21_confirmed:
             _S.k21_confirmed.pop((h, int(depth)), None)
             if out in ("deleted", "unreconcilable"):
@@ -836,11 +854,12 @@ def apply(tree: Any, events: List, seq: int = 0) -> Dict[str, int]:
                     "K21 RANK-DIVERGENCE seq=%d node=%s depth=%s hash=%s out=%s: TP0 republished "
                     "an A2-orphan node (kept on the device) and this worker's STATE apply ended "
                     "'%s' instead of 'kv' -- the ranks' trees diverge; group stop "
-                    "(raenge-nie-uneins-crash-stop)", int(seq), getattr(node, "id", "?"),
-                    depth, str(h)[:16], out, out)
+                    "(raenge-nie-uneins-crash-stop)%s", int(seq), getattr(node, "id", "?"),
+                    depth, str(h)[:16], out, out, _k21_ctx((h, int(depth)), 1, 1))
                 raise K21RankDivergence(
                     f"K21: orphan-republish STATE for node={getattr(node, 'id', '?')} depth={depth} "
-                    f"applied as {out!r} on a worker (expected 'kv'): rank trees diverge")
+                    f"applied as {out!r} on a worker (expected 'kv'): rank trees diverge"
+                    + _k21_ctx((h, int(depth)), 1, 1))
         c[out] += 1
     n = _note("applied")
     if n and (events or any(c[k] for k in ("transit", "kv", "anchor", "deleted", "rebind", "spill"))):
