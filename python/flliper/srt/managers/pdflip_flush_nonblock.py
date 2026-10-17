@@ -239,17 +239,48 @@ def sweep_no_progress(stats: dict) -> bool:
             and int((stats or {}).get("unbacked", 0) or 0) > 0)
 
 
+def arena_free(tree_cache):
+    """Room state of the host KV arena as a stamp part (None if the pool does not say). Cheap, no tree walk.
+    S13 A2: NOT ``available_size()`` -- on the arena pool that is ``slots - claimed`` (COMPLETE slots count as
+    free, arena_pool.py #1440b), so a COMPLETE slot turning free moves nothing there. Arena pool: the tuple
+    ``(complete, claimed)`` of ``arena.stats()`` (free = slots - complete - claimed, every claim, completion and
+    free moves it). Pools without an arena: ``available_size()``."""
+    try:
+        pool = getattr(getattr(tree_cache, "cache_controller", None), "mem_pool_host", None)
+        arena = getattr(pool, "arena", None)
+        if arena is not None:
+            st = arena.stats()
+            return (int(st["complete"]), int(st["claimed"]))
+        fn = getattr(pool, "available_size", None)
+        return int(fn()) if callable(fn) else None
+    except Exception:  # noqa: BLE001 - a stamp part never takes the poll down
+        return None
+
+
+def sweep_state_stamp(tree_cache, scheduler=None) -> tuple:
+    """h16v S12 (Nachreview 2, V2) + S13 A1/A2: in-flight count, arena room (complete, claimed) AND the
+    scheduler's ``forward_ct`` -- any state change moves the stamp. ``forward_ct`` moves at every executed
+    batch in EVERY event loop (Scheduler._run_batch_forward), so a batch between two polls voids the memo also on D
+    (pp=1 overlap loop, which never calls quiesce_end('batch'))."""
+    return (inflight_count(tree_cache), arena_free(tree_cache), int(getattr(scheduler, "forward_ct", -1)))
+
+
 def sweep_memo_set(scheduler, tree_cache) -> None:
-    scheduler._pdflip_flush_sweep_memo = inflight_count(tree_cache)
+    scheduler._pdflip_flush_sweep_memo = sweep_state_stamp(tree_cache, scheduler)
+
+
+def sweep_memo_clear(scheduler) -> None:
+    """h16v S12 V2: the stamp belongs to ONE quiesce on ONE tree; reset, batch and quiesce end drop it."""
+    scheduler._pdflip_flush_sweep_memo = None
 
 
 def sweep_memo_hit(scheduler, tree_cache) -> bool:
-    """True while the in-flight count stands where the no-progress round left
-    it -- under the sweep's own gate (nothing running/waiting/chunked) every
-    un-backing and every pin release moves that count, so an unchanged count
-    means the tree and the arena are exactly as futile as they were."""
+    """True while in-flight count and free arena room stand where the no-progress round left them -- under the
+    sweep's own gate (nothing running/waiting/chunked) every un-backing and pin release moves the count, every
+    arena claim/free moves the room, so an unchanged stamp means the tree and the arena are exactly as futile as
+    they were. Cleared at quiesce end (reset or batch) and at the tree reset."""
     stamp = getattr(scheduler, "_pdflip_flush_sweep_memo", None)
-    return stamp is not None and stamp == inflight_count(tree_cache)
+    return stamp is not None and stamp == sweep_state_stamp(tree_cache, scheduler)
 
 
 # ---- F5c (NF-PGAP 1016): what goes into the reset un-backed, named -----------------

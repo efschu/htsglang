@@ -78,11 +78,11 @@ NEW[M10]='if False:
 
 OLD[MA2]='PRICE_BARRIER_DECIDES = False'
 NEW[MA2]='PRICE_BARRIER_DECIDES = True'
-OLD[MA3]='x_tok = min(st["xs"][m.rid] for m in members)'
+OLD[MA3]='x_tok = Front._set_x_for(self, [(m.rid, st["depths"].get(m.rid, 0), st["xs"][m.rid]) for m in members])'
 NEW[MA3]='x_tok = int(self.tp_prefill_max_tokens)'
 OLD[MA5]='st["t_open"] = max(min(m.t_arrive for m in members), float(getattr(self, "t_awake", 0.0) or 0.0))'
 NEW[MA5]='st["t_open"] = min(m.t_arrive for m in members)'
-OLD[MA8]='        if sum(int(getattr(q, "est_uncached", 0) or 0) for q in live_q) < x_tok:
+OLD[MA8]='        if _q_s < x_tok:
             if st.get("held_epoch")'
 NEW[MA8]='        if False:
             if st.get("held_epoch")'

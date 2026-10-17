@@ -13,9 +13,12 @@ over X, an overrun never silent" was only enforced at the static ceiling.
 
 THE RULE
 --------
-1. The front hands the X of its dispatch decision (and the uncached amount it priced
-   at that decision) to D in two request headers, on the D-direct leg 2 only (no leg 1
-   ran: a request D reads back from P's hand-off prefills nothing and carries no X).
+1. The front hands the X of its dispatch decision, the uncached amount it priced at that
+   decision and halbX (F_halb x X, computed by the front, SOLL R11: never a rank-local flag)
+   to D in three request headers (x-pdflip-front-x / -priced / -halfx) on EVERY hand-over to
+   D: the D-direct leg 2 and, since H16V S8 (A3), also the hand-over after P, at the depth D
+   continues from (priced 0).  D's resumed-tail extend reads only these carried values;
+   nothing carried = RESUME-VIA-P (no fixed 6144, no rank-env read).
 2. D's X gate refuses (W31, the same named 503 / the same return to P as above the
    static X) when the realised uncached extent exceeds ``front_x + tolerance``.  The
    static X stays the hard ceiling: ``limit = min(static_x, front_x + tolerance)``.
@@ -65,6 +68,9 @@ HEADER_PRICED = "x-pdflip-front-priced"
 #: Request attribute names (GenerateReqInput / TokenizedGenerateReqInput / Req).
 ATTR_X = "weg2_front_x"
 ATTR_PRICED = "weg2_front_priced"
+#: H16V review A3: halbX (F_halb x X) of the same decision, computed by the front (SOLL R11: no rank-local flag).
+HEADER_HALFX = "x-pdflip-front-halfx"
+ATTR_HALFX = "weg2_front_halfx"
 
 #: Upper bound accepted from a header: a defensive sanity cap, far above any X.
 _MAX_TOKENS = 1 << 31
@@ -88,7 +94,7 @@ def tolerance_tokens(page_size: Optional[int]) -> int:
         return 1
 
 
-def request_headers(x: Optional[int], priced: Optional[int]) -> Dict[str, str]:
+def request_headers(x: Optional[int], priced: Optional[int], halfx: Optional[int] = None) -> Dict[str, str]:
     """The headers the front adds to a D-direct leg 2; ``{}`` = nothing to carry.
 
     No header for ``x <= 0`` (no decision X: the static gate alone) and none with the
@@ -103,6 +109,11 @@ def request_headers(x: Optional[int], priced: Optional[int]) -> Dict[str, str]:
     if priced is not None:
         try:
             out[HEADER_PRICED] = str(max(0, int(priced)))
+        except (TypeError, ValueError):
+            pass
+    if halfx is not None:
+        try:
+            out[HEADER_HALFX] = str(max(0, int(halfx)))
         except (TypeError, ValueError):
             pass
     return out
@@ -139,6 +150,17 @@ def parse_headers(headers: Optional[Mapping[str, Any]]) -> Tuple[Optional[int], 
     return x, priced
 
 
+def parse_halfx(headers: Optional[Mapping[str, Any]]) -> Optional[int]:
+    """The front's halbX of the request (H16V A3), ``None`` when absent / invalid / off / without a front X."""
+    if headers is None or not enabled():
+        return None
+    try:
+        v = _parse_one(headers, HEADER_HALFX)
+    except Exception:  # noqa: BLE001
+        return None
+    return v if v else None
+
+
 def stamp_request(adapted: Any, raw_request: Any) -> None:
     """Copy the carrier headers of ``raw_request`` onto the internal request object.
 
@@ -153,6 +175,7 @@ def stamp_request(adapted: Any, raw_request: Any) -> None:
     try:
         setattr(adapted, ATTR_X, x)
         setattr(adapted, ATTR_PRICED, priced)
+        setattr(adapted, ATTR_HALFX, parse_halfx(headers))
     except Exception:  # noqa: BLE001
         logger.warning("PDFLIP FRONT-X could not stamp %s on %s", ATTR_X, type(adapted).__name__)
 

@@ -263,7 +263,7 @@ def test_d1_the_last_recorded_decision_x_rides_with_a_d_direct_leg():
     Front._note_x_decision(f, "pdflip-40-127", 1010, 237)   # arrival verdict (X-ROUTE X=1010)
     Front._note_x_decision(f, "pdflip-40-127", 6057, 237)   # QUEUED-SHORT later (X=6057)
     h = Front._front_x_headers(f, "pdflip-40-127", None, False)
-    assert h == {"x-pdflip-front-x": "6057", "x-pdflip-front-priced": "237"}
+    assert h == {"x-pdflip-front-x": "6057", "x-pdflip-front-priced": "237", "x-pdflip-front-halfx": "3028"}
     assert f.counters["front_x_carried"] == 1
     assert Front._front_x_headers(f, "pdflip-40-127", None, False)["x-pdflip-front-x"] == "6733", \
         "a decision is consumed by the post; a re-post falls back to the X in force"
@@ -275,10 +275,16 @@ def test_d2_an_unrecorded_d_direct_rid_is_bounded_by_the_x_in_force():
     assert h["x-pdflip-front-x"] == "6733" and h["x-pdflip-front-priced"] == "237"
 
 
-def test_d3_a_leg_after_p_and_a_single_prefill_carry_no_x():
+def test_d3_a_single_prefill_carries_no_x_a_leg_after_p_carries_x_and_halfx_at_its_depth():
+    """H16V review A3: every hand-over to D carries X and halbX, the one after P at the depth D continues from (the
+    whole prompt); a single-prefill leg carries no X law."""
     f = _front_double()
     Front._note_x_decision(f, "pdflip-1-1", 1010, 5)
-    assert Front._front_x_headers(f, "pdflip-1-1", _pending("pdflip-1-1", 5, d_direct=False), False) == {}
+    pend = _pending("pdflip-1-1", 5, d_direct=False)
+    pend.est_prompt = 9000
+    h = Front._front_x_headers(f, "pdflip-1-1", pend, False)
+    x = int(f.tp_prefill_max_tokens)
+    assert h == {"x-pdflip-front-x": str(x), "x-pdflip-front-priced": "0", "x-pdflip-front-halfx": str(x // 2)}, h
     assert Front._front_x_headers(f, "pdflip-1-1", None, True) == {}
     assert Front._front_x_headers(f, "pdflip-1-1", _pending("pdflip-1-1", 5, d_direct=True), False) != {}
 
@@ -371,7 +377,7 @@ class _FixtureTokenizer:
         return [ord(c) for c in text] + [0]
 
 
-def _tokenized(front_x_=1010, priced=237):
+def _tokenized(front_x_=1010, priced=237, halfx=None):
     """GenerateReqInput -> the real ``TokenizerManager._create_tokenized_object`` on a stub self."""
     from unittest.mock import MagicMock
 
@@ -379,7 +385,8 @@ def _tokenized(front_x_=1010, priced=237):
     from flliper.srt.managers.tokenizer_manager import TokenizerManager
     from flliper.srt.sampling.sampling_params import SamplingParams
 
-    obj = GenerateReqInput(text="hi", sampling_params={}, weg2_front_x=front_x_, weg2_front_priced=priced)
+    obj = GenerateReqInput(text="hi", sampling_params={}, weg2_front_x=front_x_, weg2_front_priced=priced,
+                           weg2_front_halfx=halfx)
     obj.normalize_batch_and_arguments()
     stub = SimpleNamespace(
         preferred_sampling_params=None,

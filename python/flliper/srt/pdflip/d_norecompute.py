@@ -114,6 +114,8 @@ def d_direct_extends(sched: Any, req: Any, rem: int) -> bool:
         from flliper.srt.pdflip import front_x as _fx
 
         fx, _priced = _fx.request_front_x(req)
+        if fx is None and int(rem) > 0:
+            return _resumed_tail_extends(sched, req, int(rem), _fx)
         if fx is None or int(rem) <= 0:
             return False
         static_x = int(getattr(getattr(sched, "server_args", None), "tp_prefill_max_tokens", 0) or 0)
@@ -125,6 +127,37 @@ def d_direct_extends(sched: Any, req: Any, rem: int) -> bool:
     logger.info("%s D-DIRECT-EXTEND rid=%s would_compute=%d front_x=%d limit=%d delivered=%s -- a D-direct "
                 "leg whose prefill never ran: D extends it under X (law 4, X-GESETZ 16.10.), not diverted "
                 "to P", MARK, str(getattr(req, "rid", "?")), int(rem), int(fx), limit,
+                getattr(req, "_pdflip_store_delivered", None))
+    return True
+
+
+def _resumed_tail_extends(sched: Any, req: Any, rem: int, _fx: Any) -> bool:
+    """H16V F3 / review A3 (SCHEDULER-SOLL R2 + R7 + R11; NF h16u2 17.10.): a request that already decoded and D
+    parked for a flip comes back with a SHORT store read: its tail ``rem`` is D's own work when it is kurz -- under the
+    halbX THE FRONT carried with the D leg (``weg2_front_halfx``, F_halb x the X of the front's decision at the depth D
+    continues from, computed with the front's flag), and only then. NO front X or halbX carried (the request never came
+    through a front leg that stamped them, the carry switch is off, ...): the old way, RESUME-VIA-P -- there is NO fixed
+    substitute bound (SOLL section 2: "X nie ein fester Wert"; the former 0.5 x static X = 6144 lay above the curve X)
+    and no rank-local flag is read (R11). Five of the six h16u2 flips under X were exactly this: W50-REROUTE
+    ``store_short_after_flip`` with d_extent 77 / 693 / 1563 / 1926 / 2054 -> p_only -> a whole D->P flip and six
+    parked decodes for a few hundred tokens ("Kann D einen Request unter X nicht nehmen, ist das ein Defekt, kein
+    Flipgrund", R7). A tail of halbX or more stays on RESUME-VIA-P as before. Group-uniform: ``rem`` is the synced
+    witness, ``weg2_front_x`` / ``weg2_front_halfx`` fields of the broadcast request. The static X still bounds it."""
+    try:
+        static_x = int(getattr(getattr(sched, "server_args", None), "tp_prefill_max_tokens", 0) or 0)
+        if static_x > 0 and rem > static_x:
+            return False
+        x = getattr(req, _fx.ATTR_X, None)
+        halfx = getattr(req, _fx.ATTR_HALFX, None)
+        if x is None or int(x) <= 0 or halfx is None or int(halfx) <= 0:
+            return False   # nothing carried by the front: RESUME-VIA-P, no invented bound
+        if not rem < int(halfx):
+            return False
+    except Exception:  # noqa: BLE001 -- unknown = the law as before (divert)
+        return False
+    logger.info("%s D-RESUME-EXTEND rid=%s would_compute=%d front_x=%d front_halfx=%d delivered=%s -- a resumed "
+                "request whose tail is under the front's halbX: D extends it itself (SOLL R2/R7), no flip for it",
+                MARK, str(getattr(req, "rid", "?")), int(rem), int(x), int(halfx),
                 getattr(req, "_pdflip_store_delivered", None))
     return True
 

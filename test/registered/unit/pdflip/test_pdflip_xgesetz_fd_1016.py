@@ -75,8 +75,9 @@ def test_fd_pdflip_6_55_is_extended_on_d_not_diverted(monkeypatch, caplog):
                for m in caplog.messages)
 
 
-def test_fd_handover_after_p_prefill_still_diverts():
-    """No front X on the leg = D reads it back from P's hand-over: D-NORECOMPUTE stands."""
+def test_fd_handover_after_p_prefill_without_a_carried_front_x_still_diverts():
+    """No front X on the leg = nothing carried: D-NORECOMPUTE stands (H16V review A3: no fixed substitute bound, the
+    former 0.5 x static X = 6144 is gone -- SOLL section 2 "X nie ein fester Wert")."""
     from flliper.srt.pdflip import d_norecompute as dn
 
     calls = []
@@ -85,13 +86,21 @@ def test_fd_handover_after_p_prefill_still_diverts():
     assert kept == [] and calls == [201]
 
 
-def test_fd_resumed_request_keeps_the_law():
-    """A request that already decoded is bounded by the static X and RESUME-VIA-P
-    (front_x rule 3), not by the arrival price: still diverted."""
+def test_fd_resumed_request_tail_is_bounded_by_the_halfx_the_front_carried():
+    """H16V F3 / review A3 (SOLL R2/R7/R11): a request that already decoded carries the front's X and halbX
+    (``weg2_front_halfx``); a tail under that halbX is D's own extend (NF h16u2 pdflip-18-250: d_extent 77 flipped the
+    whole group), a tail of halbX or more is RESUME-VIA-P as before; X without halbX (nothing computed by the front)
+    is the old law."""
     from flliper.srt.pdflip import d_norecompute as dn
 
     req = _req(output_ids=[1, 2, 3])
-    assert dn.d_direct_extends(_sched(), req, 375) is False
+    req.weg2_front_halfx = 3341
+    assert dn.d_direct_extends(_sched(), req, 375) is True
+    assert dn.d_direct_extends(_sched(), req, 3340) is True      # 3340 < carried halbX 3341
+    assert dn.d_direct_extends(_sched(), req, 3341) is False     # halbX itself is not kurz
+    assert dn.d_direct_extends(_sched(static_x=2000), req, 2001) is False   # the static X still bounds it
+    req.weg2_front_halfx = None
+    assert dn.d_direct_extends(_sched(), req, 375) is False      # nothing carried: RESUME-VIA-P
 
 
 @pytest.mark.parametrize("rem,expect", [(6682 + 64, True), (6682 + 65, False), (12000, False)])

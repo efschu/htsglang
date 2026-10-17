@@ -145,6 +145,14 @@ class PdFlipIdleVoteReq:
     world: int
     #: (rank, idle as 0/1, this rank's blocker clause names)
     slots: List[Tuple[int, int, str]] = field(default_factory=list)
+    #: S9 (boot 25812b36f9 1017_181001, W3): the FOLLOWERS' own publish work
+    #: while the lap waited for them, summed along the ring (see
+    #: :func:`note_hop_work`).  PP0 reads it from the object it receives anyway
+    #: -- the verdict stays PP0's alone (R11), no rank-local decision, no
+    #: collective.  ``hop_at`` is the lap_clock of the previous stage's attach
+    #: (PP0: the stamp); CLOCK_MONOTONIC is host-wide, one clock for every rank.
+    peer_work_s: float = 0.0
+    hop_at: float = 0.0
 
     def has_slot(self, rank: int) -> bool:
         return any(int(r) == int(rank) for r, _i, _b in self.slots)
@@ -292,6 +300,12 @@ def refusal_detail(vote: PdFlipIdleVoteReq, t: PdFlipVoteTally, note: str) -> st
 #: that entered before or after taints the witness at the next pass-top
 #: anyway), so it is not age: the TTL counts only the rest.
 _OWN_WORK_S = [0.0]
+#: closed spans (t0, t1) of the outermost own_work, newest last; bounded.  The
+#: span list lets a follower say how much of the window since the lap left the
+#: previous stage was its own publish work (:func:`own_work_between`).
+_OWN_WORK_SPANS: List[Tuple[float, float]] = []
+_OWN_WORK_SPANS_MAX = 256
+_OWN_WORK_OPEN = [None]
 
 
 class own_work:
@@ -304,17 +318,63 @@ class own_work:
         own_work._depth += 1
         if own_work._depth == 1:
             self._t0 = lap_clock()
+            _OWN_WORK_OPEN[0] = self._t0
         return self
 
     def __exit__(self, *_exc):
         own_work._depth -= 1
         if own_work._depth == 0:
-            _OWN_WORK_S[0] += max(0.0, lap_clock() - self._t0)
+            t1 = lap_clock()
+            _OWN_WORK_S[0] += max(0.0, t1 - self._t0)
+            _OWN_WORK_OPEN[0] = None
+            _OWN_WORK_SPANS.append((self._t0, t1))
+            if len(_OWN_WORK_SPANS) > _OWN_WORK_SPANS_MAX:
+                del _OWN_WORK_SPANS[: len(_OWN_WORK_SPANS) - _OWN_WORK_SPANS_MAX]
         return False
 
 
 def own_work_total() -> float:
     return float(_OWN_WORK_S[0])
+
+
+def own_work_between(t_a: float, t_b: float) -> float:
+    """This process's own_work seconds inside [t_a, t_b] (closed spans plus the
+    open one), never more than the window."""
+    if t_b <= t_a:
+        return 0.0
+    total = 0.0
+    for s0, s1 in _OWN_WORK_SPANS:
+        lo, hi = max(s0, t_a), min(s1, t_b)
+        if hi > lo:
+            total += hi - lo
+    open_t0 = _OWN_WORK_OPEN[0]
+    if open_t0 is not None:
+        lo, hi = max(open_t0, t_a), t_b
+        if hi > lo:
+            total += hi - lo
+    return min(total, t_b - t_a)
+
+
+def note_hop_work(vote: "PdFlipIdleVoteReq", now: Optional[float] = None) -> float:
+    """A FOLLOWER's attach: add this rank's own publish work since the lap left
+    the previous stage to the object, and move ``hop_at`` to now.
+
+    S9 (W3, boot 25812b36f9 1017_181001): PP1/PP2 ran a futile 0.75 s sweep per
+    /flush_cache poll behind a full arena; a lap needs a follower pass per hop,
+    so its wall was 4.2-5.1 s against the 2 s TTL and every lap (epochs 2..17)
+    was dropped though 3/3 idle.  PP0's own work was discounted since 0929, the
+    followers' was not.  Same argument as PP0's: time in which this rank
+    publishes is time in which it receives nothing, and work that does enter
+    taints the slot / the PP0 witness anyway.  A vote without a ``hop_at`` (an
+    older sender) adds nothing."""
+    now = lap_clock() if now is None else float(now)
+    t_a = float(getattr(vote, "hop_at", 0.0) or 0.0)
+    added = 0.0
+    if t_a > 0.0:
+        added = own_work_between(t_a, now)
+        vote.peer_work_s = float(getattr(vote, "peer_work_s", 0.0) or 0.0) + added
+    vote.hop_at = now
+    return added
 
 
 @dataclass
@@ -372,14 +432,19 @@ def own_work_since(witness: PdFlipLapWitness) -> float:
     return max(0.0, own_work_total() - float(getattr(witness, "own_work_at_stamp", own_work_total())))
 
 
-def expiry_reason(witness: PdFlipLapWitness, *, now: float, ttl_s: float) -> str:
+def expiry_reason(
+    witness: PdFlipLapWitness, *, now: float, ttl_s: float, peer_work_s: float = 0.0
+) -> str:
     wall = float(now) - float(witness.stamped_at)
     own = min(max(0.0, wall), own_work_since(witness))
-    age = wall - own
+    # S9: the followers' own publish work the lap carried home; the two may
+    # overlap in time, so the sum is capped at the wall (age never negative).
+    peer = min(max(0.0, wall) - own, max(0.0, float(peer_work_s or 0.0)))
+    age = wall - own - peer
     if ttl_s > 0 and age > ttl_s:
         return (
             f"expired (age={age:.3f}s > ttl={float(ttl_s):.3f}s; wall={wall:.3f}s, "
-            f"PP0 own publish work {own:.3f}s not counted)"
+            f"PP0 own publish work {own:.3f}s and followers' {peer:.3f}s not counted)"
         )
     return ""
 
@@ -410,7 +475,9 @@ def stale_reason(
         )
     if witness.taint:
         return witness.taint
-    expired = expiry_reason(witness, now=now, ttl_s=ttl_s)
+    expired = expiry_reason(
+        witness, now=now, ttl_s=ttl_s, peer_work_s=float(getattr(vote, "peer_work_s", 0.0) or 0.0)
+    )
     if expired:
         return expired
     if not own_idle:

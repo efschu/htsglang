@@ -42,6 +42,7 @@ from flliper.srt.managers.pdflip_idle_vote import (
     lap_clock,
     log_stale_drop,
     log_verdict,
+    note_hop_work,
     send_home,
     tally,
 )
@@ -6973,6 +6974,7 @@ class SchedulerPPMixin:
             return
         for req in recv_reqs:
             if isinstance(req, PdFlipIdleVoteReq):
+                note_hop_work(req)   # S9: before the slot, so the housekeeping round is not counted
                 self._pdflip_vote_attach_own_slot(req)
 
     def _pdflip_vote_attach_own_slot(self: Scheduler, vote: PdFlipIdleVoteReq) -> None:
@@ -7073,6 +7075,9 @@ class SchedulerPPMixin:
         self._pdflip_vote_witness = PdFlipLapWitness(
             epoch=vote.epoch, stamped_at=lap_clock()
         )
+        # S9: the lap starts its first hop now; each follower adds its own
+        # publish work since the previous hop (note_hop_work).
+        vote.hop_at = self._pdflip_vote_witness.stamped_at
         if getattr(self, "pdflip_dormant", False):
             self._pdflip_vote_witness.spoil(entrypoint_taint(dormant=True, idle=True))
         self._pdflip_vote_attach_own_slot(vote)
@@ -7113,7 +7118,8 @@ class SchedulerPPMixin:
             return
         now = lap_clock()
         why = witness.taint or expiry_reason(
-            witness, now=now, ttl_s=envs.FLLIPER_PDFLIP_IDLE_VOTE_TTL_S.get()
+            witness, now=now, ttl_s=envs.FLLIPER_PDFLIP_IDLE_VOTE_TTL_S.get(),
+            peer_work_s=float(getattr(held, "peer_work_s", 0.0) or 0.0),
         )
         if why:
             log_stale_drop(held, witness, why, where="pass-top", now=now)

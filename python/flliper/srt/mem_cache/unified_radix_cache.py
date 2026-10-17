@@ -4512,7 +4512,21 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     else:
                         _ud_refused_note(self, node, _sf)
                     return
+                # K21 A1 (review nf-review-h16v-1017 p5): the drain runs this node's own ack.
+                # An A2 ORPHAN (the claim lost its key; the device copy is the only copy) is the
+                # same event on EVERY rank of the group (``_k12_direct_l3_verdict`` marks it on
+                # every role). TP0 gives the host layer back (K12 A2-ORPHAN REPUBLISH, R12 STATE),
+                # a worker keeps its byteless rows -- but ALL ranks keep the node on the device
+                # (a rank-local skip on TP0 alone parted the trees): the worker's STATE apply then
+                # drops only the orphan rows ("kv"); "deleted"/"unreconcilable" is a named group
+                # stop (form_a_host_shadow.K21RankDivergence). The peel frees nothing here and
+                # moves on to the same next leaf everywhere.
+                node._k21_orphan_ack = False
                 self.writing_check(write_back=True)
+                if getattr(node, "_k21_orphan_ack", False) or node.evicted or not node.backuped:
+                    node._k21_orphan_ack = False
+                    UnifiedRadixCache._k21_note_skip(self, node)
+                    return
                 self._evict_to_host(node, tracker)
                 return
             else:
@@ -4555,6 +4569,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 self._iteratively_delete_tombstone_leaf(node, tracker)
                 return
         self._evict_to_host(node, tracker)
+
+    def _k21_note_skip(self, node: UnifiedTreeNode) -> None:
+        n = getattr(UnifiedRadixCache, "_k21_skip_n", 0) + 1
+        UnifiedRadixCache._k21_skip_n = n
+        if n <= 16 or (n & (n - 1)) == 0:
+            logger.warning(
+                "K21 EVICT-SKIP node=%s evicted=%s backuped=%s n=%d: the write-back drain took "
+                "the node's host layer back (A2 orphan republish) -- the node stays on the "
+                "device, the publish sweep writes it from there",
+                getattr(node, "id", "?"), bool(node.evicted), bool(node.backuped), n,
+            )
 
     def _ud_clear_host_children(self, node: UnifiedTreeNode) -> bool:
         """UD-H (NF int19 1008, P PP2 13:37:49Z; int18 12:53:27Z PP2 ``#1421 ...
@@ -6608,7 +6633,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
           from its own ack. Off R12 the rank's own ack decides, as before.
         """
         strict = UnifiedRadixCache._pdflip_l3_present_strict()
+        try:
+            # K21 ack pairing (V1): EVERY direct ack reports its finding (1 orphan / 0 clean);
+            # TP0 as an event, a worker into its own FIFO, judged once both exist
+            _r12.note_k21_ack(node, 1 if (orphaned and strict) else 0)
+        except Exception:  # noqa: BLE001 - instrument only
+            pass
         if orphaned and strict:
+            # K21 A1: the group-uniform mark (every role) the write-back peel reads
+            node._k21_orphan_ack = True
             n = getattr(UnifiedRadixCache, "_k12_orphan_direct_n", 0) + 1
             UnifiedRadixCache._k12_orphan_direct_n = n
             if n <= 16 or (n & (n - 1)) == 0:
