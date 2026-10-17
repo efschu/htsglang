@@ -839,6 +839,12 @@ def apply(tree: Any, events: List, seq: int = 0) -> Dict[str, int]:
         out = _reconcile(tree, node, exists, kv, m)
         if out == "pending":
             _S.pending[(h, int(depth))] = e
+        elif (not exists and out != "deleted" and (h, int(depth)) not in _S.k21_expect
+              and (h, int(depth)) not in _S.k21_confirmed):
+            # K23 review A3: TP0 says the node is GONE; only ``deleted`` (and ``missing``, above) leaves the
+            # worker's tree the same. kv/anchor/noop/short/unreconcilable keep a node TP0 no longer has.
+            _state_diverged(node, h, depth, out, seq)
+            c[out] += 1
         elif (h, int(depth)) in _S.k21_expect:
             _S.k21_expect.discard((h, int(depth)))
             if out != "kv":
@@ -896,6 +902,19 @@ def _spill_diverged(node: Any, h: Any, depth: Any, out: str, seq: int) -> None:
         "rows freed, l3_present) and this worker could not apply it -- the ranks now disagree on its host copy",
         int(seq), str(getattr(node, "rid", None) or "-"), getattr(node, "id", "?"), depth,
         str(h)[:16], out, n)
+
+
+def _state_diverged(node: Any, h: Any, depth: Any, out: str, seq: int) -> None:
+    """K23 review A3 (law raenge-nie-uneins): TP0's STATE said ``exists=0`` and this worker's reconcile ended
+    ``out`` != deleted -- the worker keeps a node TP0 dropped (kv/anchor/noop run silently otherwise, unreconcilable
+    only rate-limited). Named at EVERY occurrence, plus a counter; the group stop is decided after the metal count
+    (a stop now, at an unknown rate, would be a new death button without a measurement)."""
+    n = _S.counts.get("k23_state_diverged", 0) + 1
+    _S.counts["k23_state_diverged"] = n
+    logger.warning(
+        "K23 SPILL-DIVERGED role=worker key=%s:%s node=%s seq=%d outcome=%s (n=%d): TP0 dropped this node "
+        "(STATE exists=0) and this worker could not delete it -- the ranks' trees now differ",
+        str(h)[:16], depth, getattr(node, "id", "?"), int(seq), out, n)
 
 
 def _reconcile(tree: Any, node: Any, exists: int, kv: int, m: int) -> str:

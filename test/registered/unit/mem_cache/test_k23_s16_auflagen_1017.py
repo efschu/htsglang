@@ -45,7 +45,8 @@ def _keys(cache):
 
 def _many_leaves(n_leaves, pages=SPAN):
     """A device claimer with ``n_leaves`` host-only sibling leaves of ``pages`` pages each."""
-    cache, allocator, _ = build_fixture(CacheConfig(page_size=1, components=(ComponentType.FULL,)))
+    cache, allocator, _ = build_fixture(
+        CacheConfig(page_size=1, components=(ComponentType.FULL,), kv_size=4096))
     cache.insert(InsertParams(key=RadixKey(list(range(1, 1 + pages)), None),
                               value=allocator.alloc(pages).to(dtype=torch.int64)))
     top = [n for n in cache._collect_all_nodes() if n is not cache.root_node][0]
