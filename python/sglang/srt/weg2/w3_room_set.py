@@ -262,6 +262,7 @@ class _Ctx:
         self.cap_left: Optional[int] = page_cap() if cap is _UNSET else cap   # None = no cap (B5)
         self.tried: Set[int] = set()
         self.capped = 0
+        self.admitted = 0                 # S17: nodes this call took on (the first is never capped)
         self.why: Dict[int, str] = {}     # node id -> why it stayed (B4: transient or standing)
 
     @property
@@ -504,14 +505,21 @@ def _release_one(cache: Any, pool: Any, node: Any, ctx: _Ctx, out: Dict[str, int
     if not (dev or leaf):
         return None
     slots = node_slots(pool, node)
-    if ctx.cap_left is not None and len(slots) > ctx.cap_left:
+    # S17 (h16v 1017_211842, #1324 STORE READ INCOMPLETE): the cap bounds the WORK of one call, it must never
+    # make a node unreleasable. decide() always admits its first node; a node of more pages than the whole cap
+    # (PP0 gen 79-93: slots=239 > 128, 38+31+16 of 94 sets released 0 pages, capped=1) was capped by every
+    # call -- the same node first in the group order every time -- so the KV arena stayed 6485/6485 pinned,
+    # every claim was refused, 173-468 nodes went un-backed and the flush reset them away. The first node of
+    # a call is admitted whatever its size (one node = the minimum progress); the cap holds from the second on.
+    if ctx.cap_left is not None and ctx.admitted > 0 and len(slots) > ctx.cap_left:
         ctx.capped += 1
         out["capped"] += 1
         ctx.why[id(node)] = "capped"
         return None
     ctx.tried.add(id(node))
+    ctx.admitted += 1
     if ctx.cap_left is not None:
-        ctx.cap_left -= len(slots)
+        ctx.cap_left = max(0, ctx.cap_left - len(slots))
     hv = node.component_data[BASE_COMPONENT_TYPE].host_value
     sec = pool.secure_rows_to_l3(hv)
     if int(sec.get("lost", 0)) or int(sec.get("unpaired", 0)) or int(sec.get("pages", 0)) < len(slots):
