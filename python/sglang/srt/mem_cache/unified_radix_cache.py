@@ -37,6 +37,7 @@ from sglang.srt.distributed.utils import uneven_dcp_active
 from sglang.srt.environ import envs
 from sglang.srt.weg2 import prefix_trace as _prefix_trace
 from sglang.srt.weg2.read_room import tick as _read_room_tick
+from sglang.srt.weg2.read_room import l3_complete as _read_room_l3_complete
 from sglang.srt.weg2 import tail_adopt, tail_handoff
 from sglang.srt.weg2 import short_read as _weg2_short_read
 from sglang.srt.weg2 import d_park_read as _weg2_park_read
@@ -2102,6 +2103,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def _reset_full(self) -> None:
         """Full reset: destroy entire tree and all state."""
+        # S20 (h16v3 22:48:14-22:49:08, the D arena held full by the workers' stale host rows): a Form A WORKER
+        # learned its tree only from worker_keeps / worker_short -- the first of them at 22:49:08. Until then every
+        # R12 verdict TP0 sent (seq 1-4, LOADED-HOST-RELEASE, 307848 tokens = 4810 pages) went into
+        # ``_S.pending`` unapplied (``consume`` found no tree), TP1/TP2 held tree=6043 refs against TP0's 1233 and
+        # D's arena stayed 6485/6485 pinned for 45 s. Every rank registers its tree HERE (construction runs
+        # ``reset``), so the verdict is applied at the broadcast it rides, as TP0 assumes.
+        _r12.register_tree(self)
         # rc12 (D, all ranks, 23:12:47Z: "H-leaf extra: [62, 64, 60, 63]" +
         # "4 stale nodes in host_leaves"): the #1417 prefetch pins name nodes
         # of the tree being destroyed. Kept across the sleep flush, the held
@@ -4662,6 +4670,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return False
         from sglang.srt.weg2 import pp_slot_fidelity as _sf
 
+        if _r12.role() is not None and _r12.l3_group_on():
+            return UnifiedRadixCache._weg2_l3_drop_forma(self, node, tracker)
         if not _sf.unbacked_drop_floor(self, node):
             return False
         if not UnifiedRadixCache._weg2_l3_drop_under_pressure(self, node):
@@ -4698,6 +4708,39 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 "comes back from L3)",
                 k, getattr(node, "id", "?"), len(getattr(node, "key", []) or []),
                 int(tracker.get(base, 0)) - before, max(0.0, waited_ms))
+        return True
+
+    def _weg2_l3_drop_forma(self, node: UnifiedTreeNode, tracker: dict[ComponentType, int]) -> bool:
+        """READ-ROOM-D, review readroomd B4: on a Form A group (R12) a store-backed device leaf -- ``l3_present``
+        (TP0's group verdict, mirrored by the K12b L3 event; since K12c A3 57fa93fb08 no rank sets it from its own
+        direct-write ack), no host copy (the R12 STATE dropped it) -- leaves the device WITHOUT a new arena claim,
+        like L3-DROP on the local-PP floor. The rule reads only tree state (l3_present, backuped, children, the
+        node's write-through and its device lock), never a rank-local room figure: every rank of the group takes the
+        same decision once it has APPLIED the same verdict (review readroomd2 B2). A verdict a worker could not apply
+        at once (STATE ``pending`` while its own store write holds the rows) leaves one window in which TP0 drops
+        and that worker demotes; it closes at the next broadcast and is named (READ-ROOM-STATE-DIVERGED /
+        SPILL-DIVERGED). A leaf with children or a write in flight keeps the old path. Returns True when the node
+        was dropped."""
+        if node.children or node.id in self.ongoing_write_through \
+                or getattr(node, "write_through_pending_id", None) is not None:
+            return False
+        if any(int(getattr(cd, "lock_ref", 0) or 0) > 0 for cd in node.component_data):
+            return False
+        mamba = getattr(ComponentType, "MAMBA", None)
+        if mamba is not None and node.component_data[mamba].value is not None:
+            return False   # an anchor on the device leaves only with a backup (D keeps its anchors)
+        base = BASE_COMPONENT_TYPE
+        before = int(tracker.get(base, 0))
+        self._ud_drop_unbacked_leaf(node, tracker)
+        k = getattr(UnifiedRadixCache, "_weg2_l3_drop_forma_n", 0) + 1
+        UnifiedRadixCache._weg2_l3_drop_forma_n = k
+        if k <= 32 or (k & (k - 1)) == 0:
+            logger.warning(
+                "L3-DROP FORMA n=%d node=%s tokens=%d freed=%d role=%s (a store-backed D device leaf -- l3_present by "
+                "TP0's verdict, no host copy on any rank -- left the device without a new arena claim; every rank "
+                "of the group decides the same from the same tree)",
+                k, getattr(node, "id", "?"), len(getattr(node, "key", []) or []),
+                int(tracker.get(base, 0)) - before, _r12.role())
         return True
 
     @staticmethod
@@ -6385,6 +6428,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if _role == "host" and int(sec.get("pages", 0)) < len(getattr(node, "hash_value", None) or ()):
                 # Form A: a page some owner has not finished is not COMPLETE and
                 # got no L3 copy -- the whole node stays until every page has one
+                continue
+            if not _read_room_l3_complete(node, sec):
+                # review readroomd B3 (every role): released only when EVERY page of the node has its L3 copy --
+                # the COMPLETE pages are all the node's pages and each is on disk or was written now
                 continue
             secured += int(sec.get("on_disk", 0))
             written += int(sec.get("written", 0))

@@ -109,6 +109,11 @@ L3 = "l3"
 #: orphan verdict is rank-local (each rank acks against the shared arena at its own time).
 K21 = "k21"
 
+#: READ-ROOM-D (review readroomd2 A4): TP0 released a node's KV host rows for a P read -- applied on a worker
+#: exactly like STATE, but an apply that ends ``pending`` or ``deleted`` is NAMED at every occurrence
+#: (READ-ROOM-STATE-DIVERGED), like SPILL-DIVERGED: in that window the trees differ
+RRSTATE = "rrstate"
+
 #: #239 S4b part 4: broadcasts TP0 waits for an incomplete token-cut page
 #: before it falls back to the ack's pre-cut decision (a write of every owner
 #: acks within a pass or two; the bound is a backstop, not a timing)
@@ -340,7 +345,7 @@ def record_state(tree: Any, node: Any, why: str = "") -> None:
         _S.absent.add(k)
     else:
         _S.absent.discard(k)
-    _S.ledger.append((STATE, k[0], k[1], exists, kv, m))
+    _S.ledger.append((RRSTATE if why == "read-room" else STATE, k[0], k[1], exists, kv, m))
 
 
 class K21RankDivergence(RuntimeError):
@@ -634,6 +639,18 @@ def attach(recv_reqs: List) -> List:
         except Exception as exc:  # noqa: BLE001 -- a failed spill keeps every reference
             if _note("spill_serve_error", 16):
                 logger.warning("R12 W3-SPILL serve failed: %r (every rank keeps its references)", exc)
+    # READ-ROOM-D (review readroomd B2): a P read's room request is served HERE, right before the broadcast, never
+    # inside the round; the decided host drops are applied on TP0 now and their verdicts (STATE + L3) ride this
+    # broadcast -- every rank's tree changes before the same admission
+    try:
+        from sglang.srt.weg2 import read_room as _read_room
+
+        if _S.tree is not None:
+            _read_room.serve_at_broadcast(_S.tree)
+        _read_room.flush_forma_pending()
+    except Exception as exc:  # noqa: BLE001 -- a room request never breaks the broadcast
+        if _note("read_room_serve_error", 16):
+            logger.warning("R12 READ-ROOM serve failed: %r (every rank keeps its references)", exc)
     if not _S.ledger:
         return recv_reqs
     _S.seq += 1
@@ -643,7 +660,7 @@ def attach(recv_reqs: List) -> List:
     if n:
         kinds = [e[0] for e in v.events]
         logger.info("R12 HOST-VERDICT SENT seq=%d events=%d transit=%d state=%d rebind=%d spill=%d l3=%d k21=%d (n=%d)",
-                    v.seq, len(v.events), kinds.count(TRANSIT), kinds.count(STATE),
+                    v.seq, len(v.events), kinds.count(TRANSIT), kinds.count(STATE) + kinds.count(RRSTATE),
                     kinds.count(REBIND), kinds.count(SPILL), kinds.count(L3), kinds.count(K21), n)
     return [v] + list(recv_reqs)
 
@@ -766,7 +783,7 @@ def apply(tree: Any, events: List, seq: int = 0) -> Dict[str, int]:
         return c
     idx = _index(tree)
     if inbox and r == "worker":
-        st_keys = {(e[1], int(e[2])) for e in list(_S.pending.values()) + list(events) if e[0] == STATE}
+        st_keys = {(e[1], int(e[2])) for e in list(_S.pending.values()) + list(events) if e[0] in (STATE, RRSTATE)}
         for e in inbox:
             k21k = (e[1], int(e[2]))
             if _find(idx, k21k[0], k21k[1]) is None:
@@ -781,7 +798,7 @@ def apply(tree: Any, events: List, seq: int = 0) -> Dict[str, int]:
         return c
     work = list(_S.pending.values())
     _S.pending = {}
-    state_keys = {(e[1], int(e[2])) for e in work if e[0] == STATE}
+    state_keys = {(e[1], int(e[2])) for e in work if e[0] in (STATE, RRSTATE)}
     for e in work:
         kind, h, depth, exists, kv, m = e
         node = _find(idx, h, depth)
@@ -866,6 +883,8 @@ def apply(tree: Any, events: List, seq: int = 0) -> Dict[str, int]:
                     f"applied as {out!r} on a worker (expected 'kv'): rank trees diverge"
                     + _k21_ctx((h, int(depth)), 1, 1))
         c[out] += 1
+        if kind == RRSTATE and out in ("pending", "deleted", "short", "unreconcilable"):
+            _rrstate_diverged(node, h, depth, out, seq)
     n = _note("applied")
     if n and (events or any(c[k] for k in ("transit", "kv", "anchor", "deleted", "rebind", "spill"))):
         logger.info(
@@ -914,6 +933,19 @@ def _state_diverged(node: Any, h: Any, depth: Any, out: str, seq: int) -> None:
         "K23 SPILL-DIVERGED role=worker key=%s:%s node=%s seq=%d outcome=%s (n=%d): TP0 dropped this node "
         "(STATE exists=0) and this worker could not delete it -- the ranks' trees now differ",
         str(h)[:16], depth, getattr(node, "id", "?"), int(seq), out, n)
+
+def _rrstate_diverged(node: Any, h: Any, depth: Any, out: str, seq: int) -> None:
+    """READ-ROOM-D (review readroomd2 A4): a worker that cannot apply TP0's READ-ROOM STATE at once. ``pending``:
+    the node is busy here (under the token cut its own store write holds the rows) -- until the next broadcast
+    applies it, TP0 has no host copy and this worker has one, so a device eviction in that window takes TP0's
+    Form A L3-DROP and this worker's demotion; ``deleted``: this worker dropped a node TP0 keeps. Named at EVERY
+    occurrence (no stop, no timer): the metal count says how often the window opens."""
+    n = _S.counts.get("rrstate_diverged", 0) + 1
+    _S.counts["rrstate_diverged"] = n
+    logger.warning(
+        "R12 READ-ROOM-STATE-DIVERGED seq=%d node=%s depth=%s hash=%s out=%s (n=%d): TP0 released this node's KV "
+        "host rows for a P read and this worker could not follow at once -- the ranks differ on its host copy "
+        "until the verdict applies", int(seq), getattr(node, "id", "?"), depth, str(h)[:16], out, n)
 
 
 def _reconcile(tree: Any, node: Any, exists: int, kv: int, m: int) -> str:
