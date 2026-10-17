@@ -58,6 +58,11 @@ class _Case(CustomTestCase):
 import contextlib  # noqa: E402
 
 _STATES = {}
+# on the unfixed tree these two do not exist: the model then still runs, so the red of the integration case is the
+# metal's (expired lap), not a missing attribute
+for _n, _v in (("_OWN_WORK_SPANS", []), ("_OWN_WORK_OPEN", [None])):
+    if not hasattr(weg2_idle_vote, _n):
+        setattr(weg2_idle_vote, _n, _v)
 
 
 @contextlib.contextmanager
