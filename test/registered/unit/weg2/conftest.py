@@ -152,5 +152,6 @@ def _weg2_decode_collect_old_path(monkeypatch):
     immediate paths they were written for (no wait while D decodes), so T_halb is 0 -- the set decides at once -- unless
     a test sets it. The old DECODE-COLLECT window is gone (its flag is read by nothing)."""
     if "SGLANG_WEG2_HALF_FLIP_S" not in os.environ:
-        monkeypatch.setenv("SGLANG_WEG2_HALF_FLIP_S", "0")
+        # A7: ``SGLANG_WEG2_TEST_T_HALF=4.5 pytest <arrival/flip files>`` runs the same files with the production T_halb
+        monkeypatch.setenv("SGLANG_WEG2_HALF_FLIP_S", os.environ.get("SGLANG_WEG2_TEST_T_HALF", "0"))
     yield

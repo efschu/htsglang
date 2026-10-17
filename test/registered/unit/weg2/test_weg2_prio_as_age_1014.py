@@ -371,6 +371,7 @@ def test_set_wait_opens_at_the_members_arrival_and_a_p1_long_ends_it_now(caplog,
         f = _front("D")
         f.awake = "D"
         now = NOW
+        f.t_awake = NOW - 100.0
         with mock.patch.object(Front, "_dc_d_busy", lambda self: True), \
              mock.patch.object(Front, "_dc_decoding", lambda self: True), \
              mock.patch.object(Front, "_dc_carried", lambda self: 0), \

@@ -83,7 +83,7 @@ def test_a_phase_that_moved_while_waiting_is_not_the_sum_rules_verdict(monkeypat
     _collecting(monkeypatch)
     f = _d_prefilling(5140)
 
-    async def moved(rid, unc):
+    async def moved(rid, unc, *a):
         f.epoch += 1
         return "P"
 

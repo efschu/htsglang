@@ -357,22 +357,45 @@ def test_set_verdict_line_has_the_exact_format(monkeypatch, caplog):
     assert "members=g:9000,h:3100" in line and "classes=gross,p_only" in line and "S=12100 X=6000 halfX=3000" in line
 
 
-def test_p_batch_takes_only_sets_of_x_or_more(monkeypatch):
+def test_a1_r1a_a_decided_flip_takes_everything_takable_also_a_small_set(monkeypatch):
+    """R1a: P-BATCH-ALL -- the flip a set decided takes ALL D-prefill entries waiting in D's line, also under X."""
     f = _fx()
     mk = lambda rid, u: _pending(rid, u, time.time())  # noqa: E731
-    a, b = mk("a", 2000), mk("b", 2500)
+    a, b = mk("a", 200), mk("b", 300)
     for p in (a, b):
         p.d_direct = True
     f._ready_for_d = [a, b]
-    f.counters["p_batch_from_d"] = 0
-    assert f._p_batch_takes_d_prefill() == 0, "S=4500 < X: the set stays with D (R7)"
-    assert f._ready_for_d == [a, b] and a.d_direct is True
-    c = mk("c", 2000)
-    c.d_direct = True
-    f._ready_for_d = [a, b, c]
     f._sync_batch_gate = lambda: None
-    assert f._p_batch_takes_d_prefill() == 3, "S=6500 >= X: P takes the set"
-    assert f._ready_for_d == [] and a.d_direct is False
+    assert f._p_batch_takes_d_prefill() == 2
+    assert f._ready_for_d == [] and a.d_direct is False and f.queue == [a, b] or len(f.queue) == 2
+
+
+def test_a1_yielded_kurz_is_taken_by_the_p_phase_after_a_decided_flip(monkeypatch):
+    """Review A repro: kurz yields to a decided flip (H5b), lands in D's line; the P phase takes it (not P-BATCH-STAYS)."""
+    _on(monkeypatch)
+    f = _fx()
+    now = time.time()
+    f.queue = [_pending("g", 9000, now - 5.0)]
+    assert f._decode_collect(now) == "P"
+    k = _pending("k", 300, time.time())
+    k.d_direct = True
+    f._ready_for_d.append(k)
+    f._sync_batch_gate = lambda: None
+    f.awake = "P"
+    assert f._p_batch_takes_d_prefill() == 1 and f._ready_for_d == []
+
+
+def test_a1_r6_counts_only_a_really_running_d_prefill_not_waiting_ready_entries(monkeypatch):
+    _on(monkeypatch)
+    f = _fx()
+    w = _pending("w", 4000, time.time())
+    w.d_direct = True
+    f._ready_for_d.append(w)       # waits in D's line: no D prefill runs
+    assert f._dc_carried_running() == 0
+    f._d_pf_book().grant(rid="run", tokens=4000, now=time.time())
+    f._d_pf_book().enter_leg2(rid="run")
+    f.groups["D"].outstanding["run"] = 1.0
+    assert f._dc_carried_running() == 4000
 
 
 def test_half_flip_check_reports_every_10th_flip_and_every_30_min(monkeypatch, caplog):
@@ -399,3 +422,191 @@ def test_half_flip_check_within_30_percent_is_ok():
     assert pp.half_flip_check(4.5, [4.0], [5.9])["verdict"] == "ok"        # 4.95: 10 % off
     assert pp.half_flip_check(4.5, [8.0], [9.0])["verdict"] == "abweichung"  # 8.5: 47 % off
     assert pp.half_flip_check(4.5, [], [1.0]) is None
+
+
+# ------------------------------------------------------------------------------------- Review A Auflagen (A2-A8)
+
+def test_a2_price_barrier_no_longer_decides_a_kurz_request_waits_for_no_price(monkeypatch):
+    """A2/R2: a LONG candidate no longer registers a price barrier (the to_p outcome was a second decider)."""
+    from sglang.srt.environ import envs
+    f = _fx()
+    f.x_exact = True
+    assert envs.SGLANG_WEG2_PRICE_BARRIER.get() is True            # readable ...
+    assert type(f)._pb_register(f, "a", 9000) is None              # ... decides nothing
+    assert not f.__dict__.get("_pb_inflight")
+
+
+def test_a2_burst_long_candidate_plus_kurz_kurz_gets_its_seat_without_t_half(monkeypatch):
+    _on(monkeypatch)
+    f = _fx()
+    f.queue = [_pending("big", 9000, time.time())]
+    f.__dict__["_pb_inflight"] = {}
+    t0 = time.time()
+    seat = asyncio.run(f._acquire_short_seat("k", 400, uncached=400))
+    assert seat is not None and time.time() - t0 < 1.0
+
+
+def test_a3_each_member_carries_its_own_x_and_s_is_checked_against_the_smallest(monkeypatch, caplog):
+    """R2a: X(depth)=4100 < envelope 6000. Two 2600 SHORTs: halfX(own)=2050 -> halb (not kurz as with the envelope's
+    3000), S=5200 >= 4100 -> FLIP_P, and the SET-VERDICT line reports that X."""
+    _on(monkeypatch)
+    f = _fx()
+    kurz_by_envelope = pp.classify_arrival(2600, X, HALF, False)
+    assert kurz_by_envelope == "kurz" and pp.classify_arrival(2600, 4100, HALF, False) == "halb"
+
+    async def run():
+        a = asyncio.ensure_future(f._acquire_short_seat("a", 2700, uncached=2600, x_set=4100))
+        await asyncio.sleep(0.02)
+        b = asyncio.ensure_future(f._acquire_short_seat("b", 2700, uncached=2600, x_set=4100))
+        return await asyncio.gather(a, b)
+
+    t0 = time.time()
+    with caplog.at_level(logging.INFO, logger="weg2.front"):
+        ra, rb = asyncio.run(run())
+    assert (ra, rb) == (None, None) and time.time() - t0 < 2.0
+    lines = [m for m in _verdicts(caplog) if "verdict=FLIP_P" in m]
+    assert lines and "X=4100" in lines[0] and "S=5200" in lines[0] and "classes=halb,halb" in lines[0], lines
+
+
+def test_a3_no_p_only_label_between_depth_x_and_the_envelope(monkeypatch, caplog):
+    _on(monkeypatch)
+    f = _fx()
+    q = _pending("g", 5000, time.time() - 5.0)   # over its own X 4100, under the envelope 6000
+    q.x_set = 4100
+    q.x_routed = 4100
+    f.queue = [q]
+    with caplog.at_level(logging.INFO, logger="weg2.front"):
+        assert f._decode_collect(time.time()) == "P"
+    (line,) = _verdicts(caplog)
+    assert "classes=gross" in line and "p_only" not in line and "X=4100" in line, line
+
+
+def test_a4_a_set_returnee_keeps_its_real_arrival_as_the_seat_order_stamp(monkeypatch):
+    _on(monkeypatch)
+    f = _front(running=["a"], n=1, kv={"available": 400000, "evictable": 0})
+    f.tp_prefill_max_tokens = X
+    t_real = time.time() - 4.5
+
+    async def run():
+        t = asyncio.ensure_future(f._arrival_seat_wait("h", 100, None, uncached=3500, t_arrive=t_real))
+        await asyncio.sleep(0.1)
+        stamp = f._asr_st()["waiters"]["h"]
+        t.cancel()
+        return stamp
+
+    assert asyncio.run(run()) == t_real
+
+
+def test_a5_t_open_never_before_this_d_phase_woke(monkeypatch):
+    _on(monkeypatch)
+    f = _fx()
+    now = time.time()
+    f.t_awake = now - 1.0                              # D woke 1 s ago (P->D flip)
+    f.queue = [_pending("g", 9000, now - 10.0)]        # arrived during the flip
+    assert f._decode_collect(now) == "hold", "the big request waits its T_halb in the NEW D phase (no double flip)"
+    assert f._decode_collect(now + 3.6) == "P"
+
+
+def test_a6_d_now_is_logged_when_really_admitted_with_its_wait(monkeypatch, caplog):
+    _on(monkeypatch)
+    f = _front(running=["a"], n=1, kv={"available": 400000, "evictable": 0})
+    f.tp_prefill_max_tokens = X
+    f.t_awake = time.time() - 60.0
+
+    async def run():
+        t = asyncio.ensure_future(f._acquire_short_seat("k", 400, uncached=400))
+        await asyncio.sleep(0.3)
+        assert not _verdicts(caplog), "no D_NOW while the kurz request still waits for its seat"
+        f.groups["D"].outstanding.pop("a")
+        return await asyncio.wait_for(t, 3.0)
+
+    with caplog.at_level(logging.INFO, logger="weg2.front"):
+        assert asyncio.run(run()) is not None
+    (line,) = _verdicts(caplog)
+    m = re.search(r"waited_s=(\d+\.\d) verdict=D_NOW why=R2", line)
+    assert m and float(m.group(1)) >= 0.2, line
+
+
+def test_a6_a_kurz_that_is_not_admitted_logs_the_reason(monkeypatch, caplog):
+    _on(monkeypatch)
+    f = _fx()
+    f._d_token_budget_blocks = lambda *a, **k: True
+    with caplog.at_level(logging.INFO, logger="weg2.front"):
+        assert asyncio.run(f._acquire_short_seat("k", 400, uncached=400)) is None
+    (line,) = _verdicts(caplog)
+    assert "verdict=NOT_D why=d_budget" in line and "waited_s=" in line, line
+
+
+def test_a8_a_queue_under_x_is_no_flip_reason(monkeypatch, caplog):
+    """R7/A8: small work D could not take; the work-exhausted path does not flip for it (no WAIT-BOUND-ANY flip either)."""
+    _on(monkeypatch)
+    f = _fx(running=())
+    now = time.time()
+    s1, s2 = _pending("s1", 1000, now - 90.0), _pending("s2", 800, now - 80.0)
+    f.queue = [s1, s2]
+    with caplog.at_level(logging.INFO, logger="weg2.front"):
+        assert f._set_flip_justified(now) is False
+        wf, _fair, imm = asyncio.run(f._arrival_seat_step(f.groups["D"], now))
+    assert wf is False and imm is None, "WAIT-BOUND-ANY must not flip a queue under X"
+    assert f.counters["flip_held_under_x"] == 1
+
+
+def test_a8_a_queue_sum_over_x_flips_through_set_verdict_and_is_logged(monkeypatch, caplog):
+    _on(monkeypatch)
+    f = _fx(running=())
+    now = time.time()
+    f.queue = [_pending("s1", 3000, now - 9.0), _pending("s2", 3100, now - 8.0)]
+    with caplog.at_level(logging.INFO, logger="weg2.front"):
+        assert f._set_flip_justified(now) is True
+    assert any("verdict=FLIP_P" in m and "queue-sum" in m for m in _verdicts(caplog))
+
+
+def test_b3_reroute_takes_the_waiting_d_line_entries_along_to_p(monkeypatch, caplog):
+    """R6/B3 (example 7): a D prefill of 4000 runs, 5000 arrives -> REROUTE_P; what waits in D's line rides along."""
+    _on(monkeypatch)
+    f = _fx()
+    f._sync_batch_gate = lambda: None
+    f._d_pf_book().grant(rid="run", tokens=4000, now=time.time())
+    f._d_pf_book().enter_leg2(rid="run")
+    f.groups["D"].outstanding["run"] = 1.0
+    w = _pending("w", 900, time.time() - 1.0)
+    w.d_direct = True
+    f._ready_for_d.append(w)
+    t0 = time.time()
+    f.queue = [_pending("g", 7000, t0 - 0.5)]
+    with caplog.at_level(logging.INFO, logger="weg2.front"):
+        assert f._decode_collect(t0) == "P"
+    assert any("verdict=REROUTE_P" in m for m in _verdicts(caplog))
+    assert f._ready_for_d == [] and {p.rid for p in f.queue} == {"g", "w"}, "the waiting entry is on P's queue"
+    assert f._set_st()["go_p"] >= {"g", "w"} and w.d_direct is False
+
+
+def test_b4_leftovers_from_earlier_epochs_wait_their_t_half_in_the_new_d_phase(monkeypatch):
+    _on(monkeypatch)
+    f = _fx()
+    now = time.time()
+    f.epoch = 9
+    f.t_awake = now - 0.5
+    q = _pending("old", 9000, now - 200.0)        # left behind by P's cap two phases ago
+    f.queue = [q]
+    assert f._decode_collect(now) == "hold"
+    assert f._set_st()["t_open"] >= f.t_awake
+
+
+def test_b6_a_short_the_d_budget_refused_goes_back_to_d_when_the_budget_frees_never_a_flip(monkeypatch):
+    """27B 7a19cae42a (restored): budget-refused kurz is queued; as soon as D's budget frees it is D's again."""
+    _on(monkeypatch)
+    f = _fx()
+    now = time.time()
+    p = _pending("s1", 800, now - 8.0)
+    p.d_eligible, p.d_budget_refused = False, True
+    f.queue = [p]
+    blocked = {"v": True}
+    f._d_token_budget_blocks = lambda *a, **k: blocked["v"]
+    wf, _fair, imm = asyncio.run(f._arrival_seat_step(f.groups["D"], now))
+    assert (wf, imm) == (False, None) and f._ready_for_d == [] and p in f.queue, "no flip, no move while blocked"
+    blocked["v"] = False
+    wf, _fair, imm = asyncio.run(f._arrival_seat_step(f.groups["D"], now + 1.0))
+    assert (wf, imm) == (False, None)
+    assert f._ready_for_d == [p] and p.d_direct is True and p not in f.queue
+    assert f.counters["d_budget_refused_back_to_d"] == 1

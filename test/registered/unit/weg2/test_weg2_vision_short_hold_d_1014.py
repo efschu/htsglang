@@ -163,8 +163,7 @@ def test_the_p_drain_does_not_take_a_d_presence_only_short():
     f.state = "serving"
     held = _pending("held", 9.0, skip_leg1=True, short_kept=True, d_direct=True,
                     d_presence_only=True)
-    # SOLL v2 R7: P takes a waiting D-prefill set only from S >= X (here X = 7733)
-    kept = _pending("kept", 8.0, X, skip_leg1=True, short_kept=True, d_direct=True)
+    kept = _pending("kept", 8.0, skip_leg1=True, short_kept=True, d_direct=True)
     f._ready_for_d.extend([held, kept])
     n = f._p_batch_takes_d_prefill()
     assert n == 1

@@ -31,7 +31,8 @@ RE_VERDICT = re.compile(
     r"d_decoding=(?P<dd>[01]) seats_free=(?P<seats>-?\d+) t_half_s=(?P<th>[\d.]+) waited_s=(?P<w>[\d.]+) "
     r"verdict=(?P<verdict>[A-Z_]+) why=(?P<why>.*)$")
 CLASSES = {"kurz", "halb", "gross", "p_only"}
-VERDICTS = {"COLLECT", "FLIP_P", "D_AFTER_TIMER", "PARK_NO_SEAT", "REROUTE_P", "D_NOW"}
+VERDICTS = {"COLLECT", "FLIP_P", "D_AFTER_TIMER", "PARK_NO_SEAT", "REROUTE_P", "D_NOW", "NOT_D"}
+# NOT_D (A6, 17.10.): a kurz request the front did NOT admit on D (why=yield_or_gate|d_budget) -- always an R2 finding
 ARTS = ("R2", "R3", "R6", "R7", "FORMAT")
 
 
@@ -84,7 +85,7 @@ class State:
         self.reset_stat()
 
     def reset_stat(self):
-        self.stat = {"sets": 0, "COLLECT": 0, "FLIP_P": 0, "D_AFTER_TIMER": 0, "PARK_NO_SEAT": 0, "REROUTE_P": 0, "D_NOW": 0,
+        self.stat = {"sets": 0, "COLLECT": 0, "FLIP_P": 0, "D_AFTER_TIMER": 0, "PARK_NO_SEAT": 0, "REROUTE_P": 0, "D_NOW": 0, "NOT_D": 0,
                      "viol": {a: 0 for a in ARTS}}
 
     # --- Eingabe -------------------------------------------------------------------------------------------

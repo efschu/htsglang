@@ -10,8 +10,14 @@
 #   M5   R5  the front tells the verdict D has seats it has not (a flip without seats)
 #   M6   R6  a running D prefill is not counted into S (no reroute)
 #   M7   R7  the epoch's state outlives the epoch (the epoch rule is back)
-#   M7b  R7  P takes a D-prefill set under X at the start of its drain
+#   M7b  R1a P-BATCH-ALL does not take the short in D's line (P-BATCH-STAYS back)
 #   M8   R3  the timer restarts with every new member (t_open = the newest member)
+#   MA2  R2  the price barrier decides again (PRICE_BARRIER_DECIDES True)
+#   MA3  R2a S is checked against the envelope X, not the members' smallest
+#   MA5  R4  t_open before this D phase woke (no clamp)
+#   MA8  R7  the work-exhausted flip path flips for a queue under X
+#   MB3  R6  a REROUTE_P leaves the waiting D-line entries behind
+#   MB6  R7  a budget-refused short never goes back to D
 #   M10  R3  a decided flip is re-collected on the next tick (a second T_halb)
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -44,29 +50,50 @@ OLD[M2y]='if cands and not Front._set_flip_foreseeable(self, time.time()):'
 NEW[M2y]='if False:'
 OLD[M3]='route = "D" if sv.verdict == phase_policy.V_D_AFTER_TIMER else "P"'
 NEW[M3]='route = "P"'
-OLD[M4]='d_decoding=decoding, seats_free=seats,'
-NEW[M4]='d_decoding=False, seats_free=seats,'
-OLD[M5]='d_decoding=decoding, seats_free=seats,'
-NEW[M5]='d_decoding=decoding, seats_free=999,'
-OLD[M6]='d_prefill_running_uncached=self._dc_carried(),  # R6'
+OLD[M4]='d_decoding=decoding, seats_free=seats,
+            d_prefill_running_uncached=self._dc_carried_running(),  # R6'
+NEW[M4]='d_decoding=False, seats_free=seats,
+            d_prefill_running_uncached=self._dc_carried_running(),  # R6'
+OLD[M5]='d_decoding=decoding, seats_free=seats,
+            d_prefill_running_uncached=self._dc_carried_running(),  # R6'
+NEW[M5]='d_decoding=decoding, seats_free=999,
+            d_prefill_running_uncached=self._dc_carried_running(),  # R6'
+OLD[M6]='d_prefill_running_uncached=self._dc_carried_running(),  # R6'
 NEW[M6]='d_prefill_running_uncached=0,  # R6'
 OLD[M7]='if st.get("epoch") != self.epoch:'
 NEW[M7]='if st.get("epoch") is None:'
-OLD[M7b]='if cand_ready and s_set < x_tok:'
-NEW[M7b]='if False:'
+OLD[M7b]='(moved if _takable(p) else keep).append(p)'
+NEW[M7b]='(moved if (False and _takable(p)) else keep).append(p)'
 OLD[M8]='        if st["t_open"] is None:
-            st["t_open"] = min(m.t_arrive for m in members)
-        decoding = self._dc_decoding()'
-NEW[M8]='        st["t_open"] = max(m.t_arrive for m in members)
-        decoding = self._dc_decoding()'
+            st["t_open"] = max(min(m.t_arrive for m in members)'
+NEW[M8]='        if True:
+            st["t_open"] = max(max(m.t_arrive for m in members)'
 OLD[M10]='if any(p.rid in st["go_p"] for p in live_q):
             for rid in list(st["shorts"]):'
 NEW[M10]='if False:
             for rid in list(st["shorts"]):'
 
+OLD[MA2]='PRICE_BARRIER_DECIDES = False'
+NEW[MA2]='PRICE_BARRIER_DECIDES = True'
+OLD[MA3]='x_tok = min(st["xs"][m.rid] for m in members)'
+NEW[MA3]='x_tok = int(self.tp_prefill_max_tokens)'
+OLD[MA5]='st["t_open"] = max(min(m.t_arrive for m in members), float(getattr(self, "t_awake", 0.0) or 0.0))'
+NEW[MA5]='st["t_open"] = min(m.t_arrive for m in members)'
+OLD[MA8]='        if sum(int(getattr(q, "est_uncached", 0) or 0) for q in live_q) < x_tok:
+            if st.get("held_epoch")'
+NEW[MA8]='        if False:
+            if st.get("held_epoch")'
+OLD[MB3]='            _n = self._p_batch_takes_d_prefill()
+            if _n:'
+NEW[MB3]='            _n = 0
+            if _n:'
+OLD[MB6]='                        p.d_eligible = True
+                        p.d_budget_refused = False'
+NEW[MB6]='                        p.d_budget_refused = False'
+
 run_suite || { echo "BASELINE RED -- fix the tests first"; exit 2; }
 survivors=0
-for m in M2 M2y M3 M4 M5 M6 M7 M7b M8 M10; do
+for m in M2 M2y M3 M4 M5 M6 M7 M7b M8 M10 MA2 MA3 MA5 MA8 MB3 MB6; do
   [ -n "${ONLY:-}" ] && [ "$ONLY" != "$m" ] && continue
   cp "$BAK" "$FR"
   mutate "${OLD[$m]}" "${NEW[$m]}" || { echo "$m: ANCHOR LOST"; survivors=$((survivors+1)); continue; }

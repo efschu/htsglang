@@ -3772,6 +3772,8 @@ class Pending:
     #: SHORT that D's own #915 budget refused at arrival (RC2 review: FIX 4a
     #: sent it to BATCH because D cannot take it now).
     d_eligible: bool = False
+    #: B6: D's #915 budget refused this SHORT at the arrival; it goes back to D as soon as the budget frees
+    d_budget_refused: bool = False
     #: UNIFY S7 (27B RC7-X): queued by the busy/idle split of X, not by the
     #: phase -- a band request (start X < uncached <= live X) the singleton
     #: rule sent to P while D was not empty. The idle re-grant
@@ -3783,6 +3785,8 @@ class Pending:
     #: X); phase_policy.needs_p() reads it: above it the request needs P. 0 =
     #: not routed long / switch off.
     x_routed: int = 0
+    #: SOLL R2a: this request's own D-prefill max X at its cache depth (k=1), stamped at the arrival; 0 = unknown
+    x_set: int = 0
     #: set when that drain handed it to D: its leg 2 then runs exactly as the
     #: SHORT route's (pending=None -- no leg 1 ever ran for it).
     d_direct: bool = False
@@ -7973,10 +7977,9 @@ class Front:
         -- leaves ``_ready_for_d`` for P's queue, in arrival order. Queued kept
         SHORTs get their leg 1 back. A request P already prefilled
         (``leg1_done``, not ``d_direct``) stays. Returns the number moved."""
-        # SOLL v2 R7/R1: P takes the set of D-prefill entries waiting in D's admission line only when its SUM reaches
-        # X -- a set under X stays with D and no flip is made for it (a P-only entry never waits there: it is never
-        # takable, see below). The kept SHORTs of the queue are in P's queue already: they only get their leg 1 back.
-        x_tok = int(self.tp_prefill_max_tokens)
+        # SOLL R1a (clarified 17.10.): this runs AFTER a flip a set with S >= X (or a big/p_only member) decided; the flip
+        # takes EVERYTHING takable along (user 1b: "prefillen zusammen alle anstehenden prefills"), also short
+        # requests waiting in D's line. It makes no flip itself (R7 concerns the decision to flip).
         ready = getattr(self, "_ready_for_d", None)
 
         def _takable(p) -> bool:
@@ -7986,20 +7989,11 @@ class Front:
                     and not (getattr(p, "d_presence_only", False) and getattr(p, "short_kept", False))
                     and (getattr(p, "fut", None) is None or not p.fut.done()))
 
-        cand_ready = [p for p in (ready or ()) if _takable(p)]
-        s_set = sum(int(getattr(p, "est_uncached", 0) or 0) for p in cand_ready)
-        if cand_ready and s_set < x_tok:
-            # the set waiting for D's admission line stays there (the queue's kept SHORTs below are already in P's
-            # queue: P drains it whole, they only get their leg 1 back)
-            self.counters["p_batch_set_under_x_stays"] += 1
-            logger.info("WEG2 P-BATCH-STAYS n=%d S=%d X=%d epoch=%d (SOLL R7: a set under X stays with D, "
-                        "P does not take it)", len(cand_ready), s_set, x_tok, self.epoch)
-            cand_ready = []
         moved = []
         if ready:
             keep = []
             for p in ready:
-                (moved if (cand_ready and _takable(p)) else keep).append(p)
+                (moved if _takable(p) else keep).append(p)
             if moved:
                 ready.clear()
                 ready.extend(keep)
@@ -10326,6 +10320,7 @@ class Front:
         # exceeds". Nothing read None as a number; the line simply never
         # showed the number. Instrument-text-lies, class A.
         self._note_front_price(rid, remainder)  # RESUME-VIA-P: the W50-REROUTE line's front_price
+        _x_set = Front._x_set_of(self, rid, store_span)  # R2a
         self._route_x_live = int(x_route)  # FEHLT 8: the X the last ROUTE-VERDICT decided with
         # USAGE-DETAILS: x_short = SHORT only by the live X above the band floor
         self._usage_route_note(rid, "x_short" if route == "short" and remainder > _x_floor else route,
@@ -10421,10 +10416,10 @@ class Front:
             try:
                 seat = await (self._acquire_short_seat(rid, est_prompt, short_refused,
                                                        max_tokens=_asr.max_tokens_of(payload),
-                                                       uncached=remainder)
+                                                       uncached=remainder, x_set=_x_set)
                               if _asr.enabled()  # ARRIVAL-SEAT: the KV need's decode part
                               else self._acquire_short_seat(rid, est_prompt, short_refused,
-                                                                   uncached=remainder))
+                                                                   uncached=remainder, x_set=_x_set))
             except BaseException:
                 self._d_pf_book().done(rid=rid)  # X-SUM-PRICE: cancelled between the gate's booking and the grant
                 raise
@@ -10583,11 +10578,13 @@ class Front:
                     # also the ones that fit -- until D's running decodes end,
                     # up to --drain-deadline-s each. Today's path keeps it here.
                     d_eligible=short_ok and not short_refused,
+                    d_budget_refused=short_ok and short_refused == ["d_budget"],
                     # PRIORITY LANES 1008 (L1): the lane noted at the arrival (0 with the switch off)
                     lane=Front._lane_for(self, rid))
         if _pb_to_p is not None:
             p.d_eligible = False  # PRICE-BARRIER: it rides the LONG's P phase, never handed back to D
         Front._lane_stamp(self, p)  # PRIORITY LANES 1008 (L4): original arrival + hold as clock offset
+        p.x_set = int(_x_set)  # R2a: this request's own X at its depth
         Front._stamp_x_decision(p, x_route, remainder)  # FRONT-X-MIT: the arrival verdict's X; a later hand-over re-decides
         if _d_hold:
             # VISION-SHORT-1014: D's admission line (like SHORT-IN-FLIP); P's drain
@@ -11027,8 +11024,15 @@ class Front:
     #: candidate (chars/3 undercounts by up to ~1/3: N5x weg2-0-2 50929 est, 74148 exact)
     PRICE_BARRIER_CANDIDATE_FRACTION = 0.5
 
+    PRICE_BARRIER_DECIDES = False
+
     def _pb_register(self, rid: str, est_uncached: int) -> Optional["asyncio.Future"]:
         """PRICE-BARRIER: announce a LONG-candidate arrival; resolved at its verdict."""
+        # SOLL R2 (Review A h16u A2): under the set scheduler a kurz request goes to D at once and never waits for a
+        # LONG candidate's price; a halb one joins the set (counts in S, R4 company). The barrier's to_p outcome was
+        # a second decider -- the switch stays readable and decides nothing.
+        if not Front.PRICE_BARRIER_DECIDES:
+            return None
         if not envs.SGLANG_WEG2_PRICE_BARRIER.get():
             return None
         x = int(getattr(self, "tp_prefill_max_tokens", 0) or 0)
@@ -11098,7 +11102,29 @@ class Front:
     async def _acquire_short_seat(self, rid: str, est_tokens: int = 0,
                                   refused: Optional[List[str]] = None,
                                   max_tokens: Optional[int] = None,
-                                  uncached: Optional[int] = None) -> Optional[Seat]:
+                                  uncached: Optional[int] = None,
+                                  x_set: Optional[int] = None) -> Optional[Seat]:
+        """SOLL R2/A6: the seat path of a SHORT arrival. A kurz request logs its ONE ``SET-VERDICT`` line when its
+        fate is known -- ``D_NOW why=R2`` once really admitted on D, ``NOT_D`` with the reason (yield / d_budget / gate)
+        when it was not -- with the time it waited (the X guard measures R2 on it)."""
+        t_in = time.time()
+        if refused is None:
+            refused = []
+        seat = await self._acquire_short_seat_core(rid, est_tokens, refused, max_tokens, uncached, x_set, t_in)
+        _unc = int(uncached) if uncached is not None else 0
+        _x = int(x_set) if x_set else int(self.tp_prefill_max_tokens)
+        if phase_policy.classify_arrival(_unc, _x, Front._set_cfg()[0], False) == phase_policy.CLASS_KURZ:
+            if seat is not None:
+                self._set_kurz_now(rid, _unc, _x, waited=time.time() - t_in)
+            else:
+                self._set_kurz_now(rid, _unc, _x, waited=time.time() - t_in,
+                                   why="d_budget" if "d_budget" in refused else "yield_or_gate",
+                                   verdict="NOT_D")
+        return seat
+
+    async def _acquire_short_seat_core(self, rid: str, est_tokens: int, refused: List[str],
+                                       max_tokens: Optional[int], uncached: Optional[int],
+                                       x_set: Optional[int], t_in: float) -> Optional[Seat]:
         """A SHORT arrival's seat -- behind the BATCH gate (C5/R-16).
 
         Returns ``None`` when the request must fall through to route BATCH:
@@ -11126,10 +11152,11 @@ class Front:
         # not small -- it is kurz (R2), never a guess from the prompt size
         _unc = int(uncached) if uncached is not None else 0
         _frac, _t_half = Front._set_cfg()
-        if phase_policy.classify_arrival(_unc, int(self.tp_prefill_max_tokens), _frac, False) == phase_policy.CLASS_KURZ:
-            self._set_kurz_now(rid, _unc)
+        _xs = int(x_set) if x_set else int(self.tp_prefill_max_tokens)   # R2a: this request's own X
+        if phase_policy.classify_arrival(_unc, _xs, _frac, False) == phase_policy.CLASS_KURZ:
+            pass   # R2: no set, no wait (the verdict line is written by the caller when the seat is known)
         else:
-            _set_route = await self._decode_collect_short(rid, _unc)
+            _set_route = await self._decode_collect_short(rid, _unc, _xs)
             if _set_route == "P":
                 # ``_decode_collect_short`` also answers "P" when the phase moved while this SHORT waited (epoch /
                 # awake changed): that is no verdict of the set and keeps SK's old fall-through. The set's own
@@ -11146,7 +11173,7 @@ class Front:
             # ARRIVAL-SEAT (b): no seat free or D's KV short -> wait for the
             # next free seat in arrival order, never the P detour (H91c3-3's
             # SEATS-FULL -> BATCH is off with the rule).
-            if not await self._arrival_seat_wait(rid, est_tokens, max_tokens, uncached=uncached):
+            if not await self._arrival_seat_wait(rid, est_tokens, max_tokens, uncached=uncached, t_arrive=t_in):
                 return None
         elif self._d_phase_seats_full(rid):
             # H91c3-3: D's seat cap n is full -- fall through to route BATCH
@@ -11256,6 +11283,13 @@ class Front:
             return 0
         return self._d_carried_tokens()
 
+    def _dc_carried_running(self) -> int:
+        """SOLL R6: only a D prefill that is REALLY running (the front's book of granted, not yet finished D
+        prefills) counts into the set's S -- entries merely waiting in ``_ready_for_d`` do not."""
+        if not envs.SGLANG_WEG2_ENABLE_DECODE_COLLECT_PREFILL_BUSY.get():
+            return 0
+        return Front._d_pf_pending_tokens(self)
+
     def _dc_d_busy(self) -> bool:
         """D decodes, or prefills a granted SHORT: the arrivals are priced as a SET (X-SUM-PRICE, ``carried`` in the sum).
         Only a decode lets the set WAIT (``_decode_collect``: ``decoding``); with ``carried`` alone the set is
@@ -11299,6 +11333,24 @@ class Front:
         D = self.groups["D"]
         return max(0, int(n) - len(self._flip_ledger(D)) - len(getattr(self, "_ready_for_d", ()) or ()))
 
+    def _x_set_of(self, rid: str, depth: int) -> int:
+        """SOLL R2a: the X of ONE request at its own cache depth, k=1 (the set's unit; curves modes only -- else the X in
+        force). Never raises; the verdict curves' bookkeeping (``_x_curve_last``) is left as the arrival set it."""
+        cap = int(self.tp_prefill_max_tokens)
+        setup = getattr(self, "_x_setup", None)
+        if setup is None or getattr(setup, "curves", None) is None:
+            return cap
+        try:
+            v = _xcurves.x_verdict_from_curves(depth=int(depth), open_requests=1, curves=setup.curves, cap=cap,
+                                               max_k=None, beyond=setup.beyond)
+            return max(1, int(v.x))
+        except Exception:  # noqa: BLE001 -- a refused/unknown depth: the arrival refused it already
+            return cap
+
+    def _set_x_of_entry(self, q: Any) -> int:
+        x = int(getattr(q, "x_set", 0) or 0)
+        return x if x > 0 else int(self.tp_prefill_max_tokens)
+
     def _set_cands(self, live_q: List["Pending"], st: dict) -> List["Pending"]:
         """The queued entries that need P (LONG, P-only, requeued, carrier) and are not yet committed to a flip."""
         x_tok = int(self.tp_prefill_max_tokens)
@@ -11306,16 +11358,21 @@ class Front:
                 and phase_policy.immediate_park_trigger([q], x_tok) is not None]
 
     def _set_members(self, now: float, cands: List["Pending"], st: dict) -> List[phase_policy.SetMember]:
-        """The set: the waiting halb SHORTs plus the queue entries that need P. An entry that needs P although it is
-        under X (requeued, carrier, deferred) is P-only by state -- R9 counts it big; D cannot take it."""
-        x_tok = int(self.tp_prefill_max_tokens)
-        out = []
+        """The set: the waiting halb SHORTs plus the queue entries that need P. Each carries its OWN X (R2a, in
+        ``st["xs"]``). An entry that needs P although under its X (requeued, carrier, deferred) is P-only by state --
+        R9 counts it big; D cannot take it. Only a request over its own X is "gross" (no p_only label for it)."""
+        out, xs = [], {}
         for q in cands:
             u = int(getattr(q, "est_uncached", 0) or 0)
+            xq = Front._set_x_of_entry(self, q)
+            xs[q.rid] = xq
             out.append(phase_policy.SetMember(
-                q.rid, u, float(_lctl.clock_t(q, now)), bool(getattr(q, "p_only", False)) or u < x_tok))
-        for rid, (t, u) in st["shorts"].items():
+                q.rid, u, float(_lctl.clock_t(q, now)), bool(getattr(q, "p_only", False)) or u < xq))
+        for rid, tup in st["shorts"].items():
+            t, u = tup[0], tup[1]
+            xs[rid] = int(tup[2]) if len(tup) > 2 and tup[2] else int(self.tp_prefill_max_tokens)
             out.append(phase_policy.SetMember(rid, int(u), float(t), False))
+        st["xs"] = xs
         return sorted(out, key=lambda m: m.t_arrive)
 
     def _set_log(self, st: dict, members: Sequence[phase_policy.SetMember], sv: phase_policy.SetVerdict, *,
@@ -11332,14 +11389,17 @@ class Front:
     def _set_eval(self, now: float, live_q: List["Pending"], st: dict):
         """The set's current verdict, without side effects beyond opening ``t_open`` (the first member's stamp):
         ``(members, SetVerdict, log kwargs)`` or ``None`` when the set is empty."""
-        x_tok = int(self.tp_prefill_max_tokens)
         frac, t_half = Front._set_cfg()
         cands = self._set_cands(live_q, st)
         members = self._set_members(now, cands, st)
         if not members:
             return None
+        # R2a: S is checked against the smallest X of the members (each at its own depth)
+        x_tok = min(st["xs"][m.rid] for m in members)
+        # R4/A5 (Review A): the clock starts at the first member's arrival, but never before this D phase woke -- a big
+        # request that arrived during the P->D flip waits its T_halb in the NEW D phase (no double flip)
         if st["t_open"] is None:
-            st["t_open"] = min(m.t_arrive for m in members)
+            st["t_open"] = max(min(m.t_arrive for m in members), float(getattr(self, "t_awake", 0.0) or 0.0))
         decoding = self._dc_decoding()
         seats = self._set_seats_free()
         # PRIO-AS-AGE 1014 (user decision 14.10.): a request with priority > 0 that needs P ends the wait AT ONCE
@@ -11347,9 +11407,9 @@ class Front:
         urgent = Front._prio_urgent(self, cands)
         sv = phase_policy.set_verdict(
             members=members, x_tokens=x_tok, half_frac=frac, t_half_s=0.0 if urgent is not None else t_half,
-            now=now, t_open=st["t_open"],
+            now=now, t_open=min(st["t_open"], now),
             d_decoding=decoding, seats_free=seats,
-            d_prefill_running_uncached=self._dc_carried(),  # R6: what D prefills right now counts into S
+            d_prefill_running_uncached=self._dc_carried_running(),  # R6: what D prefills right now counts into S
             new_since_last=max(0, len(members) - st["seen"]))
         kw = dict(x_tok=x_tok, frac=frac, t_half=t_half, decoding=decoding, seats=seats,
                   waited=max(0.0, now - st["t_open"]))
@@ -11414,25 +11474,74 @@ class Front:
                 self._d_pf_book().grant(rid=rid, tokens=int(st["shorts"][rid][1]), now=now)  # X-SUM-PRICE
         if route == "P":
             st["go_p"].update(m.rid for m in members)
+        if sv.verdict == phase_policy.V_REROUTE_P:
+            # B3/R6: a REAL redirect -- what waits in D's admission line rides to P too (the running D prefill's
+            # remainder is parked by the flip and handed back to P's batch by the PARK path)
+            _wait = [p.rid for p in list(getattr(self, "_ready_for_d", ()) or ()) if getattr(p, "d_direct", False)]
+            _n = self._p_batch_takes_d_prefill()
+            if _n:
+                st["go_p"].update(_wait)
+                self.counters["set_reroute_ready_to_p"] += _n
+                logger.info("WEG2 SET-REROUTE epoch=%d n=%d rids=%s running_uncached=%d -- R6: the waiting D-line "
+                            "entries ride the flip to P with the set", self.epoch, _n, _wait[:8],
+                            self._dc_carried_running())
         st.update(shorts={}, t_open=None, set_id=st["set_id"] + 1, seen=0, logged=None)
         return route
+
+    def _set_flip_justified(self, now: float) -> bool:
+        """SOLL R7/A8: the ONLY ways the controller's work-exhausted / economics path may flip D->P: a set verdict
+        (committed rids, or ``_decode_collect`` deciding P now) or a queue whose SUM reaches X -- decided here through
+        ``set_verdict`` and logged as a ``SET-VERDICT`` line like every other flip. A queue of short requests D could
+        not take (budget / seat) under X is no reason to flip: it waits for D or rides a decided flip."""
+        st = self._set_st()
+        live_q = [p for p in self.queue if not p.fut.done()]
+        if not live_q:
+            return False
+        if self._decode_collect(now, live_q) == "P":
+            return True
+        x_tok = min([Front._set_x_of_entry(self, q) for q in live_q] or [int(self.tp_prefill_max_tokens)])
+        if sum(int(getattr(q, "est_uncached", 0) or 0) for q in live_q) < x_tok:
+            if st.get("held_epoch") != self.epoch:
+                st["held_epoch"] = self.epoch
+                self.counters["flip_held_under_x"] += 1
+                logger.info("WEG2 FLIP-HELD epoch=%d n=%d S=%d X=%d (SOLL R7: queued work under X is no flip reason; "
+                            "it waits for D or rides a decided flip)", self.epoch, len(live_q),
+                            sum(int(getattr(q, "est_uncached", 0) or 0) for q in live_q), x_tok)
+            return False
+        frac, t_half = Front._set_cfg()
+        members = [phase_policy.SetMember(q.rid, int(getattr(q, "est_uncached", 0) or 0),
+                                          float(_lctl.clock_t(q, now)), bool(getattr(q, "p_only", False)))
+                   for q in live_q]
+        decoding, seats = self._dc_decoding(), self._set_seats_free()
+        sv = phase_policy.set_verdict(members=members, x_tokens=x_tok, half_frac=frac, t_half_s=0.0, now=now,
+                                      t_open=min(m.t_arrive for m in members), d_decoding=decoding, seats_free=seats,
+                                      d_prefill_running_uncached=self._dc_carried_running(), new_since_last=0)
+        self._set_log(st, members, sv, verdict=sv.verdict, why="queue-sum " + sv.why, x_tok=x_tok, frac=frac,
+                      t_half=t_half, decoding=decoding, seats=seats, waited=0.0)
+        self.counters["set_" + sv.verdict.lower()] += 1
+        if sv.verdict in (phase_policy.V_FLIP_P, phase_policy.V_PARK_NO_SEAT, phase_policy.V_REROUTE_P):
+            st["go_p"].update(m.rid for m in members)
+            return True
+        return False
 
     def _set_committed(self, live_q: List["Pending"], st: dict) -> List["Pending"]:
         """The queue entries a decided set committed to the flip (``go_p``)."""
         return [q for q in live_q if q.rid in st["go_p"]]
 
-    def _set_kurz_now(self, rid: str, uncached: int) -> None:
-        """R2: a kurz arrival goes to D at once -- logged once, ``verdict=D_NOW why=R2``."""
+    def _set_kurz_now(self, rid: str, uncached: int, x_set: Optional[int] = None, waited: float = 0.0,
+                      why: str = "R2", verdict: str = "D_NOW") -> None:
+        """R2: a kurz arrival goes to D -- logged ONCE, when it is really admitted (A6), ``verdict=D_NOW why=R2``
+        with the time it waited for its seat."""
         st = self._set_st()
-        x_tok = int(self.tp_prefill_max_tokens)
+        x_tok = int(x_set) if x_set else int(self.tp_prefill_max_tokens)
         frac, t_half = Front._set_cfg()
         m = phase_policy.SetMember(rid, int(uncached), time.time(), False)
-        sv = phase_policy.SetVerdict(phase_policy.V_D_NOW, "R2", 0.0, int(uncached), phase_policy.half_x_of(x_tok, frac))
-        self.counters["set_d_now"] += 1
-        self._set_log(st, [m], sv, verdict=phase_policy.V_D_NOW, why="R2", x_tok=x_tok, frac=frac, t_half=t_half,
-                      decoding=self._dc_decoding(), seats=self._set_seats_free(), waited=0.0)
+        sv = phase_policy.SetVerdict(verdict, why, 0.0, int(uncached), phase_policy.half_x_of(x_tok, frac))
+        self.counters["set_d_now" if verdict == "D_NOW" else "set_kurz_not_d"] += 1
+        self._set_log(st, [m], sv, verdict=verdict, why=why, x_tok=x_tok, frac=frac, t_half=t_half,
+                      decoding=self._dc_decoding(), seats=self._set_seats_free(), waited=float(waited))
 
-    async def _decode_collect_short(self, rid: str, uncached: int) -> Optional[str]:
+    async def _decode_collect_short(self, rid: str, uncached: int, x_set: Optional[int] = None) -> Optional[str]:
         """A halb SHORT on the D seat path joins the set and waits for its verdict: ``"D"`` = take the seat now,
         ``"P"`` = fall through to route BATCH (the flip takes it), ``None`` = nothing to decide."""
         st = self._set_st()
@@ -11443,7 +11552,7 @@ class Front:
                 self._d_pf_book().grant(rid=rid, tokens=int(uncached or 0), now=time.time())
             return None
         now = time.time()
-        st["shorts"][rid] = (now, int(uncached or 0))
+        st["shorts"][rid] = (now, int(uncached or 0), int(x_set or 0))
         epoch = self.epoch
         _frac, t_half = Front._set_cfg()
         deadline = now + t_half + float(getattr(self, "drain_deadline_s", 30.0) or 30.0)
@@ -11875,7 +11984,7 @@ class Front:
         return True
 
     async def _arrival_seat_wait(self, rid: str, est_tokens: int, max_tokens: Optional[int],
-                                 uncached: Optional[int] = None) -> bool:
+                                 uncached: Optional[int] = None, t_arrive: Optional[float] = None) -> bool:
         """ARRIVAL-SEAT (a)/(b) for an arrival D prefills itself (uncached <= X):
         True as soon as a seat is free, its KV need fits and it is the OLDEST
         seat waiter (arrival order, #244/#246); until then it waits here -- no P
@@ -11885,7 +11994,8 @@ class Front:
         st = self._asr_st()
         waiters = st["waiters"]
         fits_of = st.setdefault("fits", {})
-        waiters[rid] = time.time()
+        # PRIO=ALTER (A4): a set's D_AFTER_TIMER returnee keeps its REAL arrival as the order stamp
+        waiters[rid] = float(t_arrive) if t_arrive else time.time()
         _lane_on = _lctl.enabled()
         if _lane_on:
             # PRIORITY LANES 1008 (L4): a request released from the arrival gate keeps its ORIGINAL arrival as the
@@ -12059,6 +12169,18 @@ class Front:
             # or the seat/KV verdict with the switch off)
         # y4y: a queued SHORT has an owner -- D, as a d_prefill verdict (the
         # candidates below are only the entries that need P)
+        # B6 (27B 7a19cae42a): a SHORT D's budget refused is D's again once the budget frees -- never a flip under X (R7)
+        _br = [p for p in live_q if getattr(p, "d_budget_refused", False) and not getattr(p, "d_eligible", False)]
+        if _br and self.admit_d:
+            try:
+                _rd = await self._d_reading_if_armed()
+                for p in _br:
+                    if not self._d_token_budget_blocks(p.rid, int(getattr(p, "est_prompt", 0) or 0), _rd):
+                        p.d_eligible = True
+                        p.d_budget_refused = False
+                        self.counters["d_budget_refused_back_to_d"] += 1
+            except Exception:  # noqa: BLE001 -- an unreadable budget keeps the entry queued
+                pass
         handed = self._asr_queued_short_to_d(live_q, now) if live_q else []
         if handed:
             live_q = [p for p in live_q if all(p is not h for h in handed)]
@@ -12085,11 +12207,13 @@ class Front:
                     st["wait_any_rid"] = head.rid
                     self.counters["arrival_seat_wait_any"] += 1
                     logger.warning("%s rid=%s WAIT-BOUND-ANY waited=%.1f s >= bound %.0f s uncached=%d "
-                                   "d_eligible=%s -- a queued entry no rule took: the bound fires (flip to P)",
+                                   "d_eligible=%s -- a queued entry no rule took; SOLL R7: no flip for it unless a set "
+                                   "verdict / the queue sum >= X decides one (it waits for D or rides that flip)",
                                    _asr.MARKER, head.rid, q_wait, bound,
                                    int(getattr(head, "est_uncached", 0) or 0),
                                    bool(getattr(head, "d_eligible", False)))
-                return True, True, None
+                if Front._set_flip_justified(self, now):
+                    return True, True, None
             return False, not self.admit_d, None
         if envs.SGLANG_WEG2_PBOUND_FLIP_NOW.get():
             return self._asr_pbound_flip_now(cands, x_tok, now)
@@ -17246,15 +17370,19 @@ class Front:
                                         and not (getattr(self, "standard_form", True)
                                                  and self._ready_for_d))
                     if (d_work_exhausted or not self.admit_d) and not handing_off:
+                        # SOLL R7/A8: this second flip path flips only on a set verdict / a queue sum >= X (or a D the
+                        # front already closed); work under X that D could not take is no flip reason
+                        _set_ok = (not self.admit_d) or Front._set_flip_justified(self, _now)
+                        if not _set_ok:
+                            continue
                         if _x_rg == "wait" and self.admit_d and not fairness_fired:
                             # UNIFY S7 (27B RC7-X (a)): D takes this backlog itself
                             # once the singleton window is quiet -- a flip now would
                             # buy a round trip X* says does not pay.
                             continue
-                        if not self._flip_economics_ok(fairness_fired):
-                            # (c) --d-hold-s bounds the economics hold: a small backlog
-                            # D cannot serve flips once D has been free that long
-                            # (off = held until the fairness bound, today).
+                        if not self._flip_economics_ok(fairness_fired or self.admit_d):
+                            # (c) --d-hold-s bounds the economics hold (admit_d False only: a flip the front decided
+                            # earlier); a set-justified flip passed ``_set_flip_justified`` above and is not priced twice
                             if not self._d_hold_expired("backlog", _now):
                                 continue
                         if not self._dwell_ok("D", "P", fairness_fired, work_exhausted=d_work_exhausted,
