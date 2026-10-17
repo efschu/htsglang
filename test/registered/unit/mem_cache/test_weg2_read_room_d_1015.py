@@ -56,13 +56,19 @@ MAMBA = ComponentType.MAMBA
 
 @pytest.fixture(autouse=True)
 def _clean():
+    from sglang.srt.weg2 import room_verdicts as _rvm, room_wait_arbiter as _arbm
+
     _rr().reset_for_tests()
+    _rvm.reset_for_tests()
+    _arbm.reset_for_tests()
     R12._reset_state_for_tests()
     with envs.SGLANG_WEG2_L3FILL_ROOM_WAIT_MS.override(300), \
             _ov("SGLANG_WEG2_READ_ROOM_WAIT_MS", 4000), \
             envs.SGLANG_WEG2_L3FILL_SELF_JOIN_TAKEOVER.override(False):
         yield
     _rr().reset_for_tests()
+    _rvm.reset_for_tests()
+    _arbm.reset_for_tests()
     R12._reset_state_for_tests()
 
 
