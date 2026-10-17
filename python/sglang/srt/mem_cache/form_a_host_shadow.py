@@ -148,13 +148,22 @@ class _State:
         self.ledger: List[Tuple[str, str, int, int, int, int]] = []
         self.pending: Dict[Tuple[str, int], Tuple[str, str, int, int, int, int]] = {}
         self.absent: set = set()
-        # K21 A1: node keys whose own drain ack made them an A2 orphan on THIS rank
-        # (same event on every rank); a STATE for such a key must reconcile to "kv"
-        # value = handover counter at the mark, -1 once TP0's K21 confirmed it (worker side)
-        self.k21_keys: Dict[Tuple[str, int], int] = {}
-        # keys TP0 reported as orphan while this worker has NO mark: its STATE must end 'kv'
+        # K21 ack pairing (nf-nachreview2-h16v-1017 V1, S11): the orphan verdict of a direct write's
+        # ack is rank-local AND asynchronous (each rank's finish_event turns ready at its own time).
+        # So a worker pairs, per content key and in FIFO order, ITS OWN ack finding with TP0's
+        # (0 = clean, 1 = A2 orphan) and judges only once BOTH exist -- no timer, no handover count.
+        self.k21_own: Dict[Tuple[str, int], List[int]] = {}
+        self.k21_tp0: Dict[Tuple[str, int], List[Tuple[int, bool]]] = {}
+        # TP0 K21 events not yet queued (no tree yet / drained at the next apply)
+        self.k21_inbox: List[Tuple] = []
+        # keys both ranks orphaned and TP0 published a STATE for: that STATE must end 'kv'
+        # (value = handover counter, cleanup only -- never a stop reason)
+        self.k21_confirmed: Dict[Tuple[str, int], int] = {}
+        # keys TP0 reported as orphan while this worker's own ack was clean: its STATE must end 'kv'
         self.k21_expect: set = set()
-        # number of broadcasts consumed on this rank (the "handover" the K21 rule counts in)
+        # named stop found outside a consume (own-ack time); raised at the end of the next consume
+        self.k21_stop_msg: Optional[str] = None
+        # number of broadcasts consumed on this rank
         self.handover_n = 0
         self.tree: Any = None
         # #239 S4b part 4 (TP0 only): nodes whose token-cut page was not yet
@@ -340,24 +349,29 @@ class K21RankDivergence(RuntimeError):
     would hold different trees. Named group stop, never a counter."""
 
 
-def note_k21_orphan(node: Any) -> None:
-    """The drain ack of ``node`` orphaned it on this rank (every role). The orphan verdict is
-    rank-local, so it is compared in both directions (N1):
+def note_k21_ack(node: Any, orphaned: int) -> None:
+    """The write ack of ``node`` was judged on this rank: ``orphaned`` 1 = A2 orphan, 0 = clean.
+    Called at EVERY direct-write ack (V1: pairing instead of a handover karenz).
 
-    * TP0 sends a K21 event at EVERY own orphan ack (even if the host release then fails);
-    * a worker keeps a mark; TP0's K21 in the next handover confirms it, no K21 there is the
-      named stop ``K21RankDivergence`` (see :func:`consume`); a K21 without a mark makes the
-      STATE of that key have to end ``kv`` (see :func:`apply`)."""
+    * TP0 sends one K21 event per own ack (field ``exists`` = orphaned), even if the host release
+      then fails -- exactly one event per ack, so a worker's FIFO lines up;
+    * a worker records its own finding and pairs it with TP0's (see :func:`_k21_pair`)."""
     if not shadow_active():
         return
     k = node_key(node)
     if k is None:
         return
+    o = 1 if orphaned else 0
     if role() == "host":
         _announce("host")
-        _S.ledger.append((K21, k[0], k[1], 1, 0, 0))
+        _S.ledger.append((K21, k[0], k[1], o, 0, 0))
     else:
-        _S.k21_keys[k] = _S.handover_n
+        _S.k21_own.setdefault(k, []).append(o)
+        _k21_pair(k)
+
+
+def note_k21_orphan(node: Any) -> None:  # kept for callers/tests of the old name
+    note_k21_ack(node, 1)
 
 
 def _k21_stop(msg: str) -> None:
@@ -365,18 +379,50 @@ def _k21_stop(msg: str) -> None:
     raise K21RankDivergence("K21: " + msg)
 
 
-def _k21_age_check() -> None:
-    """Worker, after a handover: a mark of its OWN that TP0's K21 did not confirm by now
-    (one handover after the mark) means the worker orphaned a node TP0 did not."""
-    if not _S.k21_keys:
-        return
-    for k, n in list(_S.k21_keys.items()):
-        if n >= 0 and _S.handover_n - n >= 1:
-            _S.k21_keys.pop(k, None)
-            _k21_stop(
-                f"this worker's ack orphaned node hash={str(k[0])[:16]} depth={k[1]} but TP0 sent no "
-                f"K21 in the next handover (marked at handover {n}, now {_S.handover_n}): the ranks' "
-                "trees diverge (only this rank kept the node on the device)")
+def _k21_defer_stop(msg: str) -> None:
+    """A divergence found where an exception would be swallowed (the ack path): raised by the
+    next consume."""
+    if _S.k21_stop_msg is None:
+        _S.k21_stop_msg = msg
+
+
+def _k21_pair(k: Tuple[str, int]) -> None:
+    """Worker: judge every complete (own, TP0) pair of key ``k`` in FIFO order. Only when BOTH
+    findings exist; an own write still in flight just leaves TP0's finding parked."""
+    own = _S.k21_own.get(k)
+    tp0 = _S.k21_tp0.get(k)
+    while own and tp0:
+        o = own.pop(0)
+        t, has_state = tp0.pop(0)
+        if o and t:
+            if has_state:
+                _S.k21_confirmed[k] = _S.handover_n  # the STATE apply checks the outcome
+            # else: both orphaned, TP0's release failed: agreed
+        elif t and not o:
+            # TP0 orphaned, this worker's ack was clean: TP0 keeps the node on the device, the
+            # worker must end there too, i.e. a STATE that applies 'kv'
+            if not has_state:
+                _k21_defer_stop(
+                    f"TP0 orphaned node hash={str(k[0])[:16]} depth={k[1]} (kept on the device), this "
+                    "worker's ack was clean and no STATE follows: trees diverge")
+            else:
+                _S.k21_expect.add(k)
+        elif o and not t:
+            _k21_defer_stop(
+                f"this worker's ack orphaned node hash={str(k[0])[:16]} depth={k[1]} but TP0's ack "
+                "of the same write was clean: the ranks' trees diverge (only this rank kept the "
+                "node on the device)")
+    if own is not None and not own:
+        _S.k21_own.pop(k, None)
+    if tp0 is not None and not tp0:
+        _S.k21_tp0.pop(k, None)
+
+
+def _k21_raise_pending() -> None:
+    msg = _S.k21_stop_msg
+    if msg is not None:
+        _S.k21_stop_msg = None
+        _k21_stop(msg)
 
 
 def _pkey(e) -> tuple:
@@ -604,18 +650,20 @@ def consume(recv_reqs: Optional[List], tree: Any = None) -> Optional[List]:
 def _consume(recv_reqs: Optional[List], tree: Any = None) -> Optional[List]:
     out = _consume_apply(recv_reqs, tree)
     if role() == "worker":
-        _k21_age_check()
+        for ck in [ck for ck, n in _S.k21_confirmed.items() if _S.handover_n - n > 2]:
+            _S.k21_confirmed.pop(ck, None)  # cleanup only, never a stop
+        _k21_raise_pending()
     return out
 
 
 def _consume_apply(recv_reqs: Optional[List], tree: Any = None) -> Optional[List]:
     if not recv_reqs:
-        if _S.pending and (tree or _S.tree) is not None:
+        if (_S.pending or _S.k21_inbox) and (tree or _S.tree) is not None:
             apply(tree or _S.tree, [])
         return recv_reqs
     verdicts = [r for r in recv_reqs if isinstance(r, FormAHostVerdict)]
     if not verdicts:
-        if _S.pending and (tree or _S.tree) is not None:
+        if (_S.pending or _S.k21_inbox) and (tree or _S.tree) is not None:
             apply(tree or _S.tree, [])
         return recv_reqs
     rest = [r for r in recv_reqs if not isinstance(r, FormAHostVerdict)]
@@ -626,7 +674,10 @@ def _consume_apply(recv_reqs: Optional[List], tree: Any = None) -> Optional[List
     if t is None:
         # no tree has touched HiCache yet on this rank: keep for the next pass
         for e in events:
-            _S.pending[_pkey(e)] = e
+            if e[0] == K21:
+                _S.k21_inbox.append(e)  # FIFO, never superseded
+            else:
+                _S.pending[_pkey(e)] = e
         return rest
     apply(t, events, seq=verdicts[-1].seq)
     return rest
@@ -642,8 +693,12 @@ def on_tree_reset(tree: Any) -> None:
     _S.ledger = []
     _S.pending = {}
     _S.absent = set()
-    _S.k21_keys = {}
+    _S.k21_own = {}
+    _S.k21_tp0 = {}
+    _S.k21_inbox = []
+    _S.k21_confirmed = {}
     _S.k21_expect = set()
+    _S.k21_stop_msg = None
     _S.rebind_wait = {}
 
 
@@ -685,39 +740,36 @@ def apply(tree: Any, events: List, seq: int = 0) -> Dict[str, int]:
     c = dict(transit=0, kv=0, anchor=0, deleted=0, short=0, missing=0,
              pending=0, unreconcilable=0, noop=0, rebind=0, rebind_miss=0, spill=0)
     for e in events:
-        _S.pending[_pkey(e)] = e  # a newer event for the key supersedes (L3 has its own slot)
+        if e[0] == K21:
+            _S.k21_inbox.append(e)  # K21 verdicts are a FIFO per key: never superseded
+        else:
+            _S.pending[_pkey(e)] = e  # a newer event for the key supersedes (L3 has its own slot)
+    inbox, _S.k21_inbox = _S.k21_inbox, []
+    if not _S.pending and not inbox:
+        return c
+    idx = _index(tree)
+    if inbox and r == "worker":
+        st_keys = {(e[1], int(e[2])) for e in list(_S.pending.values()) + list(events) if e[0] == STATE}
+        for e in inbox:
+            k21k = (e[1], int(e[2]))
+            if _find(idx, k21k[0], k21k[1]) is None:
+                _S.k21_own.pop(k21k, None)
+                _S.k21_tp0.pop(k21k, None)
+                c["missing"] += 1
+                continue
+            _S.k21_tp0.setdefault(k21k, []).append((1 if e[3] else 0, k21k in st_keys))
+            _k21_pair(k21k)
+            c["noop"] += 1
     if not _S.pending:
         return c
     work = list(_S.pending.values())
     _S.pending = {}
-    idx = _index(tree)
     state_keys = {(e[1], int(e[2])) for e in work if e[0] == STATE}
     for e in work:
         kind, h, depth, exists, kv, m = e
         node = _find(idx, h, depth)
         if node is None:
-            if kind == K21:
-                _S.k21_keys.pop((h, int(depth)), None)
             c["missing"] += 1
-            continue
-        if kind == K21:
-            if r != "worker":
-                continue  # TP0 is the source
-            k21k = (h, int(depth))
-            if k21k in _S.k21_keys:
-                if k21k in state_keys:
-                    _S.k21_keys[k21k] = -1  # confirmed; the STATE apply below checks the outcome
-                else:
-                    _S.k21_keys.pop(k21k, None)  # both orphaned, TP0's release failed: agreed
-            else:
-                # TP0 orphaned the node, this worker did not: TP0 keeps it on the device; the
-                # worker must end with it on the device too, i.e. a STATE that applies 'kv'
-                if k21k not in state_keys:
-                    _k21_stop(
-                        f"TP0 orphaned node={getattr(node, 'id', '?')} depth={depth} hash={str(h)[:16]} "
-                        "(kept on the device), this worker did not and no STATE follows: trees diverge")
-                _S.k21_expect.add(k21k)
-            c["noop"] += 1
             continue
         if kind == TRANSIT:
             if cut and _busy(tree, node):
@@ -777,8 +829,8 @@ def apply(tree: Any, events: List, seq: int = 0) -> Dict[str, int]:
                     f"TP0 orphaned node={getattr(node, 'id', '?')} depth={depth} hash={str(h)[:16]} "
                     f"(kept on the device), this worker did not orphan it and its STATE apply ended "
                     f"{out!r} instead of 'kv' (seq={int(seq)}): trees diverge")
-        elif (h, int(depth)) in _S.k21_keys:
-            _S.k21_keys.pop((h, int(depth)), None)
+        elif (h, int(depth)) in _S.k21_confirmed:
+            _S.k21_confirmed.pop((h, int(depth)), None)
             if out in ("deleted", "unreconcilable"):
                 logger.error(
                     "K21 RANK-DIVERGENCE seq=%d node=%s depth=%s hash=%s out=%s: TP0 republished "
