@@ -1105,7 +1105,9 @@ class Envs:
     # round across quiesce polls -- while the in-flight write-through/store count
     # stands where that round left it, a repeat round cannot issue (kvs2 W3), so
     # the poll skips its ~1.2 s sweep (P.log 144297 sweep_ms=1221.1 per poll).
-    SGLANG_WEG2_FLUSH_SWEEP_MEMO = EnvBool(False)
+    # 17.10. (K22, S9): default ON per rule 'new features on' -- behind a full arena PP1/PP2 paid the
+    # ~0.75 s no-progress sweep on every quiesce poll (P.log 1017_181001 sweep_ms=747.7); off via env.
+    SGLANG_WEG2_FLUSH_SWEEP_MEMO = EnvBool(True)
     # PR-ARENA (NF int22, P PP1 18:34:20Z, boot 1008_171755 @ 6b3bd1a6df): the
     # PP room vote's walk (weg2/pp_room_vote.estimate_payable) priced a peel's
     # write_back backup at the KV host pool's available_size() -- on an arena

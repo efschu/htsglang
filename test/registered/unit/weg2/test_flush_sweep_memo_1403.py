@@ -13,7 +13,7 @@ THE MEMO: kvs2 W3 already breaks the loop after a round that issued nothing
 with nothing in flight ("no pin frees, no write lands"). The memo carries
 that verdict across polls: while the in-flight write-through/store count
 stands where the no-progress round left it, the next poll skips the sweep
-(SGLANG_WEG2_FLUSH_SWEEP_MEMO, default off).
+(SGLANG_WEG2_FLUSH_SWEEP_MEMO, default on since 17.10.).
 """
 
 from __future__ import annotations
@@ -74,12 +74,12 @@ def test_memo_hit_only_while_the_count_stands():
     assert not nb.sweep_memo_hit(s, tree)
 
 
-def test_memo_switch_default_off_on_via_env(monkeypatch):
+def test_memo_switch_default_on_off_via_env(monkeypatch):
     nb = _nb()
     monkeypatch.delenv("SGLANG_WEG2_FLUSH_SWEEP_MEMO", raising=False)
-    assert not nb.sweep_memo_on()
-    monkeypatch.setenv("SGLANG_WEG2_FLUSH_SWEEP_MEMO", "1")
     assert nb.sweep_memo_on()
+    monkeypatch.setenv("SGLANG_WEG2_FLUSH_SWEEP_MEMO", "0")
+    assert not nb.sweep_memo_on()
 
 
 def test_scheduler_flush_handler_is_wired():
