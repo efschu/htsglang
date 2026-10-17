@@ -65,6 +65,9 @@ HEADER_PRICED = "x-weg2-front-priced"
 #: Request attribute names (GenerateReqInput / TokenizedGenerateReqInput / Req).
 ATTR_X = "weg2_front_x"
 ATTR_PRICED = "weg2_front_priced"
+#: H16V review A3: halbX (F_halb x X) of the same decision, computed by the front (SOLL R11: no rank-local flag).
+HEADER_HALFX = "x-weg2-front-halfx"
+ATTR_HALFX = "weg2_front_halfx"
 
 #: Upper bound accepted from a header: a defensive sanity cap, far above any X.
 _MAX_TOKENS = 1 << 31
@@ -88,7 +91,7 @@ def tolerance_tokens(page_size: Optional[int]) -> int:
         return 1
 
 
-def request_headers(x: Optional[int], priced: Optional[int]) -> Dict[str, str]:
+def request_headers(x: Optional[int], priced: Optional[int], halfx: Optional[int] = None) -> Dict[str, str]:
     """The headers the front adds to a D-direct leg 2; ``{}`` = nothing to carry.
 
     No header for ``x <= 0`` (no decision X: the static gate alone) and none with the
@@ -103,6 +106,11 @@ def request_headers(x: Optional[int], priced: Optional[int]) -> Dict[str, str]:
     if priced is not None:
         try:
             out[HEADER_PRICED] = str(max(0, int(priced)))
+        except (TypeError, ValueError):
+            pass
+    if halfx is not None:
+        try:
+            out[HEADER_HALFX] = str(max(0, int(halfx)))
         except (TypeError, ValueError):
             pass
     return out
@@ -139,6 +147,17 @@ def parse_headers(headers: Optional[Mapping[str, Any]]) -> Tuple[Optional[int], 
     return x, priced
 
 
+def parse_halfx(headers: Optional[Mapping[str, Any]]) -> Optional[int]:
+    """The front's halbX of the request (H16V A3), ``None`` when absent / invalid / off / without a front X."""
+    if headers is None or not enabled():
+        return None
+    try:
+        v = _parse_one(headers, HEADER_HALFX)
+    except Exception:  # noqa: BLE001
+        return None
+    return v if v else None
+
+
 def stamp_request(adapted: Any, raw_request: Any) -> None:
     """Copy the carrier headers of ``raw_request`` onto the internal request object.
 
@@ -153,6 +172,7 @@ def stamp_request(adapted: Any, raw_request: Any) -> None:
     try:
         setattr(adapted, ATTR_X, x)
         setattr(adapted, ATTR_PRICED, priced)
+        setattr(adapted, ATTR_HALFX, parse_halfx(headers))
     except Exception:  # noqa: BLE001
         logger.warning("WEG2 FRONT-X could not stamp %s on %s", ATTR_X, type(adapted).__name__)
 

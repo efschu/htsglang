@@ -428,9 +428,12 @@ class SetMember:
     uncached: int
     t_arrive: float
     p_only: bool = False
-    #: H16V F1: the request's OWN uncached tokens at arrival when ``uncached`` was reduced by the prefix an earlier
-    #: member of the same session already brings (0 = ``uncached`` is the own figure). Classes follow the own figure
-    #: (R2: classified at arrival); S sums ``uncached``.
+    #: H16V F1/A5: the request's OWN uncached tokens at arrival when ``uncached`` was reduced by the prefix an earlier
+    #: member of the same session already brings (0 = ``uncached`` is the own figure). ``uncached`` is what P prefills
+    #: (it matches the shared prefix once: P-log 913/912 at 15:36); the own figure is what D must be assumed to prefill
+    #: (D's in-batch dedupe is not guaranteed: schedule_policy's check only runs for lpm/dfs-weight and a match of
+    #: <= 32 tokens), so the DECISION S (against X, the D-prefill max) sums the own figure, and classes follow it too
+    #: (R2: classified at arrival). The deduplicated sum is reported as ``S_P`` only.
     own_uncached: int = 0
 
 
@@ -484,7 +487,7 @@ def set_verdict(members: Sequence[SetMember], *, x_tokens: int, half_frac: float
     running = max(0, int(d_prefill_running_uncached))
     if not members:
         return SetVerdict(V_COLLECT, "empty", 0.0, running, hx)
-    s = sum(max(0, int(m.uncached)) for m in members) + running
+    s = sum(max(0, int(m.own_uncached or m.uncached)) for m in members) + running   # H16V A5: the D-side sum decides
     classes = [classify_arrival(m.own_uncached or m.uncached, xc, half_frac, m.p_only) for m in members]
     big = any(c in (CLASS_GROSS, CLASS_P_ONLY) for c in classes)
     t0 = float(t_open) if t_open is not None else min(float(m.t_arrive) for m in members)
@@ -525,8 +528,16 @@ def shared_prefix_discount(entries: Sequence[Tuple[str, int, int, float, str]],
     do not already bring. Member B's uncached tokens are the positions ``[depth_B, N_B)``; an earlier member A of the
     same session prefills ``[depth_A, N_A)``; the ids both prompts share (``common(A, B)``) cover
     ``[max(depth_A, depth_B), common)`` of B -- computed once, not twice. The earliest member keeps its own figure;
-    several earlier members discount by the deepest of their overlaps (their covered ranges all start at B's own
-    credit, so the union is the longest). A session unknown here ("") or ``common`` failing (-1/0) discounts nothing."""
+    several earlier members discount by the deepest single overlap, ``max_A (common(A, B) - max(depth_A, depth_B))``:
+    the covered ranges of different A's start at different positions (``max(depth_A, depth_B)``), so the max of the
+    overlaps is NOT their union; it is at most the union, i.e. the discount never exceeds what the earlier members
+    really bring (the error is on the safe side: S too large, never too small). A session unknown here ("") or
+    ``common`` failing (-1/0) discounts nothing.
+
+    H16V A5 (review): the figure is what P prefills (P matches the shared prefix once, P-log 913/912). It is NOT
+    assumed for D: D's in-batch prefix dedupe (``schedule_policy._compute_prefix_matches``) only runs for the
+    cache-aware policies and a cached match <= 32 tokens, so a D set after T_halb is priced at the members' own
+    figures (``set_verdict`` sums ``SetMember.own_uncached``); the discount rides the set to P only (``S_P``)."""
     out: Dict[str, int] = {}
     seen: List[Tuple[str, int, str]] = []
     for rid, u, depth, _t, sess in sorted(entries, key=lambda e: e[3]):

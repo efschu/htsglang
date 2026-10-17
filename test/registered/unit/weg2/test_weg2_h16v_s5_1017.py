@@ -52,7 +52,9 @@ def test_f1_pure_shared_prefix_counts_once():
 
 
 def test_f1_the_log_case_of_15_36_s_is_counted_once_at_the_front_edge(monkeypatch, caplog):
-    """weg2-80-912 (5396) + weg2-80-913 (5534), both credit 20032, common prefix 24064: S = 5396 + 1502, not 10930."""
+    """weg2-80-912 (5396) + weg2-80-913 (5534), both credit 20032, common prefix 24064: P brings 5396 + 1502 = 6898
+    (S_P). H16V review A5: the DECISION S is the D-side sum of the own figures (10930), D's in-batch dedupe is not
+    guaranteed; the deduplicated figure is reported as S_P only."""
     _on(monkeypatch)
     f = _fx()
     f.tp_prefill_max_tokens = 6185
@@ -67,12 +69,14 @@ def test_f1_the_log_case_of_15_36_s_is_counted_once_at_the_front_edge(monkeypatc
     with caplog.at_level(logging.INFO, logger="weg2.front"):
         f._decode_collect(t0 + 1.5)
     (line,) = _verdicts(caplog)
-    assert "S=6898 " in line and "members=weg2-80-912:5396,weg2-80-913:1502" in line, line
-    assert "classes=halb,halb" in line and "prefix-shared=4032" in line, line
+    assert "S=10930 " in line and "members=weg2-80-912:5396,weg2-80-913:5534" in line, line
+    assert "classes=halb,halb" in line and "prefix-shared=4032" in line and "S_P=6898" in line, line
 
 
-def test_f1_a_set_under_x_by_the_shared_prefix_is_not_flipped(monkeypatch):
-    """X=6185: raw 4000 + 4100 = 8100 would flip; the second brings 2000 shared tokens -> S = 6100 < X: collect."""
+def test_f1_a_shared_prefix_does_not_lower_the_deciding_s_a5(monkeypatch, caplog):
+    """H16V review A5: X=6185, raw 4000 + 4100 = 8100 flips; the second brings 2000 shared tokens (S_P = 6100 < X) --
+    P counts them once, but D is not shown to (schedule_policy's in-batch dedupe only runs for lpm/dfs-weight and a
+    cached match <= 32 tokens), so the D-side S decides: the same session flips like another one."""
     _on(monkeypatch)
     f = _fx()
     f.tp_prefill_max_tokens = 6185
@@ -82,7 +86,10 @@ def test_f1_a_set_under_x_by_the_shared_prefix_is_not_flipped(monkeypatch):
     st = f._set_st()
     st["shorts"]["a"] = (t0, 4000, 6185)
     st["shorts"]["b"] = (t0 + 0.5, 4100, 6185)
-    assert f._decode_collect(t0 + 0.6) == "hold"
+    with caplog.at_level(logging.INFO, logger="weg2.front"):
+        assert f._decode_collect(t0 + 0.6) == "P"
+    (line,) = _verdicts(caplog)
+    assert "S=8100 " in line and "S_P=6100" in line, line
     # another session: no shared prefix, S = 8100 >= X -> flip
     f2 = _fx()
     f2.tp_prefill_max_tokens = 6185
@@ -94,7 +101,7 @@ def test_f1_a_set_under_x_by_the_shared_prefix_is_not_flipped(monkeypatch):
     assert f2._decode_collect(t0 + 0.6) == "P"
 
 
-def test_f1_the_queue_sum_flip_counts_the_shared_prefix_once_too(monkeypatch):
+def test_f1_the_queue_sum_flip_decides_on_the_d_side_sum_too_a5(monkeypatch):
     _on(monkeypatch)
     f = _fx(running=())
     f.tp_prefill_max_tokens = 6185
@@ -102,7 +109,7 @@ def test_f1_the_queue_sum_flip_counts_the_shared_prefix_once_too(monkeypatch):
     _session(f, "b", "s", list(range(22000)) + [-1] * 2100, 20000)
     now = time.time()
     f.queue = [_pending("a", 4000, now - 9.0), _pending("b", 4100, now - 8.0)]
-    assert f._set_flip_justified(now) is False and f.counters["flip_held_under_x"] == 1
+    assert f._set_flip_justified(now) is True and f.counters["flip_held_under_x"] == 0
 
 
 # ------------------------------------------------------------------------------------------------ F2
@@ -131,9 +138,9 @@ def test_f2_x_of_a_set_grows_by_the_further_members_fixed_costs():
     assert x1 == 5222 and 6215 <= x2 <= 6225
 
 
-def test_f2_two_halb_members_under_the_set_x_with_p_fixed_costs_are_not_flipped(monkeypatch, caplog):
-    """Two 2700 members: S = 5400 >= X(k=1) = 5222 would flip (and P would pay 2 x 0.9 s fixed); the set's X with the
-    second P forward is 6222 > 5400 -> the set collects. The SET-VERDICT line names that X."""
+def test_f2_x_of_k_is_info_only_the_decision_stays_on_the_own_x_a2(monkeypatch, caplog):
+    """H16V review A2 (SOLL R1/R3/R2a): two 2700 members, S = 5400 >= X(k=1) = 5222 -> flip. X(k=2) = 6222 (P fixed
+    cost of the second forward) is NOT a threshold of the SOLL; it is reported in the why (``xk=``) only."""
     _on(monkeypatch)
     f = _fx()
     f.tp_prefill_max_tokens = 12000
@@ -146,9 +153,10 @@ def test_f2_two_halb_members_under_the_set_x_with_p_fixed_costs_are_not_flipped(
     st["shorts"]["a"] = (t0, 2700, x1)
     st["shorts"]["b"] = (t0 + 0.3, 2700, x1)
     with caplog.at_level(logging.INFO, logger="weg2.front"):
-        assert f._decode_collect(t0 + 0.4) == "hold"
+        assert f._decode_collect(t0 + 0.4) == "P"
     (line,) = _verdicts(caplog)
-    assert re.search(r"S=5400 X=62\d\d ", line) and "classes=halb,halb" in line, line
+    assert re.search(r"S=5400 X=5222 ", line) and "classes=halb,halb" in line, line
+    assert re.search(r"xk=62\d\d", line) and "verdict=FLIP_P" in line, line
 
 
 def test_f2_a_set_over_the_set_x_still_flips(monkeypatch):
@@ -172,21 +180,46 @@ def _sched(static_x=12288):
                                  ps=types.SimpleNamespace(tp_rank=0), weg2_d_parked=[])
 
 
-def _resumed(rem, front_x=6265):
+def _resumed(rem, front_x=6265, halfx=3132):
+    """A resumed request (it decoded). H16V review A3: the front carries X AND halbX; None = nothing carried."""
     n = 75149
     return types.SimpleNamespace(rid="weg2-18-250", full_untruncated_fill_ids=list(range(n)),
                                  _weg2_store_delivered=n - rem, stream=True, multimodal_inputs=None,
-                                 output_ids=[1, 2, 3], weg2_front_x=front_x, weg2_front_priced=3427)
+                                 output_ids=[1, 2, 3], weg2_front_x=front_x, weg2_front_priced=3427,
+                                 weg2_front_halfx=halfx)
 
 
 @pytest.mark.parametrize("rem,expect", [(77, True), (693, True), (1563, True), (2054, True), (2931, True),
                                         (3133, False), (6000, False)])
 def test_f3_the_h16u2_resumed_tails_are_d_s_own_extend_not_a_flip(rem, expect):
     """The five p_only flips under X of h16u2 (d_extent 77 / 693 / 1563 / 1926 / 2054, plus 2931): kurz = under half of
-    the carried front X 6265; from halbX up the tail is RESUME-VIA-P (R3/R4 decide that flip)."""
+    the carried front X 6265 (halbX 3132, carried by the front); from halbX up the tail is RESUME-VIA-P (R3/R4 decide
+    that flip)."""
     from sglang.srt.weg2 import d_norecompute as dn
 
     assert dn.d_direct_extends(_sched(), _resumed(rem), rem) is expect
+
+
+def test_a3_without_a_carried_front_x_d_never_extends_a_resumed_tail(monkeypatch):
+    """H16V review A3 (SOLL section 2 "X nie ein fester Wert"): no carried X / halbX -> RESUME-VIA-P for every tail,
+    there is no fixed substitute bound (the former 0.5 x static X = 6144)."""
+    from sglang.srt.weg2 import d_norecompute as dn
+
+    for rem in (77, 693, 2054, 3000, 6000):
+        assert dn.d_direct_extends(_sched(), _resumed(rem, front_x=None, halfx=None), rem) is False
+        assert dn.d_direct_extends(_sched(), _resumed(rem, front_x=6265, halfx=None), rem) is False   # X alone: no halbX
+        assert dn.d_direct_extends(_sched(), _resumed(rem, front_x=None, halfx=3132), rem) is False
+
+
+def test_a3_with_a_carried_halfx_d_never_extends_over_it_and_ignores_the_rank_env(monkeypatch):
+    """The front's halbX is the bound -- whatever F_halb a rank's environment says (R11: no rank-local decision)."""
+    from sglang.srt.weg2 import d_norecompute as dn
+
+    monkeypatch.setenv("SGLANG_WEG2_HALF_X_FRAC", "0.99")
+    for carried in (1000, 2500, 3132):
+        for rem in range(1, 4200, 37):
+            got = dn.d_direct_extends(_sched(), _resumed(rem, front_x=6265, halfx=carried), rem)
+            assert got is (rem < carried), (carried, rem)
 
 
 def test_f3_the_scheduler_gate_calls_the_extend_before_the_divert(monkeypatch):
@@ -276,13 +309,13 @@ def test_f4_a_semaphore_wait_after_the_grant_is_named_too(monkeypatch, caplog):
 
 # ------------------------------------------------------------------------- the user case 15:36Z with S6's curves
 
-def test_user_case_15_36z_two_halb_requests_of_one_session_and_a_running_d_prefill_are_no_flip(monkeypatch, caplog):
-    """NF h16u2 15:36:19-25 with the h16v curve file S6 measured from that boot (P fixed cost ~1.5-1.7 s at n->0, flip
-    price 6.1-7.4 s): weg2-80-912 (u=5396) and weg2-80-913 (u=5534, same session, common prefix 24064 of the 20032
-    credit) + the running D prefill of 177 tokens (weg2-80-910). The log summed S=11107 > X=6185 -> REROUTE_P and a flip
-    that cost ~6 s more than D (P prefilled 5534 + 1428 + 1119 in three single forwards). Counted once (S = 5396 + 1502 +
-    177 = 7075) against the X of a set of 2 members (curve X(k=1) 5586 at that depth, + one more P forward: ~7620),
-    the set collects: no flip."""
+def test_user_case_15_36z_is_reroute_p_by_the_soll_not_by_a_moved_threshold(monkeypatch, caplog):
+    """NF h16u2 15:36:19-25 with the h16v curve file S6 measured from that boot: weg2-80-912 (u=5396) and weg2-80-913
+    (u=5534, same session, common prefix 24064 of the 20032 credit) + the running D prefill of 177 tokens (weg2-80-910).
+    H16V review A2: X(k) is no threshold; the verdict is decided against the real X of the members (curve X(k=1) 5586
+    at that depth). The log summed S=11107 > X -> REROUTE_P (R6); with the shared prefix counted once (S_P = 5396 +
+    1502 + 177 = 7075) it is > X as well -> REROUTE_P either way. That is the result the SOLL gives; the P-side cost
+    (P batches the members one by one, 2-3 s gaps) is an engine defect for its own ticket, not a reason to move X."""
     from sglang.srt.weg2 import x_curves as _xc
 
     _on(monkeypatch)
@@ -305,8 +338,12 @@ def test_user_case_15_36z_two_halb_requests_of_one_session_and_a_running_d_prefi
     st["shorts"]["weg2-80-912"] = (t0, 5396, x1)
     st["shorts"]["weg2-80-913"] = (t0 + 1.5, 5534, x1)
     with caplog.at_level(logging.INFO, logger="weg2.front"):
-        assert f._decode_collect(t0 + 1.6) == "hold"
+        assert f._decode_collect(t0 + 1.6) == "P"
     (line,) = _verdicts(caplog)
     m = re.search(r"S=(\d+) X=(\d+) ", line)
-    assert m and int(m.group(1)) == 5396 + 1502 + 177 and 7500 <= int(m.group(2)) <= 7750, line
-    assert "verdict=COLLECT" in line and "REROUTE_P" not in line, line
+    assert m and int(m.group(1)) == 5396 + 5534 + 177 and int(m.group(2)) == x1, line   # X = the members' own X
+    assert "verdict=REROUTE_P" in line and "S_P=7075" in line, line
+    assert re.search(r"xk=7[56]\d\d", line), line   # X(k=2) ~7620 is reported, never decided on
+    # F1 alone: with only the deduplicated S_P = 7075 against the same real X the SOLL gives REROUTE_P as well
+    assert pp.set_verdict([M("a", 5396, 0.0), M("b", 1502, 1.5)], x_tokens=x1, half_frac=0.5, t_half_s=4.5, now=1.6,
+                          t_open=0.0, d_decoding=True, seats_free=6, d_prefill_running_uncached=177).verdict == "REROUTE_P"
