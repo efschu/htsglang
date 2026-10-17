@@ -75,6 +75,7 @@ def _front(epoch, resume_epoch, awake_s, dp_ms, pd_ms):
         queue=[types.SimpleNamespace(rid="weg2-8-29", est_uncached=91755, t_arrive=time.time(),
                                      p_only=False, x_requeues=0, leg1_done=False, skip_leg1=False)],
         tp_prefill_max_tokens=4096, counters={"park_immediate_dwell_holds": 0},
+        _decode_collect=lambda now, live_q=None: None,   # SET SCHEDULER: nothing collecting, the park rules below decide
         _flip_ledger=lambda g: ["weg2-0-1"],
         _derived_min_dwell_ms=lambda s, d: ((dp_ms, "last-flip-D->P") if (s, d) == ("D", "P")
                                             else (pd_ms, "last-flip-P->D")),

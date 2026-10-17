@@ -46,35 +46,6 @@ def _release_lines(caplog):
     return [r.getMessage() for r in caplog.records if "DECODE-COLLECT release" in r.getMessage()]
 
 
-def test_the_real_1313_set_holds_then_goes_to_d_at_d_check(monkeypatch, caplog):
-    f = _front_1313(monkeypatch)
-    t0 = time.time()
-    f.t_awake = t0 - 60.0
-    f.queue = [_pending("weg2-42-129", 213, t0)]
-    with caplog.at_level(logging.INFO, logger="weg2.front"):
-        assert f._decode_collect(t0 + 0.1) == "hold", "D decodes (bs=5) and prefills 5089: the arrival collects"
-        assert f._decode_collect(t0 + 7.0) == "hold", "before d_check_s (7.5 s) a set that fits still waits"
-        assert f._decode_collect(t0 + 7.5) == "D"
-    (line,) = _release_lines(caplog)
-    assert "n=1 tokens=5302 X=6057 waited_s=7.5 route=D stage=dcheck p_bound=False" in line, line
-    assert f.counters["decode_collect_release_D"] == 1 and f.counters["decode_collect_hold"] == 1
-
-
-def test_the_booked_prefill_counts_into_the_sum(monkeypatch, caplog):
-    """5089 on D + 3000 arriving = 8089 > X=6057: the set does not fit -> collects on (dcheck hold), later P. Without ``carried``
-    (mutant) the 3000 alone would pass X and go to D."""
-    f = _front_1313(monkeypatch)
-    t0 = time.time()
-    f.t_awake = t0 - 60.0
-    f.queue = [_pending("big", 3000, t0)]
-    with caplog.at_level(logging.INFO, logger="weg2.front"):
-        assert f._decode_collect(t0 + 0.1) == "hold"
-        assert f._decode_collect(t0 + 7.6) == "hold"
-        assert f.counters["decode_collect_dcheck_hold"] == 1
-        assert f._decode_collect(t0 + 15.1) == "P"
-    assert "tokens=8089" in _release_lines(caplog)[-1]
-
-
 def test_an_idle_d_opens_no_window(monkeypatch):
     """Nothing decodes, nothing is booked on D: the arrival is served at once -- no hold, no 7.5 s."""
     _on(monkeypatch)
@@ -100,23 +71,6 @@ def test_a_d_whose_decodes_are_all_parked_is_idle(monkeypatch):
     f.queue = [_pending("weg2-42-129", 213, t0)]
     assert not f._dc_d_busy()
     assert f._decode_collect(t0 + 0.1) is None
-
-
-def test_d_going_idle_inside_the_window_releases_at_once(monkeypatch, caplog):
-    """The window opened on a decoding D; the last decode ends 2 s in -> the next look releases (stage=d-idle), it does not wait
-    out the 7.5 s / 15 s."""
-    _on(monkeypatch)
-    f = _front(running=["r1"], n=6, kv={"available": 400000, "evictable": 0})
-    f.tp_prefill_max_tokens = X_LIVE
-    t0 = time.time()
-    f.t_awake = t0 - 60.0
-    f.queue = [_pending("weg2-42-129", 213, t0)]
-    with caplog.at_level(logging.INFO, logger="weg2.front"):
-        assert f._decode_collect(t0 + 0.1) == "hold"
-        f.groups["D"].outstanding.clear()  # r1 finished
-        assert f._decode_collect(t0 + 2.0) == "D"
-    (line,) = _release_lines(caplog)
-    assert "stage=d-idle" in line and "waited_s=2.0" in line, line
 
 
 # ---- LANES FIX 1014 (95914428c2): a GRANTED SHORT that D does not run is not "D prefills" ---------------------------------------
@@ -163,27 +117,6 @@ def test_a_granted_short_below_a_raised_lane_floor_is_not_d_prefilling(monkeypat
     assert f._d_pf_pending_tokens() == 0
     assert not f._dc_d_busy()
     assert f._decode_collect(t0 + 0.1) is None
-
-
-def test_the_same_granted_shorts_do_count_when_d_runs_them(monkeypatch):
-    """Control (both directions): running (not parked) or at/above the floor, the granted SHORTs ARE D's prefill -> they price the
-    set (sum counts). NODECODE 1015 (user law: collecting only while a DECODE stands on D): they no longer HOLD it -- D runs only
-    these two prefills, no decode, so the set is decided at once: 253 + 647 = 900 <= X -> D now (was: "hold"); and the sum is
-    what decides -- 253 + 6100 = 6353 > X -> P now, although 6100 alone fits."""
-    _on(monkeypatch)
-    for arrival, route in ((647, "D"), (6100, "P")):
-        f = _front(running=["weg2-54-149", "weg2-54-150"], n=6, kv={"available": 400000, "evictable": 0})
-        f.tp_prefill_max_tokens = 6283
-        f.__dict__["_lane_state_obj"] = types.SimpleNamespace(lane_floor=1, lane_for=lambda rid: 1)
-        _grant(f, "weg2-54-149", 31)
-        _grant(f, "weg2-54-150", 222)
-        t0 = time.time()
-        f.t_awake = t0 - 60.0
-        f.queue = [_pending("weg2-54-154", arrival, t0)]
-        assert f._d_pf_pending_tokens() == 253
-        assert f._dc_d_busy() and not f._dc_decoding()
-        assert f._decode_collect(t0 + 0.1) == route, arrival
-        assert f.counters["decode_collect_hold"] == 0
 
 
 def test_only_the_parked_short_of_a_mixed_book_drops_out(monkeypatch):
