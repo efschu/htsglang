@@ -83,9 +83,10 @@ def test_a_worker_applies_tp0s_verdict_at_the_broadcast_it_rides():
     with H._switch(True):
         for r in ranks:
             _construct(r)
-        for r in ranks:
-            with _as_rank_untreed(r):
-                r.ack_store_writes()
+        # only TP0 acks here: a worker's store ack (worker_keeps) would register its tree by itself -- exactly
+        # the first SHADOW-KEEP at 22:49:08 that ended the window; at 22:48:14 no worker had acked yet
+        with _as_rank_untreed(ranks[0]):
+            ranks[0].ack_store_writes()
         _broadcast_untreed(ranks)
     snaps = [r.snapshot() for r in ranks]
     assert snaps[0] == snaps[1] == snaps[2], f"TP0 {snaps[0]} TP1 {snaps[1]} TP2 {snaps[2]}"
