@@ -6406,9 +6406,26 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             from sglang.srt.weg2 import host_only_spill as _hos
 
             if _hos.armed(self):
-                released += _hos.spill_host_only(
-                    self, pool, max(int(need_pages) - released, self.W3_SPILL_MIN_PAGES), P, skip,
-                    released_out=released_out)["released"]
+                # K23 (NF h16u2 17.10. 20:01:10Z, D TP group, 10 min of W3-ARENA FORMA-REQUEST
+                # released_pages=0 with 6077/6485 arena slots held by host-only nodes, W3-HOST-LEAF 0x):
+                # on TP0 of a Form A group the host-only leaves leave too, and every drop is sent to the
+                # workers as a node STATE (the evict_host pattern) -- TP0 decides, the group follows.
+                _rec = None
+                if _role == "host":
+                    self._r12_rec = []
+                try:
+                    released += _hos.spill_host_only(
+                        self, pool, max(int(need_pages) - released, self.W3_SPILL_MIN_PAGES), P, skip,
+                        released_out=released_out)["released"]
+                finally:
+                    if _role == "host":
+                        _rec, self._r12_rec = self._r12_rec, None
+                if _rec:
+                    _seen = set()
+                    for _n in _rec:
+                        if id(_n) not in _seen:
+                            _seen.add(id(_n))
+                            _r12.record_state(self, _n, why="k23_host_leaf_spill")
         self._w3_spill_cap_used, self._w3_spill_cap_skipped = cap_used, cap_skipped
         k = getattr(self, "_w3_spill_n", 0) + 1
         self._w3_spill_n = k

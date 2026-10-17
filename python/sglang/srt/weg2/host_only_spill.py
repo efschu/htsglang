@@ -28,6 +28,9 @@ hashes stays.
 NOT PORTED: the #1500i census (``dual_pkvwait_instr``), the Q-1190b ``allow_aux``
 stage and the ``budget_s`` brake (callers on the 27B line only).
 
+K23 (17.10.): the gate also opens on TP0 of a Form A group (``form_a_host``); its
+drops are sent to the workers as node STATEs by the caller (``_w3_arena_spill``).
+
 GATE: ``SGLANG_WEG2_ENABLE_W3_SPILL_HOST_LEAVES`` (default on since the user
 decision of 09.10.; on hybrid boots it is reached only through the pool that
 ``SGLANG_WEG2_ENABLE_W3_SPILL_ANCHOR_POOL`` carries, default off) AND the local-PP
@@ -54,7 +57,24 @@ def armed(cache: Any) -> bool:
 
     if not envs.SGLANG_WEG2_ENABLE_W3_SPILL_HOST_LEAVES.get():
         return False
-    return bool(_sf.enabled() and getattr(cache, _sf.FLOOR_LOCAL_PP_ATTR, False))
+    if bool(_sf.enabled() and getattr(cache, _sf.FLOOR_LOCAL_PP_ATTR, False)):
+        return True
+    return form_a_host(cache)
+
+
+def form_a_host(cache: Any) -> bool:
+    """K23 (NF h16u2 17.10. 20:01:10Z, D TP0/TP1/TP2): TP0 of a Form A TP group
+    (R12 role ``host``) is the one rank that decides a host drop; every worker
+    follows its STATE events (``form_a_host_shadow.record_state``). The spill is
+    therefore rank-uniform there: TP0 drops, the workers reconcile at the next
+    broadcast. A worker never gets here (``_w3_arena_spill`` returns early and
+    asks TP0)."""
+    try:
+        from sglang.srt.mem_cache import form_a_host_shadow as _r12
+
+        return _r12.role() == "host"
+    except Exception:  # noqa: BLE001 - no shadow module: not a Form A group
+        return False
 
 
 def _strict() -> bool:
