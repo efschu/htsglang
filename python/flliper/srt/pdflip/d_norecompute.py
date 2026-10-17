@@ -20,6 +20,15 @@ context from the shared store, D resumes it after the flip back under E2. A
 request RESUME-VIA-P cannot take (non-stream, multimodal, attempts spent) is
 released as before and NAMED (``D-NORECOMPUTE-FALLBACK``), never silently.
 
+X-GESETZ F-D (user 16.10., law 4): the law covers a HAND-OVER after a P prefill
+only. A D-direct leg 2 whose prefill never ran (the front priced it SHORT and sent
+it to D with its decision X, ``req.weg2_front_x``; no output yet) and that a flip
+parked (``PARK-HANDBACK kept=committed`` -- "D prefills it after the flip") is
+D's to extend when its remainder is within that X: :func:`d_direct_extends`.
+Diverting it made a D->P flip of its own for a SHORT (NF h16s pdflip-6-55, 375
+tokens: W50-REROUTE store_short_after_flip -> PARK-IMMEDIATE over-x p_only ->
+six decodes parked). D's X gate still bounds the realised extent (W31 by name).
+
 Switch ``FLLIPER_PDFLIP_D_NORECOMPUTE`` (default on; 0 = the release as before).
 Rank-uniform: the release list is the group's MIN verdict, ``delivered`` the
 synced prefix, the agreed tail the group's answer.
@@ -90,6 +99,34 @@ def d_would_compute(req: Any) -> int:
     except Exception:  # noqa: BLE001 -- no tail module: the remainder stands
         pass
     return rem
+
+
+def d_direct_extends(sched: Any, req: Any, rem: int) -> bool:
+    """X-GESETZ F-D (16.10.): True = ``req`` is a D-direct leg whose prefill never
+    ran and ``rem`` is within the front's decision X (+ one page, the same limit
+    D's X gate applies, ``front_x.resolve_limit``) -- D extends it itself (law 4),
+    it is NOT diverted to P. False for a hand-over after a P prefill (no front X
+    on the leg), for a resumed request (output already produced: the static X and
+    RESUME-VIA-P own it, front_x rule 3) and for a remainder over that X.
+    Group-uniform: ``rem`` comes from the synced witness, the front X is a field
+    of the broadcast request, ``page_size`` and the static X are launch args."""
+    try:
+        from flliper.srt.pdflip import front_x as _fx
+
+        fx, _priced = _fx.request_front_x(req)
+        if fx is None or int(rem) <= 0:
+            return False
+        static_x = int(getattr(getattr(sched, "server_args", None), "tp_prefill_max_tokens", 0) or 0)
+        limit = int(_fx.resolve_limit(req, static_x, getattr(sched, "page_size", None))[0])
+    except Exception:  # noqa: BLE001 -- unknown = the law as before (divert)
+        return False
+    if limit <= 0 or int(rem) > limit:
+        return False
+    logger.info("%s D-DIRECT-EXTEND rid=%s would_compute=%d front_x=%d limit=%d delivered=%s -- a D-direct "
+                "leg whose prefill never ran: D extends it under X (law 4, X-GESETZ 16.10.), not diverted "
+                "to P", MARK, str(getattr(req, "rid", "?")), int(rem), int(fx), limit,
+                getattr(req, "_pdflip_store_delivered", None))
+    return True
 
 
 def divert(sched: Any, req: Any, rem: int) -> bool:
