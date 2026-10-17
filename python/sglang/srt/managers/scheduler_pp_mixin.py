@@ -6929,6 +6929,7 @@ class SchedulerPPMixin:
         )
         sender.offer(fact, now)
         sender.flush(channel, now)
+        channel.pump()  # K20: an idle follower's heartbeat keeps PP0's standing receive from reaching gloo's timeout
 
     def _weg2_vote_dp_offset(self: Scheduler) -> int:
         return self.ps.attn_dp_rank * self.ps.attn_cp_size * self.ps.attn_tp_size
