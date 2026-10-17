@@ -6406,9 +6406,40 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             from flliper.srt.pdflip import host_only_spill as _hos
 
             if _hos.armed(self):
-                released += _hos.spill_host_only(
-                    self, pool, max(int(need_pages) - released, self.W3_SPILL_MIN_PAGES), P, skip,
-                    released_out=released_out)["released"]
+                # K23 (NF h16u2 17.10. 20:01:10Z, D TP group, 10 min of W3-ARENA FORMA-REQUEST
+                # released_pages=0 with 6077/6485 arena slots held by host-only nodes, W3-HOST-LEAF 0x):
+                # on TP0 of a Form A group the host-only leaves leave too, and every drop is sent to the
+                # workers as a node STATE (the evict_host pattern) -- TP0 decides, the group follows.
+                _rec = None
+                _prev_rec = getattr(self, "_r12_rec", None)
+                if _role == "host":
+                    self._r12_rec = []
+                # K23 review A1: the REST of the synchronous-L3-write budget goes on to the host-only round
+                # (TP0's FORMA-REQUEST: the workers wait at the broadcast behind it); 0 = no bound
+                _hos_cap = 0
+                _hos_skip = False
+                if max_secure_pages > 0:
+                    _hos_cap = int(max_secure_pages) - cap_used
+                    _hos_skip = _hos_cap <= 0
+                try:
+                    if not _hos_skip:
+                        _hres = _hos.spill_host_only(
+                            self, pool, max(int(need_pages) - released, self.W3_SPILL_MIN_PAGES), P, skip,
+                            released_out=released_out, max_secure_pages=_hos_cap)
+                        released += _hres["released"]
+                        cap_used += int(_hres.get("secure_pages", 0))
+                        cap_skipped += int(_hres.get("over_cap", 0))
+                finally:
+                    # K23 review A2: whatever the round did before it raised, TP0's drops reach the workers
+                    # (TP0 deleted the nodes; a worker that is not told keeps them); the earlier _r12_rec is
+                    # restored, not set to None
+                    if _role == "host":
+                        _rec, self._r12_rec = self._r12_rec, _prev_rec
+                        _seen = set()
+                        for _n in _rec or ():
+                            if id(_n) not in _seen:
+                                _seen.add(id(_n))
+                                _r12.record_state(self, _n, why="k23_host_leaf_spill")
         self._w3_spill_cap_used, self._w3_spill_cap_skipped = cap_used, cap_skipped
         k = getattr(self, "_w3_spill_n", 0) + 1
         self._w3_spill_n = k

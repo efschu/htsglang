@@ -480,3 +480,27 @@ def test_review_f1b_b3_pp0_decides_anew_after_the_wait_bound(pp3, monkeypatch):
     trees[0]._w3_spill_quiet_until = 0.0
     trees[0]._w3_arena_spill(p0, 1)
     assert RS.read(a0)[0] == g1 + 1
+
+
+# --- S17 (h16v 1017_211842, #1324 STORE READ INCOMPLETE): a node larger than the page cap is releasable ----------
+
+def test_s17_a_node_larger_than_the_cap_is_released_by_the_first_call(pp3, monkeypatch):
+    """Metal: PP0 gen 79-93, slots=239 > cap 128, capped=1 on 85 of 94 sets, released_pages=0 -- the oversized node
+    was first in the group order every time, capped every time, the arena stayed pinned 6485/6485.
+    PP2 here holds the two-page node a0+a1; CAP 1 is smaller than the node. The first node of a call is admitted."""
+    monkeypatch.setenv(RS.CAP_ENV, "1")
+    pools, trees, nodes, store = pp3
+    p2, a2 = pools[2]
+    s = {_slot(a2, p2, h) for h in ("a0", "a1")}
+    r = RS.apply(trees[2], p2, s)
+    assert r["released"] == 2 and r["nodes"] == 1 and r["capped"] == 0, r
+
+
+def test_s17_the_cap_still_bounds_the_second_node(pp3, monkeypatch):
+    """The cap bounds the work of a call: after an oversized first node the cap is used up, the second is capped."""
+    monkeypatch.setenv(RS.CAP_ENV, "1")
+    pools, trees, nodes, store = pp3
+    p2, a2 = pools[2]
+    s = {_slot(a2, p2, h) for h in ("a0", "a1", "a2", "a3")}
+    r = RS.apply(trees[2], p2, s)
+    assert r["nodes"] == 1 and r["capped"] == 1, r

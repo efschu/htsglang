@@ -28,6 +28,9 @@ hashes stays.
 NOT PORTED: the #1500i census (``dual_pkvwait_instr``), the Q-1190b ``allow_aux``
 stage and the ``budget_s`` brake (callers on the 27B line only).
 
+K23 (17.10.): the gate also opens on TP0 of a Form A group (``form_a_host``); its
+drops are sent to the workers as node STATEs by the caller (``_w3_arena_spill``).
+
 GATE: ``FLLIPER_PDFLIP_ENABLE_W3_SPILL_HOST_LEAVES`` (default on since the user
 decision of 09.10.; on hybrid boots it is reached only through the pool that
 ``FLLIPER_PDFLIP_ENABLE_W3_SPILL_ANCHOR_POOL`` carries, default off) AND the local-PP
@@ -54,7 +57,24 @@ def armed(cache: Any) -> bool:
 
     if not envs.FLLIPER_PDFLIP_ENABLE_W3_SPILL_HOST_LEAVES.get():
         return False
-    return bool(_sf.enabled() and getattr(cache, _sf.FLOOR_LOCAL_PP_ATTR, False))
+    if bool(_sf.enabled() and getattr(cache, _sf.FLOOR_LOCAL_PP_ATTR, False)):
+        return True
+    return form_a_host(cache)
+
+
+def form_a_host(cache: Any) -> bool:
+    """K23 (NF h16u2 17.10. 20:01:10Z, D TP0/TP1/TP2): TP0 of a Form A TP group
+    (R12 role ``host``) is the one rank that decides a host drop; every worker
+    follows its STATE events (``form_a_host_shadow.record_state``). The spill is
+    therefore rank-uniform there: TP0 drops, the workers reconcile at the next
+    broadcast. A worker never gets here (``_w3_arena_spill`` returns early and
+    asks TP0)."""
+    try:
+        from flliper.srt.mem_cache import form_a_host_shadow as _r12
+
+        return _r12.role() == "host"
+    except Exception:  # noqa: BLE001 - no shadow module: not a Form A group
+        return False
 
 
 def _strict() -> bool:
@@ -143,10 +163,15 @@ def _eligible(cache: Any, node: Any, pool: Any, skip: set) -> bool:
 
 
 def spill_host_only(cache: Any, pool: Any, want: int, page_size: int, skip: set,
-                    released_out: Optional[list] = None) -> Dict[str, int]:
+                    released_out: Optional[list] = None, max_secure_pages: int = 0) -> Dict[str, int]:
     """Spill host-only H-leaves until ``want`` pages were released here (group-equal
     order, see ``UnifiedRadixCache._w3_arena_spill``; node-id order where the
-    arena names no slot). Returns the counts; the log line names them (27B loop, no census)."""
+    arena names no slot). Returns the counts; the log line names them (27B loop, no census).
+
+    K23 review A1 (17.10.): ``max_secure_pages`` > 0 is the REST of the caller's synchronous-L3-write budget
+    (H16Q review A3, ``FLLIPER_PDFLIP_W3_FORMA_SPILL_MAX_PAGES``): a leaf whose pages do not fit what is left is
+    passed over (``over_cap``), never partly written; ``secure_pages`` in the result = the pages handed to
+    ``secure_rows_to_l3`` here. 0 = no bound (the local-PP floor, as before)."""
     from flliper.srt.mem_cache.unified_radix_cache import BASE_COMPONENT_TYPE
 
     P = max(1, int(page_size or 1))
@@ -170,12 +195,19 @@ def spill_host_only(cache: Any, pool: Any, want: int, page_size: int, skip: set,
     candidates = len(heap)
     heapq.heapify(heap)
     released = leaves = unsecured = on_disk = written = stale = 0
+    cap_used = over_cap = 0
     while heap and released < want:
         _key, _id, node = heapq.heappop(heap)
         if not _eligible(cache, node, pool, skip):
             stale += 1
             continue
         cd = node.component_data[BASE_COMPONENT_TYPE]
+        if max_secure_pages > 0:
+            _np = -(-int(cd.host_value.numel()) // P)
+            if cap_used + _np > int(max_secure_pages):
+                over_cap += 1
+                continue
+            cap_used += _np
         sec = pool.secure_rows_to_l3(cd.host_value)
         if int(sec.get("incomplete", 0)):
             incomplete += 1               # a slot turned out not COMPLETE: kept, no loss (review A5)
@@ -206,13 +238,16 @@ def spill_host_only(cache: Any, pool: Any, want: int, page_size: int, skip: set,
         top = sorted(refused.items(), key=lambda kv: -kv[1])[:4]
         logger.info(
             "%s n=%d want=%d released_pages=%d leaves=%d candidates=%d unsecured_kept=%d incomplete=%d stale=%d "
+            "secure_pages=%d cap=%d over_cap=%d "
             "l3=on_disk:%d,written:%d refused=%s (a host-only leaf leaves L2 only with its L3 copy "
             "for every page; incomplete = leaves kept because a slot is not COMPLETE yet, no loss; "
             "port of the 27B Q-697c spill, local-PP floor only)",
-            MARK, k, int(want), released, leaves, candidates, unsecured, incomplete, stale, on_disk, written,
+            MARK, k, int(want), released, leaves, candidates, unsecured, incomplete, stale,
+            cap_used, int(max_secure_pages), over_cap, on_disk, written,
             ",".join("%s:%d" % kv for kv in top) or "-")
     return {"released": released, "leaves": leaves, "candidates": candidates,
-            "unsecured": unsecured, "incomplete": incomplete}
+            "unsecured": unsecured, "incomplete": incomplete,
+            "secure_pages": cap_used, "over_cap": over_cap}
 
 
 def _incomplete(keys: Any, node: Any) -> bool:
