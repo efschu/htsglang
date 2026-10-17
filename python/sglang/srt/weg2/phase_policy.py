@@ -391,62 +391,140 @@ def park_decode_dwell_ok(awake_s: float, decode_s: Optional[float], cycle_ms: fl
     return float(decode_s) >= need
 
 
-def park_collect_window(items: Sequence[Tuple[float, int]], now: float, t_awake: float,
-                        n_running: int, price_s: float, threshold_tokens: int, *,
-                        timer: bool = False, max_requests: int = 0, pool_tokens: int = 0,
-                        wait_bound_s: float = 0.0) -> Tuple[bool, str, Optional[float], float]:
-    """PARK-COLLECT-WINDOW: may the immediate park stop D's running decodes now?
+# --------------------------------------------------------------------------- SET SCHEDULER (SOLL v2, 17.10.)
+#
+# SCHEDULER-SOLL.md v2 (R1-R11) as pure functions: no clock, no I/O. The front owns the clocks, the set's
+# membership and the flip; this module owns the arithmetic and the verdict names (SOLL section 4).
+#
+# This REPLACES the Ski-Rental ``park_collect_window`` (opening at S > X, firing on rent >= price, never fired in
+# the field) and the DECODE-COLLECT window/epoch rule: opening at halbX, timer ``T_halb`` (a flag), firing at S >= X.
 
-    NF z30w-park 08:31-08:46: 21 immediate parks in 15 min, all fired by ONE
-    over-X arrival (7 of them 4224-4761 uncached against X=4096), 37 parked
-    streams, park -> resume 8.4 s median / 17.8 s p90. The user's model: D
-    keeps decoding; once the pending P work passes the bound, it collects
-    while D decodes on, and the flip comes when collecting has cost as much as
-    the flip would -- or earlier when D's decodes end.
+from dataclasses import dataclass  # noqa: E402
 
-    SKI RENTAL (user decision 29.09.), both sides in request-seconds: the
-    RENT is what the queued requests have waited since the window opened
-    (their sum), the PRICE of the flip is ``price_s`` -- the caller passes one
-    measured round trip per running stream, which is what a park stalls. One
-    stream and one waiting request = "wait one round trip". ``timer`` (the
-    fixed-x override) instead closes the window ``price_s`` after it opened.
+CLASS_KURZ = "kurz"
+CLASS_HALB = "halb"
+CLASS_GROSS = "gross"
+CLASS_P_ONLY = "p_only"
 
-    ``items`` are the queued requests that need P as ``(t_arrive, uncached)``.
-    The window opens when their uncached sum first passes
-    ``threshold_tokens`` (head first by arrival), never before this D phase
-    woke. Fires on: nothing running (the park stops nobody), a hard cap --
-    ``max_requests`` queued (P's phase cap), ``pool_tokens`` queued (P's
-    pool), the oldest waited ``wait_bound_s`` -- or the rent reaching the
-    price. Returns ``(fire, why, t_start, left_s)`` (``left_s`` at the current
-    queue); pure -- the front owns the clocks."""
-    rows = sorted((float(t), int(u)) for t, u in items)
-    if not rows:
-        return False, "empty", None, 0.0
-    total, t_cross = 0, None
-    for t, u in rows:
-        total += u
-        if total > int(threshold_tokens):
-            t_cross = t
-            break
-    if t_cross is None:
-        return False, "below-threshold", None, 0.0
-    t_start = max(t_cross, float(t_awake))
-    if timer:
-        left = max(0.0, float(price_s) - (float(now) - t_start))
-    else:
-        rent = sum(max(0.0, float(now) - max(t, t_start)) for t, _ in rows)
-        left = max(0.0, (float(price_s) - rent) / len(rows))
-    if int(n_running) <= 0:
-        return True, "d-idle", t_start, left
-    if int(max_requests) > 0 and len(rows) >= int(max_requests):
-        return True, "cap-requests", t_start, left
-    if int(pool_tokens) > 0 and sum(u for _, u in rows) >= int(pool_tokens):
-        return True, "cap-pool", t_start, left
-    if float(wait_bound_s) > 0.0 and float(now) - rows[0][0] >= float(wait_bound_s):
-        return True, "wait-bound", t_start, left
+V_COLLECT = "COLLECT"
+V_FLIP_P = "FLIP_P"
+V_D_AFTER_TIMER = "D_AFTER_TIMER"
+V_PARK_NO_SEAT = "PARK_NO_SEAT"
+V_REROUTE_P = "REROUTE_P"
+#: The verdict of a kurz arrival (R2); it never reaches :func:`set_verdict`, the front logs it.
+V_D_NOW = "D_NOW"
+
+
+@dataclass(frozen=True)
+class SetMember:
+    rid: str
+    uncached: int
+    t_arrive: float
+    p_only: bool = False
+
+
+@dataclass(frozen=True)
+class SetVerdict:
+    verdict: str
+    why: str
+    left_s: float
+    s_tokens: int
+    half_x: int
+
+
+def half_x_of(x_tokens: int, half_frac: float) -> int:
+    """halbX = F_halb x X (SOLL section 2), truncated to whole tokens."""
+    return int(max(0.0, float(half_frac)) * max(0, int(x_tokens)))
+
+
+def classify_arrival(uncached: int, x_tokens: int, half_frac: float, p_only: bool) -> str:
+    """R2/R3/R4/R9: the class of ONE request at its arrival -- the only place a single request decides anything
+    (R1). ``p_only`` (vision / only-P) counts as big (R9) and wins over the length."""
+    if p_only:
+        return CLASS_P_ONLY
+    u = int(uncached)
+    if u >= int(x_tokens):
+        return CLASS_GROSS
+    if u >= half_x_of(x_tokens, half_frac):
+        return CLASS_HALB
+    return CLASS_KURZ
+
+
+def set_verdict(members: Sequence[SetMember], *, x_tokens: int, half_frac: float, t_half_s: float,
+                now: float, t_open: Optional[float], d_decoding: bool, seats_free: int,
+                d_prefill_running_uncached: int = 0, new_since_last: int = 0) -> SetVerdict:
+    """The set's verdict (SOLL R1, R3-R6, R8, R9). ``members`` are the collected halb/big requests (a kurz one never
+    belongs to a set, R2). ``t_open`` is the stamp of the FIRST member (None: the oldest member's arrival) -- the
+    timer starts there ONCE per set (R3), later members never restart it. ``S`` = sum of the members' uncached
+    tokens plus ``d_prefill_running_uncached`` (what D is prefilling right now, R6).
+
+    Order: (1) R6 a D prefill runs and S > X -> REROUTE_P; (2) nothing decodes on D (R8) -> decide now: P if S >= X
+    or a big member, else D; (3) D decodes: a big member (R4/R9) waits ``t_half_s`` for company -- a second
+    member or the timer's end flips; without a big member S >= X flips at once (R3), the timer's end with S < X
+    sends the set to D (R3). A flip verdict is PARK_NO_SEAT when fewer free D seats than members (R5): the set is
+    prefilled on P and parked, its decode starts from L2/L3 when a seat frees. ``new_since_last`` (members that
+    joined since the caller's last look) is informational: it only enters the ``why`` text."""
+    x = int(x_tokens)
+    hx = half_x_of(x, half_frac)
+    running = max(0, int(d_prefill_running_uncached))
+    if not members:
+        return SetVerdict(V_COLLECT, "empty", 0.0, running, hx)
+    s = sum(max(0, int(m.uncached)) for m in members) + running
+    classes = [classify_arrival(m.uncached, x, half_frac, m.p_only) for m in members]
+    big = any(c in (CLASS_GROSS, CLASS_P_ONLY) for c in classes)
+    t0 = float(t_open) if t_open is not None else min(float(m.t_arrive) for m in members)
+    left = max(0.0, float(t_half_s) - (float(now) - t0))
+    new = int(new_since_last)
+    seats_ok = int(seats_free) >= len(members)
+
+    def _flip(why: str) -> SetVerdict:
+        if seats_ok:
+            return SetVerdict(V_FLIP_P, why, left, s, hx)
+        return SetVerdict(V_PARK_NO_SEAT, "R5 %d seats < %d members; %s" % (max(0, int(seats_free)), len(members), why),
+                          left, s, hx)
+
+    if running > 0 and s > x:
+        return SetVerdict(V_REROUTE_P, "R6 S=%d > X=%d with a D prefill of %d running (new=%d)" % (s, x, running, new),
+                          left, s, hx)
+    if not d_decoding:
+        if big or s >= x:
+            return _flip("R8 no decode on D: decided now, S=%d >= X=%d or a big member" % (s, x))
+        return SetVerdict(V_D_AFTER_TIMER, "R8 no decode on D: decided now, S=%d < X=%d" % (s, x), 0.0, s, hx)
+    if big:
+        if len(members) >= 2:
+            return _flip("R4 a big member and company (n=%d, S=%d, new=%d)" % (len(members), s, new))
+        if left <= 0.0:
+            return _flip("R4 T_halb over, big member alone (S=%d)" % s)
+        return SetVerdict(V_COLLECT, "R4 big member waits %.1f s for company" % left, left, s, hx)
+    if s >= x:
+        return _flip("R3 S=%d >= X=%d inside T_halb (new=%d)" % (s, x, new))
     if left <= 0.0:
-        return True, "timer" if timer else "rent", t_start, 0.0
-    return False, "collect", t_start, left
+        return SetVerdict(V_D_AFTER_TIMER, "R3 T_halb over, S=%d < X=%d" % (s, x), 0.0, s, hx)
+    return SetVerdict(V_COLLECT, "R3 S=%d < X=%d, %.1f s left" % (s, x, left), left, s, hx)
+
+
+def _nearest_rank(vals: Sequence[float], q: float) -> float:
+    v = sorted(float(x) for x in vals)
+    return v[min(len(v) - 1, max(0, int(-(-q * len(v) // 1)) - 1))]
+
+
+#: R10: how far T_halb may stand from half of the measured p90 sum before the instrument says so.
+HALF_FLIP_DEV_PCT = 30.0
+
+
+def half_flip_check(t_half_s: float, dp_s: Sequence[float], pd_s: Sequence[float]) -> Optional[dict]:
+    """R10 (SOLL v2): ``T_halb`` against the half of the measured user flip times -- p50/p90 per direction
+    (WEG2-FLIP-USERZEIT, seconds). Reports only, nothing is derived from it. ``None`` until both directions have
+    a sample. ``half_p90_s`` = (p90(D->P) + p90(P->D)) / 2; ``verdict`` is ``abweichung`` when T_halb differs from
+    it by more than :data:`HALF_FLIP_DEV_PCT` percent."""
+    if not dp_s or not pd_s:
+        return None
+    p90_dp, p90_pd = _nearest_rank(dp_s, 0.9), _nearest_rank(pd_s, 0.9)
+    half = (p90_dp + p90_pd) / 2.0
+    dev = abs(float(t_half_s) - half) / half * 100.0 if half > 0 else 0.0
+    return {"t_half_s": float(t_half_s), "p50_dp_s": _nearest_rank(dp_s, 0.5), "p50_pd_s": _nearest_rank(pd_s, 0.5),
+            "p90_dp_s": p90_dp, "p90_pd_s": p90_pd, "half_p90_s": half, "dev_pct": dev,
+            "verdict": "abweichung" if dev > HALF_FLIP_DEV_PCT else "ok"}
 
 
 #: PARK-COLLECT-WINDOW: the measured-record sidecar entry of one flip round

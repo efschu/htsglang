@@ -88,7 +88,7 @@ def test_weg2_15_52_a_short_arriving_while_p_is_awake_gets_a_p_leg1(caplog):
     assert not p.skip_leg1 and not p.short_kept and not p.d_direct, \
         "P is awake: a normal leg 1 on P, never kept for a D prefill"
     assert not any("SHORT-BEHIND-P" in m for m in caplog.messages)
-    assert any("WEG2 SHORT-TO-P rid=" in m and "joins P's batch" in m for m in caplog.messages)
+    assert any("WEG2 SHORT-IN-P-PHASE rid=" in m and "joins P's batch" in m for m in caplog.messages)
 
 
 def test_a_short_arriving_while_d_flips_to_p_joins_ps_batch():
@@ -109,18 +109,19 @@ def test_the_d_phase_keep_is_unchanged():
 
 # ---- (2) queued for D at the D->P flip -> P's batch -----------------------------
 
-def _pending(rid, age_s, **kw):
+def _pending(rid, age_s, est_uncached=200, **kw):
     loop = asyncio.new_event_loop()
     return Pending(rid=rid, path="/generate", payload={}, text="x", t_arrive=time.time() - age_s,
-                   fut=loop.create_future(), est_prompt=1000, est_uncached=200, **kw)
+                   fut=loop.create_future(), est_prompt=1000, est_uncached=est_uncached, **kw)
 
 
 def test_prefill_queued_for_d_at_the_d_to_p_flip_goes_to_p(caplog):
     caplog.set_level(logging.INFO)
     f = Front("http://p", "http://d", "P", "t", "", 0, 0, {}, 45.0, tp_prefill_max_tokens=X)
     f.state = "serving"
-    kept = _pending("kept", 9.0, skip_leg1=True, short_kept=True, d_direct=True)   # SHORT-KEPT
-    drained = _pending("drained", 7.0, d_direct=True)                            # D-SHORT-DRAIN
+    # SOLL v2 R7: P takes a waiting D-prefill set only when its SUM reaches X (2 x 2100 >= 4096)
+    kept = _pending("kept", 9.0, 2100, skip_leg1=True, short_kept=True, d_direct=True)   # SHORT-KEPT
+    drained = _pending("drained", 7.0, 2100, d_direct=True)                            # D-SHORT-DRAIN
     prefilled = _pending("handoff", 8.0, leg1_done=True)                         # P did leg 1
     carrier = _pending("carrier", 6.0, skip_leg1=True, leg1_done=True)           # P leg 1 done
     queued_kept = _pending("qkept", 5.0, skip_leg1=True, short_kept=True)        # D-phase fall-through

@@ -4336,14 +4336,6 @@ def _env_switch_on_or_profile(name: str, env=None) -> bool:
 
 
 
-def _decode_collect_window_s() -> float:
-    """DECODE-COLLECT window (user 02.10.); 0 = the old path, byte for byte."""
-    try:
-        return max(0.0, float(envs.SGLANG_WEG2_DECODE_COLLECT_WINDOW_S.get() or 0.0))
-    except (TypeError, ValueError):
-        return 0.0
-
-
 def _sum_priced_take(entries: List["Pending"], *, carried: int, limit: int) -> Tuple[List["Pending"], List["Pending"]]:
     """X-SUM-PRICE for the queued SHORTs: oldest first while ``carried`` plus
     the taken ``est_uncached`` stay within ``limit`` (the one rule:
@@ -5473,21 +5465,16 @@ class Front:
         decodes the parked requests for at least the price of its flip."""
         if self._park_attempt_epoch == self.epoch or not self._flip_ledger(D):
             return None
-        if _decode_collect_window_s() > 0.0:
-            # DECODE-COLLECT (user 02.10.): the window wins over every park rule
-            dc = self._decode_collect(now)
-            if dc == "hold":
-                return None
-            if dc == "D":
-                self._dc_hand_to_d(now)  # the small set: D prefills it now
-                return None
-            if dc == "P":
-                live = [q for q in self.queue if not q.fut.done()]
-                if not live:
-                    return None
-                # SEAT-AT-HAND-OFF (15.10.): route P flips at the release -- P computes, the hand-off to D is what
-                # needs a seat (d_admitter, the queue on D by priority = age); see _decode_collect
-                return Front._prio_sorted(self, live)[0]  # PRIO-AS-AGE 1014: the head by the order key
+        # SET SCHEDULER (SOLL v2): the set holds a collecting request back (R3/R4); a decided flip names its
+        # committed entries and returns their head
+        dc = self._decode_collect(now)
+        if dc == "hold":
+            return None
+        if dc == "P":
+            _committed = Front._set_committed(self, [q for q in self.queue if not q.fut.done()], self._set_st())
+            if _committed:
+                # SEAT-AT-HAND-OFF (15.10.): a decided set flips at the release, whatever the dwell or the seats say
+                return Front._prio_sorted(self, _committed)[0]  # PRIO-AS-AGE 1014: the head by the order key
         p = phase_policy.immediate_park_trigger(self.queue, int(self.tp_prefill_max_tokens))
         if p is None:
             if envs.SGLANG_WEG2_ENABLE_PARK_WINDOW_GATE.get():  # off: nothing touched
@@ -5506,18 +5493,19 @@ class Front:
                             int((now - self.t_awake) * 1000.0), len(self._flip_ledger(D)),
                             int(max(need_ms, FAIRNESS_DWELL_FLOOR_MS)), prov, int(FAIRNESS_DWELL_FLOOR_MS))
             return p
-        collect = envs.SGLANG_WEG2_ENABLE_PARK_COLLECT_WINDOW.get()
+        # SOLL v2 (R7): the Ski-Rental PARK-COLLECT-WINDOW is gone -- the set's T_halb timer (``_decode_collect``
+        # above) is the one collect window; the old flags stay readable and decide nothing.
         # PARK-CYCLE DWELL: a D phase that began by resuming parked requests is
         # priced at the whole park cycle (both flips), not at one flip.
         # PARK-COLLECT-WINDOW replaces it and PARK-DECODE-DWELL: its ski price
         # already charges the round trip, per running stream (27B review 29.09.).
         resumed = getattr(self, "_park_resume_epoch", -1) == self.epoch
-        if resumed and phase_policy.park_cycle_dwell_on() and not collect:
+        if resumed and phase_policy.park_cycle_dwell_on():
             back_ms, back_prov = self._derived_min_dwell_ms("P", "D")
             need_ms = phase_policy.park_cycle_dwell_ms(need_ms, back_ms, True)
             prov = f"{prov}+cycle:{back_prov}={int(back_ms)}ms"
         awake_s = now - self.t_awake
-        if phase_policy.park_decode_dwell_on() and not collect:
+        if phase_policy.park_decode_dwell_on():
             # PARK-DECODE-DWELL (NF rc12z22 14:52-14:58): the cycle is both flips
             # plus this phase's resume, and it is counted from D's first decoded
             # chunk -- not from the wake, which the resume's reload ate.
@@ -5548,43 +5536,6 @@ class Front:
                             "phase", self.epoch, p.rid, int(awake_s * 1000.0), int(need_ms), prov,
                             int(FAIRNESS_DWELL_FLOOR_MS))
             return None
-        if collect:
-            # PARK-COLLECT-WINDOW (NF z30w-park 08:31-08:46, user 29.09.): D keeps
-            # decoding while the pending P work collects for the window; the park
-            # comes at its end, or earlier when D runs nothing or a hard cap binds.
-            x_tok = int(self.tp_prefill_max_tokens)
-            # the queued requests that need P, read by the park trigger's own reader
-            items = [(_lctl.clock_t(q), int(q.est_uncached)) for q in self.queue
-                     if phase_policy.immediate_park_trigger([q], x_tok) is not None]
-            threshold = int(envs.SGLANG_WEG2_PARK_COLLECT_THRESHOLD_TOKENS.get()) or x_tok
-            round_trip_s, rt_src = self._park_collect_window_s()
-            n_running = len(self._flip_ledger(D))
-            timer = rt_src == "flag"
-            # ski rental: a park stalls every running stream for one round trip
-            price_s = round_trip_s if timer else round_trip_s * max(1, n_running)
-            fire, why, t_start, left_s = phase_policy.park_collect_window(
-                items, now, self.t_awake, n_running, price_s, threshold, timer=timer,
-                max_requests=self.p_phase_max_requests, pool_tokens=self.p_pool_tokens,
-                wait_bound_s=self.d_wait_bound_s)
-            # PARK-WINDOW-GATE: an open window (t_start set, holding) tells D its
-            # deadline; FIRE parks (D clears there), anything else clears it.
-            if not fire and envs.SGLANG_WEG2_ENABLE_PARK_WINDOW_GATE.get():
-                self._park_window_send(D, int(left_s * 1000.0) if t_start is not None else -1)
-            if not fire:
-                if self._park_collect_epoch != self.epoch:
-                    self._park_collect_epoch = self.epoch
-                    self.counters["park_collect_holds"] += 1
-                    logger.info("WEG2 PARK-COLLECT-WINDOW HOLD epoch=%d rid=%s why=%s running=%d "
-                                "queued_p=%d uncached=%d threshold=%d round_trip_s=%.2f (%s) "
-                                "price_s=%.1f left_s=%.1f -- D keeps decoding, the pending P work "
-                                "collects", self.epoch, p.rid, why, n_running, len(items),
-                                sum(u for _, u in items), threshold, round_trip_s, rt_src, price_s,
-                                left_s)
-                return None
-            self.counters[f"park_collect_{why.replace('-', '_')}"] += 1
-            logger.info("WEG2 PARK-COLLECT-WINDOW FIRE epoch=%d rid=%s why=%s running=%d queued_p=%d "
-                        "uncached=%d collected_s=%.1f", self.epoch, p.rid, why, n_running, len(items),
-                        sum(u for _, u in items), (now - t_start) if t_start is not None else 0.0)
         return p
 
     def _park_window_send(self, D: Group, left_ms: int) -> None:
@@ -5619,27 +5570,6 @@ class Front:
         task = asyncio.ensure_future(_post())
         tasks.add(task)
         task.add_done_callback(tasks.discard)
-
-    def _park_collect_window_s(self) -> Tuple[float, str]:
-        """PARK-COLLECT-WINDOW: one flip round trip in seconds and its source,
-        the unit of the SKI-RENTAL price (user decision 29.09.; the caller
-        charges it once per running stream) -- K7's D->P and P->D prices plus
-        the last D phase's wake -> first decoded chunk. RECORD > UNMEASURED
-        before this boot measured one: the newest round trip of this
-        checkpoint x form, else 0 (the immediate park, named).
-        SGLANG_WEG2_PARK_COLLECT_WINDOW_S overrides all of it as a fixed timer
-        (source "flag")."""
-        override = envs.SGLANG_WEG2_PARK_COLLECT_WINDOW_S.get()
-        if override is not None:
-            return float(override), "flag"
-        dp_ms, pd_ms, resume_ms, src = self._park_warm_legs_ms()
-        live = phase_policy.park_round_trip_s(dp_ms, pd_ms, resume_ms)
-        if live is not None:
-            return live, f"ski-live:{src}"
-        if self._park_rt_seed is not None:
-            return (float(self._park_rt_seed["round_trip_s"]),
-                    f"ski-record:{self._park_rt_seed['boot_tag']}@{self._park_rt_seed['at']}")
-        return 0.0, f"ski-unmeasured:{self._park_form_key or 'no-form'}"
 
     def _park_warm_legs_ms(self) -> Tuple[float, float, Optional[float], str]:
         """PARK-COLLECT-WINDOW: the round trip's three legs from WARM samples
@@ -8043,20 +7973,33 @@ class Front:
         -- leaves ``_ready_for_d`` for P's queue, in arrival order. Queued kept
         SHORTs get their leg 1 back. A request P already prefilled
         (``leg1_done``, not ``d_direct``) stays. Returns the number moved."""
-        moved = []
+        # SOLL v2 R7/R1: P takes the set of D-prefill entries waiting in D's admission line only when its SUM reaches
+        # X -- a set under X stays with D and no flip is made for it (a P-only entry never waits there: it is never
+        # takable, see below). The kept SHORTs of the queue are in P's queue already: they only get their leg 1 back.
+        x_tok = int(self.tp_prefill_max_tokens)
         ready = getattr(self, "_ready_for_d", None)
+
+        def _takable(p) -> bool:
+            return (getattr(p, "d_direct", False) and not getattr(p, "resume_via_p", False)
+                    and not getattr(p, "p_only", False)
+                    # VISION-SHORT-1014: D's own presence, the store cannot give it to P
+                    and not (getattr(p, "d_presence_only", False) and getattr(p, "short_kept", False))
+                    and (getattr(p, "fut", None) is None or not p.fut.done()))
+
+        cand_ready = [p for p in (ready or ()) if _takable(p)]
+        s_set = sum(int(getattr(p, "est_uncached", 0) or 0) for p in cand_ready)
+        if cand_ready and s_set < x_tok:
+            # the set waiting for D's admission line stays there (the queue's kept SHORTs below are already in P's
+            # queue: P drains it whole, they only get their leg 1 back)
+            self.counters["p_batch_set_under_x_stays"] += 1
+            logger.info("WEG2 P-BATCH-STAYS n=%d S=%d X=%d epoch=%d (SOLL R7: a set under X stays with D, "
+                        "P does not take it)", len(cand_ready), s_set, x_tok, self.epoch)
+            cand_ready = []
+        moved = []
         if ready:
             keep = []
             for p in ready:
-                if (getattr(p, "d_direct", False) and not getattr(p, "resume_via_p", False)
-                        and not getattr(p, "p_only", False)
-                        # VISION-SHORT-1014: D's own presence, the store cannot give it to P
-                        and not (getattr(p, "d_presence_only", False)
-                                 and getattr(p, "short_kept", False))
-                        and (getattr(p, "fut", None) is None or not p.fut.done())):
-                    moved.append(p)
-                else:
-                    keep.append(p)
+                (moved if (cand_ready and _takable(p)) else keep).append(p)
             if moved:
                 ready.clear()
                 ready.extend(keep)
@@ -9037,6 +8980,7 @@ class Front:
                 "queue_skip", "idle_ms")
         last = self.__dict__.setdefault("_flip_user_last", {})
         last[d] = {k: ev.get(k) for k in keys if k in ev}
+        Front._half_flip_note(self, d, ev.get("user_flipzeit_ms"))
         if d == "D>P":
             sup = "last_d_token_ts=%s(%s) waiter_arrival_ts=%s(%s) first_p_chunk_ts=%s" % (
                 ev.get("last_d_token_ts"), ev.get("last_d_token_source"), ev.get("waiter_arrival_ts"),
@@ -9051,6 +8995,39 @@ class Front:
                     ev.get("user_flipzeit_missing"), ev.get("user_flipzeit_start_source"), sup,
                     ev.get("pre_wait_ms"), ev.get("queue_age_max_ms"), ev.get("queue_skip_ms"), ev.get("idle_ms"),
                     ev.get("flip_total_ms"), FLIP_TOTAL_NOTE_SHORT)
+
+    # ---------------- HALF-FLIP-CHECK (SOLL v2 R10) ----------------
+    # T_halb is a flag. This instrument keeps p50/p90 of the user flip time per direction per boot and reports it
+    # against half of the p90 sum every 30 min and at every 10th flip. It reports; nothing is computed from it.
+    def _half_flip_note(self, d: str, user_ms: Any) -> None:
+        samples = self.__dict__.setdefault("_half_flip_s", {"D>P": [], "P>D": []})
+        try:
+            ms = float(user_ms)
+        except (TypeError, ValueError):
+            return
+        if d in samples and ms > 0:
+            samples[d].append(ms / 1000.0)
+            n = len(samples["D>P"]) + len(samples["P>D"])
+            if n % 10 == 0:
+                Front._half_flip_check(self, time.time(), "flip10")
+
+    def _half_flip_tick(self, now: float) -> None:
+        """Called from the controller tick: the 30-minute report."""
+        last = self.__dict__.setdefault("_half_flip_t", now)
+        if now - last >= 1800.0:
+            Front._half_flip_check(self, now, "30min")
+
+    def _half_flip_check(self, now: float, why: str) -> None:
+        self._half_flip_t = now
+        samples = self.__dict__.get("_half_flip_s") or {}
+        _frac, t_half = Front._set_cfg()
+        r = phase_policy.half_flip_check(t_half, samples.get("D>P", ()), samples.get("P>D", ()))
+        if r is None:
+            return
+        logger.info("WEG2 HALF-FLIP-CHECK t_half_s=%.1f p90_dp_s=%.1f p90_pd_s=%.1f half_p90_s=%.1f dev_pct=%.1f "
+                    "verdict=%s p50_dp_s=%.1f p50_pd_s=%.1f n_dp=%d n_pd=%d why=%s",
+                    r["t_half_s"], r["p90_dp_s"], r["p90_pd_s"], r["half_p90_s"], r["dev_pct"], r["verdict"],
+                    r["p50_dp_s"], r["p50_pd_s"], len(samples.get("D>P", ())), len(samples.get("P>D", ())), why)
 
     # ---------------- FLIPZEIT D>P END (user order 02.10.) ----------------
     # FLIPZEIT = last token of the outgoing phase -> first token of the incoming
@@ -10567,13 +10544,13 @@ class Front:
                         int(_xx.n) - int(getattr(_xx, "store_depth", 0) or 0),
                         int(self.tp_prefill_max_tokens), int(bool(getattr(_xx, "mm", False))))
         elif _p_phase and short_ok:
-            # L4/R-10: law 1 read literally means every arrival during a P
-            # drain is queued BATCH, SHORT ones included.  Counted here,
-            # printed by the drain (n=0 printed too), never discovered.
+            # SOLL v2 R7: the old SHORT-TO-P marker (a decision name from the epoch rule) is gone. What stays is the
+            # phase law's plain fact, named for what it is: D is asleep, a SHORT arriving in P's phase waits in P's
+            # queue (no flip is made for it, none is avoided). Counted, never a verdict.
             self.counters["short_behind_p"] += 1
-            logger.info("WEG2 SHORT-TO-P rid=%s: SHORT verdict (uncached=%d presence=%d src=%s) "
+            logger.info("WEG2 SHORT-IN-P-PHASE rid=%s: SHORT verdict (uncached=%d presence=%d src=%s) "
                         "arrived while P is %s -- joins P's batch (leg 1 on P, the prefix read "
-                        "from the shared store)", rid, remainder, store_span, presence_src,
+                        "from the shared store); no flip was made for it", rid, remainder, store_span, presence_src,
                         "awake" if self.awake == "P" else "waking")
         elif self.awake == "D" and not short_ok:
             # L5: a BATCH arrival during a D phase -- named and left; it is
@@ -11143,19 +11120,22 @@ class Front:
             return None
         if not (self.awake == "D" and self.admit_d and self.state == "serving"):
             return None
-        if _decode_collect_window_s() > 0.0:
-            # DECODE-COLLECT: D decodes -> this SHORT waits for the window; the
-            # set's route decides (P: route BATCH, the flip takes it)
-            if await self._decode_collect_short(rid, uncached if uncached is not None else est_tokens) == "P":
-                # ``_decode_collect_short`` also answers "P" when the phase moved while this SHORT
-                # waited (epoch / awake changed): that is no verdict of the sum rule and keeps
-                # SK's old fall-through. The sum rule's own verdict is the released route of THIS
-                # epoch's state -- set when the window released over X, and kept for the rest of
-                # the D phase (so a later single arrival under X finds it too, NF 21:01:08Z 663).
-                if refused is not None and self._dc_st().get("route") == "P":
-                    # the set's SUM went over X: this is not "D cannot take it now" (SK's
-                    # fall-through) but the sum rule's verdict -- the caller must queue it
-                    # BATCH for P, never keep it for D (NF int24g 12.10. 21:01:07Z)
+        # SET SCHEDULER (SOLL v2): kurz -> D at once, no wait, whatever a set is doing (R2); halb -> the set decides
+        # (R3): D after T_halb, or P by one flip with the whole set (the SHORT then rides route BATCH)
+        # ``uncached`` is the route's remainder (always given by the arrival); without it nothing says the request is
+        # not small -- it is kurz (R2), never a guess from the prompt size
+        _unc = int(uncached) if uncached is not None else 0
+        _frac, _t_half = Front._set_cfg()
+        if phase_policy.classify_arrival(_unc, int(self.tp_prefill_max_tokens), _frac, False) == phase_policy.CLASS_KURZ:
+            self._set_kurz_now(rid, _unc)
+        else:
+            _set_route = await self._decode_collect_short(rid, _unc)
+            if _set_route == "P":
+                # ``_decode_collect_short`` also answers "P" when the phase moved while this SHORT waited (epoch /
+                # awake changed): that is no verdict of the set and keeps SK's old fall-through. The set's own
+                # verdict is the release recorded for THIS rid -- the caller must queue it BATCH for P, never keep
+                # it for D (NF int24g 12.10. 21:01:07Z)
+                if refused is not None and rid in self._set_st()["go_p"]:
                     refused.append("collect_p")
                 return None
             if not (self.awake == "D" and self.admit_d and self.state == "serving"):
@@ -11199,12 +11179,11 @@ class Front:
     # none of the methods below is called.
 
     # ------------------------------------------------------------------ DECODE-COLLECT
-    # User rule 02.10. ~19:07Z (both models): while D decodes, arriving prefills
-    # are collected for SGLANG_WEG2_DECODE_COLLECT_WINDOW_S; then the set goes
-    # to D (summed uncached <= X, nothing P-only) or, by one flip, to P.
-
-    def _dc_window_s(self) -> float:
-        return _decode_collect_window_s()
+    # SET SCHEDULER (SOLL v2 R1-R11, user 17.10.; replaces the DECODE-COLLECT window of 02.10.): a kurz arrival
+    # (u < halbX) goes to D at once (R2, never a set member); halb requests and requests that need P collect in
+    # ONE set per D epoch; ``phase_policy.set_verdict`` decides over the set's SUM against X (R1) -- the front
+    # holds the clocks and the flip, the ranks get finished sets (R11). The method names keep the old
+    # ``_decode_collect`` / ``_dc_*`` spelling because every caller already speaks them.
 
     def _dc_decoding(self) -> bool:
         """D is awake, serving and a DECODE stands on it: a rid of D's flip ledger (parked, lane-parked and
@@ -11283,214 +11262,206 @@ class Front:
         decided at once -- the sum fits under X -> D, else P (NODECODE 1015)."""
         return self._dc_decoding() or self._dc_carried() > 0
 
-    def _dc_st(self) -> dict:
-        st = self.__dict__.setdefault("_dc_state", {"epoch": None})
+    # --- set scheduler state --------------------------------------------------------------------------------------
+    def _set_st(self) -> dict:
+        """The set of THIS D epoch: ``shorts`` = halb SHORTs waiting on the seat path {rid: (t, u)}, ``released`` =
+        the route each of them was sent on {rid: "D"|"P"}, ``go_p`` = rids committed to the flip (queue entries and
+        released SHORTs): a decided flip is carried out, never re-collected (no second T_halb), ``t_open`` = stamp of
+        the set's FIRST member (the timer starts there once, R3). New epoch = empty state: there is no epoch rule
+        (R7) -- nothing of this dict decides anything for a later arrival."""
+        st = self.__dict__.setdefault("_set_state", {"epoch": None})
         if st.get("epoch") != self.epoch:
             st.clear()
-            st.update(epoch=self.epoch, t_open=None, t_rel=float(getattr(self, "t_awake", 0.0) or 0.0),
-                      shorts={}, route=None, wid=0)
+            st.update(epoch=self.epoch, set_id=0, t_open=None, shorts={}, released={}, go_p=set(), seen=0,
+                      logged=None)
         return st
 
-    def _decode_collect(self, now: float, live_q: Optional[List["Pending"]] = None) -> Optional[str]:
-        """DECODE-COLLECT, the one decision site: ``"hold"`` while the window
-        is open, ``"D"``/``"P"`` once it released (``"P"`` stays for the rest
-        of this D phase -- the flip takes everything queued), ``None`` when the
-        window is off or D was not decoding when the prefill arrived.
+    @staticmethod
+    def _set_cfg() -> Tuple[float, float]:
+        """``(F_halb, T_halb)`` -- the two flags (SOLL section 2)."""
+        try:
+            frac = float(envs.SGLANG_WEG2_HALF_X_FRAC.get())
+        except (TypeError, ValueError):
+            frac = 0.5
+        try:
+            t_half = max(0.0, float(envs.SGLANG_WEG2_HALF_FLIP_S.get()))
+        except (TypeError, ValueError):
+            t_half = 4.5
+        return frac, t_half
 
-        SEAT-AT-HAND-OFF (user 15.10., design not policy): route ``"P"`` flips at the
-        release, whatever D's seat count says. P computes the prefill and hands it
-        over; only the HAND-OFF to D needs a seat, and that wait is the queue on D
-        (``_ready_for_d``, ``d_admitter``: priority = age, the head never skipped).
-        The DECODE-COLLECT SEAT GATE of 02.10. asked the seat at the release, and its
-        count (``_arrival_seat_taken``) includes ``_ready_for_d`` -- D's own wait
-        queue -- so under load it was closed for as long as anything waited for D
-        (boots 110016 / 124245 / 133855: 49 holds, ``taken`` > n in 27 of them, 12 of
-        them 20..74 s release -> flip with P idle; 119 P phases capped at the free
-        seats, 95 of them ended with ``queue_left`` > 0 -- one more flip each), and
-        the relief valves built on top (PBOUND-SEAT-HOLD 13.10., K10 (a)/(b)/(c)
-        15.10.). Gate, cap and valves are gone."""
-        win = self._dc_window_s()
-        if win <= 0.0:
+    def _set_seats_free(self) -> int:
+        """D's free decode seats for NEW sessions (R5). ARRIVAL-SEAT's count when the rule is on; without the rule
+        (it keeps no state then) D's running ledger against the phase's seat count."""
+        if _asr.enabled():
+            taken, n = self._arrival_seat_taken()
+            return max(0, int(n) - int(taken))
+        n = getattr(self, "_d_phase_n", None) or self.d_bs
+        D = self.groups["D"]
+        return max(0, int(n) - len(self._flip_ledger(D)) - len(getattr(self, "_ready_for_d", ()) or ()))
+
+    def _set_cands(self, live_q: List["Pending"], st: dict) -> List["Pending"]:
+        """The queued entries that need P (LONG, P-only, requeued, carrier) and are not yet committed to a flip."""
+        x_tok = int(self.tp_prefill_max_tokens)
+        return [q for q in live_q if q.rid not in st["go_p"]
+                and phase_policy.immediate_park_trigger([q], x_tok) is not None]
+
+    def _set_members(self, now: float, cands: List["Pending"], st: dict) -> List[phase_policy.SetMember]:
+        """The set: the waiting halb SHORTs plus the queue entries that need P. An entry that needs P although it is
+        under X (requeued, carrier, deferred) is P-only by state -- R9 counts it big; D cannot take it."""
+        x_tok = int(self.tp_prefill_max_tokens)
+        out = []
+        for q in cands:
+            u = int(getattr(q, "est_uncached", 0) or 0)
+            out.append(phase_policy.SetMember(
+                q.rid, u, float(_lctl.clock_t(q, now)), bool(getattr(q, "p_only", False)) or u < x_tok))
+        for rid, (t, u) in st["shorts"].items():
+            out.append(phase_policy.SetMember(rid, int(u), float(t), False))
+        return sorted(out, key=lambda m: m.t_arrive)
+
+    def _set_log(self, st: dict, members: Sequence[phase_policy.SetMember], sv: phase_policy.SetVerdict, *,
+                 verdict: str, why: str, x_tok: int, frac: float, t_half: float, decoding: bool, seats: int,
+                 waited: float) -> None:
+        """``WEG2 SET-VERDICT`` (SOLL section 4), the exact format, once per decision."""
+        classes = [phase_policy.classify_arrival(m.uncached, x_tok, frac, m.p_only) for m in members]
+        logger.info("WEG2 SET-VERDICT epoch=%d set=%d n=%d members=%s S=%d X=%d halfX=%d classes=%s d_decoding=%d "
+                    "seats_free=%d t_half_s=%.1f waited_s=%.1f verdict=%s why=%s",
+                    self.epoch, st["set_id"], len(members), ",".join("%s:%d" % (m.rid, m.uncached) for m in members),
+                    sv.s_tokens, x_tok, sv.half_x, ",".join(classes), int(decoding), seats, t_half, waited,
+                    verdict, why)
+
+    def _set_eval(self, now: float, live_q: List["Pending"], st: dict):
+        """The set's current verdict, without side effects beyond opening ``t_open`` (the first member's stamp):
+        ``(members, SetVerdict, log kwargs)`` or ``None`` when the set is empty."""
+        x_tok = int(self.tp_prefill_max_tokens)
+        frac, t_half = Front._set_cfg()
+        cands = self._set_cands(live_q, st)
+        members = self._set_members(now, cands, st)
+        if not members:
             return None
-        st = self._dc_st()
-        if st["route"] == "P":
-            return "P"
+        if st["t_open"] is None:
+            st["t_open"] = min(m.t_arrive for m in members)
+        decoding = self._dc_decoding()
+        seats = self._set_seats_free()
+        # PRIO-AS-AGE 1014 (user decision 14.10.): a request with priority > 0 that needs P ends the wait AT ONCE
+        # (T_halb = 0 for this verdict); the SET-VERDICT line still reports the configured T_halb
+        urgent = Front._prio_urgent(self, cands)
+        sv = phase_policy.set_verdict(
+            members=members, x_tokens=x_tok, half_frac=frac, t_half_s=0.0 if urgent is not None else t_half,
+            now=now, t_open=st["t_open"],
+            d_decoding=decoding, seats_free=seats,
+            d_prefill_running_uncached=self._dc_carried(),  # R6: what D prefills right now counts into S
+            new_since_last=max(0, len(members) - st["seen"]))
+        kw = dict(x_tok=x_tok, frac=frac, t_half=t_half, decoding=decoding, seats=seats,
+                  waited=max(0.0, now - st["t_open"]))
+        st["urgent"] = urgent
+        return members, sv, kw
+
+    def _set_flip_foreseeable(self, now: float) -> bool:
+        """True when a decided (or committed) flip stands: the set is not merely collecting. A collecting set may
+        end on D (R3) -- a kurz arrival must not yield to a flip that is not decided (R2)."""
+        st = self._set_st()
+        live_q = [p for p in self.queue if not p.fut.done()]
+        if any(p.rid in st["go_p"] for p in live_q):
+            return True
+        ev = self._set_eval(now, live_q, st)
+        return ev is None or ev[1].verdict not in (phase_policy.V_COLLECT, phase_policy.V_D_AFTER_TIMER)
+
+    def _decode_collect(self, now: float, live_q: Optional[List["Pending"]] = None) -> Optional[str]:
+        """The set scheduler's ONE decision site (R11: the front decides, nobody rank-local). Returns ``"hold"``
+        while the set collects, ``"D"`` / ``"P"`` once it is decided, ``None`` when there is nothing to decide.
+
+        ``"P"`` (FLIP_P / PARK_NO_SEAT / REROUTE_P) is a COMMITTED flip of the rids it names (``go_p``): a flip the
+        controller could not start this tick is carried out on the next without a second T_halb -- no epoch rule:
+        a later arrival is classified by its own size (R2, R7). SEAT-AT-HAND-OFF (15.10.) stays: P computes, only
+        the hand-off to D waits for a seat (``d_admitter``)."""
+        st = self._set_st()
         if live_q is None:
             live_q = [p for p in self.queue if not p.fut.done()]
-        fresh = [p for p in live_q if _lctl.clock_t(p, now) > st["t_rel"]]
-        if st["t_open"] is None:
-            if not (fresh or st["shorts"]) or not self._dc_d_busy():
-                return None
-            ts = [_lctl.clock_t(p, now) for p in fresh] + [t for t, _ in st["shorts"].values()]
-            st["t_open"] = min(ts) if ts else now
-        x_tok = int(self.tp_prefill_max_tokens)
-        unc = [int(getattr(p, "est_uncached", 0) or 0) for p in fresh] + [u for _, u in st["shorts"].values()]
-        n = len(unc)
-        carried = self._dc_carried()  # X-SUM-PRICE: what D still prefills counts
-        tokens = sum(unc) + carried
-        set_fits = _sp.fits(carried=carried, tokens=sum(unc), limit=x_tok)
-        waited = max(0.0, now - st["t_open"])
-        # NODECODE 1015 (user law: collecting only while a DECODE stands on D): ``carried`` (D prefills a granted
-        # SHORT / hand-over) prices the set but never holds it -- with no decode the stage is d-idle and the sum
-        # decides now (fits under X -> D, else P). Was ``_dc_d_busy()`` (and a still-prefilling rid counted as a
-        # decode): 15.10. 06:38:48Z and 07:08:21Z waited the full d_check_s=7.5 s with nothing on D but that prefill.
-        decoding = self._dc_decoding()
-        p_bound = any(phase_policy.immediate_park_trigger([p], x_tok) is not None
-                      or bool(getattr(p, "p_only", False)) for p in fresh)
-        try:
-            dcheck = max(0.0, float(envs.SGLANG_WEG2_DECODE_COLLECT_D_CHECK_S.get() or 0.0))
-        except (TypeError, ValueError):
-            dcheck = 0.0
-        stage = "window" if decoding else "d-idle"
-        # PRIO-AS-AGE 1014 (user decision 14.10.): a request with priority > 0 that needs a prefill on P ends the
-        # window AT ONCE (the flip urgency of vision_flip_urgent); it parks nothing extra, the normal flip runs
-        _pu = Front._prio_urgent(self, fresh)
-        if _pu is not None:
-            stage = "prio"
-            if st.get("prio_wid") != st["wid"]:
-                st["prio_wid"] = st["wid"]
-                self.counters["decode_collect_prio_release"] += 1
-                logger.info("%s rid=%s priority=%d site=decode-collect waited_s=%.1f window_s=%.1f epoch=%d -- a "
-                            "P-bound request with priority > 0 ends the DECODE-COLLECT window now (route P)",
-                            _prio_age.MARK_URGENT, _pu.rid, Front._prio_lane(self, _pu), waited, win, self.epoch)
-        elif waited < win and decoding:
-            if 0.0 < dcheck < win and waited >= dcheck and not p_bound and set_fits:
-                stage = "dcheck"  # a small set: D prefills it now
-            else:
-                if 0.0 < dcheck < win and waited >= dcheck and st.get("dcheck_wid") != st["wid"]:
-                    st["dcheck_wid"] = st["wid"]
-                    self.counters["decode_collect_dcheck_hold"] += 1
-                    logger.info("WEG2 DECODE-COLLECT dcheck n=%d tokens=%d X=%d waited_s=%.1f p_bound=%s -- "
-                                "over X: collects on to %.1f s", n, tokens, x_tok, waited, p_bound, win)
-                if st.get("hold_wid") != st["wid"]:
-                    st["hold_wid"] = st["wid"]
-                    self.counters["decode_collect_hold"] += 1
-                    logger.info("WEG2 DECODE-COLLECT hold n=%d tokens=%d X=%d waited_s=%.1f window_s=%.1f "
-                                "d_check_s=%.1f epoch=%d -- D decodes on, the arriving prefills collect",
-                                n, tokens, x_tok, waited, win, dcheck, self.epoch)
-                return "hold"
-        if stage == "window" and 0.0 < dcheck < win:
-            route = "P"  # user ~19:13Z: "ansonsten wartet er auf die 15er grenze und flippt"
-        else:
-            route = "P" if (p_bound or not set_fits) else "D"
-        if route == "D" and envs.SGLANG_WEG2_ENABLE_DECODE_COLLECT_PREFILL_BUSY.get():
-            for _rid, (_t, _u) in st["shorts"].items():  # X-SUM-PRICE: priced as a set, now booked as one
-                self._d_pf_book().grant(rid=_rid, tokens=int(_u), now=now)
-        # NODECODE 1015: the route of THIS window, by its id -- a SHORT of it whose poll comes after a LATER window
-        # already released (with no decode on D the next set is decided at once) follows its own release, not the
-        # phase's current (sticky P) route (``_decode_collect_short``)
-        _wr = st.setdefault("wid_route", {})
-        _wr[st["wid"]] = route
-        for _k in [k for k in _wr if k < st["wid"] - 64]:
-            del _wr[_k]
-        st.update(route=route, t_rel=now, t_open=None, shorts={}, wid=st["wid"] + 1,
-                  rel_rids=[p.rid for p in fresh])  # route D: the set _dc_hand_to_d moves
-        self.counters["decode_collect_release_" + route] += 1
-        logger.info("WEG2 DECODE-COLLECT release n=%d tokens=%d X=%d waited_s=%.1f route=%s stage=%s p_bound=%s "
-                    "epoch=%d", n, tokens, x_tok, waited, route, stage, p_bound, self.epoch)
+        if any(p.rid in st["go_p"] for p in live_q):
+            for rid in list(st["shorts"]):  # a SHORT that joined while the flip is committed rides it
+                st["released"][rid] = "P"
+                st["go_p"].add(rid)
+            st["shorts"] = {}
+            return "P"
+        ev = self._set_eval(now, live_q, st)
+        if ev is None:
+            st["t_open"] = None
+            st["seen"] = 0
+            return None
+        members, sv, kw = ev
+        st["seen"] = len(members)
+        _pu = st.get("urgent")
+        if _pu is not None and st.get("prio_set") != st["set_id"]:
+            st["prio_set"] = st["set_id"]
+            self.counters["decode_collect_prio_release"] += 1
+            logger.info("%s rid=%s priority=%d site=decode-collect waited_s=%.1f t_half_s=%.1f epoch=%d -- a "
+                        "P-bound request with priority > 0 ends the set's wait now (route P)",
+                        _prio_age.MARK_URGENT, _pu.rid, Front._prio_lane(self, _pu), kw["waited"], kw["t_half"],
+                        self.epoch)
+        if sv.verdict == phase_policy.V_COLLECT:
+            key = (st["set_id"], tuple(m.rid for m in members))
+            if st["logged"] != key:
+                st["logged"] = key
+                self.counters["set_collect"] += 1
+                self._set_log(st, members, sv, verdict=sv.verdict, why=sv.why, **kw)
+            return "hold"
+        route = "D" if sv.verdict == phase_policy.V_D_AFTER_TIMER else "P"
+        self._set_log(st, members, sv, verdict=sv.verdict, why=sv.why, **kw)
+        self.counters["set_" + sv.verdict.lower()] += 1
+        for rid in list(st["shorts"]):
+            st["released"][rid] = route
+            if route == "D" and envs.SGLANG_WEG2_ENABLE_DECODE_COLLECT_PREFILL_BUSY.get():
+                self._d_pf_book().grant(rid=rid, tokens=int(st["shorts"][rid][1]), now=now)  # X-SUM-PRICE
+        if route == "P":
+            st["go_p"].update(m.rid for m in members)
+        st.update(shorts={}, t_open=None, set_id=st["set_id"] + 1, seen=0, logged=None)
         return route
 
+    def _set_committed(self, live_q: List["Pending"], st: dict) -> List["Pending"]:
+        """The queue entries a decided set committed to the flip (``go_p``)."""
+        return [q for q in live_q if q.rid in st["go_p"]]
+
+    def _set_kurz_now(self, rid: str, uncached: int) -> None:
+        """R2: a kurz arrival goes to D at once -- logged once, ``verdict=D_NOW why=R2``."""
+        st = self._set_st()
+        x_tok = int(self.tp_prefill_max_tokens)
+        frac, t_half = Front._set_cfg()
+        m = phase_policy.SetMember(rid, int(uncached), time.time(), False)
+        sv = phase_policy.SetVerdict(phase_policy.V_D_NOW, "R2", 0.0, int(uncached), phase_policy.half_x_of(x_tok, frac))
+        self.counters["set_d_now"] += 1
+        self._set_log(st, [m], sv, verdict=phase_policy.V_D_NOW, why="R2", x_tok=x_tok, frac=frac, t_half=t_half,
+                      decoding=self._dc_decoding(), seats=self._set_seats_free(), waited=0.0)
+
     async def _decode_collect_short(self, rid: str, uncached: int) -> Optional[str]:
-        """DECODE-COLLECT for a SHORT arrival on the D seat path: ``None`` = no
-        window (as before), else the released route ("P": fall through to
-        route BATCH, the flip takes it)."""
-        win = self._dc_window_s()
-        if win <= 0.0:
-            return None
-        st = self._dc_st()
-        if st["route"] == "P":
-            return "P"
-        if st["t_open"] is None and not self._dc_d_busy():
+        """A halb SHORT on the D seat path joins the set and waits for its verdict: ``"D"`` = take the seat now,
+        ``"P"`` = fall through to route BATCH (the flip takes it), ``None`` = nothing to decide."""
+        st = self._set_st()
+        if st["t_open"] is None and not st["shorts"] and not self._dc_d_busy():
             if envs.SGLANG_WEG2_ENABLE_DECODE_COLLECT_PREFILL_BUSY.get():
-                # X-SUM-PRICE: this SHORT is served on D -- book its tokens in THIS
-                # loop turn. Booked after the seat (the caller's grant), six
-                # arrivals of one burst all read an empty book (NF int23xsum
-                # 09.10.: 6 x 5200 on an idle D, six D seats, no DECODE-COLLECT).
+                # X-SUM-PRICE: served on D at once -- book its tokens in THIS loop turn (six arrivals of one burst
+                # must not all read an empty book, NF int23xsum 09.10.)
                 self._d_pf_book().grant(rid=rid, tokens=int(uncached or 0), now=time.time())
             return None
         now = time.time()
         st["shorts"][rid] = (now, int(uncached or 0))
-        wid, epoch = st["wid"], self.epoch
-        deadline = now + win + float(getattr(self, "drain_deadline_s", 30.0) or 30.0)
-        while time.time() < deadline:
-            wid_before = self._dc_st()["wid"]
-            route = self._decode_collect(time.time())
-            if self.epoch != epoch or not (self.awake == "D" and self.state == "serving"):
-                return "P"
-            if self._dc_st()["wid"] != wid:
-                # NODECODE 1015: the route of ITS window's release (``wid_route``), never the phase's current one.
-                # With no decode on D the next window is decided at once; a P there made the phase sticky before
-                # this poll ran, and "sticky P = my release was P" sent a SHORT its own release had booked as D
-                # prefill (the grant at the release) to P as well -- its row then stood twice in the sums.
-                own = (self._dc_st().get("wid_route") or {}).get(wid)
-                if own is None:  # no record (cannot happen past a release of this epoch): as before
-                    own = "P" if self._dc_st()["route"] == "P" else "D"
-                if wid_before == wid and route in ("D", "P"):
-                    return own  # this poll released its own window
-                rel = own
-                # COLLECT-LANE 1014 (NF h10 13:31:53.933 weg2-18-143, 13:33:14.341 weg2-20-151): THIS
-                # window was released by another caller (the controller's _arrival_seat_step/park
-                # check) and a new arrival re-opened the next window before this SHORT's 50-ms poll
-                # -- its poll then read "hold" and it sat in the NEXT window, while the release had
-                # booked it as D prefill (grant at the release): D idle, its own row as `carried`
-                # put the next set over X, 15 s to P. The wid moved = its window released: the
-                # route is that release's (``own`` above, by the window's id).
-                self.counters["decode_collect_short_release_seen"] += 1
-                logger.info("WEG2 DECODE-COLLECT short-release rid=%s route=%s now=%s epoch=%d -- its window "
-                            "was released by another caller; the SHORT follows that release, not the next "
-                            "window", rid, rel, route, self.epoch)
-                return rel
-            if route is None:
-                return None
-            await asyncio.sleep(0.05)
-        return "D"
-
-    def _dc_hand_to_d(self, now: float) -> int:
-        """DECODE-COLLECT route D (user ~19:12Z: D prefills "die kleine menge
-        angefallene token" at once): every queued entry of the released set --
-        SHORT or not (band / x_deferred, budget-refused SHORT), each and their
-        sum <= X by the release -- goes to D's admission line now, while D
-        decodes on; no wait for an idle D (X-IDLE-REGRANT / D-SHORT-DRAIN).
-        The SHORTs held on the seat path take their own seats. Returns the
-        number moved."""
-        st = self._dc_st()
-        rel = set(st.pop("rel_rids", None) or ())
-        if not rel or not (self.awake == "D" and self.state == "serving" and self.admit_d):
-            return 0
-        x = int(self.tp_prefill_max_tokens)
-
-        def _g(p, k, d=None):  # partial test doubles
-            return getattr(p, k, d)
-        cands = Front._prio_sorted(self, (p for p in self.queue if p.rid in rel and not p.fut.done()),
-                                   t_of=lambda p: float(_g(p, "t_arrive", now) or now))  # PRIO-AS-AGE 1014
-        moved, total = [], 0
-        carried0 = self._dc_carried()
-        for p in cands:
-            u = int(_g(p, "est_uncached", 0) or 0)
-            if (_g(p, "p_only", False) or _g(p, "intake_stalled", False) or _g(p, "leg1_done", False)
-                    or _g(p, "reroutes", 0) or _g(p, "x_requeues", 0) or u < 0
-                    or not _sp.fits(carried=carried0 + total, tokens=u, limit=x)):
-                continue
-            total += u
-            moved.append(p)
-        for p in moved:
-            try:
-                self.queue.remove(p)
-            except ValueError:
-                continue
-            p.d_direct = True
-            Front._stamp_x_decision(p, x)  # FRONT-X-MIT: the collect release's X
-            if _g(p, "x_deferred", False) and hasattr(self, "_usage_route_note"):
-                self._usage_route_note(p.rid, "x_short", self.epoch)  # USAGE: served on D after all
-            self._ready_for_d.append(p)
-        if moved:
-            if hasattr(self, "_sync_batch_gate"):
-                self._sync_batch_gate()
-            self.counters["decode_collect_to_d"] += len(moved)
-            logger.info("WEG2 DECODE-COLLECT to-d n=%d tokens=%d X=%d rids=%s epoch=%d -- route=D: the "
-                        "collected set goes to D's admission line now, D decodes on", len(moved), total,
-                        x, [p.rid for p in moved][:8], self.epoch)
-        return len(moved)
+        epoch = self.epoch
+        _frac, t_half = Front._set_cfg()
+        deadline = now + t_half + float(getattr(self, "drain_deadline_s", 30.0) or 30.0)
+        try:
+            while time.time() < deadline:
+                route = self._decode_collect(time.time())
+                if self.epoch != epoch or not (self.awake == "D" and self.state == "serving"):
+                    return "P"
+                own = self._set_st()["released"].pop(rid, None)
+                if own is not None:
+                    return own
+                if route is None:
+                    return None
+                await asyncio.sleep(0.05)
+            return "D"
+        finally:
+            if self._set_st().get("epoch") == epoch:
+                self._set_st()["shorts"].pop(rid, None)
 
     def _asr_st(self) -> dict:
         return self.__dict__.setdefault("_asr_state", {
@@ -11861,7 +11832,12 @@ class Front:
         """The queued requests that need P (the step's candidates)."""
         x_tok = int(self.tp_prefill_max_tokens)
         live_q = [p for p in self.queue if not p.fut.done()]
-        return [q for q in live_q if phase_policy.immediate_park_trigger([q], x_tok) is not None]
+        cands = [q for q in live_q if phase_policy.immediate_park_trigger([q], x_tok) is not None]
+        if cands and not Front._set_flip_foreseeable(self, time.time()):
+            # SOLL R2/R4: a set that is still COLLECTING has no decided flip -- its requests hold no right of way
+            # over a D seat and make no flip foreseeable; a kurz arrival takes a free seat now
+            return []
+        return cands
 
     async def _asr_older_blocked(self, rid: str, t_mine: float, seat_is_free: bool) -> bool:
         """AGE PLAN: may ``rid`` take a seat past the requests OLDER than it?
@@ -12067,23 +12043,20 @@ class Front:
             logger.info("%s PARKED-CLEAR n=%d why=lapsed rids=%s", _asr.MARKER, len(lapsed), lapsed[:4])
         bound = self.d_wait_bound_s if self.d_wait_bound_s > 0 else float(self.w_s)
         live_q = [p for p in self.queue if not p.fut.done()]
-        dc = self._decode_collect(now, live_q) if _decode_collect_window_s() > 0.0 else None
+        dc = self._decode_collect(now, live_q)
         if dc == "hold":
-            return False, not self.admit_d, None  # DECODE-COLLECT: no flip, no D seat yet
-        if dc == "D":
-            self._dc_hand_to_d(now)  # route D: the non-SHORTs <= X too, not only d_eligible
+            return False, not self.admit_d, None  # SET SCHEDULER: collecting -- no flip, no D seat yet
         if dc == "P":
-            if not live_q:
+            # a decided set: the committed queue entries flip D->P now, the whole queue goes with them
+            committed = Front._set_committed(self, live_q, self._set_st())
+            if not committed:
                 return False, not self.admit_d, None  # the released SHORTs are on their way to the queue
-            head = Front._prio_sorted(self, live_q,  # PRIO-AS-AGE 1014: the head by the order key
-                                      t_of=lambda q: float(getattr(q, "t_arrive", now) or now))[0]
-            if st["flip_rid"] != head.rid:
-                st["flip_rid"] = head.rid
-                self.counters["arrival_seat_flip_now"] += 1
-                logger.warning("%s rid=%s verdict=%s DECODE-COLLECT route=P queued=%d -- the collected set "
-                               "goes to P: D pauses its decodes and flips now", _asr.MARKER, head.rid,
-                               _asr.FLIP_NOW, len(live_q))
-            return True, True, head
+            x_tok = int(self.tp_prefill_max_tokens)
+            if any(phase_policy.immediate_park_trigger([q], x_tok) is None for q in committed):
+                # released halb SHORTs ride the set's flip (no entry of theirs "needs P" by itself)
+                return self._asr_pbound_flip_now(committed, x_tok, now)
+            # natural P candidates: the set said "now", the flip machinery below carries it out (PBOUND-FLIP-NOW,
+            # or the seat/KV verdict with the switch off)
         # y4y: a queued SHORT has an owner -- D, as a d_prefill verdict (the
         # candidates below are only the entries that need P)
         handed = self._asr_queued_short_to_d(live_q, now) if live_q else []
@@ -17149,6 +17122,7 @@ class Front:
             # kick switch is on; both off = asyncio.sleep(0.2) as before.
             await self._ctl_wait()
             try:
+                Front._half_flip_tick(self, time.time())  # R10: the 30-minute report
                 if self.state != "serving":
                     continue
                 # PRIORITY LANES 1008 (L4): the LANE branch comes before everything else -- the floor is brought
@@ -17316,8 +17290,7 @@ class Front:
                 self._p_intake_stalled = False
                 # P-BATCH-ALL: prefill queued for D before this P phase joins it
                 self._p_batch_takes_d_prefill()
-                short_behind_p0 = self.counters.get("short_behind_p", 0)
-                # MF-3: the same delta idiom as `short_behind_p0` -- the
+                # MF-3: the delta idiom -- the
                 # epoch's terms are read off the running counters rather than
                 # carried in a second per-epoch structure.
                 reuse0 = (self.counters.get("p_prefill_requests", 0),
@@ -17500,11 +17473,6 @@ class Front:
                         _overlap_plan, _phase_stats["peak_n"], _phase_stats["peak_tokens"],
                         self.p_pool_tokens, _phase_stats["pool_holds"], len(self.queue))
                 if passes:
-                    oldest_short = 0.0
-                    if self._ready_for_d:
-                        # PRIO-AS-AGE 1014: the line may lead with a younger higher-priority entry -- the
-                        # clock reads the REAL oldest arrival
-                        oldest_short = time.time() - min(float(q.t_arrive) for q in self._ready_for_d)
                     # #1271 (b): ONE r_P SAMPLE PER DRAIN WINDOW, in the same
                     # unit the launcher now uses -- the uncached tokens this
                     # drain moved over the drain's own wall. NOT per request:
@@ -17525,12 +17493,6 @@ class Front:
                                 "passes=%d queue_at_exit=%d drain_s=%.1f",
                                 self.epoch, prefilled, max(0, prefilled - queue_at_entry),
                                 self.p_concurrency, passes, len(self.queue), time.time() - t_drain0)
-                    # L4/R-10: the counted consequence of law 1 -- SHORT work
-                    # that arrived while P was draining and had to queue
-                    # BATCH.  n=0 is printed too, so absence is a reading.
-                    logger.info("WEG2 SHORT-TO-P epoch=%d n=%d oldest_wait_s=%.1f",
-                                self.epoch, self.counters.get("short_behind_p", 0) - short_behind_p0,
-                                oldest_short)
                     # MF-3 (L15): what group P's disarmed store read cost THIS
                     # drain, beside the drain it cost it in.
                     self._log_p_prefix_reuse(reuse0)
