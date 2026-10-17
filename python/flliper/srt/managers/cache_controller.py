@@ -3917,7 +3917,11 @@ class HiCacheController:
                 from flliper.srt.mem_cache.hicache_storage import fill_protect_scope
 
                 _rd.fill_reasons_reset()
-                with fill_protect_scope(self.storage_backend, operation):
+                from flliper.srt.pdflip import room_wait_arbiter as _arbiter
+
+                with fill_protect_scope(self.storage_backend, operation), \
+                        _arbiter.fill_scope(getattr(operation, "request_id", None), operation):
+                    # ROOM-ARBITER 1016 (F3): the fill's room wait knows its request (PP0 picks the oldest)
                     # REF-AT-LAND-1014: the fill references every page as it lands;
                     # those references are ours (taken below instead of a ref here)
                     try:

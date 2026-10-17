@@ -250,3 +250,59 @@ def sweep_memo_hit(scheduler, tree_cache) -> bool:
     means the tree and the arena are exactly as futile as they were."""
     stamp = getattr(scheduler, "_pdflip_flush_sweep_memo", None)
     return stamp is not None and stamp == inflight_count(tree_cache)
+
+
+# ---- F5c (NF-PGAP 1016): what goes into the reset un-backed, named -----------------
+
+LINE_UNBACKED = "#1470 FLUSH-UNBACKED"
+
+
+def unbacked_census(tree_cache) -> dict:
+    """Device nodes whose KV is neither on the host (``backuped``) nor in the store (``l3_present``) -- the reset
+    drops their KV and a later request recomputes it. The sweep's own predicate (``publish_unbacked_sweep``);
+    ``pending`` = of those, a write-through still in flight. Read-only."""
+    out = {"nodes": 0, "tokens": 0, "pending": 0, "ids": []}
+    walk = getattr(tree_cache, "_collect_all_nodes", None)
+    if not callable(walk):
+        return out
+    try:
+        from flliper.srt.mem_cache.unified_radix_cache import BASE_COMPONENT_TYPE
+    except Exception:  # noqa: BLE001
+        return out
+    root = getattr(tree_cache, "root_node", None)
+    for node in walk():
+        if node is root or getattr(node, "evicted", False) or getattr(node, "backuped", False) \
+                or getattr(node, "l3_present", False):
+            continue
+        try:
+            if node.component_data[BASE_COMPONENT_TYPE].value is None:
+                continue
+        except Exception:  # noqa: BLE001
+            continue
+        out["nodes"] += 1
+        out["tokens"] += len(getattr(node, "key", ()) or ())
+        if getattr(node, "write_through_pending_id", None) is not None:
+            out["pending"] += 1
+        if len(out["ids"]) < 16:
+            out["ids"].append(getattr(node, "id", "?"))
+    return out
+
+
+_UNBACKED_N = [0, 0]   # resets seen, resets with un-backed KV
+
+
+def note_unbacked_at_reset(tree_cache, site: str = "flush", paused: int = -1, open_ms: float = -1.0) -> dict:
+    """F5c: one line per reset that drops un-backed KV (and the denominator every 64th clean reset), so the store
+    loss of a sleep reset is measured, never silent."""
+    c = unbacked_census(tree_cache)
+    _UNBACKED_N[0] += 1
+    if c["nodes"]:
+        _UNBACKED_N[1] += 1
+    if c["nodes"] or _UNBACKED_N[0] % 64 == 1:
+        (logger.warning if c["nodes"] else logger.info)(
+            "%s site=%s nodes=%d tokens=%d pending=%d ids=%s resets=%d with_unbacked=%d paused_sweeps=%d "
+            "quiesce_open_ms=%.0f (device KV neither on the host nor in the store goes with this reset -- a later "
+            "request recomputes it; paused_sweeps = bubble sweeps the open quiesce left to the #1470 loop)",
+            LINE_UNBACKED, site, c["nodes"], c["tokens"], c["pending"], c["ids"], _UNBACKED_N[0], _UNBACKED_N[1],
+            int(paused), float(open_ms))
+    return c

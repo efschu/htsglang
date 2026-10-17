@@ -7897,6 +7897,15 @@ class Scheduler(
         request's verdict rather than the boot's running total, in the fixed
         attribution order `PREFETCH_DECLINE_ORDER`.
         """
+        # ROOM-ARBITER PRIO 1016: the request's priority for the fill's room-wait order (PRIO = ALTER: priority
+        # descending, then arrival); process-local, read by the prefetch io thread when its fill registers
+        try:
+            from flliper.srt.pdflip import prio_age as _pa
+            from flliper.srt.pdflip import room_wait_arbiter as _arbiter
+
+            _arbiter.note_priority(req.rid, _pa.lane_of_req(req))
+        except Exception:  # noqa: BLE001 - an order hint never breaks the intake
+            pass
         # #1068 (slice 4): the denominator sits at the FUNCTION boundary, not
         # at one call site: the A12.2 retry (`_retry_deferred_prefetches`) and
         # the #946 escape enter here too, and a denominator that missed them
@@ -20705,12 +20714,16 @@ class Scheduler(
         # write-back drain), then reset.  FLLIPER_HICACHE_FLUSH_PUBLISH_SWEEP=0
         # restores the old form.
         self._pdflip_last_flush_refusal = ""  # QUIESCE-PENDING: only THIS flush's refusal names a lap
+        from flliper.srt.managers import pdflip_bubble_publish as _f5_bubble
+
         if (
             self.enable_hierarchical_cache
             and os.environ.get("FLLIPER_HICACHE_FLUSH_PUBLISH_SWEEP", "1") != "0"
             and self.running_batch.is_empty()
             and self.chunked_req is None and not getattr(self, "anchor_tails", None)
         ):
+            # F5a (NF-PGAP 1016): the quiesce is open -- the bubble publisher pauses, the #1470 loop publishes alone
+            _f5_bubble.quiesce_begin(self)
             _sweep = getattr(self.tree_cache, "publish_unbacked_sweep", None)
             _wc = getattr(self.tree_cache, "writing_check", None)
             if _sweep is not None:
@@ -20843,6 +20856,18 @@ class Scheduler(
             # second, D's store read short by 11776 tokens.  Join them first.
             self._pdflip_join_store_writes_before_reset()
             self._pdflip_note_lost_anchors()
+            # F5c (NF-PGAP 1016): what goes into this reset un-backed, named (measured, never silent)
+            if self.enable_hierarchical_cache:
+                try:
+                    _pdflip_flush_nonblock.note_unbacked_at_reset(
+                        self.tree_cache, site="flush",
+                        paused=int(getattr(self, "_pdflip_quiesce_paused", 0) or 0)
+                        if getattr(self, "_pdflip_quiesce_open", False) else 0,
+                        open_ms=(time.monotonic() - float(getattr(self, "_pdflip_quiesce_t0", time.monotonic()))) * 1000.0
+                        if getattr(self, "_pdflip_quiesce_open", False) else 0.0)
+                except Exception:  # noqa: BLE001 - an instrument never blocks the reset
+                    logger.warning("#1470 FLUSH-UNBACKED census raised", exc_info=True)
+            _f5_bubble.quiesce_end(self, "reset")
             self.cur_batch_for_debug = None
             self.last_batch = None
             if _pdflip_release_reset_redundant(self, zero_kv):
