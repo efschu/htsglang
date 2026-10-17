@@ -208,6 +208,33 @@ class K20Case(unittest.TestCase):
         ch0 = self.s0.__dict__["_weg2_fb_channel"]
         self.assertIn(1, ch0._sleeping)
 
+    def test_bye_of_an_older_epoch_after_the_wake_is_discarded(self):
+        """K20d: a bye of sleep epoch n that reaches PP0 only after PP0's wake (epoch n+1) must not make PP0 treat the
+        awake follower as asleep: discarded (counter), the follower's later sends complete, open_sends 0."""
+        os.environ["SGLANG_WEG2_PF_WAKE_DRAIN_S"] = "0.05"
+        self.addCleanup(os.environ.pop, "SGLANG_WEG2_PF_WAKE_DRAIN_S", None)
+        ch0 = self.s0.__dict__["_weg2_fb_channel"]
+        ch1 = self.s1.__dict__["_weg2_fb_channel"]
+        self._ack(self.s1, "hangs")  # PP0 has no receive posted: blocks
+        self.net.sender = 1
+        wtf.sleep_quiesce(self.s1, budget_s=0.05)  # bye pending behind it
+        self.assertTrue(ch1._bye_pending)
+        wtf.sleep_quiesce(self.s0, budget_s=0.2)  # PP0's leg: takes the hung ack, bye still missing
+        wtf.wake(self.s0)  # PP0 awake in epoch 2 BEFORE the bye leaves
+        self.assertEqual(ch0.wakes, 1)
+        for _ in range(4):
+            self.net.sender = 1
+            ch1.pump()
+            ch0.harvest()
+            time.sleep(0.02)
+        self.assertEqual(ch0.byes_stale, 1)
+        self.assertNotIn(1, ch0._sleeping)
+        wtf.wake(self.s1)
+        self._ack(self.s1, "after")
+        got = self._drain(ch0, 1)
+        self.assertEqual(got[0].reads[0][0], "after")
+        self.assertEqual(ch1.open_sends(), 0)
+
     def _quiesce_all(self):
         out = {}
 

@@ -352,6 +352,8 @@ class Weg2StreamControl:
 
     rank: int
     kind: str  # "bye" | "beat"
+    #: K20d: sleep epoch of a bye (= the sender's wake count + 1); PP0 takes a bye only of ITS current epoch. -1 = none.
+    epoch: int = -1
 
 
 #: K20: an idle follower completes PP0's standing receive at least this often (s); 0 = off. Vorgabe AN. Far below the
@@ -413,6 +415,9 @@ class GlooAckChannel:
         self._sleeping: set = set()
         self._last_post = time.monotonic()
         self.byes_taken = 0
+        #: K20d: wakes seen by this rank (lockstep on every rank: one per resume leg); a bye is stamped wakes+1
+        self.wakes = 0
+        self.byes_stale = 0
         #: K20b: follower: after its own bye NO send leaves until wake (a send without a posted receive blocks 7200 s)
         self._gated = False
         #: K20c: the bye could not be posted inside the budget (an earlier send still hangs): pump() posts it
@@ -435,7 +440,7 @@ class GlooAckChannel:
         if self._inflight is None:
             if beat and self._bye_pending:
                 self._bye_pending = False
-                if not self.send_nowait(Weg2StreamControl(rank=self.pp_rank, kind="bye")):
+                if not self.send_nowait(Weg2StreamControl(rank=self.pp_rank, kind="bye", epoch=self.wakes + 1)):
                     self._bye_pending = True
             elif beat and self._beat_due():
                 self.send_nowait(Weg2StreamControl(rank=self.pp_rank, kind="beat"))
@@ -530,7 +535,7 @@ class GlooAckChannel:
         if self.dead or self.pp_rank == 0:
             return True
         end = time.monotonic() + budget_s
-        msg = Weg2StreamControl(rank=self.pp_rank, kind="bye")
+        msg = Weg2StreamControl(rank=self.pp_rank, kind="bye", epoch=self.wakes + 1)
         while not self.send_nowait(msg):
             if time.monotonic() >= end:
                 # an earlier send still hangs: the bye is NOT posted. Gate, but remember it; pump() posts it as soon
@@ -581,6 +586,7 @@ class GlooAckChannel:
                                  n - len(self._sleeping))
             self._bye_missing = False
             self._sleeping.clear()
+        self.wakes += 1  # K20d: after the drain (a late bye of THIS sleep is still current while draining)
 
     def harvest(self) -> List[Any]:
         out: List[Any] = []
@@ -594,6 +600,12 @@ class GlooAckChannel:
                         break
                     item = frame.take()
                     if isinstance(item, Weg2StreamControl):
+                        if item.kind == "bye" and item.epoch not in (-1, self.wakes + 1):
+                            self.byes_stale += 1
+                            logger.warning(
+                                "WEG2 PP-RECEIVE-CENSUS %s: STALE bye from pp%d epoch=%d (PP0 expects %d) discarded; "
+                                "the follower is awake", self.label, r, item.epoch, self.wakes + 1)
+                            continue
                         if item.kind == "bye":
                             self._sleeping.add(r)
                             self.byes_taken += 1
