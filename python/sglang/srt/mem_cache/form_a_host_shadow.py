@@ -103,6 +103,11 @@ SPILL = "spill"
 #: complete page) -- every worker sets ``l3_present`` from this, never from its
 #: own ack, so no rank reads a different ``l3_present`` for the same node
 L3 = "l3"
+#: K21 (raenge-nie-uneins-crash-stop, nf-nachreview-h16v-1017 N1): TP0's own drain ack made
+#: this node an A2 orphan. Sent at EVERY TP0 orphan ack (also when the host release then
+#: fails), so a worker can compare it with its OWN orphan mark in both directions -- the
+#: orphan verdict is rank-local (each rank acks against the shared arena at its own time).
+K21 = "k21"
 
 #: #239 S4b part 4: broadcasts TP0 waits for an incomplete token-cut page
 #: before it falls back to the ack's pre-cut decision (a write of every owner
@@ -145,7 +150,12 @@ class _State:
         self.absent: set = set()
         # K21 A1: node keys whose own drain ack made them an A2 orphan on THIS rank
         # (same event on every rank); a STATE for such a key must reconcile to "kv"
-        self.k21_keys: set = set()
+        # value = handover counter at the mark, -1 once TP0's K21 confirmed it (worker side)
+        self.k21_keys: Dict[Tuple[str, int], int] = {}
+        # keys TP0 reported as orphan while this worker has NO mark: its STATE must end 'kv'
+        self.k21_expect: set = set()
+        # number of broadcasts consumed on this rank (the "handover" the K21 rule counts in)
+        self.handover_n = 0
         self.tree: Any = None
         # #239 S4b part 4 (TP0 only): nodes whose token-cut page was not yet
         # complete at TP0's ack -> [node, passes waited, fallback transit]
@@ -331,13 +341,42 @@ class K21RankDivergence(RuntimeError):
 
 
 def note_k21_orphan(node: Any) -> None:
-    """The drain ack of ``node`` orphaned it on this rank (every role): remember its content key
-    so the STATE of the republish is checked against the group-uniform outcome."""
+    """The drain ack of ``node`` orphaned it on this rank (every role). The orphan verdict is
+    rank-local, so it is compared in both directions (N1):
+
+    * TP0 sends a K21 event at EVERY own orphan ack (even if the host release then fails);
+    * a worker keeps a mark; TP0's K21 in the next handover confirms it, no K21 there is the
+      named stop ``K21RankDivergence`` (see :func:`consume`); a K21 without a mark makes the
+      STATE of that key have to end ``kv`` (see :func:`apply`)."""
     if not shadow_active():
         return
     k = node_key(node)
-    if k is not None:
-        _S.k21_keys.add(k)
+    if k is None:
+        return
+    if role() == "host":
+        _announce("host")
+        _S.ledger.append((K21, k[0], k[1], 1, 0, 0))
+    else:
+        _S.k21_keys[k] = _S.handover_n
+
+
+def _k21_stop(msg: str) -> None:
+    logger.error("K21 RANK-DIVERGENCE %s -- group stop (raenge-nie-uneins-crash-stop)", msg)
+    raise K21RankDivergence("K21: " + msg)
+
+
+def _k21_age_check() -> None:
+    """Worker, after a handover: a mark of its OWN that TP0's K21 did not confirm by now
+    (one handover after the mark) means the worker orphaned a node TP0 did not."""
+    if not _S.k21_keys:
+        return
+    for k, n in list(_S.k21_keys.items()):
+        if n >= 0 and _S.handover_n - n >= 1:
+            _S.k21_keys.pop(k, None)
+            _k21_stop(
+                f"this worker's ack orphaned node hash={str(k[0])[:16]} depth={k[1]} but TP0 sent no "
+                f"K21 in the next handover (marked at handover {n}, now {_S.handover_n}): the ranks' "
+                "trees diverge (only this rank kept the node on the device)")
 
 
 def _pkey(e) -> tuple:
@@ -346,7 +385,7 @@ def _pkey(e) -> tuple:
     is a fact about the store, not a host decision: a TRANSIT or REBIND of the
     same node in the same pass must not drop it."""
     k = (e[1], int(e[2]))
-    return k + (L3,) if e[0] == L3 else k
+    return k + (e[0],) if e[0] in (L3, K21) else k
 
 
 def l3_group_on(env=None) -> bool:
@@ -549,15 +588,27 @@ def attach(recv_reqs: List) -> List:
     n = _note("sent")
     if n:
         kinds = [e[0] for e in v.events]
-        logger.info("R12 HOST-VERDICT SENT seq=%d events=%d transit=%d state=%d rebind=%d spill=%d l3=%d (n=%d)",
+        logger.info("R12 HOST-VERDICT SENT seq=%d events=%d transit=%d state=%d rebind=%d spill=%d l3=%d k21=%d (n=%d)",
                     v.seq, len(v.events), kinds.count(TRANSIT), kinds.count(STATE),
-                    kinds.count(REBIND), kinds.count(SPILL), kinds.count(L3), n)
+                    kinds.count(REBIND), kinds.count(SPILL), kinds.count(L3), kinds.count(K21), n)
     return [v] + list(recv_reqs)
 
 
 def consume(recv_reqs: Optional[List], tree: Any = None) -> Optional[List]:
     """Every rank, right after the broadcast: take the verdicts out of the
     list and apply them before any request of this pass is processed."""
+    _S.handover_n += 1
+    return _consume(recv_reqs, tree)
+
+
+def _consume(recv_reqs: Optional[List], tree: Any = None) -> Optional[List]:
+    out = _consume_apply(recv_reqs, tree)
+    if role() == "worker":
+        _k21_age_check()
+    return out
+
+
+def _consume_apply(recv_reqs: Optional[List], tree: Any = None) -> Optional[List]:
     if not recv_reqs:
         if _S.pending and (tree or _S.tree) is not None:
             apply(tree or _S.tree, [])
@@ -591,7 +642,8 @@ def on_tree_reset(tree: Any) -> None:
     _S.ledger = []
     _S.pending = {}
     _S.absent = set()
-    _S.k21_keys = set()
+    _S.k21_keys = {}
+    _S.k21_expect = set()
     _S.rebind_wait = {}
 
 
@@ -639,11 +691,33 @@ def apply(tree: Any, events: List, seq: int = 0) -> Dict[str, int]:
     work = list(_S.pending.values())
     _S.pending = {}
     idx = _index(tree)
+    state_keys = {(e[1], int(e[2])) for e in work if e[0] == STATE}
     for e in work:
         kind, h, depth, exists, kv, m = e
         node = _find(idx, h, depth)
         if node is None:
+            if kind == K21:
+                _S.k21_keys.pop((h, int(depth)), None)
             c["missing"] += 1
+            continue
+        if kind == K21:
+            if r != "worker":
+                continue  # TP0 is the source
+            k21k = (h, int(depth))
+            if k21k in _S.k21_keys:
+                if k21k in state_keys:
+                    _S.k21_keys[k21k] = -1  # confirmed; the STATE apply below checks the outcome
+                else:
+                    _S.k21_keys.pop(k21k, None)  # both orphaned, TP0's release failed: agreed
+            else:
+                # TP0 orphaned the node, this worker did not: TP0 keeps it on the device; the
+                # worker must end with it on the device too, i.e. a STATE that applies 'kv'
+                if k21k not in state_keys:
+                    _k21_stop(
+                        f"TP0 orphaned node={getattr(node, 'id', '?')} depth={depth} hash={str(h)[:16]} "
+                        "(kept on the device), this worker did not and no STATE follows: trees diverge")
+                _S.k21_expect.add(k21k)
+            c["noop"] += 1
             continue
         if kind == TRANSIT:
             if cut and _busy(tree, node):
@@ -696,8 +770,15 @@ def apply(tree: Any, events: List, seq: int = 0) -> Dict[str, int]:
         out = _reconcile(tree, node, exists, kv, m)
         if out == "pending":
             _S.pending[(h, int(depth))] = e
+        elif (h, int(depth)) in _S.k21_expect:
+            _S.k21_expect.discard((h, int(depth)))
+            if out != "kv":
+                _k21_stop(
+                    f"TP0 orphaned node={getattr(node, 'id', '?')} depth={depth} hash={str(h)[:16]} "
+                    f"(kept on the device), this worker did not orphan it and its STATE apply ended "
+                    f"{out!r} instead of 'kv' (seq={int(seq)}): trees diverge")
         elif (h, int(depth)) in _S.k21_keys:
-            _S.k21_keys.discard((h, int(depth)))
+            _S.k21_keys.pop((h, int(depth)), None)
             if out in ("deleted", "unreconcilable"):
                 logger.error(
                     "K21 RANK-DIVERGENCE seq=%d node=%s depth=%s hash=%s out=%s: TP0 republished "
