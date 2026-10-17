@@ -68,7 +68,7 @@ class AForeseeableFlipYields(unittest.TestCase):
 
     def test_default_on_and_wired_into_the_short_seat(self):
         self.assertTrue(envs.SGLANG_WEG2_ENABLE_D_DIRECT_YIELD.get())
-        src = inspect.getsource(front.Front._acquire_short_seat)
+        src = inspect.getsource(front.Front._acquire_short_seat_core)  # h16u S1: body moved into the core (the wrapper only classifies + logs)
         self.assertEqual(src.count("self._d_direct_yields(rid, uncached=uncached)"), 2)
 
 

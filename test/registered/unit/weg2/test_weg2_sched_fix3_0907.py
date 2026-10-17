@@ -1321,7 +1321,7 @@ def test_a12_neither_admission_path_awaits_the_read_as_an_argument():
     A test that only exercises ``_d_reading_if_armed`` cannot see a call site
     that goes back to awaiting ``_d_pool_reading`` inline -- and that inline
     await is the entire defect, because argument evaluation happens first."""
-    for meth in (Front._acquire_short_seat, Front.d_admitter):
+    for meth in (Front._acquire_short_seat_core, Front.d_admitter):  # h16u S1: the short seat's body lives in the core
         tree = _fn_ast(meth)
         assert not _calls_named(tree, "_d_pool_reading"), (
             f"{meth.__name__} must obtain the reading through "
