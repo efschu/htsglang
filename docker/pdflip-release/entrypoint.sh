@@ -809,7 +809,8 @@ if _miss:
     print("SELFCHECK FEHLER: vorgebaute Erweiterungen liegen nicht dort, wo torch zur Laufzeit sucht -- erster Boot baut neu")
     raise SystemExit(1)
 print("tvm-ffi Saat:", len(list((pathlib.Path.home() / ".cache/tvm-ffi").glob("*"))), "Eintraege")
-tms = [p.name for p in pathlib.Path(os.environ["SGLANG_WEG2_TMS_OUT_DIR"]).glob("*.so")]
+# the flliper import folds the legacy env spellings onto FLLIPER_PDFLIP_* (srt/name_compat.py), so read both
+tms = [p.name for p in pathlib.Path(os.environ.get("FLLIPER_PDFLIP_TMS_OUT_DIR") or os.environ.get("SGLANG_WEG2_TMS_OUT_DIR") or "/opt/htsglang/tms").glob("*.so")]
 print("tms preload:", tms)
 cu13 = pathlib.Path(os.environ.get("SGLANG_WEG2_VENV", "/opt/venv")) / "lib/python3.12/site-packages/nvidia/cu13/lib"
 print("cu13 libcudart.so (Rig-Link):", (cu13 / "libcudart.so").exists())
