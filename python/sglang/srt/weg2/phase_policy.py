@@ -265,7 +265,8 @@ def park_body(epoch: int, bound_s: float, reason: Optional[str] = None) -> dict:
 
 def needs_p(est_uncached: int, x_tokens: int, *, skip_leg1: bool = False,
             leg1_done: bool = False, p_only: bool = False, x_requeues: int = 0,
-            x_deferred: bool = False, x_routed: int = 0) -> bool:
+            x_deferred: bool = False, x_routed: int = 0, handoff_lost_reroutes: int = 0,
+            reroutes: int = 0) -> bool:
     """Does this queued request need P's prefill (the immediate park's
     trigger)? ``est_uncached > X`` (law 4: D never prefills above X), a
     P-only request (an image under transient vision, long by rule), or one D
@@ -282,6 +283,10 @@ def needs_p(est_uncached: int, x_tokens: int, *, skip_leg1: bool = False,
         return False
     if p_only or int(x_requeues or 0) > 0 or x_deferred:
         return True  # x_deferred: over X_busy, the X in force while D decodes (PK2)
+    if int(handoff_lost_reroutes or 0) > 0 or int(reroutes or 0) > 0:
+        # SOLL R9/N1: a request that MUST run on P by state (hand-off lost -> leg 1 again on P, leg-2 reroute) is P-only
+        # by state even under X: a set member that counts as big, never a starved queue entry
+        return True
     if int(x_routed or 0) > 0 and int(est_uncached) > int(x_routed):
         return True  # #246b: routed to P on this X
     return int(est_uncached) > int(x_tokens)
@@ -297,7 +302,9 @@ def immediate_park_trigger(queue: Iterable, x_tokens: int):
                    p_only=bool(getattr(p, "p_only", False)),
                    x_requeues=int(getattr(p, "x_requeues", 0) or 0),
                    x_deferred=bool(getattr(p, "x_deferred", False)),
-                   x_routed=int(getattr(p, "x_routed", 0) or 0)):
+                   x_routed=int(getattr(p, "x_routed", 0) or 0),
+                   handoff_lost_reroutes=int(getattr(p, "handoff_lost_reroutes", 0) or 0),
+                   reroutes=int(getattr(p, "reroutes", 0) or 0)):
             return p
     return None
 

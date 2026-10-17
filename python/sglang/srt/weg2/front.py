@@ -11110,12 +11110,18 @@ class Front:
         t_in = time.time()
         if refused is None:
             refused = []
+        try:
+            _seats0 = self._set_seats_free()
+        except Exception:  # noqa: BLE001
+            _seats0 = 1
         seat = await self._acquire_short_seat_core(rid, est_tokens, refused, max_tokens, uncached, x_set, t_in)
         _unc = int(uncached) if uncached is not None else 0
         _x = int(x_set) if x_set else int(self.tp_prefill_max_tokens)
         if phase_policy.classify_arrival(_unc, _x, Front._set_cfg()[0], False) == phase_policy.CLASS_KURZ:
             if seat is not None:
-                self._set_kurz_now(rid, _unc, _x, waited=time.time() - t_in)
+                _w = time.time() - t_in
+                # SOLL R5 (corrected): a kurz request waits for a D seat when D had none -- named, not an R2 finding
+                self._set_kurz_now(rid, _unc, _x, waited=_w, why="seat_wait" if (_w > 0.5 and _seats0 <= 0) else "R2")
             else:
                 self._set_kurz_now(rid, _unc, _x, waited=time.time() - t_in,
                                    why="d_budget" if "d_budget" in refused else "yield_or_gate",

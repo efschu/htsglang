@@ -18,21 +18,24 @@
 #   MA8  R7  the work-exhausted flip path flips for a queue under X
 #   MB3  R6  a REROUTE_P leaves the waiting D-line entries behind
 #   MB6  R7  a budget-refused short never goes back to D
+#   MN1  R9  P-by-state entries (hand-off lost / reroute) no longer need P (starve under FLIP-HELD)
 #   M10  R3  a decided flip is re-collected on the next tick (a second T_halb)
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=${ROOT:-$(cd "$HERE/../../../.." && pwd)}
 FR=$ROOT/python/sglang/srt/weg2/front.py
+PP=$ROOT/python/sglang/srt/weg2/phase_policy.py
+BAKP=$(mktemp); cp "$PP" "$BAKP"
 TESTS=test/registered/unit/weg2/test_weg2_set_scheduler_1017.py
 GED=${GED:-/spinning/gpu-arb/pytest_gedeckelt.sh}
 BAK=$(mktemp)
 cp "$FR" "$BAK"
-trap 'cp "$BAK" "$FR"' EXIT
+trap 'cp "$BAK" "$FR"; cp "$BAKP" "$PP"' EXIT
 
 run_suite() { (cd "$ROOT" && CUDA_VISIBLE_DEVICES="" "$GED" "$TESTS" -x -p no:warnings >/dev/null 2>&1); }
 
 mutate() {
-  python3 - "$FR" "$1" "$2" <<'PY'
+  python3 - "${TARGET:-$FR}" "$1" "$2" <<'PY'
 import sys
 path, old, new = sys.argv[1], sys.argv[2], sys.argv[3]
 s = open(path).read()
@@ -91,11 +94,14 @@ OLD[MB6]='                        p.d_eligible = True
                         p.d_budget_refused = False'
 NEW[MB6]='                        p.d_budget_refused = False'
 
+OLD[MN1]='    if int(handoff_lost_reroutes or 0) > 0 or int(reroutes or 0) > 0:'
+NEW[MN1]='    if False:'
+
 run_suite || { echo "BASELINE RED -- fix the tests first"; exit 2; }
 survivors=0
-for m in M2 M2y M3 M4 M5 M6 M7 M7b M8 M10 MA2 MA3 MA5 MA8 MB3 MB6; do
+for m in M2 M2y M3 M4 M5 M6 M7 M7b M8 M10 MA2 MA3 MA5 MA8 MB3 MB6 MN1; do
   [ -n "${ONLY:-}" ] && [ "$ONLY" != "$m" ] && continue
-  cp "$BAK" "$FR"
+  cp "$BAK" "$FR"; cp "$BAKP" "$PP"; TARGET=$FR; [ "$m" = MN1 ] && TARGET=$PP
   mutate "${OLD[$m]}" "${NEW[$m]}" || { echo "$m: ANCHOR LOST"; survivors=$((survivors+1)); continue; }
   if run_suite; then echo "$m: SURVIVED"; survivors=$((survivors+1)); else echo "$m: killed"; fi
 done

@@ -82,11 +82,14 @@ def test_short_waiting_is_r2(W):
     assert art_of(W, w="0.0", **{**kw, "verdict": "COLLECT"}) == "R2"     # nor collect
 
 
-def test_not_d_of_a_kurz_request_is_r2(W):
-    """A6: a kurz request the front did not admit on D (yield / d_budget) is a parsed verdict and an R2 finding."""
-    kw = dict(S=300, n=1, members="a:300", classes="kurz", verdict="NOT_D", why="d_budget")
-    assert art_of(W, w="0.0", **kw) == "R2"
-    assert art_of(W, w="2.0", **{**kw, "why": "yield_or_gate"}) == "R2"
+def test_not_d_and_seat_wait_are_allowed_reasons_but_an_unexplained_wait_is_r2(W):
+    """R5 (corrected): NOT_D with a reason and D_NOW why=seat_wait are no R2 findings; waiting without a reason is."""
+    kw = dict(S=300, n=1, members="a:300", classes="kurz")
+    assert art_of(W, w="0.0", verdict="NOT_D", why="d_budget", **kw) is None
+    assert art_of(W, w="2.0", verdict="NOT_D", why="yield_or_gate", **kw) is None
+    assert art_of(W, w="0.0", verdict="NOT_D", why="mystery", **kw) == "R2"
+    assert art_of(W, w="3.0", verdict="D_NOW", why="seat_wait", **kw) is None
+    assert art_of(W, w="3.0", verdict="D_NOW", why="R2", **kw) == "R2"
 
 
 def test_collect_is_no_decision(W):

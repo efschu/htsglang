@@ -537,7 +537,7 @@ def test_a6_a_kurz_that_is_not_admitted_logs_the_reason(monkeypatch, caplog):
     assert "verdict=NOT_D why=d_budget" in line and "waited_s=" in line, line
 
 
-def test_a8_a_queue_under_x_is_no_flip_reason(monkeypatch, caplog):
+def test_a8_a_queue_under_x_is_no_flip_reason(monkeypatch, caplog):  # (a P-by-state orphan is N1, below)
     """R7/A8: small work D could not take; the work-exhausted path does not flip for it (no WAIT-BOUND-ANY flip either)."""
     _on(monkeypatch)
     f = _fx(running=())
@@ -610,3 +610,53 @@ def test_b6_a_short_the_d_budget_refused_goes_back_to_d_when_the_budget_frees_ne
     assert (wf, imm) == (False, None)
     assert f._ready_for_d == [p] and p.d_direct is True and p not in f.queue
     assert f.counters["d_budget_refused_back_to_d"] == 1
+
+
+def _orphan(now, age):
+    o = _pending("lost", 2000, now - age)
+    o.d_eligible = o.d_direct = o.leg1_done = o.intake_stalled = False
+    o.reroutes, o.handoff_lost_reroutes = 0, 1       # HANDOFF-LOST-REROUTE: leg 1 runs again on P, never a D prefill
+    return o
+
+
+def test_n1_an_orphan_p_by_state_under_x_flips_at_once_on_an_idle_d(monkeypatch, caplog):
+    """R9/R8: a request that must run on P by state is p_only = big; D idle -> flip now (was FLIP-HELD for ever)."""
+    _on(monkeypatch)
+    f = _fx(running=())
+    now = time.time()
+    f.queue = [_orphan(now, 70.0)]
+    with caplog.at_level(logging.INFO, logger="weg2.front"):
+        wf, _fair, imm = asyncio.run(f._arrival_seat_step(f.groups["D"], now))
+    assert wf is True and imm is not None and imm.rid == "lost"
+    assert any("classes=p_only" in m and "verdict=FLIP_P" in m for m in _verdicts(caplog))
+    assert f.counters["flip_held_under_x"] == 0
+
+
+def test_n1_an_orphan_p_by_state_waits_t_half_on_a_decoding_d_then_flips(monkeypatch):
+    _on(monkeypatch)
+    f = _fx()
+    now = time.time()
+    f.queue = [_orphan(now, 0.5)]
+    wf, _fair, imm = asyncio.run(f._arrival_seat_step(f.groups["D"], now))
+    assert (wf, imm) == (False, None), "R4: waits for company"
+    wf, _fair, imm = asyncio.run(f._arrival_seat_step(f.groups["D"], now + 4.6))
+    assert wf is True and imm.rid == "lost"
+    assert f._set_flip_justified(now + 4.7) is True
+
+
+def test_n1_seat_wait_is_named_in_the_d_now_line(monkeypatch, caplog):
+    _on(monkeypatch)
+    f = _front(running=["a"], n=1, kv={"available": 400000, "evictable": 0})
+    f.tp_prefill_max_tokens = X
+    f.t_awake = time.time() - 60.0
+
+    async def run():
+        t = asyncio.ensure_future(f._acquire_short_seat("k", 400, uncached=400))
+        await asyncio.sleep(0.7)
+        f.groups["D"].outstanding.pop("a")
+        return await asyncio.wait_for(t, 3.0)
+
+    with caplog.at_level(logging.INFO, logger="weg2.front"):
+        assert asyncio.run(run()) is not None
+    (line,) = _verdicts(caplog)
+    assert "verdict=D_NOW why=seat_wait" in line, line

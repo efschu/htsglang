@@ -58,7 +58,12 @@ def check(v):
     if verdict == "COLLECT":
         return "R2" if cls == ["kurz"] else None
     if cls == ["kurz"] or all(c == "kurz" for c in cls):
-        if verdict != "D_NOW" or v["waited_s"] > KURZ_WAIT_S:
+        # R5 (corrected 17.10.): waiting for a D seat (why=seat_wait) or a refusal for budget / a decided flip
+        # (NOT_D why=d_budget|yield_or_gate) is allowed; a kurz request that waits WITHOUT such a reason is R2
+        if verdict == "NOT_D":
+            if v["why"].split()[0] not in ("d_budget", "yield_or_gate"):
+                return "R2"
+        elif verdict != "D_NOW" or (v["waited_s"] > KURZ_WAIT_S and v["why"].split()[0] != "seat_wait"):
             return "R2"
         return "R6" if S > X else None      # D-Prefill ueber X (S schliesst einen laufenden D-Prefill ein)
     if verdict in ("FLIP_P", "REROUTE_P"):
