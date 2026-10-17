@@ -72012,9 +72012,12 @@
    "default": "True",
    "depends": [
     {
+     "baeume": [
+      "nf"
+     ],
      "beleg": {
       "anker": "R6: what D prefills right now counts into S",
-      "aufloesung": "veraltet",
+      "aufloesung": "andere_linie",
       "datei": "python/sglang/srt/weg2/front.py",
       "zeile": 11352,
       "zeile_hinweis": 11352
@@ -88817,26 +88820,20 @@
  },
  "kanten": {
   "beleg_aufloesung": {
-   "problem": [
-    "K135"
-   ],
+   "problem": [],
    "status": {
-    "andere_linie": 6,
+    "andere_linie": 7,
     "eindeutig": 119,
-    "nah": 12,
-    "veraltet": 1
+    "nah": 12
    }
   },
   "beleg_aufloesung_baeume": {
    "27b": {
-    "problem": [
-     "K135"
-    ],
+    "problem": [],
     "status": {
-     "andere_linie": 6,
+     "andere_linie": 7,
      "eindeutig": 119,
-     "nah": 12,
-     "veraltet": 1
+     "nah": 12
     }
    },
    "nf": {
@@ -88893,7 +88890,7 @@
   "kuratiert": 125,
   "unerklaert": 644
  },
- "tree_rev": "27b=02123ee2ef+nf=98ef554eff",
+ "tree_rev": "27b=02123ee2ef+nf=5f1a289728",
  "trees": {
   "27b": {
    "entries": 2641,
@@ -88901,7 +88898,7 @@
   },
   "nf": {
    "entries": 2604,
-   "rev": "98ef554eff"
+   "rev": "5f1a289728"
   }
  },
  "warnungen": []
