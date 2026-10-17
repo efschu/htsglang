@@ -45,6 +45,7 @@ class _Case(CustomTestCase):
         # the fake clock restarts at 5000 in every test: spans of an earlier test
         # of this process would overlap its windows
         del weg2_idle_vote._OWN_WORK_SPANS[:]
+        _STATES.clear()
         weg2_idle_vote._OWN_WORK_OPEN[0] = None
         p = mock.patch("time.monotonic", new=self.clock)
         p.start()
@@ -54,19 +55,56 @@ class _Case(CustomTestCase):
         self.addCleanup(p.stop)
 
 
+import contextlib  # noqa: E402
+
+_STATES = {}
+
+
+@contextlib.contextmanager
+def as_rank(r):
+    """The model runs three ranks in ONE process, but own_work's clock and span list are per-PROCESS state on metal:
+    swap them per rank, so a follower's sweep is never PP0's own work (the harness conflated them, which is how the
+    first version of this test was green on the unfixed tree)."""
+    st = _STATES.setdefault(r, [0.0, [], None])
+    saved = (weg2_idle_vote._OWN_WORK_S[0], list(weg2_idle_vote._OWN_WORK_SPANS), weg2_idle_vote._OWN_WORK_OPEN[0])
+    weg2_idle_vote._OWN_WORK_S[0] = st[0]
+    weg2_idle_vote._OWN_WORK_SPANS[:] = st[1]
+    weg2_idle_vote._OWN_WORK_OPEN[0] = st[2]
+    try:
+        yield
+    finally:
+        st[0] = weg2_idle_vote._OWN_WORK_S[0]
+        st[1] = list(weg2_idle_vote._OWN_WORK_SPANS)
+        st[2] = weg2_idle_vote._OWN_WORK_OPEN[0]
+        weg2_idle_vote._OWN_WORK_S[0] = saved[0]
+        weg2_idle_vote._OWN_WORK_SPANS[:] = saved[1]
+        weg2_idle_vote._OWN_WORK_OPEN[0] = saved[2]
+
+
 def follower_pass(g, r, sweep_s=FOLLOWER_SWEEP_S):
     """A follower pass as metal runs it: the flush handler's futile sweep (inside
     own_work, as scheduler.flush_cache wraps it), then the pass hooks."""
-    with weg2_idle_vote.own_work():
-        g.clock.advance(sweep_s)
-    g1268.run_pass(g, r)
+    with as_rank(r):
+        with weg2_idle_vote.own_work():
+            g.clock.advance(sweep_s)
+        g1268.run_pass(g, r)
+
+
+def pp0_pass(g):
+    with as_rank(0):
+        g1268.run_pass(g, 0)
+
+
+def pp0_poll(g):
+    with as_rank(0):
+        return g1268.poll(g)
 
 
 def cycle(g, sweep_s=FOLLOWER_SWEEP_S):
     """One front poll period: PP0 pass + poll (cheap sweep on PP0), then each
     follower pass pays its own futile sweep."""
-    g1268.run_pass(g, 0)
-    ok = g1268.poll(g)
+    pp0_pass(g)
+    ok = pp0_poll(g)
     for _ in range(2):          # the slot rotation: a hop takes more than one pass
         follower_pass(g, 1, sweep_s)
         follower_pass(g, 2, sweep_s)
@@ -88,13 +126,16 @@ class TheMetalSpecimen(_Case):
         the TTL (no publish work) still ages the lap out."""
         g = ow.build(self.clock)
         g.ranks[0].tree_cache.publish_unbacked_sweep = lambda **_kw: {"unbacked": 0}
-        g1268.run_pass(g, 0)
-        g1268.poll(g)
+        pp0_pass(g)
+        pp0_poll(g)
+        pp0_pass(g)                                 # stamps
         g.clock.advance(g1268._ttl_s() + 1.0)       # lying about, no work
-        g1268.run_pass(g, 1)
-        g1268.run_pass(g, 2)
-        g1268.run_pass(g, 0)
-        self.assertFalse(g1268.poll(g), "an expired lap answered")
+        with as_rank(1):
+            g1268.run_pass(g, 1)
+        with as_rank(2):
+            g1268.run_pass(g, 2)
+        pp0_pass(g)
+        self.assertFalse(pp0_poll(g), "an expired lap answered")
 
 
 class ThePureRules(_Case):
