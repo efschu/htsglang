@@ -176,6 +176,38 @@ class K20Case(unittest.TestCase):
         self.assertEqual(self._drain(ch0, 1)[0].reads[0][0], "after-late-bye")
         self.assertEqual(self._errors(), 0)
 
+    def test_bye_behind_a_hanging_send_is_posted_when_it_completes(self):
+        """K20c (Nachreview B): an earlier follower send still hangs (PP0 had no receive posted) and PP0's sleep leg is
+        slower than the follower's budget: the bye fails inside the budget but must NOT be lost -- pump() posts it once
+        the earlier send is done; PP0's census ends open=0 and its receive does not survive the sleep."""
+        import concurrent.futures as cf
+
+        ch1 = self.s1.__dict__["_weg2_fb_channel"]
+        self._ack(self.s1, "hangs")  # PP0 has posted nothing yet: this send blocks
+        self.assertEqual(ch1.open_sends(), 1)
+        self.net.sender = 1
+        self.assertFalse(wtf.sleep_quiesce(self.s1, budget_s=0.05) == 0)  # bye not posted: open_sends > 0
+        self.assertTrue(ch1._bye_pending)
+        with cf.ThreadPoolExecutor(1) as ex:
+            f0 = ex.submit(wtf.sleep_quiesce, self.s0, 8.0)  # late PP0 leg: posts, takes the hung ack, then the bye
+            t_end = time.time() + 8
+            while not f0.done() and time.time() < t_end:
+                self.net.sender = 1
+                ch1.pump()
+                self.net.sender = 2
+                self.s2.__dict__["_weg2_fb_channel"].pump()
+                self.s2.__dict__["_weg2_pr_channel"].pump()
+                self.s1.__dict__["_weg2_pr_channel"].pump()
+                time.sleep(0.01)
+            self.assertTrue(f0.done())
+            self.net.sender = 2
+            for s in (self.s2,):
+                wtf.sleep_quiesce(s, budget_s=1.0)
+        self.assertFalse(ch1._bye_pending)
+        self.assertEqual(ch1.open_sends(), 0)
+        ch0 = self.s0.__dict__["_weg2_fb_channel"]
+        self.assertIn(1, ch0._sleeping)
+
     def _quiesce_all(self):
         out = {}
 

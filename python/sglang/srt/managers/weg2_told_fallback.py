@@ -415,6 +415,8 @@ class GlooAckChannel:
         self.byes_taken = 0
         #: K20b: follower: after its own bye NO send leaves until wake (a send without a posted receive blocks 7200 s)
         self._gated = False
+        #: K20c: the bye could not be posted inside the budget (an earlier send still hangs): pump() posts it
+        self._bye_pending = False
         self.held = 0
         #: K20b: PP0: sleep_quiesce left byes missing -> wake() drains them before re-arming
         self._bye_missing = False
@@ -431,7 +433,11 @@ class GlooAckChannel:
         joined (instantly: its flag is set) only to surface its error.
         ``beat``: an idle follower posts the K20 heartbeat here (once per HEARTBEAT_S)."""
         if self._inflight is None:
-            if beat and self._beat_due():
+            if beat and self._bye_pending:
+                self._bye_pending = False
+                if not self.send_nowait(Weg2StreamControl(rank=self.pp_rank, kind="bye")):
+                    self._bye_pending = True
+            elif beat and self._beat_due():
                 self.send_nowait(Weg2StreamControl(rank=self.pp_rank, kind="beat"))
             return self._inflight is None
         if not all(pw.completed for pw, _t in self._inflight):
@@ -527,7 +533,10 @@ class GlooAckChannel:
         msg = Weg2StreamControl(rank=self.pp_rank, kind="bye")
         while not self.send_nowait(msg):
             if time.monotonic() >= end:
+                # an earlier send still hangs: the bye is NOT posted. Gate, but remember it; pump() posts it as soon
+                # as that send completes (K20c) -- PP0's receive must not stay posted through the sleep.
                 self._gated = True
+                self._bye_pending = True
                 return False
             time.sleep(0.01)
         self._gated = True
@@ -540,6 +549,8 @@ class GlooAckChannel:
     def open_sends(self) -> int:
         """Sends of this process not completed (in flight, blocked on a missing receive) -- a gated, held fact is
         not a send but counts as held."""
+        if self._bye_pending:
+            return 1
         if self._inflight is None:
             return 0
         return 0 if all(pw.completed for pw, _t in self._inflight) else 1
@@ -557,6 +568,7 @@ class GlooAckChannel:
         sleep budget is taken FIRST (bounded, ENV_WAKE_DRAIN_S) so no follower is 'asleep' through the awake phase;
         then the frames are re-armed by the next harvest."""
         self._gated = False
+        self._bye_pending = False
         if self.pp_rank == 0:
             if self._bye_missing:
                 end = time.monotonic() + _env_float(ENV_WAKE_DRAIN_S, WAKE_DRAIN_S_DEFAULT)
