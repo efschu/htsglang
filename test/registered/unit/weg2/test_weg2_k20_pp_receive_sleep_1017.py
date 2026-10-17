@@ -29,11 +29,14 @@ GLOO_TIMEOUT_S = 7200.0
 
 
 class FakeNet:
+    """In-memory gloo. A SEND completes only against a posted RECEIVE (as gloo does); a receive and a send both
+    raise after GLOO_TIMEOUT_S of VIRTUAL time from their post (review B K20: a send without a receive blocks 7200 s)."""
+
     def __init__(self):
         self.now = 0.0  # virtual gloo clock
         self.sender = 1
-        self.posted = {}  # (src, tag) -> [Work]
-        self.pending = {}  # (src, tag) -> [tensor] sent before the receive was posted
+        self.posted = {}  # (src, tag) -> [recv Work]
+        self.pending = {}  # (src, tag) -> [(tensor, send Work)]
         self.lock = threading.Lock()
 
     def irecv(self, tensor, src, group=None, tag=0):
@@ -41,24 +44,26 @@ class FakeNet:
         with self.lock:
             pend = self.pending.get((src, tag))
             if pend:
-                w.tensor.copy_(pend.pop(0).reshape(w.tensor.shape))
+                t, sw = pend.pop(0)
+                w.tensor.copy_(t.reshape(w.tensor.shape))
                 w.done.set()
+                sw.done.set()
             else:
                 self.posted.setdefault((src, tag), []).append(w)
         return w
 
     def isend(self, tensor, dst, group=None, tag=0):
         key = (self.sender, tag)
+        sw = _Work(self, tensor, self.now)
         with self.lock:
             q = self.posted.get(key) or []
             w = q.pop(0) if q else None
             if w is None:
-                self.pending.setdefault(key, []).append(tensor.clone())
+                self.pending.setdefault(key, []).append((tensor.clone(), sw))
         if w is not None:
             w.tensor.copy_(tensor.reshape(w.tensor.shape))
             w.done.set()
-        sw = _Work(self, tensor, self.now)
-        sw.done.set()
+            sw.done.set()
         return sw
 
 
@@ -70,7 +75,7 @@ class _Work:
     def wait(self, *a, **k):
         while not self.done.wait(0.002):
             if self.net.now - self.t_post >= GLOO_TIMEOUT_S:
-                raise RuntimeError("Timed out waiting 7200000ms for recv operation to complete")
+                raise RuntimeError("Timed out waiting 7200000ms for operation to complete")
         return True
 
 
@@ -119,6 +124,58 @@ class K20Case(unittest.TestCase):
             time.sleep(0.005)
         return got
 
+    def _facts(self, steps, dt):
+        """Follower passes that keep running while asleep: every pass offers a room fact + the heartbeat clock."""
+        for _ in range(steps):
+            for s in (self.s1, self.s2):
+                self.net.sender = s.ps.pp_rank
+                for key in ("_weg2_pr_channel", "_weg2_fb_channel"):
+                    ch = s.__dict__[key]
+                    ch.send_nowait(wtf.Weg2ToldReadAck(rank=s.ps.pp_rank, seq=0, reads=[]))
+                    ch.pump()
+            self.net.now += dt
+            time.sleep(0.01)
+
+    def _errors(self):
+        return sum(s.__dict__[k].errors for s in (self.s0, self.s1, self.s2) for k in ("_weg2_pr_channel", "_weg2_fb_channel"))
+
+    def test_followers_keep_passing_through_7201_sleep_seconds(self):
+        """REVIEW B / K20b: the followers' passes run on while asleep (pp-room facts every 0.5 s). After PP0's bye
+        collection no follower send may be left without a posted receive: 7201 virtual seconds, no timeout anywhere,
+        open_sends 0 on every rank."""
+        self.s0.__dict__["_weg2_fb_channel"].harvest()
+        self.s0.__dict__["_weg2_pr_channel"].harvest()
+        out = self._quiesce_all()
+        self.assertEqual(out, {0: 0, 1: 0, 2: 0})
+        for _ in range(3):
+            self.s0.__dict__["_weg2_fb_channel"].harvest()  # PP0 passes in sleep re-post nothing
+        self._facts(40, GLOO_TIMEOUT_S / 36)
+        for s in (self.s0, self.s1, self.s2):
+            for k in ("_weg2_pr_channel", "_weg2_fb_channel"):
+                self.assertEqual(s.__dict__[k].open_sends(), 0, (s.ps.pp_rank, k))
+        self.assertEqual(self._errors(), 0)
+        wtf.wake(self.s1), wtf.wake(self.s2), wtf.wake(self.s0)
+        self.assertEqual(self._errors(), 0)
+
+    def test_late_bye_is_taken_before_the_wake(self):
+        """Review B finding 7: PP0's budget ran out before the followers slept; the late bye is drained at wake, the
+        follower is not 'asleep' through the awake phase and acks flow."""
+        ch0 = self.s0.__dict__["_weg2_fb_channel"]
+        self.s0.__dict__["_weg2_pr_channel"].harvest()
+        ch0.harvest()
+        self.assertGreater(wtf.sleep_quiesce(self.s0, budget_s=0.05), 0)  # followers not asleep yet: open>0 (ERROR)
+        for s in (self.s1, self.s2):
+            self.net.sender = s.ps.pp_rank
+            wtf.sleep_quiesce(s)  # bye in flight at most until PP0 drains
+        wtf.wake(self.s1), wtf.wake(self.s2)
+        wtf.wake(self.s0)
+        self.assertEqual(len(ch0._sleeping), 0)
+        ch0.harvest()
+        self.assertEqual(ch0.open_receives(), 2)
+        self._ack(self.s1, "after-late-bye")
+        self.assertEqual(self._drain(ch0, 1)[0].reads[0][0], "after-late-bye")
+        self.assertEqual(self._errors(), 0)
+
     def _quiesce_all(self):
         out = {}
 
@@ -127,9 +184,14 @@ class K20Case(unittest.TestCase):
             out[s.ps.pp_rank] = wtf.sleep_quiesce(s)
 
         # followers first (each sends its byes with the sender id set), PP0 collects
-        for s in (self.s1, self.s2):
-            run(s)
-        run(self.s0)
+        import concurrent.futures as cf
+
+        # PP0 collects while the followers' byes leave (they complete only against PP0's posted receives)
+        with cf.ThreadPoolExecutor(1) as ex:
+            f0 = ex.submit(run, self.s0)
+            for s in (self.s1, self.s2):
+                run(s)
+            f0.result()
         return out
 
     def test_open_receive_at_sleep_is_zero_and_survives_gloo_timeout(self):
@@ -164,6 +226,7 @@ class K20Case(unittest.TestCase):
         ch0 = self.s0.__dict__["_weg2_fb_channel"]
         ch0.harvest()
         self._quiesce_all()
+        wtf.wake(self.s1), wtf.wake(self.s2)
         wtf.wake(self.s0)
         ch0.harvest()
         self.assertEqual(ch0.open_receives(), 2)
