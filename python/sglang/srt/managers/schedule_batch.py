@@ -1531,6 +1531,7 @@ class Req(ReqDllmMixin):
         # the request. None = nothing carried (the static X gate alone).
         self.weg2_front_x = None
         self.weg2_front_priced = None
+        self.weg2_front_halfx = None
 
         # For incremental decoding
         # ----- | --------- read_ids -------|

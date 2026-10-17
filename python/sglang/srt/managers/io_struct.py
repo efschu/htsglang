@@ -291,6 +291,9 @@ class GenerateReqInput:
     # nothing carried, D's static X gate is the only gate.
     weg2_front_x: Optional[int] = None
     weg2_front_priced: Optional[int] = None
+    # H16V review A3 (SOLL R2/R7/R11): halbX = F_halb x X of that decision at the depth D continues from, computed by
+    # the FRONT (x-weg2-front-halfx); the resumed-tail extend on D reads this, never a rank-local flag.
+    weg2_front_halfx: Optional[int] = None
     # Extra cache key for classifying the request (e.g. cache_salt)
     extra_key: Optional[Union[List[str], str]] = None
 
@@ -792,6 +795,7 @@ class GenerateReqInput:
             spill_class=self.spill_class,
             weg2_front_x=self.weg2_front_x,
             weg2_front_priced=self.weg2_front_priced,
+            weg2_front_halfx=self.weg2_front_halfx,
             extra_key=self.extra_key[i] if self.extra_key is not None else None,
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
@@ -888,6 +892,7 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # (rank 0 broadcasts it), so the gate's limit is the group's.
     weg2_front_x: Optional[int] = None
     weg2_front_priced: Optional[int] = None
+    weg2_front_halfx: Optional[int] = None  # H16V review A3: halbX carried by the front (see GenerateReqInput)
 
     # Extra cache key for classifying the request (e.g. cache_salt)
     extra_key: Optional[str] = None

@@ -7659,6 +7659,7 @@ class Scheduler(
             # request, so every TP rank holds the same value (MUST NOT 7).
             req.weg2_front_x = getattr(recv_req, "weg2_front_x", None)
             req.weg2_front_priced = getattr(recv_req, "weg2_front_priced", None)
+            req.weg2_front_halfx = getattr(recv_req, "weg2_front_halfx", None)   # H16V A3: the front's halbX
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode

@@ -5157,10 +5157,18 @@ class Front:
         one (:meth:`_note_x_decision`); a rid no decision site recorded is bounded by
         the X IN FORCE now (``tp_prefill_max_tokens``) -- the upper bound of every X
         the front ever decides with -- so no path is left to the static ceiling."""
-        if single_prefill or (pending is not None and not getattr(pending, "d_direct", False)):
+        if single_prefill:
             return {}
         rec = (self.__dict__.get("_x_decision") or {}).pop(str(rid), None)
-        if rec is not None:
+        _after_p = pending is not None and not getattr(pending, "d_direct", False)
+        if _after_p:
+            # H16V review A3 (SOLL R11, "X nie ein fester Wert"): the hand-over from P carries the X at the depth D
+            # continues from (the whole prompt is cached now), from the same X path as at arrival (curve, else the
+            # X in force); what D still has to prefill is ~nothing: priced 0.
+            x = Front._x_at_depth(self, max(0, int(getattr(pending, "est_prompt", 0) or 0)))
+            priced = 0
+            rec = (x, priced)
+        elif rec is not None:
             x, priced = rec
         else:
             x = int(getattr(self, "tp_prefill_max_tokens", 0) or 0)
@@ -5168,7 +5176,8 @@ class Front:
         if priced is None:
             priced = (int(getattr(pending, "est_uncached", 0) or 0) if pending is not None
                       else (self.__dict__.get("_front_price") or {}).get(str(rid)))
-        hdr = _front_x.request_headers(x, priced)
+        # H16V review A3: halbX rides along, computed here with the FRONT's flag (not read from the rank's env)
+        hdr = _front_x.request_headers(x, priced, phase_policy.half_x_of(int(x), Front._set_cfg()[0]))
         if hdr:
             self.counters["front_x_carried"] += 1
             logger.info("WEG2 FRONT-X rid=%s front_x=%d front_priced=%s static_x=%d%s (the decision X rides with the D-direct "
@@ -11383,6 +11392,11 @@ class Front:
                     book.popitem(last=False)
         except Exception:  # noqa: BLE001
             pass
+        return Front._x_at_depth(self, depth, k)
+
+    def _x_at_depth(self, depth: int, k: int = 1) -> int:
+        """X of one request at ``depth`` cached tokens (curves mode: the curve verdict; else the X in force); no
+        bookkeeping. ``k`` > 1 is the INFO figure (``xk=``), never a decision. Never raises."""
         cap = int(self.tp_prefill_max_tokens)
         setup = getattr(self, "_x_setup", None)
         if setup is None or getattr(setup, "curves", None) is None:
@@ -11430,14 +11444,23 @@ class Front:
         return phase_policy.shared_prefix_discount(entries, lambda a, b: Front._set_common(self, a, b))
 
     def _set_x_for(self, rids_depths: Sequence[Tuple[str, int, int]]) -> int:
-        """The set's X (H16V F2): the smallest, over the members at their own depths (R2a), of the X of a set of
-        ``k = len(members)`` -- with k > 1 the P fixed costs of the further members included. ``(rid, depth, X at
-        k=1)`` per member."""
+        """The X the set's S is decided against: SOLL R2a, the smallest own X of the members (each at its own depth),
+        nothing else. ``(rid, depth, X at k=1)`` per member. H16V review A2: X(k) = X + (k-1) x P fixed cost is NOT a
+        threshold of the SOLL (R1/R3 name X, no user quote for a k-dependent one) -- it is reported only
+        (:meth:`_set_xk_for`, the ``xk=`` field of the SET-VERDICT why), never decided on."""
+        return min(int(x1) for _r, _d, x1 in rids_depths)
+
+    def _set_xk_for(self, rids_depths: Sequence[Tuple[str, int, int]]) -> int:
+        """INFO ONLY (H16V review A2): the X of a set of k > 1 members with the further members' P fixed costs
+        (``_x_set_of`` with k), 0 without a curve file or for k <= 1. Never an input of a verdict."""
         k = len(rids_depths)
         _setup = getattr(self, "_x_setup", None)
         if k <= 1 or _setup is None or getattr(_setup, "curves", None) is None:
-            return min(int(x1) for _r, _d, x1 in rids_depths)   # no curve file: the members' own X (as before)
-        return min(Front._x_set_of(self, r, d, k) for r, d, _x1 in rids_depths)
+            return 0
+        try:
+            return min(Front._x_set_of(self, r, d, k) for r, d, _x1 in rids_depths)
+        except Exception:  # noqa: BLE001 -- an instrument
+            return 0
 
     def _set_x_of_entry(self, q: Any) -> int:
         x = int(getattr(q, "x_set", 0) or 0)
@@ -11454,7 +11477,7 @@ class Front:
         ``st["xs"]``). An entry that needs P although under its X (requeued, carrier, deferred) is P-only by state --
         R9 counts it big; D cannot take it. Only a request over its own X is "gross" (no p_only label for it).
         H16V F1: S counts what is NEW -- a member's tokens an earlier member of its session already brings are
-        counted once (``own_uncached`` keeps the member's own figure for its class)."""
+        counted once for P (``own_uncached`` keeps the member's own figure: its class AND the D-side S that decides, A5)."""
         raw, xs, depth = [], {}, {}
         for q in cands:
             u = int(getattr(q, "est_uncached", 0) or 0)
@@ -11476,15 +11499,18 @@ class Front:
 
     def _set_log(self, st: dict, members: Sequence[phase_policy.SetMember], sv: phase_policy.SetVerdict, *,
                  verdict: str, why: str, x_tok: int, frac: float, t_half: float, decoding: bool, seats: int,
-                 waited: float, x_cls: int = 0) -> None:
+                 waited: float, x_cls: int = 0, xk: int = 0) -> None:
         """``WEG2 SET-VERDICT`` (SOLL section 4), the exact format, once per decision."""
         classes = [phase_policy.classify_arrival(m.own_uncached or m.uncached, x_cls or x_tok, frac, m.p_only) for m in members]
         _shared = sum(m.own_uncached - m.uncached for m in members if m.own_uncached)
         if _shared > 0:
-            why = "%s [prefix-shared=%d: counted once in S]" % (why, _shared)   # H16V F1
+            # H16V F1/A5: S (decision, D side) is the sum of the own figures; P prefills the shared prefix once (S_P)
+            why = "%s [prefix-shared=%d: P counts once, S_P=%d]" % (why, _shared, max(0, int(sv.s_tokens) - _shared))
+        if xk > 0:
+            why = "%s xk=%d" % (why, xk)   # H16V review A2: X(k) is information only
         logger.info("WEG2 SET-VERDICT epoch=%d set=%d n=%d members=%s S=%d X=%d halfX=%d classes=%s d_decoding=%d "
                     "seats_free=%d t_half_s=%.1f waited_s=%.1f verdict=%s why=%s",
-                    self.epoch, st["set_id"], len(members), ",".join("%s:%d" % (m.rid, m.uncached) for m in members),
+                    self.epoch, st["set_id"], len(members), ",".join("%s:%d" % (m.rid, m.own_uncached or m.uncached) for m in members),
                     sv.s_tokens, x_tok, sv.half_x, ",".join(classes), int(decoding), seats, t_half, waited,
                     verdict, why)
 
@@ -11496,10 +11522,12 @@ class Front:
         members = self._set_members(now, cands, st)
         if not members:
             return None
-        # R2a: S is checked against the smallest X of the members (each at its own depth); H16V F2: the X of a set
-        # of k members carries the further members' P fixed costs
+        # R2a: S is checked against the smallest X of the members (each at its own depth) -- nothing else (review A2);
+        # X(k) with the further members' P fixed costs is only reported (xk= in the why)
         x_cls = min(st["xs"][m.rid] for m in members)
-        x_tok = Front._set_x_for(self, [(m.rid, st["depths"].get(m.rid, 0), st["xs"][m.rid]) for m in members])
+        _rd = [(m.rid, st["depths"].get(m.rid, 0), st["xs"][m.rid]) for m in members]
+        x_tok = Front._set_x_for(self, _rd)
+        xk = Front._set_xk_for(self, _rd)
         # R4/A5 (Review A): the clock starts at the first member's arrival, but never before this D phase woke -- a big
         # request that arrived during the P->D flip waits its T_halb in the NEW D phase (no double flip)
         if st["t_open"] is None:
@@ -11516,7 +11544,7 @@ class Front:
             d_prefill_running_uncached=self._dc_carried_running(),  # R6: what D prefills right now counts into S
             new_since_last=max(0, len(members) - st["seen"]), class_x_tokens=x_cls)
         kw = dict(x_tok=x_tok, x_cls=x_cls, frac=frac, t_half=t_half, decoding=decoding, seats=seats,
-                  waited=max(0.0, now - st["t_open"]))
+                  waited=max(0.0, now - st["t_open"]), xk=xk)
         st["urgent"] = urgent
         return members, sv, kw
 
@@ -11603,13 +11631,14 @@ class Front:
             return False
         if self._decode_collect(now, live_q) == "P":
             return True
-        # H16V F1/F2: the queue's S counts shared session prefixes once, X is the one of a set of k members
+        # H16V F1/A5: S = own figures (D side); P counts a shared session prefix once (members' uncached). X = smallest own X (R2a, A2)
         _eff = Front._set_discount(self, [(q.rid, int(getattr(q, "est_uncached", 0) or 0), float(_lctl.clock_t(q, now)), q)
                                           for q in live_q])
-        _q_s = sum(_eff.get(q.rid, int(getattr(q, "est_uncached", 0) or 0)) for q in live_q)
+        _q_s = sum(int(getattr(q, "est_uncached", 0) or 0) for q in live_q)   # A5: D-side sum decides; _eff = P's figure
         x_cls = min(Front._set_x_of_entry(self, q) for q in live_q)
-        x_tok = Front._set_x_for(self, [(q.rid, Front._set_depth_of(self, q.rid, q), Front._set_x_of_entry(self, q))
-                                        for q in live_q])
+        _rd = [(q.rid, Front._set_depth_of(self, q.rid, q), Front._set_x_of_entry(self, q)) for q in live_q]
+        x_tok = Front._set_x_for(self, _rd)
+        xk = Front._set_xk_for(self, _rd)
         if _q_s < x_tok:
             if st.get("held_epoch") != self.epoch:
                 st["held_epoch"] = self.epoch
@@ -11630,7 +11659,7 @@ class Front:
                                       d_prefill_running_uncached=self._dc_carried_running(), new_since_last=0,
                                       class_x_tokens=x_cls)
         self._set_log(st, members, sv, verdict=sv.verdict, why="queue-sum " + sv.why, x_tok=x_tok, frac=frac,
-                      t_half=t_half, decoding=decoding, seats=seats, waited=0.0, x_cls=x_cls)
+                      t_half=t_half, decoding=decoding, seats=seats, waited=0.0, x_cls=x_cls, xk=xk)
         self.counters["set_" + sv.verdict.lower()] += 1
         if sv.verdict in (phase_policy.V_FLIP_P, phase_policy.V_PARK_NO_SEAT, phase_policy.V_REROUTE_P):
             st["go_p"].update(m.rid for m in members)
@@ -11954,7 +11983,18 @@ class Front:
         as needed, only when that is enough). The front parks nothing here:
         one displacement logic, on D."""
         st = self._asr_st()
-        running = [r for r in self._flip_ledger(self.groups["D"]) if r not in st["parked"] and r != head_rid]
+        # H16V review A4: a victim an earlier to_d grant of this tick already plans on (its D displacement has not run
+        # yet: the grant is still in ``granted``) is not planned on a second time -- one decode makes room for ONE
+        # waiter, so three waiters with one younger decode and one seat give at most one to_d grant.
+        _av = st.setdefault("age_victims", {})
+        _claimed = set()
+        for _g in list(_av):
+            if _g in st["granted"] and _g != head_rid:
+                _claimed.update(_av[_g])
+            elif _g not in st["granted"]:
+                _av.pop(_g, None)
+        running = [r for r in self._flip_ledger(self.groups["D"])
+                   if r not in st["parked"] and r != head_rid and r not in _claimed]
         arrivals = {}
         for r in running:
             t = self._asr_arrival_of(r)
@@ -12224,6 +12264,11 @@ class Front:
         arrival = self._asr_arrival_of(rid) or t_mine
         plan = None
         if not fits:
+            # H16V review A4 (R5): the to_d grant below is formed from ``free`` -- read before the awaits above, like the
+            # fits branch's -- so the seat count is read AGAIN here, with no await between it and the grant (which enters
+            # ``granted`` at once and so counts into ``taken`` for the next waiter of the tick).
+            taken, n = self._arrival_seat_taken()
+            free = bool(_asr.seat_free(taken, n))
             plan = self._arrival_seat_age_verdict(rid, arrival, free, 0 if fits_kv else deficit)
         to_d = bool(plan)   # does not fit, but D can make it fit by displacing younger ones
         if fits:
@@ -12238,6 +12283,8 @@ class Front:
                 fits_of[rid] = False
         if eligible and (fits or to_d):
             st["granted"][rid] = time.time()
+            if to_d:
+                st.setdefault("age_victims", {})[rid] = list(plan)   # H16V A4: these victims are spoken for
             self.counters["arrival_seat_d_prefill"] += 1
             self._asr_note_need_terms()
             if not first and fits:
