@@ -352,6 +352,8 @@ class Weg2StreamControl:
 
     rank: int
     kind: str  # "bye" | "beat"
+    #: K20d: sleep epoch of a bye (= the sender's wake count + 1); PP0 takes a bye only of ITS current epoch. -1 = none.
+    epoch: int = -1
 
 
 #: K20: an idle follower completes PP0's standing receive at least this often (s); 0 = off. Vorgabe AN. Far below the
@@ -413,8 +415,13 @@ class GlooAckChannel:
         self._sleeping: set = set()
         self._last_post = time.monotonic()
         self.byes_taken = 0
+        #: K20d: wakes seen by this rank (lockstep on every rank: one per resume leg); a bye is stamped wakes+1
+        self.wakes = 0
+        self.byes_stale = 0
         #: K20b: follower: after its own bye NO send leaves until wake (a send without a posted receive blocks 7200 s)
         self._gated = False
+        #: K20c: the bye could not be posted inside the budget (an earlier send still hangs): pump() posts it
+        self._bye_pending = False
         self.held = 0
         #: K20b: PP0: sleep_quiesce left byes missing -> wake() drains them before re-arming
         self._bye_missing = False
@@ -431,7 +438,11 @@ class GlooAckChannel:
         joined (instantly: its flag is set) only to surface its error.
         ``beat``: an idle follower posts the K20 heartbeat here (once per HEARTBEAT_S)."""
         if self._inflight is None:
-            if beat and self._beat_due():
+            if beat and self._bye_pending:
+                self._bye_pending = False
+                if not self.send_nowait(Weg2StreamControl(rank=self.pp_rank, kind="bye", epoch=self.wakes + 1)):
+                    self._bye_pending = True
+            elif beat and self._beat_due():
                 self.send_nowait(Weg2StreamControl(rank=self.pp_rank, kind="beat"))
             return self._inflight is None
         if not all(pw.completed for pw, _t in self._inflight):
@@ -524,10 +535,13 @@ class GlooAckChannel:
         if self.dead or self.pp_rank == 0:
             return True
         end = time.monotonic() + budget_s
-        msg = Weg2StreamControl(rank=self.pp_rank, kind="bye")
+        msg = Weg2StreamControl(rank=self.pp_rank, kind="bye", epoch=self.wakes + 1)
         while not self.send_nowait(msg):
             if time.monotonic() >= end:
+                # an earlier send still hangs: the bye is NOT posted. Gate, but remember it; pump() posts it as soon
+                # as that send completes (K20c) -- PP0's receive must not stay posted through the sleep.
                 self._gated = True
+                self._bye_pending = True
                 return False
             time.sleep(0.01)
         self._gated = True
@@ -540,6 +554,8 @@ class GlooAckChannel:
     def open_sends(self) -> int:
         """Sends of this process not completed (in flight, blocked on a missing receive) -- a gated, held fact is
         not a send but counts as held."""
+        if self._bye_pending:
+            return 1
         if self._inflight is None:
             return 0
         return 0 if all(pw.completed for pw, _t in self._inflight) else 1
@@ -557,6 +573,7 @@ class GlooAckChannel:
         sleep budget is taken FIRST (bounded, ENV_WAKE_DRAIN_S) so no follower is 'asleep' through the awake phase;
         then the frames are re-armed by the next harvest."""
         self._gated = False
+        self._bye_pending = False
         if self.pp_rank == 0:
             if self._bye_missing:
                 end = time.monotonic() + _env_float(ENV_WAKE_DRAIN_S, WAKE_DRAIN_S_DEFAULT)
@@ -569,6 +586,7 @@ class GlooAckChannel:
                                  n - len(self._sleeping))
             self._bye_missing = False
             self._sleeping.clear()
+        self.wakes += 1  # K20d: after the drain (a late bye of THIS sleep is still current while draining)
 
     def harvest(self) -> List[Any]:
         out: List[Any] = []
@@ -582,6 +600,12 @@ class GlooAckChannel:
                         break
                     item = frame.take()
                     if isinstance(item, Weg2StreamControl):
+                        if item.kind == "bye" and item.epoch not in (-1, self.wakes + 1):
+                            self.byes_stale += 1
+                            logger.warning(
+                                "WEG2 PP-RECEIVE-CENSUS %s: STALE bye from pp%d epoch=%d (PP0 expects %d) discarded; "
+                                "the follower is awake", self.label, r, item.epoch, self.wakes + 1)
+                            continue
                         if item.kind == "bye":
                             self._sleeping.add(r)
                             self.byes_taken += 1
