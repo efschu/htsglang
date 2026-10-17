@@ -343,6 +343,34 @@ class Weg2ToldReadAck:
     reads: List[Tuple[str, int]] = field(default_factory=list)
 
 
+@dataclass
+class Weg2StreamControl:
+    """K20 (17.10.): follower -> PP0 on any GlooAckChannel stream, consumed INSIDE the channel (never handed to a
+    caller). ``bye`` = this rank goes to sleep: it completes PP0's standing receive and PP0 does not re-arm it until
+    ``wake()``. ``beat`` = idle heartbeat: completes the standing receive so gloo's receive clock (7200 s from the
+    post) restarts long before it can fire."""
+
+    rank: int
+    kind: str  # "bye" | "beat"
+
+
+#: K20: an idle follower completes PP0's standing receive at least this often (s); 0 = off. Vorgabe AN. Far below the
+#: gloo timeout (7200 s) that killed PP0 at 00:36:54Z (boot 1016_172204: the last ack at 22:36:54Z re-armed the frame,
+#: P slept 22:36:57Z, nothing was ever sent again).
+ENV_HEARTBEAT_S = "SGLANG_WEG2_PF_ACK_HEARTBEAT_S"
+HEARTBEAT_S_DEFAULT = 600.0
+#: K20: how long PP0 waits at sleep for the followers' byes (s). Far below the gloo timeout.
+ENV_SLEEP_COLLECT_S = "SGLANG_WEG2_PF_TOLD_ACK_TIMEOUT_S"
+SLEEP_COLLECT_S_DEFAULT = 10.0
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
 # ---------------------------------------------------------------------------
 # transport
 # ---------------------------------------------------------------------------
@@ -378,6 +406,12 @@ class GlooAckChannel:
         #: misframed for good, so this follower sends nothing more (PP0's
         #: Frist answers told=0 for its reads from then on -- alive, slower).
         self.dead = False
+        #: K20: PP0 side: ranks that said bye (their standing frame is not re-armed until wake()); follower side:
+        #: monotonic time of the last post (heartbeat clock) and the bye sent flag.
+        self._sleeping: set = set()
+        self._last_post = time.monotonic()
+        self.byes_taken = 0
+        self.beats_taken = 0
 
     @classmethod
     def for_scheduler(cls, scheduler) -> "GlooAckChannel":
@@ -385,11 +419,14 @@ class GlooAckChannel:
         return cls(group, int(scheduler.ps.pp_rank), _world_ranks(scheduler))
 
     # -- follower ------------------------------------------------------
-    def pump(self) -> bool:
+    def pump(self, beat: bool = True) -> bool:
         """True when nothing is in flight any more. A completed send is
-        joined (instantly: its flag is set) only to surface its error."""
+        joined (instantly: its flag is set) only to surface its error.
+        ``beat``: an idle follower posts the K20 heartbeat here (once per HEARTBEAT_S)."""
         if self._inflight is None:
-            return True
+            if beat and self._beat_due():
+                self.send_nowait(Weg2StreamControl(rank=self.pp_rank, kind="beat"))
+            return self._inflight is None
         if not all(pw.completed for pw, _t in self._inflight):
             return False
         done, self._inflight = self._inflight, None
@@ -414,8 +451,9 @@ class GlooAckChannel:
         the ack left the outbox (posted, or dropped on a dead stream)."""
         if self.dead:
             return True
-        if not self.pump():
+        if not self.pump(beat=False):
             return False
+        self._last_post = time.monotonic()
         import numpy as np
         import torch
         import torch.distributed as dist
@@ -463,15 +501,55 @@ class GlooAckChannel:
             )
         return frame
 
+    def _beat_due(self) -> bool:
+        if self.dead or self.pp_rank == 0:
+            return False
+        hb = _env_float(ENV_HEARTBEAT_S, HEARTBEAT_S_DEFAULT)
+        return hb > 0 and time.monotonic() - self._last_post >= hb
+
+    def send_bye(self, budget_s: float) -> bool:
+        """Follower, at sleep: complete PP0's standing receive. Bounded; True = posted."""
+        if self.dead or self.pp_rank == 0:
+            return True
+        end = time.monotonic() + budget_s
+        msg = Weg2StreamControl(rank=self.pp_rank, kind="bye")
+        while not self.send_nowait(msg):
+            if time.monotonic() >= end:
+                return False
+            time.sleep(0.01)
+        return True
+
+    def open_receives(self) -> int:
+        """PP0: standing receives that are posted right now (a frame past IDLE and not COMPLETE)."""
+        n = 0
+        for f in self._frames.values():
+            if f.state in ("awaiting_size", "awaiting_data"):
+                n += 1
+        return n
+
+    def wake(self) -> None:
+        """PP0: the group is awake again; frames of sleeping ranks are re-armed by the next harvest."""
+        self._sleeping.clear()
+
     def harvest(self) -> List[Any]:
         out: List[Any] = []
         for r in range(1, len(self.world_ranks)):
+            if r in self._sleeping:
+                continue
             frame = self._frame(r)
             for _ in range(HARVEST_MAX_PER_SRC):
                 try:
                     if not frame.poll():
                         break
-                    out.append(frame.take())
+                    item = frame.take()
+                    if isinstance(item, Weg2StreamControl):
+                        if item.kind == "bye":
+                            self._sleeping.add(r)
+                            self.byes_taken += 1
+                            break
+                        self.beats_taken += 1
+                        continue
+                    out.append(item)
                 except Exception as exc:  # noqa: BLE001 - the Frist covers it
                     self._error(f"receive[pp{r}]", exc)
                     break
@@ -1658,3 +1736,69 @@ def follower_pump(scheduler) -> None:
                 "PF TOLD-ACK SENT rank pp=%s seq=%d reads=%s (n=%d)",
                 scheduler.ps.pp_rank, ack.seq, list(ack.reads), n,
             )
+
+
+# ---------------------------------------------------------------------------
+# K20 (17.10.): the standing receives at sleep
+# ---------------------------------------------------------------------------
+
+#: scheduler attributes holding the GlooAckChannel of each stream (told-ack, pp-room)
+_STREAM_ATTRS = ("_weg2_fb_channel", "_weg2_pr_channel")
+
+
+def _streams(scheduler) -> List[GlooAckChannel]:
+    out = []
+    for a in _STREAM_ATTRS:
+        ch = getattr(scheduler, "__dict__", {}).get(a) if hasattr(scheduler, "__dict__") else getattr(scheduler, a, None)
+        if ch is not None:
+            out.append(ch)
+    return out
+
+
+def sleep_quiesce(scheduler, budget_s: Optional[float] = None) -> int:
+    """K20 root fix. PP0's standing ``ObjectRecvFrame`` on each ack stream is a posted gloo receive; gloo's clock on a
+    posted receive is the process-group timeout (7200 s here) and nothing ever stops it: boot 1016_172204 re-armed the
+    frame on the last ack of rid weg2-178-2512 (22:36:54Z), P slept at 22:36:57Z, no pass ran, and at 00:36:54Z PP0
+    died on ``PF told-ack receive[pp1] ... Timed out waiting 7200000ms`` (the pp-room receive followed as a cascade).
+
+    At sleep every follower completes PP0's standing receive with a ``bye`` (its own rank, bounded), PP0 takes the byes
+    and does NOT re-arm those frames until ``wake``. PP0 decides, the followers only report: no rank-local abort.
+    Returns the number of receives still open on THIS rank (PP0; followers return 0). The census line is emitted by
+    every rank; ``open`` must be 0."""
+    budget = _env_float(ENV_SLEEP_COLLECT_S, SLEEP_COLLECT_S_DEFAULT) if budget_s is None else float(budget_s)
+    rank = int(scheduler.ps.pp_rank)
+    chans = _streams(scheduler)
+    if int(getattr(scheduler.ps, "pp_size", 1) or 1) <= 1 or not chans:
+        logger.info("WEG2 PP-RECEIVE-CENSUS at=sleep rank=pp%d open=0 streams=0", rank)
+        return 0
+    t0 = time.monotonic()
+    open_n = 0
+    detail = []
+    if rank != 0:
+        for ch in chans:
+            ok = ch.send_bye(budget)
+            detail.append(f"{ch.label}:bye={'sent' if ok else 'UNSENT'}")
+            if not ok:
+                open_n += 1
+    else:
+        end = t0 + budget
+        while True:
+            for ch in chans:
+                ch.harvest()  # byes are consumed inside the channel; an ack still in flight at sleep is dropped (PP0's Frist: told=0)
+            open_n = sum(ch.open_receives() for ch in chans)
+            if open_n == 0 or time.monotonic() >= end:
+                break
+            time.sleep(0.005)
+        detail = [f"{ch.label}:open={ch.open_receives()},byes={ch.byes_taken},beats={ch.beats_taken}" for ch in chans]
+    logger.log(
+        logging.INFO if open_n == 0 else logging.ERROR,
+        "WEG2 PP-RECEIVE-CENSUS at=sleep rank=pp%d open=%d streams=%d waited_s=%.2f %s",
+        rank, open_n, len(chans), time.monotonic() - t0, " ".join(detail),
+    )
+    return open_n
+
+
+def wake(scheduler) -> None:
+    """PP0: re-arm the standing receives after the group woke (the next harvest posts them)."""
+    for ch in _streams(scheduler):
+        ch.wake()

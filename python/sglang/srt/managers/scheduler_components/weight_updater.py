@@ -9669,6 +9669,14 @@ class SchedulerWeightUpdaterManager:
 
         torch.get_device_module().synchronize()
         sleep_complete = WEG2_SLEEP_TAGS.issubset(self.offload_tags)
+        if sleep_complete and self.scheduler is not None:
+            # K20 (17.10.): no PP receive stays posted into the sleep (gloo's 7200 s clock killed PP0 at 00:36:54Z)
+            try:
+                from sglang.srt.managers import weg2_told_fallback as _wtf_k20
+
+                _wtf_k20.sleep_quiesce(self.scheduler)
+            except Exception:  # noqa: BLE001 - the census must never fail the sleep leg
+                logger.exception("WEG2 PP-RECEIVE-CENSUS at=sleep FAILED")
         if weg2_memory_saver_on and not sleep_complete:
             # A chunk RPC of an interleaved sleep: the census (whole-process
             # residency) is graded once the population is complete, below.
@@ -9797,6 +9805,12 @@ class SchedulerWeightUpdaterManager:
         if replay is not None:
             return replay
         if self.scheduler is not None:
+            try:  # K20 (17.10.): PP0 re-arms the standing PP receives it parked at sleep
+                from sglang.srt.managers import weg2_told_fallback as _wtf_k20w
+
+                _wtf_k20w.wake(self.scheduler)
+            except Exception:  # noqa: BLE001
+                logger.exception("WEG2 PP-RECEIVE wake FAILED")
             self.scheduler._weg2_resume_t0 = time.perf_counter()  # RW instrument: the leg's start
         # KRIT3 (weg2/resume_via_p.py): a resume is a wake -- P ran in between;
         # RESUME-VIA-P counts its attempts per wake, not per refusal.
