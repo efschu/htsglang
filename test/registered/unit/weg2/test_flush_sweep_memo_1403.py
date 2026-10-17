@@ -36,8 +36,23 @@ def _nb():
     return nb
 
 
+class _Pool:
+    def __init__(self, free):
+        self.free = free
+
+    def available_size(self):
+        return self.free
+
+
+class _CC:
+    def __init__(self, free):
+        self.mem_pool_host = _Pool(free)
+
+
 class _Tree:
-    def __init__(self, write_through=0, backup=0):
+    def __init__(self, write_through=0, backup=0, free=None):
+        if free is not None:
+            self.cache_controller = _CC(free)
         self.ongoing_write_through = {i: object() for i in range(write_through)}
         self.ongoing_backup = {i: object() for i in range(backup)}
 
@@ -91,3 +106,51 @@ def test_scheduler_flush_handler_is_wired():
     assert "sweep_memo_hit" in src
     assert "sweep_memo_set" in src
     assert "range(64) if not _memo_hit else ()" in src
+
+
+# ---- h16v S12 (Nachreview 2, V2): the stamp dies with its quiesce / tree ----
+
+
+def test_arena_room_change_invalidates_memo():
+    nb = _nb()
+    s = _Sched()
+    tree = _Tree(0, 0, free=100)
+    nb.sweep_memo_set(s, tree)
+    assert nb.sweep_memo_hit(s, tree)  # unchanged -> memo hit
+    tree.cache_controller.mem_pool_host.free = 130  # room moved, in-flight same
+    assert not nb.sweep_memo_hit(s, tree)
+
+
+def _quiesce_end():
+    from sglang.srt.managers import weg2_bubble_publish as bp
+
+    return bp.quiesce_end
+
+
+@pytest.mark.parametrize("why", ["reset", "batch"])
+def test_new_quiesce_with_same_inflight_sweeps_first_poll(why):
+    nb = _nb()
+    from sglang.srt.managers import weg2_bubble_publish as bp
+
+    s = _Sched()
+    tree = _Tree(0, 0, free=50)
+    bp.quiesce_begin(s)
+    nb.sweep_memo_set(s, tree)
+    assert nb.sweep_memo_hit(s, tree)
+    bp.quiesce_end(s, why)
+    bp.quiesce_begin(s)  # next quiesce, same count 0, same room
+    assert not nb.sweep_memo_hit(s, tree)  # first poll must sweep
+
+
+def test_memo_clear_and_flush_reset_hook_wired():
+    nb = _nb()
+    s = _Sched()
+    tree = _Tree(0, 0, free=1)
+    nb.sweep_memo_set(s, tree)
+    nb.sweep_memo_clear(s)
+    assert not nb.sweep_memo_hit(s, tree)
+    from sglang.srt.managers import scheduler as sched_mod
+
+    src = inspect.getsource(sched_mod.Scheduler.flush_cache)
+    assert src.index("self.tree_cache.reset()") < src.index("sweep_memo_clear(self)") \
+        < src.index("req_to_token_pool.clear()")

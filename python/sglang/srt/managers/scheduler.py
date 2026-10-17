@@ -20881,6 +20881,7 @@ class Scheduler(
                 pass
             else:
                 self.tree_cache.reset()
+                _weg2_flush_nonblock.sweep_memo_clear(self)  # h16v S12 V2: new tree, old stamp void
                 self.req_to_token_pool.clear()
                 self.token_to_kv_pool_allocator.clear()
                 _weg2_note_reset(self)

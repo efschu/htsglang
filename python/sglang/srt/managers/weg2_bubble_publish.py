@@ -74,6 +74,8 @@ def quiesce_begin(scheduler) -> None:
 
 
 def quiesce_end(scheduler, why: str) -> None:
+    # h16v S12 (Nachreview 2 V2): the flush sweep memo belongs to this quiesce only (reset / batch end it)
+    scheduler._weg2_flush_sweep_memo = None
     if not getattr(scheduler, "_weg2_quiesce_open", False):
         return
     scheduler._weg2_quiesce_open = False

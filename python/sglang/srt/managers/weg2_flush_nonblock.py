@@ -239,17 +239,37 @@ def sweep_no_progress(stats: dict) -> bool:
             and int((stats or {}).get("unbacked", 0) or 0) > 0)
 
 
+def arena_free(tree_cache):
+    """Free room of the host KV arena (None if the pool does not say). Cheap, no tree walk."""
+    try:
+        pool = getattr(getattr(tree_cache, "cache_controller", None), "mem_pool_host", None)
+        fn = getattr(pool, "available_size", None)
+        return int(fn()) if callable(fn) else None
+    except Exception:  # noqa: BLE001 - a stamp part never takes the poll down
+        return None
+
+
+def sweep_state_stamp(tree_cache) -> tuple:
+    """h16v S12 (Nachreview 2, V2): in-flight count AND free arena room -- any state change moves the stamp."""
+    return (inflight_count(tree_cache), arena_free(tree_cache))
+
+
 def sweep_memo_set(scheduler, tree_cache) -> None:
-    scheduler._weg2_flush_sweep_memo = inflight_count(tree_cache)
+    scheduler._weg2_flush_sweep_memo = sweep_state_stamp(tree_cache)
+
+
+def sweep_memo_clear(scheduler) -> None:
+    """h16v S12 V2: the stamp belongs to ONE quiesce on ONE tree; reset, batch and quiesce end drop it."""
+    scheduler._weg2_flush_sweep_memo = None
 
 
 def sweep_memo_hit(scheduler, tree_cache) -> bool:
-    """True while the in-flight count stands where the no-progress round left
-    it -- under the sweep's own gate (nothing running/waiting/chunked) every
-    un-backing and every pin release moves that count, so an unchanged count
-    means the tree and the arena are exactly as futile as they were."""
+    """True while in-flight count and free arena room stand where the no-progress round left them -- under the
+    sweep's own gate (nothing running/waiting/chunked) every un-backing and pin release moves the count, every
+    arena claim/free moves the room, so an unchanged stamp means the tree and the arena are exactly as futile as
+    they were. Cleared at quiesce end (reset or batch) and at the tree reset."""
     stamp = getattr(scheduler, "_weg2_flush_sweep_memo", None)
-    return stamp is not None and stamp == inflight_count(tree_cache)
+    return stamp is not None and stamp == sweep_state_stamp(tree_cache)
 
 
 # ---- F5c (NF-PGAP 1016): what goes into the reset un-backed, named -----------------
