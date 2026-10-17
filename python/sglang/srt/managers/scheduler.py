@@ -712,6 +712,8 @@ def _hp1_group_retry_due(sched, req) -> bool:
 #: producer, and a boot census that could not tell them apart would send the
 #: next reader to the wrong half of the chain.
 _DEFER_REASON_STORE_SHORT = "store_prefix_short"
+
+
 #: The verdict `Scheduler._prefetch_kvcache` returns for a read that REGISTERED
 #: and was cut by the post-consensus group trim. Not a decline: the read exists.
 _VERDICT_TRUNCATED_GROUP = "issued:truncated_group"
@@ -15696,6 +15698,27 @@ class Scheduler(
         self._weg2_store_short_delivered = getattr(self, "_weg2_store_short_delivered", 0) + delivered
         self._weg2_store_short_deliverable = getattr(self, "_weg2_store_short_deliverable", 0) + deliverable
         n = self._weg2_store_short_seen
+        # S18 (h16v3 1017_224250, weg2-1-14/-15/-16): the store HELD the whole span (the probe's hit covers the
+        # deliverable prefix; TAIL-CONSUME hit=118400) and D's read was cut by its own full arena (WEG2-READ-DEPTH
+        # cause=arena_full, READ-ROOM SHORT class=not_posted). That is a capacity cut, not P's write-through
+        # lagging, yet the line said "the store did not hold the rest yet", so the acceptance "STORE READ
+        # INCOMPLETE == 0" could not tell the two apart. Only the NAME and the counter split: the deferral
+        # below is identical for both, and the STORE-HELD-DECIDE-1014 predicate it already feeds is untouched.
+        if (int(getattr(outcome, "hit_tokens", 0) or 0) >= int(getattr(outcome, "deliverable", 0) or 0) > 0
+                and getattr(outcome, "probed", False)):
+            self._weg2_store_short_capacity = getattr(self, "_weg2_store_short_capacity", 0) + 1
+            nc = self._weg2_store_short_capacity
+            if nc <= 8 or nc % 64 == 0:
+                logger.warning(
+                    "#1324 STORE READ CAPACITY-CUT rid=%s delivered=%d deliverable=%d shortfall=%d hit_tokens=%d "
+                    "site=drain occurrence=%d capacity_occurrence=%d -- the store HOLDS the whole span (probe hit "
+                    "covers it) and the read ended short on D's own arena room; this is not P's write-through "
+                    "lagging. Deferring through the A12.2 shortfall arm; the room is the defect (READ-ROOM serves "
+                    "group P only). Denominator: every terminated store read of this rank whose record reports a "
+                    "page-floored shortfall AND whose probe hit covers the deliverable prefix",
+                    rid, delivered, deliverable, deliverable - delivered, int(outcome.hit_tokens), n, nc,
+                )
+            return self._apply_prefetch_deferral(req, _VERDICT_STORE_SHORT, site="drain")
         if n <= 8 or n % 64 == 0:
             logger.warning(
                 "#1324 STORE READ INCOMPLETE rid=%s delivered=%d deliverable=%d "
