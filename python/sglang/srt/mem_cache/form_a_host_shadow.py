@@ -844,7 +844,6 @@ def apply(tree: Any, events: List, seq: int = 0) -> Dict[str, int]:
             # K23 review A3: TP0 says the node is GONE; only ``deleted`` (and ``missing``, above) leaves the
             # worker's tree the same. kv/anchor/noop/short/unreconcilable keep a node TP0 no longer has.
             _state_diverged(node, h, depth, out, seq)
-            c[out] += 1
         elif (h, int(depth)) in _S.k21_expect:
             _S.k21_expect.discard((h, int(depth)))
             if out != "kv":
