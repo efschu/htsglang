@@ -189,8 +189,10 @@ else PKG=sglang; PDF=weg2; RENAMED=0
 fi
 "${G[@]}" cat-file -e "$REV:python/$PKG/__init__.py" 2>/dev/null || blocker "python/$PKG/__init__.py missing in ${SHA10}"
 # _version.py must be ignored by the tree's own .gitignore (Dockerfile step 4 check-ignore)
-if "${G[@]}" ls-tree -r --name-only "$REV" | grep -qx "python/$PKG/_version.py"; then blocker "python/$PKG/_version.py is TRACKED in ${SHA10} (Dockerfile writes it)"
-elif { "${G[@]}" show "$REV:python/.gitignore" 2>/dev/null; "${G[@]}" show "$REV:.gitignore" 2>/dev/null; } | grep -q '_version.py'; then ok "_version.py untracked and listed in a .gitignore"
+# 17.10. (rc7-Bau): under pipefail a producer piped into grep -q dies of SIGPIPE (141) once grep has matched and left;
+# the gate then reads a FOUND marker as missing (B2 false positive with a 60 KB entrypoint). grep -c reads the whole input.
+if "${G[@]}" ls-tree -r --name-only "$REV" | grep -cx "python/$PKG/_version.py" >/dev/null; then blocker "python/$PKG/_version.py is TRACKED in ${SHA10} (Dockerfile writes it)"
+elif { "${G[@]}" show "$REV:python/.gitignore" 2>/dev/null; "${G[@]}" show "$REV:.gitignore" 2>/dev/null; } | grep -c '_version.py' >/dev/null; then ok "_version.py untracked and listed in a .gitignore"
 else warn "_version.py not found in python/.gitignore or .gitignore of ${SHA10} -- Dockerfile check-ignore may FATAL"; fi
 # stage-B seams (prepare_context.sh step 0, both spellings)
 missing=()
@@ -570,7 +572,7 @@ else for ph in __FLLIPER_VERSION__ __FLLIPER_SOURCE__ __FLLIPER_PLACEHOLDERS__ _
        grep -q "=$ph\$" "$DFF" || blocker "Dockerfile.flliper lacks the bake point ARG ...=$ph"; done
      ok "Dockerfile.flliper present ($(grep -c '^RUN ' "$DFF") RUN, bake points 4/4)"
      if [ "$DUO" = 1 ] && ! grep -q '^ARG ALLOW_DUO_TREES=0$' "$DFF"; then blocker "DUO: Dockerfile.flliper lacks ARG ALLOW_DUO_TREES (FLAT-2 would FATAL) -- install Dockerfile.flliper.new_600"; fi; fi
-{ if [ -n "$EP_SRC" ]; then "${G[@]}" show "$REV:$EP_SRC"; else cat "$HERE/entrypoint.sh"; fi; } | grep -q 'FLLIPER_PROFILE' || relblock "B2: entrypoint.sh reads HTSGLANG_PROFILE only; README promises FLLIPER_PROFILE, MODE=pdflip, /var/lib/flliper -- RENAME step 5"
+{ if [ -n "$EP_SRC" ]; then "${G[@]}" show "$REV:$EP_SRC"; else cat "$HERE/entrypoint.sh"; fi; } | grep -c 'FLLIPER_PROFILE' >/dev/null || relblock "B2: entrypoint.sh reads HTSGLANG_PROFILE only; README promises FLLIPER_PROFILE, MODE=pdflip, /var/lib/flliper -- RENAME step 5"
 # --check (F0-G): the offline gate -- a WARN is a failure here, and so is a pre-rename profile name in a renamed tree (those are blockers in --plan already)
 if [ "$CHECK" = 1 ] && [ "${#WARNS[@]}" -gt 0 ]; then for w in "${WARNS[@]}"; do blocker "check: warning is a failure: $w"; done; fi
 say "   warnings: ${#WARNS[@]}; blockers: ${#BLOCKERS[@]}; release blockers (ctx allowed): ${#RELBLOCKERS[@]}"
