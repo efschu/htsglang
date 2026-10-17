@@ -143,6 +143,9 @@ class _State:
         self.ledger: List[Tuple[str, str, int, int, int, int]] = []
         self.pending: Dict[Tuple[str, int], Tuple[str, str, int, int, int, int]] = {}
         self.absent: set = set()
+        # K21 A1: node keys whose own drain ack made them an A2 orphan on THIS rank
+        # (same event on every rank); a STATE for such a key must reconcile to "kv"
+        self.k21_keys: set = set()
         self.tree: Any = None
         # #239 S4b part 4 (TP0 only): nodes whose token-cut page was not yet
         # complete at TP0's ack -> [node, passes waited, fallback transit]
@@ -319,6 +322,22 @@ def record_state(tree: Any, node: Any, why: str = "") -> None:
     else:
         _S.absent.discard(k)
     _S.ledger.append((STATE, k[0], k[1], exists, kv, m))
+
+
+class K21RankDivergence(RuntimeError):
+    """K21 A1 (raenge-nie-uneins-crash-stop): TP0 republished an A2-orphan node (it stays on the
+    device on every rank) and this worker could not reconcile its STATE to ``kv`` -- the ranks
+    would hold different trees. Named group stop, never a counter."""
+
+
+def note_k21_orphan(node: Any) -> None:
+    """The drain ack of ``node`` orphaned it on this rank (every role): remember its content key
+    so the STATE of the republish is checked against the group-uniform outcome."""
+    if not shadow_active():
+        return
+    k = node_key(node)
+    if k is not None:
+        _S.k21_keys.add(k)
 
 
 def _pkey(e) -> tuple:
@@ -572,6 +591,7 @@ def on_tree_reset(tree: Any) -> None:
     _S.ledger = []
     _S.pending = {}
     _S.absent = set()
+    _S.k21_keys = set()
     _S.rebind_wait = {}
 
 
@@ -676,6 +696,18 @@ def apply(tree: Any, events: List, seq: int = 0) -> Dict[str, int]:
         out = _reconcile(tree, node, exists, kv, m)
         if out == "pending":
             _S.pending[(h, int(depth))] = e
+        elif (h, int(depth)) in _S.k21_keys:
+            _S.k21_keys.discard((h, int(depth)))
+            if out in ("deleted", "unreconcilable"):
+                logger.error(
+                    "K21 RANK-DIVERGENCE seq=%d node=%s depth=%s hash=%s out=%s: TP0 republished "
+                    "an A2-orphan node (kept on the device) and this worker's STATE apply ended "
+                    "'%s' instead of 'kv' -- the ranks' trees diverge; group stop "
+                    "(raenge-nie-uneins-crash-stop)", int(seq), getattr(node, "id", "?"),
+                    depth, str(h)[:16], out, out)
+                raise K21RankDivergence(
+                    f"K21: orphan-republish STATE for node={getattr(node, 'id', '?')} depth={depth} "
+                    f"applied as {out!r} on a worker (expected 'kv'): rank trees diverge")
         c[out] += 1
     n = _note("applied")
     if n and (events or any(c[k] for k in ("transit", "kv", "anchor", "deleted", "rebind", "spill"))):

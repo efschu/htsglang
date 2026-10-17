@@ -4512,16 +4512,19 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     else:
                         _ud_refused_note(self, node, _sf)
                     return
+                # K21 A1 (review nf-review-h16v-1017 p5): the drain runs this node's own ack.
+                # An A2 ORPHAN (the claim lost its key; the device copy is the only copy) is the
+                # same event on EVERY rank of the group (``_k12_direct_l3_verdict`` marks it on
+                # every role). TP0 gives the host layer back (K12 A2-ORPHAN REPUBLISH, R12 STATE),
+                # a worker keeps its byteless rows -- but ALL ranks keep the node on the device
+                # (a rank-local skip on TP0 alone parted the trees): the worker's STATE apply then
+                # drops only the orphan rows ("kv"); "deleted"/"unreconcilable" is a named group
+                # stop (form_a_host_shadow.K21RankDivergence). The peel frees nothing here and
+                # moves on to the same next leaf everywhere.
+                node._k21_orphan_ack = False
                 self.writing_check(write_back=True)
-                # K21 (NF h16u2 1017_132112, D-TP0 13:35:14Z node=142): the drain runs this
-                # node's own ack. An A2 ORPHAN (the claim lost its key; the device copy is
-                # the only copy) makes TP0 give the host layer back (K12 A2-ORPHAN REPUBLISH,
-                # R12 STATE to the workers): the node is an UN-backed device node again, and
-                # `_evict_to_host` (assert not evicted and backuped) killed the rank. Such a
-                # node stays on the device -- the publish sweep writes it from that copy; the
-                # peel frees nothing here and moves on (the caller's under-delivery check
-                # names a shortfall). TP0's own verdict, nothing rank-local is added.
-                if node.evicted or not node.backuped:
+                if getattr(node, "_k21_orphan_ack", False) or node.evicted or not node.backuped:
+                    node._k21_orphan_ack = False
                     UnifiedRadixCache._k21_note_skip(self, node)
                     return
                 self._evict_to_host(node, tracker)
@@ -6631,6 +6634,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         """
         strict = UnifiedRadixCache._weg2_l3_present_strict()
         if orphaned and strict:
+            # K21 A1: the group-uniform mark (every role) the write-back peel reads
+            node._k21_orphan_ack = True
+            try:
+                _r12.note_k21_orphan(node)
+            except Exception:  # noqa: BLE001 - instrument only
+                pass
             n = getattr(UnifiedRadixCache, "_k12_orphan_direct_n", 0) + 1
             UnifiedRadixCache._k12_orphan_direct_n = n
             if n <= 16 or (n & (n - 1)) == 0:
