@@ -339,6 +339,11 @@ for l in "${KLISTS[@]}"; do
   UNION+=$(grep -vE '^\s*(#|$)' "$l" | sed 's/[[:space:]]\+/ /g; s/ $//')$'\n'
 done
 UNION=$(printf '%s' "$UNION" | awk 'NF && !seen[$0]++')
+# 17.10. (rc6-Bau): HiCache-JIT-Eintraege mit element_size 0 sind byteless Pools (Form-A-Expertenrang, 0 kv-heads);
+# jit_kernel/hicache.py verweigert sie absichtlich (HiCacheJitZeroElementError, Gate is_byteless_element) -> nie vorbauen.
+N_ZERO=$(printf '%s\n' "$UNION" | grep -cE '"element_size": ?0[,}]' || true)
+UNION=$(printf '%s\n' "$UNION" | grep -vE '"element_size": ?0[,}]' || true)
+[ "$N_ZERO" -gt 0 ] && say "   $N_ZERO byteless HiCache entries (element_size 0) dropped -- hicache.py refuses them by design"
 N_ALL=$(printf '%s\n' "$UNION" | grep -c . || true)
 say "   kernel lists (start: $(basename "${KLISTS[0]}")): ${#KLISTS[@]} files -> $N_ALL distinct lines"
 printf '%s\n' "$UNION" | awk '{k=$1; s=($0 ~ /src-nf\/python/) ? "nf" : "27b"; c[k" "s]++} END{for (x in c) printf "     %-14s %d\n", x, c[x]}' | sort
