@@ -37945,7 +37945,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4849,
+    "line": 4860,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -38263,7 +38263,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4848,
+    "line": 4859,
     "tree": "nf"
    },
    "status": "harvested",
@@ -53711,6 +53711,34 @@
    ],
    "type": "EnvBool"
   },
+  "FLLIPER_PDFLIP_AGE_SEAT_ON_CREDIT": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "True",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "S46 F5 (NF 18.10.): an AGE PLAN to_d grant whose plan names younger victims goes to D although every front seat is held -- the seat is taken ON CREDIT (no semaphore permit; the next normal seat released passes its permit to it), so D's SEAT-AGE seat trigger sees the older request in its waiting queue and displaces the youngest. Off = the head waits at the front's seat semaphore until a seat frees by itself (rc12: 124 grants, p50 5.3 s, max 72 s there; D's seat trigger never saw them).",
+   "id": "FLLIPER_PDFLIP_AGE_SEAT_ON_CREDIT",
+   "kind": "env",
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_AGE_SEAT_ON_CREDIT",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 4577,
+    "tree": "nf"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "EnvBool"
+  },
   "FLLIPER_PDFLIP_ANCHOR_ONLY_BACKUP": {
    "bare": false,
    "choices": null,
@@ -55204,7 +55232,7 @@
      "source": {
       "file": "pdflip/front.py",
       "kind": "os.environ",
-      "line": 4316
+      "line": 4329
      }
     }
    },
@@ -65571,7 +65599,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4656
+      "line": 4667
      }
     }
    },
@@ -68769,7 +68797,7 @@
    "id": "FLLIPER_PDFLIP_MODE_PARITY_CHECK",
    "kind": "env",
    "lesestellen": [
-    "pdflip/front.py:6412"
+    "pdflip/front.py:6425"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_MODE_PARITY_CHECK",
@@ -68778,7 +68806,7 @@
    "source": {
     "file": "pdflip/front.py",
     "kind": "os.environ",
-    "line": 6412,
+    "line": 6425,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -72942,6 +72970,34 @@
    ],
    "type": "os.environ"
   },
+  "FLLIPER_PDFLIP_SEAT_ORDER_AFTER_FLIP": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "True",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "S46 F2-F4 (NF 18.10., SA #244 / PRIO=ALTER 14.10.): the seat ORDER of requests that rode a flip to P. F2: the D line re-picks by age when an older hand-off joined it during the seat wait; F3: a BATCH fall-through is queued at its age position (not behind younger ones); F4: while P is awake a younger hand-off does not take a seat before an older request still on P (D is asleep, nothing is lost). 0 = the line as before.",
+   "id": "FLLIPER_PDFLIP_SEAT_ORDER_AFTER_FLIP",
+   "kind": "env",
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_SEAT_ORDER_AFTER_FLIP",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 4582,
+    "tree": "nf"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "EnvBool"
+  },
   "FLLIPER_PDFLIP_SEAT_ROTATE": {
    "bare": false,
    "choices": null,
@@ -76034,7 +76090,7 @@
      "source": {
       "file": "pdflip/front.py",
       "kind": "os.environ",
-      "line": 4413
+      "line": 4426
      }
     }
    },
@@ -77560,7 +77616,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4643
+      "line": 4654
      }
     }
    },
@@ -89316,28 +89372,28 @@
  "schema": "flliper.catalog/1",
  "stats": {
   "curated": 125,
-  "entries": 2815,
-  "envs": 1937,
+  "entries": 2817,
+  "envs": 1939,
   "explained": 310,
   "flags": 863,
-  "harvested": 1730,
+  "harvested": 1732,
   "trees": {
    "abweichung": 50,
    "beide": 2463,
    "nur_27b": 180,
-   "nur_nf": 154
+   "nur_nf": 156
   },
   "unexplained": 650
  },
- "tree_rev": "27b=0798c91fcd+nf=8f38972d4e",
+ "tree_rev": "27b=0798c91fcd+nf=617a9d82ac",
  "trees": {
   "27b": {
    "entries": 2643,
    "rev": "0798c91fcd"
   },
   "nf": {
-   "entries": 2617,
-   "rev": "8f38972d4e"
+   "entries": 2619,
+   "rev": "617a9d82ac"
   }
  },
  "warnungen": []
