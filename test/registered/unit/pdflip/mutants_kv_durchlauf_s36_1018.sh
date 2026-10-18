@@ -14,6 +14,10 @@
 #   Direction "Write-Behind haeuft wieder an":
 #     W1  the old quiet gate is back (legs / sleep / dormancy / loads stop the pass)
 #     W2  read priority gone (a chunk never waits for a read in flight)    W3  the pass takes no read turn per chunk
+#   S38 review (18.10.):
+#     U1  disk page ids reused (lowest free id) -- stale rows load another page, the QSA stage serves the old page
+#     D1  write-behind status 2 on the SIBLING's page committed as own again (two owners, #1295 MUST_FIX 4)
+#     D2  the status-2 rule re-labels this owner's OWN page (owns() not asked)
 #   Leak / ledger:
 #     F1  ArenaMHAHostPool.free keeps the disk page (held fd leaks)       F2  HostPoolGroup.free keeps it
 #     L1  #810 books --hicache-size again under the arena host pool
@@ -60,7 +64,12 @@ F[W3]=$SRT/mem_cache/hicache_storage.py; OLD[W3]='                    tot["read_
 F[F1]=$SRT/mem_cache/pool_host/arena_pool.py; OLD[F1]='            _kv_dl.REGISTRY.release_rows(idx, _psz(self))   # S36: a freed node'"'"'s disk pages'; NEW[F1]='            pass'
 F[F2]=$SRT/mem_cache/memory_pool_host.py; OLD[F2]='                _rel(_idx)'; NEW[F2]='                pass'
 F[L1]=$SRT/server_args.py; OLD[L1]='            per_rank_bytes = int(_stg_bytes)'; NEW[L1]='            pass'
-ORDER=(R1 R2 O1 O2 O3 O4 O5 O6 C1 W1 W2 W3 F1 F2 L1)
+F[U1]=$SRT/pdflip/kv_durchlauf.py; OLD[U1]='                d = self._next
+                self._next += 1'; NEW[U1]='                d = min(set(range(self._next + 1)) - set(self._e))
+                self._next = max(self._next, d + 1)'
+F[D1]=$SRT/mem_cache/hicache_storage.py; OLD[D1]='                                if st == 2 and not _own_before.get(stem, True):'; NEW[D1]='                                if False:'
+F[D2]=$SRT/mem_cache/hicache_storage.py; OLD[D2]='                            _own_before[stem] = bool(_owns(stem)) if callable(_owns) else True'; NEW[D2]='                            _own_before[stem] = False'
+ORDER=(R1 R2 O1 O2 O3 O4 O5 O6 C1 W1 W2 W3 F1 F2 L1 U1 D1 D2)
 [ -n "${ONLY:-}" ] && ORDER=("$ONLY")
 killed=0; survived=0
 for m in "${ORDER[@]}"; do
