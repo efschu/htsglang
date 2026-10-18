@@ -2445,6 +2445,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         _depth = getattr(self, "_weg2_l3_chain_depth", 0)
         if _depth == 0:
             UnifiedRadixCache._weg2_l3_drain_budget_reset(self)
+            # S39: the tokens this peel asks for bound what TP0 queues for its broadcast drop ([need, queued])
+            self._s39_peel = [int(getattr(params, "num_tokens", 0) or 0), 0]
         self._weg2_l3_chain_depth = _depth + 1
         try:
             for component in self._components_tuple:
@@ -4735,16 +4737,28 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         same decision once it has APPLIED the same verdict (review readroomd2 B2). A verdict a worker could not apply
         at once (STATE ``pending`` while its own store write holds the rows) leaves one window in which TP0 drops
         and that worker demotes; it closes at the next broadcast and is named (READ-ROOM-STATE-DIVERGED /
-        SPILL-DIVERGED). A leaf with children or a write in flight keeps the old path. Returns True when the node
-        was dropped."""
-        if node.children or node.id in self.ongoing_write_through \
+        SPILL-DIVERGED). A leaf with a write in flight keeps the old path. Returns True when the node was dropped.
+
+        S39 (rc11 13:46:27Z, 96 s ADMISSION-WEDGE, ``delivered=0 on_frontier=448960``; ``L3-DROP FORMA`` 0x in the
+        boot): a leaf with host-only children (the next turns' wake-read spans) or a device anchor was refused here
+        on every rank, ``write_backup`` asked a claim the full arena refused and the TP group has no UD drop -- the
+        peel paid nothing. Such a leaf is still refused HERE (every rank alike, no rank-local drop), and TP0 queues
+        it: at its broadcast it drops the leaf with its host-only subtree and every worker follows the L3DROP
+        verdict before the next admission (``weg2.forma_l3_subtree``)."""
+        if node.id in self.ongoing_write_through \
                 or getattr(node, "write_through_pending_id", None) is not None:
             return False
         if any(int(getattr(cd, "lock_ref", 0) or 0) > 0 for cd in node.component_data):
             return False
         mamba = getattr(ComponentType, "MAMBA", None)
-        if mamba is not None and node.component_data[mamba].value is not None:
-            return False   # an anchor on the device leaves only with a backup (D keeps its anchors)
+        anchor_dev = mamba is not None and node.component_data[mamba].value is not None
+        if node.children or anchor_dev:
+            # children: a delete here would orphan them (#841); an anchor on the device leaves only with a copy
+            # (D keeps its anchors) -- both are TP0's broadcast verdict now (S39)
+            from sglang.srt.weg2 import forma_l3_subtree as _s39
+
+            _s39.note_refused(self, node, "children" if node.children else "device_anchor")
+            return False
         base = BASE_COMPONENT_TYPE
         before = int(tracker.get(base, 0))
         self._ud_drop_unbacked_leaf(node, tracker)
