@@ -194,3 +194,62 @@ def test_s23_a_winner_that_never_completes_still_ends_the_wait_not_the_process(t
         t0 = time.time()
         out = _on_io_thread(lambda: HiCacheFile.arena_fill_from_disk(be, arena, ["p0", "p1", "p2"], TOTAL, prefix=True))
     assert out[0] is not None and out[1] is None and time.time() - t0 < 20     # bounded: the old miss, no hang
+
+
+# --- S23: SELF-JOIN must not take a claim a sibling io thread of THIS process is filling ----------------------------
+def _sibling_thread_fill_claim(arena, stem):
+    """What a live io worker of this process is in the middle of: its fill claimed ``stem`` (registered live)."""
+    hs._FILL_TL.active = True
+    try:
+        [(slot, status, gen)] = hs._fill_claim(arena, [stem], TOTAL)
+    finally:
+        hs._FILL_TL.active = False
+    assert status == 0
+    return slot, gen
+
+
+def test_s23_self_join_leaves_a_sibling_io_threads_live_claim_alone(tmp_path, monkeypatch, caplog):
+    import threading
+
+    monkeypatch.setenv("SGLANG_WEG2_L3FILL_JOIN_IDLE_MS", "1500")
+    root = tmp_path / "store"
+    root.mkdir()
+    (root / "p1.bin").write_bytes(b"\x41" * TOTAL)
+    arena = ShmArena(str(tmp_path / "kv.bin"), TOTAL, 16)
+    be = _backend(str(root))
+    slot, gen = _sibling_thread_fill_claim(arena, "p1")      # the sibling (this test thread) is mid-fill on p1
+    done = {}
+
+    def _sibling_finishes():
+        time.sleep(0.3)
+        arena.slot_view(slot, TOTAL)[:] = b"\x41" * TOTAL
+        done["status"] = arena.complete_slots([slot], [gen], [(0, TOTAL)])
+        hs._fill_live_drop_thread()
+
+    # the sibling's registration belongs to the thread that made the claim: finish it from a helper that is NOT the
+    # reader's thread; the reader runs on its own io-named thread
+    ident_owner = threading.get_ident()
+    t_sib = threading.Thread(target=_sibling_finishes)
+    t_sib.start()
+    with envs.SGLANG_WEG2_L3FILL_SELF_JOIN_TAKEOVER.override(True), caplog.at_level(logging.WARNING, logger=hs.__name__):
+        out = _on_io_thread(lambda: HiCacheFile.arena_fill_from_disk(be, arena, ["p1"], TOTAL, prefix=True))
+    t_sib.join(10)
+    assert not any("SELF-JOIN" in r.getMessage() for r in caplog.records), [r.getMessage() for r in caplog.records]
+    assert done["status"] == [0], done            # base: [6] -- the sibling's completion refused, its read cut
+    assert out[0] == slot, (out, slot)            # the reader waited and got the sibling's page
+    hs._FILL_LIVE.pop(slot, None)
+    assert ident_owner
+
+
+def test_s23_self_join_still_takes_over_a_leftover_claim_of_a_dead_call(tmp_path, monkeypatch):
+    """h16 PP1 (weg2-10-86): our own pid, no live registration -> the old takeover stands."""
+    root = tmp_path / "store"
+    root.mkdir()
+    (root / "p1.bin").write_bytes(b"\x41" * TOTAL)
+    arena = ShmArena(str(tmp_path / "kv.bin"), TOTAL, 16)
+    be = _backend(str(root))
+    [(old, status, gen)] = arena.claim_slots(["p1"], [TOTAL])    # not through a fill: nothing registered live
+    assert status == 0
+    with envs.SGLANG_WEG2_L3FILL_SELF_JOIN_TAKEOVER.override(True):
+        out = _on_io_thread(lambda: HiCacheFile.arena_fill_from_disk(be, arena, ["p1"], TOTAL, prefix=True))
+    assert out[0] is not None and out[0] != old

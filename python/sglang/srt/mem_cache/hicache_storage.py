@@ -232,6 +232,35 @@ def fill_protected_stems() -> list:
 _SELF_JOIN_N = [0, 0]
 
 
+#: S23 (h16v4b 1018_013102, D 01:36:22-23): the slots a LIVE fill of THIS process holds, slot -> (generation, thread
+#: ident). With WAKE-PARALLEL prefetch io workers (4 threads per rank, the hold reads of a wake share the P chain's prefix
+#: stems) a claim held by our own pid is usually ANOTHER live io thread's claim, not the leftover of a dead call.
+_FILL_LIVE: dict = {}
+_FILL_LIVE_LOCK = threading.Lock()
+_FILL_TL = threading.local()
+
+
+def _fill_live_note(slots_gens) -> None:
+    if not getattr(_FILL_TL, "active", False):
+        return
+    ident = threading.get_ident()
+    with _FILL_LIVE_LOCK:
+        for slot, gen in slots_gens:
+            _FILL_LIVE[int(slot)] = (int(gen), ident)
+
+
+def _fill_live_drop_thread() -> None:
+    ident = threading.get_ident()
+    with _FILL_LIVE_LOCK:
+        for k in [k for k, (_g, t) in _FILL_LIVE.items() if t == ident]:
+            _FILL_LIVE.pop(k, None)
+
+
+def _held_by_other_live_thread(slot: int, gen: int) -> bool:
+    ent = _FILL_LIVE.get(int(slot))
+    return ent is not None and ent[0] == int(gen) and ent[1] != threading.get_ident()
+
+
 def _take_over_self_joins(arena, stems, joined, total_bytes: int):
     """SELF-JOIN (NF h16 15:34:27, P PP1, weg2-10-86): a JOINED stem whose
     holder is THIS process (``claim_info`` pid == own pid) has no other reader
@@ -260,7 +289,11 @@ def _take_over_self_joins(arena, stems, joined, total_bytes: int):
         pids = {int(t[0]): int(t[3]) for t in info([int(s) for _, s, _ in joined if int(s) >= 0])}
     except Exception:  # noqa: BLE001
         return [], joined
-    own = [j for j in joined if int(j[1]) >= 0 and pids.get(int(j[1])) == me]
+    # S23: a claim another LIVE io thread of this process is filling right now is an ordinary join (its writer makes
+    # progress); taking it over quarantined it under that thread, whose completion was then refused (LATE-COMPLETE
+    # status 6): TP1 landed 0 and TP0 207 pages of the same read, group min 0 (weg2-0-2, 71168 tokens re-prefilled)
+    own = [j for j in joined if int(j[1]) >= 0 and pids.get(int(j[1])) == me
+           and not _held_by_other_live_thread(int(j[1]), int(j[2]))]
     if not own:
         return [], joined
     st = q([int(s) for _, s, _ in own], [int(g) for _, _, g in own], 0)
@@ -711,9 +744,14 @@ def _fill_claim(arena, stems, total_bytes: int):
     from sglang.srt.mem_cache.storage.file.hicache_arena import ROLE_L3FILL
 
     try:
-        return arena.claim_slots(stems, [int(total_bytes)] * len(stems), role=ROLE_L3FILL)
+        res = arena.claim_slots(stems, [int(total_bytes)] * len(stems), role=ROLE_L3FILL)
     except TypeError:
-        return arena.claim_slots(stems, [int(total_bytes)] * len(stems))
+        res = arena.claim_slots(stems, [int(total_bytes)] * len(stems))
+    try:
+        _fill_live_note([(r[0], r[2]) for r in res if int(r[1]) == 0])
+    except Exception:  # noqa: BLE001 - an instrument of the self-join guard never breaks a claim
+        pass
+    return res
 
 
 #: HICACHE-DRAFT-TIER (user order 2026-09-24, see environ.py): the one
@@ -3946,6 +3984,19 @@ class HiCacheFile(HiCacheStorage):
 
     def arena_fill_from_disk(self, arena, stems, total_bytes: int, prefix: bool = False,
                              room_wait: bool = True, take_ref: bool = False):
+        """The L3 -> L2 fill (see ``_arena_fill_from_disk_impl``); S23: this thread's live claims are registered for the
+        run of the fill, so a sibling io thread's SELF-JOIN never takes them over."""
+        _prev = getattr(_FILL_TL, "active", False)
+        _FILL_TL.active = True
+        try:
+            return self._arena_fill_from_disk_impl(arena, stems, total_bytes, prefix=prefix, room_wait=room_wait,
+                                                   take_ref=take_ref)
+        finally:
+            _FILL_TL.active = _prev
+            _fill_live_drop_thread()
+
+    def _arena_fill_from_disk_impl(self, arena, stems, total_bytes: int, prefix: bool = False,
+                                   room_wait: bool = True, take_ref: bool = False):
         """#1433: the L3 -> L2 return path. For every stem that is NOT in the
         arena but IS on disk: claim a slot, read the whole canonical page from
         the disk store straight into the slot, complete it. Returns one entry
