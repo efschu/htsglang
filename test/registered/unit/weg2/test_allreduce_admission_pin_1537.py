@@ -210,6 +210,10 @@ EXPECTED_HELPER_REFS = {
     # (its first NO_TOKEN on group D -- the Form A gather's verdict, the same rid on
     # every rank) is still in the replicated waiting queue; one MIN per pass.
     ("managers/scheduler.py", "Scheduler._get_new_batch_prefill_raw"): {"_weg2_group_min_flags"},
+    # MIXED-D (S32, 18.10.): the short verdict, one MIN per prefill pass. Entry = `self._mixed_d_short` (boot-static, the same
+    # server_args on every D rank) and `not running_batch.is_empty()` (the replicated running batch), evaluated after the
+    # replicated new_batch exists; the rank-local blockers (logprob/embeds, chunk stamp) ride in the VOTE, never in the entry.
+    ("managers/scheduler.py", "Scheduler._mixed_d_agreed"): {"_weg2_group_min_flags"},
     ("weg2/d_park_runtime.py", "park_tick"): {"_weg2_group_min_flags"},
     ("weg2/d_park_runtime.py", "_capacity_requeue"): {"_weg2_group_min_flags"},
     ("weg2/d_park_runtime.py", "_lift_holds_when_idle"): {"_weg2_group_min_flags"},
