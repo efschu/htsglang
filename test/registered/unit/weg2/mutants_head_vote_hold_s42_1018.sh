@@ -13,15 +13,17 @@
 #   Direction RANK DISAGREEMENT (R11, raenge-nie-uneins):
 #     R1  the hold decision is rank-local (TP0 holds, the workers measure and evaluate)
 #     R2  a held rank re-sends its previous vote instead of abstaining (a stale value enters the group MIN)
-#   Switch:
+#     S5  without a refused head the fingerprint drops the waiting set (an arrival is no change)
+#   Efficacy / switch:
 #     E1  the hold is off (the budget site always measures)
+#     E2  the fingerprint requires the refused head again (rc11 14:13: no NO_TOKEN, a stale running head)
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=${ROOT:-$(cd "$HERE/../../../.." && pwd)}
 SRT=$ROOT/python/sglang/srt
 TEST=registered/unit/weg2/test_weg2_s42_head_vote_hold_1018.py
 PY=${PY:-/spinning/shvllm/.venv/bin/python}
-FILES=("$SRT/weg2/head_vote_hold.py" "$SRT/managers/scheduler.py")
+FILES=("$SRT/weg2/head_vote_hold.py" "$SRT/managers/scheduler.py" "$SRT/weg2/d_head_hold.py")
 BAKD=$(mktemp -d); for f in "${FILES[@]}"; do cp "$f" "$BAKD/$(echo "$f" | tr / _)"; done
 restore() { for f in "${FILES[@]}"; do cp "$BAKD/$(echo "$f" | tr / _)" "$f"; done; }
 trap restore EXIT
@@ -60,7 +62,12 @@ F[R2]=$S; OLD[R2]='        if _s42_held:
 F[E1]=$H; OLD[E1]='    if not sched.__dict__.pop(ARMED_ATTR, False):
         return False'; NEW[E1]='    if True:
         return False'
-ORDER=(S1 S2 S3 S4 V1 V2 R1 R2 E1)
+Q=$SRT/weg2/d_head_hold.py
+F[S5]=$Q; OLD[S5]='    return (head, waiting_rids, running_rids, landed, generation)'; NEW[S5]='    return (head, waiting_rids if head else (), running_rids, landed, generation)'
+F[E2]=$Q; OLD[E2]='    head = str(head) if head is not None and str(head) in waiting_rids else None'; NEW[E2]='    if head is None or str(head) not in waiting_rids:
+        return None
+    head = str(head)'
+ORDER=(S1 S2 S3 S4 S5 V1 V2 R1 R2 E1 E2)
 [ -n "${ONLY:-}" ] && ORDER=("$ONLY")
 killed=0; survived=0
 for m in "${ORDER[@]}"; do

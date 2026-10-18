@@ -10,10 +10,11 @@ minus ``gpu-ms``): host gap 5-9 ms at 12:11 (no head), 124-129 ms at 12:14-12:16
 rounds with the evaluation 103.6 ms, rounds without it -3.2 ms (12:12:54-12:13:14).
 
 THE RULE (group D, Form A token cut -- NF only): after a pass that built nothing
-while the HOL head (``weg2/hol_overtake.py``, the pass's first NO_TOKEN) waits,
+while requests wait (S42: with or without a refused HOL head, ``weg2/hol_overtake.py``),
 the next passes are not built as long as nothing the verdict reads has changed --
-the head, the waiting set, the running set, the landed prefetches, no chunked
-continuation -- and at the latest every ``REEVAL_EVERY_PASSES`` passes (the
+the head, the waiting set, the running set, the landed prefetches, the binding
+generation, no chunked continuation -- and at the latest every
+``REEVAL_EVERY_PASSES`` passes (the
 rank-local room: host arena, write-through acks, evictions). Every input is
 replicated and the pass count is the same on every rank, so the group holds and
 evaluates on the same iterations (the elif chain of ``get_next_batch_to_run``
@@ -53,20 +54,36 @@ def fingerprint(
     continuation: bool,
     generation: Optional[int] = None,
 ) -> Optional[tuple]:
-    """What the head's verdict reads, as replicated values; None when no head
-    can be held (no HOL head, it left the queue, a chunked continuation runs).
+    """What the waiting queue's verdict reads, as replicated values; None when
+    nothing can be held (an empty queue, a chunked continuation runs).
+
+    S42: THE REFUSED HEAD IS NO LONGER A PRECONDITION, only a term. rc11 14:13
+    (boot ..._49f9c2ea4d_1018_133242, D TP0, 6 waiting, 902 rounds/min): every
+    pass built nothing without a single NO_TOKEN (no ``X-GATE``, no admission
+    match: exactly 4.000 ``#1042 EXTENT LIFECYCLE set`` per round, all of them
+    the head vote), and ``_weg2_hol`` still named rid 34-107 -- the refused
+    head of 14:09, admitted since, never cleared (``hol_overtake.
+    note_head_admitted`` has no caller). With the head required, DQH could not
+    arm and every round paid the full head vote (sched_ms 56.9). A pass that
+    built nothing is held on the same rule whichever gate of the pass declined
+    the queue (park gate, deferred prefetch, room, seats): the waiting and
+    running sets, the landed prefetches and the generation are what can change
+    its outcome group-wide; what is rank-local or timed is bounded by
+    ``REEVAL_EVERY_PASSES``.
+
     ``generation`` (S42): the HiCache binding generation -- it moves at every
-    flip/cutover on every rank alike, so a held head is evaluated again after a
+    flip/cutover on every rank alike, so a held queue is evaluated again after a
     flip instead of riding a fingerprint taken in the previous layout."""
-    if continuation or not hol_state:
+    if continuation:
         return None
-    head = hol_state.get("rid")
     waiting_rids = tuple(sorted(str(q.rid) for q in waiting))
-    if head is None or str(head) not in waiting_rids:
+    if not waiting_rids:
         return None
+    head = (hol_state or {}).get("rid")
+    head = str(head) if head is not None and str(head) in waiting_rids else None
     landed = tuple(sorted(str(k) for k, v in (prefetch_verdicts or {}).items() if v))
     running_rids = tuple(sorted(str(r.rid) for r in running))
-    return (str(head), waiting_rids, running_rids, landed, generation)
+    return (head, waiting_rids, running_rids, landed, generation)
 
 
 class DHeadHold:
@@ -112,7 +129,7 @@ class DHeadHold:
                 "refused head is evaluated again when the head, the waiting or running set or "
                 "a landed prefetch or the binding generation changes, and at the latest every %d "
                 "passes -- not in every decode round; the head vote is not measured on a held pass either (S42)",
-                fp[0], st.held_total, len(fp[1]), len(fp[2]), n, REEVAL_EVERY_PASSES,
+                fp[0] or "-", st.held_total, len(fp[1]), len(fp[2]), n, REEVAL_EVERY_PASSES,
             )
 
 

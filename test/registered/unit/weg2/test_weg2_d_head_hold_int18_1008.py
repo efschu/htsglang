@@ -71,15 +71,31 @@ class DHeadHoldTest(unittest.TestCase):
                 self.assertTrue(hold.should_hold(_fp(H)))
                 self.assertFalse(hold.should_hold(changed), why)
 
-    def test_never_holds_without_a_refused_head(self):
+    def test_never_holds_an_empty_queue_a_continuation_or_a_pass_that_built(self):
         from sglang.srt.weg2 import d_head_hold as H
 
         hold = self._hold(H)
-        self.assertIsNone(_fp(H, hol={"rid": None}))
-        self.assertIsNone(_fp(H, hol={"rid": "weg2-9-9"}), "the head left the queue")
+        self.assertIsNone(_fp(H, waiting=()), "nothing waits: nothing to hold")
         self.assertIsNone(_fp(H, continuation=True), "a chunked continuation must proceed")
         hold.note_pass(fp=_fp(H), built_nothing=False)
         self.assertFalse(hold.should_hold(_fp(H)), "the pass built a batch: nothing armed")
+
+    def test_s42_a_pass_that_built_nothing_holds_without_a_refused_head(self):
+        """rc11 14:13: no NO_TOKEN in the pass (the queue was declined before
+        add_one_req) and ``_weg2_hol`` still named the head of 14:09, running
+        since -- the queue is held on the same rule; the head is only a term."""
+        from sglang.srt.weg2 import d_head_hold as H
+
+        for hol in ({"rid": None}, {"rid": "weg2-18-77"}):  # none / admitted and running
+            with self.subTest(hol=hol):
+                hold = self._hold(H)
+                fp = _fp(H, hol=hol)
+                self.assertIsNotNone(fp)
+                self.assertIsNone(fp[0], "a head that does not wait is no term")
+                hold.note_pass(fp=fp, built_nothing=True)
+                self.assertTrue(hold.should_hold(_fp(H, hol=hol)))
+                self.assertFalse(hold.should_hold(_fp(H, hol={"rid": HEAD})),
+                                 "a NO_TOKEN head appearing is a change")
 
     def test_off_outside_the_form_a_token_cut_and_group_d(self):
         from sglang.srt.weg2 import d_head_hold as H
