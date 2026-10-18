@@ -176,11 +176,10 @@ def _local_pp(cache: Any) -> bool:
 def form_a_role() -> Optional[str]:
     """READ-ROOM-D: the R12 role of this rank on a Form A TP group (``"host"`` = TP0, the group's one decider;
     ``"worker"``), None elsewhere. Group-uniform: the installed role plan and the switch are the same on every
-    rank. Read at most once a second (the plan is installed at boot; ``tick`` runs ~1500 rounds/s idle)."""
-    t = time.monotonic()
-    if t - _ST.role_t < 1.0:
-        return _ST.role
-    _ST.role_t = t
+    rank. S20: read EVERY time, no one-second cache -- ``role()`` is a switch read plus two attribute reads (~1 us; ``tick``
+    runs ~1500 rounds/s idle), and the cache carried a role across anything that changed it: a test that ran
+    ``form_a_host_shadow.attach`` under a patched role left ``host`` behind for a second, and the h16t F1 room-set tests
+    (plain PP trees) that ran next took the Form A dispatch of ``serve`` (SERVE-DBG role='host' on pp=0/3)."""
     try:
         from sglang.srt.mem_cache import form_a_host_shadow as _r12
 
