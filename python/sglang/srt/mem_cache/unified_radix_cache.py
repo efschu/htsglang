@@ -6026,6 +6026,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         ok = (node.component_data[ComponentType.MAMBA].host_value is not None
               or (UnifiedRadixCache._s25_kv_in_store(node) and getattr(node, "weg2_anchor_secured", False)))
         if ok:
+            # S25 (h16v3 9/9, h16v4b 2/2 ``why=mamba_claim`` losses): the once-per-node spill latch served THIS save.
+            # A node whose anchor was saved (spill 23:55:53 for node 1422), loaded back and evicted again a minute later
+            # (23:56:55) asks for a NEW save; the latch, never cleared, denied the spill and the full arena (84/84 held by
+            # D's own tree, ARENA-REF-HOLDERS gap=0) refused -> ANCHOR-LOST. The latch bounds repeated spills of a node
+            # whose saves FAIL; a success clears it.
+            node._weg2_evict_spilled = False
             UnifiedRadixCache._k15_saved_n += 1
             n = UnifiedRadixCache._k15_saved_n
             if n <= 32 or n % 256 == 0:

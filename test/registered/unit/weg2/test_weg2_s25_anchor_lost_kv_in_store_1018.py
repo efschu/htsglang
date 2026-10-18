@@ -151,3 +151,51 @@ def test_save_after_an_unmarked_release_still_tries_anchor_only():
     t2, n = _tree(), _hosted_node()
     n.component_data[ComponentType.MAMBA].host_value = None
     assert _save(t2, n) is True and t2.calls == ["anchor_only", "join"]
+
+
+# --- Teil 3: the once-per-node spill latch is cleared by a successful save (mamba_claim losses) ---
+
+from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType as _CT  # noqa: E402,F401
+
+
+def _spill_tree_mamba(refusals):
+    t = types.SimpleNamespace()
+    t.cache_controller = types.SimpleNamespace(write_policy="write_back")
+    t.calls, seq = [], list(refusals)
+
+    def _ao(node):
+        t.calls.append("anchor_only")
+        if seq.pop(0):
+            node.component_data[ComponentType.MAMBA].host_value = object()
+            return 1
+        t._k15_last_refusal = "mamba_claim"
+        return 0
+
+    t.write_backup = t.write_backup_anchor_only = _ao
+    t.writing_check = lambda write_back=False: None
+    t._weg2_mamba_pool = lambda: object()
+    t._weg2_flush_spill_room = lambda node, mp: (t.calls.append("spill"), True)[1]
+    t._weg2_evict_spill_room = types.MethodType(UnifiedRadixCache._weg2_evict_spill_room, t)
+    t.weg2_node_depth = lambda n: n.depth
+    t._weg2_sweep_last_refusal = None
+    return t
+
+
+def test_a_second_save_of_the_same_node_may_spill_again_after_the_first_succeeded():
+    """RED before: 1st save: refused, spill, saved (latch stays); anchor lost again later; 2nd save: no spill -> LOST."""
+    n = _node(backuped=True)
+    t = _spill_tree_mamba([0, 1])
+    assert _save(t, n) is True and t.calls == ["anchor_only", "spill", "anchor_only"]
+    n.component_data[ComponentType.MAMBA].host_value = None      # loaded back, device state evicted again
+    t.calls.clear()
+    t2 = _spill_tree_mamba([0, 1])
+    assert _save(t2, n) is True
+    assert t2.calls == ["anchor_only", "spill", "anchor_only"]
+
+
+def test_a_failing_node_still_spills_only_once():
+    n = _node(backuped=True)
+    t = _spill_tree_mamba([0, 0, 0, 0])
+    _save(t, n)
+    _save(t, n)
+    assert t.calls.count("spill") == 1
