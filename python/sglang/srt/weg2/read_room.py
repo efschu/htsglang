@@ -757,13 +757,18 @@ def form_a_spill(cache: Any, pool: Any, need_pages: int, released_out: Optional[
     staging = int(getattr(pool, "staging_rows", 0) or 0)
     owt = getattr(cache, "ongoing_write_through", None) or {}
     skip = {"anchor": 0, "busy": 0, "aux_host_only": 0, "host_only": 0}
+    tree_nodes = 0
     cands = []
     for node in cache._collect_all_nodes():
         if node is root:
             continue
+        tree_nodes += 1
         cd = node.component_data[BASE_COMPONENT_TYPE]
         hv = cd.host_value
         if hv is None or hv.numel() == 0:
+            # S23 (h16v4b 1018_013102: 59x D-SPILL candidates=0 with EVERY skip 0): a node without a host copy was the
+            # one silent continue -- an empty tree and a tree of device-only nodes read alike. Counted now.
+            skip["no_host"] = skip.get("no_host", 0) + 1
             continue
         if cd.value is None or getattr(node, "evicted", False):
             skip["host_only"] += 1
@@ -826,12 +831,12 @@ def form_a_spill(cache: Any, pool: Any, need_pages: int, released_out: Optional[
     k = _ST.d_spills
     if k <= 32 or k % 16 == 0 or released == 0:
         logger.info("%s D-SPILL n=%d need=%d want=%d released_pages=%d nodes=%d candidates=%d unsecured_kept=%d "
-                    "l3=on_disk:%d,written:%d kept=anchor:%d,anchor_dev:%d,children:%d,unkeyed:%d,busy:%d,"
-                    "aux_host_only:%d,host_only:%d ms=%.0f (Form A "
+                    "l3=on_disk:%d,written:%d tree_nodes=%d kept=no_host:%d,anchor:%d,anchor_dev:%d,children:%d,"
+                    "unkeyed:%d,busy:%d,aux_host_only:%d,host_only:%d ms=%.0f (Form A "
                     "TP0 decides for group D: an L3-backed host copy of D's tree leaves L2, the device keeps the "
                     "KV, the R12 STATE verdict drops the workers' rows at the next broadcast; anchors untouched)",
                     MARK, k, int(need_pages), want, released, nodes, len(cands), unsecured, on_disk, written,
-                    skip["anchor"], skip.get("anchor_dev", 0), skip.get("children", 0), skip.get("unkeyed", 0),
+                    tree_nodes, skip.get("no_host", 0), skip["anchor"], skip.get("anchor_dev", 0), skip.get("children", 0), skip.get("unkeyed", 0),
                     skip["busy"], skip["aux_host_only"], skip["host_only"],
                     (time.perf_counter() - t0) * 1000.0)
     return released

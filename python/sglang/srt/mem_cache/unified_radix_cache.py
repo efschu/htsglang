@@ -1070,6 +1070,17 @@ def _ud_refused_note(tree, node, _sf) -> None:
         pass
 
 
+
+def _s23_cut_cause(operation):
+    """S23: the cause READ-DEPTH recorded for this operation's cut (``(page, cause)``), else None. Never raises."""
+    try:
+        from sglang.srt.weg2 import read_depth as _rd
+
+        cut = _rd.cut_of(operation)
+        return None if cut is None else str(cut[1])
+    except Exception:  # noqa: BLE001 - an instrument never breaks a read
+        return None
+
 class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     #: HY (weg2/park_hold_yield.py): the retained nodes whose backup the arena
     #: refused (#1421 arena_claim) during a D park's retraction; None = no
@@ -10441,6 +10452,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # compares -- see its docstring for why a rank-local number would
             # have had the mark refused on group D's uneven-DCP phase.
             synced=min_completed_tokens,
+            # S23 (18.10.): THIS rank's READ-DEPTH cut cause (arena_full / late_complete / join_unfinished ...): the
+            # scheduler names a short read a CAPACITY-CUT only on arena_full, not on 'the probe covered it' alone
+            cut_cause=_s23_cut_cause(operation),
         )
         if _eb_rec is not None:
             # HFB (rc12z21 D 13:35:14, weg2-8-34): under the Form A END vote

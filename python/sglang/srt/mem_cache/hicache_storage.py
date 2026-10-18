@@ -1020,8 +1020,12 @@ class PrefetchOutcome(int):
         matched=None,
         deliverable=None,
         synced=None,
+        cut_cause=None,
     ):
         self = super().__new__(cls, int(loaded))
+        # S23 (18.10.): the READ-DEPTH cause of THIS rank's cut (weg2/read_depth.py), None = none recorded. Rank-local
+        # and an instrument: it only NAMES the shortfall (scheduler._weg2_note_store_shortfall), it decides nothing.
+        self.cut_cause = None if cut_cause is None else str(cut_cause)
         self.hit_tokens = int(hit_tokens if hit_tokens is not None else 0)
         self.probed = bool(probed)
         self.matched = int(matched if matched is not None else 0)
@@ -1104,14 +1108,14 @@ class PrefetchOutcome(int):
         return (
             PrefetchOutcome,
             (int(self), self.hit_tokens, self.probed, self.matched, self.deliverable,
-             self.synced),
+             self.synced, self.cut_cause),
         )
 
     def __repr__(self) -> str:
         return (
             f"PrefetchOutcome(loaded={int(self)}, hit_tokens={self.hit_tokens}, "
             f"probed={self.probed}, matched={self.matched}, "
-            f"deliverable={self.deliverable}, synced={self.synced})"
+            f"deliverable={self.deliverable}, synced={self.synced}, cut_cause={self.cut_cause})"
         )
 
 

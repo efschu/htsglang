@@ -15704,6 +15704,27 @@ class Scheduler(
         # lagging, yet the line said "the store did not hold the rest yet", so the acceptance "STORE READ
         # INCOMPLETE == 0" could not tell the two apart. Only the NAME and the counter split: the deferral
         # below is identical for both, and the STORE-HELD-DECIDE-1014 predicate it already feeds is untouched.
+        # S23 (h16v4b 1018_013102, D TP0 01:36:24, weg2-0-2 delivered=0): the label said "D's own arena room", yet the
+        # READ-DEPTH cause of that very cut was late_complete (a JOINED claim reaped under the read; arena_full on D
+        # = 0 in the whole boot, D POSTed one room request, at 01:49:56). "The probe covers the span" proves the STORE
+        # holds it, not that the ARENA cut it: CAPACITY-CUT needs the recorded cause arena_full (or none recorded).
+        _cut_cause = getattr(outcome, "cut_cause", None)
+        if (int(getattr(outcome, "hit_tokens", 0) or 0) >= int(getattr(outcome, "deliverable", 0) or 0) > 0
+                and getattr(outcome, "probed", False) and _cut_cause not in (None, "arena_full")):
+            self._weg2_store_short_held_other = getattr(self, "_weg2_store_short_held_other", 0) + 1
+            nh = self._weg2_store_short_held_other
+            if nh <= 8 or nh % 64 == 0:
+                logger.warning(
+                    "#1324 STORE READ HELD-CUT rid=%s delivered=%d deliverable=%d shortfall=%d hit_tokens=%d "
+                    "cut_cause=%s site=drain occurrence=%d held_cut_occurrence=%d -- the store HOLDS the whole span "
+                    "(probe hit covers it) and the read was cut by %s, NOT by the arena room (that would be "
+                    "cause=arena_full: CAPACITY-CUT). Deferring through the A12.2 shortfall arm. Denominator: every "
+                    "terminated store read of this rank whose record reports a page-floored shortfall AND whose "
+                    "probe hit covers the deliverable prefix AND whose recorded cut cause is not arena_full",
+                    rid, delivered, deliverable, deliverable - delivered, int(outcome.hit_tokens), _cut_cause, n,
+                    nh, _cut_cause,
+                )
+            return self._apply_prefetch_deferral(req, _VERDICT_STORE_SHORT, site="drain")
         if (int(getattr(outcome, "hit_tokens", 0) or 0) >= int(getattr(outcome, "deliverable", 0) or 0) > 0
                 and getattr(outcome, "probed", False)):
             self._weg2_store_short_capacity = getattr(self, "_weg2_store_short_capacity", 0) + 1
