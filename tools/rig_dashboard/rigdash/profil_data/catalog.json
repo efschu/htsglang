@@ -29131,7 +29131,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2702
+      "line": 2708
      }
     }
    },
@@ -29182,7 +29182,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 2692,
+    "line": 2698,
     "tree": "nf"
    },
    "status": "harvested",
@@ -29209,7 +29209,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2738
+      "line": 2744
      }
     }
    },
@@ -37924,7 +37924,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4803,
+    "line": 4809,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -38242,7 +38242,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4802,
+    "line": 4808,
     "tree": "nf"
    },
    "status": "harvested",
@@ -38647,7 +38647,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 2130,
+    "line": 2136,
     "tree": "nf"
    },
    "status": "harvested",
@@ -38823,7 +38823,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 2353,
+    "line": 2359,
     "tree": "nf"
    },
    "status": "harvested",
@@ -38850,7 +38850,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2713
+      "line": 2719
      }
     }
    },
@@ -39019,7 +39019,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2717
+      "line": 2723
      }
     }
    },
@@ -47056,7 +47056,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 2362,
+    "line": 2368,
     "tree": "nf"
    },
    "status": "harvested",
@@ -47084,7 +47084,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 2367,
+    "line": 2373,
     "tree": "nf"
    },
    "status": "harvested",
@@ -54240,7 +54240,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 2587,
+    "line": 2593,
     "tree": "nf"
    },
    "status": "harvested",
@@ -60492,7 +60492,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 3838
+      "line": 3844
      }
     }
    },
@@ -60804,7 +60804,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2213
+      "line": 2219
      }
     }
    },
@@ -60882,7 +60882,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4510
+      "line": 4516
      }
     }
    },
@@ -60990,7 +60990,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2731
+      "line": 2737
      }
     }
    },
@@ -61352,7 +61352,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 2233,
+    "line": 2239,
     "tree": "nf"
    },
    "status": "harvested",
@@ -61610,7 +61610,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 2137,
+    "line": 2143,
     "tree": "nf"
    },
    "status": "harvested",
@@ -61637,7 +61637,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2722
+      "line": 2728
      }
     }
    },
@@ -61859,7 +61859,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4490
+      "line": 4496
      }
     }
    },
@@ -62601,7 +62601,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 2148,
+    "line": 2154,
     "tree": "nf"
    },
    "status": "harvested",
@@ -62629,7 +62629,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 2143,
+    "line": 2149,
     "tree": "nf"
    },
    "status": "harvested",
@@ -65404,7 +65404,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4610
+      "line": 4616
      }
     }
    },
@@ -66910,7 +66910,7 @@
    "id": "FLLIPER_PDFLIP_L3_REFRESH_KEPT",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/hicache_storage.py:4677"
+    "mem_cache/hicache_storage.py:4682"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_L3_REFRESH_KEPT",
@@ -66919,7 +66919,7 @@
    "source": {
     "file": "mem_cache/hicache_storage.py",
     "kind": "os.environ",
-    "line": 4677,
+    "line": 4682,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -67120,7 +67120,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 2598,
+    "line": 2604,
     "tree": "nf"
    },
    "status": "harvested",
@@ -68346,7 +68346,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4419
+      "line": 4425
      }
     }
    },
@@ -68406,6 +68406,34 @@
     "nf"
    ],
    "type": "EnvInt"
+  },
+  "FLLIPER_PDFLIP_MIXED_D_SHORT": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "True",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "MIXED-D (S32, user 18.10. \"mixed chunk fuer kurze D-Prefills wieder an\"): on the Weg-2 D group a SHORT prefill batch (summed uncached u < halbX = F_halb x X (SOLL R2), nothing chunked) is folded together with the running decodes into ONE MIXED forward instead of halting them; every running spec row degrades to a plain 1-token extend of its pending bonus token (fLLiper PR #36933 mechanism), drafting resumes the next decode step. Big prefills (R3 set after the timer, R6 rest, any chunk of a chunked request) are never mixed. New feature -> default ON; 0 = the old halt-the-decodes path, byte for byte.",
+   "id": "FLLIPER_PDFLIP_MIXED_D_SHORT",
+   "kind": "env",
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_MIXED_D_SHORT",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 2102,
+    "tree": "nf"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "EnvBool"
   },
   "FLLIPER_PDFLIP_MODE_PARITY_CHECK": {
    "bare": false,
@@ -68934,7 +68962,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 2578,
+    "line": 2584,
     "tree": "nf"
    },
    "status": "explained",
@@ -73679,7 +73707,7 @@
    "id": "FLLIPER_PDFLIP_STORE_SHORT_HELD_DECIDE",
    "kind": "env",
    "lesestellen": [
-    "managers/scheduler.py:944"
+    "managers/scheduler.py:945"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_STORE_SHORT_HELD_DECIDE",
@@ -73688,7 +73716,7 @@
    "source": {
     "file": "managers/scheduler.py",
     "kind": "os.environ",
-    "line": 944,
+    "line": 945,
     "tree": "nf"
    },
    "status": "harvested",
@@ -73715,7 +73743,7 @@
      "source": {
       "file": "managers/scheduler.py",
       "kind": "os.environ",
-      "line": 956
+      "line": 957
      }
     }
    },
@@ -75965,7 +75993,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 2109,
+    "line": 2115,
     "tree": "nf"
    },
    "status": "harvested",
@@ -77154,7 +77182,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4597
+      "line": 4603
      }
     }
    },
@@ -88910,28 +88938,28 @@
  "schema": "flliper.catalog/1",
  "stats": {
   "curated": 125,
-  "entries": 2802,
-  "envs": 1924,
+  "entries": 2803,
+  "envs": 1925,
   "explained": 310,
   "flags": 863,
-  "harvested": 1724,
+  "harvested": 1725,
   "trees": {
    "abweichung": 49,
    "beide": 2462,
    "nur_27b": 181,
-   "nur_nf": 141
+   "nur_nf": 142
   },
   "unexplained": 643
  },
- "tree_rev": "27b=0798c91fcd+nf=beaa1406cb",
+ "tree_rev": "27b=0798c91fcd+nf=76df327107",
  "trees": {
   "27b": {
    "entries": 2643,
    "rev": "0798c91fcd"
   },
   "nf": {
-   "entries": 2603,
-   "rev": "beaa1406cb"
+   "entries": 2604,
+   "rev": "76df327107"
   }
  },
  "warnungen": []
