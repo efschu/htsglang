@@ -263,6 +263,7 @@ class QSAIndexer(MultiPlatformOp):
             logical_positions=logical_positions,
             compress_ratio=self.compress_ratio,
             is_extend=is_extend,
+            always_rows=getattr(metadata, "ring_always_rows", None),   # S37: MIXED tails store like decode
         )
 
     def _group_ring_slots(
@@ -309,8 +310,31 @@ class QSAIndexer(MultiPlatformOp):
                 "QSA metadata is missing the precomputed write plan; the "
                 "sparse-attention backend derives it from the batch lengths"
             )
-        if metadata.write_locs.numel() == 0:
+        if metadata.write_locs.numel():
+            self._compress_planned_groups(token_k, rope_positions, metadata, is_extend)
+        # S37: the decode TAIL rows of a MIXED forward close their group like a decode step -- members from the
+        # pending ring (their own token was stored there above), never from this forward's packed extend rows
+        tail_locs = getattr(metadata, "tail_write_locs", None)
+        if tail_locs is not None and tail_locs.numel():
+            self._compress_from_ring(pool, metadata.tail_group_ring_locs, tail_locs)
+
+    def _compress_from_ring(self, pool, group_locs, compressed_locs) -> None:
+        """S37: compress planned groups whose members sit in the pending ring (the decode source)."""
+        source_keys = pool.get_qsa_key_state_buffer(self.layer_id)
+        source_rope = pool.qsa_rope_position_buffer
+        if self._use_fused_compress(pool):
+            self._fused_compress_store(
+                pool, group_locs, compressed_locs, source_keys=source_keys, source_rope=source_rope,
+            )
             return
+        key_groups = source_keys[group_locs]
+        pooled = average_pool_qsa_keys(key_groups)
+        compressed_rope_positions = self._rope_from_matrix(source_rope[group_locs[:, 0]])
+        normalized = self.normalize_compressed_keys(pooled, compressed_rope_positions)
+        pool.set_qsa_compressed_k_buffer(self.layer_id, compressed_locs, normalized)
+
+    def _compress_planned_groups(self, token_k, rope_positions, metadata, is_extend: bool) -> None:
+        pool = metadata.token_to_kv_pool
         group_end_positions = metadata.compress_group_positions.long()
         compressed_locs = metadata.write_locs
         if is_extend:
