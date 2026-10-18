@@ -2100,6 +2100,16 @@ class Envs:
     # (fLLiper PR #36933 mechanism), drafting resumes the next decode step. Big prefills (R3 set after the timer, R6 rest, any chunk
     # of a chunked request) are never mixed. New feature -> default ON; 0 = the old halt-the-decodes path, byte for byte.
     FLLIPER_PDFLIP_MIXED_D_SHORT = EnvBool(True)
+    # MIXED-D SHORT-CHUNKED (S50, user order 18.10. ~09:10Z "mixed chunk fuer kurze D-Prefills wieder an"): a request D
+    # CHUNKS is still a SHORT D prefill when its whole uncached amount at its first D chunk (seqlen - prefix) lies under the
+    # front's halbX (SOLL R2) -- D's chunk budget (512..2240 on rc13) split such requests, and the lifetime chunk stamp then
+    # kept every chunk unmixed (rc13 D log: 44 of 57 chunk forwards with running decodes belonged to requests under halbX).
+    # A request whose total is >= halbX stays BIG: none of its chunks mixes (R3 timer end, R6 rest), as before.
+    # New feature -> default ON; 0 = any chunked request blocks the mix (S32 form), byte for byte.
+    FLLIPER_PDFLIP_MIXED_D_SHORT_CHUNKED = EnvBool(True)
+    # MIXED-D CENSUS (S50): every this many gate decisions one line "MIXED-D CENSUS" with the mixed share and the refusal
+    # reasons (big_chunk / no_halfx / u_ge_halfx / e2_handoff / local_block / group_veto). 0 = no census line.
+    FLLIPER_PDFLIP_MIXED_D_CENSUS_N = EnvInt(64)
     # DECODE-COLLECT D-CHECK (user ~19:12Z: "es wird 7,5 gesammelt, wenn dann
     # gesammelt nicht mehr token anstehen, als X in D prefillen wuerde, dann
     # prefillt er in D die kleine menge ... auch diese zeit muss einstellbar

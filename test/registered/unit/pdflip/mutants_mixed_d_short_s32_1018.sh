@@ -35,7 +35,7 @@ declare -A F OLD NEW
 F[G1]=$SRT/pdflip/mixed_d_short.py; OLD[G1]='return int(u_tokens) < hx'; NEW[G1]='return int(u_tokens) <= hx'
 F[G2]=$SRT/pdflip/mixed_d_short.py; OLD[G2]='if int(x_tokens) <= 0 or chunked or no_forward:'; NEW[G2]='if int(x_tokens) <= 0 or no_forward:'
 F[A1]=$SRT/managers/scheduler.py; OLD[A1]='agreed = bool(self._pdflip_group_min_flags([mine])[0])'; NEW[A1]='agreed = bool(mine)'
-F[K1]=$SRT/managers/scheduler.py; OLD[K1]='self.chunked_req._mixed_d_was_chunked = True'; NEW[K1]='pass'
+F[K1]=$SRT/managers/scheduler.py; OLD[K1]='_mds_stamp.stamp_chunked(self.chunked_req)'; NEW[K1]='pass'
 F[S1]=$SRT/managers/schedule_batch.py; OLD[S1]='merged[-running_bs:] = tail_base + 1'; NEW[S1]='merged[-running_bs:] = tail_base'
 F[S2]=$SRT/managers/schedule_batch.py; OLD[S2]='        if spec_mix:
             delta = -1'; NEW[S2]='        if spec_mix:

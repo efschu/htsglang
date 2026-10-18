@@ -242,6 +242,7 @@ from flliper.srt.pdflip import fork_anchor as _pdflip_fork
 from flliper.srt.pdflip import twin_anchor as _pdflip_twin_anchor  # TWIN ANCHOR (y4a 16-28)
 from flliper.srt.pdflip import d_park_read as _pdflip_park_read  # PARK-RETAIN READ
 from flliper.srt.pdflip import lanes_p as _lanes_p  # PRIORITY LANES 1008 (L3): the P-side lane floor
+from flliper.srt.pdflip import mixed_d_short as _mds_stamp  # MIXED-D chunk stamp + S50 total (short-chunked)
 from flliper.srt.pdflip import resume_via_p as _pdflip_rvp  # RESUME-VIA-P
 from flliper.srt.pdflip import front_x as _pdflip_front_x  # FRONT-X-MIT: the front's decision X at D's X gate
 from flliper.srt.pdflip import d_wall_head as _pdflip_d_wall_head  # PW-R
@@ -18671,9 +18672,10 @@ class Scheduler(
         # the final chunk of a resumed one look like a middle chunk). Every other continuation is counted exactly as before.
         if self.chunked_req is not None and not _lanes_p.held_without_seat(self.chunked_req, can_run_list):
             self.chunked_req.inflight_middle_chunks += 1
-            # MIXED-D: lifetime-sticky. A request that has ever been chunked is a BIG prefill; its last
-            # chunk (small by construction) must not read as a short one (R6 rest stays unmixed).
-            self.chunked_req._mixed_d_was_chunked = True
+            # MIXED-D: lifetime-sticky chunk stamp. S50: plus, once, the request's whole uncached amount at its
+            # first D chunk -- a BIG one (>= halbX) keeps every chunk unmixed (R6 rest), a SHORT one D only had to
+            # chunk mixes (pdflip/mixed_d_short.py: chunked_big).
+            _mds_stamp.stamp_chunked(self.chunked_req)
 
         # fnFL2 H42: this pass's anchor bodies join the carried tails; every
         # tail IN this batch takes its middle-chunk increment (no output until
@@ -18873,15 +18875,15 @@ class Scheduler(
 
         x = int(_pdflip_store_short_tail_x(self))
         u = int(getattr(new_batch, "extend_num_tokens", 0) or 0)
-        chunked = self.chunked_req is not None or any(
-            getattr(r, "_mixed_d_was_chunked", False) for r in new_batch.reqs
-        )
         hx = _mds.batch_half_x(new_batch.reqs)
+        # S50: a chunked request blocks only when it is BIG (whole uncached amount >= halbX, or none stamped)
+        chunked = _mds.chunked_big(new_batch.reqs, self.chunked_req, hx)
         no_fwd = _mds.end_state_handoff(new_batch.reqs)
         mine = local_ok and _mds.short_gate(u, x, hx, chunked, no_fwd)
         agreed = bool(self._pdflip_group_min_flags([mine])[0])
         if agreed:
             _mds.note_mixed(u, len(running_batch.reqs), hx, x)
+        _mds.note_verdict(_mds.refusal_reason(u, x, hx, chunked, no_fwd, local_ok), agreed)
         return agreed
 
     def _can_schedule_lora_req(
