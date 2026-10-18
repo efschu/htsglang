@@ -64,6 +64,7 @@ class _RefOnLand(list):
         super().__init__([None] * n)
         self._arena = arena
         self.refused = 0
+        self.refused_at: list = []
 
     def __setitem__(self, i, v):
         old = list.__getitem__(self, i)
@@ -76,6 +77,7 @@ class _RefOnLand(list):
                 ok = False
             if not ok:
                 self.refused += 1
+                self.refused_at.append(int(i))
                 v = None
         if old is not None:
             try:
@@ -218,15 +220,35 @@ class fill_protect_scope:
         except Exception:  # noqa: BLE001 - no protection, the old eviction
             stems = None
         _FILL_CTX.protect = stems
+        if stems:
+            with _FILL_ACTIVE_LOCK:
+                _FILL_ACTIVE[id(self)] = stems
         return self
 
     def __exit__(self, *exc):
         _FILL_CTX.protect = self.prev
+        with _FILL_ACTIVE_LOCK:
+            _FILL_ACTIVE.pop(id(self), None)
         return False
 
 
+#: S24 SIBLING-EVICT (h16v5 1af79968a7, D 03:31:55, weg2-2-54 / weg2-0-25): the WAKE-PARALLEL prefetch io threads fill
+#: concurrently. ``_FILL_CTX`` is thread-local, so the room eviction of one read (weg2-0-25, need=259) kept only ITS
+#: stems off the list and took the tail of the sibling read's kept chain (``ORDERED-EVICT victims=[weg2-2-54:...
+#: pages=162,lowest_page=1538]``) in the window between that sibling's fill COMPLETE and its reference -- the sibling
+#: landed 1538 of 1700 on all three ranks (fill_none / arena_chain_recheck, one event). The stems of EVERY fill that
+#: runs in this process are off every fill's eviction list while it runs. id(scope) -> stems.
+_FILL_ACTIVE: dict = {}
+_FILL_ACTIVE_LOCK = threading.Lock()
+
+
 def fill_protected_stems() -> list:
-    return list(getattr(_FILL_CTX, "protect", None) or ())
+    own = list(getattr(_FILL_CTX, "protect", None) or ())
+    with _FILL_ACTIVE_LOCK:
+        others = [st for stems in _FILL_ACTIVE.values() for st in stems]
+    if not others:
+        return own
+    return list(dict.fromkeys(own + others))
 
 
 _SELF_JOIN_N = [0, 0]
@@ -733,6 +755,11 @@ def _read_depth_fill_reasons(stems, on_disk, out, joined, still_full, being_writ
         from sglang.srt.weg2 import read_depth as _rd
 
         _rd.fill_reasons_reset()
+        # S24: a slot the fill landed but whose reference was refused (evicted between COMPLETE and REF) -- named,
+        # not the nameless fill_none (first reason of an index wins)
+        for i in getattr(out, "refused_at", ()) or ():
+            if out[int(i)] is None:
+                _rd.fill_reason(int(i), _rd.FILL_EVICTED_BEFORE_REF)
         for i, why in (stats.get("why") or {}).items():
             if out[int(i)] is None:
                 _rd.fill_reason(int(i), why)
