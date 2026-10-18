@@ -16985,8 +16985,29 @@
    "type": "bool"
   },
   "--no-p-host-overlap": {
+   "abweichung": {
+    "27b": {
+     "default": null,
+     "help": "Turn --p-host-overlap off against the registry row's default (A/B arm).",
+     "source": {
+      "file": "weg2/launcher.py",
+      "kind": "argparse",
+      "line": 24315
+     }
+    },
+    "nf": {
+     "default": null,
+     "help": "Group P: the A/B arm of --p-host-overlap (on by default since S43): every chunk exchanges its output on the PP ring again, the chunked-prefill publish runs inline, no P-NOSYNC.",
+     "source": {
+      "file": "weg2/launcher.py",
+      "kind": "argparse",
+      "line": 23801
+     }
+    }
+   },
    "baeume": [
-    "27b"
+    "27b",
+    "nf"
    ],
    "bare": true,
    "choices": null,
@@ -18231,8 +18252,8 @@
      }
     },
     "nf": {
-     "default": null,
-     "help": "Group P: let each stage's host work for the NEXT prefill chunk run while the forward it just launched computes (managers/weg2_p_overlap.py). Adds SGLANG_WEG2_P_HOST_OVERLAP=1 and upstream's SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM=1 to group P only: a middle chunk exchanges no output (the last rank stops waiting on its own forward), the last rank fences its schedule stream device-side instead, and the chunked-prefill HiCache publish moves from the plan to right after the next launch. Measured reason (weg2xsn420, 4x98k): PP2 pass 873 ms vs 733 gpu-ms, ~95-140 ms card idle per 4096 chunk, flat over depth. Default off = argv and env byte-identical to before.",
+     "default": true,
+     "help": "Group P: let each stage's host work for the NEXT prefill chunk run while the forward it just launched computes (managers/weg2_p_overlap.py). Adds SGLANG_WEG2_P_HOST_OVERLAP=1 and upstream's SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM=1 to group P only: a middle chunk exchanges no output (the last rank stops waiting on its own forward), the last rank fences its schedule stream device-side instead, and the chunked-prefill HiCache publish moves from the plan to right after the next launch. Measured reason (weg2xsn420, 4x98k): PP2 pass 873 ms vs 733 gpu-ms, ~95-140 ms card idle per 4096 chunk, flat over depth. DEFAULT ON since S43 (NF rc12 1018: PP0 duty 57 %% in its busy runs, 80 s of PP0 commit_ms on middle-chunk output exchanges alone -- the output ring, not L3; user rule 14.10. new features on). --no-p-host-overlap = the old argv/env, byte-identical.",
      "source": {
       "file": "weg2/launcher.py",
       "kind": "argparse",
@@ -29686,7 +29707,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2708
+      "line": 2723
      }
     }
    },
@@ -29741,7 +29762,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 2698
+    "line": 2713
    },
    "status": "geerntet",
    "text": "",
@@ -29764,7 +29785,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2744
+      "line": 2759
      }
     }
    },
@@ -38483,7 +38504,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 4817
+    "line": 4832
    },
    "status": "unerklaert",
    "text": "",
@@ -38801,7 +38822,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 4816
+    "line": 4831
    },
    "status": "geerntet",
    "text": "",
@@ -39377,7 +39398,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2719
+      "line": 2734
      }
     }
    },
@@ -39546,7 +39567,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2723
+      "line": 2738
      }
     }
    },
@@ -48844,7 +48865,7 @@
     "baum": "nf",
     "file": "environ.py",
     "kind": "environ",
-    "line": 3569
+    "line": 3584
    },
    "status": "kuratiert",
    "text": "H88: Umgebungsform von --moe-act-int8 on: die int4-Experten (compressed-tensors WNA16, MoE) rechnen mit int8-Aktivierungen (W4A8) statt mit 16-Bit-Aktivierungen (W4A16). Standard aus; einer der beiden Schalter genügt. Dieser Baum hat das W4A8-MoE-Schema (CompressedTensorsWNA16A8MoE, H88-B): mit dem Schalter an wählt die Schema-Auswahl es für die int4-Expertenschichten auf CUDA (dynamische int8-Aktivierung je Token, Marlin-W4A8-Kernel); zusammen mit --moe-runner-backend triton bricht der Start mit RuntimeError ab. Ein Baum ohne das Schema bräche mit dem Text ab: MOE-ACT-INT8 requested but no W4A8 MoE scheme in this tree.",
@@ -64614,6 +64635,34 @@
    "text": "",
    "type": "EnvBool"
   },
+  "SGLANG_WEG2_ANCHOR_ONLY_READ": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "True",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "e1 ANCHOR-ONLY READ (NF h13 14:35:36, weg2-24-181): the match reached the KV but no node carried a Mamba state (the anchor sat in L3 only): the GDN-holding rank reads only that anchor blob and attaches it as the node's host Mamba value (MAMBA-HOST-RESUME). 0 = off.",
+   "id": "SGLANG_WEG2_ANCHOR_ONLY_READ",
+   "kind": "env",
+   "level": "experte",
+   "name": "SGLANG_WEG2_ANCHOR_ONLY_READ",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "baum": "nf",
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 2609
+   },
+   "status": "geerntet",
+   "text": "",
+   "type": "EnvBool"
+  },
   "SGLANG_WEG2_ARENA_CHAIN_VOID": {
    "baeume": [
     "nf"
@@ -71474,7 +71523,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 3852
+      "line": 3867
      }
     }
    },
@@ -71864,7 +71913,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4524
+      "line": 4539
      }
     }
    },
@@ -71971,7 +72020,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2737
+      "line": 2752
      }
     }
    },
@@ -72618,7 +72667,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2728
+      "line": 2743
      }
     }
    },
@@ -72840,7 +72889,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4504
+      "line": 4519
      }
     }
    },
@@ -73946,7 +73995,7 @@
    "id": "SGLANG_WEG2_EVICT_ANCHOR_SAVE",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/unified_radix_cache.py:5932"
+    "mem_cache/unified_radix_cache.py:6120"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_EVICT_ANCHOR_SAVE",
@@ -73956,7 +74005,7 @@
     "baum": "nf",
     "file": "mem_cache/unified_radix_cache.py",
     "kind": "os.environ",
-    "line": 5932
+    "line": 6120
    },
    "status": "unerklaert",
    "text": "",
@@ -76411,7 +76460,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4624
+      "line": 4639
      }
     }
    },
@@ -79507,7 +79556,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4433
+      "line": 4448
      }
     }
    },
@@ -80579,7 +80628,7 @@
    "id": "SGLANG_WEG2_PF_TOLD_ACK_TIMEOUT_S",
    "kind": "env",
    "lesestellen": [
-    "managers/weg2_told_fallback.py:1831"
+    "managers/weg2_told_fallback.py:1877"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_PF_TOLD_ACK_TIMEOUT_S",
@@ -80589,7 +80638,7 @@
     "baum": "nf",
     "file": "managers/weg2_told_fallback.py",
     "kind": "os.environ",
-    "line": 1831
+    "line": 1877
    },
    "status": "geerntet",
    "text": "",
@@ -84625,7 +84674,7 @@
    "id": "SGLANG_WEG2_SPILL_REF_FREE",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/unified_radix_cache.py:6110"
+    "mem_cache/unified_radix_cache.py:6298"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_SPILL_REF_FREE",
@@ -84635,7 +84684,7 @@
     "baum": "nf",
     "file": "mem_cache/unified_radix_cache.py",
     "kind": "os.environ",
-    "line": 6110
+    "line": 6298
    },
    "status": "unerklaert",
    "text": "",
@@ -85082,7 +85131,7 @@
    "id": "SGLANG_WEG2_SWEEP_REFUSED_MEMO",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/unified_radix_cache.py:8000"
+    "mem_cache/unified_radix_cache.py:8188"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_SWEEP_REFUSED_MEMO",
@@ -85092,7 +85141,7 @@
     "baum": "nf",
     "file": "mem_cache/unified_radix_cache.py",
     "kind": "os.environ",
-    "line": 8000
+    "line": 8188
    },
    "status": "unerklaert",
    "text": "",
@@ -85546,6 +85595,62 @@
    "text": "",
    "type": "EnvInt"
   },
+  "SGLANG_WEG2_TF_ANCHOR_READ": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "True",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "S43 TF-ANCHOR-READ (NF rc12 1018 16:39:16, pdflip-3-186): PP0's TOLD-FIDELITY floor search reads the Mamba anchor blob of a depth every follower proved when PP0's tree holds the KV there but its anchor only in the store (dropped from the arena to L3) -- instead of falling to a shallow floor and recomputing ~90k tokens. PP0's one verdict for every rank (SOLL R11). 0 = off.",
+   "id": "SGLANG_WEG2_TF_ANCHOR_READ",
+   "kind": "env",
+   "level": "experte",
+   "name": "SGLANG_WEG2_TF_ANCHOR_READ",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "baum": "nf",
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 2616
+   },
+   "status": "geerntet",
+   "text": "",
+   "type": "EnvBool"
+  },
+  "SGLANG_WEG2_TF_ANCHOR_READ_MAX": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "3",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "S43: at most this many anchor reads per TF floor search (each one blob, arena in place or one L3 fill on the scheduler thread).",
+   "id": "SGLANG_WEG2_TF_ANCHOR_READ_MAX",
+   "kind": "env",
+   "level": "experte",
+   "name": "SGLANG_WEG2_TF_ANCHOR_READ_MAX",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "baum": "nf",
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 2619
+   },
+   "status": "geerntet",
+   "text": "",
+   "type": "EnvInt"
+  },
   "SGLANG_WEG2_TMS_PRELOAD_SO": {
    "baeume": [
     "27b",
@@ -85751,7 +85856,7 @@
    "id": "SGLANG_WEG2_TOLD_DEFER_BEAT_S",
    "kind": "env",
    "lesestellen": [
-    "managers/weg2_told_fallback.py:1034"
+    "managers/weg2_told_fallback.py:1080"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_TOLD_DEFER_BEAT_S",
@@ -85761,7 +85866,7 @@
     "baum": "nf",
     "file": "managers/weg2_told_fallback.py",
     "kind": "os.environ",
-    "line": 1034
+    "line": 1080
    },
    "status": "unerklaert",
    "text": "",
@@ -86310,7 +86415,7 @@
    "id": "SGLANG_WEG2_TOLD_WAIT_HARD_S",
    "kind": "env",
    "lesestellen": [
-    "managers/weg2_told_fallback.py:981"
+    "managers/weg2_told_fallback.py:1027"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_TOLD_WAIT_HARD_S",
@@ -86320,7 +86425,7 @@
     "baum": "nf",
     "file": "managers/weg2_told_fallback.py",
     "kind": "os.environ",
-    "line": 981
+    "line": 1027
    },
    "status": "unerklaert",
    "text": "",
@@ -86341,7 +86446,7 @@
    "id": "SGLANG_WEG2_TOLD_WAIT_MARGIN_S",
    "kind": "env",
    "lesestellen": [
-    "managers/weg2_told_fallback.py:999"
+    "managers/weg2_told_fallback.py:1045"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_TOLD_WAIT_MARGIN_S",
@@ -86351,7 +86456,7 @@
     "baum": "nf",
     "file": "managers/weg2_told_fallback.py",
     "kind": "os.environ",
-    "line": 999
+    "line": 1045
    },
    "status": "unerklaert",
    "text": "",
@@ -88342,7 +88447,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4611
+      "line": 4626
      }
     }
    },
@@ -89122,28 +89227,28 @@
  "schema": "flliper.catalog/1",
  "stats": {
   "baeume": {
-   "abweichung": 47,
-   "beide": 2460,
-   "nur_27b": 181,
-   "nur_nf": 152
+   "abweichung": 48,
+   "beide": 2461,
+   "nur_27b": 180,
+   "nur_nf": 155
   },
-  "entries": 2811,
-  "envs": 1932,
+  "entries": 2814,
+  "envs": 1935,
   "erklaert": 305,
   "flags": 864,
-  "geerntet": 1730,
+  "geerntet": 1733,
   "kuratiert": 125,
   "unerklaert": 651
  },
- "tree_rev": "27b=02123ee2ef+nf=be25da3928",
+ "tree_rev": "27b=02123ee2ef+nf=4990b7f649",
  "trees": {
   "27b": {
    "entries": 2641,
    "rev": "02123ee2ef"
   },
   "nf": {
-   "entries": 2612,
-   "rev": "be25da3928"
+   "entries": 2616,
+   "rev": "4990b7f649"
   }
  },
  "warnungen": []
