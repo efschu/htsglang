@@ -16927,6 +16927,26 @@
    "type": "bool"
   },
   "--no-p-host-overlap": {
+   "abweichung": {
+    "27b": {
+     "default": null,
+     "help": "Turn --p-host-overlap off against the registry row's default (A/B arm).",
+     "source": {
+      "file": "pdflip/launcher.py",
+      "kind": "argparse",
+      "line": 24419
+     }
+    },
+    "nf": {
+     "default": null,
+     "help": "Group P: the A/B arm of --p-host-overlap (on by default since S43): every chunk exchanges its output on the PP ring again, the chunked-prefill publish runs inline, no P-NOSYNC.",
+     "source": {
+      "file": "pdflip/launcher.py",
+      "kind": "argparse",
+      "line": 23711
+     }
+    }
+   },
    "bare": true,
    "choices": null,
    "cost": "",
@@ -16950,7 +16970,8 @@
    "status": "harvested",
    "text": "",
    "trees": [
-    "27b"
+    "27b",
+    "nf"
    ],
    "type": "bool"
   },
@@ -18214,8 +18235,8 @@
      }
     },
     "nf": {
-     "default": null,
-     "help": "Group P: let each stage's host work for the NEXT prefill chunk run while the forward it just launched computes (managers/pdflip_p_overlap.py). Adds FLLIPER_PDFLIP_P_HOST_OVERLAP=1 and upstream's FLLIPER_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM=1 to group P only: a middle chunk exchanges no output (the last rank stops waiting on its own forward), the last rank fences its schedule stream device-side instead, and the chunked-prefill HiCache publish moves from the plan to right after the next launch. Measured reason (weg2xsn420, 4x98k): PP2 pass 873 ms vs 733 gpu-ms, ~95-140 ms card idle per 4096 chunk, flat over depth. Default off = argv and env byte-identical to before.",
+     "default": true,
+     "help": "Group P: let each stage's host work for the NEXT prefill chunk run while the forward it just launched computes (managers/pdflip_p_overlap.py). Adds FLLIPER_PDFLIP_P_HOST_OVERLAP=1 and upstream's FLLIPER_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM=1 to group P only: a middle chunk exchanges no output (the last rank stops waiting on its own forward), the last rank fences its schedule stream device-side instead, and the chunked-prefill HiCache publish moves from the plan to right after the next launch. Measured reason (weg2xsn420, 4x98k): PP2 pass 873 ms vs 733 gpu-ms, ~95-140 ms card idle per 4096 chunk, flat over depth. DEFAULT ON since S43 (NF rc12 1018: PP0 duty 57 %% in its busy runs, 80 s of PP0 commit_ms on middle-chunk output exchanges alone -- the output ring, not L3; user rule 14.10. new features on). --no-p-host-overlap = the old argv/env, byte-identical.",
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
@@ -29131,7 +29152,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2708
+      "line": 2723
      }
     }
    },
@@ -29182,7 +29203,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 2698,
+    "line": 2713,
     "tree": "nf"
    },
    "status": "harvested",
@@ -29209,7 +29230,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2744
+      "line": 2759
      }
     }
    },
@@ -37924,7 +37945,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4809,
+    "line": 4849,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -38242,7 +38263,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4808,
+    "line": 4848,
     "tree": "nf"
    },
    "status": "harvested",
@@ -38850,7 +38871,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2719
+      "line": 2734
      }
     }
    },
@@ -39019,7 +39040,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2723
+      "line": 2738
      }
     }
    },
@@ -52181,6 +52202,62 @@
    ],
    "type": "EnvBool"
   },
+  "FLLIPER_OPT_MOE_POOL_EAGER_LRU_MAPPED": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "True",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "S44/H107c (18.10.): H107 also arms on a MAPPED residency -- a frozen load-time layout whose residents sit at slots other than their own id, as long as ``resident_slot`` maps the R residents one-to-one onto [0, R). The NF D pool runs on the Platztausch Karte (v2), whose buffer order is [prefix | pad | extra] (``_local_map_layout``): local pad 0 sits BEHIND the prefix, so ``slot != id`` on every D rank and H107 never armed on the metal (rc12 1018_153151 D: 0x 'H107 EAGER-LRU' against 1587x 'expert-major prefill, 3 waves, 0.33-0.44 GiB H2D'; every D extend 1.5-2.5 s, decode stood 33-40 %). Wave 0 reads each resident at ``resident_slot[e]`` instead of ``e``; nothing else changes. Bit-identical (a row choice never changes what the apply computes). False: H107 only on the identity layout (H107b). Rank-uniform launcher env; the waves are rank-local (no collective).",
+   "id": "FLLIPER_OPT_MOE_POOL_EAGER_LRU_MAPPED",
+   "kind": "env",
+   "level": "expert",
+   "name": "FLLIPER_OPT_MOE_POOL_EAGER_LRU_MAPPED",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 3759,
+    "tree": "nf"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "EnvBool"
+  },
+  "FLLIPER_OPT_MOE_POOL_EAGER_LRU_RECLAIM": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "True",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "S44/H107d (18.10.): when the H107 misses would need MORE waves than the plain plan + 1 (the warm LRU holds most scratch rows, so few rows are writable), the coldest hit rows are RECLAIMED: their experts are read in the fetch-free wave 0, and only then (same stream, write-after-read) do later miss waves overwrite those rows. Waves stay <= plain + 1, the H2D stays misses-only, the decode LRU keeps its hottest rows. Writable rows are also taken coldest first (free/staging rows, then the oldest ``row_use``), which rides the same D2H as the routing. Without it a big extend under a warm LRU fell into dozens of tiny waves (or, with no writable row left, back to the plain plan). False: H107's plan as before.",
+   "id": "FLLIPER_OPT_MOE_POOL_EAGER_LRU_RECLAIM",
+   "kind": "env",
+   "level": "expert",
+   "name": "FLLIPER_OPT_MOE_POOL_EAGER_LRU_RECLAIM",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 3770,
+    "tree": "nf"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "EnvBool"
+  },
   "FLLIPER_OPT_MOE_POOL_KEEP_LRU": {
    "bare": false,
    "choices": null,
@@ -53659,6 +53736,34 @@
    "text": "",
    "trees": [
     "27b",
+    "nf"
+   ],
+   "type": "EnvBool"
+  },
+  "FLLIPER_PDFLIP_ANCHOR_ONLY_READ": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "True",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "e1 ANCHOR-ONLY READ (NF h13 14:35:36, pdflip-24-181): the match reached the KV but no node carried a Mamba state (the anchor sat in L3 only): the GDN-holding rank reads only that anchor blob and attaches it as the node's host Mamba value (MAMBA-HOST-RESUME). 0 = off.",
+   "id": "FLLIPER_PDFLIP_ANCHOR_ONLY_READ",
+   "kind": "env",
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_ANCHOR_ONLY_READ",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 2609,
+    "tree": "nf"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
     "nf"
    ],
    "type": "EnvBool"
@@ -60523,7 +60628,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 3844
+      "line": 3884
      }
     }
    },
@@ -60913,7 +61018,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4516
+      "line": 4556
      }
     }
    },
@@ -61021,7 +61126,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2737
+      "line": 2752
      }
     }
    },
@@ -61668,7 +61773,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2728
+      "line": 2743
      }
     }
    },
@@ -61890,7 +61995,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4496
+      "line": 4536
      }
     }
    },
@@ -63019,7 +63124,7 @@
    "id": "FLLIPER_PDFLIP_EVICT_ANCHOR_SAVE",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/unified_radix_cache.py:5932"
+    "mem_cache/unified_radix_cache.py:6120"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_EVICT_ANCHOR_SAVE",
@@ -63028,7 +63133,7 @@
    "source": {
     "file": "mem_cache/unified_radix_cache.py",
     "kind": "os.environ",
-    "line": 5932,
+    "line": 6120,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -65466,7 +65571,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4616
+      "line": 4656
      }
     }
    },
@@ -68563,7 +68668,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4425
+      "line": 4465
      }
     }
    },
@@ -69632,7 +69737,7 @@
    "id": "FLLIPER_PDFLIP_PF_TOLD_ACK_TIMEOUT_S",
    "kind": "env",
    "lesestellen": [
-    "managers/pdflip_told_fallback.py:1831"
+    "managers/pdflip_told_fallback.py:1877"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_PF_TOLD_ACK_TIMEOUT_S",
@@ -69641,7 +69746,7 @@
    "source": {
     "file": "managers/pdflip_told_fallback.py",
     "kind": "os.environ",
-    "line": 1831,
+    "line": 1877,
     "tree": "nf"
    },
    "status": "harvested",
@@ -73678,7 +73783,7 @@
    "id": "FLLIPER_PDFLIP_SPILL_REF_FREE",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/unified_radix_cache.py:6110"
+    "mem_cache/unified_radix_cache.py:6298"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_SPILL_REF_FREE",
@@ -73687,7 +73792,7 @@
    "source": {
     "file": "mem_cache/unified_radix_cache.py",
     "kind": "os.environ",
-    "line": 6110,
+    "line": 6298,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -74135,7 +74240,7 @@
    "id": "FLLIPER_PDFLIP_SWEEP_REFUSED_MEMO",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/unified_radix_cache.py:8000"
+    "mem_cache/unified_radix_cache.py:8188"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_SWEEP_REFUSED_MEMO",
@@ -74144,7 +74249,7 @@
    "source": {
     "file": "mem_cache/unified_radix_cache.py",
     "kind": "os.environ",
-    "line": 8000,
+    "line": 8188,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -74602,6 +74707,62 @@
    ],
    "type": "EnvInt"
   },
+  "FLLIPER_PDFLIP_TF_ANCHOR_READ": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "True",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "S43 TF-ANCHOR-READ (NF rc12 1018 16:39:16, pdflip-3-186): PP0's TOLD-FIDELITY floor search reads the Mamba anchor blob of a depth every follower proved when PP0's tree holds the KV there but its anchor only in the store (dropped from the arena to L3) -- instead of falling to a shallow floor and recomputing ~90k tokens. PP0's one verdict for every rank (SOLL R11). 0 = off.",
+   "id": "FLLIPER_PDFLIP_TF_ANCHOR_READ",
+   "kind": "env",
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_TF_ANCHOR_READ",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 2616,
+    "tree": "nf"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "EnvBool"
+  },
+  "FLLIPER_PDFLIP_TF_ANCHOR_READ_MAX": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "3",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "S43: at most this many anchor reads per TF floor search (each one blob, arena in place or one L3 fill on the scheduler thread).",
+   "id": "FLLIPER_PDFLIP_TF_ANCHOR_READ_MAX",
+   "kind": "env",
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_TF_ANCHOR_READ_MAX",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 2619,
+    "tree": "nf"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "EnvInt"
+  },
   "FLLIPER_PDFLIP_TMS_PRELOAD_SO": {
    "bare": false,
    "choices": null,
@@ -74804,7 +74965,7 @@
    "id": "FLLIPER_PDFLIP_TOLD_DEFER_BEAT_S",
    "kind": "env",
    "lesestellen": [
-    "managers/pdflip_told_fallback.py:1034"
+    "managers/pdflip_told_fallback.py:1080"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_TOLD_DEFER_BEAT_S",
@@ -74813,7 +74974,7 @@
    "source": {
     "file": "managers/pdflip_told_fallback.py",
     "kind": "os.environ",
-    "line": 1034,
+    "line": 1080,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -75363,7 +75524,7 @@
    "id": "FLLIPER_PDFLIP_TOLD_WAIT_HARD_S",
    "kind": "env",
    "lesestellen": [
-    "managers/pdflip_told_fallback.py:981"
+    "managers/pdflip_told_fallback.py:1027"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_TOLD_WAIT_HARD_S",
@@ -75372,7 +75533,7 @@
    "source": {
     "file": "managers/pdflip_told_fallback.py",
     "kind": "os.environ",
-    "line": 981,
+    "line": 1027,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -75394,7 +75555,7 @@
    "id": "FLLIPER_PDFLIP_TOLD_WAIT_MARGIN_S",
    "kind": "env",
    "lesestellen": [
-    "managers/pdflip_told_fallback.py:999"
+    "managers/pdflip_told_fallback.py:1045"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_TOLD_WAIT_MARGIN_S",
@@ -75403,7 +75564,7 @@
    "source": {
     "file": "managers/pdflip_told_fallback.py",
     "kind": "os.environ",
-    "line": 999,
+    "line": 1045,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -77399,7 +77560,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4603
+      "line": 4643
      }
     }
    },
@@ -89155,28 +89316,28 @@
  "schema": "flliper.catalog/1",
  "stats": {
   "curated": 125,
-  "entries": 2810,
-  "envs": 1932,
+  "entries": 2815,
+  "envs": 1937,
   "explained": 310,
   "flags": 863,
-  "harvested": 1725,
+  "harvested": 1730,
   "trees": {
-   "abweichung": 49,
-   "beide": 2462,
-   "nur_27b": 181,
-   "nur_nf": 149
+   "abweichung": 50,
+   "beide": 2463,
+   "nur_27b": 180,
+   "nur_nf": 154
   },
   "unexplained": 650
  },
- "tree_rev": "27b=0798c91fcd+nf=8f3b323088",
+ "tree_rev": "27b=0798c91fcd+nf=8f38972d4e",
  "trees": {
   "27b": {
    "entries": 2643,
    "rev": "0798c91fcd"
   },
   "nf": {
-   "entries": 2611,
-   "rev": "8f3b323088"
+   "entries": 2617,
+   "rev": "8f38972d4e"
   }
  },
  "warnungen": []
