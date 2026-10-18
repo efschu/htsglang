@@ -219,7 +219,8 @@ def test_unbacked_anchors_counts_a_marked_node_without_store_kv(monkeypatch):
         node.children, node.parent = {}, None
         node.component_data[ComponentType.MAMBA].value = object()
         root = types.SimpleNamespace(children={1: node})
-        t = types.SimpleNamespace(root_node=root, weg2_node_depth=lambda n: n.depth)
+        t = types.SimpleNamespace(root_node=root, weg2_node_depth=lambda n: n.depth,
+                                  _weg2_anchor_secured_holds=lambda n: True)
         t.__dict__.setdefault("_weg2_anchor_only_detached", set())
         return t
 
