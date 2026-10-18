@@ -177,6 +177,9 @@ class _State:
         # S22: this worker's device-evicted content keys (published next to the arena for TP0's spill choice)
         self.dev_evicted: set = set()
         self.dev_nodelete: set = set()
+        #: S41 (review S39): keys this worker holds ON ITS DEVICE (``dv``) -- TP0's S39 subtree drop must not include
+        #: an interior node a worker has device-resident (``nd`` cannot tell: every interior node has children)
+        self.dev_device: set = set()
         # named stop found outside a consume (own-ack time); raised at the end of the next consume
         self.k21_stop_msg: Optional[str] = None
         # number of broadcasts consumed on this rank
@@ -631,7 +634,8 @@ def _dev_publish(tree: Any) -> bool:
     try:
         with open(tmp, "w") as f:
             json.dump({"ev": sorted([k[0], k[1]] for k in _S.dev_evicted),
-                       "nd": sorted([k[0], k[1]] for k in _S.dev_nodelete)}, f)
+                       "nd": sorted([k[0], k[1]] for k in _S.dev_nodelete),
+                       "dv": sorted([k[0], k[1]] for k in _S.dev_device)}, f)
         os.replace(tmp, path)
     except OSError as exc:
         if _note("dev_publish_error", 16):
@@ -649,6 +653,7 @@ def worker_device_evicted(tree: Any, node: Any) -> None:
     if k is None:
         return
     register_tree(tree)
+    _S.dev_device.discard(k)
     if k not in _S.dev_evicted:
         _S.dev_evicted.add(k)
         _dev_publish(tree)
@@ -662,6 +667,7 @@ def _dev_refresh(tree: Any) -> None:
     base = int(_base_ct())
     cur: set = set()
     nd: set = set()
+    dv: set = set()
     stack = list(tree.root_node.children.values())
     while stack:
         n = stack.pop()
@@ -671,19 +677,22 @@ def _dev_refresh(tree: Any) -> None:
             continue
         if n.component_data[base].value is None:
             cur.add(k)
+        else:
+            dv.add(k)
         if n.children or n.component_data[base].value is not None:
             nd.add(k)
-    if cur != _S.dev_evicted or nd != _S.dev_nodelete:
-        _S.dev_evicted, _S.dev_nodelete = cur, nd
+    if cur != _S.dev_evicted or nd != _S.dev_nodelete or dv != _S.dev_device:
+        _S.dev_evicted, _S.dev_nodelete, _S.dev_device = cur, nd, dv
         _dev_publish(tree)
 
 
-def _read_worker_sets(tree: Any) -> Tuple[set, set]:
+def _read_worker_sets(tree: Any) -> Tuple[set, set, set]:
     prefix = _dev_dir_prefix(_tree_arena(tree))
     ev: set = set()
     nd: set = set()
+    dv: set = set()
     if prefix is None:
-        return ev, nd
+        return ev, nd, dv
     import glob
     import json
 
@@ -704,11 +713,13 @@ def _read_worker_sets(tree: Any) -> Tuple[set, set]:
                 ev.add((str(h), int(d)))
             for h, d in doc["nd"]:
                 nd.add((str(h), int(d)))
+            for h, d in doc.get("dv", ()):
+                dv.add((str(h), int(d)))
         except (OSError, ValueError, KeyError, TypeError) as exc:
             if _note("dev_read_error", 16):
                 logger.warning("R12 SPILL-APPLICABILITY read of %s failed: %r (TP0 decides without that "
                                "worker's state; a node it cannot follow on is named SPILL-DIVERGED)", path, exc)
-    return ev, nd
+    return ev, nd, dv
 
 
 def kept_note(path: str, n: int = 1) -> None:
@@ -730,6 +741,14 @@ def worker_nodelete_keys(tree: Any) -> set:
     """TP0: the union of every live worker's keys it cannot delete (device-resident or with children) -- TP0 must
     not drop a host-only LEAF of that key (K23 host-leaf spill), the worker would keep the node."""
     return _read_worker_sets(tree)[1]
+
+
+def worker_device_keys(tree: Any) -> set:
+    """TP0: the union of every live worker's DEVICE-RESIDENT keys (S41, review S39). An S39 subtree drop deletes every
+    node of the subtree on every rank; a node a worker still holds on its device (its device life is rank-local, S22)
+    is one that worker cannot delete -- TP0 leaves such a drop alone instead of sending a verdict the worker answers
+    with DIVERGED. ``nd`` cannot say it for an interior node (every interior node has children)."""
+    return _read_worker_sets(tree)[2]
 
 
 def await_complete(tree: Any, node: Any, fallback_transit: bool, l3_ok: bool = False) -> bool:
@@ -916,8 +935,8 @@ def on_tree_reset(tree: Any) -> None:
     _S.k21_confirmed = {}
     _S.k21_expect = set()
     _S.rr_open = {}
-    if _S.dev_evicted or _S.dev_nodelete:
-        _S.dev_evicted, _S.dev_nodelete = set(), set()
+    if _S.dev_evicted or _S.dev_nodelete or _S.dev_device:
+        _S.dev_evicted, _S.dev_nodelete, _S.dev_device = set(), set(), set()
         _dev_publish(tree)   # the nodes are gone: no key may block a re-inserted prefix
     _S.k21_stop_msg = None
     _S.rebind_wait = {}

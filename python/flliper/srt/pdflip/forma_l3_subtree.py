@@ -268,6 +268,16 @@ def _execute(tree: Any, node: Any, order: List[Any]) -> Tuple[int, int]:
     return int(tracker.get(base, 0)), int(host_tracker.get(base, 0))
 
 
+def room_pending(tree: Any = None) -> int:
+    """TP0: device tokens of the store-backed leaves of ``tree`` (any tree when None) queued for the next broadcast's
+    drop (0 on a worker, off, or an empty queue). PW-R reads it: a head this queue makes room for at the next
+    broadcast is not unservable (S41, review S39 -- PW-R runs after the pass's admission, i.e. between the peel that
+    queued and the drop)."""
+    if not _ST.queue or not on():
+        return 0
+    return sum(len(getattr(ent[1], "key", ()) or ()) for ent in _ST.queue.values() if tree is None or ent[0] is tree)
+
+
 def note_refused(tree: Any, node: Any, why: str) -> bool:
     """The peel (every rank) refused a store-backed leaf for its children or its device anchor. TP0 queues it for
     its next broadcast, at most the tokens the peel still asked for (``tree._s39_peel`` = [need, queued])."""
@@ -327,9 +337,14 @@ def flush_at_broadcast(tree: Any = None) -> int:
                 continue
             if order:
                 # S22: a host-only leaf of the subtree that a worker holds on its device (or with children of its own)
-                # cannot be deleted there -- TP0 leaves the drop alone (the K23 rule)
+                # cannot be deleted there -- TP0 leaves the drop alone (the K23 rule). S41 (review S39): the same for
+                # an INTERIOR node of the subtree a worker holds on its device (``dv``): the worker's apply would
+                # answer ``child_on_device`` with DIVERGED and keep a node TP0 deleted for good
                 nd = r12.worker_nodelete_keys(t)
-                stuck = next((d for d in order if not d.children and r12.node_key(d) in nd), None) if nd else None
+                dv = r12.worker_device_keys(t)
+                stuck = next((d for d in order
+                              if (not d.children and r12.node_key(d) in nd) or r12.node_key(d) in dv),
+                             None) if (nd or dv) else None
                 if stuck is not None:
                     r12.kept_note("s39_l3drop")
                     _kept(t, node, ent, "worker_cannot_delete", " holder=%s" % (getattr(stuck, "id", "?"),))
