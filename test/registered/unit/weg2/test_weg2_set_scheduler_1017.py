@@ -787,3 +787,14 @@ def test_s28_flip_price_stale_instrument(monkeypatch, caplog):
     f._flip_trig["late"] = (time.time() - 3.0, 52002, "set-verdict")
     f._x_exact_reprice_queue("p_anchor")
     assert f.counters["flip_price_stale"] == 0
+
+
+def test_s28_flip_price_stale_needs_a_price_under_x(monkeypatch):
+    """Item 5: a re-price that stays over X (52002 -> 40000) is no FLIP-PRICE-STALE (the flip still stands)."""
+    _on(monkeypatch)
+    f = _exact(_fx(), 40000)
+    q = _big("trig", 52002, 40.0)
+    f.queue = [q]
+    f._flip_trig_note("trig", 52002, "set-verdict")
+    f._x_exact_reprice_queue("p_anchor")
+    assert f.counters["flip_price_stale"] == 0 and "trig" in f._flip_trig
