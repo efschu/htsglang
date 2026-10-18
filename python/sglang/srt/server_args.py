@@ -9076,11 +9076,31 @@ class ServerArgs:
         per_rank_bytes = hicache_configured_host_bytes(self.hicache_size, 0)
         if per_rank_bytes is None:
             return
+        # S36 (18.10., Teil D Nebenbefund): under the ARENA host pool (#1424 Stufe 3, #1430) the per-rank KV host
+        # pool is NOT --hicache-size: ArenaMHAHostPool allocates only its staging fallback range
+        # (SGLANG_HICACHE_ARENA_STAGING_GB, 0.05 GB) and the L2 is the arena (priced by the launcher's arena term).
+        # This post booked --hicache-size x ranks (NF: D 4 GB x 3 = 12 GB, P 2 GB x 3 = 6 GB) of pinned RAM that no
+        # rank allocates. The env names are pool_host/arena_pool.ENV_ARENA_HOST / ENV_STAGING_GB, read here as
+        # strings: importing that module at parse time pulls the JIT kernels into the hermetic path.
+        _arena_note = ""
+        if os.environ.get("SGLANG_HICACHE_ARENA_HOST", "0") == "1":
+            try:
+                _stg_gb = float(os.environ.get("SGLANG_HICACHE_ARENA_STAGING_GB", "0.05") or 0.05)
+            except ValueError:
+                _stg_gb = 0.05
+            _stg_bytes = hicache_configured_host_bytes(_stg_gb, 0) or 0
+            _arena_note = (
+                f" [S36: arena host pool -- --hicache-size {self.hicache_size} GB is not allocated (#1430); "
+                f"the staging fallback range {_stg_gb:.2f} GB per rank is]"
+            )
+            per_rank_bytes = int(_stg_bytes)
+            if per_rank_bytes <= 0:
+                return
         ranks = max(1, int(self.tp_size or 1)) * max(1, int(self.pp_size or 1))
         posts = [
             PinnedHostPost(
                 name=f"HiCache staging host tier x{ranks} rank(s)",
-                flag="--hicache-size (--hicache-host-role staging)",
+                flag="--hicache-size (--hicache-host-role staging)" + _arena_note,
                 nbytes=per_rank_bytes * ranks,
             )
         ]
@@ -9185,7 +9205,7 @@ class ServerArgs:
         # when it was large.
         logger.info(
             "#810 host ledger: staging tier %.2f GB x %d rank(s) = %.2f GB "
-            "pinned host RAM (%s).%s",
+            "pinned host RAM (%s).%s%s",
             per_rank_bytes / 1e9,
             ranks,
             per_rank_bytes * ranks / 1e9,
@@ -9195,6 +9215,7 @@ class ServerArgs:
                 else "host availability unknown, unguarded"
             ),
             pin_note,
+            _arena_note,
         )
 
     def _handle_session_checkpoints(self):
