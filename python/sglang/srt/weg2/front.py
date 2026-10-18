@@ -11602,11 +11602,13 @@ class Front:
             st["t_open"] = max(min(m.t_arrive for m in members), float(getattr(self, "t_awake", 0.0) or 0.0))
         decoding = self._dc_decoding()
         seats = self._set_seats_free()
-        # PRIO-AS-AGE 1014 (user decision 14.10.): a request with priority > 0 that needs P ends the wait AT ONCE
-        # (T_halb = 0 for this verdict); the SET-VERDICT line still reports the configured T_halb
+        # S45 (18.10., SOLL v2 R4/R9): priority is an ORDER key only (user 14.10.: "priority 1 immer älter als
+        # priority 0"). The earlier "priority > 0 that needs P ends the wait at once" was a planner derivation, not
+        # the user's word, and SOLL v2 has no such exception: a big member waits T_halb for company at EVERY
+        # priority. ``urgent`` stays for the log only.
         urgent = Front._prio_urgent(self, cands)
         sv = phase_policy.set_verdict(
-            members=members, x_tokens=x_tok, half_frac=frac, t_half_s=0.0 if urgent is not None else t_half,
+            members=members, x_tokens=x_tok, half_frac=frac, t_half_s=t_half,
             now=now, t_open=min(st["t_open"], now),
             d_decoding=decoding, seats_free=seats,
             d_prefill_running_uncached=self._dc_carried_running(),  # R6: what D prefills right now counts into S
@@ -11666,9 +11668,10 @@ class Front:
         _pu = st.get("urgent")
         if _pu is not None and st.get("prio_set") != st["set_id"]:
             st["prio_set"] = st["set_id"]
-            self.counters["decode_collect_prio_release"] += 1
+            self.counters["decode_collect_prio_seen"] += 1
             logger.info("%s rid=%s priority=%d site=decode-collect waited_s=%.1f t_half_s=%.1f epoch=%d -- a "
-                        "P-bound request with priority > 0 ends the set's wait now (route P)",
+                        "P-bound request with priority > 0 waits T_halb like every big member (S45, SOLL R4: "
+                        "priority orders, it does not flip)",
                         _prio_age.MARK_URGENT, _pu.rid, Front._prio_lane(self, _pu), kw["waited"], kw["t_half"],
                         self.epoch)
         if sv.verdict == phase_policy.V_COLLECT:
@@ -17037,18 +17040,11 @@ class Front:
         p_only = sum(1 for p in self.queue if getattr(p, "p_only", False))
         urgent_on = bool(getattr(self, "vision_flip_urgent", False))
         p_only_urgent = urgent_on and p_only > 0
-        # PRIO-AS-AGE 1014: a queued request with priority > 0 that needs P is flip-worthy on its own (the
-        # urgency of vision_flip_urgent): it is the OLDEST by the order key, so nothing amortises its wait
+        # S45 (18.10., SOLL v2 R4/R7): priority > 0 is NO flip reason of its own -- it orders, it does not flip.
         prio_urgent = Front._prio_urgent(self, self.queue)
-        ok = (queued_uncached >= threshold or fairness_fired or not self.admit_d or p_only_urgent
-              or prio_urgent is not None)
-        if prio_urgent is not None and not (queued_uncached >= threshold or fairness_fired
-                                             or not self.admit_d or p_only_urgent):
-            self.counters["prio_urgent_flip"] += 1
-            logger.info("%s rid=%s priority=%d site=flip-economics queued_uncached=%d threshold=%d -- a request "
-                        "with priority > 0 that needs P satisfies the D->P latch on its own (it parks nothing "
-                        "extra; the normal flip runs)", _prio_age.MARK_URGENT, prio_urgent.rid,
-                        Front._prio_lane(self, prio_urgent), queued_uncached, threshold)
+        ok = (queued_uncached >= threshold or fairness_fired or not self.admit_d or p_only_urgent)
+        if prio_urgent is not None and not ok:
+            self.counters["prio_urgent_no_flip"] += 1
 
         # THE STRANDED-DECODE TERM, REPORTED AND NEVER A VETO. Every decode
         # resident on D stops for the whole P phase; the user accepted unbounded
