@@ -76,7 +76,38 @@ def qsa_prefix_grain_violations(forward_batch, ratio: int, n: int):
         prefixes = _host_ints(getattr(forward_batch, "extend_prefix_lens_cpu", None), n)
         if prefixes is None:
             return []
-    return [(i, p) for i, p in enumerate(prefixes) if p % r]
+    # S37: the decode TAIL rows of a MIXED forward are decode steps (ring members, qsa_mixed_tail_*), not extends
+    tails = qsa_mixed_tail_rows_host(forward_batch, n)
+    return [(i, p) for i, p in enumerate(prefixes) if p % r and not (tails and tails[i])]
+
+
+def _qsa_is_mixed(forward_batch) -> bool:
+    mode = getattr(forward_batch, "forward_mode", None)
+    try:
+        return bool(mode is not None and mode.is_mixed())
+    except Exception:  # noqa: BLE001 - a stand-in without the predicate is no mixed forward
+        return False
+
+
+def qsa_mixed_tail_rows_host(forward_batch, n: int):
+    """S37 (rc10 11:24:32Z D-TP1, QSA-PREFIX-GRAIN after the first ``MIXED-D mixed``): the 1-token rows of a MIXED
+    forward, from the HOST extend lengths -- the running decodes ``mix_with_running`` appended as 1-token extends
+    (``extend_lens += [1] * running_bs``) and a 1-token short prefill, for which the decode treatment is the same
+    (aligned prefix: the token is a pending-tail token either way, no group closes). None outside a MIXED forward
+    or without host lengths."""
+    if not _qsa_is_mixed(forward_batch):
+        return None
+    ext = _host_ints(getattr(forward_batch, "extend_seq_lens_cpu", None), n)
+    if ext is None:
+        return None
+    return [e == 1 for e in ext]
+
+
+def qsa_mixed_tail_mask(forward_batch, extend_lens: torch.Tensor):
+    """S37: the device twin of :func:`qsa_mixed_tail_rows_host` (no sync); None outside a MIXED forward."""
+    if not _qsa_is_mixed(forward_batch):
+        return None
+    return extend_lens.long() == 1
 
 
 def qsa_check_prefix_grain(forward_batch, ratio: int, n: int) -> None:
@@ -1248,23 +1279,54 @@ class QwenSparseAttnBackend(AttentionBackend):
         # K11: the HOST lengths name the row before any kernel runs; the device
         # assert stays as the backstop for a batch without host lengths.
         qsa_check_prefix_grain(forward_batch, ratio, int(lengths.numel()))
+        # S37: the decode TAIL rows of a MIXED forward are no extends -- they take no part in the extend plan (their
+        # group is compressed from the ring, ``_qsa_mixed_tail_plan``) and are exempt from the grain backstop
+        tail = qsa_mixed_tail_mask(forward_batch, extend_lens)
+        aligned = prefix_lens % ratio == 0
         torch._assert_async(
-            (prefix_lens % ratio == 0).all(),
+            (aligned if tail is None else (aligned | tail)).all(),
             "QSA-PREFIX-GRAIN: an extend prefix splits a compressed group",
         )
+        start_blocks = prefix_lens // ratio
+        if tail is not None:
+            start_blocks = torch.where(tail, end_blocks, start_blocks)
         # Each row spans at most ceil(extend_len / ratio) blocks, so the
         # token count and row count bound the plan without a sync.
         capacity = int(forward_batch.input_ids.numel()) // ratio + int(lengths.numel())
         row_token_starts = torch.cumsum(extend_lens, 0) - extend_lens
         return self._qsa_write_plan(
             token_slot_table=token_slot_table,
-            start_blocks=prefix_lens // ratio,
+            start_blocks=start_blocks,
             end_blocks=end_blocks,
             capacity=capacity,
             compress_ratio=ratio,
             row_token_starts=row_token_starts,
             prefix_lens=prefix_lens,
         )
+
+    def _qsa_mixed_tail_plan(self, *, forward_batch, token_slot_table, sequence_lengths):
+        """S37: the DECODE write plan of a MIXED forward's tail rows -- each closes at most the group its length
+        completes (``start = end - (len % ratio == 0)``, the decode rule of ``_qsa_build_write_plan``), members
+        from the pending ring. ``(write_locs, group_end_positions, rows, tail_mask)`` or None when the forward
+        has no tails."""
+        extend_lens = forward_batch.extend_seq_lens
+        if extend_lens is None:
+            return None
+        lengths = sequence_lengths.long()
+        tail = qsa_mixed_tail_mask(forward_batch, extend_lens.long()[: lengths.numel()])
+        if tail is None:
+            return None
+        ratio = self.token_to_kv_pool.qsa_compress_ratio
+        end_blocks = lengths // ratio
+        start_blocks = torch.where(tail, end_blocks - (lengths % ratio == 0).long(), end_blocks)
+        write_locs, group_positions, rows, _ = self._qsa_write_plan(
+            token_slot_table=token_slot_table,
+            start_blocks=start_blocks,
+            end_blocks=end_blocks,
+            capacity=int(lengths.numel()),
+            compress_ratio=ratio,
+        )
+        return write_locs, group_positions, rows, tail
 
     def _metadata_from_forward_batch(self, forward_batch) -> QwenSparseAttnMetadata:
         self._require_chain_speculation(
@@ -1373,6 +1435,16 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
         )
         decode_like = speculative_paged or forward_batch.forward_mode.is_decode()
+        tail_plan = None
+        if not decode_like:
+            tail_plan = self._qsa_mixed_tail_plan(
+                forward_batch=forward_batch,
+                token_slot_table=token_slot_table,
+                sequence_lengths=sequence_lengths,
+            )
+        ring_always_rows = tail_plan[3] if tail_plan is not None else None
+        tail_write_locs = None
+        tail_group_ring_locs = None
         if decode_like:
             decode_logical_positions = (
                 logical_positions.to(torch.int32)
@@ -1403,7 +1475,17 @@ class QwenSparseAttnBackend(AttentionBackend):
                 logical_positions=ring_logical_positions,
                 compress_ratio=self.compress_ratio,
                 is_extend=group_member_rows is not None,
+                always_rows=ring_always_rows,
             )
+            if tail_plan is not None and tail_plan[0].numel():
+                # S37: the tails' groups, members from the ring (the decode branch below, for these rows)
+                tail_write_locs = tail_plan[0]
+                tail_group_ring_locs = build_group_ring_slots(
+                    req_pool_indices=row_req_pool_indices,
+                    group_end_positions=tail_plan[1].long(),
+                    sequence_ids=tail_plan[2].long(),
+                    compress_ratio=self.compress_ratio,
+                )
             if write_locs.numel():
                 if group_member_rows is not None:
                     rope_source = (
@@ -1440,6 +1522,9 @@ class QwenSparseAttnBackend(AttentionBackend):
             pending_ring_slots=pending_ring_slots,
             compress_group_ring_locs=compress_group_ring_locs,
             extend_rope_matrix=extend_rope_matrix,
+            ring_always_rows=ring_always_rows,
+            tail_write_locs=tail_write_locs,
+            tail_group_ring_locs=tail_group_ring_locs,
         )
         return QwenSparseAttnMetadata(
             sequence_lengths=sequence_lengths,
