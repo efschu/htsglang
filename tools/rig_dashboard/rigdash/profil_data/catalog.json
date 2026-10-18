@@ -44520,6 +44520,37 @@
    "text": "",
    "type": "os.environ"
   },
+  "SGLANG_HICACHE_L3_WB_READ_YIELD_MS": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": null,
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "",
+   "id": "SGLANG_HICACHE_L3_WB_READ_YIELD_MS",
+   "kind": "env",
+   "lesestellen": [
+    "mem_cache/l3_write_behind.py:177"
+   ],
+   "level": "experte",
+   "name": "SGLANG_HICACHE_L3_WB_READ_YIELD_MS",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "baum": "nf",
+    "file": "mem_cache/l3_write_behind.py",
+    "kind": "os.environ",
+    "line": 177
+   },
+   "status": "unerklaert",
+   "text": "",
+   "type": "os.environ"
+  },
   "SGLANG_HICACHE_LOAD_ASYNC_INDEX": {
    "abweichung": {
     "27b": {
@@ -44537,7 +44568,7 @@
      "source": {
       "file": "mem_cache/pool_host/arena_pool.py",
       "kind": "os.environ",
-      "line": 1206
+      "line": 1262
      }
     }
    },
@@ -64852,7 +64883,7 @@
    "id": "SGLANG_WEG2_ARENA_REF_RECHECK",
    "kind": "env",
    "lesestellen": [
-    "managers/cache_controller.py:157"
+    "managers/cache_controller.py:158"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_ARENA_REF_RECHECK",
@@ -64862,7 +64893,7 @@
     "baum": "nf",
     "file": "managers/cache_controller.py",
     "kind": "os.environ",
-    "line": 157
+    "line": 158
    },
    "status": "geerntet",
    "text": "",
@@ -75515,7 +75546,7 @@
      "source": {
       "file": "server_args.py",
       "kind": "os.environ",
-      "line": 14752
+      "line": 14773
      }
     }
    },
@@ -76380,6 +76411,99 @@
    "status": "geerntet",
    "text": "",
    "type": "EnvBool"
+  },
+  "SGLANG_WEG2_KV_DURCHLAUF": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"1\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "",
+   "id": "SGLANG_WEG2_KV_DURCHLAUF",
+   "kind": "env",
+   "lesestellen": [
+    "weg2/kv_durchlauf.py:81"
+   ],
+   "level": "experte",
+   "name": "SGLANG_WEG2_KV_DURCHLAUF",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "baum": "nf",
+    "file": "weg2/kv_durchlauf.py",
+    "kind": "os.environ",
+    "line": 81
+   },
+   "status": "unerklaert",
+   "text": "",
+   "type": "os.environ"
+  },
+  "SGLANG_WEG2_KV_DURCHLAUF_BLOCK_MIB": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "",
+   "id": "SGLANG_WEG2_KV_DURCHLAUF_BLOCK_MIB",
+   "kind": "env",
+   "lesestellen": [
+    "weg2/kv_durchlauf.py:288"
+   ],
+   "level": "experte",
+   "name": "SGLANG_WEG2_KV_DURCHLAUF_BLOCK_MIB",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "baum": "nf",
+    "file": "weg2/kv_durchlauf.py",
+    "kind": "os.environ",
+    "line": 288
+   },
+   "status": "unerklaert",
+   "text": "",
+   "type": "os.environ"
+  },
+  "SGLANG_WEG2_KV_DURCHLAUF_DIRECT": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"1\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "",
+   "id": "SGLANG_WEG2_KV_DURCHLAUF_DIRECT",
+   "kind": "env",
+   "lesestellen": [
+    "weg2/kv_durchlauf.py:85"
+   ],
+   "level": "experte",
+   "name": "SGLANG_WEG2_KV_DURCHLAUF_DIRECT",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "baum": "nf",
+    "file": "weg2/kv_durchlauf.py",
+    "kind": "os.environ",
+    "line": 85
+   },
+   "status": "unerklaert",
+   "text": "",
+   "type": "os.environ"
   },
   "SGLANG_WEG2_KV_RESUME_FIT_WAIT_S": {
    "baeume": [
@@ -77309,7 +77433,7 @@
    "id": "SGLANG_WEG2_L3FILL_JOIN_IDLE_MS",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/hicache_storage.py:443"
+    "mem_cache/hicache_storage.py:457"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_L3FILL_JOIN_IDLE_MS",
@@ -77319,7 +77443,7 @@
     "baum": "nf",
     "file": "mem_cache/hicache_storage.py",
     "kind": "os.environ",
-    "line": 443
+    "line": 457
    },
    "status": "unerklaert",
    "text": "",
@@ -77501,7 +77625,7 @@
    "id": "SGLANG_WEG2_L3FILL_REF_AT_LAND",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/hicache_storage.py:53"
+    "mem_cache/hicache_storage.py:54"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_L3FILL_REF_AT_LAND",
@@ -77511,7 +77635,7 @@
     "baum": "nf",
     "file": "mem_cache/hicache_storage.py",
     "kind": "os.environ",
-    "line": 53
+    "line": 54
    },
    "status": "unerklaert",
    "text": "",
@@ -77858,7 +77982,7 @@
    "id": "SGLANG_WEG2_L3_REFRESH_KEPT",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/hicache_storage.py:4701"
+    "mem_cache/hicache_storage.py:4776"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_L3_REFRESH_KEPT",
@@ -77868,7 +77992,7 @@
     "baum": "nf",
     "file": "mem_cache/hicache_storage.py",
     "kind": "os.environ",
-    "line": 4701
+    "line": 4776
    },
    "status": "unerklaert",
    "text": "",
@@ -77901,6 +78025,68 @@
    "status": "geerntet",
    "text": "",
    "type": "EnvInt"
+  },
+  "SGLANG_WEG2_L3_WRITE_BEHIND_CHUNK_PAGES": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "",
+   "id": "SGLANG_WEG2_L3_WRITE_BEHIND_CHUNK_PAGES",
+   "kind": "env",
+   "lesestellen": [
+    "mem_cache/hicache_storage.py:3729"
+   ],
+   "level": "experte",
+   "name": "SGLANG_WEG2_L3_WRITE_BEHIND_CHUNK_PAGES",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "baum": "nf",
+    "file": "mem_cache/hicache_storage.py",
+    "kind": "os.environ",
+    "line": 3729
+   },
+   "status": "unerklaert",
+   "text": "",
+   "type": "os.environ"
+  },
+  "SGLANG_WEG2_L3_WRITE_BEHIND_DIRECT": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"1\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "",
+   "id": "SGLANG_WEG2_L3_WRITE_BEHIND_DIRECT",
+   "kind": "env",
+   "lesestellen": [
+    "mem_cache/hicache_storage.py:3736"
+   ],
+   "level": "experte",
+   "name": "SGLANG_WEG2_L3_WRITE_BEHIND_DIRECT",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "baum": "nf",
+    "file": "mem_cache/hicache_storage.py",
+    "kind": "os.environ",
+    "line": 3736
+   },
+   "status": "unerklaert",
+   "text": "",
+   "type": "os.environ"
   },
   "SGLANG_WEG2_L3_WRITE_BEHIND_MIB": {
    "baeume": [
@@ -84654,7 +84840,7 @@
    "id": "SGLANG_WEG2_STORE_SHORT_HELD_DECIDE",
    "kind": "env",
    "lesestellen": [
-    "managers/scheduler.py:944"
+    "managers/scheduler.py:945"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_STORE_SHORT_HELD_DECIDE",
@@ -84664,7 +84850,7 @@
     "baum": "nf",
     "file": "managers/scheduler.py",
     "kind": "os.environ",
-    "line": 944
+    "line": 945
    },
    "status": "geerntet",
    "text": "",
@@ -84687,7 +84873,7 @@
      "source": {
       "file": "managers/scheduler.py",
       "kind": "os.environ",
-      "line": 956
+      "line": 957
      }
     }
    },
@@ -88908,25 +89094,25 @@
    "abweichung": 47,
    "beide": 2460,
    "nur_27b": 181,
-   "nur_nf": 145
+   "nur_nf": 151
   },
-  "entries": 2804,
-  "envs": 1925,
+  "entries": 2810,
+  "envs": 1931,
   "erklaert": 305,
   "flags": 864,
   "geerntet": 1730,
   "kuratiert": 125,
-  "unerklaert": 644
+  "unerklaert": 650
  },
- "tree_rev": "27b=02123ee2ef+nf=f1011c1a90+S32",
+ "tree_rev": "27b=02123ee2ef+nf=ac3eff5491",
  "trees": {
   "27b": {
    "entries": 2641,
    "rev": "02123ee2ef"
   },
   "nf": {
-   "entries": 2605,
-   "rev": "f1011c1a90+S32"
+   "entries": 2611,
+   "rev": "ac3eff5491"
   }
  },
  "warnungen": []
