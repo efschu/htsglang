@@ -187,7 +187,7 @@ def test_s23_self_join_leaves_a_sibling_io_threads_live_claim_alone(tmp_path, mo
     assert ident_owner
 
 
-def test_s23_self_join_still_takes_over_a_leftover_claim_of_a_dead_call(tmp_path, monkeypatch):
+def test_s23_self_join_still_takes_over_a_leftover_claim_of_a_dead_call(tmp_path, monkeypatch, caplog):
     """h16 PP1 (weg2-10-86): our own pid, no live registration -> the old takeover stands."""
     root = tmp_path / "store"
     root.mkdir()
@@ -196,7 +196,8 @@ def test_s23_self_join_still_takes_over_a_leftover_claim_of_a_dead_call(tmp_path
     be = _backend(str(root))
     [(old, status, gen)] = arena.claim_slots(["p1"], [TOTAL])    # not through a fill: nothing registered live
     assert status == 0
-    with envs.SGLANG_WEG2_L3FILL_SELF_JOIN_TAKEOVER.override(True):
+    with envs.SGLANG_WEG2_L3FILL_SELF_JOIN_TAKEOVER.override(True), caplog.at_level(logging.WARNING, logger=hs.__name__):
         out = _on_io_thread(lambda: HiCacheFile.arena_fill_from_disk(be, arena, ["p1"], TOTAL, prefix=True))
     assert out[0] is not None and out[0] != old
+    assert any("SELF-JOIN" in r.getMessage() for r in caplog.records)     # by the takeover, not by a later reap
     assert not hs._FILL_LIVE, hs._FILL_LIVE      # the fill gave its live registrations back
