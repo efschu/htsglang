@@ -615,7 +615,7 @@ def test_b6_a_short_the_d_budget_refused_goes_back_to_d_when_the_budget_frees_ne
 def _orphan(now, age):
     o = _pending("lost", 2000, now - age)
     o.d_eligible = o.d_direct = o.leg1_done = o.intake_stalled = False
-    o.reroutes, o.handoff_lost_reroutes = 0, 1       # HANDOFF-LOST-REROUTE: leg 1 runs again on P, never a D prefill
+    o.reroutes, o.handoff_lost_reroutes = 1, 0       # leg-2 reroute: leg 1 runs again on P (P-by-state, R9/N1)
     return o
 
 
@@ -733,6 +733,7 @@ def test_s28_lost_handoff_priced_on_the_store_stays_on_d(monkeypatch, caplog):
     HS.reset_module_cache()
     try:
         f = _exact(_fx(), 34)
+        f.queue = __import__("collections").deque()
         p = _big("lost", 34, 120.0)
         p.leg1_done, p.skip_leg1, p.d_direct, p.resume_via_p = True, False, False, False
         p.leg1_prompt_tokens, p.fut = 117026, types.SimpleNamespace(done=lambda: False)
@@ -746,6 +747,7 @@ def test_s28_lost_handoff_priced_on_the_store_stays_on_d(monkeypatch, caplog):
         assert any("HANDOFF-LOST-STORE-PRICE" in r.getMessage() for r in caplog.records)
         # the store holds nothing: the hand-off's own price (52002 > X) stands -> fresh P (R4 path unchanged)
         f2 = _exact(_fx(), 52002)
+        f2.queue = __import__("collections").deque()
         f2.tp_prefill_max_tokens = 4921
         f2._dp_mark, f2._kick_controller = (lambda *a: None), (lambda *a: None)
         p2 = _big("lost2", 52002, 120.0)
