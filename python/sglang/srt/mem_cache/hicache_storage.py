@@ -476,7 +476,7 @@ def fill_stale_claim_ms() -> int:
 
 
 def _reap_stale_live_joins(arena, stems, joined, total_bytes: int, min_ms_override=None,
-                           out=None, verdicts=None) -> list:
+                           out=None, verdicts=None, rejoined=None) -> list:
     """L3FILL-JOINED (3): the JOINED stems whose holder delivered no byte for
     ``SGLANG_WEG2_L3FILL_STALE_CLAIM_S`` are taken from their keys (quarantine,
     generation-safe) and claimed fresh by this fill. Returns the new todo
@@ -515,6 +515,13 @@ def _reap_stale_live_joins(arena, stems, joined, total_bytes: int, min_ms_overri
             out[int(i)] = int(slot)
         elif int(status) == 1:
             _unclaim_fill_joins(arena, [(int(i), int(slot), int(gen))])
+            if rejoined is not None:
+                # S23 (h16v4b 1018_013102, D 01:36:23-24, weg2-0-2): the three D ranks reap the SAME broken claim at the
+                # same instant; one wins the fresh claim, the others get status 1 -- the winner's claim is a live, young
+                # fill (fresh generation), the opposite of a stale one. Dropping the stem made it a miss for THIS rank
+                # only (TP0 landed 79, TP1 0, TP2 1112 of 1112 -> group min 0, 71168 tokens re-prefilled). The loser
+                # awaits the winner's fill, like a host-write takeover loser does (``_take_over_host_write_joins``).
+                rejoined.append((int(i), int(slot), int(gen)))
     _STALE_REAP_N[0] += 1
     _STALE_REAP_N[1] += len(fresh)
     k = _STALE_REAP_N[0]
@@ -4126,12 +4133,18 @@ class HiCacheFile(HiCacheStorage):
             # JOIN-IDLE-1014: after the join wait's idle bound (default 1 s
             # without a move) -- never cut on a claim nobody fills.
             _verdicts: list = []
+            _reap_lost: list = []
             _fresh = _reap_stale_live_joins(
                 arena, stems, joined, int(total_bytes),
                 min_ms_override=(join_idle_ms() if (join_liveness_on() and join_idle_ms() > 0) else None),
-                out=out, verdicts=_verdicts)
+                out=out, verdicts=_verdicts, rejoined=_reap_lost)
             if _fresh:
                 self._arena_fill_read_todo(arena, _fresh, int(total_bytes), out, stats)
+            if _reap_lost and _join_wait > 0:
+                # S23: stems whose reap race a peer rank won -- its fresh claim is a live fill that completes in
+                # milliseconds: awaited (bounded, own progress clock), not dropped from this rank's prefix
+                for i, s_ in _await_fill_joins(arena, stems, _reap_lost, fill_join_wait_ms(len(_reap_lost))).items():
+                    out[i] = s_
             # H54 PARK-JOIN 1015: what the wait and the reap left. Named first
             # (JOIN-HELD: refs, merged writers, verdict per slot), then a
             # host-write holder loses the stem whatever its references and
