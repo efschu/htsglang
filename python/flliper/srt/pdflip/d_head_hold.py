@@ -43,6 +43,9 @@ class HeadHoldState(msgspec.Struct):
     held: int = 0
     held_total: int = 0
     log_n: int = 0
+    #: S42r A1: calls of ``should_hold`` -- one per scheduler iteration on every rank alike (the armed budget site
+    #: of every rank, or the elif chain), whatever the outcome; the group-wide re-evaluation is phase-locked to it.
+    tick: int = 0
 
 
 def fingerprint(
@@ -103,9 +106,24 @@ class DHeadHold:
     def should_hold(self, fp: Optional[tuple]) -> bool:
         """True = do not build this pass (nothing the verdict reads changed)."""
         st = self.state
+        # S42r A1 (review nf-review-s42-1018): THE 16-PASS BOUND IS PHASE-LOCKED TO A REPLICATED TICK. ``held`` is
+        # per rank and restarts at every evaluated pass of that rank; after ONE iteration in which the ranks decided
+        # differently (a rank-local fingerprint input, e.g. a landed verdict one iteration apart), the ranks hit
+        # their 16-pass bound on different iterations for ever -- and since S42 a lone evaluation sees every head
+        # arm ABSENT (the holding ranks abstain), so it can admit nothing: the bound that exists for rank-local room
+        # and timed gates never re-evaluated the group jointly again until a replicated change (probe: ranks 0/2
+        # evaluated on 16/33/50/67, rank 1 on 0/17/34/51/68, group match on none). ``tick`` advances once per call
+        # on every rank whatever the outcome, so every ``REEVAL_EVERY_PASSES + 1``-th iteration is a JOINT
+        # evaluation, desync or not.
+        tick = st.tick  # this iteration's index (0 = the scheduler's first call), replicated
+        st.tick = tick + 1
         if fp is None or st.fingerprint is None or not self.enabled:
             return False
-        if fp != st.fingerprint or st.held >= REEVAL_EVERY_PASSES:
+        if (
+            fp != st.fingerprint
+            or st.held >= REEVAL_EVERY_PASSES
+            or (tick > 0 and tick % (REEVAL_EVERY_PASSES + 1) == 0)
+        ):
             st.fingerprint = None
             return False
         st.held += 1

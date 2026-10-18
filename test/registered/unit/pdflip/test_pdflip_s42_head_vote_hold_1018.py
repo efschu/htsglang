@@ -476,6 +476,61 @@ def test_the_chain_consumes_the_budget_site_decision():
 
 
 # --------------------------------------------------------------------------------------------------------------
+# S42r A1 (review nf-review-s42-1018): one divergent DQH pass must not desync the 16-pass bound for ever
+# --------------------------------------------------------------------------------------------------------------
+def test_s42r_a1_one_divergent_pass_the_group_still_evaluates_jointly_every_17th_round(monkeypatch):
+    """Danger direction STARVATION x R11. ``held`` restarts per rank at that rank's evaluation; after ONE iteration
+    in which a rank decided alone (a rank-local fingerprint input), the per-rank bounds fired on different rounds
+    for ever (a14cf046ba: ranks 0/2 on 16/33/50/67, rank 1 on 0/17/34/51/68), every lone evaluation saw all head
+    arms ABSENT (the others abstained) and the head was never priced until a replicated change -- unbounded, not
+    <= 16 rounds. GREEN: the bound is phase-locked to a replicated tick, so the group evaluates jointly, on a real
+    group match, at the latest every REEVAL_EVERY_PASSES + 1 rounds after the divergence."""
+    from flliper.srt.managers import tp_head_congruence as THC
+    from flliper.srt.pdflip import d_head_hold as H
+
+    g = _Group(monkeypatch)
+    scheds = [_sched(r) for r in range(N)]
+    g.run(scheds, 1)
+    scheds[1].pdflip_d_head_hold.state.fingerprint = None  # one iteration decided differently on rank 1
+    period = H.REEVAL_EVERY_PASSES + 1
+    res = g.run(scheds, 4 * period)
+    joint = [i for i in range(len(res[0])) if all(res[r][i] != "held" for r in range(N))]
+    priced = [i for i in joint if any(int(v) > THC._ABSENT_MATCH for v in res[0][i][1].values())]
+    assert priced, ("after one divergent pass the group never evaluated jointly on a real group match", res)
+    assert priced[0] <= period, priced
+    gaps = [b - a for a, b in zip([priced[0]] + priced, priced + [len(res[0])])]
+    assert max(gaps) <= period, (priced, gaps)
+    assert g.rv.count()[0] == g.rv.count()[1] == g.rv.count()[2]
+
+
+def test_s42r_a1_desynced_dqh_instances_meet_on_the_replicated_tick():
+    """The same at the DHeadHold level: two instances armed one call apart (a lone evaluation) must hit a common
+    evaluation within REEVAL_EVERY_PASSES + 1 calls and from then on evaluate on the same calls."""
+    from flliper.srt.pdflip import d_head_hold as H
+
+    fp = ("h", ("h", "w"), ("r",), (), 7)
+    a, b = (H.DHeadHold(group_d=True, token_cut=lambda: True) for _ in range(2))
+    a.should_hold(None), b.should_hold(None)  # tick 0 on both
+    a.note_pass(fp=fp, built_nothing=True)
+    b.note_pass(fp=fp, built_nothing=True)
+    assert a.should_hold(fp) and b.should_hold(fp)
+    b.state.fingerprint = None  # b evaluates alone on this call
+    assert a.should_hold(fp) and not b.should_hold(fp)
+    b.note_pass(fp=fp, built_nothing=True)
+    ev_a, ev_b = [], []
+    for i in range(3 * (H.REEVAL_EVERY_PASSES + 1)):
+        if not a.should_hold(fp):
+            ev_a.append(i)
+            a.note_pass(fp=fp, built_nothing=True)
+        if not b.should_hold(fp):
+            ev_b.append(i)
+            b.note_pass(fp=fp, built_nothing=True)
+    common = sorted(set(ev_a) & set(ev_b))
+    assert common and common[0] <= H.REEVAL_EVERY_PASSES + 1, (ev_a, ev_b)
+    assert [e for e in ev_a if e >= common[0]] == [e for e in ev_b if e >= common[0]], (ev_a, ev_b)
+
+
+# --------------------------------------------------------------------------------------------------------------
 # Microbenchmark: a REAL tree, the REAL head-vote walks, Form A host vote (as on rc11 D TP0)
 # --------------------------------------------------------------------------------------------------------------
 def _real_tree():
