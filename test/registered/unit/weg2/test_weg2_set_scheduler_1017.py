@@ -660,3 +660,128 @@ def test_n1_seat_wait_is_named_in_the_d_now_line(monkeypatch, caplog):
         assert asyncio.run(run()) is not None
     (line,) = _verdicts(caplog)
     assert "verdict=D_NOW why=seat_wait" in line, line
+
+
+# ------------------------------------------------------------------------------------------- S28 (18.10.): no flip on a stale price
+
+class _Spans:
+    """tspans stand-in: ``pending(ids, epoch)`` -> (uncached, credit, known, src); ``price`` is what the store holds NOW."""
+
+    def __init__(self, price):
+        self.price = price
+        self.calls = 0
+
+    def pending(self, ids, epoch=None, since_seq=None):
+        self.calls += 1
+        return self.price, 100000, True, "store_anchor"
+
+
+class _Tok:
+    def ids_for(self, text):
+        import numpy as np
+        return np.arange(120000, dtype=np.int32)
+
+
+def _exact(f, price):
+    f.x_exact, f.ftok, f.tspans = True, _Tok(), _Spans(price)
+    f._d_page_size = lambda: 64
+    return f
+
+
+def _big(rid, u, age):
+    q = _pending(rid, u, time.time() - age)
+    q.text, q.d_eligible, q.reroutes, q.handoff_lost_reroutes, q.intake_stalled = "t", False, 0, 0, False
+    q.x_routed, q.p_only, q.mm_image_end = 0, False, 0
+    return q
+
+
+def test_s28_flip_verdict_is_made_on_the_current_price_not_the_stale_one(monkeypatch, caplog):
+    """R1/R7: the queue holds 52002 (stale), the store/anchor presence says 34. T_halb is over: without the pre-verdict
+    re-price the set says FLIP_P for 34 real tokens (fLLiper rc8 pdflip-17-189); with it, no flip (S=34 < X)."""
+    _on(monkeypatch)
+    f = _exact(_fx(), 34)
+    q = _big("stale", 52002, 40.0)
+    f.queue = [q]
+    with caplog.at_level(logging.INFO, logger="weg2.front"):
+        assert f._decode_collect(time.time()) != "P"
+    assert q.est_uncached == 34 and f.counters["flip_verdict_repriced"] == 1
+    assert not any("verdict=FLIP_P" in m or "verdict=PARK_NO_SEAT" in m for m in _verdicts(caplog))
+    assert f._set_flip_justified(time.time()) is False
+
+
+def test_s28_a_really_big_price_still_flips(monkeypatch):
+    """The re-price does not weaken R4: the presence confirms 52002 > X -> the verdict stands (and the price is unchanged)."""
+    _on(monkeypatch)
+    f = _exact(_fx(), 52002)
+    f.queue = [_big("big", 52002, 40.0)]
+    assert f._decode_collect(time.time()) == "P"
+    assert f.counters["flip_verdict_repriced"] == 0
+
+
+def test_s28_lost_handoff_priced_on_the_store_stays_on_d(monkeypatch, caplog):
+    """R1/R2/R7 (item 2): the hand-off credit stops at first_lost_page (uncached 52002 > X) but the store holds the span:
+    the rid is priced 34 and is NOT rerouted to P (no P leg, no flip)."""
+    import sys
+    import types
+    from sglang.srt.weg2 import handoff_seam as HS
+    mod = types.ModuleType("_fake_hp_s28")
+    mod.status = lambda rid: {"state": "lost", "first_lost_page": 1016, "pages": 1828, "page_size": 64}
+    mod.drop = lambda rid, reason: None
+    sys.modules["_fake_hp_s28"] = mod
+    old = HS.MODULE
+    HS.MODULE = "_fake_hp_s28"
+    HS.reset_module_cache()
+    try:
+        f = _exact(_fx(), 34)
+        p = _big("lost", 34, 120.0)
+        p.leg1_done, p.skip_leg1, p.d_direct, p.resume_via_p = True, False, False, False
+        p.leg1_prompt_tokens, p.fut = 117026, types.SimpleNamespace(done=lambda: False)
+        f.tp_prefill_max_tokens = 4921
+        f._dp_mark = lambda *a: None
+        f._kick_controller = lambda *a: None
+        with caplog.at_level(logging.INFO, logger="weg2.front"):
+            assert f._hl_check(p, "sweep") is False
+        assert p.leg1_done is True and p.handoff_lost_reroutes == 0 and f.queue == []
+        assert f.counters["handoff_lost_store_priced"] == 1 and f.counters["handoff_lost_reroutes"] == 0
+        assert any("HANDOFF-LOST-STORE-PRICE" in r.getMessage() for r in caplog.records)
+        # the store holds nothing: the hand-off's own price (52002 > X) stands -> fresh P (R4 path unchanged)
+        f2 = _exact(_fx(), 52002)
+        f2.tp_prefill_max_tokens = 4921
+        f2._dp_mark, f2._kick_controller = (lambda *a: None), (lambda *a: None)
+        p2 = _big("lost2", 52002, 120.0)
+        p2.leg1_done, p2.skip_leg1, p2.d_direct, p2.resume_via_p = True, False, False, False
+        p2.leg1_prompt_tokens, p2.fut = 117026, types.SimpleNamespace(done=lambda: False)
+        assert f2._hl_check(p2, "sweep") is True and p2.handoff_lost_reroutes == 1
+    finally:
+        HS.MODULE = old
+        HS.reset_module_cache()
+        sys.modules.pop("_fake_hp_s28", None)
+
+
+def test_s28_needs_p_by_state_of_a_lost_handoff_only_while_over_x():
+    """R7: a lost hand-off is P-by-state only on a price over X; a leg-2 reroute stays P-by-state (R9/N1)."""
+    assert pp.needs_p(52002, X, handoff_lost_reroutes=1) is True
+    assert pp.needs_p(34, X, handoff_lost_reroutes=1) is False
+    assert pp.needs_p(34, X, reroutes=1) is True
+
+
+def test_s28_flip_price_stale_instrument(monkeypatch, caplog):
+    """Item 5: a flip trigger re-priced under X within 2 s of its verdict -> ``WEG2 FLIP-PRICE-STALE`` + counter."""
+    _on(monkeypatch)
+    f = _exact(_fx(), 34)
+    q = _big("trig", 52002, 40.0)
+    f.queue = [q]
+    f._flip_trig_note("trig", 52002, "park-immediate")
+    with caplog.at_level(logging.INFO, logger="weg2.front"):
+        f._x_exact_reprice_queue("p_anchor")
+    (line,) = [r.getMessage() for r in caplog.records if "FLIP-PRICE-STALE" in r.getMessage()]
+    assert "rid=trig site=park-immediate est_at_flip=52002 est_now=34 X=6000" in line
+    assert f.counters["flip_price_stale"] == 1
+    # later than 2 s, or a price still over X: no signal
+    f.counters.clear()
+    q2 = _big("late", 52002, 40.0)
+    f.queue = [q2]
+    f._flip_trig_note("late", 52002, "set-verdict")
+    f._flip_trig["late"] = (time.time() - 3.0, 52002, "set-verdict")
+    f._x_exact_reprice_queue("p_anchor")
+    assert f.counters["flip_price_stale"] == 0
