@@ -27,6 +27,9 @@ from typing import Dict, List, Optional
 STATE_ROOTS = ("/spinning/docker-acceptance/nf/state", "/spinning/docker-acceptance/27b/state")
 SCHEMA = "weg2.state/1"
 EVENT_SCHEMA = "weg2.event/1"
+# fLLiper (renamed tree) writes the same records as pdflip.*/1 -- one reader for both lines (18.10.)
+SCHEMAS = (SCHEMA, "pdflip.state/1")
+EVENT_SCHEMAS = (EVENT_SCHEMA, "pdflip.event/1")
 TERMINAL = ("refused_preflight", "stopped_clean", "dead")
 SHOW_S = 6 * 3600.0           # same horizon as the log-discovered boots (live.SHOW_S)
 #: the events the field readers use (ipcfields.py, DASHBOARD-AUS-IPC-INVENTAR rows A12/A14/B1-B7/D4)
@@ -131,7 +134,7 @@ class _Events:
                 e = json.loads(raw)
             except ValueError:
                 continue
-            if not isinstance(e, dict) or e.get("schema") != EVENT_SCHEMA:
+            if not isinstance(e, dict) or e.get("schema") not in EVENT_SCHEMAS:
                 continue
             t = e.get("type")
             self.counts[t] = self.counts.get(t, 0) + 1
@@ -232,7 +235,7 @@ class IpcStates:
                 seen.add(d)
                 if self._mt.get(d) != mt:
                     st = _read_json(p)
-                    if st and st.get("schema") == SCHEMA:
+                    if st and st.get("schema") in SCHEMAS:
                         with self.lock:
                             self._st[d] = st
                             self._mt[d] = mt

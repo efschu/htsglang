@@ -29,6 +29,7 @@ import os
 from typing import Dict, List, Optional
 
 RANKSTATS_SCHEMA = "weg2.rankstats/1"
+RANKSTATS_SCHEMAS = (RANKSTATS_SCHEMA, "pdflip.rankstats/1")   # fLLiper writes pdflip.rankstats/1 (18.10.)
 RANKSTATE_SCHEMAS = (1, 2)
 
 #: the 25 rows of the inventory that were "Übergang" (order = the page's order)
@@ -158,7 +159,7 @@ def read_rank_files(dirs: List[str]) -> dict:
     for d in dirs:
         for p in sorted(glob.glob(os.path.join(d, "*.rankstats"))):
             rec = _load(p)
-            if rec and rec.get("schema") == RANKSTATS_SCHEMA:
+            if rec and rec.get("schema") in RANKSTATS_SCHEMAS:
                 stats[os.path.basename(p)[: -len(".rankstats")]] = rec
         for p in sorted(glob.glob(os.path.join(d, "*.json"))):
             rec = _load(p)
