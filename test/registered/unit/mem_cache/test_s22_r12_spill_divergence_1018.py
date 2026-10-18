@@ -24,9 +24,15 @@ from sglang.srt.mem_cache import form_a_host_shadow as R  # noqa: E402
 def _worker_peels(g, idxs):
     """The worker's own device peel, leaf first, through the real ``_evict_to_host`` (the fixture tree has no LRU
     machinery: the component free is the one stand-in, it only takes the KV off the device)."""
-    def _free(node, comp, target=None, tracker=None):
-        node.component_data[FULL].value = None
-        return 0, 0
+    from sglang.srt.mem_cache.unified_radix_cache import EvictLayer
+
+    real = g.t1._evict_component_and_detach_lru
+
+    def _free(node, comp, target=EvictLayer.DEVICE, tracker=None):
+        if EvictLayer.DEVICE in target:
+            node.component_data[FULL].value = None
+            return 0, 0
+        return real(node, comp, target=target, tracker=tracker)
 
     g.t1._evict_component_and_detach_lru = _free
     g.t1._cascade_evict = lambda node, trigger, tracker: None
