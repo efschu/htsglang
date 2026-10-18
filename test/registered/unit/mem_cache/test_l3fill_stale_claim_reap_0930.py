@@ -181,7 +181,7 @@ def test_s23_self_join_leaves_a_sibling_io_threads_live_claim_alone(tmp_path, mo
         out = _on_io_thread(lambda: HiCacheFile.arena_fill_from_disk(be, arena, ["p1"], TOTAL, prefix=True))
     t_sib.join(10)
     assert not any("SELF-JOIN" in r.getMessage() for r in caplog.records), [r.getMessage() for r in caplog.records]
-    assert done["status"] == [0], done            # base: [6] -- the sibling's completion refused, its read cut
+    assert done["status"] == [1], done            # 1 = completed; base: [6] -- the sibling's completion refused, its read cut
     assert out[0] == slot, (out, slot)            # the reader waited and got the sibling's page
     hs._FILL_LIVE.pop(slot, None)
     assert ident_owner
@@ -199,3 +199,4 @@ def test_s23_self_join_still_takes_over_a_leftover_claim_of_a_dead_call(tmp_path
     with envs.SGLANG_WEG2_L3FILL_SELF_JOIN_TAKEOVER.override(True):
         out = _on_io_thread(lambda: HiCacheFile.arena_fill_from_disk(be, arena, ["p1"], TOTAL, prefix=True))
     assert out[0] is not None and out[0] != old
+    assert not hs._FILL_LIVE, hs._FILL_LIVE      # the fill gave its live registrations back
