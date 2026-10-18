@@ -9,6 +9,8 @@
 #   B5 the read thread never wakes the worker (hook dropped in prefetch_io_aux_func)
 #   B6 armed on PP0 too
 #   B7 the window wraps more than the model forward (the produce step joins it)
+#   B10 (review) a forward that raises leaves the window released   B11 (review) a pump that raises keeps the window
+#   B12 (review) the outbox is cleared before the send (a dead send loses the ack)
 #   B8 armed at tp_size > 1 (a harvest collective from the worker thread)   B9 a nested forward releases the window twice
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -73,7 +75,25 @@ F[B9]=$E; OLD[B9]='        if self.in_window and threading.current_thread() is s
             yield
             return
 '; NEW[B9]=''
-ORDER=(B1 B1b B2 B3 B4 B5 B6 B7 B8 B9)
+# S50 review: the error paths
+F[B10]=$E; OLD[B10]='        finally:
+            self.window.acquire()
+            self.in_window = False'; NEW[B10]='        except BaseException:
+            raise
+        self.window.acquire()
+        self.in_window = False'
+F[B11]=$E; OLD[B11]='        finally:
+            self.window.release()
+
+    def _pump_and_note'; NEW[B11]='        finally:
+            if not self.errors:
+                self.window.release()
+
+    def _pump_and_note'
+F[B12]=$SRT/managers/pdflip_told_fallback.py; OLD[B12]='    if ch.send_nowait(ack):
+        st.outbox = []'; NEW[B12]='    st.outbox = []
+    if ch.send_nowait(ack):'
+ORDER=(B1 B1b B2 B3 B4 B5 B6 B7 B8 B9 B10 B11 B12)
 [ -n "${ONLY:-}" ] && ORDER=("$ONLY")
 killed=0; survived=0
 for m in "${ORDER[@]}"; do

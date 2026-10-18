@@ -113,6 +113,35 @@ def test_stamp_takes_the_whole_uncached_amount_at_the_first_chunk_once():
     assert big._mixed_d_u_total == 5983
 
 
+def test_review_a1_readmission_on_a_shorter_prefix_restamps_big():
+    """S50 review A1: a request first chunked SHORT (745 under halbX 3116), then retracted / parked and re-admitted on a
+    lost prefix (seqlen 42473, prefix now 36864: 5609 uncached >= halbX) is BIG -- its chunks must not mix, although each
+    chunk alone (512) and the batch sum stay under halbX. The first-admission total may not keep it short."""
+    r = _req("pdflip-14-180", 3116, seqlen=42473, start=41728)
+    mds.stamp_chunked(r)
+    assert r._mixed_d_u_total == 745
+    assert _agreed(_fake_sched(chunked_req=r), _batch([r], 512)) is True
+    r.extend_range.start = 36864              # re-admission: the prefix shrank
+    mds.stamp_chunked(r)
+    assert r._mixed_d_u_total == 5609
+    assert _agreed(_fake_sched(chunked_req=r), _batch([r], 512)) is False
+    r.extend_range.start = 37376              # its next chunk reads the smaller rest: the stamp keeps the maximum
+    mds.stamp_chunked(r)
+    assert r._mixed_d_u_total == 5609
+    assert _agreed(_fake_sched(chunked_req=None), _batch([r], 233)) is False
+
+
+def test_review_a1_an_unreadable_stamp_stays_big_for_life():
+    r = _req("r", 3116)                        # no seqlen: the stamp cannot be read
+    mds.stamp_chunked(r)
+    assert r._mixed_d_u_total is None
+    r.seqlen = 1000
+    r.extend_range = types.SimpleNamespace(start=900, end=None)   # a later chunk reads a small rest
+    mds.stamp_chunked(r)
+    assert r._mixed_d_u_total is None
+    assert _agreed(_fake_sched(), _batch([r], 100)) is False
+
+
 def test_boundary_total_equal_halfx_is_big_one_below_is_short():
     hx = 3116
     for total, want in ((hx, False), (hx - 1, True), (hx + 1, False)):

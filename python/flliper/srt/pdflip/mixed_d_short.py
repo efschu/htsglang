@@ -99,24 +99,35 @@ def chunked_enabled() -> bool:
 #: S50: the request's whole uncached amount at its FIRST D chunk (tokens), stamped once with the chunk stamp.
 ATTR_TOTAL = "_mixed_d_u_total"
 ATTR_CHUNKED = "_mixed_d_was_chunked"
+#: S50 review A1: a stamp that could not be read once -- the request stays big for life
+ATTR_UNREADABLE = "_mixed_d_u_total_unreadable"
 
 
 def stamp_chunked(req) -> None:
-    """The chunk stamp (S32, lifetime-sticky) plus, once, the request's whole uncached amount at its first D chunk.
+    """The chunk stamp (S32, lifetime-sticky) plus the request's whole uncached amount at its first D chunk.
 
     Called where the scheduler counts a chunk of ``req`` into this pass's batch; at the FIRST such pass
     ``extend_range.start`` is the prefix the request was admitted on, so ``seqlen - start`` is what D must prefill in all
-    (the amount R2 classifies). Later chunks keep the first value (a re-admission does not shrink a big request)."""
+    (the amount R2 classifies). Later chunks of the same admission read a smaller rest and keep the first value (the last
+    chunk of a big request does not read short). S50 review A1: the stamp is the MAXIMUM over its passes, never only the
+    first -- a request re-admitted on a shorter prefix (retract / park / resume lost part of it: ``seqlen - start`` is now
+    larger) is judged on its new whole amount, not on a smaller total of an earlier admission. An unreadable stamp makes
+    the request big for life (no invented bound)."""
     setattr(req, ATTR_CHUNKED, True)
-    if getattr(req, ATTR_TOTAL, None) is not None:
+    if getattr(req, ATTR_UNREADABLE, False):
         return
     try:
         er = getattr(req, "extend_range", None)
         start = int(er.start) if er is not None else len(getattr(req, "prefix_indices", None) or ())
         seqlen = int(getattr(req, "seqlen"))
-        setattr(req, ATTR_TOTAL, max(0, seqlen - start))
+        total = max(0, seqlen - start)
     except Exception:  # noqa: BLE001 -- no total = big (chunked_big), never an invented bound
+        setattr(req, ATTR_UNREADABLE, True)
         setattr(req, ATTR_TOTAL, None)
+        return
+    old = getattr(req, ATTR_TOTAL, None)
+    if old is None or total > int(old):
+        setattr(req, ATTR_TOTAL, total)
 
 
 def chunked_big(reqs: Iterable, chunked_req, half_x_tokens: int) -> bool:

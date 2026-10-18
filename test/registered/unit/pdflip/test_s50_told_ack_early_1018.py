@@ -208,6 +208,77 @@ def test_the_scheduler_leaves_the_window_only_after_a_running_pump(monkeypatch):
     assert marks["exit"] >= marks["end"]
 
 
+# ------------------------------------------------------------------------------------------ error paths (S50 review B1/B2)
+def test_review_b1_a_forward_that_raises_takes_the_window_back(own):
+    """S50 review B1: an exception in the model forward (OOM, a retreat, a named stop) must leave the window HELD by the
+    scheduler thread -- the exception path (retreat, abort, the next pass) touches the tree and the told state, so a
+    worker pump beside it would be exactly the race the window forbids."""
+    s = _sched()
+    tae.forward_window(s)
+    ea = tae.instance(s)
+    with pytest.raises(RuntimeError):
+        with tae.forward_window(s):
+            raise RuntimeError("forward died")
+    assert not ea.in_window
+    assert not ea.window.acquire(blocking=False)              # held by the scheduler again
+    _register(s, "r", 10)
+    s.tree_cache.done["r"] = True
+    s.tree_cache.completed["r"] = 10
+    tae.note_read_end()
+    time.sleep(0.05)
+    assert ea.run_once() is False and s._pdflip_fb_channel.sent == [] and s.tree_cache.harvest_threads == []
+    with tae.forward_window(s):                               # the next forward opens the window normally
+        assert _wait(lambda: s._pdflip_fb_channel.sent)
+    assert s._pdflip_fb_channel.sent[0].reads == [("r", 10)]
+
+
+class _FailOnceChan(Chan):
+    """The first send dies (a gloo error mid-pump); every later one goes out."""
+
+    def __init__(self):
+        super().__init__()
+        self.failed = 0
+
+    def send_nowait(self, ack):
+        if not self.failed:
+            self.failed += 1
+            raise RuntimeError("gloo send died")
+        return super().send_nowait(ack)
+
+
+def test_review_b2_a_pump_that_raises_gives_the_window_back_and_loses_no_ack(own):
+    """S50 review B2: an exception inside the early pump must release the window (else the scheduler blocks forever on
+    the window at the end of its forward -- a silent hang) and must not lose the ack: the read the dead pump harvested is
+    reported exactly once, by the next pump."""
+    s = _sched()
+    s._pdflip_fb_channel = _FailOnceChan()
+    _register(s, "r", 10)
+    box = {}
+
+    def scheduler_thread():
+        tae.forward_window(s)                                 # the scheduler thread owns the window
+        ea = tae.instance(s)
+        box["ea"] = ea
+        with tae.forward_window(s):
+            s.tree_cache.done["r"] = True
+            s.tree_cache.completed["r"] = 10
+            tae.note_read_end()
+            _wait(lambda: ea.errors >= 1)
+        box["left"] = True
+
+    t = threading.Thread(target=scheduler_thread, daemon=True)
+    t.start()
+    t.join(timeout=3.0)
+    assert not t.is_alive() and box.get("left"), "the forward never got its window back (the dead pump kept it)"
+    ea = box["ea"]
+    assert ea.errors == 1 and not ea.in_window
+    assert not ea.window.acquire(blocking=False)
+    fb.follower_pump(s)                                       # the pass-boundary pump (window held)
+    got = [r for a in s._pdflip_fb_channel.sent for r in a.reads]
+    assert got == [("r", 10)]
+    assert [a.seq for a in s._pdflip_fb_channel.sent] == [0]
+
+
 def test_boundary_and_early_pumps_share_one_ordered_stream(own):
     s = _sched()
     for i in range(6):

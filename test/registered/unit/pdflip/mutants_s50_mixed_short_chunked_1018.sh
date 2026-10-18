@@ -3,6 +3,8 @@
 # test_s50_mixed_short_chunked_1018.py red. Local, 4-GiB cgroup. ONLY=<name> runs one. Restores every file on exit.
 #   C1 chunked = big again (total ignored)            C2 boundary: total == halbX reads short (>= -> >)
 #   C3 a big chunk may mix (never big)                C4 stamp re-taken every chunk (the last chunk of a big one reads short)
+#   C4b (S50 review A1) stamp kept from the first admission only (a re-admission on a lost prefix reads short)
+#   C4c (S50 review A1) an unreadable stamp is retried later (a small rest reads short)
 #   C5 a chunked request without a total reads short  C6 the chunked_req behind the batch is not looked at
 #   C7 the verdict is the rank-local flag (no group MIN, R11)
 set -u
@@ -30,14 +32,18 @@ F[C1]=$M; OLD[C1]='    if not chunked_enabled():
 F[C2]=$M; OLD[C2]='if total is None or hx <= 0 or int(total) >= hx:'; NEW[C2]='if total is None or hx <= 0 or int(total) > hx:'
 F[C3]=$M; OLD[C3]='    if not cands:
         return False'; NEW[C3]='    return False'
-F[C4]=$M; OLD[C4]='    if getattr(req, ATTR_TOTAL, None) is not None:
-        return
-'; NEW[C4]=''
+F[C4]=$M; OLD[C4]='    if old is None or total > int(old):
+        setattr(req, ATTR_TOTAL, total)'; NEW[C4]='    setattr(req, ATTR_TOTAL, total)'
+F[C4b]=$M; OLD[C4b]='    if old is None or total > int(old):
+        setattr(req, ATTR_TOTAL, total)'; NEW[C4b]='    if old is None:
+        setattr(req, ATTR_TOTAL, total)'
+F[C4c]=$M; OLD[C4c]='    if getattr(req, ATTR_UNREADABLE, False):
+        return'; NEW[C4c]='    pass'
 F[C5]=$M; OLD[C5]='if total is None or hx <= 0 or int(total) >= hx:'; NEW[C5]='if total is not None and (hx <= 0 or int(total) >= hx):'
 F[C6]=$M; OLD[C6]='    if chunked_req is not None:
         cands.append(chunked_req)'; NEW[C6]=''
 F[C7]=$SRT/managers/scheduler.py; OLD[C7]='agreed = bool(self._pdflip_group_min_flags([mine])[0])'; NEW[C7]='agreed = bool(mine)'
-ORDER=(C1 C2 C3 C4 C5 C6 C7)
+ORDER=(C1 C2 C3 C4 C4b C4c C5 C6 C7)
 [ -n "${ONLY:-}" ] && ORDER=("$ONLY")
 killed=0; survived=0
 for m in "${ORDER[@]}"; do
