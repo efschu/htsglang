@@ -243,6 +243,7 @@ from flliper.srt.pdflip import twin_anchor as _pdflip_twin_anchor  # TWIN ANCHOR
 from flliper.srt.pdflip import d_park_read as _pdflip_park_read  # PARK-RETAIN READ
 from flliper.srt.pdflip import lanes_p as _lanes_p  # PRIORITY LANES 1008 (L3): the P-side lane floor
 from flliper.srt.pdflip import mixed_d_short as _mds_stamp  # MIXED-D chunk stamp + S50 total (short-chunked)
+from flliper.srt.managers import pdflip_told_ack_early as _pdflip_told_ack_early  # S50 TOLD-ACK-EARLY
 from flliper.srt.pdflip import resume_via_p as _pdflip_rvp  # RESUME-VIA-P
 from flliper.srt.pdflip import front_x as _pdflip_front_x  # FRONT-X-MIT: the front's decision X at D's X gate
 from flliper.srt.pdflip import d_wall_head as _pdflip_d_wall_head  # PW-R
@@ -19931,9 +19932,13 @@ class Scheduler(
                         # that raises cannot leave the batch in FULL capture
                         # for whatever runs next.
                         _stack.enter_context(self._draft_kv_full_capture(batch))
-                    batch_result = self.model_worker.forward_batch_generation(
-                        batch, **kwargs
-                    )
+                    # S50 TOLD-ACK-EARLY: on an armed P follower the forward is the window in which a
+                    # worker may report a read that just ended (managers/pdflip_told_ack_early.py); a null
+                    # context everywhere else.
+                    with _pdflip_told_ack_early.forward_window(self):
+                        batch_result = self.model_worker.forward_batch_generation(
+                            batch, **kwargs
+                        )
                     if produce:
                         self._draft_kv_produce(batch, batch_result)
                 if _pls is not None:

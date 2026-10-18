@@ -50,6 +50,7 @@ from flliper.srt.mem_cache.pdflip_store_gates import check_mamba_blob_present
 from flliper.srt.mem_cache import probe_hold as _probe_hold
 from flliper.srt.pdflip import read_depth as _rd  # READ-DEPTH 1014 (C5)
 from flliper.srt.pdflip import kv_durchlauf as _kv_dl  # S36 KV-DURCHLAUF
+from flliper.srt.managers import pdflip_told_ack_early as _told_ack_early  # S50 TOLD-ACK-EARLY
 
 
 # #1402: module-level on purpose -- the harness doubles bind curated
@@ -4295,6 +4296,9 @@ class HiCacheController:
                     operation.host_indices[operation.completed_tokens :],
                     generation=getattr(operation, "binding_generation", None),
                 )
+                # S50 TOLD-ACK-EARLY: this thread is done with the operation -- wake a P follower's early-ack
+                # worker (no-op without one); its harvest (check_prefetch_progress) decides termination as before
+                _told_ack_early.note_read_end(operation)
             except Empty:
                 continue
             except Exception:  # noqa: BLE001 - see the docstring: the only

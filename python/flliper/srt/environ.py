@@ -2176,6 +2176,12 @@ class Envs:
     FLLIPER_PDFLIP_DISABLE_TOLD_PACE_IDLE_SKIP = EnvBool(False)
     FLLIPER_PDFLIP_P_TWIN_DEFER = EnvBool(_profile_default("FLLIPER_PDFLIP_P_TWIN_DEFER", False))
     FLLIPER_PDFLIP_TOLD_GROUP_FALLBACK = EnvBool(_profile_default("FLLIPER_PDFLIP_TOLD_GROUP_FALLBACK", False))
+    # S50 TOLD-ACK-EARLY (managers/pdflip_told_ack_early.py): a P follower reports a store read that ended inside its
+    # model forward from that forward (a worker, woken by the read thread, runs the unchanged follower_pump while the
+    # scheduler thread is inside the forward and holds no tree/told state) instead of at the next pass boundary --
+    # S48 class 1 (pdflip-8-123: acks 2.5 s late, PP0's admission behind its commit block). Only on a follower running
+    # the PF ack stream. New feature -> default ON; 0 = the pump only at pass boundaries, byte for byte.
+    FLLIPER_PDFLIP_TOLD_ACK_EARLY = EnvBool(True)
     # Prefix trace (IN 26.09., pdflip/prefix_trace.py): every prefix miss of an
     # agent-load boot gets a token receipt -- one #1420 WALK-STOP line per
     # (rid, stop depth) whose unmatched rest is >= the minimum below, full
