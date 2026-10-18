@@ -199,3 +199,54 @@ def test_a_failing_node_still_spills_only_once():
     _save(t, n)
     _save(t, n)
     assert t.calls.count("spill") == 1
+
+
+# --- Teil 4 (review nf-review-s25-1018): the mark alone is no proof; store-aware backups ---
+
+def test_mark_set_but_kv_not_in_store_gives_no_early_return(monkeypatch):
+    """Review 1: weg2_anchor_secured=True on a node whose KV is on the device only (not backuped, not l3_present)."""
+    monkeypatch.setattr(UnifiedRadixCache, "_weg2_anchor_secured_holds", lambda self, node: True)
+    t, n = _tree(), _node()          # not backuped, not l3_present
+    n.weg2_anchor_secured = True
+    assert _save(t, n) is False
+    assert t.calls == ["full_kv_backup"]
+
+
+def test_unbacked_anchors_counts_a_marked_node_without_store_kv(monkeypatch):
+    monkeypatch.setattr(UnifiedRadixCache, "_weg2_anchor_secured_holds", lambda self, node: True)
+
+    def _tree_with(node):
+        node.children, node.parent = {}, None
+        node.component_data[ComponentType.MAMBA].value = object()
+        root = types.SimpleNamespace(children={1: node})
+        t = types.SimpleNamespace(root_node=root, weg2_node_depth=lambda n: n.depth)
+        t.__dict__.setdefault("_weg2_anchor_only_detached", set())
+        return t
+
+    lost = UnifiedRadixCache.weg2_unbacked_anchors(_tree_with(_node()))
+    assert [d for d, _ in lost] == [86336]
+    assert UnifiedRadixCache.weg2_unbacked_anchors(_tree_with(_node(l3_present=True))) == []
+
+
+def _bs_tree():
+    t = types.SimpleNamespace(calls=[])
+    t.write_backup = lambda node: t.calls.append("full") or 1
+    t.write_backup_anchor_only = lambda node: t.calls.append("anchor_only") or 1
+    t.weg2_node_depth = lambda n: n.depth
+    return t
+
+
+def test_store_backed_node_asks_no_full_backup_from_the_hit_path():
+    """Review 3: RED before (write_backup for every un-backed node, 93376 tokens at D.log:99080)."""
+    t = _bs_tree()
+    UnifiedRadixCache._s25_backup_store_aware(t, _node(l3_present=True))
+    assert t.calls == ["anchor_only"]
+    t = _bs_tree()
+    UnifiedRadixCache._s25_backup_store_aware(t, _node())
+    assert t.calls == ["full"]
+
+
+def test_hit_count_and_pin_reissue_route_through_the_store_aware_backup():
+    import inspect
+    assert "_s25_backup_store_aware(node)" in inspect.getsource(UnifiedRadixCache._inc_hit_count)
+    assert "_s25_backup_store_aware(node)" in inspect.getsource(UnifiedRadixCache.release_acked_anchor_pin)

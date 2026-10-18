@@ -1629,7 +1629,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 continue
             if cd is None or cd.value is None or cd.host_value is not None:
                 continue
-            if (_det and getattr(node, "id", None) in _det) or self._weg2_anchor_secured_holds(node):
+            if (_det and getattr(node, "id", None) in _det) or (
+                    (node.backuped or UnifiedRadixCache._s25_kv_in_store(node))
+                    and self._weg2_anchor_secured_holds(node)):
                 continue    # ANCHOR-ONLY (KV in the store): its arena slot carries it (or its write is in flight)
             out.append((self.weg2_node_depth(node), getattr(node, "weg2_anchor_rid", None)))
         out.sort()
@@ -2733,7 +2735,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 and cd.host_value is None
                 and node.id not in self.ongoing_write_through
             ):
-                self.write_backup(node)
+                self._s25_backup_store_aware(node)
             return False
         if not self.dec_mamba_lock_only(node):
             return False
@@ -5945,6 +5947,22 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                            type(exc).__name__, exc)
             return False
 
+    def _s25_backup_store_aware(self, node) -> int:
+        """S25 (review nf-review-s25-1018 point 3, h16v5 D.log:99080 node 263 93376 tokens, :99180 FORMA need=1459):
+        ``_inc_hit_count`` (park retract, ``force_host_write_through``) and the anchor-pin re-issue asked ``write_backup``
+        for every node without a Full host copy -- also for a store-backed one (``l3_present``), whose KV the store holds.
+        Those full backups filled the KV arena with needless host copies and left no room for fresh end nodes (flush
+        03:42:32: 16 anchors lost). A store-backed node needs at most its device-only anchor copied (anchor-only)."""
+        if UnifiedRadixCache._s25_kv_in_store(node):
+            n = getattr(UnifiedRadixCache, "_s25_store_aware_n", 0) + 1
+            UnifiedRadixCache._s25_store_aware_n = n
+            if n <= 16 or n % 256 == 0:
+                logger.info("S25 STORE-AWARE-BACKUP n=%d rank=%s node=%s depth=%d (an l3_present node asks no full KV "
+                            "backup; at most its device-only anchor is copied)", n, getattr(self, "tp_rank", "?"),
+                            getattr(node, "id", "?"), self.weg2_node_depth(node))
+            return self.write_backup_anchor_only(node)
+        return self.write_backup(node)
+
     @staticmethod
     def _s25_kv_in_store(node) -> bool:
         """S25: the node's KV is in the store only (``l3_present``, no Full host copy) and the anchor-only
@@ -5983,8 +6001,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if (cc is None or getattr(cc, "write_policy", None) != "write_back"
                 or not UnifiedRadixCache.k15_anchor_save_on()):
             return False
-        if UnifiedRadixCache._weg2_anchor_secured_holds(self, node):
-            return True   # S25: the anchor already sits in its arena slot (KV-in-store anchor-only copy)
+        if ((node.backuped or UnifiedRadixCache._s25_kv_in_store(node))
+                and UnifiedRadixCache._weg2_anchor_secured_holds(self, node)):
+            # S25: the anchor already sits in its arena slot (KV-in-store anchor-only copy). Gated on the KV being
+            # backed: the mark alone (set generically after an aux host release) is no proof for a node whose KV is
+            # on the device only.
+            n = getattr(UnifiedRadixCache, "_s25_early_return_n", 0) + 1
+            UnifiedRadixCache._s25_early_return_n = n
+            if n <= 16 or n % 256 == 0:
+                logger.info("S25 ANCHOR-SECURED-HELD n=%d rank=%s node=%s depth=%d (K15 save: the anchor already sits in "
+                            "its arena slot, no new claim)", n, getattr(self, "tp_rank", "?"), getattr(node, "id", "?"),
+                            self.weg2_node_depth(node))
+            return True
         if getattr(node, "_weg2_capped", False) or node.write_through_pending_id is not None:
             return False   # the per-path cap took it by design / a write is already in flight
         if _r12.role() == "worker":
@@ -8565,7 +8593,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 or node.hit_count >= self.write_through_threshold
             )
         ):
-            self.write_backup(node)
+            self._s25_backup_store_aware(node)
 
     @staticmethod
     def _plain_sidecar_transfers(transfers, registered_pools) -> list:
@@ -14129,6 +14157,11 @@ def _s25_mark_released_anchor_secured(tree, node) -> None:
             return
         if probe(node.hash_value[-1]):
             node.weg2_anchor_secured = True
+            n = getattr(UnifiedRadixCache, "_s25_mark_n", 0) + 1
+            UnifiedRadixCache._s25_mark_n = n
+            if n <= 16 or n % 256 == 0:
+                logger.info("S25 ANCHOR-SECURED-MARK n=%d rank=%s node=%s (the spill's aux release left the anchor in its "
+                            "arena slot)", n, getattr(tree, "tp_rank", "?"), getattr(node, "id", "?"))
     except Exception as exc:  # noqa: BLE001 - no mark = the old behaviour, named
         logger.warning("S25 ANCHOR-SECURED probe after aux host release raised: %r", exc)
 
