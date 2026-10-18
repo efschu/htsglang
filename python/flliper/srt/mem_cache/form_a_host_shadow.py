@@ -86,6 +86,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -108,6 +109,11 @@ L3 = "l3"
 #: fails), so a worker can compare it with its OWN orphan mark in both directions -- the
 #: orphan verdict is rank-local (each rank acks against the shared arena at its own time).
 K21 = "k21"
+
+#: READ-ROOM-D (review readroomd2 A4): TP0 released a node's KV host rows for a P read -- applied on a worker
+#: exactly like STATE, but an apply that ends ``pending`` or ``deleted`` is NAMED at every occurrence
+#: (READ-ROOM-STATE-DIVERGED), like SPILL-DIVERGED: in that window the trees differ
+RRSTATE = "rrstate"
 
 #: #239 S4b part 4: broadcasts TP0 waits for an incomplete token-cut page
 #: before it falls back to the ack's pre-cut decision (a write of every owner
@@ -161,6 +167,11 @@ class _State:
         self.k21_confirmed: Dict[Tuple[str, int], int] = {}
         # keys TP0 reported as orphan while this worker's own ack was clean: its STATE must end 'kv'
         self.k21_expect: set = set()
+        # S20 review A1: READ-ROOM-STATE windows open on this worker, (hash, depth) -> [t_open, passes]
+        self.rr_open: Dict[Tuple[str, int], list] = {}
+        # S22: this worker's device-evicted content keys (published next to the arena for TP0's spill choice)
+        self.dev_evicted: set = set()
+        self.dev_nodelete: set = set()
         # named stop found outside a consume (own-ack time); raised at the end of the next consume
         self.k21_stop_msg: Optional[str] = None
         # number of broadcasts consumed on this rank
@@ -340,7 +351,7 @@ def record_state(tree: Any, node: Any, why: str = "") -> None:
         _S.absent.add(k)
     else:
         _S.absent.discard(k)
-    _S.ledger.append((STATE, k[0], k[1], exists, kv, m))
+    _S.ledger.append((RRSTATE if why == "read-room" else STATE, k[0], k[1], exists, kv, m))
 
 
 class K21RankDivergence(RuntimeError):
@@ -561,6 +572,149 @@ def take_spill_request(arena: Any) -> int:
         os.close(fd)
 
 
+# ------------------------- S22 (R12 SPILL-DIVERGED, 18.10.): which nodes a worker CAN follow a spill on
+#: NF h16v4b 01:40:12 TP1/TP2 ``R12 SPILL-DIVERGED seq=46 node=90 out=unreconcilable``. THE ROOT: the device life
+#: of a node is rank-local (the D ranks' device pools differ: TP0 5090, the workers 3080; every rank peels its own
+#: LRU), the host life is TP0's. TP0 spilled node 90 -- a node that was device-resident ON TP0 -- and its host rows
+#: went; on both workers node 90 had already left the device (an interior node whose KV exists only as its host
+#: rows), so the worker's reconcile has no state to move to: dropping the host copy of an interior device-evicted
+#: node would leave a hollow node the tree cannot hold (``unreconcilable``), dropping a device-evicted LEAF deletes
+#: a node TP0 keeps (``deleted``). TP0 chose a candidate no rank could follow on. R11: TP0 decides alone, so it must
+#: decide on what the workers can apply -- a worker publishes the content keys of its device-evicted nodes next to
+#: the arena (host bookkeeping, no collective, like the W3 need above) and TP0 spills only nodes that are no worker's
+#: device-evicted node. The publish happens AT the eviction (``worker_device_evicted``, from
+#: ``_evict_to_host``) -- every device peel precedes the forward's TP sync of its loop, TP0's next decision follows
+#: it -- and is re-derived from the tree at every consume (a node that came back is released again).
+DEV_SUFFIX = ".w3dev"
+
+
+def _dev_dir_prefix(arena: Any) -> Optional[str]:
+    path = getattr(arena, "path", None)
+    return (str(path) + DEV_SUFFIX + ".") if path else None
+
+
+def _tree_arena(tree: Any) -> Any:
+    try:
+        return getattr(tree._pdflip_direct_pool(), "arena", None)
+    except Exception:  # noqa: BLE001 - a tree without a direct pool has no arena to publish next to
+        return None
+
+
+def _dev_publish(tree: Any) -> bool:
+    """A worker: write this process's key sets (atomic replace): ``ev`` = device-evicted nodes (a TP0 spill of a
+    device-resident node has no state to follow into there), ``nd`` = nodes this worker cannot DELETE (device-resident
+    or with children: a TP0 host-only-leaf drop would leave them). False = nothing to write to."""
+    prefix = _dev_dir_prefix(_tree_arena(tree))
+    if prefix is None:
+        return False
+    import json
+
+    path = prefix + str(os.getpid())
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump({"ev": sorted([k[0], k[1]] for k in _S.dev_evicted),
+                       "nd": sorted([k[0], k[1]] for k in _S.dev_nodelete)}, f)
+        os.replace(tmp, path)
+    except OSError as exc:
+        if _note("dev_publish_error", 16):
+            logger.warning("R12 SPILL-APPLICABILITY publish failed: %r (TP0 may spill a node this worker cannot "
+                           "follow on; it will name SPILL-DIVERGED)", exc)
+        return False
+    return True
+
+
+def worker_device_evicted(tree: Any, node: Any) -> None:
+    """A worker's device peel took ``node``'s KV off the device (``_evict_to_host``): TP0 must not spill it."""
+    if role() != "worker":
+        return
+    k = node_key(node)
+    if k is None:
+        return
+    register_tree(tree)
+    if k not in _S.dev_evicted:
+        _S.dev_evicted.add(k)
+        _dev_publish(tree)
+
+
+def _dev_refresh(tree: Any) -> None:
+    """A worker, every consume: the key set re-derived from the tree (a node back on the device, or gone, leaves
+    the set; an eviction the hook missed enters it)."""
+    if role() != "worker":
+        return
+    base = int(_base_ct())
+    cur: set = set()
+    nd: set = set()
+    stack = list(tree.root_node.children.values())
+    while stack:
+        n = stack.pop()
+        stack.extend(n.children.values())
+        k = node_key(n)
+        if k is None:
+            continue
+        if n.component_data[base].value is None:
+            cur.add(k)
+        if n.children or n.component_data[base].value is not None:
+            nd.add(k)
+    if cur != _S.dev_evicted or nd != _S.dev_nodelete:
+        _S.dev_evicted, _S.dev_nodelete = cur, nd
+        _dev_publish(tree)
+
+
+def _read_worker_sets(tree: Any) -> Tuple[set, set]:
+    prefix = _dev_dir_prefix(_tree_arena(tree))
+    ev: set = set()
+    nd: set = set()
+    if prefix is None:
+        return ev, nd
+    import glob
+    import json
+
+    for path in glob.glob(prefix + "*"):
+        tail = path[len(prefix):]
+        if not tail.isdigit():
+            continue   # a .tmp of a publish in flight
+        try:
+            os.kill(int(tail), 0)
+        except ProcessLookupError:
+            continue
+        except OSError:
+            pass
+        try:
+            with open(path) as f:
+                doc = json.load(f)
+            for h, d in doc["ev"]:
+                ev.add((str(h), int(d)))
+            for h, d in doc["nd"]:
+                nd.add((str(h), int(d)))
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            if _note("dev_read_error", 16):
+                logger.warning("R12 SPILL-APPLICABILITY read of %s failed: %r (TP0 decides without that "
+                               "worker's state; a node it cannot follow on is named SPILL-DIVERGED)", path, exc)
+    return ev, nd
+
+
+def kept_note(path: str, n: int = 1) -> None:
+    """A TP0 drop the workers could not follow was NOT taken (S22): counted per path, named at the usual cadence."""
+    _S.counts["kept_total_" + path] = _S.counts.get("kept_total_" + path, 0) + int(n)
+    k = _note("kept_" + path, 64)
+    if k:
+        logger.info("R12 SPILL-APPLICABILITY kept path=%s (n=%d, total=%d): TP0 left the drop alone -- a worker "
+                    "cannot follow it", path, k, _S.counts["kept_total_" + path])
+
+
+def worker_evicted_keys(tree: Any) -> set:
+    """TP0: the union of every live worker's device-evicted keys -- TP0 must not spill (drop the host copy of) a
+    device-resident node of that key. A dead process's file is ignored, an unreadable one is named."""
+    return _read_worker_sets(tree)[0]
+
+
+def worker_nodelete_keys(tree: Any) -> set:
+    """TP0: the union of every live worker's keys it cannot delete (device-resident or with children) -- TP0 must
+    not drop a host-only LEAF of that key (K23 host-leaf spill), the worker would keep the node."""
+    return _read_worker_sets(tree)[1]
+
+
 def await_complete(tree: Any, node: Any, fallback_transit: bool, l3_ok: bool = False) -> bool:
     """#239 S4b part 4, TP0 under the cut: its ack came while the page was not
     complete in the arena (an owner's write still in flight). Wait for the
@@ -634,6 +788,18 @@ def attach(recv_reqs: List) -> List:
         except Exception as exc:  # noqa: BLE001 -- a failed spill keeps every reference
             if _note("spill_serve_error", 16):
                 logger.warning("R12 W3-SPILL serve failed: %r (every rank keeps its references)", exc)
+    # READ-ROOM-D (review readroomd B2): a P read's room request is served HERE, right before the broadcast, never
+    # inside the round; the decided host drops are applied on TP0 now and their verdicts (STATE + L3) ride this
+    # broadcast -- every rank's tree changes before the same admission
+    try:
+        from flliper.srt.pdflip import read_room as _read_room
+
+        if _S.tree is not None:
+            _read_room.serve_at_broadcast(_S.tree)
+        _read_room.flush_forma_pending()
+    except Exception as exc:  # noqa: BLE001 -- a room request never breaks the broadcast
+        if _note("read_room_serve_error", 16):
+            logger.warning("R12 READ-ROOM serve failed: %r (every rank keeps its references)", exc)
     if not _S.ledger:
         return recv_reqs
     _S.seq += 1
@@ -643,7 +809,7 @@ def attach(recv_reqs: List) -> List:
     if n:
         kinds = [e[0] for e in v.events]
         logger.info("R12 HOST-VERDICT SENT seq=%d events=%d transit=%d state=%d rebind=%d spill=%d l3=%d k21=%d (n=%d)",
-                    v.seq, len(v.events), kinds.count(TRANSIT), kinds.count(STATE),
+                    v.seq, len(v.events), kinds.count(TRANSIT), kinds.count(STATE) + kinds.count(RRSTATE),
                     kinds.count(REBIND), kinds.count(SPILL), kinds.count(L3), kinds.count(K21), n)
     return [v] + list(recv_reqs)
 
@@ -652,6 +818,13 @@ def consume(recv_reqs: Optional[List], tree: Any = None) -> Optional[List]:
     """Every rank, right after the broadcast: take the verdicts out of the
     list and apply them before any request of this pass is processed."""
     _S.handover_n += 1
+    t = tree or _S.tree
+    if t is not None:
+        try:
+            _dev_refresh(t)
+        except Exception as exc:  # noqa: BLE001 - the applicability publish never breaks the broadcast
+            if _note("dev_refresh_error", 16):
+                logger.warning("R12 SPILL-APPLICABILITY refresh failed: %r", exc)
     return _consume(recv_reqs, tree)
 
 
@@ -715,6 +888,10 @@ def on_tree_reset(tree: Any) -> None:
     _S.k21_inbox = []
     _S.k21_confirmed = {}
     _S.k21_expect = set()
+    _S.rr_open = {}
+    if _S.dev_evicted or _S.dev_nodelete:
+        _S.dev_evicted, _S.dev_nodelete = set(), set()
+        _dev_publish(tree)   # the nodes are gone: no key may block a re-inserted prefix
     _S.k21_stop_msg = None
     _S.rebind_wait = {}
 
@@ -766,7 +943,7 @@ def apply(tree: Any, events: List, seq: int = 0) -> Dict[str, int]:
         return c
     idx = _index(tree)
     if inbox and r == "worker":
-        st_keys = {(e[1], int(e[2])) for e in list(_S.pending.values()) + list(events) if e[0] == STATE}
+        st_keys = {(e[1], int(e[2])) for e in list(_S.pending.values()) + list(events) if e[0] in (STATE, RRSTATE)}
         for e in inbox:
             k21k = (e[1], int(e[2]))
             if _find(idx, k21k[0], k21k[1]) is None:
@@ -781,7 +958,7 @@ def apply(tree: Any, events: List, seq: int = 0) -> Dict[str, int]:
         return c
     work = list(_S.pending.values())
     _S.pending = {}
-    state_keys = {(e[1], int(e[2])) for e in work if e[0] == STATE}
+    state_keys = {(e[1], int(e[2])) for e in work if e[0] in (STATE, RRSTATE)}
     for e in work:
         kind, h, depth, exists, kv, m = e
         node = _find(idx, h, depth)
@@ -866,6 +1043,8 @@ def apply(tree: Any, events: List, seq: int = 0) -> Dict[str, int]:
                     f"applied as {out!r} on a worker (expected 'kv'): rank trees diverge"
                     + _k21_ctx((h, int(depth)), 1, 1))
         c[out] += 1
+        if kind == RRSTATE:
+            _rrstate_window(node, h, depth, out, seq)
     n = _note("applied")
     if n and (events or any(c[k] for k in ("transit", "kv", "anchor", "deleted", "rebind", "spill"))):
         logger.info(
@@ -914,6 +1093,42 @@ def _state_diverged(node: Any, h: Any, depth: Any, out: str, seq: int) -> None:
         "K23 SPILL-DIVERGED role=worker key=%s:%s node=%s seq=%d outcome=%s (n=%d): TP0 dropped this node "
         "(STATE exists=0) and this worker could not delete it -- the ranks' trees now differ",
         str(h)[:16], depth, getattr(node, "id", "?"), int(seq), out, n)
+
+def _rrstate_window(node: Any, h: Any, depth: Any, out: str, seq: int) -> None:
+    """S20 review A1: a READ-ROOM STATE that ends ``pending`` re-enters ``_S.pending`` and is re-applied every pass.
+    The WINDOW is named once when it opens (first ``pending`` of the key) and once when it closes (first other
+    outcome, with duration and passes); the counter counts windows, not passes. ``deleted``/``short``/
+    ``unreconcilable`` are terminal single events."""
+    k = (str(h), int(depth))
+    if out == "pending":
+        w = _S.rr_open.get(k)
+        if w is None:
+            _S.rr_open[k] = [time.monotonic(), 1]
+            _rrstate_diverged(node, h, depth, out, seq)
+        else:
+            w[1] += 1
+        return
+    w = _S.rr_open.pop(k, None)
+    if w is not None:
+        logger.info(
+            "R12 READ-ROOM-STATE window closed node=%s depth=%s hash=%s out=%s after %.3fs and %d passes",
+            getattr(node, "id", "?"), depth, str(h)[:16], out, time.monotonic() - w[0], w[1])
+    if out in ("deleted", "short", "unreconcilable"):
+        _rrstate_diverged(node, h, depth, out, seq)
+
+
+def _rrstate_diverged(node: Any, h: Any, depth: Any, out: str, seq: int) -> None:
+    """READ-ROOM-D (review readroomd2 A4): a worker that cannot apply TP0's READ-ROOM STATE at once. ``pending``:
+    the node is busy here (under the token cut its own store write holds the rows) -- until the next broadcast
+    applies it, TP0 has no host copy and this worker has one, so a device eviction in that window takes TP0's
+    Form A L3-DROP and this worker's demotion; ``deleted``: this worker dropped a node TP0 keeps. Named at EVERY
+    occurrence (no stop, no timer): the metal count says how often the window opens."""
+    n = _S.counts.get("rrstate_diverged", 0) + 1
+    _S.counts["rrstate_diverged"] = n
+    logger.warning(
+        "R12 READ-ROOM-STATE-DIVERGED seq=%d node=%s depth=%s hash=%s out=%s (n=%d): TP0 released this node's KV "
+        "host rows for a P read and this worker could not follow at once -- the ranks differ on its host copy "
+        "until the verdict applies", int(seq), getattr(node, "id", "?"), depth, str(h)[:16], out, n)
 
 
 def _reconcile(tree: Any, node: Any, exists: int, kv: int, m: int) -> str:

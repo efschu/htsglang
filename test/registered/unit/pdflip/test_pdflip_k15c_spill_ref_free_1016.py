@@ -65,6 +65,8 @@ def _tree(anchors, refs, monkeypatch):
         return int(all(arena.refs.get(int(x), 0) <= 1 for x in victim.slots))
     t._pdflip_release_anchor = _release
     t._pdflip_last_resort_victim = types.MethodType(U.UnifiedRadixCache._pdflip_last_resort_victim, t)
+    # S22 (R12 anchor victim choice): the real filter is bound like the victim helper; with no worker nd set it keeps all
+    t._r12_anchor_deletable = types.MethodType(U.UnifiedRadixCache._r12_anchor_deletable, t)
     return t, mp, secured, released
 
 

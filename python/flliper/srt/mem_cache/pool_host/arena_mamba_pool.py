@@ -480,6 +480,7 @@ class ArenaMambaPoolHost(MambaPoolHost):
         out = []
         for i, (slot, state) in enumerate(found):
             bypass_row = None
+            _reffed = False
             if slot < 0 or state != 2:
                 # #1433: the L3 return path -- a blob on disk is read straight
                 # into a fresh slot and completed.
@@ -489,15 +490,22 @@ class ArenaMambaPoolHost(MambaPoolHost):
                     # not wait for arena room -- a FULL arena reads past it
                     bypass_row = self._bypass_row()
                     try:
-                        f = fill(self.arena, [stems[i]], int(self._page_bytes),
-                                 room_wait=bypass_row is None)[0]
-                    except TypeError:  # a backend without the switch
-                        f = fill(self.arena, [stems[i]], int(self._page_bytes))[0]
+                        # S24 REF-BEFORE-COMPLETE: take_ref -- the anchor blob is referenced from before its complete
+                        _fl = fill(self.arena, [stems[i]], int(self._page_bytes),
+                                   room_wait=bypass_row is None, take_ref=True)
+                        _reffed = bool(getattr(_fl, "_arena", None) is not None)
+                        f = _fl[0]
+                    except TypeError:  # a backend without the switches
+                        try:
+                            f = fill(self.arena, [stems[i]], int(self._page_bytes),
+                                     room_wait=bypass_row is None)[0]
+                        except TypeError:
+                            f = fill(self.arena, [stems[i]], int(self._page_bytes))[0]
                 else:
                     f = None
                 if f is not None:
                     slot, state = f, 2
-            if slot >= 0 and state == 2 and self.arena.ref_slots([slot], +1) == 1:
+            if slot >= 0 and state == 2 and (_reffed or self.arena.ref_slots([slot], +1) == 1):
                 if bypass_row is not None:
                     super().free(bypass_row)
                 host_indices[i] = self.staging_rows + slot

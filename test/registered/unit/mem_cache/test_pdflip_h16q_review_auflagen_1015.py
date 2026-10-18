@@ -90,7 +90,7 @@ def test_a3_forma_request_secures_at_most_the_cap_and_names_ms(group, monkeypatc
     assert len(list(g.store.glob("*.bin"))) <= 3, "more than the cap reached the synchronous L3 write"
     assert len([e for e in v.events if e[0] == R.SPILL]) == 3
     (line,) = _forma_lines(caplog)
-    assert re.search(r"secure_pages=3 cap=3 over_cap_nodes=\d+ ms=\d+\.\d", line), line
+    assert re.search(r"secure_pages=3 cap=3 over_cap_nodes=\d+ kept_worker_evicted=\d+ kept_unkeyed=\d+ ms=\d+\.\d", line), line
 
 
 def test_a3_default_cap_is_128_and_the_small_spill_is_unchanged(group, monkeypatch, caplog):

@@ -2423,10 +2423,29 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
             keep = None
         stages = [0, 0, 0]
         l3_state = [0, 0, 0]  # #257 (d): on_disk, written, dropped_without_l3
+        # S24 CLAIM-ROOM (review 1018, probe P1): the stems of every read that fills right now (any io thread of this
+        # process) are off every stage of this clock too -- the scheduler thread's claim took the not yet walked L2
+        # chain of a running read (same class as SIBLING-EVICT). Hashed in C, once.
+        prot = None
+        try:
+            from flliper.srt.mem_cache.hicache_storage import fill_protected_stems
+            from flliper.srt.mem_cache.storage.file.hicache_arena import stem_keys_lo as _skl
+
+            _ps = fill_protected_stems()
+            if _ps:
+                import numpy as _np_u
+
+                prot = _np_u.unique(_skl(_ps))   # sorted: arena.c searches the keep list by bisection
+        except Exception:  # noqa: BLE001 - the protection is an improvement, never a wall
+            prot = None
+        _kl = None if prot is None or not len(prot) else prot
         try:
             if keep is not None and len(keep):
                 # (i) unreferenced, kept by nobody
-                cands = list(arena.evict_candidates(need, keep_lo=keep.keys))
+                import numpy as _np_s24
+
+                cands = list(arena.evict_candidates(
+                    need, keep_lo=keep.keys if _kl is None else _np_s24.union1d(keep.keys, _kl)))
                 stages[0] = len(cands)
                 if len(cands) < need:
                     # (ii) #248: kept, WITH an L3 copy -- freed without I/O,
@@ -2436,21 +2455,23 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                     copied = _handoff_pending.copied_mask(self, keep)
                     if copied.any():
                         mid = _handoff_pending.evict_ordered(arena, keep, need - len(cands),
-                                                             eligible=copied, site="claim_ii")
+                                                             eligible=copied, protect_lo=_kl, site="claim_ii")
                         stages[1] = len(mid)
                         cands += list(mid)
                 if len(cands) < need:
                     # (iii) kept, WITHOUT a copy: lost, by name -- in the same
                     # order; the keep-less clock only for what the order misses
-                    last = _handoff_pending.evict_ordered(arena, keep, need - len(cands), site="claim_iii")
+                    last = _handoff_pending.evict_ordered(arena, keep, need - len(cands), protect_lo=_kl,
+                                                          site="claim_iii")
                     if len(last) < need - len(cands):
-                        last = list(last) + list(arena.evict_candidates(need - len(cands) - len(last)))
+                        last = list(last) + list(arena.evict_candidates(need - len(cands) - len(last),
+                                                                        keep_lo=_kl))
                     if last:
                         stages[2] = len(last)
                         _handoff_pending.note_evicted(self, last, keep, need=need)
                         cands += list(last)
             else:
-                cands = arena.evict_candidates(need)
+                cands = arena.evict_candidates(need, keep_lo=_kl)
                 stages[0] = len(cands)
             if cands:
                 # #257 (d): no page leaves L2 without a copy in L3. A

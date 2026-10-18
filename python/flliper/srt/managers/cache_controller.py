@@ -3971,7 +3971,7 @@ class HiCacheController:
                 if _back:
                     pool.arena.ref_slots_np(_np.asarray(_back, dtype=_np.int64), -1)
                 _arena_note_recheck_cut("fill", _cut, stems[_cut], int(slots[_cut]), _fd, len(_back))
-                _rd.note_cut(operation, _rd_base + _cut, _rd.ARENA_CHAIN_RECHECK)  # READ-DEPTH
+                _rd.note_cut(operation, _rd_base + _cut, _rd.FILL_EVICTED_BEFORE_REF)  # READ-DEPTH (S24: the ref-recheck cut is the same event as a refused ref -- one name on every rank; the stem no longer names the slot = evicted/re-claimed before the reference)
                 del slots[_cut:]
         if _pre:
             # referenced ahead, past where the prefix ended: given back
@@ -5116,16 +5116,24 @@ class HiCacheController:
                      if s_ >= 0 and st_ == 2 and dpool.arena.ref_slots([s_], +1) == 1}
             _dneed = [i for i in range(len(found)) if i not in _dref]
             _dfill = {}
+            _dreffed = False
             _fill_fn = getattr(self.storage_backend, "arena_fill_from_disk", None)
             if _dneed and callable(_fill_fn):
-                _dfill = dict(zip(_dneed, _fill_fn(dpool.arena, [stems[i] for i in _dneed],
-                                                   int(dpool._page_bytes))))
+                # S24 REF-BEFORE-COMPLETE: take_ref -- the fill holds the reference from before the complete, so no
+                # clock (any thread, any rank process) takes a landed draft page before this walk references it
+                try:
+                    _dgot = _fill_fn(dpool.arena, [stems[i] for i in _dneed], int(dpool._page_bytes),
+                                     take_ref=True)
+                    _dreffed = bool(getattr(_dgot, "_arena", None) is not None)
+                except TypeError:   # a backend without the keyword
+                    _dgot = _fill_fn(dpool.arena, [stems[i] for i in _dneed], int(dpool._page_bytes))
+                _dfill = dict(zip(_dneed, _dgot))
             for i in range(len(found)):
                 if i in _dref:
                     slot, ok = _dref[i], True
                 else:  # #1433: L3 -> L2 for the draft page too
                     slot = _dfill.get(i)
-                    ok = slot is not None and dpool.arena.ref_slots([slot], +1) == 1
+                    ok = slot is not None and (_dreffed or dpool.arena.ref_slots([slot], +1) == 1)
                     slot = slot if slot is not None else -1
                 slots.append(slot if ok else -1)
                 flags.append(bool(ok))

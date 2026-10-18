@@ -712,6 +712,8 @@ def _hp1_group_retry_due(sched, req) -> bool:
 #: producer, and a boot census that could not tell them apart would send the
 #: next reader to the wrong half of the chain.
 _DEFER_REASON_STORE_SHORT = "store_prefix_short"
+
+
 #: The verdict `Scheduler._prefetch_kvcache` returns for a read that REGISTERED
 #: and was cut by the post-consensus group trim. Not a decline: the read exists.
 _VERDICT_TRUNCATED_GROUP = "issued:truncated_group"
@@ -719,6 +721,10 @@ _VERDICT_TRUNCATED_GROUP = "issued:truncated_group"
 #: prefix it asked for (``PrefetchOutcome.is_incomplete``). ``terminated:`` and
 #: not ``issued:`` because this read is over -- what is owed is a re-issue.
 _VERDICT_STORE_SHORT = "terminated:store_short"
+#: S23: the READ-DEPTH causes that are the arena's room pressure (arena_full = no slot after the room wait; the two
+#: ``*_evicted_before_ref`` = the eviction clock took a page the read had found / landed) -- a short read with one of
+#: these (or none recorded) is a CAPACITY-CUT; every other cause is a HELD-CUT.
+_CAPACITY_CUT_CAUSES = (None, "arena_full", "l2_evicted_before_ref", "fill_evicted_before_ref")
 
 # #1068 A12.2: why the prefetch deferral is REFUSED on a rank/phase, by name.
 # MODULE-LEVEL on purpose: `_prefetch_deferral_refusal_reason` is bound to
@@ -15696,6 +15702,49 @@ class Scheduler(
         self._pdflip_store_short_delivered = getattr(self, "_pdflip_store_short_delivered", 0) + delivered
         self._pdflip_store_short_deliverable = getattr(self, "_pdflip_store_short_deliverable", 0) + deliverable
         n = self._pdflip_store_short_seen
+        # S18 (h16v3 1017_224250, pdflip-1-14/-15/-16): the store HELD the whole span (the probe's hit covers the
+        # deliverable prefix; TAIL-CONSUME hit=118400) and D's read was cut by its own full arena (PDFLIP-READ-DEPTH
+        # cause=arena_full, READ-ROOM SHORT class=not_posted). That is a capacity cut, not P's write-through
+        # lagging, yet the line said "the store did not hold the rest yet", so the acceptance "STORE READ
+        # INCOMPLETE == 0" could not tell the two apart. Only the NAME and the counter split: the deferral
+        # below is identical for both, and the STORE-HELD-DECIDE-1014 predicate it already feeds is untouched.
+        # S23 (h16v4b 1018_013102, D TP0 01:36:24, pdflip-0-2 delivered=0): the label said "D's own arena room", yet the
+        # READ-DEPTH cause of that very cut was late_complete (a JOINED claim reaped under the read; arena_full on D
+        # = 0 in the whole boot, D POSTed one room request, at 01:49:56). "The probe covers the span" proves the STORE
+        # holds it, not that the ARENA cut it: CAPACITY-CUT needs the recorded cause arena_full (or none recorded).
+        _cut_cause = getattr(outcome, "cut_cause", None)   # CAPACITY causes: _CAPACITY_CUT_CAUSES
+        if (int(getattr(outcome, "hit_tokens", 0) or 0) >= int(getattr(outcome, "deliverable", 0) or 0) > 0
+                and getattr(outcome, "probed", False) and _cut_cause not in _CAPACITY_CUT_CAUSES):
+            self._pdflip_store_short_held_other = getattr(self, "_pdflip_store_short_held_other", 0) + 1
+            nh = self._pdflip_store_short_held_other
+            if nh <= 8 or nh % 64 == 0:
+                logger.warning(
+                    "#1324 STORE READ HELD-CUT rid=%s delivered=%d deliverable=%d shortfall=%d hit_tokens=%d "
+                    "cut_cause=%s site=drain occurrence=%d held_cut_occurrence=%d -- the store HOLDS the whole span "
+                    "(probe hit covers it) and the read was cut by %s, a cause that is not "
+                    "arena room pressure (room pressure records arena_full / l2_evicted_before_ref / "
+                    "fill_evicted_before_ref). Deferring through the A12.2 shortfall arm. Denominator: every "
+                    "terminated store read of this rank whose record reports a page-floored shortfall AND whose "
+                    "probe hit covers the deliverable prefix AND whose recorded cut cause is not a room-pressure cause",
+                    rid, delivered, deliverable, deliverable - delivered, int(outcome.hit_tokens), _cut_cause, n,
+                    nh, _cut_cause,
+                )
+            return self._apply_prefetch_deferral(req, _VERDICT_STORE_SHORT, site="drain")
+        if (int(getattr(outcome, "hit_tokens", 0) or 0) >= int(getattr(outcome, "deliverable", 0) or 0) > 0
+                and getattr(outcome, "probed", False)):
+            self._pdflip_store_short_capacity = getattr(self, "_pdflip_store_short_capacity", 0) + 1
+            nc = self._pdflip_store_short_capacity
+            if nc <= 8 or nc % 64 == 0:
+                logger.warning(
+                    "#1324 STORE READ CAPACITY-CUT rid=%s delivered=%d deliverable=%d shortfall=%d hit_tokens=%d "
+                    "site=drain occurrence=%d capacity_occurrence=%d -- the store HOLDS the whole span (probe hit "
+                    "covers it) and the read ended short on D's own arena room; this is not P's write-through "
+                    "lagging. Deferring through the A12.2 shortfall arm; the room is the defect (READ-ROOM serves "
+                    "group P and, via TP0 at its broadcast, group D). Denominator: every terminated store read of this rank whose record reports a "
+                    "page-floored shortfall AND whose probe hit covers the deliverable prefix",
+                    rid, delivered, deliverable, deliverable - delivered, int(outcome.hit_tokens), n, nc,
+                )
+            return self._apply_prefetch_deferral(req, _VERDICT_STORE_SHORT, site="drain")
         if n <= 8 or n % 64 == 0:
             logger.warning(
                 "#1324 STORE READ INCOMPLETE rid=%s delivered=%d deliverable=%d "

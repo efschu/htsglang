@@ -63,6 +63,7 @@ class _RefOnLand(list):
         super().__init__([None] * n)
         self._arena = arena
         self.refused = 0
+        self.refused_at: list = []
 
     def __setitem__(self, i, v):
         old = list.__getitem__(self, i)
@@ -75,7 +76,19 @@ class _RefOnLand(list):
                 ok = False
             if not ok:
                 self.refused += 1
+                self.refused_at.append(int(i))
                 v = None
+        if old is not None:
+            try:
+                self._arena.ref_slots([int(old)], -1)
+            except Exception:  # noqa: BLE001
+                pass
+        list.__setitem__(self, i, v)
+
+    def adopt(self, i, v) -> None:
+        """S24 (review 1018): install a slot whose reference the fill already took while it was CLAIMED (reference
+        before complete) -- no second reference."""
+        old = list.__getitem__(self, i)
         if old is not None:
             try:
                 self._arena.ref_slots([int(old)], -1)
@@ -217,18 +230,73 @@ class fill_protect_scope:
         except Exception:  # noqa: BLE001 - no protection, the old eviction
             stems = None
         _FILL_CTX.protect = stems
+        if stems:
+            with _FILL_ACTIVE_LOCK:
+                _FILL_ACTIVE[id(self)] = stems
         return self
 
     def __exit__(self, *exc):
         _FILL_CTX.protect = self.prev
+        with _FILL_ACTIVE_LOCK:
+            _FILL_ACTIVE.pop(id(self), None)
         return False
 
 
+#: S24 SIBLING-EVICT (h16v5 1af79968a7, D 03:31:55, pdflip-2-54 / pdflip-0-25): the WAKE-PARALLEL prefetch io threads fill
+#: concurrently. ``_FILL_CTX`` is thread-local, so the room eviction of one read (pdflip-0-25, need=259) kept only ITS
+#: stems off the list and took the tail of the sibling read's kept chain (``ORDERED-EVICT victims=[pdflip-2-54:...
+#: pages=162,lowest_page=1538]``) in the window between that sibling's fill COMPLETE and its reference -- the sibling
+#: landed 1538 of 1700 on all three ranks (fill_none / arena_chain_recheck, one event). The stems of EVERY fill that
+#: runs in this process are off every fill's eviction list while it runs. id(scope) -> stems.
+_FILL_ACTIVE: dict = {}
+_FILL_ACTIVE_LOCK = threading.Lock()
+
+
 def fill_protected_stems() -> list:
-    return list(getattr(_FILL_CTX, "protect", None) or ())
+    own = list(getattr(_FILL_CTX, "protect", None) or ())
+    with _FILL_ACTIVE_LOCK:
+        others = [st for stems in _FILL_ACTIVE.values() for st in stems]
+    if not others:
+        return own
+    return list(dict.fromkeys(own + others))
 
 
 _SELF_JOIN_N = [0, 0]
+
+
+#: S23 (h16v4b 1018_013102, D 01:36:22-23): the slots a LIVE fill of THIS process holds, slot -> (generation, thread
+#: ident). With WAKE-PARALLEL prefetch io workers (4 threads per rank, the hold reads of a wake share the P chain's prefix
+#: stems) a claim held by our own pid is usually ANOTHER live io thread's claim, not the leftover of a dead call.
+_FILL_LIVE: dict = {}
+_FILL_LIVE_LOCK = threading.RLock()
+_FILL_TL = threading.local()
+
+
+def _arena_key(arena):
+    """The register's arena part: the KV, Mamba and Draft arenas have overlapping slot numbers and small generations."""
+    return str(getattr(arena, "path", None) or id(arena))
+
+
+def _fill_live_note(arena, slots_gens) -> None:
+    if not getattr(_FILL_TL, "active", False):
+        return
+    ident = threading.get_ident()
+    ak = _arena_key(arena)
+    with _FILL_LIVE_LOCK:
+        for slot, gen in slots_gens:
+            _FILL_LIVE[(ak, int(slot))] = (int(gen), ident)
+
+
+def _fill_live_drop_thread() -> None:
+    ident = threading.get_ident()
+    with _FILL_LIVE_LOCK:
+        for k in [k for k, (_g, t) in _FILL_LIVE.items() if t == ident]:
+            _FILL_LIVE.pop(k, None)
+
+
+def _held_by_other_live_thread(arena, slot: int, gen: int) -> bool:
+    ent = _FILL_LIVE.get((_arena_key(arena), int(slot)))
+    return ent is not None and ent[0] == int(gen) and ent[1] != threading.get_ident()
 
 
 def _take_over_self_joins(arena, stems, joined, total_bytes: int):
@@ -255,11 +323,15 @@ def _take_over_self_joins(arena, stems, joined, total_bytes: int):
     import os as _os
 
     me = _os.getpid()
-    try:
-        pids = {int(t[0]): int(t[3]) for t in info([int(s) for _, s, _ in joined if int(s) >= 0])}
-    except Exception:  # noqa: BLE001
-        return [], joined
-    own = [j for j in joined if int(j[1]) >= 0 and pids.get(int(j[1])) == me]
+    # S23: info + filter run under the register's lock; ``_fill_claim`` claims and registers under the same lock, so a
+    # sibling thread's claim is never seen between its C claim and its registration
+    with _FILL_LIVE_LOCK:
+        try:
+            pids = {int(t[0]): int(t[3]) for t in info([int(s) for _, s, _ in joined if int(s) >= 0])}
+        except Exception:  # noqa: BLE001
+            return [], joined
+        own = [j for j in joined if int(j[1]) >= 0 and pids.get(int(j[1])) == me
+               and not _held_by_other_live_thread(arena, int(j[1]), int(j[2]))]
     if not own:
         return [], joined
     st = q([int(s) for _, s, _ in own], [int(g) for _, _, g in own], 0)
@@ -350,6 +422,17 @@ def _join_signature(arena, slots) -> dict:
         return {}
 
 
+def _join_ages(arena, slots) -> dict:
+    """S23: slot -> ms since the claim's progress clock last moved (``claim_info``); empty when it cannot say."""
+    info = getattr(arena, "claim_info", None)
+    if not callable(info) or not slots:
+        return {}
+    try:
+        return {int(t[0]): int(t[2]) for t in info([int(s) for s in slots])}
+    except Exception:  # noqa: BLE001 - an instrument, never a gate
+        return {}
+
+
 def join_idle_ms() -> int:
     """JOIN-IDLE-1014: how long a JOIN wait sits without any move of its
     holders before the caller breaks the claims and reads itself (env
@@ -401,6 +484,7 @@ def _await_fill_joins(arena, stems, joined, wait_ms: int, vanished=None) -> dict
     deadline = t0 + (cap_s if live else wait_ms / 1000.0)
     last_move = t0
     seen: dict = {}
+    prev_age: dict = {}
     polls = moves = 0
     while pend:
         keys = list(pend)
@@ -425,6 +509,12 @@ def _await_fill_joins(arena, stems, joined, wait_ms: int, vanished=None) -> dict
                 sig = {i: (s, gens.get(s)) for i, s in now_slots.items()}
                 moved = bool(seen) and any(seen.get(i) not in (None, v) for i, v in sig.items())
                 seen = sig
+                # S23: a reader that touches its claims while it reads (``arena.touch_progress``) moves the claim's
+                # progress age DOWN; ages only grow otherwise. That is progress, the idle clock restarts.
+                ages = _join_ages(arena, [s for s in now_slots.values() if s >= 0])
+                if ages:
+                    moved = moved or any(a < prev_age.get(sl, 1 << 62) - 2 for sl, a in ages.items())
+                    prev_age = ages
             if moved:
                 last_move = now
                 moves += 1
@@ -675,6 +765,11 @@ def _read_depth_fill_reasons(stems, on_disk, out, joined, still_full, being_writ
         from flliper.srt.pdflip import read_depth as _rd
 
         _rd.fill_reasons_reset()
+        # S24: a slot the fill landed but whose reference was refused (evicted between COMPLETE and REF) -- named,
+        # not the nameless fill_none (first reason of an index wins)
+        for i in getattr(out, "refused_at", ()) or ():
+            if out[int(i)] is None:
+                _rd.fill_reason(int(i), _rd.FILL_EVICTED_BEFORE_REF)
         for i, why in (stats.get("why") or {}).items():
             if out[int(i)] is None:
                 _rd.fill_reason(int(i), why)
@@ -702,10 +797,16 @@ def _fill_claim(arena, stems, total_bytes: int):
     hermetic fake arena without the keyword claims as before."""
     from flliper.srt.mem_cache.storage.file.hicache_arena import ROLE_L3FILL
 
-    try:
-        return arena.claim_slots(stems, [int(total_bytes)] * len(stems), role=ROLE_L3FILL)
-    except TypeError:
-        return arena.claim_slots(stems, [int(total_bytes)] * len(stems))
+    with _FILL_LIVE_LOCK:      # S23: claim and registration are one step for the SELF-JOIN check
+        try:
+            res = arena.claim_slots(stems, [int(total_bytes)] * len(stems), role=ROLE_L3FILL)
+        except TypeError:
+            res = arena.claim_slots(stems, [int(total_bytes)] * len(stems))
+        try:
+            _fill_live_note(arena, [(r[0], r[2]) for r in res if int(r[1]) == 0])
+        except Exception:  # noqa: BLE001 - the guard's register never breaks a claim
+            pass
+    return res
 
 
 #: HICACHE-DRAFT-TIER (user order 2026-09-24, see environ.py): the one
@@ -996,8 +1097,12 @@ class PrefetchOutcome(int):
         matched=None,
         deliverable=None,
         synced=None,
+        cut_cause=None,
     ):
         self = super().__new__(cls, int(loaded))
+        # S23 (18.10.): the READ-DEPTH cause of THIS rank's cut (pdflip/read_depth.py), None = none recorded. Rank-local
+        # and an instrument: it only NAMES the shortfall (scheduler._pdflip_note_store_shortfall), it decides nothing.
+        self.cut_cause = None if cut_cause is None else str(cut_cause)
         self.hit_tokens = int(hit_tokens if hit_tokens is not None else 0)
         self.probed = bool(probed)
         self.matched = int(matched if matched is not None else 0)
@@ -1080,14 +1185,14 @@ class PrefetchOutcome(int):
         return (
             PrefetchOutcome,
             (int(self), self.hit_tokens, self.probed, self.matched, self.deliverable,
-             self.synced),
+             self.synced, self.cut_cause),
         )
 
     def __repr__(self) -> str:
         return (
             f"PrefetchOutcome(loaded={int(self)}, hit_tokens={self.hit_tokens}, "
             f"probed={self.probed}, matched={self.matched}, "
-            f"deliverable={self.deliverable}, synced={self.synced})"
+            f"deliverable={self.deliverable}, synced={self.synced}, cut_cause={self.cut_cause})"
         )
 
 
@@ -3911,6 +4016,19 @@ class HiCacheFile(HiCacheStorage):
 
     def arena_fill_from_disk(self, arena, stems, total_bytes: int, prefix: bool = False,
                              room_wait: bool = True, take_ref: bool = False):
+        """The L3 -> L2 fill (see ``_arena_fill_from_disk_impl``); S23: this thread's live claims are registered for the
+        run of the fill, so a sibling io thread's SELF-JOIN never takes them over."""
+        _prev = getattr(_FILL_TL, "active", False)
+        _FILL_TL.active = True
+        try:
+            return self._arena_fill_from_disk_impl(arena, stems, total_bytes, prefix=prefix, room_wait=room_wait,
+                                                   take_ref=take_ref)
+        finally:
+            _FILL_TL.active = _prev
+            _fill_live_drop_thread()
+
+    def _arena_fill_from_disk_impl(self, arena, stems, total_bytes: int, prefix: bool = False,
+                                   room_wait: bool = True, take_ref: bool = False):
         """#1433: the L3 -> L2 return path. For every stem that is NOT in the
         arena but IS on disk: claim a slot, read the whole canonical page from
         the disk store straight into the slot, complete it. Returns one entry
@@ -4363,6 +4481,36 @@ class HiCacheFile(HiCacheStorage):
             pend = nxt
         return pend, got, read_now, rounds
 
+    def _l3_read_with_progress(self, arena, pio, todo, paths, total_bytes: int, ptrs):
+        """S23: ``l3_read_pages_parallel`` with the READER reporting progress: the claims of the batch get their
+        progress clock touched (``arena.touch_progress``, generation-checked) before the read and by the reading
+        worker threads after every sub-call of ``L3_TOUCH_PAGES`` pages (see there). The claim's progress clock used to
+        move only at the complete at the END of the batch -- 754 pages took 1472 ms on D TP1 (01:36:24), longer than
+        the 1 s JOIN-IDLE bound, so a sibling thread or another rank joined on the claim saw 'no byte' and quarantined a
+        LIVE reader (its completion refused, status 6). A reader that has just read a sub-call is the witness that it is
+        alive; a reader that stops reading stops touching and is reaped as before. Full parallelism, no chunk barriers.
+        Returns ``(rc per page, threads used)`` exactly like ``l3_read_pages_parallel``."""
+        touch = getattr(arena, "touch_progress", None)
+        slots = [t[1] for t in todo]
+        gens = [t[2] for t in todo]
+
+        def _touch():
+            if callable(touch):
+                try:
+                    touch(slots, gens)
+                except Exception:  # noqa: BLE001 - a witness never breaks a read
+                    pass
+
+        if not callable(touch):
+            return l3_read_pages_parallel(pio, paths, total_bytes, ptrs)
+        _touch()
+        _L3_PROGRESS.cb = _touch
+        try:
+            return l3_read_pages_parallel(pio, paths, total_bytes, ptrs)
+        finally:
+            _L3_PROGRESS.cb = None
+            _touch()
+
     def _arena_fill_read_todo(self, arena, todo, total_bytes: int, out, stats) -> None:
         """#1433: read this fill's OWN claims from disk into their slots and
         complete them; ``out[index]`` gets the slot of every completed one."""
@@ -4372,15 +4520,38 @@ class HiCacheFile(HiCacheStorage):
         pio = _load_pageio()
         paths = [self._existing_path(st) for _, _, _, st in todo]
         ptrs = [arena.slot_ptr(slot) for _, slot, _, _ in todo]
-        rc, threads = l3_read_pages_parallel(pio, paths, int(total_bytes), ptrs)
+        rc, threads = self._l3_read_with_progress(arena, pio, todo, paths, int(total_bytes), ptrs)
         ok = [k for k, r in enumerate(rc) if r == 0]
         bad = [(todo[k][1], todo[k][2]) for k, r in enumerate(rc) if r != 0]
         late = []
         filled = 0
         if ok:
+            # S24 REF-BEFORE-COMPLETE (review 1018, probe P2): the reference is taken while the claim is still CLAIMED
+            # (arena_ref_slots takes CLAIMED, arena.c:860), only then the slot is completed. It is never COMPLETE and
+            # unreferenced, so no clock of any thread or rank process (TP0/TP1/TP2 share the arena) can take it between
+            # the complete and the reference -- independent of every protection list, rank-agreed by construction (the
+            # refcount sits in the shared header). The reference is taken AFTER the read, not at the claim: a
+            # reference on a CLAIMED slot blocks the JOIN-IDLE reap (microseconds here, not the read).
+            _pre = {}
+            if isinstance(out, _RefOnLand):
+                for k in ok:
+                    try:
+                        if int(arena.ref_slots([int(todo[k][1])], +1)) == 1:
+                            _pre[k] = int(todo[k][1])
+                    except Exception:  # noqa: BLE001 - the ref-on-land below
+                        pass
             cs = arena.complete_slots([todo[k][1] for k in ok], [todo[k][2] for k in ok],
                                       [(0, int(total_bytes))])
             for k, c in zip(ok, cs):
+                if c in (1, 2) and k in _pre:
+                    out.adopt(todo[k][0], todo[k][1])
+                    filled += 1
+                    continue
+                if k in _pre:
+                    try:
+                        arena.ref_slots([_pre[k]], -1)   # not ours to keep (reaped / recycled / refused)
+                    except Exception:  # noqa: BLE001
+                        pass
                 if c in (1, 2):
                     out[todo[k][0]] = todo[k][1]
                     filled += 1
@@ -6189,7 +6360,7 @@ L3_SPLIT_MIN_BYTES = 8 << 20
 L3_SPLIT_CHUNK_BYTES = 4 << 20
 
 
-def _l3_read_split(pio, paths, total_bytes: int, ptrs, k: int):
+def _l3_read_split(pio, paths, total_bytes: int, ptrs, k: int, progress=None):
     """Every page of ``paths`` in ``L3_SPLIT_CHUNK_BYTES`` pieces across ``k``
     pool threads, each piece a pread at its offset into the page's own target
     (``ptrs[i] + off``); a page's status is its first failing piece's (the
@@ -6201,9 +6372,17 @@ def _l3_read_split(pio, paths, total_bytes: int, ptrs, k: int):
     groups = [pieces[g::k] for g in range(k)]
 
     def one(group):
-        return pio.read_pages([paths[i] for i, _o, _l in group], [total] * len(group),
-                              [((o, l),) for _i, o, l in group],
-                              [int(ptrs[i]) + o for i, o, _l in group], True)
+        # S23: sub-calls of ``L3_TOUCH_PAGES`` pieces, the reader's progress after each (worker thread)
+        out = []
+        step = max(1, int(L3_TOUCH_PAGES))
+        for a in range(0, len(group), step):
+            g = group[a:a + step]
+            out += list(pio.read_pages([paths[i] for i, _o, _l in g], [total] * len(g),
+                                       [((o, l),) for _i, o, l in g],
+                                       [int(ptrs[i]) + o for i, o, _l in g], True))
+            if progress is not None:
+                progress()
+        return out
 
     rc = [0] * len(paths)
     for group, res in zip(groups, _l3_executor(k).map(one, groups)):
@@ -6211,6 +6390,14 @@ def _l3_read_split(pio, paths, total_bytes: int, ptrs, k: int):
             if r != 0 and rc[i] == 0:
                 rc[i] = r
     return rc, k
+
+
+#: S23: pages per pageio sub-call of an L3 read. The READING worker thread reports progress after each sub-call
+#: (``arena.touch_progress`` of the batch's claims), so the touch grain is one sub-call -- far below the 1 s JOIN-IDLE
+#: bound even on a cold disk (metal: 65 pages 1189 ms = 18 ms/page, 16 pages = ~0.3 s) -- while the batch keeps the
+#: full parallelism of ``l3_read_pages_parallel`` (no chunk barriers, no serial tail chunk below L3_PARALLEL_MIN_PAGES).
+L3_TOUCH_PAGES = 16
+_L3_PROGRESS = threading.local()    # the caller's progress callback, read by ``l3_read_pages_parallel`` in the caller thread
 
 
 def l3_read_pages_parallel(pio, paths, total_bytes: int, ptrs, threads: Optional[int] = None):
@@ -6221,16 +6408,33 @@ def l3_read_pages_parallel(pio, paths, total_bytes: int, ptrs, threads: Optional
     n = len(paths)
     k = l3_read_threads() if threads is None else max(1, int(threads))
     ext = ((0, int(total_bytes)),)
+    progress = getattr(_L3_PROGRESS, "cb", None)     # S23: set by ``_l3_read_with_progress`` for this call only
+    step = max(1, int(L3_TOUCH_PAGES))
     if k > 1 and n and int(total_bytes) >= L3_SPLIT_MIN_BYTES:
-        return _l3_read_split(pio, paths, total_bytes, ptrs, k)
+        return _l3_read_split(pio, paths, total_bytes, ptrs, k, progress)
     if k <= 1 or n < L3_PARALLEL_MIN_PAGES:
-        return pio.read_pages(paths, [int(total_bytes)] * n, [ext] * n, ptrs, True), 1
+        if progress is None or n <= step:
+            return pio.read_pages(paths, [int(total_bytes)] * n, [ext] * n, ptrs, True), 1
+        rc1 = []
+        for a in range(0, n, step):
+            m = len(paths[a:a + step])
+            rc1 += list(pio.read_pages(paths[a:a + step], [int(total_bytes)] * m, [ext] * m, ptrs[a:a + step], True))
+            progress()
+        return rc1, 1
     k = min(k, n)
     groups = [list(range(g, n, k)) for g in range(k)]
 
     def one(idx):
-        return pio.read_pages([paths[i] for i in idx], [int(total_bytes)] * len(idx),
-                              [ext] * len(idx), [ptrs[i] for i in idx], True)
+        if progress is None:
+            return pio.read_pages([paths[i] for i in idx], [int(total_bytes)] * len(idx),
+                                  [ext] * len(idx), [ptrs[i] for i in idx], True)
+        out = []
+        for a in range(0, len(idx), step):       # S23: the worker thread reports progress after each sub-call
+            sub = idx[a:a + step]
+            out += list(pio.read_pages([paths[i] for i in sub], [int(total_bytes)] * len(sub),
+                                       [ext] * len(sub), [ptrs[i] for i in sub], True))
+            progress()
+        return out
 
     rc = [4] * n
     for idx, res in zip(groups, _l3_executor(k).map(one, groups)):

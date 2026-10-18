@@ -178,8 +178,15 @@ def spill_host_only(cache: Any, pool: Any, want: int, page_size: int, skip: set,
     heap = []
     refused: Dict[str, int] = {}
     eligible = []
+    from flliper.srt.mem_cache import form_a_host_shadow as _r12
+
+    # S22 (R12 SPILL-DIVERGED class): on a Form A group TP0's drop of a host-only leaf is a STATE(exists=0) verdict; a
+    # worker that has the node device-resident or with children cannot delete it and would keep a node TP0 dropped
+    nodel = _r12.worker_nodelete_keys(cache) if _r12.role() == "host" else ()
     for n in cache._collect_all_nodes():
         r = _reason(cache, n, pool, skip)
+        if r is None and nodel and _r12.node_key(n) in nodel:
+            r = "worker_cannot_delete"
         if r is None:
             eligible.append(n)
         elif r != "root":
@@ -215,6 +222,11 @@ def spill_host_only(cache: Any, pool: Any, want: int, page_size: int, skip: set,
         if (int(sec.get("lost", 0)) or int(sec.get("pages", 0)) != len(node.hash_value)
                 or (int(sec.get("unpaired", 0)) and _strict())):
             unsecured += 1                # no L3 copy for every page: it stays
+            continue
+        from flliper.srt.pdflip.read_room import l3_complete as _l3_complete
+
+        if not _l3_complete(node, sec):
+            unsecured += 1                # review readroomd B3: a page neither on disk nor written now: it stays
             continue
         on_disk += int(sec.get("on_disk", 0))
         written += int(sec.get("written", 0))

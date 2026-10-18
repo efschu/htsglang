@@ -314,6 +314,7 @@ def note_role(cache: Any) -> None:
         _A.pp_size = int(getattr(cache, "pp_size", 0) or 0)
     except (AttributeError, TypeError, ValueError):
         _A.pp_rank = None
+        _A.pp_size = 0   # S20: a tree without a PP rank (a Form A TP rank, a stand-in) leaves no stale group size
 
 
 def is_pp0() -> bool:

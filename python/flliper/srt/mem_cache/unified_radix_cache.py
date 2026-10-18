@@ -37,6 +37,7 @@ from flliper.srt.distributed.utils import uneven_dcp_active
 from flliper.srt.environ import envs
 from flliper.srt.pdflip import prefix_trace as _prefix_trace
 from flliper.srt.pdflip.read_room import tick as _read_room_tick
+from flliper.srt.pdflip.read_room import l3_complete as _read_room_l3_complete
 from flliper.srt.pdflip import tail_adopt, tail_handoff
 from flliper.srt.pdflip import short_read as _pdflip_short_read
 from flliper.srt.pdflip import d_park_read as _pdflip_park_read
@@ -1069,6 +1070,17 @@ def _ud_refused_note(tree, node, _sf) -> None:
         pass
 
 
+
+def _s23_cut_cause(operation):
+    """S23: the cause READ-DEPTH recorded for this operation's cut (``(page, cause)``), else None. Never raises."""
+    try:
+        from flliper.srt.pdflip import read_depth as _rd
+
+        cut = _rd.cut_of(operation)
+        return None if cut is None else str(cut[1])
+    except Exception:  # noqa: BLE001 - an instrument never breaks a read
+        return None
+
 class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     #: HY (pdflip/park_hold_yield.py): the retained nodes whose backup the arena
     #: refused (#1421 arena_claim) during a D park's retraction; None = no
@@ -1617,7 +1629,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 continue
             if cd is None or cd.value is None or cd.host_value is not None:
                 continue
-            if (_det and getattr(node, "id", None) in _det) or self._pdflip_anchor_secured_holds(node):
+            if (_det and getattr(node, "id", None) in _det) or (
+                    (node.backuped or UnifiedRadixCache._s25_kv_in_store(node))
+                    and self._pdflip_anchor_secured_holds(node)):
                 continue    # ANCHOR-ONLY (KV in the store): its arena slot carries it (or its write is in flight)
             out.append((self.pdflip_node_depth(node), getattr(node, "pdflip_anchor_rid", None)))
         out.sort()
@@ -2102,6 +2116,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def _reset_full(self) -> None:
         """Full reset: destroy entire tree and all state."""
+        # S20 (h16v3 22:48:14-22:49:08, the D arena held full by the workers' stale host rows): a Form A WORKER
+        # learned its tree only from worker_keeps / worker_short -- the first of them at 22:49:08. Until then every
+        # R12 verdict TP0 sent (seq 1-4, LOADED-HOST-RELEASE, 307848 tokens = 4810 pages) went into
+        # ``_S.pending`` unapplied (``consume`` found no tree), TP1/TP2 held tree=6043 refs against TP0's 1233 and
+        # D's arena stayed 6485/6485 pinned for 45 s. Every rank registers its tree HERE (construction runs
+        # ``reset``), so the verdict is applied at the broadcast it rides, as TP0 assumes.
+        _r12.register_tree(self)
         # rc12 (D, all ranks, 23:12:47Z: "H-leaf extra: [62, 64, 60, 63]" +
         # "4 stale nodes in host_leaves"): the #1417 prefetch pins name nodes
         # of the tree being destroyed. Kept across the sleep flush, the held
@@ -2714,7 +2735,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 and cd.host_value is None
                 and node.id not in self.ongoing_write_through
             ):
-                self.write_backup(node)
+                self._s25_backup_store_aware(node)
             return False
         if not self.dec_mamba_lock_only(node):
             return False
@@ -4429,6 +4450,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
         self._cascade_evict(node, trigger, tracker)
         self._record_remove_event(node, medium=StorageMedium.GPU)
+        # S22 (R12 SPILL-DIVERGED): the device life of a node is rank-local; a Form A worker tells TP0 which nodes
+        # it took off the device, because TP0 may spill (drop the host copy of) only a node every worker can follow
+        _r12.worker_device_evicted(self, node)
 
         # after device eviction, insert aux components into host LRU.
         self._for_each_component_lru(
@@ -4662,6 +4686,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return False
         from flliper.srt.pdflip import pp_slot_fidelity as _sf
 
+        if _r12.role() is not None and _r12.l3_group_on():
+            return UnifiedRadixCache._pdflip_l3_drop_forma(self, node, tracker)
         if not _sf.unbacked_drop_floor(self, node):
             return False
         if not UnifiedRadixCache._pdflip_l3_drop_under_pressure(self, node):
@@ -4698,6 +4724,39 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 "comes back from L3)",
                 k, getattr(node, "id", "?"), len(getattr(node, "key", []) or []),
                 int(tracker.get(base, 0)) - before, max(0.0, waited_ms))
+        return True
+
+    def _pdflip_l3_drop_forma(self, node: UnifiedTreeNode, tracker: dict[ComponentType, int]) -> bool:
+        """READ-ROOM-D, review readroomd B4: on a Form A group (R12) a store-backed device leaf -- ``l3_present``
+        (TP0's group verdict, mirrored by the K12b L3 event; since K12c A3 57fa93fb08 no rank sets it from its own
+        direct-write ack), no host copy (the R12 STATE dropped it) -- leaves the device WITHOUT a new arena claim,
+        like L3-DROP on the local-PP floor. The rule reads only tree state (l3_present, backuped, children, the
+        node's write-through and its device lock), never a rank-local room figure: every rank of the group takes the
+        same decision once it has APPLIED the same verdict (review readroomd2 B2). A verdict a worker could not apply
+        at once (STATE ``pending`` while its own store write holds the rows) leaves one window in which TP0 drops
+        and that worker demotes; it closes at the next broadcast and is named (READ-ROOM-STATE-DIVERGED /
+        SPILL-DIVERGED). A leaf with children or a write in flight keeps the old path. Returns True when the node
+        was dropped."""
+        if node.children or node.id in self.ongoing_write_through \
+                or getattr(node, "write_through_pending_id", None) is not None:
+            return False
+        if any(int(getattr(cd, "lock_ref", 0) or 0) > 0 for cd in node.component_data):
+            return False
+        mamba = getattr(ComponentType, "MAMBA", None)
+        if mamba is not None and node.component_data[mamba].value is not None:
+            return False   # an anchor on the device leaves only with a backup (D keeps its anchors)
+        base = BASE_COMPONENT_TYPE
+        before = int(tracker.get(base, 0))
+        self._ud_drop_unbacked_leaf(node, tracker)
+        k = getattr(UnifiedRadixCache, "_pdflip_l3_drop_forma_n", 0) + 1
+        UnifiedRadixCache._pdflip_l3_drop_forma_n = k
+        if k <= 32 or (k & (k - 1)) == 0:
+            logger.warning(
+                "L3-DROP FORMA n=%d node=%s tokens=%d freed=%d role=%s (a store-backed D device leaf -- l3_present by "
+                "TP0's verdict, no host copy on any rank -- left the device without a new arena claim; every rank "
+                "of the group decides the same from the same tree)",
+                k, getattr(node, "id", "?"), len(getattr(node, "key", []) or []),
+                int(tracker.get(base, 0)) - before, _r12.role())
         return True
 
     @staticmethod
@@ -5566,7 +5625,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         path, depth = _mad.ancestor_path(target=node, root=self.root_node)
         owned = _mad.owned_anchors(path=path, rid=rid, anchor_of=lambda n: self._pdflip_anchor_of(n, mp))
         if len(owned) >= cap:
-            victim = _mad.pick_own_victim(owned)
+            victim = _mad.pick_own_victim(self._r12_anchor_deletable(owned))
             if victim is not None:
                 self._pdflip_release_anchor(victim, mp, st, why="share", for_rid=rid)
                 owned = [a for a in owned if a is not victim]
@@ -5734,7 +5793,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return False
         cands = _mad.tree_anchors(root=self.root_node, anchor_of=lambda n: self._pdflip_anchor_of(n, mp),
                                   include_untagged=True)
-        cands = [a for a in cands if a.node is not node]
+        cands = self._r12_anchor_deletable([a for a in cands if a.node is not node])
         # K15c review A1 (16.10., boot 1016_103428 10:42:16 TP0 DISPLACE why=park_first node=59
         # dropped=0): the park spill takes the same victims -- on the Form A host only ref-free ones
         _rf = UnifiedRadixCache._k15c_ref_free_filter(arena) if _r12.role() == "host" else None
@@ -5888,6 +5947,29 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                            type(exc).__name__, exc)
             return False
 
+    def _s25_backup_store_aware(self, node) -> int:
+        """S25 (review nf-review-s25-1018 point 3, h16v5 D.log:99080 node 263 93376 tokens, :99180 FORMA need=1459):
+        ``_inc_hit_count`` (park retract, ``force_host_write_through``) and the anchor-pin re-issue asked ``write_backup``
+        for every node without a Full host copy -- also for a store-backed one (``l3_present``), whose KV the store holds.
+        Those full backups filled the KV arena with needless host copies and left no room for fresh end nodes (flush
+        03:42:32: 16 anchors lost). A store-backed node needs at most its device-only anchor copied (anchor-only)."""
+        if UnifiedRadixCache._s25_kv_in_store(node):
+            n = getattr(UnifiedRadixCache, "_s25_store_aware_n", 0) + 1
+            UnifiedRadixCache._s25_store_aware_n = n
+            if n <= 16 or n % 256 == 0:
+                logger.info("S25 STORE-AWARE-BACKUP n=%d rank=%s node=%s depth=%d (an l3_present node asks no full KV "
+                            "backup; at most its device-only anchor is copied)", n, getattr(self, "tp_rank", "?"),
+                            getattr(node, "id", "?"), self.pdflip_node_depth(node))
+            return self.write_backup_anchor_only(node)
+        return self.write_backup(node)
+
+    @staticmethod
+    def _s25_kv_in_store(node) -> bool:
+        """S25: the node's KV is in the store only (``l3_present``, no Full host copy) and the anchor-only
+        backup is on -- the same set ``_pdflip_anchor_only_candidate`` admits beyond ``backuped``."""
+        return (bool(getattr(node, "l3_present", False)) and not node.backuped
+                and bool(envs.FLLIPER_PDFLIP_ANCHOR_ONLY_BACKUP.get()))
+
     def pdflip_save_anchor_before_tombstone(self, node) -> bool:
         """K15 (pdflip-56-530, 00:21:41-00:22:06): the device mamba eviction
         TOMBSTONES an internal node's anchor (mamba_component.drive_eviction,
@@ -5919,6 +6001,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if (cc is None or getattr(cc, "write_policy", None) != "write_back"
                 or not UnifiedRadixCache.k15_anchor_save_on()):
             return False
+        if ((node.backuped or UnifiedRadixCache._s25_kv_in_store(node))
+                and UnifiedRadixCache._pdflip_anchor_secured_holds(self, node)):
+            # S25: the anchor already sits in its arena slot (KV-in-store anchor-only copy). Gated on the KV being
+            # backed: the mark alone (set generically after an aux host release) is no proof for a node whose KV is
+            # on the device only.
+            n = getattr(UnifiedRadixCache, "_s25_early_return_n", 0) + 1
+            UnifiedRadixCache._s25_early_return_n = n
+            if n <= 16 or n % 256 == 0:
+                logger.info("S25 ANCHOR-SECURED-HELD n=%d rank=%s node=%s depth=%d (K15 save: the anchor already sits in "
+                            "its arena slot, no new claim)", n, getattr(self, "tp_rank", "?"), getattr(node, "id", "?"),
+                            self.pdflip_node_depth(node))
+            return True
         if getattr(node, "_pdflip_capped", False) or node.write_through_pending_id is not None:
             return False   # the per-path cap took it by design / a write is already in flight
         if _r12.role() == "worker":
@@ -5930,7 +6024,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self._k15_last_refusal = None
             self._pdflip_sweep_last_refusal = None
             try:
-                if node.backuped:
+                if node.backuped or UnifiedRadixCache._s25_kv_in_store(node):
+                    # S25 (h16v5 03:29:35 node=38 / 03:47:08 node=378, h16v4b, h16v3): a store-backed node
+                    # (``l3_present``, Full host copy spilled, W3 spill / Form A reconcile) is as KV-backed as a
+                    # ``backuped`` one -- only its anchor needs a copy. The full backup below claimed its whole
+                    # KV span again (``BACKUP-REFUSED why=arena_claim`` on the full KV arena) for pages the
+                    # store already holds -- the L3-DROP rule ("did not read that mark") applied to the anchor.
                     written = self.write_backup_anchor_only(node)
                 else:
                     written = self.write_backup(node, write_back=True)
@@ -5951,8 +6050,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 break
         if written:
             self.writing_check(write_back=True)
-        ok = node.component_data[ComponentType.MAMBA].host_value is not None
+        # S25: a KV-in-store anchor-only copy lives in its arena slot, not in the tree (host_value stays None)
+        ok = (node.component_data[ComponentType.MAMBA].host_value is not None
+              or (UnifiedRadixCache._s25_kv_in_store(node) and getattr(node, "pdflip_anchor_secured", False)))
         if ok:
+            # S25 (h16v3 9/9, h16v4b 2/2 ``why=mamba_claim`` losses): the once-per-node spill latch served THIS save.
+            # A node whose anchor was saved (spill 23:55:53 for node 1422), loaded back and evicted again a minute later
+            # (23:56:55) asks for a NEW save; the latch, never cleared, denied the spill and the full arena (84/84 held by
+            # D's own tree, ARENA-REF-HOLDERS gap=0) refused -> ANCHOR-LOST. The latch bounds repeated spills of a node
+            # whose saves FAIL; a success clears it.
+            node._pdflip_evict_spilled = False
             UnifiedRadixCache._k15_saved_n += 1
             n = UnifiedRadixCache._k15_saved_n
             if n <= 32 or n % 256 == 0:
@@ -5963,9 +6070,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             UnifiedRadixCache._k15_lost_n += 1
             n = UnifiedRadixCache._k15_lost_n
             if n <= 32 or n % 256 == 0:
-                logger.warning("PDFLIP-ANCHOR-LOST at=evict n=%d node=%s depth=%d backuped=%s why=%s (the "
+                logger.warning("PDFLIP-ANCHOR-LOST at=evict n=%d node=%s depth=%d backuped=%s l3_present=%s why=%s (the "
                                "internal anchor had no host copy and none could be made -- tombstoned)",
                                n, getattr(node, "id", "?"), self.pdflip_node_depth(node), node.backuped,
+                               bool(getattr(node, "l3_present", False)),
                                getattr(self, "_k15_last_refusal", None)
                                or getattr(self, "_pdflip_sweep_last_refusal", None) or "?")
         return ok
@@ -6043,7 +6151,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             root=self.root_node,
             anchor_of=lambda n: self._pdflip_anchor_of(n, mp, allow_end=True),
             include_untagged=True)
-        cands = [a for a in cands if a.node is not node]
+        cands = self._r12_anchor_deletable([a for a in cands if a.node is not node])
         if ref_free is not None:
             if shared_out is not None:
                 shared_out.update(id(a.node) for a in cands if not ref_free(a))
@@ -6051,15 +6159,37 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         return _mad.pick_last_resort_victim(cands, chain_ids=self._pdflip_park_chain(),
                                             claimer_lane=self._pdflip_claim_lane(node, park=park))
 
+    def _r12_anchor_deletable(self, anchors):
+        """S22 (review point 5): the anchors TP0 may release as victims. On TP0 of a Form A group releasing the anchor
+        of a device-evicted, childless node without KV host DELETES the node (STATE exists=0); a worker that holds the
+        node device-resident or interior cannot follow, so such an anchor is no victim -- the next one is taken (as
+        ``evict_host`` continues to the next leaf). Not in the sleep flush (the verdict is sent there as everywhere)."""
+        if _r12.role() != "host" or getattr(self, "_pdflip_flush_spill", False):
+            return anchors
+        nd = _r12.worker_nodelete_keys(self)
+        if not nd:
+            return anchors
+        keep, held = [], 0
+        for a in anchors:
+            n = a.node
+            if (n.evicted and not n.children and n.component_data[BASE_COMPONENT_TYPE].host_value is None
+                    and _r12.node_key(n) in nd):
+                held += 1
+                continue
+            keep.append(a)
+        if held:
+            _r12.kept_note("anchor_worker_cannot_delete", held)
+        return keep
+
     def _pdflip_full_victim(self, node, rid, owned, mp):
         """FULL: the request's own shallowest anchor; a request with none to
         give (its first anchor, or its end anchor) takes another request's
         shallowest INTERMEDIATE anchor."""
-        victim = _mad.pick_own_victim(owned)
+        victim = _mad.pick_own_victim(self._r12_anchor_deletable(owned))
         if victim is not None or (owned and not node._pdflip_end_anchor):
             return victim
         tree = _mad.tree_anchors(root=self.root_node, anchor_of=lambda n: self._pdflip_anchor_of(n, mp))
-        return _mad.pick_foreign_victim(tree, rid=rid)
+        return _mad.pick_foreign_victim(self._r12_anchor_deletable(tree), rid=rid)
 
     def _pdflip_release_anchor(self, victim, mp, st, why: str, for_rid: str) -> int:
         """Release this rank's reference on the victim's anchor (the node keeps
@@ -6067,6 +6197,21 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         the slot once no rank references it. Returns the slots dropped (K15c
         review A2: 0 = another process still references them, no slot freed)."""
         comp = self.components[ComponentType.MAMBA]
+        if _r12.role() == "host":
+            # S22 (R12 SPILL-DIVERGED class, h16v4b 02:09:44 / 02:18:01 K23 SPILL-DIVERGED after DISPLACE
+            # why=flush_spill): dropping the anchor of a device-evicted, childless node with no KV host DELETES the
+            # node on TP0; the STATE(exists=0) reaches a worker that holds it device-resident or as an interior
+            # node and cannot delete it. The VICTIM CHOICE already leaves such nodes out (``_r12_anchor_deletable``);
+            # this is the backstop for a victim that got here by another road.
+            _bcd = victim.node.component_data[BASE_COMPONENT_TYPE]
+            if victim.node.evicted and not victim.node.children and _bcd.host_value is None:
+                if getattr(self, "_pdflip_flush_spill", False):
+                    # the sleep flush ends WITHOUT a reset when /flush_cache answers "quiesced" or "Cache not
+                    # flushed" (h16v4b: 3x "Cache not flushed" on TP0): the STATE is sent as everywhere, counted only
+                    _r12.kept_note("anchor_flush_reset_covers", 1)
+                elif _r12.node_key(victim.node) in _r12.worker_nodelete_keys(self):
+                    _r12.kept_note("anchor_release_refused", 1)
+                    return 0
         self._evict_component_and_detach_lru(victim.node, comp, target=EvictLayer.HOST, tracker=None)
         self._update_evictable_leaf_sets(victim.node)
         if _r12.role() == "host":
@@ -6314,6 +6459,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             skip.add(id(n))   # the claimer's own chain: its parent rule reads backed/l3_present
             n = n.parent
         cands = []
+        # S22 (R12 SPILL-DIVERGED, NF h16v4b 01:40:12 node=90): TP0 spills only a node every worker can follow on --
+        # one a worker has device-evicted has no state to move to there (see form_a_host_shadow, DEV_SUFFIX)
+        wev = _r12.worker_evicted_keys(self) if _role == "host" else ()
+        kept_wev = kept_unkeyed = 0
         keep_payable = UnifiedRadixCache._w3_keep_payable_state(self)
         kept_payable = 0
         told_head = UnifiedRadixCache._told_head_ids(self)
@@ -6347,6 +6496,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 continue   # y5h/park_l3: an aux state lives on the host only -- the node keeps its host life
             if int(hv.min()) < int(getattr(pool, "staging_rows", 0)):
                 continue   # staging rows are not arena slots
+            if _role == "host":
+                _nk = _r12.node_key(node)
+                if _nk is None:
+                    kept_unkeyed += 1   # no R12 verdict can name it: TP0 alone would change
+                    continue
+                if _nk in wev:
+                    kept_wev += 1       # a worker has it off the device: TP0's host drop is not applicable there
+                    continue
             cands.append(node)
         keys = self._w3_spill_keys(pool, cands)
         # L3-COMPLETE review A1: a node with a slot not COMPLETE is treated like a pending write -- not a
@@ -6385,6 +6542,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if _role == "host" and int(sec.get("pages", 0)) < len(getattr(node, "hash_value", None) or ()):
                 # Form A: a page some owner has not finished is not COMPLETE and
                 # got no L3 copy -- the whole node stays until every page has one
+                continue
+            if not _read_room_l3_complete(node, sec):
+                # review readroomd B3 (every role): released only when EVERY page of the node has its L3 copy --
+                # the COMPLETE pages are all the node's pages and each is on disk or was written now
+                incomplete += 1   # S20 review H3: counted in the line's existing ``incomplete`` skip counter
                 continue
             secured += int(sec.get("on_disk", 0))
             written += int(sec.get("written", 0))
@@ -6441,6 +6603,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                                 _seen.add(id(_n))
                                 _r12.record_state(self, _n, why="k23_host_leaf_spill")
         self._w3_spill_cap_used, self._w3_spill_cap_skipped = cap_used, cap_skipped
+        self._w3_spill_kept_wev, self._w3_spill_kept_unkeyed = kept_wev, kept_unkeyed
         k = getattr(self, "_w3_spill_n", 0) + 1
         self._w3_spill_n = k
         if released == 0:
@@ -6449,13 +6612,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             logger.info(
                 "W3-ARENA SPILL n=%d need=%d released_pages=%d nodes=%d candidates=%d "
                 "l3=on_disk:%d,written:%d lost=%d unpaired=%d incomplete=%d ref_free=%s kept_payable=%d kept_told=%d "
+                "kept_worker_evicted=%d kept_unkeyed=%d "
                 "(incomplete = nodes kept because a slot is not COMPLETE yet, no loss; a finished page leaves L2 only with "
                 "its L3 copy; the node stays on the device, l3_present; ref_free = of the slots "
                 "this spill let go, those NO rank references any more -- the clock takes them; "
                 "group-equal order: fewest peer references first, then slot id; kept_payable = device nodes "
                 "not spilled because their drop could not clear a host-only child now)",
                 k, int(need_pages), released, spilled, len(cands), secured, written, lost, unpaired, incomplete,
-                self._w3_spill_ref_free(pool, released_slots), kept_payable, kept_told)
+                self._w3_spill_ref_free(pool, released_slots), kept_payable, kept_told, kept_wev, kept_unkeyed)
         if released_out is not None:
             released_out.extend(released_slots)
         return released
@@ -6527,14 +6691,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             cap = max(0, int(envs.FLLIPER_PDFLIP_W3_FORMA_SPILL_MAX_PAGES.get()))
         except Exception:  # noqa: BLE001 - a hermetic tree without the field: the review's bound
             cap = 128
+        self._w3_spill_kept_wev = self._w3_spill_kept_unkeyed = 0
         self._w3_spill_cap_used = self._w3_spill_cap_skipped = 0   # an early return (backoff) reports 0, not the last call
         t0 = time.monotonic()
         got = self._w3_arena_spill(pool, need, max_secure_pages=cap)
         ms = (time.monotonic() - t0) * 1000.0
         logger.info("W3-ARENA FORMA-REQUEST need=%d released_pages=%d secure_pages=%d cap=%d over_cap_nodes=%d "
-                    "ms=%.1f (a worker's claim was refused; TP0 spilled, the workers follow at this broadcast)",
+                    "kept_worker_evicted=%d kept_unkeyed=%d "
+                    "ms=%.1f (a worker's claim was refused; TP0 spilled, the workers follow at this broadcast; "
+                    "kept_* = device candidates TP0 left alone: a worker has them off the device / no R12 key)",
                     need, got, int(getattr(self, "_w3_spill_cap_used", 0)), cap,
-                    int(getattr(self, "_w3_spill_cap_skipped", 0)), ms)
+                    int(getattr(self, "_w3_spill_cap_skipped", 0)),
+                    int(getattr(self, "_w3_spill_kept_wev", 0)), int(getattr(self, "_w3_spill_kept_unkeyed", 0)), ms)
         return got
 
     def _pdflip_write_or_abort(self, node, device_value, aux_xfers, pre, ring):
@@ -8425,7 +8593,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 or node.hit_count >= self.write_through_threshold
             )
         ):
-            self.write_backup(node)
+            self._s25_backup_store_aware(node)
 
     @staticmethod
     def _plain_sidecar_transfers(transfers, registered_pools) -> list:
@@ -10393,6 +10561,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # compares -- see its docstring for why a rank-local number would
             # have had the mark refused on group D's uneven-DCP phase.
             synced=min_completed_tokens,
+            # S23 (18.10.): THIS rank's READ-DEPTH cut cause (arena_full / late_complete / join_unfinished ...): the
+            # scheduler names a short read a CAPACITY-CUT only on arena_full, not on 'the probe covered it' alone
+            cut_cause=_s23_cut_cause(operation),
         )
         if _eb_rec is not None:
             # HFB (rc12z21 D 13:35:14, pdflip-8-34): under the Form A END vote
@@ -13971,6 +14142,30 @@ def _aux_components(tree) -> tuple:
     return tuple(c for c in comps if c.component_type != BASE_COMPONENT_TYPE)
 
 
+def _s25_mark_released_anchor_secured(tree, node) -> None:
+    """S25 (h16v5 03:46:05 node=378: ``AUX-HOST-WITH-FULL released=1`` by the W3 spill, 03:47:08 ANCHOR-LOST): the
+    spill gives the Full host copy up (the store holds the KV, ``l3_present``) and the tree law takes the Mamba host
+    anchor with it. Releasing the host anchor only drops the tree's reference (``MambaComponent.evict_component`` ->
+    ``free``); its arena slot stays COMPLETE under its page hash (a clock candidate that writes L3 first, #257) --
+    the state of a detached anchor-only copy. The node says so (``pdflip_anchor_secured``), verified against the
+    arena/L3 (``anchor_held``; unknown or absent = no mark), so the K15 save and the flush find the anchor secured
+    instead of claiming a new mamba slot or tombstoning it. Host bookkeeping only; a worker has no mamba pool."""
+    try:
+        mp = tree._pdflip_mamba_pool()
+        probe = getattr(mp, "anchor_held", None)
+        if not callable(probe) or not getattr(node, "hash_value", None):
+            return
+        if probe(node.hash_value[-1]):
+            node.pdflip_anchor_secured = True
+            n = getattr(UnifiedRadixCache, "_s25_mark_n", 0) + 1
+            UnifiedRadixCache._s25_mark_n = n
+            if n <= 16 or n % 256 == 0:
+                logger.info("S25 ANCHOR-SECURED-MARK n=%d rank=%s node=%s (the spill's aux release left the anchor in its "
+                            "arena slot)", n, getattr(tree, "tp_rank", "?"), getattr(node, "id", "?"))
+    except Exception as exc:  # noqa: BLE001 - no mark = the old behaviour, named
+        logger.warning("S25 ANCHOR-SECURED probe after aux host release raised: %r", exc)
+
+
 def _evict_aux_host_before_full_host(tree, node, tracker) -> int:
     """y5h, the net under every "Full host copy leaves, the node stays on the
     device" path (W3 spill, PUBLISH-CHAIN host release, park_l3, the Form A
@@ -13994,6 +14189,8 @@ def _evict_aux_host_before_full_host(tree, node, tracker) -> int:
             continue
         tree._evict_component_and_detach_lru(node, comp, target=EvictLayer.HOST, tracker=tracker)
         n += 1
+        if ct == ComponentType.MAMBA:
+            _s25_mark_released_anchor_secured(tree, node)
     if n:
         k = getattr(UnifiedRadixCache, "_aux_host_with_full_n", 0) + 1
         UnifiedRadixCache._aux_host_with_full_n = k
