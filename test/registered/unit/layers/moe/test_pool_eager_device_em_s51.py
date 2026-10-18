@@ -276,13 +276,41 @@ def test_the_em_metal_check_has_its_own_budget(monkeypatch, caplog):
     assert len(lines) == 1 and "verdict=MATCH " in lines[0] and "waves=2" in lines[0], lines
 
 
-def test_the_em_metal_check_stops_by_name_when_a_device_row_lies(monkeypatch):
+def test_an_em_mismatch_falls_back_to_the_host_plan_loudly_and_stays_there(monkeypatch, caplog):
+    # S51r: a lying device row must not kill the rank (NF death) -- the check's
+    # reference IS the host plan, so the extend is served by it, one ERROR
+    # line names the layer, and this layer plans on the host from then on
     cache = _pool_cache(monkeypatch, warm=[6, 13])
     cache._pool_eager_device_em_checks = 1
     r = int(cache._pool_tables.hot_phys[6])
     cache._resident["w13"][r].fill_(99.0)
-    with pytest.raises(RuntimeError, match="EAGER-DEVICE-STEP MISMATCH layer 7"):
-        _extend(cache)
+    with caplog.at_level(logging.INFO, logger=eo.__name__):
+        got = _extend(cache)
+    assert torch.equal(got[:, 0], _truth()), "the fallback serves the host plan's output"
+    errs = [x for x in caplog.records if "EAGER-DEVICE-EM MISMATCH-FALLBACK layer 7" in x.getMessage()]
+    assert len(errs) == 1 and errs[0].levelno == logging.ERROR, [x.getMessage() for x in caplog.records]
+    assert "T=6 waves=2" in errs[0].getMessage()
+    assert cache._eager_device_em_fallbacks == 1
+    assert cache.eager_device_em_waves(18) == (0, "em_switch_off"), "no unchecked EM forward follows"
+    calls = []
+    real = cache.run_waves
+    monkeypatch.setattr(cache, "run_waves", lambda *a, **k: calls.append(1) or real(*a, **k))
+    assert torch.equal(_extend(cache, seed=4)[:, 0], _truth(seed=4))
+    assert calls, "the next extend past the graph form runs on the host plan"
+    # the device tables were republished from the host: nothing lies any more
+    assert ep.bijection_breaks(cache._pool_tables) == 0 and int(cache._pool_tables.error[0]) == 0
+
+
+def test_the_mini_extend_check_still_stops_by_name(monkeypatch):
+    # the fallback is EM's alone; the D-Mini-Extend check keeps its convention
+    cache = _pool_cache(monkeypatch, warm=[6, 13], graph_limit=64)
+    cache._pool_eager_device_checks = 1
+    r = int(cache._pool_tables.hot_phys[6])
+    cache._resident["w13"][r].fill_(99.0)
+    with envs.FLLIPER_OPT_MOE_POOL_OVERFLOW_WAVES.override(2):
+        assert cache.eager_device_waves(18) == (2, "device")
+        with pytest.raises(RuntimeError, match="EAGER-DEVICE-STEP MISMATCH layer 7"):
+            _extend(cache)
 
 
 def test_small_forwards_keep_the_mini_extend_step(monkeypatch):
@@ -322,3 +350,67 @@ def test_pinned_wave_idx_stages_through_h2d_and_changes_nothing(monkeypatch):
     # exactly one pinned stage per applied wave slice, nothing else moved
     assert calls[True][1] == calls[False][1] >= 2
     assert calls[True][0] - calls[False][0] == calls[True][1], calls
+
+
+# --- S51r review (18.10.) ---------------------------------------------------
+# The harness above stores expert e's bytes as the value e, so expert 0 (and
+# the zero row, which is expert 0's row when the layer has no shard pad) is
+# all-zero: a lane wrongly computed on expert 0 contributes 0 and no truth
+# comparison can see it. The mutant 'served = lane_route >= 0' (``owed &``
+# dropped) survived the S51 battery for exactly that reason -- a padded (-1)
+# lane maps through ``safe`` to expert 0, and once expert 0 is in the wave the
+# lane is "served" with ITS OWN (non-zero) weight. Offset bytes close that
+# blind spot.
+OFF = 100.0
+
+
+def _offset(cache, off=OFF):
+    cache._pinned["w13"].add_(off)
+    cache._resident["w13"].add_(off)
+    return cache
+
+
+def _truth_off(routes, seed=0, off=OFF):
+    w = _weights(routes, seed)
+    ids = torch.tensor(routes, dtype=torch.float32)
+    contrib = torch.where(ids >= 0, (ids + off) * w, torch.zeros_like(w))
+    acc = contrib[:, 0].clone()
+    for k in range(1, contrib.shape[1]):
+        acc = acc + contrib[:, k]
+    return acc
+
+
+def test_a_padded_lane_never_takes_expert_0_rows_weight(monkeypatch):
+    # expert 0 (resident) is routed AND padded lanes carry non-zero weights
+    routes = [[5, -1, 0], [7, 5, -1], [9, 11, 0], [-1, 17, 3], [6, 9, 21], [19, 22, 0]]
+    w = _weights(routes, seed=8)
+    assert all(float(w[t, k]) > 0 for t, row in enumerate(routes) for k, e in enumerate(row) if e < 0)
+    dev = _offset(_pool_cache(monkeypatch, warm=[5]))
+    assert dev.eager_device_em_waves(18)[1] == "device_em"
+    got = _extend(dev, routes, seed=8)
+    assert torch.equal(got[:, 0], _truth_off(routes, seed=8))
+    host = _offset(_host_twin(monkeypatch, warm=[5]))
+    assert torch.equal(got, _extend(host, routes, seed=8))
+
+
+# all 20 spill experts of E=24/R=4 in one extend (and residents, and a pad)
+ALL = [[4, 5, 6], [7, 8, 9], [10, 11, 12], [13, 14, 15], [16, 17, 18], [19, 20, 21],
+       [22, 23, 0], [1, -1, 2]]
+
+
+@pytest.mark.parametrize("scratch,waves", [(20, 1), (12, 2), (7, 3)])
+def test_one_two_and_three_waves_each_serve_every_lane_once(monkeypatch, scratch, waves):
+    # 20 distinct spill experts against C = LRU + staging rows: 1, 2 and 3 waves
+    # really run (the 3-wave case carries ``pending`` across two rewrites)
+    dev = _offset(_pool_cache(monkeypatch, scratch=scratch))
+    assert dev.eager_device_em_waves(24) == (waves, "device_em")
+    t = dev._pool_tables
+    t.misses_total.zero_()
+    calls = []
+    got = _extend(dev, ALL, seed=13, calls=calls)
+    assert len(calls) == waves, calls
+    assert int(t.misses_total[0]) == 20, "every spill expert crosses exactly once"
+    assert torch.equal(got[:, 0], _truth_off(ALL, seed=13))
+    assert ep.bijection_breaks(t) == 0 and int(t.error[0]) == 0
+    host = _offset(_host_twin(monkeypatch))
+    assert torch.equal(got, _extend(host, ALL, seed=13))

@@ -3858,9 +3858,14 @@ class Envs:
     FLLIPER_OPT_MOE_POOL_EAGER_DEVICE_EM_SLICE = EnvInt(4096)
     # S51 metal instrument for EAGER-DEVICE-EM: the first N EM forwards PER
     # LAYER also run the plain host plan (H107 off) as the reference, one line
-    # 'EAGER-DEVICE-STEP CHECK ... waves=W ...' each; a deviation beyond fp
-    # rounding stops the rank by name (the D-Mini-Extend check, own budget).
-    # 1 (default) = the first EM extend of the process proves all layers once.
+    # 'EAGER-DEVICE-STEP CHECK ... waves=W ...' each (own budget, apart from
+    # the D-Mini-Extend check). S51r (review 18.10.): a deviation beyond fp
+    # rounding does NOT stop the rank -- the reference IS the host plan, so
+    # that extend is served by it, one ERROR line 'EAGER-DEVICE-EM
+    # MISMATCH-FALLBACK layer N ...' names it, and that layer plans every
+    # later extend past the graph form on the host (a defect report; the
+    # default stays on, the other layers keep EM). 1 (default) = the first EM
+    # extend of the process proves all layers once; 0 = off.
     FLLIPER_DEBUG_MOE_POOL_EAGER_DEVICE_EM_CHECK = EnvInt(1)
     # S51: the expert-major host loop stages each wave slice's pair indices
     # through PINNED host memory (_h2d_i64) instead of a pageable

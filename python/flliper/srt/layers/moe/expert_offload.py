@@ -5523,7 +5523,7 @@ class MoEExpertOffloadCache:
                 self._pool_eager_device_em_checks -= 1
             else:
                 self._pool_eager_device_checks -= 1
-            out = self._check_eager_device_step(saved, apply_fn, out, waves)
+            out = self._check_eager_device_step(saved, apply_fn, out, waves, em=em)
         return out
 
     def _note_eager_device_step(self, tokens: int, n_ids: int, waves: int) -> None:
@@ -5566,13 +5566,24 @@ class MoEExpertOffloadCache:
             _em_slice_pairs(), self._eager_device_em_steps,
         )
 
-    def _check_eager_device_step(self, saved, apply_fn, out, waves: int):
+    def _check_eager_device_step(self, saved, apply_fn, out, waves: int, em: bool = False):
         """FLLIPER_DEBUG_MOE_POOL_EAGER_DEVICE_CHECK: the same forward on the
         plain host plan (H107 off -- every spill expert fetched fresh from
         the host store, no device table trusted) is the reference. MATCH
         (bit-identical) or MATCH~fp (fp rounding, e.g. a multi-wave
         reference) logs; anything else stops the rank by name. Returns the
-        device result (a copy: the reference's apply may reuse buffers)."""
+        device result (a copy: the reference's apply may reuse buffers).
+
+        ``em`` (S51r, review 18.10.): an EAGER-DEVICE-EM MISMATCH does NOT stop
+        the rank. The reference IS the host plan this forward would have run
+        without EM, so its output is served instead, one ERROR line
+        ``EAGER-DEVICE-EM MISMATCH-FALLBACK`` names the layer and the numbers,
+        and this layer plans every later extend past the graph form on the
+        host (``_pool_eager_device_em`` off for this instance) -- the EM rows
+        are proven wrong there, so no unchecked EM forward follows. A defect
+        report, not a switch: the default stays on, every other layer keeps
+        EM. No collective inside the MoE, so a rank-local fallback moves no
+        collective (R11 note in ``eager_device_em_waves``)."""
         import logging
 
         got = out.hidden_states.clone()
@@ -5585,6 +5596,20 @@ class MoEExpertOffloadCache:
         verdict, max_abs, scale = compare_moe_outputs(got, ref.hidden_states)
         layer_id = getattr(self.layer, "layer_id", "?")
         tokens = int(saved.topk_output.topk_ids.shape[0])
+        if verdict == "MISMATCH" and em:
+            self._pool_eager_device_em = False
+            self._eager_device_em_fallbacks = int(
+                getattr(self, "_eager_device_em_fallbacks", 0)
+            ) + 1
+            logging.getLogger(__name__).error(
+                "EAGER-DEVICE-EM MISMATCH-FALLBACK layer %s: T=%d waves=%d max_abs=%.6g "
+                "scale=%.6g -- the device-planned expert-major extend differs from the "
+                "host plan beyond fp rounding; this extend is served by the host plan "
+                "(the reference) and this layer plans every later extend past the graph "
+                "form on the host. DEFECT, report it (FLLIPER_OPT_MOE_POOL_EAGER_DEVICE_EM)",
+                layer_id, tokens, waves, max_abs, scale,
+            )
+            return ref
         if verdict == "MISMATCH":
             raise RuntimeError(
                 f"EAGER-DEVICE-STEP MISMATCH layer {layer_id}: T={tokens} waves={waves} "
