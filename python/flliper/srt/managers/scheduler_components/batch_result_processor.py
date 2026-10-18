@@ -342,13 +342,20 @@ class SchedulerBatchResultProcessor:
                     # drain its accounting without streaming it.
                     continue
 
+                # MIXED-D / mixed chunk: a row of ``batch.decoding_reqs`` is a RUNNING decode row folded into
+                # this prefill forward as a 1-token extend, not a finished prefill.
+                _is_mixed_tail = bool(
+                    batch.decoding_reqs and req in batch.decoding_reqs
+                )
                 if req.inflight_middle_chunks <= 0:
-                    req.time_stats.set_prefill_finished_time()
-                    # UNIFY S4 (H85 / 27B RC7-X): D's own prefill clock for the
-                    # front's r_D sample (pdflip/prefill_clock.py). A module
-                    # function, so a stand-in processor cannot miss it; a no-op
-                    # off the Weg-2 D group.
-                    _pdflip_prefill_clock.note_prefill_finished(req, self.server_args)
+                    if not _is_mixed_tail:
+                        req.time_stats.set_prefill_finished_time()
+                        # UNIFY S4 (H85 / 27B RC7-X): D's own prefill clock for the
+                        # front's r_D sample (pdflip/prefill_clock.py). A module
+                        # function, so a stand-in processor cannot miss it; a no-op
+                        # off the Weg-2 D group. NOT for a mixed decode tail: it
+                        # would stamp every running decode as a prefill sample.
+                        _pdflip_prefill_clock.note_prefill_finished(req, self.server_args)
 
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)
@@ -422,6 +429,14 @@ class SchedulerBatchResultProcessor:
                     self._maybe_update_reasoning_tokens(req, next_token_id)
 
                     req.update_finish_state()
+                    # A mixed spec tail committed its pending bonus token; advance so the
+                    # next spec prepare_for_decode reserves from the right base (PR #36933).
+                    if (
+                        not req.finished()
+                        and _is_mixed_tail
+                        and not batch.spec_algorithm.is_none()
+                    ):
+                        req.kv_committed_len += 1
                     if req.finished():
                         self._maybe_collect_routed_experts(req)
                         self._maybe_collect_indexer_topk(req)

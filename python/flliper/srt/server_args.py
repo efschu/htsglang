@@ -20455,8 +20455,18 @@ class ServerArgs:
 
         # Check speculative decoding
         if self.speculative_algorithm is not None:
-            assert not self.enable_mixed_chunk, (
-                "enable_mixed_chunk is required for speculative decoding"
+            from flliper.srt.speculative.spec_info import SpeculativeAlgorithm
+
+            # Running requests degrade to a plain 1-token decode inside a
+            # mixed step; only workers with a verified resume path allow it.
+            assert (
+                not self.enable_mixed_chunk
+                or SpeculativeAlgorithm.from_string(
+                    self.speculative_algorithm
+                ).supports_mixed_chunk()
+            ), (
+                "enable_mixed_chunk is not supported with "
+                f"speculative_algorithm={self.speculative_algorithm}"
             )
 
         # Check chunked prefill

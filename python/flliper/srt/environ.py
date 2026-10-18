@@ -2094,6 +2094,12 @@ class Envs:
     # SET SCHEDULER (SOLL v2 section 2): F_halb, halbX = F_halb x X(depth). A request with halbX <= uncached < X is
     # "halb" (collects, R3); below it is "kurz" (D at once, R2).
     FLLIPER_PDFLIP_HALF_X_FRAC = EnvFloat(0.5)
+    # MIXED-D (S32, user 18.10. "mixed chunk fuer kurze D-Prefills wieder an"): on the Weg-2 D group a SHORT prefill batch
+    # (summed uncached u < halbX = F_halb x X (SOLL R2), nothing chunked) is folded together with the running decodes into ONE
+    # MIXED forward instead of halting them; every running spec row degrades to a plain 1-token extend of its pending bonus token
+    # (fLLiper PR #36933 mechanism), drafting resumes the next decode step. Big prefills (R3 set after the timer, R6 rest, any chunk
+    # of a chunked request) are never mixed. New feature -> default ON; 0 = the old halt-the-decodes path, byte for byte.
+    FLLIPER_PDFLIP_MIXED_D_SHORT = EnvBool(True)
     # DECODE-COLLECT D-CHECK (user ~19:12Z: "es wird 7,5 gesammelt, wenn dann
     # gesammelt nicht mehr token anstehen, als X in D prefillen wuerde, dann
     # prefillt er in D die kleine menge ... auch diese zeit muss einstellbar

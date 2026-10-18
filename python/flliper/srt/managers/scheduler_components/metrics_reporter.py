@@ -499,10 +499,15 @@ class RankPrefillLog:
         cached_tokens: int,
         timed: bool,
         graphed: bool = False,
+        mixed: bool = False,
     ) -> None:
         if timed and self.timer is not None and not self.pairing_refused:
+            # S33 review A4 (MIXED-D): a MIXED forward stays in the #691 pairing (its span was timed like every
+            # plain prefill) but is marked; flush() reports it WITHOUT gpu-ms (see there).
             self._pending.append(
-                (new_tokens, cached_tokens, graphed, self.bubble.take_pending())
+                (new_tokens, cached_tokens, graphed, self.bubble.take_pending(), True)
+                if mixed
+                else (new_tokens, cached_tokens, graphed, self.bubble.take_pending())
             )
         else:
             logger.info(
@@ -521,7 +526,7 @@ class RankPrefillLog:
         """
         self._durations.clear()
         while self._pending:
-            new_tokens, cached_tokens, _graphed, _bubble = self._pending.popleft()
+            new_tokens, cached_tokens, *_rest = self._pending.popleft()
             logger.info(
                 "Prefill rank batch, #new-token: %d, #cached-token: %d, #chunks: 1",
                 new_tokens,
@@ -572,6 +577,27 @@ class RankPrefillLog:
             self._refuse_pairing(skew)
             return
         k = min(len(self._pending), len(self._durations))
+        if k == 0:
+            return
+        # S33 review A4 (MIXED-D, fLLiper PR #36933 port): a MIXED forward carries the running decode rows as 1-token
+        # extends. Its gpu-ms is NOT the price of its #new-token (the prefill part only): it feeds the D cost ring
+        # (prefill_clock.note_batch_cost -> the front's X-COST-LINE re-solve of X), the wake-cohort and mini-forward
+        # bounds and the offline x_curves_build -- all of which would read the decode rows' cost as prefill cost and
+        # shrink X. Its pair is taken out of the fold and reported untimed (the untimed line, no gpu-ms), the rest folds.
+        pairs = [(self._pending.popleft(), self._durations.popleft()) for _ in range(k)]
+        for rec, _dur in pairs:
+            if len(rec) > 4 and rec[4]:
+                logger.info(
+                    "Prefill rank batch, #new-token: %d, #cached-token: %d, #chunks: 1",
+                    rec[0],
+                    rec[1],
+                )
+                self._cum_untimed(rec[0], rec[1])
+        pairs = [p for p in pairs if not (len(p[0]) > 4 and p[0][4])]
+        for rec, dur in reversed(pairs):
+            self._pending.appendleft(rec)
+            self._durations.appendleft(dur)
+        k = len(pairs)
         if k == 0:
             return
         new_tokens = cached_tokens = 0
@@ -1296,6 +1322,11 @@ class SchedulerMetricsReporter:
                 and batch.forward_mode.is_plain_prefill()
             ),
             graphed=can_run_cuda_graph,
+            mixed=bool(
+                batch is not None
+                and batch.forward_mode is not None
+                and batch.forward_mode.is_mixed()
+            ),
         )
         self.rank_prefill_log.flush()
         # #1241: the decode half is drained at the same three sites the

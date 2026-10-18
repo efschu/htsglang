@@ -251,6 +251,7 @@ from flliper.srt.pdflip.d_lead_probe import build_d_lead_probe  # D-LEAD-MS-1007
 from flliper.srt.pdflip.vision_verdict import PdFlipVisionVerdict  # H125f vision verdict on the chain
 from flliper.srt.pdflip.pp_loadback_verdict import PdFlipPpLoadbackVerdict  # LB-VERDICT-1014 on the chain
 from flliper.srt.pdflip import pp_loadback_verdict as _pdflip_lbv  # LBV-ADMIT (h16h 19:33:48Z)
+from flliper.srt.pdflip import form_a_post_admit as _pdflip_fa_post_admit  # S35: an admit reads CONTINUE on a Form A group
 from flliper.srt.pdflip import extend_trim as _pdflip_extend_trim  # rc12g extend chunk cap
 from flliper.srt.pdflip import d_seat_vram as _pdflip_d_seat_vram  # D-MEM-SCHED stage between wakes
 from flliper.srt.pdflip import d_transient_lend as _pdflip_d_transient_lend  # D-TRANSIENT-LEND
@@ -3512,6 +3513,23 @@ class Scheduler(
             self.chunked_prefill_size is not None
             and self.server_args.enable_mixed_chunk
         )
+        # MIXED-D (S32, user 18.10.): on the Weg-2 D group (tp_prefill_max_tokens = X > 0) the upstream mixed-chunk
+        # path (fLLiper PR #36933, EAGLE ok) is armed by default, but only for SHORT prefill batches (the gate in
+        # _get_new_batch_prefill_raw, pdflip/mixed_d_short.py). FLLIPER_PDFLIP_MIXED_D_SHORT=0 = off.
+        from flliper.srt.pdflip import mixed_d_short as _mds
+
+        self._mixed_d_short = bool(
+            self.chunked_prefill_size is not None
+            and _mds.enabled()
+            and int(getattr(self.server_args, "tp_prefill_max_tokens", 0) or 0) > 0
+            and (self.spec_algorithm.is_none() or self.spec_algorithm.supports_mixed_chunk())
+            and not any(
+                getattr(self.server_args, n, False)
+                for n in ("enable_kv_session_offload", "weightless_kv_fastlane")
+            )
+        )
+        if self._mixed_d_short:
+            self.is_mixed_chunk = True
 
         # --p-chunk-policy (pdflip/p_chunk_policy.py, 25.09.): the P group's
         # per-request chunk plan. None unless the launcher handed this rank
@@ -18021,6 +18039,14 @@ class Scheduler(
                 consume_seam_grant(req)
 
             _hol_go_on = False
+            # S35 (SOLL R11, raenge-nie-uneins; rc9 09:51:22Z pdflip-29-190): an ADMITTED request's budget_state() is
+            # this rank's own pool on a Form A group -- NO_TOKEN on the host alone made it take the D-HOL head and enter
+            # PW-R's group MIN by itself. The admit was the group's verdict; it reads CONTINUE on every rank there.
+            res = _pdflip_fa_post_admit.uniform_result(
+                res,
+                bool(adder.can_run_list) and req is adder.can_run_list[-1],
+                getattr(adder, "form_a_admission_follow", None),
+            )
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
                     # SP (partial park, KV trigger; pdflip/d_park_runtime.displace_for_age):
@@ -18551,6 +18577,9 @@ class Scheduler(
         # the final chunk of a resumed one look like a middle chunk). Every other continuation is counted exactly as before.
         if self.chunked_req is not None and not _lanes_p.held_without_seat(self.chunked_req, can_run_list):
             self.chunked_req.inflight_middle_chunks += 1
+            # MIXED-D: lifetime-sticky. A request that has ever been chunked is a BIG prefill; its last
+            # chunk (small by construction) must not read as a short one (R6 rest stays unmixed).
+            self.chunked_req._mixed_d_was_chunked = True
 
         # fnFL2 H42: this pass's anchor bodies join the carried tails; every
         # tail IN this batch takes its middle-chunk increment (no output until
@@ -18697,13 +18726,22 @@ class Scheduler(
         )
 
         # Mixed-style chunked prefill
-        if (
-            self.is_mixed_chunk
-            and not running_batch.is_empty()
-            and not (new_batch.return_logprob or running_batch.return_logprob)
-            # mix_with_running cats input_ids but not input_embeds — shapes would mismatch
-            and new_batch.input_embeds is None
-        ):
+        # MIXED-D (S32): on D the same machinery runs for SHORT prefill batches only; the verdict is
+        # the group MIN (R11), computed whenever the replicated precondition holds so every rank
+        # enters the collective on the same pass.
+        _mix_local_ok = not (
+            new_batch.return_logprob or running_batch.return_logprob
+        ) and new_batch.input_embeds is None
+        if self._mixed_d_short:
+            # D short mode: the verdict is collective, entered on the replicated precondition
+            _do_mix = not running_batch.is_empty() and self._mixed_d_agreed(
+                new_batch, running_batch, _mix_local_ok
+            )
+        else:
+            _do_mix = (
+                self.is_mixed_chunk and not running_batch.is_empty() and _mix_local_ok
+            )
+        if _do_mix:
             # TODO (lianmin): support return_logprob + mixed chunked prefill
             running_batch.filter_batch()
             if not running_batch.is_empty():
@@ -18712,6 +18750,18 @@ class Scheduler(
                 running_batch.prepare_for_decode()
                 new_batch.mix_with_running(running_batch)
                 new_batch.decoding_reqs = running_batch.reqs
+                if not self.enable_overlap and not self.spec_algorithm.is_none():
+                    # Non-overlap spec never writes the relay; stash the
+                    # tails' pending tokens for the mixed input resolve.
+                    # (fLLiper PR #36933 1:1; S33 review A3.)
+                    last_tokens = torch.tensor(
+                        [r.output_ids[-1] for r in running_batch.reqs],
+                        dtype=torch.int64,
+                        device=self.device,
+                    )
+                    self.future_map.stash_bonus_tokens(
+                        running_batch.req_pool_indices, last_tokens
+                    )
             running_batch = ScheduleBatch(
                 reqs=[], batch_is_full=running_batch.batch_is_full
             )
@@ -18719,6 +18769,26 @@ class Scheduler(
             new_batch.decoding_reqs = None
 
         return new_batch, running_batch
+
+    def _mixed_d_agreed(self, new_batch, running_batch, local_ok: bool) -> bool:
+        """MIXED-D gate (S32): the short verdict, MIN-reduced over the TP cpu group (R11: no rank-local batch shape).
+
+        S33 review A1/A2: halbX is the FRONT's (``weg2_front_halfx``, min over the batch, R2a) -- the riegel only says
+        "group D"; a batch with an E2 END-state hand-off (no target forward) is never mixed."""
+        from flliper.srt.pdflip import mixed_d_short as _mds
+
+        x = int(_pdflip_store_short_tail_x(self))
+        u = int(getattr(new_batch, "extend_num_tokens", 0) or 0)
+        chunked = self.chunked_req is not None or any(
+            getattr(r, "_mixed_d_was_chunked", False) for r in new_batch.reqs
+        )
+        hx = _mds.batch_half_x(new_batch.reqs)
+        no_fwd = _mds.end_state_handoff(new_batch.reqs)
+        mine = local_ok and _mds.short_gate(u, x, hx, chunked, no_fwd)
+        agreed = bool(self._pdflip_group_min_flags([mine])[0])
+        if agreed:
+            _mds.note_mixed(u, len(running_batch.reqs), hx, x)
+        return agreed
 
     def _can_schedule_lora_req(
         self, req: Req, running_loras: set[Optional[str]]

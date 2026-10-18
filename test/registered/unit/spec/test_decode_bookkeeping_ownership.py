@@ -63,6 +63,13 @@ _OWNER_SITES = {
     (*_EAGLE_DECODE, "kv_allocated_len"): 1,
     (*_RESOLVE, "kv_committed_len"): 1,
     (*_RESOLVE, "spec_verify_ct"): 1,
+    # Mixed-chunk spec tails: the mixed prefill step commits the pending
+    # bonus token, advancing the watermark by exactly that one token.
+    (
+        "managers/scheduler_components/batch_result_processor.py",
+        "SchedulerBatchResultProcessor.process_batch_result_prefill",
+        "kv_committed_len",
+    ): 1,
     (
         "speculative/dflash_info_v2.py",
         "DFlashDraftInputV2.prepare_for_decode",

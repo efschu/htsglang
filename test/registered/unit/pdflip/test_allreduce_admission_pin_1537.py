@@ -210,6 +210,10 @@ EXPECTED_HELPER_REFS = {
     # (its first NO_TOKEN on group D -- the Form A gather's verdict, the same rid on
     # every rank) is still in the replicated waiting queue; one MIN per pass.
     ("managers/scheduler.py", "Scheduler._get_new_batch_prefill_raw"): {"_pdflip_group_min_flags"},
+    # MIXED-D (S32, 18.10.): the short verdict, one MIN per prefill pass. Entry = `self._mixed_d_short` (boot-static, the same
+    # server_args on every D rank) and `not running_batch.is_empty()` (the replicated running batch), evaluated after the
+    # replicated new_batch exists; the rank-local blockers (logprob/embeds, chunk stamp) ride in the VOTE, never in the entry.
+    ("managers/scheduler.py", "Scheduler._mixed_d_agreed"): {"_pdflip_group_min_flags"},
     ("pdflip/d_park_runtime.py", "park_tick"): {"_pdflip_group_min_flags"},
     ("pdflip/d_park_runtime.py", "_capacity_requeue"): {"_pdflip_group_min_flags"},
     ("pdflip/d_park_runtime.py", "_lift_holds_when_idle"): {"_pdflip_group_min_flags"},
@@ -438,7 +442,12 @@ def test_p5_the_x_refusal_vote_is_entered_only_behind_the_replicated_preconditio
     assert [g for _, g in sites] == [
         ["If:any((_pdflip_rvp.capacity_park_precondition(r) for r in refused))"]
     ], sites
-    # and the precondition reads only request fields + two process-level switches
+    # and the precondition reads only request fields + two process-level switches.
+    # "priority" (S33, 18.10.): LANES HOTFIX 2 1014 (bc35462240, git-bisect first bad commit of this pin) made a
+    # raised-lane request (req.priority > 0) skip the capacity park. The field is REPLICATED: it is the request's own
+    # value, stamped by the front on every leg (lanes hotfix a4856f6e5d) and broadcast with the tokenized request to
+    # every TP rank, or the deterministic server-args default of Scheduler._set_or_validate_priority. No rank-local
+    # term enters the vote's entry, so the RAENGE-NIE-UNEINS argument of this pin stands; the pin was stale, not the code.
     rvp = _tree(SRT / "pdflip" / "resume_via_p.py")
     pre = _find_fn(rvp, "capacity_park_precondition")
     doc = pre.body[0].value if isinstance(pre.body[0], ast.Expr) else None

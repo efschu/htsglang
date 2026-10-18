@@ -134,6 +134,15 @@ class SpeculativeAlgorithm(Enum):
     def is_frozen_kv_mtp(self) -> bool:
         return self == SpeculativeAlgorithm.FROZEN_KV_MTP
 
+    def supports_mixed_chunk(self) -> bool:
+        """Whether mixed chunk prefill may stay enabled with this algorithm.
+
+        Upstream PR #36933 (EAGLE, EAGLE3, DFLASH, DSPARK). This fork admits the EAGLE family only: the
+        DFLASH / DSPARK workers here diverge from upstream's and are not exercised; ngram cannot join as
+        is: its overlap relay skips output_tokens_buf, which the mixed input resolve reads.
+        """
+        return self in (SpeculativeAlgorithm.EAGLE, SpeculativeAlgorithm.EAGLE3)
+
     def is_dflash(self) -> bool:
         return self == SpeculativeAlgorithm.DFLASH
 
