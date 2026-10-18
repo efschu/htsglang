@@ -6,8 +6,8 @@ MEASURED (fLLiper rc11 49f9c2ea4d, boot ..._dauer10181332_49f9c2ea4d_1018_133242
 delivered_before=0 delivered_after_repair=0 reported_evictable=467328 on_frontier=448960``. Each frontier leaf:
 ``#1421 BACKUP-REFUSED why=arena_claim node=241 tokens=178816`` (the full arena) + ``UD-REFUSED
 why=not_local_pp_floor node=241 children=1`` -- and ``L3-DROP FORMA`` 0x in the boot: node 241 is the load-back of
-pdflip-12-40 (its 2794 pages on L3: ``#248 PARK-DEMOTE l3_pages=2794 complete=1``, the wake read marked it
-``l3_present``), its child the host-only wake-read span of the next turn (pdflip-12-41), and it carried a device anchor
+rid 12-40 (its 2794 pages on L3: ``#248 PARK-DEMOTE l3_pages=2794 complete=1``, the wake read marked it
+``l3_present``), its child the host-only wake-read span of the next turn (rid 12-41), and it carried a device anchor
 (``#924D station=donate node=241``). ``_weg2_l3_drop_forma`` refused every such leaf.
 
 THE SHAPE HERE ("Device voll, 0 running, Arena voll, Seiten ohne Arena-Kopie, Load-Back kommt"): the REAL
