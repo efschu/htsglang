@@ -933,3 +933,34 @@ def test_s28_min_semantics_handoff_under_x_store_over_x_stays_on_d(monkeypatch):
         HS.MODULE = old
         HS.reset_module_cache()
         sys.modules.pop("_fake_hp_min", None)
+
+
+# ------------------------------------------------------------------------------- S45 (18.10.): R4 holds for priority > 0
+
+def test_s45_r4_big_request_with_priority_waits_t_halb_while_d_decodes(monkeypatch, caplog):
+    """SOLL v2 R4: a big request while D decodes waits T_halb for company -- for EVERY priority. rc12 17:38-17:41
+    flipped priority > 0 big requests at once (waited_s=0.0, why "R4 T_halb over"): PRIO-AS-AGE's urgent shortcut
+    was a planner derivation (memory prio-als-alters-reihenfolge-1014, "Zusatz"), not the user's word; priority is
+    an ORDER key only."""
+    _on(monkeypatch)
+    f = _fx()
+    big = _pending("big", 9000, time.time())
+    big.lane = 1
+    f.queue = [big]
+    with caplog.at_level(logging.INFO):
+        assert f._decode_collect(time.time()) == "hold"
+    assert not any("verdict=FLIP_P" in m for m in _verdicts(caplog))
+    # the timer still ends the wait as for priority 0
+    f2 = _fx()
+    big2 = _pending("big2", 9000, time.time() - 5.0)
+    big2.lane = 1
+    f2.queue = [big2]
+    assert f2._decode_collect(time.time()) == "P"
+
+
+def test_s45_priority_alone_satisfies_no_flip_economics_latch():
+    """The flip-economics latch must not take priority > 0 as a flip reason on its own (R4/R7)."""
+    import inspect
+    from flliper.srt.pdflip import front as front_mod
+    src = inspect.getsource(front_mod.Front)
+    assert "or prio_urgent is not None)" not in src

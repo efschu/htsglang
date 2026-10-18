@@ -362,8 +362,9 @@ def test_front_sorts_keep_t_arrive_and_the_waiter_stamps():
     assert sorted(clocks) == [NOW - 30, NOW - 1]                  # the stamps are the real arrivals
 
 
-def test_set_wait_opens_at_the_members_arrival_and_a_p1_long_ends_it_now(caplog, monkeypatch):
-    # SET SCHEDULER (SOLL v2): the wait is the set's T_halb; PRIO-AS-AGE's urgency (priority > 0 needing P) ends it at once
+def test_set_wait_opens_at_the_members_arrival_and_a_p1_long_waits_t_halb_too(caplog, monkeypatch):
+    # SET SCHEDULER (SOLL v2 R4): the wait is the set's T_halb at EVERY priority (S45 18.10.: the old "priority > 0
+    # needing P ends it at once" was a planner derivation, not the user's word)
     monkeypatch.setenv("FLLIPER_PDFLIP_HALF_FLIP_S", "4.5")
     caplog.set_level(logging.INFO, logger="pdflip.front")
 
@@ -380,11 +381,11 @@ def test_set_wait_opens_at_the_members_arrival_and_a_p1_long_ends_it_now(caplog,
             old_short = _p(f, "s0", 0, now - 3, est_uncached=10)
             big = _p(f, "L", lane_of_long, now - 1, est_uncached=3 * X, est_prompt=3 * X)
             route = f._decode_collect(now, [old_short, big])
-            return route, st.get("t_open"), f.counters["decode_collect_prio_release"]
+            return route, st.get("t_open"), f.counters["decode_collect_prio_seen"]
 
     route, t_open, n = asyncio.run(main(1))
-    assert route == "P" and n == 1
-    assert any(m.startswith(PA.MARK_URGENT) and "site=decode-collect" in m for m in [r.getMessage() for r in caplog.records])
+    assert route == "hold" and n == 1                             # seen and logged, but it waits (R4)
+    assert t_open == NOW - 1
     route0, t_open0, n0 = asyncio.run(main(0))
     assert route0 == "hold" and n0 == 0
     assert t_open0 == NOW - 1                                     # the set's clock: its first member's arrival
@@ -392,14 +393,15 @@ def test_set_wait_opens_at_the_members_arrival_and_a_p1_long_ends_it_now(caplog,
         assert asyncio.run(main(1))[0] == "hold"
 
 
-def test_flip_economics_latch_is_satisfied_by_a_p1_that_needs_p_and_not_by_a_p0():
+def test_flip_economics_latch_is_satisfied_neither_by_a_p1_nor_by_a_p0():
+    # S45 (SOLL v2 R4/R7): priority orders, it is no flip reason of its own
     async def main(lane):
         f = _front("D")
         f.flip_min_work_tokens = 10 ** 9                          # far above the queue: the latch would hold
         f.queue.append(_p(f, "L", lane, NOW - 1, est_uncached=2 * X, est_prompt=2 * X))
         return f._flip_economics_ok(False)
 
-    assert asyncio.run(main(1)) is True
+    assert asyncio.run(main(1)) is False
     assert asyncio.run(main(0)) is False
     with _mode(False):
         assert asyncio.run(main(1)) is False
