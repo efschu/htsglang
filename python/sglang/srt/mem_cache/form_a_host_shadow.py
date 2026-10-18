@@ -169,6 +169,8 @@ class _State:
         self.k21_expect: set = set()
         # S20 review A1: READ-ROOM-STATE windows open on this worker, (hash, depth) -> [t_open, passes]
         self.rr_open: Dict[Tuple[str, int], list] = {}
+        # S22: this worker's device-evicted content keys (published next to the arena for TP0's spill choice)
+        self.dev_evicted: set = set()
         # named stop found outside a consume (own-ack time); raised at the end of the next consume
         self.k21_stop_msg: Optional[str] = None
         # number of broadcasts consumed on this rank
@@ -569,6 +571,120 @@ def take_spill_request(arena: Any) -> int:
         os.close(fd)
 
 
+# ------------------------- S22 (R12 SPILL-DIVERGED, 18.10.): which nodes a worker CAN follow a spill on
+#: NF h16v4b 01:40:12 TP1/TP2 ``R12 SPILL-DIVERGED seq=46 node=90 out=unreconcilable``. THE ROOT: the device life
+#: of a node is rank-local (the D ranks' device pools differ: TP0 5090, the workers 3080; every rank peels its own
+#: LRU), the host life is TP0's. TP0 spilled node 90 -- a node that was device-resident ON TP0 -- and its host rows
+#: went; on both workers node 90 had already left the device (an interior node whose KV exists only as its host
+#: rows), so the worker's reconcile has no state to move to: dropping the host copy of an interior device-evicted
+#: node would leave a hollow node the tree cannot hold (``unreconcilable``), dropping a device-evicted LEAF deletes
+#: a node TP0 keeps (``deleted``). TP0 chose a candidate no rank could follow on. R11: TP0 decides alone, so it must
+#: decide on what the workers can apply -- a worker publishes the content keys of its device-evicted nodes next to
+#: the arena (host bookkeeping, no collective, like the W3 need above) and TP0 spills only nodes that are no worker's
+#: device-evicted node. The publish happens AT the eviction (``worker_device_evicted``, from
+#: ``_evict_to_host``) -- every device peel precedes the forward's TP sync of its loop, TP0's next decision follows
+#: it -- and is re-derived from the tree at every consume (a node that came back is released again).
+DEV_SUFFIX = ".w3dev"
+
+
+def _dev_dir_prefix(arena: Any) -> Optional[str]:
+    path = getattr(arena, "path", None)
+    return (str(path) + DEV_SUFFIX + ".") if path else None
+
+
+def _tree_arena(tree: Any) -> Any:
+    try:
+        return getattr(tree._weg2_direct_pool(), "arena", None)
+    except Exception:  # noqa: BLE001 - a tree without a direct pool has no arena to publish next to
+        return None
+
+
+def _dev_publish(tree: Any) -> bool:
+    """A worker: write this process's device-evicted key set (atomic replace). False = nothing to write to."""
+    prefix = _dev_dir_prefix(_tree_arena(tree))
+    if prefix is None:
+        return False
+    import json
+
+    path = prefix + str(os.getpid())
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(sorted([k[0], k[1]] for k in _S.dev_evicted), f)
+        os.replace(tmp, path)
+    except OSError as exc:
+        if _note("dev_publish_error", 16):
+            logger.warning("R12 SPILL-APPLICABILITY publish failed: %r (TP0 may spill a node this worker has "
+                           "device-evicted; it will name SPILL-DIVERGED)", exc)
+        return False
+    return True
+
+
+def worker_device_evicted(tree: Any, node: Any) -> None:
+    """A worker's device peel took ``node``'s KV off the device (``_evict_to_host``): TP0 must not spill it."""
+    if role() != "worker":
+        return
+    k = node_key(node)
+    if k is None:
+        return
+    register_tree(tree)
+    if k not in _S.dev_evicted:
+        _S.dev_evicted.add(k)
+        _dev_publish(tree)
+
+
+def _dev_refresh(tree: Any) -> None:
+    """A worker, every consume: the key set re-derived from the tree (a node back on the device, or gone, leaves
+    the set; an eviction the hook missed enters it)."""
+    if role() != "worker":
+        return
+    base = int(_base_ct())
+    cur = set()
+    stack = list(tree.root_node.children.values())
+    while stack:
+        n = stack.pop()
+        stack.extend(n.children.values())
+        if n.component_data[base].value is None:
+            k = node_key(n)
+            if k is not None:
+                cur.add(k)
+    if cur != _S.dev_evicted:
+        _S.dev_evicted = cur
+        _dev_publish(tree)
+
+
+def worker_evicted_keys(tree: Any) -> set:
+    """TP0: the union of every live worker's published device-evicted keys (a dead process's file is ignored).
+    A file that cannot be read is named, never silent."""
+    prefix = _dev_dir_prefix(_tree_arena(tree))
+    out: set = set()
+    if prefix is None:
+        return out
+    import glob
+    import json
+
+    for path in glob.glob(prefix + "*"):
+        tail = path[len(prefix):]
+        if not tail.isdigit():
+            continue   # a .tmp of a publish in flight
+        try:
+            os.kill(int(tail), 0)
+        except ProcessLookupError:
+            continue
+        except OSError:
+            pass
+        try:
+            with open(path) as f:
+                for h, d in json.load(f):
+                    out.add((str(h), int(d)))
+        except (OSError, ValueError) as exc:
+            if _note("dev_read_error", 16):
+                logger.warning("R12 SPILL-APPLICABILITY read of %s failed: %r (TP0 spills without that "
+                               "worker's device state; a node it has evicted is named SPILL-DIVERGED)",
+                               path, exc)
+    return out
+
+
 def await_complete(tree: Any, node: Any, fallback_transit: bool, l3_ok: bool = False) -> bool:
     """#239 S4b part 4, TP0 under the cut: its ack came while the page was not
     complete in the arena (an owner's write still in flight). Wait for the
@@ -672,6 +788,13 @@ def consume(recv_reqs: Optional[List], tree: Any = None) -> Optional[List]:
     """Every rank, right after the broadcast: take the verdicts out of the
     list and apply them before any request of this pass is processed."""
     _S.handover_n += 1
+    t = tree or _S.tree
+    if t is not None:
+        try:
+            _dev_refresh(t)
+        except Exception as exc:  # noqa: BLE001 - the applicability publish never breaks the broadcast
+            if _note("dev_refresh_error", 16):
+                logger.warning("R12 SPILL-APPLICABILITY refresh failed: %r", exc)
     return _consume(recv_reqs, tree)
 
 
@@ -736,6 +859,9 @@ def on_tree_reset(tree: Any) -> None:
     _S.k21_confirmed = {}
     _S.k21_expect = set()
     _S.rr_open = {}
+    if _S.dev_evicted:
+        _S.dev_evicted = set()
+        _dev_publish(tree)   # the nodes are gone: no key may block a re-inserted prefix
     _S.k21_stop_msg = None
     _S.rebind_wait = {}
 

@@ -4437,6 +4437,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
         self._cascade_evict(node, trigger, tracker)
         self._record_remove_event(node, medium=StorageMedium.GPU)
+        # S22 (R12 SPILL-DIVERGED): the device life of a node is rank-local; a Form A worker tells TP0 which nodes
+        # it took off the device, because TP0 may spill (drop the host copy of) only a node every worker can follow
+        _r12.worker_device_evicted(self, node)
 
         # after device eviction, insert aux components into host LRU.
         self._for_each_component_lru(
@@ -6357,6 +6360,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             skip.add(id(n))   # the claimer's own chain: its parent rule reads backed/l3_present
             n = n.parent
         cands = []
+        # S22 (R12 SPILL-DIVERGED, NF h16v4b 01:40:12 node=90): TP0 spills only a node every worker can follow on --
+        # one a worker has device-evicted has no state to move to there (see form_a_host_shadow, DEV_SUFFIX)
+        wev = _r12.worker_evicted_keys(self) if _role == "host" else ()
+        kept_wev = kept_unkeyed = 0
         keep_payable = UnifiedRadixCache._w3_keep_payable_state(self)
         kept_payable = 0
         told_head = UnifiedRadixCache._told_head_ids(self)
@@ -6378,6 +6385,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 # the host -- one is not (host-locked / device-locked): the spill would pin 206848 tokens
                 kept_payable += 1
                 continue
+            if _role == "host":
+                _nk = _r12.node_key(node)
+                if _nk is None:
+                    kept_unkeyed += 1   # no R12 verdict can name it: TP0 alone would change
+                    continue
+                if _nk in wev:
+                    kept_wev += 1       # a worker has it off the device: TP0's host drop is not applicable there
+                    continue
             if node.id in self.ongoing_write_through:
                 continue   # pending write: the slots are not COMPLETE yet
             if any(int(getattr(c, "host_lock_ref", 0) or 0) > 0 for c in node.component_data):
@@ -6497,13 +6512,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             logger.info(
                 "W3-ARENA SPILL n=%d need=%d released_pages=%d nodes=%d candidates=%d "
                 "l3=on_disk:%d,written:%d lost=%d unpaired=%d incomplete=%d ref_free=%s kept_payable=%d kept_told=%d "
+                "kept_worker_evicted=%d kept_unkeyed=%d "
                 "(incomplete = nodes kept because a slot is not COMPLETE yet, no loss; a finished page leaves L2 only with "
                 "its L3 copy; the node stays on the device, l3_present; ref_free = of the slots "
                 "this spill let go, those NO rank references any more -- the clock takes them; "
                 "group-equal order: fewest peer references first, then slot id; kept_payable = device nodes "
                 "not spilled because their drop could not clear a host-only child now)",
                 k, int(need_pages), released, spilled, len(cands), secured, written, lost, unpaired, incomplete,
-                self._w3_spill_ref_free(pool, released_slots), kept_payable, kept_told)
+                self._w3_spill_ref_free(pool, released_slots), kept_payable, kept_told, kept_wev, kept_unkeyed)
         if released_out is not None:
             released_out.extend(released_slots)
         return released
