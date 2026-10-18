@@ -17,9 +17,13 @@ from sglang.srt.mem_cache.unified_cache_components.full_component import FullCom
 from sglang.srt.mem_cache.unified_radix_cache import BASE_COMPONENT_TYPE, UnifiedRadixCache  # noqa: E402
 
 
+class _NS(types.SimpleNamespace):
+    __hash__ = object.__hash__
+
+
 def _node(h, depth, evicted=True, children=None, host=None, nid=1):
     root = types.SimpleNamespace(parent=None, key=[], children={})
-    n = types.SimpleNamespace(
+    n = _NS(
         id=nid, parent=root, key=list(range(depth)), hash_value=[h], evicted=evicted,
         children=children or {}, component_data={BASE_COMPONENT_TYPE: types.SimpleNamespace(host_value=host)})
     return n
