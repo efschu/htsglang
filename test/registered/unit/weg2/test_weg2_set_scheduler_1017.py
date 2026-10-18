@@ -742,7 +742,7 @@ def test_s28_lost_handoff_priced_on_the_store_stays_on_d(monkeypatch, caplog):
         f._kick_controller = lambda *a: None
         with caplog.at_level(logging.INFO, logger="weg2.front"):
             assert f._hl_check(p, "sweep") is False
-        assert p.leg1_done is True and p.handoff_lost_reroutes == 0 and f.queue == []
+        assert p.leg1_done is True and p.handoff_lost_reroutes == 0 and not f.queue
         assert f.counters["handoff_lost_store_priced"] == 1 and f.counters["handoff_lost_reroutes"] == 0
         assert any("HANDOFF-LOST-STORE-PRICE" in r.getMessage() for r in caplog.records)
         # the store holds nothing: the hand-off's own price (52002 > X) stands -> fresh P (R4 path unchanged)
