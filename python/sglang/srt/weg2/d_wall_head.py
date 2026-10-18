@@ -58,7 +58,34 @@ def wall_unservable(*, tree: Any, available: int, need: int) -> bool:
 
     if tree is None or not backup_wall_up(tree):
         return False
-    return int(need) > int(available) + _payable(tree)
+    if int(need) <= int(available) + _payable(tree):
+        return False
+    # S41 (review S39): PW-R runs after the pass's admission -- between the peel that QUEUED store-backed leaves for
+    # TP0's next broadcast (weg2.forma_l3_subtree) and their drop. A head that drop makes room for is not unservable:
+    # TP0's half says False, the group MIN keeps the head on D on every rank. The queue empties at the next broadcast
+    # (dropped, or KEPT by name after MAX_PASSES); PW-F (replicated pass count) stays the named end either way.
+    try:
+        from sglang.srt.weg2 import forma_l3_subtree as _s39
+
+        pending = _s39.room_pending(tree)
+    except Exception:  # noqa: BLE001 -- no S39 reading: PW-R decides as before
+        pending = 0
+    if pending > 0:
+        _held_note(need, available, pending)
+        return False
+    return True
+
+
+_HELD = {"n": 0}
+
+
+def _held_note(need: int, available: int, pending: int) -> None:
+    _HELD["n"] += 1
+    n = _HELD["n"]
+    if n <= 8 or (n & (n - 1)) == 0:
+        logger.info("WEG2 D-WALL-HEAD HELD need_rows=%d available=%d s39_pending=%d (n=%d): TP0 drops store-backed "
+                    "leaves at its next broadcast -- the head waits for that room, PW-R does not answer W50 this "
+                    "pass", int(need), int(available), int(pending), n)
 
 
 def pick_unservable_head(

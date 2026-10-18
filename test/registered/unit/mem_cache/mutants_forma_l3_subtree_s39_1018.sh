@@ -47,7 +47,7 @@ F[M4]=$S; OLD[M4]='    if held:
         return True, "held"'; NEW[M4]='    if True:
         return True, "held"'
 F[M5]=$S; OLD[M5]='            swhy = _secure_child_anchors(t, order, budget)'; NEW[M5]='            swhy = None'
-F[K1]=$S; OLD[K1]='                stuck = next((d for d in order if not d.children and r12.node_key(d) in nd), None) if nd else None'; NEW[K1]='                stuck = None'
+F[K1]=$S; OLD[K1]='                              if (not d.children and r12.node_key(d) in nd) or r12.node_key(d) in dv),'; NEW[K1]='                              if r12.node_key(d) in dv),'
 F[R1]=$SRT/mem_cache/unified_radix_cache.py; OLD[R1]='            _s39.note_refused(self, node, "children" if node.children else "device_anchor")
             return False'; NEW[R1]='            _o, _w = _s39.subtree(self, node, tp0=False)
             if _o is not None and not anchor_dev:
