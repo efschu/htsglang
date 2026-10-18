@@ -37945,7 +37945,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4849,
+    "line": 4858,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -38263,7 +38263,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4848,
+    "line": 4857,
     "tree": "nf"
    },
    "status": "harvested",
@@ -43841,8 +43841,8 @@
    "id": "FLLIPER_HICACHE_L3_EVICT_FILE_LOG",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/storage/file/lru_file_evictor.py:2168",
-    "mem_cache/storage/file/lru_file_evictor.py:2202"
+    "mem_cache/storage/file/lru_file_evictor.py:2207",
+    "mem_cache/storage/file/lru_file_evictor.py:2241"
    ],
    "level": "expert",
    "name": "FLLIPER_HICACHE_L3_EVICT_FILE_LOG",
@@ -43851,7 +43851,7 @@
    "source": {
     "file": "mem_cache/storage/file/lru_file_evictor.py",
     "kind": "os.environ",
-    "line": 2168,
+    "line": 2207,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -43892,6 +43892,62 @@
     "nf"
    ],
    "type": "os.environ"
+  },
+  "FLLIPER_HICACHE_L3_JOURNAL_TOUCH": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "True",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "L3-READ-RECENCY-1014 (NF h13, D.log 14:22:55 TP0 'HiCacheFile EVICTION-BG reclaimed 7546953728 B'): the storage owner rebuilds its LRU from snapshot + journal lines (C/E: write times) and, since the 28.09. journal index, never walks st_mtime again -- so a page the SIBLING group only READS (P's leg-1 store read of a prefix D serves from its device; utime lands on the inode only) stays at its write time and is the first victim. On: every read hit also journals a ``T`` (touch) line, at most one per page and writer per FLLIPER_HICACHE_L3_JOURNAL_TOUCH_S, and the owner's wake / attach move a touched page to MRU. Off: byte-identical old journal (R/C/A/E only).",
+   "id": "FLLIPER_HICACHE_L3_JOURNAL_TOUCH",
+   "kind": "env",
+   "level": "expert",
+   "name": "FLLIPER_HICACHE_L3_JOURNAL_TOUCH",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 3341,
+    "tree": "nf"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "EnvBool"
+  },
+  "FLLIPER_HICACHE_L3_JOURNAL_TOUCH_S": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "30.0",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "",
+   "id": "FLLIPER_HICACHE_L3_JOURNAL_TOUCH_S",
+   "kind": "env",
+   "level": "expert",
+   "name": "FLLIPER_HICACHE_L3_JOURNAL_TOUCH_S",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 3342,
+    "tree": "nf"
+   },
+   "status": "unexplained",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "EnvFloat"
   },
   "FLLIPER_HICACHE_L3_READ_THREADS": {
    "bare": false,
@@ -52220,7 +52276,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 3759,
+    "line": 3768,
     "tree": "nf"
    },
    "status": "harvested",
@@ -52248,7 +52304,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 3770,
+    "line": 3779,
     "tree": "nf"
    },
    "status": "harvested",
@@ -60628,7 +60684,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 3884
+      "line": 3893
      }
     }
    },
@@ -61018,7 +61074,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4556
+      "line": 4565
      }
     }
    },
@@ -61995,7 +62051,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4536
+      "line": 4545
      }
     }
    },
@@ -65571,7 +65627,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4656
+      "line": 4665
      }
     }
    },
@@ -68668,7 +68724,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4465
+      "line": 4474
      }
     }
    },
@@ -77560,7 +77616,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4643
+      "line": 4652
      }
     }
    },
@@ -89316,28 +89372,28 @@
  "schema": "flliper.catalog/1",
  "stats": {
   "curated": 125,
-  "entries": 2815,
-  "envs": 1937,
+  "entries": 2817,
+  "envs": 1939,
   "explained": 310,
   "flags": 863,
-  "harvested": 1730,
+  "harvested": 1731,
   "trees": {
    "abweichung": 50,
    "beide": 2463,
    "nur_27b": 180,
-   "nur_nf": 154
+   "nur_nf": 156
   },
-  "unexplained": 650
+  "unexplained": 651
  },
- "tree_rev": "27b=0798c91fcd+nf=8f38972d4e",
+ "tree_rev": "27b=0798c91fcd+nf=b42b440e87",
  "trees": {
   "27b": {
    "entries": 2643,
    "rev": "0798c91fcd"
   },
   "nf": {
-   "entries": 2617,
-   "rev": "8f38972d4e"
+   "entries": 2619,
+   "rev": "b42b440e87"
   }
  },
  "warnungen": []
