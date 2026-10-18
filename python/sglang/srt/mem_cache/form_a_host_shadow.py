@@ -694,6 +694,15 @@ def _read_worker_sets(tree: Any) -> Tuple[set, set]:
     return ev, nd
 
 
+def kept_note(path: str, n: int = 1) -> None:
+    """A TP0 drop the workers could not follow was NOT taken (S22): counted per path, named at the usual cadence."""
+    _S.counts["kept_total_" + path] = _S.counts.get("kept_total_" + path, 0) + int(n)
+    k = _note("kept_" + path, 64)
+    if k:
+        logger.info("R12 SPILL-APPLICABILITY kept path=%s (n=%d, total=%d): TP0 left the drop alone -- a worker "
+                    "cannot follow it", path, k, _S.counts["kept_total_" + path])
+
+
 def worker_evicted_keys(tree: Any) -> set:
     """TP0: the union of every live worker's device-evicted keys -- TP0 must not spill (drop the host copy of) a
     device-resident node of that key. A dead process's file is ignored, an unreadable one is named."""

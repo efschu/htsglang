@@ -6113,9 +6113,25 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         the slot once no rank references it. Returns the slots dropped (K15c
         review A2: 0 = another process still references them, no slot freed)."""
         comp = self.components[ComponentType.MAMBA]
+        _moot = False
+        if _r12.role() == "host":
+            # S22 (R12 SPILL-DIVERGED class, h16v4b 02:09:44 / 02:18:01 K23 SPILL-DIVERGED after DISPLACE
+            # why=flush_spill): dropping the anchor of a device-evicted, childless node with no KV host DELETES the
+            # node on TP0; the STATE(exists=0) reaches a worker that holds it device-resident or as an interior
+            # node and cannot delete it. TP0 decides on what the workers can apply.
+            _bcd = victim.node.component_data[BASE_COMPONENT_TYPE]
+            if victim.node.evicted and not victim.node.children and _bcd.host_value is None:
+                if getattr(self, "_weg2_flush_spill", False):
+                    # the sleep flush: the tree reset follows on EVERY rank at the end of this flush, no verdict
+                    # outlives it -- no STATE is sent (named once, counted apart from runtime divergences)
+                    _moot = True
+                    _r12.kept_note("anchor_flush_reset_covers", 1)
+                elif _r12.node_key(victim.node) in _r12.worker_nodelete_keys(self):
+                    _r12.kept_note("anchor_worker_cannot_delete", 1)
+                    return 0
         self._evict_component_and_detach_lru(victim.node, comp, target=EvictLayer.HOST, tracker=None)
         self._update_evictable_leaf_sets(victim.node)
-        if _r12.role() == "host":
+        if _r12.role() == "host" and not _moot:
             _r12.record_state(self, victim.node, why="h19_" + why)  # R12: workers drop it too
         dropped = mp.drop_unreferenced(list(victim.slots))
         if why == "share":
@@ -6385,14 +6401,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 # the host -- one is not (host-locked / device-locked): the spill would pin 206848 tokens
                 kept_payable += 1
                 continue
-            if _role == "host":
-                _nk = _r12.node_key(node)
-                if _nk is None:
-                    kept_unkeyed += 1   # no R12 verdict can name it: TP0 alone would change
-                    continue
-                if _nk in wev:
-                    kept_wev += 1       # a worker has it off the device: TP0's host drop is not applicable there
-                    continue
             if node.id in self.ongoing_write_through:
                 continue   # pending write: the slots are not COMPLETE yet
             if any(int(getattr(c, "host_lock_ref", 0) or 0) > 0 for c in node.component_data):
@@ -6405,6 +6413,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 continue   # y5h/park_l3: an aux state lives on the host only -- the node keeps its host life
             if int(hv.min()) < int(getattr(pool, "staging_rows", 0)):
                 continue   # staging rows are not arena slots
+            if _role == "host":
+                _nk = _r12.node_key(node)
+                if _nk is None:
+                    kept_unkeyed += 1   # no R12 verdict can name it: TP0 alone would change
+                    continue
+                if _nk in wev:
+                    kept_wev += 1       # a worker has it off the device: TP0's host drop is not applicable there
+                    continue
             cands.append(node)
         keys = self._w3_spill_keys(pool, cands)
         # L3-COMPLETE review A1: a node with a slot not COMPLETE is treated like a pending write -- not a
@@ -6504,6 +6520,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                                 _seen.add(id(_n))
                                 _r12.record_state(self, _n, why="k23_host_leaf_spill")
         self._w3_spill_cap_used, self._w3_spill_cap_skipped = cap_used, cap_skipped
+        self._w3_spill_kept_wev, self._w3_spill_kept_unkeyed = kept_wev, kept_unkeyed
         k = getattr(self, "_w3_spill_n", 0) + 1
         self._w3_spill_n = k
         if released == 0:
@@ -6591,14 +6608,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             cap = max(0, int(envs.SGLANG_WEG2_W3_FORMA_SPILL_MAX_PAGES.get()))
         except Exception:  # noqa: BLE001 - a hermetic tree without the field: the review's bound
             cap = 128
+        self._w3_spill_kept_wev = self._w3_spill_kept_unkeyed = 0
         self._w3_spill_cap_used = self._w3_spill_cap_skipped = 0   # an early return (backoff) reports 0, not the last call
         t0 = time.monotonic()
         got = self._w3_arena_spill(pool, need, max_secure_pages=cap)
         ms = (time.monotonic() - t0) * 1000.0
         logger.info("W3-ARENA FORMA-REQUEST need=%d released_pages=%d secure_pages=%d cap=%d over_cap_nodes=%d "
-                    "ms=%.1f (a worker's claim was refused; TP0 spilled, the workers follow at this broadcast)",
+                    "kept_worker_evicted=%d kept_unkeyed=%d "
+                    "ms=%.1f (a worker's claim was refused; TP0 spilled, the workers follow at this broadcast; "
+                    "kept_* = device candidates TP0 left alone: a worker has them off the device / no R12 key)",
                     need, got, int(getattr(self, "_w3_spill_cap_used", 0)), cap,
-                    int(getattr(self, "_w3_spill_cap_skipped", 0)), ms)
+                    int(getattr(self, "_w3_spill_cap_skipped", 0)),
+                    int(getattr(self, "_w3_spill_kept_wev", 0)), int(getattr(self, "_w3_spill_kept_unkeyed", 0)), ms)
         return got
 
     def _weg2_write_or_abort(self, node, device_value, aux_xfers, pre, ring):

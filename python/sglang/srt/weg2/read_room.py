@@ -670,9 +670,11 @@ def flush_forma_pending() -> int:
         return int(host_freed or 0)
 
     out = 0
+    # S22: the workers' state is read again right before the broadcast (a peel since the decision keeps the copy);
+    # once per flush, not per node
+    _wev_now = _r12.worker_evicted_keys(todo[0][0])
     for cache, node, hv in todo:
-        # S22: the workers' state is read again right before the broadcast (a peel since the decision keeps the copy)
-        if _r12.node_key(node) in _r12.worker_evicted_keys(cache):
+        if _r12.node_key(node) in _wev_now:
             if _r12._note("rr_flush_worker_evicted", 16):
                 logger.info("%s D-SPILL KEPT worker_evicted node=%s (a worker took it off the device after the "
                             "decision; TP0 keeps its host copy)", MARK, getattr(node, "id", "?"))

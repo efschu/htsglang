@@ -115,9 +115,10 @@ def test_s22_two_workers_union_and_a_dead_process_is_ignored(group):
     pre = R._dev_dir_prefix(R._tree_arena(g.t1))
     import json
     with open(pre + "999999999", "w") as f:        # a worker process that no longer exists
-        json.dump([["zz", 1]], f)
+        json.dump({"ev": [["zz", 1]], "nd": [["yy", 2]]}, f)
     own = R.worker_evicted_keys(g.t0)
     assert R.node_key(g.n1[6]) in own and ("zz", 1) not in own
+    assert ("yy", 2) not in R.worker_nodelete_keys(g.t0)
 
 
 def test_s22_an_unreadable_worker_file_is_named(group, caplog):
