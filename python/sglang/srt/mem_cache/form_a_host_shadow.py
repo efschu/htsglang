@@ -171,6 +171,7 @@ class _State:
         self.rr_open: Dict[Tuple[str, int], list] = {}
         # S22: this worker's device-evicted content keys (published next to the arena for TP0's spill choice)
         self.dev_evicted: set = set()
+        self.dev_nodelete: set = set()
         # named stop found outside a consume (own-ack time); raised at the end of the next consume
         self.k21_stop_msg: Optional[str] = None
         # number of broadcasts consumed on this rank
@@ -600,7 +601,9 @@ def _tree_arena(tree: Any) -> Any:
 
 
 def _dev_publish(tree: Any) -> bool:
-    """A worker: write this process's device-evicted key set (atomic replace). False = nothing to write to."""
+    """A worker: write this process's key sets (atomic replace): ``ev`` = device-evicted nodes (a TP0 spill of a
+    device-resident node has no state to follow into there), ``nd`` = nodes this worker cannot DELETE (device-resident
+    or with children: a TP0 host-only-leaf drop would leave them). False = nothing to write to."""
     prefix = _dev_dir_prefix(_tree_arena(tree))
     if prefix is None:
         return False
@@ -610,12 +613,13 @@ def _dev_publish(tree: Any) -> bool:
     tmp = path + ".tmp"
     try:
         with open(tmp, "w") as f:
-            json.dump(sorted([k[0], k[1]] for k in _S.dev_evicted), f)
+            json.dump({"ev": sorted([k[0], k[1]] for k in _S.dev_evicted),
+                       "nd": sorted([k[0], k[1]] for k in _S.dev_nodelete)}, f)
         os.replace(tmp, path)
     except OSError as exc:
         if _note("dev_publish_error", 16):
-            logger.warning("R12 SPILL-APPLICABILITY publish failed: %r (TP0 may spill a node this worker has "
-                           "device-evicted; it will name SPILL-DIVERGED)", exc)
+            logger.warning("R12 SPILL-APPLICABILITY publish failed: %r (TP0 may spill a node this worker cannot "
+                           "follow on; it will name SPILL-DIVERGED)", exc)
         return False
     return True
 
@@ -639,27 +643,30 @@ def _dev_refresh(tree: Any) -> None:
     if role() != "worker":
         return
     base = int(_base_ct())
-    cur = set()
+    cur: set = set()
+    nd: set = set()
     stack = list(tree.root_node.children.values())
     while stack:
         n = stack.pop()
         stack.extend(n.children.values())
+        k = node_key(n)
+        if k is None:
+            continue
         if n.component_data[base].value is None:
-            k = node_key(n)
-            if k is not None:
-                cur.add(k)
-    if cur != _S.dev_evicted:
-        _S.dev_evicted = cur
+            cur.add(k)
+        if n.children or n.component_data[base].value is not None:
+            nd.add(k)
+    if cur != _S.dev_evicted or nd != _S.dev_nodelete:
+        _S.dev_evicted, _S.dev_nodelete = cur, nd
         _dev_publish(tree)
 
 
-def worker_evicted_keys(tree: Any) -> set:
-    """TP0: the union of every live worker's published device-evicted keys (a dead process's file is ignored).
-    A file that cannot be read is named, never silent."""
+def _read_worker_sets(tree: Any) -> Tuple[set, set]:
     prefix = _dev_dir_prefix(_tree_arena(tree))
-    out: set = set()
+    ev: set = set()
+    nd: set = set()
     if prefix is None:
-        return out
+        return ev, nd
     import glob
     import json
 
@@ -675,14 +682,28 @@ def worker_evicted_keys(tree: Any) -> set:
             pass
         try:
             with open(path) as f:
-                for h, d in json.load(f):
-                    out.add((str(h), int(d)))
-        except (OSError, ValueError) as exc:
+                doc = json.load(f)
+            for h, d in doc["ev"]:
+                ev.add((str(h), int(d)))
+            for h, d in doc["nd"]:
+                nd.add((str(h), int(d)))
+        except (OSError, ValueError, KeyError, TypeError) as exc:
             if _note("dev_read_error", 16):
-                logger.warning("R12 SPILL-APPLICABILITY read of %s failed: %r (TP0 spills without that "
-                               "worker's device state; a node it has evicted is named SPILL-DIVERGED)",
-                               path, exc)
-    return out
+                logger.warning("R12 SPILL-APPLICABILITY read of %s failed: %r (TP0 decides without that "
+                               "worker's state; a node it cannot follow on is named SPILL-DIVERGED)", path, exc)
+    return ev, nd
+
+
+def worker_evicted_keys(tree: Any) -> set:
+    """TP0: the union of every live worker's device-evicted keys -- TP0 must not spill (drop the host copy of) a
+    device-resident node of that key. A dead process's file is ignored, an unreadable one is named."""
+    return _read_worker_sets(tree)[0]
+
+
+def worker_nodelete_keys(tree: Any) -> set:
+    """TP0: the union of every live worker's keys it cannot delete (device-resident or with children) -- TP0 must
+    not drop a host-only LEAF of that key (K23 host-leaf spill), the worker would keep the node."""
+    return _read_worker_sets(tree)[1]
 
 
 def await_complete(tree: Any, node: Any, fallback_transit: bool, l3_ok: bool = False) -> bool:
@@ -859,8 +880,8 @@ def on_tree_reset(tree: Any) -> None:
     _S.k21_confirmed = {}
     _S.k21_expect = set()
     _S.rr_open = {}
-    if _S.dev_evicted:
-        _S.dev_evicted = set()
+    if _S.dev_evicted or _S.dev_nodelete:
+        _S.dev_evicted, _S.dev_nodelete = set(), set()
         _dev_publish(tree)   # the nodes are gone: no key may block a re-inserted prefix
     _S.k21_stop_msg = None
     _S.rebind_wait = {}

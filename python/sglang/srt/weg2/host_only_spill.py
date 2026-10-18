@@ -178,8 +178,15 @@ def spill_host_only(cache: Any, pool: Any, want: int, page_size: int, skip: set,
     heap = []
     refused: Dict[str, int] = {}
     eligible = []
+    from sglang.srt.mem_cache import form_a_host_shadow as _r12
+
+    # S22 (R12 SPILL-DIVERGED class): on a Form A group TP0's drop of a host-only leaf is a STATE(exists=0) verdict; a
+    # worker that has the node device-resident or with children cannot delete it and would keep a node TP0 dropped
+    nodel = _r12.worker_nodelete_keys(cache) if _r12.role() == "host" else ()
     for n in cache._collect_all_nodes():
         r = _reason(cache, n, pool, skip)
+        if r is None and nodel and _r12.node_key(n) in nodel:
+            r = "worker_cannot_delete"
         if r is None:
             eligible.append(n)
         elif r != "root":

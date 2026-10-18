@@ -671,6 +671,12 @@ def flush_forma_pending() -> int:
 
     out = 0
     for cache, node, hv in todo:
+        # S22: the workers' state is read again right before the broadcast (a peel since the decision keeps the copy)
+        if _r12.node_key(node) in _r12.worker_evicted_keys(cache):
+            if _r12._note("rr_flush_worker_evicted", 16):
+                logger.info("%s D-SPILL KEPT worker_evicted node=%s (a worker took it off the device after the "
+                            "decision; TP0 keeps its host copy)", MARK, getattr(node, "id", "?"))
+            continue
         comps = tuple(cache._components_tuple)
         base = next((c for c in comps if c.component_type == BASE_COMPONENT_TYPE), None)
         aux = [c for c in comps if c.component_type != BASE_COMPONENT_TYPE]
@@ -758,6 +764,7 @@ def form_a_spill(cache: Any, pool: Any, need_pages: int, released_out: Optional[
     owt = getattr(cache, "ongoing_write_through", None) or {}
     skip = {"anchor": 0, "busy": 0, "aux_host_only": 0, "host_only": 0}
     cands = []
+    wev = _r12.worker_evicted_keys(cache)   # S22: a node a worker has device-evicted is no spill candidate
     for node in cache._collect_all_nodes():
         if node is root:
             continue
@@ -796,6 +803,11 @@ def form_a_spill(cache: Any, pool: Any, need_pages: int, released_out: Optional[
             # alone would change; it is no candidate
             skip["unkeyed"] = skip.get("unkeyed", 0) + 1
             continue
+        if _r12.node_key(node) in wev:
+            # S22 (R12 SPILL-DIVERGED class): a worker has this node off the device, the STATE verdict has no state
+            # to move it to there (interior: unreconcilable, leaf: deleted)
+            skip["worker_evicted"] = skip.get("worker_evicted", 0) + 1
+            continue
         cands.append(node)
     keys = cache._w3_spill_keys(pool, cands)
     cands.sort(key=lambda x: keys[id(x)])
@@ -827,12 +839,12 @@ def form_a_spill(cache: Any, pool: Any, need_pages: int, released_out: Optional[
     if k <= 32 or k % 16 == 0 or released == 0:
         logger.info("%s D-SPILL n=%d need=%d want=%d released_pages=%d nodes=%d candidates=%d unsecured_kept=%d "
                     "l3=on_disk:%d,written:%d kept=anchor:%d,anchor_dev:%d,children:%d,unkeyed:%d,busy:%d,"
-                    "aux_host_only:%d,host_only:%d ms=%.0f (Form A "
+                    "aux_host_only:%d,host_only:%d,kept_worker_evicted=%d ms=%.0f (Form A "
                     "TP0 decides for group D: an L3-backed host copy of D's tree leaves L2, the device keeps the "
                     "KV, the R12 STATE verdict drops the workers' rows at the next broadcast; anchors untouched)",
                     MARK, k, int(need_pages), want, released, nodes, len(cands), unsecured, on_disk, written,
                     skip["anchor"], skip.get("anchor_dev", 0), skip.get("children", 0), skip.get("unkeyed", 0),
-                    skip["busy"], skip["aux_host_only"], skip["host_only"],
+                    skip["busy"], skip["aux_host_only"], skip["host_only"], skip.get("worker_evicted", 0),
                     (time.perf_counter() - t0) * 1000.0)
     return released
 
