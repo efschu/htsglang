@@ -4468,14 +4468,14 @@ class HiCacheFile(HiCacheStorage):
         return pend, got, read_now, rounds
 
     def _l3_read_with_progress(self, arena, pio, todo, paths, total_bytes: int, ptrs):
-        """S23: ``l3_read_pages_parallel`` in chunks of ``L3_READ_CHUNK_PAGES`` pages; the claims of the batch get their
-        progress clock touched (``arena.touch_progress``, generation-checked) before the first chunk and after each one.
-        The claim's progress clock used to move only at the complete at the END of the batch -- 754 pages took 1472 ms
-        on D TP1 (01:36:24), longer than the 1 s JOIN-IDLE bound, so a sibling thread or another rank joined on the
-        claim saw 'no byte' and quarantined a LIVE reader (its completion refused, status 6). A reader that has just
-        read a chunk is the witness that it is alive; a reader that stops reading stops touching and is reaped as before.
+        """S23: ``l3_read_pages_parallel`` with the READER reporting progress: the claims of the batch get their
+        progress clock touched (``arena.touch_progress``, generation-checked) before the read and by the reading
+        worker threads after every sub-call of ``L3_TOUCH_PAGES`` pages (see there). The claim's progress clock used to
+        move only at the complete at the END of the batch -- 754 pages took 1472 ms on D TP1 (01:36:24), longer than
+        the 1 s JOIN-IDLE bound, so a sibling thread or another rank joined on the claim saw 'no byte' and quarantined a
+        LIVE reader (its completion refused, status 6). A reader that has just read a sub-call is the witness that it is
+        alive; a reader that stops reading stops touching and is reaped as before. Full parallelism, no chunk barriers.
         Returns ``(rc per page, threads used)`` exactly like ``l3_read_pages_parallel``."""
-        n = len(paths)
         touch = getattr(arena, "touch_progress", None)
         slots = [t[1] for t in todo]
         gens = [t[2] for t in todo]
@@ -4487,19 +4487,15 @@ class HiCacheFile(HiCacheStorage):
                 except Exception:  # noqa: BLE001 - a witness never breaks a read
                     pass
 
-        chunk = max(1, int(L3_READ_CHUNK_PAGES))
-        if not callable(touch) or n <= chunk:
-            _touch()
+        if not callable(touch):
             return l3_read_pages_parallel(pio, paths, total_bytes, ptrs)
-        rc = [4] * n
-        threads = 1
-        for a in range(0, n, chunk):
-            _touch()
-            r, k = l3_read_pages_parallel(pio, paths[a:a + chunk], total_bytes, ptrs[a:a + chunk])
-            rc[a:a + chunk] = r
-            threads = max(threads, int(k or 1))
         _touch()
-        return rc, threads
+        _L3_PROGRESS.cb = _touch
+        try:
+            return l3_read_pages_parallel(pio, paths, total_bytes, ptrs)
+        finally:
+            _L3_PROGRESS.cb = None
+            _touch()
 
     def _arena_fill_read_todo(self, arena, todo, total_bytes: int, out, stats) -> None:
         """#1433: read this fill's OWN claims from disk into their slots and
@@ -6327,7 +6323,7 @@ L3_SPLIT_MIN_BYTES = 8 << 20
 L3_SPLIT_CHUNK_BYTES = 4 << 20
 
 
-def _l3_read_split(pio, paths, total_bytes: int, ptrs, k: int):
+def _l3_read_split(pio, paths, total_bytes: int, ptrs, k: int, progress=None):
     """Every page of ``paths`` in ``L3_SPLIT_CHUNK_BYTES`` pieces across ``k``
     pool threads, each piece a pread at its offset into the page's own target
     (``ptrs[i] + off``); a page's status is its first failing piece's (the
@@ -6339,9 +6335,17 @@ def _l3_read_split(pio, paths, total_bytes: int, ptrs, k: int):
     groups = [pieces[g::k] for g in range(k)]
 
     def one(group):
-        return pio.read_pages([paths[i] for i, _o, _l in group], [total] * len(group),
-                              [((o, l),) for _i, o, l in group],
-                              [int(ptrs[i]) + o for i, o, _l in group], True)
+        # S23: sub-calls of ``L3_TOUCH_PAGES`` pieces, the reader's progress after each (worker thread)
+        out = []
+        step = max(1, int(L3_TOUCH_PAGES))
+        for a in range(0, len(group), step):
+            g = group[a:a + step]
+            out += list(pio.read_pages([paths[i] for i, _o, _l in g], [total] * len(g),
+                                       [((o, l),) for _i, o, l in g],
+                                       [int(ptrs[i]) + o for i, o, _l in g], True))
+            if progress is not None:
+                progress()
+        return out
 
     rc = [0] * len(paths)
     for group, res in zip(groups, _l3_executor(k).map(one, groups)):
@@ -6351,8 +6355,12 @@ def _l3_read_split(pio, paths, total_bytes: int, ptrs, k: int):
     return rc, k
 
 
-#: S23: pages per read chunk of an L3 fill (the progress clock of the batch's claims moves after each chunk)
-L3_READ_CHUNK_PAGES = 64
+#: S23: pages per pageio sub-call of an L3 read. The READING worker thread reports progress after each sub-call
+#: (``arena.touch_progress`` of the batch's claims), so the touch grain is one sub-call -- far below the 1 s JOIN-IDLE
+#: bound even on a cold disk (metal: 65 pages 1189 ms = 18 ms/page, 16 pages = ~0.3 s) -- while the batch keeps the
+#: full parallelism of ``l3_read_pages_parallel`` (no chunk barriers, no serial tail chunk below L3_PARALLEL_MIN_PAGES).
+L3_TOUCH_PAGES = 16
+_L3_PROGRESS = threading.local()    # the caller's progress callback, read by ``l3_read_pages_parallel`` in the caller thread
 
 
 def l3_read_pages_parallel(pio, paths, total_bytes: int, ptrs, threads: Optional[int] = None):
@@ -6363,16 +6371,33 @@ def l3_read_pages_parallel(pio, paths, total_bytes: int, ptrs, threads: Optional
     n = len(paths)
     k = l3_read_threads() if threads is None else max(1, int(threads))
     ext = ((0, int(total_bytes)),)
+    progress = getattr(_L3_PROGRESS, "cb", None)     # S23: set by ``_l3_read_with_progress`` for this call only
+    step = max(1, int(L3_TOUCH_PAGES))
     if k > 1 and n and int(total_bytes) >= L3_SPLIT_MIN_BYTES:
-        return _l3_read_split(pio, paths, total_bytes, ptrs, k)
+        return _l3_read_split(pio, paths, total_bytes, ptrs, k, progress)
     if k <= 1 or n < L3_PARALLEL_MIN_PAGES:
-        return pio.read_pages(paths, [int(total_bytes)] * n, [ext] * n, ptrs, True), 1
+        if progress is None or n <= step:
+            return pio.read_pages(paths, [int(total_bytes)] * n, [ext] * n, ptrs, True), 1
+        rc1 = []
+        for a in range(0, n, step):
+            m = len(paths[a:a + step])
+            rc1 += list(pio.read_pages(paths[a:a + step], [int(total_bytes)] * m, [ext] * m, ptrs[a:a + step], True))
+            progress()
+        return rc1, 1
     k = min(k, n)
     groups = [list(range(g, n, k)) for g in range(k)]
 
     def one(idx):
-        return pio.read_pages([paths[i] for i in idx], [int(total_bytes)] * len(idx),
-                              [ext] * len(idx), [ptrs[i] for i in idx], True)
+        if progress is None:
+            return pio.read_pages([paths[i] for i in idx], [int(total_bytes)] * len(idx),
+                                  [ext] * len(idx), [ptrs[i] for i in idx], True)
+        out = []
+        for a in range(0, len(idx), step):       # S23: the worker thread reports progress after each sub-call
+            sub = idx[a:a + step]
+            out += list(pio.read_pages([paths[i] for i in sub], [int(total_bytes)] * len(sub),
+                                       [ext] * len(sub), [ptrs[i] for i in sub], True))
+            progress()
+        return out
 
     rc = [4] * n
     for idx, res in zip(groups, _l3_executor(k).map(one, groups)):
