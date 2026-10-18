@@ -15,6 +15,9 @@
 #     R2  a held rank re-sends its previous vote instead of abstaining (a stale value enters the group MIN)
 #     S5  without a refused head the fingerprint drops the waiting set (an arrival is no change)
 #     S6  (review S42r A1) the 16-pass bound is per rank only -- one divergent pass desyncs the group for ever
+#     S7  (review S42r A2) a held iteration skips the pass's HiCache service (acks/pins drained 1 in 17 rounds)
+#     R3  (review S42r A3) the chain consumes the LOCAL hold again (a split lets one rank run a pass alone)
+#     R4  (review S42r A3) a split does not disarm DQH (the group holds the split rank's pass, then drifts)
 #   Efficacy / switch:
 #     E1  the hold is off (the budget site always measures)
 #     E2  the fingerprint requires the refused head again (rc11 14:13: no NO_TOKEN, a stale running head)
@@ -69,7 +72,16 @@ F[E2]=$Q; OLD[E2]='    head = str(head) if head is not None and str(head) in wai
         return None
     head = str(head)'
 F[S6]=$Q; OLD[S6]='            or (tick > 0 and tick % (REEVAL_EVERY_PASSES + 1) == 0)'; NEW[S6]='            or False'
-ORDER=(S1 S2 S3 S4 S5 S6 V1 V2 R1 R2 E1 E2)
+F[S7]=$S; OLD[S7]='            # iteration -- once per iteration on every rank, held or not (the
+            # pass runs it at the same point relative to the budget site).
+            self._hicache_iteration_service()'; NEW[S7]='            # iteration -- once per iteration on every rank, held or not (the
+            # pass runs it at the same point relative to the budget site).
+            pass'
+F[R3]=$H; OLD[R3]='    d[DECISION_ATTR] = held
+    return held'; NEW[R3]='    return d[DECISION_ATTR]'
+F[R4]=$H; OLD[R4]='            dqh.state.fingerprint = None
+            dqh.state.held = 0'; NEW[R4]='            pass'
+ORDER=(S1 S2 S3 S4 S5 S6 S7 V1 V2 R1 R2 R3 R4 E1 E2)
 [ -n "${ONLY:-}" ] && ORDER=("$ONLY")
 killed=0; survived=0
 for m in "${ORDER[@]}"; do

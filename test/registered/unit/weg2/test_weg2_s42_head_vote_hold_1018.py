@@ -411,7 +411,9 @@ def test_a_rank_that_holds_alone_delays_the_head_and_splits_no_collective(monkey
 
     res = lockstep(scheds, one)
     assert [e for _v, e in res] == [None] * N, [repr(e) for _v, e in res]
-    assert [v for v, _e in res] == [True, False, True]
+    # S42r A3: the GROUP holds -- a lone evaluating rank would run its pass on an ABSENT head, where the X gate
+    # abstains and add_one_req reaches the Form A per-candidate gather alone (a14cf046ba: [True, False, True]).
+    assert [v for v, _e in res] == [True, True, True]
     assert [c - b for c, b in zip(g.rv.count(), before)] == [1, 1, 1], "a realize round on some rank only"
     for rank in range(N):
         usable, lens = seen[rank]
@@ -528,6 +530,110 @@ def test_s42r_a1_desynced_dqh_instances_meet_on_the_replicated_tick():
     common = sorted(set(ev_a) & set(ev_b))
     assert common and common[0] <= H.REEVAL_EVERY_PASSES + 1, (ev_a, ev_b)
     assert [e for e in ev_a if e >= common[0]] == [e for e in ev_b if e >= common[0]], (ev_a, ev_b)
+
+
+# --------------------------------------------------------------------------------------------------------------
+# S42r A2 (review nf-review-s42-1018): a DQH-held iteration still runs the pass's per-iteration HiCache service
+# --------------------------------------------------------------------------------------------------------------
+def _dqh_branch_source():
+    import inspect
+
+    from sglang.srt.managers.scheduler import Scheduler
+
+    src = inspect.getsource(Scheduler.get_next_batch_to_run)
+    i = src.index("elif self._weg2_dqh_holds(running_batch):")
+    j = src.index("        else:\n", i)
+    return src[i:j]
+
+
+def test_s42r_a2_a_held_iteration_runs_the_hicache_service_once_like_the_pass():
+    """Danger directions STARVATION (write-through / anchor-pin / storage acks -- the rank-local room a held queue
+    waits for -- drained on 1 iteration in 17) and R11 (the ``drain_storage_control_queues`` all_reduce inside
+    ``check_hicache_events`` entered only by a rank that evaluated alone). The held branch and the pass call the
+    SAME service, each exactly once, so every rank runs it once per iteration whichever branch it took."""
+    import inspect
+
+    from sglang.srt.managers.scheduler import Scheduler
+
+    branch = _dqh_branch_source()
+    assert branch.count("self._hicache_iteration_service()") == 1, branch
+    assert branch.count("self._retry_deferred_prefetches()") == 1, branch
+    raw = inspect.getsource(Scheduler._get_new_batch_prefill_raw)
+    assert raw.count("Scheduler._hicache_iteration_service(self)") == 1
+    assert "check_hicache_events()" not in raw, "the pass must use the shared service, not its own copy"
+    assert raw.index("Scheduler._hicache_iteration_service(self)") < raw.index("self._retry_deferred_prefetches()")
+    svc = inspect.getsource(Scheduler._hicache_iteration_service)
+    for needle in ("check_hicache_events()", "release_acked_anchor_pins", "_d_kv_evict_step(self)"):
+        assert needle in svc, needle
+
+
+def test_s42r_a2_the_service_checks_events_releases_pins_and_steps_the_evictor(monkeypatch):
+    from sglang.srt.managers.scheduler import Scheduler
+    import sglang.srt.weg2.d_kv_evict as DKE
+
+    calls = []
+    s = types.SimpleNamespace(
+        enable_hierarchical_cache=True,
+        server_args=types.SimpleNamespace(enable_flexkv=False),
+        running_batch=types.SimpleNamespace(reqs=["r34-107"]),
+        tree_cache=types.SimpleNamespace(
+            check_hicache_events=lambda: calls.append("events"),
+            release_acked_anchor_pins=lambda reqs: calls.append(("pins", tuple(reqs))),
+        ),
+    )
+    monkeypatch.setattr(DKE, "scheduler_step", lambda sched: calls.append("evict"))
+    Scheduler._hicache_iteration_service(s)
+    assert calls == ["events", ("pins", ("r34-107",)), "evict"], calls
+    calls.clear()
+    s.enable_hierarchical_cache = False
+    Scheduler._hicache_iteration_service(s)
+    assert calls == [], "off HiCache the service touches nothing (byte-identical to the pass before)"
+
+
+# --------------------------------------------------------------------------------------------------------------
+# S42r A3 (review nf-review-s42-1018): the chain consumes the GROUP's hold; a split holds all and re-evaluates all
+# --------------------------------------------------------------------------------------------------------------
+def test_s42r_a3_a_split_hold_holds_every_rank_then_every_rank_evaluates_on_a_measured_vote(monkeypatch):
+    """Danger direction R11 (collective split / raenge-nie-uneins). One rank's DQH evaluates while the others hold:
+    no rank may run its pass this iteration (the head vote is ABSENT; a lone pass would enter the Form A
+    admission gather alone), and the NEXT iteration evaluates on every rank with a real group match."""
+    from sglang.srt.managers import tp_head_congruence as THC
+
+    g = _Group(monkeypatch)
+    scheds = [_sched(r) for r in range(N)]
+    g.run(scheds, 1)                                        # all armed on the refused head
+    scheds[1].weg2_d_head_hold.state.fingerprint = None     # rank 1 alone evaluates
+    res = g.run(scheds, 2)
+    assert [res[r][0] for r in range(N)] == ["held"] * N, res
+    for r in range(N):
+        assert res[r][1] != "held", (r, res[r])
+        assert any(int(v) > THC._ABSENT_MATCH for v in res[r][1][1].values()), (r, res[r][1])
+    assert g.rv.count()[0] == g.rv.count()[1] == g.rv.count()[2]
+
+
+def test_s42r_a3_hold_payload_and_group_resolution():
+    from sglang.srt.weg2 import head_vote_hold as HV
+
+    assert HV.build_hold_payload(True) == [1, -1] and HV.build_hold_payload(False) == [0, 0]
+
+    def sched(local):
+        st = types.SimpleNamespace(fingerprint=("x",), held=3)
+        s = types.SimpleNamespace(weg2_d_head_hold=types.SimpleNamespace(state=st))
+        if local is not None:
+            s.__dict__[HV.DECISION_ATTR] = local
+        return s
+
+    # MIN over the three ranks' pairs
+    for votes, want in (((1, 1, 1), True), ((0, 0, 0), False), ((1, 0, 1), True), ((0, 1, 0), True)):
+        pair = [min(v for v in votes), min(-v for v in votes)]
+        for local in votes:
+            s = sched(bool(local))
+            assert HV.resolve_group(s, pair) is want, (votes, local)
+            assert HV.take(s) is want
+            split = len(set(votes)) > 1
+            assert (s.weg2_d_head_hold.state.fingerprint is None) is split, (votes, local)
+    s = sched(None)                                         # unarmed caller: no decision is invented
+    assert HV.resolve_group(s, [0, 0]) is None and HV.take(s) is None
 
 
 # --------------------------------------------------------------------------------------------------------------

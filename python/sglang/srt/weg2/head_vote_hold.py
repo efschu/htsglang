@@ -83,6 +83,51 @@ def decide(sched: Any, running_batch: Any, prefetch_verdicts: Optional[dict]) ->
     return held
 
 
+#: S42r A3 group-split counter (status line), not a decision input
+_SPLIT = {"n": 0}
+
+
+def build_hold_payload(held: bool) -> list:
+    """S42r A3: this rank's hold vote as an (x, -x) pair on the packed MIN reduce -> the group's MIN and MAX."""
+    h = 1 if held else 0
+    return [h, -h]
+
+
+def resolve_group(sched: Any, reduced_pair) -> Optional[bool]:
+    """S42r A3 (review nf-review-s42-1018): replace this rank's decision by the GROUP's.
+
+    ``reduced_pair`` = the MIN-reduced (h, -h) slots: ``lo = MIN(h)``, ``hi = -MIN(-h) = MAX(h)``. Only an armed
+    decision (DECISION_ATTR present) is replaced; an unarmed caller voted 0 and keeps none.
+
+    held_group = hi: the pass is held when ANY rank held. A holding rank abstained from every head arm, so the
+    group's head is ABSENT this iteration; a rank that ran its pass on it would see the X gate ABSTAIN (no refusal
+    on an absent match) and reach ``add_one_req``'s Form A per-candidate verdict gather ALONE -- a collective the
+    holding ranks never enter (a14cf046ba claimed "divergent DQH only delays, same collective count"; that held
+    for the budget-site reduce only). lo != hi = a split: every rank disarms DQH, so the next iteration evaluates
+    on every rank, jointly, on a measured vote."""
+    d = sched.__dict__
+    if DECISION_ATTR not in d:
+        return None
+    lo, hi = int(reduced_pair[0]), -int(reduced_pair[1])
+    held = hi >= 1
+    if lo != hi:
+        _SPLIT["n"] += 1
+        dqh = getattr(sched, "weg2_d_head_hold", None)
+        if dqh is not None:
+            dqh.state.fingerprint = None
+            dqh.state.held = 0
+        n = _SPLIT["n"]
+        if n <= 8 or (n & (n - 1)) == 0:
+            logger.warning(
+                "S42r DQH GROUP-SPLIT n=%d local_held=%s group_min=%d group_max=%d: the ranks decided the hold "
+                "differently -- the whole group holds this pass (no rank runs a pass on an abstained head vote) "
+                "and every rank re-evaluates the next one; a split means a DQH input was not replicated",
+                n, d.get(DECISION_ATTR), lo, hi,
+            )
+    d[DECISION_ATTR] = held
+    return held
+
+
 def take(sched: Any) -> Optional[bool]:
     """The elif chain: the budget site's decision of this iteration (consumed), or None when the budget site took
     none (single rank, offload path, an unarmed caller) -- then the chain asks DQH itself, as before."""
@@ -96,3 +141,4 @@ def stats() -> dict:
 def reset_for_tests() -> None:
     for k in _STATS:
         _STATS[k] = 0
+    _SPLIT["n"] = 0

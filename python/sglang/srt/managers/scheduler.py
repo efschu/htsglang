@@ -5252,6 +5252,50 @@ class Scheduler(
             self._weg2_d_head_fingerprint(running_batch, self.__dict__.get("_pass_prefetch_verdicts"))
         )
 
+    def _hicache_iteration_service(self) -> None:
+        """The pass's per-iteration HiCache service: event check (write-through
+        and load acks, storage control queues), #811 anchor-pin release, 24c
+        placement eviction. Moved verbatim out of `_get_new_batch_prefill_raw`.
+
+        S42r A2 (review nf-review-s42-1018): its own comment says it sits where
+        "every rank reaches this point each iteration" -- a DQH-held iteration
+        does not reach the pass. Since S42 DQH holds every pass that built
+        nothing while requests wait (rc11 14:13: minutes of queue), so this
+        service ran on 1 iteration in 17 there: write-through acks, anchor pins
+        and storage acks -- the very rank-local room a held queue waits for --
+        were drained 17x slower, and the ``drain_storage_control_queues``
+        all_reduce inside ``check_hicache_events`` was entered ONLY by a rank
+        that evaluated alone (a split collective count on a divergent DQH
+        iteration). The DQH-held branch calls this too, so every rank runs it
+        exactly once per iteration whichever branch it took."""
+        if self.enable_hierarchical_cache or self.server_args.enable_flexkv:
+            _dgap = _d_hostgap.meter()  # #DGAP (SGLANG_WEG2_D_HOSTGAP)
+            if _dgap is None:
+                self.tree_cache.check_hicache_events()
+            else:
+                with _dgap.span("hicache"):
+                    self.tree_cache.check_hicache_events()
+            # #811: release anchor pins whose write-through ack just drained,
+            # BEFORE this tick's admissions allocate -- so an acked-but-still
+            # -pinned checkpoint can never crowd out an admission in the same
+            # tick. Only requests in the RUNNING batch are swept: their first
+            # extend result has been processed, so the deferred mamba COW
+            # read of the matched anchor has provably executed. No-op unless
+            # --mamba-anchor-ack-release armed the mechanism.
+            release_pins = getattr(self.tree_cache, "release_acked_anchor_pins", None)
+            if release_pins is not None and self.running_batch is not None:
+                release_pins(self.running_batch.reqs)
+            # 24c --d-kv-evict-for-placement (weg2/d_kv_evict.py, DYN_D_RESHARD
+            # sec. 14): cold, L2-backed radix leaves leave the device so the
+            # bandwidth placement keeps its shares. Here because every rank
+            # reaches this point each iteration (the storage-drain agreement
+            # above, the #580 prefetch collectives below); a dict lookup when
+            # SGLANG_WEG2_D_KV_EVICT is absent.
+            if self.__dict__.get("_weg2_d_kv_evictor", True) is not None:
+                from sglang.srt.weg2.d_kv_evict import scheduler_step as _d_kv_evict_step
+
+                _d_kv_evict_step(self)
+
     def init_parked_decode_set(self) -> None:
         """#677 phase 1: stop charging undecodable carriers to the cap.
 
@@ -11124,6 +11168,12 @@ class Scheduler(
         vals = vals + tp_match_floor.build_usable_max_payload(
             _head_canonical, _usable_local, tp_head_congruence.TP_HEAD_SLOTS
         )
+        # S42r A3 (review nf-review-s42-1018): THE HOLD DECISION RIDES THIS
+        # REDUCE as an (x, -x) pair, so every rank learns the group's MIN and
+        # MAX of "this rank holds". Placed before the tail-indexed ballot, its
+        # own head index captured before the append. No new collective.
+        _s42_hold_at = len(vals)
+        vals = vals + _weg2_head_vote_hold.build_hold_payload(_s42_held)
         _ballot_rids = [
             req.rid
             for req in self.waiting_queue[: prefetch_ballot.PREFETCH_BALLOT_SLOTS]
@@ -11133,6 +11183,15 @@ class Scheduler(
         )
         t = torch.tensor(vals, dtype=torch.int64)
         torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MIN, group=grp)
+        # S42r A3: the chain consumes the GROUP's hold, not this rank's: held
+        # when ANY rank held (it abstained from the head vote, so no rank may
+        # run a pass on it -- a lone pass would reach the Form A per-candidate
+        # gather in add_one_req alone: X gate abstains on an ABSENT match and
+        # does not refuse). On a split every rank also disarms DQH, so the next
+        # iteration evaluates jointly.
+        _weg2_head_vote_hold.resolve_group(
+            self, t[_s42_hold_at : _s42_hold_at + 2].tolist()
+        )
         # #794: the group's tightest corridor width, read back before the
         # ballot so a later change to the ballot layout cannot silently move it.
         self._uniform_corridor_width = int(t[_corridor_at])
@@ -13181,6 +13240,12 @@ class Scheduler(
             new_batch = None
             self._weg2_sa_pass = getattr(self, "_weg2_sa_pass", 0) + 1
             self._admission_decline_note = "gate=weg2_d_head_hold"
+            # S42r A2: the pass's per-iteration service still runs on a held
+            # iteration -- once per iteration on every rank, held or not (the
+            # pass runs it at the same point relative to the budget site).
+            self._hicache_iteration_service()
+            if self.enable_hicache_storage:
+                self._retry_deferred_prefetches()
         else:
             _dqh_verdicts = self.__dict__.get("_pass_prefetch_verdicts")
             prefill_plan = self.get_new_batch_prefill(running_batch)
@@ -16204,33 +16269,11 @@ class Scheduler(
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
 
-        if self.enable_hierarchical_cache or self.server_args.enable_flexkv:
-            _dgap = _d_hostgap.meter()  # #DGAP (SGLANG_WEG2_D_HOSTGAP)
-            if _dgap is None:
-                self.tree_cache.check_hicache_events()
-            else:
-                with _dgap.span("hicache"):
-                    self.tree_cache.check_hicache_events()
-            # #811: release anchor pins whose write-through ack just drained,
-            # BEFORE this tick's admissions allocate -- so an acked-but-still
-            # -pinned checkpoint can never crowd out an admission in the same
-            # tick. Only requests in the RUNNING batch are swept: their first
-            # extend result has been processed, so the deferred mamba COW
-            # read of the matched anchor has provably executed. No-op unless
-            # --mamba-anchor-ack-release armed the mechanism.
-            release_pins = getattr(self.tree_cache, "release_acked_anchor_pins", None)
-            if release_pins is not None and self.running_batch is not None:
-                release_pins(self.running_batch.reqs)
-            # 24c --d-kv-evict-for-placement (weg2/d_kv_evict.py, DYN_D_RESHARD
-            # sec. 14): cold, L2-backed radix leaves leave the device so the
-            # bandwidth placement keeps its shares. Here because every rank
-            # reaches this point each iteration (the storage-drain agreement
-            # above, the #580 prefetch collectives below); a dict lookup when
-            # SGLANG_WEG2_D_KV_EVICT is absent.
-            if self.__dict__.get("_weg2_d_kv_evictor", True) is not None:
-                from sglang.srt.weg2.d_kv_evict import scheduler_step as _d_kv_evict_step
-
-                _d_kv_evict_step(self)
+        # S42r A2: the per-iteration HiCache service, also run by a DQH-held
+        # iteration (see `_hicache_iteration_service`). Called through the
+        # class so the pass's test doubles (a bare namespace bound to this
+        # function) keep working without growing the attribute.
+        Scheduler._hicache_iteration_service(self)
 
         # #580: rank-uniform entry into the prefetch-progress collectives.
         # MUST stay above every early return and every loop exit below -- all
