@@ -63,7 +63,7 @@ def test_anchor_release_keeps_a_leaf_a_worker_cannot_delete():
     n = _node("a", 4)
     got, calls = _release(n, flush=False, nd={R.node_key(n)})
     assert got == 0 and calls == [], "TP0 deleted a node a worker keeps (and sent STATE exists=0)"
-    assert R._S.counts["kept_total_anchor_worker_cannot_delete"] == 1
+    assert R._S.counts["kept_total_anchor_release_refused"] == 1     # the backstop; the choice leaves it out first
 
 
 def test_anchor_release_proceeds_when_every_worker_can_delete():
