@@ -23782,7 +23782,7 @@ def build_parser() -> argparse.ArgumentParser:
              "PINNED and priced on the same axis.",
     )
     ap.add_argument(
-        "--p-host-overlap", action="store_true",
+        "--p-host-overlap", action="store_true", default=True,
         help="Group P: let each stage's host work for the NEXT prefill chunk run "
              "while the forward it just launched computes (managers/"
              "weg2_p_overlap.py). Adds SGLANG_WEG2_P_HOST_OVERLAP=1 and "
@@ -23793,7 +23793,16 @@ def build_parser() -> argparse.ArgumentParser:
              "publish moves from the plan to right after the next launch. "
              "Measured reason (weg2xsn420, 4x98k): PP2 pass 873 ms vs 733 "
              "gpu-ms, ~95-140 ms card idle per 4096 chunk, flat over depth. "
-             "Default off = argv and env byte-identical to before.",
+             "DEFAULT ON since S43 (NF rc12 1018: PP0 duty 57 %% in its busy "
+             "runs, 80 s of PP0 commit_ms on middle-chunk output exchanges "
+             "alone -- the output ring, not L3; user rule 14.10. new features "
+             "on). --no-p-host-overlap = the old argv/env, byte-identical.",
+    )
+    ap.add_argument(
+        "--no-p-host-overlap", dest="p_host_overlap", action="store_false",
+        help="Group P: the A/B arm of --p-host-overlap (on by default since "
+             "S43): every chunk exchanges its output on the PP ring again, the "
+             "chunked-prefill publish runs inline, no P-NOSYNC.",
     )
     ap.add_argument(
         "--p-recv-stream", action="store_true",
