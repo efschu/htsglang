@@ -114,7 +114,8 @@ def parse_lines(data: bytes) -> Tuple[List[Record], Optional[str]]:
             boot = s[len("# boot_id="):].strip()
             continue
         parts = s.split(" ", 3)
-        if len(parts) != 4 or parts[0] not in ("R", "C", "A", "E"):
+        # L3-READ-RECENCY-1014: ``T`` = a read hit (recency only, no size change)
+        if len(parts) != 4 or parts[0] not in ("R", "C", "A", "E", "T"):
             continue
         stem = parts[3]
         # A torn tail (rank killed mid-append, the filesystem zero-fills the block)
@@ -596,6 +597,12 @@ def replay(items: "Dict[str, Tuple[float, int]]", records: List[Record],
         elif op == "E":
             pending.pop(stem, None)
             items.pop(stem, None)
+        elif op == "T":
+            # L3-READ-RECENCY-1014: a read hit moves the page to the newest end
+            # with the read's time (its size stays); a stem not indexed is ignored
+            got = items.pop(stem, None)
+            if got is not None:
+                items[stem] = (max(float(got[0]), float(t)), got[1])
     stated = 0
     if open_intents is not None:
         open_intents.extend(pending)
