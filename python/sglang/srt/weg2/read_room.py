@@ -841,18 +841,45 @@ def form_a_spill(cache: Any, pool: Any, need_pages: int, released_out: Optional[
         _ST.d_pending.append((cache, node, hv))
         released += int(hv.numel()) // P
         nodes += 1
+    # S27 (fLLiper rc8 06:58:37-47, D TP0: 10 s READ-ROOM wait at deficit=2 with ``D-SPILL candidates=0 ...
+    # host_only:22``, arena 6478/6485 pinned by D's own tree): the device-resident round above takes a node that still
+    # carries a device copy -- the arena is its second copy. A HOST-ONLY H-leaf (device copy already gone, L3 copy
+    # provable) is the same kind of cache line and was never a candidate here, although ``_w3_arena_spill`` (K23, the
+    # FORMA-REQUEST path) already drops such leaves on TP0 of a Form A group. Same round, same R12 verdict
+    # (STATE exists=0 per dropped leaf), same group order: TP0 decides, the workers follow at this broadcast.
+    host_leaves = 0
+    if released < int(need_pages):
+        from sglang.srt.weg2 import host_only_spill as _hos
+
+        if _hos.armed(cache):
+            _prev_rec = getattr(cache, "_r12_rec", None)
+            cache._r12_rec = []
+            try:
+                _hres = _hos.spill_host_only(
+                    cache, pool, max(int(need_pages) - released, int(getattr(cache, "W3_SPILL_MIN_PAGES", 64))), P,
+                    set(), released_out=released_out)
+                released += int(_hres["released"])
+                host_leaves = int(_hres["leaves"])
+            finally:
+                # whatever the round did before it raised, TP0's drops reach the workers (TP0 deleted the nodes)
+                _rec, cache._r12_rec = cache._r12_rec, _prev_rec
+                _seen = set()
+                for _n in _rec or ():
+                    if id(_n) not in _seen:
+                        _seen.add(id(_n))
+                        _r12.record_state(cache, _n, why="k23_host_leaf_spill")
     _ST.d_spills += 1
     k = _ST.d_spills
     if k <= 32 or k % 16 == 0 or released == 0:
         logger.info("%s D-SPILL n=%d need=%d want=%d released_pages=%d nodes=%d candidates=%d unsecured_kept=%d "
                     "l3=on_disk:%d,written:%d tree_nodes=%d kept=no_host:%d,anchor:%d,anchor_dev:%d,children:%d,"
-                    "unkeyed:%d,busy:%d,aux_host_only:%d,host_only:%d,kept_worker_evicted=%d ms=%.0f (Form A "
+                    "unkeyed:%d,busy:%d,aux_host_only:%d,host_only:%d,kept_worker_evicted=%d host_leaves=%d ms=%.0f (Form A "
                     "TP0 decides for group D: an L3-backed host copy of D's tree leaves L2, the device keeps the "
                     "KV, the R12 STATE verdict drops the workers' rows at the next broadcast; anchors untouched)",
                     MARK, k, int(need_pages), want, released, nodes, len(cands), unsecured, on_disk, written,
                     tree_nodes, skip.get("no_host", 0), skip["anchor"], skip.get("anchor_dev", 0), skip.get("children", 0),
                     skip.get("unkeyed", 0), skip["busy"], skip["aux_host_only"], skip["host_only"],
-                    skip.get("worker_evicted", 0),
+                    skip.get("worker_evicted", 0), host_leaves,
                     (time.perf_counter() - t0) * 1000.0)
     return released
 
