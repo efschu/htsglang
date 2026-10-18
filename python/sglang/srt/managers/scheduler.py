@@ -11062,11 +11062,7 @@ class Scheduler(
         # round, all of it this vote on held passes. Group-uniform: DQH's
         # inputs are replicated; a lone abstention MIN-reduces to ABSENT, i.e.
         # the head is delayed, the collective count is unchanged.
-        _s42_held = _weg2_head_vote_hold.decide(
-            self,
-            running_batch if running_batch is not None else self.running_batch,
-            _ballot_verdicts,
-        )
+        _s42_held = _weg2_head_vote_hold.decide(self, running_batch, _ballot_verdicts)
         if _s42_held:
             _head_canonical, _head_local_matches = [], {}
         else:

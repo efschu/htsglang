@@ -74,6 +74,8 @@ def decide(sched: Any, running_batch: Any, prefetch_verdicts: Optional[dict]) ->
     dqh = getattr(sched, "weg2_d_head_hold", None)
     if dqh is None:
         return False
+    if running_batch is None:  # the budget site's own rule: None reads self.running_batch
+        running_batch = getattr(sched, "running_batch", None)
     fp = sched._weg2_d_head_fingerprint(running_batch, prefetch_verdicts)
     held = bool(dqh.should_hold(fp))
     sched.__dict__[DECISION_ATTR] = held
