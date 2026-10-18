@@ -7292,7 +7292,12 @@ class Front:
         # (<= X), no reroute, never a flip for it. (P-BATCH-ALL 02.10. sent every loss back to P's batch; since R7
         # "kein Flip unter X" that reroute is only for a loss OVER X.) The SECOND loss under X is bounded as before
         # (no third P leg, no terminal for a tail D may compute).
-        if not over_x:
+        # S28 A2 (R1a): in a P phase (a decided flip) P prefills ALL pending prefills, also those waiting for
+        # a D seat -- the lost hand-off rides P's batch whatever its price (no flip is made for it: P is awake)
+        _p_phase = p_phase_arrival(getattr(self, "awake", "D"), getattr(self, "state", "serving"),
+                                   getattr(self, "_flip_dst", None))
+        if not over_x and not _p_phase:
+            p.est_uncached = int(uncached)  # S28 A3: the KEPT tail carries its current price (X-SUM / R6)
             if p.rid not in noted:
                 noted.add(p.rid)
                 self.counters["handoff_lost_kept_d"] += 1
@@ -7327,7 +7332,10 @@ class Front:
         p.handoff_lost_reroutes += 1
         p.leg1_done = False
         p.seat = None
-        p.d_eligible = p.d_direct = False
+        p.d_direct = False
+        # S28 A2 (N1 guard): a reroute under X (P phase, R1a) stays a SHORT for a later D phase -- not an
+        # orphan that neither D (d_eligible) nor P (needs_p) takes
+        p.d_eligible = not over_x
         p.est_uncached = int(uncached)
         self.counters["handoff_lost_reroutes"] += 1
         logger.warning(
@@ -11706,6 +11714,14 @@ class Front:
             return False
         if self._decode_collect(now, live_q) == "P":
             return True
+        # S28 A1 (R1/R7): the queue-sum verdict is a flip verdict too -- re-price before it can stand (only when the
+        # stale sum would reach X, so the per-tick path costs nothing)
+        if (self.__dict__.get("x_exact")
+                and sum(int(getattr(q, "est_uncached", 0) or 0) for q in live_q)
+                >= min(Front._set_x_of_entry(self, q) for q in live_q)):
+            _mv = self._x_exact_reprice_queue("pre_verdict_qsum")
+            if _mv:
+                self.counters["flip_verdict_repriced"] += _mv
         # H16V F1/A5: S = own figures (D side); P counts a shared session prefix once (members' uncached). X = smallest own X (R2a, A2)
         _eff = Front._set_discount(self, [(q.rid, int(getattr(q, "est_uncached", 0) or 0), float(_lctl.clock_t(q, now)), q)
                                           for q in live_q])
@@ -11738,6 +11754,8 @@ class Front:
         self.counters["set_" + sv.verdict.lower()] += 1
         if sv.verdict in (phase_policy.V_FLIP_P, phase_policy.V_PARK_NO_SEAT, phase_policy.V_REROUTE_P):
             st["go_p"].update(m.rid for m in members)
+            for _m in members:  # S28 A1: FLIP-PRICE-STALE sees this decision site too
+                Front._flip_trig_note(self, _m.rid, int(_m.own_uncached or _m.uncached), "queue-sum")
             return True
         return False
 
@@ -13152,7 +13170,8 @@ class Front:
                     self._sync_batch_gate()
                     continue
                 self._ready_for_d.popleft()
-                if getattr(p, "d_direct", False) and envs.SGLANG_WEG2_ENABLE_DECODE_COLLECT_PREFILL_BUSY.get():
+                if ((getattr(p, "d_direct", False) or p.rid in (self.__dict__.get("_hl_noted") or ()))
+                        and envs.SGLANG_WEG2_ENABLE_DECODE_COLLECT_PREFILL_BUSY.get()):  # S28 A3: KEPT tail too
                     # X-SUM-PRICE: the hand-over leaves `_ready_for_d` here (no await up to the book) -- its
                     # uncached tokens stay in `carried` until D's first content (review M3, same class as the burst)
                     self._d_pf_book().grant(rid=p.rid, tokens=int(getattr(p, "est_uncached", 0) or 0), now=time.time())
