@@ -14,6 +14,7 @@
 #     R1  the hold decision is rank-local (TP0 holds, the workers measure and evaluate)
 #     R2  a held rank re-sends its previous vote instead of abstaining (a stale value enters the group MIN)
 #     S5  without a refused head the fingerprint drops the waiting set (an arrival is no change)
+#     S6  (review S42r A1) the 16-pass bound is per rank only -- one divergent pass desyncs the group for ever
 #   Efficacy / switch:
 #     E1  the hold is off (the budget site always measures)
 #     E2  the fingerprint requires the refused head again (rc11 14:13: no NO_TOKEN, a stale running head)
@@ -67,7 +68,8 @@ F[S5]=$Q; OLD[S5]='    return (head, waiting_rids, running_rids, landed, generat
 F[E2]=$Q; OLD[E2]='    head = str(head) if head is not None and str(head) in waiting_rids else None'; NEW[E2]='    if head is None or str(head) not in waiting_rids:
         return None
     head = str(head)'
-ORDER=(S1 S2 S3 S4 S5 V1 V2 R1 R2 E1 E2)
+F[S6]=$Q; OLD[S6]='            or (tick > 0 and tick % (REEVAL_EVERY_PASSES + 1) == 0)'; NEW[S6]='            or False'
+ORDER=(S1 S2 S3 S4 S5 S6 V1 V2 R1 R2 E1 E2)
 [ -n "${ONLY:-}" ] && ORDER=("$ONLY")
 killed=0; survived=0
 for m in "${ORDER[@]}"; do
