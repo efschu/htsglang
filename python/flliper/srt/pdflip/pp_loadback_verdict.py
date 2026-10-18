@@ -79,6 +79,25 @@ when even every evictable row does not cover it, the group stops by name
 never retreated into a void pass). No refuse-and-continue, no R from another
 pass. Switch ``FLLIPER_PDFLIP_LBV_ROW_ROOM`` (default on); ``0`` = the room verdict
 of 73f6a4e110 (the death).
+
+LBV-ROW-SAME-PASS (S48, NF rc13 ``..._6767e25d89_1018_200305``). ON THE ROW FORM THE VERDICT PASS IS PURE LATENCY.
+With the #631 row authority (h16p, ``P-ROW-AUTHORITY armed``) no follower keys on this verdict: every follower
+load-back executes PP0's row (``row_executed`` -> ``gated`` False -> ``ROW-ROOM``: 0 ``LB-VERDICT HOLD`` lines on
+PP1/PP2 in rc13 against 73 PP0 verdicts). The only stage the gate still held was PP0 itself: it decided "fits" in
+pass k, refused its own load (``PDFLIP-LOADBACK-WAIT``), absorbed its own verdict at the intake of pass k+1 and
+admitted there. When pass k ran into the predecessor's last-chunk ring commit (nothing launched, PP0 idle), the
+admission waited the whole commit: pdflip-14-182 (20:26:24 VERDICT -> ``PASS-STALL commit_ms=1761`` -> 20:26:26
+RELEASE/ADMIT), pdflip-19-222 (``commit_ms=2644``). The follower room R_m is NOT what waited (S47's hypothesis): on
+this form the followers make their own room for PP0's row.
+
+THE RULE: on the row form (``followers_execute_row``, read at arm) PP0 decides its own load-back and, when it fits,
+loads it IN THE DECIDING PASS -- its row of that pass carries the admission to every follower, exactly as the row of
+pass k+1 did before. The wire is unchanged (the verdict still rides the next intake, the followers absorb it as
+before and never read it); PP0 marks the rid spent so its own absorb does not leave a stale release behind. A
+refusal stays a refusal (the request waits, PP0 decides again next pass) and is now named with its room terms
+(``LB-VERDICT PP0-WAIT``: kv, floor, agreed R_m, avail, evictable -- the line S47 asked for). The carrierless form is
+untouched (followers plan for themselves there: the one-pass verdict is the R11 law). Switch
+``FLLIPER_PDFLIP_LBV_ROW_SAME_PASS`` (default on); ``0`` = the hold of before on every form.
 """
 
 from __future__ import annotations
@@ -111,6 +130,9 @@ ROW_YIELD_ENV = "FLLIPER_PDFLIP_LBV_ROW_YIELD"
 ROW_ATTR = "_pdflip_lbv_row_executed"
 #: NF-968-ROWLB 1014: a row-executed load-back makes its own room, no room verdict (``row_room``).
 ROW_ROOM_ENV = "FLLIPER_PDFLIP_LBV_ROW_ROOM"
+#: S48 LBV-ROW-SAME-PASS: on the row form PP0 loads its fitting load-back in the deciding pass.
+SAME_PASS_ENV = "FLLIPER_PDFLIP_LBV_ROW_SAME_PASS"
+_SPENT_CAP = 4096
 
 
 @dataclass
@@ -122,7 +144,8 @@ class PdFlipPpLoadbackVerdict:
 
 
 class _State:
-    __slots__ = ("pp0", "released", "sent", "out", "said", "carrierless", "held_said", "pass_lb")
+    __slots__ = ("pp0", "released", "sent", "out", "said", "carrierless", "held_said", "pass_lb", "row_form",
+                 "self_spent", "wait_n")
 
     def __init__(self, pp0: bool) -> None:
         self.pp0 = bool(pp0)
@@ -137,6 +160,12 @@ class _State:
         #: LBV-ADMIT (PP0): load-back tokens released since the last intake -- a second
         #: load-back verdict of the same pass is judged on top of the first one's rows
         self.pass_lb = 0
+        #: S48: the followers execute PP0's row (read once at arm; False = unreadable / carrierless -> the hold)
+        self.row_form = False
+        #: S48 (PP0): rids PP0 loaded in the deciding pass -- its own absorb of their verdict releases nothing
+        self.self_spent: set = set()
+        #: S48: PP0-WAIT lines printed (sampled)
+        self.wait_n = 0
 
 
 def enabled() -> bool:
@@ -151,11 +180,28 @@ def arm(scheduler) -> bool:
     tree = getattr(scheduler, "tree_cache", None)
     if tree is None or pp_size <= 1 or not enabled():
         return False
+    st = _State(int(getattr(ps, "pp_rank", 0) or 0) == 0)
+    st.row_form = _read_row_form(scheduler)
     try:
-        setattr(tree, _STATE_ATTR, _State(int(getattr(ps, "pp_rank", 0) or 0) == 0))
+        setattr(tree, _STATE_ATTR, st)
     except Exception:  # noqa: BLE001 -- a slotted double
         return False
     return True
+
+
+def _read_row_form(scheduler) -> bool:
+    """S48: do the followers execute PP0's row on this boot (``prefill_oom_retreat.followers_execute_row``)? Read once
+    at arm (the form is fixed by ``p_row_authority.start_check``, which runs before the arm). Unreadable: False -- the
+    hold of before, never a guess in the direction of "PP0 may load alone"."""
+    try:
+        from flliper.srt.pdflip.prefill_oom_retreat import followers_execute_row
+
+        ps = getattr(scheduler, "ps", None)
+        if int(getattr(ps, "pp_size", 1) or 1) <= 1:
+            return False
+        return bool(followers_execute_row(scheduler))
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def state(tree) -> Optional[_State]:
@@ -243,6 +289,15 @@ def absorb(tree, verdict: PdFlipPpLoadbackVerdict) -> None:
     st = state(tree)
     if st is None:
         return
+    if st.pp0 and str(verdict.rid) in st.self_spent:
+        # S48 LBV-ROW-SAME-PASS: PP0 loaded this rid in the pass that decided it (its row carried it); its own
+        # verdict comes home spent -- no release is left behind for a later load-back of the same rid
+        st.self_spent.discard(str(verdict.rid))
+        st.sent.discard(str(verdict.rid))
+        st.held_said.discard(str(verdict.rid))
+        logger.info("%s RELEASE rid=%s pp0=True same_pass=1 (PP0 loaded it in the deciding pass on the row form; "
+                    "the verdict's absorb releases nothing)", MARK, verdict.rid)
+        return
     st.released.add(str(verdict.rid))
     st.sent.discard(str(verdict.rid))
     st.held_said.discard(str(verdict.rid))
@@ -301,6 +356,60 @@ def hold(tree, rid, kv_tokens: int, fits_on_pp0) -> None:
         st.held_said.add(rid)
         logger.info("%s HOLD rid=%s kv_tokens=%d (a follower loads a host hit only in the pass that absorbs "
                     "PP0's verdict; its own room decides nothing)", MARK, rid, int(kv_tokens))
+
+
+def same_pass_enabled() -> bool:
+    return (os.environ.get(SAME_PASS_ENV, "1") or "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def same_pass_applies(tree) -> bool:
+    """S48 LBV-ROW-SAME-PASS: does PP0 decide AND load its own load-back in one pass here? PP0 only (a follower never
+    decides a load-back alone -- R11), the row form only (the followers execute PP0's row), switch on."""
+    st = state(tree)
+    return bool(st is not None and st.pp0 and st.row_form and same_pass_enabled())
+
+
+def note_pp0_wait(tree, rid, kv_tokens: int, floor: int, agreed, avail: int, evictable: int) -> None:
+    """S48 instrument: PP0 refused its own load-back this pass -- name the room terms it decided on (S47: "den Wert
+    von pdflip_lbv_pp0_room bzw. R_m im verweigerten Pass loggen"). Sampled: the first 32, then powers of two."""
+    st = state(tree)
+    if st is None:
+        return
+    st.wait_n += 1
+    n = st.wait_n
+    if n <= 32 or (n & (n - 1)) == 0:
+        logger.info("%s PP0-WAIT rid=%s kv_tokens=%d floor=%d agreed=%s avail=%d evictable=%d row_form=%d (n=%d): "
+                    "PP0's room does not hold this load-back now; the request waits and PP0 decides again next pass",
+                    MARK, rid, int(kv_tokens), int(floor), "-" if agreed is None else int(agreed), int(avail),
+                    int(evictable), int(bool(st.row_form)), n)
+
+
+def decide_same_pass(tree, rid, kv_tokens: int, fits_on_pp0) -> bool:
+    """S48 LBV-ROW-SAME-PASS (PP0, row form): decide the load-back and report whether PP0 loads it in THIS pass.
+
+    True  -- it fits: the verdict goes on the wire at the next intake exactly as before (the followers' absorb is
+             unchanged), the rid is marked spent for PP0's own absorb, and the caller loads now;
+    False -- it does not fit: nothing goes on the wire, the caller refuses this pass (the request waits).
+    ``fits_on_pp0`` is the same room callable ``hold`` takes (it may evict PP0's shortfall, as there)."""
+    st = state(tree)
+    if st is None or rid is None or not st.pp0:
+        return False
+    rid = str(rid)
+    if rid in st.self_spent:
+        # decided earlier and not absorbed yet (the load did not run, e.g. a later refusal in the same pass):
+        # the verdict is on the wire already, PP0's room still decides the load
+        return bool(fits_on_pp0())
+    if not fits_on_pp0():
+        return False
+    if rid not in st.sent:
+        st.sent.add(rid)
+        st.out.append(rid)
+    if len(st.self_spent) >= _SPENT_CAP:
+        st.self_spent.clear()
+    st.self_spent.add(rid)
+    logger.info("%s VERDICT rid=%s kv_tokens=%d ok same_pass=1 (row form: PP0 loads it in this pass, its row carries "
+                "the admission; the verdict still rides the next intake)", MARK, rid, int(kv_tokens))
+    return True
 
 
 # ---------------------------------------------------------------------------

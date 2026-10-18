@@ -112,12 +112,12 @@ def test_call_edge_collective_entry_is_replicated_and_the_verdict_is_the_group_m
     assert "hx = _mds.batch_half_x(new_batch.reqs)" in ag     # A1: the front's halbX
     assert "no_fwd = _mds.end_state_handoff(new_batch.reqs)" in ag   # A2: never an E2 hand-off
     assert "local_ok and" in ag                              # rank-local blockers ride in the vote, not in the entry
-    assert "_mixed_d_was_chunked" in ag                      # lifetime-sticky chunk stamp is read
+    assert "chunked = _mds.chunked_big(new_batch.reqs, self.chunked_req, hx)" in ag   # S50: the chunk stamp is read there
 
 
 def test_call_edge_chunk_stamp_and_arming():
     src = (SRT / "managers/scheduler.py").read_text()
-    assert "self.chunked_req._mixed_d_was_chunked = True" in src
+    assert "_mds_stamp.stamp_chunked(self.chunked_req)" in src   # S50: sets _mixed_d_was_chunked (+ the total once)
     init = src[src.index("self._mixed_d_short = bool("):][:900]
     assert "tp_prefill_max_tokens" in init                   # D group only (P has no riegel)
     assert "supports_mixed_chunk()" in init and "enable_kv_session_offload" in init

@@ -2106,6 +2106,16 @@ class Envs:
     # (fLLiper PR #36933 mechanism), drafting resumes the next decode step. Big prefills (R3 set after the timer, R6 rest, any chunk
     # of a chunked request) are never mixed. New feature -> default ON; 0 = the old halt-the-decodes path, byte for byte.
     FLLIPER_PDFLIP_MIXED_D_SHORT = EnvBool(True)
+    # MIXED-D SHORT-CHUNKED (S50, user order 18.10. ~09:10Z "mixed chunk fuer kurze D-Prefills wieder an"): a request D
+    # CHUNKS is still a SHORT D prefill when its whole uncached amount at its first D chunk (seqlen - prefix) lies under the
+    # front's halbX (SOLL R2) -- D's chunk budget (512..2240 on rc13) split such requests, and the lifetime chunk stamp then
+    # kept every chunk unmixed (rc13 D log: 44 of 57 chunk forwards with running decodes belonged to requests under halbX).
+    # A request whose total is >= halbX stays BIG: none of its chunks mixes (R3 timer end, R6 rest), as before.
+    # New feature -> default ON; 0 = any chunked request blocks the mix (S32 form), byte for byte.
+    FLLIPER_PDFLIP_MIXED_D_SHORT_CHUNKED = EnvBool(True)
+    # MIXED-D CENSUS (S50): every this many gate decisions one line "MIXED-D CENSUS" with the mixed share and the refusal
+    # reasons (big_chunk / no_halfx / u_ge_halfx / e2_handoff / local_block / group_veto). 0 = no census line.
+    FLLIPER_PDFLIP_MIXED_D_CENSUS_N = EnvInt(64)
     # DECODE-COLLECT D-CHECK (user ~19:12Z: "es wird 7,5 gesammelt, wenn dann
     # gesammelt nicht mehr token anstehen, als X in D prefillen wuerde, dann
     # prefillt er in D die kleine menge ... auch diese zeit muss einstellbar
@@ -2172,6 +2182,12 @@ class Envs:
     FLLIPER_PDFLIP_DISABLE_TOLD_PACE_IDLE_SKIP = EnvBool(False)
     FLLIPER_PDFLIP_P_TWIN_DEFER = EnvBool(_profile_default("FLLIPER_PDFLIP_P_TWIN_DEFER", False))
     FLLIPER_PDFLIP_TOLD_GROUP_FALLBACK = EnvBool(_profile_default("FLLIPER_PDFLIP_TOLD_GROUP_FALLBACK", False))
+    # S50 TOLD-ACK-EARLY (managers/pdflip_told_ack_early.py): a P follower reports a store read that ended inside its
+    # model forward from that forward (a worker, woken by the read thread, runs the unchanged follower_pump while the
+    # scheduler thread is inside the forward and holds no tree/told state) instead of at the next pass boundary --
+    # S48 class 1 (pdflip-8-123: acks 2.5 s late, PP0's admission behind its commit block). Only on a follower running
+    # the PF ack stream. New feature -> default ON; 0 = the pump only at pass boundaries, byte for byte.
+    FLLIPER_PDFLIP_TOLD_ACK_EARLY = EnvBool(True)
     # Prefix trace (IN 26.09., pdflip/prefix_trace.py): every prefix miss of an
     # agent-load boot gets a token receipt -- one #1420 WALK-STOP line per
     # (rid, stop depth) whose unmatched rest is >= the minimum below, full

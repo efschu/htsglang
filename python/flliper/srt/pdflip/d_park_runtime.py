@@ -1906,6 +1906,13 @@ def admission(sched, running_batch):
     )
     if gate.deferred:
         _note_decode_first(sched, gate)
+    # S48 D-DECODE-GAP (pdflip/d_decode_gap.py): name the gate in the decode pause it may cause (read-only)
+    from flliper.srt.pdflip import d_decode_gap as _ddg
+
+    if gate.deferred:
+        _ddg.note(sched, "f3_decode_first")
+    elif gate.barrier:
+        _ddg.note(sched, "seat")
     return gate if gate.barrier else None
 
 

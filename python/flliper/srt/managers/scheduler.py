@@ -242,6 +242,8 @@ from flliper.srt.pdflip import fork_anchor as _pdflip_fork
 from flliper.srt.pdflip import twin_anchor as _pdflip_twin_anchor  # TWIN ANCHOR (y4a 16-28)
 from flliper.srt.pdflip import d_park_read as _pdflip_park_read  # PARK-RETAIN READ
 from flliper.srt.pdflip import lanes_p as _lanes_p  # PRIORITY LANES 1008 (L3): the P-side lane floor
+from flliper.srt.pdflip import mixed_d_short as _mds_stamp  # MIXED-D chunk stamp + S50 total (short-chunked)
+from flliper.srt.managers import pdflip_told_ack_early as _pdflip_told_ack_early  # S50 TOLD-ACK-EARLY
 from flliper.srt.pdflip import resume_via_p as _pdflip_rvp  # RESUME-VIA-P
 from flliper.srt.pdflip import front_x as _pdflip_front_x  # FRONT-X-MIT: the front's decision X at D's X gate
 from flliper.srt.pdflip import d_wall_head as _pdflip_d_wall_head  # PW-R
@@ -259,6 +261,7 @@ from flliper.srt.pdflip import d_seat_vram as _pdflip_d_seat_vram  # D-MEM-SCHED
 from flliper.srt.pdflip import d_transient_lend as _pdflip_d_transient_lend  # D-TRANSIENT-LEND
 from flliper.srt.pdflip import d_seat_rewake as _pdflip_d_seat_rewake  # D-SEAT-REWAKE: live seat re-plan
 from flliper.srt.pdflip import skip_first as _pdflip_skip_first  # E2 in a mixed wake cohort
+from flliper.srt.pdflip import d_decode_gap as _pdflip_d_decode_gap  # S48 D-DECODE-GAP instrument
 from flliper.srt.layers.dcp import prefix_lens_check as _prefix_lens_check  # #639 ballot (skip: deferred)
 from flliper.srt.pdflip import short_read as _pdflip_short_read  # held short wake reads
 from flliper.srt.pdflip import tail_adopt as _pdflip_tail_adopt
@@ -13245,6 +13248,7 @@ class Scheduler(
             # E2 in a mixed wake cohort: the skip batch's tokens go out with
             # this decode round before the next extend (rank-uniform)
             new_batch = None
+            _pdflip_d_decode_gap.note(self, "skipfirst_hold")  # S48 instrument
             self._admission_decline_note = "gate=pdflip_skip_first_decode"
         elif self._pdflip_dqh_holds(running_batch):
             # DQH (pdflip/d_head_hold.py): the refused D head and everything its
@@ -18678,9 +18682,10 @@ class Scheduler(
         # the final chunk of a resumed one look like a middle chunk). Every other continuation is counted exactly as before.
         if self.chunked_req is not None and not _lanes_p.held_without_seat(self.chunked_req, can_run_list):
             self.chunked_req.inflight_middle_chunks += 1
-            # MIXED-D: lifetime-sticky. A request that has ever been chunked is a BIG prefill; its last
-            # chunk (small by construction) must not read as a short one (R6 rest stays unmixed).
-            self.chunked_req._mixed_d_was_chunked = True
+            # MIXED-D: lifetime-sticky chunk stamp. S50: plus, once, the request's whole uncached amount at its
+            # first D chunk -- a BIG one (>= halbX) keeps every chunk unmixed (R6 rest), a SHORT one D only had to
+            # chunk mixes (pdflip/mixed_d_short.py: chunked_big).
+            _mds_stamp.stamp_chunked(self.chunked_req)
 
         # fnFL2 H42: this pass's anchor bodies join the carried tails; every
         # tail IN this batch takes its middle-chunk increment (no output until
@@ -18880,15 +18885,15 @@ class Scheduler(
 
         x = int(_pdflip_store_short_tail_x(self))
         u = int(getattr(new_batch, "extend_num_tokens", 0) or 0)
-        chunked = self.chunked_req is not None or any(
-            getattr(r, "_mixed_d_was_chunked", False) for r in new_batch.reqs
-        )
         hx = _mds.batch_half_x(new_batch.reqs)
+        # S50: a chunked request blocks only when it is BIG (whole uncached amount >= halbX, or none stamped)
+        chunked = _mds.chunked_big(new_batch.reqs, self.chunked_req, hx)
         no_fwd = _mds.end_state_handoff(new_batch.reqs)
         mine = local_ok and _mds.short_gate(u, x, hx, chunked, no_fwd)
         agreed = bool(self._pdflip_group_min_flags([mine])[0])
         if agreed:
             _mds.note_mixed(u, len(running_batch.reqs), hx, x)
+        _mds.note_verdict(_mds.refusal_reason(u, x, hx, chunked, no_fwd, local_ok), agreed)
         return agreed
 
     def _can_schedule_lora_req(
@@ -19609,6 +19614,9 @@ class Scheduler(
             self._decode_steps_this_phase = (
                 int(getattr(self, "_decode_steps_this_phase", 0) or 0) + 1
             )
+        # S48 D-DECODE-GAP (pdflip/d_decode_gap.py): every pause of D's decode streams with its cause, also
+        # below 5 s -- this funnel sees every forward once. Group D, first TP rank, rank-local, read-only.
+        _pdflip_d_decode_gap.on_batch(self, batch)
 
         # #1241 THE DECODE ROUND BOUNDARY. Here and nowhere else, for the same
         # reason the decode-step counter above is here: this is the ONE funnel
@@ -19936,9 +19944,13 @@ class Scheduler(
                         # that raises cannot leave the batch in FULL capture
                         # for whatever runs next.
                         _stack.enter_context(self._draft_kv_full_capture(batch))
-                    batch_result = self.model_worker.forward_batch_generation(
-                        batch, **kwargs
-                    )
+                    # S50 TOLD-ACK-EARLY: on an armed P follower the forward is the window in which a
+                    # worker may report a read that just ended (managers/pdflip_told_ack_early.py); a null
+                    # context everywhere else.
+                    with _pdflip_told_ack_early.forward_window(self):
+                        batch_result = self.model_worker.forward_batch_generation(
+                            batch, **kwargs
+                        )
                     if produce:
                         self._draft_kv_produce(batch, batch_result)
                 if _pls is not None:

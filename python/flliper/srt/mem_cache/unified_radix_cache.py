@@ -8417,14 +8417,36 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     return True
                 return bool(_sf.local_pp_room(self, kv_tokens, floor, _lbv_rid))
 
-            try:
-                _lbv.hold(self, _lbv_rid, kv_tokens, _lbv_fits)
-            finally:
+            # S48 LBV-ROW-SAME-PASS: on the row form PP0 decides its own load-back and loads it in THIS pass
+            # (its row carries the admission to every follower); a refusal waits as before, now with its terms.
+            _lbv_now = False
+            if _lbv.same_pass_applies(self):
+                try:
+                    _lbv_now = _lbv.decide_same_pass(self, _lbv_rid, kv_tokens, _lbv_fits)
+                except BaseException:
+                    self.dec_lock_ref(best_match_node, ancestor_lock_params)
+                    self.dec_host_lock_ref(best_match_node, host_anchor_params)
+                    raise
+                if not _lbv_now:
+                    _lbv.note_pp0_wait(
+                        self, _lbv_rid, kv_tokens, floor, _sf.agreed_room(self),
+                        int(self.token_to_kv_pool_allocator.available_size()), int(self.evictable_size()),
+                    )
+            else:
+                try:
+                    _lbv.hold(self, _lbv_rid, kv_tokens, _lbv_fits)
+                finally:
+                    self.dec_lock_ref(best_match_node, ancestor_lock_params)
+                    self.dec_host_lock_ref(best_match_node, host_anchor_params)
+                if req is not None:
+                    req._h105e_floor_refused = True  # H105e: waits like a floor refusal
+                return False
+            if not _lbv_now:
                 self.dec_lock_ref(best_match_node, ancestor_lock_params)
                 self.dec_host_lock_ref(best_match_node, host_anchor_params)
-            if req is not None:
-                req._h105e_floor_refused = True  # H105e: waits like a floor refusal
-            return False
+                if req is not None:
+                    req._h105e_floor_refused = True  # H105e: waits like a floor refusal
+                return False
         if kv_tokens > floor:
             try:
                 _room = _sf.local_pp_room(self, kv_tokens, floor, getattr(req, "rid", None))

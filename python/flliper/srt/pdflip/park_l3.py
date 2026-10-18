@@ -448,6 +448,9 @@ def _issue(sched, reqs) -> list:
         setattr(req, WAKE_ATTR, _wake_key(sched))
         out.append(req)
     if out:
+        from flliper.srt.pdflip import d_decode_gap as _ddg  # S48 instrument (read-only)
+
+        _ddg.note(sched, "wake_read")
         logger.info("#248 WAKE-READ issued=%d %s (the hold read runs now: reference and pin at the wake, "
                     "the device load at admission)", len(out), [str(r.rid) for r in out])
     if refused:
