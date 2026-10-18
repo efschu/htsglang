@@ -2381,6 +2381,19 @@ class HostPoolGroup:
         # remains is the whole point -- an empty result is still a valid free.
         pool = self.anchor_entry.host_pool
         handed_back = 0
+        _rel = getattr(pool, "release_disk_rows", None)
+        if callable(_rel) and indices is not None and len(indices):
+            # S36 KV-DURCHLAUF: disk ids are no rows of any tier -- their held L3 files go back here, and they never
+            # reach the #718 stray split (which would drop them by name as a retired tier's ids)
+            from flliper.srt.pdflip import kv_durchlauf as _kv_dl
+
+            if _kv_dl.any_disk(indices):
+                _idx = torch.as_tensor(indices).reshape(-1)
+                _rel(_idx)
+                _keep = (_idx < _kv_dl.DISK_BASE).to(_idx.device)
+                indices = _idx[_keep]
+                if len(indices) == 0:
+                    return 0
         if arena_queue_refs_on():
             indices, handed_back = self._free_arena_rows(pool, indices)
             if len(indices) == 0:

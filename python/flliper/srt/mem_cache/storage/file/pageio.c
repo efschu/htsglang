@@ -288,3 +288,137 @@ int64_t hicache_write_pages(int64_t n, const char **finals, const char **parts,
     free(cov);
     return ok;
 }
+
+/* ---------------------------------------------------------------------------
+ * S36 (18.10.) KV-DURCHLAUF: read whole canonical pages out of file
+ * descriptors the caller HOLDS (the L3 file was opened when the store read
+ * resolved the page; an fd keeps the inode alive even if the L3 LRU unlinks
+ * the path meanwhile -- the page is still the page its key names, writers
+ * publish by rename). fds[i] may be an O_DIRECT descriptor (XFS): a pread
+ * that the kernel refuses for alignment (EINVAL) is repeated through a
+ * buffered descriptor of the SAME inode (/proc/self/fd/<fd>), so a misaligned
+ * target never fails the page. status[i]: 0 ok, 3 short, 4 error.
+ * direct_out[i]: 1 when the page went through O_DIRECT, 0 buffered.
+ * ------------------------------------------------------------------------- */
+static int pio_pread_full(int fd, uint8_t *dst, int64_t len, int64_t off) {
+    int64_t got = 0;
+    while (got < len) {
+        ssize_t r = pread(fd, dst + got, (size_t)(len - got), (off_t)(off + got));
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return -errno;
+        }
+        if (r == 0) return 3;
+        got += r;
+    }
+    return 0;
+}
+
+int64_t hicache_read_fds(int64_t n, const int32_t *fds, const int64_t *offs,
+                         const int64_t *lens, uint8_t **out, int8_t *status,
+                         int8_t *direct_out) {
+    int64_t ok = 0;
+    for (int64_t i = 0; i < n; i++) {
+        int8_t s = 0, d = 0;
+        int fd = fds[i];
+        if (fd < 0) { status[i] = 4; direct_out[i] = 0; continue; }
+        int fl = fcntl(fd, F_GETFL);
+        int is_direct = (fl >= 0) && (fl & O_DIRECT);
+        int rc = pio_pread_full(fd, out[i], lens[i], offs[i]);
+        if (rc == -EINVAL && is_direct) {
+            char p[64];
+            snprintf(p, sizeof p, "/proc/self/fd/%d", fd);
+            int bfd = open(p, O_RDONLY | O_CLOEXEC);
+            if (bfd < 0) rc = -errno;
+            else { rc = pio_pread_full(bfd, out[i], lens[i], offs[i]); close(bfd); }
+        } else if (rc == 0 && is_direct) {
+            d = 1;
+        }
+        if (rc == 3) s = 3; else if (rc != 0) s = 4;
+        status[i] = s;
+        direct_out[i] = d;
+        if (s == 0) ok++;
+    }
+    return ok;
+}
+
+/* S36 Soll 2: the canonical extent WRITE of hicache_write_pages, with every
+ * extent that is aligned for O_DIRECT (payload address, file offset and
+ * length multiples of 4096) written through an O_DIRECT descriptor of the
+ * locked part file -- the L2 -> L3 copy bypasses the page cache on XFS. An
+ * extent that is not aligned, a filesystem without O_DIRECT (tmpfs: EINVAL at
+ * open) or a refused pwrite goes through the buffered descriptor as before.
+ * direct_out[i] counts the extents of page i that went direct. */
+#define PIO_ALIGN 4096
+int64_t hicache_write_pages_direct(int64_t n, const char **finals, const char **parts,
+                                   const char **markers, const int64_t *totals,
+                                   const int64_t *n_ext, const int64_t *ext_off,
+                                   const int64_t *ext_len, const uint8_t **payload,
+                                   int32_t do_fsync, int8_t *status, int32_t *direct_out) {
+    int64_t ok = 0, e = 0;
+    pio_ival *cov = (pio_ival *)malloc(sizeof(pio_ival) * (PIO_MAX_IVALS + 64));
+    if (!cov) { for (int64_t i = 0; i < n; i++) { status[i] = 4; direct_out[i] = 0; } return 0; }
+    for (int64_t i = 0; i < n; i++) {
+        int64_t k = n_ext[i], total = totals[i];
+        int8_t s = 0;
+        int fd = -1, dfd = -1, dfd_tried = 0;
+        direct_out[i] = 0;
+        if (k > 64) { status[i] = 3; e += k; continue; }
+        if (access(finals[i], F_OK) == 0) { status[i] = 2; e += k; continue; }
+        int rc = pio_open_part_locked(parts[i], finals[i], &fd);
+        if (rc != 0) { status[i] = (int8_t)rc; e += k; continue; }
+        struct stat st;
+        int64_t ncov = 0;
+        if (fstat(fd, &st) != 0) s = 4;
+        else {
+            if (st.st_size != 0) {
+                ncov = pio_read_marker(markers[i], total, cov, PIO_MAX_IVALS);
+                if (ncov < 0) { ncov = 0; if (ftruncate(fd, 0) != 0) s = 4; st.st_size = 0; }
+            }
+            if (s == 0 && st.st_size != total && ftruncate(fd, total) != 0) s = 4;
+        }
+        int64_t taken = 0;
+        for (int64_t j = 0; j < k && s == 0; j++) {
+            int64_t off = ext_off[e + j], len = ext_len[e + j], done = 0;
+            const uint8_t *src = payload[i] + taken;
+            int aligned = ((((uintptr_t)src) | (uintptr_t)off | (uintptr_t)len) % PIO_ALIGN) == 0 && len > 0;
+            if (aligned && !dfd_tried) {
+                dfd_tried = 1;
+                dfd = open(parts[i], O_WRONLY | O_DIRECT | O_CLOEXEC);
+            }
+            int use = (aligned && dfd >= 0) ? dfd : fd;
+            while (done < len) {
+                ssize_t w = pwrite(use, src + done, (size_t)(len - done), (off_t)(off + done));
+                if (w < 0) {
+                    if (errno == EINTR) continue;
+                    if (use == dfd && errno == EINVAL) { use = fd; continue; }
+                    s = 4;
+                    break;
+                }
+                done += w;
+            }
+            if (s == 0 && use == dfd) direct_out[i]++;
+            taken += len;
+            if (s == 0) { cov[ncov].lo = off; cov[ncov].hi = off + len; ncov++; }
+        }
+        if (dfd >= 0) close(dfd);
+        if (s == 0) {
+            ncov = pio_merge(cov, ncov);
+            int full = (ncov == 1 && cov[0].lo == 0 && cov[0].hi == total);
+            if (!full) {
+                if (pio_write_marker(markers[i], total, cov, ncov) != 0) s = 4; else s = 1;
+            } else {
+                if (do_fsync && fsync(fd) != 0) s = 4;
+                else if (rename(parts[i], finals[i]) != 0) s = 4;
+                else { if (unlink(markers[i]) != 0 && errno != ENOENT) { /* best effort */ } s = 0; }
+            }
+        }
+        flock(fd, LOCK_UN);
+        close(fd);
+        status[i] = s;
+        if (s == 0 || s == 1) ok++;
+        e += k;
+    }
+    free(cov);
+    return ok;
+}

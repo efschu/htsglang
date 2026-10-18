@@ -7,9 +7,17 @@ ms=17271 queue_ms=17016 read_ms=227`` -- the read took 0.2 s, the load waited
 awake P with work queued and no prefill for 21 s. User law: HiCache never
 brakes the prefill; the write-behind is background work.
 
+S36 SOLL 2 ENDGUELTIG (18.10., user: "das sollte schon immer so sein, das von L2
+auf L3 geschrieben wird ohne zu blockieren"): the write-behind NEVER holds still
+any more -- the 28.09. case is answered by READ PRIORITY per write chunk
+(``l3_write_behind.write_turn``, test_pdflip_s36_kv_durchlauf_1018). What stays
+here: the load census (``loads_pending``, the streak instrument ``_load_gate``)
+and that ``quiet_reason`` answers None whatever it counts.
+
 Guarded here:
-* the gate is quiet while a store->host load is queued or in flight
-  (``load``), open again when none is;
+* ``quiet_reason`` is None while a store->host load is queued or in flight; the
+  former gate's answer (``former_quiet_reason`` / ``_load_gate``) still says
+  ``load`` -- an instrument, not a gate;
 * the controller counts the prefetch queue, the aux thread's buffer and the
   operation in flight;
 * a broken probe never closes the gate.
@@ -35,14 +43,15 @@ def _clean():
     wb._reset_for_tests()
 
 
-def test_the_write_behind_yields_while_a_load_is_queued():
+def test_s36_a_queued_load_no_longer_holds_the_write_behind_still():
     q = {"n": 0}
     wb.register_load_probe(lambda: q["n"])
     assert wb.quiet_reason() is None
     q["n"] = 1
-    assert wb.quiet_reason() == "load"
+    assert wb.quiet_reason() is None, "S36: reads overtake per chunk instead (write_turn)"
+    assert wb.former_quiet_reason() == "load" and wb._load_gate() == "load"
     q["n"] = 0
-    assert wb.quiet_reason() is None
+    assert wb.quiet_reason() is None and wb.former_quiet_reason() is None
 
 
 def test_the_controller_counts_queued_and_in_flight_loads():
@@ -71,12 +80,12 @@ def test_a_dead_controller_drops_out_of_the_gate():
 
     c = Ctl()
     wb.register_load_probe(c.pending)
-    assert wb.quiet_reason() == "load"
+    assert wb.former_quiet_reason() == "load" and wb.quiet_reason() is None
     del c
     import gc
 
     gc.collect()
-    assert wb.quiet_reason() is None
+    assert wb.former_quiet_reason() is None
 
 
 class _Clock:
@@ -94,16 +103,16 @@ def test_a_load_that_never_stops_gets_a_bounded_write_window(monkeypatch):
     monkeypatch.setenv(wb.ENV_LOAD_YIELD_MAX_S, "30")
     monkeypatch.setenv(wb.ENV_LOAD_WRITE_S, "2")
     wb.register_load_probe(lambda: 1)
-    assert wb.quiet_reason() == "load"
+    assert wb._load_gate() == "load"
     clk.t += 29.0
-    assert wb.quiet_reason() == "load"
+    assert wb._load_gate() == "load"
     assert wb.load_yield_stats()["running_s"] == pytest.approx(29.0)
     clk.t += 1.0
-    assert wb.quiet_reason() is None          # the cap: writes anyway
+    assert wb._load_gate() is None          # the cap: writes anyway
     clk.t += 1.9
-    assert wb.quiet_reason() is None          # inside the 2 s window
+    assert wb._load_gate() is None          # inside the 2 s window
     clk.t += 0.2
-    assert wb.quiet_reason() == "load"        # the next streak starts
+    assert wb._load_gate() == "load"        # the next streak starts
     st = wb.load_yield_stats()
     assert st["caps"] == 1 and st["streaks"] == 1 and st["max_s"] == pytest.approx(30.0)
 
@@ -114,11 +123,11 @@ def test_the_streaks_are_counted_and_zero_bound_never_writes(monkeypatch):
     monkeypatch.setenv(wb.ENV_LOAD_YIELD_MAX_S, "0")
     q = {"n": 1}
     wb.register_load_probe(lambda: q["n"])
-    assert wb.quiet_reason() == "load"
+    assert wb._load_gate() == "load"
     clk.t += 500.0
-    assert wb.quiet_reason() == "load"        # 0 = no bound
+    assert wb._load_gate() == "load"        # 0 = no bound
     q["n"] = 0
-    assert wb.quiet_reason() is None
+    assert wb._load_gate() is None
     st = wb.load_yield_stats()
     assert st == {"streaks": 1, "total_s": pytest.approx(500.0), "max_s": pytest.approx(500.0),
                   "caps": 0, "running_s": 0.0}
