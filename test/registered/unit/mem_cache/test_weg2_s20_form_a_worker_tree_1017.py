@@ -159,3 +159,22 @@ def test_h16v3_tp0_arena_full_workers_free_the_tp0_own_store_read_lands_and_the_
     assert DD._released(tp0)[:0] == [], "diagnostics"
     # the worker's span (shared by both ranks) is released on both or on neither -- never rank-uneven
     assert (1 in DD._released(tp0)) == (1 in DD._released(worker))
+
+
+# === review S20 A2: RRSTATE counts as a STATE in the K21 pairing sets ==========================================
+def test_k21_tp0_orphaned_worker_clean_with_only_an_rrstate_is_no_stop_and_resolves_kv():
+    """TP0's ack orphaned the node (K21 event), this worker's own ack was clean, and the only verdict that follows is a
+    READ-ROOM STATE (RRSTATE). The pairing must see a STATE for the key (no 'no STATE follows' deferred stop) and the
+    worker must end ``kv`` (k21_expect resolved). Mutant: RRSTATE out of ``st_keys``/``state_keys`` -> deferred stop."""
+    ranks = H._ranks()
+    w = ranks[1]
+    node = w.node_at(H.NODE)
+    key = m.node_key(node)
+    with H._switch(True):
+        with H._as_rank(w):
+            m.note_k21_ack(node, 0)                                   # own ack: clean
+            m.apply(w, [(m.K21, key[0], key[1], 1, 0, 0),             # TP0: orphaned
+                        (m.RRSTATE, key[0], key[1], 1, 0, 1)], seq=1)  # + a READ-ROOM STATE: KV host rows gone, anchor kept
+            assert m._S.k21_stop_msg is None, m._S.k21_stop_msg
+            assert key not in m._S.k21_expect, "k21_expect must be resolved with 'kv'"
+            assert node.component_data[H.FULL].host_value is None

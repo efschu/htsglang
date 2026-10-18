@@ -15714,7 +15714,7 @@ class Scheduler(
                     "site=drain occurrence=%d capacity_occurrence=%d -- the store HOLDS the whole span (probe hit "
                     "covers it) and the read ended short on D's own arena room; this is not P's write-through "
                     "lagging. Deferring through the A12.2 shortfall arm; the room is the defect (READ-ROOM serves "
-                    "group P only). Denominator: every terminated store read of this rank whose record reports a "
+                    "group P and, via TP0 at its broadcast, group D). Denominator: every terminated store read of this rank whose record reports a "
                     "page-floored shortfall AND whose probe hit covers the deliverable prefix",
                     rid, delivered, deliverable, deliverable - delivered, int(outcome.hit_tokens), n, nc,
                 )

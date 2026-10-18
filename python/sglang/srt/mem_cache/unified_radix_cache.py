@@ -6432,6 +6432,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if not _read_room_l3_complete(node, sec):
                 # review readroomd B3 (every role): released only when EVERY page of the node has its L3 copy --
                 # the COMPLETE pages are all the node's pages and each is on disk or was written now
+                incomplete += 1   # S20 review H3: counted in the line's existing ``incomplete`` skip counter
                 continue
             secured += int(sec.get("on_disk", 0))
             written += int(sec.get("written", 0))

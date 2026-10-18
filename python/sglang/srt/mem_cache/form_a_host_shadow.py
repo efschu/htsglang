@@ -86,6 +86,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -166,6 +167,8 @@ class _State:
         self.k21_confirmed: Dict[Tuple[str, int], int] = {}
         # keys TP0 reported as orphan while this worker's own ack was clean: its STATE must end 'kv'
         self.k21_expect: set = set()
+        # S20 review A1: READ-ROOM-STATE windows open on this worker, (hash, depth) -> [t_open, passes]
+        self.rr_open: Dict[Tuple[str, int], list] = {}
         # named stop found outside a consume (own-ack time); raised at the end of the next consume
         self.k21_stop_msg: Optional[str] = None
         # number of broadcasts consumed on this rank
@@ -732,6 +735,7 @@ def on_tree_reset(tree: Any) -> None:
     _S.k21_inbox = []
     _S.k21_confirmed = {}
     _S.k21_expect = set()
+    _S.rr_open = {}
     _S.k21_stop_msg = None
     _S.rebind_wait = {}
 
@@ -883,8 +887,8 @@ def apply(tree: Any, events: List, seq: int = 0) -> Dict[str, int]:
                     f"applied as {out!r} on a worker (expected 'kv'): rank trees diverge"
                     + _k21_ctx((h, int(depth)), 1, 1))
         c[out] += 1
-        if kind == RRSTATE and out in ("pending", "deleted", "short", "unreconcilable"):
-            _rrstate_diverged(node, h, depth, out, seq)
+        if kind == RRSTATE:
+            _rrstate_window(node, h, depth, out, seq)
     n = _note("applied")
     if n and (events or any(c[k] for k in ("transit", "kv", "anchor", "deleted", "rebind", "spill"))):
         logger.info(
@@ -933,6 +937,29 @@ def _state_diverged(node: Any, h: Any, depth: Any, out: str, seq: int) -> None:
         "K23 SPILL-DIVERGED role=worker key=%s:%s node=%s seq=%d outcome=%s (n=%d): TP0 dropped this node "
         "(STATE exists=0) and this worker could not delete it -- the ranks' trees now differ",
         str(h)[:16], depth, getattr(node, "id", "?"), int(seq), out, n)
+
+def _rrstate_window(node: Any, h: Any, depth: Any, out: str, seq: int) -> None:
+    """S20 review A1: a READ-ROOM STATE that ends ``pending`` re-enters ``_S.pending`` and is re-applied every pass.
+    The WINDOW is named once when it opens (first ``pending`` of the key) and once when it closes (first other
+    outcome, with duration and passes); the counter counts windows, not passes. ``deleted``/``short``/
+    ``unreconcilable`` are terminal single events."""
+    k = (str(h), int(depth))
+    if out == "pending":
+        w = _S.rr_open.get(k)
+        if w is None:
+            _S.rr_open[k] = [time.monotonic(), 1]
+            _rrstate_diverged(node, h, depth, out, seq)
+        else:
+            w[1] += 1
+        return
+    w = _S.rr_open.pop(k, None)
+    if w is not None:
+        logger.info(
+            "R12 READ-ROOM-STATE window closed node=%s depth=%s hash=%s out=%s after %.3fs and %d passes",
+            getattr(node, "id", "?"), depth, str(h)[:16], out, time.monotonic() - w[0], w[1])
+    if out in ("deleted", "short", "unreconcilable"):
+        _rrstate_diverged(node, h, depth, out, seq)
+
 
 def _rrstate_diverged(node: Any, h: Any, depth: Any, out: str, seq: int) -> None:
     """READ-ROOM-D (review readroomd2 A4): a worker that cannot apply TP0's READ-ROOM STATE at once. ``pending``:
