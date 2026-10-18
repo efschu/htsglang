@@ -43997,6 +43997,37 @@
    ],
    "type": "os.environ"
   },
+  "FLLIPER_HICACHE_L3_WB_READ_YIELD_MS": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": null,
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "",
+   "id": "FLLIPER_HICACHE_L3_WB_READ_YIELD_MS",
+   "kind": "env",
+   "lesestellen": [
+    "mem_cache/l3_write_behind.py:177"
+   ],
+   "level": "expert",
+   "name": "FLLIPER_HICACHE_L3_WB_READ_YIELD_MS",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "mem_cache/l3_write_behind.py",
+    "kind": "os.environ",
+    "line": 177,
+    "tree": "nf"
+   },
+   "status": "unexplained",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "os.environ"
+  },
   "FLLIPER_HICACHE_LOAD_ASYNC_INDEX": {
    "abweichung": {
     "27b": {
@@ -44014,7 +44045,7 @@
      "source": {
       "file": "mem_cache/pool_host/arena_pool.py",
       "kind": "os.environ",
-      "line": 1206
+      "line": 1262
      }
     }
    },
@@ -53898,7 +53929,7 @@
    "id": "FLLIPER_PDFLIP_ARENA_REF_RECHECK",
    "kind": "env",
    "lesestellen": [
-    "managers/cache_controller.py:157"
+    "managers/cache_controller.py:158"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_ARENA_REF_RECHECK",
@@ -53907,7 +53938,7 @@
    "source": {
     "file": "managers/cache_controller.py",
     "kind": "os.environ",
-    "line": 157,
+    "line": 158,
     "tree": "nf"
    },
    "status": "harvested",
@@ -65436,6 +65467,99 @@
    ],
    "type": "EnvBool"
   },
+  "FLLIPER_PDFLIP_KV_DURCHLAUF": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"1\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "",
+   "id": "FLLIPER_PDFLIP_KV_DURCHLAUF",
+   "kind": "env",
+   "lesestellen": [
+    "pdflip/kv_durchlauf.py:81"
+   ],
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_KV_DURCHLAUF",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "pdflip/kv_durchlauf.py",
+    "kind": "os.environ",
+    "line": 81,
+    "tree": "nf"
+   },
+   "status": "unexplained",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "os.environ"
+  },
+  "FLLIPER_PDFLIP_KV_DURCHLAUF_BLOCK_MIB": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "",
+   "id": "FLLIPER_PDFLIP_KV_DURCHLAUF_BLOCK_MIB",
+   "kind": "env",
+   "lesestellen": [
+    "pdflip/kv_durchlauf.py:288"
+   ],
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_KV_DURCHLAUF_BLOCK_MIB",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "pdflip/kv_durchlauf.py",
+    "kind": "os.environ",
+    "line": 288,
+    "tree": "nf"
+   },
+   "status": "unexplained",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "os.environ"
+  },
+  "FLLIPER_PDFLIP_KV_DURCHLAUF_DIRECT": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"1\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "",
+   "id": "FLLIPER_PDFLIP_KV_DURCHLAUF_DIRECT",
+   "kind": "env",
+   "lesestellen": [
+    "pdflip/kv_durchlauf.py:85"
+   ],
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_KV_DURCHLAUF_DIRECT",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "pdflip/kv_durchlauf.py",
+    "kind": "os.environ",
+    "line": 85,
+    "tree": "nf"
+   },
+   "status": "unexplained",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "os.environ"
+  },
   "FLLIPER_PDFLIP_KV_RESUME_FIT_WAIT_S": {
    "bare": false,
    "choices": null,
@@ -66361,7 +66485,7 @@
    "id": "FLLIPER_PDFLIP_L3FILL_JOIN_IDLE_MS",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/hicache_storage.py:442"
+    "mem_cache/hicache_storage.py:456"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_L3FILL_JOIN_IDLE_MS",
@@ -66370,7 +66494,7 @@
    "source": {
     "file": "mem_cache/hicache_storage.py",
     "kind": "os.environ",
-    "line": 442,
+    "line": 456,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -66553,7 +66677,7 @@
    "id": "FLLIPER_PDFLIP_L3FILL_REF_AT_LAND",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/hicache_storage.py:52"
+    "mem_cache/hicache_storage.py:53"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_L3FILL_REF_AT_LAND",
@@ -66562,7 +66686,7 @@
    "source": {
     "file": "mem_cache/hicache_storage.py",
     "kind": "os.environ",
-    "line": 52,
+    "line": 53,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -66910,7 +67034,7 @@
    "id": "FLLIPER_PDFLIP_L3_REFRESH_KEPT",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/hicache_storage.py:4682"
+    "mem_cache/hicache_storage.py:4752"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_L3_REFRESH_KEPT",
@@ -66919,7 +67043,7 @@
    "source": {
     "file": "mem_cache/hicache_storage.py",
     "kind": "os.environ",
-    "line": 4682,
+    "line": 4752,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -66956,6 +67080,68 @@
     "27b"
    ],
    "type": "EnvInt"
+  },
+  "FLLIPER_PDFLIP_L3_WRITE_BEHIND_CHUNK_PAGES": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "",
+   "id": "FLLIPER_PDFLIP_L3_WRITE_BEHIND_CHUNK_PAGES",
+   "kind": "env",
+   "lesestellen": [
+    "mem_cache/hicache_storage.py:3705"
+   ],
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_L3_WRITE_BEHIND_CHUNK_PAGES",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "mem_cache/hicache_storage.py",
+    "kind": "os.environ",
+    "line": 3705,
+    "tree": "nf"
+   },
+   "status": "unexplained",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "os.environ"
+  },
+  "FLLIPER_PDFLIP_L3_WRITE_BEHIND_DIRECT": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"1\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "",
+   "id": "FLLIPER_PDFLIP_L3_WRITE_BEHIND_DIRECT",
+   "kind": "env",
+   "lesestellen": [
+    "mem_cache/hicache_storage.py:3712"
+   ],
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_L3_WRITE_BEHIND_DIRECT",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "mem_cache/hicache_storage.py",
+    "kind": "os.environ",
+    "line": 3712,
+    "tree": "nf"
+   },
+   "status": "unexplained",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "os.environ"
   },
   "FLLIPER_PDFLIP_L3_WRITE_BEHIND_MIB": {
    "bare": false,
@@ -88938,8 +89124,8 @@
  "schema": "flliper.catalog/1",
  "stats": {
   "curated": 125,
-  "entries": 2803,
-  "envs": 1925,
+  "entries": 2809,
+  "envs": 1931,
   "explained": 310,
   "flags": 863,
   "harvested": 1725,
@@ -88947,19 +89133,19 @@
    "abweichung": 49,
    "beide": 2462,
    "nur_27b": 181,
-   "nur_nf": 142
+   "nur_nf": 148
   },
-  "unexplained": 643
+  "unexplained": 649
  },
- "tree_rev": "27b=0798c91fcd+nf=76df327107",
+ "tree_rev": "27b=0798c91fcd+nf=8c56fdc6c4",
  "trees": {
   "27b": {
    "entries": 2643,
    "rev": "0798c91fcd"
   },
   "nf": {
-   "entries": 2604,
-   "rev": "76df327107"
+   "entries": 2610,
+   "rev": "8c56fdc6c4"
   }
  },
  "warnungen": []
