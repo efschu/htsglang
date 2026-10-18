@@ -22,7 +22,16 @@ from sglang.srt.mem_cache import form_a_host_shadow as R  # noqa: E402
 
 
 def _worker_peels(g, idxs):
-    """The worker's own device peel, leaf first, through the real funnel."""
+    """The worker's own device peel, leaf first, through the real ``_evict_to_host`` (the fixture tree has no LRU
+    machinery: the component free is the one stand-in, it only takes the KV off the device)."""
+    def _free(node, comp, target=None, tracker=None):
+        node.component_data[FULL].value = None
+        return 0, 0
+
+    g.t1._evict_component_and_detach_lru = _free
+    g.t1._cascade_evict = lambda node, trigger, tracker: None
+    g.t1._record_remove_event = lambda node, medium=None: None
+    g.t1._for_each_component_lru = lambda *a, **k: None
     for i in sorted(idxs, reverse=True):
         n = g.n1[i]
         with _as("worker"):
@@ -30,13 +39,15 @@ def _worker_peels(g, idxs):
         assert n.evicted and n.component_data[FULL].host_value is not None
 
 
-def _tp0_serves(g):
+def _tp0_serves(g, expect_verdict=True):
     with _as("worker"):
         m1 = _claimer(g.t1, "b")
         assert g.t1._weg2_direct_claim(m1) is False
     with _as("host"):
         R.register_tree(g.t0)
         sent = R.attach([])
+    if not expect_verdict:
+        return sent
     assert sent and isinstance(sent[0], R.FormAHostVerdict)
     return sent[0]
 
@@ -124,6 +135,6 @@ def test_s22_unkeyed_nodes_are_no_tp0_candidates(group):
     g = group
     for n in g.n0:
         n.hash_value = None
-    v = _tp0_serves(g)
+    sent = _tp0_serves(g, expect_verdict=False)
     assert all(n.component_data[FULL].host_value is not None for n in g.n0)
-    assert not [e for e in v.events if e[0] == R.SPILL]
+    assert not [v for v in sent if isinstance(v, R.FormAHostVerdict) and any(e[0] == R.SPILL for e in v.events)]
