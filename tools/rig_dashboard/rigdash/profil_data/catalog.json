@@ -35231,7 +35231,7 @@
    "depends": [],
    "gain": "",
    "group": "",
-   "help": "S51 metal instrument for EAGER-DEVICE-EM: the first N EM forwards PER LAYER also run the plain host plan (H107 off) as the reference, one line 'EAGER-DEVICE-STEP CHECK ... waves=W ...' each; a deviation beyond fp rounding stops the rank by name (the D-Mini-Extend check, own budget). 1 (default) = the first EM extend of the process proves all layers once.",
+   "help": "S51 metal instrument for EAGER-DEVICE-EM: the first N EM forwards PER LAYER also run the plain host plan (H107 off) as the reference, one line 'EAGER-DEVICE-STEP CHECK ... waves=W ...' each (own budget, apart from the D-Mini-Extend check). S51r (review 18.10.): a deviation beyond fp rounding does NOT stop the rank -- the reference IS the host plan, so that extend is served by it, one ERROR line 'EAGER-DEVICE-EM MISMATCH-FALLBACK layer N ...' names it, and that layer plans every later extend past the graph form on the host (a defect report; the default stays on, the other layers keep EM). 1 (default) = the first EM extend of the process proves all layers once; 0 = off.",
    "id": "FLLIPER_DEBUG_MOE_POOL_EAGER_DEVICE_EM_CHECK",
    "kind": "env",
    "level": "expert",
@@ -35241,7 +35241,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 3864,
+    "line": 3869,
     "tree": "nf"
    },
    "status": "harvested",
@@ -37973,7 +37973,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4925,
+    "line": 4930,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -38291,7 +38291,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4924,
+    "line": 4929,
     "tree": "nf"
    },
    "status": "harvested",
@@ -52188,7 +52188,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 3871,
+    "line": 3876,
     "tree": "nf"
    },
    "status": "harvested",
@@ -53953,7 +53953,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4642,
+    "line": 4647,
     "tree": "nf"
    },
    "status": "harvested",
@@ -60908,7 +60908,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 3949
+      "line": 3954
      }
     }
    },
@@ -61298,7 +61298,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4621
+      "line": 4626
      }
     }
    },
@@ -62275,7 +62275,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4601
+      "line": 4606
      }
     }
    },
@@ -65851,7 +65851,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4732
+      "line": 4737
      }
     }
    },
@@ -68948,7 +68948,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4530
+      "line": 4535
      }
     }
    },
@@ -73240,7 +73240,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4647,
+    "line": 4652,
     "tree": "nf"
    },
    "status": "harvested",
@@ -77868,7 +77868,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4719
+      "line": 4724
      }
     }
    },
@@ -89637,7 +89637,7 @@
   },
   "unexplained": 651
  },
- "tree_rev": "27b=0798c91fcd+nf=a3c0bc55f5",
+ "tree_rev": "27b=0798c91fcd+nf=1261aa4f22",
  "trees": {
   "27b": {
    "entries": 2643,
@@ -89645,7 +89645,7 @@
   },
   "nf": {
    "entries": 2628,
-   "rev": "a3c0bc55f5"
+   "rev": "1261aa4f22"
   }
  },
  "warnungen": []
