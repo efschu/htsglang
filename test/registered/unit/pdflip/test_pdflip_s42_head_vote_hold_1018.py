@@ -273,6 +273,23 @@ def test_rc11_1413_six_waiting_34_rounds_measured_only_on_evaluated_passes(monke
     assert g.rv.count() == [M] * N, "one packed MIN per round on every rank, held or not"
 
 
+def test_rc11_1413_no_refused_head_the_queue_is_held_all_the_same(monkeypatch):
+    """rc11 14:12:43-14:17:46: the passes declined all six before add_one_req (no NO_TOKEN, no X-GATE) and the
+    HOL state still named the head of 14:09 (r34-107), admitted and RUNNING since. RED with the head required
+    (DQH never armed: 6 x M head matches)."""
+    from flliper.srt.pdflip import d_head_hold as H
+
+    g = _Group(monkeypatch)
+    scheds = [_sched(r) for r in range(N)]
+    for s in scheds:
+        s._pdflip_hol = {"rid": RUNNING[0], "passes": 40, "logged": 3}
+    M = 2 * (H.REEVAL_EVERY_PASSES + 1)
+    results = g.run(scheds, M)
+    for s, res in zip(scheds, results):
+        assert _evaluated(res) == [0, H.REEVAL_EVERY_PASSES + 1], _evaluated(res)
+        assert len(s.measured) == len(RIDS) * 2, len(s.measured)
+
+
 def test_every_evaluated_pass_reads_a_vote_measured_in_its_own_iteration(monkeypatch):
     g = _Group(monkeypatch)
     scheds = [_sched(r) for r in range(N)]
@@ -289,13 +306,17 @@ def test_every_evaluated_pass_reads_a_vote_measured_in_its_own_iteration(monkeyp
 # --------------------------------------------------------------------------------------------------------------
 # Re-evaluation on every relevant change (danger direction: a missed change -> the request starves)
 # --------------------------------------------------------------------------------------------------------------
+@pytest.mark.parametrize("hol", ["refused_head", "no_head"])
 @pytest.mark.parametrize("change", ["arrival", "left_queue", "decode_finished", "prefetch_landed", "flip", "bound"])
-def test_a_relevant_change_measures_the_vote_at_once(monkeypatch, change):
+def test_a_relevant_change_measures_the_vote_at_once(monkeypatch, change, hol):
     from flliper.srt.pdflip import d_head_hold as H
 
     AT = 5
     g = _Group(monkeypatch, gen_fn=(lambda it: 8 if (change == "flip" and it >= AT) else 7))
     scheds = [_sched(r) for r in range(N)]
+    if hol == "no_head":
+        for s in scheds:
+            s._pdflip_hol = {"rid": RUNNING[0], "passes": 40, "logged": 3}
 
     def per_round(i, s):
         if i != AT:
