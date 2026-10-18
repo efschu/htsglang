@@ -5612,7 +5612,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         path, depth = _mad.ancestor_path(target=node, root=self.root_node)
         owned = _mad.owned_anchors(path=path, rid=rid, anchor_of=lambda n: self._weg2_anchor_of(n, mp))
         if len(owned) >= cap:
-            victim = _mad.pick_own_victim(owned)
+            victim = _mad.pick_own_victim(self._r12_anchor_deletable(owned))
             if victim is not None:
                 self._weg2_release_anchor(victim, mp, st, why="share", for_rid=rid)
                 owned = [a for a in owned if a is not victim]
@@ -5780,7 +5780,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return False
         cands = _mad.tree_anchors(root=self.root_node, anchor_of=lambda n: self._weg2_anchor_of(n, mp),
                                   include_untagged=True)
-        cands = [a for a in cands if a.node is not node]
+        cands = self._r12_anchor_deletable([a for a in cands if a.node is not node])
         # K15c review A1 (16.10., boot 1016_103428 10:42:16 TP0 DISPLACE why=park_first node=59
         # dropped=0): the park spill takes the same victims -- on the Form A host only ref-free ones
         _rf = UnifiedRadixCache._k15c_ref_free_filter(arena) if _r12.role() == "host" else None
@@ -6089,7 +6089,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             root=self.root_node,
             anchor_of=lambda n: self._weg2_anchor_of(n, mp, allow_end=True),
             include_untagged=True)
-        cands = [a for a in cands if a.node is not node]
+        cands = self._r12_anchor_deletable([a for a in cands if a.node is not node])
         if ref_free is not None:
             if shared_out is not None:
                 shared_out.update(id(a.node) for a in cands if not ref_free(a))
@@ -6097,15 +6097,37 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         return _mad.pick_last_resort_victim(cands, chain_ids=self._weg2_park_chain(),
                                             claimer_lane=self._weg2_claim_lane(node, park=park))
 
+    def _r12_anchor_deletable(self, anchors):
+        """S22 (review point 5): the anchors TP0 may release as victims. On TP0 of a Form A group releasing the anchor
+        of a device-evicted, childless node without KV host DELETES the node (STATE exists=0); a worker that holds the
+        node device-resident or interior cannot follow, so such an anchor is no victim -- the next one is taken (as
+        ``evict_host`` continues to the next leaf). Not in the sleep flush (the verdict is sent there as everywhere)."""
+        if _r12.role() != "host" or getattr(self, "_weg2_flush_spill", False):
+            return anchors
+        nd = _r12.worker_nodelete_keys(self)
+        if not nd:
+            return anchors
+        keep, held = [], 0
+        for a in anchors:
+            n = a.node
+            if (n.evicted and not n.children and n.component_data[BASE_COMPONENT_TYPE].host_value is None
+                    and _r12.node_key(n) in nd):
+                held += 1
+                continue
+            keep.append(a)
+        if held:
+            _r12.kept_note("anchor_worker_cannot_delete", held)
+        return keep
+
     def _weg2_full_victim(self, node, rid, owned, mp):
         """FULL: the request's own shallowest anchor; a request with none to
         give (its first anchor, or its end anchor) takes another request's
         shallowest INTERMEDIATE anchor."""
-        victim = _mad.pick_own_victim(owned)
+        victim = _mad.pick_own_victim(self._r12_anchor_deletable(owned))
         if victim is not None or (owned and not node._weg2_end_anchor):
             return victim
         tree = _mad.tree_anchors(root=self.root_node, anchor_of=lambda n: self._weg2_anchor_of(n, mp))
-        return _mad.pick_foreign_victim(tree, rid=rid)
+        return _mad.pick_foreign_victim(self._r12_anchor_deletable(tree), rid=rid)
 
     def _weg2_release_anchor(self, victim, mp, st, why: str, for_rid: str) -> int:
         """Release this rank's reference on the victim's anchor (the node keeps
@@ -6113,25 +6135,24 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         the slot once no rank references it. Returns the slots dropped (K15c
         review A2: 0 = another process still references them, no slot freed)."""
         comp = self.components[ComponentType.MAMBA]
-        _moot = False
         if _r12.role() == "host":
             # S22 (R12 SPILL-DIVERGED class, h16v4b 02:09:44 / 02:18:01 K23 SPILL-DIVERGED after DISPLACE
             # why=flush_spill): dropping the anchor of a device-evicted, childless node with no KV host DELETES the
             # node on TP0; the STATE(exists=0) reaches a worker that holds it device-resident or as an interior
-            # node and cannot delete it. TP0 decides on what the workers can apply.
+            # node and cannot delete it. The VICTIM CHOICE already leaves such nodes out (``_r12_anchor_deletable``);
+            # this is the backstop for a victim that got here by another road.
             _bcd = victim.node.component_data[BASE_COMPONENT_TYPE]
             if victim.node.evicted and not victim.node.children and _bcd.host_value is None:
                 if getattr(self, "_weg2_flush_spill", False):
-                    # the sleep flush: the tree reset follows on EVERY rank at the end of this flush, no verdict
-                    # outlives it -- no STATE is sent (named once, counted apart from runtime divergences)
-                    _moot = True
+                    # the sleep flush ends WITHOUT a reset when /flush_cache answers "quiesced" or "Cache not
+                    # flushed" (h16v4b: 3x "Cache not flushed" on TP0): the STATE is sent as everywhere, counted only
                     _r12.kept_note("anchor_flush_reset_covers", 1)
                 elif _r12.node_key(victim.node) in _r12.worker_nodelete_keys(self):
-                    _r12.kept_note("anchor_worker_cannot_delete", 1)
+                    _r12.kept_note("anchor_release_refused", 1)
                     return 0
         self._evict_component_and_detach_lru(victim.node, comp, target=EvictLayer.HOST, tracker=None)
         self._update_evictable_leaf_sets(victim.node)
-        if _r12.role() == "host" and not _moot:
+        if _r12.role() == "host":
             _r12.record_state(self, victim.node, why="h19_" + why)  # R12: workers drop it too
         dropped = mp.drop_unreferenced(list(victim.slots))
         if why == "share":

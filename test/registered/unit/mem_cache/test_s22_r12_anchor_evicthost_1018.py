@@ -12,6 +12,10 @@ import unittest.mock as mock
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
+import sys  # noqa: E402
+sys.path.insert(0, os.path.dirname(__file__))
+from test_w3_arena_spill_forma_dual15_0930 import group  # noqa: E402,F401
+
 from sglang.srt.mem_cache import form_a_host_shadow as R  # noqa: E402
 from sglang.srt.mem_cache.unified_cache_components.full_component import FullComponent  # noqa: E402
 from sglang.srt.mem_cache.unified_radix_cache import BASE_COMPONENT_TYPE, UnifiedRadixCache  # noqa: E402
@@ -74,11 +78,51 @@ def test_anchor_release_of_a_node_that_survives_is_untouched():
     assert calls == ["evict", "state"]
 
 
-def test_in_the_sleep_flush_no_verdict_is_sent_the_reset_covers_it():
+def test_in_the_sleep_flush_the_state_is_sent_as_everywhere_no_reset_is_assumed():
+    """/flush_cache can end WITHOUT a reset ("quiesced", "Cache not flushed": 3x on h16v4b TP0, two right after
+    FLUSH-SPILLs 02:09:44) -- so the flush sends the verdict like every other path, unfiltered."""
     n = _node("a", 4)
     got, calls = _release(n, flush=True, nd={R.node_key(n)})
-    assert got == 1 and calls == ["evict"], calls            # released on TP0, no STATE: no SHADOW-UNRECONCILABLE
-    assert R._S.counts["kept_total_anchor_flush_reset_covers"] == 1
+    assert got == 1 and calls == ["evict", "state"], calls
+    assert R._S.counts["kept_total_anchor_flush_reset_covers"] == 1     # classification only
+
+
+def test_after_a_flush_without_reset_the_worker_follows_the_state(group):
+    """The flip of the old reset-covers case: no tree reset after the flush; the worker applies TP0's STATE for the
+    deleted node and ends in the same tree (device-evicted leaf there -> deleted)."""
+    g = group
+    from test_w3_arena_spill_forma_dual15_0930 import FULL as F
+    g.n1[7].component_data[F].value = None
+    g.t1._evict_host_leaf = lambda node, tracker: g.n1[7].parent.children.pop(tuple(g.n1[7].key), None) \
+        or g.n1[7].parent.children.clear()
+    k = R.node_key(g.n1[7])
+    with mock.patch.object(R, "role", return_value="worker"):
+        c = R.apply(g.t1, [(R.STATE, k[0], k[1], 0, 0, 0)], seq=1)
+    assert c["deleted"] == 1 and c["unreconcilable"] == 0, c
+
+
+class _A(types.SimpleNamespace):
+    __hash__ = object.__hash__
+
+
+def _anchor(n, rid, depth):
+    return _A(node=n, rid=rid, depth=depth, slots=[depth])
+
+
+def test_victim_choice_skips_a_protected_anchor_and_takes_the_next_one():
+    """Review point 5: the protected victim at the top used to end in ``return 0`` and block every displacement
+    (callers do not look for another). The choice itself leaves it out now."""
+    R._reset_state_for_tests()
+    first, second = _node("a", 4, nid=1), _node("b", 8, nid=2)
+    owned = [_anchor(first, "r", 4), _anchor(second, "r", 8)]
+    me = types.SimpleNamespace(_weg2_flush_spill=False)
+    me._r12_anchor_deletable = lambda a: UnifiedRadixCache._r12_anchor_deletable(me, a)
+    me._weg2_anchor_of = None
+    with mock.patch.object(R, "role", return_value="host"), \
+            mock.patch.object(R, "worker_nodelete_keys", return_value={R.node_key(first)}):
+        victim = UnifiedRadixCache._weg2_full_victim(me, types.SimpleNamespace(_weg2_end_anchor=False), "r", owned, None)
+    assert victim is owned[1], "the protected first victim blocked the displacement"
+    assert R._S.counts["kept_total_anchor_worker_cannot_delete"] == 1
 
 
 def test_a_worker_or_a_plain_group_is_untouched():
