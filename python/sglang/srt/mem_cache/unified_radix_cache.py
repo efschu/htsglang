@@ -5775,13 +5775,31 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             req._weg2_aor_tried = kmd
         except Exception:  # noqa: BLE001
             pass
+        return self._weg2_aor_read_attach(req, mp, backend, kmd, sad, site="match")
+
+    def _weg2_aor_read_attach(self, req, mp, backend, depth: int, anchor_was: int, site: str) -> int:
+        """e1 body (shared with S43 ``weg2_anchor_only_read_at``): the node at
+        exactly ``depth`` on the request's key path, no Mamba state on it, a
+        last-page hash -> read ONLY that anchor blob from the store and attach
+        it as the node's host Mamba value. Returns ``depth`` on an attach, 0
+        otherwise; a failed read releases its row."""
         node = self._weg2_kv_chain_end(
-            req.full_untruncated_fill_ids, getattr(req, "extra_key", None), kmd)
+            req.full_untruncated_fill_ids, getattr(req, "extra_key", None), depth)
         if node is None:
             return 0
         cd = node.component_data[ComponentType.MAMBA]
         if cd.value is not None or (cd.host_value is not None and cd.host_value.numel() > 0):
             return 0  # the node has a state: nothing to read
+        if envs.SGLANG_WEG2_AUX_HOST_LAW.get():
+            # AUX-HOST-LAW (h17 D TP0 15:51:02, sanity_check "mamba host present
+            # but Full.host_value=None"): an anchor read never lands on a node
+            # whose KV has no host copy -- nothing is read for it (S43)
+            try:
+                full = node.component_data[ComponentType.FULL]
+            except (KeyError, IndexError, TypeError):
+                full = None
+            if full is not None and getattr(full, "host_value", None) is None:
+                return 0
         last_hash = node.get_last_hash_value()
         if last_hash is None:
             return 0
@@ -5819,10 +5837,58 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         n = UnifiedRadixCache._weg2_anchor_only_n
         if n <= 16 or n % 64 == 0:
             logger.info(
-                "WEG2 ANCHOR-ONLY-READ n=%d rid=%s depth=%d anchor_was=%d attached=%d row=%s "
+                "WEG2 ANCHOR-ONLY-READ n=%d rid=%s depth=%d anchor_was=%d attached=%d row=%s site=%s "
                 "(the KV was in the tree, its Mamba anchor only in the store: only the blob is read)",
-                n, getattr(req, "rid", "?"), kmd, sad, int(ok), int(idx[0]) if ok else -1)
-        return kmd if ok else 0
+                n, getattr(req, "rid", "?"), int(depth), int(anchor_was), int(ok),
+                int(idx[0]) if ok else -1, site)
+        return int(depth) if ok else 0
+
+    def weg2_anchor_only_read_at(self, req, depth: int, site: str = "tf_floor") -> int:
+        """S43 (NF rc12 1018 16:39:16, pdflip-3-186): e1 at a GIVEN depth.
+
+        PP0's TOLD-FIDELITY refused the floor 100224 both followers proved
+        (acks 100224, anchors 83840/67456/51072/34688/18304/10688) and
+        pp0_floor_below found none of those depths resumable on PP0: its tree
+        held the KV (host_hit 99648) but its Mamba arena had dropped the
+        anchors to L3 (13 mamba ARENA-DROPs on PP0 vs 8 on PP1, 1 on PP2 in
+        the window, l3=on_disk) -- so the floor fell to 10688 and 103977
+        tokens were recomputed. The store HAD those anchors. This reads the
+        anchor blob of the node at ``depth`` (a depth every follower already
+        proved) so PP0's tree can resume there; the decision stays PP0's one
+        verdict for every rank (SOLL R11), nothing about the followers moves.
+        One read per depth per request; ``SGLANG_WEG2_ANCHOR_ONLY_READ=0`` or
+        ``SGLANG_WEG2_TF_ANCHOR_READ=0``: off. Returns ``depth`` on an attach."""
+        if not envs.SGLANG_WEG2_ANCHOR_ONLY_READ.get() or not envs.SGLANG_WEG2_TF_ANCHOR_READ.get():
+            return 0
+        depth = int(depth)
+        if depth < int(self.page_size) or depth % int(self.page_size):
+            return 0
+        cc = self.cache_controller
+        backend = getattr(cc, "storage_backend", None) if cc is not None else None
+        if backend is None or not hasattr(backend, "batch_get_v2"):
+            return 0
+        try:
+            from sglang.srt.managers.cache_controller import rank_holds_gdn_state
+
+            if not rank_holds_gdn_state(cc):
+                return 0
+        except Exception:  # noqa: BLE001 - an unanswerable rank form reads nothing
+            return 0
+        comp = (getattr(self, "components", None) or {}).get(ComponentType.MAMBA)
+        mp = getattr(comp, "_mamba_pool_host", None)
+        if mp is None or not callable(getattr(mp, "alloc_read", None)):
+            return 0
+        tried = getattr(req, "_weg2_aor_tried_at", None)
+        if not isinstance(tried, set):
+            tried = set()
+            try:
+                req._weg2_aor_tried_at = tried
+            except Exception:  # noqa: BLE001
+                pass
+        if depth in tried:
+            return 0  # one read per depth: a miss is not re-read on every visit
+        tried.add(depth)
+        return self._weg2_aor_read_attach(req, mp, backend, depth, 0, site=site)
 
     def weg2_lane_rank_on(self) -> bool:
         return bool(envs.SGLANG_WEG2_LANE_ANCHOR_RANK.get())
