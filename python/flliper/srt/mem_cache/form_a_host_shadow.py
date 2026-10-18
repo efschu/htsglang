@@ -115,6 +115,11 @@ K21 = "k21"
 #: (READ-ROOM-STATE-DIVERGED), like SPILL-DIVERGED: in that window the trees differ
 RRSTATE = "rrstate"
 
+#: S39 (18.10., rc11 13:46:27Z wedge): TP0 dropped a store-backed device leaf (``l3_present``, no host copy) together
+#: with its host-only subtree at this broadcast (``pdflip.forma_l3_subtree``) -- every worker applies the same drop right
+#: after it, before any request of the pass, so the trees and the device room stay equal
+L3DROP = "l3drop"
+
 #: #239 S4b part 4: broadcasts TP0 waits for an incomplete token-cut page
 #: before it falls back to the ack's pre-cut decision (a write of every owner
 #: acks within a pass or two; the bound is a backstop, not a timing)
@@ -450,7 +455,7 @@ def _pkey(e) -> tuple:
     is a fact about the store, not a host decision: a TRANSIT or REBIND of the
     same node in the same pass must not drop it."""
     k = (e[1], int(e[2]))
-    return k + (e[0],) if e[0] in (L3, K21) else k
+    return k + (e[0],) if e[0] in (L3, K21, L3DROP) else k
 
 
 def l3_group_on(env=None) -> bool:
@@ -473,6 +478,18 @@ def record_l3(tree: Any, node: Any) -> bool:
     register_tree(tree)
     _announce("host")
     _S.ledger.append((L3, k[0], k[1], 1, 1, 0))
+    return True
+
+
+def record_l3_drop(tree: Any, key: Optional[Tuple[str, int]]) -> bool:
+    """S39, TP0 at its broadcast: it dropped the store-backed device leaf ``key`` (computed BEFORE the drop -- the
+    node is detached now) and its host-only subtree. Every worker drops the same at the next broadcast. False = not
+    keyable (the leaf was never dropped then: ``forma_l3_subtree`` refuses an unkeyed leaf first)."""
+    if key is None:
+        return False
+    register_tree(tree)
+    _announce("host")
+    _S.ledger.append((L3DROP, str(key[0]), int(key[1]), 0, 0, 0))
     return True
 
 
@@ -800,6 +817,15 @@ def attach(recv_reqs: List) -> List:
     except Exception as exc:  # noqa: BLE001 -- a room request never breaks the broadcast
         if _note("read_room_serve_error", 16):
             logger.warning("R12 READ-ROOM serve failed: %r (every rank keeps its references)", exc)
+    # S39: the store-backed device leaves the pass's peel refused (children / device anchor) leave HERE, on TP0, and
+    # their L3DROP verdicts ride this broadcast -- every worker drops the same before the pass's admission
+    try:
+        from flliper.srt.pdflip import forma_l3_subtree as _s39
+
+        _s39.flush_at_broadcast(_S.tree)
+    except Exception as exc:  # noqa: BLE001 -- a drop never breaks the broadcast
+        if _note("s39_flush_error", 16):
+            logger.warning("R12 S39 L3-DROP flush failed: %r (every rank keeps its leaves)", exc)
     if not _S.ledger:
         return recv_reqs
     _S.seq += 1
@@ -808,9 +834,10 @@ def attach(recv_reqs: List) -> List:
     n = _note("sent")
     if n:
         kinds = [e[0] for e in v.events]
-        logger.info("R12 HOST-VERDICT SENT seq=%d events=%d transit=%d state=%d rebind=%d spill=%d l3=%d k21=%d (n=%d)",
+        logger.info("R12 HOST-VERDICT SENT seq=%d events=%d transit=%d state=%d rebind=%d spill=%d l3=%d k21=%d "
+                    "l3drop=%d (n=%d)",
                     v.seq, len(v.events), kinds.count(TRANSIT), kinds.count(STATE) + kinds.count(RRSTATE),
-                    kinds.count(REBIND), kinds.count(SPILL), kinds.count(L3), kinds.count(K21), n)
+                    kinds.count(REBIND), kinds.count(SPILL), kinds.count(L3), kinds.count(K21), kinds.count(L3DROP), n)
     return [v] + list(recv_reqs)
 
 
@@ -894,6 +921,12 @@ def on_tree_reset(tree: Any) -> None:
         _dev_publish(tree)   # the nodes are gone: no key may block a re-inserted prefix
     _S.k21_stop_msg = None
     _S.rebind_wait = {}
+    try:
+        from flliper.srt.pdflip import forma_l3_subtree as _s39
+
+        _s39.reset()
+    except Exception:  # noqa: BLE001 - no S39 module: nothing queued
+        pass
 
 
 # ---------------------------------------------------------------- apply
@@ -975,6 +1008,18 @@ def apply(tree: Any, events: List, seq: int = 0) -> Dict[str, int]:
             before = _host_flags(node)
             tree._pdflip_release_chain_piece_host(node)
             c["transit" if _host_flags(node) != before else "noop"] += 1
+            continue
+        if kind == L3DROP:
+            if r != "worker":
+                continue  # TP0 dropped before it sent the event
+            from flliper.srt.pdflip import forma_l3_subtree as _s39
+
+            out = _s39.apply_drop(tree, node, (h, int(depth)))
+            if out == "pending":
+                _S.pending[_pkey(e)] = e
+                c["pending"] += 1
+            else:
+                c["l3drop_" + out] = c.get("l3drop_" + out, 0) + 1
             continue
         if kind == L3:
             if r != "worker":
