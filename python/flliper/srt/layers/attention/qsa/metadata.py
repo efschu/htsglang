@@ -87,6 +87,14 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
     compress_group_ring_locs: Optional[torch.Tensor] = None
     extend_rope_matrix: Optional[torch.Tensor] = None
     graph_ring_group_locs: Optional[torch.Tensor] = None
+    # S37 (rc10 11:24:32Z, MIXED-D x QSA): the 1-token TAIL rows of a MIXED forward (running decodes mixed into a
+    # short D prefill, mix_with_running) are DECODE rows: their token always goes to its pending-ring slot
+    # (``ring_always_rows``, one flag per sequence row) and the group their length completes is compressed from
+    # the ring (``tail_write_locs`` / ``tail_group_ring_locs``), exactly like a decode step -- never as an extend
+    # whose prefix would split a group (K11).
+    ring_always_rows: Optional[torch.Tensor] = None
+    tail_write_locs: Optional[torch.Tensor] = None
+    tail_group_ring_locs: Optional[torch.Tensor] = None
 
     def get_seqlens_int32(self) -> torch.Tensor:
         return self.sequence_lengths.to(torch.int32)
@@ -227,10 +235,14 @@ def build_pending_ring_slots(
     logical_positions: torch.Tensor,
     compress_ratio: int,
     is_extend: bool,
+    always_rows: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Pending-ring slot ``req_pool_idx * ratio + position % ratio`` per token.
     On extend, tokens before the pending tail dump into rows [0, ratio),
-    which no request owns (request slot 0 is never allocated); CUDA-graph safe."""
+    which no request owns (request slot 0 is never allocated); CUDA-graph safe.
+    S37: ``always_rows`` (bool per sequence row) marks the decode TAIL rows of a MIXED forward -- their token is
+    stored like a decode token, always in its ring slot (a tail whose length closes a group is compressed from the
+    ring right after)."""
     rows = token_to_batch_idx.long()[: logical_positions.numel()]
     requests = req_pool_indices.long()[rows]
     positions = logical_positions.long()
@@ -238,6 +250,8 @@ def build_pending_ring_slots(
     if is_extend:
         lengths = sequence_lengths.long()[rows]
         pending = positions >= (lengths // compress_ratio) * compress_ratio
+        if always_rows is not None:
+            pending = pending | always_rows.to(device=pending.device, dtype=torch.bool)[rows]
         slots = torch.where(pending, slots, positions % compress_ratio)
     return slots
 
