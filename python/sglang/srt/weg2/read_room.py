@@ -56,8 +56,10 @@ rows (``form_a_host_shadow._reconcile``), never by its own decision. A worker po
 (the same bound on every rank of the group) but never serves. A node holding a Mamba anchor on the host is not
 touched: a parked request reads its anchors exactly as before, and the KV pages it gave back are read again by
 stem (L2 while the slot still holds them, else the L3 copy written before the release) -- the park's resume
-reads the whole span to its last anchor, from the store, never short and never recomputed. Host-only nodes
-stay (their arena copy is the one the sleep reset gives back). Same switch."""
+reads the whole span to its last anchor, from the store, never short and never recomputed. Host-only L3-backed
+LEAVES go too (S27, the K23 round of ``_w3_arena_spill``, capped by SGLANG_WEG2_W3_FORMA_SPILL_MAX_PAGES and
+filtered by the workers' nodelete set), when the device-resident round did not cover the deficit; other host-only
+nodes (interior, anchor, no L3 copy) stay. Same switch."""
 
 from __future__ import annotations
 
@@ -855,9 +857,16 @@ def form_a_spill(cache: Any, pool: Any, need_pages: int, released_out: Optional[
             _prev_rec = getattr(cache, "_r12_rec", None)
             cache._r12_rec = []
             try:
+                try:
+                    from sglang.srt.environ import envs as _envs
+
+                    _cap = max(0, int(_envs.SGLANG_WEG2_W3_FORMA_SPILL_MAX_PAGES.get()))
+                except Exception:  # noqa: BLE001
+                    _cap = 128
+                # REVIEW S27 A2: same broadcast site as FORMA-REQUEST -> same synchronous-L3-write bound (H16Q A3)
                 _hres = _hos.spill_host_only(
                     cache, pool, max(int(need_pages) - released, int(getattr(cache, "W3_SPILL_MIN_PAGES", 64))), P,
-                    set(), released_out=released_out)
+                    set(), released_out=released_out, max_secure_pages=_cap)
                 released += int(_hres["released"])
                 host_leaves = int(_hres["leaves"])
             finally:

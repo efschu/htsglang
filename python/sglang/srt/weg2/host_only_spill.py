@@ -205,7 +205,8 @@ def spill_host_only(cache: Any, pool: Any, want: int, page_size: int, skip: set,
     cap_used = over_cap = 0
     while heap and released < want:
         _key, _id, node = heapq.heappop(heap)
-        if not _eligible(cache, node, pool, skip):
+        if not _eligible(cache, node, pool, skip) or (nodel and _r12.node_key(node) in nodel):
+            # REVIEW S27 A1: a cascaded parent is checked against the workers' nodelete set like a first-level leaf
             stale += 1
             continue
         cd = node.component_data[BASE_COMPONENT_TYPE]
@@ -238,7 +239,8 @@ def spill_host_only(cache: Any, pool: Any, want: int, page_size: int, skip: set,
         cache._evict_host_leaf(node, tracker)
         released += int(tracker.get(BASE_COMPONENT_TYPE, 0)) // P
         leaves += 1
-        if parent is not None and parent is not cache.root_node and _eligible(cache, parent, pool, skip):
+        if (parent is not None and parent is not cache.root_node and _eligible(cache, parent, pool, skip)
+                and not (nodel and _r12.node_key(parent) in nodel)):
             _pk = cache._w3_spill_keys(pool, [parent])
             if _incomplete(_pk, parent):
                 incomplete += 1
