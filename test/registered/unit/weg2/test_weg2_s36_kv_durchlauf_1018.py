@@ -583,3 +583,136 @@ def test_810_books_the_staging_range_under_the_arena_host_pool(monkeypatch, capl
     monkeypatch.setenv("SGLANG_HICACHE_ARENA_HOST", "0")
     sa.ServerArgs._post_hicache_staging_host_ledger(ns)
     assert posts[0].nbytes == int(4e9) * 3, "without the arena host pool --hicache-size is the tier"
+
+
+# ---- S38 review (18.10.) -----------------------------------------------------------------------------------------
+# A1: disk page ids are never reused.  A2: a write-behind status 2 on a page the SIBLING group wrote is counted as
+# the sibling's (never unlinked here), not committed as a second owner's (S36 risk 4, #1295 MUST_FIX 4).
+def _qsa_pool_and_files(be, hs, monkeypatch):
+    from sglang.srt import rank_role
+    from sglang.srt.mem_cache.hicache_storage import PoolName
+    from sglang.srt.mem_cache.qsa_pool_host import QSAPagedHostPool
+    from sglang.srt.mem_cache.storage.file.pageio import load
+
+    monkeypatch.setattr(rank_role, "this_rank_is_form_a_worker", lambda: False)
+    Q = 2 * 16
+    be.canonical_qsa_page = CanonicalExtentWindow(Q, ((0, Q),), label="qsa")
+    qdata = []
+    for i, h in enumerate(hs):
+        qs = be._get_suffixed_key(be._log_key(PoolName.QSA_INDEXER, h))
+        path = be._sharded_path(qs)
+        be._ensure_shard_dir(path)
+        qd = torch.randint(0, 255, (Q,), dtype=torch.uint8, generator=torch.Generator().manual_seed(70 + i))
+        assert load().write_pages([path], [Q], [((0, Q),)], [qd.data_ptr()], False) == [0]
+        qdata.append(qd)
+    q = object.__new__(QSAPagedHostPool)
+    q.pool_name = "qsa_indexer"; q.layer_num = 2; q.item_bytes = 16; q.slot_page_size = P; q.page_size = P
+    q.dtype = torch.uint8; q.num_host_pages = 4; q.layout = "layer_first"
+    q.kv_buffer = [torch.zeros((4, 16), dtype=torch.uint8) for _ in range(2)]
+    q.device_buffers = [torch.zeros((16, 16), dtype=torch.uint8) for _ in range(2)]
+    be.registered_pools = {PoolName.QSA_INDEXER: q}
+    return q, qdata
+
+
+def test_s38_a_released_disk_page_id_is_never_handed_out_again(tmp_path):
+    """Mutant direction: a LIFO free list -- the next read takes the released id, and the stale rows of the
+    released page load the NEW page's bytes instead of stopping by name."""
+    arena, be, hs, data = _setup(tmp_path, n=2)
+    p = _pool(arena)
+    kd = _kd()
+    old = p.alloc_read(P)
+    assert _read_on_prefetch_thread(_controller(p, be), _Op(), hs[:1], old)["n"] == 1
+    d_old = int(kd.pages_of_rows(old[:1], P)[0][0])
+    p.free(old)
+    new = p.alloc_read(P)
+    assert _read_on_prefetch_thread(_controller(p, be), _Op("s38-2"), hs[1:], new)["n"] == 1
+    d_new = int(kd.pages_of_rows(new[:1], P)[0][0])
+    assert d_new != d_old and kd.REGISTRY.entry(d_old) is None
+    with pytest.raises(RuntimeError, match="KV-DURCHLAUF LOAD REFUSED"):
+        p.load_to_device_per_layer(_dev_pool(), old, torch.arange(P), 0, "direct")
+
+
+def test_s38_the_qsa_stage_of_a_load_never_serves_a_later_page(tmp_path, monkeypatch):
+    """QSAPagedHostPool keeps the disk QSA pages of one load for its per-layer calls, keyed by the disk page
+    tuple. With a reused id the next single-page load (same tuple, same row count) got the PREVIOUS page's QSA
+    index on every layer -- a silent wrong sparse selection."""
+    from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+
+    arena, be, hs, data = _setup(tmp_path, n=2)
+    q, qdata = _qsa_pool_and_files(be, hs, monkeypatch)
+    p = _pool(arena)
+    dst = torch.arange(4 * P, 5 * P, dtype=torch.int64)
+    for k, rid in ((0, "s38-q0"), (1, "s38-q1")):
+        host = p.alloc_read(P)
+        assert _read_on_prefetch_thread(_controller(p, be), _Op(rid), [hs[k]], host)["n"] == 1
+        res = be.batch_get_v2([PoolTransfer(name=PoolName.QSA_INDEXER, host_indices=host, keys=[hs[k]])])
+        assert res[PoolName.QSA_INDEXER] == [True]
+        for layer in range(2):
+            q.load_to_device_per_layer(None, host, dst, layer, "direct")
+        for layer in range(2):
+            assert torch.equal(q.device_buffers[layer][4], qdata[k][layer * 16:(layer + 1) * 16]), (k, layer)
+        p.free(host)
+
+
+def _wb_owner(tmp_path, name):
+    from sglang.srt.mem_cache.storage.file.lru_file_evictor import LRUFileEvictor
+
+    arena = ShmArena(str(tmp_path / "wbpair.bin"), TOTAL, 16)      # this owner's mapping of the shared arena
+    be = _backend(tmp_path, arena)
+    be._evictor = LRUFileEvictor(
+        str(tmp_path / "l3"), SFX, tp_rank=0, writes_shared_keys=False, extra_config={"max_size": "1G"},
+        path_for_stem=be._existing_path, iter_existing=be._iter_existing_files,
+    )
+    be._l3p_persistent_dir = lambda: str(tmp_path / "l3")
+    return be, arena
+
+
+def test_s38_a_page_the_sibling_group_wrote_first_is_counted_never_unlinked_here(tmp_path):
+    """S36 risk 4: both group owners (D TP0, P PP0) now walk the same COMPLETE census at the same time. The
+    second writer of a page gets status 2 -- committing that as OWN gave the file two owners, each free to
+    unlink it. Mutant direction: status 2 committed as own again."""
+    be_d, arena_d = _wb_owner(tmp_path, "d")
+    be_p, arena_p = _wb_owner(tmp_path, "p")
+    stems = []
+    for i in range(6):
+        stem = be_d._get_suffixed_key(f"s{i:02d}" + "ab" * 30)
+        pay = _page_bytes(300 + i)
+        assert arena_d.write([stem], [TOTAL], [((0, TOTAL),)], [pay.data_ptr()]) == [1]
+        stems.append(stem)
+    tot_d = be_d.l3_write_behind_pass(slice_s=0.0)
+    assert tot_d["written"] == 6
+    # P's pass stat'ed the same pages a moment before D published them (the race of two concurrent passes)
+    be_p._stat_stems = lambda ss: set()
+    tot_p = be_p.l3_write_behind_pass(slice_s=0.0)
+    assert tot_p["written"] == 0 and tot_p.get("foreign_done") == 6, tot_p
+    ev_p, ev_d = be_p._evictor, be_d._evictor
+    assert all(ev_d.owns(s) for s in stems), "D wrote them: D's own"
+    assert not any(ev_p.owns(s) for s in stems), "P wrote nothing: never P's own"
+    assert set(stems) <= ev_p._foreign_indexed and ev_p._foreign_indexed_bytes == sum(ev_p._lru[s] for s in stems)
+    with ev_p._lock:
+        outcome = [ev_p._evict_one_lru_locked()[0] for _ in range(6)]
+    assert outcome == ["skipped"] * 6, outcome
+    assert len(be_d._stat_stems(stems)) == 6, "P never unlinks the sibling's pages"
+    # the stat tells P next cycle: nothing new to write, nothing re-labelled
+    del be_p._stat_stems
+    arena_p._l3wb_sec = None
+    tot_p2 = be_p.l3_write_behind_pass(slice_s=0.0)
+    assert tot_p2["written"] == 0 and not tot_p2.get("foreign_done"), tot_p2
+
+
+def test_s38_a_status_2_on_this_owners_own_page_stays_its_own(tmp_path):
+    """The status-2 rule never re-labels a page this owner already holds (indexed as its own or reserved by a
+    writer of this process)."""
+    be_d, arena_d = _wb_owner(tmp_path, "d")
+    stems = []
+    for i in range(3):
+        stem = be_d._get_suffixed_key(f"o{i:02d}" + "ab" * 30)
+        pay = _page_bytes(400 + i)
+        assert arena_d.write([stem], [TOTAL], [((0, TOTAL),)], [pay.data_ptr()]) == [1]
+        stems.append(stem)
+    assert be_d.l3_write_behind_pass(slice_s=0.0)["written"] == 3
+    arena_d._l3wb_sec = None
+    be_d._stat_stems = lambda ss: set()
+    tot = be_d.l3_write_behind_pass(slice_s=0.0)
+    assert not tot.get("foreign_done"), tot
+    assert all(be_d._evictor.owns(s) for s in stems) and not (set(stems) & be_d._evictor._foreign_indexed)

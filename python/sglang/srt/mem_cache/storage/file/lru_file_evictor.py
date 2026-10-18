@@ -1166,6 +1166,60 @@ class LRUFileEvictor:
                     self._lru[suffixed_key] = actual
                     self._total_bytes += actual - prev
 
+    def owns(self, suffixed_key: str) -> bool:
+        """S38 review (18.10.): does this owner already hold ``suffixed_key`` as ITS write -- indexed and not the
+        sibling's, or reserved right now by a writer of this process? Asked BEFORE a ``reserve`` whose write may
+        find the file complete already (status 2), so :meth:`adopt_foreign` never re-labels this owner's own
+        page. Without eviction there is no index: True (nothing to re-label)."""
+        if not self._eviction_enabled:
+            return True
+        with self._lock:
+            return suffixed_key in self._pending_writes or (
+                suffixed_key in self._lru and suffixed_key not in self._foreign_indexed)
+
+    def adopt_foreign(self, suffixed_key: str) -> None:
+        """S38 review (18.10., S36 risk 4): resolve a reservation whose write found the file ALREADY COMPLETE,
+        written by ANOTHER writer -- in Weg 2 the sibling group's L3 write-behind over the same shared arenas
+        (S36: the write-behind no longer holds still, so P-PP0 and D-TP0 walk the same COMPLETE census at the same
+        time and the second writer of a page gets status 2). Committing that as OWN gave the page two owners, each
+        free to unlink it -- the #1295 MUST_FIX 4 rule ("an indexed entry this owner did not write is COUNTED and
+        never UNLINKED") broken for every such page. Here it is indexed exactly as the wake's journal apply would
+        index the sibling's C line: counted against the cap, never unlinked by this owner. Journal: ``A`` (this
+        owner wrote nothing)."""
+        jn = getattr(self, "_journal", None)
+        if jn is not None:
+            jn.write("A", time.time(), 0, suffixed_key)
+        if not self._eviction_enabled:
+            return
+        actual = None
+        try:
+            actual = self._allocated_size(os.stat(self._path_for_stem(suffixed_key)))
+        except OSError:
+            pass
+        with self._lock:
+            self._pending_writes.discard(suffixed_key)
+            cur = self._lru.get(suffixed_key)
+            if actual is None:
+                # gone again (the owner evicted it meanwhile): nothing to count, nothing of ours to keep
+                if cur is not None:
+                    del self._lru[suffixed_key]
+                    self._total_bytes -= cur
+                    if suffixed_key in self._foreign_indexed:
+                        self._foreign_indexed.discard(suffixed_key)
+                        self._foreign_indexed_bytes -= cur
+                return
+            if cur is None:
+                self._lru[suffixed_key] = actual
+                self._total_bytes += actual
+            elif cur != actual:
+                self._lru[suffixed_key] = actual
+                self._total_bytes += actual - cur
+                if suffixed_key in self._foreign_indexed:
+                    self._foreign_indexed_bytes += actual - cur
+            if suffixed_key not in self._foreign_indexed:
+                self._foreign_indexed.add(suffixed_key)
+                self._foreign_indexed_bytes += actual
+
     def abort(self, suffixed_key: str) -> None:
         """Release a reservation whose write failed: drop it and refund the bytes."""
         if getattr(self, "_journal", None) is not None:

@@ -164,7 +164,11 @@ class DiskPages:
     def __init__(self):
         self._lock = threading.Lock()
         self._e: dict = {}
-        self._free: list = []
+        # S38 review (18.10.): disk page ids are NEVER reused (monotonic). A LIFO free list handed a released id to
+        # the next read at once: the QSA mirror's per-load stage cache (``QSAPagedHostPool._s36_disk_stage``, keyed
+        # by the disk page tuple) then served the OLD page's QSA index for the new page (wrong sparse selection,
+        # silent), and a stale host row would have loaded another page's bytes instead of reaching the named
+        # ``LOAD REFUSED``. The id space is 2**40 + d*P in int64 -- it does not run out.
         self._next = 0
         self.backend = None
         self.stats = {"alloc": 0, "released": 0, "open_failed": 0, "direct_fds": 0,
@@ -203,9 +207,8 @@ class DiskPages:
                 out.append(None)
                 continue
             with self._lock:
-                d = self._free.pop() if self._free else self._next
-                if d == self._next:
-                    self._next += 1
+                d = self._next
+                self._next += 1
                 self._e[d] = _Entry(k, st, p, fd, direct, total)
                 self.stats["alloc"] += 1
                 if direct:
@@ -221,8 +224,6 @@ class DiskPages:
         for d in ds:
             with self._lock:
                 e = self._e.pop(int(d), None)
-                if e is not None:
-                    self._free.append(int(d))
             if e is None:
                 continue
             n += 1

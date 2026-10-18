@@ -3946,9 +3946,14 @@ class HiCacheFile(HiCacheStorage):
                     ok = arena.pin_complete(slots[sub], klo[sub], khi[sub])
                     pinned = sub[ok]
                     batch = []
+                    _own_before: dict = {}
                     try:
                         for i in pinned.tolist():
                             stem = stem_of[i]
+                            # S38 review: asked BEFORE the reserve -- a status 2 (the sibling group's write-behind
+                            # completed the page first) is this owner's only when it already was
+                            _owns = getattr(self._evictor, "owns", None)
+                            _own_before[stem] = bool(_owns(stem)) if callable(_owns) else True
                             if not self._evictor.reserve(
                                 stem, total, key=stem,
                                 owner_writes_whole_file=owner_write_covers_whole_file(
@@ -3978,7 +3983,17 @@ class HiCacheFile(HiCacheStorage):
                                 )
                             tot["direct_extents"] += int(sum(_dc))
                             for (i, stem, _path), st in zip(batch, statuses):
-                                if st in (0, 2):
+                                if st == 2 and not _own_before.get(stem, True):
+                                    # S38 review (S36 risk 4): complete already, written by ANOTHER writer (the
+                                    # sibling group's pass over the same shared arena) -- secured, but counted
+                                    # as the sibling's and never unlinked here (#1295 MUST_FIX 4), not a second
+                                    # owner of the file
+                                    self._evictor.adopt_foreign(stem)
+                                    sec_gen[slots[i]] = gens[i]
+                                    sec_lo[slots[i]] = klo[i]
+                                    tot["on_disk"] += 1
+                                    tot["foreign_done"] = int(tot.get("foreign_done", 0)) + 1
+                                elif st in (0, 2):
                                     self._evictor.commit(stem)
                                     sec_gen[slots[i]] = gens[i]
                                     sec_lo[slots[i]] = klo[i]
@@ -4032,7 +4047,7 @@ class HiCacheFile(HiCacheStorage):
                     "unpaired=%d paused=%s written_total=%d budget=%s slice_ms=%.0f slices=%d "
                     "slice_max_ms=%.1f slice_max_stems=%d stat_ms=%.1f stat_cpu_ms=%.1f "
                     "pair_ms=%.1f deferred=%d cont=%d sliced_total=%d direct_extents=%d "
-                    "read_yield_ms=%.1f (L2 pages copied to the "
+                    "read_yield_ms=%.1f foreign_done=%d (L2 pages copied to the "
                     "persistent L3 without a free; budget=hit: the pass stopped at a slice edge "
                     "and continues after the yield, deferred stems are NOT dropped)",
                     n, tot["written"], tot["bytes"], tot["ms"], tot["cpu_ms"],
@@ -4044,6 +4059,7 @@ class HiCacheFile(HiCacheStorage):
                     tot["stat_ms"], tot["stat_cpu_ms"], tot["pair_ms"], tot["deferred"],
                     int(bool(cont)), getattr(self, "_l3wb_sliced_n", 0),
                     int(tot.get("direct_extents", 0)), float(tot.get("read_yield_ms", 0.0)),
+                    int(tot.get("foreign_done", 0)),
                 )
         return tot
 
