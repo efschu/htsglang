@@ -5661,6 +5661,7 @@ class Front:
         elif immediate is not None:
             # 27B PARK (user 26.09.): not a bound -- the arrival itself fires.
             self.counters["park_immediate_fired"] += 1
+            Front._flip_trig_note(self, immediate.rid, int(immediate.est_uncached), "park-immediate")
             if cause != "over-x":
                 self.counters[f"park_immediate_{cause}"] += 1
             logger.warning(
@@ -7142,6 +7143,7 @@ class Front:
                 if getattr(p, "x_routed", 0):
                     p.x_routed = 0
                 self.counters["x_exact_reprice_short"] += 1
+            Front._flip_stale_check(self, p.rid, old, int(new), x, why, src)
             logger.info("PDFLIP X-EXACT-REPRICE rid=%s why=%s est_uncached %d -> %d X=%d "
                         "crossed=%s src=%s epoch=%s (queued request re-priced against the "
                         "current measured cached-on-D prefix; routing flags unchanged)",
@@ -7201,6 +7203,53 @@ class Front:
         self.counters["short_kept_to_p"] += 1
         return True
 
+    #: FLIP-PRICE-STALE window: a flip trigger re-priced under X within this many seconds of its verdict was priced stale.
+    FLIP_STALE_WINDOW_S = 2.0
+
+    def _flip_trig_note(self, rid: str, est: int, site: str) -> None:
+        """S28 instrument: remember the price a flip verdict/fire was made on (bounded, oldest out)."""
+        book = self.__dict__.setdefault("_flip_trig", collections.OrderedDict())
+        book[str(rid)] = (time.time(), int(est), str(site))
+        while len(book) > 256:
+            book.popitem(last=False)
+
+    def _flip_stale_check(self, rid: str, old: int, new: int, x: int, why: str, src: str) -> None:
+        """S28 instrument ``PDFLIP FLIP-PRICE-STALE``: the trigger of a D->P flip is re-priced under X within
+        ``FLIP_STALE_WINDOW_S`` of its verdict -- the flip was decided on a price the store presence had already moved
+        (the X-Waechter reads the line / the ``flip_price_stale`` counter). An instrument, never a price input."""
+        book = self.__dict__.get("_flip_trig")
+        if not book:
+            return
+        rec = book.get(str(rid))
+        if rec is None:
+            return
+        t0, est0, site = rec
+        dt = time.time() - t0
+        if dt > Front.FLIP_STALE_WINDOW_S or int(new) > int(x) or int(est0) <= int(x):
+            return
+        book.pop(str(rid), None)
+        self.counters["flip_price_stale"] += 1
+        logger.warning("PDFLIP FLIP-PRICE-STALE rid=%s site=%s est_at_flip=%d est_now=%d X=%d dt_s=%.2f why=%s src=%s "
+                       "epoch=%s -- the trigger of a D->P flip is priced under X %.1f s after the verdict (R1/R7: a flip "
+                       "needs S >= X on the CURRENT price)", rid, site, int(est0), int(new), int(x), dt, why, src,
+                       self.epoch, dt)
+
+    def _hl_store_price(self, p: "Pending") -> Optional[Tuple[int, str]]:
+        """S28: ``(uncached, src)`` of ``p`` against the CURRENT measured store/anchor presence (the price
+        ``_x_exact_reprice_queue`` would give it), or None without an exact price (no tokenizer ids, namespaced)."""
+        if (not self.__dict__.get("x_exact") or self.__dict__.get("ftok") is None
+                or self.__dict__.get("tspans") is None):
+            return None
+        if Front._ns_isolated(self, p.rid):
+            return None
+        ids = self.ftok.ids_for(p.text)
+        if ids is None:
+            return None
+        epoch = (self.epoch if self.__dict__.get("awake") == "D" and self.__dict__.get("state") == "serving"
+                 else None)
+        new, _credit, _known, src = self.tspans.pending(ids, epoch=epoch)
+        return int(new), str(src)
+
     def _hl_check(self, p: "Pending", where: str) -> bool:
         """#243 seam (pdflip/handoff_seam.py): True when ``p`` -- leg 1 ran, it
         waits for a D seat -- had its hand-off LOST and D would have to prefill
@@ -7227,19 +7276,35 @@ class Front:
         if terms is None:
             return False
         credit, uncached, over_x = terms
+        # S28 (R1/R7, 18.10. "flip auf P fuer 34 token"): the hand-off credit stops at first_lost_page, but the L2/L3 store
+        # still holds the whole span P flushed (P-ANCHOR-PRESENCE / L3-INDEX-PRESENCE). The price a verdict is made on is
+        # the CURRENT one -- the store presence is read HERE, before the reroute, not 1 s after the flip it caused.
+        _sp = Front._hl_store_price(self, p)
+        if _sp is not None and _sp[0] < uncached:
+            self.counters["handoff_lost_store_priced"] += 1
+            logger.info("PDFLIP HANDOFF-LOST-STORE-PRICE rid=%s handoff_uncached=%d store_uncached=%d X=%d src=%s "
+                        "where=%s -- the store holds the span the hand-off lost: priced on the store (R1/R7)",
+                        p.rid, uncached, _sp[0], x, _sp[1], where)
+            uncached = int(_sp[0])
+            over_x = uncached > x
         noted = self.__dict__.setdefault("_hl_noted", set())
-        # P-BATCH-ALL (user 02.10.): a lost hand-off is an error case -- its
-        # prefill goes back to P's batch (the next P drain), not to a D
-        # prefill, whatever its size. Only a SECOND loss under X stays on D
-        # (bounded: no third P leg, no terminal for a tail D may compute).
-        if not over_x and p.handoff_lost_reroutes >= 1:
+        # SOLL R2/R7 (S28): a lost hand-off whose CURRENT price is under X stays on D -- D prefills the lost tail itself
+        # (<= X), no reroute, never a flip for it. (P-BATCH-ALL 02.10. sent every loss back to P's batch; since R7
+        # "kein Flip unter X" that reroute is only for a loss OVER X.) The SECOND loss under X is bounded as before
+        # (no third P leg, no terminal for a tail D may compute).
+        # S28 A2 (R1a): in a P phase (a decided flip) P prefills ALL pending prefills, also those waiting for
+        # a D seat -- the lost hand-off rides P's batch whatever its price (no flip is made for it: P is awake)
+        _p_phase = p_phase_arrival(getattr(self, "awake", "D"), getattr(self, "state", "serving"),
+                                   getattr(self, "_flip_dst", None))
+        if not over_x and not _p_phase:
+            p.est_uncached = int(uncached)  # S28 A3: the KEPT tail carries its current price (X-SUM / R6)
             if p.rid not in noted:
                 noted.add(p.rid)
                 self.counters["handoff_lost_kept_d"] += 1
                 logger.warning(
                     "PDFLIP HANDOFF-LOST-KEPT rid=%s first_lost_page=%d page_size=%d credit=%d "
-                    "uncached=%d X=%d reroutes=%d where=%s -- lost a second time: D prefills the "
-                    "lost tail itself (<= X, law 4; bounded, no third P leg)", p.rid, st["first_lost_page"], st["page_size"], credit,
+                    "uncached=%d X=%d reroutes=%d where=%s -- hand-off lost, current price <= X: D "
+                    "prefills the lost tail itself (R2/R7, law 4; no reroute, no flip for it)", p.rid, st["first_lost_page"], st["page_size"], credit,
                     uncached, x, p.handoff_lost_reroutes, where)
             return False
         if p.handoff_lost_reroutes >= 1:
@@ -7267,7 +7332,10 @@ class Front:
         p.handoff_lost_reroutes += 1
         p.leg1_done = False
         p.seat = None
-        p.d_eligible = p.d_direct = False
+        p.d_direct = False
+        # S28 A2 (N1 guard): a reroute under X (P phase, R1a) stays a SHORT for a later D phase -- not an
+        # orphan that neither D (d_eligible) nor P (needs_p) takes
+        p.d_eligible = not over_x
         p.est_uncached = int(uncached)
         self.counters["handoff_lost_reroutes"] += 1
         logger.warning(
@@ -11581,6 +11649,19 @@ class Front:
             st["seen"] = 0
             return None
         members, sv, kw = ev
+        if sv.verdict not in (phase_policy.V_COLLECT, phase_policy.V_D_AFTER_TIMER):
+            # S28 (R1/R7/R11): a FLIP verdict is made on the CURRENT price. The queue is re-priced against the store/anchor
+            # presence measured so far BEFORE the verdict stands; a changed price re-decides the set once (no flip on a
+            # figure a presence event already moved -- fLLiper rc8 pdflip-17-189: flip for 52002, 34 real tokens).
+            _moved = self._x_exact_reprice_queue("pre_verdict") if self.__dict__.get("x_exact") else 0
+            if _moved:
+                self.counters["flip_verdict_repriced"] += _moved
+                ev = self._set_eval(now, live_q, st)
+                if ev is None:
+                    st["t_open"] = None
+                    st["seen"] = 0
+                    return None
+                members, sv, kw = ev
         st["seen"] = len(members)
         _pu = st.get("urgent")
         if _pu is not None and st.get("prio_set") != st["set_id"]:
@@ -11606,6 +11687,8 @@ class Front:
                 self._d_pf_book().grant(rid=rid, tokens=int(st["shorts"][rid][1]), now=now)  # X-SUM-PRICE
         if route == "P":
             st["go_p"].update(m.rid for m in members)
+            for _m in members:
+                Front._flip_trig_note(self, _m.rid, int(_m.own_uncached or _m.uncached), "set-verdict")
         if sv.verdict == phase_policy.V_REROUTE_P:
             # B3/R6: a REAL redirect -- what waits in D's admission line rides to P too (the running D prefill's
             # remainder is parked by the flip and handed back to P's batch by the PARK path)
@@ -11631,6 +11714,14 @@ class Front:
             return False
         if self._decode_collect(now, live_q) == "P":
             return True
+        # S28 A1 (R1/R7): the queue-sum verdict is a flip verdict too -- re-price before it can stand (only when the
+        # stale sum would reach X, so the per-tick path costs nothing)
+        if (self.__dict__.get("x_exact")
+                and sum(int(getattr(q, "est_uncached", 0) or 0) for q in live_q)
+                >= min(Front._set_x_of_entry(self, q) for q in live_q)):
+            _mv = self._x_exact_reprice_queue("pre_verdict_qsum")
+            if _mv:
+                self.counters["flip_verdict_repriced"] += _mv
         # H16V F1/A5: S = own figures (D side); P counts a shared session prefix once (members' uncached). X = smallest own X (R2a, A2)
         _eff = Front._set_discount(self, [(q.rid, int(getattr(q, "est_uncached", 0) or 0), float(_lctl.clock_t(q, now)), q)
                                           for q in live_q])
@@ -11663,6 +11754,8 @@ class Front:
         self.counters["set_" + sv.verdict.lower()] += 1
         if sv.verdict in (phase_policy.V_FLIP_P, phase_policy.V_PARK_NO_SEAT, phase_policy.V_REROUTE_P):
             st["go_p"].update(m.rid for m in members)
+            for _m in members:  # S28 A1: FLIP-PRICE-STALE sees this decision site too
+                Front._flip_trig_note(self, _m.rid, int(_m.own_uncached or _m.uncached), "queue-sum")
             return True
         return False
 
@@ -12486,6 +12579,7 @@ class Front:
             self.counters["arrival_seat_flip_now"] += 1
             self.counters["arrival_seat_pbound_flip_now"] += 1
             taken, n = self._arrival_seat_taken()
+            Front._flip_trig_note(self, p.rid, int(getattr(p, "est_uncached", 0) or 0), "pbound-flip-now")
             ms = self._asr_verdict_ms(p.rid, getattr(p, "t_arrive", None), now)
             logger.warning("%s rid=%s verdict=%s PBOUND-FLIP-NOW uncached=%d X=%d p_only=%s taken=%d n=%d "
                            "arrival_to_verdict_ms=%.0f -- D pauses its decodes at the round boundary and "
@@ -13076,7 +13170,8 @@ class Front:
                     self._sync_batch_gate()
                     continue
                 self._ready_for_d.popleft()
-                if getattr(p, "d_direct", False) and envs.FLLIPER_PDFLIP_ENABLE_DECODE_COLLECT_PREFILL_BUSY.get():
+                if ((getattr(p, "d_direct", False) or p.rid in (self.__dict__.get("_hl_noted") or ()))
+                        and envs.FLLIPER_PDFLIP_ENABLE_DECODE_COLLECT_PREFILL_BUSY.get()):  # S28 A3: KEPT tail too
                     # X-SUM-PRICE: the hand-over leaves `_ready_for_d` here (no await up to the book) -- its
                     # uncached tokens stay in `carried` until D's first content (review M3, same class as the burst)
                     self._d_pf_book().grant(rid=p.rid, tokens=int(getattr(p, "est_uncached", 0) or 0), now=time.time())

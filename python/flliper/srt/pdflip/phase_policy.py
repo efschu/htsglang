@@ -283,9 +283,14 @@ def needs_p(est_uncached: int, x_tokens: int, *, skip_leg1: bool = False,
         return False
     if p_only or int(x_requeues or 0) > 0 or x_deferred:
         return True  # x_deferred: over X_busy, the X in force while D decodes (PK2)
-    if int(handoff_lost_reroutes or 0) > 0 or int(reroutes or 0) > 0:
-        # SOLL R9/N1: a request that MUST run on P by state (hand-off lost -> leg 1 again on P, leg-2 reroute) is P-only
-        # by state even under X: a set member that counts as big, never a starved queue entry
+    if int(reroutes or 0) > 0:
+        # SOLL R9/N1: a request that MUST run on P by state (leg-2 reroute) is P-only by state even under X: a set
+        # member that counts as big, never a starved queue entry
+        return True
+    if int(handoff_lost_reroutes or 0) > 0 and int(est_uncached) > int(x_tokens):
+        # S28 (R7/R1, 18.10. "flip auf P fuer 34 token"): a lost hand-off is P-by-state only while its CURRENT price is
+        # over X. The store holds the span (L3-INDEX-PRESENCE / P-ANCHOR-PRESENCE): at u <= X D takes the tail itself
+        # (R2) -- "kann D einen Request unter X nicht nehmen, ist das ein Defekt, kein Flipgrund" (R7)
         return True
     if int(x_routed or 0) > 0 and int(est_uncached) > int(x_routed):
         return True  # #246b: routed to P on this X

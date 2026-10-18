@@ -109,18 +109,15 @@ class Check(unittest.TestCase):
         self.assertEqual((f.marks, f.kicks, f.counters["handoff_lost_reroutes"]),
                          ([("pdflip-12-39", "reroute")], ["arrival"], 1))
 
-    def test_first_loss_under_x_goes_to_ps_batch_not_a_d_prefill(self):
-        # P-BATCH-ALL (user 02.10.): a lost hand-off is an error case -- its
-        # prefill goes back to P's batch whatever its size
+    def test_first_loss_under_x_stays_on_d_no_reroute_no_flip(self):
+        # S28 / SOLL R2+R7 (18.10.): P-BATCH-ALL (user 02.10.) sent every loss back to P; since "kein Flip unter X" a
+        # loss whose CURRENT price is <= X stays on D (D prefills the lost tail itself) -- it is no reason for a flip
         f, p = _front(), _p()
         with _Fake({"pdflip-12-39": LOST_UNDER}) as fk, self.assertLogs(F.logger, level="WARNING") as cap:
-            self.assertTrue(f._hl_check(p, "sweep"))
-        self.assertEqual(fk.drops, [("pdflip-12-39", "reroute_fresh")])
-        self.assertEqual((list(f.queue), p.leg1_done, p.d_direct, p.handoff_lost_reroutes,
-                          p.est_uncached), ([p], False, False, 1, 6202))
-        self.assertIn("PDFLIP HANDOFF-LOST-REROUTE rid=pdflip-12-39 first_lost_page=1100 credit=70400 "
-                      "path=fresh-P (uncached=6202 <= X=12288", cap.output[0])
-        self.assertFalse(any("HANDOFF-LOST-KEPT" in line for line in cap.output))
+            self.assertFalse(f._hl_check(p, "sweep"))
+        self.assertEqual((fk.drops, list(f.queue), p.leg1_done, p.handoff_lost_reroutes), ([], [], True, 0))
+        self.assertTrue(any("HANDOFF-LOST-KEPT" in line for line in cap.output))
+        self.assertFalse(any("HANDOFF-LOST-REROUTE" in line for line in cap.output))
 
     def test_second_loss_under_x_is_kept_and_named_once(self):
         f, p = _front(), _p()

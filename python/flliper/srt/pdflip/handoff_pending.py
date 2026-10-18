@@ -720,15 +720,22 @@ def census(pool) -> str:
         # requests that do not run), each "complete in the arena / kept"
         counts = {ROLE_HANDOFF: [0, 0, 0], ROLE_PARK: [0, 0, 0]}
         per = pool.__dict__.get("_pdflip_hp_rid_keys") or {}
+        # S27 (fLLiper rc8 07:05:34 handoff_kept=5875/5875, P 07:11:20 10139/10963 against 6485 slots): rids of one
+        # session share their leading chain (PDFLIP SESSION-PREFIX common=18356 ...), and the same page key is ONE slot.
+        # Counted per rid the census named more kept pages than the arena has slots; counted per KEY (once per role)
+        # it is the number of slots the order really covers.
+        seen = {ROLE_HANDOFF: set(), ROLE_PARK: set()}
         for rid, role in zip(keep.rids, keep.roles):
             rec = per.get((PARK if role == ROLE_PARK else PENDING, rid), (0, None))[1]
             if rec is None:
                 continue
             c = counts[role]
-            c[1] += len(rec[2])
+            fresh = [k for k in rec[2] if k not in seen[role]]
+            seen[role].update(fresh)
+            c[1] += len(fresh)
             c[2] += 1
-            if arena is not None and rec[2]:
-                c[0] += sum(1 for _, st in arena.find_slots(rec[2]) if int(st) == 2)
+            if arena is not None and fresh:
+                c[0] += sum(1 for _, st in arena.find_slots(fresh) if int(st) == 2)
         pinned = complete = "-"
         if arena is not None and hasattr(arena, "ref_census"):
             pinned, _refs, complete = arena.ref_census()
