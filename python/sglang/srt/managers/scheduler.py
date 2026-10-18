@@ -18741,6 +18741,18 @@ class Scheduler(
                 running_batch.prepare_for_decode()
                 new_batch.mix_with_running(running_batch)
                 new_batch.decoding_reqs = running_batch.reqs
+                if not self.enable_overlap and not self.spec_algorithm.is_none():
+                    # Non-overlap spec never writes the relay; stash the
+                    # tails' pending tokens for the mixed input resolve.
+                    # (SGLang PR #36933 1:1; S33 review A3.)
+                    last_tokens = torch.tensor(
+                        [r.output_ids[-1] for r in running_batch.reqs],
+                        dtype=torch.int64,
+                        device=self.device,
+                    )
+                    self.future_map.stash_bonus_tokens(
+                        running_batch.req_pool_indices, last_tokens
+                    )
             running_batch = ScheduleBatch(
                 reqs=[], batch_is_full=running_batch.batch_is_full
             )
@@ -18750,19 +18762,23 @@ class Scheduler(
         return new_batch, running_batch
 
     def _mixed_d_agreed(self, new_batch, running_batch, local_ok: bool) -> bool:
-        """MIXED-D gate (S32): the short verdict, MIN-reduced over the TP cpu group (R11: no rank-local batch shape)."""
+        """MIXED-D gate (S32): the short verdict, MIN-reduced over the TP cpu group (R11: no rank-local batch shape).
+
+        S33 review A1/A2: halbX is the FRONT's (``weg2_front_halfx``, min over the batch, R2a) -- the riegel only says
+        "group D"; a batch with an E2 END-state hand-off (no target forward) is never mixed."""
         from sglang.srt.weg2 import mixed_d_short as _mds
 
         x = int(_weg2_store_short_tail_x(self))
-        frac = float(envs.SGLANG_WEG2_HALF_X_FRAC.get())
         u = int(getattr(new_batch, "extend_num_tokens", 0) or 0)
         chunked = self.chunked_req is not None or any(
             getattr(r, "_mixed_d_was_chunked", False) for r in new_batch.reqs
         )
-        mine = local_ok and _mds.short_gate(u, x, frac, chunked)
+        hx = _mds.batch_half_x(new_batch.reqs)
+        no_fwd = _mds.end_state_handoff(new_batch.reqs)
+        mine = local_ok and _mds.short_gate(u, x, hx, chunked, no_fwd)
         agreed = bool(self._weg2_group_min_flags([mine])[0])
         if agreed:
-            _mds.note_mixed(u, len(running_batch.reqs), x, frac)
+            _mds.note_mixed(u, len(running_batch.reqs), hx, x)
         return agreed
 
     def _can_schedule_lora_req(

@@ -10,13 +10,16 @@
 #   S5  late binding never called under overlap+spec                       S6  running spec_info not dropped (one-sided merge)
 #   M1  mamba track of the tail rows set True                              R1  decode tail stamped as a finished prefill (prefill clock)
 #   R2  tail's bonus token not committed (kv_committed_len += 1 gone)
+#   S33 review: H1 bound = the rank riegel (x // 2) instead of the front halbX   H2 batch halbX = max instead of min (R2a)
+#   H3  a request without a carried halbX does not block the mix              E1  an E2 END-state hand-off may mix (skip_tokens crash)
+#   N1  non-overlap spec stash dropped (PR #36933)                            C1  MIXED forward priced into the D cost ring (X-COST-LINE)
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=${ROOT:-$(cd "$HERE/../../../.." && pwd)}
 SRT=$ROOT/python/sglang/srt
 RD=${RD:-/spinning/gpu-arb/devtools/remote_desk.sh}
 TEST=test/registered/unit/weg2/test_weg2_mixed_d_short_s32_1018.py
-FILES=("$SRT/weg2/mixed_d_short.py" "$SRT/managers/schedule_batch.py" "$SRT/managers/overlap_utils.py" "$SRT/managers/scheduler.py" "$SRT/managers/scheduler_components/batch_result_processor.py")
+FILES=("$SRT/weg2/mixed_d_short.py" "$SRT/managers/schedule_batch.py" "$SRT/managers/overlap_utils.py" "$SRT/managers/scheduler.py" "$SRT/managers/scheduler_components/batch_result_processor.py" "$SRT/managers/scheduler_components/metrics_reporter.py")
 BAKD=$(mktemp -d); for f in "${FILES[@]}"; do cp "$f" "$BAKD/$(echo "$f" | tr / _)"; done
 restore() { for f in "${FILES[@]}"; do cp "$BAKD/$(echo "$f" | tr / _)" "$f"; done; }
 trap restore EXIT
@@ -29,8 +32,8 @@ open(path, "w").write(s.replace(old, new))
 PY
 }
 declare -A F OLD NEW
-F[G1]=$SRT/weg2/mixed_d_short.py; OLD[G1]='return int(u_tokens) < half_x_of'; NEW[G1]='return int(u_tokens) <= half_x_of'
-F[G2]=$SRT/weg2/mixed_d_short.py; OLD[G2]='if int(x_tokens) <= 0 or chunked:'; NEW[G2]='if int(x_tokens) <= 0:'
+F[G1]=$SRT/weg2/mixed_d_short.py; OLD[G1]='return int(u_tokens) < hx'; NEW[G1]='return int(u_tokens) <= hx'
+F[G2]=$SRT/weg2/mixed_d_short.py; OLD[G2]='if int(x_tokens) <= 0 or chunked or no_forward:'; NEW[G2]='if int(x_tokens) <= 0 or no_forward:'
 F[A1]=$SRT/managers/scheduler.py; OLD[A1]='agreed = bool(self._weg2_group_min_flags([mine])[0])'; NEW[A1]='agreed = bool(mine)'
 F[K1]=$SRT/managers/scheduler.py; OLD[K1]='self.chunked_req._mixed_d_was_chunked = True'; NEW[K1]='pass'
 F[S1]=$SRT/managers/schedule_batch.py; OLD[S1]='merged[-running_bs:] = tail_base + 1'; NEW[S1]='merged[-running_bs:] = tail_base'
@@ -47,11 +50,25 @@ F[R1]=$SRT/managers/scheduler_components/batch_result_processor.py; OLD[R1]='   
 F[R2]=$SRT/managers/scheduler_components/batch_result_processor.py; OLD[R2]='                        req.kv_committed_len += 1
 '; NEW[R2]='                        pass
 '
+F[H1]=$SRT/managers/scheduler.py; OLD[H1]='hx = _mds.batch_half_x(new_batch.reqs)'; NEW[H1]='hx = x // 2'
+F[H2]=$SRT/weg2/mixed_d_short.py; OLD[H2]='best = hx if best == 0 else min(best, hx)'; NEW[H2]='best = hx if best == 0 else max(best, hx)'
+F[H3]=$SRT/weg2/mixed_d_short.py; OLD[H3]='        if hx <= 0:
+            return 0
+        best'; NEW[H3]='        if hx <= 0:
+            continue
+        best'
+F[E1]=$SRT/managers/scheduler.py; OLD[E1]='no_fwd = _mds.end_state_handoff(new_batch.reqs)'; NEW[E1]='no_fwd = False'
+F[N1]=$SRT/managers/scheduler.py; OLD[N1]='                    self.future_map.stash_bonus_tokens(
+                        running_batch.req_pool_indices, last_tokens
+                    )'; NEW[N1]='                    pass'
+F[C1]=$SRT/managers/scheduler_components/metrics_reporter.py; OLD[C1]='                if mixed
+                else'; NEW[C1]='                if False
+                else'
 run_suite() { (cd "$ROOT" && "$RD" run --allow-dirty "$ROOT" -q -p no:cacheprovider "-opythonpath=registered/unit/weg2" "$TEST" 2>&1 | grep -E "^VERDICT" ); }
 base=$(run_suite); echo "BASELINE: $base"
 case "$base" in *"VERDICT: OK"*) ;; *) echo "baseline not green -- abort"; exit 2;; esac
 surv=0
-for m in ${ONLY:-G1 G2 A1 K1 S1 S2 S3 S4 S5 S6 M1 R1 R2}; do
+for m in ${ONLY:-G1 G2 A1 K1 S1 S2 S3 S4 S5 S6 M1 R1 R2 H1 H2 H3 E1 N1 C1}; do
   restore; mutate "${F[$m]}" "${OLD[$m]}" "${NEW[$m]}" || { echo "$m: ANCHOR FAIL"; surv=1; continue; }
   v=$(run_suite)
   case "$v" in *"VERDICT: OK"*) echo "$m: SURVIVED  <<<"; surv=1;; *) echo "$m: killed ($v)";; esac

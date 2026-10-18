@@ -26,25 +26,56 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E4
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
 from sglang.srt.weg2 import mixed_d_short as mds  # noqa: E402
 
-X, F = 6000, 0.5  # halbX = 3000
+X = 6000
 SRT = pathlib.Path(__import__("sglang.srt", fromlist=["x"]).__path__[0])
 
 
 # ------------------------------------------------------------------------------------------------------ the gate
-def test_gate_boundary_is_strictly_below_halfx():
-    assert mds.short_gate(2999, X, F, False) is True       # u < halbX
-    assert mds.short_gate(3000, X, F, False) is False      # u == halbX is halb (R3), not kurz (R2)
-    assert mds.short_gate(3001, X, F, False) is False
-    assert mds.short_gate(0, X, F, False) is True
+# S33 review A1: the bound is the FRONT's halbX (weg2_front_halfx, min over the batch, SOLL R2a), X only says "group D".
+HX = 3000
 
 
-def test_gate_never_on_p_and_never_for_a_chunked_request():
-    assert mds.short_gate(10, 0, F, False) is False        # P / no riegel: X = 0
-    assert mds.short_gate(10, X, F, True) is False         # chunked request in or behind this batch (R6 rest)
+def test_gate_boundary_is_strictly_below_the_front_halfx():
+    assert mds.short_gate(2999, X, HX, False) is True       # u < halbX
+    assert mds.short_gate(3000, X, HX, False) is False      # u == halbX is halb (R3), not kurz (R2)
+    assert mds.short_gate(3001, X, HX, False) is False
+    assert mds.short_gate(0, X, HX, False) is True
 
 
-def test_gate_follows_the_half_frac_flag():
-    assert mds.short_gate(2400, X, 0.4, False) is False and mds.short_gate(2399, X, 0.4, False) is True
+def test_gate_never_on_p_never_chunked_never_without_a_front_halfx_never_an_e2_handoff():
+    assert mds.short_gate(10, 0, HX, False) is False        # P / no riegel: X = 0
+    assert mds.short_gate(10, X, HX, True) is False         # chunked request in or behind this batch (R6 rest)
+    assert mds.short_gate(10, X, 0, False) is False         # no halbX carried by the front: no invented bound
+    assert mds.short_gate(10, X, HX, False, no_forward=True) is False   # E2 END-state hand-off: no target forward
+
+
+def _r(rid, hx):
+    return types.SimpleNamespace(rid=rid, weg2_front_halfx=hx)
+
+
+def test_batch_half_x_is_the_smallest_front_halfx_and_zero_when_one_is_missing():
+    assert mds.batch_half_x([_r("a", 2807), _r("b", 2400)]) == 2400      # R2a: the smallest X of the members
+    assert mds.batch_half_x([_r("a", 2807), _r("b", None)]) == 0         # one without a carried halbX: never
+    assert mds.batch_half_x([_r("a", 0)]) == 0
+    assert mds.batch_half_x([]) == 0
+
+
+def test_the_rank_riegel_is_not_the_bound():
+    """NF: --tp-prefill-max-tokens 12288 -> 0.5 x 12288 = 6144 lies above every curve X (4096..5800) the front decides
+    with; a 4000-token D prefill under front X 5614 (halbX 2807) is halb, not kurz -- never mixed."""
+    hx = mds.batch_half_x([_r("a", 2807)])
+    assert mds.short_gate(4000, 12288, hx, False) is False
+    assert mds.short_gate(2806, 12288, hx, False) is True
+
+
+def test_an_e2_handoff_in_the_batch_is_never_mixed(monkeypatch):
+    from sglang.srt.weg2 import tail_adopt
+
+    monkeypatch.setattr(tail_adopt, "SKIP_PLANS", {"pdflip-29-190": object()})
+    assert mds.end_state_handoff([_r("pdflip-29-190", 2807)]) is True
+    assert mds.end_state_handoff([_r("pdflip-30-192", 2807)]) is False
+    monkeypatch.setattr(tail_adopt, "SKIP_PLANS", {})
+    assert mds.end_state_handoff([_r("pdflip-29-190", 2807)]) is False
 
 
 def test_default_on_and_switch(monkeypatch):
@@ -77,7 +108,9 @@ def test_call_edge_collective_entry_is_replicated_and_the_verdict_is_the_group_m
     assert "not running_batch.is_empty() and self._mixed_d_agreed(" in raw
     ag = ast.unparse(_fn(t, "_mixed_d_agreed"))
     assert "self._weg2_group_min_flags([mine])" in ag       # R11: MIN over the TP cpu group
-    assert "mds.short_gate(u, x, frac, chunked)" in ag
+    assert "mds.short_gate(u, x, hx, chunked, no_fwd)" in ag
+    assert "hx = _mds.batch_half_x(new_batch.reqs)" in ag     # A1: the front's halbX
+    assert "no_fwd = _mds.end_state_handoff(new_batch.reqs)" in ag   # A2: never an E2 hand-off
     assert "local_ok and" in ag                              # rank-local blockers ride in the vote, not in the entry
     assert "_mixed_d_was_chunked" in ag                      # lifetime-sticky chunk stamp is read
 
@@ -268,10 +301,53 @@ def test_non_overlap_spec_tail_uses_request_state():
               out_cache_loc=rig.req_to_token[1, :3].clone(), extend_num_tokens=3, prefix_lens=[0], extend_lens=[3],
               extend_logprob_start_lens=[0], req_to_token_pool=types.SimpleNamespace(req_to_token=rig.req_to_token),
               enable_overlap=False)
+    new.prefill_input_ids_cpu = torch.tensor(pb)
     ScheduleBatch.mix_with_running(new, running)
-    new.input_ids = torch.tensor(pb + [ctxA[-1]])
+    # S33 review A3 (PR #36933 1:1): non-overlap spec never writes the relay -- the scheduler stashes the tails' pending
+    # token (output_ids[-1]) before the resolve; the resolve then gathers it like the overlap path.
+    fm = rig.future_map({}, {})
+    fm.stash_bonus_tokens(running.req_pool_indices, torch.tensor([a.output_ids[-1]]))
+    resolve_forward_inputs(new, fm)
+    assert new.input_ids.tolist() == pb + [ctxA[-1]]
     assert new.prefix_lens == [0, L] and int(new.seq_lens[1]) == L + 1
     assert rig.forward(new)[1] == ref_a[k]
+
+
+def test_call_edge_non_overlap_spec_stashes_the_tails_pending_token():
+    src = ast.unparse(_fn(_tree("managers/scheduler.py"), "_get_new_batch_prefill_raw"))
+    i = src.index("new_batch.mix_with_running(running_batch)")
+    tail = src[i:i + 900]
+    assert "if not self.enable_overlap and (not self.spec_algorithm.is_none()):" in tail
+    assert "self.future_map.stash_bonus_tokens(running_batch.req_pool_indices, last_tokens)" in tail
+    assert "[r.output_ids[-1] for r in running_batch.reqs]" in tail
+
+
+def test_a_mixed_forward_is_reported_untimed_and_never_reaches_the_cost_ring():
+    """S33 review A4: a MIXED forward's gpu-ms holds the decode rows; it must not price D's #new-token (X-COST-LINE)."""
+    from sglang.srt.managers.scheduler_components.metrics_reporter import RankPrefillLog
+    from sglang.srt.weg2 import prefill_clock as pc
+
+    class _Timer:
+        def __init__(self, log):
+            self.log, self.completed = log, []
+
+        def _report(self):
+            while self.completed:
+                self.log._on_duration(self.completed.pop(0))
+
+    pc._reset_for_tests()
+    log = RankPrefillLog()
+    log.timer = _Timer(log)
+    log.record(new_tokens=168, cached_tokens=90000, timed=True, mixed=True)      # MIXED: prefill 168 + decode rows
+    log.record(new_tokens=900, cached_tokens=80000, timed=True)                  # a plain prefill
+    log.timer.completed += [0.200, 0.150]
+    log.flush()
+    recent = pc.cost_snapshot()["recent"]
+    assert [r["n"] for r in recent] == [900], recent                            # only the plain one is a cost sample
+    assert abs(recent[0]["ms"] - 150.0) < 1e-6                                   # paired with ITS own duration
+    assert log.cum["new_tokens"] == 168 + 900 and log.cum["chunks"] == 2
+    assert not log._pending and not log._durations
+    pc._reset_for_tests()
 
 
 def test_mamba_track_of_the_prefill_rows_survives_the_merge_and_tails_get_no_tracking():
