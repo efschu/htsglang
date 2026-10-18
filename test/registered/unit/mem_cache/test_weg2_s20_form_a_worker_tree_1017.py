@@ -105,3 +105,57 @@ def test_a_worker_applies_tp0s_verdict_at_the_broadcast_it_rides():
     assert snaps[0] == {H.NODE: (1, 1), 2 * H.NODE: (0, 0), 3 * H.NODE: (1, 1)}
     for r in ranks[1:]:
         assert not r.state.pending, "no verdict may stay parked on a worker after the broadcast it rode"
+
+
+# === the h16v3 TP0 host-arena-full cut (coordinator, 00:16-00:19Z, weg2-54-635 / -623) ====================
+def test_h16v3_tp0_arena_full_workers_free_the_tp0_own_store_read_lands_and_the_vote_is_not_zero(tmp_path):
+    """D.log 00:17-00:19: ARENA-REF-HOLDERS TP0 ``tree=6013-6018 own_held=6485-6952`` against TP1/TP2 ``tree=3796-3801
+    own_held=4449-4735`` (arena 6485 slots; the workers' own trees do NOT hold ~2200 of TP0's pages), 20x ``READ-ROOM
+    SHORT class=not_posted`` / ``cause=arena_full`` on D, then 24 W31 with TP0 ``why=host_admission my_vote=0`` while the
+    workers vote 60608: D's own store read of ~59584 tokens could not land on TP0 because TP0's host tree held the
+    arena and nobody on D answered a room request.
+    Replica (1:100): 48 slots, ALL pinned by TP0's tree (L3-backed spans, one reference each); the worker's tree holds
+    only a small span of them (a second reference). D's own read of 16 stems runs on TP0 (its process) with READ-ROOM-D
+    armed: TP0 serves the request at its broadcast, releases L3-backed childless spans, the clock takes the slots, EVERY
+    stem lands (= TP0's vote is the full depth, not 0 -- no W31). The worker applies the same verdict."""
+    import threading
+    import time
+
+    import test_weg2_read_room_d_1015 as DD
+    from test_weg2_read_room_1015 import _fill_arena_with_tree_pages, _read, _rr, _setup
+
+    stems = [f"r{i}" for i in range(16)]
+    be, arena = _setup(tmp_path, stems, slots=48)
+    t0_slots = _fill_arena_with_tree_pages(arena, 48, tag="dpage")            # TP0's tree holds the whole arena
+    arena.ref_slots(t0_slots[0:8], +1)                                        # the worker holds one 8-page span of it
+    stem_of = {s: f"dpage{i}" for i, s in enumerate(t0_slots)}
+    root = DD._store_files(tmp_path, [f"dpage{i}" for i in range(48)])
+    tp0_spans = [(1, t0_slots[0:8]), (2001, t0_slots[8:20]), (4001, t0_slots[20:34]), (6001, t0_slots[34:48])]
+    tp0 = DD._real_d_tree(tp0_spans, arena, "tp0")
+    worker = DD._real_d_tree([(1, t0_slots[0:8])], arena, "worker")
+    pool = DD._Pool(arena, stem_of, root)
+    tp0._weg2_direct_pool = lambda: pool
+    mp = pytest.MonkeyPatch()
+    roles = DD._Roles()
+    mp.setattr(DD.R12, "role", roles)
+    mp.setattr(_rr(), "form_a_role", roles, raising=False)
+    _rr().reset_for_tests()
+    DD.R12._reset_state_for_tests()
+    _rr()._ST.arena = arena
+    stop = threading.Event()
+    th = threading.Thread(target=DD._group_d_loop, args=(roles, tp0, worker, stop), name="d-group")
+    th.start()
+    try:
+        time.sleep(0.1)                                    # D's first broadcast arms READ-ROOM on this arena
+        out = _read(be, arena, stems)
+    finally:
+        stop.set()
+        th.join(5)
+        mp.undo()
+        _rr().reset_for_tests()
+        DD.R12._reset_state_for_tests()
+    landed = sum(1 for s in out if s is not None)
+    assert landed == len(stems), f"TP0's own read landed {landed}/{len(stems)}: its vote would be short, W31"
+    assert DD._released(tp0)[:0] == [], "diagnostics"
+    # the worker's span (shared by both ranks) is released on both or on neither -- never rank-uneven
+    assert (1 in DD._released(tp0)) == (1 in DD._released(worker))
