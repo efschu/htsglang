@@ -3728,6 +3728,31 @@ class Envs:
     # the decode LRU. False: the plan before H107. Rank-uniform: every rank
     # reads the same launcher env; the waves are rank-local (no collective).
     FLLIPER_OPT_MOE_POOL_EAGER_LRU_HITS = EnvBool(True)
+    # S44/H107c (18.10.): H107 also arms on a MAPPED residency -- a frozen
+    # load-time layout whose residents sit at slots other than their own id,
+    # as long as ``resident_slot`` maps the R residents one-to-one onto
+    # [0, R). The NF D pool runs on the Platztausch Karte (v2), whose buffer
+    # order is [prefix | pad | extra] (``_local_map_layout``): local pad 0 sits
+    # BEHIND the prefix, so ``slot != id`` on every D rank and H107 never armed
+    # on the metal (rc12 1018_153151 D: 0x 'H107 EAGER-LRU' against 1587x
+    # 'expert-major prefill, 3 waves, 0.33-0.44 GiB H2D'; every D extend
+    # 1.5-2.5 s, decode stood 33-40 %). Wave 0 reads each resident at
+    # ``resident_slot[e]`` instead of ``e``; nothing else changes. Bit-identical
+    # (a row choice never changes what the apply computes). False: H107 only
+    # on the identity layout (H107b). Rank-uniform launcher env; the waves are
+    # rank-local (no collective).
+    FLLIPER_OPT_MOE_POOL_EAGER_LRU_MAPPED = EnvBool(True)
+    # S44/H107d (18.10.): when the H107 misses would need MORE waves than the
+    # plain plan + 1 (the warm LRU holds most scratch rows, so few rows are
+    # writable), the coldest hit rows are RECLAIMED: their experts are read in
+    # the fetch-free wave 0, and only then (same stream, write-after-read) do
+    # later miss waves overwrite those rows. Waves stay <= plain + 1, the H2D
+    # stays misses-only, the decode LRU keeps its hottest rows. Writable rows
+    # are also taken coldest first (free/staging rows, then the oldest
+    # ``row_use``), which rides the same D2H as the routing. Without it a big
+    # extend under a warm LRU fell into dozens of tiny waves (or, with no
+    # writable row left, back to the plain plan). False: H107's plan as before.
+    FLLIPER_OPT_MOE_POOL_EAGER_LRU_RECLAIM = EnvBool(True)
     # D-Mini-Extend (30.09., y3u): an eager forward under the pool whose routed
     # ids fit the widest CAPTURED decode step (graph form: max graph bs x MTP
     # verify rows x top-k, and the step's wave bound min(ids, E - R) <=

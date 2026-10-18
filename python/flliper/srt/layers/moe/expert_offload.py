@@ -518,6 +518,40 @@ def pool_lru_rows(hot_phys, lru_start: int, row_limit: int) -> Dict[int, int]:
     return out
 
 
+def eager_lru_resident_slots(planner, resident_count: int,
+                             mapped: bool = True) -> Optional[Dict[int, int]]:
+    """H107c (S44, 18.10.): resident expert -> the bank slot wave 0 reads it
+    from, or None when H107 cannot compute wave 0 on this layout.
+
+    ``{}`` stands for the identity ``[0, R)`` at ``slot == id`` (no map at
+    all; the caller reads ``e`` itself). A frozen layout's map is returned as
+    it is when it places the R residents one-to-one onto ``[0, R)`` -- the
+    NF D Platztausch Karte (``[prefix | pad | extra]``, pad behind the prefix)
+    is exactly such a map, and before H107c it kept H107 off on every D rank.
+    ``mapped=False`` (FLLIPER_OPT_MOE_POOL_EAGER_LRU_MAPPED=0) accepts only the
+    identity, the H107b rule. None: a map that does not cover the residents
+    one-to-one inside ``[0, R)`` (a hot set mid-calibration, a short map)."""
+    ids = getattr(planner, "resident_ids", None)
+    R = int(resident_count)
+    if ids is None:
+        return {}
+    ids = frozenset(int(e) for e in ids)
+    if len(ids) != R:
+        return None
+    slot = getattr(planner, "resident_slot", None)
+    if slot is None:
+        return {} if ids == frozenset(range(R)) else None
+    try:
+        got = {int(e): int(slot[e]) for e in ids}
+    except (KeyError, TypeError, ValueError):
+        return None
+    if sorted(got.values()) != list(range(R)):
+        return None
+    if all(s == e for e, s in got.items()):
+        return {}
+    return got if mapped else None
+
+
 def eager_lru_static_residency(planner, resident_count: int) -> bool:
     """H107b: does the planner hold the static identity residency -- expert
     ``e`` resident at slot ``e`` for ``e`` in ``[0, R)`` -- the layout
@@ -574,6 +608,73 @@ def plan_eager_lru_waves(
         list(zip(misses[i : i + width], writable)) for i in range(0, len(misses), width)
     ]
     return hits, miss_waves
+
+
+def plan_eager_lru_waves_reclaim(
+    spill_sorted: Sequence[int],
+    lru_row_of: Dict[int, int],
+    scratch_rows: Sequence[int],
+    *,
+    row_use: Optional[Sequence[int]] = None,
+    max_waves: int = 0,
+) -> Optional[Tuple[Dict[int, int], List[List[Tuple[int, int]]], List[int]]]:
+    """H107d (S44, 18.10.): ``plan_eager_lru_waves`` with a wave bound.
+
+    Returns ``(hits, miss_waves, reclaimed)``. ``hits`` = spill expert -> the
+    LRU row it is read from in the fetch-free wave 0. Writable rows are the
+    scratch rows holding no hit, taken COLDEST FIRST: rows no expert owns
+    (free LRU rows, staging) before owned ones, owned ones by ``row_use``
+    ascending (then row id) -- so a miss evicts the decode working set's
+    coldest rows, not its lowest-numbered ones. Without ``row_use`` the row
+    order stays as in ``plan_eager_lru_waves``.
+
+    ``max_waves`` > 0: when the misses over the writable rows need more than
+    ``max_waves`` waves, the coldest HIT rows inside ``scratch_rows`` are
+    reclaimed until they fit (``reclaimed``, coldest first). A reclaimed row
+    is still read in wave 0 -- the caller must run wave 0 as its OWN apply
+    before the first miss fetch (the serial expert-major loop on one stream
+    orders the overwrite behind that read). Its expert loses the row after
+    the forward (the sync gives the row to the miss written last); every
+    other hit keeps its row. ``max_waves`` = 0 never reclaims.
+
+    None: misses remain but no row can take them (no writable row and
+    nothing reclaimable) -- the caller keeps the plain plan. Which row holds
+    an expert never changes what the forward computes."""
+    hits = {int(e): int(lru_row_of[e]) for e in spill_sorted if e in lru_row_of}
+    held = set(hits.values())
+    misses = [int(e) for e in spill_sorted if e not in hits]
+    owned = set(int(r) for r in lru_row_of.values())
+
+    def _cold(r: int):
+        if row_use is None:
+            return (0, 0, r)
+        if r not in owned:
+            return (0, 0, r)
+        try:
+            u = int(row_use[r])
+        except (IndexError, TypeError, ValueError):
+            u = 0
+        return (1, u, r)
+
+    rows = [int(r) for r in scratch_rows]
+    writable = [r for r in rows if r not in held]
+    if row_use is not None:
+        writable.sort(key=_cold)
+    reclaimed: List[int] = []
+    if misses and max_waves > 0:
+        need = -(-len(misses) // int(max_waves))  # rows per wave for <= max_waves waves
+        if len(writable) < need:
+            in_scratch = set(rows)
+            candidates = sorted((r for r in held if r in in_scratch), key=_cold)
+            reclaimed = candidates[: need - len(writable)]
+            writable = writable + reclaimed
+    if misses and not writable:
+        return None
+    width = max(1, len(writable))
+    miss_waves = [
+        list(zip(misses[i : i + width], writable)) for i in range(0, len(misses), width)
+    ]
+    return hits, miss_waves, reclaimed
 
 
 # fnFL2 H20b: below this many routed (token, k) pairs the list path stays --
@@ -3601,6 +3702,8 @@ class MoEExpertOffloadCache:
     _deferred_rows = None
     #: H107: armed by run_eager_pool for one eager forward (set per instance)
     _eager_lru_armed = False
+    #: H107c: wave 0's resident slots for that forward ({} = identity)
+    _eager_lru_slots = None
     #: D-Mini-Extend: device-planned eager step on/off, metal checks left, and
     #: the graph form's id limit (None = not derived yet; set per instance)
     _pool_eager_device_step = False
@@ -5262,18 +5365,29 @@ class MoEExpertOffloadCache:
         # (Task #47) spells that identity out as maps, and the NF D pool runs
         # on the store, so `resident_ids is None` kept H107 off on the metal
         # (bridge 28.09. 19:38-19:58: 0x 'H107 EAGER-LRU').
-        self._eager_lru_armed = (
+        # H107c (S44): a MAPPED frozen layout arms too -- wave 0 reads each
+        # resident at its own slot (the NF D Karte puts pad 0 behind the
+        # prefix, slot != id on every D rank, and H107 never armed there).
+        from flliper.srt.environ import envs
+
+        self._eager_lru_slots = None
+        if (
             self._pool_eager_lru_hits
             and self._pool_ready
             and self._pool_eager_wave_order == "expert"
-            and eager_lru_static_residency(self.planner, self.resident_count)
-        )
+        ):
+            self._eager_lru_slots = eager_lru_resident_slots(
+                self.planner, self.resident_count,
+                mapped=bool(envs.FLLIPER_OPT_MOE_POOL_EAGER_LRU_MAPPED.get()),
+            )
+        self._eager_lru_armed = self._eager_lru_slots is not None
         try:
             out = self.run_waves(
                 dispatch_output, apply_fn, lookahead=None, order=self._pool_eager_wave_order
             )
         finally:
             self._eager_lru_armed = False
+            self._eager_lru_slots = None
         self.sync_pool_from_host()
         return out
 
@@ -5812,12 +5926,25 @@ class MoEExpertOffloadCache:
         topk_ids = dispatch_output.topk_output.topk_ids
         n_own = int(topk_ids.numel())
         pool_hot = None
+        pool_use = None
         if lookahead is None and self._eager_lru_armed:
-            # H107: the pool map rides the ids' D2H (see run_waves)
-            both_np = torch.cat(
-                [topk_ids.reshape(-1), self._pool_tables.hot_phys.reshape(-1).to(topk_ids.dtype)]
-            ).cpu().numpy()
-            pool_hot = both_np[n_own:].tolist()
+            # H107: the pool map rides the ids' D2H (see run_waves); H107d
+            # (S44): the rows' use clocks too
+            from flliper.srt.environ import envs
+
+            hot_dev = self._pool_tables.hot_phys.reshape(-1).to(topk_ids.dtype)
+            parts = [topk_ids.reshape(-1), hot_dev]
+            reclaim = bool(envs.FLLIPER_OPT_MOE_POOL_EAGER_LRU_RECLAIM.get())
+            if reclaim:
+                lim = torch.iinfo(topk_ids.dtype).max
+                parts.append(
+                    self._pool_tables.row_use.reshape(-1).clamp(max=lim).to(topk_ids.dtype)
+                )
+            both_np = torch.cat(parts).cpu().numpy()
+            n_hot = int(hot_dev.numel())
+            pool_hot = both_np[n_own : n_own + n_hot].tolist()
+            if reclaim:
+                pool_use = both_np[n_own + n_hot :].tolist()
         elif lookahead is None:
             both_np = topk_ids.reshape(-1).cpu().numpy()
         else:
@@ -5849,6 +5976,7 @@ class MoEExpertOffloadCache:
                 resident_used=resident_used,
                 spill_waves=spill_waves,
                 pool_hot=pool_hot,
+                pool_use=pool_use,
             )
             if out is not None:
                 return out
@@ -5918,16 +6046,30 @@ class MoEExpertOffloadCache:
 
         prefetch = None
         pool_hot = None
+        pool_use = None
         if lookahead is None and self._eager_lru_armed:
             # H107: this layer's pool map crosses in the SAME rendezvous as the
-            # routing -- one D2H per layer, as before
+            # routing -- one D2H per layer, as before. H107d (S44): the rows'
+            # use clocks ride along (clamped into the ids' dtype; residents and
+            # staging carry ROW_USE_NEVER, which only orders them last).
             n_own = topk_ids.numel()
             k = topk_ids.shape[-1]
-            both = torch.cat(
-                [topk_ids.reshape(-1), self._pool_tables.hot_phys.reshape(-1).to(topk_ids.dtype)]
-            ).tolist()
+            from flliper.srt.environ import envs
+
+            hot_dev = self._pool_tables.hot_phys.reshape(-1).to(topk_ids.dtype)
+            parts = [topk_ids.reshape(-1), hot_dev]
+            reclaim = bool(envs.FLLIPER_OPT_MOE_POOL_EAGER_LRU_RECLAIM.get())
+            if reclaim:
+                lim = torch.iinfo(topk_ids.dtype).max
+                parts.append(
+                    self._pool_tables.row_use.reshape(-1).clamp(max=lim).to(topk_ids.dtype)
+                )
+            both = torch.cat(parts).tolist()
             ids_list = [both[i : i + k] for i in range(0, n_own, k)]
-            pool_hot = both[n_own:]
+            n_hot = int(hot_dev.numel())
+            pool_hot = both[n_own : n_own + n_hot]
+            if reclaim:
+                pool_use = both[n_own + n_hot :]
         elif lookahead is None:
             ids_list = topk_ids.tolist()  # [T][k]  (device->host sync; eager only)
         else:
@@ -5982,6 +6124,7 @@ class MoEExpertOffloadCache:
                     resident_used=resident_used,
                     spill_waves=spill_waves,
                     pool_hot=pool_hot,
+                    pool_use=pool_use,
                 )
                 if out is not None:
                     return out
@@ -6070,7 +6213,8 @@ class MoEExpertOffloadCache:
         return combine_out._replace(hidden_states=out_full)
 
     def _run_eager_lru(
-        self, dispatch_output, apply_fn, *, flat_np, resident_used, spill_waves, pool_hot
+        self, dispatch_output, apply_fn, *, flat_np, resident_used, spill_waves, pool_hot,
+        pool_use=None,
     ):
         """H107: run this eager pool forward on the plan that reads warm LRU
         rows (``plan_eager_lru_waves``). ``pool_hot`` is the host copy of the
@@ -6083,12 +6227,19 @@ class MoEExpertOffloadCache:
         lru = pool_lru_rows(pool_hot, t.lru_start, min(int(t.pool_rows), bank_rows))
         spill = [e for wave in spill_waves for e in wave]
         R = self.resident_count
-        plan = plan_eager_lru_waves(spill, lru, range(R, R + self.scratch))
+        # H107d (S44): pool_use present = the reclaim switch is on; the bound
+        # is the plain plan's spill waves + 1
+        cap = (len(spill_waves) + 1) if pool_use is not None else 0
+        plan = plan_eager_lru_waves_reclaim(
+            spill, lru, range(R, R + self.scratch), row_use=pool_use, max_waves=cap
+        )
         if plan is None:
             return None
-        hits, miss_waves = plan
+        hits, miss_waves, reclaimed = plan
         self._eager_lru_used.update({row: e for e, row in hits.items()})
-        slot0 = {int(e): int(e) for e in resident_used}
+        # H107c (S44): a resident is read at ITS slot ({} = identity layout)
+        slots = getattr(self, "_eager_lru_slots", None) or {}
+        slot0 = {int(e): int(slots.get(int(e), e)) for e in resident_used}
         slot0.update(hits)
         n_miss = sum(len(w) for w in miss_waves)
         stats = self.planner.stats
@@ -6098,7 +6249,9 @@ class MoEExpertOffloadCache:
         stats.misses += n_miss
         stats.fetches += n_miss
         h2d_before = stats.h2d_bytes
-        if len(miss_waves) <= 1:
+        # a reclaimed hit row is read in wave 0 and overwritten after it: wave 0
+        # must be its own apply (the multi-wave loop), never fused with a fetch
+        if len(miss_waves) <= 1 and not reclaimed:
             fetch = list(miss_waves[0]) if miss_waves else []
             slot = dict(slot0)
             slot.update(fetch)
@@ -6123,10 +6276,12 @@ class MoEExpertOffloadCache:
             waves_before=len(spill_waves),
             waves_after=len(miss_waves),
             h2d_bytes=stats.h2d_bytes - h2d_before,
+            reclaimed=len(reclaimed),
         )
         return out
 
-    def _note_eager_lru(self, *, tokens, spill, hits, misses, waves_before, waves_after, h2d_bytes):
+    def _note_eager_lru(self, *, tokens, spill, hits, misses, waves_before, waves_after, h2d_bytes,
+                        reclaimed=0):
         """H107 metal marker, one line per eager forward (INFO for one
         representative layer, DEBUG for the rest -- the _log_wave_h2d rule).
         waves_before = the scratch waves the plain plan would have run."""
@@ -6140,7 +6295,7 @@ class MoEExpertOffloadCache:
         logging.getLogger(__name__).log(
             logging.INFO if layer_id == _H107_LOG_LAYER else logging.DEBUG,
             "H107 EAGER-LRU layer %s: T=%d spill %d = lru_hits %d + misses %d, "
-            "waves %d -> %d, %.3f GiB H2D",
+            "waves %d -> %d, %.3f GiB H2D, reclaimed %d",
             layer_id,
             tokens,
             spill,
@@ -6149,6 +6304,7 @@ class MoEExpertOffloadCache:
             waves_before,
             waves_after,
             h2d_bytes / float(1 << 30),
+            reclaimed,
         )
 
     def _issue_lookahead(self, lookahead, pred_list):
