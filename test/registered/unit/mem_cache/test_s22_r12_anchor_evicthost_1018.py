@@ -22,7 +22,7 @@ class _NS(types.SimpleNamespace):
 
 
 def _node(h, depth, evicted=True, children=None, host=None, nid=1):
-    root = types.SimpleNamespace(parent=None, key=[], children={})
+    root = _NS(parent=None, key=[], children={})
     n = _NS(
         id=nid, parent=root, key=list(range(depth)), hash_value=[h], evicted=evicted,
         children=children or {}, component_data={BASE_COMPONENT_TYPE: types.SimpleNamespace(host_value=host)})
@@ -107,7 +107,7 @@ def test_evict_host_skips_a_leaf_a_worker_cannot_delete():
     R._reset_state_for_tests()
     a, b = _node("a", 4, nid=1), _node("b", 4, nid=2)
     for n in (a, b):
-        n.parent = types.SimpleNamespace(parent=None, key=[], children={})
+        n.parent = _NS(parent=None, key=[], children={})
     seen = _drive([a, b], {R.node_key(a)})
     assert seen == [b], seen
     assert R._S.counts["kept_total_evict_host_worker_cannot_delete"] == 1
