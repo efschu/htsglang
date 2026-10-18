@@ -508,6 +508,8 @@ def _load_lib() -> Optional[ctypes.CDLL]:
             lib.arena_quarantine_sweep.argtypes = [p_u8, i64]
             lib.arena_quarantine_host_write.restype = i64
             lib.arena_quarantine_host_write.argtypes = [p_u8, i64, p_i64, p_i64, p_i8]
+            lib.arena_touch_progress.restype = i64
+            lib.arena_touch_progress.argtypes = [p_u8, i64, p_i64, p_i64]
             lib.arena_free_if_gen.restype = i64
             lib.arena_free_if_gen.argtypes = [p_u8, i64, p_i64, p_i64, p_i8]
             lib.arena_set_writer_tag.restype = None
@@ -977,6 +979,16 @@ class ShmArena:
         """L3FILL-JOINED (3): free quarantined slots nobody holds (or held
         past the backstop). Returns the number freed."""
         return int(self._lib.arena_quarantine_sweep(self._base, int(backstop_ms)))
+
+    def touch_progress(self, slots: Sequence[int], gens: Sequence[int]) -> int:
+        """S23: the reader of these claims is alive and reading -- move their progress clock (generation-checked,
+        CLAIMED only). Returns how many were touched."""
+        n = len(slots)
+        if n == 0:
+            return 0
+        c_sl = (ctypes.c_int64 * n)(*[int(s) for s in slots])
+        c_g = (ctypes.c_int64 * n)(*[int(g) for g in gens])
+        return int(self._lib.arena_touch_progress(self._base, n, c_sl, c_g))
 
     def free_if_gen(self, slots: Sequence[int], gens: Sequence[int], reason: str = "unnamed") -> list[int]:
         """Free this writer's own claims only while they still carry its

@@ -1726,3 +1726,24 @@ int64_t arena_free_if_gen(uint8_t *base, int64_t n, const int64_t *slots, const 
     }
     return freed;
 }
+
+/* S23 (h16v4b 1018_013102): a reader that is READING a claim it holds says so. progress_ms is the clock of "bytes arrived"
+ * (merge at complete); an L3 fill reads a whole batch before it completes, so a sibling thread or another rank joined on
+ * the claim saw no progress for as long as the batch took (754 pages: 1472 ms, over the 1 s idle bound) and reaped it
+ * live. The reader now touches the claims of its batch after every chunk it has read. Only a claim that still carries the
+ * caller's generation and is still CLAIMED is touched (a reaped claim stays reaped). Returns the number touched. */
+int64_t arena_touch_progress(uint8_t *base, int64_t n, const int64_t *slots, const int64_t *gens) {
+    ArenaHeader *h = hdr(base);
+    int64_t touched = 0;
+    for (int64_t i = 0; i < n; i++) {
+        if (slots[i] < 0 || (uint64_t)slots[i] >= h->slots) continue;
+        SlotHeader *sh = slot_hdr(base, (uint64_t)slots[i]);
+        if ((int64_t)sh->generation != gens[i]) continue;
+        if (atomic_load(&sh->state) != S_CLAIMED) continue;
+        uint32_t now = mono_ms();
+        atomic_store(&sh->touched_ms, now);
+        atomic_store(&sh->progress_ms, now);
+        touched++;
+    }
+    return touched;
+}
