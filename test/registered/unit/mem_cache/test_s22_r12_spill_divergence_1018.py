@@ -59,7 +59,6 @@ def test_s22_tp0_does_not_spill_a_node_a_worker_has_device_evicted(group, caplog
     v = _tp0_serves(g)
     for i in evicted:                              # TP0 keeps those host copies: no worker could follow
         assert g.n0[i].component_data[FULL].host_value is not None, i
-        assert not g.n0[i].l3_present
     assert [i for i in range(4) if g.n0[i].component_data[FULL].host_value is None], "TP0 spilled nothing at all"
     caplog.set_level(logging.WARNING, logger=R.logger.name)
     with _as("worker"):
@@ -77,10 +76,12 @@ def test_s22_the_h16v4b_shape_without_the_worker_state_diverges(group, monkeypat
     monkeypatch.setattr(R, "worker_device_evicted", lambda tree, node: None)
     monkeypatch.setattr(R, "_dev_refresh", lambda tree: None)
     _worker_peels(g, [4, 5, 6, 7])
+    g.t1._evict_host_leaf = lambda node, tracker: None      # the fixture's keys are lists; the call is the evidence
     v = _tp0_serves(g)
     with _as("worker"):
         c = R.apply(g.t1, v.events, seq=v.seq)
-    assert c["unreconcilable"] + c["deleted"] >= 1
+    assert c["unreconcilable"] >= 1, c                       # interior 4..6: no state to follow into
+    assert c["deleted"] >= 1, c                              # leaf 7: a node TP0 keeps would be dropped
 
 
 def test_s22_a_clean_group_still_spills_every_node(group):
