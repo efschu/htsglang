@@ -442,7 +442,12 @@ def test_p5_the_x_refusal_vote_is_entered_only_behind_the_replicated_preconditio
     assert [g for _, g in sites] == [
         ["If:any((_weg2_rvp.capacity_park_precondition(r) for r in refused))"]
     ], sites
-    # and the precondition reads only request fields + two process-level switches
+    # and the precondition reads only request fields + two process-level switches.
+    # "priority" (S33, 18.10.): LANES HOTFIX 2 1014 (bc35462240, git-bisect first bad commit of this pin) made a
+    # raised-lane request (req.priority > 0) skip the capacity park. The field is REPLICATED: it is the request's own
+    # value, stamped by the front on every leg (lanes hotfix a4856f6e5d) and broadcast with the tokenized request to
+    # every TP rank, or the deterministic server-args default of Scheduler._set_or_validate_priority. No rank-local
+    # term enters the vote's entry, so the RAENGE-NIE-UNEINS argument of this pin stands; the pin was stale, not the code.
     rvp = _tree(SRT / "weg2" / "resume_via_p.py")
     pre = _find_fn(rvp, "capacity_park_precondition")
     doc = pre.body[0].value if isinstance(pre.body[0], ast.Expr) else None
@@ -459,6 +464,7 @@ def test_p5_the_x_refusal_vote_is_entered_only_behind_the_replicated_preconditio
         "SGLANG_WEG2_GROUP",
         "_weg2_store_short_fallback",
         "multimodal_inputs",
+        "priority",
         "stream",
     ], attrs
 
