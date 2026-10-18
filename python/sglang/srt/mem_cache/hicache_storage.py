@@ -86,6 +86,17 @@ class _RefOnLand(list):
                 pass
         list.__setitem__(self, i, v)
 
+    def adopt(self, i, v) -> None:
+        """S24 (review 1018): install a slot whose reference the fill already took while it was CLAIMED (reference
+        before complete) -- no second reference."""
+        old = list.__getitem__(self, i)
+        if old is not None:
+            try:
+                self._arena.ref_slots([int(old)], -1)
+            except Exception:  # noqa: BLE001
+                pass
+        list.__setitem__(self, i, v)
+
     def release_all(self) -> None:
         for i in range(len(self)):
             if list.__getitem__(self, i) is not None:
@@ -4539,9 +4550,32 @@ class HiCacheFile(HiCacheStorage):
         late = []
         filled = 0
         if ok:
+            # S24 REF-BEFORE-COMPLETE (review 1018, probe P2): the reference is taken while the claim is still CLAIMED
+            # (arena_ref_slots takes CLAIMED, arena.c:860), only then the slot is completed. It is never COMPLETE and
+            # unreferenced, so no clock of any thread or rank process (TP0/TP1/TP2 share the arena) can take it between
+            # the complete and the reference -- independent of every protection list, rank-agreed by construction (the
+            # refcount sits in the shared header). The reference is taken AFTER the read, not at the claim: a
+            # reference on a CLAIMED slot blocks the JOIN-IDLE reap (microseconds here, not the read).
+            _pre = {}
+            if isinstance(out, _RefOnLand):
+                for k in ok:
+                    try:
+                        if int(arena.ref_slots([int(todo[k][1])], +1)) == 1:
+                            _pre[k] = int(todo[k][1])
+                    except Exception:  # noqa: BLE001 - the ref-on-land below
+                        pass
             cs = arena.complete_slots([todo[k][1] for k in ok], [todo[k][2] for k in ok],
                                       [(0, int(total_bytes))])
             for k, c in zip(ok, cs):
+                if c in (1, 2) and k in _pre:
+                    out.adopt(todo[k][0], todo[k][1])
+                    filled += 1
+                    continue
+                if k in _pre:
+                    try:
+                        arena.ref_slots([_pre[k]], -1)   # not ours to keep (reaped / recycled / refused)
+                    except Exception:  # noqa: BLE001
+                        pass
                 if c in (1, 2):
                     out[todo[k][0]] = todo[k][1]
                     filled += 1
