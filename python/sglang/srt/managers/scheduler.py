@@ -15717,7 +15717,7 @@ class Scheduler(
                 logger.warning(
                     "#1324 STORE READ HELD-CUT rid=%s delivered=%d deliverable=%d shortfall=%d hit_tokens=%d "
                     "cut_cause=%s site=drain occurrence=%d held_cut_occurrence=%d -- the store HOLDS the whole span "
-                    "(probe hit covers it) and the read was cut by %s, NOT by the arena room (that would be "
+                    "(probe hit covers it) and the read was cut by %s, NOT by the arena room (XX
                     "cause=arena_full: CAPACITY-CUT). Deferring through the A12.2 shortfall arm. Denominator: every "
                     "terminated store read of this rank whose record reports a page-floored shortfall AND whose "
                     "probe hit covers the deliverable prefix AND whose recorded cut cause is not arena_full",
