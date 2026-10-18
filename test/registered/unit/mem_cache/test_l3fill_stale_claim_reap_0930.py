@@ -171,14 +171,16 @@ def _on_io_thread(fn):
     return res["out"]
 
 
-def test_s23_the_loser_of_the_reap_race_awaits_the_winners_fill_instead_of_dropping_the_stem(tmp_path, monkeypatch):
+def test_s23_the_loser_of_the_reap_race_awaits_the_winners_fill_instead_of_dropping_the_stem(tmp_path, monkeypatch, caplog):
     monkeypatch.setenv("SGLANG_WEG2_L3FILL_JOIN_IDLE_MS", "150")
     be, arena, old, gen = _setup(tmp_path)
     time.sleep(0.08)
     won = _peer_wins_the_reap(arena, 0.15)
-    with envs.SGLANG_WEG2_L3FILL_STALE_CLAIM_S.override(0.05):
+    with envs.SGLANG_WEG2_L3FILL_STALE_CLAIM_S.override(0.05), caplog.at_level(logging.INFO, logger=hs.__name__):
         out = _on_io_thread(lambda: HiCacheFile.arena_fill_from_disk(be, arena, ["p0", "p1", "p2"], TOTAL, prefix=True))
     assert won, "the peer must have won the reap"
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("STALE-CLAIM-REAP" in m and "reclaimed=0" in m for m in msgs), msgs   # the losing edge was reached
     assert out[0] is not None and out[1] == won[0] and out[2] is not None, (out, won)   # base: out[1] None, prefix ends
     assert bytes(arena.slot_view(out[1], TOTAL)[:4]) == b"\x41" * 4
 
