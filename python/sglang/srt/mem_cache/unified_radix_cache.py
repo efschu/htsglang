@@ -6429,12 +6429,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 # Form A: a page some owner has not finished is not COMPLETE and
                 # got no L3 copy -- the whole node stays until every page has one
                 continue
-            if _role == "host" and not _read_room_l3_complete(node, sec):
-                # review readroomd B3: released only when EVERY page of the node has its L3 copy -- the COMPLETE pages
-                # are all the node's pages and each is on disk or was written now. S20: Form A (TP0) only. The
-                # shared P path keeps its rule byte for byte (the h16t F1 room-set tests -- followers-first,
-                # undecided -- release PP nodes whose page count differs from the stand-ins' hash_value and went
-                # red under the all-roles form); the P-side hole B3 named stays an open point of the S20 report.
+            if not _read_room_l3_complete(node, sec):
+                # review readroomd B3 (every role): released only when EVERY page of the node has its L3 copy --
+                # the COMPLETE pages are all the node's pages and each is on disk or was written now
                 continue
             secured += int(sec.get("on_disk", 0))
             written += int(sec.get("written", 0))
