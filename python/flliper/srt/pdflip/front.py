@@ -5809,7 +5809,12 @@ class Front:
         return max(0, self.d_bs - self._seats_in_use())
 
     def _seats_in_use(self) -> int:
-        return max(0, self.d_bs - self._d_seat._value)
+        # S46r (review of S46 F5): a seat taken ON CREDIT holds no permit, yet it is a request promised to D exactly
+        # like a normal one -- counted here, or ``_handoff_in_flight`` (seats - D.outstanding) reads a batch hand-off
+        # still waiting for its POST as 0 while a credit request already sits in D.outstanding, and the D->P park /
+        # flip guards (FIX 2 round 2) pass with a leg 2 about to land in the flipping group (the W1/W2 class)
+        credit = sum(1 for s in (getattr(self, "_d_seats_live", None) or ()) if getattr(s, "on_credit", False))
+        return max(0, self.d_bs - self._d_seat._value) + credit
 
     def _handoff_in_flight(self) -> int:
         """FIX 2 (round 2): requests HANDED to D that D does not hold yet.
@@ -11345,6 +11350,16 @@ class Front:
         victims = (st.get("age_victims") or {}).get(rid)
         if not victims or rid not in (st.get("granted") or {}):
             return False
+        k = Front._sa_key(self, rid)
+        for q in list(getattr(self, "_ready_for_d", ()) or ()):
+            if getattr(getattr(q, "fut", None), "done", lambda: True)():
+                continue
+            if Front._sa_key(self, q) < k:
+                # S46r (review): an OLDER request waits in the front's D line (d_admitter at the semaphore). D's
+                # SEAT-AGE sees only its own waiting queue, and the next freed permit would pass to this debtor --
+                # the younger head would overtake it. It waits at the semaphore behind it, as before F5.
+                self.counters["arrival_seat_age_credit_older_in_line"] += 1
+                return False
         self.counters["arrival_seat_age_seat_on_credit"] += 1
         logger.info("PDFLIP SEAT-AGE ON-CREDIT rid=%s victims=%s seats_live=%d d_bs=%d -- every front seat is held: "
                     "the AGE PLAN head goes to D now, D's SEAT-AGE displaces the youngest for it (no wait at the "
@@ -13115,6 +13130,11 @@ class Front:
         takes the seat first once its leg 1 is done; D loses nothing (asleep). NF rc12: pdflip-110-1000 (the
         youngest) took the seat freed at 18:50:37,514 by D-ADMIT 18:50:43,525 while 996-999 were still on P."""
         if self.awake == "D" or not Front._seat_order_after_flip_on(self):
+            return False
+        if getattr(self, "state", "serving") != "serving":
+            # S46r (review): the P->D flip runs (awake is still "P", xsn347 admits during it) -- P serves nothing more
+            # this phase, so an older entry left in the queue cannot take the seat first; holding would only push
+            # the younger hand-off's dormant read behind the wake (the 2 s xsn347 closed) for no gain
             return False
         k = Front._sa_key(self, p)
         older = None
