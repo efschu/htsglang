@@ -73946,7 +73946,7 @@
    "id": "SGLANG_WEG2_EVICT_ANCHOR_SAVE",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/unified_radix_cache.py:5918"
+    "mem_cache/unified_radix_cache.py:5932"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_EVICT_ANCHOR_SAVE",
@@ -73956,7 +73956,7 @@
     "baum": "nf",
     "file": "mem_cache/unified_radix_cache.py",
     "kind": "os.environ",
-    "line": 5918
+    "line": 5932
    },
    "status": "unerklaert",
    "text": "",
@@ -74865,6 +74865,37 @@
     "line": 92
    },
    "status": "geerntet",
+   "text": "",
+   "type": "os.environ"
+  },
+  "SGLANG_WEG2_FORMA_L3_SUBTREE": {
+   "baeume": [
+    "nf"
+   ],
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"1\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "",
+   "id": "SGLANG_WEG2_FORMA_L3_SUBTREE",
+   "kind": "env",
+   "lesestellen": [
+    "weg2/forma_l3_subtree.py:90"
+   ],
+   "level": "experte",
+   "name": "SGLANG_WEG2_FORMA_L3_SUBTREE",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "baum": "nf",
+    "file": "weg2/forma_l3_subtree.py",
+    "kind": "os.environ",
+    "line": 90
+   },
+   "status": "unerklaert",
    "text": "",
    "type": "os.environ"
   },
@@ -84594,7 +84625,7 @@
    "id": "SGLANG_WEG2_SPILL_REF_FREE",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/unified_radix_cache.py:6096"
+    "mem_cache/unified_radix_cache.py:6110"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_SPILL_REF_FREE",
@@ -84604,7 +84635,7 @@
     "baum": "nf",
     "file": "mem_cache/unified_radix_cache.py",
     "kind": "os.environ",
-    "line": 6096
+    "line": 6110
    },
    "status": "unerklaert",
    "text": "",
@@ -85051,7 +85082,7 @@
    "id": "SGLANG_WEG2_SWEEP_REFUSED_MEMO",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/unified_radix_cache.py:7986"
+    "mem_cache/unified_radix_cache.py:8000"
    ],
    "level": "experte",
    "name": "SGLANG_WEG2_SWEEP_REFUSED_MEMO",
@@ -85061,7 +85092,7 @@
     "baum": "nf",
     "file": "mem_cache/unified_radix_cache.py",
     "kind": "os.environ",
-    "line": 7986
+    "line": 8000
    },
    "status": "unerklaert",
    "text": "",
@@ -89094,25 +89125,25 @@
    "abweichung": 47,
    "beide": 2460,
    "nur_27b": 181,
-   "nur_nf": 151
+   "nur_nf": 152
   },
-  "entries": 2810,
-  "envs": 1931,
+  "entries": 2811,
+  "envs": 1932,
   "erklaert": 305,
   "flags": 864,
   "geerntet": 1730,
   "kuratiert": 125,
-  "unerklaert": 650
+  "unerklaert": 651
  },
- "tree_rev": "27b=02123ee2ef+nf=b02f77f102",
+ "tree_rev": "27b=02123ee2ef+nf=654a2d39a2",
  "trees": {
   "27b": {
    "entries": 2641,
    "rev": "02123ee2ef"
   },
   "nf": {
-   "entries": 2611,
-   "rev": "b02f77f102"
+   "entries": 2612,
+   "rev": "654a2d39a2"
   }
  },
  "warnungen": []
