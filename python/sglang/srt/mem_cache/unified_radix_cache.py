@@ -5945,6 +5945,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                            type(exc).__name__, exc)
             return False
 
+    @staticmethod
+    def _s25_kv_in_store(node) -> bool:
+        """S25: the node's KV is in the store only (``l3_present``, no Full host copy) and the anchor-only
+        backup is on -- the same set ``_weg2_anchor_only_candidate`` admits beyond ``backuped``."""
+        return (bool(getattr(node, "l3_present", False)) and not node.backuped
+                and bool(envs.SGLANG_WEG2_ANCHOR_ONLY_BACKUP.get()))
+
     def weg2_save_anchor_before_tombstone(self, node) -> bool:
         """K15 (weg2-56-530, 00:21:41-00:22:06): the device mamba eviction
         TOMBSTONES an internal node's anchor (mamba_component.drive_eviction,
@@ -5976,6 +5983,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if (cc is None or getattr(cc, "write_policy", None) != "write_back"
                 or not UnifiedRadixCache.k15_anchor_save_on()):
             return False
+        if UnifiedRadixCache._weg2_anchor_secured_holds(self, node):
+            return True   # S25: the anchor already sits in its arena slot (KV-in-store anchor-only copy)
         if getattr(node, "_weg2_capped", False) or node.write_through_pending_id is not None:
             return False   # the per-path cap took it by design / a write is already in flight
         if _r12.role() == "worker":
@@ -5987,7 +5996,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self._k15_last_refusal = None
             self._weg2_sweep_last_refusal = None
             try:
-                if node.backuped:
+                if node.backuped or UnifiedRadixCache._s25_kv_in_store(node):
+                    # S25 (h16v5 03:29:35 node=38 / 03:47:08 node=378, h16v4b, h16v3): a store-backed node
+                    # (``l3_present``, Full host copy spilled, W3 spill / Form A reconcile) is as KV-backed as a
+                    # ``backuped`` one -- only its anchor needs a copy. The full backup below claimed its whole
+                    # KV span again (``BACKUP-REFUSED why=arena_claim`` on the full KV arena) for pages the
+                    # store already holds -- the L3-DROP rule ("did not read that mark") applied to the anchor.
                     written = self.write_backup_anchor_only(node)
                 else:
                     written = self.write_backup(node, write_back=True)
@@ -6008,7 +6022,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 break
         if written:
             self.writing_check(write_back=True)
-        ok = node.component_data[ComponentType.MAMBA].host_value is not None
+        # S25: a KV-in-store anchor-only copy lives in its arena slot, not in the tree (host_value stays None)
+        ok = (node.component_data[ComponentType.MAMBA].host_value is not None
+              or (UnifiedRadixCache._s25_kv_in_store(node) and getattr(node, "weg2_anchor_secured", False)))
         if ok:
             UnifiedRadixCache._k15_saved_n += 1
             n = UnifiedRadixCache._k15_saved_n
@@ -6020,9 +6036,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             UnifiedRadixCache._k15_lost_n += 1
             n = UnifiedRadixCache._k15_lost_n
             if n <= 32 or n % 256 == 0:
-                logger.warning("WEG2-ANCHOR-LOST at=evict n=%d node=%s depth=%d backuped=%s why=%s (the "
+                logger.warning("WEG2-ANCHOR-LOST at=evict n=%d node=%s depth=%d backuped=%s l3_present=%s why=%s (the "
                                "internal anchor had no host copy and none could be made -- tombstoned)",
                                n, getattr(node, "id", "?"), self.weg2_node_depth(node), node.backuped,
+                               bool(getattr(node, "l3_present", False)),
                                getattr(self, "_k15_last_refusal", None)
                                or getattr(self, "_weg2_sweep_last_refusal", None) or "?")
         return ok
