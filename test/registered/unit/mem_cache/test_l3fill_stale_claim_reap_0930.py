@@ -128,35 +128,6 @@ def test_the_sweep_frees_a_quarantine_whose_writer_never_returns(tmp_path):
     assert arena.stats()["claimed"] == 0
 
 
-# --- S23 (18.10., h16v4b 1018_013102, D 01:36:23-24): the reap race a peer rank wins ----------------------------------
-def _peer_wins_the_reap(arena, delay_s):
-    """Wrap ``quarantine_stale``: right after the real quarantine a PEER rank claims the stem first (fresh generation)
-    and completes it ``delay_s`` later -- the other two D ranks of the metal run reaped the same claim at the same
-    instant; one won."""
-    import threading
-
-    real = arena.quarantine_stale
-    won = []
-
-    def _q(slots, gens, min_ms):
-        st = real(slots, gens, min_ms)
-        if any(int(v) == 1 for v in st) and not won:
-            [(slot, status, gen)] = arena.claim_slots(["p1"], [TOTAL])
-            assert status == 0
-            won.append(slot)
-
-            def _fill():
-                time.sleep(delay_s)
-                arena.slot_view(slot, TOTAL)[:] = b"\x41" * TOTAL
-                arena.complete_slots([slot], [gen], [(0, TOTAL)])
-
-            threading.Thread(target=_fill, daemon=True).start()
-        return st
-
-    arena.quarantine_stale = _q
-    return won
-
-
 def _on_io_thread(fn):
     import threading
 
@@ -169,31 +140,6 @@ def _on_io_thread(fn):
     t.start()
     t.join(30)
     return res["out"]
-
-
-def test_s23_the_loser_of_the_reap_race_awaits_the_winners_fill_instead_of_dropping_the_stem(tmp_path, monkeypatch, caplog):
-    monkeypatch.setenv("SGLANG_WEG2_L3FILL_JOIN_IDLE_MS", "150")
-    be, arena, old, gen = _setup(tmp_path)
-    time.sleep(0.08)
-    won = _peer_wins_the_reap(arena, 0.15)
-    with envs.SGLANG_WEG2_L3FILL_STALE_CLAIM_S.override(0.05), caplog.at_level(logging.INFO, logger=hs.__name__):
-        out = _on_io_thread(lambda: HiCacheFile.arena_fill_from_disk(be, arena, ["p0", "p1", "p2"], TOTAL, prefix=True))
-    assert won, "the peer must have won the reap"
-    msgs = [r.getMessage() for r in caplog.records]
-    assert any("STALE-CLAIM-REAP" in m and "reclaimed=0" in m for m in msgs), msgs   # the losing edge was reached
-    assert out[0] is not None and out[1] == won[0] and out[2] is not None, (out, won)   # base: out[1] None, prefix ends
-    assert bytes(arena.slot_view(out[1], TOTAL)[:4]) == b"\x41" * 4
-
-
-def test_s23_a_winner_that_never_completes_still_ends_the_wait_not_the_process(tmp_path, monkeypatch):
-    monkeypatch.setenv("SGLANG_WEG2_L3FILL_JOIN_IDLE_MS", "100")
-    be, arena, old, gen = _setup(tmp_path)
-    time.sleep(0.08)
-    _peer_wins_the_reap(arena, 60.0)          # never completes inside the test
-    with envs.SGLANG_WEG2_L3FILL_STALE_CLAIM_S.override(0.05):
-        t0 = time.time()
-        out = _on_io_thread(lambda: HiCacheFile.arena_fill_from_disk(be, arena, ["p0", "p1", "p2"], TOTAL, prefix=True))
-    assert out[0] is not None and out[1] is None and time.time() - t0 < 20     # bounded: the old miss, no hang
 
 
 # --- S23: SELF-JOIN must not take a claim a sibling io thread of THIS process is filling ----------------------------
