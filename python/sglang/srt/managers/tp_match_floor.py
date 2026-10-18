@@ -818,10 +818,14 @@ def admission_probe(tree_cache: Any, req: Any, *, follow: bool) -> int:
         if getattr(req, "positional_embed_overrides", None) is not None:
             _note_vote(req, 0, 0, "positional_overrides")
             return 0
-        token_ids = list(req.origin_input_ids) + list(req.output_ids)
+        # S42: one int64 array, not two Python lists of the whole prompt plus
+        # their array copy below -- 3.6 ms per 114k-token rid at the desk,
+        # paid on every pass that measures the head vote (array copy: 0.04).
+        token_ids = array("q", req.origin_input_ids)
+        token_ids.extend(req.output_ids)
         carried = getattr(req, "pp_carried_fill_tail", None)
         if carried:
-            token_ids += list(carried)
+            token_ids.extend(carried)
         n_in = len(token_ids)
         compute = getattr(req, "_compute_max_prefix_len", None)
         limit = int(compute(n_in)) if callable(compute) else max(n_in - 1, 0)

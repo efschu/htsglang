@@ -51,9 +51,13 @@ def fingerprint(
     running: Iterable[Any],
     prefetch_verdicts: Optional[dict],
     continuation: bool,
+    generation: Optional[int] = None,
 ) -> Optional[tuple]:
     """What the head's verdict reads, as replicated values; None when no head
-    can be held (no HOL head, it left the queue, a chunked continuation runs)."""
+    can be held (no HOL head, it left the queue, a chunked continuation runs).
+    ``generation`` (S42): the HiCache binding generation -- it moves at every
+    flip/cutover on every rank alike, so a held head is evaluated again after a
+    flip instead of riding a fingerprint taken in the previous layout."""
     if continuation or not hol_state:
         return None
     head = hol_state.get("rid")
@@ -62,7 +66,7 @@ def fingerprint(
         return None
     landed = tuple(sorted(str(k) for k, v in (prefetch_verdicts or {}).items() if v))
     running_rids = tuple(sorted(str(r.rid) for r in running))
-    return (str(head), waiting_rids, running_rids, landed)
+    return (str(head), waiting_rids, running_rids, landed, generation)
 
 
 class DHeadHold:
@@ -106,9 +110,9 @@ class DHeadHold:
             logger.info(
                 "WEG2 D-HEAD-HOLD head=%s held_total=%d waiting=%d running=%d (n=%d): the "
                 "refused head is evaluated again when the head, the waiting or running set or "
-                "a landed prefetch changes, and at the latest every %d passes -- not in every "
-                "decode round", fp[0], st.held_total, len(fp[1]), len(fp[2]), n,
-                REEVAL_EVERY_PASSES,
+                "a landed prefetch or the binding generation changes, and at the latest every %d "
+                "passes -- not in every decode round; the head vote is not measured on a held pass either (S42)",
+                fp[0], st.held_total, len(fp[1]), len(fp[2]), n, REEVAL_EVERY_PASSES,
             )
 
 
