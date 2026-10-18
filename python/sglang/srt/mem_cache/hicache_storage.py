@@ -6127,6 +6127,35 @@ class HiCacheFile(HiCacheStorage):
                 in_arena = False
         return _kv_dl.REGISTRY.attach_qsa(d, path, in_arena)
 
+    def kv_dl_read_qsa_pages(self, ds, stage: torch.Tensor) -> None:
+        """S36: the canonical QSA index pages of KV disk pages ``ds`` into ``stage`` rows (this rank's window of the
+        installed ``canonical_qsa_page``): the held L3 file (``/proc/self/fd`` of the fd taken at the store read --
+        the inode outlives an L3 unlink) or, for a page that was in its QSA arena, the arena/store via
+        ``batch_get``. Anything unreadable stops by name (an empty index attends wrongly, x54 MISS)."""
+        from sglang.srt.mem_cache.canonical_page_store import read_extents
+
+        reg = _kv_dl.REGISTRY
+        win = getattr(self, "canonical_qsa_page", None)
+        store = []
+        for j, d in enumerate(ds):
+            e = reg.entry(d)
+            if e is None or e.qsa_mode not in ("fd", "store"):
+                raise RuntimeError(
+                    f"WEG2 KV-DURCHLAUF QSA LOAD REFUSED: disk page {d} carries no QSA index "
+                    f"(mode={None if e is None else e.qsa_mode}) -- the read counted it as a QSA hit; stopping by "
+                    "name instead of attending with an empty index (x54 MISS)")
+            if e.qsa_mode == "fd" and win is not None and e.qsa_fd >= 0:
+                if not read_extents(f"/proc/self/fd/{e.qsa_fd}", win, stage[j]):
+                    raise RuntimeError(f"WEG2 KV-DURCHLAUF QSA READ FAILED: disk page {d} (held fd)")
+            else:
+                store.append((j, e))
+        if store:
+            got = self.batch_get([self._log_key(PoolName.QSA_INDEXER, e.key) for _, e in store],
+                                 [stage[j] for j, _ in store])
+            for (j, e), page in zip(store, got):
+                if page is None:
+                    raise RuntimeError(f"WEG2 KV-DURCHLAUF QSA READ FAILED: {str(e.key)[:16]} (store)")
+
     def _extra_page_spec(self, pool_name, host_pool):
         """(numel, dtype) of one flat page of this extra pool -- probed once
         (``get_dummy_flat_data_page`` allocates a pinned page per call)."""

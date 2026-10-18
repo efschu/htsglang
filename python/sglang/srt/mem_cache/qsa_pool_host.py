@@ -208,33 +208,16 @@ class QSAPagedHostPool(DeepSeekV4PagedHostPool):
         return None
 
     def _s36_read_disk_qsa(self, ds):
-        from sglang.srt.mem_cache.canonical_page_store import read_extents
-        from sglang.srt.mem_cache.hicache_storage import PoolName
+        """The canonical QSA pages of disk pages ``ds``, read by the backend (the one consumer of the canonical
+        extent I/O, through its installed window: HiCacheFile.kv_dl_read_qsa_pages)."""
         from sglang.srt.weg2 import kv_durchlauf as _kv_dl
 
         reg = _kv_dl.REGISTRY
         be = reg.backend
         stage = torch.zeros((len(ds), self.layer_num * self.item_bytes), dtype=self.dtype)
-        win = getattr(be, "canonical_qsa_page", None) if be is not None else None
-        store = []
-        for j, d in enumerate(ds):
-            e = reg.entry(d)
-            if e is None or e.qsa_mode not in ("fd", "store"):
-                raise RuntimeError(
-                    f"WEG2 KV-DURCHLAUF QSA LOAD REFUSED: disk page {d} carries no QSA index "
-                    f"(mode={None if e is None else e.qsa_mode}) -- the read counted it as a QSA hit; stopping by "
-                    "name instead of attending with an empty index (x54 MISS)")
-            if e.qsa_mode == "fd" and win is not None and e.qsa_fd >= 0:
-                if not read_extents(f"/proc/self/fd/{e.qsa_fd}", win, stage[j]):
-                    raise RuntimeError(f"WEG2 KV-DURCHLAUF QSA READ FAILED: disk page {d} (held fd)")
-            else:
-                store.append((j, e))
-        if store:
-            got = be.batch_get([be._log_key(PoolName.QSA_INDEXER, e.key) for _, e in store],
-                               [stage[j] for j, _ in store])
-            for (j, e), page in zip(store, got):
-                if page is None:
-                    raise RuntimeError(f"WEG2 KV-DURCHLAUF QSA READ FAILED: {str(e.key)[:16]} (store)")
+        if be is None:
+            raise RuntimeError("WEG2 KV-DURCHLAUF QSA LOAD REFUSED: no backend registered for the disk pages")
+        be.kv_dl_read_qsa_pages(ds, stage)
         return stage
 
     def backup_from_device_all_layer(self, *args, **kwargs):
