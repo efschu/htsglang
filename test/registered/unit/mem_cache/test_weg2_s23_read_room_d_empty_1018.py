@@ -116,3 +116,22 @@ def test_the_cause_survives_pickle_and_the_tree_builds_the_record_with_it():
 
     assert urc._s23_cut_cause(Op()) == "late_complete"
     assert urc._s23_cut_cause(object()) is None
+
+
+@pytest.mark.parametrize("cause", ["l2_evicted_before_ref", "fill_evicted_before_ref"])
+def test_eviction_clock_causes_are_capacity_cuts(cause, caplog):
+    """The eviction clock took a page the read had found / landed: arena room pressure, not a HELD-CUT."""
+    s, out, msgs = _run(cause, caplog)
+    assert any("#1324 STORE READ CAPACITY-CUT" in m for m in msgs), msgs
+    assert not any("HELD-CUT" in m for m in msgs), msgs
+    assert getattr(s, "_weg2_store_short_capacity", 0) == 1 and out == "deferred"
+
+
+@pytest.mark.parametrize("cause", ["late_complete", "join_unfinished", "inflight_unfinished", "read_failed",
+                                   "not_on_disk", "terminated", "arena_chain_recheck", "fill_none"])
+def test_the_other_causes_are_held_cuts_and_the_text_does_not_claim_room(cause, caplog):
+    s, out, msgs = _run(cause, caplog)
+    held = [m for m in msgs if "#1324 STORE READ HELD-CUT" in m]
+    assert held and f"cut_cause={cause}" in held[0], msgs
+    assert "NOT by the arena room" not in held[0] and "CAPACITY-CUT" not in held[0], held[0]
+    assert out == "deferred"

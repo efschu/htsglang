@@ -721,6 +721,10 @@ _VERDICT_TRUNCATED_GROUP = "issued:truncated_group"
 #: prefix it asked for (``PrefetchOutcome.is_incomplete``). ``terminated:`` and
 #: not ``issued:`` because this read is over -- what is owed is a re-issue.
 _VERDICT_STORE_SHORT = "terminated:store_short"
+#: S23: the READ-DEPTH causes that are the arena's room pressure (arena_full = no slot after the room wait; the two
+#: ``*_evicted_before_ref`` = the eviction clock took a page the read had found / landed) -- a short read with one of
+#: these (or none recorded) is a CAPACITY-CUT; every other cause is a HELD-CUT.
+_CAPACITY_CUT_CAUSES = (None, "arena_full", "l2_evicted_before_ref", "fill_evicted_before_ref")
 
 # #1068 A12.2: why the prefetch deferral is REFUSED on a rank/phase, by name.
 # MODULE-LEVEL on purpose: `_prefetch_deferral_refusal_reason` is bound to
@@ -15708,19 +15712,20 @@ class Scheduler(
         # READ-DEPTH cause of that very cut was late_complete (a JOINED claim reaped under the read; arena_full on D
         # = 0 in the whole boot, D POSTed one room request, at 01:49:56). "The probe covers the span" proves the STORE
         # holds it, not that the ARENA cut it: CAPACITY-CUT needs the recorded cause arena_full (or none recorded).
-        _cut_cause = getattr(outcome, "cut_cause", None)
+        _cut_cause = getattr(outcome, "cut_cause", None)   # CAPACITY causes: _CAPACITY_CUT_CAUSES
         if (int(getattr(outcome, "hit_tokens", 0) or 0) >= int(getattr(outcome, "deliverable", 0) or 0) > 0
-                and getattr(outcome, "probed", False) and _cut_cause not in (None, "arena_full")):
+                and getattr(outcome, "probed", False) and _cut_cause not in _CAPACITY_CUT_CAUSES):
             self._weg2_store_short_held_other = getattr(self, "_weg2_store_short_held_other", 0) + 1
             nh = self._weg2_store_short_held_other
             if nh <= 8 or nh % 64 == 0:
                 logger.warning(
                     "#1324 STORE READ HELD-CUT rid=%s delivered=%d deliverable=%d shortfall=%d hit_tokens=%d "
                     "cut_cause=%s site=drain occurrence=%d held_cut_occurrence=%d -- the store HOLDS the whole span "
-                    "(probe hit covers it) and the read was cut by %s, NOT by the arena room (an arena cut "
-                    "records cause=arena_full). Deferring through the A12.2 shortfall arm. Denominator: every "
+                    "(probe hit covers it) and the read was cut by %s, a cause that is not "
+                    "arena room pressure (room pressure records arena_full / l2_evicted_before_ref / "
+                    "fill_evicted_before_ref). Deferring through the A12.2 shortfall arm. Denominator: every "
                     "terminated store read of this rank whose record reports a page-floored shortfall AND whose "
-                    "probe hit covers the deliverable prefix AND whose recorded cut cause is not arena_full",
+                    "probe hit covers the deliverable prefix AND whose recorded cut cause is not a room-pressure cause",
                     rid, delivered, deliverable, deliverable - delivered, int(outcome.hit_tokens), _cut_cause, n,
                     nh, _cut_cause,
                 )

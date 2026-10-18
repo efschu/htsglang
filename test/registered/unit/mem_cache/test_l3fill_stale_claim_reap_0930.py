@@ -35,6 +35,15 @@ def _foreign_writer_is_simulated_in_process():
 
 pytestmark = pytest.mark.skipif(shutil.which("gcc") is None, reason="needs gcc")
 
+
+@pytest.fixture(autouse=True)
+def _live_register_is_clean():
+    """S23 review: the live-fill register is process state; a test must neither inherit nor leave entries."""
+    hs._FILL_LIVE.clear()
+    yield
+    hs._FILL_LIVE.clear()
+
+
 TOTAL = 4096
 
 
@@ -170,7 +179,6 @@ def test_s23_self_join_leaves_a_sibling_io_threads_live_claim_alone(tmp_path, mo
         time.sleep(0.3)
         arena.slot_view(slot, TOTAL)[:] = b"\x41" * TOTAL
         done["status"] = arena.complete_slots([slot], [gen], [(0, TOTAL)])
-        hs._fill_live_drop_thread()
 
     # the sibling's registration belongs to the thread that made the claim: finish it from a helper that is NOT the
     # reader's thread; the reader runs on its own io-named thread
@@ -183,7 +191,8 @@ def test_s23_self_join_leaves_a_sibling_io_threads_live_claim_alone(tmp_path, mo
     assert not any("SELF-JOIN" in r.getMessage() for r in caplog.records), [r.getMessage() for r in caplog.records]
     assert done["status"] == [1], done            # 1 = completed; base: [6] -- the sibling's completion refused, its read cut
     assert out[0] == slot, (out, slot)            # the reader waited and got the sibling's page
-    hs._FILL_LIVE.pop(slot, None)
+    hs._fill_live_drop_thread()       # the registering thread (this one) gives its claim back, as its fill's finally does
+    assert not hs._FILL_LIVE
     assert ident_owner
 
 
