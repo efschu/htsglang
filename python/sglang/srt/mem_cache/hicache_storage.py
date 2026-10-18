@@ -4361,11 +4361,16 @@ class HiCacheFile(HiCacheStorage):
         _rv = None
         if _rr_iv is not None and _room_verdicts.enabled():
             _rv = [int(posted_ms) if posted_ms is not None else _arbiter.now_ms(), None]
+        # S35: the L3 write-behind does not yield to a load that waits here (l3_write_behind._load_gate)
+        from sglang.srt.mem_cache import l3_write_behind as _l3wb
+
+        _l3wb.room_wait_enter()
         try:
             pend, got, read_now, rounds = self._await_fill_room_loop(
                 arena, pend, got, int(total_bytes), out, joined, stats, live, idle_ms, deadline, last_move,
                 read_now, rounds, read_id, arb=_arb, rv=_rv)
         finally:
+            _l3wb.room_wait_exit()
             _read_room.room_wait_end(_rr_iv)
             if _rv is not None and _rv[1]:
                 _room_verdicts.note_futile(len(pend), (time.perf_counter() - t0) * 1000.0, _rv[1])

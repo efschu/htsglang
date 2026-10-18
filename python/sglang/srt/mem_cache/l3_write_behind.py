@@ -50,6 +50,9 @@ ENV_LOAD_WRITE_S = "SGLANG_HICACHE_L3_WB_LOAD_WRITE_S"
 LOAD_YIELD_MAX_S_DEFAULT = 30.0
 LOAD_WRITE_S_DEFAULT = 2.0
 _LONG_STREAK_S = 5.0
+#: S35 (18.10., rc9 restart 10:09:06-10:10:14Z): store reads of this process waiting in the arena ROOM-WAIT right now
+#: (``HiCacheFile._await_fill_room``). See :func:`_load_gate`.
+_room = {"waiting": 0, "starved_n": 0}
 
 _clock = time.monotonic
 _lock = threading.Lock()
@@ -132,11 +135,44 @@ def _load_streak_end(now: float) -> None:
                     held, _load["streaks"], _load["total_s"], _load["max_s"], _load["caps"])
 
 
+def room_wait_enter() -> None:
+    """S35: a store read enters the arena ROOM-WAIT (the arena was FULL for its stems)."""
+    with _lock:
+        _room["waiting"] += 1
+
+
+def room_wait_exit() -> None:
+    with _lock:
+        _room["waiting"] = max(0, _room["waiting"] - 1)
+
+
+def room_starved() -> bool:
+    """S35: True while a store read of this process waits for arena room."""
+    return _room["waiting"] > 0
+
+
 def _load_gate() -> Optional[str]:
-    """``load`` while loads are pending, except the bounded write window."""
+    """``load`` while loads are pending, except the bounded write window.
+
+    S35 (SOLL R7: "kann D einen Request unter X nicht nehmen, ist das ein Defekt"; fLLiper rc9 restart, D TP0
+    10:09:06-10:10:14Z, 68 s without a D round at 18 open requests): NOT while a pending load is itself waiting for
+    arena ROOM. The arena was full of D's own tree pages without an L3 copy (``slots=6485 pinned=6485``, ARENA-DROP
+    ``l3=on_disk:0,written:0 freed=0``, READ-ROOM D-SPILL ``candidates=0 host_leaves=0``); a slot frees only once its
+    page has an L3 copy, and the L3 copy is this write-behind -- which yielded to that very load (``L3-WB LOAD-YIELD END
+    held_s=20.0 ... max_s=71.9``). A circular wait, ended there only by a client abort. A load in the room wait moves
+    no store I/O, so the yield buys it nothing: the write-behind writes."""
     now = _clock()
     if loads_pending() <= 0:
         _load_streak_end(now)
+        return None
+    if room_starved():
+        if _load["since"] is not None:
+            _load_streak_end(now)
+            _room["starved_n"] += 1
+            n = _room["starved_n"]
+            if n <= 16 or (n & (n - 1)) == 0:
+                logger.info("L3-WB ROOM-STARVED n=%d: a pending store read waits for arena ROOM, which only an L3 "
+                            "copy of a full arena page can free -- the write-behind writes instead of yielding (S35)", n)
         return None
     if now < _load["open_until"]:
         return None
@@ -198,5 +234,6 @@ def quiet() -> bool:
 def _reset_for_tests() -> None:
     with _lock:
         _state.update(legs=0, released=False, sched=None, entered=0)
+        _room.update(waiting=0, starved_n=0)
         _load_probes.clear()
         _load.update(since=None, open_until=0.0, streaks=0, total_s=0.0, max_s=0.0, caps=0)

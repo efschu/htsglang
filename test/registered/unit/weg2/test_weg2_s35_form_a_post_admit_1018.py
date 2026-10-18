@@ -120,3 +120,46 @@ def test_call_edge_the_rule_runs_right_after_add_one_req_before_any_result_branc
     assert i_add < i_rule < i_branch
     # the rule is the last statement before the result branch: nothing reads the raw result in between
     assert src[i_rule:i_branch].count("\n") == 1, src[i_rule:i_branch]
+
+
+# ------------------------------------------------------------------ Nachtrag: the room-starved load-yield (rc9 restart)
+from sglang.srt.mem_cache import l3_write_behind as wb  # noqa: E402
+
+
+@pytest.fixture()
+def _wb_clean():
+    wb._reset_for_tests()
+    yield
+    wb._reset_for_tests()
+
+
+def test_write_behind_still_yields_to_a_load_that_moves_io(_wb_clean):
+    wb.register_load_probe(lambda: 1)
+    assert wb._load_gate() == "load"                  # HICACHE-NEVER-SLOW unchanged
+    assert wb._load_gate() == "load"
+
+
+def test_write_behind_writes_while_the_pending_load_waits_for_arena_room(_wb_clean):
+    """rc9 restart 10:09:06Z: the load waited for room (arena 6485/6485 pinned, no L3 copy), the write-behind yielded
+    to it (LOAD-YIELD 20-72 s) -- the circular wait. In the room wait the gate is open; after it, the yield is back."""
+    wb.register_load_probe(lambda: 1)
+    assert wb._load_gate() == "load"
+    wb.room_wait_enter()
+    assert wb.room_starved() is True
+    assert wb._load_gate() is None
+    assert wb.quiet_reason() is None
+    wb.room_wait_exit()
+    assert wb.room_starved() is False
+    assert wb._load_gate() == "load"
+
+
+def test_room_wait_is_bracketed_in_the_fill_with_a_finally():
+    src = (SRT / "mem_cache/hicache_storage.py").read_text()
+    t = ast.parse(src)
+    fn = next(n for n in ast.walk(t) if isinstance(n, ast.FunctionDef) and n.name == "_await_fill_room")
+    body = ast.unparse(fn)
+    i_enter = body.index("_l3wb.room_wait_enter()")
+    i_try = body.index("try:", i_enter)
+    i_loop = body.index("self._await_fill_room_loop(", i_try)
+    i_fin = body.index("finally:", i_loop)
+    assert i_enter < i_try < i_loop < i_fin and "_l3wb.room_wait_exit()" in body[i_fin:i_fin + 120]
