@@ -50,6 +50,14 @@ def test_a_grant_that_never_reached_leg2_expires():
 
 
 # ---- the front ----------------------------------------------------------------
+def _d_begins_every_grant(f):
+    """S49 (SOLL R6, user 18.10. "Nur echt laufend zählt"): R6 counts a granted D prefill only once D began it. These
+    burst tests model a D that begins every grant at once (the metal case: free seats, D extends ~80 ms after the
+    POST); a D that has not begun it holds the set instead (test_pdflip_s49_r6_nur_echt_laufend_1018)."""
+    from flliper.srt.pdflip import d_extend_beacon as _dxb
+    f._d_ext_reading = lambda: {_dxb.rid_key(r): time.time_ns() for r in list(f._d_pf_book()._rows)}
+
+
 def _on(monkeypatch, window="15"):
     monkeypatch.setenv("FLLIPER_PDFLIP_ENABLE_ARRIVAL_SEAT_RULE", "1")
     monkeypatch.delenv("FLLIPER_PDFLIP_DECODE_COLLECT_D_CHECK_S", raising=False)
@@ -96,6 +104,7 @@ def test_a_simultaneous_burst_books_before_the_seat_not_after(monkeypatch):
     monkeypatch.setenv("FLLIPER_PDFLIP_DECODE_COLLECT_D_CHECK_S", "0")
     f = _front(running=[], n=6, kv={"available": 400000, "evictable": 0})
     f.tp_prefill_max_tokens = 6008
+    _d_begins_every_grant(f)
 
     async def burst():
         return await asyncio.gather(*[f._acquire_short_seat(f"s{i}", 5260, uncached=5200)
@@ -127,6 +136,7 @@ def test_the_booking_stands_before_every_suspension(monkeypatch):
 
     f._d_reading_if_armed = suspends
     f._arrival_seat_wait = seat_wait
+    _d_begins_every_grant(f)
 
     async def burst():
         return await asyncio.gather(*[f._acquire_short_seat(f"s{i}", 5260, uncached=5200)

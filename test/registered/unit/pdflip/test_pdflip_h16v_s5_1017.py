@@ -22,7 +22,7 @@ import pytest
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
-from test_pdflip_set_scheduler_1017 import X, _fx, _on, _verdicts  # noqa: E402
+from test_pdflip_set_scheduler_1017 import X, _d_began, _fx, _on, _verdicts  # noqa: E402
 from test_pdflip_arrival_seat_rule_0929 import _front, _pending  # noqa: E402
 
 from flliper.srt.pdflip import phase_policy as pp  # noqa: E402
@@ -333,6 +333,7 @@ def test_user_case_15_36z_is_reroute_p_by_the_soll_not_by_a_moved_threshold(monk
     f._d_pf_book().grant(rid="pdflip-80-910", tokens=177, now=time.time())
     f._d_pf_book().enter_leg2(rid="pdflip-80-910")
     f.groups["D"].outstanding["pdflip-80-910"] = 1.0
+    _d_began(f, "pdflip-80-910")   # S49 (SOLL R6, user 18.10.): the case's D prefill was RUNNING
     t0 = time.time()
     st = f._set_st()
     st["shorts"]["pdflip-80-912"] = (t0, 5396, x1)

@@ -83,6 +83,42 @@ class SollR1toR9(unittest.TestCase):
         self.assertEqual(v.verdict, "REROUTE_P")
         self.assertNotEqual(V([M("n", 5000, 3.0)], now=3.0, running=0).verdict, "REROUTE_P")
 
+    def test_r6_only_a_really_running_d_prefill_counts(self):
+        """R6 (Nutzerentscheid 18.10. ~21:15Z, woertlich "Nur echt laufend zählt (Recommended)"): R6 zaehlt nur einen
+        D-Prefill, der schon rechnet; vergeben-aber-nicht-gestartet zaehlt nicht, ein grosser Request wartet seine
+        T_halb (R4) zu Ende. Belegfall rc13 20:33:48 (S46): p_only 8793 bei X=7543 waited 1,4 s, kurz 1426 vergeben,
+        D hatte den Extend noch nicht begonnen -> kein REROUTE_P, COLLECT; erst mit D's Extend-Beleg -> REROUTE_P."""
+        import time as _time
+        from unittest import mock
+        from test_pdflip_arrival_seat_rule_0929 import _front, _pending
+        from flliper.srt.pdflip import d_extend_beacon as dxb
+
+        env = {"FLLIPER_PDFLIP_HALF_FLIP_S": str(T_HALF), "FLLIPER_PDFLIP_HALF_X_FRAC": str(HALF),
+               "FLLIPER_PDFLIP_ENABLE_ARRIVAL_SEAT_RULE": "1"}
+        with mock.patch.dict(os.environ, env):
+            self._r6_only_really_running(_time, _front, _pending, dxb)
+
+    def _r6_only_really_running(self, _time, _front, _pending, dxb):
+        f = _front(running=["dec"], n=6, kv={"available": 400000, "evictable": 0})   # D decodes (R4 waits)
+        f.tp_prefill_max_tokens = 7543
+        now = _time.time()
+        f.t_awake = now - 60.0
+        g = _pending("g", 8793, now - 1.4)
+        g.p_only = True
+        f.queue = [g]
+        f._d_pf_book().grant(rid="k", tokens=1426, now=now - 0.136)
+        f._d_pf_book().enter_leg2(rid="k")
+        f.groups["D"].outstanding["k"] = now - 0.1    # D holds the POST, its extend has not begun
+        f._d_ext_reading = lambda: {}                 # D's beacon: no extend of "k" yet
+        self.assertEqual(f._dc_carried_running(), 0)
+        self.assertEqual(f._d_carried_tokens(), 1426, "the X-SUM price of the kurz path is unchanged")
+        self.assertEqual(f._decode_collect(now), "hold", "R4: the big member waits its T_halb")
+        self.assertEqual(f.counters["set_reroute_p"], 0)
+        f._d_ext_reading = lambda: {dxb.rid_key("k"): _time.time_ns()}   # D began the extend of "k"
+        self.assertEqual(f._dc_carried_running(), 1426)
+        self.assertEqual(f._decode_collect(_time.time()), "P")
+        self.assertEqual(f.counters["set_reroute_p"], 1)
+
     def test_r7_never_a_flip_below_x(self):
         """R7: kein Flip, kein Reroute fuer S < X -- in keinem Zustand (Decode ja/nein, Sitze, Zeit)."""
         for members in ([M("a", 5900)], [M("a", 3200), M("b", 2700, 1.0)]):

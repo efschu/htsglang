@@ -249,6 +249,7 @@ from flliper.srt.pdflip import d_head_hold as _pdflip_d_head_hold  # DQH
 from flliper.srt.pdflip import head_vote_hold as _pdflip_head_vote_hold  # S42
 from flliper.srt.pdflip import progress_beacon as _pdflip_beacon  # FP forward-progress beacon
 from flliper.srt.pdflip.d_lead_probe import build_d_lead_probe  # D-LEAD-MS-1007
+from flliper.srt.pdflip import d_extend_beacon as _pdflip_d_ext  # S49 D-EXTEND-BEACON (SOLL R6)
 from flliper.srt.pdflip.vision_verdict import PdFlipVisionVerdict  # H125f vision verdict on the chain
 from flliper.srt.pdflip.pp_loadback_verdict import PdFlipPpLoadbackVerdict  # LB-VERDICT-1014 on the chain
 from flliper.srt.pdflip import pp_loadback_verdict as _pdflip_lbv  # LBV-ADMIT (h16h 19:33:48Z)
@@ -1878,6 +1879,8 @@ class Scheduler(
 
     # D-LEAD-MS-1007: set in init_pdflip_d_lead_probe; None = no lead line.
     pdflip_d_lead_probe = None
+    # S49 D-EXTEND-BEACON: set in init_pdflip_d_lead_probe; None = off / not group D.
+    pdflip_d_ext_beacon = None
 
     def __init__(
         self,
@@ -5214,6 +5217,10 @@ class Scheduler(
         self.pdflip_d_lead_probe = build_d_lead_probe(
             group=os.environ.get("FLLIPER_PDFLIP_GROUP", "")
         )
+        # S49 (SOLL R6, user 18.10. "Nur echt laufend zählt"): which rids D really began to prefill, for the front
+        self.pdflip_d_ext_beacon = _pdflip_d_ext.build(
+            group=os.environ.get("FLLIPER_PDFLIP_GROUP", "")
+        )
 
     def init_pdflip_d_head_hold(self) -> None:
         # DQH (pdflip/d_head_hold.py): a refused D head is re-evaluated on a change
@@ -7588,6 +7595,8 @@ class Scheduler(
         _t0 = time.perf_counter()
         if self.pdflip_d_lead_probe is not None:
             self.pdflip_d_lead_probe.note_recv(rid=recv_req.rid)
+        if self.pdflip_d_ext_beacon is not None:
+            self.pdflip_d_ext_beacon.note_recv(rid=recv_req.rid)
         try:
             return self._handle_generate_request_impl(recv_req)
         finally:
@@ -19571,6 +19580,9 @@ class Scheduler(
                 rids=[req.rid for req in batch.reqs],
                 skip=batch.pdflip_skip_extend,
             )
+        if self.pdflip_d_ext_beacon is not None and batch.forward_mode.is_extend():
+            # S49 D-EXTEND-BEACON: the front's R6 counts a D prefill only from here on (SOLL R6, user 18.10.)
+            self.pdflip_d_ext_beacon.note_extend(rids=[req.rid for req in batch.reqs])
 
         # #861 fix (b): a request admitted on a cached prefix whose DRAFT rows
         # nothing wrote must not speculate over them. Here, and not in the

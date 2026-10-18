@@ -51,18 +51,24 @@ class DPrefillInflight:
         return rid in self._rows
 
     def pending_tokens(self, *, now: float, live: Container[str],
-                       idle: Optional[Callable[[str], bool]] = None) -> int:
+                       idle: Optional[Callable[[str], bool]] = None,
+                       started: Optional[Callable[[str, float], bool]] = None) -> int:
         """Sum of the open rows. A row in leg 2 lives while D still holds the
         rid (``live`` = D's outstanding set); one that never got there lives
         ``GRANT_TTL_S``. Dead rows are dropped here. ``idle(rid)`` True = the
         row lives but D is not prefilling it now (parked, held below a raised
-        lane floor): it is kept and not counted."""
+        lane floor): it is kept and not counted. ``started(rid, t_grant)``
+        (S49, SOLL R6 "nur echt laufend zählt"): given, a living row counts
+        only when D really began its extend (granted-but-not-started is kept,
+        not counted)."""
         total = 0
         for rid in list(self._rows):
             row = self._rows[rid]
             alive = rid in live if row.in_leg2 else now - row.t_grant < GRANT_TTL_S
             if alive:
                 if idle is not None and idle(rid):
+                    continue
+                if started is not None and not started(rid, row.t_grant):
                     continue
                 total += row.tokens
             else:

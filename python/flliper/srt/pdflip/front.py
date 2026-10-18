@@ -171,6 +171,7 @@ from flliper.srt.pdflip import prio_age as _prio_age  # PRIO-AS-AGE 1014: priori
 from flliper.srt.pdflip import front_requests as _frq  # front.flip / d_activity / ttft_by_via / request_done
 from flliper.srt.pdflip import front_metrics as _fmet  # weg2_req Influx push (TSDB-DELTA 1c, default off)
 from flliper.srt.pdflip import d_prefill_inflight as _dpf  # X-SUM-PRICE on the arrival path
+from flliper.srt.pdflip import d_extend_beacon as _dxb  # S49: SOLL R6 counts only a D prefill D really began
 from flliper.srt.pdflip import front_x as _front_x  # FRONT-X-MIT: the decision X rides with the D leg
 from flliper.srt.pdflip import sum_price as _sp  # X-SUM-PRICE: the one rule
 
@@ -11408,11 +11409,14 @@ class Front:
     def _d_pf_book(self) -> "_dpf.DPrefillInflight":
         return self.__dict__.setdefault("_d_pf", _dpf.DPrefillInflight())
 
-    def _d_pf_pending_tokens(self) -> int:
+    def _d_pf_pending_tokens(self, started_only: bool = False) -> int:
         """The uncached tokens D has been granted to prefill as SHORT and has
         not finished (no first content yet). DECODE-COLLECT used to look only
         at D's DECODES, so a burst arriving on an idle D went in one by one --
-        each under X, 37k together (NF y6 09.10.). Switch off: 0."""
+        each under X, 37k together (NF y6 09.10.). Switch off: 0.
+
+        ``started_only`` (S49, SOLL R6 after the user's decision 18.10.): only
+        the rows whose extend D has really begun (``_d_ext_started``)."""
         book = self.__dict__.get("_d_pf")  # created by the first SHORT grant
         if book is None or not envs.FLLIPER_PDFLIP_ENABLE_DECODE_COLLECT_PREFILL_BUSY.get():
             return 0
@@ -11435,7 +11439,42 @@ class Front:
                 return True
             return floor > 0 and ls.lane_for(rid) < floor
 
-        return book.pending_tokens(now=time.time(), live=D.outstanding, idle=_idle)
+        started = Front._d_ext_started_pred(self) if started_only else None
+        return book.pending_tokens(now=time.time(), live=D.outstanding, idle=_idle, started=started)
+
+    def _d_ext_reading(self) -> Optional[Dict[int, int]]:
+        """S49 D-EXTEND-BEACON: ``{rid_key: extend start ns}`` from group D's ranks (pdflip/d_extend_beacon.py); None
+        = no readable file (no arena dir, D wrote nothing yet)."""
+        D = self.groups.get("D") if isinstance(self.groups, dict) else None
+        sid = getattr(D, "sid", None) if D is not None else None
+        try:
+            return _dxb.read_group(_dxb.beacon_dir(getattr(self, "tag", "") or ""), "D", int(sid or 0))
+        except Exception:  # noqa: BLE001 -- no reading: nothing is proven running
+            return None
+
+    def _d_ext_started_pred(self) -> Callable[[str, float], bool]:
+        """SOLL R6 (user 18.10. ~21:15Z, verbatim "Nur echt laufend zählt (Recommended)"): a granted D prefill counts
+        as RUNNING only once D began its extend -- D's own record (D-EXTEND-BEACON) at or after the grant. No clock
+        threshold. No reading at all counts nothing (named: ``r6_extend_unread``); the switch off restores the book
+        alone (every granted, unfinished D prefill, as before S49)."""
+        if not _dxb.enabled():
+            return lambda rid, t_grant: True
+        box: List[Optional[Dict[int, int]]] = []
+
+        def _started(rid: str, t_grant: float) -> bool:
+            if not box:  # read once, and only when a living row asks
+                box.append(self._d_ext_reading())
+                if box[0] is None:
+                    self.counters["r6_extend_unread"] += 1
+                    if not self.__dict__.get("_r6_unread_warned"):
+                        self.__dict__["_r6_unread_warned"] = True
+                        logger.warning("PDFLIP R6-EXTEND-UNREAD -- no D-EXTEND-BEACON file of group D is readable "
+                                       "(dir=%r): no granted D prefill is proven running, R6 counts none of them "
+                                       "(SOLL R6, user 18.10.: only a really running D prefill counts)",
+                                       _dxb.beacon_dir(getattr(self, "tag", "") or ""))
+            return _dxb.started(box[0], rid, t_grant)
+
+        return _started
 
     def _d_carried_tokens(self) -> int:
         """X-SUM-PRICE (user 05.10. "pending token werden gesammelt und als
@@ -11454,11 +11493,25 @@ class Front:
         return self._d_carried_tokens()
 
     def _dc_carried_running(self) -> int:
-        """SOLL R6: only a D prefill that is REALLY running (the front's book of granted, not yet finished D
-        prefills) counts into the set's S -- entries merely waiting in ``_ready_for_d`` do not."""
+        """SOLL R6: only a D prefill that is REALLY running counts into the set's S -- entries merely waiting in
+        ``_ready_for_d`` do not, and (S49, user decision 18.10. ~21:15Z "Nur echt laufend zählt") neither does a
+        granted D prefill D has not begun: a row of the book counts only once D recorded its extend
+        (D-EXTEND-BEACON). A big member then waits its T_halb (R4); a kurz request never triggers a flip (R2).
+        ``_d_carried_tokens`` (the X-SUM price of the kurz path) is unchanged: it prices every granted row."""
         if not envs.FLLIPER_PDFLIP_ENABLE_DECODE_COLLECT_PREFILL_BUSY.get():
             return 0
-        return Front._d_pf_pending_tokens(self)
+        running = Front._d_pf_pending_tokens(self, started_only=True)
+        granted = Front._d_pf_pending_tokens(self)
+        if granted > running:
+            # named once per change: a granted D prefill D has not begun is NOT in R6's S (S49)
+            self.counters["r6_not_started_skipped"] += 1
+            key = (granted, running)
+            if self.__dict__.get("_r6_ns_last") != key:
+                self.__dict__["_r6_ns_last"] = key
+                logger.info("PDFLIP R6-NOT-STARTED granted=%d running=%d epoch=%d -- granted D prefill(s) D has not "
+                            "begun do not count into the set's S (SOLL R6, user 18.10. \"Nur echt laufend zählt\"; a "
+                            "big member waits its T_halb, R4)", granted, running, self.epoch)
+        return running
 
     def _dc_d_busy(self) -> bool:
         """D decodes, or prefills a granted SHORT: the arrivals are priced as a SET (X-SUM-PRICE, ``carried`` in the sum).
@@ -11668,16 +11721,37 @@ class Front:
         # the user's word, and SOLL v2 has no such exception: a big member waits T_halb for company at EVERY
         # priority. ``urgent`` stays for the log only.
         urgent = Front._prio_urgent(self, cands)
+        running = self._dc_carried_running()
         sv = phase_policy.set_verdict(
             members=members, x_tokens=x_tok, half_frac=frac, t_half_s=t_half,
             now=now, t_open=min(st["t_open"], now),
             d_decoding=decoding, seats_free=seats,
-            d_prefill_running_uncached=self._dc_carried_running(),  # R6: what D prefills right now counts into S
+            d_prefill_running_uncached=running,  # R6: what D REALLY prefills right now counts into S (S49)
             new_since_last=max(0, len(members) - st["seen"]), class_x_tokens=x_cls)
+        sv = Front._set_xsum_hold(self, sv, x_tok, running)
         kw = dict(x_tok=x_tok, x_cls=x_cls, frac=frac, t_half=t_half, decoding=decoding, seats=seats,
                   waited=max(0.0, now - st["t_open"]), xk=xk)
         st["urgent"] = urgent
         return members, sv, kw
+
+    def _set_xsum_hold(self, sv: "phase_policy.SetVerdict", x_tok: int, running: int) -> "phase_policy.SetVerdict":
+        """S49 (SOLL R6 after the user's decision 18.10. "Nur echt laufend zählt", with X-SUM-PRICE, user 05.10.
+        "pending token werden gesammelt und als SUMME bepreist"): a granted D prefill D has NOT begun is no flip
+        reason (R6 does not count it) -- but D is not handed a set on top of it either when the two together pass X.
+        Before S49 that set was rerouted at once (R6 counted the grant: the NF int23xsum burst of 09.10.); now it WAITS
+        (COLLECT, no flip, R7): once D begins the grant, R6 counts it as really running and decides; once D has
+        finished it, the set goes to D under X. Only a D verdict (D_AFTER_TIMER) is held; every flip verdict stands.
+        Switch FLLIPER_PDFLIP_D_EXTEND_BEACON off: nothing to hold (R6 counts the book as before)."""
+        if sv.verdict != phase_policy.V_D_AFTER_TIMER or not envs.FLLIPER_PDFLIP_ENABLE_DECODE_COLLECT_PREFILL_BUSY.get():
+            return sv
+        unstarted = max(0, Front._d_pf_pending_tokens(self) - int(running))
+        if unstarted <= 0 or sv.s_tokens + unstarted <= int(x_tok):
+            return sv
+        self.counters["set_xsum_hold_unstarted"] += 1
+        return phase_policy.SetVerdict(
+            phase_policy.V_COLLECT,
+            "X-SUM S=%d + %d granted on D not started > X=%d: waits for D to begin it (R6) or finish it, no flip"
+            % (sv.s_tokens, unstarted, int(x_tok)), 0.0, sv.s_tokens, sv.half_x)
 
     def _set_flip_foreseeable(self, now: float) -> bool:
         """True when a decided (or committed) flip stands: the set is not merely collecting. A collecting set may

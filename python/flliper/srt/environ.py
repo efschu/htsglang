@@ -1985,6 +1985,12 @@ class Envs:
     # to prefill is carried into the collected set's sum. Off = collect only
     # while D decodes (the sum of an arriving burst on an idle D is unpriced).
     FLLIPER_PDFLIP_ENABLE_DECODE_COLLECT_PREFILL_BUSY = EnvBool(True)
+    # S49 D-EXTEND-BEACON (SOLL v2 R6, user 18.10. ~21:15Z "Nur echt laufend zählt"): every rank of group D records
+    # in a mmap ring (<arena>/d_extend/D-pid<pid>.bin) the rids whose FIRST extend after their arrival began; the
+    # front's R6 counts a granted D prefill into the set's S only once D really computes it (granted-but-not-started
+    # does not count, a big member waits its T_halb, R4). Read on D (write) and on the front (read). Off = no file,
+    # R6 counts every granted, unfinished D prefill as before (pdflip/d_extend_beacon.py).
+    FLLIPER_PDFLIP_D_EXTEND_BEACON = EnvBool(True)
     # X_ROUTED_NEEDS_P (#246b, 30.09., NF y4c ...dauer09300427 front 04:39:57):
     # a queued request needs P above the X it was ROUTED on, not only above the
     # live X. pdflip-22-37 / 22-38 (4447 / 4191 tokens) were routed LONG on the

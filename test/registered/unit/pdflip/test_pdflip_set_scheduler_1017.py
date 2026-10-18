@@ -167,6 +167,13 @@ def _verdicts(caplog):
     return [r.getMessage() for r in caplog.records if "PDFLIP SET-VERDICT" in r.getMessage()]
 
 
+def _d_began(f, *rids):
+    """S49 (SOLL R6, user 18.10. "Nur echt laufend zählt"): D's D-EXTEND-BEACON reports that D began the extend of
+    ``rids`` (stamped at the read, i.e. after every grant) -- only then is a granted D prefill RUNNING for R6."""
+    from flliper.srt.pdflip import d_extend_beacon as _dxb
+    f._d_ext_reading = lambda: {_dxb.rid_key(r): time.time_ns() for r in rids}
+
+
 def test_envs_defaults_and_the_old_window_is_off():
     from flliper.srt.environ import envs
     assert envs.FLLIPER_PDFLIP_HALF_X_FRAC.default == 0.5
@@ -280,7 +287,8 @@ def test_r6_a_running_d_prefill_is_rerouted_when_the_set_passes_x(monkeypatch, c
     f = _fx()
     f._d_pf_book().grant(rid="run", tokens=4000, now=time.time())
     f._d_pf_book().enter_leg2(rid="run")
-    f.groups["D"].outstanding["run"] = 1.0       # D holds it: its prefill is running
+    f.groups["D"].outstanding["run"] = 1.0       # D holds it
+    _d_began(f, "run")                           # S49: and D began its extend -- its prefill is running
     t0 = time.time()
     with caplog.at_level(logging.INFO, logger="pdflip.front"):
         assert asyncio.run(f._decode_collect_short("a", 3500)) == "P", "S = 4000 + 3500 > X"
@@ -395,6 +403,8 @@ def test_a1_r6_counts_only_a_really_running_d_prefill_not_waiting_ready_entries(
     f._d_pf_book().grant(rid="run", tokens=4000, now=time.time())
     f._d_pf_book().enter_leg2(rid="run")
     f.groups["D"].outstanding["run"] = 1.0
+    assert f._dc_carried_running() == 0, "S49 (SOLL R6, user 18.10.): granted and posted, D has not begun it"
+    _d_began(f, "run")
     assert f._dc_carried_running() == 4000
 
 
@@ -569,6 +579,7 @@ def test_b3_reroute_takes_the_waiting_d_line_entries_along_to_p(monkeypatch, cap
     f._d_pf_book().grant(rid="run", tokens=4000, now=time.time())
     f._d_pf_book().enter_leg2(rid="run")
     f.groups["D"].outstanding["run"] = 1.0
+    _d_began(f, "run")                           # S49: D really prefills it (SOLL R6, user 18.10.)
     w = _pending("w", 900, time.time() - 1.0)
     w.d_direct = True
     f._ready_for_d.append(w)
