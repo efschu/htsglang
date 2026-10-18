@@ -54,6 +54,37 @@ class PageIO:
             ctypes.POINTER(ctypes.c_int8),
         ]
 
+        # S36 (18.10.): KV-DURCHLAUF reads out of held fds, O_DIRECT writes
+        self._has_fds = hasattr(lib, "hicache_read_fds")
+        if self._has_fds:
+            lib.hicache_read_fds.restype = ctypes.c_int64
+            lib.hicache_read_fds.argtypes = [
+                ctypes.c_int64,
+                ctypes.POINTER(ctypes.c_int32),
+                ctypes.POINTER(ctypes.c_int64),
+                ctypes.POINTER(ctypes.c_int64),
+                ctypes.POINTER(ctypes.c_void_p),
+                ctypes.POINTER(ctypes.c_int8),
+                ctypes.POINTER(ctypes.c_int8),
+            ]
+        self._has_direct_write = hasattr(lib, "hicache_write_pages_direct")
+        if self._has_direct_write:
+            lib.hicache_write_pages_direct.restype = ctypes.c_int64
+            lib.hicache_write_pages_direct.argtypes = [
+                ctypes.c_int64,
+                ctypes.POINTER(ctypes.c_char_p),
+                ctypes.POINTER(ctypes.c_char_p),
+                ctypes.POINTER(ctypes.c_char_p),
+                ctypes.POINTER(ctypes.c_int64),
+                ctypes.POINTER(ctypes.c_int64),
+                ctypes.POINTER(ctypes.c_int64),
+                ctypes.POINTER(ctypes.c_int64),
+                ctypes.POINTER(ctypes.c_void_p),
+                ctypes.c_int32,
+                ctypes.POINTER(ctypes.c_int8),
+                ctypes.POINTER(ctypes.c_int32),
+            ]
+
         lib.hicache_write_pages.restype = ctypes.c_int64
         lib.hicache_write_pages.argtypes = [
             ctypes.c_int64,
@@ -76,8 +107,17 @@ class PageIO:
         extents: Sequence[Sequence[tuple[int, int]]],
         payload_ptrs: Sequence[int],
         fsync: bool,
+        direct: bool = False,
+        direct_counts: Optional[list] = None,
     ) -> list[int]:
         """the canonical extent writer of canonical_page_store for a whole batch, in C.
+
+        S36 (18.10., Soll 2): ``direct=True`` writes every 4-KiB-aligned extent
+        through an O_DIRECT descriptor of the locked part file (XFS: the L2 ->
+        L3 copy bypasses the page cache); anything unaligned or a filesystem
+        without O_DIRECT falls back to the buffered descriptor, page by page,
+        with the same statuses. ``direct_counts`` (a list) receives, per page,
+        how many extents went direct.
 
         Status per page: 0 completed and published, 1 partial (marker
         written), 2 already complete, 3 shape refused, 4 io/lock error.
@@ -100,11 +140,47 @@ class PageIO:
         c_len = (ctypes.c_int64 * m)(*flat_len)
         c_pay = (ctypes.c_void_p * n)(*[int(p) for p in payload_ptrs])
         status = (ctypes.c_int8 * n)()
+        if direct and self._has_direct_write:
+            dcount = (ctypes.c_int32 * n)()
+            self._lib.hicache_write_pages_direct(
+                n, c_final, c_part, c_mark, c_total, n_ext, c_off, c_len, c_pay,
+                1 if fsync else 0, status, dcount,
+            )
+            if direct_counts is not None:
+                direct_counts.extend(int(x) for x in dcount)
+            return list(status)
         self._lib.hicache_write_pages(
             n, c_final, c_part, c_mark, c_total, n_ext, c_off, c_len, c_pay,
             1 if fsync else 0, status,
         )
+        if direct_counts is not None:
+            direct_counts.extend([0] * n)
         return list(status)
+
+    def read_fds(
+        self,
+        fds: Sequence[int],
+        offs: Sequence[int],
+        lens: Sequence[int],
+        out_ptrs: Sequence[int],
+    ) -> tuple[list[int], list[int]]:
+        """S36 KV-DURCHLAUF: ``(status, direct)`` per entry -- ``lens[i]`` bytes
+        at ``offs[i]`` of the HELD descriptor ``fds[i]`` into ``out_ptrs[i]``.
+        Status 0 ok, 3 short, 4 error; direct 1 = the read went O_DIRECT (a
+        refused aligned read is repeated buffered on the same inode)."""
+        n = len(fds)
+        if n == 0:
+            return [], []
+        if not self._has_fds:
+            raise RuntimeError("pageio helper without hicache_read_fds (stale build)")
+        c_fd = (ctypes.c_int32 * n)(*[int(f) for f in fds])
+        c_off = (ctypes.c_int64 * n)(*[int(o) for o in offs])
+        c_len = (ctypes.c_int64 * n)(*[int(x) for x in lens])
+        c_out = (ctypes.c_void_p * n)(*[int(p) for p in out_ptrs])
+        status = (ctypes.c_int8 * n)()
+        direct = (ctypes.c_int8 * n)()
+        self._lib.hicache_read_fds(n, c_fd, c_off, c_len, c_out, status, direct)
+        return list(status), list(direct)
 
     def stat_sizes(self, paths: Sequence[str]) -> list[int]:
         """``st_size`` per path, -1 where the path cannot be stat'ed."""

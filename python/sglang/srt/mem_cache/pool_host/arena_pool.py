@@ -48,12 +48,14 @@ from sglang.srt.mem_cache.storage.file.hicache_arena import free_named
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.weg2 import prefix_trace as _prefix_trace
 from sglang.srt.weg2 import handoff_pending as _handoff_pending
+from sglang.srt.weg2 import kv_durchlauf as _kv_dl  # S36 KV-DURCHLAUF
 
 logger = logging.getLogger(__name__)
 
 ENV_ARENA_HOST = "SGLANG_HICACHE_ARENA_HOST"
 ENV_STAGING_GB = "SGLANG_HICACHE_ARENA_STAGING_GB"
 PLACEHOLDERS = 1 << 22
+_DISK_LOAD_N = 0  # S36 KV-DURCHLAUF loads (log rate)
 
 
 def _psz(pool) -> int:
@@ -207,10 +209,26 @@ def _rows_page_clean(P: int, rows: torch.Tensor) -> bool:
     return not (bool((first % P).any()) or bool((pages != first[:, None] + lane).any()))
 
 
-def _chain_clean(P: int, rows: torch.Tensor) -> bool:
+def _disk_norm(P: int, rows: torch.Tensor, S) -> torch.Tensor:
+    """S36 KV-DURCHLAUF: arena rows (host id - S) with every DISK row moved to a P-aligned range of its own (2 x
+    disk_base, beyond every arena row), so the whole-page / no-twin tests read a disk page like a slot."""
+    if S is None or rows.numel() == 0:
+        return rows
+    m = (rows + int(S)) >= _kv_dl.DISK_BASE
+    if not bool(m.any()):
+        return rows
+    out = rows.clone()
+    base = _kv_dl.disk_base(P)
+    out[m] = rows[m] + int(S) - base + 2 * base
+    return out
+
+
+def _chain_clean(P: int, rows: torch.Tensor, S=None) -> bool:
     """Whole consecutive pages AND no page twice: one prefix never holds the
     same slot at two depths (a twin page survives the per-page check and
-    breaks only after the load's sort)."""
+    breaks only after the load's sort). S36: ``S`` given -> disk pages count
+    as pages of their own (``_disk_norm``)."""
+    rows = _disk_norm(P, rows, S)
     if not _rows_page_clean(P, rows):
         return False
     first = rows.view(-1, P)[:, 0] if P > 1 else rows
@@ -254,9 +272,14 @@ def _chain_keys_hold(pool, nodes, rows: torch.Tensor, stems_of, keys_of) -> bool
     bad_at = None
     if ok and keys:
         import numpy as np
-        slots, states = arena.find_slots_np(stems_of(keys))
+        stems = stems_of(keys)
+        slots, states = arena.find_slots_np(stems)
         want = (first // P).numpy() if P > 1 else first.numpy()
         good = (np.asarray(slots, dtype=np.int64) == want) & (np.asarray(states) == 2)
+        # S36 KV-DURCHLAUF: a disk page is proven by its held L3 file -- the registry stem must be the key's stem
+        _dg = _disk_pages_proven(pool, first, stems)
+        if _dg is not None:
+            good = np.where(_dg[0], _dg[1], good)
         ok = bool(good.all())
         if not ok:
             j = int(np.argmin(good))
@@ -273,6 +296,26 @@ def _chain_keys_hold(pool, nodes, rows: torch.Tensor, stems_of, keys_of) -> bool
                 "" if bad_at is None else
                 f" (page {bad_at[0]}: rows slot {bad_at[1]}, key slot {bad_at[2]} state {bad_at[3]})")
     return ok
+
+
+def _disk_pages_proven(pool, first_rows: torch.Tensor, stems):
+    """S36: ``(is_disk_page, proven)`` numpy masks over a chain's pages (``first_rows`` = each page's first arena
+    row, host id - S), or None when no page is a disk page. Proven = the disk page's registry entry holds the L3
+    file of exactly the key's stem (its lanes are checked by the whole-page test)."""
+    import numpy as np
+    S = int(getattr(pool, "staging_rows", 0) or 0)
+    host_first = first_rows.to("cpu", dtype=torch.int64) + S
+    isd = (host_first >= _kv_dl.DISK_BASE).numpy()
+    if not bool(isd.any()):
+        return None
+    P = _psz(pool)
+    base = _kv_dl.disk_base(P)
+    ok = np.zeros(isd.shape, dtype=bool)
+    hf = host_first.tolist()
+    for j in np.nonzero(isd)[0].tolist():
+        d = (int(hf[j]) - base) // P
+        ok[j] = (int(hf[j]) - base) % P == 0 and _kv_dl.REGISTRY.stem_of(d) == str(stems[j])
+    return isd, ok
 
 
 def _chain_duplicates(P: int, rows: torch.Tensor, limit: int = 4):
@@ -378,12 +421,22 @@ def _chain_plan(pool, nodes, rows_of, stems_of, keys_of, own_hash, p_chain, page
                 keys[i] = pick
                 plan["rekeyed"].append(f"node={nid} page={i} depth_page={j + i} {k[:12]}->{pick[:12]}")
                 prior = pick
-        slots, states = arena.find_slots_np(stems_of(keys))
+        _stems_k = stems_of(keys)
+        slots, states = arena.find_slots_np(_stems_k)
         slots = torch.as_tensor(slots, dtype=torch.int64)
         states = torch.as_tensor(states, dtype=torch.int64)
         want = slots[:, None] * P + lane
         pages = plan["rows"].view(-1, P)
         bad = (pages != want).any(dim=1)
+        # S36 KV-DURCHLAUF: a disk page whose held L3 file is the key's own stays a disk page (proven); one that
+        # is not (re-keyed) is re-pointed like any page -- its disk page goes back with the re-point
+        _dg = _disk_pages_proven(pool, pages[:, 0], _stems_k)
+        if _dg is not None:
+            _isd = torch.as_tensor(_dg[0])
+            _okd = torch.as_tensor(_dg[1]) & ~(pages != pages[:, :1] + lane).any(dim=1)
+            bad = torch.where(_isd, ~_okd, bad)
+            plan["disk_unrefs"] = [((int(pages[i, 0]) + S - _kv_dl.disk_base(P)) // P)
+                                   for i in (_isd & ~_okd).nonzero()[:, 0].tolist()]
         if bool(bad.any()):
             idx = bad.nonzero()[:, 0]
             invalid = idx[(slots[idx] < 0) | (states[idx] != 2)]
@@ -413,7 +466,7 @@ def _chain_plan(pool, nodes, rows_of, stems_of, keys_of, own_hash, p_chain, page
         plans.append(plan)
         j += len(stored)
     rows = torch.cat([p["rows"] for p in plans]) if plans else torch.empty(0, dtype=torch.int64)
-    if int(rows.numel()) and not _chain_clean(P, rows):
+    if int(rows.numel()) and not _chain_clean(P, rows, S):
         dups = _chain_duplicates(P, rows)
         first = dups[0][0] if dups else 0
         return plans, (first, (
@@ -577,7 +630,7 @@ def provable_pages(pool, nodes, rows_of, stems_of, *, keys_of=None, own_hash=Non
     rows = torch.cat([rows_of(n).reshape(-1) for n in nodes])
     total = int(rows.numel()) // P
     ar = rows.to("cpu", dtype=torch.int64) - S
-    if not _chain_shifted(nodes, keys_of, p_chain, page0) and _chain_clean(P, ar) \
+    if not _chain_shifted(nodes, keys_of, p_chain, page0) and _chain_clean(P, ar, S) \
             and _chain_keys_hold(pool, nodes, ar, stems_of, keys_of):   # A2 CHAIN-KEY
         return total, total
     _plans, stop, total = _chain_plan(pool, nodes, rows_of, stems_of, keys_of, own_hash,
@@ -632,7 +685,7 @@ def verify_load_chain(pool, nodes, host_indices, rows_of, stems_of, *, keys_of=N
     nodes = list(nodes)
     keys_of = keys_of or (lambda n: n.hash_value)
     ar = host_indices.to("cpu", dtype=torch.int64) - S
-    if not _chain_shifted(nodes, keys_of, p_chain, page0) and _chain_clean(P, ar) \
+    if not _chain_shifted(nodes, keys_of, p_chain, page0) and _chain_clean(P, ar, S) \
             and _chain_keys_hold(pool, nodes, ar, stems_of, keys_of):   # A2 CHAIN-KEY
         return host_indices
     plans, stop, _total = _chain_plan(pool, nodes, rows_of, stems_of, keys_of, own_hash,
@@ -659,6 +712,9 @@ def verify_load_chain(pool, nodes, host_indices, rows_of, stems_of, *, keys_of=N
         if not torch.equal(ref.to("cpu", dtype=torch.int64).reshape(-1) - S, p["rows"]):
             ref.copy_((p["rows"] + S).to(ref.dtype).view(ref.shape))
     gave = int(arena.ref_slots(drop, -1)) if drop else 0
+    _dd = [d for p in plans for d in p.get("disk_unrefs", ())]
+    if _dd:
+        _kv_dl.REGISTRY.release(_dd)   # S36: re-pointed away from their disk page
     _CHAIN_REPAIRED_N[0] += 1
     logger.warning(
         "#1424 CHAIN %s n=%d nodes=%d page0=%s refs=+%d/-%d (re-pointed %d, old held %d): %s -- %s",
@@ -1602,7 +1658,12 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
 
     def resolve_rows(self, host_indices: torch.Tensor, slots: Sequence[int]) -> None:
         """KV role: write arena ids over the placeholders, in place -- P ids
-        per slot, so a resolved run covers len(slots) * P tokens."""
+        per slot, so a resolved run covers len(slots) * P tokens.
+
+        S36 KV-DURCHLAUF: an entry ``kv_durchlauf.DiskRef`` is a disk page (the arena was full): its P ids are disk
+        ids (``kv_durchlauf.disk_ids``), read through from the held L3 file at the load."""
+        if any(isinstance(x, _kv_dl.DiskRef) for x in slots):
+            return self._resolve_rows_with_disk(host_indices, slots)
         self.pin_slots(slots)
         vals = self.arena_ids(slots).to(dtype=host_indices.dtype)
         n = int(vals.numel())
@@ -1613,6 +1674,26 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
             )
         host_indices[:n] = vals.to(host_indices.device)
 
+    def _resolve_rows_with_disk(self, host_indices: torch.Tensor, slots) -> None:
+        P = _psz(self)
+        arena = [int(x) for x in slots if not isinstance(x, _kv_dl.DiskRef)]
+        if arena:
+            self.pin_slots(arena)
+        is_d = torch.tensor([isinstance(x, _kv_dl.DiskRef) for x in slots], dtype=torch.bool)
+        num = torch.tensor([x.d if isinstance(x, _kv_dl.DiskRef) else int(x) for x in slots], dtype=torch.int64)
+        first = torch.where(is_d, num * P + _kv_dl.disk_base(P), num * P + int(self.staging_rows))
+        vals = (first[:, None] + torch.arange(P, dtype=torch.int64)[None, :]).reshape(-1)
+        n = int(vals.numel())
+        if n > int(host_indices.numel()):
+            raise ValueError(
+                f"#1424 resolve_rows: {len(slots)} pages x {P} tokens = {n} ids do not fit the "
+                f"{int(host_indices.numel())}-token registration")
+        host_indices[:n] = vals.to(dtype=host_indices.dtype).to(host_indices.device)
+
+    def release_disk_rows(self, host_indices) -> int:
+        """S36: the disk pages these host rows name go back (their held L3 files are closed)."""
+        return _kv_dl.REGISTRY.release_rows(host_indices, _psz(self))
+
     def resolve_draft_rows(self, rows: Sequence[int], slots: Sequence[int]) -> None:
         """Draft role: remember the DRAFT arena slot behind each KV row (-1 = miss)."""
         if self.row_slot is None:
@@ -1622,6 +1703,21 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
 
     # -- transfers ------------------------------------------------------------
     def load_to_device_per_layer(self, device_pool, host_indices, device_indices, layer_id, io_backend):
+        if self.arena is not None and host_indices.numel() and _kv_dl.any_disk(host_indices):
+            # S36 KV-DURCHLAUF: disk pages are read through from their held L3 files straight into the device rows
+            # (all layers at the first layer call of this load); the rest takes the arena / staging path unchanged
+            hint = (id(host_indices), id(device_indices), int(host_indices.numel()), int(device_indices.numel()))
+            dm = _kv_dl.disk_mask(host_indices)
+            dmd = dm.to(device_indices.device)
+            self._load_disk_rows(device_pool, host_indices[dm], device_indices[dmd], layer_id, hint)
+            keep = ~dm
+            if not bool(keep.any()):
+                return None
+            return self._load_to_device_nodisk(device_pool, host_indices[keep], device_indices[~dmd], layer_id,
+                                               io_backend, hint=hint)
+        return self._load_to_device_nodisk(device_pool, host_indices, device_indices, layer_id, io_backend)
+
+    def _load_to_device_nodisk(self, device_pool, host_indices, device_indices, layer_id, io_backend, hint=None):
         if self.arena is None or host_indices.numel() == 0:
             return super().load_to_device_per_layer(device_pool, host_indices, device_indices, layer_id, io_backend)
         S = self.staging_rows
@@ -1634,14 +1730,96 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         # per-layer `host_indices - S` temporaries relied on CPython reusing
         # the freed tensor's id -- when it did not (TP0, xsn398), layers
         # 1..47 also ran the per-layer kernel: a second full copy (+321 ms).
-        self._page_key_hint = (id(host_indices), id(device_indices),
-                               int(host_indices.numel()), int(device_indices.numel()))
+        self._page_key_hint = hint or (id(host_indices), id(device_indices),
+                                       int(host_indices.numel()), int(device_indices.numel()))
         if bool(is_arena.all()):
             return self._load_arena(device_pool, host_indices - S, device_indices, layer_id)
         sel = is_arena.nonzero(as_tuple=True)[0]
         rest = (~is_arena).nonzero(as_tuple=True)[0]
         self._load_arena(device_pool, host_indices[sel] - S, device_indices[sel], layer_id)
         super().load_to_device_per_layer(device_pool, host_indices[rest], device_indices[rest], layer_id, io_backend)
+
+    def _load_disk_rows(self, device_pool, rows, device_indices, layer_id, hint) -> None:
+        """S36 KV-DURCHLAUF: the device rows of disk pages. Draft role: a disk page has no draft slot -- zeros, the
+        draft miss (#993). KV role: every layer of every disk page at the first layer call of this load
+        (``hint`` = the caller's index objects, as the arena page load keys its layer 0), later layers no-ops."""
+        if rows.numel() == 0:
+            return
+        if self.row_slot is not None:
+            kb = device_pool.k_buffer[layer_id]
+            d = device_indices.to(device=kb.device, dtype=torch.int64)
+            z = torch.zeros((int(d.numel()),) + tuple(kb.shape[1:]), dtype=kb.dtype, device=kb.device)
+            kb.index_copy_(0, d, z)
+            device_pool.v_buffer[layer_id].index_copy_(0, d, z)
+            return
+        if getattr(self, "_disk_loaded_key", None) == hint and int(layer_id) != 0:
+            return
+        self._load_disk_pages_all_layers(device_pool, rows, device_indices)
+        self._disk_loaded_key = hint
+
+    def _load_disk_pages_all_layers(self, device_pool, rows, device_indices) -> None:
+        """S36 KV-DURCHLAUF: read the whole L3 pages behind ``rows`` (disk ids) out of their HELD descriptors
+        (O_DIRECT where aligned) into the transfer target -- the cpu page-load mode's pinned stages, created only
+        if absent (``kv_durchlauf.block_pages``: 64 MiB per stage by default) -- copy each block to the card and
+        scatter every layer's K/V cells of the asked (page, lane) rows into the device rows. An L3 page has the
+        arena slot's byte layout (the write-behind / claim room write ``(0, total)`` of the slot, the fill reads
+        it back the same way), so the offsets are the arena load's (``_k_offs_b`` / ``_v_offs_b``). Owner lanes
+        (#239 token cut) are just rows with their lane: any (page, lane) set, duplicates included."""
+        P = _psz(self)
+        pb = int(self._page_bytes)
+        dev = device_pool.k_buffer[0].device
+        pg, lane = _kv_dl.pages_of_rows(rows, P)
+        up, inv = torch.unique(pg, return_inverse=True)
+        n_pages = int(up.numel())
+        entries = [_kv_dl.REGISTRY.entry(int(d)) for d in up.tolist()]
+        gone = [int(d) for d, e in zip(up.tolist(), entries) if e is None]
+        if gone:
+            raise RuntimeError(
+                f"WEG2 KV-DURCHLAUF LOAD REFUSED: disk page(s) {gone[:4]} (of {n_pages}) were released before "
+                "their load -- the host rows outlived their registry entry; stopping by name instead of loading "
+                "bytes nobody holds")
+        B = max(1, min(n_pages, _kv_dl.block_pages(pb)))
+        _ensure_page_stages(self, B, pb, dev)
+        H, D = int(self.head_num), int(self.head_dim)
+        e = int(self.dtype.itemsize)
+        cell = H * D * e
+        L = len(self._k_offs_b)
+        dev_stage = torch.empty((B, pb), dtype=torch.uint8, device=dev)
+        didx = device_indices.to(device=dev, dtype=torch.int64)
+        for bi, start in enumerate(range(0, n_pages, B)):
+            b = min(B, n_pages - start)
+            k = bi % 2
+            self._page_events[k].synchronize()   # the copy that last read this stage is done
+            host_stage = self._page_stages[k]
+            ptrs = [int(host_stage[j].data_ptr()) for j in range(b)]
+            st = _kv_dl.read_pages(entries[start:start + b], ptrs, pb)
+            bad = [i for i, x in enumerate(st) if x != 0]
+            if bad:
+                raise RuntimeError(
+                    f"WEG2 KV-DURCHLAUF READ FAILED: {len(bad)} of {b} L3 page(s) (first stem "
+                    f"{str(entries[start + bad[0]].stem)[:24]}, status {st[bad[0]]}) could not be read from the "
+                    "held descriptor -- stopping by name instead of loading a torn page")
+            dev_stage[:b].copy_(host_stage[:b], non_blocking=True)
+            self._page_events[k].record()
+            sel = ((inv >= start) & (inv < start + b)).nonzero(as_tuple=True)[0]
+            if not sel.numel():
+                continue
+            loc = (inv[sel] - start).to(dev)
+            ln = lane[sel].to(dev)
+            dst = didx[sel.to(dev)]
+            for l in range(L):
+                for off, buf in ((self._k_offs_b[l], device_pool.k_buffer[l]),
+                                 (self._v_offs_b[l], device_pool.v_buffer[l])):
+                    blk = dev_stage[:b, off:off + P * cell].view(b, P, cell)
+                    cells = blk[loc, ln].reshape(-1).view(self.dtype).view(-1, H, D)
+                    buf.index_copy_(0, dst, cells)
+        global _DISK_LOAD_N
+        _DISK_LOAD_N += 1
+        if _DISK_LOAD_N <= 16 or (_DISK_LOAD_N & (_DISK_LOAD_N - 1)) == 0:
+            s_ = _kv_dl.REGISTRY.stats
+            logger.info("WEG2 KV-DURCHLAUF LOAD n=%d rows=%d pages=%d block=%d bytes=%d read_direct_total=%d "
+                        "(L3 -> transfer target -> device rows, no L2 slot)",
+                        _DISK_LOAD_N, int(rows.numel()), n_pages, B, n_pages * pb, s_["read_direct"])
 
     def _arena_load_guard(self, device_pool, slots, device_indices, layer_id, *, nrows: int, nmiss: int,
                           need_pinned: bool = True) -> None:
@@ -2268,6 +2446,8 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         idx = torch.as_tensor(host_indices).reshape(-1).cpu().to(torch.int64)
         if idx.numel() == 0:
             return 0
+        if getattr(self, "row_slot", None) is None and _kv_dl.REGISTRY.live():
+            _kv_dl.REGISTRY.release_rows(idx, _psz(self))   # S36: disk pages of a dropped node / release entry
         rows = torch.unique(idx[_arena_mask(self, idx)]) - int(self.staging_rows)
         if rows.numel() == 0:
             return 0
@@ -3147,6 +3327,8 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         if self.arena is None:
             return super().free(indices)
         idx = indices.cpu() if torch.is_tensor(indices) else torch.as_tensor(indices)
+        if self.row_slot is None and _kv_dl.REGISTRY.live():
+            _kv_dl.REGISTRY.release_rows(idx, _psz(self))   # S36: a freed node's disk pages
         S = self.staging_rows
         staging = idx[idx < S]
         arena_rows = idx[_arena_mask(self,idx)]

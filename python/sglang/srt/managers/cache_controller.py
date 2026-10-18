@@ -49,6 +49,7 @@ from sglang.srt.mem_cache.hicache_collective import (
 from sglang.srt.mem_cache.weg2_store_gates import check_mamba_blob_present
 from sglang.srt.mem_cache import probe_hold as _probe_hold
 from sglang.srt.weg2 import read_depth as _rd  # READ-DEPTH 1014 (C5)
+from sglang.srt.weg2 import kv_durchlauf as _kv_dl  # S36 KV-DURCHLAUF
 
 
 # #1402: module-level on purpose -- the harness doubles bind curated
@@ -155,6 +156,37 @@ def arena_ref_recheck_enabled(env=None) -> bool:
     """Default ON (``0``/``false``/``no``/``off`` = the read path of before)."""
     e = os.environ if env is None else env
     return (e.get(ENV_REF_RECHECK, "") or "").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _kv_dl_resolve(ctl, pool, slots, stems, hash_values, held) -> int:
+    """S36 KV-DURCHLAUF: the DURCHLAUF pages of a store read's slot list become disk pages -- the L3 file held open
+    in ``kv_durchlauf.REGISTRY`` (``DiskRef``). A file that cannot be opened (gone since the stat) ends the prefix
+    there: references past it are given back (held probe pages stay the probe's, as at the recheck cut), disk pages
+    past it released. Returns the disk pages kept."""
+    import numpy as _np
+
+    pos = [j for j in range(len(slots)) if slots[j] is _kv_dl.DURCHLAUF]
+    if not pos:
+        return 0
+    be = ctl.storage_backend
+    _kv_dl.REGISTRY.backend = be
+    ds = _kv_dl.REGISTRY.alloc([hash_values[j] for j in pos], [stems[j] for j in pos],
+                               [be._existing_path(stems[j]) for j in pos], int(pool._page_bytes))
+    cut = None
+    for j, d in zip(pos, ds):
+        if d is None:
+            cut = j if cut is None else min(cut, j)
+        else:
+            slots[j] = _kv_dl.DiskRef(d)
+    if cut is not None:
+        back = [int(slots[j]) for j in range(cut, len(slots))
+                if not held[j] and not isinstance(slots[j], _kv_dl.DiskRef) and slots[j] is not _kv_dl.DURCHLAUF]
+        if back:
+            pool.arena.ref_slots_np(_np.asarray(back, dtype=_np.int64), -1)
+        _kv_dl.REGISTRY.release([slots[j].d for j in range(cut, len(slots))
+                                 if isinstance(slots[j], _kv_dl.DiskRef)])
+        del slots[cut:]
+    return sum(1 for s_ in slots if isinstance(s_, _kv_dl.DiskRef))
 
 
 def _arena_first_unproven(arena, stems, idxs, slots):
@@ -3924,19 +3956,31 @@ class HiCacheController:
                     # ROOM-ARBITER 1016 (F3): the fill's room wait knows its request (PP0 picks the oldest)
                     # REF-AT-LAND-1014: the fill references every page as it lands;
                     # those references are ours (taken below instead of a ref here)
-                    try:
-                        _got = _fill_fn(pool.arena, [stems[i] for i in _need], int(pool._page_bytes),
-                                        prefix=True, take_ref=True)
-                        _fills_reffed = bool(getattr(_got, "_arena", None) is not None)
-                    except TypeError:   # a backend without the keyword
-                        _got = _fill_fn(pool.arena, [stems[i] for i in _need], int(pool._page_bytes), prefix=True)
-                        _fills_reffed = False
+                    _got = None
+                    if _kv_dl.on():
+                        # S36 KV-DURCHLAUF: a page the FULL arena cannot take comes back DURCHLAUF -- a disk page,
+                        # never a room wait (kv_durchlauf.durchlauf_stems, one rule for every rank)
+                        try:
+                            _got = _fill_fn(pool.arena, [stems[i] for i in _need], int(pool._page_bytes),
+                                            prefix=True, take_ref=True, durchlauf=True)
+                            _fills_reffed = bool(getattr(_got, "_arena", None) is not None)
+                        except TypeError:   # a backend without the S36 keyword
+                            _got = None
+                    if _got is None:
+                        try:
+                            _got = _fill_fn(pool.arena, [stems[i] for i in _need], int(pool._page_bytes),
+                                            prefix=True, take_ref=True)
+                            _fills_reffed = bool(getattr(_got, "_arena", None) is not None)
+                        except TypeError:   # a backend without the keyword
+                            _got = _fill_fn(pool.arena, [stems[i] for i in _need], int(pool._page_bytes), prefix=True)
+                            _fills_reffed = False
                 _fills = dict(zip(_need, list(_got)))
                 _why = {_need[k]: c for k, c in _rd.fill_reasons_take().items() if k < len(_need)}
         _tf1 = time.perf_counter()
         _rs["l3fill"] = _rs.get("l3fill", 0.0) + (_tf1 - _tf) * 1000.0
         _rs["l3fill_pages"] = _rs.get("l3fill_pages", 0) + len(_need)
         _fill_idx = []
+        _dl_n = 0
         for i in range(lead, _end):
             if _hm[i]:
                 slots.append(int(_fs[i]))  # #257: held since the probe
@@ -3946,6 +3990,12 @@ class HiCacheController:
                 continue
             # #1433: not in the L2 -- the L3 fill above read it (or not)
             fill = _fills.get(i)
+            if fill is _kv_dl.DURCHLAUF:
+                # S36: a disk page -- resolved to a held L3 file below, no slot, no reference
+                slots.append(fill)
+                _dl_n += 1
+                _fills.pop(i, None)
+                continue
             if fill is None or (not _fills_reffed and pool.arena.ref_slots([fill], +1) != 1):
                 _rd.note_cut(operation, _rd_base + i,  # READ-DEPTH: why the walk ends here
                              _why.get(i, _rd.FILL_NONE) if fill is None else _rd.FILL_EVICTED_BEFORE_REF)
@@ -3956,7 +4006,7 @@ class HiCacheController:
                 _fills.pop(i, None)   # its reference moved into the read
         if _fills_reffed:
             # REF-AT-LAND-1014: landed past where the prefix ended -- given back
-            _left = [int(v) for v in _fills.values() if v is not None]
+            _left = [int(v) for v in _fills.values() if v is not None and v is not _kv_dl.DURCHLAUF]
             if _left:
                 pool.arena.ref_slots_np(_np.asarray(_left, dtype=_np.int64), -1)
         if _recheck and _fill_idx:
@@ -3967,7 +4017,8 @@ class HiCacheController:
             _bp, _fd = _arena_first_unproven(pool.arena, stems, _fill_idx, [slots[i] for i in _fill_idx])
             if _bp >= 0:
                 _cut = _fill_idx[_bp]
-                _back = [slots[j] for j in range(_cut, len(slots)) if not _hm[j]]
+                _back = [slots[j] for j in range(_cut, len(slots))
+                         if not _hm[j] and slots[j] is not _kv_dl.DURCHLAUF]
                 if _back:
                     pool.arena.ref_slots_np(_np.asarray(_back, dtype=_np.int64), -1)
                 _arena_note_recheck_cut("fill", _cut, stems[_cut], int(slots[_cut]), _fd, len(_back))
@@ -3976,6 +4027,9 @@ class HiCacheController:
         if _pre:
             # referenced ahead, past where the prefix ended: given back
             pool.arena.ref_slots_np(_np.asarray(list(_pre.values()), dtype=_np.int64), -1)
+        _dl_disk = 0
+        if _dl_n and slots:
+            _dl_disk = _kv_dl_resolve(self, pool, slots, stems, hash_values, _hm)
         if not slots:
             # xsn314/322/326: the dormant hold's re-reads answered ZERO for
             # pages P had completed (PP2's ack flips COMPLETE within ~4 s),
@@ -3999,6 +4053,8 @@ class HiCacheController:
         _rs["ref"] = _rs.get("ref", 0.0) + ((_t2 - _t1) - (_tf1 - _tf)) * 1000.0
         _probe_hold.consumed(operation, _page0, len(slots))
         pool.resolve_rows(host_indices, slots)
+        if _dl_disk:
+            _kv_dl.note_read(getattr(operation, "request_id", None), len(slots), _dl_disk)
         _t3 = time.perf_counter()
         _rs["resolve"] = _rs.get("resolve", 0.0) + (_t3 - _t2) * 1000.0
         _rs["pages"] = _rs.get("pages", 0) + len(slots)

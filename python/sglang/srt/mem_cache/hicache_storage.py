@@ -23,6 +23,7 @@ from sglang.srt.mem_cache.canonical_page_store import (
 from sglang.srt.weg2 import moe_act_switch as _moe_act_switch
 from sglang.srt.weg2 import prefix_trace as _prefix_trace
 from sglang.srt.weg2 import read_room as _read_room
+from sglang.srt.weg2 import kv_durchlauf as _kv_dl  # S36 KV-DURCHLAUF
 from sglang.srt.weg2 import room_wait_arbiter as _arbiter
 from sglang.srt.weg2 import room_verdicts as _room_verdicts
 from sglang.srt.mem_cache.weg2_store_gates import (
@@ -68,8 +69,21 @@ class _RefOnLand(list):
 
     def __setitem__(self, i, v):
         old = list.__getitem__(self, i)
+        if v is not None and v is old:
+            return
+        if v is _kv_dl.DURCHLAUF:
+            # S36 KV-DURCHLAUF: a disk page is no slot -- no reference taken, an old slot's is given back
+            if old is not None and old is not _kv_dl.DURCHLAUF:
+                try:
+                    self._arena.ref_slots([int(old)], -1)
+                except Exception:  # noqa: BLE001
+                    pass
+            list.__setitem__(self, i, v)
+            return
         if v is not None and v == old:
             return
+        if old is _kv_dl.DURCHLAUF:
+            old = None   # a disk page held no reference
         if v is not None:
             try:
                 ok = int(self._arena.ref_slots([int(v)], +1)) == 1
@@ -3709,6 +3723,19 @@ class HiCacheFile(HiCacheStorage):
         return False, max(y, float(every) - max(0.0, now - cycle_t0))
 
     @staticmethod
+    def _l3wb_chunk_pages() -> int:
+        """S36 SOLL 2: pages per write chunk (one read-priority turn each); was a fixed 64."""
+        try:
+            return max(1, int(os.environ.get("SGLANG_WEG2_L3_WRITE_BEHIND_CHUNK_PAGES", "") or 8))
+        except ValueError:
+            return 8
+
+    @staticmethod
+    def _l3wb_direct_on() -> bool:
+        """S36 SOLL 2: the L2 -> L3 bytes O_DIRECT (XFS) -- new, default ON."""
+        return os.environ.get("SGLANG_WEG2_L3_WRITE_BEHIND_DIRECT", "1").strip() not in ("0", "false", "")
+
+    @staticmethod
     def _l3_write_behind_budget() -> int:
         try:
             return max(1, int(envs.SGLANG_WEG2_L3_WRITE_BEHIND_MIB.get())) << 20
@@ -3800,7 +3827,12 @@ class HiCacheFile(HiCacheStorage):
         if pio is None:
             return tot
         fsync = canonical_fsync_default()
-        chunk = 64
+        # S36 SOLL 2: small write chunks, each one after a read-priority turn (l3_write_behind.write_turn), the
+        # bytes O_DIRECT on XFS (pageio.write_pages direct=True; unaligned / no O_DIRECT -> buffered per extent)
+        chunk = self._l3wb_chunk_pages()
+        direct = self._l3wb_direct_on()
+        tot["direct_extents"] = 0
+        tot["read_yield_ms"] = 0.0
         # QS: the QSA index arena goes first, so a KV page's index is on disk
         # before the KV page itself is asked (the pair gate below)
         _qsa = getattr(self, "canonical_qsa_page", None)
@@ -3908,6 +3940,8 @@ class HiCacheFile(HiCacheStorage):
                             tot["pending"] += int(todo.shape[0]) - off
                             stop_all = True
                             break
+                    # S36: reads overtake -- bounded wait per chunk, then the chunk is written anyway
+                    tot["read_yield_ms"] += _gate.write_turn() * 1e3
                     sub = todo[off:off + chunk]
                     ok = arena.pin_complete(slots[sub], klo[sub], khi[sub])
                     pinned = sub[ok]
@@ -3928,11 +3962,21 @@ class HiCacheFile(HiCacheStorage):
                             self._ensure_shard_dir(path)
                             batch.append((i, stem, path))
                         if batch:
-                            statuses = pio.write_pages(
-                                [b[2] for b in batch], [total] * len(batch),
-                                [((0, total),)] * len(batch),
-                                [int(arena.slot_ptr(int(slots[b[0]]))) for b in batch], fsync,
-                            )
+                            _dc: list = []
+                            try:
+                                statuses = pio.write_pages(
+                                    [b[2] for b in batch], [total] * len(batch),
+                                    [((0, total),)] * len(batch),
+                                    [int(arena.slot_ptr(int(slots[b[0]]))) for b in batch], fsync,
+                                    direct=direct, direct_counts=_dc,
+                                )
+                            except TypeError:   # a pageio double without the S36 keywords
+                                statuses = pio.write_pages(
+                                    [b[2] for b in batch], [total] * len(batch),
+                                    [((0, total),)] * len(batch),
+                                    [int(arena.slot_ptr(int(slots[b[0]]))) for b in batch], fsync,
+                                )
+                            tot["direct_extents"] += int(sum(_dc))
                             for (i, stem, _path), st in zip(batch, statuses):
                                 if st in (0, 2):
                                     self._evictor.commit(stem)
@@ -3987,7 +4031,8 @@ class HiCacheFile(HiCacheStorage):
                     "arenas=%d complete=%d new=%d on_disk=%d pending=%d refused=%d "
                     "unpaired=%d paused=%s written_total=%d budget=%s slice_ms=%.0f slices=%d "
                     "slice_max_ms=%.1f slice_max_stems=%d stat_ms=%.1f stat_cpu_ms=%.1f "
-                    "pair_ms=%.1f deferred=%d cont=%d sliced_total=%d (L2 pages copied to the "
+                    "pair_ms=%.1f deferred=%d cont=%d sliced_total=%d direct_extents=%d "
+                    "read_yield_ms=%.1f (L2 pages copied to the "
                     "persistent L3 without a free; budget=hit: the pass stopped at a slice edge "
                     "and continues after the yield, deferred stems are NOT dropped)",
                     n, tot["written"], tot["bytes"], tot["ms"], tot["cpu_ms"],
@@ -3998,6 +4043,7 @@ class HiCacheFile(HiCacheStorage):
                     slice_s * 1e3, tot["slices"], tot["slice_max_ms"], tot["slice_max_stems"],
                     tot["stat_ms"], tot["stat_cpu_ms"], tot["pair_ms"], tot["deferred"],
                     int(bool(cont)), getattr(self, "_l3wb_sliced_n", 0),
+                    int(tot.get("direct_extents", 0)), float(tot.get("read_yield_ms", 0.0)),
                 )
         return tot
 
@@ -4039,20 +4085,21 @@ class HiCacheFile(HiCacheStorage):
         return False
 
     def arena_fill_from_disk(self, arena, stems, total_bytes: int, prefix: bool = False,
-                             room_wait: bool = True, take_ref: bool = False):
+                             room_wait: bool = True, take_ref: bool = False, durchlauf: bool = False):
         """The L3 -> L2 fill (see ``_arena_fill_from_disk_impl``); S23: this thread's live claims are registered for the
-        run of the fill, so a sibling io thread's SELF-JOIN never takes them over."""
+        run of the fill, so a sibling io thread's SELF-JOIN never takes them over. S36 ``durchlauf=True`` (the KV
+        store read): a stem the FULL arena cannot take is answered ``kv_durchlauf.DURCHLAUF`` instead of waiting."""
         _prev = getattr(_FILL_TL, "active", False)
         _FILL_TL.active = True
         try:
             return self._arena_fill_from_disk_impl(arena, stems, total_bytes, prefix=prefix, room_wait=room_wait,
-                                                   take_ref=take_ref)
+                                                   take_ref=take_ref, durchlauf=durchlauf)
         finally:
             _FILL_TL.active = _prev
             _fill_live_drop_thread()
 
     def _arena_fill_from_disk_impl(self, arena, stems, total_bytes: int, prefix: bool = False,
-                                   room_wait: bool = True, take_ref: bool = False):
+                                   room_wait: bool = True, take_ref: bool = False, durchlauf: bool = False):
         """#1433: the L3 -> L2 return path. For every stem that is NOT in the
         arena but IS on disk: claim a slot, read the whole canonical page from
         the disk store straight into the slot, complete it. Returns one entry
@@ -4201,6 +4248,23 @@ class HiCacheFile(HiCacheStorage):
                 todo = [t for t in todo if t[0] < _hard]
         stats = {"filled": 0, "todo": 0, "threads": 0}
         self._arena_fill_read_todo(arena, todo, int(total_bytes), out, stats)
+        if still_full and durchlauf:
+            # S36 KV-DURCHLAUF (user 18.10.: "wenn im L2 zu wenig platz ist, warum wird dann nicht L3 genommen?"):
+            # the arena is FULL for these stems after the immediate eviction -- they are NOT waited for, they are
+            # delivered as disk pages (read through into the device at the load). One rule for every rank
+            # (kv_durchlauf.durchlauf_stems); nothing below waits on them.
+            from sglang.srt.weg2 import kv_durchlauf as _kd
+
+            _dl = set(_kd.durchlauf_stems(still_full, on_disk))
+            if _dl:
+                for i, _st in still_full:
+                    if int(i) in _dl:
+                        if isinstance(out, _RefOnLand):
+                            _RefOnLand.__setitem__(out, int(i), _kd.DURCHLAUF)
+                        else:
+                            out[int(i)] = _kd.DURCHLAUF
+                still_full = [(i, st) for i, st in still_full if int(i) not in _dl]
+                stats["durchlauf"] = len(_dl)
         if still_full and room_wait:
             # ROOM-WAIT (NF h8 2b27c61d48, P PP0 12:04:14, weg2-0-10, 1853
             # pages in the store, 884 read): ten boot-start reads filled the
@@ -4530,15 +4594,21 @@ class HiCacheFile(HiCacheStorage):
                 except Exception:  # noqa: BLE001 - a witness never breaks a read
                     pass
 
-        if not callable(touch):
-            return l3_read_pages_parallel(pio, paths, total_bytes, ptrs)
-        _touch()
-        _L3_PROGRESS.cb = _touch
+        from sglang.srt.mem_cache import l3_write_behind as _wb
+
+        _wb.read_enter()   # S36: the read has priority over the L2 -> L3 write-behind
         try:
-            return l3_read_pages_parallel(pio, paths, total_bytes, ptrs)
-        finally:
-            _L3_PROGRESS.cb = None
+            if not callable(touch):
+                return l3_read_pages_parallel(pio, paths, total_bytes, ptrs)
             _touch()
+            _L3_PROGRESS.cb = _touch
+            try:
+                return l3_read_pages_parallel(pio, paths, total_bytes, ptrs)
+            finally:
+                _L3_PROGRESS.cb = None
+                _touch()
+        finally:
+            _wb.read_exit()
 
     def _arena_fill_read_todo(self, arena, todo, total_bytes: int, out, stats) -> None:
         """#1433: read this fill's OWN claims from disk into their slots and
@@ -5988,6 +6058,22 @@ class HiCacheFile(HiCacheStorage):
                 except Exception:  # noqa: BLE001 - fall back to the copy path
                     logger.warning("#1427 arena resolve failed for %s", transfer.name, exc_info=True)
                     pre = None
+            # S36 KV-DURCHLAUF: a KV-indexed page whose KV row is a DISK id (the arena was full, the KV page is read
+            # through from L3 at the load) has no host row in this pool either: the QSA index sidecar is held open
+            # for the load (or found in its arena) -- a hit; any other pool: a miss, never a copy into a row that
+            # does not exist. Write side: the page is in the store already.
+            if _kv_dl.any_disk(host_indices):
+                pre = list(pre) if pre is not None else [None] * len(keys)
+                for i, k in enumerate(keys):
+                    idx = int(host_indices[i * page_size])
+                    if idx < _kv_dl.DISK_BASE or pre[i] is not None:
+                        continue
+                    if not is_read:
+                        pre[i] = True
+                    elif str(transfer.name) == str(PoolName.QSA_INDEXER):
+                        pre[i] = self._kv_dl_attach_qsa(transfer.name, k, idx, page_size)
+                    else:
+                        pre[i] = False
             # #1427e: a placeholder or arena id is never a row the per-key copy
             # can land in -- on the READ side that is a miss (False), on the
             # write side the page is in the store already (True); the raise
@@ -6015,6 +6101,31 @@ class HiCacheFile(HiCacheStorage):
                     continue
             results[transfer.name] = [_one(i, key) for i, key in enumerate(keys)]
         return results
+
+    def _kv_dl_attach_qsa(self, pool_name, key: str, idx: int, page_size: int) -> bool:
+        """S36: the QSA index of a KV disk page -- its L3 file held open in the disk page's registry entry, or its
+        QSA arena slot COMPLETE (read through the backend at the load); False = a QSA miss (the read's QSA hit
+        pages end here, as for an arena page)."""
+        d = (int(idx) - _kv_dl.disk_base(page_size)) // max(1, int(page_size))
+        lk = self._log_key(pool_name, key)
+        stem = self._get_suffixed_key(lk)
+        path = None
+        try:
+            if self._stem_exists(stem):
+                path = self._existing_path(stem)
+        except Exception:  # noqa: BLE001 - no stat, no file
+            path = None
+        in_arena = False
+        if path is None:
+            try:
+                win = getattr(self, "canonical_qsa_page", None)
+                arena = (getattr(self, "_arenas", None) or {}).get(int(win.total_bytes)) if win is not None else None
+                if arena is not None:
+                    sl, stt = arena.find_slots_np([stem])
+                    in_arena = int(sl[0]) >= 0 and int(stt[0]) == 2
+            except Exception:  # noqa: BLE001
+                in_arena = False
+        return _kv_dl.REGISTRY.attach_qsa(d, path, in_arena)
 
     def _extra_page_spec(self, pool_name, host_pool):
         """(numel, dtype) of one flat page of this extra pool -- probed once
