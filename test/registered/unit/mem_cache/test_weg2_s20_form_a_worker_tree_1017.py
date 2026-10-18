@@ -32,6 +32,18 @@ m = H.m
 pytestmark = pytest.mark.skipif(m is None, reason="needs form_a_host_shadow")
 
 
+@pytest.fixture(autouse=True)
+def _clean():
+    """``attach`` calls read_room.serve_at_broadcast -> ``form_a_role()``, which caches the role for a second: left
+    behind it turns a later test's plain PP tree into a Form A host (the h16t F1 room-set tests went red in one
+    process). Reset around every test."""
+    from sglang.srt.weg2 import read_room as _rr
+
+    _rr.reset_for_tests()
+    yield
+    _rr.reset_for_tests()
+
+
 @contextlib.contextmanager
 def _as_rank_untreed(rank):
     """H._as_rank without ``m._S.tree = rank``: the process state of this rank as the boot has it before any
