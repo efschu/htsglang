@@ -554,11 +554,16 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
             "speculative decoding."
         )
 
-    if server_args.enable_mixed_chunk:
+    # Mixed steps degrade running requests to a plain 1-token decode (SGLang PR #36933).
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    algo = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
+    if server_args.enable_mixed_chunk and not algo.supports_mixed_chunk():
         server_args.enable_mixed_chunk = False
         logger.warning(
-            "Mixed chunked prefill is disabled because of using "
-            "eagle speculative decoding."
+            "Mixed chunked prefill is disabled: %s speculative decoding does "
+            "not support it.",
+            server_args.speculative_algorithm,
         )
 
     model_arch = server_args.get_model_config().hf_config.architectures[0]

@@ -3512,6 +3512,23 @@ class Scheduler(
             self.chunked_prefill_size is not None
             and self.server_args.enable_mixed_chunk
         )
+        # MIXED-D (S32, user 18.10.): on the Weg-2 D group (tp_prefill_max_tokens = X > 0) the upstream mixed-chunk
+        # path (SGLang PR #36933, EAGLE ok) is armed by default, but only for SHORT prefill batches (the gate in
+        # _get_new_batch_prefill_raw, weg2/mixed_d_short.py). SGLANG_WEG2_MIXED_D_SHORT=0 = off.
+        from sglang.srt.weg2 import mixed_d_short as _mds
+
+        self._mixed_d_short = bool(
+            self.chunked_prefill_size is not None
+            and _mds.enabled()
+            and int(getattr(self.server_args, "tp_prefill_max_tokens", 0) or 0) > 0
+            and (self.spec_algorithm.is_none() or self.spec_algorithm.supports_mixed_chunk())
+            and not any(
+                getattr(self.server_args, n, False)
+                for n in ("enable_kv_session_offload", "weightless_kv_fastlane")
+            )
+        )
+        if self._mixed_d_short:
+            self.is_mixed_chunk = True
 
         # --p-chunk-policy (weg2/p_chunk_policy.py, 25.09.): the P group's
         # per-request chunk plan. None unless the launcher handed this rank
@@ -18551,6 +18568,9 @@ class Scheduler(
         # the final chunk of a resumed one look like a middle chunk). Every other continuation is counted exactly as before.
         if self.chunked_req is not None and not _lanes_p.held_without_seat(self.chunked_req, can_run_list):
             self.chunked_req.inflight_middle_chunks += 1
+            # MIXED-D: lifetime-sticky. A request that has ever been chunked is a BIG prefill; its last
+            # chunk (small by construction) must not read as a short one (R6 rest stays unmixed).
+            self.chunked_req._mixed_d_was_chunked = True
 
         # fnFL2 H42: this pass's anchor bodies join the carried tails; every
         # tail IN this batch takes its middle-chunk increment (no output until
@@ -18697,13 +18717,22 @@ class Scheduler(
         )
 
         # Mixed-style chunked prefill
-        if (
-            self.is_mixed_chunk
-            and not running_batch.is_empty()
-            and not (new_batch.return_logprob or running_batch.return_logprob)
-            # mix_with_running cats input_ids but not input_embeds — shapes would mismatch
-            and new_batch.input_embeds is None
-        ):
+        # MIXED-D (S32): on D the same machinery runs for SHORT prefill batches only; the verdict is
+        # the group MIN (R11), computed whenever the replicated precondition holds so every rank
+        # enters the collective on the same pass.
+        _mix_local_ok = not (
+            new_batch.return_logprob or running_batch.return_logprob
+        ) and new_batch.input_embeds is None
+        if self._mixed_d_short:
+            # D short mode: the verdict is collective, entered on the replicated precondition
+            _do_mix = not running_batch.is_empty() and self._mixed_d_agreed(
+                new_batch, running_batch, _mix_local_ok
+            )
+        else:
+            _do_mix = (
+                self.is_mixed_chunk and not running_batch.is_empty() and _mix_local_ok
+            )
+        if _do_mix:
             # TODO (lianmin): support return_logprob + mixed chunked prefill
             running_batch.filter_batch()
             if not running_batch.is_empty():
@@ -18719,6 +18748,22 @@ class Scheduler(
             new_batch.decoding_reqs = None
 
         return new_batch, running_batch
+
+    def _mixed_d_agreed(self, new_batch, running_batch, local_ok: bool) -> bool:
+        """MIXED-D gate (S32): the short verdict, MIN-reduced over the TP cpu group (R11: no rank-local batch shape)."""
+        from sglang.srt.weg2 import mixed_d_short as _mds
+
+        x = int(_weg2_store_short_tail_x(self))
+        frac = float(envs.SGLANG_WEG2_HALF_X_FRAC.get())
+        u = int(getattr(new_batch, "extend_num_tokens", 0) or 0)
+        chunked = self.chunked_req is not None or any(
+            getattr(r, "_mixed_d_was_chunked", False) for r in new_batch.reqs
+        )
+        mine = local_ok and _mds.short_gate(u, x, frac, chunked)
+        agreed = bool(self._weg2_group_min_flags([mine])[0])
+        if agreed:
+            _mds.note_mixed(u, len(running_batch.reqs), x, frac)
+        return agreed
 
     def _can_schedule_lora_req(
         self, req: Req, running_loras: set[Optional[str]]

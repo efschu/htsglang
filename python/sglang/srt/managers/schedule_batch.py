@@ -3334,6 +3334,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Staging consumed by resolve_forward_inputs (prefill H2D / mixed gather).
     prefill_input_ids_cpu: Optional[torch.Tensor] = None
     mix_running_indices: Optional[torch.Tensor] = None
+    # CPU twin of mix_running_indices; lets the overlap tail resolve gather
+    # pinned mirrors without a device sync (SGLang PR #36933).
+    mix_running_indices_cpu: Optional[torch.Tensor] = None
     input_embeds: torch.Tensor = None  # shape: [b, hidden_size], float32
 
     # Token replacement embeddings and absolute positions (optional).
@@ -4473,13 +4476,81 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Decode tokens of the running portion live in future_map.output_tokens_buf.
         self.input_ids = None
         self.mix_running_indices = running_batch.req_pool_indices
-        out_cache_loc = torch.cat([self.out_cache_loc, running_batch.out_cache_loc])
+        self.mix_running_indices_cpu = running_batch.req_pool_indices_cpu
+        spec_mix = not self.spec_algorithm.is_none()
+        if spec_mix:
+            # MIXED-D / SGLang PR #36933: spec keeps no per-step out_cache_loc on the
+            # running batch; gather each tail's bonus slot at the committed length
+            # (rebound at forward entry under overlap, FutureMap.resolve_mixed_spec_tails).
+            # The tails' draft state is DROPPED by design (the mixed batch's draft
+            # extend re-seeds it), so a one-sided EagleDraftInput must not reach
+            # merge_batch's refusal.
+            running_batch.spec_info = None
+            tail_base = torch.tensor(
+                [r.seqlen - 1 for r in running_batch.reqs],
+                dtype=torch.int64,
+                device=self.seq_lens.device,
+            )
+            running_out_cache_loc = self.req_to_token_pool.req_to_token[
+                running_batch.req_pool_indices.long(),
+                tail_base,
+            ].to(self.out_cache_loc.dtype)
+            # The spec relay is unresolved at schedule time, so merge_batch would
+            # null seq_lens_cpu; rebuild the tails from request state.
+            running_seq_lens_cpu = torch.tensor(
+                [int(r.seqlen) for r in running_batch.reqs], dtype=torch.int64
+            )
+            if self.seq_lens_cpu is None:
+                merged_seq_lens_cpu = running_seq_lens_cpu
+            else:
+                merged_seq_lens_cpu = torch.cat(
+                    [self.seq_lens_cpu, running_seq_lens_cpu]
+                )
+        else:
+            # Non-spec: the running batch carries prepared seq_lens_cpu
+            # (r.seqlen lags it under overlap); merge_batch concats it.
+            tail_base = None
+            running_out_cache_loc = running_batch.out_cache_loc
+            merged_seq_lens_cpu = None
+        out_cache_loc = torch.cat([self.out_cache_loc, running_out_cache_loc])
 
+        # MIXED-D: merge_batch nulls the mamba track fields. The prefill rows' track
+        # (mask / slot / seqlen, set by prepare_for_extend) is what makes their mamba
+        # snapshot land where maybe_cache_unfinished_req expects it; dropping it would
+        # cache a stale recurrent state. Keep the prefill rows' entries and pad the
+        # tail rows with "no tracking" (mask False, slot 0, seqlen 0).
+        _mt = (
+            self.mamba_track_indices,
+            self.mamba_track_mask,
+            self.mamba_track_seqlens,
+        )
         self.merge_batch(running_batch)
         self.out_cache_loc = out_cache_loc
+        if all(t is not None for t in _mt):
+            self.mamba_track_indices = torch.cat(
+                [_mt[0], torch.zeros(running_bs, dtype=_mt[0].dtype, device=_mt[0].device)]
+            )
+            self.mamba_track_mask = torch.cat(
+                [_mt[1], torch.zeros(running_bs, dtype=_mt[1].dtype, device=_mt[1].device)]
+            )
+            self.mamba_track_seqlens = torch.cat(
+                [_mt[2], torch.zeros(running_bs, dtype=_mt[2].dtype, device=_mt[2].device)]
+            )
+        if merged_seq_lens_cpu is not None:
+            self.seq_lens_cpu = merged_seq_lens_cpu
+        if tail_base is not None:
+            # Spec seq_lens sit at the committed base (bonus token pending); this
+            # step commits it, so tails carry base + 1 or attention drops the row.
+            merged = self.seq_lens.clone()
+            merged[-running_bs:] = tail_base + 1
+            self.seq_lens = merged
 
-        # For overlap scheduler, the output_ids has one step delay
-        delta = 0 if self.enable_overlap else -1
+        # For overlap scheduler, the output_ids has one step delay;
+        # spec tail request state carries no delay in either mode.
+        if spec_mix:
+            delta = -1
+        else:
+            delta = 0 if self.enable_overlap else -1
 
         # NOTE: prefix_indices is what has been cached, but we don't cache each decode step
         self.prefix_lens.extend(
