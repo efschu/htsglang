@@ -246,6 +246,7 @@ from flliper.srt.pdflip import resume_via_p as _pdflip_rvp  # RESUME-VIA-P
 from flliper.srt.pdflip import front_x as _pdflip_front_x  # FRONT-X-MIT: the front's decision X at D's X gate
 from flliper.srt.pdflip import d_wall_head as _pdflip_d_wall_head  # PW-R
 from flliper.srt.pdflip import d_head_hold as _pdflip_d_head_hold  # DQH
+from flliper.srt.pdflip import head_vote_hold as _pdflip_head_vote_hold  # S42
 from flliper.srt.pdflip import progress_beacon as _pdflip_beacon  # FP forward-progress beacon
 from flliper.srt.pdflip.d_lead_probe import build_d_lead_probe  # D-LEAD-MS-1007
 from flliper.srt.pdflip.vision_verdict import PdFlipVisionVerdict  # H125f vision verdict on the chain
@@ -5224,12 +5225,31 @@ class Scheduler(
         """DQH: what the held head's verdict reads (replicated values).
         ``prefetch_verdicts`` is this iteration's drain memo as the pass found
         it (the pass consumes it, so the caller reads it before the pass)."""
+        try:
+            from flliper.srt.mem_cache.hicache_phase_binding import current_generation
+
+            gen = int(current_generation())
+        except Exception:  # noqa: BLE001 - no binding: a constant term, the rest decides
+            gen = None
         return _pdflip_d_head_hold.fingerprint(
             hol_state=self.__dict__.get("_pdflip_hol"),
             waiting=self.waiting_queue,
             running=running_batch.reqs if running_batch is not None else (),
             prefetch_verdicts=prefetch_verdicts,
             continuation=self.chunked_req is not None or bool(getattr(self, "anchor_tails", None)),
+            generation=gen,
+        )
+
+    def _pdflip_dqh_holds(self, running_batch) -> bool:
+        """DQH in the elif chain. S42 (pdflip/head_vote_hold.py): the budget site
+        of this iteration already took the decision -- and abstained from the
+        head vote when it held -- so its answer is consumed, not asked again;
+        without one (single rank, offload path) DQH decides here as before."""
+        pre = _pdflip_head_vote_hold.take(self)
+        if pre is not None:
+            return pre
+        return self.pdflip_d_head_hold.should_hold(
+            self._pdflip_d_head_fingerprint(running_batch, self.__dict__.get("_pass_prefetch_verdicts"))
         )
 
     def init_parked_decode_set(self) -> None:
@@ -11033,7 +11053,20 @@ class Scheduler(
         # be a snapshot the gate can actually see. Nothing between the old
         # site and this one takes a collective or reads the head vote, so the
         # move is the whole of the fix on this side.
-        _head_canonical, _head_local_matches = self._local_head_prefix_matches()
+        # S42 HEAD-VOTE HOLD (pdflip/head_vote_hold.py): the vote's only reader
+        # is this iteration's admission pass. When DQH holds that pass (decided
+        # HERE, once, after the drain whose verdicts its fingerprint reads; the
+        # elif chain consumes the same decision), every head arm abstains with
+        # its MIN-neutral value -- no match walk, no probe, no store or
+        # completion vote. rc11 14:13 (6 waiting): sched_ms 56.9 per decode
+        # round, all of it this vote on held passes. Group-uniform: DQH's
+        # inputs are replicated; a lone abstention MIN-reduces to ABSENT, i.e.
+        # the head is delayed, the collective count is unchanged.
+        _s42_held = _pdflip_head_vote_hold.decide(self, running_batch, _ballot_verdicts)
+        if _s42_held:
+            _head_canonical, _head_local_matches = [], {}
+        else:
+            _head_canonical, _head_local_matches = self._local_head_prefix_matches()
         # #823 W9b: the canonical head is no longer published as its own
         # attribute -- it goes into the single verdict value below, together
         # with the two numbers this reduce is about to produce, so the four
@@ -11050,8 +11083,11 @@ class Scheduler(
         # the ballot is indexed by QUEUE ORDER while the X gate reads the
         # canonical head. No new collective (MUST NOT 6).
         _xpend_at = len(vals)
+        # S42: a held pass does not touch the pending stamps (an empty head
+        # would DROP them and restart the wait); the age keeps running.
         vals = vals + tp_head_congruence.build_x_pending_payload(
-            _head_canonical, self._pdflip_local_store_read_pending_ages(_head_canonical)
+            _head_canonical,
+            {} if _s42_held else self._pdflip_local_store_read_pending_ages(_head_canonical),
         )
         # #1317 DESIGN A: THE STORE-PRICED MATCH ARM, third consumer of this
         # same reduce (after ORDER and COMPLETION), on the SAME canonical head.
@@ -11063,7 +11099,8 @@ class Scheduler(
         # the tree AND not in the store". No new collective (MUST NOT 6).
         _xstore_at = len(vals)
         vals = vals + tp_head_congruence.build_x_store_match_payload(
-            _head_canonical, self._pdflip_local_store_matches(_head_canonical)
+            _head_canonical,
+            {} if _s42_held else self._pdflip_local_store_matches(_head_canonical),
         )
         # RU (nf_rank_divergence): THE USABLE-MATCH ARM, fourth consumer of this
         # same reduce, on the SAME canonical head. The order arm votes the
@@ -11076,7 +11113,7 @@ class Scheduler(
         # No new collective (MUST NOT 6).
         _usable_at = len(vals)
         _usable_by_rid = {req.rid: req for req in self.waiting_queue}
-        _usable_local = tp_match_floor.local_usable_matches(
+        _usable_local = {} if _s42_held else tp_match_floor.local_usable_matches(
             getattr(self, "tree_cache", None), _usable_by_rid, _head_local_matches
         )
         vals = vals + tp_match_floor.build_usable_match_payload(
@@ -12727,7 +12764,12 @@ class Scheduler(
         # count stays rank-uniform no matter which branch is taken later.
         # W-SEAT: the COUNT vote reads THIS pass's running batch -- the merge
         # above may have rebound it away from `self.running_batch`.
+        # S42 (pdflip/head_vote_hold.py): this budget site is followed by the
+        # elif chain below, so it may take DQH's decision for this iteration
+        # and abstain from the head vote on a held pass.
+        _pdflip_head_vote_hold.arm(self)
         self._update_uniform_pool_budget(running_batch)
+        _pdflip_head_vote_hold.disarm(self)
 
         # #583 collective census. Same placement argument as the reduce above:
         # every rank reaches this line exactly once per iteration, so the
@@ -13129,13 +13171,13 @@ class Scheduler(
             # this decode round before the next extend (rank-uniform)
             new_batch = None
             self._admission_decline_note = "gate=pdflip_skip_first_decode"
-        elif self.pdflip_d_head_hold.should_hold(
-            self._pdflip_d_head_fingerprint(running_batch, self.__dict__.get("_pass_prefetch_verdicts"))
-        ):
+        elif self._pdflip_dqh_holds(running_batch):
             # DQH (pdflip/d_head_hold.py): the refused D head and everything its
             # verdict reads are unchanged -- no pass this round (replicated
             # inputs, same iterations on every rank). The SEAT-AGE pass count
             # moves as if the pass ran, so a refusal view ages honestly.
+            # S42: the decision is the budget site's when it took one (the
+            # head vote abstained there), so a held vote is never read.
             new_batch = None
             self._pdflip_sa_pass = getattr(self, "_pdflip_sa_pass", 0) + 1
             self._admission_decline_note = "gate=pdflip_d_head_hold"

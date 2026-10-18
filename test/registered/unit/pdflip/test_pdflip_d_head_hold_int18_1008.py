@@ -92,12 +92,14 @@ class DHeadHoldTest(unittest.TestCase):
         from flliper.srt.managers.scheduler import Scheduler
 
         src = inspect.getsource(Scheduler.get_next_batch_to_run)
-        i_gate = src.index("self.pdflip_d_head_hold.should_hold(")
+        # S42: the chain consumes the budget site's DQH decision of the iteration
+        # (pdflip/head_vote_hold.py) and asks DQH itself only without one
+        i_gate = src.index("elif self._pdflip_dqh_holds(running_batch):")
         i_pass = src.index("prefill_plan = self.get_new_batch_prefill(running_batch)")
         i_note = src.index("self.pdflip_d_head_hold.note_pass(")
         self.assertLess(i_gate, i_pass)
         self.assertLess(i_pass, i_note)
-        self.assertIn("elif self.pdflip_d_head_hold.should_hold(", src)
+        self.assertIn("self.pdflip_d_head_hold.should_hold(", inspect.getsource(Scheduler._pdflip_dqh_holds))
 
 
 if __name__ == "__main__":
