@@ -16975,6 +16975,34 @@
    ],
    "type": "bool"
   },
+  "--no-p-hostgap": {
+   "bare": true,
+   "choices": null,
+   "cost": "",
+   "default": null,
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "Group P: turn the #PGAP instrument (--p-hostgap, on by default since rc14) off -- FLLIPER_PDFLIP_P_HOSTGAP is not set.",
+   "id": "--no-p-hostgap",
+   "kind": "flag",
+   "level": "expert",
+   "name": "--no-p-hostgap",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "pdflip/launcher.py",
+    "kind": "argparse",
+    "line": 23739,
+    "tree": "nf"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "bool"
+  },
   "--no-p-trim-end-anchor": {
    "bare": true,
    "choices": null,
@@ -18273,6 +18301,26 @@
    "type": "bool"
   },
   "--p-hostgap": {
+   "abweichung": {
+    "27b": {
+     "default": null,
+     "help": "Group P: the #PGAP instrument (FLLIPER_PDFLIP_P_HOSTGAP=1) -- one line per forward with the card's idle before it (timing events on the forward stream, harvested without a sync) and the host phases since the previous launch. For the --p-host-overlap A/B; default off.",
+     "source": {
+      "file": "pdflip/launcher.py",
+      "kind": "argparse",
+      "line": 24434
+     }
+    },
+    "nf": {
+     "default": true,
+     "help": "Group P: the #PGAP instrument (FLLIPER_PDFLIP_P_HOSTGAP=1) -- one line per forward with the card's idle before it (timing events on the forward stream, harvested without a sync) and the host phases since the previous launch. For the --p-host-overlap A/B. DEFAULT ON since rc14 (NF 1018: the P pauses -- PP0 duty, card idle per chunk -- are the open class the next boot must measure; S43's metal check reads '#PGAP ... overlap=1'). Changes no decision. --no-p-hostgap = no #PGAP lines, env without the variable.",
+     "source": {
+      "file": "pdflip/launcher.py",
+      "kind": "argparse",
+      "line": 23728
+     }
+    }
+   },
    "bare": true,
    "choices": null,
    "cost": "Small overhead; an instrument, changes no decision.",
@@ -89664,28 +89712,28 @@
  "schema": "flliper.catalog/1",
  "stats": {
   "curated": 125,
-  "entries": 2827,
+  "entries": 2828,
   "envs": 1949,
   "explained": 310,
-  "flags": 863,
-  "harvested": 1738,
+  "flags": 864,
+  "harvested": 1739,
   "trees": {
-   "abweichung": 50,
+   "abweichung": 51,
    "beide": 2463,
    "nur_27b": 180,
-   "nur_nf": 166
+   "nur_nf": 167
   },
   "unexplained": 654
  },
- "tree_rev": "27b=0798c91fcd+nf=rc14-merge",
+ "tree_rev": "27b=0798c91fcd+nf=2be8ad0339",
  "trees": {
   "27b": {
    "entries": 2643,
    "rev": "0798c91fcd"
   },
   "nf": {
-   "entries": 2629,
-   "rev": "rc14-merge"
+   "entries": 2630,
+   "rev": "2be8ad0339"
   }
  },
  "warnungen": []
