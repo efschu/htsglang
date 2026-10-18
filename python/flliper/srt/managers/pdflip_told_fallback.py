@@ -944,6 +944,7 @@ def pp0_floor_below(scheduler, rid: str, req, below: int, absolute: bool) -> int
         from flliper.srt.managers import pdflip_told_fidelity as _tf
     except Exception:  # noqa: BLE001
         return 0
+    reads_left = _tf_anchor_read_budget()
     for d in common_depths(o):
         if d >= int(below):
             continue
@@ -951,7 +952,52 @@ def pp0_floor_below(scheduler, rid: str, req, below: int, absolute: bool) -> int
         own = _tf.pp0_admissible(scheduler, req, depth)
         if own is not None and int(own) >= depth:
             return int(d)
+        if own is not None and reads_left > 0:
+            # S43 TF-ANCHOR-READ: every follower proved ``d``; PP0's tree holds
+            # the KV there but its Mamba anchor only in the store -> read just
+            # the blob (e1 at this depth) and ask PP0's tree again. PP0 alone
+            # decides, the followers move nothing (SOLL R11).
+            reads_left -= 1
+            got = _tf_anchor_read(scheduler, req, depth)
+            if got > 0:
+                own2 = _tf.pp0_admissible(scheduler, req, depth)
+                k = _bump(scheduler, "_pf_tf_anchor_read_n")
+                if _say(k) or (own2 is not None and int(own2) >= depth):
+                    logger.warning(
+                        "S43 TF-ANCHOR-READ rid=%s depth=%d below=%d own_before=%d own_after=%s (n=%d): PP0's tree "
+                        "held the KV at a depth every follower proved, its Mamba anchor only in the store -- the "
+                        "blob was read so PP0 resumes there", str(rid), int(depth), int(below), int(own),
+                        own2, k)
+                if own2 is not None and int(own2) >= depth:
+                    return int(d)
     return 0
+
+
+def _tf_anchor_read_budget() -> int:
+    """S43: anchor reads one floor search may spend (0 = the switch is off)."""
+    try:
+        from flliper.srt.environ import envs as _envs
+
+        if not _envs.FLLIPER_PDFLIP_TF_ANCHOR_READ.get():
+            return 0
+        return max(0, int(_envs.FLLIPER_PDFLIP_TF_ANCHOR_READ_MAX.get()))
+    except Exception:  # noqa: BLE001 - an unreadable switch reads nothing
+        return 0
+
+
+def _tf_anchor_read(scheduler, req, depth: int) -> int:
+    """S43: PP0's tree reads the Mamba anchor blob of the node at ``depth``
+    (``UnifiedRadixCache.pdflip_anchor_only_read_at``); 0 when the tree has no
+    such reader or nothing was attached. Never raises."""
+    fn = getattr(getattr(scheduler, "tree_cache", None), "pdflip_anchor_only_read_at", None)
+    if not callable(fn):
+        return 0
+    try:
+        return int(fn(req, int(depth), site="tf_floor") or 0)
+    except Exception:  # noqa: BLE001 - a failed read leaves the floor where it was
+        logger.warning("S43 TF-ANCHOR-READ failed rid=%s depth=%d", getattr(req, "rid", "?"), int(depth),
+                       exc_info=True)
+        return 0
 
 
 def _frist_due(scheduler, rid: str, o: _Open, now: float, pass_n: Optional[int]) -> bool:

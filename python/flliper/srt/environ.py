@@ -2607,6 +2607,16 @@ class Envs:
     # the GDN-holding rank reads only that anchor blob and attaches it as the
     # node's host Mamba value (MAMBA-HOST-RESUME). 0 = off.
     FLLIPER_PDFLIP_ANCHOR_ONLY_READ = EnvBool(True)
+    # S43 TF-ANCHOR-READ (NF rc12 1018 16:39:16, pdflip-3-186): PP0's
+    # TOLD-FIDELITY floor search reads the Mamba anchor blob of a depth every
+    # follower proved when PP0's tree holds the KV there but its anchor only
+    # in the store (dropped from the arena to L3) -- instead of falling to a
+    # shallow floor and recomputing ~90k tokens. PP0's one verdict for every
+    # rank (SOLL R11). 0 = off.
+    FLLIPER_PDFLIP_TF_ANCHOR_READ = EnvBool(True)
+    # S43: at most this many anchor reads per TF floor search (each one blob,
+    # arena in place or one L3 fill on the scheduler thread).
+    FLLIPER_PDFLIP_TF_ANCHOR_READ_MAX = EnvInt(3)
     # Per-request mamba checkpoint diagnostics: log match length, resume
     # length, checkpoint node/slot and cache-insert positions so a
     # nondeterministic resume (or a checkpoint at a wrong position) can be
