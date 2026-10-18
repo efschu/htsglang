@@ -252,3 +252,90 @@ def test_s39_a_tree_reset_drops_the_queue(roles):
     assert m._ST.queue
     R12.on_tree_reset(tp0)
     assert not m._ST.queue
+
+
+class _Arena:
+    slot_bytes = 64
+
+    def slot_stem(self, s):
+        return f"m{s}"
+
+
+class _Backend:
+    def __init__(self, on_disk, lost):
+        self.on_disk, self.lost, self.secured = set(on_disk), lost, []
+
+    def _stat_stems(self, stems):
+        return [s for s in stems if s in self.on_disk]
+
+    def arena_secure_to_disk(self, arena, items):
+        self.secured.extend(s for s, *_ in items)
+        if self.lost:
+            return {"on_disk": 0, "written": 0, "lost": len(items)}
+        return {"on_disk": 0, "written": len(items), "lost": 0}
+
+
+class _AnchorPool:
+    def __init__(self, backend):
+        self.arena, self._backend = _Arena(), backend
+
+    def settled_anchor_slots(self, hv):
+        return [int(x) for x in hv.tolist()]
+
+    def anchor_held(self, h):
+        return True
+
+
+def test_s39_a_host_anchor_below_gets_its_l3_copy_before_its_node_leaves(roles):
+    """Danger direction DATA LOSS: the child's host anchor (the next turn's resume state) leaves L2 only with an L3
+    copy -- a failed copy keeps the leaf and the child on both ranks; a written copy lets both go."""
+    tp0, worker = _rank(roles, "tp0"), _rank(roles, "worker")
+    for t in (tp0, worker):
+        t._t_child.component_data[MAMBA].host_value = torch.tensor([7], dtype=torch.int64)
+    be = _Backend(on_disk=(), lost=True)
+    tp0._weg2_mamba_pool = lambda: _AnchorPool(be)
+    _peel(roles, tp0), _peel(roles, worker)
+    _broadcast(roles, tp0, worker)
+    assert be.secured == [7], be.secured
+    for t in (tp0, worker):
+        assert _attached(t, t._t_nodes[1]) and _attached(t, t._t_child)
+    be.lost = False
+    _peel(roles, tp0)
+    _broadcast(roles, tp0, worker)
+    for t in (tp0, worker):
+        assert not _attached(t, t._t_nodes[1]) and not _attached(t, t._t_child)
+
+
+def test_s39_a_host_anchor_already_on_disk_is_not_written_again(roles):
+    tp0, worker = _rank(roles, "tp0"), _rank(roles, "worker")
+    for t in (tp0, worker):
+        t._t_child.component_data[MAMBA].host_value = torch.tensor([7], dtype=torch.int64)
+    be = _Backend(on_disk=("m7",), lost=True)
+    tp0._weg2_mamba_pool = lambda: _AnchorPool(be)
+    _peel(roles, tp0), _peel(roles, worker)
+    _broadcast(roles, tp0, worker)
+    assert be.secured == [] and not _attached(tp0, tp0._t_nodes[1]) and not _attached(worker, worker._t_nodes[1])
+
+
+def test_s39_tp0_never_drops_a_subtree_a_worker_holds_on_its_device(roles, monkeypatch):
+    """S22 (R12 SPILL-DIVERGED class): a host-only leaf of the subtree that a worker has device-resident is in the
+    workers' nodelete set -- TP0 leaves the whole drop alone (trees stay equal)."""
+    tp0, worker = _rank(roles, "tp0"), _rank(roles, "worker")
+    key = R12.node_key(tp0._t_child)
+    monkeypatch.setattr(R12, "worker_nodelete_keys", lambda tree: {key})
+    _peel(roles, tp0), _peel(roles, worker)
+    _broadcast(roles, tp0, worker)
+    for t in (tp0, worker):
+        assert _attached(t, t._t_nodes[1]) and _attached(t, t._t_child)
+
+
+def test_s39_the_broadcast_rechecks_the_store_copy(roles):
+    """Danger direction DATA LOSS: TP0 decides at its broadcast from the tree AS IT IS THEN -- a leaf whose store
+    mark was taken back since the peel queued it (K12 A2-orphan clears ``l3_present``) is never dropped."""
+    tp0, worker = _rank(roles, "tp0"), _rank(roles, "worker")
+    _peel(roles, tp0), _peel(roles, worker)
+    for t in (tp0, worker):
+        t._t_nodes[1].l3_present = False
+    _broadcast(roles, tp0, worker)
+    for t in (tp0, worker):
+        assert _attached(t, t._t_nodes[1]) and _attached(t, t._t_child)
