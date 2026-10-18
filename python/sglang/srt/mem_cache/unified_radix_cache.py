@@ -14108,6 +14108,25 @@ def _aux_components(tree) -> tuple:
     return tuple(c for c in comps if c.component_type != BASE_COMPONENT_TYPE)
 
 
+def _s25_mark_released_anchor_secured(tree, node) -> None:
+    """S25 (h16v5 03:46:05 node=378: ``AUX-HOST-WITH-FULL released=1`` by the W3 spill, 03:47:08 ANCHOR-LOST): the
+    spill gives the Full host copy up (the store holds the KV, ``l3_present``) and the tree law takes the Mamba host
+    anchor with it. Releasing the host anchor only drops the tree's reference (``MambaComponent.evict_component`` ->
+    ``free``); its arena slot stays COMPLETE under its page hash (a clock candidate that writes L3 first, #257) --
+    the state of a detached anchor-only copy. The node says so (``weg2_anchor_secured``), verified against the
+    arena/L3 (``anchor_held``; unknown or absent = no mark), so the K15 save and the flush find the anchor secured
+    instead of claiming a new mamba slot or tombstoning it. Host bookkeeping only; a worker has no mamba pool."""
+    try:
+        mp = tree._weg2_mamba_pool()
+        probe = getattr(mp, "anchor_held", None)
+        if not callable(probe) or not getattr(node, "hash_value", None):
+            return
+        if probe(node.hash_value[-1]):
+            node.weg2_anchor_secured = True
+    except Exception as exc:  # noqa: BLE001 - no mark = the old behaviour, named
+        logger.warning("S25 ANCHOR-SECURED probe after aux host release raised: %r", exc)
+
+
 def _evict_aux_host_before_full_host(tree, node, tracker) -> int:
     """y5h, the net under every "Full host copy leaves, the node stays on the
     device" path (W3 spill, PUBLISH-CHAIN host release, park_l3, the Form A
@@ -14131,6 +14150,8 @@ def _evict_aux_host_before_full_host(tree, node, tracker) -> int:
             continue
         tree._evict_component_and_detach_lru(node, comp, target=EvictLayer.HOST, tracker=tracker)
         n += 1
+        if ct == ComponentType.MAMBA:
+            _s25_mark_released_anchor_secured(tree, node)
     if n:
         k = getattr(UnifiedRadixCache, "_aux_host_with_full_n", 0) + 1
         UnifiedRadixCache._aux_host_with_full_n = k

@@ -105,3 +105,49 @@ def test_anchor_lost_line_names_l3_present(caplog):
     with caplog.at_level(logging.WARNING):
         _save(t, n)
     assert any("WEG2-ANCHOR-LOST at=evict" in m and "l3_present=False" in m for m in caplog.messages)
+
+
+# --- Teil 2: the W3 spill's aux release keeps the anchor findable (h16v5 03:46:05 node=378) ---
+
+from sglang.srt.mem_cache import unified_radix_cache as _urc  # noqa: E402
+
+
+def _spill_tree(held):
+    mamba_comp = types.SimpleNamespace(component_type=ComponentType.MAMBA)
+    t = types.SimpleNamespace(_components_tuple=(mamba_comp,))
+    t.released = []
+    t._evict_component_and_detach_lru = lambda node, comp, target=None, tracker=None: (
+        t.released.append(node.id), setattr(node.component_data[ComponentType.MAMBA], "host_value", None))
+    t._weg2_mamba_pool = lambda: types.SimpleNamespace(anchor_held=lambda h: held)
+    return t
+
+
+def _hosted_node():
+    n = _node(l3_present=True)
+    cd = n.component_data[ComponentType.MAMBA]
+    cd.host_value = object()
+    cd.host_lock_ref = 0
+    n.hash_value = [1, 2, 3]
+    return n
+
+
+def test_spill_release_of_the_host_anchor_marks_it_secured_when_the_slot_holds():
+    """RED before: the mark stayed False -> K15 claimed a new slot / tombstoned (ANCHOR-LOST node=378)."""
+    t, n = _spill_tree(True), _hosted_node()
+    assert _urc._evict_aux_host_before_full_host(t, n, None) == 1
+    assert n.weg2_anchor_secured is True
+    t2 = _tree()
+    assert _save(t2, n) is True and t2.calls == []        # nothing claimed, the anchor is held
+
+
+def test_spill_release_sets_no_mark_when_the_slot_is_gone_or_unknown():
+    for held in (False, None):
+        t, n = _spill_tree(held), _hosted_node()
+        _urc._evict_aux_host_before_full_host(t, n, None)
+        assert n.weg2_anchor_secured is False
+
+
+def test_save_after_an_unmarked_release_still_tries_anchor_only():
+    t2, n = _tree(), _hosted_node()
+    n.component_data[ComponentType.MAMBA].host_value = None
+    assert _save(t2, n) is True and t2.calls == ["anchor_only", "join"]
