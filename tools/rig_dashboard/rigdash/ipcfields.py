@@ -32,6 +32,8 @@ from typing import Dict, List, Optional
 from . import names as N
 
 RANKSTATS_SCHEMA = "pdflip.rankstats/1"
+#: both spellings (weg2.rankstats/1 of the old line, pdflip.rankstats/1 of fLLiper); carried from 19393ee2cb
+RANKSTATS_SCHEMAS = tuple(N.marker_variants(RANKSTATS_SCHEMA))
 RANKSTATE_SCHEMAS = (1, 2)
 
 #: the 25 rows of the inventory that were "Übergang" (order = the page's order)
