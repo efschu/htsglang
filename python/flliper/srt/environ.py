@@ -4569,6 +4569,17 @@ class Envs:
     # blanket park, no clock on the backfill. Needs
     # FLLIPER_PDFLIP_ENABLE_ARRIVAL_SEAT_RULE; 0 = the ARRIVAL-SEAT/#246 front.
     FLLIPER_PDFLIP_ENABLE_ARRIVAL_SEAT_AGE_PLAN = EnvBool(True)
+    # S46 F5 (NF 18.10.): an AGE PLAN to_d grant whose plan names younger victims goes to D although every front
+    # seat is held -- the seat is taken ON CREDIT (no semaphore permit; the next normal seat released passes its
+    # permit to it), so D's SEAT-AGE seat trigger sees the older request in its waiting queue and displaces the
+    # youngest. Off = the head waits at the front's seat semaphore until a seat frees by itself (rc12: 124 grants,
+    # p50 5.3 s, max 72 s there; D's seat trigger never saw them).
+    FLLIPER_PDFLIP_AGE_SEAT_ON_CREDIT = EnvBool(True)
+    # S46 F2-F4 (NF 18.10., SA #244 / PRIO=ALTER 14.10.): the seat ORDER of requests that rode a flip to P. F2: the D
+    # line re-picks by age when an older hand-off joined it during the seat wait; F3: a BATCH fall-through is queued
+    # at its age position (not behind younger ones); F4: while P is awake a younger hand-off does not take a seat
+    # before an older request still on P (D is asleep, nothing is lost). 0 = the line as before.
+    FLLIPER_PDFLIP_SEAT_ORDER_AFTER_FLIP = EnvBool(True)
     # ARRIVAL-SEAT MIN-DWELL (NF-Operator 30.09., y5c: pdflip-0-2 parked 6x by
     # flip_now, park 4 came 1.1 s after its resume): a flip_now to P waits
     # until the decodes this D phase RESUMED have decoded since their resume

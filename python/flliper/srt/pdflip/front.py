@@ -3908,13 +3908,16 @@ class Seat:
     seat twice and inflate D's concurrency past its own bs.
     """
 
-    __slots__ = ("front", "rid", "source", "held", "tokens", "t_taken")
+    __slots__ = ("front", "rid", "source", "held", "tokens", "t_taken", "on_credit")
 
-    def __init__(self, front: Front, rid: str, source: str, tokens: int = 0):
+    def __init__(self, front: Front, rid: str, source: str, tokens: int = 0, on_credit: bool = False):
         self.front = front
         self.rid = rid
         self.source = source
         self.held = True
+        # S46 F5: a seat taken WITHOUT a semaphore permit (an AGE PLAN head D makes room for); the next normal seat
+        # that is released passes its permit to it instead of returning it to the semaphore
+        self.on_credit = bool(on_credit)
         # FIX 4a (round 1): a seat is a COUNT of one AND a charge against
         # D's host staging pool.
         #
@@ -3936,8 +3939,18 @@ class Seat:
         if not self.held:
             return
         self.held = False
-        self.front._d_seat.release()
         self.front._d_seats_live.discard(self)
+        if not self.on_credit:
+            # S46 F5: the permit of a normal seat goes to the oldest seat taken on credit, if one is live
+            debtor = None
+            for s in list(self.front._d_seats_live):
+                if getattr(s, "on_credit", False) and (debtor is None or s.t_taken < debtor.t_taken):
+                    debtor = s
+            if debtor is not None:
+                debtor.on_credit = False
+                self.front.counters["d_seat_credit_settled"] += 1
+            else:
+                self.front._d_seat.release()
         _ps = getattr(self.front, "_park_stuck", None)
         if _ps is not None:
             _ps().done(self.rid)  # #287 NEED0 (c): the rid left D
@@ -10711,7 +10724,7 @@ class Front:
         else:
             if _sk:
                 self.counters["short_kept_queue"] += 1
-            self.queue.append(p)
+            Front._queue_at_age(self, p)   # S46 F3: at its age position (a new arrival: the end, as before)
         self._dp_mark(p, "long" if route == "long" else "batch")  # R28
         self._kick_controller("arrival")  # 27B flipfast F2 (no-op when off)
         self._arm_client_watch(request, rid, p)  # H102
@@ -11292,6 +11305,11 @@ class Front:
             return None
         if self._d_direct_yields(rid, uncached=uncached):
             return None  # FLIPCYCLE H5b: a P-bound request queued while it waited
+        if Front._age_seat_on_credit(self, rid):
+            # S46 F5: an AGE PLAN to_d grant with every front seat held goes to D now -- D's SEAT-AGE makes its room
+            if not (self.awake == "D" and self.admit_d and self.state == "serving"):
+                return None
+            return Seat(self, rid, "short", tokens=est_tokens, on_credit=True)
         _t_sem = time.time()
         await self._d_seat.acquire()
         if time.time() - _t_sem > 0.5:
@@ -11305,6 +11323,34 @@ class Front:
             self._d_seat.release()
             return None
         return Seat(self, rid, "short", tokens=est_tokens)
+
+    def _age_seat_on_credit(self, rid: str) -> bool:
+        """S46 F5 (SITZPOLITIK VEREINT a1850fa9a3 / AGE PLAN; user 30.09. ~14:40Z "wird der mittlere auf die karten
+        gezogen und verdrängt ggf. auch den jüngsten"): True = ``rid`` holds an AGE PLAN ``to_d`` grant whose plan
+        names younger victims and every front seat is held -- it goes to D WITHOUT waiting for the front's seat
+        semaphore. The unified seat policy hands the head to D and D ALONE displaces (``displace_for_age``, the seat
+        trigger: every seat held, an OLDER request in D's waiting queue). The front's semaphore (``--d-bs`` permits)
+        kept exactly that request away from D until a seat freed by itself, so D's seat trigger never saw it: NF rc12
+        1018_153151 124 such grants, grant -> D-ADMIT p50 5.3 s, max 72.1 s; rc13 1018_200305 pdflip-4-33 granted
+        20:08:51,242 "no seat; AGE PLAN: to D", D-ADMIT 20:09:10,975 (19.7 s at the semaphore). The seat is taken
+        ON CREDIT (no permit); the next normal seat that frees passes its permit to it (:meth:`Seat.release`), so
+        the permits stay the count of normal seats and the front never holds more than ``--d-bs`` permits.
+        Never for a grant without victims (a free seat / KV-only plan: the semaphore has a permit, or its lag is
+        the H16V F4 seat wait). FLLIPER_PDFLIP_AGE_SEAT_ON_CREDIT (default on)."""
+        if not envs.FLLIPER_PDFLIP_AGE_SEAT_ON_CREDIT.get():
+            return False
+        if not _asr.enabled() or not self._d_seat.locked():
+            return False
+        st = self.__dict__.get("_asr_state") or {}
+        victims = (st.get("age_victims") or {}).get(rid)
+        if not victims or rid not in (st.get("granted") or {}):
+            return False
+        self.counters["arrival_seat_age_seat_on_credit"] += 1
+        logger.info("PDFLIP SEAT-AGE ON-CREDIT rid=%s victims=%s seats_live=%d d_bs=%d -- every front seat is held: "
+                    "the AGE PLAN head goes to D now, D's SEAT-AGE displaces the youngest for it (no wait at the "
+                    "front's seat semaphore; the next freed seat passes its permit to it)", rid, list(victims),
+                    len(getattr(self, "_d_seats_live", ()) or ()), int(self.d_bs))
+        return True
 
     # ------------------------------------------------------------------ ARRIVAL-SEAT
     # User rule 29.09. ~19:40Z (pdflip/arrival_seat_rule.py): D's decode seats stay
@@ -12345,6 +12391,7 @@ class Front:
         st = self._asr_st()
         fits_of = st.setdefault("fits", {})
         fits_kv, why, deficit = await self._arrival_seat_kv(est_tokens, max_tokens, rid, uncached)
+        kv_why = why
         terms = st.get("need_terms")
         fits = bool(free and fits_kv)
         if not free:
@@ -12365,7 +12412,23 @@ class Front:
             # ``granted`` at once and so counts into ``taken`` for the next waiter of the tick).
             taken, n = self._arrival_seat_taken()
             free = bool(_asr.seat_free(taken, n))
-            plan = self._arrival_seat_age_verdict(rid, arrival, free, 0 if fits_kv else deficit)
+            if free and fits_kv:
+                # S46 F1 (SOLL R2/R5; NF rc12 18:50:36,202 and rc13 20:14:58,868): ``fits`` above was formed from the
+                # seat count read BEFORE the awaits; a seat freed during them and the KV fits -- the request FITS now.
+                # Before, the age verdict said ``plan=fits`` (an empty plan, so no to_d), ``fits`` stayed False, no
+                # grant, and the line read ``why=kv`` with ``need`` far under ``free`` (pdflip-110-998 need=134779
+                # free=242816; pdflip-8-87 need=4344 free=154112): a lost tick and a false KV verdict. The fits path
+                # below re-reads the seat with no await before its grant (H16V F4).
+                fits = True
+                why = kv_why
+                fits_of[rid] = True
+                self.counters["arrival_seat_seat_freed_in_tick"] += 1
+                if not first:
+                    # eligibility was read on "no seat" -- an older P candidate that fits a FREE seat keeps its right
+                    eligible = await self._asr_older_blocked(rid, t_mine, True)
+                    st["need_terms"] = terms
+            else:
+                plan = self._arrival_seat_age_verdict(rid, arrival, free, 0 if fits_kv else deficit)
         to_d = bool(plan)   # does not fit, but D can make it fit by displacing younger ones
         if fits:
             # H16V F4 (root of the 5 s gap, NF 16:03:32,957: pdflip-96-1178/1179/1180 were ALL granted at taken=5 n=6 --
@@ -13006,6 +13069,104 @@ class Front:
         from flliper.srt.pdflip.retain_publish import d_accepts_leg2 as _acc
         return _acc(self.awake, self.state, self.dormant_admit)   # xsn347: also during the P->D flip
 
+    # ---- S46 F2-F4: the seat ORDER of requests that rode a flip to P (SA #244, PRIO=ALTER 14.10.) ----
+    def _seat_order_after_flip_on(self) -> bool:
+        from flliper.srt.pdflip import seat_age as _sa
+
+        return bool(envs.FLLIPER_PDFLIP_SEAT_ORDER_AFTER_FLIP.get()) and _sa.enabled()
+
+    def _sa_key(self, x: Any) -> tuple:
+        """The SA order key of a Pending or rid: (priority desc, FRONT ARRIVAL by the rid counter). The rid counter,
+        not ``Pending.t_arrive``: a SHORT that fell through to BATCH is a Pending created at the fall-through (NF rc12
+        pdflip-110-998: arrived 18:50:17, Pending 18:50:36) -- its t_arrive is younger than its age."""
+        from flliper.srt.pdflip import seat_age as _sa
+
+        rid = x if isinstance(x, str) else getattr(x, "rid", "")
+        on = _prio_age.enabled()
+        return _sa.order_key(rid, Front._prio_lane(self, x) if on else 0, on=on)
+
+    def _p_legs_live(self) -> Dict[int, Any]:
+        """S46 F4: the Pendings whose leg 1 runs on P right now (the drain pool's ``one``), by id."""
+        return self.__dict__.setdefault("_p_legs_live_d", {})
+
+    def _queue_at_age(self, p: "Pending") -> None:
+        """S46 F3: queue ``p`` for P at its AGE position -- before the first queued entry that is younger by the SA
+        key (a new arrival is the youngest: the end, as before). NF rc12 18:50:36: the halb pdflip-110-1000 that made
+        the set flip was queued first, the three older kurz riders (997/998/999, waiting for a D seat since 17-26 s)
+        were appended behind it when the flip closed D's admission; P served 1000 first and its hand-off took the one
+        free D seat (SEAT-AT-HAND-OFF) while the older ones were still on P."""
+        if not Front._seat_order_after_flip_on(self) or not self.queue:
+            self.queue.append(p)
+            return
+        k = Front._sa_key(self, p)
+        for i, q in enumerate(self.queue):
+            if Front._sa_key(self, q) > k:
+                self.queue.insert(i, p)
+                self.counters["queue_at_age_insert"] += 1
+                logger.info("PDFLIP QUEUE-AT-AGE rid=%s before=%s pos=%d queue=%d (S46 F3: queued for P at its "
+                            "arrival age, not behind younger entries)", p.rid, getattr(q, "rid", "?"), i,
+                            len(self.queue))
+                return
+        self.queue.append(p)
+
+    def _dormant_hold_for_older(self, p: "Pending") -> bool:
+        """S46 F4: True = the D line's head ``p`` is not given a seat yet: P is awake (D dormant, it decodes nothing
+        before the wake) and a request OLDER than ``p`` is still on P (queued, or its leg 1 runs). The older one
+        takes the seat first once its leg 1 is done; D loses nothing (asleep). NF rc12: pdflip-110-1000 (the
+        youngest) took the seat freed at 18:50:37,514 by D-ADMIT 18:50:43,525 while 996-999 were still on P."""
+        if self.awake == "D" or not Front._seat_order_after_flip_on(self):
+            return False
+        k = Front._sa_key(self, p)
+        older = None
+        now = time.time()
+        on_p = []
+        live = Front._p_legs_live(self)
+        for key, (q, t_done) in list(live.items()):
+            # a finished leg is on its way to the D line (``_on_leg1_done``); one that never got there (an exit path
+            # without on_done) stops counting 2 s after its leg ended
+            if t_done is None or now - t_done < 2.0:
+                on_p.append(q)
+            else:
+                live.pop(key, None)
+        for q in list(self.queue) + on_p:
+            if q is p or getattr(getattr(q, "fut", None), "done", lambda: True)():
+                continue
+            if getattr(q, "client_gone", False):
+                continue
+            if Front._sa_key(self, q) < k:
+                older = q
+                break
+        if older is None:
+            return False
+        told = self.__dict__.setdefault("_dormant_hold_told", {})
+        if told.get(p.rid) != older.rid:
+            told[p.rid] = older.rid
+            if len(told) > 1024:
+                told.clear()
+            self.counters["d_admit_dormant_hold_older"] += 1
+            logger.info("PDFLIP D-ADMIT-HOLD rid=%s older=%s awake=%s (S46 F4: P is awake, D dormant -- the seat "
+                        "waits for the older request still on P; SA age order)", p.rid, older.rid, self.awake)
+        return True
+
+    def _d_line_older_newcomer(self, p: "Pending", seen: set) -> bool:
+        """S46 F2: True = while the admitter waited for the seat with ``p`` picked, a request OLDER than ``p`` joined
+        the D line (it was not there at the pick). The age order is taken before the wait, so the seat went to the
+        picked one: NF rc12 18:51:04,611 pdflip-110-999 (rank 0) before 996/997/998, older and ready since
+        18:50:49-55 (D-ADMIT oldest_wait_s 28.2 before 37.5 / 39.6 / 46.1). A younger one picked by the SA KV
+        backfill stays picked: its older head was in the line at the pick."""
+        if not Front._seat_order_after_flip_on(self) or len(self._ready_for_d) < 2:
+            return False
+        k = Front._sa_key(self, p)
+        for q in self._ready_for_d:
+            if q is p or id(q) in seen or q.fut.done():
+                continue
+            if Front._sa_key(self, q) < k:
+                self.counters["d_line_older_newcomer"] += 1
+                logger.info("PDFLIP SEAT-AGE NEWCOMER rid_in=%s rid_was=%s (S46 F2: an older hand-off joined the D "
+                            "line during the seat wait -- the seat goes by age)", q.rid, p.rid)
+                return True
+        return False
+
     def _log_admit(self, rid: str, source: str, t_arrive: float, rank: Optional[int] = None,
                    t_ready: float = 0.0) -> None:
         """L2.  ``rank`` is this admission's ORDINAL in the current epoch.
@@ -13150,7 +13311,15 @@ class Front:
                     # not a pop: the head STAYS the head (law 2), so a younger
                     # request that would fit cannot be admitted past it.
                     continue
+                if Front._dormant_hold_for_older(self, p):
+                    continue   # S46 F4: an older request is still on P -- D is asleep, the seat waits for it
+                _line_seen = {id(q) for q in self._ready_for_d}
                 await self._d_seat.acquire()
+                if Front._d_line_older_newcomer(self, p, _line_seen):
+                    # S46 F2: an OLDER hand-off joined the line while this admitter waited for the seat (the order
+                    # above was taken before the wait) -- the seat goes back, the next pass picks by age
+                    self._d_seat.release()
+                    continue
                 if not (self._d_accepts_leg2() and self.admit_d):
                     # The phase moved while this admitter was queued behind a
                     # running decode.  Give the seat back and leave the
@@ -17753,6 +17922,19 @@ class Front:
                         p.intake_stalled = False
                     return p
 
+                _one_base = one
+
+                async def one(p: Pending) -> Pending:  # noqa: F811 -- S46 F4: the legs live on P, for the D line's order
+                    _live = Front._p_legs_live(self)
+                    _live[id(p)] = (p, None)
+                    try:
+                        return await _one_base(p)
+                    finally:
+                        if not getattr(p, "leg1_done", False):
+                            _live.pop(id(p), None)   # a done leg leaves at ``_on_leg1_done`` (no gap before the line)
+                        else:
+                            _live[id(p)] = (p, time.time())
+
                 if _lctl.enabled():
                     _one_inner = one
 
@@ -17767,6 +17949,7 @@ class Front:
 
                 def _on_leg1_done(p: Pending) -> None:
                     nonlocal _drain_uncached, prefilled
+                    Front._p_legs_live(self).pop(id(p), None)   # S46 F4: off P, now on its way to the D line
                     if p.lane_p_taken:
                         return  # PRIORITY LANES 1008 (L4): taken off P for a higher lane, kept in the lane register
                     if p.intake_stalled:
