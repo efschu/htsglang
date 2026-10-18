@@ -251,6 +251,7 @@ from sglang.srt.weg2.d_lead_probe import build_d_lead_probe  # D-LEAD-MS-1007
 from sglang.srt.weg2.vision_verdict import Weg2VisionVerdict  # H125f vision verdict on the chain
 from sglang.srt.weg2.pp_loadback_verdict import Weg2PpLoadbackVerdict  # LB-VERDICT-1014 on the chain
 from sglang.srt.weg2 import pp_loadback_verdict as _weg2_lbv  # LBV-ADMIT (h16h 19:33:48Z)
+from sglang.srt.weg2 import form_a_post_admit as _weg2_fa_post_admit  # S35: an admit reads CONTINUE on a Form A group
 from sglang.srt.weg2 import extend_trim as _weg2_extend_trim  # rc12g extend chunk cap
 from sglang.srt.weg2 import d_seat_vram as _weg2_d_seat_vram  # D-MEM-SCHED stage between wakes
 from sglang.srt.weg2 import d_transient_lend as _weg2_d_transient_lend  # D-TRANSIENT-LEND
@@ -18021,6 +18022,14 @@ class Scheduler(
                 consume_seam_grant(req)
 
             _hol_go_on = False
+            # S35 (SOLL R11, raenge-nie-uneins; rc9 09:51:22Z pdflip-29-190): an ADMITTED request's budget_state() is
+            # this rank's own pool on a Form A group -- NO_TOKEN on the host alone made it take the D-HOL head and enter
+            # PW-R's group MIN by itself. The admit was the group's verdict; it reads CONTINUE on every rank there.
+            res = _weg2_fa_post_admit.uniform_result(
+                res,
+                bool(adder.can_run_list) and req is adder.can_run_list[-1],
+                getattr(adder, "form_a_admission_follow", None),
+            )
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
                     # SP (partial park, KV trigger; weg2/d_park_runtime.displace_for_age):
