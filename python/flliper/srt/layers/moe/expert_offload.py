@@ -154,6 +154,8 @@ _H107_LOG_LAYER = None
 # D-Mini-Extend: the one layer whose device-planned eager step is logged at
 # INFO, one line per forward (same latch rule).
 _EDS_LOG_LAYER = None
+# S51 EAGER-DEVICE-EM: the one layer whose EM pass is logged at INFO.
+_EDS_EM_LOG_LAYER = None
 
 
 def write_routing_trace(
@@ -3376,6 +3378,31 @@ def partials_mode() -> str:
     return _PARTIALS_MODE["mode"]
 
 
+def _nan_guard_wave_armed() -> bool:
+    """FLLIPER_NAN_GUARD=1 with FLLIPER_NAN_GUARD_WAVE armed (the per-wave
+    diagnostic of the host loop, which the EM pass does not carry)."""
+    import os
+
+    try:
+        from flliper.srt.layers.nan_guard import nan_guard_on
+
+        if not nan_guard_on():
+            return False
+    except Exception:  # noqa: BLE001 -- no guard module: nothing armed
+        return False
+    return os.environ.get("FLLIPER_NAN_GUARD_WAVE", "0").strip() not in ("", "0", "off")
+
+
+def _em_slice_pairs() -> int:
+    """FLLIPER_OPT_MOE_POOL_EAGER_DEVICE_EM_SLICE (S51), >= 0; 0 = one slice."""
+    from flliper.srt.environ import envs
+
+    try:
+        return max(0, int(envs.FLLIPER_OPT_MOE_POOL_EAGER_DEVICE_EM_SLICE.get() or 0))
+    except (TypeError, ValueError):
+        return 4096
+
+
 def wave_token_slice_pairs() -> int:
     """FLLIPER_MOE_OFFLOAD_WAVE_SLICE: (token, expert) pairs one grouped GEMM of
     an expert-major wave may take at once; 0 = whole wave (the old behaviour).
@@ -3709,6 +3736,9 @@ class MoEExpertOffloadCache:
     _pool_eager_device_step = False
     _pool_eager_device_checks = 0
     _pool_eager_device_limit = None
+    #: S51 EAGER-DEVICE-EM: on/off and its own metal-check budget (per instance)
+    _pool_eager_device_em = False
+    _pool_eager_device_em_checks = 0
 
     #: names of the stacked per-expert tensors to pool/fetch (dim 0 == expert).
     EXPERT_TENSOR_ATTRS = (
@@ -3981,6 +4011,12 @@ class MoEExpertOffloadCache:
         self._pool_eager_device_step = bool(envs.FLLIPER_OPT_MOE_POOL_EAGER_DEVICE_STEP.get())
         self._pool_eager_device_checks = max(
             0, int(envs.FLLIPER_DEBUG_MOE_POOL_EAGER_DEVICE_CHECK.get() or 0)
+        )
+        # S51: extends past the graph form take the device-planned
+        # expert-major pass (FLLIPER_OPT_MOE_POOL_EAGER_DEVICE_EM)
+        self._pool_eager_device_em = bool(envs.FLLIPER_OPT_MOE_POOL_EAGER_DEVICE_EM.get())
+        self._pool_eager_device_em_checks = max(
+            0, int(envs.FLLIPER_DEBUG_MOE_POOL_EAGER_DEVICE_EM_CHECK.get() or 0)
         )
         # per eager forward: armed by run_eager_pool, the hit rows the sync
         # stamps as used (row -> expert)
@@ -5061,6 +5097,135 @@ class MoEExpertOffloadCache:
                 ids = torch.where((ids >= 0) & (r < 0), ids, torch.full_like(ids, -1))
         return first._replace(hidden_states=hidden)
 
+    def run_pool_em(self, dispatch_output, apply_fn, waves: int):
+        """S51 EAGER-DEVICE-EM: an eager forward past the graph form, planned
+        on the device and computed EXPERT-MAJOR.
+
+        Plan: the pool step sees ONE lane per local expert -- lane ``e`` holds
+        ``e`` when the forward routes any pair to it, else -1 -- so a
+        2000-pair extend is the step of at most ``E`` distinct ids and the
+        captured kernel (WIDTH >= E) runs as it is. Wave 1 is the ordinary
+        step with ``spill`` (H95); every later wave is a ``wave`` step over
+        exactly the experts the waves before could not hold; the last one
+        runs without ``spill`` and the bound of ``eager_device_em_waves``
+        makes it complete. Each step copies its own misses (``copy_rows``,
+        device count) -- the bytes the host plan's misses move.
+
+        Compute: every wave runs over all ``T x K`` lanes as top_k=1 rows in
+        fixed slices. A lane whose expert this wave serves reads its row at
+        its own weight; every other lane points at the zero row at weight 0
+        and its row is not taken. The served rows land in the ``[T*K, H]``
+        partials table at their own (token, k) slot; each lane is served in
+        exactly one wave, padded (-1) lanes in none and stay zero; the top-k
+        reduction runs ONCE at the end -- ``_run_waves_expert_major``'s
+        arithmetic (same input row, same expert bytes, same weight, same
+        combine), with no host read anywhere. ``routed_scaling_factor`` is
+        neutralised in the per-pair applies and applied by the combine, as
+        there."""
+        import torch
+
+        from flliper.srt.layers.moe.expert_pool_device import copy_rows, step
+
+        if not self._pool_ready:
+            self.install_pool()
+        t = self._pool_tables
+        buffers = self._pool_buffers
+        topk_output = dispatch_output.topk_output
+        topk_ids = topk_output.topk_ids
+        hidden = dispatch_output.hidden_states
+        scale = dispatch_output.hidden_states_scale
+        router_logits = getattr(topk_output, "router_logits", None)
+        device = topk_ids.device
+        T, K = int(topk_ids.shape[0]), int(topk_ids.shape[1])
+        E = int(t.num_experts)
+        n_lanes = T * K
+
+        flat = topk_ids.reshape(-1).to(torch.int64)
+        valid = (flat >= 0) & (flat < E)
+        safe = torch.where(valid, flat, torch.zeros_like(flat))
+        flat_weights = topk_output.topk_weights.reshape(-1, 1).contiguous()
+        if self._pool_pf_armed:
+            # a speculative prefetch for this layer is in flight: its rows are
+            # ordinary hits once the event is waited on (prepare_pool's rule)
+            self._pool_pf_armed = False
+            torch.cuda.current_stream().wait_event(self._pool_pf_done)
+        heat = getattr(self, "_pool_heat", None)
+        if heat is not None:
+            from flliper.srt.layers.moe import pool_heat
+
+            pool_heat.count(heat, self._pool_heat_ones, flat.to(torch.int32), E)
+        # the forward's distinct experts, one lane each (no host read)
+        mark = torch.zeros(E + 1, dtype=torch.int32, device=device)
+        mark.index_fill_(0, torch.where(valid, flat, torch.full_like(flat, E)), 1)
+        lane_e = torch.arange(E, dtype=torch.int32, device=device)
+        neg = torch.full_like(lane_e, -1)
+        pending = torch.where(mark[:E] > 0, lane_e, neg)
+        zero_row = self._pool_zero_row().to(torch.int64)
+
+        cfg = self.layer.moe_runner_config
+        saved_rsf = cfg.routed_scaling_factor
+        slice_pairs = _em_slice_pairs() or n_lanes
+        partials = None
+        combine_out = None
+        try:
+            cfg.routed_scaling_factor = 1.0
+            for wave in range(1, int(waves) + 1):
+                last = wave == int(waves)
+                # the lanes still owed: their expert is in this wave's step
+                owed = valid & (pending.index_select(0, safe) >= 0)
+                step(t, pending, buffers, spill=not last, wave=wave > 1, waves=waves,
+                     capture_rows_on=getattr(self, "_pool_capture_on", 0))
+                copy_rows(self._pool_srcs, self._pool_dsts, buffers.gather_src,
+                          buffers.gather_dst, buffers.gather_count)
+                # read this wave's routes before the next step rewrites them
+                routes_e = buffers.routes[:E].to(torch.int64)
+                lane_route = routes_e.index_select(0, safe)
+                served = owed & (lane_route >= 0)
+                if not last:
+                    pending = torch.where((pending >= 0) & (routes_e < 0), pending, neg)
+                for a in range(0, n_lanes, slice_pairs):
+                    b = min(n_lanes, a + slice_pairs)
+                    srv = served[a:b]
+                    rows = torch.div(torch.arange(a, b, device=device), K, rounding_mode="floor")
+                    tid_w = torch.where(srv, lane_route[a:b], zero_row).to(topk_ids.dtype)
+                    tw_w = torch.where(
+                        srv.unsqueeze(1), flat_weights[a:b], torch.zeros_like(flat_weights[a:b])
+                    )
+                    hs_w = hidden.index_select(0, rows).contiguous()
+                    sc_w = (
+                        scale.index_select(0, rows)
+                        if isinstance(scale, torch.Tensor) and scale.shape[0] == T
+                        else scale
+                    )
+                    rl_w = (
+                        router_logits.index_select(0, rows)
+                        if isinstance(router_logits, torch.Tensor)
+                        and router_logits.dim() >= 1
+                        and router_logits.shape[0] == T
+                        else router_logits
+                    )
+                    sub = dispatch_output._replace(
+                        hidden_states=hs_w,
+                        hidden_states_scale=sc_w,
+                        topk_output=topk_output._replace(
+                            topk_weights=tw_w, topk_ids=tid_w.unsqueeze(1), router_logits=rl_w
+                        ),
+                    )
+                    combine_out = apply_fn(sub)
+                    part = combine_out.hidden_states
+                    if partials is None:
+                        partials = torch.zeros(
+                            (n_lanes, part.shape[-1]), dtype=part.dtype, device=device
+                        )
+                    partials[a:b] = torch.where(
+                        srv.unsqueeze(1), part.to(partials.dtype), partials[a:b]
+                    )
+        finally:
+            cfg.routed_scaling_factor = saved_rsf
+        out_full = torch.empty((T, partials.shape[-1]), dtype=partials.dtype, device=device)
+        combine_topk_partials(partials.view(T, K, -1), out_full, saved_rsf)
+        return combine_out._replace(hidden_states=out_full)
+
     def _pool_wave_step(self, ids, *, spill: bool, waves: int):
         """H95: one later wave -- plan ``ids`` (lanes not in this wave = -1),
         copy its misses, return its routes (flat, one per lane)."""
@@ -5207,9 +5372,16 @@ class MoEExpertOffloadCache:
         every forward with a host-side routing instrument, plans on the host
         (``_run_eager_host_plan``)."""
         n_ids = int(dispatch_output.topk_output.topk_ids.numel())
-        waves, _reason = self.eager_device_waves(n_ids)
+        waves, reason = self.eager_device_waves(n_ids)
         if waves:
             return self._run_eager_device_step(dispatch_output, apply_fn, waves)
+        if reason in ("over_graph_form", "waves_cap"):
+            # S51: past the graph form, the device-planned expert-major pass
+            em_waves, _em_reason = self.eager_device_em_waves(n_ids)
+            if em_waves:
+                return self._run_eager_device_step(
+                    dispatch_output, apply_fn, em_waves, em=True
+                )
         return self._run_eager_host_plan(dispatch_output, apply_fn)
 
     def eager_device_limit(self) -> int:
@@ -5242,12 +5414,7 @@ class MoEExpertOffloadCache:
             return 0, "pool_not_ready"
         if n_ids <= 0:
             return 0, "empty"
-        if (
-            self._route_note
-            or getattr(self, "_router_stats", None) is not None
-            or getattr(self, "_heat", None) is not None
-            or (getattr(self, "_hot_enabled", False) and not getattr(self, "_hot_frozen", True))
-        ):
+        if self._eager_host_instrument():
             return 0, "host_instrument"  # they read the routing on the host
         if n_ids > self.eager_device_limit():
             return 0, "over_graph_form"
@@ -5258,15 +5425,67 @@ class MoEExpertOffloadCache:
             return 0, "waves_cap"
         return need, "device"
 
-    def _run_eager_device_step(self, dispatch_output, apply_fn, waves: int):
+    def _eager_host_instrument(self) -> bool:
+        """A routing instrument that reads the ids on the host is on (route
+        note, router stats, heat window, hot-set calibration): such a forward
+        plans on the host, whatever the device step could take."""
+        return bool(
+            self._route_note
+            or getattr(self, "_router_stats", None) is not None
+            or getattr(self, "_heat", None) is not None
+            or (getattr(self, "_hot_enabled", False) and not getattr(self, "_hot_frozen", True))
+        )
+
+    def eager_device_em_waves(self, n_ids: int) -> Tuple[int, str]:
+        """S51 EAGER-DEVICE-EM: ``(waves, reason)`` for an eager forward past
+        the graph form, or 0 and why the host plans it. The pass hands the
+        pool step ONE lane per local expert (the forward's distinct ids), so
+        the step's own width must cover ``E`` and its wave bound is the worst
+        case of that set, ``min(E, E - R) <= waves x (LRU + staging)``. Host
+        ints only, no device read."""
+        from flliper.srt.environ import envs
+        from flliper.srt.layers.moe.expert_pool_device import (
+            pool_row_capacity,
+            pool_waves_for,
+            resident_count,
+        )
+
+        if not (self._pool_eager_device_step and self._pool_eager_device_em):
+            return 0, "em_switch_off"
+        if not self._pool_ready:
+            return 0, "pool_not_ready"
+        if n_ids <= 0:
+            return 0, "empty"
+        if self._eager_host_instrument():
+            return 0, "host_instrument"
+        if partials_mode() == "stream" or _nan_guard_wave_armed():
+            return 0, "em_host_partials"  # fp32 streaming / per-wave NaN guard: host loop
+        cap_ids = int(envs.FLLIPER_OPT_MOE_POOL_EAGER_DEVICE_EM_MAX_IDS.get() or 0)
+        if cap_ids > 0 and n_ids > cap_ids:
+            return 0, "em_max_ids"
+        t = self._pool_tables
+        E = int(t.num_experts)
+        if E > int(self._pool_buffers.gather_src.shape[0]):
+            return 0, "em_width"  # one lane per expert must fit the step kernel
+        need = pool_waves_for(E, E, resident_count(t), pool_row_capacity(t, 0))
+        cap = max(1, int(envs.FLLIPER_OPT_MOE_POOL_EAGER_DEVICE_EM_WAVES.get() or 0))
+        if need > cap:
+            return 0, "em_waves_cap"
+        return need, "device_em"
+
+    def _run_eager_device_step(self, dispatch_output, apply_fn, waves: int, em: bool = False):
         """D-Mini-Extend: the eager forward on the decode graph's device plan
         (``prepare_pool`` / ``run_pool_waves``), run eagerly -- plan and row
         copies on the device, the LRU updated by the step's own rule, nothing
         republished from the host. Deferred rows land first and the resume
-        warm drops this layer, exactly as on the host plan."""
+        warm drops this layer, exactly as on the host plan.
+
+        ``em`` (S51 EAGER-DEVICE-EM): the forward is past the graph form and
+        runs ``run_pool_em`` (distinct-expert lanes, expert-major partials)
+        under the same frame; its metal check has its own budget."""
         self.land_deferred_rows()  # H31b: the layout is the full one before the step
         resume_warm().eager_reached(self)  # RW: an eager layer never waits for the warm
-        check = self._pool_eager_device_checks > 0
+        check = (self._pool_eager_device_em_checks if em else self._pool_eager_device_checks) > 0
         saved = None
         if check:
             # the reference must see the MoE input this forward saw
@@ -5280,7 +5499,9 @@ class MoEExpertOffloadCache:
         prev_on = getattr(self, "_pool_capture_on", 0)
         self._pool_capture_on = 0  # not a capture: the rows ON now
         try:
-            if waves > 1:
+            if em:
+                out = self.run_pool_em(dispatch_output, apply_fn, waves)
+            elif waves > 1:
                 out = self.run_pool_waves(dispatch_output, apply_fn, waves)
             else:
                 topk_output = dispatch_output.topk_output
@@ -5293,9 +5514,15 @@ class MoEExpertOffloadCache:
         finally:
             self._pool_capture_on = prev_on
         topk_ids = dispatch_output.topk_output.topk_ids
-        self._note_eager_device_step(int(topk_ids.shape[0]), int(topk_ids.numel()), waves)
+        if em:
+            self._note_eager_device_em(int(topk_ids.shape[0]), int(topk_ids.numel()), waves)
+        else:
+            self._note_eager_device_step(int(topk_ids.shape[0]), int(topk_ids.numel()), waves)
         if check:
-            self._pool_eager_device_checks -= 1
+            if em:
+                self._pool_eager_device_em_checks -= 1
+            else:
+                self._pool_eager_device_checks -= 1
             out = self._check_eager_device_step(saved, apply_fn, out, waves)
         return out
 
@@ -5316,6 +5543,27 @@ class MoEExpertOffloadCache:
             "sync; FLLIPER_OPT_MOE_POOL_EAGER_DEVICE_STEP)",
             layer_id, tokens, n_ids, waves, self.eager_device_limit(),
             self._eager_device_steps,
+        )
+
+    def _note_eager_device_em(self, tokens: int, n_ids: int, waves: int) -> None:
+        """S51 metal marker, one line per EM forward on one representative
+        layer (the H107 rule: INFO there, DEBUG elsewhere)."""
+        import logging
+
+        global _EDS_EM_LOG_LAYER
+
+        self._eager_device_em_steps = int(getattr(self, "_eager_device_em_steps", 0)) + 1
+        layer_id = getattr(self.layer, "layer_id", "?")
+        if _EDS_EM_LOG_LAYER is None:
+            _EDS_EM_LOG_LAYER = layer_id
+        logging.getLogger(__name__).log(
+            logging.INFO if layer_id == _EDS_EM_LOG_LAYER else logging.DEBUG,
+            "EAGER-DEVICE-EM layer %s: T=%d ids=%d experts=%d waves=%d slice=%d n=%d "
+            "(device-planned expert-major extend: distinct-expert pool step, every "
+            "(token, k) pair once into the partials table, one combine; no host plan, "
+            "no per-layer sync; FLLIPER_OPT_MOE_POOL_EAGER_DEVICE_EM)",
+            layer_id, tokens, n_ids, int(self._pool_tables.num_experts), waves,
+            _em_slice_pairs(), self._eager_device_em_steps,
         )
 
     def _check_eager_device_step(self, saved, apply_fn, out, waves: int):
@@ -6516,6 +6764,9 @@ class MoEExpertOffloadCache:
         slice_pairs = wave_token_slice_pairs()
         stream_partials = partials_mode() == "stream"
         out_acc = None  # [T, H] fp32 when streaming
+        from flliper.srt.environ import envs as _envs
+
+        pinned_idx = bool(_envs.FLLIPER_OPT_MOE_OFFLOAD_PINNED_WAVE_IDX.get())
         try:
             cfg.routed_scaling_factor = 1.0
             all_waves = [resident_used] + spill_waves
@@ -6562,9 +6813,14 @@ class MoEExpertOffloadCache:
                 # computed exactly once and lands in its own partials row.
                 step = slice_pairs if slice_pairs > 0 else int(idx_np.size)
                 for start in range(0, int(idx_np.size), step):
-                    idx = torch.from_numpy(idx_np[start : start + step]).to(
-                        device, non_blocking=True
-                    )
+                    if pinned_idx:
+                        # S51: pinned staging -- the pageable copy blocked the
+                        # host behind this wave's own fetch (fn3g)
+                        idx = _h2d_i64(idx_np[start : start + step], device)
+                    else:
+                        idx = torch.from_numpy(idx_np[start : start + step]).to(
+                            device, non_blocking=True
+                        )
                     rows = torch.div(idx, K, rounding_mode="floor")
                     tid_w = lut[flat_ids.index_select(0, idx)].unsqueeze(1)
                     tw_w = flat_weights.index_select(0, idx)
