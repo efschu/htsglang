@@ -63,7 +63,9 @@ class TestLauncherSwitch(unittest.TestCase):
         base = ["--tree", "/t", "--tag", "t"]
         ns = launcher.build_parser().parse_args(base)
         self.assertTrue(ns.p_host_overlap)
-        self.assertFalse(ns.p_hostgap)
+        # rc14 (1018): the #PGAP instrument is ON by default too; --no-p-hostgap is its off arm.
+        self.assertTrue(ns.p_hostgap)
+        self.assertFalse(launcher.build_parser().parse_args(base + ["--no-p-hostgap"]).p_hostgap)
         self.assertFalse(launcher.build_parser().parse_args(base + ["--no-p-host-overlap"]).p_host_overlap)
         ns = launcher.build_parser().parse_args(base + ["--p-host-overlap", "--p-hostgap"])
         self.assertTrue(ns.p_host_overlap)

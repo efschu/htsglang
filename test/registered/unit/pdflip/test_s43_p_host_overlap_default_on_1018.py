@@ -42,10 +42,13 @@ def test_the_default_puts_the_skip_switch_into_group_p_env():
     assert env.get(pov.P_HOST_OVERLAP_ENV) == "1"
 
 
-def test_hostgap_instrument_stays_off_by_default():
-    assert L.build_parser().parse_args(BASE).p_hostgap is False
+def test_hostgap_instrument_is_on_by_default_since_rc14():
+    # rc14 (1018): the #PGAP instrument is ON by default for the NF boot that
+    # measures this fix (metal check '#PGAP ... overlap=1'); --no-p-hostgap is
+    # its off arm. It changes no decision (test_rc14_p_hostgap_default_on_1018).
+    assert L.build_parser().parse_args(BASE).p_hostgap is True
 
 
 def test_the_off_arm_adds_nothing():
-    ns = L.build_parser().parse_args(BASE + ["--no-p-host-overlap"])
+    ns = L.build_parser().parse_args(BASE + ["--no-p-host-overlap", "--no-p-hostgap"])
     assert L.p_host_overlap_env(ns.p_host_overlap, ns.p_hostgap) == {}

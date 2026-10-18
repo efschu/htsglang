@@ -23726,12 +23726,20 @@ def build_parser() -> argparse.ArgumentParser:
              "argv and env byte-identical to before.",
     )
     ap.add_argument(
-        "--p-hostgap", action="store_true",
+        "--p-hostgap", action="store_true", default=True,
         help="Group P: the #PGAP instrument (FLLIPER_PDFLIP_P_HOSTGAP=1) -- one "
              "line per forward with the card's idle before it (timing events on "
              "the forward stream, harvested without a sync) and the host phases "
-             "since the previous launch. For the --p-host-overlap A/B; default "
-             "off.",
+             "since the previous launch. For the --p-host-overlap A/B. DEFAULT "
+             "ON since rc14 (NF 1018: the P pauses -- PP0 duty, card idle per "
+             "chunk -- are the open class the next boot must measure; S43's "
+             "metal check reads '#PGAP ... overlap=1'). Changes no decision. "
+             "--no-p-hostgap = no #PGAP lines, env without the variable.",
+    )
+    ap.add_argument(
+        "--no-p-hostgap", dest="p_hostgap", action="store_false",
+        help="Group P: turn the #PGAP instrument (--p-hostgap, on by default "
+             "since rc14) off -- FLLIPER_PDFLIP_P_HOSTGAP is not set.",
     )
     ap.add_argument(
         "--p-prefill-graph-split", type=int, default=P_PREFILL_GRAPH_SPLIT_DEFAULT,
@@ -26294,8 +26302,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # nodes, 2.0-2.8 s flush drain at the flip) does not build behind a
     # prefill that never idles.  P only; D keeps the default (decode graphs).
     env_p.setdefault("FLLIPER_HICACHE_WRITE_STREAM_PRIORITY", "-1")
-    # P-HOST-OVERLAP / #PGAP (managers/pdflip_p_overlap.py): group P only, both
-    # default off -- off adds nothing, so argv and env stay byte-identical.
+    # P-HOST-OVERLAP / #PGAP (managers/pdflip_p_overlap.py): group P only; both
+    # default ON (S43 / rc14), --no-p-host-overlap / --no-p-hostgap add nothing.
     env_p.update(p_host_overlap_env(
         getattr(ns, "p_host_overlap", False), getattr(ns, "p_hostgap", False)))
     for _pline in p_host_overlap_lines(
