@@ -258,6 +258,7 @@ from flliper.srt.pdflip import d_seat_vram as _pdflip_d_seat_vram  # D-MEM-SCHED
 from flliper.srt.pdflip import d_transient_lend as _pdflip_d_transient_lend  # D-TRANSIENT-LEND
 from flliper.srt.pdflip import d_seat_rewake as _pdflip_d_seat_rewake  # D-SEAT-REWAKE: live seat re-plan
 from flliper.srt.pdflip import skip_first as _pdflip_skip_first  # E2 in a mixed wake cohort
+from flliper.srt.pdflip import d_decode_gap as _pdflip_d_decode_gap  # S48 D-DECODE-GAP instrument
 from flliper.srt.layers.dcp import prefix_lens_check as _prefix_lens_check  # #639 ballot (skip: deferred)
 from flliper.srt.pdflip import short_read as _pdflip_short_read  # held short wake reads
 from flliper.srt.pdflip import tail_adopt as _pdflip_tail_adopt
@@ -13236,6 +13237,7 @@ class Scheduler(
             # E2 in a mixed wake cohort: the skip batch's tokens go out with
             # this decode round before the next extend (rank-uniform)
             new_batch = None
+            _pdflip_d_decode_gap.note(self, "skipfirst_hold")  # S48 instrument
             self._admission_decline_note = "gate=pdflip_skip_first_decode"
         elif self._pdflip_dqh_holds(running_batch):
             # DQH (pdflip/d_head_hold.py): the refused D head and everything its
@@ -19597,6 +19599,9 @@ class Scheduler(
             self._decode_steps_this_phase = (
                 int(getattr(self, "_decode_steps_this_phase", 0) or 0) + 1
             )
+        # S48 D-DECODE-GAP (pdflip/d_decode_gap.py): every pause of D's decode streams with its cause, also
+        # below 5 s -- this funnel sees every forward once. Group D, first TP rank, rank-local, read-only.
+        _pdflip_d_decode_gap.on_batch(self, batch)
 
         # #1241 THE DECODE ROUND BOUNDARY. Here and nowhere else, for the same
         # reason the decode-step counter above is here: this is the ONE funnel
