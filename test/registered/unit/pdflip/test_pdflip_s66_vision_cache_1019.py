@@ -770,6 +770,16 @@ def test_h3_a_throwing_attach_falls_back_untouched(monkeypatch, caplog):
             "named fall back to FETCH"
     assert r.multimodal_inputs.mm_items[0].precomputed_embeddings is None
     assert any("EMB-CACHE REFUSED rid=h3" in m for m in caplog.messages)
+    # review S66c-r B2: a PIXEL item -- after the throw its pixels are back and it has no rows (it stages)
+    px = _req(rid="h3px", ends=(5000,))
+    px.multimodal_inputs.mm_items[0].hash = 1000
+    pixels = px.multimodal_inputs.mm_items[0].feature
+    s2 = _sched(told={"h3px": 0}, wq=[px])
+    with mock.patch.object(V, "attach_precomputed_embeddings", side_effect=half_then_raise):
+        assert V.emb_cache_attach(s2, px) is False
+    it = px.multimodal_inputs.mm_items[0]
+    assert it.feature is pixels and it.precomputed_embeddings is None
+    assert V.unstaged_items(px) == [it], "the tower stages it after the fall back"
 
 
 def test_h1_rc17_pdflip_6_245_behaviour_second_turn_sends_no_fetch(monkeypatch):
