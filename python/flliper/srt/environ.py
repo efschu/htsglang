@@ -3835,6 +3835,61 @@ class Envs:
     # MISMATCH'). 1 (default) = the first mini extend of the process proves
     # all 48 layers once (one extra MoE pass); 0 = off.
     FLLIPER_DEBUG_MOE_POOL_EAGER_DEVICE_CHECK = EnvInt(1)
+    # S51 EAGER-DEVICE-EM (18.10., NF D rc13): an eager forward PAST the
+    # D-Mini-Extend graph form (every D extend of more than ~24 tokens) runs a
+    # device-planned EXPERT-MAJOR pass instead of the host plan. rc13 D TP0:
+    # extends of 64-255 tokens cost 1.33 s median (PDFLIP-VRAM-PEAK chunk
+    # window) for ~0.40 s of expert bytes at the 5090's link (Gen4 x8, 14.4
+    # GB/s card probe) -- the rest is the host plan's per-layer routing D2H,
+    # the Python plan and the per-wave launch chain, during which the GPU
+    # idles (y3u: 2-6-token extends 403-739 gpu-ms on the host plan, ~25 ms
+    # on the device step). The pass: the pool step plans the forward's
+    # DISTINCT experts (one lane per local expert, <= the step width, so the
+    # captured kernel is reused as is), copies its misses on the device, and
+    # every (token, k) pair is computed exactly once as its own top_k=1 row
+    # into the [T*K, H] partials table in the wave whose step served its
+    # expert; the top-k reduction runs once at the end (combine_topk_partials)
+    # -- the host expert-major path's arithmetic, so the output is the host
+    # plan's (same rows, same bytes, same combine). No routing D2H, no host
+    # plan, no sync_pool_from_host. False: every forward past the graph form
+    # plans on the host as before. Rank-local choice, no collective inside the
+    # MoE (R11). Needs FLLIPER_OPT_MOE_POOL_EAGER_DEVICE_STEP.
+    FLLIPER_OPT_MOE_POOL_EAGER_DEVICE_EM = EnvBool(True)
+    # S51: the most routed ids (T x top-k) one EAGER-DEVICE-EM forward takes;
+    # longer extends keep the host plan. 20480 = 2048 tokens at top-k 10 =
+    # 97 % of rc13's D extends (837 of 863 on TP0). Every wave runs over all
+    # lanes (the unserved ones on the zero row), so the extra zero-row GEMM
+    # grows with T: ~0.95 x T x K rows per extra wave, ~0.2 s per extend on
+    # a 3080 at T=2048 against the ~0.7 s of host-plan overhead it removes.
+    # The workspace stays sliced (FLLIPER_OPT_MOE_POOL_EAGER_DEVICE_EM_SLICE).
+    # 0 = no bound.
+    FLLIPER_OPT_MOE_POOL_EAGER_DEVICE_EM_MAX_IDS = EnvInt(20480)
+    # S51: at most this many pool waves per EAGER-DEVICE-EM forward (the bound
+    # min(E_local, E - R) <= waves x (LRU + staging) must hold; NF D: 2 on
+    # every rank). A layer that needs more keeps the host plan.
+    FLLIPER_OPT_MOE_POOL_EAGER_DEVICE_EM_WAVES = EnvInt(4)
+    # S51: (token, k) pairs one grouped GEMM of an EAGER-DEVICE-EM wave takes
+    # at once (every wave runs over all T x K lanes, the unserved ones on the
+    # zero row at weight 0, so the slice bounds the per-wave workspace).
+    FLLIPER_OPT_MOE_POOL_EAGER_DEVICE_EM_SLICE = EnvInt(4096)
+    # S51 metal instrument for EAGER-DEVICE-EM: the first N EM forwards PER
+    # LAYER also run the plain host plan (H107 off) as the reference, one line
+    # 'EAGER-DEVICE-STEP CHECK ... waves=W ...' each (own budget, apart from
+    # the D-Mini-Extend check). S51r (review 18.10.): a deviation beyond fp
+    # rounding does NOT stop the rank -- the reference IS the host plan, so
+    # that extend is served by it, one ERROR line 'EAGER-DEVICE-EM
+    # MISMATCH-FALLBACK layer N ...' names it, and that layer plans every
+    # later extend past the graph form on the host (a defect report; the
+    # default stays on, the other layers keep EM). 1 (default) = the first EM
+    # extend of the process proves all layers once; 0 = off.
+    FLLIPER_DEBUG_MOE_POOL_EAGER_DEVICE_EM_CHECK = EnvInt(1)
+    # S51: the expert-major host loop stages each wave slice's pair indices
+    # through PINNED host memory (_h2d_i64) instead of a pageable
+    # ``torch.from_numpy(...).to(device, non_blocking=True)`` -- pageable ->
+    # device is host-blocking (fn3g, the _build_lut note), so every wave of
+    # every layer waited for its own fetch before the host could launch the
+    # apply. Same values, same tensor. False: the pageable copy as before.
+    FLLIPER_OPT_MOE_OFFLOAD_PINNED_WAVE_IDX = EnvBool(True)
     # H95: the captured decode step of the device-planned pool
     # (FLLIPER_MOE_OFFLOAD_GRAPH_MODE=pool) in up to N OVERFLOW WAVES. 0 or 1
     # (default) = off, the Task #40 worst case: a captured batch needs

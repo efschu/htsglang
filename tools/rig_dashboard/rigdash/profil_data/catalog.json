@@ -35271,6 +35271,34 @@
    ],
    "type": "EnvInt"
   },
+  "FLLIPER_DEBUG_MOE_POOL_EAGER_DEVICE_EM_CHECK": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "1",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "S51 metal instrument for EAGER-DEVICE-EM: the first N EM forwards PER LAYER also run the plain host plan (H107 off) as the reference, one line 'EAGER-DEVICE-STEP CHECK ... waves=W ...' each (own budget, apart from the D-Mini-Extend check). S51r (review 18.10.): a deviation beyond fp rounding does NOT stop the rank -- the reference IS the host plan, so that extend is served by it, one ERROR line 'EAGER-DEVICE-EM MISMATCH-FALLBACK layer N ...' names it, and that layer plans every later extend past the graph form on the host (a defect report; the default stays on, the other layers keep EM). 1 (default) = the first EM extend of the process proves all layers once; 0 = off.",
+   "id": "FLLIPER_DEBUG_MOE_POOL_EAGER_DEVICE_EM_CHECK",
+   "kind": "env",
+   "level": "expert",
+   "name": "FLLIPER_DEBUG_MOE_POOL_EAGER_DEVICE_EM_CHECK",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 3885,
+    "tree": "nf"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "EnvInt"
+  },
   "FLLIPER_DEBUG_PP_HOST_PERIOD": {
    "bare": false,
    "choices": null,
@@ -37993,7 +38021,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4891,
+    "line": 4946,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -38311,7 +38339,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4890,
+    "line": 4945,
     "tree": "nf"
    },
    "status": "harvested",
@@ -52190,6 +52218,34 @@
    ],
    "type": "EnvBool"
   },
+  "FLLIPER_OPT_MOE_OFFLOAD_PINNED_WAVE_IDX": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "True",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "S51: the expert-major host loop stages each wave slice's pair indices through PINNED host memory (_h2d_i64) instead of a pageable ``torch.from_numpy(...).to(device, non_blocking=True)`` -- pageable -> device is host-blocking (fn3g, the _build_lut note), so every wave of every layer waited for its own fetch before the host could launch the apply. Same values, same tensor. False: the pageable copy as before.",
+   "id": "FLLIPER_OPT_MOE_OFFLOAD_PINNED_WAVE_IDX",
+   "kind": "env",
+   "level": "expert",
+   "name": "FLLIPER_OPT_MOE_OFFLOAD_PINNED_WAVE_IDX",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 3892,
+    "tree": "nf"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "EnvBool"
+  },
   "FLLIPER_OPT_MOE_POOL_DEFER_EAGER_SYNC": {
    "bare": false,
    "choices": null,
@@ -52218,6 +52274,118 @@
     "nf"
    ],
    "type": "EnvBool"
+  },
+  "FLLIPER_OPT_MOE_POOL_EAGER_DEVICE_EM": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "True",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "S51 EAGER-DEVICE-EM (18.10., NF D rc13): an eager forward PAST the D-Mini-Extend graph form (every D extend of more than ~24 tokens) runs a device-planned EXPERT-MAJOR pass instead of the host plan. rc13 D TP0: extends of 64-255 tokens cost 1.33 s median (PDFLIP-VRAM-PEAK chunk window) for ~0.40 s of expert bytes at the 5090's link (Gen4 x8, 14.4 GB/s card probe) -- the rest is the host plan's per-layer routing D2H, the Python plan and the per-wave launch chain, during which the GPU idles (y3u: 2-6-token extends 403-739 gpu-ms on the host plan, ~25 ms on the device step). The pass: the pool step plans the forward's DISTINCT experts (one lane per local expert, <= the step width, so the captured kernel is reused as is), copies its misses on the device, and every (token, k) pair is computed exactly once as its own top_k=1 row into the [T*K, H] partials table in the wave whose step served its expert; the top-k reduction runs once at the end (combine_topk_partials) -- the host expert-major path's arithmetic, so the output is the host plan's (same rows, same bytes, same combine). No routing D2H, no host plan, no sync_pool_from_host. False: every forward past the graph form plans on the host as before. Rank-local choice, no collective inside the MoE (R11). Needs FLLIPER_OPT_MOE_POOL_EAGER_DEVICE_STEP.",
+   "id": "FLLIPER_OPT_MOE_POOL_EAGER_DEVICE_EM",
+   "kind": "env",
+   "level": "expert",
+   "name": "FLLIPER_OPT_MOE_POOL_EAGER_DEVICE_EM",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 3857,
+    "tree": "nf"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "EnvBool"
+  },
+  "FLLIPER_OPT_MOE_POOL_EAGER_DEVICE_EM_MAX_IDS": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "20480",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "S51: the most routed ids (T x top-k) one EAGER-DEVICE-EM forward takes; longer extends keep the host plan. 20480 = 2048 tokens at top-k 10 = 97 % of rc13's D extends (837 of 863 on TP0). Every wave runs over all lanes (the unserved ones on the zero row), so the extra zero-row GEMM grows with T: ~0.95 x T x K rows per extra wave, ~0.2 s per extend on a 3080 at T=2048 against the ~0.7 s of host-plan overhead it removes. The workspace stays sliced (FLLIPER_OPT_MOE_POOL_EAGER_DEVICE_EM_SLICE). 0 = no bound.",
+   "id": "FLLIPER_OPT_MOE_POOL_EAGER_DEVICE_EM_MAX_IDS",
+   "kind": "env",
+   "level": "expert",
+   "name": "FLLIPER_OPT_MOE_POOL_EAGER_DEVICE_EM_MAX_IDS",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 3866,
+    "tree": "nf"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "EnvInt"
+  },
+  "FLLIPER_OPT_MOE_POOL_EAGER_DEVICE_EM_SLICE": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "4096",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "S51: (token, k) pairs one grouped GEMM of an EAGER-DEVICE-EM wave takes at once (every wave runs over all T x K lanes, the unserved ones on the zero row at weight 0, so the slice bounds the per-wave workspace).",
+   "id": "FLLIPER_OPT_MOE_POOL_EAGER_DEVICE_EM_SLICE",
+   "kind": "env",
+   "level": "expert",
+   "name": "FLLIPER_OPT_MOE_POOL_EAGER_DEVICE_EM_SLICE",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 3874,
+    "tree": "nf"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "EnvInt"
+  },
+  "FLLIPER_OPT_MOE_POOL_EAGER_DEVICE_EM_WAVES": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "4",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "S51: at most this many pool waves per EAGER-DEVICE-EM forward (the bound min(E_local, E - R) <= waves x (LRU + staging) must hold; NF D: 2 on every rank). A layer that needs more keeps the host plan.",
+   "id": "FLLIPER_OPT_MOE_POOL_EAGER_DEVICE_EM_WAVES",
+   "kind": "env",
+   "level": "expert",
+   "name": "FLLIPER_OPT_MOE_POOL_EAGER_DEVICE_EM_WAVES",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 3870,
+    "tree": "nf"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "EnvInt"
   },
   "FLLIPER_OPT_MOE_POOL_EAGER_DEVICE_STEP": {
    "bare": false,
@@ -53833,7 +54001,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4608,
+    "line": 4663,
     "tree": "nf"
    },
    "status": "harvested",
@@ -60881,7 +61049,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 3915
+      "line": 3970
      }
     }
    },
@@ -61271,7 +61439,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4587
+      "line": 4642
      }
     }
    },
@@ -62248,7 +62416,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4567
+      "line": 4622
      }
     }
    },
@@ -65824,7 +65992,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4698
+      "line": 4753
      }
     }
    },
@@ -68952,7 +69120,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4496
+      "line": 4551
      }
     }
    },
@@ -73300,7 +73468,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4613,
+    "line": 4668,
     "tree": "nf"
    },
    "status": "harvested",
@@ -77956,7 +78124,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4685
+      "line": 4740
      }
     }
    },
@@ -89712,28 +89880,28 @@
  "schema": "flliper.catalog/1",
  "stats": {
   "curated": 125,
-  "entries": 2828,
-  "envs": 1949,
+  "entries": 2834,
+  "envs": 1955,
   "explained": 310,
   "flags": 864,
-  "harvested": 1739,
+  "harvested": 1745,
   "trees": {
    "abweichung": 51,
    "beide": 2463,
    "nur_27b": 180,
-   "nur_nf": 167
+   "nur_nf": 173
   },
   "unexplained": 654
  },
- "tree_rev": "27b=0798c91fcd+nf=2be8ad0339",
+ "tree_rev": "27b=0798c91fcd+nf=rc14-s51r-merge",
  "trees": {
   "27b": {
    "entries": 2643,
    "rev": "0798c91fcd"
   },
   "nf": {
-   "entries": 2630,
-   "rev": "2be8ad0339"
+   "entries": 2636,
+   "rev": "rc14-s51r-merge"
   }
  },
  "warnungen": []
