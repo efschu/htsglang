@@ -224,6 +224,8 @@ class _State:
     #: that will compute deeper (``FLLIPER_PDFLIP_P_TWIN_CHAIN``)
     chain: bool = False
     n_chain: int = 0
+    #: S79r A1: sources that vanished without finishing (aborted in the queue)
+    n_gone: int = 0
     #: rule 6: rid -> PP0 intake sequence (age order; only an OLDER sibling is
     #: waited for, Prio = Alter), bounded by _FLAG_CAP
     order: Dict[str, int] = field(default_factory=dict)
@@ -451,7 +453,10 @@ def _chain_source(st: "_State", w: "_Wait", rid: str, older: List[Any],
     now and compute from their told) and the requests in flight on P that are
     not themselves held (``live``), never the twin's own sources -- and only
     those OLDER than the twin by PP0's intake order (Prio = Alter: a twin never
-    waits for a younger request). A candidate
+    waits for a younger request). S79r H2: P admits fcfs today
+    (``schedule_policy='fcfs'``, no priority scheduling), so the intake sequence
+    IS the age order; should P ever sort by ``(priority, wait_queue_entry_time)``,
+    rule 6 must take that same key, or "older" stops meaning the user's age rule. A candidate
     counts only when its twin boundary ``B = floor_page(shared - 1)`` with this
     twin lies strictly DEEPER than the boundary of what its sources shared
     (``w.shared``) -- otherwise waiting reads nothing more -- and it keeps a
@@ -744,11 +749,37 @@ def release_due(scheduler, queued) -> List[Tuple[Any, bool]]:
         w.done_pass, w.done_t = None, None
         return True
 
+    # S79r A1 (review nf-review-s79-1019): a source aborted while still in the
+    # waiting queue (scheduler `_abort_request_now`, "Abort method 1") is popped
+    # WITHOUT a finished_reason -- `finished()` stays False forever and the twin
+    # was held to its Frist (harness: 119 s). A source that is neither finished,
+    # nor in flight (inflight(): queue, dormant hold, chunked, running, rings),
+    # nor just finished (st.recent) is gone: it leaves the wait, and the twin is
+    # re-chained or released in this same pass. Every rule (1-6), not only 6.
+    alive = {id(r) for r in inflight(scheduler)}
+
+    def _gone(s) -> bool:
+        fin = getattr(s, "finished", None)
+        if callable(fin) and fin():
+            return False
+        return id(s) not in alive and _rid(s) not in st.recent
+
     for rid in list(st.waits):
         w = st.waits[rid]
         if rid not in queued:
             st.waits.pop(rid, None)
             continue
+        _gone_now = [s for s in w.sources if _gone(s)]
+        if _gone_now:
+            st.n_gone += 1
+            if _say(st.n_gone):
+                logger.info(
+                    "#TW TWIN-SOURCE-GONE rid=%s gone=%s left=%d (n=%d): a source left P "
+                    "without finishing (aborted in the queue) -- it is no reason to wait.",
+                    rid, [_rid(s) for s in _gone_now], len(w.sources) - len(_gone_now), st.n_gone,
+                )
+            gone_ids = {id(s) for s in _gone_now}
+            w.sources = [s for s in w.sources if id(s) not in gone_ids]
         # Rule 4: drop the sources that turned out to bring nothing (their
         # start depth is known now); none left -> no reason to wait.
         _before = list(w.sources)

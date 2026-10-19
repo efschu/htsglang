@@ -286,3 +286,110 @@ def test_default_is_on():
     from flliper.srt.environ import envs
 
     assert envs.FLLIPER_PDFLIP_P_TWIN_CHAIN.get() is True
+
+
+# ---- S79r (review nf-review-s79-1019): A1, A2a, A2b, H1 ------------------------------
+
+
+def _chain_metal(sched):
+    """The metal shape up to the chain: 0-1 released, 0-4 and 0-5 chained behind it."""
+    src, a, b, c = _metal_intake(sched)
+    _finish_and_settle(sched, src, {a.rid, b.rid, c.rid})
+    assert tw.release_due(sched, {a.rid, b.rid, c.rid}) == [(a, True)]
+    tw.take_pp0_twin(sched, a.rid)
+    return src, a, b, c
+
+
+def test_a1_a_chained_sibling_aborted_in_the_queue_releases_its_twins(pp0):
+    """'Abort method 1' pops 0-1 from the queue without a finished_reason: finished()
+    stays False. rc17 form of rules 1-5 and S79 before the review: 0-4/0-5 held to the
+    Frist (119 s). Now: released in the next pass, as ordinary requests."""
+    src, a, b, c = _chain_metal(pp0)
+    pp0.waiting_queue = [b, c]                     # 0-1 aborted in the queue, never finished
+    tw.tick(pp0)
+    out = tw.release_due(pp0, {b.rid, c.rid})
+    assert [r.rid for r, _t in out] == [b.rid, c.rid]
+    assert all(t is False for _r, t in out)
+    assert tw.state(pp0).n_gone == 2
+    assert not tw.is_deferred(pp0, b.rid) and not tw.is_deferred(pp0, c.rid)
+
+
+def test_a1_a_gone_source_of_rules_1_to_5_releases_too(pp0):
+    """The same class without a chain: the source 0-2 aborted in the queue before it ran."""
+    src = _R("pdflip-0-2", SRC, head=S0)
+    pp0.waiting_queue = [src]
+    b = _R("pdflip-0-4", B)
+    assert tw.intake_defer(pp0, b) is True           # provisional behind the queued source
+    pp0.waiting_queue = [b]                          # 0-2 aborted
+    tw.tick(pp0)
+    assert tw.release_due(pp0, {b.rid}) == [(b, False)]
+
+
+def test_a1_a_live_source_is_not_gone(pp0):
+    """A source still in flight (chunked) or just finished (settle) stays a source."""
+    src, a, b, c = _chain_metal(pp0)
+    pp0.waiting_queue = [b, c]
+    _admit(pp0, a, SH_SRC - 1)                       # in flight: chunked_req
+    assert tw.release_due(pp0, {b.rid, c.rid}) == []
+    assert tw.state(pp0).n_gone == 0
+
+
+def test_a2a_the_frist_from_the_intake_bounds_two_chain_links(pp0):
+    """0-4 chains behind 0-1, then behind 0-3 (older than 0-4, chained behind 0-1 at the
+    first link, shares 154 with 0-4); 0-3 never finishes. 0-4 leaves its hold at intake +
+    Frist -- not at the second link + Frist (mutant M5)."""
+    src = _R("pdflip-0-2", SRC, head=S0)
+    a = _R("pdflip-0-1", A)
+    a3 = _R("pdflip-0-3", B[:154] + [55] * 6)
+    b = _R("pdflip-0-4", B)
+    _admit(pp0, src, S0)
+    pp0.waiting_queue = []
+    for t in (a, a3, b):
+        assert tw.intake_defer(pp0, t) is True
+        pp0.waiting_queue.append(t)
+    t_intake = pp0.clock.t
+    _finish_and_settle(pp0, src, {a.rid, a3.rid, b.rid})
+    assert tw.release_due(pp0, {a.rid, a3.rid, b.rid}) == [(a, True)]          # link 1
+    st = tw.state(pp0)
+    assert [x.rid for x in st.waits[a3.rid].sources] == [a.rid]
+    assert [x.rid for x in st.waits[b.rid].sources] == [a.rid]
+    pp0.waiting_queue = [a3, b]
+    _admit(pp0, a, SH_SRC - 1)
+    _finish_and_settle(pp0, a, {a3.rid, b.rid})
+    assert tw.release_due(pp0, {a3.rid, b.rid}) == [(a3, True)]                # link 2 for b
+    assert [x.rid for x in st.waits[b.rid].sources] == [a3.rid]
+    _admit(pp0, a3, SH_SRC - 1)                      # 0-3 runs (its promise holds) and never finishes
+    pp0.clock.t = t_intake + tw.DEFAULT_WAIT_S - 0.5
+    assert tw.release_due(pp0, {b.rid}) == []
+    pp0.clock.t = t_intake + tw.DEFAULT_WAIT_S + 0.5
+    assert tw.release_due(pp0, {b.rid}) == [(b, False)]                         # the Frist
+
+
+def test_a2b_a_candidate_without_an_intake_age_never_chains(pp0):
+    """0-9 never passed PP0's intake (no age): it is no chain source (mutant M2)."""
+    src = _R("pdflip-0-2", SRC, head=S0)
+    b = _R("pdflip-0-4", B)
+    _admit(pp0, src, S0)
+    assert tw.intake_defer(pp0, b) is True
+    y = _R("pdflip-0-9", B[:152] + [66] * 8)          # deeper, in the queue, no intake age
+    pp0.waiting_queue = [y, b]
+    _finish_and_settle(pp0, src, {b.rid, y.rid})
+    assert tw.release_due(pp0, {b.rid, y.rid}) == [(b, True)]
+    assert tw.state(pp0).n_chain == 0
+
+
+def test_h1_a_held_twin_is_no_chain_source(pp0):
+    """0-5 shares 152 with the held (chained) 0-4 but 150 with the released 0-1: it waits
+    behind 0-1, never behind a twin that computes nothing yet (mutant M7)."""
+    src = _R("pdflip-0-2", SRC, head=S0)
+    a, b = _R("pdflip-0-1", A), _R("pdflip-0-4", B)
+    c = _R("pdflip-0-5", B[:152] + [44] * 8)
+    _admit(pp0, src, S0)
+    pp0.waiting_queue = []
+    for t in (a, b, c):
+        assert tw.intake_defer(pp0, t) is True
+        pp0.waiting_queue.append(t)
+    _finish_and_settle(pp0, src, {a.rid, b.rid, c.rid})
+    assert tw.release_due(pp0, {a.rid, b.rid, c.rid}) == [(a, True)]
+    st = tw.state(pp0)
+    assert [x.rid for x in st.waits[c.rid].sources] == [a.rid]
