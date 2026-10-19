@@ -230,3 +230,19 @@ def test_launcher_reads_each_d_ranks_link_by_uuid(monkeypatch):
     del table["GPU-x4"]
     none, why = L.d_owned_extend_h2d(cards)
     assert none is None and "nvml0" in why
+
+
+def test_sync_holds_the_extend_against_form_a_even_when_decode_wants_the_slow_link():
+    """The other danger direction: a decode price that makes the x4 card look
+    cheap must not buy a round by slowing every extend -- with the extend's
+    weight ~0 the extend max still stays at or under Form A's (the guard, not
+    the objective, holds it)."""
+    row_ms = er.owned_extend_row_ms(H2D, ROW_BYTES)
+    sol = er.solve_owned_cut(
+        solve_at, HAND, 0, miss_ms=POOLED, miss_ms_rank=(1.0, 0.01, 1.0),
+        bs_weights=er.OWNED_BS_WEIGHTS_DEFAULT, x1_scope="sync", extend_row_ms=row_ms,
+        extend_ids=EXT_IDS, extend_per_round=1e-9, **KW, **LIMITS)
+    assert sol.x1_ok
+    assert max(sol.extend_ms) <= max(sol.base_extend_ms) + 1e-9
+    # the decode price pulled ownership onto TP1 up to the guard
+    assert sol.ratios[1] > HAND[1] and max(sol.extend_ms) == sol.extend_ms[1]
