@@ -425,3 +425,18 @@ def test_b1_post_wake_settle_source_is_not_gone(pp0):
     assert tw.release_due(pp0, {b.rid}) == []
     assert tw.state(pp0).n_gone == 0
     assert tw.is_deferred(pp0, b.rid)
+
+
+def test_b1_settle_half_read_gives_no_s0_admission_does(pp0):
+    """Reviewer test /tmp/rv79d-tests/test_rv79d_b1_1019.py: a source parked in the
+    post-wake settle with a half read gives no start depth s0 (rule 4/5 would read a
+    band from it); its real admission with prefix 30 does."""
+    src, b = _held_twin_b1(pp0)
+    pp0.waiting_queue = [b]
+    src.prefix_indices = [0] * 7                      # half read while parked
+    pp0.pdflip_post_wake_settle = [src]
+    tw.tick(pp0)
+    assert src.rid not in tw.state(pp0).s0
+    pp0.pdflip_post_wake_settle = []
+    _admit(pp0, src, 30)                              # really admitted: s0 = its prefix then
+    assert tw.state(pp0).s0[src.rid] == 30
