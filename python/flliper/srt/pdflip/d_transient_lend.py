@@ -52,6 +52,28 @@ LINE (rank-local, one per lend / return):
 
     PDFLIP D-TRANSIENT-LEND rank=1 lend rows_on 15->23 card_free_mib=1850
       floor_mib=700 budget_mib=1150 lent_total=.. returned_total=..
+
+S78 KEEP-SHORT (19.10., ``FLLIPER_PDFLIP_D_LEND_KEEP_SHORT``, default ON). rc17 D
+(``..._1019_171636``): 381 lends and 312 returns in 45 min -- one cycle per short
+request. The return before a short mixed extend left 2.0-2.2 GiB free (p50) at the
+forward's start on every rank, while the forward grew the allocator by <= 65-437 MiB
+(T < 1024, ``PDFLIP-VRAM-PEAK phase=chunk``): ~1.3-1.5 GiB of expert rows per card
+sat empty through the forward the experts were needed in, and the re-lend after it
+paused the decodes ~300 ms (``D-DECODE-GAP`` tails with a lend, p50 312 ms). Now a
+pending extend that is SHORT by the front's own R2 verdict (every waiting request
+carries halbX and its priced uncached is under it, no chunked request; replicated, so
+the verdict is group-uniform) gives back only the cells above the largest lattice k
+that leaves ``lend floor + 300 + rate x rows`` MiB free -- the rc12g chunk model's
+price (``extend_trim.chunk_need_mib``), so the width vote still funds the whole
+request in one chunk. Before the built extend runs the same price is taken with the
+batch's exact rows. A big or unpriced extend, or a rank without a chunk rate, returns
+everything as before. After a partial return the next lend verdict tops the lend up
+again (one ``lend`` line, cells mapped only for the difference). Amount rank-local as
+before; the switch off = the full return byte for byte. Lines::
+
+    PDFLIP D-TRANSIENT-LEND rank=0 keep rows_on 15 (short extend pending rows=312
+      need_mib=1250 card_free_mib=1380)
+    PDFLIP D-TRANSIENT-LEND rank=0 return rows_on 15->11 (short extend pending ...)
 """
 
 from __future__ import annotations
@@ -68,13 +90,16 @@ MIB = 1 << 20
 
 class LendGate:
     """REPLICATED: the decode/idle streak of the D group (the batch kind is
-    the same on every rank). ``step`` answers return / lend / hold."""
+    the same on every rank). ``step`` answers return / lend / hold.
+    ``topup`` (S78, rank-local): a short extend gave back only part of the
+    lend -- the next lend verdict may map the difference again."""
 
-    __slots__ = ("settle", "streak")
+    __slots__ = ("settle", "streak", "topup")
 
     def __init__(self, settle: int):
         self.settle = max(1, int(settle))
         self.streak = 0
+        self.topup = False
 
     def step(self, kind: str) -> str:
         if kind == "extend":
@@ -154,25 +179,135 @@ def _rank(sched) -> int:
     return int(rank or 0)
 
 
+def _gap_note(sched, cause: str) -> None:
+    """S78: name the lend move in the decode pause it may cause (D-DECODE-GAP, read-only)."""
+    try:
+        from flliper.srt.pdflip import d_decode_gap
+
+        d_decode_gap.note(sched, cause)
+    except Exception:  # noqa: BLE001 -- an instrument never stops a lend
+        pass
+
+
 def _give_back(sched, ctl, why: str) -> Optional[str]:
     if ctl.lent_from is None:
         return None
     before = int(ctl.rows_on)
     n = ctl.unlend()
+    _gate(sched).topup = False
     if n:
+        _gap_note(sched, "lend_return")
         logger.info("%s rank=%d return rows_on %d->%d (%s) lent_total=%d returned_total=%d",
                     MARK, _rank(sched), before, int(ctl.rows_on), why, ctl.lent_rows,
                     ctl.returned_rows)
     return "return" if n else None
 
 
+def keep_short_on() -> bool:
+    """S78 KEEP-SHORT switch (default ON)."""
+    try:
+        from flliper.srt.environ import envs
+
+        return bool(envs.FLLIPER_PDFLIP_D_LEND_KEEP_SHORT.get())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _decode_rows(sched) -> int:
+    """The running decodes a mixed batch folds in (one row each)."""
+    try:
+        return len(getattr(getattr(sched, "running_batch", None), "reqs", None) or ())
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def short_pending_rows(sched) -> Optional[int]:
+    """S78: the rows the pending extend work may need when ALL of it is SHORT by
+    the front's R2 verdict -- every waiting request carries the front's halbX and
+    priced uncached with ``priced < halbX`` (first admission only, the same
+    ``front_x.request_front_x`` the X gate reads), no chunked request -- summed,
+    plus the running decodes a mixed batch folds in. ``None`` = big, unpriced
+    or nothing pending: the full return. Replicated inputs only (the queue and
+    the carried headers are the same on every D rank)."""
+    if getattr(sched, "chunked_req", None) is not None:
+        return None
+    queue = list(getattr(sched, "waiting_queue", None) or ())
+    if not queue:
+        return None
+    try:
+        from flliper.srt.pdflip import front_x
+
+        total = 0
+        for req in queue:
+            hx = getattr(req, front_x.ATTR_HALFX, None)
+            _x, priced = front_x.request_front_x(req)
+            if hx is None or priced is None or int(hx) <= 0 or int(priced) >= int(hx):
+                return None
+            total += max(0, int(priced))
+    except Exception:  # noqa: BLE001 -- unreadable = unpriced = the full return
+        return None
+    return total + _decode_rows(sched)
+
+
+def batch_rows(batch) -> Optional[int]:
+    """The exact rows of a built extend batch (prefill tokens + folded decode rows)."""
+    try:
+        if batch is None or not batch.forward_mode.is_extend():
+            return None
+        return int(batch.extend_num_tokens)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _keep_short(sched, ctl, rows: int, why: str) -> Optional[str]:
+    """S78 KEEP-SHORT: give back only the lent cells the extend's price needs.
+
+    Price = this rank's lend floor + the rc12g chunk model's ``300 + rate x rows``
+    (``extend_trim.chunk_need_mib``); no floor, no rate or no card reading = the
+    full return (nothing is guessed). Returns ``return`` when rows moved,
+    ``keep`` when the card already holds the price, else None."""
+    from flliper.srt.pdflip import d_seat_vram as dsv
+    from flliper.srt.pdflip import extend_trim
+
+    rank = _rank(sched)
+    floor = dsv.lend_floor_mib_for_rank(rank)
+    need = extend_trim.chunk_need_mib(rank, int(rows))
+    free = _card_free_bytes()
+    if floor is None or need is None or free is None:
+        return _give_back(sched, ctl, why + " (unpriced)")
+    need_mib = float(floor) + float(need)
+    need_bytes = int(need_mib * MIB)
+    before = int(ctl.rows_on)
+    k = ctl.unlend_target(need_bytes, free)
+    gate = _gate(sched)
+    if k >= before:
+        logger.info("%s rank=%d keep rows_on %d (%s rows=%d need_mib=%d card_free_mib=%d)",
+                    MARK, rank, before, why, int(rows), int(need_mib), free // MIB)
+        gate.topup = False
+        return "keep"
+    n = ctl.unlend_to(k)
+    gate.topup = ctl.lent_from is not None
+    if n:
+        _gap_note(sched, "lend_return")
+        logger.info("%s rank=%d return rows_on %d->%d (%s rows=%d need_mib=%d card_free_mib=%d) "
+                    "lent_total=%d returned_total=%d", MARK, rank, before, int(ctl.rows_on), why,
+                    int(rows), int(need_mib), free // MIB, ctl.lent_rows, ctl.returned_rows)
+    return "return" if n else None
+
+
 def round_start(sched) -> Optional[str]:
     """Top of ``get_next_batch_to_run``: extend work pending -> the lend goes
-    back BEFORE the round's width vote and EXTEND-TRIM read the card."""
+    back BEFORE the round's width vote and EXTEND-TRIM read the card (S78: only
+    the short extend's price when all pending work is short)."""
     ctl = _controller(sched)
     if ctl is None or not extend_pending(sched):
         return None
     _gate(sched).streak = 0
+    if ctl.lent_from is None:
+        return None
+    rows = short_pending_rows(sched) if keep_short_on() else None
+    if rows is not None:
+        return _keep_short(sched, ctl, rows, "short extend pending")
     return _give_back(sched, ctl, "extend pending")
 
 
@@ -188,12 +323,25 @@ def on_batch(sched, batch) -> Optional[str]:
     kind = batch_kind(batch)
     if kind != "extend" and extend_pending(sched):
         kind = "extend"  # a waiting queue lends nothing (its extend is next)
-    verdict = _gate(sched).step(kind)
+    gate = _gate(sched)
+    verdict = gate.step(kind)
     rank = _rank(sched)
     if verdict == "return":
+        if keep_short_on() and ctl.lent_from is not None:
+            # S78: the built extend's exact rows price it; a decode batch with a
+            # waiting queue reprices the pending work (big/unpriced: full return)
+            rows = batch_rows(batch)
+            if rows is None:
+                rows = short_pending_rows(sched)
+            if rows is not None:
+                return _keep_short(sched, ctl, rows, "before the short extend")
         return _give_back(sched, ctl, "before the extend")
-    if verdict != "lend" or ctl.lent_from is not None:
+    if verdict != "lend":
         return None
+    topup = ctl.lent_from is not None
+    if topup and not gate.topup:
+        return None  # one lend per settle (a full lend stays as it is)
+    gate.topup = False
     floor = dsv.lend_floor_mib_for_rank(rank)
     free = _card_free_bytes()
     if floor is None or free is None:
@@ -202,6 +350,7 @@ def on_batch(sched, batch) -> Optional[str]:
     before = int(ctl.rows_on)
     n = ctl.lend(budget)
     if n:
+        _gap_note(sched, "lend")
         logger.info("%s rank=%d lend rows_on %d->%d card_free_mib=%d floor_mib=%d budget_mib=%d "
                     "lent_total=%d returned_total=%d", MARK, rank, before, int(ctl.rows_on),
                     free // MIB, int(floor), budget // MIB, ctl.lent_rows, ctl.returned_rows)

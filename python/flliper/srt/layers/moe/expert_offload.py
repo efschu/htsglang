@@ -5191,6 +5191,10 @@ class MoEExpertOffloadCache:
         slice_pairs = _em_slice_pairs() or n_lanes
         partials = None
         combine_out = None
+        # S78 EM-FETCH: device time + rows/bytes of this layer's row copies (events, no sync)
+        from flliper.srt.layers.moe import em_fetch_probe
+
+        probe = em_fetch_probe.begin_layer(device)
         try:
             cfg.routed_scaling_factor = 1.0
             for wave in range(1, int(waves) + 1):
@@ -5199,8 +5203,11 @@ class MoEExpertOffloadCache:
                 owed = valid & (pending.index_select(0, safe) >= 0)
                 step(t, pending, buffers, spill=not last, wave=wave > 1, waves=waves,
                      capture_rows_on=getattr(self, "_pool_capture_on", 0))
+                e0 = probe.mark() if probe is not None else None
                 copy_rows(self._pool_srcs, self._pool_dsts, buffers.gather_src,
                           buffers.gather_dst, buffers.gather_count)
+                if probe is not None:
+                    probe.copied(e0, buffers.gather_count, self._em_fetch_row_bytes())
                 # read this wave's routes before the next step rewrites them
                 routes_e = buffers.routes[:E].to(torch.int64)
                 lane_route = routes_e.index_select(0, safe)
@@ -5248,7 +5255,22 @@ class MoEExpertOffloadCache:
             cfg.routed_scaling_factor = saved_rsf
         out_full = torch.empty((T, partials.shape[-1]), dtype=partials.dtype, device=device)
         combine_topk_partials(partials.view(T, K, -1), out_full, saved_rsf)
+        if probe is not None:
+            probe.end_layer(T)
         return combine_out._replace(hidden_states=out_full)
+
+    def _em_fetch_row_bytes(self) -> int:
+        """S78 EM-FETCH: the bytes ONE expert row moves over all pool tensors (host ints, cached)."""
+        rb = getattr(self, "_em_fetch_row_bytes_v", None)
+        if rb is None:
+            rb = 0
+            for src in self._pool_srcs:
+                try:
+                    rb += int(src.stride(0)) * int(src.element_size())
+                except Exception:  # noqa: BLE001 -- an odd source counts nothing
+                    pass
+            self._em_fetch_row_bytes_v = rb
+        return int(rb)
 
     def _pool_wave_step(self, ids, *, spill: bool, waves: int):
         """H95: one later wave -- plan ``ids`` (lanes not in this wave = -1),
