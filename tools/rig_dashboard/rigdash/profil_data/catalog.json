@@ -38053,7 +38053,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 5057,
+    "line": 5066,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -38371,7 +38371,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 5056,
+    "line": 5065,
     "tree": "nf"
    },
    "status": "harvested",
@@ -54112,7 +54112,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4762,
+    "line": 4771,
     "tree": "nf"
    },
    "status": "harvested",
@@ -61058,7 +61058,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4774,
+    "line": 4783,
     "tree": "nf"
    },
    "status": "harvested",
@@ -61783,7 +61783,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4741
+      "line": 4750
      }
     }
    },
@@ -62760,7 +62760,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4721
+      "line": 4730
      }
     }
    },
@@ -65428,7 +65428,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4230,
+    "line": 4239,
     "tree": "nf"
    },
    "status": "harvested",
@@ -66395,7 +66395,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4864
+      "line": 4873
      }
     }
    },
@@ -69579,7 +69579,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4650
+      "line": 4659
      }
     }
    },
@@ -72747,6 +72747,34 @@
    ],
    "type": "os.environ"
   },
+  "FLLIPER_PDFLIP_P_TWIN_CHAIN": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "True",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "TWIN CHAIN (S79, 19.10., NF rc17 boot ..._1019_171636 pdflip-0-1/0-4/0-5; pdflip/p_twin_defer.py rule 6): a held twin released in the same PP0 pass as an OLDER sibling (released with it, or in flight and not deferred) that shares a deeper boundary with it than its own sources did, waits behind that sibling instead of registering its read now -- 0-4 shared 81565 with 0-1 but registered with it at told 3584 and prefilled 78023 tokens 0-1 published meanwhile. Bounded by the twin's Frist (since its intake). 0 = rc17 byte for byte.",
+   "id": "FLLIPER_PDFLIP_P_TWIN_CHAIN",
+   "kind": "env",
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_P_TWIN_CHAIN",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 4233,
+    "tree": "nf"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "EnvBool"
+  },
   "FLLIPER_PDFLIP_P_TWIN_DEFER": {
    "bare": false,
    "choices": null,
@@ -74280,7 +74308,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4779,
+    "line": 4788,
     "tree": "nf"
    },
    "status": "harvested",
@@ -75046,7 +75074,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4769,
+    "line": 4778,
     "tree": "nf"
    },
    "status": "harvested",
@@ -75709,7 +75737,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4240,
+    "line": 4249,
     "tree": "nf"
    },
    "status": "harvested",
@@ -75737,7 +75765,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4245,
+    "line": 4254,
     "tree": "nf"
    },
    "status": "harvested",
@@ -75765,7 +75793,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4252,
+    "line": 4261,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -75793,7 +75821,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4241,
+    "line": 4250,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -75821,7 +75849,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4250,
+    "line": 4259,
     "tree": "nf"
    },
    "status": "harvested",
@@ -75849,7 +75877,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4251,
+    "line": 4260,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -79393,7 +79421,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4851
+      "line": 4860
      }
     }
    },
@@ -91177,28 +91205,28 @@
  "schema": "flliper.catalog/1",
  "stats": {
   "curated": 125,
-  "entries": 2877,
-  "envs": 1998,
+  "entries": 2878,
+  "envs": 1999,
   "explained": 310,
   "flags": 864,
-  "harvested": 1778,
+  "harvested": 1779,
   "trees": {
    "abweichung": 53,
    "beide": 2463,
    "nur_27b": 180,
-   "nur_nf": 216
+   "nur_nf": 217
   },
   "unexplained": 664
  },
- "tree_rev": "27b=0798c91fcd+nf=22747c1759",
+ "tree_rev": "27b=0798c91fcd+nf=85d9ffbfff",
  "trees": {
   "27b": {
    "entries": 2643,
    "rev": "0798c91fcd"
   },
   "nf": {
-   "entries": 2679,
-   "rev": "22747c1759"
+   "entries": 2680,
+   "rev": "85d9ffbfff"
   }
  },
  "warnungen": []
