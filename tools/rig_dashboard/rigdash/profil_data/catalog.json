@@ -29450,6 +29450,38 @@
    ],
    "type": "EnvBool"
   },
+  "FLLIPER_ANTHROPIC_STRIP_ATTRIBUTION": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"1\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "",
+   "id": "FLLIPER_ANTHROPIC_STRIP_ATTRIBUTION",
+   "kind": "env",
+   "lesestellen": [
+    "entrypoints/anthropic/head_stability.py:76",
+    "entrypoints/anthropic/head_stability.py:169"
+   ],
+   "level": "expert",
+   "name": "FLLIPER_ANTHROPIC_STRIP_ATTRIBUTION",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "entrypoints/anthropic/head_stability.py",
+    "kind": "os.environ",
+    "line": 76,
+    "tree": "nf"
+   },
+   "status": "unexplained",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "os.environ"
+  },
   "FLLIPER_ANTHROPIC_XHIGH_EFFORT": {
    "bare": false,
    "choices": null,
@@ -55583,7 +55615,7 @@
      "source": {
       "file": "pdflip/front.py",
       "kind": "os.environ",
-      "line": 4367
+      "line": 4383
      }
     }
    },
@@ -68669,7 +68701,7 @@
      "source": {
       "file": "pdflip/front.py",
       "kind": "os.environ",
-      "line": 1207
+      "line": 1223
      }
     }
    },
@@ -69611,7 +69643,7 @@
    "id": "FLLIPER_PDFLIP_MODE_PARITY_CHECK",
    "kind": "env",
    "lesestellen": [
-    "pdflip/front.py:6555"
+    "pdflip/front.py:6571"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_MODE_PARITY_CHECK",
@@ -69620,7 +69652,7 @@
    "source": {
     "file": "pdflip/front.py",
     "kind": "os.environ",
-    "line": 6555,
+    "line": 6571,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -72003,7 +72035,7 @@
    "id": "FLLIPER_PDFLIP_P_DRAIN_EARLY_SETTLE",
    "kind": "env",
    "lesestellen": [
-    "pdflip/front.py:3513"
+    "pdflip/front.py:3529"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_P_DRAIN_EARLY_SETTLE",
@@ -72012,7 +72044,7 @@
    "source": {
     "file": "pdflip/front.py",
     "kind": "os.environ",
-    "line": 3513,
+    "line": 3529,
     "tree": "nf"
    },
    "status": "harvested",
@@ -77649,7 +77681,7 @@
      "source": {
       "file": "pdflip/front.py",
       "kind": "os.environ",
-      "line": 4465
+      "line": 4481
      }
     }
    },
@@ -90993,8 +91025,8 @@
  "schema": "flliper.catalog/1",
  "stats": {
   "curated": 125,
-  "entries": 2871,
-  "envs": 1992,
+  "entries": 2872,
+  "envs": 1993,
   "explained": 310,
   "flags": 864,
   "harvested": 1774,
@@ -91002,19 +91034,19 @@
    "abweichung": 53,
    "beide": 2463,
    "nur_27b": 180,
-   "nur_nf": 210
+   "nur_nf": 211
   },
-  "unexplained": 662
+  "unexplained": 663
  },
- "tree_rev": "27b=0798c91fcd+nf=a5df94fe45",
+ "tree_rev": "27b=0798c91fcd+nf=b52b4b9b53",
  "trees": {
   "27b": {
    "entries": 2643,
    "rev": "0798c91fcd"
   },
   "nf": {
-   "entries": 2673,
-   "rev": "a5df94fe45"
+   "entries": 2674,
+   "rev": "b52b4b9b53"
   }
  },
  "warnungen": []
