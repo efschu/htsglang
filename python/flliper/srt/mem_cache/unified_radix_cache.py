@@ -112,6 +112,7 @@ from flliper.srt.mem_cache.radix_cache import RadixKey
 from flliper.srt.pdflip.turn_anchor import PENDING_ATTR as _TURN_PENDING_ATTR
 from flliper.srt.pdflip.turn_anchor import TWIN_PENDING_ATTR as _TWIN_PENDING_ATTR
 from flliper.srt.pdflip.turn_anchor import FORK_PENDING_ATTR as _FORK_PENDING_ATTR
+from flliper.srt.pdflip.turn_anchor import GEN_PENDING_ATTR as _GEN_PENDING_ATTR
 
 
 def bigram_anchor_key(token_ids, cache_len: int, extra_key, *, is_bigram: bool,
@@ -2825,7 +2826,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # ride the same insert, in position order.
         if (getattr(req, _TURN_PENDING_ATTR, None) is not None
                 or getattr(req, _TWIN_PENDING_ATTR, None)
-                or getattr(req, _FORK_PENDING_ATTR, None) is not None):
+                or getattr(req, _FORK_PENDING_ATTR, None) is not None
+                or getattr(req, _GEN_PENDING_ATTR, None) is not None):
             self._pdflip_turn_insert(req, is_insert=is_insert)
 
         kv_committed_len = req.pop_committed_kv_cache()
@@ -3040,7 +3042,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # pending; unarmed nothing is asked) -- with the twin-boundary tracks
         if (getattr(req, _TURN_PENDING_ATTR, None) is not None
                 or getattr(req, _TWIN_PENDING_ATTR, None)
-                or getattr(req, _FORK_PENDING_ATTR, None) is not None):
+                or getattr(req, _FORK_PENDING_ATTR, None) is not None
+                or getattr(req, _GEN_PENDING_ATTR, None) is not None):
             self._pdflip_turn_insert(req)
 
         token_ids = req.get_fill_ids()

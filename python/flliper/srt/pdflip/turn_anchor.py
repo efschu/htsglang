@@ -89,6 +89,10 @@ TWIN_PENDING_ATTR = "_pdflip_twin_pending"
 #: (``req._pdflip_fork_told``, P-FORK-CUT) when the cut was not free -- one plan
 #: of the same shape as PENDING_ATTR's
 FORK_PENDING_ATTR = "_pdflip_fork_pending"
+#: GEN-FORK TRACK (S57, 19.10., NF rc15 pdflip-42-262): the step's track at the
+#: generation prompt's fork ``floor_page(g)`` when the step's own (END) track lies
+#: past it -- one plan of the same shape as PENDING_ATTR's
+GEN_PENDING_ATTR = "_pdflip_gen_pending"
 
 #: the generation prompt of a thinking Qwen3.x turn is 5 tokens, the
 #: non-thinking one 8; the same window the FORK ANCHOR uses.
@@ -363,6 +367,11 @@ def note_step(batch: Any, desc: Optional[TurnTracks], req: Any, row: int,
         _free_slot(batch, fk_stale[1])
         _decline_unconsumed(req, fk_stale[0])
         setattr(req, FORK_PENDING_ATTR, None)
+    gn_stale = getattr(req, GEN_PENDING_ATTR, None)
+    if gn_stale is not None:
+        _free_slot(batch, gn_stale[1])
+        _decline_unconsumed(req, gn_stale[0])
+        setattr(req, GEN_PENDING_ATTR, None)
     if not track_mask or len(getattr(req, "output_ids", None) or ()) > 0:
         return desc
     desc = _note_turn_twin_steps(batch, desc, req, row, prefix, end, main_track,
@@ -370,6 +379,9 @@ def note_step(batch: Any, desc: Optional[TurnTracks], req: Any, row: int,
     if fork_told:
         desc = _note_fork_step(batch, desc, req, row, prefix, end, main_track,
                                chunk, page, int(fork_told))
+    if tok is not None and gen_fork_armed():
+        desc = _note_gen_step(batch, desc, req, row, prefix, end, main_track,
+                              chunk, page, tok)
     return desc
 
 
@@ -572,11 +584,143 @@ def _note_fork_step(batch: Any, desc: Optional[TurnTracks], req: Any, row: int,
     return desc
 
 
+# -- GEN-FORK TRACK (S57) ----------------------------------------------------------
+GEN_POS_ATTR = "_pdflip_gen_pos"
+
+
+def gen_fork_armed() -> bool:
+    """``FLLIPER_PDFLIP_GEN_FORK_ANCHOR`` (default ON, new features on): the
+    generation-prompt fork track. Off = every path byte-identical to rc15.
+    Read per call (an env read, no state): the same answer on every rank of
+    one process group, which all boot with one env."""
+    try:
+        from flliper.srt.environ import envs
+
+        return bool(envs.FLLIPER_PDFLIP_GEN_FORK_ANCHOR.get())
+    except Exception:  # noqa: BLE001 - unreadable = off
+        return False
+
+
+def gen_fork_pos(ids: Optional[Sequence[int]], tok: Optional[int], grain: int,
+                 tail: int = GEN_TAIL) -> Optional[int]:
+    """The generation-prompt fork position ``floor_grain(g)``.
+
+    ``g`` is the index of the turn-start token that opens the prompt's
+    generation prompt (``fork_anchor.fork_cut``: the last ``<|im_start|>``
+    among the final ``tail`` ids, never the very last id). A SIBLING of this
+    request -- the same chat up to and including that ``<|im_start|>``, then a
+    different message instead of ``assistant`` -- shares ``ids[:g + 1]`` and
+    claims at most ``floor_page(g)`` (bigram keys take the next token too, the
+    bound turn/twin anchors sit on). Pure function of the ids and the env
+    token: every PP rank derives the same position, nothing is transported.
+
+    rc15 pdflip-40-260: N=49667, g=49662 -> 49600; its END anchor sat at
+    floor_page(N-1)=49664, past the sibling pdflip-42-262's common=49663."""
+    if tok is None or ids is None:
+        return None
+    from flliper.srt.pdflip import fork_anchor as _fa
+
+    g = _fa.fork_cut(ids, tok, tail)
+    if g is None:
+        return None
+    grain = max(1, int(grain))
+    t = (int(g) // grain) * grain
+    return t if t > 0 else None
+
+
+def req_gen_pos(req: Any, tok: int, grain: int) -> Optional[int]:
+    """``gen_fork_pos`` of a request's PROMPT, cached on the request."""
+    ids = getattr(req, "origin_input_ids", None)
+    if ids is None:
+        return None
+    key = (len(ids), int(tok), int(grain))
+    cached = getattr(req, GEN_POS_ATTR, None)
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    t = gen_fork_pos(ids, tok, grain)
+    try:
+        setattr(req, GEN_POS_ATTR, (key, t))
+    except Exception:  # noqa: BLE001
+        pass
+    return t
+
+
+def _note_gen_step(batch: Any, desc: Optional[TurnTracks], req: Any, row: int,
+                   prefix: int, end: int, main_track: Optional[int], chunk: int,
+                   page: int, tok: int) -> Optional[TurnTracks]:
+    """GEN-FORK TRACK (S57, 19.10.; NF rc15 ..._1019_071429, pdflip-40-260 / 42-262).
+
+    THE MEASURED GAP. 40-260 (N=49667) ran ONE step [39424, 49667). Its tracks:
+    the END anchor at floor_page(N-1) = 49664 ('PDFLIP END-ANCHOR ... anchor=49664
+    target=49666') and no turn track -- its last message started inside the
+    step's first page, so the turn position floor_page(i) = 39424 was the step
+    start itself (``step_target``: strictly inside). The sibling 42-262 shared
+    common=49663 = N-4 (through the generation prompt's ``<|im_start|>`` at
+    g = N-5) and claims floor_page(g) = 49600: the END anchor is ONE token past
+    it, the store had the KV to 49600 ('PDFLIP-CLAIM-SHORT ... kv=775 claimed=616
+    lost=159 by=mamba'), the Mamba anchor only at 39424 -> 10239 tokens
+    recomputed on P ('RECOMPUTE-ECHT-P rid=pdflip-42-262').
+
+    The END anchor serves a generation-prompt sibling only when
+    floor_page(N-1) <= g, i.e. ``N % page`` not in {1, ..., N-1-g}: with NF's
+    5-token generation prompt and page 64 it misses 4 of 64 prompt lengths.
+
+    THE REPAIR: in exactly that geometry -- ``floor_page(g)`` strictly inside the
+    step, below the step's own track, on its FLA grid (``step_target``) -- one
+    more track in the same forward, the turn anchor's machinery (one gather row
+    per GDN/PLE layer, one mamba slot from the pool, no eviction, no reserve;
+    none free = no anchor, counted), inserted as its own node before the step's
+    insert and published with the chain. Skipped where the turn, a twin or the
+    fork track already writes the same position. A promise to a later twin
+    like the turn/fork track (S52, ``twin_anchor.note_track_planned``)."""
+    t = step_target(prefix, end, req_gen_pos(req, tok, page), chunk, main_track)
+    if t is None or t % max(1, int(page)) != 0:
+        return desc
+    rid = str(getattr(req, "rid", "?"))
+    if int(getattr(req, "cache_protected_len", 0) or 0) >= t:
+        return desc
+    taken = {int(p[0]) for p in (getattr(req, TWIN_PENDING_ATTR, None) or ())}
+    for attr in (PENDING_ATTR, FORK_PENDING_ATTR):
+        p = getattr(req, attr, None)
+        if p is not None:
+            taken.add(int(p[0]))
+    if t in taken:
+        n = _count("gen_shared")
+        if _log_due(n):
+            logger.info("PDFLIP GEN-FORK-ANCHOR SHARED rid=%s at=%d step=[%d,%d) (n=%d; the "
+                        "turn/twin/fork track writes this very position)", rid, t, prefix, end, n)
+        return desc
+    slot = _alloc_slot(batch)
+    if slot is None:
+        n = _count("gen_no_slot")
+        if _log_due(n):
+            logger.info("PDFLIP GEN-FORK-ANCHOR SKIP rid=%s reason=no_free_slot at=%d "
+                        "step=[%d,%d) (n=%d; no eviction, no reserve)", rid, t, prefix, end, n)
+        return desc
+    if desc is None:
+        desc = TurnTracks(len(batch.reqs), need=slot_state_kinds(batch.req_to_token_pool))
+    desc.add(row, slot, t, prefix, end - prefix)
+    setattr(req, GEN_PENDING_ATTR, (t, slot, desc, int(prefix), int(end)))
+    from flliper.srt.pdflip import twin_anchor as _tw
+
+    _tw.note_track_planned(rid, t)
+    n = _count("gen_planned")
+    if _log_due(n):
+        logger.info(
+            "PDFLIP GEN-FORK-ANCHOR TRACK n=%d rid=%s step=[%d,%d) at=%d prompt=%d main=%s "
+            "(extra extend track at the generation prompt's fork: the step's own track lies "
+            "past it, a sibling sharing the chat through <|im_start|> resumes here instead "
+            "of the previous anchor)", n, rid, prefix, end, t,
+            len(getattr(req, "origin_input_ids", None) or ()), main_track)
+    return desc
+
+
 def has_pending(req: Any) -> bool:
     """A turn, twin or fork plan waits for the tree's next insert of ``req``."""
     return (getattr(req, PENDING_ATTR, None) is not None
             or bool(getattr(req, TWIN_PENDING_ATTR, None))
-            or getattr(req, FORK_PENDING_ATTR, None) is not None)
+            or getattr(req, FORK_PENDING_ATTR, None) is not None
+            or getattr(req, GEN_PENDING_ATTR, None) is not None)
 
 
 def pop_all_pending(req: Any) -> List[Tuple[str, Any]]:
@@ -594,6 +738,10 @@ def pop_all_pending(req: Any) -> List[Tuple[str, Any]]:
     if fork is not None:
         setattr(req, FORK_PENDING_ATTR, None)
         out.append(("fork", fork))
+    gen = getattr(req, GEN_PENDING_ATTR, None)
+    if gen is not None:
+        setattr(req, GEN_PENDING_ATTR, None)
+        out.append(("gen", gen))
     out.sort(key=lambda kp: int(kp[1][0]))
     return out
 
@@ -712,11 +860,12 @@ def insert_verdict(pend) -> Tuple[bool, str]:
 
 
 def _label(kind: str) -> str:
-    return {"twin": "TWIN-ANCHOR", "fork": "FORK-ANCHOR"}.get(kind, "TURN-ANCHOR")
+    return {"twin": "TWIN-ANCHOR", "fork": "FORK-ANCHOR",
+            "gen": "GEN-FORK-ANCHOR"}.get(kind, "TURN-ANCHOR")
 
 
 def _kind_prefix(kind: str) -> str:
-    return kind + "_" if kind in ("twin", "fork") else ""
+    return kind + "_" if kind in ("twin", "fork", "gen") else ""
 
 
 def note_insert(req: Any, t: int, prefix_len: int, taken: bool, prompt: int,

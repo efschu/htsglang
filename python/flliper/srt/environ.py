@@ -4185,6 +4185,12 @@ class Envs:
     # behind the request (one more gather row, one mamba slot), and a twin
     # waits only for a source that promised an anchor <= shared. 0 = off.
     FLLIPER_PDFLIP_TWIN_ANCHOR = EnvBool(True)
+    # GEN-FORK TRACK (S57, 19.10., NF rc15 pdflip-42-262; pdflip/turn_anchor.py):
+    # where the turn anchor is armed, a prefill step whose own (END) track lies
+    # past the generation prompt's <|im_start|> (N % page in 1..4 on NF) also
+    # tracks the state at floor_page(g) -- where a sibling request forks. One
+    # gather row, one mamba slot, same forward. 0 = off (rc15 byte for byte).
+    FLLIPER_PDFLIP_GEN_FORK_ANCHOR = EnvBool(True)
     # fnFL2 H42b: burst assembly on the DECIDING P rank (PP0), only while
     # multi anchor tails are armed. A pass that would carry nothing but new
     # bodies is held back up to this many ms while more of a burst is still
