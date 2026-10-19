@@ -38021,7 +38021,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4993,
+    "line": 5005,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -38339,7 +38339,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4992,
+    "line": 5004,
     "tree": "nf"
    },
    "status": "harvested",
@@ -60884,6 +60884,34 @@
    ],
    "type": "os.environ"
   },
+  "FLLIPER_PDFLIP_D_ORPHAN_ABORT": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "True",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "S60 F6 (NF rc15 19.10.): a request D parks (PARK-RUNNING ``unknown_to_front``) that the front holds no D leg for is an orphan -- its client is gone, the abort missed it on D (rc15 pdflip-80-579: client gone 08:48:20, D decoded it to 09:13:55, ~13.8k tokens, ~133k KV tokens and a D running slot for nobody). The front aborts it on D at the park (R11: the front decides). 0 = it is only named in the PARK-RUNNING line, as before.",
+   "id": "FLLIPER_PDFLIP_D_ORPHAN_ABORT",
+   "kind": "env",
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_D_ORPHAN_ABORT",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 4722,
+    "tree": "nf"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "EnvBool"
+  },
   "FLLIPER_PDFLIP_D_PARK": {
    "bare": false,
    "choices": null,
@@ -66211,7 +66239,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4800
+      "line": 4812
      }
     }
    },
@@ -69552,7 +69580,7 @@
    "id": "FLLIPER_PDFLIP_MODE_PARITY_CHECK",
    "kind": "env",
    "lesestellen": [
-    "pdflip/front.py:6467"
+    "pdflip/front.py:6543"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_MODE_PARITY_CHECK",
@@ -69561,7 +69589,7 @@
    "source": {
     "file": "pdflip/front.py",
     "kind": "os.environ",
-    "line": 6467,
+    "line": 6543,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -73878,7 +73906,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4715,
+    "line": 4727,
     "tree": "nf"
    },
    "status": "harvested",
@@ -74569,6 +74597,34 @@
     "nf"
    ],
    "type": "os.environ"
+  },
+  "FLLIPER_PDFLIP_SHORT_GATE_BY_AGE": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "True",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "S60 F3 (NF rc15 19.10., PRIO=ALTER 14.10. / SOLL R2, R5): ONE age order between a kurz request waiting for a D seat (ARRIVAL-SEAT) and the hand-offs in the D line (``_ready_for_d``). A kurz arrival waits at the batch gate only for an OLDER D-line entry (before: for every one, up to --drain-deadline-s, outside every age order -- pdflip-108-779 116 s, pdflip-108-776 120 s then routed to P); the D line does not seat a younger head while an older ARRIVAL-SEAT waiter that is not blocked waits; a waiter's seat count holds only the OLDER D-line entries. Needs FLLIPER_PDFLIP_ENABLE_ARRIVAL_SEAT_RULE. 0 = the batch gate and the D line as before.",
+   "id": "FLLIPER_PDFLIP_SHORT_GATE_BY_AGE",
+   "kind": "env",
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_SHORT_GATE_BY_AGE",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 4717,
+    "tree": "nf"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "EnvBool"
   },
   "FLLIPER_PDFLIP_SHORT_KEPT_MAX_WAIT_S": {
    "bare": false,
@@ -78534,7 +78590,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4787
+      "line": 4799
      }
     }
    },
@@ -90290,28 +90346,28 @@
  "schema": "flliper.catalog/1",
  "stats": {
   "curated": 125,
-  "entries": 2847,
-  "envs": 1968,
+  "entries": 2849,
+  "envs": 1970,
   "explained": 310,
   "flags": 864,
-  "harvested": 1756,
+  "harvested": 1758,
   "trees": {
    "abweichung": 53,
    "beide": 2463,
    "nur_27b": 180,
-   "nur_nf": 186
+   "nur_nf": 188
   },
   "unexplained": 656
  },
- "tree_rev": "27b=0798c91fcd+nf=b5c3f1bbea",
+ "tree_rev": "27b=0798c91fcd+nf=fba4bc43dc",
  "trees": {
   "27b": {
    "entries": 2643,
    "rev": "0798c91fcd"
   },
   "nf": {
-   "entries": 2649,
-   "rev": "b5c3f1bbea"
+   "entries": 2651,
+   "rev": "fba4bc43dc"
   }
  },
  "warnungen": []
