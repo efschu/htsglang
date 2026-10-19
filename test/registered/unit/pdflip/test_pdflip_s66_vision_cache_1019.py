@@ -50,11 +50,13 @@ PAGE = 64
 class _Item:
     """A MultimodalDataItem stand-in: offsets, hash, pixels or not."""
 
-    def __init__(self, offsets, feature=None, hash=None, emb=None):
+    def __init__(self, offsets, feature=None, hash=None, emb=None, grid=None):
         self.offsets = offsets
         self.feature = feature
         self.hash = hash
         self.precomputed_embeddings = emb
+        n = sum(e - a + 1 for a, e in offsets)
+        self.model_specific_data = {"image_grid_thw": torch.tensor([grid or [1, 2, 2 * n]])}
 
     def is_image(self):
         return True
@@ -708,3 +710,97 @@ def test_emb_cache_miss_still_fetches_and_the_stage_keeps_the_rows(fresh_emb_cac
     assert V.skip_cached(s, [r]) == ([], [r]) and len(s.ipc_channels.send_to_tokenizer.sent) == 1
     src = inspect.getsource(V)
     assert src.count("emb_cache_store(items)") == 1 and src.count("emb_cache_store(st.items)") == 1
+
+
+
+# ---- S66c-r B1: the grid is part of an entry's identity ----------------------------------
+
+def test_review_s66c_transposed_blank_page_is_a_miss_not_the_other_grids_rows(monkeypatch, caplog):
+    """Reviewer test /tmp/rv66b/test_rv66c_grid_collision_1019.py, expectation turned: a blank A4 page portrait
+    (grid 1x84x60) and landscape (1x60x84) hash alike (Qwen2VLImageProcessor: 1634794136353122902) with 1260 rows
+    each; the tower's pos_embed is grid-interpolated -> other rows. Landscape must MISS (then FETCH / tower)."""
+    caplog.set_level(logging.INFO)
+    monkeypatch.setattr(V, "_EMB_CACHE", None)
+    H = 1634794136353122902
+
+    def item(grid):
+        return SimpleNamespace(offsets=[(10, 10 + 1260 - 1)], feature=torch.zeros(2), hash=H,
+                               precomputed_embeddings=None, image_grid_thw=torch.tensor([grid]),
+                               is_image=lambda: True)
+
+    sched = SimpleNamespace(model_config=SimpleNamespace(hf_config=SimpleNamespace(
+        vision_config=SimpleNamespace(out_hidden_size=8, deepstack_visual_indexes=[]))))
+    portrait = item([1, 84, 60])
+    portrait.precomputed_embeddings = torch.arange(1260 * 8, dtype=torch.float32).reshape(1260, 8)
+    assert V.emb_cache_store([portrait]) == 1
+    landscape = item([1, 60, 84])
+    req = SimpleNamespace(rid="rv-quer", multimodal_inputs=SimpleNamespace(mm_items=[landscape]))
+    assert V.emb_cache_attach(sched, req) is False
+    assert landscape.precomputed_embeddings is None and landscape.feature is not None
+    assert any("EMB-CACHE GRID-MISS rid=rv-quer" in m for m in caplog.messages), "the collision is named"
+    # the same grid still hits; both grids live side by side once both were staged
+    again = item([1, 84, 60])
+    assert V.emb_cache_attach(sched, SimpleNamespace(rid="rv-hoch", multimodal_inputs=SimpleNamespace(
+        mm_items=[again])))
+    landscape.precomputed_embeddings = torch.ones(1260, 8)
+    assert V.emb_cache_store([landscape]) == 1 and len(V._EMB_CACHE) == 2
+
+
+def test_an_item_without_a_grid_is_never_stored_nor_served(monkeypatch):
+    monkeypatch.setattr(V, "_EMB_CACHE", None)
+    it = SimpleNamespace(offsets=[(0, 3)], feature=None, hash=7, precomputed_embeddings=torch.ones(4, 8),
+                         is_image=lambda: True)
+    assert V.emb_cache_store([it]) == 0
+
+
+def test_h3_a_throwing_attach_falls_back_untouched(monkeypatch, caplog):
+    caplog.set_level(logging.WARNING)
+    monkeypatch.setattr(V, "_EMB_CACHE", None)
+    src = _req(rid="s", featureless=True, ends=(5000,))
+    V.emb_cache_store(_set_rows(src))
+    r = _req(rid="h3", featureless=True, ends=(5000,))
+    s = _sched(told={"h3": 0}, wq=[r])
+    def half_then_raise(items, rows, expected_width):
+        items[0].precomputed_embeddings, items[0].feature = rows[0], None  # half done, then a throw
+        raise ValueError("boom")
+
+    with mock.patch.object(V, "attach_precomputed_embeddings", side_effect=half_then_raise):
+        assert V.emb_cache_attach(s, r) is False
+        assert V.skip_cached(s, [r]) == ([], [r]) and len(s.ipc_channels.send_to_tokenizer.sent) == 1, \
+            "named fall back to FETCH"
+    assert r.multimodal_inputs.mm_items[0].precomputed_embeddings is None
+    assert any("EMB-CACHE REFUSED rid=h3" in m for m in caplog.messages)
+
+
+def test_h1_rc17_pdflip_6_245_behaviour_second_turn_sends_no_fetch(monkeypatch):
+    """H1 (review S66c): a behavioural repro without the cache API in the fixture -- turn 1 is a staged pass (the
+    fake stage attaches rows like run_rank_stage and keeps them where the tree keeps them), turn 2 is the rc17
+    order: told 96768 < image_end 96799. Base code (no EMB-CACHE): turn 2 sends a pixel FETCH."""
+    monkeypatch.setenv("FLLIPER_PDFLIP_VISION_EMB_CACHE_MB", "64")
+    monkeypatch.setattr(V, "_EMB_CACHE", None, raising=False)
+
+    def fake_stage(scheduler, reqs, **kw):
+        from flliper.srt.planner.vision_stage_load import attach_precomputed_embeddings
+
+        items = [it for r in reqs for it in V.unstaged_items(r)]
+        attach_precomputed_embeddings(items, [torch.full((sum(b - a + 1 for a, b in it.offsets), 8), 3.0)
+                                              for it in items], expected_width=8)
+        getattr(V, "emb_cache_store", lambda _i: 0)(items)  # what run_rank_stage does on the tree under test
+        return V.StageOutcome()
+
+    t1 = _req(rid="pdflip-5-240", ends=(95900, 96798))  # turn 1: pixels, same images (hashes set below)
+    for i, it in enumerate(t1.multimodal_inputs.mm_items):
+        it.hash = 1000 + i
+    s1 = _pass_sched(t1, told={"pdflip-5-240": 0})
+    s1.server_args = SimpleNamespace(model_path="/nonexistent")
+    s1.model_config = SimpleNamespace(hf_config=SimpleNamespace(
+        vision_config=SimpleNamespace(out_hidden_size=8, deepstack_visual_indexes=[])))
+    with mock.patch.object(V, "run_rank_stage", side_effect=fake_stage), mock.patch.object(V, "_rank_device",
+                                                                                         lambda: torch.device("cpu")):
+        V.vision_rank_pass(s1)
+    assert all(it.precomputed_embeddings is not None for it in t1.multimodal_inputs.mm_items), "turn 1 staged"
+    t2 = _req(rid="pdflip-6-245", featureless=True, ends=(95900, 96798))  # known images, hashes 1000/1001
+    s2 = _pass_sched(t2, told={"pdflip-6-245": 96768})
+    with mock.patch.object(V, "run_rank_stage", side_effect=AssertionError("tower ran")):
+        V.vision_rank_pass(s2)
+    assert s2.ipc_channels.send_to_tokenizer.sent == [], "turn 2 fetched pixels for rows encoded in turn 1"

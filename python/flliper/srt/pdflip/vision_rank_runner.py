@@ -268,6 +268,15 @@ def arm_ram_source(model_dir: str, env: Optional[Dict[str, str]] = None,
 # the item's placeholder count and the width the tower's ``out_hidden_size``.
 # Rows are stored and handed out as host copies (a request never shares its
 # rows tensor with the cache). Bounded in bytes, LRU.
+#
+# S66c-r B1 (review S66c): the content hash covers the pixel BYTES only, not
+# the grid -- a blank A4 page portrait (grid 1x84x60) and landscape (1x60x84)
+# hash alike (measured, Qwen2VLImageProcessor) and give 1260 rows each, while
+# the tower adds pos_embed interpolated to the grid: other rows. The identity
+# of an entry is therefore (hash, image_grid_thw): the key carries the grid,
+# the entry carries it again and the attach compares it; an item without a
+# readable grid is never stored nor served. (The radix shares such a page
+# only under a whole equal prefix, which pins the grid by the ids.)
 # ``FLLIPER_PDFLIP_VISION_EMB_CACHE_MB`` (default 1024; 0 = off).
 VISION_EMB_CACHE_ENV = "FLLIPER_PDFLIP_VISION_EMB_CACHE_MB"
 W_EMB_CACHE = "W102 PdFlipVisionStage EMB-CACHE"
@@ -293,6 +302,28 @@ def emb_cache(env: Optional[Dict[str, str]] = None):
             for h, er in old.mm_cache.items():
                 _EMB_CACHE.set(h, er)
     return _EMB_CACHE
+
+
+def _item_grid(it) -> Optional[Tuple[int, ...]]:
+    """The item's ``image_grid_thw`` as an int tuple, or None when it cannot be read."""
+    msd = getattr(it, "model_specific_data", None)
+    g = msd.get("image_grid_thw") if isinstance(msd, dict) else None
+    if g is None:
+        try:
+            g = getattr(it, "image_grid_thw", None)
+        except Exception:  # noqa: BLE001 -- MultimodalDataItem.__getattr__ may raise
+            g = None
+    if g is None:
+        return None
+    try:
+        flat = torch.as_tensor(g).reshape(-1).tolist()
+    except Exception:  # noqa: BLE001
+        return None
+    return tuple(int(x) for x in flat) if flat else None
+
+
+def _emb_key(h: Any, grid: Tuple[int, ...]) -> Tuple[int, Tuple[int, ...]]:
+    return (int(h), grid)
 
 
 def _item_rows(it) -> int:
@@ -324,9 +355,27 @@ def emb_cache_store(items: Sequence[Any]) -> int:
             continue
         if int(rows.shape[0]) != _item_rows(it):
             continue
-        if cache.set(int(h), EmbeddingResult(embedding=rows.detach().clone())):
+        grid = _item_grid(it)
+        if grid is None:
+            continue  # B1: no grid, no identity -- never stored
+        er = EmbeddingResult(embedding=rows.detach().clone())
+        er.pdflip_grid = grid
+        if cache.set(_emb_key(h, grid), er):
             n += 1
     return n
+
+
+def _note_grid_miss(scheduler, req, it, grid) -> None:
+    """H2: a hash that IS cached under another grid is named (the B1 collision class)."""
+    cache = emb_cache()
+    h = int(getattr(it, "hash"))
+    other = [k[1] for k in (cache.mm_cache.keys() if cache is not None else ()) if isinstance(k, tuple) and k[0] == h]
+    if not other:
+        return
+    scheduler._pdflip_vision_emb_grid_miss = getattr(scheduler, "_pdflip_vision_emb_grid_miss", 0) + 1
+    logger.info("%s GRID-MISS rid=%s hash=%d grid=%s cached_grids=%s n=%d (same pixel bytes, another grid: the "
+                "rows differ -- no attach)", W_EMB_CACHE, req.rid, h, list(grid), [list(g) for g in other],
+                scheduler._pdflip_vision_emb_grid_miss)
 
 
 def emb_cache_attach(scheduler, req) -> bool:
@@ -340,7 +389,12 @@ def emb_cache_attach(scheduler, req) -> bool:
     rows = []
     for it in items:
         h = getattr(it, "hash", None)
-        er = cache.get_single(int(h)) if h is not None else None
+        grid = _item_grid(it)
+        er = cache.get_single(_emb_key(h, grid)) if (h is not None and grid is not None) else None
+        if er is not None and getattr(er, "pdflip_grid", None) != grid:
+            er = None  # B1 belt: the entry's own grid must equal the item's
+        if er is None and h is not None and grid is not None:
+            _note_grid_miss(scheduler, req, it, grid)
         emb = getattr(er, "embedding", None)
         if not isinstance(emb, torch.Tensor) or emb.dim() != 2 or emb.is_cuda:
             return False
@@ -350,7 +404,15 @@ def emb_cache_attach(scheduler, req) -> bool:
             return False
         rows.append(emb.clone())
     w = width if width is not None else int(rows[0].shape[1])
-    attach_precomputed_embeddings(items, rows, expected_width=w)
+    saved = [(it.feature, it.precomputed_embeddings) for it in items]
+    try:
+        attach_precomputed_embeddings(items, rows, expected_width=w)
+    except Exception as exc:  # noqa: BLE001 -- H3: a named fall back to FETCH / STAGE, never half attached
+        for it, (f, pe) in zip(items, saved):
+            it.feature, it.precomputed_embeddings = f, pe
+        logger.warning("%s REFUSED rid=%s %s: %s -- the verdict falls back to FETCH / STAGE", W_EMB_CACHE,
+                       req.rid, type(exc).__name__, exc)
+        return False
     scheduler._pdflip_vision_emb_hits = getattr(scheduler, "_pdflip_vision_emb_hits", 0) + 1
     logger.info("%s HIT rid=%s items=%d rows=%d entries=%d bytes=%d n=%d (rows this rank encoded before, by "
                 "content hash: no pixel fetch, no tower)", W_EMB_CACHE, req.rid, len(items),
