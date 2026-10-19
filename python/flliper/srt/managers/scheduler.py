@@ -21273,6 +21273,14 @@ class Scheduler(
                     with _pdflip_own_work():
                         _prev_pending = None  # FLUSHFAST: in-flight count of the round before
                         for _round in (range(64) if not _memo_hit else ()):
+                            # S83: the writing_check between the rounds drains no release queue; the arena
+                            # references still queued on this rank go back before the round claims (rank-local)
+                            _s83_q = getattr(self.tree_cache, "_s83_release_queue_surplus_refs", None)
+                            if callable(_s83_q):
+                                try:
+                                    _s83_q(site="flush")
+                                except Exception:  # noqa: BLE001 - never the flush
+                                    logger.warning("S83 QUEUE-REFS flush pass raised", exc_info=True)
                             _stats = _sweep(max_issue=256) or {}
                             _issued += int(_stats.get("issued", 0) or 0)
                             if int(_stats.get("unbacked", 0) or 0) == 0:
@@ -21329,6 +21337,12 @@ class Scheduler(
                                     "loop and by the sleep leg, not dropped)",
                                     _round, _stats.get("unbacked"), _stats.get("arena_refused"),
                                     _pend_now, _prev_pending)
+                                _s83_c = getattr(self.tree_cache, "s83_victim_census", None)
+                                if callable(_s83_c):
+                                    try:
+                                        _s83_c("flush_stop")   # S83 instrument: who holds the arena now
+                                    except Exception:  # noqa: BLE001 - never the flush
+                                        pass
                                 break
                             _prev_pending = _pend_now
                             if _wc is not None:
@@ -21342,6 +21356,13 @@ class Scheduler(
                         _spill_tc._pdflip_flush_spill = _spill_prev
                     except Exception:  # noqa: BLE001 -- a stand-in tree
                         pass
+                if int(_stats.get("unbacked", 0) or 0) > 0:
+                    _s83_c = getattr(self.tree_cache, "s83_victim_census", None)
+                    if callable(_s83_c):
+                        try:
+                            _s83_c("flush_end")   # S83 instrument: un-backed nodes left -- who holds the arena
+                        except Exception:  # noqa: BLE001 - never the flush
+                            pass
                 logger.info(
                     "#1470 FLUSH-PUBLISH issued=%d unbacked_left=%s in_flight_after=%s waited_ms=%.0f "
                     "(un-backed nodes published and their write-throughs joined BEFORE the reset)%s",
