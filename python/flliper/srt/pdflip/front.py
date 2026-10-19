@@ -173,6 +173,7 @@ from flliper.srt.pdflip import front_requests as _frq  # front.flip / d_activity
 from flliper.srt.pdflip import front_metrics as _fmet  # weg2_req Influx push (TSDB-DELTA 1c, default off)
 from flliper.srt.pdflip import d_prefill_inflight as _dpf  # X-SUM-PRICE on the arrival path
 from flliper.srt.pdflip import d_extend_beacon as _dxb  # S49: SOLL R6 counts only a D prefill D really began
+from flliper.srt.pdflip import d_match_probe as _dmp  # S56: the arrival class from D's exact numbers (R11)
 from flliper.srt.pdflip import front_x as _front_x  # FRONT-X-MIT: the decision X rides with the D leg
 from flliper.srt.pdflip import sum_price as _sp  # X-SUM-PRICE: the one rule
 
@@ -3851,6 +3852,11 @@ class Pending:
     #: no image or not priced exactly); a P-only request whose store credit
     #: reaches it is re-priced as text (``_x_exact_reprice_queue``).
     mm_image_end: int = 0
+    #: S56 D-MATCH-PROBE: ``est_uncached`` is D's exact number (tree + store at arrival); the ledger reprice keeps off
+    probe_priced: bool = False
+    #: S56: what P computes for it (n - the shared store's depth, D's ids); -1 = not probed. A request that rides
+    #: a flip to P is priced with it (rc15 pdflip-14-76: D's figure 262, P computed 3590)
+    est_uncached_p: int = -1
     #: R28: the arrival snapshot of a request queued while D was awake, i.e.
     #: one that waits for a D->P flip; printed once as ``PDFLIP DP-WAIT`` at
     #: the ``PDFLIP-FLIP done`` that ends the wait, then cleared. Instrument
@@ -6638,6 +6644,58 @@ class Front:
                         getattr(d, "form", "list"), int(getattr(d, "asked", 0)))
         return int(d.tokens), str(d.tier)
 
+    def _d_probe_start(self, rid: str, path: str, payload: Any) -> "Optional[asyncio.Future]":
+        """S56 D-MATCH-PROBE: start D's probe for this arrival (None: switch off, no D group, unpriced shape)."""
+        if not envs.FLLIPER_PDFLIP_D_MATCH_PROBE.get():
+            return None
+        D = self.groups.get("D") if isinstance(getattr(self, "groups", None), dict) else None
+        if D is None or getattr(self, "session", None) is None or not isinstance(payload, dict):
+            return None
+        if path not in ("/v1/messages", "/v1/chat/completions", "/generate"):
+            return None
+        body = {"path": path, "payload": payload}
+        timeout = envs.FLLIPER_PDFLIP_D_MATCH_PROBE_TIMEOUT_MS.get() / 1000.0
+        return asyncio.ensure_future(self._d_probe_post(D, body, timeout))
+
+    async def _d_probe_post(self, g: "Group", body: dict, timeout: float) -> Tuple[int, str]:
+        """S56: the probe's POST -- a plain request on the front's session (no RPC-ledger lines: one per arrival)."""
+        async with self.session.post(f"{g.url}{_dmp.PROBE_PATH}", json=body,
+                                     headers=admin_key_mod.auth_headers(self.admin_key),
+                                     timeout=ClientTimeout(total=timeout)) as r:
+            return r.status, (await r.read()).decode(errors="replace")
+
+    async def _d_probe_result(self, rid: str, task: "asyncio.Future") -> "Optional[_dmp.ProbeAnswer]":
+        """S56: D's parsed answer, or None -- a failed probe is a NAMED defect (``PDFLIP D-PROBE-FAILED``), never
+        silent: the front's own count then stands for this one request."""
+        try:
+            code, text = await task
+        except Exception as e:  # noqa: BLE001
+            code, text = 0, f"{type(e).__name__}: {e}"
+        ans = None
+        why = ""
+        if code == 200:
+            try:
+                body = json.loads(text)
+            except (TypeError, ValueError):
+                body, why = None, "not json"
+            ans = _dmp.parse_answer(body)
+            if ans is None and not why:
+                why = str((body or {}).get("message") or "incomplete answer")[:200] if isinstance(body, dict) \
+                    else "incomplete answer"
+        else:
+            why = "status=%s %s" % (code, str(text)[:200])
+        if ans is None:
+            self.counters["d_probe_failed"] += 1
+            logger.warning("PDFLIP D-PROBE-FAILED rid=%s why=%s -- no exact D number for this arrival (S56: a "
+                           "defect, named; the front's own count stands for this one request)", rid, why)
+            return None
+        if not _dmp.seq_spans_ok(ans.mm_spans, ans.n):
+            self.counters["d_probe_failed"] += 1
+            logger.warning("PDFLIP D-PROBE-FAILED rid=%s why=spans_out_of_range n=%d spans=%s", rid, ans.n,
+                           list(ans.mm_spans)[:4])
+            return None
+        return ans
+
     async def _x_exact_price(self, rid: str, path: str, payload: Any, text: str,
                              est_uncached: int, est_prompt: int, multimodal: bool = False):
         """The exact pricing of one arrival, or None (then the chars/3 figures
@@ -6661,6 +6719,8 @@ class Front:
         mm = None
         mm_keys: List[str] = []
         t0 = time.monotonic()
+        # S56 D-MATCH-PROBE: D's exact numbers, asked BESIDE the front's own count (it no longer prices the class)
+        _probe_task = Front._d_probe_start(self, rid, path, payload)
         if reason is None:
             try:
                 got = await asyncio.wait_for(
@@ -6701,8 +6761,18 @@ class Front:
                     # TEMPLATE-GATE: the chat template refused the messages themselves
                     # (``Unexpected message role.``) -- a fault of the request, not of the
                     # count: it goes up to the arrival, which answers 400 before any flip
+                    if _probe_task is not None:
+                        _probe_task.cancel()
                     raise FrontTemplateRefused(str(e)) from e
                 reason = f"{type(e).__name__}: {str(e)[:160]}"
+        # S56: D's answer replaces the front's ids (D's token space: images expanded, pad values = the store keys)
+        _probe = await Front._d_probe_result(self, rid, _probe_task) if _probe_task is not None else None
+        _c_front, _mm_front = c, mm
+        if _probe is not None:
+            c = _FtCount(n=int(_probe.n), ids=_probe.ids, ms=(c.ms if c is not None else 0.0),
+                         reused=(c.reused if c is not None else 0),
+                         encoded=(c.encoded if c is not None else 0))
+            mm = None
         wait_ms = (time.monotonic() - t0) * 1000.0
         if c is None:
             self.counters["x_exact_fallback"] += 1
@@ -6717,8 +6787,8 @@ class Front:
             return None
         ft.remember(text, c.ids)
         self._sess_prefix(rid, c.ids)  # SESSION-TRACE
-        if mm is None:
-            Front._send_ids_note(self, rid, path, payload, c)  # FRONT-SEND-IDS-1007
+        if _c_front is not None and _mm_front is None:
+            Front._send_ids_note(self, rid, path, payload, _c_front)  # FRONT-SEND-IDS-1007 (the FRONT's ids)
         # L3-INDEX PRICE (y7d pdflip-0-2 / 2-19): the page-granular store prefix
         # of these exact ids, earlier boots and this one -- a store fact like
         # P's END-ANCHOR, recorded before the measured prefix is read.
@@ -6733,10 +6803,12 @@ class Front:
         isolated = (not ns_known) or ns is not None
         l3, tier = 0, "none"
         if ns_known:
+            # S56: after a D probe the store is asked with D's ids (image pages included) on its own budget
+            _st_budget = (envs.FLLIPER_PDFLIP_FRONT_EXACT_TIMEOUT_MS.get() / 1000.0
+                          if _probe is not None else
+                          envs.FLLIPER_PDFLIP_FRONT_EXACT_TIMEOUT_MS.get() / 1000.0 - (time.monotonic() - t0))
             l3, tier = await self._store_probe_depth(
-                rid, c.ids if mm is None else c.ids[: mm.first_image],
-                envs.FLLIPER_PDFLIP_FRONT_EXACT_TIMEOUT_MS.get() / 1000.0
-                - (time.monotonic() - t0), extra_key=ns)
+                rid, c.ids if mm is None else c.ids[: mm.first_image], _st_budget, extra_key=ns)
         if l3 > 0 and (isolated or self.tspans.record_store_depth(c.ids, l3, source=tier) > 0):
             self.counters["l3_index_credit"] += 1
             self.counters["l3_index_credit_tokens"] += int(l3)
@@ -6759,9 +6831,30 @@ class Front:
                 (tier if credit > 0 else "none")
         else:
             pending, credit, known, src = self.tspans.pending(c.ids, epoch=epoch)
+        # S56 D-MATCH-PROBE: THE price -- D's tree (device + host tier) and the shared store, both on D's ids; the
+        # ledger's figure above stays in the line as the comparison (it decides nothing any more)
+        _xp = None
+        if _probe is not None:
+            _xp = _dmp.exact_price(_probe, int(l3) if ns_known else 0)
+            _ledger = (pending, credit, src)
+            pending = _dmp.class_uncached(_xp)
+            credit = max(0, int(c.n) - int(pending))
+            known, src = True, "d_probe_" + _xp.src
+            self.counters["d_probe_priced"] += 1
+            if _xp.image_in_tail:
+                self.counters["d_probe_image_in_tail"] += 1
+            logger.info("PDFLIP D-PROBE rid=%s n=%d device=%d host=%d store=%d tier=%s covered=%d uncached_d=%d "
+                        "uncached_p=%d image_in_tail=%d images=%d class_u=%d ledger_pending=%d ledger_src=%s "
+                        "front_n=%s tokenize_ms=%.1f handle_ms=%.1f probe_ms=%.1f (S56: the class from D's exact "
+                        "numbers, R11 -- the front decides)",
+                        rid, int(c.n), int(_probe.device_tokens), int(_probe.host_tokens), int(_xp.store_tokens),
+                        tier, int(_xp.covered), int(_xp.uncached), int(_xp.uncached_p), int(_xp.image_in_tail),
+                        len(_probe.mm_spans), int(pending), int(_ledger[0]), _ledger[2],
+                        (int(_c_front.n) if _c_front is not None else "-"), _probe.tokenize_ms,
+                        _probe.handle_ms, _probe.total_ms)
         # NF-NEXT-1006-21: which entry (its rid, its kind) the credit came from --
         # read off the spans AFTER the price was taken; it feeds log lines only
-        win = None if isolated else self.tspans.last_winner
+        win = None if (isolated or _probe is not None) else self.tspans.last_winner
         entry_rid, entry_src = (win[1], win[2]) if win else ("-", "-")
         # SHORTHOLD-EPOCH-1014: the front epoch in which D served the credit's entry
         # (None: no entry -- a seq mark, a namespaced price)
@@ -6800,14 +6893,23 @@ class Front:
         self._prefix_diverge(rid, c.ids, pending, credit, src, l3, payload=payload)
         from types import SimpleNamespace
 
+        if _xp is not None and _probe.mm_spans:
+            # S56: D's image spans decide the vision terms exactly -- cached = every image inside the covered prefix
+            mm_cached = not _xp.image_in_tail
+            d_reach = d_floor = int(_xp.covered)
         return SimpleNamespace(pending=pending, n=c.n, known=known, credit=credit, src=src,
                                # VISION-SHORT-1014: what the shared store proved at arrival
                                # (an image request: probed only up to its first image)
                                store_depth=int(l3),
                                credit_epoch=_credit_ep,
-                               mm=mm is not None, mm_cached=mm_cached,
-                               image_end=(mm.image_end if mm is not None else 0),
-                               d_reach=d_reach, d_floor=d_floor)
+                               mm=(mm is not None) or bool(_xp is not None and _probe.mm_spans),
+                               mm_cached=mm_cached,
+                               image_end=(mm.image_end if mm is not None else
+                                          max((int(b) for _a, b in _probe.mm_spans), default=0)
+                                          if _xp is not None else 0),
+                               d_reach=d_reach, d_floor=d_floor,
+                               # S56 D-MATCH-PROBE: the exact terms (None: no probe answer)
+                               probe=_xp, image_in_tail=bool(_xp is not None and _xp.image_in_tail))
 
     #: FRONT-SEND-IDS-1007: priced ids kept for a leg 2 that has not been posted
     SEND_IDS_KEEP = 256
@@ -7139,6 +7241,8 @@ class Front:
             mm_rid = p.p_only and p.rid in (self.__dict__.get("_mm_rid_info") or {})
             if (p.leg1_done or p.skip_leg1 or (p.p_only and not mm_rid) or p.x_requeues):
                 continue
+            if getattr(p, "probe_priced", False):
+                continue  # S56: D's exact number is never replaced by the ledger's estimate
             if Front._ns_isolated(self, p.rid):
                 continue  # Q-530: a namespaced request keeps its own store price
             ids = self.ftok.ids_for(p.text)
@@ -8089,6 +8193,12 @@ class Front:
         p.leg1_done = False
         p.d_presence_only = False
         self.counters["p_batch_from_d"] += 1
+        _pp = int(getattr(p, "est_uncached_p", -1) if getattr(p, "est_uncached_p", -1) is not None else -1)
+        if _pp >= 0 and _pp != int(getattr(p, "est_uncached", 0) or 0):
+            # S56: on P it costs what P computes -- n minus the shared store (D's own tree does not travel)
+            logger.info("PDFLIP P-PRICE rid=%s d_uncached=%d p_uncached=%d where=%s (S56: priced at P's exact "
+                        "number, D's ids against the shared store)", p.rid, int(p.est_uncached), _pp, where)
+            p.est_uncached = _pp
         logger.info("PDFLIP P-BATCH-TAKES rid=%s was=%s where=%s est_uncached=%d epoch=%d (P is awake: "
                     "its whole prefill runs on P, the prefix read from the shared store; D gets it "
                     "under the E2 contract, d_compute=0)", p.rid, was, where,
@@ -10415,6 +10525,16 @@ class Front:
                 "attached on P's PP0 and do not exist on D",
                 rid, route)
             route = "long"
+        # S56 D-MATCH-PROBE: an image D's own tokenizer found in the UNCACHED tail (also inside an Anthropic
+        # tool_result block, which the top-level count above does not see) needs P's tower -- P-only (SOLL R9);
+        # rc15 pdflip-14-74: 4 new images, priced 338 as text, D refused W123, P computed 5718
+        _probe_p_only = bool(_xx is not None and getattr(_xx, "image_in_tail", False))
+        if _probe_p_only and route != "none" and not _route_vision_p_only:
+            _route_vision_p_only = True
+            self.counters["d_probe_vision_p_only"] += 1
+            logger.info("W102 PdFlipVisionStage rid=%s -- route %s -> long (P): D's probe found an image in the "
+                        "uncached tail (S56, SOLL R9: p_only); uncached_p=%d", rid, route, int(remainder))
+            route = "long"
         # H84: THE BAND ABOVE THE START X GOES TO D ONLY AS A SINGLETON. A
         # live X above the start X would send a burst of 4-8k prompts to D one
         # after another -- NF's D is bs1, so x177's 8x4.2k burst (22.8 s
@@ -10677,14 +10797,25 @@ class Front:
             # served by the NEXT P phase, whose epoch this line names.
             logger.info("PDFLIP LATE-BATCH rid=%s deferred_to_epoch=%d", rid, self.epoch + 1)
         fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        # S56: a request P will prefill (P phase batch, or a set DECODE-COLLECT sent to P) costs P's exact number
+        _rem_q = remainder
+        if (_xx is not None and getattr(_xx, "probe", None) is not None and (_collect_p or _p_phase)
+                and not _sk and not _d_hold and int(_xx.probe.uncached_p) != int(remainder)):
+            _rem_q = int(_xx.probe.uncached_p)
+            logger.info("PDFLIP P-PRICE rid=%s d_uncached=%d p_uncached=%d where=arrival (S56: queued for P, priced "
+                        "at P's exact number)", rid, int(remainder), _rem_q)
         p = Pending(rid, request.path, payload, text, time.time(), fut, est_prompt=est_prompt,
-                        est_uncached=remainder, span_known=known,
+                        est_uncached=_rem_q, span_known=known,
                     store_span_est=store_span,
                     # SK (#243): see _sk above -- no leg 1, D keeps it.
                     skip_leg1=_sk, short_kept=_sk, price_epoch=int(self.epoch),
                     # xsn438: routed `long` by the W102 rule above, not by
                     # length -- only P can serve it (Pending.p_only).
-                    p_only=_verdict == VERDICT_STAGE and not _mm_cached,
+                    p_only=(_verdict == VERDICT_STAGE and not _mm_cached) or _probe_p_only,
+                    # S56: priced from D's exact numbers -- no ledger reprice overwrites them
+                    probe_priced=bool(_xx is not None and getattr(_xx, "probe", None) is not None),
+                    est_uncached_p=(int(_xx.probe.uncached_p)
+                                    if _xx is not None and getattr(_xx, "probe", None) is not None else -1),
                     mm_image_end=(int(getattr(_xx, "image_end", 0) or 0) if _xx is not None else 0),
                     # UNIFY S7 (27B RC7-X): queued by the busy/idle split, not by the phase.
                     x_deferred=_x_band_deferred and not short_refused,
@@ -15180,6 +15311,18 @@ class Front:
         # the estimate (never a number invented here).
         if d_extent is not None and int(d_extent) > int(p.est_uncached):
             p.est_uncached = int(d_extent)
+        elif d_extent is not None and not getattr(p, "probe_priced", False) and int(p.est_uncached) > int(d_extent):
+            # S56 (user 19.10. "nichts schätzen"): D NAMED its exact extent -- the whole-prompt figure of a fresh
+            # Pending is an estimate and gives way to it (rc15 pdflip-14-74: 82066 -> D's 1878)
+            p.est_uncached = int(d_extent)
+        try:
+            _vis_reroute = b"(vision reroute)" in body or b"W123" in body
+        except TypeError:
+            _vis_reroute = False
+        if _vis_reroute and not getattr(p, "p_only", False):
+            # S56: D refused because an image lies in its uncached tail (no tower, W123): P-only (SOLL R9)
+            p.p_only = True
+            self.counters["w123_requeue_p_only"] += 1
         if seat is not None:
             seat.release("W50_requeue")
         p.seat = None

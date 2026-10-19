@@ -202,7 +202,8 @@ def test_wiring_the_route_forces_p_exactly_when_not_cached():
     assert "self._w102_image_uncached(rid, _xx)" in src
     assert ("if _verdict == VERDICT_STAGE and not _mm_cached and route != \"none\" "
             "and route != \"long\":") in src
-    assert "p_only=_verdict == VERDICT_STAGE and not _mm_cached" in src
+    # S56: an image D's probe finds in the uncached tail is P-only too (SOLL R9)
+    assert "p_only=(_verdict == VERDICT_STAGE and not _mm_cached) or _probe_p_only" in src
 
 
 # ---- the reprice at STORE-PRESENCE ------------------------------------------------------

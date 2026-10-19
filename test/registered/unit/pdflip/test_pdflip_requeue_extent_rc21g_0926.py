@@ -91,6 +91,9 @@ def test_without_a_parsed_extent_the_estimate_stands():
     assert ok is False
 
 
-def test_a_measurement_never_lowers_the_price():
+def test_a_measurement_replaces_the_estimate_in_both_directions():
+    """S56 (user 19.10. "warum wird irgendwas geschätzt? alle zahlen liegen doch schwarz auf weiß vor"): the extent D
+    NAMES is its exact number -- it replaces the front's whole-prompt estimate also when it is lower (rc15
+    pdflip-14-74: 82066 -> D's 1878). Before S56 a measurement only ever raised the price."""
     _, est, _ = _requeue(W50.replace(b"is 13000", b"is 5000"))
-    assert est == 9001
+    assert est == 5000

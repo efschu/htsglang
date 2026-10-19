@@ -1500,6 +1500,84 @@ async def pdflip_park_window(obj: Annotated[PdFlipParkWindowReqInput, Body()], r
     return ORJSONResponse({"sent": True, "left_ms": obj.left_ms}, status_code=200)
 
 
+@app.api_route("/pdflip/match_probe", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def pdflip_match_probe(raw_request: Request):
+    """S56 D-MATCH-PROBE (pdflip/d_match_probe.py): the Weg-2 front asks, before its verdict, how much of a prompt
+    (body {"path", "payload"}) this group holds NOW. Tokenized here exactly as the leg's POST will be (images
+    included), the scheduler ranks walk their tree with the admission's key, TP0 answers. 200 {"success", "ids"
+    (base64 int32, the scheduler's token space), "device_tokens", "host_tokens", "key_match_depth", "mm_spans",
+    "tokenize_ms", "handle_ms", "total_ms"}; 200 {"success": false, "message"} for a shape it cannot price."""
+    import time as _time
+
+    from flliper.srt.managers.io_struct import PdFlipMatchProbeReqInput
+    from flliper.srt.pdflip import d_match_probe as _dmp
+
+    t0 = _time.perf_counter()
+    tm = _global_state.tokenizer_manager
+    try:
+        obj = await _dmp.build_probe_obj(
+            await raw_request.json(),
+            serving_chat=raw_request.app.state.openai_serving_chat,
+            serving_anthropic=raw_request.app.state.anthropic_serving,
+            raw_request=raw_request,
+        )
+        if obj is None:
+            return ORJSONResponse({"success": False, "message": "shape not priced"}, status_code=200)
+        tm.auto_create_handle_loop()
+        tokenized = await tm._tokenize_one_request(obj)
+        mm = tokenized.mm_inputs
+        if mm is not None:
+            # the scheduler needs each item's pad value and offsets, never its pixels (a probe carries no feature)
+            for item in getattr(mm, "mm_items", None) or ():
+                try:
+                    item.set_pad_value()
+                    item.feature = None
+                except Exception:  # noqa: BLE001 -- the scheduler hashes it then, as for a leg
+                    pass
+        t_tok = (_time.perf_counter() - t0) * 1000.0
+        req = PdFlipMatchProbeReqInput(
+            rid=str(tokenized.rid),
+            input_ids=_array_q(tokenized.input_ids),
+            mm_inputs=mm,
+            extra_key=getattr(tokenized, "extra_key", None),
+            tokenize_ms=t_tok,
+        )
+        req.mm_inputs = _wrap_as_pickle_probe(req.mm_inputs)
+        out = await tm.pdflip_match_probe(req)
+    except Exception as e:
+        return ORJSONResponse({"success": False, "message": f"{type(e).__name__}: {str(e)[:300]}"},
+                              status_code=200)
+    if not out.success:
+        return ORJSONResponse({"success": False, "message": out.message}, status_code=200)
+    return ORJSONResponse(
+        {
+            "success": True,
+            "ids": _dmp.ids_to_b64(out.input_ids or ()),
+            "device_tokens": int(out.device_tokens),
+            "host_tokens": int(out.host_tokens),
+            "key_match_depth": int(out.key_match_depth),
+            "mm_spans": [list(x) for x in (out.mm_spans or ())],
+            "tokenize_ms": float(out.tokenize_ms),
+            "handle_ms": float(out.handle_ms),
+            "total_ms": (_time.perf_counter() - t0) * 1000.0,
+        },
+        status_code=200,
+    )
+
+
+def _array_q(ids):
+    from array import array as _arr
+
+    return _arr("q", ids if ids is not None else ())
+
+
+def _wrap_as_pickle_probe(mm):
+    from flliper.srt.managers.io_struct import wrap_as_pickle
+
+    return wrap_as_pickle(mm) if mm is not None else None
+
+
 @app.api_route("/pdflip/ple_prefetch_hint", methods=["POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def pdflip_ple_prefetch_hint(raw_request: Request):

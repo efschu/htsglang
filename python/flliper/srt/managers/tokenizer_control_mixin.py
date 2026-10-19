@@ -84,6 +84,8 @@ from flliper.srt.managers.io_struct import (
     VramBudgetReqOutput,
     PdFlipLaneFloorReqInput,
     PdFlipLaneFloorReqOutput,
+    PdFlipMatchProbeReqInput,
+    PdFlipMatchProbeReqOutput,
     PdFlipParkRunningReqInput,
     PdFlipParkRunningReqOutput,
 )
@@ -125,6 +127,7 @@ _COMMUNICATOR_SPECS = [
     ("session_checkpoint", SessionCheckpointReqOutput),
     ("vram_budget", VramBudgetReqOutput),
     ("pdflip_park_running", PdFlipParkRunningReqOutput),
+    ("pdflip_match_probe", PdFlipMatchProbeReqOutput),
     ("pdflip_lane_floor", PdFlipLaneFloorReqOutput),
     ("add_external_corpus", AddExternalCorpusReqOutput),
     ("remove_external_corpus", RemoveExternalCorpusReqOutput),
@@ -403,6 +406,14 @@ class TokenizerControlMixin:
         boundary (watch the VRAM-DIAL log lines for the DONE record)."""
         self.auto_create_handle_loop()
         return (await self.vram_budget_communicator(obj))[0]
+
+    async def pdflip_match_probe(
+        self: TokenizerManager, obj: PdFlipMatchProbeReqInput
+    ) -> PdFlipMatchProbeReqOutput:
+        """S56 D-MATCH-PROBE: how much of this tokenized prompt group D holds now (device + host tier), answered by
+        TP0 after every rank walked the same tree (pdflip/d_match_probe.py). Serialized like every communicator."""
+        self.auto_create_handle_loop()
+        return (await self.pdflip_match_probe_communicator(obj))[0]
 
     async def pdflip_park_running(
         self: TokenizerManager, obj: PdFlipParkRunningReqInput
