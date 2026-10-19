@@ -109,6 +109,23 @@ class FakeGroup:
     async def _info(self, request: web.Request) -> web.Response:
         return web.json_response({"x": 1})
 
+    async def _match_probe(self, request: web.Request) -> web.Response:
+        """S56r: the fake D answers the D-MATCH-PROBE like a D WITHOUT a radix tree (it holds no prefix): the
+        prompt in the harness's token measure (chars / CHARS_PER_TOKEN, the measure these tests were written
+        against), device 0. Without it the probe 404s and S56r prices nothing (D-PROBE-UNPRICED, A1)."""
+        import numpy as np
+
+        from flliper.srt.pdflip import d_match_probe as _dmp
+
+        body = await request.json()
+        payload = body.get("payload") or {}
+        if payload.get("input_ids_b64"):
+            n = int(_dmp.ids_from_b64(payload["input_ids_b64"]).size)
+        else:
+            n = int(len(front_mod.request_text(payload)) / front_mod.CHARS_PER_TOKEN) + 1
+        return web.json_response({"success": True, "ids": _dmp.ids_to_b64(np.arange(max(2, n))), "device_tokens": 0,
+                                  "host_tokens": 0, "key_match_depth": 0, "mm_spans": []})
+
     async def start(self) -> None:
         app = web.Application()
         app.router.add_post("/generate", self._generate)
@@ -119,6 +136,8 @@ class FakeGroup:
         app.router.add_get("/get_server_info", self._info)
         if self.park is not None:
             app.router.add_post(PARK_PATH, self._park)
+        if self.name == "D":
+            app.router.add_post("/pdflip/match_probe", self._match_probe)
         self.server = TestServer(app)
         await self.server.start_server()
         self.url = str(self.server.make_url("")).rstrip("/")

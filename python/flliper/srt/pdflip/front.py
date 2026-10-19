@@ -6844,6 +6844,8 @@ class Front:
                     _up = max(0, int(c.n) - int(_st)) if _st_tier != "unread" else -1
                 except Exception:  # noqa: BLE001 -- no store reading: P measures it itself
                     _up = -1
+            if c is not None and mm is None:
+                Front._send_ids_note(self, rid, path, payload, c)  # FRONT-SEND-IDS-1007: the leg still skips D's tokenizer
             return Front._x_unpriced(self, rid, c, est_prompt, _up, _media)
         _c_front, _mm_front = c, mm
         if _probe is not None:
