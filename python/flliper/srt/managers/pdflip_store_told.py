@@ -305,6 +305,105 @@ def p_wake_probe_on(env=None) -> bool:
     return str(v).strip().lower() not in ("0", "false", "no", "off", "")
 
 
+#: S80 STORE-HOLE (19.10., rc17 boot ..._7d93470b5e_1019_181004, pdflip-8-209): the wake probe above said
+#: ``have=85568 store_now=85568 -- the told stands`` and P recomputed 16482 tokens; the planner read it as "P read
+#: before D's sleep flush published" (D TP0 PUBLISH-SWEEP/#1470 FLUSH-PUBLISH ran in the same second). The logs
+#: say otherwise: D's flush had drained and reset (``#1470 FLUSH-PUBLISH in_flight_after=0``, ``#1068 RESET JOIN``)
+#: BEFORE P woke -- the flip order IS the publish witness of this read, the wake probe asks after it -- and the
+#: store's KV chain had ended at page 1337 since 18:26:34: 41 pages (85568..88192) were CLAIMED by D TP0 with
+#: share 0 and no writer (``ARENA-REF-CENSUS-CLAIM claimed=41 oldest=1378/.../pid1360/host-write/g3/open0``
+#: from 18:27:00 to the flip reset): their owners TP1/TP2 refused the ONE S74 PUBLISH (``#1421 BACKUP-REFUSED
+#: why=mamba_pin pins=5/5``, children ``why=parent_unbacked``, ``S74 CUT-L3-PUBLISH out=refused``) -- a transient --
+#: and were never asked again (S81). (``#1469 EVICT ... backuped=False`` on the workers is the MAMBA component
+#: leaving the device, not a KV share; a worker cannot drop an un-backed KV node on a TP group.) No flush and no
+#: later read fills such a hole -- only the owners' write or a revoke of the orphan claim (the D side, S81).
+#: The wake probe answered only "how deep", so the two classes looked alike. Now, when the store holds no more
+#: than the read, PP0 names the FIRST missing page from the shared arena header at the decision instant:
+#:   class=orphan    CLAIMED, no open writer -- a hole no writer can still fill (D-side defect, never a timing);
+#:   class=in_flight CLAIMED with an open writer -- a publish still running at the wake: the flip-order witness
+#:                   was broken (WARNING; this is the read-before-publish class, by construction 0);
+#:   class=absent    no slot -- nothing was ever written (or it was evicted to disk and freed);
+#:   class=anchor    the KV runs past ``have`` -- the chain ends at a missing Mamba anchor, not at a KV page;
+#: plus ``complete_after`` = COMPLETE KV pages behind the hole up to the prompt's end: the tokens the hole stranded
+#: (exact, from the arena, never an estimate). Read-only: no claim, no ref, no wait; the told is unchanged. 0 = off.
+S80_HOLE_CENSUS_ENV = "FLLIPER_PDFLIP_S80_STORE_HOLE_CENSUS"
+
+#: arena slot states (arena.c): 1 CLAIMED, 2 COMPLETE; a slot of -1 = no slot for the key
+_S80_CLAIMED, _S80_COMPLETE = 1, 2
+
+
+def s80_hole_census_on(env=None) -> bool:
+    v = (env if env is not None else os.environ).get(S80_HOLE_CENSUS_ENV, "1")
+    return str(v).strip().lower() not in ("0", "false", "no", "off", "")
+
+
+def s80_store_hole_census(cc, hashes, have: int, n_tokens: int, page_size: int, rid=None):
+    """S80: the first missing KV page of ``hashes`` (the wake probe's page keys) in the shared arena, classified
+    (see :data:`S80_HOLE_CENSUS_ENV`), logged as ``S80 STORE-HOLE``; returns the census dict or None when it cannot
+    be asked (no arena pool, no keys). Never raises."""
+    try:
+        pool = getattr(cc, "mem_pool_host", None)
+        arena = getattr(pool, "arena", None)
+        backend = getattr(cc, "storage_backend", None)
+        ps = max(1, int(page_size))
+        n_pages = min(len(hashes or ()), int(n_tokens) // ps)
+        if arena is None or backend is None or n_pages <= 0 or not callable(getattr(arena, "find_slots", None)):
+            return None
+        stems = [backend._get_suffixed_key(h) for h in list(hashes)[:n_pages]]
+        found = [(int(s), int(st)) for s, st in arena.find_slots(stems)]
+        kv_end = next((i for i, (s, st) in enumerate(found) if s < 0 or st != _S80_COMPLETE), n_pages)
+        have_pages = int(have) // ps
+        out = {"rid": rid, "have": int(have), "have_pages": have_pages, "kv_end": kv_end, "n_pages": n_pages,
+               "first_page": kv_end, "hole_pages": 0, "complete_after": 0, "state": -1, "slot": -1, "open": 0,
+               "pid": 0, "role": "-", "age_ms": 0, "gen": 0, "merged": 0, "covered": 0}
+        if kv_end > have_pages:
+            out["cls"] = "anchor"
+        elif kv_end >= n_pages:
+            out["cls"] = "none"
+        else:
+            slot, state = found[kv_end]
+            out["slot"], out["state"] = slot, state
+            j = kv_end
+            while j < n_pages and (found[j][0] < 0 or found[j][1] != _S80_COMPLETE):
+                j += 1
+            out["hole_pages"] = j - kv_end
+            out["complete_after"] = sum(1 for s, st in found[j:] if s >= 0 and st == _S80_COMPLETE)
+            if slot < 0:
+                out["cls"] = "absent"
+            else:
+                row = (arena.claim_census([slot]) or [{}])[0] if callable(getattr(arena, "claim_census", None)) \
+                    else {}
+                from flliper.srt.mem_cache.storage.file.hicache_arena import CLAIM_ROLES
+
+                out.update(open=int(row.get("open", 0)), pid=int(row.get("pid", 0)),
+                           role=CLAIM_ROLES.get(int(row.get("role", -1)), str(row.get("role", "-"))),
+                           age_ms=int(row.get("age_ms", 0)), gen=int(row.get("gen", 0)),
+                           merged=int(row.get("merged", 0)), covered=int(row.get("covered", 0)))
+                if state == _S80_CLAIMED:
+                    out["cls"] = "in_flight" if out["open"] > 0 else "orphan"
+                else:
+                    out["cls"] = "state%d" % state
+        k = getattr(s80_store_hole_census, "_n", 0) + 1
+        s80_store_hole_census._n = k
+        msg = ("S80 STORE-HOLE rid=%s have=%d kv_end=%d first_page=%d hole_pages=%d class=%s state=%d slot=%d "
+               "open=%d pid=%d role=%s age_ms=%d gen=%d covered=%d complete_after=%d complete_after_tokens=%d "
+               "pages=%d (k=%d): the store's first missing KV page at the told -- orphan = a claim no writer can "
+               "still finish (a D-side hole, no flush or later read fills it), in_flight = a publish still running "
+               "at the wake (the flip-order witness broken), absent = never written, anchor = KV present past the "
+               "told, the chain ends at a Mamba anchor; complete_after = COMPLETE pages the hole strands")
+        args = (_rt(rid), out["have"], kv_end * ps, out["first_page"], out["hole_pages"], out["cls"], out["state"],
+                out["slot"], out["open"], out["pid"], out["role"], out["age_ms"], out["gen"], out["covered"],
+                out["complete_after"], out["complete_after"] * ps, n_pages, k)
+        if out["cls"] == "in_flight":
+            logger.warning(msg, *args)
+        elif k <= 64 or k % 128 == 0 or out["complete_after"] > 0:
+            logger.info(msg, *args)
+        return out
+    except Exception as exc:  # noqa: BLE001 - an instrument never stops the told
+        logger.warning("S80 STORE-HOLE rid=%s census unavailable: %r", _rt(rid), exc)
+        return None
+
+
 def _wake_store_depth(scheduler, req, have: int):
     """The store's anchored depth of ``req``'s prompt now, in tokens (the
     #1416c/d full-span question with the fetch's key form); None = not
@@ -316,12 +415,14 @@ def _wake_store_depth(scheduler, req, have: int):
         if cc is None or not callable(getattr(cc, "get_hash_str", None)) or not ids:
             return None
         page_size = int(getattr(cc, "page_size", 1) or 1)
+        _hashes: list = []   # S80: the page keys the probe asked (the hole census reads them, no second hash)
         if _tree_key_probe_armed():
             key, _bigram = _probe_key(scheduler, req, ids, len(ids))
-            pages = _anchored_pages_full_span(cc, key, page_size, handoff_keys=_handoff_chain(req))
+            pages = _anchored_pages_full_span(cc, key, page_size, handoff_keys=_handoff_chain(req),
+                                              hashes_out=_hashes)
         else:
             pages = _anchored_pages_full_span(cc, list(ids), page_size,
-                                              extra_key=getattr(req, "extra_key", None))
+                                              extra_key=getattr(req, "extra_key", None), hashes_out=_hashes)
         if pages is None:
             return None
         depth = int(pages) * page_size
@@ -332,6 +433,8 @@ def _wake_store_depth(scheduler, req, have: int):
                         "flip; awake, the store %s", _rt(_rid(req)), int(have), depth, k,
                         "holds more -- PP0 re-reads before its told" if depth > int(have)
                         else "holds no more -- the told stands")
+        if depth <= int(have) and len(ids) - int(have) >= page_size and s80_hole_census_on():
+            s80_store_hole_census(cc, _hashes, int(have), len(ids), page_size, _rid(req))
         return depth
     except Exception as exc:  # noqa: BLE001 - a probe never stops the told
         logger.warning("PDFLIP P-WAKE-PROBE rid=%s unavailable: %r", _rt(_rid(req)), exc)
@@ -986,7 +1089,7 @@ def _adopt_keys(scheduler, req) -> None:
                         rid8(req), digest, verdict, n)
 
 
-def _anchored_pages_full_span(cc, ids, page_size: int, handoff_keys=None, extra_key=None):
+def _anchored_pages_full_span(cc, ids, page_size: int, handoff_keys=None, extra_key=None, hashes_out=None):
     """#1416c (boot xsn174): ``store_presence_pages`` asks the store about
     the FIRST ``STORAGE_BATCH_SIZE`` (128) pages only -- a 98,550-token span
     whose anchor sits on its last page answered 0, so told was clamped to 0
@@ -1014,6 +1117,8 @@ def _anchored_pages_full_span(cc, ids, page_size: int, handoff_keys=None, extra_
         if handoff_keys:
             _k = min(len(handoff_keys), len(hashes))
             hashes = list(handoff_keys[:_k]) + list(hashes[_k:])
+        if hashes_out is not None:
+            hashes_out.extend(hashes)   # S80: the caller's hole census reads the same keys
         transfers = cc._presence_pool_transfers()
         backend = cc.storage_backend
         from flliper.srt.mem_cache.hicache_storage import HiCacheStorageExtraInfo

@@ -1412,6 +1412,48 @@ int64_t arena_release_claims(uint8_t *base, int64_t n, const int64_t *slots, con
     return freed;
 }
 
+/* S81 review A1 (nf-review-s81-1019): revoke an ORPHAN share-0 claim -- atomically, for a caller that holds NO open
+ * writer on the slot (D TP0 after its share-0 merge: writers == one claimant, 0 open). arena_release_claims is the
+ * give-up of a writer with its OWN open claim: in its "joined"/"moved" branches it calls writer_done, which on an
+ * open0 slot takes the open writer of a worker that joined between the caller's census and the call, and
+ * free_if_abandoned then frees the slot under that worker ("recycled under the writer", K21 RANK-DIVERGENCE -- the
+ * S61 class). Here: CAS CLAIMED -> EVICTING, then under slot_lock (S61: a join is seen here or sees EVICTING) the slot
+ * is freed only when writers == exactly one claimant with none open, no interval merged, no reference and the
+ * generation still the caller's; otherwise it goes back to CLAIMED UNTOUCHED (no writer_done). status per slot:
+ * 0 freed, 1 kept (not an orphan, or a writer/reader came), 2 not CLAIMED / generation moved / out of range. */
+int64_t arena_revoke_orphan_claims(uint8_t *base, int64_t n, const int64_t *slots, const int64_t *gens,
+                                   int8_t *status) {
+    ArenaHeader *h = hdr(base);
+    int64_t freed = 0;
+    for (int64_t i = 0; i < n; i++) {
+        status[i] = 2;
+        if (slots[i] < 0 || (uint64_t)slots[i] >= h->slots) continue;
+        SlotHeader *sh = slot_hdr(base, (uint64_t)slots[i]);
+        if ((int64_t)sh->generation != gens[i]) continue;
+        uint32_t expect = S_CLAIMED;
+        if (!atomic_compare_exchange_strong(&sh->state, &expect, S_EVICTING)) continue;
+        slot_lock(sh);
+        int orphan = atomic_load(&sh->writers) == W_CLAIM && sh->n_ivals == 0
+                     && atomic_load(&sh->refcount) == 0 && (int64_t)sh->generation == gens[i];
+        slot_unlock(sh);
+        if (!orphan) {
+            atomic_store(&sh->state, S_CLAIMED);   /* untouched: no writer_done, no free */
+            status[i] = 1;
+            continue;
+        }
+        index_unlink(base, sh->key_lo, (uint64_t)slots[i]);
+        sh->key_lo = 0; sh->key_hi = 0;
+        sh->n_ivals = 0;
+        sh->generation++;
+        atomic_store(&sh->writers, 0u);
+        atomic_fetch_sub(&h->n_claimed, 1);
+        atomic_store(&sh->state, S_FREE);
+        status[i] = 0;
+        freed++;
+    }
+    return freed;
+}
+
 /* #1427s: the coverage-interval capacity of this arena's slots (one value per
  * file: every slot header is laid out alike). */
 int64_t arena_ival_cap(uint8_t *base) {
