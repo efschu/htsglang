@@ -347,6 +347,7 @@ def note_step(batch: Any, desc: Optional[TurnTracks], req: Any, row: int,
         # a plan the tree never consumed (a path that skipped the insert):
         # the slot goes back before a new one is drawn
         _free_slot(batch, stale[1])
+        _decline_unconsumed(req, stale[0])
         setattr(req, PENDING_ATTR, None)
         n = _count("stale")
         if _log_due(n):
@@ -354,11 +355,13 @@ def note_step(batch: Any, desc: Optional[TurnTracks], req: Any, row: int,
                            "freed (n=%d)", str(getattr(req, "rid", "?")), n)
     for st_pend in getattr(req, TWIN_PENDING_ATTR, None) or ():
         _free_slot(batch, st_pend[1])
+        _decline_unconsumed(req, st_pend[0])
     if getattr(req, TWIN_PENDING_ATTR, None):
         setattr(req, TWIN_PENDING_ATTR, None)
     fk_stale = getattr(req, FORK_PENDING_ATTR, None)
     if fk_stale is not None:
         _free_slot(batch, fk_stale[1])
+        _decline_unconsumed(req, fk_stale[0])
         setattr(req, FORK_PENDING_ATTR, None)
     if not track_mask or len(getattr(req, "output_ids", None) or ()) > 0:
         return desc
@@ -368,6 +371,22 @@ def note_step(batch: Any, desc: Optional[TurnTracks], req: Any, row: int,
         desc = _note_fork_step(batch, desc, req, row, prefix, end, main_track,
                                chunk, page, int(fork_told))
     return desc
+
+
+def _decline_unconsumed(req: Any, pos: Any) -> None:
+    """S52r (review 19.10.): a plan dropped unconsumed (its slot freed above) is never
+    inserted -- a promise booked on it (twin boundary, or the S52 turn / fork track) is
+    declined, so no late twin keeps waiting on an anchor that will not be written
+    (p_twin_defer rule 5: declined = no promise, the twin registers at once). Ledger
+    only; nothing is booked unless the twin anchor is armed, so a no-op otherwise."""
+    from flliper.srt.pdflip import twin_anchor as _tw
+
+    try:
+        rid, p = str(getattr(req, "rid", "?")), int(pos)
+    except (TypeError, ValueError):
+        return
+    if _tw.status(rid, p) == "planned":
+        _tw.note_declined(rid, p)
 
 
 def _note_turn_twin_steps(batch: Any, desc: Optional[TurnTracks], req: Any, row: int,

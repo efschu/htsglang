@@ -232,3 +232,130 @@ def test_switch_off_books_no_turn_track(pp0, monkeypatch):
     src = _R("pdflip-1-28", SRC, head=S0)
     _admit_and_plan(pp0, src)
     assert ta2.status("pdflip-1-28", TURN) is None
+
+
+# -- S52r (review 19.10.): every TRACK promise has a way out ---------------------------
+# Danger direction (a): a twin held on a turn / fork track that is never written must
+# not wait for nothing. Ways out: the track is declined (skip at insert, a dropped
+# plan) -> NO-COMMIT at the next pass; the source finishes (also by abort) -> released
+# after the settle; neither -> the Frist (wait_s) releases it as an ordinary request.
+
+
+def _deferred_behind_planned_source(pp0):
+    src = _R("pdflip-1-28", SRC, head=S0)
+    _admit_and_plan(pp0, src)
+    tw.tick(pp0)
+    twin = _R("pdflip-1-30", _twin_ids())
+    pp0.waiting_queue = [twin]
+    assert tw.intake_defer(pp0, twin) is True
+    return src, twin
+
+
+def test_a_track_skipped_at_the_insert_releases_the_twin_at_once(pp0):
+    """'TURN-ANCHOR SKIP reason=unmarked:...' (the forward did not write the track):
+    declined -> no promise left; released at the next pass, before the source ends."""
+    from flliper.srt.pdflip import turn_anchor as ta
+
+    src, twin = _deferred_behind_planned_source(pp0)
+    ta.note_skip(src, "unmarked:gdn", TURN, kind="turn")
+    tw.tick(pp0)
+    assert tw.release_due(pp0, {"pdflip-1-30"}) == [(twin, False)]
+    assert not tw.is_deferred(pp0, "pdflip-1-30")
+
+
+def test_a_dropped_plan_declines_its_track_promise(pp0):
+    """A plan the tree never consumed (note_step's STALE path frees its slot): the turn
+    track is never written, so its booking must not keep the twin. RED on d7028b0a67
+    (the booking stayed 'planned' and the twin waited for the source's finish)."""
+    from flliper.srt.pdflip import turn_anchor as ta
+    from flliper.srt.pdflip import twin_anchor as ta2
+
+    src, twin = _deferred_behind_planned_source(pp0)
+    alloc = _Alloc([21, 22])
+    batch = SimpleNamespace(reqs=[src], req_to_token_pool=SimpleNamespace(mamba_allocator=alloc))
+    # the next step [100, N) of the same source, the previous plan still pending
+    ta.note_step(batch=batch, desc=None, req=src, row=0, prefix=100, end=N,
+                 track_mask=True, main_track=N - 1, chunk=1, page=1, tok=TOK)
+    assert ta2.status("pdflip-1-28", TURN) == "declined"
+    tw.tick(pp0)
+    assert tw.release_due(pp0, {"pdflip-1-30"}) == [(twin, False)]
+
+
+def test_a_replanned_track_is_promised_again(pp0):
+    """The STALE decline does not swallow a track the same step plans anew."""
+    from flliper.srt.pdflip import turn_anchor as ta
+    from flliper.srt.pdflip import twin_anchor as ta2
+
+    src, twin = _deferred_behind_planned_source(pp0)
+    _admit_and_plan(pp0, src)                     # same step again: stale, then re-planned
+    assert ta2.status("pdflip-1-28", TURN) == "planned"
+    tw.tick(pp0)
+    assert tw.release_due(pp0, {"pdflip-1-30"}) == []
+    assert getattr(src, ta.PENDING_ATTR)[0] == TURN
+
+
+def test_frist_releases_a_twin_whose_source_never_finishes(pp0):
+    """The source stays in flight with its track planned (never inserted, never
+    skipped): the Frist releases the twin as an ordinary request -- no hang."""
+    src, twin = _deferred_behind_planned_source(pp0)
+    for _ in range(5):
+        tw.tick(pp0)
+    pp0.clock.t += tw.DEFAULT_WAIT_S - 1.0
+    assert tw.release_due(pp0, {"pdflip-1-30"}) == []
+    pp0.clock.t += 1.0
+    assert tw.release_due(pp0, {"pdflip-1-30"}) == [(twin, False)]
+    assert tw.take_pp0_twin(pp0, "pdflip-1-30") is False   # plain told, pre-TW path
+
+
+def test_an_aborted_source_releases_the_twin_after_the_settle(pp0):
+    """The source ends (abort) with its plan never inserted: the twin is released at
+    the settle, not at the Frist; its told comes from its own registration (head +
+    span, anchor-clamped), never from the promise position."""
+    src, twin = _deferred_behind_planned_source(pp0)
+    src.done = True
+    pp0.chunked_req = None
+    tw.tick(pp0)
+    assert tw.release_due(pp0, {"pdflip-1-30"}) == []
+    for _ in range(3):
+        tw.tick(pp0)
+    pp0.clock.t += 1.0
+    out = tw.release_due(pp0, {"pdflip-1-30"})
+    assert len(out) == 1 and out[0][0] is twin
+
+
+def test_turn_planning_is_byte_equal_armed_or_not(pp0, monkeypatch):
+    """R11 / followers: the booking is ledger-only -- the planned tracks, slots and the
+    pending plan are the same with the twin anchor armed and switched off."""
+    from flliper.srt.pdflip import turn_anchor as ta
+    from flliper.srt.pdflip import twin_anchor as ta2
+
+    def plan():
+        src = _R("pdflip-1-28", SRC, head=S0)
+        desc = _admit_and_plan(pp0, src)
+        pend = getattr(src, ta.PENDING_ATTR)
+        return (list(desc.targets), [int(s) for s in desc.slots], list(desc.prefixes),
+                list(desc.ext_lens), (pend[0], int(pend[1]), pend[3], pend[4]))
+
+    armed = plan()
+    assert ta2.status("pdflip-1-28", TURN) == "planned"
+    monkeypatch.setenv("FLLIPER_PDFLIP_TWIN_ANCHOR", "0")
+    ta2._reset_for_test()
+    assert plan() == armed
+    assert ta2.status("pdflip-1-28", TURN) is None
+
+
+def test_a_track_the_source_already_stands_on_promises_nothing(pp0):
+    """A written track at or below the source's start depth (an earlier visit of the
+    same rid on P) is there for the twin already: no reason to hold it (kills the
+    'lo = 0' mutant of p_twin_defer._promise)."""
+    from flliper.srt.pdflip import twin_anchor as ta2
+
+    src = _R("pdflip-1-28", SRC, head=S0)
+    src.prefix_indices = [0] * S0
+    src.fill_ids = list(src.origin_input_ids)      # its step [S0, N) planned past B
+    pp0.chunked_req = src
+    ta2._set("pdflip-1-28", S0 - 2, "written")
+    tw.tick(pp0)
+    twin = _R("pdflip-1-30", _twin_ids())
+    pp0.waiting_queue = [twin]
+    assert tw.intake_defer(pp0, twin) is False
