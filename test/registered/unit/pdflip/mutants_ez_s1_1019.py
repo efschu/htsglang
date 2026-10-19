@@ -26,6 +26,10 @@ Danger directions:
     on chars/3 again (B2), MB3 ``under`` is judged on today's halbX, not the barrier's (B3), MB3b the barrier is X at depth
     0 (B3, curve mode), MB4 the barrier is armed inside the instrument except (B4), MB5 a kurz-on-u_p request carries no
     barrier (B5), MB7 the ALT shadow loses the bool of a tuple (B7).
+  * nach-review 2 (test_ez_s1_nachreview_1019.py): MN1 a second refusal leaves the measured class standing (N1, the orphan),
+    MN1b a second refusal without an extent keeps the old class (N1), MN2a no ``row - k*chunk`` candidates (N2), MN2b no
+    flip-price bisection (N2), MN2c an estimated size bounds the depth range (N2, arm; the start site only arms a request ``_dec_arrival`` has not armed = the re-probe, n 0, so a mutant there is equivalent), MN2e the prompt
+    length is the requeue counter again (N2), MN3 the kurz-on-u_p leg is called MEASURE_ON_D again (N3).
 """
 import os
 import subprocess
@@ -35,7 +39,8 @@ DN = "python/flliper/srt/pdflip/decision_numbers.py"
 DR = "python/flliper/srt/pdflip/decision_record.py"
 FR = "python/flliper/srt/pdflip/front.py"
 PP = "python/flliper/srt/pdflip/phase_policy.py"
-TESTS = ["test/registered/unit/pdflip/test_ez_s1_review_1019.py",
+TESTS = ["test/registered/unit/pdflip/test_ez_s1_nachreview_1019.py",
+         "test/registered/unit/pdflip/test_ez_s1_review_1019.py",
          "test/registered/unit/pdflip/test_decision_numbers_1019.py",
          "test/registered/unit/pdflip/test_decision_record_1019.py",
          "test/registered/unit/pdflip/test_measure_on_d_1019.py"]
@@ -118,17 +123,38 @@ MUTANTS = [
      "            defect = hx_bar is not None and u < hx_bar",
      "            defect = u < hx"),
     ("MB3b the barrier is X at depth 0", FR,
-     "                x = min(x, Front._x_min_over_depths(self, int(n_prompt)))",
-     "                x = x"),
+     "            x = min(x, Front._x_min_over_depths(self, int(n_prompt) if n_prompt else None))",
+     "            x = x"),
     ("MB4 the barrier is armed inside the instrument except", FR,
-     "        if measure or p_upper:\n            Front._measure_arm(",
-     "        if False:\n            Front._measure_arm("),
+     "        if measure or p_upper:\n            # N2: only the front's own ids",
+     "        if False:\n            # N2: only the front's own ids"),
     ("MB5 a kurz-on-u_p request carries no barrier", FR,
      "            p_upper = _cb0 is not None and _cb0.kind == _dn.KIND_P_UPPER",
      "            p_upper = False"),
     ("MB7 the ALT shadow loses the bool of a tuple", DR,
      "    if isinstance(result, tuple) and result and isinstance(result[0], bool):",
      "    if False:"),
+    ("MN1 a second refusal leaves the measured class standing (orphan)", FR,
+     '            if reclass:\n                if not getattr(p, "measure_class", ""):',
+     '            if reclass:\n                return None\n                if not getattr(p, "measure_class", ""):'),
+    ("MN1b a second refusal without an extent keeps the old class", FR,
+     '                    p.measure_class, p.measure_src, p.measured_u = "", "", None',
+     '                    pass'),
+    ("MN2a no row - k*chunk candidates", FR,
+     "                    if r - k * c > 0:",
+     "                    if False:"),
+    ("MN2b no flip-price bisection", FR,
+     "                if (glo < 0) == (ghi < 0) or hi - lo < 2:",
+     "                if True:"),
+    ("MN2c an estimated size bounds the range (arm)", FR,
+     "Front._measure_arm(self, rid, x_set, n_prompt if _n_exact else 0,",
+     "Front._measure_arm(self, rid, x_set, n_prompt,"),
+    ("MN2e the prompt length is the requeue counter", FR,
+     'Front._measure_return(self, rid, p, d_extent, int(getattr(p, "est_prompt", 0) or 0))',
+     "Front._measure_return(self, rid, p, d_extent, n)"),
+    ("MN3 the kurz-on-u_p leg is MEASURE_ON_D", FR,
+     '_act = "D_NOW_BARRIER" if _up_leg else "MEASURE_ON_D"',
+     '_act = "MEASURE_ON_D"'),
 ]
 
 
@@ -150,7 +176,10 @@ def main(wt):
             print("base not green -- abort")
             return 1
     bad = 0
+    only = [x for x in os.environ.get("MUT_ONLY", "").split(",") if x]     # e.g. MUT_ONLY=MB3b,MN2a (names' first word)
     for name, rel, old, new in MUTANTS:
+        if only and name.split()[0] not in only:
+            continue
         path = os.path.join(wt, rel)
         orig = open(path, encoding="utf-8").read()
         if orig.count(old) != 1:

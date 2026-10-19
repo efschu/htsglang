@@ -344,7 +344,7 @@ def test_b5_p_upper_carries_the_barrier_and_a_halb_u_d_is_reported_not_prefilled
     arr = [d for d in _parsed(caplog) if d["kind"] == "arrival" and not d["rule"].startswith("ALT:")]
     assert [(d["action"], d["classes"]) for d in arr] == [("CLASSIFY", ["kurz"])], "the class stays kurz on u_p"
     hdr = F.Front._front_x_headers(f, "pdflip-0-1", None, False)
-    assert hdr[front_x.HEADER_ACTION] == "MEASURE_ON_D"
+    assert hdr[front_x.HEADER_ACTION] == "D_NOW_BARRIER"      # nach-review N3: not a measuring request
     u_d = 3000                                   # u_d > halbX > u_p: the store did not reach D
     assert 202 < HALF_X <= u_d
     assert u_d > front_x.limit_for(X, int(hdr[front_x.HEADER_X]), PAGE), "D refuses it: a report, no silent D prefill"
