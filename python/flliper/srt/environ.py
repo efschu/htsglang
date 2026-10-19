@@ -4241,6 +4241,15 @@ class Envs:
     # behind the request (one more gather row, one mamba slot), and a twin
     # waits only for a source that promised an anchor <= shared. 0 = off.
     FLLIPER_PDFLIP_TWIN_ANCHOR = EnvBool(True)
+    # TWIN CHAIN (S79, 19.10., NF rc17 boot ..._1019_171636 pdflip-0-1/0-4/0-5;
+    # pdflip/p_twin_defer.py rule 6): a held twin released in the same PP0 pass
+    # as an OLDER sibling (released with it, or in flight and not deferred) that
+    # shares a deeper boundary with it than its own sources did, waits behind
+    # that sibling instead of registering its read now -- 0-4 shared 81565 with
+    # 0-1 but registered with it at told 3584 and prefilled 78023 tokens 0-1
+    # published meanwhile. Bounded by the twin's Frist (since its intake).
+    # 0 = rc17 byte for byte.
+    FLLIPER_PDFLIP_P_TWIN_CHAIN = EnvBool(True)
     # GEN-FORK TRACK (S57, 19.10., NF rc15 pdflip-42-262; pdflip/turn_anchor.py):
     # where the turn anchor is armed, a prefill step whose own (END) track lies
     # past the generation prompt's <|im_start|> (N % page in 1..4 on NF) also
