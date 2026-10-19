@@ -77718,7 +77718,7 @@
      "source": {
       "file": "pdflip/vision_rank_runner.py",
       "kind": "os.environ",
-      "line": 1505
+      "line": 1567
      }
     }
    },
@@ -77800,7 +77800,7 @@
    "id": "FLLIPER_PDFLIP_VISION_EMB_CACHE_MB",
    "kind": "env",
    "lesestellen": [
-    "pdflip/vision_rank_runner.py:282"
+    "pdflip/vision_rank_runner.py:291"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_VISION_EMB_CACHE_MB",
@@ -77809,7 +77809,7 @@
    "source": {
     "file": "pdflip/vision_rank_runner.py",
     "kind": "os.environ",
-    "line": 282,
+    "line": 291,
     "tree": "nf"
    },
    "status": "harvested",
@@ -77918,7 +77918,7 @@
    "id": "FLLIPER_PDFLIP_VISION_PROBE_WAIT",
    "kind": "env",
    "lesestellen": [
-    "pdflip/vision_rank_runner.py:442"
+    "pdflip/vision_rank_runner.py:504"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_VISION_PROBE_WAIT",
@@ -77927,7 +77927,7 @@
    "source": {
     "file": "pdflip/vision_rank_runner.py",
     "kind": "os.environ",
-    "line": 442,
+    "line": 504,
     "tree": "nf"
    },
    "status": "harvested",
@@ -91221,7 +91221,7 @@
   },
   "unexplained": 664
  },
- "tree_rev": "27b=0798c91fcd+nf=f9001a1cc0",
+ "tree_rev": "27b=0798c91fcd+nf=a24f799df0",
  "trees": {
   "27b": {
    "entries": 2643,
@@ -91229,7 +91229,7 @@
   },
   "nf": {
    "entries": 2680,
-   "rev": "f9001a1cc0"
+   "rev": "a24f799df0"
   }
  },
  "warnungen": []
