@@ -254,3 +254,204 @@ def test_the_endpoint_tokenizes_the_probe_stateless_source_pin():
     assert "_tokenize_one_request(obj, stateless=True)" in src
     code = "\n".join(ln.split("#", 1)[0] for ln in src.splitlines())
     assert "rid_to_state" not in code and "_init_req_state" not in code
+
+
+# ============================================================================ S67r (review S67, Auflagen A2-A4)
+# A5 / A6b (estimates and the unpriced class at the front's decision) belong to the decision-centre workflow
+# (coordinator 19.10.: one number source, one decision in set_verdict) -- named in the report, not fixed here.
+
+def _media_tm(process):
+    """A REAL tokenizer manager for a media probe; ``process`` stands in for D-MM-ITEM-CACHE / the HF processor."""
+    from array import array
+
+    from flliper.srt.managers.io_struct import PdFlipMatchProbeReqOutput
+
+    async def comm(req):
+        req = pickle.loads(pickle.dumps(req))
+        return [PdFlipMatchProbeReqOutput(rid=req.rid, success=True, input_ids=array("q", req.input_ids),
+                                          device_tokens=0, host_tokens=0, key_match_depth=0, mm_spans=[[2, 6]])]
+
+    tm = _tm(comm)
+    tm.mm_processor = object()
+
+    async def _tok(text, is_cross):
+        return [1, 2, 3, 4], None
+
+    class _MmCache:
+        async def process(self, obj, prompt, compact_ids, max_req_input_len):
+            return await process()
+
+    tm._tokenize_texts = _tok
+    tm.tokenizer = SimpleNamespace()
+    tm.d_mm_item_cache = _MmCache()
+    tm.max_req_input_len = 1 << 20
+    return tm
+
+
+class _Chat:
+    def _convert_to_internal_request(self, req, raw):
+        return GenerateReqInput(text="<img> hi", image_data=["data:image/png;base64,AAAA"],
+                                sampling_params={"max_new_tokens": 1}), None
+
+
+def _post_with_ticker(monkeypatch, tm, body, serving_chat):
+    """The probe POST while a 10 ms ticker measures the loop's worst wake-up lag (the loop that serves /health)."""
+    import time
+
+    monkeypatch.setattr(hs, "_global_state", SimpleNamespace(tokenizer_manager=tm))
+    lag = [0.0]
+
+    async def run():
+        stop = asyncio.Event()
+
+        async def ticker():
+            while not stop.is_set():
+                t0 = time.perf_counter()
+                await asyncio.sleep(0.01)
+                lag[0] = max(lag[0], time.perf_counter() - t0 - 0.01)
+
+        tk = asyncio.ensure_future(ticker())
+        await asyncio.sleep(0.03)
+        resp = await hs.pdflip_match_probe(_RawRequest(body, serving_chat))
+        stop.set()
+        await tk
+        return resp
+
+    resp = asyncio.run(run())
+    return json.loads(resp.body), lag[0]
+
+
+@pytest.mark.parametrize("permitted", [True, False])
+def test_a2_media_probe_processor_runs_off_the_health_loop(monkeypatch, permitted):
+    """A2 (rc16 D log: a probe's D-MM-ITEM-CACHE miss stood the /health loop 1628.9 / 2213.5 ms). The probe's
+    processor chain runs under the leg's own switch (``mm_tokenize_offload.requested()``, decided by
+    ``offload_permitted()``): permitted -> on the processing thread, the loop answers; a device-resident frontend
+    (not permitted) keeps it on the loop exactly as for a leg. The stand-in does what ``qwen_vl.py`` does with the
+    switch (``run_offloaded`` of the chain when requested, else inline)."""
+    import time
+
+    from flliper.srt.managers import mm_tokenize_offload as mmo
+
+    monkeypatch.setattr(mmo, "offload_permitted", lambda: permitted)
+    seen = []
+
+    async def process():
+        seen.append(mmo.requested())
+        if mmo.requested():
+            await mmo.run_offloaded(time.sleep, 0.4)
+        else:
+            time.sleep(0.4)
+        return SimpleNamespace(input_ids=[1, 2, -7, -7, -7, -7, 3, 4], token_type_ids=None, mm_items=[])
+
+    monkeypatch.setattr("flliper.srt.entrypoints.openai.protocol.ChatCompletionRequest",
+                        lambda **kw: SimpleNamespace(**kw))
+    got, lag = _post_with_ticker(monkeypatch, _media_tm(process),
+                                 {"path": "/v1/chat/completions",
+                                  "payload": {"rid": "pdflip-0-1", "model": "m", "messages": []}}, _Chat())
+    assert got.get("success") is True, got
+    assert seen == [permitted]
+    assert mmo.requested() is False, "the switch does not outlive the probe"
+    if permitted:
+        assert lag < 0.2, f"the loop stood {lag:.3f} s for the probe's image chain"
+    else:
+        assert lag >= 0.3, "not permitted: the chain stays on the loop (device frontend), as for a leg"
+
+
+def test_a2_a_text_probe_never_offloads():
+    """A text probe has no image chain: the section is not offloaded and opens no stats."""
+    from flliper.srt.managers import mm_tokenize_offload as mmo
+
+    with mmo.probe_section(rid="r~probe", is_mm=False) as off:
+        assert off is False and mmo.requested() is False
+
+
+def test_a3_stateless_true_only_in_the_probe_endpoints_pin():
+    """A3 (reviewer mutant M5: ``generate_request`` with ``stateless=True`` survived every S67 test): a call with
+    ``stateless=True`` exists ONLY inside the pdflip probe endpoints of http_server.py (the D-MATCH-PROBE and,
+    after the S63r/S66 merge, TOK-AHEAD). Every other caller keeps the stateful upstream path."""
+    import ast
+    import pathlib
+
+    allowed = {("entrypoints/http_server.py", "pdflip_match_probe"),
+               ("entrypoints/http_server.py", "pdflip_tokenize_ahead")}
+    root = pathlib.Path(hs.__file__).resolve().parents[1]           # python/flliper/srt
+    found = []
+    for path in root.rglob("*.py"):
+        src = path.read_text(errors="replace")
+        if "stateless" not in src:
+            continue
+        tree = ast.parse(src)
+        stack = []
+
+        def visit(node):
+            is_fn = isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            if is_fn:
+                stack.append(node.name)
+            if isinstance(node, ast.Call):
+                for kw in node.keywords:
+                    if kw.arg == "stateless" and not (isinstance(kw.value, ast.Constant) and kw.value.value is False):
+                        found.append((str(path.relative_to(root)), stack[-1] if stack else "<module>", node.lineno))
+            for ch in ast.iter_child_nodes(node):
+                visit(ch)
+            if is_fn:
+                stack.pop()
+
+        visit(tree)
+    # the internal hand-over _tokenize_one_request -> _create_tokenized_object passes the parameter through
+    found = [f for f in found if f[:2] != ("managers/tokenizer_manager.py", "_tokenize_one_request")]
+    assert found, "the probe endpoint must pass stateless=True"
+    stray = [f for f in found if f[:2] not in allowed]
+    assert not stray, f"stateless=True outside the probe endpoints: {stray}"
+
+
+def test_a3_generate_request_stamps_the_request_time_stats():
+    """A3: a REAL request through the REAL ``generate_request`` -> ``_tokenize_one_request`` ->
+    ``_create_tokenized_object``: the tokenized object carries the request's own ``time_stats`` and the tokenize
+    finish is stamped (M5 -- generate_request with stateless=True -- loses both)."""
+    from unittest.mock import AsyncMock, Mock
+
+    tm = _tm()
+    tm.server_args.dp_size = 1
+    tm._set_default_priority = Mock()
+    tm._set_default_spill_class = Mock()
+    tm.request_logger = Mock()
+    tm.is_pause = False
+    tm.is_pause_cond = asyncio.Condition()
+
+    class _CM:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    tm.model_update_lock = SimpleNamespace(reader_lock=_CM())
+    tm._validate_and_resolve_lora = AsyncMock(return_value=None)
+    tm.init_mm_dispatch_order()
+    stamped = []
+    ts = SimpleNamespace(set_tokenize_finish_time=lambda: stamped.append(1))
+
+    def init_state(obj, request=None):
+        tm.rid_to_state[obj.rid] = SimpleNamespace(time_stats=ts, prompt_token_ids=None, pdflip_prompt_ids=None,
+                                                   dispatched=False)
+
+    tm._init_req_state = init_state
+    sent = []
+
+    class _Stop(Exception):
+        pass
+
+    def send(tok):
+        sent.append(tok)
+        raise _Stop()
+
+    tm._send_one_request = send
+    tm._release_req_states_on_failure = lambda rids: [tm.rid_to_state.pop(r, None) for r in rids]
+    obj = GenerateReqInput(rid="pdflip-3-3", input_ids=[1, 2, 3], sampling_params={"max_new_tokens": 1})
+
+    async def drive():
+        await tm.generate_request(obj).__anext__()
+
+    with pytest.raises(_Stop):
+        asyncio.run(drive())
+    assert len(sent) == 1 and sent[0].time_stats is ts and stamped == [1]

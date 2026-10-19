@@ -10,7 +10,9 @@ byte for byte after every mutant (also on Ctrl-C).
 Danger directions:
   * the probe REGISTERS a request state under ``<rid>~probe`` (M1, M2): an in-flight request nobody finishes;
   * the probe is tokenized stateful again (M3): the rc16 class, every probe a KeyError, no exact D number;
-  * the real request path loses its invariant (M4): a missing ReqState is silently skipped for every request.
+  * the real request path loses its invariant (M4): a missing ReqState is silently skipped for every request;
+  * S67r A3: a real request tokenized stateless (M5): its time_stats lost silently;
+  * S67r A2: the probe's image chain on the /health loop again (M6): the D-HEALTH stop;
 """
 import os
 import subprocess
@@ -18,25 +20,42 @@ import sys
 
 HS = "python/flliper/srt/entrypoints/http_server.py"
 TMG = "python/flliper/srt/managers/tokenizer_manager.py"
+MMO = "python/flliper/srt/managers/mm_tokenize_offload.py"
 TEST = "test/registered/unit/pdflip/test_pdflip_s67_dprobe_stateless_1019.py"
 
-_CALL = "        tokenized = await tm._tokenize_one_request(obj, stateless=True)\n"
+# S67r A4: the anchor carries the S67 comment -- after the rc17 merge ``/pdflip/tokenize_ahead`` holds a second
+# ``_tokenize_one_request(obj, stateless=True)`` line, and a bare-call anchor would run as "not applied"
+_CALL = ("            # S67: the probe is no request of this server -- tokenized WITHOUT a ReqState (rc16: the stateful path\n"
+         "            # read rid_to_state['<rid>~probe'] and every probe died of KeyError before the scheduler was asked)\n"
+         "            tokenized = await tm._tokenize_one_request(obj, stateless=True)\n")
+_CALL_HEAD = _CALL.rsplit("            tokenized", 1)[0]
 
 MUTANTS = [
     ("M1 the probe registers a ReqState under ~probe (and tokenizes stateful)", HS, _CALL,
-     "        from types import SimpleNamespace as _NS\n"
-     "        tm.rid_to_state[obj.rid] = _NS(time_stats=_NS(set_tokenize_finish_time=lambda: None))\n"
-     "        tokenized = await tm._tokenize_one_request(obj)\n"),
+     _CALL_HEAD
+     + "            from types import SimpleNamespace as _NS\n"
+       "            tm.rid_to_state[obj.rid] = _NS(time_stats=_NS(set_tokenize_finish_time=lambda: None))\n"
+       "            tokenized = await tm._tokenize_one_request(obj)\n"),
     ("M2 the stateless branch creates the state it does not read", TMG,
      "        if stateless:\n",
      "        if stateless:\n"
      "            from types import SimpleNamespace as _NS\n"
      "            self.rid_to_state.setdefault(obj.rid, _NS(time_stats=None))\n"),
     ("M3 the probe is tokenized stateful again (rc16)", HS, _CALL,
-     "        tokenized = await tm._tokenize_one_request(obj)\n"),
+     _CALL_HEAD + "            tokenized = await tm._tokenize_one_request(obj)\n"),
     ("M4 every request skips a missing ReqState silently", TMG,
      "        if stateless:\n",
      "        if stateless or obj.rid not in self.rid_to_state:\n"),
+    # S67r A3 (reviewer M5): a real request tokenized stateless loses its time_stats silently
+    ("M5 generate_request tokenizes stateless", TMG,
+     "                        tokenized_obj = await self._tokenize_one_request(obj)\n"
+     "                        state = self.rid_to_state[obj.rid]\n",
+     "                        tokenized_obj = await self._tokenize_one_request(obj, stateless=True)\n"
+     "                        state = self.rid_to_state[obj.rid]\n"),
+    # S67r A2: the probe's image chain back on the /health loop
+    ("M6 the probe section never offloads", MMO,
+     "    offload = bool(is_mm) and offload_permitted()\n    stats = MmTokenizeStats",
+     "    offload = False and bool(is_mm) and offload_permitted()\n    stats = MmTokenizeStats"),
 ]
 
 
