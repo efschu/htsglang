@@ -1765,6 +1765,11 @@ class PlePrefetchHintReqInput(BaseReq, kw_only=True):
     #: 02.10.: the front's store span of this request (where P's first chunk
     #: will start, before P's page floor); -1 = unknown (tail window)
     start_hint: int = -1
+    #: S53 L2-READ-AHEAD: PP0 fills the stored prefix [0, start_hint) from L3 into the shared arena
+    #: (pdflip/l2_read_ahead.py) -- the front holds this request for P's device room while P is awake
+    read_ahead: bool = False
+    #: S53: False = no PLE admission for this hint (P is awake; its PLE ring belongs to the running request)
+    ple: bool = True
 
 
 class AddExternalCorpusReqInput(BaseReq, kw_only=True):

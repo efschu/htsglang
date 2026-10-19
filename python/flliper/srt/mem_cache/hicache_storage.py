@@ -4702,6 +4702,11 @@ class HiCacheFile(HiCacheStorage):
             need = int(want)
         else:
             want = max(int(want), int(need))
+        if getattr(_FILL_CTX, "spare_kept", False):
+            # S53r (review 19.10.): a SPECULATIVE fill (pdflip/l2_read_ahead.py, a request not yet on P) never
+            # spends the kept hand-off / park pages (#248e stage ii) -- only unkept pages make its room; what does
+            # not fit ends the read-ahead. Set by no other caller: every real fill keeps its #248e order.
+            need = 0
         _en = getattr(type(self), "_evict_log_n", 0) + 1
         type(self)._evict_log_n = _en
         if _en <= 16 or _en % 64 == 0:

@@ -154,5 +154,8 @@ async def build_ple_prefetch_hint(
         start_hint = -1 if start_hint is None else int(start_hint)
     except (TypeError, ValueError):
         start_hint = -1
+    # S53 L2-READ-AHEAD: the front's read-ahead hint (pdflip/l2_read_ahead.py) rides the same tokenization
     return PlePrefetchHintReqInput(rid=str(rid), input_ids=[int(t) for t in ids],
-                                   start_hint=start_hint)
+                                   start_hint=start_hint,
+                                   read_ahead=bool(body.get("read_ahead", False)),
+                                   ple=bool(body.get("ple", True)))

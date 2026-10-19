@@ -29200,7 +29200,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2745
+      "line": 2753
      }
     }
    },
@@ -29251,7 +29251,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 2735,
+    "line": 2743,
     "tree": "nf"
    },
    "status": "harvested",
@@ -29278,7 +29278,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2781
+      "line": 2789
      }
     }
    },
@@ -35289,7 +35289,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 3885,
+    "line": 3893,
     "tree": "nf"
    },
    "status": "harvested",
@@ -38021,7 +38021,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4946,
+    "line": 4954,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -38339,7 +38339,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4945,
+    "line": 4953,
     "tree": "nf"
    },
    "status": "harvested",
@@ -38920,7 +38920,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 2381,
+    "line": 2389,
     "tree": "nf"
    },
    "status": "harvested",
@@ -38947,7 +38947,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2756
+      "line": 2764
      }
     }
    },
@@ -39116,7 +39116,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2760
+      "line": 2768
      }
     }
    },
@@ -43987,7 +43987,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 3363,
+    "line": 3371,
     "tree": "nf"
    },
    "status": "harvested",
@@ -44015,7 +44015,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 3364,
+    "line": 3372,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -47240,7 +47240,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 2390,
+    "line": 2398,
     "tree": "nf"
    },
    "status": "harvested",
@@ -47268,7 +47268,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 2395,
+    "line": 2403,
     "tree": "nf"
    },
    "status": "harvested",
@@ -52236,7 +52236,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 3892,
+    "line": 3900,
     "tree": "nf"
    },
    "status": "harvested",
@@ -52293,7 +52293,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 3857,
+    "line": 3865,
     "tree": "nf"
    },
    "status": "harvested",
@@ -52321,7 +52321,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 3866,
+    "line": 3874,
     "tree": "nf"
    },
    "status": "harvested",
@@ -52349,7 +52349,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 3874,
+    "line": 3882,
     "tree": "nf"
    },
    "status": "harvested",
@@ -52377,7 +52377,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 3870,
+    "line": 3878,
     "tree": "nf"
    },
    "status": "harvested",
@@ -52492,7 +52492,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 3790,
+    "line": 3798,
     "tree": "nf"
    },
    "status": "harvested",
@@ -52520,7 +52520,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 3801,
+    "line": 3809,
     "tree": "nf"
    },
    "status": "harvested",
@@ -54001,7 +54001,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4663,
+    "line": 4671,
     "tree": "nf"
    },
    "status": "harvested",
@@ -54058,7 +54058,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 2631,
+    "line": 2639,
     "tree": "nf"
    },
    "status": "harvested",
@@ -54676,7 +54676,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 2615,
+    "line": 2623,
     "tree": "nf"
    },
    "status": "harvested",
@@ -55504,7 +55504,7 @@
      "source": {
       "file": "pdflip/front.py",
       "kind": "os.environ",
-      "line": 4330
+      "line": 4349
      }
     }
    },
@@ -61049,7 +61049,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 3970
+      "line": 3978
      }
     }
    },
@@ -61361,7 +61361,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2241
+      "line": 2249
      }
     }
    },
@@ -61439,7 +61439,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4642
+      "line": 4650
      }
     }
    },
@@ -61547,7 +61547,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2774
+      "line": 2782
      }
     }
    },
@@ -61909,7 +61909,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 2261,
+    "line": 2269,
     "tree": "nf"
    },
    "status": "harvested",
@@ -62194,7 +62194,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 2765
+      "line": 2773
      }
     }
    },
@@ -62416,7 +62416,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4622
+      "line": 4630
      }
     }
    },
@@ -65992,7 +65992,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4753
+      "line": 4761
      }
     }
    },
@@ -66946,6 +66946,62 @@
    ],
    "type": "os.environ"
   },
+  "FLLIPER_PDFLIP_L2_READ_AHEAD": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "True",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "S53 L2-READ-AHEAD (pdflip/l2_read_ahead.py): the queue head the front's pool plan (H91c) holds while P is awake is hinted to P, and PP0 fills its stored prefix (KV + QSA index pages of the store span) from L3 into the shared arena once the running prefill has at most LEAD tokens left -- no reference, no room wait, one successor. The request switch on P then reads L2 (~0.2 s) instead of the disk (2.4-3.0 s on rc14, pdflip-0-22). Front and P. New feature -> default ON; 0 = no hint sent, a hint ignored, byte for byte.",
+   "id": "FLLIPER_PDFLIP_L2_READ_AHEAD",
+   "kind": "env",
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_L2_READ_AHEAD",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 2196,
+    "tree": "nf"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "EnvBool"
+  },
+  "FLLIPER_PDFLIP_L2_READ_AHEAD_LEAD_TOKENS": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "0",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "S53: prefill tokens PP0 may still have left when the read-ahead starts (0 = two chunks, 2 * chunked_prefill_size)",
+   "id": "FLLIPER_PDFLIP_L2_READ_AHEAD_LEAD_TOKENS",
+   "kind": "env",
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_L2_READ_AHEAD_LEAD_TOKENS",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 2198,
+    "tree": "nf"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "EnvInt"
+  },
   "FLLIPER_PDFLIP_L3FILL_HOST_WRITE_TAKEOVER": {
    "bare": false,
    "choices": null,
@@ -67863,7 +67919,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 2626,
+    "line": 2634,
     "tree": "nf"
    },
    "status": "harvested",
@@ -68335,7 +68391,7 @@
      "source": {
       "file": "pdflip/front.py",
       "kind": "os.environ",
-      "line": 1193
+      "line": 1194
      }
     }
    },
@@ -69120,7 +69176,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4551
+      "line": 4559
      }
     }
    },
@@ -69277,7 +69333,7 @@
    "id": "FLLIPER_PDFLIP_MODE_PARITY_CHECK",
    "kind": "env",
    "lesestellen": [
-    "pdflip/front.py:6431"
+    "pdflip/front.py:6450"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_MODE_PARITY_CHECK",
@@ -69286,7 +69342,7 @@
    "source": {
     "file": "pdflip/front.py",
     "kind": "os.environ",
-    "line": 6431,
+    "line": 6450,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -69792,7 +69848,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 2606,
+    "line": 2614,
     "tree": "nf"
    },
    "status": "explained",
@@ -71593,7 +71649,7 @@
    "id": "FLLIPER_PDFLIP_P_DRAIN_EARLY_SETTLE",
    "kind": "env",
    "lesestellen": [
-    "pdflip/front.py:3499"
+    "pdflip/front.py:3500"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_P_DRAIN_EARLY_SETTLE",
@@ -71602,7 +71658,7 @@
    "source": {
     "file": "pdflip/front.py",
     "kind": "os.environ",
-    "line": 3499,
+    "line": 3500,
     "tree": "nf"
    },
    "status": "harvested",
@@ -73468,7 +73524,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4668,
+    "line": 4676,
     "tree": "nf"
    },
    "status": "harvested",
@@ -75261,7 +75317,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 2638,
+    "line": 2646,
     "tree": "nf"
    },
    "status": "harvested",
@@ -75289,7 +75345,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 2641,
+    "line": 2649,
     "tree": "nf"
    },
    "status": "harvested",
@@ -76598,7 +76654,7 @@
      "source": {
       "file": "pdflip/front.py",
       "kind": "os.environ",
-      "line": 4427
+      "line": 4446
      }
     }
    },
@@ -78124,7 +78180,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4740
+      "line": 4748
      }
     }
    },
@@ -89880,28 +89936,28 @@
  "schema": "flliper.catalog/1",
  "stats": {
   "curated": 125,
-  "entries": 2834,
-  "envs": 1955,
+  "entries": 2836,
+  "envs": 1957,
   "explained": 310,
   "flags": 864,
-  "harvested": 1745,
+  "harvested": 1747,
   "trees": {
    "abweichung": 51,
    "beide": 2463,
    "nur_27b": 180,
-   "nur_nf": 173
+   "nur_nf": 175
   },
   "unexplained": 654
  },
- "tree_rev": "27b=0798c91fcd+nf=c76781f6df",
+ "tree_rev": "27b=0798c91fcd+nf=a2cfdbe6af",
  "trees": {
   "27b": {
    "entries": 2643,
    "rev": "0798c91fcd"
   },
   "nf": {
-   "entries": 2636,
-   "rev": "c76781f6df"
+   "entries": 2638,
+   "rev": "a2cfdbe6af"
   }
  },
  "warnungen": []

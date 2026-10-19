@@ -2188,6 +2188,14 @@ class Envs:
     # S48 class 1 (pdflip-8-123: acks 2.5 s late, PP0's admission behind its commit block). Only on a follower running
     # the PF ack stream. New feature -> default ON; 0 = the pump only at pass boundaries, byte for byte.
     FLLIPER_PDFLIP_TOLD_ACK_EARLY = EnvBool(True)
+    # S53 L2-READ-AHEAD (pdflip/l2_read_ahead.py): the queue head the front's pool plan (H91c) holds while P is awake
+    # is hinted to P, and PP0 fills its stored prefix (KV + QSA index pages of the store span) from L3 into the shared
+    # arena once the running prefill has at most LEAD tokens left -- no reference, no room wait, one successor. The
+    # request switch on P then reads L2 (~0.2 s) instead of the disk (2.4-3.0 s on rc14, pdflip-0-22). Front and P.
+    # New feature -> default ON; 0 = no hint sent, a hint ignored, byte for byte.
+    FLLIPER_PDFLIP_L2_READ_AHEAD = EnvBool(True)
+    # S53: prefill tokens PP0 may still have left when the read-ahead starts (0 = two chunks, 2 * chunked_prefill_size)
+    FLLIPER_PDFLIP_L2_READ_AHEAD_LEAD_TOKENS = EnvInt(0)
     # Prefix trace (IN 26.09., pdflip/prefix_trace.py): every prefix miss of an
     # agent-load boot gets a token receipt -- one #1420 WALK-STOP line per
     # (rid, stop depth) whose unmatched rest is >= the minimum below, full
