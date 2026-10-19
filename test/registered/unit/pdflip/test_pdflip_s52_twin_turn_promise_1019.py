@@ -154,7 +154,11 @@ def _finish_and_settle(sched, src, twin_rid="pdflip-1-30"):
     sched.clock.t += 1.0
 
 
-def test_turn_anchor_is_planned_at_the_last_message_start(pp0):
+def test_turn_anchor_is_planned_at_the_last_message_start(pp0, monkeypatch):
+    # S57: page 1 -- the END anchor N-1 never serves a generation-prompt sibling, so the GEN-FORK
+    # TRACK joins every plan here; this test pins the turn track alone (the combination:
+    # test_pdflip_s57_gen_fork_anchor_1019.py)
+    monkeypatch.setenv("FLLIPER_PDFLIP_GEN_FORK_ANCHOR", "0")
     src = _R("pdflip-1-28", SRC)
     desc = _admit_and_plan(pp0, src)
     assert desc is not None and sorted(desc.targets) == [TURN]
