@@ -264,6 +264,9 @@ def test_handler_sk_still_keeps_a_gate_held_short(monkeypatch, caplog):
     another reason (here: D not serving any more -> falls through; SK keeps it only while D is awake
     -- so use the held batch gate: it times out into BATCH and SK queues it D-direct)."""
     f = _handler_front(monkeypatch)
+    # S60 F3: the gate by age waits only for OLDER D-line entries -- this test pins SK at a gate that times out, the
+    # old gate (an empty D line with a cleared gate) is the switch off; the age gate's own timeout: test_pdflip_s60_*
+    monkeypatch.setenv("FLLIPER_PDFLIP_SHORT_GATE_BY_AGE", "0")
     f.drain_deadline_s = 0.2
     f._batch_gate.clear()  # BATCH work holds the gate: the SHORT seat path times out into None
     with caplog.at_level(logging.INFO, logger="pdflip.front"):

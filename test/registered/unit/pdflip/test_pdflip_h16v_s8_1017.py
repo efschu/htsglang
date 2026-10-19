@@ -190,7 +190,8 @@ def test_a4_three_waiters_one_seat_one_younger_decode_make_at_most_one_to_d_gran
 
 def test_a4_the_age_plan_reads_the_seat_count_again_before_the_plan():
     src = inspect.getsource(F.Front._arrival_seat_wait_age)
-    i, j = src.index("self._arrival_seat_taken()"), src.index("self._arrival_seat_age_verdict(")
+    # S60 F3: the waiter's seat count is ``_arrival_seat_taken(for_rid=rid)`` (only OLDER D-line entries hold a seat)
+    i, j = src.index("self._arrival_seat_taken("), src.index("self._arrival_seat_age_verdict(")
     assert i < j and "age_victims" in src
 
 

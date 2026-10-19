@@ -5836,7 +5836,83 @@ class Front:
             late[:8], still[:8], time.time() - t_park)
         # D->P flip time (user definition): D's decodes stopped with this park
         self._ipc_dp_clock().note_park(self.epoch, t_park, (time.time() - t_park) * 1000.0)
+        if unknown:
+            Front._d_orphan_abort(self, unknown)   # S60 F6: D holds them for nobody
         return "parked"
+
+    def _d_orphan_abort(self, rids: List[str]) -> int:
+        """S60 F6 (SOLL R11; Auftrag S60 Punkt 3/4 "beendet, aber nicht freigegeben"): the rids D just parked that the
+        front holds no D leg for -- no ``D.outstanding`` entry (the leg's ``finally`` removed it: client gone or leg
+        ended), not in the D line, no live Seat -- are orphans: D keeps their KV and a running slot and decodes them
+        for nobody. rc15: pdflip-80-579's client left at 08:48:20 (``CLIENT-GONE state=parked action=abort-d-park
+        status=200``); D received the abort during its #1471 settle and kept the request, resumed it every D phase
+        and decoded it to 09:13:55 (tokens 122800 -> 136642), listed ``unknown_to_front`` in 13 PARK-RUNNING lines
+        from 08:48:47 on. The park is the moment D holds them in its parked list, which D's abort reaches
+        (``d_park_runtime.park_abort``): the front aborts each one there, in the background (the flip never waits
+        for it). Returns the number of aborts sent."""
+        if not envs.FLLIPER_PDFLIP_D_ORPHAN_ABORT.get():
+            return 0
+        # S60r A2: an orphan is a rid the front holds NOWHERE -- not only no D leg, also not queued or on P (a W50 /
+        # park-handback requeue pops ``D.outstanding`` and the request goes on via P under the SAME rid; D's abort
+        # would drop that rid's tail staging and park parts -- ``park_abort``: ``tail_adopt.drop_aborted``,
+        # ``remove_parks_aborted`` -- under the hand-off coming back). Such a rid is left to the next park.
+        held = Front._d_orphan_front_holds(self)
+        orphans = [r for r in rids if str(r).startswith("pdflip-") and r not in held]
+        if orphans:
+            # S60r A1: D aborts by PREFIX (``park_abort`` and ``_abort_request_now``: ``rid.startswith(abort.rid)``).
+            # The rid counter is global and the epoch repeats, so one epoch holds ``pdflip-2-6`` and ``pdflip-2-60``
+            # .. ``-69`` (measured: 4 of the 8 boots 18./19.10. carry such pairs). The abort of the orphan
+            # ``pdflip-2-6`` would drop the live ``pdflip-2-60`` with it -- a user's request lost. An orphan whose rid
+            # prefixes any other rid the front or this park knows is not aborted (named; the next park asks again).
+            names = held | {str(r) for r in rids}
+            shadowed = [o for o in orphans if any(n != o and n.startswith(o) for n in names)]
+            if shadowed:
+                self.counters["d_orphan_abort_prefix_skip"] += len(shadowed)
+                logger.warning("PDFLIP D-ORPHAN-ABORT-SKIP rids=%s epoch=%d -- D aborts by rid PREFIX and another "
+                               "live rid starts with each of these: aborting would drop it too (S60r A1; the next "
+                               "park names them again)", shadowed[:8], self.epoch)
+                orphans = [o for o in orphans if o not in shadowed]
+        if not orphans:
+            return 0
+        tasks = self.__dict__.setdefault("_d_orphan_tasks", set())
+        for r in orphans:
+            self.counters["d_orphan_abort"] += 1
+            t = asyncio.ensure_future(Front._d_orphan_abort_one(self, r))
+            tasks.add(t)
+            t.add_done_callback(tasks.discard)
+        return len(orphans)
+
+    def _d_orphan_front_holds(self) -> set:
+        """S60r A2: every rid the front still holds anywhere -- a leg on any group (``outstanding``), the P queue, the
+        D line, a live Seat, a lane-held request, a RESUME-VIA-P in flight, an ARRIVAL-SEAT waiter or grant, a park
+        record. Partial fronts (test doubles) read what they have."""
+        held: set = set()
+        for g in (getattr(self, "groups", None) or {}).values():
+            held.update(str(r) for r in (getattr(g, "outstanding", None) or {}))
+        for src in (getattr(self, "queue", ()) or (), getattr(self, "_ready_for_d", ()) or (),
+                    getattr(self, "_d_seats_live", ()) or ()):
+            held.update(str(getattr(x, "rid", "")) for x in list(src))
+        try:
+            held.update(str(getattr(p, "rid", "")) for p in Front._lane_held_pendings(self))
+        except Exception:  # noqa: BLE001 -- a front without lanes holds none there
+            pass
+        held.update(str(r) for r in (getattr(self, "_rvp_inflight", None) or ()))
+        held.update(str(r) for r in (getattr(self, "_d_parked", None) or {}))
+        st = self.__dict__.get("_asr_state") or {}
+        held.update(str(r) for r in (st.get("waiters") or {}))
+        held.update(str(r) for r in (st.get("granted") or {}))
+        held.discard("")
+        return held
+
+    async def _d_orphan_abort_one(self, rid: str) -> None:
+        try:
+            code, _b = await self.rpc(self.groups["D"], "/abort_request", {"rid": rid}, 30)
+            status = str(code)
+        except Exception as exc:  # noqa: BLE001 -- named, never fatal: the next park asks again
+            status = "raised=%s" % type(exc).__name__
+        logger.warning("PDFLIP D-ORPHAN-ABORT rid=%s status=%s epoch=%d -- D parked a request the front holds no "
+                       "leg for (client gone / leg ended): its KV and D running slot served nobody; aborted on D "
+                       "(S60 F6, R11; the next park names it again if D still holds it)", rid, status, self.epoch)
 
     # ---------------- seat / gate bookkeeping (C4, C5) ----------------
     def seats_free(self) -> int:
@@ -11578,9 +11654,23 @@ class Front:
             _seats0 = self._set_seats_free()
         except Exception:  # noqa: BLE001
             _seats0 = 1
-        seat = await self._acquire_short_seat_core(rid, est_tokens, refused, max_tokens, uncached, x_set, t_in)
+        try:
+            seat = await self._acquire_short_seat_core(rid, est_tokens, refused, max_tokens, uncached, x_set, t_in)
+        except BaseException:
+            # S60r A3: a request cancelled or failed between its grant and its Seat holds no seat and no D line
+            if _asr.enabled():
+                self._asr_st()["granted"].pop(rid, None)
+            raise
         _named = None
         if _asr.enabled():   # the rule off keeps no state at all
+            # S60 F3: a grant this request did not turn into a Seat (D budget, yield, phase moved) holds no seat
+            # -- before, it counted in ``taken`` for 10 s and held the D line behind it.
+            # S60r A3: a grant that DID become a Seat is settled here too: the Seat counts in ``taken`` through the
+            # hand-off term (a Seat without a D leg) and then the D ledger, so the grant is spent. Left to the lazy
+            # settlement in ``_arrival_seat_taken``, a seated grant stayed in ``granted`` whenever no waiter read the
+            # seat count during its leg -- and after the leg released its Seat it read as an older grant not yet
+            # seated: the D line yielded to it (``_d_line_hold_for_older_waiter``) until some arrival settled it.
+            self._asr_st()["granted"].pop(rid, None)
             _wn = self._asr_st().setdefault("wait_named", {})
             _named = _wn.pop(rid, None)
             if len(_wn) > 1024:
@@ -11617,7 +11707,12 @@ class Front:
         D cannot take this request NOW, as opposed to the phase or the gate.
         """
         try:
-            await asyncio.wait_for(self._batch_gate.wait(), self.drain_deadline_s)
+            if _asr.enabled() and Front._short_gate_by_age_on(self):
+                # S60 F3: wait only for the OLDER D-line entries (PRIO=ALTER) -- a younger hand-off takes no seat
+                # before this request; the seat itself is then ARRIVAL-SEAT's, in one age order with the D line
+                await Front._short_gate_wait_by_age(self, rid)
+            else:
+                await asyncio.wait_for(self._batch_gate.wait(), self.drain_deadline_s)
         except asyncio.TimeoutError:
             self.counters["short_gate_timeout_to_batch"] += 1
             logger.warning("PDFLIP SHORT-GATE rid=%s: queued BATCH work held the gate for %.0f s; "
@@ -11687,6 +11782,76 @@ class Front:
             self._d_seat.release()
             return None
         return Seat(self, rid, "short", tokens=est_tokens)
+
+    def _short_gate_by_age_on(self) -> bool:
+        """S60 F3 switch (FLLIPER_PDFLIP_SHORT_GATE_BY_AGE, default on; acts with the ARRIVAL-SEAT rule only)."""
+        try:
+            return bool(envs.FLLIPER_PDFLIP_SHORT_GATE_BY_AGE.get()) and _asr.enabled()
+        except Exception:  # noqa: BLE001 -- an unreadable switch is its default
+            return _asr.enabled()
+
+    def _d_line_older_than(self, rid: str) -> List["Pending"]:
+        """S60 F3: the live D-line entries (``_ready_for_d``) OLDER than ``rid`` by the SA order key."""
+        k = Front._sa_key(self, rid)
+        return [q for q in list(getattr(self, "_ready_for_d", ()) or ())
+                if not getattr(getattr(q, "fut", None), "done", lambda: False)() and Front._sa_key(self, q) < k]
+
+    async def _short_gate_wait_by_age(self, rid: str) -> None:
+        """S60 F3 (PRIO=ALTER 14.10.; SOLL R2/R5; NF rc15): the batch gate of a kurz arrival, by age. Before, the gate
+        was closed while ANY hand-off waited in the D line (``_sync_batch_gate``) and every kurz arrival stood at it
+        -- outside the ARRIVAL-SEAT waiters, so no age order, no seat plan and no line saw it -- until the line
+        emptied or ``--drain-deadline-s`` (120 s) ran out and it was routed to P: pdflip-108-779 (u=55, arrived
+        09:07:20,7) entered the seat wait at 09:09:17,1 (116.4 s, ttft 118.7 s); pdflip-108-776 (u=274) hit the
+        120 s at 09:08:44,6 and went to P (ttft 205.5 s). Now it waits only while an OLDER entry waits in the D line
+        (that one takes the seat first, law 2); a younger one does not hold it. Raises TimeoutError at the same
+        bound as before (the caller's existing fall-through)."""
+        t0 = time.monotonic()
+        told = False
+        while True:
+            older = Front._d_line_older_than(self, rid)
+            if not older:
+                return
+            if not told:
+                told = True
+                self.counters["short_gate_age_waits"] += 1
+                logger.info("PDFLIP SHORT-GATE-AGE rid=%s waits for %d older D-line entr%s (first %s) -- the older "
+                            "hand-off takes the seat first; a younger one does not hold this request (S60 F3)",
+                            rid, len(older), "y" if len(older) == 1 else "ies", getattr(older[0], "rid", "?"))
+            if time.monotonic() - t0 >= float(self.drain_deadline_s):
+                raise asyncio.TimeoutError()
+            await asyncio.sleep(0.05)
+
+    def _d_line_hold_for_older_waiter(self, p: "Pending") -> Optional[str]:
+        """S60 F3: the D line's head ``p`` takes no seat while an OLDER ARRIVAL-SEAT waiter (a kurz request on D) is
+        not blocked, or holds a grant not yet seated -- the rid it yields to, else None. A waiter whose verdict says
+        it does not fit and its elders block its plan (fits False, plan none, verdict on the current room) does not
+        hold the line: younger ones backfill past it, as in the waiter queue itself."""
+        if not Front._short_gate_by_age_on(self):
+            return None
+        st = self.__dict__.get("_asr_state")
+        if not st:
+            return None
+        k = Front._sa_key(self, p)
+        _now = time.time()
+        _D_out = getattr(self.groups.get("D") if isinstance(getattr(self, "groups", None), dict) else None,
+                         "outstanding", None) or {}
+        for r, t_g in list((st.get("granted") or {}).items()):
+            # S60r A3: the grant's own settlement (``_arrival_seat_taken``): a grant whose rid runs on D or that
+            # lapsed (10 s) holds nothing -- read here too, not only when a waiter happens to count the seats
+            if r in _D_out or _now - float(t_g or 0.0) > 10.0:
+                continue
+            if Front._sa_key(self, r) < k and not any(getattr(s, "rid", None) == r
+                                                     for s in (getattr(self, "_d_seats_live", ()) or ())):
+                return r
+        fits_of = st.get("fits") or {}
+        plans = st.get("age_plan") or {}
+        for r in list((st.get("waiters") or {}).keys()):
+            if Front._sa_key(self, r) >= k:
+                continue
+            if fits_of.get(r) is False and plans.get(r, "none") == "none" and not Front._asr_verdict_stale(self, st, r):
+                continue    # blocked by its own elders / its KV: the younger hand-off backfills
+            return r
+        return None
 
     def _age_seat_on_credit(self, rid: str) -> bool:
         """S46 F5 (SITZPOLITIK VEREINT a1850fa9a3 / AGE PLAN; user 30.09. ~14:40Z "wird der mittlere auf die karten
@@ -12409,6 +12574,21 @@ class Front:
         while len(d) > self.ASR_ARRIVALS_KEPT:
             d.popitem(last=False)
 
+    def _asr_ttft_arrival(self, rid: str) -> Optional[float]:
+        """S60 F5: the arrival stamp for the ONE TTFT note of ``rid`` (None on a later first content), without
+        removing the stamp the seat orders read."""
+        if not self.__dict__.get("_asr_arrive"):
+            return None
+        done = self.__dict__.setdefault("_asr_ttft_done", collections.OrderedDict())
+        if rid in done:
+            return None
+        t = self._asr_arrival_of(rid)
+        if t is not None:
+            done[rid] = True
+            while len(done) > self.ASR_ARRIVALS_KEPT:
+                done.popitem(last=False)
+        return t
+
     def _asr_arrival_of(self, rid: str, pop: bool = False) -> Optional[float]:
         d = self.__dict__.get("_asr_arrive")
         if not d:
@@ -12442,11 +12622,14 @@ class Front:
         logger.info("%s PARKED-CLEAR n=%d why=%s (the youngest-parked decodes run again: they "
                     "hold seats and are victims of (c) again)", _asr.MARKER, n, why)
 
-    def _arrival_seat_taken(self) -> Tuple[int, int]:
+    def _arrival_seat_taken(self, for_rid: Optional[str] = None) -> Tuple[int, int]:
         """(taken, n): the D seats this phase owes -- D's running ledger (minus
         the youngest-parked and the wait-bound-parked), the hand-offs in flight
         and the prefilled requests still waiting for a front seat -- against the
-        phase's seat count (H95c ``_d_phase_n``, else ``--d-bs``)."""
+        phase's seat count (H95c ``_d_phase_n``, else ``--d-bs``).
+
+        S60 F3: ``for_rid`` (an ARRIVAL-SEAT waiter) -- the D line's waiting entries count only when they are OLDER
+        than it (SA order key): a younger hand-off holds no seat before an older kurz request (PRIO=ALTER)."""
         n = getattr(self, "_d_phase_n", None) or self.d_bs
         if _d_seat_rewake_on():
             # D-SEAT-REWAKE: D grows its phase seats live at the next round
@@ -12457,6 +12640,9 @@ class Front:
         st = self._asr_st()
         parked, granted = st["parked"], st["granted"]
         ready = [p for p in self._ready_for_d if getattr(p, "fut", None) is None or not p.fut.done()]
+        if for_rid is not None and ready and Front._short_gate_by_age_on(self):
+            _k = Front._sa_key(self, for_rid)
+            ready = [p for p in ready if Front._sa_key(self, p) < _k]
         running = [r for r in self._flip_ledger(D) if r not in parked]
         # a grant between this rule's verdict and its Seat (the caller still
         # awaits the store-budget reading) holds its seat already: no second
@@ -12524,6 +12710,13 @@ class Front:
         task = pending[1]
         if cached is None:
             return await asyncio.shield(task)
+        if float(cached[0]) < float(getattr(self, "t_awake", 0.0) or 0.0):
+            # S60 F4 (nichts schaetzen, 19.10.; NF rc15 09:09:17,093 ``kv_age_ms=312645``): the last reading is from
+            # BEFORE D woke for this phase -- D slept, parked and resumed since (epoch 104 -> 110), its KV is another
+            # one. The budget's "last reading decides" holds inside one D phase (a pass boundary late); a reading of
+            # an earlier phase is no reading of this D: the test waits for the fresh one, like the first reading.
+            self.counters["arrival_seat_kv_prev_phase"] += 1
+            return await asyncio.shield(task)
         budget = _asr.kv_read_budget_s()
         if not task.done() and budget > 0:
             try:
@@ -12580,6 +12773,7 @@ class Front:
         need = _asr.kv_need(max(0, int(est_prompt or 0) - shared), decode)
         fits, why = _asr.kv_fits(need, reading)
         free = _asr.kv_free(reading)
+        self._asr_st()["last_kv_free"] = free   # S60 F2: the room this tick's verdicts were formed on
         deficit = 0 if (fits or free is None) else int(need) - int(free)
         if shared or decode < reserve:
             why = "%s [need = prompt %d - shared %d + decode %d of max_tokens %d, D clip %s]" % (
@@ -12641,6 +12835,27 @@ class Front:
             self.counters["arrival_seat_kv_displace_refused"] += 1
         return got
 
+    def _age_claim_live(self, st: dict, head: str) -> bool:
+        """S60 F1 (SOLL R5, NF rc15 09:09:32,481-,496): does the to_d grant of ``head`` still speak for its victims?
+
+        Before, the claim lapsed as soon as the grant left ``granted`` -- and an on-credit grant leaves it within the
+        same millisecond (``_arrival_seat_taken`` settles a grant whose rid holds a live Seat). The next waiter's plan
+        then named the SAME victim again: pdflip-108-778, -108-781 and -110-782 all went to D on credit with
+        ``victims=['pdflip-110-783']`` (seat 7/6, 8/6, 9/6) -- one younger decode can free ONE seat, three heads were
+        promised it. The claim now lives while the head's grant is pending OR its Seat is live and D has not yet run
+        it (its first content ends the claim: D's SEAT-AGE has decided by then); the head's leg ending releases its
+        Seat and so the claim. The victim leaving D's running set needs no extra rule: it is then no candidate."""
+        if head in (st.get("granted") or {}):
+            return True
+        return any(getattr(s, "rid", None) == head for s in (getattr(self, "_d_seats_live", ()) or ()))
+
+    def _age_claim_head_ran(self, rid: str) -> None:
+        """S60 F1: ``rid``'s first content came from D -- its to_d displacement is decided, its claim ends."""
+        st = self.__dict__.get("_asr_state")
+        if not st:
+            return
+        (st.get("age_victims") or {}).pop(rid, None)
+
     def _arrival_seat_age_verdict(self, head_rid: str, head_arrival: Optional[float],
                                   seat_is_free: bool, deficit: int) -> Optional[List[str]]:
         """AGE PLAN (Nutzer 30.09. ~14:40Z/14:45Z), the FRONT's half: may the
@@ -12661,9 +12876,10 @@ class Front:
         _av = st.setdefault("age_victims", {})
         _claimed = set()
         for _g in list(_av):
-            if _g in st["granted"] and _g != head_rid:
-                _claimed.update(_av[_g])
-            elif _g not in st["granted"]:
+            if Front._age_claim_live(self, st, _g):
+                if _g != head_rid:
+                    _claimed.update(_av[_g])
+            else:
                 _av.pop(_g, None)
         running = [r for r in self._flip_ledger(self.groups["D"])
                    if r not in st["parked"] and r != head_rid and r not in _claimed]
@@ -12773,6 +12989,30 @@ class Front:
             return []
         return cands
 
+    def _asr_note_verdict_room(self, st: dict, rid: str, taken: int) -> None:
+        """S60 F2: the room (D's free KV, the seat count) ``rid``'s last fit verdict was formed on."""
+        st.setdefault("fits_at", {})[rid] = (st.get("last_kv_free"), int(taken))
+
+    def _asr_verdict_stale(self, st: dict, r: str) -> bool:
+        """S60 F2 (PRIO=ALTER 14.10.; NF rc15 09:09:32,373): True = the older waiter ``r``'s "does not fit" verdict
+        was formed on LESS room than there is now (D's free KV grew or the seat count fell since its tick) -- it may
+        fit now, so it is no blocked elder until its own tick has read the new room. Before, a younger waiter's tick
+        that came first on the fresh reading backfilled past it: pdflip-110-783 (arrived 09:09:31,5, need 52248) took
+        the seat at free=87296 while pdflip-108-780 (09:07:27, need 70242 -- it fit the SAME reading) still carried
+        its verdict from free=42944; the waiters each tick every 50 ms, so the older one loses at most one tick."""
+        at = (st.get("fits_at") or {}).get(r)
+        if at is None:
+            return True     # no verdict read yet: not known to be blocked
+        r_free, r_taken = at
+        cur_free = st.get("last_kv_free")
+        if cur_free is not None and (r_free is None or int(cur_free) > int(r_free)):
+            return True
+        try:
+            cur_taken = Front._arrival_seat_taken(self, for_rid=r)[0]
+        except Exception:  # noqa: BLE001 -- a partial front: the seat term reads as unchanged
+            return False
+        return int(cur_taken) < int(r_taken)
+
     async def _asr_older_blocked(self, rid: str, t_mine: float, seat_is_free: bool) -> bool:
         """AGE PLAN: may ``rid`` take a seat past the requests OLDER than it?
         Only when every older waiter -- the D-prefill waiters and the queued
@@ -12785,7 +13025,8 @@ class Front:
         k_mine = Front._prio_key(self, rid, t_mine)  # PRIO-AS-AGE 1014: "older" by the order key
         for r, t in list(st["waiters"].items()):
             if r != rid and Front._prio_key(self, r, t) < k_mine:
-                if fits_of.get(r) is not False or plans.get(r) != "none":
+                if (fits_of.get(r) is not False or plans.get(r) != "none"
+                        or Front._asr_verdict_stale(self, st, r)):
                     return False
         for q in self._asr_live_p_cands():
             t = float(getattr(q, "t_arrive", 0.0) or 0.0)
@@ -12842,7 +13083,7 @@ class Front:
                     continue
                 # PRIO-AS-AGE 1014: the head is the oldest by the order key (its clock stays the stamp)
                 head = min(waiters.items(), key=lambda kv: Front._prio_key(self, kv[0], kv[1]))[0]
-                taken, n = self._arrival_seat_taken()
+                taken, n = self._arrival_seat_taken(for_rid=rid)
                 free = _asr.seat_free(taken, n)
                 if age_plan:
                     # AGE PLAN (30.09. ~14:40Z/14:45Z): one decision per tick
@@ -12855,10 +13096,11 @@ class Front:
                                       if free else (True, "no seat", 0))
                 if free:
                     # H16V F4: the seat count again after the KV await (see the AGE PLAN path)
-                    taken, n = self._arrival_seat_taken()
+                    taken, n = self._arrival_seat_taken(for_rid=rid)
                     if not _asr.seat_free(taken, n):
                         free, fits, why = False, True, "no seat; %s" % why
                 fits_of[rid] = bool(free and fits)
+                Front._asr_note_verdict_room(self, st, rid, taken)   # S60 F2
                 if free and not fits and head == rid:
                     # NF-STAU-KV (#246): the head displaces a younger decode
                     await self._arrival_seat_kv_displace(
@@ -12869,7 +13111,8 @@ class Front:
                     # free seat it cannot use) and the head has not waited the bound
                     _k_mine = Front._prio_key(self, rid, waiters[rid])
                     older = [r for r, t in waiters.items() if Front._prio_key(self, r, t) < _k_mine]
-                    backfill = (all(fits_of.get(r) is False for r in older)
+                    backfill = (all(fits_of.get(r) is False and not Front._asr_verdict_stale(self, st, r)
+                                    for r in older)
                                 and _asr.backfill_allowed(
                                     time.time() - max(waiters[head] + float((st.get("lane_off") or {}).get(head, 0.0)),
                                                       self.t_awake), bound))
@@ -12897,6 +13140,7 @@ class Front:
         finally:
             waiters.pop(rid, None)
             fits_of.pop(rid, None)
+            (st.get("fits_at") or {}).pop(rid, None)   # S60 F2
             if _lane_on:
                 (st.get("lane_off") or {}).pop(rid, None)
                 _lc = self.__dict__.get("_lane_ctl_obj")
@@ -12940,7 +13184,7 @@ class Front:
             # H16V review A4 (R5): the to_d grant below is formed from ``free`` -- read before the awaits above, like the
             # fits branch's -- so the seat count is read AGAIN here, with no await between it and the grant (which enters
             # ``granted`` at once and so counts into ``taken`` for the next waiter of the tick).
-            taken, n = self._arrival_seat_taken()
+            taken, n = self._arrival_seat_taken(for_rid=rid)
             free = bool(_asr.seat_free(taken, n))
             if free and fits_kv:
                 # S46 F1 (SOLL R2/R5; NF rc12 18:50:36,202 and rc13 20:14:58,868): ``fits`` above was formed from the
@@ -12965,7 +13209,7 @@ class Front:
             # ONE free seat): ``free`` was read BEFORE the awaits above (KV reading, older-blocked), so every waiter of
             # the tick saw the same free seat; the losers then stood at ``_d_seat.acquire()`` unseen. The seat count is
             # read again here, with no await between it and the grant (which enters ``granted`` at once).
-            taken, n = self._arrival_seat_taken()
+            taken, n = self._arrival_seat_taken(for_rid=rid)
             if not _asr.seat_free(taken, n):
                 fits, free = False, False
                 why = "no seat; %s" % why
@@ -12989,6 +13233,7 @@ class Front:
                         time.time() - t_mine, ms)
             return True
         why_wait = "order" if fits else ("kv" if free else "seat")
+        Front._asr_note_verdict_room(self, st, rid, taken)   # S60 F2
         st.setdefault("wait_named", {})[rid] = why_wait   # H16V F4: the caller names the wait
         told = st.setdefault("age_told", {})
         if told.get(rid) != why_wait:
@@ -13683,6 +13928,21 @@ class Front:
                         "waits for the older request still on P; SA age order)", p.rid, older.rid, self.awake)
         return True
 
+    def _d_line_admit_yields(self, p: "Pending") -> bool:
+        """S60 F3: True = the D line's head ``p`` yields its seat to an older ARRIVAL-SEAT waiter (one line per pair)."""
+        r = Front._d_line_hold_for_older_waiter(self, p)
+        if r is None:
+            return False
+        told = self.__dict__.setdefault("_d_line_yield_told", {})
+        if told.get(p.rid) != r:
+            told[p.rid] = r
+            if len(told) > 1024:
+                told.clear()
+            self.counters["d_line_yield_older_waiter"] += 1
+            logger.info("PDFLIP D-LINE-YIELD rid=%s older_waiter=%s (S60 F3: the older kurz request waiting for a D "
+                        "seat takes it first -- one age order for the D line and the ARRIVAL-SEAT waiters)", p.rid, r)
+        return True
+
     def _d_line_older_newcomer(self, p: "Pending", seen: set) -> bool:
         """S46 F2: True = while the admitter waited for the seat with ``p`` picked, a request OLDER than ``p`` joined
         the D line (it was not there at the pick). The age order is taken before the wait, so the seat went to the
@@ -13848,8 +14108,15 @@ class Front:
                     continue
                 if Front._dormant_hold_for_older(self, p):
                     continue   # S46 F4: an older request is still on P -- D is asleep, the seat waits for it
+                if Front._d_line_admit_yields(self, p):
+                    continue   # S60 F3: an older kurz request waits for a D seat -- it goes first (PRIO=ALTER)
                 _line_seen = {id(q) for q in self._ready_for_d}
                 await self._d_seat.acquire()
+                if Front._d_line_admit_yields(self, p):
+                    # S60 F3: an older kurz request became due while this admitter waited -- the permit goes back
+                    # (to the next one at the semaphore: the older request's own acquire)
+                    self._d_seat.release()
+                    continue
                 if Front._d_line_older_newcomer(self, p, _line_seen):
                     # S46 F2: an OLDER hand-off joined the line while this admitter waited for the seat (the order
                     # above was taken before the wait) -- the seat goes back, the next pass picks by age
@@ -14632,7 +14899,12 @@ class Front:
                     # ROUTE-VERDICT line (the arrival), it is the
                     # arrival-to-first-token the agent-load boot measures.
                     # NF-STAU: arrival -> first token (the user's TTFT), IPC too
-                    _t_arr = self._asr_arrival_of(rid, pop=True)
+                    # S60 F5: the arrival stamp is READ, never popped -- the stamp is the request's age in every
+                    # seat order (``_younger``: a rid without a stamp counts as OLD), and popping it at the first
+                    # token made every streaming decode the oldest request on D. The TTFT is still noted once per
+                    # rid (a resumed leg's second first content is no new TTFT).
+                    _t_arr = Front._asr_ttft_arrival(self, rid)
+                    Front._age_claim_head_ran(self, rid)   # S60 F1: D ran this head -- its to_d claim ends
                     _fc["t"], _fc["arr"] = time.time(), _t_arr
                     _ttft = -1.0
                     if _t_arr is not None:

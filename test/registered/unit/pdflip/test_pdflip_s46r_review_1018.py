@@ -87,7 +87,10 @@ def test_a_no_credit_past_an_older_request_in_the_front_d_line():
         with pytest.raises(asyncio.TimeoutError):
             await asyncio.wait_for(f._acquire_short_seat("pdflip-9-40", 2000, [], max_tokens=256, uncached=400),
                                    0.8)
-        assert f.counters["arrival_seat_age_credit_older_in_line"] >= 1
+        # S60 F3: the kurz request now already waits at the age gate behind the OLDER D-line entry (it never reaches
+        # the credit test); either way no seat is taken on credit past the older request
+        assert (f.counters["arrival_seat_age_credit_older_in_line"] >= 1
+                or f.counters["short_gate_age_waits"] >= 1)
         assert f.counters["arrival_seat_age_seat_on_credit"] == 0
 
     asyncio.run(run())
@@ -120,3 +123,25 @@ def test_b_no_dormant_hold_while_the_p_to_d_flip_runs():
         assert Front._dormant_hold_for_older(f, young) is False
 
     asyncio.run(body())
+
+
+def test_a_no_credit_past_an_older_request_in_the_front_d_line_with_the_old_gate(monkeypatch):
+    """S60r: the S46r guard itself stays pinned -- with S60 F3's age gate off the kurz request reaches the credit test
+    and the guard refuses the credit past the older D-line entry."""
+    monkeypatch.setenv("FLLIPER_PDFLIP_SHORT_GATE_BY_AGE", "0")
+    f, _ = _f5_front()
+
+    async def run():
+        loop = asyncio.get_running_loop()
+        older = F.Pending("pdflip-9-30", "/generate", {}, "x", time.time(), loop.create_future(), est_prompt=500,
+                          est_uncached=500, d_eligible=True)
+        f._ready_for_d.append(older)
+        _stamp(f, "pdflip-9-40", time.time())
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(f._acquire_short_seat("pdflip-9-40", 2000, [], max_tokens=256, uncached=400),
+                                   0.8)
+        assert f.counters["arrival_seat_age_credit_older_in_line"] >= 1
+        assert f.counters["short_gate_age_waits"] == 0
+        assert f.counters["arrival_seat_age_seat_on_credit"] == 0
+
+    asyncio.run(run())
