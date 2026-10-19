@@ -2047,6 +2047,28 @@ class Envs:
     FLLIPER_PDFLIP_D_MATCH_PROBE_DEADLINE_MS = EnvInt(16000)
     # S56r A1: the pause before a failed probe is asked again (ms)
     FLLIPER_PDFLIP_D_MATCH_PROBE_RETRY_MS = EnvInt(250)
+    # S63 F1 (user 19.10. "alle zahlen liegen doch schwarz auf weiß vor zu jedem zeitpunkt?"): a set verdict that flips
+    # or assigns P (FLIP_P / PARK_NO_SEAT / REROUTE_P, also the queue-sum verdict) stands only on D's CURRENT numbers:
+    # members whose probe answer is older than _FRESH_MS are probed again (D's tree read-only + the store, one
+    # bundled round) and the verdict is made again on the new numbers. Default ON (user 14.10.: new features on).
+    FLLIPER_PDFLIP_SET_REPROBE = EnvBool(True)
+    # S63 F1: a probe answer at most this old (ms) IS the number at the verdict -- a re-probe could not be younger (it
+    # costs at least one D intake round); a burst's arrival probes flip at once (R3), unchanged
+    FLLIPER_PDFLIP_SET_REPROBE_FRESH_MS = EnvInt(500)
+    # S63 F2 TOK-AHEAD (pdflip/tok_ahead.py): one tokenization per group and request -- D's leg takes the D probe's
+    # tokenization of its media prompt, P's leg takes the tokenization P's tokenizer ran AHEAD at the arrival (posted
+    # by the front while D is awake, P's tokenizer idle: rc15 pdflip-12-340 spent 8.7 s in P's image processor inside
+    # the flip). Identity = digest of text, ids and every media datum; a mismatch is named and tokenizes as before.
+    # Default ON (user 14.10.: new features on).
+    FLLIPER_PDFLIP_TOK_AHEAD = EnvBool(True)
+    # S63 F2: entries kept per tokenizer process (each holds one prompt's ids and processed media items)
+    FLLIPER_PDFLIP_TOK_AHEAD_ENTRIES = EnvInt(8)
+    # S63 F2: an entry no leg took within this many seconds is dropped
+    FLLIPER_PDFLIP_TOK_AHEAD_TTL_S = EnvFloat(120.0)
+    # S63r review: host-RAM cap of the entries per tokenizer process (MiB; oldest out, an entry larger than the cap is
+    # not kept). P's entries hold the processed pixels (~19 KB per image token in fp32: 5 images / 20k image tokens
+    # ~ 380 MB) and live through the flip's host-memory storm; a tower-less D caches no pixels at all. 0 = no byte cap.
+    FLLIPER_PDFLIP_TOK_AHEAD_MAX_MIB = EnvInt(1024)
     # PARK-NO-DWELL (user 02.10.: an arriving request is prefilled AT ONCE, no
     # grace for running decodes; N6d ..._ec4d492f58 epoch 4: 'PDFLIP
     # PARK-IMMEDIATE-DWELL awake_ms=310 min_dwell_ms=1974 floor_ms=2000' held the

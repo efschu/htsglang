@@ -59,6 +59,7 @@ import re
 import statistics
 import subprocess
 import time
+import types
 import urllib.parse
 from dataclasses import dataclass, field
 from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Sequence, Set, Tuple
@@ -6973,6 +6974,7 @@ class Front:
                 _probe_task = Front._d_probe_start(self, rid, path, payload)
         # S56: D's answer replaces the front's ids (D's token space: images expanded, pad values = the store keys)
         _probe = await Front._d_probe_result(self, rid, _probe_task) if _probe_task is not None else None
+        _t_probe_ans = time.monotonic()  # S63 F1: the D number below is D's at this instant
         if _probe_task is not None and _probe is None:
             # S56r A1: no exact D number -- never the front's count; P's exact number where the ids are D's (a text
             # prompt's front ids, X-EXACT-TOKENS 137/137 and the probe's own fast path), else none
@@ -7072,6 +7074,14 @@ class Front:
             _pbook[str(rid)] = _xp  # a later D refusal of this rid knows P's exact number (W123 requeue)
             while len(_pbook) > 4096:
                 _pbook.popitem(last=False)
+            # S63 F1: the key of this price, for the re-probe right before a set verdict that flips or assigns P
+            Front._reprobe_note(self, rid, _dmp.ReprobeEntry(
+                ids=_probe.ids, spans=tuple(_probe.mm_spans), extra_key=_probe.extra_key,
+                extra_key_known=bool(_probe.extra_key_known), path=str(path),
+                # the body is kept only where a re-probe must send it again (no D namespace in the answer / LoRA):
+                # a media payload is megabytes, D's ids + namespace are the key itself
+                payload=(None if (_probe.extra_key_known and ns_known) else payload),
+                ns_known=bool(ns_known), ns=ns, t=_t_probe_ans, price=_xp))
             if _xp.image_in_tail:
                 self.counters["d_probe_image_in_tail"] += 1
             logger.info("PDFLIP D-PROBE rid=%s n=%d device=%d host=%d store=%d tier=%s covered=%d uncached_d=%d "
@@ -10654,9 +10664,9 @@ class Front:
         # recording site knows it even when the exact count falls back
         Front._ns_note(self, rid, payload)
         _pb_fut = Front._pb_register(self, rid, remainder) if self.x_exact else None
-        # EARLY-FLIP: D idle and a chars/3 price far over X -> the D->P flip begins
-        # NOW, beside the count and the probe below; it awaits this verdict
-        _ef = Front._early_flip_maybe(self, rid, remainder) if self.x_exact else None
+        # EARLY-FLIP: begins only on the EXACT price below (S63, user 19.10. "warum wird irgendwas geschätzt?" --
+        # the chars/3 figure no longer starts a D quiesce)
+        _ef = None
         # X-EXACT: the count replaces the chars/3 figures (off: never entered).
         _xx = None
         if self.x_exact:
@@ -10687,6 +10697,14 @@ class Front:
         if _ctx_refusal is not None:
             Front._pb_resolve(self, rid, _pb_fut, "none", 0)
             return _ctx_refusal
+        # EARLY-FLIP (S63): D idle and the EXACT price (D's probe + the store, or the front's exact count) far over X
+        # -> the D->P flip begins NOW, beside the rest of the arrival; it awaits this request's verdict. No exact
+        # number (chars/3 fallback, an unpriced probe): no early begin -- the verdict starts the flip as before
+        if self.x_exact and _xx is not None and not getattr(_xx, "unpriced", False):
+            _ef = Front._early_flip_maybe(self, rid, remainder)
+        # S63 F2 TOK-AHEAD: a media prompt that can reach P is tokenized on P's (idle, awake) tokenizer NOW, while D
+        # serves -- not inside the flip (rc15 pdflip-12-340: 8.7 s of P's image processor after the flip's begin)
+        Front._p_tok_ahead_maybe(self, rid, request.path, payload, _xx, remainder)
         if not known:
             self.counters["W22_PdFlipSpanUnknownPricedFull"] += 1
         self.counters["requests"] += 1
@@ -11441,10 +11459,57 @@ class Front:
                     [p.rid for p in moved][:8], max(0.0, now - min(p.t_arrive for p in moved)))
         return "moved"
 
+    # -- S63 F2 TOK-AHEAD --------------------------------------------------------------------------------------
+    def _p_tok_ahead_maybe(self, rid: str, path: str, payload: Any, xx: Any, uncached: int) -> bool:
+        """S63 F2: post ``/pdflip/tokenize_ahead`` to P for a media prompt that can reach P -- D awake (P's tokenizer
+        idle), and not a kurz request (R2: D serves it): class u >= halbX, an image in the uncached tail (R9) or no
+        exact number (D's admission may requeue it to P). Fire and forget; P's leg takes the result or tokenizes
+        itself (identity checked by digest on P)."""
+        try:
+            if not envs.FLLIPER_PDFLIP_TOK_AHEAD.get() or not _dmp.payload_has_any_media(payload):
+                return False
+            P = self.groups.get("P") if isinstance(getattr(self, "groups", None), dict) else None
+            if P is None or getattr(self, "session", None) is None or self.awake != "D":
+                return False
+            if path not in ("/v1/messages", "/v1/chat/completions", "/generate"):
+                return False
+            frac, _t_half = Front._set_cfg()
+            half_x = phase_policy.half_x_of(int(self.tp_prefill_max_tokens), frac)
+            unpriced = xx is None or bool(getattr(xx, "unpriced", False))
+            if not (unpriced or bool(getattr(xx, "image_in_tail", False)) or int(uncached) >= int(half_x)):
+                return False
+        except Exception:  # noqa: BLE001 -- a partial front: no ahead, the leg tokenizes as before
+            return False
+        book = self.__dict__.setdefault("_p_tok_ahead_tasks", set())
+        t = asyncio.ensure_future(Front._p_tok_ahead_post(self, P, rid, path, payload))
+        book.add(t)
+        t.add_done_callback(book.discard)
+        self.counters["p_tok_ahead_sent"] += 1
+        return True
+
+    async def _p_tok_ahead_post(self, g: "Group", rid: str, path: str, payload: Any) -> None:
+        t0 = time.monotonic()
+        try:
+            async with self.session.post(f"{g.url}/pdflip/tokenize_ahead", json={"path": path, "payload": payload},
+                                         headers=admin_key_mod.auth_headers(self.admin_key),
+                                         timeout=ClientTimeout(total=120.0)) as r:
+                code, text = r.status, (await r.read()).decode(errors="replace")
+            body = json.loads(text) if code == 200 else {}
+        except Exception as e:  # noqa: BLE001 -- P's leg tokenizes itself
+            code, body = 0, {"success": False, "message": f"{type(e).__name__}: {str(e)[:160]}"}
+        ok = bool(isinstance(body, dict) and body.get("success"))
+        self.counters["p_tok_ahead_ok" if ok else "p_tok_ahead_failed"] += 1
+        logger.info("PDFLIP P-TOK-AHEAD rid=%s ok=%d n=%s tokenize_ms=%s wall_ms=%.0f why=%s (S63 F2: P's tokenizer ran "
+                    "the template and the image processor at the arrival; P's leg takes it by digest)",
+                    rid, int(ok), (body or {}).get("n", "-"), (body or {}).get("tokenize_ms", "-"),
+                    (time.monotonic() - t0) * 1000.0,
+                    "-" if ok else ((body or {}).get("message") or "status=%s" % code))
+
     # -- EARLY-FLIP (02.10.) -----------------------------------------------------------
     def _early_flip_maybe(self, rid: str, est_uncached: int):
-        """EARLY-FLIP: begin the D->P flip now for ``rid`` -- only with D idle and a
-        chars/3 price >= the factor x X; returns the handle the verdict resolves,
+        """EARLY-FLIP: begin the D->P flip now for ``rid`` -- only with D idle and an
+        EXACT price >= the factor x X (S63: the caller passes the arrival's exact
+        number, never the chars/3 figure); returns the handle the verdict resolves,
         or None (the old path: the flip waits for the verdict)."""
         try:
             if not envs.FLLIPER_PDFLIP_EARLY_FLIP.get():
@@ -11471,9 +11536,10 @@ class Front:
         self.__dict__["_early_gate"] = h
         self.__dict__["_early_flip_open"] = h
         self.counters["early_flip_begin"] += 1
-        logger.info("PDFLIP-EARLY-FLIP begin rid=%s est_uncached=%d X=%d factor=%.1f (D idle; drain + "
-                    "quiesce run beside the count and the probe, the first sleep RPC waits for the "
-                    "verdict; FLLIPER_PDFLIP_EARLY_FLIP)", rid, int(est_uncached), x, factor)
+        logger.info("PDFLIP-EARLY-FLIP begin rid=%s est_uncached=%d X=%d factor=%.1f price=exact (D idle; "
+                    "drain + quiesce run beside the rest of the arrival, the first sleep RPC waits for the "
+                    "verdict; FLLIPER_PDFLIP_EARLY_FLIP; S63: started on the exact number)", rid,
+                    int(est_uncached), x, factor)
         h.task = asyncio.ensure_future(self.flip("D", "P"))
         h.task.add_done_callback(lambda _t, h=h: self.__dict__.get("_early_flip_open") is h
                                  and self.__dict__.pop("_early_flip_open", None))
@@ -12355,6 +12421,267 @@ class Front:
             "X-SUM S=%d + %d granted on D not started > X=%d: waits for D to begin it (R6) or finish it, no flip"
             % (sv.s_tokens, unstarted, int(x_tok)), 0.0, sv.s_tokens, sv.half_x)
 
+    # -- S63 F1: RE-PROBE AT THE SET VERDICT ------------------------------------------------------------------------
+    #: S63 F1: arrival-probe keys kept for the re-probe (bounded, oldest out; a rid that left the set is never asked)
+    REPROBE_KEEP = 256
+    #: the set verdicts that flip or assign P -- only they stand on a re-probed number (D_AFTER_TIMER: D's own
+    #: admission measures, X-GATE)
+    REPROBE_VERDICTS = (phase_policy.V_FLIP_P, phase_policy.V_PARK_NO_SEAT, phase_policy.V_REROUTE_P)
+
+    def _reprobe_note(self, rid: str, e: "_dmp.ReprobeEntry") -> None:
+        book = self.__dict__.setdefault("_reprobe_book", collections.OrderedDict())
+        book[str(rid)] = e
+        book.move_to_end(str(rid))
+        while len(book) > Front.REPROBE_KEEP:
+            book.popitem(last=False)
+
+    @staticmethod
+    def _reprobe_on() -> bool:
+        try:
+            return bool(envs.FLLIPER_PDFLIP_SET_REPROBE.get()) and bool(envs.FLLIPER_PDFLIP_D_MATCH_PROBE.get())
+        except Exception:  # noqa: BLE001 -- a partial env: the switch reads off
+            return False
+
+    def _reprobe_stale(self, rids: Sequence[str], now_m: Optional[float] = None) -> List[str]:
+        """S63 F1: the members whose number is not D's NOW: probe-priced (a re-probe key exists), answered longer
+        ago than ``FLLIPER_PDFLIP_SET_REPROBE_FRESH_MS``, and not a re-probe that just failed (inside the probe
+        deadline it is not asked again -- no loop on a D that does not answer)."""
+        book = self.__dict__.get("_reprobe_book")
+        if not book or not Front._reprobe_on():
+            return []
+        now_m = time.monotonic() if now_m is None else now_m
+        fresh = max(0.0, envs.FLLIPER_PDFLIP_SET_REPROBE_FRESH_MS.get() / 1000.0)
+        dead = Front._reprobe_bound_s()
+        out = []
+        for r in rids:
+            e = book.get(str(r))
+            if e is None or now_m - float(e.t) <= fresh:
+                continue
+            # S63r: a number from the re-probe round that LANDED inside the window is the newest that exists for this
+            # decision (the round was asked FOR it) -- D's answer is stamped before the store read, so without this a
+            # store read or a slower member > _FRESH_MS re-opened the round at every look: no verdict, ever
+            if e.landed is not None and now_m - float(e.landed) <= fresh:
+                continue
+            if e.failed_t is not None and now_m - float(e.failed_t) <= dead:
+                continue
+            out.append(str(r))
+        return out
+
+    @staticmethod
+    def _reprobe_bound_s() -> float:
+        """The longest a re-probe can take: the probe deadline (S56r A1) plus two store reads and one second."""
+        return (envs.FLLIPER_PDFLIP_D_MATCH_PROBE_DEADLINE_MS.get()
+                + 2 * envs.FLLIPER_PDFLIP_FRONT_EXACT_TIMEOUT_MS.get() + 1000) / 1000.0
+
+    def _reprobe_pending(self) -> bool:
+        rp = self._set_st().get("reprobe")
+        return rp is not None and not rp.task.done()
+
+    def _set_reprobe_gate(self, rids: Sequence[str], site: str, verdict: str) -> bool:
+        """S63 F1 (user 19.10. "alle zahlen liegen doch schwarz auf weiß vor zu jedem zeitpunkt?", SOLL R1/R3/R4/R7/
+        R8): may a set verdict that flips or assigns P stand NOW? True when every probe-priced member's number is D's
+        current one (answered inside the freshness window). Else ONE bundled re-probe of the stale members starts --
+        D's tree read-only (``peek_admission_match``, coalesced on D: a burst costs at most two intake rounds) and the
+        shared store, on the arrival's key -- and the caller holds (False); the verdict is re-made on the new numbers
+        at the next look (the controller is woken when they land). A kurz arrival (R2) never waits for it: it is no
+        member, and a flip that waits for its re-probe is not foreseeable (``_set_flip_foreseeable``)."""
+        if not Front._reprobe_on():
+            return True
+        st = self._set_st()
+        rp = st.get("reprobe")
+        if rp is not None and not rp.task.done():
+            return False
+        stale = Front._reprobe_stale(self, rids)
+        if not stale:
+            return True
+        try:
+            task = asyncio.ensure_future(Front._set_reprobe_run(self, stale, site))
+        except RuntimeError:  # no running loop (a synchronous caller): nothing can be asked -- named, not hidden
+            self.counters["set_reprobe_no_loop"] += 1
+            return True
+        st["reprobe"] = types.SimpleNamespace(task=task, rids=tuple(stale), t0=time.monotonic(), site=site)
+        self.counters["set_reprobe_begin"] += 1
+        self.counters["set_reprobe_rids"] += len(stale)
+        book = self.__dict__.get("_reprobe_book") or {}
+        now_m = time.monotonic()
+        logger.info("PDFLIP SET-REPROBE begin epoch=%d set=%d site=%s verdict_on_old=%s n=%d rids=%s ages_ms=%s "
+                    "(S63 F1: the verdict stands only on D's number NOW -- the stale members are asked again, D's "
+                    "tree read-only + the store, one bundled round; the set holds until they land)",
+                    self.epoch, st.get("set_id", 0), site, verdict, len(stale), stale[:8],
+                    ",".join("%.0f" % ((now_m - float(book[r].t)) * 1000.0) for r in stale[:8] if r in book))
+        return False
+
+    async def _set_reprobe_one(self, rid: str, e: "_dmp.ReprobeEntry"):
+        """One member's exact number NOW: (answer, store_tokens, t_answer) or (None, why)."""
+        path, payload = _dmp.reprobe_body(e, rid)
+        task = Front._d_probe_start(self, rid, path, payload)
+        if task is None:
+            return None, "probe off / no D group"
+        ans = await Front._d_probe_result(self, rid, task)
+        t_ans = time.monotonic()
+        if ans is None:
+            return None, "no exact D number by the deadline"
+        if not _dmp.reprobe_same_key(e, ans):
+            return None, "identity: D answered n=%d for the arrival's n=%d" % (ans.n, e.n)
+        ans = _dmp.with_spans(ans, e.spans)
+        store = 0
+        if e.ns_known:
+            tmo = envs.FLLIPER_PDFLIP_FRONT_EXACT_TIMEOUT_MS.get() / 1000.0
+            store, tier = await self._store_probe_depth(rid, e.ids, tmo, extra_key=e.ns)
+            if tier == "unread":
+                store, tier = await self._store_probe_depth(rid, e.ids, tmo, extra_key=e.ns)
+                if tier == "unread":
+                    return None, "store unread twice"
+        return (ans, int(store), t_ans), ""
+
+    async def _set_reprobe_run(self, rids: Sequence[str], site: str) -> int:
+        """S63 F1: the bundled re-probe of ``rids`` (concurrent POSTs, coalesced into one D round by D's tokenizer,
+        S56r A3) and the application of the new exact numbers. Bounded: each member by the probe deadline (S56r A1)
+        plus two store reads; a member without a new number is named (``SET-REPROBE-FAILED``) and not asked again
+        inside the deadline. Returns the count of moved numbers."""
+        book = self.__dict__.get("_reprobe_book") or {}
+        items = [(r, book[r]) for r in rids if r in book]
+        bound = Front._reprobe_bound_s()
+        t0 = time.monotonic()
+        try:
+            got = await asyncio.wait_for(
+                asyncio.gather(*(Front._set_reprobe_one(self, r, e) for r, e in items), return_exceptions=True),
+                timeout=bound)
+        except asyncio.TimeoutError:
+            got = [(None, "bound %.1f s" % bound)] * len(items)
+        moved = 0
+        t_landed = time.monotonic()
+        for (rid, e), res in zip(items, got):
+            if isinstance(res, BaseException):
+                res = (None, "%s: %s" % (type(res).__name__, str(res)[:160]))
+            val, why = res
+            if val is None:
+                e.failed_t = t_landed
+                self.counters["set_reprobe_failed"] += 1
+                Front._set_reprobe_unpriced(self, rid, e, why, site)
+                continue
+            ans, store, t_ans = val
+            moved += int(Front._set_reprobe_apply(self, rid, e, ans, store, t_ans, site))
+            e.landed = t_landed  # S63r: the verdict that asked for this round is made on it (no second round)
+        logger.info("PDFLIP SET-REPROBE done site=%s n=%d moved=%d failed=%d wall_ms=%.1f (S63 F1: the set's verdict is "
+                    "made again on these numbers)", site, len(items), moved,
+                    sum(1 for r in got if isinstance(r, BaseException) or r[0] is None),
+                    (time.monotonic() - t0) * 1000.0)
+        self.counters["set_reprobe_done"] += 1
+        try:  # the verdict waits for these numbers: end the controller's tick wait now
+            self._ctl_evt().set()
+            self.counters["ctl_kick_reprobe"] += 1
+        except Exception:  # noqa: BLE001 -- no loop / a partial front: the next tick decides
+            pass
+        return moved
+
+    def _set_reprobe_unpriced(self, rid: str, e: "_dmp.ReprobeEntry", why: str, site: str) -> str:
+        """S63r A1 (planner decision 19.10., user 19.10. "warum wird irgendwas geschätzt?"): a member whose re-probe got
+        NO new exact number is NOT decided on its older number. Like an UNPRICED arrival (S56r A1, ``_x_unpriced``) it
+        goes to D's own admission, which measures exactly (X-GATE: over X -> W31/W50 requeue WITH D's extent, an image in
+        the uncached tail -> W123 requeue as P-only): ``est_uncached`` 0 is only the ROUTE, never a price; a waiting halb
+        SHORT is released to D (its seat path). It leaves the set -- no flip, no hold, no second re-probe (the key is
+        dropped: it is unpriced now, like an arrival without a probe). A D that does not answer at all is a D outage:
+        the existing outage path (watchdog / group stop) owns it, not a verdict on an old number.
+
+        Not movable: a member P must serve BY STATE (D's admission already refused it over X -- ``x_requeues``, its
+        number IS D's admission measurement, S56r B2, and a second W31 is terminal, W35 --, a leg-2 reroute, a lost
+        hand-off, an intake stall, a leg 1 done or skipped). It stays P's on D's admission number, named
+        ``route=p_by_state``. Returns the route named in the line."""
+        book = self.__dict__.get("_reprobe_book")
+        if book is not None:
+            book.pop(str(rid), None)
+        routes = []
+        for p in self.queue:
+            if p.rid != rid or p.fut.done():
+                continue
+            _g = lambda k, d=0: getattr(p, k, d)  # noqa: E731 -- partial test doubles
+            if (_g("x_requeues") or _g("reroutes") or _g("handoff_lost_reroutes") or _g("intake_stalled", False)
+                    or _g("leg1_done", False) or _g("skip_leg1", False)):
+                routes.append("p_by_state")
+                self.counters["set_reprobe_failed_p_by_state"] += 1
+                continue
+            p.est_uncached = 0          # the ROUTE to D's admission (S56r A1), not a price
+            p.d_eligible = True
+            p.p_only = False            # R9 is D's admission's call now (W123 requeue on an image in the tail)
+            p.x_routed = 0
+            p.x_deferred = False
+            p.probe_priced = True       # no ledger reprice of an unpriced entry either (S56r A1)
+            p.reprobe_unpriced = True
+            routes.append("d_admission")
+            self.counters["set_reprobe_unpriced"] += 1
+        st = self._set_st()
+        if rid in st["shorts"]:
+            st["shorts"].pop(rid, None)
+            st["released"][rid] = "D"   # its seat path: D's admission measures it
+            routes.append("d_admission")
+            self.counters["set_reprobe_unpriced"] += 1
+        route = "+".join(routes) or "gone"
+        d_down = why.startswith("no exact D number") or why.startswith("bound")
+        logger.warning("PDFLIP SET-REPROBE-FAILED rid=%s site=%s why=%s age_ms=%.0f route=%s -- no new exact D number "
+                       "for this member: NOT decided on its older number (S63r A1); %s", rid, site, why,
+                       (time.monotonic() - float(e.t)) * 1000.0, route,
+                       ("it goes to D's own admission, which measures exactly (X-GATE W31 / W123 requeue with D's "
+                        "extent), as an UNPRICED arrival (S56r A1)" if "d_admission" in route else
+                        "P serves it by state on D's admission number (D refused it already; a second W31 is "
+                        "terminal)" if "p_by_state" in route else "the member left meanwhile")
+                       + ("; D did not answer: a D outage is the watchdog's / group stop's, not this verdict's"
+                          if d_down else ""))
+        return route
+
+    def _set_reprobe_apply(self, rid: str, e: "_dmp.ReprobeEntry", ans: "_dmp.ProbeAnswer", store: int,
+                           t_ans: float, site: str) -> bool:
+        """S63 F1: the re-probed exact number replaces the arrival's -- in BOTH directions (D's coverage grew:
+        writeback, a park anchor, a read-ahead; or it shrank: eviction) -- in the queue entry, in a waiting halb
+        SHORT and in the probe book. A queue entry that crosses X downwards is a SHORT now (d_eligible, as the
+        STORE-PRESENCE reprice does); a probe-priced image request is P-only exactly while an image lies in the
+        uncached tail (R9). Returns True when the class number moved."""
+        xp = _dmp.exact_price(ans, int(store) if e.ns_known else 0)
+        u = int(_dmp.class_uncached(xp))
+        old_xp = e.price
+        old_u = int(_dmp.class_uncached(old_xp)) if old_xp is not None else -1
+        age_ms = (t_ans - float(e.t)) * 1000.0
+        e.t, e.price, e.failed_t = float(t_ans), xp, None
+        pbook = self.__dict__.setdefault("_probe_price", collections.OrderedDict())
+        pbook[str(rid)] = xp
+        x = int(self.tp_prefill_max_tokens)
+        where = []
+        for p in self.queue:
+            if p.rid != rid or p.fut.done():
+                continue
+            where.append("queue")
+            q_old = int(p.est_uncached or 0)
+            p.est_uncached = u
+            p.est_uncached_p = int(xp.uncached_p)
+            if e.spans and not getattr(p, "x_requeues", 0):
+                p.p_only = bool(xp.image_in_tail)  # R9: an image in the uncached tail needs P's tower, no other one
+            if (q_old > x >= u and not getattr(p, "d_eligible", False) and not getattr(p, "reroutes", 0)
+                    and not getattr(p, "x_deferred", False) and not getattr(p, "intake_stalled", False)
+                    and not getattr(p, "p_only", False)):
+                p.d_eligible = True  # a SHORT now: a D phase admits it (R2/R7), it wakes no P
+                if getattr(p, "x_routed", 0):
+                    p.x_routed = 0
+                self.counters["set_reprobe_short"] += 1
+            if q_old != u:
+                Front._flip_stale_check(self, rid, q_old, u, x, "reprobe", "d_probe_" + xp.src)
+        st = self._set_st()
+        tup = st["shorts"].get(rid)
+        if tup is not None:
+            where.append("short")
+            st["shorts"][rid] = (tup[0], u) + tuple(tup[2:])
+        moved = old_u != u
+        if moved:
+            self.counters["set_reprobe_moved"] += 1
+            self.counters["set_reprobe_moved_tokens"] += abs(old_u - u) if old_u >= 0 else 0
+        logger.info("PDFLIP SET-REPROBE rid=%s site=%s u %d -> %d n=%d device=%d host=%d store=%d covered %d -> %d "
+                    "uncached_p=%d image_in_tail=%d age_ms=%.0f probe_ms=%.1f where=%s (S63 F1: D's number at the "
+                    "verdict, not at the arrival)",
+                    rid, site, old_u, u, int(ans.n), int(ans.device_tokens), int(ans.host_tokens),
+                    int(xp.store_tokens), int(old_xp.covered) if old_xp is not None else -1, int(xp.covered),
+                    int(xp.uncached_p), int(xp.image_in_tail), age_ms, float(ans.total_ms),
+                    "+".join(where) or "gone")
+        return moved
+
     def _set_flip_foreseeable(self, now: float) -> bool:
         """True when a decided (or committed) flip stands: the set is not merely collecting. A collecting set may
         end on D (R3) -- a kurz arrival must not yield to a flip that is not decided (R2)."""
@@ -12363,6 +12690,9 @@ class Front:
         if any(p.rid in st["go_p"] for p in live_q):
             return True
         ev = self._set_eval(now, live_q, st)
+        if ev is not None and ev[1].verdict in Front.REPROBE_VERDICTS and (
+                Front._reprobe_pending(self) or Front._reprobe_stale(self, [m.rid for m in ev[0]])):
+            return False  # S63 F1 (R2): a flip still waiting for D's current numbers is not decided
         return ev is None or ev[1].verdict not in (phase_policy.V_COLLECT, phase_policy.V_D_AFTER_TIMER)
 
     def _decode_collect(self, now: float, live_q: Optional[List["Pending"]] = None) -> Optional[str]:
@@ -12401,6 +12731,9 @@ class Front:
                     st["seen"] = 0
                     return None
                 members, sv, kw = ev
+        if sv.verdict in Front.REPROBE_VERDICTS and not Front._set_reprobe_gate(
+                self, [m.rid for m in members], "set-verdict", sv.verdict):
+            return "hold"  # S63 F1: the verdict is made again on D's current numbers once they land
         st["seen"] = len(members)
         _pu = st.get("urgent")
         if _pu is not None and st.get("prio_set") != st["set_id"]:
@@ -12494,6 +12827,9 @@ class Front:
         self._set_log(st, members, sv, verdict=sv.verdict, why="queue-sum " + sv.why, x_tok=x_tok, frac=frac,
                       t_half=t_half, decoding=decoding, seats=seats, waited=0.0, x_cls=x_cls, xk=xk)
         self.counters["set_" + sv.verdict.lower()] += 1
+        if sv.verdict in Front.REPROBE_VERDICTS and not Front._set_reprobe_gate(
+                self, [m.rid for m in members], "queue-sum", sv.verdict):
+            return False  # S63 F1: no flip on an arrival number -- the queue's sum is made again on D's numbers
         if sv.verdict in (phase_policy.V_FLIP_P, phase_policy.V_PARK_NO_SEAT, phase_policy.V_REROUTE_P):
             if sv.verdict == phase_policy.V_REROUTE_P:
                 Front._r6_redirect(self, "queue-sum")  # S56

@@ -323,6 +323,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     # FRONT-SEND-IDS-1007: set in init_pdflip_prompt_ids_digest; False = no
     # D-IDS shadow line.
     pdflip_prompt_ids_digest = False
+    # S63 F2 TOK-AHEAD: set in init_pdflip_tok_ahead; None = every leg tokenizes itself, as before.
+    pdflip_tok_ahead = None
 
     @property
     def serving_chat_class(self):
@@ -362,6 +364,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Init group D's prompt-ids shadow line (pdflip, off by default)
         self.init_pdflip_prompt_ids_digest()
+        self.init_pdflip_tok_ahead()
 
         # Init inter-process communication
         self.init_ipc_channels(port_args)
@@ -551,6 +554,86 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.pdflip_prompt_ids_digest = d_digest_armed(
             group=os.environ.get("FLLIPER_PDFLIP_GROUP", "")
         )
+
+    def init_pdflip_tok_ahead(self):
+        """S63 F2 (pdflip/tok_ahead.py): one tokenization per group and request -- the D probe's / P's ahead
+        tokenization of a media prompt is taken by the leg of the same rid (identity = digest of what decides it)."""
+        if not os.environ.get("FLLIPER_PDFLIP_GROUP"):
+            return  # not a pdflip group: nothing posts a probe or an ahead request here
+        if not envs.FLLIPER_PDFLIP_TOK_AHEAD.get():
+            return
+        from flliper.srt.pdflip.tok_ahead import TokAhead
+
+        self.pdflip_tok_ahead = TokAhead(
+            keep=envs.FLLIPER_PDFLIP_TOK_AHEAD_ENTRIES.get(),
+            ttl_s=envs.FLLIPER_PDFLIP_TOK_AHEAD_TTL_S.get(),
+            max_bytes=max(0, envs.FLLIPER_PDFLIP_TOK_AHEAD_MAX_MIB.get()) << 20,
+        )
+        logger.info(
+            "PDFLIP TOK-AHEAD armed group=%s entries=%d ttl_s=%.0f max_mib=%d (S63 F2: the leg takes the probe's / the "
+            "ahead tokenization of its own media prompt when the digest matches)",
+            os.environ.get("FLLIPER_PDFLIP_GROUP", ""),
+            self.pdflip_tok_ahead.keep,
+            self.pdflip_tok_ahead.ttl_s,
+            self.pdflip_tok_ahead.max_bytes >> 20,
+        )
+
+    async def _pdflip_tok_ahead_take(self, obj):
+        """S63 F2: the leg's tokenized object from this rid's earlier tokenization (D probe / P ahead), or None
+        (no entry, or the identity check failed: named, the leg tokenizes as before)."""
+        from flliper.srt.pdflip import tok_ahead as _tah
+
+        ta = self.pdflip_tok_ahead
+        rid = getattr(obj, "rid", None)
+        if (
+            ta is None
+            or not isinstance(obj, GenerateReqInput)
+            or not isinstance(rid, str)
+            or rid.endswith(_tah.PROBE_SUFFIX)
+            or not ta.has(rid)
+        ):
+            return None
+        if obj.input_ids is None and _pdflip_handoff_ids(obj) is not None:
+            # #1442: P tokenised this prompt for the hand-off -- P's ids are the KV's key, they win (S63r: the probe's
+            # entry is dropped now, not left to the TTL)
+            ta.discard(rid)
+            return None
+        t0 = time.perf_counter()
+        e, why = await ta.take(rid, _tah.obj_digest(obj))
+        if e is None:
+            logger.warning(
+                "PDFLIP TOK-AHEAD-MISMATCH rid=%s why=%s -- the leg tokenizes its prompt itself (S63 F2: only an "
+                "identical request takes an earlier tokenization)",
+                rid,
+                why,
+            )
+            return None
+        if obj.image_data is not None and not isinstance(obj.image_data, list):
+            obj.image_data = [obj.image_data]
+        if obj.video_data is not None and not isinstance(obj.video_data, list):
+            obj.video_data = [obj.video_data]
+        if obj.audio_data is not None and not isinstance(obj.audio_data, list):
+            obj.audio_data = [obj.audio_data]
+        if obj.contains_mm_input():
+            self._validate_mm_limits(obj)
+            self._validate_mm_lane_support(obj)
+        input_ids = list(e.input_ids) if e.input_ids is not None else []
+        self._validate_one_request(obj, input_ids)
+        out = self._create_tokenized_object(
+            obj, obj.text, input_ids, None, e.mm_inputs, e.token_type_ids
+        )
+        logger.info(
+            "PDFLIP TOK-AHEAD-REUSE rid=%s src=%s n=%d images=%d saved_ms=%.0f age_s=%.1f take_ms=%.1f (S63 F2: "
+            "one tokenization per group and request)",
+            rid,
+            e.src,
+            len(input_ids),
+            len(getattr(e.mm_inputs, "mm_items", None) or ()),
+            e.tokenize_ms,
+            time.monotonic() - e.t,
+            (time.perf_counter() - t0) * 1000.0,
+        )
+        return out
 
     def init_ipc_channels(self, port_args: PortArgs):
         context = zmq.asyncio.Context(2)
@@ -999,6 +1082,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         obj: Union[GenerateReqInput, EmbeddingReqInput],
     ):
         """Tokenize one request."""
+        if self.pdflip_tok_ahead is not None:
+            # S63 F2 TOK-AHEAD: this rid's media prompt was tokenized already (D probe / P ahead) -- taken once
+            _reused = await self._pdflip_tok_ahead_take(obj)
+            if _reused is not None:
+                return _reused
         # Tokenize
         input_embeds = None
         input_text = obj.text

@@ -274,6 +274,11 @@ class ProbeAnswer:
     tokenize_ms: float = 0.0
     handle_ms: float = 0.0
     total_ms: float = 0.0
+    #: S63: D's radix namespace of this prompt (``TokenizedGenerateReqInput.extra_key``) -- with D's ids it IS the
+    #: admission key, so a re-probe asks D's tree without a second tokenization. ``extra_key_known`` False: an answer
+    #: of a D build without the field (the re-probe then sends the arrival's own body)
+    extra_key: Optional[str] = None
+    extra_key_known: bool = False
 
     @property
     def n(self) -> int:
@@ -296,9 +301,68 @@ def parse_answer(body: Any) -> Optional[ProbeAnswer]:
                            key_match_depth=int(body.get("key_match_depth", 0) or 0), mm_spans=spans,
                            tokenize_ms=float(body.get("tokenize_ms", 0.0) or 0.0),
                            handle_ms=float(body.get("handle_ms", 0.0) or 0.0),
-                           total_ms=float(body.get("total_ms", 0.0) or 0.0))
+                           total_ms=float(body.get("total_ms", 0.0) or 0.0),
+                           extra_key=(None if body.get("extra_key") is None else str(body.get("extra_key"))),
+                           extra_key_known="extra_key" in body)
     except (TypeError, ValueError, KeyError):
         return None
+
+
+# ------------------------------------------------------------------------------- S63 F1: the re-probe at the verdict
+@dataclasses.dataclass
+class ReprobeEntry:
+    """S63 F1 (user 19.10. "alle zahlen liegen doch schwarz auf weiß vor zu jedem zeitpunkt"): what the front keeps
+    of one arrival's probe so that a set verdict that flips or assigns P can ask D's tree and the store AGAIN, right
+    before it stands, with the SAME key (D's ids + D's namespace) -- no second tokenization on D."""
+    ids: np.ndarray
+    spans: Tuple[Tuple[int, int], ...]
+    extra_key: Optional[str]
+    extra_key_known: bool
+    path: str
+    payload: Any
+    ns_known: bool
+    ns: Optional[str]
+    #: monotonic stamp of the D answer the current number rests on (arrival probe or the last re-probe)
+    t: float
+    price: Optional["ExactPrice"] = None
+    #: monotonic stamp of a re-probe that got no exact number (no new attempt for this rid inside the probe deadline)
+    failed_t: Optional[float] = None
+    #: S63r: monotonic stamp at which the re-probe round that produced the current number LANDED (all its members
+    #: answered, the store read). The verdict that asked for the round is made on it -- it is the newest number that
+    #: exists for this decision; without this stamp a store read or a slower member > _FRESH_MS made the number
+    #: "old" again at the very look it was asked for, and the set re-probed forever (no verdict, a hang)
+    landed: Optional[float] = None
+
+    @property
+    def n(self) -> int:
+        return int(self.ids.size)
+
+
+def reprobe_body(e: ReprobeEntry, rid: str) -> Tuple[str, Dict[str, Any]]:
+    """The probe body of a re-probe: D's own ids (scheduler token space: images expanded, pad values = the radix key)
+    and D's own namespace -- the admission key itself, D tokenizes nothing. Without D's namespace (a D build that does
+    not answer it, or a key only D forms: LoRA) the arrival's body goes again (D tokenizes it as before)."""
+    if e.extra_key_known and e.ns_known:
+        payload: Dict[str, Any] = {"rid": rid, "input_ids_b64": ids_to_b64(e.ids)}
+        if e.extra_key is not None:
+            payload["extra_key"] = e.extra_key
+        return "/generate", payload
+    return e.path, e.payload
+
+
+def reprobe_same_key(e: ReprobeEntry, ans: ProbeAnswer) -> bool:
+    """Identity check of a re-probe answer: D answered for exactly the arrival's ids (same length, same tokens)."""
+    try:
+        return ans.n == e.n and bool(np.array_equal(np.asarray(ans.ids), np.asarray(e.ids)))
+    except Exception:  # noqa: BLE001 -- an answer that cannot be compared is no identity
+        return False
+
+
+def with_spans(ans: ProbeAnswer, spans: Sequence[Sequence[int]]) -> ProbeAnswer:
+    """A re-probe on D's ids carries no mm items, so D names no spans; the ids are the arrival's, so are the spans."""
+    if ans.mm_spans or not spans:
+        return ans
+    return dataclasses.replace(ans, mm_spans=tuple((int(a), int(b)) for a, b in spans))
 
 
 @dataclasses.dataclass(frozen=True)
