@@ -39,7 +39,7 @@ replicated machine may shrink, so every rank enters it alike.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Tuple
+from typing import Callable, Dict, Optional, Tuple
 
 MARKER = "PDFLIP D-MEM-SCHED"
 #: 27B condition 1: rounds a no-event shrink condition must hold in a row
@@ -75,6 +75,12 @@ class MemSched:
     #: and the running rids of the last iteration (their loss = an end event)
     _epoch: object = None
     _rids: Optional[frozenset] = None
+    #: S77-A: called when a live floor blocks a decided shrink --
+    #: ``compactor(want, end, floor_tokens) -> new floor tokens or None``. It moves
+    #: the tree's idle pages above the wanted boundary down (KV-COMPACT, a group
+    #: verdict inside); the shrink then goes as far as the new floor allows.
+    #: Called on the replicated path only (``blocked`` comes from the group floor).
+    compactor: Optional[Callable[[int, bool, int], Optional[int]]] = None
 
     def __post_init__(self):
         toks = tuple(int(t) for t in self.stage_tokens)
@@ -142,7 +148,7 @@ class MemSched:
         if self.pending is not None:
             # a decided shrink waits for its floor only -- the need still fits
             return self._shrink_to(max(self.pending, target), floor_tokens, end=False,
-                                   why="pending shrink")
+                                   why="pending shrink", event=bool(ended))
         if ended:
             hold = need + int(unbacked_tokens)
             j = self._smallest_holding(hold)
@@ -166,15 +172,29 @@ class MemSched:
         return self._shrink_to(gap, floor_tokens, end=False,
                                why="below for %d rounds" % self.hysteresis_rounds)
 
-    def _shrink_to(self, want: int, floor_tokens, *, end: bool, why: str) -> StageStep:
+    def _shrink_to(self, want: int, floor_tokens, *, end: bool, why: str,
+                   event: bool = False) -> StageStep:
         """Shrink toward ``want``, never below the live floor; the blocked
-        rest stays pending (``stage_down_waited_backup`` once per decision)."""
+        rest stays pending (``stage_down_waited_backup`` once per decision).
+        ``event``: an end event reached a PENDING shrink (``end`` stays False
+        there -- the counters name the decision, not the event); the compactor
+        is told either one (S77-A: a refused compaction is looked at again at
+        the next end event, also while the shrink is pending)."""
         want, before = int(want), self.stage
         if callable(floor_tokens):
             floor_tokens = floor_tokens()
         f = self._smallest_holding(int(floor_tokens))
         j = before if f is None else min(before, max(want, f))
         blocked = j > want
+        if blocked and self.compactor is not None:
+            # S77-A: the pages that hold the floor are moved down first (KV-COMPACT)
+            lower = self.compactor(want, bool(end or event), int(floor_tokens))
+            if lower is not None and int(lower) < int(floor_tokens):
+                self.counters["stage_down_compacted"] = self.counters.get("stage_down_compacted", 0) + 1
+                floor_tokens = int(lower)
+                f = self._smallest_holding(int(floor_tokens))
+                j = before if f is None else min(before, max(want, f))
+                blocked = j > want
         if blocked and self.pending is None:
             self.counters["stage_down_waited_backup"] += 1
         if j < before:

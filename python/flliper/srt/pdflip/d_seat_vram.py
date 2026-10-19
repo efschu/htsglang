@@ -62,6 +62,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -1087,6 +1088,9 @@ _KV_BORN: List[Tuple[int, KvTensorGeom]] = []
 #: tokens, granule) -- a key that also names what the plan was computed from:
 #: the saver mapped one extent per range, the controller checks them at its build
 _KV_BORN_SPANS: Dict[tuple, Tuple[Tuple[int, int], ...]] = {}
+#: S77-A: the born tensors themselves, keyed by data_ptr (``KvPageCopier`` moves
+#: pages in exactly the tensors whose pages the stage form unmaps)
+_KV_BORN_T: Dict[int, object] = {}
 
 
 def kv_stage_born(t, *, pool_size: int, page_size: int, name: str = "kv",
@@ -1135,6 +1139,7 @@ def kv_stage_born(t, *, pool_size: int, page_size: int, name: str = "kv",
         raise PdFlipDSeatVramRefused("%s: trimming the KV tensor %s to stage S0 failed "
                                    "(tms_set_spans rc=%d)" % (LINE_MARK, name, rc))
     _KV_BORN.append((int(t.data_ptr()), geom))
+    _KV_BORN_T[int(t.data_ptr())] = t
     _KV_BORN_SPANS[(int(t.data_ptr()), geom, tuple(form.tokens), g)] = tuple(born)
     return t
 
@@ -1222,6 +1227,97 @@ def max_live_page(allocator) -> int:
         live[held.to("cpu", torch.int64)] = False
     idx = torch.nonzero(live).flatten()
     return int(idx.max()) if idx.numel() else 0
+
+
+class KvCopyRefused(RuntimeError):
+    """S77-A: a KV page move this rank cannot carry out completely (named)."""
+
+
+def page_slot_block(geom: "KvTensorGeom", page_size: int) -> Tuple[int, int]:
+    """S77-A: (slots per page, slot of page 0's first token) -> page ``p`` lives in
+    slots ``[p * per, (p + 1) * per)`` of every layer of a born KV tensor.
+
+    * a paged K/V buffer (``token_ratio`` 1): one slot per token;
+    * QSA compressed keys (``token_ratio`` = ratio): ``page // ratio`` slots;
+    * a token-cut FA owner share (#239 S3g, ``owner_block`` (S, ratio)): global slot
+      L at row (L // S) * ratio + (L % S - lo) -- a page of P global tokens is the
+      contiguous block of (P // S) * ratio rows from (p * P // S) * ratio, whatever
+      ``lo`` is; the owner class of a token (L % S) is its offset in the page, so a
+      page moved whole keeps every token on the rank that owns it.
+    The page must be a multiple of the ratio / of S, else the move is refused."""
+    P = int(page_size)
+    S, ratio = (int(x) for x in geom.owner_block)
+    if S > 0 and ratio > 0:
+        if P % S:
+            raise KvCopyRefused("page %d not a multiple of the owner block %d (%s)"
+                                % (P, S, geom.geom.name))
+        return (P // S) * ratio, 0
+    tps = max(1, int(geom.token_ratio))
+    if P % tps:
+        raise KvCopyRefused("page %d not a multiple of %d tokens per slot (%s)"
+                            % (P, tps, geom.geom.name))
+    return P // tps, 0
+
+
+class KvPageCopier:
+    """S77-A: moves whole KV pages (device copy) in EVERY tensor the stage form
+    trims on this rank (``_KV_BORN``: the FA K/V or their owner share, the QSA
+    compressed keys, the draft K/V) -- exactly the tensors whose pages a stage
+    shrink unmaps, viewed as bytes ``[layers, slots, slot_bytes]`` with the
+    geometry they were born with."""
+
+    def __init__(self, born: Sequence[Tuple[int, "KvTensorGeom"]], tensors: Dict[int, object],
+                 page_size: int):
+        self.page_size = int(page_size)
+        self.items = []
+        for ptr, geom in born:
+            t = tensors.get(int(ptr))
+            if t is None:
+                raise KvCopyRefused("born KV tensor %s has no tensor reference" % geom.geom.name)
+            g = geom.geom
+            if int(t.numel()) * int(t.element_size()) != int(g.layers) * int(g.slots) * int(g.slot_bytes):
+                raise KvCopyRefused("born KV tensor %s is not [layers, slots, slot_bytes] (%d B vs "
+                                    "%d x %d x %d)" % (g.name, t.numel() * t.element_size(),
+                                                       g.layers, g.slots, g.slot_bytes))
+            if not t.is_contiguous():
+                raise KvCopyRefused("born KV tensor %s is not contiguous" % g.name)
+            per, base = page_slot_block(geom, self.page_size)
+            self.items.append((t, geom, per, base))
+
+    @classmethod
+    def from_born(cls, page_size: int) -> "KvPageCopier":
+        return cls(list(_KV_BORN), _KV_BORN_T, page_size)
+
+    def ptrs(self) -> set:
+        return {int(t.data_ptr()) for t, _g, _p, _b in self.items}
+
+    def copy(self, src_pages: Sequence[int], dst_pages: Sequence[int]) -> int:
+        """Copy every page ``src_pages[i]`` onto ``dst_pages[i]`` in every tensor
+        (gather then scatter; the two sets are disjoint). Returns bytes copied.
+        Ordered on the current stream; the caller synchronizes before it re-points
+        the tree and frees the sources."""
+        import torch
+
+        if len(src_pages) != len(dst_pages):
+            raise KvCopyRefused("%d sources for %d destinations" % (len(src_pages), len(dst_pages)))
+        if not src_pages:
+            return 0
+        nbytes = 0
+        for t, geom, per, base in self.items:
+            g = geom.geom
+            u8 = t.view(-1).view(torch.uint8).view(int(g.layers), int(g.slots), int(g.slot_bytes))
+            off = torch.arange(per, dtype=torch.int64)
+            src = (torch.tensor([int(p) for p in src_pages], dtype=torch.int64)[:, None] * per
+                   + base + off[None, :]).reshape(-1)
+            dst = (torch.tensor([int(p) for p in dst_pages], dtype=torch.int64)[:, None] * per
+                   + base + off[None, :]).reshape(-1)
+            hi = int(max(int(src.max()), int(dst.max())))
+            if hi >= int(g.slots):
+                raise KvCopyRefused("page slot %d beyond %s's %d slots" % (hi, g.name, g.slots))
+            src, dst = src.to(t.device), dst.to(t.device)
+            u8[:, dst] = u8[:, src]
+            nbytes += int(src.numel()) * int(g.layers) * int(g.slot_bytes)
+        return nbytes
 
 
 # ---------------------------------------------------------------------------
@@ -3139,6 +3235,184 @@ def cap_lift_after_seat_move(sched) -> None:
     return None
 
 
+#: S77-A: the D-MEM-SCHED KV compaction (``pdflip/d_kv_compact.py``)
+KV_COMPACT_MARK = "PDFLIP D-MEM-SCHED KV-COMPACT"
+_KV_COMPACT_N = [0]
+
+
+def _pool_kv_tensors(pool, seen: set, out: list, name: str = "kv") -> None:
+    """Every token-indexed device buffer a KV pool (and its sub-pools) holds:
+    the K/V lists, an MLA latent list, the QSA compressed keys, a DSA index list."""
+    if pool is None or id(pool) in seen:
+        return
+    seen.add(id(pool))
+    for attr in ("k_buffer", "v_buffer", "kv_buffer", "index_k_with_scale_buffer"):
+        lst = getattr(pool, attr, None)
+        if isinstance(lst, (list, tuple)):
+            for i, t in enumerate(lst):
+                if t is not None and hasattr(t, "data_ptr"):
+                    out.append(("%s.%s[%d]" % (name, attr, i), t))
+    flat = getattr(pool, "qsa_compressed_flat", None)
+    if flat is not None and hasattr(flat, "data_ptr"):
+        out.append(("%s.qsa_compressed_flat" % name, flat))
+    for sub in ("full_kv_pool", "swa_kv_pool", "main_pool", "index_pool"):
+        _pool_kv_tensors(getattr(pool, sub, None), seen, out, "%s.%s" % (name, sub))
+
+
+def _kv_pools_of(sched) -> list:
+    """(name, pool) of the target's KV cache and the draft's (MTP/EAGLE share the ids)."""
+    out = []
+    alloc = _kv_allocator(sched)
+    kv = None
+    if alloc is not None:
+        get = getattr(alloc, "get_kvcache", None)
+        kv = get() if callable(get) else getattr(alloc, "_kvcache", None)
+    runner = getattr(getattr(sched, "tp_worker", None), "model_runner", None)
+    kv = kv if kv is not None else getattr(runner, "token_to_kv_pool", None)
+    out.append(("target", kv))
+    dw = getattr(sched, "draft_worker", None)
+    if dw is not None:
+        dr = getattr(dw, "model_runner", None) or getattr(getattr(dw, "draft_worker", None),
+                                                          "model_runner", None)
+        if dr is not None and dr is not runner:
+            out.append(("draft", getattr(dr, "token_to_kv_pool", None)))
+    return out
+
+
+def kv_compact_unregistered(sched, born_ptrs: set) -> Optional[str]:
+    """S77-A: None when every token-indexed KV buffer of this rank's pools is one the
+    stage form registered (``KvPageCopier`` moves pages in exactly those); else the
+    first one that is not -- a page moved without it would leave its bytes behind."""
+    seen, found = set(), []
+    for name, pool in _kv_pools_of(sched):
+        _pool_kv_tensors(pool, seen, found, name)
+    for name, t in found:
+        try:
+            if int(t.numel()) == 0:
+                continue
+        except Exception:  # noqa: BLE001
+            continue
+        if int(t.data_ptr()) not in born_ptrs:
+            return name
+    return None
+
+
+def _kv_compact_tree_ok(sched) -> bool:
+    """S77-A: this D runs the unified tree KV-COMPACT moves pages in (config)."""
+    from flliper.srt.pdflip import d_kv_compact as KC
+
+    return KC.tree_why(getattr(sched, "tree_cache", None)) is None
+
+
+def _kv_compact_rank_plans(sched, boundaries: Sequence[int]):
+    """Rank-local: (plans, why) -- one plan (or None) per candidate boundary page."""
+    from flliper.srt.pdflip import d_kv_compact as KC
+
+    page = _page_size(sched)
+    alloc = _kv_allocator(sched)
+    if alloc is None:
+        return [None] * len(boundaries), "no allocator", None
+    try:
+        copier = KvPageCopier.from_born(page)
+    except KvCopyRefused as exc:
+        return [None] * len(boundaries), "copier: %s" % exc, None
+    missing = kv_compact_unregistered(sched, copier.ptrs())
+    if missing is not None:
+        return [None] * len(boundaries), "KV buffer %s is not a stage tensor" % missing, None
+    sv = KC.survey(getattr(sched, "tree_cache", None), alloc, page, min(int(b) for b in boundaries))
+    plans, why = [], ""
+    for b in boundaries:
+        pl, w = KC.plan_for(sv, int(b))
+        plans.append(pl)
+        if pl is None and not why:
+            why = w
+    return plans, why, copier
+
+
+def _kv_compact_for_shrink(sched, ms, fr, want: int, end: bool, floor_tokens: int) -> Optional[int]:
+    """S77-A: the floor blocks the shrink to ``want``: move the tree's idle pages
+    above the boundary down (``d_kv_compact``), then return the GROUP floor read
+    afresh -- or None when no rank moved.
+
+    REPLICATED entry: MemSched calls this only on a shrink the GROUP floor blocks.
+    Every input of the decision is replicated (want, end, the floor, the stage); a
+    refused (or fruitless) attempt is not repeated for the same (want, stage)
+    before the next end event -- also while the shrink is pending (MemSched passes
+    the event through). Two collectives: the MIN over "my plan clears stage jj" for
+    every jj between ``want`` and the floor's stage (the lowest every rank
+    reaches wins), and the floor re-read after the moves."""
+    tokens = ms.stage_tokens
+    # a refusal is looked at again on the next END event (a request's pages became
+    # the tree's), not on every re-read of a pending floor (one survey per decision)
+    key = (int(want), int(ms.stage))
+    if not end and fr.get("compact_refused") == key:
+        fr["compact_skipped"] = int(fr.get("compact_skipped", 0)) + 1
+        return None
+    f = ms._smallest_holding(int(floor_tokens))
+    top = int(ms.stage) if f is None else min(int(ms.stage), int(f))
+    cands = list(range(int(want), top))
+    if not cands:
+        return None
+    page = _page_size(sched)
+    t0 = time.perf_counter()
+    try:
+        plans, why, copier = _kv_compact_rank_plans(sched, [int(tokens[jj]) // page for jj in cands])
+    except Exception as exc:  # noqa: BLE001 -- a survey failure is this rank's "no"
+        plans, why, copier = [None] * len(cands), "%s: %s" % (type(exc).__name__, exc), None
+    # the product rule (30.09.): move, evict only as the fallback -- the lowest stage
+    # every rank clears by MOVES alone first; only when none does, the lowest one a
+    # rank clears by also evicting backed nodes (their host copy stays)
+    moves = [1 if (p is not None and not p.evicts) else 0 for p in plans]
+    anys = [1 if p is not None else 0 for p in plans]
+    flags = moves + anys
+    gmin = getattr(sched, "_pdflip_group_min_ints", None)
+    group = list(flags) if gmin is None else [int(x) for x in gmin(list(flags))]
+    k = len(cands)
+    if len(group) != 2 * k:
+        group = [0] * (2 * k)  # an answer of another shape agrees to nothing
+    # the group MIN can only be <= this rank's own flag: a "yes" over a plan this
+    # rank does not have would be a broken collective -- never acted on
+    pick = next((i for i in range(k) if group[i] == 1 and moves[i]), None)
+    if pick is None:
+        pick = next((i for i in range(k) if group[k + i] == 1 and anys[i]), None)
+    flags = anys
+    _KV_COMPACT_N[0] += 1
+    n = _KV_COMPACT_N[0]
+    if pick is None:
+        fr["compact_refused"] = key
+        if n <= 16 or (n & (n - 1)) == 0:
+            logger.info("%s n=%d verdict=refused want=S%d stage=S%d floor=%d end=%s local=%s -- %s",
+                        KV_COMPACT_MARK, n, int(want), int(ms.stage), int(floor_tokens),
+                        "yes" if end else "no", "".join(str(x) for x in flags),
+                        why or "a peer rank cannot clear the boundary")
+        return None
+    jj, plan = cands[pick], plans[pick]
+    res = None
+    try:
+        from flliper.srt.pdflip import d_kv_compact as KC
+
+        res = KC.execute(getattr(sched, "tree_cache", None), _kv_allocator(sched), plan, copier)
+    except Exception as exc:  # noqa: BLE001 -- named; the group floor below says what holds
+        logger.warning("%s n=%d verdict=failed target=S%d: %s: %s", KV_COMPACT_MARK, n, jj,
+                       type(exc).__name__, exc)
+    new_floor = int(_group_floor_tokens(sched))
+    fr["floor"] = None
+    if new_floor >= int(floor_tokens):
+        fr["compact_refused"] = key   # nothing came down: wait for the next end event
+    else:
+        fr.pop("compact_refused", None)
+    logger.info(
+        "%s n=%d verdict=%s want=S%d target=S%d boundary=%d floor %d->%d moved_nodes=%d moved_pages=%d "
+        "evicted_nodes=%d evicted_tokens=%d bytes=%d ms=%.1f (the tree's idle pages above the boundary "
+        "moved down by device copy, node values re-pointed; evicted = backed nodes with no free page "
+        "below, their host copy stays)", KV_COMPACT_MARK, n, "moved" if res is not None else "failed",
+        int(want), jj, int(tokens[jj]), int(floor_tokens), new_floor,
+        0 if res is None else res.moved_nodes, 0 if res is None else res.moved_pages,
+        0 if res is None else res.evicted_nodes, 0 if res is None else res.evicted_tokens,
+        0 if res is None else res.bytes, (time.perf_counter() - t0) * 1000.0)
+    return new_floor
+
+
 def _grow_room_refused(sched, ctl, n: int, stage: int) -> Optional[str]:
     """S77-B: the GROUP verdict on a KV grow, before any rank moves (MIN over the
     ranks, one collective). Entered on every rank alike: the grow itself is
@@ -3217,6 +3491,12 @@ def runtime_tick(sched):
         return floor_box[0]
 
     before, pending_before = ms.stage, ms.pending
+    # S77-A: a floor that blocks a decided shrink is moved down first (KV-COMPACT) --
+    # on the tree that holds the pages (a server-config property: the same on every
+    # D rank, so every rank installs it alike and enters its collectives alike)
+    ms.compactor = (
+        (lambda want, end, cur: _kv_compact_for_shrink(sched, ms, fr, want, end, cur))
+        if _kv_compact_tree_ok(sched) else None)
     # the floor is asked for only on a path that shrinks (MemSched calls it)
     step = ms.step(used, incoming + reserve, ended=ended, floor_tokens=_floor)
     floor = floor_box[0]
