@@ -3929,6 +3929,9 @@ class Pending:
     #: EZ-S1: D's exact realised extent of a MEASURE_ON_D request (its refusal's report) and where it came from
     measured_u: Optional[int] = None
     measure_src: str = ""
+    #: EZ-S1 review B1: the class D's report gave this request (kurz | halb | gross) -- it is EXECUTED by that class, never
+    #: by state (a requeued entry is P-only by state only for what D could not take; a measured one is what it measured)
+    measure_class: str = ""
 
 
 #: H102 (#23p, dkrnfbar1agent0925): A CLIENT THAT HANGS UP BEFORE ITS ANSWER
@@ -5253,6 +5256,19 @@ class Front:
         # EZ-S1 MEASURE_ON_D stage 1: a request with no exact number goes to D with the MEASURING barrier (front_x + one
         # page == halbX - 1; ``halfx`` header = the real halbX) -- D admits u < halbX, refuses the rest with its extent
         _meas = (self.__dict__.get("_measure_on_d") or {}).pop(str(rid), None)
+        _fc = (self.__dict__.get("_measure_failclosed") or {}).pop(str(rid), None)
+        if _meas is None and _fc is not None and not _after_p and envs.FLLIPER_PDFLIP_EXACT_CLASS.get():
+            # review B4: the barrier could not be formed -- the narrowest one goes (front_x=1 + a page: D refuses all but a
+            # page and reports its extent); NEVER the decision X for a request that has no exact number
+            hdr = _front_x.request_headers(1, 0, 1, action="MEASURE_ON_D")
+            if hdr:
+                self.counters["front_x_carried"] += 1
+                self.counters["measure_on_d_headers_failclosed"] += 1
+                logger.warning("PDFLIP FRONT-X rid=%s front_x=1 front_priced=0 action=MEASURE_ON_D FAIL-CLOSED (the barrier "
+                               "could not be formed, MEASURE-BARRIER-FAILED above)", rid)
+                _ms = self.__dict__.setdefault("_measure_sent", collections.OrderedDict())
+                _ms[str(rid)] = (int(_fc[0]), int(_fc[1]), 1)
+            return hdr
         if _meas is not None and not _after_p and envs.FLLIPER_PDFLIP_EXACT_CLASS.get():
             hx, fx, _xm, _mseq, _mup = _meas
             hdr = _front_x.request_headers(fx, 0, hx, action="MEASURE_ON_D")
@@ -5265,7 +5281,7 @@ class Front:
                             int(getattr(self, "tp_prefill_max_tokens", 0) or 0), int(hx), int(hx) - 1)
                 Front._dec(self).done(_mseq, rid, "front", "ok", detail="measure barrier front_x=%d halfX=%d" % (fx, hx))
                 _ms = self.__dict__.setdefault("_measure_sent", collections.OrderedDict())
-                _ms[str(rid)] = (int(_mseq), int(_mup))   # read by _measure_return when D's refusal comes back
+                _ms[str(rid)] = (int(_mseq), int(_mup), int(hx))   # read by _measure_return (B3: the barrier's OWN halbX)
                 while len(_ms) > Front.X_DECISIONS_KEPT:
                     _ms.popitem(last=False)
             return hdr
@@ -6931,7 +6947,7 @@ class Front:
                 return None
             attempt += 1
 
-    def _x_unpriced(self, rid: str, c: Any, est_prompt: int, uncached_p: int, media: bool):
+    def _x_unpriced(self, rid: str, c: Any, est_prompt: int, uncached_p: int, media: bool, fallback: bool = False):
         """S56r A1 + EZ-S1 (plan A1): the arrival WITHOUT an exact D number (D's probe gave up). Nothing is classified on an
         estimate -- not the front's count, not the ledger, not chars/3.
 
@@ -6963,9 +6979,10 @@ class Front:
                 n_from_d_ids=text_ids, x_tokens=_x, half_x=_hx, now=time.monotonic())
             depth_hint = _depth
             self.counters["exact_class_" + basis.kind] += 1
-        logger.warning("PDFLIP D-PROBE-UNPRICED rid=%s n=%d n_src=%s p_uncached=%s -- no exact D number by the "
+        logger.warning("PDFLIP %s rid=%s n=%d n_src=%s p_uncached=%s -- no exact D number by the "
                        "deadline: the request is NOT classified on an estimate; route = D's admission (it measures: "
                        "X-GATE W31 / W123 requeue with D's own extent) or, P awake, P's batch (S56r A1)%s",
+                       "X-EXACT-FALLBACK-MEASURE" if fallback else "D-PROBE-UNPRICED",
                        rid, n, n_src, up if up >= 0 else "unknown",
                        "" if basis is None else " class_basis=%s (%s)" % (basis.kind, basis.why))
         pending = int(basis.u) if (basis is not None and basis.kind == _dn.KIND_P_UPPER) else 0
@@ -10782,6 +10799,11 @@ class Front:
                 if _ef is not None and not _ef.gate.done():
                     _ef.gate.set_result(False)  # EARLY-FLIP: no verdict, nothing sleeps
                 return template_refusal_response(request.path, str(_tpl))
+            if _xx is None and envs.FLLIPER_PDFLIP_EXACT_CLASS.get():
+                # EZ-S1 review B2 (user 19.10. "nichts schaetzen"): no exact price (tokenizer not ready, an unseen image,
+                # timeout) is NO NUMBER -- MEASURE like ``_x_unpriced``, never a class on the chars/3 estimate
+                self.counters["x_exact_fallback_measure"] += 1
+                _xx = Front._x_unpriced(self, rid, None, est_prompt, -1, bool(_img or _vid or _emb), fallback=True)
             if _xx is not None:
                 remainder, est_prompt, known = _xx.pending, _xx.n, _xx.known
                 store_span, presence_src = _xx.credit, _xx.src
@@ -12470,7 +12492,16 @@ class Front:
         """The queued entries that need P (LONG, P-only, requeued, carrier) and are not yet committed to a flip."""
         x_tok = int(self.tp_prefill_max_tokens)
         return [q for q in live_q if q.rid not in st["go_p"]
-                and phase_policy.immediate_park_trigger([q], x_tok) is not None]
+                and (phase_policy.immediate_park_trigger([q], x_tok) is not None or Front._measured_halb_member(q))]
+
+    @staticmethod
+    def _measured_halb_member(q: Any) -> bool:
+        """EZ-S1 review B1 (R3): a MEASURE returnee D measured in the halb band that waits in the queue for the set's
+        verdict -- a member although it does not "need P" (it is not over X, not p_only)."""
+        g = lambda k, d=None: getattr(q, k, d)  # noqa: E731 -- partial test doubles
+        return (g("measure_class", "") == _dn.CLASS_HALB and not g("d_eligible", False) and not g("p_only", False)
+                and not g("leg1_done", False) and not g("skip_leg1", False) and not g("reroutes", 0)
+                and not g("handoff_lost_reroutes", 0))
 
     def _set_members(self, now: float, cands: List["Pending"], st: dict) -> List[phase_policy.SetMember]:
         """The set: the waiting halb SHORTs plus the queue entries that need P. Each carries its OWN X (R2a, in
@@ -12484,7 +12515,11 @@ class Front:
             xq = Front._set_x_of_entry(self, q)
             xs[q.rid] = xq
             depth[q.rid] = Front._set_depth_of(self, q.rid, q)
-            raw.append((q.rid, u, float(_lctl.clock_t(q, now)), bool(getattr(q, "p_only", False)) or u < xq, q))
+            # EZ-S1 review B1: an entry D MEASURED (``measure_src`` d_extent) is what it measured -- under its X it is a halb
+            # member with p_only False (R3), never P-only by the state "requeued"; only W123 (p_only) or u >= X make it big
+            _meas = str(getattr(q, "measure_src", "") or "") == _dn.SRC_D_EXTENT
+            raw.append((q.rid, u, float(_lctl.clock_t(q, now)),
+                        bool(getattr(q, "p_only", False)) or (u < xq and not _meas), q))
         for rid, tup in st["shorts"].items():
             t, u = tup[0], tup[1]
             xs[rid] = int(tup[2]) if len(tup) > 2 and tup[2] else int(self.tp_prefill_max_tokens)
@@ -12564,6 +12599,27 @@ class Front:
         Front._dec(self).tick()
         Front._kv_refresh_tick(self, time.time())
 
+    def _x_min_over_depths(self, n: int) -> int:
+        """EZ-S1 review B3: the smallest X over the cached depths ``[0, n]`` a request of ``n`` tokens can still have at D
+        (exact: the curves are evaluated at 0, ``n`` and every measured row depth of either curve inside; without curves
+        X does not depend on the depth: the X in force). The MEASURING barrier is formed on THIS, so D never admits as
+        kurz what the class at its real depth would call halb."""
+        cap = int(self.tp_prefill_max_tokens)
+        setup = getattr(self, "_x_setup", None)
+        curves = getattr(setup, "curves", None) if setup is not None else None
+        if curves is None:
+            return cap
+        n = max(0, int(n))
+        depths = {0, n}
+        try:
+            for crv in (curves.p_curve, curves.d_curve):
+                for row in crv.rows:
+                    if 0 < int(row.depth) < n:
+                        depths.add(int(row.depth))
+        except Exception:  # noqa: BLE001 -- unreadable rows: the end points stand
+            pass
+        return max(1, min(Front._x_at_depth(self, d) for d in depths))
+
     def _measure_register(self, rid: str, x_set: int, seq: int = 0, u_p: int = -1) -> Tuple[int, int]:
         """MEASURE_ON_D, stage 1 (plan R.1): the barrier the front hands D with this request's leg 2 --
         ``(halbX, front_x header)`` with ``front_x + one page == halbX - 1`` (D admits u < halbX, refuses the rest with
@@ -12579,12 +12635,56 @@ class Front:
             d.popitem(last=False)
         return hx, fx
 
+    def _measure_arm(self, rid: str, x_set: int, n_prompt: int, u_p: int = -1, seq: int = 0) -> bool:
+        """EZ-S1 review B4: the barrier is registered OUTSIDE every instrument ``except`` (a record that fails must not
+        take the barrier with it). X = the smaller of the arrival's X and the smallest X over the depths ``[0, n]``
+        (B3). A failure is LOUD (counter + WARNING) and FAILS CLOSED: ``_front_x_headers`` then hands D the narrowest
+        barrier (front_x 1) -- D refuses nearly everything with its exact extent, never admits on the decision X."""
+        try:
+            x = int(x_set) if x_set else int(getattr(self, "tp_prefill_max_tokens", 0) or 0)
+            if n_prompt:
+                x = min(x, Front._x_min_over_depths(self, int(n_prompt)))
+            Front._measure_register(self, rid, x, int(seq), int(u_p))
+            return True
+        except Exception as e:  # noqa: BLE001 -- loud, and closed
+            self.counters["measure_barrier_failed"] += 1
+            fc = self.__dict__.setdefault("_measure_failclosed", collections.OrderedDict())
+            fc[str(rid)] = (int(seq), int(u_p))
+            while len(fc) > Front.X_DECISIONS_KEPT:
+                fc.popitem(last=False)
+            logger.warning("PDFLIP MEASURE-BARRIER-FAILED rid=%s %s: %s -- no barrier could be formed; the leg carries the "
+                           "NARROWEST one (front_x=1: D refuses nearly everything with its exact extent), never the "
+                           "decision X (EZ-S1 review B4)", rid, type(e).__name__, str(e)[:160])
+            return False
+
+    def _measure_set_seq(self, rid: str, seq: int) -> None:
+        """The record of an armed barrier knows its seq now (the DONE line of the leg names it)."""
+        d = self.__dict__.get("_measure_on_d") or {}
+        cur = d.get(str(rid))
+        if cur is not None:
+            d[str(rid)] = (cur[0], cur[1], cur[2], int(seq), cur[4])
+            return
+        fc = self.__dict__.get("_measure_failclosed") or {}
+        if str(rid) in fc:
+            fc[str(rid)] = (int(seq), fc[str(rid)][1])
+
     def _dec_arrival(self, rid: str, xx: Any, *, remainder: int, x_set: int, route: str, p_only: bool,
                      t_arrive_m: float, n_prompt: int) -> None:
         """The arrival's record, from the numbers it was routed on (plan S1). An arrival WITHOUT an exact number is
         ``kind=measure MEASURE_ON_D rule=NS:MEASURE`` (members ``u=-1``: no number) and the barrier is registered;
         every other arrival is ``kind=arrival CLASSIFY`` with the class, the number, its source and its age. The old
-        decisions that follow (route, seat) are shadowed ``ALT:*``."""
+        decisions that follow (route, seat) are shadowed ``ALT:*``.
+
+        Review B4/B5: the BARRIER is armed first, outside the instrument's ``except`` -- for a MEASURE request AND for a
+        kurz-on-``u_p`` request (``KIND_P_UPPER``: D reads the same store plus its radix, ``u_d <= u_p`` is an assumption
+        the code itself checks, so D reports when ``u_d >= halbX`` instead of prefilling a half request silently)."""
+        measure = xx is not None and bool(getattr(xx, "measure", False))
+        p_upper = False
+        if xx is not None and not measure and envs.FLLIPER_PDFLIP_EXACT_CLASS.get():
+            _cb0 = getattr(xx, "class_basis", None)
+            p_upper = _cb0 is not None and _cb0.kind == _dn.KIND_P_UPPER
+        if measure or p_upper:
+            Front._measure_arm(self, rid, x_set, n_prompt, int(getattr(xx, "uncached_p", -1)))
         try:
             now = time.monotonic()
             frac = Front._set_cfg()[0]
@@ -12594,12 +12694,14 @@ class Front:
             grp = Front._dec_group(self)
             Front._dec(self).alt("serviceable_route", kind="arrival", action="route_" + str(route), rid=rid, edge=False,
                                  why="uncached=%d X=%d (#11: the route verdict)" % (int(remainder), int(x)))
-            if xx is not None and bool(getattr(xx, "measure", False)):
+            if measure:
                 cb = getattr(xx, "class_basis", None)
                 Front._measure_start(self, rid, x, "%s; route=%s" % (cb.why if cb is not None else "no exact number", route),
-                                     u_p=int(getattr(xx, "uncached_p", -1)), t_dec=t_dec, grp=grp)
+                                     u_p=int(getattr(xx, "uncached_p", -1)), t_dec=t_dec, grp=grp, n_prompt=n_prompt)
                 return
             if xx is None:
+                # B2: the fallback without an exact price is MEASURE too (``handle_generate`` makes ``_x_unpriced`` of it);
+                # a ``None`` here is a partial caller (a test, a path that never priced) and keeps the old plain record
                 src, age, why = "n_est", 0, "no exact price (x_exact_fallback): the class stands on the chars/3 estimate"
             else:
                 src = str(getattr(xx, "u_src", None) or ("p_store" if getattr(xx, "unpriced", False) else
@@ -12612,21 +12714,28 @@ class Front:
             klass = phase_policy.classify_arrival(int(remainder), x, frac, bool(p_only))
             rule = {phase_policy.CLASS_KURZ: "R2", phase_policy.CLASS_HALB: "R3", phase_policy.CLASS_GROSS: "R4",
                     phase_policy.CLASS_P_ONLY: "R9"}[klass]
-            Front._dec(self).record(_dr.Decision(
+            seq = Front._dec(self).record(_dr.Decision(
                 kind="arrival", action="CLASSIFY", rule=rule, rid=rid,
                 members=(_dr.Member(rid, int(remainder), int(remainder), src, age),), s_tokens=int(remainder),
                 s_p_tokens=int(remainder), x=x, half_x=hx, classes=(klass,), numbers_age_ms_max=age,
                 why="route=%s n=%d %s" % (route, int(n_prompt), why), t_arrive_to_decide_ms=t_dec, **grp))
-        except Exception:  # noqa: BLE001 -- an instrument never breaks an arrival
+            if p_upper:
+                Front._measure_set_seq(self, rid, seq)
+        except Exception:  # noqa: BLE001 -- an instrument never breaks an arrival (the barrier is armed above)
             pass
 
     def _measure_start(self, rid: str, x: int, why: str, *, u_p: int = -1, t_dec: int = 0,
-                       grp: Optional[dict] = None) -> int:
-        """Write ``DECISION kind=measure action=MEASURE_ON_D rule=NS:MEASURE`` (members ``u=-1``: no number) and register
-        the barrier :meth:`_front_x_headers` hands D with the leg. Returns the seq."""
+                       grp: Optional[dict] = None, n_prompt: int = 0) -> int:
+        """Write ``DECISION kind=measure action=MEASURE_ON_D rule=NS:MEASURE`` (members ``u=-1``: no number) and make sure
+        the barrier :meth:`_front_x_headers` hands D with the leg is registered (``_dec_arrival`` armed it already; the
+        re-probe site arms it here, B4: outside any instrument except). Returns the seq."""
         now = time.monotonic()
         frac = Front._set_cfg()[0]
-        hx = phase_policy.half_x_of(int(x), frac)
+        armed = (self.__dict__.get("_measure_on_d") or {}).get(str(rid))
+        if armed is None and str(rid) not in (self.__dict__.get("_measure_failclosed") or {}):
+            Front._measure_arm(self, rid, int(x), int(n_prompt), int(u_p))
+            armed = (self.__dict__.get("_measure_on_d") or {}).get(str(rid))
+        hx = int(armed[0]) if armed is not None else phase_policy.half_x_of(int(x), frac)
         Front._num_note(self, rid, "none", now)
         self.counters["measure_on_d"] += 1
         seq = Front._dec(self).record(_dr.Decision(
@@ -12635,23 +12744,27 @@ class Front:
             why="%s; barrier=halfX-1=%d (D admits u<halfX, refuses the rest with its exact extent)"
                 % (why, _dn.measure_limit(hx)),
             t_arrive_to_decide_ms=int(t_dec), **(Front._dec_group(self) if grp is None else grp)))
-        Front._measure_register(self, rid, int(x), seq, int(u_p))
+        Front._measure_set_seq(self, rid, seq)
         return seq
 
-    def _measure_return(self, rid: str, p: "Pending", d_extent: Optional[int], n: int) -> None:
+    def _measure_return(self, rid: str, p: "Pending", d_extent: Optional[int], n: int) -> Optional[str]:
         """MEASURE_ON_D, stage 1 (plan R.1): D's refusal of a measuring request is its REPORT -- the exact realised extent.
-        The class is formed on THAT number (``measured_class`` at the X of the now exactly known depth): halb -> the set
-        (R3), gross -> the set (R4/R8), never BATCH by state, never p_only on it (W123 is R9, below). A refusal
-        UNDER halbX cannot be (D admits those): it is an R7 defect report, not a flip reason. Writes the DECISION
-        (kind=measure) and the DECISION-DONE of the front's MEASURE record. Not a measuring request: nothing."""
+        The class is formed on THAT number (``measured_class`` at the X of the now exactly known depth) and the request is
+        EXECUTED by that class (review B1, ``Pending.measure_class``), never by state: halb -> a set member that is NOT
+        p_only (R3: S >= X flips, else D after the timer with the decision X), gross -> a set member (R4/R8), kurz -> no
+        member, back to D (R2). Under halbX of the BARRIER (``hx`` of the leg, B3) D refused although it admits it: an R7
+        defect line, never a flip reason; between the barrier's halbX and today's it is the class at the X in force now,
+        no defect. Returns the class (``kurz``/``halb``/``gross``), ``None`` when this was no measuring request or D named
+        no extent. Writes the DECISION (kind=measure) and the DECISION-DONE of the front's record."""
         try:
             sent = (self.__dict__.get("_measure_sent") or {}).pop(str(rid), None)
             if sent is None or not envs.FLLIPER_PDFLIP_EXACT_CLASS.get():
-                return
-            seq, u_p = sent
+                return None
+            seq, u_p = int(sent[0]), int(sent[1])
+            hx_bar = int(sent[2]) if len(sent) > 2 else None
             if d_extent is None:
                 Front._dec(self).done(seq, rid, "D", "deferred", detail="D refused without a parseable extent: no class formed")
-                return
+                return None
             u = int(d_extent)
             npr = int(getattr(p, "est_prompt", 0) or n or 0)
             x = Front._x_at_depth(self, max(0, npr - u)) if npr > 0 else int(self.tp_prefill_max_tokens)
@@ -12659,12 +12772,21 @@ class Front:
             klass = _dn.measured_class(u, x, hx)
             page = Front._d_page_size(self)
             self.counters["measure_return_" + klass] += 1
-            p.measured_u, p.measure_src = u, _dn.SRC_D_EXTENT
+            p.measured_u, p.measure_src, p.measure_class = u, _dn.SRC_D_EXTENT, klass
             under = klass == _dn.CLASS_KURZ
-            rule, action = ("R7", "RIDE_P") if under else (("R3" if klass == _dn.CLASS_HALB else "R4"), "COLLECT")
-            why = ("d_refused_under_x: D refused u=%d < halfX=%d although its barrier admits it -- a defect, no flip "
-                   "reason" % (u, hx)) if under else ("D measured u=%d (%s): class %s at X=%d halfX=%d" %
-                                                      (u, _dn.SRC_D_EXTENT, klass, x, hx))
+            defect = hx_bar is not None and u < hx_bar    # D refused although ITS barrier admits u (B3)
+            if under:
+                rule, action = ("R7" if defect else "R2"), "TO_D"
+            else:
+                rule, action = ("R3" if klass == _dn.CLASS_HALB else "R4"), "COLLECT"
+            if defect:
+                why = ("d_refused_under_x: D refused u=%d < barrier halfX=%d although it admits it -- a defect, no flip "
+                       "reason" % (u, hx_bar))
+            elif under:
+                why = ("D measured u=%d (%s): kurz at the X now (halfX=%d, barrier was %s): back to D, R2, no flip"
+                       % (u, _dn.SRC_D_EXTENT, hx, hx_bar))
+            else:
+                why = "D measured u=%d (%s): class %s at X=%d halfX=%d" % (u, _dn.SRC_D_EXTENT, klass, x, hx)
             Front._num_note(self, rid, _dn.SRC_D_EXTENT)
             Front._dec(self).record(_dr.Decision(
                 kind="measure", action=action, rule=rule, rid=rid,
@@ -12673,12 +12795,13 @@ class Front:
             # DECISION-MISMATCH: u_d <= u_p must hold (D reads the same store plus its radix); more than one page above
             # u_p says one of the two numbers is not what it claims to be
             mism = u_p >= 0 and u > u_p + page
-            Front._dec(self).done(seq, rid, "D", "mismatch" if (mism or under) else "ok", measured_u=u,
+            Front._dec(self).done(seq, rid, "D", "mismatch" if (mism or defect) else "ok", measured_u=u,
                                   src=_dn.SRC_D_EXTENT,
                                   detail=("u_d=%d > u_p=%d + page %d" % (u, u_p, page)) if mism else
-                                  ("under halfX" if under else "class %s" % klass))
+                                  ("under barrier halfX=%d" % hx_bar if defect else "class %s" % klass))
+            return klass
         except Exception:  # noqa: BLE001 -- an instrument never breaks the requeue
-            pass
+            return getattr(p, "measure_class", "") or None
 
     # -- EZ-S1 (plan A10): D's KV reading, fresh or absent ---------------------------------------------------------------
     def _kv_fetch_kick(self, why: str) -> bool:
@@ -13159,6 +13282,13 @@ class Front:
         route = "D" if sv.verdict == phase_policy.V_D_AFTER_TIMER else "P"
         self._set_log(st, members, sv, verdict=sv.verdict, why=sv.why, **kw)
         self.counters["set_" + sv.verdict.lower()] += 1
+        if route == "D":
+            for _q in live_q:
+                if Front._measured_halb_member(_q) and _q.rid in st["xs"]:
+                    # EZ-S1 review B1 (R3): the timer ended without S >= X -- the measured halb member goes to D, which
+                    # takes it under the decision X (``_asr_queued_short_to_d``), not the barrier
+                    _q.d_eligible = True
+                    self.counters["measure_halb_to_d"] += 1
         for rid in list(st["shorts"]):
             st["released"][rid] = route
             if route == "D" and envs.FLLIPER_PDFLIP_ENABLE_DECODE_COLLECT_PREFILL_BUSY.get():
@@ -14398,7 +14528,8 @@ class Front:
         eligible = [p for p in live_q
                     if _g(p, "d_eligible", False) and not _g(p, "intake_stalled", False)
                     and not _g(p, "leg1_done", False) and not _g(p, "reroutes", 0)
-                    and not _g(p, "x_requeues", 0) and not _g(p, "p_only", False)
+                    and (not _g(p, "x_requeues", 0) or _g(p, "measure_class", "") in (_dn.CLASS_KURZ, _dn.CLASS_HALB))
+                    and not _g(p, "p_only", False)
                     and not _g(p, "x_deferred", False) and 0 <= int(_g(p, "est_uncached", 0) or 0) <= x]
         # X-SUM-PRICE (Nutzer 05.10. "pending token werden gesammelt und als SUMME bepreist"):
         # X prices what D prefills IN TOTAL, not per request. Boot 063507: the P
@@ -16514,7 +16645,7 @@ class Front:
             # probe's number gives way too -- D's extent is measured at D's admission, LATER than the probe (the
             # number at the decision, user 19.10.); the W123 branch below still sets P's own number for a P-only one
             p.est_uncached = int(d_extent)
-        Front._measure_return(self, rid, p, d_extent, n)  # EZ-S1: MEASURE_ON_D's report -> the class on D's exact extent
+        _mclass = Front._measure_return(self, rid, p, d_extent, n)  # EZ-S1: MEASURE_ON_D's report -> the class on D's extent
         try:
             _vis_reroute = b"(vision reroute)" in body or b"W123" in body
         except TypeError:
@@ -16531,6 +16662,13 @@ class Front:
             seat.release("W50_requeue")
         p.seat = None
         p.d_eligible = p.d_direct = False  # idle policy (b): D refused it -- P's now
+        if _mclass is not None and not getattr(p, "p_only", False):
+            # EZ-S1 review B1: a measured request is executed by its MEASURED class. kurz: no set member, D's again (R2,
+            # ``_asr_queued_short_to_d`` takes it with the decision X); halb: a set member that is NOT p_only (``_set_cands``
+            # / ``_set_members``), D's after the timer (``_decode_collect``) -- D not awake: D's when it wakes; gross: the
+            # set under R4/R8 as before
+            if _mclass == _dn.CLASS_KURZ or (_mclass == _dn.CLASS_HALB and not (self.awake == "D" and self.state == "serving")):
+                p.d_eligible = True
         self.queue.append(p)
         self._dp_mark(p, "reroute")  # R28
         self._kick_controller("arrival")  # 27B flipfast F2 (no-op when off)

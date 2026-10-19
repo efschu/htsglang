@@ -134,7 +134,7 @@ def test_report_under_halfx_is_an_r7_defect_not_a_flip_reason(caplog):
     with caplog.at_level(logging.INFO, logger="pdflip.front"):
         _report(f, "pdflip-0-1", HALF_X - 1, _pend(est_prompt=5000))
     d = _parsed(caplog)
-    assert [(x["action"], x["rule"], x["classes"]) for x in d] == [("RIDE_P", "R7", ["kurz"])]
+    assert [(x["action"], x["rule"], x["classes"]) for x in d] == [("TO_D", "R7", ["kurz"])]
     assert "d_refused_under_x" in d[0]["why"]
     done = _parsed(caplog, "DECISION-DONE")
     assert done[0]["outcome"] == "mismatch"

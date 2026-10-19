@@ -361,11 +361,16 @@ def immediate_park_trigger(queue: Iterable, x_tokens: int):
     """The first queued request (head first) that :func:`needs_p`, or None.
     Reads ``Pending``'s own fields by name (getattr: partial test doubles)."""
     for p in queue:
+        # EZ-S1 review B1: a MEASURE returnee D measured under X (kurz/halb) is not "P-only by the state requeued" -- it is
+        # executed by what D measured (a halb member of the set, R3; a kurz one goes back to D, R2); over X it needs P as ever
+        _xr = int(getattr(p, "x_requeues", 0) or 0)
+        if getattr(p, "measure_class", "") in ("kurz", "halb"):
+            _xr = 0
         if needs_p(int(getattr(p, "est_uncached", 0) or 0), x_tokens,
                    skip_leg1=bool(getattr(p, "skip_leg1", False)),
                    leg1_done=bool(getattr(p, "leg1_done", False)),
                    p_only=bool(getattr(p, "p_only", False)),
-                   x_requeues=int(getattr(p, "x_requeues", 0) or 0),
+                   x_requeues=_xr,
                    x_deferred=bool(getattr(p, "x_deferred", False)),
                    x_routed=int(getattr(p, "x_routed", 0) or 0),
                    handoff_lost_reroutes=int(getattr(p, "handoff_lost_reroutes", 0) or 0),

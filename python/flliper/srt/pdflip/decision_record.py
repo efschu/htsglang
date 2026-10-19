@@ -361,6 +361,13 @@ def summarize(result: Any) -> str:
         return str(result)
     if isinstance(result, str):
         return _tok(result)[:48]
+    if isinstance(result, tuple) and result and isinstance(result[0], bool):
+        # EZ-S1 review B7: ``(bool, why, ...)`` is a yes/no DECISION -- the shadow shows the bool, so the flank fires on a
+        # changed decision, not on every call
+        return "true" if result[0] else "false"
+    v = getattr(result, "verdict", None)
+    if isinstance(v, str) and v:
+        return _tok(v)[:48]  # a ``phase_policy.SetVerdict`` (and any verdict object): the decision it carries
     if isinstance(result, (tuple, list, set, frozenset, dict)):
         return "n%d" % len(result)
     return type(result).__name__

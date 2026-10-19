@@ -20,7 +20,12 @@ Danger directions:
   * R1  the edge trigger is gone (the log floods); R2 the ALT shadow swallows the old site's value;
   * R3  SET-VERDICT is no longer byte-identical to the H91 line (every monitor reads it);
   * R4  a measure request gets ``D_NOW`` with u=0; R5 no barrier header; R6 an under-halbX report is no defect;
-  * R7  the context gate writes no decision; R8 the boot flip pair writes no decision.
+  * R7  the context gate writes no decision; R8 the boot flip pair writes no decision;
+  * review Nachbesserung (test_ez_s1_review_1019.py): MB1 a MEASURE returnee is p_only by STATE again (B1), MB1b the
+    needs_p exemption of a measured kurz/halb entry is gone (B1), MB2 the ``_x_exact_price -> None`` fallback classifies
+    on chars/3 again (B2), MB3 ``under`` is judged on today's halbX, not the barrier's (B3), MB3b the barrier is X at depth
+    0 (B3, curve mode), MB4 the barrier is armed inside the instrument except (B4), MB5 a kurz-on-u_p request carries no
+    barrier (B5), MB7 the ALT shadow loses the bool of a tuple (B7).
 """
 import os
 import subprocess
@@ -29,7 +34,9 @@ import sys
 DN = "python/flliper/srt/pdflip/decision_numbers.py"
 DR = "python/flliper/srt/pdflip/decision_record.py"
 FR = "python/flliper/srt/pdflip/front.py"
-TESTS = ["test/registered/unit/pdflip/test_decision_numbers_1019.py",
+PP = "python/flliper/srt/pdflip/phase_policy.py"
+TESTS = ["test/registered/unit/pdflip/test_ez_s1_review_1019.py",
+         "test/registered/unit/pdflip/test_decision_numbers_1019.py",
          "test/registered/unit/pdflip/test_decision_record_1019.py",
          "test/registered/unit/pdflip/test_measure_on_d_1019.py"]
 
@@ -98,6 +105,30 @@ MUTANTS = [
     ("R8 the boot flip pair writes no decision", FR,
      '_b1 = Front._dec_flip(self, "boot", "FLIP_D", "NS:BOOT",',
      '_b1 = 0 and Front._dec_flip(self, "boot", "FLIP_D", "NS:BOOT",'),
+    ("MB1 a MEASURE returnee is p_only by state", FR,
+     "(u < xq and not _meas)",
+     "(u < xq)"),
+    ("MB1b no needs_p exemption for a measured kurz/halb entry", PP,
+     '        if getattr(p, "measure_class", "") in ("kurz", "halb"):',
+     "        if False:"),
+    ("MB2 the x_exact fallback classifies on chars/3", FR,
+     "            if _xx is None and envs.FLLIPER_PDFLIP_EXACT_CLASS.get():\n                # EZ-S1 review B2",
+     "            if False and _xx is None and envs.FLLIPER_PDFLIP_EXACT_CLASS.get():\n                # EZ-S1 review B2"),
+    ("MB3 under is judged on today's halbX", FR,
+     "            defect = hx_bar is not None and u < hx_bar",
+     "            defect = u < hx"),
+    ("MB3b the barrier is X at depth 0", FR,
+     "                x = min(x, Front._x_min_over_depths(self, int(n_prompt)))",
+     "                x = x"),
+    ("MB4 the barrier is armed inside the instrument except", FR,
+     "        if measure or p_upper:\n            Front._measure_arm(",
+     "        if False:\n            Front._measure_arm("),
+    ("MB5 a kurz-on-u_p request carries no barrier", FR,
+     "            p_upper = _cb0 is not None and _cb0.kind == _dn.KIND_P_UPPER",
+     "            p_upper = False"),
+    ("MB7 the ALT shadow loses the bool of a tuple", DR,
+     "    if isinstance(result, tuple) and result and isinstance(result[0], bool):",
+     "    if False:"),
 ]
 
 
