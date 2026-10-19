@@ -1656,7 +1656,9 @@ async def pdflip_tokenize_ahead(raw_request: Request):
     done = False
     try:
         tm.auto_create_handle_loop()
-        tokenized = await tm._tokenize_one_request(obj)
+        # rc17 merge duty (review S67 A1 / S66 A2): the ahead payload carries the ``~probe`` rid, no request of this
+        # server -- tokenized WITHOUT a ReqState like the D-MATCH-PROBE (stateful: KeyError '<rid>~probe', ta.fail)
+        tokenized = await tm._tokenize_one_request(obj, stateless=True)
         ms = (_time.perf_counter() - t0) * 1000.0
         kept = ta.put(rid, digest, list(tokenized.input_ids or ()), tokenized.mm_inputs, tokenized.token_type_ids, ms,
                       "p_ahead")
