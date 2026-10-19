@@ -176,6 +176,9 @@ def test_the_scheduler_plans_one_slot_per_turn_row_and_frees_a_stale_one(monkeyp
     # TRACK joins every plan here; this test pins the turn track alone (the combination:
     # test_pdflip_s57_gen_fork_anchor_1019.py)
     monkeypatch.setenv("FLLIPER_PDFLIP_GEN_FORK_ANCHOR", "0")
+    # S62: the SYS-GRID TRACK puts a point at the first message's end (floor_page(u)) of this prompt;
+    # the combination is pinned in test_pdflip_s62_sys_grid_anchor_1019.py
+    monkeypatch.setenv("FLLIPER_PDFLIP_SYS_GRID_ANCHOR", "0")
     from flliper.srt.pdflip import turn_anchor as ta
 
     alloc = _Alloc([11, 12])
@@ -202,6 +205,7 @@ def test_the_scheduler_plans_nothing(why, kw, monkeypatch):
     # TRACK joins every plan here; this test pins the turn track alone (the combination:
     # test_pdflip_s57_gen_fork_anchor_1019.py)
     monkeypatch.setenv("FLLIPER_PDFLIP_GEN_FORK_ANCHOR", "0")
+    monkeypatch.setenv("FLLIPER_PDFLIP_SYS_GRID_ANCHOR", "0")   # S62: see the test above
     from flliper.srt.pdflip import turn_anchor as ta
 
     alloc = _Alloc(kw.pop("alloc"))

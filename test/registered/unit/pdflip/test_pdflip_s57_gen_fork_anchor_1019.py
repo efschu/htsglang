@@ -206,8 +206,11 @@ def test_no_gen_track(why, kw):
     assert getattr(req, GEN_PENDING, None) is None, why
 
 
-def test_a_gen_position_the_turn_track_writes_is_one_slot():
+def test_a_gen_position_the_turn_track_writes_is_one_slot(monkeypatch):
     """A one-line last message: turn floor_page(i) == floor_page(g)."""
+    # S62: this prompt's first message ends inside the step, the SYS-GRID TRACK adds 40960 there;
+    # the combination is pinned in test_pdflip_s62_sys_grid_anchor_1019.py
+    monkeypatch.setenv("FLLIPER_PDFLIP_SYS_GRID_ANCHOR", "0")
     n = 49667
     ids = _ids(n, n - GEN - 20)
     alloc = _Alloc([11, 12])

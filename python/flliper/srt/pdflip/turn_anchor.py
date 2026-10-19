@@ -93,6 +93,10 @@ FORK_PENDING_ATTR = "_pdflip_fork_pending"
 #: generation prompt's fork ``floor_page(g)`` when the step's own (END) track lies
 #: past it -- one plan of the same shape as PENDING_ATTR's
 GEN_PENDING_ATTR = "_pdflip_gen_pending"
+#: SYS-GRID TRACK (S62 4b, 19.10., NF rc15 pdflip-2-8): the step's tracks on the
+#: first message's grid (system prompt + tool list), a list of plans of the same
+#: shape as PENDING_ATTR's, ascending by position
+SYSGRID_PENDING_ATTR = "_pdflip_sysgrid_pending"
 
 #: the generation prompt of a thinking Qwen3.x turn is 5 tokens, the
 #: non-thinking one 8; the same window the FORK ANCHOR uses.
@@ -372,6 +376,11 @@ def note_step(batch: Any, desc: Optional[TurnTracks], req: Any, row: int,
         _free_slot(batch, gn_stale[1])
         _decline_unconsumed(req, gn_stale[0])
         setattr(req, GEN_PENDING_ATTR, None)
+    for sg_pend in getattr(req, SYSGRID_PENDING_ATTR, None) or ():
+        _free_slot(batch, sg_pend[1])
+        _decline_unconsumed(req, sg_pend[0])
+    if getattr(req, SYSGRID_PENDING_ATTR, None):
+        setattr(req, SYSGRID_PENDING_ATTR, None)
     if not track_mask or len(getattr(req, "output_ids", None) or ()) > 0:
         return desc
     desc = _note_turn_twin_steps(batch, desc, req, row, prefix, end, main_track,
@@ -382,6 +391,9 @@ def note_step(batch: Any, desc: Optional[TurnTracks], req: Any, row: int,
     if tok is not None and gen_fork_armed():
         desc = _note_gen_step(batch, desc, req, row, prefix, end, main_track,
                               chunk, page, tok)
+    if tok is not None and sys_grid_armed():
+        desc = _note_sysgrid_steps(batch, desc, req, row, prefix, end, main_track,
+                                   chunk, page, tok)
     return desc
 
 
@@ -715,12 +727,266 @@ def _note_gen_step(batch: Any, desc: Optional[TurnTracks], req: Any, row: int,
     return desc
 
 
+# -- SYS-GRID TRACK (S62 4b) ------------------------------------------------------
+SYSGRID_POS_ATTR = "_pdflip_sysgrid_pos"
+
+
+def sys_grid_armed() -> bool:
+    """``FLLIPER_PDFLIP_SYS_GRID_ANCHOR`` (default ON) and a positive grid. Off =
+    every path byte-identical. An env read: one answer on every rank."""
+    try:
+        from flliper.srt.environ import envs
+
+        return bool(envs.FLLIPER_PDFLIP_SYS_GRID_ANCHOR.get()) and int(
+            envs.FLLIPER_PDFLIP_SYS_GRID_TOKENS.get() or 0) > 0
+    except Exception:  # noqa: BLE001 - unreadable = off
+        return False
+
+
+def _ids_env(name: str) -> Tuple[int, ...]:
+    try:
+        from flliper.srt.environ import envs
+
+        raw = getattr(envs, name).get() or ""
+        return tuple(int(x) for x in str(raw).replace(" ", "").split(",") if x)
+    except Exception:  # noqa: BLE001 - unreadable = no tool snapping
+        return ()
+
+
+def sys_grid_config() -> Tuple[int, int, Tuple[int, ...], Tuple[int, ...], Tuple[int, ...]]:
+    """(grid, max points, tool-line head ids, name-field ids, MCP name prefix ids) from the env."""
+    from flliper.srt.environ import envs
+
+    return (int(envs.FLLIPER_PDFLIP_SYS_GRID_TOKENS.get() or 0),
+            int(envs.FLLIPER_PDFLIP_SYS_GRID_MAX.get() or 0),
+            _ids_env("FLLIPER_PDFLIP_SYS_GRID_TOOL_HEAD"),
+            _ids_env("FLLIPER_PDFLIP_SYS_GRID_TOOL_NAME"),
+            _ids_env("FLLIPER_PDFLIP_SYS_GRID_MCP_PREFIX"))
+
+
+def _find(ids: Sequence[int], pat: Sequence[int], lo: int, hi: int) -> Optional[int]:
+    """First index ``i`` in [lo, hi) with ``ids[i:i+len(pat)] == pat``, or None."""
+    if not pat:
+        return None
+    first, n = int(pat[0]), len(pat)
+    i = int(lo)
+    while i < hi:
+        try:
+            i = ids.index(first, i, hi)
+        except ValueError:
+            return None
+        if tuple(int(x) for x in ids[i:i + n]) == tuple(pat):
+            return i
+        i += 1
+    return None
+
+
+def segment_end(ids: Optional[Sequence[int]], tok: Optional[int]) -> Optional[int]:
+    """Index ``u`` of the turn-start token that opens the prompt's SECOND message:
+    ``ids[:u]`` is the first message (system prompt + tool list on a Claude-Code
+    prompt). None when the prompt does not start with a turn-start token or has a
+    single message."""
+    if tok is None or ids is None or len(ids) < 2 or int(ids[0]) != int(tok):
+        return None
+    try:
+        return int(ids.index(int(tok), 1))
+    except ValueError:
+        return None
+
+
+def tool_group_bounds(ids: Sequence[int], lo: int, hi: int, head: Sequence[int],
+                      name: Sequence[int], mcp: Sequence[int]) -> List[int]:
+    """Indices of the tool lines in ``ids[lo:hi]`` whose GROUP differs from the line
+    before (the first tool line included): built-in tools form one group, MCP tools
+    one group per server (the name tokens after ``mcp`` up to its separator, the last
+    id of ``mcp``). Where two Claude-Code tool lists differ -- another MCP server set,
+    a server added or gone -- they fork at such a line (rc15 2-8: list86 -> list99 at
+    the built-in -> MCP line, 'mcp__debugtools' vs 'mcp__claude_ai_Claude_Docs').
+    Pure function of the ids; no tokenizer at run time."""
+    if not head:
+        return []
+    heads: List[int] = []
+    i = lo
+    while True:
+        j = _find(ids, head, i, hi)
+        if j is None:
+            break
+        heads.append(j)
+        i = j + len(head)
+    out: List[int] = []
+    prev = None
+    sep = int(mcp[-1]) if mcp else None
+    for k, b in enumerate(heads):
+        stop = heads[k + 1] if k + 1 < len(heads) else hi
+        group: Tuple[Any, ...] = ("?",)
+        at = _find(ids, name, b + len(head), stop) if name else None
+        if at is not None:
+            p = at + len(name)
+            if mcp and tuple(int(x) for x in ids[p:p + len(mcp)]) == tuple(mcp):
+                q = p + len(mcp)
+                srv = []
+                while q < stop and len(srv) < 32 and int(ids[q]) != sep:
+                    srv.append(int(ids[q]))
+                    q += 1
+                group = ("mcp", tuple(srv))
+            else:
+                group = ("builtin",)
+        if group != prev:
+            out.append(int(b))
+        prev = group
+    return out
+
+
+def sys_grid_positions(ids: Optional[Sequence[int]], tok: Optional[int], page: int, grid: int,
+                       max_points: int = 16, head: Sequence[int] = (), name: Sequence[int] = (),
+                       mcp: Sequence[int] = ()) -> List[int]:
+    """The SYS-GRID positions of a prompt, ascending, every one a multiple of ``page``
+    and in (0, floor_page(u)] (u = :func:`segment_end`):
+
+    * one point per grid window ``(G - grid, G]`` (G = grid, 2*grid, ... <= floor_page(u)):
+      the LOWEST tool-group boundary (page-floored, :func:`tool_group_bounds`) inside the
+      window, else G itself -- the count stays one per window, a tool-list fork at a group
+      boundary is anchored exactly, any other fork loses at most two windows;
+    * the lowest group boundary of the tail window ``(G_last, floor_page(u))``, if any;
+    * ``floor_page(u)``: where a new first message forks off the same system prompt.
+
+    More than ``max_points`` windows widen the grid (a power-of-two multiple of ``grid``,
+    so the widened points land on the chunk ends) instead of adding points. Pure: ids, the env token, page and the config only."""
+    u = segment_end(ids, tok)
+    page = max(1, int(page))
+    grid = (max(int(grid), page) // page) * page
+    if u is None or grid <= 0:
+        return []
+    end_page = (int(u) // page) * page
+    if end_page <= 0:
+        return []
+    if max_points > 0 and end_page // grid > max_points:
+        k = -(-(end_page // grid) // int(max_points))
+        # Review S62 (A4): a POWER-OF-TWO multiple, so a widened grid point falls on the
+        # prefill chunk ends (16384 = 4 x 4096 on NF), which carry their chunk anchor
+        # anyway. x3 (12288) missed them: a 150k-192k first message then held 13 grid
+        # tracks PLUS 9-11 chunk anchors -- 22-27 arena anchors against the per-request
+        # share of 21 (``MAMBA-ARENA ... cap=21``), i.e. SHARE displaced the request's
+        # own shallowest anchors.
+        grid *= 1 << (int(k) - 1).bit_length()
+    bounds = sorted({(b // page) * page for b in tool_group_bounds(ids, 0, int(u), head, name, mcp)}
+                    if head else set())
+    bounds = [b for b in bounds if 0 < b < end_page]
+    pts = set()
+    prev = 0
+    g = grid
+    while g <= end_page:
+        win = [b for b in bounds if prev < b <= g]
+        pts.add(min(win) if win else g)
+        prev = g
+        g += grid
+    tail = [b for b in bounds if prev < b < end_page]
+    if tail:
+        pts.add(min(tail))
+    pts.add(end_page)
+    return sorted(p for p in pts if p > 0)
+
+
+def req_sysgrid_pos(req: Any, tok: int, grain: int) -> List[int]:
+    """:func:`sys_grid_positions` of a request's PROMPT with the env config, cached on
+    the request (one scan per request, not per step)."""
+    ids = getattr(req, "origin_input_ids", None)
+    if ids is None:
+        return []
+    try:
+        grid, mx, head, name, mcp = sys_grid_config()
+    except Exception:  # noqa: BLE001 - unreadable = no grid
+        return []
+    key = (len(ids), int(tok), int(grain), grid, mx, head, name, mcp)
+    cached = getattr(req, SYSGRID_POS_ATTR, None)
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    pts = sys_grid_positions(ids, tok, grain, grid, mx, head, name, mcp)
+    try:
+        setattr(req, SYSGRID_POS_ATTR, (key, pts))
+    except Exception:  # noqa: BLE001
+        pass
+    return pts
+
+
+def _note_sysgrid_steps(batch: Any, desc: Optional[TurnTracks], req: Any, row: int,
+                        prefix: int, end: int, main_track: Optional[int], chunk: int,
+                        page: int, tok: int) -> Optional[TurnTracks]:
+    """SYS-GRID TRACK (S62 4b, 19.10.; NF rc15 ..._1019_071429, pdflip-0-2 / pdflip-2-8).
+
+    THE MEASURED GAP. 2-8 forked from 0-2 inside the tool list ('PREFIX-DIVERGE-TEXT
+    seg_role=system ... tools:list86 -> tools:list99', common=37859: the built-in tool
+    'Write' ends, then 'mcp__debugtools__...' vs 'mcp__claude_ai_Claude_Docs__...'). 0-2's
+    anchors: 64 / 16384 / 32768 / 49152 / turn 55872 / END 61312 -- the store had the KV to
+    37824, the Mamba anchor at 32768: 5056 tokens recomputed by its first reader (P-FORK-CUT
+    anchors the fork for the SECOND reader only). Nobody knows the fork before it happens.
+
+    THE REPAIR: while the step computes the first message (system + tools), one more track
+    per SYS-GRID position (:func:`req_sysgrid_pos`) strictly inside the step, below its own
+    track, on its FLA grid -- the turn anchor's machinery (one gather row per GDN/PLE layer,
+    one mamba slot from the free list; none free = that point skipped and counted, no
+    eviction, no reserve), each inserted as its own node before the step's insert and
+    published with the chain. A later prompt with the same system prefix hits the segment in
+    the cache and runs no grid step: the cost is paid once per system-prefix variant. Skipped
+    where a turn/twin/fork/gen track writes the same position. A promise to a later twin
+    like the other tracks (S52)."""
+    pts = req_sysgrid_pos(req, tok, page)
+    if not pts:
+        return desc
+    rid = str(getattr(req, "rid", "?"))
+    protected = int(getattr(req, "cache_protected_len", 0) or 0)
+    taken = {int(p[0]) for p in (getattr(req, TWIN_PENDING_ATTR, None) or ())}
+    for attr in (PENDING_ATTR, FORK_PENDING_ATTR, GEN_PENDING_ATTR):
+        p = getattr(req, attr, None)
+        if p is not None:
+            taken.add(int(p[0]))
+    from flliper.srt.pdflip import twin_anchor as _tw
+
+    plans = []
+    for t in pts:
+        if step_target(prefix, end, t, chunk, main_track) is None:
+            continue
+        if t % max(1, int(page)) != 0 or t <= protected:
+            continue
+        if t in taken:
+            n = _count("grid_shared")
+            if _log_due(n):
+                logger.info("PDFLIP SYS-GRID-ANCHOR SHARED rid=%s at=%d step=[%d,%d) (n=%d; another "
+                            "track writes this very position)", rid, t, prefix, end, n)
+            continue
+        slot = _alloc_slot(batch)
+        if slot is None:
+            n = _count("grid_no_slot")
+            if _log_due(n):
+                logger.info("PDFLIP SYS-GRID-ANCHOR SKIP rid=%s reason=no_free_slot at=%d "
+                            "step=[%d,%d) (n=%d; no eviction, no reserve)", rid, t, prefix, end, n)
+            continue
+        if desc is None:
+            desc = TurnTracks(len(batch.reqs), need=slot_state_kinds(batch.req_to_token_pool))
+        desc.add(row, slot, t, prefix, end - prefix)
+        plans.append((t, slot, desc, int(prefix), int(end)))
+        taken.add(t)
+        _tw.note_track_planned(rid, t)
+        n = _count("grid_planned")
+        if _log_due(n):
+            logger.info(
+                "PDFLIP SYS-GRID-ANCHOR TRACK n=%d rid=%s step=[%d,%d) at=%d segment_end=%s main=%s "
+                "(extra extend track on the first message's grid: a tool-list variant forking here "
+                "reads its KV up to this anchor instead of the previous chunk anchor)",
+                n, rid, prefix, end, t, segment_end(getattr(req, "origin_input_ids", None), tok),
+                main_track)
+    if plans:
+        setattr(req, SYSGRID_PENDING_ATTR, plans)
+    return desc
+
+
 def has_pending(req: Any) -> bool:
     """A turn, twin or fork plan waits for the tree's next insert of ``req``."""
     return (getattr(req, PENDING_ATTR, None) is not None
             or bool(getattr(req, TWIN_PENDING_ATTR, None))
             or getattr(req, FORK_PENDING_ATTR, None) is not None
-            or getattr(req, GEN_PENDING_ATTR, None) is not None)
+            or getattr(req, GEN_PENDING_ATTR, None) is not None
+            or bool(getattr(req, SYSGRID_PENDING_ATTR, None)))
 
 
 def pop_all_pending(req: Any) -> List[Tuple[str, Any]]:
@@ -742,6 +1008,10 @@ def pop_all_pending(req: Any) -> List[Tuple[str, Any]]:
     if gen is not None:
         setattr(req, GEN_PENDING_ATTR, None)
         out.append(("gen", gen))
+    grid = getattr(req, SYSGRID_PENDING_ATTR, None) or ()
+    if grid:
+        setattr(req, SYSGRID_PENDING_ATTR, None)
+        out.extend(("grid", p) for p in grid)
     out.sort(key=lambda kp: int(kp[1][0]))
     return out
 
@@ -861,11 +1131,11 @@ def insert_verdict(pend) -> Tuple[bool, str]:
 
 def _label(kind: str) -> str:
     return {"twin": "TWIN-ANCHOR", "fork": "FORK-ANCHOR",
-            "gen": "GEN-FORK-ANCHOR"}.get(kind, "TURN-ANCHOR")
+            "gen": "GEN-FORK-ANCHOR", "grid": "SYS-GRID-ANCHOR"}.get(kind, "TURN-ANCHOR")
 
 
 def _kind_prefix(kind: str) -> str:
-    return kind + "_" if kind in ("twin", "fork", "gen") else ""
+    return kind + "_" if kind in ("twin", "fork", "gen", "grid") else ""
 
 
 def note_insert(req: Any, t: int, prefix_len: int, taken: bool, prompt: int,
