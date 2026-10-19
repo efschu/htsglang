@@ -299,7 +299,7 @@ def reset_for_wake(req) -> None:
     """A new wake follows a P phase in which P may have written this rid again
     (RESUME-VIA-P publishes the same tail files anew): the writer view of the
     previous wake -- state, spent ack -- does not carry over."""
-    for attr in ("_1471w_state", "_1471w_ack", "_1471w_t"):
+    for attr in ("_1471w_state", "_1471w_ack", "_1471w_t", WHY_ATTR):
         setattr(req, attr, None)
 
 
@@ -316,11 +316,64 @@ def _tail_facts(rid: str) -> Tuple[str, bool]:
     return state, tmp
 
 
-def observe(req) -> str:
+# ---------------------------------------------------------------------------
+# S75 (19.10., NF rc16 bf9ca46f45 boot 1019_121629, D TP0): the settle waited for a
+# writer that does not exist. pdflip-190-722 was a D-direct request (14:20:39
+# ``#1324c DELIVERABLE-CAP ... no hand-off chain, no hand-off record, no tail part``,
+# X-GATE uncached=3287 admit -- P never saw it). D parked it at 14:22:03; the retract
+# runs ``cache_finished_req`` -> ``_pdflip_handoff_write`` on D, so D wrote a #1442
+# record of its OWN chain (689 pages). The wake read came back short (40000 of 44032:
+# D's decode pages [40000, 44032) were never written, ``PARK-DEMOTE missing=44``), and
+# this module read D's own record as "P prefilled it": ``SETTLE-WRITER
+# writer=p-handoff action=poll``, 11 re-reads every 2 s, the 6th D seat held 21 s
+# (pdflip-191-750/751/752 waited 19 s each), until ``W50-REROUTE`` at 14:22:48 did
+# what "decide" would have done at 14:22:27. pdflip-174-648 the same (14:13:31 ->
+# 14:13:51). The record now names its writer group (``handoff.WRITER_FIELD``): a
+# record D wrote is no P writer. And a P record bounds what P can still write: once
+# the delivered prefix covers every page of P's chain, P has nothing left for this
+# rid (``p-span-delivered``) -- the missing pages are D's own, which nobody writes
+# after the wake (module doc). Switch FLLIPER_PDFLIP_SETTLE_WRITER_LABEL (default
+# ON; 0 = every record and chain counts as P, as before).
+# ---------------------------------------------------------------------------
+
+LABEL_ENV = "FLLIPER_PDFLIP_SETTLE_WRITER_LABEL"
+#: req attribute: why the last observation found no P writer behind a record/chain
+WHY_ATTR = "_1471w_why"
+
+
+def label_enabled(env=None) -> bool:
+    """S75, default ON; 0/false/no/off = the pre-S75 view (any record = P)."""
+    e = os.environ if env is None else env
+    return str(e.get(LABEL_ENV, "1")).strip().lower() not in ("0", "false", "no", "off")
+
+
+def p_span_delivered(req, page_size: Optional[int]) -> bool:
+    """True when the delivered prefix covers every page of the longest chain P
+    wrote for ``req`` (``handoff_keys.P_PAGES_ATTR``) -- P's write-through has
+    nothing left to put in the store for it. False whenever a term is unknown."""
+    from flliper.srt.pdflip.handoff_keys import P_PAGES_ATTR, P_TOKENS_ATTR
+
+    pages = getattr(req, P_PAGES_ATTR, None)
+    tokens = getattr(req, P_TOKENS_ATTR, None)
+    delivered = getattr(req, "_pdflip_store_delivered", None)
+    try:
+        page = int(page_size or 0)
+        if not pages or delivered is None or page <= 0:
+            return False
+        if int(delivered) // page < int(pages):
+            return False
+        # and the whole pages of P's prompt (a page-size mismatch cannot make it true early)
+        return tokens is None or int(delivered) >= (int(tokens) // page) * page
+    except (TypeError, ValueError):
+        return False
+
+
+def observe(req, page_size: Optional[int] = None) -> str:
     """Gather the facts for ``req`` and classify them (rank-local; the caller
-    takes the group MIN of every verdict built on it)."""
+    takes the group MIN of every verdict built on it). ``page_size``: the
+    tree's page size (S75 P-span bound; None = the bound is not applied)."""
     from flliper.srt.pdflip import handoff as _ho
-    from flliper.srt.pdflip.handoff_keys import CHAIN_ATTR, SEEN_ATTR
+    from flliper.srt.pdflip.handoff_keys import CHAIN_ATTR, P_SEEN_ATTR, SEEN_ATTR, note_record_writer
 
     if not _ho._dir():
         return UNKNOWN
@@ -329,9 +382,44 @@ def observe(req) -> str:
         return UNKNOWN
     # SEEN_ATTR (P4b-fix): the record this rank once read may be gone after the wake
     chain = bool(getattr(req, CHAIN_ATTR, None)) or bool(getattr(req, SEEN_ATTR, False))
-    handoff_file = _ho.read(rid) is not None
+    rec = _ho.read(rid)
+    handoff_file = rec is not None
+    why = None
+    # review S75 1.3: a P leg ran for this rid (RESUME-VIA-P) -- P may still be writing it
+    # even when no fresh P record replaced D's (a skipped/failed hand-off write): D's own
+    # record then proves nothing, the pre-S75 poll stays
+    p_leg = _p_leg_ran(req)
+    if label_enabled():
+        if handoff_file:
+            note_record_writer(req, rec, list(rec.get("page_keys") or []) if isinstance(rec, dict) else [])
+            if _ho.record_writer(rec) == "D" and not p_leg:
+                handoff_file = False
+                why = "d-own-record"
+        if chain and getattr(req, P_SEEN_ATTR, None) is False and not p_leg:
+            chain = False                   # every record this rank read was D's own
+            why = "d-own-record"
+        if (chain or handoff_file) and p_span_delivered(req, page_size):
+            chain = handoff_file = False
+            why = "p-span-delivered"
     tail_state, tail_tmp = _tail_facts(rid)
-    return classify(chain=chain, handoff_file=handoff_file, tail_state=tail_state, tail_tmp=tail_tmp)
+    state = classify(chain=chain, handoff_file=handoff_file, tail_state=tail_state, tail_tmp=tail_tmp)
+    # review S75 1.1: ``not_p=`` names why NO writer was found -- only when that is the verdict
+    # (a D file over a P chain stays p-handoff and says nothing)
+    try:
+        setattr(req, WHY_ATTR, why if state == NONE else None)
+    except Exception:  # noqa: BLE001 - a frozen double
+        pass
+    return state
+
+
+def _p_leg_ran(req) -> bool:
+    """A RESUME-VIA-P leg was started for ``req`` (``resume_via_p.ATTEMPTS_ATTR``)."""
+    from flliper.srt.pdflip import resume_via_p as _rvp
+
+    try:
+        return int(getattr(req, _rvp.ATTEMPTS_ATTR, 0) or 0) > 0
+    except (TypeError, ValueError):
+        return False
 
 
 def remainder(req, records) -> Optional[int]:

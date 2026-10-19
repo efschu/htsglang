@@ -1314,7 +1314,8 @@ def _pdflip_settle_writer_action(sched, req) -> str:
         now_state = prev  # the hand-off directory is listed at most every 100 ms per request
     else:
         try:
-            now_state = _sw.observe(req)
+            # S75: the page size bounds what P can still write (P-span); a stand-in has none
+            now_state = _sw.observe(req, page_size=getattr(sched, "page_size", None))
         except Exception as exc:  # noqa: BLE001 - unknown = the old poll, never a guess
             logger.info("#1471w SETTLE-WRITER rid=%s n/a (%s: %s) -- 2 s re-read as before",
                         str(getattr(req, "rid", "?")), type(exc).__name__, exc)
@@ -1331,8 +1332,10 @@ def _pdflip_settle_writer_action(sched, req) -> str:
             "decide": "no writer can fill the rest: decided now",
             "poll": "a writer without a visible ack: the 2 s re-read stays",
         }[act]
-        logger.info("#1471w SETTLE-WRITER rid=%s writer=%s prev=%s action=%s -- %s",
-                    str(getattr(req, "rid", "?")), now_state, prev, act, _what)
+        _why = getattr(req, _sw.WHY_ATTR, None)  # S75: why a record/chain names no P writer
+        logger.info("#1471w SETTLE-WRITER rid=%s writer=%s prev=%s action=%s%s -- %s",
+                    str(getattr(req, "rid", "?")), now_state, prev, act,
+                    f" not_p={_why}" if _why else "", _what)
     return act
 
 

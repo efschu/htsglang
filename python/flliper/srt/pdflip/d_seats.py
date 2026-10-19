@@ -60,7 +60,7 @@ import logging
 import math
 import os
 from dataclasses import dataclass, field
-from typing import Dict, FrozenSet, Iterable, List, Mapping, Optional, Sequence
+from typing import Callable, Dict, FrozenSet, Iterable, List, Mapping, Optional, Sequence, Union
 
 logger = logging.getLogger(__name__)
 
@@ -315,6 +315,13 @@ class AdmissionGate:
     #: seats held for every parked request still waiting (queue + outside);
     #: None = no phase seat count known (no backfill, the barrier as before)
     seat_room: Optional[int] = None
+    #: S75 (19.10.): WHY each blocked pressure-parked rid may not resume this pass --
+    #: ``(rid, gate, older_rid, avail, need)``; gate ``held_for_older`` (Q-698: the
+    #: older one it was displaced for still waits) or ``older_live`` (an older request
+    #: is live and the early resume did not hold: avail/need are the numbers it saw,
+    #: None when no margin is armed). The census key alone (``pdflip_d_park_older_live``)
+    #: named neither the gate nor its numbers (rc16 pdflip-137-471, 193 s).
+    held: tuple = ()
 
     def skip(self, req, admitted=None, skip_extend: bool = False) -> Optional[str]:
         """Census key when ``req`` is skipped this pass, else None.
@@ -539,7 +546,7 @@ def admission_gate(
     *,
     running: Sequence,
     pending_outside: Sequence = (),
-    avail_tokens: Optional[int] = None,
+    avail_tokens: Optional[Union[int, Callable[[], Optional[int]]]] = None,
     resume_book: Optional[ResumeBook] = None,
     decode_first: Optional[DecodeFirst] = None,
     seats: Optional[int] = None,
@@ -561,6 +568,16 @@ def admission_gate(
         return AdmissionGate()
     live = list(running) + parked_waiting + parked_outside
     blocked = set()
+    held = []
+    # S75: ``avail_tokens`` may be a zero-argument callable (a group collective read
+    # lazily): read once, and only when a pressure-parked request asks the early resume
+    # -- that precondition is replicated, so every rank enters the read alike
+    _avail_box = []
+
+    def _avail():
+        if not _avail_box:
+            _avail_box.append(avail_tokens() if callable(avail_tokens) else avail_tokens)
+        return _avail_box[0]
     # Q-698: the requests still waiting (queue or outside it) -- a victim parked
     # for one of them stays parked while that one waits (no early resume either).
     # The hold ends when the older one is admitted or gone (here), when it was
@@ -576,21 +593,27 @@ def admission_gate(
             if str(held_for) in still_waiting and str(held_for) != str(r.rid):
                 blocked.add(str(r.rid))
                 held_for_older += 1
+                held.append((str(r.rid), "held_for_older", str(held_for), None, None))
                 continue
             # the older one was admitted or is gone: the hold ends for good
             setattr(r, DISPLACED_FOR_ATTR, None)
         mine = _order_key(r)  # PRIO-AS-AGE 1014: "older" by the order key
-        older_live = any(x is not r and _order_key(x) < mine for x in live)
-        if not older_live:
+        older = [x for x in live if x is not r and _order_key(x) < mine]
+        if not older:
             continue
+        seen_avail, need = None, None
         if resume_book is not None and avail_tokens is not None:
             need = len(getattr(r, "origin_input_ids", None) or ()) + len(
                 getattr(r, "output_ids", None) or ()
             )
-            if resume_book.early_ok(str(r.rid), avail_tokens=int(avail_tokens), need_tokens=need):
-                resume_book.note_resume(str(r.rid), avail_tokens=int(avail_tokens), need_tokens=need)
+            seen_avail = _avail()
+            if seen_avail is not None and resume_book.early_ok(
+                    str(r.rid), avail_tokens=int(seen_avail), need_tokens=need):
+                resume_book.note_resume(str(r.rid), avail_tokens=int(seen_avail), need_tokens=need)
                 continue
         blocked.add(str(r.rid))
+        held.append((str(r.rid), "older_live", str(getattr(min(older, key=_order_key), "rid", "?")),
+                     None if seen_avail is None else int(seen_avail), need))
     if resume_book is not None:
         resume_book.forget(str(r.rid) for r in parked_waiting)
     deferred = (
@@ -610,7 +633,7 @@ def admission_gate(
     room = (None if seats is None else
             int(seats) - len(running) - len(parked_waiting) - len(list(pending_outside)))
     return AdmissionGate(barrier=True, blocked=frozenset(blocked), note=note,
-                         seat_room=room,
+                         seat_room=room, held=tuple(held),
                          oldest_parked_age=oldest,
                          oldest_parked_key=oldest_key,
                          parked_in_queue=frozenset(str(r.rid) for r in parked_waiting),
