@@ -1865,7 +1865,13 @@ class SeatVram:
         the rows step aside), the largest k' whose released cells pay the rest.
         ``ok=False`` only when even all rows OFF cannot pay -- a real wall, which
         the runtime tick turns into a GROUP refusal before any rank moves.
-        None when nothing is measured (no live KV grows, or no CUDA card)."""
+        None when nothing is measured (no live KV grows, or no CUDA card).
+
+        H2 (review S77-B): the wake (``on_wake``) applies its stage to PAUSED KV
+        tensors (mapped at their tag's resume) -- ``need`` is 0 there and nothing
+        is voted. A wake path that ever maps KV LIVE must take the same group vote
+        as ``runtime_tick`` (``_grow_room_refused``) before its ``apply_stage``;
+        without it a short rank stops by name here, before anything moved."""
         n = max(1, min(int(n), self.cap))
         j = max(0, min(int(j), len(self.form.tokens) - 1))
         if k is None:
@@ -3491,6 +3497,8 @@ def runtime_tick(sched):
         return floor_box[0]
 
     before, pending_before = ms.stage, ms.pending
+    # S77-B review A1: a grow the group refuses moved nothing -- it must not count
+    up_before = (int(ms.counters.get("stage_up", 0)), int(ms.counters.get("stage_flap", 0)))
     # S77-A: a floor that blocks a decided shrink is moved down first (KV-COMPACT) --
     # on the tree that holds the pages (a server-config property: the same on every
     # D rank, so every rank installs it alike and enters its collectives alike)
@@ -3570,9 +3578,14 @@ def runtime_tick(sched):
     ctl = controller(sched)
     if ms.stage > before:
         # S77-B: a grow moves no rank until EVERY rank measured the room for it
+        # H1 (review S77-B): the vote measured this rank's card; ``apply_stage`` below
+        # measures it AGAIN (the vote's own collective is the only work in between) and
+        # pays a drift with more of its own rows -- a wall there would need a drift
+        # beyond free + every row, which the vote has just excluded
         refused = _grow_room_refused(sched, ctl, n, ms.stage)
         if refused is not None:
             ms.stage = before
+            ms.counters["stage_up"], ms.counters["stage_flap"] = up_before
             ms.counters["stage_up_refused_room"] = ms.counters.get("stage_up_refused_room", 0) + 1
             if alloc is not None:
                 _engage_kv_cap(alloc, tokens[before], page)

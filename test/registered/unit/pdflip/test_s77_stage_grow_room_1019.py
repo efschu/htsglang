@@ -254,3 +254,25 @@ def test_a_rank_without_pages_still_enters_the_vote(tick_env):
     sched.running_batch.reqs = [_req("a", 300_000)]
     st = dsv_.runtime_tick(sched)
     assert st.changed and [1] in votes
+
+
+def test_refused_grows_count_no_stage_up_and_the_next_room_grows(tick_env):
+    """Review S77-B A1: two group refusals, then the peer has room -- the admission is
+    not stuck, and only the grow that moved counts (stage_up 1, stage_flap 0)."""
+    dsv_, sched, caps, _floor, votes, grid = tick_env
+    ctl = _Ctl(ok=True)
+    setattr(sched, dsv_.CTL_ATTR, ctl)
+    peer = {"ok": 0}
+    sched._pdflip_group_min_ints = lambda vals: (votes.append(list(vals)) or [min(min(vals), peer["ok"])])
+    sched.running_batch.reqs = [_req("a", 300_000)]
+    for _ in range(2):
+        st = dsv_.runtime_tick(sched)
+        assert not st.changed and ctl.applied == [] and caps[-1] == grid[0]
+    ms = getattr(sched, dsv_.MEM_SCHED_ATTR)
+    assert ms.counters["stage_up_refused_room"] == 2
+    assert ms.counters["stage_up"] == 0 and ms.counters["stage_flap"] == 0
+    peer["ok"] = 1                                   # the peer found room (trim / rows off)
+    st = dsv_.runtime_tick(sched)
+    assert st.changed and ms.stage > 0 and ctl.applied == [(6, ms.stage)]
+    assert caps[-1] == grid[ms.stage]
+    assert ms.counters["stage_up"] == 1 and ms.counters["stage_flap"] == 0
