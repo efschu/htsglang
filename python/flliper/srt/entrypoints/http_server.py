@@ -1526,7 +1526,9 @@ async def pdflip_match_probe(raw_request: Request):
             return ORJSONResponse({"success": False, "message": "shape not priced", "retry": False},
                                   status_code=200)
         tm.auto_create_handle_loop()
-        tokenized = await tm._tokenize_one_request(obj)
+        # S67: the probe is no request of this server -- tokenized WITHOUT a ReqState (rc16: the stateful path read
+        # rid_to_state['<rid>~probe'] and every probe died of KeyError before the scheduler was asked)
+        tokenized = await tm._tokenize_one_request(obj, stateless=True)
         mm = tokenized.mm_inputs
         if mm is not None:
             # the scheduler needs each item's pad value and offsets, never its pixels (a probe carries no feature)

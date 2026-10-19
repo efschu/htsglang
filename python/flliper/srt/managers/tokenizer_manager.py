@@ -997,8 +997,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     async def _tokenize_one_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
+        *,
+        stateless: bool = False,
     ):
-        """Tokenize one request."""
+        """Tokenize one request.
+
+        ``stateless`` (S67, NF rc16 19.10.): tokenize a prompt that is NOT a
+        request of this server -- the D-MATCH-PROBE (``/pdflip/match_probe``,
+        pdflip/d_match_probe.py) asks "how much of this prompt does the group
+        hold", nothing is admitted. Such a tokenization has no ``ReqState`` in
+        ``rid_to_state`` and must not get one (it would be an in-flight request
+        nobody ever finishes: drain, abort sweeps and the request census would
+        count it). Default False: every real request keeps the upstream path
+        byte for byte, a missing state stays a KeyError there."""
         # Tokenize
         input_embeds = None
         input_text = obj.text
@@ -1180,7 +1191,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
         self._validate_one_request(obj, input_ids)
         return self._create_tokenized_object(
-            obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
+            obj,
+            input_text,
+            input_ids,
+            input_embeds,
+            mm_inputs,
+            token_type_ids,
+            stateless=stateless,
         )
 
     def _validate_one_request(
@@ -1390,8 +1407,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         input_embeds: Optional[List[List[float]]] = None,
         mm_inputs=None,
         token_type_ids: Optional[List[int]] = None,
+        *,
+        stateless: bool = False,
     ) -> Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]:
-        """Create a tokenized request object from common parameters."""
+        """Create a tokenized request object from common parameters.
+
+        ``stateless``: see ``_tokenize_one_request`` (S67) -- no ``ReqState``
+        is read, the object carries no ``time_stats``."""
         input_ids_arr: Optional[array[int]] = (
             array("q", input_ids) if input_ids is not None else None
         )
@@ -1503,6 +1525,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
             )
 
+        if stateless:
+            # S67 (NF rc16 12:19Z, 9/9 ``PDFLIP D-PROBE-FAILED why=KeyError:
+            # '<rid>~probe'``): the D-MATCH-PROBE's tokenization is no request of
+            # this server -- there is no ReqState to time, and none is created.
+            return tokenized_obj
         tokenized_obj.time_stats = self.rid_to_state[obj.rid].time_stats
         self.rid_to_state[obj.rid].time_stats.set_tokenize_finish_time()
 
