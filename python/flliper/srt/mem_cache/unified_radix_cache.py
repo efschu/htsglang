@@ -4983,6 +4983,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # K15 review A1: the save reads WHICH pool refused (only a mamba-arena
         # refusal can be served by a spill)
         self._k15_last_refusal = str(why).split(":", 1)[0]
+        # S73: the publish sweep names WHY it refused (its BACKUP-REFUSED lines
+        # are sampled per reason -- rc16 TP1 14:13:15: 39 refusals, 0 lines)
+        _s73 = getattr(self, "_s73_sweep_why", None)
+        if _s73 is not None:
+            _k73 = str(why).split(":", 1)[0]
+            _s73[_k73] = _s73.get(_k73, 0) + 1
         try:
             _role = _r12.role()
             if _role == "host":
@@ -7996,6 +8002,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         _issue_s = 0.0
         _walked = 0
         self._pdflip_sweep_last_refusal = None
+        self._s73_sweep_why = {}   # S73: refusal reasons of THIS sweep (the line's refused_by=)
         # SWEEP-FULL-ARENA: armed for this sweep; engaged by its first arena_claim refusal
         _full_arena_armed = self._pdflip_full_arena_skip_armed()
         _full_arena = False
@@ -8120,6 +8127,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 _full_arena = _full_arena or (
                     _full_arena_armed and self._pdflip_sweep_last_refusal == "arena_claim")
         stats["walked"] = _walked
+        stats["refused_by"] = dict(sorted((getattr(self, "_s73_sweep_why", None) or {}).items()))
+        self._s73_sweep_why = None
         stats["issue_ms"] = round(_issue_s * 1000.0, 1)
         stats["sweep_ms"] = round((time.perf_counter() - _t_sweep0) * 1000.0, 1)
         if clock is not None:
@@ -8143,12 +8152,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 "in_flight_after=%d pins=%d/%d draft_issued=%d draft_refused=%d "
                 "(denominator: un-backed device nodes at this flush poll; the draft terms are "
                 "the controller's CUMULATIVE L3 draft write counts, #1233 C18) "
-                "walked=%d sweep_ms=%.1f issue_ms=%.1f%s",
+                "walked=%d sweep_ms=%.1f issue_ms=%.1f%s%s",
                 n, stats["unbacked"], stats["issued"], stats["refused"], stats["skipped_pending"],
                 stats["pending"], self._mamba_pins_held(), self._mamba_pin_budget,
                 stats["draft_issued"], stats["draft_refused"],
                 stats["walked"], stats["sweep_ms"], stats["issue_ms"],
                 _full_arena_suffix(stats),
+                (" refused_by=" + ",".join(f"{k}:{v}" for k, v in stats["refused_by"].items()))
+                if stats["refused_by"] else "",
             )
         return stats
 

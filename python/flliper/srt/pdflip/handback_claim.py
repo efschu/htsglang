@@ -53,6 +53,34 @@ def handback_min_tokens(has_handoff: bool = False, env=None):
     return None
 
 
+#: S73 switch (default ON): group P reads a store span whatever its length
+P_INTAKE_READ_MIN_ENV = "FLLIPER_PDFLIP_S73_P_INTAKE_READ_MIN"
+
+
+def p_intake_min_tokens(env=None):
+    """S73 (rc16 bf9ca46f45, ANKER-VERFEHLT-P pdflip-194-759): 1 for every
+    store read of a group-P rank, else None (D keeps its #915 threshold).
+
+    Metal rc16 P PP0: 23x ``#915 PREFETCH REFUSED reason=too_short need=64..192``
+    (3456 tokens; rc15a 32x / 4736, rc15b 6x / 1088). 194-759: the store held
+    43392 (D's PARK-END-ANCHOR), PP0 refused the 128-token read at intake and P
+    prefilled 183 tokens from 43264 instead of 55 from 43392. The threshold
+    prices whether opening a FRESH read pays; on P the store span IS the
+    request's prefix (D's park, P's own earlier publish) and every token read
+    is a token P does not compute (user 15.10.: "groesser 0 ist fehlerhaft").
+    Same law as the hand-off read (above), the told read
+    (``pdflip_store_told.told_read_min_tokens``), the store-short tail and the
+    park-retain read. Rank-uniform: a replicated input (group + switch), every
+    P stage folds the same minimum."""
+    e = os.environ if env is None else env
+    if (e.get("FLLIPER_PDFLIP_GROUP", "") or "").strip().upper() != "P":
+        return None
+    v = str(e.get(P_INTAKE_READ_MIN_ENV, "1")).strip().lower()
+    if v in ("0", "false", "no", "off", ""):
+        return None
+    return 1
+
+
 def handback_line(rid, n_tokens: int, d_prefix: int, d_compute: int, path: str) -> str:
     """One line per hand-off at D's admission: what D holds (``d_prefix``) and
     what its target forward still computes (``d_compute``), by path:

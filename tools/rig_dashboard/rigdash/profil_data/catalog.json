@@ -63796,7 +63796,7 @@
    "id": "FLLIPER_PDFLIP_EVICT_ANCHOR_SAVE",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/unified_radix_cache.py:6126"
+    "mem_cache/unified_radix_cache.py:6132"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_EVICT_ANCHOR_SAVE",
@@ -63805,7 +63805,7 @@
    "source": {
     "file": "mem_cache/unified_radix_cache.py",
     "kind": "os.environ",
-    "line": 6126,
+    "line": 6132,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -74042,6 +74042,37 @@
    ],
    "type": "os.environ"
   },
+  "FLLIPER_PDFLIP_S73_P_INTAKE_READ_MIN": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"1\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "S73 switch (default ON): group P reads a store span whatever its length",
+   "id": "FLLIPER_PDFLIP_S73_P_INTAKE_READ_MIN",
+   "kind": "env",
+   "lesestellen": [
+    "pdflip/handback_claim.py:78"
+   ],
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_S73_P_INTAKE_READ_MIN",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "pdflip/handback_claim.py",
+    "kind": "os.environ",
+    "line": 78,
+    "tree": "nf"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "os.environ"
+  },
   "FLLIPER_PDFLIP_SEAM_DIGEST": {
    "bare": false,
    "choices": null,
@@ -75091,7 +75122,7 @@
    "id": "FLLIPER_PDFLIP_SPILL_REF_FREE",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/unified_radix_cache.py:6304"
+    "mem_cache/unified_radix_cache.py:6310"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_SPILL_REF_FREE",
@@ -75100,7 +75131,7 @@
    "source": {
     "file": "mem_cache/unified_radix_cache.py",
     "kind": "os.environ",
-    "line": 6304,
+    "line": 6310,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -75548,7 +75579,7 @@
    "id": "FLLIPER_PDFLIP_SWEEP_REFUSED_MEMO",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/unified_radix_cache.py:8194"
+    "mem_cache/unified_radix_cache.py:8205"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_SWEEP_REFUSED_MEMO",
@@ -75557,7 +75588,7 @@
    "source": {
     "file": "mem_cache/unified_radix_cache.py",
     "kind": "os.environ",
-    "line": 8194,
+    "line": 8205,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -91053,28 +91084,28 @@
  "schema": "flliper.catalog/1",
  "stats": {
   "curated": 125,
-  "entries": 2873,
-  "envs": 1994,
+  "entries": 2874,
+  "envs": 1995,
   "explained": 310,
   "flags": 864,
-  "harvested": 1775,
+  "harvested": 1776,
   "trees": {
    "abweichung": 53,
    "beide": 2463,
    "nur_27b": 180,
-   "nur_nf": 212
+   "nur_nf": 213
   },
   "unexplained": 663
  },
- "tree_rev": "27b=0798c91fcd+nf=65d24e305f",
+ "tree_rev": "27b=0798c91fcd+nf=094ee291ea",
  "trees": {
   "27b": {
    "entries": 2643,
    "rev": "0798c91fcd"
   },
   "nf": {
-   "entries": 2675,
-   "rev": "65d24e305f"
+   "entries": 2676,
+   "rev": "094ee291ea"
   }
  },
  "warnungen": []
