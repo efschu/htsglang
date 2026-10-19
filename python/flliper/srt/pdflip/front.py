@@ -6719,8 +6719,11 @@ class Front:
         mm = None
         mm_keys: List[str] = []
         t0 = time.monotonic()
-        # S56 D-MATCH-PROBE: D's exact numbers, asked BESIDE the front's own count (it no longer prices the class)
-        _probe_task = Front._d_probe_start(self, rid, path, payload)
+        # S56 D-MATCH-PROBE: D's exact numbers (they price the class, the front's count no longer does). A prompt
+        # with media is tokenized by D BESIDE the front's count; a text prompt's front ids ARE D's ids, so its probe
+        # follows the count and asks D's tree with them (no second tokenization on D)
+        _media = _dmp.payload_has_any_media(payload)
+        _probe_task = Front._d_probe_start(self, rid, path, payload) if _media else None
         if reason is None:
             try:
                 got = await asyncio.wait_for(
@@ -6765,6 +6768,14 @@ class Front:
                         _probe_task.cancel()
                     raise FrontTemplateRefused(str(e)) from e
                 reason = f"{type(e).__name__}: {str(e)[:160]}"
+        if _probe_task is None and not _media:
+            _ns_known0, _ns0 = payload_namespace(payload)
+            if c is not None and _ns_known0 and _ns0 is None:
+                _probe_task = Front._d_probe_start(
+                    self, rid, "/generate", {"rid": rid, "input_ids_b64": _dmp.ids_to_b64(c.ids)})
+            else:
+                # no front count, or a namespace only D forms the key of: D tokenizes it itself
+                _probe_task = Front._d_probe_start(self, rid, path, payload)
         # S56: D's answer replaces the front's ids (D's token space: images expanded, pad values = the store keys)
         _probe = await Front._d_probe_result(self, rid, _probe_task) if _probe_task is not None else None
         _c_front, _mm_front = c, mm

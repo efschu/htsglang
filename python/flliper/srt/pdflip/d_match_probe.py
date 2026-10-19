@@ -67,6 +67,10 @@ async def build_probe_obj(body: Dict[str, Any], *, serving_chat: Any, serving_an
 
         keep = {k: payload[k] for k in ("text", "input_ids", "image_data", "extra_key", "lora_path")
                 if k in payload}
+        if "input_ids_b64" in payload:
+            # the TEXT-ONLY fast path: the front's exact ids (137/137 text prompts of rc14+rc15 matched D's count,
+            # every mismatch was an image request) -- D skips template and tokenizer, only its tree is asked
+            keep["input_ids"] = ids_from_b64(str(payload["input_ids_b64"])).tolist()
         obj = GenerateReqInput(rid=rid, sampling_params={"max_new_tokens": 1}, **keep)
     else:
         if path == "/v1/messages":
@@ -223,6 +227,31 @@ def nested_image_parts(payload: Any) -> int:
     except Exception:  # noqa: BLE001 -- a malformed body carries no image
         return 0
     return n
+
+
+def payload_has_any_media(payload: Any) -> bool:
+    """Any image/video/audio anywhere D would expand: a non-text content part, an image inside a ``tool_result``
+    block, or the native ``image_data`` / ``video_data`` / ``audio_data``. False = a text prompt, whose front count
+    equals D's (X-EXACT-TOKENS rc14+rc15: 137/137)."""
+    if not isinstance(payload, dict):
+        return False
+    for k in ("image_data", "video_data", "audio_data", "input_embeds"):
+        if payload.get(k):
+            return True
+    if nested_image_parts(payload):
+        return True
+    for m in payload.get("messages") or ():
+        c = m.get("content") if isinstance(m, dict) else None
+        if not isinstance(c, list):
+            continue
+        for part in c:
+            if not isinstance(part, dict):
+                return True
+            t = str(part.get("type") or "")
+            if t in ("text", "tool_use", "tool_result", "thinking", "redacted_thinking", "tool_reference"):
+                continue
+            return True
+    return False
 
 
 def seq_spans_ok(spans: Sequence[Sequence[int]], n: int) -> bool:

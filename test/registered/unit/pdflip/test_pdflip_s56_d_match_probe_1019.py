@@ -187,6 +187,8 @@ def test_front_prices_from_the_probe_and_routes_an_image_tail_to_p(caplog, monke
 
     f._store_probe_depth = store
     payload = _payload(100)
+    payload["messages"].append({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t", "content": [
+        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}]}]})
     with caplog.at_level(logging.INFO, logger="pdflip.front"):
         xx = asyncio.run(f._x_exact_price("pdflip-6-11", "/v1/messages", payload, "t", 3513, 97465))
     assert calls == [(dmp.PROBE_PATH, "/v1/messages")]
@@ -301,3 +303,62 @@ def test_ipc_roundtrip_of_the_probe_structs():
                                      mm_spans=[[0, 1]])
     o2 = IO.msgpack_decode(IO.msgpack_encode(o))
     assert o2.device_tokens == 1 and list(o2.input_ids) == [3] and o2.mm_spans == [[0, 1]]
+
+
+def test_a_text_prompt_asks_d_with_the_front_ids_and_media_goes_whole(caplog):
+    """Text: the front's ids ARE D's ids (rc14+rc15 X-EXACT-TOKENS 137/137) -- the probe follows the count and asks
+    only D's tree (``/generate`` with the ids). Media anywhere (also a tool_result image): D tokenizes the payload."""
+    from test_pdflip_front_x_exact import _FakeTokens, _front, _payload
+
+    f = _front(True)
+    f.ftok = _FakeTokens(4492)
+    f.session = object()
+    sent = []
+    n = 4492
+
+    async def post(g, b, timeout):
+        sent.append(b)
+        return 200, json.dumps({"success": True, "ids": dmp.ids_to_b64(np.arange(n) + 10), "device_tokens": 0,
+                                "host_tokens": 0, "key_match_depth": 0, "mm_spans": []})
+
+    f._d_probe_post = post
+    xx = asyncio.run(f._x_exact_price("pdflip-6-12", "/v1/messages", _payload(100), "t", 4492, 4492))
+    assert sent[0]["path"] == "/generate" and "input_ids_b64" in sent[0]["payload"]
+    assert dmp.ids_from_b64(sent[0]["payload"]["input_ids_b64"]).tolist() == (np.arange(n) + 10).tolist()
+    assert xx.pending == 4492
+    sent.clear()
+    img = {"model": "m", "max_tokens": 10, "messages": [{"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "t", "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}]}]}]}
+    asyncio.run(f._x_exact_price("r2", "/v1/messages", img, "t2", 10, 10))
+    assert sent[0]["path"] == "/v1/messages" and sent[0]["payload"] is img
+    assert dmp.payload_has_any_media(img) and not dmp.payload_has_any_media(_payload(10))
+
+
+def test_text_prompt_probe_asks_ds_tree_with_the_front_ids(caplog):
+    """A text prompt (no media anywhere): the front count IS D's count (rc14+rc15 X-EXACT-TOKENS 137/137), so the
+    probe follows the count with those ids (/generate, input_ids_b64) -- D tokenizes nothing a second time."""
+    from test_pdflip_front_x_exact import _FakeTokens, _front, _payload
+
+    f = _front(True)
+    f.ftok = _FakeTokens(4492)
+    f.session = object()
+    sent = {}
+
+    async def post(g, b, timeout):
+        sent.update(b)
+        ids = dmp.ids_from_b64(b["payload"]["input_ids_b64"])
+        return 200, json.dumps({"success": True, "ids": dmp.ids_to_b64(ids), "device_tokens": 0, "host_tokens": 0,
+                                "key_match_depth": 41, "mm_spans": []})
+
+    f._d_probe_post = post
+
+    async def store(rid, ids, timeout_s, extra_key=None):
+        return 0, "none"
+
+    f._store_probe_depth = store
+    xx = asyncio.run(f._x_exact_price("pdflip-6-12", "/v1/messages", _payload(100), "t", 5616, 5635))
+    assert sent["path"] == "/generate" and sent["payload"]["rid"] == "pdflip-6-12"
+    assert dmp.ids_from_b64(sent["payload"]["input_ids_b64"]).tolist() == (np.arange(4492) + 10).tolist()
+    assert xx.pending == 4492 and xx.src == "d_probe_none" and xx.image_in_tail is False
+    assert not dmp.payload_has_any_media(_payload(100))
