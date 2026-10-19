@@ -274,6 +274,22 @@ def rows_cap(post_mib: float, rate: float, page_size: int) -> int:
     return max(page, (rows // page) * page)
 
 
+def chunk_need_mib(rank: int, rows: int) -> Optional[float]:
+    """S78 KEEP-SHORT: what an extend of ``rows`` rows costs the card by the rc12g
+    chunk model -- the inverse of :func:`rows_cap`: ``300 + rate x rows`` MiB with
+    the rate the width vote uses on this rank (start rate or the measured one x
+    RATE_SAFETY, :func:`effective_rate`). ``None`` when this rank has no rate (no
+    vote, no price: nothing is guessed)."""
+    try:
+        rate = threshold_for(int(rank), rates())
+        if rate is None or rate <= 0:
+            return None
+        rate = effective_rate(rate, int(rank))
+        return CHUNKING_FLOOR_MIB + float(rate) * max(0, int(rows))
+    except Exception:  # noqa: BLE001 -- an unpriced extend is priced by nobody
+        return None
+
+
 def width_vote(cuda, rank: int, configured: int, page_size: int, pending: bool,
                clock=time.perf_counter) -> Optional[int]:
     """This rank's vote for the group's chunk width, ``None`` = no vote.

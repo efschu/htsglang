@@ -265,6 +265,7 @@ from flliper.srt.pdflip import d_transient_lend as _pdflip_d_transient_lend  # D
 from flliper.srt.pdflip import d_seat_rewake as _pdflip_d_seat_rewake  # D-SEAT-REWAKE: live seat re-plan
 from flliper.srt.pdflip import skip_first as _pdflip_skip_first  # E2 in a mixed wake cohort
 from flliper.srt.pdflip import d_decode_gap as _pdflip_d_decode_gap  # S48 D-DECODE-GAP instrument
+from flliper.srt.layers.moe import em_fetch_probe as _em_fetch_probe  # S78 EM-FETCH instrument
 from flliper.srt.layers.dcp import prefix_lens_check as _prefix_lens_check  # #639 ballot (skip: deferred)
 from flliper.srt.pdflip import short_read as _pdflip_short_read  # held short wake reads
 from flliper.srt.pdflip import tail_adopt as _pdflip_tail_adopt
@@ -19839,7 +19840,10 @@ class Scheduler(
         # that can enter a collective (a skip batch runs none)
         if _prefix_lens_check.has_deferred() and not getattr(batch, "pdflip_skip_extend", False):
             _prefix_lens_check.resolve_deferred()
-        return self._run_batch_forward(batch, pp_proxy_tensors)
+        result = self._run_batch_forward(batch, pp_proxy_tensors)
+        # S78 D-DECODE-GAP: the run wall of a decode-advancing batch (a MIXED-D forward blocks to its end)
+        _pdflip_d_decode_gap.on_run_end(self, batch)
+        return result
 
     def _run_batch_forward(
         self,
@@ -19853,6 +19857,8 @@ class Scheduler(
         # forward progress off a 32-byte mmap -- a busy group is not a dead one.
         _pdflip_beacon.beat_start(self.forward_ct)
         self._pdflip_d_seat_guard(batch)  # H95c W-SEAT: never wider than the phase's n
+        # S78 EM-FETCH: close the previous forward's EM copy record, log the completed ones (no sync)
+        _em_fetch_probe.on_forward(self.forward_ct)
         if self.pdflip_d_lead_probe is not None and batch.forward_mode.is_extend():
             self.pdflip_d_lead_probe.note_extend(
                 rids=[req.rid for req in batch.reqs],

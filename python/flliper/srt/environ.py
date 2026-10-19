@@ -4120,6 +4120,25 @@ class Envs:
     FLLIPER_PDFLIP_D_LEND_STEP_ROWS = EnvInt(4)
     #   Decode rounds in a row before a lend (a burst of extends lends nothing).
     FLLIPER_PDFLIP_D_LEND_SETTLE_ROUNDS = EnvInt(8)
+    #   S78 (19.10., Grundgesetz VRAM=Experten): a SHORT extend (the front's R2
+    #   class, u < halbX) gives back only the lent cells its activation needs --
+    #   the rc12g chunk model's own price (300 MiB + rate x rows over the lend
+    #   floor) -- and keeps the rest ON through the mixed forward. rc17 D
+    #   (1019_171636), all three ranks: a short mixed extend grew the allocator
+    #   by <= 65-437 MiB (T < 1024) while the full return left 2.0-2.2 GiB free
+    #   (p50) at its start, and every return cost a re-lend of ~300 ms decode
+    #   pause after it. Big or unpriced extends (and a rank without a chunk
+    #   rate) return everything as before. False = the full return, byte for
+    #   byte.
+    FLLIPER_PDFLIP_D_LEND_KEEP_SHORT = EnvBool(True)
+    # S78 EM-FETCH (19.10.): per EAGER-DEVICE-EM forward and rank, the rows
+    #   and bytes the pool steps copied host->device and the device time of
+    #   those copies (CUDA events around copy_rows) beside the device time of
+    #   the whole MoE EM span -- the split of a mixed D round into expert H2D
+    #   and the rest, read without a sync (event query + pinned non-blocking
+    #   D2H, logged a forward later). Rank-local, no collective, every rank
+    #   (the pacer of a forward is the slowest link). False = no event, no line.
+    FLLIPER_PDFLIP_EM_FETCH = EnvBool(True)
     # 29.09. (Nutzer 12:35Z, Grundgesetz): KV stages BELOW the booked S0 at this
     #   granularity (floor, 2 x floor, ... < S0, e.g. 32768). The plan still
     #   books S0; the KV between the floor and S0 is born unmapped and funds

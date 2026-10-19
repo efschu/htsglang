@@ -2195,6 +2195,58 @@ class SeatVram:
                        rows_from=cur, rows_to=base, mamba_keep=self.mamba_keep, order="return")
         return cur - base
 
+    def unlend_target(self, need_free_bytes: int, free_bytes: int) -> int:
+        """S78 KEEP-SHORT: the largest lattice k in ``[lent_from, rows_on]`` whose
+        release leaves the card at least ``need_free_bytes`` free -- the cells
+        above k go back, the rows up to k stay ON (pure arithmetic, no CUDA; the
+        mirror of :meth:`lend_target`). ``rows_on`` when the card already holds
+        the need, ``lent_from`` when no lent cell can stay; ``rows_on`` with
+        nothing lent."""
+        cur = int(self.rows_on)
+        if self.lent_from is None:
+            return cur
+        base = int(self.lent_from)
+        if int(free_bytes) >= int(need_free_bytes):
+            return cur
+        have = self._bank_bytes_at(cur)
+        best = base
+        for c in self.row_cut_ks:
+            if c <= base or c >= cur:
+                continue
+            if int(free_bytes) + (have - self._bank_bytes_at(c)) >= int(need_free_bytes):
+                best = max(best, int(c))
+        return best
+
+    def unlend_to(self, k: int) -> int:
+        """S78 KEEP-SHORT: give back only the lent cells above lattice row ``k``
+        (rows OFF coldest first, sync, the cells released -- :meth:`unlend`'s
+        order and plans, cut at ``k`` instead of the phase's rows). The lend
+        stays open (``lent_from`` kept) while rows above the phase remain;
+        ``k <= lent_from`` is the full :meth:`unlend`. Returns the rows given back."""
+        if self.lent_from is None:
+            return 0
+        base = int(self.lent_from)
+        cur = int(self.rows_on)
+        k = int(k)
+        if k <= base:
+            return self.unlend()
+        if k >= cur:
+            return 0
+        live = self._bank_live()
+        plans = [(m, self.bank_spans(m, k), live) for m in self.row_tensors]
+        self.refuse_wipes([(m.ptr, m.geom.name, sp, lv) for m, sp, lv in plans])
+        self._rows_off_live(k, live)
+        census = {"kept": 0, "freed": 0, "mapped": 0, "tensors": 0}
+        self._set_bank_plans(plans, census)
+        self.evicted_rows += cur - k
+        self.returned_rows += cur - k
+        self.rows_on = k
+        applied = self.applied
+        log_live_spans(census, n=applied.n if applied is not None else 0,
+                       stage=applied.stage if applied is not None else None,
+                       rows_from=cur, rows_to=k, mamba_keep=self.mamba_keep, order="return-short")
+        return cur - k
+
     def apply(self, n: int) -> PhaseApplied:
         """The pages of a phase of ``n`` seats (``n`` = cap: the cap form).
         Called BEFORE the saver resumes the tag of a paused allocation (its
