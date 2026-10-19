@@ -394,12 +394,23 @@ def _note_turn_twin_steps(batch: Any, desc: Optional[TurnTracks], req: Any, row:
         if _log_due(n):
             logger.info("PDFLIP TURN-ANCHOR SKIP rid=%s reason=no_free_slot turn=%d "
                         "step=[%d,%d) (n=%d; no eviction, no reserve)", rid, t, prefix, end, n)
+        # S52: a twin boundary booked at this very position (``_note_twin_steps``: "the
+        # turn track writes it") is NOT written now -- no promise is left standing on it
+        from flliper.srt.pdflip import twin_anchor as _tw
+
+        if _tw.status(rid, t) == "planned":
+            _tw.note_declined(rid, t)
         return desc
     if desc is None:
         desc = TurnTracks(len(batch.reqs), need=slot_state_kinds(batch.req_to_token_pool))
     # the slot stays a tensor: no device read on the scheduler thread
     desc.add(row, slot, t, prefix, end - prefix)
     setattr(req, PENDING_ATTR, (t, slot, desc, int(prefix), int(end)))
+    # S52 (pdflip-1-30): the turn anchor is a promise to every twin with shared > t, also
+    # one that reaches PP0 only after this step was planned (twin_anchor.deepest_track)
+    from flliper.srt.pdflip import twin_anchor as _tw
+
+    _tw.note_track_planned(rid, t)
     n = _count("planned")
     if _log_due(n):
         logger.info(
@@ -528,6 +539,10 @@ def _note_fork_step(batch: Any, desc: Optional[TurnTracks], req: Any, row: int,
         desc = TurnTracks(len(batch.reqs), need=slot_state_kinds(batch.req_to_token_pool))
     desc.add(row, slot, t, prefix, end - prefix)
     setattr(req, FORK_PENDING_ATTR, (t, slot, desc, int(prefix), int(end)))
+    # S52: the fork anchor is a promise to a later twin as well (twin_anchor.deepest_track)
+    from flliper.srt.pdflip import twin_anchor as _tw
+
+    _tw.note_track_planned(rid, t)
     n = _count("fork_planned")
     if _log_due(n):
         logger.info(

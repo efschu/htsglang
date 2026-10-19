@@ -68,6 +68,10 @@ THE RULE (PP0 only; switch ``FLLIPER_PDFLIP_P_TWIN_DEFER``, default off):
      nothing: no source with a promise -> the twin registers at once
      ('#TW TWIN-NO-COMMIT', at=intake or at=release -- a provisional promise
      is resolved at the source's first plan, one pass). Switch off: rule 4.
+     S52 (19.10., NF rc14 pdflip-1-30): the source's OWN turn / fork track at a
+     position in ``(s0, B]`` is a promise too -- it is written whether a twin
+     waits or not, and a twin reaching PP0 after the source's step was planned
+     finds no ``B`` booking (twin_anchor.deepest_track).
 
 RANK AGREEMENT. Nothing new is decided off PP0. A follower already holds
 every request until PP0's told arrives on the request wire (#1400,
@@ -411,6 +415,8 @@ PROMISE_END = "end"
 PROMISE_CHUNK = "chunk"
 PROMISE_BOUNDARY = "boundary"
 PROMISE_PROVISIONAL = "boundary?"
+#: S52: the source's own turn / fork track in (s0, B] (twin_anchor.deepest_track)
+PROMISE_TRACK = "track"
 
 
 def _planned_end(src) -> Optional[int]:
@@ -441,6 +447,14 @@ def _promise(st: "_State", src, shared: int) -> Optional[Tuple[str, int]]:
     status = _tw.status(rid, b)
     if status in ("planned", "written"):
         return PROMISE_BOUNDARY, b
+    # S52 (NF rc14 19.10., pdflip-1-30): the source's own TURN / FORK track at or below B
+    # (planned before the twin reached PP0, so never booked as B) is the anchor the twin
+    # resumes at -- 'TURN-ANCHOR INSERT rid=pdflip-1-28 at=18624' = B, yet TWIN-NO-COMMIT
+    # and 15552 tokens recomputed from the 3072 anchor. Every track lies inside a planned
+    # step, so above the source's start; ``s0`` bounds it where known.
+    t = _tw.deepest_track(rid, int(s0 or 0), b)
+    if t is not None:
+        return PROMISE_TRACK, t
     if status == "declined":
         return None
     fin = getattr(src, "finished", None)
@@ -471,8 +485,8 @@ def _say_no_commit(st: "_State", rid: str, w_shared: Dict[str, int], srcs, at: s
     if _say(st.n_no_gain):
         logger.info(
             "#TW TWIN-NO-COMMIT rid=%s at=%s sources=%s page=%d chunk=%d (n=%d): no "
-            "source promised an anchor <= shared (end, chunk end or twin boundary "
-            "track) -- registered as an ordinary request, no wait.",
+            "source promised an anchor <= shared (end, chunk end, twin boundary or "
+            "own turn/fork track) -- registered as an ordinary request, no wait.",
             rid, at,
             [(_rid(s), w_shared.get(_rid(s)), st.s0.get(_rid(s)),
               _tw_anchor_boundary(w_shared.get(_rid(s), 0), st.page)) for s in srcs],
