@@ -4749,6 +4749,73 @@ class HiCacheController:
                         len(self.prefetch_io_aux_threads), PREFETCH_IO_WORKERS_ENV)
         return self.prefetch_io_aux_threads
 
+    def _reduce_store_claim(self, operation, storage_hit_count: int) -> tuple:
+        """The prefetch thread's group claim reduce for ``operation``.
+
+        Returns ``(own_count, threshold_count)``: the tokens THIS rank reads
+        (from its own span start) and the group-uniform count the revoke
+        threshold is compared against. One collective per operation on every
+        rank, in the form agreed by ``_agree_claim_form`` -- unchanged.
+
+        S59 (rc15 D pdflip-26-100 & 9 more): under a Form A END frame
+        (``claim_end_frame``) every rank votes ``span start + claim`` and takes
+        back ``group END - its own start``; without a frame both returns are
+        the reduced count, byte for byte the old reduce.
+        """
+        from flliper.srt.managers import claim_end_frame as _cef
+
+        _frame = _cef.take_claim_end_frame(self, operation)
+        _local_count = int(storage_hit_count)
+        storage_hit_count = _cef.local_claim_vote(_frame, _local_count)
+        # fnFL2x22: the FORM is agreed over the group first (one
+        # scalar MAX), never read off this rank alone -- see
+        # CLAIM_VOTE_ABSTAIN for the boot that measured the mismatch.
+        if self._agree_claim_form(operation):
+            # #1233 L8: ONE collective carries min and max -- MIN over
+            # [count, -count] -- so a rank whose claim differs from
+            # the group's is a named STOP, not a silent MIN (Q11).
+            # A rank holding no bytes (Form A worker) abstains: it
+            # adopts the voters' MIN below instead of setting the MAX.
+            # #239 S3h: a KV worker under the token cut votes in the
+            # min arm only (claim_vote_min_only).
+            packed = torch.tensor(
+                encode_claim_vote(storage_hit_count, claim_vote_abstains(self),
+                                  min_only=claim_vote_min_only(self)),
+                dtype=torch.int,
+            )
+            self._all_reduce_prefetch_groups(packed, torch.distributed.ReduceOp.MIN)
+            _mn, _mx = decode_claim_vote(packed)
+            from flliper.srt.rank_role import form_a_token_cut_active as _cut_active
+
+            if _mn != _mx and _cut_active():
+                settle_claim_split(_mn, _mx, operation.request_id, cut_active=True)
+            elif _mn != _mx and operation.request_id in getattr(self, "pdflip_hold_rids", ()):
+                # #1461 (boot weg2xsn216): a probe issued for a request in
+                # the DORMANT HOLD reads a store that P is still writing --
+                # the ranks' probes land ms apart and differ (TP2 94207 vs
+                # 97870).  That is the one case where the inequality is the
+                # write-through's clock, not a divergent store: every rank
+                # adopts the group MIN (the same prefix on every rank) and
+                # the hold's top-up (#1456) fetches the rest.  Outside the
+                # hold the law stays STOP.
+                logger.warning("#1461 DRAFT-CLAIM MIN-ADOPTED rid=%s per_rank_claim=[%d, %d] (hold-time probe, "
+                               "store in flux; every rank proceeds with %d)", operation.request_id, _mn, _mx, _mn)
+            else:
+                assert_draft_claims_agree(_mn, _mx, operation.request_id)
+            storage_hit_count = int(_mn)
+        else:
+            storage_hit_count_tensor = torch.tensor(
+                storage_hit_count, dtype=torch.int
+            )
+            self._all_reduce_prefetch_groups(
+                storage_hit_count_tensor, torch.distributed.ReduceOp.MIN
+            )
+            storage_hit_count = storage_hit_count_tensor.item()
+        _own, _thr = _cef.adopt_group_claim(_frame, int(storage_hit_count), _local_count)
+        _cef.note_line(logger, getattr(operation, "request_id", "?"), _frame, _local_count,
+                       int(storage_hit_count), _own, _thr)
+        return _own, _thr
+
     def prefetch_thread_func(self):
         """
         Manage prefetching operations from storage backend to host memory.
@@ -4778,57 +4845,19 @@ class HiCacheController:
                 hash_value, storage_hit_count = self._storage_hit_query(operation)
                 # #257 (a): hold what the probe reports until the read
                 probe_hold_pin(self, operation, hash_value, storage_hit_count)
-                # fnFL2x22: the FORM is agreed over the group first (one
-                # scalar MAX), never read off this rank alone -- see
-                # CLAIM_VOTE_ABSTAIN for the boot that measured the mismatch.
-                if self._agree_claim_form(operation):
-                    # #1233 L8: ONE collective carries min and max -- MIN over
-                    # [count, -count] -- so a rank whose claim differs from
-                    # the group's is a named STOP, not a silent MIN (Q11).
-                    # A rank holding no bytes (Form A worker) abstains: it
-                    # adopts the voters' MIN below instead of setting the MAX.
-                    # #239 S3h: a KV worker under the token cut votes in the
-                    # min arm only (claim_vote_min_only).
-                    packed = torch.tensor(
-                        encode_claim_vote(storage_hit_count, claim_vote_abstains(self),
-                                          min_only=claim_vote_min_only(self)),
-                        dtype=torch.int,
-                    )
-                    self._all_reduce_prefetch_groups(packed, torch.distributed.ReduceOp.MIN)
-                    _mn, _mx = decode_claim_vote(packed)
-                    from flliper.srt.rank_role import form_a_token_cut_active as _cut_active
-
-                    if _mn != _mx and _cut_active():
-                        settle_claim_split(_mn, _mx, operation.request_id, cut_active=True)
-                    elif _mn != _mx and operation.request_id in getattr(self, "pdflip_hold_rids", ()):
-                        # #1461 (boot weg2xsn216): a probe issued for a request in
-                        # the DORMANT HOLD reads a store that P is still writing --
-                        # the ranks' probes land ms apart and differ (TP2 94207 vs
-                        # 97870).  That is the one case where the inequality is the
-                        # write-through's clock, not a divergent store: every rank
-                        # adopts the group MIN (the same prefix on every rank) and
-                        # the hold's top-up (#1456) fetches the rest.  Outside the
-                        # hold the law stays STOP.
-                        logger.warning("#1461 DRAFT-CLAIM MIN-ADOPTED rid=%s per_rank_claim=[%d, %d] (hold-time probe, "
-                                       "store in flux; every rank proceeds with %d)", operation.request_id, _mn, _mx, _mn)
-                    else:
-                        assert_draft_claims_agree(_mn, _mx, operation.request_id)
-                    storage_hit_count = int(_mn)
-                else:
-                    storage_hit_count_tensor = torch.tensor(
-                        storage_hit_count, dtype=torch.int
-                    )
-                    self._all_reduce_prefetch_groups(
-                        storage_hit_count_tensor, torch.distributed.ReduceOp.MIN
-                    )
-                    storage_hit_count = storage_hit_count_tensor.item()
+                # S59: the claim reduce lives in `_reduce_store_claim` -- in END
+                # coordinates under a Form A frame (`claim_end_frame`), so a
+                # worker never applies the host's page COUNT from its own start.
+                storage_hit_count, _claim_threshold_count = HiCacheController._reduce_store_claim(
+                    self, operation, storage_hit_count
+                )
                 # #1157: the probe has ANSWERED (rank-uniform after the MIN).
                 # Stamped before the threshold branch so a revoke and a
                 # transfer both carry it; a reap that finds None was ahead of
                 # the probe.
                 operation.probed_hit_tokens = int(storage_hit_count)
 
-                if storage_hit_count < revoke_threshold(self, operation):
+                if _claim_threshold_count < revoke_threshold(self, operation):
                     # not to prefetch if not enough benefits
                     # (PARK-RETAIN READ: a read the caller priced below the
                     # threshold keeps its own floor, managers/pdflip_min_hit.py)
