@@ -183,20 +183,92 @@ def test_f1_r2_a_kurz_arrival_never_waits_for_a_reprobe(monkeypatch, caplog):
 
 
 def test_f1_a_d_that_never_answers_does_not_hang_the_set(monkeypatch, caplog):
-    """Hänger guard: no answer -> bounded by the probe deadline, named SET-REPROBE-FAILED, the set decides."""
+    """Hänger guard + S63r A1 (planner): no answer -> bounded by the probe deadline, named SET-REPROBE-FAILED -- and the
+    verdict does NOT stand on the older number: the member goes to D's own admission (it measures exactly, X-GATE
+    W31/W123 requeue with D's extent), exactly as an UNPRICED arrival (S56r A1). No flip, no second re-probe, no hold."""
     _on(monkeypatch)
     monkeypatch.setenv("FLLIPER_PDFLIP_D_MATCH_PROBE_DEADLINE_MS", "200")
     monkeypatch.setenv("FLLIPER_PDFLIP_FRONT_EXACT_TIMEOUT_MS", "100")
     f = _fx()
-    f.queue = [_pending("big", N_BIG, time.time() - 4.6)]
+    p = _pending("big", N_BIG, time.time() - 4.6)
+    p.d_eligible, p.x_routed = False, N_BIG - 1
+    f.queue = [p]
     _book(f, "big", N_BIG, 0, age_s=4.6)
-    _FakeD({"big": 0}, hang=True).install(monkeypatch)
+    d = _FakeD({"big": 0}, hang=True).install(monkeypatch)
     t0 = time.time()
     with caplog.at_level(logging.INFO, logger="pdflip.front"):
-        out = asyncio.run(asyncio.wait_for(_drive(f, 4.0), 5.0))
-    assert out[-1] == "P" and time.time() - t0 < 3.0, (out, time.time() - t0)
-    assert f.counters["set_reprobe_failed"] == 1
-    assert any("PDFLIP SET-REPROBE-FAILED rid=big" in r.getMessage() for r in caplog.records)
+        out = asyncio.run(asyncio.wait_for(_drive(f, 3.0), 5.0))
+    assert "P" not in out and time.time() - t0 < 4.0, (out, time.time() - t0)
+    assert out[-1] is None, out          # the set is empty: the member is D's admission's now, nothing holds
+    assert f.counters["set_reprobe_failed"] == 1 and f.counters["set_reprobe_unpriced"] == 1
+    assert f.counters["set_flip_p"] == 0 and f.counters["set_park_no_seat"] == 0
+    assert p.est_uncached == 0 and p.d_eligible is True and p.x_routed == 0 and p.p_only is False
+    assert "big" not in f.__dict__["_reprobe_book"]
+    assert [a[0] for a in d.asked] == ["big"], d.asked     # asked once: no loop on a D that does not answer
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("PDFLIP SET-REPROBE-FAILED rid=big" in m and "route=d_admission" in m for m in msgs), msgs
+    assert f._set_st()["go_p"] == set()
+
+
+def test_a1_a_failed_halb_short_is_released_to_ds_admission(monkeypatch, caplog):
+    """S63r A1 for a waiting halb SHORT: no new exact number -> released to D (its seat path, D's admission measures)."""
+    _on(monkeypatch)
+    monkeypatch.setenv("FLLIPER_PDFLIP_D_MATCH_PROBE_DEADLINE_MS", "200")
+    monkeypatch.setenv("FLLIPER_PDFLIP_FRONT_EXACT_TIMEOUT_MS", "100")
+    f = _fx()
+    f._set_st()["shorts"]["h"] = (time.time() - 4.6, 3200, X)
+    f._set_st()["shorts"]["h2"] = (time.time() - 4.6, 3300, X)   # S=6500 >= X: R3 would flip -- on old numbers
+    _book(f, "h", 3200, 0, age_s=4.6)
+    _book(f, "h2", 3300, 0, age_s=4.6)
+    _FakeD({"h": 0, "h2": 0}, hang=True).install(monkeypatch)
+    with caplog.at_level(logging.INFO, logger="pdflip.front"):
+        out = asyncio.run(asyncio.wait_for(_drive(f, 3.0), 5.0))
+    assert "P" not in out, out
+    st = f._set_st()
+    assert st["released"] == {"h": "D", "h2": "D"} and st["shorts"] == {}
+    assert f.counters["set_reprobe_unpriced"] == 2 and not st["go_p"]
+
+
+def test_a1_a_member_p_by_state_keeps_ds_admission_number(monkeypatch, caplog):
+    """A member D's admission already refused over X (x_requeues: its number IS D's admission measurement, S56r B2) cannot
+    go back to D's admission (the second W31 is terminal, W35): it stays P's, named, and is not asked again."""
+    _on(monkeypatch)
+    monkeypatch.setenv("FLLIPER_PDFLIP_D_MATCH_PROBE_DEADLINE_MS", "200")
+    monkeypatch.setenv("FLLIPER_PDFLIP_FRONT_EXACT_TIMEOUT_MS", "100")
+    f = _fx()
+    p = _pending("rq", N_BIG, time.time() - 4.6)
+    p.x_requeues = 1
+    f.queue = [p]
+    _book(f, "rq", N_BIG, 0, age_s=4.6)
+    d = _FakeD({"rq": 0}, hang=True).install(monkeypatch)
+    with caplog.at_level(logging.INFO, logger="pdflip.front"):
+        out = asyncio.run(asyncio.wait_for(_drive(f, 3.0), 5.0))
+    assert out[-1] == "P", out
+    assert p.est_uncached == N_BIG and p.x_requeues == 1 and f.counters["set_reprobe_unpriced"] == 0
+    assert [a[0] for a in d.asked] == ["rq"]
+    assert any("PDFLIP SET-REPROBE-FAILED rid=rq" in r.getMessage() and "route=p_by_state" in r.getMessage()
+               for r in caplog.records)
+
+
+def test_f1_a_slow_store_read_costs_one_round_never_a_loop(monkeypatch, caplog):
+    """S63r: the number is stamped at D's answer, the store read follows -- a store read (or a slower member) longer
+    than _FRESH_MS made the fresh number "old" again at the look that asked for it: the set re-probed forever. Now the
+    verdict is made on the round that landed: ONE round, then the verdict."""
+    _on(monkeypatch)
+    f = _fx()
+    f.queue = [_pending("big", N_BIG, time.time() - 4.6)]
+    _book(f, "big", N_BIG, 0, age_s=4.6)
+    d = _FakeD({"big": 0}).install(monkeypatch)
+
+    async def slow_store(self_f, rid, ids, timeout_s, extra_key=None):
+        await asyncio.sleep(0.7)
+        return 0, "none"
+
+    monkeypatch.setattr(F.Front, "_store_probe_depth", slow_store)
+    with caplog.at_level(logging.INFO, logger="pdflip.front"):
+        out = asyncio.run(asyncio.wait_for(_drive(f, 3.0), 5.0))
+    assert out[-1] == "P", (out[-5:], len(d.asked))
+    assert len(d.asked) == 1 and f.counters["set_reprobe_begin"] == 1, d.asked
 
 
 def test_f1_the_queue_sum_verdict_is_gated_too(monkeypatch):
@@ -263,6 +335,7 @@ class _Obj:
     def __init__(self, rid, text="t", image_data=None):
         self.rid, self.text, self.input_ids, self.image_data = rid, text, None, image_data
         self.video_data = self.audio_data = self.mm_hashes = self.modalities = self.input_embeds = None
+        self.sampling_params = None
 
 
 def test_f2_digest_identity():
@@ -386,3 +459,110 @@ def test_f2_front_posts_ahead_to_p_only_for_a_media_prompt_that_can_reach_p(monk
     assert asyncio.run(run()) == [True, False, False, True, False]
     assert sorted(sent) == ["a", "d"]
     assert envs.FLLIPER_PDFLIP_TOK_AHEAD.default is True
+
+
+# ---------------------------------------------------------------------------------------------------------- S63r F2
+
+class _T:
+    """A tensor stand-in with ``nbytes``."""
+
+    def __init__(self, nbytes):
+        self.nbytes = nbytes
+
+
+def _mm(*sizes):
+    return types.SimpleNamespace(mm_items=[types.SimpleNamespace(feature=_T(n), precomputed_embeddings=None)
+                                           for n in sizes])
+
+
+def test_s63r_byte_cap_evicts_the_oldest_and_never_keeps_an_oversized_entry():
+    """Host RAM (earlyoom, the flip's storm): the entries are bounded in BYTES, not only in count."""
+    async def run():
+        ta = tah.TokAhead(keep=8, ttl_s=60.0, max_bytes=1000)
+        assert ta.put("a", "d", [1], _mm(400), None, 1.0, "p_ahead")
+        assert ta.put("b", "d", [1], _mm(400), None, 1.0, "p_ahead")
+        assert ta.put("c", "d", [1], _mm(400), None, 1.0, "p_ahead")    # 1224 > 1000: "a" goes
+        assert not ta.has("a") and ta.has("b") and ta.has("c") and ta.bytes <= 1000
+        fut = ta.begin("big", "d")
+        assert ta.put("big", "d", [1], _mm(5000), None, 1.0, "p_ahead") is False
+        assert not ta.has("big") and fut.done() and fut.result() is False   # a waiting leg tokenizes itself
+        assert ta.counters["too_big"] == 1 and ta.counters["evicted"] == 1
+        e, _ = await ta.take("b", "d")
+        assert e is not None and ta.bytes == 408
+        ta.discard("c")
+        assert ta.bytes == 0 and not ta.has("c")
+
+    asyncio.run(run())
+
+
+def test_s63r_the_ttl_is_swept_without_further_traffic():
+    async def run():
+        ta = tah.TokAhead(keep=8, ttl_s=0.05, max_bytes=0)
+        ta.put("a", "d", [1], _mm(10), None, 1.0, "p_ahead")
+        await asyncio.sleep(0.3)
+        return ta
+
+    ta = asyncio.run(run())
+    assert not ta._done and ta.bytes == 0 and ta.counters["expired"] == 1
+
+
+def test_s63r_digest_covers_every_field_a_processor_reads():
+    """A false reuse is a wrong answer: internvl's dynamic patches, whisper's language (popped from sampling_params)."""
+    a = _Obj("pdflip-1-1", "hello", ["data:image/png;base64," + "A" * 500])
+    b = _Obj("pdflip-1-1", "hello", ["data:image/png;base64," + "A" * 500])
+    b.image_max_dynamic_patch = 6
+    c = _Obj("pdflip-1-1", "hello", ["data:image/png;base64," + "A" * 500])
+    c.sampling_params = {"max_new_tokens": 99, "language": "de"}
+    d = _Obj("pdflip-1-1", "hello", ["data:image/png;base64," + "A" * 500])
+    d.sampling_params = {"max_new_tokens": 1}      # the probe's own sampling: no tokenizing key -> same identity
+    assert tah.obj_digest(a) != tah.obj_digest(b)
+    assert tah.obj_digest(a) != tah.obj_digest(c)
+    assert tah.obj_digest(a) == tah.obj_digest(d)
+
+
+def test_s63r_a_towerless_d_caches_no_pixels():
+    class Item:
+        def __init__(self):
+            self.feature, self.pad_value = _T(10 ** 8), None
+
+        def set_pad_value(self):
+            self.pad_value = 7
+
+    mm = types.SimpleNamespace(mm_items=[Item()])
+    sched, cache = tah.d_cache_mm(mm, towerless=True)
+    assert cache is sched and cache.mm_items[0].feature is None and cache.mm_items[0].pad_value == 7
+    assert tah.entry_bytes([1, 2], cache) == 16
+    sched2, cache2 = tah.d_cache_mm(mm, towerless=False)
+    assert cache2 is mm and sched2.mm_items[0].feature is None and mm.mm_items[0].feature is not None
+
+
+def test_s63r_no_ahead_and_no_cache_with_features_on_the_card(monkeypatch):
+    from flliper.srt.multimodal.processors import base_processor as bp
+
+    monkeypatch.setattr(bp, "mm_frontend_gpu_enabled", lambda: True)
+    assert "card" in tah.gpu_side_reason()
+    monkeypatch.setattr(bp, "mm_frontend_gpu_enabled", lambda: False)
+    assert tah.gpu_side_reason() == ""
+
+
+def test_s63r_a_handoff_leg_drops_the_probe_entry(monkeypatch):
+    tmm, tm = _tm(monkeypatch)
+    probe = tmm.GenerateReqInput(rid="pdflip-7-7~probe", text="hi", image_data=["data:x" + "Q" * 400])
+    tm.pdflip_tok_ahead.put(probe.rid, tah.obj_digest(probe), [5, 6, 7], _mm(100), None, 640.0, "d_probe")
+    monkeypatch.setattr(tmm, "_pdflip_handoff_ids", lambda obj: [1, 2, 3])
+    leg = tmm.GenerateReqInput(rid="pdflip-7-7", text="hi", image_data=["data:x" + "Q" * 400])
+    assert asyncio.run(tm._pdflip_tok_ahead_take(leg)) is None
+    assert not tm.pdflip_tok_ahead.has("pdflip-7-7") and tm.pdflip_tok_ahead.bytes == 0
+
+
+def test_s63r_ahead_tokenizations_in_flight_are_bounded():
+    async def run():
+        ta = tah.TokAhead()
+        assert not ta.busy()
+        ta.begin("a", "d")
+        ta.begin("b", "d")
+        assert ta.busy()
+        ta.fail("a")
+        assert not ta.busy()
+
+    asyncio.run(run())

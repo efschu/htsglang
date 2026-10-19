@@ -327,6 +327,11 @@ class ReprobeEntry:
     price: Optional["ExactPrice"] = None
     #: monotonic stamp of a re-probe that got no exact number (no new attempt for this rid inside the probe deadline)
     failed_t: Optional[float] = None
+    #: S63r: monotonic stamp at which the re-probe round that produced the current number LANDED (all its members
+    #: answered, the store read). The verdict that asked for the round is made on it -- it is the newest number that
+    #: exists for this decision; without this stamp a store read or a slower member > _FRESH_MS made the number
+    #: "old" again at the very look it was asked for, and the set re-probed forever (no verdict, a hang)
+    landed: Optional[float] = None
 
     @property
     def n(self) -> int:

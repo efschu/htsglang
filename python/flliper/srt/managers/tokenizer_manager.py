@@ -567,13 +567,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.pdflip_tok_ahead = TokAhead(
             keep=envs.FLLIPER_PDFLIP_TOK_AHEAD_ENTRIES.get(),
             ttl_s=envs.FLLIPER_PDFLIP_TOK_AHEAD_TTL_S.get(),
+            max_bytes=max(0, envs.FLLIPER_PDFLIP_TOK_AHEAD_MAX_MIB.get()) << 20,
         )
         logger.info(
-            "PDFLIP TOK-AHEAD armed group=%s entries=%d ttl_s=%.0f (S63 F2: the leg takes the probe's / the ahead "
-            "tokenization of its own media prompt when the digest matches)",
+            "PDFLIP TOK-AHEAD armed group=%s entries=%d ttl_s=%.0f max_mib=%d (S63 F2: the leg takes the probe's / the "
+            "ahead tokenization of its own media prompt when the digest matches)",
             os.environ.get("FLLIPER_PDFLIP_GROUP", ""),
             self.pdflip_tok_ahead.keep,
             self.pdflip_tok_ahead.ttl_s,
+            self.pdflip_tok_ahead.max_bytes >> 20,
         )
 
     async def _pdflip_tok_ahead_take(self, obj):
@@ -592,7 +594,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         ):
             return None
         if obj.input_ids is None and _pdflip_handoff_ids(obj) is not None:
-            # #1442: P tokenised this prompt for the hand-off -- P's ids are the KV's key, they win
+            # #1442: P tokenised this prompt for the hand-off -- P's ids are the KV's key, they win (S63r: the probe's
+            # entry is dropped now, not left to the TTL)
+            ta.discard(rid)
             return None
         t0 = time.perf_counter()
         e, why = await ta.take(rid, _tah.obj_digest(obj))

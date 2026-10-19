@@ -12227,6 +12227,11 @@ class Front:
             e = book.get(str(r))
             if e is None or now_m - float(e.t) <= fresh:
                 continue
+            # S63r: a number from the re-probe round that LANDED inside the window is the newest that exists for this
+            # decision (the round was asked FOR it) -- D's answer is stamped before the store read, so without this a
+            # store read or a slower member > _FRESH_MS re-opened the round at every look: no verdict, ever
+            if e.landed is not None and now_m - float(e.landed) <= fresh:
+                continue
             if e.failed_t is not None and now_m - float(e.failed_t) <= dead:
                 continue
             out.append(str(r))
@@ -12315,20 +12320,19 @@ class Front:
         except asyncio.TimeoutError:
             got = [(None, "bound %.1f s" % bound)] * len(items)
         moved = 0
+        t_landed = time.monotonic()
         for (rid, e), res in zip(items, got):
             if isinstance(res, BaseException):
                 res = (None, "%s: %s" % (type(res).__name__, str(res)[:160]))
             val, why = res
             if val is None:
-                e.failed_t = time.monotonic()
+                e.failed_t = t_landed
                 self.counters["set_reprobe_failed"] += 1
-                logger.warning("PDFLIP SET-REPROBE-FAILED rid=%s site=%s why=%s age_ms=%.0f -- no new exact D number "
-                               "for this member; its number stays D's last exact number (age named), not asked again "
-                               "for %.0f s (S63 F1, a defect class with its cause: P3)", rid, site, why,
-                               (time.monotonic() - float(e.t)) * 1000.0, Front._reprobe_bound_s())
+                Front._set_reprobe_unpriced(self, rid, e, why, site)
                 continue
             ans, store, t_ans = val
             moved += int(Front._set_reprobe_apply(self, rid, e, ans, store, t_ans, site))
+            e.landed = t_landed  # S63r: the verdict that asked for this round is made on it (no second round)
         logger.info("PDFLIP SET-REPROBE done site=%s n=%d moved=%d failed=%d wall_ms=%.1f (S63 F1: the set's verdict is "
                     "made again on these numbers)", site, len(items), moved,
                     sum(1 for r in got if isinstance(r, BaseException) or r[0] is None),
@@ -12340,6 +12344,60 @@ class Front:
         except Exception:  # noqa: BLE001 -- no loop / a partial front: the next tick decides
             pass
         return moved
+
+    def _set_reprobe_unpriced(self, rid: str, e: "_dmp.ReprobeEntry", why: str, site: str) -> str:
+        """S63r A1 (planner decision 19.10., user 19.10. "warum wird irgendwas geschätzt?"): a member whose re-probe got
+        NO new exact number is NOT decided on its older number. Like an UNPRICED arrival (S56r A1, ``_x_unpriced``) it
+        goes to D's own admission, which measures exactly (X-GATE: over X -> W31/W50 requeue WITH D's extent, an image in
+        the uncached tail -> W123 requeue as P-only): ``est_uncached`` 0 is only the ROUTE, never a price; a waiting halb
+        SHORT is released to D (its seat path). It leaves the set -- no flip, no hold, no second re-probe (the key is
+        dropped: it is unpriced now, like an arrival without a probe). A D that does not answer at all is a D outage:
+        the existing outage path (watchdog / group stop) owns it, not a verdict on an old number.
+
+        Not movable: a member P must serve BY STATE (D's admission already refused it over X -- ``x_requeues``, its
+        number IS D's admission measurement, S56r B2, and a second W31 is terminal, W35 --, a leg-2 reroute, a lost
+        hand-off, an intake stall, a leg 1 done or skipped). It stays P's on D's admission number, named
+        ``route=p_by_state``. Returns the route named in the line."""
+        book = self.__dict__.get("_reprobe_book")
+        if book is not None:
+            book.pop(str(rid), None)
+        routes = []
+        for p in self.queue:
+            if p.rid != rid or p.fut.done():
+                continue
+            _g = lambda k, d=0: getattr(p, k, d)  # noqa: E731 -- partial test doubles
+            if (_g("x_requeues") or _g("reroutes") or _g("handoff_lost_reroutes") or _g("intake_stalled", False)
+                    or _g("leg1_done", False) or _g("skip_leg1", False)):
+                routes.append("p_by_state")
+                self.counters["set_reprobe_failed_p_by_state"] += 1
+                continue
+            p.est_uncached = 0          # the ROUTE to D's admission (S56r A1), not a price
+            p.d_eligible = True
+            p.p_only = False            # R9 is D's admission's call now (W123 requeue on an image in the tail)
+            p.x_routed = 0
+            p.x_deferred = False
+            p.probe_priced = True       # no ledger reprice of an unpriced entry either (S56r A1)
+            p.reprobe_unpriced = True
+            routes.append("d_admission")
+            self.counters["set_reprobe_unpriced"] += 1
+        st = self._set_st()
+        if rid in st["shorts"]:
+            st["shorts"].pop(rid, None)
+            st["released"][rid] = "D"   # its seat path: D's admission measures it
+            routes.append("d_admission")
+            self.counters["set_reprobe_unpriced"] += 1
+        route = "+".join(routes) or "gone"
+        d_down = why.startswith("no exact D number") or why.startswith("bound")
+        logger.warning("PDFLIP SET-REPROBE-FAILED rid=%s site=%s why=%s age_ms=%.0f route=%s -- no new exact D number "
+                       "for this member: NOT decided on its older number (S63r A1); %s", rid, site, why,
+                       (time.monotonic() - float(e.t)) * 1000.0, route,
+                       ("it goes to D's own admission, which measures exactly (X-GATE W31 / W123 requeue with D's "
+                        "extent), as an UNPRICED arrival (S56r A1)" if "d_admission" in route else
+                        "P serves it by state on D's admission number (D refused it already; a second W31 is "
+                        "terminal)" if "p_by_state" in route else "the member left meanwhile")
+                       + ("; D did not answer: a D outage is the watchdog's / group stop's, not this verdict's"
+                          if d_down else ""))
+        return route
 
     def _set_reprobe_apply(self, rid: str, e: "_dmp.ReprobeEntry", ans: "_dmp.ProbeAnswer", store: int,
                            t_ans: float, site: str) -> bool:

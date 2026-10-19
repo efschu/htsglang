@@ -1533,13 +1533,17 @@ async def pdflip_match_probe(raw_request: Request):
         _ta = getattr(tm, "pdflip_tok_ahead", None)
         if mm is not None and _ta is not None:
             # S63 F2 TOK-AHEAD: the D leg of this rid takes THIS tokenization (identity checked by digest); the
-            # scheduler gets feature-less copies of the items, the originals stay whole for the leg
+            # scheduler gets feature-less copies of the items. S63r: a tower-less D caches the feature-less copy too
+            # (D never needs the pixels -- no host RAM held for a request that goes to P); features on the card
+            # (CUDA-IPC / keep-on-device): nothing is cached, the leg tokenizes itself
             from flliper.srt.pdflip import tok_ahead as _tah
+            from flliper.srt.pdflip import vision_d_guard as _vdg
 
-            _sched_mm = _tah.scheduler_copy_without_features(mm)
-            if _sched_mm is not None:
-                _ta.put(obj.rid, _tah.obj_digest(obj), list(tokenized.input_ids or ()), mm,
-                        tokenized.token_type_ids, t_tok, "d_probe")
+            if not _tah.gpu_side_reason():
+                _sched_mm, _cache_mm = _tah.d_cache_mm(mm, _vdg.d_guard_armed(tm.model_config))
+                if _sched_mm is not None:
+                    _ta.put(obj.rid, _tah.obj_digest(obj), list(tokenized.input_ids or ()), _cache_mm,
+                            tokenized.token_type_ids, t_tok, "d_probe")
         if mm is not None and _sched_mm is None:
             # the scheduler needs each item's pad value and offsets, never its pixels (a probe carries no feature)
             for item in getattr(mm, "mm_items", None) or ():
@@ -1617,6 +1621,10 @@ async def pdflip_tokenize_ahead(raw_request: Request):
                                   status_code=200)
     except ImportError:
         pass
+    _gpu = _tah.gpu_side_reason()
+    if _gpu:
+        # S63r: the processor would open a CUDA context / take IPC pool slices on this group's card while it sleeps
+        return ORJSONResponse({"success": False, "message": f"{_gpu}: no ahead"}, status_code=200)
     try:
         obj = await _dmp.build_probe_obj(
             await raw_request.json(),
@@ -1630,6 +1638,12 @@ async def pdflip_tokenize_ahead(raw_request: Request):
         return ORJSONResponse({"success": False, "message": "no media prompt: nothing ahead"}, status_code=200)
     rid = _tah.leg_rid(obj.rid)
     digest = _tah.obj_digest(obj)
+    if ta.has(rid) and rid not in ta._inflight:
+        ta.discard(rid)  # a re-sent ahead of the same rid replaces the old entry (the digest is checked at the take)
+    elif rid not in ta._inflight and ta.busy():
+        # S63r: two ahead tokenizations already run in this process -- no host-RAM spike for a burst of media arrivals
+        return ORJSONResponse({"success": False, "message": "busy: %d ahead in flight" % len(ta._inflight)},
+                              status_code=200)
     if ta.begin(rid, digest) is None:
         return ORJSONResponse({"success": True, "dup": True}, status_code=200)
     done = False
@@ -1637,9 +1651,13 @@ async def pdflip_tokenize_ahead(raw_request: Request):
         tm.auto_create_handle_loop()
         tokenized = await tm._tokenize_one_request(obj)
         ms = (_time.perf_counter() - t0) * 1000.0
-        ta.put(rid, digest, list(tokenized.input_ids or ()), tokenized.mm_inputs, tokenized.token_type_ids, ms,
-               "p_ahead")
+        kept = ta.put(rid, digest, list(tokenized.input_ids or ()), tokenized.mm_inputs, tokenized.token_type_ids, ms,
+                      "p_ahead")
         done = True
+        if not kept:
+            # S63r: larger than the whole byte cap -- not held; the leg tokenizes itself
+            return ORJSONResponse({"success": False, "message": "entry over FLLIPER_PDFLIP_TOK_AHEAD_MAX_MIB: not kept",
+                                   "tokenize_ms": ms}, status_code=200)
     except Exception as e:
         return ORJSONResponse({"success": False, "message": f"{type(e).__name__}: {str(e)[:300]}"}, status_code=200)
     finally:
