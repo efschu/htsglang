@@ -38021,7 +38021,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4954,
+    "line": 4960,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -38339,7 +38339,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4953,
+    "line": 4959,
     "tree": "nf"
    },
    "status": "harvested",
@@ -43547,7 +43547,7 @@
      "source": {
       "file": "mem_cache/unified_radix_cache.py",
       "kind": "os.environ",
-      "line": 736
+      "line": 737
      }
     }
    },
@@ -54001,7 +54001,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4671,
+    "line": 4677,
     "tree": "nf"
    },
    "status": "harvested",
@@ -61439,7 +61439,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4650
+      "line": 4656
      }
     }
    },
@@ -62416,7 +62416,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4630
+      "line": 4636
      }
     }
    },
@@ -63545,7 +63545,7 @@
    "id": "FLLIPER_PDFLIP_EVICT_ANCHOR_SAVE",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/unified_radix_cache.py:6120"
+    "mem_cache/unified_radix_cache.py:6123"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_EVICT_ANCHOR_SAVE",
@@ -63554,7 +63554,7 @@
    "source": {
     "file": "mem_cache/unified_radix_cache.py",
     "kind": "os.environ",
-    "line": 6120,
+    "line": 6123,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -65066,6 +65066,34 @@
    ],
    "type": "EnvFloat"
   },
+  "FLLIPER_PDFLIP_GEN_FORK_ANCHOR": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "True",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "GEN-FORK TRACK (S57, 19.10., NF rc15 pdflip-42-262; pdflip/turn_anchor.py): where the turn anchor is armed, a prefill step whose own (END) track lies past the generation prompt's <|im_start|> (N % page in 1..4 on NF) also tracks the state at floor_page(g) -- where a sibling request forks. One gather row, one mamba slot, same forward. 0 = off (rc15 byte for byte).",
+   "id": "FLLIPER_PDFLIP_GEN_FORK_ANCHOR",
+   "kind": "env",
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_GEN_FORK_ANCHOR",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 4167,
+    "tree": "nf"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "EnvBool"
+  },
   "FLLIPER_PDFLIP_GPU_ARB": {
    "bare": false,
    "choices": null,
@@ -65992,7 +66020,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4761
+      "line": 4767
      }
     }
    },
@@ -67647,7 +67675,7 @@
    "id": "FLLIPER_PDFLIP_L3_REFRESH_KEPT",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/hicache_storage.py:4768"
+    "mem_cache/hicache_storage.py:4773"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_L3_REFRESH_KEPT",
@@ -67656,7 +67684,7 @@
    "source": {
     "file": "mem_cache/hicache_storage.py",
     "kind": "os.environ",
-    "line": 4768,
+    "line": 4773,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -69176,7 +69204,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4559
+      "line": 4565
      }
     }
    },
@@ -73524,7 +73552,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4676,
+    "line": 4682,
     "tree": "nf"
    },
    "status": "harvested",
@@ -74375,7 +74403,7 @@
    "id": "FLLIPER_PDFLIP_SPILL_REF_FREE",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/unified_radix_cache.py:6298"
+    "mem_cache/unified_radix_cache.py:6301"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_SPILL_REF_FREE",
@@ -74384,7 +74412,7 @@
    "source": {
     "file": "mem_cache/unified_radix_cache.py",
     "kind": "os.environ",
-    "line": 6298,
+    "line": 6301,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -74832,7 +74860,7 @@
    "id": "FLLIPER_PDFLIP_SWEEP_REFUSED_MEMO",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/unified_radix_cache.py:8188"
+    "mem_cache/unified_radix_cache.py:8191"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_SWEEP_REFUSED_MEMO",
@@ -74841,7 +74869,7 @@
    "source": {
     "file": "mem_cache/unified_radix_cache.py",
     "kind": "os.environ",
-    "line": 8188,
+    "line": 8191,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -78180,7 +78208,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4748
+      "line": 4754
      }
     }
    },
@@ -89936,28 +89964,28 @@
  "schema": "flliper.catalog/1",
  "stats": {
   "curated": 125,
-  "entries": 2836,
-  "envs": 1957,
+  "entries": 2837,
+  "envs": 1958,
   "explained": 310,
   "flags": 864,
-  "harvested": 1747,
+  "harvested": 1748,
   "trees": {
    "abweichung": 51,
    "beide": 2463,
    "nur_27b": 180,
-   "nur_nf": 175
+   "nur_nf": 176
   },
   "unexplained": 654
  },
- "tree_rev": "27b=0798c91fcd+nf=a2cfdbe6af",
+ "tree_rev": "27b=0798c91fcd+nf=a8bb9f3075",
  "trees": {
   "27b": {
    "entries": 2643,
    "rev": "0798c91fcd"
   },
   "nf": {
-   "entries": 2638,
-   "rev": "a2cfdbe6af"
+   "entries": 2639,
+   "rev": "a8bb9f3075"
   }
  },
  "warnungen": []
