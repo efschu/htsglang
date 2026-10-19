@@ -399,16 +399,24 @@ def test_the_measured_d_prefix_is_subtracted(caplog):
 
 def test_a_failed_load_falls_back_to_the_estimate_by_name(caplog):
     """BOOT-START HOLD (y7d): only a load that ENDED without a tokenizer
-    falls back to chars/3 -- by name; a loading one holds the decision
-    (test_pdflip_l3_index_price_1002)."""
+    falls back -- by name; a loading one holds the decision
+    (test_pdflip_l3_index_price_1002). EZ-S1 review B2 (user 19.10. "nichts schaetzen"): with FLLIPER_PDFLIP_EXACT_CLASS
+    (default ON) the fallback is NO NUMBER, the request is MEASURE (D's admission with the barrier halfX-1, routed
+    "short" to D's line); chars/3 decides nothing. Switch off: the rc17 fallback (chars/3 decides, "long")."""
     f = _front(True)
     f.ftok.state = "failed"
     with caplog.at_level(logging.INFO, logger="pdflip.front"):
-        assert _route(f, _payload(3 * X + 600)) == "long"  # chars/3 decides
+        assert _route(f, _payload(3 * X + 600)) == "short"  # MEASURE: D measures, no class on chars/3
     msgs = [r.getMessage() for r in caplog.records]
     assert any(m.startswith("PDFLIP X-EXACT-FALLBACK") and "reason=tokenizer_failed" in m
                for m in msgs)
-    assert f.counters["x_exact_fallback"] == 1
+    assert f.counters["x_exact_fallback"] == 1 and f.counters["x_exact_fallback_measure"] == 1
+    assert f.counters["measure_on_d"] == 1
+    with envs.FLLIPER_PDFLIP_EXACT_CLASS.override(False):
+        f2 = _front(True)
+        f2.ftok.state = "failed"
+        assert _route(f2, _payload(3 * X + 600)) == "long"  # rc17: chars/3 decides
+        assert f2.counters["x_exact_fallback"] == 1 and f2.counters["x_exact_fallback_measure"] == 0
 
 
 def test_residual_error_is_logged_not_banded(caplog):
