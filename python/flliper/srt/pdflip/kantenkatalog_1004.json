@@ -43,7 +43,7 @@
      "evidence": {"file": "python/flliper/srt/pdflip/launcher.py", "zeile": 20242, "anchor": "FLLIPER_MOE_RESIDENT_EXPERT_FRACTION\",\n                                          plan.solved_fractions)"}},
     {"id": "K13", "von": "FLLIPER_MOE_RESIDENT_EXPERT_FRACTION", "nach": "--rank-gpu-memory-mib", "rel": "trades", "calc": "S4", "value": null,
      "satz": "The env is the runtime side of the flag: its value determines the expert share and with it the KV budget -- the offload switches additionally depend on it (effective only below 1.0).",
-     "evidence": {"file": "python/flliper/srt/environ.py", "zeile": 4051, "anchor": "FLLIPER_MOE_RESIDENT_EXPERT_FRACTION < 1.0"}},
+     "evidence": {"file": "python/flliper/srt/environ.py", "zeile": 4051, "anchor": "additionally gated on FLLIPER_MOE_RESIDENT_EXPERT_FRACTION < 1.0"}},
     {"id": "K14", "von": "--rank-moe-ratio", "nach": "FLLIPER_UNEVEN_MOE_EXPERT_SHARD", "rel": "requires", "calc": "text", "value": null,
      "satz": "Switching on the uneven expert sharding presupposes the uneven plan -- without the matching MoE split the switch has no target.",
      "evidence": {"file": "python/flliper/srt/environ.py", "zeile": 2943, "anchor": "under an uneven plan"}},
