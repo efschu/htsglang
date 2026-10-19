@@ -526,7 +526,9 @@ def await_l3(tree: Any, node: Any) -> bool:
     register_tree(tree)
     _announce("host")
     _S.l3_wait.pop(k, None)
-    _S.l3_wait[k] = [node, 0, time.monotonic()]
+    # S81: the page stems ride the entry -- the page is still watched after TP0's node went another way
+    # (detached, host rows gone), [node, passes, t0, stems, next_publish_pass, publishes]
+    _S.l3_wait[k] = [node, 0, time.monotonic(), _node_stems(tree, node), 2, 0]   # S74 sent pass 0's PUBLISH
     if publish_on():
         _S.ledger.append((PUBLISH, k[0], k[1], 1, 1, 0))
     while len(_S.l3_wait) > L3_WAIT_CAP:
@@ -581,10 +583,14 @@ def _retry_l3_waits() -> None:
     """S74, TP0 at ``attach``: a waiting page that completed gets ``l3_present`` and its L3 event in this
     broadcast; a node that went another way (detached, host rows gone, marked by another path) leaves.
     Review A2: at most ``FLLIPER_PDFLIP_CUT_L3_RETRY_PAGES`` pages are probed per broadcast (round robin: a probed,
-    still incomplete entry moves to the end); ``S74 CUT-L3-RETRY`` names the cost (n, waiting, probed, pages, ms)."""
+    still incomplete entry moves to the end); ``S74 CUT-L3-RETRY`` names the cost (n, waiting, probed, pages, ms).
+    S81 (switch ``FLLIPER_PDFLIP_S81_HOLE_RESOLVE``, default ON): an INCOMPLETE page never leaves unresolved --
+    :func:`_s81_resolve` re-asks the owners or revokes TP0's orphan claim."""
     tree = _S.tree
     if tree is None or not _S.l3_wait:
         return
+    if s81_on():
+        return _s81_retry(tree)
     t0 = time.perf_counter()
     probe = getattr(tree, "_s74_cut_page_complete", None)
     budget = _retry_pages()
@@ -608,23 +614,244 @@ def _retry_l3_waits() -> None:
             node.l3_present = True
             _S.ledger.append((L3, k[0], k[1], 1, 1, 0))
             done += 1
-            waited_ms = (time.monotonic() - ent[2]) * 1e3 if len(ent) > 2 else -1.0
-            n = _note("l3_late", 256)
-            if n:
-                logger.info("S74 CUT-L3-LATE node=%s depth=%d after %d pass(es) waited_ms=%.0f reap_s=%.0f (every "
-                            "owner wrote; l3_present on every rank at this broadcast) n=%d",
-                            getattr(node, "id", "?"), k[1], ent[1] + 1, waited_ms, _partial_reap_s(), n)
+            _note_late(node, k, ent)
             continue
         ent[1] += 1
         requeue.append(k)
     for k in requeue:  # round robin: the probed, still incomplete ones go behind the unprobed
         _S.l3_wait[k] = _S.l3_wait.pop(k)
+    _note_retry(waiting0, probed, pages, budget, done, left, t0)
+
+
+def _note_late(node: Any, k: Tuple[str, int], ent: list) -> None:
+    waited_ms = (time.monotonic() - ent[2]) * 1e3 if len(ent) > 2 else -1.0
+    n = _note("l3_late", 256)
+    if n:
+        logger.info("S74 CUT-L3-LATE node=%s depth=%d after %d pass(es) waited_ms=%.0f reap_s=%.0f (every "
+                    "owner wrote; l3_present on every rank at this broadcast) n=%d",
+                    getattr(node, "id", "?"), k[1], ent[1] + 1, waited_ms, _partial_reap_s(), n)
+
+
+def _note_retry(waiting0: int, probed: int, pages: int, budget: int, done: int, left: int, t0: float) -> None:
     ms = (time.perf_counter() - t0) * 1e3
     n = _note("l3_retry", 256)
     if n or ms >= 20.0:
         logger.info("S74 CUT-L3-RETRY waiting=%d probed=%d pages=%d cap=%d done=%d left=%d oldest_wait_ms=%.0f "
                     "ms=%.2f (attach cost of the CUT-L3 re-check) n=%d", waiting0, probed, pages, budget, done, left,
                     _oldest_wait_ms(), ms, n or _S.counts.get("l3_retry", 0))
+
+
+# ------------------------- S81 (19.10., rc17 boot ..._7d93470b5e_1019_181004, pdflip-8-209): the orphan store hole
+#: THE METAL. D TP0 acked the pages 85568..88192 (41) as share-0 direct writes at 18:26:31-35; the page was incomplete,
+#: S74 sent ONE PUBLISH. TP1/TP2 refused it -- ``#1421 BACKUP-REFUSED why=mamba_pin node=246 pins=5/5`` (their
+#: write-through pin budget, a transient: node 246 was backed at 18:26:36) and every child ``why=parent_unbacked``.
+#: Nobody asked again: the S74 entry left the wait list the moment TP0's node "went another way" (host rows gone)
+#: without the page completing (0 ``CUT-L3-RESET`` in the boot), TP0's share-0 claims stayed CLAIMED/open0 for 8 min
+#: (``ARENA-REF-CENSUS-CLAIM claimed=41 ... open0``), the store's KV chain ended at page 1337, the flip reset dropped
+#: the claims, P recomputed 16482 tokens of pdflip-8-209. (A worker cannot DROP an un-backed KV node on a TP group --
+#: ``pp_slot_fidelity.unbacked_drop_floor`` is local-PP only -- so the share was not lost by eviction: it was never
+#: asked for again.)
+#: NOW (R11: TP0 decides, the workers follow its events; no timer, no collective): an incomplete page stays watched by
+#: its stems until it is COMPLETE or revoked --
+#:   * a worker still holds the node on its device (its S22 key set ``dv`` next to the arena): PUBLISH again, at the
+#:     broadcasts 1, 2, 4 ... 64 after the last one (a pass count, not a clock; parents first, by depth) -- the
+#:     refusal was a transient (pin budget, parent in flight), the worker's own skip rules decide each time;
+#:   * no worker holds it any more: the owners' bytes cannot come. TP0 gives its own host layer back group-uniformly
+#:     (the K12 A2-ORPHAN REPUBLISH path: release + R12 STATE) and frees its share-0 claim -- only a slot it alone
+#:     claimed, with no open writer, no byte covered and no reference (``arena_release_claims``: status 0 only for
+#:     the sole claimant, S61-safe against a join). The page is then cleanly ABSENT on every rank and the next
+#:     materialization writes it fresh instead of joining an orphan;
+#:   * TP0's node still holds host rows it cannot give back (host lock, device copy gone): kept, named HELD.
+#: ``S81 HOLE-REPUBLISH`` / ``HOLE-REVOKE`` / ``HOLE-HELD`` / ``HOLE-CLOSED`` name every exit; ``CUT-L3-RESET open=``
+#: now counts what really stayed open. ``0`` = the S74 form (an entry leaves when its node went another way).
+S81_HOLE_RESOLVE_ENV = "FLLIPER_PDFLIP_S81_HOLE_RESOLVE"
+#: S81: the longest gap between two PUBLISH of one incomplete page, in broadcasts (the backoff doubles up to it)
+S81_PUBLISH_MAX_GAP = 64
+
+
+def s81_on(env=None) -> bool:
+    env = os.environ if env is None else env
+    return str(env.get(S81_HOLE_RESOLVE_ENV, "1")).strip().lower() not in ("0", "false", "no", "off", "")
+
+
+def _tree_kv_arena(tree: Any) -> Any:
+    try:
+        return tree.cache_controller.mem_pool_host.arena
+    except Exception:  # noqa: BLE001 - no arena pool: nothing to watch
+        return None
+
+
+def _node_stems(tree: Any, node: Any) -> Optional[List[str]]:
+    """The KV page stems of ``node`` in the shared arena (the same keys ``_s74_cut_page_complete`` asks)."""
+    try:
+        backend = tree.cache_controller.storage_backend
+        hashes = getattr(node, "hash_value", None) or ()
+        return [backend._get_suffixed_key(h) for h in hashes] or None
+    except Exception:  # noqa: BLE001 - unkeyed: the entry falls back to the node probe
+        return None
+
+
+def _stems_complete(arena: Any, stems: List[str]) -> Optional[bool]:
+    try:
+        st = arena.find_states(stems)
+        return len(st) == len(stems) and all(int(s) == 2 for s in st)
+    except Exception:  # noqa: BLE001 - unreadable: not decided this broadcast
+        return None
+
+
+def _s81_orphan_slots(arena: Any, stems: List[str]) -> Optional[List[Tuple[int, int]]]:
+    """(slot, gen) of every incomplete page of ``stems`` when EACH is TP0's orphan share-0 claim: CLAIMED, claimed by
+    this process alone, no open writer, no byte covered, no reference. None = some page is not such an orphan
+    (a worker joined, a writer is open, a reader holds it, the slot moved) -- nothing is freed then."""
+    found = arena.find_slots(stems)
+    out: List[Tuple[int, int]] = []
+    me = os.getpid()
+    for s, st in found:
+        s, st = int(s), int(st)
+        if s < 0 or st == 2:
+            continue   # absent or complete: nothing of TP0's to give back on this page
+        if st != 1:
+            return None
+        row = (arena.claim_census([s]) or [{}])[0]
+        if (int(row.get("pid", -1)) != me or int(row.get("open", 1)) != 0 or int(row.get("covered", 1)) != 0
+                or int(row.get("claims", 0)) != 1):
+            return None
+        out.append((s, int(row.get("gen", 0))))
+    if out and any(int(r) != 0 for r in arena.slot_refs([s for s, _ in out])):
+        return None
+    return out
+
+
+def _worker_files_live(tree: Any) -> int:
+    """S81: how many live workers published their S22 key sets next to the arena. 0 = the workers' device state is
+    UNKNOWN here (no file, unreadable dir) -- TP0 then never revokes, it only asks again."""
+    prefix = _dev_dir_prefix(_tree_arena(tree))
+    if prefix is None:
+        return 0
+    import glob
+
+    n = 0
+    for path in glob.glob(prefix + "*"):
+        tail = path[len(prefix):]
+        if not tail.isdigit():
+            continue
+        try:
+            os.kill(int(tail), 0)
+        except ProcessLookupError:
+            continue
+        except OSError:
+            pass
+        n += 1
+    return n
+
+
+def _s81_revoke(tree: Any, arena: Any, node: Any, k: Tuple[str, int], stems: List[str]) -> str:
+    """No worker holds the page any more: TP0's host layer back (group-uniform) and its orphan claims freed.
+    Returns ``revoked`` / ``held`` (TP0 keeps rows it cannot give back) / ``kept`` (not TP0's orphan)."""
+    base = int(_base_ct())
+    if _attached(node) and node.component_data[base].host_value is not None:
+        rep = getattr(tree, "_k12_republish_orphaned", None)
+        if not callable(rep) or not rep(node, len(stems)):
+            return "held"   # host lock / device copy gone: the node keeps its rows, the slot stays referenced
+    slots = _s81_orphan_slots(arena, stems)
+    if slots is None:
+        return "kept"
+    if slots:
+        st = arena.release_claims([s for s, _ in slots], [g for _, g in slots], reason="s81-orphan")
+        if any(int(x) != 0 for x in st):
+            return "kept"
+    return "revoked"
+
+
+def _s81_retry(tree: Any) -> None:
+    """S81 TP0 at ``attach``: see the block above. Page cap and round robin as S74 review A2."""
+    t0 = time.perf_counter()
+    arena = _tree_kv_arena(tree)
+    probe = getattr(tree, "_s74_cut_page_complete", None)
+    budget = _retry_pages()
+    waiting0 = len(_S.l3_wait)
+    pages = probed = done = left = 0
+    requeue: List[Tuple[str, int]] = []
+    dv: Optional[set] = None
+    outs: Dict[str, int] = {}
+    pubs: List[Tuple[str, int]] = []
+    for k, ent in list(_S.l3_wait.items()):   # round robin (S74 review A2); the PUBLISHes go out parents first
+        while len(ent) < 6:
+            ent.append(None if len(ent) == 3 else 0)
+        node, stems = ent[0], ent[3]
+        if getattr(node, "l3_present", False):
+            del _S.l3_wait[k]   # another path marked it
+            left += 1
+            continue
+        np_ = len(stems or getattr(node, "hash_value", None) or ())
+        if probed and pages + np_ > budget:
+            continue   # the page cap of this broadcast: stays ahead of the probed ones
+        pages += np_
+        probed += 1
+        live = _attached(node) and node.component_data[int(_base_ct())].host_value is not None
+        if arena is not None and stems:
+            complete = _stems_complete(arena, stems)
+        else:
+            complete = bool(probe(node)) if (probe is not None and live) else None
+        if complete:
+            del _S.l3_wait[k]
+            if live:
+                node.l3_present = True
+                _S.ledger.append((L3, k[0], k[1], 1, 1, 0))
+                done += 1
+                _note_late(node, k, ent)
+            else:
+                outs["closed"] = outs.get("closed", 0) + 1   # complete in the store; TP0's node went elsewhere
+            continue
+        ent[1] += 1
+        if complete is None or arena is None or not stems:
+            if not live:
+                del _S.l3_wait[k]   # neither askable nor TP0's: the S74 leave, named
+                left += 1
+                outs["unaskable"] = outs.get("unaskable", 0) + 1
+            else:
+                requeue.append(k)
+            continue
+        if dv is None:
+            dv = worker_device_keys(tree) if _worker_files_live(tree) else None
+            if dv is None:
+                dv = {"__unknown__"}
+        if k in dv or "__unknown__" in dv:   # no readable worker set: never revoke on a guess -- ask again
+            if ent[1] >= int(ent[4] or 0) and publish_on():
+                pubs.append(k)
+                ent[5] = int(ent[5] or 0) + 1
+                ent[4] = ent[1] + min(S81_PUBLISH_MAX_GAP, 1 << min(int(ent[5]), 6))
+                outs["republish"] = outs.get("republish", 0) + 1
+            requeue.append(k)
+            continue
+        out = _s81_revoke(tree, arena, node, k, stems)
+        outs[out] = outs.get(out, 0) + 1
+        if out == "revoked":
+            del _S.l3_wait[k]
+            left += 1
+            n = _note("s81_revoke", 64)
+            if n:
+                logger.warning("S81 HOLE-REVOKE node=%s depth=%d pages=%d waited_ms=%.0f publishes=%d (no worker holds "
+                               "the page on its device any more: its owners' bytes cannot come -- TP0 gave its host "
+                               "layer back and freed its share-0 claim; the page is absent on every rank, the next "
+                               "write is fresh) n=%d", getattr(node, "id", "?"), k[1], len(stems),
+                               (time.monotonic() - ent[2]) * 1e3, int(ent[5] or 0), n)
+        else:
+            requeue.append(k)
+    for k in sorted(pubs, key=lambda kk: kk[1]):   # the metal refusal was parent_unbacked: parents first
+        _S.ledger.append((PUBLISH, k[0], k[1], 1, 1, 0))
+    for k in requeue:  # round robin: the probed, still incomplete ones go behind the unprobed
+        if k in _S.l3_wait:
+            _S.l3_wait[k] = _S.l3_wait.pop(k)
+    if outs:
+        n = _note("s81_pass", 256)
+        if n or outs.get("held") or outs.get("kept"):
+            logger.info("S81 HOLE-PASS waiting=%d %s (an incomplete share-0 page stays watched until COMPLETE or "
+                        "revoked: republish = a worker still holds it, PUBLISH again; revoked = no owner copy left; "
+                        "held = TP0 keeps rows it cannot give back; kept = not TP0's orphan, a writer or reader on "
+                        "it; closed = completed after TP0's node went elsewhere) n=%d", len(_S.l3_wait),
+                        " ".join("%s=%d" % kv for kv in sorted(outs.items())), n or _S.counts.get("s81_pass", 0))
+    _note_retry(waiting0, probed, pages, budget, done, left, t0)
 
 
 def record_l3_drop(tree: Any, key: Optional[Tuple[str, int]]) -> bool:

@@ -153,7 +153,9 @@ def test_no_cut_keeps_the_ack_verdict(arena, host_cut, monkeypatch):
     assert n.l3_present is True and len(_l3_events(R.attach([]))) == 1
 
 
-def test_waiting_node_that_went_another_way_leaves(arena, host_cut):
+def test_waiting_node_that_went_another_way_leaves(arena, host_cut, monkeypatch):
+    """The S74 form (S81 switch 0). S81 keeps an INCOMPLETE page watched instead -- test_s81_store_hole_d_1019."""
+    monkeypatch.setenv("FLLIPER_PDFLIP_S81_HOLE_RESOLVE", "0")
     t, n = _Tree(arena), _node()
     _tp0_claims_share0(arena, n.hash_value)
     t._k12_direct_l3_verdict(n, 0)
