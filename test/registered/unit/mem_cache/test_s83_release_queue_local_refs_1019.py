@@ -279,3 +279,55 @@ def test_victim_census_rate_limit_spares_the_flush_sites(arena):
     assert t.s83_victim_census("spill", pool=pool) is None          # within 5 s
     assert t.s83_victim_census("flush_stop", pool=pool) is not None
     assert t.s83_victim_census("flush_stop", pool=pool) is not None
+
+
+# ---- review A1 (nf-review-s83-1019): the three danger directions the first test set left open ----
+
+
+def test_review_a1_order_beyond_the_pass_bound_is_kept(arena, monkeypatch):
+    """Mc: with more entries than one pass walks, the kept (non-arena) parts stay AHEAD of
+    the entries the pass did not reach -- else ranks with different queue lengths would
+    MIN-drain different entries (the mirrored-allocator break the MIN exists for)."""
+    from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+    t, _pool_, slot_of = _worker_after_tp0_released(arena)
+    q = t.cache_controller.host_mem_release_queue
+    q.queue.clear()
+    a = torch.tensor([0, 1], dtype=torch.int64)
+    mixed = torch.cat([torch.tensor([2, 3], dtype=torch.int64), _resolve(arena, slot_of, ["g0"])])
+    b = torch.tensor([4], dtype=torch.int64)
+    for e in (a, mixed, b):
+        q.put(e)
+    monkeypatch.setattr(UnifiedRadixCache, "S83_QUEUE_REF_PASS_MAX", 2)
+    t._s83_release_queue_surplus_refs(group_min=0)
+    left = list(q.queue)
+    assert left[0] is a and left[1].tolist() == [2, 3] and left[2] is b
+
+
+def test_review_a1_two_entries_on_the_same_pages_return_two_references(arena):
+    """Me / #989b: two store prefetches of one prefix each queue their own reference on the
+    same pages -- both go back (never merged and de-duplicated into one)."""
+    t, _pool_, slot_of = _worker_after_tp0_released(arena)
+    q = t.cache_controller.host_mem_release_queue
+    q.queue.clear()
+    s = slot_of["g2"]
+    before = _refs(arena)[s]                       # the cleared fixture entry's reference stays held
+    q.put(_resolve(arena, slot_of, ["g2"]))        # prefetch 1: +1
+    q.put(_resolve(arena, slot_of, ["g2"]))        # prefetch 2: +1, the same page
+    assert _refs(arena)[s] == before + 2
+    t._s83_release_queue_surplus_refs(group_min=0)
+    assert _refs(arena)[s] == before
+
+
+def test_review_a1_a_pending_write_keeps_its_reference(arena):
+    """Mb: rows of a pending write belong to their writer -- the early rank-local release
+    skips them (release_queued_rows, _pending)."""
+    t, pool, slot_of = _worker_after_tp0_released(arena)
+    q = t.cache_controller.host_mem_release_queue
+    q.queue.clear()
+    s = slot_of["g3"]
+    q.put(_resolve(arena, slot_of, ["g3"]))
+    held = _refs(arena)[s]
+    pool._pending = {s: object()}                  # a write in flight on that slot
+    t._s83_release_queue_surplus_refs(group_min=0)
+    assert _refs(arena)[s] == held                 # not taken
