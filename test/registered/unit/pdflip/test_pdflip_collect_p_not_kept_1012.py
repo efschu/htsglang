@@ -38,6 +38,11 @@ def _d_prefilling(tokens):
     f = _front(running=[], n=6, kv={"available": 400000, "evictable": 0})
     f.tp_prefill_max_tokens = X_LIVE
     f._d_pf_book().grant(rid="first", tokens=tokens, now=time.time())
+    # rc14 (S49, SOLL R6, user 18.10. "Nur echt laufend zählt"): "in flight" means D began the extend -- D's
+    # D-EXTEND-BEACON says so; only then does R6 count it (a D that has not begun it holds the set instead,
+    # test_pdflip_s49_r6_nur_echt_laufend_1018). Same fixture form as S49's _d_begins_every_grant.
+    from flliper.srt.pdflip import d_extend_beacon as _dxb
+    f._d_ext_reading = lambda: {_dxb.rid_key(r): time.time_ns() for r in list(f._d_pf_book()._rows)}
     return f
 
 
