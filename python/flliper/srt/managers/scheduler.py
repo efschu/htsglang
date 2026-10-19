@@ -14879,6 +14879,58 @@ class Scheduler(
             )
         return verdict == "W31"
 
+    def _pdflip_s59_reread_before_refusal(self, req: Req) -> bool:
+        """S59: True = the W31 just priced is NOT taken this pass; the request
+        is marked ``store_prefix_short`` so ``_retry_deferred_prefetches``
+        re-reads the store from its current match and ``_pdflip_x_defers``
+        holds the gate until that read lands (rc14 pdflip-16-211, rc15
+        pdflip-72-525: the floor fell to 0 after an eviction / a SEAT-AGE
+        displacement while the store held the context; nothing re-read it).
+
+        Group verdict: the terms are the X gate's own replicated reduce
+        values (``_pdflip_x_terms``, set by ``pdflip_uncached_extent`` in the
+        verdict just taken) and the per-request bookkeeping is written on
+        every rank alike. No except: a rank-local failure here would refuse on
+        one rank and defer on the others -- it stops the group instead
+        (raenge-nie-uneins)."""
+        if not getattr(self, "enable_hicache_storage", False):
+            return False
+        from flliper.srt.pdflip import d_store_reread as _rr
+
+        terms = getattr(self, "_pdflip_x_terms", None)
+        done = tuple(getattr(req, "_s59_reread_keys", ()) or ())
+        due, key = _rr.reread_due(terms, done, _rr.enabled())
+        if not due:
+            return False
+        if getattr(req, "prefetch_deferred", None) is not None:
+            return False  # an armed mark has its own exits
+        if self._prefetch_deferral_refusal_reason(_DEFER_REASON_STORE_SHORT) is not None:
+            return False
+        from flliper.srt.mem_cache.match_refusal_census import (
+            note_prefetch_gate as _note_prefetch_gate,
+        )
+
+        req._s59_reread_keys = done + (key,)
+        req.prefetch_deferred = _DEFER_REASON_STORE_SHORT
+        req.prefetch_defer_attempts = 1
+        req.prefetch_defer_passes = 0
+        req.prefetch_defer_since = time.monotonic()
+        req._pdflip_defer_windows = 1
+        _note_prefetch_gate("deferred")
+        _note_prefetch_gate("deferred_store_short")
+        n = getattr(self, "_pdflip_s59_rereads", 0) + 1
+        self._pdflip_s59_rereads = n
+        logger.warning(
+            "S59 STORE-REREAD-BEFORE-W31 rid=%s total=%s head=%s store=%s floor=%s "
+            "priced=%d reread=%d/%d n=%d -- the group store arm holds more prefix "
+            "than the floor the X gate priced (the tree lost it after its read); "
+            "D re-reads the store first and prices again when it lands "
+            "(store_prefix_short mark), instead of refusing a context the store holds",
+            str(getattr(req, "rid", "?")), terms[0], terms[1], terms[2], terms[3],
+            key[0], len(req._s59_reread_keys), _rr.MAX_REREADS, n,
+        )
+        return True
+
     def _pdflip_answer_x_refusals(
         self, refused: List[Req], head_inputs=None, wall_rows: Optional[Dict[int, int]] = None
     ) -> None:
@@ -15011,7 +15063,17 @@ class Scheduler(
             head_inputs, str(getattr(req, "rid", "") or "")
         )
         if gm is not None:
-            return min(int(gm), len(req.full_untruncated_fill_ids))
+            # S59 (rc15 D pdflip-4-9 / 28-111): priced like the X gate -- the
+            # group's USABLE floor where it differs from the head (Form A: the
+            # head arm is a worker's mamba-refused walk, the floor is the depth
+            # every rank admits), both replicated terms of the same reduce.
+            from flliper.srt.pdflip import vision_d_guard as _vdg
+
+            _floor = tp_match_floor.group_usable_for(
+                getattr(self, "tree_cache", None), str(getattr(req, "rid", "") or "")
+            )
+            covered = _vdg.admitted_covered(int(gm), _floor, _pdflip_x_floor_credit_on())
+            return min(int(covered), len(req.full_untruncated_fill_ids))
         if int(getattr(getattr(self, "ps", None), "tp_size", 1) or 1) > 1:
             return None
         return len(req.prefix_indices) + int(getattr(req, "host_hit_length", 0) or 0)
@@ -17836,6 +17898,12 @@ class Scheduler(
                 _note_skip("pdflip_x_defer", req.rid)
                 continue
             if self._pdflip_x_refuses(req, _head_inputs):
+                # S59: the store holds more than the floor the gate priced --
+                # read it first (A12.2 store_prefix_short mark), refuse only on
+                # what a read could not bring (pdflip/d_store_reread.py).
+                if self._pdflip_s59_reread_before_refusal(req):
+                    _note_skip("pdflip_x_store_reread", req.rid)
+                    continue
                 _note_skip("pdflip_x_refused", req.rid)
                 _x_refused.append(req)
                 continue

@@ -323,7 +323,10 @@ def test_wiring_the_tree_registers_the_floor_before_queueing_and_the_controller_
     assert note < queue
     assert "setattr(req, _pdflip_park_read.RETAINED_ATTR, _pdflip_park_read.retained_raw_tokens(radix_key))" in tree
     ctrl = _read("managers", "cache_controller.py")
-    assert "if storage_hit_count < revoke_threshold(self, operation):" in ctrl
+    # S59 (19.10.): the threshold compares the claim reduce's group-uniform
+    # count (`_reduce_store_claim`: the host's length of the group END under a
+    # Form A frame, the reduced count otherwise) -- the floor is read the same.
+    assert "if _claim_threshold_count < revoke_threshold(self, operation):" in ctrl
     assert "if storage_hit_count < self.prefetch_threshold:" not in ctrl
 
 

@@ -73522,6 +73522,37 @@
    ],
    "type": "EnvFloat"
   },
+  "FLLIPER_PDFLIP_S59_STORE_REREAD": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"1\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "",
+   "id": "FLLIPER_PDFLIP_S59_STORE_REREAD",
+   "kind": "env",
+   "lesestellen": [
+    "pdflip/d_store_reread.py:43"
+   ],
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_S59_STORE_REREAD",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "pdflip/d_store_reread.py",
+    "kind": "os.environ",
+    "line": 43,
+    "tree": "nf"
+   },
+   "status": "unexplained",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "os.environ"
+  },
   "FLLIPER_PDFLIP_SEAM_DIGEST": {
    "bare": false,
    "choices": null,
@@ -90216,8 +90247,8 @@
  "schema": "flliper.catalog/1",
  "stats": {
   "curated": 125,
-  "entries": 2846,
-  "envs": 1967,
+  "entries": 2847,
+  "envs": 1968,
   "explained": 310,
   "flags": 864,
   "harvested": 1757,
@@ -90225,19 +90256,19 @@
    "abweichung": 51,
    "beide": 2463,
    "nur_27b": 180,
-   "nur_nf": 185
+   "nur_nf": 186
   },
-  "unexplained": 654
+  "unexplained": 655
  },
- "tree_rev": "27b=0798c91fcd+nf=d5851981fe",
+ "tree_rev": "27b=0798c91fcd+nf=ba915afc35",
  "trees": {
   "27b": {
    "entries": 2643,
    "rev": "0798c91fcd"
   },
   "nf": {
-   "entries": 2648,
-   "rev": "d5851981fe"
+   "entries": 2649,
+   "rev": "ba915afc35"
   }
  },
  "warnungen": []

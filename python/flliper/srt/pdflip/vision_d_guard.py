@@ -72,6 +72,30 @@ def image_end(req: Any) -> int:
     return (max(end for _, end in spans) + 1) if spans else 0
 
 
+def admitted_covered(head: int, floor: Optional[int], floor_credit: bool) -> int:
+    """S59: the prefix every rank ADMITS -- the depth the X gate prices from
+    (``Scheduler.pdflip_uncached_extent``, store arm excluded: a store page is
+    not materialized until its read lands).
+
+    The head arm alone is no such depth on a Form A group: a worker's own walk
+    is refused by the mamba bytes it does not hold and votes 0, while every
+    rank admits the usable floor (the host's admission, RU FORM-A FOLLOW).
+    rc15 D pdflip-4-9 (07:19:09): ``H98x X-FLOOR-CREDIT head=0 floor=95744``,
+    X gate ``admit uncached=14``, and the vision guard on the head arm refused
+    ``W123 covered=0`` -> W50 -> a D->P flip for 14 tokens (P: cached 95744).
+    Same on pdflip-28-111 (floor 88704). The other side holds as well: a floor
+    BELOW the head (#1424d proof cut / zeroed anchor) is what the admission
+    takes, so the guard must not credit the head above it."""
+    priced = int(head)
+    if floor is None:
+        return priced
+    if int(floor) < priced:
+        return int(floor)
+    if int(floor) > priced and floor_credit:
+        return int(floor)
+    return priced
+
+
 def verdict(req: Any, covered: Optional[int], tail_start: Optional[int] = None,
             tail_wait: bool = False) -> str:
     """``admit`` when every placeholder lies before the first position D's
