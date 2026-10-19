@@ -51,7 +51,8 @@ from flliper.srt.pdflip import d_seats as _d_seats
 
 #: Rule 1: requests per P phase (user 25.09.: "bis zu 6").
 P_PHASE_MAX_REQUESTS_DEFAULT = 6
-#: Rule 1: P's unified KV pool in tokens (NF: 262k, memory `262K-PFLICHT`).
+#: Rule 1: P's unified KV pool in tokens (NF: 262k, memory `262K-PFLICHT`). Since S55 (P-POOL-FROM-P) only the
+#: value until P answered: the standard form then plans against P's realised pool (resolve_p_pool_tokens).
 P_POOL_TOKENS_DEFAULT = 262144
 #: Rule 3: the wait bound in seconds (user verbatim: "wartegrenze 60 s").
 D_WAIT_BOUND_S_DEFAULT = 60.0

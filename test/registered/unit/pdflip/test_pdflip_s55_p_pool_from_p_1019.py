@@ -250,3 +250,20 @@ def test_metal_shape_the_read_pool_puts_the_successors_beside_the_predecessor():
     f = _front()
     front.Front._apply_p_pool_info(f, _info(524288, pin=524288))
     assert _drain_order(f.p_pool_tokens) == [["0-21", "0-22", "0-23"], ["1-24"]]
+
+
+# ============================================================================ S55r: one budget per P phase
+
+
+def test_one_overlap_budget_per_p_phase():
+    """S55r: the reading may land while a P phase runs (it is a free task). The phase's plan, its drain and its
+    P-PHASE line take ONE number at the phase start, so the line never prints a budget the drain did not plan
+    with; the new value acts from the next P phase on."""
+    src = inspect.getsource(front.Front)
+    i_cap = src.index("_p_pool_budget = self.p_pool_tokens")
+    i_plan = src.index("_overlap_plan = phase_policy.plan_p_overlap(")
+    i_drain = src.index("budget=_p_pool_budget, stats=_phase_stats,")
+    i_line = src.index("_p_pool_budget, _phase_stats[\"pool_holds\"], len(self.queue))")
+    assert i_cap < i_plan < i_drain < i_line
+    assert "budget=self.p_pool_tokens" not in src
+    assert "self.p_pool_tokens, _phase_stats[\"pool_holds\"]" not in src

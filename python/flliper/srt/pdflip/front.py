@@ -6499,7 +6499,8 @@ class Front:
         """S55 P-POOL-FROM-P: take P's realised KV pool off one ``/get_server_info`` body and
         resolve the overlap budget (``phase_policy.resolve_p_pool_tokens``). False = the body
         carries no usable reading (the budget is untouched). The front alone decides; the
-        drain reads ``self.p_pool_tokens`` at its next dispatch (SOLL R11)."""
+        drain takes ``self.p_pool_tokens`` once at the start of each P phase (``_p_pool_budget``),
+        so a reading that lands mid-phase acts from the next P phase on (SOLL R11)."""
         realised = phase_policy.p_pool_realised(info)
         if realised is None:
             return False
@@ -18083,10 +18084,14 @@ class Front:
                 # H91 part C rule 1: the drain's stats and its overlap plan
                 # (the queue head folded against P's pool, for the P-PHASE line).
                 _phase_stats: Dict[str, int] = {}
+                # S55r: ONE overlap budget per P phase -- the plan, the drain and the P-PHASE line read the
+                # same number even when P's pool reading (S55 P-POOL-FROM-P) lands while this phase runs;
+                # the new value takes effect at the next P phase.
+                _p_pool_budget = self.p_pool_tokens
                 _overlap_plan = phase_policy.plan_p_overlap(
                     [phase_policy.p_request_cost(p.est_prompt, p.leg1_prompt_tokens, p.skip_leg1)
                      for p in list(self.queue)[:max(1, self.p_phase_max_requests or len(self.queue))]],
-                    self.p_pool_tokens,
+                    _p_pool_budget,
                     min(self.p_concurrency + _ahead, self.p_phase_max_requests or (self.p_concurrency + _ahead)))
                 async def one(p: Pending) -> Pending:
                     if getattr(p, "short_kept", False) or p.skip_leg1:
@@ -18210,7 +18215,7 @@ class Front:
                     max_dispatch=_max_dispatch,
                     cost=lambda p: phase_policy.p_request_cost(
                         p.est_prompt, p.leg1_prompt_tokens, p.skip_leg1),
-                    budget=self.p_pool_tokens, stats=_phase_stats,
+                    budget=_p_pool_budget, stats=_phase_stats,
                     extra=(None if _ro_state is None else
                            (lambda ps: _ro.extra_slots((q.rid for q in ps), _ro_state.rids(), _ro_max))),
                     poll_s=_ro.POLL_S,
@@ -18257,7 +18262,7 @@ class Front:
                                 self.epoch, _phase_stats["overlap_dispatched"],
                                 _phase_stats["dispatched"], _phase_stats["peak_n"],
                                 self.p_concurrency + _ahead)
-                if passes and (self.p_phase_max_requests or self.p_pool_tokens):
+                if passes and (self.p_phase_max_requests or _p_pool_budget):
                     _cap_hit = phase_policy.phase_cap_reached(
                         _phase_stats["dispatched"], self.p_phase_max_requests)
                     logger.info(
@@ -18271,7 +18276,7 @@ class Front:
                         ("stall" if self._p_intake_stalled else "cap" if _cap_hit
                          else "empty" if not self.queue else "leaving"),
                         _overlap_plan, _phase_stats["peak_n"], _phase_stats["peak_tokens"],
-                        self.p_pool_tokens, _phase_stats["pool_holds"], len(self.queue))
+                        _p_pool_budget, _phase_stats["pool_holds"], len(self.queue))
                 if passes:
                     # #1271 (b): ONE r_P SAMPLE PER DRAIN WINDOW, in the same
                     # unit the launcher now uses -- the uncached tokens this

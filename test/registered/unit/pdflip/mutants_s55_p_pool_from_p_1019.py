@@ -49,6 +49,9 @@ MUTANTS = [
     ("M12 an unusable body zeroes the budget", FR,
      "        if realised is None:\n            return False\n",
      "        if realised is None:\n            self.p_pool_tokens = 0\n            return False\n"),
+    ("M13 S55r: the drain re-reads the live budget (plan, drain and P-PHASE line can disagree mid-phase)", FR,
+     "                    budget=_p_pool_budget, stats=_phase_stats,",
+     "                    budget=self.p_pool_tokens, stats=_phase_stats,"),
 ]
 
 
