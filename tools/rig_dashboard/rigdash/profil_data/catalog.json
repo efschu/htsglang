@@ -64317,7 +64317,7 @@
    "id": "FLLIPER_PDFLIP_FOLLOWER_REACH_TOLD",
    "kind": "env",
    "lesestellen": [
-    "managers/pdflip_store_told.py:2011"
+    "managers/pdflip_store_told.py:2016"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_FOLLOWER_REACH_TOLD",
@@ -64326,7 +64326,7 @@
    "source": {
     "file": "managers/pdflip_store_told.py",
     "kind": "os.environ",
-    "line": 2011,
+    "line": 2016,
     "tree": "nf"
    },
    "status": "harvested",
@@ -77181,7 +77181,7 @@
    "id": "FLLIPER_PDFLIP_W27_HELD_STOP",
    "kind": "env",
    "lesestellen": [
-    "managers/pdflip_store_told.py:2068"
+    "managers/pdflip_store_told.py:2073"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_W27_HELD_STOP",
@@ -77190,7 +77190,7 @@
    "source": {
     "file": "managers/pdflip_store_told.py",
     "kind": "os.environ",
-    "line": 2068,
+    "line": 2073,
     "tree": "nf"
    },
    "status": "harvested",
@@ -90176,7 +90176,7 @@
   },
   "unexplained": 657
  },
- "tree_rev": "27b=0798c91fcd+nf=88a8218f6b",
+ "tree_rev": "27b=0798c91fcd+nf=1e67b17c8a",
  "trees": {
   "27b": {
    "entries": 2643,
@@ -90184,7 +90184,7 @@
   },
   "nf": {
    "entries": 2646,
-   "rev": "88a8218f6b"
+   "rev": "1e67b17c8a"
   }
  },
  "warnungen": []
