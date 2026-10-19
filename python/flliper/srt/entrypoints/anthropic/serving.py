@@ -625,10 +625,18 @@ class AnthropicServing:
                 if text:
                     system_parts.append(text)
 
+        # S70 HEAD-STABILITY (head_stability.py): Claude Code's analytics block
+        # is not rendered (FLLIPER_ANTHROPIC_STRIP_ATTRIBUTION, default on), and
+        # a head that moved against a recent one is named with its bytes.
+        from flliper.srt.entrypoints.anthropic import head_stability as _hs
+
+        if system_parts and _hs.env_on():
+            system_parts, _stripped = _hs.strip_attribution_parts(system_parts)
+            _hs.note_stripped(_stripped)
         if system_parts:
-            openai_messages.append(
-                {"role": "system", "content": "\n".join(system_parts)}
-            )
+            _head = "\n".join(system_parts)
+            _hs.watch().observe(_head)
+            openai_messages.append({"role": "system", "content": _head})
 
         def _emit_user_message(parts: list[dict]) -> None:
             """Append accumulated parts as a user message, then clear them.

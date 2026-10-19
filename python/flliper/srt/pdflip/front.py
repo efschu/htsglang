@@ -954,6 +954,22 @@ def _content_text(c: Any) -> str:
     return str(c if c is not None else "")
 
 
+def _system_text(sys_field: Any) -> str:
+    """The top-level ``system`` field as the model sees it: S70 drops Claude
+    Code's analytics block exactly as the adapter does
+    (``entrypoints/anthropic/head_stability.py``), so the span LRU's character
+    prefix and the adapter's head move together."""
+    from flliper.srt.entrypoints.anthropic import head_stability as _hs
+
+    if not _hs.env_on():
+        return _content_text(sys_field)
+    if isinstance(sys_field, list):
+        texts = [_block_text(x) for x in sys_field]
+        kept, _ = _hs.strip_attribution_parts(texts)
+        return " ".join(kept)
+    return _hs.strip_attribution_text(str(sys_field))[0]
+
+
 def _native_items(value) -> int:
     """H125b: how many items a native ``/generate`` multimodal field carries.
 
@@ -1264,7 +1280,7 @@ def request_text(payload: dict, tools_first: Optional[bool] = None) -> str:
             parts.append(tools_part)
         sys_field = payload.get("system")
         if sys_field:
-            parts.append(f"system:{_content_text(sys_field)}\n")
+            parts.append(f"system:{_system_text(sys_field)}\n")
         for m in payload["messages"]:
             if not isinstance(m, dict):
                 parts.append(f"{m}\n")
