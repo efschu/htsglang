@@ -16080,6 +16080,14 @@ def d_moe_residency(env_d: str, tp_size: int):
 #: launch the way a real W61/W63 does.
 ANCHOR_NOTE_PREFIX = "W65 PdFlipMeasuredAnchor: "
 
+#: S68 review (19.10.): may the W65 scan WRITE its log index?  ``main`` sets
+#: ``rw`` for a real launch and ``ro`` for ``--dry-run`` (the oracle runs the
+#: real ``main`` in-process with ``--dry-run``); anything that reaches the scan
+#: without ``main`` (unit tests, sizing calls) stays ``ro``, so no test or dry
+#: run writes into the shared evidence dir.  ``FLLIPER_MEASURED_ANCHOR_INDEX``
+#: (rw|ro|off) overrides both -- writing from a dry run is allowed only that way.
+_ANCHOR_INDEX_MODE = "ro"
+
 
 def _d_measured_anchor(
     cards: Sequence[Card],
@@ -16122,6 +16130,7 @@ def _d_measured_anchor(
         from flliper.srt.planner.measured_anchor import (
             MeasuredAnchorRefused,
             read_measured_anchor,
+            resolve_index_mode,
         )
     except Exception as exc:  # noqa: BLE001 - an anchor never kills a launch
         return None, ANCHOR_NOTE_PREFIX + (
@@ -16148,6 +16157,7 @@ def _d_measured_anchor(
             budgets_mib=list(budgets),
             model_path=model,
             evidence_dirs=tuple(evidence_dirs),
+            index_mode=resolve_index_mode(_ANCHOR_INDEX_MODE),
         )
     except MeasuredAnchorRefused as exc:
         # The EXPECTED absence: no log of this form, or one that does not
@@ -16162,7 +16172,9 @@ def _d_measured_anchor(
             "anchor lookup FAILED (%s: %s); heuristic path stands"
             % (type(exc).__name__, exc)
         )
-    return anchor, ANCHOR_NOTE_PREFIX + anchor.provenance
+    # S68: the scan note (index hits / logs read / wall) rides behind the
+    # provenance, which itself is unchanged
+    return anchor, ANCHOR_NOTE_PREFIX + anchor.provenance + getattr(anchor, "scan_note", "")
 
 
 def d_operating_point_rows(
@@ -24702,6 +24714,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     stamp = time.strftime("%m%d_%H%M%S", time.gmtime())
     base = f"{EVIDENCE_DIR}/boot_weg2_{ns.tag}_{tip}_{stamp}"
     dry = ns.dry_run
+    global _ANCHOR_INDEX_MODE
+    _ANCHOR_INDEX_MODE = "ro" if dry else "rw"  # S68 review: a dry run reads the W65 index, never writes it
     os.makedirs(EVIDENCE_DIR, exist_ok=True)
     front_log = None if dry else f"{base}.front.log"
     log = Log(front_log)

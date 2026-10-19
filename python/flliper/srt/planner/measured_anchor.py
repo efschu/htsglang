@@ -69,8 +69,12 @@ from __future__ import annotations
 
 import dataclasses
 import glob
+import hashlib
+import inspect
+import json
 import os
 import re
+import tempfile
 import time
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -111,6 +115,10 @@ class MeasuredAnchor:
     #: One line for the boot log: which source won, which boot, how old, and
     #: which post came from configuration rather than from a measurement.
     provenance: str
+    #: S68: how the scan got there (index hits, logs actually read, wall
+    #: time).  Kept OUT of ``provenance`` so the provenance text of a found
+    #: anchor stays what it was; the launcher appends it to the W65 note.
+    scan_note: str = ""
 
     @property
     def uniform_kv_cell(self) -> bool:
@@ -368,6 +376,234 @@ def find_boot_logs(evidence_dirs: Sequence[str], group: str) -> List[str]:
     return sorted(set(found), key=lambda p: os.path.getmtime(p), reverse=True)
 
 
+# --- S68 (19.10.): the per-log index ----------------------------------------
+#
+# WHY.  The scan below rejects a log on two FORM facts -- the set of
+# ``model_path='...'`` echoes and the set of ``--rank-gpu-memory-mib`` echoes
+# -- and both are facts of the FILE, not of the boot asking.  Before S68 every
+# boot re-derived them by reading every ``boot_*.D.log`` whole: measured
+# 19.10. on the NF line, 490 of 490 logs rejected (250 different model, 240
+# other budgets), 15.8 GiB read, ~70-93 s, and because the scan sits between
+# ``group P pid`` and ``BZ3 D-EARLY-GATE LAUNCH`` it pushed D's start behind
+# P READY (+16 s on the critical path, growing ~5.5 s per GiB of new D log).
+#
+# WHAT.  The two form sets, and the parsed posts of a log that PASSED the form
+# check (per rank axis), are kept per file in one JSON next to the logs, keyed
+# by basename + (size, mtime_ns, st_ino, st_ctime_ns).  A key that no longer
+# matches is a miss and the file is read exactly as before.  The scan order, the form checks, the
+# completeness check and the winner are unchanged: the index only replaces
+# "read the file again" by "the same answer the last read gave".  A log is
+# never moved, rewritten or deleted (other tools read them).
+#
+# The fingerprint covers every regex and the parser source, so a change to
+# what a read would extract invalidates the whole index instead of serving a
+# stale answer.  An unwritable directory degrades to the old cold scan and
+# says so in the scan note -- the index can make the scan faster, never fail
+# it.
+INDEX_BASENAME = ".measured_anchor_index.json"
+#: 2 (S68 review 19.10.): key = size + mtime_ns + st_ino + st_ctime_ns (a
+#: same-size replacement with a restored mtime -- ``cp -p``, ``rsync -t``,
+#: ``touch -r`` -- still changes inode/ctime, and no tool can set ctime), and a
+#: per-entry checksum, so a damaged entry is discarded and recomputed (heals)
+#: instead of being served on every boot.
+INDEX_SCHEMA = 2
+
+#: Who may WRITE the index.  ``rw`` (default for a real boot: the launcher's
+#: ``main`` sets it when not ``--dry-run``), ``ro`` (use what is there, never
+#: write: dry runs, the oracle, tests that read a shared evidence dir), ``off``
+#: (the pre-S68 cold scan).  The env wins over every caller default, so a dry
+#: run or a test can be ALLOWED to write only explicitly.
+INDEX_MODE_ENV = "FLLIPER_MEASURED_ANCHOR_INDEX"
+INDEX_MODES = ("rw", "ro", "off")
+
+
+def resolve_index_mode(default: str = "rw") -> str:
+    env = (os.environ.get(INDEX_MODE_ENV) or "").strip().lower()
+    mode = env if env in INDEX_MODES else default
+    if mode not in INDEX_MODES:
+        raise ValueError("index mode must be one of %s, got %r" % (INDEX_MODES, mode))
+    return mode
+
+
+def _stat_key(st: os.stat_result) -> List[int]:
+    return [int(st.st_size), int(st.st_mtime_ns), int(st.st_ino), int(st.st_ctime_ns)]
+
+
+def _entry_sum(e: dict) -> str:
+    body = {k: v for k, v in e.items() if k != "sum"}
+    return hashlib.sha1(
+        json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()[:16]
+
+
+def _is_str_list(v) -> bool:
+    return isinstance(v, list) and all(isinstance(x, str) for x in v)
+
+
+def _valid_posts(raw) -> bool:
+    if not isinstance(raw, dict):
+        return False
+    for axis, ranks in raw.items():
+        if axis not in ("tp", "pp") or not isinstance(ranks, dict):
+            return False
+        for rk, fields in ranks.items():
+            if not (isinstance(rk, str) and rk.isdigit() and isinstance(fields, dict)):
+                return False
+            for fk, fv in fields.items():
+                if not isinstance(fk, str) or isinstance(fv, bool) or not isinstance(fv, (int, float)):
+                    return False
+    return True
+
+
+def _index_fingerprint() -> str:
+    h = hashlib.sha1()
+    h.update(("schema=%d\n" % INDEX_SCHEMA).encode())
+    for rx in (_RE_MODEL, _RE_BUDGETS, _RE_PREFIX, _RE_CENSUS_LOAD, _RE_IDLE,
+               _RE_SIZING, _RE_MAMBA):
+        h.update(rx.pattern.encode() + b"\n")
+    try:
+        h.update(inspect.getsource(parse_boot_log_posts).encode())
+    except (OSError, TypeError):  # no source shipped: patterns + schema only
+        h.update(b"<no-source>")
+    return h.hexdigest()[:16]
+
+
+class _LogIndex:
+    """basename -> {key, models, budgets, posts{axis: {...}}, sum} per dir."""
+
+    def __init__(self, dirs: Sequence[str], mode: str = "rw"):
+        self.fp = _index_fingerprint()
+        self.mode = mode
+        self.writable = mode == "rw"
+        self.discarded = 0
+        self.by_dir: Dict[str, Dict[str, dict]] = {}
+        self.dirty: Dict[str, bool] = {}
+        self.hits = 0
+        self.reads = 0
+        self.read_bytes = 0
+        self.notes: List[str] = []
+        for d in dict.fromkeys(os.path.abspath(x) for x in dirs if x):
+            self.by_dir[d] = self._load(d)
+            self.dirty[d] = False
+
+    def _load(self, d: str) -> Dict[str, dict]:
+        path = os.path.join(d, INDEX_BASENAME)
+        try:
+            with open(path, "r") as f:
+                doc = json.load(f)
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError) as exc:
+            self.notes.append("index %s unreadable (%s), rebuilt" % (path, type(exc).__name__))
+            return {}
+        if not isinstance(doc, dict) or doc.get("fingerprint") != self.fp:
+            self.notes.append("index %s from another parser, rebuilt" % path)
+            return {}
+        logs = doc.get("logs")
+        return logs if isinstance(logs, dict) else {}
+
+    def get(self, path: str, st: os.stat_result) -> Optional[dict]:
+        d, base = os.path.split(os.path.abspath(path))
+        entries = self.by_dir.setdefault(d, {})
+        e = entries.get(base)
+        if e is None:
+            return None
+        if not (isinstance(e, dict) and e.get("key") == _stat_key(st)):
+            return None  # a changed (or replaced) file: an ordinary miss
+        # the entry claims THIS file: it is served only when it is intact.  A
+        # damaged one (bad checksum, wrong element types -- e.g. models=[1]) is
+        # dropped here, so the read below recomputes and put() replaces it: it
+        # heals on the first scan instead of costing the anchor on every boot.
+        if (e.get("sum") != _entry_sum(e) or not _is_str_list(e.get("models"))
+                or not _is_str_list(e.get("budgets")) or not _valid_posts(e.get("posts"))):
+            del entries[base]
+            self.dirty[d] = True
+            self.discarded += 1
+            return None
+        self.hits += 1
+        return e
+
+    def put(self, path: str, st: os.stat_result, text: str) -> dict:
+        d, base = os.path.split(os.path.abspath(path))
+        e = {
+            "key": _stat_key(st),
+            "models": sorted(set(_RE_MODEL.findall(text))),
+            "budgets": sorted(set(_RE_BUDGETS.findall(text))),
+            "posts": {},
+        }
+        self.by_dir.setdefault(d, {})[base] = e
+        self.dirty[d] = True
+        return e
+
+    def put_posts(self, path: str, e: dict, axis: str, posts: Dict[int, Dict[str, float]]) -> None:
+        e.setdefault("posts", {})[axis] = {str(k): dict(v) for k, v in posts.items()}
+        self.dirty[os.path.dirname(os.path.abspath(path))] = True
+
+    @staticmethod
+    def posts_of(e: dict, axis: str) -> Optional[Dict[int, Dict[str, float]]]:
+        raw = (e.get("posts") or {}).get(axis)
+        if not isinstance(raw, dict):
+            return None
+        try:
+            return {int(k): {str(kk): float(vv) for kk, vv in v.items()} for k, v in raw.items()}
+        except (TypeError, ValueError, AttributeError):  # a damaged entry is a miss
+            return None
+
+    def read(self, path: str) -> str:
+        """The whole log, exactly as the pre-S68 scan read it."""
+        with open(path, "r", errors="replace") as f:
+            text = f.read()
+            try:  # a one-off read: do not leave 30 MiB per log in the page cache
+                os.posix_fadvise(f.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+            except (AttributeError, OSError):
+                pass
+        self.reads += 1
+        self.read_bytes += len(text)
+        return text
+
+    def save(self) -> None:
+        if not self.writable:
+            return
+        for d, dirty in self.dirty.items():
+            if not dirty:
+                continue
+            # entries of logs that are gone are dropped, so the index never grows
+            # past the directory it describes
+            logs = {}
+            for b, e in self.by_dir[d].items():
+                if os.path.exists(os.path.join(d, b)):
+                    e["sum"] = _entry_sum(e)
+                    logs[b] = e
+            path = os.path.join(d, INDEX_BASENAME)
+            # mkstemp IN the target dir: unique across PID namespaces (the
+            # launcher in the container, a dry run in CT999 and a warm run on
+            # the host can share a PID), same filesystem, so os.replace is
+            # atomic.  0644: the CT999 side reads what the container wrote.
+            tmp = None
+            try:
+                fd, tmp = tempfile.mkstemp(dir=d, prefix=INDEX_BASENAME + ".", suffix=".tmp")
+                with os.fdopen(fd, "w") as f:
+                    json.dump({"fingerprint": self.fp, "logs": logs}, f, separators=(",", ":"))
+                os.chmod(tmp, 0o644)
+                os.replace(tmp, path)
+                tmp = None
+            except OSError as exc:
+                self.notes.append("index %s not written (%s: %s); next scan is cold again"
+                                  % (path, type(exc).__name__, exc))
+                if tmp is not None:
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
+
+    def note(self, n_logs: int, wall_s: float) -> str:
+        s = (" [W65-SCAN logs=%d index_hits=%d read=%d read_mib=%.1f wall_s=%.2f index=%s%s%s]"
+             % (n_logs, self.hits, self.reads, self.read_bytes / MIB, wall_s,
+                self.mode, (" discarded=%d" % self.discarded) if self.discarded else "",
+                ("; " + "; ".join(self.notes)) if self.notes else ""))
+        return s
+
+
 def read_measured_anchor(
     *,
     group: str,
@@ -380,6 +616,8 @@ def read_measured_anchor(
     model_path: Optional[str] = None,
     evidence_dirs: Sequence[str] = (),
     now: Optional[float] = None,
+    use_index: bool = True,
+    index_mode: Optional[str] = None,
 ) -> MeasuredAnchor:
     """The newest boot log of the same FORM, as measured components.
 
@@ -397,45 +635,99 @@ def read_measured_anchor(
 
     Raises ``MeasuredAnchorRefused`` -- named -- when no log qualifies or when
     a qualifying log is missing a post.
+
+    S68: the form facts and the posts of each log come from the per-directory
+    index when its size+mtime still match (see ``_LogIndex``); the answer is
+    the same one a full read gives.  ``use_index=False`` is the pre-S68 cold
+    scan (kept for the equivalence test).  ``index_mode`` (``rw``/``ro``/
+    ``off``) says whether the index may be written; ``None`` resolves the env
+    ``FLLIPER_MEASURED_ANCHOR_INDEX`` with ``rw`` as default.  The launcher
+    passes ``ro`` for a dry run (the oracle included), so a dry run never
+    writes into a shared evidence dir unless the env allows it explicitly.
     """
+    t0 = time.monotonic()
     logs = find_boot_logs(evidence_dirs, group)
     if not logs:
         raise MeasuredAnchorRefused(
             "no boot_*.%s.log under %s -- nothing of this group has been "
             "measured yet" % (group, ", ".join(evidence_dirs) or "<no dir>")
         )
+    mode = "off" if not use_index else (index_mode or resolve_index_mode("rw"))
+    if mode not in INDEX_MODES:
+        raise ValueError("index_mode must be one of %s, got %r" % (INDEX_MODES, mode))
+    use_index = mode != "off"
+    idx = _LogIndex(evidence_dirs if use_index else (), mode)
     want_budgets = ",".join(str(int(b)) for b in budgets_mib)
     rejected: List[str] = []
+    won: Optional[MeasuredAnchor] = None
+    try:
+        won = _scan(idx, logs, use_index, group, tp_size, rank_axis, ranks_on_gpu,
+                    required_free_bytes, mlp_vector, model_path, want_budgets, now,
+                    rejected)
+    finally:
+        # also on an unexpected error: what was learned so far is kept
+        if use_index:
+            idx.save()
+    note = idx.note(len(logs), time.monotonic() - t0)
+    if won is not None:
+        return dataclasses.replace(won, scan_note=note)
+    exc = MeasuredAnchorRefused(
+        "no boot_*.%s.log of this form: %s%s" % (group, "; ".join(rejected), note)
+    )
+    exc.scan_note = note
+    raise exc
+
+
+def _scan(idx, logs, use_index, group, tp_size, rank_axis, ranks_on_gpu,
+          required_free_bytes, mlp_vector, model_path, want_budgets, now,
+          rejected) -> Optional[MeasuredAnchor]:
+    """The pre-S68 loop, newest first, first complete log of the form wins."""
     for path in logs:
+        base = os.path.basename(path)
+        text: Optional[str] = None
         try:
-            with open(path, "r", errors="replace") as f:
-                text = f.read()
+            st = os.stat(path)
+            entry = idx.get(path, st) if use_index else None
+            if entry is None:
+                text = idx.read(path)
+                entry = idx.put(path, st, text) if use_index else {
+                    "models": sorted(set(_RE_MODEL.findall(text))),
+                    "budgets": sorted(set(_RE_BUDGETS.findall(text))),
+                }
         except OSError as exc:
-            rejected.append("%s: unreadable (%s)" % (os.path.basename(path), exc))
+            rejected.append("%s: unreadable (%s)" % (base, exc))
             continue
-        if model_path is not None and not any(
-            model_path in m for m in _RE_MODEL.findall(text)
-        ):
+        models = entry["models"]
+        if model_path is not None and not any(model_path in m for m in models):
             rejected.append(
-                "%s: different model (%s)"
-                % (os.path.basename(path), ", ".join(sorted(set(_RE_MODEL.findall(text)))) or "none")
+                "%s: different model (%s)" % (base, ", ".join(models) or "none")
             )
             continue
-        echoed = set(_RE_BUDGETS.findall(text))
+        echoed = entry["budgets"]
         if want_budgets not in echoed:
             rejected.append(
                 "%s: measured under budgets %s, planning %s"
-                % (os.path.basename(path), "|".join(sorted(echoed)) or "none", want_budgets)
+                % (base, "|".join(echoed) or "none", want_budgets)
             )
             continue
-        posts = parse_boot_log_posts(text, rank_axis=rank_axis)
+        posts = _LogIndex.posts_of(entry, rank_axis) if use_index else None
+        if posts is None:
+            if text is None:
+                try:
+                    text = idx.read(path)
+                except OSError as exc:
+                    rejected.append("%s: unreadable (%s)" % (base, exc))
+                    continue
+            posts = parse_boot_log_posts(text, rank_axis=rank_axis)
+            if use_index:
+                idx.put_posts(path, entry, rank_axis, posts)
         try:
             components = build_components(
                 posts,
                 tp_size=tp_size,
                 ranks_on_gpu=ranks_on_gpu,
                 required_free_bytes=required_free_bytes,
-                source=os.path.basename(path),
+                source=base,
             )
         except MeasuredAnchorRefused as exc:
             # An INCOMPLETE newest log must not shadow an older complete one.
@@ -447,7 +739,7 @@ def read_measured_anchor(
             # checks above still gate every candidate, and the provenance
             # names which log won and how old it is, so falling through is
             # not "keep looking until something fits".
-            rejected.append("%s: %s" % (os.path.basename(path), exc))
+            rejected.append("%s: %s" % (base, exc))
             continue
         age = (now if now is not None else time.time()) - os.path.getmtime(path)
         tag = _boot_tag(path)
@@ -461,7 +753,7 @@ def read_measured_anchor(
             "max-paused-rung-tag half of the runtime's required_free is not "
             "stated by any boot-log instrument and is OPEN"
             % (
-                os.path.basename(path),
+                base,
                 tag,
                 group,
                 age / 3600.0,
@@ -476,6 +768,31 @@ def read_measured_anchor(
             age_s=age,
             provenance=prov,
         )
-    raise MeasuredAnchorRefused(
-        "no boot_*.%s.log of this form: %s" % (group, "; ".join(rejected))
-    )
+    return None
+
+
+def warm_index(evidence_dirs: Sequence[str], group: str = "D") -> str:
+    """Fill the index for every log of ``group`` without planning anything.
+
+    For a quiet moment on the host (``python -m flliper.srt.planner.measured_anchor
+    <dir> [group]``), so the first boot of an image carrying S68 does not pay
+    the cold scan.  Reads each un-indexed log once; never writes a log.
+    """
+    t0 = time.monotonic()
+    logs = find_boot_logs(evidence_dirs, group)
+    idx = _LogIndex(evidence_dirs, "rw")  # an operator call: writing is its purpose
+    for path in logs:
+        try:
+            st = os.stat(path)
+            if idx.get(path, st) is None:
+                idx.put(path, st, idx.read(path))
+        except OSError:
+            continue
+    idx.save()
+    return idx.note(len(logs), time.monotonic() - t0).strip()
+
+
+if __name__ == "__main__":  # pragma: no cover - operator entry point
+    import sys
+
+    print(warm_index([sys.argv[1]], sys.argv[2] if len(sys.argv) > 2 else "D"))
