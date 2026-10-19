@@ -487,11 +487,15 @@ def record_l3(tree: Any, node: Any) -> bool:
     return True
 
 
+#: S74 switch (default ON): under the token cut TP0's direct-write ack sets ``l3_present`` and sends the L3 event only
+#: for a COMPLETE page (every owner wrote); ``0`` = the pre-S74 verdict on TP0's own ack
+CUT_L3_COMPLETE_ENV = "FLLIPER_PDFLIP_CUT_L3_COMPLETE"
+
+
 def cut_l3_complete_on(env=None) -> bool:
-    """S74 switch ``FLLIPER_PDFLIP_CUT_L3_COMPLETE`` (default ON): under the token cut TP0's direct-write ack sets
-    ``l3_present`` and sends the L3 event only for a COMPLETE page (every owner wrote); ``0`` = the pre-S74 verdict
-    on TP0's own ack."""
-    v = (env if env is not None else os.environ).get("FLLIPER_PDFLIP_CUT_L3_COMPLETE", "1")
+    """S74 switch ``FLLIPER_PDFLIP_CUT_L3_COMPLETE`` (default ON), see :data:`CUT_L3_COMPLETE_ENV`."""
+    env = os.environ if env is None else env
+    v = env.get(CUT_L3_COMPLETE_ENV, "1")
     return str(v).strip().lower() not in ("0", "false", "no", "off", "")
 
 
