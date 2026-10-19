@@ -393,3 +393,35 @@ def test_h1_a_held_twin_is_no_chain_source(pp0):
     assert tw.release_due(pp0, {a.rid, b.rid, c.rid}) == [(a, True)]
     st = tw.state(pp0)
     assert [x.rid for x in st.waits[c.rid].sources] == [a.rid]
+
+
+# ---- S79r B1 (Nach-Review): the post-wake settle (#1471) is in flight ----------------
+# Reviewer test /tmp/rv79c-tests/test_rv79c_post_wake_settle_1019.py, expectation turned:
+# a LIVE source parked in pdflip_post_wake_settle (released from the dormant hold at the
+# wake with a short read, parked until its re-read lands) is no GONE source.
+
+
+def _held_twin_b1(sched):
+    src = _R("pdflip-0-2", SRC, head=S0)
+    sched.waiting_queue = [src]
+    b = _R("pdflip-0-4", B)
+    assert tw.intake_defer(sched, b) is True
+    return src, b
+
+
+def test_b1_dormant_hold_source_is_not_gone(pp0):
+    src, b = _held_twin_b1(pp0)
+    pp0.waiting_queue = [b]
+    pp0.pdflip_dormant_hold = [src]
+    tw.tick(pp0)
+    assert tw.release_due(pp0, {b.rid}) == [] and tw.state(pp0).n_gone == 0
+
+
+def test_b1_post_wake_settle_source_is_not_gone(pp0):
+    src, b = _held_twin_b1(pp0)
+    pp0.waiting_queue = [b]
+    pp0.pdflip_post_wake_settle = [src]       # live: back to the queue once its read lands
+    tw.tick(pp0)
+    assert tw.release_due(pp0, {b.rid}) == []
+    assert tw.state(pp0).n_gone == 0
+    assert tw.is_deferred(pp0, b.rid)

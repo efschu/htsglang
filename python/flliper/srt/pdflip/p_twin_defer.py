@@ -311,6 +311,16 @@ def _dormant_hold(scheduler) -> List[Any]:
     return list(getattr(scheduler, "pdflip_dormant_hold", None) or ())
 
 
+def _post_wake_settle(scheduler) -> List[Any]:
+    """S79r B1 (review nf-review-s79-1019, Nachtrag): the requests the wake released
+    from the dormant hold with a short read and parked in ``pdflip_post_wake_settle``
+    (#1471) until their re-read lands -- up to the settle bound (~20 s), and over a
+    re-sleep into the next wake. They are LIVE (back to the queue once settled); not
+    counting them let A1 count such a source GONE and release its twin at once (the
+    TW-WAKE class #294: the twin recomputes the shared prefix)."""
+    return list(getattr(scheduler, "pdflip_post_wake_settle", None) or ())
+
+
 def inflight(scheduler) -> List[Any]:
     """Every request PP0 knows as in flight on P and not finished: queued,
     the dormant hold (TW-WAKE), the chunked one, the running batch, the PP
@@ -335,6 +345,8 @@ def inflight(scheduler) -> List[Any]:
     for r in list(getattr(scheduler, "waiting_queue", None) or ()):
         add(r)
     for r in _dormant_hold(scheduler):
+        add(r)
+    for r in _post_wake_settle(scheduler):   # S79r B1: live, parked for its re-read
         add(r)
     add(getattr(scheduler, "chunked_req", None))
     for r in _batch_reqs(getattr(scheduler, "running_batch", None)):
@@ -392,6 +404,7 @@ def _note_s0(st: "_State", scheduler, cur: List[Any]) -> None:
     just finished, or a source of a held twin."""
     queued = {id(r) for r in (getattr(scheduler, "waiting_queue", None) or ())}
     queued.update(id(r) for r in _dormant_hold(scheduler))  # TW-WAKE: held, not admitted
+    queued.update(id(r) for r in _post_wake_settle(scheduler))  # S79r B1: parked, not admitted
     for r in cur:
         if id(r) in queued:
             continue
