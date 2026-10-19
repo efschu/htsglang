@@ -2051,7 +2051,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22834
+      "line": 22846
      }
     }
    },
@@ -6532,7 +6532,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22226
+      "line": 22238
      }
     }
    },
@@ -7101,7 +7101,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22230
+      "line": 22242
      }
     }
    },
@@ -11311,7 +11311,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22282
+      "line": 22294
      }
     }
    },
@@ -16943,7 +16943,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 23741
+      "line": 23753
      }
     }
    },
@@ -16993,7 +16993,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23769,
+    "line": 23781,
     "tree": "nf"
    },
    "status": "harvested",
@@ -17658,7 +17658,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22544
+      "line": 22556
      }
     }
    },
@@ -18183,7 +18183,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22839
+      "line": 22851
      }
     }
    },
@@ -18268,7 +18268,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 23724
+      "line": 23736
      }
     }
    },
@@ -18317,7 +18317,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 23758
+      "line": 23770
      }
     }
    },
@@ -18992,7 +18992,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22996
+      "line": 23008
      }
     }
    },
@@ -19284,7 +19284,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 23371
+      "line": 23383
      }
     }
    },
@@ -19595,7 +19595,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23541,
+    "line": 23553,
     "tree": "nf"
    },
    "status": "curated",
@@ -28443,7 +28443,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22427
+      "line": 22439
      }
     }
    },
@@ -47835,6 +47835,37 @@
     "nf"
    ],
    "type": "EnvInt"
+  },
+  "FLLIPER_MEASURED_ANCHOR_INDEX": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": null,
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "Who may WRITE the index. ``rw`` (default for a real boot: the launcher's ``main`` sets it when not ``--dry-run``), ``ro`` (use what is there, never write: dry runs, the oracle, tests that read a shared evidence dir), ``off`` (the pre-S68 cold scan). The env wins over every caller default, so a dry run or a test can be ALLOWED to write only explicitly.",
+   "id": "FLLIPER_MEASURED_ANCHOR_INDEX",
+   "kind": "env",
+   "lesestellen": [
+    "planner/measured_anchor.py:421"
+   ],
+   "level": "expert",
+   "name": "FLLIPER_MEASURED_ANCHOR_INDEX",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "planner/measured_anchor.py",
+    "kind": "os.environ",
+    "line": 421,
+    "tree": "nf"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "os.environ"
   },
   "FLLIPER_MEASURED_KV_BUDGET": {
    "bare": false,
@@ -90962,28 +90993,28 @@
  "schema": "flliper.catalog/1",
  "stats": {
   "curated": 125,
-  "entries": 2870,
-  "envs": 1991,
+  "entries": 2871,
+  "envs": 1992,
   "explained": 310,
   "flags": 864,
-  "harvested": 1773,
+  "harvested": 1774,
   "trees": {
    "abweichung": 53,
    "beide": 2463,
    "nur_27b": 180,
-   "nur_nf": 209
+   "nur_nf": 210
   },
   "unexplained": 662
  },
- "tree_rev": "27b=0798c91fcd+nf=2d8337e8ff",
+ "tree_rev": "27b=0798c91fcd+nf=a5df94fe45",
  "trees": {
   "27b": {
    "entries": 2643,
    "rev": "0798c91fcd"
   },
   "nf": {
-   "entries": 2672,
-   "rev": "2d8337e8ff"
+   "entries": 2673,
+   "rev": "a5df94fe45"
   }
  },
  "warnungen": []
