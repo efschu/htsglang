@@ -202,22 +202,117 @@ def test_front_prices_from_the_probe_and_routes_an_image_tail_to_p(caplog, monke
     assert xx.image_in_tail is True and xx.pending == n - 93952 and xx.mm_cached is False   # P's number (R9)
 
 
-def test_front_names_a_failed_probe_and_keeps_its_own_count(caplog):
+def test_front_names_a_failed_probe_asks_again_and_never_keeps_its_own_count(caplog, monkeypatch):
+    """S56r A1 (replaces S56's "the front's own count stands"): a failed probe is ASKED AGAIN; no exact number by the
+    deadline -> UNPRICED: pending 0 only as the route to D's own admission, never the front's 3000."""
+    from flliper.srt.environ import envs
+    from test_pdflip_front_x_exact import _FakeTokens, _front, _payload
+
+    monkeypatch.setenv("FLLIPER_PDFLIP_D_MATCH_PROBE_DEADLINE_MS", "300")
+    monkeypatch.setenv("FLLIPER_PDFLIP_D_MATCH_PROBE_RETRY_MS", "20")
+    assert envs.FLLIPER_PDFLIP_D_MATCH_PROBE_DEADLINE_MS.get() == 300
+    f = _front(True)
+    f.ftok = _FakeTokens(3000)
+    f.session = object()
+    calls = []
+
+    async def post(g, b, timeout):
+        calls.append(timeout)
+        return 503, "down"
+
+    f._d_probe_post = post
+
+    async def store(rid, ids, timeout_s, extra_key=None):
+        return 1000, "l3_index"
+
+    f._store_probe_depth = store
+    with caplog.at_level(logging.INFO, logger="pdflip.front"):
+        xx = asyncio.run(f._x_exact_price("r", "/v1/messages", _payload(100), "t", 1000, 3000))
+    assert len(calls) >= 3, "asked again inside the deadline"
+    assert xx.unpriced is True and xx.pending == 0 and xx.src == "d_probe_unpriced" and xx.known is False
+    assert xx.uncached_p == 2000, "P's exact number: the text prompt's ids are D's ids, n - store"
+    assert f.counters["d_probe_failed"] == len(calls) and f.counters["d_probe_unpriced"] == 1
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("PDFLIP D-PROBE-FAILED rid=r attempt=1 why=status=503" in m and "next=retry" in m for m in msgs)
+    assert any("PDFLIP D-PROBE-UNPRICED rid=r" in m for m in msgs)
+    assert not any("X-EXACT-PRICE" in m and "rid=r " in m for m in msgs), "no ledger price is formed"
+
+
+def test_front_a_payload_d_cannot_tokenize_gives_up_at_once(monkeypatch):
+    """S56r A1: what no attempt can change (D's tokenizer rejects the payload: retry=False) ends at once."""
     from test_pdflip_front_x_exact import _FakeTokens, _front, _payload
 
     f = _front(True)
     f.ftok = _FakeTokens(3000)
     f.session = object()
+    calls = []
 
     async def post(g, b, timeout):
-        return 503, "down"
+        calls.append(1)
+        return 200, json.dumps({"success": False, "message": "ValueError: bad", "retry": False})
 
     f._d_probe_post = post
-    with caplog.at_level(logging.INFO, logger="pdflip.front"):
-        xx = asyncio.run(f._x_exact_price("r", "/v1/messages", _payload(100), "t", 1000, 3000))
-    assert xx.pending == 3000 and getattr(xx, "probe", None) is None
-    assert f.counters["d_probe_failed"] == 1
-    assert any("PDFLIP D-PROBE-FAILED rid=r why=status=503" in r.getMessage() for r in caplog.records)
+
+    async def store(rid, ids, timeout_s, extra_key=None):
+        return 0, "none"
+
+    f._store_probe_depth = store
+    xx = asyncio.run(f._x_exact_price("r", "/v1/messages", _payload(100), "t", 1000, 3000))
+    assert calls == [1] and xx.unpriced is True and xx.uncached_p == 3000
+
+
+def test_front_a_probe_that_recovers_prices_exactly(monkeypatch):
+    """S56r A1: the second attempt answers -> the exact price, D-PROBE-RECOVERED, nothing decided before it."""
+    from test_pdflip_front_x_exact import _FakeTokens, _front, _payload
+
+    monkeypatch.setenv("FLLIPER_PDFLIP_D_MATCH_PROBE_RETRY_MS", "1")
+    f = _front(True)
+    f.ftok = _FakeTokens(3000)
+    f.session = object()
+    n = 3000
+    body = {"success": True, "ids": dmp.ids_to_b64(np.arange(n) + 10), "device_tokens": 2944, "host_tokens": 0,
+            "key_match_depth": 2944, "mm_spans": []}
+    seq = [(0, "ClientConnectorError"), (200, json.dumps(body))]
+
+    async def post(g, b, timeout):
+        code, text = seq.pop(0)
+        if code == 0:
+            raise ConnectionError(text)
+        return code, text
+
+    f._d_probe_post = post
+
+    async def store(rid, ids, timeout_s, extra_key=None):
+        return 0, "none"
+
+    f._store_probe_depth = store
+    xx = asyncio.run(f._x_exact_price("r", "/v1/messages", _payload(100), "t", 1000, 3000))
+    assert not getattr(xx, "unpriced", False) and xx.pending == 56 and f.counters["d_probe_recovered"] == 1
+
+
+def test_front_an_unread_store_is_not_a_zero(monkeypatch):
+    """S56r A1: a store probe that FAILED is not "the store holds nothing": asked once more, then UNPRICED."""
+    from test_pdflip_front_x_exact import _FakeTokens, _front, _payload
+
+    f = _front(True)
+    f.ftok = _FakeTokens(3000)
+    f.session = object()
+    body = {"success": True, "ids": dmp.ids_to_b64(np.arange(3000) + 10), "device_tokens": 0, "host_tokens": 0,
+            "key_match_depth": 0, "mm_spans": []}
+
+    async def post(g, b, timeout):
+        return 200, json.dumps(body)
+
+    f._d_probe_post = post
+    asked = []
+
+    async def store(rid, ids, timeout_s, extra_key=None):
+        asked.append(1)
+        return 0, "unread"
+
+    f._store_probe_depth = store
+    xx = asyncio.run(f._x_exact_price("r", "/v1/messages", _payload(100), "t", 1000, 3000))
+    assert len(asked) == 2 and xx.unpriced is True
 
 
 def test_probe_switch_default_on():
@@ -228,11 +323,30 @@ def test_probe_switch_default_on():
 
 # --------------------------------------------------------------------------------- the scheduler half (every rank)
 
-def test_scheduler_handler_walks_the_admission_key_with_the_stand_in(monkeypatch):
-    """The handler pads image items like the intake, asks ``match_prefix`` with the admission's key (whole ids,
-    limit n-1, cow_mamba on a mamba tree, the stand-in request with a slot sentinel) and answers D's numbers."""
-    from array import array
+def _fake_sched(tree, **kw):
     import types
+
+    base = dict(
+        tree_cache=tree,
+        model_config=types.SimpleNamespace(vocab_size=1000),
+        pad_input_ids_func=lambda ids, mm: [(-7 if 2 <= i <= 5 else t) for i, t in enumerate(ids)],
+        _get_multimodal_inputs=lambda mm: types.SimpleNamespace(
+            mm_items=[types.SimpleNamespace(offsets=[(2, 5)])], padded_input_ids=None),
+        _try_apply_padded_mm_input_ids=lambda recv, req, mm: False,
+    )
+    base.update(kw)
+    fake = types.SimpleNamespace(**base)
+    from flliper.srt.managers import scheduler as S
+
+    fake._pdflip_match_probe_one = lambda *a: S.Scheduler._pdflip_match_probe_one(fake, *a)
+    return fake
+
+
+def test_scheduler_handler_reads_the_admission_key_read_only(monkeypatch):
+    """S56r A2: the handler pads image items like the intake and READS the admission's usable prefix with
+    ``peek_admission_match`` (whole PADDED ids, limit n-1) -- ``match_prefix`` (which splits, re-stamps, moves LRUs)
+    is never called."""
+    from array import array
 
     from flliper.srt.managers import scheduler as S
     from flliper.srt.managers.io_struct import PdFlipMatchProbeReqInput, wrap_as_pickle
@@ -240,52 +354,77 @@ def test_scheduler_handler_walks_the_admission_key_with_the_stand_in(monkeypatch
     seen = {}
 
     class _Tree:
-        def supports_mamba(self):
-            return True
-
         def match_prefix(self, params):
-            seen["params"] = params
-            return types.SimpleNamespace(device_indices=list(range(96)), host_hit_length=32, key_match_depth=200)
+            raise AssertionError("the probe must not call match_prefix (it mutates the tree)")
 
-    class _Item:
-        offsets = [(2, 5)]
+    def peek(tc, ids, extra_key, limit):
+        seen["args"] = (list(ids), extra_key, limit)
+        return 96, 32, 200
 
-    fake = types.SimpleNamespace(
-        tree_cache=_Tree(),
-        model_config=types.SimpleNamespace(vocab_size=1000),
-        pad_input_ids_func=lambda ids, mm: [(-7 if 2 <= i <= 5 else t) for i, t in enumerate(ids)],
-        _get_multimodal_inputs=lambda mm: types.SimpleNamespace(mm_items=[_Item()], padded_input_ids=None),
-        _try_apply_padded_mm_input_ids=lambda recv, req, mm: False,
-    )
+    monkeypatch.setattr(dmp, "peek_admission_match", peek)
+    fake = _fake_sched(_Tree())
     ids = array("q", range(10, 10 + 200))
     req = PdFlipMatchProbeReqInput(rid="pdflip-6-11~probe", input_ids=ids,
                                    mm_inputs=wrap_as_pickle({"x": 1}), extra_key=None, tokenize_ms=12.0)
     out = S.Scheduler.handle_pdflip_match_probe(fake, req)
     assert out.success, out.message
-    p = seen["params"]
-    assert p.cow_mamba is True and p.req.mamba_pool_idx == -1 and p.req.rid == "pdflip-6-11~probe"
-    assert p.key.limit == 199 and list(p.key.token_ids)[2:6] == [-7, -7, -7, -7], "the PADDED ids are the key"
+    got_ids, ek, limit = seen["args"]
+    assert limit == 199 and got_ids[2:6] == [-7, -7, -7, -7], "the PADDED ids are the key"
     assert (out.device_tokens, out.host_tokens, out.key_match_depth) == (96, 32, 200)
     assert out.mm_spans == [[2, 6]] and list(out.input_ids)[3] == -7 and out.tokenize_ms == 12.0
 
 
+def test_scheduler_handler_answers_a_coalesced_batch_in_order(monkeypatch):
+    """S56r A3: the probes the tokenizer coalesced are answered in the same round, in order."""
+    from array import array
+
+    from flliper.srt.managers import scheduler as S
+    from flliper.srt.managers.io_struct import PdFlipMatchProbeReqInput, unwrap_from_pickle, wrap_as_pickle
+
+    monkeypatch.setattr(dmp, "peek_admission_match", lambda tc, ids, ek, limit: (len(ids) // 2, 0, len(ids)))
+    fake = _fake_sched(object())
+    req = PdFlipMatchProbeReqInput(rid="a", input_ids=array("q", range(10)), batch=wrap_as_pickle([
+        {"rid": "b", "input_ids": array("q", range(20)), "mm_inputs": None, "extra_key": None, "tokenize_ms": 1.0},
+        {"rid": "c", "input_ids": array("q", range(40)), "mm_inputs": None, "extra_key": None, "tokenize_ms": 2.0}]))
+    out = S.Scheduler.handle_pdflip_match_probe(fake, req)
+    more = unwrap_from_pickle(out.batch)
+    assert (out.rid, out.device_tokens) == ("a", 5)
+    assert [(d["rid"], d["device_tokens"], d["success"]) for d in more] == [("b", 10, True), ("c", 20, True)]
+
+
+def test_scheduler_handler_refuses_a_rank_local_number_by_name(monkeypatch):
+    """S56r (R11): on an asymmetric host tier without Form A the admission takes the RU MIN -- TP0's walk is not the
+    group's number: success=False, named, never TP0's guess."""
+    from array import array
+
+    from flliper.srt.managers import scheduler as S
+    from flliper.srt.managers import tp_match_floor as T
+    from flliper.srt.managers.io_struct import PdFlipMatchProbeReqInput
+
+    class _Tree:
+        def _hicache_prefetch_symmetric(self):
+            return True
+
+    monkeypatch.setattr(T, "form_a_follow_active", lambda: False)
+    monkeypatch.setattr(dmp, "peek_admission_match", lambda *a: (_ for _ in ()).throw(AssertionError("no walk")))
+    out = S.Scheduler.handle_pdflip_match_probe(
+        _fake_sched(_Tree()), PdFlipMatchProbeReqInput(rid="r", input_ids=array("q", range(10))))
+    assert out.success is False and out.message.startswith("group_min_needed")
+
+
 def test_scheduler_handler_never_raises(monkeypatch):
-    import types
+    from array import array
 
     from flliper.srt.managers import scheduler as S
     from flliper.srt.managers.io_struct import PdFlipMatchProbeReqInput
 
-    class _Tree:
-        def supports_mamba(self):
-            return False
+    def boom(*a):
+        raise RuntimeError("boom")
 
-        def match_prefix(self, params):
-            raise RuntimeError("boom")
-
-    fake = types.SimpleNamespace(tree_cache=_Tree(), model_config=types.SimpleNamespace(vocab_size=1000))
+    monkeypatch.setattr(dmp, "peek_admission_match", boom)
+    fake = _fake_sched(object())
     out = S.Scheduler.handle_pdflip_match_probe(fake, PdFlipMatchProbeReqInput(rid="r~probe", input_ids=None))
     assert out.success is True and out.device_tokens == 0      # an empty prompt walks nothing
-    from array import array
     out = S.Scheduler.handle_pdflip_match_probe(
         fake, PdFlipMatchProbeReqInput(rid="r~probe", input_ids=array("q", [1, 2, 3])))
     assert out.success is False and "boom" in out.message
@@ -303,6 +442,15 @@ def test_ipc_roundtrip_of_the_probe_structs():
                                      mm_spans=[[0, 1]])
     o2 = IO.msgpack_decode(IO.msgpack_encode(o))
     assert o2.device_tokens == 1 and list(o2.input_ids) == [3] and o2.mm_spans == [[0, 1]]
+    # S56r A3: the coalesced batch rides the same structs (msgpack wire: a PickleWrapper; pickle IPC: the object)
+    import pickle
+
+    a.batch = IO.PickleWrapper(pickle.dumps([{"rid": "b", "input_ids": array("q", [5]), "mm_inputs": None,
+                                              "extra_key": None, "tokenize_ms": 0.0}]))
+    b = IO.msgpack_decode(IO.msgpack_encode(a))
+    assert pickle.loads(b.batch.data)[0]["rid"] == "b"
+    a.batch = IO.wrap_as_pickle([{"rid": "c"}])
+    assert IO.unwrap_from_pickle(pickle.loads(pickle.dumps(a)).batch)[0]["rid"] == "c"
 
 
 def test_a_text_prompt_asks_d_with_the_front_ids_and_media_goes_whole(caplog):

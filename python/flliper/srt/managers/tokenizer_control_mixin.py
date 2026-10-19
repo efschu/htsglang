@@ -411,9 +411,57 @@ class TokenizerControlMixin:
         self: TokenizerManager, obj: PdFlipMatchProbeReqInput
     ) -> PdFlipMatchProbeReqOutput:
         """S56 D-MATCH-PROBE: how much of this tokenized prompt group D holds now (device + host tier), answered by
-        TP0 after every rank walked the same tree (pdflip/d_match_probe.py). Serialized like every communicator."""
+        TP0 (pdflip/d_match_probe.py). S56r A3: the communicator is serial and each call waits one scheduler intake
+        round, so probes that arrive while one is in flight are COALESCED into the next call (``batch``): a burst of
+        k arrivals costs at most two rounds, not k (SOLL R2: a kurz request is not held behind k D-prefill chunks)."""
         self.auto_create_handle_loop()
-        return (await self.pdflip_match_probe_communicator(obj))[0]
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        q = self.__dict__.setdefault("_pdflip_probe_wait", [])
+        q.append((obj, fut))
+        if not self.__dict__.get("_pdflip_probe_drain"):
+            # a task of its own: a caller cancelled mid-wait (client gone) never strands the probes queued behind it
+            self.__dict__["_pdflip_probe_drain"] = asyncio.ensure_future(self._pdflip_probe_drain_loop())
+        return await fut
+
+    async def _pdflip_probe_drain_loop(self: TokenizerManager) -> None:
+        from flliper.srt.managers.io_struct import unwrap_from_pickle, wrap_as_pickle
+
+        q = self.__dict__.setdefault("_pdflip_probe_wait", [])
+        try:
+            while q:
+                items = [it for it in q if not it[1].done()]
+                del q[:]
+                if not items:
+                    continue
+                head = items[0][0]
+                head.batch = wrap_as_pickle([
+                    {"rid": o.rid, "input_ids": o.input_ids, "mm_inputs": o.mm_inputs, "extra_key": o.extra_key,
+                     "tokenize_ms": float(o.tokenize_ms or 0.0)} for o, _f in items[1:]]) if len(items) > 1 else None
+                try:
+                    out = (await self.pdflip_match_probe_communicator(head))[0]
+                    more = unwrap_from_pickle(out.batch) if out.batch is not None else []
+                    outs = [out] + [PdFlipMatchProbeReqOutput(**d) for d in (more or [])]
+                    for i, (_o, f) in enumerate(items):
+                        if f.done():
+                            continue
+                        if i < len(outs):
+                            f.set_result(outs[i])
+                        else:
+                            f.set_result(PdFlipMatchProbeReqOutput(
+                                rid=_o.rid, success=False, message="batch answer missing"))
+                except BaseException as e:  # noqa: BLE001 -- every waiter gets the failure, none hangs
+                    for _o, f in items:
+                        if not f.done():
+                            f.set_exception(e if isinstance(e, Exception) else RuntimeError("probe drain cancelled"))
+                    if not isinstance(e, Exception):
+                        for _o, f in q:
+                            if not f.done():
+                                f.set_exception(RuntimeError("probe drain cancelled"))
+                        del q[:]
+                        raise
+        finally:
+            self.__dict__["_pdflip_probe_drain"] = None
 
     async def pdflip_park_running(
         self: TokenizerManager, obj: PdFlipParkRunningReqInput

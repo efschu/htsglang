@@ -6613,7 +6613,8 @@ class Front:
             self.counters["l3_index_price_failed"] += 1
             logger.info("PDFLIP L3-INDEX-PRICE rid=%s FAILED %s: %s (no store credit)",
                         rid, type(e).__name__, str(e)[:160])
-            return 0, "none"
+            # S56r A1: "unread" is not "the store holds nothing" -- the D-probe price asks again or decides nothing
+            return 0, "unread"
         self.counters["l3_index_probes"] += 1
         # ZERO-ANCHOR 1015: the arrival's anchored depth and KV depth, kept for
         # the type-A split of this rid's P leg (P-REUSE-GAP); bounded
@@ -6644,7 +6645,8 @@ class Front:
                         getattr(d, "form", "list"), int(getattr(d, "asked", 0)))
         return int(d.tokens), str(d.tier)
 
-    def _d_probe_start(self, rid: str, path: str, payload: Any) -> "Optional[asyncio.Future]":
+    def _d_probe_start(self, rid: str, path: str, payload: Any,
+                       timeout_s: Optional[float] = None) -> "Optional[asyncio.Future]":
         """S56 D-MATCH-PROBE: start D's probe for this arrival (None: switch off, no D group, unpriced shape)."""
         if not envs.FLLIPER_PDFLIP_D_MATCH_PROBE.get():
             return None
@@ -6654,8 +6656,10 @@ class Front:
         if path not in ("/v1/messages", "/v1/chat/completions", "/generate"):
             return None
         body = {"path": path, "payload": payload}
-        timeout = envs.FLLIPER_PDFLIP_D_MATCH_PROBE_TIMEOUT_MS.get() / 1000.0
-        return asyncio.ensure_future(self._d_probe_post(D, body, timeout))
+        timeout = (envs.FLLIPER_PDFLIP_D_MATCH_PROBE_TIMEOUT_MS.get() / 1000.0) if timeout_s is None else timeout_s
+        task = asyncio.ensure_future(self._d_probe_post(D, body, timeout))
+        task._dmp_req = (str(path), payload)  # S56r A1: the same probe again, if D does not answer
+        return task
 
     async def _d_probe_post(self, g: "Group", body: dict, timeout: float) -> Tuple[int, str]:
         """S56: the probe's POST -- a plain request on the front's session (no RPC-ledger lines: one per arrival)."""
@@ -6664,37 +6668,87 @@ class Front:
                                      timeout=ClientTimeout(total=timeout)) as r:
             return r.status, (await r.read()).decode(errors="replace")
 
-    async def _d_probe_result(self, rid: str, task: "asyncio.Future") -> "Optional[_dmp.ProbeAnswer]":
-        """S56: D's parsed answer, or None -- a failed probe is a NAMED defect (``PDFLIP D-PROBE-FAILED``), never
-        silent: the front's own count then stands for this one request."""
+    async def _d_probe_once(self, rid: str, task: "asyncio.Future") -> "Tuple[Optional[_dmp.ProbeAnswer], str, bool]":
+        """S56r A1: one probe answer -> (answer | None, why, retry?). ``retry`` is True for what a later attempt can
+        change (no answer, timeout, 5xx, D's scheduler refused once); False for what it cannot (4xx: D rejects the
+        payload itself, the leg will get the same answer; ``group_min_needed``; a malformed answer)."""
         try:
             code, text = await task
         except Exception as e:  # noqa: BLE001
-            code, text = 0, f"{type(e).__name__}: {e}"
-        ans = None
-        why = ""
-        if code == 200:
-            try:
-                body = json.loads(text)
-            except (TypeError, ValueError):
-                body, why = None, "not json"
-            ans = _dmp.parse_answer(body)
-            if ans is None and not why:
-                why = str((body or {}).get("message") or "incomplete answer")[:200] if isinstance(body, dict) \
-                    else "incomplete answer"
-        else:
-            why = "status=%s %s" % (code, str(text)[:200])
+            return None, f"{type(e).__name__}: {e}"[:200], True
+        if code != 200:
+            return None, "status=%s %s" % (code, str(text)[:200]), (code == 0 or int(code) >= 500)
+        try:
+            body = json.loads(text)
+        except (TypeError, ValueError):
+            return None, "not json", False
+        ans = _dmp.parse_answer(body)
         if ans is None:
-            self.counters["d_probe_failed"] += 1
-            logger.warning("PDFLIP D-PROBE-FAILED rid=%s why=%s -- no exact D number for this arrival (S56: a "
-                           "defect, named; the front's own count stands for this one request)", rid, why)
-            return None
+            msg = str((body or {}).get("message") or "incomplete answer")[:200] if isinstance(body, dict) \
+                else "incomplete answer"
+            retry = (isinstance(body, dict) and body.get("success") is False and bool(body.get("retry", True))
+                     and not msg.startswith("group_min_needed"))
+            return None, msg, retry
         if not _dmp.seq_spans_ok(ans.mm_spans, ans.n):
+            return None, "spans_out_of_range n=%d spans=%s" % (ans.n, list(ans.mm_spans)[:4]), False
+        return ans, "", False
+
+    async def _d_probe_result(self, rid: str, task: "asyncio.Future") -> "Optional[_dmp.ProbeAnswer]":
+        """S56 + S56r A1 (user 19.10. "warum wird irgendwas geschätzt?"): D's exact answer, or None. There is NO
+        fallback to the front's own count: a failed probe is ASKED AGAIN (same body, backoff
+        ``FLLIPER_PDFLIP_D_MATCH_PROBE_RETRY_MS``) until D answers or the deadline
+        ``FLLIPER_PDFLIP_D_MATCH_PROBE_DEADLINE_MS`` (from the first POST) runs out; a failure no attempt can change
+        ends at once. Every failed attempt is named (``PDFLIP D-PROBE-FAILED attempt=k``). None = no exact number:
+        the caller decides NOTHING on an estimate (``_x_unpriced``: D's own admission measures)."""
+        deadline = time.monotonic() + envs.FLLIPER_PDFLIP_D_MATCH_PROBE_DEADLINE_MS.get() / 1000.0
+        per_try = envs.FLLIPER_PDFLIP_D_MATCH_PROBE_TIMEOUT_MS.get() / 1000.0
+        backoff = max(0.0, envs.FLLIPER_PDFLIP_D_MATCH_PROBE_RETRY_MS.get() / 1000.0)
+        req = getattr(task, "_dmp_req", None)
+        attempt = 1
+        while True:
+            ans, why, retry = await Front._d_probe_once(self, rid, task)
+            if ans is not None:
+                if attempt > 1:
+                    self.counters["d_probe_recovered"] += 1
+                    logger.info("PDFLIP D-PROBE-RECOVERED rid=%s attempt=%d (S56r A1: the exact number arrived on a "
+                                "later attempt, nothing was decided before it)", rid, attempt)
+                return ans
             self.counters["d_probe_failed"] += 1
-            logger.warning("PDFLIP D-PROBE-FAILED rid=%s why=spans_out_of_range n=%d spans=%s", rid, ans.n,
-                           list(ans.mm_spans)[:4])
-            return None
-        return ans
+            left = deadline - time.monotonic()
+            again = bool(retry and req is not None and left > backoff + 0.05)
+            logger.warning("PDFLIP D-PROBE-FAILED rid=%s attempt=%d why=%s next=%s left_s=%.2f -- no exact D number "
+                           "yet (S56r A1: never the front's count; %s)", rid, attempt, why,
+                           "retry" if again else "give_up", max(0.0, left),
+                           "asked again" if again else "D's own admission measures this request")
+            if not again:
+                return None
+            if backoff > 0:
+                await asyncio.sleep(backoff)
+            left = deadline - time.monotonic()
+            task = Front._d_probe_start(self, rid, req[0], req[1], timeout_s=max(0.05, min(per_try, left)))
+            if task is None:  # the switch went off / D went away between attempts
+                return None
+            attempt += 1
+
+    def _x_unpriced(self, rid: str, c: Any, est_prompt: int, uncached_p: int, media: bool):
+        """S56r A1: the arrival WITHOUT an exact number (D's probe gave up). Nothing is classified on an estimate --
+        not the front's count, not the ledger, not chars/3: ``pending`` is 0 only as the ROUTE that sends the request
+        to D's own admission, which measures exactly (X-GATE: over X -> W31/W50 requeue WITH D's extent, an image in
+        the uncached tail -> W123 requeue as P-only); while P is awake P's batch takes it at P's exact number
+        ``uncached_p`` (n - the shared store, on ids that ARE D's for a text prompt), or P measures it itself."""
+        from types import SimpleNamespace
+
+        self.counters["d_probe_unpriced"] += 1
+        n = int(c.n) if (c is not None and not media) else int(est_prompt)
+        logger.warning("PDFLIP D-PROBE-UNPRICED rid=%s n=%d n_src=%s p_uncached=%s -- no exact D number by the "
+                       "deadline: the request is NOT classified on an estimate; route = D's admission (it measures: "
+                       "X-GATE W31 / W123 requeue with D's own extent) or, P awake, P's batch (S56r A1)",
+                       rid, n, "front_ids" if (c is not None and not media) else "size_only",
+                       uncached_p if uncached_p >= 0 else "unknown")
+        return SimpleNamespace(pending=0, n=n, known=False, credit=0, src="d_probe_unpriced", store_depth=0,
+                               credit_epoch=None, mm=False, mm_cached=False, image_end=0, d_reach=0, d_floor=0,
+                               probe=None, image_in_tail=False, unpriced=True, uncached_p=int(uncached_p),
+                               n_src="front_ids" if (c is not None and not media) else "size_only")
 
     async def _x_exact_price(self, rid: str, path: str, payload: Any, text: str,
                              est_uncached: int, est_prompt: int, multimodal: bool = False):
@@ -6778,6 +6832,19 @@ class Front:
                 _probe_task = Front._d_probe_start(self, rid, path, payload)
         # S56: D's answer replaces the front's ids (D's token space: images expanded, pad values = the store keys)
         _probe = await Front._d_probe_result(self, rid, _probe_task) if _probe_task is not None else None
+        if _probe_task is not None and _probe is None:
+            # S56r A1: no exact D number -- never the front's count; P's exact number where the ids are D's (a text
+            # prompt's front ids, X-EXACT-TOKENS 137/137 and the probe's own fast path), else none
+            _up = -1
+            _ns_k, _ns_v = payload_namespace(payload)
+            if c is not None and not _media and mm is None and _ns_k:
+                try:
+                    _st, _st_tier = await self._store_probe_depth(
+                        rid, c.ids, envs.FLLIPER_PDFLIP_FRONT_EXACT_TIMEOUT_MS.get() / 1000.0, extra_key=_ns_v)
+                    _up = max(0, int(c.n) - int(_st)) if _st_tier != "unread" else -1
+                except Exception:  # noqa: BLE001 -- no store reading: P measures it itself
+                    _up = -1
+            return Front._x_unpriced(self, rid, c, est_prompt, _up, _media)
         _c_front, _mm_front = c, mm
         if _probe is not None:
             c = _FtCount(n=int(_probe.n), ids=_probe.ids, ms=(c.ms if c is not None else 0.0),
@@ -6820,6 +6887,12 @@ class Front:
                           envs.FLLIPER_PDFLIP_FRONT_EXACT_TIMEOUT_MS.get() / 1000.0 - (time.monotonic() - t0))
             l3, tier = await self._store_probe_depth(
                 rid, c.ids if mm is None else c.ids[: mm.first_image], _st_budget, extra_key=ns)
+            if _probe is not None and tier == "unread":
+                # S56r A1: the store's depth is half of THE price -- asked once more, then no decision on a guess
+                l3, tier = await self._store_probe_depth(
+                    rid, c.ids, envs.FLLIPER_PDFLIP_FRONT_EXACT_TIMEOUT_MS.get() / 1000.0, extra_key=ns)
+                if tier == "unread":
+                    return Front._x_unpriced(self, rid, _c_front, est_prompt, -1, _media)
         if l3 > 0 and (isolated or self.tspans.record_store_depth(c.ids, l3, source=tier) > 0):
             self.counters["l3_index_credit"] += 1
             self.counters["l3_index_credit_tokens"] += int(l3)
@@ -7086,7 +7159,7 @@ class Front:
         ctx = self._context_len()
         if ctx <= 0:
             return None
-        if xx is not None:
+        if xx is not None and not (getattr(xx, "unpriced", False) and str(getattr(xx, "n_src", "")) != "front_ids"):
             tokens, how, limit = int(xx.n), "exact", ctx
         elif lb:
             tokens, how, limit = int(lb), "exact-lower-bound", ctx
@@ -8117,7 +8190,7 @@ class Front:
             self._x_exact_reprice_queue("seq_mark")
         return n
 
-    def _park_handback(self, rids: Sequence[str]) -> List[str]:
+    def _park_handback(self, rids: Sequence[str], started: Sequence[str] = ()) -> List[str]:
         """PARK-HANDBACK (user 02.10.: while P is awake every prefill is P's):
         a D-prefill leg (no P leg 1, ``_d_prefill_legs``) that D holds
         UNSTARTED at a park -- its ``held`` list, or a leg the front sent that
@@ -8148,6 +8221,12 @@ class Front:
                                       "x": int(self.tp_prefill_max_tokens)}
             self.counters["park_handback"] += 1
             out.append(rid)
+            if rid in started:
+                # S56r: an R6 redirect of a RUNNING D prefill (the text below is the unstarted case)
+                logger.info("PDFLIP PARK-HANDBACK rid=%s epoch=%d started=1 (R6: D was prefilling it; its leg "
+                            "closes, D aborts it -- the chunks D finished stay in D's tree and its write-through "
+                            "-- and P's batch takes the rest)", rid, self.epoch)
+                continue
             logger.info("PDFLIP PARK-HANDBACK rid=%s epoch=%d (D held this prefill unstarted at the "
                         "park; its leg closes and P's batch takes it -- D gets it under E2, "
                         "d_compute=0)", rid, self.epoch)
@@ -10819,6 +10898,12 @@ class Front:
             _rem_q = int(_xx.probe.uncached_p)
             logger.info("PDFLIP P-PRICE rid=%s d_uncached=%d p_uncached=%d where=arrival (S56: queued for P, priced "
                         "at P's exact number)", rid, int(remainder), _rem_q)
+        _unpriced = bool(_xx is not None and getattr(_xx, "unpriced", False))
+        if _unpriced and int(getattr(_xx, "uncached_p", -1)) >= 0 and (_collect_p or _p_phase) and not _sk:
+            # S56r A1: no D number, but P's is exact (n - the shared store on D's ids)
+            _rem_q = int(_xx.uncached_p)
+            logger.info("PDFLIP P-PRICE rid=%s d_uncached=unpriced p_uncached=%d where=arrival (S56r A1: queued for "
+                        "P, priced at P's exact number)", rid, _rem_q)
         p = Pending(rid, request.path, payload, text, time.time(), fut, est_prompt=est_prompt,
                         est_uncached=_rem_q, span_known=known,
                     store_span_est=store_span,
@@ -10828,9 +10913,11 @@ class Front:
                     # length -- only P can serve it (Pending.p_only).
                     p_only=(_verdict == VERDICT_STAGE and not _mm_cached) or _probe_p_only,
                     # S56: priced from D's exact numbers -- no ledger reprice overwrites them
-                    probe_priced=bool(_xx is not None and getattr(_xx, "probe", None) is not None),
+                    # S56r A1: an UNPRICED entry is never repriced by the ledger either -- D's admission measures it
+                    probe_priced=bool(_xx is not None and (getattr(_xx, "probe", None) is not None or _unpriced)),
                     est_uncached_p=(int(_xx.probe.uncached_p)
-                                    if _xx is not None and getattr(_xx, "probe", None) is not None else -1),
+                                    if _xx is not None and getattr(_xx, "probe", None) is not None
+                                    else int(getattr(_xx, "uncached_p", -1)) if _unpriced else -1),
                     mm_image_end=(int(getattr(_xx, "image_end", 0) or 0) if _xx is not None else 0),
                     # UNIFY S7 (27B RC7-X): queued by the busy/idle split, not by the phase.
                     x_deferred=_x_band_deferred and not short_refused,
@@ -11701,7 +11788,7 @@ class Front:
         counted = dict(self.__dict__.get("_r6_counted") or {})
         if not counted:
             return []
-        moved = self._park_handback(list(counted))
+        moved = self._park_handback(list(counted), started=list(counted))
         self.counters["r6_redirected"] += len(moved)
         logger.info("PDFLIP R6-REDIRECT epoch=%d why=%s counted=%s moved=%s -- the running D prefill(s) R6 counted go "
                     "to P with the set (S56, SOLL R6)", self.epoch, why,
@@ -15326,9 +15413,11 @@ class Front:
         # the estimate (never a number invented here).
         if d_extent is not None and int(d_extent) > int(p.est_uncached):
             p.est_uncached = int(d_extent)
-        elif d_extent is not None and not getattr(p, "probe_priced", False) and int(p.est_uncached) > int(d_extent):
+        elif d_extent is not None and int(p.est_uncached) > int(d_extent):
             # S56 (user 19.10. "nichts schätzen"): D NAMED its exact extent -- the whole-prompt figure of a fresh
-            # Pending is an estimate and gives way to it (rc15 pdflip-14-74: 82066 -> D's 1878)
+            # Pending is an estimate and gives way to it (rc15 pdflip-14-74: 82066 -> D's 1878). S56r: an arrival
+            # probe's number gives way too -- D's extent is measured at D's admission, LATER than the probe (the
+            # number at the decision, user 19.10.); the W123 branch below still sets P's own number for a P-only one
             p.est_uncached = int(d_extent)
         try:
             _vis_reroute = b"(vision reroute)" in body or b"W123" in body

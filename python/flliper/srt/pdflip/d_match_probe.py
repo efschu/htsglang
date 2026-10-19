@@ -25,9 +25,12 @@ THE PROBE. ``POST /pdflip/match_probe {"path", "payload"}`` on group D:
      chat template, Anthropic conversion with tool_result images, the image processor through D-MM-ITEM-CACHE -- a
      later real leg of the same images hits that cache);
   2. ``PdFlipMatchProbeReqInput`` goes to the scheduler like every control request: TP0 receives, the group
-     broadcasts, EVERY rank pads the image items as its intake does and runs the admission's own
-     ``tree_cache.match_prefix`` (no Req, ``cow_mamba`` off: nothing allocated) -- the same walk on every rank, so
-     the trees stay identical (Rang-Einigkeit); TP0 answers;
+     broadcasts, EVERY rank pads the image items as its intake does (a broadcast mm process needs every rank) and
+     reads the admission's usable prefix with ``peek_admission_match`` -- READ-ONLY (S56r review A2: no split, no
+     LRU, no stamp, no counter, no slot; ``match_prefix`` itself is none of that). TP0 answers. Its number is the
+     GROUP's on a Form A group (H98: the workers adopt the host's depth) or on a symmetric host tier (replica
+     trees); on an asymmetric tier without Form A the admission takes the RU MIN over the ranks, which one rank
+     cannot read -- the probe then answers success=False by name (``group_min_needed``), never TP0's guess;
   3. the answer: D's ids (scheduler token space), the device tokens and the host-tier tokens of the match (the
      admission's usable prefix: KV + the Mamba anchor), the image pad spans.
 The front then asks the SHARED store (L2 arenas + L3 stem index, ``front_store``) with D's ids -- image pages
@@ -113,17 +116,142 @@ def mm_spans(image_inputs: Any) -> List[List[int]]:
     return out
 
 
-def probe_stand_in(rid: str) -> Any:
-    """The request the probe's ``match_prefix`` names: its rid (never a live rid -- every group-planted verdict
-    keyed by rid misses it), a mamba slot SENTINEL (``mamba_pool_idx`` set, so the COW branch of
-    ``MambaComponent.finalize_match_result`` allocates nothing and only writes the copy source onto this object),
-    no session (no streaming slot). With it the walk applies the admission's own refusals (#928 a/b, strict
-    resume), so the probe's depth is the depth the admission would take."""
-    import types
+class PeekUnsupported(RuntimeError):
+    """S56r: the tree carries a component the read-only walk has no exact rule for (SWA, ...) -- the probe answers
+    success=False by name; the front then takes the A1 path (no estimate)."""
 
-    return types.SimpleNamespace(rid=str(rid), mamba_pool_idx=-1, mamba_cow_src_index=None,
-                                 mamba_needs_clear=True, mamba_slot_acquired_this_admission=False,
-                                 session=None, last_node=None, extra_key=None)
+
+def peek_admission_match(tree_cache: Any, ids: Any, extra_key: Optional[str], limit: int) -> Tuple[int, int, int]:
+    """S56r (review A2, user 19.10. "alle zahlen liegen doch schwarz auf weiß vor"): the ADMISSION's usable prefix of
+    ``ids`` -- (device tokens, host-tier tokens, key depth) -- read off the tree WITHOUT TOUCHING IT.
+
+    ``UnifiedRadixCache.match_prefix`` is not read-only, and S56 called it: ``_split_node`` re-shapes the tree at a
+    partial match (new node, LRU remove/insert, clones), ``_match_post_processor`` moves the matched chain to MRU
+    in every component LRU and re-stamps ``last_access_time`` up to the root, ``MambaComponent.finalize_match_result``
+    bumps the #928 refusal counters and prints MATCH-CENSUS-DEEP / #928 lines under the probe's rid, the mamba host
+    validator counts MAMBA-HOST-RESUME, and the #904/#1061/#1420 instruments count the walk. A probe of a request
+    that then goes to P would have re-ordered D's eviction for nothing.
+
+    This walk reads the same facts with the same rules and writes NOTHING (no node, no LRU, no stamp, no counter, no
+    log line, no slot, no lock):
+      * key: ``RadixKey(ids, extra_key, limit)`` -> bigram view (EAGLE) -> page aligned, as ``match_prefix``;
+      * the walk of ``_match_prefix_helper``: a dead node (evicted, not backuped) stops it; a PARTIAL child is NOT
+        split -- its would-be upper half is judged where ``_split_node`` would put it (FULL: the child's slice ->
+        the child's validity; MAMBA: ``redistribute_on_node_split`` leaves the upper half without a state -> never an
+        anchor);
+      * validators: FULL ``value is not None`` (device) / ``or backuped`` (host tier), MAMBA the component's own
+        ``explain_match_refusal`` (side-effect free, defined on the same ``resume_refusal_reason`` as the validator:
+        state present + checkpoint grid + the per-path cap), with ``match_device_only`` exactly as the walk builds
+        them (``cache_controller is None`` -> device only);
+      * ``FullComponent.finalize_match_result``: host hit = the host rows from the best node up to the best device
+        node; ``MambaComponent.finalize_match_result``: the #747 strict resume (no host tier only) and the #928 (a)/(b)
+        zeroing through ``tp_match_floor.anchor_unusable`` (the side-effect-free twin the RU vote already uses);
+      * ``FLLIPER_RADIX_FORCE_MISS`` zeroes like ``Req.init_next_round_input``.
+    Any other component type raises ``PeekUnsupported`` (named, never guessed)."""
+    from flliper.srt.environ import envs
+    from flliper.srt.mem_cache.radix_cache import RadixKey
+    from flliper.srt.mem_cache.unified_cache_components.tree_component import ComponentType
+
+    tc = tree_cache
+    comps = tuple(getattr(tc, "_components_tuple", ()) or ())
+    kinds = {c.component_type for c in comps}
+    unknown = kinds - {ComponentType.FULL, ComponentType.MAMBA}
+    if unknown:
+        raise PeekUnsupported("peek: no read-only rule for component(s) %s" % sorted(str(k) for k in unknown))
+    if getattr(tc, "disable", False) or envs.FLLIPER_RADIX_FORCE_MISS.get():
+        return 0, 0, 0
+    key = RadixKey(token_ids=ids, extra_key=extra_key, limit=int(limit))
+    key, _ = key.maybe_to_bigram_view(getattr(tc, "is_eagle", False))
+    page = int(getattr(tc, "page_size", 1) or 1)
+    if len(key) == 0:
+        return 0, 0, 0
+    key = key.page_aligned(page)
+    if len(key) == 0:
+        return 0, 0, 0
+    device_only = getattr(tc, "cache_controller", None) is None
+    mamba = getattr(tc, "components", {}).get(ComponentType.MAMBA) if ComponentType.MAMBA in kinds else None
+    F = ComponentType.FULL
+
+    def _full_ok(node: Any, dev_only: bool) -> bool:
+        cd = node.component_data[F]
+        return cd.value is not None or (not dev_only and cd.host_value is not None)
+
+    def _ok(node: Any, depth: int, dev_only: bool) -> bool:
+        if not _full_ok(node, dev_only):
+            return False
+        if mamba is not None and mamba.explain_match_refusal(node, depth, match_device_only=dev_only) is not None:
+            return False
+        return True
+
+    root = tc.root_node
+    node = root
+    child_key = key.child_key(page)
+    value_lens: List[int] = []          # the walk's ``value`` list (device chunks of non-evicted nodes), lengths
+    best_node, best_dev_node, best_dev_len = root, root, 0
+    best_virtual = None                 # (child, prefix_len) when the best node is the unsplit upper half
+    best_dev_virtual = False
+    cum = 0
+    while len(key) > 0 and child_key in node.children:
+        child = node.children[child_key]
+        ccd = child.component_data[F]
+        if ccd.value is None and ccd.host_value is None:  # evicted and not backuped: a dead node stops the walk
+            break
+        prefix_len = child.key.match(key, page_size=page)
+        if prefix_len < len(child.key):
+            # the would-be split parent [0, prefix_len) of ``child`` -- judged, not built
+            if ccd.value is not None:
+                value_lens.append(int(prefix_len))
+            cum += prefix_len
+            if mamba is None:  # FULL only: the upper half carries the child's slices (redistribute_on_node_split)
+                if _full_ok(child, device_only):
+                    best_node, best_virtual = node, (child, int(prefix_len))
+                if _full_ok(child, True):  # device validity: the slice of a device value is on the device
+                    best_dev_node, best_dev_len, best_dev_virtual = node, len(value_lens), True
+            # with MAMBA the upper half holds no state (redistribute_on_node_split): never an anchor
+            break
+        if ccd.value is not None:
+            value_lens.append(len(ccd.value))
+        node = child
+        cum += prefix_len
+        if _ok(node, cum, device_only):
+            best_node, best_virtual = node, None
+        if device_only:
+            if best_node is node:
+                best_dev_node, best_dev_len, best_dev_virtual = node, len(value_lens), False
+        elif _ok(node, cum, True):
+            best_dev_node, best_dev_len, best_dev_virtual = node, len(value_lens), False
+        key = key[prefix_len:]
+        if len(key):
+            child_key = key.child_key(page)
+    key_depth = int(cum)
+    dev = int(sum(value_lens[:best_dev_len]))
+    # FullComponent.finalize_match_result: host rows from the best node up to (not incl.) the best device node
+    host = 0
+    if best_virtual is not None and not (best_dev_virtual and best_dev_node is best_node):
+        ch, pl = best_virtual
+        hv = ch.component_data[F].host_value
+        if hv is not None:
+            host += min(int(pl), len(hv))
+    n_ = best_node
+    while n_ is not best_dev_node and n_ is not root and n_ is not None:
+        hv = n_.component_data[F].host_value
+        if hv is not None:
+            host += len(hv)
+        n_ = n_.parent
+    if mamba is not None:
+        interval = getattr(mamba, "mamba_checkpoint_interval", None)
+        if (interval is not None and getattr(mamba, "mamba_ckpt_strict_resume", False)
+                and getattr(tc, "cache_controller", None) is None and best_dev_len > 0):
+            from flliper.srt.mem_cache.mamba_ckpt_utils import floor_to_interval
+
+            if dev != floor_to_interval(int(sum(value_lens)), interval):
+                return 0, 0, key_depth
+        if best_node is not root:
+            from flliper.srt.managers.tp_match_floor import anchor_unusable
+
+            if anchor_unusable(tc, best_node):  # #928 (a) no state / (b) foreign pool: the admission zeroes
+                return 0, 0, key_depth
+    return dev, host, key_depth
 
 
 def match_numbers(match_result: Any) -> Tuple[int, int, int]:

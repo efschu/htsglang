@@ -1712,13 +1712,18 @@ class PdFlipMatchProbeReqInput(BaseReq, kw_only=True):
     jedem zeitpunkt?"; SOLL R11): the front asks group D, before its verdict, how much of a prompt D holds NOW. The
     tokenizer manager tokenized the prompt exactly as its POST will be (``input_ids`` and ``mm_inputs`` of the
     TokenizedGenerateReqInput); every TP rank pads the image items like an intake and walks its radix tree with the
-    admission's own key; TP0 answers. Nothing is queued, nothing allocated (``cow_mamba`` off, no Req)."""
+    admission's usable prefix READ-ONLY (S56r: ``d_match_probe.peek_admission_match``); TP0 answers. Nothing is
+    queued, allocated, split, stamped or counted."""
 
     input_ids: Optional[array] = None
     mm_inputs: Optional[PickleWrapper] = None
     extra_key: Optional[str] = None
     #: the tokenizer's tokenize time (ms), echoed for the answer's line
     tokenize_ms: float = 0.0
+    #: S56r A3: further probes answered in the SAME intake round -- a list of
+    #: ``{"rid", "input_ids", "mm_inputs", "extra_key", "tokenize_ms"}`` (pickled); the communicator is serial, so
+    #: without it a burst of k arrivals waited k scheduler rounds (k D-prefill chunks while D prefills)
+    batch: Optional[PickleWrapper] = None
 
 
 class PdFlipMatchProbeReqOutput(BaseReq, kw_only=True):
@@ -1736,6 +1741,8 @@ class PdFlipMatchProbeReqOutput(BaseReq, kw_only=True):
     mm_spans: List[List[int]] = []
     handle_ms: float = 0.0
     tokenize_ms: float = 0.0
+    #: S56r A3: the answers of the input's ``batch``, in its order (pickled list of dicts with the fields above)
+    batch: Optional[PickleWrapper] = None
 
 
 class PdFlipLaneFloorReqInput(BaseReq, kw_only=True):

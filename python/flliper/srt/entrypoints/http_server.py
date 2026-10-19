@@ -1523,7 +1523,8 @@ async def pdflip_match_probe(raw_request: Request):
             raw_request=raw_request,
         )
         if obj is None:
-            return ORJSONResponse({"success": False, "message": "shape not priced"}, status_code=200)
+            return ORJSONResponse({"success": False, "message": "shape not priced", "retry": False},
+                                  status_code=200)
         tm.auto_create_handle_loop()
         tokenized = await tm._tokenize_one_request(obj)
         mm = tokenized.mm_inputs
@@ -1544,12 +1545,20 @@ async def pdflip_match_probe(raw_request: Request):
             tokenize_ms=t_tok,
         )
         req.mm_inputs = _wrap_as_pickle_probe(req.mm_inputs)
+    except Exception as e:
+        # S56r A1: the payload itself does not tokenize here -- the leg's POST meets the same; asking again cannot
+        # change it (the front gives up at once and lets D's admission answer the request)
+        return ORJSONResponse({"success": False, "message": f"{type(e).__name__}: {str(e)[:300]}", "retry": False},
+                              status_code=200)
+    try:
         out = await tm.pdflip_match_probe(req)
     except Exception as e:
-        return ORJSONResponse({"success": False, "message": f"{type(e).__name__}: {str(e)[:300]}"},
+        return ORJSONResponse({"success": False, "message": f"{type(e).__name__}: {str(e)[:300]}", "retry": True},
                               status_code=200)
     if not out.success:
-        return ORJSONResponse({"success": False, "message": out.message}, status_code=200)
+        return ORJSONResponse({"success": False, "message": out.message,
+                               "retry": not str(out.message or "").startswith("group_min_needed")},
+                              status_code=200)
     return ORJSONResponse(
         {
             "success": True,
