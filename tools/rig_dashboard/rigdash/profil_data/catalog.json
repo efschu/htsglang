@@ -50161,8 +50161,8 @@
      "edge": "K13",
      "effect": "Resident experts against KV.",
      "evidence": {
-      "anchor": "FLLIPER_MOE_RESIDENT_EXPERT_FRACTION < 1.0",
-      "aufloesung": "nah",
+      "anchor": "additionally gated on FLLIPER_MOE_RESIDENT_EXPERT_FRACTION < 1.0",
+      "aufloesung": "eindeutig",
       "file": "python/flliper/srt/environ.py",
       "row_note": 4051,
       "zeile": 4051
@@ -89909,8 +89909,8 @@
   "beleg_aufloesung": {
    "problem": [],
    "status": {
-    "eindeutig": 122,
-    "nah": 12,
+    "eindeutig": 123,
+    "nah": 11,
     "other_line": 5
    }
   },
@@ -89918,16 +89918,16 @@
    "27b": {
     "problem": [],
     "status": {
-     "eindeutig": 122,
-     "nah": 12,
+     "eindeutig": 123,
+     "nah": 11,
      "other_line": 5
     }
    },
    "nf": {
     "problem": [],
     "status": {
-     "eindeutig": 84,
-     "nah": 10,
+     "eindeutig": 85,
+     "nah": 9,
      "other_line": 45
     }
    }
@@ -89977,7 +89977,7 @@
   },
   "unexplained": 654
  },
- "tree_rev": "27b=0798c91fcd+nf=a8bb9f3075",
+ "tree_rev": "27b=0798c91fcd+nf=9582101580",
  "trees": {
   "27b": {
    "entries": 2643,
@@ -89985,7 +89985,7 @@
   },
   "nf": {
    "entries": 2639,
-   "rev": "a8bb9f3075"
+   "rev": "9582101580"
   }
  },
  "warnungen": []
