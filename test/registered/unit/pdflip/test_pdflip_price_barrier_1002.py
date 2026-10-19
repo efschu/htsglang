@@ -45,6 +45,11 @@ def _legacy_price_barrier_machinery(monkeypatch):
     """SOLL R2 (Review A h16u A2): under the set scheduler the barrier decides nothing (``Front.PRICE_BARRIER_DECIDES``
     False; see test_pdflip_set_scheduler_1017 A2). This file pins the retained machinery itself, so it arms it."""
     monkeypatch.setattr(F.Front, "PRICE_BARRIER_DECIDES", True)
+    # EZ-S1: with FLLIPER_PDFLIP_EXACT_CLASS on (default) the barrier reads no chars/3 price -- its candidate rule IS
+    # a chars/3 reading taken before the exact pricing (test_decision_numbers_1019::test_price_barrier_reads_no_chars3_price).
+    # This file pins the retained machinery, so it runs it in its rc17 form.
+    with envs.FLLIPER_PDFLIP_EXACT_CLASS.override(False):
+        yield
 
 
 class _Req:

@@ -71,6 +71,11 @@ ATTR_PRICED = "weg2_front_priced"
 #: H16V review A3: halbX (F_halb x X) of the same decision, computed by the front (SOLL R11: no rank-local flag).
 HEADER_HALFX = "x-pdflip-front-halfx"
 ATTR_HALFX = "weg2_front_halfx"
+#: EZ-S1 (plan R.1, MEASURE_ON_D stage 1): the front's decision action rides with the leg ("MEASURE_ON_D": the carried X is
+#: the MEASURING barrier halbX-1, D admits u < halbX and refuses the rest with its exact extent). Information for D's
+#: log -- D's gate logic is unchanged (``limit = min(static_x, front_x + one page)``).
+HEADER_ACTION = "x-pdflip-decision-action"
+ATTR_ACTION = "weg2_decision_action"
 
 #: Upper bound accepted from a header: a defensive sanity cap, far above any X.
 _MAX_TOKENS = 1 << 31
@@ -94,7 +99,8 @@ def tolerance_tokens(page_size: Optional[int]) -> int:
         return 1
 
 
-def request_headers(x: Optional[int], priced: Optional[int], halfx: Optional[int] = None) -> Dict[str, str]:
+def request_headers(x: Optional[int], priced: Optional[int], halfx: Optional[int] = None,
+                    action: Optional[str] = None) -> Dict[str, str]:
     """The headers the front adds to a D-direct leg 2; ``{}`` = nothing to carry.
 
     No header for ``x <= 0`` (no decision X: the static gate alone) and none with the
@@ -116,6 +122,8 @@ def request_headers(x: Optional[int], priced: Optional[int], halfx: Optional[int
             out[HEADER_HALFX] = str(max(0, int(halfx)))
         except (TypeError, ValueError):
             pass
+    if action:
+        out[HEADER_ACTION] = str(action)
     return out
 
 
@@ -176,6 +184,9 @@ def stamp_request(adapted: Any, raw_request: Any) -> None:
         setattr(adapted, ATTR_X, x)
         setattr(adapted, ATTR_PRICED, priced)
         setattr(adapted, ATTR_HALFX, parse_halfx(headers))
+        _act = headers.get(HEADER_ACTION) if hasattr(headers, "get") else None
+        if _act:
+            setattr(adapted, ATTR_ACTION, str(_act)[:32])
     except Exception:  # noqa: BLE001
         logger.warning("PDFLIP FRONT-X could not stamp %s on %s", ATTR_X, type(adapted).__name__)
 

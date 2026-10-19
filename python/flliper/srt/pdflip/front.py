@@ -188,6 +188,8 @@ from flliper.srt.pdflip import d_extend_beacon as _dxb  # S49: SOLL R6 counts on
 from flliper.srt.pdflip import d_match_probe as _dmp  # S56: the arrival class from D's exact numbers (R11)
 from flliper.srt.pdflip import front_x as _front_x  # FRONT-X-MIT: the decision X rides with the D leg
 from flliper.srt.pdflip import sum_price as _sp  # X-SUM-PRICE: the one rule
+from flliper.srt.pdflip import decision_record as _dr  # EZ-S1: the one DECISION record (SOLL R11)
+from flliper.srt.pdflip import decision_numbers as _dn  # EZ-S1: the numbers a decision stands on (exact, with source and age)
 
 logger = logging.getLogger("pdflip.front")
 
@@ -3004,6 +3006,13 @@ def _flip_single_flight(body):
                 "PDFLIP-FLIP SKIPPED epoch=%s sleep=%s wake=%s: %s -- one flip at a time "
                 "(FS, rc12o27 b1: a second flip's quiesce flushed P after the first one's release)",
                 getattr(self, "epoch", "?"), src, dst, reason)
+            try:  # EZ-S1 #89: the single-flight veto is an executor's refusal -- named in the record
+                _dec_front = getattr(type(self), "_dec", None)
+                if _dec_front is not None:
+                    _dec_front(self).alt("flip_single_flight", kind="phase_end", action="REFUSE", edge=False,
+                                         why="%s->%s: %s" % (src, dst, reason))
+            except Exception:  # noqa: BLE001
+                pass
             return
         self._flip_open = True
         try:
@@ -3901,6 +3910,9 @@ class Pending:
     lane_retake: bool = False
     lane_p_ran_s: float = 0.0
     lane_p_done_tokens: int = 0
+    #: EZ-S1: D's exact realised extent of a MEASURE_ON_D request (its refusal's report) and where it came from
+    measured_u: Optional[int] = None
+    measure_src: str = ""
 
 
 #: H102 (#23p, dkrnfbar1agent0925): A CLIENT THAT HANGS UP BEFORE ITS ANSWER
@@ -4536,6 +4548,7 @@ class Front:
         # cached-on-D TOKEN prefix (pdflip/front_tokens.py). Off = chars/3 pricing,
         # byte for byte; nothing below is constructed or imported then.
         self.x_exact = bool(envs.FLLIPER_PDFLIP_FRONT_EXACT_TOKENS.get())
+        self._dec_rec = _dr.Recorder(logger, epoch_of=lambda: int(getattr(self, "epoch", 0)))  # EZ-S1: the decision record
         #: FRONT-PREWARM: the front's start, the clock of the ``warming`` bound
         self._x_exact_t0 = time.monotonic()
         self.ftok = None
@@ -5221,6 +5234,25 @@ class Front:
             return {}
         rec = (self.__dict__.get("_x_decision") or {}).pop(str(rid), None)
         _after_p = pending is not None and not getattr(pending, "d_direct", False)
+        # EZ-S1 MEASURE_ON_D stage 1: a request with no exact number goes to D with the MEASURING barrier (front_x + one
+        # page == halbX - 1; ``halfx`` header = the real halbX) -- D admits u < halbX, refuses the rest with its extent
+        _meas = (self.__dict__.get("_measure_on_d") or {}).pop(str(rid), None)
+        if _meas is not None and not _after_p and envs.FLLIPER_PDFLIP_EXACT_CLASS.get():
+            hx, fx, _xm, _mseq, _mup = _meas
+            hdr = _front_x.request_headers(fx, 0, hx, action="MEASURE_ON_D")
+            if hdr:
+                self.counters["front_x_carried"] += 1
+                self.counters["measure_on_d_headers"] += 1
+                logger.info("PDFLIP FRONT-X rid=%s front_x=%d front_priced=0 static_x=%d action=MEASURE_ON_D halfx=%d "
+                            "(EZ-S1: the measuring barrier -- D refuses by name above front_x + one page = halfX-1 = %d "
+                            "with its exact extent; the class is formed on that, never on an estimate)", rid, int(fx),
+                            int(getattr(self, "tp_prefill_max_tokens", 0) or 0), int(hx), int(hx) - 1)
+                Front._dec(self).done(_mseq, rid, "front", "ok", detail="measure barrier front_x=%d halfX=%d" % (fx, hx))
+                _ms = self.__dict__.setdefault("_measure_sent", collections.OrderedDict())
+                _ms[str(rid)] = (int(_mseq), int(_mup))   # read by _measure_return when D's refusal comes back
+                while len(_ms) > Front.X_DECISIONS_KEPT:
+                    _ms.popitem(last=False)
+            return hdr
         if _after_p:
             # H16V review A3 (SOLL R11, "X nie ein fester Wert"): the hand-over from P carries the X at the depth D
             # continues from (the whole prompt is cached now), from the same X path as at arrival (curve, else the
@@ -6884,24 +6916,48 @@ class Front:
             attempt += 1
 
     def _x_unpriced(self, rid: str, c: Any, est_prompt: int, uncached_p: int, media: bool):
-        """S56r A1: the arrival WITHOUT an exact number (D's probe gave up). Nothing is classified on an estimate --
-        not the front's count, not the ledger, not chars/3: ``pending`` is 0 only as the ROUTE that sends the request
-        to D's own admission, which measures exactly (X-GATE: over X -> W31/W50 requeue WITH D's extent, an image in
-        the uncached tail -> W123 requeue as P-only); while P is awake P's batch takes it at P's exact number
-        ``uncached_p`` (n - the shared store, on ids that ARE D's for a text prompt), or P measures it itself."""
+        """S56r A1 + EZ-S1 (plan A1): the arrival WITHOUT an exact D number (D's probe gave up). Nothing is classified on an
+        estimate -- not the front's count, not the ledger, not chars/3.
+
+        ``FLLIPER_PDFLIP_EXACT_CLASS`` ON (default), the ladder of ``decision_numbers.class_basis``: ``u_p`` (P's store view,
+        ``n`` minus the shared store on ids that ARE D's -- a text prompt's front ids) may say ONE thing: ``u_p < halbX`` =>
+        kurz (``pending = u_p``, the safe direction: D reads the same store plus its radix, ``u_d <= u_p``). Everything
+        else -- ``u_p >= halbX``, no ``u_p``, media (no D ids at the front) -- is MEASURE_ON_D (``pending = 0`` is only the
+        ROUTE to D's admission, the front hands D the measuring barrier halbX-1: D admits ``u < halbX`` and refuses the
+        rest with its exact extent, ``_requeue_after_x_refusal`` classifies on THAT). The media ``n`` is ``n_est``
+        (display only, never exact); a text ``n`` is the front's ids (D's ids). Switch off: the rc17 form (``pending=0``,
+        D's admission measures, no barrier)."""
         from types import SimpleNamespace
 
         self.counters["d_probe_unpriced"] += 1
-        n = int(c.n) if (c is not None and not media) else int(est_prompt)
+        exact_on = bool(envs.FLLIPER_PDFLIP_EXACT_CLASS.get())
+        text_ids = c is not None and not media
+        n = int(c.n) if text_ids else int(est_prompt)
+        n_src = "front_ids" if text_ids else ("n_est" if exact_on else "size_only")
+        up = int(uncached_p)
+        basis = None
+        depth_hint = None
+        if exact_on:
+            _frac = Front._set_cfg()[0]
+            _depth = max(0, n - up) if (text_ids and up >= 0) else 0
+            _x = Front._x_at_depth(self, _depth)
+            _hx = phase_policy.half_x_of(_x, _frac)
+            basis = _dn.class_basis(
+                u_d=None, u_p=_dn.exact_of(up if up >= 0 else None, _dn.SRC_P_STORE),
+                n_from_d_ids=text_ids, x_tokens=_x, half_x=_hx, now=time.monotonic())
+            depth_hint = _depth
+            self.counters["exact_class_" + basis.kind] += 1
         logger.warning("PDFLIP D-PROBE-UNPRICED rid=%s n=%d n_src=%s p_uncached=%s -- no exact D number by the "
                        "deadline: the request is NOT classified on an estimate; route = D's admission (it measures: "
-                       "X-GATE W31 / W123 requeue with D's own extent) or, P awake, P's batch (S56r A1)",
-                       rid, n, "front_ids" if (c is not None and not media) else "size_only",
-                       uncached_p if uncached_p >= 0 else "unknown")
-        return SimpleNamespace(pending=0, n=n, known=False, credit=0, src="d_probe_unpriced", store_depth=0,
+                       "X-GATE W31 / W123 requeue with D's own extent) or, P awake, P's batch (S56r A1)%s",
+                       rid, n, n_src, up if up >= 0 else "unknown",
+                       "" if basis is None else " class_basis=%s (%s)" % (basis.kind, basis.why))
+        pending = int(basis.u) if (basis is not None and basis.kind == _dn.KIND_P_UPPER) else 0
+        return SimpleNamespace(pending=pending, n=n, known=False, credit=0, src="d_probe_unpriced", store_depth=0,
                                credit_epoch=None, mm=False, mm_cached=False, image_end=0, d_reach=0, d_floor=0,
-                               probe=None, image_in_tail=False, unpriced=True, uncached_p=int(uncached_p),
-                               n_src="front_ids" if (c is not None and not media) else "size_only")
+                               probe=None, image_in_tail=False, unpriced=True, uncached_p=up,
+                               n_src=n_src, class_basis=basis, depth_hint=depth_hint,
+                               measure=bool(basis is not None and basis.kind == _dn.KIND_MEASURE))
 
     async def _x_exact_price(self, rid: str, path: str, payload: Any, text: str,
                              est_uncached: int, est_prompt: int, multimodal: bool = False):
@@ -7161,7 +7217,10 @@ class Front:
                                           if _xp is not None else 0),
                                d_reach=d_reach, d_floor=d_floor,
                                # S56 D-MATCH-PROBE: the exact terms (None: no probe answer)
-                               probe=_xp, image_in_tail=bool(_xp is not None and _xp.image_in_tail))
+                               probe=_xp, image_in_tail=bool(_xp is not None and _xp.image_in_tail),
+                               # EZ-S1: when the number was taken (monotonic) and where it came from -- the record's
+                               # ``members=rid:u/s_p@src/age_ms``
+                               t_priced=_t_probe_ans, u_src=("d_probe" if _xp is not None else str(src)))
 
     #: FRONT-SEND-IDS-1007: priced ids kept for a leg 2 that has not been posted
     SEND_IDS_KEEP = 256
@@ -7334,6 +7393,8 @@ class Front:
         if tokens <= limit:
             return None
         self.counters["context_gate_refused"] += 1
+        Front._dec_gate(self, "Gate-CTX", rid, "tokens=%d limit=%d how=%s (400 before any route, seat, flip or park)"
+                        % (int(tokens), int(limit), how))  # EZ-S1 #8
         logger.warning("PDFLIP CONTEXT-GATE REFUSED rid=%s tokens=%d ctx=%d by=%s (400 before any "
                        "route, seat, flip or park -- the groups refuse it anyway)",
                        rid, tokens, ctx, how)
@@ -10604,6 +10665,8 @@ class Front:
                 "%s rid=%s image_parts=%d video_parts=%d mode=%s -- request "
                 "refused with 501 and NOT routed",
                 _code, _rid_peek, int(_img), int(_vid), self.vision)
+            Front._dec_gate(self, "Gate-" + _code.split(" ")[0], _rid_peek, "%s image_parts=%d video_parts=%d mode=%s"
+                            % (_code, int(_img), int(_vid), self.vision))  # EZ-S1 #1
             return web.json_response({"error": f"{_code}: {_why}"}, status=501)
         elif _verdict == VERDICT_REFUSE_EMBEDS:
             # H125b: its OWN emitter, the code a leading literal of the format
@@ -10615,10 +10678,13 @@ class Front:
                 "video_parts=%d mode=%s -- request refused with 501 and NOT routed",
                 f"pdflip-{self.epoch}-{self._rid + 1}", int(_emb), int(_img), int(_vid),
                 self.vision)
+            Front._dec_gate(self, "Gate-W125", f"pdflip-{self.epoch}-{self._rid + 1}",
+                            "W125 embed_parts=%d image_parts=%d video_parts=%d" % (int(_emb), int(_img), int(_vid)))
             return web.json_response(
                 {"error": f"W125 PdFlipInputEmbedsRefused: {_why}"}, status=501)
         self._rid += 1
         rid = f"pdflip-{self.epoch}-{self._rid}"
+        _t_arrive_m = time.monotonic()  # EZ-S1: t_arrive_to_decide_ms of the record
         _hs.note_request_rid(request, rid)  # #243 seam: the rid-end drop reads it
         self._ipc_out_book().arrive(rid, time.time())  # state.json front.oldest_outstanding_*
         Front._req_book(self).arrive(rid, time.time(), self.epoch)  # DASHBOARD-IPC: request_done / TTFT
@@ -10691,6 +10757,7 @@ class Front:
                 # Without it an agent retrying the request paid a D->P flip and the flip
                 # back for every attempt (NF dkrnfint4h6abl 07.10.: 3 s a retry, no decode).
                 self.counters["template_gate_refused"] += 1
+                Front._dec_gate(self, "Gate-TPL", rid, "chat template refused the messages (400 before any route)")  # EZ-S1 #9
                 logger.warning("PDFLIP TEMPLATE-GATE REFUSED rid=%s path=%s reason=%s (400 before any "
                                "route, seat, flip or park -- the chat template refuses these "
                                "messages, every group would answer the same)",
@@ -10702,6 +10769,11 @@ class Front:
             if _xx is not None:
                 remainder, est_prompt, known = _xx.pending, _xx.n, _xx.known
                 store_span, presence_src = _xx.credit, _xx.src
+                _cb = getattr(_xx, "class_basis", None)
+                if _cb is not None and _cb.kind == _dn.KIND_P_UPPER and getattr(_xx, "depth_hint", None) is not None:
+                    # EZ-S1: kurz on u_p (the safe direction): the request's cached depth is n - u_p, so X is read at it
+                    # (the same X ``_x_unpriced`` compared u_p against), not at depth 0
+                    store_span = int(_xx.depth_hint)
         # CONTEXT-GATE (y7i e7a70285bd, 11:32-11:33Z): an over-context request
         # is answered 400 HERE -- before any verdict, seat, flip or park.
         _ctx_refusal = self._context_gate(rid, text, _xx, est_prompt)
@@ -10728,7 +10800,14 @@ class Front:
         self._park_stuck().note_stream(rid, stream)
         exact = self.exact_tokens.get(hashlib.sha1(text.encode(errors="replace")).hexdigest())
         if _xx is not None:
-            exact = _xx.n
+            if (envs.FLLIPER_PDFLIP_EXACT_CLASS.get() and getattr(_xx, "unpriced", False)
+                    and str(getattr(_xx, "n_src", "")) != "front_ids"):
+                # EZ-S1 (S67 A5, plan "Medien-n wird n_est"): the size of an unpriced media request is n_est, an
+                # estimate -- it is never an exact count and never sets ``carrier_est`` (``exact`` stays the map's
+                # measured figure or None)
+                self.counters["n_est_not_exact"] += 1
+            else:
+                exact = _xx.n
         carrier_est = exact if exact else int(len(text) / CARRIER_CHARS_PER_TOKEN) + 1
         # #1290: ONE ROUTE VERDICT, TAKEN ONCE, ON BOTH BOUNDS TOGETHER.  The
         # branch below used to test the carrier ALONE and send anything over
@@ -10808,6 +10887,8 @@ class Front:
                 "attached on P's PP0 and do not exist on D",
                 rid, route)
             route = "long"
+            Front._dec(self).alt("w102_image_rule", kind="arrival", action="route_long_p_only", rid=rid, edge=False,
+                                 why="an image request is prefilled on P by rule (#12)")
         # S56 D-MATCH-PROBE: an image D's own tokenizer found in the UNCACHED tail (also inside an Anthropic
         # tool_result block, which the top-level count above does not see) needs P's tower -- P-only (SOLL R9);
         # rc15 pdflip-14-74: 4 new images, priced 338 as text, D refused W123, P computed 5718
@@ -10818,6 +10899,8 @@ class Front:
             logger.info("W102 PdFlipVisionStage rid=%s -- route %s -> long (P): D's probe found an image in the "
                         "uncached tail (S56, SOLL R9: p_only); uncached_p=%d", rid, route, int(remainder))
             route = "long"
+            Front._dec(self).alt("image_in_tail", kind="arrival", action="route_long_p_only", rid=rid, edge=False,
+                                 why="D's probe found an image in the uncached tail (#13, R9)")
         # H84: THE BAND ABOVE THE START X GOES TO D ONLY AS A SINGLETON. A
         # live X above the start X would send a burst of 4-8k prompts to D one
         # after another -- NF's D is bs1, so x177's 8x4.2k burst (22.8 s
@@ -10879,6 +10962,8 @@ class Front:
             self.carrier_max_tokens, CARRIER_CHARS_PER_TOKEN, est_prompt,
             len(text), _x_note,
         )
+        Front._dec_arrival(self, rid, _xx, remainder=remainder, x_set=_x_set, route=route,
+                           p_only=bool(_route_vision_p_only), t_arrive_m=_t_arrive_m, n_prompt=est_prompt)  # EZ-S1
         Front._pb_resolve(self, rid, _pb_fut, route, remainder)  # PRICE-BARRIER: the verdict, for the SHORTs waiting on it
         if _ef is not None:
             # EARLY-FLIP: the verdict for the flip already under way; not LONG ->
@@ -10892,6 +10977,9 @@ class Front:
             # and answered 503, which reads as "try again" for a condition
             # that cannot change.
             self.counters["W52_PdFlipNoServiceableRoute"] += 1
+            Front._dec_gate(self, "Gate-W52", rid, "no serviceable route: uncached=%d X=%d carrier_est=%d carrier_max=%d"
+                            % (int(remainder), int(self.tp_prefill_max_tokens), int(carrier_est),
+                               int(self.carrier_max_tokens)))  # EZ-S1 #16
             detail = (
                 f"{NO_ROUTE_NAME} rid={rid}: no route can serve this request. "
                 f"uncached={remainder} exceeds D's prefill cap X="
@@ -11175,6 +11263,15 @@ class Front:
                 self.counters["short_kept_queue"] += 1
             Front._queue_at_age(self, p)   # S46 F3: at its age position (a new arrival: the end, as before)
         self._dp_mark(p, "long" if route == "long" else "batch")  # R28
+        # EZ-S1 shadow (#4, #25, #26, #27, #30): where the OLD code put the arrival that fell through the seat path
+        Front._dec(self).alt(
+            "arrival_placement", kind="arrival", rid=rid, edge=False,
+            action=("price_barrier_to_p" if _pb_to_p is not None else "short_hold_d" if _d_hold else
+                    "short_kept_d" if (_sk and self.awake == "D" and self.admit_d and self.state == "serving") else
+                    "short_in_flip" if (p.d_direct and not _sk and not _d_hold) else
+                    "short_in_p_phase" if (_p_phase and short_ok) else "queue_p" if route == "long" else "queue_batch"),
+            why="route=%s awake=%s admit_d=%s p_only=%s d_eligible=%s" % (route, self.awake, int(bool(self.admit_d)),
+                                                                          int(bool(p.p_only)), int(bool(p.d_eligible))))
         self._kick_controller("arrival")  # 27B flipfast F2 (no-op when off)
         self._arm_client_watch(request, rid, p)  # H102
         logger.info("PDFLIP-ROUTE rid=%s BATCH queued (awake=%s admit_d=%s est_prompt=%d remainder=%d queue=%d)",
@@ -11671,6 +11768,11 @@ class Front:
             return None
         if not envs.FLLIPER_PDFLIP_PRICE_BARRIER.get():
             return None
+        if envs.FLLIPER_PDFLIP_EXACT_CLASS.get():
+            # EZ-S1 (plan S1, user 19.10. "nichts schaetzen"): the barrier reads NO chars/3 price any more -- ``est_uncached``
+            # of the arrival call is that estimate. With the barrier's decision switch off (above) it decided nothing; a
+            # barrier that decides again announces a LONG candidate from the exact number after the pricing, not before it
+            return None
         x = int(getattr(self, "tp_prefill_max_tokens", 0) or 0)
         if x <= 0 or int(est_uncached or 0) <= self.PRICE_BARRIER_CANDIDATE_FRACTION * x:
             return None
@@ -11773,7 +11875,11 @@ class Front:
                 _wn.clear()
         _unc = int(uncached) if uncached is not None else 0
         _x = int(x_set) if x_set else int(self.tp_prefill_max_tokens)
-        if phase_policy.classify_arrival(_unc, _x, Front._set_cfg()[0], False) == phase_policy.CLASS_KURZ:
+        # EZ-S1: a MEASURE_ON_D request has no number (``_unc`` 0 is only the ROUTE to D's admission): the front does not
+        # write ``D_NOW`` with a member ``u=0`` for it -- that line would be an R2 claim on a number nobody measured.
+        # Its record is the ``DECISION kind=measure`` of the arrival and D's report after it.
+        if (rid not in (self.__dict__.get("_measure_on_d") or ())
+                and phase_policy.classify_arrival(_unc, _x, Front._set_cfg()[0], False) == phase_policy.CLASS_KURZ):
             if seat is not None:
                 _w = time.time() - t_in
                 # SOLL R5 (corrected): a kurz request waits for a D seat when D had none -- named, not an R2 finding
@@ -12375,6 +12481,232 @@ class Front:
         st["depths"] = depth
         return sorted(out, key=lambda m: m.t_arrive)
 
+    # -- EZ-S1: THE DECISION RECORD (plan nf-entscheidungszentrale-plan-1019, SOLL R11) ----------------------------------
+    #: how many (source, t_mono) notes of an arrival's number are kept (bounded, oldest out)
+    NUM_NOTES_KEPT = 4096
+
+    def _dec(self) -> "_dr.Recorder":
+        """The front's decision recorder (one per front, made on first use so a partial test front has one too)."""
+        r = self.__dict__.get("_dec_rec")
+        if r is None:
+            r = _dr.Recorder(logger, epoch_of=lambda: int(getattr(self, "epoch", 0)))
+            self.__dict__["_dec_rec"] = r
+        return r
+
+    def _num_note(self, rid: str, src: str, t_m: Optional[float] = None) -> None:
+        """Where the number of ``rid`` came from and when it was taken (the record's ``@src/age_ms``)."""
+        try:
+            d = self.__dict__.setdefault("_num_notes", collections.OrderedDict())
+            d[str(rid)] = (str(src), time.monotonic() if t_m is None else float(t_m))
+            while len(d) > Front.NUM_NOTES_KEPT:
+                d.popitem(last=False)
+        except Exception:  # noqa: BLE001 -- an instrument
+            pass
+
+    def _num_of(self, rid: str) -> Tuple[str, int]:
+        got = (self.__dict__.get("_num_notes") or {}).get(str(rid))
+        if got is None:
+            return "-", 0
+        return got[0], int(max(0.0, (time.monotonic() - got[1]) * 1000.0))
+
+    def _dec_group(self) -> dict:
+        """The group fields of a record from ONE read (``decision_numbers.NumberSource.group_numbers``): decode state,
+        seats with their source, the D-KV reading fresh or ABSENT (plan A10)."""
+        try:
+            gn = _dn.NumberSource(self).group_numbers()
+            now = time.monotonic()
+            return dict(d_decoding=bool(gn.d_decoding),
+                        seats_free=int(gn.seats_free.value) if gn.seats_free is not None else 0,
+                        seats_src=gn.seats_free.src if gn.seats_free is not None else "absent",
+                        kv_free=int(gn.kv_free.value) if gn.kv_free is not None else None,
+                        kv_src=gn.kv_free.src if gn.kv_free is not None else "absent",
+                        kv_age_ms=int(gn.kv_free.age_ms(now)) if gn.kv_free is not None else None)
+        except Exception:  # noqa: BLE001
+            return {}
+
+    def _dec_gate(self, rule: str, rid: Optional[str], why: str, *, action: str = "REFUSE", kind: str = "admit",
+                  members: Sequence["_dr.Member"] = ()) -> None:
+        """A Vor-Gate (W101/W103/W104/W125, context, template, W52, W193) writes its refusal as a DECISION (plan #1, #8,
+        #9, #16, #91). Always a line (never edge-triggered)."""
+        try:
+            Front._dec(self).record(_dr.Decision(kind=kind, action=action, rule=rule, why=why, rid=rid,
+                                                 members=tuple(members), **Front._dec_group(self)))
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _dec_flip(self, kind: str, action: str, rule: str, why: str) -> int:
+        """A flip no set verdict decided (boot pair #88, hand flip #87): its DECISION, always a line. Returns the seq (the
+        executor's DECISION-DONE names it)."""
+        try:
+            return Front._dec(self).record(_dr.Decision(kind=kind, action=action, rule=rule, why=why,
+                                                        **Front._dec_group(self)))
+        except Exception:  # noqa: BLE001
+            return 0
+
+    def _dec_tick(self) -> None:
+        """Controller tick: the DECISION-SUM window closes, and D's KV is read in the background while D is awake."""
+        Front._dec(self).tick()
+        Front._kv_refresh_tick(self, time.time())
+
+    def _measure_register(self, rid: str, x_set: int, seq: int = 0, u_p: int = -1) -> Tuple[int, int]:
+        """MEASURE_ON_D, stage 1 (plan R.1): the barrier the front hands D with this request's leg 2 --
+        ``(halbX, front_x header)`` with ``front_x + one page == halbX - 1`` (D admits u < halbX, refuses the rest with
+        its exact extent). Read by :meth:`_front_x_headers` (once, then dropped)."""
+        x = int(x_set) if x_set else int(getattr(self, "tp_prefill_max_tokens", 0) or 0)
+        hx = phase_policy.half_x_of(x, Front._set_cfg()[0])
+        # D adds ONE of ITS pages to the header X (front_x.limit_for): the page is the groups' KV page (``_d_page_size``)
+        fx = _dn.measure_front_x(hx, Front._d_page_size(self), int(getattr(self, "tp_prefill_max_tokens", 0) or 0))
+        d = self.__dict__.setdefault("_measure_on_d", collections.OrderedDict())
+        d[str(rid)] = (hx, fx, x, int(seq), int(u_p))
+        d.move_to_end(str(rid))
+        while len(d) > Front.X_DECISIONS_KEPT:
+            d.popitem(last=False)
+        return hx, fx
+
+    def _dec_arrival(self, rid: str, xx: Any, *, remainder: int, x_set: int, route: str, p_only: bool,
+                     t_arrive_m: float, n_prompt: int) -> None:
+        """The arrival's record, from the numbers it was routed on (plan S1). An arrival WITHOUT an exact number is
+        ``kind=measure MEASURE_ON_D rule=NS:MEASURE`` (members ``u=-1``: no number) and the barrier is registered;
+        every other arrival is ``kind=arrival CLASSIFY`` with the class, the number, its source and its age. The old
+        decisions that follow (route, seat) are shadowed ``ALT:*``."""
+        try:
+            now = time.monotonic()
+            frac = Front._set_cfg()[0]
+            x = int(x_set) if x_set else int(getattr(self, "tp_prefill_max_tokens", 0) or 0)
+            hx = phase_policy.half_x_of(x, frac)
+            t_dec = int(max(0.0, (now - float(t_arrive_m)) * 1000.0))
+            grp = Front._dec_group(self)
+            Front._dec(self).alt("serviceable_route", kind="arrival", action="route_" + str(route), rid=rid, edge=False,
+                                 why="uncached=%d X=%d (#11: the route verdict)" % (int(remainder), int(x)))
+            if xx is not None and bool(getattr(xx, "measure", False)):
+                cb = getattr(xx, "class_basis", None)
+                Front._measure_start(self, rid, x, "%s; route=%s" % (cb.why if cb is not None else "no exact number", route),
+                                     u_p=int(getattr(xx, "uncached_p", -1)), t_dec=t_dec, grp=grp)
+                return
+            if xx is None:
+                src, age, why = "n_est", 0, "no exact price (x_exact_fallback): the class stands on the chars/3 estimate"
+            else:
+                src = str(getattr(xx, "u_src", None) or ("p_store" if getattr(xx, "unpriced", False) else
+                                                           getattr(xx, "src", "none")))
+                tp = getattr(xx, "t_priced", None)
+                age = int(max(0.0, (now - float(tp)) * 1000.0)) if tp is not None else 0
+                cb = getattr(xx, "class_basis", None)
+                why = cb.why if cb is not None else "u from %s" % src
+            Front._num_note(self, rid, src, now - age / 1000.0)
+            klass = phase_policy.classify_arrival(int(remainder), x, frac, bool(p_only))
+            rule = {phase_policy.CLASS_KURZ: "R2", phase_policy.CLASS_HALB: "R3", phase_policy.CLASS_GROSS: "R4",
+                    phase_policy.CLASS_P_ONLY: "R9"}[klass]
+            Front._dec(self).record(_dr.Decision(
+                kind="arrival", action="CLASSIFY", rule=rule, rid=rid,
+                members=(_dr.Member(rid, int(remainder), int(remainder), src, age),), s_tokens=int(remainder),
+                s_p_tokens=int(remainder), x=x, half_x=hx, classes=(klass,), numbers_age_ms_max=age,
+                why="route=%s n=%d %s" % (route, int(n_prompt), why), t_arrive_to_decide_ms=t_dec, **grp))
+        except Exception:  # noqa: BLE001 -- an instrument never breaks an arrival
+            pass
+
+    def _measure_start(self, rid: str, x: int, why: str, *, u_p: int = -1, t_dec: int = 0,
+                       grp: Optional[dict] = None) -> int:
+        """Write ``DECISION kind=measure action=MEASURE_ON_D rule=NS:MEASURE`` (members ``u=-1``: no number) and register
+        the barrier :meth:`_front_x_headers` hands D with the leg. Returns the seq."""
+        now = time.monotonic()
+        frac = Front._set_cfg()[0]
+        hx = phase_policy.half_x_of(int(x), frac)
+        Front._num_note(self, rid, "none", now)
+        self.counters["measure_on_d"] += 1
+        seq = Front._dec(self).record(_dr.Decision(
+            kind="measure", action="MEASURE_ON_D", rule="NS:MEASURE", rid=rid,
+            members=(_dr.Member(rid, -1, -1, "none", 0),), x=int(x), half_x=hx, classes=("unknown",),
+            why="%s; barrier=halfX-1=%d (D admits u<halfX, refuses the rest with its exact extent)"
+                % (why, _dn.measure_limit(hx)),
+            t_arrive_to_decide_ms=int(t_dec), **(Front._dec_group(self) if grp is None else grp)))
+        Front._measure_register(self, rid, int(x), seq, int(u_p))
+        return seq
+
+    def _measure_return(self, rid: str, p: "Pending", d_extent: Optional[int], n: int) -> None:
+        """MEASURE_ON_D, stage 1 (plan R.1): D's refusal of a measuring request is its REPORT -- the exact realised extent.
+        The class is formed on THAT number (``measured_class`` at the X of the now exactly known depth): halb -> the set
+        (R3), gross -> the set (R4/R8), never BATCH by state, never p_only on it (W123 is R9, below). A refusal
+        UNDER halbX cannot be (D admits those): it is an R7 defect report, not a flip reason. Writes the DECISION
+        (kind=measure) and the DECISION-DONE of the front's MEASURE record. Not a measuring request: nothing."""
+        try:
+            sent = (self.__dict__.get("_measure_sent") or {}).pop(str(rid), None)
+            if sent is None or not envs.FLLIPER_PDFLIP_EXACT_CLASS.get():
+                return
+            seq, u_p = sent
+            if d_extent is None:
+                Front._dec(self).done(seq, rid, "D", "deferred", detail="D refused without a parseable extent: no class formed")
+                return
+            u = int(d_extent)
+            npr = int(getattr(p, "est_prompt", 0) or n or 0)
+            x = Front._x_at_depth(self, max(0, npr - u)) if npr > 0 else int(self.tp_prefill_max_tokens)
+            hx = phase_policy.half_x_of(x, Front._set_cfg()[0])
+            klass = _dn.measured_class(u, x, hx)
+            page = Front._d_page_size(self)
+            self.counters["measure_return_" + klass] += 1
+            p.measured_u, p.measure_src = u, _dn.SRC_D_EXTENT
+            under = klass == _dn.CLASS_KURZ
+            rule, action = ("R7", "RIDE_P") if under else (("R3" if klass == _dn.CLASS_HALB else "R4"), "COLLECT")
+            why = ("d_refused_under_x: D refused u=%d < halfX=%d although its barrier admits it -- a defect, no flip "
+                   "reason" % (u, hx)) if under else ("D measured u=%d (%s): class %s at X=%d halfX=%d" %
+                                                      (u, _dn.SRC_D_EXTENT, klass, x, hx))
+            Front._num_note(self, rid, _dn.SRC_D_EXTENT)
+            Front._dec(self).record(_dr.Decision(
+                kind="measure", action=action, rule=rule, rid=rid,
+                members=(_dr.Member(rid, u, u, _dn.SRC_D_EXTENT, 0),), s_tokens=u, s_p_tokens=u, x=x, half_x=hx,
+                classes=(klass,), why=why, **Front._dec_group(self)))
+            # DECISION-MISMATCH: u_d <= u_p must hold (D reads the same store plus its radix); more than one page above
+            # u_p says one of the two numbers is not what it claims to be
+            mism = u_p >= 0 and u > u_p + page
+            Front._dec(self).done(seq, rid, "D", "mismatch" if (mism or under) else "ok", measured_u=u,
+                                  src=_dn.SRC_D_EXTENT,
+                                  detail=("u_d=%d > u_p=%d + page %d" % (u, u_p, page)) if mism else
+                                  ("under halfX" if under else "class %s" % klass))
+        except Exception:  # noqa: BLE001 -- an instrument never breaks the requeue
+            pass
+
+    # -- EZ-S1 (plan A10): D's KV reading, fresh or absent ---------------------------------------------------------------
+    def _kv_fetch_kick(self, why: str) -> bool:
+        """Start ONE background read of D's free KV (``/server_info``, :meth:`_arrival_seat_kv_fetch`); never awaited here,
+        never a second while one is in flight. False: not started (switch off / no loop / one in flight)."""
+        try:
+            if int(envs.FLLIPER_PDFLIP_KV_REFRESH_MS.get()) <= 0 or not isinstance(getattr(self, "groups", None), dict):
+                return False
+            if "D" not in self.groups:
+                return False
+            st = self._asr_st()
+            gen = int(st.get("kv_gen", 0))
+            pending = st.get("kv_task")
+            if pending is not None and pending[0] == gen and not pending[1].done():
+                return False
+            loop = asyncio.get_running_loop()
+            st["kv_task"] = (gen, loop.create_task(self._arrival_seat_kv_fetch(gen)))
+            self.counters["kv_fetch_" + str(why)] += 1
+            return True
+        except Exception:  # noqa: BLE001 -- no loop / a partial front: the next tick asks
+            return False
+
+    def _kv_flip_end(self, dst: str) -> bool:
+        """End of a flip (``t_awake`` was just set): into D, the background read of D's KV starts NOW (plan A10, S67r) --
+        the 1.38 s ARRIVAL-SEAT wait of rc16 pdflip-140-474 was the HTTP read made on the arrival path, because a new D
+        phase had no reading at all. The controller tick keeps it fresh while D is awake."""
+        return Front._kv_fetch_kick(self, "flip_end") if dst == "D" else False
+
+    def _kv_refresh_tick(self, now: float) -> None:
+        """Controller tick: while D is awake and serving, a reading older than ``FLLIPER_PDFLIP_KV_REFRESH_MS`` is read
+        again in the background (D answers at its pass boundaries; a reading older than ``..._KV_FRESH_MS`` counts as
+        absent, never as a number)."""
+        try:
+            refresh = int(envs.FLLIPER_PDFLIP_KV_REFRESH_MS.get())
+            if refresh <= 0:
+                return
+            st = self.__dict__.get("_asr_state") or {}
+            pending = st.get("kv_task")
+            busy = pending is not None and not pending[1].done()
+            if _dn.kv_refresh_due(st.get("kv"), now, refresh, self.awake == "D" and self.state == "serving", busy):
+                Front._kv_fetch_kick(self, "refresh")
+        except Exception:  # noqa: BLE001
+            pass
+
     def _set_log(self, st: dict, members: Sequence[phase_policy.SetMember], sv: phase_policy.SetVerdict, *,
                  verdict: str, why: str, x_tok: int, frac: float, t_half: float, decoding: bool, seats: int,
                  waited: float, x_cls: int = 0, xk: int = 0) -> None:
@@ -12386,11 +12718,30 @@ class Front:
             why = "%s [prefix-shared=%d: P counts once, S_P=%d]" % (why, _shared, max(0, int(sv.s_tokens) - _shared))
         if xk > 0:
             why = "%s xk=%d" % (why, xk)   # H16V review A2: X(k) is information only
-        logger.info("PDFLIP SET-VERDICT epoch=%d set=%d n=%d members=%s S=%d X=%d halfX=%d classes=%s d_decoding=%d "
-                    "seats_free=%d t_half_s=%.1f waited_s=%.1f verdict=%s why=%s",
-                    self.epoch, st["set_id"], len(members), ",".join("%s:%d" % (m.rid, m.own_uncached or m.uncached) for m in members),
-                    sv.s_tokens, x_tok, sv.half_x, ",".join(classes), int(decoding), seats, t_half, waited,
-                    verdict, why)
+        # EZ-S1: ONE record, SET-VERDICT (SOLL section 4, byte-identical to the H91 line) derived from the same data as the
+        # DECISION line (``kind=set``); every monitor reads the first unchanged, the checker of S4 reads the second
+        members_own = [(m.rid, m.own_uncached or m.uncached) for m in members]
+        logger.info("%s", _dr.set_verdict_line(
+            epoch=self.epoch, set_id=st["set_id"], members=members_own, s_tokens=sv.s_tokens, x_tok=x_tok,
+            half_x=sv.half_x, classes=classes, d_decoding=bool(decoding), seats_free=seats, t_half=t_half,
+            waited=waited, verdict=verdict, why=why))
+        try:
+            _rule = _dr.rule_of_set_why(why, verdict)
+            _grp = Front._dec_group(self)
+            _grp.update(d_decoding=bool(decoding), seats_free=int(seats))
+            _mem = []
+            for _m in members:
+                _src, _age = Front._num_of(self, _m.rid)
+                _mem.append(_dr.Member(_m.rid, int(_m.own_uncached or _m.uncached), int(_m.uncached), _src, _age))
+            Front._dec(self).record(_dr.Decision(
+                kind="set", action=verdict, rule=_rule, why=why, set_id=int(st["set_id"]),
+                rid=members[0].rid if len(members) == 1 else None, members=tuple(_mem), s_tokens=int(sv.s_tokens),
+                s_p_tokens=max(0, int(sv.s_tokens) - int(_shared if _shared > 0 else 0)), x=int(x_tok), half_x=int(sv.half_x),
+                classes=tuple(classes), t_half_s=float(t_half), waited_s=float(waited),
+                numbers_age_ms_max=max([a.age_ms for a in _mem] or [0]), r6_rest=max(0, int(self._dc_carried_running())),
+                **_grp), edge=True)
+        except Exception:  # noqa: BLE001 -- an instrument never breaks a verdict
+            pass
 
     def _set_eval(self, now: float, live_q: List["Pending"], st: dict):
         """The set's current verdict, without side effects beyond opening ``t_open`` (the first member's stamp):
@@ -12647,6 +12998,14 @@ class Front:
             routes.append("d_admission")
             self.counters["set_reprobe_unpriced"] += 1
         route = "+".join(routes) or "gone"
+        if "d_admission" in routes and envs.FLLIPER_PDFLIP_EXACT_CLASS.get():
+            # EZ-S1: the member without a new exact number is a MEASURE request like an unpriced arrival -- D's admission
+            # gets the measuring barrier halbX-1 with it
+            try:
+                Front._measure_start(self, rid, Front._x_at_depth(self, Front._set_depth_of(self, rid)),
+                                     "SET-REPROBE-FAILED site=%s why=%s" % (site, why[:80]))
+            except Exception:  # noqa: BLE001
+                pass
         d_down = why.startswith("no exact D number") or why.startswith("bound")
         logger.warning("PDFLIP SET-REPROBE-FAILED rid=%s site=%s why=%s age_ms=%.0f route=%s -- no new exact D number "
                        "for this member: NOT decided on its older number (S63r A1); %s", rid, site, why,
@@ -13066,7 +13425,9 @@ class Front:
         st = self._asr_st()
         now = time.time()
         cached = st.get("kv")
-        if cached is not None and now - cached[0] <= 1.0:
+        _fresh_s = (max(0, int(envs.FLLIPER_PDFLIP_KV_FRESH_MS.get())) / 1000.0
+                    if envs.FLLIPER_PDFLIP_EXACT_CLASS.get() else 1.0)  # EZ-S1 (A10): the age a reading may have
+        if cached is not None and now - cached[0] <= _fresh_s:
             return cached[1]
         gen = int(st.get("kv_gen", 0))
         pending = st.get("kv_task")
@@ -13094,6 +13455,15 @@ class Front:
             if int(st.get("kv_gen", 0)) == gen:
                 return got
         self.counters["arrival_seat_kv_stale"] += 1
+        if envs.FLLIPER_PDFLIP_EXACT_CLASS.get():
+            # EZ-S1 (plan A10, user 19.10. "nichts schaetzen"): a reading older than the freshness bound is NOT PRESENT,
+            # never a number -- the seat plan decides alone (``kv=absent`` in the record); D's admission stays the guard
+            _rd, _age = _dn.kv_fresh(cached, now, int(envs.FLLIPER_PDFLIP_KV_FRESH_MS.get()))
+            if _rd is None:
+                st["kv_absent_ms"] = _age
+                self.counters["arrival_seat_kv_absent"] += 1
+                return None
+            return _rd
         st["kv_stale_ms"] = int(round((now - cached[0]) * 1000.0))
         return cached[1]
 
@@ -13145,6 +13515,10 @@ class Front:
             why = "%s [need = prompt %d - shared %d + decode %d of max_tokens %d, D clip %s]" % (
                 why, int(est_prompt or 0), shared, decode, reserve, clip)
         st = self._asr_st()
+        absent_ms = st.pop("kv_absent_ms", None)
+        if absent_ms is not None:
+            why = "%s kv=absent age_ms=%s (EZ-S1 A10: D inside a pass, the last reading is older than %d ms -- no number)" % (
+                why, absent_ms, int(envs.FLLIPER_PDFLIP_KV_FRESH_MS.get()))
         stale_ms = st.pop("kv_stale_ms", None)
         if stale_ms is not None:
             why = "%s kv_age_ms=%d (D inside a pass: the last reading decides, its refresh lands next tick)" % (
@@ -16124,6 +16498,7 @@ class Front:
             # probe's number gives way too -- D's extent is measured at D's admission, LATER than the probe (the
             # number at the decision, user 19.10.); the W123 branch below still sets P's own number for a P-only one
             p.est_uncached = int(d_extent)
+        Front._measure_return(self, rid, p, d_extent, n)  # EZ-S1: MEASURE_ON_D's report -> the class on D's exact extent
         try:
             _vis_reroute = b"(vision reroute)" in body or b"W123" in body
         except TypeError:
@@ -16966,6 +17341,10 @@ class Front:
         if getattr(self, "state", None) == "STOP":
             self._refuse_flip_in_stop(src, dst, "before the flip")
             return
+        # EZ-S1 shadow: EVERY flip the executor takes is counted (``ALT:flip``); the next boot sets the flips against the
+        # DECISIONs that named them (a flip without one is a decision still taken by old code -- S3a's yardstick)
+        Front._dec(self).alt("flip", kind="phase_end", action="FLIP_" + str(dst), edge=False,
+                             why="%s->%s epoch=%s" % (src, dst, getattr(self, "epoch", "?")))
         # DASHBOARD-IPC (front.flip): the decision -- a D->P park RPC already opened it
         if Front._flip_phase(self).warmup(f"{src}>{dst}", Front._flip_vorlauf_reason(self, src, dst), time.time()):
             Front._ipc_live_kick(self)
@@ -17611,6 +17990,7 @@ class Front:
         self._flip_stage = "none"
         # C8: phase dwell restarts here, and the L2 admission ordinal with it.
         self.t_awake = time.time()
+        Front._kv_flip_end(self, dst)  # EZ-S1 (plan A10): the new D phase's KV reading starts here, not on the arrival path
         Front._lane_kick(self)  # PRIORITY LANES 1008 (L4): a deferred lane preempts after PDFLIP-FLIP done
         try:  # #1455 PDFLIP-FLIP-TIMELINE: every stage as a delta to the flip begin, one line
             _m = self._flip_marks
@@ -18294,6 +18674,7 @@ class Front:
         self.counters["W193_PdFlipXCurveDepthBeyond"] += 1
         detail = f"{exc.code} rid={rid}: {exc.detail}"
         logger.error("%s", detail)
+        Front._dec_gate(self, "Gate-W193", rid, "x-curves refused the depth (%s)" % exc.code)  # EZ-S1 #91
         return refusal_response(path, exc.code, detail, 503, {"x_mode": self.x_mode})
 
     def _x_for_flip(self, k_flip: int, rid: str = "", site: str = "") -> int:
@@ -18574,8 +18955,12 @@ class Front:
             "Flip-Paar holt P's Bytes ueber dieselben Legs, die jeder "
             "spaetere Flip nimmt (#108)")
         t0 = time.time()
+        _b1 = Front._dec_flip(self, "boot", "FLIP_D", "NS:BOOT", "adopt first flip pair, half 1: P->D (#108: D's placeholders get P's bytes)")
         await self.flip("P", "D")
+        Front._dec(self).done(_b1, None, "front", "ok", detail="boot flip P->D done")
+        _b2 = Front._dec_flip(self, "boot", "FLIP_P", "NS:BOOT", "adopt first flip pair, half 2: D->P (the starting layout: P prefills)")
         await self.flip("D", "P")
+        Front._dec(self).done(_b2, None, "front", "ok", detail="boot flip D->P done")
         logger.info(
             "PDFLIP-ADOPT-FIRSTFLIP done in %.2f s -- D now carries P's "
             "Bytes, P ist wieder wach. Ob die Deckung VOLLSTAENDIG war, "
@@ -18875,6 +19260,7 @@ class Front:
             await self._ctl_wait()
             try:
                 Front._half_flip_tick(self, time.time())  # R10: the 30-minute report
+                Front._dec_tick(self)  # EZ-S1: DECISION-SUM window + D's KV reading while D is awake
                 if self.state != "serving":
                     continue
                 # PRIORITY LANES 1008 (L4): the LANE branch comes before everything else -- the floor is brought
@@ -19710,15 +20096,19 @@ class Front:
         why = self._manual_flip_refusal()
         if why is not None:
             logger.error("%s", why)
+            Front._dec_flip(self, "manual", "REFUSE", "NS:MANUAL", "manual flip refused (W115): %s" % why)  # EZ-S1 #87
             return web.json_response({"error": "manual-flip-refused", "why": why,
                                       "code": "W115"}, status=409)
         src, dst = self.awake, ("P" if self.awake == "D" else "D")
+        _mseq = Front._dec_flip(self, "manual", "FLIP_P" if dst == "P" else "FLIP_D", "NS:MANUAL",
+                                "operator POST /pdflip/flip %s->%s (no set verdict: a hand flip, not a SOLL rule)" % (src, dst))
         self.admit_d = False
         if src == "D":
             # the drain waits only for what the park leaves running (#1011:
             # a decode is never cut, so an unparked one held the flip)
             await self._wait_bound_park(None, cause=MANUAL_FLIP_PARK_CAUSE)
         await self.flip(src, dst)
+        Front._dec(self).done(_mseq, None, "front", "ok", detail="manual flip %s->%s done, awake=%s" % (src, dst, self.awake))
         if self.awake == "P" and self.state == "serving":
             skip = Front._manual_return_skip_reason(self)
             if skip is not None:
@@ -19736,7 +20126,10 @@ class Front:
                 # (flip("D","P") above already set it; a repeat is a no-op).
                 self._kick_controller("after_flip")
             else:
+                _rseq = Front._dec_flip(self, "manual", "FLIP_D", "NS:MANUAL",
+                                        "return half of the manual round trip P->D (no P-bound work waits)")
                 await self.flip("P", "D")
+                Front._dec(self).done(_rseq, None, "front", "ok", detail="manual return flip P->D done, awake=%s" % self.awake)
         return web.json_response(self.state_dict())
 
     def _manual_return_skip_reason(self) -> Optional[str]:
@@ -19787,6 +20180,63 @@ class Front:
 
 
 #: FEHLT 8: the counters behind state.json ``front.routes``
+#: EZ-S1 shadow table: the OLD decision sites of the front (plan inventory A1-A3, A6b-front), ``marker -> (method, kind)``.
+#: ``install_alt_shadow`` wraps each so that every call writes ONE ``rule=ALT:<marker>`` DECISION record after the old
+#: code returned (edge-triggered, no behaviour change). The next boot counts by ``ALT:*`` the decisions that are not
+#: central yet -- the yardstick of S2a..S3b. Pure functions of phase_policy (needs_p, immediate_park_trigger, the
+#: dwell predicates) are covered through their callers below; module-level sites are hooked inline.
+EZ_ALT_SITES = {
+    "lane_arrive": ("_lane_arrive", "admit"),                              # #2
+    "price_barrier": ("_price_barrier", "arrival"),                        # #4
+    "early_flip": ("_early_flip_maybe", "set"),                            # #5
+    "early_flip_verdict": ("_early_flip_verdict", "set"),                  # #5
+    "x_solo": ("_x_solo_admits", "arrival"),                               # #14
+    "short_seat": ("_acquire_short_seat", "seat"),                         # #17
+    "short_gate_wait": ("_short_gate_wait_by_age", "seat"),                # #18
+    "d_direct_yields": ("_d_direct_yields", "arrival"),                    # #20
+    "seat_wait": ("_arrival_seat_wait", "seat"),                           # #21
+    "seat_wait_age": ("_arrival_seat_wait_age", "seat"),                   # #21
+    "seat_age_verdict": ("_arrival_seat_age_verdict", "seat"),             # #21
+    "seat_fits": ("_arrival_seat_fits", "seat"),                           # #21
+    "d_token_budget": ("_d_token_budget_blocks", "seat"),                  # #22
+    "age_seat_on_credit": ("_age_seat_on_credit", "seat"),                 # #23
+    "d_phase_seats_full": ("_d_phase_seats_full", "seat"),                 # #24
+    "decode_collect": ("_decode_collect", "set"),                          # #37
+    "set_xsum_hold": ("_set_xsum_hold", "set"),                            # #39
+    "x_exact_reprice": ("_x_exact_reprice_queue", "set"),                  # #40
+    "set_flip_justified": ("_set_flip_justified", "set"),                  # #41
+    "immediate_park_due": ("_immediate_park_due", "park"),                 # #45
+    "dwell_ok": ("_dwell_ok", "phase_end"),                                # #47
+    "asr_min_dwell": ("_asr_min_dwell_held", "park"),                      # #47
+    "asr_k7_dwell": ("_asr_k7_dwell_held", "park"),                        # #47
+    "k7_dwell_idle_skip": ("_k7_dwell_idle_skip", "idle"),                 # #94
+    "flip_economics_ok": ("_flip_economics_ok", "set"),                    # #48 (+ #49 vision_flip_urgent inside)
+    "idle_disposition": ("_idle_disposition", "idle"),                     # #50
+    "d_hold_expired": ("_d_hold_expired", "idle"),                         # #51
+    "park_youngest": ("_arrival_seat_park_youngest", "park"),              # #52
+    "kv_displace": ("_arrival_seat_kv_displace", "park"),                  # #52
+    "queued_short_to_d": ("_asr_queued_short_to_d", "arrival"),            # #53
+    "hl_sweep": ("_hl_sweep", "reroute"),                                  # #55
+    "requeue_after_x_refusal": ("_requeue_after_x_refusal", "reroute"),    # #56
+    "sk_admission_reprice": ("_sk_admission_reprice", "reroute"),          # #57
+    "p_batch_takes": ("_p_batch_takes_d_prefill", "reroute"),              # #61
+    "p_phase_short_rides": ("_p_phase_short_rides", "phase_end"),          # #62
+    "p_phase_needs_p": ("_p_phase_needs_p", "phase_end"),                  # #62
+    "p_phase_reenter": ("_p_phase_reenter", "phase_end"),                  # #62
+    "d_line_hold_older": ("_d_line_hold_for_older_waiter", "seat"),        # #92
+    "d_direct_yield_fetch_cost": ("_d_direct_yield_fetch_cost", "arrival"),  # #93
+    "abort_parked_on_drain": ("_abort_parked_on_drain", "abort"),          # #90
+    "fairness_switch": ("_fairness_switch", "park"),                       # #33
+    "x_idle_regrant": ("_x_idle_regrant", "arrival"),                      # #32 (27B)
+    "d_short_drain": ("_d_short_drain", "arrival"),                        # #31 (27B)
+    "dormant_hold_for_older": ("_dormant_hold_for_older", "seat"),         # #65
+    "d_line_admit_yields": ("_d_line_admit_yields", "seat"),               # #65
+    "seat_rotate_plan": ("_seat_rotate_plan", "seat"),                     # #65
+    "set_members": ("_set_members", "set"),                                # #96 (p_only per state, R7)
+}
+EZ_ALT_MISSING = _dr.install_alt_shadow(Front, EZ_ALT_SITES, lambda f: f.__dict__.get("_dec_rec"))
+
+
 ROUTE_COUNTERS = {"d_direct": "route_d_direct", "via_p": "route_via_p", "d_drain": "route_d_drain",
                   "reroute_midstream": "route_reroute_midstream"}
 

@@ -2047,6 +2047,18 @@ class Envs:
     FLLIPER_PDFLIP_D_MATCH_PROBE_DEADLINE_MS = EnvInt(16000)
     # S56r A1: the pause before a failed probe is asked again (ms)
     FLLIPER_PDFLIP_D_MATCH_PROBE_RETRY_MS = EnvInt(250)
+    # EZ-S1 (plan nf-entscheidungszentrale-plan-1019, user 19.10. "nichts schaetzen"): the arrival is classified on an EXACT
+    # number only. No exact fresh u_d: u_p (P's store view) may only say "kurz" (u_p < halbX, D has the same store plus its
+    # radix: u_d <= u_p); everything else is MEASURE_ON_D -- D measures and refuses what is not kurz with its exact extent
+    # (the front hands D the measuring barrier halbX - 1). Media n is n_est (display), never exact; carrier_est is not set
+    # from n_est. Default ON (user 14.10.: new features on); off = the rc17 classification of an unpriced arrival.
+    FLLIPER_PDFLIP_EXACT_CLASS = EnvBool(True)
+    # EZ-S1 (plan A10): a background /server_info read of D's free KV at the end of every P->D flip and every this-many ms
+    # while D is awake (never awaited in a tick, one in flight); 0 = off. Default ON.
+    FLLIPER_PDFLIP_KV_REFRESH_MS = EnvInt(250)
+    # EZ-S1 (plan A10): a KV / seat reading older than this (ms) counts as NOT PRESENT (kv=absent in the decision record),
+    # never as a number. 1000 = the age the ARRIVAL-SEAT test has always accepted as "a reading".
+    FLLIPER_PDFLIP_KV_FRESH_MS = EnvInt(1000)
     # S63 F1 (user 19.10. "alle zahlen liegen doch schwarz auf weiß vor zu jedem zeitpunkt?"): a set verdict that flips
     # or assigns P (FLIP_P / PARK_NO_SEAT / REROUTE_P, also the queue-sum verdict) stands only on D's CURRENT numbers:
     # members whose probe answer is older than _FRESH_MS are probed again (D's tree read-only + the store, one
