@@ -850,8 +850,8 @@ def sys_grid_positions(ids: Optional[Sequence[int]], tok: Optional[int], page: i
     * the lowest group boundary of the tail window ``(G_last, floor_page(u))``, if any;
     * ``floor_page(u)``: where a new first message forks off the same system prompt.
 
-    More than ``max_points`` windows widen the grid (a multiple of ``grid``) instead of
-    adding points. Pure: ids, the env token, page and the config only."""
+    More than ``max_points`` windows widen the grid (a power-of-two multiple of ``grid``,
+    so the widened points land on the chunk ends) instead of adding points. Pure: ids, the env token, page and the config only."""
     u = segment_end(ids, tok)
     page = max(1, int(page))
     grid = (max(int(grid), page) // page) * page
@@ -862,7 +862,13 @@ def sys_grid_positions(ids: Optional[Sequence[int]], tok: Optional[int], page: i
         return []
     if max_points > 0 and end_page // grid > max_points:
         k = -(-(end_page // grid) // int(max_points))
-        grid *= k
+        # Review S62 (A4): a POWER-OF-TWO multiple, so a widened grid point falls on the
+        # prefill chunk ends (16384 = 4 x 4096 on NF), which carry their chunk anchor
+        # anyway. x3 (12288) missed them: a 150k-192k first message then held 13 grid
+        # tracks PLUS 9-11 chunk anchors -- 22-27 arena anchors against the per-request
+        # share of 21 (``MAMBA-ARENA ... cap=21``), i.e. SHARE displaced the request's
+        # own shallowest anchors.
+        grid *= 1 << (int(k) - 1).bit_length()
     bounds = sorted({(b // page) * page for b in tool_group_bounds(ids, 0, int(u), head, name, mcp)}
                     if head else set())
     bounds = [b for b in bounds if 0 < b < end_page]

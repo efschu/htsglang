@@ -189,7 +189,20 @@ def test_a_long_first_message_widens_the_grid():
     ids = [IM] + [5] * 200_000 + [IM, 1, 2, 3, IM, 4, 5]
     pts = ta.sys_grid_positions(ids, IM, 64, 4096, 16, HEAD, NAME, MCP)
     assert len(pts) <= 17 and pts[-1] == (200_001 // 64) * 64
-    assert pts[0] == 4096 * 3                            # 48 windows > 16: grid x 3
+    assert pts[0] == 4096 * 4                            # 48 windows > 16: grid x 3 -> x4 (power of two, review A4)
+
+
+@pytest.mark.parametrize("L", [40_000, 64_000, 100_000, 131_000, 150_000, 175_000, 192_000, 250_000])
+def test_grid_tracks_plus_chunk_anchors_stay_inside_the_arena_share(L):
+    """Review S62 (A4), cost bound: the grid tracks (points off the 16384 chunk ends, which need no track)
+    plus the chunk anchors, the 64 anchor, turn and END stay within the per-request arena share of 21
+    (``MAMBA-ARENA ... cap=21 slots=84``). Grid x3 (12288) gave 22-27 at 150k-192k: SHARE displaced the
+    request's own anchors."""
+    ids = [IM] + [5] * (L - 2) + [IM] + [7] * 30
+    pts = ta.sys_grid_positions(ids, IM, 64, 4096, 16, HEAD, NAME, MCP)
+    tracks = [p for p in pts if p % 16384]
+    chunks = (len(ids) - 1) // 16384
+    assert 1 + chunks + len(tracks) + 2 <= 21, (L, len(tracks), chunks)
 
 
 @pytest.mark.parametrize("ids", [
