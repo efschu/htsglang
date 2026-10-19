@@ -38021,7 +38021,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4960,
+    "line": 4982,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -38339,7 +38339,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4959,
+    "line": 4981,
     "tree": "nf"
    },
    "status": "harvested",
@@ -43547,7 +43547,7 @@
      "source": {
       "file": "mem_cache/unified_radix_cache.py",
       "kind": "os.environ",
-      "line": 737
+      "line": 738
      }
     }
    },
@@ -54001,7 +54001,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4677,
+    "line": 4699,
     "tree": "nf"
    },
    "status": "harvested",
@@ -61439,7 +61439,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4656
+      "line": 4678
      }
     }
    },
@@ -62416,7 +62416,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4636
+      "line": 4658
      }
     }
    },
@@ -63545,7 +63545,7 @@
    "id": "FLLIPER_PDFLIP_EVICT_ANCHOR_SAVE",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/unified_radix_cache.py:6123"
+    "mem_cache/unified_radix_cache.py:6126"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_EVICT_ANCHOR_SAVE",
@@ -63554,7 +63554,7 @@
    "source": {
     "file": "mem_cache/unified_radix_cache.py",
     "kind": "os.environ",
-    "line": 6123,
+    "line": 6126,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -64317,7 +64317,7 @@
    "id": "FLLIPER_PDFLIP_FOLLOWER_REACH_TOLD",
    "kind": "env",
    "lesestellen": [
-    "managers/pdflip_store_told.py:1948"
+    "managers/pdflip_store_told.py:2011"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_FOLLOWER_REACH_TOLD",
@@ -64326,7 +64326,7 @@
    "source": {
     "file": "managers/pdflip_store_told.py",
     "kind": "os.environ",
-    "line": 1948,
+    "line": 2011,
     "tree": "nf"
    },
    "status": "harvested",
@@ -66020,7 +66020,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4767
+      "line": 4789
      }
     }
    },
@@ -69204,7 +69204,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4565
+      "line": 4587
      }
     }
    },
@@ -73552,7 +73552,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4682,
+    "line": 4704,
     "tree": "nf"
    },
    "status": "harvested",
@@ -74403,7 +74403,7 @@
    "id": "FLLIPER_PDFLIP_SPILL_REF_FREE",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/unified_radix_cache.py:6301"
+    "mem_cache/unified_radix_cache.py:6304"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_SPILL_REF_FREE",
@@ -74412,7 +74412,7 @@
    "source": {
     "file": "mem_cache/unified_radix_cache.py",
     "kind": "os.environ",
-    "line": 6301,
+    "line": 6304,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -74860,7 +74860,7 @@
    "id": "FLLIPER_PDFLIP_SWEEP_REFUSED_MEMO",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/unified_radix_cache.py:8191"
+    "mem_cache/unified_radix_cache.py:8194"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_SWEEP_REFUSED_MEMO",
@@ -74869,7 +74869,7 @@
    "source": {
     "file": "mem_cache/unified_radix_cache.py",
     "kind": "os.environ",
-    "line": 8191,
+    "line": 8194,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -74878,6 +74878,174 @@
     "nf"
    ],
    "type": "os.environ"
+  },
+  "FLLIPER_PDFLIP_SYS_GRID_ANCHOR": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "True",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "SYS-GRID TRACK (S62 4b, 19.10., NF rc15 pdflip-2-8; pdflip/turn_anchor.py): where the turn anchor is armed, a prefill step inside the prompt's FIRST message (system + tool list, up to the second <|im_start|>) also tracks the state every FLLIPER_PDFLIP_SYS_GRID_TOKENS tokens -- each grid point snapped down to the lowest tool-GROUP boundary (built-in -> MCP, MCP server change) inside its window -- plus floor_page(segment end). A tool-list variant then loses at most one grid window (rc15 2-8: 0 instead of 5056 tokens). One gather row + one mamba slot per point, same forward, once per system-prefix variant. 0 = off (byte for byte).",
+   "id": "FLLIPER_PDFLIP_SYS_GRID_ANCHOR",
+   "kind": "env",
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_SYS_GRID_ANCHOR",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 4177,
+    "tree": "nf"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "EnvBool"
+  },
+  "FLLIPER_PDFLIP_SYS_GRID_MAX": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "16",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "cost bound: at most this many points per prompt (the arena's per-request share cap is 21 slots; more grid points would displace the request's own anchors). A longer first message widens the grid instead.",
+   "id": "FLLIPER_PDFLIP_SYS_GRID_MAX",
+   "kind": "env",
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_SYS_GRID_MAX",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 4182,
+    "tree": "nf"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "EnvInt"
+  },
+  "FLLIPER_PDFLIP_SYS_GRID_MCP_PREFIX": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"76,4520,548\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "",
+   "id": "FLLIPER_PDFLIP_SYS_GRID_MCP_PREFIX",
+   "kind": "env",
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_SYS_GRID_MCP_PREFIX",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 4189,
+    "tree": "nf"
+   },
+   "status": "unexplained",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "EnvStr"
+  },
+  "FLLIPER_PDFLIP_SYS_GRID_TOKENS": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "4096",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "",
+   "id": "FLLIPER_PDFLIP_SYS_GRID_TOKENS",
+   "kind": "env",
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_SYS_GRID_TOKENS",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 4178,
+    "tree": "nf"
+   },
+   "status": "unexplained",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "EnvInt"
+  },
+  "FLLIPER_PDFLIP_SYS_GRID_TOOL_HEAD": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"4754,1267,763,328,1628,487,328,1628,763\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "Qwen3.x token ids (tokenizer.json, verified 19.10.): a tool line of the chat template's <tools> block starts '{\"type\": \"function\", \"function\":', its name field is '\"name\": \"' and an MCP tool's name starts 'mcp__' (separator '__'). Empty = no tool snapping (the plain grid).",
+   "id": "FLLIPER_PDFLIP_SYS_GRID_TOOL_HEAD",
+   "kind": "env",
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_SYS_GRID_TOOL_HEAD",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 4187,
+    "tree": "nf"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "EnvStr"
+  },
+  "FLLIPER_PDFLIP_SYS_GRID_TOOL_NAME": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"591,763,328\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "",
+   "id": "FLLIPER_PDFLIP_SYS_GRID_TOOL_NAME",
+   "kind": "env",
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_SYS_GRID_TOOL_NAME",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 4188,
+    "tree": "nf"
+   },
+   "status": "unexplained",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "EnvStr"
   },
   "FLLIPER_PDFLIP_TAG": {
    "bare": false,
@@ -76129,6 +76297,37 @@
    ],
    "type": "os.environ"
   },
+  "FLLIPER_PDFLIP_TOLD_TREE_ANCHOR": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"1\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "S62 (19.10., NF rc14 ..._1019_010742, P PP0 05:20:15, pdflip-1-30): the absolute told of a request whose head sits in PP0's DEVICE tree was clamped to the STORE's deepest anchor -- 'MATCH-CENSUS-DEEP rid=pdflip-1-30 reached=18624 accepted=18624' (the sibling 1-28's turn anchor, inserted on every stage one second earlier), then '#1416 STORE-TOLD ANCHOR-CLAMP completed=18624 anchored=3072' because 1-28's retain-publish was refused by the KV arena ('RETAIN-PUBLISH ... issued=0 arena_refused=12'): 15552 tokens recomputed on P that every stage held on device. The #1416 clamp stands in for rank agreement (a follower must reach told); with the PF ack stream the followers prove told themselves -- the told-limited registration finds the head LOCALLY (FOLLOWER SATISFIED LOCALLY, H64 SETTLE-ACK-NOW) and the ack is their TREE's resumable reach (``_satisfied_resumable`` / ``_resumable_own``, ``rank_resumable``), a follower short of it acks its own reach plus its B5 anchors and PP0's H64 GROUP-FLOOR admits the deepest common depth (or told=0) for EVERY rank. So the told is max(store-anchored, PP0's tree-resumable): no arena room, no wait. Unset = on; 0/false/no/off = the store clamp alone.",
+   "id": "FLLIPER_PDFLIP_TOLD_TREE_ANCHOR",
+   "kind": "env",
+   "lesestellen": [
+    "managers/pdflip_store_told.py:1152"
+   ],
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_TOLD_TREE_ANCHOR",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "managers/pdflip_store_told.py",
+    "kind": "os.environ",
+    "line": 1152,
+    "tree": "nf"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "os.environ"
+  },
   "FLLIPER_PDFLIP_TOLD_WAIT_ABS_S": {
    "bare": false,
    "choices": null,
@@ -76982,7 +77181,7 @@
    "id": "FLLIPER_PDFLIP_W27_HELD_STOP",
    "kind": "env",
    "lesestellen": [
-    "managers/pdflip_store_told.py:2005"
+    "managers/pdflip_store_told.py:2068"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_W27_HELD_STOP",
@@ -76991,7 +77190,7 @@
    "source": {
     "file": "managers/pdflip_store_told.py",
     "kind": "os.environ",
-    "line": 2005,
+    "line": 2068,
     "tree": "nf"
    },
    "status": "harvested",
@@ -78208,7 +78407,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4754
+      "line": 4776
      }
     }
    },
@@ -89964,28 +90163,28 @@
  "schema": "flliper.catalog/1",
  "stats": {
   "curated": 125,
-  "entries": 2837,
-  "envs": 1958,
+  "entries": 2844,
+  "envs": 1965,
   "explained": 310,
   "flags": 864,
-  "harvested": 1748,
+  "harvested": 1752,
   "trees": {
    "abweichung": 51,
    "beide": 2463,
    "nur_27b": 180,
-   "nur_nf": 176
+   "nur_nf": 183
   },
-  "unexplained": 654
+  "unexplained": 657
  },
- "tree_rev": "27b=0798c91fcd+nf=9582101580",
+ "tree_rev": "27b=0798c91fcd+nf=88a8218f6b",
  "trees": {
   "27b": {
    "entries": 2643,
    "rev": "0798c91fcd"
   },
   "nf": {
-   "entries": 2639,
-   "rev": "9582101580"
+   "entries": 2646,
+   "rev": "88a8218f6b"
   }
  },
  "warnungen": []
