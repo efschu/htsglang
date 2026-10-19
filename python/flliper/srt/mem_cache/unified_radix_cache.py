@@ -7059,10 +7059,39 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         _role = _r12.role()
         if _r12.l3_group_on() and _role is not None:
             if _role == "host":
+                if (_r12.cut_role() == "host" and _r12.cut_l3_complete_on()
+                        and not UnifiedRadixCache._s74_cut_page_complete(self, node)):
+                    # S74 CUT-L3-WAIT (rc16 D 12:56:11-12:59:11, pdflip-114-244/246): under the token cut TP0
+                    # writes share 0 -- its ack proves nothing. Sent at once, the L3 event made every worker
+                    # skip the node in its publish sweep (l3_present) although its own extents were never
+                    # written (a TP0-alone K15 save, a worker's refused claim): the page stayed CLAIMED open0
+                    # (census oldest=.../pid<TP0>/host-write/open0, 153 at the park), the store's KV prefix
+                    # ended there and the reset dropped it. The verdict waits for the complete page.
+                    _r12.await_l3(self, node)
+                    return
                 node.l3_present = True
                 _r12.record_l3(self, node)
             return  # worker: TP0's L3 event sets it
         node.l3_present = True
+
+    def _s74_cut_page_complete(self, node) -> bool:
+        """S74: every KV page of ``node`` is COMPLETE in the arena (every token owner merged its extents) --
+        the shared slot header, no collective. True when it cannot be told (no arena pool, no keys, a lookup
+        error): the caller then keeps the pre-S74 verdict."""
+        try:
+            cc = self.cache_controller
+            pool = getattr(cc, "mem_pool_host", None)
+            arena = getattr(pool, "arena", None)
+            hashes = getattr(node, "hash_value", None)
+            backend = getattr(cc, "storage_backend", None)
+            if arena is None or not hashes or backend is None:
+                return True
+            stems = [backend._get_suffixed_key(h) for h in hashes]
+            states = arena.find_states(stems)
+            return all(int(s) == 2 for s in states) and len(states) == len(stems)
+        except Exception as exc:  # noqa: BLE001 - an unreadable answer keeps the old verdict
+            logger.warning("S74 CUT-L3 completeness probe raised on node %s: %r", getattr(node, "id", "?"), exc)
+            return True
 
     def _k12_republish_orphaned(self, node, orphaned: int) -> bool:
         """K12c review A3: give the orphaned node's host layer back so the node

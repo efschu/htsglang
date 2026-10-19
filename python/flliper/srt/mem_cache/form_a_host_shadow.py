@@ -188,6 +188,9 @@ class _State:
         # #239 S4b part 4 (TP0 only): nodes whose token-cut page was not yet
         # complete at TP0's ack -> [node, passes waited, fallback transit]
         self.rebind_wait: Dict[Tuple[str, int], list] = {}
+        # S74 CUT-L3-WAIT (TP0 only): direct-write acks under the token cut whose page was not yet complete ->
+        # [node, passes waited]; l3_present + the L3 event follow once every owner wrote
+        self.l3_wait: Dict[Tuple[str, int], list] = {}
         self.seq = 0
         self.counts: Dict[str, int] = {}
         self.announced = False
@@ -482,6 +485,69 @@ def record_l3(tree: Any, node: Any) -> bool:
     _announce("host")
     _S.ledger.append((L3, k[0], k[1], 1, 1, 0))
     return True
+
+
+def cut_l3_complete_on(env=None) -> bool:
+    """S74 switch ``FLLIPER_PDFLIP_CUT_L3_COMPLETE`` (default ON): under the token cut TP0's direct-write ack sets
+    ``l3_present`` and sends the L3 event only for a COMPLETE page (every owner wrote); ``0`` = the pre-S74 verdict
+    on TP0's own ack."""
+    v = (env if env is not None else os.environ).get("FLLIPER_PDFLIP_CUT_L3_COMPLETE", "1")
+    return str(v).strip().lower() not in ("0", "false", "no", "off", "")
+
+
+#: S74: bound of the TP0 wait list (oldest entry leaves first; it then simply never gets the L3 mark)
+L3_WAIT_CAP = 4096
+
+
+def await_l3(tree: Any, node: Any) -> bool:
+    """S74 CUT-L3-WAIT, TP0 under the token cut: its direct-write ack came while the node's page was not complete
+    in the arena (TP0 writes share 0; an owner's extents are missing or still in flight). Neither TP0 nor any
+    worker marks ``l3_present`` now: a worker whose extents are missing keeps the node un-backed and its publish
+    sweep writes it (the claim JOINS the open slot -- no room needed); TP0 re-checks at every broadcast and sends
+    L3 once the page is complete. False = not keyable (nothing is marked -- conservative)."""
+    k = node_key(node)
+    if k is None:
+        if _note("unkeyed_l3_wait"):
+            logger.warning("S74 CUT-L3-WAIT unkeyed node=%s (no l3_present on any rank)", getattr(node, "id", "?"))
+        return False
+    register_tree(tree)
+    _announce("host")
+    _S.l3_wait.pop(k, None)
+    _S.l3_wait[k] = [node, 0]
+    while len(_S.l3_wait) > L3_WAIT_CAP:
+        _S.l3_wait.pop(next(iter(_S.l3_wait)))
+    n = _note("l3_wait", 256)
+    if n:
+        logger.info("S74 CUT-L3-WAIT node=%s depth=%d pages=%d waiting=%d (TP0's ack under the token cut: the page "
+                    "is not complete -- no l3_present on any rank until every owner wrote; a worker's sweep writes "
+                    "its share) n=%d", getattr(node, "id", "?"), k[1], len(getattr(node, "hash_value", None) or ()),
+                    len(_S.l3_wait), n)
+    return True
+
+
+def _retry_l3_waits() -> None:
+    """S74, TP0 at ``attach``: a waiting page that completed gets ``l3_present`` and its L3 event in this
+    broadcast; a node that went another way (detached, host rows gone, marked by another path) leaves."""
+    tree = _S.tree
+    if tree is None or not _S.l3_wait:
+        return
+    probe = getattr(tree, "_s74_cut_page_complete", None)
+    for k, ent in list(_S.l3_wait.items()):
+        node = ent[0]
+        if (not _attached(node) or node.component_data[int(_base_ct())].host_value is None
+                or getattr(node, "l3_present", False) or probe is None):
+            del _S.l3_wait[k]
+            continue
+        if probe(node):
+            del _S.l3_wait[k]
+            node.l3_present = True
+            _S.ledger.append((L3, k[0], k[1], 1, 1, 0))
+            n = _note("l3_late", 256)
+            if n:
+                logger.info("S74 CUT-L3-LATE node=%s depth=%d after %d pass(es) (every owner wrote; l3_present "
+                            "on every rank at this broadcast) n=%d", getattr(node, "id", "?"), k[1], ent[1] + 1, n)
+            continue
+        ent[1] += 1
 
 
 def record_l3_drop(tree: Any, key: Optional[Tuple[str, int]]) -> bool:
@@ -817,6 +883,8 @@ def attach(recv_reqs: List) -> List:
     """Origin (TP0), right before the broadcast: put the pass's verdict FIRST."""
     if _S.rebind_wait:
         _retry_rebinds()  # #239 S4b part 4: pages that completed since
+    if _S.l3_wait:
+        _retry_l3_waits()  # S74: direct-write pages that completed since TP0's ack
     serve = getattr(_S.tree, "_w3_forma_serve_requests", None)
     if serve is not None:
         try:
@@ -940,6 +1008,11 @@ def on_tree_reset(tree: Any) -> None:
         _dev_publish(tree)   # the nodes are gone: no key may block a re-inserted prefix
     _S.k21_stop_msg = None
     _S.rebind_wait = {}
+    if _S.l3_wait:
+        # S74: pages a TP0 ack left incomplete up to the reset -- no worker ever wrote its share (named, not fixed)
+        logger.warning("S74 CUT-L3-RESET open=%d (direct-write pages still not complete at the reset: no owner "
+                       "share arrived before the flush; their nodes never carried l3_present)", len(_S.l3_wait))
+    _S.l3_wait = {}
     try:
         from flliper.srt.pdflip import forma_l3_subtree as _s39
 
