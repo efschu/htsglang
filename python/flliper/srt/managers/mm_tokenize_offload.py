@@ -396,3 +396,35 @@ class MmDispatchOrder:
                     stats.report()
                 except Exception:  # noqa: BLE001 -- an instrument never fails a request
                     pass
+
+
+@contextlib.contextmanager
+def probe_section(*, rid: Any, is_mm: bool):
+    """S67r (review A2, NF rc16 19.10.): the D-MATCH-PROBE's multimodal tokenization off the loop.
+
+    The probe (``/pdflip/match_probe``, pdflip/d_match_probe.py) tokenizes a prompt exactly as its leg will, but
+    without ``generate_request`` -- so without ``MmDispatchOrder.request`` and therefore with ``_OFFLOAD`` False:
+    the HF image processor ran ON the loop that serves ``/health``. rc16 (``..._1019_121629.D.log``): a
+    D-MM-ITEM-CACHE miss of a probe stood the loop 1628.9 ms and 2213.5 ms; on the 4096x4096 class it is the
+    41 s D-HEALTH stop (W17 PdFlipGroupDead).
+
+    This sets the same switch the leg's section sets -- ``offload_permitted()`` decides, a device-resident frontend
+    or a tokenizer-side tower keeps the work on the loop -- and the same (I) stats (PDFLIP-MM-TOKENIZE over 1 s,
+    ``offloaded=``). It does NOT join the dispatch order: the probe dispatches no request to the scheduler (its
+    control request answers a question, it queues nothing), so no FIFO is owed to it and no leg waits behind it.
+    The processing still runs on the ONE processing thread, behind any image request already there -- one
+    feature set at a time, as before. Yields whether the section is offloaded."""
+    offload = bool(is_mm) and offload_permitted()
+    stats = MmTokenizeStats.start(rid=rid, offloaded=offload) if is_mm else None
+    offload_token = _OFFLOAD.set(offload)
+    stats_token = _STATS.set(stats)
+    try:
+        yield offload
+    finally:
+        _STATS.reset(stats_token)
+        _OFFLOAD.reset(offload_token)
+        if stats is not None:
+            try:
+                stats.report()
+            except Exception:  # noqa: BLE001 -- an instrument never fails a probe
+                pass

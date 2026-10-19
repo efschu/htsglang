@@ -1526,7 +1526,14 @@ async def pdflip_match_probe(raw_request: Request):
             return ORJSONResponse({"success": False, "message": "shape not priced", "retry": False},
                                   status_code=200)
         tm.auto_create_handle_loop()
-        tokenized = await tm._tokenize_one_request(obj)
+        from flliper.srt.managers import mm_tokenize_offload as _mmo
+
+        # S67r A2: an image probe's processor chain runs on the processing thread like its leg's (D-HEALTH: a
+        # D-MM-ITEM-CACHE miss stood the /health loop 1.6-2.2 s in rc16), never on the loop
+        with _mmo.probe_section(rid=obj.rid, is_mm=obj.contains_mm_input()):
+            # S67: the probe is no request of this server -- tokenized WITHOUT a ReqState (rc16: the stateful path
+            # read rid_to_state['<rid>~probe'] and every probe died of KeyError before the scheduler was asked)
+            tokenized = await tm._tokenize_one_request(obj, stateless=True)
         mm = tokenized.mm_inputs
         t_tok = (_time.perf_counter() - t0) * 1000.0
         _sched_mm = None
