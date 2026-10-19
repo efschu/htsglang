@@ -55,6 +55,7 @@ builds the cache, no featureless item exists and nothing below runs.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import pickle
@@ -151,35 +152,72 @@ async def fetch_features(tm: Any, rid: str):
     if obj is None or not getattr(obj, "image_data", None):
         return PdFlipMmFeaturesOutput(rid=rid, ok=False,
                                 detail="P's tokenizer holds no request with image data for this rid")
-    try:
-        out = await tm.mm_processor.process_mm_data_async(
-            image_data=obj.image_data,
-            audio_data=getattr(obj, "audio_data", None),
-            input_text=obj.text,
-            request_obj=obj,
-            max_req_input_len=getattr(tm, "max_req_input_len", None),
-        )
-        items = list(getattr(out, "mm_items", None) or ())
+    from flliper.srt.managers import mm_tokenize_offload as _mmo
+
+    def _pack(items):
+        """sha256 per item + the pickle of up to ~400 MB of pixels: CPU, off the loop when offloaded."""
         feats: List[Any] = []
         hashes: List[int] = []
         offsets: List[Any] = []
         for it in items:
             f = getattr(it, "feature", None)
             if f is None:
-                return PdFlipMmFeaturesOutput(rid=rid, ok=False, detail="the processor returned an item "
-                                        "without pixels")
+                return None
             hashes.append(int(hash_feature(f)))
             feats.append(_plain(f))
             offsets.append([list(map(int, o)) for o in (getattr(it, "offsets", None) or ())])
-        payload = pickle.dumps({"features": feats, "hashes": hashes, "offsets": offsets},
-                               protocol=pickle.HIGHEST_PROTOCOL)
+        return len(feats), pickle.dumps({"features": feats, "hashes": hashes, "offsets": offsets},
+                                        protocol=pickle.HIGHEST_PROTOCOL)
+
+    try:
+        # RV66 A1: the FETCH runs the HF processor, the hash and the pickle OFF the tokenizer loop that serves
+        # /health (the D-HEALTH class, mm_tokenize_offload) -- the same switch a leg's section sets
+        # (offload_permitted()); S67r's probe_section when the tree has it, else the same two ContextVars here
+        with _fetch_section(_mmo, rid) as offloaded:
+            out = await tm.mm_processor.process_mm_data_async(
+                image_data=obj.image_data,
+                audio_data=getattr(obj, "audio_data", None),
+                input_text=obj.text,
+                request_obj=obj,
+                max_req_input_len=getattr(tm, "max_req_input_len", None),
+            )
+            items = list(getattr(out, "mm_items", None) or ())
+            packed = (await _mmo.run_offloaded(_pack, items)) if offloaded else _pack(items)
+        if packed is None:
+            return PdFlipMmFeaturesOutput(rid=rid, ok=False, detail="the processor returned an item without pixels")
+        n_items, payload = packed
     except Exception as exc:  # noqa: BLE001 -- answered by name, never silent
         logger.warning("%s FETCH rid=%s processor raised %s: %s", W_KNOWN, rid, type(exc).__name__, exc)
         return PdFlipMmFeaturesOutput(rid=rid, ok=False, detail=f"processor raised {type(exc).__name__}: {exc}")
     ms = (time.perf_counter() - t0) * 1000.0
     logger.info("%s FETCH-ANSWER rid=%s items=%d bytes=%d ms=%.0f (P's tokenizer ran the processor "
-                "for a known image PP0's verdict needs)", W_KNOWN, rid, len(feats), len(payload), ms)
-    return PdFlipMmFeaturesOutput(rid=rid, ok=True, payload=payload, detail=f"items={len(feats)} ms={ms:.0f}")
+                "for a known image PP0's verdict needs)", W_KNOWN, rid, n_items, len(payload), ms)
+    return PdFlipMmFeaturesOutput(rid=rid, ok=True, payload=payload, detail=f"items={n_items} ms={ms:.0f}")
+
+
+@contextlib.contextmanager
+def _fetch_section(mmo: Any, rid: str):
+    """RV66 A1: the FETCH's offload section. S67r's ``mm_tokenize_offload.probe_section`` (a multimodal
+    tokenization outside ``generate_request``: the offload switch and the (I) stats, no dispatch-order turn -- the
+    answer queues no request) when the tree has it; otherwise the same two ContextVars, set here."""
+    section = getattr(mmo, "probe_section", None)
+    if section is not None:
+        with section(rid=rid, is_mm=True) as offloaded:
+            yield offloaded
+        return
+    offload = bool(mmo.offload_permitted())
+    stats = mmo.MmTokenizeStats.start(rid=rid, offloaded=offload)
+    off_tok = mmo._OFFLOAD.set(offload)
+    st_tok = mmo._STATS.set(stats)
+    try:
+        yield offload
+    finally:
+        mmo._STATS.reset(st_tok)
+        mmo._OFFLOAD.reset(off_tok)
+        try:
+            stats.report()
+        except Exception:  # noqa: BLE001 -- an instrument never fails a fetch
+            pass
 
 
 # ---------------------------------------------------------------------------
