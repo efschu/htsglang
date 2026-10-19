@@ -3410,6 +3410,47 @@ def _row_geom(name: str, t, pool, alloc, P: int):
     return None, "%s: %d rows match no slot geometry of the %d-token space" % (name, rows, G)
 
 
+def kv_listener_refusal(alloc) -> Optional[str]:
+    """S84: may a page move run under this allocator's slot-lifetime listeners?
+    None = yes; else why not (named).
+
+    By the listener's DECLARED role (``allocator.base.mark_listener``), never by
+    its existence -- rc19 NF (boot 1019_230333) refused all 17 compactions per rank
+    with "allocator._free_listeners armed" although the only listener was the KV
+    stage cap itself (``KvRowCap``, engaged at the boot by ``kv_stage_boot_cap``):
+    an id-set filter that follows every free()/clear(). Such a CAP FILTER is
+    compatible: ``d_kv_compact.survey`` takes no destination above its cap and
+    counts its withheld ids as neither live nor free, and the sources go back
+    through ``free()``, where the filter withholds those above the cap again.
+    A SLOT MIRROR (DFlash ``DraftKVSlotMapper``) refuses, and so does any listener
+    that declares nothing (fail-closed) and any radix-dedup alias listener (only
+    the DFlash window pool's draft-row carry subscribes there). Replicated: every
+    D rank registers the same listeners (server config); a rank that differs says
+    "no" into the group MIN of ``_kv_compact_for_shrink`` -- no rank moves."""
+    from flliper.srt.mem_cache.allocator.base import (
+        LISTENER_ROLE_CAP_FILTER,
+        LISTENER_ROLE_SLOT_MIRROR,
+        listener_role,
+    )
+
+    if getattr(alloc, "_alias_listeners", None):
+        return ("allocator._alias_listeners armed (the radix-dedup carry of a slot-lifetime "
+                "mirror, DFlash DraftKVSlotMapper) -- its rows would not follow a page move")
+    for on_free, on_clear in list(getattr(alloc, "_free_listeners", None) or ()):
+        role = listener_role(on_free)
+        if role == LISTENER_ROLE_CAP_FILTER and (
+                on_clear is None or listener_role(on_clear) == LISTENER_ROLE_CAP_FILTER):
+            continue
+        name = getattr(on_free, "__qualname__", None) or type(on_free).__name__
+        if role == LISTENER_ROLE_SLOT_MIRROR:
+            return ("allocator._free_listeners: a slot-lifetime mirror is armed (%s, e.g. DFlash "
+                    "DraftKVSlotMapper) -- its per-slot rows would not follow a page move" % name)
+        return ("allocator._free_listeners: listener %s declares no role (role=%s, clear role=%s) "
+                "-- unknown semantics, no page move (fail-closed)"
+                % (name, role, listener_role(on_clear)))
+    return None
+
+
 def kv_page_buffers(sched):
     """S77-A N1/N2: EVERY token-indexed device buffer of every KV pool of this rank,
     each with the geometry its POOL gives it -- (list of (name, tensor, geom), why).
@@ -3420,7 +3461,8 @@ def kv_page_buffers(sched):
     compressed keys) or the walk REFUSES by its name. Named exemptions only: the
     per-request QSA rings and the GDN pool. Also refused: a draft worker whose pool
     is not found, a slot-lifetime mirror (DFlash ``DraftKVSlotMapper`` free/alias
-    listeners), HiSparse's index mapping. "Stage-born" plays no part here: TP0 on
+    listeners) or a listener of unknown role (``kv_listener_refusal``, S84; the KV
+    stage cap's own id-set filter passes), HiSparse's index mapping. "Stage-born" plays no part here: TP0 on
     NF holds the QSA index and the draft for every global token without a single
     born tensor (#251c born=0, #239 S3a ZERO-SHARE CELL)."""
     import torch
@@ -3429,9 +3471,9 @@ def kv_page_buffers(sched):
     if alloc is None:
         return [], "no allocator"
     P = int(getattr(alloc, "page_size", 0) or _page_size(sched))
-    for attr in ("_free_listeners", "_alias_listeners"):
-        if getattr(alloc, attr, None):
-            return [], "allocator.%s armed (a slot-lifetime mirror, e.g. DFlash DraftKVSlotMapper)" % attr
+    why = kv_listener_refusal(alloc)
+    if why is not None:
+        return [], why
     if getattr(alloc, "full_to_hisparse_device_index_mapping", None) is not None or \
             "HiSparse" in type(alloc).__name__:
         return [], "HiSparse device index mapping (%s)" % type(alloc).__name__

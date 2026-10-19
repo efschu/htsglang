@@ -94,6 +94,12 @@ class Survey:
     owner: Dict[int, NodePages]
     nodes: List[NodePages]
     why: Optional[str] = None
+    #: S84: pages above ``floor_page`` a cap filter OTHER than the stage cap withholds
+    #: (the backing-relief rung's KvRowCap), ascending. Not live, not free -- but
+    #: ``max_live_page`` (the floor) counts them, and must: that filter's release()
+    #: hands them back without the stage cap's hook. A plan that leaves one above its
+    #: boundary would move pages for a floor that cannot drop.
+    held_above: List[int] = field(default_factory=list)
 
 
 @dataclass
@@ -147,11 +153,38 @@ def _id_tensor(t):
     return t.detach().reshape(-1).to("cpu", torch.int64)
 
 
+def cap_filters(allocator: Any) -> List[Any]:
+    """S84: every id-set CAP FILTER on this allocator -- the KV stage cap
+    (``_pdflip_kv_stage_cap``) and every free listener that declares itself one
+    (``allocator.base.mark_listener``, role ``cap-filter``, owner = the KvRowCap).
+    Their withheld ids are neither live nor free, and no page move may take a
+    destination above their cap: the cap is what keeps an id off unmapped memory
+    (a freed source above it is withheld again by the filter's own free hook)."""
+    from flliper.srt.mem_cache.allocator.base import (
+        LISTENER_OWNER_ATTR,
+        LISTENER_ROLE_CAP_FILTER,
+        listener_role,
+    )
+
+    out: List[Any] = []
+    stage = getattr(allocator, "_pdflip_kv_stage_cap", None)
+    if stage is not None:
+        out.append(stage)
+    for on_free, _on_clear in list(getattr(allocator, "_free_listeners", None) or ()):
+        if listener_role(on_free) != LISTENER_ROLE_CAP_FILTER:
+            continue
+        owner = getattr(on_free, LISTENER_OWNER_ATTR, None)
+        if owner is not None and all(owner is not o for o in out):
+            out.append(owner)
+    return out
+
+
 def survey(cache: Any, allocator: Any, page_size: int, floor_page: int = 0) -> Survey:
     """The allocator's live pages above ``floor_page`` and the tree node holding
     each (ONE D2H copy of all node values, tensor ops; Python lists only for the
     pages above ``floor_page``). Pages in no free list and not withheld by the stage
-    cap are live; a page two nodes name is pinned in both."""
+    cap are live; a page two nodes name is pinned in both. S84: every cap filter
+    (``cap_filters``) counts, and no free page above the lowest engaged cap is offered."""
     import torch
 
     P = max(1, int(page_size))
@@ -166,17 +199,27 @@ def survey(cache: Any, allocator: Any, page_size: int, floor_page: int = 0) -> S
     for t in (getattr(allocator, "free_group", None) or []):  # staged frees: neither live nor claimable
         ids = _id_tensor(t) // P
         staged[ids[(ids >= 0) & (ids <= n)]] = True
-    cap = getattr(allocator, "_pdflip_kv_stage_cap", None)
-    held = _id_tensor(getattr(cap, "_withheld", None) if cap is not None else None)
     held_m = torch.zeros(n + 2, dtype=torch.bool)
-    held_m[held[(held >= 0) & (held <= n)]] = True
+    other_m = torch.zeros(n + 2, dtype=torch.bool)
+    top = n                     # S84: no destination above the lowest engaged cap
+    stage_cap = getattr(allocator, "_pdflip_kv_stage_cap", None)
+    for cap in cap_filters(allocator):
+        held = _id_tensor(getattr(cap, "_withheld", None))
+        held = held[(held >= 0) & (held <= n)]
+        held_m[held] = True
+        if cap is not stage_cap:
+            other_m[held] = True
+        c = getattr(cap, "cap", None)
+        if c is not None:
+            top = min(top, int(c))
     idx = torch.arange(n + 2)
     live_m = (~free_m) & (~held_m) & (~staged) & (idx >= 1) & (idx <= n)
     live_above = [int(x) for x in torch.nonzero(live_m & (idx > B)).flatten().tolist()]
-    free = [int(x) for x in torch.nonzero(free_m & (~held_m) & (idx >= 1) & (idx <= n)).flatten().tolist()]
+    free = [int(x) for x in torch.nonzero(free_m & (~held_m) & (idx >= 1) & (idx <= top)).flatten().tolist()]
+    held_above = [int(x) for x in torch.nonzero(other_m & (idx > B)).flatten().tolist()]
     why = tree_why(cache)
     if why is not None:
-        return Survey(P, n, B, live_above, free, {}, [], why=why)
+        return Survey(P, n, B, live_above, free, {}, [], why=why, held_above=held_above)
     CT = _full_ct()
     full, mamba = int(CT.FULL), int(CT.MAMBA)
     root = getattr(cache, "root_node", None)
@@ -190,7 +233,7 @@ def survey(cache: Any, allocator: Any, page_size: int, floor_page: int = 0) -> S
     owner: Dict[int, NodePages] = {}
     nodes: List[NodePages] = []
     if not rows:
-        return Survey(P, n, B, live_above, free, owner, nodes)
+        return Survey(P, n, B, live_above, free, owner, nodes, held_above=held_above)
     try:
         ids = torch.cat([v for _n, v in rows]).to("cpu", torch.int64)
     except RuntimeError:  # mixed devices: one copy each
@@ -226,7 +269,7 @@ def survey(cache: Any, allocator: Any, page_size: int, floor_page: int = 0) -> S
         if prev is not None and prev is not np_:
             prev.pinned = np_.pinned = True  # a page two nodes name moves for neither
         owner[int(p)] = np_
-    return Survey(P, n, B, live_above, free, owner, nodes)
+    return Survey(P, n, B, live_above, free, owner, nodes, held_above=held_above)
 
 
 def _device_children(node: Any) -> List[Any]:
@@ -244,6 +287,11 @@ def plan_for(s: Survey, boundary_page: int) -> Tuple[Optional[Plan], str]:
     B = int(boundary_page)
     if B < int(s.floor_page):
         return None, "boundary %d below the surveyed floor page %d" % (B, s.floor_page)
+    held = [p for p in s.held_above if p > B]
+    if held:
+        return None, ("page %d (tokens from %d) withheld above the boundary by a cap filter other "
+                      "than the stage cap (backing relief) -- the floor counts it, no move" % (
+                          held[0], held[0] * s.page_size))
     above = [p for p in s.live_above if p > B]
     if not above:
         return Plan(boundary_page=B), ""
