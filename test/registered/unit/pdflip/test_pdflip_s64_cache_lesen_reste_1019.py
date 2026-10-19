@@ -521,6 +521,20 @@ def test_1400b_no_raise_without_proof_is_told_zero_as_before(monkeypatch, pp1, p
         assert s.tree_cache.op_refs == 0 and rid not in s.tree_cache.ongoing
 
 
+def test_1400b_partial_acks_wait_only_within_the_frist(monkeypatch):
+    """PP1 acked 98560 above told, PP2's read never ends (its ack never comes):
+    the raise waits only inside the unchanged PF Frist, then told=0 for every
+    rank -- no hang."""
+    ring, rid, told, m, fb, rz = _raise_ring(monkeypatch, 98560, 98560)
+    ring.stages[2].read_s = {rid: 10 ** 6}
+    ring.arrive(rid)
+    ring.run(1500)
+    plans = ring.plans(rid)
+    assert all(len(p) == 1 for p in plans) and plans[0] == plans[1] == plans[2], plans
+    assert plans[0][0][2] == 0
+    assert getattr(ring.stages[0], "_s64_raise_admit_n", 0) == 0
+
+
 def test_1400b_switch_off_is_told_zero(monkeypatch):
     ring, rid, told, m, fb, rz = _raise_ring(monkeypatch, 98560, 98560)
     monkeypatch.setenv(rz.ENV_RAISE, "0")
