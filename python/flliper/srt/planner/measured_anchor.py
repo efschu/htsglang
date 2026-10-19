@@ -74,6 +74,7 @@ import inspect
 import json
 import os
 import re
+import tempfile
 import time
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -388,8 +389,8 @@ def find_boot_logs(evidence_dirs: Sequence[str], group: str) -> List[str]:
 #
 # WHAT.  The two form sets, and the parsed posts of a log that PASSED the form
 # check (per rank axis), are kept per file in one JSON next to the logs, keyed
-# by basename + size + mtime_ns.  A key that no longer matches is a miss and
-# the file is read exactly as before.  The scan order, the form checks, the
+# by basename + (size, mtime_ns, st_ino, st_ctime_ns).  A key that no longer
+# matches is a miss and the file is read exactly as before.  The scan order, the form checks, the
 # completeness check and the winner are unchanged: the index only replaces
 # "read the file again" by "the same answer the last read gave".  A log is
 # never moved, rewritten or deleted (other tools read them).
@@ -400,7 +401,58 @@ def find_boot_logs(evidence_dirs: Sequence[str], group: str) -> List[str]:
 # says so in the scan note -- the index can make the scan faster, never fail
 # it.
 INDEX_BASENAME = ".measured_anchor_index.json"
-INDEX_SCHEMA = 1
+#: 2 (S68 review 19.10.): key = size + mtime_ns + st_ino + st_ctime_ns (a
+#: same-size replacement with a restored mtime -- ``cp -p``, ``rsync -t``,
+#: ``touch -r`` -- still changes inode/ctime, and no tool can set ctime), and a
+#: per-entry checksum, so a damaged entry is discarded and recomputed (heals)
+#: instead of being served on every boot.
+INDEX_SCHEMA = 2
+
+#: Who may WRITE the index.  ``rw`` (default for a real boot: the launcher's
+#: ``main`` sets it when not ``--dry-run``), ``ro`` (use what is there, never
+#: write: dry runs, the oracle, tests that read a shared evidence dir), ``off``
+#: (the pre-S68 cold scan).  The env wins over every caller default, so a dry
+#: run or a test can be ALLOWED to write only explicitly.
+INDEX_MODE_ENV = "FLLIPER_MEASURED_ANCHOR_INDEX"
+INDEX_MODES = ("rw", "ro", "off")
+
+
+def resolve_index_mode(default: str = "rw") -> str:
+    env = (os.environ.get(INDEX_MODE_ENV) or "").strip().lower()
+    mode = env if env in INDEX_MODES else default
+    if mode not in INDEX_MODES:
+        raise ValueError("index mode must be one of %s, got %r" % (INDEX_MODES, mode))
+    return mode
+
+
+def _stat_key(st: os.stat_result) -> List[int]:
+    return [int(st.st_size), int(st.st_mtime_ns), int(st.st_ino), int(st.st_ctime_ns)]
+
+
+def _entry_sum(e: dict) -> str:
+    body = {k: v for k, v in e.items() if k != "sum"}
+    return hashlib.sha1(
+        json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()[:16]
+
+
+def _is_str_list(v) -> bool:
+    return isinstance(v, list) and all(isinstance(x, str) for x in v)
+
+
+def _valid_posts(raw) -> bool:
+    if not isinstance(raw, dict):
+        return False
+    for axis, ranks in raw.items():
+        if axis not in ("tp", "pp") or not isinstance(ranks, dict):
+            return False
+        for rk, fields in ranks.items():
+            if not (isinstance(rk, str) and rk.isdigit() and isinstance(fields, dict)):
+                return False
+            for fk, fv in fields.items():
+                if not isinstance(fk, str) or isinstance(fv, bool) or not isinstance(fv, (int, float)):
+                    return False
+    return True
 
 
 def _index_fingerprint() -> str:
@@ -417,10 +469,13 @@ def _index_fingerprint() -> str:
 
 
 class _LogIndex:
-    """basename -> {size, mtime_ns, models, budgets, posts{axis: {...}}} per dir."""
+    """basename -> {key, models, budgets, posts{axis: {...}}, sum} per dir."""
 
-    def __init__(self, dirs: Sequence[str]):
+    def __init__(self, dirs: Sequence[str], mode: str = "rw"):
         self.fp = _index_fingerprint()
+        self.mode = mode
+        self.writable = mode == "rw"
+        self.discarded = 0
         self.by_dir: Dict[str, Dict[str, dict]] = {}
         self.dirty: Dict[str, bool] = {}
         self.hits = 0
@@ -449,20 +504,29 @@ class _LogIndex:
 
     def get(self, path: str, st: os.stat_result) -> Optional[dict]:
         d, base = os.path.split(os.path.abspath(path))
-        e = self.by_dir.setdefault(d, {}).get(base)
-        if (isinstance(e, dict) and e.get("size") == st.st_size
-                and e.get("mtime_ns") == st.st_mtime_ns
-                and isinstance(e.get("models"), list)
-                and isinstance(e.get("budgets"), list)):
-            self.hits += 1
-            return e
-        return None
+        entries = self.by_dir.setdefault(d, {})
+        e = entries.get(base)
+        if e is None:
+            return None
+        if not (isinstance(e, dict) and e.get("key") == _stat_key(st)):
+            return None  # a changed (or replaced) file: an ordinary miss
+        # the entry claims THIS file: it is served only when it is intact.  A
+        # damaged one (bad checksum, wrong element types -- e.g. models=[1]) is
+        # dropped here, so the read below recomputes and put() replaces it: it
+        # heals on the first scan instead of costing the anchor on every boot.
+        if (e.get("sum") != _entry_sum(e) or not _is_str_list(e.get("models"))
+                or not _is_str_list(e.get("budgets")) or not _valid_posts(e.get("posts"))):
+            del entries[base]
+            self.dirty[d] = True
+            self.discarded += 1
+            return None
+        self.hits += 1
+        return e
 
     def put(self, path: str, st: os.stat_result, text: str) -> dict:
         d, base = os.path.split(os.path.abspath(path))
         e = {
-            "size": st.st_size,
-            "mtime_ns": st.st_mtime_ns,
+            "key": _stat_key(st),
             "models": sorted(set(_RE_MODEL.findall(text))),
             "budgets": sorted(set(_RE_BUDGETS.findall(text))),
             "posts": {},
@@ -498,30 +562,44 @@ class _LogIndex:
         return text
 
     def save(self) -> None:
+        if not self.writable:
+            return
         for d, dirty in self.dirty.items():
             if not dirty:
                 continue
             # entries of logs that are gone are dropped, so the index never grows
             # past the directory it describes
-            logs = {b: e for b, e in self.by_dir[d].items()
-                    if os.path.exists(os.path.join(d, b))}
+            logs = {}
+            for b, e in self.by_dir[d].items():
+                if os.path.exists(os.path.join(d, b)):
+                    e["sum"] = _entry_sum(e)
+                    logs[b] = e
             path = os.path.join(d, INDEX_BASENAME)
-            tmp = "%s.tmp.%d" % (path, os.getpid())
+            # mkstemp IN the target dir: unique across PID namespaces (the
+            # launcher in the container, a dry run in CT999 and a warm run on
+            # the host can share a PID), same filesystem, so os.replace is
+            # atomic.  0644: the CT999 side reads what the container wrote.
+            tmp = None
             try:
-                with open(tmp, "w") as f:
+                fd, tmp = tempfile.mkstemp(dir=d, prefix=INDEX_BASENAME + ".", suffix=".tmp")
+                with os.fdopen(fd, "w") as f:
                     json.dump({"fingerprint": self.fp, "logs": logs}, f, separators=(",", ":"))
+                os.chmod(tmp, 0o644)
                 os.replace(tmp, path)
+                tmp = None
             except OSError as exc:
                 self.notes.append("index %s not written (%s: %s); next scan is cold again"
                                   % (path, type(exc).__name__, exc))
-                try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
+                if tmp is not None:
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
 
     def note(self, n_logs: int, wall_s: float) -> str:
-        s = (" [W65-SCAN logs=%d index_hits=%d read=%d read_mib=%.1f wall_s=%.2f%s]"
+        s = (" [W65-SCAN logs=%d index_hits=%d read=%d read_mib=%.1f wall_s=%.2f index=%s%s%s]"
              % (n_logs, self.hits, self.reads, self.read_bytes / MIB, wall_s,
+                self.mode, (" discarded=%d" % self.discarded) if self.discarded else "",
                 ("; " + "; ".join(self.notes)) if self.notes else ""))
         return s
 
@@ -539,6 +617,7 @@ def read_measured_anchor(
     evidence_dirs: Sequence[str] = (),
     now: Optional[float] = None,
     use_index: bool = True,
+    index_mode: Optional[str] = None,
 ) -> MeasuredAnchor:
     """The newest boot log of the same FORM, as measured components.
 
@@ -560,7 +639,11 @@ def read_measured_anchor(
     S68: the form facts and the posts of each log come from the per-directory
     index when its size+mtime still match (see ``_LogIndex``); the answer is
     the same one a full read gives.  ``use_index=False`` is the pre-S68 cold
-    scan (kept for the equivalence test).
+    scan (kept for the equivalence test).  ``index_mode`` (``rw``/``ro``/
+    ``off``) says whether the index may be written; ``None`` resolves the env
+    ``FLLIPER_MEASURED_ANCHOR_INDEX`` with ``rw`` as default.  The launcher
+    passes ``ro`` for a dry run (the oracle included), so a dry run never
+    writes into a shared evidence dir unless the env allows it explicitly.
     """
     t0 = time.monotonic()
     logs = find_boot_logs(evidence_dirs, group)
@@ -569,7 +652,11 @@ def read_measured_anchor(
             "no boot_*.%s.log under %s -- nothing of this group has been "
             "measured yet" % (group, ", ".join(evidence_dirs) or "<no dir>")
         )
-    idx = _LogIndex(evidence_dirs if use_index else ())
+    mode = "off" if not use_index else (index_mode or resolve_index_mode("rw"))
+    if mode not in INDEX_MODES:
+        raise ValueError("index_mode must be one of %s, got %r" % (INDEX_MODES, mode))
+    use_index = mode != "off"
+    idx = _LogIndex(evidence_dirs if use_index else (), mode)
     want_budgets = ",".join(str(int(b)) for b in budgets_mib)
     rejected: List[str] = []
     won: Optional[MeasuredAnchor] = None
@@ -693,7 +780,7 @@ def warm_index(evidence_dirs: Sequence[str], group: str = "D") -> str:
     """
     t0 = time.monotonic()
     logs = find_boot_logs(evidence_dirs, group)
-    idx = _LogIndex(evidence_dirs)
+    idx = _LogIndex(evidence_dirs, "rw")  # an operator call: writing is its purpose
     for path in logs:
         try:
             st = os.stat(path)

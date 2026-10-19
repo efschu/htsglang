@@ -37,6 +37,11 @@ BUDGETS = [29560, 18512, 18488]
 ARGV = "argv: --rank-gpu-memory-mib %s model_path='/ckpt/form-a'\n"
 
 
+@pytest.fixture(autouse=True)
+def _no_mode_env(monkeypatch):
+    monkeypatch.delenv(ma.INDEX_MODE_ENV, raising=False)
+
+
 def _kw(tmp_path, **over):
     kw = dict(
         group="D", tp_size=3, rank_axis="tp", ranks_on_gpu=[1, 1, 1],
@@ -238,3 +243,164 @@ def test_repro_many_large_logs_warm_scan_reads_nothing(tmp_path):
     print("S68-REPRO n=%d x %d MiB: cold(no index) %.2f s, cold(index build) %.2f s, warm %.3f s"
           % (n, mib, walls[0], walls[1], walls[2]))
     assert walls[2] < walls[0] / 5
+
+
+# --- review 19.10. (nf-review-s68-1019.md), Auflagen 1-4 ----------------------
+
+
+def _index(tmp_path):
+    return json.loads((tmp_path / INDEX_BASENAME).read_text())
+
+
+def test_A1_valid_json_with_wrong_element_types_is_discarded_and_heals(tmp_path):
+    """models=[1] in an otherwise intact entry (checksum recomputed, i.e. as a
+    buggy writer would leave it) used to raise TypeError in the scan on EVERY
+    boot.  Now: discarded, recomputed, written back; the next scan hits."""
+    _populate(tmp_path)
+    ref = read_measured_anchor(**_kw(tmp_path, use_index=False))
+    read_measured_anchor(**_kw(tmp_path))
+    doc = _index(tmp_path)
+    for name, e in doc["logs"].items():
+        e["models"] = [1]
+        if "vOLD" in name:
+            e["posts"] = {"tp": {"0": {"card_free_gib": "x"}}}
+        e["sum"] = ma._entry_sum(e)
+    (tmp_path / INDEX_BASENAME).write_text(json.dumps(doc))
+    a = read_measured_anchor(**_kw(tmp_path))
+    assert a.components == ref.components and a.provenance == ref.provenance
+    assert "discarded=4" in a.scan_note and _scan_stats(a.scan_note) == (4, 0, 4)
+    healed = read_measured_anchor(**_kw(tmp_path))  # healed: a plain warm scan
+    assert healed.components == ref.components
+    assert _scan_stats(healed.scan_note) == (4, 4, 0) and "discarded" not in healed.scan_note
+
+
+def test_A1_tampered_entry_fails_its_checksum(tmp_path):
+    _populate(tmp_path)
+    ref = read_measured_anchor(**_kw(tmp_path, use_index=False))
+    read_measured_anchor(**_kw(tmp_path))
+    doc = _index(tmp_path)
+    e = doc["logs"]["boot_weg2_vOLD_x_1019_090000.D.log"]
+    e["posts"]["tp"]["0"].pop("available_bytes")  # well-typed, but not what the log says
+    (tmp_path / INDEX_BASENAME).write_text(json.dumps(doc))
+    a = read_measured_anchor(**_kw(tmp_path))
+    assert a.components == ref.components
+    assert "discarded=1" in a.scan_note
+
+
+def test_A2_tmp_name_is_unique_and_atomic(tmp_path, monkeypatch):
+    """A PID shared across namespaces must not make two writers share a tmp
+    file: a decoy at the old ``.tmp.<pid>`` name stays untouched."""
+    _populate(tmp_path)
+    monkeypatch.setattr(ma.os, "getpid", lambda: 4242)
+    decoy = tmp_path / (INDEX_BASENAME + ".tmp.4242")
+    decoy.write_text("DECOY of another writer")
+    seen = []
+    real = ma.tempfile.mkstemp
+
+    def spy(*a, **k):
+        seen.append(k.get("dir"))
+        return real(*a, **k)
+
+    monkeypatch.setattr(ma.tempfile, "mkstemp", spy)
+    read_measured_anchor(**_kw(tmp_path))
+    assert seen == [os.path.abspath(str(tmp_path))]  # same dir -> same fs -> atomic replace
+    assert decoy.read_text() == "DECOY of another writer"
+    assert _index(tmp_path)["fingerprint"]
+    assert oct(os.stat(tmp_path / INDEX_BASENAME).st_mode & 0o777) == "0o644"
+    left = [p for p in os.listdir(tmp_path) if p.endswith(".tmp") and p.startswith(INDEX_BASENAME)]
+    assert left == []
+
+
+def test_A3_same_size_replacement_with_restored_mtime_is_a_miss(tmp_path):
+    """cp -p / rsync -t / touch -r: same size, same mtime_ns, other content.
+    Inode and ctime still change, and they are part of the key now."""
+    a_body = "argv: model_path='/m/A'\n" + "x" * 100
+    b_body = "argv: model_path='/m/B'\n" + "x" * 100
+    assert len(a_body) == len(b_body)
+    p = _log(tmp_path, "boot_weg2_vX_x_1019_100000.D.log", b_body, 5_000)
+    kw = _kw(tmp_path, model_path="/m/A")
+    with pytest.raises(MeasuredAnchorRefused) as first:
+        read_measured_anchor(**kw)
+    assert "different model (/m/B)" in str(first.value)
+    mt = os.stat(p).st_mtime_ns
+    tmp = tmp_path / "replacement"
+    tmp.write_text(a_body)
+    os.replace(tmp, p)                     # new inode, new ctime
+    os.utime(p, ns=(mt, mt))               # mtime restored as cp -p would
+    assert os.stat(p).st_size == len(b_body) and os.stat(p).st_mtime_ns == mt
+    with pytest.raises(MeasuredAnchorRefused) as cold:
+        read_measured_anchor(**dict(kw, use_index=False))
+    with pytest.raises(MeasuredAnchorRefused) as warm:
+        read_measured_anchor(**kw)
+    assert _strip_note(str(warm.value)) == _strip_note(str(cold.value))
+    assert "different model" not in str(warm.value)
+
+
+def test_A3_in_place_rewrite_same_size_same_mtime_is_a_miss(tmp_path):
+    p = _log(tmp_path, "boot_weg2_vY_x_1019_100000.D.log", "argv: model_path='/m/B'\n", 5_000)
+    kw = _kw(tmp_path, model_path="/m/A")
+    with pytest.raises(MeasuredAnchorRefused):
+        read_measured_anchor(**kw)
+    mt = os.stat(p).st_mtime_ns
+    time.sleep(0.01)
+    p.write_text("argv: model_path='/m/A'\n")  # same inode, same size; ctime moves
+    os.utime(p, ns=(mt, mt))
+    with pytest.raises(MeasuredAnchorRefused) as warm:
+        read_measured_anchor(**kw)
+    assert "different model" not in str(warm.value)
+
+
+def test_A4_ro_mode_never_writes_but_uses_an_existing_index(tmp_path):
+    _populate(tmp_path)
+    ref = read_measured_anchor(**_kw(tmp_path, use_index=False))
+    a = read_measured_anchor(**_kw(tmp_path, index_mode="ro"))
+    assert a.components == ref.components and "index=ro" in a.scan_note
+    assert not (tmp_path / INDEX_BASENAME).exists()
+    read_measured_anchor(**_kw(tmp_path, index_mode="rw"))
+    before = (tmp_path / INDEX_BASENAME).stat().st_mtime_ns
+    _log(tmp_path, "boot_weg2_vNEW_x_1019_130000.D.log", ARGV % "9,9,9", 5_000)
+    a = read_measured_anchor(**_kw(tmp_path, index_mode="ro"))
+    assert _scan_stats(a.scan_note) == (5, 4, 1)  # reads the index, reads the new log
+    assert (tmp_path / INDEX_BASENAME).stat().st_mtime_ns == before  # ... and writes nothing
+
+
+def test_A4_env_overrides_and_off_is_the_cold_scan(tmp_path, monkeypatch):
+    _populate(tmp_path)
+    monkeypatch.setenv(ma.INDEX_MODE_ENV, "off")
+    a = read_measured_anchor(**_kw(tmp_path))
+    assert "index=off" in a.scan_note and not (tmp_path / INDEX_BASENAME).exists()
+    assert ma.resolve_index_mode("ro") == "off"
+    monkeypatch.setenv(ma.INDEX_MODE_ENV, "rw")
+    assert ma.resolve_index_mode("ro") == "rw"
+    monkeypatch.setenv(ma.INDEX_MODE_ENV, "bogus")
+    assert ma.resolve_index_mode("ro") == "ro"
+
+
+def test_A4_launcher_writes_only_on_a_real_launch_or_when_allowed(tmp_path, monkeypatch):
+    from flliper.srt.pdflip import launcher
+
+    _populate(tmp_path)
+    call = dict(cards=[], budgets=[1, 1, 1], model="/ckpt/form-a", maxkv_weights=[1, 1, 1],
+                user_reserve_by_card={}, injected=None, evidence_dirs=(str(tmp_path),))
+    monkeypatch.setattr(launcher, "_ANCHOR_INDEX_MODE", "ro")  # dry run / no main
+    _a, note = launcher._d_measured_anchor(**call)
+    assert "index=ro" in note and not (tmp_path / INDEX_BASENAME).exists()
+    monkeypatch.setenv(ma.INDEX_MODE_ENV, "rw")              # explicitly allowed
+    _a, note = launcher._d_measured_anchor(**call)
+    assert "index=rw" in note and (tmp_path / INDEX_BASENAME).exists()
+    monkeypatch.delenv(ma.INDEX_MODE_ENV)
+    monkeypatch.setattr(launcher, "_ANCHOR_INDEX_MODE", "rw")  # what main sets without --dry-run
+    _a, note = launcher._d_measured_anchor(**call)
+    assert "index=rw" in note
+
+
+def test_A4_main_sets_ro_for_dry_and_rw_for_a_launch():
+    """Tripwire on the one line that decides it (main is a boot, not callable here)."""
+    import inspect
+
+    from flliper.srt.pdflip import launcher
+
+    assert launcher._ANCHOR_INDEX_MODE in ("ro", "rw")
+    src = inspect.getsource(launcher.main)
+    assert '_ANCHOR_INDEX_MODE = "ro" if dry else "rw"' in src
+    assert src.index("dry = ns.dry_run") < src.index('_ANCHOR_INDEX_MODE = "ro" if dry else "rw"')
