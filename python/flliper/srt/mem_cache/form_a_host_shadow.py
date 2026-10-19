@@ -999,9 +999,10 @@ def attach(recv_reqs: List) -> List:
     if n:
         kinds = [e[0] for e in v.events]
         logger.info("R12 HOST-VERDICT SENT seq=%d events=%d transit=%d state=%d rebind=%d spill=%d l3=%d k21=%d "
-                    "l3drop=%d (n=%d)",
+                    "l3drop=%d publish=%d (n=%d)",
                     v.seq, len(v.events), kinds.count(TRANSIT), kinds.count(STATE) + kinds.count(RRSTATE),
-                    kinds.count(REBIND), kinds.count(SPILL), kinds.count(L3), kinds.count(K21), kinds.count(L3DROP), n)
+                    kinds.count(REBIND), kinds.count(SPILL), kinds.count(L3), kinds.count(K21), kinds.count(L3DROP),
+                    kinds.count(PUBLISH), n)
     return [v] + list(recv_reqs)
 
 
@@ -1161,6 +1162,7 @@ def apply(tree: Any, events: List, seq: int = 0) -> Dict[str, int]:
         return c
     work = list(_S.pending.values())
     _S.pending = {}
+    pub_n, pub_ms = 0, 0.0   # S74r review A2: the synchronous PUBLISH writes of this consume
     state_keys = {(e[1], int(e[2])) for e in work if e[0] in (STATE, RRSTATE)}
     for e in work:
         kind, h, depth, exists, kv, m = e
@@ -1195,7 +1197,10 @@ def apply(tree: Any, events: List, seq: int = 0) -> Dict[str, int]:
             if r != "worker":
                 continue  # TP0 wrote its share-0 claim before it sent the event
             pub = getattr(tree, "_s74_worker_publish", None)
+            _tp = time.perf_counter()
             out = pub(node) if callable(pub) else "no_hook"
+            pub_ms += (time.perf_counter() - _tp) * 1e3
+            pub_n += 1
             c["publish_" + out] = c.get("publish_" + out, 0) + 1
             n = _note("publish_" + out, 256)
             if n:
@@ -1290,6 +1295,15 @@ def apply(tree: Any, events: List, seq: int = 0) -> Dict[str, int]:
     if c["unreconcilable"] and _note("unreconcilable", 16):
         logger.error("R12 SHADOW-UNRECONCILABLE %d node(s): TP0 dropped host of a node "
                      "that is device-evicted and interior here", c["unreconcilable"])
+    if pub_n:
+        c["publish_ms"] = pub_ms
+        _ns = _note("publish_sum", 64)
+        if _ns or pub_ms >= 20.0:
+            outs = " ".join(f"{k[8:]}={v}" for k, v in sorted(c.items())
+                            if k.startswith("publish_") and k != "publish_ms")
+            logger.info("S74 CUT-L3-PUBLISH-SUM seq=%d n=%d ms=%.2f %s (this consume's synchronous worker writes, "
+                        "before the pass's requests) n_sum=%d", seq, pub_n, pub_ms, outs,
+                        _S.counts.get("publish_sum", 0))
     return c
 
 

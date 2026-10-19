@@ -223,6 +223,43 @@ def test_worker_gets_publish_not_l3_and_writes_its_share_at_the_broadcast(arena,
     assert len(ev) == 1 and n.l3_present is True
 
 
+def test_publish_and_transit_of_the_same_key_in_one_broadcast_both_apply(arena, host_cut, monkeypatch, caplog):
+    """S74r review A1 (mutant M2): PUBLISH has its OWN pending slot -- a TRANSIT (or STATE/REBIND) of the same
+    (hash, depth) in the same broadcast must not displace it, nor it them. Both apply on the worker, and the
+    SENT line / the worker's per-consume sum name the PUBLISH."""
+    t, n = _Tree(arena), _node()
+    _tp0_claims_share0(arena, n.hash_value)
+    t._k12_direct_l3_verdict(n, 0)
+    k = R.node_key(n)
+    R._S.ledger.append((R.TRANSIT, k[0], k[1], 1, 0, 0))   # TP0's deferred transit of the same node, same pass
+    with caplog.at_level("INFO"):
+        sent = R.attach([])
+    assert sorted(e[0] for v in sent for e in v.events) == sorted([R.PUBLISH, R.TRANSIT])
+    assert "publish=1" in caplog.text
+    w = _node()
+    wt = _WorkerTree(arena, w, 0)
+    released = []
+    wt._pdflip_release_chain_piece_host = lambda node: released.append(node.id)
+    wt.ongoing_write_through = {}
+    caplog.clear()
+    with caplog.at_level("INFO"):
+        _worker_consume(monkeypatch, sent, wt)
+    assert released == [1250], "the TRANSIT was applied"
+    assert wt.calls == [1250], "the PUBLISH was applied"
+    assert "S74 CUT-L3-PUBLISH-SUM" in caplog.text and "n=1" in caplog.text
+    # the reverse order in the ledger: still both
+    R._S.pending = {}
+    R._S.ledger = [(R.TRANSIT, k[0], k[1], 1, 0, 0), (R.PUBLISH, k[0], k[1], 1, 1, 0)]
+    sent2 = R.attach([])
+    w2 = _node()
+    wt2 = _WorkerTree(arena, w2, HALF)
+    rel2 = []
+    wt2._pdflip_release_chain_piece_host = lambda node: rel2.append(node.id)
+    wt2.ongoing_write_through = {}
+    _worker_consume(monkeypatch, sent2, wt2)
+    assert rel2 == [1250] and wt2.calls == [1250]
+
+
 def test_worker_publish_skips_a_backed_node(arena, host_cut, monkeypatch):
     """The ordinary sweep: the worker's own write is already issued/backed -- PUBLISH writes nothing twice."""
     t, n = _Tree(arena), _node()
