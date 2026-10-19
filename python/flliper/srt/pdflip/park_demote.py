@@ -96,6 +96,15 @@ def demote_once(backend, pools: Iterable, *, state: Optional[dict] = None, batch
                 full = l3 >= 1 and tot["busy"] == 0 and l3 + tot["missing"] >= len(stems)
             if full:
                 state[key] = True
+            elif prole != "anchor" and tot["absent"] and not tot["written"]:
+                # S73 (rc16 190-747/190-722/174-648): a kept KV span with pages
+                # absent from the arena and nothing to copy printed NO line --
+                # the span the wake would read short of was invisible. Once per
+                # (rid, absent, missing, busy) change.
+                sig = (tot["absent"], tot["missing"], tot["busy"])
+                if _INCOMPLETE_SEEN.get(key) != sig:
+                    _INCOMPLETE_SEEN[key] = sig
+                    _note_incomplete(rid, role, prole, len(stems), tot)
             if tot["written"] or full:
                 rec = dict(rid=rid, role=role, pool=prole, pages=len(stems), l3_pages=l3,
                            ms=(time.perf_counter() - t0) * 1e3, **tot)
@@ -110,7 +119,28 @@ def demote_once(backend, pools: Iterable, *, state: Optional[dict] = None, batch
                         tot["bytes"], rec["ms"])
     for k in [k for k in state if k not in live]:
         state.pop(k, None)
+    for k in [k for k in _INCOMPLETE_SEEN if k not in live]:
+        _INCOMPLETE_SEEN.pop(k, None)
     return done_now
+
+
+#: S73: (pool, role, rid, chain length) -> the (absent, missing, busy) last named
+_INCOMPLETE_SEEN: dict = {}
+
+
+def _note_incomplete(rid, role, prole, pages: int, tot: dict) -> None:
+    """S73 ``#248 PARK-DEMOTE-INCOMPLETE``: the kept span's pages that are in
+    neither L3 nor a COMPLETE arena slot. ``busy`` = a CLAIMED slot (a writer
+    claimed the page, the owners never completed it -- under the #239 token cut
+    typically TP0's share-0 claim the owners skipped (S74: l3_present set on the incomplete page), census line
+    ``ARENA-REF-CENSUS-CLAIM ... pid=<TP0> host-write open0``); ``missing`` = no
+    slot at all. Either way the wake's read ends at the last complete page."""
+    l3 = int(tot.get("written", 0)) + int(tot.get("on_disk", 0))
+    logger.warning(
+        "#248 PARK-DEMOTE-INCOMPLETE rid=%s role=%s pool=%s pages=%d l3_pages=%d absent=%d (missing=%d busy=%d) "
+        "-- kept span NOT whole in the store: the wake reads it short (S73: busy = claimed, never completed by "
+        "its owners; missing = no slot)", rid, role, prole, int(pages), l3, int(tot.get("absent", 0)),
+        int(tot.get("missing", 0)), int(tot.get("busy", 0)))
 
 
 class _Demoter:
