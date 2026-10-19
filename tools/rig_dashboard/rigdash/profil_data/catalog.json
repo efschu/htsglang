@@ -55674,7 +55674,7 @@
    "id": "FLLIPER_PDFLIP_CUT_L3_COMPLETE",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/form_a_host_shadow.py:498"
+    "mem_cache/form_a_host_shadow.py:504"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_CUT_L3_COMPLETE",
@@ -55683,7 +55683,69 @@
    "source": {
     "file": "mem_cache/form_a_host_shadow.py",
     "kind": "os.environ",
-    "line": 498,
+    "line": 504,
+    "tree": "nf"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "os.environ"
+  },
+  "FLLIPER_PDFLIP_CUT_L3_PUBLISH": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"1\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "",
+   "id": "FLLIPER_PDFLIP_CUT_L3_PUBLISH",
+   "kind": "env",
+   "lesestellen": [
+    "mem_cache/form_a_host_shadow.py:549"
+   ],
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_CUT_L3_PUBLISH",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "mem_cache/form_a_host_shadow.py",
+    "kind": "os.environ",
+    "line": 549,
+    "tree": "nf"
+   },
+   "status": "unexplained",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "os.environ"
+  },
+  "FLLIPER_PDFLIP_CUT_L3_RETRY_PAGES": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"8192\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "S74 review A2: pages ``_retry_l3_waits`` re-checks per broadcast (find_states over the waiting nodes' KV stems); the rest waits for the next broadcast in round-robin order",
+   "id": "FLLIPER_PDFLIP_CUT_L3_RETRY_PAGES",
+   "kind": "env",
+   "lesestellen": [
+    "mem_cache/form_a_host_shadow.py:561"
+   ],
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_CUT_L3_RETRY_PAGES",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "mem_cache/form_a_host_shadow.py",
+    "kind": "os.environ",
+    "line": 561,
     "tree": "nf"
    },
    "status": "harvested",
@@ -75273,7 +75335,7 @@
    "id": "FLLIPER_PDFLIP_SWEEP_REFUSED_MEMO",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/unified_radix_cache.py:8220"
+    "mem_cache/unified_radix_cache.py:8241"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_SWEEP_REFUSED_MEMO",
@@ -75282,7 +75344,7 @@
    "source": {
     "file": "mem_cache/unified_radix_cache.py",
     "kind": "os.environ",
-    "line": 8220,
+    "line": 8241,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -90377,28 +90439,28 @@
  "schema": "flliper.catalog/1",
  "stats": {
   "curated": 125,
-  "entries": 2850,
-  "envs": 1971,
+  "entries": 2852,
+  "envs": 1973,
   "explained": 310,
   "flags": 864,
-  "harvested": 1759,
+  "harvested": 1760,
   "trees": {
    "abweichung": 53,
    "beide": 2463,
    "nur_27b": 180,
-   "nur_nf": 189
+   "nur_nf": 191
   },
-  "unexplained": 656
+  "unexplained": 657
  },
- "tree_rev": "27b=0798c91fcd+nf=3b04a8742a",
+ "tree_rev": "27b=0798c91fcd+nf=19a6327f47",
  "trees": {
   "27b": {
    "entries": 2643,
    "rev": "0798c91fcd"
   },
   "nf": {
-   "entries": 2652,
-   "rev": "3b04a8742a"
+   "entries": 2654,
+   "rev": "19a6327f47"
   }
  },
  "warnungen": []
