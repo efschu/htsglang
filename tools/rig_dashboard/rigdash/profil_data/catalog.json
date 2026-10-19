@@ -54334,7 +54334,7 @@
    "id": "FLLIPER_PDFLIP_ARENA_REF_RECHECK",
    "kind": "env",
    "lesestellen": [
-    "managers/cache_controller.py:159"
+    "managers/cache_controller.py:188"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_ARENA_REF_RECHECK",
@@ -54343,7 +54343,7 @@
    "source": {
     "file": "managers/cache_controller.py",
     "kind": "os.environ",
-    "line": 159,
+    "line": 188,
     "tree": "nf"
    },
    "status": "harvested",
@@ -58411,7 +58411,7 @@
      "source": {
       "file": "managers/pdflip_store_told.py",
       "kind": "os.environ",
-      "line": 528
+      "line": 573
      }
     }
    },
@@ -64270,7 +64270,7 @@
      "source": {
       "file": "managers/pdflip_store_told.py",
       "kind": "os.environ",
-      "line": 448
+      "line": 493
      }
     }
    },
@@ -64317,7 +64317,7 @@
    "id": "FLLIPER_PDFLIP_FOLLOWER_REACH_TOLD",
    "kind": "env",
    "lesestellen": [
-    "managers/pdflip_store_told.py:1948"
+    "managers/pdflip_store_told.py:2020"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_FOLLOWER_REACH_TOLD",
@@ -64326,7 +64326,7 @@
    "source": {
     "file": "managers/pdflip_store_told.py",
     "kind": "os.environ",
-    "line": 1948,
+    "line": 2020,
     "tree": "nf"
    },
    "status": "harvested",
@@ -70270,7 +70270,7 @@
    "id": "FLLIPER_PDFLIP_PF_SETTLE_ACK_NOW",
    "kind": "env",
    "lesestellen": [
-    "managers/pdflip_store_told.py:521"
+    "managers/pdflip_store_told.py:566"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_PF_SETTLE_ACK_NOW",
@@ -70279,7 +70279,7 @@
    "source": {
     "file": "managers/pdflip_store_told.py",
     "kind": "os.environ",
-    "line": 521,
+    "line": 566,
     "tree": "nf"
    },
    "status": "harvested",
@@ -70301,7 +70301,7 @@
    "id": "FLLIPER_PDFLIP_PF_TOLD_ACK_TIMEOUT_S",
    "kind": "env",
    "lesestellen": [
-    "managers/pdflip_told_fallback.py:1877"
+    "managers/pdflip_told_fallback.py:1880"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_PF_TOLD_ACK_TIMEOUT_S",
@@ -70310,7 +70310,7 @@
    "source": {
     "file": "managers/pdflip_told_fallback.py",
     "kind": "os.environ",
-    "line": 1877,
+    "line": 1880,
     "tree": "nf"
    },
    "status": "harvested",
@@ -71712,7 +71712,7 @@
    "id": "FLLIPER_PDFLIP_P_HELD_SHORT_REREAD",
    "kind": "env",
    "lesestellen": [
-    "managers/pdflip_store_told.py:278"
+    "managers/pdflip_store_told.py:279"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_P_HELD_SHORT_REREAD",
@@ -71721,7 +71721,7 @@
    "source": {
     "file": "managers/pdflip_store_told.py",
     "kind": "os.environ",
-    "line": 278,
+    "line": 279,
     "tree": "nf"
    },
    "status": "harvested",
@@ -71743,7 +71743,7 @@
    "id": "FLLIPER_PDFLIP_P_HINT_REREAD",
    "kind": "env",
    "lesestellen": [
-    "managers/pdflip_store_told.py:341"
+    "managers/pdflip_store_told.py:342"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_P_HINT_REREAD",
@@ -71752,7 +71752,7 @@
    "source": {
     "file": "managers/pdflip_store_told.py",
     "kind": "os.environ",
-    "line": 341,
+    "line": 342,
     "tree": "nf"
    },
    "status": "harvested",
@@ -72345,7 +72345,7 @@
    "id": "FLLIPER_PDFLIP_P_WAKE_PROBE",
    "kind": "env",
    "lesestellen": [
-    "managers/pdflip_store_told.py:303"
+    "managers/pdflip_store_told.py:304"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_P_WAKE_PROBE",
@@ -72354,7 +72354,7 @@
    "source": {
     "file": "managers/pdflip_store_told.py",
     "kind": "os.environ",
-    "line": 303,
+    "line": 304,
     "tree": "nf"
    },
    "status": "harvested",
@@ -73432,6 +73432,161 @@
     "file": "pdflip/d_store_reread.py",
     "kind": "os.environ",
     "line": 43,
+    "tree": "nf"
+   },
+   "status": "unexplained",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "os.environ"
+  },
+  "FLLIPER_PDFLIP_S64_COMPLETION_READ_MIN": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"1\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "S64 S-1400 (NF rc15 P 08:31:45, pdflip-72-525): PP0's completion re-read. The intake read and the P-HELD-REREAD both met ``#915 PREFETCH REFUSED reason=too_short need=192 threshold=256`` although ``P-WAKE-PROBE store_now=98560`` had just confirmed the depth: PP0 told 98368 (its match, no recurrent state on the followers there), both followers acked their own 98560 (``#1400 OVER-UNRESUMABLE ... resumable_at_told=0``), PF answered told=0 (``reason=mismatch acks={1: 98560, 2: 98560}``) and P recomputed 98592 tokens the store held. A re-read to a depth the store confirmed (why store / hint / wake_probe) completes an earlier read -- the same law as the hand-back, the park-retain and the told-bounded follower reads: minimum 1. The read itself still takes only what the store answers (its own anchored v2 claim), so a minimum of 1 can never read past the store. PP0 decides alone (attn_reduce_world=1 on P); the followers follow the told. ``FLLIPER_PDFLIP_S64_COMPLETION_READ_MIN`` (default ON; 0 = the #915 threshold as before).",
+   "id": "FLLIPER_PDFLIP_S64_COMPLETION_READ_MIN",
+   "kind": "env",
+   "lesestellen": [
+    "managers/pdflip_store_told.py:366"
+   ],
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_S64_COMPLETION_READ_MIN",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "managers/pdflip_store_told.py",
+    "kind": "os.environ",
+    "line": 366,
+    "tree": "nf"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "os.environ"
+  },
+  "FLLIPER_PDFLIP_S64_DENSE_PRESENCE_FULL_SPAN": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"1\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "S64 S-ARM: the dense (KV-only) presence question asks the whole span in batches (longest prefix) instead of the first batch alone. Default ON; 0 = the first batch as before (byte-identical).",
+   "id": "FLLIPER_PDFLIP_S64_DENSE_PRESENCE_FULL_SPAN",
+   "kind": "env",
+   "lesestellen": [
+    "managers/cache_controller.py:124"
+   ],
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_S64_DENSE_PRESENCE_FULL_SPAN",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "managers/cache_controller.py",
+    "kind": "os.environ",
+    "line": 124,
+    "tree": "nf"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "os.environ"
+  },
+  "FLLIPER_PDFLIP_S64_STORE_ARM_FRESH": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"1\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "S64 S-ARM: the D store arm (#1317 X-STORE-VOTE) is asked fresh in every vote.",
+   "id": "FLLIPER_PDFLIP_S64_STORE_ARM_FRESH",
+   "kind": "env",
+   "lesestellen": [
+    "managers/scheduler.py:740"
+   ],
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_S64_STORE_ARM_FRESH",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "managers/scheduler.py",
+    "kind": "os.environ",
+    "line": 740,
+    "tree": "nf"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "os.environ"
+  },
+  "FLLIPER_PDFLIP_S64_TOLD_RAISE": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"1\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "",
+   "id": "FLLIPER_PDFLIP_S64_TOLD_RAISE",
+   "kind": "env",
+   "lesestellen": [
+    "managers/pdflip_told_raise.py:65"
+   ],
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_S64_TOLD_RAISE",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "managers/pdflip_told_raise.py",
+    "kind": "os.environ",
+    "line": 65,
+    "tree": "nf"
+   },
+   "status": "unexplained",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "os.environ"
+  },
+  "FLLIPER_PDFLIP_S64_TOLD_RAISE_WAIT_S": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "",
+   "id": "FLLIPER_PDFLIP_S64_TOLD_RAISE_WAIT_S",
+   "kind": "env",
+   "lesestellen": [
+    "managers/pdflip_told_raise.py:71"
+   ],
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_S64_TOLD_RAISE_WAIT_S",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "managers/pdflip_told_raise.py",
+    "kind": "os.environ",
+    "line": 71,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -74652,7 +74807,7 @@
    "id": "FLLIPER_PDFLIP_STORE_SHORT_HELD_DECIDE",
    "kind": "env",
    "lesestellen": [
-    "managers/scheduler.py:950"
+    "managers/scheduler.py:989"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_STORE_SHORT_HELD_DECIDE",
@@ -74661,7 +74816,7 @@
    "source": {
     "file": "managers/scheduler.py",
     "kind": "os.environ",
-    "line": 950,
+    "line": 989,
     "tree": "nf"
    },
    "status": "harvested",
@@ -74688,7 +74843,7 @@
      "source": {
       "file": "managers/scheduler.py",
       "kind": "os.environ",
-      "line": 962
+      "line": 1001
      }
     }
    },
@@ -76985,7 +77140,7 @@
    "id": "FLLIPER_PDFLIP_W27_HELD_STOP",
    "kind": "env",
    "lesestellen": [
-    "managers/pdflip_store_told.py:2005"
+    "managers/pdflip_store_told.py:2077"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_W27_HELD_STOP",
@@ -76994,7 +77149,7 @@
    "source": {
     "file": "managers/pdflip_store_told.py",
     "kind": "os.environ",
-    "line": 2005,
+    "line": 2077,
     "tree": "nf"
    },
    "status": "harvested",
@@ -89967,28 +90122,28 @@
  "schema": "flliper.catalog/1",
  "stats": {
   "curated": 125,
-  "entries": 2837,
-  "envs": 1958,
+  "entries": 2842,
+  "envs": 1963,
   "explained": 310,
   "flags": 864,
-  "harvested": 1747,
+  "harvested": 1750,
   "trees": {
    "abweichung": 51,
    "beide": 2463,
    "nur_27b": 180,
-   "nur_nf": 176
+   "nur_nf": 181
   },
-  "unexplained": 655
+  "unexplained": 657
  },
- "tree_rev": "27b=0798c91fcd+nf=5e2dbef299",
+ "tree_rev": "27b=0798c91fcd+nf=7b9f858e78",
  "trees": {
   "27b": {
    "entries": 2643,
    "rev": "0798c91fcd"
   },
   "nf": {
-   "entries": 2639,
-   "rev": "5e2dbef299"
+   "entries": 2644,
+   "rev": "7b9f858e78"
   }
  },
  "warnungen": []
