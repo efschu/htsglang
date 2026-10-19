@@ -55725,6 +55725,99 @@
    ],
    "type": "EnvBool"
   },
+  "FLLIPER_PDFLIP_CUT_L3_COMPLETE": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"1\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "S74 switch (default ON): under the token cut TP0's direct-write ack sets ``l3_present`` and sends the L3 event only for a COMPLETE page (every owner wrote); ``0`` = the pre-S74 verdict on TP0's own ack",
+   "id": "FLLIPER_PDFLIP_CUT_L3_COMPLETE",
+   "kind": "env",
+   "lesestellen": [
+    "mem_cache/form_a_host_shadow.py:504"
+   ],
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_CUT_L3_COMPLETE",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "mem_cache/form_a_host_shadow.py",
+    "kind": "os.environ",
+    "line": 504,
+    "tree": "nf"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "os.environ"
+  },
+  "FLLIPER_PDFLIP_CUT_L3_PUBLISH": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"1\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "",
+   "id": "FLLIPER_PDFLIP_CUT_L3_PUBLISH",
+   "kind": "env",
+   "lesestellen": [
+    "mem_cache/form_a_host_shadow.py:549"
+   ],
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_CUT_L3_PUBLISH",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "mem_cache/form_a_host_shadow.py",
+    "kind": "os.environ",
+    "line": 549,
+    "tree": "nf"
+   },
+   "status": "unexplained",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "os.environ"
+  },
+  "FLLIPER_PDFLIP_CUT_L3_RETRY_PAGES": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"8192\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "S74 review A2: pages ``_retry_l3_waits`` re-checks per broadcast (find_states over the waiting nodes' KV stems); the rest waits for the next broadcast in round-robin order",
+   "id": "FLLIPER_PDFLIP_CUT_L3_RETRY_PAGES",
+   "kind": "env",
+   "lesestellen": [
+    "mem_cache/form_a_host_shadow.py:561"
+   ],
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_CUT_L3_RETRY_PAGES",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "mem_cache/form_a_host_shadow.py",
+    "kind": "os.environ",
+    "line": 561,
+    "tree": "nf"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "os.environ"
+  },
   "FLLIPER_PDFLIP_DC_D_RECORD": {
    "bare": false,
    "choices": null,
@@ -75579,7 +75672,7 @@
    "id": "FLLIPER_PDFLIP_SWEEP_REFUSED_MEMO",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/unified_radix_cache.py:8205"
+    "mem_cache/unified_radix_cache.py:8255"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_SWEEP_REFUSED_MEMO",
@@ -75588,7 +75681,7 @@
    "source": {
     "file": "mem_cache/unified_radix_cache.py",
     "kind": "os.environ",
-    "line": 8205,
+    "line": 8255,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -91084,28 +91177,28 @@
  "schema": "flliper.catalog/1",
  "stats": {
   "curated": 125,
-  "entries": 2874,
-  "envs": 1995,
+  "entries": 2877,
+  "envs": 1998,
   "explained": 310,
   "flags": 864,
-  "harvested": 1776,
+  "harvested": 1778,
   "trees": {
    "abweichung": 53,
    "beide": 2463,
    "nur_27b": 180,
-   "nur_nf": 213
+   "nur_nf": 216
   },
-  "unexplained": 663
+  "unexplained": 664
  },
- "tree_rev": "27b=0798c91fcd+nf=094ee291ea",
+ "tree_rev": "27b=0798c91fcd+nf=685de62b7a",
  "trees": {
   "27b": {
    "entries": 2643,
    "rev": "0798c91fcd"
   },
   "nf": {
-   "entries": 2676,
-   "rev": "094ee291ea"
+   "entries": 2679,
+   "rev": "685de62b7a"
   }
  },
  "warnungen": []
