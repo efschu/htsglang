@@ -650,6 +650,14 @@ int64_t arena_find_slots(uint8_t *base, int64_t n, const uint64_t *klo, const ui
  * COMPLETE (nothing to write), 3 = too large, 4 = no free slot. gen_out is
  * the slot generation to hand back to arena_complete. */
 static void stem_key128(const char *stem, uint64_t *lo, uint64_t *hi);
+
+/* S61 TEST HOOK (NF rc15 K21 09:24:27/28; NULL in production, set only by the hermetic tests): called by
+ * arena_claim for a JOIN candidate after the slot was found and before the join is committed -- the point
+ * where a joining rank can be preempted while another process frees the claim. */
+typedef void (*arena_join_hook_t)(int64_t slot);
+static arena_join_hook_t g_join_hook = NULL;
+void arena_set_join_hook(arena_join_hook_t fn) { g_join_hook = fn; }
+
 int64_t arena_claim(uint8_t *base, int64_t n, const uint64_t *klo, const uint64_t *khi,
                     const int64_t *totals, const char **stems, int64_t *slots_out,
                     int64_t *gen_out, int8_t *status);
@@ -704,6 +712,7 @@ int64_t arena_claim(uint8_t *base, int64_t n, const uint64_t *klo, const uint64_
         SlotHeader *sh = slot_hdr(base, (uint64_t)slot);
         slots_out[i] = slot;
         gen_out[i] = (int64_t)sh->generation;
+        if (!fresh && g_join_hook) g_join_hook(slot);
         if (atomic_load(&sh->state) == S_COMPLETE) { status[i] = 2; ok++; continue; }
         if (stems && stems[i] && sh->stem[0] == 0) {
             size_t sl = strlen(stems[i]);
