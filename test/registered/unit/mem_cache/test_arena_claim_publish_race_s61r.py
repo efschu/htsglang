@@ -125,13 +125,15 @@ class _RaceCase(_ArenaCase):
 class ClaimPublishRaceTest(_RaceCase):
     def test_a_join_never_commits_on_a_claim_whose_header_is_half_written(self):
         """phase 0: B's claim of K on the reaped slot has written the key, not yet generation/writers."""
-        _a, _f, res = self._publish_race(phase=0, third_claims_first=False)
+        a, _f, res = self._publish_race(phase=0, third_claims_first=False)
         self._all_land({"A": res["a"], "B": res["b"]})
+        self.assertEqual(self._state(a), 0, "B's yielded slot is FREE again, not held in the private state")
 
     def test_a_join_never_commits_on_a_claim_that_yields_its_slot(self):
         """phase 1: B's header is set up, a third rank publishes K first -- B yields its slot; A must not be on it."""
-        _a, _f, res = self._publish_race(phase=1, third_claims_first=True)
+        a, _f, res = self._publish_race(phase=1, third_claims_first=True)
         self._all_land({"A": res["a"], "B": res["b"], "C": res["c"]})
+        self.assertEqual(self._state(a), 0, "B's yielded slot is FREE again, not held in the private state")
 
 
 class FreerRecheckUnderTheLockTest(_RaceCase):
@@ -184,6 +186,21 @@ class FreerRecheckUnderTheLockTest(_RaceCase):
         self.assertEqual(out["r"], [1], "joined by another writer: kept for it (#1427r), never freed")
         self.assertEqual(self._state(s), S_CLAIMED)
         self.assertEqual(self._open(s), 1, "TP0's writer resolved, the joiner's open")
+        self.assertEqual(self.arena.complete_slots([s], [g], [(0, self.SLOT)]), [1])
+
+    def test_the_last_writer_out_backs_off_from_a_join_it_raced(self):
+        """OS free_if_abandoned: TP0 claimed fresh, TP2 joined and gave up; TP0 gives up too (the last open writer
+        of a slot nobody wrote) while TP1 joins -- the slot stays TP1's."""
+        (s, st, g), = self.arena.claim_slots(["K"], [self.SLOT])
+        assert st == 0
+        (s1, st1, _g1), = self.arena.claim_slots(["K"], [self.SLOT])
+        assert (s1, st1) == (s, 1) and self.arena.unclaim([s], [g]) == 1
+        (s2, st2, g2), out = self._freer_in_the_join(lambda slot: self.arena.release_claims([slot], [g]))
+        self.assertNotEqual(out["seen"], S_CLAIMED, "the give-up's CAS landed inside the join")
+        self.assertEqual((s2, st2, g2), (s, 1, g), "the join committed")
+        self.assertEqual(out["r"], [1], "the last-out free saw the joiner's writer: kept")
+        self.assertEqual(self._state(s), S_CLAIMED)
+        self.assertEqual(self._open(s), 1)
         self.assertEqual(self.arena.complete_slots([s], [g], [(0, self.SLOT)]), [1])
 
 
