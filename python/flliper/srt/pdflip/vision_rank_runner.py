@@ -390,12 +390,25 @@ def _probe_wait(scheduler, req, end: int) -> Optional[Tuple[int, str]]:
     held = getattr(scheduler, "_pdflip_store_held", None)
     if not isinstance(held, dict) or rid not in held:
         return None  # no #1400 verdict is coming for it: nothing to wait for
+    # S66b (NF rc17 boot 171636, P PP0, pdflip-1-13): a fork twin (#TW) is held by #1400 WITHOUT a store read until
+    # its sibling finished -- no probe, no open read -- so the probe rule above staged it: KNOWN-IMAGE FETCH
+    # 17:21:35 (covered=0 src=local), pixels 1879 ms, tower 17:21:40, and only at 17:21:52 the sibling's finish
+    # released the twin: told=81664 >= image_end 72215, P computed 61 tokens. Whatever PP0's own read says, the told
+    # decides and the admission takes nothing before it: while it is outstanding neither the stage nor the pixel
+    # fetch runs (user order 19.10.: "auch FETCH und Stage warten bis zum told, wenn ein told aussteht").
     depth, src = probe_promise(scheduler, req)
     if depth is not None and depth >= end:
         return depth, src
+    try:
+        from flliper.srt.pdflip import p_twin_defer as _twin
+
+        if _twin.is_deferred(scheduler, rid):
+            return 0, "twin-deferred"
+    except Exception:  # noqa: BLE001 -- the told-pending wait below holds it anyway
+        pass
     if depth is None and _read_open(scheduler, rid):
         return 0, "probe-pending"
-    return None
+    return (0 if depth is None else int(depth)), "told-pending"
 
 
 def stage_skip_verdict(scheduler, req) -> Tuple[str, int, str]:

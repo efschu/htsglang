@@ -167,11 +167,41 @@ def test_a_probe_not_answered_yet_waits_while_the_read_is_registered():
     assert V.stage_skip_verdict(s, r) == (V.WAIT, 0, "probe-pending")
 
 
-def test_a_probe_short_of_the_images_stages_at_once():
+def test_a_probe_short_of_the_images_still_waits_for_the_told():
+    """S66b (user order 19.10.): while a told is outstanding neither stage nor fetch runs -- the told decides."""
     r = _req()
     s = _sched(held=[RID], probe={RID: 300}, ongoing=[RID])  # 19200 < 20556
-    assert V.stage_skip_verdict(s, r)[0] == V.STAGE
-    assert V.skip_cached(s, [r]) == ([r], [])
+    assert V.stage_skip_verdict(s, r) == (V.WAIT, 19200, "told-pending")
+    assert V.skip_cached(s, [r]) == ([], [r])
+    s._pdflip_store_told[RID] = 19200
+    assert V.skip_cached(s, [r]) == ([r], []), "the told is short: the tower runs"
+
+
+def test_rc17_pdflip_1_13_deferred_twin_known_image_waits_for_the_told_no_fetch_no_tower(caplog):
+    """rc17 boot 171636, P PP0, pdflip-1-13 (image_end 72215), in this order:
+    17:21:34 P-KNOWN-IMAGE hit (no pixels) -> 17:21:35 W102k FETCH covered=0 src=local -> 17:21:37 FETCH-ANSWER
+    -> 17:21:38 ATTACHED -> 17:21:40 tower -> 17:21:52 #TW TWIN-REGISTER twin=True, TOLD told=81664 -> P computed 61.
+    The twin was held by #1400 with no store read (sibling in flight): no probe, no open read."""
+    caplog.set_level(logging.INFO)
+    rid = "pdflip-1-13"
+    r = _req(rid=rid, featureless=True, ends=(72214,))
+    s = _pass_sched(r, held=[rid])
+    s._tw_state = SimpleNamespace(waits={rid: 0.0})
+    with mock.patch("flliper.srt.pdflip.p_twin_defer.is_deferred", lambda sch, x: x in sch._tw_state.waits), \
+            mock.patch.object(V, "run_rank_stage", side_effect=AssertionError("tower ran before the told")):
+        parked = V.vision_rank_pass(s)
+        assert [x for _, x in parked] == [r]
+        assert s.ipc_channels.send_to_tokenizer.sent == [], "no pixel fetch while the told is outstanding"
+        assert VV.take_verdicts(s) == []
+        assert any(f"PROBE-WAIT rid={rid} promise=0 src=twin-deferred" in m for m in caplog.messages)
+        V.vision_unpark(s, parked)
+        # the sibling finished: the twin registers at head 81664 and its told is published
+        s._tw_state.waits.pop(rid)
+        s._pdflip_store_held.pop(rid)
+        s._pdflip_store_told[rid] = 81664
+        V.vision_rank_pass(s)
+    assert r._pdflip_vision_skip and s.ipc_channels.send_to_tokenizer.sent == []
+    assert [v.rid for v in VV.take_verdicts(s)] == [rid]
 
 
 def test_registration_head_counts_into_the_promise():
