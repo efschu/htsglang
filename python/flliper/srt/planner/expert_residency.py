@@ -1468,6 +1468,20 @@ def owned_extend_row_ms(h2d_gbps: Sequence[Optional[float]], row_bytes: int
     return tuple(out)
 
 
+def owned_miss_rank_from_link(miss_ms: Tuple[float, float], row_ms: Sequence[float], host: int
+                              ) -> Tuple[float, ...]:
+    """S54: per-card decode miss cost when no rank record exists -- the
+    (host, worker) pair split over the cards by their measured link, so the
+    x4 3080 is never priced like the x8 one (the 29.09. ``round`` loss: one
+    pooled worker SEED moved the misses onto the x4 card). The host keeps
+    its own cost; every worker gets the worker cost x its link time over the
+    workers' mean link time (the mean stays the pooled value)."""
+    workers = [r for r in range(len(row_ms)) if r != host]
+    mean_w = sum(float(row_ms[r]) for r in workers) / max(1, len(workers))
+    return tuple(float(miss_ms[0]) if r == host else
+                 float(miss_ms[1]) * float(row_ms[r]) / mean_w for r in range(len(row_ms)))
+
+
 def owned_extend_ms(fits: Sequence["DRankResidency"], *, num_experts: int, n_layers: int,
                     extend_ids: int, row_ms: Sequence[float],
                     heat: Optional[Sequence[float]] = None,
@@ -4553,6 +4567,13 @@ def plan_d_residency(
         _ext_ids = int(_ext_tok) * int(text_cfg.get("num_experts_per_tok") or 1)
         _ext_kw = dict(extend_row_ms=_ext_row_ms, extend_ids=_ext_ids,
                        extend_per_round=_ext_rate)
+        _miss_rank_link = False
+        if _miss_rank is None and _ext_row_ms is not None:
+            # S54: no rank record -> the pair split by the measured links
+            _miss_rank = owned_miss_rank_from_link(_miss_ms, _ext_row_ms, host)
+            owned_miss_rank_source = ("abgeleitet aus Paar %s und Kartenprobe-Link (S54, kein "
+                                      "Rang-Record)" % "/".join("%g" % x for x in _miss_ms))
+            _miss_rank_link = True
         _base_mode = owned_base_mode()
         _stated_base = list(base_rat)
         _base_lines: Tuple[str, ...] = ()
@@ -4721,7 +4742,9 @@ def plan_d_residency(
                  % (marker, label, _ext_tok, _ext_ids, sol.extend_per_round, _ext_src,
                     ["%.1f" % x for x in sol.extend_ms], ["%.1f" % x for x in sol.base_extend_ms],
                     max(sol.extend_ms), max(sol.base_extend_ms),
-                    ["%.4f" % x for x in _ext_row_ms], owned_extend_source or "ohne Herkunft"),)
+                    ["%.4f" % x for x in _ext_row_ms], owned_extend_source or "ohne Herkunft")
+                 + ("; Fehlgriff-Kosten je Rang ohne Rang-Record aus Paar x Link abgeleitet: %s ms"
+                    % ["%.4f" % x for x in _miss_rank] if _miss_rank_link else ""),)
                 if sol.extend_ms else
                 ("%s FRACTION-SOLVE %s D-EIGENTUM EXTEND-KOPIE (S54): AUS -- %s"
                  % (marker, label,
@@ -4748,13 +4771,17 @@ def plan_d_residency(
             if sol.bs_weights:
                 cut_lines = cut_lines + (
                     "%s FRACTION-SOLVE %s D-EIGENTUM T_r JE BS (01.10.): %s -- Form A %s; "
-                    "Runde gewichtet %.2f ms (Form A %.2f), x1 bei bs %s"
+                    "Runde gewichtet %.2f ms (Form A %.2f)%s, x1 bei bs %s"
                     % (marker, label,
                        " ".join("bs%d %s" % (b, ["%.2f" % x for x in ms])
                                 for b, ms in sol.round_ms_by_bs),
                        " ".join("bs%d %s" % (b, ["%.2f" % x for x in ms])
                                 for b, ms in sol.base_round_ms_by_bs),
                        sol.objective_ms, sol.base_objective_ms,
+                       (" inkl. Extend-Anteil %.2f ms (Form A %.2f, S54)"
+                        % (sol.extend_per_round * max(sol.extend_ms),
+                           sol.extend_per_round * max(sol.base_extend_ms))
+                        if sol.extend_ms else ""),
                        ",".join(str(b) for b in OWNED_X1_BS)),
                 )
             if max(sol.round_ms) > max(sol.base_round_ms) + 1e-9:

@@ -246,3 +246,15 @@ def test_sync_holds_the_extend_against_form_a_even_when_decode_wants_the_slow_li
     assert max(sol.extend_ms) <= max(sol.base_extend_ms) + 1e-9
     # the decode price pulled ownership onto TP1 up to the guard
     assert sol.ratios[1] > HAND[1] and max(sol.extend_ms) == sol.extend_ms[1]
+
+
+def test_without_rank_records_the_pair_is_split_by_the_link():
+    """No rank record (the fixture/seed case): the worker cost is split by
+    the measured links -- the x4 TP1 costs ~2x the x8 TP2, the workers' mean
+    stays the pooled worker price, the host keeps its own."""
+    row_ms = er.owned_extend_row_ms(H2D, ROW_BYTES)
+    got = er.owned_miss_rank_from_link((0.1, 0.2), row_ms, 0)
+    assert got[0] == pytest.approx(0.1)
+    assert (got[1] + got[2]) / 2 == pytest.approx(0.2)
+    assert got[1] / got[2] == pytest.approx(row_ms[1] / row_ms[2])
+    assert got[1] > 1.9 * got[2]
