@@ -77,6 +77,40 @@ CHAIN_ATTR = "_pdflip_handoff_page_keys"
 #: attribute can be cleared (adopt_pp0_decision), but P prefilled the rid either way;
 #: pdflip/settle_writer.observe counts it as the chain (p-handoff, never "no writer").
 SEEN_ATTR = "_pdflip_handoff_seen"
+#: S75 (19.10.): WHICH group wrote the record(s) this rank read for the rid --
+#: tri-state: None = never read a labelled record (a legacy record, or a chain from
+#: elsewhere: counted as P, as before), True = a record P wrote (or an unlabelled
+#: one) was read, False = only records D itself wrote were read (D's own
+#: ``cache_finished_req`` record of a D-direct request: no P behind it).
+P_SEEN_ATTR = "_pdflip_handoff_p_seen"
+#: S75: the longest page-key chain of a record P wrote for the rid -- the most pages
+#: P's write-through can ever put in the store for it (None = unknown)
+P_PAGES_ATTR = "_pdflip_handoff_p_pages"
+#: S75: the longest prompt (token ids) of a record P wrote for the rid -- the token
+#: span behind those pages (a second, page-size-independent bound)
+P_TOKENS_ATTR = "_pdflip_handoff_p_tokens"
+
+
+def note_record_writer(req, rec, chain) -> None:
+    """S75: remember who wrote the record ``chain`` came from (see
+    :data:`P_SEEN_ATTR`). Never raises (a frozen double keeps the old view)."""
+    from flliper.srt.pdflip import handoff as _ho
+
+    try:
+        if _ho.record_writer(rec) == "D":
+            if getattr(req, P_SEEN_ATTR, None) is None:
+                setattr(req, P_SEEN_ATTR, False)
+            return
+        setattr(req, P_SEEN_ATTR, True)
+        if _ho.record_writer(rec) == "P" and chain:
+            have = getattr(req, P_PAGES_ATTR, None)
+            setattr(req, P_PAGES_ATTR, max(int(have or 0), len(chain)))
+            ids = rec.get("input_ids") if isinstance(rec, dict) else None
+            if ids:
+                have_t = getattr(req, P_TOKENS_ATTR, None)
+                setattr(req, P_TOKENS_ATTR, max(int(have_t or 0), len(ids)))
+    except Exception:  # noqa: BLE001 - a frozen double
+        pass
 
 
 def chain_digest(chain: Optional[Sequence[str]]) -> str:
@@ -104,6 +138,7 @@ def resolve_chain(req, reader) -> Optional[List[str]]:
         chain = list(rec.get("page_keys") or []) if rec else None
         if chain:
             setattr(req, CHAIN_ATTR, chain)
+            note_record_writer(req, rec, chain)
     if chain:
         try:
             setattr(req, SEEN_ATTR, True)

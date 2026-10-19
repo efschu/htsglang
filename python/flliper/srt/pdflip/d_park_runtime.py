@@ -1894,7 +1894,7 @@ def admission(sched, running_batch):
         # wait for it and it holds no seat: the requests of the lane that runs are not held behind it
         gate_waiting = [r for r in gate_waiting if not d_lane.below_floor(sched, r)]
         pending = [r for r in pending if not d_lane.below_floor(sched, r)]
-    avail = sched.uniform_min_avail() if book.margin_tokens >= 0 else None
+    avail = _resume_fit_reading(sched) if book.margin_tokens >= 0 else None
     gate = d_seats.admission_gate(
         gate_waiting,
         running=list(running_batch.reqs),
@@ -1906,6 +1906,7 @@ def admission(sched, running_batch):
     )
     if gate.deferred:
         _note_decode_first(sched, gate)
+    _note_resume_held(sched, gate)
     # S48 D-DECODE-GAP (pdflip/d_decode_gap.py): name the gate in the decode pause it may cause (read-only)
     from flliper.srt.pdflip import d_decode_gap as _ddg
 
@@ -1914,6 +1915,92 @@ def admission(sched, running_batch):
     elif gate.barrier:
         _ddg.note(sched, "seat")
     return gate if gate.barrier else None
+
+
+# ---------------------------------------------------------------------------
+# S75 (19.10., NF rc16 bf9ca46f45 boot 1019_121629, D TP0): pdflip-137-471 (144965
+# tokens) waited 193 s (13:27:47 -> 13:30:59) behind the older pdflip-132-465
+# (~125k, decoding bs1) although D's KV paid both. The gate that refused it is the
+# pressure-park resume of ``d_seats.admission_gate``: older live -> blocked unless
+# the ARRIVAL-SEAT early resume holds (``avail - need >= 0`` for 8 passes). It read
+# ``uniform_min_avail()`` = the group MIN of the FREE ids only (#1045 FLOOR
+# PUBLISHED floor=113536 at 13:28:13 ... 104128 at 13:30:56, need 144965) -- while
+# the arrival rule (``arrival_seat_rule.kv_fits``: available + evictable), the
+# displacement that parked it (``kv_displace_would_fit``: available +
+# ``_evictable_reading``) and the adder's own budget (``rem_total_tokens``) all
+# count the tree's evictable tokens. The tree held the finished pdflip-138-472 /
+# 138-473 spans (192000 + 99584 tokens loaded at 13:27:48-49) as evictable cache;
+# the moment 132-465 finished, 137-471 was admitted with ``FOLLOW-ROOM evicted=0
+# available=296960``. The census key ``pdflip_d_park_older_live`` was printed only
+# in the first post-wake passes, the numbers never. The ``CAP-LIFT room=0`` of the
+# same request is a different verdict (the D-MEM-SCHED stage cap, free ids below
+# the PENDING cap, TP0-local print): it LIFTED the cap (more room), it refused
+# nothing -- not the S72 site (``_room_ok`` re-read back-off).
+#
+# Now the early resume reads the same measure the arrival rule and the displacement
+# use: group MIN of (available + payable evictable), one MIN collective, read only on
+# a pass where a pressure-parked request asks it (replicated precondition). Switch
+# FLLIPER_PDFLIP_RESUME_FIT_EVICTABLE (default ON; 0 = free ids only, as before).
+# Instrument (always): ``PDFLIP D-PARK-RESUME-HELD`` names the gate and its numbers.
+# ---------------------------------------------------------------------------
+
+RESUME_FIT_EVICTABLE_ENV = "FLLIPER_PDFLIP_RESUME_FIT_EVICTABLE"
+RESUME_HELD_MARK = "PDFLIP D-PARK-RESUME-HELD"
+
+
+def resume_fit_evictable_on(env=None) -> bool:
+    e = os.environ if env is None else env
+    raw = (e.get(RESUME_FIT_EVICTABLE_ENV, "1") or "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def _resume_fit_reading(sched):
+    """S75: the lazy reading the pressure-park early resume compares ``need``
+    against -- a zero-argument callable (``d_seats.admission_gate`` calls it at
+    most once per pass, and only when a pressure-parked request asks)."""
+    if not resume_fit_evictable_on():
+        return sched.uniform_min_avail
+
+    def _read():
+        try:
+            local = int(sched.token_to_kv_pool_allocator.available_size())
+        except Exception:  # noqa: BLE001 -- no reading: the free ids as before
+            return sched.uniform_min_avail()
+        try:
+            local += _evictable_reading(sched.tree_cache)
+        except Exception:  # noqa: BLE001 -- no evictable reading: the free ids alone
+            pass
+        gm = getattr(sched, "_pdflip_group_min_ints", None)
+        val = int(gm([local])[0]) if callable(gm) else local
+        sched._pdflip_resume_fit_last = val
+        return val
+
+    return _read
+
+
+def _note_resume_held(sched, gate) -> None:
+    """S75 instrument: one line per held rid on every change of (gate, older) and
+    at the 1st, 2nd, 4th, ... pass it stays held -- the numbers included."""
+    seen = getattr(sched, "_pdflip_resume_held_seen", None)
+    if seen is None:
+        seen = sched._pdflip_resume_held_seen = {}
+    now = {}
+    for rid, why, older, avail, need in getattr(gate, "held", ()) or ():
+        key = (why, older)
+        prev = seen.get(rid)
+        n = prev[1] + 1 if prev is not None and prev[0] == key else 1
+        now[rid] = (key, n)
+        if n & (n - 1) == 0:
+            logger.info(
+                "%s rid=%s gate=%s older=%s avail=%s need=%s measure=%s passes=%d -- %s",
+                RESUME_HELD_MARK, rid, why, older, "-" if avail is None else avail,
+                "-" if need is None else need,
+                "free+evictable" if resume_fit_evictable_on() else "free",
+                n,
+                "the older request it was displaced for still waits (Q-698)" if why == "held_for_older"
+                else "an older request is live and the early resume does not hold (avail - need < 0, "
+                     "or not yet for the hysteresis passes, or no margin armed)")
+    sched._pdflip_resume_held_seen = now
 
 
 def _phase_seat_n(sched):

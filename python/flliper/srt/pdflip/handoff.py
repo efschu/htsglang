@@ -59,7 +59,35 @@ def path(rid: str) -> str:
     return os.path.join(d, f"{rid}.json") if d and rid else ""
 
 
-def write(rid: str, input_ids: Sequence[int], page_keys: Sequence[str]) -> bool:
+#: S75 (19.10., NF rc16 1019_121629, D TP0 pdflip-190-722 / pdflip-174-648): the
+#: record names the GROUP that wrote it. D writes this file too -- every finished
+#: or retracted request goes through ``cache_finished_req`` ->
+#: ``_pdflip_handoff_write`` on group D as well (``#1442 HANDOFF ... writer=self``
+#: on D TP0, 1792 records in that boot) -- and the #1471 settle read D's OWN
+#: record of a D-direct request as "P prefilled it" (``SETTLE-WRITER
+#: writer=p-handoff action=poll``): 21 s of 2-s re-reads for pages nobody wrote,
+#: one D seat held, then W50. Readers that only take ids/keys ignore the field;
+#: a record without it (an older writer) reads as before.
+WRITER_FIELD = "writer"
+
+
+def writer_group(env=None) -> str:
+    """This process's pdflip group ("P", "D") as the record names it; "" outside
+    a pdflip boot (no field is written then -- the old record, byte for byte)."""
+    env = os.environ if env is None else env
+    return str(env.get("FLLIPER_PDFLIP_GROUP", "") or "").strip().upper()
+
+
+def record_writer(rec) -> str:
+    """The group that wrote ``rec`` ("P", "D"), "" for a record without the
+    field (an older writer: read as P, as before) or no record."""
+    if not isinstance(rec, dict):
+        return ""
+    return str(rec.get(WRITER_FIELD, "") or "").strip().upper()
+
+
+def write(rid: str, input_ids: Sequence[int], page_keys: Sequence[str],
+          writer: Optional[str] = None) -> bool:
     p = path(rid)
     if not p:
         return False
@@ -67,6 +95,9 @@ def write(rid: str, input_ids: Sequence[int], page_keys: Sequence[str]) -> bool:
         os.makedirs(os.path.dirname(p), exist_ok=True)
         tmp = f"{p}.{os.getpid()}.tmp"
         obj = {"input_ids": list(int(t) for t in input_ids), "page_keys": list(page_keys)}
+        grp = writer_group() if writer is None else str(writer).strip().upper()
+        if grp:
+            obj[WRITER_FIELD] = grp
         with open(tmp, "w") as f:
             if one_writer_on():
                 f.write(json.dumps(obj))   # one shot: the C encoder, same bytes

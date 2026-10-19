@@ -218,6 +218,11 @@ EXPECTED_HELPER_REFS = {
     ("pdflip/d_park_runtime.py", "_capacity_requeue"): {"_pdflip_group_min_flags"},
     ("pdflip/d_park_runtime.py", "_lift_holds_when_idle"): {"_pdflip_group_min_flags"},
     ("pdflip/d_park_runtime.py", "displace_for_age"): {"_pdflip_group_min_flags"},
+    # S75 (19.10.): the pressure-park early resume's room (available + payable evictable, group MIN). Entered
+    # lazily by d_seats.admission_gate, at most once per pass, only when a PRESSURE-parked request with an older
+    # live one asks the armed early resume: park sites, the displaced-for hold, the order keys, the running batch
+    # and the waiting queue are replicated, so every rank enters it in the same pass or none does.
+    ("pdflip/d_park_runtime.py", "_resume_fit_reading._read"): {"_pdflip_group_min_ints"},
     ("pdflip/d_seat_rewake.py", "_group_min"): {"_pdflip_group_min_flags"},
     ("pdflip/d_seat_vram.py", "_agree_reserve"): {"_pdflip_group_min_ints"},
     ("pdflip/d_seat_vram.py", "_group_floor_tokens"): {"_pdflip_group_min_ints"},
