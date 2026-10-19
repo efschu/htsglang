@@ -227,6 +227,12 @@ EXPECTED_HELPER_REFS = {
     ("pdflip/d_seat_vram.py", "_agree_reserve"): {"_pdflip_group_min_ints"},
     ("pdflip/d_seat_vram.py", "_group_floor_tokens"): {"_pdflip_group_min_ints"},
     ("pdflip/d_seat_vram.py", "_group_room_below"): {"_pdflip_group_min_ints"},
+    # S77-B (19.10., review nf-review-s77b-1019.md §3): the GROUP verdict on a live KV grow, one MIN per grow.
+    # Entered from runtime_tick iff `ms.stage > before` -- MemSched.step on replicated inputs (used/incoming from
+    # the same request lists, reserve = the group MAX of _agree_reserve, ended from the rids), behind the
+    # boot-static armed()/elastic_on()/dormant/phase gates; a rank without a controller or a measured card
+    # still enters and votes yes (reviewer mutant M4). Every rank enters it in the same tick or none does.
+    ("pdflip/d_seat_vram.py", "_grow_room_refused"): {"_pdflip_group_min_ints"},
     ("pdflip/d_seat_vram.py", "_room_ok"): {"_pdflip_group_min_ints"},
 }
 
