@@ -114,6 +114,35 @@ from flliper.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
 
+#: S64 S-ARM: the dense (KV-only) presence question asks the whole span in
+#: batches (longest prefix) instead of the first batch alone. Default ON; 0 =
+#: the first batch as before (byte-identical).
+S64_DENSE_FULL_SPAN_ENV = "FLLIPER_PDFLIP_S64_DENSE_PRESENCE_FULL_SPAN"
+
+
+def s64_dense_full_span_on(env=None) -> bool:
+    v = (env if env is not None else os.environ).get(S64_DENSE_FULL_SPAN_ENV, "1")
+    return str(v).strip().lower() not in ("0", "false", "no", "off", "")
+
+
+def _s64_dense_prefix_pages(storage_backend, page_hashes, batch_size: int, prefix_keys=None) -> int:
+    """S64: the longest KV prefix the store holds for ``page_hashes``, asked
+    batch by batch in key order (``_storage_hit_query``'s walk: a short batch
+    ends it; ``prefix_keys`` grow by each full batch). Module-level for the
+    harness doubles (#1402)."""
+    pk = list(prefix_keys) if prefix_keys else None
+    total = 0
+    step = max(1, int(batch_size))
+    for start in range(0, len(page_hashes), step):
+        b = page_hashes[start:start + step]
+        hit = int(storage_backend.batch_exists(b, HiCacheStorageExtraInfo(prefix_keys=pk)) or 0)
+        total += max(0, min(hit, len(b)))
+        if hit < len(b):
+            break
+        if pk:
+            pk += list(b)
+    return total
+
 
 def _read_stages(operation) -> dict:
     """H2D phase 1 (a): CPU ms per read sub-stage of ONE prefetch operation
@@ -4624,6 +4653,21 @@ class HiCacheController:
                         "part of this issuance decision",
                         type(self.storage_backend).__name__,
                     )
+            if s64_dense_full_span_on() and claim_vote_min_only(self):
+                # S64 S-ARM (NF rc15 D: X-GATE-TERMS store = worker local_match +
+                # 65536 on 72-525 / 16-78 / 18-81 / 28-114 / 59-496 / 82-632 /
+                # 104-767..769 -- 68608 = 3072 + 1024 pages while the store held
+                # 98560): a KV-row worker has no component transfer, so it asked
+                # the dense question of the FIRST batch only (1024 pages on NF)
+                # and its vote capped the group's MIN store arm there. The chain
+                # is hashed already; ask it batch by batch in key order and stop
+                # at the first short batch (longest prefix), exactly as the
+                # fetch's ``_storage_hit_query`` walks it. Only a KV-row worker
+                # (``claim_vote_min_only``): its vote enters the MIN beside a host
+                # that asks the WHOLE span (v2); a dense group of equals keeps
+                # MAMBA-ANCHOR 1015's first batch (27B page_size=1: the cost).
+                return _s64_dense_prefix_pages(
+                    self.storage_backend, page_hashes, STORAGE_BATCH_SIZE, prefix_keys)
             return int(
                 self.storage_backend.batch_exists(batch, extra_info) or 0
             )

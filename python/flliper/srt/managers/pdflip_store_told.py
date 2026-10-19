@@ -71,6 +71,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from flliper.srt.managers import pdflip_told_fallback as _fb
 from flliper.srt.managers import pdflip_told_fidelity as _tf  # TF told fidelity
+from flliper.srt.managers import pdflip_told_raise as _raise  # S64 S-1400 (b)
 from flliper.srt.pdflip import p_twin_defer as _twin
 from flliper.srt.pdflip import prefix_trace as _pt
 
@@ -342,6 +343,49 @@ def p_hint_reread_on(env=None) -> bool:
     return str(v).strip().lower() not in ("0", "false", "no", "off", "")
 
 
+#: S64 S-1400 (NF rc15 P 08:31:45, pdflip-72-525): PP0's completion re-read.
+#: The intake read and the P-HELD-REREAD both met ``#915 PREFETCH REFUSED
+#: reason=too_short need=192 threshold=256`` although ``P-WAKE-PROBE
+#: store_now=98560`` had just confirmed the depth: PP0 told 98368 (its match,
+#: no recurrent state on the followers there), both followers acked their own
+#: 98560 (``#1400 OVER-UNRESUMABLE ... resumable_at_told=0``), PF answered
+#: told=0 (``reason=mismatch acks={1: 98560, 2: 98560}``) and P recomputed
+#: 98592 tokens the store held. A re-read to a depth the store confirmed (why
+#: store / hint / wake_probe) completes an earlier read -- the same law as the
+#: hand-back, the park-retain and the told-bounded follower reads: minimum 1.
+#: The read itself still takes only what the store answers (its own anchored
+#: v2 claim), so a minimum of 1 can never read past the store. PP0 decides
+#: alone (attn_reduce_world=1 on P); the followers follow the told.
+#: ``FLLIPER_PDFLIP_S64_COMPLETION_READ_MIN`` (default ON; 0 = the #915
+#: threshold as before).
+COMPLETION_READ_ENV = "FLLIPER_PDFLIP_S64_COMPLETION_READ_MIN"
+COMPLETION_READ_ATTR = "_pdflip_s64_completion_read"
+
+
+def completion_read_on(env=None) -> bool:
+    v = (env if env is not None else os.environ).get(COMPLETION_READ_ENV, "1")
+    return str(v).strip().lower() not in ("0", "false", "no", "off", "")
+
+
+def completion_read_min_tokens(req) -> Optional[int]:
+    """S64: 1 while ``req``'s store read is PP0's completion re-read (the
+    caller marks it for exactly that one ``_prefetch_kvcache`` call), else
+    None = the caller's minimum / the tree's threshold, unchanged."""
+    if getattr(req, COMPLETION_READ_ATTR, None) and completion_read_on():
+        return 1
+    return None
+
+
+def issue_completion_read(fn, req) -> str:
+    """S64: ``fn(req)`` (``Scheduler._prefetch_kvcache``) as a completion read
+    -- the mark lives for this one call and is gone whatever it returns."""
+    setattr(req, COMPLETION_READ_ATTR, True)
+    try:
+        return str(fn(req))
+    finally:
+        setattr(req, COMPLETION_READ_ATTR, None)
+
+
 def _p_held_short_reread(scheduler, tree, req, rid: str) -> bool:
     """P-HELD-REREAD-1014: True when PP0 re-issued ``rid``'s store read (the
     caller keeps it held and publishes nothing this pass)."""
@@ -393,7 +437,8 @@ def _p_held_short_reread(scheduler, tree, req, rid: str) -> bool:
     _sr.note_reissue(req, have)
     req._pdflip_p_held_reread_n = n + 1
     try:
-        verdict = str(fn(req))
+        # S64 S-1400: a completion read -- minimum 1, not the #915 threshold
+        verdict = issue_completion_read(fn, req)
     except Exception as exc:  # noqa: BLE001 - a re-read never takes the pass down
         logger.warning("PDFLIP P-HELD-REREAD rid=%s re-issue raised %s: %s", _rt(rid), type(exc).__name__, exc)
         return False
@@ -1778,7 +1823,19 @@ def _pp0_publish_paced(scheduler, recv_reqs: List) -> List:
             # PF: PP0 alone decides -- told once every follower's read
             # reproduced it, told=0 for every rank on a short read or at the
             # Frist. Never the window's guess.
-            verdict = _fb.pp0_decide(scheduler, rid, now, pass_n=pass_n)
+            # S64 S-1400 (b): every follower acked the same depth ABOVE told and
+            # PP0's store holds it -- PP0 re-reads to it and raises the told
+            # for every rank instead of told=0 (pdflip_told_raise).
+            _o = _fb._pp0_open_map(scheduler).get(rid)
+            _rs = (_raise.pp0_raise_step(scheduler, rid, p.req, p.told, dict(_o.acks), p.absolute, now,
+                                         pass_n=pass_n)
+                   if _o is not None else None)
+            if _rs is not None and _rs[0] == _raise.WAIT:
+                continue
+            if _rs is not None and _rs[0] == _raise.ADMIT:
+                verdict = (int(_rs[1]), _raise.REASON_RAISE)
+            else:
+                verdict = _fb.pp0_decide(scheduler, rid, now, pass_n=pass_n)
             if verdict is None:
                 continue
             told_final, reason = verdict
@@ -1801,8 +1858,16 @@ def _pp0_publish_paced(scheduler, recv_reqs: List) -> List:
                     else:
                         told_final, reason = _tf_told, "told_fidelity"
             pacing.pop(rid, None)
+            _raise.forget(scheduler, rid)
             _fb.pp0_note_verdict(scheduler, rid, p.told, told_final, reason, now, p.published_at)
             admit = PdFlipStoreAdmit(rid=rid, told=told_final)
+            if reason == _raise.REASON_RAISE and told_final > p.told:
+                # S64: PP0's own record is the raise read's (nothing released);
+                # every follower acked exactly this depth -- a plain Admit.
+                setattr(admit, _raise.WIRE_RAISE, 1)
+                told_map[rid] = told_final
+                out.append(admit)
+                continue
             if reason == _fb.REASON_FLOOR and 0 < told_final < p.told:
                 # H64 GROUP-FLOOR: every follower proved told_final, PP0's TF
                 # admits it -- the same depth for EVERY rank, nothing released.
@@ -1971,7 +2036,14 @@ def _follower_admit(scheduler, item: PdFlipStoreAdmit) -> None:
         # no read-ahead reached this request (it was not queued yet): register
         # now; admission then waits for it as the single-phase form does.
         _follower_register(scheduler, req, told)
-    if ahead is not None and int(ahead) != told and not fallback and not floor:
+    raised = bool(getattr(item, _raise.WIRE_RAISE, 0))
+    if raised:
+        n_r = getattr(scheduler, "_s64_raise_absorb_n", 0) + 1
+        scheduler._s64_raise_absorb_n = n_r
+        if n_r <= 32 or n_r % 128 == 0:
+            logger.info("S64 TOLD-RAISE ABSORBED rank pp=%s rid=%s told=%d read_ahead=%s (n=%d): PP0 admitted the "
+                        "depth this rank acked", scheduler.ps.pp_rank, _rt(rid), told, ahead, n_r)
+    if ahead is not None and int(ahead) != told and not fallback and not floor and not raised:
         logger.warning(
             "#1416e PACED-ADMIT rid=%s told=%d differs from the read-ahead %d; admission "
             "compares against the admitted value", _rt(rid), told, int(ahead),
