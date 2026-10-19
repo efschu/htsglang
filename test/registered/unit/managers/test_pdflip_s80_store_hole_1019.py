@@ -6,8 +6,8 @@ P recomputed 16482 tokens. The planner's reading was "P read before D's sleep fl
 had drained and reset before P woke (``#1470 FLUSH-PUBLISH in_flight_after=0``, ``#1068 RESET JOIN`` 18:34:27;
 the flip order IS the witness, the wake probe asks after it). The store's KV chain had ended at page 1337 since
 18:26:34: 41 pages (85568..88192) CLAIMED by D TP0 with share 0 and no open writer (``ARENA-REF-CENSUS-CLAIM
-claimed=41 oldest=1378/.../pid1360/host-write/g3/open0`` from 18:27 to the flip reset), their owners had evicted
-their shares unbacked. The wake probe only said "how deep" -- the two classes looked alike.
+claimed=41 oldest=1378/.../pid1360/host-write/g3/open0`` from 18:27 to the flip reset), their owners had refused the
+one S74 PUBLISH (mamba_pin, a transient) and were never asked again (S81). The wake probe only said "how deep" -- the two classes looked alike.
 
 Now PP0 names the first missing page at the told from the shared arena header (REAL C arena below):
 orphan / in_flight / absent / anchor, and the COMPLETE pages the hole strands. The told is unchanged.

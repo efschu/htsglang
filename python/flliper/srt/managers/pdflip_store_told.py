@@ -312,9 +312,11 @@ def p_wake_probe_on(env=None) -> bool:
 #: BEFORE P woke -- the flip order IS the publish witness of this read, the wake probe asks after it -- and the
 #: store's KV chain had ended at page 1337 since 18:26:34: 41 pages (85568..88192) were CLAIMED by D TP0 with
 #: share 0 and no writer (``ARENA-REF-CENSUS-CLAIM claimed=41 oldest=1378/.../pid1360/host-write/g3/open0``
-#: from 18:27:00 to the flip reset), their owners TP1/TP2 had evicted their shares unbacked (``#1469 EVICT ...
-#: backuped=False host=False``, ``S74 CUT-L3-PUBLISH out=refused`` why parent_unbacked). No flush and no later
-#: read fills such a hole -- only a release of the orphan claim and a fresh write do (the D side, S74's line).
+#: from 18:27:00 to the flip reset): their owners TP1/TP2 refused the ONE S74 PUBLISH (``#1421 BACKUP-REFUSED
+#: why=mamba_pin pins=5/5``, children ``why=parent_unbacked``, ``S74 CUT-L3-PUBLISH out=refused``) -- a transient --
+#: and were never asked again (S81). (``#1469 EVICT ... backuped=False`` on the workers is the MAMBA component
+#: leaving the device, not a KV share; a worker cannot drop an un-backed KV node on a TP group.) No flush and no
+#: later read fills such a hole -- only the owners' write or a revoke of the orphan claim (the D side, S81).
 #: The wake probe answered only "how deep", so the two classes looked alike. Now, when the store holds no more
 #: than the read, PP0 names the FIRST missing page from the shared arena header at the decision instant:
 #:   class=orphan    CLAIMED, no open writer -- a hole no writer can still fill (D-side defect, never a timing);

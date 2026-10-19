@@ -235,3 +235,169 @@ def test_parents_are_republished_before_children(arena, host_cut):
     _worker_set(arena, [R.node_key(parent), R.node_key(child)])
     pubs = _events(R.attach([]), R.PUBLISH)
     assert [e[2] for e in pubs] == [PAGE, 2 * PAGE]
+
+
+# ----------------------------------------------------------------- review nf-review-s81-1019: A1 / A2 / A3
+def _census(arena, stem):
+    (s, st), = arena.find_slots([stem])
+    row = dict(arena.claim_census([s])[0]) if s >= 0 else {}
+    row.pop("age_ms", None)
+    return s, st, row
+
+
+def test_a1_join_between_census_and_revoke_keeps_the_slot_and_the_joiners_writer(arena, host_cut, monkeypatch):
+    """The review repro: the census passes, a worker joins (claims=2 open=1, no bytes yet), THEN the free runs.
+    Before A1 (arena_release_claims) the joiner's writer was taken off and the slot freed -> its completion 3."""
+    t, n = _metal(arena)
+    _worker_set(arena, [])
+    orig = R._s81_orphan_slots
+    seen = {}
+
+    def racing(a, stems):
+        out = orig(a, stems)
+        assert out, "the census passed"
+        (s, st, g), = a.claim_slots(["p1337.kv"], [SLOT])   # the worker joins inside the window
+        assert st == 1
+        seen.update(s=s, g=g, row=_census(a, "p1337.kv")[2])
+        return out
+
+    monkeypatch.setattr(R, "_s81_orphan_slots", racing)
+    R.attach([])
+    s, st, row = _census(arena, "p1337.kv")
+    assert (s, st) == (seen["s"], 1), "the joined slot stays CLAIMED"
+    assert row == seen["row"] and row["claims"] == 2 and row["open"] == 1, "the joiner's writer is untouched"
+    assert R._S.l3_wait, "release said kept: the entry stays watched"
+    assert arena.complete_slots([seen["s"]], [seen["g"]], [(0, HALF)]) == [0], "merged -- not 3 'recycled'"
+
+
+def test_a1_c_revoke_status_per_condition(arena):
+    """arena_revoke_orphan_claims: 0 only for the orphan; joined / open / bytes / referenced -> 1 untouched;
+    moved generation -> 2."""
+    def share0(stem):
+        (s, st, g), = arena.claim_slots([stem], [SLOT])
+        arena.complete_slots([s], [g], [])
+        return s, g
+    s0, g0 = share0("o.kv")
+    s1, g1 = share0("joined.kv")
+    arena.claim_slots(["joined.kv"], [SLOT])                    # a worker joined, open, no bytes
+    (s2, _, g2), = arena.claim_slots(["open.kv"], [SLOT])        # TP0's own writer still open
+    (s3, _, g3), = arena.claim_slots(["bytes.kv"], [SLOT])
+    arena.complete_slots([s3], [g3], [(0, HALF)])                # bytes merged
+    s4, g4 = share0("ref.kv")
+    arena.ref_slots([s4], +1)                                    # referenced
+    before = {k: _census(arena, k)[2] for k in ("joined.kv", "open.kv", "bytes.kv", "ref.kv")}
+    st = arena.revoke_orphan_claims([s0, s1, s2, s3, s4, s0], [g0, g1, g2, g3, g4, g0])
+    assert st == [0, 1, 1, 1, 1, 2]
+    assert arena.find_states(["o.kv"]) == [0]
+    for k, row in before.items():
+        assert _census(arena, k)[1] == 1 and _census(arena, k)[2] == row, k
+
+
+@pytest.mark.parametrize("case", ["pid", "open", "covered", "claims", "ref"])
+def test_a2_precheck_refuses_each_condition_and_nothing_is_touched(arena, host_cut, monkeypatch, case):
+    """Each release condition alone, in the dangerous form 'joined / open / no bytes yet': the Python census says
+    None, the full pass leaves the slot CLAIMED and every writer count as it was."""
+    t, n = _metal(arena)
+    s = arena.find_slots(["p1337.kv"])[0][0]
+    if case == "pid":
+        monkeypatch.setattr(R.os, "getpid", lambda: 1)            # the claim is another process's
+    elif case == "open":
+        arena.claim_slots(["p1337.kv"], [SLOT])                  # a joiner, open, no bytes
+    elif case == "covered":
+        (s2, st2, g2), = arena.claim_slots(["p1337.kv"], [SLOT])
+        arena.complete_slots([s2], [g2], [(0, HALF)])            # bytes, writer closed (claims 2)
+    elif case == "claims":
+        (s2, st2, g2), = arena.claim_slots(["p1337.kv"], [SLOT])
+        arena.complete_slots([s2], [g2], [])                     # joined and closed, NO bytes: only claims=2 says it
+    elif case == "ref":
+        arena.ref_slots([s], +1)
+    stems = ["p1337.kv", "p1338.kv"]
+    before = _census(arena, "p1337.kv")
+    assert R._s81_orphan_slots(arena, stems) is None
+    _worker_set(arena, [])
+    R.attach([])
+    assert _census(arena, "p1337.kv") == before, "slot and writer counts untouched"
+    assert R._S.l3_wait
+
+
+def test_a2_publish_gap_is_capped_at_64_over_ten_republishes(arena, host_cut):
+    t, n = _metal(arena)
+    _worker_set(arena, [_key(n)])
+    at = []
+    for i in range(1, 700):
+        if _events(R.attach([]), R.PUBLISH):
+            at.append(i)
+        if len(at) >= 12:
+            break
+    gaps = [b - a for a, b in zip(at, at[1:])]
+    assert len(at) >= 12 and max(gaps) == R.S81_PUBLISH_MAX_GAP == 64 and gaps[-3:] == [64, 64, 64]
+
+
+def test_a3_real_k12_release_drops_tp0s_reference_and_the_orphan_is_revoked(arena, host_cut):
+    """The real K12 path: UnifiedRadixCache._k12_republish_orphaned -> _pdflip_release_chain_piece_host -> the REAL
+    ArenaMHAHostPool.free of TP0's host rows gives the slot reference back (#1427: a writer's node references its
+    CLAIMED slot from the claim on), then the atomic revoke frees the orphan. Only the tree's component funnel is a
+    stand-in (LRU bookkeeping); the release, the R12 STATE and the pool free are the production code."""
+    from flliper.srt.mem_cache.pool_host.arena_pool import ArenaMHAHostPool
+    from flliper.srt.mem_cache.unified_cache_components.tree_component import ComponentType
+
+    pool = SimpleNamespace(arena=arena, row_slot=None, staging_rows=0, _arena_page_tokens=PAGE, arena_slots=16,
+                           _pending_mask=None, _pending={})
+
+    class _K12Tree(_Tree):
+        _k12_republish_orphaned = U._k12_republish_orphaned
+        _pdflip_release_chain_piece_host = U._pdflip_release_chain_piece_host
+
+        def __init__(self, a):
+            super().__init__(a)
+            self._components_tuple = (SimpleNamespace(component_type=ComponentType.FULL),)
+            self.evictable_host_leaves = set()
+            self.pp_size = 1
+
+        def _evict_component_and_detach_lru(self, node, comp, target=None, tracker=None):
+            cd = node.component_data[int(comp.component_type)]
+            freed = ArenaMHAHostPool.free(pool, cd.host_value)
+            cd.host_value = None
+            return 0, freed
+
+    t = _K12Tree(arena)
+    n = _node()
+    for cd in n.component_data:
+        cd.value = torch.arange(2 * PAGE)                       # TP0's device copy is still there
+    slots = []
+    for h in n.hash_value:
+        (s, st, g), = arena.claim_slots([f"{h}.kv"], [SLOT])
+        arena.ref_slots([s], +1)                                # the writer's node references its claim
+        arena.complete_slots([s], [g], [])                      # share 0: open0
+        slots.append(s)
+    hv = torch.cat([torch.arange(s * PAGE, (s + 1) * PAGE) for s in slots])
+    n.component_data[0] = SimpleNamespace(host_value=hv, value=torch.arange(2 * PAGE), host_lock_ref=0)
+    n.component_data[1] = SimpleNamespace(host_value=None, value=None, host_lock_ref=0)
+    t._k12_direct_l3_verdict(n, 0)
+    R.attach([])
+    assert arena.slot_refs(slots) == [1, 1]
+    _worker_set(arena, [])
+    at_revoke = []
+    real_revoke = arena.revoke_orphan_claims
+    arena.revoke_orphan_claims = lambda sl, gs: (at_revoke.append(arena.slot_refs(sl)), real_revoke(sl, gs))[1]
+    v = R.attach([])
+    assert at_revoke == [[0, 0]], "the real host release gave TP0's references back before the free"
+    assert n.component_data[0].host_value is None, "TP0's host layer given back by the real release"
+    assert arena.find_states(["p1337.kv", "p1338.kv"]) == [0, 0], "revoked, not kept"
+    assert not R._S.l3_wait
+    assert any(e[0] == R.STATE for e in _events(v, R.STATE)), "R12 STATE for the workers"
+
+
+@pytest.mark.parametrize("case", ["open_alone", "covered_alone"])
+def test_a2_single_condition_open_or_covered_alone(arena, case):
+    """Exactly ONE condition violated, claims stays 1 (the cases above also carry claims=2): an open writer of
+    the claimant itself, or bytes it merged itself. The census refuses, the atomic free keeps, nothing touched."""
+    (s, st, g), = arena.claim_slots(["q.kv"], [SLOT])
+    if case == "covered_alone":
+        arena.complete_slots([s], [g], [(0, HALF)])
+    before = _census(arena, "q.kv")
+    assert before[2]["claims"] == 1
+    assert (before[2]["open"], before[2]["covered"] > 0) == ((1, False) if case == "open_alone" else (0, True))
+    assert R._s81_orphan_slots(arena, ["q.kv"]) is None
+    assert arena.revoke_orphan_claims([s], [g]) == [1]
+    assert _census(arena, "q.kv") == before

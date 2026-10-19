@@ -469,6 +469,8 @@ def _load_lib() -> Optional[ctypes.CDLL]:
             lib.arena_unclaim.argtypes = [p_u8, i64, p_i64, p_i64]
             lib.arena_release_claims.restype = i64
             lib.arena_release_claims.argtypes = [p_u8, i64, p_i64, p_i64, p_i8]
+            lib.arena_revoke_orphan_claims.restype = i64
+            lib.arena_revoke_orphan_claims.argtypes = [p_u8, i64, p_i64, p_i64, p_i8]
             lib.arena_ival_cap.restype = i64
             lib.arena_ival_cap.argtypes = [p_u8]
             lib.arena_stats.restype = None
@@ -1219,6 +1221,23 @@ class ShmArena:
         freed = [int(slots[i]) for i, x in enumerate(out) if x == 0]
         if freed:
             _note_free(reason, freed)
+        return out
+
+    def revoke_orphan_claims(self, slots: Sequence[int], gens: Sequence[int]) -> list[int]:
+        """S81 review A1: free ORPHAN claims atomically (arena.c arena_revoke_orphan_claims) -- only a CLAIMED slot of
+        exactly one claimant with no open writer, no merged interval, no reference and the caller's generation;
+        anything else stays untouched (no writer_done). status per slot: 0 freed, 1 kept, 2 moved / not CLAIMED."""
+        n = len(slots)
+        if n == 0:
+            return []
+        cs = (ctypes.c_int64 * n)(*[int(s) for s in slots])
+        cg = (ctypes.c_int64 * n)(*[int(g) for g in gens])
+        st = (ctypes.c_int8 * n)()
+        self._lib.arena_revoke_orphan_claims(self._base, n, cs, cg, st)
+        out = list(st)
+        freed = [int(slots[i]) for i, x in enumerate(out) if x == 0]
+        if freed:
+            _note_free("s81-orphan-revoke", freed)
         return out
 
     def stats(self) -> dict:

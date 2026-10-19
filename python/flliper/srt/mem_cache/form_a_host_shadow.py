@@ -658,8 +658,8 @@ def _note_retry(waiting0: int, probed: int, pages: int, budget: int, done: int, 
 #:     refusal was a transient (pin budget, parent in flight), the worker's own skip rules decide each time;
 #:   * no worker holds it any more: the owners' bytes cannot come. TP0 gives its own host layer back group-uniformly
 #:     (the K12 A2-ORPHAN REPUBLISH path: release + R12 STATE) and frees its share-0 claim -- only a slot it alone
-#:     claimed, with no open writer, no byte covered and no reference (``arena_release_claims``: status 0 only for
-#:     the sole claimant, S61-safe against a join). The page is then cleanly ABSENT on every rank and the next
+#:     claimed, with no open writer, no byte covered and no reference, in ONE atomic C step
+#:     (``arena_revoke_orphan_claims``, review A1: re-checked under the slot lock, anything else untouched). The page is then cleanly ABSENT on every rank and the next
 #:     materialization writes it fresh instead of joining an orphan;
 #:   * TP0's node still holds host rows it cannot give back (host lock, device copy gone): kept, named HELD.
 #: ``S81 HOLE-REPUBLISH`` / ``HOLE-REVOKE`` / ``HOLE-HELD`` / ``HOLE-CLOSED`` name every exit; ``CUT-L3-RESET open=``
@@ -757,7 +757,15 @@ def _s81_revoke(tree: Any, arena: Any, node: Any, k: Tuple[str, int], stems: Lis
     if slots is None:
         return "kept"
     if slots:
-        st = arena.release_claims([s for s, _ in slots], [g for _, g in slots], reason="s81-orphan")
+        # review A1: the census above is a Python look; the free is ONE atomic C step that re-checks every condition
+        # under the slot lock (exactly one claimant, none open, no interval, no reference, same generation) and leaves
+        # anything else untouched -- never arena_release_claims, whose writer_done would take a joining worker's
+        # open writer off the slot and free it under him (S61 / K21 RANK-DIVERGENCE)
+        revoke = getattr(arena, "revoke_orphan_claims", None)
+        if not callable(revoke):
+            return "kept"
+        st = revoke([s for s, _ in slots], [g for _, g in slots])
+        # a writer or reader came between the census and the free: "kept", the entry stays watched
         if any(int(x) != 0 for x in st):
             return "kept"
     return "revoked"
