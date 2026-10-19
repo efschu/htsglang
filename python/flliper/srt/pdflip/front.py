@@ -5837,11 +5837,26 @@ class Front:
         for it). Returns the number of aborts sent."""
         if not envs.FLLIPER_PDFLIP_D_ORPHAN_ABORT.get():
             return 0
-        D = self.groups["D"]
-        line = {getattr(q, "rid", None) for q in (getattr(self, "_ready_for_d", ()) or ())}
-        seats = {getattr(s, "rid", None) for s in (getattr(self, "_d_seats_live", ()) or ())}
-        orphans = [r for r in rids if str(r).startswith("pdflip-") and r not in D.outstanding
-                   and r not in line and r not in seats]
+        # S60r A2: an orphan is a rid the front holds NOWHERE -- not only no D leg, also not queued or on P (a W50 /
+        # park-handback requeue pops ``D.outstanding`` and the request goes on via P under the SAME rid; D's abort
+        # would drop that rid's tail staging and park parts -- ``park_abort``: ``tail_adopt.drop_aborted``,
+        # ``remove_parks_aborted`` -- under the hand-off coming back). Such a rid is left to the next park.
+        held = Front._d_orphan_front_holds(self)
+        orphans = [r for r in rids if str(r).startswith("pdflip-") and r not in held]
+        if orphans:
+            # S60r A1: D aborts by PREFIX (``park_abort`` and ``_abort_request_now``: ``rid.startswith(abort.rid)``).
+            # The rid counter is global and the epoch repeats, so one epoch holds ``pdflip-2-6`` and ``pdflip-2-60``
+            # .. ``-69`` (measured: 4 of the 8 boots 18./19.10. carry such pairs). The abort of the orphan
+            # ``pdflip-2-6`` would drop the live ``pdflip-2-60`` with it -- a user's request lost. An orphan whose rid
+            # prefixes any other rid the front or this park knows is not aborted (named; the next park asks again).
+            names = held | {str(r) for r in rids}
+            shadowed = [o for o in orphans if any(n != o and n.startswith(o) for n in names)]
+            if shadowed:
+                self.counters["d_orphan_abort_prefix_skip"] += len(shadowed)
+                logger.warning("PDFLIP D-ORPHAN-ABORT-SKIP rids=%s epoch=%d -- D aborts by rid PREFIX and another "
+                               "live rid starts with each of these: aborting would drop it too (S60r A1; the next "
+                               "park names them again)", shadowed[:8], self.epoch)
+                orphans = [o for o in orphans if o not in shadowed]
         if not orphans:
             return 0
         tasks = self.__dict__.setdefault("_d_orphan_tasks", set())
@@ -5851,6 +5866,28 @@ class Front:
             tasks.add(t)
             t.add_done_callback(tasks.discard)
         return len(orphans)
+
+    def _d_orphan_front_holds(self) -> set:
+        """S60r A2: every rid the front still holds anywhere -- a leg on any group (``outstanding``), the P queue, the
+        D line, a live Seat, a lane-held request, a RESUME-VIA-P in flight, an ARRIVAL-SEAT waiter or grant, a park
+        record. Partial fronts (test doubles) read what they have."""
+        held: set = set()
+        for g in (getattr(self, "groups", None) or {}).values():
+            held.update(str(r) for r in (getattr(g, "outstanding", None) or {}))
+        for src in (getattr(self, "queue", ()) or (), getattr(self, "_ready_for_d", ()) or (),
+                    getattr(self, "_d_seats_live", ()) or ()):
+            held.update(str(getattr(x, "rid", "")) for x in list(src))
+        try:
+            held.update(str(getattr(p, "rid", "")) for p in Front._lane_held_pendings(self))
+        except Exception:  # noqa: BLE001 -- a front without lanes holds none there
+            pass
+        held.update(str(r) for r in (getattr(self, "_rvp_inflight", None) or ()))
+        held.update(str(r) for r in (getattr(self, "_d_parked", None) or {}))
+        st = self.__dict__.get("_asr_state") or {}
+        held.update(str(r) for r in (st.get("waiters") or {}))
+        held.update(str(r) for r in (st.get("granted") or {}))
+        held.discard("")
+        return held
 
     async def _d_orphan_abort_one(self, rid: str) -> None:
         try:
@@ -11317,13 +11354,23 @@ class Front:
             _seats0 = self._set_seats_free()
         except Exception:  # noqa: BLE001
             _seats0 = 1
-        seat = await self._acquire_short_seat_core(rid, est_tokens, refused, max_tokens, uncached, x_set, t_in)
+        try:
+            seat = await self._acquire_short_seat_core(rid, est_tokens, refused, max_tokens, uncached, x_set, t_in)
+        except BaseException:
+            # S60r A3: a request cancelled or failed between its grant and its Seat holds no seat and no D line
+            if _asr.enabled():
+                self._asr_st()["granted"].pop(rid, None)
+            raise
         _named = None
         if _asr.enabled():   # the rule off keeps no state at all
-            if seat is None:
-                # S60 F3: a grant this request did not turn into a Seat (D budget, yield, phase moved) holds no seat
-                # -- before, it counted in ``taken`` for 10 s and held the D line behind it
-                self._asr_st()["granted"].pop(rid, None)
+            # S60 F3: a grant this request did not turn into a Seat (D budget, yield, phase moved) holds no seat
+            # -- before, it counted in ``taken`` for 10 s and held the D line behind it.
+            # S60r A3: a grant that DID become a Seat is settled here too: the Seat counts in ``taken`` through the
+            # hand-off term (a Seat without a D leg) and then the D ledger, so the grant is spent. Left to the lazy
+            # settlement in ``_arrival_seat_taken``, a seated grant stayed in ``granted`` whenever no waiter read the
+            # seat count during its leg -- and after the leg released its Seat it read as an older grant not yet
+            # seated: the D line yielded to it (``_d_line_hold_for_older_waiter``) until some arrival settled it.
+            self._asr_st()["granted"].pop(rid, None)
             _wn = self._asr_st().setdefault("wait_named", {})
             _named = _wn.pop(rid, None)
             if len(_wn) > 1024:
@@ -11485,7 +11532,14 @@ class Front:
         if not st:
             return None
         k = Front._sa_key(self, p)
-        for r in list((st.get("granted") or {}).keys()):
+        _now = time.time()
+        _D_out = getattr(self.groups.get("D") if isinstance(getattr(self, "groups", None), dict) else None,
+                         "outstanding", None) or {}
+        for r, t_g in list((st.get("granted") or {}).items()):
+            # S60r A3: the grant's own settlement (``_arrival_seat_taken``): a grant whose rid runs on D or that
+            # lapsed (10 s) holds nothing -- read here too, not only when a waiter happens to count the seats
+            if r in _D_out or _now - float(t_g or 0.0) > 10.0:
+                continue
             if Front._sa_key(self, r) < k and not any(getattr(s, "rid", None) == r
                                                      for s in (getattr(self, "_d_seats_live", ()) or ())):
                 return r

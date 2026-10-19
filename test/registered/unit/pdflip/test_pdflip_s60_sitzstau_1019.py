@@ -386,3 +386,74 @@ def test_f3_a_grant_that_never_became_a_seat_holds_no_seat_and_no_d_line():
     assert seat is None and "d_budget" in refused
     assert "pdflip-106-770" not in f._asr_st()["granted"]
     assert Front._d_line_hold_for_older_waiter(f, _hand_off("pdflip-107-775", T0 - 18)) is None
+
+
+# ------------------------------------------------------------------------------------------------- S60r (review)
+def _orphan_run(f, rids):
+    async def run():
+        n = Front._d_orphan_abort(f, rids)
+        await asyncio.gather(*list(f.__dict__.get("_d_orphan_tasks", ())))
+        return n
+
+    return asyncio.run(run())
+
+
+def test_s60r_a1_an_orphan_whose_rid_prefixes_a_live_rid_is_not_aborted():
+    """D aborts by PREFIX (``park_abort`` / ``_abort_request_now``: ``rid.startswith(abort.rid)``). Boot 1018_153151
+    holds ``pdflip-2-6`` and ``pdflip-2-60`` .. ``-69`` in one epoch: the orphan's abort would drop the live one."""
+    f = _front(running=["pdflip-2-60"], n=6)
+    assert _orphan_run(f, ["pdflip-2-6", "pdflip-2-60"]) == 0
+    assert f.rpc_calls == []
+    assert f.counters["d_orphan_abort_prefix_skip"] == 1
+
+
+def test_s60r_a1_a_prefix_inside_the_park_list_is_skipped_the_other_orphan_still_goes():
+    f = _front(running=[], n=6)
+    assert _orphan_run(f, ["pdflip-2-6", "pdflip-2-61"]) == 1
+    assert f.rpc_calls == [("/abort_request", {"rid": "pdflip-2-61"})]
+
+
+def test_s60r_a2_a_rid_the_front_still_holds_on_p_or_queued_is_no_orphan():
+    """A W50 / park-handback requeue pops ``D.outstanding`` and goes on via P under the SAME rid; D's abort would drop
+    that rid's tail staging and park parts under the hand-off coming back."""
+    f = _front(running=[], n=6)
+    f.groups["P"] = types.SimpleNamespace(name="P", outstanding={"pdflip-104-766": 1.0}, url="http://p")
+    f.queue.append(_hand_off("pdflip-104-767", T0))
+    f._rvp_inflight = {"pdflip-104-768"}
+    f._asr_st()["waiters"]["pdflip-104-765"] = T0
+    assert _orphan_run(f, ["pdflip-104-765", "pdflip-104-766", "pdflip-104-767", "pdflip-104-768"]) == 0
+    assert f.rpc_calls == []
+
+
+def test_s60r_a3_a_grant_that_became_a_seat_is_settled_at_once():
+    f = _front(running=["r1"], n=6, kv=_kv(400000))
+    _stamp(f, "pdflip-106-770", T0 - 83)
+    seat = asyncio.run(f._acquire_short_seat("pdflip-106-770", 4000, [], max_tokens=256, uncached=424))
+    assert seat is not None
+    assert "pdflip-106-770" not in f._asr_st()["granted"]
+    seat.release("leg2_finished")
+    # the leg ended: nothing older holds the D line for a younger hand-off
+    assert Front._d_line_hold_for_older_waiter(f, _hand_off("pdflip-107-775", T0 - 18)) is None
+
+
+def test_s60r_a3_a_lapsed_or_running_grant_does_not_hold_the_d_line():
+    f = _front(running=["pdflip-104-769"], n=6, kv=_kv(400000))
+    st = f._asr_st()
+    st["granted"]["pdflip-104-768"] = time.time() - 11.0     # lost grant, past the 10 s lapse
+    st["granted"]["pdflip-104-769"] = time.time()            # runs on D already
+    assert Front._d_line_hold_for_older_waiter(f, _hand_off("pdflip-107-775", T0 - 18)) is None
+    st["granted"]["pdflip-104-767"] = time.time()            # a live, unseated, older grant still holds it
+    assert Front._d_line_hold_for_older_waiter(f, _hand_off("pdflip-107-775", T0 - 18)) == "pdflip-104-767"
+
+
+def test_s60r_a3_a_request_cancelled_between_grant_and_seat_leaves_no_grant():
+    f = _front(running=["r1"], n=6, kv=_kv(400000))
+
+    async def core(rid, *a, **k):
+        f._asr_st()["granted"][rid] = time.time()
+        raise asyncio.CancelledError()
+
+    f._acquire_short_seat_core = core
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(f._acquire_short_seat("pdflip-106-771", 4000, [], max_tokens=256, uncached=424))
+    assert "pdflip-106-771" not in f._asr_st()["granted"]
