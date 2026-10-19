@@ -269,6 +269,14 @@ static uint32_t g_writer_tag = 31;
 void arena_set_writer_tag(uint32_t tag) { g_writer_tag = tag & 31u; }
 static inline uint32_t writer_bit(void) { return 1u << (g_writer_tag & 31u); }
 
+/* S61r TEST HOOK (review of S61; NULL in production, set only by the hermetic tests): called by claim_slot for
+ * the slot it just took from FREE -- phase 0 right after the key words are written, phase 1 when the header is
+ * set up and the index publication is next. The points where the claiming process can be preempted while a
+ * joiner that found the slot's previous claim (same key) looks at it. */
+typedef void (*arena_claim_hook_t)(int64_t slot, int64_t phase);
+static arena_claim_hook_t g_claim_hook = NULL;
+void arena_set_claim_hook(arena_claim_hook_t fn) { g_claim_hook = fn; }
+
 /* ZR-1 (NF y6h D 15:36:33, weg2-4-14 pages 1067..): ONE index writer at a
  * time. The index cell of a key was published in two steps -- the key by CAS,
  * the slot id by a store after it -- and a claimer that lost the CAS moved on
@@ -347,6 +355,7 @@ static int64_t claim_slot(uint8_t *base, uint64_t klo, uint64_t khi, uint64_t to
             atomic_store(&h->clock_hand, s + 1);
             sh->key_lo = klo;
             sh->key_hi = khi;
+            if (g_claim_hook) g_claim_hook((int64_t)s, 0);
             sh->total_bytes = total;
             sh->generation++;
             sh->n_ivals = 0;
@@ -364,6 +373,7 @@ static int64_t claim_slot(uint8_t *base, uint64_t klo, uint64_t khi, uint64_t to
             sh->owner_tag = g_writer_tag;
             atomic_store(&sh->joined_mask, 0u);
             atomic_store(&sh->merged_mask, 0u);
+            if (g_claim_hook) g_claim_hook((int64_t)s, 1);
             /* publish in the index (ZR-1: under the index lock; the whole
              * probe chain is read first -- a key published further down by
              * another writer is JOINED, never published twice) */
@@ -657,6 +667,10 @@ static void stem_key128(const char *stem, uint64_t *lo, uint64_t *hi);
 typedef void (*arena_join_hook_t)(int64_t slot);
 static arena_join_hook_t g_join_hook = NULL;
 void arena_set_join_hook(arena_join_hook_t fn) { g_join_hook = fn; }
+/* S61r TEST HOOK: called INSIDE the join's critical section (slot lock held, state and key read) -- the point
+ * where a freer's CAS can land while the join decides; the freer's re-check must then wait for the lock. */
+static arena_join_hook_t g_join_locked_hook = NULL;
+void arena_set_join_locked_hook(arena_join_hook_t fn) { g_join_locked_hook = fn; }
 
 int64_t arena_claim(uint8_t *base, int64_t n, const uint64_t *klo, const uint64_t *khi,
                     const int64_t *totals, const char **stems, int64_t *slots_out,
@@ -753,6 +767,7 @@ int64_t arena_claim(uint8_t *base, int64_t n, const uint64_t *klo, const uint64_
             slot_lock(sh);
             uint32_t st = atomic_load(&sh->state);
             int same_key = sh->key_lo == klo[i] && sh->key_hi == khi[i];
+            if (g_join_locked_hook) g_join_locked_hook(slot);
             if (same_key && st == S_COMPLETE) {
                 slots_out[i] = slot;
                 gen_out[i] = (int64_t)sh->generation;
