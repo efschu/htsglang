@@ -2051,7 +2051,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22804
+      "line": 22834
      }
     }
    },
@@ -6532,7 +6532,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22196
+      "line": 22226
      }
     }
    },
@@ -7101,7 +7101,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22200
+      "line": 22230
      }
     }
    },
@@ -11311,7 +11311,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22252
+      "line": 22282
      }
     }
    },
@@ -16943,7 +16943,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 23711
+      "line": 23741
      }
     }
    },
@@ -16993,7 +16993,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23739,
+    "line": 23769,
     "tree": "nf"
    },
    "status": "harvested",
@@ -17658,7 +17658,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22514
+      "line": 22544
      }
     }
    },
@@ -18183,7 +18183,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22809
+      "line": 22839
      }
     }
    },
@@ -18268,7 +18268,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 23694
+      "line": 23724
      }
     }
    },
@@ -18317,7 +18317,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 23728
+      "line": 23758
      }
     }
    },
@@ -18992,7 +18992,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22966
+      "line": 22996
      }
     }
    },
@@ -19284,7 +19284,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 23341
+      "line": 23371
      }
     }
    },
@@ -19595,7 +19595,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23511,
+    "line": 23541,
     "tree": "nf"
    },
    "status": "curated",
@@ -28443,7 +28443,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22397
+      "line": 22427
      }
     }
    },
@@ -38021,7 +38021,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4954,
+    "line": 4961,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -38339,7 +38339,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4953,
+    "line": 4960,
     "tree": "nf"
    },
    "status": "harvested",
@@ -54001,7 +54001,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4671,
+    "line": 4678,
     "tree": "nf"
    },
    "status": "harvested",
@@ -61049,7 +61049,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 3978
+      "line": 3985
      }
     }
    },
@@ -61439,7 +61439,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4650
+      "line": 4657
      }
     }
    },
@@ -62416,7 +62416,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4630
+      "line": 4637
      }
     }
    },
@@ -65992,7 +65992,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4761
+      "line": 4768
      }
     }
    },
@@ -67647,7 +67647,7 @@
    "id": "FLLIPER_PDFLIP_L3_REFRESH_KEPT",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/hicache_storage.py:4768"
+    "mem_cache/hicache_storage.py:4773"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_L3_REFRESH_KEPT",
@@ -67656,7 +67656,7 @@
    "source": {
     "file": "mem_cache/hicache_storage.py",
     "kind": "os.environ",
-    "line": 4768,
+    "line": 4773,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -69176,7 +69176,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4559
+      "line": 4566
      }
     }
    },
@@ -69492,6 +69492,26 @@
    "type": "EnvStr"
   },
   "FLLIPER_PDFLIP_OWNED_CUT_X1": {
+   "abweichung": {
+    "27b": {
+     "default": null,
+     "help": "#239 S3f round guard (29.09., Befund z30n/z30r3 gegen z30k): the x1 rule keeps every WORKER at or below its Form-A miss time and lets the HOST take the rest -- on metal the host then became the rank the synchronized round waits for (TP0 misses per seat +18..23 %, round bs1 +2.8..5.6 ms against Form A). ``workers`` (default) is the x1 rule as before; ``round`` reports x1 but does not enforce it: feasible is every form with an edge on every rank, ranked by the synchronized round (max T_r over ALL ranks, then the next-worst rank -- :func:`owned_rank_key`, #287 -- then the sum, then the ownership move).",
+     "source": {
+      "file": "planner/expert_residency.py",
+      "kind": "os.environ",
+      "line": 1200
+     }
+    },
+    "nf": {
+     "default": null,
+     "help": "#239 S3f round guard (29.09., Befund z30n/z30r3 gegen z30k): the x1 rule keeps every WORKER at or below its Form-A miss time and lets the HOST take the rest -- on metal the host then became the rank the synchronized round waits for (TP0 misses per seat +18..23 %, round bs1 +2.8..5.6 ms against Form A). ``workers`` (default) is the x1 rule as before; ``round`` reports x1 but does not enforce it: feasible is every form with an edge on every rank, ranked by the synchronized round (max T_r over ALL ranks, then the next-worst rank -- :func:`owned_rank_key`, #287 -- then the sum, then the ownership move). S54 (19.10.) ``sync`` (default): x1 is held where the user sees it -- the SYNCHRONIZED round, max over ALL ranks, at every bs of the x1 set (and the extend copy, max over all ranks, when the extend term is on) must not exceed Form A's. ``workers`` held each worker to its own Form-A miss time, so the KV cut's worker rows were always bought with host residency: on rc14 (1019_010742) the published form ran TP0 at 68.42 ms bs1 against 21.26 / 29.92 on the workers -- above Form A's 63.13 -- and TP0 bound every D extend (16.1 ms copy per layer against 12.6 / 9.1). The 29.09. ``round`` metal loss (bs1 +4..9 ms, misses moved onto the x4 card) priced both 3080s at one SEED cost; the solve now prices every card at its own measured cost per row (01.10.) and ``sync`` refuses a predicted round above Form A's. A form that misses x1 under ``sync`` is not refused but ranked behind every form that keeps it (no planner gap stops a boot).",
+     "source": {
+      "file": "planner/expert_residency.py",
+      "kind": "os.environ",
+      "line": 1248
+     }
+    }
+   },
    "bare": false,
    "choices": null,
    "cost": "",
@@ -69523,6 +69543,62 @@
     "nf"
    ],
    "type": "os.environ"
+  },
+  "FLLIPER_PDFLIP_OWNED_EXTEND_PER_ROUND": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "None",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "",
+   "id": "FLLIPER_PDFLIP_OWNED_EXTEND_PER_ROUND",
+   "kind": "env",
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_OWNED_EXTEND_PER_ROUND",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 3959,
+    "tree": "nf"
+   },
+   "status": "unexplained",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "EnvStr"
+  },
+  "FLLIPER_PDFLIP_OWNED_EXTEND_TOKENS": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "None",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "S54 (19.10.): the D extend in the owned solve. The objective adds extends-per-decode-round x the extend's expert copy at the slowest rank's link (card probe pinned H2D per card); unset = the rc14 seed (256 new tokens per extend, 0.0256 extends per round, boot 1019_010742 05:25-06:15Z); _PER_ROUND=0 switches the term off.",
+   "id": "FLLIPER_PDFLIP_OWNED_EXTEND_TOKENS",
+   "kind": "env",
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_OWNED_EXTEND_TOKENS",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 3958,
+    "tree": "nf"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "EnvStr"
   },
   "FLLIPER_PDFLIP_OWNED_MISS_RECORD": {
    "bare": false,
@@ -73524,7 +73600,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4676,
+    "line": 4683,
     "tree": "nf"
    },
    "status": "harvested",
@@ -78180,7 +78256,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4748
+      "line": 4755
      }
     }
    },
@@ -89936,28 +90012,28 @@
  "schema": "flliper.catalog/1",
  "stats": {
   "curated": 125,
-  "entries": 2836,
-  "envs": 1957,
+  "entries": 2838,
+  "envs": 1959,
   "explained": 310,
   "flags": 864,
-  "harvested": 1747,
+  "harvested": 1748,
   "trees": {
-   "abweichung": 51,
+   "abweichung": 52,
    "beide": 2463,
    "nur_27b": 180,
-   "nur_nf": 175
+   "nur_nf": 177
   },
-  "unexplained": 654
+  "unexplained": 655
  },
- "tree_rev": "27b=0798c91fcd+nf=a2cfdbe6af",
+ "tree_rev": "27b=0798c91fcd+nf=cecebe9930",
  "trees": {
   "27b": {
    "entries": 2643,
    "rev": "0798c91fcd"
   },
   "nf": {
-   "entries": 2638,
-   "rev": "a2cfdbe6af"
+   "entries": 2640,
+   "rev": "cecebe9930"
   }
  },
  "warnungen": []

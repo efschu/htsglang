@@ -3950,6 +3950,13 @@ class Envs:
     # --rank-moe-ratio only seeds the search; "stated" = the stated vector is
     # the base (the old hand base, explicit override).
     FLLIPER_PDFLIP_OWNED_BASE = EnvStr("derive")
+    # S54 (19.10.): the D extend in the owned solve. The objective adds
+    # extends-per-decode-round x the extend's expert copy at the slowest
+    # rank's link (card probe pinned H2D per card); unset = the rc14 seed
+    # (256 new tokens per extend, 0.0256 extends per round, boot 1019_010742
+    # 05:25-06:15Z); _PER_ROUND=0 switches the term off.
+    FLLIPER_PDFLIP_OWNED_EXTEND_TOKENS = EnvStr(None)
+    FLLIPER_PDFLIP_OWNED_EXTEND_PER_ROUND = EnvStr(None)
     # H95c (Nutzer 26.09.: "1,6gb experten cache kostet es nur bei tatsaechlich
     # 6 sitzen"): D's per-seat posts are PHYSICALLY backed only for the seats
     # the phase occupies (n = d_seats.phase_seats of the wake's handoff_n); the
