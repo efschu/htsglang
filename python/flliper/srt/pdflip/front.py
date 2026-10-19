@@ -160,6 +160,7 @@ from flliper.srt.pdflip import x_curves as _xcurves  # X-CURVES 1006: X per requ
 from flliper.srt.pdflip import front_gc_guard as _gcg  # GC-GUARD 02.10.
 from flliper.srt.pdflip import arrival_seat_rule as _asr  # ARRIVAL-SEAT (user 29.09.)
 from flliper.srt.pdflip import p_read_overlap as _ro  # RO: P computes while a store read runs
+from flliper.srt.pdflip import l2_read_ahead as _l2ra  # S53 L2-READ-AHEAD: the held head's prefix L3 -> L2
 from flliper.srt.pdflip import resume_via_p as _rvp  # RESUME-VIA-P
 from flliper.srt.pdflip import usage_true as _ut  # USAGE-TRUE: the client sees the prefill really computed
 from flliper.srt.pdflip import handoff_seam as _hs  # #243 seam: HANDOFF-LOST reroute + rid-end drop
@@ -3518,11 +3519,19 @@ async def _settle_posted_early_legs(queue, one, on_done, skip=None) -> int:
     return len(picked)
 
 
+def _l2ra_span(p) -> Optional[int]:
+    """S53: the store span the route priced for ``p`` (the H43 hint's ``start_hint``), None when unknown."""
+    from flliper.srt.pdflip.ple_admit_hint import ple_hint_span
+
+    return ple_hint_span(span_known=bool(getattr(p, "span_known", False)),
+                         store_span_est=int(getattr(p, "store_span_est", 0) or 0))
+
+
 async def _p_drain_pool(queue, limit: int, one, on_done, may_dispatch,
                         max_dispatch: int = 0, cost=None, budget: int = 0,
                         stats: Optional[Dict[str, int]] = None,
                         extra=None, poll_s: float = 0.0, cap_exempt=None, lane_held=None,
-                        lane_take=None, lane_take_wait=None, pick=None) -> int:
+                        lane_take=None, lane_take_wait=None, pick=None, on_pool_hold=None) -> int:
     """#1459c: keep up to ``limit`` leg-1 calls in flight, refilling from
     ``queue`` (a deque; new arrivals appended while draining are taken too)
     the moment ONE finishes.  ``on_done(p)`` runs in COMPLETION order, and
@@ -3582,6 +3591,11 @@ async def _p_drain_pool(queue, limit: int, one, on_done, may_dispatch,
     ``pred`` accepts (``pred`` None = every item): the first of the highest priority, the queue staying in arrival
     order (so every wait clock that reads the queue head still reads the real oldest).  ``None`` = the head (and
     the first ``cap_exempt`` item), as before.
+
+    S53 L2-READ-AHEAD (``on_pool_hold``): ``on_pool_hold(item)`` is called with the item the overlap plan HOLDS --
+    it waits for P's device room, not for P's compute -- so its stored prefix can be read L3 -> L2 meanwhile
+    (pdflip/l2_read_ahead.py). Called on every hold (the callee keeps its own once-per-request mark); an error in
+    it never stops the drain. ``None`` = off.
     """
     inflight: Dict[Any, int] = {}
     inflight_tokens = 0
@@ -3652,6 +3666,11 @@ async def _p_drain_pool(queue, limit: int, one, on_done, may_dispatch,
             if not phase_policy.p_overlap_admits(inflight_tokens - _th, len(inflight) - _nh, c, budget):
                 if stats is not None:
                     stats["pool_holds"] += 1
+                if on_pool_hold is not None:
+                    try:
+                        on_pool_hold(queue[idx])   # S53 L2-READ-AHEAD: the held head's prefix goes L3 -> L2
+                    except Exception:  # noqa: BLE001 - a read-ahead is a gain, never a stop of the drain
+                        pass
                 break
             _beyond = (len(inflight) - _nh) >= limit
             if idx == 0:
@@ -10795,6 +10814,45 @@ class Front:
                             "tail" if span is None else span)
             except Exception as e:  # noqa: BLE001 -- a lost hint costs the gain only
                 logger.info("PDFLIP PLE-HINT rid=%s failed: %r", p.rid, e)
+
+        tasks = self.__dict__.setdefault("_ple_hint_tasks", set())
+        task = asyncio.ensure_future(_post())
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+
+    def _maybe_l2_read_ahead(self, p: Pending) -> None:
+        """S53 L2-READ-AHEAD: the pool plan (H91c) holds ``p`` -- it waits for P's device room, not P's compute.
+        Hint P once, so PP0 reads ``p``'s stored prefix from L3 into the shared arena before its leg 1
+        (pdflip/l2_read_ahead.py). Fire and forget; never delays the drain. The front decides (SOLL R11)."""
+        span = _l2ra_span(p)
+        if not _l2ra.hint_wanted(awake=self.awake, skip_leg1=bool(p.skip_leg1), span=span,
+                                 sent=bool(getattr(p, "_l2_ra_sent", False)),
+                                 client_gone=bool(getattr(p, "client_gone", False))):
+            return
+        p._l2_ra_sent = True   # once per request, whatever the RPC answers
+        body = _l2ra.hint_body(p.path, p.payload, int(span))
+        g = self.groups.get("P")
+        if body is None or g is None or self.session is None:
+            self.counters["l2_read_ahead_skipped"] = self.counters.get("l2_read_ahead_skipped", 0) + 1
+            return
+        from flliper.srt.pdflip.ple_admit_hint import HINT_PATH
+
+        async def _post() -> None:
+            # S53r: not in the predecessor's tokenization (see l2_read_ahead.HINT_DELAY_S)
+            await asyncio.sleep(_l2ra.HINT_DELAY_S)
+            if p.client_gone or p.leg1_done:
+                self.counters["l2_read_ahead_skipped"] = self.counters.get("l2_read_ahead_skipped", 0) + 1
+                return
+            t0 = time.time()
+            try:  # rpc: the admin bearer token rides along (#1275)
+                code, _ = await self.rpc(g, HINT_PATH, body, 30)
+                n = self.counters["l2_read_ahead_hints"] = self.counters.get("l2_read_ahead_hints", 0) + 1
+                if n <= 32 or n % 64 == 0:
+                    logger.info("PDFLIP L2-READ-AHEAD HINT rid=%s span=%d status=%d ms=%.0f (n=%d): the pool plan "
+                                "holds it for P's device room -- PP0 reads its stored prefix L3 -> L2 meanwhile",
+                                p.rid, int(span), code, (time.time() - t0) * 1000.0, n)
+            except Exception as e:  # noqa: BLE001 -- a lost hint costs the gain only
+                logger.info("PDFLIP L2-READ-AHEAD HINT rid=%s failed: %r", p.rid, e)
 
         tasks = self.__dict__.setdefault("_ple_hint_tasks", set())
         task = asyncio.ensure_future(_post())
@@ -18098,6 +18156,9 @@ class Front:
                     lane_take_wait=((lambda: _lctl.take_wait(self)) if _lctl.enabled() else None),
                     # PRIO-AS-AGE 1014: P takes its legs in the order key (priority desc, arrival asc)
                     pick=((lambda q, pred: Front._prio_pick(self, q, pred)) if _prio_age.enabled() else None),
+                    # S53 L2-READ-AHEAD: the head the pool plan holds is read L3 -> L2 on P meanwhile
+                    on_pool_hold=((lambda p: Front._maybe_l2_read_ahead(self, p))
+                                  if _l2ra.enabled() else None),
                     # FLIPCYCLE H5: the phase cap never strands a SHORT
                     # DOUBLE-FLIP 1015: nor a request that needs P (the park's own reader), switch-independent;
                     # SEAT-AT-HAND-OFF: no seat cap on this phase, so no seat condition on the exemption either

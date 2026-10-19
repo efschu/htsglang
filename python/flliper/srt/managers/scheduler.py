@@ -8728,6 +8728,13 @@ class Scheduler(
         group (P still asleep, or its leg 1 not yet dispatched) -- starts the
         first chunk's PLE read now. No reply; a no-op on ranks without an
         admitting PLE gather (PP1/PP2, group D)."""
+        if getattr(recv_req, "read_ahead", False):
+            # S53 L2-READ-AHEAD: PP0 fills the held request's stored prefix L3 -> L2 (a no-op on every other rank)
+            from flliper.srt.pdflip import l2_read_ahead as _l2ra
+
+            _l2ra.on_hint(self, recv_req)
+        if not getattr(recv_req, "ple", True):
+            return  # S53: a read-ahead hint on an awake P -- no PLE admission, no ZERO-ANCHOR note
         from flliper.srt.models.qwen4_exp_ple_admit import admit_ple_hint
 
         # ZERO-ANCHOR 1015 (Typ A): the depth D was measured to hold -- PP0's
