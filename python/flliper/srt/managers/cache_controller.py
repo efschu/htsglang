@@ -4653,7 +4653,7 @@ class HiCacheController:
                         "part of this issuance decision",
                         type(self.storage_backend).__name__,
                     )
-            if s64_dense_full_span_on():
+            if s64_dense_full_span_on() and claim_vote_min_only(self):
                 # S64 S-ARM (NF rc15 D: X-GATE-TERMS store = worker local_match +
                 # 65536 on 72-525 / 16-78 / 18-81 / 28-114 / 59-496 / 82-632 /
                 # 104-767..769 -- 68608 = 3072 + 1024 pages while the store held
@@ -4662,7 +4662,10 @@ class HiCacheController:
                 # and its vote capped the group's MIN store arm there. The chain
                 # is hashed already; ask it batch by batch in key order and stop
                 # at the first short batch (longest prefix), exactly as the
-                # fetch's ``_storage_hit_query`` walks it.
+                # fetch's ``_storage_hit_query`` walks it. Only a KV-row worker
+                # (``claim_vote_min_only``): its vote enters the MIN beside a host
+                # that asks the WHOLE span (v2); a dense group of equals keeps
+                # MAMBA-ANCHOR 1015's first batch (27B page_size=1: the cost).
                 return _s64_dense_prefix_pages(
                     self.storage_backend, page_hashes, STORAGE_BATCH_SIZE, prefix_keys)
             return int(

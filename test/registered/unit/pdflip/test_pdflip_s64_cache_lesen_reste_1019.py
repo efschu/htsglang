@@ -149,11 +149,13 @@ class _DenseBackend:
         return n
 
 
-def _worker_probe(held_pages, span_tokens, batch=1024):
+def _worker_probe(held_pages, span_tokens, batch=1024, kv_row_worker=True):
     from flliper.srt.managers import cache_controller as cc
     from flliper.srt.managers.cache_controller import HiCacheController
 
     be = _DenseBackend(held_pages)
+    old_cv = cc.claim_vote_min_only
+    cc.claim_vote_min_only = lambda controller: kv_row_worker   # TP1/TP2 of the NF D (Form A token cut)
     ctl = SimpleNamespace(
         page_size=PAGE, storage_backend=be, _presence_pool_transfers=lambda: None,
         get_hash_str=lambda ids, last_hash, page_size: [f"h{i}" for i in range(len(list(ids)) // page_size)],
@@ -164,6 +166,15 @@ def _worker_probe(held_pages, span_tokens, batch=1024):
         return HiCacheController.store_presence_pages(ctl, list(range(span_tokens)), None), be
     finally:
         cc.STORAGE_BATCH_SIZE = old
+        cc.claim_vote_min_only = old_cv
+
+
+def test_arm_dense_group_of_equals_keeps_the_first_batch():
+    """Byte-identical outside the defect locus: a dense rank that is not a
+    KV-row worker beside a v2 host (27B page_size=1, any classic group) asks
+    MAMBA-ANCHOR 1015's first batch, as before."""
+    pages, be = _worker_probe(10 ** 6, 3000 * PAGE, batch=1024, kv_row_worker=False)
+    assert pages == 1024 and be.calls == [1024]
 
 
 def test_arm_root_kv_row_worker_asked_one_batch_72_525():
