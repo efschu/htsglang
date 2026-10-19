@@ -243,6 +243,17 @@ def arm_ram_source(model_dir: str, env: Optional[Dict[str, str]] = None,
 # ---------------------------------------------------------------------------
 
 
+def pending_items(req) -> List[Any]:
+    """What PP0's vision pass still owes ``req`` (S66): the items with pixels
+    and no rows, plus the known images P's tokenizer sent without pixels
+    (``p_known_image``) -- those need a verdict before any rank admits it."""
+    from flliper.srt.pdflip import p_known_image as _pki
+
+    if getattr(req, "_pdflip_vision_skip", False):
+        return []
+    return unstaged_items(req) + _pki.featureless_items(req)
+
+
 def unstaged_items(req) -> List[Any]:
     if getattr(req, "_pdflip_vision_skip", False):
         return []  # W102 SKIP: every image position is inside the admitted prefix
@@ -272,17 +283,135 @@ def unstaged_items(req) -> List[Any]:
 W_STAGE_SKIP = "W102 PdFlipVisionStage SKIP"
 SKIP, WAIT, STAGE = "skip", "wait", "stage"
 
+# S66 PROBE-WAIT (NF rc15 boot 092806, P PP0, pdflip-12-340; review S63 (6)):
+# the images end at 20556, PP0's store probe answered 42240 at 10:08:06
+# (``PDFLIP-CLAIM-SHORT ... claimed=660 tokens=42240``, ``#257 PROBE-HOLD
+# pages=660``), yet the tower ran at 10:08:09 (load 251, encode 1675) and only
+# then came ``#1416d TOLD-PROBE told=42240``. A P that reads from the store
+# after its sleep holds NOTHING locally (prefix 0, host hit 0 at the vision
+# pass), and its told is published at the top of the pass AFTER the read
+# terminated -- for a dormant-held request only once the release has queued it
+# (pdflip_store_told, TK path 4), i.e. one pass after the vision pass that
+# found it. The local-WAIT above never fires there: every such image was
+# staged. rc15, three boots: 31 of 90 tower runs were for images inside the
+# prefix P then admitted (82.5 s of PP0, the stage is synchronous).
+#
+# Now: while the told is outstanding and the rid is held by #1400, PP0's OWN
+# store probe decides WAIT -- its anchor-clamped answer (``note_probe_hit``,
+# the very number the told reuses: #1416d ``reused=prefetch_hit``) put on the
+# registration head, or the read's completed prefix. A probe that has not
+# answered yet while the read is registered waits too (the told cannot come
+# before it). WAIT only defers the verdict to the told (one pass); it never
+# skips: SKIP stays ``told >= image_end``, the admission belt
+# (:func:`skip_still_covered`) stays. The admission cannot take the request
+# before its told anyway (``pdflip_store_told_pending``), so a WAIT costs no
+# admission pass -- only the overlap of a tower the told then still needs
+# with the read, bounded by the probe's own latency. PP0 alone decides; the
+# followers hold the request until PP0's verdict reaches them (H125f).
+VISION_PROBE_WAIT_ENV = "FLLIPER_PDFLIP_VISION_PROBE_WAIT"
+W_PROBE_WAIT = "W102 PdFlipVisionStage PROBE-WAIT"
+
+
+def probe_wait_on(scheduler=None, env: Optional[Dict[str, str]] = None) -> bool:
+    """S66 (default on): resolved once per scheduler -- PP0 alone reads it."""
+    cached = getattr(scheduler, "_pdflip_vision_probe_wait_on", None) if scheduler is not None else None
+    if cached is not None:
+        return bool(cached)
+    e = os.environ if env is None else env
+    on = str(e.get(VISION_PROBE_WAIT_ENV, "1") or "1").strip().lower() not in ("0", "false", "no", "off")
+    if scheduler is not None:
+        try:
+            scheduler._pdflip_vision_probe_wait_on = on
+        except Exception:  # noqa: BLE001 -- a frozen double keeps no cache
+            pass
+    return on
+
+
+def probe_promise(scheduler, req) -> Tuple[Optional[int], str]:
+    """(depth, source): the absolute token depth PP0's own store read promises
+    for ``req`` before its told -- the larger of the read's completed prefix
+    (``completed_prefetch_tokens``: head + loaded) and the probe's
+    anchor-clamped answer on the registration head
+    (``_prefetch_registered_prefix_len`` + hit pages x page size). ``None``
+    when neither has said anything yet."""
+    rid = str(getattr(req, "rid", ""))
+    tree = getattr(scheduler, "tree_cache", None)
+    best: Optional[int] = None
+    src = "none"
+    fn = getattr(tree, "completed_prefetch_tokens", None)
+    if callable(fn):
+        try:
+            v = fn(rid)
+        except Exception:  # noqa: BLE001 -- an accelerator, never a wall
+            v = None
+        if v is not None:
+            best, src = int(v), "read"
+    cc = getattr(scheduler, "cache_controller", None) or getattr(tree, "cache_controller", None)
+    hits = getattr(cc, "_pdflip_probe_hit_pages", None) if cc is not None else None
+    pages = hits.get(rid) if isinstance(hits, dict) else None
+    if pages is not None:
+        page = int(getattr(cc, "page_size", 1) or 1)
+        head = int(getattr(req, "_prefetch_registered_prefix_len", 0) or 0)
+        v = head + int(pages) * page
+        if best is None or v > best:
+            best, src = v, "probe"
+    return best, src
+
+
+def _read_open(scheduler, rid: str) -> bool:
+    tree = getattr(scheduler, "tree_cache", None)
+    fn = getattr(tree, "prefetch_is_ongoing", None)
+    if callable(fn):
+        try:
+            return bool(fn(rid))
+        except Exception:  # noqa: BLE001
+            return False
+    return rid in (getattr(tree, "ongoing_prefetch", None) or {})
+
+
+def _probe_wait(scheduler, req, end: int) -> Optional[Tuple[int, str]]:
+    """S66: (covered, source) when PP0 waits for an outstanding told on its own
+    store probe, else None."""
+    if not probe_wait_on(scheduler):
+        return None
+    rid = str(getattr(req, "rid", ""))
+    # #1416e paced form (NF rc16, boot 121629, pdflip-2-9: PACED-TOLD
+    # told=171776, images end ~21k, the tower ran anyway): between the
+    # read-ahead and PP0's PdFlipStoreAdmit the rid has left ``held`` for
+    # ``pacing``, the told is known there and ``_pdflip_store_told`` is still
+    # empty -- the admission waits for the Admit, so the verdict does too (the
+    # Admit's told, maybe a fallback 0 or a floor, decides SKIP or STAGE)
+    pace = (getattr(scheduler, "_pdflip_told_pacing", None) or {}).get(rid)
+    if pace is not None:
+        p_told = int(getattr(pace, "told", 0) or 0)
+        if p_told >= end:
+            return p_told, "paced"
+        return None
+    held = getattr(scheduler, "_pdflip_store_held", None)
+    if not isinstance(held, dict) or rid not in held:
+        return None  # no #1400 verdict is coming for it: nothing to wait for
+    depth, src = probe_promise(scheduler, req)
+    if depth is not None and depth >= end:
+        return depth, src
+    if depth is None and _read_open(scheduler, rid):
+        return 0, "probe-pending"
+    return None
+
 
 def stage_skip_verdict(scheduler, req) -> Tuple[str, int, str]:
     """(verdict, covered, source): ``skip`` when every image position of
     ``req`` lies inside the prefix this group admits it with, ``wait`` while a
-    store-told is outstanding and the rank's own match covers the image,
-    ``stage`` otherwise."""
+    store-told is outstanding and the rank's own match -- or PP0's own store
+    probe (S66) -- covers the image, ``stage`` otherwise."""
     from flliper.srt.pdflip.vision_d_guard import image_end
 
     end = image_end(req)
     if not end:
         return STAGE, 0, "none"
+    if getattr(req, "_pdflip_vision_skip_refuted", False):
+        # S66: the admission refuted a skip of this request once -- the next
+        # verdict stages it (before, the same told re-skipped it every pass)
+        return STAGE, 0, "refuted"
     # prefix_indices is a tensor on the cached path: `tensor or ()` raises on an empty one (y7m 13:17Z P death)
     _pi = getattr(req, "prefix_indices", None)
     local = ((0 if _pi is None else len(_pi))
@@ -293,6 +422,9 @@ def stage_skip_verdict(scheduler, req) -> Tuple[str, int, str]:
             return (SKIP if int(told) >= end else STAGE), int(told), "told"
         if local >= end:
             return WAIT, local, "local"
+        pw = _probe_wait(scheduler, req, end)
+        if pw is not None:
+            return WAIT, pw[0], pw[1]
         return STAGE, local, "local"
     return (SKIP if local >= end else STAGE), local, "local"
 
@@ -302,6 +434,8 @@ def skip_cached(scheduler, pending: Sequence[Any]) -> Tuple[List[Any], List[Any]
     hold one pass); a request every image position of which is covered is
     marked skipped and leaves both."""
     from flliper.srt.pdflip.vision_d_guard import image_end
+
+    from flliper.srt.pdflip import p_known_image as _pki
 
     stage, wait = [], []
     for r in pending:
@@ -313,10 +447,43 @@ def skip_cached(scheduler, pending: Sequence[Any]) -> Tuple[List[Any], List[Any]
                         "every image position lies in the prefix this group admits)",
                         W_STAGE_SKIP, r.rid, covered, src, image_end(r))
         elif v == WAIT:
+            if src not in ("local",):
+                _note_probe_wait(scheduler, r, covered, src)
+            wait.append(r)
+        elif _pki.featureless_items(r):
+            # S66 P-KNOWN-IMAGE: P's tokenizer built this request from known
+            # images without pixels; the verdict needs the tower, so the
+            # pixels are fetched first and the request is held until they are
+            # attached (or refused by name) -- never admitted without rows
+            _pki.request_features(scheduler, r, covered=covered, src=src)
             wait.append(r)
         else:
             stage.append(r)
     return stage, wait
+
+
+def _note_probe_wait(scheduler, req, covered: int, src: str) -> None:
+    """One line per rid and source (a wait lasts a pass or a few)."""
+    from flliper.srt.pdflip.vision_d_guard import image_end
+
+    said = getattr(scheduler, "_pdflip_vision_probe_wait_said", None)
+    if said is None:
+        said = {}
+        try:
+            scheduler._pdflip_vision_probe_wait_said = said
+        except Exception:  # noqa: BLE001
+            return
+    key = (str(req.rid), src)
+    if key in said:
+        return
+    said[key] = True
+    while len(said) > 1024:
+        said.pop(next(iter(said)))
+    scheduler._pdflip_vision_probe_waits = getattr(scheduler, "_pdflip_vision_probe_waits", 0) + 1
+    logger.info("%s rid=%s promise=%d src=%s image_end=%d n=%d (told outstanding; PP0's own store "
+                "read covers the image -- the verdict waits for the told, the tower does not run "
+                "ahead of it)", W_PROBE_WAIT, req.rid, covered, src, image_end(req),
+                scheduler._pdflip_vision_probe_waits)
 
 
 def skip_still_covered(scheduler, req) -> bool:
@@ -332,6 +499,7 @@ def skip_still_covered(scheduler, req) -> bool:
     if covered >= end:
         return True
     req._pdflip_vision_skip = False
+    req._pdflip_vision_skip_refuted = True  # S66: the next verdict stages, it does not re-skip
     logger.warning("%s-REFUTED rid=%s covered=%d image_end=%d (the admitted prefix ends before "
                    "an image position: the tower is staged in the next pass)",
                    W_STAGE_SKIP, req.rid, covered, end)
@@ -1418,7 +1586,7 @@ def vision_rank_pass(scheduler) -> List[Tuple[int, Any]]:
     refused = scheduler._pdflip_vision_refused
     if refused:
         refused.intersection_update({r.rid for r in wq})  # an aborted rid leaves the set
-    pending = [r for r in wq if r.rid not in refused and unstaged_items(r)]
+    pending = [r for r in wq if r.rid not in refused and pending_items(r)]
     held = [r for r in wq if r.rid in refused]
     if pending:
         # W102 SKIP: a cached image needs no tower; one whose told is still
@@ -1521,7 +1689,9 @@ def vision_rank_pass(scheduler) -> List[Tuple[int, Any]]:
     # holds it here like every follower does in vision_verdict.follower_pass,
     # and all of them release it in the pass that absorbs the verdict.
     if getattr(scheduler, "_pdflip_vision_gate", False):
-        _vv.queue_verdicts(scheduler, wq, unstaged_items, scheduler._pdflip_vision_refused)
+        # S66: a known image without pixels is pending too -- no verdict on the
+        # wire before PP0 skipped it or staged it (the followers hold it alike)
+        _vv.queue_verdicts(scheduler, wq, pending_items, scheduler._pdflip_vision_refused)
         held = held + _vv.gate_held(scheduler, wq, held)
     if not held:
         return []

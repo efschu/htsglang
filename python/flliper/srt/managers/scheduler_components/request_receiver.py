@@ -148,6 +148,11 @@ class SchedulerRequestReceiver:
     # applies them in the same pass. Called only on the request origin.
     # None (every other boot) leaves the intake exactly as it was.
     origin_extra_reqs_hook: Optional[Callable[[], List[Any]]] = None
+    # S66 P-KNOWN-IMAGE (pdflip/p_known_image.py): takes the tokenizer's answers
+    # meant for the origin alone (the pixels of a known image) out of the
+    # intake before any broadcast or relay. Called only on the request origin;
+    # None (every other boot) leaves the intake exactly as it was.
+    origin_consume_hook: Optional[Callable[[List[Any]], List[Any]]] = None
     # #1158c: origin-only state of _dispose_health_checks_at_origin (mutable
     # content of a frozen field; read and written only on the request origin).
     quiesce_probe_window: QuiesceProbeWindow = field(default_factory=QuiesceProbeWindow)
@@ -285,6 +290,8 @@ class SchedulerRequestReceiver:
         # PP chain forward. Everything below relays exactly what survives.
         if is_request_origin and recv_reqs:
             recv_reqs = self._dispose_health_checks_at_origin(recv_reqs)
+        if is_request_origin and recv_reqs and self.origin_consume_hook is not None:
+            recv_reqs = self.origin_consume_hook(recv_reqs)
         if (
             is_request_origin
             and recv_reqs is not None

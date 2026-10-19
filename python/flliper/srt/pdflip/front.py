@@ -78,6 +78,17 @@ from flliper.srt.pdflip.intake_stall import is_intake_stall, is_too_large  # weg
 
 
 # MM-XPRICE: front_tokens is imported lazily here as everywhere in this module
+#: S66 (NF rc16 boot 121629): an image request WITHOUT an exact number (D's probe gave up) goes to D's own
+#: admission, which measures it (vision_d_guard W123 -> P-only requeue with D's extent) -- never P-only by rule on a
+#: missing number. 0/false/no/off = the pre-S66 rule (every unpriced image request P-only).
+VISION_UNPRICED_TO_D_ENV = "FLLIPER_PDFLIP_VISION_UNPRICED_TO_D"
+
+
+def vision_unpriced_to_d_on(env=None) -> bool:
+    e = os.environ if env is None else env
+    return str(e.get(VISION_UNPRICED_TO_D_ENV, "1") or "1").strip().lower() not in ("0", "false", "no", "off")
+
+
 def _ft_mm_expand(*args):
     from flliper.srt.pdflip.front_tokens import mm_expand
 
@@ -10772,7 +10783,24 @@ class Front:
             # IMAGE-CACHED-1002: the uncached verdict names its why before the rule
             self._w102_image_uncached(rid, _xx)
         _route_vision_p_only = False
-        if _verdict == VERDICT_STAGE and not _mm_cached and route != "none" and route != "long":
+        # S66 (NF rc16, boot 121629): every D probe failed (KeyError '<rid>~probe'), so every image request came
+        # here UNPRICED and the rule below made it P-only -- 65 flips to P whose store read then covered the images
+        # (pdflip-2-9: P read 171776, computed 296, the 5 images ~21k deep). A missing number is no verdict that
+        # the image is uncached: S56r A1 sends an unpriced request to D's own admission, which measures exactly
+        # (its radix/L2/L3 at admission, S59) and refuses an image outside its admitted prefix by name (W123 ->
+        # requeue as P-only with D's extent; over X -> W31). P-only stays for an image MEASURED in the uncached
+        # tail (``image_in_tail`` below) and for every priced uncached image (SOLL R9 unchanged).
+        _unpriced = bool(_xx is not None and getattr(_xx, "unpriced", False))
+        _w102_unpriced_d = False
+        if (_verdict == VERDICT_STAGE and not _mm_cached and _unpriced
+                and route != "none" and route != "long" and vision_unpriced_to_d_on()):
+            _w102_unpriced_d = True
+            self.counters["w102_unpriced_d_admission"] += 1
+            logger.info(
+                "W102 PdFlipVisionStage rid=%s -- route %s stands UNPRICED: no exact number says the image is "
+                "uncached; D's admission measures it (W123 -> P-only requeue with D's extent), no rule-flip "
+                "on a missing number (S66, S56r A1)", rid, route)
+        elif _verdict == VERDICT_STAGE and not _mm_cached and route != "none" and route != "long":
             _route_vision_p_only = True
             logger.info(
                 "W102 PdFlipVisionStage rid=%s -- route %s -> long (P): an image "
@@ -11072,7 +11100,9 @@ class Front:
                     skip_leg1=_sk, short_kept=_sk, price_epoch=int(self.epoch),
                     # xsn438: routed `long` by the W102 rule above, not by
                     # length -- only P can serve it (Pending.p_only).
-                    p_only=(_verdict == VERDICT_STAGE and not _mm_cached) or _probe_p_only,
+                    # S66: an UNPRICED image request is D's admission's call (W123 -> P-only requeue), not P-only
+                    p_only=(_verdict == VERDICT_STAGE and not _mm_cached and not _w102_unpriced_d)
+                    or _probe_p_only,
                     # S56: priced from D's exact numbers -- no ledger reprice overwrites them
                     # S56r A1: an UNPRICED entry is never repriced by the ledger either -- D's admission measures it
                     probe_priced=bool(_xx is not None and (getattr(_xx, "probe", None) is not None or _unpriced)),

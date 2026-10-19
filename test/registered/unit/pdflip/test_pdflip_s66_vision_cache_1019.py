@@ -1,0 +1,544 @@
+# SPDX-License-Identifier: Apache-2.0
+"""S66 (NF, Vision auf P): no tower and no image processor for an image the
+prefix P reads already holds.
+
+rc15 P log, boot ..._1019_092806, pdflip-12-340 (images end at token 20556):
+  10:08:06  PDFLIP-MM-TOKENIZE process_ms=8505 total_ms=8710   (P's processor)
+  10:08:06  PDFLIP-CLAIM-SHORT pp=0 claimed=660 tokens=42240    (PP0's store probe)
+  10:08:06  #257 PROBE-HOLD pages=660
+  10:08:09  W102 PdFlipVisionStage run=4 ... load 251, encode 1675   (the tower)
+  10:08:09  #1416d TOLD-PROBE told=42240 reused=prefetch_hit pages=660
+P admitted 42240 > 20556: both the processor and the tower were avoidable.
+Root: ``stage_skip_verdict`` waits for an outstanding told only when the LOCAL
+match covers the image -- 0 on a P that reads from the store -- and staged.
+
+Half 1 (PROBE-WAIT): PP0's own store probe (or its read's completed prefix)
+holds the verdict for the told. Half 2 (P-KNOWN-IMAGE): P's tokenizer builds a
+request whose images are all known without pixels; PP0 skips it on the told or
+fetches the pixels from P's tokenizer before it stages -- never admits it
+without rows.
+"""
+from __future__ import annotations
+
+import asyncio
+import base64
+import copy
+import inspect
+import io
+import logging
+import os
+import pickle
+import types
+import unittest
+from types import SimpleNamespace
+from unittest import mock
+
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+
+import pytest  # noqa: E402
+import torch  # noqa: E402
+
+from flliper.srt.pdflip import p_known_image as K  # noqa: E402
+from flliper.srt.pdflip import vision_rank_runner as V  # noqa: E402
+from flliper.srt.pdflip import vision_verdict as VV  # noqa: E402
+
+RID = "pdflip-12-340"
+IMAGE_END = 20556          # one past the last image position (front: image_end=20556)
+PAGE = 64
+
+
+class _Item:
+    """A MultimodalDataItem stand-in: offsets, hash, pixels or not."""
+
+    def __init__(self, offsets, feature=None, hash=None, emb=None):
+        self.offsets = offsets
+        self.feature = feature
+        self.hash = hash
+        self.precomputed_embeddings = emb
+
+    def is_image(self):
+        return True
+
+
+def _req(rid=RID, featureless=False, prefix=0, host=0, ends=(5000, IMAGE_END - 1)):
+    items = []
+    start = 100
+    for i, end in enumerate(ends):
+        items.append(_Item([(start, end)], feature=None if featureless else torch.zeros(2),
+                           hash=1000 + i if featureless else None))
+        start = end + 10
+    return SimpleNamespace(rid=rid, multimodal_inputs=SimpleNamespace(mm_items=items),
+                           prefix_indices=[0] * prefix, host_hit_length=host,
+                           _prefetch_registered_prefix_len=0)
+
+
+class _Tree:
+    def __init__(self, completed=None, ongoing=()):
+        self._completed = completed or {}
+        self._ongoing = set(ongoing)
+
+    def completed_prefetch_tokens(self, rid):
+        return self._completed.get(rid)
+
+    def prefetch_is_ongoing(self, rid):
+        return rid in self._ongoing
+
+
+class _Ipc:
+    def __init__(self):
+        self.sent = []
+
+    def send_output(self, obj, recv=None):
+        self.sent.append(obj)
+
+
+def _sched(told=None, held=(), probe=None, completed=None, ongoing=(), armed=True, wq=()):
+    cc = SimpleNamespace(page_size=PAGE)
+    if probe is not None:
+        cc._pdflip_probe_hit_pages = dict(probe)
+    s = SimpleNamespace(
+        _pdflip_store_told_armed=armed,
+        _pdflip_store_told=dict(told or {}),
+        _pdflip_store_held={r: object() for r in held},
+        tree_cache=_Tree(completed, ongoing),
+        cache_controller=cc,
+        ipc_channels=SimpleNamespace(send_to_tokenizer=_Ipc()),
+        waiting_queue=list(wq),
+        _pdflip_vision_origin_aborts=[],
+        _pdflip_vision_refused=set(),
+    )
+    return s
+
+
+# ---- Half 1: PROBE-WAIT ---------------------------------------------------------------
+
+def test_pdflip_12_340_waits_for_the_told_instead_of_staging(caplog):
+    """THE case: told outstanding, local 0, PP0's probe answered 660 pages = 42240."""
+    caplog.set_level(logging.INFO)
+    r = _req()
+    s = _sched(held=[RID], probe={RID: 660}, ongoing=[RID])
+    assert V.stage_skip_verdict(s, r) == (V.WAIT, 42240, "probe")
+    stage, wait = V.skip_cached(s, [r])
+    assert (stage, wait) == ([], [r]), "no tower ahead of the told"
+    assert any(m.startswith(f"W102 PdFlipVisionStage PROBE-WAIT rid={RID} promise=42240 src=probe "
+                            f"image_end={IMAGE_END}") for m in caplog.messages)
+    # next pass: the told is published (the read completed the probe's span)
+    s._pdflip_store_told[RID] = 42240
+    stage, wait = V.skip_cached(s, [r])
+    assert (stage, wait) == ([], []) and r._pdflip_vision_skip
+    assert V.pending_items(r) == [] and V.unstaged_items(r) == []
+
+
+def test_dormant_held_read_finished_during_the_flip_waits_on_its_completed_prefix():
+    """pdflip-14-492 (092806, 10:26:43-52): read done during the flip, told only at
+    the wake pass after the vision pass -- the completed prefix (61952) decides."""
+    r = _req(rid="pdflip-14-492", ends=(21757,))
+    s = _sched(held=["pdflip-14-492"], completed={"pdflip-14-492": 61952})
+    assert V.stage_skip_verdict(s, r) == (V.WAIT, 61952, "read")
+
+
+def test_rc16_paced_form_waits_between_read_ahead_and_admit():
+    """rc16 boot 121629, P PP0, pdflip-2-9: PROBE-HOLD pages=2684 (12:20:41), tower at
+    12:20:44 (load 231, encode 1749), then TOLD-PROBE / PACED-TOLD told=171776 and the
+    Admit; admitted 171776, images end ~21k. Between read-ahead and Admit the rid is in
+    ``pacing`` (not ``held``) and ``_pdflip_store_told`` is still empty."""
+    r = _req(rid="pdflip-2-9", ends=(21757,))
+    s = _sched(held=[])
+    s._pdflip_told_pacing = {"pdflip-2-9": SimpleNamespace(told=171776, absolute=True)}
+    assert V.stage_skip_verdict(s, r) == (V.WAIT, 171776, "paced")
+    s._pdflip_told_pacing = {}
+    s._pdflip_store_told["pdflip-2-9"] = 171776  # the Admit
+    assert V.stage_skip_verdict(s, r) == (V.SKIP, 171776, "told")
+
+
+def test_paced_fallback_admit_zero_stages():
+    r = _req(rid="pdflip-2-9", ends=(21757,))
+    s = _sched(held=[])
+    s._pdflip_told_pacing = {"pdflip-2-9": SimpleNamespace(told=8192, absolute=True)}
+    assert V.stage_skip_verdict(s, r)[0] == V.STAGE, "paced told short of the images"
+    s._pdflip_told_pacing = {}
+    s._pdflip_store_told["pdflip-2-9"] = 0  # PF fallback Admit
+    assert V.stage_skip_verdict(s, r) == (V.STAGE, 0, "told")
+
+
+def test_a_probe_not_answered_yet_waits_while_the_read_is_registered():
+    r = _req()
+    s = _sched(held=[RID], ongoing=[RID])
+    assert V.stage_skip_verdict(s, r) == (V.WAIT, 0, "probe-pending")
+
+
+def test_a_probe_short_of_the_images_stages_at_once():
+    r = _req()
+    s = _sched(held=[RID], probe={RID: 300}, ongoing=[RID])  # 19200 < 20556
+    assert V.stage_skip_verdict(s, r)[0] == V.STAGE
+    assert V.skip_cached(s, [r]) == ([r], [])
+
+
+def test_registration_head_counts_into_the_promise():
+    r = _req()
+    r._prefetch_registered_prefix_len = 8576
+    s = _sched(held=[RID], probe={RID: 190})  # 8576 + 12160 = 20736 >= 20556
+    assert V.stage_skip_verdict(s, r) == (V.WAIT, 20736, "probe")
+
+
+def test_no_told_coming_means_no_wait():
+    r = _req()
+    s = _sched(held=[], probe={RID: 660})
+    assert V.stage_skip_verdict(s, r)[0] == V.STAGE
+
+
+def test_never_skips_on_the_probe_only_on_the_told():
+    """Danger direction 'skip without read KV': the probe promised 42240, the read
+    ended short (told 19200 < image_end) -> the tower runs."""
+    r = _req()
+    s = _sched(told={RID: 19200}, held=[RID], probe={RID: 660})
+    assert V.stage_skip_verdict(s, r) == (V.STAGE, 19200, "told")
+    assert V.skip_cached(s, [r]) == ([r], []) and not getattr(r, "_pdflip_vision_skip", False)
+
+
+def test_switch_off_restores_the_old_verdict(monkeypatch):
+    monkeypatch.setenv(V.VISION_PROBE_WAIT_ENV, "0")
+    r = _req()
+    s = _sched(held=[RID], probe={RID: 660})
+    assert V.stage_skip_verdict(s, r)[0] == V.STAGE
+
+
+def test_a_refuted_skip_stages_next_instead_of_re_skipping():
+    r = _req(prefix=8000)
+    r._pdflip_vision_skip = True
+    assert V.skip_still_covered(None, r) is False
+    s = _sched(told={RID: 42240})
+    assert V.stage_skip_verdict(s, r) == (V.STAGE, 0, "refuted")
+
+
+# ---- the pass: PP0 holds, no verdict on the wire, followers hold too ------------------
+
+def _pass_sched(r, **kw):
+    s = _sched(wq=[r], **kw)
+    s.pdflip_dormant = False
+    s._pdflip_vision_inflight = None
+    s._pdflip_vision_runs = 0
+    s._pdflip_vision_arm_refusal = ""
+    s.ps = SimpleNamespace(pp_size=3, pp_rank=0)
+    VV.arm(s)
+    return s
+
+
+def test_vision_pass_holds_a_probe_wait_out_of_this_pass_and_puts_no_verdict_on_the_wire():
+    r = _req()
+    s = _pass_sched(r, held=[RID], probe={RID: 660})
+    with mock.patch.object(V, "run_rank_stage", side_effect=AssertionError("tower ran")):
+        parked = V.vision_rank_pass(s)
+    assert [x for _, x in parked] == [r] and s.waiting_queue == []
+    assert VV.take_verdicts(s) == [], "followers must not release what PP0 still decides"
+    V.vision_unpark(s, parked)
+    s._pdflip_store_told[RID] = 42240
+    with mock.patch.object(V, "run_rank_stage", side_effect=AssertionError("tower ran")):
+        parked = V.vision_rank_pass(s)
+    assert r._pdflip_vision_skip
+    assert [v.rid for v in VV.take_verdicts(s)] == [RID], "the skip goes out as PP0's verdict"
+
+
+def test_a_follower_never_runs_the_verdict_and_holds_until_pp0s_release():
+    r = _req(featureless=True)
+    f = SimpleNamespace(waiting_queue=[r], pdflip_dormant=False, ps=SimpleNamespace(pp_size=3, pp_rank=1))
+    VV.arm(f)
+    with mock.patch.object(V, "stage_skip_verdict", side_effect=AssertionError("follower decided")):
+        parked = VV.follower_pass(f)
+    assert [x for _, x in parked] == [r]
+    VV.absorb(f, VV.PdFlipVisionVerdict(rid=RID))
+    f.waiting_queue = [r]
+    assert VV.follower_pass(f) == []
+
+
+def test_wiring_only_pp0_runs_the_vision_pass():
+    from flliper.srt.managers import scheduler as S
+
+    src = inspect.getsource(S)
+    assert 'if getattr(self, "_pdflip_vision_rank_stage", False):' in src
+    assert "_vision_parked = vision_rank_pass(self)" in src
+    assert "_vision_parked = follower_pass(self)" in src
+    assert inspect.signature(V.arm_rank_stage)  # PP0-only arming (pp_rank != 0 -> False)
+    s = SimpleNamespace(ps=SimpleNamespace(pp_rank=1, tp_size=1))
+    assert V.arm_rank_stage(s, env={"FLLIPER_PDFLIP_VISION": "transient"}) is False
+
+
+# ---- Half 2: P-KNOWN-IMAGE, scheduler side --------------------------------------------
+
+def test_featureless_items_are_pending_and_hold_the_verdict():
+    r = _req(featureless=True)
+    assert len(K.featureless_items(r)) == 2
+    assert V.unstaged_items(r) == [] and len(V.pending_items(r)) == 2
+
+
+def test_known_images_inside_the_told_skip_without_any_pixels():
+    r = _req(featureless=True)
+    s = _sched(told={RID: 42240})
+    assert V.skip_cached(s, [r]) == ([], []) and r._pdflip_vision_skip
+    assert s.ipc_channels.send_to_tokenizer.sent == [], "no fetch for a covered image"
+    assert K.featureless_items(r) == []
+
+
+def test_known_images_outside_the_told_fetch_pixels_and_are_held(caplog):
+    caplog.set_level(logging.INFO)
+    r = _req(featureless=True)
+    s = _pass_sched(r, told={RID: 19200})
+    with mock.patch.object(V, "run_rank_stage", side_effect=AssertionError("staged without pixels")):
+        parked = V.vision_rank_pass(s)
+    sent = s.ipc_channels.send_to_tokenizer.sent
+    assert [type(x).__name__ for x in sent] == ["PdFlipMmFeatureFetchReq"] and sent[0].rid == RID
+    assert [x for _, x in parked] == [r], "held on PP0"
+    assert VV.take_verdicts(s) == [], "no verdict, the followers hold it too"
+    V.vision_unpark(s, parked)
+    with mock.patch.object(V, "run_rank_stage", side_effect=AssertionError("staged without pixels")):
+        V.vision_rank_pass(s)
+    assert len(s.ipc_channels.send_to_tokenizer.sent) == 1, "one fetch per request"
+    assert any(m.startswith("W102k PdFlipKnownImage FETCH rid=pdflip-12-340") for m in caplog.messages)
+
+
+def test_mutant_queue_verdicts_on_unstaged_items_would_release_a_featureless_request():
+    """Rank-agreement mutant: deciding the gate by pixels alone sends PP0's ok for a
+    request PP0 still holds -- the followers would admit it on their own."""
+    r = _req(featureless=True)
+    s = _pass_sched(r, told={RID: 19200})
+    VV.queue_verdicts(s, [r], V.unstaged_items, set())
+    assert [v.rid for v in VV.take_verdicts(s)] == [RID]  # the mutant's split
+    s2 = _pass_sched(_req(featureless=True), told={RID: 19200})
+    VV.queue_verdicts(s2, s2.waiting_queue, V.pending_items, set())
+    assert VV.take_verdicts(s2) == []  # what the code does
+
+
+def _answer(r, hashes=None, ok=True, n=None):
+    from flliper.srt.managers.io_struct import PdFlipMmFeaturesOutput
+
+    items = K.featureless_items(r)
+    feats = [torch.full((3,), float(i + 1)) for i in range(n if n is not None else len(items))]
+    hashes = hashes if hashes is not None else [int(it.hash) for it in items]
+    return PdFlipMmFeaturesOutput(rid=r.rid, ok=ok, detail="" if ok else "boom",
+                            payload=pickle.dumps({"features": feats, "hashes": hashes, "offsets": []}))
+
+
+def test_answer_with_equal_hashes_attaches_and_the_next_pass_stages():
+    r = _req(featureless=True)
+    s = _pass_sched(r, told={RID: 19200})
+    V.skip_cached(s, [r])
+    out = K.consume_at_origin(s, ["text-req", _answer(r)])
+    assert out == ["text-req"], "the answer never rides the chain"
+    assert K.featureless_items(r) == [] and len(V.unstaged_items(r)) == 2
+    assert V.skip_cached(s, [r]) == ([r], []), "staged like any image"
+
+
+def test_answer_with_another_hash_is_refused_never_encoded():
+    r = _req(featureless=True)
+    s = _sched(told={RID: 19200}, wq=[r])
+    V.skip_cached(s, [r])
+    assert K.apply_features(s, _answer(r, hashes=[1, 2])) == "refused"
+    assert all(it.feature is None for it in r.multimodal_inputs.mm_items)
+    assert s._pdflip_vision_origin_aborts and s._pdflip_vision_origin_aborts[0][1].startswith("W102k")
+    assert RID in s._pdflip_vision_refused
+
+
+def test_failed_or_misshaped_answers_are_refused():
+    r = _req(featureless=True)
+    s = _sched(told={RID: 19200}, wq=[r])
+    assert K.apply_features(s, _answer(r, ok=False)) == "refused"
+    r2 = _req(rid="pdflip-1-2", featureless=True)
+    s2 = _sched(told={"pdflip-1-2": 19200}, wq=[r2])
+    assert K.apply_features(s2, _answer(r2, n=1, hashes=[1000])) == "refused"
+
+
+def test_answer_after_the_told_covered_it_is_dropped_unneeded():
+    r = _req(featureless=True)
+    s = _sched(told={RID: 19200}, wq=[r])
+    V.skip_cached(s, [r])
+    s._pdflip_store_told[RID] = 42240
+    r._pdflip_vision_skip = True
+    assert K.apply_features(s, _answer(r)) == "unneeded" and not s._pdflip_vision_origin_aborts
+
+
+def test_fetch_without_answer_is_refused_after_the_deadline():
+    r = _req(featureless=True)
+    s = _sched(told={RID: 19200}, wq=[r])
+    assert K.request_features(s, r, now=100.0) == "sent"
+    assert K.request_features(s, r, now=100.0 + K.FETCH_DEADLINE_S - 1) == "waiting"
+    assert K.request_features(s, r, now=100.0 + K.FETCH_DEADLINE_S + 1) == "refused"
+    assert s._pdflip_vision_origin_aborts[0][0] == RID
+
+
+def test_mutant_admitting_a_featureless_request_on_an_uncovered_told_is_caught():
+    """Danger direction 'no output without rows': with told < image_end a known
+    image must never leave PP0's pass as staged / skipped."""
+    r = _req(featureless=True)
+    s = _sched(told={RID: 19200})
+    stage, wait = V.skip_cached(s, [r])
+    assert stage == [] and wait == [r] and not getattr(r, "_pdflip_vision_skip", False)
+    assert V.pending_items(r), "still owed: the gate keeps it on every rank"
+
+
+def test_wiring_origin_hook_and_tokenizer_handler():
+    from flliper.srt.managers import scheduler as S
+    from flliper.srt.managers import tokenizer_manager as T
+    from flliper.srt.managers.scheduler_components import request_receiver as R
+
+    assert "origin_consume_hook=(" in inspect.getsource(S)
+    assert "self.origin_consume_hook(recv_reqs)" in inspect.getsource(R)
+    src = inspect.getsource(T)
+    assert "(PdFlipMmFeatureFetchReq, self._handle_pdflip_mm_feature_fetch)" in src
+    assert "_item_cache = self.d_mm_item_cache or self.p_known_image_cache" in src
+
+
+def test_the_two_wire_objects_round_trip_msgpack():
+    from flliper.srt.managers import io_struct as IO
+
+    for obj in (IO.PdFlipMmFeatureFetchReq(rid=RID),
+                IO.PdFlipMmFeaturesOutput(rid=RID, ok=True, detail="x", payload=b"\x00\x01")):
+        back = IO.msgpack_decode(IO.msgpack_encode(obj))
+        assert type(back) is type(obj) and back.rid == RID
+    assert back.payload == b"\x00\x01" and back.ok
+
+
+# ---- Half 2: P-KNOWN-IMAGE, tokenizer side --------------------------------------------
+
+class _Proc:
+    def __init__(self, feats):
+        self.feats = feats
+        self.calls = 0
+
+    async def process_mm_data_async(self, **kw):
+        self.calls += 1
+        return SimpleNamespace(mm_items=[_Item([(1, 2)], feature=f) for f in self.feats])
+
+
+def test_fetch_features_answers_pixels_and_their_content_hashes():
+    from flliper.srt.managers.mm_utils import hash_feature
+
+    feats = [torch.arange(6, dtype=torch.float32), torch.ones(4)]
+    obj = SimpleNamespace(image_data=["data:image/png;base64,xx"], audio_data=None, text="t")
+    tm = SimpleNamespace(rid_to_state={RID: SimpleNamespace(obj=obj)}, mm_processor=_Proc(feats),
+                         max_req_input_len=10)
+    msg = asyncio.run(K.fetch_features(tm, RID))
+    assert msg.ok and msg.rid == RID
+    body = pickle.loads(msg.payload)
+    assert body["hashes"] == [hash_feature(f) for f in feats]
+    assert all(torch.equal(a, b) for a, b in zip(body["features"], feats))
+
+
+def test_fetch_features_without_a_held_request_is_a_named_no():
+    tm = SimpleNamespace(rid_to_state={}, mm_processor=_Proc([]), max_req_input_len=10)
+    msg = asyncio.run(K.fetch_features(tm, RID))
+    assert not msg.ok and "no request" in msg.detail and tm.mm_processor.calls == 0
+
+
+def test_arming_only_on_a_transient_vision_group_p():
+    sa = SimpleNamespace(tp_size=1, language_only=False, skip_tokenizer_init=False,
+                         keep_mm_feature_on_device=False)
+    mc = SimpleNamespace(is_multimodal=True)
+    env_p = {"FLLIPER_PDFLIP_GROUP": "P", "FLLIPER_PDFLIP_VISION": "transient"}
+    assert K.build_p_known_image_cache(server_args=sa, model_config=mc, mm_processor=object(),
+                                       env={"FLLIPER_PDFLIP_GROUP": "D"}) is None
+    assert K.armed_reason(server_args=sa, model_config=mc, mm_processor=object(),
+                          env=env_p) == "no Qwen-VL processor"
+    assert "not a transient" in K.armed_reason(server_args=sa, model_config=mc, mm_processor=object(),
+                                               env={"FLLIPER_PDFLIP_GROUP": "P"})
+    assert K.armed_reason(server_args=sa, model_config=mc, mm_processor=object(),
+                          env=dict(env_p, **{K.ENV: "0"})) == f"{K.ENV}=0"
+
+
+# ---- real Qwen processor of the NF checkpoint: hit without pixels, fetch equal ---------
+
+CKPT = os.environ.get("PDFLIP_TEST_NF_CKPT", "/spinning/qwen38-flash-next/ckpt")
+HAVE_CKPT = os.path.isfile(os.path.join(CKPT, "preprocessor_config.json")) and \
+    os.path.isfile(os.path.join(CKPT, "tokenizer.json"))
+
+
+def _png(color, size) -> str:
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGB", size, color).save(buf, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
+
+PROMPT = ("<|im_start|>user\nZwei Bilder:\n<|vision_start|><|image_pad|><|vision_end|> und "
+          "<|vision_start|><|image_pad|><|vision_end|> ?<|im_end|>\n<|im_start|>assistant\n")
+
+
+@unittest.skipUnless(HAVE_CKPT, f"no local NF checkpoint at {CKPT}")
+class RealProcessor(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        from flliper.srt.managers.multimodal_processor import get_mm_processor, import_processors
+        from flliper.srt.runtime_context import get_context
+        from flliper.srt.utils.hf_transformers.config import get_config
+        from flliper.srt.utils.hf_transformers.processor import get_processor
+
+        cls._override = get_context().override_server_args(base_gpu_id=0, mm_process_config={})
+        sa = cls._override.install()
+        import_processors("flliper.srt.multimodal.processors")
+        cls.mp = get_mm_processor(get_config(CKPT, trust_remote_code=True), sa,
+                                  get_processor(CKPT, trust_remote_code=True), "default")
+        cls.tok = cls.mp._tokenizer
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._override.restore()
+
+    def test_p_hit_leaves_without_pixels_and_the_fetch_brings_the_same_image(self):
+        from flliper.srt.managers.io_struct import GenerateReqInput
+        from flliper.srt.managers.schedule_batch import MultimodalInputs
+
+        imgs = [_png((200, 10, 10), (64, 48)), _png((10, 200, 10), (40, 72))]
+        sa = SimpleNamespace(tp_size=1, language_only=False, skip_tokenizer_init=False,
+                             keep_mm_feature_on_device=False)
+        env = {"FLLIPER_PDFLIP_GROUP": "P", "FLLIPER_PDFLIP_VISION": "transient"}
+        cache = K.build_p_known_image_cache(server_args=sa, model_config=SimpleNamespace(is_multimodal=True),
+                                            mm_processor=self.mp, env=env)
+        self.assertIsNotNone(cache)
+
+        def via(rid):
+            obj = GenerateReqInput(text=PROMPT, image_data=list(imgs), rid=rid)
+            return obj, asyncio.run(cache.process(obj=obj, prompt=PROMPT,
+                                                  compact_ids=self.tok(PROMPT)["input_ids"],
+                                                  max_req_input_len=10 ** 6))
+
+        _o1, first = via("pdflip-1-1")
+        ref_feats = [it.feature.clone() for it in first.mm_items]
+        with mock.patch.object(self.mp, "process_mm_data_async",
+                               side_effect=AssertionError("P's processor ran on a known image")):
+            obj2, second = via("pdflip-1-2")
+        self.assertTrue(all(it.feature is None for it in second.mm_items))
+        mm = MultimodalInputs.from_processor_output(copy.deepcopy(second))
+        req = SimpleNamespace(rid="pdflip-1-2", multimodal_inputs=mm, prefix_indices=[], host_hit_length=0)
+        self.assertEqual(len(K.featureless_items(req)), 2)
+        # PP0: told short of the images -> fetch; P's tokenizer answers from the held request
+        s = _sched(told={"pdflip-1-2": 0}, wq=[req])
+        self.assertEqual(V.skip_cached(s, [req]), ([], [req]))
+        tm = SimpleNamespace(rid_to_state={"pdflip-1-2": SimpleNamespace(obj=obj2)}, mm_processor=self.mp,
+                             max_req_input_len=10 ** 6)
+        msg = asyncio.run(K.fetch_features(tm, "pdflip-1-2"))
+        self.assertTrue(msg.ok, msg.detail)
+        self.assertEqual(K.apply_features(s, msg), "attached")
+        self.assertEqual(len(V.unstaged_items(req)), 2)
+        for it, ref in zip(req.multimodal_inputs.mm_items, ref_feats):
+            self.assertTrue(torch.equal(torch.as_tensor(it.feature), ref))
+
+
+# ---- front: an UNPRICED image request is D's admission's call, not P-only by rule ------
+
+def test_front_unpriced_image_request_is_not_p_only_by_rule():
+    """rc16 boot 121629: every D probe failed (KeyError '<rid>~probe'), 65 image requests went P-only by rule
+    (``route short -> long (P)``) and flipped P; P then read 171776 of 172072 (pdflip-2-9). An unpriced request
+    is routed to D's admission (S56r A1), which measures the image exactly (W123 -> P-only requeue)."""
+    from flliper.srt.pdflip import front as F
+
+    src = inspect.getsource(F.Front)
+    i_unpriced = src.index("route %s stands UNPRICED")
+    i_rule = src.index("request is prefilled on P by rule; its embeddings are")
+    assert i_unpriced < i_rule, "the unpriced branch must be decided before the P-only rule"
+    assert "_w102_unpriced_d = True" in src
+    assert ("p_only=(_verdict == VERDICT_STAGE and not _mm_cached and not _w102_unpriced_d)\n"
+            "                    or _probe_p_only,") in src
+    # an image MEASURED in the uncached tail stays P-only (R9 unchanged)
+    assert "_probe_p_only = bool(_xx is not None and getattr(_xx, \"image_in_tail\", False))" in src
+    assert F.vision_unpriced_to_d_on({}) is True
+    assert F.vision_unpriced_to_d_on({F.VISION_UNPRICED_TO_D_ENV: "0"}) is False

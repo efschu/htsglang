@@ -109,6 +109,12 @@ def armed_reason(*, server_args: Any, model_config: Any, mm_processor: Any) -> s
         return "not a tower-less multimodal group D"
     if server_args.language_only or server_args.skip_tokenizer_init:
         return "language_only / skip_tokenizer_init"
+    return hash_reason(server_args)
+
+
+def hash_reason(server_args: Any) -> str:
+    """Empty when the item hash is the content hash computed alike in every
+    process (shared by S66 P-KNOWN-IMAGE), else why not."""
     if server_args.keep_mm_feature_on_device:
         return "keep_mm_feature_on_device (the hash would be the GPU hash)"
     if envs.FLLIPER_MM_SKIP_COMPUTE_HASH.get():
@@ -141,7 +147,8 @@ def build_d_mm_item_cache(
 class DMmItemCache:
     """Per tokenizer process; touched only on its event loop."""
 
-    def __init__(self, *, processor: Any, max_entries: int):
+    def __init__(self, *, processor: Any, max_entries: int, tag: str = TAG):
+        self._tag = tag  # S66: P's known-image cache logs under its own name
         self._processor = processor
         self._max_entries = max(1, int(max_entries))
         self._fingerprint = processor.image_cache_fingerprint().encode("utf-8")
@@ -241,7 +248,7 @@ class DMmItemCache:
     def _log(self, *, obj: Any, verdict: str, n: int, t0: float) -> None:
         logger.info(
             "%s rid=%s verdict=%s images=%d ms=%.1f hits=%d misses=%d entries=%d",
-            TAG, obj.rid, verdict, n, (time.perf_counter() - t0) * 1000.0,
+            self._tag, obj.rid, verdict, n, (time.perf_counter() - t0) * 1000.0,
             self.hits, self.misses, len(self._entries),
         )
 

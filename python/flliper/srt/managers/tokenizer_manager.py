@@ -57,6 +57,7 @@ from flliper.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
     PdFlipLivenessHoldOutput,
+    PdFlipMmFeatureFetchReq,
     BaseBatchReq,
     BaseReq,
     BatchEmbeddingOutput,
@@ -320,6 +321,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     # D-MM-ITEM-CACHE-1007: set in maybe_init_d_mm_item_cache; None = the
     # processor runs for every image request, as before.
     d_mm_item_cache = None
+    # S66 P-KNOWN-IMAGE: set in maybe_init_d_mm_item_cache on a transient-vision
+    # group P; None = the processor runs for every image request, as before.
+    p_known_image_cache = None
     # FRONT-SEND-IDS-1007: set in init_pdflip_prompt_ids_digest; False = no
     # D-IDS shadow line.
     pdflip_prompt_ids_digest = False
@@ -547,6 +551,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             model_config=self.model_config,
             mm_processor=self.mm_processor,
         )
+        if self.d_mm_item_cache is None:
+            # S66 P-KNOWN-IMAGE: the same per-image values on a transient-vision
+            # group P -- PP0 fetches the pixels only when its verdict needs them
+            from flliper.srt.pdflip.p_known_image import build_p_known_image_cache
+
+            self.p_known_image_cache = build_p_known_image_cache(
+                server_args=self.server_args,
+                model_config=self.model_config,
+                mm_processor=self.mm_processor,
+            )
 
     def init_pdflip_prompt_ids_digest(self):
         from flliper.srt.pdflip.prompt_ids_digest import d_digest_armed
@@ -840,12 +854,31 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 (ActiveRanksOutput, self.update_active_ranks),
                 # LIVEPARK (14.10.): group D's held set -> the stream watchdogs
                 (PdFlipLivenessHoldOutput, self._handle_pdflip_liveness_hold),
+                # S66 P-KNOWN-IMAGE: PP0 needs the pixels of a known image after all
+                (PdFlipMmFeatureFetchReq, self._handle_pdflip_mm_feature_fetch),
             ]
         )
         self.init_communicators(self.server_args)
 
         self.sampling_params_class = SamplingParams
         self.signal_handler_class = SignalHandler
+
+    def _handle_pdflip_mm_feature_fetch(self, recv_obj: PdFlipMmFeatureFetchReq) -> None:
+        """S66 P-KNOWN-IMAGE (pdflip/p_known_image.py): run the processor for the
+        held request off the receive loop and answer PP0 (the request origin)."""
+        rid = str(recv_obj.rid or "")
+
+        async def _answer():
+            from flliper.srt.managers.io_struct import PdFlipMmFeaturesOutput
+            from flliper.srt.pdflip import p_known_image as _pki
+
+            try:
+                msg = await _pki.fetch_features(self, rid)
+            except Exception as exc:  # noqa: BLE001 -- PP0 refuses by name, never waits silently
+                msg = PdFlipMmFeaturesOutput(rid=rid, ok=False, detail=f"{type(exc).__name__}: {exc}")
+            self._dispatch_to_scheduler(msg)
+
+        asyncio.get_event_loop().create_task(_answer())
 
     def _handle_pdflip_liveness_hold(self, recv_obj: PdFlipLivenessHoldOutput) -> None:
         """LIVEPARK (14.10.): install the scheduler's held set; a parked D
@@ -1175,8 +1208,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                             "Encoder embedding not available, "
                             "falling back to local mm processing"
                         )
-                    if self.d_mm_item_cache is not None:
-                        mm_inputs = await self.d_mm_item_cache.process(
+                    _item_cache = self.d_mm_item_cache or self.p_known_image_cache
+                    if _item_cache is not None:
+                        mm_inputs = await _item_cache.process(
                             obj=obj,
                             prompt=(input_text or input_ids),
                             compact_ids=text_ids,

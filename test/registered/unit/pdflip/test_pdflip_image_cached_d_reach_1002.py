@@ -203,7 +203,9 @@ def test_wiring_the_route_forces_p_exactly_when_not_cached():
     assert ("if _verdict == VERDICT_STAGE and not _mm_cached and route != \"none\" "
             "and route != \"long\":") in src
     # S56: an image D's probe finds in the uncached tail is P-only too (SOLL R9)
-    assert "p_only=(_verdict == VERDICT_STAGE and not _mm_cached) or _probe_p_only" in src
+    # S66: an UNPRICED image request is D's admission's call (W123 requeue), not P-only by rule
+    assert ("p_only=(_verdict == VERDICT_STAGE and not _mm_cached and not _w102_unpriced_d)\n"
+            "                    or _probe_p_only,") in src
 
 
 # ---- the reprice at STORE-PRESENCE ------------------------------------------------------

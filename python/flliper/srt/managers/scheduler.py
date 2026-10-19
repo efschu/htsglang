@@ -255,6 +255,7 @@ from flliper.srt.pdflip import progress_beacon as _pdflip_beacon  # FP forward-p
 from flliper.srt.pdflip.d_lead_probe import build_d_lead_probe  # D-LEAD-MS-1007
 from flliper.srt.pdflip import d_extend_beacon as _pdflip_d_ext  # S49 D-EXTEND-BEACON (SOLL R6)
 from flliper.srt.pdflip.vision_verdict import PdFlipVisionVerdict  # H125f vision verdict on the chain
+from flliper.srt.pdflip.p_known_image import consume_at_origin as _pki_consume  # S66 P-KNOWN-IMAGE pixels at the origin
 from flliper.srt.pdflip.pp_loadback_verdict import PdFlipPpLoadbackVerdict  # LB-VERDICT-1014 on the chain
 from flliper.srt.pdflip import pp_loadback_verdict as _pdflip_lbv  # LBV-ADMIT (h16h 19:33:48Z)
 from flliper.srt.pdflip import form_a_post_admit as _pdflip_fa_post_admit  # S35: an admit reads CONTINUE on a Form A group
@@ -5145,6 +5146,13 @@ class Scheduler(
             origin_extra_reqs_hook=_ioa.origin_hook(
                 self._pdflip_intake_origin_aborts,
                 _lbv_compose(self, _vision_origin_aborts),
+            ),
+            # S66 P-KNOWN-IMAGE: the pixels P's tokenizer sends for a held known
+            # image are applied at the origin (PP0), never relayed down the chain
+            origin_consume_hook=(
+                (lambda reqs: _pki_consume(self, reqs))
+                if getattr(self, "_pdflip_vision_rank_stage", False)
+                else None
             ),
         )
 

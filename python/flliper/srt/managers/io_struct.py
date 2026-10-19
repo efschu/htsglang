@@ -1780,6 +1780,24 @@ class PdFlipLivenessHoldOutput(BaseReq, kw_only=True):
     held: List[str] = []
 
 
+class PdFlipMmFeatureFetchReq(BaseReq, kw_only=True):
+    """S66 P-KNOWN-IMAGE (pdflip/p_known_image.py): PP0 -> P's tokenizer,
+    one-way. P's tokenizer built ``rid`` from known images without pixels and
+    PP0's vision verdict needs the tower after all: run the processor on the
+    request the tokenizer still holds and answer :class:`PdFlipMmFeaturesOutput`."""
+
+
+class PdFlipMmFeaturesOutput(BaseReq, kw_only=True):
+    """S66 P-KNOWN-IMAGE: P's tokenizer -> PP0 (the request origin, taken out of
+    the intake there, never relayed). ``payload`` = pickle of
+    ``{"features": [...], "hashes": [...], "offsets": [...]}`` in item order;
+    ``ok`` False = refused by name (``detail``)."""
+
+    ok: bool = False
+    detail: str = ""
+    payload: bytes = b""
+
+
 class PdFlipParkWindowReqInput(BaseReq, kw_only=True):
     """PARK-WINDOW-GATE (29.09.): the front's open collect window, ``POST
     /pdflip/park_window`` to group D -- ``left_ms`` until the window's deadline
