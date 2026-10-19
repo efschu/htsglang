@@ -58615,7 +58615,7 @@
      "source": {
       "file": "managers/pdflip_store_told.py",
       "kind": "os.environ",
-      "line": 573
+      "line": 674
      }
     }
    },
@@ -64614,7 +64614,7 @@
      "source": {
       "file": "managers/pdflip_store_told.py",
       "kind": "os.environ",
-      "line": 493
+      "line": 594
      }
     }
    },
@@ -64661,7 +64661,7 @@
    "id": "FLLIPER_PDFLIP_FOLLOWER_REACH_TOLD",
    "kind": "env",
    "lesestellen": [
-    "managers/pdflip_store_told.py:2088"
+    "managers/pdflip_store_told.py:2191"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_FOLLOWER_REACH_TOLD",
@@ -64670,7 +64670,7 @@
    "source": {
     "file": "managers/pdflip_store_told.py",
     "kind": "os.environ",
-    "line": 2088,
+    "line": 2191,
     "tree": "nf"
    },
    "status": "harvested",
@@ -70749,7 +70749,7 @@
    "id": "FLLIPER_PDFLIP_PF_SETTLE_ACK_NOW",
    "kind": "env",
    "lesestellen": [
-    "managers/pdflip_store_told.py:566"
+    "managers/pdflip_store_told.py:667"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_PF_SETTLE_ACK_NOW",
@@ -70758,7 +70758,7 @@
    "source": {
     "file": "managers/pdflip_store_told.py",
     "kind": "os.environ",
-    "line": 566,
+    "line": 667,
     "tree": "nf"
    },
    "status": "harvested",
@@ -72222,7 +72222,7 @@
    "id": "FLLIPER_PDFLIP_P_HINT_REREAD",
    "kind": "env",
    "lesestellen": [
-    "managers/pdflip_store_told.py:342"
+    "managers/pdflip_store_told.py:443"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_P_HINT_REREAD",
@@ -72231,7 +72231,7 @@
    "source": {
     "file": "managers/pdflip_store_told.py",
     "kind": "os.environ",
-    "line": 342,
+    "line": 443,
     "tree": "nf"
    },
    "status": "harvested",
@@ -73992,7 +73992,7 @@
    "id": "FLLIPER_PDFLIP_S64_COMPLETION_READ_MIN",
    "kind": "env",
    "lesestellen": [
-    "managers/pdflip_store_told.py:366"
+    "managers/pdflip_store_told.py:467"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_S64_COMPLETION_READ_MIN",
@@ -74001,7 +74001,7 @@
    "source": {
     "file": "managers/pdflip_store_told.py",
     "kind": "os.environ",
-    "line": 366,
+    "line": 467,
     "tree": "nf"
    },
    "status": "harvested",
@@ -74157,6 +74157,37 @@
     "file": "pdflip/handback_claim.py",
     "kind": "os.environ",
     "line": 78,
+    "tree": "nf"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "os.environ"
+  },
+  "FLLIPER_PDFLIP_S80_STORE_HOLE_CENSUS": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"1\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "S80 STORE-HOLE (19.10., rc17 boot ..._7d93470b5e_1019_181004, pdflip-8-209): the wake probe above said ``have=85568 store_now=85568 -- the told stands`` and P recomputed 16482 tokens; the planner read it as \"P read before D's sleep flush published\" (D TP0 PUBLISH-SWEEP/#1470 FLUSH-PUBLISH ran in the same second). The logs say otherwise: D's flush had drained and reset (``#1470 FLUSH-PUBLISH in_flight_after=0``, ``#1068 RESET JOIN``) BEFORE P woke -- the flip order IS the publish witness of this read, the wake probe asks after it -- and the store's KV chain had ended at page 1337 since 18:26:34: 41 pages (85568..88192) were CLAIMED by D TP0 with share 0 and no writer (``ARENA-REF-CENSUS-CLAIM claimed=41 oldest=1378/.../pid1360/host-write/g3/open0`` from 18:27:00 to the flip reset), their owners TP1/TP2 had evicted their shares unbacked (``#1469 EVICT ... backuped=False host=False``, ``S74 CUT-L3-PUBLISH out=refused`` why parent_unbacked). No flush and no later read fills such a hole -- only a release of the orphan claim and a fresh write do (the D side, S74's line). The wake probe answered only \"how deep\", so the two classes looked alike. Now, when the store holds no more than the read, PP0 names the FIRST missing page from the shared arena header at the decision instant: class=orphan CLAIMED, no open writer -- a hole no writer can still fill (D-side defect, never a timing); class=in_flight CLAIMED with an open writer -- a publish still running at the wake: the flip-order witness was broken (WARNING; this is the read-before-publish class, by construction 0); class=absent no  ...",
+   "id": "FLLIPER_PDFLIP_S80_STORE_HOLE_CENSUS",
+   "kind": "env",
+   "lesestellen": [
+    "managers/pdflip_store_told.py:334"
+   ],
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_S80_STORE_HOLE_CENSUS",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "managers/pdflip_store_told.py",
+    "kind": "os.environ",
+    "line": 334,
     "tree": "nf"
    },
    "status": "harvested",
@@ -77233,7 +77264,7 @@
    "id": "FLLIPER_PDFLIP_TOLD_TREE_ANCHOR",
    "kind": "env",
    "lesestellen": [
-    "managers/pdflip_store_told.py:1197"
+    "managers/pdflip_store_told.py:1300"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_TOLD_TREE_ANCHOR",
@@ -77242,7 +77273,7 @@
    "source": {
     "file": "managers/pdflip_store_told.py",
     "kind": "os.environ",
-    "line": 1197,
+    "line": 1300,
     "tree": "nf"
    },
    "status": "harvested",
@@ -78167,7 +78198,7 @@
    "id": "FLLIPER_PDFLIP_W27_HELD_STOP",
    "kind": "env",
    "lesestellen": [
-    "managers/pdflip_store_told.py:2145"
+    "managers/pdflip_store_told.py:2248"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_W27_HELD_STOP",
@@ -78176,7 +78207,7 @@
    "source": {
     "file": "managers/pdflip_store_told.py",
     "kind": "os.environ",
-    "line": 2145,
+    "line": 2248,
     "tree": "nf"
    },
    "status": "harvested",
@@ -91177,28 +91208,28 @@
  "schema": "flliper.catalog/1",
  "stats": {
   "curated": 125,
-  "entries": 2877,
-  "envs": 1998,
+  "entries": 2878,
+  "envs": 1999,
   "explained": 310,
   "flags": 864,
-  "harvested": 1778,
+  "harvested": 1779,
   "trees": {
    "abweichung": 53,
    "beide": 2463,
    "nur_27b": 180,
-   "nur_nf": 216
+   "nur_nf": 217
   },
   "unexplained": 664
  },
- "tree_rev": "27b=0798c91fcd+nf=22747c1759",
+ "tree_rev": "27b=0798c91fcd+nf=b0bb6adb90",
  "trees": {
   "27b": {
    "entries": 2643,
    "rev": "0798c91fcd"
   },
   "nf": {
-   "entries": 2679,
-   "rev": "22747c1759"
+   "entries": 2680,
+   "rev": "b0bb6adb90"
   }
  },
  "warnungen": []
