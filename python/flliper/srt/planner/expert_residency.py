@@ -4574,6 +4574,16 @@ def plan_d_residency(
             owned_miss_rank_source = ("abgeleitet aus Paar %s und Kartenprobe-Link (S54, kein "
                                       "Rang-Record)" % "/".join("%g" % x for x in _miss_ms))
             _miss_rank_link = True
+        _x1_pooled = False
+        if _x1_scope == "sync" and _miss_rank is None:
+            # S54r (review 19.10.): sync weighs the slowest rank of the round,
+            # so it needs a price PER CARD (rank record or card-probe link).
+            # Without either both 3080s carry one pooled worker price and sync
+            # moves the misses (and the KV cut) onto the x4 card -- the 29.09.
+            # ``round`` metal loss (ENTSCHEIDUNGEN-0927 29.09. 08:55Z). This
+            # solve then holds x1 per worker (``workers``), named.
+            _x1_scope = "workers"
+            _x1_pooled = True
         _base_mode = owned_base_mode()
         _stated_base = list(base_rat)
         _base_lines: Tuple[str, ...] = ()
@@ -4670,6 +4680,7 @@ def plan_d_residency(
             ("forced_shares", list(_forced_shares) if _forced_shares else None),
             ("x1_ok", sol.x1_ok),
             ("x1_scope", _x1_scope),
+            ("x1_pooled_fallback", _x1_pooled),
             ("target_over_form_a_ms", round(max(sol.round_ms) - max(sol.base_round_ms), 3)
              if sol.round_ms else None),
             ("kv_tokens", int(kv_tokens)),
@@ -4750,6 +4761,14 @@ def plan_d_residency(
                  % (marker, label,
                     "kein gemessener H2D-Link je D-Rang (Kartenprobe)" if _ext_row_ms is None
                     else "FLLIPER_PDFLIP_OWNED_EXTEND_PER_ROUND=0"),))
+            if _x1_pooled:
+                cut_lines = cut_lines + (
+                    "%s FRACTION-SOLVE %s D-EIGENTUM X1 (S54r): %s=sync verlangt Fehlgriff-"
+                    "Kosten JE KARTE (Rang-Record oder Kartenprobe-Link); beide fehlen, die "
+                    "Kosten sind das Paar %s -- dieser Solve haelt x1 je Worker (workers): "
+                    "ein gepoolter Worker-Preis schob unter round/sync die Misses auf die "
+                    "x4-Karte (29.09.)"
+                    % (marker, label, OWNED_X1_ENV, "/".join("%g" % x for x in _miss_ms)),)
             if sol.guard or sol.stayed:
                 _g = dict(sol.guard)
                 cut_lines = cut_lines + (
