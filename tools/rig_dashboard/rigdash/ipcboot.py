@@ -260,6 +260,8 @@ def _rank_gpu_rates(ring, keys, g, t0, t1, wide_only: bool = False) -> Dict[str,
                 continue
             if wide_only and not activity.is_wide(_d(b, a, "pnew"), _d(b, a, "pchunks")):
                 continue                    # a 1-token admit extend is no prefill speed (WIDE_MIN_TOK)
+            if activity.is_untimed(a, b):
+                continue                    # 19.10.: counted without a duration (MIXED-D) -- no compute time, stale last.t
             n += _d(b, a, "pnew") or 0.0
             ms += _d(b, a, "pcomp") or 0.0
             if (_d(b, a, "pchunks") or 0) == 1 and b.get("plast_conly") and b.get("plast_new"):
@@ -277,7 +279,9 @@ def _burst_dict(ring, keys, g, b) -> dict:
     gpu = min((r["tps"] for r in ranks.values()), default=None) if b["tok"] >= activity.MIN_RATE_TOK else None
     exact = bool(ranks) and all(r.get("exact") for r in ranks.values())
     return {"tokens": b["tok"], "chunks": b["n"], "cached": b["cached"], "mean_chunk": (b["tok"] / b["n"]) if b["n"] else None,
-            "wall_s": b["wall_s"], "wall_tps": b["rate"], "ranks": ranks, "tps_gpu": gpu, "tps_gpu_exact": exact,
+            "wall_s": b["wall_s"],
+            "wall_tps": (b["tok_timed"] / b["wall_s"]) if b["tok_timed"] >= activity.MIN_RATE_TOK and b["wall_s"] > 0
+            else None, "ranks": ranks, "tps_gpu": gpu, "tps_gpu_exact": exact,
             "tps": b["rate"],
             "t0": b["s"], "t1": b["e"]}
 
@@ -551,7 +555,9 @@ def timeline_view(m: "activity.Model", live: bool, awake_now, now: float, boot_t
                 # (n, tokens) and the rate is "-" when the segment holds nothing wide
                 wtok = activity.spread(m.dwide, x["s"], 1, max(1e-3, x["e"] - x["s"]))[0]
                 ad = activity.admit_in(m.dadmit, x["s"], x["e"])
-                x["tps"] = wtok / max(1e-3, x["e"] - x["s"]) if wtok > 0 else None
+                # 19.10. (rc18 20:49Z "D prefill/extend 2,544 tok/s"): the timed wide chunks at compute time, not the
+                # tokens spread over a wall clock built from the ranks' flush times (activity.burst_rate)
+                x["tps"] = activity.compute_rate(m.dwide, x["s"], x["e"]) if wtok > 0 else None
                 if ad["n"]:
                     x["admit_n"], x["admit_tok"] = ad["n"], ad["tok"]
         if x.get("co") in src:

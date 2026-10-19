@@ -109,9 +109,15 @@ class TestFlipBootUnchanged(unittest.TestCase):
     (e5a274ddb4) produced -- hashes taken from that release, EXCEPT the D segments of Auftrag 880 (Nutzer 03.10. "6 token/s
     prefill in D???"): a D segment whose chunks are all narrower than activity.WIDE_MIN_TOK (admit extends of 25..92 tokens)
     now has tps None and carries admit_n/admit_tok.  Verified by diff against the base release: 10 of 125 segments changed (all D: 8x tps 1..181 tok/s -> None, e.g. a "1.0 tok/s" one),
-    admit keys added, tps of a segment with a wide chunk 80,9 -> 80,5 (no Dual/co key, no P/dec/flip segment touched).  Hashes below are the 880 state."""
-    SEGS = "9a04f69aa116537ccb709ec35b8f77bf01d919e433a63c9a91240b62b29e9823"      # 07.10. English texts: only the strings why/src/reqs_src changed (verified by structured diff against 07c20a35e5, no key/number changed)
-    TIMELINE = "1502f91e5bc7d65d4594211de32879354a60f436b8fc5a38520809e3e7d64710"
+    admit keys added, tps of a segment with a wide chunk 80,9 -> 80,5 (no Dual/co key, no P/dec/flip segment touched).  Hashes below are the 880 state.
+
+    19.10. (D prefill rate, rc18 20:49Z "2,544 tok/s"): a D segment's tps is the timed wide chunks at compute time
+    (activity.compute_rate: tokens / their own durations), no longer the tokens over the segment's wall incl. the
+    sample fill-in.  Verified by structured diff against 19393ee2cb: 24 of 125 segments changed, all D, only the key
+    tps (62,9 -> 64,5 ... 352,5 -> 452,2; never None, never lower), every other key and the rest of the timeline
+    unchanged; y8c has no untimed chunk (its rankstats predate MIXED-D)."""
+    SEGS = "95697829d49f4b78ad40a03874791ba7a88bcd31e8b0b47789ce3ed5d322a53a"      # 19.10. D tps at compute time (was 9a04f69a..., 07.10. English texts)
+    TIMELINE = "5e1ec9e1750dd5b8f71c7abe312fec647388e5b75bf18af69539dc4a09e7d15e"
 
     def test_flip_boot_bytes(self):
         r = replay_boot("y8c_0cf3")
