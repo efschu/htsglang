@@ -42,7 +42,17 @@ def _d_prefilling(tokens):
     # D-EXTEND-BEACON says so; only then does R6 count it (a D that has not begun it holds the set instead,
     # test_pdflip_s49_r6_nur_echt_laufend_1018). Same fixture form as S49's _d_begins_every_grant.
     from flliper.srt.pdflip import d_extend_beacon as _dxb
-    f._d_ext_reading = lambda: {_dxb.rid_key(r): time.time_ns() for r in list(f._d_pf_book()._rows)}
+    def _read():
+        # S56 (SOLL R6 + R11): D reports its REAL rest (here the granted tokens: nothing of them was cached) and the
+        # legs can move to P (D-prefill legs in the lookahead) -- only then R6 counts them
+        rows = f._d_pf_book()._rows
+        f._rvp_state()
+        for r in list(rows):
+            f.__dict__.setdefault("_d_prefill_legs", {})[r] = time.time()
+            f._leg2_lookahead.add(r)
+        return {_dxb.rid_key(r): (time.time_ns(), int(rows[r].tokens)) for r in list(rows)}
+
+    f._d_ext_reading = _read
     return f
 
 

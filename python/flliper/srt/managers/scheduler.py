@@ -198,6 +198,8 @@ from flliper.srt.managers.io_struct import (
     VramBudgetReqOutput,
     PdFlipLaneFloorReqInput,
     PdFlipLivenessHoldOutput,
+    PdFlipMatchProbeReqInput,
+    PdFlipMatchProbeReqOutput,
     PdFlipParkRunningReqInput,
     PdFlipParkWindowReqInput,
     sock_send,
@@ -4156,6 +4158,7 @@ class Scheduler(
                 (SessionCheckpointReqInput, self.handle_session_checkpoint),
                 (VramBudgetReqInput, self.handle_vram_budget),
                 (PdFlipParkRunningReqInput, self.handle_pdflip_park_running),
+                (PdFlipMatchProbeReqInput, self.handle_pdflip_match_probe),
                 (PdFlipLaneFloorReqInput, self.handle_pdflip_lane_floor),
                 (PdFlipParkWindowReqInput, self.handle_pdflip_park_window),
                 (PdFlipVisionVerdict, self.handle_pdflip_vision_verdict),
@@ -8722,6 +8725,101 @@ class Scheduler(
             self.chunked_prefill_size,
             dormant=bool(getattr(self, "pdflip_dormant", False)),
         )
+
+    def handle_pdflip_match_probe(self, recv_req: PdFlipMatchProbeReqInput) -> PdFlipMatchProbeReqOutput:
+        """S56 D-MATCH-PROBE (pdflip/d_match_probe.py; user 19.10. "alle zahlen liegen doch schwarz auf weiß vor"):
+        how much of this prompt the group holds NOW. Every TP rank runs it at the same point of its intake (the
+        control request is broadcast like any other) and pads the image items as ``_handle_generate_request_impl``
+        does (a broadcast mm process needs every rank). S56r (review A2): the admission's usable prefix is READ, not
+        matched -- ``d_match_probe.peek_admission_match`` walks the tree with the admission's key and rules and writes
+        nothing (``tree_cache.match_prefix`` splits nodes, moves the chain to MRU, re-stamps access times, counts and
+        logs under the probe's rid). TP0's answer reaches the tokenizer; it is the group's number on a Form A group
+        (the workers adopt the host's depth, H98) or a symmetric host tier, and refused by name otherwise. S56r A3:
+        the probes the tokenizer coalesced (``batch``) are answered in this same round, in order."""
+        from flliper.srt.managers.io_struct import unwrap_from_pickle, wrap_as_pickle
+
+        out = self._pdflip_match_probe_one(
+            recv_req.rid, recv_req.input_ids, recv_req.mm_inputs, recv_req.extra_key, recv_req.tokenize_ms)
+        batch = getattr(recv_req, "batch", None)
+        if batch is not None:
+            answers = []
+            for it in unwrap_from_pickle(batch) or ():
+                o = self._pdflip_match_probe_one(it.get("rid"), it.get("input_ids"), it.get("mm_inputs"),
+                                                 it.get("extra_key"), it.get("tokenize_ms"))
+                answers.append({f: getattr(o, f) for f in (
+                    "rid", "success", "message", "input_ids", "device_tokens", "host_tokens", "key_match_depth",
+                    "mm_spans", "handle_ms", "tokenize_ms")})
+            out.batch = wrap_as_pickle(answers)
+        return out
+
+    def _pdflip_match_probe_one(self, rid, input_ids, mm_inputs, extra_key, tokenize_ms) -> PdFlipMatchProbeReqOutput:
+        """S56/S56r: one probe of ``handle_pdflip_match_probe`` -- padding like the intake, then the READ-ONLY peek."""
+        import types
+
+        from flliper.srt.managers.io_struct import unwrap_from_pickle
+        from flliper.srt.managers.tp_match_floor import form_a_follow_active, this_rank_follows
+        from flliper.srt.pdflip import d_match_probe as _dmp
+        from flliper.srt.sampling.sampling_params import SamplingParams
+
+        t0 = time.perf_counter()
+        try:
+            ids = array("q", input_ids or ())
+            spans: List[List[int]] = []
+            mm = unwrap_from_pickle(mm_inputs) if mm_inputs is not None else None
+            if mm is not None:
+                image_inputs = self._get_multimodal_inputs(mm)
+                req = Req(
+                    str(rid),
+                    None,
+                    ids,
+                    SamplingParams(max_new_tokens=1),
+                    vocab_size=self.model_config.vocab_size,
+                    extra_key=extra_key,
+                )
+                _recv = types.SimpleNamespace(input_ids=input_ids)
+                if (
+                    not self._try_apply_padded_mm_input_ids(_recv, req, image_inputs)
+                    and self.pad_input_ids_func
+                ):
+                    req.origin_input_ids = array(
+                        "q", self.pad_input_ids_func(req.origin_input_ids, image_inputs)
+                    )
+                ids = array("q", req.origin_input_ids)
+                spans = _dmp.mm_spans(image_inputs)
+            n = len(ids)
+            dev = host = key_depth = 0
+            tc = getattr(self, "tree_cache", None)
+            if n > 1 and tc is not None:
+                # whose number is the group's admission depth (R11 / Rang-Einigkeit): the Form A host's (H98), or any
+                # rank's on a symmetric host tier; else the RU MIN over the ranks decides, which this rank cannot read
+                asym = bool(getattr(tc, "_hicache_prefetch_symmetric", lambda: False)())
+                if asym and not form_a_follow_active():
+                    return PdFlipMatchProbeReqOutput(
+                        rid=rid, success=False,
+                        message="group_min_needed: asymmetric host tier without Form A -- the admission takes the "
+                                "RU MIN over the ranks, one rank's walk is not the group's number",
+                        handle_ms=(time.perf_counter() - t0) * 1000.0,
+                    )
+                if not this_rank_follows():  # a Form A worker's anchors are bookkeeping: it adopts the host's depth
+                    # the admission's key: the whole ids, limit = _compute_max_prefix_len (n - 1)
+                    dev, host, key_depth = _dmp.peek_admission_match(tc, ids, extra_key, n - 1)
+            return PdFlipMatchProbeReqOutput(
+                rid=rid,
+                success=True,
+                input_ids=ids,
+                device_tokens=int(dev),
+                host_tokens=int(host),
+                key_match_depth=int(key_depth),
+                mm_spans=spans,
+                handle_ms=(time.perf_counter() - t0) * 1000.0,
+                tokenize_ms=float(tokenize_ms or 0.0),
+            )
+        except Exception as e:  # noqa: BLE001 -- the front names a failed probe; the scheduler never dies of one
+            logger.warning("PDFLIP D-MATCH-PROBE FAILED rid=%s %s: %s", rid, type(e).__name__, e)
+            return PdFlipMatchProbeReqOutput(
+                rid=rid, success=False, message=f"{type(e).__name__}: {str(e)[:200]}",
+                handle_ms=(time.perf_counter() - t0) * 1000.0,
+            )
 
     def handle_ple_prefetch_hint(self, recv_req: PlePrefetchHintReqInput) -> None:
         """fnFL2 H43: the front's hint -- a request that will come to this
@@ -19593,8 +19691,12 @@ class Scheduler(
                 skip=batch.pdflip_skip_extend,
             )
         if self.pdflip_d_ext_beacon is not None and batch.forward_mode.is_extend():
-            # S49 D-EXTEND-BEACON: the front's R6 counts a D prefill only from here on (SOLL R6, user 18.10.)
-            self.pdflip_d_ext_beacon.note_extend(rids=[req.rid for req in batch.reqs])
+            # S49 D-EXTEND-BEACON: the front's R6 counts a D prefill only from here on (SOLL R6, user 18.10.);
+            # S56: with D's REAL rest of each request (what this batch and the later chunks still compute)
+            self.pdflip_d_ext_beacon.note_extend(
+                rids=[req.rid for req in batch.reqs],
+                rests=[_pdflip_d_ext.req_rest(req) for req in batch.reqs],
+            )
 
         # #861 fix (b): a request admitted on a cached prefix whose DRAFT rows
         # nothing wrote must not speculate over them. Here, and not in the

@@ -114,7 +114,11 @@ class SollR1toR9(unittest.TestCase):
         self.assertEqual(f._d_carried_tokens(), 1426, "the X-SUM price of the kurz path is unchanged")
         self.assertEqual(f._decode_collect(now), "hold", "R4: the big member waits its T_halb")
         self.assertEqual(f.counters["set_reroute_p"], 0)
-        f._d_ext_reading = lambda: {dxb.rid_key("k"): _time.time_ns()}   # D began the extend of "k"
+        # D began the extend of "k" and reports its REAL rest (S56); the leg can move to P (lookahead open)
+        f._rvp_state()
+        f.__dict__.setdefault("_d_prefill_legs", {})["k"] = now
+        f._leg2_lookahead.add("k")
+        f._d_ext_reading = lambda: {dxb.rid_key("k"): (_time.time_ns(), 1426)}
         self.assertEqual(f._dc_carried_running(), 1426)
         self.assertEqual(f._decode_collect(_time.time()), "P")
         self.assertEqual(f.counters["set_reroute_p"], 1)
@@ -145,3 +149,42 @@ class SollR1toR9(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_r6_s56_the_running_rest_is_ds_real_number_and_only_if_it_moves(monkeypatch):
+    """R6 (S56, NF rc15 19.10., user "um 9:20:26 wird nur EIN request prefillt und zwar 4492 neue token"): the rest of
+    the running D prefill in S is D's REAL rest (D-EXTEND-BEACON v2), not the front's arrival price, and it counts only
+    when the REROUTE really moves it to P. rc15: 4492 + D's 977 = 5469 < X=6216 -> no flip (R7); with a real big
+    rest (3000) R6 still reroutes and the prefill is handed to P."""
+    import time as _time
+
+    from test_pdflip_s56_r6_phantom_dprefill_1019 import _fx, _grant_611, _halb_612
+    from test_pdflip_set_scheduler_1017 import _on
+
+    _on(monkeypatch)
+    now = _time.time()
+    f = _fx(now)
+    _grant_611(f, now, rest=977)
+    _halb_612(f, now)
+    assert f._decode_collect(now) == "hold" and f.counters["set_reroute_p"] == 0
+    f = _fx(now)
+    _grant_611(f, now, rest=3000)
+    _halb_612(f, now)
+    assert f._decode_collect(now) == "P" and f.counters["set_reroute_p"] == 1 and f.counters["r6_redirected"] == 1
+    f = _fx(now)
+    _grant_611(f, now, rest=3000, redirectable=False)
+    _halb_612(f, now)
+    assert f._decode_collect(now) == "hold" and f.counters["set_reroute_p"] == 0
+
+
+def test_r9_s56_an_image_in_the_uncached_tail_is_p_only():
+    """R9 (S56): D's probe finds an image past the covered prefix (D has no tower, W123) -> P-only, at P's number."""
+    import numpy as _np
+
+    from flliper.srt.pdflip import d_match_probe as _dmp
+
+    a = _dmp.ProbeAnswer(ids=_np.arange(85590, dtype=_np.int32), device_tokens=83712, host_tokens=0,
+                         key_match_depth=83712, mm_spans=((84000, 84882),))
+    p = _dmp.exact_price(a, 79872)
+    assert p.image_in_tail and _dmp.class_uncached(p) == 5718
+    assert pp.classify_arrival(_dmp.class_uncached(p), X, HALF, p.image_in_tail) == pp.CLASS_P_ONLY

@@ -201,7 +201,8 @@ class FrontBody(unittest.TestCase):
         leg2 = inspect.getsource(self.Front.leg2)
         self.assertIn("_d_body = Front._send_ids_body(self, rid, payload, pending, single_prefill)", leg2)
         self.assertIn("json=with_cached_tier_ask(_d_body, request.path)", leg2)
-        self.assertIn("Front._send_ids_note(self, rid, path, payload, c)",
+        # S56: the FRONT's own count rides the send-ids note (D's probe ids price the class, never the leg)
+        self.assertIn("Front._send_ids_note(self, rid, path, payload, _c_front)",
                       inspect.getsource(self.Front._x_exact_price))
 
 

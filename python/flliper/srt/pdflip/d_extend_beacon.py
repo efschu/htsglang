@@ -26,6 +26,15 @@ rank's record is the group's (the front takes the union).
 Switch ``FLLIPER_PDFLIP_D_EXTEND_BEACON`` (default on). Off: no file, and the front's R6 counts the book as before.
 On without a readable file (no arena dir, D not yet written): nothing is proven running, nothing counts (the user's
 rule), named by a counter.
+
+S56 (NF rc15 19.10., user: "um 9:20:26 wird nur EIN request prefillt und zwar 4492 neue token"; SOLL R6 + R11):
+VERSION 2 carries D's REAL REST. The front counted a running D prefill into R6's S with its own arrival price
+(pdflip-6-11: 3513), while D matched 98240 of 99217 and had 977 to compute (``#969 EXTENT ... 977``, X-GATE
+uncached=977) -- S=8005 > X=6216 flipped for 4492 tokens. Every extend batch of a rid now writes
+``(rid_key, t_first_extend_ns, rest, seq)``: ``rest`` = the tokens of the request D has NOT computed when the batch
+starts (``len(origin_input_ids) + len(output_ids) - len(prefix_indices)``, the in-flight chunk included), ``seq`` the
+rank's write counter (the newest record of a rid wins). The ranks only report the number; the front decides (R11).
+Several ranks: the newest record per rank, the MAX over ranks (deterministic, independent of the file order).
 """
 from __future__ import annotations
 
@@ -36,7 +45,7 @@ import mmap
 import os
 import struct
 import time
-from typing import Callable, Dict, Iterable, Optional
+from typing import Callable, Dict, Iterable, Optional, Tuple
 
 ENV = "FLLIPER_PDFLIP_D_EXTEND_BEACON"
 SUBDIR = "d_extend"
@@ -44,9 +53,12 @@ SUBDIR = "d_extend"
 _HDR_FMT = "<IIIqq"
 _HDR_SIZE = struct.calcsize(_HDR_FMT)
 _MAGIC = 0x44455842  # "DEXB"
-_VERSION = 1
-#: one record: rid key (u64, 0 = empty), extend start (epoch ns)
-_REC_FMT = "<Qq"
+_VERSION = 2
+#: one record (v2): rid key (u64, 0 = empty), FIRST extend start (epoch ns), rest tokens D has not computed at the
+#: batch start (-1 = not known), the rank's write counter (newest record of a key wins)
+_REC_FMT = "<Qqqq"
+#: v1 record (read only): rid key, extend start
+_REC_FMT_V1 = "<Qq"
 _REC_SIZE = struct.calcsize(_REC_FMT)
 #: records kept: a grant lives seconds to minutes, D starts far fewer than this many prefills in that time
 SLOTS = 1024
@@ -84,6 +96,9 @@ class DExtendBeacon:
         self._clock_ns = clock_ns
         self._slots = int(slots)
         self._armed: "collections.OrderedDict[str, None]" = collections.OrderedDict()
+        #: S56: rid -> its FIRST extend start (ns) while it keeps extending (chunked prefill: every chunk re-reports
+        #: the rest under the same start); bounded like ``_armed``
+        self._live: "collections.OrderedDict[str, int]" = collections.OrderedDict()
         self._head = 0
         self.mm = None
         size = _HDR_SIZE + self._slots * _REC_SIZE
@@ -106,24 +121,57 @@ class DExtendBeacon:
         while len(self._armed) > ARMED_CAP:
             self._armed.popitem(last=False)
 
-    def note_extend(self, *, rids: Iterable[str]) -> None:
-        """An extend batch runs: record every rid of it that has not extended since its arrival."""
+    def note_extend(self, *, rids: Iterable[str], rests: Optional[Iterable[int]] = None) -> None:
+        """An extend batch runs: record every rid of it. A rid's FIRST extend after its arrival stamps its start; every
+        later extend (the next chunk) re-reports the rest under that start. ``rests`` (S56, parallel to ``rids``): the
+        tokens D has not computed for each rid when this batch starts; None = not known (-1 in the record)."""
         if self.mm is None:
             return
         now = None
-        for rid in rids:
-            if rid not in self._armed:
+        rest_list = list(rests) if rests is not None else None
+        for i, rid in enumerate(rids):
+            if rid in self._armed:
+                del self._armed[rid]
+                if now is None:
+                    now = int(self._clock_ns())
+                t_first = now
+                self._live.pop(rid, None)
+                self._live[rid] = t_first
+                while len(self._live) > ARMED_CAP:
+                    self._live.popitem(last=False)
+            elif rid in self._live:
+                t_first = self._live[rid]
+            else:
                 continue
-            del self._armed[rid]
-            if now is None:
-                now = int(self._clock_ns())
+            rest = -1
+            if rest_list is not None and i < len(rest_list):
+                try:
+                    rest = max(0, int(rest_list[i]))
+                except (TypeError, ValueError):
+                    rest = -1
             try:
                 off = _HDR_SIZE + (self._head % self._slots) * _REC_SIZE
-                struct.pack_into(_REC_FMT, self.mm, off, rid_key(rid), now)
                 self._head += 1
+                struct.pack_into(_REC_FMT, self.mm, off, rid_key(rid), int(t_first), int(rest), int(self._head))
                 struct.pack_into("<q", self.mm, 12, self._head)
             except Exception:  # noqa: BLE001
                 return
+
+    def note_done(self, *, rid: str) -> None:
+        """The rid left this rank (finished, aborted): no later extend re-reports it."""
+        self._live.pop(rid, None)
+        self._armed.pop(rid, None)
+
+
+def req_rest(req) -> int:
+    """S56: the tokens of ``req`` D has not computed at a batch start -- its whole sequence (prompt + output, a park
+    resume included) minus the prefix the batch extends from (cached + earlier chunks). Never raises; -1 = unknown."""
+    try:
+        total = len(req.origin_input_ids) + len(getattr(req, "output_ids", None) or ())
+        pre = getattr(req, "prefix_indices", None)
+        return max(0, int(total) - (len(pre) if pre is not None else 0))
+    except Exception:  # noqa: BLE001
+        return -1
 
 
 def build(*, group: str, tag: str = "", env=None) -> Optional[DExtendBeacon]:
@@ -136,36 +184,74 @@ def build(*, group: str, tag: str = "", env=None) -> Optional[DExtendBeacon]:
     return DExtendBeacon(os.path.join(d, f"D-pid{os.getpid()}.bin"))
 
 
-def read_group(directory: str, group: str, sid: int,
-               session_of: Optional[Callable[[int], Optional[int]]] = None) -> Optional[Dict[int, int]]:
-    """``{rid_key: newest extend start ns}`` over the group's LIVE ranks (pid in the group's session); None when no
-    such file is readable (no channel -- nothing is proven running)."""
+def read_group_full(directory: str, group: str, sid: int,
+                    session_of: Optional[Callable[[int], Optional[int]]] = None
+                    ) -> Optional[Dict[int, Tuple[int, int]]]:
+    """``{rid_key: (first extend start ns, rest)}`` over the group's LIVE ranks (pid in the group's session); None when
+    no such file is readable (no channel -- nothing is proven running). Per rank the NEWEST record of a key (its write
+    counter); over ranks the larger start, then the larger rest (deterministic: the file order never decides).
+    ``rest`` -1 = the rank did not report one (a v1 file)."""
     if not directory or not sid:
         return None
     if session_of is None:
         from flliper.srt.pdflip.front_health import pid_session as session_of
-    out: Dict[int, int] = {}
+    out: Dict[int, Tuple[int, int]] = {}
     seen = False
-    for path in glob.glob(os.path.join(directory, f"{group}-pid*.bin")):
+    for path in sorted(glob.glob(os.path.join(directory, f"{group}-pid*.bin"))):
         try:
             with open(path, "rb") as fh:
                 raw = fh.read()
             magic, ver, slots, _head, pid = struct.unpack_from(_HDR_FMT, raw, 0)
         except Exception:  # noqa: BLE001
             continue
-        if magic != _MAGIC or ver != _VERSION or session_of(int(pid)) != int(sid):
+        if magic != _MAGIC or ver not in (1, _VERSION) or session_of(int(pid)) != int(sid):
             continue
         seen = True
-        n = min(int(slots), max(0, (len(raw) - _HDR_SIZE) // _REC_SIZE))
-        for key, t_ns in struct.iter_unpack(_REC_FMT, raw[_HDR_SIZE:_HDR_SIZE + n * _REC_SIZE]):
-            if key and t_ns > out.get(key, 0):
-                out[key] = int(t_ns)
+        own: Dict[int, Tuple[int, int, int]] = {}  # key -> (seq, t_first, rest)
+        if ver == 1:
+            rs = struct.calcsize(_REC_FMT_V1)
+            n = min(int(slots), max(0, (len(raw) - _HDR_SIZE) // rs))
+            for key, t_ns in struct.iter_unpack(_REC_FMT_V1, raw[_HDR_SIZE:_HDR_SIZE + n * rs]):
+                if key and (key not in own or t_ns > own[key][1]):
+                    own[key] = (0, int(t_ns), -1)
+        else:
+            n = min(int(slots), max(0, (len(raw) - _HDR_SIZE) // _REC_SIZE))
+            for key, t_ns, rest, seq in struct.iter_unpack(_REC_FMT, raw[_HDR_SIZE:_HDR_SIZE + n * _REC_SIZE]):
+                if key and (key not in own or seq > own[key][0]):
+                    own[key] = (int(seq), int(t_ns), int(rest))
+        for key, (_seq, t_ns, rest) in own.items():
+            prev = out.get(key)
+            if prev is None or (t_ns, rest) > prev:
+                out[key] = (t_ns, rest)
     return out if seen else None
 
 
-def started(reading: Optional[Dict[int, int]], rid: str, t_grant_s: float) -> bool:
+def read_group(directory: str, group: str, sid: int,
+               session_of: Optional[Callable[[int], Optional[int]]] = None) -> Optional[Dict[int, int]]:
+    """``{rid_key: newest extend start ns}`` (the pre-S56 reading, kept for its readers)."""
+    full = read_group_full(directory, group, sid, session_of)
+    return None if full is None else {k: v[0] for k, v in full.items()}
+
+
+def _entry(reading, rid: str) -> Optional[Tuple[int, int]]:
+    v = reading.get(rid_key(rid)) if reading else None
+    if v is None:
+        return None
+    if isinstance(v, tuple):
+        return int(v[0]), int(v[1])
+    return int(v), -1  # a start-only reading (v1 file, or a caller's stub)
+
+
+def started(reading: Optional[Dict[int, object]], rid: str, t_grant_s: float) -> bool:
     """D began the extend of ``rid`` at or after its grant at ``t_grant_s`` (epoch s; same host clock)."""
-    if not reading:
-        return False
-    t_ns = reading.get(rid_key(rid))
-    return t_ns is not None and t_ns >= int(float(t_grant_s) * 1e9)
+    e = _entry(reading, rid)
+    return e is not None and e[0] >= int(float(t_grant_s) * 1e9)
+
+
+def rest_of(reading: Optional[Dict[int, object]], rid: str, t_grant_s: float) -> Optional[int]:
+    """S56: D's REAL rest of ``rid`` (tokens not yet computed, as the newest extend batch saw it) when D began it at or
+    after its grant; None = not started, or started without a reported rest."""
+    e = _entry(reading, rid)
+    if e is None or e[0] < int(float(t_grant_s) * 1e9) or e[1] < 0:
+        return None
+    return int(e[1])

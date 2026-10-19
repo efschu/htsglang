@@ -2027,6 +2027,19 @@ class Envs:
     # X-EXACT: longest wait for the count before the request is priced by the
     # chars/3 estimate instead (named: PDFLIP X-EXACT-FALLBACK reason=timeout).
     FLLIPER_PDFLIP_FRONT_EXACT_TIMEOUT_MS = EnvInt(3000)
+    # S56 D-MATCH-PROBE (user 19.10. "warum wird irgendwas geschätzt? alle zahlen liegen doch schwarz auf weiß vor";
+    # pdflip/d_match_probe.py): the arrival is priced from group D's EXACT numbers -- D tokenizes the prompt as its
+    # POST will be, TP0 reads the tree read-only (device + host tier), the front asks the shared store with D's ids.
+    # Default ON (user 14.10.: new features on). S56r A1: a failed probe is named (PDFLIP D-PROBE-FAILED attempt=k) and
+    # ASKED AGAIN -- never the front's own count; no exact number by the deadline = PDFLIP D-PROBE-UNPRICED: nothing
+    # is classified, D's own admission measures the request (X-GATE W31 / W123 requeue with D's extent).
+    FLLIPER_PDFLIP_D_MATCH_PROBE = EnvBool(True)
+    # S56: the longest wait for ONE probe answer (ms); the store probe after it gets its own budget
+    FLLIPER_PDFLIP_D_MATCH_PROBE_TIMEOUT_MS = EnvInt(8000)
+    # S56r A1: the deadline for an exact D number, from the first probe POST (ms) -- retries run inside it
+    FLLIPER_PDFLIP_D_MATCH_PROBE_DEADLINE_MS = EnvInt(16000)
+    # S56r A1: the pause before a failed probe is asked again (ms)
+    FLLIPER_PDFLIP_D_MATCH_PROBE_RETRY_MS = EnvInt(250)
     # PARK-NO-DWELL (user 02.10.: an arriving request is prefilled AT ONCE, no
     # grace for running decodes; N6d ..._ec4d492f58 epoch 4: 'PDFLIP
     # PARK-IMMEDIATE-DWELL awake_ms=310 min_dwell_ms=1974 floor_ms=2000' held the

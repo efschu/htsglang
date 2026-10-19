@@ -1707,6 +1707,44 @@ class PdFlipParkRunningReqOutput(BaseReq, kw_only=True):
     answered_at: float = 0.0
 
 
+class PdFlipMatchProbeReqInput(BaseReq, kw_only=True):
+    """S56 D-MATCH-PROBE (user 19.10.: "warum wird irgendwas geschätzt? alle zahlen liegen doch schwarz auf weiß vor zu
+    jedem zeitpunkt?"; SOLL R11): the front asks group D, before its verdict, how much of a prompt D holds NOW. The
+    tokenizer manager tokenized the prompt exactly as its POST will be (``input_ids`` and ``mm_inputs`` of the
+    TokenizedGenerateReqInput); every TP rank pads the image items like an intake and walks its radix tree with the
+    admission's usable prefix READ-ONLY (S56r: ``d_match_probe.peek_admission_match``); TP0 answers. Nothing is
+    queued, allocated, split, stamped or counted."""
+
+    input_ids: Optional[array] = None
+    mm_inputs: Optional[PickleWrapper] = None
+    extra_key: Optional[str] = None
+    #: the tokenizer's tokenize time (ms), echoed for the answer's line
+    tokenize_ms: float = 0.0
+    #: S56r A3: further probes answered in the SAME intake round -- a list of
+    #: ``{"rid", "input_ids", "mm_inputs", "extra_key", "tokenize_ms"}`` (pickled); the communicator is serial, so
+    #: without it a burst of k arrivals waited k scheduler rounds (k D-prefill chunks while D prefills)
+    batch: Optional[PickleWrapper] = None
+
+
+class PdFlipMatchProbeReqOutput(BaseReq, kw_only=True):
+    success: bool = False
+    message: str = ""
+    #: the prompt in the SCHEDULER's token space (image tokens = the items' pad values, the radix key)
+    input_ids: Optional[array] = None
+    #: tokens of the prompt the tree serves from the device (KV + every component's anchor)
+    device_tokens: int = 0
+    #: tokens past the device part the tree serves from the host tier (L2 load-back)
+    host_tokens: int = 0
+    #: how far the KEY matched, no validator consulted (#1040) -- information only
+    key_match_depth: int = 0
+    #: [start, end) of every image item's pad run in ``input_ids``
+    mm_spans: List[List[int]] = []
+    handle_ms: float = 0.0
+    tokenize_ms: float = 0.0
+    #: S56r A3: the answers of the input's ``batch``, in its order (pickled list of dicts with the fields above)
+    batch: Optional[PickleWrapper] = None
+
+
 class PdFlipLaneFloorReqInput(BaseReq, kw_only=True):
     """PRIORITY LANES 1008 (L2/L3, ``pdflip/lanes.py`` ``RPC_LANE_FLOOR``): the front's floor -- ``POST
     /pdflip/lane_floor`` with ``{"floor": <int>, "epoch": <int>}``. Group D: its admission lets in only requests
