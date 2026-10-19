@@ -156,11 +156,11 @@ def test_a_protected_prefix_at_the_fork_plans_nothing():
 
 
 def test_a_fork_at_the_turn_position_is_one_track(monkeypatch):
+    """The turn track already writes that position: no second slot."""
     # S57: page 1 -- the END anchor N-1 never serves a generation-prompt sibling, so the GEN-FORK
     # TRACK joins every plan here; this test pins the turn/fork track alone (the combination:
     # test_pdflip_s57_gen_fork_anchor_1019.py)
     monkeypatch.setenv("FLLIPER_PDFLIP_GEN_FORK_ANCHOR", "0")
-    """The turn track already writes that position: no second slot."""
     ids = [IM, 1, 2] + list(range(3000, 3000 + 40)) + [IM, 5, 6] + list(range(4000, 4010)) + [IM, 7, 8]
     req = _sreq(ids)
     t_turn = ta.req_anchor_pos(req, IM, 1)

@@ -387,15 +387,19 @@ def _gain(st: "_State", src, shared: int) -> Optional[bool]:
     (``s0`` unknown: never seen admitted)."""
     n = len(_ids(src))
     end = ((n - 1) // st.page) * st.page if n > 0 else 0
-    whole_chunk_fits = st.chunk > 0 and shared >= st.chunk
+    # S57r (review 19.10.): the twin claims at most B = floor_page(shared - 1) (bigram keys
+    # take the next token too, twin_anchor.boundary) -- an anchor at shared itself
+    # (shared % page == 0) is not on its path
+    b = _tw_anchor_boundary(shared, st.page)
+    whole_chunk_fits = st.chunk > 0 and b >= st.chunk
     s0 = st.s0.get(_rid(src))
     if s0 is None:
-        if end > shared and not whole_chunk_fits:
+        if end > b and not whole_chunk_fits:
             return False  # neither its end nor a whole chunk can land inside
         return None
-    if s0 < end <= shared:
+    if s0 < end <= b:
         return True
-    return bool(st.chunk > 0 and shared - s0 >= st.chunk)
+    return bool(st.chunk > 0 and b - s0 >= st.chunk)
 
 
 def _twin_anchor_armed() -> bool:
@@ -437,11 +441,16 @@ def _promise(st: "_State", src, shared: int) -> Optional[Tuple[str, int]]:
     end = ((n - 1) // st.page) * st.page if n > 0 else 0
     rid = _rid(src)
     s0 = st.s0.get(rid)
-    if 0 < end <= shared and (s0 is None or s0 < end):
-        return PROMISE_END, end
-    if s0 is not None and st.chunk > 0 and shared - s0 >= st.chunk:
-        return PROMISE_CHUNK, s0 + ((shared - s0) // st.chunk) * st.chunk
+    # S57r (review 19.10., S57 Nebenbefund 2): every promise is bounded by the twin's
+    # claim B = floor_page(shared - 1) (bigram keys take the next token too), not by
+    # shared -- at shared % page == 0 an END or chunk end AT shared is one token past
+    # the twin's bigram claim: it waited for an anchor it could not use. Rules below
+    # (boundary / own track / provisional) then decide, as for any END past B.
     b = _tw.boundary(shared, st.page)
+    if 0 < end <= b and (s0 is None or s0 < end):
+        return PROMISE_END, end
+    if s0 is not None and st.chunk > 0 and b - s0 >= st.chunk:
+        return PROMISE_CHUNK, s0 + ((b - s0) // st.chunk) * st.chunk
     if not (0 < b < n):
         return None
     status = _tw.status(rid, b)
