@@ -749,12 +749,13 @@ def _s64_note_store_arm(sched, rid, key, cached, pages, page_size, ms) -> None:
     try:
         sched._s64_store_arm_probes = getattr(sched, "_s64_store_arm_probes", 0) + 1
         sched._s64_store_arm_ms = getattr(sched, "_s64_store_arm_ms", 0.0) + float(ms)
+        sched._s64_store_arm_ms_max = max(getattr(sched, "_s64_store_arm_ms_max", 0.0), float(ms))
         n = sched._s64_store_arm_probes
-        if n <= 3 or n % 1024 == 0:
+        if n <= 3 or n % 64 == 0:
             logger.info(
-                "S64 STORE-ARM COST probes=%d ms_sum=%.1f ms_mean=%.3f (the fresh store-arm probe of the D X gate; "
-                "denominator: every probe the vote asked)", n, sched._s64_store_arm_ms,
-                sched._s64_store_arm_ms / max(1, n))
+                "S64 STORE-ARM COST probes=%d ms_sum=%.1f ms_mean=%.3f ms_max=%.3f (the fresh store-arm probe of "
+                "the D X gate, scheduler thread; denominator: every probe the vote asked)", n,
+                sched._s64_store_arm_ms, sched._s64_store_arm_ms / max(1, n), sched._s64_store_arm_ms_max)
         if cached is None or cached[0] != key or int(cached[1]) == int(pages):
             return
         d_tok = (int(pages) - int(cached[1])) * int(page_size)

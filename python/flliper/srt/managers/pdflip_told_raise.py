@@ -207,7 +207,12 @@ def pp0_raise_step(scheduler, rid: str, req, told: int, acks: Dict[int, int], ab
         from flliper.srt.managers import pdflip_store_told as _st
 
         try:
-            verdict = _st.issue_completion_read(fn, req)
+            # REVIEW S64 B1: the raise read is BOUNDED at m (the follower
+            # registration's key rule) -- a store that grew past m meanwhile
+            # (#968: D's flush still landing) must not put more than m on PP0,
+            # whose admission compares its record with told exactly.
+            _lim = _st.follower_limit_tokens(getattr(scheduler, "tree_cache", None), int(m))
+            verdict = _st.issue_completion_read(lambda r: fn(r, limit_tokens=_lim), req)
         except Exception as exc:  # noqa: BLE001 - a re-read never takes the pass down
             _fail(scheduler, rid, st, f"raised:{type(exc).__name__}")
             return None
@@ -230,6 +235,17 @@ def pp0_raise_step(scheduler, rid: str, req, told: int, acks: Dict[int, int], ab
             _fail(scheduler, rid, st, "bound")
             return None
         return WAIT, st.target
+    # REVIEW S64 B1: PP0's admission compares its record with told EXACTLY
+    # (own != told -> PdFlipStoreToldMismatch, W17): admit m only on record == m.
+    from flliper.srt.managers import pdflip_store_told as _st
+
+    try:
+        own = int(_st._completed_prefix(tree, rid))
+    except Exception:  # noqa: BLE001 - no record, no proof
+        own = -1
+    if own != int(st.target):
+        _fail(scheduler, rid, st, f"own={own}!={st.target}")
+        return None
     if not _pp0_resumes_at(scheduler, req, st.target, absolute):
         _fail(scheduler, rid, st, "pp0_not_resumable")
         return None

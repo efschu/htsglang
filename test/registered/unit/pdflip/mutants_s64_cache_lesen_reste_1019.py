@@ -1,6 +1,6 @@
 """S64 mutants: each one in the working tree, the S64 test file in ONE 2-GiB
 scope (serial, never two at once), the file restored from HEAD afterwards.
-Run from the worktree root: python test/registered/unit/pdflip/mutants_s64_cache_lesen_reste_1019.py"""
+Blocking systemd-run scope per mutant (review S64 Auflage 3). Run from the worktree root: python test/registered/unit/pdflip/mutants_s64_cache_lesen_reste_1019.py"""
 import os
 import subprocess
 import sys
@@ -37,25 +37,25 @@ MUTANTS = [
      'get(S64_STORE_ARM_FRESH_ENV, "1")', 'get(S64_STORE_ARM_FRESH_ENV, "0")'),
     ("M5 short arm answer reused across passes", "nichts schaetzen", SC,
      "                        or int(cached[1]) * page_size >= len(span)):", "                        or True):"),
+    ("M7 raise admits without record == m", "Tod (PdFlipStoreToldMismatch auf PP0)", RZ,
+     "    if own != int(st.target):", "    if False:"),
+    ("M7b raise read unbounded", "Tod (PdFlipStoreToldMismatch auf PP0)", RZ,
+     "            verdict = _st.issue_completion_read(lambda r: fn(r, limit_tokens=_lim), req)",
+     "            verdict = _st.issue_completion_read(fn, req)"),
     ("M6 regress named as store shortness", "Benennung", "python/flliper/srt/pdflip/short_read_cause.py",
      "        return CAPACITY_REGRESS", "        return STORE_HELD"),
 ]
 
 
 def run_one(tag):
-    out = f"/tmp/s64/mut_{tag}.out"
-    done = out + ".done"
-    for p in (out, done):
-        if os.path.exists(p):
-            os.remove(p)
-    cmd = ("setsid -f systemd-run --scope -q -p MemoryMax=2G -E PYTHONPATH=python:test/registered/unit/pdflip "
-           "-E CUDA_VISIBLE_DEVICES= bash -c '/spinning/shvllm/.venv/bin/python -m pytest -q -p no:cacheprovider "
-           f"{T} > {out} 2>&1; echo done > {done}'")
-    subprocess.run(cmd, shell=True, check=True)
-    while not os.path.exists(done):
-        time.sleep(2)
-    tail = open(out, errors="replace").read().splitlines()[-3:]
-    return " ".join(tail)
+    """One BLOCKING 2-GiB scope (no setsid, no polling): serial by construction
+    (order after the kernel OOM of 19.10. 11:31:59Z)."""
+    cmd = ["systemd-run", "--scope", "-q", "-p", "MemoryMax=2G",
+           "-E", "PYTHONPATH=python:test/registered/unit/pdflip", "-E", "CUDA_VISIBLE_DEVICES=",
+           "/spinning/shvllm/.venv/bin/python", "-m", "pytest", "-q", "-p", "no:cacheprovider", T]
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    tail = [l for l in (p.stdout + p.stderr).splitlines() if " passed" in l or " failed" in l]
+    return p.returncode, (tail[-1] if tail else "")
 
 
 def main():
@@ -65,10 +65,10 @@ def main():
         assert src.count(old) == 1, (name, src.count(old))
         open(path, "w").write(src.replace(old, new))
         try:
-            summary = run_one(i)
+            rc, summary = run_one(i)
         finally:
             subprocess.run(["git", "checkout", "--", path], check=True)
-        killed = "failed" in summary or "error" in summary
+        killed = rc != 0
         res.append((name, danger, "KILLED" if killed else "SURVIVED", summary[-120:]))
         print(res[-1], flush=True)
     print("killed %d of %d" % (sum(r[2] == "KILLED" for r in res), len(res)))

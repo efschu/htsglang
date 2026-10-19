@@ -562,7 +562,7 @@ def test_1400b_raise_wait_is_bounded(monkeypatch):
 
     acks = {1: 98560, 2: 98560}
     tree = SimpleNamespace(check_prefetch_progress=lambda rid: False)
-    s = SimpleNamespace(ps=SimpleNamespace(pp_size=3), tree_cache=tree, _prefetch_kvcache=lambda req: "issued")
+    s = SimpleNamespace(ps=SimpleNamespace(pp_size=3), tree_cache=tree, _prefetch_kvcache=lambda req, **kw: "issued")
     monkeypatch.setattr(rz, "store_anchored_depth", lambda sched, req: 98560)
     req = SimpleNamespace(rid="r")
     assert rz.pp0_raise_step(s, "r", req, 98368, acks, True, now=0.0) == (rz.WAIT, 98560)
@@ -596,3 +596,67 @@ def test_1400b_only_pp0_decides():
     assert "pp0_raise_step" in inspect.getsource(m._pp0_publish_paced)
     for fn in (m._follower_admit, m._follower_absorb_impl, m.admission, m.follower_early_settle):
         assert "pp0_raise_step" not in inspect.getsource(fn)
+
+
+# ---------------------------------------------------------------- review S64 B1 (Auflage 1/2)
+
+
+@pytest.mark.parametrize("store", [98560 + 64, 98560 + 1024])
+def test_1400b_store_grew_past_the_acks_no_split_no_mismatch(monkeypatch, store):
+    """Review S64 B1 (reviewer test, adopted): the store grew past the unanimous
+    ack m before PP0's raise read (#968: D's flush still landing). RED on
+    51a5e28fd6: ``#1400 STORE-TOLD MISMATCH rank pp=0 told=98560 own_prefix=98624``
+    (unbounded raise read). Now the read is bounded at m: one plan on every
+    rank, at m, no mismatch."""
+    ring, rid, told, m, fb, rz = _raise_ring(monkeypatch, 98560, 98560, store=store)
+    ring.arrive(rid)
+    ring.run(400)
+    plans = ring.plans(rid)
+    assert all(len(p) == 1 for p in plans) and plans[0] == plans[1] == plans[2], plans
+    assert plans[0][0][2] in (98560, 0), plans
+    assert plans[0][0][2] == 98560          # bounded read lands exactly m
+    for s in ring.stages:
+        assert s.tree_cache.op_refs == 0 and rid not in s.tree_cache.ongoing
+
+
+def test_1400b_raise_admits_only_on_record_equal_m(monkeypatch):
+    """Auflage 1b: a raise read whose record is NOT m (here: it ignores the
+    bound and lands 99584) is never admitted -- PF rule (told=0) on every rank."""
+    ring, rid, told, m, fb, rz = _raise_ring(monkeypatch, 98560, 98560, store=99584)
+    p0 = ring.stages[0]
+    inner = p0._prefetch_kvcache
+
+    def _unbounded(req, rematch=True, limit_tokens=None):
+        return inner(req, rematch, None)
+
+    p0._prefetch_kvcache = _unbounded
+    ring.arrive(rid)
+    ring.run(400)
+    plans = ring.plans(rid)
+    assert all(len(p) == 1 for p in plans) and plans[0] == plans[1] == plans[2], plans
+    assert plans[0][0][2] == 0
+    assert getattr(p0, "_s64_raise_admit_n", 0) == 0 and p0._s64_raise_fail_n >= 1
+    for s in ring.stages:
+        assert s.tree_cache.op_refs == 0 and rid not in s.tree_cache.ongoing
+
+
+def test_1400b_raise_read_in_flight_past_bound_is_told_zero_everywhere(monkeypatch):
+    """Reviewer test (adopted): the raise read stays in flight past the bound."""
+    ring, rid, told, m, fb, rz = _raise_ring(monkeypatch, 98560, 98560)
+    monkeypatch.setenv(rz.ENV_WAIT_S, "0.5")
+    p0 = ring.stages[0]
+    inner = p0._prefetch_kvcache
+
+    def _slow(req, rematch=True, limit_tokens=None):
+        if m.completion_read_min_tokens(req) == 1:
+            p0.read_s[rid] = 10 ** 6
+        return inner(req, rematch, limit_tokens)
+
+    p0._prefetch_kvcache = _slow
+    ring.arrive(rid)
+    ring.run(1500)
+    plans = ring.plans(rid)
+    assert all(len(p) == 1 for p in plans) and plans[0] == plans[1] == plans[2], plans
+    assert plans[0][0][2] == 0
+    for s in ring.stages:
+        assert s.tree_cache.op_refs == 0 and rid not in s.tree_cache.ongoing
