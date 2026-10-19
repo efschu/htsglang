@@ -633,9 +633,15 @@ class AnthropicServing:
         if system_parts and _hs.env_on():
             system_parts, _stripped = _hs.strip_attribution_parts(system_parts)
             _hs.note_stripped(_stripped)
+        _head = "\n".join(system_parts) if system_parts else ""
+        # The template renders the tools block BEFORE the system text, so the
+        # watched head is both, in render order (a reordered tool list moves
+        # the head exactly like a changed system line).
+        try:
+            _hs.watch().observe(_hs.head_signature(anthropic_request.tools, _head))
+        except Exception:  # noqa: BLE001 - log-only instrument, never the request
+            logger.debug("S70 HEAD-DIVERGE observe failed", exc_info=True)
         if system_parts:
-            _head = "\n".join(system_parts)
-            _hs.watch().observe(_head)
             openai_messages.append({"role": "system", "content": _head})
 
         def _emit_user_message(parts: list[dict]) -> None:

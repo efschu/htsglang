@@ -291,10 +291,29 @@ class TestHeadDiverge(unittest.TestCase):
         self.assertIn("7e3", rec["prev"])
         self.assertIn("7f3", rec["new"])
 
+    def test_adapter_names_a_reordered_tool_list(self):
+        """Through the adapter: the same tools in another order move the head
+        inside the TOOLS part -- the instrument sees the block the template
+        renders first."""
+        w = hs.HeadWatch(window=4)
+        with envs.FLLIPER_ANTHROPIC_INLINE_SYSTEM_IN_PLACE.override(True):
+            s = AnthropicServing(_FakeChat("{{ messages }}"))
+        p1 = dict(_payload(HEADER_A))
+        p2 = dict(_payload(HEADER_A), tools=TOOLS[:2] + [TOOLS[3], TOOLS[2]] + TOOLS[4:])
+        with mock.patch.object(hs, "_WATCH", w):
+            s._convert_to_chat_completion_request(AnthropicMessagesRequest.model_validate(p1))
+            s._convert_to_chat_completion_request(AnthropicMessagesRequest.model_validate(p2))
+        self.assertEqual(w.n, 1)
+        h1, h2 = list(w._heads)
+        cut = hs._common_prefix_len(h1, h2)
+        self.assertLess(cut, h1.index("SYSTEM:"))  # the move is in the tools part
+        self.assertIn('"name": "tool_2"', h1[cut - 40:cut + 200])
+
     def test_unrelated_heads_are_silent(self):
         w = hs.HeadWatch(window=4)
-        w.observe("A" * 100)
-        self.assertIsNone(w.observe("B" * 100))
+        w.observe("A" * 1000)
+        self.assertIsNone(w.observe("B" * 1000))
+        self.assertIsNone(w.observe("A" * 100 + "C" * 900))  # shares < MIN_SHARED_CHARS
 
 
 if __name__ == "__main__":

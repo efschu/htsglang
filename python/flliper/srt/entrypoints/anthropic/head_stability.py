@@ -36,8 +36,9 @@ front's exact count share (``AnthropicServing._convert_to_chat_completion_reques
 
 2. HEAD-DIVERGE (log only, always on). The head text of each request is
    compared with the most similar of the last ``WINDOW`` heads this process
-   rendered; when the two share most of their length but not all of it, ONE
-   line names the char offset and both sides around it. That turns the next
+   rendered (tools in render order, then the system text); every NEW head
+   that shares at least ``MIN_SHARED_CHARS`` with a recent one gets ONE line
+   naming the char offset and both sides around it. That turns the next
    94-158 / 96-161 pair into the exact bytes that moved -- the instrument this
    finding lacked (no ids or text of a multimodal request are logged anywhere:
    ``tokenizer_manager`` prints D-IDS only for ``mm_inputs is None``).
@@ -140,9 +141,9 @@ def note_stripped(lines: Sequence[str]) -> None:
 # ---------------------------------------------------------------------------
 
 WINDOW = 32
-#: the two heads must share at least this fraction of the shorter one to be
-#: "the same head, moved" rather than two different agents
-MIN_SHARED_FRAC = 0.5
+#: the two heads must share at least this many leading chars to count as "one
+#: head, moved" (below it they are unrelated: another template or no tools)
+MIN_SHARED_CHARS = 256
 CONTEXT_CHARS = 96
 
 
@@ -182,8 +183,7 @@ class HeadWatch:
             self._heads.append(head)
             if best is None:
                 return None
-            shorter = min(len(best), len(head))
-            if shorter <= 0 or best_cp < MIN_SHARED_FRAC * shorter:
+            if best_cp < MIN_SHARED_CHARS:
                 return None
             self.n += 1
             n = self.n
@@ -204,6 +204,24 @@ class HeadWatch:
                 rec["prev"], rec["new"],
             )
         return rec
+
+
+def head_signature(tools, system_text: str) -> str:
+    """What the head turn is made of, in the template's render order: every
+    tool as canonical JSON (one per line, in the request's order), then the
+    system text. Never raises -- an unreadable tool contributes its repr."""
+    import json
+
+    lines = ["TOOLS:"]
+    for t in tools or ():
+        try:
+            d = t.model_dump(exclude_none=True) if hasattr(t, "model_dump") else t
+            lines.append(json.dumps(d, sort_keys=True, ensure_ascii=False, default=str))
+        except Exception:  # noqa: BLE001 - an instrument never breaks the request
+            lines.append(repr(t))
+    lines.append("SYSTEM:")
+    lines.append(system_text or "")
+    return "\n".join(lines)
 
 
 _WATCH = HeadWatch()
