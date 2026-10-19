@@ -1081,15 +1081,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 (batch_size, 1), dtype=torch.int64, device=device
             )
         else:
-            mrope_deltas = [
-                (
-                    torch.zeros(1, dtype=torch.int64)
-                    if mm_inputs[i] is None
-                    else mm_inputs[i].mrope_position_delta.squeeze(0)
-                )
-                for i in range(batch_size)
-            ]
-            mrope_delta_tensor = torch.stack(mrope_deltas, dim=0).to(device=device)
+            mrope_delta_tensor = spec_mrope_delta_tensor(mm_inputs, batch_size, device)
         next_input_positions = (
             (seq_positions + mrope_delta_tensor).flatten().unsqueeze(0).repeat(3, 1)
         )
@@ -1622,6 +1614,64 @@ class PPProxyTensors:
 
     def __repr__(self) -> str:
         return f"PPProxyTensors(tensors={self.tensors})"
+
+
+def spec_mrope_delta_tensor(mm_inputs, batch_size: int, device) -> torch.Tensor:
+    """S65 (NF decode tempo): the per-request mrope deltas of a spec round that
+    carries at least one multimodal request, as a ``(batch_size, 1)`` int64
+    tensor on ``device`` -- WITHOUT a host wait.
+
+    WHY. ``compute_spec_mrope_positions`` runs three times in every spec-v2
+    decode round of an mrope model (draft, verify prep, draft extend: each
+    builds a ForwardBatch). Its mixed branch stacked the CPU deltas and moved
+    them with a plain ``.to(device)``: a CPU->CUDA copy with
+    ``non_blocking=False`` is ``cudaMemcpyAsync`` + ``cudaStreamSynchronize``,
+    i.e. the scheduler thread waits for everything queued on the stream. In the
+    draft extend that is the verify that was just launched -- the overlap loop
+    loses its round of lead and the GPU idles while the host does result,
+    recv, sched and the next draft launch. Measured on rc15/rc12 D TP0
+    (DECODE-HOST-SPLIT, 64-round windows): every window with a multimodal
+    request in the batch shows ``dext_ms`` 21-85 ms (the verify's remainder),
+    ``ctl_wait`` 0 and ``gpu_idle`` 6-11 ms per round; text-only windows of the
+    same boot show ``dext_ms`` ~1 ms and ``gpu_idle`` 0.1 ms. bs1 round 46.8 ->
+    29.2 ms, bs2 59.8 -> 43.5 ms start-to-start (rc15, same boot).
+
+    THE FIX. The same values, staged in page-locked host memory and copied with
+    ``non_blocking=True`` -- a stream-ordered H2D that the host does not wait
+    for. ``pin_memory()`` comes from the caching host allocator, which records
+    the copy's stream use, so the staging block is not reused before the copy
+    ran. The values are byte-identical to the old construction (same deltas,
+    same order, same dtype), on every rank, so the round stays rank-uniform.
+    Deltas that already live on ``device`` (none of today's processors) skip
+    the staging; a non-CUDA ``device`` keeps the plain copy (nothing to wait
+    for)."""
+    deltas = [
+        (
+            torch.zeros(1, dtype=torch.int64)
+            if mm_inputs[i] is None
+            else mm_inputs[i].mrope_position_delta.squeeze(0).to(torch.int64)
+        )
+        for i in range(batch_size)
+    ]
+    device = torch.device(device)
+    if device.type != "cuda":
+        return torch.stack(deltas, dim=0).to(device=device)
+    if all(d.device.type == "cpu" for d in deltas):
+        host = torch.stack(deltas, dim=0)
+        return host.pin_memory().to(device=device, non_blocking=True)
+    # Mixed residency (not produced by today's processors): never read a
+    # device delta back to the host; move each CPU row on its own, staged.
+    return torch.stack(
+        [
+            (
+                d.pin_memory().to(device=device, non_blocking=True)
+                if d.device.type == "cpu"
+                else d.to(device=device, non_blocking=True)
+            )
+            for d in deltas
+        ],
+        dim=0,
+    )
 
 
 def compute_position(
