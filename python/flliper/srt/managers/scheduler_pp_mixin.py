@@ -657,6 +657,34 @@ def _pp_output_exchange_due(batch: Optional[ScheduleBatch]) -> bool:
     )
 
 
+def _pp_output_relay_now(holder) -> bool:
+    """S69 OUTPUT-RELAY-NOW: does this rank forward a received output in the pass that received it?
+
+    Outputs travel last -> 0 -> 1 -> ... -> last. On the contiguous ring a non-last rank used to forward
+    ``pp_outputs`` -- what it received LAST pass -- inside the NEXT pass's output commit, i.e. after that pass's
+    launch. With a blocking launch that is seconds of relay lag in which the downstream sits in its blocking
+    output receive while its next proxy is already on its wire (rc16 boot ..._1019_121629, 12:27:51.702 ->
+    12:27:53.611: 1909 ms, PP0's 1542-token launch 1787 ms, then COMMIT-STALL-P 3887 ms at the epoch tail).
+
+    Same rule on every rank, no verdict of anyone's (R11 untouched): a pure transport timing. Off where the old
+    relay is the only correct one or where the lag does not exist:
+      * the last rank is the SOURCE, it relays nothing;
+      * the gapped wire already forwards in the receiving iteration (#753, ``forward_now``);
+      * XPU orders send/recv by rank parity because its isend can block -- an extra post there is a new arc;
+      * ``pp_async_batch_depth > 0`` commits BEFORE the launch, so no launch sits between receipt and forward.
+    """
+    if not envs.FLLIPER_PP_OUTPUT_RELAY_NOW.get():
+        return False
+    if getattr(getattr(holder, "pp_group", None), "is_last_rank", True):
+        return False
+    if getattr(holder, "_pp_gapped_wire", False):
+        return False
+    if is_xpu():
+        return False
+    depth = getattr(getattr(holder, "server_args", None), "pp_async_batch_depth", 0)
+    return int(depth or 0) == 0
+
+
 @dataclass
 class PPBatchMetadata:
     can_run_cuda_graph: bool
@@ -6065,7 +6093,14 @@ class SchedulerPPMixin:
                 # the torch Work). Without this line the frame kept it until the NEXT forward,
                 # i.e. across a whole sleep served at the top of the next pass.
                 result = None
-                self.pp_outputs = next_pp_outputs
+                # S69 OUTPUT-RELAY-NOW: a non-last rank forwards the output it received THIS pass here, after its
+                # proxy send (wire order unchanged) and before the chain flush, instead of in the next pass's
+                # output commit behind the next launch (rc16 12:27:51: 1909 ms relay lag). Then nothing is kept
+                # for the next exchange to forward. Off (last rank, gapped, XPU, async depth, switch 0): as before.
+                if self._pp_relay_output_now(next_pp_outputs):
+                    self.pp_outputs = None
+                else:
+                    self.pp_outputs = next_pp_outputs
                 if self.pp_group.is_last_rank:
                     # FIXES Nr. 45: the last stage owes nobody a frame (and sends no output for a slot without a batch)
                     _pp_void_pass.take_out(self)
@@ -8166,6 +8201,8 @@ class SchedulerPPMixin:
         self.send_req_work = []
         self.send_proxy_work = []
         self.send_output_work = []
+        # S69: no early-posted output relay is pending a late filing across a cutover.
+        self._pp_relay_posted = False
         self.launch_event = None
 
         # #791 PP ADMISSION UNIFORMITY. Per-pass scratch, filled and drained
@@ -8703,7 +8740,7 @@ class SchedulerPPMixin:
         return max(1, int(getattr(self.ps, "pp_size", 1) or 1))
 
     @_1463_timed("_1475_post_send_ms")  # #1475
-    def _pp_post_send(self: Scheduler, work: List[P2PWork]) -> None:
+    def _pp_post_send(self: Scheduler, work: List[P2PWork], lap_offset: int = 0) -> None:
         """Post-and-forget: take the send off the pass path entirely.
 
         #1015e. THE JOIN IS THE CYCLE, NOT THE ARC. Three boots removed or
@@ -8740,7 +8777,9 @@ class SchedulerPPMixin:
         """
         if not work:
             return
-        lap = int(getattr(self, "_pp_send_lap", 0))
+        # S69: ``lap_offset=1`` files a send that was POSTED one pass early (OUTPUT-RELAY-NOW) under the lap the
+        # old relay would have filed the same message in, so its join lap -- the #1015e cycle point -- is unchanged.
+        lap = int(getattr(self, "_pp_send_lap", 0)) + int(lap_offset)
         pending = getattr(self, "_pp_pending_sends", None)
         if pending is None:
             pending = self._pp_pending_sends = {}
@@ -8914,7 +8953,14 @@ class SchedulerPPMixin:
         pending_output_work = self.send_output_work
         gapped = getattr(self, "_pp_gapped_wire", False)
         if not gapped:
-            self._pp_commit_comm_work(work=pending_output_work)
+            if getattr(self, "_pp_relay_posted", False):
+                # S69 OUTPUT-RELAY-NOW: the forward in this list was posted at the end of the LAST pass, one pass
+                # before the old relay posted the same message here. Filed one lap later, it is joined at the old
+                # lap: the post moves, the join does not (#1015e: the join is the cycle).
+                self._pp_relay_posted = False
+                self._pp_post_send(pending_output_work, lap_offset=1)
+            else:
+                self._pp_commit_comm_work(work=pending_output_work)
         (
             next_pp_outputs,
             next_batch_result,
@@ -11843,6 +11889,47 @@ class SchedulerPPMixin:
                         msg_type="output",
                     )
         return send_output_work
+
+    def _pp_relay_output_now(self: Scheduler, outputs: Optional[PPProxyTensors]) -> bool:
+        """S69 OUTPUT-RELAY-NOW: forward the output this pass received, now.
+
+        Called once per pass from ``_event_loop_pp_body``, after this pass's proxy send and before the chain
+        flush. True = this rank relays on receipt (``_pp_output_relay_now``): the caller then keeps NOTHING in
+        ``pp_outputs``, so the next pass's exchange (``if pp_outputs:``) forwards nothing and the message is sent
+        exactly once. False = the old one-pass relay; the caller keeps ``pp_outputs`` as before.
+
+        The send predicate is the old one (``if pp_outputs:`` = "I received"), the payload is the same dict, and
+        the wire order is the same: the old relay posted output(k) in pass i+1's commit, i.e. after proxy(k-1)
+        (end of pass i) and before proxy(k) (end of pass i+1); this posts it at the end of pass i, after
+        proxy(k-1). Only the time moves: the downstream gets it at this rank's receipt, not after this rank's
+        next launch. The handles go to ``send_output_work`` (seen by the presence check, the reaper and the
+        cutover instrument exactly like the old relay's), and ``_pp_relay_posted`` tells the next commit to file
+        them one lap later, so the join lap is the old one.
+        """
+        if not _pp_output_relay_now(self):
+            return False
+        if outputs:
+            with torch.profiler.record_function("send_res_dict_to_next_stage"):
+                work = self._pp_send_dict_to_next_stage(
+                    outputs.tensors,
+                    async_send=True,
+                    msg_type="output",
+                )
+            if work:
+                if getattr(self, "send_output_work", None) is None:
+                    self.send_output_work = []
+                self.send_output_work.extend(work)
+                self._pp_relay_posted = True
+            n = int(getattr(self, "_pp_relay_now_n", 0)) + 1
+            self._pp_relay_now_n = n
+            if n == 1:
+                logger.info(
+                    "S69 OUTPUT-RELAY-NOW pp_rank=%s: the received output is forwarded in the pass that received "
+                    "it (end of pass, after the proxy send); its join is filed one lap later = the old join lap. "
+                    "FLLIPER_PP_OUTPUT_RELAY_NOW=0 = the one-pass relay.",
+                    getattr(getattr(self, "ps", None), "pp_rank", "?"),
+                )
+        return True
 
     def _pp_send_recv_and_preprocess_output_tensors(
         self: Scheduler,

@@ -2222,6 +2222,14 @@ class Envs:
     # successor while PP1/PP2 finish the predecessor (rc14 epoch 1: 24.2 s output_commit drain). Front only.
     # New feature -> default ON; 0 = the configured value alone, byte for byte.
     FLLIPER_PDFLIP_P_POOL_FROM_P = EnvBool(True)
+    # S69 OUTPUT-RELAY-NOW (scheduler_pp_mixin._pp_relay_output_now): a non-last PP rank on the contiguous ring
+    # forwards a received output at the end of the pass that received it, not inside the NEXT pass's output commit
+    # behind that pass's launch (rc16 12:27:51: PP0 had pdflip-30-41's output at .702, PP1 got it 1909 ms later,
+    # behind PP0's 1787 ms launch; PP1 sat in the receive with its next proxy on the wire). Wire order unchanged,
+    # the join of the send filed one lap later = the old join lap. Not on the last rank, the gapped wire (it has
+    # its own lag removal, #753), XPU, or pp_async_batch_depth > 0.
+    # New feature -> default ON; 0 = the one-pass relay, byte for byte.
+    FLLIPER_PP_OUTPUT_RELAY_NOW = EnvBool(True)
     # Prefix trace (IN 26.09., pdflip/prefix_trace.py): every prefix miss of an
     # agent-load boot gets a token receipt -- one #1420 WALK-STOP line per
     # (rid, stop depth) whose unmatched rest is >= the minimum below, full
