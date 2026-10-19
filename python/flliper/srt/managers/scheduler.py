@@ -732,6 +732,45 @@ _VERDICT_STORE_SHORT = "terminated:store_short"
 #: these (or none recorded) is a CAPACITY-CUT; every other cause is a HELD-CUT.
 _CAPACITY_CUT_CAUSES = (None, "arena_full", "l2_evicted_before_ref", "fill_evicted_before_ref")
 
+#: S64 S-ARM: the D store arm (#1317 X-STORE-VOTE) is asked fresh in every vote.
+S64_STORE_ARM_FRESH_ENV = "FLLIPER_PDFLIP_S64_STORE_ARM_FRESH"
+
+
+def _s64_store_arm_fresh_on(env=None) -> bool:
+    v = (env if env is not None else os.environ).get(S64_STORE_ARM_FRESH_ENV, "1")
+    return str(v).strip().lower() not in ("0", "false", "no", "off", "")
+
+
+def _s64_note_store_arm(sched, rid, key, cached, pages, page_size, ms) -> None:
+    """S64 S-ARM instrument: the cost of the fresh probe (ms, counted per vote)
+    and every rid whose fresh answer differs from what the generation-keyed
+    cache held for the SAME key -- the token delta the old arm would have
+    priced. Never raises (a vote may never break the reduce)."""
+    try:
+        sched._s64_store_arm_probes = getattr(sched, "_s64_store_arm_probes", 0) + 1
+        sched._s64_store_arm_ms = getattr(sched, "_s64_store_arm_ms", 0.0) + float(ms)
+        n = sched._s64_store_arm_probes
+        if n <= 3 or n % 1024 == 0:
+            logger.info(
+                "S64 STORE-ARM COST probes=%d ms_sum=%.1f ms_mean=%.3f (the fresh store-arm probe of the D X gate; "
+                "denominator: every probe the vote asked)", n, sched._s64_store_arm_ms,
+                sched._s64_store_arm_ms / max(1, n))
+        if cached is None or cached[0] != key or int(cached[1]) == int(pages):
+            return
+        d_tok = (int(pages) - int(cached[1])) * int(page_size)
+        sched._s64_store_arm_stale = getattr(sched, "_s64_store_arm_stale", 0) + 1
+        sched._s64_store_arm_stale_tok = getattr(sched, "_s64_store_arm_stale_tok", 0) + abs(d_tok)
+        k = sched._s64_store_arm_stale
+        if k <= 64 or k % 256 == 0:
+            logger.warning(
+                "S64 STORE-ARM STALE rid=%s gen=%d local_match=%d span=%d cached=%d fresh=%d delta=%+d (k=%d "
+                "tok_sum=%d): the store changed under an unchanged key -- the generation-keyed cache would have "
+                "priced %d tokens; the vote prices the store as it is now", rid, int(key[0]), int(key[1]),
+                int(key[2]), int(cached[1]) * int(page_size), int(pages) * int(page_size), d_tok, k,
+                sched._s64_store_arm_stale_tok, int(cached[1]) * int(page_size))
+    except Exception:  # noqa: BLE001 - an instrument
+        pass
+
 # #1068 A12.2: why the prefetch deferral is REFUSED on a rank/phase, by name.
 # MODULE-LEVEL on purpose: `_prefetch_deferral_refusal_reason` is bound to
 # test stand-ins by method, and a class attribute would not travel with it
@@ -1092,15 +1131,25 @@ def _pdflip_store_short_fallback(sched, req, reason: str, span, site: str) -> Op
     req._pdflip_store_short_fallback = True
     _note_prefetch_gate("defer_expired")
     sched._pdflip_store_short_fallbacks = getattr(sched, "_pdflip_store_short_fallbacks", 0) + 1
+    # S64 S-CAP: the reason names capacity (delivered fell / a room cut) apart
+    # from a store that genuinely held no more -- an instrument, no decision.
+    from flliper.srt.pdflip import short_read_cause as _src
+
+    _reason = _src.of_request(req, held, settled)
+    _causes = getattr(sched, "_s64_short_causes", None)
+    if _causes is None:
+        _causes = sched._s64_short_causes = {}
+    _causes[_reason] = _causes.get(_reason, 0) + 1
     logger.warning(
         "PREFETCH-DEFER-FALLBACK rid=%s delivered=%d tail=%d X=%d cycles=%d "
-        "bound=%d reason=" + ("settled_no_writer" if settled
-                              else "store_held_no_growth" if held else "no_writer_progress")
+        "bound=%d reason=" + _reason + " prev_delivered=%s cut_cause=%s causes=%s"
         + " span=%s site=%s n=%d -- the store "
         "read terminated short %d times in a row without delivering more; no "
         "writer is filling the tail, so the matched prefix is taken and D "
         "extends the rest (the X gate prices it with the group's match)",
-        rid, delivered, tail, x, cycles, bound, span, site,
+        rid, delivered, tail, x, cycles, bound,
+        getattr(req, _src.PREV_DELIVERED_ATTR, None), getattr(req, _src.CUT_CAUSE_ATTR, None),
+        dict(sorted(_causes.items())), span, site,
         sched._pdflip_store_short_fallbacks, cycles,
     )
     return "expired"
@@ -8325,6 +8374,12 @@ class Scheduler(
         _park_min = _pdflip_park_read.park_read_min_tokens(req)
         if _park_min is not None:
             _tail_min = _park_min if _tail_min is None else min(int(_tail_min), int(_park_min))
+        # S64 S-1400 (rc15 P 08:31:45 pdflip-72-525): PP0's completion re-read
+        # to a store-confirmed depth (P-HELD-REREAD / P-WAKE-PROBE) reads
+        # whatever its length -- the #915 threshold refused 192 < 256 twice.
+        _cmin = pdflip_store_told.completion_read_min_tokens(req)
+        if _cmin is not None:
+            _tail_min = _cmin if _tail_min is None else min(int(_tail_min), int(_cmin))
         # TS (y4a death 03:36:24): a read bounded by a told is prescribed --
         # the #915 threshold does not refuse it (follower need 64 < 256).
         _tail_min = pdflip_store_told.told_read_min_tokens(limit_tokens, _tail_min)
@@ -14290,6 +14345,9 @@ class Scheduler(
             )
 
             gen = int(_current_generation())
+            # S64 S-ARM: one id per vote (= per pass); a probe is reused only inside it
+            _vote_pass = getattr(self, "_s64_store_vote_pass", 0) + 1
+            self._s64_store_vote_pass = _vote_pass
             wanted = set(canonical)
             for req in self.waiting_queue:
                 rid = str(getattr(req, "rid", "") or "")
@@ -14322,7 +14380,23 @@ class Scheduler(
                     prefix_keys = node.get_prefix_hash_values(node.parent)
                 key = (gen, local_match, len(span))
                 cached = getattr(req, "_pdflip_store_match_cache", None)
-                if cached is not None and cached[0] == key:
+                # S64 S-ARM (rc15 D 08:31:34 pdflip-72-525 store=68608 while the
+                # store held 98560; rc14 16-211 20032/27200 vs 37888): the key
+                # (generation, local_match, span) does not move while a waiting
+                # request's tree match stands still -- and the store fills under
+                # it (P's write-through, D's own park demote, the anchor demote).
+                # The verdict is reused only inside the pass that took it; a new
+                # pass asks the store again, so the arm is the store at decision
+                # time (FLLIPER_PDFLIP_S64_STORE_ARM_FRESH, default ON; 0 = the
+                # generation-keyed cache as before).
+                # COST: an answer that already covers the whole span cannot grow
+                # and stays cached; only a SHORT answer -- the one a W31 is priced
+                # on -- is asked again (the hash chain is ~20 ms per 100k tokens).
+                _fresh = _s64_store_arm_fresh_on()
+                if cached is not None and cached[0] == key and (
+                        not _fresh
+                        or (len(cached) > 2 and cached[2] == _vote_pass)
+                        or int(cached[1]) * page_size >= len(span)):
                     pages = int(cached[1])
                 else:
                     # Q-460 SALT-ISOLATION: the request's namespace
@@ -14331,9 +14405,12 @@ class Scheduler(
                     # MAMBA-ANCHOR 1015: the fetch's key form (bigram RadixKey)
                     from flliper.srt.pdflip import presence_fetch_key as _pfk
 
+                    _t0 = time.perf_counter()
                     pages = int(probe(_pfk.span_key(self.tree_cache, req, span),
                                       last_hash, prefix_keys, **_ns) or 0)
-                    req._pdflip_store_match_cache = (key, pages)
+                    _s64_note_store_arm(self, rid, key, cached, pages, page_size,
+                                        (time.perf_counter() - _t0) * 1000.0)
+                    req._pdflip_store_match_cache = (key, pages, _vote_pass)
                 # The probe counts PAGES; the arm votes TOKENS, because the
                 # extent it prices is a token count. Clamped to the span so a
                 # backend that over-reports can never credit tokens the
@@ -15908,6 +15985,10 @@ class Scheduler(
         # The witness term, written BEFORE the arm reads it: a re-read that
         # gains nothing leaves this value unchanged and the standstill count
         # advances, which is what ends the wait honestly.
+        # S64 S-CAP: the previous pair and this read's cut cause, for the name
+        from flliper.srt.pdflip import short_read_cause as _src
+
+        _src.note_record(req, delivered, deliverable, getattr(outcome, "cut_cause", None))
         req._pdflip_store_delivered = delivered
         req._pdflip_store_deliverable = deliverable  # #248h: what the store holds
         self._pdflip_store_short_seen = getattr(self, "_pdflip_store_short_seen", 0) + 1

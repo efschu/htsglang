@@ -1218,6 +1218,9 @@ def pp0_note_verdict(scheduler, rid: str, told: int, told_final: int, reason: st
                 rid, told, now - published_at, acks, n,
             )
         return
+    if reason == "raise" and int(told_final) > int(told):
+        # S64 S-1400 (b): pdflip_told_raise names the admit itself (S64 TOLD-RAISE ADMIT)
+        return
     if reason == REASON_FLOOR and int(told_final) > 0:
         n = _bump(scheduler, "_pf_floor_n")
         if n <= 32 or n % _LOG_EVERY == 0:
