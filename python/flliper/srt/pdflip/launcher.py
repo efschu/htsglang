@@ -16162,7 +16162,9 @@ def _d_measured_anchor(
             "anchor lookup FAILED (%s: %s); heuristic path stands"
             % (type(exc).__name__, exc)
         )
-    return anchor, ANCHOR_NOTE_PREFIX + anchor.provenance
+    # S68: the scan note (index hits / logs read / wall) rides behind the
+    # provenance, which itself is unchanged
+    return anchor, ANCHOR_NOTE_PREFIX + anchor.provenance + getattr(anchor, "scan_note", "")
 
 
 def d_operating_point_rows(
