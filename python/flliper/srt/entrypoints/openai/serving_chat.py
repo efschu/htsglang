@@ -933,6 +933,17 @@ class OpenAIServingChat(OpenAIServingBase):
             result = self._apply_conversation_template(request, is_multimodal)
 
         result.tool_call_constraint = tool_call_constraint
+        # S70 PROMPT-DIVERGE (entrypoints/prompt_diverge.py): every chat path
+        # renders here -- a prompt that stopped extending a recent one is named
+        # with the bytes that moved. Log only, never raises.
+        from flliper.srt.entrypoints import prompt_diverge as _pd
+
+        _pd.observe(
+            getattr(result, "prompt", None),
+            rid=getattr(request, "rid", None),
+            ids=getattr(result, "prompt_ids", None),
+            decode=getattr(self.tokenizer_manager.tokenizer, "decode", None),
+        )
         return result
 
     def _apply_jinja_template(

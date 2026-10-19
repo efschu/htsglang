@@ -8403,6 +8403,13 @@ class Scheduler(
         _hb_min = handback_min_tokens(has_handoff=_pdflip_hb_handoff)
         if _hb_min is not None:
             _tail_min = _hb_min if _tail_min is None else min(int(_tail_min), int(_hb_min))
+        # S73 (rc16 194-759: 23x '#915 too_short need=64..192' on P PP0): a
+        # group-P store read is read whatever its length (handback_claim).
+        from flliper.srt.pdflip.handback_claim import p_intake_min_tokens
+
+        _pi_min = p_intake_min_tokens()
+        if _pi_min is not None:
+            _tail_min = _pi_min if _tail_min is None else min(int(_tail_min), int(_pi_min))
         _tail_kw = {"min_tokens": _tail_min} if _tail_min is not None else {}
         _tail_kw.update(_prefetch_namespace_kw(self.tree_cache, req))
         if group_decides:

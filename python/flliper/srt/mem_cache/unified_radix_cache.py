@@ -4983,6 +4983,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # K15 review A1: the save reads WHICH pool refused (only a mamba-arena
         # refusal can be served by a spill)
         self._k15_last_refusal = str(why).split(":", 1)[0]
+        # S73: the publish sweep names WHY it refused (its BACKUP-REFUSED lines
+        # are sampled per reason -- rc16 TP1 14:13:15: 39 refusals, 0 lines)
+        _s73 = getattr(self, "_s73_sweep_why", None)
+        if _s73 is not None:
+            _k73 = str(why).split(":", 1)[0]
+            _s73[_k73] = _s73.get(_k73, 0) + 1
         try:
             _role = _r12.role()
             if _role == "host":
@@ -7062,10 +7068,60 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         _role = _r12.role()
         if _r12.l3_group_on() and _role is not None:
             if _role == "host":
+                if (_r12.cut_role() == "host" and _r12.cut_l3_complete_on()
+                        and not UnifiedRadixCache._s74_cut_page_complete(self, node)):
+                    # S74 CUT-L3-WAIT (rc16 D 12:56:11-12:59:11, pdflip-114-244/246): under the token cut TP0
+                    # writes share 0 -- its ack proves nothing. Sent at once, the L3 event made every worker
+                    # skip the node in its publish sweep (l3_present) although its own extents were never
+                    # written (a TP0-alone K15 save, a worker's refused claim): the page stayed CLAIMED open0
+                    # (census oldest=.../pid<TP0>/host-write/open0, 153 at the park), the store's KV prefix
+                    # ended there and the reset dropped it. The verdict waits for the complete page.
+                    _r12.await_l3(self, node)
+                    return
                 node.l3_present = True
                 _r12.record_l3(self, node)
             return  # worker: TP0's L3 event sets it
         node.l3_present = True
+
+    def _s74_worker_publish(self, node) -> str:
+        """S74 review A1, a Form A worker at TP0's PUBLISH event (R12 consume, before any request of the pass):
+        write THIS rank's share of ``node`` now -- the same ``write_backup`` and the same skip rules as its publish
+        sweep, targeted -- so the claim joins TP0's open share-0 slot inside the partial-reap window. Returns the
+        outcome (named in ``S74 CUT-L3-PUBLISH``); a refusal leaves the node to the sweep, as before."""
+        if node.evicted or node.backuped or getattr(node, "l3_present", False):
+            return "backed"
+        if node.component_data[BASE_COMPONENT_TYPE].value is None:
+            return "no_device"
+        if node.write_through_pending_id is not None:
+            return "pending"
+        _adm = getattr(self, "_mamba_write_through_pin_admissible", None)
+        if callable(_adm) and not _adm(node):
+            return "pin_deferred"
+        try:
+            got = self.write_backup(node)
+        except Exception as exc:  # noqa: BLE001 - the sweep stays the fallback
+            logger.warning("S74 CUT-L3-PUBLISH write_backup raised on node %s: %r", getattr(node, "id", "?"), exc)
+            return "raised"
+        return "issued" if got and got > 0 else "refused"
+
+    def _s74_cut_page_complete(self, node) -> bool:
+        """S74: every KV page of ``node`` is COMPLETE in the arena (every token owner merged its extents) --
+        the shared slot header, no collective. True when it cannot be told (no arena pool, no keys, a lookup
+        error): the caller then keeps the pre-S74 verdict."""
+        try:
+            cc = self.cache_controller
+            pool = getattr(cc, "mem_pool_host", None)
+            arena = getattr(pool, "arena", None)
+            hashes = getattr(node, "hash_value", None)
+            backend = getattr(cc, "storage_backend", None)
+            if arena is None or not hashes or backend is None:
+                return True
+            stems = [backend._get_suffixed_key(h) for h in hashes]
+            states = arena.find_states(stems)
+            return all(int(s) == 2 for s in states) and len(states) == len(stems)
+        except Exception as exc:  # noqa: BLE001 - an unreadable answer keeps the old verdict
+            logger.warning("S74 CUT-L3 completeness probe raised on node %s: %r", getattr(node, "id", "?"), exc)
+            return True
 
     def _k12_republish_orphaned(self, node, orphaned: int) -> bool:
         """K12c review A3: give the orphaned node's host layer back so the node
@@ -7996,6 +8052,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         _issue_s = 0.0
         _walked = 0
         self._pdflip_sweep_last_refusal = None
+        self._s73_sweep_why = {}   # S73: refusal reasons of THIS sweep (the line's refused_by=)
         # SWEEP-FULL-ARENA: armed for this sweep; engaged by its first arena_claim refusal
         _full_arena_armed = self._pdflip_full_arena_skip_armed()
         _full_arena = False
@@ -8120,6 +8177,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 _full_arena = _full_arena or (
                     _full_arena_armed and self._pdflip_sweep_last_refusal == "arena_claim")
         stats["walked"] = _walked
+        stats["refused_by"] = dict(sorted((getattr(self, "_s73_sweep_why", None) or {}).items()))
+        self._s73_sweep_why = None
         stats["issue_ms"] = round(_issue_s * 1000.0, 1)
         stats["sweep_ms"] = round((time.perf_counter() - _t_sweep0) * 1000.0, 1)
         if clock is not None:
@@ -8143,12 +8202,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 "in_flight_after=%d pins=%d/%d draft_issued=%d draft_refused=%d "
                 "(denominator: un-backed device nodes at this flush poll; the draft terms are "
                 "the controller's CUMULATIVE L3 draft write counts, #1233 C18) "
-                "walked=%d sweep_ms=%.1f issue_ms=%.1f%s",
+                "walked=%d sweep_ms=%.1f issue_ms=%.1f%s%s",
                 n, stats["unbacked"], stats["issued"], stats["refused"], stats["skipped_pending"],
                 stats["pending"], self._mamba_pins_held(), self._mamba_pin_budget,
                 stats["draft_issued"], stats["draft_refused"],
                 stats["walked"], stats["sweep_ms"], stats["issue_ms"],
                 _full_arena_suffix(stats),
+                (" refused_by=" + ",".join(f"{k}:{v}" for k, v in stats["refused_by"].items()))
+                if stats["refused_by"] else "",
             )
         return stats
 
