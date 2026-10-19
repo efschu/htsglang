@@ -279,13 +279,36 @@ def test_a_backed_node_with_a_device_child_that_stays_is_not_evicted():
     assert plan is None and "device child" in why
 
 
-def test_mru_first_gets_the_room_the_cold_backed_one_is_evicted():
+def test_newest_pages_get_the_room_not_the_rank_local_clock():
+    """N4: the backed node allocated LAST (highest page) keeps the room, the older one
+    is the fallback eviction -- whatever the rank-local access clock says."""
     alloc, tree, cop = _world()
     _take(alloc, list(range(1, 16)))                       # one free page: 16
-    hot = _node(tree, alloc, [20], P, last=9)
-    cold = _node(tree, alloc, [21], P, last=1)
+    newer = _node(tree, alloc, [21], P, last=1)            # the clock calls it cold
+    older = _node(tree, alloc, [20], P, last=9)            # the clock calls it hot
     plan, _ = KC.plan_for(KC.survey(tree, alloc, P, B), B)
-    assert [m.node for m, _s, _d in plan.moves] == [hot] and [m.node for m in plan.evicts] == [cold]
+    assert [m.node for m, _s, _d in plan.moves] == [newer] and [m.node for m in plan.evicts] == [older]
+    # the same allocator and tree with the clocks swapped: the very same plan
+    newer.last_access_time, older.last_access_time = 9, 1
+    plan2, _ = KC.plan_for(KC.survey(tree, alloc, P, B), B)
+    assert KC.plan_digest(8, plan2) == KC.plan_digest(8, plan)
+
+
+def test_a_refused_move_leaves_nothing_evicted():
+    """Review test_rv77a_evict_then_refuse, turned: the MOVES go first (d_seat_compact's
+    order); a destination gone before execute refuses with nothing evicted."""
+    alloc, tree, cop = _world()
+    below = list(range(1, B + 1))
+    _take(alloc, below[:-1])                               # exactly one free page below
+    mover = _node(tree, alloc, [B + 4], P, backed=False, last=9)
+    leaf = _node(tree, alloc, [B + 5], P, backed=True, last=1)
+    plan, why = KC.plan_for(KC.survey(tree, alloc, P, B), B)
+    assert plan is not None and plan.moves and [m.node for m in plan.evicts] == [leaf], why
+    _take(alloc, [below[-1]])                              # the destination is gone
+    with pytest.raises(KC.CompactRefused):
+        KC.execute(tree, alloc, plan, cop)
+    assert tree.evicted == [] and leaf.component_data[FULL].value is not None
+    assert int((mover.component_data[FULL].value // P).max()) == B + 4
 
 
 def test_a_failed_copy_moves_no_node_and_frees_the_destinations():
@@ -440,3 +463,271 @@ def test_a_running_page_above_the_boundary_waits_for_its_end(floor_env, monkeypa
     sched.running_batch.reqs = [_req("pdflip-2-70", 150_000)]
     st = dsv_.runtime_tick(sched)
     assert not st.changed and ms.stage == 9 and "hold S9" in st.reason
+
+
+# ---- review N1: the real rank forms of NF rc17 -------------------------------------
+#
+# TP0 (5090): "#239 S3a ZERO-SHARE CELL: rank 0 owns no full-attention token (vector
+# [0, 1, 1]) -- 1855 B per GLOBAL token (QSA index 768 + draft 1087)", "#251c KV-STAGE
+# ... born=0": the QSA index and the draft K/V for EVERY global token, nothing born.
+# TP1/TP2 (3080): the token-cut FA owner share (#239 S3g), born; the draft as well.
+
+TOP = FLOOR_LADDER[-1]
+RATIO = 4                                     # QSA tokens per compressed slot
+
+
+def _fill(t):
+    flat = t.view(-1).view(torch.uint8)
+    flat.copy_((torch.arange(flat.numel(), dtype=torch.int64) * 7 % 251).to(torch.uint8))
+    return t
+
+
+def _draft_worker_v2(draft_pool):
+    """EAGLEWorkerV2: ``draft_worker.draft_worker`` is an EagleDraftWorker with
+    ``draft_runner`` and ``draft_worker.model_runner`` -- no ``model_runner``."""
+    runner = types.SimpleNamespace(token_to_kv_pool=draft_pool)
+    eagle = types.SimpleNamespace(draft_runner=runner,
+                                  draft_worker=types.SimpleNamespace(model_runner=runner))
+    return types.SimpleNamespace(draft_worker=eagle)
+
+
+def _draft_pool():
+    rows = TOP + PG
+    return types.SimpleNamespace(page_size=PG, size=TOP,
+                                 k_buffer=[_fill(torch.zeros(rows, 3, dtype=torch.uint8))],
+                                 v_buffer=[_fill(torch.zeros(rows, 2, dtype=torch.uint8))])
+
+
+def _tp0_pool():
+    cap = -(-(TOP + PG) // RATIO)
+    flat = _fill(torch.zeros(2, cap * 2, dtype=torch.uint8))           # 2 layers, 2 B a group
+    return types.SimpleNamespace(
+        page_size=PG, size=TOP, qsa_slot_space=TOP, qsa_compress_ratio=RATIO,
+        qsa_compressed_capacity=cap, qsa_compressed_flat=flat,
+        qsa_compressed_k_buffer_pool=[flat[i].view(cap, 2) for i in range(2)],
+        qsa_key_state_buffer_pool=[torch.zeros(7 * RATIO, 2)],         # per-request ring
+        qsa_rope_position_buffer=torch.zeros(7 * RATIO, 3, dtype=torch.int64),
+        full_kv_pool=types.SimpleNamespace(page_size=PG, size=0, k_buffer=[torch.zeros(0)],
+                                           v_buffer=[torch.zeros(0)]),
+        mamba_pool=types.SimpleNamespace(temporal=torch.zeros(3, 9, 4)))
+
+
+def _tp12_pool(S=2, ratio=1):
+    size = (TOP // S + 1) * ratio                                       # the owner share
+    return types.SimpleNamespace(
+        page_size=PG, size=size,
+        k_buffer=[_fill(torch.zeros(size + PG, 2, dtype=torch.uint8))],
+        v_buffer=[_fill(torch.zeros(size + PG, 2, dtype=torch.uint8))])
+
+
+def _form(floor_env, monkeypatch, target, *, owner=(0, 0)):
+    dsv_, sched, caps, alloc, tree, born = _metal_env(floor_env, monkeypatch)
+    monkeypatch.setattr(dsv_, "_KV_BORN", [])                         # TP0: born=0 -- not asked
+    monkeypatch.setattr(dsv_, "kv_owner_block", lambda: owner)
+    alloc._kvcache = target
+    draft = _draft_pool()
+    sched.draft_worker = _draft_worker_v2(draft)
+    return dsv_, sched, caps, alloc, tree, draft
+
+
+def _end_event(dsv_, sched, alloc, tree):
+    ms = _to_s9(dsv_, sched)
+    _take(alloc, list(range(1, 5000)))
+    turn = _node(tree, alloc, list(range(5800, 6000)) + list(range(6145, 6330)), PG, last=7)
+    v_old = turn.component_data[FULL].value.clone()
+    sched.running_batch.reqs = [_req("pdflip-2-70", 150_000), _req("pdflip-2-71", 120_000)]
+    st = dsv_.runtime_tick(sched)
+    return ms, st, turn, v_old
+
+
+def test_tp0_form_qsa_index_and_draft_move_with_no_born_tensor(floor_env, monkeypatch):
+    """RED on f0d30cfb7c (the guard named qsa_compressed_flat, every compaction refused).
+    GREEN: S8, and the QSA groups and the draft rows of every moved page carry their
+    bytes to the new page -- found through the pools, none of them stage-born."""
+    target = _tp0_pool()
+    dsv_, sched, caps, alloc, tree, draft = _form(floor_env, monkeypatch, target)
+    q0 = target.qsa_compressed_flat.clone()
+    d0 = [draft.k_buffer[0].clone(), draft.v_buffer[0].clone()]
+    ms, st, turn, v_old = _end_event(dsv_, sched, alloc, tree)
+    assert st.changed and ms.stage == 8, st.reason
+    v_new = turn.component_data[FULL].value
+    assert int((v_new // PG).max()) <= S8_PAGE
+    assert torch.equal(draft.k_buffer[0][v_new], d0[0][v_old])
+    assert torch.equal(draft.v_buffer[0][v_new], d0[1][v_old])
+    assert torch.equal(target.qsa_compressed_flat.view(2, -1, 2)[:, v_new // RATIO],
+                       q0.view(2, -1, 2)[:, v_old // RATIO])          # token by token
+
+
+def test_tp12_form_the_owner_share_and_the_draft_move(floor_env, monkeypatch):
+    """TP1/TP2: the FA owner share (S=2: 32 rows a page, the owner class = the offset
+    in the page) and the draft, global rows."""
+    target = _tp12_pool()
+    dsv_, sched, caps, alloc, tree, draft = _form(floor_env, monkeypatch, target, owner=(2, 1))
+    k0 = target.k_buffer[0].clone()
+    d0 = draft.k_buffer[0].clone()
+    ms, st, turn, v_old = _end_event(dsv_, sched, alloc, tree)
+    assert st.changed and ms.stage == 8, st.reason
+    v_new = turn.component_data[FULL].value
+    assert torch.equal(draft.k_buffer[0][v_new], d0[v_old])
+    per = PG // 2
+    for po, pn in zip((v_old[::PG] // PG).tolist(), (v_new[::PG] // PG).tolist()):
+        assert torch.equal(target.k_buffer[0][pn * per:(pn + 1) * per], k0[po * per:(po + 1) * per])
+
+
+# ---- review N2: the guard, structural and fail-closed ----------------------------------
+
+def _guard_sched(target, draft_worker=None, alloc_size=TOP):
+    alloc = _alloc(alloc_size // PG, PG)
+    alloc._kvcache = target
+    return types.SimpleNamespace(token_to_kv_pool_allocator=alloc, page_size=PG,
+                                 draft_worker=draft_worker), alloc
+
+
+def _names(sched):
+    bufs, why = dsv.kv_page_buffers(sched)
+    return [n for n, _t, _g in bufs], why
+
+
+def test_guard_finds_the_eaglev2_draft_pool():
+    s, _a = _guard_sched(_tp0_pool(), _draft_worker_v2(_draft_pool()))
+    assert [n for n, _p in dsv._kv_pools_of(s)] == ["target", "draft"]
+    names, why = _names(s)
+    assert why is None and "draft.k_buffer[0]" in names and "draft.v_buffer[0]" in names
+    assert "target.qsa_compressed_flat" in names
+
+
+def test_guard_refuses_a_draft_worker_whose_pool_it_cannot_find():
+    s, _a = _guard_sched(_tp0_pool(), types.SimpleNamespace(draft_worker=types.SimpleNamespace()))
+    names, why = _names(s)
+    assert names == [] and "draft?" in why
+
+
+def test_guard_moves_fp4_scale_buffers_too():
+    pool = _draft_pool()
+    pool.k_scale_buffer = [_fill(torch.zeros(TOP + PG, 1, dtype=torch.uint8))]
+    pool.v_scale_buffer = [_fill(torch.zeros(TOP + PG, 1, dtype=torch.uint8))]
+    s, _a = _guard_sched(pool)
+    names, why = _names(s)
+    assert why is None and {"target.k_scale_buffer[0]", "target.v_scale_buffer[0]"} <= set(names)
+
+
+@pytest.mark.parametrize("shape", [(TOP + PG, 4), (2, TOP + PG), (TOP // PG + 1, 8)])
+def test_guard_refuses_an_unknown_token_indexed_buffer(shape):
+    pool = _draft_pool()
+    pool.mystery = torch.zeros(*shape, dtype=torch.uint8)
+    s, _a = _guard_sched(pool)
+    names, why = _names(s)
+    assert names == [] and "target.mystery" in why
+
+
+def test_guard_leaves_the_request_rings_and_small_metadata():
+    pool = _tp0_pool()
+    pool.layer_ids = torch.arange(12)
+    s, _a = _guard_sched(pool)
+    names, why = _names(s)
+    assert why is None and not any("ring" in n or "key_state" in n or "rope" in n or "layer_ids" in n
+                                   for n in names)
+    assert not any("qsa_compressed_k_buffer_pool" in n for n in names)   # views of the flat
+
+
+def test_guard_refuses_a_slot_lifetime_mirror_and_hisparse():
+    s, alloc = _guard_sched(_draft_pool())
+    alloc.register_free_listener(lambda idx: None)                      # DFlash DraftKVSlotMapper
+    assert "_free_listeners" in _names(s)[1]
+    s, alloc = _guard_sched(_draft_pool())
+    alloc.full_to_hisparse_device_index_mapping = torch.zeros(4)
+    assert "HiSparse" in _names(s)[1]
+
+
+def test_guard_on_the_real_mha_pool_class():
+    """No false refusal and no blind spot on the real MHATokenToKVPool (CPU)."""
+    from unittest import mock
+
+    from flliper.srt.mem_cache.memory_pool import MHATokenToKVPool
+
+    with mock.patch.object(dsv, "stage_form", lambda env=None: None):
+        pool = MHATokenToKVPool(192, 16, torch.bfloat16, 1, 8, 2, "cpu", False,
+                                enable_alt_stream=False)
+    alloc = _alloc(192 // 16, 16)
+    alloc._kvcache = pool
+    s = types.SimpleNamespace(token_to_kv_pool_allocator=alloc, page_size=16)
+    names, why = _names(s)
+    assert why is None and sorted(names) == ["target.k_buffer[0]", "target.k_buffer[1]",
+                                             "target.v_buffer[0]", "target.v_buffer[1]"]
+
+
+# ---- review N3: digest, outcome AND, crash-stop ------------------------------------------
+
+def _scripted_same(monkeypatch, dsv_, answers):
+    """The N3 MIN/MAX collectives answer from a script: (lo, hi) per call."""
+    calls = []
+
+    def same(sched, value):
+        calls.append(int(value))
+        return answers[len(calls) - 1] if len(calls) <= len(answers) else (int(value), int(value))
+    monkeypatch.setattr(dsv_, "_group_same", same)
+    return calls
+
+
+def test_unequal_plan_digests_crash_stop_before_anything_moved(floor_env, monkeypatch):
+    target = _tp0_pool()
+    dsv_, sched, caps, alloc, tree, draft = _form(floor_env, monkeypatch, target)
+    ms = _to_s9(dsv_, sched)
+    _take(alloc, list(range(1, 5000)))
+    turn = _node(tree, alloc, list(range(6145, 6200)), PG)
+    v0 = turn.component_data[FULL].value
+    _scripted_same(monkeypatch, dsv_, [(1, 2)])                          # a peer planned otherwise
+    sched.running_batch.reqs = [_req("pdflip-2-70", 150_000)]
+    with pytest.raises(dsv_.PdFlipKvCompactDivergence, match="plans .* differ"):
+        dsv_.runtime_tick(sched)
+    assert turn.component_data[FULL].value is v0
+
+
+def test_moves_landed_here_but_not_on_a_peer_crash_stop(floor_env, monkeypatch):
+    target = _tp0_pool()
+    dsv_, sched, caps, alloc, tree, draft = _form(floor_env, monkeypatch, target)
+    ms = _to_s9(dsv_, sched)
+    _take(alloc, list(range(1, 5000)))
+    _node(tree, alloc, list(range(6145, 6200)), PG)
+    calls = []
+
+    def same(sched_, value):
+        calls.append(int(value))
+        if len(calls) == 1:
+            return int(value), int(value)                                # digests equal
+        return 0, 1                                                      # a peer rolled back
+    monkeypatch.setattr(dsv_, "_group_same", same)
+    sched.running_batch.reqs = [_req("pdflip-2-70", 150_000)]
+    with pytest.raises(dsv_.PdFlipKvCompactDivergence, match="rolled back on"):
+        dsv_.runtime_tick(sched)
+
+
+def test_every_rank_rolled_back_is_a_refusal_not_a_stop(floor_env, monkeypatch):
+    target = _tp0_pool()
+    dsv_, sched, caps, alloc, tree, draft = _form(floor_env, monkeypatch, target)
+    ms = _to_s9(dsv_, sched)
+    _take(alloc, list(range(1, 5000)))
+    turn = _node(tree, alloc, list(range(6145, 6200)), PG)
+    v0 = turn.component_data[FULL].value
+    monkeypatch.setattr(dsv_.KvPageCopier, "copy",
+                        lambda self, s, d: (_ for _ in ()).throw(RuntimeError("boom")))
+    sched.running_batch.reqs = [_req("pdflip-2-70", 150_000)]
+    st = dsv_.runtime_tick(sched)                                        # local group: all 0
+    assert not st.changed and ms.stage == 9 and turn.component_data[FULL].value is v0
+
+
+def test_a_failed_fallback_eviction_on_a_rank_crash_stops(floor_env, monkeypatch):
+    target = _tp0_pool()
+    dsv_, sched, caps, alloc, tree, draft = _form(floor_env, monkeypatch, target)
+    ms = _to_s9(dsv_, sched)
+    _take(alloc, [p for p in range(1, S8_PAGE + 1)])                    # nothing free below S8
+    _node(tree, alloc, list(range(6145, 6150)), PG, backed=True)
+    calls = []
+
+    def same(sched_, value):
+        calls.append(int(value))
+        return (int(value), int(value)) if len(calls) < 3 else (0, 1)   # the eviction AND
+    monkeypatch.setattr(dsv_, "_group_same", same)
+    sched.running_batch.reqs = [_req("pdflip-2-70", 150_000)]
+    with pytest.raises(dsv_.PdFlipKvCompactDivergence, match="evictions"):
+        dsv_.runtime_tick(sched)

@@ -32,18 +32,22 @@ page into free pages below it -- in every KV tensor the stage form trims on this
 rank (``d_seat_vram.KvPageCopier``: FA K/V or their owner share, QSA compressed
 keys, draft K/V) -- then the node's value is re-pointed (same tokens, same
 offsets in the page) and the sources go back to the allocator. Un-backed nodes
-take the free pages first, then the backed ones, most recently used first; a
-backed node left over is EVICTED from the device (its host copy stays, a later
+take the free pages first, then the backed ones, newest pages first (page ids:
+replicated, never the rank-local access clock); a backed node left over is EVICTED from the device (its host copy stays, a later
 hit reads it back -- never a recompute), leaf first, never one with a device
 child that stays. A page above the boundary that no tree node holds (a running
 request's own page, a session slot) or a pinned node stops the plan by name:
 no partial move, the next end event looks again.
 
-Rank-local execution, group verdict (``d_seat_vram._kv_compact_for_shrink``):
-the plan is surveyed on every rank, the group MIN of "my plan clears boundary
-j" picks the lowest stage every rank reaches, then each rank carries its own
-plan out and the group floor is read again -- the ranks agree on the shrink as
-they did before (the floor MAX), only now the floor has come down.
+Rank-local execution, group verdict and group check (``d_seat_vram.
+_kv_compact_for_shrink``): the plan is surveyed on every rank, the group MIN of
+"my plan clears boundary j" picks the lowest stage every rank reaches; the plan
+DIGEST must be equal on every rank, the MOVES go first and their outcome must be
+equal on every rank, only then the fallback evictions -- any difference after a
+mutation is a named crash-stop (review N3). The pages move in EVERY token-indexed
+buffer of every KV pool of the rank (``d_seat_vram.kv_page_buffers``), stage-born
+or not (review N1: TP0 on NF holds the QSA index and the draft for every token
+with ``born=0``).
 """
 
 from __future__ import annotations
@@ -72,7 +76,7 @@ class NodePages:
     pinned: bool
     #: its host (L2) copy has landed for every component it holds on the device
     backed: bool
-    #: last access (LRU order; larger = more recent)
+    #: the rank-local access clock -- logged only, never a decision (review N4)
     last: float = 0.0
 
 
@@ -254,8 +258,17 @@ def plan_for(s: Survey, boundary_page: int) -> Tuple[Optional[Plan], str]:
                 p, getattr(np_.node, "id", "?"))
         movers[id(np_)] = np_
     free = [p for p in s.free if p <= B]
-    order = ([m for m in movers.values() if not m.backed]
-             + sorted((m for m in movers.values() if m.backed), key=lambda m: -m.last))
+    # N4 (review S77-A): the order is REPLICATED state only -- page ids, never the
+    # rank-local access clock. Un-backed first (they must not be lost); then the
+    # backed ones whose pages were allocated LAST (highest page above the boundary:
+    # the allocator hands out the lowest free page, so the newest turns sit highest)
+    # keep the room, the older ones are the fallback evictions. The plan digest (N3)
+    # still compares the whole plan across the ranks.
+    def _key(m):
+        return (-max(m.pages), min(m.pages))
+
+    order = (sorted((m for m in movers.values() if not m.backed), key=_key)
+             + sorted((m for m in movers.values() if m.backed), key=_key))
     plan = Plan(boundary_page=B)
     rest: List[NodePages] = []
     for m in order:
@@ -325,25 +338,44 @@ def _remap_value(value, P: int, remap: Dict[int, int]):
     return out.to(dtype=value.dtype, device=value.device).reshape(value.shape)
 
 
-def execute(cache: Any, allocator: Any, plan: Plan, copier: Any, *, sync=None) -> Result:
-    """Carry the plan out on this rank: the fallback evictions (lossless, the host
-    copy stays), then claim the destinations, copy, sync, re-point the nodes
-    (transactional), free the sources. Raises CompactRefused (named) before any
-    node moved when a destination is not free or the copy fails."""
+def plan_digest(stage: int, plan: Plan) -> int:
+    """N3: a 62-bit digest of what this rank will do -- the target stage, every move
+    (sources, destinations) and every eviction (its pages above the boundary), all
+    in plan order. Equal on every rank exactly when the plans are the same."""
+    import hashlib
+
+    h = hashlib.blake2b(digest_size=8)
+    h.update(repr((int(stage), int(plan.boundary_page),
+                   [(tuple(s), tuple(d)) for _m, s, d in plan.moves],
+                   [tuple(m.pages) for m in plan.evicts])).encode())
+    return int.from_bytes(h.digest(), "big") >> 2
+
+
+def _sync_device(sync=None) -> None:
+    import torch
+
+    if sync is not None:
+        sync()
+    elif torch.cuda.is_available() and torch.cuda.is_initialized():
+        torch.cuda.synchronize()
+
+
+def execute_moves(cache: Any, allocator: Any, plan: Plan, copier: Any, *, sync=None) -> Result:
+    """The MOVES of the plan on this rank: claim the destinations, sync, copy, sync,
+    re-point the nodes (transactional), free the sources. Raises CompactRefused
+    (named) with everything rolled back -- no node re-pointed, destinations free.
+
+    OVERLAP (H1 of the review): the tick runs in ``get_next_batch_to_run`` while the
+    previous batch may still run. That batch writes only its own ``out_cache_loc``
+    pages (never a free destination, never an idle tree page: a tree page is a full
+    page of committed tokens) and reads at most tree pages (read against read). The
+    first sync still makes the copy start after it; the second lands the copy before
+    a node names the destination and before a source goes back to the allocator."""
     import torch
 
     t0 = time.perf_counter()
     P = int(copier.page_size)
     full = _full_ct().FULL
-    evicted_nodes = evicted_tokens = 0
-    for m in plan.evicts:
-        node = m.node
-        if not cache._is_device_leaf(node):
-            raise CompactRefused("node %s is no device leaf at its eviction" % getattr(node, "id", "?"))
-        tracker = {ct: 0 for ct in cache.tree_components}
-        cache._evict_to_host(node, tracker)
-        evicted_nodes += 1
-        evicted_tokens += int(tracker.get(full, 0))
     nbytes = 0
     dev = getattr(getattr(allocator, "free_pages", None), "device", "cpu")
     if plan.moves:
@@ -352,11 +384,9 @@ def execute(cache: Any, allocator: Any, plan: Plan, copier: Any, *, sync=None) -
         if not _claim_pages(allocator, dst_all):
             raise CompactRefused("destination pages %s.. not all free" % dst_all[:8])
         try:
+            _sync_device(sync)
             nbytes = copier.copy(src_all, dst_all)
-            if sync is not None:
-                sync()
-            elif torch.cuda.is_available() and torch.cuda.is_initialized():
-                torch.cuda.synchronize()
+            _sync_device(sync)
         except Exception as exc:  # noqa: BLE001 -- nothing re-pointed yet: destinations go back
             allocator.free(torch.tensor([p * P for p in dst_all], dtype=torch.int64, device=dev))
             raise CompactRefused("copy failed before any node moved: %s: %s"
@@ -376,6 +406,31 @@ def execute(cache: Any, allocator: Any, plan: Plan, copier: Any, *, sync=None) -
                                  "freed): %s: %s" % (len(done), len(plan.moves), type(exc).__name__,
                                                      exc)) from exc
         allocator.free(torch.tensor([p * P for p in src_all], dtype=torch.int64, device=dev))
-    return Result(moved_nodes=len(plan.moves), moved_pages=plan.moved_pages,
-                  evicted_nodes=evicted_nodes, evicted_tokens=evicted_tokens, bytes=int(nbytes),
-                  ms=(time.perf_counter() - t0) * 1000.0)
+    return Result(moved_nodes=len(plan.moves), moved_pages=plan.moved_pages, evicted_nodes=0,
+                  evicted_tokens=0, bytes=int(nbytes), ms=(time.perf_counter() - t0) * 1000.0)
+
+
+def execute_evicts(cache: Any, plan: Plan) -> Tuple[int, int]:
+    """The fallback EVICTIONS (after the group saw every rank's moves land): backed
+    device leaves, leaf first, through the tree's own ``_evict_to_host`` (the host
+    copy stays). Returns (nodes, tokens)."""
+    full = _full_ct().FULL
+    nodes = tokens = 0
+    for m in plan.evicts:
+        node = m.node
+        if not cache._is_device_leaf(node):
+            raise CompactRefused("node %s is no device leaf at its eviction" % getattr(node, "id", "?"))
+        tracker = {ct: 0 for ct in cache.tree_components}
+        cache._evict_to_host(node, tracker)
+        nodes += 1
+        tokens += int(tracker.get(full, 0))
+    return nodes, tokens
+
+
+def execute(cache: Any, allocator: Any, plan: Plan, copier: Any, *, sync=None) -> Result:
+    """Single-rank form (tests, no group): the moves, then the evictions -- the order
+    the group path keeps with a collective between the two (d_seat_compact's order:
+    a refused move leaves nothing evicted)."""
+    res = execute_moves(cache, allocator, plan, copier, sync=sync)
+    res.evicted_nodes, res.evicted_tokens = execute_evicts(cache, plan)
+    return res

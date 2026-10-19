@@ -1288,6 +1288,12 @@ class KvPageCopier:
     def from_born(cls, page_size: int) -> "KvPageCopier":
         return cls(list(_KV_BORN), _KV_BORN_T, page_size)
 
+    @classmethod
+    def from_buffers(cls, bufs, page_size: int) -> "KvPageCopier":
+        """S77-A N1: the buffers ``kv_page_buffers`` found, each with its pool's geometry."""
+        born = [(int(t.data_ptr()), g) for _n, t, g in bufs]
+        return cls(born, {int(t.data_ptr()): t for _n, t, _g in bufs}, page_size)
+
     def ptrs(self) -> set:
         return {int(t.data_ptr()) for t, _g, _p, _b in self.items}
 
@@ -3246,27 +3252,54 @@ KV_COMPACT_MARK = "PDFLIP D-MEM-SCHED KV-COMPACT"
 _KV_COMPACT_N = [0]
 
 
-def _pool_kv_tensors(pool, seen: set, out: list, name: str = "kv") -> None:
-    """Every token-indexed device buffer a KV pool (and its sub-pools) holds:
-    the K/V lists, an MLA latent list, the QSA compressed keys, a DSA index list."""
-    if pool is None or id(pool) in seen:
+class PdFlipKvCompactDivergence(RuntimeError):
+    """S77-A N3: the ranks' KV-COMPACT plans or outcomes differ -- a named crash-stop
+    (RAENGE-NIE-UNEINS: never "refuse and go on" after a rank-local mutation)."""
+
+
+#: per-REQUEST rings a page move does not touch (indexed ``req_pool_idx * ratio``)
+_KV_REQUEST_RINGS = ("qsa_key_state_buffer_pool", "qsa_rope_position_buffer")
+#: per-layer lists whose FIRST dim is the token slot (rows), with the page's tokens
+_KV_ROW_LISTS = ("k_buffer", "v_buffer", "k_scale_buffer", "v_scale_buffer",
+                 "kv_buffer", "kv_scale_buffer")
+#: sub-objects that are no token-indexed KV (GDN states: slots per request, moved by
+#: d_seat_compact; the saver adapter; device descriptors)
+_KV_SKIP_ATTRS = ("mamba_pool", "memory_saver_adapter", "_kv_buffer_descs", "layer_transfer_counter")
+
+
+def _is_pool(x) -> bool:
+    if x is None or isinstance(x, (int, float, str, bytes, bool)):
+        return False
+    try:
+        from flliper.srt.mem_cache.memory_pool import KVCache
+
+        if isinstance(x, KVCache):
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    return any(hasattr(x, a) for a in ("k_buffer", "kv_buffer", "qsa_compressed_flat"))
+
+
+def _runner_pools(obj, out: list, seen_ids: set, depth: int = 0) -> None:
+    """Every ``token_to_kv_pool`` behind a draft worker, whatever its shape:
+    ``model_runner``, ``draft_runner``, ``draft_model_runner`` and the nested
+    ``draft_worker`` (EAGLEWorkerV2: ``draft_worker.draft_worker`` is an
+    EagleDraftWorker with ``draft_runner`` and ``draft_worker.model_runner``)."""
+    if obj is None or depth > 3 or id(obj) in seen_ids:
         return
-    seen.add(id(pool))
-    for attr in ("k_buffer", "v_buffer", "kv_buffer", "index_k_with_scale_buffer"):
-        lst = getattr(pool, attr, None)
-        if isinstance(lst, (list, tuple)):
-            for i, t in enumerate(lst):
-                if t is not None and hasattr(t, "data_ptr"):
-                    out.append(("%s.%s[%d]" % (name, attr, i), t))
-    flat = getattr(pool, "qsa_compressed_flat", None)
-    if flat is not None and hasattr(flat, "data_ptr"):
-        out.append(("%s.qsa_compressed_flat" % name, flat))
-    for sub in ("full_kv_pool", "swa_kv_pool", "main_pool", "index_pool"):
-        _pool_kv_tensors(getattr(pool, sub, None), seen, out, "%s.%s" % (name, sub))
+    seen_ids.add(id(obj))
+    for attr in ("model_runner", "draft_runner", "draft_model_runner"):
+        r = getattr(obj, attr, None)
+        pool = getattr(r, "token_to_kv_pool", None) if r is not None else None
+        if pool is not None:
+            out.append(pool)
+    _runner_pools(getattr(obj, "draft_worker", None), out, seen_ids, depth + 1)
 
 
 def _kv_pools_of(sched) -> list:
-    """(name, pool) of the target's KV cache and the draft's (MTP/EAGLE share the ids)."""
+    """(name, pool) of the target's KV cache and of EVERY draft pool (MTP/EAGLE write
+    at the target's page ids). A draft worker whose pool cannot be found is named
+    by a ``(\"draft?\", None)`` entry -- the walker refuses on it (fail-closed)."""
     out = []
     alloc = _kv_allocator(sched)
     kv = None
@@ -3274,33 +3307,153 @@ def _kv_pools_of(sched) -> list:
         get = getattr(alloc, "get_kvcache", None)
         kv = get() if callable(get) else getattr(alloc, "_kvcache", None)
     runner = getattr(getattr(sched, "tp_worker", None), "model_runner", None)
-    kv = kv if kv is not None else getattr(runner, "token_to_kv_pool", None)
+    if kv is None:
+        kv = getattr(runner, "token_to_kv_pool", None)
     out.append(("target", kv))
     dw = getattr(sched, "draft_worker", None)
     if dw is not None:
-        dr = getattr(dw, "model_runner", None) or getattr(getattr(dw, "draft_worker", None),
-                                                          "model_runner", None)
-        if dr is not None and dr is not runner:
-            out.append(("draft", getattr(dr, "token_to_kv_pool", None)))
+        pools: list = []
+        _runner_pools(dw, pools, set())
+        uniq = []
+        for p in pools:
+            if p is not kv and all(p is not q for q in uniq):
+                uniq.append(p)
+        if not uniq and not any(p is kv for p in pools):
+            out.append(("draft?", None))
+        for i, p in enumerate(uniq):
+            out.append(("draft" if i == 0 else "draft%d" % i, p))
     return out
 
 
-def kv_compact_unregistered(sched, born_ptrs: set) -> Optional[str]:
-    """S77-A: None when every token-indexed KV buffer of this rank's pools is one the
-    stage form registered (``KvPageCopier`` moves pages in exactly those); else the
-    first one that is not -- a page moved without it would leave its bytes behind."""
-    seen, found = set(), []
-    for name, pool in _kv_pools_of(sched):
-        _pool_kv_tensors(pool, seen, found, name)
-    for name, t in found:
-        try:
-            if int(t.numel()) == 0:
+def _slot_counts(alloc, pool) -> set:
+    """The sizes a token-slot dimension of ``pool`` can have (exact): the global
+    slot space (+ page), its pages, a compacted owner share, QSA groups."""
+    P = int(getattr(pool, "page_size", 0) or getattr(alloc, "page_size", 0) or 1)
+    out = set()
+    for size in (getattr(alloc, "size", None), getattr(pool, "size", None),
+                 getattr(pool, "qsa_slot_space", None)):
+        if size:
+            out.update({int(size), int(size) + P, (int(size) + P) // P, int(size) // P + 1})
+    cap = getattr(pool, "qsa_compressed_capacity", None)
+    if cap:
+        out.add(int(cap))
+    return {x for x in out if x > 1}
+
+
+def _row_geom(name: str, t, pool, alloc, P: int):
+    """A per-layer buffer whose FIRST dim is the token slot -> (KvTensorGeom, why)."""
+    rows = int(t.shape[0])
+    nbytes = int(t.numel()) * int(t.element_size())
+    if rows <= 0 or nbytes % rows:
+        return None, "%s: %d bytes not whole rows of %d" % (name, nbytes, rows)
+    sb = nbytes // rows
+    G = int(getattr(alloc, "size", 0) or 0) + P            # the global slot space (+ pad page)
+    S, ratio = owner_block_for(int(getattr(pool, "size", 0) or 0))
+    if S > 0 and ratio > 0:                                # #239 S3g: this rank's owner share
+        return KvTensorGeom(SlotTensorGeom(name, 1, rows, sb, nbytes), 1, P, (S, ratio)), None
+    if rows == G:                                          # one row per global token
+        return KvTensorGeom(SlotTensorGeom(name, 1, rows, sb, nbytes), 1, P), None
+    if rows * P == G:                                      # page-major: one row per page
+        return KvTensorGeom(SlotTensorGeom(name, 1, rows, sb, nbytes), P, P), None
+    return None, "%s: %d rows match no slot geometry of the %d-token space" % (name, rows, G)
+
+
+def kv_page_buffers(sched):
+    """S77-A N1/N2: EVERY token-indexed device buffer of every KV pool of this rank,
+    each with the geometry its POOL gives it -- (list of (name, tensor, geom), why).
+
+    Structural, fail-closed: every tensor attribute / tensor list of every pool
+    (sub-pools recursed) is looked at; a buffer with a token-slot dimension is
+    either one the walker knows how to move (the per-layer row lists, the QSA
+    compressed keys) or the walk REFUSES by its name. Named exemptions only: the
+    per-request QSA rings and the GDN pool. Also refused: a draft worker whose pool
+    is not found, a slot-lifetime mirror (DFlash ``DraftKVSlotMapper`` free/alias
+    listeners), HiSparse's index mapping. "Stage-born" plays no part here: TP0 on
+    NF holds the QSA index and the draft for every global token without a single
+    born tensor (#251c born=0, #239 S3a ZERO-SHARE CELL)."""
+    import torch
+
+    alloc = _kv_allocator(sched)
+    if alloc is None:
+        return [], "no allocator"
+    P = int(getattr(alloc, "page_size", 0) or _page_size(sched))
+    for attr in ("_free_listeners", "_alias_listeners"):
+        if getattr(alloc, attr, None):
+            return [], "allocator.%s armed (a slot-lifetime mirror, e.g. DFlash DraftKVSlotMapper)" % attr
+    if getattr(alloc, "full_to_hisparse_device_index_mapping", None) is not None or \
+            "HiSparse" in type(alloc).__name__:
+        return [], "HiSparse device index mapping (%s)" % type(alloc).__name__
+    found, seen_t, seen_p = [], set(), set()
+
+    def walk(pool, name):
+        if pool is None:
+            raise KvCopyRefused("%s: pool not found" % name)
+        if id(pool) in seen_p:
+            return
+        seen_p.add(id(pool))
+        counts = _slot_counts(alloc, pool)
+        flat = getattr(pool, "qsa_compressed_flat", None)
+        flat_st = None
+        if isinstance(flat, torch.Tensor) and flat.numel():
+            flat_st = flat.untyped_storage().data_ptr()
+        if getattr(pool, "full_to_hisparse_device_index_mapping", None) is not None:
+            raise KvCopyRefused("%s: HiSparse index mapping" % name)
+        for attr, val in sorted(vars(pool).items()):
+            here = "%s.%s" % (name, attr)
+            if attr in _KV_SKIP_ATTRS or attr in _KV_REQUEST_RINGS:
                 continue
-        except Exception:  # noqa: BLE001
-            continue
-        if int(t.data_ptr()) not in born_ptrs:
-            return name
-    return None
+            if _is_pool(val):
+                walk(val, here)
+                continue
+            if isinstance(val, dict):
+                items = [("%s[%r]" % (here, k), v) for k, v in val.items()]
+            elif isinstance(val, (list, tuple)):
+                items = [("%s[%d]" % (here, i), v) for i, v in enumerate(val)]
+            else:
+                items = [(here, val)]
+            for nm, t in items:
+                if _is_pool(t):
+                    walk(t, nm)
+                    continue
+                if not isinstance(t, torch.Tensor) or t.numel() == 0:
+                    continue
+                if id(t) in seen_t:
+                    continue
+                seen_t.add(id(t))
+                if attr in _KV_ROW_LISTS:
+                    g, why = _row_geom(nm, t, pool, alloc, P)
+                    if g is None:
+                        raise KvCopyRefused(why)
+                    found.append((nm, t, g))
+                    continue
+                if attr == "qsa_compressed_flat":
+                    cap = int(getattr(pool, "qsa_compressed_capacity", 0) or 0)
+                    r = int(getattr(pool, "qsa_compress_ratio", 0) or 0)
+                    nb = int(t.numel()) * int(t.element_size())
+                    L = int(t.shape[0])
+                    if cap <= 0 or r <= 0 or nb % (L * cap):
+                        raise KvCopyRefused("%s: QSA geometry unreadable" % nm)
+                    found.append((nm, t, KvTensorGeom(SlotTensorGeom(nm, L, cap, nb // (L * cap), nb), r, P)))
+                    continue
+                if attr == "qsa_compressed_k_buffer_pool" and flat_st is not None and \
+                        t.untyped_storage().data_ptr() == flat_st:
+                    continue  # per-layer views of qsa_compressed_flat
+                if any(int(d) in counts for d in t.shape):
+                    raise KvCopyRefused("%s %s: a token-slot dimension the page move does not "
+                                        "know how to follow" % (nm, tuple(t.shape)))
+    try:
+        for name, pool in _kv_pools_of(sched):
+            walk(pool, name)
+    except KvCopyRefused as exc:
+        return [], str(exc)
+    return found, None
+
+
+def kv_compact_unregistered(sched, born_ptrs=None) -> Optional[str]:
+    """None when every token-indexed KV buffer of this rank is one the page move
+    follows (``kv_page_buffers``); else why not. ``born_ptrs`` is ignored (kept for
+    callers of the first form): being stage-born is not the question (review N1)."""
+    return kv_page_buffers(sched)[1]
 
 
 def _kv_compact_tree_ok(sched) -> bool:
@@ -3311,20 +3464,20 @@ def _kv_compact_tree_ok(sched) -> bool:
 
 
 def _kv_compact_rank_plans(sched, boundaries: Sequence[int]):
-    """Rank-local: (plans, why) -- one plan (or None) per candidate boundary page."""
+    """Rank-local: (plans, why, copier) -- one plan (or None) per candidate boundary."""
     from flliper.srt.pdflip import d_kv_compact as KC
 
     page = _page_size(sched)
     alloc = _kv_allocator(sched)
     if alloc is None:
         return [None] * len(boundaries), "no allocator", None
+    bufs, why = kv_page_buffers(sched)
+    if why is not None:
+        return [None] * len(boundaries), why, None
     try:
-        copier = KvPageCopier.from_born(page)
+        copier = KvPageCopier.from_buffers(bufs, page)
     except KvCopyRefused as exc:
         return [None] * len(boundaries), "copier: %s" % exc, None
-    missing = kv_compact_unregistered(sched, copier.ptrs())
-    if missing is not None:
-        return [None] * len(boundaries), "KV buffer %s is not a stage tensor" % missing, None
     sv = KC.survey(getattr(sched, "tree_cache", None), alloc, page, min(int(b) for b in boundaries))
     plans, why = [], ""
     for b in boundaries:
@@ -3335,6 +3488,15 @@ def _kv_compact_rank_plans(sched, boundaries: Sequence[int]):
     return plans, why, copier
 
 
+def _group_same(sched, value: int) -> Tuple[int, int]:
+    """(MIN, MAX) of one int over the group (one collective); local without a group."""
+    gmin = getattr(sched, "_pdflip_group_min_ints", None)
+    if gmin is None:
+        return int(value), int(value)
+    r = [int(x) for x in gmin([int(value), -int(value)])]
+    return r[0], -r[1]
+
+
 def _kv_compact_for_shrink(sched, ms, fr, want: int, end: bool, floor_tokens: int) -> Optional[int]:
     """S77-A: the floor blocks the shrink to ``want``: move the tree's idle pages
     above the boundary down (``d_kv_compact``), then return the GROUP floor read
@@ -3343,13 +3505,20 @@ def _kv_compact_for_shrink(sched, ms, fr, want: int, end: bool, floor_tokens: in
     REPLICATED entry: MemSched calls this only on a shrink the GROUP floor blocks.
     Every input of the decision is replicated (want, end, the floor, the stage); a
     refused (or fruitless) attempt is not repeated for the same (want, stage)
-    before the next end event -- also while the shrink is pending (MemSched passes
-    the event through). Two collectives: the MIN over "my plan clears stage jj" for
-    every jj between ``want`` and the floor's stage (the lowest every rank
-    reaches wins), and the floor re-read after the moves."""
+    before the next end event -- also while the shrink is pending.
+
+    Collectives, all entered by every rank on the same path:
+    1. MIN over "my plan clears stage jj" (moves only / with evictions);
+    2. N3 the plan DIGEST (jj, sources, destinations, evictions) as MIN/MAX:
+       unequal = PdFlipKvCompactDivergence before anything moved;
+    3. N3 the MOVES' outcome as MIN/MAX: all moved -> go on; none moved (each
+       rolled back) -> refused, nothing changed anywhere; mixed -> crash-stop;
+    4. only then the evictions (the d_seat_compact order: move first), outcome
+       MIN/MAX: anything but "all evicted" -> crash-stop;
+    5. the floor re-read (MAX)."""
+    from flliper.srt.pdflip import d_kv_compact as KC
+
     tokens = ms.stage_tokens
-    # a refusal is looked at again on the next END event (a request's pages became
-    # the tree's), not on every re-read of a pending floor (one survey per decision)
     key = (int(want), int(ms.stage))
     if not end and fr.get("compact_refused") == key:
         fr["compact_skipped"] = int(fr.get("compact_skipped", 0)) + 1
@@ -3365,9 +3534,6 @@ def _kv_compact_for_shrink(sched, ms, fr, want: int, end: bool, floor_tokens: in
         plans, why, copier = _kv_compact_rank_plans(sched, [int(tokens[jj]) // page for jj in cands])
     except Exception as exc:  # noqa: BLE001 -- a survey failure is this rank's "no"
         plans, why, copier = [None] * len(cands), "%s: %s" % (type(exc).__name__, exc), None
-    # the product rule (30.09.): move, evict only as the fallback -- the lowest stage
-    # every rank clears by MOVES alone first; only when none does, the lowest one a
-    # rank clears by also evicting backed nodes (their host copy stays)
     moves = [1 if (p is not None and not p.evicts) else 0 for p in plans]
     anys = [1 if p is not None else 0 for p in plans]
     flags = moves + anys
@@ -3375,13 +3541,10 @@ def _kv_compact_for_shrink(sched, ms, fr, want: int, end: bool, floor_tokens: in
     group = list(flags) if gmin is None else [int(x) for x in gmin(list(flags))]
     k = len(cands)
     if len(group) != 2 * k:
-        group = [0] * (2 * k)  # an answer of another shape agrees to nothing
-    # the group MIN can only be <= this rank's own flag: a "yes" over a plan this
-    # rank does not have would be a broken collective -- never acted on
+        group = [0] * (2 * k)
     pick = next((i for i in range(k) if group[i] == 1 and moves[i]), None)
     if pick is None:
         pick = next((i for i in range(k) if group[k + i] == 1 and anys[i]), None)
-    flags = anys
     _KV_COMPACT_N[0] += 1
     n = _KV_COMPACT_N[0]
     if pick is None:
@@ -3389,33 +3552,64 @@ def _kv_compact_for_shrink(sched, ms, fr, want: int, end: bool, floor_tokens: in
         if n <= 16 or (n & (n - 1)) == 0:
             logger.info("%s n=%d verdict=refused want=S%d stage=S%d floor=%d end=%s local=%s -- %s",
                         KV_COMPACT_MARK, n, int(want), int(ms.stage), int(floor_tokens),
-                        "yes" if end else "no", "".join(str(x) for x in flags),
+                        "yes" if end else "no", "".join(str(x) for x in anys),
                         why or "a peer rank cannot clear the boundary")
         return None
     jj, plan = cands[pick], plans[pick]
+    digest = KC.plan_digest(jj, plan)
+    lo, hi = _group_same(sched, digest)
+    if lo != hi:
+        raise PdFlipKvCompactDivergence(
+            "%s n=%d: the ranks' plans for S%d differ (digest here %d, group %d..%d) -- the "
+            "allocators or trees are no longer replicas; nothing moved" % (
+                KV_COMPACT_MARK, n, jj, digest, lo, hi))
     res = None
     try:
-        from flliper.srt.pdflip import d_kv_compact as KC
-
-        res = KC.execute(getattr(sched, "tree_cache", None), _kv_allocator(sched), plan, copier)
-    except Exception as exc:  # noqa: BLE001 -- named; the group floor below says what holds
-        logger.warning("%s n=%d verdict=failed target=S%d: %s: %s", KV_COMPACT_MARK, n, jj,
-                       type(exc).__name__, exc)
+        res = KC.execute_moves(getattr(sched, "tree_cache", None), _kv_allocator(sched), plan, copier)
+        ok = 1
+    except KC.CompactRefused as exc:   # rolled back on THIS rank
+        logger.warning("%s n=%d moves refused here (rolled back): %s", KV_COMPACT_MARK, n, exc)
+        ok = 0
+    lo, hi = _group_same(sched, ok)
+    if lo != hi:
+        raise PdFlipKvCompactDivergence(
+            "%s n=%d: the moves for S%d went through on some ranks and were rolled back on "
+            "others (here: %s) -- page placement differs" % (KV_COMPACT_MARK, n, jj,
+                                                            "moved" if ok else "rolled back"))
+    if not ok:
+        fr["compact_refused"] = key
+        logger.warning("%s n=%d verdict=refused-all target=S%d: every rank rolled back, nothing moved",
+                       KV_COMPACT_MARK, n, jj)
+        return None
+    evicted = (0, 0)
+    if plan.evicts:
+        try:
+            evicted = KC.execute_evicts(getattr(sched, "tree_cache", None), plan)
+            ok = 1
+        except Exception as exc:  # noqa: BLE001 -- named below as a group stop
+            logger.error("%s n=%d eviction failed here: %s: %s", KV_COMPACT_MARK, n,
+                         type(exc).__name__, exc)
+            ok = 0
+        lo, hi = _group_same(sched, ok)
+        if lo != 1 or hi != 1:
+            raise PdFlipKvCompactDivergence(
+                "%s n=%d: the fallback evictions for S%d did not go through on every rank "
+                "(here: %s) -- device presence of the tree differs" % (
+                    KV_COMPACT_MARK, n, jj, "ok" if ok else "failed"))
     new_floor = int(_group_floor_tokens(sched))
     fr["floor"] = None
     if new_floor >= int(floor_tokens):
-        fr["compact_refused"] = key   # nothing came down: wait for the next end event
+        fr["compact_refused"] = key
     else:
         fr.pop("compact_refused", None)
     logger.info(
-        "%s n=%d verdict=%s want=S%d target=S%d boundary=%d floor %d->%d moved_nodes=%d moved_pages=%d "
-        "evicted_nodes=%d evicted_tokens=%d bytes=%d ms=%.1f (the tree's idle pages above the boundary "
-        "moved down by device copy, node values re-pointed; evicted = backed nodes with no free page "
-        "below, their host copy stays)", KV_COMPACT_MARK, n, "moved" if res is not None else "failed",
-        int(want), jj, int(tokens[jj]), int(floor_tokens), new_floor,
-        0 if res is None else res.moved_nodes, 0 if res is None else res.moved_pages,
-        0 if res is None else res.evicted_nodes, 0 if res is None else res.evicted_tokens,
-        0 if res is None else res.bytes, (time.perf_counter() - t0) * 1000.0)
+        "%s n=%d verdict=moved want=S%d target=S%d boundary=%d floor %d->%d moved_nodes=%d "
+        "moved_pages=%d evicted_nodes=%d evicted_tokens=%d bytes=%d buffers=%d digest=%d ms=%.1f "
+        "(the tree's idle pages above the boundary moved down in every token-indexed KV buffer, "
+        "node values re-pointed; evicted = backed nodes with no free page below, host copy stays)",
+        KV_COMPACT_MARK, n, int(want), jj, int(tokens[jj]), int(floor_tokens), new_floor,
+        res.moved_nodes, res.moved_pages, evicted[0], evicted[1], res.bytes,
+        len(getattr(copier, "items", ()) or ()), digest, (time.perf_counter() - t0) * 1000.0)
     return new_floor
 
 
