@@ -3036,6 +3036,29 @@ def _pinned_exact_unregister(ptr: int) -> bool:
     return True
 
 
+def _clear_cuda_last_error() -> None:
+    """S58r: read the calling thread's CUDA runtime error variable out (cudaGetLastError resets it).
+
+    A runtime call that fails -- here ``cudaHostRegister`` -- leaves its code in the thread's error variable, and
+    the NEXT kernel-launch check of that thread (``C10_CUDA_KERNEL_LAUNCH_CHECK`` = ``cudaGetLastError()``) raises
+    it on an unrelated launch. The exact-pin callers (tail-stage arena, draft image, S58) fall back to the
+    ``torch.empty(pin_memory)`` form on a failed registration; without this the fallback would end in a CUDA error
+    blamed on the boot's next kernel. ``torch.cuda.cudart()`` has no ``cudaGetLastError``, so the runtime torch
+    links (``libcudart.so.<major>``, already loaded: dlopen by soname returns that instance) is asked directly.
+    Never raises."""
+    try:
+        import ctypes
+
+        import torch
+
+        major = str(getattr(torch.version, "cuda", "") or "").split(".")[0]
+        if not major:
+            return
+        ctypes.CDLL(f"libcudart.so.{major}").cudaGetLastError()
+    except Exception:  # noqa: BLE001 - nothing to clear / no runtime: nothing to do
+        pass
+
+
 def pinned_exact_empty(shape, dtype):
     """Uninitialised host tensor of ``shape``/``dtype``, page-locked at its
     exact byte size (see the module comment). Without a CUDA context (desk
@@ -3070,6 +3093,7 @@ def pinned_exact_empty(shape, dtype):
     ptr = flat.data_ptr()
     err = torch.cuda.cudart().cudaHostRegister(ptr, nbytes, _CUDA_HOST_REGISTER_MAPPED)
     if int(err) != 0:
+        _clear_cuda_last_error()   # S58r: the caller's fallback must not inherit this error
         mm.close()
         raise RuntimeError(
             f"cudaHostRegister({nbytes} bytes) failed with cudaError {int(err)}"
