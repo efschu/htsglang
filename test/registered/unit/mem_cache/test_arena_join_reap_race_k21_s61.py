@@ -85,6 +85,21 @@ class _ArenaCase(unittest.TestCase):
         assert self.arena.complete_slots([s], [g], [(0, self.SLOT // 4)]) == [0]
         return s, g
 
+    def _bounded(self, fn, what, timeout=10.0):
+        res = {}
+        t = threading.Thread(target=lambda: res.setdefault("r", fn()), daemon=True)
+        t.start()
+        t.join(timeout)
+        self.assertFalse(t.is_alive(), what)
+        return res["r"]
+
+    def _lost(self):
+        fn = getattr(self.lib, "arena_join_lost_count", None)   # absent before the fix: the red run fails on the join
+        if fn is None:
+            return 0
+        fn.restype = ctypes.c_int64
+        return int(fn())
+
     def _open(self, slot):
         return self.arena.claim_info([slot])[0][5]
 
@@ -102,6 +117,7 @@ class JoinReapRaceTest(_ArenaCase):
     def test_rc15_join_preempted_while_the_reap_frees_never_completes_lost(self):
         """09:24:27/28: TP0's reap frees the orphan while TP1 joins it -- TP1's completion must land."""
         s, _g = self._orphan("K")
+        lost0 = self._lost()
         freed = []
         fired = self._hook(lambda slot: freed.extend(self.arena.reap_partial(0.0)))
         (s2, st2, g2), = self.arena.claim_slots(["K"], [self.SLOT])
@@ -114,6 +130,13 @@ class JoinReapRaceTest(_ArenaCase):
         self.assertEqual(self.arena.complete_slots([s2], [g2], [(self.SLOT // 2, self.SLOT // 2)]), [0])
         self.assertEqual(self._open(s2), 0)
         self.assertEqual(self.arena.stats()["claimed"], 1, "the reaped orphan is not counted twice, nothing leaks")
+        self.assertEqual(self._lost() - lost0, 1, "the lost join is counted once")
+        # the reaped slot is an ordinary free slot afterwards: claimed and completed again, nothing held on it
+        fills = [self.arena.claim_slots([f"f{i}"], [self.SLOT])[0] for i in range(self.SLOTS - 1)]
+        reuse = [(fs, fg) for fs, fst, fg in fills if fs == s and fst == 0]
+        self.assertEqual(len(reuse), 1, "the freed slot is handed out again")
+        self.assertEqual(self._bounded(lambda: self.arena.complete_slots([s], [reuse[0][1]], [(0, self.SLOT)]),
+                                       "the freed slot's lock is held: its next completion hangs"), [1])
 
     def test_aba_the_freed_slot_reclaimed_for_another_key_is_never_joined(self):
         """Between the find and the commit the slot is reaped AND re-claimed for another key (the only free slot):
@@ -135,19 +158,17 @@ class JoinReapRaceTest(_ArenaCase):
         self.assertEqual(st, 4, "arena full for K: refused by name, never a join of K2's slot")
         self.assertNotEqual(s, a)
         self.assertEqual(self._open(a), 1, "K2's slot carries K2's writer only")
+        k2_gen = got["k2"][2]
+        self.assertEqual(self._bounded(lambda: self.arena.complete_slots([a], [k2_gen], [(0, self.SLOT)]),
+                                       "the rejected join left K2's slot locked: K2's completion hangs"), [1])
 
     def test_a_join_waiting_on_a_freer_that_never_finishes_is_bounded(self):
         """A freer died between its CAS (EVICTING) and its free: the join waits a bounded time, then claims the key
         fresh -- it never hangs and never joins the dead slot."""
         s, _g = self._orphan("K")
         self._hook(lambda slot: self._set_state(slot, S_EVICTING))
-        res = {}
-        t = threading.Thread(target=lambda: res.setdefault("r", self.arena.claim_slots(["K"], [self.SLOT])[0]),
-                             daemon=True)
-        t.start()
-        t.join(10.0)
-        self.assertFalse(t.is_alive(), "the join hung on a slot that never leaves EVICTING")
-        s2, st2, g2 = res["r"]
+        s2, st2, g2 = self._bounded(lambda: self.arena.claim_slots(["K"], [self.SLOT])[0],
+                                    "the join hung on a slot that never leaves EVICTING")
         self.assertEqual(st2, 0, "fresh claim beside the dead slot")
         self.assertNotEqual(s2, s)
         self.assertEqual(self.arena.complete_slots([s2], [g2], [(0, self.SLOT)]), [1])

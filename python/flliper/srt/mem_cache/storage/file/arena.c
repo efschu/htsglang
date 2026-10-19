@@ -691,6 +691,26 @@ int64_t arena_claim_stems(uint8_t *base, int64_t n, const char **stems, const in
     return ok;
 }
 
+/* S61 (NF rc15 489909d138 D 09:24:27/28, K21): the JOIN is committed under the slot's own lock and only on a slot
+ * that still is what the find saw -- CLAIMED (or COMPLETE) for THIS key. Before, arena_claim joined in three
+ * unguarded steps (find the slot, read its generation, add the open writer); a free of the claim by another process
+ * (#231 arena_reap_partial: TP0's claim made room, slots=[5725]) ran entirely between the second and the third: the
+ * reap saw no open writer, the joiner (TP1) added its writer to a FREED slot under the OLD generation and its
+ * completion came back 3 ("recycled under the writer"), A2 orphaned the page on TP1 only -- TP0 and TP2 claimed the
+ * key after the reap, fresh, and acked clean: K21 RANK-DIVERGENCE, group stop. Every free of a CLAIMED slot that
+ * requires "no open writer" (arena_reap_partial, free_if_abandoned, arena_release_claims) re-checks the writer word
+ * under the same lock after its CAS away from CLAIMED, so exactly one of the two wins: the join (its writer is seen,
+ * the free backs off) or the free (the join sees the state moved and claims the key again -- fresh). A slot that a
+ * freer left mid-flight (EVICTING, same generation) is waited for a bounded time; then the claim goes on without it
+ * (a fresh slot, the index cell taken over as for any stale cell). */
+#define JOIN_RETRIES 8
+static _Atomic int64_t g_join_lost = 0;   /* S61: joins that met a free between find and commit (process-local) */
+#define _S61_JOIN_LOST_NOTE() atomic_fetch_add(&g_join_lost, 1)
+int64_t arena_join_lost_count(void) { return atomic_load(&g_join_lost); }
+#define JOIN_EVICTING_SPINS 4096
+static inline void slot_lock(SlotHeader *sh) { while (atomic_exchange(&sh->lock, 1)) { /* spin */ } }
+static inline void slot_unlock(SlotHeader *sh) { atomic_store(&sh->lock, 0); }
+
 int64_t arena_claim(uint8_t *base, int64_t n, const uint64_t *klo, const uint64_t *khi,
                     const int64_t *totals, const char **stems, int64_t *slots_out,
                     int64_t *gen_out, int8_t *status) {
@@ -700,31 +720,72 @@ int64_t arena_claim(uint8_t *base, int64_t n, const uint64_t *klo, const uint64_
         uint64_t total = (uint64_t)totals[i];
         slots_out[i] = -1; gen_out[i] = 0;
         if (total > h->slot_bytes) { status[i] = 3; continue; }
-        int64_t slot = find_slot(base, klo[i], khi[i]);
-        int fresh = 0;
-        if (slot < 0) {
-            /* xsn342: 'fresh' is what claim_slot says -- a yield to another
-             * writer's slot is a JOIN (status 1), never a fresh claim the
-             * caller may free again on abort. */
-            slot = claim_slot(base, klo[i], khi[i], total, &fresh);
-            if (slot < 0) { status[i] = 4; continue; }
+        int8_t st_i = 4;
+        for (int attempt = 0; attempt < JOIN_RETRIES; attempt++) {
+            int64_t slot = find_slot(base, klo[i], khi[i]);
+            int fresh = 0;
+            if (slot < 0) {
+                /* xsn342: 'fresh' is what claim_slot says -- a yield to another
+                 * writer's slot is a JOIN (status 1), never a fresh claim the
+                 * caller may free again on abort. */
+                slot = claim_slot(base, klo[i], khi[i], total, &fresh);
+                if (slot < 0) { st_i = 4; break; }
+            }
+            SlotHeader *sh = slot_hdr(base, (uint64_t)slot);
+            if (fresh) {
+                /* our own fresh claim: writers 0, progress now -- no free that requires a writer (#231, OS,
+                 * #1427r) can take it before the writer below opens */
+                slots_out[i] = slot;
+                gen_out[i] = (int64_t)sh->generation;
+                if (stems && stems[i] && sh->stem[0] == 0) {
+                    size_t sl = strlen(stems[i]);
+                    if (sl >= STEM_CAP) sl = STEM_CAP - 1;
+                    memcpy(sh->stem, stems[i], sl);
+                    sh->stem[sl] = 0;
+                }
+                atomic_fetch_add(&sh->writers, W_CLAIM + 1u);   /* #231: an open direct writer */
+                atomic_store(&sh->touched_ms, mono_ms());
+                st_i = 0;
+                break;
+            }
+            if (g_join_hook) g_join_hook(slot);
+            uint32_t g0 = sh->generation;
+            slot_lock(sh);
+            uint32_t st = atomic_load(&sh->state);
+            int same_key = sh->key_lo == klo[i] && sh->key_hi == khi[i];
+            if (same_key && st == S_COMPLETE) {
+                slots_out[i] = slot;
+                gen_out[i] = (int64_t)sh->generation;
+                slot_unlock(sh);
+                st_i = 2;
+                break;
+            }
+            if (same_key && st == S_CLAIMED) {
+                slots_out[i] = slot;
+                gen_out[i] = (int64_t)sh->generation;
+                if (stems && stems[i] && sh->stem[0] == 0) {
+                    size_t sl = strlen(stems[i]);
+                    if (sl >= STEM_CAP) sl = STEM_CAP - 1;
+                    memcpy(sh->stem, stems[i], sl);
+                    sh->stem[sl] = 0;
+                }
+                atomic_fetch_add(&sh->writers, W_CLAIM + 1u);   /* #231: an open direct writer */
+                atomic_fetch_or(&sh->joined_mask, writer_bit());   /* ZR-1 census */
+                atomic_store(&sh->touched_ms, mono_ms());
+                slot_unlock(sh);
+                st_i = 1;
+                break;
+            }
+            slot_unlock(sh);
+            /* lost to a free (or the slot carries another key now): a freer between its CAS and its decision is
+             * waited for (bounded), then the key is looked up again -- never a join of what the find saw */
+            for (int w = 0; w < JOIN_EVICTING_SPINS && atomic_load(&sh->state) == S_EVICTING
+                            && sh->generation == g0; w++) sched_yield();
+            _S61_JOIN_LOST_NOTE();
         }
-        SlotHeader *sh = slot_hdr(base, (uint64_t)slot);
-        slots_out[i] = slot;
-        gen_out[i] = (int64_t)sh->generation;
-        if (!fresh && g_join_hook) g_join_hook(slot);
-        if (atomic_load(&sh->state) == S_COMPLETE) { status[i] = 2; ok++; continue; }
-        if (stems && stems[i] && sh->stem[0] == 0) {
-            size_t sl = strlen(stems[i]);
-            if (sl >= STEM_CAP) sl = STEM_CAP - 1;
-            memcpy(sh->stem, stems[i], sl);
-            sh->stem[sl] = 0;
-        }
-        atomic_fetch_add(&sh->writers, W_CLAIM + 1u);   /* #231: an open direct writer */
-        if (!fresh) atomic_fetch_or(&sh->joined_mask, writer_bit());   /* ZR-1 census */
-        atomic_store(&sh->touched_ms, mono_ms());
-        status[i] = fresh ? 0 : 1;
-        ok++;
+        status[i] = st_i;
+        if (st_i <= 2) ok++;
+        else { slots_out[i] = -1; gen_out[i] = 0; }
     }
     return ok;
 }
@@ -1164,8 +1225,13 @@ int64_t arena_reap_partial(uint8_t *base, int64_t min_age_ms, int64_t *out, int6
         if ((uint32_t)(now - p) < (uint32_t)min_age_ms) continue;
         uint32_t expect = S_CLAIMED;
         if (!atomic_compare_exchange_strong(&sh->state, &expect, S_EVICTING)) continue;
-        if (atomic_load(&sh->refcount) != 0 || atomic_load(&sh->writers) != w
-            || atomic_load(&sh->touched_ms) != t) {
+        /* S61: the re-check under the slot lock -- a join commits under it on a CLAIMED slot only, so it is either
+         * seen here (its writer) or it sees EVICTING and claims the key again */
+        slot_lock(sh);
+        int moved = atomic_load(&sh->refcount) != 0 || atomic_load(&sh->writers) != w
+            || atomic_load(&sh->touched_ms) != t;
+        slot_unlock(sh);
+        if (moved) {
             atomic_store(&sh->state, S_CLAIMED);
             continue;
         }
@@ -1205,7 +1271,10 @@ static int free_if_abandoned(uint8_t *base, uint64_t slot) {
     if (sh->n_ivals != 0 || atomic_load(&sh->refcount) != 0) return 0;
     uint32_t expect = S_CLAIMED;
     if (!atomic_compare_exchange_strong(&sh->state, &expect, S_EVICTING)) return 0;
-    if (atomic_load(&sh->writers) != w || sh->n_ivals != 0 || atomic_load(&sh->refcount) != 0) {
+    slot_lock(sh);   /* S61: see arena_claim -- a join is seen here or sees EVICTING */
+    int moved = atomic_load(&sh->writers) != w || sh->n_ivals != 0 || atomic_load(&sh->refcount) != 0;
+    slot_unlock(sh);
+    if (moved) {
         atomic_store(&sh->state, S_CLAIMED);
         return 0;
     }
@@ -1293,7 +1362,10 @@ int64_t arena_release_claims(uint8_t *base, int64_t n, const int64_t *slots, con
             /* completed (or taken) between the load and here: keep it */
             writer_done(sh); status[i] = 1; continue;
         }
-        if (atomic_load(&sh->writers) != w || (int64_t)sh->generation != gens[i]) {
+        slot_lock(sh);   /* S61: see arena_claim -- a join is seen here or sees EVICTING */
+        int moved = atomic_load(&sh->writers) != w || (int64_t)sh->generation != gens[i];
+        slot_unlock(sh);
+        if (moved) {
             /* a writer joined between the load and the CAS: the slot is theirs */
             atomic_store(&sh->state, S_CLAIMED);
             writer_done(sh);
