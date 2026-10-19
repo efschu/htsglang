@@ -151,7 +151,7 @@ def test_a_long_head_is_still_a_candidate_and_the_short_behind_goes_to_d():
         long_ = _pending("L", 1.0, d_eligible=False, uncached=20000)
         short = _pending("S", 0.5)
         f.queue.extend([long_, short])
-        with mock.patch.object(Front, "_arrival_seat_taken", lambda self: (0, 4)), \
+        with mock.patch.object(Front, "_arrival_seat_taken", lambda self, for_rid=None: (0, 4)), \
                 mock.patch.object(Front, "_arrival_seat_kv",
                                   lambda self, *a, **k: _async((False, "kv", 0))), \
                 mock.patch.object(Front, "_arrival_seat_kv_displace", lambda self, *a, **k: _async(None)), \

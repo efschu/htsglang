@@ -87,7 +87,10 @@ def test_a_no_credit_past_an_older_request_in_the_front_d_line():
         with pytest.raises(asyncio.TimeoutError):
             await asyncio.wait_for(f._acquire_short_seat("pdflip-9-40", 2000, [], max_tokens=256, uncached=400),
                                    0.8)
-        assert f.counters["arrival_seat_age_credit_older_in_line"] >= 1
+        # S60 F3: the kurz request now already waits at the age gate behind the OLDER D-line entry (it never reaches
+        # the credit test); either way no seat is taken on credit past the older request
+        assert (f.counters["arrival_seat_age_credit_older_in_line"] >= 1
+                or f.counters["short_gate_age_waits"] >= 1)
         assert f.counters["arrival_seat_age_seat_on_credit"] == 0
 
     asyncio.run(run())

@@ -1189,7 +1189,7 @@ def _asr_front():
     f.t_awake = time.time() - 1.0
     f.__dict__["_seat_taken"] = 1
 
-    def taken():
+    def taken(for_rid=None):   # S60 F3: a waiter passes its rid (only OLDER D-line entries hold a seat for it)
         return f.__dict__["_seat_taken"], 1
     f._arrival_seat_taken = taken
 

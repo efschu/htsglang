@@ -4669,6 +4669,18 @@ class Envs:
     # youngest. Off = the head waits at the front's seat semaphore until a seat frees by itself (rc12: 124 grants,
     # p50 5.3 s, max 72 s there; D's seat trigger never saw them).
     FLLIPER_PDFLIP_AGE_SEAT_ON_CREDIT = EnvBool(True)
+    # S60 F3 (NF rc15 19.10., PRIO=ALTER 14.10. / SOLL R2, R5): ONE age order between a kurz request waiting for a D
+    # seat (ARRIVAL-SEAT) and the hand-offs in the D line (``_ready_for_d``). A kurz arrival waits at the batch gate
+    # only for an OLDER D-line entry (before: for every one, up to --drain-deadline-s, outside every age order --
+    # pdflip-108-779 116 s, pdflip-108-776 120 s then routed to P); the D line does not seat a younger head while an
+    # older ARRIVAL-SEAT waiter that is not blocked waits; a waiter's seat count holds only the OLDER D-line
+    # entries. Needs FLLIPER_PDFLIP_ENABLE_ARRIVAL_SEAT_RULE. 0 = the batch gate and the D line as before.
+    FLLIPER_PDFLIP_SHORT_GATE_BY_AGE = EnvBool(True)
+    # S60 F6 (NF rc15 19.10.): a request D parks (PARK-RUNNING ``unknown_to_front``) that the front holds no D leg
+    # for is an orphan -- its client is gone, the abort missed it on D (rc15 pdflip-80-579: client gone 08:48:20,
+    # D decoded it to 09:13:55, ~13.8k tokens, ~133k KV tokens and a D running slot for nobody). The front aborts
+    # it on D at the park (R11: the front decides). 0 = it is only named in the PARK-RUNNING line, as before.
+    FLLIPER_PDFLIP_D_ORPHAN_ABORT = EnvBool(True)
     # S46 F2-F4 (NF 18.10., SA #244 / PRIO=ALTER 14.10.): the seat ORDER of requests that rode a flip to P. F2: the D
     # line re-picks by age when an older hand-off joined it during the seat wait; F3: a BATCH fall-through is queued
     # at its age position (not behind younger ones); F4: while P is awake a younger hand-off does not take a seat
