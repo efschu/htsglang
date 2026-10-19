@@ -9123,6 +9123,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         _end_base = _fa_end_base(span_base) if symmetric else None
         _local_end = group_end = 0
+        # S59: the host's start as the #580 vote reduced it (slot 6); set only
+        # on the END-vote path, read by the claim frame registered below.
+        _host_base = None
 
         extra_key = prefetch_namespace(
             anchor_extra_key=last_host_node.key.extra_key if last_host_node.key else None,
@@ -9754,6 +9757,20 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 _bases.pop(next(iter(_bases)))
         else:
             _bases.pop(str(req_id), None)
+        # S59: the prefetch thread's CLAIM reduce must compare the same ENDS
+        # as the registration vote and the completion MIN (rc15 D pdflip-26-100:
+        # the workers took the host's 1593-page claim from THEIR start 0, the
+        # group END fell from 119808 to 101952, W31 on 18936 -> R6 flip, P
+        # computed 1080). Registered before the operation is queued; a read
+        # without an END vote clears any stale frame (the old length reduce).
+        from flliper.srt.managers.claim_end_frame import note_claim_end_frame as _s59_note
+
+        _s59_note(
+            self.cache_controller, req_id,
+            _end_base if (_end_base is not None and _host_base is not None
+                          and _host_base < _FA_SPAN_ABSTAIN) else None,
+            _host_base,
+        )
         operation = self.cache_controller.prefetch(
             req_id,
             host_indices,
