@@ -296,18 +296,23 @@ SKIP, WAIT, STAGE = "skip", "wait", "stage"
 # staged. rc15, three boots: 31 of 90 tower runs were for images inside the
 # prefix P then admitted (82.5 s of PP0, the stage is synchronous).
 #
-# Now: while the told is outstanding and the rid is held by #1400, PP0's OWN
-# store probe decides WAIT -- its anchor-clamped answer (``note_probe_hit``,
-# the very number the told reuses: #1416d ``reused=prefetch_hit``) put on the
-# registration head, or the read's completed prefix. A probe that has not
-# answered yet while the read is registered waits too (the told cannot come
-# before it). WAIT only defers the verdict to the told (one pass); it never
-# skips: SKIP stays ``told >= image_end``, the admission belt
+# Now (S66 + S66b, user order 19.10. "auch FETCH und Stage warten bis zum
+# told, wenn ein told aussteht"): a rid held by #1400 ALWAYS waits for its
+# told -- neither the tower nor a known-image pixel fetch runs before it. The
+# WAIT names why (src): PP0's own store read covers the image (``probe``: the
+# anchor-clamped answer ``note_probe_hit`` on the registration head, the
+# number the told reuses; ``read``: the completed prefix), a fork twin held
+# without a read (``twin-deferred``), a probe not answered yet
+# (``probe-pending``), or the probe short of the image (``told-pending``).
+# In the paced form (#1416e) the rid waits for its Admit while the Admit can
+# still reach the image: told >= image_end, or an S64 raise may still come
+# (``paced-raise``); it stages at once only when no raise can come. WAIT
+# never skips: SKIP stays ``told >= image_end``, the admission belt
 # (:func:`skip_still_covered`) stays. The admission cannot take the request
 # before its told anyway (``pdflip_store_told_pending``), so a WAIT costs no
 # admission pass -- only the overlap of a tower the told then still needs
-# with the read, bounded by the probe's own latency. PP0 alone decides; the
-# followers hold the request until PP0's verdict reaches them (H125f).
+# with the read. PP0 alone decides; the followers hold the request until
+# PP0's verdict reaches them (H125f).
 VISION_PROBE_WAIT_ENV = "FLLIPER_PDFLIP_VISION_PROBE_WAIT"
 W_PROBE_WAIT = "W102 PdFlipVisionStage PROBE-WAIT"
 
@@ -386,6 +391,24 @@ def _probe_wait(scheduler, req, end: int) -> Optional[Tuple[int, str]]:
         p_told = int(getattr(pace, "told", 0) or 0)
         if p_told >= end:
             return p_told, "paced"
+        # S66b A1 (review S66b): the Admit does NOT only lower the read-ahead told -- the S64 S-1400 (b) raise
+        # (pdflip_told_raise, default on) admits told_final > p.told, the depth every follower proved. While a
+        # raise can still come the verdict waits for the Admit; the wait is bounded by the paced machinery itself
+        # (window, PF Frist, FLLIPER_PDFLIP_S64_TOLD_RAISE_WAIT_S): the Admit pops the rid from pacing and sets the
+        # told. Stage at once only when no raise can come (switch off, or this rid's one raise attempt failed).
+        raise_pending = False
+        try:
+            from flliper.srt.managers import pdflip_told_raise as _raise
+
+            if _raise.raise_on():
+                rs = (getattr(scheduler, _raise._ATTR, None) or {}).get(rid)
+                raise_pending = rs is None or getattr(rs, "state", "") != "failed"
+                if rs is not None and getattr(rs, "state", "") in ("issued", "done") and int(rs.target) < end:
+                    raise_pending = False  # the one raise of this rid targets a depth short of the image
+        except Exception:  # noqa: BLE001 -- unknown: wait for the Admit, it is bounded
+            raise_pending = True
+        if raise_pending:
+            return p_told, "paced-raise"
         return None
     held = getattr(scheduler, "_pdflip_store_held", None)
     if not isinstance(held, dict) or rid not in held:
@@ -413,9 +436,11 @@ def _probe_wait(scheduler, req, end: int) -> Optional[Tuple[int, str]]:
 
 def stage_skip_verdict(scheduler, req) -> Tuple[str, int, str]:
     """(verdict, covered, source): ``skip`` when every image position of
-    ``req`` lies inside the prefix this group admits it with, ``wait`` while a
-    store-told is outstanding and the rank's own match -- or PP0's own store
-    probe (S66) -- covers the image, ``stage`` otherwise."""
+    ``req`` lies inside the prefix this group admits it with (the told);
+    ``wait`` while a store-told is outstanding -- a rid held by #1400 always
+    waits for its told (S66b), a paced rid for its Admit while the Admit can
+    still reach the image (S66b A1) -- or the rank's own match covers the
+    image; ``stage`` otherwise."""
     from flliper.srt.pdflip.vision_d_guard import image_end
 
     end = image_end(req)

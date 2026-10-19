@@ -152,13 +152,51 @@ def test_rc16_paced_form_waits_between_read_ahead_and_admit():
 
 
 def test_paced_fallback_admit_zero_stages():
+    """S66b A1: a paced told short of the image waits for the Admit (an S64 raise may still lift it); the PF
+    fallback Admit 0 then stages."""
     r = _req(rid="pdflip-2-9", ends=(21757,))
     s = _sched(held=[])
     s._pdflip_told_pacing = {"pdflip-2-9": SimpleNamespace(told=8192, absolute=True)}
-    assert V.stage_skip_verdict(s, r)[0] == V.STAGE, "paced told short of the images"
+    assert V.stage_skip_verdict(s, r) == (V.WAIT, 8192, "paced-raise")
     s._pdflip_told_pacing = {}
     s._pdflip_store_told["pdflip-2-9"] = 0  # PF fallback Admit
     assert V.stage_skip_verdict(s, r) == (V.STAGE, 0, "told")
+
+
+def test_review_s66b_paced_raise_admit_above_image_end_skips_without_fetch(monkeypatch):
+    """Review S66b A1 (reviewer test /tmp/rv66b/test_rv66b_paced_raise_1019.py as template): paced told 72128 <
+    image_end 72215, the S64 raise (default on) admits 72256 >= image_end -> SKIP, no pixel fetch, no tower."""
+    from flliper.srt.managers import pdflip_told_raise as R
+
+    assert R.raise_on({}) is True
+    r = _req(rid="rv-1", featureless=True, ends=(72214,))
+    s = _pass_sched(r, held=[])
+    s._pdflip_told_pacing = {"rv-1": SimpleNamespace(told=72128, absolute=True)}
+    with mock.patch.object(V, "run_rank_stage", side_effect=AssertionError("tower before the Admit")):
+        parked = V.vision_rank_pass(s)
+        assert [x for _, x in parked] == [r] and s.ipc_channels.send_to_tokenizer.sent == []
+        V.vision_unpark(s, parked)
+        s._pdflip_told_pacing = {}
+        s._pdflip_store_told["rv-1"] = 72256  # Admit with raise
+        V.vision_rank_pass(s)
+    assert r._pdflip_vision_skip and s.ipc_channels.send_to_tokenizer.sent == []
+
+
+def test_paced_short_stages_at_once_only_when_no_raise_can_come(monkeypatch):
+    from flliper.srt.managers import pdflip_told_raise as R
+
+    r = _req(rid="rv-2", ends=(72214,))
+    s = _sched(held=[])
+    s._pdflip_told_pacing = {"rv-2": SimpleNamespace(told=72128, absolute=True)}
+    monkeypatch.setenv(R.ENV_RAISE, "0")
+    assert V.stage_skip_verdict(s, r)[0] == V.STAGE, "switch off: the Admit can only lower it"
+    monkeypatch.setenv(R.ENV_RAISE, "1")
+    setattr(s, R._ATTR, {"rv-2": SimpleNamespace(target=72192, state="failed")})
+    assert V.stage_skip_verdict(s, r)[0] == V.STAGE, "the rid's one raise failed"
+    setattr(s, R._ATTR, {"rv-2": SimpleNamespace(target=72192, state="issued")})
+    assert V.stage_skip_verdict(s, r)[0] == V.STAGE, "the raise targets a depth short of the image"
+    setattr(s, R._ATTR, {"rv-2": SimpleNamespace(target=72256, state="issued")})
+    assert V.stage_skip_verdict(s, r) == (V.WAIT, 72128, "paced-raise")
 
 
 def test_a_probe_not_answered_yet_waits_while_the_read_is_registered():
