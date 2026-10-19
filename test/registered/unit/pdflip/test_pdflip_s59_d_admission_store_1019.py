@@ -273,7 +273,16 @@ def test_A_the_tree_registers_the_frame_from_the_end_vote():
     """Through the REAL ``prefetch_from_storage`` (HP1/H99 harness): rc15
     26-100's bases -- host 17856, workers 0 -- land as each rank's claim frame
     (its own start, the reduced host start)."""
-    import test_nf_form_a_end_vote_hp1 as hp1
+    # S59r: the HP1 harness lives in ../managers -- import it by path, so the
+    # file runs alone (PYTHONPATH=python:<this dir>) as well as in a batch.
+    import importlib
+    import os
+    import sys
+
+    _mgr = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "managers")
+    if _mgr not in sys.path:
+        sys.path.insert(0, _mgr)
+    hp1 = importlib.import_module("test_nf_form_a_end_vote_hp1")
 
     bases = {0: 17856, 1: 0, 2: 0}
     caches, _r, errors, _g = hp1._intake(bases, "pdflip-26-100", end=120832)
