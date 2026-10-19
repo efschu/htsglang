@@ -385,24 +385,41 @@ def observe(req, page_size: Optional[int] = None) -> str:
     rec = _ho.read(rid)
     handoff_file = rec is not None
     why = None
+    # review S75 1.3: a P leg ran for this rid (RESUME-VIA-P) -- P may still be writing it
+    # even when no fresh P record replaced D's (a skipped/failed hand-off write): D's own
+    # record then proves nothing, the pre-S75 poll stays
+    p_leg = _p_leg_ran(req)
     if label_enabled():
         if handoff_file:
             note_record_writer(req, rec, list(rec.get("page_keys") or []) if isinstance(rec, dict) else [])
-            if _ho.record_writer(rec) == "D":
+            if _ho.record_writer(rec) == "D" and not p_leg:
                 handoff_file = False
                 why = "d-own-record"
-        if chain and getattr(req, P_SEEN_ATTR, None) is False:
+        if chain and getattr(req, P_SEEN_ATTR, None) is False and not p_leg:
             chain = False                   # every record this rank read was D's own
             why = "d-own-record"
         if (chain or handoff_file) and p_span_delivered(req, page_size):
             chain = handoff_file = False
             why = "p-span-delivered"
+    tail_state, tail_tmp = _tail_facts(rid)
+    state = classify(chain=chain, handoff_file=handoff_file, tail_state=tail_state, tail_tmp=tail_tmp)
+    # review S75 1.1: ``not_p=`` names why NO writer was found -- only when that is the verdict
+    # (a D file over a P chain stays p-handoff and says nothing)
     try:
-        setattr(req, WHY_ATTR, why)
+        setattr(req, WHY_ATTR, why if state == NONE else None)
     except Exception:  # noqa: BLE001 - a frozen double
         pass
-    tail_state, tail_tmp = _tail_facts(rid)
-    return classify(chain=chain, handoff_file=handoff_file, tail_state=tail_state, tail_tmp=tail_tmp)
+    return state
+
+
+def _p_leg_ran(req) -> bool:
+    """A RESUME-VIA-P leg was started for ``req`` (``resume_via_p.ATTEMPTS_ATTR``)."""
+    from flliper.srt.pdflip import resume_via_p as _rvp
+
+    try:
+        return int(getattr(req, _rvp.ATTEMPTS_ATTR, 0) or 0) > 0
+    except (TypeError, ValueError):
+        return False
 
 
 def remainder(req, records) -> Optional[int]:

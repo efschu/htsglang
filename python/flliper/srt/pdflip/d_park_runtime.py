@@ -1962,16 +1962,25 @@ def _resume_fit_reading(sched):
         return sched.uniform_min_avail
 
     def _read():
-        try:
-            local = int(sched.token_to_kv_pool_allocator.available_size())
-        except Exception:  # noqa: BLE001 -- no reading: the free ids as before
-            return sched.uniform_min_avail()
-        try:
-            local += _evictable_reading(sched.tree_cache)
-        except Exception:  # noqa: BLE001 -- no evictable reading: the free ids alone
-            pass
+        # review S75 2.1 (raenge-nie-uneins): EVERY path enters the group MIN exactly once.
+        # A rank without a reading (available_size raised) sends a sentinel (ok=0) into
+        # the same MIN instead of returning early -- an early return left its peers alone
+        # in the collective (gloo hang, W17 class). The group then refuses the early
+        # resume by name on every rank (None: no early resume this pass).
+        have = _pool_reading(sched)
+        ok = 0 if have is None else 1
+        vals = [int(have or 0), ok]
         gm = getattr(sched, "_pdflip_group_min_ints", None)
-        val = int(gm([local])[0]) if callable(gm) else local
+        got = list(gm(vals)) if callable(gm) else vals
+        if int(got[1]) == 0:
+            n = int(getattr(sched, "_pdflip_resume_fit_unread_n", 0) or 0) + 1
+            sched._pdflip_resume_fit_unread_n = n
+            if n & (n - 1) == 0:
+                logger.warning("%s UNREAD n=%d local_ok=%d -- a rank of the group has no pool reading: "
+                               "no early resume this pass (refused on every rank alike)",
+                               RESUME_HELD_MARK, n, ok)
+            return None
+        val = int(got[0])
         sched._pdflip_resume_fit_last = val
         return val
 

@@ -287,9 +287,9 @@ def test_the_reading_is_the_group_min_of_free_plus_evictable(monkeypatch):
     seen = []
     sched = types.SimpleNamespace(token_to_kv_pool_allocator=_Alloc(FREE), tree_cache=_Tree(EVICT),
                                   uniform_min_avail=lambda: FREE)
-    sched._pdflip_group_min_ints = lambda vals: (seen.append(list(vals)), [v - 1000 for v in vals])[1]
+    sched._pdflip_group_min_ints = lambda vals: (seen.append(list(vals)), [vals[0] - 1000, vals[1]])[1]
     read = dpr._resume_fit_reading(sched)
-    assert read() == FREE + EVICT - 1000 and seen == [[FREE + EVICT]]
+    assert read() == FREE + EVICT - 1000 and seen == [[FREE + EVICT, 1]]
     monkeypatch.setenv(dpr.RESUME_FIT_EVICTABLE_ENV, "0")
     assert dpr._resume_fit_reading(sched)() == FREE, "switch off: the free ids, as before"
 
@@ -305,3 +305,89 @@ def test_the_held_line_names_gate_and_numbers_on_powers_of_two(caplog):
     assert "gate=older_live older=pdflip-132-465 avail=104128 need=144965" in lines[0]
     dpr._note_resume_held(sched, types.SimpleNamespace(held=()))
     assert sched._pdflip_resume_held_seen == {}
+
+
+# ---------------------------------------------------------------- review S75 (Auflagen 1.1-1.3, 2.1)
+
+
+class _RaisingAlloc:
+    def available_size(self):
+        raise RuntimeError("allocator gone")
+
+
+def test_2_1_a_rank_without_a_reading_still_enters_the_min_exactly_once(monkeypatch, caplog):
+    """3 ranks, rank 1's allocator raises. Each rank must enter the group MIN once (its peers do);
+    the fake collective answers every rank with the element-wise MIN of all three payloads."""
+    monkeypatch.delenv(dpr.RESUME_FIT_EVICTABLE_ENV, raising=False)
+    payloads = {0: [FREE + EVICT, 1], 1: [0, 0], 2: [FREE + EVICT, 1]}
+    group_min = [min(col) for col in zip(*payloads.values())]
+    entered, sent = {0: 0, 1: 0, 2: 0}, {}
+
+    def make(i):
+        def gm(vals):
+            entered[i] += 1
+            sent[i] = list(vals)
+            return list(group_min)
+        return gm
+
+    scheds = [types.SimpleNamespace(token_to_kv_pool_allocator=_RaisingAlloc() if i == 1 else _Alloc(FREE),
+                                    tree_cache=_Tree(EVICT), uniform_min_avail=lambda: FREE,
+                                    _pdflip_group_min_ints=make(i)) for i in range(3)]
+    with caplog.at_level(logging.INFO, logger=dpr.logger.name):
+        results = [dpr._resume_fit_reading(s)() for s in scheds]
+    assert entered == {0: 1, 1: 1, 2: 1}, "every rank enters the group MIN exactly once"
+    assert sent == payloads, "the rank without a reading sends the sentinel (ok=0)"
+    assert results == [None, None, None], "the group refuses the early resume alike, by name"
+    assert any("UNREAD" in m for m in _lines(caplog, dpr.RESUME_HELD_MARK))
+
+
+def _p_then_d(rid, delivered):
+    assert ho.write(rid, list(range(6400)), _keys(100), writer="P")    # P prefilled, record read at admission
+    r = _req(rid, 7000, delivered)
+    assert hk.resolve_chain(r, ho.read)
+    assert ho.write(rid, list(range(7000)), _keys(109), writer="D")    # D's park overwrote the file
+    return r
+
+
+def test_1_2_p_chain_then_d_overwrite_stays_poll_and_names_nothing(arena):
+    r = _p_then_d("pdflip-9-9", 3200)
+    assert sw.observe(r, page_size=PAGE) == sw.P_HANDOFF
+    assert getattr(r, hk.P_SEEN_ATTR) is True
+    assert getattr(r, sw.WHY_ATTR) is None, "1.1: no not_p= while the verdict is p-handoff"
+
+
+def test_1_2_mutant_p_seen_from_the_current_file_is_red(arena, monkeypatch):
+    """Mutant: P_SEEN read from the CURRENT file instead of sticky -> the danger direction opens."""
+    r = _p_then_d("pdflip-9-12", 3200)
+
+    def non_sticky(req, rec, chain):
+        setattr(req, hk.P_SEEN_ATTR, ho.record_writer(rec) != "D")
+    monkeypatch.setattr(hk, "note_record_writer", non_sticky)
+    assert sw.observe(r, page_size=PAGE) == sw.NONE, "the mutant decides a P-prefilled rid -- the test above catches it"
+
+
+def test_1_2_the_settle_line_of_a_d_file_over_a_p_chain_says_poll_without_not_p(arena, caplog):
+    r = _p_then_d("pdflip-9-13", 3200)
+    r._1471_since = time.monotonic()
+    r._1456_last = time.monotonic()
+    r._1471_short = True
+    h = _holder()
+    h.pdflip_post_wake_settle = [r]
+    with caplog.at_level(logging.INFO, logger=sched_mod.logger.name):
+        assert h._pdflip_post_wake_settle_tick() == 0
+    w = _lines(caplog, "SETTLE-WRITER")
+    assert len(w) == 1 and "writer=p-handoff" in w[0] and "action=poll --" in w[0] and "not_p" not in w[0]
+
+
+def test_1_3_a_p_leg_without_a_fresh_p_record_keeps_the_poll(arena):
+    from flliper.srt.pdflip import resume_via_p as rvp
+
+    rid = "pdflip-9-11"
+    assert ho.write(rid, list(range(7000)), _keys(109), writer="D")
+    r = _req(rid, 7000, 3200)
+    hk.resolve_chain(r, ho.read)
+    assert sw.observe(r, page_size=PAGE) == sw.NONE                    # before any P leg: decided
+    setattr(r, rvp.ATTEMPTS_ATTR, 1)                                   # RESUME-VIA-P ran, P wrote no record
+    sw.reset_for_wake(r)
+    assert sw.observe(r, page_size=PAGE) == sw.P_HANDOFF
+    assert getattr(r, sw.WHY_ATTR) is None
