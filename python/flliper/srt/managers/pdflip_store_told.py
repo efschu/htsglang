@@ -1128,16 +1128,79 @@ def _twin_register(scheduler, req, twin: bool) -> str:
     return verdict
 
 
+#: S62 (19.10., NF rc14 ..._1019_010742, P PP0 05:20:15, pdflip-1-30): the
+#: absolute told of a request whose head sits in PP0's DEVICE tree was clamped
+#: to the STORE's deepest anchor -- 'MATCH-CENSUS-DEEP rid=pdflip-1-30
+#: reached=18624 accepted=18624' (the sibling 1-28's turn anchor, inserted on
+#: every stage one second earlier), then '#1416 STORE-TOLD ANCHOR-CLAMP
+#: completed=18624 anchored=3072' because 1-28's retain-publish was refused by
+#: the KV arena ('RETAIN-PUBLISH ... issued=0 arena_refused=12'): 15552 tokens
+#: recomputed on P that every stage held on device. The #1416 clamp stands in
+#: for rank agreement (a follower must reach told); with the PF ack stream the
+#: followers prove told themselves -- the told-limited registration finds the
+#: head LOCALLY (FOLLOWER SATISFIED LOCALLY, H64 SETTLE-ACK-NOW) and the ack is
+#: their TREE's resumable reach (``_satisfied_resumable`` / ``_resumable_own``,
+#: ``rank_resumable``), a follower short of it acks its own reach plus its B5
+#: anchors and PP0's H64 GROUP-FLOOR admits the deepest common depth (or told=0)
+#: for EVERY rank. So the told is max(store-anchored, PP0's tree-resumable): no
+#: arena room, no wait. Unset = on; 0/false/no/off = the store clamp alone.
+ENV_TOLD_TREE_ANCHOR = "FLLIPER_PDFLIP_TOLD_TREE_ANCHOR"
+
+
+def told_tree_anchor_on(env=None) -> bool:
+    env = os.environ if env is None else env
+    return str(env.get(ENV_TOLD_TREE_ANCHOR, "1") or "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _tree_anchored(scheduler, req, rid: str, told: int, clamped: int) -> int:
+    """S62: the absolute told PP0 publishes -- ``clamped`` (the #1416 store
+    anchor) or, deeper, the depth PP0's OWN tree resumes ``req`` from
+    (``pdflip_told_fidelity.rank_resumable``: capped match plus the #988
+    load-back's state-aligned extent, the probe every follower's ack uses), never
+    past ``told``. Only on the PF ack stream (``scheduler._pdflip_told_fallback_on``:
+    paced form AND ``pdflip_told_fallback.env_on``):
+    without it a follower short of the told could only refuse by name (the
+    #1416 rank exit), so the store clamp stays the told there. No probe / probe
+    error / fidelity off = ``clamped`` unchanged. PP0 alone; read-only."""
+    told, clamped = int(told), int(clamped)
+    if clamped >= told or told <= 0 or not told_tree_anchor_on():
+        return clamped
+    try:
+        # the PF stream exists only on the paced form (``armed``: paced AND env_on)
+        if not bool(getattr(scheduler, "_pdflip_told_fallback_on", False)) or not _tf.enabled():
+            return clamped
+        reach = _tf.rank_resumable(scheduler, req, told)
+    except Exception:  # noqa: BLE001 - a probe never breaks publication
+        logger.warning("S62 TOLD-TREE-ANCHOR probe skipped rid=%s", _rt(rid), exc_info=True)
+        return clamped
+    if reach is None or int(reach) <= clamped:
+        return clamped
+    final = min(told, int(reach))
+    n = getattr(scheduler, "_s62_tree_told_n", 0) + 1
+    try:
+        scheduler._s62_tree_told_n = n
+    except Exception:  # noqa: BLE001
+        pass
+    if _log_due(n):
+        logger.warning(
+            "S62 TOLD-TREE-ANCHOR rid=%s told=%d store_anchored=%d tree=%d -> %d (n=%d): PP0's device "
+            "tree resumes past the store's deepest anchor (the source's publish never reached the store) "
+            "-- the told names the tree depth; every follower proves it with its own tree in its ack, "
+            "PP0's GROUP-FLOOR answers for EVERY rank", _rt(rid), told, clamped, int(reach), final, n)
+    return final
+
+
 def _twin_pp0_told(scheduler, tree, req, rid: str, label: str = "TW TWIN-TOLD") -> int:
     """TW: PP0's told for a released fork twin. The #1400 record counts only
     the span beyond the registration's match (the host insert is rooted at
     ``last_host_node``); a twin's point is the head it matched on the device
     -- its sibling's rows -- so its told is head + span, ABSOLUTE, anchor-
-    clamped like every told, and PP0's own record is set to it."""
+    clamped like every told -- S62: but never below what PP0's own tree
+    resumes from (``_tree_anchored``) -- and PP0's own record is set to it."""
     span = int(_completed_prefix(tree, rid))
     head = _twin.registered_head(req)
     told = head + span
-    clamped = int(_anchor_clamp(scheduler, req, told))
+    clamped = _tree_anchored(scheduler, req, rid, told, int(_anchor_clamp(scheduler, req, told)))
     try:
         tree._prefetch_completed_tokens[rid] = clamped
     except Exception:  # noqa: BLE001 - a tree without the dict keeps its number
