@@ -1222,16 +1222,30 @@ OWNED_EXACT_CHECKS = 64
 #: rank, ranked by the synchronized round (max T_r over ALL ranks, then the
 #: next-worst rank -- :func:`owned_rank_key`, #287 -- then the sum, then the
 #: ownership move).
+#:
+#: S54 (19.10.) ``sync`` (default): x1 is held where the user sees it -- the
+#: SYNCHRONIZED round, max over ALL ranks, at every bs of the x1 set (and the
+#: extend copy, max over all ranks, when the extend term is on) must not
+#: exceed Form A's. ``workers`` held each worker to its own Form-A miss time,
+#: so the KV cut's worker rows were always bought with host residency: on
+#: rc14 (1019_010742) the published form ran TP0 at 68.42 ms bs1 against
+#: 21.26 / 29.92 on the workers -- above Form A's 63.13 -- and TP0 bound every
+#: D extend (16.1 ms copy per layer against 12.6 / 9.1). The 29.09. ``round``
+#: metal loss (bs1 +4..9 ms, misses moved onto the x4 card) priced both 3080s
+#: at one SEED cost; the solve now prices every card at its own measured cost
+#: per row (01.10.) and ``sync`` refuses a predicted round above Form A's. A
+#: form that misses x1 under ``sync`` is not refused but ranked behind every
+#: form that keeps it (no planner gap stops a boot).
 OWNED_X1_ENV = "FLLIPER_PDFLIP_OWNED_CUT_X1"
-OWNED_X1_SCOPES = ("workers", "round")
+OWNED_X1_SCOPES = ("sync", "workers", "round")
 
 
 def owned_x1_scope() -> str:
     """#239 S3f: the x1 scope of the owned solve (``FLLIPER_PDFLIP_OWNED_CUT_X1``,
-    default ``workers``); an unknown value is refused, never guessed."""
+    default ``sync`` since S54); an unknown value is refused, never guessed."""
     import os
 
-    v = (os.environ.get(OWNED_X1_ENV) or "workers").strip().lower()
+    v = (os.environ.get(OWNED_X1_ENV) or "sync").strip().lower()
     if v not in OWNED_X1_SCOPES:
         raise ValueError("%s=%r: one of %s" % (OWNED_X1_ENV, v, "/".join(OWNED_X1_SCOPES)))
     return v
@@ -1277,6 +1291,13 @@ class OwnedCut(msgspec.Struct, frozen=True, kw_only=True):
     #: scratch rows per rank the chosen form needs on top of the given ones
     #: for the wave floor (:func:`owned_scratch_raise`); empty = none
     scratch_raise: Tuple[int, ...] = ()
+    #: S54 (19.10.): the expert copy of one D extend per rank and MoE layer
+    #: summed over the layers (:func:`owned_extend_ms`, ms) of the chosen form
+    #: and of Form A, and the extends per decode round it was weighted by;
+    #: empty / 0.0 = the extend term is off (no link of every rank)
+    extend_ms: Tuple[float, ...] = ()
+    base_extend_ms: Tuple[float, ...] = ()
+    extend_per_round: float = 0.0
 
 
 def owned_miss_rows(fit: "DRankResidency", *, num_experts: int, ids_per_step: int) -> float:
@@ -1393,6 +1414,79 @@ def owned_round_ms(fits: Sequence["DRankResidency"], *, host: int, num_experts: 
     return tuple(out)
 
 
+#: S54 (19.10.): the D extend the owned solve prices besides the decode
+#: round. SEED from rc14 (boot ...dauer10190107_92dd662831_1019_010742.D.log,
+#: 05:25-06:15Z, TP0, log-order gaps between decode rounds): 476 D extends
+#: against 18573 decode rounds (0.0256 extends per round), median 64-255 new
+#: tokens per single extend (168 of 356 single-extend gaps). At T >= ~150 a
+#: forward touches every expert of a rank (1 - (1 - 1/512)^(T*10) >= 0.95),
+#: so the copy is ~ the rank's non-held experts x its link. Measured there
+#: (H107 EAGER-LRU layer 0, 33 host-plan extends): misses per layer TP0 91.5 /
+#: TP1 32.1 / TP2 48.1 -> 16.1 / 12.6 / 9.1 ms per layer at the card probe's
+#: pinned H2D (14.42 / 6.47 / 13.40 GB/s): TP0 is the clock of every extend.
+OWNED_EXTEND_TOKENS_SEED = 256
+OWNED_EXTEND_PER_ROUND_SEED = 0.0256
+OWNED_EXTEND_SOURCE_SEED = ("Saat rc14 1019_010742 05:25-06:15Z: 476 D-Extends / 18573 Decode-"
+                            "Runden, Median 64-255 neue Token je Extend")
+
+
+def owned_extend_form() -> Tuple[int, float, str]:
+    """S54: ``(tokens per extend, extends per decode round, source)`` of the
+    owned solve's extend term. ``FLLIPER_PDFLIP_OWNED_EXTEND_TOKENS`` /
+    ``FLLIPER_PDFLIP_OWNED_EXTEND_PER_ROUND`` replace the rc14 seed; a
+    malformed or negative value is refused, never guessed."""
+    from flliper.srt.environ import envs
+
+    raw_t = (envs.FLLIPER_PDFLIP_OWNED_EXTEND_TOKENS.get() or "").strip()
+    raw_r = (envs.FLLIPER_PDFLIP_OWNED_EXTEND_PER_ROUND.get() or "").strip()
+    try:
+        tok = int(raw_t) if raw_t else OWNED_EXTEND_TOKENS_SEED
+        rate = float(raw_r) if raw_r else OWNED_EXTEND_PER_ROUND_SEED
+    except ValueError:
+        raise ValueError("FLLIPER_PDFLIP_OWNED_EXTEND_TOKENS=%r / _PER_ROUND=%r: int / float"
+                         % (raw_t, raw_r))
+    if tok < 1 or rate < 0:
+        raise ValueError("FLLIPER_PDFLIP_OWNED_EXTEND_TOKENS=%r >= 1, _PER_ROUND=%r >= 0"
+                         % (raw_t, raw_r))
+    src = (OWNED_EXTEND_SOURCE_SEED if not (raw_t or raw_r) else
+           "FLLIPER_PDFLIP_OWNED_EXTEND_TOKENS=%s _PER_ROUND=%s" % (raw_t or "-", raw_r or "-"))
+    return tok, rate, src
+
+
+def owned_extend_row_ms(h2d_gbps: Sequence[Optional[float]], row_bytes: int
+                        ) -> Optional[Tuple[float, ...]]:
+    """S54: ms to copy one expert row of ONE MoE layer (``row_bytes``) over
+    each rank's host link at its measured pinned H2D rate (GB/s, the card
+    probe -- the copy-engine number; the UVA gather runs at ~94 % of it,
+    S51). ``None`` when any rank has no measured rate: the extend term is
+    then off and named, never priced from a nameplate."""
+    out = []
+    for g in h2d_gbps:
+        if g is None or float(g) <= 0.0 or int(row_bytes) <= 0:
+            return None
+        out.append(float(row_bytes) / (float(g) * 1e9) * 1e3)
+    return tuple(out)
+
+
+def owned_extend_ms(fits: Sequence["DRankResidency"], *, num_experts: int, n_layers: int,
+                    extend_ids: int, row_ms: Sequence[float],
+                    heat: Optional[Sequence[float]] = None,
+                    spans: Optional[Sequence[Tuple[int, int]]] = None) -> Tuple[float, ...]:
+    """S54: the expert copy of one D extend per rank, ms: the rows the
+    extend's ``extend_ids`` routed pairs miss on the rank (the same miss
+    model as the decode round, :func:`owned_miss_rows` / the heat variant,
+    with the extend's ids) x MoE layers x the rank's link cost per row.
+    The ranks wait on each other at every layer's all-reduce, so the extend
+    lasts max_r of this (plus compute)."""
+    out = []
+    for f in fits:
+        rows = (owned_miss_rows_heat(f, span=spans[f.rank], heat=heat, ids_per_step=extend_ids)
+                if heat is not None and spans is not None
+                else owned_miss_rows(f, num_experts=num_experts, ids_per_step=extend_ids))
+        out.append(rows * int(n_layers) * float(row_ms[f.rank]))
+    return tuple(out)
+
+
 def owned_rank_key(ms: Sequence[float]) -> Tuple[Tuple[float, ...], float]:
     """#287: how the owned solve ranks two forms by their T_r -- the T_r sorted
     descending and compared lexicographically (leximax: the max first, then
@@ -1504,6 +1598,9 @@ def solve_owned_cut(
     stage_row_bytes: int = 0,
     stage_floor_tokens: int = 0,
     switch_gain: float = 0.0,
+    extend_row_ms: Optional[Sequence[float]] = None,
+    extend_ids: int = 0,
+    extend_per_round: float = 0.0,
 ) -> OwnedCut:
     """#239 S3f: ownership, token cut and FR_D in one solve.
 
@@ -1541,6 +1638,15 @@ def solve_owned_cut(
     a form that needs more waves or a lower top stage is not tragbar. With
     ``switch_gain`` > 0 the solve keeps the base ownership unless the best
     other one is more than that fraction faster (weighted round).
+
+    S54 (19.10.): with ``extend_row_ms`` (each rank's link cost per expert
+    row and layer, :func:`owned_extend_row_ms`), ``extend_ids`` and
+    ``extend_per_round`` > 0 the objective adds the D extend's expert copy,
+    ``extend_per_round x max_r X_r`` (:func:`owned_extend_ms`) -- D's time per
+    decode round including its share of the extends, the extend priced at
+    the slowest rank's link. ``x1_scope='sync'`` holds x1 on the synchronized
+    round (max over all ranks) at every x1 bs and on the extend's max, against
+    Form A; a form that misses it ranks behind, it is not refused.
     """
     base = tuple(int(x) for x in base_ratios)
     if bs_weights:
@@ -1578,13 +1684,26 @@ def solve_owned_cut(
                                   rows_per_round=int(rows_per_round) * b, spans=spans, **kw)
                 for b in _bss}
 
-    def _objective(by):
-        return sum(w * max(by[b]) for b, w in _bsw)
+    _ext_on = (extend_row_ms is not None and float(extend_per_round) > 0
+               and int(extend_ids) > 0 and len(extend_row_ms) == n)
+
+    def _ext(fits, rat):
+        if not _ext_on:
+            return ()
+        spans = owned_spans(rat, num_experts) if heat is not None else None
+        return owned_extend_ms(fits, num_experts=num_experts, n_layers=n_layers,
+                               extend_ids=int(extend_ids), row_ms=extend_row_ms, heat=heat,
+                               spans=spans)
+
+    def _objective(by, ext=()):
+        return (sum(w * max(by[b]) for b, w in _bsw)
+                + (float(extend_per_round) * max(ext) if _ext_on and ext else 0.0))
 
     base_fits = _edge(tuple(solve_at(base, None)))
     # Form A: the host attends over the whole KV, no merge
     base_by = _by_bs(base_fits, tuple(1 if r == host else 0 for r in range(len(base))), False,
                      base)
+    base_ext = _ext(base_fits, base)
     base_ms = base_by[1]
     shares_list = []
     forced = forced_shares is not None
@@ -1609,20 +1728,20 @@ def solve_owned_cut(
     # budget and the card are per rank; the expert span is the ratio's share
     # of the (fixed) sum, up to rounding. The memo keeps one budget solve per
     # (rank, ownership, share); the chosen form is re-solved exactly below.
-    memo: Dict[Tuple[int, int, int], Tuple["_EdgeFit", Dict[int, float]]] = {}
+    memo: Dict[Tuple[int, int, int], Tuple["_EdgeFit", Dict[int, float], float]] = {}
 
     def _exact(rat, sh):
         nonlocal solves
         solves += 1
         fits = _edge(tuple(solve_at(rat, sh)))
-        return fits, _by_bs(fits, sh, True, rat)
+        return fits, _by_bs(fits, sh, True, rat), _ext(fits, rat)
 
     def _terms(rat, sh):
         keys = [(r, int(rat[r]), int(sh[r])) for r in range(n)]
         if any(k not in memo for k in keys):
-            fits, by = _exact(rat, sh)
+            fits, by, ext = _exact(rat, sh)
             for i, (k, f) in enumerate(zip(keys, fits)):
-                memo[k] = (f, {b: by[b][i] for b in _bss})
+                memo[k] = (f, {b: by[b][i] for b in _bss}, ext[i] if ext else 0.0)
         return [memo[k] for k in keys]
 
     guard_on = int(seats_cap) > 0 and int(waves_cap) > 0
@@ -1634,7 +1753,7 @@ def solve_owned_cut(
             stage_tokens=int(stage_tokens), stage_row_bytes=int(stage_row_bytes),
             stage_floor_tokens=int(stage_floor_tokens))
 
-    def _verdict(fits, by):
+    def _verdict(fits, by, ext=()):
         nonlocal guard_refused
         if any(f.ceiling_fraction is None or f.ceiling_max_rows < f.scratch_rows + 2
                for f in fits):
@@ -1642,15 +1761,19 @@ def solve_owned_cut(
         if guard_on and _raise_of(fits) is None:
             guard_refused += 1
             return None
+        if x1_scope == "sync":
+            # S54: the synchronized round and the extend, max over ALL ranks
+            return (all(max(by[b]) <= max(base_by[b]) + 1e-9 for b in _x1_bss)
+                    and (not _ext_on or not ext or max(ext) <= max(base_ext) + 1e-9))
         x1 = not any(by[b][w] > base_by[b][w] + 1e-9 for b in _x1_bss for w in workers)
         if not x1 and not forced and x1_scope != "round":
             return None
         return x1
 
-    def _key(x1, by, move, rat, sh):
+    def _key(x1, by, move, rat, sh, ext=()):
         # bs1 alone: the weighted term is constant, the order is the old
         # (x1, leximax, sum, move) one
-        obj = round(_objective(by), 9) if bs_weights else 0.0
+        obj = round(_objective(by, ext), 9) if (bs_weights or _ext_on) else 0.0
         return (0 if (x1 or not ranks_x1) else 1, obj, owned_rank_key(by[1]), move,
                 tuple(rat), tuple(sh))
 
@@ -1664,25 +1787,26 @@ def solve_owned_cut(
         for sh in shares_list:
             cand += 1
             terms = _terms(rat, sh)
-            fits = tuple(f for f, _ in terms)
-            by = {b: tuple(t[b] for _, t in terms) for b in _bss}
-            x1 = _verdict(fits, by)
+            fits = tuple(f for f, _, _ in terms)
+            by = {b: tuple(t[b] for _, t, _ in terms) for b in _bss}
+            ext = tuple(x for _, _, x in terms) if _ext_on else ()
+            x1 = _verdict(fits, by, ext)
             if x1 is None:
                 continue
             feas += 1
             # forced: a form keeping x1 wins over one that breaks it
-            ranked.append(_key(x1, by, move, rat, sh))
+            ranked.append(_key(x1, by, move, rat, sh, ext))
     ranked.sort()
     best = None
     for key in ranked[:OWNED_EXACT_CHECKS]:
         rat, sh = key[4], key[5]
-        fits, by = _exact(rat, sh)
-        x1 = _verdict(fits, by)
+        fits, by, ext = _exact(rat, sh)
+        x1 = _verdict(fits, by, ext)
         if x1 is None:
             continue
-        exact_key = _key(x1, by, key[3], rat, sh)
+        exact_key = _key(x1, by, key[3], rat, sh, ext)
         if best is None or exact_key < best[0]:
-            best = (exact_key, rat, sh, fits, by)
+            best = (exact_key, rat, sh, fits, by, ext)
         if best is not None and best[0][:3] <= key[:3]:
             break  # no later estimate can beat the exact best
     stayed = False
@@ -1694,18 +1818,18 @@ def solve_owned_cut(
         for key in ranked:
             if tuple(key[4]) != base:
                 continue
-            fits_s, by_s = _exact(key[4], key[5])
-            x1_s = _verdict(fits_s, by_s)
+            fits_s, by_s, ext_s = _exact(key[4], key[5])
+            x1_s = _verdict(fits_s, by_s, ext_s)
             if x1_s is None:
                 continue
-            k_s = _key(x1_s, by_s, key[3], key[4], key[5])
+            k_s = _key(x1_s, by_s, key[3], key[4], key[5], ext_s)
             if k_s[0] > best[0][0]:
                 continue  # x1 lost: never trade x1 for staying
-            stay = (k_s, key[4], key[5], fits_s, by_s)
+            stay = (k_s, key[4], key[5], fits_s, by_s, ext_s)
             break
         if stay is not None:
-            other_obj = _objective(best[4])
-            if other_obj > _objective(stay[4]) * (1.0 - float(switch_gain)):
+            other_obj = _objective(best[4], best[5])
+            if other_obj > _objective(stay[4], stay[5]) * (1.0 - float(switch_gain)):
                 best, stayed = stay, True
     elapsed = _time.monotonic() - t0
     _bs_rec = tuple(_bsw) if bs_weights else ()
@@ -1720,9 +1844,11 @@ def solve_owned_cut(
                         base_ratios=base, base_round_ms=base_ms, candidates=cand, feasible=0,
                         solves=solves, elapsed_s=round(elapsed, 2),
                         base_round_ms_by_bs=_base_by_t, bs_weights=_bs_rec,
-                        base_objective_ms=_objective(base_by), guard_refused=guard_refused,
-                        guard=_guard)
-    key, rat, sh, fits, by = best
+                        base_objective_ms=_objective(base_by, base_ext),
+                        guard_refused=guard_refused, guard=_guard,
+                        base_extend_ms=tuple(base_ext),
+                        extend_per_round=float(extend_per_round) if _ext_on else 0.0)
+    key, rat, sh, fits, by, ext = best
     fr = tuple(float(f.ceiling_fraction) for f in fits)
     raise_ = _raise_of(fits) if guard_on else None
     if raise_ is not None and any(raise_):
@@ -1737,10 +1863,13 @@ def solve_owned_cut(
                     elapsed_s=round(elapsed, 2),
                     round_ms_by_bs=tuple((b, tuple(by[b])) for b in _bss),
                     base_round_ms_by_bs=_base_by_t, bs_weights=_bs_rec,
-                    objective_ms=_objective(by), base_objective_ms=_objective(base_by),
+                    objective_ms=_objective(by, ext),
+                    base_objective_ms=_objective(base_by, base_ext),
                     guard_refused=guard_refused, guard=_guard, stayed=stayed,
                     best_other_objective_ms=other_obj,
-                    scratch_raise=tuple(raise_) if raise_ is not None and any(raise_) else ())
+                    scratch_raise=tuple(raise_) if raise_ is not None and any(raise_) else (),
+                    extend_ms=tuple(ext), base_extend_ms=tuple(base_ext),
+                    extend_per_round=float(extend_per_round) if _ext_on else 0.0)
 
 
 class OwnedBase(msgspec.Struct, frozen=True, kw_only=True):
@@ -1773,6 +1902,9 @@ def derive_owned_base(
     ratio_step: int = OWNED_RATIO_STEP,
     max_iter: int = 8,
     heat: Optional[Sequence[float]] = None,
+    extend_row_ms: Optional[Sequence[float]] = None,
+    extend_ids: int = 0,
+    extend_per_round: float = 0.0,
 ) -> OwnedBase:
     """01.10. (user: the planner proposes the expert split from the hardware
     and model profile, not a hand value): the Form-A ownership -- no KV cut,
@@ -1785,7 +1917,11 @@ def derive_owned_base(
     240,100,148 ended 5 ms apart). The seed fixes only the sum and the
     lattice phase; single-expert steps around the lattice optimum then refine
     it (``max_iter`` rounds). The owned solve holds its x1 guard against
-    THIS form, not against a stated vector."""
+    THIS form, not against a stated vector. S54: with the extend term on
+    (as in :func:`solve_owned_cut`) the round adds ``extend_per_round x
+    max_r X_r``."""
+    ext_on = (extend_row_ms is not None and float(extend_per_round) > 0
+              and int(extend_ids) > 0 and len(extend_row_ms) == len(seed_ratios))
     bsw = (tuple((int(b), float(w)) for b, w in bs_weights if float(w) > 0)
            if bs_weights else ((1, 1.0),))
     bss = tuple(sorted({b for b, _ in bsw} | {1}))
@@ -1823,6 +1959,11 @@ def derive_owned_base(
                                 rows_per_round=int(rows_per_round) * b, merged=False)
               for b in bss}
         obj = sum(w * max(by[b]) for b, w in bsw)
+        if ext_on:
+            obj += float(extend_per_round) * max(owned_extend_ms(
+                edged, num_experts=num_experts, n_layers=n_layers, extend_ids=int(extend_ids),
+                row_ms=extend_row_ms, heat=heat,
+                spans=owned_spans(rat, num_experts) if heat is not None else None))
         memo[rat] = (by, obj)
         return memo[rat]
 
@@ -4097,8 +4238,15 @@ def plan_d_residency(
     owned_miss_rank_source: str = "",
     owned_heat_records: Optional[Sequence[Mapping[str, object]]] = None,
     owned_heat_source: str = "",
+    owned_extend_h2d_gbps: Optional[Sequence[Optional[float]]] = None,
+    owned_extend_source: str = "",
 ) -> DResidencyPlan:
     """Der D-FRACTION-SOLVE mit den Metallregeln, fuer ``launcher``.
+
+    S54 (19.10.): ``owned_extend_h2d_gbps`` = gemessener gepinnter H2D je
+    D-Rang (Kartenprobe, GB/s, Rangfolge); damit bepreist der Eigentums-Solve
+    die Experten-Kopie eines D-Extends je Rang an seinem Link
+    (:func:`owned_extend_ms`). Fehlt ein Rang, bleibt der Term aus (benannt).
 
     01.10. (Eigentum aus den Profilen): ``owned_miss_ms_rank`` = die Kosten
     je verfehlter Zeile JE RANG (jede Karte an ihrem Link, aus den
@@ -4397,6 +4545,14 @@ def plan_d_residency(
         _heat_src = ("%s in %s" % (_heat_got[1], owned_heat_source or "ohne Herkunft")
                      if _heat_got is not None
                      else "gleichverteilt (kein Hitze-Record dieses Checkpoints)")
+        # S54: the extend's expert copy, priced at each rank's link
+        _ext_tok, _ext_rate, _ext_src = owned_extend_form()
+        _ext_row_ms = (owned_extend_row_ms(owned_extend_h2d_gbps, int(round(slot_bytes)))
+                       if owned_extend_h2d_gbps is not None
+                       and len(owned_extend_h2d_gbps) == len(base_rat) else None)
+        _ext_ids = int(_ext_tok) * int(text_cfg.get("num_experts_per_tok") or 1)
+        _ext_kw = dict(extend_row_ms=_ext_row_ms, extend_ids=_ext_ids,
+                       extend_per_round=_ext_rate)
         _base_mode = owned_base_mode()
         _stated_base = list(base_rat)
         _base_lines: Tuple[str, ...] = ()
@@ -4407,7 +4563,7 @@ def plan_d_residency(
                     num_experts=int(terms.num_experts), n_layers=int(terms.n_layers),
                     ids_per_step=ids, miss_ms=_miss_ms, miss_ms_rank=_miss_rank,
                     card_rows=_card_rows, fa_layers=fa_layers, rows_per_round=int(verify),
-                    bs_weights=_bs_w, heat=_heat)
+                    bs_weights=_bs_w, heat=_heat, **_ext_kw)
             except ValueError as exc:
                 # no Form A with an edge on every rank: the stated vector
                 # stays the base, named -- a planner gap never stops a boot
@@ -4448,7 +4604,7 @@ def plan_d_residency(
                 ids_per_step=ids, miss_ms=_miss_ms, card_rows=_card_rows, fa_layers=fa_layers,
                 rows_per_round=int(verify), forced_shares=_forced_shares,
                 x1_scope=_x1_scope, bs_weights=_bs_w, miss_ms_rank=_miss_rank, heat=_heat,
-                switch_gain=OWNED_SWITCH_GAIN, **_lim)
+                switch_gain=OWNED_SWITCH_GAIN, **_ext_kw, **_lim)
 
         sol = _owned_from(base_rat)
         if tuple(int(x) for x in base_rat) != tuple(int(x) for x in _stated_base):
@@ -4511,6 +4667,12 @@ def plan_d_residency(
             ("limits_refused", sol.guard_refused),
             ("stayed_on_base", sol.stayed),
             ("scratch_raise", list(sol.scratch_raise) or None),
+            ("extend_ms", [round(x, 2) for x in sol.extend_ms] or None),
+            ("base_extend_ms", [round(x, 2) for x in sol.base_extend_ms] or None),
+            ("extend_per_round", sol.extend_per_round),
+            ("extend_ids", _ext_ids if _ext_row_ms is not None else None),
+            ("extend_row_ms", [round(x, 4) for x in _ext_row_ms] if _ext_row_ms else None),
+            ("extend_source", "%s; Link %s" % (_ext_src, owned_extend_source or "-")),
         )
         if sol.feasible:
             ratios = [float(x) for x in sol.ratios]
@@ -4533,9 +4695,15 @@ def plan_d_residency(
                    ["%.3f" % x for x in sol.fractions],
                    ["%.2f" % x for x in sol.round_ms], ["%.2f" % x for x in sol.base_round_ms],
                    max(sol.round_ms), max(sol.base_round_ms),
-                   ("kein Worker ueber Form A" if sol.x1_ok else
+                   (("synchrone Runde (max ueber ALLE Raenge) und Extend-Kopie nicht ueber "
+                     "Form A (%s=sync, S54)" % OWNED_X1_ENV)
+                    if sol.x1_ok and _x1_scope == "sync" else
+                    "kein Worker ueber Form A" if sol.x1_ok else
                     ("gemeldet, nicht erzwungen (%s=round: die Runde entscheidet)" % OWNED_X1_ENV
                      if _x1_scope == "round" else
+                     ("VERFEHLT (%s=sync: keine tragbare Form haelt die Runde von Form A, "
+                      "die beste Runde ist gewaehlt)" % OWNED_X1_ENV)
+                     if _x1_scope == "sync" and not _forced_shares else
                      "VERLETZT (Schnitt erzwungen, Messarm M1b)")) + (
                        " -- Schnitt ERZWUNGEN %s" % list(_forced_shares) if _forced_shares
                        else ""),
@@ -4546,6 +4714,19 @@ def plan_d_residency(
                    int(kv_tokens)),
             )
             cut_lines = _base_lines + cut_lines
+            cut_lines = cut_lines + (
+                ("%s FRACTION-SOLVE %s D-EIGENTUM EXTEND-KOPIE (S54): Experten-Kopie je D-Extend "
+                 "(%d neue Token, %d Ids, %.4f Extends je Decode-Runde, %s) je Rang %s ms "
+                 "(Form A %s), max %.1f gegen %.1f; Link je Zeile %s ms (%s)"
+                 % (marker, label, _ext_tok, _ext_ids, sol.extend_per_round, _ext_src,
+                    ["%.1f" % x for x in sol.extend_ms], ["%.1f" % x for x in sol.base_extend_ms],
+                    max(sol.extend_ms), max(sol.base_extend_ms),
+                    ["%.4f" % x for x in _ext_row_ms], owned_extend_source or "ohne Herkunft"),)
+                if sol.extend_ms else
+                ("%s FRACTION-SOLVE %s D-EIGENTUM EXTEND-KOPIE (S54): AUS -- %s"
+                 % (marker, label,
+                    "kein gemessener H2D-Link je D-Rang (Kartenprobe)" if _ext_row_ms is None
+                    else "FLLIPER_PDFLIP_OWNED_EXTEND_PER_ROUND=0"),))
             if sol.guard or sol.stayed:
                 _g = dict(sol.guard)
                 cut_lines = cut_lines + (

@@ -14645,6 +14645,28 @@ def d_owned_miss_ms_rank(ns, *, env_d: Mapping[str, str], n: int
     return got
 
 
+def d_owned_extend_h2d(cards: Sequence["Card"]) -> Tuple[Optional[List[float]], str]:
+    """S54 (19.10.): the measured pinned H2D GB/s of every D rank's card, in
+    rank order, from the card probe (``rigmon.card_probe``, the artifact the
+    cold tier and the planner's cost model already price links from -- read
+    by UUID, never by enumeration order). ``(None, why)`` when a card has no
+    measured rate: the owned solve's extend term then stays off, named."""
+    try:
+        from flliper.srt.layers.moe.expert_offload import _card_probe_h2d_table
+
+        table = _card_probe_h2d_table()
+    except Exception as exc:  # noqa: BLE001 - an unreadable probe is an absence
+        return None, f"Kartenprobe nicht lesbar ({type(exc).__name__})"
+    out, parts = [], []
+    for c in cards:
+        g = table.get(str(getattr(c, "uuid", "")))
+        if g is None:
+            return None, f"nvml{getattr(c, 'nvml_index', '?')} ohne gemessenen H2D in der Kartenprobe"
+        out.append(float(g))
+        parts.append(f"nvml{getattr(c, 'nvml_index', '?')} {g:.2f}")
+    return out, "Kartenprobe H2D GB/s " + " / ".join(parts)
+
+
 def d_owned_heat_records(ns, *, env_d: Mapping[str, str]) -> Tuple[List[dict], str]:
     """01.10. (owned cut from the profiles): the #276 heat records of group
     D's ``FLLIPER_DEBUG_MOE_HEAT`` directory -- the owned solve's non-resident
@@ -19549,6 +19571,8 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
     # 01.10.: the same records per rank -- each card at its own link
     _miss_rank, _miss_rank_src = d_owned_miss_ms_rank(ns, env_d=_env_d, n=n)
     _heat_recs, _heat_root = d_owned_heat_records(ns, env_d=_env_d)
+    # S54: each D rank's link for the extend term of the owned solve
+    _ext_gbps, _ext_src = d_owned_extend_h2d(cards)
     if _miss_rank is not None:
         log(f"{D_RANK_SOLVE_MARKER} {label} D-EIGENTUM FEHLGRIFF-KOSTEN JE RANG (01.10.): "
             f"{'/'.join('%.4f' % x for x in _miss_rank)} ms je Zeile (TP0..TP{n - 1}) "
@@ -19610,6 +19634,8 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
             owned_miss_rank_source=_miss_rank_src,
             owned_heat_records=_heat_recs,
             owned_heat_source=_heat_root,
+            owned_extend_h2d_gbps=_ext_gbps,
+            owned_extend_source=_ext_src,
             **_kv_cut_kw,
         )
         if _ledger is not None and plan.refusal is not None and plan.fits:
@@ -19653,6 +19679,8 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
                     owned_miss_rank_source=_miss_rank_src,
                     owned_heat_records=_heat_recs,
                     owned_heat_source=_heat_root,
+                    owned_extend_h2d_gbps=_ext_gbps,
+                    owned_extend_source=_ext_src,
                     **_kv_cut_kw,
                 )
         if d_stated_seats(ns) is not None:
@@ -19750,6 +19778,8 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
             owned_miss_rank_source=_miss_rank_src,
             owned_heat_records=_heat_recs,
             owned_heat_source=_heat_root,
+            owned_extend_h2d_gbps=_ext_gbps,
+            owned_extend_source=_ext_src,
             **_seat_cut_kw,
     ), label):
         log(_ln)

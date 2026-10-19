@@ -81,6 +81,9 @@ def test_round_scope_ranks_by_the_synchronized_round():
 
 def test_env_default_and_refusal(monkeypatch):
     monkeypatch.delenv(er.OWNED_X1_ENV, raising=False)
+    # S54 (19.10.): the default is sync (x1 on the synchronized round)
+    assert er.owned_x1_scope() == "sync"
+    monkeypatch.setenv(er.OWNED_X1_ENV, "workers")
     assert er.owned_x1_scope() == "workers"
     monkeypatch.setenv(er.OWNED_X1_ENV, "round")
     assert er.owned_x1_scope() == "round"
