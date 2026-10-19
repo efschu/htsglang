@@ -2713,20 +2713,48 @@ def _floor_for_shrink(sched, ms, fr, ended: bool) -> int:
 
 
 def _room_ok(sched, ms, fr, alloc, cap_tokens: int, need: int, incoming: int,
-             n_running: int, page: int) -> bool:
+             n_running: int, page: int, demand: Optional[tuple] = None) -> bool:
     """``_group_room_below`` with the same replicated re-check: a pure decode
     round (no incoming) under an unchanged pending cap reuses the last group
     verdict while the group's MIN slack (free tokens below the cap minus the
     need) cannot have been used up -- each running request takes at most
     ceil(r * R / page) new pages in r rounds of R tokens (R = verify tokens
-    + 1). A new demand, a new running set or a new cap re-reads at once."""
+    + 1). A new demand, a new running set or a new cap re-reads at once.
+
+    S72 (rc16 1019_121629, D TP0 13:28:43-13:30:58, bs 1, ``#queue-req: 1``):
+    a HELD demand -- the same queued request, nothing admitted, DQH holding
+    the pass -- is not a new demand, but ``incoming > 0`` bypassed the cache in
+    every pass: ``FLOOR-CHECK room_reads`` +512 per 512 ticks, ``room_cached=0``,
+    each read a device->host copy of the free lists behind the schedule
+    stream's WAR wait on the previous forward plus one group collective.
+    ``DECODE-HOST-SPLIT sched_ms`` 34.9 (3.7 without the reads), ``sync_ms`` 0:
+    the overlap was gone, the round 42 ms wall / 33.5 "gpu-ms" against
+    29.7 / 25.6 (3157 rounds of pdflip-132-465 = the whole rc16 "bs1 64-160k"
+    bucket). ``demand`` is the REPLICATED fingerprint of what the admission
+    can take (sorted queued rids, the live chunked rid); with it, a NOT-OK
+    group verdict (the cap stays lifted to the mapped stage: more room, never
+    less) is reused under an unchanged (pending, cap, running count, incoming
+    tokens, demand) on the same back-off as a decode round (1, 2, 4 .. K
+    passes). The rank-local ``need`` (host load-back extents, #1046) is NOT in
+    that key -- every input of the hit test is replicated, so every rank
+    enters the collective on the same passes. An OK verdict under demand is
+    still read every pass (an admission on this pass must not ride a stale
+    "the pending cap pays it" -- NF1d). ``demand=None`` (direct callers) keeps
+    the old rule."""
     k = _recheck_max()
     rnd = int(getattr(ms, "_round", 0))
     key = (ms.pending, int(cap_tokens), int(need), int(n_running))
+    dkey = None
+    if demand is not None and int(incoming) > 0:
+        dkey = (ms.pending, int(cap_tokens), int(n_running), int(incoming), tuple(demand))
     c = fr.get("room")
     if k > 1 and int(incoming) <= 0 and c is not None and c["key"] == key and rnd < c["next"]:
         fr["room_cached"] += 1
         return bool(c["ok"])
+    if (k > 1 and dkey is not None and c is not None and not c["ok"]
+            and c.get("dkey") == dkey and rnd < c["next"]):
+        fr["room_cached"] += 1
+        return False
     room = free_tokens_below(alloc, cap_tokens, _page_size(sched))
     slack = _SLACK_CAP if room is None else min(_SLACK_CAP, int(room) - int(need))
     ok_local = 1 if slack >= 0 else 0
@@ -2735,6 +2763,13 @@ def _room_ok(sched, ms, fr, alloc, cap_tokens: int, need: int, incoming: int,
     fr["room_reads"] += 1
     ok = bool(int(res[0]))
     min_slack = int(res[1]) if len(res) > 1 else 0
+    # S72: under a demand key the back-off grows on the REPLICATED key only
+    # (``key`` carries the rank-local ``need`` there), so ``next`` -- the hit
+    # test above -- is the same number on every rank
+    if dkey is not None:
+        prev = c["gap"] if (c is not None and c.get("dkey") == dkey) else 0
+    else:
+        prev = c["gap"] if (c is not None and c["key"] == key) else 0
     gap = 0
     if ok and min_slack > 0:
         pg = max(1, int(page))
@@ -2743,14 +2778,12 @@ def _room_ok(sched, ms, fr, alloc, cap_tokens: int, need: int, incoming: int,
         n = max(1, int(n_running))
         pages_each = min_slack // (n * pg)          # new pages each request may still take
         safe = (pages_each * pg) // per_round        # rounds before any could need more
-        prev = c["gap"] if (c is not None and c["key"] == key) else 0
         gap = min(k, safe, max(1, int(prev) * 2))
     elif not ok:
         # a lift keeps the cap at the mapped stage (more room, not less):
         # re-read on the same back-off, the lift ends on a fresh verdict
-        prev = c["gap"] if (c is not None and c["key"] == key) else 0
         gap = min(k, max(1, int(prev) * 2))
-    fr["room"] = {"key": key, "ok": ok, "next": rnd + gap, "gap": max(1, gap)}
+    fr["room"] = {"key": key, "dkey": dkey, "ok": ok, "next": rnd + gap, "gap": max(1, gap)}
     return ok
 
 
@@ -2797,6 +2830,18 @@ def boot_phase(sched) -> Optional[PhaseState]:
     return st
 
 
+def _demand_fingerprint(sched, admissible) -> tuple:
+    """S72: what the admission of this pass can take, as REPLICATED values --
+    the sorted rids of the queued requests the next admission may take (the
+    request lists are the same on every D rank, #603) and the rid of a live
+    chunked_req. Token counts ride beside it in ``_room_ok``'s key (``incoming``,
+    replicated); nothing rank-local (page lists, prefix_indices, load-back
+    extents) enters."""
+    queued = tuple(sorted(str(getattr(r, "rid", "")) for r in (admissible or ())))
+    chunked = getattr(sched, "chunked_req", None)
+    return queued + (("~chunked", str(getattr(chunked, "rid", ""))) if chunked is not None else ())
+
+
 def _cap_lift_verdict(sched, ms, fr, alloc, tokens, used: int, incoming: int, admissible, rids,
                       page: int):
     """NF1d / 1528: does a pending shrink's cap go back up to the mapped stage
@@ -2833,7 +2878,8 @@ def _cap_lift_verdict(sched, ms, fr, alloc, tokens, used: int, incoming: int, ad
         # A live chunked_req is replicated (it is in ``used``), so the bit is that.
         chunk_live = 1 if getattr(sched, "chunked_req", None) is not None else 0
         lifted = not _room_ok(sched, ms, fr, alloc, tokens[ms.pending], need,
-                              incoming + chunk_live, len(rids), page)
+                              incoming + chunk_live, len(rids), page,
+                              demand=_demand_fingerprint(sched, admissible))
     ms._cap_lifted = lifted
     if lifted:
         fr["lifted_since"] = True
