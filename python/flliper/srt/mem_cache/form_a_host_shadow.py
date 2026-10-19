@@ -120,6 +120,12 @@ RRSTATE = "rrstate"
 #: after it, before any request of the pass, so the trees and the device room stay equal
 L3DROP = "l3drop"
 
+#: S74 review A1 (nf-review-s74-1019): TP0's direct-write ack under the token cut found the page incomplete (CUT-L3-WAIT)
+#: -- every worker publishes ITS share of that node at this broadcast (the same ``write_backup`` its publish sweep would
+#: issue, targeted), so its claim JOINS TP0's open slot inside FLLIPER_PDFLIP_ARENA_PARTIAL_REAP_S instead of whenever
+#: the BFS sweep reaches the node (rc16: minutes; the 30 s partial reap then freed TP0's claim and the join needed room)
+PUBLISH = "publish"
+
 #: #239 S4b part 4: broadcasts TP0 waits for an incomplete token-cut page
 #: before it falls back to the ack's pre-cut decision (a write of every owner
 #: acks within a pass or two; the bound is a backstop, not a timing)
@@ -461,7 +467,7 @@ def _pkey(e) -> tuple:
     is a fact about the store, not a host decision: a TRANSIT or REBIND of the
     same node in the same pass must not drop it."""
     k = (e[1], int(e[2]))
-    return k + (e[0],) if e[0] in (L3, K21, L3DROP) else k
+    return k + (e[0],) if e[0] in (L3, K21, L3DROP, PUBLISH) else k
 
 
 def l3_group_on(env=None) -> bool:
@@ -506,9 +512,12 @@ L3_WAIT_CAP = 4096
 def await_l3(tree: Any, node: Any) -> bool:
     """S74 CUT-L3-WAIT, TP0 under the token cut: its direct-write ack came while the node's page was not complete
     in the arena (TP0 writes share 0; an owner's extents are missing or still in flight). Neither TP0 nor any
-    worker marks ``l3_present`` now: a worker whose extents are missing keeps the node un-backed and its publish
-    sweep writes it (the claim JOINS the open slot -- no room needed); TP0 re-checks at every broadcast and sends
-    L3 once the page is complete. False = not keyable (nothing is marked -- conservative)."""
+    worker marks ``l3_present`` now: a worker whose extents are missing keeps the node un-backed and writes its share
+    -- at once through the PUBLISH event of this broadcast (review A1), else in its publish sweep. Its claim JOINS
+    the open slot without room only while TP0's share-0 claim lives, i.e. within FLLIPER_PDFLIP_ARENA_PARTIAL_REAP_S
+    (30 s) of TP0's merge; after the #231 partial reap the join is a fresh claim that needs room. TP0 re-checks at
+    every broadcast (page-capped, :func:`_retry_l3_waits`) and sends L3 once the page is complete. False = not
+    keyable (nothing is marked -- conservative)."""
     k = node_key(node)
     if k is None:
         if _note("unkeyed_l3_wait"):
@@ -517,41 +526,105 @@ def await_l3(tree: Any, node: Any) -> bool:
     register_tree(tree)
     _announce("host")
     _S.l3_wait.pop(k, None)
-    _S.l3_wait[k] = [node, 0]
+    _S.l3_wait[k] = [node, 0, time.monotonic()]
+    if publish_on():
+        _S.ledger.append((PUBLISH, k[0], k[1], 1, 1, 0))
     while len(_S.l3_wait) > L3_WAIT_CAP:
         _S.l3_wait.pop(next(iter(_S.l3_wait)))
     n = _note("l3_wait", 256)
     if n:
-        logger.info("S74 CUT-L3-WAIT node=%s depth=%d pages=%d waiting=%d (TP0's ack under the token cut: the page "
-                    "is not complete -- no l3_present on any rank until every owner wrote; a worker's sweep writes "
-                    "its share) n=%d", getattr(node, "id", "?"), k[1], len(getattr(node, "hash_value", None) or ()),
-                    len(_S.l3_wait), n)
+        logger.info("S74 CUT-L3-WAIT node=%s depth=%d pages=%d waiting=%d oldest_wait_ms=%.0f publish=%d (TP0's ack "
+                    "under the token cut: the page is not complete -- no l3_present on any rank until every owner "
+                    "wrote; the workers publish their share at this broadcast; the join needs no room only within "
+                    "the %.0f s partial reap of TP0's claim) n=%d", getattr(node, "id", "?"), k[1],
+                    len(getattr(node, "hash_value", None) or ()), len(_S.l3_wait), _oldest_wait_ms(),
+                    int(publish_on()), _partial_reap_s(), n)
     return True
+
+
+def publish_on(env=None) -> bool:
+    """S74 review A1 switch ``FLLIPER_PDFLIP_CUT_L3_PUBLISH`` (default ON): a CUT-L3-WAIT sends the PUBLISH event;
+    ``0`` = the workers' publish sweep alone writes their share (the 6ffdebbbcb form)."""
+    env = os.environ if env is None else env
+    return str(env.get(CUT_L3_PUBLISH_ENV, "1")).strip().lower() not in ("0", "false", "no", "off", "")
+
+
+CUT_L3_PUBLISH_ENV = "FLLIPER_PDFLIP_CUT_L3_PUBLISH"
+#: S74 review A2: pages ``_retry_l3_waits`` re-checks per broadcast (find_states over the waiting nodes' KV stems);
+#: the rest waits for the next broadcast in round-robin order
+CUT_L3_RETRY_PAGES_ENV = "FLLIPER_PDFLIP_CUT_L3_RETRY_PAGES"
+
+
+def _retry_pages(env=None) -> int:
+    env = os.environ if env is None else env
+    try:
+        return max(1, int(env.get(CUT_L3_RETRY_PAGES_ENV, "8192")))
+    except (TypeError, ValueError):
+        return 8192
+
+
+def _partial_reap_s() -> float:
+    try:
+        from flliper.srt.mem_cache.pool_host.arena_pool import ENV_PARTIAL_REAP_S
+
+        return max(0.0, float(os.environ.get(ENV_PARTIAL_REAP_S, "30")))
+    except Exception:  # noqa: BLE001 - the instrument only names it
+        return 30.0
+
+
+def _oldest_wait_ms() -> float:
+    now = time.monotonic()
+    return max(((now - e[2]) * 1e3 for e in _S.l3_wait.values() if len(e) > 2), default=0.0)
 
 
 def _retry_l3_waits() -> None:
     """S74, TP0 at ``attach``: a waiting page that completed gets ``l3_present`` and its L3 event in this
-    broadcast; a node that went another way (detached, host rows gone, marked by another path) leaves."""
+    broadcast; a node that went another way (detached, host rows gone, marked by another path) leaves.
+    Review A2: at most ``FLLIPER_PDFLIP_CUT_L3_RETRY_PAGES`` pages are probed per broadcast (round robin: a probed,
+    still incomplete entry moves to the end); ``S74 CUT-L3-RETRY`` names the cost (n, waiting, probed, pages, ms)."""
     tree = _S.tree
     if tree is None or not _S.l3_wait:
         return
+    t0 = time.perf_counter()
     probe = getattr(tree, "_s74_cut_page_complete", None)
+    budget = _retry_pages()
+    waiting0 = len(_S.l3_wait)
+    pages = probed = done = left = 0
+    requeue = []
     for k, ent in list(_S.l3_wait.items()):
         node = ent[0]
         if (not _attached(node) or node.component_data[int(_base_ct())].host_value is None
                 or getattr(node, "l3_present", False) or probe is None):
             del _S.l3_wait[k]
+            left += 1
             continue
+        np_ = len(getattr(node, "hash_value", None) or ())
+        if probed and pages + np_ > budget:
+            break  # the page cap of this broadcast (the first entry is always probed)
+        pages += np_
+        probed += 1
         if probe(node):
             del _S.l3_wait[k]
             node.l3_present = True
             _S.ledger.append((L3, k[0], k[1], 1, 1, 0))
+            done += 1
+            waited_ms = (time.monotonic() - ent[2]) * 1e3 if len(ent) > 2 else -1.0
             n = _note("l3_late", 256)
             if n:
-                logger.info("S74 CUT-L3-LATE node=%s depth=%d after %d pass(es) (every owner wrote; l3_present "
-                            "on every rank at this broadcast) n=%d", getattr(node, "id", "?"), k[1], ent[1] + 1, n)
+                logger.info("S74 CUT-L3-LATE node=%s depth=%d after %d pass(es) waited_ms=%.0f reap_s=%.0f (every "
+                            "owner wrote; l3_present on every rank at this broadcast) n=%d",
+                            getattr(node, "id", "?"), k[1], ent[1] + 1, waited_ms, _partial_reap_s(), n)
             continue
         ent[1] += 1
+        requeue.append(k)
+    for k in requeue:  # round robin: the probed, still incomplete ones go behind the unprobed
+        _S.l3_wait[k] = _S.l3_wait.pop(k)
+    ms = (time.perf_counter() - t0) * 1e3
+    n = _note("l3_retry", 256)
+    if n or ms >= 20.0:
+        logger.info("S74 CUT-L3-RETRY waiting=%d probed=%d pages=%d cap=%d done=%d left=%d oldest_wait_ms=%.0f "
+                    "ms=%.2f (attach cost of the CUT-L3 re-check) n=%d", waiting0, probed, pages, budget, done, left,
+                    _oldest_wait_ms(), ms, n or _S.counts.get("l3_retry", 0))
 
 
 def record_l3_drop(tree: Any, key: Optional[Tuple[str, int]]) -> bool:
@@ -1014,8 +1087,9 @@ def on_tree_reset(tree: Any) -> None:
     _S.rebind_wait = {}
     if _S.l3_wait:
         # S74: pages a TP0 ack left incomplete up to the reset -- no worker ever wrote its share (named, not fixed)
-        logger.warning("S74 CUT-L3-RESET open=%d (direct-write pages still not complete at the reset: no owner "
-                       "share arrived before the flush; their nodes never carried l3_present)", len(_S.l3_wait))
+        logger.warning("S74 CUT-L3-RESET open=%d oldest_wait_ms=%.0f reap_s=%.0f (direct-write pages still not "
+                       "complete at the reset: no owner share arrived before the flush; their nodes never carried "
+                       "l3_present)", len(_S.l3_wait), _oldest_wait_ms(), _partial_reap_s())
     _S.l3_wait = {}
     try:
         from flliper.srt.pdflip import forma_l3_subtree as _s39
@@ -1116,6 +1190,18 @@ def apply(tree: Any, events: List, seq: int = 0) -> Dict[str, int]:
                 c["pending"] += 1
             else:
                 c["l3drop_" + out] = c.get("l3drop_" + out, 0) + 1
+            continue
+        if kind == PUBLISH:
+            if r != "worker":
+                continue  # TP0 wrote its share-0 claim before it sent the event
+            pub = getattr(tree, "_s74_worker_publish", None)
+            out = pub(node) if callable(pub) else "no_hook"
+            c["publish_" + out] = c.get("publish_" + out, 0) + 1
+            n = _note("publish_" + out, 256)
+            if n:
+                logger.info("S74 CUT-L3-PUBLISH out=%s node=%s depth=%d (TP0's ack found this page incomplete: this "
+                            "worker writes its share now, the claim joins TP0's open slot) n=%d",
+                            out, getattr(node, "id", "?"), int(depth), n)
             continue
         if kind == L3:
             if r != "worker":

@@ -7074,6 +7074,27 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return  # worker: TP0's L3 event sets it
         node.l3_present = True
 
+    def _s74_worker_publish(self, node) -> str:
+        """S74 review A1, a Form A worker at TP0's PUBLISH event (R12 consume, before any request of the pass):
+        write THIS rank's share of ``node`` now -- the same ``write_backup`` and the same skip rules as its publish
+        sweep, targeted -- so the claim joins TP0's open share-0 slot inside the partial-reap window. Returns the
+        outcome (named in ``S74 CUT-L3-PUBLISH``); a refusal leaves the node to the sweep, as before."""
+        if node.evicted or node.backuped or getattr(node, "l3_present", False):
+            return "backed"
+        if node.component_data[BASE_COMPONENT_TYPE].value is None:
+            return "no_device"
+        if node.write_through_pending_id is not None:
+            return "pending"
+        _adm = getattr(self, "_mamba_write_through_pin_admissible", None)
+        if callable(_adm) and not _adm(node):
+            return "pin_deferred"
+        try:
+            got = self.write_backup(node)
+        except Exception as exc:  # noqa: BLE001 - the sweep stays the fallback
+            logger.warning("S74 CUT-L3-PUBLISH write_backup raised on node %s: %r", getattr(node, "id", "?"), exc)
+            return "raised"
+        return "issued" if got and got > 0 else "refused"
+
     def _s74_cut_page_complete(self, node) -> bool:
         """S74: every KV page of ``node`` is COMPLETE in the arena (every token owner merged its extents) --
         the shared slot header, no collective. True when it cannot be told (no arena pool, no keys, a lookup

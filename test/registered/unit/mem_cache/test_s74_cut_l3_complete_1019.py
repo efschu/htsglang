@@ -167,7 +167,7 @@ def test_reset_names_and_drops_the_open_waits(arena, host_cut, caplog):
     t._k12_direct_l3_verdict(n, 0)
     with caplog.at_level("WARNING"):
         R.on_tree_reset(None)
-    assert "S74 CUT-L3-RESET open=1" in caplog.text and not R._S.l3_wait
+    assert "S74 CUT-L3-RESET open=1 oldest_wait_ms=" in caplog.text and not R._S.l3_wait
 
 
 def test_unreadable_arena_keeps_the_old_verdict(host_cut):
@@ -178,19 +178,120 @@ def test_unreadable_arena_keeps_the_old_verdict(host_cut):
     assert n.l3_present is True
 
 
-def test_worker_applies_l3_only_when_sent(arena, host_cut, monkeypatch):
-    """The worker side of the chain: its l3_present comes ONLY from TP0's event (sweep skip reason)."""
+class _WorkerTree:
+    """A Form A worker: the real targeted publish over a stub write_backup (an owner's share into the real arena)."""
+    _s74_worker_publish = U._s74_worker_publish
+
+    def __init__(self, arena, wn, off, backed=False):
+        self.root_node, self._components_tuple = wn.parent, ()
+        self.arena, self.off, self.calls = arena, off, []
+        wn.evicted, wn.backuped, wn.write_through_pending_id = False, backed, None
+        wn.component_data[0].value = torch.arange(len(wn.hash_value) * PAGE)
+
+    def write_backup(self, node):
+        self.calls.append(node.id)
+        _owner_writes(self.arena, node.hash_value, self.off)
+        return len(node.hash_value)
+
+
+def _worker_consume(monkeypatch, sent, wtree):
+    monkeypatch.setattr(R, "role", lambda: "worker")
+    monkeypatch.setattr(R, "cut_role", lambda: "worker")
+    R.consume(list(sent), wtree)
+    monkeypatch.setattr(R, "role", lambda: "host")
+    monkeypatch.setattr(R, "cut_role", lambda: "host")
+
+
+def test_worker_gets_publish_not_l3_and_writes_its_share_at_the_broadcast(arena, host_cut, monkeypatch):
+    """Review A1: the CUT-L3-WAIT sends PUBLISH (never L3); each worker writes its share at the SAME broadcast,
+    its claim joins TP0's open share-0 slot (status 1), the page completes, the next attach sends L3."""
     t, n = _Tree(arena), _node()
     _tp0_claims_share0(arena, n.hash_value)
     t._k12_direct_l3_verdict(n, 0)
     sent = R.attach([])
-    wn = _node()
-    monkeypatch.setattr(R, "role", lambda: "worker")
-    monkeypatch.setattr(R, "cut_role", lambda: "worker")
-    R.consume(list(sent), SimpleNamespace(root_node=wn.parent, _components_tuple=()))
-    assert wn.l3_present is False, "the worker's sweep still writes its share"
+    kinds = [e[0] for v in sent for e in v.events]
+    assert kinds == [R.PUBLISH] and _l3_events(sent) == []
+    w1, w2 = _node(), _node()
+    t1, t2 = _WorkerTree(arena, w1, 0), _WorkerTree(arena, w2, HALF)
+    _worker_consume(monkeypatch, sent, t1)
+    R._S.pending = {}
+    _worker_consume(monkeypatch, sent, t2)
+    assert t1.calls == [1250] and t2.calls == [1250] and w1.l3_present is False
+    assert arena.find_states(["p1432.kv", "p1433.kv"]) == [2, 2]
+    R._S.pending = {}
+    ev = _l3_events(R.attach([]))
+    assert len(ev) == 1 and n.l3_present is True
+
+
+def test_worker_publish_skips_a_backed_node(arena, host_cut, monkeypatch):
+    """The ordinary sweep: the worker's own write is already issued/backed -- PUBLISH writes nothing twice."""
+    t, n = _Tree(arena), _node()
+    _tp0_claims_share0(arena, n.hash_value)
+    t._k12_direct_l3_verdict(n, 0)
+    sent = R.attach([])
+    w = _node()
+    wt = _WorkerTree(arena, w, 0, backed=True)
+    _worker_consume(monkeypatch, sent, wt)
+    assert wt.calls == []
+
+
+def test_publish_switch_off_sends_no_event(arena, host_cut, monkeypatch):
+    monkeypatch.setenv("FLLIPER_PDFLIP_CUT_L3_PUBLISH", "0")
+    t, n = _Tree(arena), _node()
+    _tp0_claims_share0(arena, n.hash_value)
+    t._k12_direct_l3_verdict(n, 0)
+    assert R.attach([]) == []
+
+
+def test_partial_reap_frees_tp0s_share0_claim_after_the_window(arena):
+    """Review A1, measured on the real C arena: TP0's share-0 claim after its merge has no open writer and no
+    reference -- inside the window it stays (an owner JOINS without room), past it #231 reaps it and the owner's
+    claim is FRESH (needs a free slot). This is why the PUBLISH event exists."""
+    (s, st, g), = arena.claim_slots(["p2000.kv"], [SLOT])
+    assert st == 0
+    assert arena.complete_slots([s], [g], []) == [0]          # TP0 merges share 0
+    assert arena.reap_partial(30.0) == [], "inside FLLIPER_PDFLIP_ARENA_PARTIAL_REAP_S: kept"
+    (s1, st1, _), = arena.claim_slots(["p2000.kv"], [SLOT])
+    assert (s1, st1) == (s, 1), "an owner inside the window joins TP0's slot"
+    arena.complete_slots([s1], [g], [(0, HALF)])
+    (s3, st3, g3), = arena.claim_slots(["p2001.kv"], [SLOT])
+    arena.complete_slots([s3], [g3], [])
+    # past the window (age 0 here): the share-0 claim is reaped -- and so is the page ONE owner merged (the other
+    # never came): both are the rc16 212-1185 'missing' pages (#231 ARENA-REAP-PARTIAL total=2132 on TP0)
+    assert sorted(arena.reap_partial(0.0)) == sorted([s, s3])
+    assert arena.find_states(["p2001.kv"]) == [0]
+    (s4, st4, _), = arena.claim_slots(["p2001.kv"], [SLOT])
+    assert st4 == 0, "the late owner's claim is fresh: it needs room"
+
+
+def test_wait_lines_carry_ms_and_retry_is_page_capped(arena, host_cut, monkeypatch, caplog):
+    """Review A1/A2: WAIT/LATE/RESET name the wait in ms; the re-check probes at most the page cap per broadcast
+    (round robin) and names its cost."""
+    monkeypatch.setenv("FLLIPER_PDFLIP_CUT_L3_RETRY_PAGES", "2")
+    t = _Tree(arena)
+    nodes = [_node((f"a{i}", f"b{i}")) for i in range(3)]
+    for i, n in enumerate(nodes):
+        n.id = 100 + i
+        _tp0_claims_share0(arena, n.hash_value)
+    with caplog.at_level("INFO"):
+        for n in nodes:
+            t._k12_direct_l3_verdict(n, 0)
+        R.attach([])
+    assert "oldest_wait_ms=" in caplog.text and "CUT-L3-RETRY waiting=3 probed=1 pages=2 cap=2" in caplog.text
+    order = list(R._S.l3_wait)
+    assert order[-1] == ("b0", 2 * PAGE), "the probed entry went behind the unprobed"
+    for n in nodes:
+        _owner_writes(arena, n.hash_value, 0)
+        _owner_writes(arena, n.hash_value, HALF)
+    caplog.clear()
+    with caplog.at_level("INFO"):
+        for _ in range(3):
+            R.attach([])
+    assert not R._S.l3_wait and all(n.l3_present for n in nodes)
+    assert "CUT-L3-LATE" in caplog.text and "waited_ms=" in caplog.text
 
 
 def test_switch_default_on():
+    assert R.publish_on({}) is True and R._retry_pages({}) == 8192
     assert R.cut_l3_complete_on({}) is True
     assert R.cut_l3_complete_on({"FLLIPER_PDFLIP_CUT_L3_COMPLETE": "0"}) is False
