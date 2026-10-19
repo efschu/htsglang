@@ -6852,6 +6852,10 @@ class Front:
             credit = max(0, int(c.n) - int(pending))
             known, src = True, "d_probe_" + _xp.src
             self.counters["d_probe_priced"] += 1
+            _pbook = self.__dict__.setdefault("_probe_price", collections.OrderedDict())
+            _pbook[str(rid)] = _xp  # a later D refusal of this rid knows P's exact number (W123 requeue)
+            while len(_pbook) > 4096:
+                _pbook.popitem(last=False)
             if _xp.image_in_tail:
                 self.counters["d_probe_image_in_tail"] += 1
             logger.info("PDFLIP D-PROBE rid=%s n=%d device=%d host=%d store=%d tier=%s covered=%d uncached_d=%d "
@@ -15331,9 +15335,13 @@ class Front:
         except TypeError:
             _vis_reroute = False
         if _vis_reroute and not getattr(p, "p_only", False):
-            # S56: D refused because an image lies in its uncached tail (no tower, W123): P-only (SOLL R9)
+            # S56: D refused because an image lies in its uncached tail (no tower, W123): P-only (SOLL R9), and it
+            # costs what P computes -- the arrival probe's n - store (rc15 pdflip-4-9: D extent 95758, P computed 14)
             p.p_only = True
             self.counters["w123_requeue_p_only"] += 1
+            _xp_r = (self.__dict__.get("_probe_price") or {}).get(str(rid))
+            if _xp_r is not None:
+                p.est_uncached = int(_xp_r.uncached_p)
         if seat is not None:
             seat.release("W50_requeue")
         p.seat = None

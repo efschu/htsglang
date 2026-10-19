@@ -362,3 +362,35 @@ def test_text_prompt_probe_asks_ds_tree_with_the_front_ids(caplog):
     assert dmp.ids_from_b64(sent["payload"]["input_ids_b64"]).tolist() == (np.arange(4492) + 10).tolist()
     assert xx.pending == 4492 and xx.src == "d_probe_none" and xx.image_in_tail is False
     assert not dmp.payload_has_any_media(_payload(100))
+
+
+def test_a_w123_requeue_is_p_only_at_p_s_number():
+    """rc15 pdflip-4-9: D refused W123 (covered 0) with extent 95758; P computed 14 from the store. The requeue marks
+    it P-only (R9) and prices it at the arrival probe's n - store."""
+    from types import SimpleNamespace
+
+    from test_pdflip_front_x_exact import _front
+
+    f = _front(True)
+    f._probe_price = {"pdflip-4-9": dmp.exact_price(_ans(95758, 0), 95744)}
+    body = (b'{"error": "W50 PdFlipTpPrefillExceeded (vision reroute): group D cannot serve this request itself; '
+            b'this request\'s extent after prefix matching is 95758. Re-routed ... W123 PdFlipVisionImageNotInPrefixOnD"}')
+
+    async def run():
+        req = SimpleNamespace(path="/v1/messages")
+        task = asyncio.create_task(
+            f._requeue_after_x_refusal(req, "pdflip-4-9", {}, "w" * 300, False, None, None, body))
+        for _ in range(200):
+            if f.queue:
+                break
+            await asyncio.sleep(0.005)
+        q = f.queue[0]
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            pass
+        return q
+
+    q = asyncio.run(run())
+    assert q.p_only is True and q.est_uncached == 14 and f.counters["w123_requeue_p_only"] == 1
