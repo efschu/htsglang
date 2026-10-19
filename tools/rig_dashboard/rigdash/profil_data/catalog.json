@@ -55504,7 +55504,7 @@
      "source": {
       "file": "pdflip/front.py",
       "kind": "os.environ",
-      "line": 4356
+      "line": 4367
      }
     }
    },
@@ -68503,7 +68503,7 @@
      "source": {
       "file": "pdflip/front.py",
       "kind": "os.environ",
-      "line": 1196
+      "line": 1207
      }
     }
    },
@@ -69445,7 +69445,7 @@
    "id": "FLLIPER_PDFLIP_MODE_PARITY_CHECK",
    "kind": "env",
    "lesestellen": [
-    "pdflip/front.py:6457"
+    "pdflip/front.py:6468"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_MODE_PARITY_CHECK",
@@ -69454,7 +69454,7 @@
    "source": {
     "file": "pdflip/front.py",
     "kind": "os.environ",
-    "line": 6457,
+    "line": 6468,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -71761,7 +71761,7 @@
    "id": "FLLIPER_PDFLIP_P_DRAIN_EARLY_SETTLE",
    "kind": "env",
    "lesestellen": [
-    "pdflip/front.py:3502"
+    "pdflip/front.py:3513"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_P_DRAIN_EARLY_SETTLE",
@@ -71770,7 +71770,7 @@
    "source": {
     "file": "pdflip/front.py",
     "kind": "os.environ",
-    "line": 3502,
+    "line": 3513,
     "tree": "nf"
    },
    "status": "harvested",
@@ -71936,6 +71936,38 @@
    "text": "",
    "trees": [
     "27b",
+    "nf"
+   ],
+   "type": "os.environ"
+  },
+  "FLLIPER_PDFLIP_P_KNOWN_IMAGE": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"1\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "",
+   "id": "FLLIPER_PDFLIP_P_KNOWN_IMAGE",
+   "kind": "env",
+   "lesestellen": [
+    "pdflip/p_known_image.py:77",
+    "pdflip/p_known_image.py:93"
+   ],
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_P_KNOWN_IMAGE",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "pdflip/p_known_image.py",
+    "kind": "os.environ",
+    "line": 77,
+    "tree": "nf"
+   },
+   "status": "unexplained",
+   "text": "",
+   "trees": [
     "nf"
    ],
    "type": "os.environ"
@@ -74820,7 +74852,7 @@
    "id": "FLLIPER_PDFLIP_STORE_SHORT_HELD_DECIDE",
    "kind": "env",
    "lesestellen": [
-    "managers/scheduler.py:952"
+    "managers/scheduler.py:953"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_STORE_SHORT_HELD_DECIDE",
@@ -74829,7 +74861,7 @@
    "source": {
     "file": "managers/scheduler.py",
     "kind": "os.environ",
-    "line": 952,
+    "line": 953,
     "tree": "nf"
    },
    "status": "harvested",
@@ -74856,7 +74888,7 @@
      "source": {
       "file": "managers/scheduler.py",
       "kind": "os.environ",
-      "line": 964
+      "line": 965
      }
     }
    },
@@ -76878,7 +76910,7 @@
      "source": {
       "file": "pdflip/vision_rank_runner.py",
       "kind": "os.environ",
-      "line": 1179
+      "line": 1347
      }
     }
    },
@@ -76965,7 +76997,7 @@
      "source": {
       "file": "pdflip/front.py",
       "kind": "os.environ",
-      "line": 4453
+      "line": 4464
      }
     }
    },
@@ -77035,6 +77067,37 @@
    ],
    "type": "os.environ"
   },
+  "FLLIPER_PDFLIP_VISION_PROBE_WAIT": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"1\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "S66 PROBE-WAIT (NF rc15 boot 092806, P PP0, pdflip-12-340; review S63 (6)): the images end at 20556, PP0's store probe answered 42240 at 10:08:06 (``PDFLIP-CLAIM-SHORT ... claimed=660 tokens=42240``, ``#257 PROBE-HOLD pages=660``), yet the tower ran at 10:08:09 (load 251, encode 1675) and only then came ``#1416d TOLD-PROBE told=42240``. A P that reads from the store after its sleep holds NOTHING locally (prefix 0, host hit 0 at the vision pass), and its told is published at the top of the pass AFTER the read terminated -- for a dormant-held request only once the release has queued it (pdflip_store_told, TK path 4), i.e. one pass after the vision pass that found it. The local-WAIT above never fires there: every such image was staged. rc15, three boots: 31 of 90 tower runs were for images inside the prefix P then admitted (82.5 s of PP0, the stage is synchronous). Now: while the told is outstanding and the rid is held by #1400, PP0's OWN store probe decides WAIT -- its anchor-clamped answer (``note_probe_hit``, the very number the told reuses: #1416d ``reused=prefetch_hit``) put on the registration head, or the read's completed prefix. A probe that has not answered yet while the read is registered waits too (the told cannot come before it). WAIT only defers the verdict to the told (one pass); it never skips: SKIP stays ``told >= image_end``, the admission belt (:func:`skip_still_covered`) stays. The admission cannot take the request before its told anyway (``pdflip_store_told_pending``), so a WAIT costs no admission pass -- only the overlap of a tower the told then still need ...",
+   "id": "FLLIPER_PDFLIP_VISION_PROBE_WAIT",
+   "kind": "env",
+   "lesestellen": [
+    "pdflip/vision_rank_runner.py:321"
+   ],
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_VISION_PROBE_WAIT",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "pdflip/vision_rank_runner.py",
+    "kind": "os.environ",
+    "line": 321,
+    "tree": "nf"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "os.environ"
+  },
   "FLLIPER_PDFLIP_VISION_RAM_DIR": {
    "bare": false,
    "choices": null,
@@ -77097,6 +77160,37 @@
    "text": "",
    "trees": [
     "27b",
+    "nf"
+   ],
+   "type": "os.environ"
+  },
+  "FLLIPER_PDFLIP_VISION_UNPRICED_TO_D": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"1\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "MM-XPRICE: front_tokens is imported lazily here as everywhere in this module S66 (NF rc16 boot 121629): an image request WITHOUT an exact number (D's probe gave up) goes to D's own admission, which measures it (vision_d_guard W123 -> P-only requeue with D's extent) -- never P-only by rule on a missing number. 0/false/no/off = the pre-S66 rule (every unpriced image request P-only).",
+   "id": "FLLIPER_PDFLIP_VISION_UNPRICED_TO_D",
+   "kind": "env",
+   "lesestellen": [
+    "pdflip/front.py:89"
+   ],
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_VISION_UNPRICED_TO_D",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "pdflip/front.py",
+    "kind": "os.environ",
+    "line": 89,
+    "tree": "nf"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
     "nf"
    ],
    "type": "os.environ"
@@ -90247,28 +90341,28 @@
  "schema": "flliper.catalog/1",
  "stats": {
   "curated": 125,
-  "entries": 2847,
-  "envs": 1968,
+  "entries": 2850,
+  "envs": 1971,
   "explained": 310,
   "flags": 864,
-  "harvested": 1757,
+  "harvested": 1759,
   "trees": {
    "abweichung": 51,
    "beide": 2463,
    "nur_27b": 180,
-   "nur_nf": 186
+   "nur_nf": 189
   },
-  "unexplained": 655
+  "unexplained": 656
  },
- "tree_rev": "27b=0798c91fcd+nf=ba915afc35",
+ "tree_rev": "27b=0798c91fcd+nf=d945eaf87a",
  "trees": {
   "27b": {
    "entries": 2643,
    "rev": "0798c91fcd"
   },
   "nf": {
-   "entries": 2649,
-   "rev": "ba915afc35"
+   "entries": 2652,
+   "rev": "d945eaf87a"
   }
  },
  "warnungen": []
