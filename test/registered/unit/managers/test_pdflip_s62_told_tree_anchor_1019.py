@@ -49,8 +49,10 @@ def _clean(monkeypatch):
             monkeypatch.delenv(k, raising=False)
 
 
-def _ring(monkeypatch, tree_reach, pf=True, b5=None, **env):
-    """``tree_reach[rank]`` = the depth that rank's tree resumes pdflip-1-30 from (``rank_resumable``)."""
+def _ring(monkeypatch, tree_reach, pf=True, b5=None, local=None, store_kv=False, **env):
+    """``tree_reach[rank]`` = the depth that rank's tree resumes pdflip-1-30 from (``rank_resumable``);
+    ``local[rank]`` = the KV that rank's match holds (default: its reach); ``store_kv`` = the told-limited
+    registration of a follower reads the KV span up to its limit from the store (default: nothing to read)."""
     _clean(monkeypatch)
     if pf:
         monkeypatch.setenv(fb.ENV_FALLBACK, "1")
@@ -86,6 +88,9 @@ def _ring(monkeypatch, tree_reach, pf=True, b5=None, **env):
             if limit_tokens is None:  # the early read at intake, before the sibling's insert
                 tree.start_read(req.rid, STALE, 0.0)
                 return "issued"
+            if store_kv:  # the store holds the KV pages up to the limit (their Mamba anchor: not)
+                tree.start_read(req.rid, int(limit_tokens), 0.0)
+                return "issued"
             return "declined:too_short"  # the told-limited registration: nothing beyond the local head
 
         s._prefetch_kvcache = fol_read
@@ -93,7 +98,7 @@ def _ring(monkeypatch, tree_reach, pf=True, b5=None, **env):
     for s in ring.stages[1:]:
         for r in s.waiting_queue:
             # what this stage's device match holds when the told comes (05:20:15: the insert ran before the ack)
-            r.host_hit_length = int(tree_reach[int(s.ps.pp_rank)])
+            r.host_hit_length = int((local or tree_reach)[int(s.ps.pp_rank)])
     return ring
 
 
@@ -193,6 +198,46 @@ def test_follower_without_the_anchor_and_no_common_depth_is_told_zero_everywhere
     assert _uniform(ring) == 0
     assert _admits(ring) == [(0, 1, None)]
     assert ring.sleeps == {0: 0.0, 1: 0.0, 2: 0.0}
+
+
+def test_follower_holding_the_kv_but_not_the_state_floors_every_rank(monkeypatch):
+    """Review S62 (A2), the most dangerous follower: PP2's match holds the KV up to 18624 ("FOLLOWER SATISFIED
+    LOCALLY") but its recurrent state only at 3072 (1-28's turn anchor never got a slot there, the #968 shape).
+    Its ack must be its TREE's resumable depth (``_satisfied_resumable``), so PP0 floors every rank at 3072 --
+    an ack of told would admit 18624 on a rank that cannot resume there (wrong state / #968 group stop)."""
+    ring = _ring(monkeypatch, {0: HEAD, 1: HEAD, 2: STORE}, b5={1: (STORE,), 2: ()},
+                 local={0: HEAD, 1: HEAD, 2: HEAD})
+    ring.run(16)
+    assert _told_on_wire(ring) == [HEAD]
+    assert _uniform(ring) == STORE
+    assert _admits(ring) == [(STORE, None, 1)]
+    assert getattr(ring.stages[2], "_pf_ack_satisfied_unresumable_n", 0) >= 1
+
+
+def test_follower_reading_the_kv_but_not_the_state_floors_every_rank(monkeypatch):
+    """Review S62 (A3), the same danger on the NOT-satisfied path: PP2's tree resumes from 3072, its told-limited
+    registration reads the KV pages up to 18624 from the store (the store holds the KV, not the Mamba anchor --
+    rc15: KV to 37824, anchor at 32768). The read's record says 18624; the ack must be the tree's resumable depth
+    (``_resumable_own``, ACK-RESUMABLE), so PP0 floors every rank at 3072."""
+    ring = _ring(monkeypatch, {0: HEAD, 1: HEAD, 2: STORE}, b5={1: (STORE,), 2: ()},
+                 local={0: HEAD, 1: HEAD, 2: 12032}, store_kv=True)
+    ring.run(16)
+    assert _told_on_wire(ring) == [HEAD]
+    assert _uniform(ring) == STORE
+    assert _admits(ring) == [(STORE, None, 1)]
+    assert getattr(ring.stages[2], "_pf_ack_unresumable_n", 0) >= 1
+
+
+def test_dual_layout_keeps_the_store_clamp(monkeypatch):
+    """Review S62 (A1): on the dual layout a satisfied follower acks told UNPROBED (``_satisfied_resumable``,
+    ``_over_resumable_at_told``) -- the follower check that carries the tree told does not exist there, so the
+    told stays the store anchor."""
+    _clean(monkeypatch)
+    monkeypatch.setattr(tf, "rank_resumable", lambda s, r, told: min(int(told), HEAD))
+    monkeypatch.setenv("FLLIPER_PDFLIP_DUAL_LAYOUT", "1")
+    assert m._tree_anchored(_S(), object(), RID, HEAD, STORE) == STORE
+    monkeypatch.setenv("FLLIPER_PDFLIP_DUAL_LAYOUT", "0")
+    assert m._tree_anchored(_S(), object(), RID, HEAD, STORE) == HEAD
 
 
 def test_no_hang_the_verdict_comes_within_the_ack_passes(monkeypatch):

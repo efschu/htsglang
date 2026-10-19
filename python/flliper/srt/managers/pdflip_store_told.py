@@ -1165,6 +1165,11 @@ def _tree_anchored(scheduler, req, rid: str, told: int, clamped: int) -> int:
     told, clamped = int(told), int(clamped)
     if clamped >= told or told <= 0 or not told_tree_anchor_on():
         return clamped
+    if (os.environ.get("FLLIPER_PDFLIP_DUAL_LAYOUT", "") or "").strip() == "1":
+        # Review S62 (A1): on the dual layout a satisfied follower acks told UNPROBED
+        # (``pdflip_told_fallback._satisfied_resumable``, ``_over_resumable_at_told``) -- the
+        # follower tree check this raise stands on does not exist there: the store clamp stays.
+        return clamped
     try:
         # the PF stream exists only on the paced form (``armed``: paced AND env_on)
         if not bool(getattr(scheduler, "_pdflip_told_fallback_on", False)) or not _tf.enabled():

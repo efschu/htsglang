@@ -44,6 +44,16 @@ MUTANTS = [
     ("A6 switch default off (new features on)", ST, T4A,
      "    return str(env.get(ENV_TOLD_TREE_ANCHOR, \"1\") or \"1\")",
      "    return str(env.get(ENV_TOLD_TREE_ANCHOR, \"0\") or \"0\")"),
+    # review S62 (19.10.): the follower checks the tree told stands on, and the dual-layout guard
+    ("A7 a satisfied follower acks told unprobed (pre-#968 form: KV held, state not)", FB, T4A,
+     "    if res is None or int(res) >= told:\n        return told\n    # H64-AUFLAGE 1",
+     "    return told\n    # H64-AUFLAGE 1"),
+    ("A8 the tree raise on the dual layout (satisfied acks unprobed there)", ST, T4A,
+     "    if (os.environ.get(\"FLLIPER_PDFLIP_DUAL_LAYOUT\", \"\") or \"\").strip() == \"1\":\n        # Review S62 (A1)",
+     "    if False:\n        # Review S62 (A1)"),
+    ("A9 a reading follower acks its KV record unprobed (ACK-RESUMABLE off)", FB, T4A,
+     "        res = _tf.rank_resumable(scheduler, req, int(own))\n    except Exception:  # noqa: BLE001 - a probe never breaks the ack\n        return own\n",
+     "        res = None\n    except Exception:  # noqa: BLE001 - a probe never breaks the ack\n        return own\n"),
     # ---- 4b
     ("B1 the forward gathers one page below the inserted position (wrong KV/state)", TA, T4B,
      "        desc.add(row, slot, t, prefix, end - prefix)\n        plans.append((t, slot, desc,",
