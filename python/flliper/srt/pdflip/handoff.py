@@ -105,6 +105,43 @@ def read_ids(rid: str) -> Optional[list]:
     return list(ids) if ids else None
 
 
+#: S58 (19.10., NF rc15 1019_071429): the hand-off file outlived its rid. The
+#: only reader that removed it (``read_keys(remove=True)``) lost its caller
+#: with xsn330 (``remove=False``: the dormant hold re-reads the keys every
+#: 2 s), and the scheduler's hold release removes it only for rids that sat
+#: in the dormant hold. Every other P-prefilled rid left its file in the
+#: shared arena directory on /dev/shm for the rest of the boot: measured
+#: 08:40Z, 85 min into the boot, 565 files / 318 MiB in ``handoff/`` against
+#: ONE pending and ONE park mark (63-84 files and 17-80 MiB per 10 min, i.e.
+#: ~0.25 GiB/h of shmem under memory.max, unbounded, on a 16 GiB /dev/shm
+#: that the arena files share). The front's rid-end drop
+#: (``handoff_pending.drop`` via ``handoff_seam.wrap_handler``, every return,
+#: exception and cancel of the generate handler, plus the W35/reroute drops)
+#: is the one site that knows the rid is over; it removes the file there.
+#: Unset = on; 0/false/no/off = the file stays, as before.
+REMOVE_AT_RID_END_ENV = "FLLIPER_PDFLIP_HANDOFF_REMOVE_AT_RID_END"
+
+
+def remove_at_rid_end_on(env=None) -> bool:
+    env = os.environ if env is None else env
+    return str(env.get(REMOVE_AT_RID_END_ENV, "1") or "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def remove(rid: Optional[str]) -> bool:
+    """Remove ``rid``'s hand-off file (and a leftover ``*.tmp`` of a writer
+    that died mid-write is not touched: it carries a pid suffix and is
+    replaced by the next write). True when a file was removed; never raises.
+    Absent file = nothing to do (D then takes the old path, byte for byte)."""
+    p = path(rid) if isinstance(rid, str) else ""
+    if not p:
+        return False
+    try:
+        os.remove(p)
+        return True
+    except OSError:
+        return False
+
+
 def read_keys(rid: str, remove: bool = True) -> Optional[list]:
     d = read(rid)
     keys = d.get("page_keys") if d else None

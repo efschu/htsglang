@@ -1828,7 +1828,14 @@ class Envs:
     # whose CachingHostAllocator rounds to the next power of two: 1522.8 MiB
     # image -> 2048 MiB block on D-TP0, 525 MiB of host RAM no ledger post
     # books. False = the torch.empty form, byte for byte.
-    FLLIPER_OPT_PDFLIP_DRAFT_PARK_EXACT_PIN = EnvBool(False)
+    # S58 (19.10.): ON by default (user order 14.10.: new functions default
+    # ON). Measured on NF rc15 1019_071429 D TP0: the 1522.8 MiB image still
+    # held a 2048 MiB /dev/zero block with the switch off -- 525 MiB host RAM.
+    FLLIPER_OPT_PDFLIP_DRAFT_PARK_EXACT_PIN = EnvBool(True)
+    # S58 (19.10.): the tail-stage pin arena (pdflip/tail_adopt.PinArena) is
+    # page-locked at its exact size, the same path. NF rc15 D TP0: 1386.2 MiB
+    # arena -> 2048 MiB block, 662 MiB host RAM. False = torch.empty form.
+    FLLIPER_OPT_PDFLIP_TAIL_STAGE_EXACT_PIN = EnvBool(True)
     # LAYER-REST-1002 (NF y7t D->P): the park skips its D2H when a device
     # digest (int64 sum per MiB) equals the digest of the image's last D2H --
     # the draft is static and every wake wrote the image back. y7t: the

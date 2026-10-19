@@ -843,6 +843,31 @@ def rid_bytes(held: HeldShapes, page_size: int, verify: bool) -> int:
     return total * (2 if verify else 1)
 
 
+def _arena_buffer(nbytes: int, pin: bool) -> torch.Tensor:
+    """The arena's one host buffer of ``nbytes``.
+
+    S58 (19.10., NF rc15 1019_071429, D TP0 /proc smaps): the arena asked for
+    1453524096 B (1386.2 MiB, ``TAIL-STAGE-ARENA seats=6 per_rid_mib=231.0``)
+    and the rank held a 2048 MiB ``/dev/zero`` block for it --
+    ``torch.empty(pin_memory=True)`` goes through ATen's CachingHostAllocator,
+    which rounds every request up to the next power of two (PowerOf2Ceil, see
+    expert_offload.pinned_exact_empty and 73b1a4750a): 662 MiB of host RAM no
+    post books (the ledger line prices ``bytes=``, not the block). With
+    FLLIPER_OPT_PDFLIP_TAIL_STAGE_EXACT_PIN (default on) the buffer is
+    page-locked at its exact size (anonymous mapping + cudaHostRegister, the
+    path of the spill pools and the draft image). A failed registration falls
+    back to the torch.empty form, named; off = that form, byte for byte."""
+    if pin and envs.FLLIPER_OPT_PDFLIP_TAIL_STAGE_EXACT_PIN.get():
+        try:
+            from flliper.srt.layers.moe.expert_offload import pinned_exact_empty
+
+            return pinned_exact_empty((int(nbytes),), torch.uint8)
+        except Exception as e:  # noqa: BLE001 - the old form is always there
+            logger.warning("%s exact pin of %d bytes failed (%s: %s) -- torch.empty(pin_memory) instead, "
+                           "rounded to the next power of two", LEDGER_LINE, int(nbytes), type(e).__name__, e)
+    return torch.empty(int(nbytes), dtype=torch.uint8, pin_memory=pin)
+
+
 class PinArena:
     """ONE pinned host buffer, taken in aligned spans per rid (first fit) and
     given back per rid -- no pin_memory() per tensor. ``take`` returns None
@@ -850,7 +875,7 @@ class PinArena:
 
     def __init__(self, nbytes: int, pin: bool = True):
         self.nbytes = int(max(0, nbytes))
-        self.buf = torch.empty(self.nbytes, dtype=torch.uint8, pin_memory=pin) if self.nbytes else None
+        self.buf = _arena_buffer(self.nbytes, pin) if self.nbytes else None
         self._lock = threading.Lock()
         self._free: List[Tuple[int, int]] = [(0, self.nbytes)] if self.nbytes else []
         self._spans: Dict[str, List[Tuple[int, int]]] = {}
