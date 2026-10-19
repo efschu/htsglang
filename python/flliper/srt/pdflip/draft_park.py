@@ -31,6 +31,7 @@ flip would cost ~0.3 s of cudaHostAlloc on every D sleep.
 
 from __future__ import annotations
 
+import logging
 import time
 from typing import Any, Callable, Iterable, List, Optional, Sequence, Tuple
 
@@ -38,6 +39,8 @@ import msgspec
 import torch
 
 from flliper.srt.environ import envs
+
+logger = logging.getLogger(__name__)
 
 MIB = float(1 << 20)
 
@@ -183,9 +186,13 @@ def _host_image(nbytes: int, *, pin: bool) -> torch.Tensor:
     pins exactly ``nbytes`` (expert_offload.pinned_exact_empty: an anonymous
     mapping + cudaHostRegister). Off = the torch.empty form, byte for byte."""
     if pin and envs.FLLIPER_OPT_PDFLIP_DRAFT_PARK_EXACT_PIN.get():
-        from flliper.srt.layers.moe.expert_offload import pinned_exact_empty
+        try:
+            from flliper.srt.layers.moe.expert_offload import pinned_exact_empty
 
-        return pinned_exact_empty((int(nbytes),), torch.uint8)
+            return pinned_exact_empty((int(nbytes),), torch.uint8)
+        except Exception as e:  # noqa: BLE001 - S58: the old form is always there
+            logger.warning("PDFLIP-DRAFT-PARK exact pin of %d bytes failed (%s: %s) -- torch.empty(pin_memory) "
+                           "instead, rounded to the next power of two", int(nbytes), type(e).__name__, e)
     return torch.empty(int(nbytes), dtype=torch.uint8, pin_memory=pin)
 
 

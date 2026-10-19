@@ -262,11 +262,26 @@ def consume(rid: str, where: str, **kv) -> bool:
 
 def drop(rid: str, reason: str = "front") -> bool:
     """FRONT SEAM: rid ended where D never took it (served via P, aborted,
-    disconnected, re-routed fresh). Never raises."""
+    disconnected, re-routed fresh). Never raises.
+
+    S58: the front calls this at EVERY rid end (``handoff_seam.wrap_handler``)
+    -- the rid is over, so its hand-off file goes too (``handoff.remove``;
+    FLLIPER_PDFLIP_HANDOFF_REMOVE_AT_RID_END, default on). A re-routed rid is
+    prefilled by P again, which writes the file again at its finish. D's own
+    ``consume`` (prefetch termination) does NOT remove it: the dormant hold
+    re-reads the keys after that (xsn330)."""
     try:
-        return _end(str(rid), str(reason), "DROPPED")
+        ended = _end(str(rid), str(reason), "DROPPED")
     except Exception:  # noqa: BLE001
-        return False
+        ended = False
+    try:
+        from flliper.srt.pdflip import handoff as _ho
+
+        if _ho.remove_at_rid_end_on():
+            _ho.remove(str(rid))
+    except Exception:  # noqa: BLE001 - bookkeeping never breaks the front
+        pass
+    return ended
 
 
 def status(rid: str) -> dict:
