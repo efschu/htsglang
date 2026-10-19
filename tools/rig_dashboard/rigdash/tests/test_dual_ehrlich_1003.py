@@ -112,8 +112,10 @@ class TestFlipBootUnchanged(unittest.TestCase):
     admit keys added, tps of a segment with a wide chunk 80,9 -> 80,5 (no Dual/co key, no P/dec/flip segment touched).  Hashes below are the 880 state; F0-D 08.10.: re-pinned for the renamed tree (the segments and the timeline are identical to the old tree after the name mapping, verified by a structured diff of the replayed JSON).  Old: segs 9a04f69aa116, timeline 1502f91e5bc7."""
     # F0-D 08.10. (fLLiper rename): both hashes re-pinned for the renamed tree. The replayed segments/timeline are identical to the old tree after the name
     # mapping (structured diff of the two JSON dumps: empty); old pins: segs 9a04f69aa116, timeline 1502f91e5bc7.
-    SEGS = "f08946c212612fcea17ea7ea2c9f6470b4695511e269ba23a80b4176b7ac2b88"      # 07.10. English texts: only the strings why/src/reqs_src changed (verified by structured diff against 07c20a35e5, no key/number changed)
-    TIMELINE = "bd2199ac4b215fb0bf77cc8dd3870cab4380e03cd2c60fa63a0525af2a1f8696"
+    # 21.10. (carried 299945f808, D prefill rate at compute time, onto the renamed tree): SEGS re-pinned -- the old line re-pinned the
+    # same change (9a04f69a -> 95697829); here f08946c2 -> 9d77fec8, the difference to the old pin being the rename mapping above.
+    SEGS = "9d77fec8fd55262a45ca729cf1580db2cefb316731d0af15c414ab17f7502545"      # was f08946c2... (07.10. English texts)
+    TIMELINE = "90b171a20f6e9a508caf4ceecdc66f763b627fe41c82d9b9f8ad49aabbedc484"   # 21.10. carried 299945f808 (old line: 5e1ec9e1); was bd2199ac...
 
     def test_flip_boot_bytes(self):
         r = replay_boot("y8c_0cf3")

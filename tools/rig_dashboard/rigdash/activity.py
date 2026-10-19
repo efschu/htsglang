@@ -162,7 +162,14 @@ def chunks(ring, keys, g: str, kind: Optional[str] = None) -> List[dict]:
         tok = _d(b, a, "pnew") or 0
         if n <= 0 and tok <= 0:
             continue
-        if kind is not None and is_wide(tok, n) != (kind == "wide"):
+        untimed = is_untimed(a, b)
+        if kind is not None and (is_wide(tok, n) and not untimed) != (kind == "wide"):
+            continue
+        if untimed:
+            # UNTIMED (19.10., rc18 D 20:49Z): prefill.last is still the previous TIMED chunk -- these chunks ran
+            # between the two rank clocks, never on that old interval, and carry no compute time of their own
+            out.append({"s": a["ts"], "e0": b["ts"], "e": b["ts"], "tok": tok, "cached": _d(b, a, "pcached") or 0.0,
+                        "n": n, "comp_ms": 0.0, "g": g, "ext": None, "timed": False, "dur_s": None})
             continue
         e0 = b.get("plast_t") if b.get("plast_t") is not None else b["ts"]
         # FEHLT 7 (build y5a): own_ms = the chunk's own time after the previous one left -- the
@@ -181,7 +188,10 @@ def chunks(ring, keys, g: str, kind: Optional[str] = None) -> List[dict]:
         el = next((t for c, t in last_recs if cnt is not None and c >= cnt), None) if kl != k0 else e0
         out.append({"s": s, "e0": e0, "e": max(e0, el if el is not None else e0), "tok": tok,
                     "cached": _d(b, a, "pcached") or 0.0, "n": n, "comp_ms": _d(b, a, "pcomp") or 0.0, "g": g,
-                    "ext": b.get("plast_ext")})
+                    "ext": b.get("plast_ext"), "timed": True,
+                    # one stage: the chunk's own duration on the device (its start rule above); a pipeline keeps
+                    # the P-Ende wall clock (first stage start .. last stage end) as its rate base
+                    "dur_s": (e0 - s) if k0 == kl else None})
     out.sort(key=lambda c: c["e0"])
     # bursts and the spread intervals
     burst: List[dict] = []
@@ -216,8 +226,43 @@ def bursts(cs: List[dict]) -> List[dict]:
             out.append({"s": c["s"], "e": c["e"], "tok": c["tok"], "n": c["n"], "cached": c["cached"], "cs": [c]})
     for b in out:
         b["wall_s"] = b["e"] - b["s"]
-        b["rate"] = b["tok"] / b["wall_s"] if b["tok"] >= MIN_RATE_TOK and b["wall_s"] > 0 else None
+        b["tok_timed"], b["rate"] = burst_rate(b["cs"])
     return out
+
+
+def is_untimed(a: dict, b: dict) -> bool:
+    """A sample pair whose chunks were counted WITHOUT a duration (19.10., rc18 D 20:49Z): the rank's
+    RankPrefillLog adds a MIXED-D forward (S33 review A4: its gpu-ms carries the decode rows, so it is reported
+    untimed) or a forward of a refused #691 pairing to ``chunks``/``new_tokens`` but neither to ``gpu_ms`` nor to
+    ``last`` -- prefill.last still describes the previous TIMED chunk.  Read off that record, 15 such extends
+    (9760 tokens, 20:49:23-20:50:59) landed on the interval of the 2732-token chunk at 20:49:23 and the D burst
+    showed 15180 tokens / 5.97 s = 2544 tok/s.  Older rankstats without gpu_ms decide nothing (False)."""
+    g = _d(b, a, "pgpu")
+    return g is not None and g <= 0 and b.get("plast_t") == a.get("plast_t")
+
+
+def burst_rate(cs: List[dict], min_tok: float = MIN_RATE_TOK) -> Tuple[float, Optional[float]]:
+    """(timed tokens, rate) of one burst: untimed chunks have no compute time and are never rated.  One stage
+    (D): tokens / the summed own durations of the timed chunks -- the chunks at compute time, independent of
+    the moment the rank flushed each record (prefill.last.t is the time the line was written, up to seconds
+    after the forward; rc18 20:49:21/23 lagged 4.2 / 2.2 s and shrank the wall to 5.97 s for 8.0 s of
+    prefill).  A pipeline (P): tokens / (end of the last timed chunk on the last stage - start of the first)."""
+    tc = [c for c in cs if c.get("timed", True)]
+    tok = sum(c["tok"] for c in tc)
+    if tok < min_tok or tok <= 0 or not tc:
+        return tok, None
+    if all(c.get("dur_s") is not None for c in tc):
+        busy = sum(c["dur_s"] for c in tc)
+    else:
+        busy = max(c["e"] for c in tc) - min(c["s"] for c in tc)
+    return tok, (tok / busy if busy > 0 else None)
+
+
+def compute_rate(cs: List[dict], s: float, e: float) -> Optional[float]:
+    """The rate of the timed chunks of ``cs`` whose own interval [s, e0] overlaps [s, e] (a phase-bar segment):
+    their tokens / their summed own durations (one stage) -- the tooltip's "chunks at compute time"."""
+    tc = [c for c in cs if c.get("timed", True) and c["s"] < e and c["e0"] > s]
+    return burst_rate(tc, min_tok=0)[1]   # a segment's own rate, as before without the burst minimum
 
 
 # ----------------------------------------------------------------------------- Tiefe je Prefill / Decode
