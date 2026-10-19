@@ -23,10 +23,13 @@ UNCHANGED ``HiCacheFile.arena_fill_from_disk``:
     withheld from the running request's publish -- the later real read references them like any L2 hit (or reads
     from L3 again if the clock took them meanwhile: only the gain is lost);
   * no room wait (``room_wait=False``): a FULL arena ends the read-ahead, no READ-ROOM post asks a tree to spill;
+  * no kept page spent (S53r, ``_FILL_CTX.spare_kept``): its room comes from unkept pages only, never from the
+    hand-off / park pages #248e stage (ii) gives a real fill -- D's hand-off and park reads keep their L2 copies;
   * pages already COMPLETE in L2 are not asked (LMCache #3540: no I/O for what the faster tier holds) and stay out
     of this fill's own room eviction (``fill_protect_scope``);
   * the prefix walk ends at the first page neither in L2 nor on disk (the real read ends there too).
-WHEN: not at the hint but once the running prefill on PP0 has at most ``LEAD`` tokens left (default two chunks,
+WHEN: not at the hint but -- once no other rid's store read or admission is still ahead (S53r,
+``predecessor_busy``) -- once the running prefill on PP0 has at most ``LEAD`` tokens left (default two chunks,
 ``2 * chunked_prefill_size`` ~ 6 s of PP0 compute against a 2.4-3.0 s cold read) -- early enough to finish before
 the predecessor does, late enough that the predecessor's own chunk publish does not clock the pages out again.
 ONE successor: one job runs, one waits; a newer hint replaces the waiting one. The job is dropped when P is dormant
@@ -61,6 +64,14 @@ MIN_SPAN_TOKENS = 4096
 #: a job older than this is a request the front no longer holds for P (flip, abort): dropped
 MAX_AGE_S = 180.0
 POLL_S = 0.2
+#: S53r (review 19.10.): the front posts the read-ahead hint this long after the pool plan first held the head. The
+#: hold begins in the same drain round that dispatched the predecessor's leg 1, so without the delay the hint's POST
+#: and the predecessor's leg-1 POST reach P's HTTP loop together -- and the hint's synchronous tokenization (H43:
+#: ``PLE-HINT ... ms=651`` for a 199k prompt on rc14) can run before the predecessor's own, in its critical path; it
+#: can also reach PP0's scheduler before the predecessor and start the fill beside the predecessor's store read.
+#: 1.5 s > P's tokenization of a 200k prompt (0.3-0.65 s) + the leg-1 pre-POST awaits; the read-ahead waits for the
+#: predecessor's read and admission anyway (``predecessor_busy``), so the delay costs no gain.
+HINT_DELAY_S = 1.5
 
 
 def enabled() -> bool:
@@ -129,6 +140,37 @@ def armed(scheduler) -> bool:
         return False
 
 
+def predecessor_busy(scheduler, rid: str) -> Optional[str]:
+    """S53r (review 19.10.): why the read-ahead of ``rid`` must not start yet, None = it may.
+
+    ``remaining_prefill_tokens`` answers 0 both when the predecessor's last chunk is out (the read-ahead's point)
+    AND when the predecessor has not begun chunking yet -- its store read still running or its admission (TOLD)
+    still pending, ``chunked_req`` None. That is exactly when the hint arrives (the pool plan holds the head in the
+    drain round that dispatched the predecessor), so the old gate started the fill at once: beside the
+    predecessor's cold read (one ``_l3_executor``, one disk, its stems off the predecessor fill's room eviction
+    via ``_FILL_ACTIVE``) -- in the critical path -- and early enough that the predecessor's chunk publish clocks
+    the pages out again. Wait instead while
+      * another rid's real store read is registered on this rank (``tree.ongoing_prefetch``) -> ``read``;
+      * no chunked request runs and another request sits in the waiting queue (read done, admission pending)
+        -> ``admission``.
+    Attribute reads from the worker thread (at worst one pass stale); a timing gate, never a verdict."""
+    tree = getattr(scheduler, "tree_cache", None)
+    try:
+        ongoing = list(getattr(tree, "ongoing_prefetch", None) or ())
+    except Exception:  # noqa: BLE001 -- unreadable: no wait on it
+        ongoing = []
+    if any(str(k) != rid for k in ongoing):
+        return "read"
+    if getattr(scheduler, "chunked_req", None) is None:
+        try:
+            waiting = list(getattr(scheduler, "waiting_queue", None) or ())
+        except Exception:  # noqa: BLE001
+            waiting = []
+        if any(str(getattr(r, "rid", "")) != rid for r in waiting):
+            return "admission"
+    return None
+
+
 def remaining_prefill_tokens(scheduler) -> int:
     """Prefill tokens PP0 still has to schedule for its chunked request (0 = none running / its last chunk is out).
     Read from the worker thread: an attribute read, at worst one pass stale -- a timing heuristic, never a verdict."""
@@ -164,6 +206,7 @@ def span_hashes(scheduler, ids, span: int) -> List[str]:
 def fill_arena(backend, arena, stems: List[str], total_bytes: int) -> Dict[str, int]:
     """L3 -> L2 for ``stems`` (a prefix walk): the pages not COMPLETE in ``arena`` are filled by the unchanged
     ``arena_fill_from_disk`` -- no reference, no room wait; the whole span stays off this fill's room eviction."""
+    from flliper.srt.mem_cache import hicache_storage as _hs
     from flliper.srt.mem_cache.hicache_storage import fill_protect_scope
 
     n = len(stems)
@@ -178,9 +221,14 @@ def fill_arena(backend, arena, stems: List[str], total_bytes: int) -> Dict[str, 
         return out
     out["asked"] = len(missing)
     op = SimpleNamespace(hash_value=(), _pdflip_protect_stems=list(stems))
-    with fill_protect_scope(backend, op):
-        got = backend.arena_fill_from_disk(arena, missing, int(total_bytes), prefix=True, room_wait=False,
-                                           take_ref=False)
+    _prev_spare = getattr(_hs._FILL_CTX, "spare_kept", False)
+    _hs._FILL_CTX.spare_kept = True   # S53r: a speculative fill never spends kept hand-off / park pages (#248e ii)
+    try:
+        with fill_protect_scope(backend, op):
+            got = backend.arena_fill_from_disk(arena, missing, int(total_bytes), prefix=True, room_wait=False,
+                                               take_ref=False)
+    finally:
+        _hs._FILL_CTX.spare_kept = _prev_spare
     out["landed"] = sum(1 for g in list(got) if isinstance(g, int) and not isinstance(g, bool) and g >= 0)
     return out
 
@@ -280,6 +328,9 @@ class ReadAhead:
         try:
             if job["rid"] in (getattr(tree, "ongoing_prefetch", None) or {}):
                 return "read_started"
+            # S53r: the real request is on this rank already (no read registered for it): its own path serves it
+            if any(str(getattr(r, "rid", "")) == job["rid"] for r in list(getattr(s, "waiting_queue", None) or ())):
+                return "arrived"
         except Exception:  # noqa: BLE001
             pass
         return None
@@ -289,6 +340,12 @@ class ReadAhead:
         why = self._skip_reason(job)
         if why is not None:
             return "skip:" + why
+        busy = predecessor_busy(self.scheduler, job["rid"])
+        if busy is not None:
+            if job.get("busy") != busy:
+                job["busy"] = busy
+                self._bump("wait_" + busy)
+            return None
         rem = remaining_prefill_tokens(self.scheduler)
         if rem > lead_tokens(self.scheduler):
             return None
@@ -301,10 +358,11 @@ class ReadAhead:
             q = res.get("qsa") or {}
             logger.info("PDFLIP L2-READ-AHEAD DONE rid=%s span=%d pages=%s kv=resident:%s,asked:%s,landed:%s "
                         "qsa=resident:%s,asked:%s,landed:%s verdict=%s remaining_at_start=%d waited_ms=%.0f "
-                        "fill_ms=%.0f (n=%d; no reference taken -- the real read finds the pages COMPLETE in L2)",
+                        "waited_for=%s fill_ms=%.0f (n=%d; no reference taken -- the real read finds the pages "
+                        "COMPLETE in L2)",
                         job["rid"], job["span"], res.get("pages", 0), kv.get("resident", "-"), kv.get("asked", "-"),
                         kv.get("landed", "-"), q.get("resident", "-"), q.get("asked", "-"), q.get("landed", "-"),
-                        res.get("verdict"), rem, (t0 - job["t"]) * 1000.0, ms, n)
+                        res.get("verdict"), rem, (t0 - job["t"]) * 1000.0, job.get("busy") or "-", ms, n)
         return str(res.get("verdict") or "done")
 
     def run_job(self, job: dict) -> str:

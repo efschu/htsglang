@@ -536,3 +536,114 @@ def test_phase_policy_unchanged_the_device_plan_stays():
     """H91c stays: the read-ahead never changes which request P admits."""
     assert phase_policy.p_overlap_admits(199014, 1, 152764, 262144) is False
     assert phase_policy.p_overlap_admits(0, 0, 999999, 262144) is True
+
+
+# ============================================================================ S53r (review 19.10.)
+# The hint arrives in the drain round that dispatched the predecessor: the predecessor has not begun chunking yet
+# (``chunked_req`` None), its store read is still registered or its admission still pending. The old LEAD gate read
+# "0 tokens left" and filled at once -- beside the predecessor's cold read (one executor, one disk), in its critical
+# path. The front also posted the hint together with the predecessor's leg 1 (P tokenizes both on one HTTP loop).
+
+
+def test_s53r_metal_shape_the_read_ahead_waits_for_the_predecessors_read_and_admission():
+    """pdflip-0-22 dispatched (its read 2087 pages cold), pdflip-0-23 held in the same round and hinted: the
+    read-ahead of 0-23 waits through 0-22's read, its admission and its chunks down to the lead -- then fills."""
+    fills = []
+    pred = types.SimpleNamespace(rid="pdflip-0-22")
+    tree = types.SimpleNamespace(ongoing_prefetch={"pdflip-0-22": object()})
+    s = _sched(tree_cache=tree, waiting_queue=[pred])
+    w, _ = _worker(s, fills)
+    w.submit("pdflip-0-23", [1], 17472)
+    job = w._take()
+    assert w.step(job) is None and job["busy"] == "read", "0-22's store read runs: no fill beside it"
+    tree.ongoing_prefetch.clear()
+    assert w.step(job) is None and job["busy"] == "admission", "0-22 read, TOLD pending: still not"
+    s.waiting_queue.clear()
+    s.chunked_req = _chunked(152764, 17535 + 16384)
+    assert w.step(job) is None and fills == [], "0-22 chunks, more than the lead left"
+    s.chunked_req = _chunked(152764, 152764 - 16384)
+    assert w.step(job) == "done" and fills == [17472]
+    assert w.counters["wait_read"] == 1 and w.counters["wait_admission"] == 1
+
+
+def test_s53r_the_last_chunk_out_with_nothing_ahead_still_starts_at_once():
+    fills = []
+    s = _sched(tree_cache=types.SimpleNamespace(ongoing_prefetch={}), waiting_queue=[])
+    w, _ = _worker(s, fills)
+    w.submit("r", [1], 8192)
+    assert w.step(w._take()) == "done"
+
+
+def test_s53r_its_own_rid_never_counts_as_a_predecessor_and_its_arrival_ends_the_job():
+    assert ra.predecessor_busy(_sched(tree_cache=types.SimpleNamespace(ongoing_prefetch={"r": 1})), "r") is None
+    fills = []
+    s = _sched(tree_cache=types.SimpleNamespace(ongoing_prefetch={}),
+               waiting_queue=[types.SimpleNamespace(rid="r")])
+    w, _ = _worker(s, fills)
+    w.submit("r", [1], 8192)
+    assert w.run_job(w._take()) == "skip:arrived" and fills == []
+
+
+def test_s53r_the_front_posts_the_hint_after_the_delay_and_not_for_a_gone_or_served_request(monkeypatch):
+    import time as _t
+
+    monkeypatch.setattr(ra, "HINT_DELAY_S", 0.3)
+    fs, p = _FrontStandIn(), _pending()
+    t0 = _t.monotonic()
+    _hint(fs, p)
+    assert len(fs.posts) == 1 and _t.monotonic() - t0 >= 0.29, "posted after the delay"
+
+    async def gone(attr):
+        fs2, p2 = _FrontStandIn(), _pending(rid="pdflip-0-23")
+        front.Front._maybe_l2_read_ahead(fs2, p2)
+        await asyncio.sleep(0)
+        setattr(p2, attr, True)            # during the delay: the client left / its leg 1 already came back
+        for t in list(fs2.__dict__.get("_ple_hint_tasks", ())):
+            await t
+        return fs2
+
+    for attr in ("client_gone", "leg1_done"):
+        fs2 = asyncio.run(gone(attr))
+        assert fs2.posts == [] and fs2.counters["l2_read_ahead_skipped"] == 1, attr
+
+
+def _kept(monkeypatch, stems):
+    """The hand-off order of the arena's pool keeps ``stems`` (#248e): pool_for_arena/keep_for faked, Keep real."""
+    import numpy as np
+
+    from flliper.srt.mem_cache.storage.file.hicache_arena import stem_keys_lo
+    from flliper.srt.pdflip import handoff_pending as hp
+
+    keys = np.sort(stem_keys_lo(stems))
+    keep = hp.Keep(keys, np.zeros(len(stems), dtype=np.int64), np.arange(len(stems), dtype=np.int64),
+                   ["pdflip-9-1"], [list(stems)])
+    monkeypatch.setattr(hp, "pool_for_arena", lambda a: object())
+    monkeypatch.setattr(hp, "keep_for", lambda pool: keep)
+
+
+@needs_gcc
+def test_s53r_the_read_ahead_never_spends_kept_hand_off_pages(arena_env, monkeypatch):
+    """The arena full of UNREFERENCED pages that the hand-off order keeps (P's pages for D's seat): a real fill would
+    spend them (#248e stage ii, they wait on L3); the read-ahead -- a request not even on P yet -- gets no room from
+    them and ends. Danger: D's hand-off read after the flip loses its L2 copy for a speculative read."""
+    from flliper.srt.mem_cache import hicache_storage as hs
+
+    e = arena_env
+    kept = [f"h{i}" for i in range(SLOTS)]
+    e.publish(kept, 0x01)
+    e.to_l3(kept, 0x01)
+    _kept(monkeypatch, kept)
+    spent = []
+    from flliper.srt.pdflip import handoff_pending as hp
+
+    orig = hp.evict_ordered
+    monkeypatch.setattr(hp, "evict_ordered", lambda *a, **k: spent.append(a[2]) or orig(*a, **k))
+    stems = [f"p{i}" for i in range(4)]
+    e.to_l3(stems, 0x20)
+    res = ra.fill_arena(e.be, e.arena, stems, SB)
+    assert res["landed"] == 0 and spent == [], "no kept page spent for a read-ahead"
+    assert _states(e.arena, kept) == [2] * SLOTS, "the hand-off pages stay in L2"
+    # the control: a REAL fill (no read-ahead) spends kept pages as #248e stage (ii) says -- unchanged
+    got = e.be.arena_fill_from_disk(e.arena, stems, SB, prefix=True, room_wait=False, take_ref=False)
+    assert spent and sum(1 for g in got if isinstance(g, int) and g >= 0) == 4
+    assert not getattr(hs._FILL_CTX, "spare_kept", False), "the flag never leaks past the read-ahead"

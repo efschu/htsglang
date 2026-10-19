@@ -14,8 +14,8 @@ TEST = "test/registered/unit/pdflip/test_pdflip_s53_l2_read_ahead_1019.py"
 
 MUTANTS = [
     ("M1 read-ahead takes references (pins L2 slots)", L2,
-     "room_wait=False,\n                                           take_ref=False)",
-     "room_wait=False,\n                                           take_ref=True)"),
+     "room_wait=False,\n                                               take_ref=False)",
+     "room_wait=False,\n                                               take_ref=True)"),
     ("M2 read-ahead room-waits (READ-ROOM spill for a request not on P)", L2,
      "prefix=True, room_wait=False,", "prefix=True, room_wait=True,"),
     ("M3 armed on followers too", L2,
@@ -44,11 +44,22 @@ MUTANTS = [
      "_pdflip_protect_stems=list(stems))", "_pdflip_protect_stems=[])"),
     ("M14 unigram keys on a bigram tree", L2,
      "bigram = bool(getattr(tree, \"is_eagle\", False))", "bigram = False"),
+    # S53r (review 19.10.)
+    ("M15 no predecessor gate (fill beside the predecessor's store read)", L2,
+     "        busy = predecessor_busy(self.scheduler, job[\"rid\"])\n", "        busy = None\n"),
+    ("M16 front posts the hint at once (into the predecessor's tokenization)", FR,
+     "            await asyncio.sleep(_l2ra.HINT_DELAY_S)\n", ""),
+    ("M17 front posts for a request whose leg 1 already came back", FR,
+     "            if p.client_gone or p.leg1_done:", "            if p.client_gone:"),
+    ("M18 read-ahead spends kept hand-off / park pages", L2,
+     "    _hs._FILL_CTX.spare_kept = True   #", "    _hs._FILL_CTX.spare_kept = False   #"),
+    ("M19 the real read of its own rid already queued does not end the job", L2,
+     "                return \"arrived\"", "                pass"),
 ]
 
 
 def run_tests(wt, tag):
-    out = f"/tmp/s53/mut_{tag}.out"
+    out = os.path.join(os.environ.get("MUT_OUT", "/tmp/s53"), f"mut_{tag}.out")
     done = out + ".done"
     for f in (out, done):
         if os.path.exists(f):

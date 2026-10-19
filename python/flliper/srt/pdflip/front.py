@@ -10838,6 +10838,11 @@ class Front:
         from flliper.srt.pdflip.ple_admit_hint import HINT_PATH
 
         async def _post() -> None:
+            # S53r: not in the predecessor's tokenization (see l2_read_ahead.HINT_DELAY_S)
+            await asyncio.sleep(_l2ra.HINT_DELAY_S)
+            if p.client_gone or p.leg1_done:
+                self.counters["l2_read_ahead_skipped"] = self.counters.get("l2_read_ahead_skipped", 0) + 1
+                return
             t0 = time.time()
             try:  # rpc: the admin bearer token rides along (#1275)
                 code, _ = await self.rpc(g, HINT_PATH, body, 30)
