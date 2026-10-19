@@ -19593,8 +19593,12 @@ class Scheduler(
                 skip=batch.pdflip_skip_extend,
             )
         if self.pdflip_d_ext_beacon is not None and batch.forward_mode.is_extend():
-            # S49 D-EXTEND-BEACON: the front's R6 counts a D prefill only from here on (SOLL R6, user 18.10.)
-            self.pdflip_d_ext_beacon.note_extend(rids=[req.rid for req in batch.reqs])
+            # S49 D-EXTEND-BEACON: the front's R6 counts a D prefill only from here on (SOLL R6, user 18.10.);
+            # S56: with D's REAL rest of each request (what this batch and the later chunks still compute)
+            self.pdflip_d_ext_beacon.note_extend(
+                rids=[req.rid for req in batch.reqs],
+                rests=[_pdflip_d_ext.req_rest(req) for req in batch.reqs],
+            )
 
         # #861 fix (b): a request admitted on a cached prefix whose DRAFT rows
         # nothing wrote must not speculate over them. Here, and not in the

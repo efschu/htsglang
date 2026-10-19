@@ -11467,14 +11467,19 @@ class Front:
     def _d_pf_book(self) -> "_dpf.DPrefillInflight":
         return self.__dict__.setdefault("_d_pf", _dpf.DPrefillInflight())
 
-    def _d_pf_pending_tokens(self, started_only: bool = False) -> int:
+    def _d_pf_pending_tokens(self, started_only: bool = False, unstarted_only: bool = False,
+                             d_rest: bool = False) -> int:
         """The uncached tokens D has been granted to prefill as SHORT and has
         not finished (no first content yet). DECODE-COLLECT used to look only
         at D's DECODES, so a burst arriving on an idle D went in one by one --
         each under X, 37k together (NF y6 09.10.). Switch off: 0.
 
         ``started_only`` (S49, SOLL R6 after the user's decision 18.10.): only
-        the rows whose extend D has really begun (``_d_ext_started``)."""
+        the rows whose extend D has really begun (``_d_ext_started``);
+        ``unstarted_only``: only the rows D has NOT begun (their granted price).
+        ``d_rest`` (S56, with ``started_only``): a started row counts D's REAL
+        rest from the D-EXTEND-BEACON, and only when the front can redirect it
+        to P (``_r6_tokens_of``) -- never the front's arrival price."""
         book = self.__dict__.get("_d_pf")  # created by the first SHORT grant
         if book is None or not envs.FLLIPER_PDFLIP_ENABLE_DECODE_COLLECT_PREFILL_BUSY.get():
             return 0
@@ -11497,8 +11502,78 @@ class Front:
                 return True
             return floor > 0 and ls.lane_for(rid) < floor
 
-        started = Front._d_ext_started_pred(self) if started_only else None
-        return book.pending_tokens(now=time.time(), live=D.outstanding, idle=_idle, started=started)
+        started = Front._d_ext_started_pred(self) if (started_only or unstarted_only) else None
+        if unstarted_only and started is not None:
+            _st = started
+            started = lambda rid, t_grant: not _st(rid, t_grant)  # noqa: E731
+        tokens_of = Front._r6_tokens_of(self) if (started_only and d_rest and _dxb.enabled()) else None
+        return book.pending_tokens(now=time.time(), live=D.outstanding, idle=_idle, started=started,
+                                   tokens_of=tokens_of)
+
+    def _r6_redirectable(self, rid: str) -> bool:
+        """S56 (SOLL R6 "wird ... umgeleitet", user finding 19.10.): a running D prefill the front CAN move to P -- a
+        D-prefill leg (no P leg 1, ``_d_prefill_legs``) whose stream is still in the lookahead (nothing committed to
+        the client): PARK-HANDBACK closes it, D aborts it, P's batch takes it. Anything else runs on D to its end and
+        is no part of what P gets, so R6 does not count it."""
+        legs = self.__dict__.get("_d_prefill_legs") or {}
+        return str(rid) in legs and str(rid) in (getattr(self, "_leg2_lookahead", None) or ())
+
+    def _r6_tokens_of(self) -> Callable[[str, float, int], int]:
+        """S56 (SOLL R6 + R11, user 19.10. "warum wird irgendwas geschätzt? alle zahlen liegen doch schwarz auf weiß
+        vor"): the tokens a STARTED D prefill adds to R6's S = D's REAL rest (D-EXTEND-BEACON v2: what D has not
+        computed at its newest extend batch), and only for a leg the front redirects to P (``_r6_redirectable``). D
+        reported no rest, or the leg cannot move: 0 (named). The counted rids are kept in ``_r6_counted`` for the
+        redirect (``_r6_redirect``). Belegfall rc15 07:20:23: pdflip-6-11 front price 3513, D's rest 977."""
+        box: List[Optional[Dict[int, Any]]] = []
+        counted: Dict[str, int] = {}
+        self.__dict__["_r6_counted"] = counted
+
+        def _tok(rid: str, t_grant: float, _granted: int) -> int:
+            if not box:
+                box.append(self._d_ext_reading_full())
+            rest = _dxb.rest_of(box[0], rid, t_grant)
+            if rest is None:
+                self.counters["r6_rest_unreported"] += 1
+                return 0
+            if not Front._r6_redirectable(self, rid):
+                self.counters["r6_rest_not_redirectable"] += 1
+                if rest > 0 and self.__dict__.get("_r6_nr_last") != (rid, rest):
+                    self.__dict__["_r6_nr_last"] = (rid, rest)
+                    logger.info("PDFLIP R6-REST-STAYS-ON-D rid=%s d_rest=%d granted=%d epoch=%d -- D runs this prefill "
+                                "to its end (stream committed or no D-prefill leg): it is no part of what P would get, "
+                                "R6 does not count it (S56, SOLL R6)", rid, rest, int(_granted), self.epoch)
+                return 0
+            counted[str(rid)] = int(rest)
+            return int(rest)
+
+        return _tok
+
+    def _r6_redirect(self, why: str) -> List[str]:
+        """S56 (SOLL R6 "auch ein laufender D prefill wird dann geflippt"): a REROUTE_P verdict MOVES the running D
+        prefills its S counted -- PARK-HANDBACK closes each leg (D aborts it), P's batch takes it. Before S56 the
+        counted prefill ran on D to its end (pdflip-6-11, PARK-RUNNING) and P prefilled the 4492 tokens alone."""
+        counted = dict(self.__dict__.get("_r6_counted") or {})
+        if not counted:
+            return []
+        moved = self._park_handback(list(counted))
+        self.counters["r6_redirected"] += len(moved)
+        logger.info("PDFLIP R6-REDIRECT epoch=%d why=%s counted=%s moved=%s -- the running D prefill(s) R6 counted go "
+                    "to P with the set (S56, SOLL R6)", self.epoch, why,
+                    ",".join("%s:%d" % kv for kv in counted.items()), moved)
+        return moved
+
+    def _d_ext_reading_full(self) -> Optional[Dict[int, Any]]:
+        """S56: ``{rid_key: (first extend ns, D's rest)}`` (D-EXTEND-BEACON v2). A test stub of ``_d_ext_reading``
+        (start-only values) is honoured: those entries carry no rest."""
+        stub = self.__dict__.get("_d_ext_reading")
+        if stub is not None:
+            return stub()
+        D = self.groups.get("D") if isinstance(self.groups, dict) else None
+        sid = getattr(D, "sid", None) if D is not None else None
+        try:
+            return _dxb.read_group_full(_dxb.beacon_dir(getattr(self, "tag", "") or ""), "D", int(sid or 0))
+        except Exception:  # noqa: BLE001 -- no reading: nothing is proven running
+            return None
 
     def _d_ext_reading(self) -> Optional[Dict[int, int]]:
         """S49 D-EXTEND-BEACON: ``{rid_key: extend start ns}`` from group D's ranks (pdflip/d_extend_beacon.py); None
@@ -11521,7 +11596,7 @@ class Front:
 
         def _started(rid: str, t_grant: float) -> bool:
             if not box:  # read once, and only when a living row asks
-                box.append(self._d_ext_reading())
+                box.append(self._d_ext_reading_full())
                 if box[0] is None:
                     self.counters["r6_extend_unread"] += 1
                     if not self.__dict__.get("_r6_unread_warned"):
@@ -11556,9 +11631,11 @@ class Front:
         granted D prefill D has not begun: a row of the book counts only once D recorded its extend
         (D-EXTEND-BEACON). A big member then waits its T_halb (R4); a kurz request never triggers a flip (R2).
         ``_d_carried_tokens`` (the X-SUM price of the kurz path) is unchanged: it prices every granted row."""
+        self.__dict__["_r6_counted"] = {}  # S56: only this reading's counted rows may be redirected
         if not envs.FLLIPER_PDFLIP_ENABLE_DECODE_COLLECT_PREFILL_BUSY.get():
             return 0
-        running = Front._d_pf_pending_tokens(self, started_only=True)
+        # S56: a started row counts D's REAL rest, and only when the front redirects it to P (``_r6_tokens_of``)
+        running = Front._d_pf_pending_tokens(self, started_only=True, d_rest=True)
         granted = Front._d_pf_pending_tokens(self)
         if granted > running:
             # named once per change: a granted D prefill D has not begun is NOT in R6's S (S49)
@@ -11802,7 +11879,9 @@ class Front:
         Switch FLLIPER_PDFLIP_D_EXTEND_BEACON off: nothing to hold (R6 counts the book as before)."""
         if sv.verdict != phase_policy.V_D_AFTER_TIMER or not envs.FLLIPER_PDFLIP_ENABLE_DECODE_COLLECT_PREFILL_BUSY.get():
             return sv
-        unstarted = max(0, Front._d_pf_pending_tokens(self) - int(running))
+        # S56: the rows D has not begun, at their granted price (``running`` is D's rest of the started ones now)
+        unstarted = max(0, Front._d_pf_pending_tokens(self, unstarted_only=True)) if _dxb.enabled() \
+            else max(0, Front._d_pf_pending_tokens(self) - int(running))
         if unstarted <= 0 or sv.s_tokens + unstarted <= int(x_tok):
             return sv
         self.counters["set_xsum_hold_unstarted"] += 1
@@ -11886,6 +11965,8 @@ class Front:
             for _m in members:
                 Front._flip_trig_note(self, _m.rid, int(_m.own_uncached or _m.uncached), "set-verdict")
         if sv.verdict == phase_policy.V_REROUTE_P:
+            # S56: the running D prefill(s) R6 counted move to P NOW (PARK-HANDBACK), not after the flip
+            Front._r6_redirect(self, "set-verdict")
             # B3/R6: a REAL redirect -- what waits in D's admission line rides to P too (the running D prefill's
             # remainder is parked by the flip and handed back to P's batch by the PARK path)
             _wait = [p.rid for p in list(getattr(self, "_ready_for_d", ()) or ()) if getattr(p, "d_direct", False)]
@@ -11949,6 +12030,8 @@ class Front:
                       t_half=t_half, decoding=decoding, seats=seats, waited=0.0, x_cls=x_cls, xk=xk)
         self.counters["set_" + sv.verdict.lower()] += 1
         if sv.verdict in (phase_policy.V_FLIP_P, phase_policy.V_PARK_NO_SEAT, phase_policy.V_REROUTE_P):
+            if sv.verdict == phase_policy.V_REROUTE_P:
+                Front._r6_redirect(self, "queue-sum")  # S56
             st["go_p"].update(m.rid for m in members)
             for _m in members:  # S28 A1: FLIP-PRICE-STALE sees this decision site too
                 Front._flip_trig_note(self, _m.rid, int(_m.own_uncached or _m.uncached), "queue-sum")

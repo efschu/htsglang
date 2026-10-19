@@ -171,7 +171,15 @@ def _d_began(f, *rids):
     """S49 (SOLL R6, user 18.10. "Nur echt laufend zählt"): D's D-EXTEND-BEACON reports that D began the extend of
     ``rids`` (stamped at the read, i.e. after every grant) -- only then is a granted D prefill RUNNING for R6."""
     from flliper.srt.pdflip import d_extend_beacon as _dxb
-    f._d_ext_reading = lambda: {_dxb.rid_key(r): time.time_ns() for r in rids}
+    # S56 (SOLL R6 + R11): D reports its REAL rest -- here the granted tokens (D matched nothing of them) -- and the
+    # legs are D-prefill legs in the lookahead, i.e. the front can move them to P (only then R6 counts them)
+    book = f._d_pf_book()._rows
+    f._rvp_state()
+    for r in rids:
+        f.__dict__.setdefault("_d_prefill_legs", {})[r] = time.time()
+        f._leg2_lookahead.add(r)
+    f._d_ext_reading = lambda: {_dxb.rid_key(r): (time.time_ns(), int(book[r].tokens) if r in book else 0)
+                                for r in rids}
 
 
 def test_envs_defaults_and_the_old_window_is_off():

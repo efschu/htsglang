@@ -53,6 +53,13 @@ def _grant_in_leg2(f, rid, tokens, t_grant):
     f.groups["D"].outstanding[rid] = t_grant
 
 
+def _redirectable(f, rid):
+    """S56: a D-prefill leg whose stream is still in the lookahead -- the front can move it to P (R6 counts it)."""
+    f._rvp_state()
+    f.__dict__.setdefault("_d_prefill_legs", {})[rid] = time.time()
+    f._leg2_lookahead.add(rid)
+
+
 def _verdicts(caplog):
     return [r.getMessage() for r in caplog.records if "PDFLIP SET-VERDICT" in r.getMessage()]
 
@@ -85,11 +92,14 @@ def test_started_is_rerouted_at_once(monkeypatch, caplog):
     f = _fx(now)
     f.queue = [_big(now)]
     _grant_in_leg2(f, "k", 1426, now - 0.136)
-    f._d_ext_reading = lambda: {dxb.rid_key("k"): int((now - 0.05) * 1e9)}   # D's first extend after the grant
+    _redirectable(f, "k")
+    # D's first extend after the grant, with D's REAL rest (S56: D-EXTEND-BEACON v2)
+    f._d_ext_reading = lambda: {dxb.rid_key("k"): (int((now - 0.05) * 1e9), 1426)}
     with caplog.at_level(logging.INFO, logger="pdflip.front"):
         assert f._decode_collect(now) == "P"
     assert f.counters["set_reroute_p"] == 1
     assert any("verdict=REROUTE_P" in m and "S=10219" in m for m in _verdicts(caplog))
+    assert f.counters["r6_redirected"] == 1 and "k" in f._rvp_requeue, "S56: the counted D prefill MOVES to P"
 
 
 def test_an_extend_before_the_grant_is_not_this_grant_started(monkeypatch):
@@ -200,9 +210,12 @@ def test_front_reads_d_files_from_the_arena(tmp_path, monkeypatch):
     f.groups["D"].sid = os.getsid(0)
     _grant_in_leg2(f, "k", 1426, now - 0.1)
     w.note_recv(rid="k")
+    _redirectable(f, "k")
     assert f._dc_carried_running() == 0
-    w.note_extend(rids=["k"])
+    w.note_extend(rids=["k"], rests=[1426])
     assert f._dc_carried_running() == 1426
+    w.note_extend(rids=["k"], rests=[400])          # S56: the next chunk -- D's rest shrinks, the front follows
+    assert f._dc_carried_running() == 400
 
 
 def test_build_off_without_switch_or_arena(tmp_path, monkeypatch):
@@ -253,7 +266,8 @@ def test_xsum_a_set_is_not_handed_to_d_on_top_of_an_unstarted_grant_and_no_flip(
     (line,) = _verdicts(caplog)
     assert "verdict=COLLECT" in line and "X-SUM" in line and "not started" in line
     assert f.counters["set_reroute_p"] == 0 and f.counters["set_xsum_hold_unstarted"] == 1
-    f._d_ext_reading = lambda: {dxb.rid_key("s0"): time.time_ns()}           # D began s0: really running
+    _redirectable(f, "s0")
+    f._d_ext_reading = lambda: {dxb.rid_key("s0"): (time.time_ns(), 5200)}   # D began s0: really running, rest 5200
     assert f._decode_collect(time.time()) == "P" and f.counters["set_reroute_p"] == 1
 
 

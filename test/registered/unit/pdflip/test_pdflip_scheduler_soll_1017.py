@@ -114,7 +114,11 @@ class SollR1toR9(unittest.TestCase):
         self.assertEqual(f._d_carried_tokens(), 1426, "the X-SUM price of the kurz path is unchanged")
         self.assertEqual(f._decode_collect(now), "hold", "R4: the big member waits its T_halb")
         self.assertEqual(f.counters["set_reroute_p"], 0)
-        f._d_ext_reading = lambda: {dxb.rid_key("k"): _time.time_ns()}   # D began the extend of "k"
+        # D began the extend of "k" and reports its REAL rest (S56); the leg can move to P (lookahead open)
+        f._rvp_state()
+        f.__dict__.setdefault("_d_prefill_legs", {})["k"] = now
+        f._leg2_lookahead.add("k")
+        f._d_ext_reading = lambda: {dxb.rid_key("k"): (_time.time_ns(), 1426)}
         self.assertEqual(f._dc_carried_running(), 1426)
         self.assertEqual(f._decode_collect(_time.time()), "P")
         self.assertEqual(f.counters["set_reroute_p"], 1)
