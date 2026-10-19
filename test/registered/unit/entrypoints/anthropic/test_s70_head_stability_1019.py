@@ -29,6 +29,7 @@ maybe_stub_sgl_kernel()  # must precede imports that may pull in sgl_kernel
 
 import jinja2  # noqa: E402
 
+from flliper.srt.entrypoints import prompt_diverge as pd  # noqa: E402
 from flliper.srt.entrypoints.anthropic import head_stability as hs  # noqa: E402
 from flliper.srt.entrypoints.anthropic.protocol import (  # noqa: E402
     AnthropicMessagesRequest,
@@ -279,41 +280,134 @@ class TestForeignImageNeverShares(unittest.TestCase):
         self.assertNotEqual(pad(px), pad(other))
 
 
-class TestHeadDiverge(unittest.TestCase):
-    def test_names_the_moved_bytes(self):
-        w = hs.HeadWatch(window=4)
-        base = "tools...\n" + "S" * 400
-        self.assertIsNone(w.observe(base + HEADER_A + "tail"))
-        self.assertIsNone(w.observe(base + HEADER_A + "tail"))  # identical: silent
-        rec = w.observe(base + HEADER_B + "tail")
-        self.assertIsNotNone(rec)
-        self.assertEqual(rec["at_char"], len(base) + HEADER_A.index("7e3") + 1)  # "7e3" vs "7f3"
-        self.assertIn("7e3", rec["prev"])
-        self.assertIn("7f3", rec["new"])
+class TestStripNote(unittest.TestCase):
+    """Auflage 4: changed= is per head, and the same request converted again
+    (front count, D probe, PLE hint, group) stays silent."""
 
-    def test_adapter_names_a_reordered_tool_list(self):
-        """Through the adapter: the same tools in another order move the head
-        inside the TOOLS part -- the instrument sees the block the template
-        renders first."""
-        w = hs.HeadWatch(window=4)
+    def setUp(self):
+        hs._STRIP_SEEN.clear()
+        self.rate = mock.patch.object(hs, "_STRIP_RATE", hs.RateLimit(per_s=1e9, burst=1e9))
+        self.rate.start()
+
+    def tearDown(self):
+        self.rate.stop()
+
+    def test_per_head_first_then_changed_then_silent(self):
+        k1 = hs.head_key([SYSTEM_TEXT], TOOLS)
+        k2 = hs.head_key(["another agent"], TOOLS)
+        r = hs.note_stripped([HEADER_A], k1)
+        self.assertTrue(r["first"])
+        self.assertIsNone(hs.note_stripped([HEADER_A], k1))  # the same request again
+        r = hs.note_stripped([HEADER_A], k2)  # another head: first, NOT changed
+        self.assertTrue(r["first"])
+        self.assertFalse(r["changed"])
+        r = hs.note_stripped([HEADER_B], k1)  # same head, new value
+        self.assertTrue(r["changed"])
+        self.assertEqual(r["prev"], HEADER_A)
+
+    def test_adapter_notes_once_per_request(self):
         with envs.FLLIPER_ANTHROPIC_INLINE_SYSTEM_IN_PLACE.override(True):
             s = AnthropicServing(_FakeChat("{{ messages }}"))
-        p1 = dict(_payload(HEADER_A))
-        p2 = dict(_payload(HEADER_A), tools=TOOLS[:2] + [TOOLS[3], TOOLS[2]] + TOOLS[4:])
-        with mock.patch.object(hs, "_WATCH", w):
-            s._convert_to_chat_completion_request(AnthropicMessagesRequest.model_validate(p1))
-            s._convert_to_chat_completion_request(AnthropicMessagesRequest.model_validate(p2))
-        self.assertEqual(w.n, 1)
-        h1, h2 = list(w._heads)
-        cut = hs._common_prefix_len(h1, h2)
-        self.assertLess(cut, h1.index("SYSTEM:"))  # the move is in the tools part
-        self.assertIn('"name": "tool_2"', h1[cut - 40:cut + 200])
+        req = AnthropicMessagesRequest.model_validate(_payload(HEADER_A))
+        with self.assertLogs(hs.logger, level="INFO") as cm:
+            for _ in range(4):  # front count, D probe, PLE hint, group
+                s._convert_to_chat_completion_request(req)
+        lines = [m for m in cm.output if hs.TAG_STRIP in m]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("first=1 changed=0", lines[0])
+        self.assertEqual(len(hs._STRIP_SEEN), 1)
 
-    def test_unrelated_heads_are_silent(self):
-        w = hs.HeadWatch(window=4)
-        w.observe("A" * 1000)
-        self.assertIsNone(w.observe("B" * 1000))
-        self.assertIsNone(w.observe("A" * 100 + "C" * 900))  # shares < MIN_SHARED_CHARS
+
+class TestPromptDiverge(unittest.TestCase):
+    """Auflage 2/3: the instrument on the rendered ids, behind every chat path."""
+
+    def _w(self):
+        return pd.PromptWatch(window=8, rate=pd.RateLimit(per_s=1e9, burst=1e9))
+
+    def test_the_96_161_shape_is_named_with_token_and_page(self):
+        w = self._w()
+        base = list(range(1000, 1000 + 89434))
+        self.assertIsNone(w.observe(ids=base, rid="pdflip-94-158"))  # new
+        moved = list(base)
+        moved[8400] = 7  # one token in page 131, same length
+        rec = w.observe(ids=moved, rid="pdflip-96-161", decode=lambda s: ",".join(map(str, s)))
+        self.assertIsNotNone(rec)
+        self.assertEqual((rec["unit"], rec["at"], rec["page"]), ("token", 8400, 131))
+        self.assertEqual(rec["prev_len"], 89434)
+        self.assertIn("9400", rec["prev"])  # base[8400] = 9400
+        self.assertIn(",7,", rec["new"])
+
+    def test_silent_classes(self):
+        w = self._w()
+        a = list(range(5000))
+        w.observe(ids=a)
+        self.assertIsNone(w.observe(ids=a))  # repeat
+        self.assertIsNone(w.observe(ids=a + [1, 2, 3]))  # extends (next turn)
+        self.assertIsNone(w.observe(ids=a[:-100] + [9] * 100))  # tail (regenerate)
+        self.assertIsNone(w.observe(ids=list(range(90000, 95000))))  # new head
+        self.assertEqual(w.counts["moved"], 0)
+        self.assertEqual(
+            (w.counts["repeat"], w.counts["extends"], w.counts["tail"], w.counts["new"]),
+            (1, 1, 1, 2),
+        )
+
+    def test_rate_limit_counts_what_it_holds_back(self):
+        r = pd.RateLimit(per_s=1.0, burst=2)
+        self.assertEqual(r.take(now=0.0), 0)
+        self.assertEqual(r.take(now=0.0), 0)
+        self.assertIsNone(r.take(now=0.1))
+        self.assertIsNone(r.take(now=0.2))
+        self.assertEqual(r.take(now=1.5), 2)  # the line after names the two held back
+
+    def test_text_fallback(self):
+        w = self._w()
+        t = "x" * 9000
+        w.observe("S" + t)
+        rec = w.observe("T" + t)
+        self.assertIsNone(rec)  # shares < MIN_SHARED: new
+        w.observe("H" * 300 + "a" + t)
+        rec = w.observe("H" * 300 + "b" + t)
+        self.assertEqual((rec["unit"], rec["at"]), ("byte", 300))
+
+    def test_hook_sits_in_process_messages(self):
+        """The real _process_messages hands its result to the watch, on the
+        input_ids path (no template needed) -- both chat paths pass here."""
+        from flliper.srt.entrypoints.openai.protocol import ChatCompletionRequest
+        from flliper.srt.entrypoints.openai.serving_chat import OpenAIServingChat
+
+        fake = SimpleNamespace(
+            _apply_default_chat_template_kwargs=lambda r: None,
+            is_gpt_oss=False, is_gemma4=False,
+            _patch_reasoning_skip_special_tokens=lambda r: None,
+            _get_reasoning_from_request=lambda r: False,
+            tokenizer_manager=SimpleNamespace(
+                server_args=SimpleNamespace(reasoning_parser=None),
+                tokenizer=SimpleNamespace(decode=lambda s: "|".join(map(str, s))),
+            ),
+            tool_call_parser=None,
+        )
+        req = ChatCompletionRequest(model="m", messages=[{"role": "user", "content": "x"}],
+                                    input_ids=list(range(3000)))
+        with mock.patch.object(pd, "observe", wraps=pd.observe) as spy:
+            OpenAIServingChat._process_messages(fake, req, False)
+        self.assertEqual(spy.call_count, 1)
+        self.assertEqual(list(spy.call_args.kwargs["ids"]), list(range(3000)))
+
+    @unittest.skipUnless(os.path.isdir(NF_MODEL), "NF tokenizer/template not on this host")
+    def test_reordered_tools_are_named_inside_the_tools_block(self):
+        _Real.load()
+        with envs.FLLIPER_ANTHROPIC_INLINE_SYSTEM_IN_PLACE.override(True):
+            s = AnthropicServing(_FakeChat(_Real.template))
+        p2 = dict(_payload(HEADER_A), tools=TOOLS[:2] + [TOOLS[3], TOOLS[2]] + TOOLS[4:])
+        t1, a = _ids(s, _payload(HEADER_A))
+        t2, b = _ids(s, p2)
+        w = self._w()
+        w.observe(ids=a)
+        rec = w.observe(ids=b, decode=lambda x: _Real.tok.decode(x))
+        self.assertIsNotNone(rec)
+        sys_at = len(_Real.tok.encode(t1[: t1.index("</IMPORTANT>")], add_special_tokens=False).ids)
+        self.assertLess(rec["at"], sys_at)
+        self.assertIn("tool_", rec["prev"] + rec["new"])
 
 
 if __name__ == "__main__":

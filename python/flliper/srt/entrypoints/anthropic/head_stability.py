@@ -34,14 +34,14 @@ front's exact count share (``AnthropicServing._convert_to_chat_completion_reques
    not the pure ``key=value;`` form, is left as it is. User and assistant turns
    are never examined.
 
-2. HEAD-DIVERGE (log only, always on). The head text of each request is
-   compared with the most similar of the last ``WINDOW`` heads this process
-   rendered (tools in render order, then the system text); every NEW head
-   that shares at least ``MIN_SHARED_CHARS`` with a recent one gets ONE line
-   naming the char offset and both sides around it. That turns the next
-   94-158 / 96-161 pair into the exact bytes that moved -- the instrument this
-   finding lacked (no ids or text of a multimodal request are logged anywhere:
-   ``tokenizer_manager`` prints D-IDS only for ``mm_inputs is None``).
+2. The strip names each (head, block value) pair once: ``ANTHROPIC
+   ATTRIBUTION-STRIP head=<digest of the head without the block> first=|changed=``.
+   ``changed=1`` = the same head arrived with another block value -- without
+   the strip that request would have left the key chain at the system text.
+
+The divergence instrument for EVERY chat path (Anthropic and
+``/v1/chat/completions``) is ``srt/entrypoints/prompt_diverge.py``, hooked into
+``OpenAIServingChat._process_messages``.
 
 Danger direction: the strip changes the ids of EVERY request that carries the
 block, on P, on D and in the front alike (one function, one call site), so the
@@ -56,13 +56,14 @@ import logging
 import os
 import re
 import threading
-from typing import Deque, List, Optional, Sequence, Tuple
+from typing import Any, List, Optional, Sequence, Tuple
+
+from flliper.srt.entrypoints.prompt_diverge import RateLimit
 
 logger = logging.getLogger(__name__)
 
 ENV = "FLLIPER_ANTHROPIC_STRIP_ATTRIBUTION"
 TAG_STRIP = "ANTHROPIC ATTRIBUTION-STRIP"
-TAG_DIVERGE = "ANTHROPIC HEAD-DIVERGE"
 
 #: The block Claude Code writes: one line, ``key=value;`` fields after the tag.
 _ATTRIBUTION_LINE = re.compile(
@@ -113,119 +114,58 @@ def strip_attribution_parts(parts: Sequence[str]) -> Tuple[List[str], List[str]]
     return out, stripped
 
 
+#: per HEAD (the system text and tools WITHOUT the block): the block value last
+#: seen with it. A change for the same head is the event that would have moved it.
+_STRIP_SEEN: "collections.OrderedDict[str, str]" = collections.OrderedDict()
+_STRIP_SEEN_CAP = 256
+_STRIP_LOCK = threading.Lock()
+_STRIP_RATE = RateLimit()
 _STRIP_N = [0]
-_LAST_LINE: List[Optional[str]] = [None]
 
 
-def note_stripped(lines: Sequence[str]) -> None:
-    """One INFO line for the first 64 strips, every 256th after, and EVERY
-    strip whose value differs from the previous one -- the change is the
-    event that would have broken the head."""
-    if not lines:
-        return
-    n = _STRIP_N[0] = _STRIP_N[0] + 1
-    value = " | ".join(lines)
-    prev = _LAST_LINE[0]
-    changed = prev is not None and prev != value
-    _LAST_LINE[0] = value
-    if changed or n <= 64 or n % 256 == 0:
-        logger.info(
-            "%s n=%d changed=%d value=%r prev=%r (%s: Claude Code's analytics "
-            "block is not rendered; a value that moves no longer moves the head)",
-            TAG_STRIP, n, int(changed), value, prev, ENV,
-        )
-
-
-# ---------------------------------------------------------------------------
-# HEAD-DIVERGE instrument
-# ---------------------------------------------------------------------------
-
-WINDOW = 32
-#: the two heads must share at least this many leading chars to count as "one
-#: head, moved" (below it they are unrelated: another template or no tools)
-MIN_SHARED_CHARS = 256
-CONTEXT_CHARS = 96
-
-
-def _common_prefix_len(a: str, b: str) -> int:
-    n = min(len(a), len(b))
-    lo, hi = 0, n
-    while lo < hi:
-        mid = (lo + hi + 1) // 2
-        if a[:mid] == b[:mid]:
-            lo = mid
-        else:
-            hi = mid - 1
-    return lo
-
-
-class HeadWatch:
-    """The last ``WINDOW`` distinct head texts of this process."""
-
-    def __init__(self, window: int = WINDOW) -> None:
-        self._heads: Deque[str] = collections.deque(maxlen=max(1, int(window)))
-        self._lock = threading.Lock()
-        self.n = 0
-
-    def observe(self, head: str) -> Optional[dict]:
-        """Compare ``head`` with the recent heads; returns the divergence
-        record it logged, or None (identical to one, or unrelated to all)."""
-        if not isinstance(head, str) or not head:
-            return None
-        with self._lock:
-            if head in self._heads:
-                return None
-            best, best_cp = None, -1
-            for h in self._heads:
-                cp = _common_prefix_len(h, head)
-                if cp > best_cp:
-                    best, best_cp = h, cp
-            self._heads.append(head)
-            if best is None:
-                return None
-            if best_cp < MIN_SHARED_CHARS:
-                return None
-            self.n += 1
-            n = self.n
-        lo = max(0, best_cp - CONTEXT_CHARS // 3)
-        rec = {
-            "at_char": best_cp,
-            "prev_len": len(best),
-            "new_len": len(head),
-            "prev": best[lo:best_cp + CONTEXT_CHARS],
-            "new": head[lo:best_cp + CONTEXT_CHARS],
-        }
-        if n <= 256 or n % 256 == 0:
-            logger.warning(
-                "%s n=%d at_char=%d prev_len=%d new_len=%d prev=%r new=%r "
-                "(S70: the head system turn moved; every token behind at_char is "
-                "recomputed on P and D)",
-                TAG_DIVERGE, n, rec["at_char"], rec["prev_len"], rec["new_len"],
-                rec["prev"], rec["new"],
-            )
-        return rec
-
-
-def head_signature(tools, system_text: str) -> str:
-    """What the head turn is made of, in the template's render order: every
-    tool as canonical JSON (one per line, in the request's order), then the
-    system text. Never raises -- an unreadable tool contributes its repr."""
+def head_key(parts_without_block: Sequence[str], tools: Any = None) -> str:
+    """A short digest of the head the block was stripped from."""
+    import hashlib
     import json
 
-    lines = ["TOOLS:"]
+    h = hashlib.sha1()
     for t in tools or ():
         try:
             d = t.model_dump(exclude_none=True) if hasattr(t, "model_dump") else t
-            lines.append(json.dumps(d, sort_keys=True, ensure_ascii=False, default=str))
-        except Exception:  # noqa: BLE001 - an instrument never breaks the request
-            lines.append(repr(t))
-    lines.append("SYSTEM:")
-    lines.append(system_text or "")
-    return "\n".join(lines)
+            h.update(json.dumps(d, sort_keys=True, default=str).encode("utf-8", "replace"))
+        except Exception:  # noqa: BLE001 - a key, never a failure
+            h.update(repr(t).encode("utf-8", "replace"))
+    h.update(b"\x00")
+    for p in parts_without_block:
+        h.update(str(p).encode("utf-8", "replace") + b"\x00")
+    return h.hexdigest()[:12]
 
 
-_WATCH = HeadWatch()
-
-
-def watch() -> HeadWatch:
-    return _WATCH
+def note_stripped(lines: Sequence[str], key: str) -> Optional[dict]:
+    """ONE line per (head, value) pair that is new: the first block a head is
+    seen with (``first=1``) and every later value that differs for the SAME
+    head (``changed=1``). The same request converted again (front count, D
+    probe, PLE hint, group) repeats the pair and stays silent. Rate-limited."""
+    if not lines:
+        return None
+    value = " | ".join(lines)
+    with _STRIP_LOCK:
+        prev = _STRIP_SEEN.get(key)
+        if prev == value:
+            _STRIP_SEEN.move_to_end(key)
+            return None
+        _STRIP_SEEN[key] = value
+        _STRIP_SEEN.move_to_end(key)
+        while len(_STRIP_SEEN) > _STRIP_SEEN_CAP:
+            _STRIP_SEEN.popitem(last=False)
+        n = _STRIP_N[0] = _STRIP_N[0] + 1
+    rec = {"n": n, "head": key, "first": prev is None, "changed": prev is not None,
+           "value": value, "prev": prev}
+    held = _STRIP_RATE.take()
+    if held is not None:
+        logger.info(
+            "%s n=%d head=%s first=%d changed=%d value=%r prev=%r held_back=%d (%s: Claude "
+            "Code's analytics block is not rendered; changed=1 = this head would have moved)",
+            TAG_STRIP, n, key, int(rec["first"]), int(rec["changed"]), value, prev, held, ENV,
+        )
+    return rec
