@@ -29462,8 +29462,8 @@
    "id": "FLLIPER_ANTHROPIC_STRIP_ATTRIBUTION",
    "kind": "env",
    "lesestellen": [
-    "entrypoints/anthropic/head_stability.py:74",
-    "entrypoints/anthropic/head_stability.py:134"
+    "entrypoints/anthropic/head_stability.py:75",
+    "entrypoints/anthropic/head_stability.py:135"
    ],
    "level": "expert",
    "name": "FLLIPER_ANTHROPIC_STRIP_ATTRIBUTION",
@@ -29472,7 +29472,7 @@
    "source": {
     "file": "entrypoints/anthropic/head_stability.py",
     "kind": "os.environ",
-    "line": 74,
+    "line": 75,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -90391,7 +90391,7 @@
   },
   "unexplained": 657
  },
- "tree_rev": "27b=0798c91fcd+nf=fe04b341bb",
+ "tree_rev": "27b=0798c91fcd+nf=15042034bd",
  "trees": {
   "27b": {
    "entries": 2643,
@@ -90399,7 +90399,7 @@
   },
   "nf": {
    "entries": 2652,
-   "rev": "fe04b341bb"
+   "rev": "15042034bd"
   }
  },
  "warnungen": []
