@@ -231,3 +231,53 @@ def test_the_decode_gap_hears_the_lend_moves():
         r, _ctl = _live_lent(tms)
         dtl.round_start(r.sched)
         note.assert_called_with(r.sched, "lend_return")
+
+
+def test_review_a3_the_price_uses_the_effective_rate_not_the_start_rate(monkeypatch):
+    """Under-pricing is the danger direction: with the measurement armed, the vote cuts with
+    max(start, measured x RATE_SAFETY) -- the price must use the same rate (rc17 TP2 0.6308 vs start 0.5871)."""
+    with envs.FLLIPER_PDFLIP_EXTEND_GROWTH_PER_ROW_MIB.override("0.5871"):
+        extend_trim.reset_for_tests()
+        monkeypatch.setattr(extend_trim, "measure_armed", lambda rank=None: True)
+        extend_trim._CACHE["measured"] = 0.5485  # x 1.15 = 0.6308 > 0.5871
+        eff = extend_trim.effective_rate(0.5871, 2)
+        assert eff > 0.5871
+        assert extend_trim.chunk_need_mib(2, 1000) == pytest.approx(300 + eff * 1000)
+        assert extend_trim.chunk_need_mib(2, 1000) > 300 + 0.5871 * 1000
+
+
+def test_review_a2_a_waiting_short_request_logs_keep_once(caplog):
+    """A short request waiting for a seat re-prices every iteration; only a change of (rows_on, rows,
+    need_mib) is a line (review: 50 iterations gave 100 lines before)."""
+    import logging
+
+    tms = h.CoreTms()
+    with _Ctx(tms, NEED + 64 * MIB), caplog.at_level(logging.INFO, logger=dtl.__name__):
+        r, ctl = _live_lent(tms)
+        for _ in range(50):
+            assert dtl.round_start(r.sched) == "keep"
+        keeps = [m for m in caplog.messages if " keep rows_on " in m]
+        assert len(keeps) == 1, keeps
+        r.sched.waiting_queue = [_short(), _short(40)]  # the price changed: one new line
+        assert dtl.round_start(r.sched) == "keep"
+        assert len([m for m in caplog.messages if " keep rows_on " in m]) == 2
+        assert ctl.rows_on == 40
+
+
+def test_review_h1_a_full_lend_below_x_max_is_not_relent():
+    """The one-lend-per-settle lock (no partial return before) holds even with headroom above the lend."""
+    from flliper.srt.model_executor.forward_batch_info import ForwardMode
+
+    decode = types.SimpleNamespace(forward_mode=ForwardMode.DECODE)
+    tms = h.CoreTms()
+    with _Ctx(tms, NEED), envs.FLLIPER_PDFLIP_D_LEND_SETTLE_ROUNDS.override(1):
+        r = h._rank(tms)
+        h._pause_all(tms)
+        dsv.on_wake(r.sched, types.SimpleNamespace(epoch="e1"), None)
+        for p in list(tms.allocs):
+            tms.resume(p)
+        ctl = r.sched._pdflip_d_seat_vram
+        r.sched.waiting_queue, r.sched.chunked_req = [], None
+        assert ctl.lend(STEP_BYTES) == 4 and ctl.rows_on == 36  # a full lend of what the card had then
+        with mock.patch.object(dtl, "_card_free_bytes", lambda: 10 * STEP_BYTES):
+            assert dtl.on_batch(r.sched, decode) is None and ctl.rows_on == 36

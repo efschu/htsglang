@@ -37,16 +37,18 @@ class _Clock:
 
 
 class _Ev:
-    """A timing event on a fake device clock: each record advances it 1.5 ms."""
+    """A timing event on a fake device clock: each record advances it 1.5 ms and notes its stream."""
 
     done = True
 
     def __init__(self, enable_timing=False):
         self.ts = None
+        self.stream = None
 
     def record(self):
         _Clock.t += 1.5
         self.ts = _Clock.t
+        self.stream = _FakeCuda.cur
 
     def elapsed_time(self, other):
         return float(other.ts - self.ts)
@@ -56,12 +58,30 @@ class _Ev:
 
 
 class _FakeCuda:
+    """Two streams: the forward stream (EM work) and the schedule stream (the funnel)."""
+
     Event = _Ev
     capturing = False
+    FWD, SCHED = "forward_stream", "schedule_stream"
+    cur = "schedule_stream"
 
     @staticmethod
     def is_current_stream_capturing():
         return _FakeCuda.capturing
+
+    @staticmethod
+    def current_stream():
+        return _FakeCuda.cur
+
+    class stream:  # noqa: N801 -- torch.cuda.stream's shape
+        def __init__(self, s):
+            self.s = s
+
+        def __enter__(self):
+            self.prev, _FakeCuda.cur = _FakeCuda.cur, self.s
+
+        def __exit__(self, *a):
+            _FakeCuda.cur = self.prev
 
 
 @pytest.fixture(autouse=True)
@@ -69,6 +89,7 @@ def _probe(monkeypatch):
     P.reset_for_tests()
     _Ev.done = True
     _FakeCuda.capturing = False
+    _FakeCuda.cur = _FakeCuda.SCHED
     monkeypatch.setattr(P, "DEVICE_TYPES", ("cuda", "cpu"))
     monkeypatch.setattr(P, "_cuda", lambda: _FakeCuda)
     yield
@@ -132,3 +153,26 @@ def test_the_funnel_never_raises(monkeypatch):
     monkeypatch.setattr(P, "_cuda", boom)
     P.on_forward(7)
     assert P.begin_layer(torch.device("cpu")) is None
+
+
+def test_review_a1_the_close_is_ordered_on_the_em_stream_not_the_funnels(monkeypatch, caplog):
+    """D's overlap loop: EM work on forward_stream, the funnel on schedule_stream. The counter D2H and the done
+    event must follow the EM adds in stream order (forward stream), and the funnel's stream is left as it was."""
+    seen = []
+    real = P._d2h
+    monkeypatch.setattr(P, "_d2h", lambda host, counter: (seen.append(_FakeCuda.cur), real(host, counter)))
+    dev = S51._pool_cache(monkeypatch, warm=[8, 9])
+    dev._pool_tables.misses_total.zero_()
+    P.on_forward(11)
+    _FakeCuda.cur = _FakeCuda.FWD          # with self.forward_stream_ctx: the forward
+    S51._extend(dev, S51.WIDE, seed=5)
+    _FakeCuda.cur = _FakeCuda.SCHED        # back on the scheduler thread's stream
+    rec = P._STATE["cur"]
+    assert rec is not None and rec.stream == _FakeCuda.FWD
+    with caplog.at_level(logging.INFO, logger=P.__name__):
+        P.on_forward(12)
+    assert seen == [_FakeCuda.FWD], seen
+    assert rec.done.stream == _FakeCuda.FWD and rec.end.stream == _FakeCuda.FWD
+    assert _FakeCuda.cur == _FakeCuda.SCHED  # no wait_event / no switch left on the schedule stream
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith(P.MARK)]
+    assert len(lines) == 1 and "rows=%d " % int(dev._pool_tables.misses_total[0]) in lines[0]

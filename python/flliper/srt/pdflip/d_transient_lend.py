@@ -94,12 +94,15 @@ class LendGate:
     ``topup`` (S78, rank-local): a short extend gave back only part of the
     lend -- the next lend verdict may map the difference again."""
 
-    __slots__ = ("settle", "streak", "topup")
+    __slots__ = ("settle", "streak", "topup", "last_keep")
 
     def __init__(self, settle: int):
         self.settle = max(1, int(settle))
         self.streak = 0
         self.topup = False
+        # S78 review A2: the last logged ``keep`` (rows_on, rows, need_mib) -- a short request waiting for a
+        # seat re-prices every iteration; only a change is a line (any move clears it)
+        self.last_keep = None
 
     def step(self, kind: str) -> str:
         if kind == "extend":
@@ -195,6 +198,7 @@ def _give_back(sched, ctl, why: str) -> Optional[str]:
     before = int(ctl.rows_on)
     n = ctl.unlend()
     _gate(sched).topup = False
+    _gate(sched).last_keep = None
     if n:
         _gap_note(sched, "lend_return")
         logger.info("%s rank=%d return rows_on %d->%d (%s) lent_total=%d returned_total=%d",
@@ -281,10 +285,14 @@ def _keep_short(sched, ctl, rows: int, why: str) -> Optional[str]:
     k = ctl.unlend_target(need_bytes, free)
     gate = _gate(sched)
     if k >= before:
-        logger.info("%s rank=%d keep rows_on %d (%s rows=%d need_mib=%d card_free_mib=%d)",
-                    MARK, rank, before, why, int(rows), int(need_mib), free // MIB)
+        key = (before, int(rows), int(need_mib))
+        if key != gate.last_keep:
+            gate.last_keep = key
+            logger.info("%s rank=%d keep rows_on %d (%s rows=%d need_mib=%d card_free_mib=%d)",
+                        MARK, rank, before, why, int(rows), int(need_mib), free // MIB)
         gate.topup = False
         return "keep"
+    gate.last_keep = None
     n = ctl.unlend_to(k)
     gate.topup = ctl.lent_from is not None
     if n:
@@ -350,6 +358,7 @@ def on_batch(sched, batch) -> Optional[str]:
     before = int(ctl.rows_on)
     n = ctl.lend(budget)
     if n:
+        gate.last_keep = None
         _gap_note(sched, "lend")
         logger.info("%s rank=%d lend rows_on %d->%d card_free_mib=%d floor_mib=%d budget_mib=%d "
                     "lent_total=%d returned_total=%d", MARK, rank, before, int(ctl.rows_on),

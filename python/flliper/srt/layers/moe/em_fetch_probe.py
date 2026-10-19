@@ -13,6 +13,12 @@ pacer either. This names it on the device, per forward and rank:
       gib=<bytes copied> copy_ms=<device time of those copy_rows> em_ms=<device time first EM op -> last>
       link_gbps=<bytes / copy_ms>
 
+S78 review A1: D runs ``event_loop_overlap`` -- the forward (and with it the counter ``add_``s and the timing
+events) is on ``forward_stream``, the scheduler funnel that closes the record on ``schedule_stream``; nothing
+orders the two. The record therefore remembers the stream of its first EM layer, and the counter D2H plus the
+``done`` event are enqueued on THAT stream (``torch.cuda.stream(rec.stream)``) -- stream order, no
+``wait_event`` on the schedule stream (that would serialize the overlap), no sync.
+
 HOW. ``run_pool_em`` brackets each wave's ``copy_rows`` with two timing events and adds the step's device
 ``gather_count`` (rows) and ``gather_count x row bytes`` into a device counter -- no host read. The
 scheduler funnel closes the forward at the next forward's start: one non-blocking D2H of the counter into
@@ -52,12 +58,13 @@ def reset_for_tests() -> None:
 class Record:
     """One forward's EM layers on this rank (device counters + timing events)."""
 
-    __slots__ = ("fwd", "start", "end", "pairs", "counter", "layers", "waves", "tokens", "host", "done")
+    __slots__ = ("fwd", "stream", "start", "end", "pairs", "counter", "layers", "waves", "tokens", "host", "done")
 
     def __init__(self, fwd: int, device, cuda):
         import torch
 
         self.fwd = int(fwd)
+        self.stream = cuda.current_stream()  # review A1: the stream the EM work (adds, events) runs on
         self.start = cuda.Event(enable_timing=True)
         self.start.record()
         self.end = None
@@ -117,6 +124,11 @@ def begin_layer(device) -> Optional[Record]:
         return None
 
 
+def _d2h(host, counter) -> None:
+    """The counter's non-blocking copy into pinned memory (one seam for the stream-order test)."""
+    host.copy_(counter, non_blocking=True)
+
+
 def _close_current(cuda) -> None:
     import torch
 
@@ -125,9 +137,12 @@ def _close_current(cuda) -> None:
     if rec is None or rec.end is None:
         return
     rec.host = torch.empty(2, dtype=torch.int64, pin_memory=bool(torch.cuda.is_available()))
-    rec.host.copy_(rec.counter, non_blocking=True)
     rec.done = cuda.Event()
-    rec.done.record()
+    # review A1: behind the counter's adds and the end event in stream order (the funnel runs on the
+    # schedule stream, the EM work on the forward stream)
+    with cuda.stream(rec.stream):
+        _d2h(rec.host, rec.counter)
+        rec.done.record()
     pend = _STATE["pending"]
     pend.append(rec)
     while len(pend) > MAX_PENDING:
