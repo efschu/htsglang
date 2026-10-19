@@ -1430,10 +1430,17 @@ int64_t arena_revoke_orphan_claims(uint8_t *base, int64_t n, const int64_t *slot
         if (slots[i] < 0 || (uint64_t)slots[i] >= h->slots) continue;
         SlotHeader *sh = slot_hdr(base, (uint64_t)slots[i]);
         if ((int64_t)sh->generation != gens[i]) continue;
+        /* S81 review B1: the same look BEFORE the CAS as free_if_abandoned / arena_release_claims -- a slot a worker
+         * has joined (writers != W_CLAIM), bytes merged into or a reader on it is answered "kept" WITHOUT ever
+         * leaving CLAIMED: a CAS to EVICTING there would make the joiner's arena_complete in that window answer 4
+         * ("not CLAIMED": its bytes lost, its writer left open). Re-checked under the lock below (writers == w). */
+        uint32_t w = atomic_load(&sh->writers);
+        if (atomic_load(&sh->state) != S_CLAIMED) continue;
+        if (w != W_CLAIM || sh->n_ivals != 0 || atomic_load(&sh->refcount) != 0) { status[i] = 1; continue; }
         uint32_t expect = S_CLAIMED;
         if (!atomic_compare_exchange_strong(&sh->state, &expect, S_EVICTING)) continue;
         slot_lock(sh);
-        int orphan = atomic_load(&sh->writers) == W_CLAIM && sh->n_ivals == 0
+        int orphan = atomic_load(&sh->writers) == w && sh->n_ivals == 0
                      && atomic_load(&sh->refcount) == 0 && (int64_t)sh->generation == gens[i];
         slot_unlock(sh);
         if (!orphan) {
