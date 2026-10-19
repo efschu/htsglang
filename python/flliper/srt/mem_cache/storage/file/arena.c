@@ -37,7 +37,7 @@
 #define S_COMPLETE 2u
 #define S_EVICTING 3u
 #define S_QUARANTINE 4u
-#define S_REAPING 5u     /* READ-DEPTH 1014 (port of 27B dae863c7c8 (1)): transient and private -- held by arena_reap_stale_aged / arena_free_evicting while they reset the header */
+#define S_REAPING 5u     /* READ-DEPTH 1014 (port of 27B dae863c7c8 (1)): transient and private -- held by arena_reap_stale_aged / arena_free_evicting while they reset the header; S61r: and by claim_slot from FREE until its index publication */
 #define TOMB (~0ULL)
 #define KV_IVALS 64      /* interval capacity for slots <= 1 MiB */
 #define BLOB_IVALS 8192  /* interval capacity for larger slots (mamba blobs) */
@@ -346,7 +346,16 @@ static int64_t claim_slot(uint8_t *base, uint64_t klo, uint64_t khi, uint64_t to
         uint64_t s = (start + n) % h->slots;
         SlotHeader *sh = slot_hdr(base, s);
         uint32_t expect = S_FREE;
-        if (atomic_compare_exchange_strong(&sh->state, &expect, S_CLAIMED)) {
+        /* S61r (review of S61): the slot is taken PRIVATELY (S_REAPING: no finder, joiner or freer takes it) and
+         * becomes CLAIMED only together with its index publication, under the index lock. Before, it was CLAIMED
+         * from the CAS on while its header was still being written and before the publication: a joiner that had
+         * found the slot's previous claim of the SAME key (rc15: TP0's reap freed it, the next claim of the key
+         * took that very slot in the full arena) committed (1) on the half-written header -- own key, old
+         * generation, the writer word reset to 0 right after: completion 3, the K21 class -- or (2) on a fresh
+         * claim that then lost the publication to another claimant of the key and yielded the slot (FREE, no
+         * generation move): completion 4. A joiner now sees a finished, published claim or a slot that is not
+         * CLAIMED (and looks the key up again). */
+        if (atomic_compare_exchange_strong(&sh->state, &expect, S_REAPING)) {
             /* xsn342 (18.09.): the hand moved +1 per claim while the scan
              * ran ahead of it; once it wrapped, EVERY claim re-walked the
              * whole occupied prefix (measured: 2 us -> 2.8 ms per claim,
@@ -390,7 +399,7 @@ static int64_t claim_slot(uint8_t *base, uint64_t klo, uint64_t khi, uint64_t to
                     SlotHeader *oh = slot_hdr(base, other);
                     uint32_t ost = atomic_load(&oh->state);
                     if (oh->key_lo == klo && oh->key_hi == khi && (ost == S_CLAIMED || ost == S_COMPLETE)) {
-                        /* another writer published this key: yield our slot */
+                        /* another writer published this key: yield our slot (never CLAIMED, nobody joined it) */
                         index_unlock(h);
                         atomic_store(&sh->state, S_FREE);
                         return (int64_t)other;
@@ -401,6 +410,7 @@ static int64_t claim_slot(uint8_t *base, uint64_t klo, uint64_t khi, uint64_t to
                      * does not own (ARENA-COMPLETE LOST 'recycled under the writer'). */
                     atomic_store(&slots[i], (uint32_t)s);
                     atomic_fetch_add(&h->n_claimed, 1);
+                    atomic_store(&sh->state, S_CLAIMED);   /* S61r: CLAIMED with its publication */
                     index_unlock(h);
                     if (fresh) *fresh = 1;
                     return (int64_t)s;
@@ -416,6 +426,7 @@ static int64_t claim_slot(uint8_t *base, uint64_t klo, uint64_t khi, uint64_t to
             }
             if (free_cell >= 0) {
                 atomic_store(&slots[free_cell], (uint32_t)s);
+                atomic_store(&sh->state, S_CLAIMED);   /* S61r: CLAIMED before the key is visible in the index */
                 atomic_store(&keys[free_cell], klo);   /* visible together with its slot */
                 atomic_fetch_add(&h->n_claimed, 1);
                 index_unlock(h);
