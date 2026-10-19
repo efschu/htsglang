@@ -4165,6 +4165,28 @@ class Envs:
     # tracks the state at floor_page(g) -- where a sibling request forks. One
     # gather row, one mamba slot, same forward. 0 = off (rc15 byte for byte).
     FLLIPER_PDFLIP_GEN_FORK_ANCHOR = EnvBool(True)
+    # SYS-GRID TRACK (S62 4b, 19.10., NF rc15 pdflip-2-8; pdflip/turn_anchor.py):
+    # where the turn anchor is armed, a prefill step inside the prompt's FIRST
+    # message (system + tool list, up to the second <|im_start|>) also tracks the
+    # state every FLLIPER_PDFLIP_SYS_GRID_TOKENS tokens -- each grid point snapped
+    # down to the lowest tool-GROUP boundary (built-in -> MCP, MCP server change)
+    # inside its window -- plus floor_page(segment end). A tool-list variant then
+    # loses at most one grid window (rc15 2-8: 0 instead of 5056 tokens). One
+    # gather row + one mamba slot per point, same forward, once per system-prefix
+    # variant. 0 = off (byte for byte).
+    FLLIPER_PDFLIP_SYS_GRID_ANCHOR = EnvBool(True)
+    FLLIPER_PDFLIP_SYS_GRID_TOKENS = EnvInt(4096)
+    # cost bound: at most this many points per prompt (the arena's per-request
+    # share cap is 21 slots; more grid points would displace the request's own
+    # anchors). A longer first message widens the grid instead.
+    FLLIPER_PDFLIP_SYS_GRID_MAX = EnvInt(16)
+    # Qwen3.x token ids (tokenizer.json, verified 19.10.): a tool line of the
+    # chat template's <tools> block starts '{"type": "function", "function":',
+    # its name field is '"name": "' and an MCP tool's name starts 'mcp__'
+    # (separator '__'). Empty = no tool snapping (the plain grid).
+    FLLIPER_PDFLIP_SYS_GRID_TOOL_HEAD = EnvStr("4754,1267,763,328,1628,487,328,1628,763")
+    FLLIPER_PDFLIP_SYS_GRID_TOOL_NAME = EnvStr("591,763,328")
+    FLLIPER_PDFLIP_SYS_GRID_MCP_PREFIX = EnvStr("76,4520,548")
     # fnFL2 H42b: burst assembly on the DECIDING P rank (PP0), only while
     # multi anchor tails are armed. A pass that would carry nothing but new
     # bodies is held back up to this many ms while more of a burst is still
