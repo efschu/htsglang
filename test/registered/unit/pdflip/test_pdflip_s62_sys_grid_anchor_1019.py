@@ -306,12 +306,12 @@ def test_a_position_the_turn_track_writes_is_one_slot():
     """A two-message prompt: the turn anchor floor_page(u) IS the segment end."""
     ids = [IM] + [100000 + i for i in range(9000)] + [IM] + [5] * 300 + [IM, 1, 2, 3, 4]
     req = _sreq(ids)
-    alloc = _Alloc([11, 12, 13])
+    alloc = _Alloc([11, 12, 13, 14])
     _plan(req, alloc, 0, len(ids), ((len(ids) - 1) // 64) * 64, chunk=64, page=64)
     turn = getattr(req, TURN_PENDING)[0]
     assert turn == (9001 // 64) * 64
     assert [p[0] for p in getattr(req, GRID_PENDING)] == [4096, 8192]   # 8960 (= turn) not twice
-    assert alloc.free_ids == []
+    assert alloc.free_ids == [14], "a second slot for the turn position"
 
 
 # -- C. the real tree -----------------------------------------------------------------------------------
