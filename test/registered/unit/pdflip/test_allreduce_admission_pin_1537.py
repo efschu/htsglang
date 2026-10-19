@@ -233,6 +233,15 @@ EXPECTED_HELPER_REFS = {
     # boot-static armed()/elastic_on()/dormant/phase gates; a rank without a controller or a measured card
     # still enters and votes yes (reviewer mutant M4). Every rank enters it in the same tick or none does.
     ("pdflip/d_seat_vram.py", "_grow_room_refused"): {"_pdflip_group_min_ints"},
+    # S77-A KV-COMPACT (19.10., review nf-review-s77a-1019.md N3, Nachtrag JA @ 5574402851): entered from
+    # MemSched._shrink_to iff the shrink is BLOCKED by the GROUP floor (_group_floor_tokens, a MAX) and the
+    # compactor is installed (_kv_compact_tree_ok: the tree type, a server-config property equal on every D rank).
+    # Inside, every rank walks the same path: MIN over the candidate flags (a survey failure is this rank's "no",
+    # it still enters), then _group_same (MIN/MAX) over the plan digest, the moves' outcome and the evictions'
+    # outcome -- unequal = PdFlipKvCompactDivergence (crash-stop) before or instead of anything diverging;
+    # the refused/skip memo is set only from group results. _group_same is the (MIN, MAX) helper it calls.
+    ("pdflip/d_seat_vram.py", "_group_same"): {"_pdflip_group_min_ints"},
+    ("pdflip/d_seat_vram.py", "_kv_compact_for_shrink"): {"_pdflip_group_min_ints"},
     ("pdflip/d_seat_vram.py", "_room_ok"): {"_pdflip_group_min_ints"},
 }
 
