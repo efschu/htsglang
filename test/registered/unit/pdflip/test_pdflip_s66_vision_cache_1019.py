@@ -50,11 +50,13 @@ PAGE = 64
 class _Item:
     """A MultimodalDataItem stand-in: offsets, hash, pixels or not."""
 
-    def __init__(self, offsets, feature=None, hash=None, emb=None):
+    def __init__(self, offsets, feature=None, hash=None, emb=None, grid=None):
         self.offsets = offsets
         self.feature = feature
         self.hash = hash
         self.precomputed_embeddings = emb
+        n = sum(e - a + 1 for a, e in offsets)
+        self.model_specific_data = {"image_grid_thw": torch.tensor([grid or [1, 2, 2 * n]])}
 
     def is_image(self):
         return True
@@ -152,13 +154,51 @@ def test_rc16_paced_form_waits_between_read_ahead_and_admit():
 
 
 def test_paced_fallback_admit_zero_stages():
+    """S66b A1: a paced told short of the image waits for the Admit (an S64 raise may still lift it); the PF
+    fallback Admit 0 then stages."""
     r = _req(rid="pdflip-2-9", ends=(21757,))
     s = _sched(held=[])
     s._pdflip_told_pacing = {"pdflip-2-9": SimpleNamespace(told=8192, absolute=True)}
-    assert V.stage_skip_verdict(s, r)[0] == V.STAGE, "paced told short of the images"
+    assert V.stage_skip_verdict(s, r) == (V.WAIT, 8192, "paced-raise")
     s._pdflip_told_pacing = {}
     s._pdflip_store_told["pdflip-2-9"] = 0  # PF fallback Admit
     assert V.stage_skip_verdict(s, r) == (V.STAGE, 0, "told")
+
+
+def test_review_s66b_paced_raise_admit_above_image_end_skips_without_fetch(monkeypatch):
+    """Review S66b A1 (reviewer test /tmp/rv66b/test_rv66b_paced_raise_1019.py as template): paced told 72128 <
+    image_end 72215, the S64 raise (default on) admits 72256 >= image_end -> SKIP, no pixel fetch, no tower."""
+    from flliper.srt.managers import pdflip_told_raise as R
+
+    assert R.raise_on({}) is True
+    r = _req(rid="rv-1", featureless=True, ends=(72214,))
+    s = _pass_sched(r, held=[])
+    s._pdflip_told_pacing = {"rv-1": SimpleNamespace(told=72128, absolute=True)}
+    with mock.patch.object(V, "run_rank_stage", side_effect=AssertionError("tower before the Admit")):
+        parked = V.vision_rank_pass(s)
+        assert [x for _, x in parked] == [r] and s.ipc_channels.send_to_tokenizer.sent == []
+        V.vision_unpark(s, parked)
+        s._pdflip_told_pacing = {}
+        s._pdflip_store_told["rv-1"] = 72256  # Admit with raise
+        V.vision_rank_pass(s)
+    assert r._pdflip_vision_skip and s.ipc_channels.send_to_tokenizer.sent == []
+
+
+def test_paced_short_stages_at_once_only_when_no_raise_can_come(monkeypatch):
+    from flliper.srt.managers import pdflip_told_raise as R
+
+    r = _req(rid="rv-2", ends=(72214,))
+    s = _sched(held=[])
+    s._pdflip_told_pacing = {"rv-2": SimpleNamespace(told=72128, absolute=True)}
+    monkeypatch.setenv(R.ENV_RAISE, "0")
+    assert V.stage_skip_verdict(s, r)[0] == V.STAGE, "switch off: the Admit can only lower it"
+    monkeypatch.setenv(R.ENV_RAISE, "1")
+    setattr(s, R._ATTR, {"rv-2": SimpleNamespace(target=72192, state="failed")})
+    assert V.stage_skip_verdict(s, r)[0] == V.STAGE, "the rid's one raise failed"
+    setattr(s, R._ATTR, {"rv-2": SimpleNamespace(target=72192, state="issued")})
+    assert V.stage_skip_verdict(s, r)[0] == V.STAGE, "the raise targets a depth short of the image"
+    setattr(s, R._ATTR, {"rv-2": SimpleNamespace(target=72256, state="issued")})
+    assert V.stage_skip_verdict(s, r) == (V.WAIT, 72128, "paced-raise")
 
 
 def test_a_probe_not_answered_yet_waits_while_the_read_is_registered():
@@ -167,11 +207,41 @@ def test_a_probe_not_answered_yet_waits_while_the_read_is_registered():
     assert V.stage_skip_verdict(s, r) == (V.WAIT, 0, "probe-pending")
 
 
-def test_a_probe_short_of_the_images_stages_at_once():
+def test_a_probe_short_of_the_images_still_waits_for_the_told():
+    """S66b (user order 19.10.): while a told is outstanding neither stage nor fetch runs -- the told decides."""
     r = _req()
     s = _sched(held=[RID], probe={RID: 300}, ongoing=[RID])  # 19200 < 20556
-    assert V.stage_skip_verdict(s, r)[0] == V.STAGE
-    assert V.skip_cached(s, [r]) == ([r], [])
+    assert V.stage_skip_verdict(s, r) == (V.WAIT, 19200, "told-pending")
+    assert V.skip_cached(s, [r]) == ([], [r])
+    s._pdflip_store_told[RID] = 19200
+    assert V.skip_cached(s, [r]) == ([r], []), "the told is short: the tower runs"
+
+
+def test_rc17_pdflip_1_13_deferred_twin_known_image_waits_for_the_told_no_fetch_no_tower(caplog):
+    """rc17 boot 171636, P PP0, pdflip-1-13 (image_end 72215), in this order:
+    17:21:34 P-KNOWN-IMAGE hit (no pixels) -> 17:21:35 W102k FETCH covered=0 src=local -> 17:21:37 FETCH-ANSWER
+    -> 17:21:38 ATTACHED -> 17:21:40 tower -> 17:21:52 #TW TWIN-REGISTER twin=True, TOLD told=81664 -> P computed 61.
+    The twin was held by #1400 with no store read (sibling in flight): no probe, no open read."""
+    caplog.set_level(logging.INFO)
+    rid = "pdflip-1-13"
+    r = _req(rid=rid, featureless=True, ends=(72214,))
+    s = _pass_sched(r, held=[rid])
+    s._tw_state = SimpleNamespace(waits={rid: 0.0})
+    with mock.patch("flliper.srt.pdflip.p_twin_defer.is_deferred", lambda sch, x: x in sch._tw_state.waits), \
+            mock.patch.object(V, "run_rank_stage", side_effect=AssertionError("tower ran before the told")):
+        parked = V.vision_rank_pass(s)
+        assert [x for _, x in parked] == [r]
+        assert s.ipc_channels.send_to_tokenizer.sent == [], "no pixel fetch while the told is outstanding"
+        assert VV.take_verdicts(s) == []
+        assert any(f"PROBE-WAIT rid={rid} promise=0 src=twin-deferred" in m for m in caplog.messages)
+        V.vision_unpark(s, parked)
+        # the sibling finished: the twin registers at head 81664 and its told is published
+        s._tw_state.waits.pop(rid)
+        s._pdflip_store_held.pop(rid)
+        s._pdflip_store_told[rid] = 81664
+        V.vision_rank_pass(s)
+    assert r._pdflip_vision_skip and s.ipc_channels.send_to_tokenizer.sent == []
+    assert [v.rid for v in VV.take_verdicts(s)] == [rid]
 
 
 def test_registration_head_counts_into_the_promise():
@@ -542,3 +612,195 @@ def test_front_unpriced_image_request_is_not_p_only_by_rule():
     assert "_probe_p_only = bool(_xx is not None and getattr(_xx, \"image_in_tail\", False))" in src
     assert F.vision_unpriced_to_d_on({}) is True
     assert F.vision_unpriced_to_d_on({F.VISION_UNPRICED_TO_D_ENV: "0"}) is False
+
+
+# ---- S66c EMB-CACHE: an image P encoded once is not fetched / encoded again --------------
+
+def _rows_for(req, width=8, fill=1.0):
+    return [torch.full((sum(b - a + 1 for a, b in it.offsets), width), fill + i)
+            for i, it in enumerate(req.multimodal_inputs.mm_items)]
+
+
+def _store_rows(req, width=8):
+    """A previous turn's stage: rows attached to items with the same content hashes, then kept."""
+    prev = _req(rid="prev", featureless=True, ends=[it.offsets[0][1] for it in req.multimodal_inputs.mm_items])
+    for it, rows in zip(prev.multimodal_inputs.mm_items, _rows_for(prev, width)):
+        it.precomputed_embeddings = rows
+    return V.emb_cache_store(prev.multimodal_inputs.mm_items)
+
+
+@pytest.fixture(autouse=False)
+def fresh_emb_cache(monkeypatch):
+    monkeypatch.setattr(V, "_EMB_CACHE", None)
+    monkeypatch.setenv(V.VISION_EMB_CACHE_ENV, "64")
+    yield
+
+
+def test_rc17_pdflip_6_245_told_short_by_31_positions_uses_cached_rows_no_fetch_no_tower(fresh_emb_cache, caplog):
+    """rc17 boot 171636, P PP0, pdflip-6-245 (also 8-254): P-KNOWN-IMAGE hit, TOLD told=96768, W102k FETCH
+    covered=0 image_end=96799 -> pixels 2963 ms + tower 0.6 s for 210 new tokens. The two images' rows had been
+    encoded by this rank one turn earlier."""
+    caplog.set_level(logging.INFO)
+    rid = "pdflip-6-245"
+    r = _req(rid=rid, featureless=True, ends=(95900, 96798))  # image_end 96799
+    assert _store_rows(r) == 2
+    s = _pass_sched(r, told={rid: 96768})
+    s.model_config = SimpleNamespace(hf_config=SimpleNamespace(
+        vision_config=SimpleNamespace(out_hidden_size=8, deepstack_visual_indexes=[])))
+    with mock.patch.object(V, "run_rank_stage", side_effect=AssertionError("tower ran for cached rows")):
+        parked = V.vision_rank_pass(s)
+    assert s.ipc_channels.send_to_tokenizer.sent == [], "no pixel fetch"
+    assert [x for _, x in parked] == [r], "held this pass only by the H125f gate, like every follower"
+    assert [v.rid for v in VV.take_verdicts(s)] == [rid], "PP0's verdict goes out at once"
+    for it, want in zip(r.multimodal_inputs.mm_items, _rows_for(r)):
+        assert torch.equal(it.precomputed_embeddings, want) and it.feature is None
+    assert V.pending_items(r) == []
+    assert any(m.startswith(f"W102 PdFlipVisionStage EMB-CACHE HIT rid={rid} items=2") for m in caplog.messages)
+
+
+def test_emb_cache_is_all_or_nothing_and_checks_count_and_width(fresh_emb_cache):
+    r = _req(rid="r1", featureless=True, ends=(5000, 20555))
+    _store_rows(_req(rid="r0", featureless=True, ends=(5000,)))  # only the first image known
+    s = _sched(told={"r1": 0})
+    assert V.emb_cache_attach(s, r) is False and all(
+        it.precomputed_embeddings is None for it in r.multimodal_inputs.mm_items), "partial attach never"
+    # a row count that does not match the placeholders is never attached
+    r2 = _req(rid="r2", featureless=True, ends=(5000,))
+    bad = _req(rid="bad", featureless=True, ends=(5001,))
+    bad.multimodal_inputs.mm_items[0].precomputed_embeddings = _rows_for(bad)[0]
+    V._EMB_CACHE = None  # fresh cache (the fixture restores it)
+    V.emb_cache_store(bad.multimodal_inputs.mm_items)  # same hash 1000, one row more
+    assert V.emb_cache_attach(s, r2) is False
+    # width against the tower
+    r3 = _req(rid="r3", featureless=True, ends=(5000,))
+    V._EMB_CACHE = None
+    V.emb_cache_store(_set_rows(_req(rid="ok", featureless=True, ends=(5000,))))
+    assert V.emb_cache_attach(_sched(), _req(rid="r3ok", featureless=True, ends=(5000,))), "same rows, no width set"
+    s.model_config = SimpleNamespace(hf_config=SimpleNamespace(
+        vision_config=SimpleNamespace(out_hidden_size=16, deepstack_visual_indexes=[])))
+    assert V.emb_cache_attach(s, r3) is False
+
+
+def _set_rows(req, width=8):
+    for it, rows in zip(req.multimodal_inputs.mm_items, _rows_for(req, width)):
+        it.precomputed_embeddings = rows
+    return req.multimodal_inputs.mm_items
+
+
+def test_emb_cache_rows_are_copies_and_off_switch(fresh_emb_cache, monkeypatch):
+    src = _req(rid="s", featureless=True, ends=(5000,))
+    items = _set_rows(src)
+    V.emb_cache_store(items)
+    items[0].precomputed_embeddings.add_(100.0)  # the request mutates its own rows
+    r = _req(rid="r", featureless=True, ends=(5000,))
+    assert V.emb_cache_attach(_sched(), r)
+    assert torch.equal(r.multimodal_inputs.mm_items[0].precomputed_embeddings, _rows_for(r)[0])
+    r.multimodal_inputs.mm_items[0].precomputed_embeddings.mul_(-1.0)  # a request mutates the rows it got
+    r5 = _req(rid="r5", featureless=True, ends=(5000,))
+    assert V.emb_cache_attach(_sched(), r5)
+    assert torch.equal(r5.multimodal_inputs.mm_items[0].precomputed_embeddings, _rows_for(r5)[0])
+    monkeypatch.setenv(V.VISION_EMB_CACHE_ENV, "0")
+    r4 = _req(rid="r4", featureless=True, ends=(5000,))
+    assert V.emb_cache_attach(_sched(), r4) is False
+
+
+def test_emb_cache_miss_still_fetches_and_the_stage_keeps_the_rows(fresh_emb_cache):
+    r = _req(rid="m", featureless=True, ends=(72214,))
+    s = _sched(told={"m": 0}, wq=[r])
+    assert V.skip_cached(s, [r]) == ([], [r]) and len(s.ipc_channels.send_to_tokenizer.sent) == 1
+    src = inspect.getsource(V)
+    assert src.count("emb_cache_store(items)") == 1 and src.count("emb_cache_store(st.items)") == 1
+
+
+
+# ---- S66c-r B1: the grid is part of an entry's identity ----------------------------------
+
+def test_review_s66c_transposed_blank_page_is_a_miss_not_the_other_grids_rows(monkeypatch, caplog):
+    """Reviewer test /tmp/rv66b/test_rv66c_grid_collision_1019.py, expectation turned: a blank A4 page portrait
+    (grid 1x84x60) and landscape (1x60x84) hash alike (Qwen2VLImageProcessor: 1634794136353122902) with 1260 rows
+    each; the tower's pos_embed is grid-interpolated -> other rows. Landscape must MISS (then FETCH / tower)."""
+    caplog.set_level(logging.INFO)
+    monkeypatch.setattr(V, "_EMB_CACHE", None)
+    H = 1634794136353122902
+
+    def item(grid):
+        return SimpleNamespace(offsets=[(10, 10 + 1260 - 1)], feature=torch.zeros(2), hash=H,
+                               precomputed_embeddings=None, image_grid_thw=torch.tensor([grid]),
+                               is_image=lambda: True)
+
+    sched = SimpleNamespace(model_config=SimpleNamespace(hf_config=SimpleNamespace(
+        vision_config=SimpleNamespace(out_hidden_size=8, deepstack_visual_indexes=[]))))
+    portrait = item([1, 84, 60])
+    portrait.precomputed_embeddings = torch.arange(1260 * 8, dtype=torch.float32).reshape(1260, 8)
+    assert V.emb_cache_store([portrait]) == 1
+    landscape = item([1, 60, 84])
+    req = SimpleNamespace(rid="rv-quer", multimodal_inputs=SimpleNamespace(mm_items=[landscape]))
+    assert V.emb_cache_attach(sched, req) is False
+    assert landscape.precomputed_embeddings is None and landscape.feature is not None
+    assert any("EMB-CACHE GRID-MISS rid=rv-quer" in m for m in caplog.messages), "the collision is named"
+    # the same grid still hits; both grids live side by side once both were staged
+    again = item([1, 84, 60])
+    assert V.emb_cache_attach(sched, SimpleNamespace(rid="rv-hoch", multimodal_inputs=SimpleNamespace(
+        mm_items=[again])))
+    landscape.precomputed_embeddings = torch.ones(1260, 8)
+    assert V.emb_cache_store([landscape]) == 1 and len(V._EMB_CACHE) == 2
+
+
+def test_an_item_without_a_grid_is_never_stored_nor_served(monkeypatch):
+    monkeypatch.setattr(V, "_EMB_CACHE", None)
+    it = SimpleNamespace(offsets=[(0, 3)], feature=None, hash=7, precomputed_embeddings=torch.ones(4, 8),
+                         is_image=lambda: True)
+    assert V.emb_cache_store([it]) == 0
+
+
+def test_h3_a_throwing_attach_falls_back_untouched(monkeypatch, caplog):
+    caplog.set_level(logging.WARNING)
+    monkeypatch.setattr(V, "_EMB_CACHE", None)
+    src = _req(rid="s", featureless=True, ends=(5000,))
+    V.emb_cache_store(_set_rows(src))
+    r = _req(rid="h3", featureless=True, ends=(5000,))
+    s = _sched(told={"h3": 0}, wq=[r])
+    def half_then_raise(items, rows, expected_width):
+        items[0].precomputed_embeddings, items[0].feature = rows[0], None  # half done, then a throw
+        raise ValueError("boom")
+
+    with mock.patch.object(V, "attach_precomputed_embeddings", side_effect=half_then_raise):
+        assert V.emb_cache_attach(s, r) is False
+        assert V.skip_cached(s, [r]) == ([], [r]) and len(s.ipc_channels.send_to_tokenizer.sent) == 1, \
+            "named fall back to FETCH"
+    assert r.multimodal_inputs.mm_items[0].precomputed_embeddings is None
+    assert any("EMB-CACHE REFUSED rid=h3" in m for m in caplog.messages)
+
+
+def test_h1_rc17_pdflip_6_245_behaviour_second_turn_sends_no_fetch(monkeypatch):
+    """H1 (review S66c): a behavioural repro without the cache API in the fixture -- turn 1 is a staged pass (the
+    fake stage attaches rows like run_rank_stage and keeps them where the tree keeps them), turn 2 is the rc17
+    order: told 96768 < image_end 96799. Base code (no EMB-CACHE): turn 2 sends a pixel FETCH."""
+    monkeypatch.setenv("FLLIPER_PDFLIP_VISION_EMB_CACHE_MB", "64")
+    monkeypatch.setattr(V, "_EMB_CACHE", None, raising=False)
+
+    def fake_stage(scheduler, reqs, **kw):
+        from flliper.srt.planner.vision_stage_load import attach_precomputed_embeddings
+
+        items = [it for r in reqs for it in V.unstaged_items(r)]
+        attach_precomputed_embeddings(items, [torch.full((sum(b - a + 1 for a, b in it.offsets), 8), 3.0)
+                                              for it in items], expected_width=8)
+        getattr(V, "emb_cache_store", lambda _i: 0)(items)  # what run_rank_stage does on the tree under test
+        return V.StageOutcome()
+
+    t1 = _req(rid="pdflip-5-240", ends=(95900, 96798))  # turn 1: pixels, same images (hashes set below)
+    for i, it in enumerate(t1.multimodal_inputs.mm_items):
+        it.hash = 1000 + i
+    s1 = _pass_sched(t1, told={"pdflip-5-240": 0})
+    s1.server_args = SimpleNamespace(model_path="/nonexistent")
+    s1.model_config = SimpleNamespace(hf_config=SimpleNamespace(
+        vision_config=SimpleNamespace(out_hidden_size=8, deepstack_visual_indexes=[])))
+    with mock.patch.object(V, "run_rank_stage", side_effect=fake_stage), mock.patch.object(V, "_rank_device",
+                                                                                         lambda: torch.device("cpu")):
+        V.vision_rank_pass(s1)
+    assert all(it.precomputed_embeddings is not None for it in t1.multimodal_inputs.mm_items), "turn 1 staged"
+    t2 = _req(rid="pdflip-6-245", featureless=True, ends=(95900, 96798))  # known images, hashes 1000/1001
+    s2 = _pass_sched(t2, told={"pdflip-6-245": 96768})
+    with mock.patch.object(V, "run_rank_stage", side_effect=AssertionError("tower ran")):
+        V.vision_rank_pass(s2)
+    assert s2.ipc_channels.send_to_tokenizer.sent == [], "turn 2 fetched pixels for rows encoded in turn 1"

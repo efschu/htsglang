@@ -243,6 +243,184 @@ def arm_ram_source(model_dir: str, env: Optional[Dict[str, str]] = None,
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# S66c EMB-CACHE: an image P encoded once is not encoded again
+# ---------------------------------------------------------------------------
+# rc17 boot 171636, P PP0, pdflip-6-245 / pdflip-8-254: P-KNOWN-IMAGE hit, told
+# 96768 (1512 pages; the store's KV is page/anchor-granular), image_end 96799
+# -- the last 31 image positions lie past the deepest cached page, so the told
+# cannot cover the image and the verdict is STAGE: pixel FETCH 1594-2963 ms
+# (ATTACHED wait_ms) plus the tower (~0.6 s) for 210 / 917 new tokens. The
+# rows of exactly these two images had been computed by this very rank one
+# turn earlier.
+#
+# Upstream SGLang keeps such rows in ``MultiModalStaticCache`` keyed by the
+# item's content hash (``mm_utils.embedding_cache``, ``get_single``/``set``,
+# consulted in ``_get_chunked_embedding_by_item`` before the ViT). On P that
+# path is never reached for a staged image: the transient stage decides
+# before the embed routine. So the stage keeps its rows in the SAME upstream
+# class (its own instance on PP0: the module global is re-made by
+# ``kv_cache_builder`` and sized for the in-model ViT path) and, when a
+# verdict says STAGE, attaches cached rows instead of fetching pixels and
+# loading the tower -- for every pending item or for none. Key: ``item.hash``
+# = ``hash_feature(pixels)``, the content hash the prefix is keyed with
+# (equal on the known-image path, S70 condition); the row count must equal
+# the item's placeholder count and the width the tower's ``out_hidden_size``.
+# Rows are stored and handed out as host copies (a request never shares its
+# rows tensor with the cache). Bounded in bytes, LRU.
+#
+# S66c-r B1 (review S66c): the content hash covers the pixel BYTES only, not
+# the grid -- a blank A4 page portrait (grid 1x84x60) and landscape (1x60x84)
+# hash alike (measured, Qwen2VLImageProcessor) and give 1260 rows each, while
+# the tower adds pos_embed interpolated to the grid: other rows. The identity
+# of an entry is therefore (hash, image_grid_thw): the key carries the grid,
+# the entry carries it again and the attach compares it; an item without a
+# readable grid is never stored nor served. (The radix shares such a page
+# only under a whole equal prefix, which pins the grid by the ids.)
+# ``FLLIPER_PDFLIP_VISION_EMB_CACHE_MB`` (default 1024; 0 = off).
+VISION_EMB_CACHE_ENV = "FLLIPER_PDFLIP_VISION_EMB_CACHE_MB"
+W_EMB_CACHE = "W102 PdFlipVisionStage EMB-CACHE"
+_EMB_CACHE = None
+
+
+def emb_cache(env: Optional[Dict[str, str]] = None):
+    """The stage's row cache (upstream ``MultiModalStaticCache``), or None when off."""
+    global _EMB_CACHE
+    e = os.environ if env is None else env
+    try:
+        mb = int(str(e.get(VISION_EMB_CACHE_ENV, "1024") or "1024").strip())
+    except ValueError:
+        mb = 1024
+    if mb <= 0:
+        return None
+    if _EMB_CACHE is None or int(_EMB_CACHE.max_size) != mb << 20:
+        from flliper.srt.mem_cache.multimodal_cache import MultiModalStaticCache
+
+        old = _EMB_CACHE
+        _EMB_CACHE = MultiModalStaticCache(mb << 20)
+        if old is not None:
+            for h, er in old.mm_cache.items():
+                _EMB_CACHE.set(h, er)
+    return _EMB_CACHE
+
+
+def _item_grid(it) -> Optional[Tuple[int, ...]]:
+    """The item's ``image_grid_thw`` as an int tuple, or None when it cannot be read."""
+    msd = getattr(it, "model_specific_data", None)
+    g = msd.get("image_grid_thw") if isinstance(msd, dict) else None
+    if g is None:
+        try:
+            g = getattr(it, "image_grid_thw", None)
+        except Exception:  # noqa: BLE001 -- MultimodalDataItem.__getattr__ may raise
+            g = None
+    if g is None:
+        return None
+    try:
+        flat = torch.as_tensor(g).reshape(-1).tolist()
+    except Exception:  # noqa: BLE001
+        return None
+    return tuple(int(x) for x in flat) if flat else None
+
+
+def _emb_key(h: Any, grid: Tuple[int, ...]) -> Tuple[int, Tuple[int, ...]]:
+    return (int(h), grid)
+
+
+def _item_rows(it) -> int:
+    offs = getattr(it, "offsets", None)
+    return sum(int(b) - int(a) + 1 for a, b in (() if offs is None else offs))
+
+
+def _tower_width(scheduler) -> Optional[int]:
+    hf = getattr(getattr(scheduler, "model_config", None), "hf_config", None)
+    vc = getattr(hf, "vision_config", None)
+    w = getattr(vc, "out_hidden_size", None)
+    if w is None:
+        return None
+    deep = getattr(vc, "deepstack_visual_indexes", None) or ()
+    return int(w) * (1 + len(deep))
+
+
+def emb_cache_store(items: Sequence[Any]) -> int:
+    """After an attach: keep each item's rows under its content hash. Returns how many."""
+    cache = emb_cache()
+    if cache is None:
+        return 0
+    from flliper.srt.mem_cache.multimodal_cache import EmbeddingResult
+
+    n = 0
+    for it in items:
+        h, rows = getattr(it, "hash", None), getattr(it, "precomputed_embeddings", None)
+        if h is None or not isinstance(rows, torch.Tensor) or rows.is_cuda or rows.dim() != 2:
+            continue
+        if int(rows.shape[0]) != _item_rows(it):
+            continue
+        grid = _item_grid(it)
+        if grid is None:
+            continue  # B1: no grid, no identity -- never stored
+        er = EmbeddingResult(embedding=rows.detach().clone())
+        er.pdflip_grid = grid
+        if cache.set(_emb_key(h, grid), er):
+            n += 1
+    return n
+
+
+def _note_grid_miss(scheduler, req, it, grid) -> None:
+    """H2: a hash that IS cached under another grid is named (the B1 collision class)."""
+    cache = emb_cache()
+    h = int(getattr(it, "hash"))
+    other = [k[1] for k in (cache.mm_cache.keys() if cache is not None else ()) if isinstance(k, tuple) and k[0] == h]
+    if not other:
+        return
+    scheduler._pdflip_vision_emb_grid_miss = getattr(scheduler, "_pdflip_vision_emb_grid_miss", 0) + 1
+    logger.info("%s GRID-MISS rid=%s hash=%d grid=%s cached_grids=%s n=%d (same pixel bytes, another grid: the "
+                "rows differ -- no attach)", W_EMB_CACHE, req.rid, h, list(grid), [list(g) for g in other],
+                scheduler._pdflip_vision_emb_grid_miss)
+
+
+def emb_cache_attach(scheduler, req) -> bool:
+    """A STAGE verdict: attach cached rows to EVERY pending item of ``req`` (True),
+    or touch nothing (False)."""
+    cache = emb_cache()
+    items = pending_items(req)
+    if cache is None or not items:
+        return False
+    width = _tower_width(scheduler)
+    rows = []
+    for it in items:
+        h = getattr(it, "hash", None)
+        grid = _item_grid(it)
+        er = cache.get_single(_emb_key(h, grid)) if (h is not None and grid is not None) else None
+        if er is not None and getattr(er, "pdflip_grid", None) != grid:
+            er = None  # B1 belt: the entry's own grid must equal the item's
+        if er is None and h is not None and grid is not None:
+            _note_grid_miss(scheduler, req, it, grid)
+        emb = getattr(er, "embedding", None)
+        if not isinstance(emb, torch.Tensor) or emb.dim() != 2 or emb.is_cuda:
+            return False
+        if int(emb.shape[0]) != _item_rows(it):
+            return False
+        if width is not None and int(emb.shape[1]) != width:
+            return False
+        rows.append(emb.clone())
+    w = width if width is not None else int(rows[0].shape[1])
+    saved = [(it.feature, it.precomputed_embeddings) for it in items]
+    try:
+        attach_precomputed_embeddings(items, rows, expected_width=w)
+    except Exception as exc:  # noqa: BLE001 -- H3: a named fall back to FETCH / STAGE, never half attached
+        for it, (f, pe) in zip(items, saved):
+            it.feature, it.precomputed_embeddings = f, pe
+        logger.warning("%s REFUSED rid=%s %s: %s -- the verdict falls back to FETCH / STAGE", W_EMB_CACHE,
+                       req.rid, type(exc).__name__, exc)
+        return False
+    scheduler._pdflip_vision_emb_hits = getattr(scheduler, "_pdflip_vision_emb_hits", 0) + 1
+    logger.info("%s HIT rid=%s items=%d rows=%d entries=%d bytes=%d n=%d (rows this rank encoded before, by "
+                "content hash: no pixel fetch, no tower)", W_EMB_CACHE, req.rid, len(items),
+                sum(int(r.shape[0]) for r in rows), len(cache), int(cache.current_size),
+                scheduler._pdflip_vision_emb_hits)
+    return True
+
+
 def pending_items(req) -> List[Any]:
     """What PP0's vision pass still owes ``req`` (S66): the items with pixels
     and no rows, plus the known images P's tokenizer sent without pixels
@@ -296,18 +474,23 @@ SKIP, WAIT, STAGE = "skip", "wait", "stage"
 # staged. rc15, three boots: 31 of 90 tower runs were for images inside the
 # prefix P then admitted (82.5 s of PP0, the stage is synchronous).
 #
-# Now: while the told is outstanding and the rid is held by #1400, PP0's OWN
-# store probe decides WAIT -- its anchor-clamped answer (``note_probe_hit``,
-# the very number the told reuses: #1416d ``reused=prefetch_hit``) put on the
-# registration head, or the read's completed prefix. A probe that has not
-# answered yet while the read is registered waits too (the told cannot come
-# before it). WAIT only defers the verdict to the told (one pass); it never
-# skips: SKIP stays ``told >= image_end``, the admission belt
+# Now (S66 + S66b, user order 19.10. "auch FETCH und Stage warten bis zum
+# told, wenn ein told aussteht"): a rid held by #1400 ALWAYS waits for its
+# told -- neither the tower nor a known-image pixel fetch runs before it. The
+# WAIT names why (src): PP0's own store read covers the image (``probe``: the
+# anchor-clamped answer ``note_probe_hit`` on the registration head, the
+# number the told reuses; ``read``: the completed prefix), a fork twin held
+# without a read (``twin-deferred``), a probe not answered yet
+# (``probe-pending``), or the probe short of the image (``told-pending``).
+# In the paced form (#1416e) the rid waits for its Admit while the Admit can
+# still reach the image: told >= image_end, or an S64 raise may still come
+# (``paced-raise``); it stages at once only when no raise can come. WAIT
+# never skips: SKIP stays ``told >= image_end``, the admission belt
 # (:func:`skip_still_covered`) stays. The admission cannot take the request
 # before its told anyway (``pdflip_store_told_pending``), so a WAIT costs no
 # admission pass -- only the overlap of a tower the told then still needs
-# with the read, bounded by the probe's own latency. PP0 alone decides; the
-# followers hold the request until PP0's verdict reaches them (H125f).
+# with the read. PP0 alone decides; the followers hold the request until
+# PP0's verdict reaches them (H125f).
 VISION_PROBE_WAIT_ENV = "FLLIPER_PDFLIP_VISION_PROBE_WAIT"
 W_PROBE_WAIT = "W102 PdFlipVisionStage PROBE-WAIT"
 
@@ -386,23 +569,56 @@ def _probe_wait(scheduler, req, end: int) -> Optional[Tuple[int, str]]:
         p_told = int(getattr(pace, "told", 0) or 0)
         if p_told >= end:
             return p_told, "paced"
+        # S66b A1 (review S66b): the Admit does NOT only lower the read-ahead told -- the S64 S-1400 (b) raise
+        # (pdflip_told_raise, default on) admits told_final > p.told, the depth every follower proved. While a
+        # raise can still come the verdict waits for the Admit; the wait is bounded by the paced machinery itself
+        # (window, PF Frist, FLLIPER_PDFLIP_S64_TOLD_RAISE_WAIT_S): the Admit pops the rid from pacing and sets the
+        # told. Stage at once only when no raise can come (switch off, or this rid's one raise attempt failed).
+        raise_pending = False
+        try:
+            from flliper.srt.managers import pdflip_told_raise as _raise
+
+            if _raise.raise_on():
+                rs = (getattr(scheduler, _raise._ATTR, None) or {}).get(rid)
+                raise_pending = rs is None or getattr(rs, "state", "") != "failed"
+                if rs is not None and getattr(rs, "state", "") in ("issued", "done") and int(rs.target) < end:
+                    raise_pending = False  # the one raise of this rid targets a depth short of the image
+        except Exception:  # noqa: BLE001 -- unknown: wait for the Admit, it is bounded
+            raise_pending = True
+        if raise_pending:
+            return p_told, "paced-raise"
         return None
     held = getattr(scheduler, "_pdflip_store_held", None)
     if not isinstance(held, dict) or rid not in held:
         return None  # no #1400 verdict is coming for it: nothing to wait for
+    # S66b (NF rc17 boot 171636, P PP0, pdflip-1-13): a fork twin (#TW) is held by #1400 WITHOUT a store read until
+    # its sibling finished -- no probe, no open read -- so the probe rule above staged it: KNOWN-IMAGE FETCH
+    # 17:21:35 (covered=0 src=local), pixels 1879 ms, tower 17:21:40, and only at 17:21:52 the sibling's finish
+    # released the twin: told=81664 >= image_end 72215, P computed 61 tokens. Whatever PP0's own read says, the told
+    # decides and the admission takes nothing before it: while it is outstanding neither the stage nor the pixel
+    # fetch runs (user order 19.10.: "auch FETCH und Stage warten bis zum told, wenn ein told aussteht").
     depth, src = probe_promise(scheduler, req)
     if depth is not None and depth >= end:
         return depth, src
+    try:
+        from flliper.srt.pdflip import p_twin_defer as _twin
+
+        if _twin.is_deferred(scheduler, rid):
+            return 0, "twin-deferred"
+    except Exception:  # noqa: BLE001 -- the told-pending wait below holds it anyway
+        pass
     if depth is None and _read_open(scheduler, rid):
         return 0, "probe-pending"
-    return None
+    return (0 if depth is None else int(depth)), "told-pending"
 
 
 def stage_skip_verdict(scheduler, req) -> Tuple[str, int, str]:
     """(verdict, covered, source): ``skip`` when every image position of
-    ``req`` lies inside the prefix this group admits it with, ``wait`` while a
-    store-told is outstanding and the rank's own match -- or PP0's own store
-    probe (S66) -- covers the image, ``stage`` otherwise."""
+    ``req`` lies inside the prefix this group admits it with (the told);
+    ``wait`` while a store-told is outstanding -- a rid held by #1400 always
+    waits for its told (S66b), a paced rid for its Admit while the Admit can
+    still reach the image (S66b A1) -- or the rank's own match covers the
+    image; ``stage`` otherwise."""
     from flliper.srt.pdflip.vision_d_guard import image_end
 
     end = image_end(req)
@@ -450,6 +666,9 @@ def skip_cached(scheduler, pending: Sequence[Any]) -> Tuple[List[Any], List[Any]
             if src not in ("local",):
                 _note_probe_wait(scheduler, r, covered, src)
             wait.append(r)
+        elif emb_cache_attach(scheduler, r):
+            # S66c: rows this rank encoded before -- the request is staged without the tower
+            pass
         elif _pki.featureless_items(r):
             # S66 P-KNOWN-IMAGE: P's tokenizer built this request from known
             # images without pixels; the verdict needs the tower, so the
@@ -1120,6 +1339,7 @@ def run_rank_stage(scheduler, reqs: Sequence[Any], *, model_dir: str, hf_config:
             leg, t0 = "attach", clock()
             w0 = _enter("attach")
             attach_precomputed_embeddings(items, rows, expected_width=int(module.out_hidden_size))
+            emb_cache_store(items)  # S66c: kept by content hash for the next turn
             out.legs_ms["attach"] = (clock() - t0) * 1e3
             out.legs_wall["attach"] = (w0, time.time())
         except Exception as exc:  # noqa: BLE001 -- every seam is a named verdict
@@ -1529,6 +1749,7 @@ def finish_async_stage(st: AsyncStage, clock: Callable[[], float] = time.perf_co
         out.encode_ms = dict(getattr(st.module, "_pdflip_encode_ms", {}) or {})
         t0 = clock()
         attach_precomputed_embeddings(st.items, rows, expected_width=int(st.module.out_hidden_size))
+        emb_cache_store(st.items)  # S66c
         out.legs_ms["attach"] = (clock() - t0) * 1e3
     except Exception as exc:  # noqa: BLE001 -- a named verdict, as the sync stage
         out.ok = False
