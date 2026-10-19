@@ -243,6 +243,122 @@ def arm_ram_source(model_dir: str, env: Optional[Dict[str, str]] = None,
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# S66c EMB-CACHE: an image P encoded once is not encoded again
+# ---------------------------------------------------------------------------
+# rc17 boot 171636, P PP0, pdflip-6-245 / pdflip-8-254: P-KNOWN-IMAGE hit, told
+# 96768 (1512 pages; the store's KV is page/anchor-granular), image_end 96799
+# -- the last 31 image positions lie past the deepest cached page, so the told
+# cannot cover the image and the verdict is STAGE: pixel FETCH 1594-2963 ms
+# (ATTACHED wait_ms) plus the tower (~0.6 s) for 210 / 917 new tokens. The
+# rows of exactly these two images had been computed by this very rank one
+# turn earlier.
+#
+# Upstream SGLang keeps such rows in ``MultiModalStaticCache`` keyed by the
+# item's content hash (``mm_utils.embedding_cache``, ``get_single``/``set``,
+# consulted in ``_get_chunked_embedding_by_item`` before the ViT). On P that
+# path is never reached for a staged image: the transient stage decides
+# before the embed routine. So the stage keeps its rows in the SAME upstream
+# class (its own instance on PP0: the module global is re-made by
+# ``kv_cache_builder`` and sized for the in-model ViT path) and, when a
+# verdict says STAGE, attaches cached rows instead of fetching pixels and
+# loading the tower -- for every pending item or for none. Key: ``item.hash``
+# = ``hash_feature(pixels)``, the content hash the prefix is keyed with
+# (equal on the known-image path, S70 condition); the row count must equal
+# the item's placeholder count and the width the tower's ``out_hidden_size``.
+# Rows are stored and handed out as host copies (a request never shares its
+# rows tensor with the cache). Bounded in bytes, LRU.
+# ``FLLIPER_PDFLIP_VISION_EMB_CACHE_MB`` (default 1024; 0 = off).
+VISION_EMB_CACHE_ENV = "FLLIPER_PDFLIP_VISION_EMB_CACHE_MB"
+W_EMB_CACHE = "W102 PdFlipVisionStage EMB-CACHE"
+_EMB_CACHE = None
+
+
+def emb_cache(env: Optional[Dict[str, str]] = None):
+    """The stage's row cache (upstream ``MultiModalStaticCache``), or None when off."""
+    global _EMB_CACHE
+    e = os.environ if env is None else env
+    try:
+        mb = int(str(e.get(VISION_EMB_CACHE_ENV, "1024") or "1024").strip())
+    except ValueError:
+        mb = 1024
+    if mb <= 0:
+        return None
+    if _EMB_CACHE is None or int(_EMB_CACHE.max_size) != mb << 20:
+        from flliper.srt.mem_cache.multimodal_cache import MultiModalStaticCache
+
+        old = _EMB_CACHE
+        _EMB_CACHE = MultiModalStaticCache(mb << 20)
+        if old is not None:
+            for h, er in old.mm_cache.items():
+                _EMB_CACHE.set(h, er)
+    return _EMB_CACHE
+
+
+def _item_rows(it) -> int:
+    offs = getattr(it, "offsets", None)
+    return sum(int(b) - int(a) + 1 for a, b in (() if offs is None else offs))
+
+
+def _tower_width(scheduler) -> Optional[int]:
+    hf = getattr(getattr(scheduler, "model_config", None), "hf_config", None)
+    vc = getattr(hf, "vision_config", None)
+    w = getattr(vc, "out_hidden_size", None)
+    if w is None:
+        return None
+    deep = getattr(vc, "deepstack_visual_indexes", None) or ()
+    return int(w) * (1 + len(deep))
+
+
+def emb_cache_store(items: Sequence[Any]) -> int:
+    """After an attach: keep each item's rows under its content hash. Returns how many."""
+    cache = emb_cache()
+    if cache is None:
+        return 0
+    from flliper.srt.mem_cache.multimodal_cache import EmbeddingResult
+
+    n = 0
+    for it in items:
+        h, rows = getattr(it, "hash", None), getattr(it, "precomputed_embeddings", None)
+        if h is None or not isinstance(rows, torch.Tensor) or rows.is_cuda or rows.dim() != 2:
+            continue
+        if int(rows.shape[0]) != _item_rows(it):
+            continue
+        if cache.set(int(h), EmbeddingResult(embedding=rows.detach().clone())):
+            n += 1
+    return n
+
+
+def emb_cache_attach(scheduler, req) -> bool:
+    """A STAGE verdict: attach cached rows to EVERY pending item of ``req`` (True),
+    or touch nothing (False)."""
+    cache = emb_cache()
+    items = pending_items(req)
+    if cache is None or not items:
+        return False
+    width = _tower_width(scheduler)
+    rows = []
+    for it in items:
+        h = getattr(it, "hash", None)
+        er = cache.get_single(int(h)) if h is not None else None
+        emb = getattr(er, "embedding", None)
+        if not isinstance(emb, torch.Tensor) or emb.dim() != 2 or emb.is_cuda:
+            return False
+        if int(emb.shape[0]) != _item_rows(it):
+            return False
+        if width is not None and int(emb.shape[1]) != width:
+            return False
+        rows.append(emb.clone())
+    w = width if width is not None else int(rows[0].shape[1])
+    attach_precomputed_embeddings(items, rows, expected_width=w)
+    scheduler._pdflip_vision_emb_hits = getattr(scheduler, "_pdflip_vision_emb_hits", 0) + 1
+    logger.info("%s HIT rid=%s items=%d rows=%d entries=%d bytes=%d n=%d (rows this rank encoded before, by "
+                "content hash: no pixel fetch, no tower)", W_EMB_CACHE, req.rid, len(items),
+                sum(int(r.shape[0]) for r in rows), len(cache), int(cache.current_size),
+                scheduler._pdflip_vision_emb_hits)
+    return True
+
+
 def pending_items(req) -> List[Any]:
     """What PP0's vision pass still owes ``req`` (S66): the items with pixels
     and no rows, plus the known images P's tokenizer sent without pixels
@@ -488,6 +604,9 @@ def skip_cached(scheduler, pending: Sequence[Any]) -> Tuple[List[Any], List[Any]
             if src not in ("local",):
                 _note_probe_wait(scheduler, r, covered, src)
             wait.append(r)
+        elif emb_cache_attach(scheduler, r):
+            # S66c: rows this rank encoded before -- the request is staged without the tower
+            pass
         elif _pki.featureless_items(r):
             # S66 P-KNOWN-IMAGE: P's tokenizer built this request from known
             # images without pixels; the verdict needs the tower, so the
@@ -1158,6 +1277,7 @@ def run_rank_stage(scheduler, reqs: Sequence[Any], *, model_dir: str, hf_config:
             leg, t0 = "attach", clock()
             w0 = _enter("attach")
             attach_precomputed_embeddings(items, rows, expected_width=int(module.out_hidden_size))
+            emb_cache_store(items)  # S66c: kept by content hash for the next turn
             out.legs_ms["attach"] = (clock() - t0) * 1e3
             out.legs_wall["attach"] = (w0, time.time())
         except Exception as exc:  # noqa: BLE001 -- every seam is a named verdict
@@ -1567,6 +1687,7 @@ def finish_async_stage(st: AsyncStage, clock: Callable[[], float] = time.perf_co
         out.encode_ms = dict(getattr(st.module, "_pdflip_encode_ms", {}) or {})
         t0 = clock()
         attach_precomputed_embeddings(st.items, rows, expected_width=int(st.module.out_hidden_size))
+        emb_cache_store(st.items)  # S66c
         out.legs_ms["attach"] = (clock() - t0) * 1e3
     except Exception as exc:  # noqa: BLE001 -- a named verdict, as the sync stage
         out.ok = False

@@ -610,3 +610,101 @@ def test_front_unpriced_image_request_is_not_p_only_by_rule():
     assert "_probe_p_only = bool(_xx is not None and getattr(_xx, \"image_in_tail\", False))" in src
     assert F.vision_unpriced_to_d_on({}) is True
     assert F.vision_unpriced_to_d_on({F.VISION_UNPRICED_TO_D_ENV: "0"}) is False
+
+
+# ---- S66c EMB-CACHE: an image P encoded once is not fetched / encoded again --------------
+
+def _rows_for(req, width=8, fill=1.0):
+    return [torch.full((sum(b - a + 1 for a, b in it.offsets), width), fill + i)
+            for i, it in enumerate(req.multimodal_inputs.mm_items)]
+
+
+def _store_rows(req, width=8):
+    """A previous turn's stage: rows attached to items with the same content hashes, then kept."""
+    prev = _req(rid="prev", featureless=True, ends=[it.offsets[0][1] for it in req.multimodal_inputs.mm_items])
+    for it, rows in zip(prev.multimodal_inputs.mm_items, _rows_for(prev, width)):
+        it.precomputed_embeddings = rows
+    return V.emb_cache_store(prev.multimodal_inputs.mm_items)
+
+
+@pytest.fixture(autouse=False)
+def fresh_emb_cache(monkeypatch):
+    monkeypatch.setattr(V, "_EMB_CACHE", None)
+    monkeypatch.setenv(V.VISION_EMB_CACHE_ENV, "64")
+    yield
+
+
+def test_rc17_pdflip_6_245_told_short_by_31_positions_uses_cached_rows_no_fetch_no_tower(fresh_emb_cache, caplog):
+    """rc17 boot 171636, P PP0, pdflip-6-245 (also 8-254): P-KNOWN-IMAGE hit, TOLD told=96768, W102k FETCH
+    covered=0 image_end=96799 -> pixels 2963 ms + tower 0.6 s for 210 new tokens. The two images' rows had been
+    encoded by this rank one turn earlier."""
+    caplog.set_level(logging.INFO)
+    rid = "pdflip-6-245"
+    r = _req(rid=rid, featureless=True, ends=(95900, 96798))  # image_end 96799
+    assert _store_rows(r) == 2
+    s = _pass_sched(r, told={rid: 96768})
+    s.model_config = SimpleNamespace(hf_config=SimpleNamespace(
+        vision_config=SimpleNamespace(out_hidden_size=8, deepstack_visual_indexes=[])))
+    with mock.patch.object(V, "run_rank_stage", side_effect=AssertionError("tower ran for cached rows")):
+        parked = V.vision_rank_pass(s)
+    assert s.ipc_channels.send_to_tokenizer.sent == [], "no pixel fetch"
+    assert [x for _, x in parked] == [r], "held this pass only by the H125f gate, like every follower"
+    assert [v.rid for v in VV.take_verdicts(s)] == [rid], "PP0's verdict goes out at once"
+    for it, want in zip(r.multimodal_inputs.mm_items, _rows_for(r)):
+        assert torch.equal(it.precomputed_embeddings, want) and it.feature is None
+    assert V.pending_items(r) == []
+    assert any(m.startswith(f"W102 PdFlipVisionStage EMB-CACHE HIT rid={rid} items=2") for m in caplog.messages)
+
+
+def test_emb_cache_is_all_or_nothing_and_checks_count_and_width(fresh_emb_cache):
+    r = _req(rid="r1", featureless=True, ends=(5000, 20555))
+    _store_rows(_req(rid="r0", featureless=True, ends=(5000,)))  # only the first image known
+    s = _sched(told={"r1": 0})
+    assert V.emb_cache_attach(s, r) is False and all(
+        it.precomputed_embeddings is None for it in r.multimodal_inputs.mm_items), "partial attach never"
+    # a row count that does not match the placeholders is never attached
+    r2 = _req(rid="r2", featureless=True, ends=(5000,))
+    bad = _req(rid="bad", featureless=True, ends=(5001,))
+    bad.multimodal_inputs.mm_items[0].precomputed_embeddings = _rows_for(bad)[0]
+    V._EMB_CACHE = None  # fresh cache (the fixture restores it)
+    V.emb_cache_store(bad.multimodal_inputs.mm_items)  # same hash 1000, one row more
+    assert V.emb_cache_attach(s, r2) is False
+    # width against the tower
+    r3 = _req(rid="r3", featureless=True, ends=(5000,))
+    V._EMB_CACHE = None
+    V.emb_cache_store(_set_rows(_req(rid="ok", featureless=True, ends=(5000,))))
+    assert V.emb_cache_attach(_sched(), _req(rid="r3ok", featureless=True, ends=(5000,))), "same rows, no width set"
+    s.model_config = SimpleNamespace(hf_config=SimpleNamespace(
+        vision_config=SimpleNamespace(out_hidden_size=16, deepstack_visual_indexes=[])))
+    assert V.emb_cache_attach(s, r3) is False
+
+
+def _set_rows(req, width=8):
+    for it, rows in zip(req.multimodal_inputs.mm_items, _rows_for(req, width)):
+        it.precomputed_embeddings = rows
+    return req.multimodal_inputs.mm_items
+
+
+def test_emb_cache_rows_are_copies_and_off_switch(fresh_emb_cache, monkeypatch):
+    src = _req(rid="s", featureless=True, ends=(5000,))
+    items = _set_rows(src)
+    V.emb_cache_store(items)
+    items[0].precomputed_embeddings.add_(100.0)  # the request mutates its own rows
+    r = _req(rid="r", featureless=True, ends=(5000,))
+    assert V.emb_cache_attach(_sched(), r)
+    assert torch.equal(r.multimodal_inputs.mm_items[0].precomputed_embeddings, _rows_for(r)[0])
+    r.multimodal_inputs.mm_items[0].precomputed_embeddings.mul_(-1.0)  # a request mutates the rows it got
+    r5 = _req(rid="r5", featureless=True, ends=(5000,))
+    assert V.emb_cache_attach(_sched(), r5)
+    assert torch.equal(r5.multimodal_inputs.mm_items[0].precomputed_embeddings, _rows_for(r5)[0])
+    monkeypatch.setenv(V.VISION_EMB_CACHE_ENV, "0")
+    r4 = _req(rid="r4", featureless=True, ends=(5000,))
+    assert V.emb_cache_attach(_sched(), r4) is False
+
+
+def test_emb_cache_miss_still_fetches_and_the_stage_keeps_the_rows(fresh_emb_cache):
+    r = _req(rid="m", featureless=True, ends=(72214,))
+    s = _sched(told={"m": 0}, wq=[r])
+    assert V.skip_cached(s, [r]) == ([], [r]) and len(s.ipc_channels.send_to_tokenizer.sent) == 1
+    src = inspect.getsource(V)
+    assert src.count("emb_cache_store(items)") == 1 and src.count("emb_cache_store(st.items)") == 1
