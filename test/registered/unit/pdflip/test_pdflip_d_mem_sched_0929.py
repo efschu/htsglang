@@ -272,9 +272,11 @@ def test_tick_grows_the_stage_for_the_queue_head(tick_env):
     assert st.changed and st.stage > 0
     phase = getattr(sched, dsv.PHASE_ATTR)
     assert phase.stage == st.stage and phase.stage_tokens == grid[st.stage]
-    # growth asks no floor collective; the one vote is the reserve agreement
-    # over the queued head (y6h 10011531, rank-local new_token_ratio)
-    assert caps == [grid[st.stage]] and [len(v) for v in votes] == [1] and votes[0][0] < 0
+    # growth asks no floor collective; the votes are the reserve agreement over
+    # the queued head (y6h 10011531, rank-local new_token_ratio) and S77-B's room
+    # verdict before any rank maps the grown KV (this rank: no pages -> yes)
+    assert caps == [grid[st.stage]] and [len(v) for v in votes] == [1, 1] and votes[0][0] < 0
+    assert votes[1] == [1]
 
 
 def test_tick_shrinks_in_the_next_round_after_a_finish(tick_env):
@@ -285,7 +287,8 @@ def test_tick_shrinks_in_the_next_round_after_a_finish(tick_env):
     sched.running_batch.reqs = [_req("a", 200_000)]    # b finished
     st = dsv.runtime_tick(sched)
     assert st.changed and getattr(sched, dsv.PHASE_ATTR).stage < hi
-    assert len(votes) == 1                              # one floor vote, only here
+    # the grow's S77-B room verdict, then one floor vote, only here
+    assert votes[0] == [1] and len(votes) == 2
     ms = getattr(sched, dsv.MEM_SCHED_ATTR)
     assert ms.counters["stage_down_on_end"] == 1
 

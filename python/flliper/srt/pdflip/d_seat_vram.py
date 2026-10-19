@@ -96,6 +96,87 @@ class PdFlipDSeatVramNoMemory(PdFlipDSeatVramRefused):
 TMS_RC_OUT_OF_MEMORY = 2
 
 
+#: S77-B: one line per rank whenever a live KV grow found the card short
+GROW_ROOM_MARK = "PDFLIP D-SEAT-VRAM GROW-ROOM"
+
+
+def _fresh_bytes(prev, spans, mapped: int) -> int:
+    """Bytes ``set_spans(spans, now=True)`` maps fresh over the extents ``prev``: the
+    new plan's ranges minus the extents it keeps. ``prev`` unknown: the mapped bytes
+    count as kept (never below zero)."""
+    want = span_bytes(spans)
+    if prev is None:
+        return max(0, want - int(mapped))
+    kept = [e for e in prev if any(lo <= e[0] and e[1] <= hi for lo, hi in spans)]
+    return max(0, want - span_bytes(kept))
+
+
+def _released_bytes(prev, spans, mapped: int) -> int:
+    """Bytes a live ``set_spans(spans)`` gives back: the extents of ``prev`` that lie
+    wholly inside no range of the new plan."""
+    if prev is None:
+        return max(0, int(mapped) - span_bytes(spans))
+    return span_bytes([e for e in prev if not any(lo <= e[0] and e[1] <= hi for lo, hi in spans)])
+
+
+@dataclass
+class GrowRoom:
+    """S77-B: one rank's measured answer for a live KV grow (bytes)."""
+
+    ok: bool
+    need: int
+    free_before: int
+    free_after: int
+    trimmed: int
+    rows_from: int
+    rows_cell: int
+    rows_to: Optional[int]
+    release_all: int
+
+    def line(self, *, n: int, stage: int) -> str:
+        return ("%s n=%d stage=S%d need_mib=%.1f free_mib=%.1f trimmed_mib=%.1f free_after_mib=%.1f "
+                "rows_on=%d cell_rows=%d rows_to=%s release_all_mib=%.1f verdict=%s (the KV the cell "
+                "books is mapped into MEASURED bytes: the cache trimmed first, then this rank's own "
+                "expert rows OFF; short = no rank moves, the admission waits)"
+                % (GROW_ROOM_MARK, n, stage, self.need / _MIB, self.free_before / _MIB,
+                   self.trimmed / _MIB, self.free_after / _MIB, self.rows_from, self.rows_cell,
+                   "-" if self.rows_to is None else self.rows_to, self.release_all / _MIB,
+                   "ok" if self.ok else "short"))
+
+
+class CardRoom:
+    """S77-B: the card as the CUDA driver reports it (``cudaMemGetInfo``) and the
+    caching allocator's trim (synchronize + empty_cache, as PDFLIP-EXTEND-CACHE-TRIM).
+    ``free`` is None without an initialised CUDA context (CPU tests, P): nothing is
+    measured then and the grow keeps its plan."""
+
+    def free(self) -> Optional[int]:
+        try:
+            import torch
+
+            if not torch.cuda.is_available() or not torch.cuda.is_initialized():
+                return None
+            return int(torch.cuda.mem_get_info()[0])
+        except Exception:  # noqa: BLE001 -- an unreadable card is "not measured"
+            return None
+
+    def trim(self) -> int:
+        import torch
+
+        try:
+            if torch.cuda.is_current_stream_capturing():
+                return 0
+        except Exception:  # noqa: BLE001
+            pass
+        r0 = int(torch.cuda.memory_reserved())
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        return max(0, r0 - int(torch.cuda.memory_reserved()))
+
+
+_CARD = CardRoom()
+
+
 class PdFlipDSeatVramWipe(PdFlipDSeatVramRefused):
     """W-SEAT-WIPE: a live span plan would release an extent holding bytes it
     keeps. Never swallowed into "no controller on this rank" (``controller``):
@@ -1614,6 +1695,123 @@ class SeatVram:
 
         n = max(1, min(int(n), self.cap))
         j = max(0, min(int(stage), len(self.form.tokens) - 1))
+        cell, k, keep, notes, infos = self._stage_rows(n, j)
+        tokens = int(self.form.tokens[j])
+        # S77-B (NF rc17 1019_171636, D TP0 18:07:42Z): a live KV grow maps its
+        # pages only into bytes the card HAS -- measured, the allocator cache
+        # trimmed, this rank's own expert rows released first if still short
+        room = self.grow_room(n, j, k=k)
+        if room is not None:
+            if not room.ok:
+                raise PdFlipDSeatVramNoMemory(
+                    "%s %s: S%d at n=%d maps %d KV bytes fresh; the card has %d free after "
+                    "the cache trim and the rows ON down to 0 release %d -- refused before "
+                    "anything moved" % (LINE_MARK, GROW_ROOM_MARK, j, n, room.need,
+                                        room.free_after, room.release_all))
+            if room.rows_to is not None and room.rows_to < k:
+                notes.append("GROW-ROOM: rows %d -> %d pay the KV the card did not have"
+                             % (k, room.rows_to))
+                k = int(room.rows_to)
+        return self._apply_stage_rows(n, j, cell, k, keep, notes, infos, tokens)
+
+    def kv_map_bytes(self, tokens: int) -> int:
+        """S77-B: the bytes a LIVE KV move to ``tokens`` maps FRESH -- every range of
+        the new plan minus the extents it keeps (``set_plan``'s census rule: an extent
+        is kept only wholly inside one range). Paused tensors map at their resume."""
+        total = 0
+        for m in self.kv_tensors:
+            info = self.spans.info(m.ptr)
+            if info is None or not info.active:
+                continue
+            total += _fresh_bytes(self.spans_by_ptr.get(int(m.ptr)), self.kv_spans(m, tokens),
+                                  int(info.mapped))
+        return int(total)
+
+    def bank_release_bytes(self, k: int) -> int:
+        """S77-B: the bytes a LIVE bank gives back going from its mapped rows to ``k``
+        rows ON (whole lattice cells above the new end; a paused bank gives none)."""
+        total = 0
+        for m in self.row_tensors:
+            info = self.spans.info(m.ptr)
+            if info is None or not info.active:
+                continue
+            total += _released_bytes(self.spans_by_ptr.get(int(m.ptr)), self.bank_spans(m, k),
+                                     int(info.mapped))
+        return int(total)
+
+    def _bank_straddles(self, k: int) -> bool:
+        """``refuse_wipes``' rule for a live bank going to ``k`` rows ON."""
+        for m in self.row_tensors:
+            info = self.spans.info(m.ptr)
+            prev = self.spans_by_ptr.get(int(m.ptr))
+            if info is None or not info.active or prev is None:
+                continue
+            if straddling(prev, self.bank_spans(m, k)) is not None:
+                return True
+        return False
+
+    def grow_room(self, n: int, j: int, *, k: Optional[int] = None,
+                  card: Optional["CardRoom"] = None) -> Optional["GrowRoom"]:
+        """S77-B: can THIS rank map the live KV of stage ``j`` at ``n`` seats -- measured?
+
+        NF rc17 1019_171636 D TP0 18:07:42Z: S8 -> S9 mid D-prefill, the 5090's cell
+        books the same 6 rows at S8 and S9 (its slack pays the KV), so ``apply_stage``
+        mapped KV FIRST (``order=kv-first``) -- into a card whose free bytes the last
+        chunk's transient still sat on in the caching allocator (``PDFLIP-VRAM-PEAK
+        ... reserved 32980 allocated 30126 card_free_mib=109``; the extend trim runs
+        only BEFORE the next chunk). The draft k0 (~68 MiB) mapped, v0 did not:
+        ``tms_set_spans(v0, now=True) rc=2`` -> rank dead, TP1/TP2 (bank-first,
+        applied) dead in the next collective. The cell table is the PLAN; the card
+        is measured here: ``need`` = the bytes the KV maps fresh, ``free`` =
+        ``cudaMemGetInfo``; short -> the allocator cache is trimmed (synchronize +
+        empty_cache, the extend trim's own move) and measured again; still short ->
+        this rank's own expert rows go OFF first (elastic by law: the KV is demand,
+        the rows step aside), the largest k' whose released cells pay the rest.
+        ``ok=False`` only when even all rows OFF cannot pay -- a real wall, which
+        the runtime tick turns into a GROUP refusal before any rank moves.
+        None when nothing is measured (no live KV grows, or no CUDA card)."""
+        n = max(1, min(int(n), self.cap))
+        j = max(0, min(int(j), len(self.form.tokens) - 1))
+        if k is None:
+            _cell, k, _keep, _notes, _infos = self._stage_rows(n, j)
+        k = int(k)
+        need = self.kv_map_bytes(int(self.form.tokens[j]))
+        if need <= 0:
+            return None
+        card = _CARD if card is None else card
+        free0 = card.free()
+        if free0 is None:
+            return None
+        start = min(k, int(self.rows_on))
+        rel = self.bank_release_bytes(start) if start < int(self.rows_on) else 0
+        trimmed = 0
+        free1 = int(free0)
+        if free1 + rel < need:
+            trimmed = int(card.trim() or 0)
+            f = card.free()
+            free1 = int(free0) if f is None else int(f)
+        rows_to = None
+        ok = free1 + rel >= need
+        if not ok:
+            # only a k on the rows' lattice (S1-Wisch: a live shrink releases whole
+            # cells and never straddles a kept extent) -- the largest that pays
+            for kk in sorted((c for c in self.row_cut_ks if 0 <= c < start), reverse=True):
+                if self._bank_straddles(kk):
+                    continue
+                if free1 + self.bank_release_bytes(kk) >= need:
+                    rows_to, ok = int(kk), True
+                    break
+        release_all = self.bank_release_bytes(0)
+        room = GrowRoom(ok=bool(ok), need=int(need), free_before=int(free0), free_after=int(free1),
+                        trimmed=int(trimmed), rows_from=int(self.rows_on), rows_cell=k,
+                        rows_to=rows_to, release_all=int(release_all))
+        if trimmed or rows_to is not None or not ok:
+            logger.info(room.line(n=n, stage=j))
+        return room
+
+    def _stage_rows(self, n: int, j: int):
+        """The expert rows ON and the GDN keep of the cell (n, j) as ``apply_stage``
+        books them beside a LIVE GDN pool -- (cell, k, keep, notes, infos)."""
         cell = self.cells[(n, j)]
         notes = []
         k, keep = int(cell.extra_rows), int(cell.mamba_keep)
@@ -1648,10 +1846,15 @@ class SeatVram:
                     "pool must already be paused" % (LINE_MARK, j, n))
             notes.append("the Mamba pool is mapped (live): it keeps its cap form")
             k, keep = int(cell.rows_full), self.pool_size + 1
+        return cell, k, keep, notes, infos
+
+    def _apply_stage_rows(self, n: int, j: int, cell, k: int, keep: int, notes, infos,
+                          tokens: int) -> "PhaseApplied":
+        import torch
+
         experts_live = any(
             (lambda i: i is not None and i.active)(self.spans.info(m.ptr))
             for m in self.row_tensors)
-        tokens = int(self.form.tokens[j])
         kv_plans = []
         for m in self.kv_tensors:
             info = self.spans.info(m.ptr)
@@ -2936,6 +3139,32 @@ def cap_lift_after_seat_move(sched) -> None:
     return None
 
 
+def _grow_room_refused(sched, ctl, n: int, stage: int) -> Optional[str]:
+    """S77-B: the GROUP verdict on a KV grow, before any rank moves (MIN over the
+    ranks, one collective). Entered on every rank alike: the grow itself is
+    replicated (MemSched), a rank without a controller or without a measured card
+    answers yes. Each rank's own answer is ``SeatVram.grow_room`` -- measured
+    bytes, the cache trimmed, its own rows OFF counted in. None = grow; else why not."""
+    room = None
+    if ctl is not None and getattr(ctl, "cells", None):
+        try:
+            room = ctl.grow_room(n, stage)
+        except PdFlipDSeatVramRefused as exc:
+            room = None
+            logger.warning("%s n=%d stage=S%d not measured: %s", GROW_ROOM_MARK, n, stage, exc)
+    ok = 1 if (room is None or room.ok) else 0
+    gmin = getattr(sched, "_pdflip_group_min_ints", None)
+    group = ok if gmin is None else int(gmin([ok])[0])
+    if group:
+        return None
+    if room is not None and not room.ok:
+        return ("grow to S%d refused: this rank maps %.1f MiB fresh, has %.1f MiB after the cache "
+                "trim and %.1f MiB with every expert row OFF -- no rank moves, the admission waits"
+                % (stage, room.need / _MIB, room.free_after / _MIB,
+                   (room.free_after + room.release_all) / _MIB))
+    return "grow to S%d refused: a peer rank has no room for its KV -- no rank moves" % stage
+
+
 def runtime_tick(sched):
     """Once per scheduler iteration of an AWAKE D (after the write-through
     acks are flushed): the KV stage follows the global demand between wakes
@@ -3058,10 +3287,24 @@ def runtime_tick(sched):
                 "-" if ms.pending is None else ms.pending, ms.stage, used, incoming,
                 floor, step.reason)
         return step
+    ctl = controller(sched)
+    if ms.stage > before:
+        # S77-B: a grow moves no rank until EVERY rank measured the room for it
+        refused = _grow_room_refused(sched, ctl, n, ms.stage)
+        if refused is not None:
+            ms.stage = before
+            ms.counters["stage_up_refused_room"] = ms.counters.get("stage_up_refused_room", 0) + 1
+            if alloc is not None:
+                _engage_kv_cap(alloc, tokens[before], page)
+            logger.warning("%s %s from=S%d to=S%d used=%d incoming=%d refused=%d -- %s",
+                           ms.line(), GROW_ROOM_MARK, before, before + (step.stage - before),
+                           used, incoming, ms.counters["stage_up_refused_room"], refused)
+            from flliper.srt.pdflip.d_mem_sched import StageStep
+
+            return StageStep(before, tokens[before], False, True, refused)
     if alloc is not None:
         _engage_kv_cap(alloc, tokens[ms.pending if (ms.pending is not None and not lifted)
                                      else ms.stage], page)
-    ctl = controller(sched)
     applied = ctl.apply_stage(n, ms.stage) if (ctl is not None and ctl.cells) else None
     st.stage, st.stage_tokens = ms.stage, tokens[ms.stage]
     if ms.stage > before:
