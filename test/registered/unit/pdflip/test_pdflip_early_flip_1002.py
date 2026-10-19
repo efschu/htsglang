@@ -1,7 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-"""EARLY-FLIP (02.10.): with D idle, a request whose chars/3 price is far over X
-begins the D->P flip at once; drain + D quiesce run beside the exact count and
-the store probe, and the flip awaits the verdict before its first sleep RPC.
+"""EARLY-FLIP (02.10.): with D idle, a request whose price is far over X
+begins the D->P flip at once; drain + D quiesce run beside the rest of the
+arrival, and the flip awaits the verdict before its first sleep RPC.
+
+S63 (user 19.10. "warum wird irgendwas geschätzt?"): the begin rests on the
+EXACT price (D's probe + the store, or the front's exact count), never on the
+chars/3 figure -- a SHORT whose chars/3 figure was 3X no longer starts a D
+quiesce (that flushed D's radix for nothing), and a LONG whose chars/3 figure
+was under the factor no longer misses the early begin.
 
 Binding flip time (user 02.10.): last D token -> first P chunk; every ms before
 the begin counts. N6d (..._ec4d492f58_1002_170955): arrival -> verdict 194-224
@@ -151,53 +157,87 @@ def test_red_long_the_flip_runs_beside_the_pricing_and_completes(caplog, monkeyp
     assert any(m.startswith("PDFLIP-EARLY-FLIP begin") for m in msgs), msgs
     flush = [c for c in f.calls if c[0] == "D" and c[1] == "/flush_cache"]
     assert flush, f.calls
-    begin_rec = [r for r in caplog.records if r.getMessage().startswith("PDFLIP-FLIP begin")][0]
-    assert begin_rec.created < _verdict_t(caplog), "the flip began only after the verdict"
+    begin_rec = [r for r in caplog.records if r.getMessage().startswith("PDFLIP-EARLY-FLIP begin")][0]
+    assert begin_rec.created <= _verdict_t(caplog), "the flip began only after the verdict"
+    assert "price=exact" in begin_rec.getMessage() and "est_uncached=%d" % (3 * X) in begin_rec.getMessage()
     assert f.awake == "P" and f.epoch == epoch0 + 1 and f.stops == []
     go = [m for m in msgs if m.startswith("PDFLIP-EARLY-FLIP go")]
-    assert go and int(go[0].split("saved_ms=")[1].split()[0]) > 0, go
+    # S63: the begin waits for the exact price, so the head start is the rest of the arrival only -- in this
+    # harness the verdict even precedes the flip task's first step (saved_ms <= 0 is reported as measured)
+    assert go and isinstance(int(go[0].split("saved_ms=")[1].split()[0]), int), go
     assert [p.rid for p in f.queue] == [f.p_legs[0]], (f.p_legs, [p.rid for p in f.queue])
     assert f.counters["early_flip_go"] == 1 and f.counters["early_flip_abort"] == 0
-    assert any("LEG1-EARLY" in m and "EARLY-FLIP go" in m for m in msgs), msgs
+    # S63: the trigger is queued before the flip task's first step, so its leg 1 goes out at the flip's begin
+    # (DP-NACHLAUF at the go only for a trigger queued after the begin)
+    assert any(m.startswith("PDFLIP LEG1-EARLY rid=%s" % f.p_legs[0]) for m in msgs), msgs
 
 
-def test_short_aborts_d_serves_the_state_is_clean_and_p_sees_nothing(caplog, monkeypatch):
+def test_s63_a_short_by_the_exact_count_never_begins_d_serves_and_d_keeps_its_radix(caplog, monkeypatch):
+    """S63: chars/3 says 3X, the EXACT count 3000 <= X -> no early begin at all: no D quiesce (/flush_cache would
+    flush D's radix for a SHORT), D serves it at once, nothing goes to P."""
     monkeypatch.setenv(F.LEG1_EARLY_ENV, "1")
-    f = _front({"big": (3000, 0.15)})           # chars/3 says 3X, the exact count 3000 <= X
+    f = _front({"big": (3000, 0.15)})
     epoch0 = f.epoch
     with caplog.at_level(logging.INFO, logger="pdflip.front"):
         asyncio.run(_run(f, BIG))
     msgs = [r.getMessage() for r in caplog.records]
-    assert any(m.startswith("PDFLIP-EARLY-FLIP abort") and "why=verdict-not-long" in m for m in msgs), msgs
+    assert not [m for m in msgs if "PDFLIP-EARLY-FLIP" in m], msgs
+    assert f.calls == [], f.calls                    # no /flush_cache, no sleep RPC
     assert f.awake == "D" and f.state == "serving" and f.epoch == epoch0
-    assert f.counters["early_flip_abort"] == 1 and f.counters["early_flip_go"] == 0
-    # D served the SHORT, awake and serving at its leg 2
+    assert f.counters["early_flip_begin"] == 0
     assert len(f.d_legs) == 1 and f.d_legs[0][1:3] == ("D", "serving"), f.d_legs
-    # nothing slept, nothing went to P: no sleep RPC, no LEG1-EARLY
-    assert not [c for c in f.calls if c[1] in ("/release_memory_occupation", "/resume_memory_occupation")]
     assert not [c for c in f.calls if c[0] == "P"] and f.p_legs == []
-    assert f.queue == [] or len(f.queue) == 0
-    # the flip's bookkeeping is closed
-    assert getattr(f, "_flip_dst", None) is None and f._flip_t0 is None and f._flip_stage == "none"
-    assert not getattr(f, "_flip_open", False) and f.__dict__.get("_early_flip_open") is None
-    snap = F.Front._flip_phase(f).snap
-    assert snap["phase"] is None and str(snap["last"]["aborted"]).startswith("early-flip"), snap
 
 
-def test_rank_agreement_the_abort_waits_for_the_group_quiesce(caplog):
-    """The verdict lands while D's quiesce (/flush_cache, one GROUP verdict over
-    every rank, #1268) is still in flight: the abort comes only after it
-    answered, and no group ever receives a sleep RPC -- no rank of D is left
-    in a different state than the others."""
-    f = _front({"big": (3000, 0.02)}, flush_delay=0.3)
+def test_s63_a_long_by_the_exact_count_begins_although_chars3_was_under_the_factor(caplog, monkeypatch):
+    """S63: chars/3 ~ 1.0X (under the 2X factor), the EXACT count 3X -> the early begin happens (chars/3 missed it)."""
+    monkeypatch.setenv(F.LEG1_EARLY_ENV, "1")
+    f = _front({"mid": (3 * X, 0.05)})
     with caplog.at_level(logging.INFO, logger="pdflip.front"):
+        asyncio.run(_run(f, _payload("mid", 3 * X + 300)))
+    msgs = [r.getMessage() for r in caplog.records]
+    begin = [m for m in msgs if m.startswith("PDFLIP-EARLY-FLIP begin")]
+    assert begin and "est_uncached=%d" % (3 * X) in begin[0] and "price=exact" in begin[0], msgs
+    assert f.counters["early_flip_go"] == 1 and f.awake == "P"
+
+
+def test_s63_no_exact_number_no_early_begin(caplog):
+    """S63: the count times out (chars/3 fallback) -> nothing begins on the estimate; the verdict starts the flip."""
+    f = _front({"big": (3 * X, 0.4)})
+    with envs.FLLIPER_PDFLIP_FRONT_EXACT_TIMEOUT_MS.override(100), \
+            caplog.at_level(logging.INFO, logger="pdflip.front"):
         asyncio.run(_run(f, BIG, settle=1.0))
+    assert f.counters["early_flip_begin"] == 0, [r.getMessage() for r in caplog.records]
+
+
+def test_rank_agreement_the_abort_waits_for_the_group_quiesce(caplog, monkeypatch):
+    """A not-LONG verdict lands while D's quiesce (/flush_cache, one GROUP verdict over every rank, #1268) is still
+    in flight: the abort comes only after it answered, and no group ever receives a sleep RPC -- no rank of D is
+    left in a different state than the others. (S63: the begin follows the exact price, so the verdict is driven
+    here directly on the begun flip.)"""
+    f = _front({"big": (3 * X, 0.02)}, flush_delay=0.3)
+    t_abort = []
+    real_abort = F.Front._early_flip_abort
+
+    def abort(self, h, src, dst):
+        t_abort.append(time.monotonic())
+        return real_abort(self, h, src, dst)
+
+    monkeypatch.setattr(F.Front, "_early_flip_abort", abort)
+
+    async def go():
+        h = F.Front._early_flip_maybe(f, "pdflip-0-9", 3 * X)
+        assert h is not None
+        await asyncio.sleep(0.06)
+        await F.Front._early_flip_verdict(f, h, "short", "pdflip-0-9")
+
+    with caplog.at_level(logging.INFO, logger="pdflip.front"):
+        asyncio.run(go())
     paths = [(g, p) for g, p, _ in f.calls]
     assert paths == [("D", "/flush_cache")], paths
-    abort = [r for r in caplog.records if r.getMessage().startswith("PDFLIP-EARLY-FLIP abort")][0]
     flush_t = [t for g, p, t in f.calls if p == "/flush_cache"][0]
-    assert abort.relativeCreated / 1000.0 >= 0  # logged
-    assert f.d_legs and f.d_legs[0][3] >= flush_t + 0.3 - 0.02, "the SHORT was routed before D's quiesce answered"
+    assert t_abort and t_abort[0] >= flush_t + 0.3 - 0.02, "the abort came before D's quiesce answered"
+    assert f.awake == "D" and f.state == "serving" and f.counters["early_flip_abort"] == 1
 
 
 def test_switch_off_no_early_begin(caplog):
@@ -213,13 +253,32 @@ def test_only_d_idle_and_only_far_over_x():
     f.groups["D"].outstanding["decoding"] = time.time()
     asyncio.run(_run(f, BIG, settle=0.3))
     assert f.counters["early_flip_begin"] == 0 and not f.calls
-    g = _front({"mid": (3 * X, 0.05)})
-    asyncio.run(_run(g, _payload("mid", 3 * X + 300), settle=0.3))   # chars/3 ~ 1.0X < 2X
-    assert g.counters["early_flip_begin"] == 0 and not g.calls
+    g = _front({"mid": (int(1.5 * X), 0.05)})
+    asyncio.run(_run(g, BIG, settle=0.3))   # S63: the EXACT count 1.5X < 2X decides (chars/3 says 3X)
+    assert g.counters["early_flip_begin"] == 0 and not [c for c in g.calls if c[1] == "/flush_cache"]
 
 
-def test_a_client_gone_before_the_verdict_aborts():
+def test_a_client_gone_before_the_exact_price_begins_nothing():
+    """S63: the client leaves during the count -- no exact price, so no early begin and no D quiesce at all."""
     f = _front({"big": (3 * X, 0.4)})
     asyncio.run(_run(f, BIG, settle=0.8, cancel_after=0.1))
+    assert f.counters["early_flip_begin"] == 0 and f.awake == "D" and f.state == "serving"
+    assert not [c for c in f.calls if c[1] in ("/flush_cache", "/release_memory_occupation")]
+
+
+def test_a_client_gone_after_the_begin_aborts():
+    """The handler ends after the begin and before its verdict (the done-callback resolves the gate False)."""
+    f = _front({"big": (3 * X, 0.02)}, flush_delay=0.2)
+
+    async def go():
+        async def handler():
+            h = F.Front._early_flip_maybe(f, "pdflip-0-8", 3 * X)
+            assert h is not None
+            return h
+
+        h = await asyncio.ensure_future(handler())   # the handler task ends: no verdict
+        await asyncio.gather(h.task, return_exceptions=True)
+
+    asyncio.run(go())
     assert f.counters["early_flip_abort"] == 1 and f.awake == "D" and f.state == "serving"
     assert not [c for c in f.calls if c[1] == "/release_memory_occupation"]

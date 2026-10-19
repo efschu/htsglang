@@ -1528,7 +1528,19 @@ async def pdflip_match_probe(raw_request: Request):
         tm.auto_create_handle_loop()
         tokenized = await tm._tokenize_one_request(obj)
         mm = tokenized.mm_inputs
-        if mm is not None:
+        t_tok = (_time.perf_counter() - t0) * 1000.0
+        _sched_mm = None
+        _ta = getattr(tm, "pdflip_tok_ahead", None)
+        if mm is not None and _ta is not None:
+            # S63 F2 TOK-AHEAD: the D leg of this rid takes THIS tokenization (identity checked by digest); the
+            # scheduler gets feature-less copies of the items, the originals stay whole for the leg
+            from flliper.srt.pdflip import tok_ahead as _tah
+
+            _sched_mm = _tah.scheduler_copy_without_features(mm)
+            if _sched_mm is not None:
+                _ta.put(obj.rid, _tah.obj_digest(obj), list(tokenized.input_ids or ()), mm,
+                        tokenized.token_type_ids, t_tok, "d_probe")
+        if mm is not None and _sched_mm is None:
             # the scheduler needs each item's pad value and offsets, never its pixels (a probe carries no feature)
             for item in getattr(mm, "mm_items", None) or ():
                 try:
@@ -1536,11 +1548,11 @@ async def pdflip_match_probe(raw_request: Request):
                     item.feature = None
                 except Exception:  # noqa: BLE001 -- the scheduler hashes it then, as for a leg
                     pass
-        t_tok = (_time.perf_counter() - t0) * 1000.0
+            _sched_mm = mm
         req = PdFlipMatchProbeReqInput(
             rid=str(tokenized.rid),
             input_ids=_array_q(tokenized.input_ids),
-            mm_inputs=mm,
+            mm_inputs=_sched_mm,
             extra_key=getattr(tokenized, "extra_key", None),
             tokenize_ms=t_tok,
         )
@@ -1567,12 +1579,74 @@ async def pdflip_match_probe(raw_request: Request):
             "host_tokens": int(out.host_tokens),
             "key_match_depth": int(out.key_match_depth),
             "mm_spans": [list(x) for x in (out.mm_spans or ())],
+            # S63 F1: D's namespace of this prompt -- with D's ids the admission key, so the front's re-probe at the
+            # set verdict asks the tree again without a second tokenization here
+            "extra_key": getattr(tokenized, "extra_key", None),
             "tokenize_ms": float(out.tokenize_ms),
             "handle_ms": float(out.handle_ms),
             "total_ms": (_time.perf_counter() - t0) * 1000.0,
         },
         status_code=200,
     )
+
+
+@app.api_route("/pdflip/tokenize_ahead", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def pdflip_tokenize_ahead(raw_request: Request):
+    """S63 F2 TOK-AHEAD (pdflip/tok_ahead.py): the Weg-2 front posts a media prompt that can reach this group while
+    the group is dormant (body {"path", "payload"}, the leg's own body); this tokenizer process -- awake while the
+    group's weights sleep -- runs the chat template and the image processor NOW, and the group's leg of the same rid
+    takes the result (identity checked by digest). No scheduler call. 200 {"success", "n", "tokenize_ms"} or
+    {"success": false, "message"}."""
+    import time as _time
+
+    from flliper.srt.pdflip import d_match_probe as _dmp
+    from flliper.srt.pdflip import tok_ahead as _tah
+
+    t0 = _time.perf_counter()
+    tm = _global_state.tokenizer_manager
+    ta = getattr(tm, "pdflip_tok_ahead", None)
+    if ta is None:
+        return ORJSONResponse({"success": False, "message": "tok-ahead off"}, status_code=200)
+    try:
+        from flliper.srt.pdflip import vision_stage_service as _vss
+
+        if _vss.installed() is not None:
+            # a tokenizer-side tower would run on a card now, while the group sleeps -- never ahead of the flip
+            return ORJSONResponse({"success": False, "message": "tokenizer-side vision stage: no ahead"},
+                                  status_code=200)
+    except ImportError:
+        pass
+    try:
+        obj = await _dmp.build_probe_obj(
+            await raw_request.json(),
+            serving_chat=raw_request.app.state.openai_serving_chat,
+            serving_anthropic=raw_request.app.state.anthropic_serving,
+            raw_request=raw_request,
+        )
+    except Exception as e:
+        return ORJSONResponse({"success": False, "message": f"{type(e).__name__}: {str(e)[:300]}"}, status_code=200)
+    if obj is None or not obj.contains_mm_input():
+        return ORJSONResponse({"success": False, "message": "no media prompt: nothing ahead"}, status_code=200)
+    rid = _tah.leg_rid(obj.rid)
+    digest = _tah.obj_digest(obj)
+    if ta.begin(rid, digest) is None:
+        return ORJSONResponse({"success": True, "dup": True}, status_code=200)
+    done = False
+    try:
+        tm.auto_create_handle_loop()
+        tokenized = await tm._tokenize_one_request(obj)
+        ms = (_time.perf_counter() - t0) * 1000.0
+        ta.put(rid, digest, list(tokenized.input_ids or ()), tokenized.mm_inputs, tokenized.token_type_ids, ms,
+               "p_ahead")
+        done = True
+    except Exception as e:
+        return ORJSONResponse({"success": False, "message": f"{type(e).__name__}: {str(e)[:300]}"}, status_code=200)
+    finally:
+        if not done:
+            ta.fail(rid)  # a leg waiting for it tokenizes itself, none hangs
+    return ORJSONResponse({"success": True, "n": len(tokenized.input_ids or ()), "tokenize_ms": ms},
+                          status_code=200)
 
 
 def _array_q(ids):
