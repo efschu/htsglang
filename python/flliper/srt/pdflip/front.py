@@ -18151,13 +18151,13 @@ class Front:
                     lane_take_wait=((lambda: _lctl.take_wait(self)) if _lctl.enabled() else None),
                     # PRIO-AS-AGE 1014: P takes its legs in the order key (priority desc, arrival asc)
                     pick=((lambda q, pred: Front._prio_pick(self, q, pred)) if _prio_age.enabled() else None),
+                    # S53 L2-READ-AHEAD: the head the pool plan holds is read L3 -> L2 on P meanwhile
+                    on_pool_hold=((lambda p: Front._maybe_l2_read_ahead(self, p))
+                                  if _l2ra.enabled() else None),
                     # FLIPCYCLE H5: the phase cap never strands a SHORT
                     # DOUBLE-FLIP 1015: nor a request that needs P (the park's own reader), switch-independent;
                     # SEAT-AT-HAND-OFF: no seat cap on this phase, so no seat condition on the exemption either
-                    cap_exempt=Front._p_phase_cap_exempt_pred(self),
-                    # S53 L2-READ-AHEAD: the head the pool plan holds is read L3 -> L2 on P meanwhile
-                    on_pool_hold=((lambda p: Front._maybe_l2_read_ahead(self, p))
-                                  if _l2ra.enabled() else None))
+                    cap_exempt=Front._p_phase_cap_exempt_pred(self))
                 # K9 P-DRAIN-EARLY-SETTLE: the early legs P is prefilling anyway are settled here, in "serving",
                 # not in the P->D flip's drain under the flip-stall bound (h16r 11:52:25Z death, 11:26:01Z hang)
                 if p_drain_early_settle_enabled() and self.state == "serving":

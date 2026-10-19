@@ -158,7 +158,7 @@ def test_the_drain_call_site_wires_the_hook_behind_the_switch():
 
     src = inspect.getsource(front)
     assert "on_pool_hold=((lambda p: Front._maybe_l2_read_ahead(self, p))" in src
-    assert "if _l2ra.enabled() else None))" in src
+    assert "if _l2ra.enabled() else None)," in src
 
 
 # ============================================================================ P: the hint and the scheduler
