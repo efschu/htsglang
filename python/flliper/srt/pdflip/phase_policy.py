@@ -114,6 +114,65 @@ def p_overlap_admits(inflight_tokens: int, inflight_n: int, next_cost: int,
     return int(inflight_tokens) + int(next_cost) <= int(pool_tokens)
 
 
+#: S55 P-POOL-FROM-P: the front's overlap budget is P's REALISED KV pool, read once off P's own
+#: ``/get_server_info`` (``max_total_num_tokens``: the scheduler handshake's value, min-reduced across
+#: P's PP ranks -- ``KV token sizing ... min-reduced across ranks to N``). One reading, made by the
+#: front; the ranks get dispatches as before (SOLL R11). ``FLLIPER_PDFLIP_P_POOL_FROM_P=0`` = the
+#: configured value alone, byte-identical to rc14.
+P_POOL_SRC_REALISED = "p_realised"
+P_POOL_SRC_WRITTEN = "written"
+P_POOL_SRC_CLAMPED = "written_clamped"
+P_POOL_SRC_CONFIGURED = "configured"
+P_POOL_SRC_OFF = "off"
+
+
+def p_pool_realised(info) -> Optional[int]:
+    """P's realised KV pool in tokens from a ``/get_server_info`` body, else None.
+
+    Only the top-level ``max_total_num_tokens`` counts: that is the scheduler's handshake
+    value (``Scheduler.get_init_info``), i.e. the pool P actually allocated after the
+    cross-rank min-reduce. ``max_total_tokens`` is the ARGV cap (a profile pin) and is never
+    read here -- a pin above P's own sizing would plan an overlap P cannot hold. A list body
+    (one entry per DP rank) reads its first entry. Anything not a positive int is None."""
+    if isinstance(info, list):
+        info = info[0] if info else None
+    if not isinstance(info, dict):
+        return None
+    raw = info.get("max_total_num_tokens")
+    if isinstance(raw, bool):
+        return None
+    try:
+        v = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return v if v > 0 else None
+
+
+def resolve_p_pool_tokens(configured: int, written: bool,
+                          realised: Optional[int]) -> Tuple[int, str]:
+    """The overlap budget the front plans against, and why (S55).
+
+    * ``configured <= 0`` -- the rule is OFF (qwen27b, ``--p-pool-tokens 0``): stays 0.
+    * P not read yet -- the configured value (rc14 behaviour).
+    * not written (the H91 standard-form default) -- P's realised pool: the overlap goes
+      "je nachdem wie viel vram context zur verfuegung steht" (user 25.09., H91 design).
+    * written -- the operator's value, but NEVER above P's realised pool: a plan above it
+      dispatches a leg 1 whose pages P cannot hold (it waits in P's queue, its store read
+      fights the running request for room).
+    """
+    c = max(0, int(configured or 0))
+    if c <= 0:
+        return 0, P_POOL_SRC_OFF
+    if realised is None or int(realised) <= 0:
+        return c, P_POOL_SRC_CONFIGURED
+    r = int(realised)
+    if not written:
+        return r, P_POOL_SRC_REALISED
+    if c > r:
+        return r, P_POOL_SRC_CLAMPED
+    return c, P_POOL_SRC_WRITTEN
+
+
 def plan_p_overlap(costs: Sequence[int], pool_tokens: int, cap: int) -> int:
     """How many of the waiting requests (head first) P prefills at once.
 

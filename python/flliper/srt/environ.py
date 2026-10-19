@@ -2196,6 +2196,12 @@ class Envs:
     FLLIPER_PDFLIP_L2_READ_AHEAD = EnvBool(True)
     # S53: prefill tokens PP0 may still have left when the read-ahead starts (0 = two chunks, 2 * chunked_prefill_size)
     FLLIPER_PDFLIP_L2_READ_AHEAD_LEAD_TOKENS = EnvInt(0)
+    # S55 P-POOL-FROM-P (phase_policy.resolve_p_pool_tokens): the front's H91c overlap budget is P's REALISED KV pool,
+    # read once off P's /get_server_info (max_total_num_tokens, min-reduced across P's ranks) instead of the constant
+    # 262144 -- a written --p-pool-tokens is kept but clamped to it. With a P pool that holds two legs, PP0 starts the
+    # successor while PP1/PP2 finish the predecessor (rc14 epoch 1: 24.2 s output_commit drain). Front only.
+    # New feature -> default ON; 0 = the configured value alone, byte for byte.
+    FLLIPER_PDFLIP_P_POOL_FROM_P = EnvBool(True)
     # Prefix trace (IN 26.09., pdflip/prefix_trace.py): every prefix miss of an
     # agent-load boot gets a token receipt -- one #1420 WALK-STOP line per
     # (rid, stop depth) whose unmatched rest is >= the minimum below, full

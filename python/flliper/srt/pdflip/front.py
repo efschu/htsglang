@@ -4415,6 +4415,7 @@ class Front:
                  record_line: str = "",
                  p_phase_max_requests: int = 0,
                  p_pool_tokens: int = 0,
+                 p_pool_tokens_written: bool = True,
                  d_wait_bound_s: float = 0.0,
                  p_leg1_stall_s: float = 0.0,
                  d_park_immediate: bool = False,
@@ -4821,6 +4822,14 @@ class Front:
         self.p_phase_max_requests = max(0, int(p_phase_max_requests or 0))
         #: rule 1: P's unified pool the overlap is planned against (0 = off).
         self.p_pool_tokens = max(0, int(p_pool_tokens or 0))
+        #: S55 P-POOL-FROM-P: the value the launcher/profile resolved, whether it was WRITTEN (an
+        #: operator value, clamped to P's realised pool) or the standard-form default (replaced by
+        #: P's realised pool), and what P reported (None = not read yet).
+        self.p_pool_tokens_configured = self.p_pool_tokens
+        self.p_pool_tokens_written = bool(p_pool_tokens_written)
+        self.p_pool_realised: Optional[int] = None
+        self.p_pool_src = (phase_policy.P_POOL_SRC_CONFIGURED if self.p_pool_tokens > 0
+                           else phase_policy.P_POOL_SRC_OFF)
         #: rule 3: the D-phase wait bound in seconds (0 = off: the fairness
         #: switch --fairness-w-s acts in the D phase exactly as before).
         self.d_wait_bound_s = max(0.0, float(d_wait_bound_s or 0.0))
@@ -6247,6 +6256,8 @@ class Front:
         # PDFLIP MODE-PARITY (h16m 1014, N4): one priority mode on front, P and D
         # -- the front's own line now, the groups' read until both answered.
         app["mode_parity"] = asyncio.create_task(self._mode_parity_boot())
+        # S55 P-POOL-FROM-P: the H91c overlap budget follows P's realised KV pool (one read, then never again).
+        app["p_pool_from_p"] = asyncio.create_task(self._p_pool_boot())
         # H78: the same move for the flip path's small lazy imports (wake_credit
         # alone put ~5 ms into x175's first FLIP-ORDER) and for the sidecar the
         # sleep-leg gate reads at every flip (18-47 ms of JSON on the loop).
@@ -6483,6 +6494,59 @@ class Front:
         logger.error("%s", line)
         if stop_on:
             self.do_stop(_mp.STOP_NAME, line)
+
+    def _apply_p_pool_info(self, info) -> bool:
+        """S55 P-POOL-FROM-P: take P's realised KV pool off one ``/get_server_info`` body and
+        resolve the overlap budget (``phase_policy.resolve_p_pool_tokens``). False = the body
+        carries no usable reading (the budget is untouched). The front alone decides; the
+        drain reads ``self.p_pool_tokens`` at its next dispatch (SOLL R11)."""
+        realised = phase_policy.p_pool_realised(info)
+        if realised is None:
+            return False
+        before = self.p_pool_tokens
+        pool, src = phase_policy.resolve_p_pool_tokens(
+            self.p_pool_tokens_configured, self.p_pool_tokens_written, realised)
+        self.p_pool_realised = realised
+        self.p_pool_tokens = pool
+        self.p_pool_src = src
+        self.counters["p_pool_from_p_read"] += 1
+        if pool != before:
+            self.counters["p_pool_from_p_changed"] += 1
+        logger.info(
+            "PDFLIP P-POOL-FROM-P pool_tokens=%d (was %d) source=%s p_realised=%d configured=%d written=%d "
+            "-- S55: the H91c overlap budget is P's own KV pool (max_total_num_tokens, min-reduced across "
+            "P's ranks), never a plan above it; a P pool that holds two legs lets PP0 start the successor "
+            "while PP1/PP2 finish the predecessor",
+            pool, before, src, realised, self.p_pool_tokens_configured, int(self.p_pool_tokens_written))
+        return True
+
+    async def _p_pool_boot(self) -> None:
+        """S55 P-POOL-FROM-P: read P's realised KV pool once, off the event loop's normal path.
+        Until P answered the configured value stands (the rc14 plan), so nothing ever waits on
+        this read. ``FLLIPER_PDFLIP_P_POOL_FROM_P=0`` or the rule off (0): no read at all."""
+        if not envs.FLLIPER_PDFLIP_P_POOL_FROM_P.get() or self.p_pool_tokens_configured <= 0:
+            return
+        g = self.groups.get("P") if isinstance(getattr(self, "groups", None), dict) else None
+        if g is None:
+            return
+        tries = 0
+        while True:
+            tries += 1
+            body = None
+            try:
+                async with self.session.get(f"{g.url}/get_server_info",
+                                            timeout=ClientTimeout(total=10)) as r:
+                    body = await r.json() if r.status == 200 else None
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 -- P not up yet; retried, the configured value stands
+                body = None
+            if self._apply_p_pool_info(body):
+                return
+            if tries % 6 == 1:
+                logger.info("PDFLIP P-POOL-FROM-P waiting for P's /get_server_info (try %d); the overlap "
+                            "budget stays %d (%s) until then", tries, self.p_pool_tokens, self.p_pool_src)
+            await asyncio.sleep(self.MODE_PARITY_RETRY_S)
 
     async def _x_exact_boot_load(self) -> None:
         """Load D's rendering stack into the front, off the event loop.
@@ -18999,6 +19063,9 @@ def main():
                     help="#1233 fix 8: JSON {s_gb, m_mib, store_gib} -- the arm the ledger chose, needed to "
                          "derive the RUN-MOMENT residual from the front's own cgroup reading")
     args = ap.parse_args()
+    # S55 P-POOL-FROM-P: a --p-pool-tokens the launcher/profile WROTE is the operator's (kept, clamped to P's
+    # realised pool); the standard-form default below is replaced by P's realised pool once P answered.
+    _p_pool_written = getattr(args, "p_pool_tokens", None) is not None
     phase_policy.resolve_front_defaults(args, bool(envs.FLLIPER_PDFLIP_STANDARD_FORM.get()))
     if args.d_park_immediate is None:  # 27B park: the env / the profile row decides --
         # through the SAME reader D's flip park uses (form.d_park_immediate_state),
@@ -19035,6 +19102,7 @@ def main():
                   record_line=args.record_line,
                   p_phase_max_requests=args.p_phase_max_requests,
                   p_pool_tokens=args.p_pool_tokens,
+                  p_pool_tokens_written=_p_pool_written,
                   d_wait_bound_s=args.d_wait_bound_s,
                   p_leg1_stall_s=args.p_leg1_stall_s,
                   d_park_immediate=args.d_park_immediate == "on",
