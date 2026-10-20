@@ -315,8 +315,18 @@ def plan_for(s: Survey, boundary_page: int) -> Tuple[Optional[Plan], str]:
     def _key(m):
         return (-max(m.pages), min(m.pages))
 
-    order = (sorted((m for m in movers.values() if not m.backed), key=_key)
-             + sorted((m for m in movers.values() if m.backed), key=_key))
+    # S98: ``backed`` is NOT replicated on Form A -- it reads the host copy and the
+    # mamba anchor, which the attention host (TP0, the real GDN states) and an expert
+    # worker (byteless R12 shadow pool, KV-only anchors under eviction) hold
+    # differently. With room for every mover it decides nothing (every node moves),
+    # so it must not reorder the destinations either: a different order is a
+    # different digest, a crash-stop before anything moved. Page ids alone then.
+    need = sum(sum(1 for p in m.pages if p > B) for m in movers.values())
+    if len(free) >= need:
+        order = sorted(movers.values(), key=_key)
+    else:
+        order = (sorted((m for m in movers.values() if not m.backed), key=_key)
+                 + sorted((m for m in movers.values() if m.backed), key=_key))
     plan = Plan(boundary_page=B)
     rest: List[NodePages] = []
     for m in order:

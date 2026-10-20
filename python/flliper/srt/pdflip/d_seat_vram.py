@@ -3332,11 +3332,13 @@ def _is_pool(x) -> bool:
     return any(hasattr(x, a) for a in ("k_buffer", "kv_buffer", "qsa_compressed_flat"))
 
 
-def _runner_pools(obj, out: list, seen_ids: set, depth: int = 0) -> None:
+def _runner_pools(obj, out: list, seen_ids: set, depth: int = 0, poolless=None) -> None:
     """Every ``token_to_kv_pool`` behind a draft worker, whatever its shape:
     ``model_runner``, ``draft_runner``, ``draft_model_runner`` and the nested
     ``draft_worker`` (EAGLEWorkerV2: ``draft_worker.draft_worker`` is an
-    EagleDraftWorker with ``draft_runner`` and ``draft_worker.model_runner``)."""
+    EagleDraftWorker with ``draft_runner`` and ``draft_worker.model_runner``).
+    S98: every runner WITHOUT a pool goes into ``poolless`` (once per object), so
+    the caller can tell a declared solo shadow from a pool it cannot find."""
     if obj is None or depth > 3 or id(obj) in seen_ids:
         return
     seen_ids.add(id(obj))
@@ -3345,13 +3347,32 @@ def _runner_pools(obj, out: list, seen_ids: set, depth: int = 0) -> None:
         pool = getattr(r, "token_to_kv_pool", None) if r is not None else None
         if pool is not None:
             out.append(pool)
-    _runner_pools(getattr(obj, "draft_worker", None), out, seen_ids, depth + 1)
+        elif r is not None and poolless is not None and all(r is not x for x in poolless):
+            poolless.append(r)
+    _runner_pools(getattr(obj, "draft_worker", None), out, seen_ids, depth + 1, poolless)
+
+
+def _declared_solo_shadow(runner) -> bool:
+    """S98: ``runner`` declares itself a solo-draft SHADOW (``ModelRunner.
+    is_draft_solo_shadow``, ``compute_draft_solo_role``: "meta-device draft, no draft
+    weights/KV/graphs"). Read as a declaration, never inferred from the missing pool:
+    ``kv_cache_builder.get_draft_kv_pool`` answers None for a shadow by design."""
+    return getattr(runner, "is_draft_solo_shadow", False) is True
 
 
 def _kv_pools_of(sched) -> list:
     """(name, pool) of the target's KV cache and of EVERY draft pool (MTP/EAGLE write
     at the target's page ids). A draft worker whose pool cannot be found is named
-    by a ``(\"draft?\", None)`` entry -- the walker refuses on it (fail-closed)."""
+    by a ``(\"draft?\", None)`` entry -- the walker refuses on it (fail-closed).
+
+    S98 (NF rc22 9c40fe40a2, boot 1020_094747): a solo-draft SHADOW holds no draft KV
+    by design -- ``Draft-solo placement: rank 1 is a draft SHADOW (meta-device draft,
+    no draft weights/KV/graphs ...)``; the solo host TP0 holds the draft rows of every
+    global token (``#tokens: 524288``) and moves them. rc22 refused every compaction on
+    TP1/TP2 with ``draft?: pool not found``. A draft side whose EVERY pool-less runner
+    declares ``is_draft_solo_shadow`` therefore has nothing token-indexed here; one
+    pool-less runner that declares nothing still makes the entry (fail-closed), and a
+    pool a declared shadow does hold is walked like any other."""
     out = []
     alloc = _kv_allocator(sched)
     kv = None
@@ -3365,12 +3386,14 @@ def _kv_pools_of(sched) -> list:
     dw = getattr(sched, "draft_worker", None)
     if dw is not None:
         pools: list = []
-        _runner_pools(dw, pools, set())
+        poolless: list = []
+        _runner_pools(dw, pools, set(), poolless=poolless)
         uniq = []
         for p in pools:
             if p is not kv and all(p is not q for q in uniq):
                 uniq.append(p)
-        if not uniq and not any(p is kv for p in pools):
+        shadow_only = bool(poolless) and all(_declared_solo_shadow(r) for r in poolless)
+        if not uniq and not any(p is kv for p in pools) and not shadow_only:
             out.append(("draft?", None))
         for i, p in enumerate(uniq):
             out.append(("draft" if i == 0 else "draft%d" % i, p))
@@ -3392,9 +3415,29 @@ def _slot_counts(alloc, pool) -> set:
     return {x for x in out if x > 1}
 
 
+#: S98: ``_row_geom``'s answer for a buffer that holds no token (see there)
+KV_ROWS_NO_TOKEN = "no-token"
+
+
 def _row_geom(name: str, t, pool, alloc, P: int):
-    """A per-layer buffer whose FIRST dim is the token slot -> (KvTensorGeom, why)."""
+    """A per-layer buffer whose FIRST dim is the token slot -> (KvTensorGeom, why);
+    ``(None, KV_ROWS_NO_TOKEN)`` for a buffer that provably holds no token.
+
+    S98 (NF rc22 9c40fe40a2, boot 1020_094747, TP0): ``target.full_kv_pool.k_buffer[0]:
+    64 rows match no slot geometry of the 524352-token space`` -- every compaction
+    refused. TP0 is the Form A attention host with owner share 0 (``#239 S3a ZERO-SHARE
+    CELL: rank 0 owns no full-attention token (vector [0, 3, 5])``):
+    ``dcp_compact_pool_rows`` sizes its FA pool at 0 tokens (``KV Cache is allocated
+    ... #tokens: 0``) and an MHA pool always carries ``size + page_size`` rows. Those
+    rows are the pad page alone (page 0, never handed out, never a move's source or
+    destination); every allocator page id >= 1 lies past the buffer, so no token can
+    live in it -- structurally, whatever the form. Exactly ``pool.size == 0`` and at
+    most one page of rows (a page-major layout: one row); anything more still refuses
+    by name below."""
     rows = int(t.shape[0])
+    size = getattr(pool, "size", None)
+    if size is not None and int(size) == 0 and 0 < rows <= P:
+        return None, KV_ROWS_NO_TOKEN
     nbytes = int(t.numel()) * int(t.element_size())
     if rows <= 0 or nbytes % rows:
         return None, "%s: %d bytes not whole rows of %d" % (name, nbytes, rows)
@@ -3459,8 +3502,9 @@ def kv_page_buffers(sched):
     (sub-pools recursed) is looked at; a buffer with a token-slot dimension is
     either one the walker knows how to move (the per-layer row lists, the QSA
     compressed keys) or the walk REFUSES by its name. Named exemptions only: the
-    per-request QSA rings and the GDN pool. Also refused: a draft worker whose pool
-    is not found, a slot-lifetime mirror (DFlash ``DraftKVSlotMapper`` free/alias
+    per-request QSA rings, the GDN pool, the pad page of a size-0 pool (an empty Form A
+    owner share, S98) and a draft side of declared solo shadows (S98). Also refused: a
+    draft worker whose pool is not found, a slot-lifetime mirror (DFlash ``DraftKVSlotMapper`` free/alias
     listeners) or a listener of unknown role (``kv_listener_refusal``, S84; the KV
     stage cap's own id-set filter passes), HiSparse's index mapping. "Stage-born" plays no part here: TP0 on
     NF holds the QSA index and the draft for every global token without a single
@@ -3516,6 +3560,8 @@ def kv_page_buffers(sched):
                 seen_t.add(id(t))
                 if attr in _KV_ROW_LISTS:
                     g, why = _row_geom(nm, t, pool, alloc, P)
+                    if g is None and why == KV_ROWS_NO_TOKEN:
+                        continue   # S98: an empty owner share's pad page -- nothing to move
                     if g is None:
                         raise KvCopyRefused(why)
                     found.append((nm, t, g))
