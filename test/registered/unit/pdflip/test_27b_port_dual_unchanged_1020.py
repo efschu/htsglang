@@ -104,3 +104,34 @@ class DualUnchanged(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DualDefaultsKept(unittest.TestCase):
+    def test_arrival_seat_rule_default_off_under_the_dual_layout(self):
+        from flliper.srt.pdflip import arrival_seat_rule as asr
+
+        self.assertTrue(asr.enabled({}))                                            # flip form: NF default ON
+        self.assertFalse(asr.enabled({"FLLIPER_PDFLIP_DUAL_LAYOUT": "1"}))          # dual: the 27B default OFF
+        self.assertTrue(asr.enabled({"FLLIPER_PDFLIP_DUAL_LAYOUT": "1", "FLLIPER_PDFLIP_ENABLE_ARRIVAL_SEAT_RULE": "1"}))
+        self.assertFalse(asr.enabled({"FLLIPER_PDFLIP_ENABLE_ARRIVAL_SEAT_RULE": "0"}))
+
+    def test_front_sets_the_dual_env_for_itself(self):
+        s = _src(FRONT)
+        i = s.index('front.dual_layout = bool(getattr(args, "dual_layout", False))')
+        self.assertIn('os.environ.setdefault("FLLIPER_PDFLIP_DUAL_LAYOUT", "1")', s[i:i + 400])
+
+    def test_no_d_probe_and_no_tok_ahead_in_the_dual_layout(self):
+        s = _src(FRONT)
+        i = s.index("    def _d_probe_start(")
+        self.assertIn('if getattr(self, "dual_layout", False):\n            return None', s[i:i + 1200])
+        j = s.index("    def _p_tok_ahead_maybe(")
+        self.assertIn('if getattr(self, "dual_layout", False):\n                return False', s[j:j + 1500])
+
+    def test_pgap_instrument_off_in_the_dual_layout(self):
+        s = _src(os.path.join(_PY, "pdflip", "launcher.py"))
+        self.assertIn('_pgap = bool(getattr(ns, "p_hostgap", False)) and not getattr(ns, "dual_layout", False)', s)
+
+    def test_dual_d_resume_reading_is_the_27b_one(self):
+        s = _src(os.path.join(_PY, "pdflip", "d_park_runtime.py"))
+        self.assertIn('elif str(os.environ.get("FLLIPER_PDFLIP_DUAL_LAYOUT", "")).strip() == "1":   # rank-uniform env\n'
+                      '        avail = sched.uniform_min_avail()', s)
