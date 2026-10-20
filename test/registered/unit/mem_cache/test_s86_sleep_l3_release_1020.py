@@ -241,7 +241,7 @@ def test_the_release_frees_every_l3_page_on_both_ranks_and_keeps_the_nodes_on_th
             assert n.component_data[FULL].value is not None              # still on the device, still in the tree
     for n in g.n0:                                                       # the L3 copy is there (never released without)
         assert (g.store / (n.hash_value[0] + "_sfx.bin")).exists()
-    assert grp.calls[0] == grp.calls[1] and len(grp.calls[0]) == 3
+    assert grp.calls[0] == grp.calls[1] and len(grp.calls[0]) == 4   # + veto_fix (S86c)
 
 
 # ---- (2) never a page without its L3 copy -----------------------------------------------------------------------
@@ -298,7 +298,8 @@ def test_every_rank_posts_the_same_collectives_whatever_it_holds(rc19):
         n.component_data[FULL].host_lock_ref = 1                        # the worker keeps everything
     (r0, r1), grp = _sleep_release(g, grp)
     assert grp.calls[0] == grp.calls[1] == [
-        "s86_sleep_l3_release/slots", "s86_sleep_l3_release/veto", "s86_sleep_l3_release/digest"]
+        "s86_sleep_l3_release/slots", "s86_sleep_l3_release/veto", "s86_sleep_l3_release/veto_fix",
+        "s86_sleep_l3_release/digest"]
     assert r0["pages"] == r1["pages"] == 0 and r0["agreed"]
     assert _refs(g) == [2] * SLOTS
 
@@ -315,7 +316,7 @@ def test_a_raising_veto_keeps_everything_and_still_posts_every_collective(rc19):
 
     with mock.patch.object(S86, "_reason", boom):
         (r0, r1), grp = _sleep_release(g, grp)
-    assert grp.calls[0] == grp.calls[1] and len(grp.calls[0]) == 3
+    assert grp.calls[0] == grp.calls[1] and len(grp.calls[0]) == 4   # + veto_fix (S86c)
     assert r0["pages"] == r1["pages"] == 0
     assert all(n.component_data[FULL].host_value is not None for n in g.n0 + g.n1)
 

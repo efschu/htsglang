@@ -621,8 +621,8 @@ def _s86_lockstep(pools, monkeypatch=None):
 def test_d1_s86_the_collective_count_follows_no_local_value():
     rz, res = _s86_lockstep([_s86_pool(8), None, _s86_pool(7)])
     assert [e for _v, e in res if e is not None] == []
-    assert rz.count() == [3, 3, 3]
-    assert [[len(v) for v in c] for c in rz.calls] == [[1, 8, 5]] * N
+    assert rz.count() == [4, 4, 4]   # slots, veto, veto_fix (S86c fixed point, one stable round), digest
+    assert [[len(v) for v in c] for c in rz.calls] == [[1, 8, 8, 6]] * N
 
 
 def test_d2_s86_no_arena_anywhere_takes_one_collective_on_every_rank():
@@ -645,4 +645,4 @@ def test_d3_s86_a_rank_whose_veto_raises_still_takes_every_collective(monkeypatc
     monkeypatch.setattr(S86, "local_veto", veto)
     rz, res = _s86_lockstep(pools)
     assert [e for _v, e in res if e is not None] == []
-    assert rz.count() == [3, 3, 3]
+    assert rz.count() == [4, 4, 4]   # slots, veto, veto_fix (S86c fixed point, one stable round), digest

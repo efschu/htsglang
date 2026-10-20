@@ -644,7 +644,9 @@ def test_p7_chunked_rest_reads_only_the_prefix_length_and_the_fill_boundary():
 S86_PATH = SRT / "pdflip" / "sleep_l3_release.py"
 S86_EXPECTED = {
     "run": [("s86_sleep_l3_release/slots", [])],
-    "_after_first_collective": [("s86_sleep_l3_release/veto", []), ("s86_sleep_l3_release/digest", [])],
+    # S86c: the veto fixed point -- a While whose exit reads only group-reduced vectors (same rounds on every rank)
+    "_after_first_collective": [("s86_sleep_l3_release/veto", []), ("s86_sleep_l3_release/veto_fix", ["While"]),
+                                ("s86_sleep_l3_release/digest", [])],
 }
 
 

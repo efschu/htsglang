@@ -225,6 +225,37 @@ def apply(tree: Any, pool: Any, cands: List[tuple], agreed_veto: torch.Tensor,
     return released
 
 
+FIX_ROUNDS = 16
+
+
+def _mixed_block(cands: List[tuple], agreed: torch.Tensor) -> torch.Tensor:
+    """S86c: this rank's slots that the agreed set cannot release here -- the agreed slots of a candidate node that
+    also holds a vetoed slot (the node is kept whole, so its agreed slots stay referenced). An error blocks every
+    slot (fail closed; the collective is still posted)."""
+    out = torch.zeros_like(agreed)
+    try:
+        for _node, sl in cands:
+            flags = [int(agreed[s]) for s in sl]
+            if any(flags) and not all(flags):
+                out[torch.tensor(sl, dtype=torch.int64)] = 1
+    except Exception:  # noqa: BLE001
+        logger.warning("%s mixed-node scan raised: every slot kept", MARK, exc_info=True)
+        out.fill_(1)
+    return out
+
+
+def _residual(cands: List[tuple], agreed: torch.Tensor, released: List[int]) -> int:
+    """S86c: agreed slots (no rank vetoes them) this rank holds in a candidate node but did not let go -- 0 on
+    every rank when the group is one."""
+    rel = set(int(s) for s in released)
+    held = set()
+    for _node, sl in cands:
+        for s in sl:
+            if not int(agreed[s]):
+                held.add(int(s))
+    return len(held - rel)
+
+
 def _digest(slots: List[int]) -> int:
     arr = torch.tensor(sorted(set(int(s) for s in slots)), dtype=torch.int64).numpy().tobytes()
     return int(zlib.crc32(arr)) & 0x7FFFFFFF
@@ -283,6 +314,25 @@ def _after_first_collective(tree, pool, group_max, mine: int, n_slots: int, out:
             logger.warning("%s veto raised: every slot kept", MARK, exc_info=True)
             veto, cands, why = torch.ones(n_slots, dtype=torch.int64), [], {"error": 1}
     agreed = torch.tensor(group_max(veto.tolist(), label="s86_sleep_l3_release/veto"), dtype=torch.int64)
+    # S86c (rc23 D 11:05:06Z, W86 DIVERGED released 431..433): the node structure is RANK-LOCAL -- TP0 (share-0 host)
+    # holds other nodes than the token owners (ARENA-REF-HOLDERS tree=259 vs 433; kept aux_host_only:24 vs 8) and
+    # splits are rank-local. A node holding an agreed slot AND a vetoed one is kept whole on its rank while a peer
+    # whose node holds only the agreed slot lets it go. Fixed point over the group: the slots of such a mixed node
+    # join the veto until the reduced vector stands; then every node that holds an agreed slot can release it on
+    # every rank. The loop ends on a group-reduced comparison only (same rounds on every rank); past the bound every
+    # slot is vetoed (uniform).
+    rounds = 0
+    while True:
+        rounds += 1
+        nxt = torch.tensor(group_max(torch.maximum(agreed, _mixed_block(cands, agreed)).tolist(),
+                                     label="s86_sleep_l3_release/veto_fix"), dtype=torch.int64)
+        if torch.equal(nxt, agreed):
+            break
+        agreed = nxt
+        if rounds >= FIX_ROUNDS:
+            logger.warning("%s veto fixed point not reached in %d rounds: every slot kept", MARK, rounds)
+            agreed = torch.ones_like(agreed)
+            break
     released: List[int] = []
     err = 0
     try:
@@ -291,27 +341,36 @@ def _after_first_collective(tree, pool, group_max, mine: int, n_slots: int, out:
         logger.error("%s release raised on this rank after %d slots", MARK, len(released), exc_info=True)
         err = 1
     try:
-        cnt, dig = len(set(released)), _digest(released)
+        cnt = len(set(released))
+        # S86c: the unity check reads what must be one -- the agreed release set (its digest, the same on every rank)
+        # and the RESIDUAL: agreed slots this rank holds but did not let go (0 on every rank). A rank that holds a
+        # slot nobody else holds (TP0's tree is not the workers') releases a different COUNT, which is no divergence.
+        res = _residual(cands, agreed, released)
+        dig = _digest(torch.nonzero(agreed == 0).reshape(-1).tolist())
     except Exception:  # noqa: BLE001
-        cnt, dig, err = len(released), 0, 1
-    mx = group_max([cnt, -cnt, dig, -dig, err], label="s86_sleep_l3_release/digest")
-    g_max, g_min, d_max, d_min, g_err = int(mx[0]), -int(mx[1]), int(mx[2]), -int(mx[3]), int(mx[4])
+        cnt, res, dig, err = len(released), 0, 0, 1
+    mx = group_max([cnt, -cnt, dig, -dig, err, res], label="s86_sleep_l3_release/digest")
+    g_max, g_min, d_max, d_min, g_err, g_res = (int(mx[0]), -int(mx[1]), int(mx[2]), -int(mx[3]), int(mx[4]),
+                                                int(mx[5]))
     out.update(nodes=sum(1 for n, sl in cands if not any(int(agreed[s]) for s in sl)), pages=cnt,
-               group_released=g_max, agreed=(g_max == g_min and d_max == d_min),
-               vetoed=int((agreed > 0).sum()), why=why, ms=(time.monotonic() - t0) * 1000.0, group_error=g_err)
+               group_released=g_max, agreed=(d_max == d_min and g_res == 0),
+               vetoed=int((agreed > 0).sum()), why=why, ms=(time.monotonic() - t0) * 1000.0, group_error=g_err,
+               fix_rounds=rounds, residual=res)
     _N["calls"] += 1
     kept_line = ",".join("%s:%d" % kv for kv in sorted(why.items(), key=lambda kv: -kv[1])[:6]) or "-"
-    msg = ("%s n=%d nodes=%d slots=%d of %d vetoed_by_group=%d group_released=%d..%d digest=%s kept=%s ms=%.1f "
+    msg = ("%s n=%d nodes=%d slots=%d of %d vetoed_by_group=%d group_released=%d..%d fix_rounds=%d residual=%d "
+           "digest=%s kept=%s ms=%.1f "
            "(the sleep's reset drops every tree reference; the pages L3 holds go first, agreed over the group, so "
            "the #1470 flush finds room for the nodes with no copy -- the park-end chains; a page without an L3 "
-           "copy is never released)") % (
-        MARK, _N["calls"], out["nodes"], cnt, n_slots, out["vetoed"], g_min, g_max,
+           "copy is never released; released counts differ where a rank holds slots its peers do not)") % (
+        MARK, _N["calls"], out["nodes"], cnt, n_slots, out["vetoed"], g_min, g_max, rounds, g_res,
         "agreed" if out["agreed"] and not g_err else ("ERROR" if g_err else "DIVERGED"), kept_line, out["ms"])
     if out["agreed"] and not g_err:
         logger.info(msg)
         return out
     logger.error(msg)
     raise SleepL3ReleaseDivergence(
-        "W86 SleepL3ReleaseDivergence: %s %s -- released %d..%d slots, digest %d..%d, rank error %d: the ranks are not "
-        "one (RAENGE-NIE-UNEINS); every rank reads this reduced digest and stops in the same pass"
-        % (MARK, "DIVERGED" if not out["agreed"] else "ERROR", g_min, g_max, d_min, d_max, g_err))
+        "W86 SleepL3ReleaseDivergence: %s %s -- agreed-set digest %d..%d, residual (agreed slots a rank kept) %d, "
+        "rank error %d, released %d..%d: the ranks are not one (RAENGE-NIE-UNEINS); every rank reads this reduced "
+        "digest and stops in the same pass"
+        % (MARK, "DIVERGED" if not out["agreed"] else "ERROR", d_min, d_max, g_res, g_err, g_min, g_max))

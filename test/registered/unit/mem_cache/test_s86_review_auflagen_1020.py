@@ -28,7 +28,15 @@ from test_s86_sleep_l3_release_1020 import _thread_roles, rc19  # noqa: E402,F40
 from flliper.srt.pdflip import sleep_l3_release as S86  # noqa: E402
 
 FULL, SLOTS = B.FULL, B.SLOTS
-LABELS = ["s86_sleep_l3_release/slots", "s86_sleep_l3_release/veto", "s86_sleep_l3_release/digest"]
+LABELS = ["s86_sleep_l3_release/slots", "s86_sleep_l3_release/veto", "s86_sleep_l3_release/veto_fix",
+          "s86_sleep_l3_release/digest"]
+
+
+def _labels_ok(grp):
+    """Every rank the same sequence: slots, veto, veto_fix x n (n >= 1, the S86c fixed point), digest."""
+    a, b = grp.calls[0], grp.calls[1]
+    return (a == b and a[:2] == LABELS[:2] and a[-1] == LABELS[-1] and len(a) >= 4
+            and all(x == LABELS[2] for x in a[2:-1]))
 
 
 class _Group(B._Group):
@@ -68,7 +76,7 @@ def _kept(g, i):
 
 def _assert_agreed(res, grp):
     assert not any(isinstance(r, BaseException) for r in res), res
-    assert grp.calls[0] == grp.calls[1] == LABELS
+    assert _labels_ok(grp)
 
 
 # ---- A3a / A3 guards: kept on EVERY rank ------------------------------------------------------------------------
@@ -150,10 +158,10 @@ def test_a3b_another_slot_count_vetoes_everything(rc19):
 
 # ---- A1: DIVERGED and errors stop the group by name ----------------------------------------------------------------
 
-def test_a1_diverged_stops_every_rank_by_name(rc19):
-    """The worker's node 2 spans the pages a2 AND a3, TP0's only a2; the worker keeps a3 (host lock). The group
-    veto names slot 3: TP0 lets go of slot 2, the worker cannot (its node holds slot 3 too) -- the ranks let go of
-    different slots. Every rank reads the same reduced digest and raises W86."""
+def test_s86c_mixed_node_boundaries_converge_and_every_rank_keeps_the_same_slots(rc19):
+    """(was: DIVERGED by mixed node boundaries.) The worker's node 2 spans a2 AND a3, TP0's only a2; the worker keeps
+    a3 (host lock). S86c's fixed point adds a2 to the group veto (the worker cannot release it without a3): TP0 keeps
+    slot 2 too -- no rank lets go of a slot another keeps, no W86. RED on f54d033012 (W86 DIVERGED, the rc23 death)."""
     g = rc19
     n = g.n1[2]
     cd = n.component_data[FULL]
@@ -161,10 +169,31 @@ def test_a1_diverged_stops_every_rank_by_name(rc19):
     n.hash_value = ["a2", "a3"]
     g.n1[3].component_data[FULL].host_lock_ref = 1
     res, grp = _both(g)
-    assert all(isinstance(r, S86.SleepL3ReleaseDivergence) for r in res), res
-    assert all("DIVERGED" in str(r) and "W86" in str(r) for r in res)
-    assert grp.calls[0] == grp.calls[1] == LABELS
+    assert not any(isinstance(r, BaseException) for r in res), res
+    assert _labels_ok(grp) and grp.calls[0].count(LABELS[2]) == 2       # one round that moved, one that stood
+    assert _kept(g, 2) == (True, True) and _kept(g, 3) == (True, True)
+    refs = B._refs(g)
+    assert refs[2] >= 2 and refs[3] >= 2
+    assert [refs[i] for i in range(SLOTS) if i not in (2, 3)] == [0] * (SLOTS - 2)
+    assert res[0]["residual"] == res[1]["residual"] == 0
 
+
+def test_a1_diverged_stops_every_rank_by_name(rc19):
+    """A real divergence: the worker's release silently skips one candidate whose slots the group agreed on (a
+    rank-local selection). Its residual is 1, every rank reads it from the digest and raises W86 DIVERGED."""
+    g = rc19
+    real = S86.apply
+
+    def skip_one(tree, pool, cands, agreed, released=None):
+        if tree is g.t1:
+            cands = [c for c in cands if c[0] is not g.n1[6]]
+        return real(tree, pool, cands, agreed, released)
+
+    with mock.patch.object(S86, "apply", skip_one):
+        res, grp = _both(g)
+    assert all(isinstance(r, S86.SleepL3ReleaseDivergence) for r in res), res
+    assert all("DIVERGED" in str(r) and "W86" in str(r) and "residual" in str(r) for r in res)
+    assert _labels_ok(grp)
 
 def test_a1_an_error_after_the_first_collective_stops_every_rank_by_name(rc19):
     """The worker's release raises half-way: the error rides the digest collective (no peer left waiting), and
@@ -180,7 +209,7 @@ def test_a1_an_error_after_the_first_collective_stops_every_rank_by_name(rc19):
     with mock.patch.object(S86, "apply", boom):
         res, grp = _both(g)
     assert all(isinstance(r, S86.SleepL3ReleaseDivergence) for r in res), res
-    assert grp.calls[0] == grp.calls[1] == LABELS
+    assert _labels_ok(grp)
 
 
 def test_a1_the_caller_lets_the_named_stop_through():
@@ -231,7 +260,7 @@ def test_a2_every_rank_posts_the_same_three_collectives_whatever_it_holds(rc19, 
         for p in patches:
             p.stop()
         g.a1.slots = SLOTS
-    assert grp.calls[0] == grp.calls[1] == LABELS, (case, dict(grp.calls), res)
+    assert _labels_ok(grp), (case, dict(grp.calls), res)
 
 
 def test_a1_an_error_with_equal_digests_still_stops_every_rank_by_name(rc19):
