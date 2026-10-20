@@ -30,6 +30,16 @@ CAUSES (the dominant one is ``cause=``, every one present is listed in ``notes=`
 * ``lend_return``     -- S78: D-TRANSIENT-LEND gave lent expert rows back in the gap (rows OFF, sync, unmap);
 * ``lend``            -- S78: D-TRANSIENT-LEND lent rows in the gap (map + ON) -- rc17 p50 ~300 ms per lend;
 * ``other``           -- none of these: the rest of the gap (``other_ms`` = gap minus the extends' wall).
+* ``idle``            -- S106: no request of the round that opened the gap is in the round that closed it (the
+                         earlier decodes finished, a new request opened the next stream): nothing was paused --
+                         D had no decode to advance (rc26 13:50:44: a 7.7 s "lend_return" gap with running=0, the
+                         new head held by DQH for its KV device load, harvest_ms=2560).
+
+S106 (20.10.): the lend's own moves are TIMED (``lend_ms``, ``return_ms`` = the host wall of ``SeatVram.lend`` /
+``unlend`` / ``unlend_to``, their syncs included) and ``lend`` / ``lend_return`` is the cause only when that wall is
+at least half of ``other_ms``. Before, any return anywhere in the gap named it (rc26 13:50:35, 13:50:44, 13:50:48:
+gaps of 2.2-7.7 s labelled ``lend_return`` whose time was pure extends, the KV device load and DQH; the gaps holding
+ONLY a return were p50 307-344 ms, max 1230 ms over rc22-rc26, rounds' own forward included).
 
 S78 (19.10.): rc17 D (``..._1019_171636``) logged 703 gaps / 648.9 s as ``other``; re-derived from the round
 stamps, 388 / 473.9 s were opened by a MIXED-D round (its forward 444.8 s) and 283 / 133.7 s by a decode
@@ -55,7 +65,9 @@ ENV_MS = "FLLIPER_PDFLIP_D_DECODE_GAP_MS"
 ENV_CENSUS_S = "FLLIPER_PDFLIP_D_DECODE_GAP_CENSUS_S"
 _ATTR = "_pdflip_d_decode_gap"
 NOTE_CAUSES = ("skipfirst_hold", "f3_decode_first", "seat", "wake_read", "lend_return", "lend")
-CAUSES = ("flip", "mixed_prefill", "d_prefill") + NOTE_CAUSES + ("other",)
+#: S106: the notes whose own wall is measured (``note_ms``); they name the gap only when that wall dominates it
+TIMED_CAUSES = ("lend_return", "lend")
+CAUSES = ("flip", "idle", "mixed_prefill", "d_prefill") + NOTE_CAUSES + ("other",)
 
 
 def _env_float(name: str, default: float) -> float:
@@ -86,6 +98,8 @@ class Tracker:
         self.ext_n = 0
         self.ext_tokens = 0
         self.notes: Dict[str, int] = {}
+        self.notes_ms: Dict[str, float] = {}  # S106: the measured wall of the timed notes in this gap
+        self.last_rids: Optional[frozenset] = None  # S106: the requests the opener advanced
         self.window_t0 = now
         self.census: Dict[str, list] = {c: [0, 0.0] for c in CAUSES}
         self.rounds = 0
@@ -93,6 +107,11 @@ class Tracker:
 
     def note(self, cause: str) -> None:
         self.notes[cause] = self.notes.get(cause, 0) + 1
+
+    def note_ms(self, cause: str, ms: float) -> None:
+        """S106: a timed note -- counted like ``note`` and its own wall summed."""
+        self.note(cause)
+        self.notes_ms[cause] = self.notes_ms.get(cause, 0.0) + max(0.0, float(ms))
 
     def _close_extend(self, now: float) -> None:
         if self.ext_open is not None:
@@ -104,7 +123,8 @@ class Tracker:
         if decode_rows > 0 and self.last_decode_t is not None:
             self.last_run_ms = max(0.0, now - self.last_decode_t) * 1000.0
 
-    def on_batch(self, now: float, decode_rows: int, extend_tokens: int, wake_seq) -> Optional[dict]:
+    def on_batch(self, now: float, decode_rows: int, extend_tokens: int, wake_seq,
+                 rids: Optional[frozenset] = None) -> Optional[dict]:
         """One batch at its launch. ``decode_rows`` > 0 = it advances the running decodes (decode or MIXED-D);
         ``extend_tokens`` > 0 with no decode rows = a pure extend; with decode rows (MIXED-D) the batch's total
         extend rows (its prefill tokens + one row per folded decode). Returns the gap record when one closed."""
@@ -116,8 +136,10 @@ class Tracker:
                 gap_ms = (now - self.last_decode_t) * 1000.0
                 if gap_ms >= self.bound_ms:
                     flip = wake_seq is not None and self.last_wake_seq is not None and wake_seq != self.last_wake_seq
-                    rec = self._record(gap_ms, flip)
+                    idle = (rids is not None and self.last_rids is not None and not (rids & self.last_rids))
+                    rec = self._record(gap_ms, flip, idle=idle)
             self.last_decode_t = now
+            self.last_rids = rids
             self.last_rows = int(decode_rows)
             self.last_wake_seq = wake_seq
             self.last_mixed_tokens = max(0, int(extend_tokens) - int(decode_rows)) if extend_tokens > 0 else 0
@@ -129,23 +151,33 @@ class Tracker:
             self.ext_tokens += int(extend_tokens)
         return rec
 
-    def _record(self, gap_ms: float, flip: bool) -> dict:
+    def _record(self, gap_ms: float, flip: bool, idle: bool = False) -> dict:
         notes = dict(self.notes)
+        notes_ms = dict(self.notes_ms)
         run_ms = self.last_run_ms
         mixed = self.last_mixed_tokens
+        other_ms = max(0.0, gap_ms - self.ext_ms)
+
+        def _names(c: str) -> bool:
+            # S106: a timed note names the gap only when its own wall is at least half of the rest
+            return c in notes and (c not in TIMED_CAUSES or c not in notes_ms
+                                   or notes_ms[c] >= 0.5 * other_ms)
+
         if flip:
             cause = "flip"
+        elif idle:
+            cause = "idle"
         elif mixed > 0 and (run_ms or 0.0) >= self.ext_ms:
             cause = "mixed_prefill"
         elif self.ext_n > 0 and self.ext_ms >= 0.5 * gap_ms:
             cause = "d_prefill"
         else:
-            cause = next((c for c in NOTE_CAUSES if c in notes), "d_prefill" if self.ext_n else "other")
-        other_ms = max(0.0, gap_ms - self.ext_ms)
+            cause = next((c for c in NOTE_CAUSES if _names(c)), "d_prefill" if self.ext_n else "other")
         host_ms = None if run_ms is None else max(0.0, gap_ms - self.ext_ms - run_ms)
         rec = {"gap_ms": gap_ms, "cause": cause, "rows": self.last_rows, "d_prefill_ms": self.ext_ms,
                "extends": self.ext_n, "prefill_tokens": self.ext_tokens, "notes": notes, "other_ms": other_ms,
-               "flip": flip, "mixed_tokens": mixed, "run_ms": run_ms, "host_ms": host_ms}
+               "flip": flip, "mixed_tokens": mixed, "run_ms": run_ms, "host_ms": host_ms,
+               "lend_ms": notes_ms.get("lend"), "return_ms": notes_ms.get("lend_return")}
         self.gaps += 1
         self.census[cause][0] += 1
         self.census[cause][1] += gap_ms
@@ -157,6 +189,7 @@ class Tracker:
         self.ext_n = 0
         self.ext_tokens = 0
         self.notes = {}
+        self.notes_ms = {}
 
     def census_due(self, now: float) -> Optional[dict]:
         if self.census_s <= 0 or now - self.window_t0 < self.census_s:
@@ -201,6 +234,34 @@ def note(sched, cause: str) -> None:
         pass
 
 
+def note_ms(sched, cause: str, ms: float) -> None:
+    """S106: a timed cause (the lend's own moves): counted like :func:`note`, its wall summed for the gap line."""
+    try:
+        tr = tracker(sched)
+        if tr is not None:
+            tr.note_ms(str(cause), float(ms))
+    except Exception:  # noqa: BLE001 -- an instrument never breaks the pass
+        pass
+
+
+def _batch_rids(batch) -> Optional[frozenset]:
+    """S106: the requests a decode-advancing batch advances (decode: all; MIXED-D: the folded decodes)."""
+    try:
+        mode = getattr(batch, "forward_mode", None)
+        if mode is None:
+            return None
+        if mode.is_decode():
+            reqs = getattr(batch, "reqs", None) or ()
+        elif mode.is_extend():
+            reqs = getattr(batch, "decoding_reqs", None) or ()
+        else:
+            return None
+        rids = frozenset(str(getattr(r, "rid", "")) for r in reqs if getattr(r, "rid", None) is not None)
+        return rids or None  # unknown requests: no idle verdict (only two named sets can be disjoint)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _batch_terms(batch):
     """``(decode_rows, extend_rows)``: a decode batch advances ``batch_size`` decodes; an extend batch its folded
     MIXED-D decodes (``decoding_reqs``) with ``extend_num_tokens`` rows (prefill tokens + one per folded decode)."""
@@ -226,17 +287,21 @@ def on_batch(sched, batch, now: Optional[float] = None) -> None:
             return
         now = time.monotonic() if now is None else float(now)
         rows, tokens = _batch_terms(batch)
-        rec = tr.on_batch(now, rows, tokens, getattr(sched, "_pdflip_wake_seq", None))
+        rec = tr.on_batch(now, rows, tokens, getattr(sched, "_pdflip_wake_seq", None),
+                          _batch_rids(batch) if rows > 0 else None)
         if rec is not None:
             logger.info(
                 "%s gap_ms=%.0f cause=%s rows=%d d_prefill_ms=%.0f extends=%d prefill_tokens=%d other_ms=%.0f "
                 "mixed_tokens=%d run_ms=%s host_ms=%s "
-                "notes=%s (start-to-start between two decode-advancing batches; D group, rank-local)",
+                "notes=%s lend_ms=%s return_ms=%s (start-to-start between two decode-advancing batches; D group, "
+                "rank-local)",
                 MARK, rec["gap_ms"], rec["cause"], rec["rows"], rec["d_prefill_ms"], rec["extends"],
                 rec["prefill_tokens"], rec["other_ms"], rec["mixed_tokens"],
                 "-" if rec["run_ms"] is None else "%.0f" % rec["run_ms"],
                 "-" if rec["host_ms"] is None else "%.0f" % rec["host_ms"],
-                ",".join("%s:%d" % kv for kv in sorted(rec["notes"].items())) or "-")
+                ",".join("%s:%d" % kv for kv in sorted(rec["notes"].items())) or "-",
+                "-" if rec["lend_ms"] is None else "%.0f" % rec["lend_ms"],
+                "-" if rec["return_ms"] is None else "%.0f" % rec["return_ms"])
         cen = tr.census_due(now)
         if cen is not None:
             logger.info(

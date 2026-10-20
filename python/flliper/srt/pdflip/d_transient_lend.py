@@ -40,7 +40,14 @@ lends its own card):
   k above the phase's rows whose pages fit; map first, then ON;
 * a stage move (D-MEM-SCHED), a re-seat or a wake re-plans from the phase cell
   and ends the lend in the same apply (``lent_from = None``): every lend ends on
-  the cut lattice, so those applies release whole cells only (S1-Wisch);
+  the cut lattice, so those applies release whole cells only (S1-Wisch) --
+  S106 STAGE-KEEP: a live stage move and a live re-seat SHRINK keep the lent
+  rows the card holds beside what the move maps (``stage_keep_need_bytes``: the
+  lend floor + a pending short extend's KEEP-SHORT price, measured card), and
+  the lend stays open above the new phase rows (``lent_from`` = the new cell's
+  k). rc22-rc26 (20.10.): the old end-and-re-lend pair re-mapped the same cells
+  in >= 90 % of the cases (rc26 TP0 134 re-lends, 133 back at or above the
+  dropped rows), each pair a decode pause (rc26 group 82.4 s / 0.44 h);
 * a sleep pauses the whole bank; the wake's apply re-plans from the cell.
 
 No reserve: the floor is the card ledger's near-OOM edge (the launcher writes
@@ -79,6 +86,7 @@ before; the switch off = the full return byte for byte. Lines::
 from __future__ import annotations
 
 import logging
+import time
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -308,28 +316,39 @@ def _rank(sched) -> int:
     return int(rank or 0)
 
 
-def _gap_note(sched, cause: str) -> None:
-    """S78: name the lend move in the decode pause it may cause (D-DECODE-GAP, read-only)."""
+def _gap_note(sched, cause: str, ms: Optional[float] = None) -> None:
+    """S78: name the lend move in the decode pause it may cause (D-DECODE-GAP, read-only). S106: with its
+    own measured host wall (``ms``: the move's call, its syncs included) when the caller timed it."""
     try:
         from flliper.srt.pdflip import d_decode_gap
 
-        d_decode_gap.note(sched, cause)
+        if ms is None:
+            d_decode_gap.note(sched, cause)
+        else:
+            d_decode_gap.note_ms(sched, cause, ms)
     except Exception:  # noqa: BLE001 -- an instrument never stops a lend
         pass
+
+
+def _timed(fn, *args):
+    """S106: ``(result, host wall ms)`` of one lend move."""
+    t0 = time.perf_counter()
+    out = fn(*args)
+    return out, (time.perf_counter() - t0) * 1000.0
 
 
 def _give_back(sched, ctl, why: str) -> Optional[str]:
     if ctl.lent_from is None:
         return None
     before = int(ctl.rows_on)
-    n = ctl.unlend()
+    n, ms = _timed(ctl.unlend)
     _gate(sched).topup = False
     _gate(sched).last_keep = None
     if n:
-        _gap_note(sched, "lend_return")
-        logger.info("%s rank=%d return rows_on %d->%d (%s) lent_total=%d returned_total=%d",
+        _gap_note(sched, "lend_return", ms)
+        logger.info("%s rank=%d return rows_on %d->%d (%s) lent_total=%d returned_total=%d ms=%.0f",
                     MARK, _rank(sched), before, int(ctl.rows_on), why, ctl.lent_rows,
-                    ctl.returned_rows)
+                    ctl.returned_rows, ms)
     return "return" if n else None
 
 
@@ -419,14 +438,73 @@ def _keep_short(sched, ctl, rows: int, why: str) -> Optional[str]:
         gate.topup = False
         return "keep"
     gate.last_keep = None
-    n = ctl.unlend_to(k)
+    n, ms = _timed(ctl.unlend_to, k)
     gate.topup = ctl.lent_from is not None
     if n:
-        _gap_note(sched, "lend_return")
+        _gap_note(sched, "lend_return", ms)
         logger.info("%s rank=%d return rows_on %d->%d (%s rows=%d need_mib=%d card_free_mib=%d) "
-                    "lent_total=%d returned_total=%d", MARK, rank, before, int(ctl.rows_on), why,
-                    int(rows), int(need_mib), free // MIB, ctl.lent_rows, ctl.returned_rows)
+                    "lent_total=%d returned_total=%d ms=%.0f", MARK, rank, before, int(ctl.rows_on), why,
+                    int(rows), int(need_mib), free // MIB, ctl.lent_rows, ctl.returned_rows, ms)
     return "return" if n else None
+
+
+def stage_keep_need_bytes(sched, ctl=None) -> Optional[int]:
+    """S106 STAGE-KEEP: the card bytes a live phase move (D-MEM-SCHED stage, re-seat shrink) must
+    leave free when it keeps an open lend -- the lend's OWN price, nothing new:
+
+    * the lend floor of this rank (the card ledger's near-OOM edge, ``FLLIPER_PDFLIP_D_LEND_FLOOR_MIB``);
+    * plus, when extend work is pending and ALL of it is short (S78's R2 verdict, replicated), the
+      KEEP-SHORT price ``extend_trim.chunk_need_mib(rank, rows)`` -- the same price ``round_start``
+      already left free before this move; the move must not eat it.
+
+    ``None`` (the lend ends with the move, the old behaviour): nothing lent, the lend not armed, no
+    floor, a chunked request, a big or unpriced pending extend (``round_start`` returned it in full),
+    no rate for this rank. The VERDICT inputs (queue, chunked request, carried headers) are replicated;
+    the amount -- like every lend amount -- is rank-local."""
+    try:
+        if ctl is None:
+            ctl = _controller(sched)
+        if ctl is None or getattr(ctl, "lent_from", None) is None:
+            return None
+        from flliper.srt.pdflip import d_seat_vram as dsv
+
+        rank = _rank(sched)
+        floor = dsv.lend_floor_mib_for_rank(rank)
+        if floor is None:
+            return None
+        if getattr(sched, "chunked_req", None) is not None:
+            return None
+        need_mib = float(floor)
+        if takeable_waiting(sched):
+            rows = short_pending_rows(sched) if keep_short_on() else None
+            if rows is None:
+                return None
+            from flliper.srt.pdflip import extend_trim
+
+            price = extend_trim.chunk_need_mib(rank, int(rows))
+            if price is None:
+                return None
+            need_mib += float(price)
+        return int(need_mib * MIB)
+    except Exception:  # noqa: BLE001 -- unpriced: the lend ends with the move (the old behaviour)
+        return None
+
+
+def after_phase_move(sched, ctl, rows_before: int) -> None:
+    """S106: a live phase move that KEPT part of an open lend gave rows back -- like S78's partial
+    return, the next lend verdict may top the difference up (``topup``). A move that kept the whole
+    lend changes nothing in the gate (one lend per settle); a move that ended it clears ``topup``."""
+    try:
+        gate = _gate(sched)
+        if ctl is None or getattr(ctl, "lent_from", None) is None:
+            gate.topup = False
+            gate.last_keep = None
+            return
+        if int(ctl.rows_on) < int(rows_before):
+            gate.topup = True
+            gate.last_keep = None
+    except Exception:  # noqa: BLE001 -- the gate is advice; the move already ran
+        pass
 
 
 def round_start(sched) -> Optional[str]:
@@ -485,11 +563,11 @@ def on_batch(sched, batch) -> Optional[str]:
         return None
     budget = lend_budget_bytes(free, floor)
     before = int(ctl.rows_on)
-    n = ctl.lend(budget)
+    n, ms = _timed(ctl.lend, budget)
     if n:
         gate.last_keep = None
-        _gap_note(sched, "lend")
+        _gap_note(sched, "lend", ms)
         logger.info("%s rank=%d lend rows_on %d->%d card_free_mib=%d floor_mib=%d budget_mib=%d "
-                    "lent_total=%d returned_total=%d", MARK, rank, before, int(ctl.rows_on),
-                    free // MIB, int(floor), budget // MIB, ctl.lent_rows, ctl.returned_rows)
+                    "lent_total=%d returned_total=%d ms=%.0f", MARK, rank, before, int(ctl.rows_on),
+                    free // MIB, int(floor), budget // MIB, ctl.lent_rows, ctl.returned_rows, ms)
     return "lend" if n else None

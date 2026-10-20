@@ -78,6 +78,8 @@ REFUSAL_CODE = "W-SEAT PdFlipDSeatOverrun"
 WIPE_CODE = "W-SEAT-WIPE"
 #: one line per live apply: extents kept, cells freed / mapped, wiped=0
 LIVE_MARK = "PDFLIP D-SEAT-VRAM LIVE-SPANS"
+#: S106: the lend's own marker (d_transient_lend.MARK) for the stage-keep line
+LEND_MARK = "PDFLIP D-TRANSIENT-LEND"
 _MIB = float(1 << 20)
 
 
@@ -1781,7 +1783,66 @@ class SeatVram:
         if self.mamba_pool is not None and self.slot_tensors:
             self.mamba_pool._pdflip_seat_keep = self.mamba_keep
 
-    def apply_stage(self, n: int, stage: int) -> PhaseApplied:
+    def lend_keep_target(self, k_cell: int, kv_need_bytes: int, keep_need_bytes: Optional[int],
+                         card: Optional["CardRoom"] = None) -> int:
+        """S106 STAGE-KEEP: the rows a live phase move keeps ON of an open D-TRANSIENT-LEND.
+
+        Metal (NF rc22-rc26, 20.10., D logs ``..._1020_094747`` .. ``..._1020_130752``): every
+        D-MEM-SCHED stage move ended the lend (``lent_from = None``) -- rows OFF coldest first,
+        sync, the lent cells released -- and the lend verdict mapped the SAME cells again a
+        few rounds later (rc26 TP0: 134 re-lends after a lend-ending stage move, 133 of them
+        back at or above the rows the move had dropped; group gap 82.4 s in 0.44 h). The
+        card held the lend beside the new stage all along.
+
+        Rule: the largest lattice k in ``[k_cell, rows_on]`` (no straddled extent) whose
+        released cells leave the card -- measured now (``cudaMemGetInfo``) -- at least
+        ``keep_need_bytes`` free after the move maps ``kv_need_bytes`` fresh:
+        ``free + release(k) - kv_need >= keep_need``. ``keep_need`` is the lend's own price
+        (``d_transient_lend.stage_keep_need_bytes``: the lend floor = the card ledger's
+        near-OOM edge, plus the KEEP-SHORT price of a pending short extend); no new number,
+        no reserve. ``k_cell`` (the old behaviour: the lend ends) when nothing is lent, no
+        price is given (a big or unpriced extend pending: its full return already ran),
+        or no card is measured (CPU, no context). Pure arithmetic over one card reading."""
+        cur = int(self.rows_on)
+        k_cell = int(k_cell)
+        if self.lent_from is None or keep_need_bytes is None or cur <= k_cell:
+            return k_cell
+        if not self.row_tensors or not self._bank_live():
+            return k_cell
+        card = _CARD if card is None else card
+        free = card.free()
+        if free is None:
+            return k_cell
+        for c in sorted({cur} | {int(x) for x in self.row_cut_ks if k_cell < int(x) < cur}, reverse=True):
+            if c < cur and self._bank_straddles(c):
+                continue
+            rel = self.bank_release_bytes(c) if c < cur else 0
+            if int(free) + int(rel) - int(kv_need_bytes) >= int(keep_need_bytes):
+                return int(c)
+        return k_cell
+
+    def _gdn_map_bytes(self, mamba_plans) -> int:
+        """S106: the bytes a LIVE re-seat maps fresh for the GDN pool (``kv_map_bytes``' rule)."""
+        total = 0
+        for m, sp in mamba_plans:
+            info = self.spans.info(m.ptr)
+            if info is None or not info.active:
+                continue
+            total += _fresh_bytes(self.spans_by_ptr.get(int(m.ptr)), sp, int(info.mapped))
+        return int(total)
+
+    def _log_lend_keep(self, *, move: str, rows_from: int, kept: int, k_cell: int, kv_need: int,
+                       keep_need: Optional[int]) -> None:
+        """S106 line: what the phase move did with an open lend (one per move that met one)."""
+        logger.info(
+            "%s rank=%d stage-keep %s rows_on %d->%d phase_rows=%d lent_from=%s kv_need_mib=%d "
+            "keep_need_mib=%s -- %s (S106)", LEND_MARK, _this_rank(), move, rows_from, kept, k_cell,
+            "-" if self.lent_from is None else int(self.lent_from), int(int(kv_need) / _MIB),
+            "-" if keep_need is None else int(int(keep_need) / _MIB),
+            "the lend rides on above the new phase rows" if kept > k_cell
+            else "the lend ends with the move (no price, or the card does not hold it)")
+
+    def apply_stage(self, n: int, stage: int, keep_lend_need: Optional[int] = None) -> PhaseApplied:
         """#251c: the pages of a phase of ``n`` seats at KV stage ``stage``
         (``stage_vram_cells``): the GDN slots, the KV prefix and the expert
         rows ON move together, the total never above the boot form. Paused
@@ -1799,6 +1860,19 @@ class SeatVram:
         j = max(0, min(int(stage), len(self.form.tokens) - 1))
         cell, k, keep, notes, infos = self._stage_rows(n, j)
         tokens = int(self.form.tokens[j])
+        # S106 STAGE-KEEP: an open lend rides on above the new phase rows as far as the
+        # card holds it beside the KV this move maps (``keep_lend_need`` = the lend's price;
+        # None = the lend ends with the move, as before)
+        k_cell, lent_base, rows_from = int(k), None, int(self.rows_on)
+        if self.lent_from is not None and keep_lend_need is not None and rows_from > k_cell:
+            kv_need = self.kv_map_bytes(tokens)
+            k_keep = self.lend_keep_target(k_cell, kv_need, keep_lend_need)
+            self._log_lend_keep(move="S%s->S%d" % ("-" if self.applied is None else self.applied.stage, j),
+                                rows_from=rows_from, kept=k_keep, k_cell=k_cell, kv_need=kv_need,
+                                keep_need=keep_lend_need)
+            if k_keep > k_cell:
+                k, lent_base = int(k_keep), k_cell
+                notes.append("S106: the lend keeps rows %d above the phase's %d" % (k_keep, k_cell))
         # S77-B (NF rc17 1019_171636, D TP0 18:07:42Z): a live KV grow maps its
         # pages only into bytes the card HAS -- measured, the allocator cache
         # trimmed, this rank's own expert rows released first if still short
@@ -1814,7 +1888,7 @@ class SeatVram:
                 notes.append("GROW-ROOM: rows %d -> %d pay the KV the card did not have"
                              % (k, room.rows_to))
                 k = int(room.rows_to)
-        return self._apply_stage_rows(n, j, cell, k, keep, notes, infos, tokens)
+        return self._apply_stage_rows(n, j, cell, k, keep, notes, infos, tokens, lent_base=lent_base)
 
     def kv_map_bytes(self, tokens: int) -> int:
         """S77-B: the bytes a LIVE KV move to ``tokens`` maps FRESH -- every range of
@@ -1957,7 +2031,7 @@ class SeatVram:
         return cell, k, keep, notes, infos
 
     def _apply_stage_rows(self, n: int, j: int, cell, k: int, keep: int, notes, infos,
-                          tokens: int) -> "PhaseApplied":
+                          tokens: int, lent_base: Optional[int] = None) -> "PhaseApplied":
         import torch
 
         experts_live = any(
@@ -2019,7 +2093,9 @@ class SeatVram:
             else:
                 self.refilled_rows += k - int(self.rows_on)
         self.rows_on = k
-        self.lent_from = None  # D-TRANSIENT-LEND: a phase move ends any lend
+        # D-TRANSIENT-LEND: a phase move ends any lend -- S106: unless the move kept lent
+        # rows above the new phase's rows (``lent_base``): then the lend stays open from there
+        self.lent_from = int(lent_base) if (lent_base is not None and k > int(lent_base)) else None
         applied = PhaseApplied(
             n=n, extra_rows=k,
             mamba_mapped=sum(span_bytes(slot_spans(m.geom, keep, self.granule))
@@ -2324,7 +2400,7 @@ class SeatVram:
         k = int(row.extra_rows) if (self.slot_tensors and self.row_tensors) else 0
         return k, ((int(row.slot_limit) + 1) if k > 0 else self.pool_size + 1)
 
-    def reseat_live(self, n: int, stage: Optional[int]) -> PhaseApplied:
+    def reseat_live(self, n: int, stage: Optional[int], keep_lend_need: Optional[int] = None) -> PhaseApplied:
         """D-SEAT-REWAKE: the pages of a LIVE phase move from n seats to ``n``
         (Nutzer 30.09.: "D sleeped ohne wirklich runterzufahren und waket
         sofort wieder mit mehr sitzen"). Nothing sleeps: the GDN pool keeps the
@@ -2345,6 +2421,18 @@ class SeatVram:
         grow = keep_eff > cur_keep
         mamba_plans = [(m, slot_spans(m.geom, keep_eff, self.granule, cuts=self.mamba_cut_keeps()))
                        for m in self.slot_tensors]
+        # S106 STAGE-KEEP on a live re-seat: an open lend rides on above the new phase rows
+        # as far as the card holds it beside what the move maps fresh -- a SHRINK maps
+        # nothing (GDN cells only go), a GROW maps the new seats' GDN cells (priced here,
+        # RB order unchanged: the bank's released cells go before the GDN maps)
+        k_cell, lent_base = int(k), None
+        if self.lent_from is not None and keep_lend_need is not None and int(self.rows_on) > k_cell:
+            gdn_need = self._gdn_map_bytes(mamba_plans) if grow else 0
+            k_keep = self.lend_keep_target(k_cell, gdn_need, keep_lend_need)
+            self._log_lend_keep(move="reseat n->%d" % n, rows_from=int(self.rows_on), kept=k_keep,
+                                k_cell=k_cell, kv_need=gdn_need, keep_need=keep_lend_need)
+            if k_keep > k_cell:
+                k, lent_base = int(k_keep), k_cell
         bank_plans = [(m, self.bank_spans(m, k), True) for m in self.row_tensors]
         self.refuse_wipes([(m.ptr, m.geom.name, sp, True) for m, sp in mamba_plans]
                           + [(m.ptr, m.geom.name, sp, lv) for m, sp, lv in bank_plans])
@@ -2405,7 +2493,8 @@ class SeatVram:
         elif k > rows_from:
             self.refilled_rows += k - rows_from
         self.rows_on = int(k)
-        self.lent_from = None  # D-TRANSIENT-LEND: a phase move ends any lend
+        # D-TRANSIENT-LEND: a phase move ends any lend -- S106: unless a shrink kept lent rows
+        self.lent_from = int(lent_base) if (lent_base is not None and int(k) > int(lent_base)) else None
         log_live_spans(census, n=n, stage=stage, rows_from=rows_from, rows_to=int(k),
                        mamba_keep=self.mamba_keep, order="bank-first" if grow else "mamba-first")
         prev = self.applied
@@ -4042,7 +4131,20 @@ def runtime_tick(sched):
     if alloc is not None:
         _engage_kv_cap(alloc, tokens[ms.pending if (ms.pending is not None and not lifted)
                                      else ms.stage], page)
-    applied = ctl.apply_stage(n, ms.stage) if (ctl is not None and ctl.cells) else None
+    if ctl is not None and ctl.cells:
+        # S106 STAGE-KEEP: the lend's own price (rank-local amount; the move's verdict is the
+        # group's, replicated above -- nothing here enters a collective)
+        from flliper.srt.pdflip import d_transient_lend as _dtl
+
+        need = _dtl.stage_keep_need_bytes(sched, ctl)
+        if need is None:
+            applied = ctl.apply_stage(n, ms.stage)
+        else:
+            lend_rows_before = int(getattr(ctl, "rows_on", 0) or 0)
+            applied = ctl.apply_stage(n, ms.stage, keep_lend_need=need)
+            _dtl.after_phase_move(sched, ctl, lend_rows_before)
+    else:
+        applied = None
     st.stage, st.stage_tokens = ms.stage, tokens[ms.stage]
     if ms.stage > before:
         _reopen_admission(sched)

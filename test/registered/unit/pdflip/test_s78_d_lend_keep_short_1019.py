@@ -230,7 +230,9 @@ def test_the_decode_gap_hears_the_lend_moves():
     with _Ctx(tms, NEED - 20 * 1024), mock.patch.object(dtl, "_gap_note") as note:
         r, _ctl = _live_lent(tms)
         dtl.round_start(r.sched)
-        note.assert_called_with(r.sched, "lend_return")
+        # S106: the move's own host wall rides with the note (D-DECODE-GAP return_ms)
+        args = note.call_args[0]
+        assert args[:2] == (r.sched, "lend_return") and isinstance(args[2], float) and args[2] >= 0.0
 
 
 def test_review_a3_the_price_uses_the_effective_rate_not_the_start_rate(monkeypatch):
