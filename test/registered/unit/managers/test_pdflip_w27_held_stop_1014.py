@@ -235,7 +235,7 @@ def test_pf_on_every_stage_plans_the_same_batch(monkeypatch):
 def test_nextflash_row_arms_pf():
     assert FM.PROFILES["nextflash"].told_group_fallback is True
     assert FM.PROFILE_SWITCH_DEFAULTS["nextflash"][fb.ENV_FALLBACK] is True
-    assert FM.PROFILES["qwen27b"].told_group_fallback is False
+    assert FM.PROFILES["qwen27b"].told_group_fallback is True   # 27B port 20.10.: the 27B row (PF on since z30y14)
     env = {FM.FORM_ENV: FM.PdFlipForm(arch="moe", experts="offload", draft="mtp", p_draft="none",
                                     kv="qsa_forma", flip="family", vision="off", profile="nextflash",
                                     model="m").env_value()}

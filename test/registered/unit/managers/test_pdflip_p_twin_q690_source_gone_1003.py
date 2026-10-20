@@ -325,6 +325,7 @@ def test_dual_finished_source_is_not_gone_it_publishes(dual, clock):
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.skip(reason="27B port 20.10.: the flip form prunes a twin whose source is gone at once (NF p_twin_defer); the DUAL layout keeps the 27B Q-690 path (tests above)")
 def test_flip_form_aborted_source_holds_until_the_frist(flip, clock, caplog, monkeypatch):
     monkeypatch.setenv(tw.ENV_WAIT_S, "5")
     caplog.set_level(logging.INFO, logger=tw.__name__)

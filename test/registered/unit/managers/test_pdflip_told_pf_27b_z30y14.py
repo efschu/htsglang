@@ -77,9 +77,9 @@ def test_the_27b_row_arms_pf_by_profile_default(monkeypatch):
     monkeypatch.setenv(FM.FORM_ENV, _form_env("qwen27b"))
     assert fb.env_on() is True
     assert FM.PROFILES["qwen27b"].told_group_fallback is True
-    # NF keeps its own row (released by the NF seat with a boot tag only)
+    # NF row: PF on since 14.10. (h16g WIDTH GUARD) -- the NF merge (27B port 20.10.) carries that row
     monkeypatch.setenv(FM.FORM_ENV, _form_env("nextflash"))
-    assert fb.env_on() is False
+    assert fb.env_on() is True
 
 
 def test_z30y14_specimen_is_a_rank_agreed_told_zero_not_a_death(monkeypatch):
