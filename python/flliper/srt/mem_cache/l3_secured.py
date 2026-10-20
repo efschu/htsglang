@@ -162,6 +162,8 @@ def queue_unsecured_all(why: str = "quiesce") -> int:
 
 
 QUIESCE_STATS = {"n": 0, "queued": 0}
+#: S109-A5-M: how often the L3 LRU took the file of a page still COMPLETE in L2 (each one a rewrite trigger)
+LRU_L2_STATS = {"n": 0, "bytes": 0}
 
 
 def secured(arena: Any, slots, backend: Any = None, evicting_ok: bool = False) -> np.ndarray:
@@ -405,7 +407,7 @@ _HAND: list = []
 _HAND_LOCK = threading.Lock()
 _HAND_THREAD: list = []
 _HAND_WAKE = threading.Event()
-HAND_STATS = {"queued": 0, "freed": 0, "copy_failed": 0, "reaped": 0, "dropped_without_l3": 0}
+HAND_STATS = {"queued": 0, "freed": 0, "free_refused": 0, "copy_failed": 0, "reaped": 0, "voided": 0, "dropped_without_l3": 0}
 
 
 def wait_or_stop(stop: "threading.Event", timeout_s: float) -> bool:
@@ -462,6 +464,43 @@ def _dropped_without_l3(n: int) -> None:
     HAND_STATS["dropped_without_l3"] = HAND_STATS.get("dropped_without_l3", 0) + int(n)
 
 
+def _hand_still_ours(arena: Any, slot: int, gen) -> tuple:
+    """S109-A8/A8-N1: is ``slot`` still the candidate -- EVICTING under ``gen``? Stamps it against the aged reaper
+    first (``ShmArena.touch_evicting``: the reaper re-reads touched_ms after its CAS and backs off), so a True stays
+    true for the stale age. ``(ok, state, generation)``."""
+    try:
+        touch = getattr(arena, "touch_evicting", None)
+        touched = bool(touch(int(slot), gen)) if callable(touch) else True
+        st = int(arena.slot_states([slot])[0])
+        g = int(np.asarray(arena.slot_gens_np([slot]))[0]) if gen is not None else None
+    except Exception:  # noqa: BLE001 -- cannot tell: never copy into an unknown slot
+        return False, -1, None
+    return (touched and st == 3 and (gen is None or g == int(gen))), st, g
+
+
+def _void_copy(backend: Any, arena: Any, stem: Optional[str]) -> None:
+    """S109-A8-N1 backstop: the slot stopped being the candidate WHILE its copy ran (the copy outlived the stale
+    age) -- the file written under the old stem may hold new bytes: unlinked, struck from the LRU and the #1459
+    index, the record voided (the hand-over thread, never the scheduler)."""
+    if not stem:
+        return
+    try:
+        path = backend._sharded_path(stem)
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        ev = getattr(backend, "_evictor", None)
+        if ev is not None and callable(getattr(ev, "forget", None)):
+            ev.forget([stem])
+        idx = getattr(backend, "_l3idx", None)
+        if idx is not None and callable(getattr(idx, "remove", None)):
+            idx.remove([stem])
+        invalidate_stems(arena, [stem])
+    except Exception as exc:  # noqa: BLE001 -- named; the counters say it happened
+        logger.warning("S109-A8-N1 EVICT-HANDOVER void of %s failed: %r", stem, exc)
+
+
 def _hand_drain() -> int:
     from flliper.srt.mem_cache.storage.file.hicache_arena import free_evicted_named
 
@@ -471,34 +510,56 @@ def _hand_drain() -> int:
     for item in work:
         arena, backend, cand, why = item[:4]
         gen = item[4] if len(item) > 4 else None
+        if _PROMOTE:
+            _promote_drain()                       # re-review (low): a promotion never waits behind a long drain
         # S109-A8 (re-review): still OUR candidate? EVICTING under the generation the clock saw. A slot the aged
         # reaper (arena_reap_stale, 60 s) freed -- and a new claim may have filled -- is never copied (new bytes under
-        # the old stem: the READ-DEPTH 1014 class); its page left L2 without a copy: dropped_without_l3
-        try:
-            st = int(arena.slot_states([cand[0]])[0])
-            g = int(np.asarray(arena.slot_gens_np([cand[0]]))[0]) if gen is not None else None
-        except Exception:  # noqa: BLE001 -- cannot tell: do not copy into an unknown slot
-            st, g = -1, None
-        if st != 3 or (gen is not None and g != int(gen)):
+        # the old stem: the READ-DEPTH 1014 class); its page left L2 without a copy: dropped_without_l3.
+        # S109-A8-N1: the check STAMPS the slot first (touch_evicting), so the reaper cannot take it between this
+        # check and the copy below.
+        ok_slot, st, g = _hand_still_ours(arena, cand[0], gen)
+        if not ok_slot:
             HAND_STATS["reaped"] = HAND_STATS.get("reaped", 0) + 1
             _dropped_without_l3(1)
             logger.warning("S109-A8 EVICT-HANDOVER slot=%d why=%s state=%d gen=%s/%s: reaped or re-claimed before its "
                            "copy -- not copied (no new bytes under the old stem); dropped_without_l3=1 (total %d)",
                            cand[0], why, st, g, gen, HAND_STATS["dropped_without_l3"])
             continue
+        try:
+            stem = (getattr(arena, "_stems", None) or {}).get((int(cand[1]), int(cand[2]))) or arena.slot_stem(cand[0])
+        except Exception:  # noqa: BLE001
+            stem = None
         secure = getattr(backend, "arena_secure_to_disk", None)
         ok = False
+        res = {}
         if callable(secure):
             try:
-                res = secure(arena, [cand], writer="evict_handover")
+                res = secure(arena, [cand], writer="evict_handover") or {}
                 ok = not int(res.get("lost", 0) or 0) and int(res.get("on_disk", 0) or 0) + \
                     int(res.get("written", 0) or 0) >= 1
             except Exception as exc:  # noqa: BLE001 -- the slot stays EVICTING, named
                 logger.warning("S109-A3 EVICT-HANDOVER copy raised for slot %d: %r", cand[0], exc)
+        # S109-A8-N1 backstop: the copy outlived the stamp (> the stale age) and the slot moved meanwhile
+        still, st2, g2 = _hand_still_ours(arena, cand[0], gen)
+        if not still:
+            if int(res.get("written", 0) or 0):
+                _void_copy(backend, arena, stem)
+                HAND_STATS["voided"] = HAND_STATS.get("voided", 0) + 1
+            HAND_STATS["reaped"] = HAND_STATS.get("reaped", 0) + 1
+            _dropped_without_l3(1)
+            logger.warning("S109-A8-N1 EVICT-HANDOVER slot=%d why=%s state=%d gen=%s/%s: the slot moved WHILE its copy "
+                           "ran -- the copy is voided (written=%s), dropped_without_l3=1 (total %d)", cand[0], why, st2,
+                           g2, gen, res.get("written", 0), HAND_STATS["dropped_without_l3"])
+            continue
         if ok:
-            free_evicted_named(arena, [cand[0]], "evict_handover")
-            HAND_STATS["freed"] += 1
-            done += 1
+            freed = free_evicted_named(arena, [cand[0]], "evict_handover")
+            if freed is None or int(freed) >= 1:   # S109-A8-N2: counted only when the free really happened
+                HAND_STATS["freed"] += 1
+                done += 1
+            else:
+                HAND_STATS["free_refused"] = HAND_STATS.get("free_refused", 0) + 1
+                logger.warning("S109-A8-N2 EVICT-HANDOVER slot=%d why=%s: copied, but the generation-bound free was "
+                               "refused (the slot moved after the copy) -- not counted freed", cand[0], why)
         else:
             HAND_STATS["copy_failed"] += 1
             _dropped_without_l3(1)
@@ -517,7 +578,7 @@ def _hand_drain() -> int:
 # eviction OWNER keeps an LRU (review anchor0 B1): elsewhere this is a no-op, as before.
 _PROMOTE: dict = {}
 PROMOTE_MAX = 262144
-PROMOTE_STATS = {"queued": 0, "refreshed": 0, "overflow": 0}
+PROMOTE_STATS = {"queued": 0, "refreshed": 0, "missed": 0, "overflow": 0}
 
 
 def promote(arena: Any, slots, backend: Any = None) -> int:
@@ -560,11 +621,42 @@ def _promote_drain() -> int:
     n = 0
     for backend, stems in work:
         try:
+            # S109-A6-M: a stem no longer in the LRU when the drain comes was taken in the window between the
+            # release and its promotion (missed)
+            lru = getattr(getattr(backend, "_evictor", None), "_lru", None)
+            if lru is not None:
+                PROMOTE_STATS["missed"] += sum(1 for st in stems if st not in lru)
             n += int(backend._l3_refresh_kept(stems, mtime=False) or 0)
         except Exception as exc:  # noqa: BLE001 -- recency is best effort, named
             logger.warning("S109-A6 L3-PROMOTE failed for %d stems: %r", len(stems), exc)
     PROMOTE_STATS["refreshed"] += n
     return n
+
+
+STATS_LOG_S = 60.0
+_STATS_LAST = {"t": 0.0, "snap": None}
+
+
+def stats_line(force: bool = False) -> Optional[str]:
+    """S109-A6-M / A5-M: one throttled line with every S109 counter (promotion, hand-over, quiesce wake-up, L3 LRU
+    takes of L2 pages) -- at most every STATS_LOG_S, and only when something moved."""
+    import time as _t
+
+    now = _t.monotonic()
+    snap = (tuple(PROMOTE_STATS.values()), tuple(HAND_STATS.values()), tuple(QUIESCE_STATS.values()),
+            tuple(LRU_L2_STATS.values()))
+    if not force and (now - _STATS_LAST["t"] < STATS_LOG_S or snap == _STATS_LAST["snap"]):
+        return None
+    _STATS_LAST["t"], _STATS_LAST["snap"] = now, snap
+    line = ("S109 L3-STATS promote queued=%d refreshed=%d missed=%d overflow=%d | handover queued=%d freed=%d "
+            "free_refused=%d copy_failed=%d reaped=%d voided=%d dropped_without_l3=%d | quiesce n=%d queued=%d | lru_took_l2 n=%d "
+            "bytes=%d" % (PROMOTE_STATS["queued"], PROMOTE_STATS["refreshed"], PROMOTE_STATS["missed"],
+                          PROMOTE_STATS["overflow"], HAND_STATS["queued"], HAND_STATS["freed"],
+                          HAND_STATS["free_refused"], HAND_STATS["copy_failed"], HAND_STATS["reaped"], HAND_STATS["voided"],
+                          HAND_STATS["dropped_without_l3"], QUIESCE_STATS["n"], QUIESCE_STATS["queued"],
+                          LRU_L2_STATS["n"], LRU_L2_STATS["bytes"]))
+    logger.info(line)
+    return line
 
 
 def _hand_loop() -> None:
@@ -576,5 +668,6 @@ def _hand_loop() -> None:
                 _promote_drain()                   # S109-A6: before a hand-over copy can make the LRU evict
             if _HAND:
                 _hand_drain()
+            stats_line()                           # S109-A6-M: throttled, only when a counter moved
         except Exception as exc:  # noqa: BLE001 -- the writer never dies
             logger.warning("S109-A3 EVICT-HANDOVER loop error: %r", exc)

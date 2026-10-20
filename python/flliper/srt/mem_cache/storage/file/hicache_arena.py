@@ -378,15 +378,15 @@ def _evict_gens_for(path: str) -> dict:
     return d
 
 
-def free_evicted_named(arena, slots, reason: str) -> None:
+def free_evicted_named(arena, slots, reason: str):
     """ARENA-FREE-GEN: an evictor's free of its own candidates -- generation
     bound where the arena knows it (``ShmArena.free_evicted``); a hermetic
     arena without it frees as before."""
     fe = getattr(arena, "free_evicted", None)
     if callable(fe):
-        fe(slots, reason=reason)
-    else:
-        free_named(arena, slots, reason)
+        return fe(slots, reason=reason)       # S109-A8-N2: the number really freed
+    free_named(arena, slots, reason)
+    return None
 
 
 def free_named(arena, slots, reason: str) -> None:
@@ -466,6 +466,8 @@ def _load_lib() -> Optional[ctypes.CDLL]:
             lib.arena_reap_stale.argtypes = [p_u8]
             lib.arena_reap_stale_aged.restype = i64
             lib.arena_reap_stale_aged.argtypes = [p_u8, i64]
+            lib.arena_touch_evicting.restype = i64
+            lib.arena_touch_evicting.argtypes = [p_u8, i64, i64]
             lib.arena_slot_gens.restype = i64
             lib.arena_slot_gens.argtypes = [p_u8, i64, p_i64, p_i64]
             lib.arena_free_evicting.restype = i64
@@ -703,6 +705,11 @@ class ShmArena:
             for i in range(got):
                 eg[int(slots[i])] = int(gens[i])
         return [(int(slots[i]), int(lo[i]), int(hi[i]), int(tot[i])) for i in range(got)]
+
+    def touch_evicting(self, slot: int, gen: Optional[int]) -> bool:
+        """S109-A8-N1: stamp ``slot`` against the aged reaper while it is EVICTING under ``gen`` (None: any
+        generation); False = it is not that candidate any more (reaped / re-claimed). One C call, no wait."""
+        return bool(self._lib.arena_touch_evicting(self._base, int(slot), -1 if gen is None else int(gen)))
 
     def free_evicted(self, slots: Sequence[int], reason: str = "evict") -> int:
         """ARENA-FREE-GEN: free this process's eviction candidates -- each only

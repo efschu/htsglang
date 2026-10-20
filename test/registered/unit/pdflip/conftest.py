@@ -118,45 +118,6 @@ def _pdflip_draft_on_p_form(request):
             os.environ[_DRAFT_ON_P_ENV] = backup
 
 
-#: The boot form ``launcher.main`` PUBLISHES into ``os.environ``
-#: (pdflip/form.py FORM_ENV) and the speculative form it installs into
-#: ``launcher._SPEC_FORM`` outlive the case that ran ``main`` -- every later
-#: module then reads the registry defaults of THAT boot's profile. Measured
-#: 29.09.: once the qwen27b row turned --d-replayssm-spec and X-EXACT on, the
-#: dry-run cases (#1378, #1386, #1392) leaked d_replayssm_spec=on and the
-#: qwen27b form into NF wake-credit (h14, pd_h34), pd_free0 h92d and X-EXACT
-#: cases. Saved and restored around every case, like the H25 value above.
-_FORM_ENV = "FLLIPER_PDFLIP_FORM"
-
-
-@pytest.fixture(autouse=True)
-def _pdflip_published_form():
-    from flliper.srt.pdflip import launcher  # imported by nearly every case anyway
-
-    backup = os.environ.get(_FORM_ENV)
-    spec = dict(launcher._SPEC_FORM)
-    try:
-        yield
-    finally:
-        if backup is None:
-            os.environ.pop(_FORM_ENV, None)
-        else:
-            os.environ[_FORM_ENV] = backup
-        launcher._SPEC_FORM.clear()
-        launcher._SPEC_FORM.update(spec)
-
-
-@pytest.fixture(autouse=True)
-def _pdflip_decode_collect_old_path(monkeypatch):
-    """SET SCHEDULER (SOLL v2, 17.10.) ships ON with T_halb = 4.5 s. The suite's arrival / park / flip tests pin the
-    immediate paths they were written for (no wait while D decodes), so T_halb is 0 -- the set decides at once -- unless
-    a test sets it. The old DECODE-COLLECT window is gone (its flag is read by nothing)."""
-    if "FLLIPER_PDFLIP_HALF_FLIP_S" not in os.environ:
-        # A7: ``FLLIPER_PDFLIP_TEST_T_HALF=4.5 pytest <arrival/flip files>`` runs the same files with the production T_halb
-        monkeypatch.setenv("FLLIPER_PDFLIP_HALF_FLIP_S", os.environ.get("FLLIPER_PDFLIP_TEST_T_HALF", "0"))
-    yield
-
-
 # ---------------------------------------------------------------------------------------------------------------------
 # S109b seam (NF 20.10.): the spills read the write-behind's shared record and only QUEUE a missing L3 copy
 # (mem_cache/l3_secured; user 20.10.: no synchronous write into the cache in the scheduler thread). The tests of the
@@ -194,4 +155,43 @@ def _s109b_write_behind_instant(request, monkeypatch):
                                 lambda self, slots: (self._secure_before_drop_now(slots), set())[1])
     except Exception:  # noqa: BLE001
         pass
+    yield
+
+
+#: The boot form ``launcher.main`` PUBLISHES into ``os.environ``
+#: (pdflip/form.py FORM_ENV) and the speculative form it installs into
+#: ``launcher._SPEC_FORM`` outlive the case that ran ``main`` -- every later
+#: module then reads the registry defaults of THAT boot's profile. Measured
+#: 29.09.: once the qwen27b row turned --d-replayssm-spec and X-EXACT on, the
+#: dry-run cases (#1378, #1386, #1392) leaked d_replayssm_spec=on and the
+#: qwen27b form into NF wake-credit (h14, pd_h34), pd_free0 h92d and X-EXACT
+#: cases. Saved and restored around every case, like the H25 value above.
+_FORM_ENV = "FLLIPER_PDFLIP_FORM"
+
+
+@pytest.fixture(autouse=True)
+def _pdflip_published_form():
+    from flliper.srt.pdflip import launcher  # imported by nearly every case anyway
+
+    backup = os.environ.get(_FORM_ENV)
+    spec = dict(launcher._SPEC_FORM)
+    try:
+        yield
+    finally:
+        if backup is None:
+            os.environ.pop(_FORM_ENV, None)
+        else:
+            os.environ[_FORM_ENV] = backup
+        launcher._SPEC_FORM.clear()
+        launcher._SPEC_FORM.update(spec)
+
+
+@pytest.fixture(autouse=True)
+def _pdflip_decode_collect_old_path(monkeypatch):
+    """SET SCHEDULER (SOLL v2, 17.10.) ships ON with T_halb = 4.5 s. The suite's arrival / park / flip tests pin the
+    immediate paths they were written for (no wait while D decodes), so T_halb is 0 -- the set decides at once -- unless
+    a test sets it. The old DECODE-COLLECT window is gone (its flag is read by nothing)."""
+    if "FLLIPER_PDFLIP_HALF_FLIP_S" not in os.environ:
+        # A7: ``FLLIPER_PDFLIP_TEST_T_HALF=4.5 pytest <arrival/flip files>`` runs the same files with the production T_halb
+        monkeypatch.setenv("FLLIPER_PDFLIP_HALF_FLIP_S", os.environ.get("FLLIPER_PDFLIP_TEST_T_HALF", "0"))
     yield

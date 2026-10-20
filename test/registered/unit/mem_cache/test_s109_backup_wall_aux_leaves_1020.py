@@ -431,7 +431,11 @@ def test_the_write_behind_keeps_its_record_in_the_shared_mapping_and_serves_requ
     from flliper.srt.mem_cache.hicache_storage import HiCacheFile
 
     src = inspect.getsource(HiCacheFile.l3_write_behind_pass)
-    assert src.count("_l3s.publish(arena,") == 3, "on disk, written, and written by the sibling group: all published"
+    # S109-A5-N1: every publish goes through _l3wb_publish (publish, then the #1459 index re-read)
+    assert src.count("self._l3wb_publish(arena,") == 3, "on disk, written, and written by the sibling group: all published"
+    assert "_l3s.publish(" not in src, "a bare publish skips the index re-read (A5-N1)"
+    hsrc = inspect.getsource(HiCacheFile._l3wb_publish)
+    assert hsrc.index("_l3s.publish(arena, slots, gens)") < hsrc.index("idx.has(") < hsrc.index("base_gen[_b] = -1")
     i_take = src.index("_l3s.take_urgent(arena)")
     i_cur = src.index("new = new[int(np.searchsorted(slots[new], cur)):]")
     i_cat = src.index("new = np.concatenate([_urg_new, new])")
@@ -776,7 +780,10 @@ def test_s109_a3_a_race_candidate_is_handed_over_not_freed(tmp_path):
     be.pins = None
     copied = []
 
+    go = _threading.Event()
+
     def _writer(ar, cands, writer="claim_room"):
+        go.wait(5.0)                                         # the hand-over thread waits until the test looked
         copied.append((writer, [int(c[0]) for c in cands], _threading.current_thread().name))
         return {"on_disk": 0, "written": len(cands), "lost": 0}
 
@@ -787,6 +794,7 @@ def test_s109_a3_a_race_candidate_is_handed_over_not_freed(tmp_path):
     with _m.patch.object(L3S, "unsecured_keys_lo", lambda a, b=None: np.zeros(0, dtype=np.uint64)):
         assert HiCacheFile._arena_evict_to_disk(be, arena, 4) == 0
     took = [s_ for s_ in slots if arena.slot_states([s_])[0] == 3]
+    go.set()
     assert len(took) == 1, "the candidate is EVICTING, not freed"
     for _ in range(200):
         if copied and arena.slot_states(took)[0] != 3:
@@ -842,7 +850,10 @@ def test_s109_a3_a_claim_race_candidate_is_handed_over_not_freed(tmp_path):
     be.pins = None
     copied = []
 
+    go = _threading.Event()
+
     def _writer(ar, cands, writer="claim_room"):
+        go.wait(5.0)                                         # the hand-over thread waits until the test looked
         copied.append((writer, len(cands), _threading.current_thread().name))
         return {"on_disk": 0, "written": len(cands), "lost": 0}
 
@@ -850,6 +861,7 @@ def test_s109_a3_a_claim_race_candidate_is_handed_over_not_freed(tmp_path):
     with _m.patch.object(L3S, "unsecured_keys_lo", lambda a, b=None: np.zeros(0, dtype=np.uint64)):
         p._evict_for_claim(arena, 2)
     st = arena.slot_states(slots)
+    go.set()
     assert sum(1 for x in st if x == 3) == 2 and sum(1 for x in st if x == 0) == 0, st
     for _ in range(200):
         if copied and sum(1 for x in arena.slot_states(slots) if x == 0) == 2:
@@ -910,7 +922,7 @@ def _reuse_boot(tmp_path, monkeypatch):
     be = RR._boot(tmp_path, monkeypatch, "boot1")
     hs = RR._hashes("s")
     RR._prefill(be, hs)
-    assert be.l3_write_behind_pass()["written"] == 2 * RR.PAGES
+    assert be.l3_write_behind_pass(slice_s=0)["written"] == 2 * RR.PAGES
     return RR, be, hs
 
 
@@ -929,10 +941,10 @@ def test_s109_a5_the_l3_lru_unlink_makes_the_real_pass_copy_the_page_again(tmp_p
     be._l3idx.remove([victim])
     be._l3sec_on_evict(victim)                                 # ... and its on_evict hook
     assert L3S.secured(kv, [slot], be).tolist() == [False]
-    r = be.l3_write_behind_pass()
+    r = be.l3_write_behind_pass(slice_s=0)
     assert r["written"] == 1 and os.path.exists(be._existing_path(victim)), r
     assert L3S.secured(kv, [slot], be).tolist() == [True], "re-copied, published again"
-    assert be.l3_write_behind_pass()["written"] == 0
+    assert be.l3_write_behind_pass(slice_s=0)["written"] == 0
 
 
 @_needs_gcc
@@ -949,7 +961,7 @@ def test_s109_a5_the_sister_writers_unlink_is_seen_through_the_shared_record(tmp
     be._l3idx.remove([victim])
     L3S.arrays(kv)[0][slot] = -1                                # the sister process's invalidate_stems
     assert kv._l3wb_sec[0][slot] >= 0, "this process's baseline is untouched"
-    assert be.l3_write_behind_pass()["written"] == 1
+    assert be.l3_write_behind_pass(slice_s=0)["written"] == 1
 
 
 class _PromoteBe:
@@ -1090,3 +1102,85 @@ def test_s109_a8_a_failed_hand_over_copy_counts_as_dropped(tmp_path):
     L3S._hand_drain()
     assert L3S.HAND_STATS["dropped_without_l3"] == h0 + 1
     assert arena.slot_states([cands[0][0]])[0] == 3
+
+
+# ---------------------------------------------------------------------------------------------------- re-review 2: N1/N2/M
+@_needs_gcc
+def test_s109_a8n1_the_real_aged_reaper_cannot_take_the_slot_while_the_hand_over_copies(tmp_path):
+    """The hand-over stamps its candidate (arena_touch_evicting) before the check: the real aged reaper, firing while
+    the copy runs, backs off -- the copy is of the candidate, the hand-over frees it. (Without the stamp the slot,
+    EVICTING longer than the reaper's age, is reaped mid-copy.)"""
+    import time as _t
+
+    from flliper.srt.mem_cache import l3_secured as L3S
+    import flliper.srt.mem_cache.storage.file.hicache_arena as HA
+
+    p, arena, slots = _unreferenced_full_arena(tmp_path)
+    be = p._backend
+    cands = arena.evict_candidates(1)
+    s0 = cands[0][0]
+    gen = HA._evict_gens_for(arena.path).get(s0)
+    _t.sleep(0.25)                                           # EVICTING older than the reaper's age below
+    seen, reaped = [], []
+
+    def _copy(ar, cs, writer="x"):
+        reaped.append(int(ar._lib.arena_reap_stale_aged(ar._base, 200)))   # the reaper fires mid-copy
+        seen.append((int(ar.slot_states([s0])[0]), int(np.asarray(ar.slot_gens_np([s0]))[0])))
+        return {"written": 1, "lost": 0}
+
+    be.arena_secure_to_disk = _copy
+    f0 = L3S.HAND_STATS["freed"]
+    with L3S._HAND_LOCK:
+        L3S._HAND.append((arena, be, tuple(cands[0]), "test", gen))
+    L3S._hand_drain()
+    assert reaped == [0] and seen == [(3, gen)], (reaped, seen)
+    assert arena.slot_states([s0])[0] == 0 and L3S.HAND_STATS["freed"] == f0 + 1
+
+
+@_needs_gcc
+def test_s109_a8n2_freed_counts_only_a_free_that_happened(tmp_path):
+    from flliper.srt.mem_cache import l3_secured as L3S
+    import flliper.srt.mem_cache.storage.file.hicache_arena as HA
+
+    p, arena, slots = _unreferenced_full_arena(tmp_path)
+    be = p._backend
+    be.arena_secure_to_disk = lambda ar, cs, writer="x": {"written": 1, "lost": 0}
+    cands = arena.evict_candidates(1)
+    gen = HA._evict_gens_for(arena.path).get(cands[0][0])
+    arena.free_evicted = lambda sl, reason="": 0           # the generation-bound free refuses
+    f0, r0 = L3S.HAND_STATS["freed"], L3S.HAND_STATS["free_refused"]
+    with L3S._HAND_LOCK:
+        L3S._HAND.append((arena, be, tuple(cands[0]), "test", gen))
+    L3S._hand_drain()
+    assert L3S.HAND_STATS["freed"] == f0 and L3S.HAND_STATS["free_refused"] == r0 + 1
+
+
+@_needs_gcc
+def test_s109_a5m_the_lru_taking_an_l2_page_is_counted(tmp_path):
+    from flliper.srt.mem_cache import l3_secured as L3S
+    from flliper.srt.mem_cache.hicache_storage import HiCacheFile
+
+    p, arena, slots = _unreferenced_full_arena(tmp_path)
+    _write_behind(arena, p._backend._l3idx, slots[:2])
+    n0, b0 = L3S.LRU_L2_STATS["n"], L3S.LRU_L2_STATS["bytes"]
+    fake = types.SimpleNamespace(metadata_cache=None, _arenas={"kv": arena})
+    HiCacheFile._l3sec_on_evict(fake, arena.slot_stem(slots[0]))
+    HiCacheFile._l3sec_on_evict(fake, "not-in-l2")
+    assert L3S.LRU_L2_STATS["n"] == n0 + 1 and L3S.LRU_L2_STATS["bytes"] == b0 + int(arena.slot_bytes)
+
+
+@_needs_gcc
+def test_s109_a6m_promote_stats_are_logged_with_missed(tmp_path):
+    from flliper.srt.mem_cache import l3_secured as L3S
+
+    p, arena, slots = _unreferenced_full_arena(tmp_path)
+    be = _PromoteBe()
+    be._evictor._lru = {arena.slot_stem(slots[0]): 1}       # slot 1's file left the LRU before the drain
+    m0 = L3S.PROMOTE_STATS["missed"]
+    with L3S._HAND_LOCK:
+        L3S._PROMOTE[id(be)] = (be, {arena.slot_stem(slots[0]): None, arena.slot_stem(slots[1]): None})
+    L3S._promote_drain()
+    assert L3S.PROMOTE_STATS["missed"] == m0 + 1
+    line = L3S.stats_line(force=True)
+    assert line.startswith("S109 L3-STATS promote queued=") and " missed=%d " % L3S.PROMOTE_STATS["missed"] in line
+    assert L3S.stats_line() is None, "throttled: nothing moved, under STATS_LOG_S"
