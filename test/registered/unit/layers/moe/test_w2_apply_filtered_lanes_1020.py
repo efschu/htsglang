@@ -148,3 +148,22 @@ def test_fused_marlin_moe_takes_the_ep_form_inside_the_context():
     assert body.count("is_ep=is_ep,") == 2
     assert "if is_ep:\n        intermediate_cache3.zero_()" in body
     assert "is_ep=expert_map is not None" not in body
+
+
+def test_the_49_stage_walk_never_reports_a_minus_one_lane():
+    """The #49 stage walk (FLLIPER_MOE_MARLIN_C_SENTINEL=2) scans GEMM1 / ACT / GEMM2 rows for non-finite
+    values. In the EP form a -1 lane's GEMM1 / ACT rows are never written: they are excluded; a live lane's
+    bad row still counts; outside the EP form nothing changes."""
+    import inspect
+
+    from flliper.srt.layers.moe.fused_moe_triton import fused_marlin_moe as FM
+
+    bad = torch.tensor([True, False, True, True])            # (token, k) rows, M=2, topk=2
+    ids = torch.tensor([[3, -1], [-1, 5]])
+    assert FM._live_lanes_only(bad, ids, True, 2, 2).tolist() == [True, True]   # live lanes 0 and 3
+    ids2 = torch.tensor([[-1, 2], [-1, 5]])
+    assert FM._live_lanes_only(bad, ids2, True, 2, 2).tolist() == [False, True]  # token 0 bad only on -1
+    assert FM._live_lanes_only(bad, ids2, False, 2, 2).tolist() == [True, True]  # not EP: unchanged
+    src = inspect.getsource(FM)
+    for stage in ("GEMM1", "ACT", "GEMM2"):
+        assert '_stage_masks["%s"] = _live_lanes_only(' % stage in src
