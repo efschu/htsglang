@@ -148,7 +148,7 @@ def test_an_x_refusal_body_keeps_ds_extent():
     body = b"W50 PdFlipTpPrefillExceeded: this request's extent after prefix matching is 15077."
     assert F.Front._wall_extent_to_u(f, "r", body, 15077) == 15077
     assert F.Front._wall_extent_to_u(f, "r", WALL_BODY, None) is None
-    assert F.Front._wall_extent_to_u(f, "unknown", WALL_BODY, 85494) == 85494  # no probe: the rows, named
+    assert F.Front._wall_extent_to_u(f, "unknown", WALL_BODY, 85494) == 0  # NF-VISION-CACHED: no number -> unpriced
 
 
 def test_the_requeue_path_calls_the_wall_conversion_before_any_use_of_the_extent():
