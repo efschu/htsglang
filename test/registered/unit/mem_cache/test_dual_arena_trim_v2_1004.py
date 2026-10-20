@@ -693,6 +693,9 @@ def _pp_stage(rank, n_leaves=97):
     h.flush_wrapper = types.SimpleNamespace(apply_pp0_verdict=lambda *a, **k: None)
     h._pdflip_store_told_armed = False
     h._pdflip_vote_pass_hook = lambda reqs: None
+    # 27B port 20.10.: the NF pass hooks (PR room vote, lane floor) on the test stage
+    h._pdflip_pp_room_pass_hook = lambda: None
+    h._pdflip_lane_floor_pass_hook = lambda: None
     h._pdflip_vote_after_forward = lambda reqs: reqs
     h._pp_commit_comm_work = lambda work: None
     h.sent, h.dispatched = [], []

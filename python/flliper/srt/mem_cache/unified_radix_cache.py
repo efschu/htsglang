@@ -14525,6 +14525,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return
 
         if write_back:
+            if not self.ongoing_write_through:
+                return  # nothing in flight to wait for or ack (the 27B guard; every ack below needs an ongoing id)
             from flliper.srt.pdflip import d_turn_end_l2 as _te
 
             if only is None:
