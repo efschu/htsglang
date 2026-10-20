@@ -3661,6 +3661,12 @@ class HiCacheFile(HiCacheStorage):
         t = threading.Thread(target=_run, name="pdflip-l3-write-behind", daemon=True)
         self._l3wb_thread = t
         t.start()
+        try:  # S104: the SIGTERM handler drains this backend before the process ends (l3_final_drain)
+            from flliper.srt.mem_cache import l3_final_drain as _s104_fd
+
+            _s104_fd.register(self)
+        except Exception:  # noqa: BLE001 - never the write-behind start
+            logger.warning("S104 L3-FINAL-DRAIN register raised", exc_info=True)
         logger.info(
             "L3-REUSE WRITE-BEHIND started (every %.1f s, %d MiB per arena and pass, store %s): "
             "every COMPLETE L2 arena page gets its L3 copy, so a restart resumes from L3",

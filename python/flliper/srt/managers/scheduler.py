@@ -21282,8 +21282,11 @@ class Scheduler(
         empty_cache: bool = True,
         zero_kv: Optional[bool] = None,
         tp_group_verdict: bool = False,
+        pdflip_flip_quiesce: bool = False,
     ):
         """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache.
+        ``pdflip_flip_quiesce``: S104 review A1 -- the front's flip quiesce (a sleep leg follows); only then
+        may an idle flush with un-backed device KV hand its reset to the sleep leg.
         ``tp_group_verdict``: fnFL2x105 -- the caller guarantees every TP rank
         runs this flush in the same pass (the immediate /flush_cache RPC), so
         the idle verdict is reduced over the HiCache group instead of read
@@ -21321,6 +21324,7 @@ class Scheduler(
         # write-back drain), then reset.  FLLIPER_HICACHE_FLUSH_PUBLISH_SWEEP=0
         # restores the old form.
         self._pdflip_last_flush_refusal = ""  # QUIESCE-PENDING: only THIS flush's refusal names a lap
+        _s104_unbacked_left = 0  # S104: the #1470 loop's un-backed remainder on THIS rank (0 = no sweep ran)
         from flliper.srt.managers import pdflip_bubble_publish as _f5_bubble
 
         if (
@@ -21455,6 +21459,7 @@ class Scheduler(
                             _s83_c("flush_end")   # S83 instrument: un-backed nodes left -- who holds the arena
                         except Exception:  # noqa: BLE001 - never the flush
                             pass
+                _s104_unbacked_left = int(_stats.get("unbacked", 0) or 0)
                 logger.info(
                     "#1470 FLUSH-PUBLISH issued=%d unbacked_left=%s in_flight_after=%s waited_ms=%.0f "
                     "(un-backed nodes published and their write-throughs joined BEFORE the reset)%s",
@@ -21473,6 +21478,14 @@ class Scheduler(
         )
         if _b1_quiesced is not None:
             logger.info("%s | #1268 group verdict: %s", _b1_quiesced, verdict_detail)
+            return True
+        # S104 (rc22 D 09:54:35, 10432 tokens): an idle quiesce whose #1470 loop left un-backed nodes (KV arena
+        # full of tree references) hands its reset to the sleep leg, where S86 releases the L3-proven slots first
+        _s104_deferred = _pdflip_flush_nonblock.s104_defer_reset_verdict(
+            self, group_idle, tp_group_verdict, _s104_unbacked_left, flip_quiesce=pdflip_flip_quiesce
+        )
+        if _s104_deferred is not None:
+            logger.info("%s | #1268 group verdict: %s", _s104_deferred, verdict_detail)
             return True
         if group_idle:
             # fnFL2 H63d (#1470b): the reset below restarts the storage
@@ -24091,6 +24104,14 @@ def run_scheduler_process(
         from flliper.srt.pdflip.gc_instrument import arm_after_boot as _pdflip_gc_arm
 
         _pdflip_gc_arm(server_args, tp_rank, pp_rank=pp_rank)
+        # S104 L3-FINAL-DRAIN: SIGTERM lets this process's L3 write-behind (if it owns one) copy what L2 completed
+        # since its last pass before the process ends (rc22 10:50 stop: 1216 tokens)
+        try:
+            from flliper.srt.mem_cache import l3_final_drain as _s104_fd
+
+            _s104_fd.install()
+        except Exception:  # noqa: BLE001 - never the boot
+            logger.warning("S104 L3-FINAL-DRAIN install raised", exc_info=True)
         # #1054: a MEASUREMENT run keeps the window open past this point. The
         # boot-bounded window is right for the resident posts and blind to the
         # transient one that killed boot 24 -- the GDN extend allocation only

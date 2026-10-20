@@ -1453,6 +1453,11 @@ class FlushCacheReqInput(BaseReq, kw_only=True):
     # z30j: PP0's stamp on the request chain; a follower waits for PP0's
     # verdict on this seq instead of deciding the flush itself (pdflip/flush_verdict.py).
     pdflip_flush_seq: Optional[int] = None
+    # S104 review A1: True only on the front's flip quiesce (pdflip/front.py ``quiesce``) -- the one flush a sleep
+    # leg follows. Only such a flush may hand its reset to the sleep leg (S104 FLUSH-DEFER-RESET); every other
+    # /flush_cache (operator, test, "remove wrong data") resets as before. Replicated: the same request reaches
+    # every rank.
+    pdflip_flip_quiesce: bool = False
 
 
 class FlushCacheReqOutput(BaseReq, kw_only=True):

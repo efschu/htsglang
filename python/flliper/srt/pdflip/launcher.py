@@ -27742,6 +27742,55 @@ def _cards_empty(cards: list[dict]) -> bool:
     return True
 
 
+#: S104 review A2 (nf-review-s104-1020): a scheduler process that still lives this long after the teardown's TERM
+#: is SIGKILLed by name. Only the L3 write-behind owner (D TP0, P PP0) handles SIGTERM at all
+#: (mem_cache/l3_final_drain.py: drain bounded by FINAL_DRAIN_S = 3 s, then SIGTERM to itself); every other rank
+#: keeps the default action. A Python handler runs only between bytecodes: an owner whose main thread is blocked in C
+#: (an NCCL wait on a dead peer, a CUDA sync) never runs it and used to live until the 60 s SIGKILL below, holding
+#: its card. FINAL_DRAIN_S + 2 s: the drain's own bound plus its join and the re-sent SIGTERM.
+S104_SCHED_KILL_S = 5.0
+
+
+def s104_scheduler_pids(pids, cmdline=None) -> List[int]:
+    """The scheduler processes among ``pids`` (process title ``flliper::scheduler...``, set by
+    ``run_scheduler_process``) -- read BEFORE the TERM."""
+    cmdline = cmdline or _proc_cmdline
+    out = []
+    for p in sorted(pids):
+        try:
+            if "::scheduler" in (cmdline(int(p)) or ""):
+                out.append(int(p))
+        except Exception:  # noqa: BLE001 - an unreadable pid is not named
+            pass
+    return out
+
+
+def s104_escalate_schedulers(sched, bound_s: float = S104_SCHED_KILL_S, *, alive=None, kill=None,
+                             clock=time.monotonic, sleep=time.sleep, log=print) -> List[int]:
+    """Wait at most ``bound_s`` for the TERMed scheduler pids, then SIGKILL the ones still alive, named
+    (``S104 TEARDOWN-SCHED-KILL``). Returns the pids killed. Nothing else in the teardown changes: the front and
+    the HTTP servers keep their 60 s graceful bound."""
+    alive = alive or _alive
+    kill = kill or (lambda p: os.kill(p, signal.SIGKILL))
+    sched = list(sched or [])
+    if not sched:
+        return []
+    t0 = clock()
+    while clock() - t0 < bound_s and any(alive(p) for p in sched):
+        sleep(0.1)
+    left = [p for p in sched if alive(p)]
+    for p in left:
+        try:
+            kill(p)
+        except OSError:
+            pass
+    if left:
+        log(f"S104 TEARDOWN-SCHED-KILL pids={left} after {bound_s:.1f} s (a scheduler still alive after the "
+            f"TERM: the L3 write-behind owner's drain is bounded at 3 s -- a main thread blocked in C never ran "
+            f"its handler; SIGKILL instead of holding the card until the 60 s bound)", flush=True)
+    return left
+
+
 def teardown(path: str, report: dict | None = None) -> int:
     """Tear down a boot from its state json. Unchanged signature for the
     ``--teardown PATH`` CLI mode (main()'s ``if ns.teardown: return
@@ -27780,12 +27829,15 @@ def teardown(path: str, report: dict | None = None) -> int:
     if st.get("tag"):
         for name in ("memts", "deadman_P", "deadman_D", "deadman_front"):
             unregister_helper(st["tag"], name)
+    # S104 review A2: the scheduler processes are named BEFORE the TERM (a dead pid has no cmdline)
+    s104_sched = s104_scheduler_pids(pids)
     print(f"TERM {sorted(pids)}")
     for p in pids:
         try:
             os.kill(p, signal.SIGTERM)
         except OSError:
             pass
+    s104_escalate_schedulers(s104_sched)
     t0 = time.time()
     while time.time() - t0 < 60 and any(_alive(p) for p in pids):
         time.sleep(2)
