@@ -12535,9 +12535,15 @@ class Front:
             return 0
         frac = Front._set_cfg()[0]
         n = 0
+        try:
+            go_p = self._set_st()["go_p"]
+        except Exception:  # noqa: BLE001 -- a test double without the set state
+            go_p = set()
         for q in live_q:
             if getattr(q, "d_eligible", False) or not Front._wait_seat_owned(self, q):
                 continue
+            if q.rid in go_p:
+                continue                           # EZ-S2a H8: committed to a decided flip (R1a rider) -- never D's as well
             u, xq = int(getattr(q, "est_uncached", 0) or 0), Front._set_x_of_entry(self, q)
             if u >= phase_policy.half_x_of(xq, frac):
                 continue
@@ -14497,7 +14503,9 @@ class Front:
             x_tok = int(self.tp_prefill_max_tokens)
             if any(phase_policy.immediate_park_trigger([q], x_tok) is None for q in committed):
                 # released halb SHORTs ride the set's flip (no entry of theirs "needs P" by itself)
-                return self._asr_pbound_flip_now(committed, x_tok, now)
+                _xs = self._set_st().get("xs", {})
+                return self._asr_pbound_flip_now(committed, x_tok, now,
+                                                 trigger_pool=[q for q in committed if q.rid in _xs] if _fd.enabled() else None)
             # natural P candidates: the set said "now", the flip machinery below carries it out (PBOUND-FLIP-NOW,
             # or the seat/KV verdict with the switch off)
         # y4y: a queued SHORT has an owner -- D, as a d_prefill verdict (the
@@ -14620,7 +14628,8 @@ class Front:
         return False, not self.admit_d, None
 
     def _asr_pbound_flip_now(self, cands: List["Pending"], x_tok: int,
-                             now: float) -> Tuple[bool, bool, Optional["Pending"]]:
+                             now: float, trigger_pool: Optional[List["Pending"]] = None
+                             ) -> Tuple[bool, bool, Optional["Pending"]]:
         """PBOUND-FLIP-NOW (user law 02.10. "Request kommt = sofort Prefill"):
         the OLDEST queued request that needs P (LONG over X, P-only/vision,
         requeued, carrier) flips D->P now. It never needed a D seat or D KV
@@ -14629,7 +14638,10 @@ class Front:
         229 s on 'wait_seat why=kv', 17 younger requests admitted past it)."""
         st = self._asr_st()
         # PRIO-AS-AGE 1014: the "oldest" that flips is the first by the order key; its wait clock is real
-        p = Front._prio_sorted(self, cands, t_of=lambda c: float(getattr(c, "t_arrive", now) or now))[0]
+        # EZ-S2a H7: with a decided set the trigger named in the line is the oldest MEMBER (``trigger_pool``), never a
+        # kurz WAIT_SEAT rider that merely rides the flip (R2: no flip for a kurz request)
+        p = Front._prio_sorted(self, list(trigger_pool or cands),
+                               t_of=lambda c: float(getattr(c, "t_arrive", now) or now))[0]
         waited = now - max(_lctl.clock_t(p, now), float(self.t_awake))
         if waited > 2.0 and st.get("pbound_stall_rid") != p.rid:
             st["pbound_stall_rid"] = p.rid
@@ -17003,6 +17015,14 @@ class Front:
             seat.release("W50_requeue")
         p.seat = None
         p.d_eligible = p.d_direct = False  # idle policy (b): D refused it -- P's now
+        if _fd.enabled():
+            # EZ-S2a review B1 (S2a-1b, SOLL R7/R3): D refused it AGAIN -- the earlier D_AFTER_TIMER verdict is spent. The
+            # marker would keep ``_set_cands`` from taking it back (no owner: the orphan of #246b); without it the entry is a
+            # member again, one verdict per round (R3), W35 bounds the rounds at n=3
+            try:
+                self._set_st().get("d_after", set()).discard(str(rid))
+            except Exception:  # noqa: BLE001 -- a test double without the set state
+                pass
         if _mclass is not None and not getattr(p, "p_only", False):
             # EZ-S1 review B1: a measured request is executed by its MEASURED class. kurz: no set member, D's again (R2,
             # ``_asr_queued_short_to_d`` takes it with the decision X); halb: a set member that is NOT p_only (``_set_cands``

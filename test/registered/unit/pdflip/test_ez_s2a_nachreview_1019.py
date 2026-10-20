@@ -189,7 +189,15 @@ def test_a1_pin_flipqueue_refused_under_x_does_not_need_p_but_has_an_owner():
     assert not F.Front._p_phase_needs_p(f, p)                  # the P phase may end without it (no double flip)
     assert F.Front._p_phase_needs_p(f, _queue(f, "v", 10, p_only=True))   # R9 stays P
     _dcs, handed = _settle(f)
-    assert "w31" in handed
+    # EZ-S2a H8 (one owner): the p_only "v" decides a flip (R9/R4) -- w31 is then its R1a rider (go_p), no longer ALSO handed to D
+    assert "w31" in f._set_st()["go_p"] and "w31" not in handed
+
+
+def test_a1_pin_flipqueue_refused_under_x_without_a_flip_is_handed_to_d():
+    f = _d_awake(_fresh())
+    _refuse(f, "w31", 10)
+    _dcs, handed = _settle(f)
+    assert "w31" in handed and "w31" not in f._set_st()["go_p"]
 
 
 def test_a1_pin_27b_park2_band_deferred_has_an_owner_on():
