@@ -7652,6 +7652,8 @@ class Front:
         """S56 D-MATCH-PROBE: start D's probe for this arrival (None: switch off, no D group, unpriced shape)."""
         if not envs.FLLIPER_PDFLIP_D_MATCH_PROBE.get():
             return None
+        if getattr(self, "dual_layout", False):
+            return None  # 27B DUAL (port 20.10., user 20.10.: dual unchanged): priced as before, no D probe RPC
         D = self.groups.get("D") if isinstance(getattr(self, "groups", None), dict) else None
         if D is None or getattr(self, "session", None) is None or not isinstance(payload, dict):
             return None
@@ -13154,6 +13156,8 @@ class Front:
         try:
             if not envs.FLLIPER_PDFLIP_TOK_AHEAD.get() or not _dmp.payload_has_any_media(payload):
                 return False
+            if getattr(self, "dual_layout", False):
+                return False  # 27B DUAL: P is awake and prefills at once -- no flip to hide (port 20.10.)
             P = self.groups.get("P") if isinstance(getattr(self, "groups", None), dict) else None
             if P is None or getattr(self, "session", None) is None or self.awake != "D":
                 return False
