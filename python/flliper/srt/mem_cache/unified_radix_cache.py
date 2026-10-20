@@ -4465,6 +4465,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         ct = BASE_COMPONENT_TYPE
         cur = deleted_node.parent
         while cur != self.root_node and len(cur.children) == 0:
+            if UnifiedRadixCache._leaf_set_detached(self, cur):
+                # S92: an ancestor that already left the tree (its own drop) is no tombstone of this tree --
+                # neither re-entered in a leaf set nor unlinked twice; named by _leaf_set_detached
+                break
             if any(
                 cd.lock_ref > 0 or cd.host_lock_ref > 0 for cd in cur.component_data
             ):
@@ -4607,8 +4611,50 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return False
         return True
 
+    def _clear_dropped_device_values(self, node: UnifiedTreeNode) -> None:
+        """S92: a node that leaves the tree WITH its device rows (UD drop, the write_through delete) gives up its
+        device values here -- after every component freed them (``evict_component`` defers Full's ``value = None``
+        to ``_cascade_evict`` so SWA can still read it; these two paths never reach that cascade).
+
+        NF rc20 b40f47c91c, boot 1020_081757, D TP0 08:50:12Z: ``AssertionError: assert v == node`` in
+        ``_remove_leaf_from_parent`` (peel -> _evict_device_leaf -> _pdflip_l3_drop_forma -> _ud_drop_unbacked_leaf).
+        A node dropped earlier kept its Full value: detached, yet ``evicted`` False and ``_is_device_leaf`` True, so a
+        later ``_update_evictable_leaf_sets`` on a stale handle (``dec_lock_ref`` ends with one) put it back into
+        ``evictable_device_leaves``; the peel picked it, freed its Full rows a SECOND time (rows that may belong to
+        another request by then) and only the parent's ``children.pop`` stopped it. With the values cleared a removed
+        node is no D-leaf (``evicted``) and no H-leaf (no host value) for any caller."""
+        for cd in getattr(node, "component_data", None) or ():
+            cd.value = None
+
+    def _leaf_set_detached(self, node: UnifiedTreeNode) -> bool:
+        """S92 invariant: True when ``node`` is not in its parent's children (removed from the tree). Such a node is
+        never a leaf; a set update on it is a stale handle and is named (``LEAF-SET DETACHED``)."""
+        parent = getattr(node, "parent", None)
+        page = getattr(self, "page_size", None)
+        key = getattr(node, "key", None)
+        children = getattr(parent, "children", None)
+        if node is getattr(self, "root_node", None) or parent is None or key is None or page is None \
+                or not isinstance(children, dict):
+            return False
+        if children.get(key.child_key(page)) is node:
+            return False
+        n = getattr(UnifiedRadixCache, "_s92_detached_n", 0) + 1
+        UnifiedRadixCache._s92_detached_n = n
+        if n <= 16 or (n & (n - 1)) == 0:
+            import traceback
+
+            caller = "/".join(f.name for f in traceback.extract_stack(limit=5)[:-2])
+            logger.warning(
+                "LEAF-SET DETACHED n=%d node=%s evicted=%s caller=%s (a removed node was handed to the leaf sets by "
+                "a stale handle -- it stays out of both sets; S92)", n, getattr(node, "id", "?"), getattr(node, "evicted", None), caller)
+        return True
+
     def _update_evictable_leaf_sets(self, node: UnifiedTreeNode) -> None:
         """Update both device and host leaf sets for a node."""
+        if UnifiedRadixCache._leaf_set_detached(self, node):
+            self.evictable_device_leaves.discard(node)
+            self.evictable_host_leaves.discard(node)
+            return
         if self._is_device_leaf(node):
             self.evictable_device_leaves.add(node)
         else:
@@ -4766,6 +4812,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     self._evict_component_and_detach_lru(
                         node, comp, target=EvictLayer.ALL, tracker=tracker
                     )
+                UnifiedRadixCache._clear_dropped_device_values(self, node)  # S92
                 self.evictable_device_leaves.discard(node)
                 parent = node.parent
                 self._remove_leaf_from_parent(node)
@@ -5119,6 +5166,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self._evict_component_and_detach_lru(
                 node, comp, target=EvictLayer.ALL, tracker=tracker
             )
+        UnifiedRadixCache._clear_dropped_device_values(self, node)  # S92
         self.evictable_device_leaves.discard(node)
         parent = node.parent
         self._remove_leaf_from_parent(node)
