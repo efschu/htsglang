@@ -795,7 +795,9 @@ def running_overlap(runs: Sequence[Tuple[str, int, int, str]], members: Sequence
     for both: the UNION of those pieces over the members is taken out of A's rest (members already discount one another,
     ``shared_prefix_discount``). Exact from ids and depths; ``common`` failing / a session unknown discounts nothing."""
     total = 0
-    for _arid, adepth, rest, asess in runs:
+    _run_sess = {(str(r[0]), r[3]) for r in runs}
+    earlier: List[Tuple[str, int, int]] = []        # (rid, depth, rest) of the runs counted before (rid order: deterministic)
+    for _arid, adepth, rest, asess in sorted(runs, key=lambda r: str(r[0])):
         rest = max(0, int(rest))
         if rest <= 0 or not asess:
             continue
@@ -811,6 +813,19 @@ def running_overlap(runs: Sequence[Tuple[str, int, int, str]], members: Sequence
             lo, hi = max(int(adepth), int(bdepth)), min(c, a_end)
             if hi > lo:
                 spans.append((lo, hi))
+        # R1u, run against run: an EARLIER counted run of the same session brings the shared piece already -- its span joins
+        # THIS run's spans, so a piece shared by run, run and member is taken out of this rest once, not twice
+        for orid, odepth, orest in earlier:
+            if (orid, asess) not in _run_sess:
+                continue
+            try:
+                c = int(common(orid, _arid))
+            except Exception:  # noqa: BLE001
+                c = 0
+            lo, hi = max(int(adepth), int(odepth)), min(c, a_end, int(odepth) + int(orest))
+            if hi > lo:
+                spans.append((lo, hi))
+        earlier.append((_arid, int(adepth), rest))
         cur_lo = cur_hi = None
         covered = 0
         for lo, hi in sorted(spans):

@@ -367,3 +367,51 @@ def test_r1u_pure_union_of_member_pieces_counts_each_token_once():
     ov = pp.running_overlap([("A", 7000, 3000, "s")], [("B", 7000, "s"), ("C", 8000, "s")], lambda a, b: ids[(a, b)])
     assert ov == 2500          # B: [7000,9000), C: [8000,9500) -> union [7000,9500)
     assert pp.running_overlap([("A", 7000, 3000, "")], [("B", 7000, "")], lambda a, b: 9000) == 0     # unknown session
+
+
+def test_r1u_two_running_prefills_share_a_piece_counted_once_also_with_a_member():
+    """R1u, run against run: A (rest 3000 at [7000,10000)) and B (rest 2000 at [8000,10000)), same session, common 10000: the
+    piece [8000,10000) is in both rests -> once. With a member that brings the same piece too, the piece is taken out of each
+    rest once (union per rest), so S = what is really new."""
+    com = lambda a, b: 10000      # noqa: E731
+    runs = [("A", 7000, 3000, "s"), ("B", 8000, 2000, "s")]
+    assert pp.running_overlap(runs, [], com) == 2000                                  # B's whole rest is A's tail
+    # with member M (depth 8000): A loses [8000,10000)=2000, B loses its 2000 (M and A spans coincide: once) -> 4000 out of 5000
+    assert pp.running_overlap(runs, [("M", 8000, "s")], com) == 4000
+    assert pp.running_overlap(runs, [], lambda a, b: 100) == 0                        # diverging prompts: nothing shared
+    assert pp.running_overlap([("A", 7000, 3000, ""), ("B", 8000, 2000, "")], [], com) == 0   # session unknown: counts in full
+
+
+def test_r1u_two_running_prefills_on_the_real_path(monkeypatch, tmp_path):
+    """Front: two counted running prefills of one session whose rests share a piece -> S counts the piece once (R6 rest 3000 +
+    2000 -> 3000), so a halb member of 2400 stays under X=5229 (naive 7400 would reroute)."""
+    import numpy as np
+    _on(monkeypatch)
+    now = time.time()
+    f = _front_r1u(now, tmp_path)
+    ra, rb, rc = "pdflip-10-80", "pdflip-10-79", "pdflip-10-81"
+    # pdflip-10-80 is run A (rest 2911); add run B = pdflip-10-79: same session, ids = A's first 10000, depth 8500 (rest 1500)
+    ids = f.__dict__["_set_ids"]
+    ids[rb] = ids[ra]
+    f.__dict__["_sess_by_rid"][rb] = "s1"
+    f._d_pf_book().grant(rid=rb, tokens=1500, now=now - 2.0)
+    f._d_pf_book().enter_leg2(rid=rb)
+    f.groups["D"].outstanding[rb] = now - 2.0
+    f.__dict__["_d_prefill_legs"][rb] = now - 2.0
+    f._leg2_lookahead.add(rb)
+    base = f._d_ext_reading
+    import flliper.srt.pdflip.d_extend_beacon as dxb2
+    clock = {"t": 0}
+    bc = dxb2.DExtendBeacon(str(tmp_path / "D-pid9.bin"), clock_ns=lambda: clock["t"])
+    bc.note_recv(rid=rb)
+    clock["t"] = int((now - 1.4) * 1e9)
+    bc.note_extend(rids=[rb], rests=[1500], extend_lens=[100])
+    f._d_ext_reading = lambda: dxb2.read_group_full(str(tmp_path), "D", 7, session_of=lambda pid: 7)
+    f._set_st()["shorts"].clear()
+    f._set_st()["shorts"]["pdflip-10-90"] = (now - 1.0, 2400, 5229)
+    f.__dict__["_set_depth"]["pdflip-10-90"] = 0
+    with envs.FLLIPER_PDFLIP_DECIDER.override(True):
+        running = f._dc_carried_running()
+        eff = F.Front._r1u_running(f, running, [])
+    assert running == 2911 + 1500 and eff == 2911, (running, eff)
+    assert f.counters["r1u_overlap_tokens"] == 1500
