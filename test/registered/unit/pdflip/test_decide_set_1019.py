@@ -42,9 +42,10 @@ def D(members, *, now=1.0, t_open=0.0, decoding=True, seats=8, running=0, unstar
 
 # ------------------------------------------------------------------------------------------------------ (a) rules on decide
 
-def test_decide_only_kind_set_exists_in_s2a():
+def test_decide_kinds_are_set_admit_arrival_since_s2b():
+    # EZ-S2b: 'admit' and 'arrival' now exist (test_ez_s2b_1020); anything else is still refused
     with pytest.raises(ValueError):
-        pp.decide("arrival", members=[])
+        pp.decide("park", members=[])
 
 
 def test_r1_set_sum_decides():

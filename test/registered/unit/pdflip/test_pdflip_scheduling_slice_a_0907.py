@@ -549,7 +549,7 @@ def test_t9b2_a_pending_store_read_DEFERS_it_never_refuses_it():
     assert Scheduler._pdflip_store_read_is_pending(sched, req_c) is False
 
 
-@pytest.mark.usefixtures("_pdflip_band_off")
+@pytest.mark.usefixtures("_pdflip_band_off", "decider_off")  # EZ-S2b: a refusal without an extent is MEASURE now (test_ez_s2b_1020)
 def test_t9c_the_front_requeues_a_w31_once_and_then_raises_w35():
     """T9 front half: a W31 body re-joins route BATCH exactly once; a second
     W31 on the same rid is W35 by name, never a third pass."""

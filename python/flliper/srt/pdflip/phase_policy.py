@@ -393,6 +393,8 @@ def immediate_park_trigger(queue: Iterable, x_tokens: int):
     decides (:func:`needs_p_class`) on the entry's own X (``x_set``, else ``x_tokens`` as the cap)."""
     if decider_on():
         for p in queue:
+            if getattr(p, "measure_reoffer", False):
+                continue      # S2b: D measures it (MEASURE barrier): its price is no number yet -- never a P trigger
             _xo = int(getattr(p, "x_set", 0) or 0) or int(x_tokens)
             if needs_p_class(int(getattr(p, "est_uncached", 0) or 0), _xo,
                              skip_leg1=bool(getattr(p, "skip_leg1", False)),
@@ -665,8 +667,10 @@ def decide(kind: str, **kw) -> "SetDecision":
     """ONE decision site of the scheduler (plan B2). S2a: ``kind="set"`` -- :func:`set_verdict` on the members that BELONG to
     the set. R2: a kurz member (own u < halbX at ITS X, not p_only) never counts in S and never makes a flip (it is left
     out and named); R1/A4: S is the sum of the members' OWN u. ``kind`` other than ``"set"`` is S2b."""
+    if kind in ("admit", "arrival"):
+        return decide_arrival(kind, **kw)
     if kind != "set":
-        raise ValueError("decide(kind=%r): only kind='set' exists in S2a (arrival is S2b)" % (kind,))
+        raise ValueError("decide(kind=%r): kinds are 'set' (S2a), 'admit' and 'arrival' (S2b)" % (kind,))
     members = list(kw.pop("members"))
     half_frac = kw["half_frac"]
     xc = int(kw.get("class_x_tokens") or kw["x_tokens"])
@@ -680,6 +684,59 @@ def decide(kind: str, **kw) -> "SetDecision":
         classes.append(c)
     sv = set_verdict(keep, **kw)
     return SetDecision(sv, _rule_tag(sv.why, sv.verdict), tuple(classes), tuple(m.rid for m in keep), tuple(out))
+
+
+# ----------------------------------------------------------------------------------------------------------- S2b: arrival
+ACT_D_NOW = "D_NOW"
+ACT_RIDE_P = "RIDE_P"
+ACT_WAIT_SEAT = "WAIT_SEAT"
+ACT_COLLECT = "COLLECT"
+ACT_P_CAND = "P_CAND"
+ACT_MEASURE = "MEASURE_ON_D"
+
+
+@dataclass(frozen=True)
+class ArrivalDecision:
+    """EZ-S2b ``decide(kind="admit"|"arrival")``: what ONE arriving request does, decided once at its arrival."""
+    action: str
+    rule: str
+    cls: str
+    why: str
+    waits: bool          # True = the request waits for something (a seat, a set verdict); False = it goes now
+
+
+def decide_arrival(kind: str, *, uncached: Optional[int], x_own: int, half_frac: float, p_only: bool = False,
+                   d_open: bool = True, flip_decided: bool = False, p_phase: bool = False,
+                   exact: bool = True) -> "ArrivalDecision":
+    """ONE decision at the arrival (SOLL R1a, R2, R2a, R4, R5, R7, R9; plan B2/S2b). Pure.
+
+    * no exact number (``uncached`` None or ``exact`` False) and not p_only: ``MEASURE_ON_D`` (A1/R.1) -- never a class
+      from an estimate;
+    * p_only (R9) or u >= X_own (R4): a P candidate, the set decides the flip (``kind="arrival"``);
+    * halb: a set member (R3);
+    * kurz (u < halbX, R2): D at once while D's door is open. A flip that is DECIDED (D closing for it, or a P phase) is
+      the one thing a kurz request rides (R1a: it is prefilled on P with the batch); a flip that is merely foreseeable
+      (a big request waits its T_halb, R4) is no reason -- D takes it (R2). Door closed without a decided flip: it waits
+      for its seat (R5), never for P.
+    ``kind="admit"`` answers the same for the seat path (the caller knows the door and the flip state at that moment);
+    both kinds share the rule table so no site can disagree."""
+    if p_only:
+        return ArrivalDecision(ACT_P_CAND, "R9", CLASS_P_ONLY, "p_only (vision / only-P) counts as big", False)
+    if uncached is None or not exact:
+        return ArrivalDecision(ACT_MEASURE, "NS:MEASURE", "unknown", "no exact number: D measures (halfX barrier)", True)
+    cls = classify_arrival(int(uncached), int(x_own), half_frac, False)
+    if cls == CLASS_GROSS:
+        return ArrivalDecision(ACT_P_CAND, "R4", cls, "u=%d >= X=%d: P candidate, waits T_halb for company" % (uncached, x_own),
+                               True)
+    if cls == CLASS_HALB:
+        return ArrivalDecision(ACT_COLLECT, "R3", cls, "halb u=%d: set member" % uncached, True)
+    if p_phase or flip_decided:
+        return ArrivalDecision(ACT_RIDE_P, "R1a", cls, "kurz u=%d, a flip is decided (%s): rides it, never a trigger (R2)"
+                               % (uncached, "P phase" if p_phase else "D closing"), False)
+    if d_open:
+        return ArrivalDecision(ACT_D_NOW, "R2", cls, "kurz u=%d: D at once, no wait" % uncached, False)
+    return ArrivalDecision(ACT_WAIT_SEAT, "R5", cls, "kurz u=%d, D cannot take it now and no flip is decided: waits for its "
+                           "seat, never P" % uncached, True)
 
 
 def _rule_tag(why: str, verdict: str) -> str:

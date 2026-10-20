@@ -76,3 +76,26 @@ def wait_seat_owner(front: Any, rid: str, u: int, x_own: int, why: str) -> None:
                                          x=int(x_own), **front._dec_group()), edge=True)
     except Exception:  # noqa: BLE001
         pass
+
+
+def arrival(front: Any, rid: str, ad: "phase_policy.ArrivalDecision", u: Optional[int], x_own: int, *, kind: str = "arrival",
+            half_x: int = 0, waited_s: float = 0.0, waited_on: str = "-") -> None:
+    """S2b (plan B3): the ONE record of an arrival's decision -- ``DECISION kind=arrival|admit action=<D_NOW|RIDE_P|WAIT_SEAT|
+    COLLECT|P_CAND|MEASURE_ON_D> rule=<R1a|R2|R3|R4|R5|R9>``, once per arrival (no edge filter: one arrival, one line)."""
+    try:
+        mem = (_dr.Member(str(rid), int(u) if u is not None else -1, -1, "exact" if u is not None else "none", 0),)
+        front._dec().record(_dr.Decision(kind=kind, action=ad.action, rule=ad.rule, rid=str(rid), members=mem,
+                                         x=int(x_own), half_x=int(half_x), classes=(ad.cls,), why=ad.why,
+                                         waited_s=float(waited_s), waited_on=str(waited_on), **front._dec_group()), edge=False)
+    except Exception:  # noqa: BLE001 -- an instrument never breaks an arrival
+        pass
+
+
+def kurz_wait_free(front: Any, rid: str, why: str) -> None:
+    """R2 (S2b): a kurz request has no wait of its own -- the unreadable D pool (FIX 4a reading) is no reason to hold it. One
+    record per rid so a missing line means the old wait is back."""
+    try:
+        front._dec().record(_dr.Decision(kind="admit", action="D_NOW", rule="R2", rid=str(rid), why=why,
+                                         **front._dec_group()), edge=False)
+    except Exception:  # noqa: BLE001
+        pass

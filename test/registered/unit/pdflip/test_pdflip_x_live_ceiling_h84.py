@@ -336,6 +336,9 @@ async def _drive(f: Front, sizes, window_ms: int = 40, gap: bool = True,
     await asyncio.gather(*tasks, return_exceptions=True)
 
 
+@pytest.mark.usefixtures("decider_off")  # EZ-S2b: the X-SOLO band is gone (#14, R2a: the own X decides); this pins the S2a band (reachable until S4)
+
+
 def test_a_singleton_in_the_band_goes_to_d_after_the_window(caplog):
     caplog.set_level(logging.INFO, logger="pdflip.front")
     f = _band_front()
@@ -343,6 +346,9 @@ def test_a_singleton_in_the_band_goes_to_d_after_the_window(caplog):
     assert f.on_d == ["pdflip-0-1"] and f.counters["route_short"] == 1
     assert any("PDFLIP X-SOLO rid=pdflip-0-1 uncached=5001 X_live=7500 verdict=d reason=solo"
                in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.usefixtures("decider_off")  # EZ-S2b: the X-SOLO band is gone (#14, R2a: the own X decides); this pins the S2a band (reachable until S4)
 
 
 def test_red_first_a_second_arrival_in_the_window_sends_both_to_p():
@@ -353,6 +359,9 @@ def test_red_first_a_second_arrival_in_the_window_sends_both_to_p():
     assert f.on_d == []
     assert f.counters["route_long"] == 2 and len(f.queue) == 2
     assert f.counters["x_solo_p"] == 2
+
+
+@pytest.mark.usefixtures("decider_off")  # EZ-S2b: the X-SOLO band is gone (#14, R2a: the own X decides); this pins the S2a band (reachable until S4)
 
 
 def test_red_first_a_busy_d_sends_the_band_request_to_p(caplog):
