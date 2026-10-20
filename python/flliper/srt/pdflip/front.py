@@ -24561,6 +24561,9 @@ def main():
     # DUAL-TP3PP3: set after construction so the constructor call above stays
     # the one pinned by test_27b_park_immediate (the class default is off).
     front.dual_layout = bool(getattr(args, "dual_layout", False))
+    if front.dual_layout:
+        # 27B port 20.10.: the front reads the same dual defaults as the ranks (arrival_seat_rule.enabled)
+        os.environ.setdefault("FLLIPER_PDFLIP_DUAL_LAYOUT", "1")
     front.dual_dbusy_file = str(getattr(args, "dual_dbusy_file", "") or "")
     # DUAL-SHARE (pdflip/dual_share.py, item 800): None unless --dual-layout AND
     # --dual-priority -- the flip front never builds it, every hook below is a

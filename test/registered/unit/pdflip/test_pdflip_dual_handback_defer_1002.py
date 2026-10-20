@@ -229,6 +229,7 @@ def test_the_scheduler_wiring():
     i_beg = src.index("_pdflip_hbd.begin(", i_ref)
     i_app = src.index("_x_refused.append(req)", i_ref)
     assert i_ref < i_beg < i_app, "the defer sits between the W31 verdict and the refusal"
-    i_retry = src.index("self._retry_deferred_prefetches()")
+    # 27B port 20.10.: NF S42r added a held-iteration retry site before this one; the dual D retry sits at the pass site
+    i_retry = src.index("self._retry_deferred_prefetches()", src.index("_pdflip_hbd.retry(self)") - 400)
     assert src.index("_pdflip_hbd.retry(self)", i_retry) - i_retry < 400
     assert "_pdflip_hbd.note_admit(req)" in src

@@ -8150,20 +8150,9 @@ class SchedulerWeightUpdaterManager:
         sched = self.scheduler
         if sched is None:
             return False
-        # Q-570 tripwire: clearing the pools under a tree that still references
-        # device slots puts every one of them on BOTH credit sides (NF y8s TP1:
-        # free_and_cached=22, #924 MAMBA SLOT ALIASING at the first idle pass).
-        # The sleep leg guarantees a device-free tree (_pdflip_sleep_flush); a
-        # tree that still holds one here is refused by name, before any clear.
-        held_full, held_mamba = tree_device_held(getattr(sched, "tree_cache", None))
-        if held_full or held_mamba:
-            raise RuntimeError(
-                f"W26b PdFlipWakeTreeHeld: the radix tree kept across the sleep still holds "
-                f"device values (full={held_full} mamba={held_mamba}); the #1455 restore "
-                f"would clear req_to_token/mamba/allocator under them (#924 MAMBA SLOT "
-                f"ALIASING). The sleep flush of this rank did not reset its tree -- nothing "
-                f"was cleared."
-            )
+        # Q-570 tripwire (NF form: before the L15 hold signal) is NOT taken on the 27B line: the 27B
+        # check below runs after the L15 hold drops/keeps a retained tree, so an L15-held tree is not
+        # refused (port 20.10.; test_pdflip_l15_nohold_tree_1002 pins it). The tripwire itself stays.
         try:
             _l15_m, _l15_rank, _l15_keep, _l15_master_on = self._l15_wake_hold_signal()
             if _l15_master_on:

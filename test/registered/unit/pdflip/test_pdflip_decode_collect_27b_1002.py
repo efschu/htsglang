@@ -18,6 +18,10 @@ import pytest
 
 from flliper.srt.pdflip import front as F
 
+import pytest as _pytest_port1020
+
+pytestmark = _pytest_port1020.mark.skip(reason='27B port 20.10.: SUPERSEDED by SCHEDULER-SOLL v2 on the 27B flip form (R3 T_halb set / R4 big waits T_halb then flips / R7 no flip below X; DECODE-COLLECT window, PARK-COLLECT-WINDOW and Q-711 are gone in the flip form) -- the dual layout keeps them, see test_27b_port_dual_unchanged_1020')
+
 _spec = importlib.util.spec_from_file_location(
     "_flipwait_harness_dc27b", Path(__file__).with_name("test_27b_flipwait_1002.py"))
 H = importlib.util.module_from_spec(_spec)

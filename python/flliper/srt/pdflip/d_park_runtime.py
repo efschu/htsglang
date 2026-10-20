@@ -2009,11 +2009,9 @@ def admission(sched, running_batch):
         pending = [r for r in pending if not d_lane.below_floor(sched, r)]
     # 27B port 20.10.: the dual D keeps its reading byte for byte (user 20.10.: the
     # ported scheduler parts never act in the dual layout); S75's fit reading on the flip form
-    from flliper.srt.pdflip import dual_handback_defer as _hbd_gate
-
     if book.margin_tokens < 0:
         avail = None
-    elif _hbd_gate.armed():
+    elif str(os.environ.get("FLLIPER_PDFLIP_DUAL_LAYOUT", "")).strip() == "1":   # rank-uniform env
         avail = sched.uniform_min_avail()
     else:
         avail = _resume_fit_reading(sched)

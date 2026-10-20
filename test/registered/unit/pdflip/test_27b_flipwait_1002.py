@@ -96,6 +96,8 @@ def _park_dwell_rules(monkeypatch):
     # PARK-NO-DWELL (02.10.) removes the dwell/collect hold this file pins: the old rule, explicitly
     monkeypatch.setenv("FLLIPER_PDFLIP_PARK_NO_DWELL", "0")
 
+@pytest.mark.skip(reason='27B port 20.10.: SUPERSEDED by SCHEDULER-SOLL v2 on the 27B flip form (R3 T_halb set / R4 big waits T_halb then flips / R7 no flip below X; DECODE-COLLECT window, PARK-COLLECT-WINDOW and Q-711 are gone in the flip form) -- the dual layout keeps them, see test_27b_port_dual_unchanged_1020')
+
 def test_red_a_free_seat_parks_now_instead_of_collecting(caplog):
     """N3o epoch 16 05:53:39: pdflip-16-39 (uncached 6472 > X 3797), running=2 of 6,
     round trip 11.37 s -> base: HOLD (price 22.7 s, fired 20.2 s later)."""
@@ -108,6 +110,9 @@ def test_red_a_free_seat_parks_now_instead_of_collecting(caplog):
         assert ns.counters["park_seat_free_fired"] == 1
         assert ns.counters["park_collect_holds"] == 0
         assert any("PDFLIP PARK-SEAT-FREE FIRE" in m and "taken=2 n=6" in m for m in caplog.messages)
+
+
+@pytest.mark.skip(reason='27B port 20.10.: SUPERSEDED by SCHEDULER-SOLL v2 on the 27B flip form (R3 T_halb set / R4 big waits T_halb then flips / R7 no flip below X; DECODE-COLLECT window, PARK-COLLECT-WINDOW and Q-711 are gone in the flip form) -- the dual layout keeps them, see test_27b_port_dual_unchanged_1020')
 
 
 def test_no_free_seat_keeps_the_collect_window(caplog):
@@ -126,6 +131,9 @@ def test_no_free_seat_keeps_the_collect_window(caplog):
         assert fn(ns, None, time.time()) is not None and ns.counters["park_seat_free_fired"] == 1
 
 
+@pytest.mark.skip(reason='27B port 20.10.: SUPERSEDED by SCHEDULER-SOLL v2 on the 27B flip form (R3 T_halb set / R4 big waits T_halb then flips / R7 no flip below X; DECODE-COLLECT window, PARK-COLLECT-WINDOW and Q-711 are gone in the flip form) -- the dual layout keeps them, see test_27b_port_dual_unchanged_1020')
+
+
 def test_switch_off_is_the_collect_window_byte_for_byte():
     with envs.FLLIPER_PDFLIP_ENABLE_PARK_COLLECT_WINDOW.override(True), \
             envs.FLLIPER_PDFLIP_ENABLE_PARK_SEAT_FREE.override(False):
@@ -139,6 +147,9 @@ def test_switch_off_is_the_collect_window_byte_for_byte():
         assert fn(ns, None, time.time()) is not None and ns.counters["park_seat_free_fired"] == 0
 
 
+@pytest.mark.skip(reason='27B port 20.10.: SUPERSEDED by SCHEDULER-SOLL v2 on the 27B flip form (R3 T_halb set / R4 big waits T_halb then flips / R7 no flip below X; DECODE-COLLECT window, PARK-COLLECT-WINDOW and Q-711 are gone in the flip form) -- the dual layout keeps them, see test_27b_port_dual_unchanged_1020')
+
+
 def test_the_immediate_park_dwell_still_comes_first():
     """D woke 1 s ago (floor 2 s): no park yet, free seat or not."""
     a, b = _on()
@@ -146,6 +157,9 @@ def test_the_immediate_park_dwell_still_comes_first():
         fn, ns = _front(running=2, waits_s=[0.5], awake_s=1.0)
         assert fn(ns, None, time.time()) is None
         assert ns.counters["park_immediate_dwell_holds"] == 1 and ns.counters["park_seat_free_fired"] == 0
+
+
+@pytest.mark.skip(reason='27B port 20.10.: SUPERSEDED by SCHEDULER-SOLL v2 on the 27B flip form (R3 T_halb set / R4 big waits T_halb then flips / R7 no flip below X; DECODE-COLLECT window, PARK-COLLECT-WINDOW and Q-711 are gone in the flip form) -- the dual layout keeps them, see test_27b_port_dual_unchanged_1020')
 
 
 def test_danger_a_resumed_decode_is_not_parked_again_before_one_round_trip(caplog):

@@ -121,7 +121,7 @@ class TestFlipUnchanged:
 
     def test_admitter_calls_it_after_the_age_sort_and_before_the_head_is_read(self):
         src = inspect.getsource(F.Front.d_admitter)
-        i_sa = src.index("_sa.by_age(self._ready_for_d)")
+        i_sa = src.index("_sa.by_age(self._ready_for_d")  # 27B port 20.10.: PRIO-AS-AGE passes lane_of=
         i_lf = src.index("self._d_seat_long_first()")
         i_head = src.index("p = self._ready_for_d[0]")
         assert i_sa < i_lf < i_head

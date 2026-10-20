@@ -147,11 +147,14 @@ class DualLayoutFront(CustomTestCase):
 
     def test_pump_runs_the_one_moved_pass(self):
         src = inspect.getsource(front_mod.Front.controller)
-        self.assertEqual(src.count("async def _p_drain_pass"), 1)
-        self.assertIn("self._dual_pump(_p_drain_pass)", src)
+        # 27B port 20.10.: two passes -- the dual pump keeps the 27B pass byte for byte
+        # (_p_drain_pass_dual, sha-pinned in test_27b_port_dual_unchanged_1020), the flip form runs the NF pass
+        self.assertEqual(src.count("async def _p_drain_pass_dual()"), 1)
+        self.assertEqual(src.count("async def _p_drain_pass()"), 1)
+        self.assertIn("self._dual_pump(_p_drain_pass_dual)", src)
         self.assertIn("await _p_drain_pass()", src)
-        # the drain pool is called exactly once in the controller: the pass.
-        self.assertEqual(src.count("await _p_drain_pool("), 1)
+        # the drain pool is called once per pass
+        self.assertEqual(src.count("await _p_drain_pool("), 2)
 
     # Metal 30.09. boot ...09300304: serving + needle MATCH, then the arm's
     # POST /pdflip/flip ran a real D->P flip; P never slept, so its

@@ -87,6 +87,9 @@ def _h91c():
     return mod
 
 
+
+
+@pytest.mark.skip(reason='27B port 20.10.: SUPERSEDED by SCHEDULER-SOLL v2 on the 27B flip form (R3 T_halb set / R4 big waits T_halb then flips / R7 no flip below X; DECODE-COLLECT window, PARK-COLLECT-WINDOW and Q-711 are gone in the flip form) -- the dual layout keeps them, see test_27b_port_dual_unchanged_1020')
 @pytest.mark.usefixtures("decider_off")  # EZ-S2a: describes the S1 code (reachable until S4)
 
 

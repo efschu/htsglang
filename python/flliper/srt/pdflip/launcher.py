@@ -27721,10 +27721,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     env_p.setdefault("FLLIPER_HICACHE_WRITE_STREAM_PRIORITY", "-1")
     # P-HOST-OVERLAP / #PGAP (managers/pdflip_p_overlap.py): group P only; both
     # default ON (S43 / rc14), --no-p-host-overlap / --no-p-hostgap add nothing.
-    env_p.update(p_host_overlap_env(
-        getattr(ns, "p_host_overlap", False), getattr(ns, "p_hostgap", False)))
-    for _pline in p_host_overlap_lines(
-            getattr(ns, "p_host_overlap", False), getattr(ns, "p_hostgap", False)):
+    # 27B port 20.10. (user 20.10.: the dual layout stays as it was): the #PGAP instrument is default ON only
+    # on the flip form -- the 27B dual ran without it (its profile drops --p-hostgap, 27B code default off)
+    _pgap = bool(getattr(ns, "p_hostgap", False)) and not getattr(ns, "dual_layout", False)
+    env_p.update(p_host_overlap_env(getattr(ns, "p_host_overlap", False), _pgap))
+    for _pline in p_host_overlap_lines(getattr(ns, "p_host_overlap", False), _pgap):
         log(_pline)
     # P-RECV-STREAM (managers/pdflip_p_overlap.py): group P only, default off --
     # off adds nothing, so argv and env stay byte-identical.

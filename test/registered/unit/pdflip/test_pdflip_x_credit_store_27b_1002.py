@@ -28,6 +28,8 @@ prompt with it, fresh tokens after it.
 """
 from __future__ import annotations
 
+import pytest
+
 import asyncio
 import collections
 import logging
@@ -161,6 +163,9 @@ def test_the_anchor_the_flush_lost_is_not_credited():
     f._p_leg1_store_note("pdflip-26-43", "26-43", 55607)
     assert f._p_flush_store_presence([55552]) == 0
     assert f.tspans.pending(ids)[0] == 4971
+
+
+@pytest.mark.skip(reason='27B port 20.10.: NF made STORE-PRESENCE unconditional (the K1 switch no longer gates the record) -- superseded')
 
 
 def test_the_switch_off_records_nothing(monkeypatch):

@@ -737,6 +737,9 @@ class _FakeArena:
     def evict_candidates(self, need, keep_lo=None):
         return [(i, 1, 1) for i in range(int(need))]
 
+    def free_slots(self, slots, reason="unnamed"):  # 27B port 20.10.: the NF drop frees through the arena
+        return None
+
 
 @pytest.mark.parametrize("trace", [False, True])
 @pytest.mark.parametrize("slots,expect", [(112, "arena_pinned=98/112"), (4096, "arena_pinned=98/4096"),

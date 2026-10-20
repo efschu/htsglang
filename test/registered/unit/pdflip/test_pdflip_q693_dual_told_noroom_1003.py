@@ -185,7 +185,7 @@ def test_follower_pump_holds_then_acks_told(dual_p, rows, monkeypatch):
     s.mbs = [None, None, None]
     s.tree_cache.token_to_kv_pool_allocator.avail = 3551 + PRED_TOKENS
     FB.follower_pump(s)
-    assert ch.sent == [[(RID, TOLD)]] and RID not in st.registered
+    assert ch.sent == [[(RID, TOLD, ())]] and RID not in st.registered  # 27B port 20.10.: NF acks carry the hashes
 
 
 def test_pp0_verdict_ends_the_hold(dual_p, rows, monkeypatch, caplog):
@@ -202,7 +202,7 @@ def test_pp0_verdict_ends_the_hold(dual_p, rows, monkeypatch, caplog):
 def test_flip_form_pump_acks_zero_at_once(gate_off, rows, monkeypatch):
     s, req, ch, st = _pump_setup(monkeypatch, _pred())
     FB.follower_pump(s)
-    assert ch.sent == [[(RID, 0)]] and RID not in st.registered
+    assert ch.sent == [[(RID, 0, ())]] and RID not in st.registered  # 27B port 20.10.: NF acks carry the hashes
 
 
 # --- D. PP0's paced intake stamp leaves with the request -----------------------------------

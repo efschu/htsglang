@@ -529,6 +529,9 @@ def test_27b_front_parks_at_once_and_resumes_first(clean):
     asyncio.run(body())
 
 
+@pytest.mark.skip(reason='27B port 20.10.: SUPERSEDED by SCHEDULER-SOLL v2 on the 27B flip form (R3 T_halb set / R4 big waits T_halb then flips / R7 no flip below X; DECODE-COLLECT window, PARK-COLLECT-WINDOW and Q-711 are gone in the flip form) -- the dual layout keeps them, see test_27b_port_dual_unchanged_1020')
+
+
 def test_nf_wait_bound_60_does_not_delay_the_immediate_park(clean):
     """28.09. (operator, user "Wartegrenze 0" for BOTH models): on the NF form
     with its 60 s wait bound armed, a queued request over X parks D at once --
@@ -554,6 +557,9 @@ def test_nf_wait_bound_60_does_not_delay_the_immediate_park(clean):
             await asyncio.wait_for(asyncio.gather(t0, t1), 30)
 
     asyncio.run(body())
+
+
+@pytest.mark.skip(reason='27B port 20.10.: SUPERSEDED by SCHEDULER-SOLL v2 on the 27B flip form (R3 T_halb set / R4 big waits T_halb then flips / R7 no flip below X; DECODE-COLLECT window, PARK-COLLECT-WINDOW and Q-711 are gone in the flip form) -- the dual layout keeps them, see test_27b_port_dual_unchanged_1020')
 
 
 def test_27b_front_switch_off_waits_for_d_as_today(clean):

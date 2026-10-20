@@ -30,6 +30,8 @@ Pure functions only -- the front's wiring is in ``pdflip/front.py``
 
 from __future__ import annotations
 
+import os
+
 from typing import Dict, Iterable, List, Mapping, Optional, Tuple
 
 MARKER = "PDFLIP ARRIVAL-SEAT"
@@ -94,15 +96,21 @@ def kv_read_budget_s(env=None) -> float:
     return max(0.0, float(envs.FLLIPER_PDFLIP_ARRIVAL_KV_READ_BUDGET_S.get()))
 
 
-def enabled(env=None) -> bool:
-    if env is not None:
-        # unset/blank = the code default (ON on the NF line, 110): only an
-        # explicit off value disables, as the EnvBool does.
-        raw = str(env.get("FLLIPER_PDFLIP_ENABLE_ARRIVAL_SEAT_RULE", "") or "").strip().lower()
-        return raw not in ("0", "false", "no", "off")
-    from flliper.srt.environ import envs
+def _dual_default_off(env) -> bool:
+    """27B port 20.10. (user 20.10.: the dual layout stays as it was): the 27B line ran the rule OFF (code
+    default False, no profile set it). The NF default ON reaches the flip form only; under the DUAL layout
+    an UNSET switch stays off. The ranks carry FLLIPER_PDFLIP_DUAL_LAYOUT=1 (launcher), the front sets it
+    for itself from --dual-layout (front.main), so every process of a dual boot reads the same default."""
+    return str(env.get("FLLIPER_PDFLIP_DUAL_LAYOUT", "") or "").strip() == "1"
 
-    return bool(envs.FLLIPER_PDFLIP_ENABLE_ARRIVAL_SEAT_RULE.get())
+
+def enabled(env=None) -> bool:
+    src = os.environ if env is None else env
+    raw = str(src.get("FLLIPER_PDFLIP_ENABLE_ARRIVAL_SEAT_RULE", "") or "").strip().lower()
+    if not raw:
+        # unset/blank = the code default: ON on the flip form (NF 110), OFF under the 27B dual layout
+        return not _dual_default_off(src)
+    return raw not in ("0", "false", "no", "off")
 
 
 def default_reserve() -> int:
