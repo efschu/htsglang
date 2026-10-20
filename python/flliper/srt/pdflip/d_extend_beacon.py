@@ -44,6 +44,18 @@ after the result is synchronised): same rid, same first-extend start, newer ``se
 (0 for a single-chunk prefill; the later chunks of a chunked prefill report their own start rest again). The front counts a
 rest only while it is > 0. Ranks still only report a number (R11); with several ranks the MAX rest is kept, so a rank that has
 not finished its forward keeps the rest alive (agreement by MAX, as before).
+
+NF-R6-REST-EXAKT (20.10., SOLL R6 + R11, user order 19.10. "NICHTS SCHÄTZEN, EXAKTE ZAHLEN: Einstufung uncached/S/R6-Rest/Sitz nur
+aus D-Radix/L2/L3 zum Entscheidungszeitpunkt"): v3 wrote the after-rest only from ``process_batch_result`` -- and with overlap
+scheduling (D runs ``overlap=True``) that runs AFTER the NEXT batch was built and launched. rc28 _1020_174205 pdflip-12-275: chunk 1
+(768 of 1394) ended its forward at 18:36:32.918-.930 on all three ranks, the next batch (chunk 2, 626) was launched only at
+18:36:33.x, so the record still said 1394 when the front decided at 32.977-.983 (``r6_rest=1394``; D's exact rest was 626). Now the
+rank also ARMS the done of every extend batch with a device event recorded behind its forward (``arm_done``) and POLLS it
+(``poll_done``, ``event.query()``: no sync, no wait) at its loop's top and again before the next launch: the after-rest is written
+as soon as the forward has really ended on the device. ``note_extend_done`` (the result path) stays the backstop: what the poll
+already wrote is not written twice, what no event armed is written there as before, and a result always flushes the older armed
+batches first (one stream: an earlier forward has ended when a later one's result is in) -- the per-rid FIFO stays aligned. The
+record layout and ``_VERSION`` are unchanged; only the moment of the after-rest record moves to the forward's real end.
 """
 from __future__ import annotations
 
@@ -74,6 +86,8 @@ _REC_SIZE = struct.calcsize(_REC_FMT)
 SLOTS = 1024
 #: rids received but not yet extended, dropped oldest-first (an aborted request never extends)
 ARMED_CAP = 4096
+#: NF-R6-REST-EXAKT: extend batches armed behind their forward and not yet written (a handful in flight at most)
+PENDING_CAP = 256
 
 
 def enabled(env=None) -> bool:
@@ -111,6 +125,10 @@ class DExtendBeacon:
         self._live: "collections.OrderedDict[str, int]" = collections.OrderedDict()
         #: v3: rid -> the rest once the CURRENT extend batch's forward has ended (rest at start - extend_len)
         self._after: "collections.OrderedDict[str, int]" = collections.OrderedDict()
+        #: NF-R6-REST-EXAKT: batch key (the rank's forward counter) -> (rids, ready) armed behind its forward, oldest first
+        self._pending: "collections.OrderedDict[int, Tuple[list, Callable[[], bool]]]" = collections.OrderedDict()
+        #: keys whose done the poll already wrote (the result path then writes nothing)
+        self._polled: "collections.OrderedDict[int, None]" = collections.OrderedDict()
         self._head = 0
         self.mm = None
         size = _HDR_SIZE + self._slots * _REC_SIZE
@@ -185,11 +203,62 @@ class DExtendBeacon:
             except Exception:  # noqa: BLE001
                 return
 
-    def note_extend_done(self, *, rids: Iterable[str]) -> None:
-        """v3: the forward of the extend batch ``rids`` has ended on this rank: re-report each rid under its first-extend
-        start with the rest AFTER the batch (``rest_at_start - extend_len``; 0 when the batch finished the prefill)."""
+    def arm_done(self, *, key: int, rids: Iterable[str], ready: Callable[[], bool]) -> None:
+        """NF-R6-REST-EXAKT: the extend batch ``key`` (the rank's forward counter) was issued; ``ready()`` (a device event's
+        non-blocking ``query``) says when its forward has ended on the device. ``poll_done`` then writes its after-rest."""
         if self.mm is None:
             return
+        self._pending.pop(int(key), None)
+        self._pending[int(key)] = (list(rids), ready)
+        while len(self._pending) > PENDING_CAP:
+            # dropped unwritten: the result path writes it (the key is neither pending nor polled)
+            self._pending.popitem(last=False)
+
+    def poll_done(self) -> int:
+        """NF-R6-REST-EXAKT: write the after-rest of every armed batch whose forward has ended, oldest first, and stop at the
+        first that has not (one stream: a later forward cannot have ended before it). Never blocks; returns the batches
+        written."""
+        n = 0
+        while self._pending:
+            key, (rids, ready) = next(iter(self._pending.items()))
+            try:
+                done = bool(ready())
+            except Exception:  # noqa: BLE001 -- an unreadable event: the result path writes it
+                done = False
+            if not done:
+                break
+            self._pending.popitem(last=False)
+            self._write_done(rids)
+            self._polled[key] = None
+            while len(self._polled) > PENDING_CAP:
+                self._polled.popitem(last=False)
+            n += 1
+        return n
+
+    def note_extend_done(self, *, rids: Iterable[str], key: Optional[int] = None) -> None:
+        """v3: the forward of the extend batch ``rids`` has ended on this rank: re-report each rid under its first-extend
+        start with the rest AFTER the batch (``rest_at_start - extend_len``; 0 when the batch finished the prefill).
+        NF-R6-REST-EXAKT: with ``key`` (the batch's forward counter) a batch the poll already wrote is not written again, and
+        the older armed batches are written first (their forwards have ended: this result is in)."""
+        if self.mm is None:
+            return
+        if key is not None:
+            k = int(key)
+            # the older armed batches first (keys are the rank's monotone forward counter): their forwards have ended
+            while self._pending:
+                k0 = next(iter(self._pending))
+                if k0 >= k:
+                    break
+                _k0, (r0, _ready) = self._pending.popitem(last=False)
+                self._write_done(r0)
+                self._polled[k0] = None
+            if k in self._polled:
+                del self._polled[k]
+                return
+            self._pending.pop(k, None)
+        self._write_done(rids)
+
+    def _write_done(self, rids: Iterable[str]) -> None:
         for rid in rids:
             q = self._after.get(rid)
             t_first = self._live.get(rid)

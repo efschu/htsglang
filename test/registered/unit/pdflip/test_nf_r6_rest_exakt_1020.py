@@ -1,0 +1,297 @@
+"""NF-R6-REST-EXAKT (20.10., SOLL R6 + R11; user order 19.10. "NICHTS SCHÄTZEN, EXAKTE ZAHLEN: Einstufung uncached/S/R6-Rest/Sitz
+nur aus D-Radix/L2/L3 zum Entscheidungszeitpunkt").
+
+Live case rc28 boot ``..._297198745d_1020_174205`` (front + D log, /spinning/docker-acceptance/nf/evidence):
+- 18:36:31,120 pdflip-12-275 kurz u=1394 (R2) -> D. D: #969 EXTENT chunk 1 (26496, 27264, 768) extend_ms ...391923-...391973.
+- 18:36:32,918-,930 ``PDFLIP-VRAM-PEAK phase=chunk rows=769`` on TP0/TP1/TP2: chunk 1's forward has ENDED (768 of 1394 computed).
+- 18:36:32,977-,983 front: ``SET-VERDICT ... REROUTE_P why=R6 ... D prefill of 1394 running``, ``r6_rest=1394``.
+- 18:36:33,x D: #969 EXTENT chunk 2 (27264, 27890, 626) -- the next batch was launched only now.
+Root: D-EXTEND-BEACON v3 wrote the after-rest (626) only from ``process_batch_result``, which under overlap scheduling (D runs
+``overlap=True``) comes after the NEXT batch was built and launched. The front read the chunk-START record (1394). D's exact rest at
+the verdict was 626. Fix: the rank arms a device event behind every extend forward and polls it (non-blocking) at its loop top and
+before the next launch; the result path stays the backstop.
+
+Danger directions (mutants): the OLD start value keeps counting after the forward ended (rest too big, a wrong flip); a rest
+written TOO EARLY or TWICE (rest too small -> the R6 flip is missing)."""
+from __future__ import annotations
+
+import asyncio
+import inspect
+import logging
+import os
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+
+from flliper.srt.environ import envs  # noqa: E402
+from flliper.srt.pdflip import d_extend_beacon as dxb  # noqa: E402
+from flliper.srt.pdflip import front as F  # noqa: E402
+from test_pdflip_arrival_seat_rule_0929 import _front as _fake_front  # noqa: E402
+from test_pdflip_set_scheduler_1017 import _on  # noqa: E402
+
+RID_K, RID_G = "pdflip-12-275", "pdflip-12-274"
+X_LIVE = 7016                 # 18:36:32,980 SET-VERDICT X=7016 halfX=3508
+U_K, CHUNK1, REST_AFTER = 1394, 768, 626
+U_G = 9875
+SID = 7
+
+
+class _Ev:
+    """A device event stand-in: ``query`` is what the rank polls (never a sync)."""
+
+    def __init__(self, done=False):
+        self.done = done
+
+    def query(self):
+        return self.done
+
+
+def _read(d, rid=RID_K):
+    got = dxb.read_group_full(str(d), "D", SID, session_of=lambda pid: SID)
+    return None if got is None or dxb.rid_key(rid) not in got else got[dxb.rid_key(rid)][1]
+
+
+def _writers(tmp_path, ranks=3, t_ns=10**9):
+    ws = [dxb.DExtendBeacon(str(tmp_path / ("D-pid%d.bin" % (r + 1))), clock_ns=lambda: t_ns) for r in range(ranks)]
+    for w in ws:
+        w.note_recv(rid=RID_K)
+    return ws
+
+
+# ------------------------------------------------------------------------------------------------ writer (rank side)
+def test_live_12_275_the_forward_of_chunk1_ended_the_poll_writes_626_before_the_next_launch(tmp_path):
+    """rc28 18:36:32,918-,930: chunk 1 (768 of 1394) ended on all three ranks; the next launch came after the verdict. The poll
+    (loop top / before the launch) writes D's exact rest 626 -- the front's reading at ,977 is 626, not the chunk-start 1394."""
+    ws = _writers(tmp_path)
+    evs = [_Ev() for _ in ws]
+    for w, ev in zip(ws, evs):
+        w.note_extend(rids=[RID_K], rests=[U_K], extend_lens=[CHUNK1])          # chunk 1 starts: 1394 left
+        w.arm_done(key=37869, rids=[RID_K], ready=ev.query)
+    assert _read(tmp_path) == U_K                                                # forward running: its tokens are not computed
+    for w in ws:
+        assert w.poll_done() == 0                                                # not ended: nothing written
+    assert _read(tmp_path) == U_K
+    for ev in evs:
+        ev.done = True                                                           # 32,918-,930
+    for w in ws:
+        assert w.poll_done() == 1
+    assert _read(tmp_path) == REST_AFTER                                         # D's exact rest at the verdict (,977)
+
+
+def test_without_the_poll_the_reading_keeps_the_chunk_start_rest_base_behaviour(tmp_path):
+    """The base (v3, result path only): until ``process_batch_result`` ran -- after the NEXT launch -- the record says 1394."""
+    ws = _writers(tmp_path)
+    for w in ws:
+        w.note_extend(rids=[RID_K], rests=[U_K], extend_lens=[CHUNK1])
+    assert _read(tmp_path) == U_K
+    for w in ws:
+        w.note_extend_done(rids=[RID_K], key=37869)                              # the backstop still writes it
+    assert _read(tmp_path) == REST_AFTER
+
+
+def test_the_result_path_after_the_poll_writes_nothing_twice_chunk2_rest_survives(tmp_path):
+    """Overlap order on D: poll wrote chunk 1's done (626); chunk 2 launches (626 left, 626 computed); THEN chunk 1's result is
+    processed. A second done of chunk 1 would pop chunk 2's FIFO entry and write 0 while chunk 2 still runs (rest too small ->
+    the R6 flip missing). Must stay 626 until chunk 2's own forward has ended."""
+    (w,) = _writers(tmp_path, ranks=1)
+    ev1, ev2 = _Ev(), _Ev()
+    w.note_extend(rids=[RID_K], rests=[U_K], extend_lens=[CHUNK1])
+    w.arm_done(key=37869, rids=[RID_K], ready=ev1.query)
+    ev1.done = True
+    assert w.poll_done() == 1 and _read(tmp_path) == REST_AFTER
+    w.note_extend(rids=[RID_K], rests=[REST_AFTER], extend_lens=[REST_AFTER])   # chunk 2 starts
+    w.arm_done(key=37870, rids=[RID_K], ready=ev2.query)
+    w.note_extend_done(rids=[RID_K], key=37869)                                  # chunk 1's result, late (overlap)
+    assert _read(tmp_path) == REST_AFTER                                         # chunk 2 runs: 626 not computed yet
+    assert w.poll_done() == 0
+    ev2.done = True
+    assert w.poll_done() == 1 and _read(tmp_path) == 0                           # chunk 2 ended: computed
+    w.note_extend_done(rids=[RID_K], key=37870)                                  # its result: nothing twice
+    assert _read(tmp_path) == 0
+
+
+def test_the_poll_stops_at_the_first_forward_that_has_not_ended(tmp_path):
+    """One stream: a later forward cannot have ended before an earlier one -- the poll writes oldest first and stops."""
+    (w,) = _writers(tmp_path, ranks=1)
+    ev1, ev2 = _Ev(False), _Ev(True)
+    w.note_extend(rids=[RID_K], rests=[3000], extend_lens=[1000])
+    w.arm_done(key=1, rids=[RID_K], ready=ev1.query)
+    w.note_extend(rids=[RID_K], rests=[2000], extend_lens=[1000])
+    w.arm_done(key=2, rids=[RID_K], ready=ev2.query)
+    assert w.poll_done() == 0 and _read(tmp_path) == 2000                       # chunk 2 start record, nothing ended
+    ev1.done = True
+    assert w.poll_done() == 2 and _read(tmp_path) == 1000
+
+
+def test_a_result_flushes_older_armed_batches_first_fifo_stays_aligned(tmp_path):
+    """A batch armed but never polled (event unreadable) and a later unarmed batch (a skip batch): the later result writes the
+    older armed done first, then its own -- each rid's FIFO pops in order."""
+    (w,) = _writers(tmp_path, ranks=1)
+
+    def _boom():
+        raise RuntimeError("no event")
+
+    w.note_extend(rids=[RID_K], rests=[3000], extend_lens=[1000])
+    w.arm_done(key=5, rids=[RID_K], ready=_boom)
+    assert w.poll_done() == 0
+    w.note_extend(rids=[RID_K], rests=[2000], extend_lens=[2000])                # key 6, not armed
+    w.note_extend_done(rids=[RID_K], key=6)
+    assert _read(tmp_path) == 0
+    w.note_extend_done(rids=[RID_K], key=5)                                      # its own result: already written
+    assert _read(tmp_path) == 0
+
+
+def test_rank_agreement_max_keeps_the_rest_until_every_rank_polled_its_end(tmp_path):
+    """R11: each rank polls its own event; the front's MAX over the ranks keeps the chunk-start rest until EVERY rank wrote its
+    end -- deterministic, independent of the file order."""
+    ws = _writers(tmp_path)
+    evs = [_Ev() for _ in ws]
+    for w, ev in zip(ws, evs):
+        w.note_extend(rids=[RID_K], rests=[U_K], extend_lens=[CHUNK1])
+        w.arm_done(key=37869, rids=[RID_K], ready=ev.query)
+    for i in (0, 1):
+        evs[i].done = True
+        ws[i].poll_done()
+    assert _read(tmp_path) == U_K                                                # TP2 not ended yet
+    evs[2].done = True
+    ws[2].poll_done()
+    assert _read(tmp_path) == REST_AFTER
+
+
+# ------------------------------------------------------------------------------------------------ scheduler wiring (rank side)
+def test_scheduler_arms_every_extend_forward_and_polls_before_the_launch_without_a_sync():
+    from flliper.srt.managers import scheduler as S
+
+    fwd = inspect.getsource(S.Scheduler._run_batch_forward)
+    assert "self._pdflip_d_ext_arm_done(batch)" in fwd
+    i_arm, i_fwd = fwd.index("self._pdflip_d_ext_arm_done(batch)"), fwd.rindex("forward_batch_generation(")
+    assert i_arm > i_fwd                                                         # behind the forward, not before it
+    loop = inspect.getsource(S.Scheduler.event_loop_overlap)
+    assert loop.count("self._pdflip_d_ext_poll()") == 2
+    assert loop.index("self._pdflip_d_ext_poll()") < loop.index("self.get_next_batch_to_run(")
+    assert loop.rindex("self._pdflip_d_ext_poll()") < loop.index("batch_result = self.run_batch(batch)")
+    res = inspect.getsource(S.Scheduler.process_batch_result)
+    assert 'key=getattr(batch, "forward_iter", None)' in res
+    arm = inspect.getsource(S.Scheduler._pdflip_d_ext_arm_done) + inspect.getsource(S.Scheduler._pdflip_d_ext_poll)
+    assert "synchronize" not in arm and ".wait(" not in arm                     # a query, never a sync
+
+
+def test_arm_helper_records_on_the_forward_stream_and_hands_the_query(tmp_path):
+    from flliper.srt.managers import scheduler as S
+
+    rec = {}
+
+    class _E:
+        def record(self, stream=None):
+            rec["stream"] = stream
+
+        def query(self):
+            return True
+
+    (w,) = _writers(tmp_path, ranks=1)
+    w.note_extend(rids=[RID_K], rests=[U_K], extend_lens=[CHUNK1])
+    fake = type("Sch", (), {})()
+    fake.device_module = type("DM", (), {"Event": _E})
+    fake.enable_overlap = True
+    fake.forward_stream = "FWD"
+    fake.pdflip_d_ext_beacon = w
+    batch = type("B", (), {})()
+    batch.forward_iter = 37869
+    batch.reqs = [type("R", (), {"rid": RID_K})()]
+    S.Scheduler._pdflip_d_ext_arm_done(fake, batch)
+    assert rec["stream"] == "FWD"
+    S.Scheduler._pdflip_d_ext_poll(fake)
+    assert _read(tmp_path) == REST_AFTER
+    fake.pdflip_d_ext_beacon = None
+    S.Scheduler._pdflip_d_ext_poll(fake)                                         # beacon off: nothing, no error
+
+
+# ------------------------------------------------------------------------------------------------ the front's verdict (R6)
+def _front_live(now, tmp_path, *, member_u, ended, rest_start=U_K, ext_len=CHUNK1, x=X_LIVE, ranks=3):
+    """The real front: D decodes, the kurz 12-275 granted at 31,120 (now-1.86) and posted, its leg redirectable; chunk 1 began at
+    now-1.0; ``ended`` = its forward's device end was polled. The set member waits since 29,094 (now-3.9 < T_halb)."""
+    import asyncio as _a
+    f = _fake_front(running=["dec"], n=6, kv={"available": 400000, "evictable": 0})
+    f.tp_prefill_max_tokens = x
+    f.t_awake = now - 60.0
+    f._sync_batch_gate = lambda: None
+    f._d_pf_book().grant(rid=RID_K, tokens=rest_start, now=now - 1.86)
+    f._d_pf_book().enter_leg2(rid=RID_K)
+    f.groups["D"].outstanding[RID_K] = now - 1.86
+    f._rvp_state()
+    f.__dict__.setdefault("_d_prefill_legs", {})[RID_K] = now - 1.86
+    f._leg2_lookahead.add(RID_K)
+    clock = {"t": int((now - 1.0) * 1e9)}
+    for r in range(ranks):
+        w = dxb.DExtendBeacon(str(tmp_path / ("D-pid%d.bin" % (r + 1))), clock_ns=lambda: clock["t"])
+        w.note_recv(rid=RID_K)
+        w.note_extend(rids=[RID_K], rests=[rest_start], extend_lens=[ext_len])
+        w.arm_done(key=37869, rids=[RID_K], ready=lambda: ended)
+        w.poll_done()
+    f._d_ext_reading = lambda: dxb.read_group_full(str(tmp_path), "D", SID, session_of=lambda pid: SID)
+    if member_u >= x:                                    # gross: a queued P candidate (R4)
+        g = F.Pending(RID_G, "/v1/messages", {}, "t", now - 3.9, _a.new_event_loop().create_future(),
+                      est_prompt=32979, est_uncached=member_u)
+        g.x_set = x
+        f.queue.append(g)
+    else:                                                # halb: a set member collecting (R3)
+        f._set_st()["shorts"][RID_G] = (now - 3.9, member_u, x)
+    return f
+
+
+def test_front_live_12_275_r6_counts_626_after_chunk1_ended_and_the_flip_still_stands(monkeypatch, caplog, tmp_path):
+    """The live verdict with D's exact rest: r6_rest=626 (not 1394). The gross member alone already has S=9875 >= X=7016, so
+    S=10501 > X and REROUTE_P why=R6 still fires (SOLL R6 as written; whether a kurz rest may pull a gross member's flip forward
+    is the open question to the user, report section 2). The number is exact; the verdict is the SOLL's."""
+    _on(monkeypatch)
+    now = time.time()
+    f = _front_live(now, tmp_path, member_u=U_G, ended=True)
+    with envs.FLLIPER_PDFLIP_DECIDER.override(True), caplog.at_level(logging.INFO, logger="pdflip.front"):
+        assert f._dc_carried_running() == REST_AFTER
+        assert f._decode_collect(now) == "P"
+    sv = [m for m in caplog.messages if "PDFLIP SET-VERDICT" in m]
+    assert any("verdict=REROUTE_P" in m and "S=%d" % (U_G + REST_AFTER) in m for m in sv), sv
+    assert any("R6-REDIRECT" in m and "counted=%s:%d" % (RID_K, REST_AFTER) in m for m in caplog.messages)
+
+
+def test_front_halb_member_exact_rest_keeps_s_under_x_no_flip(monkeypatch, caplog, tmp_path):
+    """Where the exact number decides: halb member u=4000 (halbX 3508 <= u < X 7016), a kurz D prefill of 3400 whose first chunk
+    (2048) has ended. Stale start rest: S=7400 > X -> REROUTE_P (R6). Exact rest 1352: S=5352 < X -> the set collects (R3), no
+    flip under X (R7)."""
+    _on(monkeypatch)
+    now = time.time()
+    f = _front_live(now, tmp_path, member_u=4000, ended=True, rest_start=3400, ext_len=2048)
+    with envs.FLLIPER_PDFLIP_DECIDER.override(True), caplog.at_level(logging.INFO, logger="pdflip.front"):
+        assert f._dc_carried_running() == 1352
+        assert f._decode_collect(now) == "hold"
+    assert not any("verdict=REROUTE_P" in m for m in caplog.messages if "PDFLIP SET-VERDICT" in m)
+    assert f.counters["r6_redirected"] == 0
+
+
+def test_front_halb_member_while_the_chunk_still_runs_the_start_rest_counts_r6(monkeypatch, tmp_path):
+    """Danger direction 'rest too small -> flip missing': the same chunk whose forward has NOT ended -- its 3400 are not computed,
+    S=7400 > X -> REROUTE_P (SOLL R6, EZ-S2b review A2: a running forward counts its rest)."""
+    _on(monkeypatch)
+    now = time.time()
+    f = _front_live(now, tmp_path, member_u=4000, ended=False, rest_start=3400, ext_len=2048)
+    with envs.FLLIPER_PDFLIP_DECIDER.override(True):
+        assert f._dc_carried_running() == 3400
+        assert f._decode_collect(now) == "P"
+    assert f.counters["set_reroute_p"] == 1 and f.counters["r6_redirected"] == 1
+
+
+def test_the_armed_event_is_held_strongly_never_a_weakref(tmp_path):
+    """Death fix ce594d90ba (torch 2.11: a weakref on a torch.cuda Stream/Event dangles): the beacon keeps the armed event alive by
+    a strong reference (its bound ``query``) until the done is written; the module takes no weakref at all."""
+    import gc
+
+    (w,) = _writers(tmp_path, ranks=1)
+    w.note_extend(rids=[RID_K], rests=[U_K], extend_lens=[CHUNK1])
+    ev = _Ev(True)
+    w.arm_done(key=1, rids=[RID_K], ready=ev.query)
+    del ev
+    gc.collect()
+    assert w.poll_done() == 1 and _read(tmp_path) == REST_AFTER
+    assert "weakref" not in inspect.getsource(dxb)
