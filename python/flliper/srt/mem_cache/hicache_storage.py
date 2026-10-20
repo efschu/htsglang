@@ -4071,7 +4071,16 @@ class HiCacheFile(HiCacheStorage):
             tot["complete"] += int(slots.shape[0])
             # L3WB-SLICE: THE LINE THAT MAKES A PAGE `new` -- its (generation,
             # key) is not the one this process last secured in that slot.
-            new = np.nonzero((sec_gen[slots] != gens) | (sec_lo[slots] != klo))[0]
+            _stale = (sec_gen[slots] != gens) | (sec_lo[slots] != klo)
+            # S109-A5 (re-review R11): ... or the SHARED record does not hold this generation any more -- the L3 LRU
+            # unlinked the file (``_l3sec_on_evict`` -> ``invalidate_stems``), in this process or in the sister
+            # group's (P and D share the arena, each writer has its own baseline). Without it a page still COMPLETE
+            # in L2 whose L3 file the cap took was never copied again: on every keep list for the rest of the boot,
+            # an arena slot lost toward the D-WALL (R7).
+            _pub = _l3s.arrays(arena, create=True)
+            if _pub is not None and _pub[0] is not sec_gen:
+                _stale |= np.asarray(_pub[0][slots]) != gens
+            new = np.nonzero(_stale)[0]
             # a continuation resumes at the cursor (the census walks slots in
             # ascending order): each new page is visited at most ONCE per cycle,
             # so a head that never secures cannot eat every continuation's

@@ -899,3 +899,194 @@ def test_s109_a1_the_census_keeps_a_page_whose_l3_file_is_gone(tmp_path):
     assert p._evict_for_claim(arena, 3) == 2
     assert arena.slot_states([slots[0]])[0] == 2, "kept COMPLETE in L2, never a candidate"
     assert L3S.HAND_STATS["queued"] == q0
+
+
+# ---------------------------------------------------------------------------------------------------- Re-review A5..A8
+def _reuse_boot(tmp_path, monkeypatch):
+    import test_l3_reuse_after_restart_0928 as RR
+    from flliper.srt.mem_cache import l3_write_behind as gate
+
+    gate._reset_for_tests()
+    be = RR._boot(tmp_path, monkeypatch, "boot1")
+    hs = RR._hashes("s")
+    RR._prefill(be, hs)
+    assert be.l3_write_behind_pass()["written"] == 2 * RR.PAGES
+    return RR, be, hs
+
+
+@_needs_gcc
+def test_s109_a5_the_l3_lru_unlink_makes_the_real_pass_copy_the_page_again(tmp_path, monkeypatch):
+    """Re-review R11, the real pass: the LRU unlinks a copied page's file (its on_evict hook voids the record); the
+    page is still COMPLETE in L2 -> the next pass writes it again, and only it."""
+    from flliper.srt.mem_cache import l3_secured as L3S
+
+    RR, be, hs = _reuse_boot(tmp_path, monkeypatch)
+    kv = be._arenas[RR.KV_TOTAL]
+    victim = be._get_suffixed_key(hs[0])
+    (slot, _st), = kv.find_slots([victim])
+    assert L3S.secured(kv, [slot], be).tolist() == [True]
+    os.remove(be._existing_path(victim))                       # the LRU's unlink ...
+    be._l3idx.remove([victim])
+    be._l3sec_on_evict(victim)                                 # ... and its on_evict hook
+    assert L3S.secured(kv, [slot], be).tolist() == [False]
+    r = be.l3_write_behind_pass()
+    assert r["written"] == 1 and os.path.exists(be._existing_path(victim)), r
+    assert L3S.secured(kv, [slot], be).tolist() == [True], "re-copied, published again"
+    assert be.l3_write_behind_pass()["written"] == 0
+
+
+@_needs_gcc
+def test_s109_a5_the_sister_writers_unlink_is_seen_through_the_shared_record(tmp_path, monkeypatch):
+    """P and D share the arena, each writer has its own baseline: the OTHER group's evictor voids only the shared
+    record. This process's baseline still says copied -- the pass must see the record and copy again."""
+    from flliper.srt.mem_cache import l3_secured as L3S
+
+    RR, be, hs = _reuse_boot(tmp_path, monkeypatch)
+    kv = be._arenas[RR.KV_TOTAL]
+    victim = be._get_suffixed_key(hs[1])
+    (slot, _st), = kv.find_slots([victim])
+    os.remove(be._existing_path(victim))
+    be._l3idx.remove([victim])
+    L3S.arrays(kv)[0][slot] = -1                                # the sister process's invalidate_stems
+    assert kv._l3wb_sec[0][slot] >= 0, "this process's baseline is untouched"
+    assert be.l3_write_behind_pass()["written"] == 1
+
+
+class _PromoteBe:
+    def __init__(self, enabled=True):
+        self._evictor = types.SimpleNamespace(enabled=enabled)
+        self.calls = []
+        self.ev = _threading.Event()
+
+    def _l3_refresh_kept(self, stems, mtime=True):
+        self.calls.append((list(stems), mtime, _threading.current_thread().name))
+        self.ev.set()
+        return len(stems)
+
+    def l3_listed(self, stems):
+        return [True] * len(stems)
+
+    def arena_secure_to_disk(self, *a, **k):          # present (the backend's shape), never called by the async forms
+        raise AssertionError("S109: no synchronous write")
+
+
+@_needs_gcc
+def test_s109_a6_a_release_on_an_l3_copy_promotes_it_in_the_lru_off_the_scheduler_thread(tmp_path):
+    """Re-review R8 (ZERO-ANCHOR 1015): every scheduler form that gives L2 up on an L3 copy queues that copy's LRU
+    promotion; the hand-over thread runs ``_l3_refresh_kept(..., mtime=False)`` -- never the calling thread."""
+    from flliper.srt.mem_cache import l3_secured as L3S
+
+    from test_w3_arena_spill_0929 import _finished
+
+    p, arena, slots = _unreferenced_full_arena(tmp_path)
+    p._backend.pins = None
+    _write_behind(arena, p._backend._l3idx, slots[:4])
+    assert p._evict_for_claim(arena, 2) == 2                 # room for one more page (the secure_rows form)
+    rows = _finished(p, arena, ["g0"], 0x71)
+    (g0, _st), = arena.find_slots(p._stems(["g0"]))
+    L3S.mark(arena, [g0])
+    live = [s_ for s_ in slots if arena.slot_states([s_])[0] == 2][:2]
+    for form, want in (("check", live), ("verify", live), ("secure_rows", [int(g0)])):
+        be = _PromoteBe()
+        with _no_file_io_in_this_thread() as hits:
+            if form == "check":
+                L3S.check(arena, live, be)
+            elif form == "verify":
+                L3S.verify_candidates(arena, [(s_, 0, 0, 1) for s_ in live], be)
+            else:
+                p._backend = be
+                _r = p.secure_rows_to_l3(rows)
+                assert _r["lost"] == 0, (_r, arena.slot_states([int(g0)]), L3S.secured(arena, [int(g0)], be))
+        assert hits == []
+        assert be.ev.wait(3.0), form
+        stems, mtime, th = be.calls[0]
+        assert sorted(stems) == sorted(arena.slot_stem(s_) for s_ in want) and mtime is False, (form, be.calls)
+        assert th == "pdflip-l3-evict-handover", th
+    # not the LRU owner: a no-op, as before (review anchor0 B1)
+    off = _PromoteBe(enabled=False)
+    assert L3S.promote(arena, slots[:2], off) == 0
+
+
+def test_s109_a6_the_old_writer_promoted_too():
+    """The pin the async forms replace: arena_secure_to_disk promoted what it relied on (in-memory form)."""
+    import inspect
+
+    from flliper.srt.mem_cache.hicache_storage import HiCacheFile
+
+    assert "_l3_refresh_kept(_relied, mtime=False)" in inspect.getsource(HiCacheFile.arena_secure_to_disk)
+
+
+@_needs_gcc
+def test_s109_a7_the_quiesce_entrance_queues_every_unsecured_page_and_wakes_the_write_behind(tmp_path):
+    from flliper.srt.managers import pdflip_bubble_publish as BP
+    from flliper.srt.mem_cache import l3_secured as L3S
+
+    p, arena, slots = _unreferenced_full_arena(tmp_path)
+    be = p._backend
+    L3S.mark(arena, slots[:2])
+    _write_behind(arena, be._l3idx, slots[:2])
+    saved = list(L3S._REG)
+    try:
+        L3S._REG[:] = []
+        be._l3wb_thread = None
+        L3S.register_backend(arena, be)
+        sched = types.SimpleNamespace()
+        L3S.WAKE.clear()
+        BP.quiesce_begin(sched)
+        assert not getattr(arena, "_l3wb_urgent", set()), "no write-behind on this rank: nothing queued"
+        BP.quiesce_end(sched, "t")
+        be._l3wb_thread = object()                               # the store's LRU owner (D TP0 / P PP0)
+        with _no_file_io_in_this_thread() as hits:
+            BP.quiesce_begin(sched)
+        assert hits == []
+        assert set(arena._l3wb_urgent) == set(slots[2:]) and L3S.WAKE.is_set()
+        arena._l3wb_urgent.clear()
+        BP.quiesce_begin(sched)                                  # still open: once per quiesce
+        assert not arena._l3wb_urgent
+    finally:
+        L3S._REG[:] = saved
+
+
+@_needs_gcc
+def test_s109_a8_a_reaped_and_reclaimed_slot_is_never_copied_and_counts_as_dropped(tmp_path):
+    from flliper.srt.mem_cache import l3_secured as L3S
+    from flliper.srt.mem_cache.pool_host.arena_pool import ArenaMHAHostPool
+
+    p, arena, slots = _unreferenced_full_arena(tmp_path)
+    be = p._backend
+    copied = []
+    be.arena_secure_to_disk = lambda ar, cands, writer="x": copied.append(cands) or {"written": 1, "lost": 0}
+    cands = arena.evict_candidates(1)
+    s0 = cands[0][0]
+    d0 = getattr(ArenaMHAHostPool, "_257_dropped_without_l3", 0)
+    h0 = L3S.HAND_STATS["dropped_without_l3"]
+    # the hand-over is late: the aged reaper freed the slot and a new claim filled it (new generation)
+    import flliper.srt.mem_cache.storage.file.hicache_arena as HA
+
+    gen = HA._evict_gens_for(arena.path).get(s0)
+    arena.free_slots([s0])
+    with L3S._HAND_LOCK:
+        L3S._HAND.append((arena, be, tuple(cands[0]), "test", gen))
+    L3S._hand_drain()
+    assert copied == [], "no bytes copied under the old stem"
+    assert L3S.HAND_STATS["dropped_without_l3"] == h0 + 1
+    assert ArenaMHAHostPool._257_dropped_without_l3 == d0 + 1
+
+
+@_needs_gcc
+def test_s109_a8_a_failed_hand_over_copy_counts_as_dropped(tmp_path):
+    from flliper.srt.mem_cache import l3_secured as L3S
+
+    p, arena, slots = _unreferenced_full_arena(tmp_path)
+    be = p._backend
+    be.arena_secure_to_disk = lambda ar, cands, writer="x": {"written": 0, "lost": 1}
+    cands = arena.evict_candidates(1)
+    import flliper.srt.mem_cache.storage.file.hicache_arena as HA
+
+    gen = HA._evict_gens_for(arena.path).get(cands[0][0])
+    h0 = L3S.HAND_STATS["dropped_without_l3"]
+    with L3S._HAND_LOCK:
+        L3S._HAND.append((arena, be, tuple(cands[0]), "test", gen))
+    L3S._hand_drain()
+    assert L3S.HAND_STATS["dropped_without_l3"] == h0 + 1
+    assert arena.slot_states([cands[0][0]])[0] == 3

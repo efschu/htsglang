@@ -127,6 +127,41 @@ def register_backend(arena: Any, backend: Any) -> None:
         arena._l3sec_backend = backend
     except Exception:  # noqa: BLE001 -- an arena that takes no attribute: callers pass the backend
         pass
+    with _LOCK:
+        if not any(a is arena and b is backend for a, b in _REG):
+            _REG.append((arena, backend))
+
+
+#: S109-A7: every (arena, backend) this process opened (register_backend) -- the quiesce wake-up walks it
+_REG: list = []
+
+
+def queue_unsecured_all(why: str = "quiesce") -> int:
+    """S109-A7 (re-review 20.10.): at a quiesce's entrance (flip or sleep) every COMPLETE slot without an L3 copy is
+    queued for the write-behind and the write-behind is woken -- the whole quiesce (53-410 ms, median 98 ms) is its
+    time before the S86 veto. Only where the write-behind runs (the store's LRU owner: D TP0 / P PP0); one C census
+    plus memory reads per arena (``unsecured_keys_lo``, ~5 ms CPU), never I/O, never a wait. Returns the slots queued."""
+    with _LOCK:
+        reg = list(_REG)
+    n = 0
+    for arena, backend in reg:
+        if getattr(backend, "_l3wb_thread", None) is None:
+            continue
+        try:
+            n += int(unsecured_keys_lo(arena, backend, keys=False))
+        except Exception as exc:  # noqa: BLE001 -- a wake-up, never a failure of the quiesce
+            logger.warning("S109-A7 QUIESCE-WAKE %s failed: %r", why, exc)
+    if n:
+        k = QUIESCE_STATS["n"] = QUIESCE_STATS["n"] + 1
+        QUIESCE_STATS["queued"] += n
+        if k <= 32 or k % 64 == 0:
+            logger.info("S109-A7 QUIESCE-WAKE n=%d why=%s queued=%d (every COMPLETE page without its L3 copy is asked "
+                        "of the write-behind at the quiesce entrance; S86 vetoes not_on_l3 only what it could not "
+                        "copy in the quiesce)", k, why, n)
+    return n
+
+
+QUIESCE_STATS = {"n": 0, "queued": 0}
 
 
 def secured(arena: Any, slots, backend: Any = None, evicting_ok: bool = False) -> np.ndarray:
@@ -173,7 +208,13 @@ def invalidate_stems(arena: Any, stems) -> int:
     try:
         found = [int(sl) for sl, _st in arena.find_slots(list(stems)) if int(sl) >= 0]
         if found:
-            sec[0][np.asarray(found, dtype=np.int64)] = -1
+            _f = np.asarray(found, dtype=np.int64)
+            sec[0][_f] = -1
+            # S109-A5 (re-review R11): this process's write-behind visit baseline forgets them too (the pass also
+            # compares against the shared record, which covers the sister group's writer)
+            base = getattr(arena, "_l3wb_sec", None)
+            if base is not None:
+                base[0][_f] = -1
         return len(found)
     except Exception as exc:  # noqa: BLE001 -- the index side (AND) still answers "not on L3"
         logger.warning("S109-A1 L3-SECURED invalidate failed: %r", exc)
@@ -239,6 +280,9 @@ def check(arena: Any, slots, backend: Any = None, writer: str = "write_behind") 
     ok = secured(arena, slots, backend)
     if not bool(ok.all()):
         request(arena, [int(s) for s, k in zip(np.asarray(slots, dtype=np.int64).tolist(), ok.tolist()) if not k])
+    if ok.any():
+        promote(arena, [int(s) for s, k in zip(np.asarray(slots, dtype=np.int64).tolist(), ok.tolist()) if k],
+                backend)
     return ok
 
 
@@ -277,7 +321,7 @@ def publish(arena: Any, slots, gens) -> None:
         logger.warning("S109b L3-SECURED publish failed: %r", exc)
 
 
-def unsecured_keys_lo(arena: Any, backend: Any = None):
+def unsecured_keys_lo(arena: Any, backend: Any = None, keys: bool = True):
     """S109d: the key low words of every COMPLETE slot WITHOUT an L3 copy (record or index) -- the arena clock's keep
     list, so no room-making frees a page that has no copy -- and those slots queued for the write-behind. One census
     call (``complete_census``, C) plus memory reads; never I/O. Returns a sorted uint64 array."""
@@ -306,13 +350,15 @@ def unsecured_keys_lo(arena: Any, backend: Any = None):
     un = ~mine
     if un.any():
         request(arena, slots[un])
+    if not keys:
+        return int(un.sum())
     return np.unique(np.asarray(klo, dtype=np.uint64)[un])
 
 
-def unsecured_keys_lo_none(arena: Any, backend: Any = None):
+def unsecured_keys_lo_none(arena: Any, backend: Any = None, keys: bool = True):
     """The WRITER's form of ``unsecured_keys_lo`` (conftest seam only): no keep list -- the old clock, whose writer
     (``verify_candidates_now``) copies what it takes."""
-    return np.zeros(0, dtype=np.uint64)
+    return np.zeros(0, dtype=np.uint64) if keys else 0
 
 
 def verify_candidates(arena: Any, cands, backend: Any = None, writer: str = "claim_room") -> dict:
@@ -321,6 +367,8 @@ def verify_candidates(arena: Any, cands, backend: Any = None, writer: str = "cla
     candidate with ``mask`` False re-completed between the census and the clock: the caller does NOT free it but hands
     it over (``hand_over``: copied on the hand-over writer's own thread, then freed) -- S109-A3."""
     ok = secured(arena, [int(c[0]) for c in cands], backend, evicting_ok=True)
+    if ok.any():
+        promote(arena, [int(c[0]) for c, k in zip(cands, ok.tolist()) if k], backend)
     return {"on_disk": int(ok.sum()), "written": 0, "lost": 0, "uncopied": int((~ok).sum()),
             "mask": [bool(x) for x in ok.tolist()]}
 
@@ -357,7 +405,7 @@ _HAND: list = []
 _HAND_LOCK = threading.Lock()
 _HAND_THREAD: list = []
 _HAND_WAKE = threading.Event()
-HAND_STATS = {"queued": 0, "freed": 0, "copy_failed": 0}
+HAND_STATS = {"queued": 0, "freed": 0, "copy_failed": 0, "reaped": 0, "dropped_without_l3": 0}
 
 
 def wait_or_stop(stop: "threading.Event", timeout_s: float) -> bool:
@@ -373,19 +421,45 @@ def hand_over(arena: Any, cands, backend: Any, why: str) -> int:
     """S109-A3: queue EVICTING candidates without a copy for the hand-over writer (never I/O here)."""
     if not cands:
         return 0
-    items = [(arena, backend, (int(c[0]), int(c[1]), int(c[2]), int(c[3])), str(why)) for c in cands]
+    # S109-A8: the generation the clock saw (``evict_candidates`` keeps it, memory) -- the writer copies only while
+    # the slot is still EVICTING under it
+    try:
+        from flliper.srt.mem_cache.storage.file.hicache_arena import _evict_gens_for
+
+        eg = _evict_gens_for(arena.path) if getattr(arena, "path", None) else {}
+    except Exception:  # noqa: BLE001
+        eg = {}
+    items = [(arena, backend, (int(c[0]), int(c[1]), int(c[2]), int(c[3])), str(why), eg.get(int(c[0])))
+             for c in cands]
     with _HAND_LOCK:
         _HAND.extend(items)
         HAND_STATS["queued"] += len(items)
+    _hand_thread_start()
+    logger.warning("S109-A3 EVICT-HANDOVER why=%s n=%d (queued total %d): candidates re-completed between the census "
+                   "and the clock have no L3 copy -- NOT freed; the hand-over writer copies them, then frees",
+                   why, len(items), HAND_STATS["queued"])
+    return len(items)
+
+
+def _hand_thread_start() -> None:
+    with _HAND_LOCK:
         if not _HAND_THREAD:
             t = threading.Thread(target=_hand_loop, name="pdflip-l3-evict-handover", daemon=True)
             _HAND_THREAD.append(t)
             t.start()
     _HAND_WAKE.set()
-    logger.warning("S109-A3 EVICT-HANDOVER why=%s n=%d (queued total %d): candidates re-completed between the census "
-                   "and the clock have no L3 copy -- NOT freed; the hand-over writer copies them, then frees",
-                   why, len(items), HAND_STATS["queued"])
-    return len(items)
+
+
+def _dropped_without_l3(n: int) -> None:
+    """S109-A8: a hand-over page that leaves L2 with no L3 copy is the #257 loss -- counted where the claim's
+    ``#1427 ARENA-DROP ... dropped_without_l3`` total counts it."""
+    try:
+        from flliper.srt.mem_cache.pool_host.arena_pool import ArenaMHAHostPool as _P
+
+        _P._257_dropped_without_l3 = getattr(_P, "_257_dropped_without_l3", 0) + int(n)
+    except Exception:  # noqa: BLE001
+        pass
+    HAND_STATS["dropped_without_l3"] = HAND_STATS.get("dropped_without_l3", 0) + int(n)
 
 
 def _hand_drain() -> int:
@@ -394,7 +468,24 @@ def _hand_drain() -> int:
     with _HAND_LOCK:
         work, _HAND[:] = list(_HAND), []
     done = 0
-    for arena, backend, cand, why in work:
+    for item in work:
+        arena, backend, cand, why = item[:4]
+        gen = item[4] if len(item) > 4 else None
+        # S109-A8 (re-review): still OUR candidate? EVICTING under the generation the clock saw. A slot the aged
+        # reaper (arena_reap_stale, 60 s) freed -- and a new claim may have filled -- is never copied (new bytes under
+        # the old stem: the READ-DEPTH 1014 class); its page left L2 without a copy: dropped_without_l3
+        try:
+            st = int(arena.slot_states([cand[0]])[0])
+            g = int(np.asarray(arena.slot_gens_np([cand[0]]))[0]) if gen is not None else None
+        except Exception:  # noqa: BLE001 -- cannot tell: do not copy into an unknown slot
+            st, g = -1, None
+        if st != 3 or (gen is not None and g != int(gen)):
+            HAND_STATS["reaped"] = HAND_STATS.get("reaped", 0) + 1
+            _dropped_without_l3(1)
+            logger.warning("S109-A8 EVICT-HANDOVER slot=%d why=%s state=%d gen=%s/%s: reaped or re-claimed before its "
+                           "copy -- not copied (no new bytes under the old stem); dropped_without_l3=1 (total %d)",
+                           cand[0], why, st, g, gen, HAND_STATS["dropped_without_l3"])
+            continue
         secure = getattr(backend, "arena_secure_to_disk", None)
         ok = False
         if callable(secure):
@@ -410,9 +501,70 @@ def _hand_drain() -> int:
             done += 1
         else:
             HAND_STATS["copy_failed"] += 1
-            logger.warning("S109-A3 EVICT-HANDOVER slot=%d why=%s: no L3 copy could be made -- kept EVICTING (the aged "
-                           "reaper is the last resort), named", cand[0], why)
+            _dropped_without_l3(1)
+            logger.warning("S109-A3 EVICT-HANDOVER slot=%d why=%s: no L3 copy could be made -- kept EVICTING, the aged "
+                           "reaper frees it without a copy: dropped_without_l3=1 (total %d)", cand[0], why,
+                           HAND_STATS["dropped_without_l3"])
     return done
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# S109-A6 (re-review R8, ZERO-ANCHOR 1015): a page that leaves L2 because L3 holds it makes that L3 file the ONLY copy
+# -- it must be the youngest in the store's LRU (``HiCacheFile._l3_refresh_kept``, in-memory form), or the LRU takes
+# exactly it next (pdflip-40-179: lost from BOTH tiers). The old writer form promoted inside ``arena_secure_to_disk``;
+# the scheduler forms (``check``, ``verify_candidates``, ``secure_rows_to_l3``, the S39 child anchors) only QUEUE the
+# stems here; the hand-over thread promotes them (the evictor's lock is never taken on the scheduler thread). Only the
+# eviction OWNER keeps an LRU (review anchor0 B1): elsewhere this is a no-op, as before.
+_PROMOTE: dict = {}
+PROMOTE_MAX = 262144
+PROMOTE_STATS = {"queued": 0, "refreshed": 0, "overflow": 0}
+
+
+def promote(arena: Any, slots, backend: Any = None) -> int:
+    """Queue the L3 LRU promotion of ``slots``' stems (memory: ``slot_stem``); never I/O, never the evictor lock."""
+    if backend is None:
+        backend = getattr(arena, "_l3sec_backend", None)
+    ev = getattr(backend, "_evictor", None) if backend is not None else None
+    if ev is None or not getattr(ev, "enabled", False) or not callable(getattr(backend, "_l3_refresh_kept", None)):
+        return 0
+    stems = []
+    for x in slots:
+        try:
+            st = arena.slot_stem(int(x))
+        except Exception:  # noqa: BLE001
+            st = None
+        if st:
+            stems.append(st)
+    if not stems:
+        return 0
+    with _HAND_LOCK:
+        ent = _PROMOTE.get(id(backend))
+        if ent is None:
+            ent = _PROMOTE[id(backend)] = (backend, {})
+        if len(ent[1]) + len(stems) > PROMOTE_MAX:
+            PROMOTE_STATS["overflow"] += len(stems)
+            logger.warning("S109-A6 L3-PROMOTE queue full (%d): %d stems not promoted", len(ent[1]), len(stems))
+            return 0
+        for st in stems:
+            ent[1][st] = None                      # insertion order = release order (the LRU's order of touches)
+        PROMOTE_STATS["queued"] += len(stems)
+    _hand_thread_start()
+    return len(stems)
+
+
+def _promote_drain() -> int:
+    with _HAND_LOCK:
+        work = [(b, list(d)) for b, d in _PROMOTE.values() if d]
+        for _b, d in _PROMOTE.values():
+            d.clear()
+    n = 0
+    for backend, stems in work:
+        try:
+            n += int(backend._l3_refresh_kept(stems, mtime=False) or 0)
+        except Exception as exc:  # noqa: BLE001 -- recency is best effort, named
+            logger.warning("S109-A6 L3-PROMOTE failed for %d stems: %r", len(stems), exc)
+    PROMOTE_STATS["refreshed"] += n
+    return n
 
 
 def _hand_loop() -> None:
@@ -420,6 +572,8 @@ def _hand_loop() -> None:
         try:
             _HAND_WAKE.wait(1.0)
             _HAND_WAKE.clear()
+            if _PROMOTE:
+                _promote_drain()                   # S109-A6: before a hand-over copy can make the LRU evict
             if _HAND:
                 _hand_drain()
         except Exception as exc:  # noqa: BLE001 -- the writer never dies
