@@ -278,6 +278,105 @@ def _device_children(node: Any) -> List[Any]:
             if c.component_data[full].value is not None]
 
 
+#: S98 page codes of the group vote (``page_codes`` / ``agreed_survey``). Above the
+#: surveyed floor the MIN picks the most blocking answer of any rank: a cap filter
+#: other than the stage cap withholds it < live and blocking (outside the tree, pinned,
+#: two owners) < a live tree page NOT backed < a live tree page backed < not live and
+#: not claimable (withheld by the stage cap, a staged free) < free (a destination).
+CODE_HELD = -1
+CODE_BLOCK = 0
+CODE_UNBACKED = 1
+CODE_BACKED = 2
+CODE_IDLE = 3
+CODE_FREE = 4
+
+
+def page_codes(s: Survey, top_page: int) -> Tuple[List[int], List[int], Optional[str]]:
+    """S98: this rank's vote on its survey -- (dest, above, why).
+
+    ``dest[p - 1]`` for pages 1..floor_page: 1 = free here (a destination), else 0.
+    ``above[i]`` for pages floor_page+1..top_page: one ``CODE_*`` each (a free page
+    there is a destination for a higher candidate boundary). ``why`` names
+    a rank-local reason the survey cannot be voted on (then the caller votes "no").
+    The vector length is a function of (floor_page, top_page) alone -- both
+    replicated -- so every rank enters the collective with the same length."""
+    B, T = int(s.floor_page), int(top_page)
+    free = set(int(p) for p in s.free)
+    dest = [1 if p in free else 0 for p in range(1, B + 1)]
+    above = [CODE_FREE if p in free else CODE_IDLE for p in range(B + 1, T + 1)]
+    if s.why is not None:
+        return dest, above, s.why
+    for p in s.held_above:
+        if B < p <= T:
+            above[p - B - 1] = CODE_HELD
+    for p in s.live_above:
+        if p > T:
+            return dest, above, "page %d live above the stage top %d" % (p, T)
+        if above[p - B - 1] == CODE_HELD:
+            continue
+        np_ = s.owner.get(int(p))
+        if np_ is None or np_.pinned:
+            above[p - B - 1] = CODE_BLOCK
+        else:
+            above[p - B - 1] = CODE_BACKED if np_.backed else CODE_UNBACKED
+    return dest, above, None
+
+
+def agreed_survey(s: Survey, top_page: int, dest_min: Sequence[int], above_min: Sequence[int],
+                  above_max: Sequence[int]) -> Survey:
+    """S98: the survey every rank plans on, built from the GROUP vote (element-wise
+    MIN, and MAX for the pages above the floor) -- the same on every rank whose tree
+    groups the pages into the same nodes (the plan digest still checks that).
+
+    rc22/rc23 (NF Form A): ``backed`` reads host copies and mamba anchors, and the
+    attention host (real GDN states) and the expert workers (R12 shadow pool,
+    KV-only anchors under eviction) hold those differently; a rank-local ``backed``
+    picked different evictions and destinations per rank -> a different digest, a
+    crash-stop. Here a node is backed only when EVERY rank says so for every one of
+    its pages (group AND: never evict what one rank has not secured), a page blocks
+    when it blocks on ANY rank, a destination is a page free on EVERY rank, and a
+    page live on some ranks and free on others refuses by name (the replicas differ;
+    nothing moves anywhere)."""
+    B, T = int(s.floor_page), int(top_page)
+    free = [p for p in range(1, B + 1) if int(dest_min[p - 1]) >= 1]
+    free += [B + 1 + i for i in range(max(0, T - B)) if int(above_min[i]) >= CODE_FREE]
+    live: List[int] = []
+    held: List[int] = []
+    owner: Dict[int, NodePages] = {}
+    copies: Dict[int, NodePages] = {}
+    blocked_nodes = set()
+    unbacked_nodes = set()
+    why = s.why
+    for i in range(max(0, T - B)):
+        p, lo, hi = B + 1 + i, int(above_min[i]), int(above_max[i])
+        if lo >= CODE_IDLE:
+            continue           # not live on any rank (a destination when free on all)
+        if lo == CODE_HELD:
+            held.append(p)
+            continue
+        live.append(p)
+        if lo >= CODE_UNBACKED and hi >= CODE_IDLE and why is None:
+            why = ("page %d (tokens from %d) is live on some ranks and free on others -- the "
+                   "allocators are no replicas, no move" % (p, p * s.page_size))
+        np_ = s.owner.get(p)
+        if np_ is None:
+            continue           # blocks by "held outside the tree" (CODE_BLOCK on this rank)
+        cp = copies.get(id(np_))
+        if cp is None:
+            cp = copies[id(np_)] = NodePages(node=np_.node, pages=list(np_.pages), pinned=False,
+                                             backed=True, last=np_.last)
+        if lo == CODE_BLOCK:
+            blocked_nodes.add(id(np_))
+        elif lo == CODE_UNBACKED:
+            unbacked_nodes.add(id(np_))
+        owner[p] = cp
+    for k, cp in copies.items():
+        cp.pinned = k in blocked_nodes
+        cp.backed = k not in unbacked_nodes
+    return Survey(s.page_size, s.num_pages, B, live, free, owner, list(copies.values()),
+                  why=why, held_above=held)
+
+
 def plan_for(s: Survey, boundary_page: int) -> Tuple[Optional[Plan], str]:
     """Moves (and, only as the fallback, evictions of BACKED nodes) that leave no
     live page above ``boundary_page`` -- or None and why. All or nothing: a plan

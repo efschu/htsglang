@@ -430,18 +430,15 @@ def test_a_peer_that_cannot_clear_keeps_every_rank_on_s9(floor_env, monkeypatch)
     turn = _node(tree, alloc, list(range(6145, 6200)), PG)
     v0 = turn.component_data[FULL].value
     surveys = []
-    real = dsv_._kv_compact_rank_plans
+    real = dsv_._kv_compact_rank_survey
 
-    def counted(sched_, boundaries):
-        surveys.append(list(boundaries))
-        plans, why, copier = real(sched_, boundaries)
-        return plans, why, copier
-    monkeypatch.setattr(dsv_, "_kv_compact_rank_plans", counted)
+    def counted(sched_, floor_page):
+        surveys.append(int(floor_page))
+        return real(sched_, floor_page)
+    monkeypatch.setattr(dsv_, "_kv_compact_rank_survey", counted)
 
-    def gmin(vals):
-        # the peer clears no stage: every KV-COMPACT flag is 0 (2 per candidate)
-        return [0] * len(vals) if len(vals) == 2 * len(surveys[-1] if surveys else ()) else list(vals)
-    sched._pdflip_group_min_ints = gmin
+    # the peer clears no stage: its vote says no (S98: the one vote collective, ok = 0)
+    monkeypatch.setattr(dsv_, "_kv_compact_group_vote", lambda s_, vec: [0] + list(vec[1:]))
     sched.running_batch.reqs = [_req("pdflip-2-70", 150_000)]
     st = dsv_.runtime_tick(sched)
     assert not st.changed and ms.stage == 9 and ms.pending is not None

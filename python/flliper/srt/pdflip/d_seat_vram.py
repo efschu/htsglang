@@ -3603,29 +3603,83 @@ def _kv_compact_tree_ok(sched) -> bool:
     return KC.tree_why(getattr(sched, "tree_cache", None)) is None
 
 
-def _kv_compact_rank_plans(sched, boundaries: Sequence[int]):
-    """Rank-local: (plans, why, copier) -- one plan (or None) per candidate boundary."""
+def _kv_compact_rank_survey(sched, floor_page: int):
+    """Rank-local: (survey, why, copier) -- the survey above ``floor_page`` or why
+    this rank cannot take part (no allocator, a buffer the move cannot follow, ...)."""
     from flliper.srt.pdflip import d_kv_compact as KC
 
     page = _page_size(sched)
     alloc = _kv_allocator(sched)
     if alloc is None:
-        return [None] * len(boundaries), "no allocator", None
+        return None, "no allocator", None
     bufs, why = kv_page_buffers(sched)
     if why is not None:
-        return [None] * len(boundaries), why, None
+        return None, why, None
     try:
         copier = KvPageCopier.from_buffers(bufs, page)
     except KvCopyRefused as exc:
-        return [None] * len(boundaries), "copier: %s" % exc, None
-    sv = KC.survey(getattr(sched, "tree_cache", None), alloc, page, min(int(b) for b in boundaries))
+        return None, "copier: %s" % exc, None
+    sv = KC.survey(getattr(sched, "tree_cache", None), alloc, page, int(floor_page))
+    return sv, sv.why, copier
+
+
+def _kv_compact_vote(sv, why, floor_page: int, top_page: int) -> List[int]:
+    """S98: this rank's ONE vote vector (fixed length from the replicated floor/top):
+    [ok] + destinations (MIN) + page codes (MIN) + negated page codes (-> MAX)."""
+    from flliper.srt.pdflip import d_kv_compact as KC
+
+    B, T = int(floor_page), int(top_page)
+    if sv is None:
+        return [0] + [0] * B + [KC.CODE_BLOCK] * (T - B) + [-KC.CODE_BLOCK] * (T - B)
+    dest, above, w = KC.page_codes(sv, T)
+    ok = 1 if (why is None and w is None) else 0
+    return [ok] + dest + above + [-c for c in above]
+
+
+def _kv_compact_group_vote(sched, vec: List[int]) -> List[int]:
+    """The element-wise group MIN of the vote (the ONE collective of the survey step;
+    local without a group). A seam of its own so a test can play a peer."""
+    gmin = getattr(sched, "_pdflip_group_min_ints", None)
+    out = list(vec) if gmin is None else [int(x) for x in gmin(list(vec))]
+    if len(out) != len(vec):
+        return [0] * len(vec)
+    return out
+
+
+def _kv_compact_plans_from_vote(sv, group: List[int], floor_page: int, top_page: int,
+                                boundaries: Sequence[int]):
+    """(plans, why) per candidate boundary, planned on the GROUP-agreed survey."""
+    from flliper.srt.pdflip import d_kv_compact as KC
+
+    B, T = int(floor_page), int(top_page)
+    if sv is None or int(group[0]) != 1:
+        return [None] * len(boundaries), ""
+    dest = group[1:1 + B]
+    lo = group[1 + B:1 + B + (T - B)]
+    hi = [-int(x) for x in group[1 + B + (T - B):]]
+    agreed = KC.agreed_survey(sv, T, dest, lo, hi)
     plans, why = [], ""
     for b in boundaries:
-        pl, w = KC.plan_for(sv, int(b))
+        pl, w = KC.plan_for(agreed, int(b))
         plans.append(pl)
         if pl is None and not why:
             why = w
-    return plans, why, copier
+    return plans, why
+
+
+def _kv_compact_rank_plans(sched, boundaries: Sequence[int], top_page: Optional[int] = None):
+    """Single-rank form (no group): (plans, why, copier) -- one plan (or None) per
+    candidate boundary, planned on this rank's own vote as if it were the group's."""
+    B = min(int(b) for b in boundaries)
+    alloc = _kv_allocator(sched)
+    T = int(top_page) if top_page is not None else int(getattr(alloc, "num_pages", 0) or 0)
+    T = max(T, max(int(b) for b in boundaries))
+    sv, why, copier = _kv_compact_rank_survey(sched, B)
+    vec = _kv_compact_vote(sv, why, B, T)
+    if vec[0] != 1:
+        return [None] * len(boundaries), why or "this rank cannot vote", copier
+    plans, w = _kv_compact_plans_from_vote(sv, vec, B, T, boundaries)
+    return plans, w, copier
 
 
 def _group_same(sched, value: int) -> Tuple[int, int]:
@@ -3648,7 +3702,10 @@ def _kv_compact_for_shrink(sched, ms, fr, want: int, end: bool, floor_tokens: in
     before the next end event -- also while the shrink is pending.
 
     Collectives, all entered by every rank on the same path:
-    1. MIN over "my plan clears stage jj" (moves only / with evictions);
+    1. S98: the VOTE, one MIN over [ok, destinations free here, page codes, negated
+       page codes] (``_kv_compact_vote``); every rank plans every candidate on the
+       agreed survey (``d_kv_compact.agreed_survey``: backed = group AND) and picks
+       the lowest stage it clears (moves only first) -- replicated input, same pick;
     2. N3 the plan DIGEST (jj, sources, destinations, evictions) as MIN/MAX:
        unequal = PdFlipKvCompactDivergence before anything moved;
     3. N3 the MOVES' outcome as MIN/MAX: all moved -> go on; none moved (each
@@ -3670,24 +3727,36 @@ def _kv_compact_for_shrink(sched, ms, fr, want: int, end: bool, floor_tokens: in
         return None
     page = _page_size(sched)
     t0 = time.perf_counter()
+    bounds = [int(tokens[jj]) // page for jj in cands]
+    floor_page = min(bounds)
+    top_page = int(tokens[int(ms.stage)]) // page
+    # S98: ONE collective -- the vote. Every rank plans on the group-agreed survey
+    # (backed = group AND, blocking = group OR, destinations = free on every rank),
+    # so the pick, the moves and the evictions are the same on every rank whose tree
+    # holds the same nodes; the digest below still checks exactly that.
     try:
-        plans, why, copier = _kv_compact_rank_plans(sched, [int(tokens[jj]) // page for jj in cands])
+        sv, why, copier = _kv_compact_rank_survey(sched, floor_page)
     except Exception as exc:  # noqa: BLE001 -- a survey failure is this rank's "no"
-        plans, why, copier = [None] * len(cands), "%s: %s" % (type(exc).__name__, exc), None
-    moves = [1 if (p is not None and not p.evicts) else 0 for p in plans]
-    anys = [1 if p is not None else 0 for p in plans]
-    flags = moves + anys
-    gmin = getattr(sched, "_pdflip_group_min_ints", None)
-    group = list(flags) if gmin is None else [int(x) for x in gmin(list(flags))]
+        sv, why, copier = None, "%s: %s" % (type(exc).__name__, exc), None
+    vec = _kv_compact_vote(sv, why, floor_page, top_page)
+    if vec[0] != 1 and not why:
+        why = "this rank cannot vote"
+    group = _kv_compact_group_vote(sched, vec)
+    try:
+        plans, pwhy = _kv_compact_plans_from_vote(sv, group, floor_page, top_page, bounds)
+    except Exception as exc:  # noqa: BLE001 -- replicated input: every rank fails alike
+        plans, pwhy = [None] * len(cands), "%s: %s" % (type(exc).__name__, exc)
+    if not why:
+        why = pwhy if int(group[0]) == 1 else ""
     k = len(cands)
-    if len(group) != 2 * k:
-        group = [0] * (2 * k)
-    pick = next((i for i in range(k) if group[i] == 1 and moves[i]), None)
+    anys = [1 if p is not None else 0 for p in plans]
+    pick = next((i for i in range(k) if plans[i] is not None and not plans[i].evicts), None)
     if pick is None:
-        pick = next((i for i in range(k) if group[k + i] == 1 and anys[i]), None)
+        pick = next((i for i in range(k) if plans[i] is not None), None)
     _KV_COMPACT_N[0] += 1
     n = _KV_COMPACT_N[0]
-    if pick is None:
+
+    def _refused():
         fr["compact_refused"] = key
         if n <= 16 or (n & (n - 1)) == 0:
             logger.info("%s n=%d verdict=refused want=S%d stage=S%d floor=%d end=%s local=%s -- %s",
@@ -3695,14 +3764,24 @@ def _kv_compact_for_shrink(sched, ms, fr, want: int, end: bool, floor_tokens: in
                         "yes" if end else "no", "".join(str(x) for x in anys),
                         why or "a peer rank cannot clear the boundary")
         return None
-    jj, plan = cands[pick], plans[pick]
-    digest = KC.plan_digest(jj, plan)
+
+    if int(group[0]) != 1:          # the group said no: replicated, every rank returns here
+        return _refused()
+    # S98: the pick comes from the agreed survey, so it is the same on every rank whose
+    # tree holds the same nodes. The digest collective is entered on EVERY rank once the
+    # group said yes -- with a plan or with the sentinel -1 -- so a rank whose tree
+    # differs cannot leave its peers waiting in a collective it skipped: unequal is the
+    # named crash-stop before anything moved, equal -1 is a refusal everywhere.
+    jj, plan = (cands[pick], plans[pick]) if pick is not None else (-1, None)
+    digest = KC.plan_digest(jj, plan) if plan is not None else -1
     lo, hi = _group_same(sched, digest)
     if lo != hi:
         raise PdFlipKvCompactDivergence(
             "%s n=%d: the ranks' plans for S%d differ (digest here %d, group %d..%d) -- the "
             "allocators or trees are no longer replicas; nothing moved" % (
                 KV_COMPACT_MARK, n, jj, digest, lo, hi))
+    if plan is None:
+        return _refused()
     res = None
     try:
         res = KC.execute_moves(getattr(sched, "tree_cache", None), _kv_allocator(sched), plan, copier)

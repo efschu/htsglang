@@ -306,22 +306,198 @@ def test_an_unknown_token_indexed_tensor_beside_the_empty_fa_share_refuses(floor
 
 
 def test_a_tp0_peer_refusal_keeps_the_worker_on_s9(floor_env, monkeypatch, caplog):
-    """Rank agreement: the worker's own answer is yes, a peer says no -> group MIN 0,
-    no rank moves, the worker's pages stay where they are."""
+    """Rank agreement: the worker's own answer is yes, a peer votes no (ok = 0 in the
+    group MIN) -> no rank moves, the worker's pages stay where they are."""
     caplog.set_level(logging.INFO)
     dsv_, sched, caps, alloc, tree, target, dw = _form_metal(floor_env, monkeypatch, _tp1)
-    seen = []
-    real = dsv_._kv_compact_rank_plans
+    votes = []
 
-    def counted(sched_, boundaries):
-        seen.append(len(boundaries))
-        return real(sched_, boundaries)
-    monkeypatch.setattr(dsv_, "_kv_compact_rank_plans", counted)
-    # the peer clears no stage: every KV-COMPACT flag (2 per candidate) is 0 in the MIN
-    sched._pdflip_group_min_ints = lambda vals: (
-        [0] * len(vals) if seen and len(vals) == 2 * seen[-1] else list(vals))
+    def peer_says_no(sched_, vec):
+        votes.append(list(vec))
+        return [0] + list(vec[1:])
+    monkeypatch.setattr(dsv_, "_kv_compact_group_vote", peer_says_no)
     ms, st, turn, v_old = _end_event(dsv_, sched, alloc, tree)
+    assert votes and votes[0][0] == 1, "the worker itself could not vote yes"
     assert not st.changed and ms.stage == 9
     assert torch.equal(turn.component_data[FULL].value, v_old)
     r = _refusals(caplog, dsv_)
     assert r and "a peer rank cannot clear the boundary" in r[0], r
+
+
+# ---- (5) planner order 20.10.: the eviction choice is rank-agreed (group AND of backed) ----
+#
+# rc23 d76cae6851 (boot 1020_105621, 11:05:06) died of the same class in another place:
+# ``S86 SLEEP-L3-RELEASE ... slots=431/433/433 ... digest=DIVERGED kept=aux_host_only:24``
+# (TP0) vs ``aux_host_only:8`` (TP1/TP2) -- the host and the expert workers do not hold
+# the same host-side state. KV-COMPACT's ``backed`` reads exactly such state.
+
+from test_s77_kv_compact_s9_hold_1019 import MAMBA  # noqa: E402
+
+
+def _three_ranks(monkeypatch, *, host_backs_x):
+    """TP0 host, TP1/TP2 workers; the same replicated allocator and tree steps. Node X:
+    the host holds its real GDN state without a host copy (unbacked there), the workers'
+    R12 shadow holds no state (backed there) -- unless ``host_backs_x``. Node Y backed
+    everywhere, node Z unbacked everywhere. Below S8 only 10 pages are free: X (8) + Z (2)
+    fit, Y must be evicted -- the plan NEEDS an eviction."""
+    ranks = []
+    for name, form in (("TP0", _tp0), ("TP1", _tp1), ("TP2", _tp2)):
+        target, dw = form(monkeypatch)
+        alloc = _alloc(TOP // PG, PG)
+        alloc._kvcache = target
+        tree = Tree(alloc)
+        _take(alloc, [p for p in range(1, S8_PAGE + 1) if p not in range(5000, 5010)])
+        x = _node(tree, alloc, list(range(6200, 6208)), PG, backed=True)
+        if name == "TP0" and not host_backs_x:
+            x.component_data[MAMBA] = types.SimpleNamespace(value=torch.tensor([1]), host_value=None,
+                                                            lock_ref=0)
+        y = _node(tree, alloc, list(range(6300, 6308)), PG, backed=True)
+        z = _node(tree, alloc, list(range(6400, 6402)), PG, backed=False)
+        sched = types.SimpleNamespace(token_to_kv_pool_allocator=alloc, page_size=PG,
+                                      draft_worker=dw, tree_cache=tree)
+        sv, why, cop = dsv._kv_compact_rank_survey(sched, S8_PAGE)
+        assert why is None, (name, why)
+        ranks.append((name, sched, sv, {"x": x, "y": y, "z": z}))
+    return ranks
+
+
+def _tp2(monkeypatch):
+    ratio = CUT[2]
+    monkeypatch.setattr(dsv, "kv_owner_block", lambda: (S, ratio))
+    target = _qsa_pool((TOP // S + 1) * ratio, index_on_rank=False)
+    return target, _shadow_draft_worker()
+
+
+def _vote_and_plan(ranks, top=TOP // PG):
+    vecs = [dsv._kv_compact_vote(sv, None, S8_PAGE, top) for _n, _s, sv, _x in ranks]
+    assert len({len(v) for v in vecs}) == 1, "the ranks enter the collective with unequal lengths"
+    group = [min(col) for col in zip(*vecs)]                         # gloo MIN over 3 ranks
+    out = []
+    for name, _s, sv, nodes in ranks:
+        plans, why = dsv._kv_compact_plans_from_vote(sv, group, S8_PAGE, top, [S8_PAGE])
+        out.append((name, plans[0], why, nodes))
+    return out
+
+
+def test_three_ranks_with_unequal_backed_choose_the_same_eviction_and_digest(floor_env, monkeypatch):
+    ranks = _three_ranks(monkeypatch, host_backs_x=False)
+    local_backed = {n: {k: sv.owner[min(v.component_data[FULL].value.tolist()) // PG].backed
+                        for k, v in nodes.items()} for n, _s, sv, nodes in ranks}
+    assert local_backed["TP0"]["x"] is False and local_backed["TP1"]["x"] is True   # the premise
+    # the class: planned on each rank's OWN survey (beef9035eb and before), the host keeps X
+    # and evicts Y while the workers evict X -- different digests, the W86-style group death
+    rank_local = [KC.plan_for(sv, S8_PAGE)[0] for _n, _s, sv, _x in ranks]
+    assert len({KC.plan_digest(8, p) for p in rank_local}) > 1
+    res = _vote_and_plan(ranks)
+    digests = set()
+    for name, plan, why, nodes in res:
+        assert plan is not None, (name, why)
+        assert plan.evicts, "the plan was meant to need an eviction"
+        assert [m.node for m in plan.evicts] == [nodes["y"]], name              # never X
+        assert {id(m.node) for m, _s, _d in plan.moves} == {id(nodes["x"]), id(nodes["z"])}, name
+        digests.add(KC.plan_digest(8, plan))
+    assert len(digests) == 1, "the ranks' plans differ (crash-stop on the metal)"
+
+
+def test_three_ranks_backed_everywhere_evict_by_the_replicated_order(floor_env, monkeypatch):
+    ranks = _three_ranks(monkeypatch, host_backs_x=True)
+    res = _vote_and_plan(ranks)
+    assert len({KC.plan_digest(8, p) for _n, p, _w, _x in res}) == 1
+    assert all(p is not None and p.evicts for _n, p, _w, _x in res)
+
+
+def test_a_page_live_on_one_rank_and_free_on_another_refuses_everywhere(floor_env, monkeypatch):
+    ranks = _three_ranks(monkeypatch, host_backs_x=True)
+    name, sched, sv, nodes = ranks[2]
+    sv.live_above = [p for p in sv.live_above if p != 6400]                  # TP2: page free
+    sv.owner.pop(6400)
+    res = _vote_and_plan(ranks)
+    for name, plan, why, _x in res:
+        assert plan is None and "live on some ranks and free on others" in why, (name, why)
+
+
+def test_a_page_blocked_on_one_rank_blocks_every_rank(floor_env, monkeypatch):
+    ranks = _three_ranks(monkeypatch, host_backs_x=True)
+    ranks[1][2].owner[6300].pinned = True                                     # TP1: Y pinned
+    res = _vote_and_plan(ranks)
+    assert all(p is None and "pinned" in w for _n, p, w, _x in res), [w for _n, _p, w, _x in res]
+
+
+def test_a_destination_free_on_one_rank_only_is_no_destination(floor_env, monkeypatch):
+    ranks = _three_ranks(monkeypatch, host_backs_x=True)
+    ranks[0][2].free = [p for p in ranks[0][2].free if p != 5000]            # TP0: 5000 taken
+    res = _vote_and_plan(ranks)
+    for _n, plan, _w, _x in res:
+        assert plan is not None and 5000 not in [d for _m, _s, ds in plan.moves for d in ds]
+    assert len({KC.plan_digest(8, p) for _n, p, _w, _x in res}) == 1
+
+
+def test_the_vote_is_one_collective_on_the_tick(floor_env, monkeypatch):
+    """No new collective: the survey step enters exactly one group MIN (the vote)."""
+    dsv_, sched, caps, alloc, tree, target, dw = _form_metal(floor_env, monkeypatch, _tp1)
+    seen = []
+    real = dsv_._kv_compact_group_vote
+    monkeypatch.setattr(dsv_, "_kv_compact_group_vote",
+                        lambda s_, v: seen.append(len(v)) or real(s_, v))
+    ms, st, turn, v_old = _end_event(dsv_, sched, alloc, tree)
+    assert st.changed and len(seen) == 1
+
+
+def test_a_higher_candidate_takes_its_destinations_above_the_lowest_boundary(floor_env, monkeypatch):
+    """The vote covers every candidate at once: a page free between the lowest boundary
+    (S4) and S8 is a destination for S8 -- the move, not an eviction."""
+    t0, dw0 = _tp0(monkeypatch)
+    sched = _replica(t0, dw0)
+    s4 = FLOOR_LADDER[4] // PG
+    plans, why, _c = dsv._kv_compact_rank_plans(sched, [s4, S8_PAGE])
+    assert plans[0] is None                                       # 1..4999 run below S8, above S4
+    assert plans[1] is not None and not plans[1].evicts, why
+    dst = [d for _m, _s, ds in plans[1].moves for d in ds]
+    assert dst and min(dst) > s4 and max(dst) <= S8_PAGE
+
+
+def test_a_page_withheld_by_the_cap_is_no_destination_in_the_vote(floor_env, monkeypatch):
+    """Not live is not free: ids the stage cap withholds (above it) are no destination
+    for any candidate, even though nothing lives there."""
+    from flliper.srt.managers.kv_backing_relief import KvRowCap
+
+    t0, dw0 = _tp0(monkeypatch)
+    sched = _replica(t0, dw0)
+    alloc = sched.token_to_kv_pool_allocator
+    cap = alloc._pdflip_kv_stage_cap = KvRowCap(alloc)
+    cap.engage(5050)                                             # 51 free pages below it
+    s4 = FLOOR_LADDER[4] // PG                                   # the vote's floor: S4, so the
+    plans, why, _c = dsv._kv_compact_rank_plans(sched, [s4, S8_PAGE])   # withheld ids sit above it
+    assert plans[1] is not None, why
+    dst = [d for _m, _s, ds in plans[1].moves for d in ds]
+    assert dst and max(dst) <= 5050
+    assert plans[1].evicts, "85 pages do not fit into 51: the backed node is the fallback"
+
+
+def test_a_rank_without_a_plan_still_enters_the_digest_collective(floor_env, monkeypatch):
+    """The group voted yes, but this rank's tree yields no plan (a structure its peers do
+    not share): it must not skip the digest collective its peers enter -- it answers -1,
+    and the unequal digest is the named crash-stop, never a hang."""
+    dsv_, sched, caps, alloc, tree, target, dw = _form_metal(floor_env, monkeypatch, _tp1)
+    monkeypatch.setattr(dsv_, "_kv_compact_plans_from_vote",
+                        lambda sv, group, fp, tp, bounds: ([None] * len(bounds), "no plan here"))
+    calls = []
+
+    def same(sched_, value):
+        calls.append(int(value))
+        return int(value), 12345                                       # a peer has its plan
+    monkeypatch.setattr(dsv_, "_group_same", same)
+    with pytest.raises(dsv_.PdFlipKvCompactDivergence, match="plans .* differ"):
+        _end_event(dsv_, sched, alloc, tree)
+    assert calls == [-1]
+
+
+def test_no_plan_on_every_rank_after_a_yes_vote_is_a_refusal(floor_env, monkeypatch, caplog):
+    caplog.set_level(logging.INFO)
+    dsv_, sched, caps, alloc, tree, target, dw = _form_metal(floor_env, monkeypatch, _tp1)
+    monkeypatch.setattr(dsv_, "_kv_compact_plans_from_vote",
+                        lambda sv, group, fp, tp, bounds: ([None] * len(bounds), "no plan here"))
+    ms, st, turn, v_old = _end_event(dsv_, sched, alloc, tree)
+    assert not st.changed and ms.stage == 9
+    r = _refusals(caplog, dsv_)
+    assert r and "no plan here" in r[0], r
