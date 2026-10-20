@@ -8809,6 +8809,69 @@ class SchedulerPPMixin:
         work.clear()
         self._pp_drain_due_sends()
 
+    def _pp_retire_device_sends_at_sleep(self: Scheduler, releasable=None) -> Tuple[int, int, int]:
+        """S95b (rc22 NF P, boot 1020_094747): at the group's sleep, the DEVICE frames this rank sent and still
+        references go -- after a device-side ``Work.wait()``, the primitive ``bound_proxy_lead`` fences with.
+
+        Two holders keep the sent hidden/residual frames alive past the last pass: the lap-late join book
+        (``_pp_pending_sends``, joined ``_pp_send_join_lag()`` laps after the post -- the passes that would join
+        them never come once the group sleeps) and the P-overlap lead deque (``_pdflip_proxy_lead``, the newest
+        frame always stays). Measured: PP0/PP1 ``untagged_live`` 754/721 MiB at sleep 2 after full 16384-token
+        chunks (two frames of 16384 x 5120 x 2 B x 2 tensors) against 106-150 MiB at a sleep after short chunks
+        (``PDFLIP-SLEEP-HOLDER ... P2PWork.payload <- list <- deque``), sampled into the group-P dormant record
+        and priced against D's expert residency by its MAX.
+
+        What goes: only works whose payload is a CUDA tensor (the device group's halves). Host halves (gloo
+        metadata) stay in the book for the lap-late join -- dropping a gloo handle unjoined frees memory the
+        transport still reads (corpse A, ``_pp_post_send``). Rank-local by construction: no collective, no
+        verdict another rank reads; every rank runs it at the same sleep RPC, unconditionally. The sends are
+        matched -- the group sleeps only after its drain, every frame was received by the stage that consumed it.
+        Returns (frames released, bytes released, host works kept). ``releasable`` (tests): which works go."""
+        if releasable is None:
+            def releasable(w):
+                return getattr(w, "work", None) is not None and bool(getattr(getattr(w, "payload", None), "is_cuda", False))
+        released: Dict[int, object] = {}
+
+        def _retire(w) -> None:
+            if id(w) not in released:
+                w.work.wait()
+                released[id(w)] = w
+
+        lead = getattr(self, "_pdflip_proxy_lead", None)
+        if lead:
+            for frame in list(lead):
+                for w in frame:
+                    if releasable(w):
+                        _retire(w)
+            lead.clear()
+        kept = 0
+        pending = getattr(self, "_pp_pending_sends", None)
+        if pending:
+            for lap in list(pending):
+                lists = pending[lap]
+                for lst in lists:
+                    keep = []
+                    for w in lst:
+                        if releasable(w):
+                            _retire(w)
+                        else:
+                            keep.append(w)
+                    lst[:] = keep
+                    kept += len(keep)
+                lists[:] = [lst for lst in lists if lst]
+                if not lists:
+                    del pending[lap]
+        nbytes = 0
+        for w in released.values():
+            t = getattr(w, "payload", None)
+            try:
+                nbytes += int(t.numel()) * int(t.element_size())
+            except Exception:  # noqa: BLE001 -- a payload without a size counts 0
+                pass
+        frames = len(released)
+        released.clear()
+        return frames, nbytes, kept
+
     def _pp_drain_due_sends(self: Scheduler) -> None:
         """Join sends posted at least one full slot cycle ago.
 
