@@ -80,8 +80,8 @@ class Record:
         self.start.record()
         self.end = None
         self.pairs: List[tuple] = []
-        # [rows, bytes, served lanes of wave 1 .. MAX_WAVES] (F3)
-        self.counter = torch.zeros(2 + MAX_WAVES, dtype=torch.int64, device=device)
+        # [rows, bytes, served lanes of wave 1 .. MAX_WAVES (F3), computed lanes of wave 1 .. MAX_WAVES (W2)]
+        self.counter = torch.zeros(2 + 2 * MAX_WAVES, dtype=torch.int64, device=device)
         self.wave_copy: dict = {}   # F3: wave -> [(copy start, copy end)]
         self.wave_apply: dict = {}  # F3: wave -> [(copy end, apply end)]
         self.last_copy_end = None
@@ -111,9 +111,10 @@ class Record:
         self.counter[0:1].add_(n)
         self.counter[1:2].add_(n * int(row_bytes))
 
-    def applied(self, wave: int, served) -> None:
+    def applied(self, wave: int, served, computed=None) -> None:
         """F3: after one wave's apply slices -- its device time (copy end -> now) and its served lanes (a device
-        sum into the counter; no host read)."""
+        sum into the counter; no host read). W2-APPLY: ``computed`` = the lanes the wave's GEMMs computed (a
+        device mask, or the host lane count of the zero-row form)."""
         import torch
 
         e2 = _cuda().Event(enable_timing=True)
@@ -123,6 +124,12 @@ class Record:
             self.wave_apply.setdefault(w, []).append((self.last_copy_end, e2))
             self.last_copy_end = None
         self.counter[1 + w:2 + w].add_(served.reshape(-1).to(torch.int64).sum().reshape(1))
+        if computed is not None:
+            c = 1 + MAX_WAVES + w
+            if isinstance(computed, int):
+                self.counter[c:c + 1].add_(int(computed))
+            else:
+                self.counter[c:c + 1].add_(computed.reshape(-1).to(torch.int64).sum().reshape(1))
 
     def end_layer(self, tokens: int) -> None:
         ev = _cuda().Event(enable_timing=True)
@@ -203,10 +210,12 @@ def wave_terms(rec: Record) -> str:
 
     host = rec.host
     served = [int(host[1 + w]) if host is not None and 1 + w < len(host) else 0 for w in waves]
-    return (" wave_copy_ms=%s wave_apply_ms=%s wave_served=%s"
+    lanes = [int(host[1 + MAX_WAVES + w]) if host is not None and 1 + MAX_WAVES + w < len(host) else 0
+             for w in waves]
+    return (" wave_copy_ms=%s wave_apply_ms=%s wave_served=%s wave_lanes=%s"
             % ("/".join("%.1f" % _ms(rec.wave_copy.get(w, ())) for w in waves),
                "/".join("%.1f" % _ms(rec.wave_apply.get(w, ())) for w in waves),
-               "/".join(str(x) for x in served)))
+               "/".join(str(x) for x in served), "/".join(str(x) for x in lanes)))
 
 
 def drain() -> int:

@@ -77,4 +77,4 @@ def test_the_wave_counter_rides_the_one_non_blocking_d2h(monkeypatch, caplog):
     with caplog.at_level(logging.INFO, logger=P.__name__):
         S51._extend(dev)
         P.on_forward(42)
-    assert seen == [(2 + P.MAX_WAVES,)]
+    assert seen == [(2 + 2 * P.MAX_WAVES,)]
