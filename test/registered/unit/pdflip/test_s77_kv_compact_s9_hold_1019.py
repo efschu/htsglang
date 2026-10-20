@@ -430,18 +430,15 @@ def test_a_peer_that_cannot_clear_keeps_every_rank_on_s9(floor_env, monkeypatch)
     turn = _node(tree, alloc, list(range(6145, 6200)), PG)
     v0 = turn.component_data[FULL].value
     surveys = []
-    real = dsv_._kv_compact_rank_plans
+    real = dsv_._kv_compact_rank_survey
 
-    def counted(sched_, boundaries):
-        surveys.append(list(boundaries))
-        plans, why, copier = real(sched_, boundaries)
-        return plans, why, copier
-    monkeypatch.setattr(dsv_, "_kv_compact_rank_plans", counted)
+    def counted(sched_, floor_page):
+        surveys.append(int(floor_page))
+        return real(sched_, floor_page)
+    monkeypatch.setattr(dsv_, "_kv_compact_rank_survey", counted)
 
-    def gmin(vals):
-        # the peer clears no stage: every KV-COMPACT flag is 0 (2 per candidate)
-        return [0] * len(vals) if len(vals) == 2 * len(surveys[-1] if surveys else ()) else list(vals)
-    sched._pdflip_group_min_ints = gmin
+    # the peer clears no stage: its vote says no (S98: the one vote collective, ok = 0)
+    monkeypatch.setattr(dsv_, "_kv_compact_group_vote", lambda s_, vec: [0] + list(vec[1:]))
     sched.running_batch.reqs = [_req("pdflip-2-70", 150_000)]
     st = dsv_.runtime_tick(sched)
     assert not st.changed and ms.stage == 9 and ms.pending is not None
@@ -669,7 +666,9 @@ def _scripted_same(monkeypatch, dsv_, answers):
     return calls
 
 
-def test_unequal_plan_digests_crash_stop_before_anything_moved(floor_env, monkeypatch):
+def test_unequal_plan_digests_refuse_uniformly_before_anything_moved(floor_env, monkeypatch):
+    """S98c (rang review nf-review-s98-1020.md, Auflage 3): nothing has moved when the
+    digests differ and every rank sees the same reduced lo/hi -- a uniform refusal."""
     target = _tp0_pool()
     dsv_, sched, caps, alloc, tree, draft = _form(floor_env, monkeypatch, target)
     ms = _to_s9(dsv_, sched)
@@ -678,8 +677,8 @@ def test_unequal_plan_digests_crash_stop_before_anything_moved(floor_env, monkey
     v0 = turn.component_data[FULL].value
     _scripted_same(monkeypatch, dsv_, [(1, 2)])                          # a peer planned otherwise
     sched.running_batch.reqs = [_req("pdflip-2-70", 150_000)]
-    with pytest.raises(dsv_.PdFlipKvCompactDivergence, match="plans .* differ"):
-        dsv_.runtime_tick(sched)
+    st = dsv_.runtime_tick(sched)
+    assert not st.changed and ms.stage == 9
     assert turn.component_data[FULL].value is v0
 
 

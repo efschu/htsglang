@@ -241,7 +241,12 @@ EXPECTED_HELPER_REFS = {
     # outcome -- unequal = PdFlipKvCompactDivergence (crash-stop) before or instead of anything diverging;
     # the refused/skip memo is set only from group results. _group_same is the (MIN, MAX) helper it calls.
     ("pdflip/d_seat_vram.py", "_group_same"): {"_pdflip_group_min_ints"},
-    ("pdflip/d_seat_vram.py", "_kv_compact_for_shrink"): {"_pdflip_group_min_ints"},
+    # S98 (20.10.): the candidate-flag MIN became the VOTE, still ONE MIN per entry, now behind its own seam
+    # _kv_compact_group_vote (called only from _kv_compact_for_shrink, same place, same entry condition). The
+    # vector length is (1 + floor_page + 2 x (top_page - floor_page)) from the replicated want/stage, so every
+    # rank enters with the same length; a rank whose survey failed still enters (ok = 0). After a YES vote
+    # every rank enters the digest _group_same, with a plan or the sentinel -1 (no rank skips it).
+    ("pdflip/d_seat_vram.py", "_kv_compact_group_vote"): {"_pdflip_group_min_ints"},
     ("pdflip/d_seat_vram.py", "_room_ok"): {"_pdflip_group_min_ints"},
 }
 

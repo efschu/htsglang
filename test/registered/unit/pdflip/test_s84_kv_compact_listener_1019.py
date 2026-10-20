@@ -259,20 +259,20 @@ def test_the_rank_local_answer_enters_the_group_min(floor_env, monkeypatch, role
         alloc.register_free_listener(mark_listener(lambda idx: None, LISTENER_ROLE_SLOT_MIRROR),
                                      mark_listener(lambda: None, LISTENER_ROLE_SLOT_MIRROR))
     votes = []
+    real = dsv_._kv_compact_group_vote
 
-    def gmin(vals):
-        votes.append(list(vals))
-        return list(vals)
-    sched._pdflip_group_min_ints = gmin
+    def vote(sched_, vec):        # S98: the compaction's one group MIN (ok first)
+        votes.append(list(vec))
+        return real(sched_, vec)
+    monkeypatch.setattr(dsv_, "_kv_compact_group_vote", vote)
     ms, st, turn, v_old = _end_event(dsv_, sched, alloc, tree)
-    flags = [v for v in votes if len(v) >= 2 and len(v) % 2 == 0 and set(v) <= {0, 1}]
-    assert flags, "the compaction never entered the group MIN"
+    assert votes, "the compaction never entered the group MIN"
     if role == "mirror":
-        assert not st.changed and ms.stage == 9 and not any(flags[-1])
+        assert not st.changed and ms.stage == 9 and votes[-1][0] == 0
         assert torch.equal(turn.component_data[FULL].value, v_old)
     else:
         assert st.changed and ms.stage == 8, st.reason
-        assert any(any(f) for f in flags)
+        assert votes[-1][0] == 1
 
 
 # ---- review A1 (nf-review-s84-1019): the two cap edges the first test set left open ----------
