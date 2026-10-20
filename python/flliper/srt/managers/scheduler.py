@@ -1927,6 +1927,63 @@ def _pdflip_release_reset_redundant(sched, zero_kv) -> bool:
     return True
 
 
+def _s88_deferred_reachability(scheduler, scanned_ids) -> None:
+    """S88 DEFERRED-UNREACHABLE: the riegel behind the S88 scan fix.
+
+    A #1400-held rid (``_pdflip_store_held``) whose #1068 mark stands gets
+    its told only after `_retry_deferred_prefetches` re-issues the read
+    (pp0_publish skips a marked rid), and the deferral's own exits
+    (LANDED / RELEASED / #1317k STALLED / DROPPED) are reached only from
+    that retry. So a marked held request that is in NEITHER this scan NOR
+    the dormant hold / post-wake settle (TK path 4: released into the queue
+    later) has no way out -- the 20.10. 07:16-07:18 class. Named ERROR
+    once per rid when it is unreachable in two CONSECUTIVE scans (one scan
+    alone can be the abort window before the next pp0_publish drops the
+    held entry), counted; no self-heal, no timer, no decision changed.
+    """
+    held = scheduler.__dict__.get("_pdflip_store_held")
+    prev = scheduler.__dict__.get("_s88_unreach_prev") or set()
+    if not held:
+        scheduler._s88_unreach_prev = set()
+        return
+    try:
+        parked = pdflip_store_told._parked(scheduler)
+    except Exception:  # noqa: BLE001 -- unknown: count nothing parked
+        parked = set()
+    now = set()
+    for rid, req in list(held.items()):
+        if getattr(req, "prefetch_deferred", None) is None:
+            continue
+        if id(req) in scanned_ids or rid in parked:
+            continue
+        if getattr(req, "finished_reason", None) is not None:
+            continue
+        now.add(rid)
+    scheduler._s88_unreach_prev = now
+    said = scheduler.__dict__.setdefault("_s88_unreach_said", set())
+    for rid in sorted(now & prev):
+        if rid in said:
+            continue
+        said.add(rid)
+        scheduler._s88_deferred_unreachable = (
+            int(scheduler.__dict__.get("_s88_deferred_unreachable", 0) or 0) + 1
+        )
+        req = held.get(rid)
+        logger.error(
+            "S88 DEFERRED-UNREACHABLE rid=%s reason=%s in_queue=%d "
+            "vision_parked=%d n=%d: a #1400-held request with a #1068 "
+            "deferral mark is outside the retry scan for two passes -- no "
+            "re-issue, no told, no deferral exit can reach it",
+            rid,
+            getattr(req, "prefetch_deferred", None),
+            int(any(r is req for r in scheduler.waiting_queue)),
+            int(any(r is req for r in (scheduler.__dict__.get("_pdflip_vision_parked_reqs") or ()))),
+            scheduler._s88_deferred_unreachable,
+        )
+    if len(said) > 4096:
+        said.clear()
+
+
 class Scheduler(
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
@@ -10228,11 +10285,25 @@ class Scheduler(
         on enable_hicache_storage; there is no second guard here, so a mark
         that meets storage_disabled (plantable only by hand) is dropped by
         that name too instead of surviving a writer-only reason."""
+        # S88: the scan is the queue AS IT STOOD BEFORE THE VISION PARK of this
+        # pass -- waiting_queue plus the requests the vision stage holds out of
+        # it until `vision_unpark` (scheduler attribute set around
+        # `_get_new_batch_prefill_raw`, empty everywhere else). PP0 parks
+        # through `vision_rank_pass`, a follower through `follower_pass`; the
+        # union is the full queue on every rank, so the set below stays
+        # rank-identical (the property the comment further down relies on).
+        scanned = list(self.waiting_queue)
+        _seen = {id(r) for r in scanned}
+        for r in self.__dict__.get("_pdflip_vision_parked_reqs") or ():
+            if id(r) not in _seen:
+                _seen.add(id(r))
+                scanned.append(r)
         marked = [
             r
-            for r in self.waiting_queue
+            for r in scanned
             if getattr(r, "prefetch_deferred", None) is not None
         ]
+        _s88_deferred_reachability(self, _seen)
         if not marked:
             return 0
         marked.sort(
@@ -15306,6 +15377,14 @@ class Scheduler(
             from flliper.srt.pdflip.vision_verdict import follower_pass
 
             _vision_parked = follower_pass(self)
+        # S88 (NF rc19 death 20.10. 07:18:44Z, pdflip-262-3338): the requests
+        # parked above are STILL queue occupants for this pass -- the #1068
+        # retry at the head of `_get_new_batch_prefill_raw` scans them too
+        # (`_retry_deferred_prefetches`). Without this a vision request held
+        # told-pending with a deferred intake prefetch was parked out of every
+        # retry scan: no re-issue, no told (pp0_publish skips a marked rid), the
+        # told-pending wait never ended -- a deadlock without a Frist.
+        self._pdflip_vision_parked_reqs = [r for _, r in _vision_parked]
         try:
             try:
                 ret, running_batch = self._get_new_batch_prefill_raw(
@@ -15313,6 +15392,7 @@ class Scheduler(
                     running_batch=running_batch,
                 )
             finally:
+                self._pdflip_vision_parked_reqs = []
                 if _vision_parked:
                     from flliper.srt.pdflip.vision_rank_runner import vision_unpark
 
