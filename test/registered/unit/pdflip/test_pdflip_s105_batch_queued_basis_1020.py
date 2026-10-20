@@ -3,7 +3,7 @@
 
 Six NF boots on 20.10. (rc22 ..._094747/_110748, rc23 _105621, rc24 _113244, rc25 _121958) were diagnosed as "after
 the boot the front classifies the waiting requests on est_prompt (the whole prompt) -> gross -> flip to P". The front
-logs disprove it: every one of the 1124 CLASSIFY records of those boots carries ``u from d_probe`` (D's tree + the
+logs disprove it: every one of the 1272 CLASSIFY records of those boots (count 12:46Z, rc25 still running) carries ``u from d_probe`` (D's tree + the
 L2/L3 store at the decision), zero MEASURE/n_est records, and each boot-start flip trigger's u equals the tokens P then
 computed (rc25 pdflip-0-1 87361/87361, rc22 pdflip-0-2 11772/11772, rc23 pdflip-0-2 8434/8434, rc22b pdflip-0-3
 4452/4452). The P-PREFILL-UNTER-X alarms were kurz requests that arrived in P's phase and rode P's batch (P-BATCH-ALL,
