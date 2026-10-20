@@ -9362,9 +9362,23 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         min_tokens: Optional[int] = None,
         span_base: Optional[int] = None,
         extra_key: Optional[str] = None,
+        prescribed: bool = False,
     ) -> None:
         if not self.enable_storage or self.cache_controller is None:
             return
+        # `prescribed` (S90): a read bounded by a TOLD (`limit_tokens`: a
+        # follower's #1400 registration, a told refetch plan) -- PP0 already
+        # admitted that prefix. The RATE term prices CONCURRENT SPECULATIVE
+        # spans (`prefetch_tokens_occupied`, see `prefetch_rate_limited`); a
+        # prescribed read is owed, and refusing it is the double prefill that
+        # brake "was never meant to cause" -- the whole group falls to told=0
+        # (`PF TOLD-FALLBACK ... reason=mismatch`). NF rc20 1020_081757 P,
+        # pdflip-0-6: PP1/PP2 `#915 PREFETCH REFUSED reason=rate_limited ...
+        # occupied=415360 limit=373536` at the told registration -> ack 0 ->
+        # told 83072 -> 0, every rank recomputed 83072 tokens. Precedent: the
+        # #915 threshold (TS, `told_read_min_tokens`). The allocation keeps the
+        # alloc -> evict_host path; no room is still a named decline. The
+        # anchor and too_short terms are unchanged.
         # `extra_key`: the REQUEST's namespace (cache_salt / lora), upstream
         # 3639655dda. See `prefetch_namespace` -- a root anchor has none.
         # `min_tokens` (xsn437): the smallest read worth issuing. None = the
@@ -9471,7 +9485,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             reason = "anchor"
         elif prefetch_length < _min_len and not _topup:
             reason = "too_short"
-        elif self.cache_controller.prefetch_rate_limited():
+        elif not prescribed and self.cache_controller.prefetch_rate_limited():
+            # S90: a prescribed (told-bounded) read is not asked -- see `prescribed` above
             reason = "rate_limited"
         else:
             reason = None

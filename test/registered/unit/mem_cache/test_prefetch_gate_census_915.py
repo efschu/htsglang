@@ -157,7 +157,9 @@ class TestTheGateIsWiredAndOrdered(CustomTestCase):
         )
         # UNIFY S7: the NF extent top-up (_topup) and the 27B minimum compose.
         self.assertIn("elif prefetch_length < _min_len and not _topup:", src)
-        self.assertIn("elif self.cache_controller.prefetch_rate_limited():", src)
+        # S90 (NF rc20 pdflip-0-6): a prescribed (told-bounded) read is not asked the rate term -- same place
+        # in the order, one condition more
+        self.assertIn("elif not prescribed and self.cache_controller.prefetch_rate_limited():", src)
 
     def test_the_rate_limit_check_is_still_called_at_most_once(self):
         """It reads a live counter; calling it twice per gate would be a second

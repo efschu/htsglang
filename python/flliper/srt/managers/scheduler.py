@@ -8473,6 +8473,9 @@ class Scheduler(
             _tail_min = _pi_min if _tail_min is None else min(int(_tail_min), int(_pi_min))
         _tail_kw = {"min_tokens": _tail_min} if _tail_min is not None else {}
         _tail_kw.update(_prefetch_namespace_kw(self.tree_cache, req))
+        # S90: a told-bounded read is prescribed -- the speculative-span budget
+        # (#915 rate_limited) does not refuse it (follower at told, told plans).
+        _tail_kw.update(pdflip_store_told.told_read_prescribed_kw(self.tree_cache, limit_tokens))
         if group_decides:
             self.tree_cache.prefetch_from_storage(
                 req.rid,

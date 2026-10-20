@@ -838,6 +838,26 @@ def told_read_min_tokens(limit_tokens: Optional[int], tail_min: Optional[int]) -
     return tail_min
 
 
+def told_read_prescribed_kw(tree, limit_tokens: Optional[int]) -> dict:
+    """S90: ``{"prescribed": True}`` for a store read bounded by a told (``limit_tokens`` set) on a tree whose
+    ``prefetch_from_storage`` takes it -- the speculative-span budget (``reason=rate_limited``) does not refuse a
+    read PP0 already admitted (``UnifiedRadixCache.prefetch_from_storage``'s rate term). Unbounded reads: ``{}``."""
+    if limit_tokens is None:
+        return {}
+    fn = getattr(tree, "prefetch_from_storage", None)
+    if fn is None:
+        return {}
+    import inspect
+
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return {}
+    if "prescribed" in params or any(p.kind == p.VAR_KEYWORD for p in params.values()):
+        return {"prescribed": True}
+    return {}
+
+
 def prefix_cap_tokens(tree, told: int) -> int:
     """TK (#1419 with told > 0): the RAW-token cap that lets the radix match
     reach exactly ``told`` KEYS. ``_pdflip_cap_key_limit`` feeds it to
