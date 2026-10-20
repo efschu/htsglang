@@ -3481,6 +3481,16 @@ class Envs:
     # stopped with W3. The revoke and host-release drains keep the MIN. False
     # restores the MIN for the backup acks too.
     FLLIPER_PDFLIP_ENABLE_LOCAL_BACKUP_ACK_DRAIN = EnvBool(True)
+    # S83 (rc18 boot ..._1019_200330, D 20:21:22: TP1/TP2 queue=4160 arena references in
+    # host_mem_release_queue, TP0 queue=0; 1249 KV-arena slots pinned by those queued references
+    # alone; 20:22:12 #1470 ARENA-FULL-STOP, 20:22:13 FLUSH-UNBACKED nodes=16 tokens=8512): the
+    # host-release drain counts the group MIN, and on Form A TP0 releases its arena references at
+    # once while the workers queue theirs -- the MIN is 0, the workers' references wait for the
+    # reset. True: after every group drain (and before each #1470 flush round) each rank gives back
+    # the ARENA references still queued on it (an arena row names a reader reference, not an
+    # allocation: no mirrored allocator to keep in step); the non-arena rows stay queued in place
+    # for the MIN. False restores the MIN-only release.
+    FLLIPER_PDFLIP_RELEASE_QUEUE_LOCAL_REFS = EnvBool(True)
     # fnFL2 H74 (x172): on a TP group the publish split window (#1407) is the
     # chunk (4096, page-aligned) on every rank instead of a quarter of the
     # rank's OWN host pool -- x172 split a 6080-token node into 4096 + 1984 on

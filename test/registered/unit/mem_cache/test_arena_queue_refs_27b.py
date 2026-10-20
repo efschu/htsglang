@@ -344,12 +344,25 @@ def _scenario_other_rank_reading(case):
 def _scenario_pending_write(case):
     """A's writer has claimed the page (pending, DMA in flight) and the same
     row reaches the queue. Returns the slot state (1 = CLAIMED expected)."""
+    return _scenario_pending_write_refs(case)[0]
+
+
+def _scenario_pending_write_refs(case):
+    """The same, read by REFERENCE (S83 review H-A): the slot state alone cannot see
+    the pending-write exception -- a reference handed back leaves the slot CLAIMED.
+    Returns (state, the slot's references before the queue release, after it)."""
     case.on()
     a = _Rank(case.path, case.SLOTS)
     rows = a.pool.alloc_write(["w0"])      # claimed, not completed
+    slot = int(rows[0]) - S
+    # the writer's node reference on its claimed slot (#1427: CLAIMED slots take refs), held by THIS
+    # process (ledgered) -- without one a release would be refused by the ledger anyway and the
+    # exception stayed invisible
+    assert a.arena.ref_slots_np(np.asarray([slot], dtype=np.int64), +1) == 1
+    _st, ref0 = _hdr(a.arena)
     a.release_via_queue(rows)
-    st, _ref = _hdr(a.arena)
-    return int(st[int(rows[0]) - S])
+    st, ref = _hdr(a.arena)
+    return int(st[slot]), int(ref0[slot]), int(ref[slot])
 
 
 def _scenario_two_prefetches_one_drain(case):
@@ -450,6 +463,11 @@ class TheDangerScenariosHold(_ArenaCase):
 
     def test_a_pending_write_is_not_released(self):
         self.assertEqual(_scenario_pending_write(self), 1)
+        # S83 review H-A: the exception itself -- the writer's reference stays on the slot
+        state, ref0, ref = _scenario_pending_write_refs(self)
+        self.assertEqual(state, 1)
+        self.assertGreaterEqual(ref0, 1, "the claim took the writer's reference (#1427)")
+        self.assertEqual(ref, ref0, "a pending write's reference was handed back by the release queue")
 
 
 class TheMutantsAreCaught(_ArenaCase):
