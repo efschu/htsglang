@@ -3830,6 +3830,10 @@ class HiCacheFile(HiCacheStorage):
                 continue                    # this cycle has visited all of it already
             tot["arenas"] += 1
             nslots = int(arena.slots)
+            # S109b: the record is SHARED (``<arena>.l3sec``): every rank reads which pages have their L3 copy as
+            # memory (l3_secured.secured) -- the spills give a page up only then, never by a write of their own
+            from flliper.srt.mem_cache import l3_secured as _l3s
+
             sec = getattr(arena, "_l3wb_sec", None)
             if sec is None:
                 sec = arena._l3wb_sec = (np.full(nslots, -1, dtype=np.int64),
@@ -3846,8 +3850,17 @@ class HiCacheFile(HiCacheStorage):
             # budget, and the cycle ends. What turns new behind the cursor
             # meanwhile is the next cycle's (one tick later).
             cur = int(getattr(arena, "_l3wb_cursor", 0) or 0)
+            # S109b: the slots a spill asked for (l3_secured.request) are visited first, cursor or not
+            _urg = _l3s.take_urgent(arena)
+            _urg_new = np.zeros(0, dtype=new.dtype)
+            if _urg.shape[0] and new.shape[0]:
+                _um = np.isin(slots[new], _urg)
+                _urg_new, new = new[_um], new[~_um]
+                tot["urgent"] = int(tot.get("urgent", 0)) + int(_urg_new.shape[0])
             if cur and new.shape[0]:
                 new = new[int(np.searchsorted(slots[new], cur)):]
+            if _urg_new.shape[0]:
+                new = np.concatenate([_urg_new, new])
             if not new.shape[0]:
                 arena._l3wb_done = True
                 continue
@@ -3864,7 +3877,10 @@ class HiCacheFile(HiCacheStorage):
                     # the budget is used up at a slice edge: stop, remember
                     tot["sliced"] = True
                     tot["deferred"] += n_new - pos
-                    arena._l3wb_cursor = int(slots[new[pos]])
+                    # S109b: urgent slots lead the list out of slot order -- the cursor names the first ORDINARY
+                    # page not reached, so the continuation keeps its ascending walk
+                    _cpos = max(pos, int(_urg_new.shape[0]))
+                    arena._l3wb_cursor = int(slots[new[_cpos if _cpos < n_new else pos]])
                     stop_all = True
                     break
                 why = quiet()
@@ -3886,6 +3902,7 @@ class HiCacheFile(HiCacheStorage):
                 have = np.fromiter((bool(s) and s in on for s in stems), dtype=bool, count=len(stems))
                 sec_gen[slots[part[have]]] = gens[part[have]]
                 sec_lo[slots[part[have]]] = klo[part[have]]
+                _l3s.publish(arena, slots[part[have]], gens[part[have]])   # S109b: every rank reads it
                 tot["on_disk"] += int(have.sum())
                 todo = part[~have & np.fromiter((bool(s) for s in stems), dtype=bool,
                                                 count=len(stems))]
@@ -3967,12 +3984,14 @@ class HiCacheFile(HiCacheStorage):
                                     self._evictor.adopt_foreign(stem)
                                     sec_gen[slots[i]] = gens[i]
                                     sec_lo[slots[i]] = klo[i]
+                                    _l3s.publish(arena, [slots[i]], [gens[i]])
                                     tot["on_disk"] += 1
                                     tot["foreign_done"] = int(tot.get("foreign_done", 0)) + 1
                                 elif st in (0, 2):
                                     self._evictor.commit(stem)
                                     sec_gen[slots[i]] = gens[i]
                                     sec_lo[slots[i]] = klo[i]
+                                    _l3s.publish(arena, [slots[i]], [gens[i]])
                                     tot["written"] += 1
                                     tot["bytes"] += total
                                     arena._l3wb_cycle_pages = int(getattr(arena, "_l3wb_cycle_pages", 0)) + 1

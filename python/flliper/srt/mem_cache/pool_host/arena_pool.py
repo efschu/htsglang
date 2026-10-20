@@ -2542,6 +2542,82 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
             return out
         # key 0/0: arena_secure_to_disk names the page by the slot header's
         # stem (arena.slot_stem), the same name the clock evict writes under
+        # S109b (user 20.10.: "UND WEHE DAS SCHREIBEN IN DEN CACHE BLOCKIERT DURCH IRGENDEINE SYNCHRON ODER
+        # WARTESCHEISSE"): NO stat and NO write in the caller's (scheduler) thread any more. The write-behind thread is
+        # the one L2 -> L3 writer; its shared record (mem_cache/l3_secured.py) says which COMPLETE pages have their copy.
+        # Those count ``on_disk``; the rest is ``pending_l3`` -- queued for the write-behind's next pass, and folded into
+        # ``incomplete`` AND ``lost`` (every caller keeps such a node, as for a page not COMPLETE: no loss, asked again)
+        from flliper.srt.mem_cache import l3_secured as _l3s
+
+        import numpy as _np_s109
+        _sl = _np_s109.asarray(slot_list, dtype=_np_s109.int64)
+        _ok = _l3s.secured(arena, _sl)
+        _pending = _sl[~_ok]
+        if _pending.shape[0]:
+            _l3s.request(arena, _pending)
+        out["on_disk"] = int(_ok.sum())
+        out["written"] = 0
+        out["pending_l3"] = int(_pending.shape[0])
+        out["incomplete"] += out["pending_l3"]
+        out["lost"] = out["incomplete"]
+        return out
+
+    def secure_rows_to_l3_now(self, host_indices) -> dict:
+        """S109b: the WRITER's form of ``secure_rows_to_l3`` -- the pre-S109b synchronous body (stat, QS pair gate,
+        ``arena_secure_to_disk``), plus the write-behind's shared record (``mem_cache/l3_secured``) marked for every slot
+        it proved. Never from the scheduler thread (user 20.10.: no synchronous write into the cache); the unit tests of
+        the spill logic use it as "the write-behind has run" (conftest seam).
+
+        W3-ARENA (kvs2 0929, P PP0 12:30:55): give every COMPLETE arena page
+        these host rows address an L3 copy -- the #257 (d) write
+        (``arena_secure_to_disk``) -- WITHOUT freeing the slot. The tree's
+        spill (``UnifiedRadixCache._w3_arena_spill``) calls it before it hands
+        its reference back: the clock (``_evict_for_claim``) takes only
+        UNREFERENCED slots, and every COMPLETE slot of a live tree carries the
+        tree's reference, so a page the tree still held could never reach L3
+        and the arena stayed full (74751x ARENA-DROP freed=0, written=0).
+
+        Rows of a pending (un-acked) write are not COMPLETE and are skipped
+        (``arena_ref_slots``' own rule). Returns ``{pages, on_disk, written,
+        lost}``; the caller releases the rows only when ``lost`` is 0."""
+        out = {"pages": 0, "on_disk": 0, "written": 0, "lost": 0, "unpaired": 0, "sidecar_absent": 0}
+        arena = getattr(self, "arena", None)
+        if arena is None or host_indices is None:
+            return out
+        slots = arena_ref_slots(self, host_indices)
+        if not int(slots.numel()):
+            return out
+        out["pages"] = int(slots.numel())
+        secure = getattr(getattr(self, "_backend", None), "arena_secure_to_disk", None)
+        if not callable(secure):
+            out["lost"] = out["pages"]
+            return out
+        total = int(getattr(self, "_page_bytes", 0) or getattr(arena, "slot_bytes", 0) or 0)
+        # L3-COMPLETE (review K15b B1/A1, 16.10.): arena_ref_slots excludes only THIS rank's pending
+        # set; complete_write takes a slot out of it on status 0 too (merged, not full) -- under the
+        # token cut TP0's ack comes ~45 s before the workers'. Such a slot is CLAIMED in the shared
+        # header: its bytes are half a page. It is neither written to L3 nor counted as secured
+        # (``incomplete`` adds to ``lost``: every caller keeps the node -- the K10 device round, the
+        # W3 host-leaf round). An on-disk file of the same stem does not make it secured either.
+        # No switch (review A1/A4 16.10.: a switch back onto a proven wrong-KV path is no feature);
+        # an arena without the header read is fail-closed (nothing provably complete).
+        slot_list = [int(s) for s in slots.tolist()]
+        out["incomplete"] = 0
+        states_fn = getattr(arena, "slot_states", None)
+        try:
+            states = states_fn(slot_list) if callable(states_fn) else [-1] * len(slot_list)
+        except Exception:  # noqa: BLE001 - unreadable header = not provably complete
+            states = [-1] * len(slot_list)
+        keep = [s for s, st in zip(slot_list, states) if int(st) == 2]
+        out["incomplete"] = len(slot_list) - len(keep)
+        if out["incomplete"]:
+            _l3_complete_note(out["incomplete"], len(slot_list))
+        slot_list = keep
+        if not slot_list:
+            out["lost"] = out["incomplete"]
+            return out
+        # key 0/0: arena_secure_to_disk names the page by the slot header's
+        # stem (arena.slot_stem), the same name the clock evict writes under
         sec = secure(arena, [(s, 0, 0, total) for s in slot_list])
         # H16P-NACHBESSERUNG A2: `unpaired` (a KV page held back for want of its QSA index: NOT on disk) and
         # `sidecar_absent` are passed on -- the caller must not read them as a complete copy
@@ -2552,6 +2628,10 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         out["incomplete"] += int(sec.get("incomplete", 0))
         ArenaMHAHostPool._257_written_to_l3 = (
             getattr(ArenaMHAHostPool, "_257_written_to_l3", 0) + out["written"])
+        if not out["lost"] and not int(out.get("unpaired", 0)) and out["on_disk"] + out["written"] == len(slot_list):
+            from flliper.srt.mem_cache import l3_secured as _l3s
+
+            _l3s.mark(arena, slot_list)
         return out
 
     def _evict_for_claim(self, arena, need: int, claim_stem: Optional[str] = None) -> int:

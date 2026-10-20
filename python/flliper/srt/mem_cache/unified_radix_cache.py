@@ -5885,9 +5885,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if (mrows is None and getattr(self, "_pdflip_flush_spill", False)
                     and not getattr(node, "_pdflip_flush_spilled", False)):
                 # once per node and rank (the H19 FULL rule): a slot frees only
-                # after the LAST rank released it -- later rounds re-claim only
-                node._pdflip_flush_spilled = True
+                # after the LAST rank released it -- later rounds re-claim only.
+                # S109b: the room-making reads the write-behind's record (no write); a round whose victim is still
+                # being copied is no spent try (``PENDING``), the flush loop asks again
                 if self._pdflip_flush_spill_room(node, mp):
+                    node._pdflip_flush_spilled = True
                     mrows = mp.alloc_write([last_hash])
             return mrows
         st = self._pdflip_anchor_ledger.of(rid)
@@ -6417,14 +6419,19 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if tries >= self.PDFLIP_PARK_SPILL_TRIES:
             return False
         node._pdflip_park_spill_tries = tries + 1
-        backend = getattr(mp, "_backend", None)
         arena = getattr(mp, "arena", None)
-        secure = getattr(backend, "arena_secure_to_disk", None)
-        if arena is None or not callable(secure):
+        if arena is None:
             return False
         cands = _mad.tree_anchors(root=self.root_node, anchor_of=lambda n: self._pdflip_anchor_of(n, mp),
                                   include_untagged=True)
         cands = self._r12_anchor_deletable([a for a in cands if a.node is not node])
+        # S109b: only victims whose anchor the write-behind already copied to L3 (shared record); the others are
+        # queued for it -- no stat, no write in the scheduler thread (user 20.10.)
+        from flliper.srt.mem_cache import l3_secured as _l3s
+
+        _backend = getattr(mp, "_backend", None)
+        _ok_c = [a for a in cands if a.slots and bool(_l3s.secured(arena, a.slots).all())]
+        cands = _ok_c or cands
         # K15c review A1 (16.10., boot 1016_103428 10:42:16 TP0 DISPLACE why=park_first node=59
         # dropped=0): the park spill takes the same victims -- on the Form A host only ref-free ones
         _rf = UnifiedRadixCache._k15c_ref_free_filter(arena) if _r12.role() == "host" else None
@@ -6445,13 +6452,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                            "anchor to give; the node stays un-backed, named)",
                            getattr(node, "id", "?"), depth, bool(node.pdflip_park_end))
             return False
-        slot_bytes = int(getattr(arena, "slot_bytes", 0) or 0)
-        sec = secure(arena, [(int(s), 0, 0, slot_bytes) for s in victim.slots], writer="park_first_spill")
-        if int(sec.get("lost", 0) or 0) > 0:
-            logger.warning("PDFLIP PARK-END-ANCHOR-FIRST SPILL node=%s victim_node=%s depth=%d NOT released: its "
-                           "L3 copy could not be secured (%s)", getattr(node, "id", "?"), victim.node.id,
-                           victim.depth, sec)
+        _vok = _l3s.check(arena, victim.slots, _backend, writer="park_first_spill")
+        if not bool(_vok.all()):
+            node._pdflip_park_spill_tries = tries   # S109b: a pending round is no spent try
+            logger.info("PDFLIP PARK-END-ANCHOR-FIRST SPILL node=%s victim_node=%s depth=%d PENDING: its L3 copy is "
+                        "queued for the write-behind (S109b); not released now", getattr(node, "id", "?"),
+                        victim.node.id, victim.depth)
             return False
+        sec = {"on_disk": len(victim.slots), "written": 0, "lost": 0}
         st = self._pdflip_anchor_ledger.of(victim.rid)
         dropped = int(self._pdflip_release_anchor(victim, mp, st, why="park_first", for_rid="park") or 0)
         n = getattr(UnifiedRadixCache, "_pdflip_park_spill_n", 0) + 1
@@ -6487,13 +6495,21 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         read after the wake takes it from disk. A victim whose copy could not
         be secured is NOT released (no anchor is traded for another). Returns
         True when a slot was freed."""
-        backend = getattr(mp, "_backend", None)
         arena = getattr(mp, "arena", None)
-        secure = getattr(backend, "arena_secure_to_disk", None)
-        if arena is None or not callable(secure):
+        if arena is None:
             return False
         tree = _mad.tree_anchors(root=self.root_node, anchor_of=lambda n: self._pdflip_anchor_of(n, mp))
         tree = [a for a in tree if a.node is not node]
+        # S109b (user 20.10.: no synchronous write into the cache in the scheduler thread): a victim must ALREADY have
+        # its L3 copy by the write-behind's shared record (mem_cache/l3_secured) -- the rest is queued for the
+        # write-behind and stays; no stat, no write here
+        from flliper.srt.mem_cache import l3_secured as _l3s
+
+        _backend = getattr(mp, "_backend", None)
+        # victims the write-behind already copied first; none of them: the usual choice, its copy checked below
+        _sec_ok = [a for a in tree if a.slots and bool(_l3s.secured(arena, a.slots).all())]
+        _n_pending = len(tree) - len(_sec_ok)
+        tree = _sec_ok or tree
         tree = _mad.lane_filter(tree, self._pdflip_claim_lane(node))   # LANE-ANCHOR-RANK
         # K15c: only on the Form A host (D TP0) is "one reference" this group's whole share --
         # the workers hold no mamba slot; P's stages each hold one, so there the old rule stands
@@ -6508,20 +6524,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if (victim is None or not victim.slots) and _shared:
             UnifiedRadixCache._k15c_note_no_free(node, _shared)
         if victim is None or not victim.slots:
-            logger.warning("PDFLIP MAMBA-ARENA FLUSH-SPILL node=%s depth=%s victim=none (no releasable "
+            logger.warning("PDFLIP MAMBA-ARENA FLUSH-SPILL node=%s depth=%s victim=none pending=" + str(_n_pending) + " (no releasable "
                            "intermediate anchor in the tree -- the node stays un-backed, named)",
                            getattr(node, "id", "?"), _mad.ancestor_path(target=node, root=self.root_node)[1])
             return False
-        slot_bytes = int(getattr(arena, "slot_bytes", 0) or 0)
-        try:
-            sec = secure(arena, [(int(s), 0, 0, slot_bytes) for s in victim.slots], writer="flush_spill")
-        except Exception as exc:  # noqa: BLE001 -- not secured = not released
-            logger.warning("PDFLIP MAMBA-ARENA FLUSH-SPILL secure raised %s: %s", type(exc).__name__, exc)
+        # S109b: the victim came out of the secured set above (or the last resort, checked here) -- never a write
+        _vok = _l3s.check(arena, victim.slots, _backend, writer="flush_spill")
+        if not bool(_vok.all()):
+            logger.info("PDFLIP MAMBA-ARENA FLUSH-SPILL victim=%s depth=%d PENDING: its L3 copy is queued for the "
+                        "write-behind (S109b, no synchronous write); the node stays un-backed, asked again",
+                        victim.node.id, victim.depth)
             return False
-        if int(sec.get("lost", 0) or 0) > 0:
-            logger.warning("PDFLIP MAMBA-ARENA FLUSH-SPILL victim=%s depth=%d NOT released: its L3 copy "
-                           "could not be secured (%s)", victim.node.id, victim.depth, sec)
-            return False
+        sec = {"on_disk": len(victim.slots), "written": 0, "lost": 0, "pending_victims": _n_pending}
         st = self._pdflip_anchor_ledger.of(victim.rid)
         dropped = int(self._pdflip_release_anchor(victim, mp, st, why="flush_spill", for_rid="flush") or 0)
         UnifiedRadixCache._pdflip_flush_spill_n += 1
@@ -7152,6 +7166,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         kept_payable = 0
         told_head = UnifiedRadixCache._told_head_ids(self)
         kept_told = 0
+        aux_cands = []
         # S83 instrument: every reason the device round passes a host-holding node over, as
         # reason -> [nodes, pages] (VICTIM-CENSUS spill_why); counting only, no decision changes
         _why = {}
@@ -7199,11 +7214,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if any(int(getattr(c, "host_lock_ref", 0) or 0) > 0 for c in node.component_data):
                 _pass("host_locked", hv)
                 continue   # a load-back reads these rows
-            if any(
-                node.component_data[c.component_type].host_value is not None
-                and node.component_data[c.component_type].value is None
-                for c in _aux_components(self)
-            ):
+            _aux_kinds = [c.component_type for c in _aux_components(self)
+                          if node.component_data[c.component_type].host_value is not None
+                          and node.component_data[c.component_type].value is None]
+            _aux_mamba_only = bool(_aux_kinds) and all(k == ComponentType.MAMBA for k in _aux_kinds)
+            if _aux_kinds and not _aux_mamba_only:
                 _pass("aux_host_only", hv)
                 continue   # y5h/park_l3: an aux state lives on the host only -- the node keeps its host life
             if int(hv.min()) < int(getattr(pool, "staging_rows", 0)):
@@ -7219,6 +7234,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     kept_wev += 1       # a worker has it off the device: TP0's host drop is not applicable there
                     _pass("worker_evicted", hv)
                     continue
+            if _aux_mamba_only:
+                # S109c: a device node whose only host-only aux state is its MAMBA anchor -- the AUX stage, after every
+                # plain node (below); counted apart so the census still names it
+                aux_cands.append(node)
+                continue
             cands.append(node)
         self._s83_spill_why = _why
         keys = self._w3_spill_keys(pool, cands)
@@ -7278,6 +7298,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 _r12.record_spill(self, node)   # every worker gives its reference back too
             released += int(host_freed or 0) // P
             spilled += 1
+        if released < want and aux_cands:
+            _ar = UnifiedRadixCache._s109c_aux_device_round(self, pool, aux_cands, want - released, _role, P)
+            released += _ar["released"]
+            spilled += _ar["spilled"]
+            secured += _ar["on_disk"]
+            released_slots.extend(_ar["slots"])
+            if _ar["pending"]:
+                _pass("aux_anchor_pending", torch.zeros(_ar["pending"] * P, dtype=torch.int64))
         if released < int(need_pages):
             # W3-HOST-LEAF (NF int22 1008_171755: candidates=0 on all P stages;
             # port of the 27B Q-697c spill, pdflip/host_only_spill.py): when the
@@ -7350,6 +7378,63 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if released_out is not None:
             released_out.extend(released_slots)
         return released
+
+    def _s109c_aux_device_round(self, pool, aux_cands, want: int, role, P: int) -> dict:
+        """S109c (NF 20.10.): the W3 device round's AUX stage. METAL: at the rc22 wall (D TP0 09:54:29Z,
+        ``PDFLIP D-WALL-HEAD rid=pdflip-2-21``) the KV arena (6485 slots, pinned 6485) was held by DEVICE nodes whose
+        only host-only aux state was their mamba anchor: ``S83 VICTIM-CENSUS ... tree_device=4908 ...
+        spill_why=aux_host_only:4/4908,host_only:12/1913`` -- the device round passed them over by the single rule
+        "an aux state lives on the host only" (D TP0 census lines with ``aux_host_only`` in the device round today:
+        rc20 40, rc21 9, rc22 10, rc24 5, rc25 3, rc26 7).
+
+        THE RULE: after every plain node, such a node gives its host copies up -- its KV pages AND its anchor -- only
+        when the write-behind's shared record says every one of them has its L3 copy (``secure_rows_to_l3`` and the
+        S39 anchor helper: no stat, no write, S109b); otherwise both are queued and the node keeps its host life
+        (``pending``). The node stays on the device (``l3_present``); its anchor comes back from the store. Form A:
+        TP0 decides alone and sends the node's STATE (exists, no KV host copy, no anchor host copy) -- every worker's
+        reconcile drops both (``form_a_host_shadow._reconcile``, aux first). A worker never gets here."""
+        from flliper.srt.pdflip import forma_l3_subtree as _fls
+        from flliper.srt.pdflip.read_room import l3_complete as _rr_l3_complete
+
+        out = {"released": 0, "spilled": 0, "on_disk": 0, "pending": 0, "slots": []}
+        if role == "worker" or not aux_cands:
+            return out
+        base = self.components.get(BASE_COMPONENT_TYPE)
+        mcomp = self.components.get(ComponentType.MAMBA)
+        if base is None or mcomp is None:
+            return out
+        keys = self._w3_spill_keys(pool, aux_cands)
+        aux_cands = sorted((c for c in aux_cands if not keys.incomplete(c)), key=lambda x: keys[id(x)])
+        for node in aux_cands:
+            if out["released"] >= want:
+                break
+            hv = node.component_data[BASE_COMPONENT_TYPE].host_value
+            if hv is None or node.component_data[ComponentType.MAMBA].host_value is None:
+                continue
+            sec = pool.secure_rows_to_l3(hv)
+            if int(sec.get("lost", 0)) or int(sec.get("unpaired", 0)) or not _rr_l3_complete(node, sec):
+                out["pending"] += 1
+                continue
+            if _fls._secure_child_anchors(self, [node], [_fls.ANCHOR_SECURE_PER_FLUSH]) is not None:
+                out["pending"] += 1
+                continue
+            out["slots"].extend(keys.slots_of(node))
+            # the tree law (y5h, ``_evict_aux_host_before_full_host``): the anchor's host state leaves first, its arena
+            # slot stays COMPLETE (S25 marks it secured), then the Full host rows
+            _dev, host_freed = self._evict_component_and_detach_lru(node, base, target=EvictLayer.HOST, tracker=None)
+            self.evictable_host_leaves.discard(node)
+            node.l3_present = True
+            if role == "host":
+                _r12.record_state(self, node, why="s109c_aux_device_spill")
+            out["released"] += int(host_freed or 0) // P
+            out["on_disk"] += int(sec.get("on_disk", 0))
+            out["spilled"] += 1
+        if out["spilled"] or out["pending"]:
+            logger.info("S109c W3-AUX-DEVICE SPILL want=%d released_pages=%d nodes=%d pending=%d (device nodes whose "
+                        "only host-only aux state is the mamba anchor: KV and anchor leave L2 only with their L3 copy "
+                        "by the write-behind's record; pending = queued for it, kept)", int(want), out["released"],
+                        out["spilled"], out["pending"])
+        return out
 
     def _w3_keep_payable_state(self):
         """W3-KEEP-PAYABLE (ARENAFULL-1015): the payable walk's per-node state
