@@ -415,3 +415,51 @@ def test_r1u_two_running_prefills_on_the_real_path(monkeypatch, tmp_path):
         eff = F.Front._r1u_running(f, running, [])
     assert running == 2911 + 1500 and eff == 2911, (running, eff)
     assert f.counters["r1u_overlap_tokens"] == 1500
+
+
+# ---------------------------------------------------------------------------------------------------- rc26 P-PREFILL-GESCHWISTER
+def _front_gesch(now, tmp_path, *, rid, x, u, rest_start, ext_len, big_rid, big_u, big_waited, started_ago):
+    f = _fake_front(running=["dec"], n=6, kv={"available": 400000, "evictable": 0})
+    f.tp_prefill_max_tokens = x
+    f.t_awake = now - 60.0
+    f._sync_batch_gate = lambda: None
+    f._d_pf_book().grant(rid=rid, tokens=u, now=now - started_ago - 0.3)
+    f._d_pf_book().enter_leg2(rid=rid)
+    f.groups["D"].outstanding[rid] = now - started_ago - 0.3
+    f._rvp_state()
+    f.__dict__.setdefault("_d_prefill_legs", {})[rid] = now - started_ago - 0.3
+    f._leg2_lookahead.add(rid)
+    F.Front._note_x_decision(f, rid, x, u)
+    F.Front._front_x_headers(f, rid, None, False)
+    _beacon_reading(f, tmp_path, rid, now - started_ago, rest_start, ext_len, done=True)
+    big = F.Pending(big_rid, "/v1/messages", {}, "t", now - big_waited, asyncio.new_event_loop().create_future(),
+                    est_prompt=big_u + 40000, est_uncached=big_u)
+    big.x_set = x
+    f.queue.append(big)
+    return f
+
+
+def test_rc26_pdflip_48_456_a_finished_single_chunk_prefill_is_no_r6_reason(monkeypatch, tmp_path):
+    """rc26 14:15:13: pdflip-48-456 (decision u=1797, X=5397): D's ONE forward ended 13.417 (`Prefill batch #new-token 1797`), the
+    verdict fell 13.527 as R6 `S=7376 > X with a D prefill of 1797 running` and P then realised 773. v3 reports rest_after = 0:
+    the big member pdflip-48-455 (5579, waited 3.6 s < T_halb) holds (R4) instead of flipping 0.9 s early on a computed rest."""
+    _on(monkeypatch)
+    now = time.time()
+    f = _front_gesch(now, tmp_path, rid="pdflip-48-456", x=5397, u=1797, rest_start=1797, ext_len=1797,
+                     big_rid="pdflip-48-455", big_u=5579, big_waited=3.6, started_ago=2.3)
+    with envs.FLLIPER_PDFLIP_DECIDER.override(True):
+        assert f._dc_carried_running() == 0
+        assert f._decode_collect(now) == "hold" and f.counters["set_reroute_p"] == 0
+
+
+def test_rc26_pdflip_46_451_a_chunked_prefill_counts_only_what_is_left(monkeypatch, tmp_path):
+    """rc26 14:13:59: pdflip-46-451 (decision u=2716, chunks 2176 + 540): chunk 1 ended 59.799, the verdict fell 59.832 counting
+    the whole 2716. v3 counts the 540 D has left (P then realised 28: D's finished chunks stay in its tree). The flip itself is
+    legitimate (the big member pdflip-46-450 waited 5.0 s > T_halb, R4/R6) -- only the figure was wrong."""
+    _on(monkeypatch)
+    now = time.time()
+    f = _front_gesch(now, tmp_path, rid="pdflip-46-451", x=5504, u=2716, rest_start=2716, ext_len=2176,
+                     big_rid="pdflip-46-450", big_u=45032, big_waited=5.0, started_ago=3.0)
+    with envs.FLLIPER_PDFLIP_DECIDER.override(True):
+        assert f._dc_carried_running() == 540
+        assert f._decode_collect(now) == "P" and f.__dict__["_r6_counted"] == {"pdflip-46-451": 540}
