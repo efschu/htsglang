@@ -100,13 +100,21 @@ class Survey:
     #: hands them back without the stage cap's hook. A plan that leaves one above its
     #: boundary would move pages for a floor that cannot drop.
     held_above: List[int] = field(default_factory=list)
+    #: S98c: pages that block on SOME rank (the group vote's MIN is CODE_BLOCK) -- per
+    #: page, never spread over a rank-local node (the node cuts differ between ranks)
+    blocked: frozenset = frozenset()
 
 
 @dataclass
 class Plan:
     boundary_page: int
+    #: per LOCAL node (the re-point groups); never part of the digest (S98c)
     moves: List[Tuple[NodePages, List[int], List[int]]] = field(default_factory=list)
     evicts: List[NodePages] = field(default_factory=list)
+    #: S98c: the page pairs (src, dst) in source-page order -- what the digest compares
+    pairs: List[Tuple[int, int]] = field(default_factory=list)
+    #: S98c: every device page the evictions free (all pages of the evicted nodes)
+    evict_pages: List[int] = field(default_factory=list)
 
     @property
     def moved_pages(self) -> int:
@@ -344,7 +352,7 @@ def agreed_survey(s: Survey, top_page: int, dest_min: Sequence[int], above_min: 
     held: List[int] = []
     owner: Dict[int, NodePages] = {}
     copies: Dict[int, NodePages] = {}
-    blocked_nodes = set()
+    blocked = set()
     unbacked_nodes = set()
     why = s.why
     for i in range(max(0, T - B)):
@@ -358,23 +366,24 @@ def agreed_survey(s: Survey, top_page: int, dest_min: Sequence[int], above_min: 
         if lo >= CODE_UNBACKED and hi >= CODE_IDLE and why is None:
             why = ("page %d (tokens from %d) is live on some ranks and free on others -- the "
                    "allocators are no replicas, no move" % (p, p * s.page_size))
+        if lo == CODE_BLOCK:
+            blocked.add(p)     # S98c: per page -- never spread over this rank's node cut
+            continue
         np_ = s.owner.get(p)
         if np_ is None:
-            continue           # blocks by "held outside the tree" (CODE_BLOCK on this rank)
+            continue           # cannot happen for lo >= CODE_UNBACKED (this rank's code >= 1)
         cp = copies.get(id(np_))
         if cp is None:
             cp = copies[id(np_)] = NodePages(node=np_.node, pages=list(np_.pages), pinned=False,
                                              backed=True, last=np_.last)
-        if lo == CODE_BLOCK:
-            blocked_nodes.add(id(np_))
-        elif lo == CODE_UNBACKED:
+        if lo == CODE_UNBACKED:
             unbacked_nodes.add(id(np_))
         owner[p] = cp
     for k, cp in copies.items():
-        cp.pinned = k in blocked_nodes
         cp.backed = k not in unbacked_nodes
+        cp.pages = [p for p in cp.pages if p in owner]
     return Survey(s.page_size, s.num_pages, B, live, free, owner, list(copies.values()),
-                  why=why, held_above=held)
+                  why=why, held_above=held, blocked=frozenset(blocked))
 
 
 def plan_for(s: Survey, boundary_page: int) -> Tuple[Optional[Plan], str]:
@@ -396,6 +405,9 @@ def plan_for(s: Survey, boundary_page: int) -> Tuple[Optional[Plan], str]:
         return Plan(boundary_page=B), ""
     movers: Dict[int, NodePages] = {}
     for p in above:
+        if p in s.blocked:
+            return None, ("page %d (tokens from %d) blocks on a rank (outside the tree / lock / "
+                          "write-through / load-back there)" % (p, p * s.page_size))
         np_ = s.owner.get(p)
         if np_ is None:
             return None, "page %d (tokens from %d) held outside the tree (a running request / a session)" % (
@@ -414,18 +426,29 @@ def plan_for(s: Survey, boundary_page: int) -> Tuple[Optional[Plan], str]:
     def _key(m):
         return (-max(m.pages), min(m.pages))
 
-    # S98: ``backed`` is NOT replicated on Form A -- it reads the host copy and the
-    # mamba anchor, which the attention host (TP0, the real GDN states) and an expert
-    # worker (byteless R12 shadow pool, KV-only anchors under eviction) hold
-    # differently. With room for every mover it decides nothing (every node moves),
-    # so it must not reorder the destinations either: a different order is a
-    # different digest, a crash-stop before anything moved. Page ids alone then.
-    need = sum(sum(1 for p in m.pages if p > B) for m in movers.values())
-    if len(free) >= need:
-        order = sorted(movers.values(), key=_key)
-    else:
-        order = (sorted((m for m in movers.values() if not m.backed), key=_key)
-                 + sorted((m for m in movers.values() if m.backed), key=_key))
+    # S98c (rang review nf-review-s98-1020.md): with room for every page the plan is
+    # PAGE-level -- the pages above the boundary ascending onto the free pages below it
+    # ascending, both agreed sets -- so it is the same on every rank however its tree
+    # cuts those pages into nodes (rc24 _113244: the same 177 slots in 32 nodes on TP0,
+    # 35 on TP1/TP2). The nodes only group the re-pointing, locally, after the fact.
+    if len(free) >= len(above):
+        plan = Plan(boundary_page=B, pairs=list(zip(above, free[:len(above)])))
+        groups: Dict[int, Tuple[NodePages, List[int], List[int]]] = {}
+        for src, dst in plan.pairs:
+            m = s.owner[src]
+            g = groups.get(id(m))
+            if g is None:
+                g = groups[id(m)] = (m, [], [])
+                plan.moves.append(g)
+            g[1].append(src)
+            g[2].append(dst)
+        return plan, ""
+    # short of room: un-backed nodes first (they must not be lost), backed ones as the
+    # fallback evictions -- node-level, so the digest compares the resulting PAGES
+    # (moves and every page an eviction frees); node cuts that make the ranks differ are
+    # refused uniformly before anything moves (``d_seat_vram._kv_compact_for_shrink``).
+    order = (sorted((m for m in movers.values() if not m.backed), key=_key)
+             + sorted((m for m in movers.values() if m.backed), key=_key))
     plan = Plan(boundary_page=B)
     rest: List[NodePages] = []
     for m in order:
@@ -453,6 +476,14 @@ def plan_for(s: Survey, boundary_page: int) -> Tuple[Optional[Plan], str]:
                 d, x = d + 1, x.parent
             depth[id(m)] = d
         plan.evicts = sorted(rest, key=lambda m: -depth[id(m)])
+        full = int(_full_ct().FULL)
+        ev = set()
+        for m in rest:
+            v = m.node.component_data[full].value
+            if v is not None and v.numel():
+                ev.update(int(x) for x in (v.reshape(-1).to("cpu") // s.page_size).unique().tolist())
+        plan.evict_pages = sorted(ev)
+    plan.pairs = sorted((p, d) for _m, src, dst in plan.moves for p, d in zip(src, dst))
     return plan, ""
 
 
@@ -496,15 +527,18 @@ def _remap_value(value, P: int, remap: Dict[int, int]):
 
 
 def plan_digest(stage: int, plan: Plan) -> int:
-    """N3: a 62-bit digest of what this rank will do -- the target stage, every move
-    (sources, destinations) and every eviction (its pages above the boundary), all
-    in plan order. Equal on every rank exactly when the plans are the same."""
+    """N3: a 62-bit digest of what this rank will do -- the target stage, every page
+    move (source, destination) and every page an eviction frees. Equal on every rank
+    exactly when the ranks will do the same to the same pages (S98c)."""
     import hashlib
 
     h = hashlib.blake2b(digest_size=8)
+    # S98c: PAGES only -- the pairs in source-page order and every page the evictions
+    # free; never the rank-local node cuts (a node split on one rank only would make an
+    # otherwise identical plan differ)
     h.update(repr((int(stage), int(plan.boundary_page),
-                   [(tuple(s), tuple(d)) for _m, s, d in plan.moves],
-                   [tuple(m.pages) for m in plan.evicts])).encode())
+                   [(int(a), int(b)) for a, b in sorted(plan.pairs)],
+                   [int(p) for p in sorted(plan.evict_pages)])).encode())
     return int.from_bytes(h.digest(), "big") >> 2
 
 

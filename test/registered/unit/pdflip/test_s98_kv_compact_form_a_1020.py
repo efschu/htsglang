@@ -420,7 +420,8 @@ def test_a_page_blocked_on_one_rank_blocks_every_rank(floor_env, monkeypatch):
     ranks = _three_ranks(monkeypatch, host_backs_x=True)
     ranks[1][2].owner[6300].pinned = True                                     # TP1: Y pinned
     res = _vote_and_plan(ranks)
-    assert all(p is None and "pinned" in w for _n, p, w, _x in res), [w for _n, _p, w, _x in res]
+    assert all(p is None and "blocks on a rank" in w for _n, p, w, _x in res), \
+        [w for _n, _p, w, _x in res]
 
 
 def test_a_destination_free_on_one_rank_only_is_no_destination(floor_env, monkeypatch):
@@ -474,10 +475,11 @@ def test_a_page_withheld_by_the_cap_is_no_destination_in_the_vote(floor_env, mon
     assert plans[1].evicts, "85 pages do not fit into 51: the backed node is the fallback"
 
 
-def test_a_rank_without_a_plan_still_enters_the_digest_collective(floor_env, monkeypatch):
+def test_a_rank_without_a_plan_still_enters_the_digest_collective(floor_env, monkeypatch, caplog):
     """The group voted yes, but this rank's tree yields no plan (a structure its peers do
-    not share): it must not skip the digest collective its peers enter -- it answers -1,
-    and the unequal digest is the named crash-stop, never a hang."""
+    not share): it must not skip the digest collective its peers enter -- it answers -1.
+    S98c: the unequal digest is a UNIFORM, named refusal (nothing moved yet), no crash."""
+    caplog.set_level(logging.INFO)
     dsv_, sched, caps, alloc, tree, target, dw = _form_metal(floor_env, monkeypatch, _tp1)
     monkeypatch.setattr(dsv_, "_kv_compact_plans_from_vote",
                         lambda sv, group, fp, tp, bounds: ([None] * len(bounds), "no plan here"))
@@ -487,9 +489,11 @@ def test_a_rank_without_a_plan_still_enters_the_digest_collective(floor_env, mon
         calls.append(int(value))
         return int(value), 12345                                       # a peer has its plan
     monkeypatch.setattr(dsv_, "_group_same", same)
-    with pytest.raises(dsv_.PdFlipKvCompactDivergence, match="plans .* differ"):
-        _end_event(dsv_, sched, alloc, tree)
+    ms, st, turn, v_old = _end_event(dsv_, sched, alloc, tree)
     assert calls == [-1]
+    assert not st.changed and ms.stage == 9
+    assert torch.equal(turn.component_data[FULL].value, v_old)
+    assert any("verdict=refused-plan-diff" in m for m in caplog.messages)
 
 
 def test_no_plan_on_every_rank_after_a_yes_vote_is_a_refusal(floor_env, monkeypatch, caplog):
@@ -501,3 +505,119 @@ def test_no_plan_on_every_rank_after_a_yes_vote_is_a_refusal(floor_env, monkeypa
     assert not st.changed and ms.stage == 9
     r = _refusals(caplog, dsv_)
     assert r and "no plan here" in r[0], r
+
+
+# ---- (6) rang review nf-review-s98-1020.md (S98c): the same pages, other node cuts ------
+#
+# rc24 781238542c (_113244, D.log 21695-21697, 11:39:51): the same 177 device slots in 32
+# nodes on TP0 and 35 on TP1/TP2 -- node splits are rank-local.
+
+def _split_ranks(monkeypatch, *, free_below):
+    """Three ranks, the SAME pages above S8 (6200..6207 backed, 6300..6301 unbacked); TP0
+    holds 6200..6207 as ONE node, TP1/TP2 split it into 6200..6203 -> 6204..6207."""
+    ranks = []
+    for name, form in (("TP0", _tp0), ("TP1", _tp1), ("TP2", _tp2)):
+        target, dw = form(monkeypatch)
+        alloc = _alloc(TOP // PG, PG)
+        alloc._kvcache = target
+        tree = Tree(alloc)
+        _take(alloc, [p for p in range(1, S8_PAGE + 1) if p not in free_below])
+        if name == "TP0":
+            _node(tree, alloc, list(range(6200, 6208)), PG, backed=True)
+        else:
+            a = _node(tree, alloc, list(range(6200, 6204)), PG, backed=True)
+            _node(tree, alloc, list(range(6204, 6208)), PG, backed=True, parent=a)
+        _node(tree, alloc, [6300, 6301], PG, backed=False)
+        sched = types.SimpleNamespace(token_to_kv_pool_allocator=alloc, page_size=PG,
+                                      draft_worker=dw, tree_cache=tree)
+        sv, why, cop = dsv._kv_compact_rank_survey(sched, S8_PAGE)
+        assert why is None, (name, why)
+        ranks.append((name, sched, sv, {}))
+    assert len({len(sv.nodes) for _n, _s, sv, _x in ranks}) == 2       # the premise: other cuts
+    return ranks
+
+
+def test_three_ranks_with_other_node_cuts_make_the_same_page_plan_and_move_alike(
+        floor_env, monkeypatch):
+    ranks = _split_ranks(monkeypatch, free_below=range(5000, 5020))      # room for all 10
+    res = _vote_and_plan(ranks)
+    plans = [p for _n, p, _w, _x in res]
+    assert all(p is not None and not p.evicts for p in plans), [w for _n, _p, w, _x in res]
+    assert len({KC.plan_digest(8, p) for p in plans}) == 1
+    want = list(zip(list(range(6200, 6208)) + [6300, 6301], range(5000, 5010)))
+    assert all(p.pairs == want for p in plans)
+    # executed locally, grouped by each rank's own nodes: the same pages land alike
+    for (name, sched, sv, _x), plan in zip(ranks, plans):
+        KC.execute(sched.tree_cache, sched.token_to_kv_pool_allocator, plan, _NullCopier())
+    vals = []
+    for name, sched, _sv, _x in ranks:
+        pages = sorted(int(x) for n in sched.tree_cache._collect_all_nodes()
+                       if n is not sched.tree_cache.root_node
+                       for x in (n.component_data[FULL].value // PG).unique().tolist())
+        vals.append(pages)
+        free = sorted(sched.token_to_kv_pool_allocator.free_pages.tolist())
+        assert free[:3] == [5010, 5011, 5012], name
+    assert vals[0] == vals[1] == vals[2] == list(range(5000, 5010))
+
+
+def test_the_rc24_split_with_a_needed_eviction_is_agreed_or_refused_uniformly(
+        floor_env, monkeypatch):
+    """Short of room the fallback evicts NODES (cut-dependent): the digest compares the
+    pages they free. TP0 frees 6200..6207 with its one node; TP1/TP2 evict the leaf
+    6204..6207 only -- the page sets differ, so the digests differ: the group refuses
+    (uniform, nothing moved) instead of a crash-stop."""
+    ranks = _split_ranks(monkeypatch, free_below=range(5000, 5006))      # 6 of 10 pages
+    res = _vote_and_plan(ranks)
+    plans = [p for _n, p, _w, _x in res]
+    # TP0 evicts its one node (all 8 pages); TP1/TP2 move the leaf and cannot evict the
+    # parent (a device child that stays) -- no plan there
+    assert plans[0] is not None and plans[0].evict_pages == list(range(6200, 6208))
+    assert plans[1] is None and plans[2] is None
+    digests = [KC.plan_digest(8, p) if p is not None else -1 for p in plans]
+    lo, hi = min(digests), max(digests)
+    assert lo != hi        # -> _kv_compact_for_shrink: uniform refusal, nothing moved
+                           #    (test_a_rank_without_a_plan_still_enters_the_digest_collective)
+
+
+class _NullCopier:
+    page_size = PG
+
+    def copy(self, src, dst):
+        return 0
+
+
+def test_an_eviction_that_frees_pages_below_the_floor_differs_by_those_pages(floor_env, monkeypatch):
+    """The digest counts EVERY page an eviction frees, not only the ones above the floor:
+    TP0's one node 6140..6143 + 6200..6207 frees 6140..6143 with it, TP1's split leaf
+    6200..6207 does not -- the allocators would part, so the digests must differ."""
+    plans = []
+    for name, form in (("TP0", _tp0), ("TP1", _tp1)):
+        target, dw = form(monkeypatch)
+        alloc = _alloc(TOP // PG, PG)
+        alloc._kvcache = target
+        tree = Tree(alloc)
+        _take(alloc, list(range(1, S8_PAGE + 1)))                     # no room below S8
+        low, high = list(range(6140, 6144)), list(range(6200, 6208))
+        if name == "TP0":                                             # low: taken above
+            _node(tree, alloc, high, PG, backed=True).component_data[FULL].value = \
+                torch.cat([_tokens_of(low), _tokens_of(high)])
+        else:
+            a = _node(tree, alloc, [], PG, backed=True)
+            a.component_data[FULL].value = _tokens_of(low)
+            _node(tree, alloc, high, PG, backed=True, parent=a)
+        sched = types.SimpleNamespace(token_to_kv_pool_allocator=alloc, page_size=PG,
+                                      draft_worker=dw, tree_cache=tree)
+        sv, why, _c = dsv._kv_compact_rank_survey(sched, S8_PAGE)
+        assert why is None, why
+        plans.append((sv, sched))
+    vecs = [dsv._kv_compact_vote(sv, None, S8_PAGE, TOP // PG) for sv, _s in plans]
+    group = [min(c) for c in zip(*vecs)]
+    got = [dsv._kv_compact_plans_from_vote(sv, group, S8_PAGE, TOP // PG, [S8_PAGE])[0][0]
+           for sv, _s in plans]
+    assert got[0] is not None and got[1] is not None
+    assert got[0].evict_pages == low + high and got[1].evict_pages == high
+    assert KC.plan_digest(8, got[0]) != KC.plan_digest(8, got[1])
+
+
+def _tokens_of(pages):
+    return torch.tensor([p * PG + o for p in pages for o in range(PG)], dtype=torch.int64)

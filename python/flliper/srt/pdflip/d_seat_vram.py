@@ -3603,6 +3603,10 @@ def _kv_compact_tree_ok(sched) -> bool:
     return KC.tree_why(getattr(sched, "tree_cache", None)) is None
 
 
+#: S98c: how often the ranks' page plans differed (uniform refusal, nothing moved)
+_KV_COMPACT_PLAN_DIFF = [0]
+
+
 def _kv_compact_rank_survey(sched, floor_page: int):
     """Rank-local: (survey, why, copier) -- the survey above ``floor_page`` or why
     this rank cannot take part (no allocator, a buffer the move cannot follow, ...)."""
@@ -3706,8 +3710,9 @@ def _kv_compact_for_shrink(sched, ms, fr, want: int, end: bool, floor_tokens: in
        page codes] (``_kv_compact_vote``); every rank plans every candidate on the
        agreed survey (``d_kv_compact.agreed_survey``: backed = group AND) and picks
        the lowest stage it clears (moves only first) -- replicated input, same pick;
-    2. N3 the plan DIGEST (jj, sources, destinations, evictions) as MIN/MAX:
-       unequal = PdFlipKvCompactDivergence before anything moved;
+    2. N3 the plan DIGEST (jj, page pairs, evicted pages) as MIN/MAX, entered by
+       every rank after a yes vote (-1 without a plan): S98c unequal = a uniform,
+       named refusal (nothing moved yet), no longer a crash-stop;
     3. N3 the MOVES' outcome as MIN/MAX: all moved -> go on; none moved (each
        rolled back) -> refused, nothing changed anywhere; mixed -> crash-stop;
     4. only then the evictions (the d_seat_compact order: move first), outcome
@@ -3767,19 +3772,28 @@ def _kv_compact_for_shrink(sched, ms, fr, want: int, end: bool, floor_tokens: in
 
     if int(group[0]) != 1:          # the group said no: replicated, every rank returns here
         return _refused()
-    # S98: the pick comes from the agreed survey, so it is the same on every rank whose
-    # tree holds the same nodes. The digest collective is entered on EVERY rank once the
-    # group said yes -- with a plan or with the sentinel -1 -- so a rank whose tree
-    # differs cannot leave its peers waiting in a collective it skipped: unequal is the
-    # named crash-stop before anything moved, equal -1 is a refusal everywhere.
+    # S98: the pick comes from the agreed survey. The digest collective is entered on
+    # EVERY rank once the group said yes -- with a plan or with the sentinel -1 -- so no
+    # rank leaves its peers waiting in a collective it skipped.
+    # S98c (rang review nf-review-s98-1020.md, Auflage 3): the digest is over PAGES
+    # (d_kv_compact.plan_digest); unequal means the ranks would do different things to
+    # the pages -- but NOTHING has moved yet and lo/hi are the reduced values every
+    # rank sees alike: a uniform, named refusal, not a crash-stop. The crash-stop stays
+    # for what cannot be undone: a mixed move outcome, a failed eviction.
     jj, plan = (cands[pick], plans[pick]) if pick is not None else (-1, None)
     digest = KC.plan_digest(jj, plan) if plan is not None else -1
     lo, hi = _group_same(sched, digest)
     if lo != hi:
-        raise PdFlipKvCompactDivergence(
-            "%s n=%d: the ranks' plans for S%d differ (digest here %d, group %d..%d) -- the "
-            "allocators or trees are no longer replicas; nothing moved" % (
-                KV_COMPACT_MARK, n, jj, digest, lo, hi))
+        why = ("the ranks' plans for S%d differ (digest here %d, group %d..%d: other node cuts "
+               "or another fallback eviction) -- refused on every rank, nothing moved"
+               % (jj, digest, lo, hi))
+        _KV_COMPACT_PLAN_DIFF[0] += 1
+        d = _KV_COMPACT_PLAN_DIFF[0]
+        fr["compact_refused"] = key
+        if d <= 16 or (d & (d - 1)) == 0:
+            logger.warning("%s n=%d verdict=refused-plan-diff diffs=%d want=S%d stage=S%d floor=%d -- %s",
+                           KV_COMPACT_MARK, n, d, int(want), int(ms.stage), int(floor_tokens), why)
+        return None
     if plan is None:
         return _refused()
     res = None

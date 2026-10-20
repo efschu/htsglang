@@ -666,7 +666,9 @@ def _scripted_same(monkeypatch, dsv_, answers):
     return calls
 
 
-def test_unequal_plan_digests_crash_stop_before_anything_moved(floor_env, monkeypatch):
+def test_unequal_plan_digests_refuse_uniformly_before_anything_moved(floor_env, monkeypatch):
+    """S98c (rang review nf-review-s98-1020.md, Auflage 3): nothing has moved when the
+    digests differ and every rank sees the same reduced lo/hi -- a uniform refusal."""
     target = _tp0_pool()
     dsv_, sched, caps, alloc, tree, draft = _form(floor_env, monkeypatch, target)
     ms = _to_s9(dsv_, sched)
@@ -675,8 +677,8 @@ def test_unequal_plan_digests_crash_stop_before_anything_moved(floor_env, monkey
     v0 = turn.component_data[FULL].value
     _scripted_same(monkeypatch, dsv_, [(1, 2)])                          # a peer planned otherwise
     sched.running_batch.reqs = [_req("pdflip-2-70", 150_000)]
-    with pytest.raises(dsv_.PdFlipKvCompactDivergence, match="plans .* differ"):
-        dsv_.runtime_tick(sched)
+    st = dsv_.runtime_tick(sched)
+    assert not st.changed and ms.stage == 9
     assert turn.component_data[FULL].value is v0
 
 
