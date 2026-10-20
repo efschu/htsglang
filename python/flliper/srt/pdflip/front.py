@@ -12891,6 +12891,8 @@ class Front:
                 # into S. Before v3 the record kept the rest of the batch START and R6 counted a computed prefill.
                 self.counters["r6_rest_computed"] += 1
                 return 0
+            if Front._r6k_kurz_stays(self, rid, rest, _granted):
+                return 0
             if not Front._r6_redirectable(self, rid):
                 self.counters["r6_rest_not_redirectable"] += 1
                 if rest > 0 and self.__dict__.get("_r6_nr_last") != (rid, rest):
@@ -12903,6 +12905,39 @@ class Front:
             return int(rest)
 
         return _tok
+
+    def _r6k_note_class(self, rid: str, klass: str, src: str) -> None:
+        """SOLL R6k (user decision 20.10. 21:30:15Z, "b"): the class a request was put on D with -- the arrival's exact
+        CLASSIFY (R2/R3/R4/R9), D's barrier for a measured arrival (u < halfX), D's measured class after a refusal.
+        Bounded like the other per-rid books."""
+        book = self.__dict__.setdefault("_r6k_class", collections.OrderedDict())
+        book.pop(str(rid), None)
+        book[str(rid)] = (str(klass), str(src))
+        while len(book) > 4096:
+            book.popitem(last=False)
+
+    def _r6k_kurz_stays(self, rid: str, rest: int, granted: int) -> bool:
+        """SOLL R6k (user decision 20.10. 21:30:15Z, verbatim "b": "Kurze bleiben auf D: Ein laufender kurzer D-Prefill
+        (u < halbX) läuft nach R2 auf D zu Ende; sein Rest zählt nicht zu S und löst keinen Flip aus. R6 gilt dann nur für
+        halbe und große laufende Prefills."): True = a RUNNING D prefill whose class is kurz -- its rest is not in S, it
+        is not counted for the redirect (no PARK-HANDBACK, no R6-REDIRECT). The class is the one it went to D with
+        (``_r6k_note_class``), never re-derived from a number. No class known: named (``r6k_class_unknown``) and R6 applies
+        as before. R11: the front decides alone, nothing is asked of D here."""
+        got = (self.__dict__.get("_r6k_class") or {}).get(str(rid))
+        if got is None:
+            self.counters["r6k_class_unknown"] += 1
+            return False
+        klass, src = got
+        if klass != phase_policy.CLASS_KURZ:
+            return False
+        self.counters["r6k_kurz_stays_on_d"] += 1
+        if self.__dict__.get("_r6k_last") != (rid, rest):
+            self.__dict__["_r6k_last"] = (rid, rest)
+            logger.info("PDFLIP R6K-KURZ-STAYS-ON-D rid=%s d_rest=%d granted=%d class=kurz src=%s epoch=%d -- a running kurz D "
+                        "prefill runs to its end on D: its rest is not in S, it makes no flip and pulls none forward, it "
+                        "is not redirected to P (SOLL R6k, user 20.10. \"b\"; R2)", rid, int(rest), int(granted), src,
+                        self.epoch)
+        return True
 
     def _r6_redirect(self, why: str) -> List[str]:
         """S56 (SOLL R6 "auch ein laufender D prefill wird dann geflippt"): a REROUTE_P verdict MOVES the running D
@@ -13670,6 +13705,9 @@ class Front:
                                  why="uncached=%d X=%d (#11: the route verdict)" % (int(remainder), int(x)))
             if measure:
                 cb = getattr(xx, "class_basis", None)
+                # SOLL R6k: D prefills a measured request only under its barrier halfX-1 (D's exact u < halfX) -- what runs on
+                # D from here is kurz; a refusal names the measured class (``_measure_return`` overwrites it)
+                Front._r6k_note_class(self, rid, phase_policy.CLASS_KURZ, "measure_barrier")
                 Front._measure_start(self, rid, x, "%s; route=%s" % (cb.why if cb is not None else "no exact number", route),
                                      u_p=int(getattr(xx, "uncached_p", -1)), t_dec=t_dec, grp=grp,
                                      n_prompt=n_prompt if _n_exact else 0)
@@ -13687,6 +13725,7 @@ class Front:
                 why = cb.why if cb is not None else "u from %s" % src
             Front._num_note(self, rid, src, now - age / 1000.0)
             klass = phase_policy.classify_arrival(int(remainder), x, frac, bool(p_only))
+            Front._r6k_note_class(self, rid, klass, "arrival")  # SOLL R6k: the class R6 reads for a running D prefill
             rule = {phase_policy.CLASS_KURZ: "R2", phase_policy.CLASS_HALB: "R3", phase_policy.CLASS_GROSS: "R4",
                     phase_policy.CLASS_P_ONLY: "R9"}[klass]
             seq = Front._dec(self).record(_dr.Decision(
@@ -13766,6 +13805,7 @@ class Front:
             page = Front._d_page_size(self)
             self.counters["measure_return_" + klass] += 1
             p.measured_u, p.measure_src, p.measure_class = u, _dn.SRC_D_EXTENT, klass
+            Front._r6k_note_class(self, rid, klass, _dn.SRC_D_EXTENT)  # SOLL R6k: D's measured class replaces the barrier's
             if reclass:
                 self.counters["measure_reclass_" + klass] += 1
             under = klass == _dn.CLASS_KURZ

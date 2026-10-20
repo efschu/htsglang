@@ -209,42 +209,51 @@ def test_arm_helper_records_on_the_forward_stream_and_hands_the_query(tmp_path):
 
 
 # ------------------------------------------------------------------------------------------------ the front's verdict (R6)
-def _front_live(now, tmp_path, *, member_u, ended, rest_start=U_K, ext_len=CHUNK1, x=X_LIVE, ranks=3):
-    """The real front: D decodes, the kurz 12-275 granted at 31,120 (now-1.86) and posted, its leg redirectable; chunk 1 began at
-    now-1.0; ``ended`` = its forward's device end was polled. The set member waits since 29,094 (now-3.9 < T_halb)."""
+def _front_live(now, tmp_path, *, member_u, ended, rest_start=U_K, ext_len=CHUNK1, x=X_LIVE, ranks=3, klass=None, waited=3.9,
+                rid_run=RID_K):
+    """The real front: D decodes, the running D prefill ``rid_run`` granted at now-1.86 and posted, its leg redirectable; its
+    chunk began at now-1.0; ``ended`` = its forward's device end was polled. The set member waits ``waited`` s (live 3.9 <
+    T_halb). ``klass`` = the class the running prefill went to D with (SOLL R6k; None = unknown, named)."""
     import asyncio as _a
     f = _fake_front(running=["dec"], n=6, kv={"available": 400000, "evictable": 0})
     f.tp_prefill_max_tokens = x
     f.t_awake = now - 60.0
     f._sync_batch_gate = lambda: None
-    f._d_pf_book().grant(rid=RID_K, tokens=rest_start, now=now - 1.86)
-    f._d_pf_book().enter_leg2(rid=RID_K)
-    f.groups["D"].outstanding[RID_K] = now - 1.86
-    f._rvp_state()
-    f.__dict__.setdefault("_d_prefill_legs", {})[RID_K] = now - 1.86
-    f._leg2_lookahead.add(RID_K)
-    clock = {"t": int((now - 1.0) * 1e9)}
-    for r in range(ranks):
-        w = dxb.DExtendBeacon(str(tmp_path / ("D-pid%d.bin" % (r + 1))), clock_ns=lambda: clock["t"])
-        w.note_recv(rid=RID_K)
-        w.note_extend(rids=[RID_K], rests=[rest_start], extend_lens=[ext_len])
-        w.arm_done(key=37869, rids=[RID_K], ready=lambda: ended)
-        w.poll_done()
+    add_running(f, now, tmp_path, rid_run, rest_start=rest_start, ext_len=ext_len, ended=ended, ranks=ranks, klass=klass)
     f._d_ext_reading = lambda: dxb.read_group_full(str(tmp_path), "D", SID, session_of=lambda pid: SID)
     if member_u >= x:                                    # gross: a queued P candidate (R4)
-        g = F.Pending(RID_G, "/v1/messages", {}, "t", now - 3.9, _a.new_event_loop().create_future(),
+        g = F.Pending(RID_G, "/v1/messages", {}, "t", now - waited, _a.new_event_loop().create_future(),
                       est_prompt=32979, est_uncached=member_u)
         g.x_set = x
         f.queue.append(g)
     else:                                                # halb: a set member collecting (R3)
-        f._set_st()["shorts"][RID_G] = (now - 3.9, member_u, x)
+        f._set_st()["shorts"][RID_G] = (now - waited, member_u, x)
     return f
 
 
-def test_front_live_12_275_r6_counts_626_after_chunk1_ended_and_the_flip_still_stands(monkeypatch, caplog, tmp_path):
-    """The live verdict with D's exact rest: r6_rest=626 (not 1394). The gross member alone already has S=9875 >= X=7016, so
-    S=10501 > X and REROUTE_P why=R6 still fires (SOLL R6 as written; whether a kurz rest may pull a gross member's flip forward
-    is the open question to the user, report section 2). The number is exact; the verdict is the SOLL's."""
+def add_running(f, now, tmp_path, rid, *, rest_start, ext_len, ended, ranks=3, klass=None, key=37869):
+    """A RUNNING D prefill ``rid`` (granted, posted, leg redirectable, its chunk begun at now-1.0 on ``ranks`` real beacon
+    writers, ``ended`` polled) and the class it went to D with (SOLL R6k)."""
+    f._d_pf_book().grant(rid=rid, tokens=rest_start, now=now - 1.86)
+    f._d_pf_book().enter_leg2(rid=rid)
+    f.groups["D"].outstanding[rid] = now - 1.86
+    f._rvp_state()
+    f.__dict__.setdefault("_d_prefill_legs", {})[rid] = now - 1.86
+    f._leg2_lookahead.add(rid)
+    clock = {"t": int((now - 1.0) * 1e9)}
+    for r in range(ranks):
+        w = dxb.DExtendBeacon(str(tmp_path / ("D-pid%d%d.bin" % (r + 1, sum(map(ord, rid)) % 1000))), clock_ns=lambda: clock["t"])
+        w.note_recv(rid=rid)
+        w.note_extend(rids=[rid], rests=[rest_start], extend_lens=[ext_len])
+        w.arm_done(key=key, rids=[rid], ready=lambda: ended)
+        w.poll_done()
+    if klass is not None:
+        F.Front._r6k_note_class(f, rid, klass, "arrival")
+
+
+def test_front_live_12_275_class_unknown_r6_counts_the_exact_626(monkeypatch, caplog, tmp_path):
+    """Exactness of the number (class not known to the front: named ``r6k_class_unknown``, R6 applies as before): r6_rest=626, not
+    1394 -> S=10501 > X=7016, REROUTE_P why=R6 with counted 626."""
     _on(monkeypatch)
     now = time.time()
     f = _front_live(now, tmp_path, member_u=U_G, ended=True)
@@ -254,30 +263,46 @@ def test_front_live_12_275_r6_counts_626_after_chunk1_ended_and_the_flip_still_s
     sv = [m for m in caplog.messages if "PDFLIP SET-VERDICT" in m]
     assert any("verdict=REROUTE_P" in m and "S=%d" % (U_G + REST_AFTER) in m for m in sv), sv
     assert any("R6-REDIRECT" in m and "counted=%s:%d" % (RID_K, REST_AFTER) in m for m in caplog.messages)
+    assert f.counters["r6k_class_unknown"] >= 1
+
+
+def test_front_live_12_275_r6k_the_kurz_stays_on_d_the_gross_member_waits_its_t_half(monkeypatch, caplog, tmp_path):
+    """SOLL R6k (user 20.10. "b"): 12-275 went to D as kurz (R2, u=1394 < halbX 3508). Its rest is not in S, it is not redirected,
+    and it pulls no flip forward: the gross member (waited 3.9 s < T_halb 4.5 s, D decodes) keeps waiting (R4)."""
+    _on(monkeypatch)
+    now = time.time()
+    f = _front_live(now, tmp_path, member_u=U_G, ended=True, klass="kurz")
+    with envs.FLLIPER_PDFLIP_DECIDER.override(True), caplog.at_level(logging.INFO, logger="pdflip.front"):
+        assert f._dc_carried_running() == 0
+        assert f._decode_collect(now) == "hold"
+    assert not any("verdict=REROUTE_P" in m for m in caplog.messages if "PDFLIP SET-VERDICT" in m)
+    assert not any("R6-REDIRECT" in m or "PARK-HANDBACK" in m for m in caplog.messages)
+    assert f.counters["r6_redirected"] == 0 and f.counters["r6k_kurz_stays_on_d"] >= 1
+    assert any("R6K-KURZ-STAYS-ON-D rid=%s d_rest=%d" % (RID_K, REST_AFTER) in m for m in caplog.messages)
 
 
 def test_front_halb_member_exact_rest_keeps_s_under_x_no_flip(monkeypatch, caplog, tmp_path):
-    """Where the exact number decides: halb member u=4000 (halbX 3508 <= u < X 7016), a kurz D prefill of 3400 whose first chunk
-    (2048) has ended. Stale start rest: S=7400 > X -> REROUTE_P (R6). Exact rest 1352: S=5352 < X -> the set collects (R3), no
-    flip under X (R7)."""
+    """Where the exact number decides: halb member u=3600 (halbX 3508 <= u < X 7016), a running HALB D prefill of 4000 (R6 applies,
+    SOLL R6k) whose first chunk (2048) has ended. Stale start rest: S=7600 > X -> REROUTE_P (R6). Exact rest 1952: S=5552 < X ->
+    the set collects (R3), no flip under X (R7)."""
     _on(monkeypatch)
     now = time.time()
-    f = _front_live(now, tmp_path, member_u=4000, ended=True, rest_start=3400, ext_len=2048)
+    f = _front_live(now, tmp_path, member_u=3600, ended=True, rest_start=4000, ext_len=2048, klass="halb")
     with envs.FLLIPER_PDFLIP_DECIDER.override(True), caplog.at_level(logging.INFO, logger="pdflip.front"):
-        assert f._dc_carried_running() == 1352
+        assert f._dc_carried_running() == 1952
         assert f._decode_collect(now) == "hold"
     assert not any("verdict=REROUTE_P" in m for m in caplog.messages if "PDFLIP SET-VERDICT" in m)
     assert f.counters["r6_redirected"] == 0
 
 
 def test_front_halb_member_while_the_chunk_still_runs_the_start_rest_counts_r6(monkeypatch, tmp_path):
-    """Danger direction 'rest too small -> flip missing': the same chunk whose forward has NOT ended -- its 3400 are not computed,
-    S=7400 > X -> REROUTE_P (SOLL R6, EZ-S2b review A2: a running forward counts its rest)."""
+    """Danger direction 'rest too small -> flip missing': the same halb chunk whose forward has NOT ended -- its 4000 are not
+    computed, S=7600 > X -> REROUTE_P (SOLL R6, EZ-S2b review A2: a running forward counts its rest)."""
     _on(monkeypatch)
     now = time.time()
-    f = _front_live(now, tmp_path, member_u=4000, ended=False, rest_start=3400, ext_len=2048)
+    f = _front_live(now, tmp_path, member_u=3600, ended=False, rest_start=4000, ext_len=2048, klass="halb")
     with envs.FLLIPER_PDFLIP_DECIDER.override(True):
-        assert f._dc_carried_running() == 3400
+        assert f._dc_carried_running() == 4000
         assert f._decode_collect(now) == "P"
     assert f.counters["set_reroute_p"] == 1 and f.counters["r6_redirected"] == 1
 
