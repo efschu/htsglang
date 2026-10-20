@@ -70,7 +70,7 @@ paused the decodes ~300 ms (``D-DECODE-GAP`` tails with a lend, p50 312 ms). Now
 pending extend that is SHORT by the front's own R2 verdict (every waiting request
 carries halbX and its priced uncached is under it, no chunked request; replicated, so
 the verdict is group-uniform) gives back only the cells above the largest lattice k
-that leaves ``lend floor + 300 + rate x rows`` MiB free -- the rc12g chunk model's
+that leaves ``lend floor + 300 + rate x rows`` MiB free (KEEP-PRICE below: now the larger of the two) -- the rc12g chunk model's
 price (``extend_trim.chunk_need_mib``), so the width vote still funds the whole
 request in one chunk. Before the built extend runs the same price is taken with the
 batch's exact rows. A big or unpriced extend, or a rank without a chunk rate, returns
@@ -81,6 +81,21 @@ before; the switch off = the full return byte for byte. Lines::
     PDFLIP D-TRANSIENT-LEND rank=0 keep rows_on 15 (short extend pending rows=312
       need_mib=1250 card_free_mib=1380)
     PDFLIP D-TRANSIENT-LEND rank=0 return rows_on 15->11 (short extend pending ...)
+
+KEEP-PRICE (20.10., nf-expert-h2d-1020): the short extend's price is ``max(lend floor,
+300 + rate x rows)`` -- no longer their SUM. Both terms are the planner's (the launcher's
+``FLLIPER_PDFLIP_D_LEND_FLOOR_MIB`` and the rc12g chunk model ``extend_trim.chunk_need_mib``),
+nothing new is priced. The sum stacked two safety lines that are never stacked anywhere else:
+every big chunk runs on ``300 + rate x rows`` alone (the #794 width vote, ``rows_cap``) and ends
+below the lend floor (rc28 D ``..._1020_174205``: TP1 688, TP2 434, TP0 385 MiB after a 2812
+chunk). The width vote is still funded (``free >= 300 + rate x rows`` = ``rows_cap >= rows``:
+the short request still runs in one chunk) and the card keeps its near-OOM edge between extends.
+Measured both ways over every extend of rc28 D ``_174205`` and ``_201023`` (PDFLIP-VRAM-PEAK
+phase=chunk, all three ranks, 752 + 101 windows): started at exactly the new price, the card would
+have kept >= 397 MiB free at the forward's peak in every one of them (the 300 HALT line holds);
+the old sum returned rows before 2184 short extends in ``_174205`` of which 1795 need no return
+at all at the new price (TP1: 604 of 732, >= 2206 rows of return + re-lend saved). Rows kept
+through the extend are its expert rows: the same experts are not copied again over the link.
 """
 
 from __future__ import annotations
@@ -408,23 +423,46 @@ def batch_rows(batch) -> Optional[int]:
         return None
 
 
-def _keep_short(sched, ctl, rows: int, why: str) -> Optional[str]:
-    """S78 KEEP-SHORT: give back only the lent cells the extend's price needs.
+def short_extend_need_mib(rank: int, rows: int) -> Optional[float]:
+    """KEEP-PRICE (20.10.): the card MiB a pending / built SHORT extend of ``rows`` rows needs free
+    while lent expert rows stay ON -- ``max(lend floor, extend_trim.chunk_need_mib(rank, rows))``.
 
-    Price = this rank's lend floor + the rc12g chunk model's ``300 + rate x rows``
-    (``extend_trim.chunk_need_mib``); no floor, no rate or no card reading = the
-    full return (nothing is guessed). Returns ``return`` when rows moved,
-    ``keep`` when the card already holds the price, else None."""
+    * ``300 + rate x rows`` (the rc12g chunk model, the planner's measured rate) is what the #794
+      width vote funds a chunk of ``rows`` with -- every big chunk runs on exactly that line, so the
+      short request still goes in one chunk and its growth keeps the 300 HALT line;
+    * the lend floor (the launcher's near-OOM edge) is what D keeps free between extends -- the
+      card never drops under it for a lend kept through a tiny extend.
+
+    The old S78 price was their SUM (``floor + 300 + rate x rows``): 1002 MiB on TP1 for a 4-row
+    extend whose card use was <= 20 MiB (rc28 ``_174205``, <=64 rows, PDFLIP-VRAM-PEAK), so ~2.5
+    expert rows went back -- and were re-lent after it -- around every short request. ``None``
+    (= the full return) when this rank has no floor or no chunk rate: nothing is guessed."""
     from flliper.srt.pdflip import d_seat_vram as dsv
     from flliper.srt.pdflip import extend_trim
 
+    try:
+        floor = dsv.lend_floor_mib_for_rank(int(rank))
+        price = extend_trim.chunk_need_mib(int(rank), int(rows))
+    except Exception:  # noqa: BLE001 -- unpriced: the full return
+        return None
+    if floor is None or price is None:
+        return None
+    return max(float(floor), float(price))
+
+
+def _keep_short(sched, ctl, rows: int, why: str) -> Optional[str]:
+    """S78 KEEP-SHORT: give back only the lent cells the extend's price needs.
+
+    Price = :func:`short_extend_need_mib` (KEEP-PRICE: the larger of this rank's lend
+    floor and the rc12g chunk model's ``300 + rate x rows``); no floor, no rate or no
+    card reading = the full return (nothing is guessed). Returns ``return`` when rows
+    moved, ``keep`` when the card already holds the price, else None."""
     rank = _rank(sched)
-    floor = dsv.lend_floor_mib_for_rank(rank)
-    need = extend_trim.chunk_need_mib(rank, int(rows))
+    need = short_extend_need_mib(rank, int(rows))
     free = _card_free_bytes()
-    if floor is None or need is None or free is None:
+    if need is None or free is None:
         return _give_back(sched, ctl, why + " (unpriced)")
-    need_mib = float(floor) + float(need)
+    need_mib = float(need)
     need_bytes = int(need_mib * MIB)
     before = int(ctl.rows_on)
     k = ctl.unlend_target(need_bytes, free)
@@ -454,8 +492,9 @@ def stage_keep_need_bytes(sched, ctl=None) -> Optional[int]:
     leave free when it keeps an open lend -- the lend's OWN price, nothing new:
 
     * the lend floor of this rank (the card ledger's near-OOM edge, ``FLLIPER_PDFLIP_D_LEND_FLOOR_MIB``);
-    * plus, when extend work is pending and ALL of it is short (S78's R2 verdict, replicated), the
-      KEEP-SHORT price ``extend_trim.chunk_need_mib(rank, rows)`` -- the same price ``round_start``
+    * when extend work is pending and ALL of it is short (S78's R2 verdict, replicated), the
+      KEEP-SHORT price instead (KEEP-PRICE 20.10.: :func:`short_extend_need_mib`, the larger of the
+      floor and ``extend_trim.chunk_need_mib(rank, rows)``) -- the same price ``round_start``
       already left free before this move; the move must not eat it.
 
     ``None`` (the lend ends with the move, the old behaviour): nothing lent, the lend not armed, no
@@ -480,12 +519,10 @@ def stage_keep_need_bytes(sched, ctl=None) -> Optional[int]:
             rows = short_pending_rows(sched) if keep_short_on() else None
             if rows is None:
                 return None
-            from flliper.srt.pdflip import extend_trim
-
-            price = extend_trim.chunk_need_mib(rank, int(rows))
+            price = short_extend_need_mib(rank, int(rows))
             if price is None:
                 return None
-            need_mib += float(price)
+            need_mib = max(need_mib, float(price))
         return int(need_mib * MIB)
     except Exception:  # noqa: BLE001 -- unpriced: the lend ends with the move (the old behaviour)
         return None

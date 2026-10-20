@@ -1882,7 +1882,8 @@ class SeatVram:
         ``keep_need_bytes`` free after the move maps ``kv_need_bytes`` fresh:
         ``free + release(k) - kv_need >= keep_need``. ``keep_need`` is the lend's own price
         (``d_transient_lend.stage_keep_need_bytes``: the lend floor = the card ledger's
-        near-OOM edge, plus the KEEP-SHORT price of a pending short extend); no new number,
+        near-OOM edge, or the KEEP-SHORT price of a pending short extend when it is larger --
+        KEEP-PRICE 20.10.); no new number,
         no reserve. ``k_cell`` (the old behaviour: the lend ends) when nothing is lent, no
         price is given (a big or unpriced extend pending: its full return already ran),
         or no card is measured (CPU, no context). Pure arithmetic over one card reading."""
