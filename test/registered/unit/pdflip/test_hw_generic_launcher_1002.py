@@ -7,7 +7,7 @@ Two halves:
 1. THE REGRESSION GATE. On the reference rig (nvml0 RTX 3080 20480 MiB sm86,
    nvml1 RTX 5090 32607 MiB sm120, nvml2 RTX 3080 20480 MiB sm86) every
    hardware-dependent launcher decision is IDENTICAL to the base tree
-   bd2e3bc22d (27B y8p, before the port): the plan fingerprint
+   3fe878018d: the plan fingerprint
    (``hw_generic_rig_plan_fingerprint_1002.py``) written on the base tree is
    the golden file this tree must reproduce byte for byte -- card order, CVD,
    W19 residue (both weight sources), DC expectations, the P-cut attention
@@ -42,7 +42,10 @@ from flliper.srt.pdflip import launcher as L
 from flliper.srt.pdflip import xchg_census as XC
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-GOLDEN = os.path.join(HERE, "fixtures", "hw_generic_1002", "rig_plan_fingerprint_base_bd2e3bc22d.json")
+# NF y7 line (desk/nf-y7j-hwgen-1002): the golden is re-derived on THIS line's base
+# e7a70285bd (y7h + H4 fix + big_cards fix), the tree without HW-GENERIC; the
+# 3fe878018d golden stays beside it for the release-tree line.
+GOLDEN = os.path.join(HERE, "fixtures", "hw_generic_1002", "rig_plan_fingerprint_base_e7a70285bd.json")
 MIB = 1 << 20
 
 
@@ -94,7 +97,7 @@ class RegressionGateReferenceRig(unittest.TestCase):
         now = json.loads(json.dumps(FP.fingerprint(), sort_keys=True, default=str))
         self.assertEqual(sorted(now), sorted(golden))
         for key in sorted(golden):
-            self.assertEqual(now[key], golden[key], f"plan fingerprint {key!r} differs from base bd2e3bc22d")
+            self.assertEqual(now[key], golden[key], f"plan fingerprint {key!r} differs from base e7a70285bd")
 
     def test_order_is_the_old_5090_first_then_3080s_by_nvml_index(self):
         o = L.order_cards(rig())
@@ -205,6 +208,8 @@ class SyntheticInventories(unittest.TestCase):
         for c in SYNTHETIC["3x3090"]:
             self.assertTrue(L.driver_carve_charged(c, 32000))
 
+    @unittest.skipUnless(hasattr(L, "resolve_pp_cut_stage_model"),
+                         "PP-COST stage model (27B release 01.10.) is not on the NF y7 line")
     def test_stage_model_is_not_picked_for_foreign_cards(self):
         from flliper.srt.pdflip import form as F
 

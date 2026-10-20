@@ -2,10 +2,6 @@
 """STORE-PRESENCE (user law 02.10.: L2/L3 are shared, the credit is the STORE
 prefix) and X-EXACT-BACKFILL on NF.
 
-27B port (02.10., desk/27b-nfport-route-1002): the NF cases below are kept as
-token arithmetic (model-neutral); the 27B cases of boot b6a878f145 live in
-test_pdflip_x_credit_store_27b_1002.py.
-
 y6y (0e1967fd36), front log ..._1002_074625.front.log: 8 LONG verdicts whose
 P leg 1 computed <= X new tokens, all priced src=none / credit=0:
   * the six requests before 'X-EXACT READY' (pdflip-0-1..0-5, 1-6, reason
@@ -151,12 +147,12 @@ def test_a_queued_long_repriced_below_x_becomes_d_eligible(caplog):
     f.ftok.m["1-7"] = _ids(105048)
     p = F.Pending("pdflip-1-7", "/generate", {}, "1-7", time.time(),
                   asyncio.new_event_loop().create_future(), est_prompt=105048,
-                  est_uncached=105048)  # 27B Pending has no x_routed
+                  est_uncached=105048, x_routed=3722)
     f.queue.append(p)
     f._p_leg1_store_note("pdflip-0-2", "0-2", 104893)
     f._p_flush_store_presence([])
     assert p.est_uncached == 105048 - 104832 == 216
-    assert p.d_eligible
+    assert p.d_eligible and p.x_routed == 0
     assert f.counters["x_exact_reprice_short"] == 1
 
 

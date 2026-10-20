@@ -281,6 +281,14 @@ def capacity_park_precondition(req) -> bool:
             return False
         if getattr(req, "multimodal_inputs", None) is not None:
             return False
+        # LANES HOTFIX 2 1014 (NF 09:33:44 pdflip-2-13, lane 1): a request of a raised lane does not wait out the
+        # capacity park (120 s while every lower lane is parked behind it) -- it goes to P at once (RESUME-VIA-P,
+        # measured 4.3 s).  The lane is replicated (the request's own field), so the group vote stays uniform.
+        try:
+            if int(getattr(req, "priority", 0) or 0) > 0:
+                return False
+        except (TypeError, ValueError):
+            pass
         return bool(getattr(req, "_pdflip_store_short_fallback", False))
     except Exception:  # noqa: BLE001
         return False
@@ -344,7 +352,7 @@ def park_for_capacity(sched, req, d_extent: int, x: int) -> None:
         "attempts=%d -- the store holds the context and D's read of it ended short on its own "
         "capacity: D keeps the stream parked and re-reads it when the arena has room (no P leg, "
         "no attempt, no W50 to the client)",
-        CAPPARK_MARK, str(req.rid)[:24], int(d_extent), int(x), delivered, deliverable,
+        CAPPARK_MARK, str(req.rid), int(d_extent), int(x), delivered, deliverable,
         now - float(getattr(req, CAPPARK_SINCE_ATTR)), capacity_park_bound_s(),
         int(getattr(req, ATTEMPTS_ATTR, 0) or 0))
 
@@ -416,6 +424,6 @@ def keep_on_d(sched, req, d_extent: int, x: int, reason: str = "x_refusal_midstr
         "attempt=%d/%d hold=%s written=%s -- D keeps the stream open and parks the request; P "
         "prefills its %d-token context, D resumes after the flip back (no abort, no bytes to the "
         "client)",
-        str(req.rid)[:24], int(d_extent), int(x), reason, n, n, max_attempts(),
+        str(req.rid), int(d_extent), int(x), reason, n, n, max_attempts(),
         "same" if same else "new", ok if rank0 else "rank>0", len(context_ids(req)))
     return ok

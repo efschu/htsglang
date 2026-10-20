@@ -331,7 +331,7 @@ def _front(exact):
     f.state = "serving"
     f.routed = []
 
-    async def seat(rid, est, refused=None):
+    async def seat(rid, est, refused=None, **kw):  # 1400: take the seat kwargs
         return 1
 
     async def leg2(request, rid, payload, text, stream, pending=None, **kw):
@@ -399,16 +399,24 @@ def test_the_measured_d_prefix_is_subtracted(caplog):
 
 def test_a_failed_load_falls_back_to_the_estimate_by_name(caplog):
     """BOOT-START HOLD (y7d): only a load that ENDED without a tokenizer
-    falls back to chars/3 -- by name; a loading one holds the decision
-    (test_pdflip_l3_index_price_1002)."""
+    falls back -- by name; a loading one holds the decision
+    (test_pdflip_l3_index_price_1002). EZ-S1 review B2 (user 19.10. "nichts schaetzen"): with FLLIPER_PDFLIP_EXACT_CLASS
+    (default ON) the fallback is NO NUMBER, the request is MEASURE (D's admission with the barrier halfX-1, routed
+    "short" to D's line); chars/3 decides nothing. Switch off: the rc17 fallback (chars/3 decides, "long")."""
     f = _front(True)
     f.ftok.state = "failed"
     with caplog.at_level(logging.INFO, logger="pdflip.front"):
-        assert _route(f, _payload(3 * X + 600)) == "long"  # chars/3 decides
+        assert _route(f, _payload(3 * X + 600)) == "short"  # MEASURE: D measures, no class on chars/3
     msgs = [r.getMessage() for r in caplog.records]
     assert any(m.startswith("PDFLIP X-EXACT-FALLBACK") and "reason=tokenizer_failed" in m
                for m in msgs)
-    assert f.counters["x_exact_fallback"] == 1
+    assert f.counters["x_exact_fallback"] == 1 and f.counters["x_exact_fallback_measure"] == 1
+    assert f.counters["measure_on_d"] == 1
+    with envs.FLLIPER_PDFLIP_EXACT_CLASS.override(False):
+        f2 = _front(True)
+        f2.ftok.state = "failed"
+        assert _route(f2, _payload(3 * X + 600)) == "long"  # rc17: chars/3 decides
+        assert f2.counters["x_exact_fallback"] == 1 and f2.counters["x_exact_fallback_measure"] == 0
 
 
 def test_residual_error_is_logged_not_banded(caplog):
@@ -448,7 +456,8 @@ def test_off_constructs_and_imports_nothing():
 
     src = inspect.getsource(F.Front.handle_generate)
     # every X-EXACT statement in the handler sits behind the switch
-    assert "if self.x_exact:\n            _xx = await self._x_exact_price(" in src
+    # (TEMPLATE-GATE 07.10.: the call sits in a try that answers a template refusal 400)
+    assert "if self.x_exact:\n            try:\n                _xx = await self._x_exact_price(" in src
     assert src.count("self._x_exact_price(") == 1
     init = inspect.getsource(F.Front.__init__)
     assert "if self.x_exact:\n            from flliper.srt.pdflip.front_tokens import" in init
@@ -587,11 +596,16 @@ def test_off_never_reprices_and_the_hooks_sit_behind_the_switch():
     src = inspect.getsource(F.Front)
     assert "if self.x_exact:\n            # X-EXACT: a held (#49) credit is bound to its epoch" in src
     # 4th: _p_anchor_presence (PREFILL-EINBRUCH-0929 K1), returns before it when x_exact is off
-    # 5th: _d_epoch_publish_presence (#49 L2), returns before it when x_exact is off or its switch is
-    # 6th: _p_flush_store_presence (STORE-PRESENCE, NF ba76adffe2 ported 02.10.), returns before it
+    # 5th: _d_epoch_publish_presence (#49 L2, 27B), returns before it when x_exact is off or its switch is
+    # 6th/7th: _d_inflight_presence / _d_inflight_park (X-CREDIT-INFLIGHT-1002, NF):
+    # the first returns before it when x_exact is off, the second needs a
+    # tspans entry (None when x_exact is off)
+    # 8th: _p_flush_store_presence (STORE-PRESENCE 1002), returns before it
     # without tspans (None when x_exact is off)
-    # 7th: _seq_park (SEQ-HASH, NF 02ddfc4906 ported 02.10.), returns before it when x_exact is off
-    assert src.count("self._x_exact_reprice_queue(") == 7
+    # 9th: _seq_park (SEQ-HASH 1002), returns before it when x_exact is off
+    # 10th/11th: _decode_collect / _set_flip_justified "pre_verdict" (NF set scheduler, SOLL v2), behind x_exact
+    # (27B port 20.10.: NF rc28 counts 10, the 27B line 7; the merged front carries both families = 11)
+    assert src.count("self._x_exact_reprice_queue(") == 11
     i = src.index("def _d_epoch_publish_presence(")
     body = src[i:src.index("self._x_exact_reprice_queue(", i)]
     assert "if not envs.FLLIPER_PDFLIP_ENABLE_D_EPOCH_PUBLISH_PRESENCE.get() or not self.x_exact" in body
@@ -605,3 +619,13 @@ def test_the_w31_requeue_counts_the_whole_prompt_exactly():
     j = src.index("p = Pending(", i)
     body = src[i:j]
     assert "if self.x_exact:" in body and "_est = int(_ids.size)" in body
+
+
+import pytest as _pytest_110  # noqa: E402
+
+
+@_pytest_110.fixture(autouse=True)
+def _arrival_seat_rule_off_110(monkeypatch):
+    """110: FLLIPER_PDFLIP_ENABLE_ARRIVAL_SEAT_RULE is default ON on the NF line;
+    this file pins the pre-rule front it was written against (=0 is that path)."""
+    monkeypatch.setenv("FLLIPER_PDFLIP_ENABLE_ARRIVAL_SEAT_RULE", "0")

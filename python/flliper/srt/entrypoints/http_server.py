@@ -160,6 +160,7 @@ from flliper.srt.managers.io_struct import (
     UpdateWeightVersionReqInput,
     VertexGenerateReqInput,
     VramBudgetReqInput,
+    PdFlipLaneFloorReqInput,
     PdFlipParkRunningReqInput,
     PdFlipDualPLendReqInput,
     PdFlipParkWindowReqInput,
@@ -174,6 +175,7 @@ from flliper.srt.managers.multi_tokenizer_mixin import (
 )
 from flliper.srt.managers.shutdown_gate import ServerShuttingDown
 from flliper.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
+from flliper.srt.pdflip import front_x as weg2_front_x  # FRONT-X-MIT: the native /generate stamps the front's decision X too
 from flliper.srt.observability.func_timer import enable_func_timer
 from flliper.srt.observability.trace import (
     process_tracing_init,
@@ -1188,6 +1190,10 @@ async def generate_request(obj: GenerateReqInput, request: Request):
     note_serving_activity()
     if envs.FLLIPER_ENABLE_REQUEST_HEADER_OVERRIDES.get():
         apply_header_overrides(obj, request.headers)
+    # FRONT-X-MIT (15.10., review dx-r2 A1): the front forwards /generate to D as well
+    # (front.py FORWARD_PATHS), so the native route stamps the decision X like chat and
+    # completions do -- otherwise a D-direct /generate is bounded by the static X alone.
+    weg2_front_x.stamp_request(obj, request)
     if obj.stream:
 
         async def stream_results() -> AsyncIterator[bytes]:
@@ -1442,8 +1448,42 @@ async def pdflip_park_running(obj: Annotated[PdFlipParkRunningReqInput, Body()],
     seq_marks = getattr(ret, "pdflip_seq_hash", None)  # SEQ-HASH (02.10.)
     if seq_marks:
         body["pdflip_seq_hash"] = dict(seq_marks)
+    answered_at = float(getattr(ret, "answered_at", 0.0) or 0.0)  # FLIPSTALL-1015
+    if answered_at > 0.0:
+        body["answered_at"] = answered_at
+    if getattr(ret, "lane", False):
+        # PRIORITY LANES 1008 (L2): the answer of a rids / hold park carries "lane" (+ why a rid was not parked)
+        body["lane"] = True
+        body["skipped"] = dict(getattr(ret, "lane_skipped", None) or {})
     return ORJSONResponse(
         body,
+        status_code=200 if ret.success else HTTPStatus.CONFLICT,
+    )
+
+
+@app.api_route("/pdflip/lane_floor", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def pdflip_lane_floor(obj: Annotated[PdFlipLaneFloorReqInput, Body()], request: Request):
+    """PRIORITY LANES 1008 (L2 + L3, one route for both groups): the front's floor. Group P: PP0 stamps it into the
+    PP-room vote so every stage applies it in the same pass (pdflip/lanes_p.py). Group D: Body {"floor": <int>, "epoch": <int>}; answer
+    200 {"success", "floor", "epoch", "requeued": [rid, ...], "held": <n>, "message"} -- the floor and epoch in
+    force, the held lane parks this call re-queued (oldest first) and the holds still standing. D's admission
+    lets in only requests with priority >= floor; a request parked with hold="lane" (POST /pdflip/park_running
+    with "rids") comes back when the floor falls to its lane. 409 when refused (FLLIPER_PDFLIP_LANES off on this
+    server, or a stale epoch). Names: pdflip/lanes.py RPC_LANE_FLOOR."""
+    try:
+        ret = await _global_state.tokenizer_manager.pdflip_lane_floor(obj)
+    except Exception as e:
+        return _create_error_response(e)
+    return ORJSONResponse(
+        {
+            "success": ret.success,
+            "floor": ret.floor,
+            "epoch": ret.epoch,
+            "requeued": list(ret.requeued),
+            "held": ret.held,
+            "message": ret.message,
+        },
         status_code=200 if ret.success else HTTPStatus.CONFLICT,
     )
 
@@ -1474,6 +1514,194 @@ async def pdflip_dual_p_lend(obj: Annotated[PdFlipDualPLendReqInput, Body()], re
     except Exception as e:
         return _create_error_response(e)
     return ORJSONResponse({"sent": True, "action": obj.action}, status_code=200)
+
+
+@app.api_route("/pdflip/match_probe", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def pdflip_match_probe(raw_request: Request):
+    """S56 D-MATCH-PROBE (pdflip/d_match_probe.py): the Weg-2 front asks, before its verdict, how much of a prompt
+    (body {"path", "payload"}) this group holds NOW. Tokenized here exactly as the leg's POST will be (images
+    included), the scheduler ranks walk their tree with the admission's key, TP0 answers. 200 {"success", "ids"
+    (base64 int32, the scheduler's token space), "device_tokens", "host_tokens", "key_match_depth", "mm_spans",
+    "tokenize_ms", "handle_ms", "total_ms"}; 200 {"success": false, "message"} for a shape it cannot price."""
+    import time as _time
+
+    from flliper.srt.managers.io_struct import PdFlipMatchProbeReqInput
+    from flliper.srt.pdflip import d_match_probe as _dmp
+
+    t0 = _time.perf_counter()
+    tm = _global_state.tokenizer_manager
+    try:
+        obj = await _dmp.build_probe_obj(
+            await raw_request.json(),
+            serving_chat=raw_request.app.state.openai_serving_chat,
+            serving_anthropic=raw_request.app.state.anthropic_serving,
+            raw_request=raw_request,
+        )
+        if obj is None:
+            return ORJSONResponse({"success": False, "message": "shape not priced", "retry": False},
+                                  status_code=200)
+        tm.auto_create_handle_loop()
+        from flliper.srt.managers import mm_tokenize_offload as _mmo
+
+        # S67r A2: an image probe's processor chain runs on the processing thread like its leg's (D-HEALTH: a
+        # D-MM-ITEM-CACHE miss stood the /health loop 1.6-2.2 s in rc16), never on the loop
+        with _mmo.probe_section(rid=obj.rid, is_mm=obj.contains_mm_input()):
+            # S67: the probe is no request of this server -- tokenized WITHOUT a ReqState (rc16: the stateful path
+            # read rid_to_state['<rid>~probe'] and every probe died of KeyError before the scheduler was asked)
+            tokenized = await tm._tokenize_one_request(obj, stateless=True)
+        mm = tokenized.mm_inputs
+        t_tok = (_time.perf_counter() - t0) * 1000.0
+        _sched_mm = None
+        _ta = getattr(tm, "pdflip_tok_ahead", None)
+        if mm is not None and _ta is not None:
+            # S63 F2 TOK-AHEAD: the D leg of this rid takes THIS tokenization (identity checked by digest); the
+            # scheduler gets feature-less copies of the items. S63r: a tower-less D caches the feature-less copy too
+            # (D never needs the pixels -- no host RAM held for a request that goes to P); features on the card
+            # (CUDA-IPC / keep-on-device): nothing is cached, the leg tokenizes itself
+            from flliper.srt.pdflip import tok_ahead as _tah
+            from flliper.srt.pdflip import vision_d_guard as _vdg
+
+            if not _tah.gpu_side_reason():
+                _sched_mm, _cache_mm = _tah.d_cache_mm(mm, _vdg.d_guard_armed(tm.model_config))
+                if _sched_mm is not None:
+                    _ta.put(obj.rid, _tah.obj_digest(obj), list(tokenized.input_ids or ()), _cache_mm,
+                            tokenized.token_type_ids, t_tok, "d_probe")
+        if mm is not None and _sched_mm is None:
+            # the scheduler needs each item's pad value and offsets, never its pixels (a probe carries no feature)
+            for item in getattr(mm, "mm_items", None) or ():
+                try:
+                    item.set_pad_value()
+                    item.feature = None
+                except Exception:  # noqa: BLE001 -- the scheduler hashes it then, as for a leg
+                    pass
+            _sched_mm = mm
+        req = PdFlipMatchProbeReqInput(
+            rid=str(tokenized.rid),
+            input_ids=_array_q(tokenized.input_ids),
+            mm_inputs=_sched_mm,
+            extra_key=getattr(tokenized, "extra_key", None),
+            tokenize_ms=t_tok,
+        )
+        req.mm_inputs = _wrap_as_pickle_probe(req.mm_inputs)
+    except Exception as e:
+        # S56r A1: the payload itself does not tokenize here -- the leg's POST meets the same; asking again cannot
+        # change it (the front gives up at once and lets D's admission answer the request)
+        return ORJSONResponse({"success": False, "message": f"{type(e).__name__}: {str(e)[:300]}", "retry": False},
+                              status_code=200)
+    try:
+        out = await tm.pdflip_match_probe(req)
+    except Exception as e:
+        return ORJSONResponse({"success": False, "message": f"{type(e).__name__}: {str(e)[:300]}", "retry": True},
+                              status_code=200)
+    if not out.success:
+        return ORJSONResponse({"success": False, "message": out.message,
+                               "retry": not str(out.message or "").startswith("group_min_needed")},
+                              status_code=200)
+    return ORJSONResponse(
+        {
+            "success": True,
+            "ids": _dmp.ids_to_b64(out.input_ids or ()),
+            "device_tokens": int(out.device_tokens),
+            "host_tokens": int(out.host_tokens),
+            "key_match_depth": int(out.key_match_depth),
+            "mm_spans": [list(x) for x in (out.mm_spans or ())],
+            # S63 F1: D's namespace of this prompt -- with D's ids the admission key, so the front's re-probe at the
+            # set verdict asks the tree again without a second tokenization here
+            "extra_key": getattr(tokenized, "extra_key", None),
+            "tokenize_ms": float(out.tokenize_ms),
+            "handle_ms": float(out.handle_ms),
+            "total_ms": (_time.perf_counter() - t0) * 1000.0,
+        },
+        status_code=200,
+    )
+
+
+@app.api_route("/pdflip/tokenize_ahead", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def pdflip_tokenize_ahead(raw_request: Request):
+    """S63 F2 TOK-AHEAD (pdflip/tok_ahead.py): the Weg-2 front posts a media prompt that can reach this group while
+    the group is dormant (body {"path", "payload"}, the leg's own body); this tokenizer process -- awake while the
+    group's weights sleep -- runs the chat template and the image processor NOW, and the group's leg of the same rid
+    takes the result (identity checked by digest). No scheduler call. 200 {"success", "n", "tokenize_ms"} or
+    {"success": false, "message"}."""
+    import time as _time
+
+    from flliper.srt.pdflip import d_match_probe as _dmp
+    from flliper.srt.pdflip import tok_ahead as _tah
+
+    t0 = _time.perf_counter()
+    tm = _global_state.tokenizer_manager
+    ta = getattr(tm, "pdflip_tok_ahead", None)
+    if ta is None:
+        return ORJSONResponse({"success": False, "message": "tok-ahead off"}, status_code=200)
+    try:
+        from flliper.srt.pdflip import vision_stage_service as _vss
+
+        if _vss.installed() is not None:
+            # a tokenizer-side tower would run on a card now, while the group sleeps -- never ahead of the flip
+            return ORJSONResponse({"success": False, "message": "tokenizer-side vision stage: no ahead"},
+                                  status_code=200)
+    except ImportError:
+        pass
+    _gpu = _tah.gpu_side_reason()
+    if _gpu:
+        # S63r: the processor would open a CUDA context / take IPC pool slices on this group's card while it sleeps
+        return ORJSONResponse({"success": False, "message": f"{_gpu}: no ahead"}, status_code=200)
+    try:
+        obj = await _dmp.build_probe_obj(
+            await raw_request.json(),
+            serving_chat=raw_request.app.state.openai_serving_chat,
+            serving_anthropic=raw_request.app.state.anthropic_serving,
+            raw_request=raw_request,
+        )
+    except Exception as e:
+        return ORJSONResponse({"success": False, "message": f"{type(e).__name__}: {str(e)[:300]}"}, status_code=200)
+    if obj is None or not obj.contains_mm_input():
+        return ORJSONResponse({"success": False, "message": "no media prompt: nothing ahead"}, status_code=200)
+    rid = _tah.leg_rid(obj.rid)
+    digest = _tah.obj_digest(obj)
+    if ta.has(rid) and rid not in ta._inflight:
+        ta.discard(rid)  # a re-sent ahead of the same rid replaces the old entry (the digest is checked at the take)
+    elif rid not in ta._inflight and ta.busy():
+        # S63r: two ahead tokenizations already run in this process -- no host-RAM spike for a burst of media arrivals
+        return ORJSONResponse({"success": False, "message": "busy: %d ahead in flight" % len(ta._inflight)},
+                              status_code=200)
+    if ta.begin(rid, digest) is None:
+        return ORJSONResponse({"success": True, "dup": True}, status_code=200)
+    done = False
+    try:
+        tm.auto_create_handle_loop()
+        # rc17 merge duty (review S67 A1 / S66 A2): the ahead payload carries the ``~probe`` rid, no request of this
+        # server -- tokenized WITHOUT a ReqState like the D-MATCH-PROBE (stateful: KeyError '<rid>~probe', ta.fail)
+        tokenized = await tm._tokenize_one_request(obj, stateless=True)
+        ms = (_time.perf_counter() - t0) * 1000.0
+        kept = ta.put(rid, digest, list(tokenized.input_ids or ()), tokenized.mm_inputs, tokenized.token_type_ids, ms,
+                      "p_ahead")
+        done = True
+        if not kept:
+            # S63r: larger than the whole byte cap -- not held; the leg tokenizes itself
+            return ORJSONResponse({"success": False, "message": "entry over FLLIPER_PDFLIP_TOK_AHEAD_MAX_MIB: not kept",
+                                   "tokenize_ms": ms}, status_code=200)
+    except Exception as e:
+        return ORJSONResponse({"success": False, "message": f"{type(e).__name__}: {str(e)[:300]}"}, status_code=200)
+    finally:
+        if not done:
+            ta.fail(rid)  # a leg waiting for it tokenizes itself, none hangs
+    return ORJSONResponse({"success": True, "n": len(tokenized.input_ids or ()), "tokenize_ms": ms},
+                          status_code=200)
+
+
+def _array_q(ids):
+    from array import array as _arr
+
+    return _arr("q", ids if ids is not None else ())
+
+
+def _wrap_as_pickle_probe(mm):
+    from flliper.srt.managers.io_struct import wrap_as_pickle
+
+    return wrap_as_pickle(mm) if mm is not None else None
 
 
 @app.api_route("/pdflip/ple_prefetch_hint", methods=["POST"])
@@ -1511,11 +1739,27 @@ async def pdflip_ple_prefetch_hint(raw_request: Request):
     )
 
 
+async def _s104_flip_quiesce_flag(request) -> bool:
+    """S104 review A1: True only for a POST whose JSON body says ``pdflip_flip_quiesce: true``; an empty or
+    unreadable body (curl, GET, tests) is a plain flush."""
+    if getattr(request, "method", "GET") != "POST":
+        return False
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001 - no body / not JSON: a plain flush
+        return False
+    return isinstance(body, dict) and body.get("pdflip_flip_quiesce") is True
+
+
 @app.api_route("/flush_cache", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def flush_cache(timeout: float = Query(0.0, ge=0.0)):
-    """Flush the radix cache."""
-    ret = await _global_state.tokenizer_manager.flush_cache(timeout_s=timeout)
+async def flush_cache(request: Request, timeout: float = Query(0.0, ge=0.0)):
+    """Flush the radix cache.
+
+    S104 review A1: a JSON body ``{"pdflip_flip_quiesce": true}`` marks the front's flip quiesce (the only flush
+    a sleep leg follows); without it -- every operator/test flush -- the reset is never deferred."""
+    ret = await _global_state.tokenizer_manager.flush_cache(
+        timeout_s=timeout, flip_quiesce=await _s104_flip_quiesce_flag(request))
     if ret.success:
         content = (
             "Cache flushed.\nPlease check backend logs for more details. "

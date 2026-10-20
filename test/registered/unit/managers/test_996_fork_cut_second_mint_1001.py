@@ -113,6 +113,17 @@ def adder(monkeypatch):
     monkeypatch.setenv("FLLIPER_PDFLIP_GROUP", "P")
     monkeypatch.delenv("FLLIPER_PDFLIP_MAMBA_ANCHOR_INTERVAL", raising=False)
     monkeypatch.delenv("FLLIPER_PDFLIP_FORM", raising=False)
+    # schedule_policy reads the group ONCE per process (_pdflip_chunk_admit /
+    # _pdflip_park_on cache their verdict in module globals).  With
+    # FLLIPER_PDFLIP_GROUP=P that verdict is True and it outlives this test's
+    # monkeypatch: every later file in the same pytest process that builds a
+    # real PrefillAdder then prices the next CHUNK instead of the whole extend,
+    # the NO_TOKEN gate falls away and the add is refused OTHER (nb14:
+    # test_nf_form_a_admission_follow_h105 4 red in a chunk run, 13/13 green
+    # alone).  Plain assignment, not monkeypatch: the undo of a monkeypatch
+    # would put back whatever a polluter left before this test.
+    sp._PDFLIP_CHUNK_ADMIT = None
+    sp._PDFLIP_PARK_ON = None
     sp._SECOND_CONTINUATION_REFUSALS.clear()
     running = MagicMock()
     running.reqs = []
@@ -129,6 +140,8 @@ def adder(monkeypatch):
     )
     yield a
     sp._SECOND_CONTINUATION_REFUSALS.clear()
+    sp._PDFLIP_CHUNK_ADMIT = None  # see above: never leave the P verdict behind
+    sp._PDFLIP_PARK_ON = None
 
 
 def _admit(adder, req):

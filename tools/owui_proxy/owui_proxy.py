@@ -32,6 +32,12 @@ ALIAS = "rig-auto"
 HOP_HEADERS = {"host", "content-length", "transfer-encoding", "connection", "keep-alive", "accept-encoding"}
 
 
+def forwarded_for(request) -> str:
+    """X-Forwarded-For for the front (08.10.: the dashboard shows the origin IP of a session): the value the client sent, if any,
+    then the peer of this connection -- so the front sees the client, not this proxy."""
+    return ", ".join(x for x in (request.headers.get("X-Forwarded-For"), request.remote) if x)
+
+
 class Cfg:
     def __init__(self, upstream: str, hold_s: float, keepalive_s: float, poll_s: float, state_file: str,
                  max_resumes: int):
@@ -144,7 +150,8 @@ class Proxy:
             if isinstance(body, dict) and "model" in body:
                 body = dict(body, model=ids[0])
                 raw = json.dumps(body).encode()
-            hdrs = {k: v for k, v in request.headers.items() if k.lower() not in HOP_HEADERS}
+            hdrs = {k: v for k, v in request.headers.items() if k.lower() not in HOP_HEADERS | {"x-forwarded-for"}}
+            hdrs["X-Forwarded-For"] = forwarded_for(request)
             try:
                 async with self.session.request(request.method, self.cfg.upstream + path, data=raw,
                                                 headers=hdrs) as r:
@@ -180,7 +187,7 @@ class Proxy:
                 log.info("resume %s attempt %d: %d chars content, %d chars reasoning", st.id, attempt,
                          len(st.content), len(st.reasoning))
             try:
-                done = await self._pump(req_body, st, resp)
+                done = await self._pump(req_body, st, resp, forwarded_for(request))
             except ClientGone as e:
                 # 01.10.: a closed client used to count as a backend break -> 6 resumes against a dead socket.
                 log.info("stream %s: client gone (%s), not resuming", st.id, e)
@@ -196,9 +203,10 @@ class Proxy:
             pass
         return resp
 
-    async def _pump(self, req_body: dict, st: "StreamState", resp) -> bool:
+    async def _pump(self, req_body: dict, st: "StreamState", resp, xff: str = "") -> bool:
         """One upstream stream; True when it ended normally ([DONE] or a finish_reason other than abort)."""
-        async with self.session.post(self.cfg.upstream + "/v1/chat/completions", json=req_body) as r:
+        async with self.session.post(self.cfg.upstream + "/v1/chat/completions", json=req_body,
+                                     headers={"X-Forwarded-For": xff} if xff else None) as r:
             if r.status != 200:
                 raise aiohttp.ClientError("upstream %d: %s" % (r.status, (await r.text())[:200]))
             finished = False

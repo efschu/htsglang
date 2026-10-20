@@ -141,10 +141,13 @@ def test_riders_never_raise_x_above_the_lone_request():
 def test_the_arrival_is_routed_on_the_flip_x():
     src = inspect.getsource(F.Front)
     # X-CURVES 1006: the arrival goes through _x_route_of, whose non-curve path
-    # is exactly X-K-FLIP's _x_for_flip(k_flip, rid, "route") with the role-split k_flip
+    # is exactly X-K-FLIP's _x_for_flip(k_flip, rid, "route") (27B port: either form of the call site)
     assert 'return self._x_for_flip(k_flip, rid, "route")' in inspect.getsource(F.Front._x_route_of)
-    i = src.index("_x_arrival = Front._x_route_of(\n"
-                  "                self, rid=rid, depth=store_span, k_flip=1 + self._x_riders() if _x_rides else 1)")
+    _forms = ("_x_arrival = Front._x_route_of(\n"
+              "                self, rid=rid, depth=store_span, k_flip=1 + self._x_riders() if _x_rides else 1)",
+              "_x_arrival = Front._x_route_of(self, rid=rid, depth=store_span,\n"
+              "                                           k_flip=1 + self._x_riders())")
+    i = next(src.index(f) for f in _forms if f in src)
     j = src.index("route = serviceable_route(remainder, carrier_est,\n                                  _x_arrival,", i)
     k = src.index("x_route = _x_arrival", j)
     assert i < j < k

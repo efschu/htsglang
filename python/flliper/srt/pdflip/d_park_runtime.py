@@ -10,6 +10,10 @@ replicated state, so every rank moves the same requests at the same point.
 
 Entry points (all no-ops off group D / with nothing parked):
   park_running   -- ``POST /pdflip/park_running`` (front, before D's sleep)
+  park_rids      -- PRIORITY LANES 1008 (L2): ``park_running`` with ``rids`` (+ ``hold="lane"``): only
+                    those running requests leave, no sleep follows, the others keep decoding
+  lane_floor     -- PRIORITY LANES 1008 (L2): ``POST /pdflip/lane_floor`` -- the floor of D's admission;
+                    a fall of the floor re-queues the held lane parks in arrival order
   hold_late_arrival -- H91c3: a hand-off reaching D after the park is held
   hold_parked    -- the sleep leg's dormant point (weight_updater)
   park_tick      -- every pass: a park whose sleep never came re-queues
@@ -32,8 +36,11 @@ import time
 from typing import Optional
 
 from flliper.srt.managers import pdflip_resumable_depth
-from flliper.srt.pdflip import d_park_draft, d_park_read, d_seats, park_hold_yield, park_retract_laps
+from flliper.srt.pdflip import d_lane, d_park_draft, d_park_read, d_seats, park_hold_yield, park_retract_laps, park_retract_split
 from flliper.srt.pdflip import handback_claim as _hb
+from flliper.srt.pdflip import poolleak_instr as _poolleak
+from flliper.srt.pdflip import mamba_arena_displace as _mad_park
+from flliper.srt.pdflip import prio_age as _pa  # PRIO-AS-AGE 1014: the order key and the floor-mode gate
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +60,14 @@ LATE_HOLD_ATTR = "_pdflip_d_park_late_since"
 #: PARK-SETTLE (28.09.): a #1471 post-wake settle request the park folded into
 #: its list; an awake re-queue gives it back to the settle, not to the queue.
 FROM_SETTLE_ATTR = "_pdflip_park_from_settle"
+
+#: CAPPARK-FLIP-HOLD (08.10., NF dauer10081045 epoch 4->5): the epoch of the
+#: flip park ``park_running`` opened (its sleep follows); None = no flip park
+#: open. Closed like the late hold: by the sleep (hold_parked) or by the awake
+#: re-queue (park_tick). While open, the #248h capacity re-queue does not run.
+#: Replicated: set and cleared by the same broadcast RPC / sleep on every rank.
+FLIP_PARK_OPEN_ATTR = "_pdflip_d_flip_park_open"
+_CAPPARK_HOLD_LOGGED_ATTR = "_pdflip_cappark_flip_hold_logged"
 
 
 def rearm_window_draft_cold(sched, reqs) -> int:
@@ -164,6 +179,41 @@ def _log_park_timing(sched, epoch: int, laps: dict, *, total_s: float, coll_s: f
         )
 
 
+def park_answer_stamp(sched, flip_list, *, late_hold: bool) -> float:
+    """FLIPSTALL-1015 (NF h16n 17c2563647, D epoch 90, 06:56:31-06:57:02Z):
+    the awake re-queue clock of a flip park (``d_seats.SINCE_ATTR``, read by
+    ``park_tick`` against ``FLLIPER_PDFLIP_D_PARK_AWAKE_REQUEUE_S`` = 30 s) and
+    the late hold's clock start when the park ANSWERS -- the front can begin
+    the sleep only after it has the answer. Before, both were stamped right
+    after the retraction, ahead of the park's own phases (HY settle, #248
+    PARK-MARK, #59b depths). Under a host swap storm those phases took 31 s
+    (``PDFLIP-FLIPCYCLE stage=park ms=31311 sub=...yield:21732,l3mark:9334``),
+    the stamp was 31 s old when ``park_running`` returned, and the very next
+    pass re-queued the whole park (``PDFLIP-D-PARK requeue (awake)`` 06:57:02,
+    same second as the answer): D admitted pdflip-88-1054 and blocked its
+    scheduler thread 72 s in that request's load-back (``PDFLIP-POST-WAKE-PASS
+    schedule_ms=72024 init_new_ms=66794``) while the front, told the requests
+    were parked, began the D->P flip -- its drain witness got no
+    /get_server_info answer for 12 s: ``PDFLIP STOP W3
+    PdFlipDrainWitnessUnreachable``. The park undid itself; the bound measured
+    the park's own duration, not the front's.
+
+    Replicated: every rank stamps its own monotonic clock at the end of the
+    same park; ``park_tick`` MIN-reduces the verdict over the group as before
+    (weg2xsn296), so no rank decides alone.
+
+    Returns the same moment on the wall clock (``time.time()``; the front runs
+    on the same host): the answer carries it (``answered_at``) and the front
+    starts its own lapse clock for the parked rids there
+    (``phase_policy.park_lapse_stamp``) -- D and front lapse together again."""
+    answered = time.monotonic()
+    answered_wall = time.time()
+    for req in flip_list:
+        setattr(req, d_seats.SINCE_ATTR, answered)
+    setattr(sched, LATE_HOLD_ATTR, answered if late_hold else None)
+    return float(answered_wall)
+
+
 def park_running(sched, recv_req, *, late_hold_armed: bool = False):
     """Retract every running D request RETAINING its span (KV, the node's
     GDN/Mamba anchor, the draft rows) with a forced host write-through -- the
@@ -189,6 +239,12 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
     reason = str(getattr(recv_req, "reason", "") or "")
     if str(getattr(recv_req, "youngest", "") or ""):
         return park_youngest(sched, recv_req)
+    # PRIORITY LANES 1008 (L2): ``rids`` / ``hold`` name a LANE park (only those requests, no sleep
+    # follows); an empty body of both is the flip park below, untouched.
+    lane_rids = [str(r) for r in (getattr(recv_req, "rids", None) or []) if str(r)]
+    lane_hold = str(getattr(recv_req, "hold", "") or "")
+    if lane_rids or lane_hold:
+        return park_rids(sched, recv_req, rids=lane_rids, hold=lane_hold)
     if not d_seats.d_flip_park_active():
         return PdFlipParkRunningReqOutput(
             success=False, parked=[], epoch=epoch,
@@ -198,7 +254,7 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
     parked = parked_list(sched)
     if getattr(sched, "pdflip_dormant", False):
         return PdFlipParkRunningReqOutput(
-            success=True, parked=[str(r.rid) for r in parked], epoch=epoch,
+            success=True, parked=[str(r.rid) for r in parked if not d_lane.lane_held(r)], epoch=epoch,
             message="group D is dormant: nothing runs, the listed requests were parked earlier",
         )
     if getattr(sched, "anchor_tails", None):
@@ -216,9 +272,22 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
         laps[name] = laps.get(name, 0.0) + (t - t_lap)
         t_lap = t
 
+    # FLIPCYCLE H3 (02.10.): the park's own phases on the scheduler thread
+    # (y6z dispatch_ms 142-591, ~110 ms per parked request; floor ~30 ms: the
+    # END-state D2H of ~65 MB per request). One line per park, TP0 reads it.
+    _pt = [time.perf_counter()]
+    _pk: list = []
+
+    def _ph(name):
+        now = time.perf_counter()
+        _pk.append((name, (now - _pt[0]) * 1000.0))
+        _pt[0] = now
+
+    _t_park0 = _pt[0]
     if sched.enable_overlap and sched.last_batch and sched.result_queue:
         tmp_batch, tmp_result = sched.result_queue.popleft()
         sched.process_batch_result(tmp_batch, tmp_result)
+    _ph("result")
     last = sched.last_batch
     if last and last.forward_mode.is_extend():
         last.filter_batch(chunked_req_to_exclude=[])
@@ -235,12 +304,18 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
     _lap("land")
     for req in running:
         setattr(req, FORCE_HOST_WRITE_THROUGH_ATTR, True)
+        # PARK-END-ANCHOR-FIRST: the retraction's insert marks the node it ends
+        # at (the park's resume anchor); its chain outranks anchors without
+        # park reference at the sleep's mamba arena claims
+        setattr(req, _mad_park.PARK_REQ_ATTR, True)
         # PARK-RETAIN READ: the retraction's insert stamps what it retains;
         # a stamp left from an earlier insert must not stand in for it.
         setattr(req, d_park_read.RETAINED_ATTR, None)
     # H91d: the draft rows have no host twin (tier off) -- copy them off
     # BEFORE the retraction hands the slots to the tree (d_park_draft).
+    _ph("filter")
     d_park_draft.save_parked(sched, running, site=d_seats.SITE_FLIP)
+    _ph("draft")
     # 27B PARK: a DFlash window pool carries nothing; the resume is a fresh
     # hand-off's admission (rearm_window_draft_cold). MTP pools: no-op.
     rearmed = rearm_window_draft_cold(sched, running)
@@ -249,18 +324,29 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
     _park_end(sched, running)
     _lap("draft")
     host_before = _host_free_slots(sched)
+    _ph("end")
     park_hold_yield.begin(getattr(sched, "tree_cache", None))
-    # FLIP-EDGE 2: the retract lap's own contiguous sub-laps (park_retract_laps)
+    # POOLLEAK-INSTR (1): holdings + ledger before the retraction (log only)
+    _pl_before = _poolleak.park_snapshot(sched, running, phase="before-retract", epoch=epoch)
+    # FLIP-EDGE 2: the retract lap's own contiguous sub-laps (park_retract_laps);
+    # PARK-RETRACT-SPLIT: the retract phase split per request (release /
+    # write-through backup / controller write / rest), one line per park
     park_retract_laps.arm()
     try:
         retracted = (
-            sched.running_batch.retract_all(sched.server_args, offload_kv=False, retain=True)
+            park_retract_split.run_split(
+                getattr(sched, "tree_cache", None),
+                lambda: sched.running_batch.retract_all(sched.server_args, offload_kv=False, retain=True),
+                epoch,
+            )
             if running else []
         )
     finally:
         retract_sub = park_retract_laps.disarm()
     host_after = _host_free_slots(sched)
     _lap("retract")
+    _ph("retract")
+    _poolleak.park_snapshot(sched, running, phase="after-retract", epoch=epoch)  # (1)
     sched.running_batch.batch_is_full = False
     sched.chunked_req = None
     now = time.monotonic()
@@ -301,13 +387,18 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
     settle = list(getattr(sched, "pdflip_post_wake_settle", None) or [])
     if settle:
         sched.pdflip_post_wake_settle = []
+        from flliper.srt.pdflip import settle_writer as _sw_sc
+
         for req in settle:
             setattr(req, FROM_SETTLE_ATTR, True)
+            _sw_sc.note_fold(req)  # SC (#1210): the settle clock runs over the next wake
     sched.pdflip_d_parked = d_seats.order_waiting(list(parked) + list(retracted) + settle + queued)
+    _ph("mark")
     # HY: a retained span whose backup the full arena refused takes the
     # L3-copied pages of a held (not running) request -- one group vote, then
     # the give-back and the backup again on every rank, or nothing moves
     park_hold_yield.settle(sched, retracted=retracted, parked=sched.pdflip_d_parked)
+    _ph("yield")
     # #248: every parked request is kept by ORDER over the flip -- the
     # sleep's reset gives its references back, the hold reads it at the wake
     _lap("order")
@@ -325,15 +416,17 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
     # whole park, D decoded the parked requests again while the front, told
     # they were parked, flipped (quiesce never idle -> W3). Rank-local
     # monotonic, like every stamp here; park_tick MIN-reduces the verdict.
-    for req in sched.pdflip_d_parked:
-        setattr(req, d_seats.SINCE_ATTR, now)
+    # PRIORITY LANES 1008 (L2): a lane hold keeps its own stamp and is no part of this flip park's answer
+    _flip_list = [r for r in sched.pdflip_d_parked if not d_lane.lane_held(r)]
     sched._pdflip_d_park_slept = False
     # PARK-SETTLE: the settle is in the park list now (above), so nothing
     # releases into the queue behind the park's back -- the late hold holds.
+    # FLIPSTALL-1015: the clock of both (SINCE, LATE_HOLD) is stamped where
+    # the park ANSWERS (park_answer_stamp, below), not here.
     late_hold = bool(late_hold_armed)
-    setattr(sched, LATE_HOLD_ATTR, now if late_hold else None)
-    rids = [str(r.rid) for r in sched.pdflip_d_parked if d_seats.park_site(r) is not None]
-    held = [str(r.rid) for r in sched.pdflip_d_parked if d_seats.park_site(r) is None]
+    setattr(sched, FLIP_PARK_OPEN_ATTR, epoch)  # CAPPARK-FLIP-HOLD: until the sleep / awake re-queue
+    rids = [str(r.rid) for r in _flip_list if d_seats.park_site(r) is not None]
+    held = [str(r.rid) for r in _flip_list if d_seats.park_site(r) is None]
     # #59b: the depth each parked request resumes from, after the retraction
     # above retained its span (every rank parks the same list).
     _lap("order")
@@ -347,13 +440,15 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
         finally:
             coll_s[0] += _park_clock() - c0
 
+    _ph("l3mark")
     resumable = pdflip_resumable_depth.park_depths(
         getattr(sched, "tree_cache", None),
-        [r for r in sched.pdflip_d_parked if d_seats.park_site(r) is not None],
+        [r for r in _flip_list if d_seats.park_site(r) is not None],
         getattr(sched, "ps", None),
         reduce_min=_timed_tp_min,
     )
     _lap("depth")
+    _ph("depth")
     # PARK-READ = RESUMABLE: the read of a request this park retracted ends at
     # the depth it resumes from, not at the tombstoned KV above the anchor
     # (d_park_read.clamp_to_resumable). Group-uniform: #59b's depths are.
@@ -365,13 +460,21 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
                 req, resumable.get(str(req.rid)), is_bigram=bigram
             ) is not None:
                 logger.info("PDFLIP-D-PARK READ=RESUMABLE rid=%s cap %s -> %s",
-                            str(req.rid)[:12], before, d_park_read.describe(req))
+                            str(req.rid), before, d_park_read.describe(req))
+    _ph("clamp")
+    # POOLLEAK-INSTR (2): the idle equation after the park, a line, never a raise
+    _poolleak.ledger_line(sched, epoch=epoch, before=_pl_before)
+    answered_at = park_answer_stamp(sched, _flip_list, late_hold=late_hold)
+    logger.info("PDFLIP-FLIPCYCLE stage=park epoch=%d n=%d ms=%.0f floor_ms=%d sub=%s (H3: the park's "
+                "phases on the scheduler thread; floor = the END-state D2H)", epoch, len(retracted),
+                (time.perf_counter() - _t_park0) * 1000.0, 30 * max(1, len(retracted)) // 3 or 10,
+                ",".join("%s:%.0f" % kv for kv in _pk))
     logger.info(
         "PDFLIP-D-PARK park_running epoch=%d reason=%s: %d running retracted (span retained, "
         "forced host write-through), parked=%s queued-behind=%s settle-folded=%s late_hold=%s -- "
         "the sleep holds them first, the wake resumes oldest first%s",
-        epoch, reason, len(retracted), [r[:12] for r in rids], [r[:12] for r in held],
-        [str(r.rid)[:12] for r in settle], late_hold,
+        epoch, reason, len(retracted), list(rids), list(held),
+        [str(r.rid) for r in settle], late_hold,
         (" (DFlash window draft: %d resume(s) re-armed like a fresh hand-off)" % rearmed
          if rearmed else ""),
     )
@@ -384,8 +487,438 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
     return PdFlipParkRunningReqOutput(
         success=True, parked=rids, held=held, epoch=epoch, late_hold=late_hold,
         message="parked %d, queued behind them %d" % (len(rids), len(held)),
-        pdflip_resumable_depth=resumable,
+        pdflip_resumable_depth=resumable, answered_at=answered_at,
     )
+
+
+def _land_inflight(sched, keep_chunked=None) -> None:
+    """The in-flight batch lands first (park_running's shape): its result is processed, an extend batch
+    joins the running batch. This landing IS the chunk boundary of a chunked prefill: the launched chunk is
+    over, ``inflight_middle_chunks`` is back to 0, nothing is running on the request's rows.
+
+    LANES FIX 1 (metal jjbbrx probe 3): ``keep_chunked`` = the chunked request that is NOT being parked. It
+    stays the chunked request, so it is excluded from the merge exactly as ``get_next_batch_to_run`` excludes it
+    (``chunked_req_to_exclude.add(self.chunked_req)``); merged with a prefill that is not finished it would
+    decode from an incomplete prompt. ``None`` (the flip park's and upstream ``pause_generation``'s shape) merges
+    everything: the chunked request is then a member of the running batch and the caller retracts it."""
+    if sched.enable_overlap and sched.last_batch and sched.result_queue:
+        tmp_batch, tmp_result = sched.result_queue.popleft()
+        sched.process_batch_result(tmp_batch, tmp_result)
+    last = sched.last_batch
+    if last and last.forward_mode.is_extend():
+        last.filter_batch(chunked_req_to_exclude=[keep_chunked] if keep_chunked is not None else [])
+        if not last.is_empty():
+            if sched.running_batch.is_empty():
+                sched.running_batch = last
+            else:
+                sched.running_batch.merge_batch(last)
+    sched.last_batch = None
+
+
+def _unmerge_chunk(sched, chunk) -> None:
+    """LANES FIX 1b (review round 1): ``park_rids`` of the chunked request merged it into the running batch
+    (``_land_inflight(keep_chunked=None)``). Every return BEFORE the retract must undo that merge: the unfinished
+    prefill would otherwise decode in ``running_batch`` while ``sched.chunked_req`` keeps chunking it (double
+    membership). Taking it out again restores exactly what ``get_next_batch_to_run`` would have made of the
+    landing (the chunked request is excluded from the merge). No-op when it is not in the batch."""
+    rb = sched.running_batch
+    if chunk is None or rb.is_empty() or not any(r is chunk for r in rb.reqs):
+        return
+    rb.filter_batch(chunked_req_to_exclude=[chunk])
+
+
+def _retract_subset(sched, reqs, sel) -> list:
+    """Retract exactly ``reqs[i] for i in sel`` RETAINING their spans (``release_req(retain=True)`` per request,
+    then one ``filter_batch(keep_indices=...)`` -- the shape of ``retract_decode`` and of SA (3)'s
+    ``_displace_at``). The requests not selected stay in the running batch and keep decoding."""
+    batch = sched.running_batch
+    chosen = set(sel)
+    for k, idx in enumerate(sel):
+        batch.release_req(idx, len(sel) - k, sched.server_args, retain=True)
+    batch.filter_batch(keep_indices=[i for i in range(len(reqs)) if i not in chosen])
+    return [reqs[i] for i in sel]
+
+
+def _release_outside_chunk(sched, req):
+    """LANES FIX 1: retract a chunked prefill request that is NOT a member of any batch (the pass after its last
+    chunk ran a decode batch, so ``last_batch`` carried no extend batch to merge it from): the rows go back to the
+    tree with ``is_insert=True`` (``release_req(retain=True)``, the same call the batch retract makes) and the
+    request is reset for the retract. Its previous chunk was stashed at the head of that pass
+    (``get_next_batch_to_run``). Returns the request."""
+    from flliper.srt.managers.schedule_batch import release_req as _release_req
+
+    _release_req(
+        req=req, remaing_req_count=1, server_args=sched.server_args,
+        req_to_token_pool=sched.req_to_token_pool,
+        token_to_kv_pool_allocator=sched.token_to_kv_pool_allocator,
+        tree_cache=sched.tree_cache, hisparse_coordinator=getattr(sched, "hisparse_coordinator", None),
+        retain=True,
+    )
+    return req
+
+
+def park_rids(sched, recv_req, *, rids, hold: str = ""):
+    """PRIORITY LANES 1008 (L2), plan section 2 "D (Decode)": ``park_running`` with ``rids`` -- retract ONLY
+    these running requests, RETAINING their span (KV, the node's GDN/Mamba anchor, the draft rows) with a forced
+    host write-through, exactly as the flip park does for all of them; NO sleep follows and NOTHING else is
+    touched: the other running requests decode on, the queue stays as it is, no late hold and no flip-park
+    window is opened (``LATE_HOLD_ATTR`` / ``FLIP_PARK_OPEN_ATTR`` stay as they were).
+
+    ``hold="lane"`` marks every parked request with :data:`d_lane.LANE_HOLD_ATTR`: it takes part in neither
+    the 30-s awake re-queue nor the #248h capacity re-queue nor the sleep's dormant hold, and is not
+    preferred by ``order_waiting``, until ``lane_floor`` re-queues it (floor <= its lane). Without ``hold``
+    the parked requests are an ordinary flip-site park (the 30-s re-queue brings them back). The park site
+    is ``flip``: on the re-queue the request resumes first, oldest first, as soon as it fits.
+
+    A CHUNKED PREFILL on D (plan section 0/1: "Prefill wird an der CHUNK-GRENZE geparkt"): the RPC runs on the
+    scheduler thread between two passes, so no chunk of it is launched; the in-flight one lands first
+    (:func:`_land_inflight`) -- that landing is the chunk boundary. The request is then retracted like a decode
+    seat, its span of finished chunks retained (page-aligned, ``PDFLIP-D-PARK RETAINED retained=N of M``; the rest
+    is computed at the resume) and -- the part the first Lane park missed -- ``sched.chunked_req`` is released
+    with it (``None``: the next ``get_next_batch_to_run`` reads ``chunked_req.extend_range``, which the retract
+    reset). A chunked request of ANOTHER lane stays the chunked request and is kept out of the merge.
+
+    Answered like the flip park (``parked`` = the rids that left the batch, ``held`` = requested rids that
+    only wait on D and are kept back by the floor alone) plus ``lane=True`` and ``lane_skipped`` (requested
+    rid -> why it was not parked). Refused (nothing parked) when the switch ``FLLIPER_PDFLIP_LANES`` is off, off
+    group D, ``hold`` is unknown or given without ``rids``, anchor tails are present, or -- under
+    speculative decoding, where only the BACK of the batch may leave -- the rids are not the batch's tail."""
+    from flliper.srt.managers.io_struct import PdFlipParkRunningReqOutput
+    from flliper.srt.mem_cache.base_prefix_cache import FORCE_HOST_WRITE_THROUGH_ATTR
+    from flliper.srt.pdflip import lanes
+
+    epoch = int(getattr(recv_req, "epoch", 0) or 0)
+
+    def _out(ok, parked, msg, held=(), skipped=None, resumable=None):
+        return PdFlipParkRunningReqOutput(
+            success=ok, parked=list(parked), held=list(held), epoch=epoch, message=msg,
+            pdflip_resumable_depth=dict(resumable or {}), lane=True, lane_skipped=dict(skipped or {}),
+        )
+
+    if hold not in ("", d_lane.HOLD_LANE):
+        return _out(False, [], f"W-PARK refused: unknown hold {hold!r} (only 'lane') -- nothing parked")
+    if hold and not rids:
+        return _out(False, [], "W-PARK refused: hold=lane needs rids -- nothing parked")
+    if not _pa.floor_mode():
+        # PRIO-AS-AGE 1014: priority acts as age -- no lane park exists (the floor never rises)
+        return _out(False, [], "W-PARK refused: rids/hold need FLLIPER_PDFLIP_LANES=1 and FLLIPER_PDFLIP_PRIO_AS_AGE=0 "
+                               "on this server (priority acts as age: no lane park) -- nothing parked")
+    if not d_seats.d_flip_park_active():
+        return _out(False, [], "W-PARK refused: not group D (or FLLIPER_PDFLIP_D_PARK=0, or neither the "
+                               "standard form nor FLLIPER_PDFLIP_D_PARK_IMMEDIATE) -- nothing parked")
+    want = [str(r) for r in rids]
+    if getattr(sched, "pdflip_dormant", False):
+        return _out(True, [], "group D is dormant: nothing runs, nothing parked",
+                    skipped={r: "dormant" for r in want})
+    if getattr(sched, "anchor_tails", None):
+        return _out(False, [], "W-PARK refused: anchor tails present (a P-group structure) -- nothing parked")
+    t0 = time.perf_counter()
+    # LANES FIX 4 (minor, NF metal 5 probe 5: LANE-PREEMPT floor=1 902 ms for 3 decodes, the park body 815 ms, no phase in the log): the
+    # phases of this park on the scheduler thread, one line after the park(lane) line (log only; the flip park has the same in
+    # PDFLIP-FLIPCYCLE stage=park sub=)
+    _pt = [t0]
+    _pk: list = []
+
+    def _ph(name):
+        now_ = time.perf_counter()
+        _pk.append((name, (now_ - _pt[0]) * 1000.0))
+        _pt[0] = now_
+
+    wanted = set(want)
+    chunk = getattr(sched, "chunked_req", None)
+    park_chunk = chunk is not None and str(getattr(chunk, "rid", "")) in wanted
+    _land_inflight(sched, keep_chunked=None if (park_chunk or chunk is None) else chunk)
+    _ph("land")
+    if not sched.running_batch.is_empty():
+        sched.running_batch.filter_batch()
+    running_batch = sched.running_batch
+    reqs = list(running_batch.reqs) if not running_batch.is_empty() else []
+    sel = [i for i, r in enumerate(reqs) if str(r.rid) in wanted]
+    running_ids = {str(reqs[i].rid) for i in sel}
+    parked = parked_list(sched)
+    queued_ids = {str(getattr(q, "rid", "")) for q in list(getattr(sched, "waiting_queue", None) or [])
+                  + list(getattr(sched, "pdflip_dormant_hold", None) or [])
+                  + list(getattr(sched, "pdflip_post_wake_settle", None) or [])}
+    chunk_id = str(getattr(chunk, "rid", "")) if chunk is not None else None
+    skipped, held_ids, already = {}, [], []
+    # LANES FIX 2 (metal 180335): a requested rid that only waits in ``waiting_queue`` is taken into the lane hold below
+    # (it used to be named ``held`` and left in the queue: a request the floor keeps out of admission forever, and the
+    # queue is an idle term of D's flush -- the D->P quiesce never saw an idle group).
+    wq_ids = {str(getattr(q, "rid", "")) for q in list(getattr(sched, "waiting_queue", None) or [])}
+    queued_take: list = []
+    outside = None  # the chunked request to park that is in no batch (see _release_outside_chunk)
+    for rid in want:
+        if rid in running_ids:
+            continue
+        if any(str(r.rid) == rid for r in parked):
+            already.append(rid)
+        elif rid in wq_ids and not (chunk is not None and rid == str(getattr(chunk, "rid", ""))):
+            queued_take.append(rid)
+        elif rid in queued_ids:
+            held_ids.append(rid)
+        elif chunk_id is not None and rid == chunk_id:
+            if int(getattr(chunk, "inflight_middle_chunks", 0) or 0) > 0 or getattr(chunk, "req_pool_idx", 0) is None:
+                # a chunk of it still writes its rows (cannot be after the landing) or it holds none yet
+                skipped[rid] = "in a chunked prefill on D with a chunk in flight or no rows yet: asked again"
+            else:
+                outside = chunk
+        else:
+            skipped[rid] = "not running here (finished or not admitted)"
+    if not hold:
+        held_ids.extend(queued_take)  # no lane hold asked: a queued rid stays only queued (named, as before)
+        queued_take = []
+    if hold:
+        # a request the flip park already holds, asked for a lane hold: it waits for its floor from now on
+        for r in parked:
+            if str(r.rid) in already:
+                d_lane.mark_hold(r)
+    spec = not (getattr(running_batch, "spec_algorithm", None) is None
+                or running_batch.spec_algorithm.is_none())
+    if spec and sel and sel != list(range(len(reqs) - len(sel), len(reqs))):
+        # SPEC BACK-ONLY REMOVAL INVARIANT (kv_session_offload.spec_decline_non_back_spill): only the back of
+        # the batch may leave under speculative decoding -- named, nothing parked, the front asks again
+        if park_chunk:
+            _unmerge_chunk(sched, chunk)  # nothing parked: the chunk goes back to being only chunked_req
+        return _out(False, [], "W-PARK refused: the rids are not the back of the batch under speculative "
+                               "decoding -- nothing parked, the front asks again",
+                    held=held_ids, skipped=skipped)
+    if not sel and outside is None:
+        if park_chunk:
+            _unmerge_chunk(sched, chunk)
+        moved_ids = _take_queued(sched, queued_take, held_ids)
+        return _out(True, already + moved_ids,
+                    "nothing to retract: no requested rid is running here" if not moved_ids
+                    else "nothing to retract; %d queued request(s) taken into the lane hold" % len(moved_ids),
+                    held=held_ids, skipped=skipped)
+    sel_reqs = [reqs[i] for i in sel] + ([outside] if outside is not None else [])
+    rest = [r for i, r in enumerate(reqs) if i not in set(sel)]
+    for req in sel_reqs:
+        setattr(req, FORCE_HOST_WRITE_THROUGH_ATTR, True)
+        setattr(req, _mad_park.PARK_REQ_ATTR, True)
+        setattr(req, d_park_read.RETAINED_ATTR, None)
+    _ph("select")
+    d_park_draft.save_parked(sched, sel_reqs, site=d_seats.SITE_FLIP)
+    rearmed = rearm_window_draft_cold(sched, sel_reqs)
+    _ph("draft")
+    _park_end(sched, sel_reqs, also_live=rest)
+    _ph("end")
+    park_hold_yield.begin(getattr(sched, "tree_cache", None))
+    _pl_before = _poolleak.park_snapshot(sched, sel_reqs, phase="before-retract", epoch=epoch)
+    def _retract_all_wanted():
+        out = _retract_subset(sched, reqs, sel) if sel else []
+        if outside is not None:
+            out.append(_release_outside_chunk(sched, outside))
+        return out
+
+    retracted = park_retract_split.run_split(getattr(sched, "tree_cache", None), _retract_all_wanted, epoch)
+    _ph("retract")
+    # LANES FIX 1 (metal jjbbrx probe 3): the chunked request left with the retract -- the scheduler must not
+    # keep pointing at it (the next pass reads ``chunked_req.extend_range.end``, None after the retract: the
+    # AttributeError that killed D). The flip park does the same (``sched.chunked_req = None``).
+    chunk_parked = chunk is not None and any(r is chunk for r in retracted)
+    if chunk_parked:
+        sched.chunked_req = None
+    _poolleak.park_snapshot(sched, sel_reqs, phase="after-retract", epoch=epoch)
+    running_batch.batch_is_full = False
+    now = time.monotonic()
+    for req in retracted:
+        d_seats.mark_parked(req, d_seats.SITE_FLIP, epoch=epoch, now=now)
+        if hold:
+            d_lane.mark_hold(req)
+        sched._969ad_note_retract(req, "pdflip_park_running")
+        _hb.note_origin(req.rid, _hb.ORIGIN_PARK)  # ZR: the resume computes 0 tokens again
+        d_park_read.clear_read_cycle(req)  # a new read cycle (the flip park's rule)
+        if d_park_read.stamp_parked(req) is not None:
+            logger.info("PDFLIP-D-PARK RETAINED rid=%s %s", str(req.rid), d_park_read.describe(req))
+    sched.pdflip_d_parked = list(parked) + d_seats.park_running_order(retracted)
+    park_hold_yield.settle(sched, retracted=retracted, parked=sched.pdflip_d_parked)
+    try:
+        from flliper.srt.pdflip import park_l3
+
+        park_l3.mark_parked(sched, retracted)  # #248: kept by ORDER (a flip may follow before the floor falls)
+    except Exception:  # noqa: BLE001 - the order is an improvement, never a wall
+        logger.warning("#248 PARK-MARK failed", exc_info=True)
+    resumable = pdflip_resumable_depth.park_depths(
+        getattr(sched, "tree_cache", None), list(retracted), getattr(sched, "ps", None))
+    if resumable:
+        bigram = bool(getattr(getattr(sched, "tree_cache", None), "is_eagle", False))
+        for req in retracted:
+            before = d_park_read.read_cap(req)
+            if d_park_read.clamp_to_resumable(
+                req, resumable.get(str(req.rid)), is_bigram=bigram
+            ) is not None:
+                logger.info("PDFLIP-D-PARK READ=RESUMABLE rid=%s cap %s -> %s",
+                            str(req.rid), before, d_park_read.describe(req))
+    _poolleak.ledger_line(sched, epoch=epoch, before=_pl_before)
+    parked_ids = [str(r.rid) for r in retracted]
+    _ph("rest")
+    logger.info(
+        "%s rids=%s ms=%.0f epoch=%d floor=%d hold=%s running_left=%d held=%s skipped=%s chunk_boundary=%d -- "
+        "retracted with the span retained and a forced host write-through, no sleep follows, the others decode "
+        "on (chunk_boundary=1: a chunked prefill was parked at its chunk border and released as the chunked "
+        "request)%s",
+        lanes.MARK_D_PARK_PARK, parked_ids, (time.perf_counter() - t0) * 1000.0, epoch,
+        d_lane.floor_of(sched), hold or "-", len(rest), held_ids, skipped or "-", 1 if chunk_parked else 0,
+        (" (DFlash window draft: %d resume(s) re-armed like a fresh hand-off)" % rearmed if rearmed else ""),
+    )
+    logger.info(
+        "%s n=%d ms=%.0f epoch=%d sub=%s -- the phases of the park(lane) line above on the scheduler thread (land = the in-flight batch "
+        "lands, select, draft = draft rows saved, end = the END state of each request gathered as park tail parts, retract = "
+        "cache_finished_req with the forced write-through (see PDFLIP-PARK-RETRACT-SPLIT), rest = marks, L3 order, resumable depths)",
+        lanes.MARK_D_PARK_PHASES, len(retracted), (time.perf_counter() - t0) * 1000.0, epoch,
+        ",".join("%s:%.0f" % kv for kv in _pk),
+    )
+    moved_ids = _take_queued(sched, queued_take, held_ids)
+    return _out(True, already + parked_ids + moved_ids,
+                "parked %d (lane), %d queued taken into the lane hold, %d only queued, %d skipped"
+                % (len(parked_ids), len(moved_ids), len(held_ids), len(skipped)),
+                held=held_ids, skipped=skipped, resumable=resumable)
+
+
+def lane_floor(sched, recv_req):
+    """PRIORITY LANES 1008 (L2): ``POST /pdflip/lane_floor {floor, epoch}`` (``lanes.RPC_LANE_FLOOR``) on
+    group D -- the floor of D's admission. The scheduler's admission lets in only requests with
+    ``priority >= floor`` (``Scheduler._pdflip_lane_skip``); a request below it waits in the queue (or in its
+    lane hold) and is no victim and no reason for a displacement. Every lane hold whose lane is AT OR ABOVE
+    the new floor is re-queued in ARRIVAL order (oldest first, its age untouched) at the queue head --
+    ``lanes.MARK_D_PARK_REQUEUE`` -- and resumes before anything else.
+
+    Epoch rule: the front counts every floor change (``LaneState.set_floor``); a body with an epoch below the
+    one this scheduler holds -- or the same epoch and another floor -- is STALE and refused (nothing changes);
+    the same epoch and the same floor is a no-op; ``{"floor": 0, "epoch": 0}`` is the front's (re)start and is
+    always taken. Answered with the floor / epoch now in force, the re-queued rids and the number of holds
+    still standing. Off: a refusal naming the switch; off group D: success, nothing applied (P's half is the
+    P side of the plan)."""
+    from flliper.srt.managers.io_struct import PdFlipLaneFloorReqOutput
+    from flliper.srt.pdflip import lanes, progress_beacon
+
+    floor = max(0, int(getattr(recv_req, "floor", 0) or 0))
+    epoch = int(getattr(recv_req, "epoch", 0) or 0)
+
+    def _out(ok, msg, requeued=()):
+        n_held = sum(1 for r in (getattr(sched, "pdflip_d_parked", None) or []) if d_lane.lane_held(r))
+        return PdFlipLaneFloorReqOutput(
+            success=ok, floor=d_lane.floor_of(sched), epoch=d_lane.epoch_of(sched),
+            requeued=list(requeued), held=n_held, message=msg,
+        )
+
+    if not _pa.floor_mode():
+        # PRIO-AS-AGE 1014: priority acts as age -- the lane floor is never applied
+        return _out(False, "W-LANE refused: /pdflip/lane_floor needs FLLIPER_PDFLIP_LANES=1 and FLLIPER_PDFLIP_PRIO_AS_AGE=0 "
+                           "on this server (priority acts as age: no floor)")
+    if str(os.environ.get(d_seats.GROUP_ENV, "")).strip().upper() != "D":
+        return _out(True, "not group D: the floor is not applied here (D's admission only)")
+    cur_f, cur_e = d_lane.floor_of(sched), d_lane.epoch_of(sched)
+    if (floor, epoch) == (cur_f, cur_e):
+        return _out(True, "floor unchanged")
+    reset = floor == 0 and epoch == 0
+    if not reset and (epoch < cur_e or (epoch == cur_e and floor != cur_f)):
+        logger.warning("PDFLIP-D-LANE floor STALE floor=%d epoch=%d (held: floor=%d epoch=%d): refused", floor, epoch,
+                       cur_f, cur_e)
+        return _out(False, f"W-LANE refused: stale epoch {epoch} (held {cur_e}) -- nothing changed")
+    setattr(sched, d_lane.FLOOR_ATTR, floor)
+    setattr(sched, d_lane.EPOCH_ATTR, epoch)
+    progress_beacon.beat_lane(floor, epoch)  # the watchdogs read a hold, not a stall
+    requeued = _lane_requeue(sched, floor, cur_f, epoch)
+    logger.info("%s %d->%d epoch=%d->%d requeued=%d held_left=%d -- D admits lanes >= %d only",
+                d_lane.MARK_D_FLOOR, cur_f, floor, cur_e, epoch, len(requeued),
+                sum(1 for r in (getattr(sched, "pdflip_d_parked", None) or []) if d_lane.lane_held(r)), floor)
+    return _out(True, "floor %d->%d, %d re-queued" % (cur_f, floor, len(requeued)), requeued)
+
+
+def _lane_requeue(sched, floor: int, was: int, epoch: int) -> list:
+    """The lane holds whose lane is at or above ``floor`` leave the hold: re-queued at the queue head in
+    ARRIVAL order (``d_seats.park_running_order``: the front arrival / ``kv_arrival_seq`` the request has
+    always carried -- the hold changed neither), the hold cleared. Returns their rids, oldest first."""
+    from flliper.srt.pdflip import lanes
+
+    parked = getattr(sched, "pdflip_d_parked", None) or []
+    out = [r for r in parked if d_lane.lane_held(r) and d_lane.lane_of_req(r) >= floor]
+    if not out:
+        return []
+    ids = {id(r) for r in out}
+    sched.pdflip_d_parked = [r for r in parked if id(r) not in ids]
+    ordered = d_seats.park_running_order(out)
+    for req in ordered:
+        d_lane.clear_hold(req)
+        sched._add_request_to_queue(req, is_retracted=True)
+    _to_queue_head(sched, ordered)
+    logger.info("%s n=%d rids=%s floor=%d->%d epoch=%d -- the held lane parks of lanes >= %d resume first, "
+                "oldest first (arrival order, their age kept)", lanes.MARK_D_PARK_REQUEUE, len(ordered),
+                [str(r.rid) for r in ordered], was, floor, epoch, floor)
+    return [str(r.rid) for r in ordered]
+
+
+def _take_queued(sched, queued_take, held_ids) -> list:
+    """The lane park's queued rids (:func:`hold_queued` with ``rids``): the ids moved into the hold; a named rid that D's
+    OWN floor does not hold (the floor RPC and the park RPC travel side by side, the park may be served first) stays
+    queued and is named ``held`` -- the pass rule takes it as soon as the floor stands."""
+    if not queued_take:
+        return []
+    moved = [str(r.rid) for r in hold_queued(sched, rids=queued_take)]
+    held_ids.extend(r for r in queued_take if r not in moved)
+    return moved
+
+
+def hold_queued(sched, rids=None) -> list:
+    """LANES FIX 2 (metal jjbbrx 18:03:35Z, probe 2b: server stop W3 PdFlipDrainWitnessDisagreement).  A request that is
+    below D's lane floor and only WAITS in ``waiting_queue`` (a hand-off that reached D after its P leg, a late
+    arrival, a request the wake released) is taken out of the queue into the LANE HOLD -- ``pdflip_d_parked`` with
+    :data:`d_lane.LANE_HOLD_ATTR`, the place a retracted lane park already sits in.  One definition of "held" on D.
+
+    Why: the admission skip (``Scheduler._pdflip_lane_skip``) kept such a request in ``waiting_queue`` for as long as the
+    floor stood, and ``Scheduler.is_fully_idle`` counts the queue -- so the D->P flip's quiesce polled ``/flush_cache``
+    -> 400 ``not-idle because: waiting_queue`` for 22 s while the front, which books every lane-held rid out of its
+    flip ledger, saw nothing to wait for (and, with an empty ledger, no flip park to send): ``front ledger []
+    (outstanding ['pdflip-6-18']) vs group(D) flush_cache -> Flush cache failed`` -> W3, the server stopped.  The held
+    request owns no device rows (the admission skip comes before the match); the park list is what the flip park and
+    the sleep already move such a request through (``park_running`` takes ``queued`` into ``pdflip_d_parked``).
+
+    ``rids`` None = the per-pass rule (every queued request of a lane below the floor, floor > 0: called from
+    ``get_next_batch_to_run``); a list = those of the named queued rids that D's floor holds (the front's lane park RPC
+    asked for them).  Never a request of a lane at or above D's floor: the higher lane is not blocked, and a hold that no
+    floor change ends would lose the request.
+    Group D, awake, ``FLLIPER_PDFLIP_LANES=1`` only (else ``[]``).  Replicated: the queue, the floor and the switch are
+    group-uniform, so every rank moves the same requests at the same pass.  Returns the requests moved, oldest first.
+    The hold ends where every lane hold ends: ``lane_floor`` re-queues it at the queue head when the floor falls to
+    its lane (the re-intake prefetches it from the store like any retracted park)."""
+    from flliper.srt.pdflip import lanes
+
+    if not _pa.floor_mode() or not d_seats.d_flip_park_active() or getattr(sched, "pdflip_dormant", False):
+        return []  # PRIO-AS-AGE 1014: no lane hold while priority acts as age
+    queue = list(getattr(sched, "waiting_queue", None) or [])
+    if not queue:
+        return []
+    if rids is None:
+        floor = d_lane.floor_of(sched)
+        if floor <= 0:
+            return []
+        take = [q for q in queue if d_lane.lane_of_req(q) < floor]
+    else:
+        # named by the front's lane park RPC: only what D's own floor holds -- a request its admission would let in must
+        # never enter a hold nothing ends (the hold ends on a floor CHANGE: ``lane_floor``); the floor RPC and the park RPC
+        # travel side by side, so a park served first leaves the request queued and the pass rule takes it with the floor
+        want = {str(r) for r in rids}
+        take = [q for q in queue if str(getattr(q, "rid", "")) in want and d_lane.below_floor(sched, q)]
+    if not take:
+        return []
+    ids = {id(q) for q in take}
+    sched.waiting_queue = [q for q in queue if id(q) not in ids]
+    ordered = d_seats.park_running_order(take)
+    for req in ordered:
+        d_lane.mark_hold(req)
+    sched.pdflip_d_parked = list(parked_list(sched)) + ordered
+    try:
+        from flliper.srt.pdflip import park_l3
+
+        park_l3.mark_parked(sched, ordered)  # #248: kept by ORDER over a flip that may follow before the floor falls
+    except Exception:  # noqa: BLE001 - the order is an improvement, never a wall
+        logger.warning("#248 PARK-MARK failed", exc_info=True)
+    logger.info("%s n=%d rids=%s floor=%d via=%s -- requests below D's floor that only waited in the queue are in "
+                "the lane hold now (not an idle blocker any more; they leave it when the floor falls to their lane)",
+                d_lane.MARK_D_HOLD_QUEUED, len(ordered), [str(r.rid) for r in ordered], d_lane.floor_of(sched),
+                "rpc" if rids is not None else "pass")
+    return ordered
 
 
 def hold_late_arrival(sched, req) -> bool:
@@ -405,11 +938,11 @@ def hold_late_arrival(sched, req) -> bool:
     parked.append(req)
     logger.info("PDFLIP-D-PARK late-hold rid=%s: arrived after park_running (a hand-off in flight "
                 "at the park), held behind the park (%d in the park list) -- the front counts it "
-                "parked", str(req.rid)[:12], len(parked))
+                "parked", str(req.rid), len(parked))
     return True
 
 
-def _park_end(sched, running, *, reduce_min=None) -> int:
+def _park_end(sched, running, *, reduce_min=None, also_live=()) -> int:
     """F4 (#259 4c, FLLIPER_PDFLIP_ENABLE_D_PARK_END): every rank writes its
     part of each running request's END state (pdflip/tail_handoff
     ``publish_park_end``) -- the resume adopts it as E2's skip instead of
@@ -424,10 +957,13 @@ def _park_end(sched, running, *, reduce_min=None) -> int:
     tp_rank = int(getattr(ps, "tp_rank", getattr(sched, "tp_rank", 0)) or 0)
     tp_size = int(getattr(ps, "tp_size", getattr(sched, "tp_size", 1)) or 1)
     # leak (29.09.): the parts of rids D no longer holds leave before new ones come
-    n_reaped, reaped = th.reap_orphan_parks(_live_rids(sched, running), f"{th.PARK_PART}{tp_rank}")
+    live = _live_rids(sched, running)
+    # PRIORITY LANES 1008 (L2): a lane park leaves the other requests of the batch running; they are live
+    live.update(str(getattr(r, "rid", "")) for r in also_live)
+    n_reaped, reaped = th.reap_orphan_parks(live, f"{th.PARK_PART}{tp_rank}")
     if n_reaped:
         logger.info("F4 PARK-REAP files=%d rids=%s (parts of rids D no longer holds)",
-                    n_reaped, [r[:12] for r in reaped])
+                    n_reaped, list(reaped))
     if not running:
         return 0
     part = f"{th.PARK_PART}{tp_rank}-{os.getpid()}"
@@ -449,7 +985,7 @@ def _park_end(sched, running, *, reduce_min=None) -> int:
             part, tp_size, 2 * interval, anchor=anchor, max_rows=max_rows,
         )
         if refusal:
-            why[str(req.rid)[:12]] = refusal
+            why[str(req.rid)] = refusal
         else:
             events.append(ev)
     sync_ms = th.park_end_barrier(events) if events else 0.0
@@ -551,7 +1087,11 @@ def hold_parked(sched, *, hold_armed: bool) -> int:
     so it runs during the flip. Hold not armed: they stay parked and the first
     awake pass re-queues them."""
     setattr(sched, LATE_HOLD_ATTR, None)  # H91c3-2: the sleep closes the late hold
-    parked = list(getattr(sched, "pdflip_d_parked", None) or [])
+    setattr(sched, FLIP_PARK_OPEN_ATTR, None)  # CAPPARK-FLIP-HOLD: ... and the flip park
+    all_parked = list(getattr(sched, "pdflip_d_parked", None) or [])
+    # PRIORITY LANES 1008 (L2): a lane hold waits for its floor, not for the wake -- it stays in the list
+    lane_kept = [r for r in all_parked if d_lane.lane_held(r)]
+    parked = [r for r in all_parked if not d_lane.lane_held(r)] if lane_kept else all_parked
     if not parked:
         return 0
     if not hold_armed:
@@ -570,7 +1110,7 @@ def hold_parked(sched, *, hold_armed: bool) -> int:
     # W50 holds of that boot were re-queued at once, the second one of a phase
     # (pdflip-62-182) held.
     sched._pdflip_d_park_slept = False
-    sched.pdflip_d_parked = []
+    sched.pdflip_d_parked = lane_kept
     for req in parked:
         # PARK-SETTLE: held over the sleep, a folded settle request is hold work
         # like the rest -- the wake's #1471 verdict reads it again.
@@ -584,7 +1124,7 @@ def hold_parked(sched, *, hold_armed: bool) -> int:
     hold[:] = d_seats.order_waiting(moved) + [h for h in hold if id(h) not in ids]
     logger.info("PDFLIP-D-PARK hold: %d parked request(s) at the head of the dormant hold %s "
                 "(prefetch issued during the flip; the wake releases them first)",
-                len(moved), [str(r.rid)[:12] for r in moved])
+                len(moved), [str(r.rid) for r in moved])
     return len(moved)
 
 
@@ -605,6 +1145,13 @@ def park_tick(sched) -> int:
     parked = getattr(sched, "pdflip_d_parked", None)
     if not parked or getattr(sched, "pdflip_dormant", False):
         return 0
+    # PRIORITY LANES 1008 (L2): a lane hold takes part in neither the awake re-queue (30 s) nor the #248h
+    # capacity re-queue -- it leaves the hold when the floor falls to its lane (``lane_floor``)
+    lane_kept = [r for r in parked if d_lane.lane_held(r)]
+    if lane_kept:
+        parked = [r for r in parked if not d_lane.lane_held(r)]
+        if not parked:
+            return 0
     due = bool(getattr(sched, "_pdflip_d_park_slept", False))
     if not due:
         local = d_seats.awake_requeue_due(
@@ -612,11 +1159,14 @@ def park_tick(sched) -> int:
         )
         due = bool(sched._pdflip_group_min_flags([local])[0])
     if not due:
-        return _capacity_requeue(sched, parked)
+        if _flip_park_holds_capacity(sched, parked):
+            return 0
+        return _capacity_requeue(sched, parked, lane_kept)
     moved = list(parked)
-    sched.pdflip_d_parked = []
+    sched.pdflip_d_parked = lane_kept
     sched._pdflip_d_park_slept = False
     setattr(sched, LATE_HOLD_ATTR, None)  # H91c3-2: the re-queue closes the late hold
+    setattr(sched, FLIP_PARK_OPEN_ATTR, None)  # CAPPARK-FLIP-HOLD: ... and the flip park
     # PARK-SETTLE: a folded settle request goes back to the settle (its read is
     # still short; the queue would hand it to the X gate unsettled).
     back = [r for r in moved if getattr(r, FROM_SETTLE_ATTR, False)]
@@ -634,13 +1184,38 @@ def park_tick(sched) -> int:
         sched._add_request_to_queue(req, is_retracted=True)
     mine = _to_queue_head(sched, moved)
     logger.info("PDFLIP-D-PARK requeue (awake): %d parked request(s) at the queue head %s%s",
-                len(mine), [str(r.rid)[:12] for r in mine],
-                (", %d back to the #1471 settle %s" % (len(back), [str(r.rid)[:12] for r in back]))
+                len(mine), [str(r.rid) for r in mine],
+                (", %d back to the #1471 settle %s" % (len(back), [str(r.rid) for r in back]))
                 if back else "")
     return len(mine) + len(back)
 
 
-def _capacity_requeue(sched, parked) -> int:
+def _flip_park_holds_capacity(sched, parked) -> bool:
+    """CAPPARK-FLIP-HOLD (08.10., NF dauer10081045, D->P flip epoch 4->5): a
+    flip park is open -- the #248h capacity re-queue waits for the wake's hold
+    read (or the awake re-queue). Before, park_tick re-queued the capacity-
+    parked requests the park had just folded in (pdflip-0-9/-0-10/-0-12, #248h
+    requeue 10:53:17); D ran them to their end and the front's D->P quiesce,
+    told they were parked, waited 28180 ms. ``FLLIPER_PDFLIP_ENABLE_CAPPARK_FLIP_HOLD=0``
+    = the old re-queue inside the park. Replicated verdict (the attribute and
+    the switch are the same on every rank), no collective."""
+    from flliper.srt.environ import envs
+
+    epoch = getattr(sched, FLIP_PARK_OPEN_ATTR, None)
+    if epoch is None or not envs.FLLIPER_PDFLIP_ENABLE_CAPPARK_FLIP_HOLD.get():
+        return False
+    from flliper.srt.pdflip import resume_via_p as _rvp
+
+    held = [str(r.rid) for r in parked if getattr(r, _rvp.CAPPARK_AT_ATTR, None) is not None]
+    if held and getattr(sched, _CAPPARK_HOLD_LOGGED_ATTR, None) != epoch:
+        setattr(sched, _CAPPARK_HOLD_LOGGED_ATTR, epoch)
+        logger.info("#248h CAPPARK-FLIP-HOLD epoch=%s n=%d rids=%s -- a flip park is open: the capacity "
+                    "re-read waits for the wake's hold read / the awake re-queue, nothing of the park runs "
+                    "on D during the flip (FLLIPER_PDFLIP_ENABLE_CAPPARK_FLIP_HOLD)", epoch, len(held), held)
+    return True
+
+
+def _capacity_requeue(sched, parked, lane_kept=()) -> int:
     """#248h: the capacity-parked requests (``resume_via_p.park_for_capacity``)
     re-join the queue head as soon as the arena holds their re-read -- the
     other parked requests keep waiting for their P leg / the awake bound.
@@ -655,13 +1230,13 @@ def _capacity_requeue(sched, parked) -> int:
     if not moved:
         return 0
     ids = {id(r) for r in moved}
-    sched.pdflip_d_parked = [r for r in parked if id(r) not in ids]
+    sched.pdflip_d_parked = [r for r in parked if id(r) not in ids] + list(lane_kept)
     for req in moved:
         setattr(req, _rvp.CAPPARK_AT_ATTR, None)  # a re-park stamps it again
         sched._add_request_to_queue(req, is_retracted=True)
     mine = _to_queue_head(sched, moved)
     logger.info("#248h PDFLIP-D-PARK requeue (capacity): %d parked request(s) at the queue head %s -- "
-                "the arena holds their re-read now", len(mine), [str(r.rid)[:12] for r in mine])
+                "the arena holds their re-read now", len(mine), [str(r.rid) for r in mine])
     return len(mine)
 
 
@@ -684,7 +1259,7 @@ def note_retracted(sched, retracted_reqs) -> int:
     mine = _to_queue_head(sched, retracted_reqs)
     logger.info("PDFLIP-D-PARK pressure: %d youngest request(s) parked %s (span retained; "
                 "resume when no older request is live)",
-                len(mine), [str(r.rid)[:12] for r in mine])
+                len(mine), [str(r.rid) for r in mine])
     return len(mine)
 
 
@@ -715,17 +1290,20 @@ def _apply_park_defer(sched) -> int:
             # SA: each deferred request goes before the first waiting request
             # YOUNGER than it (the rest keeps the group's order) -- it moves in
             # as soon as the older ones leave, never behind younger arrivals.
-            for r in _sa.by_age(mine):
-                a = _sa.rid_age(r.rid)
+            # PRIO-AS-AGE 1014: "younger" / "oldest first" by the order key (priority desc, age asc)
+            def _ok(q):
+                return _sa.order_key(getattr(q, "rid", ""), _pa.lane_of_req(q))
+            for r in sorted(mine, key=_ok):
+                a = _ok(r)
                 k = next((i for i, q in enumerate(rest) if d_seats.park_site(q) is None
-                          and _sa.rid_age(getattr(q, "rid", "")) > a), len(rest))
+                          and _ok(q) > a), len(rest))
                 rest.insert(k, r)
             sched.waiting_queue = rest
         else:
             sched.waiting_queue = rest + mine
         logger.info("PDFLIP-D-PARK seat-rotate: %d parked request(s) deferred this phase %s "
                     "(not resumed first; ordinary waiting work behind the hand-offs)",
-                    len(moved), [str(r.rid)[:12] for r in moved])
+                    len(moved), [str(r.rid) for r in moved])
     return len(moved)
 
 
@@ -790,6 +1368,7 @@ def _lift_holds_when_idle(sched) -> None:
         return
     no_token_rid = getattr(sched, "_pdflip_sa_no_token", None)
     sched._pdflip_sa_no_token = None
+    setattr(sched, NO_TOKEN_VIEW_ATTR, None)
     if not getattr(sched, "_pdflip_sa_idle_armed", False):
         # the refusal read here may stem from a pass in which something still
         # ran: only a refusal from an idle pass counts (replicated: the
@@ -804,8 +1383,59 @@ def _lift_holds_when_idle(sched) -> None:
     released = _release_holds(sched)
     logger.warning("Q-698 SEAT-AGE HOLD-LIFT older=%s released=%s: refused NO_TOKEN with nothing "
                    "running on D -- no running request releases KV for it; its victims resume, "
-                   "it waits for their KV", sorted(r[:16] for r in held),
-                   [r[:16] for r in released])
+                   "it waits for their KV", sorted(held),
+                   [r for r in released])
+
+
+def _lanes_on() -> bool:
+    """The lane FLOOR rules of 1008 on D (victim pools by lane, the floor's admission filter, the park refusal
+    above the floor). PRIO-AS-AGE 1014 (default on): off -- priority acts as AGE through the order key instead
+    (``seat_age``/``prio_age``)."""
+    return _pa.floor_mode()
+
+
+def _prio_lane_map(*seqs):
+    """PRIO-AS-AGE 1014: rid -> priority of the given request lists (the request's own replicated field)."""
+    m = {}
+    for seq in seqs:
+        for r in seq or ():
+            m[str(getattr(r, "rid", ""))] = _pa.lane_of_req(r)
+    return m
+
+
+def _lane_of_rid(waiting, rid):
+    for q in waiting:
+        if str(getattr(q, "rid", "")) == str(rid):
+            return d_lane.lane_of_req(q)
+    return 0
+
+
+def _lane_pool(sched, reqs, older_rid, waiting, lanes_on):
+    """PRIORITY LANES 1008 (L2): the running requests a displacement for ``older_rid`` may take as victims --
+    never one of a HIGHER lane than the waiter's (plan section 2, D: ``displace_for_age`` and the
+    ARRIVAL-SEAT victim). Off: ``reqs``, the very list."""
+    if not lanes_on:
+        return reqs
+    lane = _lane_of_rid(waiting, older_rid)
+    return [r for r in reqs if d_lane.lane_of_req(r) <= lane]
+
+
+def _displace_candidate(sched, _sa, waiting, reqs, lanes_on):
+    """``(older_waiting, youngest_running)`` of SA (3). Off: ``seat_age.displace_victim`` over the whole queue
+    and batch, as before. On: the oldest waiter (admissible: the caller filtered the floor) that has a victim
+    among the running requests of ITS lane or below."""
+    if not lanes_on:
+        # PRIO-AS-AGE 1014: oldest waiter / youngest runner by the order key -- exactly one victim, the
+        # youngest of the lowest priority, and only for a waiter older by that key
+        _lm = _prio_lane_map(waiting, reqs)
+        return _sa.displace_victim([str(q.rid) for q in waiting], [str(r.rid) for r in reqs], True,
+                                   lane_of=lambda rid: _lm.get(str(rid), 0))
+    for q in sorted(waiting, key=lambda w: _sa.rid_age(str(w.rid))):
+        pool = [str(r.rid) for r in reqs if d_lane.lane_of_req(r) <= d_lane.lane_of_req(q)]
+        cand = _sa.displace_victim([str(q.rid)], pool, True)
+        if cand is not None:
+            return cand
+    return None
 
 
 def displace_for_age(sched, running_batch) -> Optional[str]:
@@ -833,15 +1463,33 @@ def displace_for_age(sched, running_batch) -> Optional[str]:
     # SP (partial park, KV trigger): the rid the adder refused with NO_TOKEN in
     # the LAST pass (Scheduler sets it; consumed here, one pass old).
     no_token_rid = getattr(sched, "_pdflip_sa_no_token", None)
+    # Q-702: the adder's own numbers of that refusal travel with the rid.
+    no_token_view = getattr(sched, NO_TOKEN_VIEW_ATTR, None)
+    if no_token_view is not None and not _view_fresh(sched, no_token_view):
+        n = getattr(sched, "_sa_view_stale_n", 0) + 1
+        sched._sa_view_stale_n = n
+        if n <= 8 or (n & (n - 1)) == 0:
+            logger.info("Q-702 SEAT-AGE VIEW-STALE older=%s age=%d passes max=%d (n=%d): the adder's "
+                        "numbers are older than one pass; the verdict reads the legacy basis",
+                        no_token_view.get("rid"),
+                        int(getattr(sched, SA_PASS_ATTR, 0) or 0) - int(no_token_view.get("pass", 0)),
+                        VIEW_MAX_AGE_PASSES, n)
+        no_token_view = None
     try:
         sched._pdflip_sa_no_token = None
+        setattr(sched, NO_TOKEN_VIEW_ATTR, None)
     except Exception:  # noqa: BLE001
         pass
     waiting = [q for q in sched.waiting_queue if d_seats.park_site(q) != d_seats.SITE_PRESSURE]
+    lanes_on = _lanes_on()
+    if lanes_on:
+        # PRIORITY LANES 1008 (L2): a waiter the floor keeps out cannot be admitted -- no reason to
+        # displace anybody for it
+        waiting = [q for q in waiting if d_lane.admissible_for_displace(sched, q)]
     trigger = "seat"
     pair = None
     if cap and len(reqs) >= int(cap):
-        cand = _sa.displace_victim([str(q.rid) for q in waiting], [str(r.rid) for r in reqs], True)
+        cand = _displace_candidate(sched, _sa, waiting, reqs, lanes_on)
         if cand is not None:
             # NF review of 2d49cd45bf: the seat trigger freed a seat without asking
             # whether the older one then FITS the KV -- a victim for nothing, against the
@@ -849,7 +1497,8 @@ def displace_for_age(sched, running_batch) -> Optional[str]:
             # The KV half is rank-local, so it goes through the group MIN like the KV
             # trigger (the precondition -- full seats, a candidate -- is replicated,
             # so every rank enters the collective).
-            local = kv_displace_would_fit(sched, cand[0], reqs, seat=True)
+            local = kv_displace_would_fit(sched, cand[0], _lane_pool(sched, reqs, cand[0], waiting, lanes_on),
+                                          seat=True, view=no_token_view)
             gm = getattr(sched, "_pdflip_group_min_flags", None)
             agreed = bool(gm([local])[0]) if callable(gm) else bool(local)
             if agreed:
@@ -861,15 +1510,18 @@ def displace_for_age(sched, running_batch) -> Optional[str]:
         # read through the group MIN (_pdflip_group_min_flags), entered by every
         # rank because the precondition is the same on every rank -- so the
         # group displaces only when EVERY rank refused (RAENGE-NIE-UNEINS).
-        cand = _sa.displace_victim([str(q.rid) for q in waiting], [str(r.rid) for r in reqs], True)
+        cand = _displace_candidate(sched, _sa, waiting, reqs, lanes_on)
         if cand is not None:
-            local = no_token_rid is not None and _sa.rid_age(no_token_rid) <= _sa.rid_age(cand[0])
+            _lm = _prio_lane_map(sched.waiting_queue, reqs)  # PRIO-AS-AGE 1014: compared by the order key
+            local = no_token_rid is not None and not _sa.is_older(
+                cand[0], no_token_rid, lane_of=lambda rid: _lm.get(str(rid), 0))
             if local:
                 # user 30.09. (verbatim): "natürlich muss ein jüngerer nur verdrängt werden,
                 # wenn der ältere nicht draufpasst. nicht pauschal den jüngeren verdrängen" --
                 # only when displacing the youngest seats is ENOUGH for the older one (and it
                 # does not already fit); else nobody leaves and the backfill stays.
-                local = kv_displace_would_fit(sched, cand[0], reqs)
+                local = kv_displace_would_fit(sched, cand[0], _lane_pool(sched, reqs, cand[0], waiting, lanes_on),
+                                              view=no_token_view)
             gm = getattr(sched, "_pdflip_group_min_flags", None)
             agreed = bool(gm([local])[0]) if callable(gm) else bool(local)
             if agreed:
@@ -902,7 +1554,7 @@ def displace_for_age(sched, running_batch) -> Optional[str]:
         if n <= 8 or (n & (n - 1)) == 0:
             logger.info("SEAT-AGE DISPLACE-WAIT older=%s youngest=%s (n=%d): under speculative "
                         "decoding only the back of the batch may leave; the youngest is not the back",
-                        older[:16], victim_rid[:16], n)
+                        older, victim_rid, n)
         return None
     victim = _displace_at(sched, running_batch, reqs, idx)
     # Q-698: the victim waits for the older one it was parked for
@@ -920,7 +1572,7 @@ def displace_for_age(sched, running_batch) -> Optional[str]:
     logger.warning("SEAT-AGE DISPLACE rid_out=%s older_waiting=%s trigger=%s running=%d cap=%s "
                    "pages_out=%s: the youngest running request pauses (span retained: its KV leaves "
                    "the device only as far as the older one needs it -- LRU eviction, tail last)",
-                   victim_rid[:16], older[:16], trigger, len(reqs), cap, pages_out)
+                   victim_rid, older, trigger, len(reqs), cap, pages_out)
     return victim_rid
 
 
@@ -988,12 +1640,17 @@ def park_youngest(sched, recv_req):
     if spec and idx != len(reqs) - 1:
         return _out(False, [], f"{rid} is not the back of the batch under speculative decoding: "
                                "refused, the front asks again")
+    if _lanes_on() and d_lane.lane_of_req(reqs[idx]) > d_lane.floor_of(sched):
+        # PRIORITY LANES 1008 (L2): never a victim of a lane above the floor (the active lane is the
+        # highest the front has released; a request above it is a floor still in flight)
+        return _out(False, [], f"{rid} is in lane {d_lane.lane_of_req(reqs[idx])}, above the floor "
+                               f"{d_lane.floor_of(sched)}: refused, nothing parked")
     _displace_at(sched, running_batch, reqs, idx)
     n = getattr(sched, "_pdflip_asr_parked", 0) + 1
     sched._pdflip_asr_parked = n
     logger.warning("PDFLIP ARRIVAL-SEAT YOUNGEST-PARK rid=%s running_before=%d n=%d: the youngest running "
                    "decode pauses at this round boundary (span retained, pressure park); its seat goes "
-                   "to the oldest waiter (user rule #246)", rid[:16], len(reqs), n)
+                   "to the oldest waiter (user rule #246)", rid, len(reqs), n)
     return _out(True, [rid], "parked (arrival-seat youngest)")
 
 
@@ -1013,7 +1670,7 @@ def exclude_displaced(sched, prefetch_verdicts) -> Optional[str]:
     prefetch_verdicts[rid] = False
     logger.info("SEAT-AGE DISPLACED-THIS-PASS rid=%s: requeued after the pass's prefetch "
                 "drain; excluded from this pass's admission (not-done verdict), it "
-                "resumes from the next pass", str(rid)[:16])
+                "resumes from the next pass", str(rid))
     return rid
 
 
@@ -1043,30 +1700,196 @@ def _req_kv_tokens(r) -> int:
     return _n(getattr(r, "origin_input_ids", None)) + _n(getattr(r, "output_ids", None))
 
 
-def kv_displace_would_fit(sched, older_rid: str, running, seat: bool = False) -> bool:
+#: Q-702: the scheduler attribute that carries the adder's own refusal numbers
+#: next to ``_pdflip_sa_no_token`` (set in the same branch, consumed in the same pass).
+NO_TOKEN_VIEW_ATTR = "_pdflip_sa_no_token_view"
+
+#: Q-702 (Auftrag 1522): the scheduler's pass counter (``_get_new_batch_prefill_raw``
+#: counts every call, before any early exit). A view carries the count of the pass
+#: that wrote it; ``displace_for_age`` reads it in the NEXT pass at the earliest.
+SA_PASS_ATTR = "_pdflip_sa_pass"
+#: A view older than this many passes is dropped (legacy reading): its budget
+#: carries only the pool drift, not the decode steps, finished requests and
+#: backfills of the passes in between (review 1140, finding 2).
+VIEW_MAX_AGE_PASSES = 1
+
+
+def _evictable_reading(tree) -> int:
+    """PW (NF int18 1008): the evictable tokens the peel can PAY -- the ED count,
+    which subtracts what the last short peel measured unpayable (the backup
+    wall, mem_cache/evict_frontier_census.py) -- the same basis the adder's
+    ``rem_total_tokens`` and the H105d cut read. On 12:13:14Z the reported
+    count made ``free=190528 -> fits free, nobody leaves`` while the cut found
+    ``available=144832 evicted=0``."""
+    from flliper.srt.mem_cache.common import deliverable_evictable_or
+
+    return int(deliverable_evictable_or(tree, tree.evictable_size) or 0)
+
+
+def backup_wall_up(tree) -> bool:
+    """PW: True while the tree's last short peel stands (payable < reported):
+    rows that go back to the tree now -- a displaced seat's retained span, a
+    finished request's cache -- meet the same wall and free no device row."""
+    from flliper.srt.mem_cache.common import payable_evictable_or
+
+    try:
+        reported = int(tree.evictable_size() or 0)
+        return int(payable_evictable_or(tree, tree.evictable_size)) < reported
+    except Exception:  # noqa: BLE001 -- no reading: no wall
+        return False
+
+
+def _pool_reading(sched) -> Optional[int]:
+    """available + evictable as the (legacy) verdict reads them; None = no reading."""
+    try:
+        have = int(sched.token_to_kv_pool_allocator.available_size())
+    except Exception:  # noqa: BLE001 -- no reading
+        return None
+    try:
+        have += _evictable_reading(sched.tree_cache)
+    except Exception:  # noqa: BLE001
+        pass
+    return have
+
+
+def _group_refusal(follow, rid: str):
+    """Q-702 (Auftrag 1522, review 1140 finding 1): ``(rid, price, budget)`` of the
+    GROUP's refusal on a Form A group, read from the gate numbers the group verdict
+    carried (``tp_match_floor.form_a_admission_verdict(sink=...)``, kept by the
+    scheduler's ``_follow`` as ``last_verdict``): the host's -- under the token cut
+    the decider's -- ``total_tokens`` against ``rem_total_tokens``, the same tuple on
+    every rank. None unless that call was THIS rid's NO_TOKEN with the adder's own
+    shape (``price >= budget``: a lifetime refusal; a host refusal on another gate --
+    SWA, load-back no room, cut room -- carries no budget question and stays legacy
+    on every rank alike)."""
+    last = getattr(follow, "last_verdict", None)
+    if not isinstance(last, tuple) or len(last) != 4:
+        return None
+    lrid, code, price, budget = last
+    if str(lrid) != str(rid) or str(code) != "NO_TOKEN":
+        return None
+    price, budget = int(price), int(budget)
+    if price < budget:
+        return None
+    return (str(rid), price, budget)
+
+
+def note_adder_refusal(sched, adder, req, running_batch) -> None:
+    """Q-702 BUDGET-EINHEIT. Called by the scheduler where it keeps the first
+    NO_TOKEN rid of a pass (``_pdflip_sa_no_token``): keeps what the ADDER refused
+    on -- ``price`` (its ``total_tokens``) against ``budget`` (its
+    ``rem_total_tokens``) -- plus the decode reserve it holds for each running
+    request (what a victim's leaving gives back besides its KV rows), the pool
+    reading at that moment (to carry the number forward by the drift) and the
+    pass number (the age lock of :func:`displace_for_age`). The verdict
+    (:func:`kv_displace_would_fit`) then asks the adder's question, not one of its
+    own. Bookkeeping only; a missing or foreign refusal sets None and the verdict
+    keeps its legacy reading.
+
+    Form A (``adder.form_a_admission_follow`` set; NF D): the gate is the HOST's
+    and every rank adopts its verdict -- a worker's own gate said ADMIT
+    (``local_price`` 4544 against ``local_budget`` 176587, D.log of 10032328
+    23:33:28Z) and never wrote a lifetime refusal, so with only the local numbers
+    the workers read the legacy basis and vetoed the host's in the group MIN. Here
+    every rank takes the GROUP's numbers (:func:`_group_refusal`), so the view --
+    and with it the basis of the verdict -- is the same on all ranks by
+    construction. The rank-local ``lifetime_refusal`` is not read on such a group."""
+    view = None
+    if not d_seats.d_flip_park_active():
+        return  # not a D park group: nothing reads the view, nothing is kept
+    try:
+        follow = getattr(adder, "form_a_admission_follow", None)
+        if follow is not None:
+            ref = _group_refusal(follow, req.rid)
+        else:
+            ref = getattr(adder, "lifetime_refusal", None)
+        if ref is not None and str(ref[0]) == str(req.rid):
+            reserve = {}
+            for r in list(getattr(running_batch, "reqs", None) or []):
+                reserve[str(r.rid)] = int(adder.released_by_leaving(r))
+            view = {"rid": str(ref[0]), "price": int(ref[1]), "budget": int(ref[2]),
+                    "reserve": reserve, "pool": _pool_reading(sched),
+                    "pass": int(getattr(sched, SA_PASS_ATTR, 0) or 0)}
+    except Exception:  # noqa: BLE001 -- bookkeeping must never take a pass down
+        view = None
+    setattr(sched, NO_TOKEN_VIEW_ATTR, view)
+
+
+def _view_fresh(sched, view) -> bool:
+    """Q-702 age lock (review 1140 finding 2): a view is read in the pass after the
+    one that wrote it. When ``admission()`` was not reached in between (the pass
+    declined above it: ``batch_is_full``, the HOL scan cap, an idle run) the budget
+    in it is several passes old -- decode steps took ``bs`` rows a step, finished
+    requests gave their reserve back, backfills took theirs -- and only the pool's
+    drift is carried. Older than :data:`VIEW_MAX_AGE_PASSES` it is dropped and the
+    verdict reads the legacy basis (the base's behaviour, fresh each pass). A view
+    without a pass stamp (a desk double) counts as fresh."""
+    if view is None:
+        return False
+    then = view.get("pass")
+    if then is None:
+        return True
+    age = int(getattr(sched, SA_PASS_ATTR, 0) or 0) - int(then)
+    return 0 <= age <= VIEW_MAX_AGE_PASSES
+
+
+def kv_displace_would_fit(sched, older_rid: str, running, seat: bool = False, view=None) -> bool:
     """This rank's half of the displacement verdict (the group takes the MIN):
     KV trigger (seat=False): the older waiting request does not fit the free KV,
     and parking the youngest running seats younger than it frees enough for it.
     Seat trigger (seat=True): every seat is held, so one victim is needed for the
     seat anyway; it is taken only when the older one then also fits the KV
-    (k youngest, k >= 1). Logs the outcome (throttled)."""
+    (k youngest, k >= 1). Logs the outcome (throttled).
+
+    Q-702 BUDGET-EINHEIT (NF y9nf ...10032328 D 23:33:28Z): the budget is the
+    ADDER's. With ``view`` (its refusal of this very rid: ``price`` against
+    ``budget``, see :func:`note_adder_refusal`) the verdict asks whether the price
+    is below the budget once the k youngest are gone -- each gives back its KV rows
+    AND its decode reserve -- carried forward by the pool's drift since the
+    refusal; ``basis=adder`` in the log. The adder refuses at ``price >= budget``,
+    so the fit needs ``price + 1``. Without a matching view (no lifetime refusal
+    of this rid, a desk double) the legacy reading stands: ``basis=legacy`` -- raw
+    extend against available + evictable, which omits max_new, the page, the
+    running decode reserves, the group floor and the commitment ledger (the
+    "fits free, nobody leaves" of an older request the adder kept refusing)."""
     from flliper.srt.pdflip import seat_age as _sa
 
     older = next((q for q in getattr(sched, "waiting_queue", ()) or () if str(q.rid) == str(older_rid)), None)
     if older is None:
         return False
-    need = max(0, _req_kv_tokens(older) - _n(getattr(older, "prefix_indices", None)))
-    try:
-        avail = int(sched.token_to_kv_pool_allocator.available_size())
-    except Exception:  # noqa: BLE001 -- no reading: no displacement
-        return False
-    try:
-        avail += int(sched.tree_cache.evictable_size() or 0)
-    except Exception:  # noqa: BLE001
-        pass
-    young = sorted((r for r in running if _sa.rid_age(str(r.rid)) > _sa.rid_age(str(older_rid))),
-                   key=lambda r: _sa.rid_age(str(r.rid)), reverse=True)
-    k = victims_needed(need, avail, [_req_kv_tokens(r) for r in young])
+    # PRIO-AS-AGE 1014: "younger than the older one" and "youngest first" by the order key
+    _on = _pa.enabled()
+    _k_old = _pa.key(_pa.lane_of_req(older), _sa.rid_age(str(older_rid)), on=_on)
+    young = sorted((r for r in running
+                    if _pa.key(_pa.lane_of_req(r), _sa.rid_age(str(r.rid)), on=_on) > _k_old),
+                   key=lambda r: _pa.key(_pa.lane_of_req(r), _sa.rid_age(str(r.rid)), on=_on), reverse=True)
+    basis = "legacy"
+    # PW: under the backup wall a victim's retained KV goes back to the tree and
+    # is as unpayable as the rest -- only its decode reserve comes free.
+    wall = backup_wall_up(getattr(sched, "tree_cache", None))
+    if view is not None and str(view.get("rid")) == str(older_rid):
+        need = int(view["price"]) + 1
+        avail = int(view["budget"])
+        now, then = _pool_reading(sched), view.get("pool")
+        if now is not None and then is not None:
+            avail += now - int(then)
+        reserve = view.get("reserve") or {}
+        sizes = [(0 if wall else _req_kv_tokens(r)) + int(reserve.get(str(r.rid), 0)) for r in young]
+        basis = "adder"
+    else:
+        need = max(0, _req_kv_tokens(older) - _n(getattr(older, "prefix_indices", None)))
+        try:
+            avail = int(sched.token_to_kv_pool_allocator.available_size())
+        except Exception:  # noqa: BLE001 -- no reading: no displacement
+            return False
+        try:
+            avail += _evictable_reading(sched.tree_cache)
+        except Exception:  # noqa: BLE001
+            pass
+        sizes = [0 if wall else _req_kv_tokens(r) for r in young]
+    if wall:
+        basis += "+wall"
+    k = victims_needed(need, avail, sizes)
     if seat and k is not None:
         if not young:
             k = None                                   # no younger seat to give
@@ -1074,9 +1897,11 @@ def kv_displace_would_fit(sched, older_rid: str, running, seat: bool = False) ->
             k = max(1, k)                              # the seat itself needs one victim
     n = getattr(sched, "_sa_kv_fit_n", 0) + 1
     sched._sa_kv_fit_n = n
-    if k != 1 and (n <= 8 or (n & (n - 1)) == 0):
-        logger.info("SEAT-AGE %s-DISPLACE-VERDICT older=%s need=%d free=%d younger_running=%d -> %s (n=%d)",
-                    "SEAT" if seat else "KV", str(older_rid)[:16], need, avail, len(young),
+    # Q-702 (Auftrag 1522): the adder basis names k == 1 too (the displacement itself) -- the
+    # metal probe reads ``basis=adder`` per RANK on exactly that line (review 1110/1140).
+    if (k != 1 or basis.startswith("adder")) and (n <= 8 or (n & (n - 1)) == 0):
+        logger.info("SEAT-AGE %s-DISPLACE-VERDICT older=%s need=%d free=%d younger_running=%d basis=%s -> %s (n=%d)",
+                    "SEAT" if seat else "KV", str(older_rid), need, avail, len(young), basis,
                     "fits free, nobody leaves" if k == 0 else
                     "not even with all younger seats: nobody leaves, backfill stays" if k is None else
                     "%d youngest must leave (one per pass)" % k, n)
@@ -1175,7 +2000,23 @@ def admission(sched, running_batch):
     if not d_seats.d_park_active():
         settle = []
     pending = settle + list(getattr(sched, "pdflip_dormant_hold", None) or [])
-    avail = sched.uniform_min_avail() if book.margin_tokens >= 0 else None
+    gate_waiting = sched.waiting_queue
+    if d_lane.floor_of(sched) > 0:
+        # PRIORITY LANES 1008 (L2): a request the floor keeps out (its lane is below the floor) is not
+        # admitted this pass whatever the park says (``Scheduler._pdflip_lane_skip``), so the barrier does not
+        # wait for it and it holds no seat: the requests of the lane that runs are not held behind it
+        gate_waiting = [r for r in gate_waiting if not d_lane.below_floor(sched, r)]
+        pending = [r for r in pending if not d_lane.below_floor(sched, r)]
+    # 27B port 20.10.: the dual D keeps its reading byte for byte (user 20.10.: the
+    # ported scheduler parts never act in the dual layout); S75's fit reading on the flip form
+    from flliper.srt.pdflip import dual_handback_defer as _hbd_gate
+
+    if book.margin_tokens < 0:
+        avail = None
+    elif _hbd_gate.armed():
+        avail = sched.uniform_min_avail()
+    else:
+        avail = _resume_fit_reading(sched)
     # #1989 (dual D, default off): the seat cap for d_seats' OLDER-LIVE-FREE room --
     # the same replicated cap displace_for_age reads. Off: None, the gate as before.
     cap = None
@@ -1184,17 +2025,129 @@ def admission(sched, running_batch):
         if cap is None:
             cap = int(getattr(getattr(sched, "server_args", None), "max_running_requests", 0) or 0) or None
     gate = d_seats.admission_gate(
-        sched.waiting_queue,
+        gate_waiting,
         running=list(running_batch.reqs),
         pending_outside=pending,
         avail_tokens=avail,
         resume_book=book,
         decode_first=decode_first_facts(sched, running_batch),
         seat_cap=cap,
+        seats=_phase_seat_n(sched),  # SB (#1210): replicated from the wake request
     )
     if gate.deferred:
         _note_decode_first(sched, gate)
+    _note_resume_held(sched, gate)
+    # S48 D-DECODE-GAP (pdflip/d_decode_gap.py): name the gate in the decode pause it may cause (read-only)
+    from flliper.srt.pdflip import d_decode_gap as _ddg
+
+    if gate.deferred:
+        _ddg.note(sched, "f3_decode_first")
+    elif gate.barrier:
+        _ddg.note(sched, "seat")
     return gate if gate.barrier else None
+
+
+# ---------------------------------------------------------------------------
+# S75 (19.10., NF rc16 bf9ca46f45 boot 1019_121629, D TP0): pdflip-137-471 (144965
+# tokens) waited 193 s (13:27:47 -> 13:30:59) behind the older pdflip-132-465
+# (~125k, decoding bs1) although D's KV paid both. The gate that refused it is the
+# pressure-park resume of ``d_seats.admission_gate``: older live -> blocked unless
+# the ARRIVAL-SEAT early resume holds (``avail - need >= 0`` for 8 passes). It read
+# ``uniform_min_avail()`` = the group MIN of the FREE ids only (#1045 FLOOR
+# PUBLISHED floor=113536 at 13:28:13 ... 104128 at 13:30:56, need 144965) -- while
+# the arrival rule (``arrival_seat_rule.kv_fits``: available + evictable), the
+# displacement that parked it (``kv_displace_would_fit``: available +
+# ``_evictable_reading``) and the adder's own budget (``rem_total_tokens``) all
+# count the tree's evictable tokens. The tree held the finished pdflip-138-472 /
+# 138-473 spans (192000 + 99584 tokens loaded at 13:27:48-49) as evictable cache;
+# the moment 132-465 finished, 137-471 was admitted with ``FOLLOW-ROOM evicted=0
+# available=296960``. The census key ``pdflip_d_park_older_live`` was printed only
+# in the first post-wake passes, the numbers never. The ``CAP-LIFT room=0`` of the
+# same request is a different verdict (the D-MEM-SCHED stage cap, free ids below
+# the PENDING cap, TP0-local print): it LIFTED the cap (more room), it refused
+# nothing -- not the S72 site (``_room_ok`` re-read back-off).
+#
+# Now the early resume reads the same measure the arrival rule and the displacement
+# use: group MIN of (available + payable evictable), one MIN collective, read only on
+# a pass where a pressure-parked request asks it (replicated precondition). Switch
+# FLLIPER_PDFLIP_RESUME_FIT_EVICTABLE (default ON; 0 = free ids only, as before).
+# Instrument (always): ``PDFLIP D-PARK-RESUME-HELD`` names the gate and its numbers.
+# ---------------------------------------------------------------------------
+
+RESUME_FIT_EVICTABLE_ENV = "FLLIPER_PDFLIP_RESUME_FIT_EVICTABLE"
+RESUME_HELD_MARK = "PDFLIP D-PARK-RESUME-HELD"
+
+
+def resume_fit_evictable_on(env=None) -> bool:
+    e = os.environ if env is None else env
+    raw = (e.get(RESUME_FIT_EVICTABLE_ENV, "1") or "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def _resume_fit_reading(sched):
+    """S75: the lazy reading the pressure-park early resume compares ``need``
+    against -- a zero-argument callable (``d_seats.admission_gate`` calls it at
+    most once per pass, and only when a pressure-parked request asks)."""
+    if not resume_fit_evictable_on():
+        return sched.uniform_min_avail
+
+    def _read():
+        # review S75 2.1 (raenge-nie-uneins): EVERY path enters the group MIN exactly once.
+        # A rank without a reading (available_size raised) sends a sentinel (ok=0) into
+        # the same MIN instead of returning early -- an early return left its peers alone
+        # in the collective (gloo hang, W17 class). The group then refuses the early
+        # resume by name on every rank (None: no early resume this pass).
+        have = _pool_reading(sched)
+        ok = 0 if have is None else 1
+        vals = [int(have or 0), ok]
+        gm = getattr(sched, "_pdflip_group_min_ints", None)
+        got = list(gm(vals)) if callable(gm) else vals
+        if int(got[1]) == 0:
+            n = int(getattr(sched, "_pdflip_resume_fit_unread_n", 0) or 0) + 1
+            sched._pdflip_resume_fit_unread_n = n
+            if n & (n - 1) == 0:
+                logger.warning("%s UNREAD n=%d local_ok=%d -- a rank of the group has no pool reading: "
+                               "no early resume this pass (refused on every rank alike)",
+                               RESUME_HELD_MARK, n, ok)
+            return None
+        val = int(got[0])
+        sched._pdflip_resume_fit_last = val
+        return val
+
+    return _read
+
+
+def _note_resume_held(sched, gate) -> None:
+    """S75 instrument: one line per held rid on every change of (gate, older) and
+    at the 1st, 2nd, 4th, ... pass it stays held -- the numbers included."""
+    seen = getattr(sched, "_pdflip_resume_held_seen", None)
+    if seen is None:
+        seen = sched._pdflip_resume_held_seen = {}
+    now = {}
+    for rid, why, older, avail, need in getattr(gate, "held", ()) or ():
+        key = (why, older)
+        prev = seen.get(rid)
+        n = prev[1] + 1 if prev is not None and prev[0] == key else 1
+        now[rid] = (key, n)
+        if n & (n - 1) == 0:
+            logger.info(
+                "%s rid=%s gate=%s older=%s avail=%s need=%s measure=%s passes=%d -- %s",
+                RESUME_HELD_MARK, rid, why, older, "-" if avail is None else avail,
+                "-" if need is None else need,
+                "free+evictable" if resume_fit_evictable_on() else "free",
+                n,
+                "the older request it was displaced for still waits (Q-698)" if why == "held_for_older"
+                else "an older request is live and the early resume does not hold (avail - need < 0, "
+                     "or not yet for the hysteresis passes, or no margin armed)")
+    sched._pdflip_resume_held_seen = now
+
+
+def _phase_seat_n(sched):
+    """SB (#1210): this D phase's seat count (``note_wake_seats``), None when
+    the wake carried none -- then no newcomer backfills past the barrier."""
+    seats = getattr(sched, "pdflip_d_phase_seats", None)
+    n = getattr(seats, "n", None)
+    return int(n) if isinstance(n, int) and n > 0 else None
 
 
 #: F3: (wake_seq, decode rounds run since that wake) -- the event loop counts
@@ -1294,7 +2247,7 @@ def _note_decode_first(sched, gate) -> None:
     logger.info(
         "F3 DECODE-FIRST wake=%s deferred=%s rounds=%d -- the wake's hand-offs extend and "
         "decode first; the flip-parked resume(s) keep their seat and extend after",
-        key[0], sorted(r[:12] for r in gate.deferred), rounds_since_wake(sched))
+        key[0], sorted(gate.deferred), rounds_since_wake(sched))
 
 
 def park_abort(sched, recv_req) -> int:
@@ -1312,7 +2265,7 @@ def park_abort(sched, recv_req) -> int:
         n = th.remove_parks_aborted(rid, abort_all)
         if n:
             logger.info("F4 PARK-END abort: %d park part file(s) removed (rid=%s abort_all=%s)",
-                        n, rid[:12], abort_all)
+                        n, rid, abort_all)
     # Q-699: the aborted rid's tail staging ends with it (its parts may be gone)
     try:
         from flliper.srt.pdflip import tail_adopt as _ta
@@ -1334,7 +2287,7 @@ def park_abort(sched, recv_req) -> int:
             sched.tree_cache.release_aborted_request(req.rid)
         sched.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
     logger.info("PDFLIP-D-PARK abort: %d parked request(s) dropped (rid=%s abort_all=%s)",
-                len(gone), rid[:12], abort_all)
+                len(gone), rid, abort_all)
     return len(gone)
 
 

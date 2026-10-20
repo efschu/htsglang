@@ -566,7 +566,11 @@ class TheConsumerSweepRatchet(unittest.TestCase):
         # itself survives with its remaining tests.
         "test_pp_admission_wiring_791.py",
         "test_pp_dead_peer_is_not_the_wedge_801.py",
-        "test_pp_proxy_retracted_pass_mispair_791c.py",
+        # #1502: `test_pp_proxy_retracted_pass_mispair_791c.py` is DELETED (its
+        # five cases drove `_pp_note_output_expectation` and
+        # `_pp_pass_retraction_reason`, both gone since eed2b1fce2 / #1072c);
+        # its replacement `test_pp_membership_follows_the_row_791c_1502.py`
+        # never reads `observed_local`.
         "test_pp_reconcile_slot_blind_798.py",
         # #1072/#1072c: `test_pp_retracted_pass_void_797.py` and
         # `test_pp_void_send_contract_801.py` are DELETED with the void relay

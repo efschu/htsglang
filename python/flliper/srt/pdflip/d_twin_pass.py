@@ -97,7 +97,7 @@ def waits(req, prefix_len: int, admitted: Iterable, *, env=None) -> bool:
                 logger.info(
                     "%s rid=%s twin=%s prefix=%d shared=%d n=%d -- the twin computes these tokens in "
                     "this pass; this one waits one pass and matches them from the tree",
-                    MARK, str(getattr(req, "rid", "?"))[:16], str(getattr(other, "rid", "?"))[:16],
+                    MARK, str(getattr(req, "rid", "?")), str(getattr(other, "rid", "?")),
                     int(prefix_len), n, k)
             return True
     return False

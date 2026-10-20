@@ -135,16 +135,21 @@ def test_the_parallel_read_equals_the_serial_read(tmp_path, monkeypatch):
 
 
 class _PoolArena:
-    """The pool's arena as _arena_page_get sees it: find/ref over fixed state."""
+    """The pool's arena as _arena_page_get sees it: find/ref over fixed state.
+
+    ARENA-CHAIN (14.10.): the read looks the stems up AGAIN after a reference (the key must still name the slot),
+    so the double answers by stem ("s<i>" -> (slot, state)) and learns the slots a fill completes."""
 
     def __init__(self, found, evicted=()):
         self.found = found
+        self.by_stem = {"s%d" % i: (s, t) for i, (s, t) in enumerate(found)}
         self.evicted = set(evicted)
         self.refs = []
 
     def find_slots_np(self, stems):
-        return (np.asarray([s for s, _ in self.found], dtype=np.int64),
-                np.asarray([t for _, t in self.found], dtype=np.int8))
+        got = [self.by_stem.get(st, (-1, 0)) for st in stems]
+        return (np.asarray([s for s, _ in got], dtype=np.int64),
+                np.asarray([t for _, t in got], dtype=np.int8))
 
     def ref_slots_np(self, a, delta):
         a = [int(x) for x in a]
@@ -170,6 +175,9 @@ def _controller(found, fill_ok, evicted=()):
         fills.append(list(stems))
         seen_refs.append(list(arena.refs))
         out = [1000 + int(st[1:]) if int(st[1:]) in fill_ok else None for st in stems]
+        for st, o in zip(stems, out):
+            if o is not None:
+                arena.by_stem[st] = (o, 2)  # the fill completed the page under its stem
         if prefix and None in out:  # the storage stops at the first gap
             k = out.index(None)
             out[k:] = [None] * (len(out) - k)
@@ -260,14 +268,29 @@ class _BusyArena(_Arena):
         return out
 
 
-def test_prefix_fill_frees_claims_past_a_page_it_cannot_have_unread(tmp_path):
+def test_prefix_fill_reads_its_own_claims_past_a_joined_page(tmp_path):
+    # STORE-SHORT (NF h6 11:17:38, pdflip-4-17): a page another writer is
+    # filling (JOINED) no longer ends the fill BEFORE this fill read its own
+    # claims -- the peer may be waiting on exactly those (cross claims). The
+    # read's answer still ends at the page it could not have; the pages past
+    # it are COMPLETE in the arena for the next reader, no claim stays open.
     be, stems = _store(tmp_path, 20)
     a = _BusyArena("s00005", n_slots=64)
     out = hs.HiCacheFile.arena_fill_from_disk(be, a, stems, PAGE, prefix=True)
     assert [s is not None for s in out] == [True] * 5 + [False] * 15
+    assert sorted(a.state) == stems[:5] + stems[6:] and not a.claimed
+    assert len(a.free) == 64 - 19
+
+
+def test_prefix_fill_frees_nothing_past_a_page_not_on_disk(tmp_path):
+    # a page that is NOT on disk still ends the walk: nothing past it is claimed
+    be, stems = _store(tmp_path, 20)
+    os.remove(be._existing_path(stems[5]))
+    a = _Arena(n_slots=64)
+    out = hs.HiCacheFile.arena_fill_from_disk(be, a, stems, PAGE, prefix=True)
+    assert [s is not None for s in out] == [True] * 5 + [False] * 15
     assert sorted(a.state) == stems[:5] and not a.claimed
-    assert len(a.free) == 64 - 5                    # the 14 claims past it went back
-    assert not a.buf[5:].any()                      # ... unread (the bytes of the first 5 only)
+    assert not a.buf[5:].any()
 
 
 def test_found_l2_pages_are_referenced_before_the_fill():

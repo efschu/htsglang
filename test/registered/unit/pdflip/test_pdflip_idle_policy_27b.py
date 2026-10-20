@@ -74,10 +74,10 @@ def _front(**kw):
     return f
 
 
-def _pending(rid, tokens, *, eligible=True, t_arrive=None):
+def _pending(rid, tokens, *, eligible=True, t_arrive=None, p_only=False):
     fut = asyncio.get_running_loop().create_future()
     return front_mod.Pending(rid, "/generate", {}, "x", t_arrive or time.time(), fut,
-                             est_prompt=tokens, est_uncached=tokens, d_eligible=eligible)
+                             est_prompt=tokens, est_uncached=tokens, d_eligible=eligible, p_only=p_only)
 
 
 async def _cancel(task):
@@ -302,10 +302,10 @@ class ControllerIdleHold(CustomTestCase):
 class ControllerBacklogHold(CustomTestCase):
     """A small backlog D cannot serve (the weg2xsn438 image request)."""
 
-    def _flip_after(self, seconds, **kw):
+    def _flip_after(self, seconds, p_only=False, **kw):
         async def body():
             f = _front(**kw)
-            f.queue.append(_pending("img", 35, eligible=False))
+            f.queue.append(_pending("img", 35, eligible=False, p_only=p_only))
             seen, t0 = await _run_controller(f, lambda s: "flip" in s, seconds)
             return seen, t0
 
@@ -315,14 +315,18 @@ class ControllerBacklogHold(CustomTestCase):
     def test_default_holds_it_like_today(self):
         self.assertIsNone(self._flip_after(1.2), "today: only the fairness bound (45 s) releases it")
 
-    def test_switch_on_flips_after_the_hold_instead_of_the_fairness_bound(self):
-        gap = self._flip_after(3.0, d_hold_s=0.6)
+    def test_a_small_request_d_cannot_serve_is_no_flip_reason_even_after_the_hold(self):
+        # SOLL R7/A8 (17.10.): work under X that D could not take never flips, d_hold_s or not
+        self.assertIsNone(self._flip_after(2.0, d_hold_s=0.6))
+
+    def test_a_p_only_request_flips_at_once_on_an_idle_d(self):
+        # SOLL R8/R9: p_only = groß, D decodes nothing -> sofort Flip (the former 'hold' priced it against X*)
+        gap = self._flip_after(3.0, p_only=True, d_hold_s=0.6)
         self.assertIsNotNone(gap)
-        self.assertGreater(gap, 0.7)
-        self.assertLess(gap, 1.4)
+        self.assertLess(gap, 1.0)
 
     def test_the_drain_does_not_take_what_d_cannot_serve(self):
-        gap = self._flip_after(3.0, d_hold_s=0.3, d_short_drain_tokens=X)
+        gap = self._flip_after(3.0, p_only=True, d_hold_s=0.3, d_short_drain_tokens=X)
         self.assertIsNotNone(gap, "the image request must still reach P")
 
 
@@ -365,9 +369,9 @@ class Wiring(CustomTestCase):
         src = inspect.getsource(front_mod.Front.handle_generate)
         # RC2 review: minus the SHORT that D's own #915 budget just refused
         # (test_pdflip_idle_drain_budget_rc2_0924.py).
-        self.assertIn("d_eligible=short_ok and not short_refused,", src)
-        # NFPORT STORE-PRESENCE: the arrival's own LONG verdict rides beside it (reprice -> SHORT)
-        self.assertIn('route_long=route == "long")', src)
+        # int24f5: the Pending constructor call continues with the lane field after this argument (PRIORITY LANES L1:
+        # `d_eligible=short_ok and not short_refused,` + `lane=Front._lane_for(self, rid))`), so the closing paren moved
+        self.assertRegex(src, r"d_eligible=short_ok and not short_refused[,)]")
         tail = src[src.rfind("await fut  # leg 1 done and D awake"):]
         self.assertIn("if p.d_direct:", tail)
         i = tail.index("if p.d_direct:")
@@ -436,3 +440,13 @@ class LauncherFlags(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+import pytest as _pytest_110  # noqa: E402
+
+
+@_pytest_110.fixture(autouse=True)
+def _arrival_seat_rule_off_110(monkeypatch):
+    """110: FLLIPER_PDFLIP_ENABLE_ARRIVAL_SEAT_RULE is default ON on the NF line;
+    this file pins the pre-rule front it was written against (=0 is that path)."""
+    monkeypatch.setenv("FLLIPER_PDFLIP_ENABLE_ARRIVAL_SEAT_RULE", "0")

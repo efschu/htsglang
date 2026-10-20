@@ -594,7 +594,12 @@ class TestWiring(CustomTestCase):
         fwd = _method(self.tree, "Scheduler", "_run_batch_forward")
         names = [n for _, n, _ in _calls(fwd)]
         self.assertLess(names.index("publish_ple_next_chunk"), names.index("note_ple_batch"))
+        # K14: abort_request may hold a follower's waiting-queue abort; the abort
+        # itself (every side effect) lives in _abort_request_apply -- the H43 order
+        # (drop the PLE admission, then the abort) is pinned there.
         ab = [n for _, n, _ in _calls(_method(self.tree, "Scheduler", "abort_request"))]
+        if "_abort_request_apply" in ab:
+            ab = [n for _, n, _ in _calls(_method(self.tree, "Scheduler", "_abort_request_apply"))]
         self.assertLess(ab.index("drop_ple_admission"), ab.index("_abort_request_now"))
         disp = ast.unparse(_method(self.tree, "Scheduler", "init_request_dispatcher"))
         self.assertIn("(PlePrefetchHintReqInput, self.handle_ple_prefetch_hint)", disp)

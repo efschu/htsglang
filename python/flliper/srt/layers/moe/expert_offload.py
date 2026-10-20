@@ -154,6 +154,8 @@ _H107_LOG_LAYER = None
 # D-Mini-Extend: the one layer whose device-planned eager step is logged at
 # INFO, one line per forward (same latch rule).
 _EDS_LOG_LAYER = None
+# S51 EAGER-DEVICE-EM: the one layer whose EM pass is logged at INFO.
+_EDS_EM_LOG_LAYER = None
 
 
 def write_routing_trace(
@@ -518,6 +520,40 @@ def pool_lru_rows(hot_phys, lru_start: int, row_limit: int) -> Dict[int, int]:
     return out
 
 
+def eager_lru_resident_slots(planner, resident_count: int,
+                             mapped: bool = True) -> Optional[Dict[int, int]]:
+    """H107c (S44, 18.10.): resident expert -> the bank slot wave 0 reads it
+    from, or None when H107 cannot compute wave 0 on this layout.
+
+    ``{}`` stands for the identity ``[0, R)`` at ``slot == id`` (no map at
+    all; the caller reads ``e`` itself). A frozen layout's map is returned as
+    it is when it places the R residents one-to-one onto ``[0, R)`` -- the
+    NF D Platztausch Karte (``[prefix | pad | extra]``, pad behind the prefix)
+    is exactly such a map, and before H107c it kept H107 off on every D rank.
+    ``mapped=False`` (FLLIPER_OPT_MOE_POOL_EAGER_LRU_MAPPED=0) accepts only the
+    identity, the H107b rule. None: a map that does not cover the residents
+    one-to-one inside ``[0, R)`` (a hot set mid-calibration, a short map)."""
+    ids = getattr(planner, "resident_ids", None)
+    R = int(resident_count)
+    if ids is None:
+        return {}
+    ids = frozenset(int(e) for e in ids)
+    if len(ids) != R:
+        return None
+    slot = getattr(planner, "resident_slot", None)
+    if slot is None:
+        return {} if ids == frozenset(range(R)) else None
+    try:
+        got = {int(e): int(slot[e]) for e in ids}
+    except (KeyError, TypeError, ValueError):
+        return None
+    if sorted(got.values()) != list(range(R)):
+        return None
+    if all(s == e for e, s in got.items()):
+        return {}
+    return got if mapped else None
+
+
 def eager_lru_static_residency(planner, resident_count: int) -> bool:
     """H107b: does the planner hold the static identity residency -- expert
     ``e`` resident at slot ``e`` for ``e`` in ``[0, R)`` -- the layout
@@ -574,6 +610,73 @@ def plan_eager_lru_waves(
         list(zip(misses[i : i + width], writable)) for i in range(0, len(misses), width)
     ]
     return hits, miss_waves
+
+
+def plan_eager_lru_waves_reclaim(
+    spill_sorted: Sequence[int],
+    lru_row_of: Dict[int, int],
+    scratch_rows: Sequence[int],
+    *,
+    row_use: Optional[Sequence[int]] = None,
+    max_waves: int = 0,
+) -> Optional[Tuple[Dict[int, int], List[List[Tuple[int, int]]], List[int]]]:
+    """H107d (S44, 18.10.): ``plan_eager_lru_waves`` with a wave bound.
+
+    Returns ``(hits, miss_waves, reclaimed)``. ``hits`` = spill expert -> the
+    LRU row it is read from in the fetch-free wave 0. Writable rows are the
+    scratch rows holding no hit, taken COLDEST FIRST: rows no expert owns
+    (free LRU rows, staging) before owned ones, owned ones by ``row_use``
+    ascending (then row id) -- so a miss evicts the decode working set's
+    coldest rows, not its lowest-numbered ones. Without ``row_use`` the row
+    order stays as in ``plan_eager_lru_waves``.
+
+    ``max_waves`` > 0: when the misses over the writable rows need more than
+    ``max_waves`` waves, the coldest HIT rows inside ``scratch_rows`` are
+    reclaimed until they fit (``reclaimed``, coldest first). A reclaimed row
+    is still read in wave 0 -- the caller must run wave 0 as its OWN apply
+    before the first miss fetch (the serial expert-major loop on one stream
+    orders the overwrite behind that read). Its expert loses the row after
+    the forward (the sync gives the row to the miss written last); every
+    other hit keeps its row. ``max_waves`` = 0 never reclaims.
+
+    None: misses remain but no row can take them (no writable row and
+    nothing reclaimable) -- the caller keeps the plain plan. Which row holds
+    an expert never changes what the forward computes."""
+    hits = {int(e): int(lru_row_of[e]) for e in spill_sorted if e in lru_row_of}
+    held = set(hits.values())
+    misses = [int(e) for e in spill_sorted if e not in hits]
+    owned = set(int(r) for r in lru_row_of.values())
+
+    def _cold(r: int):
+        if row_use is None:
+            return (0, 0, r)
+        if r not in owned:
+            return (0, 0, r)
+        try:
+            u = int(row_use[r])
+        except (IndexError, TypeError, ValueError):
+            u = 0
+        return (1, u, r)
+
+    rows = [int(r) for r in scratch_rows]
+    writable = [r for r in rows if r not in held]
+    if row_use is not None:
+        writable.sort(key=_cold)
+    reclaimed: List[int] = []
+    if misses and max_waves > 0:
+        need = -(-len(misses) // int(max_waves))  # rows per wave for <= max_waves waves
+        if len(writable) < need:
+            in_scratch = set(rows)
+            candidates = sorted((r for r in held if r in in_scratch), key=_cold)
+            reclaimed = candidates[: need - len(writable)]
+            writable = writable + reclaimed
+    if misses and not writable:
+        return None
+    width = max(1, len(writable))
+    miss_waves = [
+        list(zip(misses[i : i + width], writable)) for i in range(0, len(misses), width)
+    ]
+    return hits, miss_waves, reclaimed
 
 
 # fnFL2 H20b: below this many routed (token, k) pairs the list path stays --
@@ -921,7 +1024,27 @@ def pool_prefetch_stream():
         import torch
 
         _POOL_PREFETCH_STREAM = torch.cuda.Stream()
+        _register_row_stream(_POOL_PREFETCH_STREAM)  # F3: it writes bank rows
     return _POOL_PREFETCH_STREAM
+
+
+def _new_row_stream():
+    """F3 review (M9): a new CUDA stream that reads or writes expert bank rows -- created AND registered."""
+    import torch
+
+    s = torch.cuda.Stream()
+    _register_row_stream(s)
+    return s
+
+
+def _register_row_stream(stream) -> None:
+    """F3: a stream that reads or writes expert bank rows joins the ROW-FENCE's set (d_row_fence)."""
+    try:
+        from flliper.srt.pdflip.d_row_fence import register_row_stream
+
+        register_row_stream(stream)
+    except Exception:  # noqa: BLE001 -- the fence module is part of the tree; never stops a stream
+        pass
 
 
 def resident_slot_count(num_local_experts: int, fraction: float) -> int:
@@ -2933,6 +3056,29 @@ def _pinned_exact_unregister(ptr: int) -> bool:
     return True
 
 
+def _clear_cuda_last_error() -> None:
+    """S58r: read the calling thread's CUDA runtime error variable out (cudaGetLastError resets it).
+
+    A runtime call that fails -- here ``cudaHostRegister`` -- leaves its code in the thread's error variable, and
+    the NEXT kernel-launch check of that thread (``C10_CUDA_KERNEL_LAUNCH_CHECK`` = ``cudaGetLastError()``) raises
+    it on an unrelated launch. The exact-pin callers (tail-stage arena, draft image, S58) fall back to the
+    ``torch.empty(pin_memory)`` form on a failed registration; without this the fallback would end in a CUDA error
+    blamed on the boot's next kernel. ``torch.cuda.cudart()`` has no ``cudaGetLastError``, so the runtime torch
+    links (``libcudart.so.<major>``, already loaded: dlopen by soname returns that instance) is asked directly.
+    Never raises."""
+    try:
+        import ctypes
+
+        import torch
+
+        major = str(getattr(torch.version, "cuda", "") or "").split(".")[0]
+        if not major:
+            return
+        ctypes.CDLL(f"libcudart.so.{major}").cudaGetLastError()
+    except Exception:  # noqa: BLE001 - nothing to clear / no runtime: nothing to do
+        pass
+
+
 def pinned_exact_empty(shape, dtype):
     """Uninitialised host tensor of ``shape``/``dtype``, page-locked at its
     exact byte size (see the module comment). Without a CUDA context (desk
@@ -2967,6 +3113,7 @@ def pinned_exact_empty(shape, dtype):
     ptr = flat.data_ptr()
     err = torch.cuda.cudart().cudaHostRegister(ptr, nbytes, _CUDA_HOST_REGISTER_MAPPED)
     if int(err) != 0:
+        _clear_cuda_last_error()   # S58r: the caller's fallback must not inherit this error
         mm.close()
         raise RuntimeError(
             f"cudaHostRegister({nbytes} bytes) failed with cudaError {int(err)}"
@@ -3273,6 +3420,31 @@ def partials_mode() -> str:
         v = str(os.environ.get("FLLIPER_MOE_OFFLOAD_PARTIALS", "table")).strip().lower()
         _PARTIALS_MODE["mode"] = "stream" if v == "stream" else "table"
     return _PARTIALS_MODE["mode"]
+
+
+def _nan_guard_wave_armed() -> bool:
+    """FLLIPER_NAN_GUARD=1 with FLLIPER_NAN_GUARD_WAVE armed (the per-wave
+    diagnostic of the host loop, which the EM pass does not carry)."""
+    import os
+
+    try:
+        from flliper.srt.layers.nan_guard import nan_guard_on
+
+        if not nan_guard_on():
+            return False
+    except Exception:  # noqa: BLE001 -- no guard module: nothing armed
+        return False
+    return os.environ.get("FLLIPER_NAN_GUARD_WAVE", "0").strip() not in ("", "0", "off")
+
+
+def _em_slice_pairs() -> int:
+    """FLLIPER_OPT_MOE_POOL_EAGER_DEVICE_EM_SLICE (S51), >= 0; 0 = one slice."""
+    from flliper.srt.environ import envs
+
+    try:
+        return max(0, int(envs.FLLIPER_OPT_MOE_POOL_EAGER_DEVICE_EM_SLICE.get() or 0))
+    except (TypeError, ValueError):
+        return 4096
 
 
 def wave_token_slice_pairs() -> int:
@@ -3601,11 +3773,16 @@ class MoEExpertOffloadCache:
     _deferred_rows = None
     #: H107: armed by run_eager_pool for one eager forward (set per instance)
     _eager_lru_armed = False
+    #: H107c: wave 0's resident slots for that forward ({} = identity)
+    _eager_lru_slots = None
     #: D-Mini-Extend: device-planned eager step on/off, metal checks left, and
     #: the graph form's id limit (None = not derived yet; set per instance)
     _pool_eager_device_step = False
     _pool_eager_device_checks = 0
     _pool_eager_device_limit = None
+    #: S51 EAGER-DEVICE-EM: on/off and its own metal-check budget (per instance)
+    _pool_eager_device_em = False
+    _pool_eager_device_em_checks = 0
 
     #: names of the stacked per-expert tensors to pool/fetch (dim 0 == expert).
     EXPERT_TENSOR_ATTRS = (
@@ -3879,6 +4056,12 @@ class MoEExpertOffloadCache:
         self._pool_eager_device_checks = max(
             0, int(envs.FLLIPER_DEBUG_MOE_POOL_EAGER_DEVICE_CHECK.get() or 0)
         )
+        # S51: extends past the graph form take the device-planned
+        # expert-major pass (FLLIPER_OPT_MOE_POOL_EAGER_DEVICE_EM)
+        self._pool_eager_device_em = bool(envs.FLLIPER_OPT_MOE_POOL_EAGER_DEVICE_EM.get())
+        self._pool_eager_device_em_checks = max(
+            0, int(envs.FLLIPER_DEBUG_MOE_POOL_EAGER_DEVICE_EM_CHECK.get() or 0)
+        )
         # per eager forward: armed by run_eager_pool, the hit rows the sync
         # stamps as used (row -> expert)
         self._eager_lru_armed = False
@@ -3985,7 +4168,7 @@ class MoEExpertOffloadCache:
         # hermetic desk test instead of a GPU-window claim. Production always
         # has a context, so the CUDA branch is unchanged.
         cuda = torch.cuda.is_available()
-        self._stream = torch.cuda.Stream() if cuda else None
+        self._stream = _new_row_stream() if cuda else None  # F3: the layer's fetch stream writes bank rows
         dev = torch.cuda.current_device() if cuda else torch.device("cpu")
         R = self.resident_count
         buf_slots = self.planner.buffer_size  # R + C
@@ -4818,26 +5001,103 @@ class MoEExpertOffloadCache:
                 raise ValueError("H95c: seat rows on a layer without seat rows / pool")
             return 0
         from flliper.srt.environ import envs
-        from flliper.srt.layers.moe.expert_pool_device import set_seat_rows_on
+        from flliper.srt.layers.moe.expert_pool_device import seat_rows_off_device, set_seat_rows_on
 
-        # D-MEM-SCHED (29.09.): a shrink moves the dropped rows' experts into
-        # the coldest kept rows first (Not-Aus: FLLIPER_PDFLIP_DISABLE_D_ELASTIC_ROWS)
-        mover = None
-        if (device_write and getattr(self, "_resident", None)
-                and not envs.FLLIPER_PDFLIP_DISABLE_D_ELASTIC_ROWS.get()):
-            mover = functools.partial(MoEExpertOffloadCache._move_bank_rows, self)
         # KV-STAGE warm refill (01.10.): a shrink remembers the experts it sent
         # to the store (hottest first); the grow that follows hands them their
         # rows back at once instead of one cold miss each. This method is bound
         # onto test doubles too (types.MethodType); only a real cache warms.
         warm = (device_write and isinstance(self, MoEExpertOffloadCache)
                 and envs.FLLIPER_PDFLIP_D_SEAT_WARM_REFILL.get())
-        departed = [] if warm else None
-        old = set_seat_rows_on(self._pool_tables, int(k), device_write=device_write,
-                               move_rows=mover, departed_out=departed)
-        if warm:
-            self._seat_warm_step(int(k), old, departed)
+        if device_write and int(k) < int(self._pool_tables.seat_on):
+            # F3: the SHRINK on the device -- no .cpu(); the caller's ROW-FENCE (d_seat_vram._rows_off_live)
+            # orders it behind every row stream and every row stream's later work behind it. D-MEM-SCHED
+            # (29.09.): the dropped rows' experts move into the coldest kept rows first (Not-Aus:
+            # FLLIPER_PDFLIP_DISABLE_D_ELASTIC_ROWS); pending warm rows of this layer go back free first.
+            from flliper.srt.pdflip import d_row_fence
+
+            d_row_fence.drop_warm(self)
+            mover = None
+            if getattr(self, "_resident", None) and not envs.FLLIPER_PDFLIP_DISABLE_D_ELASTIC_ROWS.get():
+                mover = functools.partial(MoEExpertOffloadCache._move_bank_rows_device, self)
+            recall = functools.partial(MoEExpertOffloadCache._seat_recall_snapshot, self) if warm else None
+            return seat_rows_off_device(self._pool_tables, int(k), move_rows=mover, recall=recall)
+        old = set_seat_rows_on(self._pool_tables, int(k), device_write=device_write)
+        if warm and int(k) > old:
+            self._seat_warm_grow(int(k), old)
         return old
+
+    def _seat_recall_snapshot(self, keys_before, uses_before, hot_after) -> None:
+        """F3: the shrink's departed-expert inputs, read back to the host WITHOUT a wait (pinned, side
+        stream, event); the next grow uses them once ready (``departed_experts``), else the older recall."""
+        from flliper.srt.pdflip.d_row_fence import DeferredRead
+
+        self._pdflip_seat_recall_read = DeferredRead((keys_before, uses_before, hot_after))
+
+    def _seat_warm_grow(self, k: int, old: int) -> None:
+        """F3: the grow's warm refill without a host read of the tables: the recalled experts (cold ones only,
+        checked on the device) take the rows this grow just turned ON -- known free in stream order --,
+        reserved at once; their bytes come on the warm stream; the commit follows the copies' event."""
+        import torch
+
+        from flliper.srt.layers.moe.expert_pool_device import departed_experts, reserve_warm_rows
+        from flliper.srt.pdflip import d_row_fence
+
+        t = self._pool_tables
+        recall = list(getattr(self, "_pdflip_seat_recall", []) or [])
+        rd = getattr(self, "_pdflip_seat_recall_read", None)
+        if rd is not None and rd.ready():
+            kb, ub, ha = rd.get()
+            departed = departed_experts(kb.tolist(), ub.tolist(), ha.tolist(), num_experts=int(t.num_experts))
+            seen = set(departed)
+            recall = (departed + [e for e in recall if e not in seen])[: max(1, int(self.seat_rows)) * 2]
+            self._pdflip_seat_recall_read = None
+        n = min(len(recall), int(k) - int(old))
+        if n <= 0:
+            self._pdflip_seat_recall = recall
+            return
+        self._pdflip_seat_recall = []
+        dev = t.row_key.device
+        ids = torch.tensor(recall[:n], dtype=torch.int64)
+        if dev.type == "cuda":
+            ids = ids.pin_memory().to(dev, non_blocking=True)
+        row0 = int(t.seat_base) + int(old)
+        rows = torch.arange(row0, row0 + n, device=dev, dtype=torch.int64)
+        hr = t.host_row.index_select(0, ids).to(torch.int64)
+        reserve_warm_rows(t, rows)
+        d_row_fence.submit_warm(self, ids, rows, hr >= 0, hr.clamp(min=0))
+
+    def _move_bank_rows_device(self, src, dst) -> None:
+        """F3: :meth:`_move_bank_rows` for the device pairs of ``seat_rows_off_device``. F3 review A5: only
+        the MOVES are copied and booked -- a move has ``src != dst`` (drop range vs kept range), a no-op lane
+        ``src == dst``, and the moves are a prefix; ``copy_rows`` takes that count as a DEVICE scalar (no
+        host read; a no-op lane costs nothing). The booking is a host int on a CPU desk rank, a device counter
+        on CUDA (``_pdflip_bank_bytes_dev``, read back without a wait by the controller). The bound is checked
+        statically against the seat block's top."""
+        import torch
+
+        from flliper.srt.layers.moe.expert_pool_device import copy_rows
+
+        top = int(self._pool_tables.seat_base) + int(self._pool_tables.seat_rows)
+        bufs = list(self._resident.values())
+        row_bytes = 0
+        for attr, buf in self._resident.items():
+            if int(buf.shape[0]) < top:
+                raise RuntimeError(
+                    "D-MEM-SCHED: bank buffer %s has %d rows, the seat block ends at row %d"
+                    % (attr, int(buf.shape[0]), top))
+            row_bytes += (buf.numel() // int(buf.shape[0])) * buf.element_size()
+        count = (src != dst).to(torch.int32).sum().reshape(1)
+        copy_rows(bufs, bufs, src.to(torch.int32), dst.to(torch.int32), count)
+        if count.device.type == "cpu":
+            self._pdflip_bank_bytes_copied = (int(getattr(self, "_pdflip_bank_bytes_copied", 0))
+                                              + int(count[0]) * row_bytes)
+        else:
+            acc = getattr(self, "_pdflip_bank_bytes_dev", None)
+            if acc is None:
+                acc = torch.zeros(1, dtype=torch.int64, device=count.device)
+                self._pdflip_bank_bytes_dev = acc
+            acc.add_(count.to(torch.int64) * int(row_bytes))
 
     def _seat_warm_step(self, k: int, old: int, departed: List[int]) -> None:
         """KV-STAGE warm refill: remember on a shrink, refill on a grow. The
@@ -4957,6 +5217,170 @@ class MoEExpertOffloadCache:
             if not last:
                 ids = torch.where((ids >= 0) & (r < 0), ids, torch.full_like(ids, -1))
         return first._replace(hidden_states=hidden)
+
+    def run_pool_em(self, dispatch_output, apply_fn, waves: int):
+        """S51 EAGER-DEVICE-EM: an eager forward past the graph form, planned
+        on the device and computed EXPERT-MAJOR.
+
+        Plan: the pool step sees ONE lane per local expert -- lane ``e`` holds
+        ``e`` when the forward routes any pair to it, else -1 -- so a
+        2000-pair extend is the step of at most ``E`` distinct ids and the
+        captured kernel (WIDTH >= E) runs as it is. Wave 1 is the ordinary
+        step with ``spill`` (H95); every later wave is a ``wave`` step over
+        exactly the experts the waves before could not hold; the last one
+        runs without ``spill`` and the bound of ``eager_device_em_waves``
+        makes it complete. Each step copies its own misses (``copy_rows``,
+        device count) -- the bytes the host plan's misses move.
+
+        Compute: every wave runs over all ``T x K`` lanes as top_k=1 rows in
+        fixed slices. A lane whose expert this wave serves reads its row at
+        its own weight; every other lane points at the zero row at weight 0
+        and its row is not taken. The served rows land in the ``[T*K, H]``
+        partials table at their own (token, k) slot; each lane is served in
+        exactly one wave, padded (-1) lanes in none and stay zero; the top-k
+        reduction runs ONCE at the end -- ``_run_waves_expert_major``'s
+        arithmetic (same input row, same expert bytes, same weight, same
+        combine), with no host read anywhere. ``routed_scaling_factor`` is
+        neutralised in the per-pair applies and applied by the combine, as
+        there."""
+        import torch
+
+        from flliper.srt.layers.moe.expert_pool_device import copy_rows, step
+
+        if not self._pool_ready:
+            self.install_pool()
+        t = self._pool_tables
+        buffers = self._pool_buffers
+        topk_output = dispatch_output.topk_output
+        topk_ids = topk_output.topk_ids
+        hidden = dispatch_output.hidden_states
+        scale = dispatch_output.hidden_states_scale
+        router_logits = getattr(topk_output, "router_logits", None)
+        device = topk_ids.device
+        T, K = int(topk_ids.shape[0]), int(topk_ids.shape[1])
+        E = int(t.num_experts)
+        n_lanes = T * K
+
+        flat = topk_ids.reshape(-1).to(torch.int64)
+        valid = (flat >= 0) & (flat < E)
+        safe = torch.where(valid, flat, torch.zeros_like(flat))
+        flat_weights = topk_output.topk_weights.reshape(-1, 1).contiguous()
+        if self._pool_pf_armed:
+            # a speculative prefetch for this layer is in flight: its rows are
+            # ordinary hits once the event is waited on (prepare_pool's rule)
+            self._pool_pf_armed = False
+            torch.cuda.current_stream().wait_event(self._pool_pf_done)
+        heat = getattr(self, "_pool_heat", None)
+        if heat is not None:
+            from flliper.srt.layers.moe import pool_heat
+
+            pool_heat.count(heat, self._pool_heat_ones, flat.to(torch.int32), E)
+        # the forward's distinct experts, one lane each (no host read)
+        mark = torch.zeros(E + 1, dtype=torch.int32, device=device)
+        mark.index_fill_(0, torch.where(valid, flat, torch.full_like(flat, E)), 1)
+        lane_e = torch.arange(E, dtype=torch.int32, device=device)
+        neg = torch.full_like(lane_e, -1)
+        pending = torch.where(mark[:E] > 0, lane_e, neg)
+        zero_row = self._pool_zero_row().to(torch.int64)
+        # W2-APPLY: a runner with the EP skip gets ONLY the wave's own lanes -- every other lane carries expert
+        # id -1 and its GEMM blocks are skipped (layers/moe/filtered_lanes.py); else the zero-row form
+        from contextlib import nullcontext
+
+        from flliper.srt.layers.moe import filtered_lanes
+
+        filtered = filtered_lanes.layer_supports(self.layer)
+        off_lane = torch.full((), -1, dtype=torch.int64, device=device) if filtered else zero_row
+        apply_ctx = filtered_lanes.active if filtered else nullcontext
+
+        cfg = self.layer.moe_runner_config
+        saved_rsf = cfg.routed_scaling_factor
+        slice_pairs = _em_slice_pairs() or n_lanes
+        partials = None
+        combine_out = None
+        # S78 EM-FETCH: device time + rows/bytes of this layer's row copies (events, no sync)
+        from flliper.srt.layers.moe import em_fetch_probe
+
+        probe = em_fetch_probe.begin_layer(device)
+        try:
+            cfg.routed_scaling_factor = 1.0
+            for wave in range(1, int(waves) + 1):
+                last = wave == int(waves)
+                # the lanes still owed: their expert is in this wave's step
+                owed = valid & (pending.index_select(0, safe) >= 0)
+                step(t, pending, buffers, spill=not last, wave=wave > 1, waves=waves,
+                     capture_rows_on=getattr(self, "_pool_capture_on", 0))
+                e0 = probe.mark() if probe is not None else None
+                copy_rows(self._pool_srcs, self._pool_dsts, buffers.gather_src,
+                          buffers.gather_dst, buffers.gather_count)
+                if probe is not None:
+                    probe.copied(e0, buffers.gather_count, self._em_fetch_row_bytes(), wave=wave)
+                # read this wave's routes before the next step rewrites them
+                routes_e = buffers.routes[:E].to(torch.int64)
+                lane_route = routes_e.index_select(0, safe)
+                served = owed & (lane_route >= 0)
+                if not last:
+                    pending = torch.where((pending >= 0) & (routes_e < 0), pending, neg)
+                for a in range(0, n_lanes, slice_pairs):
+                    b = min(n_lanes, a + slice_pairs)
+                    srv = served[a:b]
+                    rows = torch.div(torch.arange(a, b, device=device), K, rounding_mode="floor")
+                    tid_w = torch.where(srv, lane_route[a:b], off_lane).to(topk_ids.dtype)
+                    tw_w = torch.where(
+                        srv.unsqueeze(1), flat_weights[a:b], torch.zeros_like(flat_weights[a:b])
+                    )
+                    hs_w = hidden.index_select(0, rows).contiguous()
+                    sc_w = (
+                        scale.index_select(0, rows)
+                        if isinstance(scale, torch.Tensor) and scale.shape[0] == T
+                        else scale
+                    )
+                    rl_w = (
+                        router_logits.index_select(0, rows)
+                        if isinstance(router_logits, torch.Tensor)
+                        and router_logits.dim() >= 1
+                        and router_logits.shape[0] == T
+                        else router_logits
+                    )
+                    sub = dispatch_output._replace(
+                        hidden_states=hs_w,
+                        hidden_states_scale=sc_w,
+                        topk_output=topk_output._replace(
+                            topk_weights=tw_w, topk_ids=tid_w.unsqueeze(1), router_logits=rl_w
+                        ),
+                    )
+                    with apply_ctx():
+                        combine_out = apply_fn(sub)
+                    part = combine_out.hidden_states
+                    if partials is None:
+                        partials = torch.zeros(
+                            (n_lanes, part.shape[-1]), dtype=part.dtype, device=device
+                        )
+                    partials[a:b] = torch.where(
+                        srv.unsqueeze(1), part.to(partials.dtype), partials[a:b]
+                    )
+                if probe is not None:
+                    # F3: this wave's apply time and served lanes; W2-APPLY: the lanes its GEMMs computed
+                    probe.applied(wave, served, served if filtered else n_lanes)
+        finally:
+            cfg.routed_scaling_factor = saved_rsf
+        out_full = torch.empty((T, partials.shape[-1]), dtype=partials.dtype, device=device)
+        combine_topk_partials(partials.view(T, K, -1), out_full, saved_rsf)
+        if probe is not None:
+            probe.end_layer(T)
+        return combine_out._replace(hidden_states=out_full)
+
+    def _em_fetch_row_bytes(self) -> int:
+        """S78 EM-FETCH: the bytes ONE expert row moves over all pool tensors (host ints, cached)."""
+        rb = getattr(self, "_em_fetch_row_bytes_v", None)
+        if rb is None:
+            rb = 0
+            for src in self._pool_srcs:
+                try:
+                    rb += int(src.stride(0)) * int(src.element_size())
+                except Exception:  # noqa: BLE001 -- an odd source counts nothing
+                    pass
+            self._em_fetch_row_bytes_v = rb
+        return int(rb)
 
     def _pool_wave_step(self, ids, *, spill: bool, waves: int):
         """H95: one later wave -- plan ``ids`` (lanes not in this wave = -1),
@@ -5104,9 +5528,16 @@ class MoEExpertOffloadCache:
         every forward with a host-side routing instrument, plans on the host
         (``_run_eager_host_plan``)."""
         n_ids = int(dispatch_output.topk_output.topk_ids.numel())
-        waves, _reason = self.eager_device_waves(n_ids)
+        waves, reason = self.eager_device_waves(n_ids)
         if waves:
             return self._run_eager_device_step(dispatch_output, apply_fn, waves)
+        if reason in ("over_graph_form", "waves_cap"):
+            # S51: past the graph form, the device-planned expert-major pass
+            em_waves, _em_reason = self.eager_device_em_waves(n_ids)
+            if em_waves:
+                return self._run_eager_device_step(
+                    dispatch_output, apply_fn, em_waves, em=True
+                )
         return self._run_eager_host_plan(dispatch_output, apply_fn)
 
     def eager_device_limit(self) -> int:
@@ -5139,12 +5570,7 @@ class MoEExpertOffloadCache:
             return 0, "pool_not_ready"
         if n_ids <= 0:
             return 0, "empty"
-        if (
-            self._route_note
-            or getattr(self, "_router_stats", None) is not None
-            or getattr(self, "_heat", None) is not None
-            or (getattr(self, "_hot_enabled", False) and not getattr(self, "_hot_frozen", True))
-        ):
+        if self._eager_host_instrument():
             return 0, "host_instrument"  # they read the routing on the host
         if n_ids > self.eager_device_limit():
             return 0, "over_graph_form"
@@ -5155,15 +5581,67 @@ class MoEExpertOffloadCache:
             return 0, "waves_cap"
         return need, "device"
 
-    def _run_eager_device_step(self, dispatch_output, apply_fn, waves: int):
+    def _eager_host_instrument(self) -> bool:
+        """A routing instrument that reads the ids on the host is on (route
+        note, router stats, heat window, hot-set calibration): such a forward
+        plans on the host, whatever the device step could take."""
+        return bool(
+            self._route_note
+            or getattr(self, "_router_stats", None) is not None
+            or getattr(self, "_heat", None) is not None
+            or (getattr(self, "_hot_enabled", False) and not getattr(self, "_hot_frozen", True))
+        )
+
+    def eager_device_em_waves(self, n_ids: int) -> Tuple[int, str]:
+        """S51 EAGER-DEVICE-EM: ``(waves, reason)`` for an eager forward past
+        the graph form, or 0 and why the host plans it. The pass hands the
+        pool step ONE lane per local expert (the forward's distinct ids), so
+        the step's own width must cover ``E`` and its wave bound is the worst
+        case of that set, ``min(E, E - R) <= waves x (LRU + staging)``. Host
+        ints only, no device read."""
+        from flliper.srt.environ import envs
+        from flliper.srt.layers.moe.expert_pool_device import (
+            pool_row_capacity,
+            pool_waves_for,
+            resident_count,
+        )
+
+        if not (self._pool_eager_device_step and self._pool_eager_device_em):
+            return 0, "em_switch_off"
+        if not self._pool_ready:
+            return 0, "pool_not_ready"
+        if n_ids <= 0:
+            return 0, "empty"
+        if self._eager_host_instrument():
+            return 0, "host_instrument"
+        if partials_mode() == "stream" or _nan_guard_wave_armed():
+            return 0, "em_host_partials"  # fp32 streaming / per-wave NaN guard: host loop
+        cap_ids = int(envs.FLLIPER_OPT_MOE_POOL_EAGER_DEVICE_EM_MAX_IDS.get() or 0)
+        if cap_ids > 0 and n_ids > cap_ids:
+            return 0, "em_max_ids"
+        t = self._pool_tables
+        E = int(t.num_experts)
+        if E > int(self._pool_buffers.gather_src.shape[0]):
+            return 0, "em_width"  # one lane per expert must fit the step kernel
+        need = pool_waves_for(E, E, resident_count(t), pool_row_capacity(t, 0))
+        cap = max(1, int(envs.FLLIPER_OPT_MOE_POOL_EAGER_DEVICE_EM_WAVES.get() or 0))
+        if need > cap:
+            return 0, "em_waves_cap"
+        return need, "device_em"
+
+    def _run_eager_device_step(self, dispatch_output, apply_fn, waves: int, em: bool = False):
         """D-Mini-Extend: the eager forward on the decode graph's device plan
         (``prepare_pool`` / ``run_pool_waves``), run eagerly -- plan and row
         copies on the device, the LRU updated by the step's own rule, nothing
         republished from the host. Deferred rows land first and the resume
-        warm drops this layer, exactly as on the host plan."""
+        warm drops this layer, exactly as on the host plan.
+
+        ``em`` (S51 EAGER-DEVICE-EM): the forward is past the graph form and
+        runs ``run_pool_em`` (distinct-expert lanes, expert-major partials)
+        under the same frame; its metal check has its own budget."""
         self.land_deferred_rows()  # H31b: the layout is the full one before the step
         resume_warm().eager_reached(self)  # RW: an eager layer never waits for the warm
-        check = self._pool_eager_device_checks > 0
+        check = (self._pool_eager_device_em_checks if em else self._pool_eager_device_checks) > 0
         saved = None
         if check:
             # the reference must see the MoE input this forward saw
@@ -5177,7 +5655,9 @@ class MoEExpertOffloadCache:
         prev_on = getattr(self, "_pool_capture_on", 0)
         self._pool_capture_on = 0  # not a capture: the rows ON now
         try:
-            if waves > 1:
+            if em:
+                out = self.run_pool_em(dispatch_output, apply_fn, waves)
+            elif waves > 1:
                 out = self.run_pool_waves(dispatch_output, apply_fn, waves)
             else:
                 topk_output = dispatch_output.topk_output
@@ -5190,10 +5670,16 @@ class MoEExpertOffloadCache:
         finally:
             self._pool_capture_on = prev_on
         topk_ids = dispatch_output.topk_output.topk_ids
-        self._note_eager_device_step(int(topk_ids.shape[0]), int(topk_ids.numel()), waves)
+        if em:
+            self._note_eager_device_em(int(topk_ids.shape[0]), int(topk_ids.numel()), waves)
+        else:
+            self._note_eager_device_step(int(topk_ids.shape[0]), int(topk_ids.numel()), waves)
         if check:
-            self._pool_eager_device_checks -= 1
-            out = self._check_eager_device_step(saved, apply_fn, out, waves)
+            if em:
+                self._pool_eager_device_em_checks -= 1
+            else:
+                self._pool_eager_device_checks -= 1
+            out = self._check_eager_device_step(saved, apply_fn, out, waves, em=em)
         return out
 
     def _note_eager_device_step(self, tokens: int, n_ids: int, waves: int) -> None:
@@ -5215,13 +5701,45 @@ class MoEExpertOffloadCache:
             self._eager_device_steps,
         )
 
-    def _check_eager_device_step(self, saved, apply_fn, out, waves: int):
+    def _note_eager_device_em(self, tokens: int, n_ids: int, waves: int) -> None:
+        """S51 metal marker, one line per EM forward on one representative
+        layer (the H107 rule: INFO there, DEBUG elsewhere)."""
+        import logging
+
+        global _EDS_EM_LOG_LAYER
+
+        self._eager_device_em_steps = int(getattr(self, "_eager_device_em_steps", 0)) + 1
+        layer_id = getattr(self.layer, "layer_id", "?")
+        if _EDS_EM_LOG_LAYER is None:
+            _EDS_EM_LOG_LAYER = layer_id
+        logging.getLogger(__name__).log(
+            logging.INFO if layer_id == _EDS_EM_LOG_LAYER else logging.DEBUG,
+            "EAGER-DEVICE-EM layer %s: T=%d ids=%d experts=%d waves=%d slice=%d n=%d "
+            "(device-planned expert-major extend: distinct-expert pool step, every "
+            "(token, k) pair once into the partials table, one combine; no host plan, "
+            "no per-layer sync; FLLIPER_OPT_MOE_POOL_EAGER_DEVICE_EM)",
+            layer_id, tokens, n_ids, int(self._pool_tables.num_experts), waves,
+            _em_slice_pairs(), self._eager_device_em_steps,
+        )
+
+    def _check_eager_device_step(self, saved, apply_fn, out, waves: int, em: bool = False):
         """FLLIPER_DEBUG_MOE_POOL_EAGER_DEVICE_CHECK: the same forward on the
         plain host plan (H107 off -- every spill expert fetched fresh from
         the host store, no device table trusted) is the reference. MATCH
         (bit-identical) or MATCH~fp (fp rounding, e.g. a multi-wave
         reference) logs; anything else stops the rank by name. Returns the
-        device result (a copy: the reference's apply may reuse buffers)."""
+        device result (a copy: the reference's apply may reuse buffers).
+
+        ``em`` (S51r, review 18.10.): an EAGER-DEVICE-EM MISMATCH does NOT stop
+        the rank. The reference IS the host plan this forward would have run
+        without EM, so its output is served instead, one ERROR line
+        ``EAGER-DEVICE-EM MISMATCH-FALLBACK`` names the layer and the numbers,
+        and this layer plans every later extend past the graph form on the
+        host (``_pool_eager_device_em`` off for this instance) -- the EM rows
+        are proven wrong there, so no unchecked EM forward follows. A defect
+        report, not a switch: the default stays on, every other layer keeps
+        EM. No collective inside the MoE, so a rank-local fallback moves no
+        collective (R11 note in ``eager_device_em_waves``)."""
         import logging
 
         got = out.hidden_states.clone()
@@ -5234,6 +5752,20 @@ class MoEExpertOffloadCache:
         verdict, max_abs, scale = compare_moe_outputs(got, ref.hidden_states)
         layer_id = getattr(self.layer, "layer_id", "?")
         tokens = int(saved.topk_output.topk_ids.shape[0])
+        if verdict == "MISMATCH" and em:
+            self._pool_eager_device_em = False
+            self._eager_device_em_fallbacks = int(
+                getattr(self, "_eager_device_em_fallbacks", 0)
+            ) + 1
+            logging.getLogger(__name__).error(
+                "EAGER-DEVICE-EM MISMATCH-FALLBACK layer %s: T=%d waves=%d max_abs=%.6g "
+                "scale=%.6g -- the device-planned expert-major extend differs from the "
+                "host plan beyond fp rounding; this extend is served by the host plan "
+                "(the reference) and this layer plans every later extend past the graph "
+                "form on the host. DEFECT, report it (FLLIPER_OPT_MOE_POOL_EAGER_DEVICE_EM)",
+                layer_id, tokens, waves, max_abs, scale,
+            )
+            return ref
         if verdict == "MISMATCH":
             raise RuntimeError(
                 f"EAGER-DEVICE-STEP MISMATCH layer {layer_id}: T={tokens} waves={waves} "
@@ -5262,18 +5794,29 @@ class MoEExpertOffloadCache:
         # (Task #47) spells that identity out as maps, and the NF D pool runs
         # on the store, so `resident_ids is None` kept H107 off on the metal
         # (bridge 28.09. 19:38-19:58: 0x 'H107 EAGER-LRU').
-        self._eager_lru_armed = (
+        # H107c (S44): a MAPPED frozen layout arms too -- wave 0 reads each
+        # resident at its own slot (the NF D Karte puts pad 0 behind the
+        # prefix, slot != id on every D rank, and H107 never armed there).
+        from flliper.srt.environ import envs
+
+        self._eager_lru_slots = None
+        if (
             self._pool_eager_lru_hits
             and self._pool_ready
             and self._pool_eager_wave_order == "expert"
-            and eager_lru_static_residency(self.planner, self.resident_count)
-        )
+        ):
+            self._eager_lru_slots = eager_lru_resident_slots(
+                self.planner, self.resident_count,
+                mapped=bool(envs.FLLIPER_OPT_MOE_POOL_EAGER_LRU_MAPPED.get()),
+            )
+        self._eager_lru_armed = self._eager_lru_slots is not None
         try:
             out = self.run_waves(
                 dispatch_output, apply_fn, lookahead=None, order=self._pool_eager_wave_order
             )
         finally:
             self._eager_lru_armed = False
+            self._eager_lru_slots = None
         self.sync_pool_from_host()
         return out
 
@@ -5812,12 +6355,25 @@ class MoEExpertOffloadCache:
         topk_ids = dispatch_output.topk_output.topk_ids
         n_own = int(topk_ids.numel())
         pool_hot = None
+        pool_use = None
         if lookahead is None and self._eager_lru_armed:
-            # H107: the pool map rides the ids' D2H (see run_waves)
-            both_np = torch.cat(
-                [topk_ids.reshape(-1), self._pool_tables.hot_phys.reshape(-1).to(topk_ids.dtype)]
-            ).cpu().numpy()
-            pool_hot = both_np[n_own:].tolist()
+            # H107: the pool map rides the ids' D2H (see run_waves); H107d
+            # (S44): the rows' use clocks too
+            from flliper.srt.environ import envs
+
+            hot_dev = self._pool_tables.hot_phys.reshape(-1).to(topk_ids.dtype)
+            parts = [topk_ids.reshape(-1), hot_dev]
+            reclaim = bool(envs.FLLIPER_OPT_MOE_POOL_EAGER_LRU_RECLAIM.get())
+            if reclaim:
+                lim = torch.iinfo(topk_ids.dtype).max
+                parts.append(
+                    self._pool_tables.row_use.reshape(-1).clamp(max=lim).to(topk_ids.dtype)
+                )
+            both_np = torch.cat(parts).cpu().numpy()
+            n_hot = int(hot_dev.numel())
+            pool_hot = both_np[n_own : n_own + n_hot].tolist()
+            if reclaim:
+                pool_use = both_np[n_own + n_hot :].tolist()
         elif lookahead is None:
             both_np = topk_ids.reshape(-1).cpu().numpy()
         else:
@@ -5849,6 +6405,7 @@ class MoEExpertOffloadCache:
                 resident_used=resident_used,
                 spill_waves=spill_waves,
                 pool_hot=pool_hot,
+                pool_use=pool_use,
             )
             if out is not None:
                 return out
@@ -5918,16 +6475,30 @@ class MoEExpertOffloadCache:
 
         prefetch = None
         pool_hot = None
+        pool_use = None
         if lookahead is None and self._eager_lru_armed:
             # H107: this layer's pool map crosses in the SAME rendezvous as the
-            # routing -- one D2H per layer, as before
+            # routing -- one D2H per layer, as before. H107d (S44): the rows'
+            # use clocks ride along (clamped into the ids' dtype; residents and
+            # staging carry ROW_USE_NEVER, which only orders them last).
             n_own = topk_ids.numel()
             k = topk_ids.shape[-1]
-            both = torch.cat(
-                [topk_ids.reshape(-1), self._pool_tables.hot_phys.reshape(-1).to(topk_ids.dtype)]
-            ).tolist()
+            from flliper.srt.environ import envs
+
+            hot_dev = self._pool_tables.hot_phys.reshape(-1).to(topk_ids.dtype)
+            parts = [topk_ids.reshape(-1), hot_dev]
+            reclaim = bool(envs.FLLIPER_OPT_MOE_POOL_EAGER_LRU_RECLAIM.get())
+            if reclaim:
+                lim = torch.iinfo(topk_ids.dtype).max
+                parts.append(
+                    self._pool_tables.row_use.reshape(-1).clamp(max=lim).to(topk_ids.dtype)
+                )
+            both = torch.cat(parts).tolist()
             ids_list = [both[i : i + k] for i in range(0, n_own, k)]
-            pool_hot = both[n_own:]
+            n_hot = int(hot_dev.numel())
+            pool_hot = both[n_own : n_own + n_hot]
+            if reclaim:
+                pool_use = both[n_own + n_hot :]
         elif lookahead is None:
             ids_list = topk_ids.tolist()  # [T][k]  (device->host sync; eager only)
         else:
@@ -5982,6 +6553,7 @@ class MoEExpertOffloadCache:
                     resident_used=resident_used,
                     spill_waves=spill_waves,
                     pool_hot=pool_hot,
+                    pool_use=pool_use,
                 )
                 if out is not None:
                     return out
@@ -6070,7 +6642,8 @@ class MoEExpertOffloadCache:
         return combine_out._replace(hidden_states=out_full)
 
     def _run_eager_lru(
-        self, dispatch_output, apply_fn, *, flat_np, resident_used, spill_waves, pool_hot
+        self, dispatch_output, apply_fn, *, flat_np, resident_used, spill_waves, pool_hot,
+        pool_use=None,
     ):
         """H107: run this eager pool forward on the plan that reads warm LRU
         rows (``plan_eager_lru_waves``). ``pool_hot`` is the host copy of the
@@ -6083,12 +6656,19 @@ class MoEExpertOffloadCache:
         lru = pool_lru_rows(pool_hot, t.lru_start, min(int(t.pool_rows), bank_rows))
         spill = [e for wave in spill_waves for e in wave]
         R = self.resident_count
-        plan = plan_eager_lru_waves(spill, lru, range(R, R + self.scratch))
+        # H107d (S44): pool_use present = the reclaim switch is on; the bound
+        # is the plain plan's spill waves + 1
+        cap = (len(spill_waves) + 1) if pool_use is not None else 0
+        plan = plan_eager_lru_waves_reclaim(
+            spill, lru, range(R, R + self.scratch), row_use=pool_use, max_waves=cap
+        )
         if plan is None:
             return None
-        hits, miss_waves = plan
+        hits, miss_waves, reclaimed = plan
         self._eager_lru_used.update({row: e for e, row in hits.items()})
-        slot0 = {int(e): int(e) for e in resident_used}
+        # H107c (S44): a resident is read at ITS slot ({} = identity layout)
+        slots = getattr(self, "_eager_lru_slots", None) or {}
+        slot0 = {int(e): int(slots.get(int(e), e)) for e in resident_used}
         slot0.update(hits)
         n_miss = sum(len(w) for w in miss_waves)
         stats = self.planner.stats
@@ -6098,7 +6678,9 @@ class MoEExpertOffloadCache:
         stats.misses += n_miss
         stats.fetches += n_miss
         h2d_before = stats.h2d_bytes
-        if len(miss_waves) <= 1:
+        # a reclaimed hit row is read in wave 0 and overwritten after it: wave 0
+        # must be its own apply (the multi-wave loop), never fused with a fetch
+        if len(miss_waves) <= 1 and not reclaimed:
             fetch = list(miss_waves[0]) if miss_waves else []
             slot = dict(slot0)
             slot.update(fetch)
@@ -6123,10 +6705,12 @@ class MoEExpertOffloadCache:
             waves_before=len(spill_waves),
             waves_after=len(miss_waves),
             h2d_bytes=stats.h2d_bytes - h2d_before,
+            reclaimed=len(reclaimed),
         )
         return out
 
-    def _note_eager_lru(self, *, tokens, spill, hits, misses, waves_before, waves_after, h2d_bytes):
+    def _note_eager_lru(self, *, tokens, spill, hits, misses, waves_before, waves_after, h2d_bytes,
+                        reclaimed=0):
         """H107 metal marker, one line per eager forward (INFO for one
         representative layer, DEBUG for the rest -- the _log_wave_h2d rule).
         waves_before = the scratch waves the plain plan would have run."""
@@ -6140,7 +6724,7 @@ class MoEExpertOffloadCache:
         logging.getLogger(__name__).log(
             logging.INFO if layer_id == _H107_LOG_LAYER else logging.DEBUG,
             "H107 EAGER-LRU layer %s: T=%d spill %d = lru_hits %d + misses %d, "
-            "waves %d -> %d, %.3f GiB H2D",
+            "waves %d -> %d, %.3f GiB H2D, reclaimed %d",
             layer_id,
             tokens,
             spill,
@@ -6149,6 +6733,7 @@ class MoEExpertOffloadCache:
             waves_before,
             waves_after,
             h2d_bytes / float(1 << 30),
+            reclaimed,
         )
 
     def _issue_lookahead(self, lookahead, pred_list):
@@ -6360,6 +6945,9 @@ class MoEExpertOffloadCache:
         slice_pairs = wave_token_slice_pairs()
         stream_partials = partials_mode() == "stream"
         out_acc = None  # [T, H] fp32 when streaming
+        from flliper.srt.environ import envs as _envs
+
+        pinned_idx = bool(_envs.FLLIPER_OPT_MOE_OFFLOAD_PINNED_WAVE_IDX.get())
         try:
             cfg.routed_scaling_factor = 1.0
             all_waves = [resident_used] + spill_waves
@@ -6406,9 +6994,14 @@ class MoEExpertOffloadCache:
                 # computed exactly once and lands in its own partials row.
                 step = slice_pairs if slice_pairs > 0 else int(idx_np.size)
                 for start in range(0, int(idx_np.size), step):
-                    idx = torch.from_numpy(idx_np[start : start + step]).to(
-                        device, non_blocking=True
-                    )
+                    if pinned_idx:
+                        # S51: pinned staging -- the pageable copy blocked the
+                        # host behind this wave's own fetch (fn3g)
+                        idx = _h2d_i64(idx_np[start : start + step], device)
+                    else:
+                        idx = torch.from_numpy(idx_np[start : start + step]).to(
+                            device, non_blocking=True
+                        )
                     rows = torch.div(idx, K, rounding_mode="floor")
                     tid_w = lut[flat_ids.index_select(0, idx)].unsqueeze(1)
                     tw_w = flat_weights.index_select(0, idx)
@@ -7232,9 +7825,15 @@ class DeferredRowsFill:
         self.by_tick = 0
         self.by_eager = 0
         self.ticks = 0
+        # 02.10. (y7l NF D->P): layers whose rows were NOT yet on the card when
+        # the forward stream needed them (event open, or loaded by land() on the
+        # forward stream itself). 0 = no forward ever waited for the fill.
+        self.waited = 0
+        self.t_first_tick = None
         # xid13 kvh: layers whose full layout landed after a live seat-row change
         self.seat_moved = 0
         self.seat_moved_on = None
+        self.per_layer_told = False
 
     def _ops(self):
         if self._ops_arg == "cuda":
@@ -7301,9 +7900,14 @@ class DeferredRowsFill:
                 load_refill_rows(d.entries, d.runs, layer_id=d.layer_id)
                 self.events[id(cache)] = ops.record(self.stream) if ops is not None else None
 
-    def _promote(self, cache, how: str) -> None:
+    def _promote(self, cache, how: str, *, waited: Optional[bool] = None) -> None:
         ops = self._ops()
         ev = self.events.pop(id(cache), None)
+        if waited is None:
+            # an event still open here makes the forward stream wait for it
+            waited = ev is not None and not bool(ev.query())
+        if waited:
+            self.waited += 1
         if ev is not None and ops is not None:
             ops.current_waits(ev)
         rows = int(cache._deferred_rows.rows)
@@ -7319,13 +7923,24 @@ class DeferredRowsFill:
             self.by_eager += 1
         if not self.pending:
             now = self._clock()
+            # fill_ms is fill-start -> THIS promotion (it happens at a forward of
+            # this rank), NOT the copy time: y7l (02.10.) read PP2's fill_ms=6630
+            # as 6.6 s of copies gating P's first chunk, while every layer had
+            # landed before PP2's first forward (forward_waited_layers=0) and
+            # PP2's first forward simply came when PP0+PP1 had computed chunk 1.
+            first = self.t_first_tick
             logger.info(
                 "%s landed layers=%d rows=%d by_tick=%d by_eager=%d ticks=%d "
-                "fill_ms=%s since_rearm_ms=%.0f (every pool layer is on its full layout "
-                "again)", self.LINE, self.by_tick + self.by_eager, self.rows_landed,
-                self.by_tick, self.by_eager, self.ticks,
+                "fill_ms=%s since_rearm_ms=%.0f forward_waited_layers=%d first_forward_ms=%s "
+                "(every pool layer is on its full layout again; fill_ms = fill-start -> this "
+                "promotion at a forward of this rank, not the copy time; "
+                "forward_waited_layers=0: the rows had landed before any forward needed them, "
+                "the fill gated nothing)", self.LINE, self.by_tick + self.by_eager,
+                self.rows_landed, self.by_tick, self.by_eager, self.ticks,
                 "n/a" if self.t_start is None else "%.0f" % ((now - self.t_start) * 1000),
-                (now - (self.t_rearm or now)) * 1000)
+                (now - (self.t_rearm or now)) * 1000, self.waited,
+                "n/a" if first is None or self.t_start is None
+                else "%.0f" % ((first - self.t_start) * 1000))
             if self.seat_moved:
                 logger.info(
                     "%s SEAT-RESTAMP layers=%d rows_on %d->%d (the full layouts were built "
@@ -7343,6 +7958,8 @@ class DeferredRowsFill:
             d = cache._deferred_rows
             # noch nicht auf dem Seitenstrom: dieser Layer allein, hier
             load_refill_rows(d.entries, d.runs, layer_id=d.layer_id)
+            self._promote(cache, "eager", waited=True)  # the forward stream copies
+            return
         self._promote(cache, "eager")
 
     def tick(self, is_decode: bool) -> None:
@@ -7350,6 +7967,8 @@ class DeferredRowsFill:
         if not self.pending:
             return
         self.ticks += 1
+        if self.t_first_tick is None:
+            self.t_first_tick = self._clock()
         early = [c for c in self.pending
                  if c._deferred_rows is not None and c._deferred_rows.early]
         if early:
@@ -7360,8 +7979,32 @@ class DeferredRowsFill:
             late = [c for c in early if id(c) not in self.events]
             if late:
                 self._issue(late)
-            for cache in early:
-                self._promote(cache, "tick")
+            if is_decode or not per_layer_landing():
+                for cache in early:
+                    self._promote(cache, "tick")
+            else:
+                # FLIPCYCLE H2 (02.10.): an EXTEND forward lands each early layer
+                # right before its own MoE (run_waves / run_eager_pool call
+                # land_deferred_rows -> land -> the forward stream waits THAT
+                # layer's event only). Layer 0 computes while the rows of the
+                # later layers still stream; the old form made the whole forward
+                # wait for every layer (y6z P-PP0 0.3-1.0 s, PP1 ~0.36 s, PLE
+                # gather 743 ms behind it). The layers whose rows already landed
+                # are promoted here; a decode (graph replay, no land) keeps the
+                # full wait above.
+                ready = [c for c in early
+                         if self.events.get(id(c)) is None or bool(self.events[id(c)].query())]
+                for cache in ready:
+                    self._promote(cache, "tick")
+                if self.pending and not self.per_layer_told:
+                    self.per_layer_told = True
+                    logger.info("PDFLIP-FLIPCYCLE stage=rearm_wait ms=0 floor_ms=0 mode=per_layer "
+                                "layers_open=%d rows_open=%d since_start_ms=%.0f (H2: the first "
+                                "extend after the wake no longer waits for every layer's extra "
+                                "rows; each layer waits for its own)", len(self.pending),
+                                self.rows_pending(),
+                                (self._clock() - (self.t_start or self._clock())) * 1000)
+                return
             if not self.pending:
                 return
         if not self.started:
@@ -7376,6 +8019,28 @@ class DeferredRowsFill:
             if ev is not None and not bool(ev.query()):
                 break  # ein Strom: dahinter ist auch noch nichts fertig
             self._promote(cache, "tick")
+
+    def land_now(self, why: str) -> int:
+        """VISION-WEIGHTS (AP3, NF): jede offene Zeile JETZT auf der Karte,
+        auf dem Host abgewartet. Die Vision-Stufe leiht residente Zeilen als
+        Turmspeicher und bildet vorher ihre Pruefsumme -- ein Nachlader, der
+        noch auf dem Seitenstrom schreibt, waere ein zweiter Schreiber (Plan
+        R3). Nicht eingereihte Layer werden eingereiht (hinter den laufenden
+        Strom), dann wartet der Host jedes Event. Befoerdert wird NICHTS: das
+        macht der naechste Forward (``tick``), dessen Warten dann leer ist.
+        Gibt die Zahl der abgewarteten Layer zurueck (0: nichts offen)."""
+        if not self.pending:
+            return 0
+        if not self.started:
+            self.start(why=why)
+        late = [c for c in self.pending if id(c) not in self.events]
+        if late:
+            self._issue(late)
+        for cache in self.pending:
+            ev = self.events.get(id(cache))
+            if ev is not None:
+                ev.synchronize()
+        return len(self.pending)
 
     def settle(self) -> None:
         """Vor dem Schlaf: einen laufenden Nachlader abwarten (die Puffer
@@ -7394,6 +8059,13 @@ class DeferredRowsFill:
 
 
 _DEFERRED_ROWS_FILL: Optional[DeferredRowsFill] = None
+
+
+def per_layer_landing() -> bool:
+    """FLIPCYCLE H2 switch (FLLIPER_PDFLIP_ENABLE_REARM_DEFER_PER_LAYER)."""
+    from flliper.srt.environ import envs
+
+    return bool(envs.FLLIPER_PDFLIP_ENABLE_REARM_DEFER_PER_LAYER.get())
 
 
 # ---------------------------------------------------------------------------
@@ -7984,7 +8656,9 @@ class _CudaStreamOps:
     def new_stream(self):
         import torch
 
-        return torch.cuda.Stream()
+        s = torch.cuda.Stream()
+        _register_row_stream(s)  # F3: H31 rearm / deferred rows / resume warm streams write bank rows
+        return s
 
     def stream_ctx(self, stream):
         import torch

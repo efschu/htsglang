@@ -481,8 +481,9 @@ def test_vram_refusal_sites_of_the_launcher_are_untouched():
     src = open(launcher.__file__, encoding="utf-8").read()
     counts = {c: len(re.findall(r'refuse_value\(\s*"%s"' % re.escape(c), src))
               for c in ("D-BUDGET", "P-CARD", "WAKE-CREDIT", "HW-COUNT", "HW-UNCALIBRATED", "HW-BORROWED")}
-    # 27B line: counted on the RC3 head 524a880606 (the base of this port); all of them stay as they were
-    assert counts == {'D-BUDGET': 1, 'P-CARD': 2, 'WAKE-CREDIT': 2, 'HW-COUNT': 2, 'HW-UNCALIBRATED': 1, 'HW-BORROWED': 0}, counts
+    # 27B line: counted on the RC3 head 524a880606 (the base of this port); all of them stay as they were.
+    # 27B port 20.10. (NF rc28 merged): + the NF AP4 HW-BORROWED site (refusals register carries the code now)
+    assert counts == {'D-BUDGET': 1, 'P-CARD': 2, 'WAKE-CREDIT': 2, 'HW-COUNT': 2, 'HW-UNCALIBRATED': 1, 'HW-BORROWED': 1}, counts
     # 97 `raise PdFlipLaunchRefused` on 524a880606; HOSTWARN2 adds exactly one (the preflight script without a verdict)
     assert src.count("raise PdFlipLaunchRefused") == 98
 

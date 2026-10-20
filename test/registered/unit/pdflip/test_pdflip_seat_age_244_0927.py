@@ -78,7 +78,10 @@ class FrontWakePlan(unittest.TestCase):
         self.assertEqual(out, [R(9), R(10)])
         lines = [m for m in cap.output if "SEAT-ROTATE" in m]
         self.assertIn(f"rid_in={R(3)} rid_out={R(9)} reason=age", lines[0])
-        self.assertTrue(any(f"D-REFILL rid={R(9)} freed_by=rotate" in m for m in cap.output))
+        # S87 (rc19 pdflip-166-3095): D resumes a deferred rid anyway -- it keeps its seat as a debt, the permit
+        # goes on to the older taker (was: D-REFILL freed_by=rotate, a seatless leg on D)
+        self.assertTrue(any(f"D-SEAT-CREDIT rid={R(9)} why=rotate" in m for m in cap.output))
+        self.assertTrue(all(s.held for s in f._d_seats_live if s.rid in (R(9), R(10))))
 
     def test_the_old_long_runs_keep_their_seats_against_younger_waiters(self):
         # the NF finding re-read: the five long runs are OLDER than the waiters -> they keep the
@@ -264,7 +267,8 @@ class Wiring(unittest.TestCase):
         src = open(F.__file__).read()
         i = src.index("    async def d_admitter(self)")
         blk = src[i:i + 9000]
-        self.assertIn("_ordered = _sa.by_age(self._ready_for_d)", blk)
+        # PRIO-AS-AGE 1014: the D line is ordered by the order key (priority desc, front arrival asc)
+        self.assertIn("_ordered = _sa.by_age(self._ready_for_d, lane_of=lambda q: Front._prio_lane(self, q))", blk)
         self.assertIn("PDFLIP SEAT-AGE BACKFILL", blk)
         self.assertLess(blk.index("SEAT-AGE BACKFILL"), blk.index("await self._d_seat.acquire()"))
 

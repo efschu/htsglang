@@ -202,6 +202,9 @@ class FullComponent(TreeComponent):
                 census = _ef.census_and_repair(self.cache, ct)
                 self._peel(request, tracker)
                 _ef.log_census(census, request, got, tracker[ct], reported)
+                if tracker[ct] < request:
+                    # PW: what the tree still reports is MEASURED unpayable now
+                    _ef.note_peel_short(self.cache, ct)
 
     def _peel(self, request: int, tracker: dict[ComponentType, int]) -> None:
         heap = [
@@ -231,9 +234,18 @@ class FullComponent(TreeComponent):
         ]
         heapq.heapify(heap)
         ct = self.component_type
+        # S22 (R12 SPILL-DIVERGED class): on TP0 of a Form A group the host leaf drop is a STATE(exists=0) verdict; a
+        # worker that holds the node device-resident or interior cannot delete it -- TP0 leaves such a leaf alone
+        from flliper.srt.mem_cache import form_a_host_shadow as _r12
+
+        nodel = _r12.worker_nodelete_keys(self.cache) if _r12.role() == "host" else ()
+        kept = 0
         while tracker[ct] < num_tokens and heap:
             _, x = heapq.heappop(heap)
             if x not in self.cache.evictable_host_leaves:
+                continue
+            if nodel and _r12.node_key(x) in nodel:
+                kept += 1
                 continue
             self.cache._evict_host_leaf(x, tracker)
             if x.parent is not None and x.parent in self.cache.evictable_host_leaves:
@@ -241,6 +253,8 @@ class FullComponent(TreeComponent):
                     heap,
                     (self.cache.eviction_strategy.get_priority(x.parent), x.parent),
                 )
+        if kept:
+            _r12.kept_note("evict_host_worker_cannot_delete", kept)
 
     def acquire_component_lock(
         self,

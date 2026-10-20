@@ -282,7 +282,7 @@ def test_sleep_leg_drains_asserts_flushes_before_the_kv_pause():
     body = src[i:]
     i_drain = body.index("self._pdflip_drain_hicache_before_sleep()")
     i_assert = body.index("self._pdflip_sleep_idle()")
-    # Q-570/Q-590: the flush runs through the guard that leaves no device value in any rank's tree
+    # Q-570: the flush runs through the guard that leaves no device value in any rank's tree
     i_flush = body.index("self._pdflip_sleep_flush()")
     i_pause = body.index("self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)")
     assert i_drain < i_assert < i_flush < i_pause

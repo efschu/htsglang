@@ -26,6 +26,15 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 from flliper.srt.pdflip import arrival_seat_rule as asr  # noqa: E402
 from flliper.srt.pdflip import front as front_mod  # noqa: E402
 
+
+@pytest.fixture(autouse=True)
+def _pbound_flip_now_off(monkeypatch):
+    """These tests pin the seat/KV verdict and the dwell holds for requests that
+    need P -- the rule PBOUND-FLIP-NOW (default on, 02.10.) replaces; they keep
+    covering it as the switch-off path."""
+    monkeypatch.setenv("FLLIPER_PDFLIP_PBOUND_FLIP_NOW", "0")
+
+
 X = 4096
 
 
@@ -124,7 +133,7 @@ def _on(monkeypatch):
 def test_off_is_todays_path_seats_full_goes_to_p(monkeypatch):
     """Switch off: H91c3-3 exactly as before (SEATS-FULL -> BATCH), the rule's
     state is never created."""
-    monkeypatch.delenv("FLLIPER_PDFLIP_ENABLE_ARRIVAL_SEAT_RULE", raising=False)
+    monkeypatch.setenv("FLLIPER_PDFLIP_ENABLE_ARRIVAL_SEAT_RULE", "0")
     f = _front(running=["a"], n=1)
     assert asyncio.run(f._acquire_short_seat("new", 385)) is None
     assert f.counters["short_phase_seats_full"] == 1

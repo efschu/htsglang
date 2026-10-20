@@ -1,5 +1,4 @@
-"""#1400 (NF cand4c 06.10. 11:08:10Z, PP2, rid pdflip-74-260; ported to the 27B
-tree, which has the identical admission spin and revoke drain): the told admission
+"""#1400 (NF cand4c 06.10. 11:08:10Z, PP2, rid pdflip-74-260): the told admission
 gate waited ON the scheduler thread for a read that only the scheduler thread
 could finish.
 
@@ -147,7 +146,7 @@ def test_early_settle_wait_drains_the_revoke_too(clock):
 
 
 def test_a_tree_without_the_drain_keeps_the_unchanged_wait_and_cap(clock):
-    """A tree without the method (doubles): no drain, the wait ends at the cap
+    """27B hi-mamba / doubles: no method, no drain, the wait ends at the cap
     with the named stop, as before."""
     tree = _RevokedTree(can_drain=False)
     s = _Sched(tree)

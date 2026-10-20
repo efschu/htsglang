@@ -505,7 +505,9 @@ class TestRegistryDerivation(unittest.TestCase):
 
     def test_every_model_profile_field_is_classified(self):
         names = {f.name for f in dataclasses.fields(F.ModelProfile)}
-        self.assertEqual(names, set(MP.FIELD_CLASS), "ein neues ModelProfile-Feld muss in model_profile.FIELD_CLASS eingeordnet werden")
+        # FIELD_CLASS ist die Vereinigung der Zeilen-Felder beider Linien (27B-Linie hat Felder, die NF nicht führt, und umgekehrt):
+        # jedes Feld DIESER Dataclass muss eingeordnet sein, ein Feld nur der anderen Linie ist kein Fehler
+        self.assertLessEqual(names, set(MP.FIELD_CLASS), "ein neues ModelProfile-Feld muss in model_profile.FIELD_CLASS eingeordnet werden")
         self.assertEqual({c for c, _ in MP.FIELD_CLASS.values()}, {"fact", "name", "experts", "format", "policy"})
         self.assertEqual(sorted(n for n, (c, _) in MP.FIELD_CLASS.items() if c == "fact"),
                          ["arch", "attn", "context_tokens", "d_layout", "kv_dtype", "page_size", "ple", "replayssm"])
@@ -536,8 +538,11 @@ class TestRegistryDerivation(unittest.TestCase):
             row, _ = self.derived(rid + "-generisch", fx, ckpt)
             self.assertEqual(row.draft.kind, "none")
             self.assertEqual(row.p_draft, "none")
-            for fld in ("agent_span", "standard_form", "inline_system_in_place", "told_paced", "p_twin_defer", "d_hostgap_levers",
-                        "d_release_fixes", "p_row_authority", "mamba_carrier_hold", "repack_outside_pool"):
+            present = {f.name for f in dataclasses.fields(F.ModelProfile)}
+            switches = [fld for fld in ("agent_span", "standard_form", "inline_system_in_place", "told_paced", "p_twin_defer", "d_hostgap_levers",
+                                        "d_release_fixes", "p_row_authority", "mamba_carrier_hold", "repack_outside_pool") if fld in present]
+            self.assertGreaterEqual(len(switches), 7)       # die Linie führt die Mehrzahl dieser Schalter; fehlende gehören der anderen Linie
+            for fld in switches:
                 self.assertFalse(getattr(row, fld), fld)
             self.assertEqual(row.constants, {})
             self.assertEqual(row.vision, "off")

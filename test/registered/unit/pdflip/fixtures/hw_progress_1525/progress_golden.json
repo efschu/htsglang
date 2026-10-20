@@ -1,0 +1,506 @@
+{
+ "2x3090 | 27B-FP8": [
+  "ja",
+  "verweigert",
+  "HW-COUNT",
+  "PROFILE-VECTORS"
+ ],
+ "2x3090 | 27B-GGUF": [
+  "ja",
+  "verweigert",
+  "HW-COUNT",
+  "PROFILE-VECTORS"
+ ],
+ "2x3090 | 27B-INT8": [
+  "ja",
+  "verweigert",
+  "HW-COUNT",
+  "PROFILE-VECTORS"
+ ],
+ "2x3090 | 27B-NVFP4": [
+  "ja",
+  "verweigert",
+  "HW-COUNT",
+  "PROFILE-VECTORS"
+ ],
+ "2x3090 | 27B-NVFP4-DUAL": [
+  "ja",
+  "verweigert",
+  "HW-COUNT",
+  "PROFILE-VECTORS"
+ ],
+ "2x3090 | NF": [
+  "ja",
+  "verweigert",
+  "HW-COUNT",
+  "PROFILE-VECTORS"
+ ],
+ "2x4090 | 27B-FP8": [
+  "ja",
+  "verweigert",
+  "HW-COUNT",
+  "PROFILE-VECTORS"
+ ],
+ "2x4090 | 27B-GGUF": [
+  "ja",
+  "verweigert",
+  "HW-COUNT",
+  "PROFILE-VECTORS"
+ ],
+ "2x4090 | 27B-INT8": [
+  "ja",
+  "verweigert",
+  "HW-COUNT",
+  "PROFILE-VECTORS"
+ ],
+ "2x4090 | 27B-NVFP4": [
+  "ja",
+  "verweigert",
+  "HW-COUNT",
+  "PROFILE-VECTORS"
+ ],
+ "2x4090 | 27B-NVFP4-DUAL": [
+  "ja",
+  "verweigert",
+  "HW-COUNT",
+  "PROFILE-VECTORS"
+ ],
+ "2x4090 | NF": [
+  "ja",
+  "verweigert",
+  "HW-COUNT",
+  "PROFILE-VECTORS"
+ ],
+ "2x5090 | 27B-FP8": [
+  "ja",
+  "verweigert",
+  "HW-COUNT",
+  "PROFILE-VECTORS"
+ ],
+ "2x5090 | 27B-GGUF": [
+  "ja",
+  "verweigert",
+  "HW-COUNT",
+  "PROFILE-VECTORS"
+ ],
+ "2x5090 | 27B-INT8": [
+  "ja",
+  "verweigert",
+  "HW-COUNT",
+  "PROFILE-VECTORS"
+ ],
+ "2x5090 | 27B-NVFP4": [
+  "ja",
+  "verweigert",
+  "HW-COUNT",
+  "PROFILE-VECTORS"
+ ],
+ "2x5090 | 27B-NVFP4-DUAL": [
+  "ja",
+  "verweigert",
+  "HW-COUNT",
+  "PROFILE-VECTORS"
+ ],
+ "2x5090 | NF": [
+  "ja",
+  "verweigert",
+  "HW-COUNT",
+  "PROFILE-VECTORS"
+ ],
+ "3070+5070+3090+5090 | 27B-FP8": [
+  "ja",
+  "verweigert",
+  "HW-COUNT",
+  "PROFILE-VECTORS"
+ ],
+ "3070+5070+3090+5090 | 27B-GGUF": [
+  "ja",
+  "verweigert",
+  "HW-COUNT",
+  "PROFILE-VECTORS"
+ ],
+ "3070+5070+3090+5090 | 27B-INT8": [
+  "ja",
+  "verweigert",
+  "HW-COUNT",
+  "PROFILE-VECTORS"
+ ],
+ "3070+5070+3090+5090 | 27B-NVFP4": [
+  "ja",
+  "verweigert",
+  "HW-COUNT",
+  "PROFILE-VECTORS"
+ ],
+ "3070+5070+3090+5090 | 27B-NVFP4-DUAL": [
+  "ja",
+  "verweigert",
+  "HW-COUNT",
+  "PROFILE-VECTORS"
+ ],
+ "3070+5070+3090+5090 | NF": [
+  "ja",
+  "verweigert",
+  "HW-COUNT",
+  "PROFILE-VECTORS"
+ ],
+ "3x3070 | 27B-FP8": [
+  "nein",
+  "verweigert",
+  "HW-UNCALIBRATED",
+  "UNCALIBRATED"
+ ],
+ "3x3070 | 27B-GGUF": [
+  "nein",
+  "verweigert",
+  "HW-UNCALIBRATED",
+  "UNCALIBRATED"
+ ],
+ "3x3070 | 27B-INT8": [
+  "nein",
+  "verweigert",
+  "HW-UNCALIBRATED",
+  "UNCALIBRATED"
+ ],
+ "3x3070 | 27B-NVFP4": [
+  "nein",
+  "verweigert",
+  "HW-UNCALIBRATED",
+  "UNCALIBRATED"
+ ],
+ "3x3070 | 27B-NVFP4-DUAL": [
+  "nein",
+  "verweigert",
+  "HW-UNCALIBRATED",
+  "UNCALIBRATED"
+ ],
+ "3x3070 | NF": [
+  "nein",
+  "verweigert",
+  "HW-UNCALIBRATED",
+  "UNCALIBRATED"
+ ],
+ "3x3080-10G | 27B-FP8": [
+  "nein",
+  "verweigert",
+  "HW-UNCALIBRATED",
+  "UNCALIBRATED"
+ ],
+ "3x3080-10G | 27B-GGUF": [
+  "nein",
+  "verweigert",
+  "HW-UNCALIBRATED",
+  "UNCALIBRATED"
+ ],
+ "3x3080-10G | 27B-INT8": [
+  "nein",
+  "verweigert",
+  "HW-UNCALIBRATED",
+  "UNCALIBRATED"
+ ],
+ "3x3080-10G | 27B-NVFP4": [
+  "nein",
+  "verweigert",
+  "HW-UNCALIBRATED",
+  "UNCALIBRATED"
+ ],
+ "3x3080-10G | 27B-NVFP4-DUAL": [
+  "nein",
+  "verweigert",
+  "HW-UNCALIBRATED",
+  "UNCALIBRATED"
+ ],
+ "3x3080-10G | NF": [
+  "nein",
+  "verweigert",
+  "HW-UNCALIBRATED",
+  "UNCALIBRATED"
+ ],
+ "3x3090 | 27B-FP8": [
+  "ja",
+  "verweigert",
+  "HW-UNCALIBRATED",
+  "UNCALIBRATED"
+ ],
+ "3x3090 | 27B-GGUF": [
+  "ja",
+  "verweigert",
+  "HW-UNCALIBRATED",
+  "UNCALIBRATED"
+ ],
+ "3x3090 | 27B-INT8": [
+  "ja",
+  "verweigert",
+  "HW-UNCALIBRATED",
+  "UNCALIBRATED"
+ ],
+ "3x3090 | 27B-NVFP4": [
+  "ja",
+  "verweigert",
+  "HW-UNCALIBRATED",
+  "UNCALIBRATED"
+ ],
+ "3x3090 | 27B-NVFP4-DUAL": [
+  "ja",
+  "verweigert",
+  "HW-UNCALIBRATED",
+  "UNCALIBRATED"
+ ],
+ "3x3090 | NF": [
+  "ja",
+  "verweigert",
+  "HW-UNCALIBRATED",
+  "UNCALIBRATED"
+ ],
+ "3x5070Ti | 27B-FP8": [
+  "nein",
+  "verweigert",
+  "HW-UNCALIBRATED",
+  "UNCALIBRATED"
+ ],
+ "3x5070Ti | 27B-GGUF": [
+  "ja",
+  "verweigert",
+  "HW-UNCALIBRATED",
+  "UNCALIBRATED"
+ ],
+ "3x5070Ti | 27B-INT8": [
+  "nein",
+  "verweigert",
+  "HW-UNCALIBRATED",
+  "UNCALIBRATED"
+ ],
+ "3x5070Ti | 27B-NVFP4": [
+  "ja",
+  "verweigert",
+  "HW-UNCALIBRATED",
+  "UNCALIBRATED"
+ ],
+ "3x5070Ti | 27B-NVFP4-DUAL": [
+  "ja",
+  "verweigert",
+  "HW-UNCALIBRATED",
+  "UNCALIBRATED"
+ ],
+ "3x5070Ti | NF": [
+  "nein",
+  "verweigert",
+  "HW-UNCALIBRATED",
+  "UNCALIBRATED"
+ ],
+ "4x3090 | 27B-FP8": [
+  "ja",
+  "verweigert",
+  "HW-COUNT",
+  "PROFILE-VECTORS"
+ ],
+ "4x3090 | 27B-GGUF": [
+  "ja",
+  "verweigert",
+  "HW-COUNT",
+  "PROFILE-VECTORS"
+ ],
+ "4x3090 | 27B-INT8": [
+  "ja",
+  "verweigert",
+  "HW-COUNT",
+  "PROFILE-VECTORS"
+ ],
+ "4x3090 | 27B-NVFP4": [
+  "ja",
+  "verweigert",
+  "HW-COUNT",
+  "PROFILE-VECTORS"
+ ],
+ "4x3090 | 27B-NVFP4-DUAL": [
+  "ja",
+  "verweigert",
+  "HW-COUNT",
+  "PROFILE-VECTORS"
+ ],
+ "4x3090 | NF": [
+  "ja",
+  "verweigert",
+  "HW-COUNT",
+  "PROFILE-VECTORS"
+ ],
+ "5070Ti+3090 | 27B-FP8": [
+  "nein",
+  "verweigert",
+  "HW-COUNT",
+  "PROFILE-VECTORS"
+ ],
+ "5070Ti+3090 | 27B-GGUF": [
+  "ja",
+  "verweigert",
+  "HW-COUNT",
+  "PROFILE-VECTORS"
+ ],
+ "5070Ti+3090 | 27B-INT8": [
+  "nein",
+  "verweigert",
+  "HW-COUNT",
+  "PROFILE-VECTORS"
+ ],
+ "5070Ti+3090 | 27B-NVFP4": [
+  "knapp",
+  "verweigert",
+  "HW-COUNT",
+  "PROFILE-VECTORS"
+ ],
+ "5070Ti+3090 | 27B-NVFP4-DUAL": [
+  "knapp",
+  "verweigert",
+  "HW-COUNT",
+  "PROFILE-VECTORS"
+ ],
+ "5070Ti+3090 | NF": [
+  "ja",
+  "verweigert",
+  "HW-COUNT",
+  "PROFILE-VECTORS"
+ ],
+ "5090+2x3090 | 27B-FP8": [
+  "ja",
+  "verweigert",
+  "HW-UNCALIBRATED",
+  "UNCALIBRATED"
+ ],
+ "5090+2x3090 | 27B-GGUF": [
+  "ja",
+  "verweigert",
+  "HW-UNCALIBRATED",
+  "UNCALIBRATED"
+ ],
+ "5090+2x3090 | 27B-INT8": [
+  "ja",
+  "verweigert",
+  "HW-UNCALIBRATED",
+  "UNCALIBRATED"
+ ],
+ "5090+2x3090 | 27B-NVFP4": [
+  "ja",
+  "verweigert",
+  "HW-UNCALIBRATED",
+  "UNCALIBRATED"
+ ],
+ "5090+2x3090 | 27B-NVFP4-DUAL": [
+  "ja",
+  "verweigert",
+  "HW-UNCALIBRATED",
+  "UNCALIBRATED"
+ ],
+ "5090+2x3090 | NF": [
+  "ja",
+  "verweigert",
+  "HW-UNCALIBRATED",
+  "UNCALIBRATED"
+ ],
+ "REF 27B 5090+3080 (N=2) | 27B-FP8": [
+  "ja",
+  "verweigert",
+  "HW-COUNT",
+  "METAL-UNPROVEN"
+ ],
+ "REF 27B 5090+3080 (N=2) | 27B-GGUF": [
+  "ja",
+  "verweigert",
+  "HW-COUNT",
+  "METAL-UNPROVEN"
+ ],
+ "REF 27B 5090+3080 (N=2) | 27B-INT8": [
+  "ja",
+  "verweigert",
+  "HW-COUNT",
+  "METAL-UNPROVEN"
+ ],
+ "REF 27B 5090+3080 (N=2) | 27B-NVFP4": [
+  "ja",
+  "verweigert",
+  "HW-COUNT",
+  "METAL-UNPROVEN"
+ ],
+ "REF 27B 5090+3080 (N=2) | 27B-NVFP4-DUAL": [
+  "ja",
+  "verweigert",
+  "HW-COUNT",
+  "PROFILE-VECTORS"
+ ],
+ "REF 27B 5090+3080 (N=2) | NF": [
+  "ja",
+  "verweigert",
+  "HW-COUNT",
+  "PROFILE-VECTORS"
+ ],
+ "REF 3080+3080 (N=2) | 27B-FP8": [
+  "nein",
+  "verweigert",
+  "HW-COUNT",
+  "METAL-UNPROVEN"
+ ],
+ "REF 3080+3080 (N=2) | 27B-GGUF": [
+  "ja",
+  "verweigert",
+  "HW-COUNT",
+  "METAL-UNPROVEN"
+ ],
+ "REF 3080+3080 (N=2) | 27B-INT8": [
+  "nein",
+  "verweigert",
+  "HW-COUNT",
+  "METAL-UNPROVEN"
+ ],
+ "REF 3080+3080 (N=2) | 27B-NVFP4": [
+  "ja",
+  "verweigert",
+  "HW-COUNT",
+  "METAL-UNPROVEN"
+ ],
+ "REF 3080+3080 (N=2) | 27B-NVFP4-DUAL": [
+  "ja",
+  "verweigert",
+  "HW-COUNT",
+  "PROFILE-VECTORS"
+ ],
+ "REF 3080+3080 (N=2) | NF": [
+  "ja",
+  "verweigert",
+  "HW-COUNT",
+  "PROFILE-VECTORS"
+ ],
+ "REF 5090+2x3080 (N=3) | 27B-FP8": [
+  "ja",
+  "läuft",
+  "",
+  ""
+ ],
+ "REF 5090+2x3080 (N=3) | 27B-GGUF": [
+  "ja",
+  "läuft",
+  "",
+  ""
+ ],
+ "REF 5090+2x3080 (N=3) | 27B-INT8": [
+  "ja",
+  "läuft",
+  "",
+  ""
+ ],
+ "REF 5090+2x3080 (N=3) | 27B-NVFP4": [
+  "ja",
+  "läuft",
+  "",
+  ""
+ ],
+ "REF 5090+2x3080 (N=3) | 27B-NVFP4-DUAL": [
+  "ja",
+  "läuft",
+  "",
+  ""
+ ],
+ "REF 5090+2x3080 (N=3) | NF": [
+  "ja",
+  "läuft",
+  "",
+  ""
+ ]
+}

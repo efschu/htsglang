@@ -31,7 +31,8 @@ New golden, line by line.
 So: new golden vs new dump (at S0) differ in exactly the lines in which old golden and old dump differed, and nowhere else; and the live lines
 carry the wording the renamed code can print.  A golden line that depends on state S0 does not have cannot be proven by any tool.
 
-usage: planer_golden_regen.py <old tree> <renamed tree> [--dry] [--verbose] [--cache DIR]
+usage: planer_golden_regen.py <old tree> <renamed tree> [--line nf] [--dry] [--verbose] [--cache DIR]
+       (--line nf, F0-E: the renamed tree is the NF line; only golden/nf/plan_nf_abl_n3.txt is regenerated, from the NF launcher's own dump)
        (--cache DIR keeps the two dump runs, the dumps are the slow part: ~2 min each)
 Prints per golden: lines, stable, live, stable-lines-translated-or-reworded, unaligned, fragment-check agree/disagree; exit 3 on an unaligned stable line."""
 import ast, collections, difflib, glob, json, os, re, subprocess, sys, tempfile
@@ -41,6 +42,7 @@ sys.path.insert(0, KIT)
 import rename_to_flliper as R
 
 PROFILES = [("27b-base", "plan_27b_flip_n3.txt"), ("27b-nvfp4-dual", "plan_27b_dual_n3.txt"), ("nf-int4-h6-abl", "plan_nf_abl_n3.txt")]
+NF_PROFILES = [("nf-int4-h6-abl", "plan_nf_abl_n3.txt")]          # --line nf (F0-E): the NF launcher's reference, golden/nf/
 MASK = re.compile(r"WEG2|PDFLIP|Weg2|PdFlip|SGLANG|FLLIPER|weg2|pdflip|sglang|flliper")
 PLACEHOLDER = re.compile(r"%(?:\([^)]*\))?[-+ #0]*(?:\d+|\*)?(?:\.(?:\d+|\*))?[sdrfxXeEgGiuc]|%%|\{[^{}]*\}")
 # Fragments shorter than this are never applied (measured on the 967 stable lines of the three goldens + the live Dual one, 28.08. cache): the
@@ -56,26 +58,29 @@ def masked(l):
     return re.sub(r"[0-9]+(\.[0-9]+)?", "N", MASK.sub("NAME", l))
 
 
-def dumps(tree, sub, home):
-    """child process: the test modules of `tree` dump the reference profiles; returns {golden name: (golden text, dump text)}"""
-    code = (
+def dumps(tree, sub, home, line="27b"):
+    """child process: the test modules of `tree` dump the reference profiles; returns {golden name: (golden text, dump text)}.
+    line "nf" (F0-E): the NF launcher dumps only the NF reference profile (its parser refuses the 27B profiles; the `_ON_27B_LINE` tests skip) and
+    reads the golden of ITS line (`golden/nf/`, test_planer_referenz_n3_1006._golden_file); no live Dual snapshot (a 27B-line test)."""
+    head = (
         "import importlib,sys,json;t,s=sys.argv[1:3];sys.path.insert(0,t+'/python');sys.path.insert(0,t+'/test/registered/unit/'+s)\n"
         "m=importlib.import_module('test_planer_referenz_n3_1006');o={}\n"
         "for p,g in %r:\n"
-        "    r=m._dump_of(p,m.O.read_replay(m.REPLAY_REF));o[g]=[m._read(m._golden_file(g)),r.result.dump()]\n"
-        # the live Dual snapshot of AP-J (test_planer_abnahme_1006.TestLiveDualReference): the proposal's dry run, a named launcher refusal
+        "    r=m._dump_of(p,m.O.read_replay(m.REPLAY_REF));o[g]=[m._read(m._golden_file(g)),r.result.dump()]\n" % (NF_PROFILES if line == "nf" else PROFILES,))
+    # the live Dual snapshot of AP-J (test_planer_abnahme_1006.TestLiveDualReference): the proposal's dry run, a named launcher refusal
+    live = (
         "ab=importlib.import_module('test_planer_abnahme_1006');ab.setUpModule();A=ab.APE;O=ab.O\n"
         "v=A._propose('ref3',profile=ab.LIVE);b=A._dual_profile(ab.LIVE)\n"
         "li=O.LaunchInput(v['argv'],v['env'],b.vars,[],'propose:'+v['basis'],b.instruments)\n"
         "res=O.run_profile('',A._ref_rows(),tree=A.TREE,force=False,launch_input=li).result\n"
-        "o['plan_27b_dual_live1521_n3.txt']=[open(ab.GOLDEN_TXT,encoding='utf-8').read(),res.dump()]\n"
-        "print('@@JSON@@'+json.dumps(o))\n" % (PROFILES,))
+        "o['plan_27b_dual_live1521_n3.txt']=[open(ab.GOLDEN_TXT,encoding='utf-8').read(),res.dump()]\n")
+    code = head + ("" if line == "nf" else live) + "print('@@JSON@@'+json.dumps(o))\n"
     out = subprocess.run([sys.executable, "-W", "ignore", "-c", code, tree, sub], capture_output=True, text=True, cwd=tree,
                          env=dict(os.environ, HOME=home, CUDA_VISIBLE_DEVICES="", PYTHONPATH=""))
-    line = [l for l in out.stdout.splitlines() if l.startswith("@@JSON@@")]
-    if not line:
+    got = [l for l in out.stdout.splitlines() if l.startswith("@@JSON@@")]
+    if not got:
         sys.exit("dump failed in %s: %s" % (tree, out.stderr[-1500:]))
-    return json.loads(line[0][8:])
+    return json.loads(got[0][8:])
 
 
 # ---------------------------------------------------------------- the kit's rewrite, read from the code
@@ -213,6 +218,7 @@ def main():
     old_tree, new_tree = os.path.abspath(sys.argv[1]), os.path.abspath(sys.argv[2])
     DRY, VERBOSE = "--dry" in sys.argv, "--verbose" in sys.argv
     cache = sys.argv[sys.argv.index("--cache") + 1] if "--cache" in sys.argv else None
+    LINE = sys.argv[sys.argv.index("--line") + 1] if "--line" in sys.argv else "27b"
     imap = R._load_imap(os.path.join(KIT, "data", "merged_0928.json"))
     table, st = fragment_table(old_tree, new_tree)
     print("fragments: %s" % dict(st))
@@ -222,7 +228,7 @@ def main():
         if f and os.path.exists(f):
             return json.load(open(f))
         with tempfile.TemporaryDirectory(prefix="golden-regen-home-") as home:
-            d = dumps(tree, sub, home)
+            d = dumps(tree, sub, home, LINE)
         if f:
             os.makedirs(cache, exist_ok=True)
             json.dump(d, open(f, "w"))
@@ -275,7 +281,7 @@ def main():
                 live += i2 - i1
                 out.extend(rw_live.line(l, live_rx) for l in G[i1:i2])
         bad += unaligned
-        path = os.path.join(new_tree, "test/registered/unit/pdflip/fixtures/planer_1006/golden", g)
+        path = os.path.join(new_tree, "test/registered/unit/pdflip/fixtures/planer_1006/golden", "nf" if LINE == "nf" else "", g)
         if not DRY:
             open(path, "w", encoding="utf-8").write("\n".join(out))
         print("%-34s lines=%d stable=%d live=%d stable-lines-translated-or-reworded=%d unaligned=%d check(fragment method vs renamed dump on stable lines)=%d/%d"

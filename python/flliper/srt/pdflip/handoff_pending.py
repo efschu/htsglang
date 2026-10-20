@@ -335,14 +335,29 @@ def drop(rid: str, reason: str = "front") -> bool:
     900 s bound (117304 kept keys in every D reset census, a 1.1 GB L3 copy
     by PARK-DEMOTE). A terminal drop now leaves a tombstone first; a later
     mark of the rid is refused (:func:`_refuse_if_ended`). A re-route
-    (``reroute*``) is not a rid end: no tombstone, P may mark again."""
+    (``reroute*``) is not a rid end: no tombstone, P may mark again.
+
+    S58: the front calls this at EVERY rid end (``handoff_seam.wrap_handler``)
+    -- the rid is over, so its hand-off file goes too (``handoff.remove``;
+    FLLIPER_PDFLIP_HANDOFF_REMOVE_AT_RID_END, default on). A re-routed rid is
+    prefilled by P again, which writes the file again at its finish. D's own
+    ``consume`` (prefetch termination) does NOT remove it: the dormant hold
+    re-reads the keys after that (xsn330)."""
     try:
         rid, reason = str(rid), str(reason)
         if not reason.startswith(NON_TERMINAL_DROPS):
             _tombstone(rid)
-        return _end(rid, reason, "DROPPED")
+        ended = _end(rid, reason, "DROPPED")
     except Exception:  # noqa: BLE001
-        return False
+        ended = False
+    try:
+        from flliper.srt.pdflip import handoff as _ho
+
+        if _ho.remove_at_rid_end_on():
+            _ho.remove(str(rid))
+    except Exception:  # noqa: BLE001 - bookkeeping never breaks the front
+        pass
+    return ended
 
 
 def status(rid: str) -> dict:
@@ -776,6 +791,11 @@ def evict_ordered(arena, keep: Keep, n: int, *, eligible=None, protect_lo=None, 
     idx = victim_order(keep)
     if eligible is not None:
         idx = idx[np.asarray(eligible, dtype=bool)[idx]]
+    if protect_lo is not None and len(protect_lo):
+        # h18port (SELF-EVICT, h16h pdflip-58-558): a protected key (the pins, the read being filled) is never a
+        # VICTIM either -- before, ``protect_lo`` only guarded the keys that were not chosen, and a kept page
+        # that was also this read's own (the sibling turn's hold = the same stems) was taken from the tail
+        idx = idx[~np.isin(keep.keys[idx], np.asarray(protect_lo, dtype=np.uint64))]
     idx = _present(arena, keep, idx)
     guard = keep.keys if protect_lo is None or not len(protect_lo) else np.union1d(
         keep.keys, np.asarray(protect_lo, dtype=np.uint64))
@@ -811,11 +831,11 @@ def _note_ordered(keep: Keep, cands, n: int, site: str) -> None:
         r = int(keep.rid_ix[p])
         per.setdefault(r, []).append(int(keep.page[p]))
     ranks = _rid_ranks(keep)
-    parts = [f"{keep.rids[r][:14]}:rank={int(ranks[r])},pages={len(v)},lowest_page={min(v)}"
+    parts = [f"{keep.rids[r]}:rank={int(ranks[r])},pages={len(v)},lowest_page={min(v)}"
              for r, v in sorted(per.items(), key=lambda kv: -int(ranks[kv[0]]))]
     logger.info("#248e ORDERED-EVICT n=%d site=%s need=%d took=%d read_order=%s victims=[%s] (kept pages leave "
                 "in hold order, the last-read rid first and every chain from its tail -- the head of the next "
-                "read stays in L2)", k, site, int(n), len(cands), [r[:14] for r in _READ_ORDER[:8]],
+                "read stays in L2)", k, site, int(n), len(cands), _READ_ORDER[:8],
                 "; ".join(parts))
 
 
@@ -844,24 +864,36 @@ def census(pool, refresh: bool = True) -> str:
         counts = {ROLE_HANDOFF: [0, 0, 0], ROLE_PARK: [0, 0, 0]}
         per = pool.__dict__.get("_pdflip_hp_rid_keys") or {}
         live = _live_marks()
-        seen = set()
+        seen_marks = set()  # 27B unread_marks (PDFLIP-H); ``seen`` below is NF S27's per-role key set
+        # S27 (fLLiper rc8 07:05:34 handoff_kept=5875/5875, P 07:11:20 10139/10963 against 6485 slots): rids of one
+        # session share their leading chain (PDFLIP SESSION-PREFIX common=18356 ...), and the same page key is ONE slot.
+        # Counted per rid the census named more kept pages than the arena has slots; counted per KEY (once per role)
+        # it is the number of slots the order really covers.
+        seen = {ROLE_HANDOFF: set(), ROLE_PARK: set()}
         for rid, role in zip(keep.rids, keep.roles):
             where = PARK if role == ROLE_PARK else PENDING
             rec = per.get((where, rid), (0, None))[1]
             if rec is None or (where, rid) not in live:
                 continue
-            seen.add((where, rid))
+            seen_marks.add((where, rid))
             c = counts[role]
-            c[1] += len(rec[2])
+            fresh = [k for k in rec[2] if k not in seen[role]]
+            seen[role].update(fresh)
+            c[1] += len(fresh)
             c[2] += 1
-            if arena is not None and rec[2]:
-                c[0] += _complete_count(pool, arena, rec)
+            if arena is not None and fresh:
+                # 27B PDFLIP-L: the encoded per-record count when the record is
+                # all fresh (page_size=1: ~90k keys); NF S27 per-key dedup else
+                if len(fresh) == len(rec[2]):
+                    c[0] += _complete_count(pool, arena, rec)
+                else:
+                    c[0] += sum(1 for _, st in arena.find_slots(fresh) if int(st) == 2)
         pinned = complete = "-"
         if arena is not None and hasattr(arena, "ref_census"):
             pinned, _refs, complete = arena.ref_census()
         h, k = counts[ROLE_HANDOFF], counts[ROLE_PARK]
         return (f"handoff_kept={h[0]}/{h[1]} handoff_rids={h[2]} park_kept={k[0]}/{k[1]} park_rids={k[2]} "
-                f"arena_pinned={pinned} arena_complete={complete} unread_marks={len(live - seen)}")
+                f"arena_pinned={pinned} arena_complete={complete} unread_marks={len(live - seen_marks)}")
     except Exception as exc:  # noqa: BLE001 - an instrument never breaks a census
         return f"handoff_kept=failed:{type(exc).__name__}"
 

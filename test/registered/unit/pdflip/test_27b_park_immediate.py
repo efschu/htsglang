@@ -443,6 +443,9 @@ def _p(**kw):
     return types.SimpleNamespace(**base)
 
 
+@pytest.mark.usefixtures("decider_off")  # EZ-S2a: describes the S1 code (reachable until S4)
+
+
 def test_needs_p_is_exactly_over_x_or_p_only():
     X = 12288
     assert not pp.needs_p(X, X)                         # AT X: D may prefill it (law 4)
@@ -512,7 +515,9 @@ def test_27b_front_parks_at_once_and_resumes_first(clean):
             assert h.front.counters["wait_bound_fired"] == 0
             assert took < 10.0, took  # floor 2 s + flip; r0 still decodes (held)
             assert await H._until(lambda: h.front.awake == "D" and not h.front._d_parked, 20)
-            kv = [b for b in h.d.resume_bodies if b.get("tags") == ["kv_cache"]]
+            # FLIPCYCLE H6: the kv resume rides the weights leg (tags weights+kv_cache,
+            # kv_late) instead of a call of its own, so select by "kv_cache in tags".
+            kv = [b for b in h.d.resume_bodies if "kv_cache" in b.get("tags", [])]
             assert "handoff_n" not in kv[-1] and "parked_n" not in kv[-1]  # 27B wake body unchanged
             assert h.front.counters["d_parked_resumed"] == 1
             assert rid0 in h.front.groups["D"].outstanding
@@ -695,3 +700,13 @@ def test_the_launcher_main_runs_the_refusal_before_anything_spawns():
     i_ref = src.index("_park_split = d_park_split_refusal(ns)")
     i_sf = src.index("_sf_on, _sf_src = standard_form_resolved(ns)")
     assert i_ref < i_sf
+
+
+import pytest as _pytest_110  # noqa: E402
+
+
+@_pytest_110.fixture(autouse=True)
+def _arrival_seat_rule_off_110(monkeypatch):
+    """110: FLLIPER_PDFLIP_ENABLE_ARRIVAL_SEAT_RULE is default ON on the NF line;
+    this file pins the pre-rule front it was written against (=0 is that path)."""
+    monkeypatch.setenv("FLLIPER_PDFLIP_ENABLE_ARRIVAL_SEAT_RULE", "0")

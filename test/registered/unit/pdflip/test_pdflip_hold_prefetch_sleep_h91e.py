@@ -251,7 +251,7 @@ def test_bb3_the_held_read_keeps_running_and_the_wake_releases_it_first():
         assert wu._pdflip_hold_owned_prefetch() == frozenset({RID})
         sch.pdflip_dormant = False  # the wake
         assert wu._pdflip_hold_owned_prefetch() == frozenset()
-        assert sch.idle_blockers() == ["hicache_prefetch(1: pdflip-16-)"]
+        assert sch.idle_blockers() == ["hicache_prefetch(1: pdflip-16-23)"]
         assert not wu._pdflip_sleep_idle()
 
 

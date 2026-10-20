@@ -2,7 +2,8 @@
 
 The solo HOST (D rank 0) holds the DFlash draft WHOLE, the shadows hold a
 meta draft (no bytes). The join must plan the draft on the host only:
-ROWS with widths (whole, 0, 0); `_blocks_of` gives a 0-width rank NO block
+REPLICATED (no cut edge, #76) with widths (whole, 0, 0);
+`_blocks_of` gives a 0-width rank NO block
 (so `_emit` skips it); any other partial hold stays W74."""
 from __future__ import annotations
 
@@ -49,7 +50,10 @@ def test_a_tensor_held_whole_by_one_tp_rank_joins_as_rows_whole_zero_zero():
     join = xm.join_manifests(_manifests(), pp_group="P", tp_group="D")
     by = {t.param_name: t for t in join.tensors}
     d = by[DRAFT]
-    assert d.shard_axis == wx.ROWS and d.tp_widths == (1600, 0, 0)
+    # 1533: a tensor every HOLDER holds whole has no cut edge (#76, 21.09.): the
+    # join reads it REPLICATED, and the width vector over the whole TP group
+    # still says who holds it -- (whole, 0, 0).  The 19.09. reading was ROWS.
+    assert d.shard_axis == wx.REPLICATED and d.tp_widths == (1600, 0, 0)
     assert d.rows_full == 1600 and d.cols_full == 20480 and d.pp_stage == 0
     assert by[MAIN].shard_axis == wx.COLS and by[MAIN].tp_widths == (400, 400, 400)
 
@@ -111,20 +115,36 @@ DTAG = wx.GPU_MEMORY_TYPE_WEIGHTS_DRAFT
 def _region_manifests():
     """P: stages 0..2 hold the main weights (whole, one per stage); the LAST
     stage also holds the draft whole. D: every rank a main cut; only rank 0
-    (the solo host) holds the draft, whole."""
+    (the solo host) holds the draft, whole.
+
+    1533: ONE MANIFEST PER (rank, region), as the product writes them
+    (``MANIFEST-WRITE group=D rank=1 region_tag=weights_draft pieces=0``,
+    #103/#104).  The solo-draft shadows publish an EMPTY draft-region manifest
+    -- "this rank exists, it holds nothing of this region" -- and the leg
+    filter keeps exactly those (arrived empty).  The 19.09. fixture put the
+    shadows' main pieces and the draft region into one manifest, and relied on
+    the filter keeping a rank the REGION cut had emptied; #104 (22.09.) made
+    that a case that must go (a manifest belonging to another runner)."""
     out = []
     for r in range(3):
-        pieces = [_piece(f"model.layers.{r}.mlp.down_proj.weight", 2048, 1200)]
+        out.append(xm.RankManifest(
+            group="P", rank=r, card=r, region_tag=TAG, boot_token="b1",
+            tp_rank=0, pp_rank=r,
+            pieces=(_piece(f"model.layers.{r}.mlp.down_proj.weight", 2048, 1200),)))
         if r == 2:
-            pieces.append(_piece(DRAFT, 1600, 20480, tag=DTAG))
-        out.append(xm.RankManifest(group="P", rank=r, card=r, region_tag=TAG, boot_token="b1",
-                                   tp_rank=0, pp_rank=r, pieces=tuple(pieces)))
+            out.append(xm.RankManifest(
+                group="P", rank=r, card=r, region_tag=DTAG, boot_token="b1",
+                tp_rank=0, pp_rank=r, pieces=(_piece(DRAFT, 1600, 20480, tag=DTAG),)))
     for r in range(3):
-        pieces = [_piece(f"model.layers.{i}.mlp.down_proj.weight", 2048, 400) for i in range(3)]
-        if r == 0:
-            pieces.append(_piece(DRAFT, 1600, 20480, tag=DTAG))
-        out.append(xm.RankManifest(group="D", rank=r, card=r, region_tag=TAG, boot_token="b1",
-                                   tp_rank=r, pp_rank=0, pieces=tuple(pieces)))
+        out.append(xm.RankManifest(
+            group="D", rank=r, card=r, region_tag=TAG, boot_token="b1",
+            tp_rank=r, pp_rank=0,
+            pieces=tuple(_piece(f"model.layers.{i}.mlp.down_proj.weight", 2048, 400)
+                         for i in range(3))))
+        out.append(xm.RankManifest(
+            group="D", rank=r, card=r, region_tag=DTAG, boot_token="b1",
+            tp_rank=r, pp_rank=0,
+            pieces=((_piece(DRAFT, 1600, 20480, tag=DTAG),) if r == 0 else ())))
     return out
 
 
@@ -139,23 +159,45 @@ def test_the_draft_regions_leg_plans_the_solo_host_with_the_shadows_as_empty_row
     descs = [d for d in plan.descs if d.param_name == DRAFT]
     assert descs and {int(getattr(d, rank_side)) for d in descs} == {0}
     assert sum(int(d.nbytes) for d in descs) == 1600 * 20480
-    assert any("tp_ranks_without_pieces=[1, 2]" in l for l in lines)
 
 
-def test_a_shadow_gets_no_draft_leg_and_is_told_so_not_a_crash():
+def test_a_shadow_goes_empty_in_the_draft_leg_not_refused_and_not_a_crash():
+    # 1533: since #105 (22.09.) a rank whose OWN manifest arrived empty gets a
+    # normal LegPlan with no descriptors -- "holds nothing" is its right
+    # answer.  (Before it, 19.09., the leg answered None + no-descriptors-for-
+    # rank; that refusal now belongs to a rank that SHOULD hold bytes.)
     plan, why = xm.leg_plan_from_join(hook="source", group="D", rank=1,
                                       manifests=_region_manifests(),
+                                      region_tag=DTAG, log=lambda *_: None)
+    assert plan is not None, why
+    assert tuple(plan.descs) == ()
+
+
+def test_a_rank_with_a_non_empty_manifest_that_moves_nothing_is_still_refused():
+    # the refusal #105 kept (weight_updater / xchg_manifest ``_is_shadow``): a
+    # rank whose OWN manifest is not empty SHOULD hold bytes; a plan that moves
+    # none through it is a silent loss.  D rank 1 publishes a draft piece too,
+    # the join gives the tensor to rank 0 alone, so rank 1 is told by name.
+    out = []
+    for m in _region_manifests():
+        if m.group == "D" and m.rank == 1 and m.region_tag == DTAG:
+            m = xm.RankManifest(group="D", rank=1, card=1, region_tag=DTAG, boot_token="b1",
+                                tp_rank=1, pp_rank=0,
+                                pieces=(_piece(DRAFT, 1600, 20480, tag=DTAG),))
+        out.append(m)
+    plan, why = xm.leg_plan_from_join(hook="source", group="D", rank=1, manifests=out,
                                       region_tag=DTAG, log=lambda *_: None)
     assert plan is None and "no-descriptors-for-rank" in why
 
 
 def test_a_region_nobody_in_tp_holds_is_still_refused():
-    mans = [m for m in _region_manifests()]
+    mans = []
+    for m in _region_manifests():
+        if m.group == "D" and m.rank == 0 and m.region_tag == DTAG:
+            m = xm.RankManifest(group="D", rank=0, card=0, region_tag=DTAG, boot_token="b1",
+                                tp_rank=0, pp_rank=0, pieces=())
+        mans.append(m)
     # strip the draft from D rank 0 too: the region has no TP holder at all
-    d0 = mans[3]
-    mans[3] = xm.RankManifest(group="D", rank=0, card=0, region_tag=TAG, boot_token="b1",
-                              tp_rank=0, pp_rank=0,
-                              pieces=tuple(p for p in d0.pieces if p.tag != DTAG))
     plan, why = xm.leg_plan_from_join(hook="source", group="D", rank=0, manifests=mans,
                                       region_tag=DTAG, log=lambda *_: None)
     assert plan is None and why

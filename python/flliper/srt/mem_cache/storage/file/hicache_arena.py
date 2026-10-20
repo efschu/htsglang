@@ -73,30 +73,64 @@ class RefLedger:
         import torch
 
         self.held = torch.zeros(int(slots), dtype=torch.int32)
+        # A2 (nf-h54-review-1015 B1, second arm): the slot GENERATION the held
+        # references were taken in (-1 = none recorded). A slot recycled
+        # behind the ledger (a hard free resets the C refcount with the claim)
+        # leaves references here that no longer exist; they are never applied
+        # to the slot's next owner.
+        self.gen = torch.full((int(slots),), -1, dtype=torch.int64)
         self.lock = threading.Lock()
         self.refused = 0
+        self.refused_gen = 0   # A2: releases refused because the slot's generation moved
+        self.gen_reset = 0     # A2: held references dropped because the slot's generation moved
 
-    def took(self, slots) -> None:
+    def took(self, slots, gens=None) -> None:
         import torch
 
         t = torch.as_tensor(slots, dtype=torch.int64).reshape(-1)
-        t = t[t >= 0]
+        keep = t >= 0
+        t = t[keep]
         if t.numel():
             with self.lock:
+                if gens is not None:
+                    g = torch.as_tensor(gens, dtype=torch.int64).reshape(-1)[keep]
+                    stale = (self.gen[t] != g) & (self.held[t] > 0)
+                    if bool(stale.any()):
+                        su = torch.unique(t[stale])
+                        self.gen_reset += int(self.held[su].sum())
+                        self.held[su] = 0
+                    self.gen[t] = g
                 self.held.index_add_(0, t, torch.ones(t.numel(), dtype=torch.int32))
 
-    def allow_release(self, slots):
+    def allow_release(self, slots, gens=None):
         """The multiset of `slots` this process may release (each at most as
-        often as it holds a reference there); the ledger is debited for it."""
+        often as it holds a reference there); the ledger is debited for it.
+
+        A2: with ``gens`` (the slots' CURRENT generation) a reference counts
+        only in the generation it was taken in -- a slot whose generation
+        moved since holds none of this process's references any more (they
+        went with the old generation), so a release there is refused and the
+        stale count dropped instead of taking a reference the next owner's
+        readers hold."""
         import torch
 
         t = torch.as_tensor(slots, dtype=torch.int64).reshape(-1)
-        t = t[t >= 0]
+        keep = t >= 0
+        t = t[keep]
         if t.numel() == 0:
             return t
         with self.lock:
-            uq, cnt = torch.unique(t, return_counts=True)
+            uq, inv, cnt = torch.unique(t, return_inverse=True, return_counts=True)
             have = self.held[uq]
+            if gens is not None:
+                g = torch.as_tensor(gens, dtype=torch.int64).reshape(-1)[keep]
+                gu = torch.empty_like(uq).scatter_(0, inv, g)
+                moved = (self.gen[uq] >= 0) & (self.gen[uq] != gu)
+                if bool(moved.any()):
+                    self.gen_reset += int(have[moved].sum())
+                    self.refused_gen += int(cnt[moved].sum())
+                    self.held[uq[moved]] = 0
+                    have = torch.where(moved, torch.zeros_like(have), have)
             allow = torch.minimum(cnt.to(torch.int32), have)
             self.held[uq] = have - allow
             self.refused += int((cnt - allow).sum())
@@ -115,11 +149,18 @@ REAP_STALE_MIN_AGE_S = 60.0
 STATE_COMPLETE = 2
 STATE_EVICTING = 3
 
-#: Instrument (default 0 = off): every N seconds a daemon thread logs the
-#: arena's reference census (ShmArena.ref_census) -- how many COMPLETE slots a
-#: reader reference pins, over the whole boot. Off the round path: the strided
-#: header read of a 720k-slot arena is ~15 ms (desk), numpy releases the GIL.
+#: Instrument (default 60 = ON since the NF arena fix of 14.10.; 0 = off, any
+#: other value = that period): every N seconds a daemon thread logs the arena's
+#: reference census (ShmArena.ref_census) -- how many COMPLETE slots a reader
+#: reference pins, over the whole boot -- and the holder classes of every
+#: provider (ARENA-REF-HOLDERS). Off the round path: the strided header read of
+#: a 720k-slot arena is ~15 ms (desk), numpy releases the GIL. It was off by
+#: default and only in ``profile_instr_env``, so the boot of 14.10. 03:00-04:50Z
+#: had no census at the REFUSED moments (nf-arena-voll-analyse-1014 section 2):
+#: every holder statement of that analysis was derived from the resets. An
+#: instrument only -- no round, no decision reads it.
 ENV_REF_CENSUS_S = "FLLIPER_HICACHE_ARENA_REF_CENSUS_S"
+REF_CENSUS_DEFAULT_S = "60"
 _CENSUS_THREADS: dict = {}
 #: #1424e: the reference HOLDERS of this process, per class, next to the census
 #: (weak methods: a provider never keeps its tree alive). A provider is called
@@ -157,7 +198,7 @@ def _holder_lines(arena) -> list:
 
 def _start_ref_census(arena: "ShmArena") -> None:
     try:
-        every = float(os.environ.get(ENV_REF_CENSUS_S, "0") or 0)
+        every = float(os.environ.get(ENV_REF_CENSUS_S, REF_CENSUS_DEFAULT_S) or 0)
     except ValueError:
         every = 0.0
     if every <= 0:
@@ -171,18 +212,29 @@ def _start_ref_census(arena: "ShmArena") -> None:
         def _run():
             n = 0
             while not stop.wait(every):
+                if getattr(getattr(arena, "_mm", None), "closed", False):
+                    # the arena was unmapped (shutdown, a test's tmp arena): the
+                    # census ends instead of logging 'failed' every period --
+                    # it is on by default now (REF_CENSUS_DEFAULT_S)
+                    with _lock:
+                        if _CENSUS_THREADS.get(key) is stop:
+                            _CENSUS_THREADS.pop(key, None)
+                    return
                 n += 1
                 try:
                     pinned, refs, complete = arena.ref_census()
                     led = arena._ledger
                     logger.info(
                         "ARENA-REF-CENSUS n=%d path=%s slots=%d complete=%d pinned=%d refs=%d "
-                        "own_held=%s own_refused=%s (pinned = COMPLETE slots a reader "
-                        "reference keeps from eviction, all ranks; own_* = this process's "
-                        "ledger, FLLIPER_HICACHE_ARENA_QUEUE_REFS)",
+                        "own_held=%s own_refused=%s own_refused_gen=%s own_gen_reset=%s (pinned = "
+                        "COMPLETE slots a reader reference keeps from eviction, all ranks; own_* = this "
+                        "process's ledger, FLLIPER_HICACHE_ARENA_QUEUE_REFS; *_gen = A2: references of a "
+                        "slot generation that moved, never applied to the next owner)",
                         n, arena.path, arena.slots, complete, pinned, refs,
                         int(led.held.sum()) if led is not None else "-",
                         led.refused if led is not None else "-",
+                        getattr(led, "refused_gen", "-") if led is not None else "-",
+                        getattr(led, "gen_reset", "-") if led is not None else "-",
                     )
                 except Exception as exc:  # noqa: BLE001 - an instrument never raises
                     logger.info("ARENA-REF-CENSUS n=%d failed: %r", n, exc)
@@ -314,6 +366,32 @@ def claim_open_text(stem: str, row: dict) -> str:
                 row["age_ms"], row["pid"], CLAIM_ROLES.get(row["role"], str(row["role"])), row["state"]))
 
 
+#: ARENA-FREE-GEN: refused evictor frees (lines, slots)
+_FREE_EVICTED_REFUSED = [0, 0]
+#: ARENA-FREE-GEN: this process's open eviction candidates per arena file:
+#: slot -> generation at the choice (every ShmArena object of one path shares it)
+_EVICT_GENS: dict = {}
+
+
+def _evict_gens_for(path: str) -> dict:
+    key = os.path.realpath(str(path))
+    d = _EVICT_GENS.get(key)
+    if d is None:
+        d = _EVICT_GENS.setdefault(key, {})
+    return d
+
+
+def free_evicted_named(arena, slots, reason: str) -> None:
+    """ARENA-FREE-GEN: an evictor's free of its own candidates -- generation
+    bound where the arena knows it (``ShmArena.free_evicted``); a hermetic
+    arena without it frees as before."""
+    fe = getattr(arena, "free_evicted", None)
+    if callable(fe):
+        fe(slots, reason=reason)
+    else:
+        free_named(arena, slots, reason)
+
+
 def free_named(arena, slots, reason: str) -> None:
     """#1427s: ``arena.free_slots(slots, reason=reason)`` for every caller; a
     hermetic fake arena without the keyword frees as before."""
@@ -389,12 +467,20 @@ def _load_lib() -> Optional[ctypes.CDLL]:
             lib.arena_drop_unreferenced.argtypes = [p_u8, i64, p_i64, p_i8]
             lib.arena_reap_stale.restype = i64
             lib.arena_reap_stale.argtypes = [p_u8]
+            lib.arena_reap_stale_aged.restype = i64
+            lib.arena_reap_stale_aged.argtypes = [p_u8, i64]
+            lib.arena_slot_gens.restype = i64
+            lib.arena_slot_gens.argtypes = [p_u8, i64, p_i64, p_i64]
+            lib.arena_free_evicting.restype = i64
+            lib.arena_free_evicting.argtypes = [p_u8, i64, p_i64, p_i64, p_i8]
             lib.arena_reap_partial.restype = i64
             lib.arena_reap_partial.argtypes = [p_u8, i64, p_i64, i64]
             lib.arena_unclaim.restype = i64
             lib.arena_unclaim.argtypes = [p_u8, i64, p_i64, p_i64]
             lib.arena_release_claims.restype = i64
             lib.arena_release_claims.argtypes = [p_u8, i64, p_i64, p_i64, p_i8]
+            lib.arena_revoke_orphan_claims.restype = i64
+            lib.arena_revoke_orphan_claims.argtypes = [p_u8, i64, p_i64, p_i64, p_i8]
             lib.arena_ival_cap.restype = i64
             lib.arena_ival_cap.argtypes = [p_u8]
             lib.arena_stats.restype = None
@@ -432,6 +518,10 @@ def _load_lib() -> Optional[ctypes.CDLL]:
             lib.arena_quarantine_stale.argtypes = [p_u8, i64, p_i64, p_i64, i64, p_i8]
             lib.arena_quarantine_sweep.restype = i64
             lib.arena_quarantine_sweep.argtypes = [p_u8, i64]
+            lib.arena_quarantine_host_write.restype = i64
+            lib.arena_quarantine_host_write.argtypes = [p_u8, i64, p_i64, p_i64, p_i8]
+            lib.arena_touch_progress.restype = i64
+            lib.arena_touch_progress.argtypes = [p_u8, i64, p_i64, p_i64]
             lib.arena_free_if_gen.restype = i64
             lib.arena_free_if_gen.argtypes = [p_u8, i64, p_i64, p_i64, p_i8]
             # ARENA-COPY-GEN (N2): copies bound to the slot generation
@@ -616,7 +706,50 @@ class ShmArena:
         c_keep = (keep.ctypes.data_as(ctypes.POINTER(ctypes.c_uint64)) if n_keep
                   else (ctypes.c_uint64 * 1)())
         got = self._lib.arena_evict_candidates(self._base, want, slots, lo, hi, tot, c_keep, n_keep)
+        if got > 0:
+            # ARENA-FREE-GEN: remember each candidate's generation -- the
+            # evictor's free (free_evicted) frees only an unchanged one
+            gens = (ctypes.c_int64 * got)()
+            self._lib.arena_slot_gens(self._base, got, slots, gens)
+            eg = _evict_gens_for(self.path)
+            for i in range(got):
+                eg[int(slots[i])] = int(gens[i])
         return [(int(slots[i]), int(lo[i]), int(hi[i]), int(tot[i])) for i in range(got)]
+
+    def free_evicted(self, slots: Sequence[int], reason: str = "evict") -> int:
+        """ARENA-FREE-GEN: free this process's eviction candidates -- each only
+        while still EVICTING under the generation ``evict_candidates`` saw.
+        A refused slot (reaped, or re-claimed by a new owner since) is never
+        freed; it is counted and named (``ARENA-FREE-EVICTED REFUSED``). A
+        slot this arena object never handed out as a candidate takes the old
+        free. Returns the number freed."""
+        eg = _evict_gens_for(self.path)
+        known, legacy = [], []
+        for s_ in slots:
+            g = eg.pop(int(s_), None)
+            (known if g is not None else legacy).append((int(s_), g))
+        if legacy:
+            self.free_slots([s_ for s_, _ in legacy], reason=reason)
+        if not known:
+            return len(legacy)
+        n = len(known)
+        c = (ctypes.c_int64 * n)(*[s_ for s_, _ in known])
+        g = (ctypes.c_int64 * n)(*[int(x) for _, x in known])
+        st = (ctypes.c_int8 * n)()
+        freed = int(self._lib.arena_free_evicting(self._base, n, c, g, st))
+        refused = [(known[i][0], int(st[i])) for i in range(n) if int(st[i]) != 1]
+        if refused:
+            _FREE_EVICTED_REFUSED[0] += 1
+            _FREE_EVICTED_REFUSED[1] += len(refused)
+            k = _FREE_EVICTED_REFUSED[0]
+            if k <= 16 or (k & (k - 1)) == 0:
+                logger.warning(
+                    "ARENA-FREE-EVICTED REFUSED n=%d reason=%s refused=%d of %d total=%d slots=%s statuses=%s "
+                    "(2 = generation moved, 3 = not EVICTING: the slot is no longer this evictor's candidate -- "
+                    "reaped or re-claimed by a new owner -- and is never freed under that owner)",
+                    k, reason, len(refused), n, _FREE_EVICTED_REFUSED[1],
+                    [s_ for s_, _ in refused[:4]], sorted({x for _, x in refused}))
+        return freed + len(legacy)
 
     # -- Stufe 3 (#1424): address pages in place --------------------------
     def find_slots(self, stems: Sequence[str]) -> list[tuple[int, int]]:
@@ -700,7 +833,7 @@ class ShmArena:
         if self._ledger is not None:
             took = a[ok == 1]
             if took.shape[0]:
-                self._ledger.took(took)
+                self._ledger.took(took, self.slot_gens_np(took))   # A2: generation-stamped
         return ok
 
     def _ref_ledgered(self, a, delta: int) -> int:
@@ -712,7 +845,10 @@ class ShmArena:
         cannot name is leaked rather than ever released twice."""
         import numpy as np
         if delta < 0:
-            a = self._ledger.allow_release(a).numpy()
+            # A2: generation-exact -- the slots' current generation is read while
+            # this process still holds what it releases (a held reference pins
+            # the slot; a moved generation means the reference is already gone)
+            a = self._ledger.allow_release(a, self.slot_gens_np(a)).numpy()
             if a.shape[0] == 0:
                 return 0
         n = int(a.shape[0])
@@ -720,7 +856,7 @@ class ShmArena:
                                              a.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
                                              int(delta)))
         if delta > 0 and done == int(np.count_nonzero(a >= 0)):
-            self._ledger.took(a)
+            self._ledger.took(a, self.slot_gens_np(a))   # A2: generation-stamped
         return done
 
     def ref_census(self):
@@ -747,6 +883,31 @@ class ShmArena:
         u32 = np.frombuffer(self._mm, dtype=np.uint32, count=self.slots * hb // 4, offset=hope)
         ref = u32.reshape(self.slots, hb // 4)[:, 1]
         return [int(ref[int(s)]) if 0 <= int(s) < self.slots else 0 for s in slots]
+
+    def slot_states(self, slots) -> list[int]:
+        """A2: the header state of these slots (0 free, 1 claimed, 2 complete,
+        3 evicting, 4 quarantine, 5 reaping) -- one strided header read, for
+        the rare re-point path (``arena_pool._old_slot_still_ours``)."""
+        import numpy as np
+        out = (ctypes.c_int64 * 6)()
+        self._lib.arena_layout(self.slots, self.slot_bytes, out)
+        hb, hope = int(out[0]), int(out[3])
+        u32 = np.frombuffer(self._mm, dtype=np.uint32, count=self.slots * hb // 4, offset=hope)
+        st = u32.reshape(self.slots, hb // 4)[:, 0]
+        return [int(st[int(s)]) if 0 <= int(s) < self.slots else -1 for s in slots]
+
+    def slot_gens_np(self, slots):
+        """A2: the generation of each slot (-1 out of range), numpy int64 --
+        one C call (arena_slot_gens). The reference ledger stamps every
+        reference it records with it (``RefLedger``)."""
+        import numpy as np
+        a = np.ascontiguousarray(np.asarray(slots, dtype=np.int64))
+        g = np.empty(a.shape, dtype=np.int64)
+        if a.shape[0]:
+            self._lib.arena_slot_gens(self._base, int(a.shape[0]),
+                                      a.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
+                                      g.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)))
+        return g
 
     def find_states(self, stems: Sequence[str]) -> list[int]:
         """#1439: the states only (0 absent/free, 1 claimed, 2 complete), by stem, hashed in C."""
@@ -845,10 +1006,35 @@ class ShmArena:
         self._lib.arena_quarantine_stale(self._base, n, c_sl, c_g, int(min_age_ms), st)
         return list(st)
 
+    def quarantine_host_write(self, slots: Sequence[int], gens: Sequence[int]) -> list[int]:
+        """H54 PARK-JOIN 1015: take HOST-WRITE claims away from their keys
+        regardless of references and byte progress (arena.c
+        ``arena_quarantine_host_write``; generation-checked, the old slot is
+        never freed while referenced or written). Per slot 1 quarantined,
+        2 generation moved / not claimed, 4 not a host-write claim."""
+        n = len(slots)
+        if n == 0:
+            return []
+        c_sl = (ctypes.c_int64 * n)(*[int(s) for s in slots])
+        c_g = (ctypes.c_int64 * n)(*[int(g) for g in gens])
+        st = (ctypes.c_int8 * n)()
+        self._lib.arena_quarantine_host_write(self._base, n, c_sl, c_g, st)
+        return list(st)
+
     def quarantine_sweep(self, backstop_ms: int) -> int:
         """L3FILL-JOINED (3): free quarantined slots nobody holds (or held
         past the backstop). Returns the number freed."""
         return int(self._lib.arena_quarantine_sweep(self._base, int(backstop_ms)))
+
+    def touch_progress(self, slots: Sequence[int], gens: Sequence[int]) -> int:
+        """S23: the reader of these claims is alive and reading -- move their progress clock (generation-checked,
+        CLAIMED only). Returns how many were touched."""
+        n = len(slots)
+        if n == 0:
+            return 0
+        c_sl = (ctypes.c_int64 * n)(*[int(s) for s in slots])
+        c_g = (ctypes.c_int64 * n)(*[int(g) for g in gens])
+        return int(self._lib.arena_touch_progress(self._base, n, c_sl, c_g))
 
     def free_if_gen(self, slots: Sequence[int], gens: Sequence[int], reason: str = "unnamed") -> list[int]:
         """Free this writer's own claims only while they still carry its
@@ -1135,6 +1321,23 @@ class ShmArena:
         freed = [int(slots[i]) for i, x in enumerate(out) if x == 0]
         if freed:
             _note_free(reason, freed)
+        return out
+
+    def revoke_orphan_claims(self, slots: Sequence[int], gens: Sequence[int]) -> list[int]:
+        """S81 review A1: free ORPHAN claims atomically (arena.c arena_revoke_orphan_claims) -- only a CLAIMED slot of
+        exactly one claimant with no open writer, no merged interval, no reference and the caller's generation;
+        anything else stays untouched (no writer_done). status per slot: 0 freed, 1 kept, 2 moved / not CLAIMED."""
+        n = len(slots)
+        if n == 0:
+            return []
+        cs = (ctypes.c_int64 * n)(*[int(s) for s in slots])
+        cg = (ctypes.c_int64 * n)(*[int(g) for g in gens])
+        st = (ctypes.c_int8 * n)()
+        self._lib.arena_revoke_orphan_claims(self._base, n, cs, cg, st)
+        out = list(st)
+        freed = [int(slots[i]) for i, x in enumerate(out) if x == 0]
+        if freed:
+            _note_free("s81-orphan-revoke", freed)
         return out
 
     def stats(self) -> dict:

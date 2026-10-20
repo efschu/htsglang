@@ -902,6 +902,12 @@ class SchedulerWeightUpdaterManager:
     _pdflip_kv_resumed_epoch: object = None  # Wake-Parallel: flip epoch whose kv_cache tms resume (the RESUME half) already ran
     _pdflip_leg_min_free_mib: object = None  # xsn323: the LOWEST card-free (MiB) seen at a tag claim of this rank's last wake legs
     _pdflip_leg_min_free_epoch: object = None  # the epoch that minimum belongs to (reset at the first claim of a new epoch)
+    #: y7o PDFLIP-LEG-ORDER: flip epoch whose first claim was logged (resp. whose
+    #: 'n/a' line was). FIELDS, not ad-hoc attributes -- slots=True: y7t logged
+    #: 0 LEG-ORDER lines because the assignment itself raised, and y7u died on
+    #: all ranks when the 'n/a' branch assigned the second one.
+    _pdflip_leg_order_epoch: object = None
+    _pdflip_leg_order_na_epoch: object = None
     _pdflip_graph_deferred: bool = False    # Wake-Parallel: cuda_graph resume deferred to the weights call
     _pdflip_weights_epoch_done: object = None  # Wake-Parallel: flip epoch whose weight legs are collected
     #: #1452b: snapshot counter -- slots=True, so it is a FIELD (boot weg2xsn208
@@ -4767,6 +4773,38 @@ class SchedulerWeightUpdaterManager:
             else "no (attach-time census reprinted, no walk; reads ask the shared #1459 L3 index)",
         )
 
+    def _pdflip_retire_pp_sends_before_sleep(self) -> None:
+        """S95b: ``Scheduler._pp_retire_device_sends_at_sleep`` at the sleep, one line when frames went. Rank-local,
+        no collective (every rank of the group runs it in this RPC). Never raises: a frame that cannot be retired
+        stays in its book and is joined lap-late as before."""
+        fn = getattr(getattr(self, "scheduler", None), "_pp_retire_device_sends_at_sleep", None)
+        if not callable(fn):
+            return
+        try:
+            frames, nbytes, kept = fn()
+        except Exception as exc:  # noqa: BLE001 -- the sleep goes on; the frames stay for the lap-late join
+            logger.warning("PDFLIP-SLEEP PP-SENDS-RETIRE skipped (%s: %s)", type(exc).__name__, str(exc)[:160])
+            return
+        if frames:
+            logger.info("PDFLIP-SLEEP PP-SENDS-RETIRED frames=%d mib=%.1f host_kept=%d (S95b: the device frames "
+                        "this rank sent and still held -- lap-late join book, P-overlap lead -- went after a "
+                        "device-side wait, before any pause; host halves stay for the lap-late join)",
+                        frames, nbytes / float(1 << 20), kept)
+
+    def _pdflip_quiesce_lend_before_sleep(self) -> None:
+        """F3: ``d_transient_lend.quiesce_for_sleep`` -- nothing of D's expert bank may move under the pause
+        (the lend's map thread, a deferred unmap, a warm copy). A rank without a seat controller does nothing.
+        Never raises: a failure is named and the sleep goes on (the pause serialises with the saver's mutex)."""
+        sched = getattr(self, "scheduler", None)
+        if sched is None:
+            return
+        try:
+            from flliper.srt.pdflip import d_transient_lend as _dtl
+
+            _dtl.quiesce_for_sleep(sched)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("PDFLIP-SLEEP LEND-QUIESCE skipped (%s: %s)", type(exc).__name__, str(exc)[:160])
+
     def _pdflip_drain_hicache_before_sleep(
         self, bound_s: float = PDFLIP_SLEEP_DRAIN_BOUND_S
     ) -> None:
@@ -4798,7 +4836,7 @@ class SchedulerWeightUpdaterManager:
                 "H91e SLEEP-DRAIN HOLD-OWNED prefetch=%d rids=%s: store->host "
                 "reads of the #1443 dormant hold (KV pool paused; the device "
                 "load is the wake's) -- not a sleep term, they keep running",
-                len(owned), sorted(r[:12] for r in owned),
+                len(owned), sorted(owned),
             )
         first = list(blockers())
         # H136: the decode-round cadence of the storage-queue agreement
@@ -4806,15 +4844,47 @@ class SchedulerWeightUpdaterManager:
         # -- every poll agrees, as with the gate unset (see
         # UnifiedRadixCache.drain_gate_forced for why that stays rank-uniform).
         _forced = getattr(tc, "drain_gate_forced", None)
+        # K12: every rank of the group passes the same switch (one launcher
+        # environment), so the reduced vector has the same length everywhere.
+        from flliper.srt.mem_cache import pdflip_backup_guard as _k12_guard
+        from flliper.srt.managers.pdflip_sleep_drain import sleep_abandon_backup_on
+
+        _k12_on = sleep_abandon_backup_on()
+        _k12_exec = (lambda: _k12_guard.drain_state(tc)[1]) if _k12_on else None
+        _group_max = functools.partial(tc.hicache_group_max, label="pdflip_sleep_drain")
         with (_forced() if callable(_forced) else nullcontext()):
             verdict, polls = drain_until_group_verdict(
                 idle_blockers=blockers,
                 check_hicache_events=tc.check_hicache_events,
-                group_max=functools.partial(
-                    tc.hicache_group_max, label="pdflip_sleep_drain"
-                ),
+                group_max=_group_max,
                 bound_s=bound_s,
+                backup_executing=_k12_exec,
             )
+            if _k12_on and not verdict.idle and verdict.abandonable:
+                # K12 (NF h16p D 13:35:43Z): the group read the SAME verdict --
+                # only storage backups left, none executing on a live thread --
+                # so every rank gives up its store copies here and re-reads the
+                # group once (bound 0: one reduction, the same on every rank).
+                # A backup that started executing in between keeps the rank
+                # blocked and the W120 below stops the group as before.
+                _ab, _kept = _k12_guard.abandon(
+                    tc, why=f"sleep drain expired after {time.monotonic() - t0:.2f} s"
+                )
+                verdict, _polls2 = drain_until_group_verdict(
+                    idle_blockers=blockers,
+                    check_hicache_events=tc.check_hicache_events,
+                    group_max=_group_max,
+                    bound_s=0.0,
+                    backup_executing=_k12_exec,
+                )
+                polls += _polls2
+                logger.warning(
+                    "K12 SLEEP-DRAIN ABANDON: abandoned=%d kept_executing=%d on this "
+                    "rank; group verdict after the abandon %s -- %s",
+                    _ab, _kept, verdict,
+                    "the sleep goes on (store copies lost, no KV lost)" if verdict.idle
+                    else "still blocked: W120 stops the group by name",
+                )
         waited_s = time.monotonic() - t0
         now = list(blockers())
         if first or polls or not verdict.idle:
@@ -4847,14 +4917,21 @@ class SchedulerWeightUpdaterManager:
         SLOT ALIASING). 27B: the idle verdict is group-reduced
         (``sleep_group_verdict``: the idle branch posts the L15 SLEEP-AGREE
         gathers, all ranks or none) and the L15 hold's chains are not counted
-        (``l15_retained_books``). Called on EVERY rank of the group (the held
-        bit, the drain and the verdict are collectives). Returns the retries
-        used; raises W120b before any pause otherwise."""
+        (``l15_retained_books``). S86 (NF port): on group D with HiCache the
+        pages L3 holds give their tree references back first, agreed. Called on
+        EVERY rank of the group (the held bit, the drain and the verdict are
+        collectives). Returns the retries used; raises W120b before any pause
+        otherwise."""
         sch = self.scheduler
         tc = getattr(sch, "tree_cache", None) if sch is not None else None
         if tc is None:
             self.flush_cache(zero_kv=False, sleep_group_verdict=True)
             return 0
+        if self._pdflip_group_name() == "D" and getattr(sch, "enable_hierarchical_cache", False):
+            # S86 (rc19 D 05:37:22-23, three park-end chains dropped un-backed): the pages L3 holds give their
+            # tree references back on every rank, agreed, BEFORE the flush's #1470 loop claims room (every rank,
+            # this point, a rank-uniform gate: group, HiCache, the switch inside)
+            self._pdflip_sleep_l3_release(sch, tc)
         return sleep_flush_until_reset(
             flush=lambda: self.flush_cache(zero_kv=False, sleep_group_verdict=True),
             tree=tc,
@@ -4862,6 +4939,24 @@ class SchedulerWeightUpdaterManager:
             retained=lambda: l15_retained_books(sch),
             log=logger,
         )
+
+    def _pdflip_sleep_l3_release(self, sch, tc) -> dict:
+        """S86 SLEEP-L3-RELEASE (``pdflip/sleep_l3_release.py``): every rank of group D, after the group drain and
+        before the sleep flush. A release the group made voids the quiesce's no-progress memo (the #1470 loop must
+        run again: the slots it found pinned are unreferenced now). Never raises past the step."""
+        from flliper.srt.managers import pdflip_flush_nonblock as _fnb
+        from flliper.srt.pdflip import sleep_l3_release as _s86
+
+        try:
+            res = _s86.run(tc)
+        except _s86.SleepL3ReleaseDivergence:
+            raise   # review S86 A1: the ranks are not one -- the group stops by name, it never flushes on
+        except Exception:  # noqa: BLE001 - only before the first collective (run converts every later one): as before
+            logger.warning("%s raised: the sleep flush runs without it", _s86.MARK, exc_info=True)
+            return {}
+        if int(res.get("group_released", 0) or 0) > 0:
+            _fnb.sweep_memo_clear(sch)
+        return res
 
     def _pdflip_hold_owned_prefetch(self) -> frozenset:
         """H91e: the open prefetch records of the #1443 dormant hold (empty
@@ -6233,7 +6328,7 @@ class SchedulerWeightUpdaterManager:
                 ext = sp._pp_load_back_extent(req)
                 if not ext:
                     logger.info("PDFLIP-PRELOAD rid=%s no host extent (device hit %d)",
-                                str(getattr(req, "rid", "?"))[:12],
+                                str(getattr(req, "rid", "?")),
                                 0 if getattr(req, "prefix_indices", None) is None
                                 else len(req.prefix_indices))  # SL: no bool() of a tensor
                     continue
@@ -6250,9 +6345,9 @@ class SchedulerWeightUpdaterManager:
                         tree.dec_lock_ref(old_last, dec)
                 n += 1
                 logger.info("PDFLIP-PRELOAD rid=%s extent=%d issued=%d tokens",
-                            str(getattr(req, "rid", "?"))[:12], int(ext), int(new_indices.numel()))
+                            str(getattr(req, "rid", "?")), int(ext), int(new_indices.numel()))
             except Exception as exc:  # noqa: BLE001 -- init_new loads it later as before
-                logger.info("PDFLIP-PRELOAD rid=%s skipped: %r", str(getattr(req, "rid", "?"))[:12], exc)
+                logger.info("PDFLIP-PRELOAD rid=%s skipped: %r", str(getattr(req, "rid", "?")), exc)
         logger.info("PDFLIP-PRELOAD held=%d issued=%d ms=%.0f", len(hold), n, (time.perf_counter() - t0) * 1000)
         return n
 
@@ -8055,6 +8150,20 @@ class SchedulerWeightUpdaterManager:
         sched = self.scheduler
         if sched is None:
             return False
+        # Q-570 tripwire: clearing the pools under a tree that still references
+        # device slots puts every one of them on BOTH credit sides (NF y8s TP1:
+        # free_and_cached=22, #924 MAMBA SLOT ALIASING at the first idle pass).
+        # The sleep leg guarantees a device-free tree (_pdflip_sleep_flush); a
+        # tree that still holds one here is refused by name, before any clear.
+        held_full, held_mamba = tree_device_held(getattr(sched, "tree_cache", None))
+        if held_full or held_mamba:
+            raise RuntimeError(
+                f"W26b PdFlipWakeTreeHeld: the radix tree kept across the sleep still holds "
+                f"device values (full={held_full} mamba={held_mamba}); the #1455 restore "
+                f"would clear req_to_token/mamba/allocator under them (#924 MAMBA SLOT "
+                f"ALIASING). The sleep flush of this rank did not reset its tree -- nothing "
+                f"was cleared."
+            )
         try:
             _l15_m, _l15_rank, _l15_keep, _l15_master_on = self._l15_wake_hold_signal()
             if _l15_master_on:
@@ -9826,8 +9935,13 @@ class SchedulerWeightUpdaterManager:
                     float(rec.get("waited_s", 0.0)) * 1000,
                     "counter" if int(rec.get("available_bytes", 0) or 0) >= 0 else "card-overdraw",
                     int(_st.get("credit_bytes", 0) or 0) // MIB_, int(need_bytes) // MIB_)
-        except Exception:  # noqa: BLE001 -- an instrument, never a gate
-            pass
+        except Exception as _lo_exc:  # noqa: BLE001 -- an instrument, never a gate
+            # LAYER-REST-1002: y7t carried 0 of these lines on 18 legs and the
+            # bare `pass` said nothing about why -- name it, once per leg.
+            if getattr(self, "_pdflip_leg_order_na_epoch", None) != epoch:
+                self._pdflip_leg_order_na_epoch = epoch
+                logger.info("PDFLIP-LEG-ORDER n/a tag=%s (%s: %s)", tag,
+                            type(_lo_exc).__name__, _lo_exc)
         # xsn323: remember the tightest point of these legs. The kv-first gate
         # of the NEXT wake reads it: kv_cache resumed before the legs must not
         # eat the free space the legs' tags need (5090: free 9028 MiB at
@@ -10033,6 +10147,14 @@ class SchedulerWeightUpdaterManager:
         # verdict over that group first and raises W120 on every rank alike.
         self._pdflip_drain_hicache_before_sleep()
         _pdflip_ph("drain_hicache")
+        # S95b: the device frames this rank sent and still holds (lap-late join book, P-overlap lead deque) go
+        # BEFORE any pause and before the sleep's empty_cache -- they are untagged, no pause covers them, and
+        # they sat in the group-P dormant residue D's expert residency is priced against (rc22 PP0/PP1 +600 MiB).
+        self._pdflip_retire_pp_sends_before_sleep()
+        # F3: D's bank -- an in-flight lend's map lands, the deferred unmaps go (their E1), the warm copies
+        # land -- before any pause; rank-local, no collective
+        self._pdflip_quiesce_lend_before_sleep()
+        _pdflip_ph("pp_sends")
         if self._pdflip_group_name() == "D":
             # RW: the LRU owners of every pool layer, BEFORE any pause (the
             # tables live under a paused tag); ids only, no expert bytes.
@@ -10629,6 +10751,14 @@ class SchedulerWeightUpdaterManager:
                 _kvsub,
             )
         sleep_complete = PDFLIP_SLEEP_TAGS.issubset(self.offload_tags)
+        if sleep_complete and self.scheduler is not None:
+            # K20 (17.10.): no PP receive stays posted into the sleep (gloo's 7200 s clock killed PP0 at 00:36:54Z)
+            try:
+                from flliper.srt.managers import pdflip_told_fallback as _wtf_k20
+
+                _wtf_k20.sleep_quiesce(self.scheduler)
+            except Exception:  # noqa: BLE001 - the census must never fail the sleep leg
+                logger.exception("PDFLIP PP-RECEIVE-CENSUS at=sleep FAILED")
         if pdflip_memory_saver_on and not sleep_complete:
             # A chunk RPC of an interleaved sleep: the census (whole-process
             # residency) is graded once the population is complete, below.
@@ -10792,6 +10922,12 @@ class SchedulerWeightUpdaterManager:
 
         _dpk_wake.wake_reclaim(self.scheduler)
         if self.scheduler is not None:
+            try:  # K20 (17.10.): PP0 re-arms the standing PP receives it parked at sleep
+                from flliper.srt.managers import pdflip_told_fallback as _wtf_k20w
+
+                _wtf_k20w.wake(self.scheduler)
+            except Exception:  # noqa: BLE001
+                logger.exception("PDFLIP PP-RECEIVE wake FAILED")
             self.scheduler._pdflip_resume_t0 = time.perf_counter()  # RW instrument: the leg's start
         # KRIT3 (pdflip/resume_via_p.py): a resume is a wake -- P ran in between;
         # RESUME-VIA-P counts its attempts per wake, not per refusal.

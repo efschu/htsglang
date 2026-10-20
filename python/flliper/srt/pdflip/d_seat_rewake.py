@@ -240,7 +240,17 @@ def _reseat(sched: Any, st: Any, n_new: int, grow: bool) -> Optional[float]:
     applied = None
     if ctl is not None:
         try:
-            applied = ctl.reseat_live(n_new, st.stage)
+            # S106 STAGE-KEEP: an open lend rides on beside what the re-seat maps (a shrink maps
+            # nothing, a grow the new seats' GDN cells -- priced in reseat_live); rank-local amount
+            from flliper.srt.pdflip import d_transient_lend as _dtl
+
+            need = _dtl.stage_keep_need_bytes(sched, ctl)
+            if need is None:
+                applied = ctl.reseat_live(n_new, st.stage)
+            else:
+                rows_before = int(getattr(ctl, "rows_on", 0) or 0)
+                applied = ctl.reseat_live(n_new, st.stage, keep_lend_need=need)
+                _dtl.after_phase_move(sched, ctl, rows_before)
         except V.PdFlipDSeatVramRefused as exc:
             ok = False
             logger.warning("%s %s n->%d refused on this rank: %s: %s", MARKER,
@@ -335,7 +345,9 @@ def round_boundary(sched: Any) -> Optional[str]:
     if moved is None:
         V.runtime_tick(sched)
         return None
-    V._tick_noop(sched)
+    # 1534 F6: the stage tick is skipped, admission is not -- the cap-lift verdict
+    # still has to stand before the next chunk (the only part of the tick run here)
+    V.cap_lift_after_seat_move(sched)
     return moved
 
 

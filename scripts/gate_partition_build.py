@@ -134,13 +134,11 @@ HARDENED_REASON = "simultaneity:hardened_899_2026-08-26;serial_pending_solo_repr
 # is the ground that refusal stands on, which is not the same for every member
 # and should not be reported as if it were.
 NOT_CROWDING_PROVABLE = {
-    "test/registered/unit/managers/test_pp_proxy_cross_epoch_mispair_795.py": SIMULTANEITY_REASON,
     "test/registered/unit/managers/test_pp_proxy_readiness_contract_789.py": SIMULTANEITY_REASON,
     # Same harness, same 3-rank gloo rendezvous, same shortened readiness
     # budget: the two above are the members that were observed, not the only
     # members that share the shape. The family is the unit.
     "test/registered/unit/managers/test_pp_proxy_readiness_rendezvous_789.py": SIMULTANEITY_REASON,
-    "test/registered/unit/managers/test_pp_proxy_retracted_pass_mispair_791c.py": SIMULTANEITY_REASON,
     # Same class, found by the #895 gate run rather than looked for. #868
     # classified this one SERIAL with the reason
     # `solo_differs:fails_only_solo=PPAdmissionWraparoundBlocks::

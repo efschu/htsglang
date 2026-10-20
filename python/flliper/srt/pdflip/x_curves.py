@@ -453,24 +453,45 @@ def _candidates(curves: XCurves, depth: float, n_lo: int, n_hi: int,
     return sorted(n for n in cand if n_lo <= n <= n_hi)
 
 
-def _excess_ms(curves: XCurves, depth: float, n: float, k: float, notes: Set[str]) -> float:
+def p_fixed_ms(curves: XCurves, depth: float, notes: Optional[Set[str]] = None) -> float:
+    """H16V F2: P's fixed cost of ONE prefill request at cached ``depth`` -- the P curve's first segment read at
+    ``n -> 0`` (the line through its first two points, clamped at 0), blended between the bracketing depth rows. What
+    every extra request of a set costs on P beyond its tokens (a P prefill is one forward per request; NF h16u2
+    15:36Z: 1119 tokens = 1.59 s gpu-ms). A one-point row carries no slope: its fixed cost is unknown, 0 and named."""
+    sink: Set[str] = set() if notes is None else notes
+    lo, hi, w = _bracket(curves.p_curve, depth, sink, "p")
+
+    def _icpt(row: CurveRow) -> float:
+        if len(row.n) < 2:
+            sink.add("p-fixed-unknown")
+            return 0.0
+        slope = (float(row.ms[1]) - float(row.ms[0])) / float(row.n[1] - row.n[0])
+        return max(0.0, float(row.ms[0]) - slope * float(row.n[0]))
+
+    a = _icpt(lo)
+    return a if w == 0.0 else (1.0 - w) * a + w * _icpt(hi)
+
+
+def _excess_ms(curves: XCurves, depth: float, n: float, k: float, notes: Set[str],
+               p_extra_ms: float = 0.0) -> float:
     """D's cost of the request minus its cost through the flip, in ms: <= 0
-    means D is the cheaper route (the request is SHORT)."""
+    means D is the cheaper route (the request is SHORT). ``p_extra_ms``: P forwards beyond the first that the
+    flip's riders cost (a set of k members: (k-1) x :func:`p_fixed_ms`)."""
     d_ms = request_ms(curves.d_curve, depth=depth, n=n, notes=notes, tag="d")
     p_ms = request_ms(curves.p_curve, depth=depth, n=n, notes=notes, tag="p")
     price_ms = 1000.0 * flip_seconds(curves.flip_price, depth=depth + n, notes=notes) / k
-    return d_ms - p_ms - price_ms
+    return d_ms - p_ms - price_ms - float(p_extra_ms)
 
 
-def _first_crossing(curves: XCurves, depth: float, k: float, notes: Set[str]
-                    ) -> Tuple[float, str, str]:
+def _first_crossing(curves: XCurves, depth: float, k: float, notes: Set[str],
+                    p_extra_ms: float = 0.0) -> Tuple[float, str, str]:
     """``(X, why, clamp)``: the first ``n`` of D's measured range where D
     becomes dearer than the flip, linear between candidates."""
     n_lo, n_hi, d_pts = _d_domain(curves.d_curve, depth, reach_depth(curves))
     cand = _candidates(curves, depth, n_lo, n_hi, d_pts)
     prev_n, prev_g = None, None
     for n in cand:
-        g = _excess_ms(curves, depth, float(n), k, notes)
+        g = _excess_ms(curves, depth, float(n), k, notes, p_extra_ms)
         if g > 0.0:
             if prev_n is None:
                 return float(n_lo), "p-cheaper-at-n_lo", "n_lo"
@@ -482,9 +503,10 @@ def _first_crossing(curves: XCurves, depth: float, k: float, notes: Set[str]
 
 def x_verdict_from_curves(*, depth: int, open_requests: int, curves: XCurves,
                           cap: Optional[int] = None, max_k: Optional[float] = None,
-                          beyond: str = BEYOND_REFUSE) -> XCurveVerdict:
+                          beyond: str = BEYOND_REFUSE, p_extra_ms: float = 0.0) -> XCurveVerdict:
     """The X of one request at cached ``depth`` with ``open_requests`` riding
-    one flip (>= 1), stateless. ``cap`` bounds X from above (the ceiling /
+    one flip (>= 1), stateless. ``p_extra_ms`` (H16V F2) is the P fixed cost of the set's further members, added to
+    P's side of the break-even. ``cap`` bounds X from above (the ceiling /
     D's riegel), ``max_k`` bounds the amortisation (a P phase's request cap).
     A depth beyond :func:`reach_depth` is refused (W193) or, with
     ``beyond="clamp"``, priced at the deepest row and named."""
@@ -504,7 +526,7 @@ def x_verdict_from_curves(*, depth: int, open_requests: int, curves: XCurves,
     k = max(1.0, float(open_requests))
     if max_k is not None and max_k >= 1.0:
         k = min(k, float(max_k))
-    x_star, why, clamp = _first_crossing(curves, float(depth_used), k, notes)
+    x_star, why, clamp = _first_crossing(curves, float(depth_used), k, notes, max(0.0, float(p_extra_ms)))
     x_curve = int(math.floor(x_star + 1e-6))  # a crossing ON a token is that token (float noise)
     x = x_curve
     if cap is not None and cap > 0 and x > int(cap):

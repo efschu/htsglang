@@ -1166,6 +1166,60 @@ class LRUFileEvictor:
                     self._lru[suffixed_key] = actual
                     self._total_bytes += actual - prev
 
+    def owns(self, suffixed_key: str) -> bool:
+        """S38 review (18.10.): does this owner already hold ``suffixed_key`` as ITS write -- indexed and not the
+        sibling's, or reserved right now by a writer of this process? Asked BEFORE a ``reserve`` whose write may
+        find the file complete already (status 2), so :meth:`adopt_foreign` never re-labels this owner's own
+        page. Without eviction there is no index: True (nothing to re-label)."""
+        if not self._eviction_enabled:
+            return True
+        with self._lock:
+            return suffixed_key in self._pending_writes or (
+                suffixed_key in self._lru and suffixed_key not in self._foreign_indexed)
+
+    def adopt_foreign(self, suffixed_key: str) -> None:
+        """S38 review (18.10., S36 risk 4): resolve a reservation whose write found the file ALREADY COMPLETE,
+        written by ANOTHER writer -- in Weg 2 the sibling group's L3 write-behind over the same shared arenas
+        (S36: the write-behind no longer holds still, so P-PP0 and D-TP0 walk the same COMPLETE census at the same
+        time and the second writer of a page gets status 2). Committing that as OWN gave the page two owners, each
+        free to unlink it -- the #1295 MUST_FIX 4 rule ("an indexed entry this owner did not write is COUNTED and
+        never UNLINKED") broken for every such page. Here it is indexed exactly as the wake's journal apply would
+        index the sibling's C line: counted against the cap, never unlinked by this owner. Journal: ``A`` (this
+        owner wrote nothing)."""
+        jn = getattr(self, "_journal", None)
+        if jn is not None:
+            jn.write("A", time.time(), 0, suffixed_key)
+        if not self._eviction_enabled:
+            return
+        actual = None
+        try:
+            actual = self._allocated_size(os.stat(self._path_for_stem(suffixed_key)))
+        except OSError:
+            pass
+        with self._lock:
+            self._pending_writes.discard(suffixed_key)
+            cur = self._lru.get(suffixed_key)
+            if actual is None:
+                # gone again (the owner evicted it meanwhile): nothing to count, nothing of ours to keep
+                if cur is not None:
+                    del self._lru[suffixed_key]
+                    self._total_bytes -= cur
+                    if suffixed_key in self._foreign_indexed:
+                        self._foreign_indexed.discard(suffixed_key)
+                        self._foreign_indexed_bytes -= cur
+                return
+            if cur is None:
+                self._lru[suffixed_key] = actual
+                self._total_bytes += actual
+            elif cur != actual:
+                self._lru[suffixed_key] = actual
+                self._total_bytes += actual - cur
+                if suffixed_key in self._foreign_indexed:
+                    self._foreign_indexed_bytes += actual - cur
+            if suffixed_key not in self._foreign_indexed:
+                self._foreign_indexed.add(suffixed_key)
+                self._foreign_indexed_bytes += actual
+
     def abort(self, suffixed_key: str) -> None:
         """Release a reservation whose write failed: drop it and refund the bytes."""
         if getattr(self, "_journal", None) is not None:
@@ -1185,6 +1239,7 @@ class LRUFileEvictor:
         bumped the inode through its open fd, and a second syscall here would
         be a second GIL hand-off per page for nothing.
         """
+        self._journal_touch(suffixed_key)
         if not self._eviction_enabled:
             return
         if mtime:
@@ -1206,6 +1261,36 @@ class LRUFileEvictor:
             else:
                 self._lru[suffixed_key] = size
                 self._total_bytes += size
+
+    def _journal_touch(self, suffixed_key: str) -> None:
+        """L3-READ-RECENCY-1014: a read hit as a ``T`` journal line, so the
+        storage OWNER (it rebuilds its LRU from journal lines at wake and never
+        walks st_mtime since the 28.09. journal index) sees the SIBLING's reads.
+        NF h13 14:22:55: D's owner reclaimed 7.5 GB oldest-first while the
+        prefix P had read at 14:21:32 (124928 tokens of a vision session D
+        serves from its device) still stood at its write time -- P's probe at
+        14:25:49 found 88 leading pages instead of 196. At most one line per
+        page and writer per FLLIPER_HICACHE_L3_JOURNAL_TOUCH_S. Never raises."""
+        jn = getattr(self, "_journal", None)
+        if jn is None:
+            return
+        try:
+            if not envs.FLLIPER_HICACHE_L3_JOURNAL_TOUCH.get():
+                return
+            now = time.time()
+            seen = self.__dict__.get("_journal_touched")
+            if seen is None:
+                seen = self.__dict__["_journal_touched"] = OrderedDict()
+            last = seen.get(suffixed_key)
+            if last is not None and now - last < float(envs.FLLIPER_HICACHE_L3_JOURNAL_TOUCH_S.get()):
+                return
+            seen[suffixed_key] = now
+            seen.move_to_end(suffixed_key, last=True)
+            while len(seen) > 65536:
+                seen.popitem(last=False)
+            jn.write("T", now, 0, suffixed_key)
+        except Exception:  # noqa: BLE001 -- a recency line is never a reason to fail a read
+            return
 
     def _touch_mtime(self, tensor_path: str) -> None:
         """Record the recency where the SIBLING owner can read it (N2).
@@ -1279,7 +1364,8 @@ class LRUFileEvictor:
         # estimate rather than re-probing statvfs on every eviction.
         free = fs[1]
         self._evict_while(
-            lambda reclaimed: (free + reclaimed) - value_bytes < self.min_free_bytes
+            lambda reclaimed: (free + reclaimed) - value_bytes < self.min_free_bytes,
+            why="min_free",
         )
         # Re-probe: external writers may have changed free space meanwhile.
         fs = self._fs_stats()
@@ -1718,10 +1804,16 @@ class LRUFileEvictor:
         names a page whose file is gone is harmless: the index only ever COUNTS
         and UNLINKS (FileNotFoundError is a drop), the read path never asks it.
         """
-        added = removed = 0
+        added = removed = touched = 0
         with self._lock:
             c = dict(getattr(self, "_scan_census", None) or _EMPTY_CENSUS)
             for _t, op, size, stem in records:
+                if op == "T":
+                    # L3-READ-RECENCY-1014: the sibling READ this page -- newest end of the LRU
+                    if stem in self._lru and stem not in self._pending_writes:
+                        self._lru.move_to_end(stem, last=True)
+                        touched += 1
+                    continue
                 if op not in ("C", "E"):
                     continue  # R/A: intents, resolved by their C/A (or at the next load)
                 indexed = (not self._scan_suffixes) or stem.endswith(self._scan_suffixes)
@@ -1804,6 +1896,8 @@ class LRUFileEvictor:
             f"{len(self._journal_reader.state)} journal(s), +{added}/-{removed} files, "
             f"{census['indexed_entries']} of {census['seen_entries']} files indexed, "
             f"{(time.monotonic() - t0) * 1000:.0f} ms (no directory walk)"
+            + (f"; read-recency: {touched} page(s) the other writers read moved to MRU "
+               f"(L3-READ-RECENCY-1014)" if touched else "")
         )
         return census
 
@@ -2001,8 +2095,13 @@ class LRUFileEvictor:
         # these two must not disagree.
         tensor_path = self._path_for_stem(evict_stem)
         try:
+            try:
+                _mtime = os.stat(tensor_path).st_mtime   # L3-EVICT-FILE: the victim's age
+            except OSError:
+                _mtime = None
             os.remove(tensor_path)
             freed = evict_size
+            self._note_evicted_file(evict_stem, evict_size, _mtime)
             _idx = getattr(self, "l3_index", None)
             if _idx is not None:
                 try:
@@ -2054,8 +2153,14 @@ class LRUFileEvictor:
             if self._pins is not None and self._pins.is_pinned(tw):
                 continue
             try:
-                os.remove(self._path_for_stem(tw))
+                _tp = self._path_for_stem(tw)
+                try:
+                    _mt = os.stat(_tp).st_mtime
+                except OSError:
+                    _mt = None
+                os.remove(_tp)
                 freed += size
+                self._note_evicted_file(tw, size, _mt)   # L3-EVICT-FILE (with its KV page)
             except FileNotFoundError:
                 pass
             except OSError as e:
@@ -2089,7 +2194,32 @@ class LRUFileEvictor:
             "FLLIPER_HICACHE_L3_SIDECAR_PAIR_EVICT)", cur[0], cur[1],
         )
 
-    def _evict_while(self, should_continue) -> int:
+    def _note_evicted_file(self, stem: str, size: int, mtime) -> None:
+        """ZERO-ANCHOR 1015 (pdflip-40-179 / pdflip-5-52, boot 133855): the L3 LRU
+        took files of a parked span between its demote and its resume, and the
+        log could not name one of them -- ``EVICTION-BG reclaimed 8265510912 B``
+        is a sum. One line per evicted file (stem, component, age, reason, run),
+        capped per run (``FLLIPER_HICACHE_L3_EVICT_FILE_LOG``, default 64; 0 =
+        off), the rest counted in the run's ``L3-EVICT-FILE SUMMARY``."""
+        try:
+            n = self.__dict__.get("_evict_file_run_n", 0) + 1
+            self._evict_file_run_n = n
+            cap = int(os.environ.get("FLLIPER_HICACHE_L3_EVICT_FILE_LOG", "64") or 0)
+            if cap <= 0 or n > cap:
+                return
+            age = -1.0 if mtime is None else max(0.0, time.time() - float(mtime))
+            comp = "kv"
+            for tag in (".qsa_indexer", ".mamba", ".draft"):
+                if tag in stem:
+                    comp = tag[1:]
+                    break
+            logger.info("L3-EVICT-FILE stem=%s comp=%s bytes=%d age_s=%.0f why=%s run=%d n=%d (an L3 "
+                        "file left the store; capped at %d per run)", stem, comp, int(size), age,
+                        self.__dict__.get("_evict_why", "?"), self.__dict__.get("_evict_run_id", 0), n, cap)
+        except Exception:  # noqa: BLE001 - an instrument never stops an eviction
+            pass
+
+    def _evict_while(self, should_continue, why: str = "cap") -> int:
         """Evict oldest non-pending entries while ``should_continue(reclaimed)``.
 
         ``should_continue`` is passed the disk bytes reclaimed so far and returns
@@ -2099,6 +2229,23 @@ class LRUFileEvictor:
         """
         reclaimed = 0
         attempts_left = len(self._lru)
+        # L3-EVICT-FILE: one run = one call; its per-file lines are capped
+        self._evict_why = why
+        self._evict_run_id = self.__dict__.get("_evict_run_id", 0) + 1
+        self._evict_file_run_n = 0
+        try:
+            return self._evict_while_impl(should_continue, reclaimed, attempts_left)
+        finally:
+            _n = self.__dict__.get("_evict_file_run_n", 0)
+            try:
+                _cap = int(os.environ.get("FLLIPER_HICACHE_L3_EVICT_FILE_LOG", "64") or 0)
+            except ValueError:
+                _cap = 64
+            if _cap > 0 and _n > _cap:
+                logger.info("L3-EVICT-FILE SUMMARY run=%d why=%s files=%d logged=%d suppressed=%d",
+                            self._evict_run_id, why, _n, _cap, _n - _cap)
+
+    def _evict_while_impl(self, should_continue, reclaimed: int, attempts_left: int) -> int:
         while self._lru and attempts_left > 0 and should_continue(reclaimed):
             outcome, freed = self._evict_one_lru_locked()
             if outcome == "stop":
@@ -2241,7 +2388,7 @@ class LRUFileEvictor:
                                       and time.monotonic() - t_b < _BG_EVICT_BATCH_S)) \
                     and self._directory_bytes_locked() > target
 
-            got = self._evict_while(more)
+            got = self._evict_while(more, why="cap_bg")
             # A batch cut for a waiter has not shown that nothing is evictable.
             return before, got, (got == 0 and not cut[0] and self._directory_bytes_locked() > target)
 

@@ -41,8 +41,22 @@ from flliper.srt.mem_cache.pool_host.arena_pool import (
 
 logger = logging.getLogger(__name__)
 
+#: MAMBA-STAGING-HWM: the period of the instrument's line while staging rows are used
+MAMBA_STAGING_HWM_LOG_S = 60.0
+
 
 _STATE_LOAD_N = 0
+_BYPASS_N = [0]
+
+#: ANCHOR-BYPASS (14.10.): an anchor blob the mamba arena has no slot for is
+#: read from L3 into a host staging row instead of being a miss. Unset = on;
+#: 0/false/no/off = the arena-only read (a full arena is a miss after the wait).
+ENV_ANCHOR_BYPASS = "FLLIPER_PDFLIP_MAMBA_ANCHOR_BYPASS"
+
+
+def anchor_bypass_on(env=None) -> bool:
+    env = os.environ if env is None else env
+    return str(env.get(ENV_ANCHOR_BYPASS, "1") or "1").strip().lower() not in ("0", "false", "no", "off")
 
 
 def _arena_state_load_block_bytes() -> int:
@@ -322,6 +336,7 @@ class ArenaMambaPoolHost(MambaPoolHost):
     _evict_for_claim = ArenaMHAHostPool._evict_for_claim     # H81: the claim's room, no disk I/O
     release_tree_rows = ArenaMHAHostPool.release_tree_rows   # H81: the tree reset's release
     complete_write = ArenaMHAHostPool.complete_write
+    take_lost_slots = ArenaMHAHostPool.take_lost_slots   # A2: the anchors a late ack lost
     abort_write = ArenaMHAHostPool.abort_write
     _slots_of = ArenaMHAHostPool._slots_of
     # L15-12c-E2a: the anchor's L2 identity reads the same complete census
@@ -481,16 +496,56 @@ class ArenaMambaPoolHost(MambaPoolHost):
         found = self.arena.find_slots(stems)
         out = []
         for i, (slot, state) in enumerate(found):
+            bypass_row = None
+            _reffed = False
             if slot < 0 or state != 2:
                 # #1433: the L3 return path -- a blob on disk is read straight
                 # into a fresh slot and completed.
                 fill = getattr(backend, "arena_fill_from_disk", None)
-                f = fill(self.arena, [stems[i]], int(self._page_bytes))[0] if callable(fill) else None
+                if callable(fill):
+                    # ANCHOR-BYPASS: with a staging row in hand the fill does
+                    # not wait for arena room -- a FULL arena reads past it
+                    bypass_row = self._bypass_row()
+                    try:
+                        # S24 REF-BEFORE-COMPLETE: take_ref -- the anchor blob is referenced from before its complete
+                        _fl = fill(self.arena, [stems[i]], int(self._page_bytes),
+                                   room_wait=bypass_row is None, take_ref=True)
+                        _reffed = bool(getattr(_fl, "_arena", None) is not None)
+                        f = _fl[0]
+                    except TypeError:  # a backend without the switches
+                        try:
+                            f = fill(self.arena, [stems[i]], int(self._page_bytes),
+                                     room_wait=bypass_row is None)[0]
+                        except TypeError:
+                            f = fill(self.arena, [stems[i]], int(self._page_bytes))[0]
+                else:
+                    f = None
                 if f is not None:
                     slot, state = f, 2
-            if slot >= 0 and state == 2 and self.arena.ref_slots([slot], +1) == 1:
+            if slot >= 0 and state == 2 and (_reffed or self.arena.ref_slots([slot], +1) == 1):
+                if bypass_row is not None:
+                    super().free(bypass_row)
                 host_indices[i] = self.staging_rows + slot
                 out.append(True)
+            elif bypass_row is not None:
+                # ANCHOR-BYPASS (NF h13 84e787ec96, D TP0 14:16:17, pdflip-10-82):
+                # the 32-slot mamba arena was full of the lane-held requests'
+                # PARK anchors (PARK-DEMOTE pool=anchor, DISPLACE why=park_first);
+                # every lane resume waited the 5 s ROOM-WAIT (rounds=196,
+                # claimed=0), D's store vote was 0 (X-GATE store=0 W31) and the
+                # request went to P for a full prefill although its 921 KV pages
+                # AND its anchor were on disk. The blob is read from L3 straight
+                # into a host STAGING row (the pre-arena row path: this rank's
+                # extents via HiCacheFile.get -> _get_canonical_slice) -- None =
+                # the per-key read of the caller fills it; a failed read releases
+                # the row with the transfer's host indices like any miss.
+                host_indices[i] = int(bypass_row[0])
+                _BYPASS_N[0] += 1
+                if _BYPASS_N[0] <= 16 or _BYPASS_N[0] % 256 == 0:
+                    logger.info("PDFLIP ANCHOR-BYPASS n=%d stem=%s row=%d (the mamba arena had no slot: "
+                                "the anchor blob is read from L3 into a host staging row)",
+                                _BYPASS_N[0], stems[i][:24], int(bypass_row[0]))
+                out.append(None)
             else:
                 # #1427d (xsn190): NOT in the arena = an honest miss, exactly
                 # as the KV pages (#1424 `_arena_page_get`): the arena is the
@@ -500,6 +555,16 @@ class ArenaMambaPoolHost(MambaPoolHost):
                 # still writing) -- the prefix is recomputed, nothing crashes.
                 out.append(False)
         return out
+
+    def _bypass_row(self):
+        """ANCHOR-BYPASS: one free host staging row (the pre-arena row path),
+        or None (switch off, or every staging row in use)."""
+        if not anchor_bypass_on():
+            return None
+        try:
+            return self._stg_alloc(1, "bypass")  # MAMBA-STAGING-HWM: counted as the bypass path
+        except Exception:  # noqa: BLE001 - no row, the old miss
+            return None
 
     # -- transfers -------------------------------------------------------------------
     def _split(self, host_indices: torch.Tensor):
@@ -947,10 +1012,10 @@ class ArenaMambaPoolHost(MambaPoolHost):
     # -- allocator -------------------------------------------------------------------
     def free(self, indices: torch.Tensor) -> int:
         if self.arena is None:
-            return super().free(indices)
+            return self._stg_note_free(indices) or super().free(indices)
         idx = indices.cpu() if torch.is_tensor(indices) else torch.as_tensor(indices)
         S, A = self.staging_rows, self.arena_slots
-        staging = idx[idx < S]
+        staging = idx[idx < S]; self._stg_note_free(staging)
         rows = (idx[(idx >= S) & (idx < S + A)] - S).tolist()
         freed = 0
         if staging.numel():
@@ -974,3 +1039,74 @@ class ArenaMambaPoolHost(MambaPoolHost):
                 self.arena.ref_slots(keep, -1)
             freed += len(rows)
         return freed
+
+    # -- MAMBA-STAGING-HWM (16.10.): how many staging rows [0, S) are really used ------
+    # The staging rows carry ANCHOR-BYPASS reads (a full arena), transfers without a
+    # pre-claimed arena id and whatever the flush takes that way; the arena carries
+    # the backups. This instrument names the real need (Planer 16.10.: the staging is
+    # sized from it): the highest number of rows in use at once, the highest row id,
+    # allocations per path (bypass / transfer / flush) and refusals per path. Logged
+    # when the high-water mark rises, every MAMBA_STAGING_HWM_LOG_S (60 s) on use,
+    # and at every reset (clear). Reads nothing a rank decides on.
+    def _stg_state(self) -> dict:
+        st = getattr(self, "_stg", None)
+        if st is None:
+            st = self._stg = {"in_use": set(), "hwm": 0, "max_row": -1, "t": time.monotonic(),
+                              "alloc": {"bypass": 0, "transfer": 0, "flush": 0},
+                              "refused": {"bypass": 0, "transfer": 0, "flush": 0}}
+        return st
+
+    def _stg_line(self, why: str) -> None:
+        st = self._stg_state()
+        st["t"] = time.monotonic()
+        logger.info(
+            "MAMBA-STAGING-HWM %s staging=%d in_use=%d hwm=%d max_row=%d alloc bypass=%d transfer=%d flush=%d "
+            "refused bypass=%d transfer=%d flush=%d (staging rows [0,S) of the mamba anchor host pool; the arena "
+            "carries the backups)",
+            why, int(getattr(self, "staging_rows", self.size)), len(st["in_use"]), st["hwm"], st["max_row"],
+            st["alloc"]["bypass"], st["alloc"]["transfer"], st["alloc"]["flush"],
+            st["refused"]["bypass"], st["refused"]["transfer"], st["refused"]["flush"],
+        )
+
+    def _stg_alloc(self, need_size: int, path: str):
+        rows = MambaPoolHost.alloc(self, need_size)
+        try:
+            st = self._stg_state()
+            if rows is None:
+                st["refused"][path] += 1
+            else:
+                ids = [int(x) for x in rows.tolist()]
+                st["alloc"][path] += len(ids)
+                st["in_use"].update(ids)
+                st["max_row"] = max([st["max_row"]] + ids)
+                if len(st["in_use"]) > st["hwm"]:
+                    st["hwm"] = len(st["in_use"])
+                    self._stg_line("new-hwm path=%s" % path)
+                    return rows
+            if time.monotonic() - st["t"] >= MAMBA_STAGING_HWM_LOG_S:
+                self._stg_line("periodic")
+        except Exception:  # noqa: BLE001 - an instrument never breaks an allocation
+            pass
+        return rows
+
+    def alloc(self, need_size: int):
+        """MAMBA-STAGING-HWM: every staging allocation that is not a bypass read is
+        a transfer without a pre-claimed arena id -- 'flush' while the tree's flush
+        spill mark is on (set on this pool by the radix cache when it hands it out)."""
+        return self._stg_alloc(need_size, "flush" if getattr(self, "_pdflip_flush_tag", False) else "transfer")
+
+    def _stg_note_free(self, indices) -> None:
+        try:
+            st = self._stg_state()
+            ids = indices.tolist() if torch.is_tensor(indices) else list(indices)
+            st["in_use"].difference_update(int(x) for x in ids)
+        except Exception:  # noqa: BLE001 - an instrument never breaks a free
+            pass
+        return None
+
+    def clear(self):
+        super().clear()
+        st = getattr(self, "_stg", None)
+        if st is not None:
+            self._stg_line("reset")
+            st["in_use"].clear()

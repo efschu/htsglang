@@ -62,6 +62,8 @@ from __future__ import annotations
 import logging
 import math
 import os
+import re
+import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -77,6 +79,8 @@ REFUSAL_CODE = "W-SEAT PdFlipDSeatOverrun"
 WIPE_CODE = "W-SEAT-WIPE"
 #: one line per live apply: extents kept, cells freed / mapped, wiped=0
 LIVE_MARK = "PDFLIP D-SEAT-VRAM LIVE-SPANS"
+#: S106: the lend's own marker (d_transient_lend.MARK) for the stage-keep line
+LEND_MARK = "PDFLIP D-TRANSIENT-LEND"
 _MIB = float(1 << 20)
 
 
@@ -94,6 +98,160 @@ class PdFlipDSeatVramNoMemory(PdFlipDSeatVramRefused):
 
 #: torch_memory_saver's rc for a map the card cannot back (cuMemCreate OOM)
 TMS_RC_OUT_OF_MEMORY = 2
+
+
+#: S77-B: one line per rank whenever a live KV grow found the card short
+GROW_ROOM_MARK = "PDFLIP D-SEAT-VRAM GROW-ROOM"
+
+
+def _fresh_bytes(prev, spans, mapped: int) -> int:
+    """Bytes ``set_spans(spans, now=True)`` maps fresh over the extents ``prev``: the
+    new plan's ranges minus the extents it keeps. ``prev`` unknown: the mapped bytes
+    count as kept (never below zero)."""
+    want = span_bytes(spans)
+    if prev is None:
+        return max(0, want - int(mapped))
+    kept = [e for e in prev if any(lo <= e[0] and e[1] <= hi for lo, hi in spans)]
+    return max(0, want - span_bytes(kept))
+
+
+def _released_bytes(prev, spans, mapped: int) -> int:
+    """Bytes a live ``set_spans(spans)`` gives back: the extents of ``prev`` that lie
+    wholly inside no range of the new plan."""
+    if prev is None:
+        return max(0, int(mapped) - span_bytes(spans))
+    return span_bytes([e for e in prev if not any(lo <= e[0] and e[1] <= hi for lo, hi in spans)])
+
+
+@dataclass
+class GrowRoom:
+    """S77-B: one rank's measured answer for a live KV grow (bytes)."""
+
+    ok: bool
+    need: int
+    free_before: int
+    free_after: int
+    trimmed: int
+    rows_from: int
+    rows_cell: int
+    rows_to: Optional[int]
+    release_all: int
+
+    def line(self, *, n: int, stage: int) -> str:
+        return ("%s n=%d stage=S%d need_mib=%.1f free_mib=%.1f trimmed_mib=%.1f free_after_mib=%.1f "
+                "rows_on=%d cell_rows=%d rows_to=%s release_all_mib=%.1f verdict=%s (the KV the cell "
+                "books is mapped into MEASURED bytes: the cache trimmed first, then this rank's own "
+                "expert rows OFF; short = no rank moves, the admission waits)"
+                % (GROW_ROOM_MARK, n, stage, self.need / _MIB, self.free_before / _MIB,
+                   self.trimmed / _MIB, self.free_after / _MIB, self.rows_from, self.rows_cell,
+                   "-" if self.rows_to is None else self.rows_to, self.release_all / _MIB,
+                   "ok" if self.ok else "short"))
+
+
+class CardRoom:
+    """S77-B: the card as the CUDA driver reports it (``cudaMemGetInfo``) and the
+    caching allocator's trim (synchronize + empty_cache, as PDFLIP-EXTEND-CACHE-TRIM).
+    ``free`` is None without an initialised CUDA context (CPU tests, P): nothing is
+    measured then and the grow keeps its plan."""
+
+    def free(self) -> Optional[int]:
+        try:
+            import torch
+
+            if not torch.cuda.is_available() or not torch.cuda.is_initialized():
+                return None
+            return int(torch.cuda.mem_get_info()[0])
+        except Exception:  # noqa: BLE001 -- an unreadable card is "not measured"
+            return None
+
+    def trim(self) -> int:
+        import torch
+
+        try:
+            if torch.cuda.is_current_stream_capturing():
+                return 0
+        except Exception:  # noqa: BLE001
+            pass
+        r0 = int(torch.cuda.memory_reserved())
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        return max(0, r0 - int(torch.cuda.memory_reserved()))
+
+
+_CARD = CardRoom()
+
+
+def _fold_device_bytes(ctl) -> None:
+    """F3 review A5: the device mover books on the device; its cumulative total is read back without a wait
+    (``DeferredRead``) and folded into ``ctl.bytes_copied_dev`` once ready."""
+    rd = getattr(ctl, "_bytes_dev_read", None)
+    if rd is not None and rd.ready():
+        host = rd.get()
+        ctl.bytes_copied_dev = int(host[0].reshape(-1)[0])
+        ctl._bytes_dev_read = None
+        rd = None
+    accs = [a for a in (getattr(c, "_pdflip_bank_bytes_dev", None) for c in getattr(ctl, "caches", ())) if a is not None]
+    if accs and rd is None:
+        import torch
+
+        from flliper.srt.pdflip.d_row_fence import DeferredRead
+
+        ctl._bytes_dev_read = DeferredRead([torch.stack([a.reshape(()) for a in accs]).sum().reshape(1)])
+
+
+class _LendJob:
+    """F3: one lend whose map runs on the helper thread."""
+
+    __slots__ = ("base", "want", "census", "future")
+
+    def __init__(self, base: int, want: int, census: dict, future):
+        self.base, self.want, self.census, self.future = int(base), int(want), census, future
+
+
+class _Inline:
+    """F3: an executor that runs the map in the caller (the synchronous ``lend`` and CPU desk ranks)."""
+
+    def submit(self, fn, *args):
+        import concurrent.futures
+
+        fut = concurrent.futures.Future()
+        try:
+            fut.set_result(fn(*args))
+        except BaseException as exc:  # noqa: BLE001 -- re-raised by finish_lend on the scheduler thread
+            fut.set_exception(exc)
+        return fut
+
+
+_INLINE = _Inline()
+_LEND_EXECUTOR = None
+
+
+def _lend_executor():
+    """F3: ONE map thread per rank. ``tms_set_spans`` (ctypes, GIL released) takes the saver's metadata mutex
+    per allocation, so it serialises with the scheduler's own saver calls; the CUDA device of the scheduler
+    thread is made current on the thread first (the VMM calls need no stream; no kernel is launched there)."""
+    global _LEND_EXECUTOR
+    if _LEND_EXECUTOR is None:
+        import concurrent.futures
+
+        dev = None
+        try:
+            import torch
+
+            if torch.cuda.is_available() and torch.cuda.is_initialized():
+                dev = torch.cuda.current_device()
+        except Exception:  # noqa: BLE001
+            dev = None
+
+        def _init():
+            if dev is not None:
+                import torch
+
+                torch.cuda.set_device(dev)
+
+        _LEND_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="pdflip-lend-map", initializer=_init)
+    return _LEND_EXECUTOR
 
 
 class PdFlipDSeatVramWipe(PdFlipDSeatVramRefused):
@@ -1006,6 +1164,9 @@ _KV_BORN: List[Tuple[int, KvTensorGeom]] = []
 #: tokens, granule) -- a key that also names what the plan was computed from:
 #: the saver mapped one extent per range, the controller checks them at its build
 _KV_BORN_SPANS: Dict[tuple, Tuple[Tuple[int, int], ...]] = {}
+#: S77-A: the born tensors themselves, keyed by data_ptr (``KvPageCopier`` moves
+#: pages in exactly the tensors whose pages the stage form unmaps)
+_KV_BORN_T: Dict[int, object] = {}
 
 
 def kv_stage_born(t, *, pool_size: int, page_size: int, name: str = "kv",
@@ -1054,6 +1215,7 @@ def kv_stage_born(t, *, pool_size: int, page_size: int, name: str = "kv",
         raise PdFlipDSeatVramRefused("%s: trimming the KV tensor %s to stage S0 failed "
                                    "(tms_set_spans rc=%d)" % (LINE_MARK, name, rc))
     _KV_BORN.append((int(t.data_ptr()), geom))
+    _KV_BORN_T[int(t.data_ptr())] = t
     _KV_BORN_SPANS[(int(t.data_ptr()), geom, tuple(form.tokens), g)] = tuple(born)
     return t
 
@@ -1141,6 +1303,103 @@ def max_live_page(allocator) -> int:
         live[held.to("cpu", torch.int64)] = False
     idx = torch.nonzero(live).flatten()
     return int(idx.max()) if idx.numel() else 0
+
+
+class KvCopyRefused(RuntimeError):
+    """S77-A: a KV page move this rank cannot carry out completely (named)."""
+
+
+def page_slot_block(geom: "KvTensorGeom", page_size: int) -> Tuple[int, int]:
+    """S77-A: (slots per page, slot of page 0's first token) -> page ``p`` lives in
+    slots ``[p * per, (p + 1) * per)`` of every layer of a born KV tensor.
+
+    * a paged K/V buffer (``token_ratio`` 1): one slot per token;
+    * QSA compressed keys (``token_ratio`` = ratio): ``page // ratio`` slots;
+    * a token-cut FA owner share (#239 S3g, ``owner_block`` (S, ratio)): global slot
+      L at row (L // S) * ratio + (L % S - lo) -- a page of P global tokens is the
+      contiguous block of (P // S) * ratio rows from (p * P // S) * ratio, whatever
+      ``lo`` is; the owner class of a token (L % S) is its offset in the page, so a
+      page moved whole keeps every token on the rank that owns it.
+    The page must be a multiple of the ratio / of S, else the move is refused."""
+    P = int(page_size)
+    S, ratio = (int(x) for x in geom.owner_block)
+    if S > 0 and ratio > 0:
+        if P % S:
+            raise KvCopyRefused("page %d not a multiple of the owner block %d (%s)"
+                                % (P, S, geom.geom.name))
+        return (P // S) * ratio, 0
+    tps = max(1, int(geom.token_ratio))
+    if P % tps:
+        raise KvCopyRefused("page %d not a multiple of %d tokens per slot (%s)"
+                            % (P, tps, geom.geom.name))
+    return P // tps, 0
+
+
+class KvPageCopier:
+    """S77-A: moves whole KV pages (device copy) in EVERY tensor the stage form
+    trims on this rank (``_KV_BORN``: the FA K/V or their owner share, the QSA
+    compressed keys, the draft K/V) -- exactly the tensors whose pages a stage
+    shrink unmaps, viewed as bytes ``[layers, slots, slot_bytes]`` with the
+    geometry they were born with."""
+
+    def __init__(self, born: Sequence[Tuple[int, "KvTensorGeom"]], tensors: Dict[int, object],
+                 page_size: int):
+        self.page_size = int(page_size)
+        self.items = []
+        for ptr, geom in born:
+            t = tensors.get(int(ptr))
+            if t is None:
+                raise KvCopyRefused("born KV tensor %s has no tensor reference" % geom.geom.name)
+            g = geom.geom
+            if int(t.numel()) * int(t.element_size()) != int(g.layers) * int(g.slots) * int(g.slot_bytes):
+                raise KvCopyRefused("born KV tensor %s is not [layers, slots, slot_bytes] (%d B vs "
+                                    "%d x %d x %d)" % (g.name, t.numel() * t.element_size(),
+                                                       g.layers, g.slots, g.slot_bytes))
+            if not t.is_contiguous():
+                raise KvCopyRefused("born KV tensor %s is not contiguous" % g.name)
+            per, base = page_slot_block(geom, self.page_size)
+            self.items.append((t, geom, per, base))
+
+    @classmethod
+    def from_born(cls, page_size: int) -> "KvPageCopier":
+        return cls(list(_KV_BORN), _KV_BORN_T, page_size)
+
+    @classmethod
+    def from_buffers(cls, bufs, page_size: int) -> "KvPageCopier":
+        """S77-A N1: the buffers ``kv_page_buffers`` found, each with its pool's geometry."""
+        born = [(int(t.data_ptr()), g) for _n, t, g in bufs]
+        return cls(born, {int(t.data_ptr()): t for _n, t, _g in bufs}, page_size)
+
+    def ptrs(self) -> set:
+        return {int(t.data_ptr()) for t, _g, _p, _b in self.items}
+
+    def copy(self, src_pages: Sequence[int], dst_pages: Sequence[int]) -> int:
+        """Copy every page ``src_pages[i]`` onto ``dst_pages[i]`` in every tensor
+        (gather then scatter; the two sets are disjoint). Returns bytes copied.
+        Ordered on the current stream; the caller synchronizes before it re-points
+        the tree and frees the sources."""
+        import torch
+
+        if len(src_pages) != len(dst_pages):
+            raise KvCopyRefused("%d sources for %d destinations" % (len(src_pages), len(dst_pages)))
+        if not src_pages:
+            return 0
+        nbytes = 0
+        for t, geom, per, base in self.items:
+            g = geom.geom
+            u8 = t.view(-1).view(torch.uint8).view(int(g.layers), int(g.slots), int(g.slot_bytes))
+            off = torch.arange(per, dtype=torch.int64)
+            src = (torch.tensor([int(p) for p in src_pages], dtype=torch.int64)[:, None] * per
+                   + base + off[None, :]).reshape(-1)
+            dst = (torch.tensor([int(p) for p in dst_pages], dtype=torch.int64)[:, None] * per
+                   + base + off[None, :]).reshape(-1)
+            hi = int(max(int(src.max()), int(dst.max())))
+            if hi >= int(g.slots):
+                raise KvCopyRefused("page slot %d beyond %s's %d slots" % (hi, g.name, g.slots))
+            src, dst = src.to(t.device), dst.to(t.device)
+            u8[:, dst] = u8[:, src]
+            nbytes += int(src.numel()) * int(g.layers) * int(g.slot_bytes)
+        return nbytes
 
 
 # ---------------------------------------------------------------------------
@@ -1416,6 +1675,15 @@ class SeatVram:
     #: the last span plan set on each managed allocation; after its tag's
     #: resume or a live apply it IS the saver's extents (one per range)
     spans_by_ptr: Dict[int, Tuple[Tuple[int, int], ...]] = field(default_factory=dict)
+    #: F3: unmaps deferred behind their ROW-FENCE (FIFO), the lend whose map runs on the helper thread, the
+    #: finished lend for the lend gate's line, and the host ms spent waiting on fences (E1 only)
+    pending_releases: List[object] = field(default_factory=list)
+    #: F3 review A4: unmaps handed to the map thread (futures, FIFO); None executor = auto (thread with CUDA)
+    release_jobs: List[object] = field(default_factory=list)
+    release_executor: Optional[object] = None
+    lend_job: Optional[object] = None
+    lend_done: Optional[dict] = None
+    fence_wait_ms: float = 0.0
 
     def __post_init__(self):
         x_max = min((int(getattr(c, "seat_rows", 0)) for c in self.caches), default=0)
@@ -1598,7 +1866,67 @@ class SeatVram:
         if self.mamba_pool is not None and self.slot_tensors:
             self.mamba_pool._pdflip_seat_keep = self.mamba_keep
 
-    def apply_stage(self, n: int, stage: int) -> PhaseApplied:
+    def lend_keep_target(self, k_cell: int, kv_need_bytes: int, keep_need_bytes: Optional[int],
+                         card: Optional["CardRoom"] = None) -> int:
+        """S106 STAGE-KEEP: the rows a live phase move keeps ON of an open D-TRANSIENT-LEND.
+
+        Metal (NF rc22-rc26, 20.10., D logs ``..._1020_094747`` .. ``..._1020_130752``): every
+        D-MEM-SCHED stage move ended the lend (``lent_from = None``) -- rows OFF coldest first,
+        sync, the lent cells released -- and the lend verdict mapped the SAME cells again a
+        few rounds later (rc26 TP0: 134 re-lends after a lend-ending stage move, 133 of them
+        back at or above the rows the move had dropped; group gap 82.4 s in 0.44 h). The
+        card held the lend beside the new stage all along.
+
+        Rule: the largest lattice k in ``[k_cell, rows_on]`` (no straddled extent) whose
+        released cells leave the card -- measured now (``cudaMemGetInfo``) -- at least
+        ``keep_need_bytes`` free after the move maps ``kv_need_bytes`` fresh:
+        ``free + release(k) - kv_need >= keep_need``. ``keep_need`` is the lend's own price
+        (``d_transient_lend.stage_keep_need_bytes``: the lend floor = the card ledger's
+        near-OOM edge, plus the KEEP-SHORT price of a pending short extend); no new number,
+        no reserve. ``k_cell`` (the old behaviour: the lend ends) when nothing is lent, no
+        price is given (a big or unpriced extend pending: its full return already ran),
+        or no card is measured (CPU, no context). Pure arithmetic over one card reading."""
+        self.settle()
+        cur = int(self.rows_on)
+        k_cell = int(k_cell)
+        if self.lent_from is None or keep_need_bytes is None or cur <= k_cell:
+            return k_cell
+        if not self.row_tensors or not self._bank_live():
+            return k_cell
+        card = _CARD if card is None else card
+        free = card.free()
+        if free is None:
+            return k_cell
+        for c in sorted({cur} | {int(x) for x in self.row_cut_ks if k_cell < int(x) < cur}, reverse=True):
+            if c < cur and self._bank_straddles(c):
+                continue
+            rel = self.bank_release_bytes(c) if c < cur else 0
+            if int(free) + int(rel) - int(kv_need_bytes) >= int(keep_need_bytes):
+                return int(c)
+        return k_cell
+
+    def _gdn_map_bytes(self, mamba_plans) -> int:
+        """S106: the bytes a LIVE re-seat maps fresh for the GDN pool (``kv_map_bytes``' rule)."""
+        total = 0
+        for m, sp in mamba_plans:
+            info = self.spans.info(m.ptr)
+            if info is None or not info.active:
+                continue
+            total += _fresh_bytes(self.spans_by_ptr.get(int(m.ptr)), sp, int(info.mapped))
+        return int(total)
+
+    def _log_lend_keep(self, *, move: str, rows_from: int, kept: int, k_cell: int, kv_need: int,
+                       keep_need: Optional[int]) -> None:
+        """S106 line: what the phase move did with an open lend (one per move that met one)."""
+        logger.info(
+            "%s rank=%d stage-keep %s rows_on %d->%d phase_rows=%d lent_from=%s kv_need_mib=%d "
+            "keep_need_mib=%s -- %s (S106)", LEND_MARK, _this_rank(), move, rows_from, kept, k_cell,
+            "-" if self.lent_from is None else int(self.lent_from), int(int(kv_need) / _MIB),
+            "-" if keep_need is None else int(int(keep_need) / _MIB),
+            "the lend rides on above the new phase rows" if kept > k_cell
+            else "the lend ends with the move (no price, or the card does not hold it)")
+
+    def apply_stage(self, n: int, stage: int, keep_lend_need: Optional[int] = None) -> PhaseApplied:
         """#251c: the pages of a phase of ``n`` seats at KV stage ``stage``
         (``stage_vram_cells``): the GDN slots, the KV prefix and the expert
         rows ON move together, the total never above the boot form. Paused
@@ -1612,8 +1940,146 @@ class SeatVram:
         33 -> 23 and mapped fresh (``refuse_wipes`` stops that by name)."""
         import torch
 
+        self.settle()  # F3: an in-flight lend lands and the deferred unmaps go before any move
         n = max(1, min(int(n), self.cap))
         j = max(0, min(int(stage), len(self.form.tokens) - 1))
+        cell, k, keep, notes, infos = self._stage_rows(n, j)
+        tokens = int(self.form.tokens[j])
+        # S106 STAGE-KEEP: an open lend rides on above the new phase rows as far as the
+        # card holds it beside the KV this move maps (``keep_lend_need`` = the lend's price;
+        # None = the lend ends with the move, as before)
+        k_cell, lent_base, rows_from = int(k), None, int(self.rows_on)
+        if self.lent_from is not None and keep_lend_need is not None and rows_from > k_cell:
+            kv_need = self.kv_map_bytes(tokens)
+            k_keep = self.lend_keep_target(k_cell, kv_need, keep_lend_need)
+            self._log_lend_keep(move="S%s->S%d" % ("-" if self.applied is None else self.applied.stage, j),
+                                rows_from=rows_from, kept=k_keep, k_cell=k_cell, kv_need=kv_need,
+                                keep_need=keep_lend_need)
+            if k_keep > k_cell:
+                k, lent_base = int(k_keep), k_cell
+                notes.append("S106: the lend keeps rows %d above the phase's %d" % (k_keep, k_cell))
+        # S77-B (NF rc17 1019_171636, D TP0 18:07:42Z): a live KV grow maps its
+        # pages only into bytes the card HAS -- measured, the allocator cache
+        # trimmed, this rank's own expert rows released first if still short
+        room = self.grow_room(n, j, k=k)
+        if room is not None:
+            if not room.ok:
+                raise PdFlipDSeatVramNoMemory(
+                    "%s %s: S%d at n=%d maps %d KV bytes fresh; the card has %d free after "
+                    "the cache trim and the rows ON down to 0 release %d -- refused before "
+                    "anything moved" % (LINE_MARK, GROW_ROOM_MARK, j, n, room.need,
+                                        room.free_after, room.release_all))
+            if room.rows_to is not None and room.rows_to < k:
+                notes.append("GROW-ROOM: rows %d -> %d pay the KV the card did not have"
+                             % (k, room.rows_to))
+                k = int(room.rows_to)
+        return self._apply_stage_rows(n, j, cell, k, keep, notes, infos, tokens, lent_base=lent_base)
+
+    def kv_map_bytes(self, tokens: int) -> int:
+        """S77-B: the bytes a LIVE KV move to ``tokens`` maps FRESH -- every range of
+        the new plan minus the extents it keeps (``set_plan``'s census rule: an extent
+        is kept only wholly inside one range). Paused tensors map at their resume."""
+        total = 0
+        for m in self.kv_tensors:
+            info = self.spans.info(m.ptr)
+            if info is None or not info.active:
+                continue
+            total += _fresh_bytes(self.spans_by_ptr.get(int(m.ptr)), self.kv_spans(m, tokens),
+                                  int(info.mapped))
+        return int(total)
+
+    def bank_release_bytes(self, k: int) -> int:
+        """S77-B: the bytes a LIVE bank gives back going from its mapped rows to ``k``
+        rows ON (whole lattice cells above the new end; a paused bank gives none)."""
+        total = 0
+        for m in self.row_tensors:
+            info = self.spans.info(m.ptr)
+            if info is None or not info.active:
+                continue
+            total += _released_bytes(self.spans_by_ptr.get(int(m.ptr)), self.bank_spans(m, k),
+                                     int(info.mapped))
+        return int(total)
+
+    def _bank_straddles(self, k: int) -> bool:
+        """``refuse_wipes``' rule for a live bank going to ``k`` rows ON."""
+        for m in self.row_tensors:
+            info = self.spans.info(m.ptr)
+            prev = self.spans_by_ptr.get(int(m.ptr))
+            if info is None or not info.active or prev is None:
+                continue
+            if straddling(prev, self.bank_spans(m, k)) is not None:
+                return True
+        return False
+
+    def grow_room(self, n: int, j: int, *, k: Optional[int] = None,
+                  card: Optional["CardRoom"] = None) -> Optional["GrowRoom"]:
+        """S77-B: can THIS rank map the live KV of stage ``j`` at ``n`` seats -- measured?
+
+        NF rc17 1019_171636 D TP0 18:07:42Z: S8 -> S9 mid D-prefill, the 5090's cell
+        books the same 6 rows at S8 and S9 (its slack pays the KV), so ``apply_stage``
+        mapped KV FIRST (``order=kv-first``) -- into a card whose free bytes the last
+        chunk's transient still sat on in the caching allocator (``PDFLIP-VRAM-PEAK
+        ... reserved 32980 allocated 30126 card_free_mib=109``; the extend trim runs
+        only BEFORE the next chunk). The draft k0 (~68 MiB) mapped, v0 did not:
+        ``tms_set_spans(v0, now=True) rc=2`` -> rank dead, TP1/TP2 (bank-first,
+        applied) dead in the next collective. The cell table is the PLAN; the card
+        is measured here: ``need`` = the bytes the KV maps fresh, ``free`` =
+        ``cudaMemGetInfo``; short -> the allocator cache is trimmed (synchronize +
+        empty_cache, the extend trim's own move) and measured again; still short ->
+        this rank's own expert rows go OFF first (elastic by law: the KV is demand,
+        the rows step aside), the largest k' whose released cells pay the rest.
+        ``ok=False`` only when even all rows OFF cannot pay -- a real wall, which
+        the runtime tick turns into a GROUP refusal before any rank moves.
+        None when nothing is measured (no live KV grows, or no CUDA card).
+
+        H2 (review S77-B): the wake (``on_wake``) applies its stage to PAUSED KV
+        tensors (mapped at their tag's resume) -- ``need`` is 0 there and nothing
+        is voted. A wake path that ever maps KV LIVE must take the same group vote
+        as ``runtime_tick`` (``_grow_room_refused``) before its ``apply_stage``;
+        without it a short rank stops by name here, before anything moved."""
+        self.settle()  # F3: the spans and the card as they are after an in-flight lend / deferred unmap
+        n = max(1, min(int(n), self.cap))
+        j = max(0, min(int(j), len(self.form.tokens) - 1))
+        if k is None:
+            _cell, k, _keep, _notes, _infos = self._stage_rows(n, j)
+        k = int(k)
+        need = self.kv_map_bytes(int(self.form.tokens[j]))
+        if need <= 0:
+            return None
+        card = _CARD if card is None else card
+        free0 = card.free()
+        if free0 is None:
+            return None
+        start = min(k, int(self.rows_on))
+        rel = self.bank_release_bytes(start) if start < int(self.rows_on) else 0
+        trimmed = 0
+        free1 = int(free0)
+        if free1 + rel < need:
+            trimmed = int(card.trim() or 0)
+            f = card.free()
+            free1 = int(free0) if f is None else int(f)
+        rows_to = None
+        ok = free1 + rel >= need
+        if not ok:
+            # only a k on the rows' lattice (S1-Wisch: a live shrink releases whole
+            # cells and never straddles a kept extent) -- the largest that pays
+            for kk in sorted((c for c in self.row_cut_ks if 0 <= c < start), reverse=True):
+                if self._bank_straddles(kk):
+                    continue
+                if free1 + self.bank_release_bytes(kk) >= need:
+                    rows_to, ok = int(kk), True
+                    break
+        release_all = self.bank_release_bytes(0)
+        room = GrowRoom(ok=bool(ok), need=int(need), free_before=int(free0), free_after=int(free1),
+                        trimmed=int(trimmed), rows_from=int(self.rows_on), rows_cell=k,
+                        rows_to=rows_to, release_all=int(release_all))
+        if trimmed or rows_to is not None or not ok:
+            logger.info(room.line(n=n, stage=j))
+        return room
+
+    def _stage_rows(self, n: int, j: int):
+        """The expert rows ON and the GDN keep of the cell (n, j) as ``apply_stage``
+        books them beside a LIVE GDN pool -- (cell, k, keep, notes, infos)."""
         cell = self.cells[(n, j)]
         notes = []
         k, keep = int(cell.extra_rows), int(cell.mamba_keep)
@@ -1648,10 +2114,15 @@ class SeatVram:
                     "pool must already be paused" % (LINE_MARK, j, n))
             notes.append("the Mamba pool is mapped (live): it keeps its cap form")
             k, keep = int(cell.rows_full), self.pool_size + 1
+        return cell, k, keep, notes, infos
+
+    def _apply_stage_rows(self, n: int, j: int, cell, k: int, keep: int, notes, infos,
+                          tokens: int, lent_base: Optional[int] = None) -> "PhaseApplied":
+        import torch
+
         experts_live = any(
             (lambda i: i is not None and i.active)(self.spans.info(m.ptr))
             for m in self.row_tensors)
-        tokens = int(self.form.tokens[j])
         kv_plans = []
         for m in self.kv_tensors:
             info = self.spans.info(m.ptr)
@@ -1663,8 +2134,7 @@ class SeatVram:
         self.refuse_wipes([(m.ptr, m.geom.geom.name, sp, lv) for m, sp, lv in kv_plans]
                           + [(m.ptr, m.geom.name, sp, lv) for m, sp, lv in bank_plans])
         shrink = k < int(self.rows_on)
-        if shrink:
-            self._rows_off_live(k, experts_live)
+        fence = self._rows_off_live(k, experts_live) if shrink else None
         self._plan_mamba(infos, keep)
         census = {"kept": 0, "freed": 0, "mapped": 0, "tensors": 0}
         # D-MEM-SCHED: a LIVE KV prefix that shrinks between rounds -- every
@@ -1688,7 +2158,7 @@ class SeatVram:
         # a bank that shrinks gives its cells back before the KV maps, a KV
         # that shrinks (the loop order below, unchanged) before the bank maps.
         if shrink:
-            self._set_bank_plans(bank_plans, census)
+            self._release_behind(fence, bank_plans, census)  # F3: E1, then the cells (RB unchanged)
         for m, sp, live in kv_plans:
             self.set_plan(m.ptr, m.geom.geom.name, sp, live=live, census=census)
         page = int(self.kv_tensors[0].geom.token_pad) if self.kv_tensors else 0
@@ -1708,7 +2178,9 @@ class SeatVram:
             else:
                 self.refilled_rows += k - int(self.rows_on)
         self.rows_on = k
-        self.lent_from = None  # D-TRANSIENT-LEND: a phase move ends any lend
+        # D-TRANSIENT-LEND: a phase move ends any lend -- S106: unless the move kept lent
+        # rows above the new phase's rows (``lent_base``): then the lend stays open from there
+        self.lent_from = int(lent_base) if (lent_base is not None and k > int(lent_base)) else None
         applied = PhaseApplied(
             n=n, extra_rows=k,
             mamba_mapped=sum(span_bytes(slot_spans(m.geom, keep, self.granule))
@@ -1755,40 +2227,124 @@ class SeatVram:
                                LINE_MARK, floor, k, want)
             return k
 
-    def _rows_off_live(self, k: int, experts_live: bool) -> None:
-        """Turn bank rows OFF (coldest first) on a live bank: sync, then the
-        copies and table writes of every layer, then a sync that lands them
-        before the next forward and before a page goes."""
+    def _rows_off_live(self, k: int, experts_live: bool):
+        """Turn bank rows OFF (coldest first) on a live bank -- F3: ordered by a ROW-FENCE
+        (``d_row_fence``), no device-wide sync, no host read. E0: the current stream waits on the tail of
+        every row stream (every kernel that may still read a row -- source or coldest-first destination --
+        is ordered before a byte moves); W: the copies and the OFF table writes of EVERY layer on the current
+        stream (device ops only, ``seat_rows_off_device``); E1: after W, and every row stream's later kernels
+        wait on it (the next forward reads the OFF routing). Returns the closed fence: a page of the dropped
+        rows may go only after ``fence.done()`` / ``fence.wait()`` (E1 alone, never device-wide)."""
         import time
 
-        import torch
+        from flliper.srt.pdflip.d_row_fence import RowFence
 
-        live_cuda = experts_live and any(
-            getattr(getattr(getattr(c, "_pool_tables", None), "row_key", None),
-                    "is_cuda", False) for c in self.caches)
-        # D-MEM-SCHED (27B 29.09.): every kernel that may still read a
-        # row -- source or coldest-first destination -- is done before a
-        # byte moves; the copies and the table writes of EVERY layer then
-        # land (second sync) before the next forward reads the routing
-        # and before a page of the dropped rows goes
-        if live_cuda:
-            self._timed_sync()
         moved0 = self._bank_bytes_copied()
         t0 = time.perf_counter()
+        fence = RowFence.begin()
         for cache in self.caches:
             cache.set_seat_rows_on(k, device_write=experts_live)
-        if live_cuda:
-            torch.cuda.synchronize()
+        fence.close()
+        _fold_device_bytes(self)
         ms = (time.perf_counter() - t0) * 1000.0
         moved = self._bank_bytes_copied() - moved0
         if moved > 0:
             self.bytes_copied += moved
             self.copy_ms += ms
-        elif live_cuda:
-            self.sync_ms += ms
+        elif any(getattr(c, "_pdflip_bank_bytes_dev", None) is not None for c in self.caches):
+            # F3 review (copy_ms on CUDA): the device mover books its bytes on the device (bytes_copied_dev,
+            # read back without a wait); the host ms of the rows-OFF move is booked here unconditionally
+            self.copy_ms += ms
+        return fence
+
+    def _release_behind(self, fence, plans, census) -> None:
+        """F3: release cells NOW (a map follows in the same move): the host waits on E1 of ``fence`` alone --
+        the rows' last readers and the OFF writes -- then the plans go (never before E1 completed)."""
+        self.fence_wait_ms += fence.wait()
+        self._set_bank_plans(plans, census)
+
+    def drain_releases(self, block: bool) -> float:
+        """F3: the deferred unmaps (FIFO) whose fence is done go -- F3 review A4: on the single map thread
+        (``cuMemUnmap``/``cuMemRelease`` per cell is 60-130 ms of driver work, rc27 SEAT-REWAKE unmap_ms),
+        serialised with the lend's maps; ``block`` (the bytes are needed in this pass) waits on E1 of each in
+        turn AND joins the unmaps. Returns the ms waited on the scheduler thread. One LIVE-SPANS line each,
+        with ``unmap_ms``."""
+        import time
+
+        waited = 0.0
+        while self.pending_releases:
+            pr = self.pending_releases[0]
+            if not pr.fence.done():
+                if not block:
+                    break
+                w = pr.fence.wait()
+                waited += w
+                self.fence_wait_ms += w
+            self.pending_releases.pop(0)
+            self.release_jobs.append(self._release_executor().submit(self._apply_release, pr))
+        if block and self.release_jobs:
+            t0 = time.perf_counter()
+            self._join_releases()
+            w = (time.perf_counter() - t0) * 1000.0
+            waited += w
+            self.fence_wait_ms += w
+        else:
+            self._reap_releases()
+        return waited
+
+    def _release_executor(self):
+        if self.release_executor is not None:
+            return self.release_executor
+        from flliper.srt.pdflip.d_row_fence import CudaOps, ops
+
+        return _lend_executor() if isinstance(ops(), CudaOps) else _INLINE
+
+    def _apply_release(self, pr) -> float:
+        """The map thread: one deferred unmap (its fence is done), timed; the LIVE-SPANS line names it."""
+        import time
+
+        t0 = time.perf_counter()
+        census = {"kept": 0, "freed": 0, "mapped": 0, "tensors": 0}
+        self._set_bank_plans(pr.plans, census)
+        ms = (time.perf_counter() - t0) * 1000.0
+        log_live_spans(census, n=pr.log.get("n", 0), stage=pr.log.get("stage"),
+                       rows_from=pr.log.get("rows_from", 0), rows_to=pr.log.get("rows_to", 0),
+                       mamba_keep=self.mamba_keep, order=pr.log.get("order", "return"), unmap_ms=ms)
+        return ms
+
+    def _reap_releases(self) -> None:
+        """Finished unmaps leave the list; a refused one re-raises here (stops by name)."""
+        while self.release_jobs and self.release_jobs[0].done():
+            self.release_jobs.pop(0).result()
+
+    def _join_releases(self) -> None:
+        while self.release_jobs:
+            self.release_jobs.pop(0).result()
+
+    def _defer_release(self, fence, plans, **log) -> None:
+        from flliper.srt.pdflip.d_row_fence import PendingRelease
+
+        self.pending_releases.append(PendingRelease(fence, plans, log))
+        self.drain_releases(block=False)
+
+    # ---- F3: the lend's map on the helper thread ----------------------------------------------------------
+
+    def lend_in_flight(self) -> bool:
+        return self.lend_job is not None
+
+    def settle(self) -> None:
+        """F3: every move of the bank first lands an in-flight lend (joins its map thread -- the only wait,
+        and only while a lend's map runs) and the deferred unmaps (blocking on their E1)."""
+        if self.lend_job is not None:
+            done = self.finish_lend(block=True)
+            if done is not None:
+                self.lend_done = done
+        if self.pending_releases or self.release_jobs:
+            self.drain_releases(block=True)
 
     def _bank_bytes_copied(self) -> int:
         return sum(int(getattr(c, "_pdflip_bank_bytes_copied", 0) or 0) for c in self.caches)
+
 
     def warm_rows(self) -> int:
         """KV-STAGE warm refill: rows the grows refilled with the experts the
@@ -1833,7 +2389,19 @@ class SeatVram:
         ON (no sync, no kernel reads a moved byte), halved if the card says
         no (``_grow_bank_elastic``). The phase cell is not touched: the lend
         rides above it until ``unlend`` or the next phase move. Returns the
-        rows added."""
+        rows added. F3: :meth:`start_lend` + :meth:`finish_lend` in one call
+        (the lend gate uses the two halves: the map on the helper thread)."""
+        if self.start_lend(budget_bytes, executor=_INLINE) <= 0:
+            return 0
+        done = self.finish_lend(block=True)
+        return 0 if done is None else int(done["rows"])
+
+    def start_lend(self, budget_bytes: int, executor=None) -> int:
+        """F3: the lend's MAP (cuMemCreate/Map/SetAccess of every new cell, ~0.2 ms each, 600-960 per lend)
+        runs on the helper thread (``executor``; default the controller's single map thread); the rows stay
+        OFF -- nothing routes to them -- until :meth:`finish_lend` turns them ON on the scheduler thread.
+        Returns the rows the map aims at (0 = nothing to lend)."""
+        self.settle()
         if self.applied is None or not self.row_tensors or not self._bank_live():
             return 0
         base = int(self.rows_on)
@@ -1843,7 +2411,37 @@ class SeatVram:
         plans = [(m, self.bank_spans(m, want), True) for m in self.row_tensors]
         self.refuse_wipes([(m.ptr, m.geom.name, sp, lv) for m, sp, lv in plans])
         census = {"kept": 0, "freed": 0, "mapped": 0, "tensors": 0}
+        ex = executor if executor is not None else _lend_executor()
+        self.lend_job = _LendJob(base, want, census, ex.submit(self._timed_grow, plans, want, census))
+        return want - base
+
+    def _timed_grow(self, plans, want, census):
+        import time
+
+        t0 = time.perf_counter()
         k = self._grow_bank_elastic(plans, want, census)
+        return k, (time.perf_counter() - t0) * 1000.0
+
+    def finish_lend(self, block: bool) -> Optional[dict]:
+        """F3: the lend's map landed (or ``block``: join it) -> the rows go ON on the scheduler thread
+        (device writes on the current stream, ordered before the next forward; the warm refill copies on the
+        warm stream, committed only after their event). Returns ``{rows, before, after, map_ms, join_ms,
+        census}`` or None (nothing in flight / not done yet). A failed map re-raises here."""
+        import time
+
+        job = self.lend_job
+        if job is None:
+            return None
+        if not block and not job.future.done():
+            return None
+        t0 = time.perf_counter()
+        try:
+            k, map_ms = job.future.result()
+        finally:
+            self.lend_job = None
+        join_ms = (time.perf_counter() - t0) * 1000.0
+        base = int(job.base)
+        census = job.census
         for cache in self.caches:
             cache.set_seat_rows_on(k, device_write=True)
         if k > base:
@@ -1853,15 +2451,19 @@ class SeatVram:
             self.lent_rows += k - base
         self.rows_on = int(k)
         applied = self.applied
-        log_live_spans(census, n=applied.n, stage=applied.stage, rows_from=base,
+        log_live_spans(census, n=applied.n if applied is not None else 0,
+                       stage=applied.stage if applied is not None else None, rows_from=base,
                        rows_to=int(k), mamba_keep=self.mamba_keep, order="lend")
-        return int(k) - base
+        return {"rows": int(k) - base, "before": base, "after": int(k), "map_ms": float(map_ms),
+                "join_ms": join_ms, "census": dict(census)}
 
     def unlend(self) -> int:
         """D-TRANSIENT-LEND: the lent rows go back before anything that needs
         the bytes (an extend, a stage move): rows OFF coldest first, sync,
         then the cells above the phase's k are released (whole lattice cells,
-        S1-Wisch). Returns the rows given back."""
+        S1-Wisch). Returns the rows given back. F3: rows OFF behind a ROW-FENCE, the cells released once
+        its E1 completed (deferred; :meth:`drain_releases`)."""
+        self.settle()
         if self.lent_from is None:
             return 0
         base = int(self.lent_from)
@@ -1872,17 +2474,67 @@ class SeatVram:
         live = self._bank_live()
         plans = [(m, self.bank_spans(m, base), live) for m in self.row_tensors]
         self.refuse_wipes([(m.ptr, m.geom.name, sp, lv) for m, sp, lv in plans])
-        self._rows_off_live(base, live)
-        census = {"kept": 0, "freed": 0, "mapped": 0, "tensors": 0}
-        self._set_bank_plans(plans, census)
+        fence = self._rows_off_live(base, live)
         self.evicted_rows += cur - base
         self.returned_rows += cur - base
         self.rows_on = base
         applied = self.applied
-        log_live_spans(census, n=applied.n if applied is not None else 0,
-                       stage=applied.stage if applied is not None else None,
-                       rows_from=cur, rows_to=base, mamba_keep=self.mamba_keep, order="return")
+        self._defer_release(fence, plans, n=applied.n if applied is not None else 0,
+                            stage=applied.stage if applied is not None else None,
+                            rows_from=cur, rows_to=base, order="return")
         return cur - base
+
+    def unlend_target(self, need_free_bytes: int, free_bytes: int) -> int:
+        """S78 KEEP-SHORT: the largest lattice k in ``[lent_from, rows_on]`` whose
+        release leaves the card at least ``need_free_bytes`` free -- the cells
+        above k go back, the rows up to k stay ON (pure arithmetic, no CUDA; the
+        mirror of :meth:`lend_target`). ``rows_on`` when the card already holds
+        the need, ``lent_from`` when no lent cell can stay; ``rows_on`` with
+        nothing lent."""
+        self.settle()
+        cur = int(self.rows_on)
+        if self.lent_from is None:
+            return cur
+        base = int(self.lent_from)
+        if int(free_bytes) >= int(need_free_bytes):
+            return cur
+        have = self._bank_bytes_at(cur)
+        best = base
+        for c in self.row_cut_ks:
+            if c <= base or c >= cur:
+                continue
+            if int(free_bytes) + (have - self._bank_bytes_at(c)) >= int(need_free_bytes):
+                best = max(best, int(c))
+        return best
+
+    def unlend_to(self, k: int) -> int:
+        """S78 KEEP-SHORT: give back only the lent cells above lattice row ``k``
+        (rows OFF coldest first, sync, the cells released -- :meth:`unlend`'s
+        order and plans, cut at ``k`` instead of the phase's rows). The lend
+        stays open (``lent_from`` kept) while rows above the phase remain;
+        ``k <= lent_from`` is the full :meth:`unlend`. Returns the rows given back."""
+        self.settle()
+        if self.lent_from is None:
+            return 0
+        base = int(self.lent_from)
+        cur = int(self.rows_on)
+        k = int(k)
+        if k <= base:
+            return self.unlend()
+        if k >= cur:
+            return 0
+        live = self._bank_live()
+        plans = [(m, self.bank_spans(m, k), live) for m in self.row_tensors]
+        self.refuse_wipes([(m.ptr, m.geom.name, sp, lv) for m, sp, lv in plans])
+        fence = self._rows_off_live(k, live)
+        self.evicted_rows += cur - k
+        self.returned_rows += cur - k
+        self.rows_on = k
+        applied = self.applied
+        self._defer_release(fence, plans, n=applied.n if applied is not None else 0,
+                            stage=applied.stage if applied is not None else None,
+                            rows_from=cur, rows_to=k, order="return-short")
+        return cur - k
 
     def apply(self, n: int) -> PhaseApplied:
         """The pages of a phase of ``n`` seats (``n`` = cap: the cap form).
@@ -1891,8 +2543,7 @@ class SeatVram:
         or shrinks in place). A live shrink goes as in ``apply_stage``: rows
         OFF in the tables first, synchronize, then the pages (PA review of
         1bab093912: the pages went first here)."""
-        import torch
-
+        self.settle()  # F3
         n = max(1, min(int(n), self.cap))
         notes = []
         k = self.row_for(n).extra_rows if (self.slot_tensors and self.row_tensors) else 0
@@ -1913,13 +2564,11 @@ class SeatVram:
         self.refuse_wipes([(m.ptr, m.geom.name, sp, lv) for m, sp, lv in bank_plans])
         experts_live = any(lv for _m, _sp, lv in bank_plans)
         shrink = int(k) < int(self.rows_on)
+        fence = None
         if shrink:
-            for cache in self.caches:
-                cache.set_seat_rows_on(k, device_write=experts_live)
-            if experts_live and any(
-                    getattr(getattr(getattr(c, "_pool_tables", None), "row_key", None),
-                            "is_cuda", False) for c in self.caches):
-                torch.cuda.synchronize()
+            # F3: rows OFF behind a ROW-FENCE; the plans below release cells only after its E1
+            fence = self._rows_off_live(k, experts_live)
+            self.fence_wait_ms += fence.wait()
         census = {"kept": 0, "freed": 0, "mapped": 0, "tensors": 0}
         for m, sp, live in bank_plans:
             self.set_plan(m.ptr, m.geom.name, sp, live=live, census=census)
@@ -1961,7 +2610,7 @@ class SeatVram:
         k = int(row.extra_rows) if (self.slot_tensors and self.row_tensors) else 0
         return k, ((int(row.slot_limit) + 1) if k > 0 else self.pool_size + 1)
 
-    def reseat_live(self, n: int, stage: Optional[int]) -> PhaseApplied:
+    def reseat_live(self, n: int, stage: Optional[int], keep_lend_need: Optional[int] = None) -> PhaseApplied:
         """D-SEAT-REWAKE: the pages of a LIVE phase move from n seats to ``n``
         (Nutzer 30.09.: "D sleeped ohne wirklich runterzufahren und waket
         sofort wieder mit mehr sitzen"). Nothing sleeps: the GDN pool keeps the
@@ -1975,6 +2624,7 @@ class SeatVram:
         then the bank grows elastically (a row the card cannot back stays in
         the host store). Every plan is cut at the lattice (``refuse_wipes``
         stops a plan that would release a kept cell before anything moves)."""
+        self.settle()  # F3
         n = max(1, min(int(n), self.cap))
         k, keep = self.reseat_target(n, stage)
         cur_keep = self.pool_size + 1 if self.mamba_keep is None else int(self.mamba_keep)
@@ -1982,6 +2632,18 @@ class SeatVram:
         grow = keep_eff > cur_keep
         mamba_plans = [(m, slot_spans(m.geom, keep_eff, self.granule, cuts=self.mamba_cut_keeps()))
                        for m in self.slot_tensors]
+        # S106 STAGE-KEEP on a live re-seat: an open lend rides on above the new phase rows
+        # as far as the card holds it beside what the move maps fresh -- a SHRINK maps
+        # nothing (GDN cells only go), a GROW maps the new seats' GDN cells (priced here,
+        # RB order unchanged: the bank's released cells go before the GDN maps)
+        k_cell, lent_base = int(k), None
+        if self.lent_from is not None and keep_lend_need is not None and int(self.rows_on) > k_cell:
+            gdn_need = self._gdn_map_bytes(mamba_plans) if grow else 0
+            k_keep = self.lend_keep_target(k_cell, gdn_need, keep_lend_need)
+            self._log_lend_keep(move="reseat n->%d" % n, rows_from=int(self.rows_on), kept=k_keep,
+                                k_cell=k_cell, kv_need=gdn_need, keep_need=keep_lend_need)
+            if k_keep > k_cell:
+                k, lent_base = int(k_keep), k_cell
         bank_plans = [(m, self.bank_spans(m, k), True) for m in self.row_tensors]
         self.refuse_wipes([(m.ptr, m.geom.name, sp, True) for m, sp in mamba_plans]
                           + [(m.ptr, m.geom.name, sp, lv) for m, sp, lv in bank_plans])
@@ -1995,12 +2657,14 @@ class SeatVram:
         parts = {"off_copy_ms": 0.0, "unmap_ms": 0.0, "map_ms": 0.0, "sync_ms": 0.0}
 
         def _off(k_to: int) -> None:
-            s0, t = self.sync_ms, _time.perf_counter()
-            self._rows_off_live(k_to, True)
+            # F3: rows OFF behind a ROW-FENCE; the host waits on its E1 alone before the cells go
+            t = _time.perf_counter()
+            fence = self._rows_off_live(k_to, True)
             wall = (_time.perf_counter() - t) * 1000.0
-            ds = max(0.0, self.sync_ms - s0)
-            parts["sync_ms"] += ds
-            parts["off_copy_ms"] += max(0.0, wall - ds)
+            w = fence.wait()
+            self.fence_wait_ms += w
+            parts["sync_ms"] += w
+            parts["off_copy_ms"] += wall
 
         def _timed(key: str, fn) -> None:
             t = _time.perf_counter()
@@ -2042,7 +2706,8 @@ class SeatVram:
         elif k > rows_from:
             self.refilled_rows += k - rows_from
         self.rows_on = int(k)
-        self.lent_from = None  # D-TRANSIENT-LEND: a phase move ends any lend
+        # D-TRANSIENT-LEND: a phase move ends any lend -- S106: unless a shrink kept lent rows
+        self.lent_from = int(lent_base) if (lent_base is not None and int(k) > int(lent_base)) else None
         log_live_spans(census, n=n, stage=stage, rows_from=rows_from, rows_to=int(k),
                        mamba_keep=self.mamba_keep, order="bank-first" if grow else "mamba-first")
         prev = self.applied
@@ -2073,7 +2738,8 @@ class SeatVram:
 
 
 def log_live_spans(census: Dict[str, int], *, n: int, stage: Optional[int], rows_from: int,
-                   rows_to: int, mamba_keep: Optional[int] = None, order: str = "-") -> None:
+                   rows_to: int, mamba_keep: Optional[int] = None, order: str = "-",
+                   unmap_ms: Optional[float] = None) -> None:
     """The metal marker of a live apply (none when every allocation was
     paused: a plan moves no byte). ``wiped=0`` by construction --
     ``refuse_wipes`` stopped the apply otherwise."""
@@ -2081,13 +2747,14 @@ def log_live_spans(census: Dict[str, int], *, n: int, stage: Optional[int], rows
         return
     logger.info(
         "%s n=%d stage=%s rows_on %d->%d tensors=%d extents_kept=%d cells_freed=%d "
-        "cells_mapped=%d wiped=0 mamba_keep=%s order=%s (a live move releases whole lattice "
+        "cells_mapped=%d wiped=0 mamba_keep=%s order=%s%s (a live move releases whole lattice "
         "cells only; mamba_keep = the GDN slots with pages = the flush's reset range, all = "
         "cap form -- a live apply never moves it; order = which side moved first, RB: the "
         "shrinking side always releases before the growing side maps)",
         LIVE_MARK, int(n), "-" if stage is None else "S%d" % int(stage), int(rows_from),
         int(rows_to), census["tensors"], census["kept"], census["freed"], census["mapped"],
-        "all" if mamba_keep is None else int(mamba_keep), order)
+        "all" if mamba_keep is None else int(mamba_keep), order,
+        "" if unmap_ms is None else " unmap_ms=%.1f (map thread, F3 review A4)" % float(unmap_ms))
 
 
 # ---------------------------------------------------------------------------
@@ -2376,7 +3043,7 @@ def _demand_lists(sched) -> Tuple[list, list]:
             logger.info(
                 "%s n=%d rids=%s tokens=%d -- the extend batch that ran last is not merged "
                 "yet at this tick: its requests hold their pages (no end event, no shrink "
-                "below them)", UNMERGED_MARK, n, [str(getattr(r, "rid", ""))[:16] for r in extra],
+                "below them)", UNMERGED_MARK, n, [str(getattr(r, "rid", "")) for r in extra],
                 sum(_req_tokens(r) for r in extra))
     queue = getattr(sched, "waiting_queue", None) or ()
     return running, _admissible_queue(queue, _cap_of(sched) - len(running))
@@ -2578,6 +3245,48 @@ def _group_floor_tokens(sched) -> int:
 CAP_LIFT_MARK = "PDFLIP D-MEM-SCHED CAP-LIFT"
 
 
+def _chunked_rest(sched) -> int:
+    """REPLICATED (27B condition 2): the tokens of the live ``chunked_req``
+    that are not prefilled yet -- the whole request (``_req_tokens``, what
+    ``used`` counts) minus what its chunks hold. The chunked continuation is
+    the same request on every rank, as are the prefix length and the fill
+    boundary; of the two the SMALLER counts as done (a parked chunk whose
+    ``extend_range`` ran ahead of the prefix is not done): an overestimate is
+    the safe side, the lift only ends on a fresh verdict. 0 without one."""
+    req = getattr(sched, "chunked_req", None)
+    if req is None:
+        return 0
+    done = []
+    pre = getattr(req, "prefix_indices", None)
+    if pre is not None:
+        try:
+            done.append(len(pre))
+        except TypeError:
+            pass
+    ext = getattr(req, "extend_range", None)
+    end = getattr(ext, "end", None)
+    if end is not None:
+        done.append(int(end))
+    return max(0, _req_tokens(req) - (min(done) if done else 0))
+
+
+def _queued_load_back(admissible) -> int:
+    """The host load-back tokens the queued requests the next admission takes
+    will put on the device in ONE step (``pp_load_back_extent``, stamped at the
+    request's own match of an earlier pass; 0 until it was matched -- the
+    guard then still stands). Rank-LOCAL by construction (``#1046``: each rank
+    chose its extent at its own match): it enters only this rank's room
+    (``free ids below the cap - need``), whose verdict is the group MIN, so a
+    rank with more to load back is exactly the one that must lift the cap.
+    Each request's extent is clamped to its own prompt."""
+    total = 0
+    for r in admissible:
+        ext = getattr(r, "pp_load_back_extent", None)
+        if ext:
+            total += max(0, min(int(ext), _req_tokens(r)))
+    return total
+
+
 def free_tokens_below(allocator, tokens: int, page_size: int) -> Optional[int]:
     """Rank-local: the tokens of the FREE page ids at or below the cap of
     ``tokens`` (the only ids an allocation under that cap can take); None
@@ -2671,20 +3380,48 @@ def _floor_for_shrink(sched, ms, fr, ended: bool) -> int:
 
 
 def _room_ok(sched, ms, fr, alloc, cap_tokens: int, need: int, incoming: int,
-             n_running: int, page: int) -> bool:
+             n_running: int, page: int, demand: Optional[tuple] = None) -> bool:
     """``_group_room_below`` with the same replicated re-check: a pure decode
     round (no incoming) under an unchanged pending cap reuses the last group
     verdict while the group's MIN slack (free tokens below the cap minus the
     need) cannot have been used up -- each running request takes at most
     ceil(r * R / page) new pages in r rounds of R tokens (R = verify tokens
-    + 1). A new demand, a new running set or a new cap re-reads at once."""
+    + 1). A new demand, a new running set or a new cap re-reads at once.
+
+    S72 (rc16 1019_121629, D TP0 13:28:43-13:30:58, bs 1, ``#queue-req: 1``):
+    a HELD demand -- the same queued request, nothing admitted, DQH holding
+    the pass -- is not a new demand, but ``incoming > 0`` bypassed the cache in
+    every pass: ``FLOOR-CHECK room_reads`` +512 per 512 ticks, ``room_cached=0``,
+    each read a device->host copy of the free lists behind the schedule
+    stream's WAR wait on the previous forward plus one group collective.
+    ``DECODE-HOST-SPLIT sched_ms`` 34.9 (3.7 without the reads), ``sync_ms`` 0:
+    the overlap was gone, the round 42 ms wall / 33.5 "gpu-ms" against
+    29.7 / 25.6 (3157 rounds of pdflip-132-465 = the whole rc16 "bs1 64-160k"
+    bucket). ``demand`` is the REPLICATED fingerprint of what the admission
+    can take (sorted queued rids, the live chunked rid); with it, a NOT-OK
+    group verdict (the cap stays lifted to the mapped stage: more room, never
+    less) is reused under an unchanged (pending, cap, running count, incoming
+    tokens, demand) on the same back-off as a decode round (1, 2, 4 .. K
+    passes). The rank-local ``need`` (host load-back extents, #1046) is NOT in
+    that key -- every input of the hit test is replicated, so every rank
+    enters the collective on the same passes. An OK verdict under demand is
+    still read every pass (an admission on this pass must not ride a stale
+    "the pending cap pays it" -- NF1d). ``demand=None`` (direct callers) keeps
+    the old rule."""
     k = _recheck_max()
     rnd = int(getattr(ms, "_round", 0))
     key = (ms.pending, int(cap_tokens), int(need), int(n_running))
+    dkey = None
+    if demand is not None and int(incoming) > 0:
+        dkey = (ms.pending, int(cap_tokens), int(n_running), int(incoming), tuple(demand))
     c = fr.get("room")
     if k > 1 and int(incoming) <= 0 and c is not None and c["key"] == key and rnd < c["next"]:
         fr["room_cached"] += 1
         return bool(c["ok"])
+    if (k > 1 and dkey is not None and c is not None and not c["ok"]
+            and c.get("dkey") == dkey and rnd < c["next"]):
+        fr["room_cached"] += 1
+        return False
     room = free_tokens_below(alloc, cap_tokens, _page_size(sched))
     slack = _SLACK_CAP if room is None else min(_SLACK_CAP, int(room) - int(need))
     ok_local = 1 if slack >= 0 else 0
@@ -2693,6 +3430,13 @@ def _room_ok(sched, ms, fr, alloc, cap_tokens: int, need: int, incoming: int,
     fr["room_reads"] += 1
     ok = bool(int(res[0]))
     min_slack = int(res[1]) if len(res) > 1 else 0
+    # S72: under a demand key the back-off grows on the REPLICATED key only
+    # (``key`` carries the rank-local ``need`` there), so ``next`` -- the hit
+    # test above -- is the same number on every rank
+    if dkey is not None:
+        prev = c["gap"] if (c is not None and c.get("dkey") == dkey) else 0
+    else:
+        prev = c["gap"] if (c is not None and c["key"] == key) else 0
     gap = 0
     if ok and min_slack > 0:
         pg = max(1, int(page))
@@ -2701,14 +3445,12 @@ def _room_ok(sched, ms, fr, alloc, cap_tokens: int, need: int, incoming: int,
         n = max(1, int(n_running))
         pages_each = min_slack // (n * pg)          # new pages each request may still take
         safe = (pages_each * pg) // per_round        # rounds before any could need more
-        prev = c["gap"] if (c is not None and c["key"] == key) else 0
         gap = min(k, safe, max(1, int(prev) * 2))
     elif not ok:
         # a lift keeps the cap at the mapped stage (more room, not less):
         # re-read on the same back-off, the lift ends on a fresh verdict
-        prev = c["gap"] if (c is not None and c["key"] == key) else 0
         gap = min(k, max(1, int(prev) * 2))
-    fr["room"] = {"key": key, "ok": ok, "next": rnd + gap, "gap": max(1, gap)}
+    fr["room"] = {"key": key, "dkey": dkey, "ok": ok, "next": rnd + gap, "gap": max(1, gap)}
     return ok
 
 
@@ -2725,6 +3467,829 @@ def _tick_noop(sched) -> None:
     return None
 
 
+#: Q-701: the epoch of the phase a D serves in from its boot, before any wake
+BOOT_EPOCH = "boot"
+BOOT_PHASE_MARK = "Q-701 D-MEM-SCHED BOOT-PHASE"
+
+
+def boot_phase(sched) -> Optional[PhaseState]:
+    """Q-701 (NF y9nf boot 2, D 00:49:37Z serving, never woken): the phase
+    state is made only by a wake (``on_wake``), so a D that SERVES FROM ITS
+    BOOT had none and the runtime tick -- the only thing that moves the KV
+    stage between wakes -- was a no-op. D stayed at the boot cap S0 (32768
+    tokens, ``#1045 FLOOR PUBLISHED floor=32768``) while the front sent it
+    store-cached requests on the X route (uncached 204..1934, load-back
+    88768 / 159040): ``H105 RU FORM-A ADMISSION WAIT ... host_price=163404
+    host_budget=32768`` 5604 times, 4 queued / 0 running, no forward, no
+    flip (the front saw nothing to flip for). The boot form IS a phase: the
+    cap's seats at S0, exactly what ``kv_stage_boot_cap`` engaged -- seeded
+    here once (replicated: the form and the cap), so the tick grows the stage
+    for the demand as it does after any wake. None without a stage form."""
+    form = stage_form()
+    if form is None:
+        return None
+    st = PhaseState(cap=_cap_of(sched), epoch=BOOT_EPOCH, done=True,
+                    stage=0, stage_tokens=int(form.tokens[0]))
+    setattr(sched, PHASE_ATTR, st)
+    logger.info("%s cap=%d stage=S0 tokens=%d: this D serves from its boot without a wake; the "
+                "boot form is its phase, the runtime tick moves the KV stage for the demand",
+                BOOT_PHASE_MARK, st.cap, st.stage_tokens)
+    return st
+
+
+def _demand_fingerprint(sched, admissible) -> tuple:
+    """S72: what the admission of this pass can take, as REPLICATED values --
+    the sorted rids of the queued requests the next admission may take (the
+    request lists are the same on every D rank, #603) and the rid of a live
+    chunked_req. Token counts ride beside it in ``_room_ok``'s key (``incoming``,
+    replicated); nothing rank-local (page lists, prefix_indices, load-back
+    extents) enters."""
+    queued = tuple(sorted(str(getattr(r, "rid", "")) for r in (admissible or ())))
+    chunked = getattr(sched, "chunked_req", None)
+    return queued + (("~chunked", str(getattr(chunked, "rid", ""))) if chunked is not None else ())
+
+
+def _cap_lift_verdict(sched, ms, fr, alloc, tokens, used: int, incoming: int, admissible, rids,
+                      page: int):
+    """NF1d / 1528: does a pending shrink's cap go back up to the mapped stage
+    for the demand of this iteration? Sets ``ms._cap_lifted`` and the floor
+    cache; returns (lifted, need, rest). The group verdict (``_room_ok``) is
+    replicated, so every rank calls this in the same iterations. Shared by
+    ``runtime_tick`` and ``cap_lift_after_seat_move``."""
+    from flliper.srt.pdflip.park import chunk_admit_tokens
+
+    lifted_before = bool(getattr(ms, "_cap_lifted", False))
+    lifted = False
+    need = 0
+    rest = 0
+    if ms.pending is not None and alloc is not None and (incoming > 0 or used > 0):
+        chunk = int(getattr(getattr(sched, "server_args", None), "chunked_prefill_size", 0) or 0)
+        # NF 1540 (cand3 bce16a6ddf 23:45:03Z, pdflip-62-415: 26048 host-backed
+        # prefix + 1572): the host load-back is NOT chunked -- ``add_one_req`` /
+        # ``chunk_admit_tokens`` (Q-700) charge it WHOLE, the allocator takes it
+        # at admission. ``first`` as one chunk counted 4096 against room 26880,
+        # the load-back took 26048 of it and the 1572 extend found 832.
+        first = chunk_admit_tokens(int(incoming), chunk, load_back=_queued_load_back(admissible))
+        # NF 1528 (K2 20:49:25Z, pdflip-54-290: 2176 + 830): the request after its
+        # first chunk is the chunked_req, in ``used`` and no longer in
+        # ``incoming`` -- the lift paid for chunk 1 only, ended itself between
+        # the chunks (need=64) and chunk 2 found 192 free ids under the cap.
+        # The next chunk of a live chunked_req is demand like a first chunk.
+        rest = _chunked_rest(sched)
+        nxt = min(rest, chunk) if chunk > 0 else rest
+        need = first + nxt + len(rids) * max(1, page)
+        # NF 1536: the cache bypass of ``_room_ok`` (``incoming <= 0``) must be a
+        # RANK-UNIFORM bit. ``rest`` is read from the rank's own prefix_indices /
+        # extend_range: 0 on one rank and > 0 on another would send one rank to the
+        # group collective and the other to its cache (collective #0 without partners).
+        # A live chunked_req is replicated (it is in ``used``), so the bit is that.
+        chunk_live = 1 if getattr(sched, "chunked_req", None) is not None else 0
+        lifted = not _room_ok(sched, ms, fr, alloc, tokens[ms.pending], need,
+                              incoming + chunk_live, len(rids), page,
+                              demand=_demand_fingerprint(sched, admissible))
+    ms._cap_lifted = lifted
+    if lifted:
+        fr["lifted_since"] = True
+    elif lifted_before:
+        fr["floor"] = None                      # the lift ended: read the floor afresh
+    return lifted, need, rest
+
+
+def cap_lift_after_seat_move(sched) -> None:
+    """NF 1534 F6 (4p5am6 22:10:15Z TP0: ``D-SEAT-REWAKE GROW n=2->3`` between chunk 2
+    and chunk 3 of pdflip-40-295 at a pending S3): the iteration of a D-SEAT-REWAKE
+    GROW/SHRINK skips the stage tick (``d_seat_rewake.round_boundary``) but admission
+    runs on in the same iteration, so a pending shrink's cap stayed down for the next
+    chunk (K2: 13 of 25 GROWs at a pending cap with lifted=no). This runs ONLY the
+    cap-lift verdict of the tick, on the machine the last tick built (no stage step, no
+    shrink, no apply_stage; a missing machine or one built for another seat count waits
+    for the next tick). Same gates as the tick: not armed / dormant / no stage form ->
+    the plain noop count, so P, the 27B and a D without a form never reach the verdict."""
+    if not armed() or not elastic_on() or getattr(sched, "pdflip_dormant", False):
+        return _tick_noop(sched)
+    st = getattr(sched, PHASE_ATTR, None)
+    form = stage_form()
+    ms = getattr(sched, MEM_SCHED_ATTR, None)
+    if st is None or st.stage is None or not st.done or form is None or ms is None:
+        return _tick_noop(sched)
+    n = max(1, min(int(st.n or st.cap), int(st.cap)))
+    tokens = tuple(form.tokens[: form.max_stage(n) + 1])
+    if ms.stage_tokens != tokens or getattr(ms, "_epoch", None) != st.epoch or ms.pending is None:
+        return _tick_noop(sched)
+    alloc = _kv_allocator(sched)
+    if alloc is None:
+        return _tick_noop(sched)
+    page = _page_size(sched)
+    running, admissible = _demand_lists(sched)
+    used = sum(_req_tokens(r) for r in running)
+    incoming = sum(_req_tokens(r) for r in admissible)
+    rids = frozenset(getattr(r, "rid", id(r)) for r in running)
+    fr = _floor_room_state(ms)
+    lifted_before = bool(getattr(ms, "_cap_lifted", False))
+    lifted, need, rest = _cap_lift_verdict(sched, ms, fr, alloc, tokens, used, incoming, admissible, rids, page)
+    if lifted == lifted_before:
+        return None
+    _engage_kv_cap(alloc, tokens[ms.stage if lifted else ms.pending], page)
+    if lifted:
+        _reopen_admission(sched)
+    room = free_tokens_below(alloc, tokens[ms.pending], page)
+    logger.info(
+        "%s pending=S%s stage=S%d cap=%d used=%d incoming=%d rest=%d need=%d room=%s lifted=%s "
+        "-- seat move iteration (no stage tick): %s", CAP_LIFT_MARK, ms.pending, ms.stage,
+        tokens[ms.stage if lifted else ms.pending], used, incoming, rest, need,
+        "-" if room is None else room, "yes" if lifted else "no",
+        "the free ids below the pending cap do not pay the demand: the mapped stage pays it"
+        if lifted else "no demand left: the pending cap again")
+    return None
+
+
+#: S77-A: the D-MEM-SCHED KV compaction (``pdflip/d_kv_compact.py``)
+KV_COMPACT_MARK = "PDFLIP D-MEM-SCHED KV-COMPACT"
+_KV_COMPACT_N = [0]
+
+
+class PdFlipKvCompactDivergence(RuntimeError):
+    """S77-A N3: the ranks' KV-COMPACT plans or outcomes differ -- a named crash-stop
+    (RAENGE-NIE-UNEINS: never "refuse and go on" after a rank-local mutation)."""
+
+
+#: per-REQUEST rings a page move does not touch (indexed ``req_pool_idx * ratio``)
+_KV_REQUEST_RINGS = ("qsa_key_state_buffer_pool", "qsa_rope_position_buffer")
+#: per-layer lists whose FIRST dim is the token slot (rows), with the page's tokens
+_KV_ROW_LISTS = ("k_buffer", "v_buffer", "k_scale_buffer", "v_scale_buffer",
+                 "kv_buffer", "kv_scale_buffer")
+#: sub-objects that are no token-indexed KV (GDN states: slots per request, moved by
+#: d_seat_compact; the saver adapter; device descriptors)
+_KV_SKIP_ATTRS = ("mamba_pool", "memory_saver_adapter", "_kv_buffer_descs", "layer_transfer_counter")
+
+
+def _is_pool(x) -> bool:
+    if x is None or isinstance(x, (int, float, str, bytes, bool)):
+        return False
+    try:
+        from flliper.srt.mem_cache.memory_pool import KVCache
+
+        if isinstance(x, KVCache):
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    return any(hasattr(x, a) for a in ("k_buffer", "kv_buffer", "qsa_compressed_flat"))
+
+
+def _runner_pools(obj, out: list, seen_ids: set, depth: int = 0, poolless=None) -> None:
+    """Every ``token_to_kv_pool`` behind a draft worker, whatever its shape:
+    ``model_runner``, ``draft_runner``, ``draft_model_runner`` and the nested
+    ``draft_worker`` (EAGLEWorkerV2: ``draft_worker.draft_worker`` is an
+    EagleDraftWorker with ``draft_runner`` and ``draft_worker.model_runner``).
+    S98: every runner WITHOUT a pool goes into ``poolless`` (once per object), so
+    the caller can tell a declared solo shadow from a pool it cannot find."""
+    if obj is None or depth > 3 or id(obj) in seen_ids:
+        return
+    seen_ids.add(id(obj))
+    for attr in ("model_runner", "draft_runner", "draft_model_runner"):
+        r = getattr(obj, attr, None)
+        pool = getattr(r, "token_to_kv_pool", None) if r is not None else None
+        if pool is not None:
+            out.append(pool)
+        elif r is not None and poolless is not None and all(r is not x for x in poolless):
+            poolless.append(r)
+    _runner_pools(getattr(obj, "draft_worker", None), out, seen_ids, depth + 1, poolless)
+
+
+def _declared_solo_shadow(runner) -> bool:
+    """S98: ``runner`` declares itself a solo-draft SHADOW (``ModelRunner.
+    is_draft_solo_shadow``, ``compute_draft_solo_role``: "meta-device draft, no draft
+    weights/KV/graphs"). Read as a declaration, never inferred from the missing pool:
+    ``kv_cache_builder.get_draft_kv_pool`` answers None for a shadow by design."""
+    return getattr(runner, "is_draft_solo_shadow", False) is True
+
+
+def _kv_pools_of(sched) -> list:
+    """(name, pool) of the target's KV cache and of EVERY draft pool (MTP/EAGLE write
+    at the target's page ids). A draft worker whose pool cannot be found is named
+    by a ``(\"draft?\", None)`` entry -- the walker refuses on it (fail-closed).
+
+    S98 (NF rc22 9c40fe40a2, boot 1020_094747): a solo-draft SHADOW holds no draft KV
+    by design -- ``Draft-solo placement: rank 1 is a draft SHADOW (meta-device draft,
+    no draft weights/KV/graphs ...)``; the solo host TP0 holds the draft rows of every
+    global token (``#tokens: 524288``) and moves them. rc22 refused every compaction on
+    TP1/TP2 with ``draft?: pool not found``. A draft side whose EVERY pool-less runner
+    declares ``is_draft_solo_shadow`` therefore has nothing token-indexed here; one
+    pool-less runner that declares nothing still makes the entry (fail-closed), and a
+    pool a declared shadow does hold is walked like any other."""
+    out = []
+    alloc = _kv_allocator(sched)
+    kv = None
+    if alloc is not None:
+        get = getattr(alloc, "get_kvcache", None)
+        kv = get() if callable(get) else getattr(alloc, "_kvcache", None)
+    runner = getattr(getattr(sched, "tp_worker", None), "model_runner", None)
+    if kv is None:
+        kv = getattr(runner, "token_to_kv_pool", None)
+    out.append(("target", kv))
+    dw = getattr(sched, "draft_worker", None)
+    if dw is not None:
+        pools: list = []
+        poolless: list = []
+        _runner_pools(dw, pools, set(), poolless=poolless)
+        uniq = []
+        for p in pools:
+            if p is not kv and all(p is not q for q in uniq):
+                uniq.append(p)
+        shadow_only = bool(poolless) and all(_declared_solo_shadow(r) for r in poolless)
+        if not uniq and not any(p is kv for p in pools) and not shadow_only:
+            out.append(("draft?", None))
+        for i, p in enumerate(uniq):
+            out.append(("draft" if i == 0 else "draft%d" % i, p))
+    return out
+
+
+def _slot_counts(alloc, pool) -> set:
+    """The sizes a token-slot dimension of ``pool`` can have (exact): the global
+    slot space (+ page), its pages, a compacted owner share, QSA groups."""
+    P = int(getattr(pool, "page_size", 0) or getattr(alloc, "page_size", 0) or 1)
+    out = set()
+    for size in (getattr(alloc, "size", None), getattr(pool, "size", None),
+                 getattr(pool, "qsa_slot_space", None)):
+        if size:
+            out.update({int(size), int(size) + P, (int(size) + P) // P, int(size) // P + 1})
+    cap = getattr(pool, "qsa_compressed_capacity", None)
+    if cap:
+        out.add(int(cap))
+    return {x for x in out if x > 1}
+
+
+#: S98: ``_row_geom``'s answer for a buffer that holds no token (see there)
+KV_ROWS_NO_TOKEN = "no-token"
+
+
+def _row_geom(name: str, t, pool, alloc, P: int):
+    """A per-layer buffer whose FIRST dim is the token slot -> (KvTensorGeom, why);
+    ``(None, KV_ROWS_NO_TOKEN)`` for a buffer that provably holds no token.
+
+    S98 (NF rc22 9c40fe40a2, boot 1020_094747, TP0): ``target.full_kv_pool.k_buffer[0]:
+    64 rows match no slot geometry of the 524352-token space`` -- every compaction
+    refused. TP0 is the Form A attention host with owner share 0 (``#239 S3a ZERO-SHARE
+    CELL: rank 0 owns no full-attention token (vector [0, 3, 5])``):
+    ``dcp_compact_pool_rows`` sizes its FA pool at 0 tokens (``KV Cache is allocated
+    ... #tokens: 0``) and an MHA pool always carries ``size + page_size`` rows. Those
+    rows are the pad page alone (page 0, never handed out, never a move's source or
+    destination); every allocator page id >= 1 lies past the buffer, so no token can
+    live in it -- structurally, whatever the form. Exactly ``pool.size == 0`` and at
+    most one page of rows (a page-major layout: one row); anything more still refuses
+    by name below."""
+    rows = int(t.shape[0])
+    size = getattr(pool, "size", None)
+    if size is not None and int(size) == 0 and 0 < rows <= P:
+        return None, KV_ROWS_NO_TOKEN
+    nbytes = int(t.numel()) * int(t.element_size())
+    if rows <= 0 or nbytes % rows:
+        return None, "%s: %d bytes not whole rows of %d" % (name, nbytes, rows)
+    sb = nbytes // rows
+    G = int(getattr(alloc, "size", 0) or 0) + P            # the global slot space (+ pad page)
+    S, ratio = owner_block_for(int(getattr(pool, "size", 0) or 0))
+    if S > 0 and ratio > 0:                                # #239 S3g: this rank's owner share
+        return KvTensorGeom(SlotTensorGeom(name, 1, rows, sb, nbytes), 1, P, (S, ratio)), None
+    if rows == G:                                          # one row per global token
+        return KvTensorGeom(SlotTensorGeom(name, 1, rows, sb, nbytes), 1, P), None
+    if rows * P == G:                                      # page-major: one row per page
+        return KvTensorGeom(SlotTensorGeom(name, 1, rows, sb, nbytes), P, P), None
+    return None, "%s: %d rows match no slot geometry of the %d-token space" % (name, rows, G)
+
+
+def kv_listener_refusal(alloc) -> Optional[str]:
+    """S84: may a page move run under this allocator's slot-lifetime listeners?
+    None = yes; else why not (named).
+
+    By the listener's DECLARED role (``allocator.base.mark_listener``), never by
+    its existence -- rc19 NF (boot 1019_230333) refused all 17 compactions per rank
+    with "allocator._free_listeners armed" although the only listener was the KV
+    stage cap itself (``KvRowCap``, engaged at the boot by ``kv_stage_boot_cap``):
+    an id-set filter that follows every free()/clear(). Such a CAP FILTER is
+    compatible: ``d_kv_compact.survey`` takes no destination above its cap and
+    counts its withheld ids as neither live nor free, and the sources go back
+    through ``free()``, where the filter withholds those above the cap again.
+    A SLOT MIRROR (DFlash ``DraftKVSlotMapper``) refuses, and so does any listener
+    that declares nothing (fail-closed) and any radix-dedup alias listener (only
+    the DFlash window pool's draft-row carry subscribes there). Replicated: every
+    D rank registers the same listeners (server config); a rank that differs says
+    "no" into the group MIN of ``_kv_compact_for_shrink`` -- no rank moves."""
+    from flliper.srt.mem_cache.allocator.base import (
+        LISTENER_ROLE_CAP_FILTER,
+        LISTENER_ROLE_SLOT_MIRROR,
+        listener_role,
+    )
+
+    if getattr(alloc, "_alias_listeners", None):
+        return ("allocator._alias_listeners armed (the radix-dedup carry of a slot-lifetime "
+                "mirror, DFlash DraftKVSlotMapper) -- its rows would not follow a page move")
+    for on_free, on_clear in list(getattr(alloc, "_free_listeners", None) or ()):
+        role = listener_role(on_free)
+        if role == LISTENER_ROLE_CAP_FILTER and (
+                on_clear is None or listener_role(on_clear) == LISTENER_ROLE_CAP_FILTER):
+            continue
+        name = getattr(on_free, "__qualname__", None) or type(on_free).__name__
+        if role == LISTENER_ROLE_SLOT_MIRROR:
+            return ("allocator._free_listeners: a slot-lifetime mirror is armed (%s, e.g. DFlash "
+                    "DraftKVSlotMapper) -- its per-slot rows would not follow a page move" % name)
+        return ("allocator._free_listeners: listener %s declares no role (role=%s, clear role=%s) "
+                "-- unknown semantics, no page move (fail-closed)"
+                % (name, role, listener_role(on_clear)))
+    return None
+
+
+def kv_page_buffers(sched):
+    """S77-A N1/N2: EVERY token-indexed device buffer of every KV pool of this rank,
+    each with the geometry its POOL gives it -- (list of (name, tensor, geom), why).
+
+    Structural, fail-closed: every tensor attribute / tensor list of every pool
+    (sub-pools recursed) is looked at; a buffer with a token-slot dimension is
+    either one the walker knows how to move (the per-layer row lists, the QSA
+    compressed keys) or the walk REFUSES by its name. Named exemptions only: the
+    per-request QSA rings, the GDN pool, the pad page of a size-0 pool (an empty Form A
+    owner share, S98) and a draft side of declared solo shadows (S98). Also refused: a
+    draft worker whose pool is not found, a slot-lifetime mirror (DFlash ``DraftKVSlotMapper`` free/alias
+    listeners) or a listener of unknown role (``kv_listener_refusal``, S84; the KV
+    stage cap's own id-set filter passes), HiSparse's index mapping. "Stage-born" plays no part here: TP0 on
+    NF holds the QSA index and the draft for every global token without a single
+    born tensor (#251c born=0, #239 S3a ZERO-SHARE CELL)."""
+    import torch
+
+    alloc = _kv_allocator(sched)
+    if alloc is None:
+        return [], "no allocator"
+    P = int(getattr(alloc, "page_size", 0) or _page_size(sched))
+    why = kv_listener_refusal(alloc)
+    if why is not None:
+        return [], why
+    if getattr(alloc, "full_to_hisparse_device_index_mapping", None) is not None or \
+            "HiSparse" in type(alloc).__name__:
+        return [], "HiSparse device index mapping (%s)" % type(alloc).__name__
+    found, seen_t, seen_p = [], set(), set()
+
+    def walk(pool, name):
+        if pool is None:
+            raise KvCopyRefused("%s: pool not found" % name)
+        if id(pool) in seen_p:
+            return
+        seen_p.add(id(pool))
+        counts = _slot_counts(alloc, pool)
+        flat = getattr(pool, "qsa_compressed_flat", None)
+        flat_st = None
+        if isinstance(flat, torch.Tensor) and flat.numel():
+            flat_st = flat.untyped_storage().data_ptr()
+        if getattr(pool, "full_to_hisparse_device_index_mapping", None) is not None:
+            raise KvCopyRefused("%s: HiSparse index mapping" % name)
+        for attr, val in sorted(vars(pool).items()):
+            here = "%s.%s" % (name, attr)
+            if attr in _KV_SKIP_ATTRS or attr in _KV_REQUEST_RINGS:
+                continue
+            if _is_pool(val):
+                walk(val, here)
+                continue
+            if isinstance(val, dict):
+                items = [("%s[%r]" % (here, k), v) for k, v in val.items()]
+            elif isinstance(val, (list, tuple)):
+                items = [("%s[%d]" % (here, i), v) for i, v in enumerate(val)]
+            else:
+                items = [(here, val)]
+            for nm, t in items:
+                if _is_pool(t):
+                    walk(t, nm)
+                    continue
+                if not isinstance(t, torch.Tensor) or t.numel() == 0:
+                    continue
+                if id(t) in seen_t:
+                    continue
+                seen_t.add(id(t))
+                if attr in _KV_ROW_LISTS:
+                    g, why = _row_geom(nm, t, pool, alloc, P)
+                    if g is None and why == KV_ROWS_NO_TOKEN:
+                        continue   # S98: an empty owner share's pad page -- nothing to move
+                    if g is None:
+                        raise KvCopyRefused(why)
+                    found.append((nm, t, g))
+                    continue
+                if attr == "qsa_compressed_flat":
+                    cap = int(getattr(pool, "qsa_compressed_capacity", 0) or 0)
+                    r = int(getattr(pool, "qsa_compress_ratio", 0) or 0)
+                    nb = int(t.numel()) * int(t.element_size())
+                    L = int(t.shape[0])
+                    if cap <= 0 or r <= 0 or nb % (L * cap):
+                        raise KvCopyRefused("%s: QSA geometry unreadable" % nm)
+                    found.append((nm, t, KvTensorGeom(SlotTensorGeom(nm, L, cap, nb // (L * cap), nb), r, P)))
+                    continue
+                if attr == "qsa_compressed_k_buffer_pool" and flat_st is not None and \
+                        t.untyped_storage().data_ptr() == flat_st:
+                    continue  # per-layer views of qsa_compressed_flat
+                if any(int(d) in counts for d in t.shape):
+                    raise KvCopyRefused("%s %s: a token-slot dimension the page move does not "
+                                        "know how to follow" % (nm, tuple(t.shape)))
+    try:
+        for name, pool in _kv_pools_of(sched):
+            walk(pool, name)
+    except KvCopyRefused as exc:
+        return [], str(exc)
+    return found, None
+
+
+def kv_compact_unregistered(sched, born_ptrs=None) -> Optional[str]:
+    """None when every token-indexed KV buffer of this rank is one the page move
+    follows (``kv_page_buffers``); else why not. ``born_ptrs`` is ignored (kept for
+    callers of the first form): being stage-born is not the question (review N1)."""
+    return kv_page_buffers(sched)[1]
+
+
+def _kv_compact_tree_ok(sched) -> bool:
+    """S77-A: this D runs the unified tree KV-COMPACT moves pages in (config)."""
+    from flliper.srt.pdflip import d_kv_compact as KC
+
+    return KC.tree_why(getattr(sched, "tree_cache", None)) is None
+
+
+#: S98c: how often the ranks' page plans differed (uniform refusal, nothing moved)
+_KV_COMPACT_PLAN_DIFF = [0]
+
+
+def _kv_compact_rank_survey(sched, floor_page: int):
+    """Rank-local: (survey, why, copier) -- the survey above ``floor_page`` or why
+    this rank cannot take part (no allocator, a buffer the move cannot follow, ...)."""
+    from flliper.srt.pdflip import d_kv_compact as KC
+
+    page = _page_size(sched)
+    alloc = _kv_allocator(sched)
+    if alloc is None:
+        return None, "no allocator", None
+    bufs, why = kv_page_buffers(sched)
+    if why is not None:
+        return None, why, None
+    try:
+        copier = KvPageCopier.from_buffers(bufs, page)
+    except KvCopyRefused as exc:
+        return None, "copier: %s" % exc, None
+    sv = KC.survey(getattr(sched, "tree_cache", None), alloc, page, int(floor_page))
+    return sv, sv.why, copier
+
+
+def _kv_compact_vote(sv, why, floor_page: int, top_page: int) -> List[int]:
+    """S98: this rank's ONE vote vector (fixed length from the replicated floor/top):
+    [ok] + destinations (MIN) + page codes (MIN) + negated page codes (-> MAX)."""
+    from flliper.srt.pdflip import d_kv_compact as KC
+
+    B, T = int(floor_page), int(top_page)
+    if sv is None:
+        return [0] + [0] * B + [KC.CODE_BLOCK] * (T - B) + [-KC.CODE_BLOCK] * (T - B)
+    dest, above, w = KC.page_codes(sv, T)
+    ok = 1 if (why is None and w is None) else 0
+    return [ok] + dest + above + [-c for c in above]
+
+
+def _kv_compact_group_vote(sched, vec: List[int]) -> List[int]:
+    """The element-wise group MIN of the vote (the ONE collective of the survey step;
+    local without a group). A seam of its own so a test can play a peer."""
+    gmin = getattr(sched, "_pdflip_group_min_ints", None)
+    out = list(vec) if gmin is None else [int(x) for x in gmin(list(vec))]
+    if len(out) != len(vec):
+        return [0] * len(vec)
+    return out
+
+
+def _kv_compact_plans_from_vote(sv, group: List[int], floor_page: int, top_page: int,
+                                boundaries: Sequence[int]):
+    """(plans, why) per candidate boundary, planned on the GROUP-agreed survey."""
+    from flliper.srt.pdflip import d_kv_compact as KC
+
+    B, T = int(floor_page), int(top_page)
+    if sv is None or int(group[0]) != 1:
+        return [None] * len(boundaries), ""
+    dest = group[1:1 + B]
+    lo = group[1 + B:1 + B + (T - B)]
+    hi = [-int(x) for x in group[1 + B + (T - B):]]
+    agreed = KC.agreed_survey(sv, T, dest, lo, hi)
+    plans, why = _Plans(), ""
+    for b in boundaries:
+        pl, w = KC.plan_for(agreed, int(b))
+        plans.append(pl)
+        plans.whys.append("" if pl is not None else w)
+        if pl is None and not why:
+            why = w
+    return plans, why
+
+
+class _Plans(list):
+    """S98e: the plans per candidate, carrying each candidate's reason (``whys``) so
+    the refusal names every candidate stage, not only the first."""
+
+    def __init__(self, *a):
+        super().__init__(*a)
+        self.whys: List[str] = []
+
+
+def _kv_compact_stage_reasons(cands, whys) -> str:
+    """'S1..S7: <reason>; S0: <reason>' -- consecutive equal reasons folded."""
+    out, run = [], []
+    for jj, w in zip(cands, whys):
+        w = re.sub(r"\b\d{3,}\b", "N", w or "plan ok")[:110]
+        if run and run[-1][1] == w:
+            run[-1][0].append(jj)
+        else:
+            run.append(([jj], w))
+    for js, w in run:
+        out.append("S%d%s: %s" % (js[0], "" if len(js) == 1 else "..S%d" % js[-1], w))
+    return "; ".join(out)
+
+
+def _kv_compact_page_witness(sched, sv, page: int, vec=None, floor_page: int = 0) -> str:
+    """S98e: what holds ``page`` on THIS rank, read where it lives -- rank-local, no
+    collective, logged only on a refusal. Kinds: free / release list / staged free /
+    withheld by a cap / tree node (id, lock, write-through, load-back, backed, two
+    owners) / a running or waiting request (rid, from req_to_token) / nobody known."""
+    import torch
+
+    from flliper.srt.pdflip import d_kv_compact as KC
+
+    P = _page_size(sched)
+    alloc = _kv_allocator(sched)
+    p = int(page)
+    kinds = []
+    if vec is not None and p > int(floor_page):
+        B = int(floor_page)
+        T = (len(vec) - 1 - B) // 2 + B
+        if p <= T:
+            kinds.append("vote=%d" % int(vec[1 + B + (p - B - 1)]))
+    for name in ("free_pages", "release_pages"):
+        ids = KC._id_tensor(getattr(alloc, name, None))
+        if bool((ids == p).any()):
+            kinds.append(name)
+    for t in (getattr(alloc, "free_group", None) or []):
+        if bool((KC._id_tensor(t) // P == p).any()):
+            kinds.append("staged-free(free_group)")
+            break
+    for cap in KC.cap_filters(alloc):
+        if bool((KC._id_tensor(getattr(cap, "_withheld", None)) == p).any()):
+            kinds.append("withheld(cap=%s)" % getattr(cap, "cap", "?"))
+    np_ = getattr(sv, "owner", {}).get(p) if sv is not None else None
+    if np_ is not None:
+        node = np_.node
+        nid = getattr(node, "id", "?")
+        tree = getattr(sched, "tree_cache", None)
+        locks = [int(getattr(cd, "lock_ref", 0) or 0) for cd in node.component_data]
+        kinds.append("tree(node=%s locks=%s wt=%s lb=%s backed=%s pinned=%s)" % (
+            nid, locks, nid in (getattr(tree, "ongoing_write_through", None) or {}) or
+            getattr(node, "write_through_pending_id", None) is not None,
+            nid in (getattr(tree, "ongoing_load_back", None) or {}), np_.backed, np_.pinned))
+    rtt = getattr(_req_pool(sched), "req_to_token", None)
+    reqs = list(getattr(getattr(sched, "running_batch", None), "reqs", None) or [])
+    for r in reqs + list(getattr(sched, "waiting_queue", None) or []):
+        idx = getattr(r, "req_pool_idx", None)
+        if rtt is None or idx is None:
+            continue
+        try:
+            n = int(len(getattr(r, "origin_input_ids", ()) or ()) + len(getattr(r, "output_ids", ()) or ()))
+            row = rtt[int(idx), :max(1, n)].to("cpu", torch.int64) // P
+            if bool((row == p).any()):
+                kinds.append("request(rid=%s %s)" % (getattr(r, "rid", "?"),
+                                                    "running" if r in reqs else "waiting"))
+        except Exception:  # noqa: BLE001 -- a witness never fails the tick
+            continue
+    return ", ".join(kinds) or "nobody known here (live, no tree node, no request row)"
+
+
+def _kv_compact_rank_plans(sched, boundaries: Sequence[int], top_page: Optional[int] = None):
+    """Single-rank form (no group): (plans, why, copier) -- one plan (or None) per
+    candidate boundary, planned on this rank's own vote as if it were the group's."""
+    B = min(int(b) for b in boundaries)
+    alloc = _kv_allocator(sched)
+    T = int(top_page) if top_page is not None else int(getattr(alloc, "num_pages", 0) or 0)
+    T = max(T, max(int(b) for b in boundaries))
+    sv, why, copier = _kv_compact_rank_survey(sched, B)
+    vec = _kv_compact_vote(sv, why, B, T)
+    if vec[0] != 1:
+        return [None] * len(boundaries), why or "this rank cannot vote", copier
+    plans, w = _kv_compact_plans_from_vote(sv, vec, B, T, boundaries)
+    return plans, w, copier
+
+
+def _group_same(sched, value: int) -> Tuple[int, int]:
+    """(MIN, MAX) of one int over the group (one collective); local without a group."""
+    gmin = getattr(sched, "_pdflip_group_min_ints", None)
+    if gmin is None:
+        return int(value), int(value)
+    r = [int(x) for x in gmin([int(value), -int(value)])]
+    return r[0], -r[1]
+
+
+def _kv_compact_for_shrink(sched, ms, fr, want: int, end: bool, floor_tokens: int) -> Optional[int]:
+    """S77-A: the floor blocks the shrink to ``want``: move the tree's idle pages
+    above the boundary down (``d_kv_compact``), then return the GROUP floor read
+    afresh -- or None when no rank moved.
+
+    REPLICATED entry: MemSched calls this only on a shrink the GROUP floor blocks.
+    Every input of the decision is replicated (want, end, the floor, the stage); a
+    refused (or fruitless) attempt is not repeated for the same (want, stage)
+    before the next end event -- also while the shrink is pending.
+
+    Collectives, all entered by every rank on the same path:
+    1. S98: the VOTE, one MIN over [ok, destinations free here, page codes, negated
+       page codes] (``_kv_compact_vote``); every rank plans every candidate on the
+       agreed survey (``d_kv_compact.agreed_survey``: backed = group AND) and picks
+       the lowest stage it clears (moves only first) -- replicated input, same pick;
+    2. N3 the plan DIGEST (jj, page pairs, evicted pages) as MIN/MAX, entered by
+       every rank after a yes vote (-1 without a plan): S98c unequal = a uniform,
+       named refusal (nothing moved yet), no longer a crash-stop;
+    3. N3 the MOVES' outcome as MIN/MAX: all moved -> go on; none moved (each
+       rolled back) -> refused, nothing changed anywhere; mixed -> crash-stop;
+       S98c: any other exception in the move step enters as -1 (state unknown) ->
+       the named crash-stop on every rank, never a rank that skips the collective;
+    4. only then the evictions (the d_seat_compact order: move first), outcome
+       MIN/MAX: anything but "all evicted" -> crash-stop;
+    5. the floor re-read (MAX)."""
+    from flliper.srt.pdflip import d_kv_compact as KC
+
+    tokens = ms.stage_tokens
+    key = (int(want), int(ms.stage))
+    if not end and fr.get("compact_refused") == key:
+        fr["compact_skipped"] = int(fr.get("compact_skipped", 0)) + 1
+        return None
+    f = ms._smallest_holding(int(floor_tokens))
+    top = int(ms.stage) if f is None else min(int(ms.stage), int(f))
+    cands = list(range(int(want), top))
+    if not cands:
+        return None
+    page = _page_size(sched)
+    t0 = time.perf_counter()
+    bounds = [int(tokens[jj]) // page for jj in cands]
+    floor_page = min(bounds)
+    top_page = int(tokens[int(ms.stage)]) // page
+    # S98: ONE collective -- the vote. Every rank plans on the group-agreed survey
+    # (backed = group AND, blocking = group OR, destinations = free on every rank),
+    # so the pick, the moves and the evictions are the same on every rank whose tree
+    # holds the same nodes; the digest below still checks exactly that.
+    try:
+        sv, why, copier = _kv_compact_rank_survey(sched, floor_page)
+    except Exception as exc:  # noqa: BLE001 -- a survey failure is this rank's "no"
+        sv, why, copier = None, "%s: %s" % (type(exc).__name__, exc), None
+    vec = _kv_compact_vote(sv, why, floor_page, top_page)
+    if vec[0] != 1 and not why:
+        why = "this rank cannot vote"
+    group = _kv_compact_group_vote(sched, vec)
+    try:
+        plans, pwhy = _kv_compact_plans_from_vote(sv, group, floor_page, top_page, bounds)
+    except Exception as exc:  # noqa: BLE001 -- replicated input: every rank fails alike
+        plans, pwhy = [None] * len(cands), "%s: %s" % (type(exc).__name__, exc)
+    if not why:
+        why = pwhy if int(group[0]) == 1 else ""
+    k = len(cands)
+    anys = [1 if p is not None else 0 for p in plans]
+    pick = next((i for i in range(k) if plans[i] is not None and not plans[i].evicts), None)
+    if pick is None:
+        pick = next((i for i in range(k) if plans[i] is not None), None)
+    _KV_COMPACT_N[0] += 1
+    n = _KV_COMPACT_N[0]
+
+    def _refused():
+        fr["compact_refused"] = key
+        if n <= 16 or (n & (n - 1)) == 0:
+            logger.info("%s n=%d verdict=refused want=S%d stage=S%d floor=%d end=%s local=%s -- %s",
+                        KV_COMPACT_MARK, n, int(want), int(ms.stage), int(floor_tokens),
+                        "yes" if end else "no", "".join(str(x) for x in anys),
+                        why or "a peer rank cannot clear the boundary")
+            _refusal_detail()
+        return None
+
+    def _refusal_detail():
+        # S98e: every candidate stage's reason (the line above names the first only), and
+        # for a named page what holds it HERE -- rank-local, no collective
+        try:
+            whys = getattr(plans, "whys", None)
+            if whys is not None and len(whys) == len(cands):
+                logger.info("%s n=%d STAGES %s", KV_COMPACT_MARK, n,
+                            _kv_compact_stage_reasons(cands, whys))
+            pages = sorted({int(x) for x in re.findall(r"page (\d+)", why or "")})
+            for pg in pages[:2]:
+                logger.info("%s n=%d WITNESS page=%d (tokens from %d) here: %s", KV_COMPACT_MARK, n,
+                            pg, pg * page, _kv_compact_page_witness(sched, sv, pg, vec, floor_page))
+        except Exception as exc:  # noqa: BLE001 -- an instrument never fails the tick
+            logger.info("%s n=%d WITNESS failed: %s: %s", KV_COMPACT_MARK, n, type(exc).__name__, exc)
+
+    if int(group[0]) != 1:          # the group said no: replicated, every rank returns here
+        return _refused()
+    # S98: the pick comes from the agreed survey. The digest collective is entered on
+    # EVERY rank once the group said yes -- with a plan or with the sentinel -1 -- so no
+    # rank leaves its peers waiting in a collective it skipped.
+    # S98c (rang review nf-review-s98-1020.md, Auflage 3): the digest is over PAGES
+    # (d_kv_compact.plan_digest); unequal means the ranks would do different things to
+    # the pages -- but NOTHING has moved yet and lo/hi are the reduced values every
+    # rank sees alike: a uniform, named refusal, not a crash-stop. The crash-stop stays
+    # for what cannot be undone: a mixed move outcome, a failed eviction.
+    jj, plan = (cands[pick], plans[pick]) if pick is not None else (-1, None)
+    digest = KC.plan_digest(jj, plan) if plan is not None else -1
+    lo, hi = _group_same(sched, digest)
+    if lo != hi:
+        why = ("the ranks' plans for S%d differ (digest here %d, group %d..%d: other node cuts "
+               "or another fallback eviction) -- refused on every rank, nothing moved"
+               % (jj, digest, lo, hi))
+        _KV_COMPACT_PLAN_DIFF[0] += 1
+        d = _KV_COMPACT_PLAN_DIFF[0]
+        fr["compact_refused"] = key
+        if d <= 16 or (d & (d - 1)) == 0:
+            logger.warning("%s n=%d verdict=refused-plan-diff diffs=%d want=S%d stage=S%d floor=%d -- %s",
+                           KV_COMPACT_MARK, n, d, int(want), int(ms.stage), int(floor_tokens), why)
+            _refusal_detail()
+        return None
+    if plan is None:
+        return _refused()
+    res = None
+    try:
+        res = KC.execute_moves(getattr(sched, "tree_cache", None), _kv_allocator(sched), plan, copier)
+        ok = 1
+    except KC.CompactRefused as exc:   # rolled back on THIS rank
+        logger.warning("%s n=%d moves refused here (rolled back): %s", KV_COMPACT_MARK, n, exc)
+        ok = 0
+    except Exception as exc:  # noqa: BLE001 -- S98c review hint: never leave the peers waiting
+        # Anything else (e.g. the final allocator.free of the sources, outside the
+        # rollback) leaves THIS rank's state unknown -- nodes possibly re-pointed, sources
+        # not freed. The rank still enters the outcome collective, with -1: not 0, which
+        # means "rolled back cleanly" (a uniform 0 reads as "nothing moved anywhere").
+        # Any -1 in the group is the named crash-stop on EVERY rank, in the same pass --
+        # no rank leaves before the collective, so no peer hangs to the gloo timeout.
+        logger.error("%s n=%d moves FAILED here (state unknown, not rolled back): %s: %s",
+                     KV_COMPACT_MARK, n, type(exc).__name__, exc)
+        ok = -1
+    lo, hi = _group_same(sched, ok)
+    if lo < 0:
+        raise PdFlipKvCompactDivergence(
+            "%s n=%d: the moves for S%d FAILED on a rank (here: %s) -- page placement there "
+            "is unknown and cannot be undone; every rank stops in the same pass" % (
+                KV_COMPACT_MARK, n, jj, {1: "moved", 0: "rolled back", -1: "failed"}[ok]))
+    if lo != hi:
+        raise PdFlipKvCompactDivergence(
+            "%s n=%d: the moves for S%d went through on some ranks and were rolled back on "
+            "others (here: %s) -- page placement differs" % (KV_COMPACT_MARK, n, jj,
+                                                            "moved" if ok else "rolled back"))
+    if not ok:
+        fr["compact_refused"] = key
+        logger.warning("%s n=%d verdict=refused-all target=S%d: every rank rolled back, nothing moved",
+                       KV_COMPACT_MARK, n, jj)
+        return None
+    evicted = (0, 0)
+    if plan.evicts:
+        try:
+            evicted = KC.execute_evicts(getattr(sched, "tree_cache", None), plan)
+            ok = 1
+        except Exception as exc:  # noqa: BLE001 -- named below as a group stop
+            logger.error("%s n=%d eviction failed here: %s: %s", KV_COMPACT_MARK, n,
+                         type(exc).__name__, exc)
+            ok = 0
+        lo, hi = _group_same(sched, ok)
+        if lo != 1 or hi != 1:
+            raise PdFlipKvCompactDivergence(
+                "%s n=%d: the fallback evictions for S%d did not go through on every rank "
+                "(here: %s) -- device presence of the tree differs" % (
+                    KV_COMPACT_MARK, n, jj, "ok" if ok else "failed"))
+    new_floor = int(_group_floor_tokens(sched))
+    fr["floor"] = None
+    if new_floor >= int(floor_tokens):
+        fr["compact_refused"] = key
+    else:
+        fr.pop("compact_refused", None)
+    logger.info(
+        "%s n=%d verdict=moved want=S%d target=S%d boundary=%d floor %d->%d moved_nodes=%d "
+        "moved_pages=%d evicted_nodes=%d evicted_tokens=%d bytes=%d buffers=%d digest=%d ms=%.1f "
+        "(the tree's idle pages above the boundary moved down in every token-indexed KV buffer, "
+        "node values re-pointed; evicted = backed nodes with no free page below, host copy stays)",
+        KV_COMPACT_MARK, n, int(want), jj, int(tokens[jj]), int(floor_tokens), new_floor,
+        res.moved_nodes, res.moved_pages, evicted[0], evicted[1], res.bytes,
+        len(getattr(copier, "items", ()) or ()), digest, (time.perf_counter() - t0) * 1000.0)
+    return new_floor
+
+
+def _grow_room_refused(sched, ctl, n: int, stage: int) -> Optional[str]:
+    """S77-B: the GROUP verdict on a KV grow, before any rank moves (MIN over the
+    ranks, one collective). Entered on every rank alike: the grow itself is
+    replicated (MemSched), a rank without a controller or without a measured card
+    answers yes. Each rank's own answer is ``SeatVram.grow_room`` -- measured
+    bytes, the cache trimmed, its own rows OFF counted in. None = grow; else why not."""
+    room = None
+    if ctl is not None and getattr(ctl, "cells", None):
+        try:
+            room = ctl.grow_room(n, stage)
+        except PdFlipDSeatVramRefused as exc:
+            room = None
+            logger.warning("%s n=%d stage=S%d not measured: %s", GROW_ROOM_MARK, n, stage, exc)
+    ok = 1 if (room is None or room.ok) else 0
+    gmin = getattr(sched, "_pdflip_group_min_ints", None)
+    group = ok if gmin is None else int(gmin([ok])[0])
+    if group:
+        return None
+    if room is not None and not room.ok:
+        return ("grow to S%d refused: this rank maps %.1f MiB fresh, has %.1f MiB after the cache "
+                "trim and %.1f MiB with every expert row OFF -- no rank moves, the admission waits"
+                % (stage, room.need / _MIB, room.free_after / _MIB,
+                   (room.free_after + room.release_all) / _MIB))
+    return "grow to S%d refused: a peer rank has no room for its KV -- no rank moves" % stage
+
+
 def runtime_tick(sched):
     """Once per scheduler iteration of an AWAKE D (after the write-through
     acks are flushed): the KV stage follows the global demand between wakes
@@ -2737,12 +4302,15 @@ def runtime_tick(sched):
     if not armed() or not elastic_on() or getattr(sched, "pdflip_dormant", False):
         return _tick_noop(sched)
     st = getattr(sched, PHASE_ATTR, None)
+    if st is None:
+        st = boot_phase(sched)
     if st is None or st.stage is None or not st.done:
         return _tick_noop(sched)
     form = stage_form()
     if form is None:
         return _tick_noop(sched)
     from flliper.srt.pdflip.d_mem_sched import MemSched
+    from flliper.srt.pdflip.park import chunk_admit_tokens
 
     n = max(1, min(int(st.n or st.cap), int(st.cap)))
     tokens = tuple(form.tokens[: form.max_stage(n) + 1])
@@ -2774,6 +4342,14 @@ def runtime_tick(sched):
         return floor_box[0]
 
     before, pending_before = ms.stage, ms.pending
+    # S77-B review A1: a grow the group refuses moved nothing -- it must not count
+    up_before = (int(ms.counters.get("stage_up", 0)), int(ms.counters.get("stage_flap", 0)))
+    # S77-A: a floor that blocks a decided shrink is moved down first (KV-COMPACT) --
+    # on the tree that holds the pages (a server-config property: the same on every
+    # D rank, so every rank installs it alike and enters its collectives alike)
+    ms.compactor = (
+        (lambda want, end, cur: _kv_compact_for_shrink(sched, ms, fr, want, end, cur))
+        if _kv_compact_tree_ok(sched) else None)
     # the floor is asked for only on a path that shrinks (MemSched calls it)
     step = ms.step(used, incoming + reserve, ended=ended, floor_tokens=_floor)
     floor = floor_box[0]
@@ -2792,27 +4368,19 @@ def runtime_tick(sched):
     # group has demand the cap goes back to the stage unless the free ids
     # below it pay (replicated verdict); with no demand it returns to pending.
     lifted_before = bool(getattr(ms, "_cap_lifted", False))
-    lifted = False
-    need = 0
-    if ms.pending is not None and alloc is not None and (incoming > 0 or used > 0):
-        chunk = int(getattr(getattr(sched, "server_args", None), "chunked_prefill_size", 0) or 0)
-        first = min(int(incoming), chunk) if chunk > 0 else int(incoming)
-        need = first + len(rids) * max(1, page)
-        lifted = not _room_ok(sched, ms, fr, alloc, tokens[ms.pending], need, incoming,
-                              len(rids), page)
-    ms._cap_lifted = lifted
-    if lifted:
-        fr["lifted_since"] = True
-    elif lifted_before:
-        fr["floor"] = None                      # the lift ended: read the floor afresh
+    lifted, need, rest = _cap_lift_verdict(sched, ms, fr, alloc, tokens, used, incoming, admissible, rids, page)
     if fr["ticks"] % FLOOR_CHECK_EVERY == 0:
         logger.info(
             "%s ticks=%d floor_reads=%d floor_cached=%d room_reads=%d room_cached=%d "
-            "collectives=%d pending=S%s lifted=%s recheck_max=%d",
+            "collectives=%d pending=S%s lifted=%s recheck_max=%d used=%d chunk_live=%d",
             FLOOR_CHECK_MARK, fr["ticks"], fr["floor_reads"], fr["floor_cached"],
             fr["room_reads"], fr["room_cached"], fr["floor_reads"] + fr["room_reads"],
             "-" if ms.pending is None else ms.pending, "yes" if lifted else "no",
-            _recheck_max())
+            _recheck_max(), used,
+            # nf-next-1006-30 (observation only, nf-next-1006-28 Fix A tripwire): this
+            # rank's own ``used`` and live-chunked_req bit, appended so a later rank
+            # comparison can show a split the group verdict would not (no collective).
+            1 if getattr(sched, "chunked_req", None) is not None else 0)
     if not step.changed:
         if lifted != lifted_before and alloc is not None:
             want = ms.stage if lifted else ms.pending
@@ -2821,10 +4389,16 @@ def runtime_tick(sched):
             _engage_kv_cap(alloc, tokens[want], page)
             if lifted:
                 _reopen_admission(sched)
+            # room= is rank-local (the verdict itself is the group MIN): the free
+            # tokens at or below the PENDING cap, i.e. what the lift was weighed on
+            room = (free_tokens_below(alloc, tokens[ms.pending], page)
+                    if ms.pending is not None else None)
             logger.info(
-                "%s pending=S%s stage=S%d cap=%d used=%d incoming=%d need=%d lifted=%s -- %s",
+                "%s pending=S%s stage=S%d cap=%d used=%d incoming=%d rest=%d need=%d "
+                "room=%s lifted=%s -- %s",
                 CAP_LIFT_MARK, "-" if ms.pending is None else ms.pending, ms.stage,
-                tokens[want], used, incoming, need, "yes" if lifted else "no",
+                tokens[want], used, incoming, rest, need,
+                "-" if room is None else room, "yes" if lifted else "no",
                 "the free ids below the pending cap do not pay the demand: the mapped "
                 "stage pays it" if lifted else "no demand left: the pending cap again")
             return step
@@ -2846,11 +4420,43 @@ def runtime_tick(sched):
                 "-" if ms.pending is None else ms.pending, ms.stage, used, incoming,
                 floor, step.reason)
         return step
+    ctl = controller(sched)
+    if ms.stage > before:
+        # S77-B: a grow moves no rank until EVERY rank measured the room for it
+        # H1 (review S77-B): the vote measured this rank's card; ``apply_stage`` below
+        # measures it AGAIN (the vote's own collective is the only work in between) and
+        # pays a drift with more of its own rows -- a wall there would need a drift
+        # beyond free + every row, which the vote has just excluded
+        refused = _grow_room_refused(sched, ctl, n, ms.stage)
+        if refused is not None:
+            ms.stage = before
+            ms.counters["stage_up"], ms.counters["stage_flap"] = up_before
+            ms.counters["stage_up_refused_room"] = ms.counters.get("stage_up_refused_room", 0) + 1
+            if alloc is not None:
+                _engage_kv_cap(alloc, tokens[before], page)
+            logger.warning("%s %s from=S%d to=S%d used=%d incoming=%d refused=%d -- %s",
+                           ms.line(), GROW_ROOM_MARK, before, before + (step.stage - before),
+                           used, incoming, ms.counters["stage_up_refused_room"], refused)
+            from flliper.srt.pdflip.d_mem_sched import StageStep
+
+            return StageStep(before, tokens[before], False, True, refused)
     if alloc is not None:
         _engage_kv_cap(alloc, tokens[ms.pending if (ms.pending is not None and not lifted)
                                      else ms.stage], page)
-    ctl = controller(sched)
-    applied = ctl.apply_stage(n, ms.stage) if (ctl is not None and ctl.cells) else None
+    if ctl is not None and ctl.cells:
+        # S106 STAGE-KEEP: the lend's own price (rank-local amount; the move's verdict is the
+        # group's, replicated above -- nothing here enters a collective)
+        from flliper.srt.pdflip import d_transient_lend as _dtl
+
+        need = _dtl.stage_keep_need_bytes(sched, ctl)
+        if need is None:
+            applied = ctl.apply_stage(n, ms.stage)
+        else:
+            lend_rows_before = int(getattr(ctl, "rows_on", 0) or 0)
+            applied = ctl.apply_stage(n, ms.stage, keep_lend_need=need)
+            _dtl.after_phase_move(sched, ctl, lend_rows_before)
+    else:
+        applied = None
     st.stage, st.stage_tokens = ms.stage, tokens[ms.stage]
     if ms.stage > before:
         _reopen_admission(sched)
@@ -2860,7 +4466,7 @@ def runtime_tick(sched):
                 "" if ctl is None else (" evicted_rows=%d refilled_rows=%d warm_rows=%d "
                                         "sync_ms=%.1f bytes_copied=%d copy_ms=%.1f rows_on=%s")
                 % (ctl.evicted_rows, ctl.refilled_rows, ctl.warm_rows(), ctl.sync_ms,
-                   ctl.bytes_copied, ctl.copy_ms,
+                   ctl.bytes_copied + int(getattr(ctl, "bytes_copied_dev", 0) or 0), ctl.copy_ms,
                    "-" if applied is None else int(applied.extra_rows)),
                 int(reserve))
     return step

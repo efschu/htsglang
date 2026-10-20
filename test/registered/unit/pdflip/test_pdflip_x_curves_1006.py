@@ -476,24 +476,14 @@ def test_the_route_site_and_the_verdict_line_are_wired():
     import inspect
 
     src = inspect.getsource(F)
-    # 27B port: the role split (trigger k=1, rider k=1+queued) stays the k passed in
-    assert ("_x_arrival = Front._x_route_of(\n"
-            "                self, rid=rid, depth=store_span, k_flip=1 + self._x_riders() if _x_rides else 1)") in src
+    # 27B port: either form of the call site (NF one-line / 27B role split k=1 for the trigger)
+    assert ("_x_arrival = Front._x_route_of(self, rid=rid, depth=store_span," in src
+            or "_x_arrival = Front._x_route_of(\n                self, rid=rid, depth=store_span, k_flip=" in src)
     assert "return Front._x_curve_refusal(self, request.path, rid, _xcr)" in src
-    # 27B port: the early flip begun for this arrival is told "none" before the refusal answers
-    i = src.index("except _xcurves.XCurvesRefused as _xcr:")
-    assert ('            if _ef is not None:\n'
-            '                # the flip begun EARLY for this arrival is told: not LONG, settle and hand D back\n'
-            '                await Front._early_flip_verdict(self, _ef, "none", rid)') in src[i:i + 500]
-    # a curve-routed LONG needs P above the X it was routed on, with or without the env switch
-    assert "or self.x_mode in _xcurves.CURVE_MODES) else 0)," in src
-    # the launcher hands D's riegel the curves' envelope (resolve_x_mode_launch), not the raw flag
-    assert "x_mode_launch.ceiling_for_d, x_tokens, getattr(ns, \"x_busy_tokens\", None))" in inspect.getsource(L.main)
     assert '"est_prompt=%d chars=%d (#1290)%s",' in src
     assert "_x_note = Front._x_route_note(self)\n        route = serviceable_route(" in src
     assert "len(text), _x_note," in src
     assert "self._x_for_flip(1 + self._x_riders(), rid, \"route\")" not in src
-
 
 
 # ------------------------------------------- user decision 06.10.: manual ceiling

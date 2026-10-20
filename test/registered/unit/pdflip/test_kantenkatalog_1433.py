@@ -202,8 +202,8 @@ APG_REL = {
 
 class AuftragG(Basis, unittest.TestCase):
     def test_edge_count_is_pinned(self):
-        self.assertEqual(len(self.kanten), 134)                         # 61 + 47 (K62-K108, AP-G; fix round 1 dropped 2 wrongly typed edges) + 8 (K109-K116, AP-H1: Dual-ENV-Tabelle) + 15 (K117-K131, Katalog-Neubau 07.10.: Waechter-Envs, D-COMPACT, AUX-SPILL, --x-mode/--x-curves) + 3 (K132-K134, VISION-WEIGHTS AP4 09.10.: --pdflip-vision-place weights needs transient / excludes VISION_ASYNC / kvtail+auto excluded with --dual-layout)
-        self.assertEqual([k["id"] for k in self.kanten], ["K%02d" % i for i in range(1, 135)])
+        self.assertEqual(len(self.kanten), 139)                         # 61 + 47 (K62-K108, AP-G; fix round 1 dropped 2 wrongly typed edges) + 8 (K109-K116, AP-H1: Dual-ENV-Tabelle) + 15 (K117-K131, Katalog-Neubau 07.10.: Waechter-Envs, D-COMPACT, AUX-SPILL, --x-mode/--x-curves) + 3 (K132-K134, VISION-WEIGHTS AP4 09.10.: --pdflip-vision-place weights requires transient / excludes VISION_ASYNC / kvtail+auto excluded with --dual-layout) + 1 (K135, F0-H round 2: W3 host-leaf spill requires the anchor pool; numbered K132 there, moved behind the vision edges when the lines' edge files were joined, F0-H round 3) + 1 (K136, X-SUM-PRICE 10.10.: DECODE_COLLECT_PREFILL_BUSY requires/scales with DECODE_COLLECT_WINDOW_S; K135 in the old NF chain, K136 here because the W3 edge holds K135) + 2 (K137-K138, RC4: Prio-Lanes L1 lane envs; K136/K137 in the old NF chain) + 1 (K139, RC5: FLLIPER_PDFLIP_PRIO_AS_AGE requires FLLIPER_PDFLIP_LANES, trees nf; K138 in the old NF chain, h16m)
+        self.assertEqual([k["id"] for k in self.kanten], ["K%02d" % i for i in range(1, 140)])
 
     def test_apg_values_are_curated_and_explained_from_the_source(self):
         for n in APG_NAMES:

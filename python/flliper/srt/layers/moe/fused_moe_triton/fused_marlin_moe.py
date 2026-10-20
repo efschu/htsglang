@@ -406,6 +406,16 @@ def _log_atomic_add_choice(use_atomic_add: bool, source: str, device) -> None:
         logger.debug("[nan-probe-c] reduce-branch log skipped: %s", exc)
 
 
+def _live_lanes_only(bad, topk_ids, is_ep: bool, M: int, topk: int):
+    """#49 stage walk, W2-APPLY: per token, a bad (token, k) lane counts only when its expert id is live. In the
+    EP form (an expert map, or a pool EM wave's filtered lanes) a -1 lane's GEMM1 / ACT rows are never written
+    (the GEMMs skip their blocks) -- whatever they hold is not a defect and must not be reported as one."""
+    lanes = bad.reshape(M, topk)
+    if is_ep:
+        lanes = lanes & (topk_ids.reshape(M, topk) >= 0)
+    return lanes.any(dim=1)
+
+
 def _bad_rows(t):
     """Row indices of a [rows, ...] tensor that carry a non-finite element.
 
@@ -723,6 +733,11 @@ def fused_marlin_moe(
 
     if global_num_experts == -1:
         global_num_experts = E
+    # W2-APPLY: a pool EM wave's unserved lanes carry expert id -1 -- the upstream EP form (moe_align puts them
+    # in blocks with expert id -1, the GEMMs skip those blocks); no expert map is needed for that
+    from flliper.srt.layers.moe.filtered_lanes import ep_form
+
+    is_ep = ep_form(expert_map)
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
         topk_ids, block_size_m, global_num_experts
     )
@@ -821,7 +836,7 @@ def fused_marlin_moe(
         moe_block_size=block_size_m,
         top_k=topk,
         mul_topk_weights=False,
-        is_ep=expert_map is not None,
+        is_ep=is_ep,
         b_q_type=scalar_type1,
         size_m=M,
         size_n=gemm1_n,
@@ -837,7 +852,7 @@ def fused_marlin_moe(
             # GEMM1 writes [M*topk, gemm1_n]; fold back to the M token rows so
             # every stage of this report is indexed the same way.
             _g1 = _bad_rows(intermediate_cache1.view(-1, gemm1_n))
-            _stage_masks["GEMM1"] = _g1.reshape(M, topk).any(dim=1)
+            _stage_masks["GEMM1"] = _live_lanes_only(_g1, topk_ids, is_ep, M, topk)
         except Exception as exc:  # noqa: BLE001
             logger.debug("[nan-probe-in] gemm1 scan skipped: %s", exc)
 
@@ -875,11 +890,11 @@ def fused_marlin_moe(
     if _stage_on:
         try:
             _act = _bad_rows(intermediate_cache2.view(-1, intermediate_cache2.shape[-1]))
-            _stage_masks["ACT"] = _act.reshape(M, topk).any(dim=1)
+            _stage_masks["ACT"] = _live_lanes_only(_act, topk_ids, is_ep, M, topk)
         except Exception as exc:  # noqa: BLE001
             logger.debug("[nan-probe-in] act scan skipped: %s", exc)
 
-    if expert_map is not None:
+    if is_ep:
         intermediate_cache3.zero_()
 
     intermediate_cache3 = moe_wna16_marlin_gemm(
@@ -900,7 +915,7 @@ def fused_marlin_moe(
         moe_block_size=block_size_m,
         top_k=1,
         mul_topk_weights=True,
-        is_ep=expert_map is not None,
+        is_ep=is_ep,
         b_q_type=scalar_type2,
         size_m=M * topk,
         size_n=K,
@@ -927,7 +942,7 @@ def fused_marlin_moe(
         if _stage_on:
             try:
                 _g2 = _bad_rows(intermediate_cache3.reshape(-1, K))
-                _stage_masks["GEMM2"] = _g2.reshape(M, topk).any(dim=1)
+                _stage_masks["GEMM2"] = _live_lanes_only(_g2, topk_ids, is_ep, M, topk)
             except Exception as exc:  # noqa: BLE001
                 logger.debug("[nan-probe-in] gemm2 scan skipped: %s", exc)
             _stage_probe_report(

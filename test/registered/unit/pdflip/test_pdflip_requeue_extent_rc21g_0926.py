@@ -16,6 +16,7 @@ Hermetisch, CPU: die ECHTE ``Front._requeue_after_x_refusal`` und die ECHTE
 from __future__ import annotations
 
 import asyncio
+import pytest
 from types import SimpleNamespace
 
 from flliper.srt.pdflip.front import Front
@@ -85,12 +86,18 @@ def test_red_first_the_nf_pin_4096_class():
     assert (est, ok) == (13000, True)
 
 
+@pytest.mark.usefixtures("decider_off")  # EZ-S2a: describes the S1 code (reachable until S4)
+
+
 def test_without_a_parsed_extent_the_estimate_stands():
     _, est, ok = _requeue(b'{"error": "W50 PdFlipTpPrefillExceeded"}')
     assert est == 9001, "no measurement, no invented number"
     assert ok is False
 
 
-def test_a_measurement_never_lowers_the_price():
+def test_a_measurement_replaces_the_estimate_in_both_directions():
+    """S56 (user 19.10. "warum wird irgendwas geschätzt? alle zahlen liegen doch schwarz auf weiß vor"): the extent D
+    NAMES is its exact number -- it replaces the front's whole-prompt estimate also when it is lower (rc15
+    pdflip-14-74: 82066 -> D's 1878). Before S56 a measurement only ever raised the price."""
     _, est, _ = _requeue(W50.replace(b"is 13000", b"is 5000"))
-    assert est == 9001
+    assert est == 5000

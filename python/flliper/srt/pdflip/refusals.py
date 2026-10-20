@@ -98,6 +98,14 @@ REGISTER: Tuple[Refusal, ...] = (
        "(borrows the reference stage), launcher._unpin_foreign_cut (drops an infeasible profile pin)", "launcher",
        "The numbers of the profile are applied to the foreign inventory as if they had been measured for it (the boot log carries FORCED-PAST). "
        "To be expected: wrong budgets, in the worst case OOM at loading or graph building."),
+    _v("HW-BORROWED", "Census row of a card is borrowed from another card",
+       "AP4 1526: the W71 residency census (--pdflip-xchg-census) is measured per card UUID. A card of the running inventory that is not "
+       "in the census (foreign rig, other card count, other class) gets the row of the heaviest census card of the same class, or "
+       "(without class) the heaviest row at all. A borrowed measurement is a judgement about the quality of the numbers, not about the "
+       "possibility to start; the peak is still checked against the LIVE NVML sum of the card.",
+       "pdflip/xchg_residency.py resolve_census; launcher.load_xchg_census_for_cards", "launcher",
+       "The exchange peak is calculated from the borrowed row (the boot log carries FORCED-PAST HW-BORROWED). To be expected: peak "
+       "over- or underestimated; a card that is too small keeps refusing through W71 (peak against the NVML sum)."),
     _v("HOST-DISK", "Free disk under the preflight floor",
        "host_ledger_preflight.sh refuses when / has under 100 GiB free (the HiCache file backend writes there): a threshold against a "
        "measured value, capacity of the DISK. HOSTWARN2: split off from HOST-MEM, which was the same exit code for RAM and disk; the "

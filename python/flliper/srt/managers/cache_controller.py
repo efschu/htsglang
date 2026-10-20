@@ -20,6 +20,7 @@ import sys
 import threading
 import time
 
+from flliper.srt.environ import envs
 from flliper.srt.managers.pdflip_pass_timer import timed as _pass_timed
 from flliper.srt.managers import pdflip_p_overlap as _pdflip_p_overlap
 from flliper.srt.managers.pdflip_min_hit import revoke_threshold  # PARK-RETAIN READ
@@ -30,6 +31,7 @@ import psutil
 import torch
 
 from flliper.srt.mem_cache.hicache_drain_budget import coalesce_host_releases
+from flliper.srt.mem_cache import pdflip_backup_guard as _k12_guard
 from flliper.srt.mem_cache.hicache_phase_guard import device_tier_disarmed
 from flliper.srt.mem_cache.hicache_storage import (
     STORAGE_BATCH_SIZE,
@@ -46,6 +48,9 @@ from flliper.srt.mem_cache.hicache_collective import (
 )
 from flliper.srt.mem_cache.pdflip_store_gates import check_mamba_blob_present
 from flliper.srt.mem_cache import probe_hold as _probe_hold
+from flliper.srt.pdflip import read_depth as _rd  # READ-DEPTH 1014 (C5)
+from flliper.srt.pdflip import kv_durchlauf as _kv_dl  # S36 KV-DURCHLAUF
+from flliper.srt.managers import pdflip_told_ack_early as _told_ack_early  # S50 TOLD-ACK-EARLY
 
 
 # #1402: module-level on purpose -- the harness doubles bind curated
@@ -109,6 +114,35 @@ from flliper.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
 
+#: S64 S-ARM: the dense (KV-only) presence question asks the whole span in
+#: batches (longest prefix) instead of the first batch alone. Default ON; 0 =
+#: the first batch as before (byte-identical).
+S64_DENSE_FULL_SPAN_ENV = "FLLIPER_PDFLIP_S64_DENSE_PRESENCE_FULL_SPAN"
+
+
+def s64_dense_full_span_on(env=None) -> bool:
+    v = (env if env is not None else os.environ).get(S64_DENSE_FULL_SPAN_ENV, "1")
+    return str(v).strip().lower() not in ("0", "false", "no", "off", "")
+
+
+def _s64_dense_prefix_pages(storage_backend, page_hashes, batch_size: int, prefix_keys=None) -> int:
+    """S64: the longest KV prefix the store holds for ``page_hashes``, asked
+    batch by batch in key order (``_storage_hit_query``'s walk: a short batch
+    ends it; ``prefix_keys`` grow by each full batch). Module-level for the
+    harness doubles (#1402)."""
+    pk = list(prefix_keys) if prefix_keys else None
+    total = 0
+    step = max(1, int(batch_size))
+    for start in range(0, len(page_hashes), step):
+        b = page_hashes[start:start + step]
+        hit = int(storage_backend.batch_exists(b, HiCacheStorageExtraInfo(prefix_keys=pk)) or 0)
+        total += max(0, min(hit, len(b)))
+        if hit < len(b):
+            break
+        if pk:
+            pk += list(b)
+    return total
+
 
 def _read_stages(operation) -> dict:
     """H2D phase 1 (a): CPU ms per read sub-stage of ONE prefetch operation
@@ -127,6 +161,101 @@ def _read_stages(operation) -> dict:
 
 
 _READ_STAGES_N = [0]
+
+# ---------------------------------------------------------------------------
+# ARENA-CHAIN (NF 14.10. 07:29:33Z, ArenaChainMismatch #1424 on P PP0): REF, THEN RECHECK
+# ---------------------------------------------------------------------------
+# The L3 fill hands out COMPLETE slots with NO reference ("no reference taken yet",
+# ``arena_fill_from_disk``); the reader references them afterwards, and
+# ``arena_ref_slots(+1)`` takes a reference on any COMPLETE *or CLAIMED* slot without
+# looking at its key (arena.c: "#1427 CLAIMED slots take refs too"). In the window
+# between the fill and the reference another rank's full-arena claim runs the clock
+# (>= 256 slots per round) and re-claims the freed slots for ITS stems: the reference
+# then succeeds on a slot that belongs to another page, and the node's rows address
+# that slot until ``verify_load_chain`` kills the rank ("key slot -1 (state 0)").
+# The rule of the Linux page cache (mm/filemap.c: speculative ``folio_try_get`` then
+# re-load the index entry, ``folio_put`` and retry on a mismatch) applies verbatim:
+# first reference, then look the key up again, and keep the reference only where the
+# stem still names THIS slot, COMPLETE. After the reference the clock cannot take the
+# slot any more (it skips refcount != 0), so the check is stable.
+ENV_REF_RECHECK = "FLLIPER_PDFLIP_ARENA_REF_RECHECK"
+_REF_RECHECK_N = [0, 0]  # prefixes cut by the recheck, pages given back
+
+
+def arena_ref_recheck_enabled(env=None) -> bool:
+    """Default ON (``0``/``false``/``no``/``off`` = the read path of before)."""
+    e = os.environ if env is None else env
+    return (e.get(ENV_REF_RECHECK, "") or "").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _kv_dl_resolve(ctl, pool, slots, stems, hash_values, held) -> int:
+    """S36 KV-DURCHLAUF: the DURCHLAUF pages of a store read's slot list become disk pages -- the L3 file held open
+    in ``kv_durchlauf.REGISTRY`` (``DiskRef``). A file that cannot be opened (gone since the stat) ends the prefix
+    there: references past it are given back (held probe pages stay the probe's, as at the recheck cut), disk pages
+    past it released. Returns the disk pages kept."""
+    import numpy as _np
+
+    pos = [j for j in range(len(slots)) if slots[j] is _kv_dl.DURCHLAUF]
+    if not pos:
+        return 0
+    be = ctl.storage_backend
+    _kv_dl.REGISTRY.backend = be
+    ds = _kv_dl.REGISTRY.alloc([hash_values[j] for j in pos], [stems[j] for j in pos],
+                               [be._existing_path(stems[j]) for j in pos], int(pool._page_bytes))
+    cut = None
+    for j, d in zip(pos, ds):
+        if d is None:
+            cut = j if cut is None else min(cut, j)
+        else:
+            slots[j] = _kv_dl.DiskRef(d)
+    if cut is not None:
+        back = [int(slots[j]) for j in range(cut, len(slots))
+                if not held[j] and not isinstance(slots[j], _kv_dl.DiskRef) and slots[j] is not _kv_dl.DURCHLAUF]
+        if back:
+            pool.arena.ref_slots_np(_np.asarray(back, dtype=_np.int64), -1)
+        _kv_dl.REGISTRY.release([slots[j].d for j in range(cut, len(slots))
+                                 if isinstance(slots[j], _kv_dl.DiskRef)])
+        del slots[cut:]
+    return sum(1 for s_ in slots if isinstance(s_, _kv_dl.DiskRef))
+
+
+def _arena_first_unproven(arena, stems, idxs, slots):
+    """``(position, (found_slot, found_state))`` of the first page (position in
+    ``idxs``) whose stem no longer names the slot that was just referenced for it as a
+    COMPLETE slot; ``(-1, None)`` = every page still proven. ONE ``find`` over the
+    referenced pages."""
+    import numpy as _np
+
+    n = len(idxs)
+    if n == 0:
+        return -1, None
+    fs, st = arena.find_slots_np([stems[int(i)] for i in idxs])
+    fs = _np.asarray(fs, dtype=_np.int64)
+    st = _np.asarray(st)
+    if int(fs.shape[0]) != n:  # a find that answers another count proves nothing: nothing is proven
+        return 0, (-1, 0)
+    ok = (fs == _np.asarray(slots, dtype=_np.int64)) & (st == 2)
+    bad = _np.flatnonzero(~ok)
+    if not bad.size:
+        return -1, None
+    b = int(bad[0])
+    return b, (int(fs[b]), int(st[b]))
+
+
+def _arena_note_recheck_cut(where: str, page: int, stem: str, slot: int, found, given_back: int) -> None:
+    _REF_RECHECK_N[0] += 1
+    _REF_RECHECK_N[1] += int(given_back)
+    k = _REF_RECHECK_N[0]
+    if k <= 16 or (k & (k - 1)) == 0:
+        logger.warning(
+            "#1424 ARENA-REF RECHECK CUT n=%d where=%s page=%d stem=%s slot=%d found=(slot=%d,state=%d) "
+            "given_back=%d total_given_back=%d: the reference took a slot that no longer holds this page's "
+            "key (cleared and re-claimed between the find/fill and the reference); the references from this "
+            "page on are returned and the read's prefix ends here -- the page is read again, never loaded "
+            "from another page's slot",
+            k, where, int(page), str(stem)[:48], int(slot), int(found[0]), int(found[1]), int(given_back),
+            _REF_RECHECK_N[1])
+
 
 
 def _read_stages_line(operation, total_ms: float) -> None:
@@ -3952,11 +4081,13 @@ class HiCacheController:
             # An honest miss instead.
             return 0
         _t0 = time.perf_counter()
+        _rd_base = int(getattr(operation, "completed_tokens", 0) or 0) // max(1, int(getattr(self, "page_size", 1) or 1))  # READ-DEPTH: this batch's first page (instrument: never raises)
         stems = pdflip_suffixed_stems(self.storage_backend, hash_values)  # Posten 2: suffix memoised per key class
         import numpy as _np
         _fs, _st = pool.arena.find_slots_np(stems)  # Posten 2 (18.09.): numpy, no 520k-tuple list
         _rs = _read_stages(operation)
         _rs["find"] = _rs.get("find", 0.0) + (time.perf_counter() - _t0) * 1000.0
+        _recheck = arena_ref_recheck_enabled()  # ARENA-CHAIN: reference, then look the key up again
         _ta = time.perf_counter()
         # #257 (a): pages the probe HOLDS are read from the held slot -- the
         # probe's reference becomes the read's, no second reference is taken
@@ -3985,6 +4116,26 @@ class HiCacheController:
             _need = _fs[:lead][~_hm[:lead]]
             got = pool.arena.ref_slots_np(_need, +1) if _need.size else 0
             if got == int(_need.size):
+                if _recheck and _need.size:
+                    # ARENA-CHAIN: a reference takes any COMPLETE or CLAIMED slot, key unseen -- the
+                    # key must still name this slot, COMPLETE, or the page is not ours
+                    _li = _np.flatnonzero(~_hm[:lead])
+                    _bp, _fd = _arena_first_unproven(pool.arena, stems, _li, _fs[_li])
+                    if _bp >= 0:
+                        _cut = int(_li[_bp])
+                        _back = _fs[_cut:lead][~_hm[_cut:lead]]
+                        pool.arena.ref_slots_np(_back, -1)
+                        _arena_note_recheck_cut("lead", _cut, stems[_cut], int(_fs[_cut]), _fd, int(_back.size))
+                        # the pages from the cut on were found before whatever moved them: find them again
+                        # (a fill below reads them from the L3 when they are gone, a fresh find refs them
+                        # once more -- and is rechecked once more)
+                        _fs = _np.asarray(_fs, dtype=_np.int64).copy()
+                        _st = _np.asarray(_st).copy()
+                        _f2, _s2 = pool.arena.find_slots_np(list(stems[_cut:]))
+                        _nh = ~_hm[_cut:]
+                        _fs[_cut:][_nh] = _np.asarray(_f2, dtype=_np.int64)[_nh]
+                        _st[_cut:][_nh] = _np.asarray(_s2)[_nh]
+                        lead = _cut
                 slots = _fs[:lead].tolist()
             else:
                 pool.arena.ref_slots_np(_need, -1)  # undo the partial refs, take the slow path
@@ -4014,18 +4165,69 @@ class HiCacheController:
                     _pre[i] = s_
                     continue
                 _end = i  # evicted between find and ref: the prefix ends here
+                _rd.note_cut(operation, _rd_base + i, _rd.L2_EVICTED_BEFORE_REF)  # READ-DEPTH
                 break
             _need.append(i)
+        if _recheck and _pre:
+            # ARENA-CHAIN: the pages found past the lead and referenced ahead of the fill (EG review (b)):
+            # the fill's arena-full clock cannot take them, but the clock of ANOTHER rank could have, between
+            # the find and the reference -- the key must still name the slot
+            _pi = sorted(_pre)
+            _bp, _fd = _arena_first_unproven(pool.arena, stems, _pi, [_pre[i] for i in _pi])
+            if _bp >= 0:
+                _cut = _pi[_bp]
+                _back = [_pre.pop(i) for i in _pi[_bp:]]
+                pool.arena.ref_slots_np(_np.asarray(_back, dtype=_np.int64), -1)
+                _arena_note_recheck_cut("pre", _cut, stems[_cut], int(_back[0]), _fd, len(_back))
+                _end = min(_end, _cut)
+                _need = [i for i in _need if i < _end]
         _fills = {}
+        _fills_reffed = False
+        _why = {}
         _tf = time.perf_counter()
         if _need:
             _fill_fn = getattr(self.storage_backend, "arena_fill_from_disk", None)
             if callable(_fill_fn):
-                _got = _fill_fn(pool.arena, [stems[i] for i in _need], int(pool._page_bytes), prefix=True)
-                _fills = dict(zip(_need, _got))
+                # SELF-EVICT (NF h16 15:34:27, P PP1, pdflip-10-86; h16h 19:21:06 PP2, pdflip-58-558): the fill's
+                # room eviction took this very read's kept pages (#248e ORDERED-EVICT victims=[pdflip-10-86 ...
+                # lowest_page=1024]; victims=[pdflip-58-555 ... lowest_page=807] = the sibling turn's held pages,
+                # the same stems this read had found in L2 -- every stage's walk then ended at page 807). Every
+                # stem of the operation is protected for the fill (pins + this read).
+                from flliper.srt.mem_cache.hicache_storage import fill_protect_scope
+
+                _rd.fill_reasons_reset()
+                from flliper.srt.pdflip import room_wait_arbiter as _arbiter
+
+                with fill_protect_scope(self.storage_backend, operation), \
+                        _arbiter.fill_scope(getattr(operation, "request_id", None), operation):
+                    # ROOM-ARBITER 1016 (F3): the fill's room wait knows its request (PP0 picks the oldest)
+                    # REF-AT-LAND-1014: the fill references every page as it lands;
+                    # those references are ours (taken below instead of a ref here)
+                    _got = None
+                    if _kv_dl.on():
+                        # S36 KV-DURCHLAUF: a page the FULL arena cannot take comes back DURCHLAUF -- a disk page,
+                        # never a room wait (kv_durchlauf.durchlauf_stems, one rule for every rank)
+                        try:
+                            _got = _fill_fn(pool.arena, [stems[i] for i in _need], int(pool._page_bytes),
+                                            prefix=True, take_ref=True, durchlauf=True)
+                            _fills_reffed = bool(getattr(_got, "_arena", None) is not None)
+                        except TypeError:   # a backend without the S36 keyword
+                            _got = None
+                    if _got is None:
+                        try:
+                            _got = _fill_fn(pool.arena, [stems[i] for i in _need], int(pool._page_bytes),
+                                            prefix=True, take_ref=True)
+                            _fills_reffed = bool(getattr(_got, "_arena", None) is not None)
+                        except TypeError:   # a backend without the keyword
+                            _got = _fill_fn(pool.arena, [stems[i] for i in _need], int(pool._page_bytes), prefix=True)
+                            _fills_reffed = False
+                _fills = dict(zip(_need, list(_got)))
+                _why = {_need[k]: c for k, c in _rd.fill_reasons_take().items() if k < len(_need)}
         _tf1 = time.perf_counter()
         _rs["l3fill"] = _rs.get("l3fill", 0.0) + (_tf1 - _tf) * 1000.0
         _rs["l3fill_pages"] = _rs.get("l3fill_pages", 0) + len(_need)
+        _fill_idx = []
+        _dl_n = 0
         for i in range(lead, _end):
             if _hm[i]:
                 slots.append(int(_fs[i]))  # #257: held since the probe
@@ -4035,12 +4237,46 @@ class HiCacheController:
                 continue
             # #1433: not in the L2 -- the L3 fill above read it (or not)
             fill = _fills.get(i)
-            if fill is None or pool.arena.ref_slots([fill], +1) != 1:
+            if fill is _kv_dl.DURCHLAUF:
+                # S36: a disk page -- resolved to a held L3 file below, no slot, no reference
+                slots.append(fill)
+                _dl_n += 1
+                _fills.pop(i, None)
+                continue
+            if fill is None or (not _fills_reffed and pool.arena.ref_slots([fill], +1) != 1):
+                _rd.note_cut(operation, _rd_base + i,  # READ-DEPTH: why the walk ends here
+                             _why.get(i, _rd.FILL_NONE) if fill is None else _rd.FILL_EVICTED_BEFORE_REF)
                 break  # not on disk / evicted between fill and ref: the prefix ends here
             slots.append(fill)
+            _fill_idx.append(i)
+            if _fills_reffed:
+                _fills.pop(i, None)   # its reference moved into the read
+        if _fills_reffed:
+            # REF-AT-LAND-1014: landed past where the prefix ended -- given back
+            _left = [int(v) for v in _fills.values() if v is not None and v is not _kv_dl.DURCHLAUF]
+            if _left:
+                pool.arena.ref_slots_np(_np.asarray(_left, dtype=_np.int64), -1)
+        if _recheck and _fill_idx:
+            # ARENA-CHAIN (NF 14.10. 07:29:33Z, P PP0): the fill hands the slots out WITHOUT a reference; between
+            # the fill and this reference another rank's full-arena claim (>= 256 slots per clock round) can have
+            # cleared and re-claimed them, and the reference above takes a CLAIMED slot of another stem without a
+            # key check. Look the stems up again: only a slot the stem still names, COMPLETE, is kept.
+            _bp, _fd = _arena_first_unproven(pool.arena, stems, _fill_idx, [slots[i] for i in _fill_idx])
+            if _bp >= 0:
+                _cut = _fill_idx[_bp]
+                _back = [slots[j] for j in range(_cut, len(slots))
+                         if not _hm[j] and slots[j] is not _kv_dl.DURCHLAUF]
+                if _back:
+                    pool.arena.ref_slots_np(_np.asarray(_back, dtype=_np.int64), -1)
+                _arena_note_recheck_cut("fill", _cut, stems[_cut], int(slots[_cut]), _fd, len(_back))
+                _rd.note_cut(operation, _rd_base + _cut, _rd.FILL_EVICTED_BEFORE_REF)  # READ-DEPTH (S24: the ref-recheck cut is the same event as a refused ref -- one name on every rank; the stem no longer names the slot = evicted/re-claimed before the reference)
+                del slots[_cut:]
         if _pre:
             # referenced ahead, past where the prefix ended: given back
             pool.arena.ref_slots_np(_np.asarray(list(_pre.values()), dtype=_np.int64), -1)
+        _dl_disk = 0
+        if _dl_n and slots:
+            _dl_disk = _kv_dl_resolve(self, pool, slots, stems, hash_values, _hm)
         if not slots:
             # xsn314/322/326: the dormant hold's re-reads answered ZERO for
             # pages P had completed (PP2's ack flips COMPLETE within ~4 s),
@@ -4064,6 +4300,8 @@ class HiCacheController:
         _rs["ref"] = _rs.get("ref", 0.0) + ((_t2 - _t1) - (_tf1 - _tf)) * 1000.0
         _probe_hold.consumed(operation, _page0, len(slots))
         pool.resolve_rows(host_indices, slots)
+        if _dl_disk:
+            _kv_dl.note_read(getattr(operation, "request_id", None), len(slots), _dl_disk)
         _t3 = time.perf_counter()
         _rs["resolve"] = _rs.get("resolve", 0.0) + (_t3 - _t2) * 1000.0
         _rs["pages"] = _rs.get("pages", 0) + len(slots)
@@ -4125,6 +4363,7 @@ class HiCacheController:
         prefix_keys = operation.prefix_keys
         for i in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
             if operation.is_terminated():
+                _rd.note_cut(operation, i, _rd.TERMINATED)  # READ-DEPTH
                 # #1068 (A12.4): a stop or a revoke lands at the next batch
                 # boundary (~4 MiB), never after one more storage read. The
                 # per-page increment below would refuse anyway; checking
@@ -4167,6 +4406,22 @@ class HiCacheController:
                 operation.completed_tokens
                 != prev_completed_tokens + len(batch_hashes) * self.page_size
             ):
+                if envs.FLLIPER_PDFLIP_READ_FIRST_FAIL_LOG.get():
+                    # 1476: name the batch that under-delivered (read-only
+                    # instrument, default off; no sync, no loop). Fires at
+                    # most once per operation -- the loop breaks below.
+                    logger.warning(
+                        "PDFLIP READ-FIRST-FAIL rid=%s batch_first_hash=%s "
+                        "batch_pages=%d expected_tokens=%d completed_tokens=%d "
+                        "prev_completed=%d page_size=%d",
+                        operation.request_id,
+                        str(batch_hashes[0])[:8],
+                        len(batch_hashes),
+                        prev_completed_tokens + len(batch_hashes) * self.page_size,
+                        operation.completed_tokens,
+                        prev_completed_tokens,
+                        self.page_size,
+                    )
                 operation.mark_terminate()
                 break  # Some operations fail or operation terminated by controller
 
@@ -4275,6 +4530,8 @@ class HiCacheController:
                 self._page_transfer(operation)
                 operation.read_end_time = time.monotonic()
                 _read_stages_line(operation, (operation.read_end_time - operation.read_start_time) * 1000.0)
+                _rd.line(operation, self.page_size, getattr(self, "pp_rank", "?"),  # READ-DEPTH (C5)
+                         (operation.read_end_time - operation.read_start_time) * 1000.0)
                 _note_l3_read(self, operation)  # RANK-TIMING: rankstats cache.l3 / prefetch
                 # #257: what the read did not take, the probe gives back
                 _probe_hold.release(operation, getattr(self, "mem_pool_host", None), 0, reason="read-end")
@@ -4285,6 +4542,9 @@ class HiCacheController:
                     operation.host_indices[operation.completed_tokens :],
                     generation=getattr(operation, "binding_generation", None),
                 )
+                # S50 TOLD-ACK-EARLY: this thread is done with the operation -- wake a P follower's early-ack
+                # worker (no-op without one); its harvest (check_prefetch_progress) decides termination as before
+                _told_ack_early.note_read_end(operation)
             except Empty:
                 continue
             except Exception:  # noqa: BLE001 - see the docstring: the only
@@ -4566,8 +4826,14 @@ class HiCacheController:
                 from flliper.srt.mem_cache.utils import namespace_root_hash
 
                 last_hash = namespace_root_hash(extra_key)
+            # MAMBA-ANCHOR 1015 (pdflip/presence_fetch_key.py): a RadixKey (the
+            # fetch's bigram key, built by the caller) is hashed as is -- the
+            # id list of the pre-1015 call hashed the unigram chain nobody
+            # writes (pdflip-0-6: R13 EMPTY KV PREFIX, 208338 tokens recomputed).
+            from flliper.srt.pdflip import presence_fetch_key as _pfk
+
             page_hashes = self.get_hash_str(
-                list(token_ids), last_hash, page_size=self.page_size
+                _pfk.hash_input(token_ids), last_hash, page_size=self.page_size
             )
             if not page_hashes:
                 return 0
@@ -4580,6 +4846,10 @@ class HiCacheController:
             batch = page_hashes[:STORAGE_BATCH_SIZE]
             pool_transfers = self._presence_pool_transfers()
             if pool_transfers:
+                # MAMBA-ANCHOR 1015: the anchor-clamped question over the
+                # WHOLE span, as the fetch's v2 query asks it -- an anchor
+                # beyond page 1024 no longer clamps the first batch to 0.
+                batch = _pfk.v2_batch(page_hashes, STORAGE_BATCH_SIZE)
                 try:
                     # THE WHOLE CHAIN, never the first STORAGE_BATCH_SIZE keys
                     # (gmps13/gmps14, dual D: `#1028B FETCH CAP kv=1024
@@ -4611,6 +4881,21 @@ class HiCacheController:
                         "part of this issuance decision",
                         type(self.storage_backend).__name__,
                     )
+            if s64_dense_full_span_on() and claim_vote_min_only(self):
+                # S64 S-ARM (NF rc15 D: X-GATE-TERMS store = worker local_match +
+                # 65536 on 72-525 / 16-78 / 18-81 / 28-114 / 59-496 / 82-632 /
+                # 104-767..769 -- 68608 = 3072 + 1024 pages while the store held
+                # 98560): a KV-row worker has no component transfer, so it asked
+                # the dense question of the FIRST batch only (1024 pages on NF)
+                # and its vote capped the group's MIN store arm there. The chain
+                # is hashed already; ask it batch by batch in key order and stop
+                # at the first short batch (longest prefix), exactly as the
+                # fetch's ``_storage_hit_query`` walks it. Only a KV-row worker
+                # (``claim_vote_min_only``): its vote enters the MIN beside a host
+                # that asks the WHOLE span (v2); a dense group of equals keeps
+                # MAMBA-ANCHOR 1015's first batch (27B page_size=1: the cost).
+                return _s64_dense_prefix_pages(
+                    self.storage_backend, page_hashes, STORAGE_BATCH_SIZE, prefix_keys)
             return int(
                 self.storage_backend.batch_exists(batch, extra_info) or 0
             )
@@ -4739,6 +5024,73 @@ class HiCacheController:
                         len(self.prefetch_io_aux_threads), PREFETCH_IO_WORKERS_ENV)
         return self.prefetch_io_aux_threads
 
+    def _reduce_store_claim(self, operation, storage_hit_count: int) -> tuple:
+        """The prefetch thread's group claim reduce for ``operation``.
+
+        Returns ``(own_count, threshold_count)``: the tokens THIS rank reads
+        (from its own span start) and the group-uniform count the revoke
+        threshold is compared against. One collective per operation on every
+        rank, in the form agreed by ``_agree_claim_form`` -- unchanged.
+
+        S59 (rc15 D pdflip-26-100 & 9 more): under a Form A END frame
+        (``claim_end_frame``) every rank votes ``span start + claim`` and takes
+        back ``group END - its own start``; without a frame both returns are
+        the reduced count, byte for byte the old reduce.
+        """
+        from flliper.srt.managers import claim_end_frame as _cef
+
+        _frame = _cef.take_claim_end_frame(self, operation)
+        _local_count = int(storage_hit_count)
+        storage_hit_count = _cef.local_claim_vote(_frame, _local_count)
+        # fnFL2x22: the FORM is agreed over the group first (one
+        # scalar MAX), never read off this rank alone -- see
+        # CLAIM_VOTE_ABSTAIN for the boot that measured the mismatch.
+        if self._agree_claim_form(operation):
+            # #1233 L8: ONE collective carries min and max -- MIN over
+            # [count, -count] -- so a rank whose claim differs from
+            # the group's is a named STOP, not a silent MIN (Q11).
+            # A rank holding no bytes (Form A worker) abstains: it
+            # adopts the voters' MIN below instead of setting the MAX.
+            # #239 S3h: a KV worker under the token cut votes in the
+            # min arm only (claim_vote_min_only).
+            packed = torch.tensor(
+                encode_claim_vote(storage_hit_count, claim_vote_abstains(self),
+                                  min_only=claim_vote_min_only(self)),
+                dtype=torch.int,
+            )
+            self._all_reduce_prefetch_groups(packed, torch.distributed.ReduceOp.MIN)
+            _mn, _mx = decode_claim_vote(packed)
+            from flliper.srt.rank_role import form_a_token_cut_active as _cut_active
+
+            if _mn != _mx and _cut_active():
+                settle_claim_split(_mn, _mx, operation.request_id, cut_active=True)
+            elif _mn != _mx and operation.request_id in getattr(self, "pdflip_hold_rids", ()):
+                # #1461 (boot weg2xsn216): a probe issued for a request in
+                # the DORMANT HOLD reads a store that P is still writing --
+                # the ranks' probes land ms apart and differ (TP2 94207 vs
+                # 97870).  That is the one case where the inequality is the
+                # write-through's clock, not a divergent store: every rank
+                # adopts the group MIN (the same prefix on every rank) and
+                # the hold's top-up (#1456) fetches the rest.  Outside the
+                # hold the law stays STOP.
+                logger.warning("#1461 DRAFT-CLAIM MIN-ADOPTED rid=%s per_rank_claim=[%d, %d] (hold-time probe, "
+                               "store in flux; every rank proceeds with %d)", operation.request_id, _mn, _mx, _mn)
+            else:
+                assert_draft_claims_agree(_mn, _mx, operation.request_id)
+            storage_hit_count = int(_mn)
+        else:
+            storage_hit_count_tensor = torch.tensor(
+                storage_hit_count, dtype=torch.int
+            )
+            self._all_reduce_prefetch_groups(
+                storage_hit_count_tensor, torch.distributed.ReduceOp.MIN
+            )
+            storage_hit_count = storage_hit_count_tensor.item()
+        _own, _thr = _cef.adopt_group_claim(_frame, int(storage_hit_count), _local_count)
+        _cef.note_line(logger, getattr(operation, "request_id", "?"), _frame, _local_count,
+                       int(storage_hit_count), _own, _thr)
+        return _own, _thr
+
     def prefetch_thread_func(self):
         """
         Manage prefetching operations from storage backend to host memory.
@@ -4773,50 +5125,12 @@ class HiCacheController:
                     _st["probed"] = time.monotonic()
                 # #257 (a): hold what the probe reports until the read
                 probe_hold_pin(self, operation, hash_value, storage_hit_count)
-                # fnFL2x22: the FORM is agreed over the group first (one
-                # scalar MAX), never read off this rank alone -- see
-                # CLAIM_VOTE_ABSTAIN for the boot that measured the mismatch.
-                if self._agree_claim_form(operation):
-                    # #1233 L8: ONE collective carries min and max -- MIN over
-                    # [count, -count] -- so a rank whose claim differs from
-                    # the group's is a named STOP, not a silent MIN (Q11).
-                    # A rank holding no bytes (Form A worker) abstains: it
-                    # adopts the voters' MIN below instead of setting the MAX.
-                    # #239 S3h: a KV worker under the token cut votes in the
-                    # min arm only (claim_vote_min_only).
-                    packed = torch.tensor(
-                        encode_claim_vote(storage_hit_count, claim_vote_abstains(self),
-                                          min_only=claim_vote_min_only(self)),
-                        dtype=torch.int,
-                    )
-                    self._all_reduce_prefetch_groups(packed, torch.distributed.ReduceOp.MIN)
-                    _mn, _mx = decode_claim_vote(packed)
-                    from flliper.srt.rank_role import form_a_token_cut_active as _cut_active
-
-                    if _mn != _mx and _cut_active():
-                        settle_claim_split(_mn, _mx, operation.request_id, cut_active=True)
-                    elif _mn != _mx and operation.request_id in getattr(self, "pdflip_hold_rids", ()):
-                        # #1461 (boot weg2xsn216): a probe issued for a request in
-                        # the DORMANT HOLD reads a store that P is still writing --
-                        # the ranks' probes land ms apart and differ (TP2 94207 vs
-                        # 97870).  That is the one case where the inequality is the
-                        # write-through's clock, not a divergent store: every rank
-                        # adopts the group MIN (the same prefix on every rank) and
-                        # the hold's top-up (#1456) fetches the rest.  Outside the
-                        # hold the law stays STOP.
-                        logger.warning("#1461 DRAFT-CLAIM MIN-ADOPTED rid=%s per_rank_claim=[%d, %d] (hold-time probe, "
-                                       "store in flux; every rank proceeds with %d)", operation.request_id, _mn, _mx, _mn)
-                    else:
-                        assert_draft_claims_agree(_mn, _mx, operation.request_id)
-                    storage_hit_count = int(_mn)
-                else:
-                    storage_hit_count_tensor = torch.tensor(
-                        storage_hit_count, dtype=torch.int
-                    )
-                    self._all_reduce_prefetch_groups(
-                        storage_hit_count_tensor, torch.distributed.ReduceOp.MIN
-                    )
-                    storage_hit_count = storage_hit_count_tensor.item()
+                # S59: the claim reduce lives in `_reduce_store_claim` -- in END
+                # coordinates under a Form A frame (`claim_end_frame`), so a
+                # worker never applies the host's page COUNT from its own start.
+                storage_hit_count, _claim_threshold_count = HiCacheController._reduce_store_claim(
+                    self, operation, storage_hit_count
+                )
                 # #1157: the probe has ANSWERED (rank-uniform after the MIN).
                 # Stamped before the threshold branch so a revoke and a
                 # transfer both carry it; a reap that finds None was ahead of
@@ -4825,7 +5139,7 @@ class HiCacheController:
                 if _st is not None:
                     _st["voted"] = time.monotonic()
 
-                if storage_hit_count < revoke_threshold(self, operation):
+                if _claim_threshold_count < revoke_threshold(self, operation):
                     # not to prefetch if not enough benefits
                     # (PARK-RETAIN READ: a read the caller priced below the
                     # threshold keeps its own floor, managers/pdflip_min_hit.py)
@@ -5176,16 +5490,24 @@ class HiCacheController:
                      if s_ >= 0 and st_ == 2 and dpool.arena.ref_slots([s_], +1) == 1}
             _dneed = [i for i in range(len(found)) if i not in _dref]
             _dfill = {}
+            _dreffed = False
             _fill_fn = getattr(self.storage_backend, "arena_fill_from_disk", None)
             if _dneed and callable(_fill_fn):
-                _dfill = dict(zip(_dneed, _fill_fn(dpool.arena, [stems[i] for i in _dneed],
-                                                   int(dpool._page_bytes))))
+                # S24 REF-BEFORE-COMPLETE: take_ref -- the fill holds the reference from before the complete, so no
+                # clock (any thread, any rank process) takes a landed draft page before this walk references it
+                try:
+                    _dgot = _fill_fn(dpool.arena, [stems[i] for i in _dneed], int(dpool._page_bytes),
+                                     take_ref=True)
+                    _dreffed = bool(getattr(_dgot, "_arena", None) is not None)
+                except TypeError:   # a backend without the keyword
+                    _dgot = _fill_fn(dpool.arena, [stems[i] for i in _dneed], int(dpool._page_bytes))
+                _dfill = dict(zip(_dneed, _dgot))
             for i in range(len(found)):
                 if i in _dref:
                     slot, ok = _dref[i], True
                 else:  # #1433: L3 -> L2 for the draft page too
                     slot = _dfill.get(i)
-                    ok = slot is not None and dpool.arena.ref_slots([slot], +1) == 1
+                    ok = slot is not None and (_dreffed or dpool.arena.ref_slots([slot], +1) == 1)
                     slot = slot if slot is not None else -1
                 slots.append(slot if ok else -1)
                 flags.append(bool(ok))
@@ -5301,48 +5623,60 @@ class HiCacheController:
                 operation = self.backup_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
-
-                # W35 CLASS 4: the durable-corruption gate. Checked HERE, on
-                # the consumer thread, immediately before the persist and
-                # after the operation has been dequeued -- the one point where
-                # this operation's fate is decided. See `operation_is_stale`
-                # for why a stale backup is REFUSED rather than routed.
-                # Acked either way: an unacked operation stalls the queue, and
-                # a declined backup is a correct non-persist, exactly as
-                # `backup_skip` already is.
-                if operation_is_stale(self, operation, "backup"):
+                # K12: an operation the group's sleep verdict abandoned is
+                # acked unwritten at dequeue; any other is EXECUTING from here
+                # on, and an exception in its body no longer ends this thread
+                # (D TP0 13:35:33Z: an IndexError in _page_backup killed it,
+                # its two backups were never acked -> W120 10 s later).
+                if not _k12_guard.begin(self, operation):
                     self.ack_backup_queue.put(operation)
                     continue
+                try:
+                    # W35 CLASS 4: the durable-corruption gate. Checked HERE, on
+                    # the consumer thread, immediately before the persist and
+                    # after the operation has been dequeued -- the one point where
+                    # this operation's fate is decided. See `operation_is_stale`
+                    # for why a stale backup is REFUSED rather than routed.
+                    # Acked either way: an unacked operation stalls the queue, and
+                    # a declined backup is a correct non-persist, exactly as
+                    # `backup_skip` already is.
+                    if operation_is_stale(self, operation, "backup"):
+                        self.ack_backup_queue.put(operation)
+                        continue
 
-                if not self.backup_skip:
-                    # Capacity watchdog: rate-limited inside the backend, so this
-                    # is cheap per operation. A backend that has stopped writing
-                    # (out of disk) still runs the backup: the individual page
-                    # writes turn into refusals, which the ack path already
-                    # treats as a partial backup, so the caller sees a cache
-                    # miss rather than a stalled queue.
-                    self.storage_backend.check_disk_space()
-                    # #1061: stamp every key this operation hands to the store
-                    # with the #719 binding generation it was OPENED under --
-                    # the stamp `StorageOperation.__init__` already carries
-                    # (the existing carrier; no second scheme). This is the
-                    # producer-phase ledger's only production writer; disarmed
-                    # it records nothing. Placed BEFORE `_page_backup` so a
-                    # partial backup can only OVER-stamp: a stamped-but-
-                    # unwritten key reads as a store miss later, never as a
-                    # wrongly-attributed phase.
-                    try:
-                        from flliper.srt.mem_cache.producer_phase_census import (
-                            note_backup_keys,
-                        )
+                    if not self.backup_skip:
+                        # Capacity watchdog: rate-limited inside the backend, so this
+                        # is cheap per operation. A backend that has stopped writing
+                        # (out of disk) still runs the backup: the individual page
+                        # writes turn into refusals, which the ack path already
+                        # treats as a partial backup, so the caller sees a cache
+                        # miss rather than a stalled queue.
+                        self.storage_backend.check_disk_space()
+                        # #1061: stamp every key this operation hands to the store
+                        # with the #719 binding generation it was OPENED under --
+                        # the stamp `StorageOperation.__init__` already carries
+                        # (the existing carrier; no second scheme). This is the
+                        # producer-phase ledger's only production writer; disarmed
+                        # it records nothing. Placed BEFORE `_page_backup` so a
+                        # partial backup can only OVER-stamp: a stamped-but-
+                        # unwritten key reads as a store miss later, never as a
+                        # wrongly-attributed phase.
+                        try:
+                            from flliper.srt.mem_cache.producer_phase_census import (
+                                note_backup_keys,
+                            )
 
-                        note_backup_keys(
-                            getattr(operation, "hash_value", None),
-                            getattr(operation, "binding_generation", None),
-                        )
-                    except Exception:  # noqa: BLE001 - never break the backup thread
-                        pass
-                    self._page_backup(operation)
+                            note_backup_keys(
+                                getattr(operation, "hash_value", None),
+                                getattr(operation, "binding_generation", None),
+                            )
+                        except Exception:  # noqa: BLE001 - never break the backup thread
+                            pass
+                        self._page_backup(operation)
+                except Exception as exc:  # noqa: BLE001 - K12: the consumer survives
+                    _k12_guard.fail(operation, exc)
+                finally:
+                    _k12_guard.end(self, operation)
                 self.ack_backup_queue.put(operation)
 
             except Empty:

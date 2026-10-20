@@ -109,6 +109,23 @@ class FakeGroup:
     async def _info(self, request: web.Request) -> web.Response:
         return web.json_response({"x": 1})
 
+    async def _match_probe(self, request: web.Request) -> web.Response:
+        """S56r: the fake D answers the D-MATCH-PROBE like a D WITHOUT a radix tree (it holds no prefix): the
+        prompt in the harness's token measure (chars / CHARS_PER_TOKEN, the measure these tests were written
+        against), device 0. Without it the probe 404s and S56r prices nothing (D-PROBE-UNPRICED, A1)."""
+        import numpy as np
+
+        from flliper.srt.pdflip import d_match_probe as _dmp
+
+        body = await request.json()
+        payload = body.get("payload") or {}
+        if payload.get("input_ids_b64"):
+            n = int(_dmp.ids_from_b64(payload["input_ids_b64"]).size)
+        else:
+            n = int(len(front_mod.request_text(payload)) / front_mod.CHARS_PER_TOKEN) + 1
+        return web.json_response({"success": True, "ids": _dmp.ids_to_b64(np.arange(max(2, n))), "device_tokens": 0,
+                                  "host_tokens": 0, "key_match_depth": 0, "mm_spans": []})
+
     async def start(self) -> None:
         app = web.Application()
         app.router.add_post("/generate", self._generate)
@@ -119,6 +136,8 @@ class FakeGroup:
         app.router.add_get("/get_server_info", self._info)
         if self.park is not None:
             app.router.add_post(PARK_PATH, self._park)
+        if self.name == "D":
+            app.router.add_post("/pdflip/match_probe", self._match_probe)
         self.server = TestServer(app)
         await self.server.start_server()
         self.url = str(self.server.make_url("")).rstrip("/")
@@ -292,6 +311,12 @@ def test_main_flags_default_to_the_user_design():
 
 # ------------------------------------------------------ rule 1: the cap
 def test_rule1_a_p_phase_takes_at_most_six_then_flips_with_handoff_n():
+    """H91 part C rule 1 AMENDED by flipqueue 1015 (double flip P->D->P): the cap never strands a request that
+    NEEDS P (``Front._p_phase_cap_exempt_pred``). Here X = 10, so all nine (~1000 tokens each) are over X and need
+    P: the first phase takes all nine, the wake of D carries handoff_n=9, and no request is prefilled twice. Left
+    at the cap (the old form: 6, then 3 queued) they made D's DONE-KICK fire PARK-IMMEDIATE at once (11:04:50Z
+    pdflip-0-7, awake_s=0.0). The cap still binds what neither rides nor needs P
+    (test_pdflip_flipqueue_1015::test_the_cap_still_binds_what_neither_rides_nor_needs_p)."""
     async def body():
         async with Harness(awake="P", p_concurrency=8, d_bs=8,
                            p_phase_max_requests=6) as h:
@@ -300,13 +325,13 @@ def test_rule1_a_p_phase_takes_at_most_six_then_flips_with_handoff_n():
             assert await _until(lambda: "rpc:release_memory_occupation" in h.p.timeline, 20)
             first = _first(h.p.timeline, "rpc:release_memory_occupation")
             before = [e for e in h.p.timeline[:first] if e.startswith("gen:")]
-            assert len(before) == 6, h.p.timeline[:first]
+            assert len(before) == 9, h.p.timeline[:first]
             results = await asyncio.wait_for(asyncio.gather(*tasks), 40)
             assert [s for s, _ in results] == [200] * 9
             # rule 2: the wake of D carried the hand-off count on its kv resume
-            kv = [b for b in h.d.resume_bodies if "kv_cache" in (b.get("tags") or [])]  # H6: kv may ride the weights leg
-            assert kv and kv[0].get("handoff_n") == 6 and kv[0].get("parked_n") == 0, kv
-            # the second P phase took the remaining three
+            kv = [b for b in h.d.resume_bodies if "kv_cache" in (b.get("tags") or [])]  # H6 (6b8913e519): the kv resume rides the weights leg
+            assert kv and kv[0].get("handoff_n") == 9 and kv[0].get("parked_n") == 0, kv
+            # no second P phase was needed, and nothing was prefilled twice
             assert h.p.gen_marks.count("c8") == 1 and len(h.p.gen_marks) == 9
 
     asyncio.run(body())
@@ -375,7 +400,7 @@ def test_rule3_the_wait_bound_parks_the_running_decode_and_flips_to_p():
             assert h.front.counters["wait_bound_fired"] == 1 and h.front.counters["d_parked"] == 1
             # D wakes again: r0 is resumed (parked_n=1), r1 is the new hand-off
             assert await _until(lambda: h.front.awake == "D" and not h.front._d_parked, 20)
-            kv = [b for b in h.d.resume_bodies if "kv_cache" in (b.get("tags") or [])]  # H6: kv may ride the weights leg
+            kv = [b for b in h.d.resume_bodies if "kv_cache" in (b.get("tags") or [])]  # H6 (6b8913e519): the kv resume rides the weights leg
             assert kv[-1].get("parked_n") == 1 and kv[-1].get("handoff_n") == 1, kv
             assert rid0 in h.front.groups["D"].outstanding
             h.d.release_all()
@@ -509,3 +534,13 @@ def test_leg1_that_never_starts_is_requeued_as_an_intake_stall_and_the_flip_foll
             assert h.p.gen_marks.count("st") >= 2                 # prefilled in a later P phase
 
     asyncio.run(body())
+
+
+import pytest as _pytest_110  # noqa: E402
+
+
+@_pytest_110.fixture(autouse=True)
+def _arrival_seat_rule_off_110(monkeypatch):
+    """110: FLLIPER_PDFLIP_ENABLE_ARRIVAL_SEAT_RULE is default ON on the NF line;
+    this file pins the pre-rule front it was written against (=0 is that path)."""
+    monkeypatch.setenv("FLLIPER_PDFLIP_ENABLE_ARRIVAL_SEAT_RULE", "0")

@@ -20,6 +20,8 @@ import threading
 import time
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
+from . import names as N
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 WORKER = os.path.join(os.path.dirname(HERE), "kartenplan_build", "couplings_worker.py")
 DEFAULT_PYTHON = os.environ.get("RIGDASH_COUPLINGS_PYTHON") or "/spinning/htsglang-gpu/.venv/bin/python"
@@ -104,11 +106,18 @@ def scoped_args(text: str) -> Dict[str, str]:
 
 
 def env_map(text: str) -> Dict[str, str]:
+    """``A=1;B=2`` -> dict.  Keys come back in the RENAMED spelling (F0-F): a profile written before the rename carries ``<LEGACY>_X`` and the
+    planner modules the dashboard feeds (``profile_couplings``) look up ``FLLIPER_X``; when both spellings stand in one text, the renamed one wins."""
     out: Dict[str, str] = {}
     for item in str(text).split(";"):
         if "=" in item:
             k, v = item.split("=", 1)
-            out[k.strip()] = v.strip()
+            k = k.strip()
+            c = N.canonical_env_name(k)
+            if c != k:
+                out.setdefault(c, v.strip())
+            else:
+                out[k] = v.strip()
     return out
 
 

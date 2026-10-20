@@ -1,5 +1,6 @@
 """OVER-UNRESUMABLE (27B 673cc89f6a, boot dkr27browauthoritybar1fs10031707
-1003_170754, P group stop 17:23:06Z on PP1, rid pdflip-24-204).
+1003_170754, P group stop 17:23:06Z on PP1, rid pdflip-24-204); NF port of the 27B
+fix b2744f5043 (told-fidelity probe = ``rank_resumable``, the NF ack probe).
 
 MEASURED (P log + debug-hold dump rank1_pid710):
 
@@ -13,9 +14,10 @@ MEASURED (P log + debug-hold dump rank1_pid710):
 
 "over" marked the rid SATISFIED at told and ``own_prefix`` acked told without
 asking whether the rank can RESUME there: its tree held one node 0..59392 with
-the recurrent state at 59392 only. Now the over-settle asks the told-fidelity
-probe at told; unresumable -> ``over_unresumable``, not satisfied, the ack
-names the own read (!= told) and PP0's PF answers told=0 for every rank.
+the recurrent state at 59392 only. Now the over-settle asks the rank's own
+admission reach (``rank_resumable``) at told; unresumable -> ``over_unresumable``,
+not satisfied, the ack names the own read (!= told) and PP0's PF answers told=0
+for every rank. ``own_prefix`` also probes a SATISFIED rid before acking told.
 
 Real ``check_prefetch_progress`` (#1157 harness) on a real FULL+MAMBA tree:
 the read completes 16 tokens with its anchor at 16; PP0's told is 12."""
@@ -23,6 +25,8 @@ the read completes 16 tokens with its anchor at 16; PP0's told is 12."""
 import importlib.util
 import os
 from types import SimpleNamespace
+
+import pytest
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
@@ -41,6 +45,12 @@ OWN = n1.TOLD          # the follower's early read: 16 tokens, anchor at 16
 TOLD = OWN - 4         # PP0's (absolute) told: shallower than this rank's read
 
 
+@pytest.fixture(autouse=True)
+def _pf_ring_armed(monkeypatch):
+    """The verdict travels on the PF ack stream: armed here (see the PF-off test)."""
+    monkeypatch.setenv(fb.ENV_FALLBACK, "1")
+
+
 def _follower(cache):
     return SimpleNamespace(tree_cache=cache, _pdflip_store_told={REQ: TOLD},
                            ps=SimpleNamespace(pp_rank=1, pp_size=3, tp_size=1))
@@ -51,8 +61,8 @@ def test_the_tree_cannot_resume_at_told(monkeypatch):
     -- a match capped at told=12 resumes nothing (the metal #904 refusal)."""
     try:
         cache, _ = n1._completed(monkeypatch, with_anchor=True)
-        assert tf.pp0_admissible(_follower(cache), n1._req(), TOLD) == 0
-        assert tf.pp0_admissible(_follower(cache), n1._req(), OWN) == OWN
+        assert tf.rank_resumable(_follower(cache), n1._req(), TOLD) == 0
+        assert tf.rank_resumable(_follower(cache), n1._req(), OWN) == OWN
     finally:
         binding_state().reset()
 
@@ -83,5 +93,65 @@ def test_dual_layout_keeps_the_old_over(monkeypatch):
         sched, req = _follower(cache), n1._req()
         assert st.follower_early_settle(sched, req, TOLD, OWN, absolute=True) == "over"
         assert sched._pdflip_store_told_satisfied[REQ] == TOLD
+    finally:
+        binding_state().reset()
+
+
+def test_a_resumable_over_read_stays_satisfied(monkeypatch):
+    """No false fallback: the same over-read where the rank CAN resume at told
+    (probe: told) -- "over", SATISFIED, the ack says told. Also no probe."""
+    monkeypatch.delenv("FLLIPER_PDFLIP_DUAL_LAYOUT", raising=False)
+    try:
+        for verdict in (TOLD, None):
+            cache, _ = n1._completed(monkeypatch, with_anchor=True)
+            sched, req = _follower(cache), n1._req()
+            monkeypatch.setattr(tf, "rank_resumable", lambda s, r, d, v=verdict: v)
+            assert st.follower_early_settle(sched, req, TOLD, OWN, absolute=True) == "over"
+            assert sched._pdflip_store_told_satisfied[REQ] == TOLD
+            assert fb.own_prefix(sched, req, REQ, TOLD) == TOLD
+            assert getattr(sched, "_pdflip_over_unresumable_n", 0) == 0
+            binding_state().reset()
+    finally:
+        binding_state().reset()
+
+
+def test_a_satisfied_rid_without_a_state_at_told_acks_what_it_can_resume(monkeypatch):
+    """own_prefix: a rid already SATISFIED (any route) on a tree that cannot
+    resume at told no longer acks told unprobed; dual layout keeps told."""
+    monkeypatch.delenv("FLLIPER_PDFLIP_DUAL_LAYOUT", raising=False)
+    try:
+        cache, _ = n1._completed(monkeypatch, with_anchor=True)
+        sched, req = _follower(cache), n1._req()
+        sched._pdflip_store_told_satisfied = {REQ: TOLD}
+        assert fb.own_prefix(sched, req, REQ, TOLD) == 0
+        monkeypatch.setenv("FLLIPER_PDFLIP_DUAL_LAYOUT", "1")
+        assert fb.own_prefix(sched, req, REQ, TOLD) == TOLD
+    finally:
+        binding_state().reset()
+
+
+def test_fidelity_off_keeps_the_old_over(monkeypatch):
+    monkeypatch.delenv("FLLIPER_PDFLIP_DUAL_LAYOUT", raising=False)
+    monkeypatch.setenv(tf.ENV, "0")
+    try:
+        cache, _ = n1._completed(monkeypatch, with_anchor=True)
+        sched, req = _follower(cache), n1._req()
+        assert st.follower_early_settle(sched, req, TOLD, OWN, absolute=True) == "over"
+        assert fb.own_prefix(sched, req, REQ, TOLD) == TOLD
+    finally:
+        binding_state().reset()
+
+
+def test_without_the_pf_ack_stream_the_old_over_stands(monkeypatch):
+    """PF off: no carrier for "cannot resume", the admission would raise a
+    MISMATCH on own > told -- byte-identical to before (W27-UNIFORM re-read)."""
+    monkeypatch.delenv("FLLIPER_PDFLIP_DUAL_LAYOUT", raising=False)
+    monkeypatch.setenv(fb.ENV_FALLBACK, "0")
+    try:
+        cache, _ = n1._completed(monkeypatch, with_anchor=True)
+        sched, req = _follower(cache), n1._req()
+        assert st.follower_early_settle(sched, req, TOLD, OWN, absolute=True) == "over"
+        assert sched._pdflip_store_told_satisfied[REQ] == TOLD
+        assert fb.own_prefix(sched, req, REQ, TOLD) == TOLD
     finally:
         binding_state().reset()

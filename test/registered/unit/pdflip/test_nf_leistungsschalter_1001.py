@@ -35,7 +35,10 @@ PROFILE_P = {
     "FLLIPER_UNEVEN_MOE_EXPERT_SHARD": "1",
     "FLLIPER_HC_MIXER_INT8": "1",
     "FLLIPER_WEIGHT_LOADER_COALESCE_MIB": "32",
-    # GC-FREEZE 1013 (RC4 port): the boot heap leaves the collector after boot (P and D); the nextflash row writes it
+    # SWITCH-DEFAULTS 1004: nf-int4-h6-abl.env NF_ENV_P (P only)
+    "FLLIPER_PDFLIP_ENABLE_PREFILL_FETCH_OVERLAP": "1",
+    "FLLIPER_PDFLIP_ENABLE_TARGETED_PREWARM": "1",
+    # GC-FREEZE 1013: the boot heap leaves the collector after boot (P and D)
     "FLLIPER_PDFLIP_GC_FREEZE": "1",
 }
 PROFILE_D = {
@@ -52,11 +55,21 @@ PROFILE_D = {
     "FLLIPER_PDFLIP_ENABLE_D_PARK_END": "1",
     "FLLIPER_HC_MIXER_INT8": "1",
     "FLLIPER_WEIGHT_LOADER_COALESCE_MIB": "32",
-    # GC-FREEZE 1013 (RC4 port): freeze as on P, and the GC warning armed on D (P has had it since 30.09.)
+    # SCHALTER-HALBPORT 1002: nf-int4.env NF_ENV_D_FORM (D only)
+    "FLLIPER_PDFLIP_STORE_SHORT_TAIL": "1",
+    # SWITCH-DEFAULTS 1004: nf-int4-h6-abl.env NF_ENV_D (D only)
+    "FLLIPER_PDFLIP_ENABLE_TAIL_STAGE_EARLY": "1",
+    "FLLIPER_PDFLIP_RESUME_WARM_FINISH": "1",
+    "FLLIPER_PDFLIP_TAIL_STAGE_WORKER": "1",
+    # GC-FREEZE 1013: freeze as on P, and the GC warning armed on D (P has had it since 30.09.)
     "FLLIPER_PDFLIP_GC_FREEZE": "1",
     "FLLIPER_PDFLIP_GC_WARN_SECS": "0.5",
 }
-FORM_A_D = "--max-total-tokens 262144 --rank-role host,worker,worker --rank-tp-ratio 1,0,0"
+#: a per-group value that overrides the row's form-wide default on ONE group
+#: (the row's global value is what the other group runs): STORE_SHORT_TAIL, row
+#: off (= P), D on (SCHALTER-HALBPORT 1002).
+GROUP_OVER_GLOBAL = {"FLLIPER_PDFLIP_STORE_SHORT_TAIL": ("D", False)}
+FORM_A_D ="--max-total-tokens 262144 --rank-role host,worker,worker --rank-tp-ratio 1,0,0"
 
 
 def _ns(profile, env_p="", env_d="", extra_d=FORM_A_D, **kw):
@@ -89,7 +102,13 @@ class TestRegistryRows(CustomTestCase):
         none of the per-group switches is in PROFILE_SWITCH_DEFAULTS."""
         for pid in F.PROFILES:
             got = set(F.PROFILE_SWITCH_DEFAULTS[pid])
-            self.assertFalse(got & (set(PROFILE_P) | set(PROFILE_D)), pid)
+            self.assertFalse(got & (set(PROFILE_P) | set(PROFILE_D)) - set(GROUP_OVER_GLOBAL), pid)
+        # the one deliberate override: the row's global value is what the
+        # group that does not state it runs
+        groups = F.PROFILES[F.PROFILE_NEXTFLASH].group_switch_defaults
+        for name, (group, global_value) in GROUP_OVER_GLOBAL.items():
+            self.assertIs(F.PROFILE_SWITCH_DEFAULTS[F.PROFILE_NEXTFLASH][name], global_value)
+            self.assertEqual([g for g in groups if name in groups[g]], [group])
 
 
 class TestLauncherGroupDefaults(CustomTestCase):

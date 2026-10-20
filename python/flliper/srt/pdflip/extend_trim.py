@@ -45,9 +45,9 @@ MIB = float(1 << 20)
 
 _UNSET = object()
 _CACHE = {"thresholds": _UNSET, "rates": _UNSET, "armed": False, "logged_cap": None, "cap_trimmed": False,
-          # Q-694b EXTEND-RATE: measurement switch, this rank's measured rate
-          # (MiB/row, ratchet up), the open extend's start reading
-          "measure": _UNSET, "measured": None, "pending": None,
+          # Q-694b EXTEND-RATE: measurement switch + its rank list, this rank's
+          # measured rate (MiB/row, ratchet up), the open extend's start reading
+          "measure": _UNSET, "measure_ranks": _UNSET, "measured": None, "pending": None,
           # Q-710 EXTEND-CAP-FLOOR: the arming switch, the last logged floor line
           "cap_floor": _UNSET, "logged_floor": None}
 
@@ -96,6 +96,7 @@ def reset_for_tests() -> None:
     _CACHE["logged_cap"] = None
     _CACHE["cap_trimmed"] = False
     _CACHE["measure"] = _UNSET
+    _CACHE["measure_ranks"] = _UNSET
     _CACHE["measured"] = None
     _CACHE["pending"] = None
     _CACHE["cap_floor"] = _UNSET
@@ -153,11 +154,11 @@ def maybe_trim(cuda, rank: int, threshold_mib: Optional[float],
 def before_extend(worker, batch) -> Optional[str]:
     """Hook for ``TpModelWorker.forward_batch_generation``: the target
     worker's extend batches only (the draft extend that follows shares the
-    allocator and profits from the same trim). Q-694b: after the trim, the
-    rate measurement opens its reading (only with
-    ``FLLIPER_PDFLIP_EXTEND_RATE_MEASURE``; off = byte-identical)."""
+    allocator and profits from the same trim). Q-694b: after the trim, the rate
+    measurement opens its reading (only with ``FLLIPER_PDFLIP_EXTEND_RATE_MEASURE``
+    on this rank; off = byte-identical)."""
     line = _before_extend_trim(worker, batch)
-    if batch is not None and measure_armed():
+    if batch is not None and measure_armed(getattr(worker, "tp_rank", None)):
         measure_open(worker, batch)
     return line
 
@@ -282,6 +283,22 @@ def rows_cap(post_mib: float, rate: float, page_size: int) -> int:
     return max(page, (rows // page) * page)
 
 
+def chunk_need_mib(rank: int, rows: int) -> Optional[float]:
+    """S78 KEEP-SHORT: what an extend of ``rows`` rows costs the card by the rc12g
+    chunk model -- the inverse of :func:`rows_cap`: ``300 + rate x rows`` MiB with
+    the rate the width vote uses on this rank (start rate or the measured one x
+    RATE_SAFETY, :func:`effective_rate`). ``None`` when this rank has no rate (no
+    vote, no price: nothing is guessed)."""
+    try:
+        rate = threshold_for(int(rank), rates())
+        if rate is None or rate <= 0:
+            return None
+        rate = effective_rate(rate, int(rank))
+        return CHUNKING_FLOOR_MIB + float(rate) * max(0, int(rows))
+    except Exception:  # noqa: BLE001 -- an unpriced extend is priced by nobody
+        return None
+
+
 def width_vote(cuda, rank: int, configured: int, page_size: int, pending: bool,
                clock=time.perf_counter) -> Optional[int]:
     """This rank's vote for the group's chunk width, ``None`` = no vote.
@@ -298,7 +315,7 @@ def width_vote(cuda, rank: int, configured: int, page_size: int, pending: bool,
         # Q-694b: the start rate (record / derived) or this rank's measured
         # rate x RATE_SAFETY, whichever is larger; off: the start rate itself
         start_rate = rate
-        rate = effective_rate(rate)
+        rate = effective_rate(rate, rank)
         if bool(cuda.is_current_stream_capturing()):
             return None
         if not _CACHE["armed"]:
@@ -335,7 +352,7 @@ def width_vote(cuda, rank: int, configured: int, page_size: int, pending: bool,
                 f"{CHUNKING_MARKER} rank={rank} geplant={int(configured)} cap={cap} "
                 f"post={post_mib:.0f} rate={rate:.4f} floor={CHUNKING_FLOOR_MIB:.0f}"
                 + ("" if cap_post is None else f" torch_cap={torch_cap:.0f} cap_post={cap_post:.0f}")
-                + ("" if not measure_armed() else
+                + ("" if not measure_armed(rank) else
                    f" rate_src={'measured' if rate > start_rate else 'start'} start_rate={start_rate:.4f}")
             )
         if cap_floor_armed():
@@ -518,8 +535,26 @@ def _ceil4(x: float) -> float:
     return math.ceil(float(x) * 10000.0 - 1e-9) / 10000.0
 
 
-def measure_armed() -> bool:
-    """``FLLIPER_PDFLIP_EXTEND_RATE_MEASURE``, read once per process."""
+def measure_ranks() -> Optional[List[int]]:
+    """``FLLIPER_PDFLIP_EXTEND_RATE_MEASURE_RANKS`` (CSV of TP ranks), read once;
+    ``None`` = the measurement applies to every rank."""
+    if _CACHE["measure_ranks"] is _UNSET:
+        try:
+            from flliper.srt.environ import envs
+
+            raw = envs.FLLIPER_PDFLIP_EXTEND_RATE_MEASURE_RANKS.get()
+            vals = [int(x) for x in str(raw).split(",") if x.strip()] if raw else []
+            _CACHE["measure_ranks"] = vals or None
+        except Exception:  # noqa: BLE001 -- an instrument never kills a forward
+            _CACHE["measure_ranks"] = None
+    return _CACHE["measure_ranks"]  # type: ignore[return-value]
+
+
+def measure_armed(rank: Optional[int] = None) -> bool:
+    """``FLLIPER_PDFLIP_EXTEND_RATE_MEASURE`` (read once per process), narrowed to
+    ``FLLIPER_PDFLIP_EXTEND_RATE_MEASURE_RANKS`` when that names ranks and the
+    caller knows its own (NF port: TP0 keeps its recorded rate, TP1/TP2 --
+    whose record is null -- measure)."""
     if _CACHE["measure"] is _UNSET:
         try:
             from flliper.srt.environ import envs
@@ -527,7 +562,10 @@ def measure_armed() -> bool:
             _CACHE["measure"] = bool(envs.FLLIPER_PDFLIP_EXTEND_RATE_MEASURE.get())
         except Exception:  # noqa: BLE001 -- an instrument never kills a forward
             _CACHE["measure"] = False
-    return bool(_CACHE["measure"])
+    if not _CACHE["measure"]:
+        return False
+    ranks = measure_ranks()
+    return ranks is None or rank is None or int(rank) in ranks
 
 
 def measured_rate() -> Optional[float]:
@@ -535,10 +573,10 @@ def measured_rate() -> Optional[float]:
     return _CACHE["measured"]  # type: ignore[return-value]
 
 
-def effective_rate(start: float) -> float:
+def effective_rate(start: float, rank: Optional[int] = None) -> float:
     """The rate the vote uses: ``max(start, measured x RATE_SAFETY)`` while the
-    measurement is armed and holds a value, else ``start``."""
-    m = _CACHE["measured"] if measure_armed() else None
+    measurement is armed (on this rank) and holds a value, else ``start``."""
+    m = _CACHE["measured"] if measure_armed(rank) else None
     if m is None:
         return float(start)
     return max(float(start), _ceil4(float(m) * RATE_SAFETY))
@@ -583,6 +621,9 @@ def measure_close(runner, forward_batch, cuda, rank: Optional[int] = None) -> Op
     if pending is None:
         return None
     try:
+        if not measure_armed(rank):
+            _CACHE["pending"] = None
+            return None
         if getattr(runner, "is_draft_worker", False) or getattr(runner, "is_draft_model_runner", False):
             return None
         owner, pa0, a0, r0 = pending
@@ -610,7 +651,7 @@ def measure_close(runner, forward_batch, cuda, rank: Optional[int] = None) -> Op
             return None
         _CACHE["measured"] = rate
         start = threshold_for(int(rank) if rank is not None else 0, rates())
-        eff = None if start is None else effective_rate(start)
+        eff = None if start is None else effective_rate(start, rank)
         line = (
             f"{RATE_MARKER} source=measured rank={'?' if rank is None else int(rank)} rows={rows} "
             f"transient_mib={transient / MIB:.0f} reserved_growth_mib={growth / MIB:.0f} "
@@ -692,3 +733,74 @@ def derived_rate_mib(cfg: dict) -> Optional[float]:
         return _ceil4(elems * elem / MIB)
     except Exception:  # noqa: BLE001 -- an unreadable geometry derives nothing
         return None
+
+
+# --------------------------------------------------------------------------
+# NF port 1003 (order 980 item 2): the ranks whose record is NULL.
+#
+# Next Flash carries D_EXTEND_GROWTH_PER_ROW_MIB = [0.5871, null, null]: only
+# TP0 (5090) was priced, so TP1/TP2 (3080) read "0" = no rate = no vote
+# (Bericht 780 section A.4: a gap). The two 3080 ranks then never cap the
+# extend chunk although they have LESS room than the 5090 (z30x2: card_free
+# 16 / 78 MiB under the floors with the old trim threshold). A start rate for a
+# null rank is DERIVED, never a rig number written into the code:
+#
+#   ratio    = rate[anchor] x growth[r] / growth[anchor]
+#              the anchor is the first ranked with a recorded rate; growth is
+#              the profile's per-rank ``D_EXTEND_GROWTH_MIB`` (what one D extend
+#              added to torch reserved on each rank, the same extends)
+#   geometry = derived_rate_mib(config.json): the model's own per-row activation
+#              bound, no card, no rig. It is the Q-694b formula and it is NOT
+#              a bound on the reserved growth NF measures: 0.4622 on the NF
+#              geometry against the measured 0.5871 (report 960, -21 %; on the
+#              27B geometry it is conservative, 0.4422 against 0.3091)
+#   floor    = the recorded rank's own measured rate: no rank of the profile
+#              starts under the highest MEASURED value of its record until
+#              the formula knows the NF terms (coordinator, report 960) or the
+#              3080 ranks are measured (the run-time measurement below only
+#              ratchets UP, so the floor is also the 3080 ranks' resting value)
+#
+# and the start is the LARGEST of the candidates that exist (the conservative
+# direction); the run-time measurement above then raises it per rank
+# (``FLLIPER_PDFLIP_EXTEND_RATE_MEASURE_RANKS`` names exactly these ranks, so a
+# recorded rank keeps its recorded rate byte for byte).
+# --------------------------------------------------------------------------
+
+
+def fill_null_rates(rate_mib: Sequence[Optional[float]],
+                    growth_mib: Optional[Sequence[Optional[float]]] = None,
+                    geometry_mib: Optional[float] = None,
+                    floor_to_record: bool = True) -> "tuple[List[Optional[float]], List[str]]":
+    """``(rates, sources)``: ``rate_mib`` with every ``None`` rank replaced by
+    the largest of its derivable candidates (``ratio``, ``geometry``, and with
+    ``floor_to_record`` the highest recorded rate ``record-floor``), or left
+    ``None`` when it has none. ``sources[r]`` is ``record`` for a recorded
+    rank, else the winning candidate or ``none``."""
+    rates = [None if r is None or float(r) <= 0 else float(r) for r in rate_mib]
+    anchor = next((i for i, r in enumerate(rates) if r is not None), None)
+    growth = list(growth_mib) if growth_mib is not None and len(growth_mib) == len(rates) else None
+    top = max((r for r in rates if r is not None), default=None)
+    out: List[Optional[float]] = []
+    src: List[str] = []
+    for i, r in enumerate(rates):
+        if r is not None:
+            out.append(r)
+            src.append("record")
+            continue
+        cands = []
+        if floor_to_record and top is not None:
+            cands.append(("record-floor", top))
+        if (anchor is not None and growth is not None
+                and growth[i] is not None and growth[anchor] is not None
+                and float(growth[i]) > 0 and float(growth[anchor]) > 0):
+            cands.append(("ratio", rates[anchor] * float(growth[i]) / float(growth[anchor])))
+        if geometry_mib is not None and float(geometry_mib) > 0:
+            cands.append(("geometry", float(geometry_mib)))
+        if not cands:
+            out.append(None)
+            src.append("none")
+            continue
+        name, val = max(cands, key=lambda c: c[1])
+        out.append(_ceil4(val))
+        src.append(name)
+    return out, src

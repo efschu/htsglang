@@ -44,6 +44,7 @@ from flliper.srt.managers.pdflip_idle_vote import (
     lap_clock,
     log_stale_drop,
     log_verdict,
+    note_hop_work,
     send_home,
     tally,
 )
@@ -138,6 +139,7 @@ def _pp_segs_text(segs, t_end: float, top: int = 6) -> str:
 
 from flliper.srt.managers.pdflip_pass_timer import read_ms as _pt_read
 from flliper.srt.managers import pdflip_p_overlap as _pov
+from flliper.srt.pdflip import pp_void_pass as _pp_void_pass  # FIXES Nr. 45: group-wide void pass (void proxy frame)
 
 
 def _1463_timed(attr: str):
@@ -685,6 +687,34 @@ def _pp_output_exchange_due(batch: Optional[ScheduleBatch]) -> bool:
         and not batch.forward_mode.is_prebuilt()
         and not _pp_can_skip_output_comm(batch)
     )
+
+
+def _pp_output_relay_now(holder) -> bool:
+    """S69 OUTPUT-RELAY-NOW: does this rank forward a received output in the pass that received it?
+
+    Outputs travel last -> 0 -> 1 -> ... -> last. On the contiguous ring a non-last rank used to forward
+    ``pp_outputs`` -- what it received LAST pass -- inside the NEXT pass's output commit, i.e. after that pass's
+    launch. With a blocking launch that is seconds of relay lag in which the downstream sits in its blocking
+    output receive while its next proxy is already on its wire (rc16 boot ..._1019_121629, 12:27:51.702 ->
+    12:27:53.611: 1909 ms, PP0's 1542-token launch 1787 ms, then COMMIT-STALL-P 3887 ms at the epoch tail).
+
+    Same rule on every rank, no verdict of anyone's (R11 untouched): a pure transport timing. Off where the old
+    relay is the only correct one or where the lag does not exist:
+      * the last rank is the SOURCE, it relays nothing;
+      * the gapped wire already forwards in the receiving iteration (#753, ``forward_now``);
+      * XPU orders send/recv by rank parity because its isend can block -- an extra post there is a new arc;
+      * ``pp_async_batch_depth > 0`` commits BEFORE the launch, so no launch sits between receipt and forward.
+    """
+    if not envs.FLLIPER_PP_OUTPUT_RELAY_NOW.get():
+        return False
+    if getattr(getattr(holder, "pp_group", None), "is_last_rank", True):
+        return False
+    if getattr(holder, "_pp_gapped_wire", False):
+        return False
+    if is_xpu():
+        return False
+    depth = getattr(getattr(holder, "server_args", None), "pp_async_batch_depth", 0)
+    return int(depth or 0) == 0
 
 
 @dataclass
@@ -1536,8 +1566,8 @@ def _1000_upstream_moved_on(scheduler, mb_id: int) -> str:
                         _1000_SPECIMENS.append(
                             (
                                 int(mb_id),
-                                tuple(sorted(h[:8] for h in held))[:3],
-                                tuple(sorted(str(k)[:8] for k in up))[:3],
+                                tuple(sorted(held))[:3],
+                                tuple(sorted(str(k) for k in up))[:3],
                                 # THE FIELD THAT DECIDES THE RELEASE: is the
                                 # held occupant a chunked continuation (the
                                 # mover's legality argument covers it) or a
@@ -1660,6 +1690,9 @@ def pp_flip_forget_ring_scoped_slots(holder) -> None:
     # #1020 void guard) does a membership test, and an empty set is the
     # truth on a ring that has just been rebuilt from zero.
     holder._pp_launched_pending = set()
+    # Review A1 (intake fix): the consumed-pass mark belongs to the ring that was just rebuilt, too: passes retracted at the
+    # cutover are never consumed by the followers, and PP0 must not wait for a result that will not come.
+    holder._pp_last_processed_ct = -1
     # #1225: and the BATCHES those slots owe, keyed by slot. Same
     # lifecycle as the set above and reset here for the same reason --
     # an entry that outlived a ring rebuild would name a slot of the
@@ -1696,7 +1729,7 @@ def pp_slot_disagreement_message(*, pp_rank, mb_id, stamp, recv_fwd_ct, batch) -
 
     try:
         reqs = list(getattr(batch, "reqs", None) or ())
-        rids = ",".join(str(getattr(r, "rid", "?"))[:16] for r in reqs) or "-"
+        rids = ",".join(str(getattr(r, "rid", "?")) for r in reqs) or "-"
         extend = getattr(batch, "extend_num_tokens", None)
     except Exception:  # noqa: BLE001
         rids, extend = "?", None
@@ -2089,7 +2122,7 @@ def pp_parked_continuation_stamp(holder, incoming, out: Dict[str, object]) -> No
             "#968 FORWARD rank=%s out=%d rids=%s (seen=%d)",
             own_rank,
             len(merged),
-            ",".join(str(merged[r][0])[:8] for r in sorted(merged)),
+            ",".join(str(merged[r][0]) for r in sorted(merged)),
             seen,
         )
 
@@ -2450,7 +2483,7 @@ def pp_prefetch_completion_stamp(holder, incoming, out: Dict[str, object]) -> No
                 "prints as 'absent' rather than reading as zero.",
                 own_rank,
                 len(own),
-                ",".join(f"{rid[:8]}={completed}" for rid, completed, _r in own[:8]),
+                ",".join(f"{rid}={completed}" for rid, completed, _r in own[:8]),
                 seen,
             )
 
@@ -4234,7 +4267,11 @@ def pdflip_791c_release_on_idle_vote(self, vote) -> None:
     # blockers=[waiting_queue]", every /flush_cache 400, W3 at the drain.
     req = getattr(self, "_pending_chunked_abort_req", None)
     waiting = getattr(self, "_pdflip_pending_waiting_aborts", None)
-    if (req is None and not waiting) or int(getattr(self.ps, "pp_rank", 0) or 0) == 0:
+    # K14: a held waiting-queue abort (pdflip.pp_abort) is released by the same
+    # vote -- an idle PP0 sends no frame that could still admit it. (27B keeps its
+    # #1180-W TWIN-DEFER waiting hold beside it.)
+    held = getattr(self, "_pdflip_pp_held_waiting_aborts", None)
+    if (req is None and not waiting and not held) or int(getattr(self.ps, "pp_rank", 0) or 0) == 0:
         return
     try:
         from flliper.srt.pdflip import p_row_authority as _prow
@@ -4248,6 +4285,8 @@ def pdflip_791c_release_on_idle_vote(self, vote) -> None:
         return
     self._791c_pp0_drained = True
     try:
+        if held:
+            self._pdflip_resolve_waiting_aborts(pp0_drained=True)
         self.process_pending_chunked_abort()
     finally:
         self._791c_pp0_drained = False
@@ -4375,6 +4414,252 @@ def pdflip_writethrough_drain_on_idle_vote(self) -> int:
     return drained
 
 
+_BAV_N = [0]
+
+
+def pdflip_backup_ack_drain_on_idle_vote(self) -> int:
+    """STORAGE-BACKUP LIVENESS (NF h16l 75e3ee8abd, boot
+    dkrnfint4h6ablxcw3spmlrhlvwbar1dauer10142044 ..._1014_204509, W3 20:50:22):
+    the third twin of :func:`pdflip_loadback_drain_on_idle_vote` and
+    :func:`pdflip_writethrough_drain_on_idle_vote`.
+
+    P.log 20:48:52: pdflip-0-1's last pass left three direct write-throughs in
+    flight on PP1 and PP2. The P->D quiesce's first #1268 lap ran the
+    write-through drain on each follower (``PDFLIP-WRITETHROUGH-DRAIN-ON-VOTE
+    drained=3``); each ack completed its arena slot (``#1427 DIRECT-WRITE ACK``)
+    and issued the QSA-index sidecar store write (``#106S SIDECAR-WRITE-ISSUED
+    op=1..3``) -- three entries in ``ongoing_backup``. Their acks land in
+    ``ack_backup_queue`` within milliseconds, but only ``_drain_backup`` (in the
+    round drain of ``check_hicache_events``, i.e. a PLANNED pass) retires them,
+    and a follower under the row authority plans no frameless cycle (PLAN
+    BYPASS; ``#1028 HICACHE-ROUND`` ran n=1 on PP1/PP2 in the whole boot). Every
+    lap from epoch 2 to 6697 voted ``hicache_backup(3)`` on PP1/PP2, PP0 refused
+    every /flush_cache, the parked follower flush waited for a ``passed`` its own
+    vote prevented, and the front stopped the group: ``W3
+    PdFlipDrainWitnessDisagreement`` with an empty, CORRECT front ledger.
+
+    The drain is rank-local where the round drain is local anyway
+    (``UnifiedRadixCache.drain_backup_acks_uncoordinated``: nothing when the
+    attention group > 1). It runs AFTER the write-through drain, because that
+    drain is what issues the sidecar backups. Nothing is waited on: a backup the
+    store has not acked yet stays and votes not-idle, the next lap drains it.
+    Returns the drained count."""
+    tc = getattr(self, "tree_cache", None)
+    pending = getattr(tc, "ongoing_backup", None)
+    if not pending or int(getattr(getattr(self, "ps", None), "pp_rank", 0) or 0) == 0:
+        return 0
+    drain = getattr(tc, "drain_backup_acks_uncoordinated", None)
+    if not callable(drain):
+        return 0
+    try:
+        from flliper.srt.pdflip import p_row_authority as _prow
+
+        if not _prow.applies(self) or not self._pp_microbatches_drained():
+            return 0
+        drained = int(drain())
+    except Exception:  # noqa: BLE001 - the drain never blocks the vote
+        logger.warning("PDFLIP-BACKUP-ACK-DRAIN-ON-VOTE raised; the slot votes on the undrained state",
+                       exc_info=True)
+        return 0
+    if drained > 0:
+        _BAV_N[0] += 1
+        if _BAV_N[0] <= 16 or _BAV_N[0] % 256 == 0:
+            logger.info("PDFLIP-BACKUP-ACK-DRAIN-ON-VOTE pp_rank=%d drained=%d left=%d (n=%d): the "
+                        "follower's acked storage backups (the #106S sidecar writes its own "
+                        "write-through drain issued), retired at the #1268 vote -- a frameless "
+                        "cycle skips the round drain that retires them", int(self.ps.pp_rank),
+                        drained, len(getattr(tc, "ongoing_backup", None) or ()), _BAV_N[0])
+    return max(drained, 0)
+
+
+#: NF-FOLLOWER-ROUND 1014 switch (default ON, user rule 14.10.: new features are on);
+#: ``0`` = e7cfda7fbe byte for byte: no round on a frameless cycle, the #1268 vote
+#: runs its four single drains.
+FOLLOWER_ROUND_ENV = "FLLIPER_PDFLIP_P_FOLLOWER_ROUND"
+_FR_N = [0, 0]  # [rounds, rounds that drained something]
+
+
+class FollowerRoundRefused(RuntimeError):
+    """The named stop of :func:`pdflip_follower_round` (a form whose round would
+    carry a collective or a peer wait)."""
+
+
+def follower_round_enabled() -> bool:
+    return (os.environ.get(FOLLOWER_ROUND_ENV, "1") or "1").strip().lower() not in (
+        "0", "false", "no", "off")
+
+
+def _follower_round_census(tc) -> tuple:
+    """(write_through, load_back, revoke, backup, release, extra, prefetch) of THIS
+    rank: what a planned pass's round would drain. Host-side lengths only."""
+    cc = getattr(tc, "cache_controller", None)
+
+    def _q(name):
+        q = getattr(cc, name, None)
+        try:
+            return int(q.qsize()) if q is not None else 0
+        except Exception:  # noqa: BLE001 - a census never breaks the round
+            return 0
+
+    try:
+        extra = sum(int(q.qsize()) for q in
+                    (getattr(cc, "extra_host_mem_release_queues", None) or {}).values())
+    except Exception:  # noqa: BLE001
+        extra = 0
+    return (
+        len(getattr(tc, "ongoing_write_through", None) or ()),
+        len(getattr(tc, "ongoing_load_back", None) or ()),
+        _q("prefetch_revoke_queue"),
+        _q("ack_backup_queue"),
+        _q("host_mem_release_queue"),
+        extra,
+        len(getattr(tc, "ongoing_prefetch", None) or ()),
+    )
+
+
+def _follower_round_tree_call(tc):
+    """The tree's own per-round poll, where it is the #737 form (rank-local ack
+    counting, ``_drain_agreement_is_collective`` known): ``check_hicache_events``.
+    None for a tree without it -- a stand-in of the lap tests, or a tree whose
+    round carries the legacy MIN reduce + PP sync (HiRadixCache): the single
+    drains of e7cfda7fbe stay in charge there, unchanged."""
+    call = getattr(tc, "check_hicache_events", None)
+    if not callable(call):
+        return None
+    if not callable(getattr(tc, "_count_ready_acks", None)):
+        return None
+    if not callable(getattr(tc, "_drain_agreement_is_collective", None)):
+        return None
+    return call
+
+
+def pdflip_follower_round(self, site: str = "frameless") -> bool:
+    """NF-FOLLOWER-ROUND 1014 (inventory done/nf-row-inventory-1014.md, C1): a
+    follower of group P runs, on every cycle WITHOUT a frame, the same HiCache
+    housekeeping round a planned pass runs -- and nothing else.
+
+    WHY. Under the row authority (31aa655fff) a frameless follower cycle skips the
+    plan (PLAN BYPASS), and with the plan it skipped the whole housekeeping of
+    ``_get_new_batch_prefill_raw``: ``check_hicache_events`` (write-through and
+    load-back acks, then the storage control queues: prefetch REVOKES, storage
+    BACKUP acks, host RELEASES, extra-pool releases), the deferred-prefetch retry
+    and the prefetch progress drain. Upstream flliper runs that round on EVERY
+    stage in EVERY iteration (``get_next_batch_to_run`` on each PP rank); it was
+    never meant to depend on having a batch. Two images died of single missing
+    drains today (#968 75e3ee8abd, W3 e7cfda7fbe); four single drains in the
+    #1268 vote covered only the quiesce, and every new queue would have needed a
+    fifth. This is the one round, the same functions, for every queue.
+
+    WHAT IT DECIDES: NOTHING. Every queue it empties holds work this rank has
+    ALREADY been told to do or has already finished (an acked event, an acked
+    store write, a probe's own revoke answer, rows already given back); the
+    drains retire it on this rank's own tree and pool, in this rank's own queue
+    order. No membership, no extent, no abort, no park, no timeout, no evict
+    choice, no admission -- those stay PP0's (row) or the next planned pass's.
+    What changes on this rank afterwards is what it REPORTS (idle slot, PR room
+    fact, PF ack): votes PP0 folds into its own verdict.
+
+    NO COLLECTIVE. Refused by name (``FOLLOWER-ROUND REFUSED``) where the round
+    would carry one: an attention group > 1 (the storage drain MIN-reduces the
+    queue sizes, ``check_prefetch_progress`` reduces) -- a group collective
+    triggered from a rank-local point is the #580 class -- and pending PP-sync
+    sends (a peer wait). On group P (TP 1, PP 3) none of them exist.
+
+    ``site``: ``frameless`` = the ``_row_skip_plan`` branch of the loop body (the
+    bypass itself is the proof that this pass plans nothing); ``vote`` = the
+    #1268 slot attach (needs the row authority, like the single drains it
+    replaces). Returns True iff the round ran."""
+    ps = getattr(self, "ps", None)
+    if ps is None or int(getattr(ps, "pp_size", 1) or 1) <= 1:
+        return False
+    if int(getattr(ps, "pp_rank", 0) or 0) == 0:
+        return False
+    if not follower_round_enabled():
+        return False
+    if site != "frameless":
+        try:
+            from flliper.srt.pdflip import p_row_authority as _prow
+
+            if not _prow.applies(self):
+                return False
+        except Exception:  # noqa: BLE001 - no row module: the unchanged path
+            return False
+    tc = getattr(self, "tree_cache", None)
+    if tc is None:
+        return False
+    attn_world = max(int(getattr(ps, "attn_tp_size", 1) or 1),
+                     int(getattr(ps, "attn_cp_size", 1) or 1))
+    collective = False
+    agree = getattr(tc, "_drain_agreement_is_collective", None)
+    if callable(agree):
+        collective = bool(agree())
+    reduce_world = 1
+    rw = getattr(tc, "_attn_reduce_world", None)
+    if callable(rw):
+        try:
+            reduce_world = int(rw())
+        except Exception:  # noqa: BLE001 - an unreadable world is not world 1
+            reduce_world = 2
+    if attn_world > 1 or collective or reduce_world > 1:
+        raise FollowerRoundRefused(
+            "FOLLOWER-ROUND REFUSED (NF-FOLLOWER-ROUND 1014, #580 class): this "
+            f"follower (pp_rank={int(ps.pp_rank)}, site={site}) has attn world "
+            f"{attn_world}, drain agreement collective={collective}, reduce world "
+            f"{reduce_world}. Its housekeeping round would trigger a group "
+            "collective from a rank-local point. The round is built for group P "
+            "(TP 1, PP 3); a form with an attention group > 1 under the row "
+            f"authority needs a group-aligned round first. {FOLLOWER_ROUND_ENV}=0 "
+            "restores the single vote drains of e7cfda7fbe."
+        )
+    if getattr(tc, "work_list", None):
+        raise FollowerRoundRefused(
+            "FOLLOWER-ROUND REFUSED (NF-FOLLOWER-ROUND 1014): "
+            f"{len(tc.work_list)} PP-sync send(s) pending on pp_rank="
+            f"{int(ps.pp_rank)}; reaping them waits on a peer's receive, which a "
+            "frameless cycle may not do. Group P issues none (no _pp_sync caller "
+            "on the #737 tree) -- this is a form the round was not built for."
+        )
+    before = _follower_round_census(tc)
+    tree_round = _follower_round_tree_call(tc)
+    if tree_round is not None:
+        if getattr(self, "enable_hierarchical_cache", False):
+            tree_round()
+            # #811: the planned pass releases the anchor pins whose write-through
+            # ack just drained (only the running batch; no-op unless armed).
+            release_pins = getattr(tc, "release_acked_anchor_pins", None)
+            running = getattr(self, "running_batch", None)
+            if callable(release_pins) and running is not None:
+                release_pins(getattr(running, "reqs", ()) or ())
+    else:
+        # A tree without the #737 round (a stand-in, HiRadixCache): the single
+        # drains of e7cfda7fbe, each with its own guards, unchanged.
+        pdflip_loadback_drain_on_idle_vote(self)
+        pdflip_writethrough_drain_on_idle_vote(self)
+        pdflip_backup_ack_drain_on_idle_vote(self)
+    if getattr(self, "enable_hicache_storage", False):
+        retry = getattr(self, "_retry_deferred_prefetches", None)
+        if callable(retry):
+            retry()
+        # #1272 orphan collector included; the verdict map is discarded on
+        # purpose -- no memo is planted (`_pass_prefetch_verdicts` stays the
+        # planned pass's own).
+        self._drain_prefetch_progress()
+    after = _follower_round_census(tc)
+    _FR_N[0] += 1
+    self._pdflip_follower_rounds = int(getattr(self, "_pdflip_follower_rounds", 0)) + 1
+    if before != after:
+        _FR_N[1] += 1
+        if _FR_N[1] <= 16 or _FR_N[1] % 256 == 0:
+            logger.info(
+                "FOLLOWER-ROUND pp_rank=%d site=%s n=%d drained_rounds=%d "
+                "[wt,lb,rev,bak,rel,extra,pf] before=%s after=%s: a follower's "
+                "housekeeping round on a cycle that plans nothing (NF-FOLLOWER-ROUND "
+                "1014; the planned pass runs the same round)",
+                int(ps.pp_rank), site, _FR_N[0], _FR_N[1], list(before), list(after),
+            )
+    return True
+
+
 class SchedulerPPMixin:
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
@@ -4448,6 +4733,11 @@ class SchedulerPPMixin:
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
+                # S82 COMMIT-PARK: the slot pair this pass plans and then receives the output of
+                # (pdflip_store_told._s82_output_pending reads it at PP0's pass top).
+                self._s82_slot = (mb_id, next_mb_id)
+                self._s82_receive_deadline = None   # A1: set by this pass's park, consumed by its receive
+                self._s82_park_admit = None         # A3: set when this pass's park admits the younger set
                 self._pp_flip_pass_tick(mb_id)
                 # #1466 PASS-STALL: boot weg2xsn221 (P running-req 2) still shows
                 # whole seconds without a forward on ALL P ranks, twice per
@@ -4472,15 +4762,23 @@ class SchedulerPPMixin:
                     # stage, send-join + output from the last stage) -- xsn224's
                     # request tails read other_ms=400-700 with every named term
                     # near 0, i.e. the pass sat in exactly these two.
-                    _1466_prx = float(getattr(self, "_1463_recv_ms", 0.0) or 0.0)
-                    _1466_cmt = float(getattr(self, "_1463_commit_ms", 0.0) or 0.0)
+                    # 1447 (04.10.): _pp_process_batch_result zeroes _1463_recv_ms/_1463_commit_ms
+                    # after its PASS-TAIL line, i.e. BEFORE this block reads them on the next
+                    # slot. nf12: other_ms >= 800 equalled recv+commit of the PASS-TAIL line in
+                    # 137 of 137 passes, with commit_ms/proxy_recv_ms printed as 0 here. The
+                    # kept copies (summed since the last read here) restore the two terms.
+                    _1466_prx = float(getattr(self, "_1463_recv_ms", 0.0) or 0.0) + float(
+                        getattr(self, "_1466_recv_keep", 0.0) or 0.0)
+                    _1466_cmt = float(getattr(self, "_1463_commit_ms", 0.0) or 0.0) + float(
+                        getattr(self, "_1466_commit_keep", 0.0) or 0.0)
                     _1466_proc = float(getattr(self, "_1463_process_ms", 0.0) or 0.0)  # #1466c: process_batch_result
                     # #1475: the intake's own parts (weg2xsn232-235: input_ms 1.4-1.9 s
                     # on every rank in the same pass, handle_generate_request < 200 ms)
                     _1475 = " ".join("%s=%.0f" % (k, _pt_read(self, a)) for k, a in (
                         ("vote_ms", "_1475_vote_ms"), ("post_send_ms", "_1475_post_send_ms"),
                         ("send_ms", "_1475_send_ms"), ("proc_input_ms", "_1475_process_input_ms"),
-                        ("absorb_ms", "_1475_absorb_ms")))
+                        ("absorb_ms", "_1475_absorb_ms"),
+                        ("s82_park_ms", "_s82_park_ms")))  # S82: the COMMIT-PARK inside input_ms
                     if _1466_prev is not None:
                         _1466_pass = (_1466_now - _1466_prev) * 1000.0
                         if _1466_pass - _1466_run >= 300.0:
@@ -4496,6 +4794,8 @@ class SchedulerPPMixin:
                         self._1463_recv_ms = 0.0
                         self._1463_commit_ms = 0.0
                         self._1463_process_ms = 0.0
+                        self._1466_recv_keep = 0.0
+                        self._1466_commit_keep = 0.0
                     except Exception:  # noqa: BLE001
                         pass
                 except Exception:  # noqa: BLE001
@@ -4830,6 +5130,8 @@ class SchedulerPPMixin:
                 # was deleted with the void relay, #1072).
                 self._pp_note_chunked_req_before_admission(mb_id)
                 _pp_seg(self, "pre_admission")
+                # FIXES Nr. 45: the waiting queue's order before this pass's plan (a void restores it on every rank)
+                _pp_void_pass.snapshot_queue(self)
                 # #947 THE RING SITE, and the whole reason this instrument
                 # exists. This line runs on EVERY iteration of the PP body --
                 # voided ones included -- and `get_next_batch_to_run` directly
@@ -5093,6 +5395,12 @@ class SchedulerPPMixin:
                     # (#1020 guard, #1153 sibling sweep).
                     self._pp_null_frameless_slot(mb_id)
                     pp_bulletin.clear_after_plan(self)
+                    # NF-FOLLOWER-ROUND 1014: no plan, but the same housekeeping
+                    # round the plan runs (acks, revokes, backups, releases,
+                    # prefetch progress) -- upstream runs it on every stage
+                    # every iteration; skipping it with the plan left the
+                    # follower's queues to the next frame (A1-A8, #968, W3).
+                    pdflip_follower_round(self, site="frameless")
                 elif _pre_proxy is not None:
                     _dn2 = getattr(self, "_pp_row_deliver_trace_n", 0)
                     _prow_t0 = time.perf_counter()  # Fix B P-ROW-COST
@@ -5217,6 +5525,21 @@ class SchedulerPPMixin:
                 _pp_seg(self, "admission_ring")
                 self._pp_void_pass_without_upstream_launch(mb_id)
                 _pp_seg(self, "void_check")
+                # FIXES Nr. 45 PP-VOID-PASS: a load-back refusal on the carrierless form discards the whole planned pass HERE
+                # (own-void + the slot's frame becomes a void frame), before anything of it is sent or launched.
+                _pp_void_pass.after_plan(self, mb_id)
+                # S82 TWIN-AT-PLAN: a held twin whose wait this plan resolved registers its store read
+                # NOW, before PP0's (host-blocking) forward, not at the next pass top after it.
+                if self.ps.pp_size > 1 and self.ps.pp_rank == 0 and pdflip_store_told.armed(self):
+                    pdflip_store_told.pp0_after_plan(self)
+                # K14: a waiting-queue abort this follower held because PP0 had
+                # already admitted the request is applied HERE, right after the
+                # plan that executed PP0's frame admitting it and before the
+                # launch -- the request runs the pass PP0 runs and gets PP0's
+                # to_finish (or the #791C chunked verdict), never a pass more or
+                # less (pdflip.pp_abort). One getattr while nothing is held.
+                if getattr(self, "_pdflip_pp_held_waiting_aborts", None):
+                    self._pdflip_resolve_waiting_aborts()
 
                 # #795 PP ADMISSION UNIFORMITY, RELOCATED: emit/forward this
                 # pass's admission decision HERE, immediately after
@@ -5383,16 +5706,26 @@ class SchedulerPPMixin:
                 # neither state is constructible: nothing is owed unless the
                 # sender has a batch, and then it always sends.
                 pp_proxy_tensors = None
-                if cur_batch:
+                if cur_batch or _pp_void_pass.owes_frame(self):
                     # #631 ROW AUTHORITY: on a row-driven pass the frame was
                     # already taken BEFORE the plan (it is what the plan was
                     # built from); receiving again here would consume the NEXT
                     # pass's frame -- the corpse-R dual (two consumes against
                     # a debt of one).
-                    pp_proxy_tensors = (
-                        _pre_proxy
-                        if _pre_proxy is not None
-                        else self._pp_recv_proxy_tensors(mb_id)
+                    #
+                    # FIXES Nr. 45: the frame of this slot is the group's common abort point. A VOID frame discards the
+                    # pass here on every stage that holds a batch for it (cur_batch -> None, no launch, the same statement is
+                    # owed to the next stage); a stage that unwound its own plan still takes the frame it owes (one frame
+                    # per pass, never a second blocking receive against a debt of one).
+                    cur_batch, pp_proxy_tensors = _pp_void_pass.at_receive(
+                        self,
+                        mb_id,
+                        cur_batch,
+                        lambda: (
+                            _pre_proxy
+                            if _pre_proxy is not None
+                            else self._pp_recv_proxy_tensors(mb_id)
+                        ),
                     )
                 next_pp_outputs = None
                 next_batch_result = None
@@ -5449,7 +5782,7 @@ class SchedulerPPMixin:
                 if cur_batch:
                     try:
                         _reqs = getattr(cur_batch, "reqs", None) or []
-                        _rids = ",".join(str(getattr(r, "rid", "?"))[:8] for r in _reqs)
+                        _rids = ",".join(str(getattr(r, "rid", "?")) for r in _reqs)
                         _ext = getattr(cur_batch, "extend_num_tokens", None)
                         logger.warning(
                             "#969N ADMIT slot=%s fwd_ct=%s bs=%d extend=%s "
@@ -5508,6 +5841,9 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
+                    if self.ps.pp_size > 1 and self.ps.pp_rank == 0:
+                        # S82 A3: the slot's launch end and size (exact downstream samples, Prio = Alter rule)
+                        pdflip_store_told.s82_note_launch(self, mb_id, cur_batch)
                 else:
                     # FIX 1r/2: this visit launches NO forward on this
                     # rank. The gap that is open right now therefore
@@ -5531,6 +5867,10 @@ class SchedulerPPMixin:
                         if _flush is not None:
                             _flush()
                 if self.server_args.pp_async_batch_depth == 0:
+                    _s82_pp0 = self.ps.pp_size > 1 and self.ps.pp_rank == 0
+                    _s82_entry = (
+                        pdflip_store_told.s82_output_pending_at_entry(self) if _s82_pp0 else None
+                    )
                     with _pov.span("output_commit"):
                         next_pp_outputs, next_batch_result, d2h_event = (
                             self._pp_commit_send_output_work_and_preprocess_output_tensors(
@@ -5538,6 +5878,9 @@ class SchedulerPPMixin:
                                 next_mb_id,
                             )
                         )
+                    if _s82_pp0:
+                        # S82 A3: exact downstream sample + OUTPUT-LATE of the older set after a park admit
+                        pdflip_store_told.s82_after_commit(self, next_mb_id, _s82_entry)
                 if self.mbs[next_mb_id] is not None:
                     # #1002d: a declined output leaves this unset by design.
                     if d2h_event is not None:
@@ -5696,6 +6039,14 @@ class SchedulerPPMixin:
                         getattr(self, "_pp_launched_pending", set()).discard(
                             next_mb_id
                         )
+                        # Review A1 (intake fix): the event that releases the rows of a finished pass is its RESULT being
+                        # consumed, on every rank. Remember the newest consumed pass: PP0 reads it as "the last pass I picked
+                        # up" (``intake_stall.work_in_flight``), a follower sends it as ``processed`` in its room fact.
+                        _ct_done = getattr(self.mbs[next_mb_id], "forward_iter", None)
+                        if isinstance(_ct_done, int):
+                            self._pp_last_processed_ct = max(
+                                int(getattr(self, "_pp_last_processed_ct", -1)), _ct_done
+                            )
                         # #1225: the batch has DELIVERED, so it is no longer
                         # owed and must leave the register in the same step.
                         # A delivered batch left here would be retracted a
@@ -5851,6 +6202,23 @@ class SchedulerPPMixin:
                             )
                         if _pov.p_host_overlap_on():
                             _pov.note_proxy_send(self, self.send_proxy_work)
+                    else:
+                        # FIXES Nr. 45: no batch but a void statement: the next stage waits for a frame in this slot --
+                        # the void frame is that frame (no tensors, the ordinary stamp).
+                        _pp_void_pass.send_owed_frame(
+                            self,
+                            mb_id,
+                            lambda _frame, _mb: setattr(
+                                self,
+                                "send_proxy_work",
+                                self._pp_send_dict_to_next_stage(
+                                    _frame,
+                                    async_send=True,
+                                    msg_type="proxy",
+                                    stamp=self._pp_proxy_stamp(_mb, None),
+                                ),
+                            ),
+                        )
                 elif cur_batch and _pov.p_host_overlap_on():
                     # P-HOST-OVERLAP (pdflip_p_overlap.py, item 2): THE LAST RANK
                     # FENCES ITS SCHEDULE STREAM ON THIS FORWARD, device-side,
@@ -5873,7 +6241,17 @@ class SchedulerPPMixin:
                 # the torch Work). Without this line the frame kept it until the NEXT forward,
                 # i.e. across a whole sleep served at the top of the next pass.
                 result = None
-                self.pp_outputs = next_pp_outputs
+                # S69 OUTPUT-RELAY-NOW: a non-last rank forwards the output it received THIS pass here, after its
+                # proxy send (wire order unchanged) and before the chain flush, instead of in the next pass's
+                # output commit behind the next launch (rc16 12:27:51: 1909 ms relay lag). Then nothing is kept
+                # for the next exchange to forward. Off (last rank, gapped, XPU, async depth, switch 0): as before.
+                if self._pp_relay_output_now(next_pp_outputs):
+                    self.pp_outputs = None
+                else:
+                    self.pp_outputs = next_pp_outputs
+                if self.pp_group.is_last_rank:
+                    # FIXES Nr. 45: the last stage owes nobody a frame (and sends no output for a slot without a batch)
+                    _pp_void_pass.take_out(self)
 
                 # #788: flush THIS pass's request-chain send only after
                 # everything else this rank owed its peers this iteration is
@@ -6448,6 +6826,13 @@ class SchedulerPPMixin:
         # Nothing here blocks: see `_pdflip_vote_pass_hook`.
         self._pdflip_vote_pass_hook(recv_reqs)
         _pp_seg(self, "in.vote_hook")
+        # PR (pdflip/pp_room_vote.py): followers send their payable room to PP0,
+        # PP0 forms R_m for this pass (stamped on list m below). Non-blocking on
+        # both ends, no collective (#1268's rule).
+        self._pdflip_pp_room_pass_hook()
+        # PRIORITY LANES 1008 (L3, pdflip/lanes_p.py): PP0 applies the newest lane floor at the top of THIS pass and stamps
+        # it on list m below; nothing without an RPC.
+        self._pdflip_lane_floor_pass_hook()
 
         # #631 REQ-TRACE (bounded): the check-2 wedge's open question is
         # where a relayed request dies between the consumed chain hop and
@@ -6471,7 +6856,7 @@ class SchedulerPPMixin:
                         getattr(getattr(self, "ps", None), "pp_rank", "?"),
                         len(_traced),
                         [type(r).__name__ for r in _traced][:4],
-                        [str(getattr(r, "rid", "?"))[:8] for r in _traced][:4],
+                        [str(getattr(r, "rid", "?")) for r in _traced][:4],
                     )
                 except Exception:  # noqa: BLE001
                     pass
@@ -6567,6 +6952,23 @@ class SchedulerPPMixin:
             _dgreen = getattr(self, "_dual_green", None)
             if _dgreen is not None and self.pp_group.is_first_rank:
                 _wire_reqs, _ = _dgreen.pp0_stamp(_wire_reqs)
+                # K14: PP0's group verdict on each forwarded abort (does a
+                # frame it sent name the rid?) rides the AbortReq itself --
+                # stamped here, before the send and before PP0 applies it.
+                if any(type(r).__name__ == "AbortReq" for r in (_wire_reqs or ())):
+                    from flliper.srt.pdflip import pp_abort as _pp_abort_k14
+
+                    _wire_reqs = _pp_abort_k14.pp0_stamp_aborts(self, _wire_reqs)
+            # PR (pdflip/pp_room_vote.py): R_m rides list m; nothing without one.
+            if self.pp_group.is_first_rank and self.__dict__.get("_pdflip_pr_verdict") is not None:
+                from flliper.srt.pdflip import pp_room_vote as _pr
+
+                _wire_reqs = _pr.stamp_cap(_wire_reqs, self._pdflip_pr_verdict)
+            # PRIORITY LANES 1008 (L3): the lane floor rides list m beside R_m; nothing without one.
+            if self.pp_group.is_first_rank and self.__dict__.get("_pdflip_lane_stamp") is not None:
+                from flliper.srt.pdflip import pp_room_vote as _pr
+
+                _wire_reqs = _pr.stamp_lane_floor(_wire_reqs, self._pdflip_lane_stamp)
             try:  # #1460: when did PP0 put a Weg-2 control request on the chain?
                 _ctrl = [type(r).__name__ for r in (_wire_reqs or ())
                          if type(r).__name__ in ("FlushCacheReqInput", "ReleaseMemoryOccupationReqInput",
@@ -6599,6 +7001,21 @@ class SchedulerPPMixin:
         # a request, and `process_input_requests` has no handler for it.
         recv_reqs = self._pdflip_vote_after_forward(recv_reqs)
         _pp_seg(self, "in.vote_after")
+        # PR (pdflip/pp_room_vote.py): a follower takes R_m off list m after
+        # relaying it and applies it in THIS pass, as PP0 does (None: no cap).
+        if not self.pp_group.is_first_rank and int(getattr(self.ps, "pp_size", 1) or 1) > 1:
+            from flliper.srt.pdflip import pp_room_vote as _pr
+
+            recv_reqs, _pr_cap = _pr.absorb_cap(recv_reqs)
+            _pr_tree = self.__dict__.get("tree_cache")
+            if _pr_tree is not None:
+                _pr.apply_cap(_pr_tree, _pr_cap)
+            # PRIORITY LANES 1008 (L3): the lane floor off list m, applied in THIS pass as PP0 applied it.
+            recv_reqs, _lane_stamp = _pr.absorb_lane_floor(recv_reqs)
+            if _lane_stamp is not None:
+                from flliper.srt.pdflip import lanes_p as _lanes_p
+
+                _lanes_p.apply_follower(self, _lane_stamp)
         # z30j: a follower applies PP0's flush verdicts (already forwarded
         # onward above) to the flushes it parked, before this pass's dispatch.
         if not self.pp_group.is_first_rank:
@@ -6639,6 +7056,100 @@ class SchedulerPPMixin:
     # ------------------------------------------------------------------
     # #1268 fix 1c: the idle vote travels home on the ring lap
     # ------------------------------------------------------------------
+
+    def _pdflip_lane_floor_pass_hook(self: Scheduler) -> None:
+        """PRIORITY LANES 1008 (L3): PP0's step of the lane-floor vote -- take the newest ``/pdflip/lane_floor`` value, apply
+        it in this pass and set the stamp for list m (``pdflip/lanes_p.pp0_pass``).  A follower does nothing here: it applies
+        the stamp it takes off list m.  No state (switch off / no RPC yet): nothing."""
+        if int(getattr(self.ps, "pp_size", 1) or 1) <= 1 or not self.pp_group.is_first_rank:
+            return
+        if self.__dict__.get("_pdflip_lane_p") is None:
+            return
+        from flliper.srt.pdflip import lanes_p as _lanes_p
+
+        _lanes_p.pp0_pass(self)
+
+    def _pdflip_pp_room_pass_hook(self: Scheduler) -> None:
+        """PR: one non-blocking step of the PP room vote (pdflip/pp_room_vote.py)."""
+        if int(getattr(self.ps, "pp_size", 1) or 1) <= 1 or not self._pdflip_vote_is_wire_rank():
+            return
+        from flliper.srt.managers.pdflip_told_fallback import GlooAckChannel, _world_ranks
+        from flliper.srt.pdflip import pp_room_vote as _pr
+        from flliper.srt.pdflip.pp_slot_fidelity import FLOOR_LOCAL_PP_ATTR
+
+        channel = self.__dict__.get("_pdflip_pr_channel")
+        if channel is None:
+            channel = self._pdflip_pr_channel = GlooAckChannel(
+                self.world_group.cpu_group, int(self.ps.pp_rank), _world_ranks(self),
+                tag=_pr.PDFLIP_ROOM_TAG, label="pp-room",
+            )
+        tree = self.tree_cache
+        local_floor = bool(getattr(tree, FLOOR_LOCAL_PP_ATTR, False))
+        if self.pp_group.is_first_rank:
+            from flliper.srt.mem_cache.common import fundable_extend_tokens
+
+            book = self.__dict__.get("_pdflip_pr_book")
+            if book is None:
+                book = self._pdflip_pr_book = _pr.RoomBook()
+            book.begin_pass()
+            book.note_batches(self.__dict__.get("mbs") or ())
+            verdict = None
+            own_only = None
+            _have_facts = book.absorb(channel.harvest()) or book.facts
+            # fix 43 / review blocker 1: PP0 may size a pass on its OWN walk, unstamped, only where the followers execute
+            # its row (pp_row_carrier_present's law). Carrierless (NF group P: '#631 ROW AUTHORITY DISABLED') PP1/PP2 plan
+            # their chunk width from their own pool and see no cap: a cap on PP0 alone is a W27/#1233 width divergence
+            # built into the default path, exactly under pressure.
+            _own_walk = False
+            if local_floor and _pr.own_walk_enabled():
+                from flliper.srt.pdflip import prefill_oom_retreat as _oom_retreat
+
+                _own_walk = _oom_retreat.followers_execute_row(self)
+            if _have_facts or _own_walk:
+                from flliper.srt.pdflip import lanes_p as _lanes_p
+
+                _lf, _le = _lanes_p.echo(self)
+                own = _pr.follower_fact(
+                    tree=tree, allocator=self.token_to_kv_pool_allocator, rank=0,
+                    executed=int(self.forward_ct), local_floor=local_floor,
+                    lane_floor=_lf, lane_epoch=_le,
+                    processed=int(getattr(self, "_pp_last_processed_ct", -1)),
+                )
+                if _have_facts:
+                    verdict = book.cap(own.room)
+                if verdict is None and _own_walk:
+                    # fix 43 (PREFILL-OOM): PP0 sizes the pass on its OWN walk when no follower fact is fresh. It
+                    # used to publish nothing then, and fundable/rem_total read the reported evictable count.
+                    # Local only, never stamped on list m: a follower's cap stays what the vote made it.
+                    own_only = int(own.room)
+            # R_m for THIS pass: applied here and stamped on list m (below)
+            self._pdflip_pr_verdict = verdict
+            _pr.set_cap(tree, None)
+            if verdict is not None:
+                _pr.note_binding(verdict, fundable_extend_tokens(tree), book)
+                _pr.set_cap(tree, verdict.cap)
+            elif own_only is not None:
+                _pr.note_own_only(tree, own_only, book, fundable_extend_tokens(tree))
+                _pr.set_cap(tree, own_only)
+            return
+        if not local_floor:
+            return
+        sender = self.__dict__.get("_pdflip_pr_sender")
+        if sender is None:
+            sender = self._pdflip_pr_sender = _pr.FollowerSender()
+        now = time.monotonic()
+        from flliper.srt.pdflip import lanes_p as _lanes_p
+
+        _lf, _le = _lanes_p.echo(self)
+        fact = _pr.follower_fact(
+            tree=tree, allocator=self.token_to_kv_pool_allocator, rank=int(self.ps.pp_rank),
+            executed=int(self.forward_ct), local_floor=local_floor,
+            lane_floor=_lf, lane_epoch=_le,
+            processed=int(getattr(self, "_pp_last_processed_ct", -1)),
+        )
+        sender.offer(fact, now)
+        sender.flush(channel, now)
+        channel.pump()  # K20: an idle follower's heartbeat keeps PP0's standing receive from reaching gloo's timeout
 
     def _pdflip_vote_dp_offset(self: Scheduler) -> int:
         return self.ps.attn_dp_rank * self.ps.attn_cp_size * self.ps.attn_tp_size
@@ -6682,6 +7193,7 @@ class SchedulerPPMixin:
             return
         for req in recv_reqs:
             if isinstance(req, PdFlipIdleVoteReq):
+                note_hop_work(req)   # S9: before the slot, so the housekeeping round is not counted
                 self._pdflip_vote_attach_own_slot(req)
 
     def _pdflip_vote_attach_own_slot(self: Scheduler, vote: PdFlipIdleVoteReq) -> None:
@@ -6714,20 +7226,44 @@ class SchedulerPPMixin:
                 "run with tp_size > 1 on P (#1028, stated as a residual risk in "
                 "the fix-1b docstring and now enforced)."
             )
-        if getattr(self, "enable_hicache_storage", False):
-            try:
-                self._drain_prefetch_progress()
-            except Exception as exc:  # noqa: BLE001 - a collection may not kill the vote
-                logger.warning(
-                    "#1272 orphan collection before the idle slot raised %r; the "
-                    "slot is attached on the uncollected state (which votes "
-                    "not-idle and names its blocker, rather than sleeping)",
-                    exc,
-                )
         rank = int(self.ps.pp_rank)
+        # #791C stays its own: it needs PP0's idle slot on this vote -- a
+        # verdict, not housekeeping. Before the round, so the round retires
+        # what the release queued.
         pdflip_791c_release_on_idle_vote(self, vote)
-        pdflip_loadback_drain_on_idle_vote(self)
-        pdflip_writethrough_drain_on_idle_vote(self)
+        # NF-FOLLOWER-ROUND 1014: under the row authority the vote runs the ONE
+        # housekeeping round (the same one every frameless cycle runs; the #1272
+        # orphan collector is its prefetch drain). A refusal of the round (attn
+        # world > 1) is a named stop, not a vote on the uncollected state.
+        _round_ran = False
+        try:
+            _round_ran = pdflip_follower_round(self, site="vote")
+        except FollowerRoundRefused:
+            raise
+        except Exception as exc:  # noqa: BLE001 - housekeeping may not kill the vote
+            _round_ran = True
+            logger.warning(
+                "NF-FOLLOWER-ROUND at the #1268 vote raised %r; the slot is attached "
+                "on the undrained state (which votes not-idle and names its blocker)",
+                exc,
+            )
+        if not _round_ran:
+            # e7cfda7fbe, unchanged: no row authority (or the switch is 0).
+            if getattr(self, "enable_hicache_storage", False):
+                try:
+                    self._drain_prefetch_progress()
+                except Exception as exc:  # noqa: BLE001 - a collection may not kill the vote
+                    logger.warning(
+                        "#1272 orphan collection before the idle slot raised %r; the "
+                        "slot is attached on the uncollected state (which votes "
+                        "not-idle and names its blocker, rather than sleeping)",
+                        exc,
+                    )
+            pdflip_loadback_drain_on_idle_vote(self)
+            pdflip_writethrough_drain_on_idle_vote(self)
+            # NF-W3-DRAIN 1014: after the write-through drain -- its acks issue the
+            # #106S sidecar backups this one retires once the store acked them.
+            pdflip_backup_ack_drain_on_idle_vote(self)
         if attach_slot(vote, rank, self.is_fully_idle(), ", ".join(self.idle_blockers()) or "none"):
             log_verdict(vote, rank)
 
@@ -6758,6 +7294,9 @@ class SchedulerPPMixin:
         self._pdflip_vote_witness = PdFlipLapWitness(
             epoch=vote.epoch, stamped_at=lap_clock()
         )
+        # S9: the lap starts its first hop now; each follower adds its own
+        # publish work since the previous hop (note_hop_work).
+        vote.hop_at = self._pdflip_vote_witness.stamped_at
         if getattr(self, "pdflip_dormant", False):
             self._pdflip_vote_witness.spoil(entrypoint_taint(dormant=True, idle=True))
         self._pdflip_vote_attach_own_slot(vote)
@@ -6798,7 +7337,8 @@ class SchedulerPPMixin:
             return
         now = lap_clock()
         why = witness.taint or expiry_reason(
-            witness, now=now, ttl_s=envs.FLLIPER_PDFLIP_IDLE_VOTE_TTL_S.get()
+            witness, now=now, ttl_s=envs.FLLIPER_PDFLIP_IDLE_VOTE_TTL_S.get(),
+            peer_work_s=float(getattr(held, "peer_work_s", 0.0) or 0.0),
         )
         if why:
             log_stale_drop(held, witness, why, where="pass-top", now=now)
@@ -7845,6 +8385,8 @@ class SchedulerPPMixin:
         self.send_req_work = []
         self.send_proxy_work = []
         self.send_output_work = []
+        # S69: no early-posted output relay is pending a late filing across a cutover.
+        self._pp_relay_posted = False
         self.launch_event = None
 
         # #791 PP ADMISSION UNIFORMITY. Per-pass scratch, filled and drained
@@ -8382,7 +8924,7 @@ class SchedulerPPMixin:
         return max(1, int(getattr(self.ps, "pp_size", 1) or 1))
 
     @_1463_timed("_1475_post_send_ms")  # #1475
-    def _pp_post_send(self: Scheduler, work: List[P2PWork]) -> None:
+    def _pp_post_send(self: Scheduler, work: List[P2PWork], lap_offset: int = 0) -> None:
         """Post-and-forget: take the send off the pass path entirely.
 
         #1015e. THE JOIN IS THE CYCLE, NOT THE ARC. Three boots removed or
@@ -8419,7 +8961,9 @@ class SchedulerPPMixin:
         """
         if not work:
             return
-        lap = int(getattr(self, "_pp_send_lap", 0))
+        # S69: ``lap_offset=1`` files a send that was POSTED one pass early (OUTPUT-RELAY-NOW) under the lap the
+        # old relay would have filed the same message in, so its join lap -- the #1015e cycle point -- is unchanged.
+        lap = int(getattr(self, "_pp_send_lap", 0)) + int(lap_offset)
         pending = getattr(self, "_pp_pending_sends", None)
         if pending is None:
             pending = self._pp_pending_sends = {}
@@ -8428,6 +8972,69 @@ class SchedulerPPMixin:
         # joined inline; the handles now live in `pending`, not in the caller.
         work.clear()
         self._pp_drain_due_sends()
+
+    def _pp_retire_device_sends_at_sleep(self: Scheduler, releasable=None) -> Tuple[int, int, int]:
+        """S95b (rc22 NF P, boot 1020_094747): at the group's sleep, the DEVICE frames this rank sent and still
+        references go -- after a device-side ``Work.wait()``, the primitive ``bound_proxy_lead`` fences with.
+
+        Two holders keep the sent hidden/residual frames alive past the last pass: the lap-late join book
+        (``_pp_pending_sends``, joined ``_pp_send_join_lag()`` laps after the post -- the passes that would join
+        them never come once the group sleeps) and the P-overlap lead deque (``_pdflip_proxy_lead``, the newest
+        frame always stays). Measured: PP0/PP1 ``untagged_live`` 754/721 MiB at sleep 2 after full 16384-token
+        chunks (two frames of 16384 x 5120 x 2 B x 2 tensors) against 106-150 MiB at a sleep after short chunks
+        (``PDFLIP-SLEEP-HOLDER ... P2PWork.payload <- list <- deque``), sampled into the group-P dormant record
+        and priced against D's expert residency by its MAX.
+
+        What goes: only works whose payload is a CUDA tensor (the device group's halves). Host halves (gloo
+        metadata) stay in the book for the lap-late join -- dropping a gloo handle unjoined frees memory the
+        transport still reads (corpse A, ``_pp_post_send``). Rank-local by construction: no collective, no
+        verdict another rank reads; every rank runs it at the same sleep RPC, unconditionally. The sends are
+        matched -- the group sleeps only after its drain, every frame was received by the stage that consumed it.
+        Returns (frames released, bytes released, host works kept). ``releasable`` (tests): which works go."""
+        if releasable is None:
+            def releasable(w):
+                return getattr(w, "work", None) is not None and bool(getattr(getattr(w, "payload", None), "is_cuda", False))
+        released: Dict[int, object] = {}
+
+        def _retire(w) -> None:
+            if id(w) not in released:
+                w.work.wait()
+                released[id(w)] = w
+
+        lead = getattr(self, "_pdflip_proxy_lead", None)
+        if lead:
+            for frame in list(lead):
+                for w in frame:
+                    if releasable(w):
+                        _retire(w)
+            lead.clear()
+        kept = 0
+        pending = getattr(self, "_pp_pending_sends", None)
+        if pending:
+            for lap in list(pending):
+                lists = pending[lap]
+                for lst in lists:
+                    keep = []
+                    for w in lst:
+                        if releasable(w):
+                            _retire(w)
+                        else:
+                            keep.append(w)
+                    lst[:] = keep
+                    kept += len(keep)
+                lists[:] = [lst for lst in lists if lst]
+                if not lists:
+                    del pending[lap]
+        nbytes = 0
+        for w in released.values():
+            t = getattr(w, "payload", None)
+            try:
+                nbytes += int(t.numel()) * int(t.element_size())
+            except Exception:  # noqa: BLE001 -- a payload without a size counts 0
+                pass
+        frames = len(released)
+        released.clear()
+        return frames, nbytes, kept
 
     def _pp_drain_due_sends(self: Scheduler) -> None:
         """Join sends posted at least one full slot cycle ago.
@@ -8593,7 +9200,14 @@ class SchedulerPPMixin:
         pending_output_work = self.send_output_work
         gapped = getattr(self, "_pp_gapped_wire", False)
         if not gapped:
-            self._pp_commit_comm_work(work=pending_output_work)
+            if getattr(self, "_pp_relay_posted", False):
+                # S69 OUTPUT-RELAY-NOW: the forward in this list was posted at the end of the LAST pass, one pass
+                # before the old relay posted the same message here. Filed one lap later, it is joined at the old
+                # lap: the post moves, the join does not (#1015e: the join is the cycle).
+                self._pp_relay_posted = False
+                self._pp_post_send(pending_output_work, lap_offset=1)
+            else:
+                self._pp_commit_comm_work(work=pending_output_work)
         (
             next_pp_outputs,
             next_batch_result,
@@ -9296,7 +9910,7 @@ class SchedulerPPMixin:
             occupied = [(-1, ("<unreadable>",))]
         occ_txt = (
             ", ".join(
-                f"slot{_s}=[{','.join(r[:8] for r in _r) or 'no-reqs'}]"
+                f"slot{_s}=[{','.join(_r) or 'no-reqs'}]"
                 for _s, _r in occupied
             )
             or "NONE OCCUPIED"
@@ -9308,14 +9922,14 @@ class SchedulerPPMixin:
             for _rid in _rids[:4]:
                 try:
                     throttles.append(
-                        f"{_rid[:8]}(unresolved_rounds="
+                        f"{_rid}(unresolved_rounds="
                         f"{guard.unresolved_rounds(_rid) if guard else '?'},"
                         f"terminator_spent="
                         f"{guard.terminator_spent(_rid) if guard else '?'},"
                         f"offer_streak={guard.offer_streak(_rid) if guard else '?'})"
                     )
                 except Exception:  # noqa: BLE001
-                    throttles.append(f"{_rid[:8]}(<unreadable>)")
+                    throttles.append(f"{_rid}(<unreadable>)")
         thr_txt = "; ".join(throttles) or "no rid held"
 
         # #1073c: WHY THE ARM WAS TAKEN AT ALL. Boot 1077 printed "NONE
@@ -9346,30 +9960,30 @@ class SchedulerPPMixin:
         except Exception:  # noqa: BLE001
             _proxy = None
         why = (
-            f"chunked_req={'set(' + str(getattr(_chunked, 'rid', '?'))[:8] + ')' if _chunked is not None else 'None'}, "
+            f"chunked_req={'set(' + str(getattr(_chunked, 'rid', '?')) + ')' if _chunked is not None else 'None'}, "
             f"any_slot_occupied={bool(occupied)}, proxy_signal={_proxy}"
         )
         # CONTEXT, not a candidate: #1079 deleted this term from the idle
         # test, so a queued rid can no longer hold the rank on this arm.
         context = (
             f"waiting_queue={len(_wq)}"
-            f"{'[' + ','.join(r[:8] for r in _wq_rids[:4]) + ']' if _wq_rids else ''}"
+            f"{'[' + ','.join(_wq_rids[:4]) + ']' if _wq_rids else ''}"
         )
         # The throttles for the QUEUED rids too -- with an empty ring those are
         # the only rids in play, and the earlier version reported none of them.
         for _rid in _wq_rids[:4]:
             try:
                 throttles.append(
-                    f"queued:{_rid[:8]}(unresolved_rounds="
+                    f"queued:{_rid}(unresolved_rounds="
                     f"{guard.unresolved_rounds(_rid) if guard else '?'},"
                     f"terminator_spent={guard.terminator_spent(_rid) if guard else '?'},"
                     f"offer_streak={guard.offer_streak(_rid) if guard else '?'})"
                 )
             except Exception:  # noqa: BLE001
-                throttles.append(f"queued:{_rid[:8]}(<unreadable>)")
+                throttles.append(f"queued:{_rid}(<unreadable>)")
         thr_txt = "; ".join(throttles) or "no rid held and none queued"
 
-        held = tuple(r[:8] for _s, _r in occupied for r in _r)[:4]
+        held = tuple(r for _s, _r in occupied for r in _r)[:4]
         counters = getattr(self, "pp_flip_counters", None)
         receiver = getattr(self, "pp_chain_receiver", None)
         waited = time.monotonic() - float(since.get(mb_id, time.monotonic()))
@@ -9667,18 +10281,19 @@ class SchedulerPPMixin:
                     _peek = pp_admission_decision_from_wire(
                         {_ADMISSION_DECISION_PAYLOAD_KEY: _row_raw}
                     )
-                    _known = {
-                        getattr(r, "rid", None) for r in self.waiting_queue
-                    }
-                    _known.add(getattr(getattr(self, "chunked_req", None), "rid", None))
+                    # ROW-PROBE-TAILS (NF h16s 1016_150003 15:13:26, PP1 pdflip-6-94, #1180 death): the
+                    # probe enumerated its OWN four places (waiting queue, chunked_req, the slot's
+                    # chunked req, running batch) and missed the fifth, the END-ANCHOR tails
+                    # (fnFL2 H42 ``anchor_tails``): PP1 minted the 4-token tail of pdflip-6-94 at
+                    # slot 1 (ANCHOR-TAILS minted_rids=pdflip-6-94) exactly like PP0, PP0's slot-2
+                    # row re-added it -- and the probe called a rid this rank holds "not
+                    # locatable" until the lap cap. The shared enumeration (#946
+                    # ``pp_request_locations``: every place a request can live) is the one
+                    # source; the named slot's chunked req stays on top of it.
+                    _known = set(pp_request_locations(self))
                     _known.add(
                         getattr(pp_chunked_req_for_slot(self, mb_id), "rid", None)
                     )
-                    for _r in (
-                        getattr(getattr(self, "running_batch", None), "reqs", None)
-                        or ()
-                    ):
-                        _known.add(getattr(_r, "rid", None))
                     _missing = [
                         e.rid
                         for e in _peek.entries
@@ -9739,7 +10354,7 @@ class SchedulerPPMixin:
                             "left in the inbox (defer_told=%d).",
                             mb_id,
                             len(_told_missing),
-                            str(_told_missing[0])[:8],
+                            str(_told_missing[0]),
                             stats["defer_told"],
                         )
                     _missing = list(_missing) + list(_told_missing)
@@ -9775,7 +10390,8 @@ class SchedulerPPMixin:
                         _q695.log_told_overdue(self, _told_missing, _peek, mb_id)
                         raise PpRowDeferCapExceeded(
                             "#791T STORE-TOLD HOP OVERDUE: the frame's row admits "
-                            f"rid(s) {','.join(str(r)[:8] for r in _told_missing[:4])} "
+                            f"rid(s) {','.join(str(r) for r in _told_missing[:4])}"
+                            f"{' +%d more' % (len(_told_missing) - 4) if len(_told_missing) > 4 else ''} "
                             "whose PdFlipStoreTold never reached this rank within the "
                             "row-defer lap cap (the request is queued here, its "
                             "told is not) -- " + str(_verdict.message)
@@ -9802,7 +10418,7 @@ class SchedulerPPMixin:
                             "missing-set); scheduler-wide defer_rid=%d).",
                             mb_id,
                             len(_missing),
-                            str(_missing[0])[:8],
+                            str(_missing[0]),
                             _verdict.occurrence,
                             _verdict.cap,
                             _dr,
@@ -10864,6 +11480,12 @@ class SchedulerPPMixin:
             now = time.monotonic()
             if deadline is None:
                 deadline = now + _pp_proxy_readiness_budget_s()
+                if kind == "output":
+                    # S82 A1: the pass's COMMIT-PARK and this receive share ONE readiness budget -- the
+                    # receive takes only what the park left (a wedge is named after 30 s, not 60 s)
+                    _s82_dl = getattr(self, "_s82_receive_deadline", None)
+                    if _s82_dl is not None:
+                        deadline = min(deadline, float(_s82_dl))
             if now < deadline:
                 time.sleep(PROXY_READINESS_POLL_STEP_S)
                 continue
@@ -11094,6 +11716,12 @@ class SchedulerPPMixin:
         # entry SURVIVES THE WIRE; it does not show one is safe to compute
         # on.
         stamp = raw.pop("__stamp__", None) if isinstance(raw, dict) else None
+        # FIXES Nr. 45 PP-VOID-PASS: a VOID frame (the upstream stage discarded this pass) carries no hidden states. The
+        # statement is popped here (before anything maps over the dict); the identity check below (slot, epoch) judges the
+        # void frame like any frame, and only after it the statement is handed to the event loop
+        # (`_pp_void_pass.take_incoming`) and `None` is returned -- a void frame is only ever taken by `at_receive`, whose
+        # caller does not launch on it.
+        _void_stmt = _pp_void_pass.pop_from_frame(raw)
         # #968/#1035 POPPED UNDER THE SAME LAW AS THE STAMP ABOVE, and for the
         # identical reason: what stays in `raw` becomes a PPProxyTensors and is
         # mapped over by the slice path (`v[key]` for EVERY entry) and by the
@@ -11224,6 +11852,10 @@ class SchedulerPPMixin:
         # identity across a cutover.
         epoch = pp_flip_epoch_of(self)
         if stamp is None or mb_id < 0 or pp_proxy_stamp_names_pass(stamp, mb_id, epoch):
+            if _void_stmt is not None:
+                self._pp_last_recv_admission_decision = None
+                _pp_void_pass.note_incoming(self, _void_stmt)
+                return None
             # #791c: THE STAMP IS RIGHT AND THE MESSAGE IS STILL WRONG. Every
             # identity above answers "which PASS is this from"; none answers
             # "which BATCH is it of". A retraction this rank performed at the
@@ -11469,6 +12101,9 @@ class SchedulerPPMixin:
                         "#1463 PASS-TAIL pp_rank=%s bs=%d finished=%d recv_ms=%.0f commit_ms=%.0f process_ms=%.0f t=%.3f",
                         getattr(getattr(self, "ps", None), "pp_rank", "?"), len(_reqs), _fin,
                         _recv, _commit, _proc, time.time())
+                # 1447: keep what PASS-STALL (next slot) still has to subtract
+                self._1466_recv_keep = float(getattr(self, "_1466_recv_keep", 0.0) or 0.0) + _recv
+                self._1466_commit_keep = float(getattr(self, "_1466_commit_keep", 0.0) or 0.0) + _commit
                 self._1463_recv_ms = 0.0
                 self._1463_commit_ms = 0.0
             except Exception:  # noqa: BLE001
@@ -11524,6 +12159,47 @@ class SchedulerPPMixin:
                         msg_type="output",
                     )
         return send_output_work
+
+    def _pp_relay_output_now(self: Scheduler, outputs: Optional[PPProxyTensors]) -> bool:
+        """S69 OUTPUT-RELAY-NOW: forward the output this pass received, now.
+
+        Called once per pass from ``_event_loop_pp_body``, after this pass's proxy send and before the chain
+        flush. True = this rank relays on receipt (``_pp_output_relay_now``): the caller then keeps NOTHING in
+        ``pp_outputs``, so the next pass's exchange (``if pp_outputs:``) forwards nothing and the message is sent
+        exactly once. False = the old one-pass relay; the caller keeps ``pp_outputs`` as before.
+
+        The send predicate is the old one (``if pp_outputs:`` = "I received"), the payload is the same dict, and
+        the wire order is the same: the old relay posted output(k) in pass i+1's commit, i.e. after proxy(k-1)
+        (end of pass i) and before proxy(k) (end of pass i+1); this posts it at the end of pass i, after
+        proxy(k-1). Only the time moves: the downstream gets it at this rank's receipt, not after this rank's
+        next launch. The handles go to ``send_output_work`` (seen by the presence check, the reaper and the
+        cutover instrument exactly like the old relay's), and ``_pp_relay_posted`` tells the next commit to file
+        them one lap later, so the join lap is the old one.
+        """
+        if not _pp_output_relay_now(self):
+            return False
+        if outputs:
+            with torch.profiler.record_function("send_res_dict_to_next_stage"):
+                work = self._pp_send_dict_to_next_stage(
+                    outputs.tensors,
+                    async_send=True,
+                    msg_type="output",
+                )
+            if work:
+                if getattr(self, "send_output_work", None) is None:
+                    self.send_output_work = []
+                self.send_output_work.extend(work)
+                self._pp_relay_posted = True
+            n = int(getattr(self, "_pp_relay_now_n", 0)) + 1
+            self._pp_relay_now_n = n
+            if n == 1:
+                logger.info(
+                    "S69 OUTPUT-RELAY-NOW pp_rank=%s: the received output is forwarded in the pass that received "
+                    "it (end of pass, after the proxy send); its join is filed one lap later = the old join lap. "
+                    "FLLIPER_PP_OUTPUT_RELAY_NOW=0 = the one-pass relay.",
+                    getattr(getattr(self, "ps", None), "pp_rank", "?"),
+                )
+        return True
 
     def _pp_send_recv_and_preprocess_output_tensors(
         self: Scheduler,

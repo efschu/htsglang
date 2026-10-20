@@ -303,12 +303,20 @@ def census_o1_evict_armed() -> bool:
         if raw:
             _o1_evict = raw == "1"
         else:
-            # unset or blank: the published form's profile default (27B
-            # release fixes, pdflip/form.py ModelProfile.d_release_fixes:
-            # qwen27b on since 30.09., nextflash off; no form: off).
+            # SCHALTER-HALBPORT 1002: unset/blank takes the published form's
+            # registry row (pdflip/form.py ModelProfile.census_o1_evict:
+            # nextflash on; qwen27b states nothing -> off; no form: off).
             from flliper.srt.pdflip.form import profile_switch_default
 
             _o1_evict = bool(profile_switch_default(ENV_O1_EVICT, False))
+        if _o1_evict:
+            # the switch reached the rank (once per process; the cap line below
+            # comes only when a ledger reaches its cap). Off: no line.
+            import logging
+
+            logging.getLogger(__name__).info(
+                "KR CENSUS-O1-EVICT armed: a census ledger at its cap evicts its oldest "
+                "key in O(1) (%s=%s)", ENV_O1_EVICT, raw or "profile")
     return _o1_evict
 
 

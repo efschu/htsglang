@@ -88,7 +88,7 @@ def test_pdflip_15_52_a_short_arriving_while_p_is_awake_gets_a_p_leg1(caplog):
     assert not p.skip_leg1 and not p.short_kept and not p.d_direct, \
         "P is awake: a normal leg 1 on P, never kept for a D prefill"
     assert not any("SHORT-BEHIND-P" in m for m in caplog.messages)
-    assert any("PDFLIP SHORT-TO-P rid=" in m and "joins P's batch" in m for m in caplog.messages)
+    assert any("PDFLIP SHORT-IN-P-PHASE rid=" in m and "joins P's batch" in m for m in caplog.messages)
 
 
 def test_a_short_arriving_while_d_flips_to_p_joins_ps_batch():
@@ -109,10 +109,10 @@ def test_the_d_phase_keep_is_unchanged():
 
 # ---- (2) queued for D at the D->P flip -> P's batch -----------------------------
 
-def _pending(rid, age_s, **kw):
+def _pending(rid, age_s, est_uncached=200, **kw):
     loop = asyncio.new_event_loop()
     return Pending(rid=rid, path="/generate", payload={}, text="x", t_arrive=time.time() - age_s,
-                   fut=loop.create_future(), est_prompt=1000, est_uncached=200, **kw)
+                   fut=loop.create_future(), est_prompt=1000, est_uncached=est_uncached, **kw)
 
 
 def test_prefill_queued_for_d_at_the_d_to_p_flip_goes_to_p(caplog):
@@ -138,18 +138,34 @@ def test_prefill_queued_for_d_at_the_d_to_p_flip_goes_to_p(caplog):
 
 
 def test_the_p_drain_sweeps_before_it_dispatches_and_gives_a_kept_short_its_leg1():
-    # 27B port: the drain body is the nested `_p_drain_pass` (shared with the
-    # DUAL-TP3PP3 pump). The sweep sits on the FLIP form's call only; the dual
-    # pump (`self._dual_pump(_p_drain_pass)` + continue) never reaches it.
     src = inspect.getsource(F.Front)
-    call = src.index("self._p_batch_takes_d_prefill()\n                await _p_drain_pass()")
-    assert src.index("self._dual_pump(_p_drain_pass)") < call
-    i = src.index("async def _p_drain_pass() -> int:")
+    i = src.index("# awake == P: prefill the backlog until empty")
     blk = src[i:i + 20000]
-    a = blk.index('if (getattr(p, "short_kept", False) or p.skip_leg1) and not self.dual_layout:')
+    assert blk.index("self._p_batch_takes_d_prefill()") < blk.index("_p_drain_pool(")
+    a = blk.index('if getattr(p, "short_kept", False) or p.skip_leg1:')
     assert a < blk.index("async with sem:")
-    assert a < blk.index("if p.skip_leg1:  # DUAL-TP3PP3 only (27B port)")
     assert 'self._to_p_batch(p, "drain")' in blk[a:a + 300]
+
+
+# ---- (3) the cut-off ----------------------------------------------------------------
+
+def test_the_cut_off_is_the_begin_of_the_flip_to_d():
+    assert F.p_phase_arrival("P", "serving", None) is True
+    assert F.p_phase_arrival("D", "flipping", "P") is True
+    assert F.p_phase_arrival("P", "flipping", "D") is False, "the flip to D began: D's (no reverse flip)"
+    assert F.p_phase_arrival("D", "serving", None) is False
+    assert F.p_phase_arrival("D", "serving", "P") is False, "a stale flip_dst outside a flip"
+
+
+def test_27b_dual_pump_drains_through_the_shared_pass():
+    # 27B port 20.10. (user: the dual layout runs P and D in parallel, the ported flip
+    # scheduler never acts there): the DUAL-TP3PP3 pump still drains through the shared
+    # `_p_drain_pass`, and the flip form's P-batch sweep sits on the flip call only
+    src = inspect.getsource(F.Front)
+    assert "async def _p_drain_pass() -> int:" in src
+    assert "self._dual_pump(_p_drain_pass" in src  # the merged front may name the dual pass _p_drain_pass_dual
+    assert 'if (getattr(p, "short_kept", False) or p.skip_leg1) and not self.dual_layout:' in src
+    assert "if p.skip_leg1:  # DUAL-TP3PP3 only (27B port)" in src
 
 
 def test_27b_flip_names_its_destination_for_arrivals():
@@ -166,7 +182,7 @@ def test_27b_dual_layout_arrival_is_not_a_p_phase_arrival(caplog):
     f = _front("P")
     f.dual_layout = True
     _arrive(f)
-    assert not any("PDFLIP SHORT-TO-P rid=" in m for m in caplog.messages)
+    assert not any("PDFLIP SHORT-TO-P rid=" in m or "PDFLIP SHORT-IN-P-PHASE rid=" in m for m in caplog.messages)
 
 
 # ---- (3) the cut-off ----------------------------------------------------------------

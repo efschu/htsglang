@@ -74,6 +74,25 @@ def _node_has_state(node) -> bool:
 def pp0_admissible(scheduler, req, told: int) -> Optional[int]:
     """The prefix PP0's own tree can resume ``req`` from, capped at ``told``
     keys; None = the probe could not be asked (no verdict)."""
+    return _admissible(scheduler, req, told, aligned=False)
+
+
+def rank_resumable(scheduler, req, told: int) -> Optional[int]:
+    """W27-UNIFORM (NF e124d8f431, P 02.10. 22:37:12Z pdflip-58-576 and
+    23:05:11Z pdflip-6-77): the prefix THIS rank's admission -- the capped match
+    plus the #988 load-back -- reaches for ``req``, capped at ``told`` keys;
+    None = no verdict.
+
+    :func:`pp0_admissible` plus the load-back's own clamp: a host hit loads
+    back only up to the state anchor (``state_aligned_extent``, the
+    expression ``stamp_state_aligned_extent`` applies), so a host KV run whose
+    end carries no recurrent state stops the admission at the anchor below
+    it -- exactly where PP1/PP2 stopped (13184, the twin anchor of the
+    sibling) while PP0 loaded back to its told (16640 / 16896)."""
+    return _admissible(scheduler, req, told, aligned=True)
+
+
+def _admissible(scheduler, req, told: int, aligned: bool) -> Optional[int]:
     try:
         tree = getattr(scheduler, "tree_cache", None)
         match = getattr(tree, "match_prefix", None)
@@ -98,13 +117,23 @@ def pp0_admissible(scheduler, req, told: int) -> Optional[int]:
         depth = dev + host
         if depth <= 0:
             return 0
+        anchor = getattr(mr, "state_anchor_depth", None) if aligned else None
+        if aligned and host > 0 and isinstance(anchor, int):
+            # the load-back's own extent (#1040): KV beyond the deepest state
+            # anchor is not loaded back, the admission resumes at the anchor
+            from flliper.srt.managers.pp_admission_congruence import state_aligned_extent
+
+            extent, _raised = state_aligned_extent(
+                host, anchor, dev, getattr(mr, "key_match_depth", None)
+            )
+            return min(dev + int(extent), int(told))
         node = getattr(mr, "last_host_node", None) if host > 0 else getattr(mr, "last_device_node", None)
         if node is not None and not _node_has_state(node):
             return 0  # the #928 (a) refusal zeroes the whole match
         return min(int(depth), int(told))
     except Exception as exc:  # noqa: BLE001 - a probe never breaks publication
         logger.warning("#TF told-fidelity probe skipped for rid=%s: %r",
-                       str(getattr(req, "rid", "?"))[:12], exc)
+                       str(getattr(req, "rid", "?")), exc)
         return None
 
 
@@ -137,6 +166,48 @@ def pp0_verdict(scheduler, req, told: int, absolute: bool = True) -> tuple:
         "the Admit carries told=0 for EVERY rank (PF fallback: every read released, "
         "every stage prefills from 0) instead of PP0 admitting a different prefix than "
         "the followers adopt (rc12k27 b1: W27 start split 512 vs 16895)",
-        str(getattr(req, "rid", "?"))[:16], int(told), int(depth), int(own), n,
+        str(getattr(req, "rid", "?")), int(told), int(depth), int(own), n,
     )
+    _reprice_after_fallback(scheduler, req)
     return 0, own
+
+
+def _reprice_after_fallback(scheduler, req) -> Optional[str]:
+    """Fix 43 (PREFILL-OOM, NF 13.10. pdflip-587-1256): the front priced this request SHORT (uncached=165 of 148965) and
+    the fallback above turned it into a full prefill from 0 -- nothing re-priced it, so it walked chunk by chunk into the
+    pool's wall. Price it again HERE, against the room this pool can actually give (the intake verdict on the whole
+    uncached length, with PR's agreed room and the measured wall in the terms), and NAME the verdict: ``#TF REPRICE``.
+
+    Named and stamped only (``req._tf_reprice`` = the verdict): the answer 503 / re-route needs an un-admission or a relay
+    on the Admit's publication seam, which is not this function's; the admitted request's first retreat
+    (``pdflip/prefill_oom_retreat``) reads the same verdict on its REMAINING need and answers the stall at once instead of
+    after N passes. Never raises."""
+    try:
+        from flliper.srt.pdflip import p_intake as _pi
+        from flliper.srt.pdflip.intake_stall import intake_verdict
+
+        ids = getattr(req, "full_untruncated_fill_ids", None)
+        if ids is None or len(ids) == 0:
+            ids = getattr(req, "origin_input_ids", None)
+        tree = getattr(scheduler, "tree_cache", None)
+        terms = _pi.pool_terms(tree, getattr(tree, "token_to_kv_pool_allocator", None))
+        if ids is None or terms is None:
+            return None
+        free, evictable, inflight = terms
+        need = len(ids)
+        pool = int(getattr(scheduler, "max_total_num_tokens", 0) or 0)
+        v = intake_verdict(need_tokens=need, pool_tokens=pool, free_tokens=free,
+                           evictable_tokens=evictable, inflight=inflight)
+        try:
+            req._tf_reprice = v
+        except Exception:  # noqa: BLE001
+            pass
+        logger.warning(
+            "#TF REPRICE rid=%s need=%d (whole prompt, told=0) free=%d evictable_payable=%d pool=%d inflight=%s "
+            "-> %s (the front priced this request on its told prefix; after the fallback it is a full prefill)",
+            str(getattr(req, "rid", "?")), need, free, evictable, pool, bool(inflight), v,
+        )
+        return v
+    except Exception as exc:  # noqa: BLE001 - an instrument never breaks the verdict
+        logger.warning("#TF REPRICE skipped for rid=%s: %r", str(getattr(req, "rid", "?")), exc)
+        return None

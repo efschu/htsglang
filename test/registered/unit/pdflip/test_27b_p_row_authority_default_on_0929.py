@@ -21,14 +21,15 @@ def _form_env(profile):
 def test_rows():
     assert FM.PROFILES["qwen27b"].p_row_authority is True
     assert FM.PROFILE_SWITCH_DEFAULTS["qwen27b"][PR.ENV] is True
-    assert FM.PROFILES["nextflash"].p_row_authority is False        # NF unchanged
-    assert FM.PROFILE_SWITCH_DEFAULTS["nextflash"][PR.ENV] is False
+    # NF-RANG-AUDIT 1014 (Fix 1): nextflash on too -- test_pdflip_nf_row_authority_on_1014.py
+    assert FM.PROFILES["nextflash"].p_row_authority is True
+    assert FM.PROFILE_SWITCH_DEFAULTS["nextflash"][PR.ENV] is True
 
 
 @pytest.mark.parametrize("profile,explicit,want", [
     ("qwen27b", None, True),     # default ON on the 27B row
     ("qwen27b", "0", False),     # explicit off wins
-    ("nextflash", None, False),  # NF unchanged
+    ("nextflash", None, True),   # NF on since 14.10. (nf-rang-audit S5)
     (None, None, False),         # no form: off, unchanged
 ])
 def test_enabled_follows_the_row(profile, explicit, want):
@@ -41,7 +42,7 @@ def test_enabled_follows_the_row(profile, explicit, want):
 
 
 @pytest.mark.parametrize("profile,explicit,want", [
-    ("qwen27b", None, True), ("qwen27b", "0", False), ("nextflash", None, False), (None, None, False)])
+    ("qwen27b", None, True), ("qwen27b", "0", False), ("nextflash", None, True), (None, None, False)])
 def test_environ_entry_follows_the_row(monkeypatch, profile, explicit, want):
     from flliper.srt.environ import envs
 

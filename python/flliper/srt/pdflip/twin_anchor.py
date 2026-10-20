@@ -166,6 +166,31 @@ def status(rid: str, b: int) -> Optional[str]:
     return (_STATUS.get(str(rid)) or {}).get(int(b))
 
 
+def note_track_planned(rid: str, pos: int) -> None:
+    """S52 (NF rc14 19.10., P log ...1019_010742, pdflip-1-30): a TURN or FORK track the
+    source planned for itself is an anchor it writes anyway -- a twin that arrives AFTER
+    that step was planned (no ``twin_bounds`` then) resumes there all the same. Booked in
+    the same ledger (planned -> written at the insert, declined at a skip), so
+    :func:`deepest_track` sees it. Only where the twin anchor is armed (the switch-off
+    path books nothing, byte for byte)."""
+    if armed():
+        _set(str(rid), int(pos), "planned")
+
+
+def deepest_track(rid: str, lo: int, hi: int) -> Optional[int]:
+    """S52: the deepest anchor position ``p`` of ``rid`` with ``lo < p <= hi`` whose track
+    is planned or written (a declined one writes nothing), or None. ``hi`` is the twin
+    boundary ``B = floor_page(shared - 1)``: an anchor there or below is on the twin's
+    path; ``lo`` the source's start depth (an anchor at or below it is there already)."""
+    d = _STATUS.get(str(rid)) or {}
+    best = None
+    for p, st in d.items():
+        if st in ("planned", "written") and int(lo) < int(p) <= int(hi):
+            if best is None or int(p) > best:
+                best = int(p)
+    return best
+
+
 def forget(rid: str) -> None:
     _STATUS.pop(str(rid), None)
 

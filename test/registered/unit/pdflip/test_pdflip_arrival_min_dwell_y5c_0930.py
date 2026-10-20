@@ -27,6 +27,16 @@ from flliper.srt.managers.scheduler_components import weight_updater as _wu  # n
 from flliper.srt.pdflip import arrival_seat_rule as asr  # noqa: E402
 from flliper.srt.pdflip.front_state_ipc import OutstandingBook  # noqa: E402
 from flliper.srt.pdflip.park_stuck import ParkStuck  # noqa: E402
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _pbound_flip_now_off(monkeypatch):
+    """These tests pin the seat/KV verdict and the dwell holds for requests that
+    need P -- the rule PBOUND-FLIP-NOW (default on, 02.10.) replaces; they keep
+    covering it as the switch-off path."""
+    monkeypatch.setenv("FLLIPER_PDFLIP_PBOUND_FLIP_NOW", "0")
+
 
 # y5c, the six flip_now verdicts that parked pdflip-0-2:
 # (flip_now rid, epoch, PARK-RESUME of the phase or None, flip_now time, price_s

@@ -204,10 +204,14 @@ class TheLatchIsWIRED1361(CustomTestCase):
     def test_the_guard_loop_constructs_the_rate_latch(self):
         self.assertIn("host_ledger.RateLatch(", self._loop_src())
 
-    def test_it_is_fed_and_its_verdict_reaches_the_named_teardown(self):
+    def test_it_is_fed_and_its_verdict_is_a_warning_not_a_teardown(self):
+        # 12.10.2026 (NF W98 HOST-WARN, user rule 06.10.): the verdict used to
+        # reach `do_stop("W98 PdFlipHostRateLatched")`; it now reaches a WARNING.
         body = self._loop_src()
         self.assertIn("rate_latch.observe(", body)
-        self.assertIn('do_stop("W98 PdFlipHostRateLatched"', body)
+        self.assertNotIn('do_stop("W98 PdFlipHostRateLatched"', body)
+        self.assertIn("warn_only=True", body)
+        self.assertIn('logger.warning("%s", _line)', body)
         # ...and a GAP is reported but never torn down: the loop kept running,
         # it just could not look.
         self.assertIn("RATE-GAP", body)

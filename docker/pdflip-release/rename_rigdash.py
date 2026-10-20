@@ -19,6 +19,9 @@ Was es tut (und was nicht):
   * Inhaltlich GESPERRT bleiben `rigdash/kartenplan_data/*`: Boot-Aufzeichnungen, deren plan_id ein sha256 ueber den Inhalt ist
     (kartenplan.plan_id_ok); umbenannt faellt jede Aufzeichnung durch (gemessen: test_plan_id_wird_nachgerechnet rot). Sie sind
     Beleg-Daten wie die Evidenz-Dateien des Kits und wandern byte-gleich zurueck.
+  * Ebenfalls GESPERRT (F0-F): `rigdash/deploy/grafana/dashboards/*`. Die Tafel liest jede Metrikfamilie absichtlich unter dem alten UND dem neuen
+    Namen; die Umbenennung wuerde daraus (neu|neu) machen. Der Generator (`make_dashboard.py`) bekommt beide Namen aus `names.STEM_TOKENS` und
+    ist selbst ein Fixpunkt.
   * Kollisionen (zwei alte Woerter werden ein neues, `flliper` <- {`flliper`, `sglang`}) sind bei 20 Paketdateien Absicht (der Editor
     schreibt `flliper.server/1` und `sglang-Umgebung` nebeneinander). Freigegeben sind genau die Dateien in
     rename_rigdash_collision_ok.json; eine NEUE Kollisionsdatei bricht ab (Exit 3), bis sie gelesen und eingetragen ist.
@@ -47,7 +50,10 @@ DEFAULT_KIT = os.environ.get("RELEASE_KIT_TOOLS") or os.path.join(os.path.dirnam
 COLLISION_OK = os.path.join(HERE, "rename_rigdash_collision_ok.json")
 PKG_PREFIX = "tools/rig_dashboard"
 #: inhaltlich gesperrt (Pfade relativ zum Paketinhalt, fnmatch)
-LOCKED = ("rigdash/kartenplan_data/*",)
+LOCKED = ("rigdash/kartenplan_data/*",
+          # F0-F: the Grafana board reads each metric family under BOTH generations' names on purpose ({__name__=~"(old|new)_..."}); a rename run
+          # would turn that into (new|new) and the board would show a hole where the series of the boots before the rename lie
+          "rigdash/deploy/grafana/dashboards/*")
 SKIP_DIRS = {"__pycache__", ".git"}
 #: harte Reste: so etwas darf im umbenannten Paket (ausser den gesperrten Daten) nirgends mehr stehen
 RESIDUE = (

@@ -36,6 +36,16 @@ from flliper.srt.managers.scheduler_components import weight_updater as _wu  # n
 from flliper.srt.pdflip import arrival_seat_rule as asr  # noqa: E402
 from flliper.srt.pdflip import front as F  # noqa: E402
 from flliper.srt.pdflip import phase_policy  # noqa: E402
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _pbound_flip_now_off(monkeypatch):
+    """These tests pin the seat/KV verdict and the dwell holds for requests that
+    need P -- the rule PBOUND-FLIP-NOW (default on, 02.10.) replaces; they keep
+    covering it as the switch-off path."""
+    monkeypatch.setenv("FLLIPER_PDFLIP_PBOUND_FLIP_NOW", "0")
+
 
 # y3u 00:42:24: ladder 524288-392468=131820, stage free 131648, D clip 4096
 Y3U_READING = {"available": 100000, "evictable": 31648, "capacity": 524288,

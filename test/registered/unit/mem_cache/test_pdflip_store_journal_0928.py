@@ -234,6 +234,20 @@ class TestCrashOrder(_Env):
         self.assertIn(f"x0000{SHARED}", stems, "a landed page without its C line was lost")
         self.assertNotIn(f"y0000{SHARED}", stems, "an intent whose file never landed was indexed")
 
+    def test_a_torn_tail_with_nul_bytes_is_dropped_not_raised(self):
+        # NF y8t 11:27 (03.10.): the launcher died on os.lstat('...\x00...') -- "embedded
+        # null byte" -- replaying a journal whose last append the filesystem zero-filled.
+        recs, _ = SJ.parse_lines(b"R 1.0 4096 ok0000_K\nR 2.0 4096 to\x00\x00\x00\nC 3.0 0 \x00\x00\n")
+        self.assertEqual([r[3] for r in recs], ["ok0000_K"])
+        a = _ev(self.d)
+        w = _ev(self.d, tp=1, group="D")
+        _fill(w, self.d, [f"z0000{SHARED}"])
+        with open(w._journal.path, "ab") as f:
+            f.write(b"R 9.0 4096 z0001\x00\x00\x00\x00" + b"\x00" * 64)
+        self.reboot(201)
+        b = _ev(self.d)
+        self.assertIn(f"z0000{SHARED}", set(b._lru), "the records before the torn tail were lost")
+
     def test_enoent_strikes_the_entry_in_both_indexes(self):
         me = _ev(self.d)
         sib = _ev(self.d, group="P")

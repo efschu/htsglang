@@ -164,7 +164,61 @@ class QSAPagedHostPool(DeepSeekV4PagedHostPool):
 
     def load_to_device_per_layer(self, *args, **kwargs):
         QSAPagedHostPool._h106_tls.dir = "load"
+        hi = args[1] if len(args) > 1 else kwargs.get("host_indices")
+        from flliper.srt.pdflip import kv_durchlauf as _kv_dl
+
+        if hi is not None and _kv_dl.any_disk(hi):
+            return self._load_with_disk_pages(*args, **kwargs)
         return super().load_to_device_per_layer(*args, **kwargs)
+
+    def _load_with_disk_pages(self, device_pool, host_indices, device_indices, layer_id, io_backend):
+        """S36 KV-DURCHLAUF: the QSA index pages of KV DISK pages (the KV arena was full; the KV page is read
+        through from L3) have no row in this mirror -- their canonical QSA pages are read once per load (the held
+        L3 file, or the QSA arena / store through the backend) and each layer's block goes straight to the
+        device rows; the rest of the transfer takes the mirror path unchanged. A Form A worker never reads its
+        QSA rows (H106): nothing is transferred there."""
+        from flliper.srt.rank_role import this_rank_is_form_a_worker
+        from flliper.srt.pdflip import kv_durchlauf as _kv_dl
+
+        dm = _kv_dl.disk_mask(host_indices)
+        keep = ~dm
+        if bool(keep.any()):
+            super().load_to_device_per_layer(device_pool, host_indices[keep],
+                                             device_indices[keep.to(device_indices.device)], layer_id, io_backend)
+        if this_rank_is_form_a_worker():
+            return None
+        P = int(self.slot_page_size)
+        hd = host_indices[dm].to("cpu", dtype=torch.int64)
+        dd = device_indices[dm.to(device_indices.device)]
+        if hd.numel() % P:
+            raise ValueError("QSA HiCache transfers must contain complete KV pages")
+        firsts = hd.reshape(-1, P)[:, 0]
+        ds = ((firsts - _kv_dl.disk_base(P)) // P).tolist()
+        key = (tuple(ds), int(dd.numel()))
+        cached = getattr(self, "_s36_disk_stage", None)
+        if cached is None or cached[0] != key:
+            stage = self._s36_read_disk_qsa(ds)
+            self._s36_disk_stage = (key, stage)
+        else:
+            stage = cached[1]
+        buf = self.device_buffers[layer_id]
+        rows = self._to_page_indices(dd.to(buf.device)).to(device=buf.device, dtype=torch.int64)
+        blk = stage.view(len(ds), self.layer_num, self.item_bytes)[:, layer_id]
+        buf.index_copy_(0, rows, blk.to(buf.device, non_blocking=False))
+        return None
+
+    def _s36_read_disk_qsa(self, ds):
+        """The canonical QSA pages of disk pages ``ds``, read by the backend (the one consumer of the canonical
+        extent I/O, through its installed window: HiCacheFile.kv_dl_read_qsa_pages)."""
+        from flliper.srt.pdflip import kv_durchlauf as _kv_dl
+
+        reg = _kv_dl.REGISTRY
+        be = reg.backend
+        stage = torch.zeros((len(ds), self.layer_num * self.item_bytes), dtype=self.dtype)
+        if be is None:
+            raise RuntimeError("PDFLIP KV-DURCHLAUF QSA LOAD REFUSED: no backend registered for the disk pages")
+        be.kv_dl_read_qsa_pages(ds, stage)
+        return stage
 
     def backup_from_device_all_layer(self, *args, **kwargs):
         QSAPagedHostPool._h106_tls.dir = "backup"

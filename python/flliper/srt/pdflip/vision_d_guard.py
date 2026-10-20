@@ -74,8 +74,10 @@ def image_spans(req: Any) -> List[Tuple[int, int]]:
     """Every multimodal placeholder span of the request, (start, end) inclusive."""
     mm = getattr(req, "multimodal_inputs", None)
     spans: List[Tuple[int, int]] = []
-    for it in getattr(mm, "mm_items", None) or []:
-        for off in getattr(it, "offsets", None) or []:
+    items = getattr(mm, "mm_items", None)
+    for it in (() if items is None else items):
+        offs = getattr(it, "offsets", None)  # a list today; never truth-tested
+        for off in (() if offs is None else offs):
             spans.append((int(off[0]), int(off[1])))
     return spans
 
@@ -84,6 +86,30 @@ def image_end(req: Any) -> int:
     """One past the last placeholder position, 0 without images."""
     spans = image_spans(req)
     return (max(end for _, end in spans) + 1) if spans else 0
+
+
+def admitted_covered(head: int, floor: Optional[int], floor_credit: bool) -> int:
+    """S59: the prefix every rank ADMITS -- the depth the X gate prices from
+    (``Scheduler.pdflip_uncached_extent``, store arm excluded: a store page is
+    not materialized until its read lands).
+
+    The head arm alone is no such depth on a Form A group: a worker's own walk
+    is refused by the mamba bytes it does not hold and votes 0, while every
+    rank admits the usable floor (the host's admission, RU FORM-A FOLLOW).
+    rc15 D pdflip-4-9 (07:19:09): ``H98x X-FLOOR-CREDIT head=0 floor=95744``,
+    X gate ``admit uncached=14``, and the vision guard on the head arm refused
+    ``W123 covered=0`` -> W50 -> a D->P flip for 14 tokens (P: cached 95744).
+    Same on pdflip-28-111 (floor 88704). The other side holds as well: a floor
+    BELOW the head (#1424d proof cut / zeroed anchor) is what the admission
+    takes, so the guard must not credit the head above it."""
+    priced = int(head)
+    if floor is None:
+        return priced
+    if int(floor) < priced:
+        return int(floor)
+    if int(floor) > priced and floor_credit:
+        return int(floor)
+    return priced
 
 
 def verdict(req: Any, covered: Optional[int], tail_start: Optional[int] = None,

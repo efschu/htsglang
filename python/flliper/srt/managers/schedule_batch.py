@@ -168,7 +168,7 @@ def _pdflip_fork_track(req, prefix_len: int, end: int, chunk: int,
             logger.info(
                 "PDFLIP FORK-ANCHOR TRACK n=%d rid=%s step=[%d,%d) anchor %d -> %d "
                 "(at or below the generation prompt; chunk grid %d)",
-                n, str(getattr(req, "rid", "?"))[:16], prefix_len, end,
+                n, str(getattr(req, "rid", "?")), prefix_len, end,
                 default_aligned, t, chunk,
             )
     return t
@@ -200,7 +200,7 @@ def _pdflip_claim_track(req, tree_cache, prefix_len: int, end: int, chunk: int,
             logger.info(
                 "PDFLIP CLAIM-ANCHOR TRACK n=%d rid=%s step=[%d,%d) anchor %d -> %d "
                 "(the deepest page a bigram reader of N=%d claims; chunk grid %d)",
-                n, str(getattr(req, "rid", "?"))[:16], prefix_len, end,
+                n, str(getattr(req, "rid", "?")), prefix_len, end,
                 default_aligned, t, len(req.origin_input_ids), chunk,
             )
     return t
@@ -272,7 +272,7 @@ def _note_1037_instance(rid: str) -> None:
                 "running instance %d, the two ranks hold different objects "
                 "under one identity -- the prefix-0-versus-8192 split the "
                 "extent census names.",
-                str(rid)[:8],
+                str(rid),
                 n,
                 n,
                 n - 1,
@@ -319,7 +319,7 @@ def _note_968_readmit_cached(req, pre_len: int, new_cached: int) -> None:
                 "non-zero cached prefix; before FIX-8 the retraction stain "
                 "held this at 0 for the whole re-admitted population. "
                 "occurrence=%d",
-                str(getattr(req, "rid", None))[:8],
+                str(getattr(req, "rid", None)),
                 int(new_cached),
                 int(pre_len),
                 int(getattr(req, "readmit_cached_tokens", 0)),
@@ -706,7 +706,7 @@ def _note_1036_prefix_demotion(req, start: int, hwm: int) -> None:
                 "admitted_start=%d lost=%d prefix_indices=%d "
                 "host_hit=%s mamba_host_hit=%s seam_readmit=%s "
                 "site_occurrence=%d census=%s",
-                str(getattr(req, "rid", "?"))[:8],
+                str(getattr(req, "rid", "?")),
                 site,
                 hwm,
                 live,
@@ -1526,6 +1526,12 @@ class Req(ReqDllmMixin):
         # construction is on the per-request path. The two are pinned together
         # by test_kv_spill_class_unit.test_req_defaults_to_normal.
         self.spill_class = "normal"
+        # FRONT-X-MIT (15.10., pdflip/front_x.py): the Weg-2 front's decision X and
+        # priced uncached for this D-direct leg 2, stamped by the scheduler from
+        # the request. None = nothing carried (the static X gate alone).
+        self.weg2_front_x = None
+        self.weg2_front_priced = None
+        self.weg2_front_halfx = None
 
         # For incremental decoding
         # ----- | --------- read_ids -------|
@@ -2169,7 +2175,7 @@ class Req(ReqDllmMixin):
                         "#969AC lap=%s last_queued_as=%s from_fwd=%s "
                         "stamped_rank=%s",
                         _n,
-                        _rid[:8],
+                        _rid,
                         0 if self.prefix_indices is None else len(self.prefix_indices),
                         getattr(self, "host_hit_length", None),
                         getattr(self, "mamba_host_hit_length", None),
@@ -2440,7 +2446,7 @@ class Req(ReqDllmMixin):
             _fr = self.finished_reason
             logger.info(
                 "FINISH-TRACE rid=%s reason=%s matched=%r acc_len=%d out_len=%d tail=%s",
-                self.rid[:16] if isinstance(self.rid, str) else self.rid,
+                self.rid,
                 type(_fr).__name__ if _fr is not None else None,
                 getattr(_fr, "matched", None),
                 new_accepted_len,
@@ -3346,6 +3352,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Staging consumed by resolve_forward_inputs (prefill H2D / mixed gather).
     prefill_input_ids_cpu: Optional[torch.Tensor] = None
     mix_running_indices: Optional[torch.Tensor] = None
+    # CPU twin of mix_running_indices; lets the overlap tail resolve gather
+    # pinned mirrors without a device sync (fLLiper PR #36933).
+    mix_running_indices_cpu: Optional[torch.Tensor] = None
     input_embeds: torch.Tensor = None  # shape: [b, hidden_size], float32
 
     # Token replacement embeddings and absolute positions (optional).
@@ -3675,7 +3684,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     getattr(self, "forward_mode", "?"),
                     [
                         (
-                            str(getattr(r, "rid", "?"))[:8],
+                            str(getattr(r, "rid", "?")),
                             None if r.extend_range is None else int(r.extend_range.start),
                             None if r.extend_range is None else int(r.extend_range.end),
                             0 if r.prefix_indices is None else len(r.prefix_indices),
@@ -4485,13 +4494,81 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Decode tokens of the running portion live in future_map.output_tokens_buf.
         self.input_ids = None
         self.mix_running_indices = running_batch.req_pool_indices
-        out_cache_loc = torch.cat([self.out_cache_loc, running_batch.out_cache_loc])
+        self.mix_running_indices_cpu = running_batch.req_pool_indices_cpu
+        spec_mix = not self.spec_algorithm.is_none()
+        if spec_mix:
+            # MIXED-D / fLLiper PR #36933: spec keeps no per-step out_cache_loc on the
+            # running batch; gather each tail's bonus slot at the committed length
+            # (rebound at forward entry under overlap, FutureMap.resolve_mixed_spec_tails).
+            # The tails' draft state is DROPPED by design (the mixed batch's draft
+            # extend re-seeds it), so a one-sided EagleDraftInput must not reach
+            # merge_batch's refusal.
+            running_batch.spec_info = None
+            tail_base = torch.tensor(
+                [r.seqlen - 1 for r in running_batch.reqs],
+                dtype=torch.int64,
+                device=self.seq_lens.device,
+            )
+            running_out_cache_loc = self.req_to_token_pool.req_to_token[
+                running_batch.req_pool_indices.long(),
+                tail_base,
+            ].to(self.out_cache_loc.dtype)
+            # The spec relay is unresolved at schedule time, so merge_batch would
+            # null seq_lens_cpu; rebuild the tails from request state.
+            running_seq_lens_cpu = torch.tensor(
+                [int(r.seqlen) for r in running_batch.reqs], dtype=torch.int64
+            )
+            if self.seq_lens_cpu is None:
+                merged_seq_lens_cpu = running_seq_lens_cpu
+            else:
+                merged_seq_lens_cpu = torch.cat(
+                    [self.seq_lens_cpu, running_seq_lens_cpu]
+                )
+        else:
+            # Non-spec: the running batch carries prepared seq_lens_cpu
+            # (r.seqlen lags it under overlap); merge_batch concats it.
+            tail_base = None
+            running_out_cache_loc = running_batch.out_cache_loc
+            merged_seq_lens_cpu = None
+        out_cache_loc = torch.cat([self.out_cache_loc, running_out_cache_loc])
 
+        # MIXED-D: merge_batch nulls the mamba track fields. The prefill rows' track
+        # (mask / slot / seqlen, set by prepare_for_extend) is what makes their mamba
+        # snapshot land where maybe_cache_unfinished_req expects it; dropping it would
+        # cache a stale recurrent state. Keep the prefill rows' entries and pad the
+        # tail rows with "no tracking" (mask False, slot 0, seqlen 0).
+        _mt = (
+            self.mamba_track_indices,
+            self.mamba_track_mask,
+            self.mamba_track_seqlens,
+        )
         self.merge_batch(running_batch)
         self.out_cache_loc = out_cache_loc
+        if all(t is not None for t in _mt):
+            self.mamba_track_indices = torch.cat(
+                [_mt[0], torch.zeros(running_bs, dtype=_mt[0].dtype, device=_mt[0].device)]
+            )
+            self.mamba_track_mask = torch.cat(
+                [_mt[1], torch.zeros(running_bs, dtype=_mt[1].dtype, device=_mt[1].device)]
+            )
+            self.mamba_track_seqlens = torch.cat(
+                [_mt[2], torch.zeros(running_bs, dtype=_mt[2].dtype, device=_mt[2].device)]
+            )
+        if merged_seq_lens_cpu is not None:
+            self.seq_lens_cpu = merged_seq_lens_cpu
+        if tail_base is not None:
+            # Spec seq_lens sit at the committed base (bonus token pending); this
+            # step commits it, so tails carry base + 1 or attention drops the row.
+            merged = self.seq_lens.clone()
+            merged[-running_bs:] = tail_base + 1
+            self.seq_lens = merged
 
-        # For overlap scheduler, the output_ids has one step delay
-        delta = 0 if self.enable_overlap else -1
+        # For overlap scheduler, the output_ids has one step delay;
+        # spec tail request state carries no delay in either mode.
+        if spec_mix:
+            delta = -1
+        else:
+            delta = 0 if self.enable_overlap else -1
 
         # NOTE: prefix_indices is what has been cached, but we don't cache each decode step
         self.prefix_lens.extend(
@@ -4652,7 +4729,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     logger.info(
                         "PDFLIP-RETRACT-RETAIN n=%d rid=%s span=%d (origin=%d out=%d): "
                         "kept in the tree, evictable; the re-admission loads it back",
-                        _n, str(req.rid)[:16],
+                        _n, str(req.rid),
                         len(req.origin_input_ids or ()) + len(req.output_ids or ()),
                         len(req.origin_input_ids or ()), len(req.output_ids or ()),
                     )
@@ -4752,7 +4829,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             logger.warning(
                 "PDFLIP-D-PARK retraction: the back of this spec batch (rid=%s) is not its "
                 "youngest request -- the stock back-only order stands",
-                str(getattr(reqs[-1], "rid", "?"))[:12],
+                str(getattr(reqs[-1], "rid", "?")),
             )
 
         # TODO(lsyin): improve retraction policy for radix cache

@@ -1,0 +1,104 @@
+{
+ "format": "weg2-x-curves/1",
+ "identity": {
+  "model": "Qwen3.8-Flash-Next-int4",
+  "form": "arch=moe,experts=offload,draft=dflash,kv=qsa_forma,flip=family",
+  "hardware": "RTX5090,RTX3080,RTX3080",
+  "created": "2026-10-06T10:30:00Z",
+  "source": "synthetic"
+ },
+ "p_curve": {
+  "rows": [
+   {
+    "depth": 0,
+    "n": [
+     64,
+     128,
+     256,
+     512
+    ],
+    "ms": [
+     107.24893953812209,
+     124.10218061008474,
+     159.04134816615434,
+     223.95012605565563
+    ]
+   },
+   {
+    "depth": 2852,
+    "n": [
+     64,
+     128,
+     256,
+     512
+    ],
+    "ms": [
+     110.65997102507404,
+     131.38128429925138,
+     172.37195818147663,
+     253.33567478512944
+    ]
+   }
+  ],
+  "chunk_tokens": 256,
+  "instrument": "synthetic",
+  "depth_interp": "linear",
+  "points": 0
+ },
+ "d_curve": {
+  "rows": [
+   {
+    "depth": 0,
+    "n": [
+     64,
+     128,
+     256,
+     512
+    ],
+    "ms": [
+     102.23264110664213,
+     168.50453026717435,
+     302.264452925767,
+     569.0726367081426
+    ]
+   },
+   {
+    "depth": 2852,
+    "n": [
+     64,
+     128,
+     256,
+     512
+    ],
+    "ms": [
+     110.89539049767036,
+     186.9214922098331,
+     336.99937790458074,
+     642.5076921770001
+    ]
+   }
+  ],
+  "chunk_tokens": 512,
+  "instrument": "synthetic",
+  "depth_interp": "linear",
+  "points": 0
+ },
+ "flip_price": {
+  "depth": [
+   0,
+   1243,
+   1339,
+   2526,
+   4852
+  ],
+  "seconds": [
+   0.577,
+   0.467,
+   0.253,
+   0.497,
+   0.577
+  ],
+  "attribution": "calib_prefix",
+  "pairs": 9
+ }
+}

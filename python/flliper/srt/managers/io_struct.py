@@ -285,6 +285,15 @@ class GenerateReqInput:
     # nothing infers a class from traffic. Unset -> the server-wide default
     # (--kv-session-offload-default-spill-class, itself "normal").
     spill_class: Optional[str] = None
+    # FRONT-X-MIT (15.10., pdflip/front_x.py): the X of the Weg-2 front's dispatch
+    # decision for this D-direct leg 2 and what it priced at that decision (tokens).
+    # Set only from the x-pdflip-front-x / x-pdflip-front-priced request headers; None =
+    # nothing carried, D's static X gate is the only gate.
+    weg2_front_x: Optional[int] = None
+    weg2_front_priced: Optional[int] = None
+    # H16V review A3 (SOLL R2/R7/R11): halbX = F_halb x X of that decision at the depth D continues from, computed by
+    # the FRONT (x-pdflip-front-halfx); the resumed-tail extend on D reads this, never a rank-local flag.
+    weg2_front_halfx: Optional[int] = None
     # Extra cache key for classifying the request (e.g. cache_salt)
     extra_key: Optional[Union[List[str], str]] = None
 
@@ -784,6 +793,9 @@ class GenerateReqInput:
             priority=self.priority,
             lane=self.lane,
             spill_class=self.spill_class,
+            weg2_front_x=self.weg2_front_x,
+            weg2_front_priced=self.weg2_front_priced,
+            weg2_front_halfx=self.weg2_front_halfx,
             extra_key=self.extra_key[i] if self.extra_key is not None else None,
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
@@ -874,6 +886,13 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # Resolved to a concrete class by the tokenizer manager; None only reaches
     # the scheduler on internal paths that bypass it (treated as "normal").
     spill_class: Optional[str] = None
+
+    # FRONT-X-MIT (15.10.): the front's decision X / priced uncached for a D-direct
+    # leg 2 (pdflip/front_x.py). Rides this object to the scheduler on every TP rank
+    # (rank 0 broadcasts it), so the gate's limit is the group's.
+    weg2_front_x: Optional[int] = None
+    weg2_front_priced: Optional[int] = None
+    weg2_front_halfx: Optional[int] = None  # H16V review A3: halbX carried by the front (see GenerateReqInput)
 
     # Extra cache key for classifying the request (e.g. cache_salt)
     extra_key: Optional[str] = None
@@ -1434,6 +1453,11 @@ class FlushCacheReqInput(BaseReq, kw_only=True):
     # z30j: PP0's stamp on the request chain; a follower waits for PP0's
     # verdict on this seq instead of deciding the flush itself (pdflip/flush_verdict.py).
     pdflip_flush_seq: Optional[int] = None
+    # S104 review A1: True only on the front's flip quiesce (pdflip/front.py ``quiesce``) -- the one flush a sleep
+    # leg follows. Only such a flush may hand its reset to the sleep leg (S104 FLUSH-DEFER-RESET); every other
+    # /flush_cache (operator, test, "remove wrong data") resets as before. Replicated: the same request reaches
+    # every rank.
+    pdflip_flip_quiesce: bool = False
 
 
 class FlushCacheReqOutput(BaseReq, kw_only=True):
@@ -1645,6 +1669,14 @@ class PdFlipParkRunningReqInput(BaseReq, kw_only=True):
     #: decode) at the round boundary, in the SEAT-AGE pressure shape; empty =
     #: park every running request (H91b).
     youngest: str = ""
+    #: PRIORITY LANES 1008 (L2, pdflip/lanes.py): park ONLY these rids (the running requests of the lanes below
+    #: a new floor), RETAINING their span with the forced host write-through -- no sleep follows, the other
+    #: running requests decode on. Empty = park every running request (H91b). Needs FLLIPER_PDFLIP_LANES=1.
+    rids: List[str] = []
+    #: ``"lane"``: the parked requests are held for their floor -- no 30-s awake re-queue, no #248h
+    #: capacity re-queue, no dormant hold -- until ``POST /pdflip/lane_floor`` lets their lane in again.
+    #: Needs ``rids``. Empty = an ordinary park.
+    hold: str = ""
 
 
 class PdFlipParkRunningReqOutput(BaseReq, kw_only=True):
@@ -1667,6 +1699,108 @@ class PdFlipParkRunningReqOutput(BaseReq, kw_only=True):
     #: sequence up to its #59b depth -- filled by the tokenizer manager (it holds
     #: prompt + output ids; the scheduler computes nothing for it).
     pdflip_seq_hash: Dict[str, str] = {}
+    #: PRIORITY LANES 1008 (L2): True when this answers a ``rids`` / ``hold`` park (a lane park): ``parked`` =
+    #: the rids that left the batch (or were already parked), ``held`` = requested rids that only wait on D
+    #: (kept back by the floor alone).
+    lane: bool = False
+    #: lane park only: {requested rid: why it was not parked}
+    lane_skipped: Dict[str, str] = {}
+    #: FLIPSTALL-1015: wall clock (time.time()) of the moment the flip park
+    #: answered -- D's awake re-queue clock starts there (d_park_runtime.
+    #: park_answer_stamp); the front starts its lapse clock there too. 0.0 =
+    #: not stamped (old D, lane park, refusal): the front keeps its pre-RPC stamp.
+    answered_at: float = 0.0
+
+
+class PdFlipMatchProbeReqInput(BaseReq, kw_only=True):
+    """S56 D-MATCH-PROBE (user 19.10.: "warum wird irgendwas geschätzt? alle zahlen liegen doch schwarz auf weiß vor zu
+    jedem zeitpunkt?"; SOLL R11): the front asks group D, before its verdict, how much of a prompt D holds NOW. The
+    tokenizer manager tokenized the prompt exactly as its POST will be (``input_ids`` and ``mm_inputs`` of the
+    TokenizedGenerateReqInput); every TP rank pads the image items like an intake and walks its radix tree with the
+    admission's usable prefix READ-ONLY (S56r: ``d_match_probe.peek_admission_match``); TP0 answers. Nothing is
+    queued, allocated, split, stamped or counted."""
+
+    input_ids: Optional[array] = None
+    mm_inputs: Optional[PickleWrapper] = None
+    extra_key: Optional[str] = None
+    #: the tokenizer's tokenize time (ms), echoed for the answer's line
+    tokenize_ms: float = 0.0
+    #: S56r A3: further probes answered in the SAME intake round -- a list of
+    #: ``{"rid", "input_ids", "mm_inputs", "extra_key", "tokenize_ms"}`` (pickled); the communicator is serial, so
+    #: without it a burst of k arrivals waited k scheduler rounds (k D-prefill chunks while D prefills)
+    batch: Optional[PickleWrapper] = None
+
+
+class PdFlipMatchProbeReqOutput(BaseReq, kw_only=True):
+    success: bool = False
+    message: str = ""
+    #: the prompt in the SCHEDULER's token space (image tokens = the items' pad values, the radix key)
+    input_ids: Optional[array] = None
+    #: tokens of the prompt the tree serves from the device (KV + every component's anchor)
+    device_tokens: int = 0
+    #: tokens past the device part the tree serves from the host tier (L2 load-back)
+    host_tokens: int = 0
+    #: how far the KEY matched, no validator consulted (#1040) -- information only
+    key_match_depth: int = 0
+    #: [start, end) of every image item's pad run in ``input_ids``
+    mm_spans: List[List[int]] = []
+    handle_ms: float = 0.0
+    tokenize_ms: float = 0.0
+    #: S56r A3: the answers of the input's ``batch``, in its order (pickled list of dicts with the fields above)
+    batch: Optional[PickleWrapper] = None
+
+
+class PdFlipLaneFloorReqInput(BaseReq, kw_only=True):
+    """PRIORITY LANES 1008 (L2/L3, ``pdflip/lanes.py`` ``RPC_LANE_FLOOR``): the front's floor -- ``POST
+    /pdflip/lane_floor`` with ``{"floor": <int>, "epoch": <int>}``. Group D: its admission lets in only requests
+    with ``priority >= floor`` and re-queues the held lane parks of the lanes now let in, oldest first.
+    Group P (part L3): PP0 takes it at the top of its next pass and stamps it on the PP-room vote
+    (``pp_room_vote.PdFlipPpLaneFloor``), every stage applies it in the same pass. ONE class, ONE route, ONE
+    dispatcher entry for both groups (L5: L2 and L3 had each defined their own). Needs FLLIPER_PDFLIP_LANES=1."""
+
+    floor: int = 0
+    epoch: int = 0
+
+
+class PdFlipLaneFloorReqOutput(BaseReq, kw_only=True):
+    success: bool
+    #: the floor / epoch in force on this scheduler after the call
+    floor: int = 0
+    epoch: int = 0
+    #: rids of the held lane parks this call re-queued, oldest first
+    requeued: List[str] = []
+    #: lane holds still standing
+    held: int = 0
+    message: str = ""
+
+
+class PdFlipLivenessHoldOutput(BaseReq, kw_only=True):
+    """LIVEPARK (14.10.): scheduler -> tokenizer, one-way. The WHOLE set of
+    request ids group D holds on purpose right now (``pdflip_d_parked`` +
+    ``pdflip_dormant_hold`` + ``pdflip_post_wake_settle``: flip park, lane park,
+    RESUME-VIA-P hold, dormant hold, wake read). Sent only when the set
+    changes; replace semantics (``liveness/hold.py``). The LLM-stream liveness
+    watchdog pauses its silence clock for these rids."""
+
+    held: List[str] = []
+
+
+class PdFlipMmFeatureFetchReq(BaseReq, kw_only=True):
+    """S66 P-KNOWN-IMAGE (pdflip/p_known_image.py): PP0 -> P's tokenizer,
+    one-way. P's tokenizer built ``rid`` from known images without pixels and
+    PP0's vision verdict needs the tower after all: run the processor on the
+    request the tokenizer still holds and answer :class:`PdFlipMmFeaturesOutput`."""
+
+
+class PdFlipMmFeaturesOutput(BaseReq, kw_only=True):
+    """S66 P-KNOWN-IMAGE: P's tokenizer -> PP0 (the request origin, taken out of
+    the intake there, never relayed). ``payload`` = pickle of
+    ``{"features": [...], "hashes": [...], "offsets": [...]}`` in item order;
+    ``ok`` False = refused by name (``detail``)."""
+
+    ok: bool = False
+    detail: str = ""
+    payload: bytes = b""
 
 
 class PdFlipParkWindowReqInput(BaseReq, kw_only=True):
@@ -1700,6 +1834,14 @@ class PlePrefetchHintReqInput(BaseReq, kw_only=True):
     PLE read of its first chunk now (no reply, a pure prefetch)."""
 
     input_ids: List[int] = []
+    #: 02.10.: the front's store span of this request (where P's first chunk
+    #: will start, before P's page floor); -1 = unknown (tail window)
+    start_hint: int = -1
+    #: S53 L2-READ-AHEAD: PP0 fills the stored prefix [0, start_hint) from L3 into the shared arena
+    #: (pdflip/l2_read_ahead.py) -- the front holds this request for P's device room while P is awake
+    read_ahead: bool = False
+    #: S53: False = no PLE admission for this hint (P is awake; its PLE ring belongs to the running request)
+    ple: bool = True
 
 
 class AddExternalCorpusReqInput(BaseReq, kw_only=True):
@@ -2164,6 +2306,11 @@ class AbortReq(BaseReq, kw_only=True):
     # The finished reason data (from BaseFinishReason.to_json())
     finished_reason: Optional[FinishReasonDict] = None
     abort_message: Optional[str] = None
+    # K14 (pdflip.pp_abort): PP0's group verdict on a forwarded abort under the
+    # #631 row authority -- True = a frame PP0 sent names the rid, so a
+    # follower that still queues it holds the abort until that frame admits
+    # it; False = no frame names it; None = not stamped (today's path).
+    pdflip_pp0_admitted: Optional[bool] = None
 
     def __post_init__(self):
         # FIXME: This is a hack to keep the same with the old code

@@ -107,7 +107,7 @@ def note_new_head(scheduler, head: BudgetHead, width: int, where: str) -> None:
             "%s where=%s pp_rank=%s head=%s pos=%d pos_src=%s end=%d width=%d local_prefix=%d "
             "(Fix A: a queued head sizes the pass from rank-identical data -- its published told or 0; "
             "local_prefix is the rank-local position the pre-fix budget used)",
-            MARKER, where, pp, rid[:12], head.pos, head.src, head.end, int(width), head.local_prefix,
+            MARKER, where, pp, rid, head.pos, head.src, head.end, int(width), head.local_prefix,
         )
     except Exception:  # noqa: BLE001 -- an instrument never stops a pass
         pass

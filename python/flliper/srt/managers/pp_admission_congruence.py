@@ -939,6 +939,13 @@ class PPAdmissionCongruenceGuard:
         """
         return self._unresolved_rounds.get(rid, 0)
 
+    def forget_offer(self, rid) -> None:
+        """PREFILL-OOM-RETREAT (pdflip/prefill_oom_retreat.py): PP0 built an offer for ``rid`` and the pass was taken
+        back BEFORE it was sent (the paged extend found no pages). An offer no rank ever saw is not a re-offer
+        without progress, so it leaves no streak -- three retreats must not escalate a request the pool simply could
+        not pay yet. Counting stays what it was for every offer that was sent."""
+        self._offer_streak.pop(rid, None)
+
     def note_offer(self, rid: str, told: int) -> bool:
         """#944c RECORD ONE OFFER. True iff `rid` has now exceeded the cap.
 
@@ -2949,6 +2956,38 @@ def execute_scheduled_prefix(req, tree_cache, scheduled_prefix_len: int) -> int:
     # #1175 (E2): whether the poll ever drove the progress check, so the
     # expiry text can say what it does and does not measure.
     _drove_ever = False
+    # NF-RANG-AUDIT 1014 (S5 x LB-VERDICT): this load-back EXECUTES PP0's row,
+    # so the LB-VERDICT gate in `load_back` must not hold it for a verdict PP0
+    # never sent (the follower's host hit is not PP0's on the layer-split
+    # form). Set for exactly this materialisation, cleared on every exit --
+    # writer, reader (`pp_loadback_verdict.gated`) and deleter share one
+    # straight-line stretch, the only lifecycle shape such a flag is safe under.
+    from flliper.srt.pdflip import pp_loadback_verdict as _lbv_row
+
+    try:
+        setattr(req, _lbv_row.ROW_ATTR, True)
+    except Exception:  # noqa: BLE001 -- a slotted stand-in: the gate then decides as before
+        pass
+    try:
+        return _materialise_scheduled_prefix(
+            req, tree_cache, scheduled, deficit, local, bound_s, started, storage_on, _die, loaded_total, _drove_ever
+        )
+    finally:
+        try:
+            setattr(req, _lbv_row.ROW_ATTR, False)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _materialise_scheduled_prefix(
+    req, tree_cache, scheduled, deficit, local, bound_s, started, storage_on, _die, loaded_total, _drove_ever
+) -> int:
+    """The materialisation loop of :func:`execute_scheduled_prefix` (split out so the
+    row flag above is set and cleared around exactly this stretch)."""
+    from flliper.srt.mem_cache.base_prefix_cache import InitLoadBackParams
+
+    import torch
+
     while True:
         best = getattr(req, "best_match_node", None)
         if best is not None:
@@ -2979,6 +3018,19 @@ def execute_scheduled_prefix(req, tree_cache, scheduled_prefix_len: int) -> int:
             if applied != deficit and bool(
                 getattr(req, "mamba_loadback_anchor_adopted", False)
             ):
+                if applied == 0:
+                    # NF-968-ROWLB 1014: the mamba component sets the flag when
+                    # it BUILDS its transfer, before load_back's room/threshold
+                    # exits; a load-back that returned nothing planted nothing.
+                    # Stop as before, but name what happened (h16j 19:43:19Z
+                    # read "GDN anchor at a depth" for a room refusal).
+                    raise _die(
+                        loaded_total,
+                        "load-back refused before any transfer ran (applied=0; "
+                        "the GDN anchor flag is set when the transfer is BUILT, "
+                        "nothing was planted) -- this rank did not execute the "
+                        "row's prefix that PP0 holds",
+                    )
                 raise _die(
                     loaded_total + applied,
                     "load-back adopted a GDN anchor at a depth the schedule "

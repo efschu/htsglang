@@ -88,6 +88,9 @@ class GPTQMarlinState(Enum):
 
 
 class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
+    #: W2-APPLY: ``apply_weights`` runs ``fused_marlin_moe``, whose GEMMs skip lanes with expert id -1 (the EP
+    #: form) -- the pool's EM waves may hand it only their own lanes (layers/moe/filtered_lanes.py)
+    MOE_FILTERED_LANES = True
 
     def __init__(
         self,
@@ -784,6 +787,8 @@ class CompressedTensorsWNA16TritonMoE(CompressedTensorsWNA16MoE):
     weights to the uint8-packed format expected by the Triton fused MoE kernel
     instead of the Marlin-specific format.
     """
+
+    MOE_FILTERED_LANES = False  # W2-APPLY: this runner is not checked for -1 lanes: the zero-row form stays
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if getattr(layer, "is_triton_converted", False):

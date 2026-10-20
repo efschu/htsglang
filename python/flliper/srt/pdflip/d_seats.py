@@ -60,7 +60,7 @@ import logging
 import math
 import os
 from dataclasses import dataclass, field
-from typing import Dict, FrozenSet, Iterable, List, Mapping, Optional, Sequence
+from typing import Callable, Dict, FrozenSet, Iterable, List, Mapping, Optional, Sequence, Union
 
 logger = logging.getLogger(__name__)
 
@@ -164,6 +164,21 @@ def _arrival(req) -> float:
     return float("inf") if seq is None else float(seq)
 
 
+def _order_key(req, on: Optional[bool] = None):
+    """PRIO-AS-AGE 1014 (pdflip/prio_age.py): THE order of D -- ``(-priority, _arrival)`` with the mode on
+    (a higher priority is older than every lower one; inside a priority the arrival decides), ``(0,
+    _arrival)`` off.  Smaller = older.  Replicated: ``req.priority`` is the request's own field."""
+    from flliper.srt.pdflip import prio_age as _pa
+
+    return _pa.key(_pa.lane_of_req(req), _arrival(req), on=on)
+
+
+def _lane_held(req) -> bool:
+    from flliper.srt.pdflip.d_lane import lane_held
+
+    return lane_held(req)
+
+
 def park_site(req) -> Optional[str]:
     site = getattr(req, SITE_ATTR, None)
     return site if site in SITES else None
@@ -182,8 +197,11 @@ def clear_park(req) -> None:
 
 
 def park_running_order(reqs: Iterable) -> List:
-    """The order a flip park keeps and the wake resumes: oldest first."""
-    return sorted(list(reqs), key=_arrival)
+    """The order a flip park keeps and the wake resumes: oldest first (PRIO-AS-AGE 1014: by the order key)."""
+    from flliper.srt.pdflip import prio_age as _pa
+
+    on = _pa.enabled()
+    return sorted(list(reqs), key=lambda r: _order_key(r, on=on))
 
 
 def retraction_order(reqs: Sequence, *, spec_active: bool) -> Optional[List[int]]:
@@ -213,9 +231,16 @@ def retraction_order(reqs: Sequence, *, spec_active: bool) -> Optional[List[int]
         # victim by SA, a 'preferred' one still parks first. No second age.
         from flliper.srt.managers.kv_session_offload import spill_class_rank
 
+        from flliper.srt.pdflip import prio_age as _pa
+
+        _on = _pa.enabled()
+
         def _sa_key(r):
+            # PRIO-AS-AGE 1014: the age term is the order key, negated (a higher priority is more
+            # protected, inside a priority the older one) -- no second age
+            k = _order_key(r, on=_on)
             return (spill_class_rank(r), 1 if getattr(r, "is_fast_lane", False) else 0,
-                    -_arrival(r))
+                    -k[0], -k[1])
 
         by_protection = sorted(range(n), key=lambda i: _sa_key(reqs[i]), reverse=True)
     else:
@@ -237,9 +262,16 @@ def order_waiting(waiting: Sequence) -> List:
     held on every rank first), and a re-sort could lift a request one rank
     does not hold above that head.  The park marks themselves are set by
     group-uniform events, so moving the parked requests is replicated."""
-    parked = [r for r in waiting if park_site(r) is not None]
-    rest = [r for r in waiting if park_site(r) is None]
-    return park_running_order(parked) + rest
+    # PRIORITY LANES 1008 (L2): a request in a LANE hold (``d_lane.lane_held``) is not preferred -- it
+    # waits for its floor, not for a seat, so it must not move ahead of the requests that can run
+    parked = [r for r in waiting if park_site(r) is not None and not _lane_held(r)]
+    rest = [r for r in waiting if park_site(r) is None or _lane_held(r)]
+    # PRIO-AS-AGE 1014: a higher priority is OLDER than every lower one, a parked one included -- a stable
+    # sort by priority only, so inside a priority the order above (parked first, then the group's order)
+    # stands exactly; ``priority`` is the request's own field, every rank sorts alike
+    from flliper.srt.pdflip import prio_age as _pa
+
+    return _pa.lane_sorted(park_running_order(parked) + rest)
 
 
 def head_of_queue(waiting: Sequence, reqs: Sequence) -> List:
@@ -262,6 +294,8 @@ class AdmissionGate:
     barrier: bool = False
     #: SA: the front-arrival age of the oldest parked request still waiting
     oldest_parked_age: Optional[float] = None
+    #: PRIO-AS-AGE 1014: that request's ORDER KEY ``(-priority, age)`` -- the barrier compares by it
+    oldest_parked_key: Optional[tuple] = None
     blocked: FrozenSet[str] = frozenset()
     note: str = ""
     #: AP (28.09.): the parked rids IN the queue that may resume this pass --
@@ -286,12 +320,24 @@ class AdmissionGate:
     #: #1989 (dual D, ``FLLIPER_PDFLIP_DUAL_D_PARK_OLDER_LIVE_FREE``): every parked
     #: request still waiting is a pressure park blocked ONLY because an older
     #: request RUNS -- none of them can come back this pass. Newcomers may take
-    #: up to ``seat_room`` seats this pass (``seat_cap - running - parked``: the
-    #: parked ones keep theirs). None = the relaxation is off (the barrier as
-    #: before).
-    seat_room: Optional[int] = None
+    #: up to ``older_live_seat_room`` seats this pass (``seat_cap - running - parked``:
+    #: the parked ones keep theirs). None = the relaxation is off (the barrier as
+    #: before). (27B port 20.10.: was ``seat_room`` on 27B; NF's SB ``seat_room``
+    #: below is a different number and keeps its name.)
+    older_live_seat_room: Optional[int] = None
     #: #1989: the parked rids of this pass (to count the newcomers admitted)
     parked_rids: FrozenSet[str] = frozenset()
+    #: SB (#1210): the phase's seats left after the running requests and the
+    #: seats held for every parked request still waiting (queue + outside);
+    #: None = no phase seat count known (no backfill, the barrier as before)
+    seat_room: Optional[int] = None
+    #: S75 (19.10.): WHY each blocked pressure-parked rid may not resume this pass --
+    #: ``(rid, gate, older_rid, avail, need)``; gate ``held_for_older`` (Q-698: the
+    #: older one it was displaced for still waits) or ``older_live`` (an older request
+    #: is live and the early resume did not hold: avail/need are the numbers it saw,
+    #: None when no margin is armed). The census key alone (``pdflip_d_park_older_live``)
+    #: named neither the gate nor its numbers (rc16 pdflip-137-471, 193 s).
+    held: tuple = ()
 
     def skip(self, req, admitted=None, skip_extend: bool = False) -> Optional[str]:
         """Census key when ``req`` is skipped this pass, else None.
@@ -307,11 +353,11 @@ class AdmissionGate:
             return "pdflip_d_park_decode_first" if str(req.rid) in self.deferred else None
         if not self.barrier or skip_extend or self.newcomers_free:
             return None
-        if self.seat_room is not None:
+        if self.older_live_seat_room is not None:
             # #1989: the parked ones cannot resume this pass (an older request
             # runs); a newcomer takes a FREE seat beside them, never theirs.
             taken = sum(1 for a in (admitted or ()) if str(a) not in self.parked_rids)
-            if taken < self.seat_room:
+            if taken < self.older_live_seat_room:
                 return None
         if self.deferred and self.cohort_wake is not None and in_wake_cohort(req, self.cohort_wake):
             # F3: a member of THIS wake goes ahead of the deferred resume; the
@@ -333,9 +379,38 @@ class AdmissionGate:
         from flliper.srt.pdflip import seat_age as _sa
 
         if _sa.enabled() and self.oldest_parked_age is not None:
-            if _arrival(req) < self.oldest_parked_age:
+            # PRIO-AS-AGE 1014: "older" by the order key (a higher priority passes a lower parked one)
+            ref = (self.oldest_parked_key if self.oldest_parked_key is not None
+                   else (0, self.oldest_parked_age))
+            if _order_key(req) < ref:
                 return None
+        if self._backfill(admitted):
+            return None
         return "pdflip_d_park_first"
+
+    def _backfill(self, admitted) -> bool:
+        """SB (#1210, NF y9nf4 1004_031945 D): the barrier stood ONLY on parked
+        requests outside the queue (#1471 settle: pdflip-8-79 / pdflip-8-82, their
+        store read short for good after the sleep flush lost their anchors) and
+        held the 69-token newcomer pdflip-12-99 for 43 passes over 7 D phases of
+        6 seats with 1-3 running (``pdflip_d_park_first=1(first=pdflip-12-99)``).
+        A request outside the queue is not admitted in this pass anyway; its
+        seat stays held (``seat_room`` subtracts it), and a newcomer takes only
+        a seat beyond those -- the user's backfill rule (30.09.: a younger small
+        one runs beside the older ones it does not displace). Not while a
+        parked request IN the queue still waits or is blocked: the older one
+        gets the freed room first. Rank-uniform: the phase seats (wake
+        request), the running batch, the settle list (group-MIN) and this
+        pass's admitted list."""
+        if self.seat_room is None or admitted is None or not sb_enabled():
+            return False
+        if self.blocked or not self.parked_outside:
+            return False
+        adm = set(admitted)
+        if not self.parked_in_queue <= adm:
+            return False
+        newcomers = len(adm - set(self.parked_in_queue))
+        return self.seat_room - newcomers > 0
 
 
 @dataclass
@@ -493,11 +568,12 @@ def admission_gate(
     *,
     running: Sequence,
     pending_outside: Sequence = (),
-    avail_tokens: Optional[int] = None,
+    avail_tokens: Optional[Union[int, Callable[[], Optional[int]]]] = None,
     resume_book: Optional[ResumeBook] = None,
     decode_first: Optional[DecodeFirst] = None,
     seat_cap: Optional[int] = None,
     env: Optional[Mapping[str, str]] = None,
+    seats: Optional[int] = None,
 ) -> AdmissionGate:
     """The stage-1 rule, per pass.
 
@@ -520,6 +596,16 @@ def admission_gate(
     exempt = _dual_defer_exempt(parked_waiting)
     live = list(running) + parked_waiting + parked_outside
     blocked = set()
+    held = []
+    # S75: ``avail_tokens`` may be a zero-argument callable (a group collective read
+    # lazily): read once, and only when a pressure-parked request asks the early resume
+    # -- that precondition is replicated, so every rank enters the read alike
+    _avail_box = []
+
+    def _avail():
+        if not _avail_box:
+            _avail_box.append(avail_tokens() if callable(avail_tokens) else avail_tokens)
+        return _avail_box[0]
     # Q-698: the requests still waiting (queue or outside it) -- a victim parked
     # for one of them stays parked while that one waits (no early resume either).
     # The hold ends when the older one is admitted or gone (here), when it was
@@ -536,22 +622,28 @@ def admission_gate(
             if str(held_for) in still_waiting and str(held_for) != str(r.rid):
                 blocked.add(str(r.rid))
                 held_for_older += 1
+                held.append((str(r.rid), "held_for_older", str(held_for), None, None))
                 continue
             # the older one was admitted or is gone: the hold ends for good
             setattr(r, DISPLACED_FOR_ATTR, None)
-        mine = _arrival(r)
-        older_live = any(x is not r and _arrival(x) < mine for x in live)
-        if not older_live:
+        mine = _order_key(r)  # PRIO-AS-AGE 1014: "older" by the order key
+        older = [x for x in live if x is not r and _order_key(x) < mine]
+        if not older:
             continue
+        seen_avail, need = None, None
         if resume_book is not None and avail_tokens is not None:
             need = len(getattr(r, "origin_input_ids", None) or ()) + len(
                 getattr(r, "output_ids", None) or ()
             )
-            if resume_book.early_ok(str(r.rid), avail_tokens=int(avail_tokens), need_tokens=need):
-                resume_book.note_resume(str(r.rid), avail_tokens=int(avail_tokens), need_tokens=need)
+            seen_avail = _avail()
+            if seen_avail is not None and resume_book.early_ok(
+                    str(r.rid), avail_tokens=int(seen_avail), need_tokens=need):
+                resume_book.note_resume(str(r.rid), avail_tokens=int(seen_avail), need_tokens=need)
                 continue
         blocked.add(str(r.rid))
         older_blocked.add(str(r.rid))
+        held.append((str(r.rid), "older_live", str(getattr(min(older, key=_order_key), "rid", "?")),
+                     None if seen_avail is None else int(seen_avail), need))
     if resume_book is not None:
         resume_book.forget(str(r.rid) for r in parked_waiting)
     deferred = (
@@ -565,19 +657,27 @@ def admission_gate(
     )
     # Q-692: a parked request waiting for a store read (exempt) holds no seat
     # against newcomers -- neither the barrier nor the SA age nor AP count it
+    # (dual D only: ``exempt`` is empty off the dual layout, holders == parked_waiting)
     holders = [r for r in parked_waiting if str(r.rid) not in exempt]
     if exempt:
         note = note[:-1] + f" defer_exempt={len(exempt)})"
     _waiting_parked = [r for r in holders if str(r.rid) not in blocked] or holders
-    oldest = min((_arrival(r) for r in _waiting_parked + parked_outside), default=None)
+    _oldest_req = min(_waiting_parked + parked_outside, key=_order_key, default=None)
+    oldest = None if _oldest_req is None else _arrival(_oldest_req)
+    oldest_key = None if _oldest_req is None else _order_key(_oldest_req)
     seat_room = _older_live_seat_room(holders, older_blocked, held_for_older, deferred,
                                       parked_outside, parked_waiting, running, seat_cap, env)
     if seat_room is not None:
         note = note[:-1] + f" older_live_free={len(holders)} seat_room={seat_room})"
+    # SB (#1210): every request outside the queue (settle, dormant hold) keeps a seat
+    room = (None if seats is None else
+            int(seats) - len(running) - len(parked_waiting) - len(list(pending_outside)))
     return AdmissionGate(barrier=True, blocked=frozenset(blocked), note=note,
-                         seat_room=seat_room,
+                         older_live_seat_room=seat_room,
                          parked_rids=frozenset(str(r.rid) for r in parked_waiting),
+                         seat_room=room, held=tuple(held),
                          oldest_parked_age=oldest,
+                         oldest_parked_key=oldest_key,
                          parked_in_queue=frozenset(str(r.rid) for r in holders),
                          parked_outside=len(parked_outside),
                          deferred=deferred,
@@ -664,6 +764,15 @@ def _older_live_seat_room(holders, older_blocked, held_for_older, deferred, park
 
 
 AP_ENV = "FLLIPER_PDFLIP_D_PARK_BARRIER_ADMITTED"
+#: SB (#1210): newcomers backfill the phase's free seats while the barrier
+#: stands only on parked requests outside the queue (default on, 0 = off)
+SB_ENV = "FLLIPER_PDFLIP_D_PARK_BARRIER_BACKFILL"
+
+
+def sb_enabled(env: Optional[Mapping[str, str]] = None) -> bool:
+    """SB (#1210), default ON; 0 = the barrier holds every newcomer as before."""
+    e = os.environ if env is None else env
+    return str(e.get(SB_ENV, "1")).strip().lower() not in ("0", "false", "no", "off")
 
 
 def ap_enabled(env: Optional[Mapping[str, str]] = None) -> bool:

@@ -95,7 +95,7 @@ def test_pt2_newcomers_take_the_free_seats_beside_the_older_live_victim(monkeypa
     waiting = DS.order_waiting([v7] + newcomers)
     gate = DS.admission_gate(waiting, running=running, seat_cap=6)
     assert gate.barrier is True and "pdflip-0-7" in gate.blocked
-    assert gate.seat_room == 4, gate.note
+    assert gate.older_live_seat_room == 4, gate.note
     admitted, skipped = _admit_pass(gate, waiting)
     assert skipped == {"pdflip-0-7": "pdflip_d_park_older_live"}, (
         "pt2: 0-7 blocked behind the running 0-5 held 0-8/0-11/0-12/0-18 behind the barrier for 209 s")
@@ -116,7 +116,7 @@ def test_the_parked_seat_stays_held(monkeypatch):
     assert len(admitted) == 4 and skipped["pdflip-0-19"] == "pdflip_d_park_first"
     # seats already full (cap - running - parked == 0): the barrier as before
     gate0 = DS.admission_gate(waiting, running=running + [_req("pdflip-0-2")] * 4, seat_cap=6)
-    assert gate0.seat_room is None
+    assert gate0.older_live_seat_room is None
     assert gate0.skip(newcomers[0], admitted=[]) == "pdflip_d_park_first"
 
 
@@ -129,7 +129,7 @@ def test_q698_victim_held_for_an_older_waiting_request_keeps_the_barrier(monkeyp
     older = _req("pdflip-0-5", span=71391)
     waiting = DS.order_waiting([v7, older] + newcomers)
     gate = DS.admission_gate(waiting, running=[_req("pdflip-0-3")], seat_cap=6)
-    assert gate.seat_room is None and "held_for_older=1" in gate.note
+    assert gate.older_live_seat_room is None and "held_for_older=1" in gate.note
     assert gate.skip(older, admitted=[]) is None                  # older than 0-7: SA lets it go
     for r in newcomers:
         assert gate.skip(r, admitted=[]) == "pdflip_d_park_first"
@@ -140,7 +140,7 @@ def test_a_resumable_parked_request_keeps_the_barrier(monkeypatch):
     _env(monkeypatch, DUAL_D_ON)
     _, v7, newcomers = _pt2()
     gate = DS.admission_gate([v7] + newcomers, running=[_req("pdflip-0-9")], seat_cap=6)
-    assert "pdflip-0-7" not in gate.blocked and gate.seat_room is None
+    assert "pdflip-0-7" not in gate.blocked and gate.older_live_seat_room is None
     assert gate.skip(v7, admitted=[]) is None
     # AP is on by default: once 0-7 is admitted this pass the newcomers follow (unchanged)
     assert gate.skip(newcomers[0], admitted=[]) == "pdflip_d_park_first"
@@ -152,10 +152,10 @@ def test_a_flip_park_or_a_park_outside_the_queue_keeps_the_barrier(monkeypatch):
     running, v7, newcomers = _pt2()
     flip = _parked("pdflip-0-6", site=DS.SITE_FLIP)
     g1 = DS.admission_gate([flip, v7] + newcomers, running=running, seat_cap=6)
-    assert g1.seat_room is None
+    assert g1.older_live_seat_room is None
     outside = _parked("pdflip-0-4")
     g2 = DS.admission_gate([v7] + newcomers, running=running, pending_outside=[outside], seat_cap=6)
-    assert g2.seat_room is None
+    assert g2.older_live_seat_room is None
     for g in (g1, g2):
         assert g.skip(newcomers[-1], admitted=[]) == "pdflip_d_park_first"
 
@@ -165,7 +165,7 @@ def test_an_f3_deferral_keeps_the_barrier(monkeypatch):
     running, v7, newcomers = _pt2()
     df = types.SimpleNamespace(defer=lambda pw, w, b: frozenset({"pdflip-0-7"}), wake_seq=3)
     gate = DS.admission_gate([v7] + newcomers, running=running, seat_cap=6, decode_first=df)
-    assert gate.seat_room is None
+    assert gate.older_live_seat_room is None
 
 
 # -- default off / flip unchanged -----------------------------------------------------------
@@ -184,7 +184,7 @@ def test_off_and_flip_form_keep_the_pt2_barrier(monkeypatch, env):
     running, v7, newcomers = _pt2()
     waiting = DS.order_waiting([v7] + newcomers)
     gate = DS.admission_gate(waiting, running=running, seat_cap=6)
-    assert gate.seat_room is None and "older_live_free" not in gate.note
+    assert gate.older_live_seat_room is None and "older_live_free" not in gate.note
     admitted, skipped = _admit_pass(gate, waiting)
     assert admitted == [] and set(skipped.values()) == {"pdflip_d_park_older_live", "pdflip_d_park_first"}
 
@@ -225,7 +225,7 @@ def test_runtime_passes_the_seat_cap_only_when_armed(monkeypatch):
     _env(monkeypatch, {"FLLIPER_PDFLIP_DUAL_LAYOUT": "1", "FLLIPER_PDFLIP_GROUP": "D"})
     calls = []
     gate = _admission(*_sched(running, [v7] + newcomers), calls)
-    assert calls == [] and gate.seat_room is None, "default off read the seat cap"
+    assert calls == [] and gate.older_live_seat_room is None, "default off read the seat cap"
     monkeypatch.setenv(ON, "1")
     gate = _admission(*_sched(running, [v7] + newcomers), calls)
-    assert calls == [1] and gate.seat_room == 4
+    assert calls == [1] and gate.older_live_seat_room == 4

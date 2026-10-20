@@ -148,9 +148,23 @@ def _pdflip_published_form():
 
 @pytest.fixture(autouse=True)
 def _pdflip_decode_collect_old_path(monkeypatch):
-    """DECODE-COLLECT (02.10.) ships ON (15 s window). The suite's arrival /
-    park / flip tests pin the immediate paths they were written for, so the
-    window is 0 (the old path, byte for byte) unless a test sets it."""
+    """SET SCHEDULER (SOLL v2, 17.10.) ships ON with T_halb = 4.5 s. The suite's arrival / park / flip tests pin the
+    immediate paths they were written for (no wait while D decodes), so T_halb is 0 -- the set decides at once -- unless
+    a test sets it. The old DECODE-COLLECT window is gone on the flip path (27B port: pinned 0 as before for any 27B
+    reader left, e.g. the dual layout)."""
+    if "FLLIPER_PDFLIP_HALF_FLIP_S" not in os.environ:
+        # A7: ``FLLIPER_PDFLIP_TEST_T_HALF=4.5 pytest <arrival/flip files>`` runs the same files with the production T_halb
+        monkeypatch.setenv("FLLIPER_PDFLIP_HALF_FLIP_S", os.environ.get("FLLIPER_PDFLIP_TEST_T_HALF", "0"))
     if "FLLIPER_PDFLIP_DECODE_COLLECT_WINDOW_S" not in os.environ:
         monkeypatch.setenv("FLLIPER_PDFLIP_DECODE_COLLECT_WINDOW_S", "0")
     yield
+
+
+@pytest.fixture
+def decider_off():
+    """EZ-S2a: pins ``FLLIPER_PDFLIP_DECIDER`` OFF for a test that describes the S1 set code (the queue-sum second set, FLIP-ECONOMICS as
+    a verdict, P-by-state under X). The old code stays reachable until S4 (plan A13); the new behaviour is pinned by
+    ``test_decide_set_1019``."""
+    from flliper.srt.environ import envs
+    with envs.FLLIPER_PDFLIP_DECIDER.override(False):
+        yield

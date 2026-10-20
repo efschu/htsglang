@@ -132,7 +132,12 @@ class SchedulerFlushWrapper:
             # pass, so its idle verdict may be (and is) a TP-group reduction.
             # The deferred path below flushes on a rank-local idle test and
             # must stay rank-local.
-            success = self._flush_cache(tp_group_verdict=True)
+            # S104 review A1: the flip quiesce mark rides the replicated request (passed only when set, so a
+            # flush callable without the keyword keeps working)
+            if getattr(recv_req, "pdflip_flip_quiesce", False):
+                success = self._flush_cache(tp_group_verdict=True, pdflip_flip_quiesce=True)
+            else:
+                success = self._flush_cache(tp_group_verdict=True)
             return FlushCacheReqOutput(
                 success=success,
                 message="" if success else self._refusal_message(),

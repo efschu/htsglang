@@ -165,6 +165,7 @@ def test_band_floor_is_the_start_x_unless_x_busy_is_given():
 
 
 @pytest.mark.usefixtures("_pdflip_band_off")
+@pytest.mark.usefixtures("decider_off")  # EZ-S2b: the X-SOLO band is gone (#14, R2a); this pins the S2a band (reachable until S4)
 def test_x_busy_lowers_the_band_floor_a_busy_d_sends_the_band_to_p():
     """27B X_busy=2048: a 3000-token SHORT is a band request now; with D busy
     it routes LONG on the band floor instead of halting D's decode."""
@@ -176,6 +177,7 @@ def test_x_busy_lowers_the_band_floor_a_busy_d_sends_the_band_to_p():
 
 
 @pytest.mark.usefixtures("_pdflip_band_off")
+@pytest.mark.usefixtures("decider_off")  # EZ-S2b: the X-SOLO band is gone (#14, R2a); this pins the S2a band (reachable until S4)
 def test_without_x_busy_the_same_request_takes_no_window():
     """Unset: 3000 <= start X is no band request -- SHORT at once, no X-SOLO
     decision (the NF H84 behaviour, byte for byte); with X_busy=2048 the same

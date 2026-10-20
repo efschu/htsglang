@@ -680,8 +680,7 @@ def test_b2c_every_l_line_the_spec_names_is_present_with_its_denominators():
                                            "p_concurrency=", "passes=", "queue_at_exit="]),
         "L2": (front_src, "PDFLIP D-ADMIT rid=", ["seat=", "rank=", "oldest_wait_s=", "source="]),
         "L3": (front_src, "PDFLIP D-REFILL", ["freed_by=", "seats_free=", "queued_d="]),
-        # P-BATCH-ALL (02.10.): SHORT arrivals in a P phase join P's batch
-        "L4": (front_src, "PDFLIP SHORT-TO-P", ["epoch=", "n=", "oldest_wait_s="]),
+        # L4 (the per-drain "PDFLIP SHORT-TO-P epoch= n= oldest_wait_s=" line) is gone: SOLL v2 R7 removed SHORT-TO-P
         "L5": (front_src, "PDFLIP LATE-BATCH", ["deferred_to_epoch="]),
         "L9": (sched_src, "PDFLIP X-GATE", ["uncached=", "X=", "replicated_term=", "verdict="]),
         "L10": (front_src, "PDFLIP X-ROUTE", ["est_uncached=", "X=", "ESTIMATE"]),
@@ -1322,7 +1321,7 @@ def test_a12_neither_admission_path_awaits_the_read_as_an_argument():
     A test that only exercises ``_d_reading_if_armed`` cannot see a call site
     that goes back to awaiting ``_d_pool_reading`` inline -- and that inline
     await is the entire defect, because argument evaluation happens first."""
-    for meth in (Front._acquire_short_seat, Front.d_admitter):
+    for meth in (Front._acquire_short_seat_core, Front.d_admitter):  # h16u S1: the short seat's body lives in the core
         tree = _fn_ast(meth)
         assert not _calls_named(tree, "_d_pool_reading"), (
             f"{meth.__name__} must obtain the reading through "
@@ -1340,7 +1339,9 @@ def test_a13_the_read_timeout_is_derived_from_its_own_freshness_bound():
     than ``D_POOL_MAX_AGE_S`` describes a pool state the next freshness check
     would discard anyway, so the timeout IS that bound."""
     assert front_mod.D_POOL_READ_TIMEOUT_S == front_mod.D_POOL_MAX_AGE_S
-    tree = _fn_ast(Front._d_pool_reading)
+    # NF-R2-DPOOL (20.10.): the round trip lives in ``_d_pool_fetch`` (a shared task); the decision in
+    # ``_d_pool_reading`` waits at most the arrival KV read budget (test_nf_r2_dpool_nowait_1020.py)
+    tree = _fn_ast(Front._d_pool_fetch)
     timeouts = [
         kw.value
         for node in ast.walk(tree)

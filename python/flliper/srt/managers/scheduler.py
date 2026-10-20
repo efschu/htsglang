@@ -196,6 +196,10 @@ from flliper.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     VramBudgetReqInput,
     VramBudgetReqOutput,
+    PdFlipLaneFloorReqInput,
+    PdFlipLivenessHoldOutput,
+    PdFlipMatchProbeReqInput,
+    PdFlipMatchProbeReqOutput,
     PdFlipParkRunningReqInput,
     PdFlipDualPLendReqInput,
     PdFlipParkWindowReqInput,
@@ -241,14 +245,29 @@ from flliper.srt.managers import pdflip_flush_nonblock as _pdflip_flush_nonblock
 from flliper.srt.pdflip import fork_anchor as _pdflip_fork
 from flliper.srt.pdflip import twin_anchor as _pdflip_twin_anchor  # TWIN ANCHOR (y4a 16-28)
 from flliper.srt.pdflip import d_park_read as _pdflip_park_read  # PARK-RETAIN READ
+from flliper.srt.pdflip import lanes_p as _lanes_p  # PRIORITY LANES 1008 (L3): the P-side lane floor
+from flliper.srt.pdflip import mixed_d_short as _mds_stamp  # MIXED-D chunk stamp + S50 total (short-chunked)
+from flliper.srt.managers import pdflip_told_ack_early as _pdflip_told_ack_early  # S50 TOLD-ACK-EARLY
 from flliper.srt.pdflip import resume_via_p as _pdflip_rvp  # RESUME-VIA-P
+from flliper.srt.pdflip import front_x as _pdflip_front_x  # FRONT-X-MIT: the front's decision X at D's X gate
+from flliper.srt.pdflip import d_wall_head as _pdflip_d_wall_head  # PW-R
+from flliper.srt.pdflip import d_head_hold as _pdflip_d_head_hold  # DQH
+from flliper.srt.pdflip import head_vote_hold as _pdflip_head_vote_hold  # S42
 from flliper.srt.pdflip import progress_beacon as _pdflip_beacon  # FP forward-progress beacon
+from flliper.srt.pdflip.d_lead_probe import build_d_lead_probe  # D-LEAD-MS-1007
+from flliper.srt.pdflip import d_extend_beacon as _pdflip_d_ext  # S49 D-EXTEND-BEACON (SOLL R6)
 from flliper.srt.pdflip.vision_verdict import PdFlipVisionVerdict  # H125f vision verdict on the chain
+from flliper.srt.pdflip.p_known_image import consume_at_origin as _pki_consume  # S66 P-KNOWN-IMAGE pixels at the origin
+from flliper.srt.pdflip.pp_loadback_verdict import PdFlipPpLoadbackVerdict  # LB-VERDICT-1014 on the chain
+from flliper.srt.pdflip import pp_loadback_verdict as _pdflip_lbv  # LBV-ADMIT (h16h 19:33:48Z)
+from flliper.srt.pdflip import form_a_post_admit as _pdflip_fa_post_admit  # S35: an admit reads CONTINUE on a Form A group
 from flliper.srt.pdflip import extend_trim as _pdflip_extend_trim  # rc12g extend chunk cap
 from flliper.srt.pdflip import d_seat_vram as _pdflip_d_seat_vram  # D-MEM-SCHED stage between wakes
 from flliper.srt.pdflip import d_transient_lend as _pdflip_d_transient_lend  # D-TRANSIENT-LEND
 from flliper.srt.pdflip import d_seat_rewake as _pdflip_d_seat_rewake  # D-SEAT-REWAKE: live seat re-plan
 from flliper.srt.pdflip import skip_first as _pdflip_skip_first  # E2 in a mixed wake cohort
+from flliper.srt.pdflip import d_decode_gap as _pdflip_d_decode_gap  # S48 D-DECODE-GAP instrument
+from flliper.srt.layers.moe import em_fetch_probe as _em_fetch_probe  # S78 EM-FETCH instrument
 from flliper.srt.layers.dcp import prefix_lens_check as _prefix_lens_check  # #639 ballot (skip: deferred)
 from flliper.srt.pdflip import short_read as _pdflip_short_read  # held short wake reads
 from flliper.srt.pdflip import tail_adopt as _pdflip_tail_adopt
@@ -308,6 +327,7 @@ from flliper.srt.managers.scheduler_components.invariant_checker import (
     SchedulerInvariantChecker,
     create_admission_wedge_watchdog,
     create_scheduler_watchdog,
+    idle_mamba_check_every,
 )
 from flliper.srt.managers.scheduler_components.ipc_channels import SchedulerIpcChannels
 from flliper.srt.managers.scheduler_components.kv_events_publisher import (
@@ -356,11 +376,18 @@ from flliper.srt.managers.utils import (
 )
 from flliper.srt.mem_cache.hicache_collective import bounded_wait
 from flliper.srt.mem_cache import kv_cache_builder
+from flliper.srt.rank_role import this_rank_is_form_a_worker
 from flliper.srt.planner import transient_census as _transient_census
 from flliper.srt.pdflip import tail_handoff
 from flliper.srt.pdflip import p_intake as _p_intake
 from flliper.srt.pdflip.dual_not_named_giveback import give_back_not_named  # Q-1220
+from flliper.srt.pdflip import prefill_oom_retreat as _prefill_oom_retreat  # fix 43: Prefill-OOM = retreat, not death
+from flliper.srt.pdflip.pp_slot_fidelity import AgreedRoomShort  # PREFILL-OOM-RETREAT, load-back entrance
+from flliper.srt.mem_cache.pool_host.arena_pool import ArenaChainMismatch  # ARENA-CHAIN: a refused load-back chain is a void pass
 from flliper.srt.mem_cache.common import (
+    PrefillOutOfPages,  # PREFILL-OOM-RETREAT (pdflip/prefill_oom_retreat.py)
+    cap_above_evictable,  # F1 (nf-next-1006-01)
+    publish_cap_blind_gap,  # F1 (nf-next-1006-01)
     release_admission_acquired_mamba_slot,
     evict_from_tree_cache,
     maybe_cache_unfinished_req,
@@ -662,7 +689,7 @@ def _hp1_group_retry_due(sched, req) -> bool:
     if callable(_arm):
         _arm(
             req,
-            str(getattr(req, "rid", "?"))[:8],
+            str(getattr(req, "rid", "?")),
             getattr(req, "_prefetch_span_tokens", None),
             True,
             "retry_backoff",
@@ -679,7 +706,7 @@ def _hp1_group_retry_due(sched, req) -> bool:
             "HP1 DEFER-RETRY BACKOFF rid=%s mark=%s pass=%d interval=%d "
             "(skipped=%d): the group-cut read is re-voted on a pass back-off, "
             "not every pass",
-            str(getattr(req, "rid", "?"))[:16],
+            str(getattr(req, "rid", "?")),
             getattr(req, "prefetch_deferred", None),
             n,
             interval,
@@ -701,6 +728,8 @@ def _hp1_group_retry_due(sched, req) -> bool:
 #: producer, and a boot census that could not tell them apart would send the
 #: next reader to the wrong half of the chain.
 _DEFER_REASON_STORE_SHORT = "store_prefix_short"
+
+
 #: The verdict `Scheduler._prefetch_kvcache` returns for a read that REGISTERED
 #: and was cut by the post-consensus group trim. Not a decline: the read exists.
 _VERDICT_TRUNCATED_GROUP = "issued:truncated_group"
@@ -708,6 +737,50 @@ _VERDICT_TRUNCATED_GROUP = "issued:truncated_group"
 #: prefix it asked for (``PrefetchOutcome.is_incomplete``). ``terminated:`` and
 #: not ``issued:`` because this read is over -- what is owed is a re-issue.
 _VERDICT_STORE_SHORT = "terminated:store_short"
+#: S23: the READ-DEPTH causes that are the arena's room pressure (arena_full = no slot after the room wait; the two
+#: ``*_evicted_before_ref`` = the eviction clock took a page the read had found / landed) -- a short read with one of
+#: these (or none recorded) is a CAPACITY-CUT; every other cause is a HELD-CUT.
+_CAPACITY_CUT_CAUSES = (None, "arena_full", "l2_evicted_before_ref", "fill_evicted_before_ref")
+
+#: S64 S-ARM: the D store arm (#1317 X-STORE-VOTE) is asked fresh in every vote.
+S64_STORE_ARM_FRESH_ENV = "FLLIPER_PDFLIP_S64_STORE_ARM_FRESH"
+
+
+def _s64_store_arm_fresh_on(env=None) -> bool:
+    v = (env if env is not None else os.environ).get(S64_STORE_ARM_FRESH_ENV, "1")
+    return str(v).strip().lower() not in ("0", "false", "no", "off", "")
+
+
+def _s64_note_store_arm(sched, rid, key, cached, pages, page_size, ms) -> None:
+    """S64 S-ARM instrument: the cost of the fresh probe (ms, counted per vote)
+    and every rid whose fresh answer differs from what the generation-keyed
+    cache held for the SAME key -- the token delta the old arm would have
+    priced. Never raises (a vote may never break the reduce)."""
+    try:
+        sched._s64_store_arm_probes = getattr(sched, "_s64_store_arm_probes", 0) + 1
+        sched._s64_store_arm_ms = getattr(sched, "_s64_store_arm_ms", 0.0) + float(ms)
+        sched._s64_store_arm_ms_max = max(getattr(sched, "_s64_store_arm_ms_max", 0.0), float(ms))
+        n = sched._s64_store_arm_probes
+        if n <= 3 or n % 64 == 0:
+            logger.info(
+                "S64 STORE-ARM COST probes=%d ms_sum=%.1f ms_mean=%.3f ms_max=%.3f (the fresh store-arm probe of "
+                "the D X gate, scheduler thread; denominator: every probe the vote asked)", n,
+                sched._s64_store_arm_ms, sched._s64_store_arm_ms / max(1, n), sched._s64_store_arm_ms_max)
+        if cached is None or cached[0] != key or int(cached[1]) == int(pages):
+            return
+        d_tok = (int(pages) - int(cached[1])) * int(page_size)
+        sched._s64_store_arm_stale = getattr(sched, "_s64_store_arm_stale", 0) + 1
+        sched._s64_store_arm_stale_tok = getattr(sched, "_s64_store_arm_stale_tok", 0) + abs(d_tok)
+        k = sched._s64_store_arm_stale
+        if k <= 64 or k % 256 == 0:
+            logger.warning(
+                "S64 STORE-ARM STALE rid=%s gen=%d local_match=%d span=%d cached=%d fresh=%d delta=%+d (k=%d "
+                "tok_sum=%d): the store changed under an unchanged key -- the generation-keyed cache would have "
+                "priced %d tokens; the vote prices the store as it is now", rid, int(key[0]), int(key[1]),
+                int(key[2]), int(cached[1]) * int(page_size), int(pages) * int(page_size), d_tok, k,
+                sched._s64_store_arm_stale_tok, int(cached[1]) * int(page_size))
+    except Exception:  # noqa: BLE001 - an instrument
+        pass
 
 # #1068 A12.2: why the prefetch deferral is REFUSED on a rank/phase, by name.
 # MODULE-LEVEL on purpose: `_prefetch_deferral_refusal_reason` is bound to
@@ -838,7 +911,7 @@ def _pdflip_fork_match_end(req, match_end: int, exact_bigram: bool = False) -> i
         logger.info(
             "PDFLIP FORK-ANCHOR SPAN n=%d rid=%s store read ends at the fork %d, not %d "
             "(a fork-cut P leg wrote exactly that far; the tail is D's own extend)",
-            n, str(getattr(req, "rid", "?"))[:16], fork, match_end,
+            n, str(getattr(req, "rid", "?")), fork, match_end,
         )
     return fork
 
@@ -963,6 +1036,25 @@ def _pdflip_store_short_tail_x(sched) -> int:
 #: seconds (every rank marks off the group-synced record in the same pass);
 #: not counted while this group sleeps (P can still publish then, xsn344).
 STORE_SHORT_MAX_CYCLES_ENV = "FLLIPER_PDFLIP_STORE_SHORT_MAX_CYCLES"
+#: STORE-HELD-DECIDE-1014 (NF h16 a2cfc77f76, D TP0 15:27:55-15:28:16, pdflip-8-68): the
+#: store-short wait exists for a WRITER still filling the store (P's asynchronous
+#: write-through). A read that ended short of what the store ALREADY holds
+#: (``deliverable`` = the store's hit, #248h) and did not grow on its re-read has no
+#: writer to wait for: 64576 of 175872 held, four identical 5.2-s re-reads, 21 s of a
+#: stalled D before the fallback. On (default): one re-read without growth decides.
+#: 0: the bound of FLLIPER_PDFLIP_STORE_SHORT_MAX_CYCLES alone, as before.
+STORE_HELD_DECIDE_ENV = "FLLIPER_PDFLIP_STORE_SHORT_HELD_DECIDE"
+
+
+def _pdflip_store_held_short(req) -> bool:
+    """STORE-HELD-DECIDE-1014: the store holds more than this request's read
+    delivered (the shortfall is not a missing write). Group-uniform: both terms
+    are the group-synced END-vote reading the drain wrote (HFB)."""
+    if (os.environ.get(STORE_HELD_DECIDE_ENV, "1") or "1").strip().lower() in ("0", "false", "no", "off"):
+        return False
+    delivered = int(getattr(req, "_pdflip_store_delivered", 0) or 0)
+    held = int(getattr(req, "_pdflip_store_deliverable", 0) or 0)
+    return held > delivered > 0
 
 
 #: DUAL-TP3PP3 (metal tnybbz 30.09., D rid pdflip-0-8): the 4-cycle bound is
@@ -1070,7 +1162,7 @@ def _pdflip_store_short_reroute(sched, req, span, site: str, cause: str, detail:
         "site=%s %s n=%d -- the store read ended short and the remainder "
         "exceeds X: released to the X gate on the delivered prefix, which "
         "re-routes it through P by name (RESUME-VIA-P / W50); not a 503",
-        str(getattr(req, "rid", "?"))[:16], cause,
+        str(getattr(req, "rid", "?")), cause,
         int(getattr(req, "_pdflip_store_delivered", 0) or 0),
         -1 if remainder is None else int(remainder),
         _pdflip_store_short_tail_x(sched), span, site, detail, n,
@@ -1090,21 +1182,25 @@ def _pdflip_store_short_fallback(sched, req, reason: str, span, site: str) -> Op
         return None
     cycles = _pdflip_store_short_cycle(sched, req)
     settled = _pdflip_settled_this_wake(sched, req)
-    # WT: no writer after this wake's settle -- the first short read decides
-    bound = 0 if settled else _pdflip_store_short_max_cycles()
+    held = _pdflip_store_held_short(req)
+    # WT: no writer after this wake's settle -- the first short read decides;
+    # STORE-HELD-DECIDE-1014: the store already holds what the read missed --
+    # the first re-read without growth decides
+    bound = 0 if settled else (1 if held else _pdflip_store_short_max_cycles())
     if cycles <= bound:
         return None
     x = _pdflip_store_short_tail_x(sched)
     remainder = _pdflip_store_short_remainder(req)
     tail = -1 if remainder is None else int(remainder)
     delivered = int(getattr(req, "_pdflip_store_delivered", 0) or 0)
-    rid = str(getattr(req, "rid", "?"))[:16]
+    rid = str(getattr(req, "rid", "?"))
     if x > 0 and (remainder is None or remainder > x) and _pdflip_windowed_path(sched):
         # W88 CYCLE (29.09.): over X is a RE-ROUTE, not a 503 -- see
         # `_pdflip_store_short_reroute`.
         return _pdflip_store_short_reroute(
             sched, req, span=span, site=site, cause="over_x",
-            detail=f"cycles={cycles} bound={bound}",
+            detail=f"cycles={cycles} bound={bound}"
+            + (f" store_held={int(getattr(req, '_pdflip_store_deliverable', 0) or 0)}" if held else ""),
         )
     from flliper.srt.mem_cache.match_refusal_census import (
         note_prefetch_gate as _note_prefetch_gate,
@@ -1114,14 +1210,25 @@ def _pdflip_store_short_fallback(sched, req, reason: str, span, site: str) -> Op
     req._pdflip_store_short_fallback = True
     _note_prefetch_gate("defer_expired")
     sched._pdflip_store_short_fallbacks = getattr(sched, "_pdflip_store_short_fallbacks", 0) + 1
+    # S64 S-CAP: the reason names capacity (delivered fell / a room cut) apart
+    # from a store that genuinely held no more -- an instrument, no decision.
+    from flliper.srt.pdflip import short_read_cause as _src
+
+    _reason = _src.of_request(req, held, settled)
+    _causes = getattr(sched, "_s64_short_causes", None)
+    if _causes is None:
+        _causes = sched._s64_short_causes = {}
+    _causes[_reason] = _causes.get(_reason, 0) + 1
     logger.warning(
         "PREFETCH-DEFER-FALLBACK rid=%s delivered=%d tail=%d X=%d cycles=%d "
-        "bound=%d reason=" + ("settled_no_writer" if settled else "no_writer_progress")
+        "bound=%d reason=" + _reason + " prev_delivered=%s cut_cause=%s causes=%s"
         + " span=%s site=%s n=%d -- the store "
         "read terminated short %d times in a row without delivering more; no "
         "writer is filling the tail, so the matched prefix is taken and D "
         "extends the rest (the X gate prices it with the group's match)",
-        rid, delivered, tail, x, cycles, bound, span, site,
+        rid, delivered, tail, x, cycles, bound,
+        getattr(req, _src.PREV_DELIVERED_ATTR, None), getattr(req, _src.CUT_CAUSE_ATTR, None),
+        dict(sorted(_causes.items())), span, site,
         sched._pdflip_store_short_fallbacks, cycles,
     )
     return "expired"
@@ -1160,7 +1267,7 @@ def _pdflip_store_short_recompute(sched, req, reason: str, span) -> Optional[str
     sched._pdflip_store_tail_recomputed = n
     # weg2rc2: one parked request printed this line 569 times per rank in 20 s.
     # Per request: the 1st, 2nd, 4th, 8th, ... occurrence (n stays the total).
-    rid = str(getattr(req, "rid", "?"))[:16]
+    rid = str(getattr(req, "rid", "?"))
     per = getattr(sched, "_pdflip_store_tail_per_rid", None)
     if per is None or len(per) > 4096:
         per = sched._pdflip_store_tail_per_rid = {}
@@ -1236,8 +1343,35 @@ def _pdflip_producer_wake_verdict(sched, req) -> str:
     if n <= 8 or n % 64 == 0:
         logger.info("#TK WAKE-REREAD rid=%s span=%d verdict=%s (n=%d): the hold read "
                     "answered zero; one final read of the store at the wake, no park "
-                    "(P computes what the store lacks)", str(rid)[:12], span, verdict, n)
+                    "(P computes what the store lacks)", str(rid), span, verdict, n)
     return "complete"
+
+
+def _lbv_compose(sched, other):
+    """LB-VERDICT-1014: PP0's load-back verdicts join the origin's extra requests (after the vision verdicts and
+    aborts, which lead); armed here on every stage, the verdicts are produced on PP0 only."""
+    from flliper.srt.pdflip import pp_loadback_verdict as _lbv
+
+    if not _lbv.arm(sched):
+        return other
+    if int(getattr(getattr(sched, "ps", None), "pp_rank", 0) or 0) != 0:
+        return other
+
+    def _hook():
+        out = list(other() or ()) if other is not None else []
+        out.extend(_lbv.take(getattr(sched, "tree_cache", None)))
+        return out
+
+    return _hook
+
+
+def _prefetch_rid_stop():
+    """PREFETCH-RID-NET-1014: the exception class of the named group stop (lazy: the
+    radix cache module is not imported at scheduler import time). The settle's
+    'never die on a top-up' handlers re-raise it -- raenge-nie-uneins-crash-stop."""
+    from flliper.srt.mem_cache.unified_radix_cache import PrefetchRidMismatch
+
+    return PrefetchRidMismatch
 
 
 def _pdflip_settle_writer_action(sched, req) -> str:
@@ -1255,10 +1389,11 @@ def _pdflip_settle_writer_action(sched, req) -> str:
         now_state = prev  # the hand-off directory is listed at most every 100 ms per request
     else:
         try:
-            now_state = _sw.observe(req)
+            # S75: the page size bounds what P can still write (P-span); a stand-in has none
+            now_state = _sw.observe(req, page_size=getattr(sched, "page_size", None))
         except Exception as exc:  # noqa: BLE001 - unknown = the old poll, never a guess
             logger.info("#1471w SETTLE-WRITER rid=%s n/a (%s: %s) -- 2 s re-read as before",
-                        str(getattr(req, "rid", "?"))[:12], type(exc).__name__, exc)
+                        str(getattr(req, "rid", "?")), type(exc).__name__, exc)
             return "poll"
         req._1471w_t = t
     act, ack = _sw.step(prev, now_state, getattr(req, "_1471w_ack", None))
@@ -1272,8 +1407,10 @@ def _pdflip_settle_writer_action(sched, req) -> str:
             "decide": "no writer can fill the rest: decided now",
             "poll": "a writer without a visible ack: the 2 s re-read stays",
         }[act]
-        logger.info("#1471w SETTLE-WRITER rid=%s writer=%s prev=%s action=%s -- %s",
-                    str(getattr(req, "rid", "?"))[:12], now_state, prev, act, _what)
+        _why = getattr(req, _sw.WHY_ATTR, None)  # S75: why a record/chain names no P writer
+        logger.info("#1471w SETTLE-WRITER rid=%s writer=%s prev=%s action=%s%s -- %s",
+                    str(getattr(req, "rid", "?")), now_state, prev, act,
+                    f" not_p={_why}" if _why else "", _what)
     return act
 
 
@@ -1289,7 +1426,7 @@ def _pdflip_settle_no_writer_line(sched, req, now: float) -> None:
         "hand-off chain, no tail part and none under write: nothing can fill the rest, so the "
         "request goes to admission now (D prefills within X; over X the X gate refuses by name "
         "and the front re-routes via P)",
-        str(getattr(req, "rid", "?"))[:12], "?" if rem is None else rem, x, _sw.route(rem, x),
+        str(getattr(req, "rid", "?")), "?" if rem is None else rem, x, _sw.route(rem, x),
         now - float(getattr(req, "_1471_since", now)), int(getattr(req, "_1456_n", 0) or 0),
     )
 
@@ -1411,6 +1548,23 @@ def _pdflip_regroup_chain_tail(node, depth: int = 5) -> str:
     return ",".join(out) or "-"
 
 
+def _pp_chunked_continuation_not_named(sched, incoming, req) -> bool:
+    """The #992 predicate: this rank executes a forwarded schedule that does not name its chunked continuation `req`, so the
+    seat is refused (the continuation is kept, `add_chunked_req` is not called).
+
+    PRIORITY LANES 1008 (L3, pdflip/lanes_p.py): a continuation the stamped lane floor holds is NOT a seat this gate has to
+    refuse -- it takes no chunk and no budget (`add_chunked_req` parks it in place and returns before it touches
+    `can_run_list`), and the follower MUST reach that park, or PP1/PP2 keep the device rows of the parked lane locked while
+    PP0 has given its own back (L3 review, finding 1: under the default row authority every follower holds an effective map,
+    `{}` included, so without this exemption a lane hold never left PP0). Without lane state (switch off / no RPC)
+    `continuation_held` is False and this is the expression it was."""
+    return (
+        incoming is not None
+        and incoming.get(req.rid) is None
+        and not _lanes_p.continuation_held(sched, req)
+    )
+
+
 def _len_or_zero(x) -> int:
     """``len(x)`` for a list or a tensor, 0 for None -- never ``x or ()``: the
     truth value of an empty tensor raises (27B rc12z9 D 08:23:24, all three
@@ -1459,7 +1613,7 @@ def _head_vote_len(req) -> int:
                 "#823 HEAD-VOTE ANCHOR rid=%s matched=%d (device %d + host %d) "
                 "anchor_depth=%d vote=%d (n=%d): a device node without a state "
                 "below the host chain counts toward the materializable prefix",
-                str(getattr(req, "rid", "?"))[:16], n,
+                str(getattr(req, "rid", "?")), n,
                 _len_or_zero(getattr(req, "prefix_indices", None)),
                 int(getattr(req, "host_hit_length", 0) or 0), int(anchor), vote, k,
             )
@@ -1480,6 +1634,47 @@ def _pdflip_device_idle(sched) -> bool:
     if getattr(sched, "enable_overlap", False) and len(getattr(sched, "result_queue", ()) or ()):
         return False
     return getattr(sched, "chunked_req", None) is None
+
+
+def _pdflip_liveness_hold_publish(sched) -> bool:
+    """LIVEPARK (14.10.): publish the requests group D holds ON PURPOSE --
+    flip / lane / RESUME-VIA-P parks (``pdflip_d_parked``), the #1443 dormant
+    hold (``pdflip_dormant_hold``) and the #1471 wake read
+    (``pdflip_post_wake_settle``) -- to the tokenizer, whose LLM-stream
+    liveness watchdog then pauses the silence clock of those streams and
+    restarts it at the resumption (srt/liveness/hold.py). Without it the
+    watchdog took a parked stream for a dead client after 90 s and aborted
+    it (NF 1014_073255 D.log Z.403857, front 503 Z.27137).
+
+    Called once per loop iteration from ``Scheduler.process_input_requests``
+    (every loop family); a module function, so the partial schedulers the
+    unit tests drive through that method need no new attribute. Sends only
+    when the set changed: on a server that never parks, a few attribute reads
+    and nothing else. The whole set each time (replace semantics), so a
+    dropped notice heals at the next change. Never raises into the loop.
+    Returns whether a notice was sent. Multi-HTTP-worker mode (no worker ipc
+    to route a one-way notice to) publishes nothing: the old watchdog."""
+    try:
+        if int(getattr(getattr(sched, "server_args", None), "tokenizer_worker_num", 1) or 1) > 1:
+            return False
+        last = getattr(sched, "_pdflip_liveness_hold_sent", None)
+        rids = set()
+        for attr in ("pdflip_d_parked", "pdflip_dormant_hold", "pdflip_post_wake_settle"):
+            for r in getattr(sched, attr, None) or ():
+                rid = getattr(r, "rid", None)
+                if rid:
+                    rids.add(str(rid))
+        if not rids and not last:
+            return False
+        cur = frozenset(rids)
+        if cur == last:
+            return False
+        sched._pdflip_liveness_hold_sent = cur
+        sched.ipc_channels.send_to_tokenizer.send_output(PdFlipLivenessHoldOutput(held=sorted(cur)))
+        return True
+    except Exception as e:  # noqa: BLE001 -- a lost notice heals at the next change
+        logger.warning("LIVEPARK hold notice not sent (%s: %s)", type(e).__name__, e)
+        return False
 
 
 def _pdflip_resume_warm_tick(sched) -> int:
@@ -1617,7 +1812,7 @@ def _pdflip_prefetch_span_start(sched, req, matched_len: int) -> int:
         logger.info(
             "FA PREFETCH-FROM-ANCHOR rid=%s matched=%d (device %d + host %d) anchor=%d (n=%d): "
             "the store read starts at the host chain's end, where its last hash is",
-            str(getattr(req, "rid", "?"))[:16], int(matched_len),
+            str(getattr(req, "rid", "?")), int(matched_len),
             _len_or_zero(getattr(req, "prefix_indices", None)),
             int(getattr(req, "host_hit_length", 0) or 0), int(anchor), k,
         )
@@ -1683,10 +1878,15 @@ def _pdflip_store_presence(
     # extra_key) -- the unsalted chain is another tenant's pages.
     _ek = getattr(req, "extra_key", None)
     _ns = {"extra_key": _ek} if _ek is not None else {}
+    # MAMBA-ANCHOR 1015 (pdflip/presence_fetch_key.py): the span in the fetch's
+    # key form -- the bigram RadixKey on every Weg-2 tree, not the id list
+    from flliper.srt.pdflip import presence_fetch_key as _pfk
+
+    _span = _pfk.span_key(getattr(sched, "tree_cache", None), req, tokens)
     if keys:
-        pages = probe(tokens, last_hash, prefix_keys, page_keys=keys, **_ns)
+        pages = probe(_span, last_hash, prefix_keys, page_keys=keys, **_ns)
     else:
-        pages = probe(tokens, last_hash, prefix_keys, **_ns)
+        pages = probe(_span, last_hash, prefix_keys, **_ns)
     present = bool(pages)
     req._pp_store_presence_cache = (key, present)
     tree = getattr(sched, "tree_cache", None)
@@ -1714,10 +1914,11 @@ def _pdflip_store_presence(
     if n <= 64 or n % 256 == 0 or miss:
         logger.info(
             "H108 PRESENCE-PROBE rid=%s keys=%s covered=%d span_tokens=%d matched=%d "
-            "pages=%d present=%s (n=%d): the #950 verdict this rank carries into the "
+            "pages=%d present=%s form=%s (n=%d): the #950 verdict this rank carries into the "
             "#580 vote, asked with the keys the fetch reads with",
-            str(getattr(req, "rid", "?"))[:16], src, len(keys) if keys else 0,
-            len(tokens), int(matched_len), int(pages or 0), present, n,
+            str(getattr(req, "rid", "?")), src, len(keys) if keys else 0,
+            len(tokens), int(matched_len), int(pages or 0), present,
+            "bigram" if getattr(_span, "is_bigram", False) else "ids", n,
         )
     return present
 
@@ -1844,6 +2045,63 @@ def _pdflip_release_reset_redundant(sched, zero_kv) -> bool:
     return True
 
 
+def _s88_deferred_reachability(scheduler, scanned_ids) -> None:
+    """S88 DEFERRED-UNREACHABLE: the riegel behind the S88 scan fix.
+
+    A #1400-held rid (``_pdflip_store_held``) whose #1068 mark stands gets
+    its told only after `_retry_deferred_prefetches` re-issues the read
+    (pp0_publish skips a marked rid), and the deferral's own exits
+    (LANDED / RELEASED / #1317k STALLED / DROPPED) are reached only from
+    that retry. So a marked held request that is in NEITHER this scan NOR
+    the dormant hold / post-wake settle (TK path 4: released into the queue
+    later) has no way out -- the 20.10. 07:16-07:18 class. Named ERROR
+    once per rid when it is unreachable in two CONSECUTIVE scans (one scan
+    alone can be the abort window before the next pp0_publish drops the
+    held entry), counted; no self-heal, no timer, no decision changed.
+    """
+    held = scheduler.__dict__.get("_pdflip_store_held")
+    prev = scheduler.__dict__.get("_s88_unreach_prev") or set()
+    if not held:
+        scheduler._s88_unreach_prev = set()
+        return
+    try:
+        parked = pdflip_store_told._parked(scheduler)
+    except Exception:  # noqa: BLE001 -- unknown: count nothing parked
+        parked = set()
+    now = set()
+    for rid, req in list(held.items()):
+        if getattr(req, "prefetch_deferred", None) is None:
+            continue
+        if id(req) in scanned_ids or rid in parked:
+            continue
+        if getattr(req, "finished_reason", None) is not None:
+            continue
+        now.add(rid)
+    scheduler._s88_unreach_prev = now
+    said = scheduler.__dict__.setdefault("_s88_unreach_said", set())
+    for rid in sorted(now & prev):
+        if rid in said:
+            continue
+        said.add(rid)
+        scheduler._s88_deferred_unreachable = (
+            int(scheduler.__dict__.get("_s88_deferred_unreachable", 0) or 0) + 1
+        )
+        req = held.get(rid)
+        logger.error(
+            "S88 DEFERRED-UNREACHABLE rid=%s reason=%s in_queue=%d "
+            "vision_parked=%d n=%d: a #1400-held request with a #1068 "
+            "deferral mark is outside the retry scan for two passes -- no "
+            "re-issue, no told, no deferral exit can reach it",
+            rid,
+            getattr(req, "prefetch_deferred", None),
+            int(any(r is req for r in scheduler.waiting_queue)),
+            int(any(r is req for r in (scheduler.__dict__.get("_pdflip_vision_parked_reqs") or ()))),
+            scheduler._s88_deferred_unreachable,
+        )
+    if len(said) > 4096:
+        said.clear()
+
+
 class Scheduler(
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
@@ -1853,6 +2111,11 @@ class Scheduler(
     SchedulerMlxOverlapMixin,
 ):
     """A scheduler that manages a tensor parallel GPU worker."""
+
+    # D-LEAD-MS-1007: set in init_pdflip_d_lead_probe; None = no lead line.
+    pdflip_d_lead_probe = None
+    # S49 D-EXTEND-BEACON: set in init_pdflip_d_lead_probe; None = off / not group D.
+    pdflip_d_ext_beacon = None
 
     def __init__(
         self,
@@ -2277,6 +2540,10 @@ class Scheduler(
         self.init_pool_stats_observer()
 
         self.init_invariant_checker()
+
+        self.init_pdflip_d_lead_probe()
+
+        self.init_pdflip_d_head_hold()
 
         self.init_kv_events_publisher()
 
@@ -3493,6 +3760,23 @@ class Scheduler(
             self.chunked_prefill_size is not None
             and self.server_args.enable_mixed_chunk
         )
+        # MIXED-D (S32, user 18.10.): on the Weg-2 D group (tp_prefill_max_tokens = X > 0) the upstream mixed-chunk
+        # path (fLLiper PR #36933, EAGLE ok) is armed by default, but only for SHORT prefill batches (the gate in
+        # _get_new_batch_prefill_raw, pdflip/mixed_d_short.py). FLLIPER_PDFLIP_MIXED_D_SHORT=0 = off.
+        from flliper.srt.pdflip import mixed_d_short as _mds
+
+        self._mixed_d_short = bool(
+            self.chunked_prefill_size is not None
+            and _mds.enabled()
+            and int(getattr(self.server_args, "tp_prefill_max_tokens", 0) or 0) > 0
+            and (self.spec_algorithm.is_none() or self.spec_algorithm.supports_mixed_chunk())
+            and not any(
+                getattr(self.server_args, n, False)
+                for n in ("enable_kv_session_offload", "weightless_kv_fastlane")
+            )
+        )
+        if self._mixed_d_short:
+            self.is_mixed_chunk = True
 
         # --p-chunk-policy (pdflip/p_chunk_policy.py, 25.09.): the P group's
         # per-request chunk plan. None unless the launcher handed this rank
@@ -4141,9 +4425,12 @@ class Scheduler(
                 (SessionCheckpointReqInput, self.handle_session_checkpoint),
                 (VramBudgetReqInput, self.handle_vram_budget),
                 (PdFlipParkRunningReqInput, self.handle_pdflip_park_running),
+                (PdFlipMatchProbeReqInput, self.handle_pdflip_match_probe),
+                (PdFlipLaneFloorReqInput, self.handle_pdflip_lane_floor),
                 (PdFlipParkWindowReqInput, self.handle_pdflip_park_window),
                 (PdFlipDualPLendReqInput, self.handle_pdflip_dual_p_lend),
                 (PdFlipVisionVerdict, self.handle_pdflip_vision_verdict),
+                (PdFlipPpLoadbackVerdict, self.handle_pdflip_pp_loadback_verdict),
                 (PlePrefetchHintReqInput, self.handle_ple_prefetch_hint),
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
@@ -4615,6 +4902,8 @@ class Scheduler(
         # watchdog thread (it silenced PP0's detector on 2026-08-22).
         _t_in = time.perf_counter()  # #1476b: name the untimed tail of this method
         drain_recovery_request(self)
+        # LIVEPARK (14.10.): D's held set to the stream watchdogs, on change only
+        _pdflip_liveness_hold_publish(self)
         _t_rec_ms = (time.perf_counter() - _t_in) * 1000.0
         # #969 §W3: take PP0's flip decision off the stream before anything
         # else looks at the list. THIS site is the one place every loop family
@@ -4664,7 +4953,7 @@ class Scheduler(
                 # took 200 ms -- name the request kind and split dispatch vs the
                 # output send back to the tokenizer.
                 logger.info("#1476 DISPATCH kind=%s rid=%s dispatch_ms=%.0f send_ms=%.0f",
-                            type(recv_req).__name__, str(getattr(recv_req, "rid", "-"))[:12], _d_ms, _s_ms)
+                            type(recv_req).__name__, str(getattr(recv_req, "rid", "-")), _d_ms, _s_ms)
         _t_fw = time.perf_counter()
         self.flush_wrapper.check_pending()
         _fw_ms = (time.perf_counter() - _t_fw) * 1000.0
@@ -4886,6 +5175,7 @@ class Scheduler(
                     req.rid, local, price, budget,
                     running_empty=running_empty, now=time.monotonic(),
                 )
+            _numbers = {}
             code = _tmf.form_a_admission_verdict(
                 req.rid,
                 local,
@@ -4897,6 +5187,15 @@ class Scheduler(
                 drained=drained,
                 stop=stop,
                 on_host_drain=_worker_drain if _drain_rides else None,
+                sink=_numbers,
+            )
+            # Q-702 (Auftrag 1522): the GROUP's gate numbers of this call -- the
+            # host's (or, under the token cut, the decider's), identical on every
+            # rank. A worker's own gate said ADMIT (its pool is not the host's),
+            # so its adder never wrote a lifetime refusal; the SEAT-AGE verdict
+            # (`pdflip/d_park_runtime.note_adder_refusal`) reads these instead.
+            _follow.last_verdict = (
+                str(req.rid), code, _numbers.get("price"), _numbers.get("budget")
             )
             return None if code == _tmf.ADMISSION_ADMIT else AddReqResult[code]
 
@@ -4906,6 +5205,7 @@ class Scheduler(
         # Under the token cut the verdict is a gather of real gates on every
         # rank -- unchanged there.
         _follow.host_decides_load_back = bool(is_host) and _gather is None
+        _follow.last_verdict = None  # Q-702: (rid, code, price, budget) of the last call
         return _follow
 
     def _form_a_extend_set_riegel(self, can_run_list) -> None:
@@ -4916,13 +5216,24 @@ class Scheduler(
             return
         from flliper.srt.managers import tp_match_floor as _tmf
 
-        _tmf.form_a_extend_set_check(
+        follow = _tmf.form_a_extend_set_check(
             _tmf.form_a_extend_set(can_run_list),
             is_host=is_host,
             exchange=lambda p: self._form_a_tp_exchange(
                 "form-a-admission/tp<-extend-set", p
             ),
+            # H105f: this rank's prompt length per entry -- a difference in the
+            # end of a chunk that stays chunked is the host's to decide
+            fill_lens=[
+                len(getattr(r, "full_untruncated_fill_ids", ()) or ())
+                for r in can_run_list
+            ],
         )
+        if follow:
+            for r in can_run_list:
+                end = follow.get(str(getattr(r, "rid", "?")))
+                if end is not None:
+                    r.set_extend_range(int(r.extend_range.start), int(end))
 
     def init_request_receiver(self) -> None:
         # #1233 (WEG 2, S0): both were built only under the flip, to let an
@@ -4943,6 +5254,13 @@ class Scheduler(
             self.pp_flip_counters = _prow.build_counters(self)
             self.pp_chain_receiver = _prow.build_chain_receiver(self, self.pp_flip_counters)
             _prow.start_check(self)
+        # PDFLIP MODE-PARITY (h16m 1014, N4): every rank of a Weg-2 group states
+        # its priority mode once (no collective); the front compares the
+        # groups' published mode with its own and stops by name on a mismatch.
+        if os.environ.get("FLLIPER_PDFLIP_GROUP", "").strip().upper() in ("P", "D"):
+            from flliper.srt.pdflip import mode_parity as _mode_parity
+
+            _mode_parity.log_rank(self)
         # PDFLIP VISION (user design 2026-09-24): PP0 of a transient P group
         # encodes images in its OWN process, on its KV tail, before the
         # admission (pdflip/vision_rank_runner.py). False on every other boot
@@ -4979,6 +5297,20 @@ class Scheduler(
                 from flliper.srt.pdflip.vision_rank_runner import transient_p_boot
 
                 self._pdflip_vision_follower_gate = transient_p_boot() and _vv.arm(self)
+        # W27 RID-SPLIT (NF nf9 04.10., pdflip/intake_origin_abort.py): PP0's
+        # intake-stall drop rides the request wire, so every PP stage drops
+        # the rid in the same pass (group P origin with pp>1 only).
+        from flliper.srt.pdflip import intake_origin_abort as _ioa
+
+        self._pdflip_intake_origin_aborts = _ioa.IntakeOriginAborts(
+            relay=_ioa.relay_applies(
+                group=os.environ.get("FLLIPER_PDFLIP_GROUP"),
+                pp_size=self.ps.pp_size,
+                pp_rank=self.ps.pp_rank,
+                attn_tp_rank=self.ps.attn_tp_rank,
+                attn_cp_rank=self.ps.attn_cp_rank,
+            )
+        )
         self.request_receiver = SchedulerRequestReceiver(
             recv_from_tokenizer=self.ipc_channels.recv_from_tokenizer,
             recv_from_rpc=self.ipc_channels.recv_from_rpc,
@@ -5032,7 +5364,18 @@ class Scheduler(
             ),
             # PDFLIP VISION: PP0's named aborts of refused stages, injected at
             # the origin so every rank drops the same rids in the same pass.
-            origin_extra_reqs_hook=_vision_origin_aborts,
+            # W27 RID-SPLIT: then PP0's intake-stall drops (vision leads).
+            origin_extra_reqs_hook=_ioa.origin_hook(
+                self._pdflip_intake_origin_aborts,
+                _lbv_compose(self, _vision_origin_aborts),
+            ),
+            # S66 P-KNOWN-IMAGE: the pixels P's tokenizer sends for a held known
+            # image are applied at the origin (PP0), never relayed down the chain
+            origin_consume_hook=(
+                (lambda reqs: _pki_consume(self, reqs))
+                if getattr(self, "_pdflip_vision_rank_stage", False)
+                else None
+            ),
         )
 
     def _health_check_gate(self) -> Tuple[bool, int, int]:
@@ -5150,7 +5493,106 @@ class Scheduler(
             # the on-idle ledger keeps auditing the boot phase's pool for the
             # rest of the process -- see SchedulerInvariantChecker._allocator.
             get_token_to_kv_pool_allocator=lambda: self.token_to_kv_pool_allocator,
+            idle_mamba_check_every=idle_mamba_check_every(
+                group=os.environ.get("FLLIPER_PDFLIP_GROUP", ""),
+                every=envs.FLLIPER_PDFLIP_IDLE_MAMBA_CHECK_EVERY.get(),
+            ),
         )
+
+    def init_pdflip_d_lead_probe(self) -> None:
+        self.pdflip_d_lead_probe = build_d_lead_probe(
+            group=os.environ.get("FLLIPER_PDFLIP_GROUP", "")
+        )
+        # S49 (SOLL R6, user 18.10. "Nur echt laufend zählt"): which rids D really began to prefill, for the front
+        self.pdflip_d_ext_beacon = _pdflip_d_ext.build(
+            group=os.environ.get("FLLIPER_PDFLIP_GROUP", "")
+        )
+
+    def init_pdflip_d_head_hold(self) -> None:
+        # DQH (pdflip/d_head_hold.py): a refused D head is re-evaluated on a change
+        self.pdflip_d_head_hold = _pdflip_d_head_hold.build(
+            group=os.environ.get("FLLIPER_PDFLIP_GROUP", "")
+        )
+
+    def _pdflip_d_head_fingerprint(self, running_batch, prefetch_verdicts) -> Optional[tuple]:
+        """DQH: what the held head's verdict reads (replicated values).
+        ``prefetch_verdicts`` is this iteration's drain memo as the pass found
+        it (the pass consumes it, so the caller reads it before the pass)."""
+        try:
+            from flliper.srt.mem_cache.hicache_phase_binding import current_generation
+
+            gen = int(current_generation())
+        except Exception:  # noqa: BLE001 - no binding: a constant term, the rest decides
+            gen = None
+        return _pdflip_d_head_hold.fingerprint(
+            hol_state=self.__dict__.get("_pdflip_hol"),
+            waiting=self.waiting_queue,
+            running=running_batch.reqs if running_batch is not None else (),
+            prefetch_verdicts=prefetch_verdicts,
+            continuation=self.chunked_req is not None or bool(getattr(self, "anchor_tails", None)),
+            generation=gen,
+        )
+
+    def _pdflip_dqh_holds(self, running_batch) -> bool:
+        """DQH in the elif chain. S42 (pdflip/head_vote_hold.py): the budget site
+        of this iteration already took the decision -- and abstained from the
+        head vote when it held -- so its answer is consumed, not asked again;
+        without one (single rank, offload path) DQH decides here as before."""
+        pre = _pdflip_head_vote_hold.take(self)
+        if pre is not None:
+            return pre
+        return self.pdflip_d_head_hold.should_hold(
+            self._pdflip_d_head_fingerprint(running_batch, self.__dict__.get("_pass_prefetch_verdicts"))
+        )
+
+    def _hicache_iteration_service(self) -> None:
+        """The pass's per-iteration HiCache service: event check (write-through
+        and load acks, storage control queues), #811 anchor-pin release, 24c
+        placement eviction. Moved verbatim out of `_get_new_batch_prefill_raw`.
+
+        S42r A2 (review nf-review-s42-1018): its own comment says it sits where
+        "every rank reaches this point each iteration" -- a DQH-held iteration
+        does not reach the pass. Since S42 DQH holds every pass that built
+        nothing while requests wait (rc11 14:13: minutes of queue), so this
+        service ran on 1 iteration in 17 there: write-through acks, anchor pins
+        and storage acks -- the very rank-local room a held queue waits for --
+        were drained 17x slower, and the ``drain_storage_control_queues``
+        all_reduce inside ``check_hicache_events`` was entered ONLY by a rank
+        that evaluated alone (a split collective count on a divergent DQH
+        iteration). The DQH-held branch calls this too, so every rank runs it
+        exactly once per iteration whichever branch it took."""
+        if self.enable_hierarchical_cache or self.server_args.enable_flexkv:
+            _dgap = _d_hostgap.meter()  # #DGAP (FLLIPER_PDFLIP_D_HOSTGAP)
+            if _dgap is None:
+                self.tree_cache.check_hicache_events()
+            else:
+                with _dgap.span("hicache"):
+                    self.tree_cache.check_hicache_events()
+            # #811: release anchor pins whose write-through ack just drained,
+            # BEFORE this tick's admissions allocate -- so an acked-but-still
+            # -pinned checkpoint can never crowd out an admission in the same
+            # tick. Only requests in the RUNNING batch are swept: their first
+            # extend result has been processed, so the deferred mamba COW
+            # read of the matched anchor has provably executed. No-op unless
+            # --mamba-anchor-ack-release armed the mechanism.
+            release_pins = getattr(self.tree_cache, "release_acked_anchor_pins", None)
+            if release_pins is not None and self.running_batch is not None:
+                release_pins(self.running_batch.reqs)
+            # 24c --d-kv-evict-for-placement (pdflip/d_kv_evict.py, DYN_D_RESHARD
+            # sec. 14): cold, L2-backed radix leaves leave the device so the
+            # bandwidth placement keeps its shares. Here because every rank
+            # reaches this point each iteration (the storage-drain agreement
+            # above, the #580 prefetch collectives below); a dict lookup when
+            # FLLIPER_PDFLIP_D_KV_EVICT is absent.
+            if self.__dict__.get("_pdflip_d_kv_evictor", True) is not None:
+                from flliper.srt.pdflip.d_kv_evict import scheduler_step as _d_kv_evict_step
+
+                _d_kv_evict_step(self)
+            # PUBLISH-SWEEP-BG (27B, pdflip_flush_nonblock part 1b): a few un-backed
+            # finished-request nodes published between D decode rounds so the
+            # flip's flush finds a small backlog. Same group-uniform point as
+            # the evictor above; a dict/env lookup when the switch is off.
+            _pdflip_flush_nonblock.bg_publish_tick(self)
 
     def init_parked_decode_set(self) -> None:
         """#677 phase 1: stop charging undecodable carriers to the cap.
@@ -6580,12 +7022,19 @@ class Scheduler(
                 self.tree_cache.release_aborted_request(req.rid)
             self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
         logger.info("#1445 DORMANT-HOLD abort: %d held request(s) dropped (rid=%s abort_all=%s), %d still held",
-                    len(gone), rid[:12], abort_all, len(keep))
+                    len(gone), rid, abort_all, len(keep))
         return len(gone)
 
     # ---- H91 Teil B: D seats -- the park and its resume ---------------------
     # Delegation only (large-class-style): the bookkeeping moves live in
     # pdflip/d_park_runtime.py, the verdicts in pdflip/d_seats.py.
+
+    def handle_pdflip_pp_loadback_verdict(self, recv_req):
+        """LB-VERDICT-1014: PP0's load-back verdict, dispatched on every PP stage."""
+        from flliper.srt.pdflip.pp_loadback_verdict import absorb
+
+        absorb(getattr(self, "tree_cache", None), recv_req)
+        return None
 
     def handle_pdflip_vision_verdict(self, recv_req):
         """H125f: PP0's vision verdict, dispatched on every PP stage."""
@@ -6599,10 +7048,32 @@ class Scheduler(
         before D's sleep (d_park_runtime.park_running)."""
         from flliper.srt.pdflip import d_park_runtime, park_window_gate
 
-        park_window_gate.clear(self, "park")  # the window fired: its deadline is spent
+        if not (getattr(recv_req, "rids", None) or getattr(recv_req, "hold", "")):
+            # a LANE park (rids / hold, PRIORITY LANES 1008 L2) opens no flip: the collect window stays
+            park_window_gate.clear(self, "park")  # the window fired: its deadline is spent
         return d_park_runtime.park_running(
             self, recv_req, late_hold_armed=_pdflip_dormant_admit_armed()
         )
+
+    def handle_pdflip_lane_floor(self, recv_req):
+        """PRIORITY LANES 1008 (L2 + L3, merged in L5): ``POST /pdflip/lane_floor`` -- ONE handler for both groups.
+        Group D (L2): the floor of D's admission (d_park_runtime.lane_floor); a fall of the floor re-queues the
+        held lane parks it lets in. Group P (L3, pdflip/lanes_p.py): PP0 records the value for its next pass and
+        stamps it on the PP-room vote, every stage applies it in the same pass; PP1/PP2 ignore the request
+        itself. Both halves return at once when they are not their group's; the reply (one, from rank 0 -- the
+        only rank with a real sender) is the L2 output on either group."""
+        from flliper.srt.pdflip import d_park_runtime, lanes_p
+
+        lanes_p.on_rpc(self, recv_req)
+        return d_park_runtime.lane_floor(self, recv_req)
+
+    def _pdflip_lane_skip(self, req):
+        """PRIORITY LANES 1008 (L2): the census key when D's floor keeps ``req`` out of this admission pass
+        (its lane is below the floor), else None. Floor 0 (the switch off, or no lane held back) is None
+        for every request -- the loop reads exactly what it read before."""
+        from flliper.srt.pdflip import d_lane
+
+        return d_lane.SKIP_KEY if d_lane.below_floor(self, req) else None
 
     def handle_pdflip_park_window(self, recv_req) -> None:
         """PARK-WINDOW-GATE: the front's open collect window (deadline and D's
@@ -6649,6 +7120,13 @@ class Scheduler(
 
         return d_park_runtime.park_tick(self)
 
+    def _pdflip_d_lane_hold_queued(self) -> int:
+        """PRIORITY LANES fix 2: the queued requests below D's lane floor enter the lane hold
+        (d_park_runtime.hold_queued); every rank moves the same ones (queue and floor are replicated)."""
+        from flliper.srt.pdflip import d_park_runtime
+
+        return len(d_park_runtime.hold_queued(self))
+
     def _pdflip_d_park_note_retracted(self, retracted_reqs) -> int:
         from flliper.srt.pdflip import d_park_runtime
 
@@ -6657,7 +7135,10 @@ class Scheduler(
     def _pdflip_d_park_admission(self, running_batch):
         from flliper.srt.pdflip import d_park_runtime
 
-        return d_park_runtime.admission(self, running_batch)
+        gate = d_park_runtime.admission(self, running_batch)
+        # S93: the lend reads THIS verdict (which waiting request the admission holds out), never a second one
+        _pdflip_d_transient_lend.note_gate(self, gate, running_batch)
+        return gate
 
     def _pdflip_sa_exclude_displaced(self, prefetch_verdicts) -> None:
         from flliper.srt.pdflip import d_park_runtime
@@ -6727,6 +7208,12 @@ class Scheduler(
                 torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MIN, group=group)
                 return [int(x) for x in t.tolist()]
         except Exception as exc:  # noqa: BLE001
+            # NF-RANG-AUDIT 1014 Fix 3 (B2): a failed group verdict is a named stop, never the local flags
+            from flliper.srt.pdflip import group_min_strict as _gms
+
+            if _gms.enabled():
+                logger.error("%s flags n=%d (%s: %s)", _gms.MARK, len(vals), type(exc).__name__, exc)
+                raise _gms.failed("flags", len(vals), exc) from exc
             logger.info("#1471 group verdict n/a (%s: %s) -- local flags used", type(exc).__name__, exc)
         return vals
 
@@ -6808,7 +7295,7 @@ class Scheduler(
             logger.info("#x38 SETTLE-TAIL rid=%s tail=%d tokens <= %d after %d re-read(s) (%s): "
                         "released -- D-NORECOMPUTE sends it through RESUME-VIA-P (no D compute "
                         "after a flip)",
-                        str(req.rid)[:12], _tail, self.PDFLIP_TAIL_RECOMPUTE_TOKENS,
+                        str(req.rid), _tail, self.PDFLIP_TAIL_RECOMPUTE_TOKENS,
                         int(getattr(req, "_1456_n", 0) or 0), reason)
             return "complete"
         # TK (#1400 told form, tp_size 1 = no group MIN): a follower re-reads
@@ -6845,7 +7332,7 @@ class Scheduler(
             verdict = self._prefetch_kvcache(req, limit_tokens=int(_told_plan))
         if req._1456_n <= 4 or req._1456_n % 16 == 0:
             logger.info("#1456 HOLD-REFETCH rid=%s n=%d reason=%s verdict=%s (the store was short; "
-                        "re-read from the registered extent)", str(req.rid)[:12], req._1456_n, reason, verdict)
+                        "re-read from the registered extent)", str(req.rid), req._1456_n, reason, verdict)
         if _sw.note_read_verdict(req, verdict, now, tree=self.tree_cache):
             return "budget"  # NW: refused, not issued -- never a read in flight
         return "reissued"
@@ -6883,7 +7370,7 @@ class Scheduler(
         self._1471b_n = n
         if n <= 16 or n % 64 == 0:
             logger.info("#1471b BUDGET-REREAD rid=%s n=%d verdict=%s refused=%s (n_all=%d): the read the "
-                        "host budget refused is re-issued now that it has room", str(req.rid)[:12],
+                        "host budget refused is re-issued now that it has room", str(req.rid),
                         req._1456_n, verdict, refused, n)
         return "budget" if refused else "reissued"
 
@@ -6901,6 +7388,12 @@ class Scheduler(
                 torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MIN, group=group)
                 return [int(x) for x in t.tolist()]
         except Exception as exc:  # noqa: BLE001
+            # NF-RANG-AUDIT 1014 Fix 3 (B2): a failed group verdict is a named stop, never the local values
+            from flliper.srt.pdflip import group_min_strict as _gms
+
+            if _gms.enabled():
+                logger.error("%s ints n=%d (%s: %s)", _gms.MARK, len(vals), type(exc).__name__, exc)
+                raise _gms.failed("ints", len(vals), exc) from exc
             logger.info("#1479 group min n/a (%s: %s) -- local values used", type(exc).__name__, exc)
         return vals
 
@@ -6957,8 +7450,10 @@ class Scheduler(
         for req in hold:
             try:
                 due.append(1 if _refetch(req, now, allow_reissue=False) == "due" else 0)
+            except _prefetch_rid_stop():  # PREFETCH-RID-NET-1014: a named group stop is never swallowed
+                raise
             except Exception as exc:  # noqa: BLE001 -- the hold must never die on a top-up
-                logger.info("#1456 HOLD-REFETCH rid=%s n/a (%s: %s)", str(getattr(req, "rid", "?"))[:12],
+                logger.info("#1456 HOLD-REFETCH rid=%s n/a (%s: %s)", str(getattr(req, "rid", "?")),
                             type(exc).__name__, exc)
                 due.append(0)
         _gmin = getattr(self, "_pdflip_group_min_flags", None) or functools.partial(Scheduler._pdflip_group_min_flags, self)
@@ -6970,8 +7465,10 @@ class Scheduler(
             try:
                 if _refetch(req, now, allow_reissue=True) == "reissued":
                     reissued += 1
+            except _prefetch_rid_stop():  # PREFETCH-RID-NET-1014: a named group stop is never swallowed
+                raise
             except Exception as exc:  # noqa: BLE001 -- the hold must never die on a top-up
-                logger.info("#1456 HOLD-REFETCH rid=%s n/a (%s: %s)", str(getattr(req, "rid", "?"))[:12],
+                logger.info("#1456 HOLD-REFETCH rid=%s n/a (%s: %s)", str(getattr(req, "rid", "?")),
                             type(exc).__name__, exc)
         return reissued
 
@@ -7003,7 +7500,7 @@ class Scheduler(
             if not getattr(self, "_x36_settle_dormant_said", False):
                 self._x36_settle_dormant_said = True
                 logger.info("#x36 SETTLE dormant: %d parked request(s) kept until the next wake %s",
-                            len(settle), [str(getattr(r, "rid", "?"))[:12] for r in settle])
+                            len(settle), [str(getattr(r, "rid", "?")) for r in settle])
             return 0
         self._x36_settle_dormant_said = False
         # #1471d (weg2xsn239): a parked request stayed "reading" for the whole
@@ -7028,11 +7525,11 @@ class Scheduler(
             _cap_wait = [r for r in settle if _pl3f.capacity_waiting(r)]
         except Exception as exc:  # noqa: BLE001 -- a failed issue leaves them waiting
             logger.warning("#248f WAKE-READ capacity issue n/a (%s: %s)", type(exc).__name__, exc)
-        if _cap_wait:
-            _ids = {id(r) for r in _cap_wait}
-            settle = [r for r in settle if id(r) not in _ids]
-            if not settle:
-                return 0
+        # 1537b (b): the cap-waiters are NOT stripped before the vote. Which members wait is a
+        # rank-local view (arena bound here or not, a failed issue); stripping them changed the
+        # vector length / the entry into the collective per rank. The replicated settle is voted
+        # whole, a waiter votes "not due, not ready" (0), the MIN keeps it parked on every rank.
+        _cap_ids = {id(r) for r in _cap_wait}
         now = time.monotonic()
         _refetch = getattr(self, "_pdflip_refetch_one", None) or functools.partial(Scheduler._pdflip_refetch_one, self)
         keep, release = [], []
@@ -7047,7 +7544,8 @@ class Scheduler(
         # on them goes through the group MIN below.
         from flliper.srt.pdflip import settle_writer as _sw_nw
 
-        _acts = [_pdflip_settle_writer_action(self, req) for req in settle]
+        _acts = ["capwait" if id(req) in _cap_ids else _pdflip_settle_writer_action(self, req)
+                 for req in settle]
         # P4b-fix (28.09.): the writer view is RANK-LOCAL -- a rank that never read the
         # hand-off record before the wake removed it sees "none" while its peers see P's
         # hand-off. "decide" must not veto the group's re-read then (it did: 0 in the due
@@ -7055,7 +7553,26 @@ class Scheduler(
         # (1) in the due vote and votes separately whether it has no writer; the group skips
         # the re-read only when EVERY rank decides. One collective: [due..., decide...].
         _pre, _dec = [], []
+        _uniform_check = envs.FLLIPER_PDFLIP_SETTLE_UNIFORM_CHECK.get()
         for req, _act in zip(settle, _acts):
+            if _act == "capwait":
+                _pre.append(0)  # 1537b: waits for arena room, no re-read, no release
+                _dec.append(0)
+                continue
+            if _act in ("wait", "decide") and _uniform_check:
+                # SETTLE-UNIFORM-1014 (NF h18 fe799c4d6e, D 16:23:23-24, gloo abort): the action is a
+                # RANK-LOCAL view (the writer directory, ``_1471_short`` from this rank's own record), and
+                # ``_refetch`` carries the progress check's collectives. TP0 alone had pdflip-10-28 at
+                # "reread" then "decide" and skipped its check; its next collective (pdflip-12-29) met the
+                # workers' 10-28 (TP0 '#905 ... req=pdflip-12-29 completed=96256 min_synced=62848'), TP0
+                # deferred and re-issued 12-29 alone, the prefetch threads fell out of step -> "8 vs 4".
+                # The progress check runs on every rank for every member; only the VOTE follows the act.
+                try:
+                    _refetch(req, now, allow_reissue=False)
+                except _prefetch_rid_stop():  # PREFETCH-RID-NET-1014: a named group stop is never swallowed
+                    raise
+                except Exception:  # noqa: BLE001 -- the vote below stays the act's
+                    pass
             if _act == "wait":
                 _pre.append(0)  # a writer at work: a re-read cannot see pages still being written
                 _dec.append(0)
@@ -7069,6 +7586,8 @@ class Scheduler(
                 req._1456_last = 0.0  # the ack is the clock, not the 2 s timer
             try:
                 _pre.append(1 if _refetch(req, now, allow_reissue=False) == "due" else 0)
+            except _prefetch_rid_stop():  # PREFETCH-RID-NET-1014: a named group stop is never swallowed
+                raise
             except Exception:  # noqa: BLE001
                 _pre.append(0)
         _gmin0 = getattr(self, "_pdflip_group_min_flags", None) or functools.partial(Scheduler._pdflip_group_min_flags, self)
@@ -7076,17 +7595,26 @@ class Scheduler(
         _n = len(settle)
         _agreed_due = [int(bool(d) and not a) for d, a in zip(_votes[:_n], _votes[_n:])]
         for req, _ok, _act in zip(settle, _agreed_due, _acts):
+            if _act == "capwait":
+                # state "capwait", NOT "wait": wake_cohort.IN_FLIGHT holds "wait", and a cap-waiter has
+                # NO read in flight (its read is not issued yet) -- it must not buy the ready members a hold
+                _local.append((req, "capwait", False, False))
+                continue
             try:
                 state = _refetch(req, now, allow_reissue=bool(_ok))
                 if state == "due":
                     state = "wait"
+            except _prefetch_rid_stop():  # PREFETCH-RID-NET-1014: a named group stop is never swallowed
+                raise
             except Exception as exc:  # noqa: BLE001
-                logger.info("#1471 SETTLE rid=%s n/a (%s: %s)", str(getattr(req, "rid", "?"))[:12],
+                logger.info("#1471 SETTLE rid=%s n/a (%s: %s)", str(getattr(req, "rid", "?")),
                             type(exc).__name__, exc)
                 state = "complete"
             # NW (30.09.): a re-read the budget refused has not spent the writer's ack
             _sw_nw.keep_ack_if_unread(req, _act)
             lapsed = now - float(getattr(req, "_1471_since", now)) >= self.PDFLIP_POST_WAKE_SETTLE_S
+            if _sw_nw.carry_holds_lapse(req, state):
+                lapsed = False  # SC (#1210): a carried clock awaits this wake's own read once
             # P4b: no writer and no read in flight = decided now (the bound would
             # release the same request "as it is" 20 s later).
             # a re-read the group issued this tick is a read in flight, on this rank too
@@ -7136,7 +7664,7 @@ class Scheduler(
                     _said.update(_new)
                     logger.warning("PDFLIP-WAKE-COHORT VOTE-ERROR rids=%s %s: %s -- voted release (0); the "
                                    "group releases the ready members as without the cohort",
-                                   [r[:16] for r in _new], type(_exc).__name__, _exc)
+                                   list(_new), type(_exc).__name__, _exc)
             _v = _gmin(_flags + [_hv])  # #1471e
             _agreed, _cohort_hold = _v[:-1], bool(_v[-1]) and any(_v[:-1])
         else:
@@ -7160,15 +7688,20 @@ class Scheduler(
             else:
                 keep.append(req)
         # D-NORECOMPUTE (user law 02.10.): a released SHORT read whose tail no
-        # agreed F4/E2 window adopts goes through RESUME-VIA-P, never to D's extend
+        # agreed F4/E2 window adopts goes through RESUME-VIA-P, never to D's extend --
+        # unless it is a D-direct leg within its front X (X-GESETZ F-D 16.10., law 4)
         try:
             from flliper.srt.pdflip import d_norecompute as _dnr
 
             if _dnr.enabled() and release:
                 _rel2 = []
+                _recs = getattr(getattr(self, "tree_cache", None), "prefetch_loaded_tokens_by_reqid", None) or {}
                 for _r, _s, _l in release:
+                    # TAIL-CONSUME-ON-FULL companion: a re-read that completed raises the stale witness
+                    _dnr.refresh_delivered(_r, _recs.get(str(_r.rid)))
+                    # X-GESETZ F-D (16.10.): a D-direct leg under its X is D's own extend
                     _rem = _dnr.d_would_compute(_r)
-                    if _rem > 0 and _dnr.divert(self, _r, _rem):
+                    if _rem > 0 and not _dnr.d_direct_extends(self, _r, _rem) and _dnr.divert(self, _r, _rem):
                         continue
                     _rel2.append((_r, _s, _l))
                 release = _rel2
@@ -7193,7 +7726,7 @@ class Scheduler(
                 if _s == "no-writer":
                     _pdflip_settle_no_writer_line(self, _r, now)
                 logger.info("#1471 SETTLE-RELEASE rid=%s state=%s lapsed=%s held_after_wake_s=%.1f",
-                            str(_r.rid)[:12], _s, _l, now - float(getattr(_r, "_1471_since", now)))
+                            str(_r.rid), _s, _l, now - float(getattr(_r, "_1471_since", now)))
         return len(release)
 
     def _pdflip_run_deferred_hold_release(self) -> int:
@@ -7295,7 +7828,7 @@ class Scheduler(
                     _state = "wait"
             except Exception as exc:  # noqa: BLE001
                 logger.info("#1471 SETTLE rid=%s wake verdict n/a (%s: %s) -- queued as it is",
-                            str(getattr(_r, "rid", "?"))[:12], type(exc).__name__, exc)
+                            str(getattr(_r, "rid", "?")), type(exc).__name__, exc)
                 _state = "complete"
             _states.append(_state)
         try:  # L1 instrument: this wake's cohort, wake -> its last member's first decode
@@ -7316,7 +7849,7 @@ class Scheduler(
             if ok and t and st != "complete":
                 logger.info("#1471 SETTLE-TAIL rid=%s delivered=%s remainder=%s -- released at the "
                             "wake: the short read's remainder fits in X, D prefills it (#1324)",
-                            str(_r.rid)[:12], getattr(_r, "_pdflip_store_delivered", None),
+                            str(_r.rid), getattr(_r, "_pdflip_store_delivered", None),
                             _pdflip_store_short_remainder(_r))
         for _r, ok in zip(list(hold), _agreed):
             if ok:
@@ -7339,7 +7872,7 @@ class Scheduler(
                 _settle = self.pdflip_post_wake_settle = []
             _settle.extend(parked)
             logger.info("#1471 SETTLE %d held request(s) parked after the wake (read still short: %s)",
-                        len(parked), [str(r.rid)[:12] for r in parked])
+                        len(parked), [str(r.rid) for r in parked])
         try:  # #1461: back under the strict claim law
             _cc = self.tree_cache.cache_controller
             for _r in released:
@@ -7395,6 +7928,10 @@ class Scheduler(
         # intake).  The terms are recorded by the decorated methods on their
         # own holders and read here; one line per intake over 200 ms.
         _t0 = time.perf_counter()
+        if self.pdflip_d_lead_probe is not None:
+            self.pdflip_d_lead_probe.note_recv(rid=recv_req.rid)
+        if self.pdflip_d_ext_beacon is not None:
+            self.pdflip_d_ext_beacon.note_recv(rid=recv_req.rid)
         try:
             return self._handle_generate_request_impl(recv_req)
         finally:
@@ -7407,7 +7944,7 @@ class Scheduler(
                     logger.info(
                         "#1474 INTAKE rid=%s tokens=%d total_ms=%.0f prefetch_kvcache_ms=%.0f "
                         "prefetch_from_storage_ms=%.0f presence_probe_ms=%.0f host_alloc_ms=%.0f",
-                        str(getattr(recv_req, "rid", "?"))[:12],
+                        str(getattr(recv_req, "rid", "?")),
                         len(getattr(recv_req, "input_ids", None) or ()), _tot,
                         _pt_read(self, "_1474_prefetch_ms"), _pt_read(_tc, "_1474_pfs_ms"),
                         _pt_read(_cc, "_1474_probe_ms"), _pt_read(_hp, "_1474_alloc_ms"))
@@ -7549,6 +8086,12 @@ class Scheduler(
             _spill_class = getattr(recv_req, "spill_class", None)
             if _spill_class is not None:
                 req.spill_class = _spill_class
+            # FRONT-X-MIT (15.10., pdflip/front_x.py): the front's decision X for this
+            # D-direct leg 2, read by `_pdflip_x_refuses`. A field of the broadcast
+            # request, so every TP rank holds the same value (MUST NOT 7).
+            req.weg2_front_x = getattr(recv_req, "weg2_front_x", None)
+            req.weg2_front_priced = getattr(recv_req, "weg2_front_priced", None)
+            req.weg2_front_halfx = getattr(recv_req, "weg2_front_halfx", None)   # H16V A3: the front's halbX
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
@@ -7793,6 +8336,15 @@ class Scheduler(
         request's verdict rather than the boot's running total, in the fixed
         attribution order `PREFETCH_DECLINE_ORDER`.
         """
+        # ROOM-ARBITER PRIO 1016: the request's priority for the fill's room-wait order (PRIO = ALTER: priority
+        # descending, then arrival); process-local, read by the prefetch io thread when its fill registers
+        try:
+            from flliper.srt.pdflip import prio_age as _pa
+            from flliper.srt.pdflip import room_wait_arbiter as _arbiter
+
+            _arbiter.note_priority(req.rid, _pa.lane_of_req(req))
+        except Exception:  # noqa: BLE001 - an order hint never breaks the intake
+            pass
         # #1068 (slice 4): the denominator sits at the FUNCTION boundary, not
         # at one call site: the A12.2 retry (`_retry_deferred_prefetches`) and
         # the #946 escape enter here too, and a denominator that missed them
@@ -7861,6 +8413,13 @@ class Scheduler(
         # needs; a redundant re-match is simply not taken.
         if rematch:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
+            # e1 ANCHOR-ONLY READ: KV in the tree, its Mamba anchor only in the
+            # store -- the GDN rank reads the blob, attaches it and re-matches
+            # (MAMBA-HOST-RESUME); rank-local, no collective (the head vote's
+            # MIN keeps the group where a rank's read failed)
+            _aor = getattr(self.tree_cache, "pdflip_anchor_only_read", None)
+            if callable(_aor) and _aor(req) > 0:
+                req.init_next_round_input(self.tree_cache, cow_mamba=False)
         last_host_node = req.last_host_node
         # RANK-LOCAL: `backuped` means "full KV present in THIS rank's host
         # pool", and uneven DCP gives the ranks host pools of different sizes,
@@ -8106,6 +8665,12 @@ class Scheduler(
         _park_min = _pdflip_park_read.park_read_min_tokens(req)
         if _park_min is not None:
             _tail_min = _park_min if _tail_min is None else min(int(_tail_min), int(_park_min))
+        # S64 S-1400 (rc15 P 08:31:45 pdflip-72-525): PP0's completion re-read
+        # to a store-confirmed depth (P-HELD-REREAD / P-WAKE-PROBE) reads
+        # whatever its length -- the #915 threshold refused 192 < 256 twice.
+        _cmin = pdflip_store_told.completion_read_min_tokens(req)
+        if _cmin is not None:
+            _tail_min = _cmin if _tail_min is None else min(int(_tail_min), int(_cmin))
         # TS (y4a death 03:36:24): a read bounded by a told is prescribed --
         # the #915 threshold does not refuse it (follower need 64 < 256).
         _tail_min = pdflip_store_told.told_read_min_tokens(limit_tokens, _tail_min)
@@ -8123,8 +8688,18 @@ class Scheduler(
         _hb_min = handback_min_tokens(has_handoff=_pdflip_hb_handoff)
         if _hb_min is not None:
             _tail_min = _hb_min if _tail_min is None else min(int(_tail_min), int(_hb_min))
+        # S73 (rc16 194-759: 23x '#915 too_short need=64..192' on P PP0): a
+        # group-P store read is read whatever its length (handback_claim).
+        from flliper.srt.pdflip.handback_claim import p_intake_min_tokens
+
+        _pi_min = p_intake_min_tokens()
+        if _pi_min is not None:
+            _tail_min = _pi_min if _tail_min is None else min(int(_tail_min), int(_pi_min))
         _tail_kw = {"min_tokens": _tail_min} if _tail_min is not None else {}
         _tail_kw.update(_prefetch_namespace_kw(self.tree_cache, req))
+        # S90: a told-bounded read is prescribed -- the speculative-span budget
+        # (#915 rate_limited) does not refuse it (follower at told, told plans).
+        _tail_kw.update(pdflip_store_told.told_read_prescribed_kw(self.tree_cache, limit_tokens))
         if group_decides:
             # W65-REGROUP (tp_match_floor, "W65-REGROUP"): armed for exactly this
             # call, and only an intake-style one that has not been regrouped yet;
@@ -8311,7 +8886,7 @@ class Scheduler(
         logger.error(
             "#915 PREFETCH UNREGISTERED rid=%s phase=%s generation=%d n=%d "
             "verdict=%s -- %s",
-            str(getattr(req, "rid", "?"))[:8],
+            str(getattr(req, "rid", "?")),
             bound_phase(),
             int(current_generation()),
             n,
@@ -8384,7 +8959,7 @@ class Scheduler(
                 "#969AD RETRACT site=%s rank=%s rid=%s fwd_ct=%s prefix_len=%s n=%d",
                 site,
                 getattr(self.ps, "pp_rank", -1),
-                str(getattr(req, "rid", "?"))[:8],
+                str(getattr(req, "rid", "?")),
                 getattr(self, "forward_ct", -1),
                 (
                     0
@@ -8514,7 +9089,7 @@ class Scheduler(
                         "available_before=%d last_host_node=%s host_hit=%s "
                         "prefix_len=%s storage_hit=%s readmit_epoch=%s",
                         _n,
-                        str(getattr(req, "rid", "?"))[:8],
+                        str(getattr(req, "rid", "?")),
                         (
                             _population
                             if _population is not None
@@ -8568,6 +9143,9 @@ class Scheduler(
             # wake no longer flushes (FLLIPER_PDFLIP_WAKE_FLUSH=0), so nothing of
             # it is lost.  The tree was flushed at the sleep leg.
             if getattr(self, "pdflip_dormant", False) and _pdflip_dormant_admit_armed():
+                # ZERO-ANCHOR 1015 (3): its store read runs during the flip --
+                # PP0 asks the store once more, awake, before its told
+                req._pdflip_read_dormant = True
                 hold = getattr(self, "pdflip_dormant_hold", None)
                 if hold is None:
                     hold = self.pdflip_dormant_hold = []
@@ -8583,7 +9161,7 @@ class Scheduler(
                 self._1443_held_n = n
                 if n <= 8 or n % 64 == 0:
                     logger.info("#1443 DORMANT-HOLD rid=%s tokens=%d held=%d (prefetch issued during the flip; device load at the wake -- #1455)",
-                                str(req.rid)[:12], len(req.origin_input_ids or []), len(hold))
+                                str(req.rid), len(req.origin_input_ids or []), len(hold))
                 return
             if not is_retracted and self._pdflip_d_park_hold_late(req):
                 return  # H91c3-2: arrived after the D park -- held behind it
@@ -8614,18 +9192,127 @@ class Scheduler(
             dormant=bool(getattr(self, "pdflip_dormant", False)),
         )
 
+    def handle_pdflip_match_probe(self, recv_req: PdFlipMatchProbeReqInput) -> PdFlipMatchProbeReqOutput:
+        """S56 D-MATCH-PROBE (pdflip/d_match_probe.py; user 19.10. "alle zahlen liegen doch schwarz auf weiß vor"):
+        how much of this prompt the group holds NOW. Every TP rank runs it at the same point of its intake (the
+        control request is broadcast like any other) and pads the image items as ``_handle_generate_request_impl``
+        does (a broadcast mm process needs every rank). S56r (review A2): the admission's usable prefix is READ, not
+        matched -- ``d_match_probe.peek_admission_match`` walks the tree with the admission's key and rules and writes
+        nothing (``tree_cache.match_prefix`` splits nodes, moves the chain to MRU, re-stamps access times, counts and
+        logs under the probe's rid). TP0's answer reaches the tokenizer; it is the group's number on a Form A group
+        (the workers adopt the host's depth, H98) or a symmetric host tier, and refused by name otherwise. S56r A3:
+        the probes the tokenizer coalesced (``batch``) are answered in this same round, in order."""
+        from flliper.srt.managers.io_struct import unwrap_from_pickle, wrap_as_pickle
+
+        out = self._pdflip_match_probe_one(
+            recv_req.rid, recv_req.input_ids, recv_req.mm_inputs, recv_req.extra_key, recv_req.tokenize_ms)
+        batch = getattr(recv_req, "batch", None)
+        if batch is not None:
+            answers = []
+            for it in unwrap_from_pickle(batch) or ():
+                o = self._pdflip_match_probe_one(it.get("rid"), it.get("input_ids"), it.get("mm_inputs"),
+                                                 it.get("extra_key"), it.get("tokenize_ms"))
+                answers.append({f: getattr(o, f) for f in (
+                    "rid", "success", "message", "input_ids", "device_tokens", "host_tokens", "key_match_depth",
+                    "mm_spans", "handle_ms", "tokenize_ms")})
+            out.batch = wrap_as_pickle(answers)
+        return out
+
+    def _pdflip_match_probe_one(self, rid, input_ids, mm_inputs, extra_key, tokenize_ms) -> PdFlipMatchProbeReqOutput:
+        """S56/S56r: one probe of ``handle_pdflip_match_probe`` -- padding like the intake, then the READ-ONLY peek."""
+        import types
+
+        from flliper.srt.managers.io_struct import unwrap_from_pickle
+        from flliper.srt.managers.tp_match_floor import form_a_follow_active, this_rank_follows
+        from flliper.srt.pdflip import d_match_probe as _dmp
+        from flliper.srt.sampling.sampling_params import SamplingParams
+
+        t0 = time.perf_counter()
+        try:
+            ids = array("q", input_ids or ())
+            spans: List[List[int]] = []
+            mm = unwrap_from_pickle(mm_inputs) if mm_inputs is not None else None
+            if mm is not None:
+                image_inputs = self._get_multimodal_inputs(mm)
+                req = Req(
+                    str(rid),
+                    None,
+                    ids,
+                    SamplingParams(max_new_tokens=1),
+                    vocab_size=self.model_config.vocab_size,
+                    extra_key=extra_key,
+                )
+                _recv = types.SimpleNamespace(input_ids=input_ids)
+                if (
+                    not self._try_apply_padded_mm_input_ids(_recv, req, image_inputs)
+                    and self.pad_input_ids_func
+                ):
+                    req.origin_input_ids = array(
+                        "q", self.pad_input_ids_func(req.origin_input_ids, image_inputs)
+                    )
+                ids = array("q", req.origin_input_ids)
+                spans = _dmp.mm_spans(image_inputs)
+            n = len(ids)
+            dev = host = key_depth = 0
+            tc = getattr(self, "tree_cache", None)
+            if n > 1 and tc is not None:
+                # whose number is the group's admission depth (R11 / Rang-Einigkeit): the Form A host's (H98), or any
+                # rank's on a symmetric host tier; else the RU MIN over the ranks decides, which this rank cannot read
+                asym = bool(getattr(tc, "_hicache_prefetch_symmetric", lambda: False)())
+                if asym and not form_a_follow_active():
+                    return PdFlipMatchProbeReqOutput(
+                        rid=rid, success=False,
+                        message="group_min_needed: asymmetric host tier without Form A -- the admission takes the "
+                                "RU MIN over the ranks, one rank's walk is not the group's number",
+                        handle_ms=(time.perf_counter() - t0) * 1000.0,
+                    )
+                if not this_rank_follows():  # a Form A worker's anchors are bookkeeping: it adopts the host's depth
+                    # the admission's key: the whole ids, limit = _compute_max_prefix_len (n - 1)
+                    dev, host, key_depth = _dmp.peek_admission_match(tc, ids, extra_key, n - 1)
+            return PdFlipMatchProbeReqOutput(
+                rid=rid,
+                success=True,
+                input_ids=ids,
+                device_tokens=int(dev),
+                host_tokens=int(host),
+                key_match_depth=int(key_depth),
+                mm_spans=spans,
+                handle_ms=(time.perf_counter() - t0) * 1000.0,
+                tokenize_ms=float(tokenize_ms or 0.0),
+            )
+        except Exception as e:  # noqa: BLE001 -- the front names a failed probe; the scheduler never dies of one
+            logger.warning("PDFLIP D-MATCH-PROBE FAILED rid=%s %s: %s", rid, type(e).__name__, e)
+            return PdFlipMatchProbeReqOutput(
+                rid=rid, success=False, message=f"{type(e).__name__}: {str(e)[:200]}",
+                handle_ms=(time.perf_counter() - t0) * 1000.0,
+            )
+
     def handle_ple_prefetch_hint(self, recv_req: PlePrefetchHintReqInput) -> None:
         """fnFL2 H43: the front's hint -- a request that will come to this
         group (P still asleep, or its leg 1 not yet dispatched) -- starts the
         first chunk's PLE read now. No reply; a no-op on ranks without an
         admitting PLE gather (PP1/PP2, group D)."""
+        if getattr(recv_req, "read_ahead", False):
+            # S53 L2-READ-AHEAD: PP0 fills the held request's stored prefix L3 -> L2 (a no-op on every other rank)
+            from flliper.srt.pdflip import l2_read_ahead as _l2ra
+
+            _l2ra.on_hint(self, recv_req)
+        if not getattr(recv_req, "ple", True):
+            return  # S53: a read-ahead hint on an awake P -- no PLE admission, no ZERO-ANCHOR note
         from flliper.srt.models.qwen4_exp_ple_admit import admit_ple_hint
 
+        # ZERO-ANCHOR 1015 (Typ A): the depth D was measured to hold -- PP0's
+        # held re-read compares its read with it (pdflip_store_told)
+        from flliper.srt.pdflip import short_read as _za_sr
+
+        _za_sr.note_hint(recv_req.rid, getattr(recv_req, "start_hint", -1))
         admit_ple_hint(
             recv_req.rid,
             recv_req.input_ids,
             self.chunked_prefill_size,
             dormant=bool(getattr(self, "pdflip_dormant", False)),
+            start_hint=getattr(recv_req, "start_hint", -1),
+            page_size=int(getattr(self, "page_size", 1) or 1),
         )
 
     def readmit_seam_residents(
@@ -9243,7 +9930,7 @@ class Scheduler(
                 logger.info("W88-DORMANT-WAIT rid=%s: standstill (%d passes) is not terminal while "
                             "this group sleeps -- P publishes at retain, in bubbles and at its sleep "
                             "flush; the pass/wall bound starts at the wake (xsn344: 2 of 4 100k "
-                            "requests were answered 503 after 5 s)", str(getattr(req, "rid", "?"))[:16], n)
+                            "requests were answered 503 after 5 s)", str(getattr(req, "rid", "?")), n)
             return "stalled"
         # Boot xsn127 (D, rids baec88b4/f4b94d87): the store read stood still
         # from 20:44:46 on, but the pass counter alone declares death -- and
@@ -9328,7 +10015,7 @@ class Scheduler(
             "no_progress_passes=%d bound_passes=%d witness=%s n=%d %s -- terminal, "
             "answered 503; never admitted over X (denominator: every deferred "
             "store read this exit answered)",
-            code, name, rid[:16], arm, span, site, passes,
+            code, name, rid, arm, span, site, passes,
             self._pdflip_prefetch_stall_passes(), terms,
             self._pdflip_store_load_failed, cut,
         )
@@ -9350,7 +10037,7 @@ class Scheduler(
             logger.info(
                 "#991 GIVE-BACK rid=%s site=pdflip_store_load_terminal -- the COW "
                 "slot this admission's match acquired, returned on the W88 exit",
-                rid[:16],
+                rid,
             )
         try:
             if self.enable_hicache_storage:
@@ -9363,7 +10050,7 @@ class Scheduler(
             # than passed, so it is a finding and not a silence.
             logger.warning(
                 "W88 rid=%s: releasing the aborted store read raised; the "
-                "client is answered anyway", rid[:16], exc_info=True,
+                "client is answered anyway", rid, exc_info=True,
             )
         abort_req = AbortReq(
             finished_reason={
@@ -9377,7 +10064,7 @@ class Scheduler(
             req.time_stats.trace_ctx.abort(abort_info=abort_req.finished_reason)
         except Exception:
             # Tracing may never eat the answer.
-            logger.debug("W88 rid=%s: trace abort raised", rid[:16], exc_info=True)
+            logger.debug("W88 rid=%s: trace abort raised", rid, exc_info=True)
         self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
         return "failed"
 
@@ -9403,7 +10090,7 @@ class Scheduler(
             pass
         if gone:
             logger.info("#x36 FORGET-HELD rid=%s site=%s removed_from=%s",
-                        str(rid)[:12], site, ",".join(gone))
+                        str(rid), site, ",".join(gone))
 
     def _apply_prefetch_deferral(self, req, verdict: str, site: str) -> Optional[str]:
         """Route one prefetch verdict through the A12.2 deferral state machine.
@@ -9417,7 +10104,7 @@ class Scheduler(
             note_prefetch_gate as _note_prefetch_gate,
         )
 
-        rid = str(getattr(req, "rid", "?"))[:8]
+        rid = str(getattr(req, "rid", "?"))
         marked = getattr(req, "prefetch_deferred", None) is not None
         span = getattr(req, "_prefetch_span_tokens", None)
         if verdict == _VERDICT_TRUNCATED_GROUP:
@@ -9867,7 +10554,7 @@ class Scheduler(
             note_prefetch_gate as _note_prefetch_gate,
         )
 
-        rid = str(getattr(req, "rid", "?"))[:8]
+        rid = str(getattr(req, "rid", "?"))
         passes = int(getattr(req, "prefetch_defer_passes", 0) or 0)
         since = getattr(req, "prefetch_defer_since", None)
         waited = time.monotonic() - float(since) if since is not None else 0.0
@@ -9896,7 +10583,7 @@ class Scheduler(
         cleared: List[str] = []
         for req in population:
             if self._clear_prefetch_deferral_fields(req):
-                cleared.append(str(getattr(req, "rid", "?"))[:8])
+                cleared.append(str(getattr(req, "rid", "?")))
         if cleared:
             from flliper.srt.mem_cache.match_refusal_census import (
                 note_prefetch_gate as _note_prefetch_gate,
@@ -9933,11 +10620,25 @@ class Scheduler(
         on enable_hicache_storage; there is no second guard here, so a mark
         that meets storage_disabled (plantable only by hand) is dropped by
         that name too instead of surviving a writer-only reason."""
+        # S88: the scan is the queue AS IT STOOD BEFORE THE VISION PARK of this
+        # pass -- waiting_queue plus the requests the vision stage holds out of
+        # it until `vision_unpark` (scheduler attribute set around
+        # `_get_new_batch_prefill_raw`, empty everywhere else). PP0 parks
+        # through `vision_rank_pass`, a follower through `follower_pass`; the
+        # union is the full queue on every rank, so the set below stays
+        # rank-identical (the property the comment further down relies on).
+        scanned = list(self.waiting_queue)
+        _seen = {id(r) for r in scanned}
+        for r in self.__dict__.get("_pdflip_vision_parked_reqs") or ():
+            if id(r) not in _seen:
+                _seen.add(id(r))
+                scanned.append(r)
         marked = [
             r
-            for r in self.waiting_queue
+            for r in scanned
             if getattr(r, "prefetch_deferred", None) is not None
         ]
+        _s88_deferred_reachability(self, _seen)
         if not marked:
             return 0
         marked.sort(
@@ -10361,12 +11062,23 @@ class Scheduler(
         req = getattr(self, "chunked_req", None)
         if req is None or not getattr(req, "pdflip_pool_parked", False):
             return
+        if getattr(req, "_pdflip_oom_abort_pending", False):
+            return  # PREFILL-OOM-RETREAT: its 503 is on the request wire; requeueing it now would race the abort of the other stages
         if getattr(req, "finished", lambda: False)() or req.req_pool_idx is None:
             req.pdflip_pool_parked = False
             return
+        # PRIORITY LANES 1008 (L3, pdflip/lanes_p.py): the trigger is the lane floor, not the pool. The rows go back whether
+        # or not anybody waits (the floor holds the whole lane), and only while the floor still stands above the lane.
+        _lane_park = _lanes_p.park_is_lane(req)
+        if _lane_park and not _lanes_p.park_still_due(self, req):
+            req.pdflip_pool_parked = False  # the floor fell before the rows went back: the park is void
+            req.pdflip_lane_parked = False
+            return
         if int(getattr(req, "inflight_middle_chunks", 0) or 0) > 0:
+            if _lane_park:
+                _lanes_p.note_park_wait(self, req)  # FIX 4: name the count that holds the lane park back (one line per epoch)
             return  # a launched chunk still writes its rows; try next step
-        if not getattr(self, "waiting_queue", None):
+        if not _lane_park and not getattr(self, "waiting_queue", None):
             return  # nobody to make room for: keep the in-place park (#679)
         try:
             from flliper.srt.pdflip.park import park_active
@@ -10380,20 +11092,24 @@ class Scheduler(
             release_kv_cache(req, self.tree_cache, is_insert=True)
         except Exception:  # noqa: BLE001 -- a failed park must not kill the rank
             logger.warning("PDFLIP-PARK rid=%s: release raised, keeping the in-place park",
-                           rid[:16], exc_info=True)
+                           rid, exc_info=True)
             return
         req.pdflip_pool_parked = False
         req.pdflip_parked_span = max(1, span)
         req.reset_for_retract()
         self.chunked_req = None
         self._add_request_to_queue(req, is_retracted=True)
+        if _lane_park:
+            # the request keeps `pdflip_lane_parked` (the admission loop skips it while the floor stands above its lane)
+            _lanes_p.note_parked(self, req, span=span, total=len(getattr(req, "origin_input_ids", ()) or ()))
+            return
         n = getattr(self, "_pdflip_park_n", 0) + 1
         self._pdflip_park_n = n
         logger.info(
             "PDFLIP-PARK n=%d rid=%s span=%d of %d: rows given back to the tree "
             "(evictable), request back at the head of the queue; resume by "
             "prefix match / load_back, admitted whole",
-            n, rid[:16], span, len(getattr(req, "origin_input_ids", ()) or ()),
+            n, rid, span, len(getattr(req, "origin_input_ids", ()) or ()),
         )
 
     def _pdflip_defer_waiting_abort(self, recv_req) -> bool:
@@ -10489,6 +11205,11 @@ class Scheduler(
         # via the class: the #791c/xsn324 harnesses drive this method on a bare
         # namespace; the hook itself is a no-op without pending waiting aborts
         Scheduler._pdflip_process_waiting_aborts(self)
+        # K14: a held waiting-queue abort whose request an earlier plan admitted
+        # is applied first (it may register the chunked abort read below). The
+        # PP loop already settles them right after each plan; this is the
+        # fallback for every other loop. Via the class: bare-namespace harnesses.
+        Scheduler._pdflip_resolve_waiting_aborts(self)
         req = self._pending_chunked_abort_req
         if req is None:
             return
@@ -10560,7 +11281,13 @@ class Scheduler(
         self.chunked_req = None
         self._pending_chunked_abort_req = None
         self._pending_chunked_abort_delay = 0
-        self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
+        # PREFILL-OOM-RETREAT: an origin-relayed abort that names its reason (the 503 the front re-routes on) keeps it;
+        # every other chunked abort answers as before.
+        _reason = getattr(self, "_pending_chunked_abort_reason", None)
+        self._pending_chunked_abort_reason = None
+        self.ipc_channels.send_to_tokenizer.send_output(
+            AbortReq(rid=req.rid) if _reason is None else AbortReq(rid=req.rid, finished_reason=_reason), req
+        )
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
 
     def _build_hisparse_decode_batch(self, reqs):
@@ -10751,6 +11478,14 @@ class Scheduler(
             # path. The host and mamba floors are a different axis and keep
             # their None; only the evict floor is being made total here.
             self._publish_uniform_evict_floor(local_avail)
+            # F1 (nf-next-1006-01): nothing is pinned on one rank; clear what a
+            # previous (TP) layout published so a flip cannot read it
+            publish_cap_blind_gap(
+                getattr(self, "tree_cache", None),
+                allocator=getattr(self, "token_to_kv_pool_allocator", None),
+                pin_admission=False, min_avail=0, min_admission=0,
+                local_evict_full=0, local_cap_above=0,
+            )
             # SF (b23 #1004): on pp > 1 this "group min" is THIS rank's own
             # value and the ranks that must agree are not in the group; the
             # load-back reads the mark and loads in the same pass instead of
@@ -10816,6 +11551,8 @@ class Scheduler(
 
         pin_admission = uneven_dcp_active(self.server_args.dcp_size)
         local_admission = 0
+        local_evict_full = 0
+        local_cap_above = 0
         if pin_admission:
             tree = self.tree_cache
             fe = getattr(tree, "full_evictable_size", None)
@@ -10824,6 +11561,18 @@ class Scheduler(
             # `swa_evictable_size` instead. SWA models route to
             # UnifiedRadixCache and are out of this path's reach.
             local_evict = int(fe() if fe is not None else tree.evictable_size())
+            # F1 (nf-next-1006-01): the evictable tokens above the engaged
+            # residency cap are not fundable (the pool takes every id they free
+            # straight back). They go into THIS rank's vote, through the MIN this
+            # reduce already takes -- no new site, no new payload element, no new
+            # guard -- so every rank admits against the same group number.
+            local_evict_full = local_evict
+            local_cap_above = cap_above_evictable(
+                tree,
+                allocator=getattr(self, "token_to_kv_pool_allocator", None),
+                page_size=int(getattr(self, "page_size", 1) or 1),
+            )
+            local_evict = local_evict - local_cap_above
             local_admission = local_avail + local_evict
         # #616g: `-local_avail` rides the SAME reduce so one MIN yields both
         # the group minimum and (negated) the group MAXIMUM. The pair is what
@@ -11042,7 +11791,20 @@ class Scheduler(
         # be a snapshot the gate can actually see. Nothing between the old
         # site and this one takes a collective or reads the head vote, so the
         # move is the whole of the fix on this side.
-        _head_canonical, _head_local_matches = self._local_head_prefix_matches()
+        # S42 HEAD-VOTE HOLD (pdflip/head_vote_hold.py): the vote's only reader
+        # is this iteration's admission pass. When DQH holds that pass (decided
+        # HERE, once, after the drain whose verdicts its fingerprint reads; the
+        # elif chain consumes the same decision), every head arm abstains with
+        # its MIN-neutral value -- no match walk, no probe, no store or
+        # completion vote. rc11 14:13 (6 waiting): sched_ms 56.9 per decode
+        # round, all of it this vote on held passes. Group-uniform: DQH's
+        # inputs are replicated; a lone abstention MIN-reduces to ABSENT, i.e.
+        # the head is delayed, the collective count is unchanged.
+        _s42_held = _pdflip_head_vote_hold.decide(self, running_batch, _ballot_verdicts)
+        if _s42_held:
+            _head_canonical, _head_local_matches = [], {}
+        else:
+            _head_canonical, _head_local_matches = self._local_head_prefix_matches()
         # #823 W9b: the canonical head is no longer published as its own
         # attribute -- it goes into the single verdict value below, together
         # with the two numbers this reduce is about to produce, so the four
@@ -11059,8 +11821,11 @@ class Scheduler(
         # the ballot is indexed by QUEUE ORDER while the X gate reads the
         # canonical head. No new collective (MUST NOT 6).
         _xpend_at = len(vals)
+        # S42: a held pass does not touch the pending stamps (an empty head
+        # would DROP them and restart the wait); the age keeps running.
         vals = vals + tp_head_congruence.build_x_pending_payload(
-            _head_canonical, self._pdflip_local_store_read_pending_ages(_head_canonical)
+            _head_canonical,
+            {} if _s42_held else self._pdflip_local_store_read_pending_ages(_head_canonical),
         )
         # #1317 DESIGN A: THE STORE-PRICED MATCH ARM, third consumer of this
         # same reduce (after ORDER and COMPLETION), on the SAME canonical head.
@@ -11072,7 +11837,8 @@ class Scheduler(
         # the tree AND not in the store". No new collective (MUST NOT 6).
         _xstore_at = len(vals)
         vals = vals + tp_head_congruence.build_x_store_match_payload(
-            _head_canonical, self._pdflip_local_store_matches(_head_canonical)
+            _head_canonical,
+            {} if _s42_held else self._pdflip_local_store_matches(_head_canonical),
         )
         # RU (nf_rank_divergence): THE USABLE-MATCH ARM, fourth consumer of this
         # same reduce, on the SAME canonical head. The order arm votes the
@@ -11085,7 +11851,7 @@ class Scheduler(
         # No new collective (MUST NOT 6).
         _usable_at = len(vals)
         _usable_by_rid = {req.rid: req for req in self.waiting_queue}
-        _usable_local = tp_match_floor.local_usable_matches(
+        _usable_local = {} if _s42_held else tp_match_floor.local_usable_matches(
             getattr(self, "tree_cache", None), _usable_by_rid, _head_local_matches
         )
         vals = vals + tp_match_floor.build_usable_match_payload(
@@ -11096,6 +11862,12 @@ class Scheduler(
         vals = vals + tp_match_floor.build_usable_max_payload(
             _head_canonical, _usable_local, tp_head_congruence.TP_HEAD_SLOTS
         )
+        # S42r A3 (review nf-review-s42-1018): THE HOLD DECISION RIDES THIS
+        # REDUCE as an (x, -x) pair, so every rank learns the group's MIN and
+        # MAX of "this rank holds". Placed before the tail-indexed ballot, its
+        # own head index captured before the append. No new collective.
+        _s42_hold_at = len(vals)
+        vals = vals + _pdflip_head_vote_hold.build_hold_payload(_s42_held)
         _ballot_rids = [
             req.rid
             for req in self.waiting_queue[: prefetch_ballot.PREFETCH_BALLOT_SLOTS]
@@ -11105,6 +11877,15 @@ class Scheduler(
         )
         t = torch.tensor(vals, dtype=torch.int64)
         torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MIN, group=grp)
+        # S42r A3: the chain consumes the GROUP's hold, not this rank's: held
+        # when ANY rank held (it abstained from the head vote, so no rank may
+        # run a pass on it -- a lone pass would reach the Form A per-candidate
+        # gather in add_one_req alone: X gate abstains on an ABSENT match and
+        # does not refuse). On a split every rank also disarms DQH, so the next
+        # iteration evaluates jointly.
+        _pdflip_head_vote_hold.resolve_group(
+            self, t[_s42_hold_at : _s42_hold_at + 2].tolist()
+        )
         # #794: the group's tightest corridor width, read back before the
         # ballot so a later change to the ballot layout cannot silently move it.
         self._uniform_corridor_width = int(t[_corridor_at])
@@ -11281,6 +12062,16 @@ class Scheduler(
         self._publish_uniform_evict_floor(
             int(t[0].item()), max_avail=-int(t[max_avail_at].item())
         )
+        # F1 (nf-next-1006-01): the cap-blind gap, from the REDUCED values only.
+        publish_cap_blind_gap(
+            getattr(self, "tree_cache", None),
+            allocator=getattr(self, "token_to_kv_pool_allocator", None),
+            pin_admission=pin_admission,
+            min_avail=int(t[0].item()),
+            min_admission=int(t[1].item()) if pin_admission else 0,
+            local_evict_full=local_evict_full,
+            local_cap_above=local_cap_above,
+        )
         self._publish_uniform_host_floor(
             int(t[host_at].item()), max_host_avail=-int(t[host_at + 1].item())
         )
@@ -11393,7 +12184,7 @@ class Scheduler(
                         "contributed ABSENT, which delays it rather than "
                         "publishing a 0 the X gate would read as an opinion "
                         "(occurrence=%d)",
-                        str(rid)[:16], exc, self._head_vote_unpriced,
+                        str(rid), exc, self._head_vote_unpriced,
                     )
                 continue
             matches[rid] = _head_vote_len(req)
@@ -11638,6 +12429,46 @@ class Scheduler(
             return seqs or None
         except Exception:  # noqa: BLE001 - a key may never break the order arm
             return None
+
+    def _pdflip_prio_age_order(self) -> None:
+        """PRIO-AS-AGE 1014: ``waiting_queue`` with the higher priority first,
+        stable inside a priority (``prio_age.lane_sorted``). Only on a Weg-2
+        group (FLLIPER_PDFLIP_GROUP P or D) and not under upstream
+        ``--enable-priority-scheduling`` (its own sort ran in calc_priority).
+        Every input is replicated -- the queue the group agreed on and each
+        request's own ``priority`` -- so every rank sorts alike (raenge-nie-
+        uneins); a different order on one rank is what the #791b ballot
+        digest of the queue head detects."""
+        # No except: an order this rank could not form while its peers did is
+        # the divergence class #1158 ends -- it raises, never degrades.
+        if getattr(self, "enable_priority_scheduling", False):
+            return
+        _grp = str(os.environ.get("FLLIPER_PDFLIP_GROUP", "")).strip().upper()
+        if _grp not in ("P", "D"):
+            return
+        from flliper.srt.pdflip import prio_age as _pa
+
+        if not _pa.enabled():
+            return
+        # N5 (review nf-prio-alter 1014): on group P a stage sorts only where
+        # its order cannot become a per-stage plan -- a single stage
+        # (pp_size==1), or the row form where the followers EXECUTE PP0's row
+        # (``followers_execute_row``: PP0's sort reaches them through the
+        # row's entries, their own sort is overruled by
+        # ``order_batch_by_schedule``).  On the carrierless form every stage
+        # plans for itself and a stage-local sort would assume equal queues
+        # per pass; there P's order stays the front's ``pick`` alone.  The
+        # predicate reads the form fixed at init (switch + ROW_ONLY_ATTR), the
+        # same on every stage of one boot.
+        if _grp == "P":
+            from flliper.srt.pdflip.prefill_oom_retreat import followers_execute_row
+
+            if not followers_execute_row(self):
+                return
+        q = self.waiting_queue
+        ordered = _pa.lane_sorted(q, on=True)
+        if any(a is not b for a, b in zip(ordered, q)):
+            q[:] = ordered
 
     def _apply_uniform_head_order(
         self, head_inputs: Optional[tp_head_congruence.UniformHeadInputs]
@@ -12397,6 +13228,10 @@ class Scheduler(
         self.process_pending_pdflip_park()  # Punkt 2 (18.09.)
         if getattr(self, "pdflip_d_parked", None):
             self._pdflip_d_park_tick()  # H91b
+        if getattr(self, "pdflip_lane_floor", 0):
+            # PRIORITY LANES fix 2 (metal 180335): a queued request below D's floor goes into the lane hold, so the
+            # queue (an idle term) holds nothing the floor keeps out. Floor 0 (the default, switch off) never gets here.
+            self._pdflip_d_lane_hold_queued()
         _pdflip_resume_warm_tick(self)  # RW: experts of the resumes, after the legs, never waited for
         if getattr(self, "pdflip_post_wake_settle", None):
             self._pdflip_post_wake_settle_tick()  # #1471
@@ -12631,7 +13466,7 @@ class Scheduler(
                             int(running_batch.batch_size()),
                             getattr(self, "chunked_req", None) is not None,
                             ",".join(
-                                str(getattr(r, "rid", "?"))[:8]
+                                str(getattr(r, "rid", "?"))
                                 for r in list(getattr(running_batch, "reqs", []) or [])[:4]
                             ),
                         )
@@ -12697,7 +13532,12 @@ class Scheduler(
         # count stays rank-uniform no matter which branch is taken later.
         # W-SEAT: the COUNT vote reads THIS pass's running batch -- the merge
         # above may have rebound it away from `self.running_batch`.
+        # S42 (pdflip/head_vote_hold.py): this budget site is followed by the
+        # elif chain below, so it may take DQH's decision for this iteration
+        # and abstain from the head vote on a held pass.
+        _pdflip_head_vote_hold.arm(self)
         self._update_uniform_pool_budget(running_batch)
+        _pdflip_head_vote_hold.disarm(self)
 
         # #583 collective census. Same placement argument as the reduce above:
         # every rank reaches this line exactly once per iteration, so the
@@ -13098,11 +13938,33 @@ class Scheduler(
             # E2 in a mixed wake cohort: the skip batch's tokens go out with
             # this decode round before the next extend (rank-uniform)
             new_batch = None
+            _pdflip_d_decode_gap.note(self, "skipfirst_hold")  # S48 instrument
             self._admission_decline_note = "gate=pdflip_skip_first_decode"
+        elif self._pdflip_dqh_holds(running_batch):
+            # DQH (pdflip/d_head_hold.py): the refused D head and everything its
+            # verdict reads are unchanged -- no pass this round (replicated
+            # inputs, same iterations on every rank). The SEAT-AGE pass count
+            # moves as if the pass ran, so a refusal view ages honestly.
+            # S42: the decision is the budget site's when it took one (the
+            # head vote abstained there), so a held vote is never read.
+            new_batch = None
+            self._pdflip_sa_pass = getattr(self, "_pdflip_sa_pass", 0) + 1
+            self._admission_decline_note = "gate=pdflip_d_head_hold"
+            # S42r A2: the pass's per-iteration service still runs on a held
+            # iteration -- once per iteration on every rank, held or not (the
+            # pass runs it at the same point relative to the budget site).
+            self._hicache_iteration_service()
+            if self.enable_hicache_storage:
+                self._retry_deferred_prefetches()
         else:
+            _dqh_verdicts = self.__dict__.get("_pass_prefetch_verdicts")
             prefill_plan = self.get_new_batch_prefill(running_batch)
             new_batch = prefill_plan.batch_to_run
             running_batch = prefill_plan.running_batch
+            self.pdflip_d_head_hold.note_pass(
+                fp=self._pdflip_d_head_fingerprint(running_batch, _dqh_verdicts),
+                built_nothing=new_batch is None,
+            )
             if (
                 self.congruent_prefill_lane is not None
                 and new_batch is not None
@@ -13271,6 +14133,26 @@ class Scheduler(
         depths (pdflip/front.py ``SpanLRU.retract_lost_anchors``)."""
         probe = getattr(self.tree_cache, "pdflip_unbacked_anchors", None)
         if probe is None:
+            return
+        # FORM-A-WORKER (1304, NF y9nf5 04:54:46): a Form A worker holds no
+        # GDN/mamba state (``Mamba Cache ... ssm_state size: 0.00GB`` on
+        # TP1/TP2, 2.06GB on TP0) and no arena: its tree anchors are byteless
+        # bookkeeping whose write-through is refused by construction
+        # (``anchor_only_no_arena`` / ``mamba_pin``). Counted here they were 84
+        # ANCHOR-LOST lines (42 sleeps x TP1+TP2) while TP0, the only rank that
+        # can resume at an anchor, had 0, and each one made the front retract
+        # presence credit (PRESENCE-ANCHOR-LOST, union over ranks). TP0 alone
+        # speaks for the anchors; the rank role is the installed plan, the same
+        # answer on every rank, and the group fence still gathers (an empty
+        # list) from every rank.
+        if this_rank_is_form_a_worker():
+            _n = self.__dict__.get("_pdflip_anchor_lost_worker_skips", 0) + 1
+            self._pdflip_anchor_lost_worker_skips = _n
+            if _n <= 2:
+                logger.info(
+                    "PDFLIP-ANCHOR-LOST at=flush skipped on a Form A worker (no mamba state, no arena: "
+                    "TP0's own probe is the group's authority) n=%d", _n,
+                )
             return
         try:
             lost = probe()
@@ -13843,7 +14725,7 @@ class Scheduler(
                     "it voted; the verdict is priced on the group term alone "
                     "and is therefore unaffected -- no rank-local quantity "
                     "enters it)",
-                    str(getattr(req, "rid", "?"))[:16], local_match, gm,
+                    str(getattr(req, "rid", "?")), local_match, gm,
                     self._pdflip_x_term_priced, n,
                 )
         self._pdflip_x_term_priced = getattr(self, "_pdflip_x_term_priced", 0) + 1
@@ -13902,7 +14784,7 @@ class Scheduler(
                     "content key and anchor-capped; the remainder is bounded by "
                     "one chunk under the #939 law. Denominator: every X pricing "
                     "in which the store arm credited more than the tree arm)",
-                    str(getattr(req, "rid", "?"))[:16], gm, int(gsm),
+                    str(getattr(req, "rid", "?")), gm, int(gsm),
                     int(gsm) - gm, total, max(0, total - gm),
                     max(0, total - priced_match), n,
                 )
@@ -13922,7 +14804,7 @@ class Scheduler(
                 logger.info(
                     "#1424d X-PRICE-FLOOR rid=%s head=%d floor=%d uncached=%d n=%d (the group "
                     "admits the usable floor, so the extent is priced from it)",
-                    str(getattr(req, "rid", "?"))[:16], priced_match, floor,
+                    str(getattr(req, "rid", "?")), priced_match, floor,
                     max(0, total - floor), n,
                 )
             priced_match = floor
@@ -13944,7 +14826,7 @@ class Scheduler(
                     "H98x X-FLOOR-CREDIT rid=%s head=%d store=%s floor=%d total=%d "
                     "uncached=%d n=%d (Form A: the group admits the usable floor; "
                     "the head arm is a worker's mamba-refused walk, not a depth)",
-                    str(getattr(req, "rid", "?"))[:16], gm,
+                    str(getattr(req, "rid", "?")), gm,
                     "-" if gsm is None else int(gsm), floor, total,
                     max(0, total - floor), n,
                 )
@@ -14107,6 +14989,9 @@ class Scheduler(
             )
 
             gen = int(_current_generation())
+            # S64 S-ARM: one id per vote (= per pass); a probe is reused only inside it
+            _vote_pass = getattr(self, "_s64_store_vote_pass", 0) + 1
+            self._s64_store_vote_pass = _vote_pass
             wanted = set(canonical)
             for req in self.waiting_queue:
                 rid = str(getattr(req, "rid", "") or "")
@@ -14139,14 +15024,37 @@ class Scheduler(
                     prefix_keys = node.get_prefix_hash_values(node.parent)
                 key = (gen, local_match, len(span))
                 cached = getattr(req, "_pdflip_store_match_cache", None)
-                if cached is not None and cached[0] == key:
+                # S64 S-ARM (rc15 D 08:31:34 pdflip-72-525 store=68608 while the
+                # store held 98560; rc14 16-211 20032/27200 vs 37888): the key
+                # (generation, local_match, span) does not move while a waiting
+                # request's tree match stands still -- and the store fills under
+                # it (P's write-through, D's own park demote, the anchor demote).
+                # The verdict is reused only inside the pass that took it; a new
+                # pass asks the store again, so the arm is the store at decision
+                # time (FLLIPER_PDFLIP_S64_STORE_ARM_FRESH, default ON; 0 = the
+                # generation-keyed cache as before).
+                # COST: an answer that already covers the whole span cannot grow
+                # and stays cached; only a SHORT answer -- the one a W31 is priced
+                # on -- is asked again (the hash chain is ~20 ms per 100k tokens).
+                _fresh = _s64_store_arm_fresh_on()
+                if cached is not None and cached[0] == key and (
+                        not _fresh
+                        or (len(cached) > 2 and cached[2] == _vote_pass)
+                        or int(cached[1]) * page_size >= len(span)):
                     pages = int(cached[1])
                 else:
                     # Q-460 SALT-ISOLATION: the request's namespace
                     _ek = getattr(req, "extra_key", None)
                     _ns = {"extra_key": _ek} if _ek is not None else {}
-                    pages = int(probe(span, last_hash, prefix_keys, **_ns) or 0)
-                    req._pdflip_store_match_cache = (key, pages)
+                    # MAMBA-ANCHOR 1015: the fetch's key form (bigram RadixKey)
+                    from flliper.srt.pdflip import presence_fetch_key as _pfk
+
+                    _t0 = time.perf_counter()
+                    pages = int(probe(_pfk.span_key(self.tree_cache, req, span),
+                                      last_hash, prefix_keys, **_ns) or 0)
+                    _s64_note_store_arm(self, rid, key, cached, pages, page_size,
+                                        (time.perf_counter() - _t0) * 1000.0)
+                    req._pdflip_store_match_cache = (key, pages, _vote_pass)
                 # The probe counts PAGES; the arm votes TOKENS, because the
                 # extent it prices is a token count. Clamped to the span so a
                 # backend that over-reports can never credit tokens the
@@ -14451,7 +15359,7 @@ class Scheduler(
                     "re-issue; pricing it now is the uncached=whole-prompt W31 "
                     "of boot weg2sc3. Denominator: every pass in which any "
                     "request was found pending)",
-                    str(getattr(req, "rid", "?"))[:16], _defer_reason,
+                    str(getattr(req, "rid", "?")), _defer_reason,
                     pending_ms / 1000.0, bound_s, n,
                 )
             _pdflip_hbd.note_x_defer(req, True)
@@ -14462,7 +15370,7 @@ class Scheduler(
             "group's youngest store-read timer outlived the span's own "
             "length-priced bound, so the request is priced as it stands and W31 "
             "may fire honestly)",
-            str(getattr(req, "rid", "?"))[:16], _defer_reason,
+            str(getattr(req, "rid", "?")), _defer_reason,
             pending_ms / 1000.0, bound_s, n,
         )
         return False
@@ -14493,11 +15401,28 @@ class Scheduler(
         )
         if tp_size > 1 and group_match is None:
             self._pdflip_x_abstained = getattr(self, "_pdflip_x_abstained", 0) + 1
-            if self._pdflip_x_abstained <= 5 or self._pdflip_x_abstained % 64 == 0:
+            # N3 (review nf-prio-alter 1014), COUNTED, not changed: PRIO-AS-AGE
+            # can lift a p>0 rid from outside the W9 canon (the 32 smallest
+            # rids, tp_head_congruence.canonical_head_rids) to the queue head;
+            # the gate abstains for it (group-uniform: the canon is the rid
+            # SET's). Extending the canon by priority would change the slot
+            # map of the head reduce -- not done here; this counter is the
+            # metal reading that decides whether it is needed.
+            try:
+                _prio = int(getattr(req, "priority", 0) or 0)
+            except (TypeError, ValueError):
+                _prio = 0
+            if _prio > 0:
+                self._pdflip_x_abstained_prio = getattr(self, "_pdflip_x_abstained_prio", 0) + 1
+            if (self._pdflip_x_abstained <= 5 or self._pdflip_x_abstained % 64 == 0
+                    or (_prio > 0 and (self._pdflip_x_abstained_prio <= 5
+                                       or self._pdflip_x_abstained_prio % 64 == 0))):
                 logger.info(
                     "PDFLIP X-GATE rid=%s uncached=? X=%d replicated_term=False "
-                    "verdict=abstain_no_group_match occurrence=%d",
-                    str(getattr(req, "rid", "?"))[:16], x, self._pdflip_x_abstained,
+                    "verdict=abstain_no_group_match occurrence=%d priority=%d "
+                    "prio_occurrence=%d",
+                    str(getattr(req, "rid", "?")), x, self._pdflip_x_abstained,
+                    _prio, getattr(self, "_pdflip_x_abstained_prio", 0),
                 )
             return False
         uncached = self.pdflip_uncached_extent(req, head_inputs)
@@ -14544,7 +15469,12 @@ class Scheduler(
         # `_pdflip_host_carry_tokens` stays: the #1246 carrier bound still reads
         # D's own #915 line, and it is the term the acceptance checks against
         # cap x share.
-        verdict = "W31" if uncached > x else "admit"
+        # FRONT-X-MIT (15.10.): the limit is the front's decision X (+ one page of
+        # rounding) when the request carries it, never above the static X.
+        # `X=` stays the STATIC value (the old readers of this line parse it);
+        # `front_x=`/`front_priced=`/`limit=` name what the verdict compared to.
+        limit, _front_x, _front_priced = _pdflip_front_x.resolve_limit(req, x, getattr(self, "page_size", None))
+        verdict = "W31" if uncached > limit else "admit"
         # FORK ANCHOR (Q-360): the generation-prompt tail a fork-cut P leg
         # leaves to D is D's own extend, not a prefill over X -- admitted when
         # the GROUP match reaches the fork (uncached <= N - F). Both terms are
@@ -14586,8 +15516,11 @@ class Scheduler(
         if verdict == "admit" and _pdflip_extend_trim.cap_floor_armed():
             verdict = self._pdflip_cap_floor_verdict(req, uncached, verdict)
         logger.info(
-            "PDFLIP X-GATE rid=%s uncached=%d X=%d replicated_term=%s verdict=%s",
-            str(getattr(req, "rid", "?"))[:16], uncached, x, term, verdict,
+            "PDFLIP X-GATE rid=%s uncached=%d X=%d replicated_term=%s verdict=%s "
+            "front_x=%s front_priced=%s limit=%d",
+            str(getattr(req, "rid", "?")), uncached, x, term, verdict,
+            "-" if _front_x is None else _front_x,
+            "-" if _front_priced is None else _front_priced, limit,
         )
         if verdict == "admit":
             _pdflip_rvp.clear_capacity_park(req)  # #248h: its re-read landed
@@ -14624,7 +15557,7 @@ class Scheduler(
                 "uncached=%d my_vote=%s my_raw=%s why=%s (W31: the group priced "
                 "total - min(max(head, store), floor); this rank's usable vote "
                 "entered that floor's MIN)",
-                str(getattr(req, "rid", "?"))[:16], _t[0], _t[1], _t[2], _t[3],
+                str(getattr(req, "rid", "?")), _t[0], _t[1], _t[2], _t[3],
                 uncached,
                 None if _v is None else _v[1], None if _v is None else _v[0],
                 None if _v is None else _v[2],
@@ -14655,13 +15588,71 @@ class Scheduler(
             marks.pop(next(iter(marks)))
         return verdict
 
-    def _pdflip_answer_x_refusals(self, refused: List[Req], head_inputs=None) -> None:
+    def _pdflip_s59_reread_before_refusal(self, req: Req) -> bool:
+        """S59: True = the W31 just priced is NOT taken this pass; the request
+        is marked ``store_prefix_short`` so ``_retry_deferred_prefetches``
+        re-reads the store from its current match and ``_pdflip_x_defers``
+        holds the gate until that read lands (rc14 pdflip-16-211, rc15
+        pdflip-72-525: the floor fell to 0 after an eviction / a SEAT-AGE
+        displacement while the store held the context; nothing re-read it).
+
+        Group verdict: the terms are the X gate's own replicated reduce
+        values (``_pdflip_x_terms``, set by ``pdflip_uncached_extent`` in the
+        verdict just taken) and the per-request bookkeeping is written on
+        every rank alike. No except: a rank-local failure here would refuse on
+        one rank and defer on the others -- it stops the group instead
+        (raenge-nie-uneins)."""
+        if not getattr(self, "enable_hicache_storage", False):
+            return False
+        from flliper.srt.pdflip import d_store_reread as _rr
+
+        terms = getattr(self, "_pdflip_x_terms", None)
+        done = tuple(getattr(req, "_s59_reread_keys", ()) or ())
+        due, key = _rr.reread_due(terms, done, _rr.enabled())
+        if not due:
+            return False
+        if getattr(req, "prefetch_deferred", None) is not None:
+            return False  # an armed mark has its own exits
+        if self._prefetch_deferral_refusal_reason(_DEFER_REASON_STORE_SHORT) is not None:
+            return False
+        from flliper.srt.mem_cache.match_refusal_census import (
+            note_prefetch_gate as _note_prefetch_gate,
+        )
+
+        req._s59_reread_keys = done + (key,)
+        req.prefetch_deferred = _DEFER_REASON_STORE_SHORT
+        req.prefetch_defer_attempts = 1
+        req.prefetch_defer_passes = 0
+        req.prefetch_defer_since = time.monotonic()
+        req._pdflip_defer_windows = 1
+        _note_prefetch_gate("deferred")
+        _note_prefetch_gate("deferred_store_short")
+        n = getattr(self, "_pdflip_s59_rereads", 0) + 1
+        self._pdflip_s59_rereads = n
+        logger.warning(
+            "S59 STORE-REREAD-BEFORE-W31 rid=%s total=%s head=%s store=%s floor=%s "
+            "priced=%d reread=%d/%d n=%d -- the group store arm holds more prefix "
+            "than the floor the X gate priced (the tree lost it after its read); "
+            "D re-reads the store first and prices again when it lands "
+            "(store_prefix_short mark), instead of refusing a context the store holds",
+            str(getattr(req, "rid", "?")), terms[0], terms[1], terms[2], terms[3],
+            key[0], len(req._s59_reread_keys), _rr.MAX_REREADS, n,
+        )
+        return True
+
+    def _pdflip_answer_x_refusals(
+        self, refused: List[Req], head_inputs=None, wall_rows: Optional[Dict[int, int]] = None
+    ) -> None:
         """Remove the W31-refused requests and answer them BY NAME (C11).
 
         Not a silent skip: a request left in the queue would be re-offered
         every pass and never served, which is a livelock wearing the costume
         of a policy. The named 503 is what lets the caller re-route it
         through the prefill group exactly once (its own W35 bounds that).
+
+        ``wall_rows`` (PW-R, pdflip/d_wall_head.py): ``id(req) -> device rows``
+        of a head the backup wall made unservable; its refusal names those rows
+        as the extent, so the front prices the re-route at what D could not hold.
         """
         x = int(getattr(self.server_args, "tp_prefill_max_tokens", 0) or 0)
         refused_ids = {id(r) for r in refused}
@@ -14672,10 +15663,22 @@ class Scheduler(
         # group's; the local terms are MIN-reduced like every park release).
         _cap_park = [False] * len(refused)
         if any(_pdflip_rvp.capacity_park_precondition(r) for r in refused):  # replicated terms
-            _cap_local = [_pdflip_rvp.capacity_park_candidate(r, x, sched=self) for r in refused]
+            _cap_local = [
+                _pdflip_rvp.capacity_park_candidate(
+                    r, _pdflip_front_x.resolve_limit(r, x, getattr(self, "page_size", None))[0], sched=self
+                )
+                for r in refused
+            ]
             _cap_park = [bool(f) for f in self._pdflip_group_min_flags(_cap_local)]
+        x_static = x
         for _i, req in enumerate(refused):
-            uncached = self.pdflip_uncached_extent(req, head_inputs)
+            # FRONT-X-MIT (15.10.): the bound this request was refused against is the
+            # front's decision X (+ one page) when it carried one, else the static X.
+            x, _front_x, _front_priced = _pdflip_front_x.resolve_limit(req, x_static, getattr(self, "page_size", None))
+            if wall_rows is not None and id(req) in wall_rows:
+                uncached = int(wall_rows[id(req)])
+            else:
+                uncached = self.pdflip_uncached_extent(req, head_inputs)
             if _cap_park[_i]:
                 _tc = getattr(self, "tree_cache", None)
                 if _tc is not None:
@@ -14706,7 +15709,23 @@ class Scheduler(
                 f"prefix matching is {uncached}. Refused by name so the caller re-routes it "
                 f"through the prefill group -- never prefilled here silently."
             )
-            logger.warning("W50 PdFlipTpPrefillExceeded rid=%s uncached=%d X=%d", req.rid, uncached, x)
+            if _front_x is not None:
+                message += (
+                    f" FRONT-X: the front dispatched this request on X={_front_x} "
+                    f"(priced {'?' if _front_priced is None else _front_priced}); "
+                    f"limit = min(static {x_static}, front X + one page)."
+                )
+            if wall_rows is not None and id(req) in wall_rows:
+                message += (
+                    " D-WALL-HEAD: the extent is the device rows this request needs; the "
+                    "host arena takes no backup, so nothing D holds can leave the device."
+                )
+            logger.warning(
+                "W50 PdFlipTpPrefillExceeded rid=%s uncached=%d X=%d front_x=%s front_priced=%s",
+                req.rid, uncached, x,
+                "-" if _front_x is None else _front_x,
+                "-" if _front_priced is None else _front_priced,
+            )
             # #Q0/#991 THE THIRD EXIT. A request refused here was matched
             # first, and the match may have drawn a COW resume slot
             # (`MambaComponent.finalize_match_result`). It never reaches
@@ -14753,7 +15772,17 @@ class Scheduler(
             head_inputs, str(getattr(req, "rid", "") or "")
         )
         if gm is not None:
-            return min(int(gm), len(req.full_untruncated_fill_ids))
+            # S59 (rc15 D pdflip-4-9 / 28-111): priced like the X gate -- the
+            # group's USABLE floor where it differs from the head (Form A: the
+            # head arm is a worker's mamba-refused walk, the floor is the depth
+            # every rank admits), both replicated terms of the same reduce.
+            from flliper.srt.pdflip import vision_d_guard as _vdg
+
+            _floor = tp_match_floor.group_usable_for(
+                getattr(self, "tree_cache", None), str(getattr(req, "rid", "") or "")
+            )
+            covered = _vdg.admitted_covered(int(gm), _floor, _pdflip_x_floor_credit_on())
+            return min(int(covered), len(req.full_untruncated_fill_ids))
         if int(getattr(getattr(self, "ps", None), "tp_size", 1) or 1) > 1:
             return None
         return len(req.prefix_indices) + int(getattr(req, "host_hit_length", 0) or 0)
@@ -14863,7 +15892,7 @@ class Scheduler(
                 self._x36_dormant_batch_said = True
                 logger.info("#x36 DORMANT: no prefill batch for %d queued request(s) while the pools are paused %s",
                             len(self.waiting_queue),
-                            [str(getattr(r, "rid", "?"))[:12] for r in self.waiting_queue[:4]])
+                            [str(getattr(r, "rid", "?")) for r in self.waiting_queue[:4]])
             return NextBatchPlan(batch_to_run=None, running_batch=running_batch)
         self._x36_dormant_batch_said = False
         prefill_delayer_single_pass = None
@@ -14889,6 +15918,14 @@ class Scheduler(
             from flliper.srt.pdflip.vision_verdict import follower_pass
 
             _vision_parked = follower_pass(self)
+        # S88 (NF rc19 death 20.10. 07:18:44Z, pdflip-262-3338): the requests
+        # parked above are STILL queue occupants for this pass -- the #1068
+        # retry at the head of `_get_new_batch_prefill_raw` scans them too
+        # (`_retry_deferred_prefetches`). Without this a vision request held
+        # told-pending with a deferred intake prefetch was parked out of every
+        # retry scan: no re-issue, no told (pp0_publish skips a marked rid), the
+        # told-pending wait never ended -- a deadlock without a Frist.
+        self._pdflip_vision_parked_reqs = [r for _, r in _vision_parked]
         try:
             try:
                 ret, running_batch = self._get_new_batch_prefill_raw(
@@ -14896,6 +15933,7 @@ class Scheduler(
                     running_batch=running_batch,
                 )
             finally:
+                self._pdflip_vision_parked_reqs = []
                 if _vision_parked:
                     from flliper.srt.pdflip.vision_rank_runner import vision_unpark
 
@@ -15565,7 +16603,7 @@ class Scheduler(
                             "the drain collected it here instead of never. "
                             "collected=%d ongoing_after=%d (denominator: "
                             "every open prefetch record of this rank)",
-                            str(_rid)[:8],
+                            str(_rid),
                             _n,
                             len(_ongoing),
                         )
@@ -15686,6 +16724,10 @@ class Scheduler(
         # The witness term, written BEFORE the arm reads it: a re-read that
         # gains nothing leaves this value unchanged and the standstill count
         # advances, which is what ends the wait honestly.
+        # S64 S-CAP: the previous pair and this read's cut cause, for the name
+        from flliper.srt.pdflip import short_read_cause as _src
+
+        _src.note_record(req, delivered, deliverable, getattr(outcome, "cut_cause", None))
         req._pdflip_store_delivered = delivered
         req._pdflip_store_deliverable = deliverable  # #248h: what the store holds
         self._pdflip_store_short_seen = getattr(self, "_pdflip_store_short_seen", 0) + 1
@@ -15694,6 +16736,49 @@ class Scheduler(
         self._pdflip_store_short_delivered = getattr(self, "_pdflip_store_short_delivered", 0) + delivered
         self._pdflip_store_short_deliverable = getattr(self, "_pdflip_store_short_deliverable", 0) + deliverable
         n = self._pdflip_store_short_seen
+        # S18 (h16v3 1017_224250, pdflip-1-14/-15/-16): the store HELD the whole span (the probe's hit covers the
+        # deliverable prefix; TAIL-CONSUME hit=118400) and D's read was cut by its own full arena (PDFLIP-READ-DEPTH
+        # cause=arena_full, READ-ROOM SHORT class=not_posted). That is a capacity cut, not P's write-through
+        # lagging, yet the line said "the store did not hold the rest yet", so the acceptance "STORE READ
+        # INCOMPLETE == 0" could not tell the two apart. Only the NAME and the counter split: the deferral
+        # below is identical for both, and the STORE-HELD-DECIDE-1014 predicate it already feeds is untouched.
+        # S23 (h16v4b 1018_013102, D TP0 01:36:24, pdflip-0-2 delivered=0): the label said "D's own arena room", yet the
+        # READ-DEPTH cause of that very cut was late_complete (a JOINED claim reaped under the read; arena_full on D
+        # = 0 in the whole boot, D POSTed one room request, at 01:49:56). "The probe covers the span" proves the STORE
+        # holds it, not that the ARENA cut it: CAPACITY-CUT needs the recorded cause arena_full (or none recorded).
+        _cut_cause = getattr(outcome, "cut_cause", None)   # CAPACITY causes: _CAPACITY_CUT_CAUSES
+        if (int(getattr(outcome, "hit_tokens", 0) or 0) >= int(getattr(outcome, "deliverable", 0) or 0) > 0
+                and getattr(outcome, "probed", False) and _cut_cause not in _CAPACITY_CUT_CAUSES):
+            self._pdflip_store_short_held_other = getattr(self, "_pdflip_store_short_held_other", 0) + 1
+            nh = self._pdflip_store_short_held_other
+            if nh <= 8 or nh % 64 == 0:
+                logger.warning(
+                    "#1324 STORE READ HELD-CUT rid=%s delivered=%d deliverable=%d shortfall=%d hit_tokens=%d "
+                    "cut_cause=%s site=drain occurrence=%d held_cut_occurrence=%d -- the store HOLDS the whole span "
+                    "(probe hit covers it) and the read was cut by %s, a cause that is not "
+                    "arena room pressure (room pressure records arena_full / l2_evicted_before_ref / "
+                    "fill_evicted_before_ref). Deferring through the A12.2 shortfall arm. Denominator: every "
+                    "terminated store read of this rank whose record reports a page-floored shortfall AND whose "
+                    "probe hit covers the deliverable prefix AND whose recorded cut cause is not a room-pressure cause",
+                    rid, delivered, deliverable, deliverable - delivered, int(outcome.hit_tokens), _cut_cause, n,
+                    nh, _cut_cause,
+                )
+            return self._apply_prefetch_deferral(req, _VERDICT_STORE_SHORT, site="drain")
+        if (int(getattr(outcome, "hit_tokens", 0) or 0) >= int(getattr(outcome, "deliverable", 0) or 0) > 0
+                and getattr(outcome, "probed", False)):
+            self._pdflip_store_short_capacity = getattr(self, "_pdflip_store_short_capacity", 0) + 1
+            nc = self._pdflip_store_short_capacity
+            if nc <= 8 or nc % 64 == 0:
+                logger.warning(
+                    "#1324 STORE READ CAPACITY-CUT rid=%s delivered=%d deliverable=%d shortfall=%d hit_tokens=%d "
+                    "site=drain occurrence=%d capacity_occurrence=%d -- the store HOLDS the whole span (probe hit "
+                    "covers it) and the read ended short on D's own arena room; this is not P's write-through "
+                    "lagging. Deferring through the A12.2 shortfall arm; the room is the defect (READ-ROOM serves "
+                    "group P and, via TP0 at its broadcast, group D). Denominator: every terminated store read of this rank whose record reports a "
+                    "page-floored shortfall AND whose probe hit covers the deliverable prefix",
+                    rid, delivered, deliverable, deliverable - delivered, int(outcome.hit_tokens), n, nc,
+                )
+            return self._apply_prefetch_deferral(req, _VERDICT_STORE_SHORT, site="drain")
         if n <= 8 or n % 64 == 0:
             logger.warning(
                 "#1324 STORE READ INCOMPLETE rid=%s delivered=%d deliverable=%d "
@@ -15704,7 +16789,7 @@ class Scheduler(
                 "the X gate price the shortfall as tokens D must prefill. "
                 "Denominator: every terminated store read of this rank whose "
                 "record reports a page-floored shortfall",
-                rid[:16], delivered, deliverable, deliverable - delivered, n,
+                rid, delivered, deliverable, deliverable - delivered, n,
             )
         return self._apply_prefetch_deferral(req, _VERDICT_STORE_SHORT, site="drain")
 
@@ -15922,7 +17007,7 @@ class Scheduler(
                             "is refused on this boot; this is the quantity "
                             "the #968 fix-form fork turns on.",
                             _o,
-                            str(rid)[:8],
+                            str(rid),
                             told,
                             local_prefix,
                             told - local_prefix,
@@ -16073,6 +17158,11 @@ class Scheduler(
         # itself here, and _trace_pp_admission_verdict prints it on DECLINE
         # lines. Host-side strings only (#790).
         self._admission_decline_note = None
+        # Q-702 (Auftrag 1522): the pass number the SEAT-AGE verdict ages the
+        # adder's refusal numbers by (`pdflip/d_park_runtime.NO_TOKEN_VIEW_ATTR`):
+        # one count per call, before any early exit, so a pass that declines
+        # above `admission()` still ages the view. Host-side int, no collective.
+        self._pdflip_sa_pass = getattr(self, "_pdflip_sa_pass", 0) + 1
 
         # #1046: PP0'S SELF-APPLY IS GONE WITH THE REST OF THE DELIVERY CHAIN.
         # PP0 used to apply the row it built last pass so its timing matched a
@@ -16082,43 +17172,17 @@ class Scheduler(
         # and one lap of latency disappears with it.
 
         # Check if the grammar is ready in the grammar queue
+        ready_grammar_requests = ()
         if self.grammar_manager.has_waiting_grammars():
             ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
 
-        if self.enable_hierarchical_cache or self.server_args.enable_flexkv:
-            _dgap = _d_hostgap.meter()  # #DGAP (FLLIPER_PDFLIP_D_HOSTGAP)
-            if _dgap is None:
-                self.tree_cache.check_hicache_events()
-            else:
-                with _dgap.span("hicache"):
-                    self.tree_cache.check_hicache_events()
-            # #811: release anchor pins whose write-through ack just drained,
-            # BEFORE this tick's admissions allocate -- so an acked-but-still
-            # -pinned checkpoint can never crowd out an admission in the same
-            # tick. Only requests in the RUNNING batch are swept: their first
-            # extend result has been processed, so the deferred mamba COW
-            # read of the matched anchor has provably executed. No-op unless
-            # --mamba-anchor-ack-release armed the mechanism.
-            release_pins = getattr(self.tree_cache, "release_acked_anchor_pins", None)
-            if release_pins is not None and self.running_batch is not None:
-                release_pins(self.running_batch.reqs)
-            # 24c --d-kv-evict-for-placement (pdflip/d_kv_evict.py, DYN_D_RESHARD
-            # sec. 14): cold, L2-backed radix leaves leave the device so the
-            # bandwidth placement keeps its shares. Here because every rank
-            # reaches this point each iteration (the storage-drain agreement
-            # above, the #580 prefetch collectives below); a dict lookup when
-            # FLLIPER_PDFLIP_D_KV_EVICT is absent.
-            if self.__dict__.get("_pdflip_d_kv_evictor", True) is not None:
-                from flliper.srt.pdflip.d_kv_evict import scheduler_step as _d_kv_evict_step
-
-                _d_kv_evict_step(self)
-            # PUBLISH-SWEEP-BG (pdflip_flush_nonblock part 1b): a few un-backed
-            # finished-request nodes published between D decode rounds so the
-            # flip's flush finds a small backlog. Same group-uniform point as
-            # the evictor above; a dict/env lookup when the switch is off.
-            _pdflip_flush_nonblock.bg_publish_tick(self)
+        # S42r A2: the per-iteration HiCache service, also run by a DQH-held
+        # iteration (see `_hicache_iteration_service`). Called through the
+        # class so the pass's test doubles (a bare namespace bound to this
+        # function) keep working without growing the attribute.
+        Scheduler._hicache_iteration_service(self)
 
         # #580: rank-uniform entry into the prefetch-progress collectives.
         # MUST stay above every early return and every loop exit below -- all
@@ -16159,6 +17223,26 @@ class Scheduler(
         prefetch_verdicts = self.__dict__.pop("_pass_prefetch_verdicts", None)
         if prefetch_verdicts is None:
             prefetch_verdicts = self._drain_prefetch_progress()
+        elif ready_grammar_requests and self.enable_hicache_storage:
+            # NF 08.10. (#580 after #791b): the memo was drained at the budget
+            # site, BEFORE the grammar intake above -- its rids are pending
+            # this pass (the ballot does not hold them either), drained next
+            # pass. See prefetch_ballot.cover_post_drain_intake.
+            _covered = prefetch_ballot.cover_post_drain_intake(
+                prefetch_verdicts, ready_grammar_requests
+            )
+            if _covered:
+                _n = getattr(self, "_grammar_intake_covered_n", 0) + 1
+                self._grammar_intake_covered_n = _n
+                if _n <= 8 or _n % 64 == 0:
+                    logger.info(
+                        "#580 GRAMMAR-INTAKE PENDING rids=%s n=%d: entered the "
+                        "waiting queue after this pass's memoised prefetch drain "
+                        "(grammar compiled); not-done this pass, drained and "
+                        "balloted from the next",
+                        _covered,
+                        _n,
+                    )
         _prefetch_ballot = self.__dict__.pop("_uniform_prefetch_ballot", None)
         # #823 W9b: take the group's batch verdict HERE, once, above every
         # early return and above both consumers -- the same position and the
@@ -16353,6 +17437,12 @@ class Scheduler(
         # queue, same policy, different order -- and a different order is a
         # different batch.
         self._apply_uniform_head_order(_head_inputs)
+        # PRIO-AS-AGE 1014 (pdflip/prio_age.py): on a Weg-2 group a higher
+        # `priority` is OLDER than every lower one -- a STABLE sort by the
+        # request's own (replicated) priority field, so inside a priority the
+        # group order just agreed on stands exactly; P's batch order and D's
+        # admission order follow it. Off / no priority: the queue untouched.
+        self._pdflip_prio_age_order()
         # H91b: on group D the parked requests come first and hold the seats
         # they return to (pdflip/d_seats.admission_gate); None = stock loop.
         _d_park_gate = self._pdflip_d_park_admission(running_batch)
@@ -16596,6 +17686,9 @@ class Scheduler(
         # H105: on a Form A group the attention host's gate verdict is the
         # group's (None elsewhere: every gate in add_one_req stays rank-local).
         adder.form_a_admission_follow = self._form_a_admission_follow_fn()
+        # PRIORITY LANES 1008 (L3): this pass's lane floor (and the lane chunk) for the adder; nothing is written without
+        # lane state (no RPC / switch off), so the adder keeps its class defaults.
+        _lanes_p.configure_adder(self, adder)
         # ED (rc12o b1): on a Form A group only the host's vote decides (H105);
         # a worker keeps the reported evictable count so its local extend
         # arithmetic is the pre-ED one (mem_cache/evict_frontier_census.py).
@@ -16666,6 +17759,11 @@ class Scheduler(
                 incoming=getattr(self, "_pp_admission_incoming_effective", None),
             )
             self.anchor_tails = _tail_readd.kept
+
+        # PREFILL-OOM-RETREAT: the continuation this pass starts with. ``add_chunked_req`` returns None for the LAST chunk
+        # of a continuation (``self.chunked_req`` is None afterwards although the request is in ``can_run_list``), so the
+        # retreat cannot recognise it as carried from the attribute after the fact.
+        _oom_carried_before = self.chunked_req
 
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
@@ -16780,8 +17878,8 @@ class Scheduler(
             # below rather than guessed at, so boot 12 measures the second
             # half instead of assuming it.
             incoming = getattr(self, "_pp_admission_incoming_effective", None)
-            not_named = (
-                incoming is not None and incoming.get(self.chunked_req.rid) is None
+            not_named = _pp_chunked_continuation_not_named(
+                self, incoming, self.chunked_req
             )
             if not_named:
                 self._992_chunked_not_named = (
@@ -16913,7 +18011,8 @@ class Scheduler(
                                 count,
                             )
                         self.chunked_req.truncate_prefix_to(told)
-                self.chunked_req = adder.add_chunked_req(self.chunked_req)
+                with _lanes_p.chunk_scope(adder, self.chunked_req):
+                    self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
         # #959 THE RESIDENCY FACT, STAMPED WHERE IT IS SETTLED. Both branches
         # above leave `self.chunked_req` final for this pass -- the seam
@@ -16969,7 +18068,7 @@ class Scheduler(
                 self._admission_decline_note = (
                     "loop_skips("
                     + ",".join(
-                        f"{k}={v}(first={_skip_first_rid[k][:16]})"
+                        f"{k}={v}(first={_skip_first_rid[k]})"
                         for k, v in sorted(_skips.items())
                     )
                     + ")"
@@ -17051,11 +18150,24 @@ class Scheduler(
         from flliper.srt.pdflip import hol_overtake as _hol_mod
 
         _hol = _hol_mod.HolPass(self)
+        # PRIORITY LANES 1008 (L3): while the floor stands above a request's lane every rank that DECIDES membership itself
+        # (PP0 / non-PP, and -- FIX 3, NF metal 211536 -- every follower of a form without a row carrier, which plans for
+        # itself: PP1 admitted the lane-0 pdflip-6-17 that PP0 held -> #1004) does not admit it. A follower that EXECUTES PP0's
+        # named schedule never skips by lane (the schedule names its members). 0 = off.
+        _lane_floor = _lanes_p.floor_for_pass(self) if _lanes_p.skips_by_lane(self) else 0
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
+            if _lane_floor and _lanes_p.holds(_lanes_p.req_lane(req), _lane_floor):
+                _note_skip("pdflip_lane_held", req.rid)
+                continue
             if _burst_hold is not None:  # fnFL2 H42b: the burst is still assembling
                 _note_skip("pdflip_burst_assembly", req.rid)
                 continue
+            if getattr(self, "pdflip_lane_floor", 0):  # PRIORITY LANES 1008 (L2): the floor of D's admission
+                _lane_skip = self._pdflip_lane_skip(req)
+                if _lane_skip is not None:
+                    _note_skip(_lane_skip, req.rid)
+                    continue
             if _d_park_gate is not None:  # H91b: parked first, newcomers wait
                 # AP: the parked requests already admitted THIS pass hold no seat
                 _d_skip = _d_park_gate.skip(req, admitted=[str(_r.rid) for _r in adder.can_run_list],
@@ -17269,7 +18381,18 @@ class Scheduler(
                     self, req, _note_skip, pdflip_store_told.admission
                 )
                 if _told_loaded is None:
-                    continue
+                    # C2 (NF-FOLLOWER-ROUND 1014, B4): under PP0's executed row
+                    # the gate yields to the row for a rid the row names (as
+                    # the LB-VERDICT gate does, LBV_ROW_YIELD) and is no
+                    # barrier for one it does not; without a row it is the
+                    # W27-HELD-STOP barrier as before (`told_pending_gate`).
+                    _told_gate = _p_intake.told_pending_gate(
+                        self, req, _note_skip, pdflip_store_told.held_barrier
+                    )
+                    if _told_gate == _p_intake.GATE_BREAK:
+                        break
+                    if _told_gate == _p_intake.GATE_SKIP:
+                        continue
             if self.enable_hicache_storage and _pp_group:
                 # #1066: PP0 DOES WAIT NOW -- and only PP0. The #969Z verdict
                 # above ("TAKE WITHOUT WAITING, uniform and therefore
@@ -17462,7 +18585,7 @@ class Scheduler(
                 _irl = getattr(self, "_pdflip_gnbp_initr", None)
                 if _irl is None:
                     _irl = self._pdflip_gnbp_initr = []
-                _irl.append((str(getattr(req, "rid", "?"))[:10], (time.perf_counter() - _ir_t0) * 1000.0))
+                _irl.append((str(getattr(req, "rid", "?")), (time.perf_counter() - _ir_t0) * 1000.0))
 
             # WEG2_SCHEDULING_SPEC_0907 C11/W31 -- LAW 4, ENFORCED WHERE THE
             # UNCACHED EXTENT IS REAL.
@@ -17517,6 +18640,12 @@ class Scheduler(
                     req, int(self.pdflip_uncached_extent(req, _head_inputs))
                 ):
                     _note_skip("pdflip_handback_defer", req.rid)
+                    continue
+                # S59: the store holds more than the floor the gate priced --
+                # read it first (A12.2 store_prefix_short mark), refuse only on
+                # what a read could not bring (pdflip/d_store_reread.py).
+                if self._pdflip_s59_reread_before_refusal(req):
+                    _note_skip("pdflip_x_store_reread", req.rid)
                     continue
                 _note_skip("pdflip_x_refused", req.rid)
                 _x_refused.append(req)
@@ -17706,7 +18835,7 @@ class Scheduler(
                                 "deleted. Applying it here would move this "
                                 "rank's prefix alone and manufacture the "
                                 "rank split. occurrence=%d",
-                                str(getattr(req, "rid", "?"))[:8],
+                                str(getattr(req, "rid", "?")),
                                 told,
                                 _n,
                             )
@@ -17810,7 +18939,7 @@ class Scheduler(
                                 "admission visit on a carrierless form that "
                                 "arrived carrying a nonzero extent; visits with "
                                 "no extent are not counted and are not events)",
-                                str(getattr(req, "rid", "?"))[:8],
+                                str(getattr(req, "rid", "?")),
                                 _dropped,
                                 len(req.prefix_indices),
                                 int(self.ps.pp_rank),
@@ -17855,18 +18984,52 @@ class Scheduler(
                 # slice lived, and where the offer's only deleter was lost in
                 # e0bc96008e.
 
+            # LBV-ADMIT (NF h16h 19:33:48Z, pdflip/pp_loadback_verdict.admit_holds): on the
+            # carrierless form no stage admits a request before PP0's verdict for it was
+            # absorbed at this pass's intake -- the gate keys on the admission, not on this
+            # stage's own host hit (PP0 admitted pdflip-70-656 from its device, PP1/PP2 held
+            # it for a load-back verdict that never came: ring wait). After every deferral
+            # above, so PP0 releases only what it would admit; skipped like a deferral.
+            _lbv_held = False
             try:
                 _ar_t0 = time.perf_counter()  # xsn325: host cost per admission
-                res = adder.add_one_req(
-                    req,
-                    truncation_align_size=self.truncation_align_size,
-                )
+                if _pdflip_lbv.admit_holds(self, req):
+                    _lbv_held = True
+                    res = AddReqResult.OTHER
+                else:
+                    try:
+                        with _lanes_p.chunk_scope(adder, req):  # L3: a lower lane's chunk is smaller while a higher lane waits
+                            res = adder.add_one_req(
+                                req,
+                                truncation_align_size=self.truncation_align_size,
+                            )
+                    finally:
+                        _pdflip_lbv.admit_done(req)
                 if getattr(self, "_pdflip_post_wake_pass_n", None) is not None:
                     _arl = getattr(self, "_pdflip_gnbp_addreq", None)
                     if _arl is None:
                         _arl = self._pdflip_gnbp_addreq = []
-                    _arl.append((str(getattr(req, "rid", "?"))[:10], (time.perf_counter() - _ar_t0) * 1000.0,
+                    _arl.append((str(getattr(req, "rid", "?")), (time.perf_counter() - _ar_t0) * 1000.0,
                                  int(getattr(req, "host_hit_length", 0) or 0)))
+            except AgreedRoomShort as _ars:
+                # PREFILL-OOM-RETREAT, load-back entrance (NF 13.10. 18:30:21Z): this stage's pool is below the room the stages
+                # agreed for the load-back. ``load_back`` has unwound its locks. PP0 of group P, where the followers execute
+                # PP0's row, leaves the load-back undone for the pass (the row names nothing of it); everything else raises
+                # as before (#1004: no stage refuses alone).
+                _lb_verdict = _prefill_oom_retreat.retreat_loadback(self, _ars, req, adder)
+                if _lb_verdict is None:
+                    raise
+                res = AddReqResult.OTHER if _lb_verdict == _prefill_oom_retreat.ABORT else AddReqResult.NO_TOKEN
+            except ArenaChainMismatch as _acm:
+                # ARENA-CHAIN (NF 14.10. 07:29:33Z, P PP0 ``#1424 CHAIN MISMATCH node=460 page=174``): ``load_back`` refused a chain page
+                # nothing proves ("the LAST latch"; the proof_cut vote that cuts the match before it runs in the TP group D only) --
+                # before any device allocation, its host lock unwound. Same shape as the AgreedRoomShort above: the request is skipped,
+                # the pass is voided group-wide, the page leaves this rank's host tier, the rank lives. Out of scope (tp group, D) or
+                # switched off (FLLIPER_PDFLIP_ARENA_CHAIN_VOID=0): the exception stops the rank as before.
+                _cm_verdict = _prefill_oom_retreat.retreat_chain_mismatch(self, _acm, req, adder)
+                if _cm_verdict is None:
+                    raise
+                res = AddReqResult.OTHER if _cm_verdict == _prefill_oom_retreat.ABORT else AddReqResult.NO_TOKEN
             except PPScheduleRefused as exc:
                 # NAMED, NOT FOLDED IN (the #797 practice for a sibling with a
                 # different root): requests admitted EARLIER in this same loop
@@ -17905,6 +19068,14 @@ class Scheduler(
                 consume_seam_grant(req)
 
             _hol_go_on = False
+            # S35 (SOLL R11, raenge-nie-uneins; rc9 09:51:22Z pdflip-29-190): an ADMITTED request's budget_state() is
+            # this rank's own pool on a Form A group -- NO_TOKEN on the host alone made it take the D-HOL head and enter
+            # PW-R's group MIN by itself. The admit was the group's verdict; it reads CONTINUE on every rank there.
+            res = _pdflip_fa_post_admit.uniform_result(
+                res,
+                bool(adder.can_run_list) and req is adder.can_run_list[-1],
+                getattr(adder, "form_a_admission_follow", None),
+            )
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
                     # SP (partial park, KV trigger; pdflip/d_park_runtime.displace_for_age):
@@ -17912,6 +19083,11 @@ class Scheduler(
                     # group MIN -- by the next pass's admission.
                     if getattr(self, "_pdflip_sa_no_token", None) is None:
                         self._pdflip_sa_no_token = str(req.rid)
+                        # Q-702 BUDGET-EINHEIT: and the adder's own numbers of
+                        # this refusal, which the SEAT-AGE verdict reads.
+                        from flliper.srt.pdflip import d_park_runtime as _dpr_q702
+
+                        _dpr_q702.note_adder_refusal(self, adder, req, running_batch)
                     _hol_go_on = _hol.may_overtake(req)
                     if _hol_go_on:
                         pass  # D-HOL backfill: later requests that fit the free KV still run
@@ -17973,6 +19149,8 @@ class Scheduler(
                 # slot into a batch. `req.session` is kept as a second, weaker
                 # term: it costs nothing and it is upstream's own contract.
                 added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
+                if added:
+                    _p_intake.note_intake_resumed(self, req, adder)  # review A2: names an admission out of a wait
                 if not added:
                     # init_next_round_input() may stage deferred Mamba COW/clear
                     # metadata before add_one_req() rejects the request.
@@ -18018,6 +19196,12 @@ class Scheduler(
                                     res.name,
                                     count,
                                 )
+                if _lbv_held:
+                    # LBV-ADMIT: a deferral, not a stop -- the loop goes on (every stage
+                    # skips the same unreleased rids; PP0-only deferrals above cannot make
+                    # a follower stop one request earlier than PP0)
+                    _note_skip("pdflip_lbv_unreleased", req.rid)
+                    continue
                 _note_skip(f"add_result_{res.name}", req.rid)
                 if _hol_go_on:
                     continue
@@ -18048,8 +19232,63 @@ class Scheduler(
         # the send is a no-op off rank 0 (`SenderWrapper(None)`,
         # ipc_channels.py:71), so a rank-local refusal would drop the
         # request from that rank's queue with no client-visible signal.
+        # PW-R (pdflip/d_wall_head.py): the group-D HOL head the backup wall makes
+        # unservable goes back to the front by name (W50) instead of waiting for
+        # a flip nothing on D can bring. `_hol.head` is the pass's first NO_TOKEN
+        # (the same rid on every rank), so the group MIN inside is entered alike.
+        _wall_rows = None
+        _nofund_seen = False
+        if _hol.head is not None:
+            _wall_head = _pdflip_d_wall_head.pick_unservable_head(
+                head_rid=_hol.head,
+                waiting=self.waiting_queue,
+                tree=self.tree_cache,
+                available=int(self.token_to_kv_pool_allocator.available_size()),
+                group_min=self._pdflip_group_min_flags,
+            )
+            if _wall_head is not None:
+                _x_refused.append(_wall_head)
+                _wall_rows = {id(_wall_head): _pdflip_d_wall_head.device_need_rows(_wall_head)}
+            else:
+                # PW-W (pdflip/d_wall_head.py): the structural wedge -- the
+                # group-DECIDED gate tuple refuses the head with price > budget
+                # and nothing running, evaluation after evaluation
+                _fa_fn = getattr(adder, "form_a_admission_follow", None)
+                _rb = getattr(self, "running_batch", None)
+                _wedge_head = _pdflip_d_wall_head.pick_structural_wedge_head(
+                    sched=self,
+                    head_rid=_hol.head,
+                    waiting=self.waiting_queue,
+                    verdict=getattr(_fa_fn, "last_verdict", None),
+                    running_empty=bool(
+                        (_rb is None or _rb.is_empty())
+                        and getattr(self, "chunked_req", None) is None
+                    ),
+                )
+                if _wedge_head is not None:
+                    _x_refused.append(_wedge_head)
+                    _wall_rows = {id(_wedge_head): int(_fa_fn.last_verdict[2])}
+                else:
+                    # PW-F (K10, pdflip/d_wall_head.py): the no-fund wedge -- a refused
+                    # head, nothing running, nothing admitted, pass after pass
+                    _nofund_seen = True
+                    _nf_head = _pdflip_d_wall_head.pick_nofund_head(
+                        sched=self,
+                        head_rid=_hol.head,
+                        waiting=self.waiting_queue,
+                        running_empty=bool(
+                            (_rb is None or _rb.is_empty())
+                            and getattr(self, "chunked_req", None) is None
+                        ),
+                        admitted_n=len(adder.can_run_list),
+                    )
+                    if _nf_head is not None:
+                        _x_refused.append(_nf_head)
+                        _wall_rows = {id(_nf_head): _pdflip_d_wall_head.device_need_rows(_nf_head)}
+        if not _nofund_seen:
+            _pdflip_d_wall_head.reset_nofund(self)
         if _x_refused:
-            self._pdflip_answer_x_refusals(_x_refused, _head_inputs)
+            self._pdflip_answer_x_refusals(_x_refused, _head_inputs, wall_rows=_wall_rows)
         if _v_refused:
             self._pdflip_answer_vision_d_refusals(_v_refused, _head_inputs)
 
@@ -18132,7 +19371,7 @@ class Scheduler(
                 self._admission_decline_note = (
                     "loop_skips("
                     + ",".join(
-                        f"{k}={v}(first={_skip_first_rid[k][:16]})"
+                        f"{k}={v}(first={_skip_first_rid[k]})"
                         for k, v in sorted(_skips.items())
                     )
                     + ")"
@@ -18148,7 +19387,7 @@ class Scheduler(
         self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
         self._admission_partial_note = "admitted=%d left=%d %s" % (
             len(can_run_list), len(self.waiting_queue),
-            ",".join(f"{k}={v}(first={_skip_first_rid[k][:16]})" for k, v in sorted(_skips.items()))
+            ",".join(f"{k}={v}(first={_skip_first_rid[k]})" for k, v in sorted(_skips.items()))
             if _skips else "no_skip",
         )
         _p_intake.settle_told(self, self.waiting_queue)  # H91a: admitted/aborted verdicts go
@@ -18362,8 +19601,15 @@ class Scheduler(
             assert self.chunked_req is None
             self.chunked_req = adder.new_chunked_req
 
-        if self.chunked_req is not None:
+        # LANES FIX 4 (NF metal 5): a continuation the lane floor holds in place is not in this batch -- no chunk of it was launched, so none
+        # is counted (the head-of-step park waits for the count to drain; a leaked +1 kept every stage from ever parking it, and made
+        # the final chunk of a resumed one look like a middle chunk). Every other continuation is counted exactly as before.
+        if self.chunked_req is not None and not _lanes_p.held_without_seat(self.chunked_req, can_run_list):
             self.chunked_req.inflight_middle_chunks += 1
+            # MIXED-D: lifetime-sticky chunk stamp. S50: plus, once, the request's whole uncached amount at its
+            # first D chunk -- a BIG one (>= halbX) keeps every chunk unmixed (R6 rest), a SHORT one D only had to
+            # chunk mixes (pdflip/mixed_d_short.py: chunked_big).
+            _mds_stamp.stamp_chunked(self.chunked_req)
 
         # fnFL2 H42: this pass's anchor bodies join the carried tails; every
         # tail IN this batch takes its middle-chunk increment (no output until
@@ -18455,7 +19701,22 @@ class Scheduler(
         new_batch.pdflip_twin_bounds = _pdflip_twin_anchor.batch_bounds(
             can_run_list, self.waiting_queue, page=self.page_size
         )
-        new_batch.prepare_for_extend()
+        try:
+            new_batch.prepare_for_extend()
+        except PrefillOutOfPages as _oom:
+            # PREFILL-OOM-RETREAT (NF 13.10. 11:59:14Z, fix 43): the paged extend found no pages. This is BEFORE the
+            # batch's launch and before anything of this pass went to a follower, so the pass can be taken back as if
+            # it had admitted nothing -- the server lives, the wall is read by the next pass. Out of scope (follower,
+            # TP group, D, switch off, retreat failed): re-raise, the rank dies exactly as before.
+            if not _prefill_oom_retreat.retreat(
+                self, _oom, new_batch, can_run_list, adder, carried_before=_oom_carried_before
+            ):
+                raise
+            self._admission_decline_note = "prefill_oom_retreat"
+            return None, running_batch
+        _oom_ledger = getattr(self, "_pdflip_prefill_oom_ledger", None)
+        if _oom_ledger is not None:
+            _oom_ledger.clear_batch(can_run_list)  # a rid that got through has no retreat history
         _wk_t4 = time.perf_counter()
         if getattr(self, "_pdflip_post_wake_pass_n", None) is not None:
             self._pdflip_gnbp_ms = (
@@ -18520,13 +19781,22 @@ class Scheduler(
         )
 
         # Mixed-style chunked prefill
-        if (
-            self.is_mixed_chunk
-            and not running_batch.is_empty()
-            and not (new_batch.return_logprob or running_batch.return_logprob)
-            # mix_with_running cats input_ids but not input_embeds — shapes would mismatch
-            and new_batch.input_embeds is None
-        ):
+        # MIXED-D (S32): on D the same machinery runs for SHORT prefill batches only; the verdict is
+        # the group MIN (R11), computed whenever the replicated precondition holds so every rank
+        # enters the collective on the same pass.
+        _mix_local_ok = not (
+            new_batch.return_logprob or running_batch.return_logprob
+        ) and new_batch.input_embeds is None
+        if self._mixed_d_short:
+            # D short mode: the verdict is collective, entered on the replicated precondition
+            _do_mix = not running_batch.is_empty() and self._mixed_d_agreed(
+                new_batch, running_batch, _mix_local_ok
+            )
+        else:
+            _do_mix = (
+                self.is_mixed_chunk and not running_batch.is_empty() and _mix_local_ok
+            )
+        if _do_mix:
             # TODO (lianmin): support return_logprob + mixed chunked prefill
             running_batch.filter_batch()
             if not running_batch.is_empty():
@@ -18535,6 +19805,18 @@ class Scheduler(
                 running_batch.prepare_for_decode()
                 new_batch.mix_with_running(running_batch)
                 new_batch.decoding_reqs = running_batch.reqs
+                if not self.enable_overlap and not self.spec_algorithm.is_none():
+                    # Non-overlap spec never writes the relay; stash the
+                    # tails' pending tokens for the mixed input resolve.
+                    # (fLLiper PR #36933 1:1; S33 review A3.)
+                    last_tokens = torch.tensor(
+                        [r.output_ids[-1] for r in running_batch.reqs],
+                        dtype=torch.int64,
+                        device=self.device,
+                    )
+                    self.future_map.stash_bonus_tokens(
+                        running_batch.req_pool_indices, last_tokens
+                    )
             running_batch = ScheduleBatch(
                 reqs=[], batch_is_full=running_batch.batch_is_full
             )
@@ -18576,6 +19858,26 @@ class Scheduler(
             len(reqs), [str(getattr(r, "rid", "?"))[:16] for r in reqs[:8]],
             [int(r.kv_committed_len) for r in reqs[:8]],
         )
+
+    def _mixed_d_agreed(self, new_batch, running_batch, local_ok: bool) -> bool:
+        """MIXED-D gate (S32): the short verdict, MIN-reduced over the TP cpu group (R11: no rank-local batch shape).
+
+        S33 review A1/A2: halbX is the FRONT's (``weg2_front_halfx``, min over the batch, R2a) -- the riegel only says
+        "group D"; a batch with an E2 END-state hand-off (no target forward) is never mixed."""
+        from flliper.srt.pdflip import mixed_d_short as _mds
+
+        x = int(_pdflip_store_short_tail_x(self))
+        u = int(getattr(new_batch, "extend_num_tokens", 0) or 0)
+        hx = _mds.batch_half_x(new_batch.reqs)
+        # S50: a chunked request blocks only when it is BIG (whole uncached amount >= halbX, or none stamped)
+        chunked = _mds.chunked_big(new_batch.reqs, self.chunked_req, hx)
+        no_fwd = _mds.end_state_handoff(new_batch.reqs)
+        mine = local_ok and _mds.short_gate(u, x, hx, chunked, no_fwd)
+        agreed = bool(self._pdflip_group_min_flags([mine])[0])
+        if agreed:
+            _mds.note_mixed(u, len(running_batch.reqs), hx, x)
+        _mds.note_verdict(_mds.refusal_reason(u, x, hx, chunked, no_fwd, local_ok), agreed)
+        return agreed
 
     def _can_schedule_lora_req(
         self, req: Req, running_loras: set[Optional[str]]
@@ -19272,7 +20574,10 @@ class Scheduler(
         # that can enter a collective (a skip batch runs none)
         if _prefix_lens_check.has_deferred() and not getattr(batch, "pdflip_skip_extend", False):
             _prefix_lens_check.resolve_deferred()
-        return self._run_batch_forward(batch, pp_proxy_tensors)
+        result = self._run_batch_forward(batch, pp_proxy_tensors)
+        # S78 D-DECODE-GAP: the run wall of a decode-advancing batch (a MIXED-D forward blocks to its end)
+        _pdflip_d_decode_gap.on_run_end(self, batch)
+        return result
 
     def _run_batch_forward(
         self,
@@ -19286,6 +20591,21 @@ class Scheduler(
         # forward progress off a 32-byte mmap -- a busy group is not a dead one.
         _pdflip_beacon.beat_start(self.forward_ct)
         self._pdflip_d_seat_guard(batch)  # H95c W-SEAT: never wider than the phase's n
+        # S78 EM-FETCH: close the previous forward's EM copy record, log the completed ones (no sync)
+        _em_fetch_probe.on_forward(self.forward_ct)
+        if self.pdflip_d_lead_probe is not None and batch.forward_mode.is_extend():
+            self.pdflip_d_lead_probe.note_extend(
+                rids=[req.rid for req in batch.reqs],
+                skip=batch.pdflip_skip_extend,
+            )
+        if self.pdflip_d_ext_beacon is not None and batch.forward_mode.is_extend():
+            # S49 D-EXTEND-BEACON: the front's R6 counts a D prefill only from here on (SOLL R6, user 18.10.);
+            # S56: with D's REAL rest of each request (what this batch and the later chunks still compute)
+            self.pdflip_d_ext_beacon.note_extend(
+                rids=[req.rid for req in batch.reqs],
+                rests=[_pdflip_d_ext.req_rest(req) for req in batch.reqs],
+                extend_lens=[_pdflip_d_ext.req_extend_len(req) for req in batch.reqs],
+            )
 
         # #861 fix (b): a request admitted on a cached prefix whose DRAFT rows
         # nothing wrote must not speculate over them. Here, and not in the
@@ -19312,6 +20632,9 @@ class Scheduler(
             self._decode_steps_this_phase = (
                 int(getattr(self, "_decode_steps_this_phase", 0) or 0) + 1
             )
+        # S48 D-DECODE-GAP (pdflip/d_decode_gap.py): every pause of D's decode streams with its cause, also
+        # below 5 s -- this funnel sees every forward once. Group D, first TP rank, rank-local, read-only.
+        _pdflip_d_decode_gap.on_batch(self, batch)
 
         # #1241 THE DECODE ROUND BOUNDARY. Here and nowhere else, for the same
         # reason the decode-step counter above is here: this is the ONE funnel
@@ -19639,9 +20962,13 @@ class Scheduler(
                         # that raises cannot leave the batch in FULL capture
                         # for whatever runs next.
                         _stack.enter_context(self._draft_kv_full_capture(batch))
-                    batch_result = self.model_worker.forward_batch_generation(
-                        batch, **kwargs
-                    )
+                    # S50 TOLD-ACK-EARLY: on an armed P follower the forward is the window in which a
+                    # worker may report a read that just ended (managers/pdflip_told_ack_early.py); a null
+                    # context everywhere else.
+                    with _pdflip_told_ack_early.forward_window(self):
+                        batch_result = self.model_worker.forward_batch_generation(
+                            batch, **kwargs
+                        )
                     if produce:
                         self._draft_kv_produce(batch, batch_result)
                 if _pls is not None:
@@ -19940,6 +21267,12 @@ class Scheduler(
         elif batch.forward_mode.is_idle():
             self.batch_result_processor.process_batch_result_idle(batch, result)
 
+        if self.pdflip_d_ext_beacon is not None and batch.forward_mode.is_extend():
+            # (review A2c: a skip batch reports too -- note_extend queued its after-rest, the FIFO stays aligned)
+            # EZ-S2b review A2 (SOLL R6, D-EXTEND-BEACON v3): the extend forward has ended and its result is processed --
+            # re-report the REST AFTER it (0 for a finished prefill); R6 counts nothing D has already computed
+            self.pdflip_d_ext_beacon.note_extend_done(rids=[req.rid for req in batch.reqs])
+
         self.metrics_reporter.log_batch_result_stats(batch, result)
         # nf-pd-post: a skip batch's #639 ballot is decided after its result
         # (P's token) went out (layers/dcp/prefix_lens_check.resolve_deferred)
@@ -20150,6 +21483,7 @@ class Scheduler(
             has_leak, messages = self.invariant_checker._check_all_pools(
                 self.pool_stats_observer.get_pool_stats(),
                 allow_enumeration=allow_enumeration,
+                check_mamba=self.invariant_checker.take_idle_mamba_turn(),
             )
             if has_leak:
                 # The ledger names the SIZE of the evictable term, never who
@@ -20623,6 +21957,7 @@ class Scheduler(
         zero_kv: Optional[bool] = None,
         tp_group_verdict: bool = False,
         sleep_group_verdict: bool = False,
+        pdflip_flip_quiesce: bool = False,
     ):
         """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache.
         ``sleep_group_verdict``: Q-590 -- the Weg-2 release leg's flush (every
@@ -20633,6 +21968,8 @@ class Scheduler(
         alike. NF y8s TP1 refused rank-locally while its peers reset; on 27B D
         the peers' idle branch posts the L15 SLEEP-AGREE gathers, which a
         refusing rank never joins.
+        ``pdflip_flip_quiesce``: S104 review A1 -- the front's flip quiesce (a sleep leg follows); only then
+        may an idle flush with un-backed device KV hand its reset to the sleep leg.
         ``tp_group_verdict``: fnFL2x105 -- the caller guarantees every TP rank
         runs this flush in the same pass (the immediate /flush_cache RPC), so
         the idle verdict is reduced over the HiCache group instead of read
@@ -20674,12 +22011,17 @@ class Scheduler(
 
         _fsub = _pdflip_flush_sub.begin_flush(zero_kv)
         self._pdflip_last_flush_refusal = ""  # QUIESCE-PENDING: only THIS flush's refusal names a lap
+        _s104_unbacked_left = 0  # S104: the #1470 loop's un-backed remainder on THIS rank (0 = no sweep ran)
+        from flliper.srt.managers import pdflip_bubble_publish as _f5_bubble
+
         if (
             self.enable_hierarchical_cache
             and os.environ.get("FLLIPER_HICACHE_FLUSH_PUBLISH_SWEEP", "1") != "0"
             and self.running_batch.is_empty()
             and self.chunked_req is None and not getattr(self, "anchor_tails", None)
         ):
+            # F5a (NF-PGAP 1016): the quiesce is open -- the bubble publisher pauses, the #1470 loop publishes alone
+            _f5_bubble.quiesce_begin(self)
             _sweep = getattr(self.tree_cache, "publish_unbacked_sweep", None)
             _wc = getattr(self.tree_cache, "writing_check", None)
             if _sweep is not None:
@@ -20690,6 +22032,19 @@ class Scheduler(
                 # leg drains -- unless a node is left un-issued (then #1470 as before)
                 _b1_nowait = not _pdflip_flush_nonblock.quiesce_sweep_blocking(
                     self, {}, tp_group_verdict)
+                # 1403 (NF nf9 1004_105315): a no-progress round of THIS quiesce
+                # (arena full, issued=0, nothing in flight) repeats identically on
+                # every front poll -- ~1.2 s of tree walk per poll (P.log 144297:
+                # sweep_ms=1221.1, four polls). While the in-flight count stands
+                # where that round left it, the sweep is skipped (FLLIPER_PDFLIP_FLUSH_SWEEP_MEMO).
+                _memo_hit = (_pdflip_flush_nonblock.sweep_memo_on()
+                             and _pdflip_flush_nonblock.sweep_memo_hit(
+                                 self, self.tree_cache))
+                if _memo_hit:
+                    logger.info(
+                        "#1470 FLUSH-PUBLISH MEMO-SKIP in-flight=%d (last round "
+                        "issued 0 with nothing in flight; the count is unchanged)",
+                        _pdflip_flush_nonblock.inflight_count(self.tree_cache))
                 # kvs2 W3 (boot ...kvdemandbar1dauer09291534): the poll's own
                 # publish work is not the idle lap's age (pdflip_idle_vote.own_work).
                 # D-NORECOMPUTE (a): a full mamba arena at the flush spills a
@@ -20699,7 +22054,16 @@ class Scheduler(
                 try:
                     _spill_tc._pdflip_flush_spill = True
                     with _pdflip_own_work():
-                        for _round in range(64):
+                        _prev_pending = None  # FLUSHFAST: in-flight count of the round before
+                        for _round in (range(64) if not _memo_hit else ()):
+                            # S83: the writing_check between the rounds drains no release queue; the arena
+                            # references still queued on this rank go back before the round claims (rank-local)
+                            _s83_q = getattr(self.tree_cache, "_s83_release_queue_surplus_refs", None)
+                            if callable(_s83_q):
+                                try:
+                                    _s83_q(site="flush")
+                                except Exception:  # noqa: BLE001 - never the flush
+                                    logger.warning("S83 QUEUE-REFS flush pass raised", exc_info=True)
                             _stats = _sweep(max_issue=256) or {}
                             _issued += int(_stats.get("issued", 0) or 0)
                             if int(_stats.get("unbacked", 0) or 0) == 0:
@@ -20716,7 +22080,54 @@ class Scheduler(
                             # full), 4.6-5.0 s ahead of the idle read on every poll.
                             if (int(_stats.get("issued", 0) or 0) == 0
                                     and int(_stats.get("pending", 0) or 0) == 0):
+                                if _pdflip_flush_nonblock.sweep_memo_on():
+                                    _pdflip_flush_nonblock.sweep_memo_set(
+                                        self, self.tree_cache)
                                 break
+                            # FLUSHFAST (NF int24g, D>P epochs 105/115, boot
+                            # 1012_185900: 28-30 s instead of ~3 s): a round that
+                            # issued nothing, left EVERY un-backed node refused for
+                            # want of KV-arena room, AND saw no write land since the
+                            # round before (in-flight count not lower after the wait
+                            # below) is a stuck round: nothing moved that could free
+                            # a slot, so the next round repeats it. Measured on D TP0:
+                            # 66/36 nodes refused, in_flight stuck at 48/31, four
+                            # rounds x ~3 s per leg, the rest lost at the reset anyway
+                            # (ANCHOR-LOST at=flush). Progress-aware on purpose
+                            # (review flushfast-1012 finding 1): the sleep leg of the
+                            # same boot ran 0/2/3/0/0 issued with in_flight 16 -> 3 --
+                            # an all-refused round 0 followed by rounds that landed
+                            # writes and published 5 nodes. So round 0 never stops
+                            # here (it has no round before it to compare with), and a
+                            # round whose wait let writes land goes on. Writes in
+                            # flight are NOT dropped: the join after the loop, the
+                            # sleep leg's drain and #1470b still take them. Rank-local
+                            # like the break above (no collective in this loop; a rank
+                            # that stops early waits in the group verdict).
+                            _pend_now = int(_stats.get("pending", 0) or 0)
+                            if (_prev_pending is not None
+                                    and _pend_now >= _prev_pending
+                                    and int(_stats.get("issued", 0) or 0) == 0
+                                    and int(_stats.get("unbacked", 0) or 0) > 0
+                                    and int(_stats.get("arena_refused", 0) or 0)
+                                    >= int(_stats.get("unbacked", 0) or 0)):
+                                logger.info(
+                                    "#1470 FLUSH-PUBLISH ARENA-FULL-STOP round=%d unbacked=%s "
+                                    "arena_refused=%s issued=0 in_flight=%s (round before: %s): every "
+                                    "un-backed node was refused by the full KV arena and no write landed "
+                                    "during the wait, the loop ends instead of waiting for a slot that "
+                                    "does not free (in-flight writes are joined by the steps after the "
+                                    "loop and by the sleep leg, not dropped)",
+                                    _round, _stats.get("unbacked"), _stats.get("arena_refused"),
+                                    _pend_now, _prev_pending)
+                                _s83_c = getattr(self.tree_cache, "s83_victim_census", None)
+                                if callable(_s83_c):
+                                    try:
+                                        _s83_c("flush_stop")   # S83 instrument: who holds the arena now
+                                    except Exception:  # noqa: BLE001 - never the flush
+                                        pass
+                                break
+                            _prev_pending = _pend_now
                             if _wc is not None:
                                 _wc(write_back=True)  # free the pins, then sweep again
                             if int(_stats.get("issued", 0) or 0) == 0 and _round >= 3:
@@ -20728,6 +22139,14 @@ class Scheduler(
                         _spill_tc._pdflip_flush_spill = _spill_prev
                     except Exception:  # noqa: BLE001 -- a stand-in tree
                         pass
+                if int(_stats.get("unbacked", 0) or 0) > 0:
+                    _s83_c = getattr(self.tree_cache, "s83_victim_census", None)
+                    if callable(_s83_c):
+                        try:
+                            _s83_c("flush_end")   # S83 instrument: un-backed nodes left -- who holds the arena
+                        except Exception:  # noqa: BLE001 - never the flush
+                            pass
+                _s104_unbacked_left = int(_stats.get("unbacked", 0) or 0)
                 logger.info(
                     "#1470 FLUSH-PUBLISH issued=%d unbacked_left=%s in_flight_after=%s waited_ms=%.0f "
                     "(un-backed nodes published and their write-throughs joined BEFORE the reset)%s",
@@ -20749,6 +22168,14 @@ class Scheduler(
         if _b1_quiesced is not None:
             logger.info("%s | #1268 group verdict: %s", _b1_quiesced, verdict_detail)
             _pdflip_flush_sub.end_flush(_fsub, "b1_quiesced")
+            return True
+        # S104 (rc22 D 09:54:35, 10432 tokens): an idle quiesce whose #1470 loop left un-backed nodes (KV arena
+        # full of tree references) hands its reset to the sleep leg, where S86 releases the L3-proven slots first
+        _s104_deferred = _pdflip_flush_nonblock.s104_defer_reset_verdict(
+            self, group_idle, tp_group_verdict, _s104_unbacked_left, flip_quiesce=pdflip_flip_quiesce
+        )
+        if _s104_deferred is not None:
+            logger.info("%s | #1268 group verdict: %s", _s104_deferred, verdict_detail)
             return True
         if group_idle:
             # fnFL2 H63d (#1470b): the reset below restarts the storage
@@ -21398,6 +22825,18 @@ class Scheduler(
             _fsub.mark("l15")
             self._pdflip_note_lost_anchors()
             _fsub.mark("anchors")
+            # F5c (NF-PGAP 1016): what goes into this reset un-backed, named (measured, never silent)
+            if self.enable_hierarchical_cache:
+                try:
+                    _pdflip_flush_nonblock.note_unbacked_at_reset(
+                        self.tree_cache, site="flush",
+                        paused=int(getattr(self, "_pdflip_quiesce_paused", 0) or 0)
+                        if getattr(self, "_pdflip_quiesce_open", False) else 0,
+                        open_ms=(time.monotonic() - float(getattr(self, "_pdflip_quiesce_t0", time.monotonic()))) * 1000.0
+                        if getattr(self, "_pdflip_quiesce_open", False) else 0.0)
+                except Exception:  # noqa: BLE001 - an instrument never blocks the reset
+                    logger.warning("#1470 FLUSH-UNBACKED census raised", exc_info=True)
+            _f5_bubble.quiesce_end(self, "reset")
             self.cur_batch_for_debug = None
             self.last_batch = None
             if _l15_res is not None:
@@ -21533,6 +22972,7 @@ class Scheduler(
                         _prd_cc._pdflip_reset_detach_rids = _pdflip_parked_owned_prefetch_of(self)
                     try:
                         self.tree_cache.reset()
+                        _pdflip_flush_nonblock.sweep_memo_clear(self)  # h16v S12 V2: new tree, old stamp void
                         _fsub.mark("tree_reset")
                         self.req_to_token_pool.clear()
                         _fsub.mark("req_pool_clear")
@@ -21706,7 +23146,7 @@ class Scheduler(
             if _n <= 8 or _n % 64 == 0:
                 logger.info("PDFLIP-QUIESCE-PARKED-PREFETCH rids=%s n=%d: store reads of D's park list "
                             "are not a quiesce term (held by the sleep, re-read at the wake; the "
-                            "release reset joins them)", sorted(r[:12] for r in _pk), _n)
+                            "release reset joins them)", sorted(_pk), _n)
 
         pp_size = int(getattr(getattr(self, "ps", None), "pp_size", 1) or 1)
         pp_rank = int(getattr(getattr(self, "ps", None), "pp_rank", 0) or 0)
@@ -21875,7 +23315,7 @@ class Scheduler(
                 _open = [r for r in list(tc.ongoing_prefetch) if str(r) not in exempt_prefetch]
                 _check(
                     f"hicache_prefetch({len(_open)}: "
-                    f"{','.join(str(r)[:8] for r in _open[:4])})",
+                    f"{','.join(str(r) for r in _open[:4])})",
                     len(_open) == 0,
                 )
                 _check(
@@ -22264,7 +23704,32 @@ class Scheduler(
             from flliper.srt.pdflip.arrival_seat_rule import d_decode_clip
 
             ret["pdflip_kv"]["decode_clip"] = d_decode_clip()
+            # S94 (rc19 07:15:48 pdflip-262-3339: the front read free=312036 = available + REPORTED evictable while D
+            # had available=13568 payable_evictable=0 -- D-WALL-HEAD 07:15:57): what D can really pay. Under the
+            # backup wall (payable < reported) a row going back to the tree frees no device row, a displaced decode
+            # frees none either (d_park_runtime.kv_displace_would_fit sizes victims 0) -- the front's ARRIVAL-SEAT
+            # verdict reads this instead of the reported count. TP0's reading, like available/evictable above.
+            from flliper.srt.mem_cache.common import payable_evictable_or
+
+            _rep = int(ret["pdflip_kv"]["evictable"])
+            _pay = int(payable_evictable_or(self.tree_cache, self.tree_cache.evictable_size) or 0)
+            ret["pdflip_kv"]["payable_evictable"] = _pay
+            ret["pdflip_kv"]["backup_wall"] = bool(_pay < _rep)
+            # S94 F3 (rc20 08:34:48 pdflip-12-82: the AGE PLAN's victim pdflip-8-58 was no running decode -- D held it
+            # as a queued load-back, 08:34:51 LOAD-BACK ROOM need=81475 available=33728): the decodes D RUNS, the only
+            # ones its SEAT-AGE can displace (``displace_for_age`` walks the running batch). Replicated across D's TP
+            # ranks (one schedule); capped -- D's bs is single digits.
+            ret["pdflip_kv"]["running_rids"] = [str(r.rid) for r in list(
+                getattr(getattr(self, "running_batch", None), "reqs", None) or ())[:64]]
         except Exception:  # noqa: BLE001 -- an instrument never breaks the info route
+            pass
+        # PDFLIP MODE-PARITY (h16m 1014, N4): this group's priority mode for the
+        # front's start check (pdflip/mode_parity.py). A reading, the front decides.
+        try:
+            from flliper.srt.pdflip import mode_parity as _mode_parity
+
+            ret[_mode_parity.INFO_KEY] = _mode_parity.local_mode()
+        except Exception:  # noqa: BLE001 -- absent block = the front stops by name
             pass
         # #287: the effective figure is the limiter's floating value. Without
         # a ceiling the limiter holds max_running_requests, so this key keeps
@@ -22929,12 +24394,17 @@ class Scheduler(
 
 
     def abort_request(self, recv_req: AbortReq):
-        # #1233 (WEG 2, S0): aborts are never deferred any more. The
-        # deferral existed because an abort applied on one rank before its
-        # peers diverged the replicated live set MID-LAYOUT-CHANGE; there is
-        # no in-process layout change to be mid-way through. This is the
-        # direct call every boot without the flip already made.
-        deferred = False
+        # #1233 (WEG 2, S0): aborts are never deferred for a layout change any
+        # more. K14 (NF h16p 15.10. 21:52:38Z, pdflip-164-2265): a PP follower
+        # under the #631 row authority defers ONE kind -- the abort of a request
+        # it still queues while PP0 already admitted it (PP0's verdict rides
+        # the forwarded AbortReq, pdflip.pp_abort). Popping it here let PP0's
+        # frame name a rid this rank no longer had: #1180, group death. The
+        # whole abort is held (no side effect) and applied right after the plan
+        # that admits it (pdflip.pp_abort.resolve_waiting_aborts).
+        from flliper.srt.pdflip import pp_abort as _pp_abort_k14
+
+        deferred = _pp_abort_k14.hold_waiting_abort(self, recv_req)
         # #801 CORROBORATION MARKER, and it exists because its absence was
         # unreadable. An abort applied on one rank before its peers diverges
         # the replicated live set -- pin 4 says exactly that, one comment up --
@@ -22965,6 +24435,14 @@ class Scheduler(
             getattr(recv_req, "abort_all", None),
             deferred,
         )
+        if deferred:
+            return  # K14: applied by pdflip.pp_abort.resolve_waiting_aborts
+        Scheduler._abort_request_apply(self, recv_req)  # via the class: bare-namespace harnesses
+
+    def _abort_request_apply(self, recv_req: AbortReq):
+        """The abort itself, every side effect included. ``abort_request`` at
+        receipt, or K14's ``resolve_waiting_aborts`` after the plan that
+        admitted a held request (never held twice: it calls this directly)."""
         # fnFL2 H43: an aborted request's first-chunk PLE admission is dropped
         from flliper.srt.models.qwen4_exp_ple_admit import drop_ple_admission
 
@@ -22973,6 +24451,19 @@ class Scheduler(
             abort_all=bool(getattr(recv_req, "abort_all", False)),
         )
         self._abort_request_now(recv_req)
+
+    def _pdflip_resolve_waiting_aborts(self, pp0_drained: bool = False) -> int:
+        """K14: settle this follower's held waiting-queue aborts (one getattr
+        while none is held). See pdflip.pp_abort.resolve_waiting_aborts."""
+        if not getattr(self, "_pdflip_pp_held_waiting_aborts", None):
+            return 0
+        from flliper.srt.pdflip import pp_abort as _pp_abort_k14
+
+        return _pp_abort_k14.resolve_waiting_aborts(
+            self,
+            lambda r: Scheduler._abort_request_apply(self, r),
+            pp0_drained=pp0_drained,
+        )
 
     def _pdflip_rearm_defer_tick(self, batch) -> None:
         """H31b: start / promote the deferred Platztausch extra rows
@@ -23083,7 +24574,7 @@ class Scheduler(
         import time as _time
 
         from flliper.srt.managers.corridor_guard import GROUP_ENV
-        from flliper.srt.pdflip.intake_stall import IntakeStallWatch
+        from flliper.srt.pdflip.intake_stall import IntakeStallWatch, work_in_flight
 
         if str(os.environ.get(GROUP_ENV, "")).strip().upper() != "P":
             return
@@ -23103,6 +24594,12 @@ class Scheduler(
         watch = getattr(self, "_pdflip_intake_watch", None)
         if watch is None:
             watch = self._pdflip_intake_watch = IntakeStallWatch()
+        # NF design defect 1 (15.10.): the stall's premise -- "nothing runs, so nothing will ever free a token" -- is read HERE,
+        # for every caller (adder NO_TOKEN, seat gate, prefetch-pending, wedge hand-off). The callers test only the running
+        # batch, the chunked continuation and the anchor tails; on a PP ring the finishing request's LAST chunk is a launched
+        # pass whose result PP0 has not consumed (``_pp_launched_pending``): its rows are locked and the followers have not
+        # republished their room. A refusal while anything is in flight is a WAIT and restarts the hold (h16r 11:47:19
+        # held_s=2.8, 11:52:21 2.6, h16p 13:58:24 5.6: the first pass after the finish named the stall).
         need, rem_total, cur_rem = -1, -1, -1
         try:
             need = len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
@@ -23117,6 +24614,13 @@ class Scheduler(
         # requeueing (the requeue loop killed xsn291).
         _pool = int(getattr(self, "max_total_num_tokens", 0) or 0)
         _too_large = bool(_pool > 0 and need > _pool)
+        # Review A3: a request that cannot fit the pool however long it waits is named at once -- waiting for in-flight work
+        # (which can never make it fit) would defer a refusal that is already certain.
+        _busy = "" if _too_large else work_in_flight(self)
+        if _busy:
+            watch.progress()
+            _p_intake.note_stall_deferred(self, req, _busy, note)
+            return
         _extra = note or "gate=adder_no_token"
         # H91a: the stall is only what no row of this phase can fund; a
         # request that fits free + evictable stays queued (no 503, no flip).
@@ -23125,13 +24629,19 @@ class Scheduler(
         ) in (_p_intake.INTAKE_FITS, _p_intake.INTAKE_WAITS):
             watch.progress()
             return
+        _extra_arg = _extra
         if _too_large:
             from flliper.srt.pdflip.intake_stall import TOO_LARGE_MARK
-            _extra = f"{_extra} {TOO_LARGE_MARK} pool_tokens={_pool}"
+            _extra_arg = f"{_extra} {TOO_LARGE_MARK} pool_tokens={_pool}"
+        else:
+            # a stall at IDLE is a deviation from the design (a request that fits the pool always fits): name the term.
+            # Review A4: read lazily -- ``observe`` calls it only when the stall is NAMED (the cause walks the evict frontier).
+            def _extra_arg(_gate=_extra, _need=need, _pool=_pool):
+                return f"{_gate} {_p_intake.stall_cause(self, _need, _pool)}"
         message = watch.observe(
             rid=str(req.rid), need_tokens=need, rem_total_tokens=rem_total,
             cur_rem_tokens=cur_rem, running_empty=True, now=_time.monotonic(),
-            extra=_extra,
+            extra=_extra_arg,
             # xsn275: the admission-wedge detector already waited >= 20 s
             # with nothing running; its verdict needs no second hold here.
             # xsn291: a too-large request needs no hold either.
@@ -23149,7 +24659,7 @@ class Scheduler(
             if _cs is not None:
                 logger.error(
                     "PDFLIP-INTAKE-STALL-CENSUS rid=%s pool_avail=%d %s",
-                    str(req.rid)[:16],
+                    str(req.rid),
                     int(self.token_to_kv_pool_allocator.available_size()),
                     _cs(),
                 )
@@ -23158,6 +24668,13 @@ class Scheduler(
         refused_id = id(req)
         self.waiting_queue = [q for q in self.waiting_queue if id(q) != refused_id]
         pdflip_store_told.forget_left_queue(self, req, "intake_stall")  # Q-580
+        # W27 RID-SPLIT (nf9 pdflip-84-299): this drop is rank-local; without
+        # the row authority every follower plans from its own queue and the
+        # front's /abort_request may never come (an un-awaited LEG1-EARLY).
+        # The origin relays it on its next intake (pdflip/intake_origin_abort.py).
+        _ioa = getattr(self, "_pdflip_intake_origin_aborts", None)  # test doubles
+        if _ioa is not None:
+            _ioa.note(req.rid, message)
         try:
             if self.enable_hicache_storage:
                 self.tree_cache.release_aborted_request(req.rid)
@@ -23165,7 +24682,7 @@ class Scheduler(
                 self.tree_cache.terminate_prefetch(req.rid)
         except Exception:  # noqa: BLE001 -- the answer must go out regardless
             logger.warning("PDFLIP-INTAKE-STALL rid=%s: releasing the store read raised",
-                           str(req.rid)[:16], exc_info=True)
+                           str(req.rid), exc_info=True)
         abort_req = AbortReq(
             finished_reason={
                 "type": "abort",
@@ -23179,6 +24696,9 @@ class Scheduler(
     def _abort_request_now(self, recv_req: AbortReq):
         # weg2xsn288: an abort ends the intake-stall hold and the reported
         # mark of that rid on THIS rank (the requeued rid returns next phase).
+        _oom_ledger = getattr(self, "_pdflip_prefill_oom_ledger", None)
+        if _oom_ledger is not None:
+            _oom_ledger.forget(None if recv_req.abort_all else recv_req.rid)
         _watch = getattr(self, "_pdflip_intake_watch", None)
         if _watch is not None:
             try:
@@ -23189,6 +24709,7 @@ class Scheduler(
         if (chunked_req := self.chunked_req) is not None:
             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
                 self._pending_chunked_abort_req = chunked_req
+                self._pending_chunked_abort_reason = getattr(recv_req, "finished_reason", None)
                 from flliper.srt.pdflip.pp_abort import chunked_abort_delay, row_authority_of
                 _row_791c = row_authority_of(self)
                 self._pending_chunked_abort_delay = chunked_abort_delay(
@@ -23281,6 +24802,8 @@ class Scheduler(
             logger.debug(f"Abort queued request. {req.rid=}")
         self._pdflip_abort_dormant_hold(recv_req)  # #1445: the hold is a queue too
         self._pdflip_d_park_abort(recv_req)  # H91b: so is the D park
+        # FIX 5 (lanes, metal 6 lage (a)): the aborted rid leaves the told ledger of this rank (lane path only; returns at once otherwise)
+        _lanes_p.forget_aborted_told(self, recv_req)
 
         # Delete the requests in the grammar queue
         # Abort method 2: call `set_finish_with_abort`
@@ -23919,6 +25442,15 @@ def run_scheduler_process(
     pipe_writer,
 ):
     _pdflip_arm_dc_snapshot_history()  # #1452
+    # EXIT WITNESS (NF 20.10. 14:18:29Z, D TP0 OOM-killed in silence): the
+    # cgroup oom_kill baseline, read before this rank can have died, so the
+    # death path below can name a kernel OOM kill as the cause. Never raises.
+    try:
+        from flliper.srt.pdflip import state_file as _ow_state
+
+        _ow_state.arm_oom_witness()
+    except Exception:  # noqa: BLE001 - a witness never stops a rank
+        pass
     # Load plugins so hooks can override Scheduler and its dependencies.
     load_plugins()
     # #1402 (boot xsn133, 2026-09-15): the HiCache prefetch threads read the
@@ -24068,6 +25600,14 @@ def run_scheduler_process(
         from flliper.srt.pdflip.gc_instrument import arm_after_boot as _pdflip_gc_arm
 
         _pdflip_gc_arm(server_args, tp_rank, pp_rank=pp_rank)
+        # S104 L3-FINAL-DRAIN: SIGTERM lets this process's L3 write-behind (if it owns one) copy what L2 completed
+        # since its last pass before the process ends (rc22 10:50 stop: 1216 tokens)
+        try:
+            from flliper.srt.mem_cache import l3_final_drain as _s104_fd
+
+            _s104_fd.install()
+        except Exception:  # noqa: BLE001 - never the boot
+            logger.warning("S104 L3-FINAL-DRAIN install raised", exc_info=True)
         # #1054: a MEASUREMENT run keeps the window open past this point. The
         # boot-bounded window is right for the resident posts and blind to the
         # transient one that killed boot 24 -- the GDN extend allocation only
@@ -24131,6 +25671,12 @@ def run_scheduler_process(
             from flliper.srt.environ import envs as _rd_envs
             from flliper.srt.pdflip import state_file as _rd_state
 
+            # EXIT WITNESS (NF 20.10.): on EVERY rank, whether or not this
+            # rank's state write wins -- the D log then says on all survivors
+            # that the kernel killed a process here, not only in state.json.
+            _ow_line = _rd_state.oom_witness()
+            if _ow_line:
+                logger.error("PDFLIP EXIT-WITNESS %s", _ow_line)
             if _rd_state.note_rank_death(
                 _rd_envs.PDFLIP_STATE_DIR.get() or None,
                 group=(os.environ.get("FLLIPER_PDFLIP_GROUP", "") or "").strip().upper() or None,
@@ -24138,7 +25684,7 @@ def run_scheduler_process(
                 detail=traceback.strip().splitlines()[-1] if traceback else "",
             ):
                 logger.error("PDFLIP RANK-DEATH lifecycle=dead written (origin rank, code %s)",
-                             _rd_state.RANK_EXCEPTION_CODE)
+                             _rd_state.last_rank_death_code())
         except Exception:  # noqa: BLE001 - a record may not mask the death
             pass
         # #1058b: the census goes out HERE, ahead of every signal, not only in

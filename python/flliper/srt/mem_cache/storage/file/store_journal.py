@@ -114,10 +114,17 @@ def parse_lines(data: bytes) -> Tuple[List[Record], Optional[str]]:
             boot = s[len("# boot_id="):].strip()
             continue
         parts = s.split(" ", 3)
-        if len(parts) != 4 or parts[0] not in ("R", "C", "A", "E"):
+        # L3-READ-RECENCY-1014: ``T`` = a read hit (recency only, no size change)
+        if len(parts) != 4 or parts[0] not in ("R", "C", "A", "E", "T"):
+            continue
+        stem = parts[3]
+        # A torn tail (rank killed mid-append, the filesystem zero-fills the block)
+        # leaves NUL bytes in the last line; such a stem names no page and would
+        # make every later os.* call on it raise ValueError -- drop the record.
+        if not stem or "\x00" in stem or "/" in stem:
             continue
         try:
-            out.append((float(parts[1]), parts[0], int(parts[2]), parts[3]))
+            out.append((float(parts[1]), parts[0], int(parts[2]), stem))
         except ValueError:
             continue
     return out, boot
@@ -590,6 +597,12 @@ def replay(items: "Dict[str, Tuple[float, int]]", records: List[Record],
         elif op == "E":
             pending.pop(stem, None)
             items.pop(stem, None)
+        elif op == "T":
+            # L3-READ-RECENCY-1014: a read hit moves the page to the newest end
+            # with the read's time (its size stays); a stem not indexed is ignored
+            got = items.pop(stem, None)
+            if got is not None:
+                items[stem] = (max(float(got[0]), float(t)), got[1])
     stated = 0
     if open_intents is not None:
         open_intents.extend(pending)

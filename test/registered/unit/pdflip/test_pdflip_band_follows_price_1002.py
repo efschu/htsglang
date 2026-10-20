@@ -15,6 +15,7 @@ Hermetic, CPU. Each test named red_* is red on e90d7fcf88.
 from __future__ import annotations
 
 import os
+import pytest
 import types
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
@@ -28,6 +29,15 @@ from flliper.srt.pdflip import front as F  # noqa: E402
 from flliper.srt.pdflip import phase_policy as pp  # noqa: E402
 
 
+def _exc(on: bool = True):
+    """FLLIPER_PDFLIP_X_EXCURSION_PRICE exists on the 27B line only; the NF line
+    prices X-COST-LINE with the ski price and reads the switch as on."""
+    import contextlib
+
+    sw = getattr(envs, "FLLIPER_PDFLIP_X_EXCURSION_PRICE", None)
+    return contextlib.nullcontext() if sw is None else sw.override(on)
+
+
 def _front(**kw):
     ns = types.SimpleNamespace(x_start_tokens=4096, x_busy_tokens=None, tp_prefill_max_tokens=10674,
                                flip_min_work_tokens=4096, epoch=6, _park_attempt_epoch=6)
@@ -38,7 +48,7 @@ def _front(**kw):
 
 def test_red_the_band_floor_is_the_live_x_under_the_excursion_price():
     ns = _front()
-    with envs.FLLIPER_PDFLIP_X_EXCURSION_PRICE.override(True), envs.FLLIPER_PDFLIP_ENABLE_X_COST_LINE.override(True):
+    with _exc(True), envs.FLLIPER_PDFLIP_ENABLE_X_COST_LINE.override(True):
         assert F.Front._x_band_floor(ns) == 10674
         # pdflip-6-12: 7668 uncached is no band request any more -> it never reaches the X-SOLO
         # singleton rule, is routed SHORT on the live X, and never needs P
@@ -49,8 +59,14 @@ def test_switch_off_restores_the_band_floor():
     ns = _front()
     with envs.FLLIPER_PDFLIP_X_BAND_FOLLOWS_PRICE.override(False):
         assert F.Front._x_band_floor(ns) == 4096
-    with envs.FLLIPER_PDFLIP_X_EXCURSION_PRICE.override(False):
+    if getattr(envs, "FLLIPER_PDFLIP_X_EXCURSION_PRICE", None) is not None:
+        with _exc(False):
+            assert F.Front._x_band_floor(ns) == 4096
+    with envs.FLLIPER_PDFLIP_ENABLE_X_COST_LINE.override(False):
         assert F.Front._x_band_floor(ns) == 4096
+
+
+@pytest.mark.usefixtures("decider_off")  # EZ-S2a: describes the S1 code (reachable until S4)
 
 
 def test_red_flip_economics_compares_the_backlog_with_the_live_x(caplog):
@@ -58,7 +74,7 @@ def test_red_flip_economics_compares_the_backlog_with_the_live_x(caplog):
 
     ns = _front(queue=[types.SimpleNamespace(est_uncached=7668, est_prompt=26868, p_only=False)],
                 admit_d=True, groups={"D": types.SimpleNamespace(outstanding={})}, vision_flip_urgent=False)
-    with envs.FLLIPER_PDFLIP_X_EXCURSION_PRICE.override(True), caplog.at_level(logging.INFO):
+    with _exc(True), caplog.at_level(logging.INFO):
         ok = F.Front._flip_economics_ok(ns, False)
     assert ok is False                                       # 7668 < X 10674: hold
     assert "threshold=10674" in caplog.text

@@ -58,10 +58,15 @@ class TestLauncherSwitch(unittest.TestCase):
         self.assertEqual(launcher.p_host_overlap_lines(False, False), [])
 
     def test_flags_exist_and_default_off(self):
+        # S43 (1018): --p-host-overlap is ON by default (NF rc12 output-ring
+        # stall, user rule "new features on"); --no-p-host-overlap is the off arm.
         base = ["--tree", "/t", "--tag", "t"]
         ns = launcher.build_parser().parse_args(base)
-        self.assertFalse(ns.p_host_overlap)
-        self.assertFalse(ns.p_hostgap)
+        self.assertTrue(ns.p_host_overlap)
+        # rc14 (1018): the #PGAP instrument is ON by default too; --no-p-hostgap is its off arm.
+        self.assertTrue(ns.p_hostgap)
+        self.assertFalse(launcher.build_parser().parse_args(base + ["--no-p-hostgap"]).p_hostgap)
+        self.assertFalse(launcher.build_parser().parse_args(base + ["--no-p-host-overlap"]).p_host_overlap)
         ns = launcher.build_parser().parse_args(base + ["--p-host-overlap", "--p-hostgap"])
         self.assertTrue(ns.p_host_overlap)
         self.assertTrue(ns.p_hostgap)

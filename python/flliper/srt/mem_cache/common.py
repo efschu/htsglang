@@ -429,6 +429,16 @@ def payable_size(allocator) -> int:
     return payable
 
 
+def _published_int(allocator, name: str) -> Optional[int]:
+    """An int attribute of the allocator, or None. Text-only helper (1535 F5):
+    None is printed as '?', so a missing figure reads as missing, not as 0."""
+    try:
+        value = getattr(allocator, name, None)
+        return None if value is None else int(value)
+    except Exception:  # noqa: BLE001 - a diagnostic must not raise
+        return None
+
+
 def _residency_withheld_note(allocator) -> str:
     """One clause naming the confiscator, or ''. #790.
 
@@ -437,20 +447,71 @@ def _residency_withheld_note(allocator) -> str:
     scheduler's idle invariant does not read it as a leak. The same number is
     the answer to "where did the tokens the tree just freed go", so the error
     that reports the under-delivery names it.
+
+    1535 F5: WHAT THE NUMBER IS. It is ``len(withheld page ids) * page_size``
+    -- TOKEN slot ids (pages x page_size), counted over the allocator's WHOLE
+    id space (``num_pages * page_size``), not over the "EFFECTIVE
+    max_total_num_tokens" the boot line projects, and not references or tree
+    nodes. NF K2 20:49:25: 336064 = 5251 pages x 64 inside an id space of
+    8192 pages = 524288 tokens (cap at page 2560 = 163840 tokens), while the
+    EFFECTIVE line said 262144. The clause therefore names the unit and prints
+    the id space, the cap and the available tokens beside it.
     """
-    withheld = getattr(allocator, "residency_withheld_slots", 0)
+    withheld = _published_int(allocator, "residency_withheld_slots")
+    if withheld is None or withheld <= 0:
+        return ""
+    page = max(1, _published_int(allocator, "page_size") or 1)
+    num_pages = _published_int(allocator, "num_pages")
+    cap_pages = _published_int(allocator, "residency_cap_pages")
     try:
-        withheld = int(withheld)
+        available = int(allocator.available_size())
     except Exception:  # noqa: BLE001 - a diagnostic must not raise
-        return ""
-    if withheld <= 0:
-        return ""
+        available = None
+
+    def _fmt(value: Optional[int]) -> str:
+        return "?" if value is None else str(value)
+
+    space = None if num_pages is None else num_pages * page
+    cap_tokens = None if cap_pages is None else cap_pages * page
     return (
-        f" A RESIDENCY CAP IS ENGAGED and is holding {withheld} slot ids out "
-        f"of the allocator's free list: every freed id above the cap is taken "
-        f"straight back by the cap's free listener, so peeling nodes whose "
-        f"slots live above it frees the TREE and pays the POOL nothing."
+        f" A RESIDENCY CAP IS ENGAGED and is holding {withheld} token slot "
+        f"ids ({withheld // page} pages x page_size {page}; ids, not "
+        f"references or tree nodes) out of the allocator's free list "
+        f"[id space {_fmt(space)} tokens = {_fmt(num_pages)} pages; cap "
+        f"{_fmt(cap_tokens)} tokens = page {_fmt(cap_pages)}; available "
+        f"under the cap {_fmt(available)} tokens]: every freed id above the "
+        f"cap is taken straight back by the cap's free listener, so peeling "
+        f"nodes whose slots live above it frees the TREE and pays the POOL "
+        f"nothing."
     )
+
+
+class PrefillOutOfPages(RuntimeError):
+    """The paged extend allocation of a PREFILL batch found no pages (NF 13.10. 11:59:14Z).
+
+    A ``RuntimeError`` on purpose: every other catcher (the PP followers, the
+    D group, any test that expects ``RuntimeError``) keeps dying exactly as before,
+    with the message of before. What the type adds is the TERMS, so the one
+    scheduler seat that can still retreat (PP0 of group P on the local-PP floor,
+    ``pdflip/prefill_oom_retreat.py``) decides on numbers instead of parsing text:
+
+    * ``need``: pages' worth of tokens the allocation asked for (``num_tokens``),
+    * ``free``: ``allocator.available_size()`` after the peel,
+    * ``evictable_reported``: what the tree still reports evictable,
+    * ``evictable_paid``: what the peel actually delivered to the pool
+      (the ``delivered`` receipt, 320 of 3200 in the specimen).
+
+    Raised BEFORE the batch is launched and before anything is sent to a
+    follower (``alloc_for_extend`` runs inside ``prepare_for_extend``)."""
+
+    def __init__(self, message, *, need=0, free=0, evictable_reported=0,
+                 evictable_paid=0, evict_asked=0):
+        super().__init__(message)
+        self.need = int(need)
+        self.free = int(free)
+        self.evictable_reported = int(evictable_reported)
+        self.evictable_paid = int(evictable_paid)
+        self.evict_asked = int(evict_asked)
 
 
 def _eviction_shortfall_note(tree_cache, asked: int, evicted: int) -> str:
@@ -729,6 +790,12 @@ def alloc_token_slots(
     return (out_cache_loc, state) if backup_state else out_cache_loc
 
 
+#: PR (pdflip/pp_room_vote.py): PP0's tree attribute carrying the room every PP
+#: stage can pay this pass (an int), or None -- published only on a PP group
+#: whose followers sent a fact; absent everywhere else (byte-identical).
+PP_ROOM_CAP_ATTR = "pdflip_pp_room_cap"
+
+
 def fundable_extend_tokens(tree_cache) -> int:
     """Tokens an extend allocation could actually get RIGHT NOW, group-uniform.
 
@@ -760,7 +827,14 @@ def fundable_extend_tokens(tree_cache) -> int:
         evictable = deliverable_evictable_or(tree_cache, tree_cache.evictable_size)
     except Exception:  # noqa: BLE001 - a cache without the accessor evicts none
         evictable = 0
-    return max(0, avail) + max(0, evictable)
+    # F1 (nf-next-1006-01): minus the group's cap-blind gap (0 unless a residency
+    # cap is engaged AND the iteration's reduce published one)
+    fundable = max(0, max(0, avail) + max(0, evictable) - cap_blind_gap_published(tree_cache))
+    # PR (pdflip/pp_room_vote.py): on PP0, the room every PP stage can pay
+    room_cap = getattr(tree_cache, PP_ROOM_CAP_ATTR, None)
+    if isinstance(room_cap, int) and not isinstance(room_cap, bool):
+        fundable = min(fundable, max(0, room_cap))
+    return fundable
 
 
 def published_fundable_floor(tree_cache) -> Optional[int]:
@@ -783,7 +857,9 @@ def published_fundable_floor(tree_cache) -> Optional[int]:
     """
     if tree_cache is None:
         return None
-    if getattr(tree_cache, "uniform_avail_floor", None) is None:
+    room_cap = getattr(tree_cache, PP_ROOM_CAP_ATTR, None)
+    has_cap = isinstance(room_cap, int) and not isinstance(room_cap, bool)
+    if getattr(tree_cache, "uniform_avail_floor", None) is None and not has_cap:
         return None
     return fundable_extend_tokens(tree_cache)
 
@@ -836,6 +912,161 @@ def deliverable_evictable_or(tree_cache, fallback) -> int:
         if isinstance(v, int) and not isinstance(v, bool):
             return v
     return int(fallback())
+
+
+def payable_evictable_or(tree_cache, fallback) -> int:
+    """PW (NF int18 1008): the evictable count a peel asked NOW can pay -- the
+    reported count minus the backup wall the last short peel measured -- where
+    the cache's CLASS defines it, else ``fallback()`` (looked up on the type for
+    the reason :func:`deliverable_evictable_or` gives)."""
+    fn = getattr(type(tree_cache), "payable_evictable_size", None)
+    if callable(fn):
+        v = fn(tree_cache)
+        if isinstance(v, int) and not isinstance(v, bool):
+            return v
+    return int(fallback())
+
+
+#: F1 (nf-next-1006-01): what the scheduler's iteration reduce publishes on the
+#: tree cache when a residency cap (``KvRowCap``) is engaged and the ranks'
+#: admission is pinned to the group MIN (uneven DCP). Absent / 0 everywhere
+#: else, which is the whole byte-for-byte argument: with neither attribute set
+#: every reader below returns exactly what it returned before.
+#:
+#: ``CAP_ABOVE_ATTR``: THIS rank's evictable tokens above the cap (rank-local;
+#: it also went into this rank's vote, so it cancels in ``dcp_avail_deficit``).
+#: ``CAP_GAP_ATTR``: the GROUP's gap ``floor - (MIN admission - evictable)``,
+#: the same number on every rank (it is built only from the reduced values).
+CAP_ABOVE_ATTR = "uniform_cap_above_tokens"
+CAP_GAP_ATTR = "uniform_cap_blind_gap"
+
+
+def _published_nonneg_int(tree_cache, attr: str) -> int:
+    v = getattr(tree_cache, attr, 0) if tree_cache is not None else 0
+    if isinstance(v, bool) or not isinstance(v, int):
+        return 0
+    return max(0, v)
+
+
+def cap_above_published(tree_cache) -> int:
+    """This iteration's evictable tokens above the engaged cap on THIS rank (0
+    when none was published)."""
+    return _published_nonneg_int(tree_cache, CAP_ABOVE_ATTR)
+
+
+def cap_blind_gap_published(tree_cache) -> int:
+    """The group-uniform gap ``fundable_extend_tokens`` is cut by (0 when none
+    was published)."""
+    return _published_nonneg_int(tree_cache, CAP_GAP_ATTR)
+
+
+def cap_above_evictable(tree_cache, *, allocator, page_size: int) -> int:
+    """F1 (nf-next-1006-01): THIS rank's DELIVERABLE evictable tokens whose slots
+    lie above the engaged residency cap, 0 when no cap is engaged.
+
+    Rank-local (the ids are this rank's own), read once per iteration BEFORE the
+    scheduler's reduce, so the same number goes into the vote and into the adder
+    (:func:`publish_cap_blind_gap`). Never raises: a failed read is 0 = the
+    admission counts what it counted before F1."""
+    from flliper.srt.mem_cache import evict_frontier_census as _ef
+
+    try:
+        if _ef.engaged_cap_pages(allocator) is None:
+            return 0
+        from flliper.srt.mem_cache.unified_cache_components.tree_component import (
+            BASE_COMPONENT_TYPE,
+        )
+
+        above = _ef.cap_above_tokens_memo(
+            tree_cache, BASE_COMPONENT_TYPE, allocator, int(page_size)
+        )
+        if above <= 0:
+            return 0
+        fe = getattr(tree_cache, "full_evictable_size", None)
+        deliverable = deliverable_evictable_or(
+            tree_cache, fe if fe is not None else tree_cache.evictable_size
+        )
+        return max(0, min(int(above), int(deliverable)))
+    except Exception:  # noqa: BLE001 - an admission input must not raise
+        return 0
+
+
+def publish_cap_blind_gap(
+    tree_cache,
+    *,
+    allocator,
+    pin_admission: bool,
+    min_avail: int,
+    min_admission: int,
+    local_evict_full: int,
+    local_cap_above: int,
+) -> None:
+    """F1 (nf-next-1006-01): publish on the tree cache what the cap-aware
+    admission reads after this iteration's reduce.
+
+    ``CAP_ABOVE_ATTR`` (rank-local: the number that went into this rank's vote,
+    so it cancels in ``dcp_avail_deficit``) and ``CAP_GAP_ATTR`` = ``floor + E -
+    MIN admission``, the group's cut of :func:`fundable_extend_tokens`. The gap
+    is built from REDUCED values only, so it is the same on every rank; it is 0
+    unless a residency cap is engaged on a pinned (uneven-DCP) group, and 0 when
+    no rank has evictable tokens above the cap (MIN admission then equals
+    ``floor + E``). NO collective is taken here."""
+    if tree_cache is None:
+        return
+    from flliper.srt.mem_cache import evict_frontier_census as _ef
+
+    gap = 0
+    if pin_admission and _ef.engaged_cap_pages(allocator) is not None:
+        gap = max(0, int(min_avail) + int(local_evict_full) - int(min_admission))
+    try:
+        setattr(tree_cache, CAP_ABOVE_ATTR, int(local_cap_above) if pin_admission else 0)
+        setattr(tree_cache, CAP_GAP_ATTR, int(gap))
+    except Exception:  # noqa: BLE001 - a tree that takes no attribute reads 0
+        pass
+
+
+def deliverable_evictable_cap_aware_or(tree_cache, fallback) -> int:
+    """F1 (nf-next-1006-01): :func:`deliverable_evictable_or` minus the
+    evictable tokens whose slots lie above the engaged residency cap -- the
+    pool takes every id freed up there straight back, so counting them as
+    fundable is what let the cand3 admission see 832 + 19200 while the pool
+    delivered 64 (D.log 05.10. 23:45:03Z). Equal to the plain count whenever
+    nothing was published (no cap engaged, no pin): byte-identical there."""
+    v = deliverable_evictable_or(tree_cache, fallback)
+    above = cap_above_published(tree_cache)
+    if above <= 0:
+        return v
+    return v - min(above, max(0, v))
+
+
+#: F1 instrument: one line per second per process (= per rank).
+_CAP_BLIND_LOG_EVERY_S = 1.0
+_cap_blind_last_log = [0.0]
+
+
+def note_cap_blind_admit(
+    *, rid, avail: int, evictable_reported: int, above_cap: int, grant: int
+) -> bool:
+    """``PDFLIP CAP-BLIND-ADMIT``: an admission was cut because evictable tokens
+    sit above the engaged cap. Called only where the cut happened and
+    ``above_cap > 0``; at most one line per second per rank (the early-warning
+    counter of nf-next-1006-02/03). Returns whether a line was written."""
+    import time
+
+    if int(above_cap) <= 0:
+        return False
+    now = time.monotonic()
+    if now - _cap_blind_last_log[0] < _CAP_BLIND_LOG_EVERY_S:
+        return False
+    _cap_blind_last_log[0] = now
+    logger.warning(
+        "PDFLIP CAP-BLIND-ADMIT rid=%s avail=%d evictable_reported=%d above_cap=%d grant=%d "
+        "(the admission did not count the above_cap evictable tokens: their slot ids lie "
+        "above the engaged residency cap, so the pool would take every id they free straight "
+        "back; the request was cut to what the ids below the cap can pay)",
+        rid, int(avail), int(evictable_reported), int(above_cap), int(grant),
+    )
+    return True
 
 
 def chunk_tokens_the_pool_can_fund(
@@ -901,7 +1132,9 @@ def _attempt_extend_relief(num_tokens: int) -> int:
     error, which is strictly more informative than a relief bug's traceback.
     """
     if not _extend_relief_providers:
-        # SAY THAT THE NET IS EMPTY, ONCE. Nothing registers a provider today:
+        # SAY THAT THE PROVIDER REGISTER IS EMPTY, ONCE (the alloc-site
+        # over-ask _cap_overask is a net at the allocation site, not a
+        # provider, so it does not fill this register). Nothing registers a provider today:
         # the rank-local reliefs that could pay here (eviction) are already
         # spent by the time this runs, and the ones that could genuinely free
         # tokens -- retraction, session spill -- are collective and belong on
@@ -916,10 +1149,18 @@ def _attempt_extend_relief(num_tokens: int) -> int:
             _announced_empty_relief = True
             logger.warning(
                 "extend allocation failed and NO relief provider is "
-                "registered: the alloc-site net is empty on this boot, so the "
-                "guarantee against this crash is entirely the admission guard "
-                "(chunk_tokens_the_pool_can_fund). If you are reading this "
-                "line, admission let through work the pool could not fund."
+                "registered: no rank-local relief provider is registered on "
+                "this boot. That is not 'no net': under an engaged residency "
+                "cap with a published gap the allocation site asks the tree "
+                "for num_tokens + gap (_cap_overask, a net at the allocation "
+                "site, not a provider), and admission "
+                "(chunk_tokens_the_pool_can_fund on the _rem_tokens <= 0 path; "
+                "otherwise PrefillAdder.rem_total_tokens = available_size() + "
+                "deliverable evictable) subtracts the evictable tokens above "
+                "an engaged residency cap on a pinned group "
+                "(deliverable_evictable_cap_aware_or), so it counts evictable "
+                "only below the cap there. If you are reading this line, "
+                "admission let through work the pool could not fund."
             )
         return 0
     freed = 0
@@ -1317,6 +1558,36 @@ def _compute_dsv4_state_lens(batch, *, is_decode: bool):
     )
 
 
+def _cap_overask(tree_cache, allocator, num_tokens: int) -> int:
+    """nf-next-1006-07c: extra TREE tokens the pre-allocation eviction of
+    :func:`alloc_paged_token_slots_extend` asks for under an engaged residency cap.
+
+    The pool takes every id freed above the cap straight back out of its free
+    list, so a peel of ``num_tokens`` can pay the pool nothing when its victims
+    sit up there (cand3 05.10. 23:45:03Z: 19200 evictable, 16512 of them in one
+    atomic leaf above the cap, one peel delivered 64 of 868). nf-next-1006-01
+    publishes the GROUP gap ``floor + E - MIN admission`` (``CAP_GAP_ATTR``, built
+    from the reduced values only): asking for ``num_tokens + gap`` evicts on every
+    rank at least ``num_tokens + U_s - A_s`` tree tokens, at most ``U_s`` of which
+    lie above that rank's cap, so at least ``num_tokens - A_s`` reach the pool.
+
+    Rank-uniform: the entry is the SAME predicate :func:`evict_from_tree_cache`
+    uses (``uniform_avail_for_evict < num_tokens``), the amount is a published
+    group value -- no rank-local branch, no collective, no new payload, no env.
+    0 (= the base's ask, byte for byte) without an engaged cap, without a
+    published gap, or when the base would not evict at all."""
+    gap = _published_nonneg_int(tree_cache, CAP_GAP_ATTR)
+    if gap <= 0:
+        return 0
+    from flliper.srt.mem_cache import evict_frontier_census as _ef
+
+    if _ef.engaged_cap_pages(allocator) is None:
+        return 0
+    if uniform_avail_for_evict(tree_cache, allocator) >= num_tokens:
+        return 0
+    return gap
+
+
 def alloc_paged_token_slots_extend(
     tree_cache: BasePrefixCache,
     prefix_lens: torch.Tensor,
@@ -1337,7 +1608,9 @@ def alloc_paged_token_slots_extend(
     # rc12k 10:51:00 raised here with "226048 evictable" in the message and
     # no word that the eviction in between had freed nothing.
     payable_before = payable_size(allocator)
-    evict_from_tree_cache(tree_cache, num_tokens)
+    evict_from_tree_cache(
+        tree_cache, num_tokens + _cap_overask(tree_cache, allocator, num_tokens)
+    )
     delivered = max(0, payable_size(allocator) - payable_before)
     evict_asked = max(0, num_tokens - payable_before)
 
@@ -1449,7 +1722,28 @@ def alloc_paged_token_slots_extend(
         logger.error(error_msg)
         if tree_cache is not None:
             tree_cache.pretty_print()
-        raise RuntimeError(error_msg)
+        _free_now = _evictable_now = -1
+        try:
+            _free_now = int(allocator.available_size())
+        except Exception:  # noqa: BLE001 - the terms are a diagnosis, never a new failure
+            pass
+        for _name in ("full_evictable_size", "evictable_size"):
+            _g = getattr(tree_cache, _name, None)
+            if _g is None:
+                continue
+            try:
+                _evictable_now = int(_g())
+                break
+            except Exception:  # noqa: BLE001
+                continue
+        raise PrefillOutOfPages(
+            error_msg,
+            need=num_tokens,
+            free=_free_now,
+            evictable_reported=_evictable_now,
+            evictable_paid=delivered,
+            evict_asked=evict_asked,
+        )
 
     return (out_cache_loc, state) if backup_state else out_cache_loc
 

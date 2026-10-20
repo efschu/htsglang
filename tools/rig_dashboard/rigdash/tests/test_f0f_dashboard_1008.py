@@ -232,7 +232,7 @@ class Residue(unittest.TestCase):
     rename_rigdash (their plan_id is a hash over the content) and are outside the check."""
 
     def test_no_old_prefix_or_path_left(self):
-        rx = re.compile(r"%s_%s_|%s\.srt|%s/srt" % ("SGLANG", "WEG2", "sg" "lang", "sg" "lang"))
+        rx = re.compile(r"%s_%s_|%s\.srt|%s/srt" % ("SG" "LANG", "WE" "G2", "sg" "lang", "sg" "lang"))
         bad = {}
         for base in (PKG, os.path.join(DASH, "kartenplan_build")):
             for d, dirs, files in os.walk(base):

@@ -849,6 +849,61 @@ def _pdflip_park_on() -> bool:
 
 
 from flliper.srt.mem_cache.common import deliverable_evictable_or  # ED
+from flliper.srt.mem_cache.common import payable_evictable_or  # PW
+from flliper.srt.mem_cache.common import (  # F1
+    cap_above_published,
+    cap_blind_gap_published,
+    deliverable_evictable_cap_aware_or,
+    note_cap_blind_admit,
+)
+
+
+@contextmanager
+def _form_a_admit_taken_room(tree_cache, admit_taken: bool):
+    """H98e (NF xc D 21:37:29Z 07.10., pdflip-130-2093 -> pdflip-130-2092; the
+    WURZEL behind H98d): the room rule of a load-back whose group ADMIT is
+    already taken, applied to its FIRST attempt.
+
+    ``admit_taken``: this rank read the H105 verdict BEFORE its load-back and
+    it was ADMIT -- a worker off the token cut, every rank on it (H105d
+    gathers before any load-back). The admission is then decided; what is
+    left is room, and H105c/H105d already answer that from the LIVE pool with
+    a shortfall-only eviction (``_form_a_load_back_floor`` under
+    ``_h105c_follow_room``). The first attempt used to go through the
+    pass-published, ledger-charged floor instead -- published once per
+    iteration, debited for allocations (#694), never credited for frees, so
+    it can sit below the live pool. On the token cut H105d had just proven
+    the live pool held these rows on every rank, yet the floor refused, and
+    the refusal ran the xsn285 drain --
+    ``evict(num_tokens=evictable_size())``, EVERY evictable leaf -- before
+    H105c's retry loaded from the very room that had been there all along
+    (D log 21:37:29: ``EVICT-FRONTIER-CENSUS request=168832`` on every rank,
+    then ``H105c FORM-A FOLLOW-ROOM rid=pdflip-130-2093 kv_tokens=49280
+    evicted=0 available=142464``). The drain took the device tail of
+    pdflip-130-2092, whose depth the pass had voted (175104) but not yet
+    admitted; the full mamba arena backed it up KV-only (P-FUND), the anchor
+    was gone, and the H98 depth went stale (H98d's death).
+
+    On (switch ``FLLIPER_PDFLIP_ENABLE_FORM_A_ADMIT_ROOM_FIRST``): no drain for
+    room that exists; a real shortfall is evicted in LRU order -- the pass's
+    vote probes just refreshed every voted path, so they go last -- and only
+    a live pool that still cannot hold the rows reaches the xsn285 branch and
+    H105c's retry, as before. The host-first path (H105b/H106: the host
+    loads back BEFORE its verdict) is untouched, as is every non-Form-A
+    boot (no verdict callable -> ``admit_taken`` False)."""
+    if not admit_taken or tree_cache is None:
+        yield
+        return
+    from flliper.srt.environ import envs
+
+    if not envs.FLLIPER_PDFLIP_ENABLE_FORM_A_ADMIT_ROOM_FIRST.get():
+        yield
+        return
+    tree_cache._h105c_follow_room = True
+    try:
+        yield
+    finally:
+        tree_cache._h105c_follow_room = False
 
 
 def _h105c_follow(adder, req, lb_extent, follow, new_indices) -> torch.Tensor:
@@ -857,17 +912,64 @@ def _h105c_follow(adder, req, lb_extent, follow, new_indices) -> torch.Tensor:
     ADMIT (a follower reads the verdict before its load-back), must not WAIT
     alone -- that ended the workers' loop one gate call short of the host's.
     It follows (:func:`_h105c_follow_load_back`); anything else passes
-    ``new_indices`` through untouched."""
+    ``new_indices`` through untouched.
+
+    H105e: under the #239 token cut the same holds for a KV-ONLY rank (no
+    anchor adopted) whose load-back the group FLOOR refused (see
+    :func:`_h105e_kv_only_floor_refused`)."""
     if (
         int(new_indices.numel()) == 0
         and lb_extent
         and int(lb_extent) > 0
-        and getattr(req, "mamba_loadback_anchor_adopted", False)
         and follow is not None
         and not getattr(follow, "host_decides_load_back", False)
+        and (
+            getattr(req, "mamba_loadback_anchor_adopted", False)
+            or _h105e_kv_only_floor_refused(req, int(lb_extent))
+        )
     ):
         return _h105c_follow_load_back(adder, req, int(lb_extent))
     return new_indices
+
+
+#: H105e: how often a KV-only rank followed the gathered ADMIT.
+_H105E_FOLLOWED = {"n": 0}
+
+
+def _h105e_kv_only_floor_refused(req, lb_extent: int) -> bool:
+    """H105e (NF xc boot dkrnfint4h6ablxcbar1dauer10061548, 220e3f8b70, D log
+    227758-227879, 16:52:04Z, pdflip-72-531, FormAAdmissionSplit EXTEND-SET
+    SPLIT host=(16640, 18729) local=(0, 2688)): under the token cut every rank
+    took the gathered ADMIT before its load-back (H105d had found each rank's
+    room). The group floor then refused the load-back on EVERY rank (0 rows).
+    TP0 had adopted its GDN anchor and followed (H105c, ``FOLLOW-ROOM ...
+    available=65536`` -> 16640); TP1/TP2 walk ``MambaComponent:absent`` --
+    KV-only, no anchor -- so H105c's condition missed them, they took the
+    #1048 "served 0" arm, re-prefilled from 0 and split from the host.
+
+    A rank-local 0 the FLOOR made is the follow case, anchor or not
+    (``req._h105e_floor_refused``, written by ``load_back`` at that refusal
+    only). Any other 0 (a stale stamp, an unservable component) keeps the
+    #1048 arm. Token cut only: off the cut the host decides first (H105b) and
+    nothing here changes."""
+    if getattr(req, "_h105e_floor_refused", False) is not True:
+        return False
+    from flliper.srt.rank_role import form_a_token_cut_active
+
+    if not form_a_token_cut_active():
+        return False
+    _H105E_FOLLOWED["n"] += 1
+    n = _H105E_FOLLOWED["n"]
+    if n <= 20 or (n & (n - 1)) == 0:
+        logger.info(
+            "H105e FORM-A-CUT KV-ONLY FOLLOW rid=%s extent=%d (n=%d): the group "
+            "floor refused this rank's load-back after it took the gathered "
+            "ADMIT and no GDN anchor was adopted (KV-only walk); it follows "
+            "the ADMIT through its own room like an anchor rank (H105c), "
+            "instead of re-prefilling from its device prefix alone",
+            getattr(req, "rid", "?"), int(lb_extent), n,
+        )
+    return True
 
 
 def _h105c_follow_load_back(adder, req, lb_extent: int) -> torch.Tensor:
@@ -917,7 +1019,197 @@ def _h105c_follow_load_back(adder, req, lb_extent: int) -> torch.Tensor:
     return new_indices
 
 
+#: H105d: how often a token-cut rank voted NO_TOKEN for want of load-back room.
+_H105D_REFUSED = {"n": 0}
+
+
+def _h105d_load_back_kv_rows(best_match_node) -> int:
+    """The device rows a load-back of ``best_match_node`` allocates on THIS
+    rank: the host values of its evicted run -- exactly what
+    ``FullComponent.build_hicache_transfers(LOAD_BACK)`` gathers into
+    ``kv_xfer.host_indices`` (``load_back``'s ``kv_tokens``)."""
+    from flliper.srt.mem_cache.unified_cache_components.tree_component import (
+        BASE_COMPONENT_TYPE,
+    )
+
+    rows, cur = 0, best_match_node
+    while cur is not None and cur.evicted:
+        host_value = cur.component_data[BASE_COMPONENT_TYPE].host_value
+        if host_value is None:
+            break
+        rows += len(host_value)
+        cur = cur.parent
+    return rows
+
+
+def _form_a_stale_vote_gate(adder, req, follow) -> AddReqResult | None:
+    """H98d (NF xc D 21:37:29Z 07.10., pdflip-130-2092; tp_match_floor H98d):
+    ``OTHER`` when THIS rank -- the Form A attention host -- found its
+    admission match below the group depth planted at the top of the pass.
+    It rides the H105 verdict below, so every rank keeps the request queued
+    and the next pass votes again; without a verdict callable it is the H98
+    stop. None everywhere else (one lookup, nothing else changes)."""
+    from flliper.srt.managers.tp_match_floor import form_a_stale_vote_refuses
+
+    if form_a_stale_vote_refuses(
+        adder.tree_cache, req, has_verdict_channel=follow is not None
+    ):
+        return AddReqResult.OTHER
+    return None
+
+
+def _h105d_cut_load_back_room(adder, req, evict: bool = True) -> bool:
+    """H105d (NF y9nf6 rc12z30y9nf6, 191228abc5, D log boot_weg2_dkrnfint4h6abl
+    bar1dauer10040608 ~158218-158410, 06:32:52Z, pdflip-32-93): may THIS rank
+    vote ADMIT for a request whose host hit it must load back?
+
+    Under the #239 token cut the H105 verdict is a gather of every rank's real
+    gate (MIN), taken BEFORE the load-back -- there is no host-first load-back
+    (H105b) and no H106 drain on this path. The gate priced the load-back
+    against ``rem_total_tokens`` = available + the REPORTED evictable count;
+    on all three ranks that read 318912 (available 85568, evictable 237568),
+    the peel then delivered 7616: the frontier leaves are write_back leaves
+    whose backup the full host arena refused (R12 SHADOW-SHORT arena_claim,
+    ARENA-DROP freed=0), UD drop is local-PP only, and 200640 tokens sat
+    behind them (EVICT-FRONTIER-CENSUS behind_device_child=200640, aux_locked
+    {} -> ED subtracted nothing). Every rank took the group ADMIT, H105c
+    made its own room (available 93184 < kv 121856) and stopped by name: the
+    whole D group died for one request that could simply have waited.
+
+    The rule: on the token cut, a rank with a load-back extent makes its room
+    for its OWN load-back rows NOW (the same shortfall eviction H105c's
+    follow-room does after the vote) and votes NO_TOKEN when the live pool
+    still cannot hold them. The gather MIN keeps the rid queued on every rank;
+    no rank loads, no rank waits alone. When every rank has the room, the
+    group ADMITs and H105c's follow load-back finds it -- the H105c stop stays
+    the named stop for room that vanished between vote and load-back.
+    Off the token cut: True, untouched (the host decides, H105b/H106).
+
+    H110 (NF int15, 9341551eae, D log boot_weg2_dkrnfint4h6ablxcbar1dauer
+    10080122_9341551eae_1008_012219.D.log 437580-437746, 05:53:12Z, pdflip-44-438):
+    the room priced here is the rows THIS PASS allocates on this rank, not the
+    load-back alone -- the load-back rows, the first extend chunk behind them
+    (``_h110_chunk_rows``) and the chunks this adder already promised in the
+    same pass (``_h110_promised_rows``: admitted, not yet allocated). The
+    load-back-only check passed pdflip-44-438 at 86464 rows on ~87488 available;
+    the load-back left 1024, the 2368-token chunk then asked the tree for 1408,
+    its only frontier leaf (72576 tokens, un-backed write_back, ``#1421
+    BACKUP-REFUSED why=arena_claim``) paid 0 and all three ranks raised
+    "Prefill out of memory" -> RANK-DEATH, W17, container gone. A request
+    without a load-back is priced the same way (its chunk + the pass's
+    promises), since its extend meets the same peel."""
+    from flliper.srt.rank_role import form_a_token_cut_active
+
+    if not form_a_token_cut_active():
+        return True
+    kv_rows = (
+        _h105d_load_back_kv_rows(req.best_match_node)
+        if _pp_load_back_extent(req)
+        else 0
+    )
+    chunk_rows = _h110_chunk_rows(adder, req, kv_rows)
+    promised = _h110_promised_rows(adder)
+    need = kv_rows + chunk_rows + promised
+    alloc = adder.token_to_kv_pool_allocator
+    available = int(alloc.available_size())
+    if need <= available:
+        return True
+    from flliper.srt.mem_cache.base_prefix_cache import EvictParams
+
+    tc = adder.tree_cache
+    reported = int(tc.evictable_size())
+    # PW (NF int18 1008, 12:13-12:17Z pdflip-28-97): the backup wall the last short
+    # peel measured is not asked again -- the count the peel can PAY decides.
+    payable = min(reported, payable_evictable_or(tc, tc.evictable_size))
+    evicted = 0
+    if not evict:
+        # H105f (NF h14 14:50:53, pdflip-0-3): the DRY vote -- may this rank make
+        # the room? Nothing is evicted before the group has said ADMIT.
+        if need <= available + payable:
+            return True
+    elif payable > 0 and need <= available + payable:
+        res = tc.evict(EvictParams(num_tokens=min(payable, need - available)))
+        # evict() returns None on some caches (as read by H105c/H106 too)
+        evicted = int(getattr(res, "num_tokens_evicted", 0) or 0)
+        available = int(alloc.available_size())
+    if need <= available:
+        return True
+    _H105D_REFUSED["n"] += 1
+    n = _H105D_REFUSED["n"]
+    if n <= 3 or (n & (n - 1)) == 0:
+        logger.info(
+            "H105d FORM-A-CUT LOAD-BACK ROOM rid=%s kv_rows=%d chunk_rows=%d "
+            "promised=%d need=%d available=%d evicted=%d reported_evictable=%d "
+            "payable_evictable=%d rem_total_tokens=%s (n=%d): this rank cannot hold "
+            "the rows this pass allocates for it (load-back + first chunk + the "
+            "pass's earlier chunks, H110) even after evicting what it can pay; it "
+            "votes NO_TOKEN and the group's MIN keeps the request queued on every rank",
+            req.rid, kv_rows, chunk_rows, promised, need, available, evicted,
+            reported, payable, adder.rem_total_tokens, n,
+        )
+    return False
+
+
+def _h105f_on() -> bool:
+    """H105f: vote before evicting (token cut only -- H105d is a no-op off it)."""
+    import os
+
+    from flliper.srt.rank_role import form_a_token_cut_active
+
+    if (os.environ.get("FLLIPER_PDFLIP_H105F_VOTE_BEFORE_EVICT", "1") or "1").strip().lower() in (
+            "0", "false", "no", "off"):
+        return False
+    return bool(form_a_token_cut_active())
+
+
+def _h105f_confirm_due(group_gate, armed: bool) -> bool:
+    """H105f: the second (confirming) gather runs exactly when the first one
+    returned the group's ADMIT -- a group-uniform fact, so every rank enters it
+    alike. ``armed`` is group-uniform too (switch + the installed token cut)."""
+    return bool(armed) and group_gate is None
+
+
+def _h110_int(v) -> int:
+    """A count read off a request/adder, 0 for anything that is not an int
+    (a desk double answers every getattr)."""
+    return int(v) if isinstance(v, int) and not isinstance(v, bool) else 0
+
+
+def _h110_chunk_rows(adder, req, kv_rows: int) -> int:
+    """H110: the device rows the first extend chunk behind a load-back of
+    ``kv_rows`` allocates in this pass -- the rest of the extend after the
+    load-back, cut to the adder's chunk width (all of it without chunking),
+    plus the one page the paged allocator may add (the 1408 = 1344 + 64 of
+    the 05:53:12Z ask)."""
+    ext = max(0, len(req.full_untruncated_fill_ids) - len(req.prefix_indices))
+    rest = max(0, ext - max(0, min(int(kv_rows), ext)))
+    width = adder.rem_chunk_tokens
+    if isinstance(width, int) and not isinstance(width, bool) and width > 0:
+        rest = min(rest, width)
+    return rest + max(1, _h110_int(getattr(adder, "page_size", 1)))
+
+
+def _h110_promised_rows(adder) -> int:
+    """H110: rows this adder already promised in this pass and that are not
+    allocated yet -- every admitted request's extend chunk (``extend_input_len``,
+    set at its admission) plus a page each; they are allocated together in
+    ``prepare_for_extend`` after the adder is done, so ``available_size()``
+    does not show them. A load-back's own rows are allocated at admission and
+    already left ``available_size()``."""
+    page = max(1, _h110_int(getattr(adder, "page_size", 1)))
+    rows = 0
+    for r in list(getattr(adder, "can_run_list", None) or ()):
+        rows += _h110_int(getattr(r, "extend_input_len", 0)) + page
+    return rows
+
+
 class PrefillAdder:
+    # PRIORITY LANES 1008 (L3, pdflip/lanes_p.py): written by `lanes_p.configure_adder` only when the rank holds lane state
+    # (an RPC or a stamp arrived with FLLIPER_PDFLIP_LANES=1); these class defaults ARE the switch-off behaviour.
+    lane_floor: int = 0  # a request of a lane below this gets no chunk (0 = nothing is held)
+    lane_chunk_cap_tokens: int = 0  # FLLIPER_PDFLIP_LANE_PREEMPT_CHUNK_TOKENS in pages (0 = the normal chunk)
+    lane_higher_waiting: int = -1  # the highest lane among the waiting requests (-1 = unknown)
+
     def __init__(
         self,
         page_size: int,
@@ -1037,6 +1329,10 @@ class PrefillAdder:
         )
         self.running_batch = running_batch
         self.new_token_ratio = new_token_ratio
+        #: Q-702 BUDGET-EINHEIT: the adder's OWN lifetime numbers of the first
+        #: refusal this pass, ``(rid, price, budget)`` -- see
+        #: ``_note_lifetime_refusal``. None = no lifetime refusal yet.
+        self.lifetime_refusal = None
         self.rem_input_tokens = rem_input_tokens - num_mixed_decode_tokens
         self.rem_chunk_tokens = rem_chunk_tokens
         self.dllm_config = dllm_config
@@ -1214,6 +1510,93 @@ class PrefillAdder:
 
         self.rem_dllm_tokens = max_running_reqs * self.dllm_block_size
 
+    def _note_lifetime_refusal(self, req: Req, total_tokens, budget) -> None:
+        """Q-702 BUDGET-EINHEIT (NF y9nf boot ...10032328 D 23:33:28Z, SEAT-AGE
+        livelock): the first lifetime NO_TOKEN of the pass keeps the numbers the
+        adder refused on -- ``total_tokens`` (what it charged: extend + max_new +
+        page + mamba gap, or the per-chunk form) against ``rem_total_tokens``
+        (pool + evictable - running decode reserves - group floor - ledger). The
+        SEAT-AGE KV verdict reads exactly these instead of re-deriving a budget of
+        its own that omits all of that (pdflip/d_park_runtime.kv_displace_would_fit).
+        Bookkeeping only: no admission decision reads it here."""
+        if self.lifetime_refusal is None:
+            try:
+                self.lifetime_refusal = (str(req.rid), int(total_tokens), int(budget))
+            except Exception:  # noqa: BLE001 -- bookkeeping on every group's gate path (review 1140, 3c)
+                pass
+        self._note_cap_blind_refusal(req, total_tokens, budget)
+
+    def _cap_lifetime_waiver(self, total_tokens, born_input_tokens, rem_total) -> bool:
+        """F1 (nf-next-1006-01): the cap-aware budget guards the IMMEDIATE
+        allocation (extend + load-back + page + mamba gap = ``born_input_tokens``);
+        the decode reserve (``max_new``) is future growth, which the D-MEM-SCHED
+        tick prices (``_room_ok``) and lifts for. Counting it against the
+        cap-aware number would park a request the pool under the cap can serve
+        for as long as the tree holds evictable tokens above the cap (nothing
+        lifts a cap for a request whose immediate demand fits). So the lifetime
+        gate keeps the pre-F1 (cap-blind) budget = this one + the group's gap.
+        The gap is a reduced value, the same on every rank; 0 without an engaged
+        cap and without the uneven-DCP pin -> False, the gate is as it was."""
+        try:
+            gap = cap_blind_gap_published(self.tree_cache)
+            if gap <= 0:
+                return False
+            return int(born_input_tokens) < int(rem_total) and int(total_tokens) < int(rem_total) + gap
+        except Exception:  # noqa: BLE001 -- the gate may not raise on a stand-in
+            return False
+
+    def _note_cap_blind_chunk(self, req: Req, fundable: int, grant: int) -> None:
+        """F1 instrument (nf-next-1006-01) for the CHUNKED gate: the grant was
+        cut below what the cap-blind count would have granted. Silent unless a
+        residency cap is engaged with evictable tokens above it. Bookkeeping
+        only: no admission decision reads it."""
+        try:
+            from flliper.srt.mem_cache.common import chunk_tokens_the_pool_can_fund
+
+            gap = cap_blind_gap_published(self.tree_cache)
+            above = cap_above_published(self.tree_cache)
+            if gap <= 0 and above <= 0:
+                return
+            blind = chunk_tokens_the_pool_can_fund(
+                int(fundable) + gap, self.page_size, self.rem_chunk_tokens
+            )
+            if grant >= blind:
+                return
+            note_cap_blind_admit(
+                rid=req.rid,
+                avail=int(self.token_to_kv_pool_allocator.available_size()),
+                evictable_reported=int(self.tree_cache.full_evictable_size()),
+                above_cap=above if above > 0 else gap,
+                grant=int(grant),
+            )
+        except Exception:  # noqa: BLE001 -- an instrument may not raise on the gate path
+            pass
+
+    def _note_cap_blind_refusal(self, req: Req, total_tokens, budget) -> None:
+        """F1 instrument for the NEW-request gate: the lifetime budget refused
+        a request the cap-blind budget (this one plus the tokens above the cap)
+        would have admitted. Bookkeeping only."""
+        try:
+            above = cap_above_published(self.tree_cache)
+            if above <= 0 or int(total_tokens) >= int(budget) + above:
+                return
+            note_cap_blind_admit(
+                rid=req.rid,
+                avail=int(self.token_to_kv_pool_allocator.available_size()),
+                evictable_reported=int(self.tree_cache.full_evictable_size()),
+                above_cap=above,
+                grant=int(budget),
+            )
+        except Exception:  # noqa: BLE001 -- an instrument may not raise on the gate path
+            pass
+
+    def released_by_leaving(self, req: Req) -> int:
+        """Q-702: what the lifetime budget regains when the RUNNING request
+        ``req`` leaves the batch: the decode reserve this adder charged it
+        (``rem_total_token_offset`` includes it for every running request); its
+        KV rows are the caller's term."""
+        return int(self._get_running_request_total_token_offset(req))
+
     def _get_running_request_total_token_offset(self, req: Req) -> int:
         return (
             min(
@@ -1240,7 +1623,7 @@ class PrefillAdder:
             # (mamba-locked nodes and their ancestors are counted but unpeelable).
             available_and_evictable = (
                 self.token_to_kv_pool_allocator.available_size()
-                + deliverable_evictable_or(self.tree_cache, self.tree_cache.full_evictable_size)
+                + deliverable_evictable_cap_aware_or(self.tree_cache, self.tree_cache.full_evictable_size)
             )
         else:
             available_and_evictable = (
@@ -1277,6 +1660,35 @@ class PrefillAdder:
             return budget
         return effective_rem_total_tokens(budget, self.commitment_ledger)
 
+    _PDFLIP_BUDGET_PARTS_N = [0]
+
+    def _pdflip_note_budget_parts(self, req, price, budget) -> None:
+        """PW-W instrument (NF h14 14:50:53, pdflip-2-21: ``host_price=167776
+        host_budget=33536`` for 317 s with nothing running): the terms the
+        refusing budget is made of, so the next wedge names which one held the
+        rows. Observation only, rate-limited, never raises."""
+        n = self._PDFLIP_BUDGET_PARTS_N[0] = self._PDFLIP_BUDGET_PARTS_N[0] + 1
+        if not (n <= 20 or n % 256 == 0):
+            return
+        try:
+            alloc = self.token_to_kv_pool_allocator
+            parts = {
+                "available": int(alloc.available_size()),
+                "evictable": int(self.tree_cache.evictable_size()),
+                "offset": int(self.rem_total_token_offset),
+                "dcp_deficit": int(self.dcp_avail_deficit or 0),
+                "fundable_floor": self.fundable_extend_floor,
+                "ledger": (int(self.commitment_ledger.outstanding_tokens())
+                           if getattr(self, "commitment_ledger", None) is not None else None),
+                "prefix": len(req.prefix_indices),
+                "host_hit": int(getattr(req, "host_hit_length", 0) or 0),
+            }
+        except Exception as e:  # noqa: BLE001 - an instrument never breaks the gate
+            parts = {"unreadable": type(e).__name__}
+        logger.info("PDFLIP GATE-BUDGET-PARTS rid=%s price=%s budget=%s %s (n=%d)",
+                    getattr(req, "rid", "?"), price, budget,
+                    " ".join("%s=%s" % kv for kv in parts.items()), n)
+
     @property
     def rem_swa_tokens(self):
         return (
@@ -1302,7 +1714,7 @@ class PrefillAdder:
             # (mamba-locked nodes and their ancestors are counted but unpeelable).
             available_and_evictable = (
                 self.token_to_kv_pool_allocator.available_size()
-                + deliverable_evictable_or(self.tree_cache, self.tree_cache.full_evictable_size)
+                + deliverable_evictable_cap_aware_or(self.tree_cache, self.tree_cache.full_evictable_size)
             )
         else:
             available_and_evictable = (
@@ -1669,6 +2081,36 @@ class PrefillAdder:
         if not self.scheduled_extents:
             return None
         return self.scheduled_extents.get(req.rid)
+
+    def _pdflip_chunk_grain(self) -> int:
+        """K11: where the end of a chunk that stays chunked may land -- the
+        end-anchor grain (`_pdflip_end_anchor_grain`): the QSA compress ratio or
+        page on a QSA pool, 1 everywhere else. An allocator without
+        `get_kvcache` (a desk double) is not a QSA pool."""
+        alloc = getattr(self, "token_to_kv_pool_allocator", None)
+        if alloc is None or not callable(getattr(alloc, "get_kvcache", None)):
+            return 1
+        return int(_pdflip_end_anchor_grain(alloc, int(getattr(self, "page_size", 1) or 1)))
+
+    def _pdflip_floor_chunk_to_grain(self, start: int, length: int) -> int:
+        """K11: shorten a TRUNCATED chunk [start, start+length) so its end is a
+        grain multiple; 0 means the budget does not reach the next boundary
+        (the caller parks). Unchanged when the grain is 1."""
+        g = self._pdflip_chunk_grain()
+        if g <= 1:
+            return int(length)
+        end = (int(start) + int(length)) // g * g
+        return max(0, end - int(start))
+
+    def _pdflip_park_chunked_in_place(self, req: Req) -> None:
+        """K11's copy of the #679 park (`if grant <= 0:` in add_chunked_req,
+        kept inline there because test_pdflip_park_xsn303 pins its text): the
+        request keeps its place at the chunk boundary (`Range(prefix,
+        prefix)`); under the pdflip park the scheduler turns it into a rows-back
+        park at the head of the next step (Punkt 2)."""
+        req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices))
+        if _pdflip_park_on():
+            req.pdflip_pool_parked = True
 
     def _pdflip_end_anchor_split(self, req: Req, start: int, length: int):
         """#1233 END-OF-PREFILL ANCHOR: (length, forced_chunked).
@@ -2074,6 +2516,26 @@ class PrefillAdder:
         )
         return AddReqResult.CONTINUE
 
+    def _pdflip_lane_hold_chunked(self, req: Req) -> bool:
+        """PRIORITY LANES 1008 (L3): True = the chunked continuation `req` is held by the lane floor and has been parked in
+        place (no extend range, `pdflip_pool_parked` + `pdflip_lane_parked` for the head-of-step park). A continuation whose
+        floor fell before its rows went back is released from the lane park here (False)."""
+        lane_parked = getattr(req, "pdflip_lane_parked", False) is True
+        if self.lane_floor <= 0 and not lane_parked:
+            return False  # the switch-off path: two attribute reads
+        from flliper.srt.pdflip import lanes_p
+
+        if lanes_p.holds(lanes_p.req_lane(req), self.lane_floor):
+            n = len(req.prefix_indices)
+            req.set_extend_range(n, n)
+            req.pdflip_pool_parked = True
+            req.pdflip_lane_parked = True
+            return True
+        if lane_parked:
+            req.pdflip_lane_parked = False
+            req.pdflip_pool_parked = False
+        return False
+
     def add_chunked_req(self, req: Req):
         # #791 CORE: the carried chunked request is the consumer that had NO
         # forwarded-decision gate at all. `add_one_req` at least read the
@@ -2103,6 +2565,16 @@ class PrefillAdder:
                 if req.extend_range.end < len(req.full_untruncated_fill_ids)
                 else None
             )
+        # PRIORITY LANES 1008 (L3): the floor stands above this continuation's lane -> no chunk this pass, the request
+        # parks IN PLACE at the chunk boundary (the #679 shape) and `process_pending_pdflip_park` gives its rows back to
+        # the tree (is_insert=True) at the head of the next step. Reached on PP0 (it owns the decision) and on a follower
+        # only for a request the forwarded schedule does NOT name -- where it reads the SAME stamped floor, so every
+        # stage parks. A request the schedule names was run by the branch above (the decision wins). On a follower the
+        # scheduler's #992 gate (a continuation the decision does not name gets no seat; under the row authority every
+        # follower has an effective map, `{}` included) would skip this method; `lanes_p.continuation_held` exempts the
+        # lane-held continuation from that skip, because it takes no seat here (no chunk, no budget, no can_run_list).
+        if self._pdflip_lane_hold_chunked(req):
+            return req
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens()
         else:
@@ -2179,6 +2651,7 @@ class PrefillAdder:
                 grant = chunk_tokens_the_pool_can_fund(
                     fundable, self.page_size, self.rem_chunk_tokens
                 )
+                self._note_cap_blind_chunk(req, fundable, grant)
                 if grant <= 0:
                     req.set_extend_range(
                         len(req.prefix_indices), len(req.prefix_indices)
@@ -2206,6 +2679,34 @@ class PrefillAdder:
         truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
         if truncated:
+            # K11 (NF h16p 226aad7105, P.log 29069/29397, 15.10. 12:39:42Z):
+            # a budget-bound continuation (rem_total_tokens 9586 at a 94 % PP0
+            # pool) ended at 58546, so the NEXT chunk's prefix split a QSA
+            # group (58546 % 4 == 2) and `_qsa_build_write_plan`'s
+            # `prefix_lens % ratio` device assert took PP0 down. The end of a
+            # chunk that stays chunked lands on the same grain as the
+            # end-anchor cut (fnFL2x14); 1 off QSA, so nothing changes there.
+            # PP0 decides it here and its rows carry the extent: a follower
+            # that is told runs `_add_scheduled_req` above and never reaches
+            # this line, so every stage gets the same end.
+            new_len = self._pdflip_floor_chunk_to_grain(
+                len(req.prefix_indices), new_len
+            )
+            if new_len <= 0:
+                # The budget does not reach the next grain boundary: the #679
+                # park, not a chunk that would poison the next prefix.
+                self._pdflip_park_chunked_in_place(req)
+                logger.warning(
+                    "chunked prefill PARKED (K11 QSA-CHUNK-GRAIN): rid=%s "
+                    "prefix=%d budget=%d does not reach the next grain "
+                    "boundary (grain %d). The request keeps its place and is "
+                    "retried when memory frees.",
+                    getattr(req, "rid", "?"),
+                    len(req.prefix_indices),
+                    int(_rem_tokens),
+                    self._pdflip_chunk_grain(),
+                )
+                return req
             # P-FORK-CUT: end this chunk at the shared-prefix fork when that is free.
             new_len = _pdflip_p_fork_cut.apply(
                 self, req, len(req.prefix_indices), new_len, "add_chunked_req"
@@ -2397,6 +2898,11 @@ class PrefillAdder:
 
             # Chunked prefill
             trunc_len = self.rem_chunk_tokens
+            # K11: a chunk that stays chunked ends on the QSA grain (1 off QSA);
+            # a leftover rem_chunk_tokens from an earlier admission is not one.
+            trunc_len = self._pdflip_floor_chunk_to_grain(0, trunc_len)
+            if trunc_len <= 0:
+                return AddReqResult.OTHER
 
             assert len(req.prefix_indices) == 0
             req.set_extend_range(
@@ -2514,8 +3020,10 @@ class PrefillAdder:
         # (today's gate) so a tight pool cannot ping-pong it.
         if _pdflip_chunk_admit() and not getattr(req, "pdflip_parked_span", 0):
             from flliper.srt.pdflip.park import chunk_admit_tokens as _cat
+            # Q-700: the host load-back is not chunked -- charged whole
             total_tokens = (
-                _cat(cand_extend_input_len, self.rem_chunk_tokens)
+                _cat(cand_extend_input_len, self.rem_chunk_tokens,
+                     load_back=int(_pp_load_back_extent(req) or 0))
                 + max_new + self.page_size + mamba_gap_reserve
             )
         # Prefill-Spill (PS1-V1a): the born-spilled current-step demand is the
@@ -2535,8 +3043,18 @@ class PrefillAdder:
         # point inside the lock (`form_a_admission_follow`); everywhere else
         # the first failing gate returns exactly as before.
         _fa_follow = self.form_a_admission_follow
-        _gate = None
-        if total_tokens >= self.rem_total_tokens:
+        # H98d: this rank (the Form A host) found its match below the group
+        # depth planted at the top of the pass -- refused through the H105
+        # verdict on every rank (OTHER), or the H98 stop without a verdict.
+        _gate = _form_a_stale_vote_gate(self, req, _fa_follow)
+        _rem_total = self.rem_total_tokens
+        if (
+            _gate is None
+            and total_tokens >= _rem_total
+            and not self._cap_lifetime_waiver(
+                total_tokens, born_input_tokens, _rem_total
+            )
+        ):
             # Lifetime doesn't fit VRAM: wedge -- UNLESS Prefill-Spill can admit
             # it born-spilled (input transiently fits, a host region is free),
             # or -- PS2, the strict complement -- born-spilled DEEP (not even
@@ -2545,6 +3063,7 @@ class PrefillAdder:
                 req, born_input_tokens
             ) and not self._admit_born_spilled_deep(req, born_input_tokens):
                 _gate = AddReqResult.NO_TOKEN
+                self._note_lifetime_refusal(req, total_tokens, _rem_total)
 
         if _gate is None and self.is_hybrid_swa:
             swa_needed = self._swa_budget_for_req(
@@ -2569,7 +3088,14 @@ class PrefillAdder:
 
         with self._lock_node(req.last_node):
             # self.rem_total_tokens may decrease after the lock acquisition
-            if _gate is None and total_tokens >= self.rem_total_tokens:
+            _rem_total = self.rem_total_tokens if _gate is None else None
+            if (
+                _gate is None
+                and total_tokens >= _rem_total
+                and not self._cap_lifetime_waiver(
+                    total_tokens, born_input_tokens, _rem_total
+                )
+            ):
                 # Prefill-Spill: a prompt already admitted born-spilled at the
                 # pre-lock gate stays admitted as long as its input still fits
                 # the (possibly shrunk) device budget; otherwise wedge as usual.
@@ -2578,9 +3104,11 @@ class PrefillAdder:
                 # stays admitted (its host region was reserved at the pre-lock
                 # verdict, replicated on every rank).
                 if not req.born_spilled_deep and not (
-                    req.born_spilled and born_input_tokens < self.rem_total_tokens
+                    req.born_spilled and born_input_tokens < _rem_total
                 ):
                     _gate = AddReqResult.NO_TOKEN
+                    self._note_lifetime_refusal(req, total_tokens, _rem_total)
+                    self._pdflip_note_budget_parts(req, total_tokens, _rem_total)
 
             if _gate is None and self.is_hybrid_swa:
                 swa_needed = self._swa_budget_for_req(
@@ -2603,6 +3131,26 @@ class PrefillAdder:
                 getattr(_fa_follow, "host_decides_load_back", False)
             )
             if _fa_follow is not None and (_gate is not None or not _fa_host_first):
+                # H105d: under the token cut every rank's gate is REAL and is
+                # gathered (MIN) BEFORE any load-back -- so this rank's gate
+                # must already know whether it can pay its OWN load-back rows.
+                # H105f (NF h14 ba1d5becd7, D TP0 14:50:53, pdflip-0-3): H105d
+                # evicted THIS rank's room before the gather -- TP0 freed the
+                # device copy of pdflip-2-20's 163k session (#1469 EVICT
+                # node=43/42/38/37/36), then a worker's own gate refused
+                # (WORKER-GATE code=NO_TOKEN price=83239 budget=33536) and the
+                # request stayed queued; the session's next turn (pdflip-2-21)
+                # found its prefix host-only and wedged the server 317 s. Now a
+                # DRY vote (room makeable here?), the gather, and only on the
+                # group's ADMIT the eviction plus a second gather confirming
+                # the room. Both gathers are entered by every rank alike (the
+                # first's verdict is the group's).
+                # FLLIPER_PDFLIP_H105F_VOTE_BEFORE_EVICT=0: the old order.
+                _h105f = _h105f_on()
+                if _gate is None and not _h105d_cut_load_back_room(
+                    self, req, evict=not _h105f
+                ):
+                    _gate = AddReqResult.NO_TOKEN
                 # H105: after every rank-local gate and BEFORE the load-back
                 # (and the tail-adopt vote behind it) -- the one point every
                 # rank of the group reaches for this rid. The host's verdict
@@ -2611,6 +3159,14 @@ class PrefillAdder:
                 _gate = _fa_follow(
                     req, _gate, int(total_tokens), int(self.rem_total_tokens)
                 )
+                if _h105f_confirm_due(_gate, _h105f):
+                    _room = _h105d_cut_load_back_room(self, req, evict=True)
+                    _gate = _fa_follow(
+                        req,
+                        None if _room else AddReqResult.NO_TOKEN,
+                        int(total_tokens),
+                        int(self.rem_total_tokens),
+                    )
                 _fa_host_first = False
             if _gate is not None:
                 return _gate
@@ -2663,18 +3219,24 @@ class PrefillAdder:
                 _h106_d0 = int(
                     getattr(self.tree_cache, "_pdflip_loadback_drained_total", 0) or 0
                 )
-                new_indices, req.last_node = self.tree_cache.init_load_back(
-                    InitLoadBackParams(
-                        best_match_node=req.best_match_node,
-                        # THE TOLD EXTENT, NOT THIS RANK'S OWN HIT. On
-                        # `pp_size <= 1` the two are the same value by
-                        # construction (`_pp_load_back_extent` returns the
-                        # local hit there), so upstream's path is byte-for-byte
-                        # what it was.
-                        host_hit_length=_lb_extent,
-                        req=req,
+                # H98e: past a gathered/followed ADMIT the load-back decides
+                # its room from the live pool on the FIRST attempt (H105c's
+                # follow-room), never through the xsn285 full drain.
+                with _form_a_admit_taken_room(
+                    self.tree_cache, _fa_follow is not None and not _fa_host_first
+                ):
+                    new_indices, req.last_node = self.tree_cache.init_load_back(
+                        InitLoadBackParams(
+                            best_match_node=req.best_match_node,
+                            # THE TOLD EXTENT, NOT THIS RANK'S OWN HIT. On
+                            # `pp_size <= 1` the two are the same value by
+                            # construction (`_pp_load_back_extent` returns the
+                            # local hit there), so upstream's path is
+                            # byte-for-byte what it was.
+                            host_hit_length=_lb_extent,
+                            req=req,
+                        )
                     )
-                )
                 PDFLIP_ADMIT_T["lb_ms"] += (time.perf_counter() - _lb_t0) * 1000.0
                 if _fa_host_first:
                     req._h106_host_drained = max(

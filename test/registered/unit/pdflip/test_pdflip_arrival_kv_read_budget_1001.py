@@ -34,6 +34,16 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 from test_pdflip_arrival_seat_rule_0929 import _front, _on, _pending  # noqa: E402
 
 from flliper.srt.pdflip import arrival_seat_rule as asr  # noqa: E402
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _pbound_flip_now_off(monkeypatch):
+    """These tests pin the seat/KV verdict and the dwell holds for requests that
+    need P -- the rule PBOUND-FLIP-NOW (default on, 02.10.) replaces; they keep
+    covering it as the switch-off path."""
+    monkeypatch.setenv("FLLIPER_PDFLIP_PBOUND_FLIP_NOW", "0")
+
 
 FITS = {"available": 400000, "evictable": 0}       # pdflip-14-90's ladder: free 436000
 SHORT = {"available": 1000, "evictable": 0}
@@ -139,7 +149,10 @@ def test_no_reading_still_waits_for_d_and_a_pre_park_read_never_lands():
         st = f._asr_st()
         st["kv"] = (time.time() - 3.0, SHORT)
         f.session.delay = 0.3
-        assert await f._arrival_seat_kv_reading() == SHORT          # stale, refresh in flight
+        # EZ-S1 (plan A10): a reading older than FLLIPER_PDFLIP_KV_FRESH_MS (1 s) is ABSENT, never a number -- the seat
+        # plan decides alone (kv=absent). With the switch off (rc17) the last reading decided.
+        assert await f._arrival_seat_kv_reading() is None           # stale, refresh in flight: no number
+        assert f.counters["arrival_seat_kv_absent"] == 1
         old = st["kv_task"][1]
         f._asr_kv_invalidate()                                       # a KV park happened
         f.session.reading, f.session.delay = FITS, 0.05
@@ -150,3 +163,20 @@ def test_no_reading_still_waits_for_d_and_a_pre_park_read_never_lands():
         assert st["kv"][1] == FITS                                   # ... and never lands
 
     asyncio.run(run())
+
+
+def test_switch_off_the_last_reading_decides_as_in_rc17():
+    """EZ-S1: with FLLIPER_PDFLIP_EXACT_CLASS off the budget's old rule stands -- a stale reading decides while its refresh
+    is in flight (the byte-for-byte rc17 behaviour)."""
+    from flliper.srt.environ import envs
+
+    with envs.FLLIPER_PDFLIP_EXACT_CLASS.override(False):
+        f = _real_reader(_front(running=["a"], n=6), _Session(SHORT, delay=0.0))
+
+        async def run():
+            await f._arrival_seat_kv_reading()
+            f._asr_st()["kv"] = (time.time() - 3.0, SHORT)
+            f.session.delay = 0.3
+            assert await f._arrival_seat_kv_reading() == SHORT
+
+        asyncio.run(run())

@@ -172,7 +172,102 @@ def deliverable_evictable(cache, base_ct) -> int:
     reported = int(cache.component_evictable_size_.get(base_ct, 0) or 0)
     if not deliverable_enabled() or getattr(cache, EXEMPT_ATTR, False):
         return reported
-    return max(0, reported - blocked_tokens_memo(cache, base_ct))
+    held = max(blocked_tokens_memo(cache, base_ct), known_unpayable(cache, base_ct))
+    return max(0, reported - held)
+
+
+# ---------------------------------------------------------------------------
+# PW (NF int18 1008, D log boot_weg2_dkrnfint4h6ablxcbar1dauer10081149_
+# e69f28a7f6_1008_115011.D.log): the BACKUP WALL. The peel pays a write_back
+# leaf only by backing it up first; with the host arena full (``#1427
+# ARENA-DROP need=1052 freed=0 stages=i:0,ii:0,iii:0``) every such leaf is
+# refused and the peel delivers nothing while the tree keeps REPORTING it:
+# ``EVICT-FRONTIER-CENSUS request=31552 delivered_before=0
+# delivered_after_repair=0 reported_evictable=182528 ... aux_locked={}``
+# (12:15:00Z TP0). Two readers of the same capacity then disagreed:
+# ``SEAT-AGE ... need=182428 free=190528 -> fits free, nobody leaves`` against
+# ``H105d FORM-A-CUT LOAD-BACK ROOM need=180928 available=144832 evicted=0``,
+# and the cut re-ran the futile peel (two backup attempts per leaf, the
+# census scan) in EVERY scheduler round: host gap 5-9 ms -> 124-129 ms per
+# decode round, decode 100 -> 35 tok/s; at running=0 the group stood still
+# (12:27:36-12:29:52, ``available=1408 reported_evictable=507136``).
+#
+# THE RULE: a peel that ended short (after the census' repair retry) MEASURED
+# that whatever the tree still reports evictable cannot be paid now. That
+# remainder is kept as the KNOWN-UNPAYABLE count until an input of the wall
+# moves -- the tree's evictable/protected counts, the aux lock set, the host
+# arena's free room, the write-throughs in flight -- or ``UNPAYABLE_TTL_S``
+# passed (then the next peel measures again). The deliverable count (ED) and
+# the cut subtract it, so every admission reader prices the same capacity the
+# load-back actually gets.
+# ---------------------------------------------------------------------------
+#: cache attribute: ``(key, unpayable_tokens, monotonic_t)`` of the last short peel.
+UNPAYABLE_ATTR = "_ef_unpayable_memo"
+#: a measured wall is re-measured at the latest after this many seconds, even
+#: when none of its inputs moved (a missed input costs one peel, not a wedge).
+UNPAYABLE_TTL_S = 2.0
+
+
+def _host_free_reading(cache):
+    """The host tier's free room as its pool reports it (the arena's free slot
+    tokens on an arena pool); None when the cache has no host pool."""
+    cc = getattr(cache, "cache_controller", None)
+    pool = getattr(cc, "mem_pool_host", None) if cc is not None else None
+    if pool is None:
+        return None
+    try:
+        return int(pool.available_size())
+    except Exception:  # noqa: BLE001 -- no reading: the key carries None
+        return None
+
+
+def _unpayable_key(cache, base_ct) -> tuple:
+    return (
+        int(cache.component_evictable_size_.get(base_ct, 0) or 0),
+        int(getattr(cache, "component_protected_size_", {}).get(base_ct, 0) or 0),
+        int(getattr(cache, "_ef_aux_version", 0) or 0),
+        _host_free_reading(cache),
+        len(getattr(cache, "ongoing_write_through", None) or ()),
+    )
+
+
+def note_peel_short(cache, base_ct, now=None) -> int:
+    """Called where a peel ended short of its request AFTER the census'
+    repair retry: the tokens the tree still reports evictable are unpayable
+    as long as the wall's inputs stand. Returns the count kept."""
+    import time
+
+    remainder = int(cache.component_evictable_size_.get(base_ct, 0) or 0)
+    t = time.monotonic() if now is None else float(now)
+    try:
+        setattr(cache, UNPAYABLE_ATTR, (_unpayable_key(cache, base_ct), remainder, t))
+    except Exception:  # noqa: BLE001 -- a cache that takes no attribute keeps the reported count
+        return 0
+    return remainder
+
+
+def known_unpayable(cache, base_ct, now=None) -> int:
+    """The KNOWN-UNPAYABLE evictable tokens: the last short peel's remainder
+    while the wall's inputs are unchanged and the measurement is younger than
+    ``UNPAYABLE_TTL_S``; 0 otherwise (and 0 on a cache that never had a short
+    peel -- byte-identical to the pre-PW count there)."""
+    import time
+
+    memo = getattr(cache, UNPAYABLE_ATTR, None)
+    if not isinstance(memo, tuple) or len(memo) != 3:
+        return 0
+    key, val, t = memo
+    t_now = time.monotonic() if now is None else float(now)
+    if t_now - float(t) > UNPAYABLE_TTL_S or key != _unpayable_key(cache, base_ct):
+        return 0
+    return max(0, int(val))
+
+
+def payable_evictable(cache, base_ct, now=None) -> int:
+    """The reported FULL-evictable count minus the known-unpayable remainder,
+    on EVERY rank (no ED exemption): what a peel asked now can pay at most."""
+    reported = int(cache.component_evictable_size_.get(base_ct, 0) or 0)
+    return max(0, reported - known_unpayable(cache, base_ct, now=now))
 
 
 def census_and_repair(cache, base_ct) -> Dict[str, object]:
@@ -226,3 +321,91 @@ def log_census(c: Dict[str, object], request: int, got_before: int, got_after: i
         int(c["device_child_tokens"]), int(c["leaves_before"]), int(c["leaves_after"]),
         int(c["stale_added"]), c["aux_locked_ids"], int(c["nodes"]),
     )
+
+
+# ---------------------------------------------------------------------------
+# F1 (nf-next-1006-01): evictable tokens ABOVE the engaged residency cap
+# ---------------------------------------------------------------------------
+#: allocator attribute the stage cap (``KvRowCap``) is kept on (d_seat_vram.py
+#: ``_engage_kv_cap``); the only cap setter on the NF D boot.
+STAGE_CAP_ATTR = "_pdflip_kv_stage_cap"
+#: cache attribute: the last scan, ``(cap_pages, monotonic_t, value)``.
+_ABOVE_MEMO_ATTR = "_ef_cap_above_memo"
+#: a repeat scan under the SAME cap is reused for this long (seconds). The
+#: scan walks every tree node and reads one device tensor; the number only
+#: falls while a shrink is pending (evictions peel the high leaves) and a cap
+#: change always rescans, so a reused value is stale on the HIGH side (the
+#: admission parks a little longer, never admits more).
+_ABOVE_TTL_S = 0.25
+
+
+def engaged_cap_pages(allocator):
+    """The engaged residency cap of ``allocator`` in PAGES (the unit of its
+    free-list ids), or None when no cap is engaged (then nothing is above)."""
+    cap = getattr(allocator, STAGE_CAP_ATTR, None) if allocator is not None else None
+    if cap is None:
+        return None
+    try:
+        if not bool(cap.engaged) or cap.cap is None:
+            return None
+        return int(cap.cap)
+    except Exception:  # noqa: BLE001 - a stand-in without the cap protocol has none
+        return None
+
+
+def above_cap_tokens(cache, base_ct, cap_pages: int, page_size: int) -> int:
+    """FULL-evictable device tokens whose slot lies ABOVE page id ``cap_pages``.
+
+    The pool hands out only free ids at or below the cap (``KvRowCap`` pulls
+    every freed id above it straight back out of the free list), so a leaf the
+    peel frees up there pays the TREE and the POOL nothing. A token slot ``s``
+    belongs to page ``s // page_size``; page ids are 1-based and a page is above
+    the cap when its id is greater than ``cap_pages`` (``free_tokens_below``,
+    d_seat_vram.py, counts ``ids <= cap``).
+
+    One scan over the unlocked FULL nodes (the census' own definition of
+    evictable) and ONE device read. Rank-LOCAL by construction: slot ids are the
+    rank's own, which is why the caller pins it through the group MIN."""
+    import torch
+
+    root = cache.root_node
+    vals = []
+    for n in cache._collect_all_nodes():
+        if n is root or getattr(n, "evicted", False):
+            continue
+        cd = n.component_data[base_ct]
+        if cd.value is None or cd.lock_ref > 0 or len(cd.value) == 0:
+            continue
+        vals.append(cd.value)
+    if not vals:
+        return 0
+    flat = torch.cat([v if isinstance(v, torch.Tensor) else torch.as_tensor(v, dtype=torch.int64)
+                      for v in vals])
+    lim = (int(cap_pages) + 1) * max(1, int(page_size))
+    return int((flat >= lim).sum().item())
+
+
+def cap_above_tokens_memo(cache, base_ct, allocator, page_size: int) -> int:
+    """:func:`above_cap_tokens` for the engaged cap of ``allocator`` (0 without
+    one), rescanned on a cap change or after ``_ABOVE_TTL_S``. Never raises: a
+    failed scan reads 0 = the pre-F1 behaviour (the guard then counts what it
+    always counted)."""
+    import time
+
+    cap = engaged_cap_pages(allocator)
+    if cap is None:
+        return 0
+    now = time.monotonic()
+    memo = getattr(cache, _ABOVE_MEMO_ATTR, None)
+    if memo is not None and memo[0] == cap and now - memo[1] < _ABOVE_TTL_S:
+        return memo[2]
+    try:
+        val = above_cap_tokens(cache, base_ct, cap, page_size)
+    except Exception:  # noqa: BLE001 - an admission input must not raise
+        logger.warning("CAP-BLIND-ADMIT scan failed; counted as 0 above the cap", exc_info=True)
+        val = 0
+    try:
+        setattr(cache, _ABOVE_MEMO_ATTR, (cap, now, val))
+    except Exception:  # noqa: BLE001
+        pass
+    return val

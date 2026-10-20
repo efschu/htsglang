@@ -50,6 +50,8 @@ import time
 from dataclasses import dataclass
 from typing import Mapping as _Map, Optional
 
+from flliper.srt.pdflip.host_pause import PauseAwareDeadline
+
 logger = logging.getLogger(__name__)
 
 ENV_ON = "FLLIPER_PDFLIP_BAR1_LANES"
@@ -274,6 +276,8 @@ def take_flag(d: str, kind: str, seq, g: int, timeout_s: float,
     t0 = time.perf_counter()
     n = 0
     next_tick = t0 + SPILL_TICK_S
+    # W68: the hot poll's slice is ~20 us; a host freeze shows as one huge gap
+    dl = PauseAwareDeadline(timeout_s, 0.05, what="bar1-flag", clock=time.perf_counter)
     while True:
         if on_tick is not None and time.perf_counter() >= next_tick:
             next_tick = time.perf_counter() + SPILL_TICK_S
@@ -287,7 +291,7 @@ def take_flag(d: str, kind: str, seq, g: int, timeout_s: float,
         except FileNotFoundError:
             pass
         n += 1
-        if time.perf_counter() - t0 > timeout_s:
+        if dl.left() < 0:
             return None
         if on_slow is not None and time.perf_counter() - t0 > SLOW_WAIT_S:
             on_slow()
@@ -375,15 +379,16 @@ class SocketCredits:
     def _read(self, n: int, timeout_s: float) -> Optional[bytes]:
         buf = b""
         t_wait0 = time.monotonic()
-        deadline = t_wait0 + float(timeout_s)
         slow_sent = False
         # W109b (02.10., NF y6u): a depositor's wait asks its cycle question
         # every SPILL_TICK_S -- with the old 0.5-s socket slice the metal path
         # (credits=sock) asked only every 0.5 s whatever SPILL_TICK_S said.
         # Waits without a tick question keep the 0.5-s slice.
         slice_s = SPILL_TICK_S if self.on_tick is not None else 0.5
+        # W68 (NF 14.10. 12:17Z): a host freeze is not the peer's time
+        dl = PauseAwareDeadline(timeout_s, slice_s, what="bar1-sock")
         while len(buf) < n:
-            left = deadline - time.monotonic()
+            left = dl.left()
             if left <= 0:
                 return None
             self.sock.settimeout(min(left, slice_s))
@@ -622,6 +627,16 @@ def spill_grace_s() -> float:
     except (TypeError, ValueError):
         g = 0.1
     return min(max(0.5, cycle_grace_s() / 3.0), max(0.05, g))
+
+
+def own_edge_on() -> bool:
+    """y7z: a blocked depositor counts its OWN live wait as a cycle edge from
+    the wait's start (FLLIPER_PDFLIP_BAR1_SPILL_OWN_EDGE)."""
+    from flliper.srt.environ import envs
+    try:
+        return bool(envs.FLLIPER_PDFLIP_BAR1_SPILL_OWN_EDGE.get())
+    except Exception:  # noqa: BLE001 -- the desk may lack the knob
+        return False
 
 
 def credit_cycle(me: int, waits: dict, blocked: dict, grace_s: float, now: float):
@@ -908,18 +923,36 @@ class Bar1Lanes:
         return credit_cycle(self.rank, self.read_credit_waits(), self.read_blocked(), g, time.time())
 
     # -- W109b: the depositor's half of the cycle ------------------------
-    def deposit_cycle(self, grace_s: Optional[float] = None):
+    def deposit_cycle(self, grace_s: Optional[float] = None, own=None):
         """The waker credit cycle one of whose edges is THIS rank's blocked
         deposit, or None. Read from the depositor's side: the wakers are the
         other group, the blocked flags are the ones this group posted into
         it. ``grace_s`` defaults to :func:`spill_grace_s` -- the sleeper has
         to act (``_spill_rest``) long before the waker refuses, and the chain
-        cannot dissolve on its own, so it acts as soon as the flags agree."""
+        cannot dissolve on its own, so it acts as soon as the flags agree.
+
+        ``own`` = ``(dst, seq, since)``: THIS rank's live credit wait, aged
+        from its START (see :func:`own_edge_on`) instead of from its
+        ``blocked`` flag, which goes up only after SLOW_WAIT_S."""
         g = spill_grace_s() if grace_s is None else float(grace_s)
         other = other_group(self.group)
         waits = self.read_credit_waits(other)
         blocked = self.read_blocked(other)
         now = time.time()
+        if own is not None:
+            # y7z (02.10., A/B 7cwk87): the depositor's own edge is a fact in
+            # this process, not a flag to read back. The flag's 0.5-s delay put
+            # 0.6 s of deposit stall on every cycled D->P wake (sleeper blocked
+            # depositing to a waker that sits in its own credit wait for the
+            # first claim); the draft-park skip (D sleeps ~120 ms earlier) made
+            # that the common case -- P first claims 787-1788 ms, D>P layer
+            # 3.5-3.8 s. A posted flag older than the wait start wins.
+            dst, seq, since = own
+            key = (int(self.rank), int(dst))
+            prev = blocked.get(key)
+            if prev is None or float(prev.get("since", now)) > float(since):
+                blocked = dict(blocked)
+                blocked[key] = {"seq": str(seq), "since": float(since), "own": True}
         for w in sorted(waits):
             chain = credit_cycle(w, waits, blocked, g, now)
             if chain and any(int(s) == self.rank for s, _d, _t in chain):
@@ -964,10 +997,10 @@ class Bar1Lanes:
         """Wait until every spilled tag of every lane is fed (the sleep leg's
         end, after the last pause -- nothing on this rank blocks a waker any
         more). Returns "" or the feeders' refusals."""
-        deadline = time.monotonic() + float(budget_s)
+        dl = PauseAwareDeadline(budget_s, 0.5, what="w109b-backlog")
         with self.backlog_cv:
             while self.backlog:
-                left = deadline - time.monotonic()
+                left = dl.left()
                 if left <= 0:
                     return (f"W109b backlog: {sorted(self.backlog)} still feeding after "
                             f"{budget_s:.0f} s")
@@ -1016,13 +1049,13 @@ class Bar1Lanes:
         if order_key is None:
             return True
         key = (int(order_key[0]), int(order_key[1]))
-        deadline = time.monotonic() + float(timeout_s)
+        dl = PauseAwareDeadline(timeout_s, 0.5, what="lane-turn")
         with self.turn_cv:
             while True:
                 pend = self.turn.get(lane_key) or set()
                 if key not in pend or min(pend) == key:
                     return True
-                left = deadline - time.monotonic()
+                left = dl.left()
                 if left <= 0:
                     return False
                 self.turn_cv.wait(min(left, 0.5))
@@ -1465,12 +1498,15 @@ def run_bar1_units(descs, ops, *, lanes: Bar1Lanes, lane_key: str, role: str,
 
 
 def _recv_marked(cred, kind: str, g: int, budget_s: float, d: str, seq, lane_key: str,
-                 rank: int, wait: str, on_tick=None):
+                 rank: int, wait: str, on_tick=None, own_state=None):
     """The depositor's credit wait; longer than SLOW_WAIT_S it posts a
     `blocked` flag (#22) the wakers' cycle reader sees, removed on return.
     ``on_tick`` (W109b): asked while the wait lasts; truthy raises
-    _CycleSpill (the flag is removed on that exit too)."""
+    _CycleSpill (the flag is removed on that exit too). ``own_state`` (y7z):
+    a dict the tick reads; carries this wait's start while it lasts."""
     posted = []
+    if own_state is not None:
+        own_state["since"] = time.time()
 
     def slow():
         if not posted:
@@ -1488,6 +1524,8 @@ def _recv_marked(cred, kind: str, g: int, budget_s: float, d: str, seq, lane_key
     finally:
         cred.on_slow = None
         cred.on_tick = None
+        if own_state is not None:
+            own_state.pop("since", None)
         if posted:
             try:
                 os.unlink(_flag_path(d, "blocked", seq, g))
@@ -1546,9 +1584,15 @@ def lane_streams(ops, device: int, ring: int):
 def _run_bar1_tag(descs, ops, lanes, lane_key, role, seq, phase, no_write, liveness,
                   budget_s, device, log, base, slot_bytes, ring, batches, tp) -> str:
     with lane_streams(ops, device, ring) as streams:
-        return _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase,
-                                      no_write, liveness, budget_s, device, log, base,
-                                      slot_bytes, ring, batches, tp, streams)
+        try:
+            return _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase,
+                                          no_write, liveness, budget_s, device, log, base,
+                                          slot_bytes, ring, batches, tp, streams)
+        finally:
+            # FLIPCYCLE H4: the top lane's streams go now -- no peer may sync them
+            _g = getattr(lanes, "_engine_gate", None)
+            if _g is not None and role == "src":
+                _g.retire(lane_key)
 
 
 def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_write,
@@ -1574,6 +1618,16 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
     sync_q = sync_query_mode(ops)
     cblocks = sm_blocks() if copier is not None else 0
     slow = 0          # this tag's bytes that could not take the 16-B SM path
+    # FLIPCYCLE H4: fast-receiver-first on this card's one D2H engine
+    _gate = None
+    _gate_ms = 0.0
+    if role == "src":
+        try:
+            from flliper.srt.pdflip import lane_priority as _lp
+
+            _gate = _lp.gate_for(lanes)
+        except Exception:  # noqa: BLE001 - the gate never fails a transfer
+            _gate = None
     t0 = time.perf_counter()
     span = span_open(lane_key, t0)
     clk = LaneClock()
@@ -1609,10 +1663,20 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
     # the cycle is gone. The collector's protocol is unchanged.
     tick_state: dict = {}
     tick = None
+    _own_dst = None
+    if role == "src" and own_edge_on():
+        try:
+            _own_dst = int(lanes.cross_pairs[int(str(lane_key)[1:])][1])
+        except (AttributeError, ValueError, IndexError, TypeError):
+            _own_dst = None
     if role == "src" and hasattr(lanes, "deposit_cycle") and hasattr(lanes, "backlog_push"):
         def tick():
             try:
-                chain = lanes.deposit_cycle()
+                _since = tick_state.get("since")
+                if _own_dst is not None and _since is not None:
+                    chain = lanes.deposit_cycle(own=(_own_dst, seq, _since))
+                else:
+                    chain = lanes.deposit_cycle()
             except Exception:  # noqa: BLE001 -- a probe may not raise
                 chain = None
             if chain:
@@ -1735,7 +1799,7 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
                     tw = time.perf_counter()
                     try:
                         got_free = _recv_marked(cred, "free", g - ring, budget_s, d, seq, lane_key,
-                                                lanes.rank, "free", on_tick=tick)
+                                                lanes.rank, "free", on_tick=tick, own_state=tick_state)
                     except _CycleSpill:
                         clk.credit += time.perf_counter() - tw
                         return _spill_rest(g, g - ring, plan_sent=True,
@@ -1744,6 +1808,8 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
                         return (f"bar1 deposit lane={lane_key} seq={seq}: no 'free' for batch "
                                 f"{g - ring} within {budget_s:.0f} s (collector gone or stuck)")
                     clk.credit += time.perf_counter() - tw
+                if _gate is not None:
+                    _gate_ms += _gate.before_issue(lane_key, ops)
                 ti = time.perf_counter()
                 for piece in batch.pieces:
                     desc = descs[piece.desc_index]
@@ -1769,6 +1835,8 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
                         out_cp2d(dst, int(piece.run_bytes), src, int(piece.spitch),
                                  int(piece.run_bytes), int(piece.rows), stream)
                 clk.issue += time.perf_counter() - ti
+                if _gate is not None:
+                    _gate.issued(lane_key, stream)
                 if g >= lag:
                     _finish(g - lag)
                 continue
@@ -1840,7 +1908,7 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
                 for g in range(max(0, nb - ring), nb):
                     try:
                         got_free = _recv_marked(cred, "free", g, budget_s, d, seq, lane_key,
-                                                lanes.rank, "trailing-free", on_tick=tick)
+                                                lanes.rank, "trailing-free", on_tick=tick, own_state=tick_state)
                     except _CycleSpill:
                         # every byte is in the ring already: the backlog only waits
                         return _spill_rest(nb, g, plan_sent=True)
@@ -1849,7 +1917,7 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
                                 f"batch {g} within {budget_s:.0f} s")
             try:
                 got_done = _recv_marked(cred, "done", 0, budget_s, d, seq, lane_key,
-                                        lanes.rank, "done", on_tick=tick)
+                                        lanes.rank, "done", on_tick=tick, own_state=tick_state)
             except _CycleSpill:
                 return _spill_rest(nb, nb, plan_sent=True)
             if got_done is None:
@@ -1876,6 +1944,10 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
         f"lag={lag} prep_ms={prep_s * 1000:.0f}"
         + (f" issue_gil={gil_mode}" if gil_mode else "")
         + f" sync_query={'held' if sync_q else 'off'} sync_skipped={clk.sync_skipped}/{clk.syncs}")
+    if _gate is not None and _gate_ms > 0:
+        log(f"PDFLIP-FLIPCYCLE stage=legs_engine lane={lane_key} seq={seq} top={_gate.top} "
+            f"ms={_gate_ms:.0f} floor_ms=0 (H4: this slower-receiver lane yielded the D2H "
+            f"engine to the lane into the widest receiver)")
     return ""
 
 

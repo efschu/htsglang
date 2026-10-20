@@ -78,7 +78,11 @@ def test_the_manual_park_names_itself_and_parks_the_running_decode(caplog):
     fake = types.SimpleNamespace(
         _park_attempt_epoch=None, epoch=38, groups={"D": D}, admit_d=True,
         counters=collections.Counter(), _ready_for_d=[], queue=[], _park_unsupported=False,
-        d_wait_bound_s=60.0, rpc=_rpc, _d_parked={})
+        d_wait_bound_s=60.0, rpc=_rpc, _d_parked={},
+        # Later park bookkeeping the verdict path calls on self (no-ops here).
+        _d_inflight_park=lambda depths: None, _seq_park=lambda marks: None,
+        _park_handback=lambda rids: None,
+        _ipc_dp_clock=lambda: types.SimpleNamespace(note_park=lambda *args: None))
     fake._flip_ledger = lambda g: [r for r in g.outstanding if r not in fake._d_parked]
     with caplog.at_level(logging.WARNING):
         verdict = _run(fr.Front._wait_bound_park(fake, None, cause=fr.MANUAL_FLIP_PARK_CAUSE))

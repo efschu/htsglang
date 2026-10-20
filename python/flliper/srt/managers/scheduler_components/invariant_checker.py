@@ -65,6 +65,19 @@ BUSY_MEM_CHECK_LOG_RING_SIZE = 1000
 LEAK_WARN_LOG_INTERVAL = 1000
 
 
+def idle_mamba_check_every(*, group: str, every: int) -> int:
+    """D-IDLE-MAMBA-1007: on how many idle passes the Mamba pool ledger runs
+    once. ``every`` (``FLLIPER_PDFLIP_IDLE_MAMBA_CHECK_EVERY``) binds group D
+    alone; any other group -- the flip path's included -- checks on every
+    pass, as before. The ledger is rank-local (allocator free list, the
+    rank's own radix tree, no collective), so a rank that skips a pass cannot
+    disagree with one that does not; a leak is reported up to ``every - 1``
+    idle passes later, never missed."""
+    if group.strip().upper() != "D":
+        return 1
+    return max(1, int(every))
+
+
 def _dcp_global_slot_total(
     server_args: ServerArgs,
     allocator: BaseTokenToKVPoolAllocator,
@@ -117,6 +130,10 @@ class SchedulerInvariantChecker:
     #: may actually run, and what it cost when it did. See the module
     #: docstring of `idle_census_cadence` for the boot this exists for.
     idle_census: IdleCensusCadence = field(default_factory=IdleCensusCadence)
+    #: D-IDLE-MAMBA-1007: :func:`idle_mamba_check_every`; 1 = every pass.
+    idle_mamba_check_every: int = 1
+    #: idle passes seen, for :meth:`take_idle_mamba_turn`
+    idle_mamba_passes: int = 0
     #: nf-poolleak-1011 (Commit B): the terms of the LAST full-pool ledger
     #: evaluation, ``(available, evictable, protected, session_held, uncached,
     #: withheld, total, page_size)`` in TOKENS, so ``_report_leak`` can name the
@@ -1033,6 +1050,16 @@ class SchedulerInvariantChecker:
     def _report_leak(self, pool_name: str, token_msg: str):
         strict = envs.FLLIPER_ENABLE_STRICT_MEM_CHECK_DURING_IDLE.get()
         msg = f"{pool_name} memory leak detected! {token_msg}"
+        # POOLLEAK-INSTR (3), FLLIPER_PDFLIP_POOLLEAK_INSTR (default off): the
+        # leaked full ids minus the KvRowCap-withheld ids -- the rows nobody
+        # owns, by id (y9nf6 b3: 92800 listed = 92672 withheld + 128). Log only.
+        from flliper.srt.pdflip import poolleak_instr
+
+        if poolleak_instr.enabled() and (not strict or self.leak_detail_due()):
+            line = poolleak_instr.unwithheld_leak_ids(self._allocator(), self.tree_cache)
+            if line:
+                logger.error("%s", line)
+                msg += "\n" + line
         if strict:
             # USER ORDER 11.10.2026 ("er soll warnen und weitermachen"): THE LEAK
             # CHECK NEVER KILLS THE SERVER. The idle ledger used to raise here
@@ -1059,8 +1086,19 @@ class SchedulerInvariantChecker:
             msg,
         )
 
+    def take_idle_mamba_turn(self) -> bool:
+        """Count one idle pass; True on the passes whose Mamba ledger runs
+        (the first, then every ``idle_mamba_check_every``-th)."""
+        due = self.idle_mamba_passes % self.idle_mamba_check_every == 0
+        self.idle_mamba_passes += 1
+        return due
+
     def _check_all_pools(
-        self, ps: PoolStats, uncached: int = 0, allow_enumeration: bool = True
+        self,
+        ps: PoolStats,
+        uncached: int = 0,
+        allow_enumeration: bool = True,
+        check_mamba: bool = True,
     ) -> Tuple[bool, List[str]]:
         """Check memory invariant across all pools. Returns (has_leak, messages).
 
@@ -1068,6 +1106,9 @@ class SchedulerInvariantChecker:
         message already queued, so the O(1) ledger still runs but the row
         census that would explain a disagreement is postponed rather than
         made to compete with the loop's service of that message.
+
+        ``check_mamba=False`` is D-IDLE-MAMBA-1007: this idle pass is not the
+        Mamba ledger's turn (:meth:`take_idle_mamba_turn`).
         """
         has_leak = False
         messages = []
@@ -1083,7 +1124,7 @@ class SchedulerInvariantChecker:
             has_leak |= swa_leak
             messages.append(swa_msg)
 
-        if self.is_hybrid_ssm and self.tree_cache.supports_mamba():
+        if check_mamba and self.is_hybrid_ssm and self.tree_cache.supports_mamba():
             mamba_leak, mamba_msg = self._check_mamba_pool(ps)
             has_leak |= mamba_leak
             messages.append(mamba_msg)

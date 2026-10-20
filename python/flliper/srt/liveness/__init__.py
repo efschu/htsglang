@@ -31,6 +31,7 @@ from flliper.srt.liveness.grace import (
     ResourceClaim,
     global_attachment_registry,
 )
+from flliper.srt.liveness.hold import HoldRegistry, global_hold_registry
 from flliper.srt.liveness.ledger_bridge import (
     LedgerGraceBridge,
     attach_ledger_grace_bridge,
@@ -64,6 +65,7 @@ __all__ = [
     "DEFAULT_TIMEOUTS_S",
     "DEFAULT_TIMEOUT_RATIONALE",
     "EndpointClass",
+    "HoldRegistry",
     "LedgerGraceBridge",
     "LivenessConfig",
     "LivenessPolicy",
@@ -73,6 +75,7 @@ __all__ = [
     "await_with_liveness",
     "claims_for_rids",
     "global_attachment_registry",
+    "global_hold_registry",
     "global_liveness_config",
     "guard_generate_stream",
     "guard_streaming_response",

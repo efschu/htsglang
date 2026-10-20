@@ -162,6 +162,13 @@ def _req(rid, device, fill):
     return req
 
 
+def _room_first(on):
+    """H98e's switch (FLLIPER_PDFLIP_ENABLE_FORM_A_ADMIT_ROOM_FIRST)."""
+    from flliper.srt.environ import envs
+
+    return envs.FLLIPER_PDFLIP_ENABLE_FORM_A_ADMIT_ROOM_FIRST.override(on)
+
+
 def _install(adder, sched, tp_rank):
     with patch.object(m, "form_a_follow_active", return_value=True), patch.object(
         m, "this_rank_follows", return_value=tp_rank != 0
@@ -204,6 +211,14 @@ class FollowLoadBackTest(unittest.TestCase):
             sched._form_a_extend_set_riegel(adder.can_run_list)
 
     def test_rc12z30g_workers_follow_the_admit_and_the_riegel_agrees(self):
+        # H98e: switched on (default) the worker's FIRST load-back already makes
+        # its own room; off, the first attempt is the floor's and the H105c
+        # retry follows -- both must end in the same admission.
+        for room_first, seen in ((False, [False, True]), (True, [True])):
+            with self.subTest(room_first=room_first), _room_first(room_first):
+                self._rc12z30g(seen)
+
+    def _rc12z30g(self, seen):
         ch = _Channel()
         host = self._loop(ch, 0)
         self.assertEqual([r for r, _ in host[2]], [RID_304, RID_305])
@@ -219,8 +234,8 @@ class FollowLoadBackTest(unittest.TestCase):
             self.assertEqual(w[2][1][1], AddReqResult.NO_TOKEN)  # followed the host
             self.assertEqual([q.rid for q in w[0].can_run_list], [RID_304])
             self.assertEqual(len(w[3][0].prefix_indices), DEPTH_304)
-            # the retry made its own room; the first attempt did not
-            self.assertEqual(w[0].tree_cache.follow_room_seen, [False, True])
+            # the worker made its own room (off: on the retry only)
+            self.assertEqual(w[0].tree_cache.follow_room_seen, seen)
             self._riegel(w[1], w[0], r)  # base: FormAAdmissionSplit MALFORMED
         self.assertEqual(ch.read, {1: 3, 2: 3})
 

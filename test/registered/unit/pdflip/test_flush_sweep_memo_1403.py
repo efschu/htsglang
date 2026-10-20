@@ -1,0 +1,156 @@
+# SPDX-License-Identifier: Apache-2.0
+"""1403 (NF nf9 1004_105315): the flush publish sweep's no-progress memo.
+
+DER BEFUND (nf9 P.log, Zeilen 144024/144160/144297/144421): each quiesce
+``/flush_cache`` poll ran one full #1470 publish sweep whose rounds issued
+nothing (host arena full, ARENA-DROP freed=0): "PDFLIP PUBLISH-SWEEP n=5707
+unbacked=18 issued=0 refused=18 ... sweep_ms=1221.1 issue_ms=1219.8" and
+"#1470 FLUSH-PUBLISH issued=0 unbacked_left=18 waited_ms=1221" -- four
+identical ~1.2 s blocks inside the 9.8 s quiesce, plus the pass stalls they
+cause on the pass slice ("#1466 PASS-STALL pp_rank=2 pass_ms=1177 fwd_ms=0").
+
+THE MEMO: kvs2 W3 already breaks the loop after a round that issued nothing
+with nothing in flight ("no pin frees, no write lands"). The memo carries
+that verdict across polls: while the in-flight write-through/store count
+stands where the no-progress round left it, the next poll skips the sweep
+(FLLIPER_PDFLIP_FLUSH_SWEEP_MEMO, default on since 17.10.).
+"""
+
+from __future__ import annotations
+
+import inspect
+import os
+
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+
+import pytest
+
+from flliper.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=10, suite="stage-a-test-cpu")
+
+
+def _nb():
+    from flliper.srt.managers import pdflip_flush_nonblock as nb
+
+    return nb
+
+
+class _Pool:
+    def __init__(self, free):
+        self.free = free
+
+    def available_size(self):
+        return self.free
+
+
+class _CC:
+    def __init__(self, free):
+        self.mem_pool_host = _Pool(free)
+
+
+class _Tree:
+    def __init__(self, write_through=0, backup=0, free=None):
+        if free is not None:
+            self.cache_controller = _CC(free)
+        self.ongoing_write_through = {i: object() for i in range(write_through)}
+        self.ongoing_backup = {i: object() for i in range(backup)}
+
+
+class _Sched:
+    def __init__(self):
+        self._pdflip_flush_sweep_memo = None
+
+
+def test_no_progress_needs_issued_zero_pending_zero_unbacked_positive():
+    nb = _nb()
+    assert nb.sweep_no_progress({"issued": 0, "pending": 0, "unbacked": 18})
+    assert not nb.sweep_no_progress({"issued": 3, "pending": 0, "unbacked": 18})
+    assert not nb.sweep_no_progress({"issued": 0, "pending": 2, "unbacked": 18})
+    assert not nb.sweep_no_progress({"issued": 0, "pending": 0, "unbacked": 0})
+    assert not nb.sweep_no_progress({})
+
+
+def test_inflight_count_sums_write_through_and_backup():
+    nb = _nb()
+    assert nb.inflight_count(None) == 0
+    assert nb.inflight_count(_Tree(0, 0)) == 0
+    assert nb.inflight_count(_Tree(3, 4)) == 7
+
+
+def test_memo_hit_only_while_the_count_stands():
+    nb = _nb()
+    s = _Sched()
+    tree = _Tree(2, 1)
+    assert not nb.sweep_memo_hit(s, tree)  # unset
+    nb.sweep_memo_set(s, tree)
+    assert nb.sweep_memo_hit(s, tree)
+    tree.ongoing_write_through.pop(0)  # a write-through acked: state moved
+    assert not nb.sweep_memo_hit(s, tree)
+
+
+def test_memo_switch_default_on_off_via_env(monkeypatch):
+    nb = _nb()
+    monkeypatch.delenv("FLLIPER_PDFLIP_FLUSH_SWEEP_MEMO", raising=False)
+    assert nb.sweep_memo_on()
+    monkeypatch.setenv("FLLIPER_PDFLIP_FLUSH_SWEEP_MEMO", "0")
+    assert not nb.sweep_memo_on()
+
+
+def test_scheduler_flush_handler_is_wired():
+    """The handler checks the memo before its rounds, skips the loop on a hit,
+    and arms the memo exactly where the kvs2 W3 break fires."""
+    from flliper.srt.managers import scheduler as sched_mod
+
+    src = inspect.getsource(sched_mod.Scheduler.flush_cache)
+    assert "sweep_memo_hit" in src
+    assert "sweep_memo_set" in src
+    assert "range(64) if not _memo_hit else ()" in src
+
+
+# ---- h16v S12 (Nachreview 2, V2): the stamp dies with its quiesce / tree ----
+
+
+def test_arena_room_change_invalidates_memo():
+    nb = _nb()
+    s = _Sched()
+    tree = _Tree(0, 0, free=100)
+    nb.sweep_memo_set(s, tree)
+    assert nb.sweep_memo_hit(s, tree)  # unchanged -> memo hit
+    tree.cache_controller.mem_pool_host.free = 130  # room moved, in-flight same
+    assert not nb.sweep_memo_hit(s, tree)
+
+
+def _quiesce_end():
+    from flliper.srt.managers import pdflip_bubble_publish as bp
+
+    return bp.quiesce_end
+
+
+@pytest.mark.parametrize("why", ["reset", "batch"])
+def test_new_quiesce_with_same_inflight_sweeps_first_poll(why):
+    nb = _nb()
+    from flliper.srt.managers import pdflip_bubble_publish as bp
+
+    s = _Sched()
+    tree = _Tree(0, 0, free=50)
+    bp.quiesce_begin(s)
+    nb.sweep_memo_set(s, tree)
+    assert nb.sweep_memo_hit(s, tree)
+    bp.quiesce_end(s, why)
+    bp.quiesce_begin(s)  # next quiesce, same count 0, same room
+    assert not nb.sweep_memo_hit(s, tree)  # first poll must sweep
+
+
+def test_memo_clear_and_flush_reset_hook_wired():
+    nb = _nb()
+    s = _Sched()
+    tree = _Tree(0, 0, free=1)
+    nb.sweep_memo_set(s, tree)
+    nb.sweep_memo_clear(s)
+    assert not nb.sweep_memo_hit(s, tree)
+    from flliper.srt.managers import scheduler as sched_mod
+
+    src = inspect.getsource(sched_mod.Scheduler.flush_cache)
+    assert src.index("self.tree_cache.reset()") < src.index("sweep_memo_clear(self)") \
+        < src.index("req_to_token_pool.clear()")

@@ -1649,6 +1649,100 @@ def recut_reference(reference: "PCardReference", stage_layers: Sequence[int], *,
         source="%s RECUT %s->%s" % (reference.source, split_text(ref_split), split_text(split)))
 
 
+def role_stage_map(n_stages: int, n_ref: int) -> Optional[Tuple[int, ...]]:
+    """AP2 1006: the reference stage each of ``n_stages`` P stages takes its measured
+    row from -- by ROLE (the first stage holds the embedding, the last the head and
+    the draft, every other neither): first -> 0, last -> ``n_ref - 1``, middle -> 1.
+    ``None`` for fewer than two stages on either side (no role to place)."""
+    n, r = int(n_stages), int(n_ref)
+    if n < 2 or r < 2:
+        return None
+    mid = 1 if r > 2 else r - 1
+    return tuple(0 if s == 0 else (r - 1 if s == n - 1 else mid) for s in range(n))
+
+
+def restage_reference(reference: "PCardReference", support: "TransientSupport",
+                      co_tenant: "CoTenantSpan", stage_layers: Sequence[int],
+                      stage_map: Sequence[int], *,
+                      layer_kinds: Optional[Sequence[str]],
+                      dense_mib_per_layer: Optional[float],
+                      mamba_mib_per_linear_layer_per_slot: Optional[float],
+                      ) -> Tuple["PCardReference", "TransientSupport", "CoTenantSpan"]:
+    """AP2 1006: the measured reference on a DIFFERENT STAGE COUNT (a P = PP<N>
+    of another card count). Live stage ``s`` takes every per-stage term of
+    reference stage ``stage_map[s]`` (:func:`role_stage_map`: K0, transient,
+    growth, co-tenant, cap, LMEM) and its ``K0`` is shifted by the layers it holds
+    more or fewer than that reference stage -- the :func:`recut_reference` rule
+    (Dense per layer, Mamba per LINEAR layer x the reference's slots), per stage.
+    KV and expert rows come from the PLAN in :func:`solve_p_card` as always.
+    A HOCHRECHNUNG for the layer count and a BORROW of the stage row: the caller
+    names it. Not derivable -> :class:`PCutRecutRefused` (W167)."""
+    split = tuple(int(x) for x in stage_layers)
+    ref_split = tuple(int(x) for x in reference.stage_layers)
+    smap = tuple(int(m) for m in stage_map)
+    why = []
+    if len(smap) != len(split) or any(not 0 <= m < len(ref_split) for m in smap):
+        why.append("Stufenzuordnung %s passt nicht zu %d Stufen / %d Referenzstufen"
+                   % (list(smap), len(split), len(ref_split)))
+    if sum(ref_split) != sum(split):
+        why.append("Layersumme %d gegen %d der Referenz" % (sum(split), sum(ref_split)))
+    if any(n <= 0 for n in split):
+        why.append("leere Stufe im Schnitt %s" % split_text(split))
+    if not layer_kinds:
+        why.append("Layer-Typen des Checkpoints unbekannt")
+    elif len(layer_kinds) != sum(split):
+        why.append("%d Layer-Typen fuer %d Layer" % (len(layer_kinds), sum(split)))
+    if dense_mib_per_layer is None or not (float(dense_mib_per_layer) > 0.0):
+        why.append("Dense je Layer unbekannt (%r)" % (dense_mib_per_layer,))
+    rate = float(mamba_mib_per_linear_layer_per_slot or 0.0)
+    if int(reference.mamba_slots) > 0 and rate <= 0.0:
+        why.append("die Referenz traegt %d Mamba-Slots, der Preis je linearem Layer und Slot "
+                   "ist unbekannt" % int(reference.mamba_slots))
+    if support.n_stages not in (len(split), len(ref_split)):
+        why.append("Transienten-Stuetzpunkte fuer %d Stufen" % support.n_stages)
+    if why:
+        raise PCutRecutRefused(
+            "%s: %s -- Schnitt %s ist aus der Referenz (Schnitt %s) nicht auf %d Stufen "
+            "umrechenbar: %s. Boots DIESES Schnitts als Referenz geben (--p-card-reference-logs)."
+            % (RECUT_REFUSAL_CODE, CARD_MARKER, split_text(split), split_text(ref_split),
+               len(split), "; ".join(why)))
+    _a0, lin0 = stage_kind_counts(layer_kinds, ref_split)
+    _a1, lin1 = stage_kind_counts(layer_kinds, split)
+    mamba_lin = int(reference.mamba_slots) * rate
+
+    def pick(t):
+        return tuple(t[m] for m in smap) if t else t
+
+    h0 = tuple(
+        round(float(reference.headroom0_mib[m]) - (split[s] - ref_split[m]) * float(dense_mib_per_layer)
+              - (lin1[s] - lin0[m]) * mamba_lin, 1)
+        for s, m in enumerate(smap))
+    row_card = tuple(round(float(reference.row_card_mib[m]) * split[s] / ref_split[m], 1)
+                     for s, m in enumerate(smap)) if reference.row_card_mib else ()
+    tag = "RESTAGE %s->%s Stufen %s" % (split_text(ref_split), split_text(split),
+                                         ",".join(str(m) for m in smap))
+    ref = msgspec.structs.replace(
+        reference, stage_layers=split, headroom0_mib=h0, headroom_mib=pick(reference.headroom_mib),
+        buffer_rows=pick(reference.buffer_rows), kv_mib=pick(reference.kv_mib),
+        cap_mib=pick(reference.cap_mib), peak_mib=pick(reference.peak_mib),
+        private_free_mib=pick(reference.private_free_mib),
+        growth_mib_per_token=pick(reference.growth_mib_per_token),
+        growth_measured_chunks=pick(reference.growth_measured_chunks),
+        lmem_mib=pick(reference.lmem_mib), row_card_mib=row_card,
+        co_tenant_mib=pick(reference.co_tenant_mib), growth_cap_mib=pick(reference.growth_cap_mib),
+        source="%s %s" % (reference.source, tag))
+    if support.n_stages == len(split) and len(split) != len(ref_split):
+        sup = support   # already staged for the live count (the launcher's inventory view)
+    else:
+        sup = TransientSupport(model=support.model, points=tuple(
+            TransientPoint(chunk=p.chunk, mib=tuple(p.mib[m] for m in smap), source=p.source)
+            for p in support.points))
+    co = CoTenantSpan(
+        max_mib=tuple(float(co_tenant.max_mib[m]) if m < len(co_tenant.max_mib) else 0.0 for m in smap),
+        source="%s %s" % (co_tenant.source, tag))
+    return ref, sup, co
+
+
 def recut_card_line(ref_split: Sequence[int], split: Sequence[int],
                     fits: Sequence["PCardFit"], *, dense_mib_per_layer: float,
                     mamba_mib_per_linear_layer: float) -> str:

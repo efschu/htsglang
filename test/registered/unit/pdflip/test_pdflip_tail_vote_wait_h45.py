@@ -401,7 +401,7 @@ def test_the_termination_max_carries_the_hold(d_group):
         ta.stage(RID, d_group[0].tree)
         tree, seen = _tree(peer_hold=0)
         assert tree.can_terminate_prefetch(op, tail_hold=0)  # nobody holds: today's answer
-        assert seen == {"len": 3, "label": "can_terminate_prefetch"}
+        assert seen == {"len": 5, "label": "can_terminate_prefetch"}  # PREFETCH-RID-NET-1014: + the rid (h, -h)
         assert d_group[0].jobs[RID].held_since < 0
         tree, _ = _tree(peer_hold=1)  # a PEER's staging is unfinished
         assert not tree.can_terminate_prefetch(op, tail_hold=0)

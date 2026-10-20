@@ -53,14 +53,52 @@ def gate(scheduler) -> threading.Event | None:
     return ev
 
 
+QUIESCE_ENV = "FLLIPER_PDFLIP_BUBBLE_QUIESCE_PAUSE"
+
+
+def quiesce_pause_on() -> bool:
+    return (os.environ.get(QUIESCE_ENV, "1") or "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def quiesce_begin(scheduler) -> None:
+    """F5a (NF-PGAP 1016): a ``/flush_cache`` poll with nothing running opens a QUIESCE on this rank. Until it ends
+    (the flush resets, or a batch is launched) the publishing belongs to the flush's #1470 loop alone: the bubble
+    publisher issues no sweep (boot ..._1f4b3e73d4_1016_103428, P->D quiesce 11:29:08-11:29:22: 200 PUBLISH-SWEEP
+    lines against 40 #1470 FLUSH-PUBLISH, the in-between sweeps issued write-throughs whose acks and #106S sidecar
+    store writes held the #1268 vote at hicache_write_through / hicache_backup -- 24 polls, 14278 ms quiesce). No
+    node is lost: the flush loop sweeps every poll (max_issue 256, up to 64 rounds)."""
+    if not getattr(scheduler, "_pdflip_quiesce_open", False):
+        scheduler._pdflip_quiesce_open = True
+        scheduler._pdflip_quiesce_paused = 0
+        scheduler._pdflip_quiesce_t0 = time.monotonic()
+
+
+def quiesce_end(scheduler, why: str) -> None:
+    # h16v S12 (Nachreview 2 V2): the flush sweep memo belongs to this quiesce only (reset / batch end it)
+    scheduler._pdflip_flush_sweep_memo = None
+    if not getattr(scheduler, "_pdflip_quiesce_open", False):
+        return
+    scheduler._pdflip_quiesce_open = False
+    paused = int(getattr(scheduler, "_pdflip_quiesce_paused", 0) or 0)
+    n = getattr(scheduler, "_pdflip_quiesce_n", 0) + 1
+    scheduler._pdflip_quiesce_n = n
+    if paused and (n <= 32 or n % 64 == 0):
+        logger.info("PDFLIP BUBBLE-PUBLISH QUIESCE-END n=%d why=%s paused_sweeps=%d open_ms=%.0f (the flush loop "
+                    "published alone while the quiesce was open)", n, why, paused,
+                    (time.monotonic() - float(getattr(scheduler, "_pdflip_quiesce_t0", time.monotonic()))) * 1000.0)
+
+
 def bubble_begin(scheduler) -> None:
     """Called where the PP loop notes 'no batch': open the gate, issue a
-    bounded sweep at most every MIN_INTERVAL_S."""
+    bounded sweep at most every MIN_INTERVAL_S -- not while a quiesce is open (F5a, :func:`quiesce_begin`)."""
     if not armed(scheduler):
         return
     ev = gate(scheduler)
     if ev is not None:
         ev.set()
+    if getattr(scheduler, "_pdflip_quiesce_open", False) and quiesce_pause_on():
+        scheduler._pdflip_quiesce_paused = int(getattr(scheduler, "_pdflip_quiesce_paused", 0) or 0) + 1
+        return
     now = time.monotonic()
     last = getattr(scheduler, "_pdflip_bubble_last", 0.0)
     if now - last < MIN_INTERVAL_S:
@@ -86,7 +124,9 @@ def bubble_begin(scheduler) -> None:
 
 
 def bubble_end(scheduler) -> None:
-    """Called when a batch is launched: close the gate."""
+    """Called when a batch is launched: close the gate; a launched batch ends an open quiesce (F5a)."""
+    if getattr(scheduler, "_pdflip_quiesce_open", False):
+        quiesce_end(scheduler, "batch")
     if not armed(scheduler):
         return
     ev = gate(scheduler)

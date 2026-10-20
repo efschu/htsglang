@@ -34,6 +34,16 @@ from test_pdflip_arrival_seat_rule_0929 import X, _front, _pending  # noqa: E402
 from flliper.srt.managers.scheduler_components import weight_updater as _wu  # noqa: E402,F401
 from flliper.srt.pdflip import arrival_seat_rule as asr  # noqa: E402
 from flliper.srt.pdflip import front as F  # noqa: E402
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _pbound_flip_now_off(monkeypatch):
+    """These tests pin the seat/KV verdict and the dwell holds for requests that
+    need P -- the rule PBOUND-FLIP-NOW (default on, 02.10.) replaces; they keep
+    covering it as the switch-off path."""
+    monkeypatch.setenv("FLLIPER_PDFLIP_PBOUND_FLIP_NOW", "0")
+
 
 
 def _on(monkeypatch):
@@ -65,7 +75,8 @@ def test_the_plan_is_the_fewest_youngest_younger_decodes():
 
 
 def test_the_switch_needs_the_rule():
-    assert asr.age_plan_enabled({"FLLIPER_PDFLIP_ENABLE_ARRIVAL_SEAT_AGE_PLAN": "1"}) is False
+    assert asr.age_plan_enabled({"FLLIPER_PDFLIP_ENABLE_ARRIVAL_SEAT_AGE_PLAN": "1",
+                                 "FLLIPER_PDFLIP_ENABLE_ARRIVAL_SEAT_RULE": "0"}) is False
     assert asr.age_plan_enabled({"FLLIPER_PDFLIP_ENABLE_ARRIVAL_SEAT_AGE_PLAN": "1",
                                  "FLLIPER_PDFLIP_ENABLE_ARRIVAL_SEAT_RULE": "1"}) is True
     assert asr.age_plan_enabled({"FLLIPER_PDFLIP_ENABLE_ARRIVAL_SEAT_RULE": "1"}) is True   # default on

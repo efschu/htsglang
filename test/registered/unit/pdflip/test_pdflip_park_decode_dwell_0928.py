@@ -78,6 +78,7 @@ def _front(epoch, resume_epoch, awake_s, first_chunk_after_s, dp_ms, pd_ms):
         queue=[types.SimpleNamespace(rid="pdflip-17-22", est_uncached=70000, t_arrive=now,
                                      p_only=False, x_requeues=0, leg1_done=False, skip_leg1=False)],
         tp_prefill_max_tokens=4096, counters={"park_immediate_dwell_holds": 0},
+        _decode_collect=lambda now, live_q=None: None,   # SET SCHEDULER: nothing collecting, the park dwell decides
         _flip_ledger=lambda g: ["pdflip-0-5", "pdflip-4-11"],
         _derived_min_dwell_ms=lambda s, d: ((3544, "last-flip-D->P") if (s, d) == ("D", "P")
                                             else (2935, "last-flip-P->D")),

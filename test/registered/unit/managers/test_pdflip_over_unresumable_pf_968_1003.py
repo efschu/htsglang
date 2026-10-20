@@ -1,4 +1,4 @@
-"""OVER-UNRESUMABLE on the PF ring (27B 673cc89f6a boot 1003_170754, PP1
+"""OVER-UNRESUMABLE on the PF ring (NF port of 27B b2744f5043; 27B 673cc89f6a boot 1003_170754, PP1
 #968 group stop 17:23:06Z, rid pdflip-24-204): the whole paced-told + PF group
 fallback round trip with the follower early read (the 27B production form).
 
@@ -28,6 +28,7 @@ OVER = 120_000
 
 
 def _ring(monkeypatch, resumable_at_told: bool):
+    monkeypatch.delenv("FLLIPER_PDFLIP_TOLD_FIDELITY", raising=False)
     for k in list(os.environ):
         if k.startswith("FLLIPER_PDFLIP_TOLD") or k in ("FLLIPER_PDFLIP_P_TWIN_DEFER", m.ENV_FOLLOWER_EARLY_READ):
             monkeypatch.delenv(k, raising=False)
@@ -41,14 +42,14 @@ def _ring(monkeypatch, resumable_at_told: bool):
     over.prompts = {RID: OVER}   # this rank's early read reaches past told
 
     def probe(scheduler, req, depth):
-        # the #928 rule on PP2's tree: KV 0..OVER, recurrent state at OVER only
+        # the rank-resumable (#928) rule on PP2's tree: KV 0..OVER, recurrent state at OVER only
         if scheduler is not over:
             return None              # no probe on the other ranks (LedgerTree)
         if resumable_at_told or int(depth) >= OVER:
             return min(int(depth), OVER)
         return 0
 
-    monkeypatch.setattr(m._tf, "pp0_admissible", probe)
+    monkeypatch.setattr(m._tf, "rank_resumable", probe)
     return ring
 
 

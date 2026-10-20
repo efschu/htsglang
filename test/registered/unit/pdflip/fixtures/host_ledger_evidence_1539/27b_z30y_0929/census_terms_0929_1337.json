@@ -1,0 +1,10 @@
+{
+ "arena_handoff_gib": 0.0,
+ "arena_measured_gib": 31.41,
+ "arena_sidecar_gib": 0.0,
+ "nonrank_anon_gib": 7.2,
+ "other_tmpfs_gib": 0.89,
+ "seq_ring_gib": 3.0,
+ "unbooked_shm_gib": 1.49,
+ "xchg_measured_gib": 0.0006
+}

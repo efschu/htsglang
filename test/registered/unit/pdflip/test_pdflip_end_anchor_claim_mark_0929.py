@@ -127,7 +127,7 @@ def _prefill(sb, n, chunks=(), exact=True, trim=False, rid=None):
 
 def _line(caplog, rid):
     lines = [r.getMessage() for r in caplog.records
-             if "PDFLIP END-ANCHOR n=" in r.getMessage() and f"rid={rid[:12]} " in r.getMessage()]
+             if "PDFLIP END-ANCHOR n=" in r.getMessage() and f"rid={rid} " in r.getMessage()]
     assert len(lines) == 1, lines
     return lines[0]
 

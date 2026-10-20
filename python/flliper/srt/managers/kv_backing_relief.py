@@ -905,6 +905,10 @@ class KvRowCap:
         page = max(1, int(getattr(self._alloc, "page_size", 1) or 1))
         try:
             self._alloc.residency_withheld_slots = self.withheld * page
+            # 1535 F5: READ ONLY BY THE ERROR TEXT (mem_cache/common.py,
+            # _residency_withheld_note). No decision reads it. In PAGE ids,
+            # the unit ``_apply`` compares free page ids against.
+            self._alloc.residency_cap_pages = self._cap
         except Exception:  # pragma: no cover - exotic allocator objects
             pass
 
@@ -1050,7 +1054,20 @@ class KvRowCap:
                 # count -- which the idle invariant reports as a pool memory
                 # leak and which puts DUPLICATE ids into the free list on the
                 # next ``release()``.
-                register(lambda _idx: self._apply(), self._on_clear)
+                # S84: both hooks declare themselves an id-set CAP FILTER (no
+                # per-slot payload, re-derived from the free lists), so a page
+                # move (d_kv_compact) knows it may claim free ids below the cap
+                # and free its sources through free() -- instead of refusing
+                # every compaction because "a listener is armed".
+                from flliper.srt.mem_cache.allocator.base import (
+                    LISTENER_ROLE_CAP_FILTER,
+                    mark_listener,
+                )
+
+                register(
+                    mark_listener(lambda _idx: self._apply(), LISTENER_ROLE_CAP_FILTER, self),
+                    mark_listener(lambda: self._on_clear(), LISTENER_ROLE_CAP_FILTER, self),
+                )
                 self._subscribed = True
             else:
                 logger.warning(

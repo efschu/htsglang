@@ -88,7 +88,7 @@ class SegmentEncoder:
     ``enabled`` is False and every call encodes the whole text."""
 
     def __init__(self, tok, marker: str = SEGMENT_MARKER,
-                 cap_tokens: int = SEGMENT_CACHE_TOKENS):
+                 cap_tokens: int = SEGMENT_CACHE_TOKENS, track_round_trip: bool = False):
         self.tok = tok
         self.marker = marker
         self.cap_tokens = int(cap_tokens)
@@ -98,6 +98,13 @@ class SegmentEncoder:
         #: per call: tokens taken from the cache / tokens encoded now
         self.last_reused = 0
         self.last_encoded = 0
+        #: FRONT-SEND-IDS-1007: every new segment is decoded and encoded once;
+        #: ``last_round_trip_ok`` = every segment of the last call came back as
+        #: its ids (None while not tracking). ``rt_lossy`` = the cached keys that
+        #: did not.
+        self.track_round_trip = bool(track_round_trip)
+        self.rt_lossy: set = set()
+        self.last_round_trip_ok: Optional[bool] = None
         self.lock = threading.Lock()
 
     def _probe(self) -> Tuple[bool, str]:
@@ -124,14 +131,28 @@ class SegmentEncoder:
         out.extend(self.marker + p for p in parts[1:])
         return out
 
+    def round_trip_ok(self, ids: Sequence[int], **kw) -> bool:
+        """``encode(decode(ids)) == ids`` -- group D's text path decodes the
+        rendered ids and its tokenizer manager encodes that text again, so the
+        front's ids are D's ids exactly where this holds (per segment: each
+        starts with the special marker, which the encode splits out first)."""
+        want = list(ids)
+        try:
+            return list(self.tok.encode(self.tok.decode(want), **kw)) == want
+        except Exception:  # noqa: BLE001 -- unknown is not sound
+            return False
+
     def encode(self, text: str, **kw) -> List[int]:
         if not self.enabled:
             ids = self.tok.encode(text, **kw)
             self.last_reused, self.last_encoded = 0, len(ids)
+            self.last_round_trip_ok = (self.round_trip_ok(ids, **kw)
+                                       if self.track_round_trip else None)
             return ids
         kwkey = json.dumps(kw, sort_keys=True, default=str)
         out: List[int] = []
         reused = encoded = 0
+        rt_ok = True
         with self.lock:
             for seg in self.split(text):
                 key = (_sha(seg), kwkey)
@@ -142,13 +163,18 @@ class SegmentEncoder:
                 else:
                     hit = array.array("i", self.tok.encode(seg, **kw))
                     encoded += len(hit)
+                    if self.track_round_trip and not self.round_trip_ok(hit, **kw):
+                        self.rt_lossy.add(key)
                     self.cache[key] = hit
                     self.cached_tokens += len(hit)
                     while self.cached_tokens > self.cap_tokens and len(self.cache) > 1:
-                        _, old = self.cache.popitem(last=False)
+                        old_key, old = self.cache.popitem(last=False)
                         self.cached_tokens -= len(old)
+                        self.rt_lossy.discard(old_key)
+                rt_ok = rt_ok and key not in self.rt_lossy
                 out.extend(hit)
         self.last_reused, self.last_encoded = reused, encoded
+        self.last_round_trip_ok = rt_ok if self.track_round_trip else None
         return out
 
 
@@ -180,6 +206,8 @@ class Count:
     ms: float
     reused: int
     encoded: int
+    #: FRONT-SEND-IDS-1007: SegmentEncoder.last_round_trip_ok of the render
+    round_trip_ok: Optional[bool] = None
 
 
 def _server_args_namespace(server_args: Dict[str, Any]) -> SimpleNamespace:
@@ -269,6 +297,26 @@ class MMExpansion:
     ends: List[int] = dataclasses.field(default_factory=list)
 
 
+def _mm_expand_widths(compact: np.ndarray, pos: np.ndarray, keys: Sequence[str],
+                      widths: Sequence[int]) -> MMExpansion:
+    """``compact`` with placeholder ``i`` replaced by ``widths[i]`` copies of its
+    key's surrogate; ``pos`` are the placeholder positions."""
+    parts: List[np.ndarray] = []
+    ends: List[int] = []
+    last = width_sum = 0
+    for p, k, width in zip(pos.tolist(), keys, widths):
+        parts.append(compact[last:p])
+        width_sum += p - last
+        parts.append(np.full(int(width), mm_surrogate_value(k), dtype=np.int32))
+        width_sum += int(width)
+        ends.append(width_sum)
+        last = p + 1
+    parts.append(compact[last:])
+    ids = np.concatenate(parts).astype(np.int32, copy=False)
+    return MMExpansion(ids=ids, image_end=int(ends[-1]), first_image=int(pos[0]),
+                       n_images=len(keys), ends=ends)
+
+
 def mm_expand(compact: np.ndarray, image_token_id: Optional[int], keys: Sequence[str],
               ktok: Dict[str, int]) -> Optional[MMExpansion]:
     """``compact`` with each image placeholder replaced by K surrogate ids;
@@ -279,21 +327,74 @@ def mm_expand(compact: np.ndarray, image_token_id: Optional[int], keys: Sequence
     pos = np.flatnonzero(compact == int(image_token_id))
     if pos.size != len(keys) or any(k not in ktok for k in keys):
         return None
-    parts: List[np.ndarray] = []
-    ends: List[int] = []
-    last = width_sum = 0
-    for p, k in zip(pos.tolist(), keys):
-        parts.append(compact[last:p])
-        width_sum += p - last
-        width = int(ktok[k])
-        parts.append(np.full(width, mm_surrogate_value(k), dtype=np.int32))
-        width_sum += width
-        ends.append(width_sum)
-        last = p + 1
-    parts.append(compact[last:])
-    ids = np.concatenate(parts).astype(np.int32, copy=False)
-    return MMExpansion(ids=ids, image_end=int(ends[-1]), first_image=int(pos[0]),
-                       n_images=len(keys), ends=ends)
+    return _mm_expand_widths(compact, pos, keys, [int(ktok[k]) for k in keys])
+
+
+def mm_expand_sum(compact: np.ndarray, image_token_id: Optional[int], keys: Sequence[str],
+                  total: Optional[int]) -> Optional[MMExpansion]:
+    """MM-SUM-1007: the expansion of a request whose images the front never learned ONE
+    BY ONE but whose exact image set (the ordered tuple of image hashes) a group
+    served before: ``total`` = the sum of ALL its images' token counts, as realised.
+
+    The prompt length (``compact - n_images + total``) and the end of the LAST image are
+    exact whatever each image's own K is -- every image sits before or at the last one.
+    The positions inside the run of images are an equal split (deterministic for the
+    same tuple, so every later request of the set matches its predecessor token for
+    token); a request is never sent these ids, they are the front's own keys."""
+    if image_token_id is None or not keys or total is None:
+        return None
+    compact = np.asarray(compact, dtype=np.int32)
+    pos = np.flatnonzero(compact == int(image_token_id))
+    n = len(keys)
+    if pos.size != n or int(total) < n:
+        return None
+    base, rest = divmod(int(total), n)
+    widths = [base] * n
+    widths[-1] += rest
+    return _mm_expand_widths(compact, pos, keys, widths)
+
+
+def mm_sum_learn(n_compact: int, keys: Sequence[str], realised: int) -> Optional[int]:
+    """MM-SUM-1007: the sum of all the images' token counts of a request from the prompt
+    length a group realised; None when it is not a plausible count."""
+    n = len(keys)
+    if n == 0 or int(realised) <= 0:
+        return None
+    total = int(realised) - (int(n_compact) - n)
+    return total if total >= n else None
+
+
+def mm_d_reach(credit: int, n_tokens: int, page: int = ANCHOR_PAGE) -> Tuple[int, int]:
+    """IMAGE-CACHED-1002: ``(reach, floor)`` -- how far D's own admission of an
+    ``n_tokens`` prompt can cover it from its prefix, and the admission floor
+    that bounds it whatever the credit says.
+
+    The credit is a presence witness (a D finish, a store anchor), not D's
+    admission: D matches at most ``n - 1`` tokens (``_compute_max_prefix_len``,
+    one token is always computed for the logits), aligned DOWN to the groups'
+    KV page. ``floor`` is that page floor; every position at or above it D
+    computes itself. An image ending above ``floor`` can therefore never be
+    served by D (no tower): D would compute image positions -- vision_d_guard
+    refuses it (W123) and the request re-routes through P after a wasted D
+    admission.
+
+    y7n pdflip-2-6 (NF, page 64, 02.10. 13:39:05): the same 128-token image
+    request again, image_end=110, floor = page_floor(127) = 64 -- D recomputes
+    [64, 128) whatever anchor it holds; P is the only server of it. N5j
+    pdflip-18-24 (27B, page 1, 13:52:40): floor 127 >= 110, D served it from its
+    prefix (cached_tokens=127) without a flip."""
+    page = max(1, int(page))
+    floor = max(0, int(n_tokens) - 1) // page * page
+    return max(0, min(int(credit), floor)), floor
+
+
+def mm_d_cached(ends: Sequence[int], credit: int, n_tokens: int,
+                page: int = ANCHOR_PAGE) -> Tuple[int, int, int]:
+    """IMAGE-CACHED-1002: ``(covered, reach, floor)`` -- the images (by their
+    one-past-end positions ``ends``) D can take from its prefix without ever
+    computing one of their positions (:func:`mm_d_reach`)."""
+    reach, floor = mm_d_reach(credit, n_tokens, page)
+    return sum(1 for e in ends if int(e) <= reach), reach, floor
 
 
 def mm_learn(n_compact: int, keys: Sequence[str], ktok: Dict[str, int],
@@ -357,7 +458,8 @@ class FrontTokens:
                                 trust_remote_code=ns.trust_remote_code,
                                 tokenizer_revision=getattr(ns, "revision", None),
                                 tokenizer_backend=getattr(ns, "tokenizer_backend", "huggingface"))
-            seg = SegmentEncoder(tok)
+            seg = SegmentEncoder(
+                tok, track_round_trip=envs.FLLIPER_ENABLE_PDFLIP_FRONT_SEND_IDS.get())
             wrapped = _TokWrapper(tok, seg)
             hf = _hf_config_stub(ns.model_path or path)
             mc = SimpleNamespace(
@@ -468,7 +570,8 @@ class FrontTokens:
             ids = self._tok.encode(ids)
         arr = np.asarray(ids, dtype=np.int32)
         return Count(n=int(arr.size), ids=arr, ms=(time.perf_counter() - t0) * 1000.0,
-                     reused=seg.last_reused, encoded=seg.last_encoded), image_data
+                     reused=seg.last_reused, encoded=seg.last_encoded,
+                     round_trip_ok=seg.last_round_trip_ok), image_data
 
     def remember(self, text: str, ids: np.ndarray) -> None:
         key = _sha(text)
@@ -479,6 +582,64 @@ class FrontTokens:
 
     def ids_for(self, text: str) -> Optional[np.ndarray]:
         return self.ids_by_text.get(_sha(text))
+
+
+# ---------------------------------------------------------------------------
+# FRONT-SEND-IDS-1007 (Hebel 2b): the D leg carries the front's ids
+# ---------------------------------------------------------------------------
+# A text-only chat turn is rendered and encoded twice today: by the front (the
+# X-EXACT count, with D's own serving code and tokenizer) and by group D
+# (render, encode, decode, and the tokenizer manager's encode of the decoded
+# text). With FLLIPER_ENABLE_PDFLIP_FRONT_SEND_IDS the leg D prefills itself
+# carries the front's ids as ``input_ids`` and D's chat serving skips the
+# template (``_process_messages``: ``request.input_ids`` given). The ids are
+# D's ids exactly when D would render the same text and its decode/encode
+# round trip is the identity on every segment -- the second is checked here,
+# per new segment; the first is what the FRONT-IDS / D-IDS shadow lines
+# (FLLIPER_LOG_PDFLIP_PROMPT_IDS_DIGEST) prove on the metal before the switch
+# is turned on.
+
+#: the one path whose D leg may carry the front's ids (the brief's scope; the
+#: Anthropic /v1/messages body is converted on D first)
+SEND_IDS_PATH = "/v1/chat/completions"
+
+
+def payload_has_media(payload: Dict[str, Any]) -> bool:
+    """Any message content part that is not text (an image, audio, video)."""
+    for msg in payload.get("messages") or ():
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if isinstance(content, list) and any(
+                not (isinstance(part, dict) and part.get("type") == "text") for part in content):
+            return True
+    return False
+
+
+def send_ids_eligible(*, path: str, payload: Any, count: Count) -> bool:
+    """May the D leg of this request carry ``count.ids`` instead of its text?
+
+    Not when D would render other text than the front counted: a continued
+    final message (its prefix ids are appended by a separate encode, whose
+    round trip the segment bit does not see), and ``reasoning_effort`` inside
+    ``chat_template_kwargs`` (D's ``_convert_to_internal_request`` pops it
+    before ``_process_messages``, the front's count does not)."""
+    if path != SEND_IDS_PATH or not isinstance(payload, dict):
+        return False
+    ctk = payload.get("chat_template_kwargs")
+    return (
+        count.round_trip_ok is True
+        and count.n > 0
+        and payload.get("input_ids") is None
+        and not payload.get("continue_final_message")
+        and not (isinstance(ctk, dict) and "reasoning_effort" in ctk)
+        and not payload_has_media(payload)
+    )
+
+
+def ids_digest(ids: Sequence[int]) -> str:
+    """The FRONT-IDS / D-IDS shadow key (pdflip/prompt_ids_digest.py)."""
+    from flliper.srt.pdflip.prompt_ids_digest import ids_digest as _digest
+
+    return _digest(ids)
 
 
 def token_lcp(a: np.ndarray, b: np.ndarray) -> int:
@@ -536,6 +697,10 @@ class RecentPrompts:
         # rid -> (ids, time noted)
         self.items: "collections.OrderedDict[str, Tuple[np.ndarray, float]]" = \
             collections.OrderedDict()
+        #: PREFIX-DIVERGE-TEXT: rid -> the request's message digest
+        #: (front_diverge_text.payload_digest); written and read only in the
+        #: front tokenizer's worker, so it may lag ``items`` by one job
+        self.meta: Dict[str, Any] = {}
 
     def note(self, rid: str, ids: Optional[np.ndarray], now: Optional[float] = None) -> None:
         if ids is None or int(ids.size) == 0:
@@ -544,6 +709,16 @@ class RecentPrompts:
         self.items[str(rid)] = (ids, time.time() if now is None else float(now))
         while len(self.items) > self.cap:
             self.items.popitem(last=False)
+
+    def note_meta(self, rid: str, meta: Any) -> None:
+        """PREFIX-DIVERGE-TEXT: keep ``meta`` beside the ids of ``rid``
+        (worker thread only; bounded like ``items``)."""
+        if meta is None:
+            return
+        self.meta.pop(str(rid), None)
+        self.meta[str(rid)] = meta
+        while len(self.meta) > self.cap:
+            self.meta.pop(next(iter(self.meta)))
 
     def best(self, ids: np.ndarray, exclude_rid: Optional[str] = None
              ) -> Tuple[int, Optional[str], int, Optional[float]]:
@@ -615,6 +790,12 @@ class TokenSpans:
         #: below its end anchor), recorded with the P-anchor witness; beside the entry like
         #: :attr:`published`. :meth:`pending` credits the deepest one on the new text's shared path.
         self.inner: Dict[str, Tuple[int, ...]] = {}
+        #: D-INFLIGHT (X-CREDIT-INFLIGHT-1002): key -> rid of the D leg 2 whose
+        #: FIRST CONTENT recorded the entry (:meth:`record_d_inflight`) and
+        #: whose finish reading has not replaced it yet; rid -> key beside it.
+        #: Only these entries price as ``d_inflight``.
+        self.inflight_keys: Dict[str, str] = {}
+        self.inflight_rid: Dict[str, str] = {}
         #: SEQ-HASH (02.10.): prompt key -> (prompt ids, [(depth, hash)]) -- D's
         #: resumable anchors on the request's WHOLE sequence (prompt + output),
         #: each with the hash of that sequence up to the depth (finish / park).
@@ -623,6 +804,16 @@ class TokenSpans:
         #: STORE-PRESENCE (NF ba76adffe2, ported 02.10.): key -> label of an entry recorded as a
         #: store anchor (P's END-ANCHOR published by P's sleep flush); a finish reading replaces it.
         self.store_keys: Dict[str, str] = {}
+        #: X-CREDIT-FINISHED-1002: key -> the depth D REPORTED before the own-text
+        #: clamp lowered the cap (K2). ANCHOR-LOST names D's real anchor depths,
+        #: so a clamped entry is retracted by its unclamped depth too.
+        self.raw_depths: Dict[str, int] = {}
+        #: NF-NEXT-1006-21 (observation only, never read by a decision): key ->
+        #: rid of the finish reading that recorded the entry, and the entry
+        #: that won the LAST :meth:`pending` call as ``(key, rid, kind)``
+        #: (``None`` = no entry won). ``pending``'s return value is unchanged.
+        self.entry_rid: Dict[str, str] = {}
+        self.last_winner: Optional[Tuple[Optional[str], str, str]] = None
 
     @staticmethod
     def _key(ids: np.ndarray) -> str:
@@ -630,9 +821,12 @@ class TokenSpans:
 
     def record_presence(self, ids: Optional[np.ndarray], cached_tokens: int,
                         prompt_tokens: int = 0, held_epoch: Optional[int] = None,
-                        resumable_depth: Optional[int] = None) -> None:
+                        resumable_depth: Optional[int] = None,
+                        rid: Optional[str] = None) -> None:
         """#59: ``resumable_depth`` (D's ``pdflip_resumable_depth``, None = not
-        sent) caps every credit of this entry; 0 retracts.
+        sent) caps every credit of this entry; 0 retracts. ``rid``: the
+        request whose reading this is -- only remembered (``entry_rid``) so a
+        price line can name the entry's origin; no credit depends on it.
 
         PREFILL-EINBRUCH-0929 K2: a reading is about THIS text and never
         credits past it. A D leg 2 that was parked and resumed answers with
@@ -654,6 +848,10 @@ class TokenSpans:
         # cached_tokens retracts an over-credit here, D itself being the witness
         self.published.pop(key, None)
         self.inner.pop(key, None)
+        self.raw_depths.pop(key, None)
+        self.entry_rid.pop(key, None)
+        self._unflag_inflight(key)  # D-INFLIGHT: the finish reading replaces it
+        reported_depth = resumable_depth
         if not self.agent_span:
             prompt_tokens, held_epoch = 0, None
         ct = max(0, int(cached_tokens))
@@ -676,8 +874,12 @@ class TokenSpans:
             self.entry_seq.pop(key, None)
             return
         self.entries[key] = (ids, ct, pt, held)
+        if rid is not None:
+            self.entry_rid[key] = str(rid)
         if resumable_depth is not None:
             self.depth_caps[key] = int(resumable_depth)
+            if int(reported_depth) != int(resumable_depth):
+                self.raw_depths[key] = int(reported_depth)
         self._stamp(key)
 
     def own_anchor(self, n: int) -> int:
@@ -808,7 +1010,11 @@ class TokenSpans:
             self.published.pop(old_key, None)
             self.inner.pop(old_key, None)
             self.entry_seq.pop(old_key, None)
-            self.store_keys.pop(old_key, None)
+            self.raw_depths.pop(old_key, None)
+            self.entry_rid.pop(old_key, None)
+            self._unflag_inflight(old_key)
+        while len(self.entry_rid) > 2 * self.cap:  # keys retracted elsewhere leave one behind
+            self.entry_rid.pop(next(iter(self.entry_rid)))
 
     # -- SEQ-HASH (02.10.) ------------------------------------------------------
     def record_seq(self, ids: Optional[np.ndarray], depth: int, digest: str) -> bool:
@@ -859,6 +1065,98 @@ class TokenSpans:
                 self.seq_marks.pop(key, None)
         return n
 
+    # -- D-INFLIGHT (X-CREDIT-INFLIGHT-1002) ----------------------------------
+    def _unflag_inflight(self, key: str) -> None:
+        self.store_keys.pop(key, None)
+        rid = self.inflight_keys.pop(key, None)
+        if rid is not None and self.inflight_rid.get(rid) == key:
+            self.inflight_rid.pop(rid, None)
+
+    def record_d_inflight(self, rid: str, ids: Optional[np.ndarray],
+                          prompt_tokens: int = 0) -> int:
+        """D-INFLIGHT: D produced the FIRST CONTENT of ``rid``'s leg 2, so the
+        prompt is realised on D while that leg still decodes -- a D reading,
+        not a text guess. NF boot ...10020634 (5b46b8842e): pdflip-12-20 (31566
+        tokens) was handed to D at 06:39:51 ('#988 LOADBACK ... anchor_depth=
+        31552', '#59b PARK-RESUMABLE pdflip-12-20=31552') and decoded until
+        06:40:44; pdflip-14-23 (31723 tokens, same 31566 prefix) was priced at
+        06:39:53 against the only FINISHED reading, 19968 -> pending 11755,
+        LONG, flip pair, P prefilled 171. The in-flight anchor is the page
+        floor of the prompt (``own_anchor``): P's END-ANCHOR an after_p leg
+        resumed from (``prompt_tokens`` = P's leg-1 prompt), D's own #1469
+        RETAIN of a prompt it prefilled ('RETAIN is_finished=False
+        token_ids_len=19580 cache_len=19520 value=True'). It is the entry's
+        credit AND its #59 cap, so ANCHOR-LOST retracts it like any reading.
+
+        An existing entry of this text that already credits at least the
+        anchor stands untouched (0 returned). The finish's
+        :meth:`record_presence` replaces the entry with D's measurement;
+        :meth:`end_d_inflight` retracts it when the leg ends without one;
+        :meth:`park_cap` lowers it to D's #59b park depth. Returns the anchor
+        recorded (0 = none)."""
+        if ids is None or ids.size == 0:
+            return 0
+        n = int(ids.size)
+        if int(prompt_tokens or 0) > 0:
+            n = min(n, int(prompt_tokens))
+        anchor = self.own_anchor(n)
+        if anchor <= 0:
+            return 0
+        key = self._key(ids)
+        old = self.entries.get(key)
+        if old is not None:
+            cap = self.depth_caps.get(key)
+            have = int(old[1]) if cap is None else min(int(old[1]), int(cap))
+            if have >= anchor:
+                return 0
+        self.entries.pop(key, None)
+        pt, held = (int(old[2]), old[3]) if old is not None else (0, None)
+        self.entries[key] = (ids, anchor, pt, held)
+        self.depth_caps[key] = anchor
+        self._unflag_inflight(key)
+        old_key = self.inflight_rid.pop(str(rid), None)
+        if old_key is not None and old_key != key and self.inflight_keys.get(old_key) == str(rid):
+            self.inflight_keys.pop(old_key, None)
+        self.inflight_keys[key] = str(rid)
+        self.inflight_rid[str(rid)] = key
+        self._stamp(key)
+        return anchor
+
+    def end_d_inflight(self, rid: str) -> int:
+        """D-INFLIGHT: ``rid``'s leg 2 ended. If its in-flight entry was not
+        replaced by a finish reading (no usage: an abort, a failed stream),
+        the entry is retracted -- only realised D readings credit. Returns
+        the anchor retracted (0 = nothing)."""
+        key = self.inflight_rid.pop(str(rid), None)
+        if key is None or self.inflight_keys.get(key) != str(rid):
+            return 0
+        self.inflight_keys.pop(key, None)
+        old = self.entries.pop(key, None)
+        self.depth_caps.pop(key, None)
+        self.entry_seq.pop(key, None)
+        self.raw_depths.pop(key, None)
+        return int(old[1]) if old is not None else 0
+
+    def park_cap(self, rid: str, depth: int) -> Optional[Tuple[int, int]]:
+        """D-INFLIGHT x #59b: D parked ``rid`` and named the depth it resumes
+        from (``pdflip_resumable_depth`` of the park answer). An in-flight entry
+        is capped there (never raised past its own anchor); 0 retracts it.
+        Returns (old credit, new credit), or None when ``rid`` has no
+        in-flight entry."""
+        key = self.inflight_rid.get(str(rid))
+        if key is None or self.inflight_keys.get(key) != str(rid) or key not in self.entries:
+            return None
+        ids, ct, pt, held = self.entries[key]
+        old = int(self.depth_caps.get(key, ct))
+        new = max(0, min(old, int(depth)))
+        if new <= 0:
+            self.end_d_inflight(rid)
+            return old, 0
+        if new < old:
+            self.entries[key] = (ids, min(int(ct), new), pt, held)
+            self.depth_caps[key] = new
+        return old, new
+
     def record_inflight(self, ids: Optional[np.ndarray], held_epoch: Optional[int]) -> None:
         if ids is None or ids.size == 0 or held_epoch is None:
             return
@@ -896,6 +1194,7 @@ class TokenSpans:
         ``since_seq``: only entries recorded after that record count (a FRESH
         D confirmation); None = every entry, as before."""
         best, src, known = 0, "none", False
+        win: Optional[Tuple[Optional[str], str]] = None  # NF-NEXT-1006-21: (key, kind), report only
         for key, (eids, ct, pt, held_epoch) in self.entries.items():
             if since_seq is not None and self.entry_seq.get(key, 0) <= int(since_seq):
                 continue
@@ -907,6 +1206,17 @@ class TokenSpans:
             cap = self.depth_caps.get(key)
             if cap is not None:
                 raw = min(raw, cap)  # #59: never past D's deepest anchor
+            # X-CREDIT-FINISHED-1002 (cross epoch): a leg D SERVED (held_epoch
+            # set) whose resumable depth D named keeps its end anchor after
+            # the epoch -- min(prompt, D's depth, page floor of the text). The
+            # #49 epoch guard protects the radix-only tokens past the anchor
+            # (D flushes them on sleep); the anchor itself comes back from
+            # the store as a load (NF 10020634: 14 of 14 follow-ups after a
+            # D sleep read >= it, e.g. pdflip-26-45 P hit 53760 >= 53696), and
+            # ANCHOR-LOST retracts it when the flush drops it.
+            served = (not held and held_epoch is not None and pt > 0 and cap is not None)
+            if served:
+                raw = max(raw, min(int(pt), int(cap), self.own_anchor(int(eids.size))))
             if raw <= 0:
                 continue
             known = True
@@ -922,11 +1232,28 @@ class TokenSpans:
             if credit > best:
                 best = credit
                 src = ("d_served_epoch" if held and credit > ct
+                       else "d_served_anchor" if served and credit > ct
+                       else "d_inflight" if key in self.inflight_keys
                        else self.store_keys.get(key, "d_leg2_cached"))
+                win = (key, "served_epoch" if held and credit > ct
+                       else "served_anchor" if served and credit > ct
+                       else "inflight" if key in self.inflight_keys
+                       else "store" if key in self.store_keys
+                       else "held" if held else "leg2_cached")
         if self.seq_marks and since_seq is None:
             # SEQ-HASH: a prompt that extends a previous turn's GENERATED tokens (27B port: not
             # for an SK-X fresh-confirmation read -- a seq mark is no D evidence after the void)
             seq, _plen = self.seq_credit(ids)
             if seq > best:
                 best, src, known = seq, "d_seq_anchor", True
+                win = (None, "seq")
+        # NF-NEXT-1006-21: name the winner for the price line (a side field; the
+        # return value above is exactly what it was)
+        if win is None:
+            self.last_winner = None
+        else:
+            wkey = win[0]
+            wrid = "-" if wkey is None else (
+                self.inflight_keys.get(wkey) or self.entry_rid.get(wkey) or "-")
+            self.last_winner = (wkey, wrid, win[1])
         return max(0, int(ids.size) - best), best, known, src

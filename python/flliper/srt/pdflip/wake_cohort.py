@@ -219,7 +219,7 @@ class WakeLedger:
                 "cohort=%s rids=%s (L1: the reads of one wake join one extend; before L1 the "
                 "first finished read ran its 1.5-2.2 s expert pass alone)"
                 % (self.seq, len(self.rids), (now - self.t_wake) * 1000.0, self.hold_ms, self.holds,
-                   "on" if cohort_on else "off", [r[:12] for r in self.rids[:8]]))
+                   "on" if cohort_on else "off", self.rids[:8]))
 
 
 def monotonic() -> float:

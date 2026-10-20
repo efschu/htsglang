@@ -48,12 +48,14 @@ from flliper.srt.mem_cache.storage.file.hicache_arena import free_named
 from flliper.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from flliper.srt.pdflip import prefix_trace as _prefix_trace
 from flliper.srt.pdflip import handoff_pending as _handoff_pending
+from flliper.srt.pdflip import kv_durchlauf as _kv_dl  # S36 KV-DURCHLAUF
 
 logger = logging.getLogger(__name__)
 
 ENV_ARENA_HOST = "FLLIPER_HICACHE_ARENA_HOST"
 ENV_STAGING_GB = "FLLIPER_HICACHE_ARENA_STAGING_GB"
 PLACEHOLDERS = 1 << 22
+_DISK_LOAD_N = 0  # S36 KV-DURCHLAUF loads (log rate)
 
 
 def _psz(pool) -> int:
@@ -155,7 +157,44 @@ _CHAIN_REPAIRED_N = [0]
 class ArenaChainMismatch(RuntimeError):
     """#1424: a load-back chain addresses arena rows that neither form whole
     pages nor can be proven against the page keys -- loading them could put
-    another page's KV under these tokens, so the load is refused by name."""
+    another page's KV under these tokens, so the load is refused by name.
+
+    ARENA-CHAIN (NF 14.10. 07:29:33Z, P PP0, node=460 page=174 of 848): the
+    terms ride on the exception so the one seat that can take the pass back
+    (``pdflip/prefill_oom_retreat.retreat_chain_mismatch``: group-wide void pass
+    plus cutting the unproven pages out of the tree) decides on numbers, not on
+    text. ``page`` = the first unproven page counted from the chain's first page
+    (``None`` = unknown), ``node`` / ``node_page`` = the chain node that holds it
+    and the page's offset inside that node. The message is the one of before."""
+
+    def __init__(self, message="", *, page=None, node=None, node_page=None):
+        super().__init__(message)
+        self.page = None if page is None else int(page)
+        self.node = node
+        self.node_page = None if node_page is None else int(node_page)
+        # the load-back terms of AgreedRoomShort, so one retreat reads both (no room verdict here: all zero)
+        self.rid = None
+        self.kv_tokens = 0
+        self.agreed = 0
+        self.avail = 0
+        self.evictable = 0
+        self.evicted = 0
+        self.avail_after = 0
+
+
+def _chain_node_of_page(nodes, keys_of, page):
+    """``(node, offset inside the node)`` of chain page ``page`` (counted from the
+    chain's first page); a page past the end names the last node."""
+    if page is None or not nodes:
+        return None, None
+    left = int(page)
+    for n in nodes:
+        k = len(list(keys_of(n) or ()))
+        if left < k:
+            return n, left
+        left -= k
+    last = nodes[-1]
+    return last, max(0, len(list(keys_of(last) or ())) - 1)
 
 
 def _rows_page_clean(P: int, rows: torch.Tensor) -> bool:
@@ -170,14 +209,113 @@ def _rows_page_clean(P: int, rows: torch.Tensor) -> bool:
     return not (bool((first % P).any()) or bool((pages != first[:, None] + lane).any()))
 
 
-def _chain_clean(P: int, rows: torch.Tensor) -> bool:
+def _disk_norm(P: int, rows: torch.Tensor, S) -> torch.Tensor:
+    """S36 KV-DURCHLAUF: arena rows (host id - S) with every DISK row moved to a P-aligned range of its own (2 x
+    disk_base, beyond every arena row), so the whole-page / no-twin tests read a disk page like a slot."""
+    if S is None or rows.numel() == 0:
+        return rows
+    m = (rows + int(S)) >= _kv_dl.DISK_BASE
+    if not bool(m.any()):
+        return rows
+    out = rows.clone()
+    base = _kv_dl.disk_base(P)
+    out[m] = rows[m] + int(S) - base + 2 * base
+    return out
+
+
+def _chain_clean(P: int, rows: torch.Tensor, S=None) -> bool:
     """Whole consecutive pages AND no page twice: one prefix never holds the
     same slot at two depths (a twin page survives the per-page check and
-    breaks only after the load's sort)."""
+    breaks only after the load's sort). S36: ``S`` given -> disk pages count
+    as pages of their own (``_disk_norm``)."""
+    rows = _disk_norm(P, rows, S)
     if not _rows_page_clean(P, rows):
         return False
     first = rows.view(-1, P)[:, 0] if P > 1 else rows
     return int(torch.unique(first).numel()) == int(first.numel())
+
+
+#: A2 CHAIN-KEY: [fast-path proofs run, fast-path proofs that failed and went to the full proof]
+_CHAIN_KEY_N = [0, 0]
+
+
+def _chain_keys_hold(pool, nodes, rows: torch.Tensor, stems_of, keys_of) -> bool:
+    """A2 CHAIN-KEY (nf-h54-review-1015 B1): the clean-chain fast path of
+    ``provable_pages`` / ``verify_load_chain``, PROVEN. ``rows`` are the chain's
+    arena rows (host ids - S), already whole distinct pages (``_chain_clean``).
+
+    True only when every page's stored key names, through the arena index, the
+    very slot its rows address AND that slot is COMPLETE -- one
+    ``find_slots_np`` for the whole chain (hashed in C). Anything else goes to
+    the full proof (``_chain_plan``): re-point to the key's COMPLETE slot, or a
+    named stop on the group-legal path (admission cut / ArenaChainMismatch ->
+    PP0 RETRY / retreat, followers a named stop).
+
+    WHY. A clean chain was passed WITHOUT looking at a single key. The rows of
+    a late host-write writer (``arena_complete`` 6 after an H54 take-over or a
+    JOIN-IDLE quarantine: no reference taken) stay on the old slot; once that
+    slot is recycled for another key the rows are still whole distinct pages,
+    and the load put the other key's KV under these tokens -- silently. Whole
+    pages say nothing about WHOSE page it is; only the key does.
+
+    Without an arena there is nothing to prove against (unchanged)."""
+    arena = getattr(pool, "arena", None)
+    if arena is None or not hasattr(arena, "find_slots_np"):
+        return True
+    P = _psz(pool)
+    keys = []
+    for n in nodes:
+        keys.extend(str(k) for k in (keys_of(n) or ()))
+    first = (rows.view(-1, P)[:, 0] if P > 1 else rows).to(torch.int64)
+    _CHAIN_KEY_N[0] += 1
+    ok = len(keys) == int(first.numel())
+    bad_at = None
+    if ok and keys:
+        import numpy as np
+        stems = stems_of(keys)
+        slots, states = arena.find_slots_np(stems)
+        want = (first // P).numpy() if P > 1 else first.numpy()
+        good = (np.asarray(slots, dtype=np.int64) == want) & (np.asarray(states) == 2)
+        # S36 KV-DURCHLAUF: a disk page is proven by its held L3 file -- the registry stem must be the key's stem
+        _dg = _disk_pages_proven(pool, first, stems)
+        if _dg is not None:
+            good = np.where(_dg[0], _dg[1], good)
+        ok = bool(good.all())
+        if not ok:
+            j = int(np.argmin(good))
+            bad_at = (j, int(want[j]), int(slots[j]), int(states[j]))
+    if not ok:
+        _CHAIN_KEY_N[1] += 1
+        k = _CHAIN_KEY_N[1]
+        if k <= 16 or (k & (k - 1)) == 0:
+            logger.warning(
+                "A2 CHAIN-KEY n=%d of %d proofs: a clean chain (%d node(s), %d page(s), %d key(s)) does not "
+                "hold its keys%s -- full proof (#1424 _chain_plan: re-point to the key's COMPLETE slot or a "
+                "named stop); before A2 these rows were loaded unproven",
+                k, _CHAIN_KEY_N[0], len(nodes), int(first.numel()), len(keys),
+                "" if bad_at is None else
+                f" (page {bad_at[0]}: rows slot {bad_at[1]}, key slot {bad_at[2]} state {bad_at[3]})")
+    return ok
+
+
+def _disk_pages_proven(pool, first_rows: torch.Tensor, stems):
+    """S36: ``(is_disk_page, proven)`` numpy masks over a chain's pages (``first_rows`` = each page's first arena
+    row, host id - S), or None when no page is a disk page. Proven = the disk page's registry entry holds the L3
+    file of exactly the key's stem (its lanes are checked by the whole-page test)."""
+    import numpy as np
+    S = int(getattr(pool, "staging_rows", 0) or 0)
+    host_first = first_rows.to("cpu", dtype=torch.int64) + S
+    isd = (host_first >= _kv_dl.DISK_BASE).numpy()
+    if not bool(isd.any()):
+        return None
+    P = _psz(pool)
+    base = _kv_dl.disk_base(P)
+    ok = np.zeros(isd.shape, dtype=bool)
+    hf = host_first.tolist()
+    for j in np.nonzero(isd)[0].tolist():
+        d = (int(hf[j]) - base) // P
+        ok[j] = (int(hf[j]) - base) % P == 0 and _kv_dl.REGISTRY.stem_of(d) == str(stems[j])
+    return isd, ok
 
 
 def _chain_duplicates(P: int, rows: torch.Tensor, limit: int = 4):
@@ -253,7 +391,7 @@ def _chain_plan(pool, nodes, rows_of, stems_of, keys_of, own_hash, p_chain, page
                 f"{len(stored)} page key(s) of {P} tokens{'' if arena is not None else ', no arena'} "
                 f"-- the rows are not whole pages and cannot be proven")), total
         plan = {"node": node, "keys": list(stored), "stored": stored, "rows": hv.clone(),
-                "refs": [], "unrefs": [], "fixed": [], "rekeyed": []}
+                "refs": [], "unrefs": [], "unref_keys": [], "fixed": [], "rekeyed": []}
         if not stored:
             plans.append(plan)
             continue
@@ -283,12 +421,22 @@ def _chain_plan(pool, nodes, rows_of, stems_of, keys_of, own_hash, p_chain, page
                 keys[i] = pick
                 plan["rekeyed"].append(f"node={nid} page={i} depth_page={j + i} {k[:12]}->{pick[:12]}")
                 prior = pick
-        slots, states = arena.find_slots_np(stems_of(keys))
+        _stems_k = stems_of(keys)
+        slots, states = arena.find_slots_np(_stems_k)
         slots = torch.as_tensor(slots, dtype=torch.int64)
         states = torch.as_tensor(states, dtype=torch.int64)
         want = slots[:, None] * P + lane
         pages = plan["rows"].view(-1, P)
         bad = (pages != want).any(dim=1)
+        # S36 KV-DURCHLAUF: a disk page whose held L3 file is the key's own stays a disk page (proven); one that
+        # is not (re-keyed) is re-pointed like any page -- its disk page goes back with the re-point
+        _dg = _disk_pages_proven(pool, pages[:, 0], _stems_k)
+        if _dg is not None:
+            _isd = torch.as_tensor(_dg[0])
+            _okd = torch.as_tensor(_dg[1]) & ~(pages != pages[:, :1] + lane).any(dim=1)
+            bad = torch.where(_isd, ~_okd, bad)
+            plan["disk_unrefs"] = [((int(pages[i, 0]) + S - _kv_dl.disk_base(P)) // P)
+                                   for i in (_isd & ~_okd).nonzero()[:, 0].tolist()]
         if bool(bad.any()):
             idx = bad.nonzero()[:, 0]
             invalid = idx[(slots[idx] < 0) | (states[idx] != 2)]
@@ -308,13 +456,17 @@ def _chain_plan(pool, nodes, rows_of, stems_of, keys_of, own_hash, p_chain, page
                      & (head % P == 0) & (head < _atok(pool)))
             plan["unrefs"] = [int(s) if bool(w) else -1
                               for s, w in zip((head // P).tolist(), whole.tolist())]
+            # A2: the key each re-pointed page was stored under -- its old slot's
+            # reference is given back only while that slot is still THIS page's
+            # (``_repoint_unrefs``), never a recycled slot's new owner's
+            plan["unref_keys"] = [stored[int(x)] for x in idx.tolist()]
             pages[idx] = want[idx]
             plan["refs"] = [int(x) for x in slots[idx].tolist()]
             plan["fixed"].append(what)
         plans.append(plan)
         j += len(stored)
     rows = torch.cat([p["rows"] for p in plans]) if plans else torch.empty(0, dtype=torch.int64)
-    if int(rows.numel()) and not _chain_clean(P, rows):
+    if int(rows.numel()) and not _chain_clean(P, rows, S):
         dups = _chain_duplicates(P, rows)
         first = dups[0][0] if dups else 0
         return plans, (first, (
@@ -386,7 +538,28 @@ def _claim_duplicates(slots, st):
     return dup & ok
 
 
-def _repoint_unrefs(pool, arena, olds):
+_REPOINT_FOREIGN_N = [0, 0]  # A2: re-points whose old slot was no longer theirs, slots kept
+
+
+def _old_slot_still_ours(arena, olds, stems):
+    """A2 (nf-h54-review-1015 B1, second arm): per old slot, is it still the
+    page's own GENERATION -- the slot still carries the page's stored key
+    (find(stem) == slot), or it is QUARANTINE (an H54 take-over / JOIN-IDLE
+    reap unlinked the key but kept the slot, its generation and its
+    references)? A slot recycled for another key holds that key's readers'
+    references, never this page's: nothing is given back there."""
+    import numpy as np
+    if stems is None or not hasattr(arena, "find_slots_np"):
+        return [True] * len(olds)
+    f_slots, _st = arena.find_slots_np(list(stems))
+    states = arena.slot_states(olds) if hasattr(arena, "slot_states") else [None] * len(olds)
+    out = []
+    for s, f, st in zip(olds, np.asarray(f_slots).tolist(), states):
+        out.append(int(f) == int(s) or st == 4)   # 4 = S_QUARANTINE (arena.c)
+    return out
+
+
+def _repoint_unrefs(pool, arena, olds, stems=None):
     """#1424e (rc12p D-TP0 ARENA-REF-CENSUS, pinned 4315 of 4669): the old
     slots of re-pointed pages whose reader reference THIS page holds and gives
     back with the re-point. A page of a load-back chain holds one reference on
@@ -400,11 +573,31 @@ def _repoint_unrefs(pool, arena, olds):
     with the ack, never before), and per slot at most as many as this process
     holds there (the reference ledger, FLLIPER_HICACHE_ARENA_QUEUE_REFS; without
     it the slot's header count) -- a counter never goes below what exists."""
-    olds = [int(s) for s in olds if int(s) >= 0]
-    if not olds:
+    if stems is not None and len(stems) == len(olds):
+        pairs = [(int(s), k) for s, k in zip(olds, stems) if int(s) >= 0]
+    else:
+        pairs = [(int(s), None) for s in olds if int(s) >= 0]
+    if not pairs:
         return []
     if getattr(pool, "_pending_mask", None) is not None or getattr(pool, "_pending", None):
-        olds = [s for s, pend in zip(olds, pool._pend_has(olds)) if not pend]
+        pairs = [p for p, pend in zip(pairs, pool._pend_has([s for s, _ in pairs])) if not pend]
+    if pairs and all(k is not None for _, k in pairs):
+        # A2: generation-exact -- only an old slot that is still this page's
+        ours = _old_slot_still_ours(arena, [s for s, _ in pairs], [k for _, k in pairs])
+        foreign = [s for (s, _), o in zip(pairs, ours) if not o]
+        if foreign:
+            _REPOINT_FOREIGN_N[0] += 1
+            _REPOINT_FOREIGN_N[1] += len(foreign)
+            k = _REPOINT_FOREIGN_N[0]
+            if k <= 16 or (k & (k - 1)) == 0:
+                logger.warning(
+                    "A2 REPOINT-FOREIGN n=%d slots=%d first=%s total=%d -- a re-pointed page's old slot "
+                    "carries another key now (recycled): its references are that key's readers', none is "
+                    "given back", k, len(foreign), foreign[:4], _REPOINT_FOREIGN_N[1])
+        pairs = [p for p, o in zip(pairs, ours) if o]
+    olds = [s for s, _ in pairs]
+    if not olds:
+        return []
     ledger = getattr(arena, "_ledger", None)
     if ledger is not None:
         held = {s: int(ledger.held[s]) for s in set(olds)}
@@ -436,8 +629,9 @@ def provable_pages(pool, nodes, rows_of, stems_of, *, keys_of=None, own_hash=Non
     S = int(pool.staging_rows)
     rows = torch.cat([rows_of(n).reshape(-1) for n in nodes])
     total = int(rows.numel()) // P
-    if not _chain_shifted(nodes, keys_of, p_chain, page0) and _chain_clean(
-            P, rows.to("cpu", dtype=torch.int64) - S):
+    ar = rows.to("cpu", dtype=torch.int64) - S
+    if not _chain_shifted(nodes, keys_of, p_chain, page0) and _chain_clean(P, ar, S) \
+            and _chain_keys_hold(pool, nodes, ar, stems_of, keys_of):   # A2 CHAIN-KEY
         return total, total
     _plans, stop, total = _chain_plan(pool, nodes, rows_of, stems_of, keys_of, own_hash,
                                       p_chain, page0, prior0)
@@ -454,7 +648,10 @@ def verify_load_chain(pool, nodes, host_indices, rows_of, stems_of, *, keys_of=N
     A correct chain is whole consecutive pages with no slot twice: every page
     is one arena slot's P ids, and a page KEY is content-chained over the whole
     prefix, so one prefix never holds one key -- hence one slot -- at two
-    depths. A chain that is not, or that carries one of P's hand-off keys at a
+    depths. A2 CHAIN-KEY: whole pages alone prove nothing about WHOSE page a
+    slot holds now -- the fast path passes only when every stored key names
+    exactly the slot its rows address, COMPLETE (``_chain_keys_hold``, one
+    ``find_slots_np`` per chain). A chain that is not, or that carries one of P's hand-off keys at a
     depth where P's chain has another key (``p_chain``, indexed from token 0,
     ``page0`` = the first loaded page's index), is proven PAGE BY PAGE AGAINST
     ITS TOKENS (``_chain_plan``):
@@ -487,20 +684,24 @@ def verify_load_chain(pool, nodes, host_indices, rows_of, stems_of, *, keys_of=N
     S = int(pool.staging_rows)
     nodes = list(nodes)
     keys_of = keys_of or (lambda n: n.hash_value)
-    if not _chain_shifted(nodes, keys_of, p_chain, page0) and _chain_clean(
-            P, host_indices.to("cpu", dtype=torch.int64) - S):
+    ar = host_indices.to("cpu", dtype=torch.int64) - S
+    if not _chain_shifted(nodes, keys_of, p_chain, page0) and _chain_clean(P, ar, S) \
+            and _chain_keys_hold(pool, nodes, ar, stems_of, keys_of):   # A2 CHAIN-KEY
         return host_indices
     plans, stop, _total = _chain_plan(pool, nodes, rows_of, stems_of, keys_of, own_hash,
                                       p_chain, page0, prior0)
     if stop is not None:
-        raise ArenaChainMismatch(stop[1] + " -- the load is refused")
+        _n, _np_ = _chain_node_of_page(nodes, keys_of, stop[0])
+        raise ArenaChainMismatch(stop[1] + " -- the load is refused", page=stop[0], node=_n, node_page=_np_)
     fixed = [w for p in plans for w in p["fixed"]]
     rekeyed = [w for p in plans for w in p["rekeyed"]]
     if not fixed and not rekeyed:
         return host_indices
     arena = pool.arena
     olds = [s for p in plans for s in p["unrefs"]]
-    drop = _repoint_unrefs(pool, arena, olds)
+    okeys = [k for p in plans for k in p.get("unref_keys", ())]
+    drop = _repoint_unrefs(pool, arena, olds,
+                           stems=stems_of(okeys) if len(okeys) == len(olds) and okeys else None)
     took = 0
     for p in plans:
         if p["refs"]:
@@ -511,6 +712,9 @@ def verify_load_chain(pool, nodes, host_indices, rows_of, stems_of, *, keys_of=N
         if not torch.equal(ref.to("cpu", dtype=torch.int64).reshape(-1) - S, p["rows"]):
             ref.copy_((p["rows"] + S).to(ref.dtype).view(ref.shape))
     gave = int(arena.ref_slots(drop, -1)) if drop else 0
+    _dd = [d for p in plans for d in p.get("disk_unrefs", ())]
+    if _dd:
+        _kv_dl.REGISTRY.release(_dd)   # S36: re-pointed away from their disk page
     _CHAIN_REPAIRED_N[0] += 1
     logger.warning(
         "#1424 CHAIN %s n=%d nodes=%d page0=%s refs=+%d/-%d (re-pointed %d, old held %d): %s -- %s",
@@ -538,6 +742,13 @@ def _partial_reap_age_s() -> float:
         return max(0.0, float(os.environ.get(ENV_PARTIAL_REAP_S, "30")))
     except ValueError:
         return 30.0
+
+
+def _arena_free_slots(arena) -> int:
+    """FREE slots of the arena now (arena.c keeps COMPLETE and CLAIMED
+    disjoint, so free = slots - complete - claimed)."""
+    st = arena.stats()
+    return int(st["slots"]) - int(st["complete"]) - int(st["claimed"])
 
 
 def _reap_orphan_claims(arena) -> list:
@@ -619,9 +830,36 @@ def _release_fresh(arena, slots, gens, site: str) -> None:
                 _RELEASE_N[1])
 
 
+_LOST_SETTLED = [0, 0, 0]  # A2: settle calls, pages re-pointed, pages orphaned
 _COMPLETE_LOST = {3: 0, 4: 0, 5: 0, 6: 0}  # arena_complete status -> slots lost, process-wide
 _COMPLETE_LOST_CALLS = [0]
 _LOST_NAMES = {3: "recycled", 4: "not_claimed", 5: "overflow"}
+
+
+#: 1494: last emit time per (pool class, event) for the fill line (seconds)
+_FILL_LOG_LAST: dict = {}
+_FILL_LOG_MIN_GAP_S = 1.0
+
+
+def _arena_fill_log(pool, event: str) -> None:
+    """1494: ONE ``PDFLIP MAMBA-ARENA-FILL`` line from the arena's own counters.
+    used = complete + claimed (arena.c keeps the two states disjoint, so
+    free = slots - used); staging_used = staging rows minus the free list.
+    Reads one 4-word stats call; at most one line per second per pool class
+    and event. Off (default) = a single env read, nothing else."""
+    if not envs.FLLIPER_PDFLIP_MAMBA_ARENA_FILL_LOG.get():
+        return
+    key = (type(pool).__name__, event)
+    now = time.monotonic()
+    if now - _FILL_LOG_LAST.get(key, -_FILL_LOG_MIN_GAP_S) < _FILL_LOG_MIN_GAP_S:
+        return
+    _FILL_LOG_LAST[key] = now
+    st = pool.arena.stats()
+    slots, complete, claimed = int(st["slots"]), int(st["complete"]), int(st["claimed"])
+    logger.info("PDFLIP MAMBA-ARENA-FILL event=%s pool=%s used=%d/%d claimed=%d complete=%d free=%d "
+                "staging_used=%d/%d", event, type(pool).__name__, complete + claimed, slots,
+                claimed, complete, slots - complete - claimed,
+                int(pool.staging_rows) - len(pool.free_slots), int(pool.staging_rows))
 
 
 def _host_write_claim(arena, stems, totals):
@@ -1025,18 +1263,19 @@ def load_index_async() -> bool:
     if raw:
         on = raw in ("1", "true", "yes", "on")
     else:
-        # LS12 rest (30.09.): unset/blank takes the published form's registry row
-        # (qwen27b hicache_load_async_index on, hauenh 'HICACHE-LOAD-ASYNC-INDEX armed' 3/3).
+        # SCHALTER-HALBPORT 1002: unset/blank takes the published form's
+        # registry row (pdflip/form.py ModelProfile.hicache_load_async_index:
+        # nextflash on, P and D; qwen27b states nothing -> off; no form: off).
         from flliper.srt.pdflip.form import profile_switch_default
 
         on = bool(profile_switch_default("FLLIPER_HICACHE_LOAD_ASYNC_INDEX", False))
     if on and not _LOAD_ASYNC_INDEX_SEEN:
-        # LS12 (30.09.): the metal proof -- one line per process at the first
-        # load-back that takes the async index path. Off: no line.
+        # the metal proof (27B LS12 da8464b9f0): one line per process at the
+        # first load-back that takes the async index path. Off: no line.
         _LOAD_ASYNC_INDEX_SEEN.append(True)
         logger.info("HICACHE-LOAD-ASYNC-INDEX armed: the first load-back's index tensors cross "
                     "through pinned memory / are selected on the device, no host wait on the "
-                    "load stream (FLLIPER_HICACHE_LOAD_ASYNC_INDEX=1)")
+                    "load stream (FLLIPER_HICACHE_LOAD_ASYNC_INDEX=%s)", raw or "profile")
     return on
 
 
@@ -1066,11 +1305,27 @@ def _select_rows_async(t: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     return t.index_select(0, index_to_device_async(pos, t.device))
 
 
+_L3_COMPLETE_N = [0]
+
+
+def _l3_complete_note(incomplete: int, pages: int) -> None:
+    _L3_COMPLETE_N[0] += 1
+    n = _L3_COMPLETE_N[0]
+    if n <= 32 or n % 256 == 0:
+        logger.warning("L3-COMPLETE-ONLY n=%d incomplete=%d of %d pages: a slot not COMPLETE in the shared "
+                       "header (an owner's share missing) is neither written to L3 nor counted as secured -- "
+                       "the node keeps its host copy", n, incomplete, pages)
+
+
 class ArenaMHAHostPool(MHATokenToKVPoolHost):
     """MHA host pool whose rows beyond the staging ring are arena slots."""
 
     #: #243: a pending hand-off keeps every page of its chain in this arena
     _pdflip_handoff_keep = "kv"
+
+    #: #231: the KV arena reaps orphan claims FIRST in its claim-time room
+    #: (``_evict_for_claim``); the mamba anchor arena overrides this with True
+    _pdflip_reaps_orphan_claims = False
 
     arena_read = True
 
@@ -1406,7 +1661,12 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
 
     def resolve_rows(self, host_indices: torch.Tensor, slots: Sequence[int]) -> None:
         """KV role: write arena ids over the placeholders, in place -- P ids
-        per slot, so a resolved run covers len(slots) * P tokens."""
+        per slot, so a resolved run covers len(slots) * P tokens.
+
+        S36 KV-DURCHLAUF: an entry ``kv_durchlauf.DiskRef`` is a disk page (the arena was full): its P ids are disk
+        ids (``kv_durchlauf.disk_ids``), read through from the held L3 file at the load."""
+        if any(isinstance(x, _kv_dl.DiskRef) for x in slots):
+            return self._resolve_rows_with_disk(host_indices, slots)
         self.pin_slots(slots)
         vals = self.arena_ids(slots).to(dtype=host_indices.dtype)
         n = int(vals.numel())
@@ -1417,6 +1677,26 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
             )
         host_indices[:n] = vals.to(host_indices.device)
 
+    def _resolve_rows_with_disk(self, host_indices: torch.Tensor, slots) -> None:
+        P = _psz(self)
+        arena = [int(x) for x in slots if not isinstance(x, _kv_dl.DiskRef)]
+        if arena:
+            self.pin_slots(arena)
+        is_d = torch.tensor([isinstance(x, _kv_dl.DiskRef) for x in slots], dtype=torch.bool)
+        num = torch.tensor([x.d if isinstance(x, _kv_dl.DiskRef) else int(x) for x in slots], dtype=torch.int64)
+        first = torch.where(is_d, num * P + _kv_dl.disk_base(P), num * P + int(self.staging_rows))
+        vals = (first[:, None] + torch.arange(P, dtype=torch.int64)[None, :]).reshape(-1)
+        n = int(vals.numel())
+        if n > int(host_indices.numel()):
+            raise ValueError(
+                f"#1424 resolve_rows: {len(slots)} pages x {P} tokens = {n} ids do not fit the "
+                f"{int(host_indices.numel())}-token registration")
+        host_indices[:n] = vals.to(dtype=host_indices.dtype).to(host_indices.device)
+
+    def release_disk_rows(self, host_indices) -> int:
+        """S36: the disk pages these host rows name go back (their held L3 files are closed)."""
+        return _kv_dl.REGISTRY.release_rows(host_indices, _psz(self))
+
     def resolve_draft_rows(self, rows: Sequence[int], slots: Sequence[int]) -> None:
         """Draft role: remember the DRAFT arena slot behind each KV row (-1 = miss)."""
         if self.row_slot is None:
@@ -1426,6 +1706,21 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
 
     # -- transfers ------------------------------------------------------------
     def load_to_device_per_layer(self, device_pool, host_indices, device_indices, layer_id, io_backend):
+        if self.arena is not None and host_indices.numel() and _kv_dl.any_disk(host_indices):
+            # S36 KV-DURCHLAUF: disk pages are read through from their held L3 files straight into the device rows
+            # (all layers at the first layer call of this load); the rest takes the arena / staging path unchanged
+            hint = (id(host_indices), id(device_indices), int(host_indices.numel()), int(device_indices.numel()))
+            dm = _kv_dl.disk_mask(host_indices)
+            dmd = dm.to(device_indices.device)
+            self._load_disk_rows(device_pool, host_indices[dm], device_indices[dmd], layer_id, hint)
+            keep = ~dm
+            if not bool(keep.any()):
+                return None
+            return self._load_to_device_nodisk(device_pool, host_indices[keep], device_indices[~dmd], layer_id,
+                                               io_backend, hint=hint)
+        return self._load_to_device_nodisk(device_pool, host_indices, device_indices, layer_id, io_backend)
+
+    def _load_to_device_nodisk(self, device_pool, host_indices, device_indices, layer_id, io_backend, hint=None):
         if self.arena is None or host_indices.numel() == 0:
             return super().load_to_device_per_layer(device_pool, host_indices, device_indices, layer_id, io_backend)
         S = self.staging_rows
@@ -1438,14 +1733,96 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         # per-layer `host_indices - S` temporaries relied on CPython reusing
         # the freed tensor's id -- when it did not (TP0, xsn398), layers
         # 1..47 also ran the per-layer kernel: a second full copy (+321 ms).
-        self._page_key_hint = (id(host_indices), id(device_indices),
-                               int(host_indices.numel()), int(device_indices.numel()))
+        self._page_key_hint = hint or (id(host_indices), id(device_indices),
+                                       int(host_indices.numel()), int(device_indices.numel()))
         if bool(is_arena.all()):
             return self._load_arena(device_pool, host_indices - S, device_indices, layer_id)
         sel = is_arena.nonzero(as_tuple=True)[0]
         rest = (~is_arena).nonzero(as_tuple=True)[0]
         self._load_arena(device_pool, host_indices[sel] - S, device_indices[sel], layer_id)
         super().load_to_device_per_layer(device_pool, host_indices[rest], device_indices[rest], layer_id, io_backend)
+
+    def _load_disk_rows(self, device_pool, rows, device_indices, layer_id, hint) -> None:
+        """S36 KV-DURCHLAUF: the device rows of disk pages. Draft role: a disk page has no draft slot -- zeros, the
+        draft miss (#993). KV role: every layer of every disk page at the first layer call of this load
+        (``hint`` = the caller's index objects, as the arena page load keys its layer 0), later layers no-ops."""
+        if rows.numel() == 0:
+            return
+        if self.row_slot is not None:
+            kb = device_pool.k_buffer[layer_id]
+            d = device_indices.to(device=kb.device, dtype=torch.int64)
+            z = torch.zeros((int(d.numel()),) + tuple(kb.shape[1:]), dtype=kb.dtype, device=kb.device)
+            kb.index_copy_(0, d, z)
+            device_pool.v_buffer[layer_id].index_copy_(0, d, z)
+            return
+        if getattr(self, "_disk_loaded_key", None) == hint and int(layer_id) != 0:
+            return
+        self._load_disk_pages_all_layers(device_pool, rows, device_indices)
+        self._disk_loaded_key = hint
+
+    def _load_disk_pages_all_layers(self, device_pool, rows, device_indices) -> None:
+        """S36 KV-DURCHLAUF: read the whole L3 pages behind ``rows`` (disk ids) out of their HELD descriptors
+        (O_DIRECT where aligned) into the transfer target -- the cpu page-load mode's pinned stages, created only
+        if absent (``kv_durchlauf.block_pages``: 64 MiB per stage by default) -- copy each block to the card and
+        scatter every layer's K/V cells of the asked (page, lane) rows into the device rows. An L3 page has the
+        arena slot's byte layout (the write-behind / claim room write ``(0, total)`` of the slot, the fill reads
+        it back the same way), so the offsets are the arena load's (``_k_offs_b`` / ``_v_offs_b``). Owner lanes
+        (#239 token cut) are just rows with their lane: any (page, lane) set, duplicates included."""
+        P = _psz(self)
+        pb = int(self._page_bytes)
+        dev = device_pool.k_buffer[0].device
+        pg, lane = _kv_dl.pages_of_rows(rows, P)
+        up, inv = torch.unique(pg, return_inverse=True)
+        n_pages = int(up.numel())
+        entries = [_kv_dl.REGISTRY.entry(int(d)) for d in up.tolist()]
+        gone = [int(d) for d, e in zip(up.tolist(), entries) if e is None]
+        if gone:
+            raise RuntimeError(
+                f"PDFLIP KV-DURCHLAUF LOAD REFUSED: disk page(s) {gone[:4]} (of {n_pages}) were released before "
+                "their load -- the host rows outlived their registry entry; stopping by name instead of loading "
+                "bytes nobody holds")
+        B = max(1, min(n_pages, _kv_dl.block_pages(pb)))
+        _ensure_page_stages(self, B, pb, dev)
+        H, D = int(self.head_num), int(self.head_dim)
+        e = int(self.dtype.itemsize)
+        cell = H * D * e
+        L = len(self._k_offs_b)
+        dev_stage = torch.empty((B, pb), dtype=torch.uint8, device=dev)
+        didx = device_indices.to(device=dev, dtype=torch.int64)
+        for bi, start in enumerate(range(0, n_pages, B)):
+            b = min(B, n_pages - start)
+            k = bi % 2
+            self._page_events[k].synchronize()   # the copy that last read this stage is done
+            host_stage = self._page_stages[k]
+            ptrs = [int(host_stage[j].data_ptr()) for j in range(b)]
+            st = _kv_dl.read_pages(entries[start:start + b], ptrs, pb)
+            bad = [i for i, x in enumerate(st) if x != 0]
+            if bad:
+                raise RuntimeError(
+                    f"PDFLIP KV-DURCHLAUF READ FAILED: {len(bad)} of {b} L3 page(s) (first stem "
+                    f"{str(entries[start + bad[0]].stem)[:24]}, status {st[bad[0]]}) could not be read from the "
+                    "held descriptor -- stopping by name instead of loading a torn page")
+            dev_stage[:b].copy_(host_stage[:b], non_blocking=True)
+            self._page_events[k].record()
+            sel = ((inv >= start) & (inv < start + b)).nonzero(as_tuple=True)[0]
+            if not sel.numel():
+                continue
+            loc = (inv[sel] - start).to(dev)
+            ln = lane[sel].to(dev)
+            dst = didx[sel.to(dev)]
+            for l in range(L):
+                for off, buf in ((self._k_offs_b[l], device_pool.k_buffer[l]),
+                                 (self._v_offs_b[l], device_pool.v_buffer[l])):
+                    blk = dev_stage[:b, off:off + P * cell].view(b, P, cell)
+                    cells = blk[loc, ln].reshape(-1).view(self.dtype).view(-1, H, D)
+                    buf.index_copy_(0, dst, cells)
+        global _DISK_LOAD_N
+        _DISK_LOAD_N += 1
+        if _DISK_LOAD_N <= 16 or (_DISK_LOAD_N & (_DISK_LOAD_N - 1)) == 0:
+            s_ = _kv_dl.REGISTRY.stats
+            logger.info("PDFLIP KV-DURCHLAUF LOAD n=%d rows=%d pages=%d block=%d bytes=%d read_direct_total=%d "
+                        "(L3 -> transfer target -> device rows, no L2 slot)",
+                        _DISK_LOAD_N, int(rows.numel()), n_pages, B, n_pages * pb, s_["read_direct"])
 
     def _arena_load_guard(self, device_pool, slots, device_indices, layer_id, *, nrows: int, nmiss: int,
                           need_pinned: bool = True) -> None:
@@ -2042,6 +2419,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                 if k <= 8 or k % 256 == 0:
                     logger.warning("#1427 ARENA-CLAIM REFUSED n=%d pages=%d statuses=%s (4 = no free slot)",
                                    k, len(stems), sorted(set(st.tolist())))
+                _arena_fill_log(self, "claim_refused")
                 return None
         pend = st != 2
         if bool(pend.any()):
@@ -2106,6 +2484,8 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         idx = torch.as_tensor(host_indices).reshape(-1).cpu().to(torch.int64)
         if idx.numel() == 0:
             return 0
+        if getattr(self, "row_slot", None) is None and _kv_dl.REGISTRY.live():
+            _kv_dl.REGISTRY.release_rows(idx, _psz(self))   # S36: disk pages of a dropped node / release entry
         rows = torch.unique(idx[_arena_mask(self, idx)]) - int(self.staging_rows)
         if rows.numel() == 0:
             return 0
@@ -2162,7 +2542,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         Rows of a pending (un-acked) write are not COMPLETE and are skipped
         (``arena_ref_slots``' own rule). Returns ``{pages, on_disk, written,
         lost}``; the caller releases the rows only when ``lost`` is 0."""
-        out = {"pages": 0, "on_disk": 0, "written": 0, "lost": 0}
+        out = {"pages": 0, "on_disk": 0, "written": 0, "lost": 0, "unpaired": 0, "sidecar_absent": 0}
         arena = getattr(self, "arena", None)
         if arena is None or host_indices is None:
             return out
@@ -2175,11 +2555,39 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
             out["lost"] = out["pages"]
             return out
         total = int(getattr(self, "_page_bytes", 0) or getattr(arena, "slot_bytes", 0) or 0)
+        # L3-COMPLETE (review K15b B1/A1, 16.10.): arena_ref_slots excludes only THIS rank's pending
+        # set; complete_write takes a slot out of it on status 0 too (merged, not full) -- under the
+        # token cut TP0's ack comes ~45 s before the workers'. Such a slot is CLAIMED in the shared
+        # header: its bytes are half a page. It is neither written to L3 nor counted as secured
+        # (``incomplete`` adds to ``lost``: every caller keeps the node -- the K10 device round, the
+        # W3 host-leaf round). An on-disk file of the same stem does not make it secured either.
+        # No switch (review A1/A4 16.10.: a switch back onto a proven wrong-KV path is no feature);
+        # an arena without the header read is fail-closed (nothing provably complete).
+        slot_list = [int(s) for s in slots.tolist()]
+        out["incomplete"] = 0
+        states_fn = getattr(arena, "slot_states", None)
+        try:
+            states = states_fn(slot_list) if callable(states_fn) else [-1] * len(slot_list)
+        except Exception:  # noqa: BLE001 - unreadable header = not provably complete
+            states = [-1] * len(slot_list)
+        keep = [s for s, st in zip(slot_list, states) if int(st) == 2]
+        out["incomplete"] = len(slot_list) - len(keep)
+        if out["incomplete"]:
+            _l3_complete_note(out["incomplete"], len(slot_list))
+        slot_list = keep
+        if not slot_list:
+            out["lost"] = out["incomplete"]
+            return out
         # key 0/0: arena_secure_to_disk names the page by the slot header's
         # stem (arena.slot_stem), the same name the clock evict writes under
-        sec = secure(arena, [(int(s), 0, 0, total) for s in slots.tolist()])
-        for k in ("on_disk", "written", "lost"):
+        sec = secure(arena, [(s, 0, 0, total) for s in slot_list])
+        # H16P-NACHBESSERUNG A2: `unpaired` (a KV page held back for want of its QSA index: NOT on disk) and
+        # `sidecar_absent` are passed on -- the caller must not read them as a complete copy
+        for k in ("on_disk", "written", "lost", "unpaired", "sidecar_absent"):
             out[k] = int(sec.get(k, 0))
+        # the sink's own CLAIMED lock (review A2) adds to both: its ``lost`` already carries it
+        out["lost"] += out["incomplete"]
+        out["incomplete"] += int(sec.get("incomplete", 0))
         ArenaMHAHostPool._257_written_to_l3 = (
             getattr(ArenaMHAHostPool, "_257_written_to_l3", 0) + out["written"])
         return out
@@ -2233,10 +2641,29 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
             keep = None
         stages = [0, 0, 0]
         l3_state = [0, 0, 0]  # #257 (d): on_disk, written, dropped_without_l3
+        # S24 CLAIM-ROOM (review 1018, probe P1): the stems of every read that fills right now (any io thread of this
+        # process) are off every stage of this clock too -- the scheduler thread's claim took the not yet walked L2
+        # chain of a running read (same class as SIBLING-EVICT). Hashed in C, once.
+        prot = None
+        try:
+            from flliper.srt.mem_cache.hicache_storage import fill_protected_stems
+            from flliper.srt.mem_cache.storage.file.hicache_arena import stem_keys_lo as _skl
+
+            _ps = fill_protected_stems()
+            if _ps:
+                import numpy as _np_u
+
+                prot = _np_u.unique(_skl(_ps))   # sorted: arena.c searches the keep list by bisection
+        except Exception:  # noqa: BLE001 - the protection is an improvement, never a wall
+            prot = None
+        _kl = None if prot is None or not len(prot) else prot
         try:
             if keep is not None and len(keep):
                 # (i) unreferenced, kept by nobody
-                cands = list(arena.evict_candidates(need, keep_lo=keep.keys))
+                import numpy as _np_s24
+
+                cands = list(arena.evict_candidates(
+                    need, keep_lo=keep.keys if _kl is None else _np_s24.union1d(keep.keys, _kl)))
                 stages[0] = len(cands)
                 if len(cands) < need:
                     # (ii) #248: kept, WITH an L3 copy -- freed without I/O,
@@ -2246,21 +2673,23 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                     copied = _handoff_pending.copied_mask(self, keep)
                     if copied.any():
                         mid = _handoff_pending.evict_ordered(arena, keep, need - len(cands),
-                                                             eligible=copied, site="claim_ii")
+                                                             eligible=copied, protect_lo=_kl, site="claim_ii")
                         stages[1] = len(mid)
                         cands += list(mid)
                 if len(cands) < need:
                     # (iii) kept, WITHOUT a copy: lost, by name -- in the same
                     # order; the keep-less clock only for what the order misses
-                    last = _handoff_pending.evict_ordered(arena, keep, need - len(cands), site="claim_iii")
+                    last = _handoff_pending.evict_ordered(arena, keep, need - len(cands), protect_lo=_kl,
+                                                          site="claim_iii")
                     if len(last) < need - len(cands):
-                        last = list(last) + list(arena.evict_candidates(need - len(cands) - len(last)))
+                        last = list(last) + list(arena.evict_candidates(need - len(cands) - len(last),
+                                                                        keep_lo=_kl))
                     if last:
                         stages[2] = len(last)
                         _handoff_pending.note_evicted(self, last, keep, need=need)
                         cands += list(last)
             else:
-                cands = arena.evict_candidates(need)
+                cands = arena.evict_candidates(need, keep_lo=_kl)
                 stages[0] = len(cands)
             if cands:
                 # #257 (d): no page leaves L2 without a copy in L3. A
@@ -2276,7 +2705,10 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                     l3_state[2] += int(sec.get("lost", 0))
                 else:
                     l3_state[2] += len(cands)
-                free_named(arena, [c[0] for c in cands], "claim_room")
+                # ARENA-FREE-GEN (READ-DEPTH 1014): only this evictor's candidates, generation-bound
+                from flliper.srt.mem_cache.storage.file.hicache_arena import free_evicted_named
+
+                free_evicted_named(arena, [c[0] for c in cands], "claim_room")
                 stems = getattr(arena, "_stems", None)
                 if isinstance(stems, dict):
                     for c in cands:
@@ -2326,6 +2758,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                         l3_state[0], l3_state[1], l3_state[2],
                         ArenaMHAHostPool._257_written_to_l3,
                         ArenaMHAHostPool._257_dropped_without_l3)
+        _arena_fill_log(self, "drop")
         return len(cands) + len(reaped) + len(reaped0)
 
     def _claim(self, stems):
@@ -2379,11 +2812,13 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                 if k <= 8 or k % 256 == 0:
                     logger.warning("#1427 ARENA-CLAIM REFUSED n=%d pages=%d statuses=%s (4 = no free slot)",
                                    k, len(stems), sorted({st for _, st, _ in got}))
+                _arena_fill_log(self, "claim_refused")
                 return None
         # xsn352 (py-spy PP0): the per-slot loop was ~27 ms per 4096-page node
         # in the scheduler thread -- batched: one dict update, one ref call.
         self._pending.update((slot, (gen, st == 0)) for slot, st, gen in got if st != 2)
         self._pend_mark([slot for slot, st, _ in got if st != 2], True)
+        _arena_fill_log(self, "claim")
         return [slot for slot, _, _ in got]
 
     def alloc_write(self, hashes) -> Optional[torch.Tensor]:
@@ -2395,6 +2830,29 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         if slots is None:
             return None
         return self.arena_ids(slots)  # x59: P ids per page hash
+
+    def claim_would_refuse(self, hashes) -> bool:
+        """SWEEP-FULL-ARENA (NF boot 1007_2142, P->D flip epoch 2): would
+        ``alloc_write(hashes)`` be refused right now for want of room?
+
+        The claim's room is: free slots, plus the orphan claims its own reap
+        frees first (#231, the KV arena's first step -- taken here exactly as
+        the claim takes it), plus every COMPLETE slot no reader references
+        (the clock of ``_evict_for_claim``, all stages). A page already in the
+        arena (claimed or complete) needs no room. Pins are not subtracted, so
+        the room can only be OVER-estimated -- an over-estimate answers False
+        and the caller claims as before. Never claims, never evicts.
+        False when the pool has no bound arena (the claim decides)."""
+        arena = self.arena
+        if arena is None or self._backend is None or not hashes:
+            return False
+        absent = sum(1 for s in arena.find_states(self._stems(hashes)) if int(s) == 0)
+        if absent <= _arena_free_slots(arena):
+            return False   # the claim needs no room-making: it is not refused for room
+        if not self._pdflip_reaps_orphan_claims:
+            _reap_orphan_claims(arena)   # the claim's own first step (#231 / OS)
+        referenced, _refs, complete = arena.ref_census()
+        return absent > _arena_free_slots(arena) + int(complete) - int(referenced)
 
     def alloc_write_draft(self, kv_host_indices: torch.Tensor, hashes, comp: str) -> bool:
         """Draft role: claim the draft slot behind each KV arena row."""
@@ -2725,6 +3183,10 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
             st = self.arena.complete_slots_np(sel.numpy(), gens.numpy(), self._own_extents)
             _note_complete_lost(st.tolist(), sel.tolist(), "complete_write")
             keep = sel.numpy()[st <= 2]
+            # A2: the pages whose bytes this writer lost (3 recycled, 4 not
+            # claimed, 5 overflow, 6 quarantined) take NO reference -- the node's
+            # rows on them must not stay (``settle_lost_rows``)
+            self._a2_lost = [int(x) for x in sel.numpy()[st >= 3].tolist()]
             if keep.size:
                 self.arena.ref_slots(keep.tolist(), +1)
             return int((st == 1).sum())
@@ -2738,8 +3200,97 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
             self._pend_pop(s)
             done += int(r == 1)
         _note_complete_lost(st, slots, "complete_write")
+        self._a2_lost = [int(s) for s, r in zip(slots, st) if r >= 3]   # A2 (see above)
         self.arena.ref_slots([s for s, r in zip(slots, st) if r <= 2], +1)
         return done
+
+    def take_lost_slots(self) -> list:
+        """A2: the slots the LAST ``complete_write`` of this pool lost (status
+        3..6, no reference taken), handed out once."""
+        lost = list(getattr(self, "_a2_lost", None) or ())
+        self._a2_lost = []
+        return lost
+
+    def settle_lost_rows(self, host_indices: torch.Tensor, hashes=None, suffix: str = "") -> dict:
+        """A2 (nf-h54-review-1015 B1): a node's rows on pages its write LOST
+        (``complete_write`` status 3..6: an H54 take-over or a JOIN-IDLE
+        quarantine took the claim from its key before this writer's ack; no
+        reference was taken) must not stay on the old slot -- once the slot is
+        recycled they would load another key's KV and their release would
+        take that key's readers' reference.
+
+        Settled IN PLACE on ``host_indices`` (the node's own host_value), page
+        by page:
+          * the page key has a COMPLETE slot (the take-over's reader filled it
+            from L3): the rows are re-pointed there and that slot takes the
+            node's reader reference (the #1424 re-point, done at the ack);
+          * otherwise the rows become ``ORPHAN`` ids -- above the arena and the
+            placeholder range: no release ever touches them (not an arena row,
+            not a staging row) and the load-back proof cannot pass them (not a
+            whole page): it re-points to the key's COMPLETE slot or stops by
+            name on the group-legal path (``_chain_plan``).
+        Returns ``{"lost", "repointed", "orphaned", "moved": [(old_row, new_row), ...]}``;
+        ``moved`` lets the draft pool follow the KV rows."""
+        out = {"lost": 0, "repointed": 0, "orphaned": 0, "moved": []}
+        lost = set(self.take_lost_slots())
+        if not lost or self.arena is None or host_indices is None or host_indices.numel() == 0:
+            return out
+        import numpy as np
+        P = _psz(self)
+        S = int(self.staging_rows)
+        hi = host_indices.reshape(-1)
+        rows = hi.to("cpu", dtype=torch.int64) - S
+        n = int(rows.numel())
+        if n % P:
+            return out
+        pages = rows.view(-1, P)
+        head = pages[:, 0]
+        in_arena = (head >= 0) & (head < _atok(self))
+        page_slot = torch.where(in_arena, head // P, torch.full_like(head, -1))
+        hit = torch.tensor([int(x) in lost for x in page_slot.tolist()], dtype=torch.bool)
+        idx = hit.nonzero()[:, 0]
+        if not idx.numel():
+            return out
+        out["lost"] = int(idx.numel())
+        lane = torch.arange(P, dtype=torch.int64)[None, :]
+        new = pages.clone()
+        settled = torch.zeros(int(idx.numel()), dtype=torch.bool)
+        if hashes is not None and len(hashes) == int(pages.shape[0]) and getattr(self, "_backend", None) is not None:
+            try:
+                stems = self._stems([hashes[int(i)] for i in idx.tolist()], suffix)
+                c_slots, c_states = self.arena.find_slots_np(stems)
+                c_slots = np.asarray(c_slots, dtype=np.int64)
+                ok = (c_slots >= 0) & (np.asarray(c_states) == 2) & np.asarray(
+                    [int(c) not in lost for c in c_slots.tolist()], dtype=bool)
+                if ok.any():
+                    took = self.arena.ref_slots_mask_np(c_slots[ok]) == 1
+                    pos = np.nonzero(ok)[0][took]
+                    for k in pos.tolist():
+                        i = int(idx[k])
+                        new[i] = int(c_slots[k]) * P + lane[0]
+                        settled[k] = True
+            except Exception as exc:  # noqa: BLE001 -- the orphan form below is always safe
+                logger.warning("A2 LOST-ROWS re-point raised: %r -- the lost pages are orphaned", exc)
+        orphan = int(getattr(self, "id_space", S + _atok(self) + PLACEHOLDERS)) - S
+        for k in (~settled).nonzero()[:, 0].tolist():
+            new[int(idx[k])] = orphan
+        out["repointed"] = int(settled.sum())
+        out["orphaned"] = int(idx.numel()) - out["repointed"]
+        for i in idx.tolist():
+            out["moved"].extend(zip((pages[i] + S).tolist(), (new[i] + S).tolist()))
+        hi.copy_((new.reshape(-1) + S).to(hi.dtype).to(hi.device))
+        _LOST_SETTLED[0] += 1
+        _LOST_SETTLED[1] += out["repointed"]
+        _LOST_SETTLED[2] += out["orphaned"]
+        k = _LOST_SETTLED[0]
+        if k <= 16 or (k & (k - 1)) == 0:
+            logger.warning(
+                "A2 LOST-ROWS n=%d pages=%d repointed=%d orphaned=%d totals=%d/%d -- a write's ack came "
+                "after its claim lost the key (complete 3..6, no reference): the node's rows left the old "
+                "slot at the ack (re-pointed to the key's COMPLETE slot, else orphaned: the load proof "
+                "re-points or stops by name, no release touches them)",
+                k, out["lost"], out["repointed"], out["orphaned"], _LOST_SETTLED[1], _LOST_SETTLED[2])
+        return out
 
     def abort_write(self, host_indices: torch.Tensor) -> None:
         """The write never happened: free fresh claims, drop joins, release
@@ -2824,6 +3375,8 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         if self.arena is None:
             return super().free(indices)
         idx = indices.cpu() if torch.is_tensor(indices) else torch.as_tensor(indices)
+        if self.row_slot is None and _kv_dl.REGISTRY.live():
+            _kv_dl.REGISTRY.release_rows(idx, _psz(self))   # S36: a freed node's disk pages
         S = self.staging_rows
         staging = idx[idx < S]
         arena_rows = idx[_arena_mask(self,idx)]

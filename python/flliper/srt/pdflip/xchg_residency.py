@@ -169,6 +169,11 @@ class CardCensus:
     dormant_proc_used_mib: int
     #: Where that number was read.  Printed; never defaulted.
     dormant_source: str = ""
+    #: AP4 1526: the card CLASS this row was measured on (``card_identity``
+    #: label, e.g. ``RTX3080``), optional.  A donor of a borrowed row is chosen
+    #: by it; a row without one is labelled by the live card that carries its
+    #: UUID (:func:`resolve_census`).
+    card_class: str = ""
 
 
 @dataclass(frozen=True)
@@ -397,12 +402,275 @@ def load_census(path: str) -> XchgCensus:
                 f"card {uuid} dormant_proc_used_mib",
             ),
             dormant_source=str(entry.get("dormant_source", "")),
+            card_class=str(entry.get("card_class", "") or ""),
         )
     return XchgCensus(
         cards=cards,
         waves=tuple(waves),
         provenance=str(blob.get("provenance", "")),
         path=path,
+    )
+
+
+# ---------------------------------------------------------------------------
+# AP4 1526: the census is joined to the LIVE inventory, not to this rig's UUIDs
+
+#: The refusal code of a census row that is BORROWED from another card.  It is
+#: a VALUE refusal in ``refusals.REGISTER`` (``--force`` starts with the
+#: borrowed row and prints ``FORCED-PAST HW-BORROWED``), wired through
+#: ``launcher.load_xchg_census_for_cards``.
+CODE_BORROWED = "HW-BORROWED"
+
+
+@dataclass(frozen=True)
+class CensusBorrow:
+    """One live card whose census row is BORROWED from another census row."""
+
+    uuid: str
+    nvml_index: int
+    name: str
+    card_class: str
+    donor_uuid: str
+    donor_class: str
+    #: ``class`` (a census row of the same card class), ``twin`` (AP2b 1006: no
+    #: row of that class, but one of its ARCH TWIN -- ``card_identity.
+    #: arch_twin_class``, the AP1 W19 rule, sm_86 -> RTX3080), ``conservative``
+    #: (neither: the most demanding row of the census, which can only OVER-price
+    #: a peak) or ``map`` (the operator named the row).
+    kind: str
+    #: AP2b 1006: where the donor's class came from when the census row states
+    #: none and no live card carries its UUID -- the reference rig's card
+    #: registry (:func:`reference_census_classes`).  "" = stated / live card.
+    donor_class_from: str = ""
+
+    def text(self, census_path: str = "") -> str:
+        how = {
+            "class": "the most demanding census row of the SAME card class "
+                     f"({self.card_class})",
+            "twin": "the census has no row of this card class "
+                    f"({self.card_class}); the most demanding row of its ARCH TWIN "
+                    f"class {self.donor_class} (same compute capability, the AP1 W19 "
+                    "rule) stands in",
+            "conservative": "the census has no row of this card class "
+                            f"({self.card_class}); the most demanding row of the census "
+                            "stands in (it can only over-price the peak)",
+            "map": "the row the operator named (--pdflip-xchg-census-map)",
+        }[self.kind]
+        src = (f", class read from {self.donor_class_from}"
+               if self.donor_class_from else "")
+        return (
+            f"{CODE_BORROWED}: card {self.uuid} (nvml{self.nvml_index} {self.name}, "
+            f"class {self.card_class}) is not in the census {census_path or '<inline>'}; "
+            f"its row would be BORROWED from census row {self.donor_uuid} "
+            f"(class {self.donor_class or 'unlabelled'}{src}) -- {how}.  The per-tag bytes "
+            "and the dormant residue are another card's measurement, applied here as if "
+            "measured on this one; the serving constants must not stand in -- they "
+            "contain none of the exchange lane's residency.  Measure this inventory "
+            "(pdflip/xchg_census.py), name "
+            "the row with --pdflip-xchg-census-map <live>=<census uuid>, or start with "
+            "--force"
+        )
+
+
+def parse_census_map(text: str) -> List[Tuple[str, str]]:
+    """``"<live>=<census uuid>[,...]"`` -> ``[(live, donor), ...]``.
+
+    ``<live>`` is a live card UUID, ``nvml<N>`` or a card class label
+    (``RTX3080``); ``<census uuid>`` is a key of the census file.  A malformed
+    item is W71 by name (an operator error, not forceable)."""
+    out: List[Tuple[str, str]] = []
+    for item in str(text or "").replace(";", ",").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        live, sep, donor = item.partition("=")
+        if not sep or not live.strip() or not donor.strip():
+            raise PdFlipXchgResidencyUnarmable(
+                f"W71 PdFlipXchgResidencyUnarmable: --pdflip-xchg-census-map item {item!r} is "
+                "not <live>=<census uuid> (live = card UUID, nvml<N> or class label)"
+            )
+        out.append((live.strip(), donor.strip()))
+    return out
+
+
+def _demand_mib(entry: CardCensus) -> int:
+    """How much a census row asks of its card: both groups' tag bytes plus the
+    dormant residue counted twice (the same terms ``solve`` sums)."""
+    return (
+        sum(sum(per.values()) for per in entry.tags.values())
+        + 2 * int(entry.dormant_proc_used_mib)
+    )
+
+
+#: AP2b 1006: the source named for a donor class read from the reference rig's
+#: card registry (:func:`reference_census_classes`).
+REFERENCE_CLASS_SOURCE = (
+    "the reference rig's card registry (planner/power_limit.py RIG_5090 / "
+    "RIG_3080_NVML0 / RIG_3080_NVML2: UUID + NVML board name)"
+)
+
+
+def reference_census_classes() -> Dict[str, str]:
+    """AP2b 1006: ``census UUID -> card class`` of the reference rig's cards.
+
+    The shipped census files under ``pdflip/census/`` predate AP2's ``card_class``
+    field: their rows are keyed by the reference rig's UUIDs and say nothing
+    else about the board.  On that rig the live card carrying the UUID names the
+    class (:func:`resolve_census`); on ANY other inventory nobody did, every row
+    was "unlabelled", and a 3080 borrowed the census's heaviest row (the 5090
+    image, 24330 MiB on a 20480 MiB board: W71 at N = 4).
+
+    The UUID -> board mapping of the reference rig is recorded in the tree
+    already, keyed by physical UUID on purpose (``planner/power_limit.py``, the
+    ``NVML -> CUDA ordinal map`` of boots fnFL2x148/x160/x162/x163); the class
+    is the SAME ``card_identity.calibration_class`` every record lookup uses.
+    No census file is read or changed here; a UUID this registry does not name
+    stays unlabelled (and borrows conservatively, as before)."""
+    from flliper.srt.planner import power_limit as _pl
+    from flliper.srt.pdflip import card_identity as _ci
+
+    out: Dict[str, str] = {}
+    for uuid, nvml, name in (_pl.RIG_5090, _pl.RIG_3080_NVML0, _pl.RIG_3080_NVML2):
+        cls = _ci.calibration_class({"uuid": uuid, "nvml_index": nvml, "name": name})
+        if cls:
+            out[str(uuid)] = cls
+    return out
+
+
+def resolve_census(
+    census: XchgCensus,
+    cards: Sequence[object],
+    census_map: str = "",
+    class_of: Optional[object] = None,
+    known_classes: Optional[Mapping[str, str]] = None,
+    twin_of: Optional[object] = None,
+) -> Tuple[XchgCensus, List[CensusBorrow], List[str]]:
+    """Give EVERY live card a census row, and say which rows are not its own.
+
+    ``(census', borrows, notes)``.  A live card whose UUID is a key of the
+    census keeps its own row untouched; when every live card is such a card the
+    SAME census object is returned and the lists are empty -- the reference rig
+    (and any inventory the census was measured on) is byte-for-byte what
+    ``solve`` always saw.
+
+    A live card without a row is not an ``is not in the census`` dead end:
+    its row is taken from a donor and reported as a :class:`CensusBorrow`, which
+    the launcher turns into the forcebar refusal ``HW-BORROWED``.  Donor order:
+    the operator's ``census_map`` (``notes`` says so, not a borrow to refuse:
+    the operator named it), else the most demanding row of the SAME card class,
+    else (AP2b 1006) the most demanding row of the card's ARCH TWIN class
+    (``twin_of``, default ``card_identity.arch_twin_class`` -- the AP1 W19 rule:
+    a 3090 borrows a 3080 row, not the 5090's), else the most demanding row of
+    the whole census.  The class of a donor is its ``card_class`` field when the
+    file states one, else the class of the live card that carries its UUID,
+    else (AP2b 1006) ``known_classes[uuid]`` -- the reference rig's registry
+    (:func:`reference_census_classes`, named in the borrow line) -- else
+    unlabelled.  A derived donor is still a BORROW (HW-BORROWED, forcebar):
+    the class picks the row, it does not make the row a measurement of this
+    card; only ``census_map`` (the operator's assertion) is not refused.
+
+    The model, format and flip mode are not looked at here and need not be: the
+    census file a profile hands in is already per model (its tag names, waves
+    and bytes), and a borrowed row keeps that model's tags -- the SAME code
+    serves the NF, INT8, FP8, NVFP4 and GGUF lines.
+    """
+    from flliper.srt.pdflip import card_identity
+
+    label = class_of if callable(class_of) else card_identity.class_label
+    live_by_uuid = {getattr(c, "uuid", ""): c for c in cards if getattr(c, "uuid", "")}
+    missing = [
+        c for c in cards
+        if getattr(c, "uuid", "") and getattr(c, "uuid", "") not in census.cards
+    ]
+    if not missing:
+        return census, [], []
+
+    known = dict(known_classes or {})
+    donor_class: Dict[str, str] = {}
+    donor_from: Dict[str, str] = {}
+    for duuid, entry in census.cards.items():
+        stated = getattr(entry, "card_class", "") or ""
+        if stated:
+            donor_class[duuid] = stated
+        elif duuid in live_by_uuid:
+            donor_class[duuid] = str(label(live_by_uuid[duuid]))
+        elif known.get(duuid):
+            donor_class[duuid] = str(known[duuid])
+            donor_from[duuid] = REFERENCE_CLASS_SOURCE
+        else:
+            donor_class[duuid] = ""
+    twin_fn = twin_of if callable(twin_of) else card_identity.arch_twin_class
+
+    pairs = parse_census_map(census_map)
+    for _live, donor in pairs:
+        if donor not in census.cards:
+            raise PdFlipXchgResidencyUnarmable(
+                f"W71 PdFlipXchgResidencyUnarmable: --pdflip-xchg-census-map names census row "
+                f"{donor!r}, which census {census.path or '<inline>'} does not carry "
+                f"(rows: {sorted(census.cards)})"
+            )
+
+    def _named(card: object) -> Optional[str]:
+        keys = {
+            getattr(card, "uuid", ""),
+            f"nvml{getattr(card, 'nvml_index', '?')}",
+            str(label(card)),
+        }
+        hit = [donor for live, donor in pairs if live in keys]
+        return hit[-1] if hit else None
+
+    new_cards = dict(census.cards)
+    borrows: List[CensusBorrow] = []
+    notes: List[str] = []
+    for card in missing:
+        uuid = getattr(card, "uuid", "")
+        cls = str(label(card))
+        named = _named(card)
+        if named is not None:
+            donor_uuid, kind = named, "map"
+        else:
+            same = [u for u, k in donor_class.items() if k and k == cls]
+            twin = "" if same else str(twin_fn(card) or "")
+            kin = [u for u, k in donor_class.items() if twin and k == twin]
+            pool = same or kin or list(census.cards)
+            donor_uuid = max(pool, key=lambda u: (_demand_mib(census.cards[u]), u))
+            kind = "class" if same else ("twin" if kin else "conservative")
+        donor = census.cards[donor_uuid]
+        new_cards[uuid] = CardCensus(
+            uuid=uuid,
+            tags=donor.tags,
+            dormant_proc_used_mib=donor.dormant_proc_used_mib,
+            dormant_source=(
+                f"BORROWED ({kind}) from census row {donor_uuid}: {donor.dormant_source}"
+            ),
+        )
+        b = CensusBorrow(
+            uuid=uuid,
+            nvml_index=int(getattr(card, "nvml_index", -1)),
+            name=str(getattr(card, "name", "")),
+            card_class=cls,
+            donor_uuid=donor_uuid,
+            donor_class=donor_class.get(donor_uuid, ""),
+            kind=kind,
+            donor_class_from=donor_from.get(donor_uuid, ""),
+        )
+        if kind == "map":
+            notes.append(
+                f"PDFLIP-XCHG-CENSUS-MAP card {uuid} (nvml{b.nvml_index} {b.name}, class "
+                f"{cls}) is priced from census row {donor_uuid} as named by "
+                "--pdflip-xchg-census-map"
+            )
+        else:
+            borrows.append(b)
+    return (
+        XchgCensus(
+            cards=new_cards,
+            waves=census.waves,
+            provenance=census.provenance,
+            path=census.path,
+        ),
+        borrows,
+        notes,
     )
 
 

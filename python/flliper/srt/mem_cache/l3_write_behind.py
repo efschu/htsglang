@@ -32,6 +32,18 @@ bounded: after ``FLLIPER_HICACHE_L3_WB_LOAD_YIELD_MAX_S`` (30 s, 0 = no bound)
 of one unbroken streak the gate opens for ``FLLIPER_HICACHE_L3_WB_LOAD_WRITE_S``
 (2 s) -- ``L3-WB LOAD-YIELD CAP`` -- then the streak starts over. At most
 2 s of writes per 30 s of continuous load.
+
+S36 SOLL 2 ENDGUELTIG (18.10., user: "das sollte schon immer so sein, das von L2 auf L3 geschrieben wird ohne zu
+blockieren" and "flip oder schlaf sind d2h oder h2d zwischen gpu und systemram. zurueckschreiben in L3 ist disk und
+systemram. unabhaengig also."): the L2 -> L3 write NEVER holds still -- not during a leg, not while the group sleeps
+or is dormant, not while loads are pending. Measured on the rc9 restart, D TP0: ``LOAD-YIELD`` 430 s in ~25 min,
+single streaks up to 84 s, D's tree pages ``l3=on_disk:0,written:0`` -- a full arena that nothing could give back.
+:func:`quiet_reason` answers None always; the leg / sleep / load bookkeeping stays (``awake_epoch`` and the
+censuses read it) but gates nothing. The 28.09. problem (a 227 ms read queued 17 s behind write passes) is solved
+by READ PRIORITY in the I/O order instead of silence: every store read brackets its I/O with :func:`read_enter` /
+:func:`read_exit`; the writer asks :func:`write_turn` before each SMALL write chunk and waits while a read is in
+flight -- at most ``FLLIPER_HICACHE_L3_WB_READ_YIELD_MS`` (20 ms) per chunk, then the chunk is written anyway, so
+reads overtake and writes still move (>= one chunk per yield window).
 """
 
 from __future__ import annotations
@@ -50,12 +62,20 @@ ENV_LOAD_WRITE_S = "FLLIPER_HICACHE_L3_WB_LOAD_WRITE_S"
 LOAD_YIELD_MAX_S_DEFAULT = 30.0
 LOAD_WRITE_S_DEFAULT = 2.0
 _LONG_STREAK_S = 5.0
+#: S35 (18.10., rc9 restart 10:09:06-10:10:14Z): store reads of this process waiting in the arena ROOM-WAIT right now
+#: (``HiCacheFile._await_fill_room``). See :func:`_load_gate`.
+_room = {"waiting": 0, "starved_n": 0}
 
 _clock = time.monotonic
 _lock = threading.Lock()
 _state = {"legs": 0, "released": False, "sched": None, "entered": 0}
 #: EG review (c): the load-yield streak (see module docstring)
 _load = {"since": None, "open_until": 0.0, "streaks": 0, "total_s": 0.0, "max_s": 0.0, "caps": 0}
+#: S36: store reads with I/O in flight right now (read priority over the write-behind), and the census
+_reads = {"inflight": 0, "yields": 0, "yield_s": 0.0, "max_s": 0.0, "forced": 0}
+_read_cv = threading.Condition(threading.Lock())
+ENV_READ_YIELD_MS = "FLLIPER_HICACHE_L3_WB_READ_YIELD_MS"
+READ_YIELD_MS_DEFAULT = 20.0
 #: callables answering "how many store->host loads are queued or in flight"
 #: (the cache controller's prefetch queues registers one); any > 0 = quiet.
 _load_probes: list = []
@@ -132,11 +152,90 @@ def _load_streak_end(now: float) -> None:
                     held, _load["streaks"], _load["total_s"], _load["max_s"], _load["caps"])
 
 
+def read_enter() -> None:
+    """S36: a store read starts moving I/O (an L3 -> L2 fill, a KV-DURCHLAUF read)."""
+    with _read_cv:
+        _reads["inflight"] += 1
+
+
+def read_exit() -> None:
+    with _read_cv:
+        _reads["inflight"] = max(0, _reads["inflight"] - 1)
+        if _reads["inflight"] == 0:
+            _read_cv.notify_all()
+
+
+def reads_inflight() -> int:
+    return int(_reads["inflight"])
+
+
+def write_turn(max_wait_s: Optional[float] = None) -> float:
+    """S36 read priority: called by the write-behind before each write chunk. Waits while a store read is in
+    flight, at most ``max_wait_s`` (default ``FLLIPER_HICACHE_L3_WB_READ_YIELD_MS``), then returns -- the chunk is
+    written either way. Returns the seconds waited."""
+    if max_wait_s is None:
+        max_wait_s = _env_s(ENV_READ_YIELD_MS, READ_YIELD_MS_DEFAULT) / 1000.0
+    if _reads["inflight"] <= 0 or max_wait_s <= 0:
+        return 0.0
+    t0 = _clock()
+    deadline = t0 + max_wait_s
+    with _read_cv:
+        while _reads["inflight"] > 0:
+            left = deadline - _clock()
+            if left <= 0:
+                _reads["forced"] += 1
+                break
+            _read_cv.wait(left)
+    held = max(0.0, _clock() - t0)
+    _reads["yields"] += 1
+    _reads["yield_s"] += held
+    _reads["max_s"] = max(_reads["max_s"], held)
+    return held
+
+
+def read_priority_stats() -> dict:
+    return {"inflight": _reads["inflight"], "yields": _reads["yields"], "yield_s": _reads["yield_s"],
+            "max_s": _reads["max_s"], "forced": _reads["forced"]}
+
+
+def room_wait_enter() -> None:
+    """S35: a store read enters the arena ROOM-WAIT (the arena was FULL for its stems)."""
+    with _lock:
+        _room["waiting"] += 1
+
+
+def room_wait_exit() -> None:
+    with _lock:
+        _room["waiting"] = max(0, _room["waiting"] - 1)
+
+
+def room_starved() -> bool:
+    """S35: True while a store read of this process waits for arena room."""
+    return _room["waiting"] > 0
+
+
 def _load_gate() -> Optional[str]:
-    """``load`` while loads are pending, except the bounded write window."""
+    """``load`` while loads are pending, except the bounded write window.
+
+    S35 (SOLL R7: "kann D einen Request unter X nicht nehmen, ist das ein Defekt"; fLLiper rc9 restart, D TP0
+    10:09:06-10:10:14Z, 68 s without a D round at 18 open requests): NOT while a pending load is itself waiting for
+    arena ROOM. The arena was full of D's own tree pages without an L3 copy (``slots=6485 pinned=6485``, ARENA-DROP
+    ``l3=on_disk:0,written:0 freed=0``, READ-ROOM D-SPILL ``candidates=0 host_leaves=0``); a slot frees only once its
+    page has an L3 copy, and the L3 copy is this write-behind -- which yielded to that very load (``L3-WB LOAD-YIELD END
+    held_s=20.0 ... max_s=71.9``). A circular wait, ended there only by a client abort. A load in the room wait moves
+    no store I/O, so the yield buys it nothing: the write-behind writes."""
     now = _clock()
     if loads_pending() <= 0:
         _load_streak_end(now)
+        return None
+    if room_starved():
+        if _load["since"] is not None:
+            _load_streak_end(now)
+            _room["starved_n"] += 1
+            n = _room["starved_n"]
+            if n <= 16 or (n & (n - 1)) == 0:
+                logger.info("L3-WB ROOM-STARVED n=%d: a pending store read waits for arena ROOM, which only an L3 "
+                            "copy of a full arena page can free -- the write-behind writes instead of yielding (S35)", n)
         return None
     if now < _load["open_until"]:
         return None
@@ -165,7 +264,15 @@ def load_yield_stats() -> dict:
 
 
 def quiet_reason() -> Optional[str]:
-    """Why the write-behind must not run now, or None."""
+    """Why the write-behind must not run now -- S36 SOLL 2 ENDGUELTIG: never (None). Legs, sleep, dormancy and
+    pending loads gate nothing any more (see the module docstring); reads get priority per chunk
+    (:func:`write_turn`) instead. The former gates are kept readable as :func:`former_quiet_reason` for the
+    censuses and the tests that pin that they no longer gate."""
+    return None
+
+
+def former_quiet_reason() -> Optional[str]:
+    """What the pre-S36 gate would have answered now (instrument only, gates nothing)."""
     if _state["legs"] > 0:
         return "leg"
     if _state["released"]:
@@ -174,7 +281,7 @@ def quiet_reason() -> Optional[str]:
     sched = ref() if ref is not None else None
     if sched is not None and bool(getattr(sched, "pdflip_dormant", False)):
         return "dormant"
-    return _load_gate()
+    return "load" if loads_pending() > 0 else None
 
 
 def awake_epoch() -> Optional[int]:
@@ -198,5 +305,7 @@ def quiet() -> bool:
 def _reset_for_tests() -> None:
     with _lock:
         _state.update(legs=0, released=False, sched=None, entered=0)
+        _room.update(waiting=0, starved_n=0)
+        _reads.update(inflight=0, yields=0, yield_s=0.0, max_s=0.0, forced=0)
         _load_probes.clear()
         _load.update(since=None, open_until=0.0, streaks=0, total_s=0.0, max_s=0.0, caps=0)

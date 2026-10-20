@@ -45,15 +45,13 @@ def test_a_flush_spills_a_foreign_intermediate_anchor_to_l3(tmp_path, secured):
     spilled = []
 
     class _Sec(H._Backend):
-        def arena_secure_to_disk(self, arena, cands):  # 27B signature: no writer label
-            spilled.append(("flush_spill", [c[0] for c in cands]))
+        def arena_secure_to_disk(self, arena, cands, writer="claim_room"):
+            spilled.append((writer, [c[0] for c in cands]))
             return {"on_disk": len(cands) if secured else 0, "written": 0,
                     "lost": 0 if secured else len(cands)}
 
     for rk in ranks:
         rk.mp._backend = _Sec()
-    from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache as _U0
-    spill_n0 = _U0._pdflip_flush_spill_n
     hs = H._prefill(ranks, "pdflip-12-43", 4)          # four anchors fill the four slots
     assert all(H._state(arena, h) == 2 for h in hs)
     # the parked request's retained node: untagged (rid=None) at the flush
@@ -69,11 +67,8 @@ def test_a_flush_spills_a_foreign_intermediate_anchor_to_l3(tmp_path, secured):
         assert not any(rk.unbacked for rk in ranks)
         # the victim: pdflip-12-43's SHALLOWEST intermediate anchor, never its deepest
         assert H._state(arena, hs[0]) != 2 and H._state(arena, hs[-1]) == 2
-        # 27B port: arena_secure_to_disk has no writer label on 27B (its claim-room path calls it
-        # too), so the flush spills are counted by the spill's own counter, not by the label
-        from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache as _U
-        assert _U._pdflip_flush_spill_n - spill_n0 == H.RANKS, "one flush spill per rank (once per node)"
-        assert len(spilled) >= H.RANKS
+        assert sum(1 for w, _ in spilled if w == "flush_spill") == H.RANKS, \
+            "one flush spill per rank (once per node)"
     else:
         assert not landed and all(rk.unbacked for rk in ranks)
         assert all(H._state(arena, h) == 2 for h in hs), "an unsecured victim is never released"

@@ -124,6 +124,7 @@ from flliper.srt.mem_cache.hicache_storage import (
 )
 from flliper.srt.mem_cache.memory_pool_host import PoolEntry
 from flliper.srt.pdflip import p_fork_cut
+from flliper.srt.pdflip import claim_line as _claim_line
 from flliper.srt.utils import get_device_module
 from flliper.srt.environ import envs
 
@@ -132,6 +133,34 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 device_module = get_device_module()
+
+
+#: QSA-PAIR (S99): marks an operation queued by :func:`put_backup_ahead`.
+BACKUP_AHEAD_ATTR = "_qsa_pair_ahead"
+
+
+def put_backup_ahead(q, operation) -> int:
+    """QSA-PAIR (S99, NF rc22 P 10:19:45, pdflip-12-238): a direct write's
+    plain-sidecar store write (the QSA index, #106S) is what its KV slot's
+    completion waits for (``UnifiedRadixCache._qsa_pair_settle``) -- queued
+    behind D's flip backlog (``hicache_backup(34)`` on TP0) it kept 192 KV
+    pages unreadable-by-claim for the whole backlog. It goes ahead of every
+    queued KV backup instead, FIFO among the sidecar writes, in the SAME
+    queue (``join_storage_backups``, ``qsize`` and the K12 guard see it as
+    before). Small: 768 B/token against 12288 B/token of KV. Returns its
+    position in the queue."""
+    setattr(operation, BACKUP_AHEAD_ATTR, True)
+    with q.mutex:
+        dq = q.queue
+        pos = 0
+        for item in dq:
+            if item is None or not getattr(item, BACKUP_AHEAD_ATTR, False):
+                break
+            pos += 1
+        dq.insert(pos, operation)
+        q.unfinished_tasks += 1
+        q.not_empty.notify()
+    return pos
 
 
 def _mamba_snapshot_fence_needed(pool_transfers) -> bool:
@@ -993,6 +1022,12 @@ class HybridCacheController(BaseHiCacheController):
         _comp_txt = ",".join(f"{k}={v:.0f}" for k, v in sorted((_comp or {}).items()))
         if isinstance(_comp, dict):
             _comp.clear()
+        try:  # S82 A3 (pdflip/pp0_commit_park): PP0's measured START-LOADING rate prices a park admit
+            from flliper.srt.pdflip import pp0_commit_park as _s82cp
+
+            _s82cp.note_start_loading(_n_tok, (_sl_t3 - _sl_t0) * 1000.0)
+        except Exception:  # noqa: BLE001 -- an instrument feed never breaks the load
+            pass
         if _n_tok >= 8192 or (_sl_t3 - _sl_t0) > 0.05:
             logger.info(
                 "PDFLIP-START-LOADING tokens=%d nodes=%d total_ms=%.0f merge_move_ms=%.0f dcp_pairs_ms=%.0f "
@@ -1067,7 +1102,10 @@ class HybridCacheController(BaseHiCacheController):
         )
         operation.kv_page_owner_mask = kv_page_owner_mask
         operation.sidecar_only = bool(sidecar_only)
-        self.backup_queue.put(operation)
+        if operation.sidecar_only:
+            put_backup_ahead(self.backup_queue, operation)
+        else:
+            self.backup_queue.put(operation)
         return operation.id
 
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
@@ -1200,6 +1238,11 @@ class HybridCacheController(BaseHiCacheController):
                 kv_uncapped=kv_hit_count,
             )
 
+        # ZERO-ANCHOR 1015: the claim's shortfall, per rid and never rate
+        # limited (#1028B carries no rid and stops after 40) -- an instrument
+        _claim_line.claim_short(
+            operation, hit_result, self.page_size, getattr(self, "pp_rank", "?")
+        )
         kv_hit_pages = hit_result.kv_hit_pages
         operation.pool_storage_result.update_kv_hit_pages(kv_hit_pages)
         # DP-NACHLAUF: PP0's told clamp reuses this anchor-clamped answer when

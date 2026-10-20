@@ -44,6 +44,15 @@ def _mamba_carrier_hold_default() -> bool:
     return _profile_default("FLLIPER_PDFLIP_ENABLE_MAMBA_CARRIER_HOLD", True)()
 
 
+def _admission_wedge_recovery_default():
+    """SCHALTER-HALBPORT 1002: FLLIPER_ADMISSION_WEDGE_RECOVERY_SECONDS's default
+    when unset -- the seconds the published form's profile states (pdflip/form.py
+    ModelProfile.admission_wedge_recovery_s: nextflash 2.0), else the env's own
+    unset sentinel -1 (= the 60 s code default), unchanged in type."""
+    val = _profile_default("FLLIPER_ADMISSION_WEDGE_RECOVERY_SECONDS", None)()
+    return -1 if val is None else float(val)
+
+
 @functools.lru_cache(maxsize=1)
 def _default_hip() -> bool:
     """Lazy ROCm/HIP detection for platform-conditional env defaults.
@@ -331,9 +340,8 @@ class Envs:
     # Producer-phase census ledger: O(1) FIFO eviction at its cap (KR
     # e54ac95c65, mem_cache/producer_phase_census.py, read once per process;
     # the reader keeps its parse of an explicit value, only "1" arms). Default
-    # as DEDUP_CARRY above (ModelProfile.d_release_fixes).
-    FLLIPER_PDFLIP_CENSUS_O1_EVICT = EnvBool(
-        _profile_default("FLLIPER_PDFLIP_CENSUS_O1_EVICT", False))
+    # as DEDUP_CARRY above (ModelProfile.d_release_fixes). The entry itself stands in the
+    # SCHALTER-HALBPORT block below (one environ entry per registry switch).
     # DFLASH window pool, hole rows out of the draft softmax (27b-draftwin
     # 26.09.): window rows without draft KV (prefix from P / HiCache after a
     # flip or loadback) read the hole slot 0 and dilute the draft attention.
@@ -377,18 +385,15 @@ class Envs:
     # allocator peak straight from torch's nested stats dict instead of the
     # flattened memory_stats() -- the same number without the Python flatten
     # (~0.7 ms per DFLASH round on D). Off = torch.cuda.max_memory_allocated().
-    # LS12 rest (30.09.): default = the published form's row (ModelProfile.vram_peak_fast_read,
-    # qwen27b on); off without a form; an explicit value wins.
+    # Default per profile (ModelProfile.vram_peak_fast_read, SCHALTER-HALBPORT
+    # 1002): nextflash on; off for qwen27b (its profiles set it) and no form.
     FLLIPER_VRAM_PEAK_FAST_READ = EnvBool(_profile_default("FLLIPER_VRAM_PEAK_FAST_READ", False))
     # LS12 rest (30.09.): the profile-default contract entries (UNIFY S2) of the switches whose
     # readers parse the environment themselves and ask the same registry when unset/blank:
     # logits_processor.verify_local_vocab_requested, arena_pool.load_index_async,
     # unified_radix_cache._hicache_drain_agree_every, front._env_switch_on_or_profile (kicks).
     FLLIPER_DFLASH_VERIFY_VOCAB_ARGMAX = EnvBool(_profile_default("FLLIPER_DFLASH_VERIFY_VOCAB_ARGMAX", False))
-    FLLIPER_HICACHE_LOAD_ASYNC_INDEX = EnvBool(_profile_default("FLLIPER_HICACHE_LOAD_ASYNC_INDEX", False))
     FLLIPER_HICACHE_DRAIN_AGREE_EVERY = EnvInt(_profile_default("FLLIPER_HICACHE_DRAIN_AGREE_EVERY", 1))
-    FLLIPER_PDFLIP_CTL_KICK_ARRIVAL = EnvBool(_profile_default("FLLIPER_PDFLIP_CTL_KICK_ARRIVAL", False))
-    FLLIPER_PDFLIP_CTL_KICK_AFTER_FLIP = EnvBool(_profile_default("FLLIPER_PDFLIP_CTL_KICK_AFTER_FLIP", False))
     # INT8 W8A8 small-M GEMM on sm_120 (27b-int8tri 26.09.): route
     # CompressedTensorsW8A8Int8.apply_weights through the Triton kernel with
     # exact int32 split-K (layers/quantization/int8_sm120_triton.py) when the
@@ -421,6 +426,22 @@ class Envs:
     # pdflip launcher resolves it once, together with --draft-kv-on-p, and
     # publishes the resolved value to the front and both groups' ranks.
     FLLIPER_PDFLIP_DRAFT_ON_P = EnvBool(False)
+
+    # 1476: read-thread instrument. When a storage read batch delivers fewer
+    # tokens than expected, the read terminates the operation without naming
+    # the batch that missed (pdflip-9-40: pages 47-50 of 1501). With this switch
+    # on, the terminate point logs ONE line naming the batch (first page hash,
+    # page count, token counts). Off by default; read-only, no sync.
+    FLLIPER_PDFLIP_READ_FIRST_FAIL_LOG = EnvBool(False)
+
+    # 1494: mamba-arena fill instrument. No log says how many of the arena's
+    # slots are occupied when a claim is refused or room is made (the Q-1303
+    # measurement had to use ARENA-CLAIM REFUSED / ARENA-DROP as a proxy). With
+    # this switch on, those events (and, rate-limited, successful claims) log
+    # ONE `PDFLIP MAMBA-ARENA-FILL` line from the arena's existing counters
+    # (stats(): slots/complete/claimed) and the staging free list. Off by
+    # default; no extra sync, no slot scan.
+    FLLIPER_PDFLIP_MAMBA_ARENA_FILL_LOG = EnvBool(False)
 
     # #695: allocate the permanent phase-flip host weight images at their exact
     # size (MAP_ANONYMOUS + cudaHostRegister) instead of through torch's pinned
@@ -901,15 +922,9 @@ class Envs:
     # 0.60 s, z30x2-kvdemand 0.35 s; x178 (read during the flip) 0. The
     # reference exists from the wake's first RPC on -- P has drained by then
     # (the front drains before the sleep/wake pair), so #248's measured fault
-    # (a reference over P's whole phase) stays closed. Model-neutral.
-    # DEFAULT ON (02.10., 27B P->D seat): NF ran it since 09300726 (60+ boots,
-    # nf-int4.env:340, #248 WAKE-READ-EARLY issued= 99x, PDFLIP-WAKE-COHORT
-    # wake_to_last_decode_ms 476-579 ms); the 27B left it unset and paid for it
-    # on every P->D flip -- N3u 1002_072908: read_early=0 on 19/19 wakes, the
-    # release issued the reads 160-550 ms after the resume reply, the reads
-    # queued 0.6-2.1 s, SETTLE held_after_wake_s p50 1.4 s, wake_to_last_decode
-    # p50 2.49 s = the bulk of the 2.8 s P->D nachlauf. =0 restores the
-    # release-time read byte for byte.
+    # (a reference over P's whole phase) stays closed. Model-neutral; default ON
+    # since 03.10. (60 NF boots since 30.09., 99x '#248 WAKE-READ-EARLY issued='
+    # on D; the 27B tree ships it ON). =0 restores the release-time read.
     FLLIPER_PDFLIP_ENABLE_WAKE_READ_EARLY = EnvBool(True)
     # TAIL-STAGE-EARLY (30.09., NF y4k/y4l P->D, pdflip/tail_adopt.stage_early):
     # the E2 tail staging of the dormant hold starts at the START of D's weight
@@ -974,6 +989,13 @@ class Envs:
     # beside the collects, still early. Same hold order on every rank, no other
     # collective in the loop. 0 = all at the legs' start (d1e5da09dc).
     FLLIPER_PDFLIP_WAKE_READ_EARLY_SPREAD = EnvBool(True)
+    # CAPPARK-FLIP-HOLD (08.10., NF dauer10081045 D->P flip epoch 4->5): while
+    # a flip park is open (park_running until the sleep / the awake re-queue)
+    # the #248h capacity re-queue does not run -- the capacity-parked requests
+    # ride the flip and the wake's hold read takes them up. On metal the
+    # re-queue ran three just-parked requests to their end while the front's
+    # D->P quiesce waited 28180 ms for D. Off = the re-queue inside the park.
+    FLLIPER_PDFLIP_ENABLE_CAPPARK_FLIP_HOLD = EnvBool(True)
     # PARK_DEMOTE_S (#248): the tick of the background thread (D, attention
     # rank 0, never the scheduler thread) that copies the kept pages of
     # parked and waiting rids from the arena to HiCacheFile without freeing
@@ -989,6 +1011,35 @@ class Envs:
     # standing still until the deadman. Decided on the host, carried by the
     # H105 verdict broadcast. 0 = never stop.
     FLLIPER_PDFLIP_FORM_A_DEADLOCK_STOP_S = EnvFloat(120.0)
+    # ENABLE_FORM_A_STALE_VOTE_DEFER (H98d, NF xc D 21:37:29Z 07.10.,
+    # pdflip-130-2092): the H98 group depth is a snapshot from the top of the
+    # pass; an earlier admission of the SAME pass can evict the attention
+    # host's tail (xsn285 load-back drain, P-FUND KV-ONLY drops the anchors),
+    # so the host admits less than the planted depth. On: the host refuses
+    # THIS admission through the H105 verdict (OTHER) -- every rank keeps
+    # the request queued, the next pass votes again from the trees as they
+    # are. The H98 stop (FormAHostBelowGroup) stays for the same
+    # (local, group) three passes running and wherever no H105 verdict
+    # channel exists. Off = the immediate stop (pre-H98d). Reached only
+    # where that stop would have fired; everywhere else byte-identical.
+    FLLIPER_PDFLIP_ENABLE_FORM_A_STALE_VOTE_DEFER = EnvBool(True)
+    # ENABLE_FORM_A_ADMIT_ROOM_FIRST (H98e, the cause behind H98d, NF xc D
+    # 21:37:29Z 07.10., pdflip-130-2093 -> pdflip-130-2092): a Form A load-back
+    # whose group ADMIT is already taken (worker off the token cut, every
+    # rank on it) decides its room from the LIVE pool with a shortfall-only
+    # eviction on its FIRST attempt (H105c's follow-room). Off = the first
+    # attempt goes through the pass-published floor, whose refusal runs the
+    # xsn285 full drain (every evictable leaf, the voted-but-not-admitted
+    # prefixes of the same pass included) before H105c retries from the
+    # live pool. The host-first path (H105b/H106) is not touched.
+    FLLIPER_PDFLIP_ENABLE_FORM_A_ADMIT_ROOM_FIRST = EnvBool(True)
+    # POOLLEAK_INSTR (NF y9nf6 boot 3, 07:03:50Z: "[full] ... withheld=92672
+    # ... deficit of 128 row(s)" + 3 mamba slots on TP1/TP2 right after a D
+    # park): LOG-ONLY instruments, no behaviour -- per-request pool holdings
+    # and the pool ledger before/after the park's retract_all, a read-only
+    # ledger line after every park, and in the leak report the enumerated
+    # leaked full ids MINUS the KvRowCap-withheld ids (pdflip/poolleak_instr.py).
+    FLLIPER_PDFLIP_POOLLEAK_INSTR = EnvBool(False)
     # L3_WRITE_BEHIND_S (L3-REUSE 0928, NF rc12z13: the first request after a
     # boot read 399 of 512 KV pages from L3 -- the rest had been in the
     # boot's /dev/shm arena only -- and the QSA index for 47): the tick of the
@@ -1115,13 +1166,65 @@ class Envs:
     # first miss, so one JOINED page cut a 1070-page prefix at 146 (the rest
     # re-prefilled). Only on the prefetch io threads (hicache-prefetch-io-<k>);
     # the scheduler, flip and decode threads never wait. 0 = the pre-0930 form.
-    FLLIPER_PDFLIP_L3FILL_JOIN_WAIT_MS = EnvInt(300)
+    # 5000 (user 14.10. ~13:40Z: "cache zurueckholen ist 100x effizienter als neu rechnen"; NF h10 13:25:02
+    # pdflip-4-82: 3 joined stems at the head of a 1024-page fill gave bound_ms=300 and cut a 127k prefix at 19k,
+    # 108k re-prefilled ~25 s against ~1 s of read). The wait is NOT a budget for a live writer: it ends the moment
+    # the writer completes, and only a writer that stopped is cut -- at the stale-claim age
+    # (L3FILL_STALE_CLAIM_S, 5 s), the one rule for 'this writer is dead'. Floor = cap = that age.
+    FLLIPER_PDFLIP_L3FILL_JOIN_WAIT_MS = EnvInt(5000)
+    # STORE-SHORT (NF h6 11:17:38, pdflip-4-17): a claimer fills its whole
+    # batch and completes it at once -- 385 stems took 460 ms (837 pages/s
+    # under the read storm), so a flat 300 ms ended the prefix 160 ms early.
+    # The wait is priced on the joined stems: max(JOIN_WAIT_MS, stems x
+    # PER_PAGE_MS), at most JOIN_WAIT_MAX_MS. A dead or stalled writer is
+    # still cut by L3FILL_STALE_CLAIM_S. PER_PAGE_MS=0 = the flat form.
+    FLLIPER_PDFLIP_L3FILL_JOIN_WAIT_PER_PAGE_MS = EnvFloat(2.0)
+    FLLIPER_PDFLIP_L3FILL_JOIN_WAIT_MAX_MS = EnvInt(5000)
+    # ROOM-WAIT (NF h8 12:04:14, pdflip-0-10): an L3 -> L2 fill whose stems find
+    # the shared arena FULL (every slot referenced by a read or pinned by a
+    # running load-back) evicts + claims again every 25 ms for at most this
+    # long instead of ending the prefix there. Prefetch io threads only.
+    # 0 = the pre-1014 form (the prefix ends at the first FULL stem).
+    FLLIPER_PDFLIP_L3FILL_ROOM_WAIT_MS = EnvInt(5000)  # 14.10.: as the join wait -- reading beats re-prefilling; a stuck arena is cut at the stale age
+    # READ-ROOM 1015 (NF h16p, user order 15.10.: zero avoidable tokens; boots ..._226aad7105_1015_*, P, 46 PP0
+    # ``PDFLIP-READ-DEPTH cause=arena_full`` cuts, pdflip-4-25 12:52:35: 977 stems, claimed=0 after the 5 s room
+    # wait, ``tree=6478 tree_in_use=0``): a fill that finds the arena FULL after the clock posts its need next
+    # to the arena; every PP rank's scheduler (check_hicache_events) hands back L3-backed tree copies
+    # (``_w3_arena_spill``) for the deficit. Default ON; 0 = the old fill (no post, the 5 s room wait).
+    # READ_ROOM_WAIT_MS = the room wait's idle bound while the request is armed (more than three scheduler rounds
+    # of a 2-3 s chunk forward, below the told Frist cap of 12 s so a wait never outlives the group's patience);
+    # REPOST_MS = pace of a fill's repeated posts.
+    FLLIPER_PDFLIP_READ_ROOM = EnvBool(True)
+    FLLIPER_PDFLIP_READ_ROOM_WAIT_MS = EnvInt(10000)
+    FLLIPER_PDFLIP_READ_ROOM_REPOST_MS = EnvInt(1500)
     # L3FILL_STALE_CLAIM_S (L3FILL-JOINED (3), 30.09.): a claim whose writer is
     # alive but delivered no byte for this long is taken from its key
     # (arena_quarantine_stale, generation-safe: a late completion of the old
     # writer is refused by name, status 6) and the fill claims the stem fresh.
     # y4a: 29 stems JOINED for >= 6 s blocked D and P. 0 = never.
     FLLIPER_PDFLIP_L3FILL_STALE_CLAIM_S = EnvFloat(5.0)
+    # JOIN-LIVENESS (NF h16 15:34:27-32, pdflip-10-86): the JOIN / ROOM waits
+    # follow progress -- a completed stem or a claim taken over restarts the
+    # idle clock; nothing moving for max(bound, STALE_CLAIM_S) ends the wait
+    # (the stale reap then breaks the claim and reads the page itself);
+    # JOIN_CAP_S is the emergency brake. 0 = the fixed bound.
+    FLLIPER_PDFLIP_L3FILL_JOIN_LIVENESS = EnvBool(True)
+    FLLIPER_PDFLIP_L3FILL_JOIN_CAP_S = EnvFloat(60.0)
+    # SELF-EVICT / SELF-JOIN (NF h16 15:34:27, P PP1, pdflip-10-86): a fill
+    # never evicts the stems of the read it is filling, and a JOINED stem this
+    # process itself holds is taken over and read at once. 0 = off.
+    FLLIPER_PDFLIP_L3FILL_PROTECT_READ = EnvBool(True)
+    FLLIPER_PDFLIP_L3FILL_SELF_JOIN_TAKEOVER = EnvBool(True)
+    # H54 PARK-JOIN 1015 (NF h16h, 16 of 16 JOIN-WAIT tears after a park /
+    # wake): a JOINED stem whose holder is a HOST-WRITE claim that did not
+    # complete inside the join wait, on a page L3 holds, is taken from its key
+    # whatever its references and byte progress (arena_quarantine_host_write)
+    # and read from L3 by this fill; a stem a peer stage took over first is
+    # awaited, not dropped. JOIN_HELD_LOG: one 'L3-FILL JOIN-HELD' line per
+    # wait that ends with claims left -- refs, merged/joined writers, open,
+    # coverage and the quarantine verdict of each held slot. 0 = off.
+    FLLIPER_PDFLIP_L3FILL_HOST_WRITE_TAKEOVER = EnvBool(True)
+    FLLIPER_PDFLIP_L3FILL_JOIN_HELD_LOG = EnvBool(True)
     # STORE_REFUSE_FS (W57, user 28.09.: "L3 gehoert auf XFS, nie ZFS"): a
     # real boot whose store directory lives on one of these filesystems
     # (/proc/mounts) is refused by name -- the container layer (overlay) or
@@ -1189,10 +1292,9 @@ class Envs:
     # the launcher hands its own environment to the front and to every rank
     # (build_env / fenv = dict(os.environ)), so export it in the arm.
     # False = the 50 ms poll and the unconditional want, byte-identical.
-    # LS6 (30.09.): default = the published form's row (pdflip/form.py
-    # ModelProfile.front_quiesce_fast, qwen27b on -- z30y5m 13 PDFLIP-QUIESCE-FAST
-    # lines, until then only the 27B arm set it; nextflash off, NF H111 decides);
-    # off without a form; an explicit value wins.
+    # Default per profile (pdflip/form.py ModelProfile.front_quiesce_fast,
+    # SCHALTER-HALBPORT 1002): nextflash on (every NF boot set it); off for
+    # qwen27b and without a form.
     FLLIPER_PDFLIP_QUIESCE_FAST = EnvBool(_profile_default("FLLIPER_PDFLIP_QUIESCE_FAST", False))
     # LS6 (30.09.): the profile-default contract entries of the two other env
     # switches of the six (UNIFY S2: one environ entry per registry switch).
@@ -1203,6 +1305,23 @@ class Envs:
     FLLIPER_PDFLIP_DC_OFF_PATH = EnvBool(_profile_default("FLLIPER_PDFLIP_DC_OFF_PATH", False))
     FLLIPER_DCP_LSE_MERGE = EnvStr(_profile_default("FLLIPER_DCP_LSE_MERGE", "ar"))
     FLLIPER_PDFLIP_QUIESCE_FAST_POLL_MS = EnvInt(10)
+    # SCHALTER-HALBPORT 1002: the registry's entries for switches whose readers
+    # keep their own parse of an explicit value and take the same profile
+    # default when unset (pdflip/form.py STATED_SWITCHES; nextflash on, off for
+    # qwen27b and without a form): the front's flipfast pair
+    # (pdflip/front._env_switch_on_or_profile: CTL_KICK_ARRIVAL/_AFTER_FLIP, F2/F3;
+    # DC_OFF_PATH, F1), the D->P latch for P-only requests (front
+    # vision_flip_urgent, xsn438), the load-back's async index copies
+    # (mem_cache/pool_host/arena_pool.load_index_async) and the census O(1)
+    # FIFO eviction (mem_cache/producer_phase_census.census_o1_evict_armed, KR).
+    FLLIPER_PDFLIP_CTL_KICK_ARRIVAL = EnvBool(_profile_default("FLLIPER_PDFLIP_CTL_KICK_ARRIVAL", False))
+    FLLIPER_PDFLIP_CTL_KICK_AFTER_FLIP = EnvBool(
+        _profile_default("FLLIPER_PDFLIP_CTL_KICK_AFTER_FLIP", False))
+    FLLIPER_PDFLIP_VISION_FLIP_URGENT = EnvBool(
+        _profile_default("FLLIPER_PDFLIP_VISION_FLIP_URGENT", False))
+    FLLIPER_HICACHE_LOAD_ASYNC_INDEX = EnvBool(
+        _profile_default("FLLIPER_HICACHE_LOAD_ASYNC_INDEX", False))
+    FLLIPER_PDFLIP_CENSUS_O1_EVICT = EnvBool(_profile_default("FLLIPER_PDFLIP_CENSUS_O1_EVICT", False))
     # QUIESCE-PENDING (02.10., N5t epoch 11 ..._012d1a161a_1002_153611: PP2's last
     # PASS-TAIL 51.319, the idle lap home ~51.327, the next poll only at 51.335 --
     # the 10 ms interval after a 'GROUP VERDICT PENDING' answer): while PP0 says
@@ -1230,7 +1349,9 @@ class Envs:
     # Measured x177/x178/h91v1: lockstep idle 42-156 ms and pause+credit
     # 5-7 ms x 10 tags per flip sit on PP0's chain above the 1.25 s copy-engine
     # floor. False = the lockstep, byte for byte.
-    FLLIPER_PDFLIP_DEPOSIT_LANE_LOOKAHEAD = EnvBool(False)
+    # SWITCH-DEFAULTS 1004: --profile nextflash states it ON (pdflip/form.py
+    # STATED_SWITCHES); without a form / for qwen27b the default stays off.
+    FLLIPER_PDFLIP_DEPOSIT_LANE_LOOKAHEAD = EnvBool(_profile_default("FLLIPER_PDFLIP_DEPOSIT_LANE_LOOKAHEAD", False))
     FLLIPER_PDFLIP_DEPOSIT_LANE_AHEAD = EnvInt(1)
     # TAG-STALL-SENTINEL (30.09., NF y3z ep52: PP0 still 5.4 s process-wide at
     # the first tag of P's sleep): per sleep tag, faulthandler's C watchdog
@@ -1241,6 +1362,11 @@ class Envs:
     # (pdflip/gc_instrument.arm_after_boot) when --gc-warning-threshold-secs is
     # 0; the launcher sets 0.5 for group P by default (--env-p states another).
     FLLIPER_PDFLIP_GC_WARN_SECS = EnvFloat(0.0)
+    # D-IDLE-MAMBA-1007: group D runs the idle Mamba pool ledger
+    # (invariant_checker._check_mamba_pool, rank-local, 20-120 ms measured on
+    # NF D) only on every K-th idle pass. 1 = every pass, as before; every
+    # other group ignores it, so the flip path keeps its check per pass.
+    FLLIPER_PDFLIP_IDLE_MAMBA_CHECK_EVERY = EnvInt(1)
     # the sleeping group(s) that take the lookahead (comma list, default the
     # P->D direction only: P sleeps, PP0's chain is the Flipzeit's legs).
     FLLIPER_PDFLIP_DEPOSIT_LANE_LOOKAHEAD_GROUPS = EnvStr("P")
@@ -1267,20 +1393,50 @@ class Envs:
     FLLIPER_PDFLIP_MAMBA_SNAPSHOT_FENCE = EnvBool(True)
     # the sleeping group(s) that take it (comma list; default the D->P leg).
     FLLIPER_PDFLIP_SLEEP_PAUSE_OVERLAP_GROUPS = EnvStr("D")
+    # FLIPCYCLE H5 (02.10., pdflip/front._p_drain_pool cap_exempt): past the P
+    # phase cap (H91 part C rule 1) a queued SHORT still rides P's batch; off =
+    # the cap strands it and D prefills it after the P->D flip (y6z ep 2,
+    # pdflip-1-7: 2.03 s with every seat stalled). Design law E2: on.
+    FLLIPER_PDFLIP_ENABLE_P_PHASE_SHORT_RIDES = EnvBool(True)
+    # FLIPCYCLE H5b (02.10., pdflip/front._d_direct_yields): a SHORT arrival does
+    # not start a D-direct prefill while a P-bound request is queued (the D->P
+    # flip is foreseeable; its park would wait the whole 1.2-3.8 s D pass). It
+    # rides P's batch. Off = the D pass runs and the park waits behind it.
+    FLLIPER_PDFLIP_ENABLE_D_DIRECT_YIELD = EnvBool(True)
+    # FETCH-COST-YIELD (1369 draft, pdflip/front._d_direct_yield_fetch_cost): with NO
+    # foreseeable flip, yield a SHORT whose own D prefill is fetch-dominated --
+    # spill layers x per-fetch ms (1362: 48 fetches at 25..138 new tokens, 96 at
+    # 191..3072; per-fetch median 12.7-17.2 ms) beyond the budget below. Off =
+    # the H5b behaviour alone (flip foreseeability only).
+    FLLIPER_PDFLIP_ENABLE_D_DIRECT_YIELD_FETCH = EnvBool(False)
+    # Budget in ms for the line above. Default 600 sits AT the measured floor of
+    # the class (48 x 13.2 ms = 634 ms, 1362(3)); raising it past 1248 exposes
+    # only the two-wave SHORTs (>= ~190 uncached tokens).
+    FLLIPER_PDFLIP_D_DIRECT_YIELD_FETCH_MS = EnvInt(600)
+    # FLIPCYCLE H2 (02.10., expert_offload.DeferredRowsFill.tick): P's first
+    # extend after the wake waits only for EACH layer's own deferred extra rows
+    # (land_deferred_rows before that layer's MoE), not for all of them before
+    # the forward starts. Off = the whole forward waits (y6z: 0.3-1.0 s on PP0).
+    FLLIPER_PDFLIP_ENABLE_REARM_DEFER_PER_LAYER = EnvBool(True)
+    # FLIPCYCLE H4 (02.10., pdflip/lane_priority.py): on a depositor with two or
+    # more cross lanes into receivers of different PCIe bandwidth, the lane into
+    # the widest receiver goes first on the card's one D2H engine, so the lane
+    # into the narrow (x4) receiver -- the leg's critical path -- is not
+    # time-multiplexed down to 4.3 GB/s (y6z P-PP0 p0 lane_ms 1198 for 5.22 GB).
+    # Off = the engine's own time-multiplexing.
+    FLLIPER_PDFLIP_ENABLE_LANE_FAST_FIRST = EnvBool(True)
+    # FLIPCYCLE H1 (02.10., pdflip/front.drain): a flip whose ledger is already
+    # empty (D->P after the park) skips the drain's blocking progress read.
+    FLLIPER_PDFLIP_ENABLE_DRAIN_EMPTY_SKIP = EnvBool(True)
+    # FLIPCYCLE marker (02.10.): the legs' physics floor printed beside the
+    # measured stage (x4 link: ~6.6 GB each way / 6.6 GB/s; H111c says 1250).
+    FLLIPER_PDFLIP_FLIPCYCLE_LEGS_FLOOR_MS = EnvInt(1000)
     # FLIPCYCLE H6 (02.10., pdflip/front.flip): the waker's kv_cache resume rides
     # its weights leg (late site, after the legs, with the z30y7 bounded fit wait)
     # instead of a second RPC the waker's scheduler picks up only after its
     # post-wake pass (y6z P->D wake-kv p50 158 ms on the front against 41 ms of
     # D-side work). Off = the separate kv RPC issued when the weights leg returns.
     FLLIPER_PDFLIP_ENABLE_WAKE_KV_FUSED = EnvBool(True)
-    # FLIPCYCLE H1 (02.10., pdflip/front.drain): a flip whose ledger is already
-    # empty (D->P after the park) skips the drain's blocking progress read.
-    FLLIPER_PDFLIP_ENABLE_DRAIN_EMPTY_SKIP = EnvBool(True)
-    # FLIPCYCLE H5 (02.10., pdflip/front._p_drain_pool cap_exempt): past the P
-    # phase cap (H91 part C rule 1) a queued SHORT still rides P's batch; off =
-    # the cap strands it and D prefills it after the P->D flip (y6z ep 2,
-    # pdflip-1-7: 2.03 s with every seat stalled). Design law E2: on.
-    FLLIPER_PDFLIP_ENABLE_P_PHASE_SHORT_RIDES = EnvBool(True)
     # PAUSE-MAPS (30.09., tms_csrc patch 5, pdflip/pause_overlap.arm_pause_maps):
     # the saver's pause releases a span-mapped (H95c) allocation with ONE
     # cuMemUnmap per contiguous run of extents instead of one per extent.
@@ -1332,10 +1488,159 @@ class Envs:
     # before. 0 = no size limit.
     FLLIPER_PDFLIP_PUBLISH_SWEEP_BG_MAX_TOKENS = EnvInt(8192)
     FLLIPER_PDFLIP_PUBLISH_SWEEP_BG_MAX_ISSUE = EnvInt(1)
+    # 1403 (NF nf9 1004_105315): memoize the flush publish sweep's no-progress
+    # round across quiesce polls -- while the in-flight write-through/store count
+    # stands where that round left it, a repeat round cannot issue (kvs2 W3), so
+    # the poll skips its ~1.2 s sweep (P.log 144297 sweep_ms=1221.1 per poll).
+    # 17.10. (K22, S9): default ON per rule 'new features on' -- behind a full arena PP1/PP2 paid the
+    # ~0.75 s no-progress sweep on every quiesce poll (P.log 1017_181001 sweep_ms=747.7); off via env.
+    FLLIPER_PDFLIP_FLUSH_SWEEP_MEMO = EnvBool(True)
+    # PR-ARENA (NF int22, P PP1 18:34:20Z, boot 1008_171755 @ 6b3bd1a6df): the
+    # PP room vote's walk (pdflip/pp_room_vote.estimate_payable) priced a peel's
+    # write_back backup at the KV host pool's available_size() -- on an arena
+    # pool (slots - claimed) * P, complete slots counted free -- while every
+    # claim was refused (no free slot): PP1's fact paid 195968 tokens the peel
+    # could not (on_frontier=8192 behind_device_child=187776), PP0 launched
+    # 16321 rows, PP1 'Prefill out of memory'. On: an arena-bound pool's backup
+    # room is its FREE slots (slots - complete - claimed) times the slot's
+    # tokens. Off = the available_size() reading, byte for byte.
+    FLLIPER_PDFLIP_ENABLE_PP_ROOM_ARENA_FREE_ROOM = EnvBool(True)
+    # SWEEP-FULL-ARENA (NF boot 1007_2142, P->D flip epoch 2: drain+quiesce
+    # 41730 ms, sleep-kv 8883 ms, cards idle): once a publish sweep's backup
+    # was refused for KV arena room (#1421 arena_claim), every later node
+    # whose claim the arena provably cannot serve (ArenaMHAHostPool.
+    # claim_would_refuse: free + reapable + unreferenced-complete room smaller
+    # than its absent pages, W3 spill asked first) is counted refused without
+    # the claim -- each such claim walked the hand-off keep list for nothing
+    # (~70 ms, 58 per sweep = 4.1 s per PP loop pass and per quiesce poll).
+    # Same nodes backed, same refusals; groups without the Form A shadow
+    # (R12) only, never while a D park records its refusals (HY). Off = every
+    # refused claim is made as before.
+    FLLIPER_PDFLIP_ENABLE_SWEEP_FULL_ARENA_SKIP = EnvBool(True)
+    # W3-HOST-LEAF (NF int22, P 18:33:37-18:34:20Z, boot 1008_171755): the W3
+    # spill found candidates=0 on all three stages -- it releases only host
+    # copies of device-resident nodes; the full KV arena freed nothing for a
+    # claim (ARENA-DROP freed=0). On (local-PP floor only, as UD-H): the 27B
+    # line's Q-697c host-only spill, ported (pdflip/host_only_spill.py): host-only
+    # H-leaves get their L3 copy for every page first (secure_rows_to_l3, #257),
+    # then leave the tree; aux host-only (anchor) / in-flight leaves stay. Needs
+    # the spill's arena pool (on hybrid boots
+    # FLLIPER_PDFLIP_ENABLE_W3_SPILL_ANCHOR_POOL). Default on (user decision
+    # 09.10.); 0 = the old spill.
+    FLLIPER_PDFLIP_ENABLE_W3_SPILL_HOST_LEAVES = EnvBool(True)
+    # W3-ANCHOR-POOL (NF int20 1008_135412, P PP0 13:58-14:01): the W3-ARENA
+    # spill (UnifiedRadixCache._w3_arena_spill) stopped at its first gate on
+    # every hybrid boot -- the KV host pool is a HostPoolGroup whose
+    # __getattr__ forwards the claim calls but not secure_rows_to_l3, so
+    # hasattr() said False and it returned 0 before its log line ('W3-ARENA'
+    # 0x in 15 NF P logs; PUBLISH-SWEEP issued=0 refused=5130, every L3->L2
+    # fill ended at the full arena: ARENA-GET MISS, prefetch completed=0 of
+    # hit_pages=1318). On: the spill uses the group's anchor (arena) host
+    # pool, the one alloc_write already forwards to -- the 27B dual line's
+    # Q-697c (a), without its dual gate. Off = the old silent stop, byte for
+    # byte.
+    FLLIPER_PDFLIP_ENABLE_W3_SPILL_ANCHOR_POOL = EnvBool(False)
+    # W3-GROUP-ORDER (NF arena fix 14.10., desk/nf-arenafix-1014): the W3 spill
+    # ordered its candidates by node id and assumed the PP ranks' trees were
+    # replicas -- they are not (P.log:15554 PP0 31 candidates x 64 pages, PP1 9
+    # x 208-256), so every PP0 spill ended ARENA-DROP freed=0: a slot is free
+    # only when every rank's reference is gone, and each rank let go of other
+    # slots. On: the order is read from the shared arena -- fewest reader
+    # references first (the pages a peer already let go), then the slot id (the
+    # canonical page identity, equal on every rank), then the node id. No
+    # collective, no reserve. Off = the node-id order, byte for byte.
+    FLLIPER_PDFLIP_W3_SPILL_GROUP_ORDER = EnvBool(True)
+    # ARENAFULL-1015 (NF h16n deaths 07:11:54 / 07:30:35, PP1): L3-DROP -- a write_back device leaf whose KV
+    # is in L3 (l3_present: its arena copy spilled) leaves the device on the local-PP floor without a new
+    # arena claim (UD drop, host-only children via UD-H). Off = the old claim-first path.
+    FLLIPER_PDFLIP_L3_DROP = EnvBool(True)
+    # L3-DROP: how long a host-only child held by its OWN store write may have its acks drained on this
+    # rank before the drop is refused by name (ms; 0 = drain once, no wait).
+    FLLIPER_PDFLIP_L3_DROP_ACK_WAIT_MS = EnvInt(2000)
+    # H16P-NACHBESSERUNG E1 (Opus review of ARENAFULL-1015, B3): L3-DROP only where the arena would refuse the
+    # node's backup claim anyway (backup_room_tokens < tokens, no claim attempt). With room the node is demoted
+    # to L2 as before (L2 hits stay, the peel agrees with the payable walk). Off = L3-DROP whenever l3_present.
+    FLLIPER_PDFLIP_L3_DROP_ONLY_UNDER_PRESSURE = EnvBool(True)
+    # H16P-NACHBESSERUNG A2 (review B2): l3_present is set only for a COMPLETE store write. _drain_backup sets it
+    # only when operation.completed_tokens covers every page (a partial / stale-refused / skipped write does
+    # not), and a W3 / host-only spill that sees unpaired pages (KV page without its QSA index, not written)
+    # treats them like lost (no release, no l3_present). Off = every ack sets it, unpaired is ignored.
+    FLLIPER_PDFLIP_L3_PRESENT_STRICT = EnvBool(True)
+    # ARENAFULL-1015 W3-KEEP-PAYABLE: on the local-PP floor the W3 spill never releases the host copy of a
+    # device node whose drop it would make impossible right now (a host-only descendant that UD-H could not
+    # clear). Off = every written device node is a candidate, as before.
+    FLLIPER_PDFLIP_W3_SPILL_KEEP_PAYABLE = EnvBool(True)
+    # ARENAFULL-1015 ACK-ROOM-PAYABLE: a follower's told ack measures its load-back room as free rows plus
+    # what ONE peel can pay (pp_room_vote walk), not the tree's reported evictable size (07:30:35: reported
+    # 255040, paid 48192). Off = available + evictable_size, as before.
+    FLLIPER_PDFLIP_ACK_ROOM_PAYABLE = EnvBool(True)
+    # SETTLE-UNIFORM-1014 (NF h18 fe799c4d6e, D 16:23:24 gloo 'op.preamble.length <= op.nbytes. 8 vs 4'):
+    # the #1471 settle skipped the progress check (a collective) of a member whose rank-local writer
+    # action was wait/decide. On: every rank checks every non-capwait member; the action only shapes the
+    # vote. Off: the old skip.
+    FLLIPER_PDFLIP_SETTLE_UNIFORM_CHECK = EnvBool(True)
+    # PREFETCH-RID-NET-1014: the termination collective of a store read carries the rid's fingerprint
+    # (two slots under the same MAX: h and -h). Ranks that reached it for DIFFERENT rids see max != min
+    # alike, and the group STOPS by name on every rank (RuntimeError 'PREFETCH-RID-MISMATCH ... rids=...';
+    # user law raenge-nie-uneins-crash-stop, 29.08.: a detected rank disagreement is a stop, never a
+    # 'not done' and on) -- instead of a reap that mixes two rids' numbers and a later gloo abort with no
+    # name. Off: the 3-slot form.
+    FLLIPER_PDFLIP_PREFETCH_RID_NET = EnvBool(True)
+    # WAKE-READ-SEAT-GATE (NF arena fix 14.10.): the #248f gate held hold reads
+    # up to the whole KV arena (6466 of 6485 pages pinned, 231 CAPACITY-WAIT in
+    # one boot) -- D's own retain/park backup and its L3 fills found no slot.
+    # On: beside the page gate a hold read is issued only for as many requests
+    # as D has free seats for (seats = --max-running-requests, minus running
+    # requests, minus the requests whose read already holds the arena and have
+    # no seat yet), in hold/arrival order; the rest wait named in the #1471
+    # settle and read when a seat frees. No reserve. Off = the page gate alone.
+    FLLIPER_PDFLIP_WAKE_READ_SEAT_GATE = EnvBool(True)
+    # MAMBA-LAST-RESORT (NF int22, D TP0 boot 1008_171755 17:51:57): the D
+    # mamba anchor arena (32 slots, 6 staging) held only END and deepest
+    # anchors, so the flush / park-first spill found victim=none (`#1427
+    # ARENA-DROP ... slot_bytes=58834944 freed=0` x59, `PDFLIP-ANCHOR-LOST
+    # at=flush n=15` incl. the END anchor 112896 of the parked pdflip-24-128).
+    # On: with no victim by the old rules, the shallowest settled END/deepest
+    # anchor OFF the claimer's park chain is secured to L3 first
+    # (arena_secure_to_disk) and then released -- never one whose copy could
+    # not be secured. Default on (user decision 09.10.); 0 = the old answer,
+    # byte for byte.
+    FLLIPER_PDFLIP_MAMBA_SPILL_LAST_RESORT = EnvBool(True)
     # #287 NEED0 (c, 30.09., NF y4k pdflip-0-4): the front's state.json field
     # front.d_park_stuck lists the rids parked in at least this many
     # consecutive D phases with no output in between (pdflip/park_stuck.py).
     FLLIPER_PDFLIP_PARK_STUCK_PHASES = EnvInt(3)
+    # PRIORITY LANES 1008 (plan deskq/PLAN-PRIO-LANES-1008.md, part L1; pdflip/lanes.py): a
+    # request carries an integer `priority` (no number = lane 0, higher = higher lane, equal =
+    # same lane); between lanes the rule is strict displacement. 1 = the front reads the field,
+    # keeps lane_floor / lane_epoch / per-lane counters (state.json front.lane_floor,
+    # front.lane_epoch, front.lanes) and the Anthropic adapter forwards `priority`.
+    # DEFAULT ON since int24f5 (user word 13.10.2026: lanes "muss im boot defaultmaessig an
+    # sein"; NF line only -- this environ.py is the NF tree's). With every request in lane 0
+    # (no `priority`, or 0) nothing displaces anything: no LANE-* action, no RPC to the groups,
+    # no park, routing as without lanes (test_pdflip_lanes_default_on_1013). The only visible
+    # differences with lane 0 only: state.json front.lane_floor / lane_epoch / lanes, a `lane`
+    # key in request-book rows, a 48-byte progress beacon. =0 is the old path: the front does
+    # not read `priority`, no lane field in state.json, the request book or a log line. Read by
+    # the front and by both groups (the env is inherited; the code default reaches the ranks
+    # without a profile line).
+    FLLIPER_PDFLIP_LANES = EnvBool(True)
+    # PRIO-AS-AGE 1014 (user decision 14.10.2026 18:27Z, pdflip/prio_age.py): `priority` acts as AGE --
+    # every age order/comparison (D seats, SEAT-AGE displacement, the KV rule "oldest first", decode
+    # admission, the P queue and batch order, wake reads, D refill) uses the pair (priority desc,
+    # arrival asc); every wait CLOCK keeps the real arrival. With it on, the lane FLOOR of 1008
+    # (LANE-PREEMPT, LANE-RAISE/RESUME, LANE-WAITER-HOLD, the lane hold of P legs, D's lane park) is
+    # never entered; a P-bound request with priority > 0 ends a DECODE-COLLECT window at once.
+    # DEFAULT ON; acts only with FLLIPER_PDFLIP_LANES=1. =0 is the lane floor of 1008 unchanged.
+    FLLIPER_PDFLIP_PRIO_AS_AGE = EnvBool(True)
+    # PRIORITY LANES 1008: seconds between the keepalive comment lines (`: lane-hold floor=N`)
+    # the front writes into a held SSE stream. Used only with FLLIPER_PDFLIP_LANES=1 (the sender
+    # is part L4 of the plan; part L1 only declares the value).
+    FLLIPER_PDFLIP_LANE_KEEPALIVE_S = EnvInt(15)
+    # PRIORITY LANES 1008: the P-side prefill chunk size in tokens while a higher lane waits;
+    # 0 = the normal chunk. Used only with FLLIPER_PDFLIP_LANES=1 (part L3 of the plan reads it;
+    # part L1 only declares the value).
+    FLLIPER_PDFLIP_LANE_PREEMPT_CHUNK_TOKENS = EnvInt(0)
     # TSDB (user 01.10. ~07:40Z, docs/TSDB-DELTA-27B-1001.md 1c): the front's
     # optional Influx-line push of one `weg2_req` point per finished request
     # to VictoriaMetrics (e.g. http://192.168.0.88:8428/write), bundled ~2 s in
@@ -1433,12 +1738,13 @@ class Envs:
     # CSV, "0" = no rate). Set by the pdflip launcher from D_EXTEND_GROWTH_PER_ROW_MIB;
     # the scheduler caps the extend chunk to floor((card_free_post - 300) / rate).
     FLLIPER_PDFLIP_EXTEND_GROWTH_PER_ROW_MIB = EnvStr(None)
-    # Q-694b EXTEND-RATE: the rank MEASURES its own extend transient per row
-    # (allocator peak / reserved growth of every target extend of >= 2048 rows)
-    # and votes with max(start rate, measured x 1.15), a per-rank ratchet up
-    # only; the rate above is then only the start value (record or derived from
-    # the model geometry). Written by the pdflip launcher on the flip line's D
-    # group; off = the rate above alone, byte-identical.
+    # Q-694b EXTEND-RATE (NF port 1003): the rank MEASURES its own extend
+    # transient per row (allocator peak / reserved growth of every target
+    # extend of >= 2048 rows) and votes with max(start rate, measured x 1.15),
+    # a per-rank ratchet up only; the rate above is then only the start value.
+    # Written by the pdflip launcher on the D group for the ranks whose profile
+    # record has NO rate (NF: TP1/TP2); off = the rate above alone,
+    # byte-identical.
     FLLIPER_PDFLIP_EXTEND_RATE_MEASURE = EnvBool(False)
     # Q-710 EXTEND-CAP-FLOOR (INT8 y8vb 03.10. 19:34-19:51Z, 3905 one-token D
     # extends, ~150 ms each, 11x 'GROUP-NARROWED 4096 to 1'): the rc12g vote
@@ -1453,6 +1759,9 @@ class Envs:
     # the flip arm's rate (Q-694); off = byte-identical, P0 arm and dual never
     # set it.
     FLLIPER_PDFLIP_EXTEND_CAP_FLOOR = EnvBool(False)
+    # CSV of the TP ranks the measurement above applies to; unset/empty = every
+    # rank. NF: "1,2" -- TP0 keeps its recorded rate unchanged.
+    FLLIPER_PDFLIP_EXTEND_RATE_MEASURE_RANKS = EnvStr(None)
     # CORRIDOR BOUND WAKE RESET (y3r Klasse E/A2, D TP1 3080, 23:45:29-34): the
     # '#794 GROUP-NARROWED ... from 4096 to 64' right after every wake is the
     # #1028c bounded-min window (5 s) of the #656 gate still holding the
@@ -1861,6 +2170,16 @@ class Envs:
     # flag-read skew. The waker's W109 refusal keeps its own grace
     # (FLLIPER_PDFLIP_BAR1_CYCLE_GRACE_S, 3 s).
     FLLIPER_PDFLIP_BAR1_SPILL_GRACE_S = EnvFloat(0.1)
+    # y7z (02.10., A/B 7cwk87): the blocked depositor counts its OWN live
+    # credit wait as a cycle edge from the wait's START, not from its
+    # `blocked` flag (posted only after SLOW_WAIT_S = 0.5 s). The chain is the
+    # same deadlock (D's serial tag deposit waits on a P collector that sits in
+    # its own VRAM credit wait for its first claim, funded only by the pause
+    # behind that deposit); the spill now comes ~0.1 s after the block, not
+    # ~0.6 s. Needed before FLLIPER_OPT_PDFLIP_DRAFT_PARK_SKIP_UNCHANGED goes back
+    # on (with the skip that cycle was the common case: D>P layer 3.5-3.8 s).
+    # Default off until metal A/B: it also moves the spill on the skip-off path.
+    FLLIPER_PDFLIP_BAR1_SPILL_OWN_EDGE = EnvBool(False)
     # Weg-2 load (H39, fnFL2x141-x145): the dense Marlin linears
     # (compressed_tensors_wNa16: GDN/attention/shared-expert 6->8 bit, HC
     # mixer, PLE, lm_head) keep their checkpoint-format tensors and the whole
@@ -1909,7 +2228,26 @@ class Envs:
     # whose CachingHostAllocator rounds to the next power of two: 1522.8 MiB
     # image -> 2048 MiB block on D-TP0, 525 MiB of host RAM no ledger post
     # books. False = the torch.empty form, byte for byte.
-    FLLIPER_OPT_PDFLIP_DRAFT_PARK_EXACT_PIN = EnvBool(False)
+    # S58 (19.10.): ON by default (user order 14.10.: new functions default
+    # ON). Measured on NF rc15 1019_071429 D TP0: the 1522.8 MiB image still
+    # held a 2048 MiB /dev/zero block with the switch off -- 525 MiB host RAM.
+    FLLIPER_OPT_PDFLIP_DRAFT_PARK_EXACT_PIN = EnvBool(True)
+    # S58 (19.10.): the tail-stage pin arena (pdflip/tail_adopt.PinArena) is
+    # page-locked at its exact size, the same path. NF rc15 D TP0: 1386.2 MiB
+    # arena -> 2048 MiB block, 662 MiB host RAM. False = torch.empty form.
+    FLLIPER_OPT_PDFLIP_TAIL_STAGE_EXACT_PIN = EnvBool(True)
+    # LAYER-REST-1002 (NF y7t D->P): the park skips its D2H when a device
+    # digest (int64 sum per MiB) equals the digest of the image's last D2H --
+    # the draft is static and every wake wrote the image back. y7t: the
+    # 113 ms D2H on D TP0's pre-loop gated P PP0's first claim and TP1/TP2's
+    # first deposits (~150 ms BAR1 wait each) in every D->P flip. 27B parks no
+    # draft (draft_park=0). False = the D2H on every park, byte for byte.
+    # DEFAULT OFF (y7v2 A/B 02.10.): with the skip D's sleep starts ~120 ms
+    # earlier, its first deposits stall on P collectors still in their own
+    # credit wait (D TP2 weights_0 deposit 838-868 ms vs 206-270 ms, P first
+    # claims 787-1788 ms vs 143-562 ms) and the D->P layer grew 2,06-2,26 s
+    # -> 3,52-3,76 s. On only once that credit cycle is broken.
+    FLLIPER_OPT_PDFLIP_DRAFT_PARK_SKIP_UNCHANGED = EnvBool(False)
 
     # Model & File Download
     FLLIPER_USE_MODELSCOPE = EnvBool(False)
@@ -2042,6 +2380,24 @@ class Envs:
     # is in flight; otherwise it is routed with the start X (to P). NF D is
     # bs1, so a burst served serially on D would be slower than P's batch.
     FLLIPER_PDFLIP_X_SOLO_WINDOW_MS = EnvInt(250)
+    # FRONT-X-MIT (15.10., NF boot 124245 report nf-core-dx-1015): the front's
+    # decision X (+ what it priced) rides with the D-direct leg 2 in two request
+    # headers and D's X gate (W31) checks the REALISED uncached extent against
+    # min(static X, front X + one page) -- named refusal instead of a silent
+    # compute between the front's X and the static 12288. Read on the front
+    # (send) and on D (check). Off on either end = the static gate byte for byte.
+    FLLIPER_PDFLIP_FRONT_X_CARRY = EnvBool(True)
+    # X-SUM-PRICE on the arrival path (user 09.10.): a D that is PREFILLING a
+    # granted SHORT counts as busy for DECODE-COLLECT, and what it still has
+    # to prefill is carried into the collected set's sum. Off = collect only
+    # while D decodes (the sum of an arriving burst on an idle D is unpriced).
+    FLLIPER_PDFLIP_ENABLE_DECODE_COLLECT_PREFILL_BUSY = EnvBool(True)
+    # S49 D-EXTEND-BEACON (SOLL v2 R6, user 18.10. ~21:15Z "Nur echt laufend zählt"): every rank of group D records
+    # in a mmap ring (<arena>/d_extend/D-pid<pid>.bin) the rids whose FIRST extend after their arrival began; the
+    # front's R6 counts a granted D prefill into the set's S only once D really computes it (granted-but-not-started
+    # does not count, a big member waits its T_halb, R4). Read on D (write) and on the front (read). Off = no file,
+    # R6 counts every granted, unfinished D prefill as before (pdflip/d_extend_beacon.py).
+    FLLIPER_PDFLIP_D_EXTEND_BEACON = EnvBool(True)
     # X_ROUTED_NEEDS_P (#246b, 30.09., NF y4c ...dauer09300427 front 04:39:57):
     # a queued request needs P above the X it was ROUTED on, not only above the
     # live X. pdflip-22-37 / 22-38 (4447 / 4191 tokens) were routed LONG on the
@@ -2125,7 +2481,10 @@ class Envs:
     # PBOUND-FLIP-NOW, the ARRIVAL-SEAT flip_now and the SHORT seat on D.
     # Marker 'PDFLIP DECODE-COLLECT hold|dcheck|release'. 0 = the old path, byte
     # for byte (whatever D_CHECK_S says).
-    FLLIPER_PDFLIP_DECODE_COLLECT_WINDOW_S = EnvFloat(15.0)
+    # SOLL v2 (17.10.): DEPRECATED, default 0 = the old window is OFF and nothing reads it any more -- the set
+    # scheduler (FLLIPER_PDFLIP_HALF_X_FRAC / FLLIPER_PDFLIP_HALF_FLIP_S below) replaced the 7.5 s / 15 s timers and the epoch
+    # rule (R7). Kept so a profile that still names it parses.
+    FLLIPER_PDFLIP_DECODE_COLLECT_WINDOW_S = EnvFloat(0.0)
     # DECODE-COLLECT D-CHECK (user ~19:12Z: "es wird 7,5 gesammelt, wenn dann
     # gesammelt nicht mehr token anstehen, als X in D prefillen wuerde, dann
     # prefillt er in D die kleine menge ... auch diese zeit muss einstellbar
@@ -2145,6 +2504,101 @@ class Envs:
     # classic path) the switch is never read. Marker 'PDFLIP DECODE-COLLECT
     # seat-gate'. 0 = route P flips at once, as before.
     FLLIPER_PDFLIP_DECODE_COLLECT_SEAT_GATE = EnvBool(True)
+    # S56 D-MATCH-PROBE (user 19.10. "warum wird irgendwas geschätzt? alle zahlen liegen doch schwarz auf weiß vor";
+    # pdflip/d_match_probe.py): the arrival is priced from group D's EXACT numbers -- D tokenizes the prompt as its
+    # POST will be, TP0 reads the tree read-only (device + host tier), the front asks the shared store with D's ids.
+    # Default ON (user 14.10.: new features on). S56r A1: a failed probe is named (PDFLIP D-PROBE-FAILED attempt=k) and
+    # ASKED AGAIN -- never the front's own count; no exact number by the deadline = PDFLIP D-PROBE-UNPRICED: nothing
+    # is classified, D's own admission measures the request (X-GATE W31 / W123 requeue with D's extent).
+    FLLIPER_PDFLIP_D_MATCH_PROBE = EnvBool(True)
+    # S56: the longest wait for ONE probe answer (ms); the store probe after it gets its own budget
+    FLLIPER_PDFLIP_D_MATCH_PROBE_TIMEOUT_MS = EnvInt(8000)
+    # S56r A1: the deadline for an exact D number, from the first probe POST (ms) -- retries run inside it
+    FLLIPER_PDFLIP_D_MATCH_PROBE_DEADLINE_MS = EnvInt(16000)
+    # S56r A1: the pause before a failed probe is asked again (ms)
+    FLLIPER_PDFLIP_D_MATCH_PROBE_RETRY_MS = EnvInt(250)
+    # EZ-S1 (plan nf-entscheidungszentrale-plan-1019, user 19.10. "nichts schaetzen"): the arrival is classified on an EXACT
+    # number only. No exact fresh u_d: u_p (P's store view) may only say "kurz" (u_p < halbX, D has the same store plus its
+    # radix: u_d <= u_p); everything else is MEASURE_ON_D -- D measures and refuses what is not kurz with its exact extent
+    # (the front hands D the measuring barrier halbX - 1). Media n is n_est (display), never exact; carrier_est is not set
+    # from n_est. Default ON (user 14.10.: new features on); off = the rc17 classification of an unpriced arrival.
+    FLLIPER_PDFLIP_EXACT_CLASS = EnvBool(True)
+    # EZ-S2a (plan nf-entscheidungszentrale-plan-1019, SOLL R1-R9, R11): ONE decision for the set/controller core --
+    # ``phase_policy.decide(kind="set")``: one X per member (x_own), S from the members' own u, p_only only by R9, a kurz
+    # member never in a set, the queue-sum second set and FLIP-ECONOMICS / VISION-FLIP-URGENT / _set_flip_foreseeable no
+    # longer verdicts, the S49 hold inside the verdict. Default ON (user 14.10.: new features on); off = the S1 code, which
+    # stays reachable until S4.
+    FLLIPER_PDFLIP_DECIDER = EnvBool(True)
+    # EZ-S1 (plan A10): a background /server_info read of D's free KV at the end of every P->D flip and every this-many ms
+    # while D is awake (never awaited in a tick, one in flight); 0 = off. Default ON.
+    FLLIPER_PDFLIP_KV_REFRESH_MS = EnvInt(250)
+    # EZ-S1 (plan A10): a KV / seat reading older than this (ms) counts as NOT PRESENT (kv=absent in the decision record),
+    # never as a number. 1000 = the age the ARRIVAL-SEAT test has always accepted as "a reading".
+    FLLIPER_PDFLIP_KV_FRESH_MS = EnvInt(1000)
+    # S63 F1 (user 19.10. "alle zahlen liegen doch schwarz auf weiß vor zu jedem zeitpunkt?"): a set verdict that flips
+    # or assigns P (FLIP_P / PARK_NO_SEAT / REROUTE_P, also the queue-sum verdict) stands only on D's CURRENT numbers:
+    # members whose probe answer is older than _FRESH_MS are probed again (D's tree read-only + the store, one
+    # bundled round) and the verdict is made again on the new numbers. Default ON (user 14.10.: new features on).
+    FLLIPER_PDFLIP_SET_REPROBE = EnvBool(True)
+    # S63 F1: a probe answer at most this old (ms) IS the number at the verdict -- a re-probe could not be younger (it
+    # costs at least one D intake round); a burst's arrival probes flip at once (R3), unchanged
+    FLLIPER_PDFLIP_SET_REPROBE_FRESH_MS = EnvInt(500)
+    # S63 F2 TOK-AHEAD (pdflip/tok_ahead.py): one tokenization per group and request -- D's leg takes the D probe's
+    # tokenization of its media prompt, P's leg takes the tokenization P's tokenizer ran AHEAD at the arrival (posted
+    # by the front while D is awake, P's tokenizer idle: rc15 pdflip-12-340 spent 8.7 s in P's image processor inside
+    # the flip). Identity = digest of text, ids and every media datum; a mismatch is named and tokenizes as before.
+    # Default ON (user 14.10.: new features on).
+    FLLIPER_PDFLIP_TOK_AHEAD = EnvBool(True)
+    # S63 F2: entries kept per tokenizer process (each holds one prompt's ids and processed media items)
+    FLLIPER_PDFLIP_TOK_AHEAD_ENTRIES = EnvInt(8)
+    # S63 F2: an entry no leg took within this many seconds is dropped
+    FLLIPER_PDFLIP_TOK_AHEAD_TTL_S = EnvFloat(120.0)
+    # S63r review: host-RAM cap of the entries per tokenizer process (MiB; oldest out, an entry larger than the cap is
+    # not kept). P's entries hold the processed pixels (~19 KB per image token in fp32: 5 images / 20k image tokens
+    # ~ 380 MB) and live through the flip's host-memory storm; a tower-less D caches no pixels at all. 0 = no byte cap.
+    FLLIPER_PDFLIP_TOK_AHEAD_MAX_MIB = EnvInt(1024)
+    # PARK-RETRACT-SPLIT (02.10., y7y FLIPCYCLE stage=park retract 34-277 ms):
+    # one 'PDFLIP-PARK-RETRACT-SPLIT' line per flip park splits the retract phase
+    # into each request's cache_finished_req, the write_backup calls inside it
+    # and their cache_controller.write -- wall clock only, no device sync, the
+    # wrappers live for the retract alone. 0 = the park as before.
+    FLLIPER_PDFLIP_PARK_RETRACT_SPLIT = EnvBool(True)
+    # PBOUND-FLIP-NOW (user law 02.10. "Request kommt = sofort Prefill"; y8a
+    # pdflip-10-22: an image request, P-only by the vision rule, waited 229 s on
+    # 'ARRIVAL-SEAT verdict=wait_seat why=kv' while 17 younger requests were
+    # admitted to D): under ARRIVAL-SEAT the oldest queued request that needs P
+    # flips D->P at once -- no D seat/KV test (P prefills it; D's seat is the
+    # P->D re-admission's business), no K7/MIN-DWELL hold -- and no younger
+    # request is admitted to D past it. Marker 'PBOUND-FLIP-NOW' /
+    # 'PBOUND-STALL'. 0 = the seat/KV verdict as before.
+    FLLIPER_PDFLIP_PBOUND_FLIP_NOW = EnvBool(True)
+    # SET SCHEDULER (SOLL v2 R3, user 17.10. ~05:30Z "einfach als flag setzen wie lang halbeflipzeit dauer sein soll"):
+    # T_halb, the half flip time in seconds -- how long a halb/big request waits for company while D decodes.
+    # Never computed, only reported against the measured p90s (HALF-FLIP-CHECK, R10). 0 = no wait (decide at once).
+    FLLIPER_PDFLIP_HALF_FLIP_S = EnvFloat(4.5)
+    # SET SCHEDULER (SOLL v2 section 2): F_halb, halbX = F_halb x X(depth). A request with halbX <= uncached < X is
+    # "halb" (collects, R3); below it is "kurz" (D at once, R2).
+    FLLIPER_PDFLIP_HALF_X_FRAC = EnvFloat(0.5)
+    # MIXED-D (S32, user 18.10. "mixed chunk fuer kurze D-Prefills wieder an"): on the Weg-2 D group a SHORT prefill batch
+    # (summed uncached u < halbX = F_halb x X (SOLL R2), nothing chunked) is folded together with the running decodes into ONE
+    # MIXED forward instead of halting them; every running spec row degrades to a plain 1-token extend of its pending bonus token
+    # (fLLiper PR #36933 mechanism), drafting resumes the next decode step. Big prefills (R3 set after the timer, R6 rest, any chunk
+    # of a chunked request) are never mixed. New feature -> default ON; 0 = the old halt-the-decodes path, byte for byte.
+    FLLIPER_PDFLIP_MIXED_D_SHORT = EnvBool(True)
+    # MIXED-D SHORT-CHUNKED (S50, user order 18.10. ~09:10Z "mixed chunk fuer kurze D-Prefills wieder an"): a request D
+    # CHUNKS is still a SHORT D prefill when its whole uncached amount at its first D chunk (seqlen - prefix) lies under the
+    # front's halbX (SOLL R2) -- D's chunk budget (512..2240 on rc13) split such requests, and the lifetime chunk stamp then
+    # kept every chunk unmixed (rc13 D log: 44 of 57 chunk forwards with running decodes belonged to requests under halbX).
+    # A request whose total is >= halbX stays BIG: none of its chunks mixes (R3 timer end, R6 rest), as before.
+    # New feature -> default ON; 0 = any chunked request blocks the mix (S32 form), byte for byte.
+    FLLIPER_PDFLIP_MIXED_D_SHORT_CHUNKED = EnvBool(True)
+    # MIXED-D CENSUS (S50): every this many gate decisions one line "MIXED-D CENSUS" with the mixed share and the refusal
+    # reasons (big_chunk / no_halfx / u_ge_halfx / e2_handoff / local_block / group_veto). 0 = no census line.
+    FLLIPER_PDFLIP_MIXED_D_CENSUS_N = EnvInt(64)
+    # W3-FORMA (h16q review A3): pages one FORMA-REQUEST may hand to the SYNCHRONOUS L3 write on D's TP0 scheduler
+    # thread before the broadcast the workers wait at (128 x 768 KiB ~ 96 MB). A node larger than what is left is
+    # passed over and counted (over_cap_nodes=). 0 = no bound (as on 1c337d79a3).
+    FLLIPER_PDFLIP_W3_FORMA_SPILL_MAX_PAGES = EnvInt(128)
     # X-EXACT: tokenizer path override (tests, or a front without a group
     # reachable); empty = the group's own server_args.tokenizer_path.
     FLLIPER_PDFLIP_FRONT_TOKENIZER_PATH = EnvStr("")
@@ -2160,6 +2614,30 @@ class Envs:
     # its /health and every route decision are unchanged; a client that does
     # not wait is held exactly as before. 0 = serving at once, no warm render.
     FLLIPER_PDFLIP_FRONT_TOKENIZER_PREWARM = EnvBool(True)
+    # FRONT-SEND-IDS-1007 (Hebel 2b): a text-only /v1/chat/completions leg that
+    # D prefills itself carries the front's exact X-EXACT ids as input_ids, so
+    # D neither renders nor encodes it -- only when every segment of the render
+    # passed the decode/encode round trip (pdflip/front_tokens.send_ids_eligible).
+    # Enable only after the FRONT-IDS / D-IDS shadow lines matched on the metal.
+    FLLIPER_ENABLE_PDFLIP_FRONT_SEND_IDS = EnvBool(False)
+    # MM-PERSIST-1002 (y7t pdflip-10-10: the first image after a restart was
+    # priced by chars/3, routed LONG and flipped D->P for 23 new tokens, the
+    # image KV in the persistent L3 store): the front keeps the learned image
+    # token counts and the store anchors of image prompts in
+    # <store dir>/PDFLIP_FRONT_MM.json and reloads them at start. Off = the
+    # RAM-only table of the boot, as before.
+    FLLIPER_PDFLIP_ENABLE_FRONT_MM_PERSIST = EnvBool(True)
+    # VISION-LOAD-WARM-1002: an image arrival warms the host cache (ZFS ARC)
+    # with the tower's checkpoint extent in a front thread (during the D->P
+    # flip, before the prefill); P's PP0 stage reads each chunk from that cache
+    # when it holds it whole (RWF_NOWAIT), else O_DIRECT as before. Off = the
+    # pure O_DIRECT read.
+    FLLIPER_PDFLIP_ENABLE_VISION_LOAD_WARM = EnvBool(True)
+    # VISION-GC-SKIP-1002: the vision stage's teardown skips the full
+    # gc.collect (389-448 ms of the 398-459 ms teardown on y7o/y7t) when
+    # every tensor of the stripped tower is already dead (weak references);
+    # one alive, or a failed stage, still collects. Off = always collect.
+    FLLIPER_PDFLIP_ENABLE_VISION_GC_SKIP = EnvBool(True)
     # RG 26.09.: the told/twin prefix switches as registry fields (pdflip/form.py
     # PREFIX_SWITCHES; their readers in managers/pdflip_store_told.py,
     # pdflip/p_twin_defer.py and managers/pdflip_told_fallback.py take the same
@@ -2174,6 +2652,34 @@ class Envs:
     FLLIPER_PDFLIP_DISABLE_TOLD_PACE_IDLE_SKIP = EnvBool(False)
     FLLIPER_PDFLIP_P_TWIN_DEFER = EnvBool(_profile_default("FLLIPER_PDFLIP_P_TWIN_DEFER", False))
     FLLIPER_PDFLIP_TOLD_GROUP_FALLBACK = EnvBool(_profile_default("FLLIPER_PDFLIP_TOLD_GROUP_FALLBACK", False))
+    # S50 TOLD-ACK-EARLY (managers/pdflip_told_ack_early.py): a P follower reports a store read that ended inside its
+    # model forward from that forward (a worker, woken by the read thread, runs the unchanged follower_pump while the
+    # scheduler thread is inside the forward and holds no tree/told state) instead of at the next pass boundary --
+    # S48 class 1 (pdflip-8-123: acks 2.5 s late, PP0's admission behind its commit block). Only on a follower running
+    # the PF ack stream. New feature -> default ON; 0 = the pump only at pass boundaries, byte for byte.
+    FLLIPER_PDFLIP_TOLD_ACK_EARLY = EnvBool(True)
+    # S53 L2-READ-AHEAD (pdflip/l2_read_ahead.py): the queue head the front's pool plan (H91c) holds while P is awake
+    # is hinted to P, and PP0 fills its stored prefix (KV + QSA index pages of the store span) from L3 into the shared
+    # arena once the running prefill has at most LEAD tokens left -- no reference, no room wait, one successor. The
+    # request switch on P then reads L2 (~0.2 s) instead of the disk (2.4-3.0 s on rc14, pdflip-0-22). Front and P.
+    # New feature -> default ON; 0 = no hint sent, a hint ignored, byte for byte.
+    FLLIPER_PDFLIP_L2_READ_AHEAD = EnvBool(True)
+    # S53: prefill tokens PP0 may still have left when the read-ahead starts (0 = two chunks, 2 * chunked_prefill_size)
+    FLLIPER_PDFLIP_L2_READ_AHEAD_LEAD_TOKENS = EnvInt(0)
+    # S55 P-POOL-FROM-P (phase_policy.resolve_p_pool_tokens): the front's H91c overlap budget is P's REALISED KV pool,
+    # read once off P's /get_server_info (max_total_num_tokens, min-reduced across P's ranks) instead of the constant
+    # 262144 -- a written --p-pool-tokens is kept but clamped to it. With a P pool that holds two legs, PP0 starts the
+    # successor while PP1/PP2 finish the predecessor (rc14 epoch 1: 24.2 s output_commit drain). Front only.
+    # New feature -> default ON; 0 = the configured value alone, byte for byte.
+    FLLIPER_PDFLIP_P_POOL_FROM_P = EnvBool(True)
+    # S69 OUTPUT-RELAY-NOW (scheduler_pp_mixin._pp_relay_output_now): a non-last PP rank on the contiguous ring
+    # forwards a received output at the end of the pass that received it, not inside the NEXT pass's output commit
+    # behind that pass's launch (rc16 12:27:51: PP0 had pdflip-30-41's output at .702, PP1 got it 1909 ms later,
+    # behind PP0's 1787 ms launch; PP1 sat in the receive with its next proxy on the wire). Wire order unchanged,
+    # the join of the send filed one lap later = the old join lap. Not on the last rank, the gapped wire (it has
+    # its own lag removal, #753), XPU, or pp_async_batch_depth > 0.
+    # New feature -> default ON; 0 = the one-pass relay, byte for byte.
+    FLLIPER_PP_OUTPUT_RELAY_NOW = EnvBool(True)
     # Prefix trace (IN 26.09., pdflip/prefix_trace.py): every prefix miss of an
     # agent-load boot gets a token receipt -- one #1420 WALK-STOP line per
     # (rid, stop depth) whose unmatched rest is >= the minimum below, full
@@ -2227,8 +2733,8 @@ class Envs:
     # unchanged: an uncached rest above X still routes LONG. Off = the pre-#49
     # pricing (NF rc2.1l + H100). Default per profile (pdflip/form.py
     # ModelProfile.agent_span, operator 26.09.): qwen27b on (its line ran #49
-    # unswitched since RC9), nextflash off until the NF seat releases it with a
-    # boot tag; off without a form (the NF code default).
+    # unswitched since RC9), nextflash on since X-CREDIT-1002 (02.10., NF seat:
+    # a finished D leg 2 credits its own end anchor); off without a form.
     FLLIPER_PDFLIP_ENABLE_AGENT_SPAN = EnvBool(_profile_default("FLLIPER_PDFLIP_ENABLE_AGENT_SPAN", False))
     # PREFILL-EINBRUCH-0929 K1 (Weg-2 front, X-EXACT): at the first content of
     # an after_p leg 2 -- P's publish is complete, D resumed from it -- the
@@ -2236,7 +2742,11 @@ class Envs:
     # store presence, so a follow-up turn on that prefix prices its real rest
     # and stays on D. Line 'PDFLIP P-ANCHOR-PRESENCE'. Off = no record (#1324:
     # P's leg 1 feeds no presence); A/B against the W50-REROUTE count.
-    FLLIPER_PDFLIP_ENABLE_P_ANCHOR_PRESENCE = EnvBool(True)
+    # Default per profile (ModelProfile.p_anchor_presence, SCHALTER-HALBPORT
+    # 1002): nextflash on (built on NF z30u evidence, a59c95ae36); off for
+    # qwen27b on this tree and without a form.
+    FLLIPER_PDFLIP_ENABLE_P_ANCHOR_PRESENCE = EnvBool(
+        _profile_default("FLLIPER_PDFLIP_ENABLE_P_ANCHOR_PRESENCE", False))
     # Q-711 SHORT-KEPT-BOUND (INT8 y8vb 03.10.): a SHORT kept for D waits in the
     # front's _ready_for_d, which no flip trigger reads (they read only the batch
     # queue) -- it had no upper bound (137 s and 152 s, p90 137 s against 1 s on
@@ -2267,6 +2777,15 @@ class Envs:
     # at P's reset (FLLIPER_PDFLIP_MAMBA_INNER_ANCHOR_RELEASE, grid4096), so crediting them there would
     # over-credit. Default off.
     FLLIPER_PDFLIP_ENABLE_INNER_ANCHOR_PRESENCE = EnvBool(False)
+    # X-CREDIT-INFLIGHT-1002 (Weg-2 front, X-EXACT): at the first content of
+    # ANY D leg 2 (after_p, d_direct, d_single, a drained SHORT) the prompt's
+    # page-floor anchor is recorded as a D presence of that in-flight leg
+    # (presence_src=d_inflight), so a follow-up turn priced while its
+    # predecessor still decodes on D is credited with it. Replaced by the
+    # finish reading, capped by the #59b park depth, retracted when the leg
+    # ends without one and by ANCHOR-LOST. Line 'PDFLIP PRESENCE-INFLIGHT'.
+    # Off = no record (the 5b46b8842e price).
+    FLLIPER_PDFLIP_ENABLE_D_INFLIGHT_PRESENCE = EnvBool(True)
     # The page grain of that end anchor (the store page, ArenaMHAHostPool #107).
     FLLIPER_PDFLIP_FRONT_ANCHOR_PAGE = EnvInt(64)
     # H102 (Weg-2 front): a per-request watcher sees the client's connection
@@ -2383,12 +2902,24 @@ class Envs:
     FLLIPER_ENABLE_REQUEST_DECOMPRESSION = EnvBool(False)
     # Override parsed request fields from headers.
     FLLIPER_ENABLE_REQUEST_HEADER_OVERRIDES = EnvBool(False)
+    # REUSE-TEXT-IDS-1007 (upstream _can_reuse_text_only_prompt_ids): group D's
+    # chat serving hands a text-only request's rendered ids to the tokenizer
+    # manager instead of the decoded text it would encode again.
+    FLLIPER_ENABLE_REUSE_TEXT_ONLY_PROMPT_IDS = EnvBool(False)
 
     # Logging Options
     FLLIPER_LOG_GC = EnvBool(False)
     FLLIPER_LOG_FORWARD_ITERS = EnvBool(False)
     FLLIPER_LOG_DECODE_GRAPH_KEY = EnvBool(False)
     FLLIPER_LOG_MS = EnvBool(False)
+    # D-LEAD-MS-1007: every rank of group D logs, at a request's first extend,
+    # its scheduler arrival and extend start in epoch ms (pdflip/d_lead_probe.py).
+    FLLIPER_LOG_PDFLIP_D_LEAD_MS = EnvBool(False)
+    # FRONT-SEND-IDS-1007 shadow comparison: the front logs PDFLIP FRONT-IDS (its
+    # X-EXACT ids of a text-only request) and group D's tokenizer manager logs
+    # PDFLIP D-IDS (the ids it hands the scheduler), each with length and digest,
+    # joined by rid on the metal. Log only.
+    FLLIPER_LOG_PDFLIP_PROMPT_IDS_DIGEST = EnvBool(False)
     # #540: what the Anthropic front sends downstream for output_config.effort
     # == "xhigh". Default "xhigh" = pass the client's value through unchanged,
     # which is what the Qwen3.8 family's chat template accepts ('xhigh',
@@ -2592,6 +3123,70 @@ class Envs:
     # arena (no KV copy); the publish sweep skipped such nodes and the flush
     # reset dropped the anchor.
     FLLIPER_PDFLIP_ANCHOR_ONLY_BACKUP = EnvBool(True)
+    # S90b EVICT-ANCHOR-DEVICE-KV (NF rc16 bf9ca46f45, P PP0/PP1/PP2 09:11:44-
+    # 09:13:03, 17x PDFLIP-ANCHOR-LOST at=evict backuped=False l3_present=False
+    # why=arena_claim): the device mamba eviction of an internal node whose KV
+    # is on the device only asked for a FULL backup; the KV arena refused it
+    # and the anchor was tombstoned although the mamba arena had room
+    # (MAMBA-ARENA displaced=0 refused=0). The anchor alone now goes into its
+    # mamba arena slot (detached, keyed by the node's last page hash -- not in
+    # the tree, Full keeps no host copy) and from there to L3 (#257 clock /
+    # write-behind); the KV follows with the publish sweep. 0 = the old
+    # tombstone.
+    FLLIPER_PDFLIP_EVICT_ANCHOR_DEVICE_KV = EnvBool(True)
+    # S90b FOLLOWER-STATE-AT-TOLD (same boot, PP2 09:13:10 pdflip-1-23
+    # OVER-UNRESUMABLE told=19200 own=47808 resumable_at_told=3072 -> PF
+    # TOLD-FLOOR 3072 for every rank): a follower whose device KV reaches past
+    # PP0's told but holds no recurrent state AT told reads the anchor of told
+    # from the store (arena slot / L3) and attaches it to its node at told --
+    # as the node's host value when its KV has a host copy (e1, AUX-HOST-LAW),
+    # else straight into a device mamba slot -- instead of acking the
+    # shallower depth. PP0's told stays the one verdict (SOLL R11). 0 = the
+    # old ack.
+    FLLIPER_PDFLIP_FOLLOWER_STATE_AT_TOLD = EnvBool(True)
+    # PARK-END-ANCHOR-FIRST (NF y9nf4 03:33:18, auftrag 1303): the chain of a
+    # parked request (the node its retraction ended at and every ancestor)
+    # outranks the Mamba anchors without park reference when the host arena
+    # is full: its claim spills such an anchor to L3 (secured first), and a
+    # chain INTERMEDIATE that still finds no slot goes down KV-only so the
+    # END anchor behind it is not cut off by ``parent_unbacked``. Acts only on
+    # nodes marked by ``park_running``; no park = byte for byte as before.
+    FLLIPER_PDFLIP_PARK_END_ANCHOR_FIRST = EnvBool(True)
+    # AUX-HOST-LAW (NF h17 38c6d40239, D TP0 15:51:02, "node 248/243/251
+    # mamba host present but Full.host_value=None" killed D from on_idle):
+    # construction, never repair -- the Full host copy leaving a node takes its
+    # aux host states first also when the node holds no device KV (the
+    # internal host-only node lives on for its children; a later insert
+    # revived Full.value over a kept Mamba host state), and a read's anchor
+    # never lands on a node without a Full host copy. The sanity check stays
+    # fatal (raenge-nie-uneins-crash-stop). 0 = the old behaviour.
+    FLLIPER_PDFLIP_AUX_HOST_LAW = EnvBool(True)
+    # LANE-ANCHOR-RANK (NF h13 84e787ec96, D TP0 14:35:34, pdflip-24-181): a
+    # lane park of lane-0 requests (LANE-PREEMPT for an arriving lane-1
+    # request) spilled the arriving request's own resume anchor (MAMBA-ARENA
+    # DISPLACE why=park_first depth=148992) to make room for lane-0 park
+    # chains; D then refused the lane-1 request (#904 MambaComponent absent,
+    # X-GATE W31) and it went to P for a full prefill. A node carries the
+    # highest lane that finished through it (pdflip_lane); a mamba-arena claim
+    # (park chain, flush spill, last resort) may only displace anchors of a
+    # lane at or below the claimer's, lowest lane first. Lanes off: every node
+    # is lane 0, the order is the old one byte for byte. 0 = off.
+    FLLIPER_PDFLIP_LANE_ANCHOR_RANK = EnvBool(True)
+    # e1 ANCHOR-ONLY READ (NF h13 14:35:36, pdflip-24-181): the match reached
+    # the KV but no node carried a Mamba state (the anchor sat in L3 only):
+    # the GDN-holding rank reads only that anchor blob and attaches it as the
+    # node's host Mamba value (MAMBA-HOST-RESUME). 0 = off.
+    FLLIPER_PDFLIP_ANCHOR_ONLY_READ = EnvBool(True)
+    # S43 TF-ANCHOR-READ (NF rc12 1018 16:39:16, pdflip-3-186): PP0's
+    # TOLD-FIDELITY floor search reads the Mamba anchor blob of a depth every
+    # follower proved when PP0's tree holds the KV there but its anchor only
+    # in the store (dropped from the arena to L3) -- instead of falling to a
+    # shallow floor and recomputing ~90k tokens. PP0's one verdict for every
+    # rank (SOLL R11). 0 = off.
+    FLLIPER_PDFLIP_TF_ANCHOR_READ = EnvBool(True)
+    # S43: at most this many anchor reads per TF floor search (each one blob,
+    # arena in place or one L3 fill on the scheduler thread).
+    FLLIPER_PDFLIP_TF_ANCHOR_READ_MAX = EnvInt(3)
     # Per-request mamba checkpoint diagnostics: log match length, resume
     # length, checkpoint node/slot and cache-insert positions so a
     # nondeterministic resume (or a checkpoint at a wrong position) can be
@@ -2682,56 +3277,55 @@ class Envs:
     # persist, on top of the report threshold, before the watchdog fires ONE
     # forced-admission recovery attempt for that episode. See
     # ADMISSION_WEDGE_RECOVERY_SECONDS in invariant_checker.py for the
-    # default's derivation and rationale.
-    # LS12 rest (30.09.): default = the published form's row (ModelProfile.admission_wedge_recovery_s,
-    # qwen27b 2.0 s); -1 (the 60 s default) without a form; an explicit value wins.
-    FLLIPER_ADMISSION_WEDGE_RECOVERY_SECONDS = EnvFloat(
-        _profile_default("FLLIPER_ADMISSION_WEDGE_RECOVERY_SECONDS", -1.0))
+    # default's derivation and rationale. Default per profile
+    # (ModelProfile.admission_wedge_recovery_s, SCHALTER-HALBPORT 1002):
+    # nextflash 2.0; -1 (= the 60 s code default) for qwen27b and no form.
+    FLLIPER_ADMISSION_WEDGE_RECOVERY_SECONDS = EnvFloat(_admission_wedge_recovery_default)
 
-    # deskq 1981 (f11 false alarms): the ADMISSION-WEDGE 'queue age' is the time since D's LAST FIRST TOKEN, not the
-    # age of the waiting request -- a long decode or an idle D makes the clock old before the request arrives, and
-    # the first poll that sees it alarms. 1 = (dual layout only, FLLIPER_PDFLIP_DUAL_LAYOUT=1) the age is
-    # min(that clock, time the waiting_queue has been non-empty as seen by the poll), and a new alarm window
-    # clears the recovery channel's stale last_outcome. 0 = off (default): the pre-fix verdict, byte for byte.
+    # deskq 1507 (NF boot 1005_185049, two false ADMISSION-WEDGE alarms after idle): both verdicts age a request
+    # from the LAST PROGRESS (first-token clock for the classic verdict, decode clock for PREFILL-LIVELOCK), so a
+    # request that arrives after a long idle meets an old clock and the first 10 s poll that sees it alarms. 1 = the
+    # age of BOTH verdicts (and of the recovery driver) is taken from max(last progress, the poll that saw the
+    # queue/running set go from empty to non-empty): a request alarms only after 20 s of its OWN waiting; a stand
+    # that begins while the box is busy alarms exactly as fast as before. 0 = off (default): the pre-fix verdict,
+    # byte for byte, nothing written onto the scheduler. Same name as the 27B branch's switch (deskq 1981); here
+    # without the dual-layout gate.
     FLLIPER_ADMISSION_WEDGE_QUEUE_CLOCK = EnvBool(False)
 
-    # ---- WAECHTER-SCHALTER 06.10. (Nutzerentscheid): Schalter und Schwellen NUR fuer die Waechter, die die Gruppe oder den
-    # Prozess hart stoppen (plus die Alarme ADMISSION-WEDGE / PREFILL-LIVELOCK, die der Nutzer ausdruecklich nannte).
-    # Jeder Default ist das bisherige Verhalten byte-gleich: ungesetzt aendert sich nichts, kein Boot-Argv/Env ist betroffen.
-    # Ein Schalter auf 0 behaelt Erkennung, Logzeilen und Dumps und nimmt NUR den Stopp. NICHT Teil dieses Blocks, mit
-    # Absicht: WAIT_CAP_S (pdflip_store_told.py, Store-Read > 60 s, bleibt ein Fehler), der Deadman, die Request-Abbruch-Waechter
-    # (H102, W88, Client-Liveness, Intake-Stall) und der Scheduler-Exception-Pfad. Es gibt KEINEN 'stop'-Modus fuer reine Alarme.
-    # Gelesen ueber flliper.srt.guard_switches (nicht-positive Zahl = Default, unbekanntes Modus-Wort = Default, nie ein Raise).
-    # Die Namen (ENABLE_*_KILL/_STOP, *_STREAK, *_REFUSALS, FLIP_STALL_SLACK, ADMISSION_WEDGE_SECONDS, PREFILL_LIVELOCK_SECONDS)
-    # sind dieselben wie im NF-Baum (deskq 52, desk/nf-nf22-integ-1006 @ 220e3f8b70).
+    # deskq 52 (user decision 06.10.): switches and thresholds for the watchdogs that STOP the group or the process
+    # hard. Every default is today's behaviour byte for byte (switch on, threshold as before); an unset env changes
+    # nothing. A switch set to 0 keeps the watchdog's detection, its logging and its dumps and removes only the
+    # stop. WAIT_CAP_S of pdflip_store_told.py and the request-abort watchdogs (H102, W88, client liveness) are not
+    # part of this block on purpose.
     #
     # Scheduler watchdog (WatchdogRaw, soft=False; --watchdog-timeout is its threshold): 1 = after the dump and 5 s,
-    # SIGQUIT to the parent process as before; 0 = the timeout is dumped and logged (as the soft watchdog does) and the
-    # process lives on.
+    # SIGQUIT to the parent process (kill_process_tree) as before; 0 = the timeout is dumped and logged (as the
+    # soft watchdog does) and the process lives on.
     FLLIPER_ENABLE_SCHEDULER_WATCHDOG_KILL = EnvBool(True)
     # SubprocessWatchdog (engine.py): 1 = a scheduler/detokenizer child that exited non-zero makes the watchdog send
-    # SIGQUIT to its own process (whole server down) as before; 0 = every death is still reported, nothing is signalled.
+    # SIGQUIT to its own process (cleanup, whole server down) as before; 0 = every death is still reported, nothing
+    # is signalled.
     FLLIPER_ENABLE_SUBPROCESS_WATCHDOG_KILL = EnvBool(True)
-    # Front W17 PdFlipGroupDead: 1 = a group whose /health failed for >= FLLIPER_PDFLIP_GROUP_DEAD_STREAK polls with a dead
-    # process (or a held rank) stops the front as before; 0 = the PDFLIP-HEALTH lines and the /health facts stay, the stop
-    # does not happen. Streak: consecutive failed polls before W17 may fire (minimum 1); it also drives the 503 of the
-    # front's own /health, so a raised streak does not make /health report a group dead that W17 still tolerates.
+    # Front W17 PdFlipGroupDead: 1 = a group whose /health failed for >= FLLIPER_PDFLIP_GROUP_DEAD_STREAK polls with a
+    # dead process (or a held rank) stops the front (STOP, 503) as before; 0 = the PDFLIP-HEALTH lines and the /health
+    # facts stay, the stop does not happen. Streak: consecutive failed polls (5 s apart) before W17 may fire
+    # (minimum 1).
     FLLIPER_PDFLIP_ENABLE_GROUP_DEAD_STOP = EnvBool(True)
     FLLIPER_PDFLIP_GROUP_DEAD_STREAK = EnvInt(2)
-    # Front W2 PdFlipDrainStuck: 1 = this many W1 DrainRefused in a row stop the front as before; 0 = every W1 still refuses
-    # its flip and is logged, the stop never follows. Refusals: the "in a row" count (minimum 1).
+    # Front W2 PdFlipDrainStuck: 1 = this many W1 DrainRefused in a row stop the front as before; 0 = every W1 still
+    # refuses its flip and is logged, the stop never follows. Refusals: the "in a row" count (minimum 1).
     FLLIPER_PDFLIP_ENABLE_DRAIN_STUCK_STOP = EnvBool(True)
     FLLIPER_PDFLIP_DRAIN_STUCK_REFUSALS = EnvInt(3)
-    # Front CONTROLLER-DEAD (#1264): 1 = an exception that escapes an OPEN flip stops the front by name as before; 0 = the
-    # CONTROLLER-DEAD line and the traceback are written, the stop is not (the front then stays in 'flipping').
+    # Front CONTROLLER-DEAD (#1264): 1 = an exception that escapes an OPEN flip stops the front by name as before;
+    # 0 = the CONTROLLER-DEAD line and the traceback are written, the stop is not (the front then stays in
+    # 'flipping': the controller skips every later iteration).
     FLLIPER_PDFLIP_ENABLE_CONTROLLER_DEAD_STOP = EnvBool(True)
-    # Flip-stall detector (#1262 tier 3, feeds the deadman): a flip is named stalled after this many times the boot's last
-    # measured flip. Non-positive reads as the default 4.0.
+    # Flip-stall detector (#1262 tier 3, feeds the deadman): a flip is named stalled after this many times the
+    # boot's last measured flip. Non-positive reads as the default 4.0.
     FLLIPER_PDFLIP_FLIP_STALL_SLACK = EnvFloat(4.0)
-    # Seconds without a first token (ADMISSION-WEDGE alarm, #699; it feeds the wedge status file, the recovery and the
-    # intake-stall handover) and seconds without a decode round (PREFILL-LIVELOCK, Q-698b). Non-positive reads as the
-    # default 20.0. The ADMISSION-WEDGE poll follows the threshold (threshold / 2) once the threshold is set; unset it
-    # stays the 10 s it always was. The recovery threshold (FLLIPER_ADMISSION_WEDGE_RECOVERY_SECONDS) stays its own value.
+    # Seconds without a first token (ADMISSION-WEDGE alarm, #699; it feeds the wedge status file, the recovery and
+    # the intake-stall handover) and seconds without a decode round (PREFILL-LIVELOCK, Q-698b). The poll cadence
+    # stays 10 s. Non-positive reads as the default 20.0.
     FLLIPER_ADMISSION_WEDGE_SECONDS = EnvFloat(20.0)
     FLLIPER_PREFILL_LIVELOCK_SECONDS = EnvFloat(20.0)
     # ADMISSION-WEDGE: act (default) = alarm line + status file + recovery driver (as before); log = alarm line + status,
@@ -3320,6 +3914,15 @@ class Envs:
     # On: the QSA index page of a KV page that is on disk is never the victim; it leaves together with its KV page.
     # Off: byte-identical old path (every file its own LRU entry).
     FLLIPER_HICACHE_L3_SIDECAR_PAIR_EVICT = EnvBool(True)
+    # L3-READ-RECENCY-1014 (NF h13, D.log 14:22:55 TP0 'HiCacheFile EVICTION-BG reclaimed 7546953728 B'): the
+    # storage owner rebuilds its LRU from snapshot + journal lines (C/E: write times) and, since the 28.09.
+    # journal index, never walks st_mtime again -- so a page the SIBLING group only READS (P's leg-1 store
+    # read of a prefix D serves from its device; utime lands on the inode only) stays at its write time and is
+    # the first victim. On: every read hit also journals a ``T`` (touch) line, at most one per page and writer
+    # per FLLIPER_HICACHE_L3_JOURNAL_TOUCH_S, and the owner's wake / attach move a touched page to MRU.
+    # Off: byte-identical old journal (R/C/A/E only).
+    FLLIPER_HICACHE_L3_JOURNAL_TOUCH = EnvBool(True)
+    FLLIPER_HICACHE_L3_JOURNAL_TOUCH_S = EnvFloat(30.0)
     FLLIPER_HICACHE_FILE_BACKEND_MIN_FREE_SPACE = EnvStr("0")
     # Enable client-side metadata caching to optimize filesystem checks (e.g. for Lustre/NFS/FUSE)
     FLLIPER_HICACHE_FILE_BACKEND_ENABLE_METADATA_CACHE = EnvBool(False)
@@ -3375,6 +3978,25 @@ class Envs:
     # stopped with W3. The revoke and host-release drains keep the MIN. False
     # restores the MIN for the backup acks too.
     FLLIPER_PDFLIP_ENABLE_LOCAL_BACKUP_ACK_DRAIN = EnvBool(True)
+    # S83 (rc18 boot ..._1019_200330, D 20:21:22: TP1/TP2 queue=4160 arena references in
+    # host_mem_release_queue, TP0 queue=0; 1249 KV-arena slots pinned by those queued references
+    # alone; 20:22:12 #1470 ARENA-FULL-STOP, 20:22:13 FLUSH-UNBACKED nodes=16 tokens=8512): the
+    # host-release drain counts the group MIN, and on Form A TP0 releases its arena references at
+    # once while the workers queue theirs -- the MIN is 0, the workers' references wait for the
+    # reset. True: after every group drain (and before each #1470 flush round) each rank gives back
+    # the ARENA references still queued on it (an arena row names a reader reference, not an
+    # allocation: no mirrored allocator to keep in step); the non-arena rows stay queued in place
+    # for the MIN. False restores the MIN-only release.
+    FLLIPER_PDFLIP_RELEASE_QUEUE_LOCAL_REFS = EnvBool(True)
+    # S86 (rc19 boot ..._1019_230333, D 05:37:22-23: ARENA-REF-HOLDERS tree=6409 queue=0 -- the trees'
+    # references alone pinned the KV arena; #1427 ARENA-DROP freed=0, #1421 arena_claim, #1470
+    # ARENA-FULL-STOP, FLUSH-UNBACKED nodes=17 tokens=13632 with three park-end chains): at the sleep leg,
+    # after the group drain and before the sleep flush (group D), every rank gives back the arena
+    # references of its device-resident nodes whose every page has a proven L3 copy, agreed over the
+    # group (MAX of the veto vector; digest + barrier after), so the #1470 flush finds room for the
+    # nodes with no copy. A page without an L3 copy is never released (pdflip/sleep_l3_release.py).
+    # False: the sleep flush as before.
+    FLLIPER_PDFLIP_SLEEP_L3_RELEASE = EnvBool(True)
     # fnFL2 H74 (x172): on a TP group the publish split window (#1407) is the
     # chunk (4096, page-aligned) on every rank instead of a quarter of the
     # rank's OWN host pool -- x172 split a 6080-token node into 4096 + 1984 on
@@ -3732,6 +4354,31 @@ class Envs:
     # the decode LRU. False: the plan before H107. Rank-uniform: every rank
     # reads the same launcher env; the waves are rank-local (no collective).
     FLLIPER_OPT_MOE_POOL_EAGER_LRU_HITS = EnvBool(True)
+    # S44/H107c (18.10.): H107 also arms on a MAPPED residency -- a frozen
+    # load-time layout whose residents sit at slots other than their own id,
+    # as long as ``resident_slot`` maps the R residents one-to-one onto
+    # [0, R). The NF D pool runs on the Platztausch Karte (v2), whose buffer
+    # order is [prefix | pad | extra] (``_local_map_layout``): local pad 0 sits
+    # BEHIND the prefix, so ``slot != id`` on every D rank and H107 never armed
+    # on the metal (rc12 1018_153151 D: 0x 'H107 EAGER-LRU' against 1587x
+    # 'expert-major prefill, 3 waves, 0.33-0.44 GiB H2D'; every D extend
+    # 1.5-2.5 s, decode stood 33-40 %). Wave 0 reads each resident at
+    # ``resident_slot[e]`` instead of ``e``; nothing else changes. Bit-identical
+    # (a row choice never changes what the apply computes). False: H107 only
+    # on the identity layout (H107b). Rank-uniform launcher env; the waves are
+    # rank-local (no collective).
+    FLLIPER_OPT_MOE_POOL_EAGER_LRU_MAPPED = EnvBool(True)
+    # S44/H107d (18.10.): when the H107 misses would need MORE waves than the
+    # plain plan + 1 (the warm LRU holds most scratch rows, so few rows are
+    # writable), the coldest hit rows are RECLAIMED: their experts are read in
+    # the fetch-free wave 0, and only then (same stream, write-after-read) do
+    # later miss waves overwrite those rows. Waves stay <= plain + 1, the H2D
+    # stays misses-only, the decode LRU keeps its hottest rows. Writable rows
+    # are also taken coldest first (free/staging rows, then the oldest
+    # ``row_use``), which rides the same D2H as the routing. Without it a big
+    # extend under a warm LRU fell into dozens of tiny waves (or, with no
+    # writable row left, back to the plain plan). False: H107's plan as before.
+    FLLIPER_OPT_MOE_POOL_EAGER_LRU_RECLAIM = EnvBool(True)
     # D-Mini-Extend (30.09., y3u): an eager forward under the pool whose routed
     # ids fit the widest CAPTURED decode step (graph form: max graph bs x MTP
     # verify rows x top-k, and the step's wave bound min(ids, E - R) <=
@@ -3768,6 +4415,61 @@ class Envs:
     # MISMATCH'). 1 (default) = the first mini extend of the process proves
     # all 48 layers once (one extra MoE pass); 0 = off.
     FLLIPER_DEBUG_MOE_POOL_EAGER_DEVICE_CHECK = EnvInt(1)
+    # S51 EAGER-DEVICE-EM (18.10., NF D rc13): an eager forward PAST the
+    # D-Mini-Extend graph form (every D extend of more than ~24 tokens) runs a
+    # device-planned EXPERT-MAJOR pass instead of the host plan. rc13 D TP0:
+    # extends of 64-255 tokens cost 1.33 s median (PDFLIP-VRAM-PEAK chunk
+    # window) for ~0.40 s of expert bytes at the 5090's link (Gen4 x8, 14.4
+    # GB/s card probe) -- the rest is the host plan's per-layer routing D2H,
+    # the Python plan and the per-wave launch chain, during which the GPU
+    # idles (y3u: 2-6-token extends 403-739 gpu-ms on the host plan, ~25 ms
+    # on the device step). The pass: the pool step plans the forward's
+    # DISTINCT experts (one lane per local expert, <= the step width, so the
+    # captured kernel is reused as is), copies its misses on the device, and
+    # every (token, k) pair is computed exactly once as its own top_k=1 row
+    # into the [T*K, H] partials table in the wave whose step served its
+    # expert; the top-k reduction runs once at the end (combine_topk_partials)
+    # -- the host expert-major path's arithmetic, so the output is the host
+    # plan's (same rows, same bytes, same combine). No routing D2H, no host
+    # plan, no sync_pool_from_host. False: every forward past the graph form
+    # plans on the host as before. Rank-local choice, no collective inside the
+    # MoE (R11). Needs FLLIPER_OPT_MOE_POOL_EAGER_DEVICE_STEP.
+    FLLIPER_OPT_MOE_POOL_EAGER_DEVICE_EM = EnvBool(True)
+    # S51: the most routed ids (T x top-k) one EAGER-DEVICE-EM forward takes;
+    # longer extends keep the host plan. 20480 = 2048 tokens at top-k 10 =
+    # 97 % of rc13's D extends (837 of 863 on TP0). Every wave runs over all
+    # lanes (the unserved ones on the zero row), so the extra zero-row GEMM
+    # grows with T: ~0.95 x T x K rows per extra wave, ~0.2 s per extend on
+    # a 3080 at T=2048 against the ~0.7 s of host-plan overhead it removes.
+    # The workspace stays sliced (FLLIPER_OPT_MOE_POOL_EAGER_DEVICE_EM_SLICE).
+    # 0 = no bound.
+    FLLIPER_OPT_MOE_POOL_EAGER_DEVICE_EM_MAX_IDS = EnvInt(20480)
+    # S51: at most this many pool waves per EAGER-DEVICE-EM forward (the bound
+    # min(E_local, E - R) <= waves x (LRU + staging) must hold; NF D: 2 on
+    # every rank). A layer that needs more keeps the host plan.
+    FLLIPER_OPT_MOE_POOL_EAGER_DEVICE_EM_WAVES = EnvInt(4)
+    # S51: (token, k) pairs one grouped GEMM of an EAGER-DEVICE-EM wave takes
+    # at once (every wave runs over all T x K lanes, the unserved ones on the
+    # zero row at weight 0, so the slice bounds the per-wave workspace).
+    FLLIPER_OPT_MOE_POOL_EAGER_DEVICE_EM_SLICE = EnvInt(4096)
+    # S51 metal instrument for EAGER-DEVICE-EM: the first N EM forwards PER
+    # LAYER also run the plain host plan (H107 off) as the reference, one line
+    # 'EAGER-DEVICE-STEP CHECK ... waves=W ...' each (own budget, apart from
+    # the D-Mini-Extend check). S51r (review 18.10.): a deviation beyond fp
+    # rounding does NOT stop the rank -- the reference IS the host plan, so
+    # that extend is served by it, one ERROR line 'EAGER-DEVICE-EM
+    # MISMATCH-FALLBACK layer N ...' names it, and that layer plans every
+    # later extend past the graph form on the host (a defect report; the
+    # default stays on, the other layers keep EM). 1 (default) = the first EM
+    # extend of the process proves all layers once; 0 = off.
+    FLLIPER_DEBUG_MOE_POOL_EAGER_DEVICE_EM_CHECK = EnvInt(1)
+    # S51: the expert-major host loop stages each wave slice's pair indices
+    # through PINNED host memory (_h2d_i64) instead of a pageable
+    # ``torch.from_numpy(...).to(device, non_blocking=True)`` -- pageable ->
+    # device is host-blocking (fn3g, the _build_lut note), so every wave of
+    # every layer waited for its own fetch before the host could launch the
+    # apply. Same values, same tensor. False: the pageable copy as before.
+    FLLIPER_OPT_MOE_OFFLOAD_PINNED_WAVE_IDX = EnvBool(True)
     # H95: the captured decode step of the device-planned pool
     # (FLLIPER_MOE_OFFLOAD_GRAPH_MODE=pool) in up to N OVERFLOW WAVES. 0 or 1
     # (default) = off, the Task #40 worst case: a captured batch needs
@@ -3820,6 +4522,13 @@ class Envs:
     # --rank-moe-ratio only seeds the search; "stated" = the stated vector is
     # the base (the old hand base, explicit override).
     FLLIPER_PDFLIP_OWNED_BASE = EnvStr("derive")
+    # S54 (19.10.): the D extend in the owned solve. The objective adds
+    # extends-per-decode-round x the extend's expert copy at the slowest
+    # rank's link (card probe pinned H2D per card); unset = the rc14 seed
+    # (256 new tokens per extend, 0.0256 extends per round, boot 1019_010742
+    # 05:25-06:15Z); _PER_ROUND=0 switches the term off.
+    FLLIPER_PDFLIP_OWNED_EXTEND_TOKENS = EnvStr(None)
+    FLLIPER_PDFLIP_OWNED_EXTEND_PER_ROUND = EnvStr(None)
     # H95c (Nutzer 26.09.: "1,6gb experten cache kostet es nur bei tatsaechlich
     # 6 sitzen"): D's per-seat posts are PHYSICALLY backed only for the seats
     # the phase occupies (n = d_seats.phase_seats of the wake's handoff_n); the
@@ -3843,7 +4552,9 @@ class Envs:
     # re-plan round trip (ski rental, the flip policy's shape) -- the freed
     # pages go back to expert rows. Needs FLLIPER_OPT_PDFLIP_D_SEAT_VRAM; read by
     # D's ranks AND by the front (which then counts D's seats at --d-bs).
-    FLLIPER_PDFLIP_D_SEAT_REWAKE = EnvBool(False)
+    # SWITCH-DEFAULTS 1004: --profile nextflash states it ON (pdflip/form.py
+    # STATED_SWITCHES); without a form / for qwen27b the default stays off.
+    FLLIPER_PDFLIP_D_SEAT_REWAKE = EnvBool(_profile_default("FLLIPER_PDFLIP_D_SEAT_REWAKE", False))
     # H95c: the extra expert rows' VIRTUAL reservation per MoE TP rank
     # ("16,0,0"), written by the launcher from the seat table (rows at n=1
     # minus rows at the --d-bs cap, GERECHNET). Only the rows the runtime's
@@ -3925,6 +4636,33 @@ class Envs:
     FLLIPER_PDFLIP_D_LEND_STEP_ROWS = EnvInt(4)
     #   Decode rounds in a row before a lend (a burst of extends lends nothing).
     FLLIPER_PDFLIP_D_LEND_SETTLE_ROUNDS = EnvInt(8)
+    #   S78 (19.10., Grundgesetz VRAM=Experten): a SHORT extend (the front's R2
+    #   class, u < halbX) gives back only the lent cells its activation needs --
+    #   the rc12g chunk model's own price (300 MiB + rate x rows over the lend
+    #   floor) -- and keeps the rest ON through the mixed forward. rc17 D
+    #   (1019_171636), all three ranks: a short mixed extend grew the allocator
+    #   by <= 65-437 MiB (T < 1024) while the full return left 2.0-2.2 GiB free
+    #   (p50) at its start, and every return cost a re-lend of ~300 ms decode
+    #   pause after it. Big or unpriced extends (and a rank without a chunk
+    #   rate) return everything as before. False = the full return, byte for
+    #   byte.
+    FLLIPER_PDFLIP_D_LEND_KEEP_SHORT = EnvBool(True)
+    #   S93 (20.10., Grundgesetz VRAM=Experten; S91 nf-s91-decode-regression-1020.md): "extend pending" counts
+    #   only waiting requests D's admission can TAKE -- not the ones its own verdicts hold out (the park gate's
+    #   older_live / held_for_older / park-first barrier, ``AdmissionGate.skip``; a DQH-held queue,
+    #   ``DHeadHold`` armed on the unchanged fingerprint). rc20 D (1020_081757): the waiting queue was non-empty
+    #   in 99 % of the decode rounds (best boot 1017_183228: 0 %), every lend went back 0-2 s later, decode ran
+    #   on 4-7 expert rows instead of > 20 (bs1 34.3 vs 22.9 gpu-ms). False = any waiting request is pending,
+    #   as before.
+    FLLIPER_PDFLIP_D_LEND_HOLD_AWARE = EnvBool(True)
+    # S78 EM-FETCH (19.10.): per EAGER-DEVICE-EM forward and rank, the rows
+    #   and bytes the pool steps copied host->device and the device time of
+    #   those copies (CUDA events around copy_rows) beside the device time of
+    #   the whole MoE EM span -- the split of a mixed D round into expert H2D
+    #   and the rest, read without a sync (event query + pinned non-blocking
+    #   D2H, logged a forward later). Rank-local, no collective, every rank
+    #   (the pacer of a forward is the slowest link). False = no event, no line.
+    FLLIPER_PDFLIP_EM_FETCH = EnvBool(True)
     # 29.09. (Nutzer 12:35Z, Grundgesetz): KV stages BELOW the booked S0 at this
     #   granularity (floor, 2 x floor, ... < S0, e.g. 32768). The plan still
     #   books S0; the KV between the floor and S0 is born unmapped and funds
@@ -4027,6 +4765,43 @@ class Envs:
     # behind the request (one more gather row, one mamba slot), and a twin
     # waits only for a source that promised an anchor <= shared. 0 = off.
     FLLIPER_PDFLIP_TWIN_ANCHOR = EnvBool(True)
+    # TWIN CHAIN (S79, 19.10., NF rc17 boot ..._1019_171636 pdflip-0-1/0-4/0-5;
+    # pdflip/p_twin_defer.py rule 6): a held twin released in the same PP0 pass
+    # as an OLDER sibling (released with it, or in flight and not deferred) that
+    # shares a deeper boundary with it than its own sources did, waits behind
+    # that sibling instead of registering its read now -- 0-4 shared 81565 with
+    # 0-1 but registered with it at told 3584 and prefilled 78023 tokens 0-1
+    # published meanwhile. Bounded by the twin's Frist (since its intake).
+    # 0 = rc17 byte for byte.
+    FLLIPER_PDFLIP_P_TWIN_CHAIN = EnvBool(True)
+    # GEN-FORK TRACK (S57, 19.10., NF rc15 pdflip-42-262; pdflip/turn_anchor.py):
+    # where the turn anchor is armed, a prefill step whose own (END) track lies
+    # past the generation prompt's <|im_start|> (N % page in 1..4 on NF) also
+    # tracks the state at floor_page(g) -- where a sibling request forks. One
+    # gather row, one mamba slot, same forward. 0 = off (rc15 byte for byte).
+    FLLIPER_PDFLIP_GEN_FORK_ANCHOR = EnvBool(True)
+    # SYS-GRID TRACK (S62 4b, 19.10., NF rc15 pdflip-2-8; pdflip/turn_anchor.py):
+    # where the turn anchor is armed, a prefill step inside the prompt's FIRST
+    # message (system + tool list, up to the second <|im_start|>) also tracks the
+    # state every FLLIPER_PDFLIP_SYS_GRID_TOKENS tokens -- each grid point snapped
+    # down to the lowest tool-GROUP boundary (built-in -> MCP, MCP server change)
+    # inside its window -- plus floor_page(segment end). A tool-list variant then
+    # loses at most one grid window (rc15 2-8: 0 instead of 5056 tokens). One
+    # gather row + one mamba slot per point, same forward, once per system-prefix
+    # variant. 0 = off (byte for byte).
+    FLLIPER_PDFLIP_SYS_GRID_ANCHOR = EnvBool(True)
+    FLLIPER_PDFLIP_SYS_GRID_TOKENS = EnvInt(4096)
+    # cost bound: at most this many points per prompt (the arena's per-request
+    # share cap is 21 slots; more grid points would displace the request's own
+    # anchors). A longer first message widens the grid instead.
+    FLLIPER_PDFLIP_SYS_GRID_MAX = EnvInt(16)
+    # Qwen3.x token ids (tokenizer.json, verified 19.10.): a tool line of the
+    # chat template's <tools> block starts '{"type": "function", "function":',
+    # its name field is '"name": "' and an MCP tool's name starts 'mcp__'
+    # (separator '__'). Empty = no tool snapping (the plain grid).
+    FLLIPER_PDFLIP_SYS_GRID_TOOL_HEAD = EnvStr("4754,1267,763,328,1628,487,328,1628,763")
+    FLLIPER_PDFLIP_SYS_GRID_TOOL_NAME = EnvStr("591,763,328")
+    FLLIPER_PDFLIP_SYS_GRID_MCP_PREFIX = EnvStr("76,4520,548")
     # fnFL2 H42b: burst assembly on the DECIDING P rank (PP0), only while
     # multi anchor tails are armed. A pass that would carry nothing but new
     # bodies is held back up to this many ms while more of a burst is still
@@ -4422,8 +5197,8 @@ class Envs:
     # 09252328: a D->P flip that drained 29.7 s recorded flip_ms=31115, and the next
     # D->P was held 39.2 s by min-dwell (need 31115 ms, awake 8758 ms) while a batch
     # waiter queued. On: the price is flip_ms - drain_quiesce_ms (the flip itself).
-    # DEFAULT ON since 03.10. (110: 27B w109290020 129x ':drain-<n>ms-excluded',
-    # NF 197 boots); =0 restores the flip_ms-with-drain price.
+    # DEFAULT ON since 03.10. (110: NF in 197 boots, 27B w109290020 129x
+    # ':drain-<n>ms-excluded'); =0 restores the flip_ms-with-drain price.
     FLLIPER_PDFLIP_MIN_DWELL_EXCLUDE_DRAIN = EnvBool(True)
     # H91d D-PARK DRAFT KV (user decision 2026-09-25: "Ausnahme nur fuers
     # Parken"): the one exception to the tier being off. A PARKED group-D
@@ -4493,7 +5268,9 @@ class Envs:
     # (p_phase_max_requests, P's pool, d_wait_bound_s) fires at once. Off =
     # the immediate park byte for byte.
     # WINDOW_S: a fixed timer x instead of the measured price (override only).
-    FLLIPER_PDFLIP_ENABLE_PARK_COLLECT_WINDOW = EnvBool(False)
+    # SWITCH-DEFAULTS 1004: --profile nextflash states it ON (pdflip/form.py
+    # STATED_SWITCHES); without a form / for qwen27b the default stays off.
+    FLLIPER_PDFLIP_ENABLE_PARK_COLLECT_WINDOW = EnvBool(_profile_default("FLLIPER_PDFLIP_ENABLE_PARK_COLLECT_WINDOW", False))
     # PARK-SEAT-FREE (27B flip layout, 02.10.; N3o ...10020544: the collect
     # window held P-bound arrivals 20-46 s while D ran 1-4 of its 6 seats --
     # DP-WAIT hold_by=d-work, p90 60 s; NF prefills after ~2 s). The NF
@@ -4522,8 +5299,10 @@ class Envs:
     # (no collect window); without a seat nothing flips and it waits for the
     # next seat in arrival order; the wait bound parks the youngest decode.
     # With it on, PARK-COLLECT-WINDOW and PARK-WINDOW-GATE are inert. Front-
-    # side, model-neutral. Off until the first series, then on.
-    FLLIPER_PDFLIP_ENABLE_ARRIVAL_SEAT_RULE = EnvBool(False)
+    # side, model-neutral. DEFAULT ON on this (NF) line since 03.10. (110: NF
+    # metal since 29.09. ~19:40Z, DP-WAIT p90 3-6.5 s against 27B 16-60 s); the
+    # 27B line never ran it and keeps it off. =0 is the pre-rule front.
+    FLLIPER_PDFLIP_ENABLE_ARRIVAL_SEAT_RULE = EnvBool(True)
     # ARRIVAL-SEAT: the decode part of an arrival's KV need when the client
     # set no max_tokens (prompt + this = the need checked against D's free KV).
     FLLIPER_PDFLIP_ARRIVAL_DECODE_RESERVE_TOKENS = EnvInt(2048)
@@ -4539,6 +5318,29 @@ class Envs:
     # blanket park, no clock on the backfill. Needs
     # FLLIPER_PDFLIP_ENABLE_ARRIVAL_SEAT_RULE; 0 = the ARRIVAL-SEAT/#246 front.
     FLLIPER_PDFLIP_ENABLE_ARRIVAL_SEAT_AGE_PLAN = EnvBool(True)
+    # S46 F5 (NF 18.10.): an AGE PLAN to_d grant whose plan names younger victims goes to D although every front
+    # seat is held -- the seat is taken ON CREDIT (no semaphore permit; the next normal seat released passes its
+    # permit to it), so D's SEAT-AGE seat trigger sees the older request in its waiting queue and displaces the
+    # youngest. Off = the head waits at the front's seat semaphore until a seat frees by itself (rc12: 124 grants,
+    # p50 5.3 s, max 72 s there; D's seat trigger never saw them).
+    FLLIPER_PDFLIP_AGE_SEAT_ON_CREDIT = EnvBool(True)
+    # S60 F3 (NF rc15 19.10., PRIO=ALTER 14.10. / SOLL R2, R5): ONE age order between a kurz request waiting for a D
+    # seat (ARRIVAL-SEAT) and the hand-offs in the D line (``_ready_for_d``). A kurz arrival waits at the batch gate
+    # only for an OLDER D-line entry (before: for every one, up to --drain-deadline-s, outside every age order --
+    # pdflip-108-779 116 s, pdflip-108-776 120 s then routed to P); the D line does not seat a younger head while an
+    # older ARRIVAL-SEAT waiter that is not blocked waits; a waiter's seat count holds only the OLDER D-line
+    # entries. Needs FLLIPER_PDFLIP_ENABLE_ARRIVAL_SEAT_RULE. 0 = the batch gate and the D line as before.
+    FLLIPER_PDFLIP_SHORT_GATE_BY_AGE = EnvBool(True)
+    # S60 F6 (NF rc15 19.10.): a request D parks (PARK-RUNNING ``unknown_to_front``) that the front holds no D leg
+    # for is an orphan -- its client is gone, the abort missed it on D (rc15 pdflip-80-579: client gone 08:48:20,
+    # D decoded it to 09:13:55, ~13.8k tokens, ~133k KV tokens and a D running slot for nobody). The front aborts
+    # it on D at the park (R11: the front decides). 0 = it is only named in the PARK-RUNNING line, as before.
+    FLLIPER_PDFLIP_D_ORPHAN_ABORT = EnvBool(True)
+    # S46 F2-F4 (NF 18.10., SA #244 / PRIO=ALTER 14.10.): the seat ORDER of requests that rode a flip to P. F2: the D
+    # line re-picks by age when an older hand-off joined it during the seat wait; F3: a BATCH fall-through is queued
+    # at its age position (not behind younger ones); F4: while P is awake a younger hand-off does not take a seat
+    # before an older request still on P (D is asleep, nothing is lost). 0 = the line as before.
+    FLLIPER_PDFLIP_SEAT_ORDER_AFTER_FLIP = EnvBool(True)
     # ARRIVAL-SEAT MIN-DWELL (NF-Operator 30.09., y5c: pdflip-0-2 parked 6x by
     # flip_now, park 4 came 1.1 s after its resume): a flip_now to P waits
     # until the decodes this D phase RESUMED have decoded since their resume
@@ -4609,17 +5411,21 @@ class Envs:
     # divided by k; k samples skip manual-flip phases. Model-neutral (NF shares
     # the solver). 0 = the ski price (warm legs + resume) / k, byte for byte.
     FLLIPER_PDFLIP_X_EXCURSION_PRICE = EnvBool(True)
-    # PDFLIP-B (02.10., N5d ping-pong): with the excursion price the X-SOLO band
-    # floor (X_busy / start X) and FLIP-ECONOMICS' threshold follow the live X;
-    # a park-closed admission is labelled "park", not "fairness", in MIN-DWELL.
-    # 0 = the band floor and the threshold as before.
+    # PDFLIP-B (02.10., 27B N5d ping-pong; NF cherry-pick of 98b8168d66): the
+    # X-SOLO band floor (X_busy / start X) and FLIP-ECONOMICS' threshold follow
+    # the live X -- X* of the measured round trip (X-COST-LINE price; the 27B
+    # line prices it with FLLIPER_PDFLIP_X_EXCURSION_PRICE, NF with the ski price:
+    # warm D->P + P->D legs + resume); a park-closed admission is labelled
+    # "park", not "fairness", in MIN-DWELL (NF: the ARRIVAL-SEAT trigger passes
+    # K7's min-dwell first). 0 = the band floor and the threshold as before.
     FLLIPER_PDFLIP_X_BAND_FOLLOWS_PRICE = EnvBool(True)
-    # K7-DWELL idle skip (02.10., N5j 13:50:12-15: D just woke, nothing to decode,
-    # a LONG waiting; MIN-DWELL held the idle D 2.2 s until awake >= the derived
-    # 2586 ms). The D->P min-dwell only holds while D has work (running decodes,
-    # a hand-off in flight or ready_for_d); an idle D flips at once (NF cd12370e30
-    # names: "PDFLIP ARRIVAL-SEAT K7-DWELL skip ... d_running=0",
-    # arrival_seat_k7_dwell_skip_idle). 0 = the dwell holds an idle D as before.
+    # K7-DWELL idle skip on the classic D-branch (27B 02.10., N5j 13:50:12-15; the
+    # NF ARRIVAL-SEAT form cd12370e30 covered only the seat path): the D->P
+    # min-dwell only holds while D has work (running decodes, a hand-off in
+    # flight or ready_for_d); an idle D flips at once -- MIN-DWELL
+    # overridden_by=d_idle. Without it a DONE-KICK pass on an idle D held for
+    # the derived dwell and the flip came one 0.2 s tick later.
+    # 0 = the dwell holds an idle D as before.
     FLLIPER_PDFLIP_K7_DWELL_IDLE_SKIP = EnvBool(True)
     # MANUAL-FLIP RETURN-SKIP (02.10., L15 boot dac8b62b8c 14:43:03): POST /pdflip/flip
     # from D skips its return half P->D while P-bound work waits (P outstanding or
@@ -4813,6 +5619,12 @@ class Envs:
     # For pre-tokenized (list[int]) multimodal prompts,
     # preserve the user's original tokens to avoid retokenization drift.
     FLLIPER_MM_AVOID_RETOKENIZE = EnvBool(True)
+    # D-MM-ITEM-CACHE-1007: group D (multimodal tokenizer, no tower) keeps the
+    # hash, grid and token count of every inline image it tokenized and builds
+    # a request whose images it has all seen without loading or preprocessing
+    # their pixels (pdflip/d_mm_item_cache.py). Off: the processor runs as before.
+    FLLIPER_ENABLE_D_MM_ITEM_CACHE = EnvBool(False)
+    FLLIPER_D_MM_ITEM_CACHE_ENTRIES = EnvInt(64)
 
     # VLM Item CUDA IPC Transport
     FLLIPER_USE_CUDA_IPC_TRANSPORT = EnvBool(False)

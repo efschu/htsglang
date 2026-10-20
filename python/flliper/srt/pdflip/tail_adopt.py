@@ -113,6 +113,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import queue
 import threading
 import time
@@ -750,18 +751,21 @@ def _first_check(rid: str, now: float) -> float:
 
 def drop(rid: str) -> None:
     """Q-699: the rid ended on D (abort): its job, its first-check time and
-    any agreed entry go; a queued staging of it is skipped by the worker."""
+    any agreed entry go; a queued staging of it is skipped by the worker.
+    TAIL-CONSUME-ON-FULL: a receipt deferred by a short reap is honoured."""
     rid = str(rid)
     _JOBS.pop(rid, None)
     _T_FIRST.pop(rid, None)
     _AGREED.pop(rid, None)
+    _release_deferred(rid, "abort")
 
 
 def drop_aborted(rid: str, abort_all: bool = False) -> int:
     """Q-699: :func:`drop` for every staged rid an AbortReq names (the
     scheduler's own matching: ``startswith``, or all). Returns the count."""
     rid = str(rid or "")
-    gone = [r for r in set(_JOBS) | set(_AGREED) if abort_all or (rid and r.startswith(rid))]
+    gone = [r for r in set(_JOBS) | set(_AGREED) | set(_CONSUME_DEFERRED)
+            if abort_all or (rid and r.startswith(rid))]
     for r in gone:
         drop(r)
     return len(gone)
@@ -839,6 +843,31 @@ def rid_bytes(held: HeldShapes, page_size: int, verify: bool) -> int:
     return total * (2 if verify else 1)
 
 
+def _arena_buffer(nbytes: int, pin: bool) -> torch.Tensor:
+    """The arena's one host buffer of ``nbytes``.
+
+    S58 (19.10., NF rc15 1019_071429, D TP0 /proc smaps): the arena asked for
+    1453524096 B (1386.2 MiB, ``TAIL-STAGE-ARENA seats=6 per_rid_mib=231.0``)
+    and the rank held a 2048 MiB ``/dev/zero`` block for it --
+    ``torch.empty(pin_memory=True)`` goes through ATen's CachingHostAllocator,
+    which rounds every request up to the next power of two (PowerOf2Ceil, see
+    expert_offload.pinned_exact_empty and 73b1a4750a): 662 MiB of host RAM no
+    post books (the ledger line prices ``bytes=``, not the block). With
+    FLLIPER_OPT_PDFLIP_TAIL_STAGE_EXACT_PIN (default on) the buffer is
+    page-locked at its exact size (anonymous mapping + cudaHostRegister, the
+    path of the spill pools and the draft image). A failed registration falls
+    back to the torch.empty form, named; off = that form, byte for byte."""
+    if pin and envs.FLLIPER_OPT_PDFLIP_TAIL_STAGE_EXACT_PIN.get():
+        try:
+            from flliper.srt.layers.moe.expert_offload import pinned_exact_empty
+
+            return pinned_exact_empty((int(nbytes),), torch.uint8)
+        except Exception as e:  # noqa: BLE001 - the old form is always there
+            logger.warning("%s exact pin of %d bytes failed (%s: %s) -- torch.empty(pin_memory) instead, "
+                           "rounded to the next power of two", LEDGER_LINE, int(nbytes), type(e).__name__, e)
+    return torch.empty(int(nbytes), dtype=torch.uint8, pin_memory=pin)
+
+
 class PinArena:
     """ONE pinned host buffer, taken in aligned spans per rid (first fit) and
     given back per rid -- no pin_memory() per tensor. ``take`` returns None
@@ -846,7 +875,7 @@ class PinArena:
 
     def __init__(self, nbytes: int, pin: bool = True):
         self.nbytes = int(max(0, nbytes))
-        self.buf = torch.empty(self.nbytes, dtype=torch.uint8, pin_memory=pin) if self.nbytes else None
+        self.buf = _arena_buffer(self.nbytes, pin) if self.nbytes else None
         self._lock = threading.Lock()
         self._free: List[Tuple[int, int]] = [(0, self.nbytes)] if self.nbytes else []
         self._spans: Dict[str, List[Tuple[int, int]]] = {}
@@ -1304,8 +1333,76 @@ def _note_defect_why(rid: str, why: str) -> None:
         pass
 
 
-def agree(rid: str, group_vote: int) -> None:
-    """After the MIN: remember the group's answer for the admission."""
+#: TAIL-CONSUME-ON-FULL (NF h16h 853534a9ff, boot _211215, D 00:49:44-45,
+#: pdflip-182-1661, the h48 pendulum, 106 s over P three times): D's FIRST wake
+#: read was reaped SHORT (TP2 ``READ-STAGES pages=810 of 1417`` -- the arena
+#: reap race, ``LATE-COMPLETE statuses=[3]`` the same second; group END 51840),
+#: and THIS reap's ``agree`` ran the H63b receipt -- ``PDFLIP-TAIL-CONSUMED
+#: removed_files=4/2``. The #1456 HOLD-REFETCH then read every page
+#: (``completed_synced=90688``) but its re-staging found nothing
+#: (``TAIL-READY verdict=no_parts``): the 13-token tail was not adoptable,
+#: ``#x38 SETTLE-TAIL ... record-short`` -> D-NORECOMPUTE -> W50-REROUTE ->
+#: P prefilled the 90701 tokens again. The receipt's premise -- "nothing reads
+#: the files again" -- is false for a SHORT reap: the settle re-reads and
+#: re-stages. Now the files leave only at a FULL reap; a short reap DEFERS the
+#: receipt (rid remembered, named), released by the next full reap, by the
+#: admission (``plan_adopt``: the parts were read or given up), by an abort
+#: (``drop``), or -- bounded -- when the deferred set overflows. ``full`` is
+#: computed from the group-synced reap values (Form A MIN), so every rank of the
+#: group defers or consumes alike. ``FLLIPER_PDFLIP_TAIL_CONSUME_ON_FULL=0``: the
+#: receipt at every reap, as before.
+CONSUME_ON_FULL_ENV = "FLLIPER_PDFLIP_TAIL_CONSUME_ON_FULL"
+#: deferred receipts kept at most (the oldest is released, named, beyond)
+CONSUME_DEFERRED_CAP = 64
+_CONSUME_DEFERRED: Dict[str, bool] = {}   # rid -> its parts were D's own park parts (F4)
+
+
+def consume_on_full_enabled(env=None) -> bool:
+    e = os.environ if env is None else env
+    return (e.get(CONSUME_ON_FULL_ENV, "") or "").strip().lower() not in ("0", "false", "no", "off")
+
+
+def reap_full(completed_synced: int, hit_synced: int, probed: bool = True) -> bool:
+    """TAIL-CONSUME-ON-FULL: whether a reap delivered every page the store
+    held for it -- from the GROUP-SYNCED reap values only (the reduced END and
+    the reduced probe hit of ``check_prefetch_progress``), so the verdict is
+    one value on every rank. An unprobed read (no hit count) counts as full:
+    the receipt as before."""
+    if not probed or int(hit_synced) <= 0:
+        return True
+    return int(completed_synced) >= int(hit_synced)
+
+
+def _release_deferred(rid: str, at: str) -> bool:
+    """A deferred receipt is honoured now: the files leave (named)."""
+    rid = str(rid)
+    park = _CONSUME_DEFERRED.pop(rid, None)
+    if park is None:
+        return False
+    th.consumed(rid)
+    if park:
+        th.remove_park(rid)  # F4: as the receipt would have at the reap
+    logger.info("PDFLIP-TAIL-CONSUME RELEASED rid=%s at=%s deferred_left=%d (the deferred H63b receipt of a "
+                "short reap: the parts leave the store now)", rid, at, len(_CONSUME_DEFERRED))
+    return True
+
+
+def _defer_consume(rid: str, completed_synced: int, hit_synced: int, park: bool) -> None:
+    rid = str(rid)
+    _CONSUME_DEFERRED.pop(rid, None)
+    _CONSUME_DEFERRED[rid] = bool(park)
+    logger.info("PDFLIP-TAIL-CONSUME DEFERRED rid=%s completed=%d hit=%d deferred=%d (a SHORT reap: the settle "
+                "re-reads and re-stages the parts, so they stay in the store until a full reap, the "
+                "admission or an abort)", rid, int(completed_synced), int(hit_synced), len(_CONSUME_DEFERRED))
+    while len(_CONSUME_DEFERRED) > CONSUME_DEFERRED_CAP:
+        _release_deferred(next(iter(_CONSUME_DEFERRED)), "cap")
+
+
+def agree(rid: str, group_vote: int, full: bool = True, completed_synced: int = -1,
+          hit_synced: int = -1) -> None:
+    """After the MIN: remember the group's answer for the admission.
+    ``full`` (TAIL-CONSUME-ON-FULL): the group-synced verdict whether this reap
+    delivered every page the store held (:func:`reap_full`)."""
     job = _JOBS.pop(rid, None)
     _T_FIRST.pop(str(rid), None)  # Q-699: the vote ended this rid's staging
     if job is None:
@@ -1313,10 +1410,17 @@ def agree(rid: str, group_vote: int) -> None:
     # H63b: the MIN above means every rank of the group has voted, i.e.
     # staged this rid's parts into memory or given up on them -- nothing
     # reads the files again; under FLLIPER_PDFLIP_TAIL_KEEP_MIB they leave the
-    # store now (the consumption receipt P's budget relies on)
-    th.consumed(rid)
-    if job.headers and th.is_park_part(getattr(job.headers[0], "part", "")):
-        th.remove_park(rid)  # F4: the park parts are read (or given up) by every rank
+    # store now (the consumption receipt P's budget relies on).
+    # TAIL-CONSUME-ON-FULL: unless the reap was SHORT -- then the settle
+    # re-reads and its re-staging reads the files again.
+    _park = bool(job.headers and th.is_park_part(getattr(job.headers[0], "part", "")))
+    if not full and consume_on_full_enabled():
+        _defer_consume(rid, completed_synced, hit_synced, _park)
+    else:
+        _CONSUME_DEFERRED.pop(str(rid), None)
+        th.consumed(rid)
+        if job.headers and th.is_park_part(getattr(job.headers[0], "part", "")):
+            th.remove_park(rid)  # F4: the park parts are read (or given up) by every rank
     waited_ms = (time.perf_counter() - job.held_since) * 1000.0 if job.held_since >= 0 else 0.0
     st = job.box[0] if job.box else None
     if st is None:
@@ -1459,6 +1563,9 @@ def plan_adopt(req, prefix_len: int, batch_empty: bool = True) -> Optional[Agree
     """Admission, before the commit: the agreed outcome for ``req`` if the
     group takes the tail now, else None (today's extend). One-shot per rid.
     ``entry.skip`` says whether it takes the END state (E2) or E1."""
+    # TAIL-CONSUME-ON-FULL: the admission is reached -- the parts were read
+    # (or given up) by every rank; a deferred receipt is honoured now
+    _release_deferred(str(req.rid), "admit")
     if not adopt_enabled():
         return None
     entry = _AGREED.pop(str(req.rid), None)
@@ -1959,6 +2066,14 @@ def _put(dst: torch.Tensor, idx: torch.Tensor, src: torch.Tensor, back: Optional
     the preallocated host buffer ``back``."""
     d = _as_bytes(dst)
     i = idx.to(device=d.device, dtype=torch.int64)
+    if i is idx:
+        # Q-1302 (Z1, the Q-702 class): no copy was made, so the index_copy_
+        # below reads the caller's block -- ``rows`` / ``groups`` / ``slot`` of
+        # an E1 install, made on the schedule stream -- LATER, on this
+        # (forward) stream. Bind it so it outlives the install (the verify
+        # thread's reference is the only other thing that did, and only with
+        # FLLIPER_PDFLIP_TAIL_VERIFY / the stage worker on).
+        ple_state.hold_for_current_stream(i, "tail_put")
     d.index_copy_(0, i, _as_bytes(src).to(d.device, non_blocking=True))
     if back is not None:
         back.copy_(d.index_select(0, i), non_blocking=d.is_cuda)

@@ -321,6 +321,30 @@ CURATED: Dict[str, Dict[str, object]] = {
         "text": 'Distributes MoE experts by index (whole experts per card) under an uneven plan.',
         "gain": 'Needed so that --rank-moe-ratio can distribute experts unevenly.', "cost": 'The nextflash profile switches it on per group; globally it stays off.',
         "depends": [_d("--rank-moe-ratio", "requires", 'The distribution by index.', "text")]},
+    "FLLIPER_PDFLIP_LANES": {
+        "kind": "env", "group": 'Other', "level": "expert", "planner_derived": False,
+        "text": "Priority lanes: a request carries an integer 'priority' (no number = lane 0, a higher number is a higher lane, the same number is the same lane). With 1 the front reads the field, keeps the active lane (lane_floor), the count of its changes (lane_epoch) and the requests per lane, and shows them in state.json (front.lane_floor, front.lane_epoch, front.lanes); the Anthropic adapter forwards 'priority'. Default 1 on the NF line (since int24f5, user word 13.10.2026): with every request in lane 0 (no 'priority', or 0) nothing is displaced -- no lane action, no RPC to P or D. 0 = off: the front does not read 'priority', and no lane field appears in state.json, the request book or a log line.",
+        "gain": "", "cost": "",
+        "depends": [],
+        "satz_quelle": "environ.py comment above FLLIPER_PDFLIP_LANES and pdflip/lanes.py (PLAN-PRIO-LANES-1008, part L1: field and state only; the displacing controller is part L4)"},
+    "FLLIPER_PDFLIP_PRIO_AS_AGE": {
+        "kind": "env", "group": 'Other', "level": "expert", "planner_derived": False,
+        "text": "Priority acts as AGE (user decision 14.10.2026): every age order and comparison -- D seats, SEAT-AGE displacement, the KV rule 'oldest first', decode admission, the P queue and batch order, wake reads, D refill -- uses the pair (priority descending, arrival ascending); a request of priority p+1 is older than every request of priority p, inside a priority the real arrival decides. Every wait clock keeps the real arrival. With 1 (default) the lane floor (LANE-PREEMPT, LANE-RAISE/RESUME, LANE-WAITER-HOLD, the P-leg hold, D's lane park) is never entered, and a request with priority > 0 that needs a prefill on P ends a DECODE-COLLECT window at once. Acts only with FLLIPER_PDFLIP_LANES=1. 0 = the lane floor of PLAN-PRIO-LANES-1008.",
+        "gain": "A higher priority is served first without parking or holding any lower request.", "cost": "A lower priority waits behind every higher one (no displacement of running work beyond the one youngest of the lowest priority SEAT-AGE takes).",
+        "depends": [_d("FLLIPER_PDFLIP_LANES", "requires", "The front reads 'priority' only with the lanes switch on.", "text")],
+        "satz_quelle": "environ.py comment above FLLIPER_PDFLIP_PRIO_AS_AGE and pdflip/prio_age.py (PRIO-AS-AGE 1014)"},
+    "FLLIPER_PDFLIP_LANE_KEEPALIVE_S": {
+        "kind": "env", "group": 'Other', "level": "expert", "planner_derived": False,
+        "text": "Seconds between the keepalive comment lines (': lane-hold floor=N') the front writes into a held SSE stream. Default 15. Used only with FLLIPER_PDFLIP_LANES=1; the sender is part L4 of the lane plan, part L1 only declares the value.",
+        "gain": "", "cost": "",
+        "depends": [],
+        "satz_quelle": "environ.py comment above FLLIPER_PDFLIP_LANE_KEEPALIVE_S (PLAN-PRIO-LANES-1008, section 1: Waechter)"},
+    "FLLIPER_PDFLIP_LANE_PREEMPT_CHUNK_TOKENS": {
+        "kind": "env", "group": 'Other', "level": "expert", "planner_derived": False,
+        "text": "The P-side prefill chunk size in tokens while a higher lane waits; 0 (default) = the normal chunk. Used only with FLLIPER_PDFLIP_LANES=1; part L3 of the lane plan reads it, part L1 only declares the value.",
+        "gain": "", "cost": "",
+        "depends": [],
+        "satz_quelle": "environ.py comment above FLLIPER_PDFLIP_LANE_PREEMPT_CHUNK_TOKENS (PLAN-PRIO-LANES-1008, section 2: P)"},
     "FLLIPER_PDFLIP_OWNED_BASE": {
         "kind": "env", "group": 'Split', "level": "expert", "planner_derived": False,
         "text": "Basis of the expert ownership solution: 'derive' (planner derives) or 'stated' (the vector of the profile is the basis).",
@@ -1268,12 +1292,47 @@ EXPLAINED.update({
         "satz_quelle": 'NF-Sitz, Bericht 1504 (Baum nf-release-cand-1005 @3bfee09511), Freigabe als Katalogtext 05.10. 19:22Z'},
 })
 
+# X-SUM-PRICE (NF-Sitz 10.10.): die Ankunftsregel preist D-Prefill als Summe, nicht je Request.
+EXPLAINED.update({
+    'FLLIPER_PDFLIP_ENABLE_DECODE_COLLECT_PREFILL_BUSY': {"kind": "env", "group": 'Other', "level": "expert", "planner_derived": False,
+        "text": 'Collect rule for short requests when D is prefilling instead of decoding: on, a short request (that would go to D by itself) that was granted to D and has not yet delivered a first token counts as work on D. The next short requests that arrive meanwhile are collected for the window (FLLIPER_PDFLIP_DECODE_COLLECT_WINDOW_S) and priced as a SUM together with those open tokens against the X limit; what does not fit goes to the P batch. Off: the old blind path, every short request is checked alone against X and an idle D takes all of them (six shorts of 6239 tokens within one second: 37k tokens prefilled on D, about 53 s). Default on in the NF tree (since 10.10.; metal int23xsum2 09.10.: 6 x 5200 on an idle D, one seat on D, five to the P batch). With the collect window at 0 (FLLIPER_PDFLIP_DECODE_COLLECT_WINDOW_S) only the collecting is off; the booking still prices the queue-take of waiting shorts and the short drain.',
+        "gain": 'A burst of short requests no longer lands on D as one long prefill: the sum is checked, the rest is prefilled by P as a batch.',
+        "cost": 'A short request that arrives while D prefills another one waits for the collect window before it is served; a long short plus a straggler can flip D to P at the window end.',
+        "depends": [], "satz_quelle": 'NF-Sitz, X-SUM-PRICE (Review xsum-review-1009, Planer-Auftrag 10.10.), Metall int23xsum2 09.10. 22:53Z', "trees_expected": ["nf"]},
+})
+
 # Wedge-Alarm-Uhr: derselbe Name in beiden Bäumen, je Baum andere Wirkung (27B nur Dual, NF ohne Gate; 05.10.). Beide Sätze belegt von dem Sitz, dem der Baum gehört;
 # der Editor zeigt zusätzlich die Beschreibungen beider Bäume nebeneinander (abweichung).
 EXPLAINED.update({
     'FLLIPER_ADMISSION_WEDGE_QUEUE_CLOCK': {"kind": "env", "group": 'Other', "level": "expert", "planner_derived": False,
         "text": 'Same name, different effect per tree. 27B tree (default off, effective only in the dual layout): the age for the wedge alarm ("request hangs", ADMISSION-WEDGE) is the minimum of the time since the last first token and the age of the non-empty queue as the poll saw it; a new alarm window deletes the stale last result of the recovery channel; a real stall still alarms. NF tree (default off, without a dual condition, the same on prefill and decode group): the server no longer falsely reports "request hangs" when a new request arrives after a rest pause: the waiting time is counted only from the moment the server really sees the request, a report comes at the earliest after 20 s of its own waiting. The classic verdict additionally has a floor in the code (the first poll that saw "requests in the queue and nothing running"); that is only in the code, not in the comment, the code applies. The prefill chunk age of at least 20 s is not raised. Verified (NF): the cause of the false alarms (the clocks run through the idle time, only the wake resets them; two false alarms in boot 1005_185049). Unverified (NF): the effect on the metal (in the test run with the switch on 0 alarms under load, but only a pause of at least 75 s, n=1, no proof); a real hang is reported up to about 10 s (one poll) later with the switch on than without; behavior in continuous operation over 60 min not yet measured. Not set in the NF release profile (only in the test profile nf-int4-h6-abl-k2.env); whether the release form will set it in future is open. Not set in any 27B profile.', "gain": "", "cost": "", "depends": [],
         "satz_quelle": '27B-Sitz (Commit bbf5fd846e, Bericht 1981, Test test_pdflip_admission_wedge_queue_clock_1981) und NF-Sitz (Berichte 1507/1531-03, Code invariant_checker.py:1202-1360 im Baum bce16a6ddf)'},
+})
+
+# F0-H round 2 (08.10.2026): the NF post-freeze switches that the catalog of F0-E did not know (CAPPARK_FLIP_HOLD, W3_SPILL_ANCHOR_POOL from round 1;
+# PP_ROOM_ARENA_FREE_ROOM, W3_SPILL_HOST_LEAVES, MAMBA_SPILL_LAST_RESORT from int23). Each sentence is the comment of the switch in environ.py, shortened, no number
+# that is not in that comment. catalog.json is NOT rebuilt here (F0-I does it).
+EXPLAINED.update({
+    'FLLIPER_PDFLIP_ENABLE_CAPPARK_FLIP_HOLD': {"kind": "env", "group": 'Other', "level": "expert", "planner_derived": False,
+        "text": 'While a flip park is open (from park_running until the sleep or the awake re-queue) the #248h capacity re-queue does not run: the capacity-parked requests ride the flip and the wake takes them up. Off: the re-queue runs inside the park (on metal it ran three just-parked requests to their end while the front waited 28180 ms for D). Default on.',
+        "gain": 'The D->P flip does not wait for D to finish capacity-parked requests.', "cost": '', "depends": [],
+        "satz_quelle": "NF line, post-freeze fix round 2: sentence taken from the comment of the switch in environ.py (nothing added); the five switches are NF-only (not in the 27B environ.py) (environ.py, CAPPARK-FLIP-HOLD comment)", "trees_expected": ["nf"]},
+    'FLLIPER_PDFLIP_ENABLE_W3_SPILL_ANCHOR_POOL': {"kind": "env", "group": 'Other', "level": "expert", "planner_derived": False,
+        "text": "On hybrid boots the W3 arena spill stopped at its first gate because the KV host pool is a group whose forwarding does not include secure_rows_to_l3. On: the spill uses the group's anchor (arena) host pool, the one alloc_write already forwards to. Off: the old silent stop. Default off.",
+        "gain": 'The W3 arena spill works on hybrid boots (it can then free arena room for a claim).', "cost": '', "depends": [],
+        "satz_quelle": "NF line, post-freeze fix round 2: sentence taken from the comment of the switch in environ.py (nothing added); the five switches are NF-only (not in the 27B environ.py) (environ.py, W3-ANCHOR-POOL comment)", "trees_expected": ["nf"]},
+    'FLLIPER_PDFLIP_ENABLE_PP_ROOM_ARENA_FREE_ROOM': {"kind": "env", "group": 'Other', "level": "expert", "planner_derived": False,
+        "text": "The prefill stages' room vote priced a peel's backup at the host pool's available_size(), which on an arena pool counts complete slots as free while every claim was refused (one stage paid 195968 tokens the peel could not and ended in 'Prefill out of memory'). On: an arena-bound pool's backup room is its FREE slots times the slot's tokens. Off: the available_size() reading. Default on.",
+        "gain": 'The room vote no longer promises backup room the arena cannot give.', "cost": '', "depends": [],
+        "satz_quelle": "NF line, post-freeze fix round 2: sentence taken from the comment of the switch in environ.py (nothing added); the five switches are NF-only (not in the 27B environ.py) (environ.py, PR-ARENA comment)", "trees_expected": ["nf"]},
+    'FLLIPER_PDFLIP_ENABLE_W3_SPILL_HOST_LEAVES': {"kind": "env", "group": 'Other', "level": "expert", "planner_derived": False,
+        "text": "The W3 spill found no candidates because it released only host copies of device-resident nodes. On (local-PP floor only): host-only leaves first get their L3 copy for every page, then leave the tree; leaves with a host-only anchor state or in flight stay. Needs the spill's arena pool (on hybrid boots FLLIPER_PDFLIP_ENABLE_W3_SPILL_ANCHOR_POOL). Off: the old spill. Default off.",
+        "gain": 'A full KV arena can free room from host-only leaves.', "cost": '', "depends": [],
+        "satz_quelle": "NF line, post-freeze fix round 2: sentence taken from the comment of the switch in environ.py (nothing added); the five switches are NF-only (not in the 27B environ.py) (environ.py, W3-HOST-LEAF comment)", "trees_expected": ["nf"]},
+    'FLLIPER_PDFLIP_MAMBA_SPILL_LAST_RESORT': {"kind": "env", "group": 'Other', "level": "expert", "planner_derived": False,
+        "text": "The D mamba anchor arena held only END and deepest anchors, so the flush spill found no victim. On: with no victim by the old rules, the shallowest settled END/deepest anchor off the claimer's park chain is secured to L3 first and then released, never one whose copy could not be secured. Off: the old answer. Default off.",
+        "gain": 'A full anchor arena can make room without losing an anchor (the next reader takes it from the store).', "cost": '', "depends": [],
+        "satz_quelle": "NF line, post-freeze fix round 2: sentence taken from the comment of the switch in environ.py (nothing added); the five switches are NF-only (not in the 27B environ.py) (environ.py, MAMBA-LAST-RESORT comment)", "trees_expected": ["nf"]},
 })
 
 #: Lesehilfe der NF-Sätze (NF-Sitz, Bericht 1504): wird mit dem Katalog ausgeliefert, die Seite zeigt sie als Glossar/Tooltip, die Sätze erklären die Wörter nicht noch einmal.

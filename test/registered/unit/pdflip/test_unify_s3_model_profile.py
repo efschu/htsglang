@@ -159,8 +159,10 @@ def test_every_profile_switch_has_exactly_one_environ_entry_with_a_profile_defau
 
     tree = ast.parse(inspect.getsource(env_mod))
     names = {n for d in F.PROFILE_SWITCH_DEFAULTS.values() for n in d}
+    # SCHALTER-HALBPORT 1002: STATED switches only on the rows that state them
+    stated = {e for _, envs_ in F.STATED_SWITCHES for e in envs_}
     for d in F.PROFILE_SWITCH_DEFAULTS.values():
-        assert set(d) == names
+        assert set(d) - stated == names - stated
     for name in names:
         hits = [n for n in ast.walk(tree) if isinstance(n, ast.Assign)
                 and any(isinstance(t, ast.Name) and t.id == name for t in n.targets)]

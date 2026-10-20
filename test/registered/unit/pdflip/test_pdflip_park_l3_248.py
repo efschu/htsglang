@@ -654,3 +654,16 @@ def test_f22_early_read_is_group_d_only(env):
     r._pdflip_248_read_at_wake = True
     s.pdflip_dormant_hold = [r]
     assert park_l3.issue_reads_at_wake_begin(s) == [] and reads == []
+
+
+def test_f22_wake_read_early_is_default_on(env):
+    """110: proven on the NF metal (60 boots), so the code default is ON with
+    the variable unset -- no profile line needed."""
+    env.mp.delenv("FLLIPER_PDFLIP_ENABLE_WAKE_READ_EARLY", raising=False)
+    assert park_l3.early_enabled() is True
+    reads = []
+    s = _wake_sched(_Tree(), reads)
+    a = _req(PARKED)
+    park_l3.defer_hold_read(s, a)
+    s.pdflip_dormant_hold = [a]
+    assert park_l3.issue_reads_at_wake_begin(s) == [a] and reads == [PARKED]

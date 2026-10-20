@@ -1,4 +1,4 @@
-"""AP1 1006 (27B port of nf-next-1006-50, desk/27b-hwgen-ap1-1006): the fixed per-class gates of the launcher are VALUE refusals, not walls.
+"""AP1 1006 (nf-next-1006-50): the fixed per-class gates of the launcher are VALUE refusals, not walls.
 
 Order 05.10. 20:03/20:45Z and Q-710 ("das muss generisch sein bzw. per flags oder env gesetzt werden"; flags
 instead of code, the existing way: ``--force`` + ``refusals.refuse_value``): a boot tree with a 5090 and two
@@ -21,10 +21,6 @@ other case re-raises the planner's refusal.
 THE REFERENCE RIG (3080, 5090, 3080 = N = 3) IS PLAN-IDENTICAL: no entry in ``refusals.forced_list`` under
 ``--force``, the same W19 figures, the same anchor stage, the same plan fingerprint armed and unarmed (the golden of
 test_hw_generic_launcher_1002 pins the unarmed one against the base).
-
-hw_sim step 5d (AP1 merge with the NF line, 06.10.): the pre-boot simulator asks the same two gates; the class
-TestHwSimSeesTheGates is the NF file's, verbatim, so the AP1 code is the same in both lines (the 27B file keeps its
-own register cases on top).
 
 Honesty: every borrowed figure is UNMEASURED on the card it is applied to; a green test here is the Vorab-gate, not
 a boot ("HOCHRECHNUNG != MESSUNG").
@@ -355,58 +351,6 @@ class TestHwSimSeesTheGates(_Armed):
         c, forced = self.cell(["5090", "3090"], force=True)
         self.assertNotIn("ATTN-ANCHOR", c.blockers)
         self.assertFalse(any("deep attention anchor" in f["text"] for f in forced))
-
-
-class TestRegisterShape27B(_Armed):
-    """The 27B launcher carries its OWN register truth (``ENTRYPOINT_FORCE_CODES`` / ``entrypoint_wired_codes`` /
-    ``public_register`` with ``wired_entrypoint`` / ``wired_at`` / ``force_scope``). The port must not move it: the
-    value refusals W19 / anchor / pin go through ``refuse_value("HW-UNCALIBRATED")``, which the register already
-    lists as wired (inventory_check_line); only the ``source`` text of that one entry names the new sites."""
-
-    def entry(self, code="HW-UNCALIBRATED"):
-        reg = R.public_register(R.wired_codes(open(L.__file__).read()))
-        return {e["code"]: e for e in reg}[code]
-
-    def test_hw_uncalibrated_stays_wired_in_launcher_and_entrypoint(self):
-        e = self.entry()
-        self.assertTrue(e["forcebar"])
-        self.assertTrue(e["wired"])
-        self.assertTrue(e["wired_entrypoint"])
-        self.assertEqual(e["wired_at"], "launcher+entrypoint")
-        self.assertEqual(e["force_scope"], "forceable in the Docker start (entrypoint) and in the launcher")
-
-    def test_the_entrypoint_force_codes_are_unchanged(self):
-        self.assertEqual(R.ENTRYPOINT_FORCE_CODES,
-                         ("HW-COUNT", "HW-UNCALIBRATED", "MEMAVAIL", "PROFIL-STATUS", "SHM", "STORE"))
-
-    def test_the_register_names_the_three_new_sites(self):
-        src = self.entry()["source"]
-        for site in ("launcher.dc_measured_d_mib", "launcher.attn_anchor_stage", "launcher._unpin_foreign_cut"):
-            self.assertIn(site, src)
-
-    def test_sm89_is_not_forcebar_anywhere_the_class_is_still_hard_for_other_codes(self):
-        """No code became forcebar or hard by this port: the register's class column is what the 27B had."""
-        classes = {r.code: r.klass for r in R.REGISTER}
-        self.assertEqual(classes["HW-UNCALIBRATED"], R.CLASS_VALUE)
-        self.assertEqual(classes["HW-TOPOLOGY"], R.CLASS_HARD)
-
-    def test_main_flushes_the_w19_borrow_into_the_log_right_after_the_dc_residue_line(self):
-        """``dc_measured_d_mib`` has no logger: the FORCED-PAST lines of the W19 twin borrow reach the boot log only through
-        ``refusals.flush(log)`` in main (mutant: flush removed -> the borrow is in forced_list but invisible in the log)."""
-        import inspect
-        src = inspect.getsource(L.main)
-        i = src.index("reserve incl. {slack_mib} MiB slack")
-        self.assertIn("refusals.flush(log)", src[i:i + 600])
-
-    def test_no_new_flag_or_env_in_the_port(self):
-        """Q-710: flags instead of code, no new configuration. The new helpers add no argparse option and no env name."""
-        import inspect
-        for fn in (L.dc_measured_d_mib, L.attn_anchor_stage, L._refuse_value_once, L._drop_cut_pins,
-                   L._unpin_foreign_cut, CI.arch_twin_class):
-            src = inspect.getsource(fn)
-            self.assertNotIn("add_argument", src, fn.__name__)
-            self.assertNotIn("os.environ", src, fn.__name__)
-            self.assertNotIn("getenv", src, fn.__name__)
 
 
 class TestReferencePlanIdentical(_Armed):

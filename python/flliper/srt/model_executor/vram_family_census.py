@@ -522,9 +522,9 @@ def _max_allocated_bytes(cuda) -> int:
     return cuda.max_memory_allocated()
 
 
-#: LS12 (30.09.): the metal proof of FLLIPER_VRAM_PEAK_FAST_READ. One line per
-#: process and outcome -- "armed" at the first fast read, "fallback" at the
-#: first public read it had to take instead. Off: never called, no line.
+#: the metal proof of FLLIPER_VRAM_PEAK_FAST_READ (27B LS12 da8464b9f0). One
+#: line per process and outcome -- "armed" at the first fast read, "fallback"
+#: at the first public read it had to take instead. Off: never called, no line.
 _FAST_READ_SEEN: set = set()
 
 
@@ -532,7 +532,7 @@ def _fast_read_note(outcome: str, detail: str) -> None:
     if outcome in _FAST_READ_SEEN:
         return
     _FAST_READ_SEEN.add(outcome)
-    logger.info("VRAM-PEAK-FAST-READ %s: %s (FLLIPER_VRAM_PEAK_FAST_READ=1; allocator peak "
+    logger.info("VRAM-PEAK-FAST-READ %s: %s (FLLIPER_VRAM_PEAK_FAST_READ on; allocator peak "
                 "read from the nested stats dict, no memory_stats() flatten)", outcome, detail)
 
 

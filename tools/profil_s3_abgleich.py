@@ -151,7 +151,7 @@ def main(argv=None):
         r = enf["activation"]["extend_rate_mib_per_row"]["v"]
         print("| NF Extend-Rate per row (start value) | %.4f MiB | %.4f MiB (reserved growth, not same size) | %s | D_EXTEND_GROWTH_PER_ROW_MIB rc12g |" % (r, recnf["D_EXTEND_GROWTH_PER_ROW_MIB"][0], pct(r, recnf["D_EXTEND_GROWTH_PER_ROW_MIB"][0])))
         n = enf["experts"]
-        print("| NF Experten (n, top_k) | %d, %d | 512, 10 | exakt | Boot-Log `512 Experten`, ServerArgs |" % (n["n"]["v"], n["top_k"]["v"]))
+        print("| NF experts (n, top_k) | %d, %d | 512, 10 | exact | Boot Log `512 Experten`, ServerArgs |" % (n["n"]["v"], n["top_k"]["v"]))
     print()
 
     print("## E. Registry row from the estimate profile against the hand row\n")

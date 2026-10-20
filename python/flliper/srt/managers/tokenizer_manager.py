@@ -56,6 +56,8 @@ from flliper.srt.managers.embed_types import PositionalEmbeds
 from flliper.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
+    PdFlipLivenessHoldOutput,
+    PdFlipMmFeatureFetchReq,
     BaseBatchReq,
     BaseReq,
     BatchEmbeddingOutput,
@@ -316,6 +318,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     # that overrides that method cannot turn the admission check into an
     # AttributeError.
     mm_lane_refusal = None
+    # D-MM-ITEM-CACHE-1007: set in maybe_init_d_mm_item_cache; None = the
+    # processor runs for every image request, as before.
+    d_mm_item_cache = None
+    # S66 P-KNOWN-IMAGE: set in maybe_init_d_mm_item_cache on a transient-vision
+    # group P; None = the processor runs for every image request, as before.
+    p_known_image_cache = None
+    # FRONT-SEND-IDS-1007: set in init_pdflip_prompt_ids_digest; False = no
+    # D-IDS shadow line.
+    pdflip_prompt_ids_digest = False
+    # S63 F2 TOK-AHEAD: set in init_pdflip_tok_ahead; None = every leg tokenizes itself, as before.
+    pdflip_tok_ahead = None
 
     @property
     def serving_chat_class(self):
@@ -349,6 +362,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Initialize tokenizer and multimodalprocessor
         self.init_tokenizer_and_processor()
+
+        # Init group D's image item cache (pdflip, off by default)
+        self.maybe_init_d_mm_item_cache()
+
+        # Init group D's prompt-ids shadow line (pdflip, off by default)
+        self.init_pdflip_prompt_ids_digest()
+        self.init_pdflip_tok_ahead()
 
         # Init inter-process communication
         self.init_ipc_channels(port_args)
@@ -522,6 +542,112 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
         else:
             self.async_dynamic_batch_tokenizer = None
+
+    def maybe_init_d_mm_item_cache(self):
+        from flliper.srt.pdflip.d_mm_item_cache import build_d_mm_item_cache
+
+        self.d_mm_item_cache = build_d_mm_item_cache(
+            server_args=self.server_args,
+            model_config=self.model_config,
+            mm_processor=self.mm_processor,
+        )
+        if self.d_mm_item_cache is None:
+            # S66 P-KNOWN-IMAGE: the same per-image values on a transient-vision
+            # group P -- PP0 fetches the pixels only when its verdict needs them
+            from flliper.srt.pdflip.p_known_image import build_p_known_image_cache
+
+            self.p_known_image_cache = build_p_known_image_cache(
+                server_args=self.server_args,
+                model_config=self.model_config,
+                mm_processor=self.mm_processor,
+            )
+
+    def init_pdflip_prompt_ids_digest(self):
+        from flliper.srt.pdflip.prompt_ids_digest import d_digest_armed
+
+        self.pdflip_prompt_ids_digest = d_digest_armed(
+            group=os.environ.get("FLLIPER_PDFLIP_GROUP", "")
+        )
+
+    def init_pdflip_tok_ahead(self):
+        """S63 F2 (pdflip/tok_ahead.py): one tokenization per group and request -- the D probe's / P's ahead
+        tokenization of a media prompt is taken by the leg of the same rid (identity = digest of what decides it)."""
+        if not os.environ.get("FLLIPER_PDFLIP_GROUP"):
+            return  # not a pdflip group: nothing posts a probe or an ahead request here
+        if not envs.FLLIPER_PDFLIP_TOK_AHEAD.get():
+            return
+        from flliper.srt.pdflip.tok_ahead import TokAhead
+
+        self.pdflip_tok_ahead = TokAhead(
+            keep=envs.FLLIPER_PDFLIP_TOK_AHEAD_ENTRIES.get(),
+            ttl_s=envs.FLLIPER_PDFLIP_TOK_AHEAD_TTL_S.get(),
+            max_bytes=max(0, envs.FLLIPER_PDFLIP_TOK_AHEAD_MAX_MIB.get()) << 20,
+        )
+        logger.info(
+            "PDFLIP TOK-AHEAD armed group=%s entries=%d ttl_s=%.0f max_mib=%d (S63 F2: the leg takes the probe's / the "
+            "ahead tokenization of its own media prompt when the digest matches)",
+            os.environ.get("FLLIPER_PDFLIP_GROUP", ""),
+            self.pdflip_tok_ahead.keep,
+            self.pdflip_tok_ahead.ttl_s,
+            self.pdflip_tok_ahead.max_bytes >> 20,
+        )
+
+    async def _pdflip_tok_ahead_take(self, obj):
+        """S63 F2: the leg's tokenized object from this rid's earlier tokenization (D probe / P ahead), or None
+        (no entry, or the identity check failed: named, the leg tokenizes as before)."""
+        from flliper.srt.pdflip import tok_ahead as _tah
+
+        ta = self.pdflip_tok_ahead
+        rid = getattr(obj, "rid", None)
+        if (
+            ta is None
+            or not isinstance(obj, GenerateReqInput)
+            or not isinstance(rid, str)
+            or rid.endswith(_tah.PROBE_SUFFIX)
+            or not ta.has(rid)
+        ):
+            return None
+        if obj.input_ids is None and _pdflip_handoff_ids(obj) is not None:
+            # #1442: P tokenised this prompt for the hand-off -- P's ids are the KV's key, they win (S63r: the probe's
+            # entry is dropped now, not left to the TTL)
+            ta.discard(rid)
+            return None
+        t0 = time.perf_counter()
+        e, why = await ta.take(rid, _tah.obj_digest(obj))
+        if e is None:
+            logger.warning(
+                "PDFLIP TOK-AHEAD-MISMATCH rid=%s why=%s -- the leg tokenizes its prompt itself (S63 F2: only an "
+                "identical request takes an earlier tokenization)",
+                rid,
+                why,
+            )
+            return None
+        if obj.image_data is not None and not isinstance(obj.image_data, list):
+            obj.image_data = [obj.image_data]
+        if obj.video_data is not None and not isinstance(obj.video_data, list):
+            obj.video_data = [obj.video_data]
+        if obj.audio_data is not None and not isinstance(obj.audio_data, list):
+            obj.audio_data = [obj.audio_data]
+        if obj.contains_mm_input():
+            self._validate_mm_limits(obj)
+            self._validate_mm_lane_support(obj)
+        input_ids = list(e.input_ids) if e.input_ids is not None else []
+        self._validate_one_request(obj, input_ids)
+        out = self._create_tokenized_object(
+            obj, obj.text, input_ids, None, e.mm_inputs, e.token_type_ids
+        )
+        logger.info(
+            "PDFLIP TOK-AHEAD-REUSE rid=%s src=%s n=%d images=%d saved_ms=%.0f age_s=%.1f take_ms=%.1f (S63 F2: "
+            "one tokenization per group and request)",
+            rid,
+            e.src,
+            len(input_ids),
+            len(getattr(e.mm_inputs, "mm_items", None) or ()),
+            e.tokenize_ms,
+            time.monotonic() - e.t,
+            (time.perf_counter() - t0) * 1000.0,
+        )
+        return out
 
     def init_ipc_channels(self, port_args: PortArgs):
         context = zmq.asyncio.Context(2)
@@ -726,12 +852,40 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # For handling case when scheduler skips detokenizer and forwards back to the tokenizer manager, we ignore it.
                 (HealthCheckOutput, lambda x: None),
                 (ActiveRanksOutput, self.update_active_ranks),
+                # LIVEPARK (14.10.): group D's held set -> the stream watchdogs
+                (PdFlipLivenessHoldOutput, self._handle_pdflip_liveness_hold),
+                # S66 P-KNOWN-IMAGE: PP0 needs the pixels of a known image after all
+                (PdFlipMmFeatureFetchReq, self._handle_pdflip_mm_feature_fetch),
             ]
         )
         self.init_communicators(self.server_args)
 
         self.sampling_params_class = SamplingParams
         self.signal_handler_class = SignalHandler
+
+    def _handle_pdflip_mm_feature_fetch(self, recv_obj: PdFlipMmFeatureFetchReq) -> None:
+        """S66 P-KNOWN-IMAGE (pdflip/p_known_image.py): run the processor for the
+        held request off the receive loop and answer PP0 (the request origin)."""
+        rid = str(recv_obj.rid or "")
+
+        async def _answer():
+            from flliper.srt.managers.io_struct import PdFlipMmFeaturesOutput
+            from flliper.srt.pdflip import p_known_image as _pki
+
+            try:
+                msg = await _pki.fetch_features(self, rid)
+            except Exception as exc:  # noqa: BLE001 -- PP0 refuses by name, never waits silently
+                msg = PdFlipMmFeaturesOutput(rid=rid, ok=False, detail=f"{type(exc).__name__}: {exc}")
+            self._dispatch_to_scheduler(msg)
+
+        asyncio.get_event_loop().create_task(_answer())
+
+    def _handle_pdflip_liveness_hold(self, recv_obj: PdFlipLivenessHoldOutput) -> None:
+        """LIVEPARK (14.10.): install the scheduler's held set; a parked D
+        request is not a silent consumer (srt/liveness/hold.py)."""
+        from flliper.srt.liveness.hold import global_hold_registry
+
+        global_hold_registry().replace(recv_obj.held or ())
 
     async def generate_request(
         self,
@@ -959,12 +1113,31 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     async def _tokenize_one_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
+        *,
+        stateless: bool = False,
     ):
-        """Tokenize one request."""
+        """Tokenize one request.
+
+        ``stateless`` (S67, NF rc16 19.10.): tokenize a prompt that is NOT a
+        request of this server -- the D-MATCH-PROBE (``/pdflip/match_probe``,
+        pdflip/d_match_probe.py) asks "how much of this prompt does the group
+        hold", nothing is admitted. Such a tokenization has no ``ReqState`` in
+        ``rid_to_state`` and must not get one (it would be an in-flight request
+        nobody ever finishes: drain, abort sweeps and the request census would
+        count it). Default False: every real request keeps the upstream path
+        byte for byte, a missing state stays a KeyError there."""
+        if self.pdflip_tok_ahead is not None:
+            # S63 F2 TOK-AHEAD: this rid's media prompt was tokenized already (D probe / P ahead) -- taken once
+            _reused = await self._pdflip_tok_ahead_take(obj)
+            if _reused is not None:
+                return _reused
         # Tokenize
         input_embeds = None
         input_text = obj.text
         token_type_ids = None
+        # D-MM-ITEM-CACHE-1007: the ids tokenized from ``input_text`` here, None
+        # when the prompt's ids came from anywhere else
+        text_ids = None
         is_cross_encoder_request = (
             isinstance(obj, EmbeddingReqInput) and obj.is_cross_encoder_request
         )
@@ -998,6 +1171,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 input_ids, token_type_ids = await self._tokenize_texts(
                     input_text, is_cross_encoder_request
                 )
+                text_ids = input_ids
 
         contains_mm_input = obj.contains_mm_input()
         is_mossvl = (
@@ -1045,13 +1219,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                             "Encoder embedding not available, "
                             "falling back to local mm processing"
                         )
-                    mm_inputs = await self.mm_processor.process_mm_data_async(
-                        image_data=obj.image_data,
-                        audio_data=obj.audio_data,
-                        input_text=(input_text or input_ids),
-                        request_obj=obj,
-                        max_req_input_len=self.max_req_input_len,
-                    )
+                    _item_cache = self.d_mm_item_cache or self.p_known_image_cache
+                    if _item_cache is not None:
+                        mm_inputs = await _item_cache.process(
+                            obj=obj,
+                            prompt=(input_text or input_ids),
+                            compact_ids=text_ids,
+                            max_req_input_len=self.max_req_input_len,
+                        )
+                    else:
+                        mm_inputs = await self.mm_processor.process_mm_data_async(
+                            image_data=obj.image_data,
+                            audio_data=obj.audio_data,
+                            input_text=(input_text or input_ids),
+                            request_obj=obj,
+                            max_req_input_len=self.max_req_input_len,
+                        )
             elif (
                 self.server_args.language_only
                 and self.server_args.encoder_transfer_backend
@@ -1116,9 +1299,27 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         else:
             mm_inputs = None
 
+        if self.pdflip_prompt_ids_digest and mm_inputs is None:
+            from flliper.srt.pdflip.prompt_ids_digest import log_d_ids
+
+            log_d_ids(
+                rid=obj.rid,
+                ids=input_ids,
+                src=(
+                    "text"
+                    if text_ids is not None
+                    else "ids" if obj.input_ids is not None else "handoff"
+                ),
+            )
         self._validate_one_request(obj, input_ids)
         return self._create_tokenized_object(
-            obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
+            obj,
+            input_text,
+            input_ids,
+            input_embeds,
+            mm_inputs,
+            token_type_ids,
+            stateless=stateless,
         )
 
     def _validate_one_request(
@@ -1328,8 +1529,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         input_embeds: Optional[List[List[float]]] = None,
         mm_inputs=None,
         token_type_ids: Optional[List[int]] = None,
+        *,
+        stateless: bool = False,
     ) -> Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]:
-        """Create a tokenized request object from common parameters."""
+        """Create a tokenized request object from common parameters.
+
+        ``stateless``: see ``_tokenize_one_request`` (S67) -- no ``ReqState``
+        is read, the object carries no ``time_stats``."""
         input_ids_arr: Optional[array[int]] = (
             array("q", input_ids) if input_ids is not None else None
         )
@@ -1401,6 +1607,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 priority=obj.priority,
                 lane=obj.lane,
                 spill_class=obj.spill_class,
+                weg2_front_x=obj.weg2_front_x,
+                weg2_front_priced=obj.weg2_front_priced,
+                weg2_front_halfx=obj.weg2_front_halfx,
                 extra_key=obj.extra_key,
                 routing_key=obj.routing_key,
                 token_type_ids=token_type_ids,
@@ -1438,6 +1647,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
             )
 
+        if stateless:
+            # S67 (NF rc16 12:19Z, 9/9 ``PDFLIP D-PROBE-FAILED why=KeyError:
+            # '<rid>~probe'``): the D-MATCH-PROBE's tokenization is no request of
+            # this server -- there is no ReqState to time, and none is created.
+            return tokenized_obj
         tokenized_obj.time_stats = self.rid_to_state[obj.rid].time_stats
         self.rid_to_state[obj.rid].time_stats.set_tokenize_finish_time()
 
@@ -3562,6 +3776,19 @@ class SignalHandler:
         logger.error(
             f"SIGQUIT received. {signum=}, {frame=}. It usually means one child failed."
         )
+        # EXIT WITNESS (NF 20.10. 14:18:29Z): name every child that is already
+        # gone BEFORE the watch stops -- the peers' SIGQUIT beat the 1 s poll,
+        # and the OOM-killed rank 0 was never reported. Never raises.
+        try:
+            _sweep = getattr(
+                self.tokenizer_manager._subprocess_watchdog,
+                "report_dead_children",
+                None,
+            )
+            if _sweep is not None:
+                _sweep("SIGQUIT")
+        except Exception:  # noqa: BLE001 - the witness may not stop the kill
+            logger.error("EXIT-WITNESS sweep failed at SIGQUIT", exc_info=True)
         # Stop subprocess watchdog before killing processes to prevent false-positive
         # crash detection during normal shutdown
         if self.tokenizer_manager._subprocess_watchdog is not None:

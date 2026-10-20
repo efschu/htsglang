@@ -131,7 +131,7 @@ def test_qwen27b_wake_of_d_carries_no_seat_counts(clean):
             tasks = [h.post(f"q{i}") for i in range(3)]
             results = await asyncio.wait_for(asyncio.gather(*tasks), 40)
             assert [s for s, _ in results] == [200] * 3
-            kv = [b for b in h.d.resume_bodies if b.get("tags") == ["kv_cache"]]
+            kv = [b for b in h.d.resume_bodies if "kv_cache" in b.get("tags", [])]
             assert kv and all("handoff_n" not in b and "parked_n" not in b for b in kv), kv
 
     asyncio.run(body())

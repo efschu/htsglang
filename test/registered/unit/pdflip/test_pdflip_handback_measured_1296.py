@@ -301,7 +301,8 @@ def test_arm_b_natural_prose_is_the_same_fault_and_must_reach_the_same_verdict()
             # visible to the next reader instead of being re-derived.
             m = re.search(r"leg1_prompt_tokens=(\d+)", text)
             assert m and int(m.group(1)) == t["measured"], text[:400]
-            assert f"est_uncached={t['est']}" in text, text[:400]
+            # S56 (user 19.10. "nichts schätzen"): the requeue carries D's NAMED extent, not the front's estimate
+            assert f"est_uncached={t['measured']}" in text, text[:400]
             # ... and the front's X is labelled as the FRONT's, because D
             # enforced a different one for all of sb5h (SECTION 1ax-b 7).
             assert "front_X=" in text, text[:400]

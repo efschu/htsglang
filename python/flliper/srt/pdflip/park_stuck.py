@@ -33,6 +33,9 @@ class ParkStuck:
         self._at_park: Dict[str, int] = {}
         self.max_seen = 0
         self.nonstream: set = set()
+        #: PRIORITY LANES 1008 (L4): rids a higher lane holds. A lane hold is a policy, not a D phase without
+        #: output: the rid is never listed as stuck while held, and the hold does not add to its streak.
+        self.lane_held: set = set()
 
     def note_stream(self, rid, is_stream: bool) -> None:
         if is_stream:
@@ -56,8 +59,24 @@ class ParkStuck:
             if r not in self.nonstream:
                 self.max_seen = max(self.max_seen, self.streak[r])
 
+    def hold(self, rids: Iterable) -> None:
+        """PRIORITY LANES 1008 (L4): ``rids`` are held for a higher lane (parked on D or held in the front)."""
+        for rid in rids:
+            self.lane_held.add(str(rid))
+
+    def release(self, rids: Iterable) -> None:
+        """PRIORITY LANES 1008 (L4): the hold ends (the lane floor fell). The streak starts again: the hold
+        was no phase of D without output, so it neither counted nor may count against the rid afterwards."""
+        for rid in rids:
+            r = str(rid)
+            if r in self.lane_held:
+                self.lane_held.discard(r)
+                self.streak.pop(r, None)
+                self._at_park.pop(r, None)
+
     def done(self, rid) -> None:
         r = str(rid)
+        self.lane_held.discard(r)
         self.streak.pop(r, None)
         self._chunks.pop(r, None)
         self._at_park.pop(r, None)
@@ -65,10 +84,10 @@ class ParkStuck:
 
     def block(self, min_phases: int) -> dict:
         n = max(1, int(min_phases))
-        seen = {r: s for r, s in self.streak.items() if r not in self.nonstream}
-        blind = {r: s for r, s in self.streak.items() if r in self.nonstream}
+        seen = {r: s for r, s in self.streak.items() if r not in self.nonstream and r not in self.lane_held}
+        blind = {r: s for r, s in self.streak.items() if r in self.nonstream and r not in self.lane_held}
         stuck = sorted((r for r, s in seen.items() if s >= n), key=lambda r: -seen[r])
-        return {
+        out = {
             "min_phases": n,
             "stuck": len(stuck),
             "max_streak": max(seen.values(), default=0),
@@ -77,3 +96,7 @@ class ParkStuck:
             # non-stream rids: parks counted, progress not visible to the front
             "blind_nonstream": {r: blind[r] for r in sorted(blind, key=lambda r: -blind[r])[:8]},
         }
+        # PRIORITY LANES 1008 (L4): the key exists only once a lane hold was booked (switch off: byte-identical)
+        if self.lane_held:
+            out["lane_held"] = len(self.lane_held)
+        return out

@@ -334,7 +334,7 @@ def _boot_front(probe, ids):
     f.state = "serving"
     f.routed = []
 
-    async def seat(rid, est, refused=None, **kw):   # Q-712: _acquire_short_seat(..., uncached=...)
+    async def seat(rid, est, refused=None, **kw):  # 1400: take the seat kwargs
         return 1
 
     async def leg2(request, rid, payload, text, stream, pending=None, **kw):
@@ -562,3 +562,13 @@ def test_the_arena_view_never_creates_or_initialises(tmp_path):
     with pytest.raises(RuntimeError):
         ArenaView(path)
     assert os.path.getsize(path) == 0, "untouched"
+
+
+import pytest as _pytest_110  # noqa: E402
+
+
+@_pytest_110.fixture(autouse=True)
+def _arrival_seat_rule_off_110(monkeypatch):
+    """110: FLLIPER_PDFLIP_ENABLE_ARRIVAL_SEAT_RULE is default ON on the NF line;
+    this file pins the pre-rule front it was written against (=0 is that path)."""
+    monkeypatch.setenv("FLLIPER_PDFLIP_ENABLE_ARRIVAL_SEAT_RULE", "0")

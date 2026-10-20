@@ -12,8 +12,8 @@ What must hold:
 * the store's identity maps arm H107 exactly like "no map": a warm LRU
   expert is read from its row, not fetched; the output is bit-identical;
 * a layout that moves a resident off its own slot (hot set, load-time
-  layout) keeps the plain plan -- ``_run_eager_lru`` computes wave 0 at
-  ``slot == id``.
+  layout) keeps the plain plan when FLLIPER_OPT_MOE_POOL_EAGER_LRU_MAPPED=0;
+  since H107c (S44, 18.10.) the default reads wave 0 at ``resident_slot``.
 """
 
 import os
@@ -70,13 +70,20 @@ def test_store_identity_logs_the_metal_marker(monkeypatch, caplog):
     assert any("H107 EAGER-LRU" in r.getMessage() for r in caplog.records)
 
 
-def test_a_moved_resident_keeps_the_plain_plan(monkeypatch):
+def test_a_moved_resident_keeps_the_plain_plan_with_the_mapped_switch_off(monkeypatch):
+    """H107b's rule survives as FLLIPER_OPT_MOE_POOL_EAGER_LRU_MAPPED=0; with the
+    switch on (default, H107c / S44) a mapped layout arms H107 -- see
+    test_pool_eager_lru_mapped_reclaim_s44.py, which builds the bank in the
+    mapped order instead of only renaming the slots."""
+    from flliper.srt.environ import envs
+
     cache, fetched = _pool_cache(monkeypatch, warm=[3, 7])
     cache.planner.resident_ids = frozenset(range(R))
     cache.planner.resident_slot = {0: 1, 1: 0}  # a load-time layout that swapped slots
     assert not eo.eager_lru_static_residency(cache.planner, R)
-    _extend(cache)
-    assert {3, 7} <= set(fetched), "a non-identity layout must not run the H107 plan"
+    with envs.FLLIPER_OPT_MOE_POOL_EAGER_LRU_MAPPED.override(False):
+        _extend(cache)
+    assert {3, 7} <= set(fetched), "MAPPED=0: a non-identity layout keeps the plain plan"
 
 
 def test_eager_lru_static_residency():

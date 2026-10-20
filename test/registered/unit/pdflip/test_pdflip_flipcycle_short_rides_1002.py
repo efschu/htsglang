@@ -86,8 +86,7 @@ class ThePredicateIsTheQueuedShortFilter(unittest.TestCase):
         import inspect
 
         src = inspect.getsource(front)
-        self.assertIn("cap_exempt=(self._p_phase_short_rides", src)
-        self.assertIn("PDFLIP-FLIPCYCLE stage=d_prefill_after_flip", src)
+        self.assertIn("cap_exempt=Front._p_phase_cap_exempt_pred(self))", src)
 
     def test_seat_gate_cap_is_never_exceeded(self):
         # 27B head (DECODE-COLLECT SEAT GATE, NF e124d8f431): the P cap IS the free D
@@ -96,6 +95,7 @@ class ThePredicateIsTheQueuedShortFilter(unittest.TestCase):
 
         src = inspect.getsource(front)
         self.assertIn("envs.FLLIPER_PDFLIP_ENABLE_P_PHASE_SHORT_RIDES.get() and _dc_cap <= 0", src)
+        self.assertIn("PDFLIP-FLIPCYCLE stage=d_prefill_after_flip", src)
 
 
 if __name__ == "__main__":

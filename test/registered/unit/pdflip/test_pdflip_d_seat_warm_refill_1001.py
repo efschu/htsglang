@@ -59,14 +59,25 @@ def test_a_shrink_names_every_expert_it_sent_to_the_store_hottest_first():
 
 
 def test_the_grow_after_a_shrink_refills_the_departed_experts_at_once(monkeypatch):
+    """F3: no host read of the tables -- the departed experts come from the shrink's device snapshot (read
+    back without a wait), they take the rows the grow turned ON (reserved at once), their bytes come on the
+    warm stream and the commit follows the copy (CPU desk: immediate). Hottest first, as before."""
+    from flliper.srt.pdflip import d_row_fence as F
+
+    F.reset_for_tests()
     cache = _cache(monkeypatch, warm_switch=True)
-    warmed = []
-    cache.warm_lru_local = lambda ids, limit=0: warmed.append((list(ids), limit)) or min(
-        len(ids), limit)
+    cache.warm_lru_local = lambda ids, limit=0: pytest.fail("F3: the host-read warm path is gone")
+    t = cache._pool_tables
+    t.host_row = torch.arange(16, dtype=torch.int64)
+    store = torch.arange(16 * 2, dtype=torch.float32).reshape(16, 2)
+    bank = torch.zeros(8, 2)
+    cache._pool_srcs, cache._pool_dsts = [store], [bank]
     cache.set_seat_rows_on(0, device_write=True)          # shrink: 7 and 6 leave
-    assert not warmed
+    assert int(t.hot_phys[7]) < 0 and int(t.hot_phys[6]) < 0
     cache.set_seat_rows_on(2, device_write=True)          # grow: back at once, hottest first
-    assert warmed == [([7, 6], 2)]
+    assert t.row_key[6:8].tolist() == [7, 6]
+    assert int(t.hot_phys[7]) == 6 and int(t.hot_phys[6]) == 7
+    assert torch.equal(bank[6], store[7]) and torch.equal(bank[7], store[6])
     assert cache._pdflip_seat_warmed == 2 and cache._pdflip_seat_recall == []
 
 

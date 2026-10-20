@@ -119,7 +119,7 @@ def cap_req_geometry(req, tree_cache) -> None:
                     "published fact (n=%d, capped_host=%d, under=%d). Loss is "
                     "bounded by the prefetch gain; the content stays in the "
                     "host tier for a later, published lap.",
-                    rid[:8],
+                    rid,
                     hh,
                     n,
                     _STATS["capped_host"],
@@ -142,7 +142,7 @@ def cap_req_geometry(req, tree_cache) -> None:
                 "(n=%d, capped_host=%d, under=%d). This is the divergence "
                 "direction that killed boots 26-35; the truncate makes this "
                 "rank run PP0's geometry instead of its own.",
-                rid[:8],
+                rid,
                 told,
                 n,
                 _STATS["capped_host"],
@@ -167,7 +167,7 @@ def cap_req_geometry(req, tree_cache) -> None:
                 "materialized yet; if this pass runs divergent the #631 guard "
                 "will name it. A rising counter here orders the next slice "
                 "(PP0 defers its raise to the group floor).",
-                rid[:8],
+                rid,
                 told,
                 local,
                 hh,

@@ -44,27 +44,28 @@ def test_the_park_rpc_starts_the_span_and_p_prefill_ends_it():
     c.note_d_served(90.0)
     c.note_park(5, 100.0, 660.0)                 # 27B z30j median park RPC
     c.begin(5, 100.7, oldest_waiter_ts=95.0)     # the waiter arrived before the park: the park counts
-    _done_and_forward(c, 103.2, 103.5)
-    ev = c.first_prefill("pdflip-6-1", t_dispatch=103.25, t_end=106.0, p_prefill_s=2.5)
+    c.done(103.2)
+    # 02.10.: the end is P's FIRST stage's first forward (progress beacon), not leg 1
+    ev = c.first_prefill("pdflip-6-1", t_dispatch=103.25, pp_first={"ts": 103.5, "pid": 9, "ct": 2, "pp_rank": 0})
     assert (ev["epoch"], ev["dir"], ev["start_source"], ev["prefill_start_source"]) == \
         (6, "D>P", "park_rpc_sent", "pp_first_forward")
     assert ev["flip_user_ms"] == 3500                        # 100.0 -> 103.5
     assert ev["parts"] == {"park_rpc_ms": 660, "pre_begin_ms": 700, "legs_ms": 2500, "first_chunk_ms": 300}
-    assert c.first_prefill("pdflip-6-2", 107.0, 108.0, 0.5) is None   # one per flip
+    assert c.first_prefill("pdflip-6-2", 107.0, {"ts": 108.0}) is None   # one per flip
 
 
 def test_without_a_park_the_last_served_leg2_is_the_decode_end():
     c = fsi.DpFlipClock()
     c.note_d_served(50.0)
     c.begin(3, 60.0, oldest_waiter_ts=58.0)
-    _done_and_forward(c, 62.0, 62.1)
-    ev = c.first_prefill("r", 62.1, 64.0, None)              # P's body carried no prefill time
+    c.done(62.0)
+    ev = c.first_prefill("r", 62.0, {"ts": 62.1})
     assert (ev["start_source"], ev["prefill_start_source"], ev["flip_user_ms"]) == \
         ("oldest_waiter_arrival", "pp_first_forward", 4100)
     assert ev["parts"]["park_rpc_ms"] is None and ev["idle_flip"] is False
     c.begin(5, 70.0, oldest_waiter_ts=40.0)                  # the waiter came first: D's served leg 2 starts it
-    _done_and_forward(c, 71.0, 71.1)
-    ev = c.first_prefill("r2", 71.1, 72.0, None)
+    c.done(71.0)
+    ev = c.first_prefill("r2", 71.0, {"ts": 71.1})
     assert (ev["start_source"], ev["flip_user_ms"]) == ("last_d_served", 21100)
 
 
@@ -75,8 +76,8 @@ def test_an_idle_flip_starts_at_the_first_dispatch_not_at_the_decode_end():
     c = fsi.DpFlipClock()
     c.note_d_served(1000.0)
     c.begin(4, 1010.9, oldest_waiter_ts=None)                # nobody waits for this flip
-    _done_and_forward(c, 1012.8, 1038.4)
-    ev = c.first_prefill("pdflip-5-5", t_dispatch=1038.3, t_end=1040.8, p_prefill_s=2.4)
+    c.done(1012.8)
+    ev = c.first_prefill("pdflip-5-5", t_dispatch=1038.3, pp_first={"ts": 1038.4})
     assert ev["idle_flip"] is True
     assert ev["start_source"] == "first_dispatch_after_idle_flip"
     assert ev["flip_user_ms"] == 100                          # 1038.3 -> 1038.4: P's own queue only
@@ -87,8 +88,8 @@ def test_the_span_starts_no_earlier_than_the_oldest_waiter():
     c = fsi.DpFlipClock()
     c.note_d_served(10.0)                                     # D idle since 10 s
     c.begin(2, 30.0, oldest_waiter_ts=28.0)                   # the request came at 28 s
-    _done_and_forward(c, 32.0, 32.5)
-    ev = c.first_prefill("r", 32.0, 33.0, 0.5)
+    c.done(32.0)
+    ev = c.first_prefill("r", 32.0, {"ts": 32.5})
     assert (ev["start_source"], ev["flip_user_ms"]) == ("oldest_waiter_arrival", 4500)
 
 
@@ -100,7 +101,7 @@ def test_a_park_of_another_phase_does_not_count():
 
 
 def test_no_flip_no_event():
-    assert fsi.DpFlipClock().first_prefill("r", 1.0, 2.0, 0.5) is None
+    assert fsi.DpFlipClock().first_prefill("r", 1.0, {"ts": 1.5}) is None
 
 
 # ---------------------------------------------------------------- the front
@@ -148,6 +149,8 @@ def test_the_front_publishes_one_flip_user_time_after_a_dp_flip():
     assert len(ev) == 1
     w = ev[0]["data"]
     # PDFLIP-E: the test front has no P beacons -> the end is MISSING, never the dispatch
+    # 02.10.: the test front's group P has no progress beacon -> the end is
+    # missing, never P's leg-1 end minus its prefill time or the dispatch
     assert (w["dir"], w["start_source"], w["prefill_start_source"], w["rid"]) == \
         ("D>P", "park_rpc_sent", "missing", "pdflip-1-1")
     assert w["parts"]["park_rpc_ms"] == 400 and w["flip_user_ms"] is None

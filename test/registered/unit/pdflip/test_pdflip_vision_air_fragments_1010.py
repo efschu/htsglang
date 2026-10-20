@@ -74,6 +74,10 @@ class _FragmentedCard:
 def _stage(tmp_path, monkeypatch, card):
     _write_model(tmp_path)
     monkeypatch.setattr(torch.cuda, "empty_cache", card.empty_cache)
+    # NF int24d: this tree does not carry the 27B leaner tower forward (9ee0536427 VISION-WORK), so its work
+    # model books 15403581440 B for the 4096x4096 image, not the metal's 1574 MiB. The test pins the AIR
+    # check, not the work model: the work is booked at the metal figure.
+    monkeypatch.setattr(vv, "encode_work_for", lambda vision_config, items, backend: WORK_MIB * MIB)
     it = _Item()
     it.image_grid_thw = torch.tensor([[1, 256, 256]])  # 4096x4096 at patch 16 = 65536 patches
     victims = _Victims()

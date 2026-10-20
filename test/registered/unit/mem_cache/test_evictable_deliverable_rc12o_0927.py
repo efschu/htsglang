@@ -139,7 +139,11 @@ class Deliverable(unittest.TestCase):
         src = open(sp.__file__).read()
         i = src.index("def rem_total_tokens(self)")
         blk = src[i:i + 1500]
-        self.assertIn("deliverable_evictable_or(self.tree_cache, self.tree_cache.full_evictable_size)", blk)
+        # nf-next-1006-01: the adder reads the deliverable count THROUGH the cap-aware wrapper
+        # (deliverable_evictable_or minus the evictable tokens above the engaged residency cap)
+        self.assertIn(
+            "deliverable_evictable_cap_aware_or(self.tree_cache, self.tree_cache.full_evictable_size)", blk
+        )
 
 
 class FrontierRepair(unittest.TestCase):

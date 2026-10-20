@@ -463,10 +463,21 @@ class VramCreditTest(unittest.TestCase):
         # outright unless sorted(pause_order) == sorted(self.weights_tags), so
         # the two legs still cannot name different tags.  What this test pins is
         # unchanged: the FLIP's epoch rides on BOTH legs.
-        self.assertIn('"/release_memory_occupation",\n                           '
-                      '{"tags": pause_order, "epoch": flip_epoch}', src)
-        self.assertIn('"/resume_memory_occupation",\n                           '
-                      '{"tags": family, "epoch": flip_epoch}', src)
+        # 1533: judged on whitespace-normalised source -- the call sites were
+        # reflowed (the sleep leg moved into a ``_legs`` list, the wake leg
+        # into a shared ``_w_payload`` that FLIPCYCLE H6 extends with kv_cache)
+        # without changing what the test pins.
+        flat = " ".join(src.split())
+        self.assertIn('self.timed_rpc(S, "/release_memory_occupation", '
+                      '{"tags": pause_order, "epoch": flip_epoch}, RPC_TIMEOUT_S)', flat)
+        # xsn84 (#1378): the WAKE walks the SAME order as the sleep, so the
+        # resume leg's tags are ``list(pause_order)`` (+ kv_cache under H6),
+        # no longer ``family``; the epoch rides in the same dict, and that
+        # dict is what the resume RPC sends.
+        self.assertIn('_w_payload = dict({"tags": list(pause_order) + '
+                      '([KV_TAG] if _kv_fused else []), "epoch": flip_epoch}', flat)
+        self.assertIn('self.timed_rpc(D, "/resume_memory_occupation", _w_payload, RPC_TIMEOUT_S)',
+                      flat)
         # and the permutation guard that makes the two equivalent is present,
         # so "different variable" can never quietly become "different tags".
         self.assertIn("if sorted(pause_order) != sorted(self.weights_tags):", src)
@@ -665,12 +676,27 @@ class VramCreditTest(unittest.TestCase):
         # The peer's NEXT release, in the window the waiting tag now has because
         # it was not granted on bytes weights_6 had spent (on the real boot that
         # was P rank 0's 2988 MiB weights_0, about a second later).
-        peer = threading.Timer(0.2, self.credit.publish, ("weights_0", 2988 * MIB))
+        #
+        # 1533 (fnFL2x37, 23.09.): the card is re-read on EVERY pass of the
+        # wait, so a card that already reads 4000 MiB while the counter is short
+        # is licensed at once as an OVERDRAWN claim -- not "funded" by the peer.
+        # What this test pins is the debited tag being funded BY THE PEER'S
+        # RELEASE, so the card must read what it reads in the real sequence:
+        # short until that release has landed (the release is what frees it),
+        # roomy after.  The flag follows the publish, so a pass between the two
+        # still sees the short card and the grant is the counter's.
+        released = threading.Event()
+
+        def _peer_release():
+            self.credit.publish("weights_0", 2988 * MIB)
+            released.set()
+
+        peer = threading.Timer(0.2, _peer_release)
         peer.start()
         self.addCleanup(peer.cancel)
         rec = self.credit.wait_for(1906 * MIB, budget_s=5.0, tag="weights_7",
                                    free_bytes_now=0, epoch=1,
-                                   free_reader=lambda: 4000 * MIB)
+                                   free_reader=lambda: (4000 if released.is_set() else 100) * MIB)
         self.assertIn("funded", rec["reason"])
         self.assertEqual(rec["claimed_bytes"], 1906 * MIB)
         self.assertEqual(self.credit.read()["consumed_bytes"], 2 * 1906 * MIB)
@@ -724,7 +750,16 @@ class VramCreditTest(unittest.TestCase):
         rec = self.credit.wait_for(1906 * MIB, budget_s=1.0, tag="weights_7",
                                    free_bytes_now=0, epoch=1,
                                    free_reader=lambda: 4000 * MIB)
-        self.assertIn("the card itself holds the bytes", rec["reason"])
+        # 1533 (fnFL2x37, 23.09.): the card is now re-read on every pass of the
+        # wait, BEFORE the leg-complete branch, so a card that holds the bytes
+        # is licensed there (OVERDRAWN, the peer's staging takes the host path)
+        # instead of by the late re-read ("the card itself holds the bytes").
+        # Both are the answer this test is about: the spent balance does not
+        # turn a card with room into a refusal.
+        self.assertTrue(
+            "the card itself holds the bytes" in rec["reason"]
+            or "the card came to hold the bytes" in rec["reason"], rec["reason"])
+        self.assertEqual(rec["claimed_bytes"], 1906 * MIB)
 
     def test_a_leg_complete_short_card_is_still_the_named_refusal(self):
         # ... and the late re-read may only LICENSE, never hide the refusal that

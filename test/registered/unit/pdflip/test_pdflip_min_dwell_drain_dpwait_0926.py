@@ -51,7 +51,7 @@ def test_flag_off_keeps_the_old_price_and_provenance():
 
 
 def test_flag_default_is_on_without_any_profile_line():
-    """110: proven on the 27B metal (w109290020, 129x drain-excluded) and on NF."""
+    """110: proven on the NF metal (197 boots) and the 27B metal (w109290020)."""
     env = {k: v for k, v in os.environ.items() if k != "FLLIPER_PDFLIP_MIN_DWELL_EXCLUDE_DRAIN"}
     with mock.patch.dict(os.environ, env, clear=True):
         assert front_mod.envs.FLLIPER_PDFLIP_MIN_DWELL_EXCLUDE_DRAIN.get() is True

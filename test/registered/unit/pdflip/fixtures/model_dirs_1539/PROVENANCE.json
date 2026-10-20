@@ -1,0 +1,131 @@
+{
+ "Qwen3.8-27B-DFlash2-W8-lued": {
+  "files": {
+   "config.json": {
+    "bytes": 2064,
+    "sha256": "1c63a70cd7fa0e8be7276b3597e464ab9a0e609b70611354e9fb76e76b2e42d6"
+   },
+   "model.safetensors": {
+    "bytes": 16320,
+    "sha256": "6d1f8a447a2102f00403f0558f359021273be329e188ea354bff06b1636586c2"
+   },
+   "model.safetensors.index.json": {
+    "bytes": 10011,
+    "sha256": "1bc0fa7ef5c8078dd427dd735a6912d4755bc49a605ba18a1a85e751619d4cc0"
+   }
+  },
+  "header_bytes": 16320,
+  "ondisk_safetensors_bytes": 2172742656,
+  "source": "/tmp/s3/hdr/Qwen3.8-27B-DFlash2-W8-lued (header-only snapshot of the real directory taken 2026-10-03 20:49Z by the profil_s3_1003 task; shards are the safetensors headers verbatim, payload absent)",
+  "tensor_bytes_from_headers": 2172726336,
+  "tensors": 153
+ },
+ "Qwen3.8-27B-INT8-gdncov-vocabembed": {
+  "files": {
+   "config.json": {
+    "bytes": 5071,
+    "sha256": "02adafaa809837662bf120b90aa4dee2985f6070930905dc5f8d6e672c66c4ff"
+   },
+   "generation_config.json": {
+    "bytes": 202,
+    "sha256": "e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e"
+   },
+   "model-00001-of-00018.safetensors": {
+    "bytes": 47704,
+    "sha256": "82fa94cddc209c09ec6f9a0bf2b2bb61ea731b97ffd951df944f143502d91ef3"
+   },
+   "model-00002-of-00018.safetensors": {
+    "bytes": 9176,
+    "sha256": "f9343fb697627c3a5ef7363d26e39e55a0904afadc76e5021c41ae8474b71c9f"
+   },
+   "model-00003-of-00018.safetensors": {
+    "bytes": 272,
+    "sha256": "fc9e6d03bb87449d2d1d28c94927dc141d1824aa6b4d510fbd7b4cfd2ccc4828"
+   },
+   "model-00004-of-00018.safetensors": {
+    "bytes": 12968,
+    "sha256": "e8d640e4b545c8d65f19815bdf0301751fca9adaeb2a75a438e5f7bd6eda29f1"
+   },
+   "model-00005-of-00018.safetensors": {
+    "bytes": 6976,
+    "sha256": "88c4e7d57a584323ff0c6dd42b184e821a33c9e061877eb12e240a205b8c94f5"
+   },
+   "model-00006-of-00018.safetensors": {
+    "bytes": 13992,
+    "sha256": "31a4b6bcc4fec3d9437e0559a9742d0b7b351b9191c8a06c8ef0de827f05be3e"
+   },
+   "model-00007-of-00018.safetensors": {
+    "bytes": 6016,
+    "sha256": "450903f10adc141e8179e4a79ba2f0772c0b6259671b8ec417e80ce6d0207010"
+   },
+   "model-00008-of-00018.safetensors": {
+    "bytes": 13992,
+    "sha256": "4e2f654c4beb40d4156f6fb1b1634d73c602aa5d57a5a44ac6110b5dbbdda75e"
+   },
+   "model-00009-of-00018.safetensors": {
+    "bytes": 6016,
+    "sha256": "c0312cc49fd4a3660d265aae9f19fc8d0eca418d42c0e4093f88b1a1fd8ce467"
+   },
+   "model-00010-of-00018.safetensors": {
+    "bytes": 13992,
+    "sha256": "907ef2001e7b2f227fcac9ed970db0569792dc76cfaa301c58ab7023b6045c11"
+   },
+   "model-00011-of-00018.safetensors": {
+    "bytes": 6016,
+    "sha256": "bcf002b53493b576dc312a7deb47346a49a709b66916552d0873376f21dd51fe"
+   },
+   "model-00012-of-00018.safetensors": {
+    "bytes": 13992,
+    "sha256": "f15e1983b35a243d00127da62e21940b8d0955efd9c7d4b719bc6be854b48809"
+   },
+   "model-00013-of-00018.safetensors": {
+    "bytes": 6016,
+    "sha256": "733b2604c9252192796cc4b81a45bb7c662fd2b63a63451cbde369a925ae137a"
+   },
+   "model-00014-of-00018.safetensors": {
+    "bytes": 13992,
+    "sha256": "f71f56ea14e52efe8cc1cc16f800f4f94a3b79583bb34a7a1e83871838ac3752"
+   },
+   "model-00015-of-00018.safetensors": {
+    "bytes": 6016,
+    "sha256": "a072fb8f7b3158fe5112940089e34f513fd85ad37decfd09f21b49ac0074ab11"
+   },
+   "model-00016-of-00018.safetensors": {
+    "bytes": 14088,
+    "sha256": "cbdc84997b2cea97619db5c31f70ca513f1a554fc9559f6d75e1ac338ae7e687"
+   },
+   "model-00017-of-00018.safetensors": {
+    "bytes": 6016,
+    "sha256": "2b9be8c5f69e2fd8269fc692c9d89cbea40e6f1a01cdbb43d9c51f3c863ea809"
+   },
+   "model-00018-of-00018.safetensors": {
+    "bytes": 2632,
+    "sha256": "d9ce50fe97ef7dfa82cabd0d45c96a5302b2fc24decf90e64d96b9a64c4d6c6a"
+   },
+   "tokenizer_config.json": {
+    "bytes": 17928,
+    "note": "NOT from the header snapshot (it carried no tokenizer file): copy of the sibling Qwen3.8-27B-INT8-gdncov/tokenizer_config.json, which the launcher docstring (tokenizer_path_decision) names as the same tokenizer. Only its PRESENCE is read (W163 sibling-tokenizer check).",
+    "sha256": "b11349aafa7cdc6a320767cf7ceb29ed82f7eda5d65e8e0819e76f0ce947bf27"
+   }
+  },
+  "header_bytes": 199872,
+  "ondisk_safetensors_bytes": 29548445344,
+  "source": "/tmp/s3/hdr/Qwen3.8-27B-INT8-gdncov-vocabembed (header-only snapshot of the real directory taken 2026-10-03 20:49Z by the profil_s3_1003 task; shards are the safetensors headers verbatim, payload absent)",
+  "tensor_bytes_from_headers": 29548245472,
+  "tensors": 1608
+ },
+ "Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist": {
+  "files": {
+   "Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist.headers.tar.xz": {
+    "bytes": 870556,
+    "sha256": "f5e3027080c33231486dc048f00a5f0e821dee251bc6cec6137dcf47bfb9be94"
+   }
+  },
+  "header_bytes": 31146216,
+  "ondisk_safetensors_bytes": 175260508352,
+  "shards": 48,
+  "source": "/tmp/s3/hdr/Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist (header-only snapshot of the real directory, 2026-10-03 20:49Z, profil_s3_1003 task); the archive holds the shard headers verbatim, payload absent. config.json is NOT duplicated here: fixtures/profil_s3_1003/nextflash_int4mixed/config.json (sha256 b058d1b1cde7b76b342b0838ac02e1d1175f5d4aa5a6b0471d6f43a91bcbfaba, identical to the snapshot's).",
+  "tensor_bytes_from_headers": 175229362136,
+  "tensors": 225300
+ }
+}

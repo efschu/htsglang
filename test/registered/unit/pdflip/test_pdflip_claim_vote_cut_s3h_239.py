@@ -85,6 +85,10 @@ def test_min_only_is_the_kv_holding_worker(monkeypatch):
 def test_the_prefetch_loop_encodes_with_the_min_only_arm():
     import inspect
 
-    src = inspect.getsource(cc.HiCacheController.prefetch_thread_func)
+    # S59 (19.10.): the claim reduce moved into `_reduce_store_claim` (END
+    # coordinates under a Form A frame); the loop calls it once per read.
+    loop = inspect.getsource(cc.HiCacheController.prefetch_thread_func)
+    assert "HiCacheController._reduce_store_claim(" in loop
+    src = inspect.getsource(cc.HiCacheController._reduce_store_claim)
     assert "min_only=claim_vote_min_only(self)" in src
     assert "settle_claim_split(" in src

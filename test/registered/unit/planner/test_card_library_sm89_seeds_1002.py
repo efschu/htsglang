@@ -10,15 +10,7 @@ seeds to measured on the way: source == "seed", measured fields empty.
 
 import unittest
 
-from flliper.srt.planner.card_library import SEED_CARDS, _canonical
-
-
-def seed_card(name):
-    """27B line: no ``card_library.seed_card`` accessor (that is the NF line's
-    HW-GENERIC addition) -- the same lookup over ``SEED_CARDS`` by the loose
-    canonical key (vendor words dropped)."""
-    want = _canonical(name)
-    return next((s for k, s in SEED_CARDS.items() if _canonical(k) == want), None)
+from flliper.srt.planner.card_library import seed_card
 
 SM89_SEEDS = ("RTX 4090", "RTX 4080")
 

@@ -171,7 +171,14 @@ def test_a_stage_without_a_ple_layer_does_not_require_the_ngram_history():
     assert desc.complete()
 
 
-def test_the_scheduler_plans_one_slot_per_turn_row_and_frees_a_stale_one():
+def test_the_scheduler_plans_one_slot_per_turn_row_and_frees_a_stale_one(monkeypatch):
+    # S57: page 1 -- the END anchor N-1 never serves a generation-prompt sibling, so the GEN-FORK
+    # TRACK joins every plan here; this test pins the turn track alone (the combination:
+    # test_pdflip_s57_gen_fork_anchor_1019.py)
+    monkeypatch.setenv("FLLIPER_PDFLIP_GEN_FORK_ANCHOR", "0")
+    # S62: the SYS-GRID TRACK puts a point at the first message's end (floor_page(u)) of this prompt;
+    # the combination is pinned in test_pdflip_s62_sys_grid_anchor_1019.py
+    monkeypatch.setenv("FLLIPER_PDFLIP_SYS_GRID_ANCHOR", "0")
     from flliper.srt.pdflip import turn_anchor as ta
 
     alloc = _Alloc([11, 12])
@@ -193,7 +200,12 @@ def test_the_scheduler_plans_one_slot_per_turn_row_and_frees_a_stale_one():
     ("step before the boundary", dict(alloc=[5], prefix=0, end=I_LAST, main=I_LAST - 1)),
     ("no default track this step", dict(alloc=[5], prefix=0, end=N, main=N - 1, mask=False)),
 ])
-def test_the_scheduler_plans_nothing(why, kw):
+def test_the_scheduler_plans_nothing(why, kw, monkeypatch):
+    # S57: page 1 -- the END anchor N-1 never serves a generation-prompt sibling, so the GEN-FORK
+    # TRACK joins every plan here; this test pins the turn track alone (the combination:
+    # test_pdflip_s57_gen_fork_anchor_1019.py)
+    monkeypatch.setenv("FLLIPER_PDFLIP_GEN_FORK_ANCHOR", "0")
+    monkeypatch.setenv("FLLIPER_PDFLIP_SYS_GRID_ANCHOR", "0")   # S62: see the test above
     from flliper.srt.pdflip import turn_anchor as ta
 
     alloc = _Alloc(kw.pop("alloc"))
@@ -203,7 +215,11 @@ def test_the_scheduler_plans_nothing(why, kw):
     assert alloc.freed == []
 
 
-def test_a_protected_prefix_at_the_boundary_plans_nothing():
+def test_a_protected_prefix_at_the_boundary_plans_nothing(monkeypatch):
+    # S57: page 1 -- the END anchor N-1 never serves a generation-prompt sibling, so the GEN-FORK
+    # TRACK joins every plan here; this test pins the turn track alone (the combination:
+    # test_pdflip_s57_gen_fork_anchor_1019.py)
+    monkeypatch.setenv("FLLIPER_PDFLIP_GEN_FORK_ANCHOR", "0")
     alloc = _Alloc([5])
     req = _sreq(PROMPT, cpl=I_LAST)
     assert _plan(None, req, alloc, 0, N, N - 1) is None

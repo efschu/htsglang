@@ -10,10 +10,6 @@ rid=pdflip-12-39 epoch=14 via=d_direct': D prefilled 954 tokens after the P->D f
 Fix: a D-prefill leg (no P leg 1) that D holds unstarted at a park and whose
 stream is still in the lookahead is handed back -- its leg closes, D's hold is
 aborted by name, P's batch takes it.
-
-27B port (02.10.): every 27B park (wait bound, PARK-IMMEDIATE, PARK-SEAT-FREE,
-the manual flip park) precedes a D->P flip, so the handback never fights a
-D phase; a handed-back rid is not counted parked as well (no double effect).
 """
 from __future__ import annotations
 
@@ -173,11 +169,8 @@ def test_the_park_hands_back_held_and_late_rids():
     src = inspect.getsource(F.Front)
     i = src.index("verdict, rids, why = phase_policy.park_verdict(code, text)")
     blk = src[i:i + 6000]
-    assert ("_handed = set(Front._park_handback(\n"
-            "            self, park_held_rids(text) + [r for r in self._flip_ledger(D) if r not in rids]))") in blk
-    # 27B port: a handed-back rid is not also parked (no stale _d_parked hiding its NEW leg 2)
-    assert "known = [r for r in known if r not in _handed]" in blk
-    assert "late = [r for r in self._flip_ledger(D) if r not in rids and r not in _handed]" in blk
-    assert "still = [r for r in self._flip_ledger(D) if r not in _handed]" in blk
-    j = src.index("async def _requeue_park_handback(")
-    assert '(getattr(self, "_d_parked", None) or {}).pop(rid, None)' in src[j:j + 3000]
+    # 27B port: the NF call or the 27B form that also keeps a handed-back rid out of the parked set
+    assert (("self._park_handback(park_held_rids(text) + [r for r in self._flip_ledger(D) "
+             "if r not in rids])") in blk
+            or ("_handed = set(Front._park_handback(\n"
+                "            self, park_held_rids(text) + [r for r in self._flip_ledger(D) if r not in rids]))") in blk)

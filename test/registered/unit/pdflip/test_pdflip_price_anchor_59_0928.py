@@ -83,7 +83,9 @@ def test_the_held_epoch_credit_is_capped_too():
     ts.record_presence(_ids(1000), 200, prompt_tokens=1000, held_epoch=3,
                        resumable_depth=640)
     assert ts.pending(_ids(1000), epoch=3)[1] == 640, "held prompt 1000 capped"
-    assert ts.pending(_ids(1000), epoch=4)[1] == 200, "outside the epoch: ct, below the cap"
+    # X-CREDIT-FINISHED-1002: outside the epoch the SERVED leg keeps its end
+    # anchor min(prompt, cap, page floor) = 640 (a store load), not ct
+    assert ts.pending(_ids(1000), epoch=4)[1:4:2] == (640, "d_served_anchor")
 
 
 def test_inflight_keeps_the_cap_until_the_finish_replaces_it():

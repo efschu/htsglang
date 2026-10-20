@@ -79,10 +79,15 @@ class Wiring(unittest.TestCase):
 
     def test_fall_through_keeps_a_measured_d_presence(self):
         i = self.src.index("_sk = (short_ok and _short_keep_enabled() and int(store_span or 0) > 0")
-        blk = self.src[i:i + 6000]
+        # The rest of the enclosing handler, not a fixed 9000-char window: S56
+        # (D-MATCH-PROBE / R6 rest) inserted lines between the fall-through
+        # term and the SK branch and pushed `if _sk and self.awake == "D"`
+        # past the old window (rc16) -- the same strings are pinned.
+        _ends = [k for k in (self.src.find("\n    async def ", i), self.src.find("\n    def ", i)) if k > 0]
+        blk = self.src[i:min(_ends)]
         # P-BATCH-ALL (02.10.): the per-rid line names P's batch, not a keep
-        self.assertIn("PDFLIP SHORT-TO-P rid=%s", blk)
-        self.assertIn("and not _p_phase)", blk)
+        self.assertIn("PDFLIP SHORT-IN-P-PHASE rid=%s", blk)
+        self.assertIn("and not _p_phase and _pb_to_p is None", blk)  # PRICE-BARRIER/COLLECT-P extended the term
         self.assertIn("skip_leg1=_sk, short_kept=_sk, price_epoch=int(self.epoch)", blk)
         self.assertIn('if _sk and self.awake == "D" and self.admit_d and self.state == "serving":', blk)
         self.assertIn("self._ready_for_d.append(p)", blk)

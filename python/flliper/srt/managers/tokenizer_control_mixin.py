@@ -82,6 +82,10 @@ from flliper.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqOutput,
     VramBudgetReqInput,
     VramBudgetReqOutput,
+    PdFlipLaneFloorReqInput,
+    PdFlipLaneFloorReqOutput,
+    PdFlipMatchProbeReqInput,
+    PdFlipMatchProbeReqOutput,
     PdFlipParkRunningReqInput,
     PdFlipParkRunningReqOutput,
 )
@@ -123,6 +127,8 @@ _COMMUNICATOR_SPECS = [
     ("session_checkpoint", SessionCheckpointReqOutput),
     ("vram_budget", VramBudgetReqOutput),
     ("pdflip_park_running", PdFlipParkRunningReqOutput),
+    ("pdflip_match_probe", PdFlipMatchProbeReqOutput),
+    ("pdflip_lane_floor", PdFlipLaneFloorReqOutput),
     ("add_external_corpus", AddExternalCorpusReqOutput),
     ("remove_external_corpus", RemoveExternalCorpusReqOutput),
     ("list_external_corpora", ListExternalCorporaReqOutput),
@@ -312,11 +318,12 @@ class TokenizerControlMixin:
         )
 
     async def flush_cache(
-        self: TokenizerManager, timeout_s: Optional[float] = None
+        self: TokenizerManager, timeout_s: Optional[float] = None, flip_quiesce: bool = False
     ) -> FlushCacheReqOutput:
         self.auto_create_handle_loop()
         return (
-            await self.flush_cache_communicator(FlushCacheReqInput(timeout_s=timeout_s))
+            await self.flush_cache_communicator(
+                FlushCacheReqInput(timeout_s=timeout_s, pdflip_flip_quiesce=bool(flip_quiesce)))
         )[0]
 
     async def kv_reshard(
@@ -401,6 +408,62 @@ class TokenizerControlMixin:
         self.auto_create_handle_loop()
         return (await self.vram_budget_communicator(obj))[0]
 
+    async def pdflip_match_probe(
+        self: TokenizerManager, obj: PdFlipMatchProbeReqInput
+    ) -> PdFlipMatchProbeReqOutput:
+        """S56 D-MATCH-PROBE: how much of this tokenized prompt group D holds now (device + host tier), answered by
+        TP0 (pdflip/d_match_probe.py). S56r A3: the communicator is serial and each call waits one scheduler intake
+        round, so probes that arrive while one is in flight are COALESCED into the next call (``batch``): a burst of
+        k arrivals costs at most two rounds, not k (SOLL R2: a kurz request is not held behind k D-prefill chunks)."""
+        self.auto_create_handle_loop()
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        q = self.__dict__.setdefault("_pdflip_probe_wait", [])
+        q.append((obj, fut))
+        if not self.__dict__.get("_pdflip_probe_drain"):
+            # a task of its own: a caller cancelled mid-wait (client gone) never strands the probes queued behind it
+            self.__dict__["_pdflip_probe_drain"] = asyncio.ensure_future(self._pdflip_probe_drain_loop())
+        return await fut
+
+    async def _pdflip_probe_drain_loop(self: TokenizerManager) -> None:
+        from flliper.srt.managers.io_struct import unwrap_from_pickle, wrap_as_pickle
+
+        q = self.__dict__.setdefault("_pdflip_probe_wait", [])
+        try:
+            while q:
+                items = [it for it in q if not it[1].done()]
+                del q[:]
+                if not items:
+                    continue
+                head = items[0][0]
+                head.batch = wrap_as_pickle([
+                    {"rid": o.rid, "input_ids": o.input_ids, "mm_inputs": o.mm_inputs, "extra_key": o.extra_key,
+                     "tokenize_ms": float(o.tokenize_ms or 0.0)} for o, _f in items[1:]]) if len(items) > 1 else None
+                try:
+                    out = (await self.pdflip_match_probe_communicator(head))[0]
+                    more = unwrap_from_pickle(out.batch) if out.batch is not None else []
+                    outs = [out] + [PdFlipMatchProbeReqOutput(**d) for d in (more or [])]
+                    for i, (_o, f) in enumerate(items):
+                        if f.done():
+                            continue
+                        if i < len(outs):
+                            f.set_result(outs[i])
+                        else:
+                            f.set_result(PdFlipMatchProbeReqOutput(
+                                rid=_o.rid, success=False, message="batch answer missing"))
+                except BaseException as e:  # noqa: BLE001 -- every waiter gets the failure, none hangs
+                    for _o, f in items:
+                        if not f.done():
+                            f.set_exception(e if isinstance(e, Exception) else RuntimeError("probe drain cancelled"))
+                    if not isinstance(e, Exception):
+                        for _o, f in q:
+                            if not f.done():
+                                f.set_exception(RuntimeError("probe drain cancelled"))
+                        del q[:]
+                        raise
+        finally:
+            self.__dict__["_pdflip_probe_drain"] = None
+
     async def pdflip_park_running(
         self: TokenizerManager, obj: PdFlipParkRunningReqInput
     ) -> PdFlipParkRunningReqOutput:
@@ -429,6 +492,14 @@ class TokenizerControlMixin:
         except Exception:  # noqa: BLE001 -- the park answer never fails on a mark
             pass
         return out
+
+    async def pdflip_lane_floor(
+        self: TokenizerManager, obj: PdFlipLaneFloorReqInput
+    ) -> PdFlipLaneFloorReqOutput:
+        """PRIORITY LANES 1008 (L2): hand the front's floor to the scheduler; group D takes it into its
+        admission and re-queues the held lane parks it lets in again."""
+        self.auto_create_handle_loop()
+        return (await self.pdflip_lane_floor_communicator(obj))[0]
 
     async def clear_hicache_storage(self: TokenizerManager, force: bool = False) -> ClearHiCacheReqOutput:
         """Clear the hierarchical cache storage (``force``: also a persistent L3 store)."""

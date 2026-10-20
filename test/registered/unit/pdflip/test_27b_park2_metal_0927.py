@@ -65,6 +65,7 @@ def d27(clean):
 
 
 # ---------------------------------------------------------------- (b) fix 1
+@pytest.mark.usefixtures("decider_off")  # EZ-S2a: describes the S1 code (reachable until S4)
 def test_a_band_deferred_request_fires_the_immediate_park():
     """pdflip-28-62: est_uncached 4172, live X 7290, X_busy 4096, x_deferred."""
     band = types.SimpleNamespace(rid="pdflip-28-62", est_uncached=4172, skip_leg1=False,
@@ -84,6 +85,9 @@ def _h91c():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+@pytest.mark.usefixtures("decider_off")  # EZ-S2a: describes the S1 code (reachable until S4)
 
 
 def test_a_fairness_flip_under_the_immediate_park_parks_instead_of_draining(clean, monkeypatch):
@@ -223,3 +227,13 @@ def test_without_the_immediate_park_a_zero_answer_waits_as_before_pk2(clean, pro
     sched = types.SimpleNamespace(server_args=types.SimpleNamespace(tp_prefill_max_tokens=12288))
     assert S._pdflip_store_tail_settles(sched, _tail_req(418, True, None)) is False
     assert S._pdflip_store_tail_settles(sched, _tail_req(4316, True, 4095)) is True
+
+
+import pytest as _pytest_110  # noqa: E402
+
+
+@_pytest_110.fixture(autouse=True)
+def _arrival_seat_rule_off_110(monkeypatch):
+    """110: FLLIPER_PDFLIP_ENABLE_ARRIVAL_SEAT_RULE is default ON on the NF line;
+    this file pins the pre-rule front it was written against (=0 is that path)."""
+    monkeypatch.setenv("FLLIPER_PDFLIP_ENABLE_ARRIVAL_SEAT_RULE", "0")

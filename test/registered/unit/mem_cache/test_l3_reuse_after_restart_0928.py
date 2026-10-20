@@ -249,11 +249,12 @@ def test_b_census_and_pin_are_one_c_call_each(tmp_path, monkeypatch):
     kv.unpin(slots[1:2])
 
 
-def test_b_quiet_during_legs_sleep_and_dormancy(tmp_path, monkeypatch):
-    """The flip owns the arena and the lanes: a pass writes nothing while a
-    leg runs on this rank, after the sleep leg until the wake leg returned,
-    and while the scheduler is dormant (W25) -- the existing leg bracket of
-    ``_pdflip_group_stop_on_leg_failure`` drives the gate, no clock."""
+def test_b_writes_during_legs_sleep_and_dormancy_s36(tmp_path, monkeypatch):
+    """S36 SOLL 2 ENDGUELTIG (18.10., user: "flip oder schlaf sind d2h oder h2d zwischen gpu und systemram.
+    zurueckschreiben in L3 ist disk und systemram. unabhaengig also."): the pass WRITES while a leg runs on this
+    rank, after the sleep leg until the wake leg returned, and while the scheduler is dormant -- the former quiet
+    gate (L3-REUSE 0928) is an instrument now (``former_quiet_reason``), never a stop. The leg bracket of
+    ``_pdflip_group_stop_on_leg_failure`` still drives the bookkeeping (``awake_epoch`` reads it)."""
     from flliper.srt.managers.scheduler_components.weight_updater import (
         _pdflip_group_stop_on_leg_failure,
     )
@@ -275,27 +276,19 @@ def test_b_quiet_during_legs_sleep_and_dormancy(tmp_path, monkeypatch):
 
         @_pdflip_group_stop_on_leg_failure
         def release_memory_occupation(self, recv_req):
+            seen["former"] = gate.former_quiet_reason()
             seen["in_leg"] = be.l3_write_behind_pass()
             return "released"
 
-        @_pdflip_group_stop_on_leg_failure
-        def resume_memory_occupation(self, recv_req):
-            seen["in_wake"] = be.l3_write_behind_pass()
-            return "resumed"
-
     u = _Updater()
     assert u.release_memory_occupation(None) == "released"
-    assert seen["in_leg"]["paused"] == "leg" and seen["in_leg"]["written"] == 0
-    asleep = be.l3_write_behind_pass()
-    assert asleep["paused"] == "asleep" and asleep["written"] == 0
-    assert u.resume_memory_occupation(None) == "resumed"
-    assert seen["in_wake"]["paused"] == "leg"
+    assert seen["former"] == "leg"
+    assert seen["in_leg"]["paused"] is None and seen["in_leg"]["written"] == 2 * PAGES
+    assert gate.former_quiet_reason() == "asleep" and gate.quiet_reason() is None
     u.scheduler.pdflip_dormant = True
-    assert be.l3_write_behind_pass()["paused"] == "dormant"
-    u.scheduler.pdflip_dormant = False
-    awake = be.l3_write_behind_pass()
-    assert awake["paused"] is None and awake["written"] == 2 * PAGES
-    assert gate.quiet_reason() is None
+    assert gate.former_quiet_reason() in ("asleep", "dormant") and gate.quiet_reason() is None
+    again = be.l3_write_behind_pass()
+    assert again["paused"] is None and again["written"] == 0, "everything was secured in the leg already"
 
 
 def test_b_no_write_evict_ping_pong(tmp_path, monkeypatch):

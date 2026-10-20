@@ -303,7 +303,7 @@ RECORD_KEY_FIELDS: Tuple[str, ...] = ("checkpoint", "form", "line", "power_limit
 
 #: RG (operator 26.09.): the agent-load prefix switches as registry fields,
 #: ``(ModelProfile field, env name)``. The first five are the ones
-#: dkr27brc10bar1agent09261821 (rc11a) proved on metal; PF is a field only.
+#: dkr27brc10bar1agent09261821 (rc11a) proved on metal; PF: nextflash ON since 14.10. (h16g WIDTH GUARD), qwen27b off.
 PREFIX_SWITCHES: Tuple[Tuple[str, str], ...] = (
     ("inline_system_in_place", "FLLIPER_ANTHROPIC_INLINE_SYSTEM_IN_PLACE"),  # MZ
     ("told_probe_tree_key", "FLLIPER_PDFLIP_TOLD_PROBE_TREE_KEY"),  # TK
@@ -349,6 +349,33 @@ RELEASE_FIX_SWITCHES: Tuple[str, ...] = (
 #: the one of them P and D must run identically (Befund M: the rendered
 #: prompt, hence the prefix keys, differ otherwise)
 PREFIX_SWITCH_P_EQ_D: Tuple[str, ...] = ("FLLIPER_ANTHROPIC_INLINE_SYSTEM_IN_PLACE",)
+#: SCHALTER-HALBPORT 1002 (/spinning/gpu-arb/docs/SCHALTER-HALBPORT-AUDIT-1002.md):
+#: env switches a row states as its DEFAULT, field -> the env name(s) it sets
+#: (:meth:`ModelProfile.switch_defaults`). A field left ``None`` states nothing:
+#: the switch keeps the code default (or what another field derives, e.g. the
+#: HG bundle for CANON_ORDER) and the row's :data:`PROFILE_SWITCH_DEFAULTS`
+#: carry no key for it -- the qwen27b row states none of them and stays byte-
+#: identical. The readers take the row's value when the env is unset or blank
+#: (an explicit value always wins), on P, D and the front alike (all three
+#: carry the published form).
+STATED_SWITCHES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+    ("p_anchor_presence", ("FLLIPER_PDFLIP_ENABLE_P_ANCHOR_PRESENCE",)),
+    ("admission_wedge_recovery_s", ("FLLIPER_ADMISSION_WEDGE_RECOVERY_SECONDS",)),
+    ("hicache_load_async_index", ("FLLIPER_HICACHE_LOAD_ASYNC_INDEX",)),
+    ("vision_flip_urgent", ("FLLIPER_PDFLIP_VISION_FLIP_URGENT",)),
+    ("bar1_canon_order", ("FLLIPER_BARLINK_BAR1_CANON_ORDER",)),
+    ("vram_peak_fast_read", ("FLLIPER_VRAM_PEAK_FAST_READ",)),
+    ("front_dc_off_path", ("FLLIPER_PDFLIP_DC_OFF_PATH",)),
+    ("front_quiesce_fast", ("FLLIPER_PDFLIP_QUIESCE_FAST",)),
+    ("front_ctl_kick", ("FLLIPER_PDFLIP_CTL_KICK_ARRIVAL", "FLLIPER_PDFLIP_CTL_KICK_AFTER_FLIP")),
+    ("census_o1_evict", ("FLLIPER_PDFLIP_CENSUS_O1_EVICT",)),
+    # SWITCH-DEFAULTS 1004 (user order 04.10. ~07:15Z: proven on metal -> on
+    # in the code): front + rank switches every NF profile states for all
+    # processes (nf-int4-h6-abl.env _form / export lines).
+    ("front_park_collect_window", ("FLLIPER_PDFLIP_ENABLE_PARK_COLLECT_WINDOW",)),
+    ("deposit_lane_lookahead", ("FLLIPER_PDFLIP_DEPOSIT_LANE_LOOKAHEAD",)),
+    ("d_seat_rewake", ("FLLIPER_PDFLIP_D_SEAT_REWAKE",)),
+)
 
 
 @dataclass(frozen=True)
@@ -401,8 +428,8 @@ class ModelProfile:
     #: 27B #49 agent span on the front (FLLIPER_PDFLIP_ENABLE_AGENT_SPAN, NF P49
     #: c1988ff84f): tools priced first, a D serve holds its prompt_tokens for
     #: its epoch, prefix priced in measured tokens. Operator 26.09.: the 27B
-    #: line ran it unswitched since RC9 (S7c); NF off until the NF seat
-    #: releases it with a boot tag.
+    #: line ran it unswitched since RC9 (S7c); NF released 02.10. by the NF
+    #: seat (X-CREDIT-1002, see the nextflash row).
     agent_span: bool
     #: NF H91 STANDARD FORM (user design 25.09.; NF H91b/c/c2/d, H95 B/c):
     #: the front's phase policy (P phase cap 6 + overlap plan against P's pool,
@@ -533,8 +560,10 @@ class ModelProfile:
     #: Fix B (pdflip/p_row_authority.py): FLLIPER_PDFLIP_P_ROW_AUTHORITY, the #631
     #: row form on group P (effective on pp>1 only). Operator 27.09.: the
     #: default turns only after a clean metal proof under agent load -- met by
-    #: w109290020 (29.09.), qwen27b on since; nextflash off. An explicit env
-    #: wins (=0 turns the 27B row off).
+    #: w109290020 (29.09.), qwen27b on since; nextflash on since 14.10. (NF
+    #: rang-audit S5: the carrierless form's followers planned from their own
+    #: pools; its metal proof is the next NF boot's K0-K3). An explicit env
+    #: wins (=0 turns the row off).
     p_row_authority: bool = False
     #: VRAM-GRUNDGESETZ (user 19.09. / 29.09.: no reserve, only measured
     #: transients; desk/27b-no-reserve-0929, pdflip/budget_rest.py): group D's
@@ -672,6 +701,45 @@ class ModelProfile:
     #: bound: INT8 y8vb 137 s / 152 s). 0 = off (nextflash, byte-identical).
     #: FLLIPER_PDFLIP_SHORT_KEPT_MAX_WAIT_S (pdflip/front._short_kept_bound).
     short_kept_max_wait_s: float = 0.0
+    #: SCHALTER-HALBPORT 1002: the row's ``vision`` is the launcher's DEFAULT for
+    #: an unset ``--pdflip-vision`` (``launcher.apply_profile_vision_default``,
+    #: before the form is resolved). nextflash on: every NF boot runs
+    #: ``transient`` (nf-int4.env:229). qwen27b off: its profiles state the flag
+    #: (27b.env transient, 27b-gguf off); the row stays byte-identical.
+    vision_arg_default: bool = False
+    #: SCHALTER-HALBPORT 1002, :data:`STATED_SWITCHES` (``None`` = not stated by
+    #: this row, the code default stands):
+    #: K1 FLLIPER_PDFLIP_ENABLE_P_ANCHOR_PRESENCE (front) -- 'PDFLIP P-ANCHOR-PRESENCE'.
+    p_anchor_presence: Optional[bool] = None
+    #: FLLIPER_ADMISSION_WEDGE_RECOVERY_SECONDS (ranks) -- 'ADMISSION-WEDGE
+    #: recovery armed after 2.0s'.
+    admission_wedge_recovery_s: Optional[float] = None
+    #: FLLIPER_HICACHE_LOAD_ASYNC_INDEX (P and D ranks) -- 'HICACHE-LOAD-ASYNC-INDEX
+    #: armed', PDFLIP-START-LOADING mamba.idx=0.
+    hicache_load_async_index: Optional[bool] = None
+    #: FLLIPER_PDFLIP_VISION_FLIP_URGENT (front) -- 'PDFLIP VISION-FLIP-URGENT on'.
+    vision_flip_urgent: Optional[bool] = None
+    #: FLLIPER_BARLINK_BAR1_CANON_ORDER alone (ranks), over the value the HG
+    #: bundle derives -- 'oneshot all_reduce in canonical rank order'.
+    bar1_canon_order: Optional[bool] = None
+    #: FLLIPER_VRAM_PEAK_FAST_READ (ranks) -- 'VRAM-PEAK-FAST-READ armed'.
+    vram_peak_fast_read: Optional[bool] = None
+    #: FLLIPER_PDFLIP_DC_OFF_PATH (front) -- 'PDFLIP-FLIPFAST ... dc_off_path=on',
+    #: 'PDFLIP-DC-OFFPATH epoch='.
+    front_dc_off_path: Optional[bool] = None
+    #: FLLIPER_PDFLIP_QUIESCE_FAST (front and P ranks) -- 'PDFLIP-QUIESCE-FAST group='.
+    front_quiesce_fast: Optional[bool] = None
+    #: FLLIPER_PDFLIP_CTL_KICK_ARRIVAL + _AFTER_FLIP (front) -- 'PDFLIP-FLIPFAST
+    #: kick_arrival=on kick_after_flip=on', 'PDFLIP-FLIPFAST kick why='.
+    front_ctl_kick: Optional[bool] = None
+    #: FLLIPER_PDFLIP_CENSUS_O1_EVICT (ranks) -- 'KR CENSUS-O1-EVICT armed'.
+    census_o1_evict: Optional[bool] = None
+    #: FLLIPER_PDFLIP_ENABLE_PARK_COLLECT_WINDOW (front) -- z30y collect window.
+    front_park_collect_window: Optional[bool] = None
+    #: FLLIPER_PDFLIP_DEPOSIT_LANE_LOOKAHEAD (ranks, weight_updater) -- H111b.
+    deposit_lane_lookahead: Optional[bool] = None
+    #: FLLIPER_PDFLIP_D_SEAT_REWAKE (front + D ranks) -- SITZ-REWAKE 47539d581e.
+    d_seat_rewake: Optional[bool] = None
 
     def switch_defaults(self) -> Dict[str, object]:
         """The rank switches whose default this profile sets, DERIVED."""
@@ -715,6 +783,13 @@ class ModelProfile:
         out["FLLIPER_ADMISSION_WEDGE_RECOVERY_SECONDS"] = float(self.admission_wedge_recovery_s)
         out["FLLIPER_PDFLIP_CTL_KICK_ARRIVAL"] = bool(self.front_ctl_kick)
         out["FLLIPER_PDFLIP_CTL_KICK_AFTER_FLIP"] = bool(self.front_ctl_kick)
+        # SCHALTER-HALBPORT 1002: only what the row states (None adds no key).
+        for fld, env_names in STATED_SWITCHES:
+            val = getattr(self, fld)
+            if val is None:
+                continue
+            for env_name in env_names:
+                out[env_name] = val if isinstance(val, bool) else float(val)
         # NF R12: Form A groups exist only on a qsa_forma D (it also needs an
         # installed Form A role plan at run time).
         out["FLLIPER_PDFLIP_ENABLE_FORM_A_HOST_SHADOW"] = self.d_layout == "qsa_forma"
@@ -802,6 +877,9 @@ _NF_LS_BOTH: Dict[str, str] = {
 NEXTFLASH_GROUP_SWITCH_DEFAULTS: Dict[str, Dict[str, str]] = {
     "P": dict(_NF_LS_BOTH, **{
         "FLLIPER_PDFLIP_ENABLE_P_TAIL_FOLD": "1",
+        # SWITCH-DEFAULTS 1004: P-only lines of nf-int4-h6-abl.env (NF_ENV_P)
+        "FLLIPER_PDFLIP_ENABLE_PREFILL_FETCH_OVERLAP": "1",
+        "FLLIPER_PDFLIP_ENABLE_TARGETED_PREWARM": "1",
         "FLLIPER_FORCE_QSA_ROWS_CONFIG": "inf=64/8/2",
         "FLLIPER_PDFLIP_QSA_FP8_DECODE": "ptx",
         "FLLIPER_PDFLIP_QSA_ROWS_FUSED_EAGER": "1",
@@ -816,6 +894,15 @@ NEXTFLASH_GROUP_SWITCH_DEFAULTS: Dict[str, Dict[str, str]] = {
         "FLLIPER_QWEN4_PLE_DECODE_PREAD_THREADS": "8",
         "FLLIPER_PDFLIP_ENABLE_CUT_WORKER_END": "1",
         "FLLIPER_PDFLIP_ENABLE_D_PARK_END": "1",
+        # SWITCH-DEFAULTS 1004: D-only lines of nf-int4-h6-abl.env (NF_ENV_D)
+        "FLLIPER_PDFLIP_ENABLE_TAIL_STAGE_EARLY": "1",
+        "FLLIPER_PDFLIP_RESUME_WARM_FINISH": "1",
+        "FLLIPER_PDFLIP_TAIL_STAGE_WORKER": "1",
+        # SCHALTER-HALBPORT 1002 (audit section 6): the row's store_short_tail
+        # is off, but every NF boot runs it on D (nf-int4.env NF_ENV_D_FORM) and
+        # off on P (0x W88 on NF-P in 10 boots: no need shown) -- per group here,
+        # so the profile line can go.
+        "FLLIPER_PDFLIP_STORE_SHORT_TAIL": "1",
     }),
 }
 
@@ -1069,8 +1156,17 @@ PROFILES: Dict[str, ModelProfile] = {
         store_short_tail=False,
         bigram_anchor_exact=True,
         warm_min_dwell=True,
-        # NF P49: off until the NF seat releases #49 with a boot tag
-        agent_span=False,
+        # NF P49: released by X-CREDIT-1002 (NF seat, 02.10.). Boot
+        # dkrnfint4bar1dauer10020634 (5b46b8842e, #49 off): a FINISHED D leg 2
+        # credited only its admission hit, so every agent follow-up kept the
+        # predecessor's delta as uncached -- pdflip-26-45 credit 50688 (26-44's
+        # cached_tokens) pending 4582 > X=3647 -> LONG, P prefilled 1510 of a
+        # 53760 hit; 24-40 45824 / 4339 > 3602 -> LONG, P prefilled 2291. The
+        # premises hold on NF: the Flash-Next template renders <tools> first
+        # (chat_template.jinja:57-67), D sends pdflip_resumable_depth on every
+        # finish (#59 RESUMABLE mode=form-a-dcp-min). Metal tag: the next NF
+        # boot on desk/nf-x-credit-inflight-1002.
+        agent_span=True,
         standard_form=True,
         # NF-MZ (29.09., y3m boot ...dauer09292136, 375f44975e): released.
         # Claude Code 2.1.280 sends role:"system" (api_system) messages
@@ -1097,8 +1193,29 @@ PROFILES: Dict[str, ModelProfile] = {
         told_paced=True,
         p_twin_defer=True,
         front_span_inflight=False,
-        told_group_fallback=False,
-        vision="off",
+        # PF ON (NF h16g 14.10. 17:49:53Z, P.log ..._1014_174538 12223-12251): PP0's told for
+        # pdflip-0-10 was 20096 (its own read anchored at 17088+3008), PP1/PP2 read on to 38784 with
+        # the recurrent state at 38784 only. Without PF the "over" settle made PP1 SATISFIED
+        # unprobed (#968 OVER-UNRESUMABLE is armed only with the ack stream), its admission met
+        # rank_resumable(20096) = 3008 (W27-UNIFORM FOLLOWER TREE SHORT live=3008), held the rid
+        # (route=none) and planned bs=2 against PP0's bs=3 -> #1233 WIDTH GUARD. With PF the ack
+        # names the follower's resumable reach, PP0 sees own != told and answers told=0 for EVERY
+        # rank before anyone seats it. 27B row: PF has run on 27B metal (z30y14 ff.); NF: first boot.
+        told_group_fallback=True,
+        # NF-RANG-AUDIT 1014 (nf-rang-audit-1014.md S5): on the carrierless P
+        # form (PP3, TP=1 per stage) '#631 ROW AUTHORITY DISABLED' let every
+        # follower plan from its OWN pool through every rank-local gate of
+        # add_one_req; the class #1233/#1004/W27 was closed one term at a time
+        # (six deaths 14.10.). Fix B is the mechanism "PP0 decides, the
+        # followers execute its row" and was off here only for want of an NF
+        # metal proof (user rule 14.10.: features are on, weaknesses get fixed).
+        # The LB-VERDICT gate yields to an executed row (FLLIPER_PDFLIP_LBV_ROW_YIELD).
+        # An explicit FLLIPER_PDFLIP_P_ROW_AUTHORITY=0 still wins.
+        p_row_authority=True,
+        # SCHALTER-HALBPORT 1002 (audit section 6): every NF boot runs
+        # --pdflip-vision transient (nf-int4.env:229); the row said off. It is the
+        # launcher default for an unset flag (vision_arg_default below).
+        vision="transient",
         context_tokens=262144,
         records=RecordKey(fields=("checkpoint", "form", "power_limit")),
         early_read_flags=False,
@@ -1140,6 +1257,46 @@ PROFILES: Dict[str, ModelProfile] = {
         # #239 uneven-DCP-KV (user 28.09.: release feature): z30m-z30w and
         # every NF flip boot since run --d-kv-token-cut owned (z30w 112 flips).
         d_kv_token_cut="owned",
+        # SCHALTER-HALBPORT 1002 (NF seat, 02.10.; audit SCHALTER-HALBPORT-
+        # AUDIT-1002.md): switches NF ran only through profile lines, or not at
+        # all although nothing in NF's form argues against them. An explicit
+        # env still wins (=0 turns one off).
+        vision_arg_default=True,
+        # K1 (audit 2.2): built on NF evidence (a59c95ae36, z30u: 77 LONG
+        # follow-ups prefilled < 2k on P, 69 on exactly one P END-ANCHOR
+        # depth), released only on the 27B line (02adfaadee: z30y11-13, 0
+        # deaths, W50-REROUTE 0). Front-only; the credit is the max of the
+        # entry's readings (TokenSpans.record_store_anchor), not added to the
+        # d_inflight / d_served credit.
+        p_anchor_presence=True,
+        # audit 2.5: NF y6o ...10012132 D: 'ADMISSION-WEDGE ... NO first token
+        # for 121.0s', recovery only after the 60 s default on top of the
+        # 20 s alarm. 27B LS12 hauenh ran 2.0 (armed P3/D3, never fired).
+        admission_wedge_recovery_s=2.0,
+        # audit 2.6 + section 6: NF-D ran it (nf-int4.env NF_ENV_D_FORM,
+        # mamba.idx=0); NF-P 10020634 START-LOADING mamba.idx p90 795 ms, max
+        # 1034 ms, 31.6 s scheduler time per boot. Same bytes, same rows, same
+        # stream order -- only the host wait goes (arena_pool.load_index_async).
+        hicache_load_async_index=True,
+        # audit 2.7: NF boots --pdflip-vision transient; a P-only request
+        # (image) satisfies the D->P flip-economics latch on its own.
+        vision_flip_urgent=True,
+        # audit 2.9: the BAR1 oneshot sums 0..R-1 on every rank (bit-equal
+        # ranks); same reads, no extra barrier (reduceNPhaseCanon). The other
+        # two HG switches stay off on NF (DFLASH worker only).
+        bar1_canon_order=True,
+        # audit 2.11: the allocator peak read without memory_stats()' flatten.
+        vram_peak_fast_read=True,
+        # audit section 6: NF ran these only through nf-int4.env _form lines
+        # (DC_OFF_PATH :270, QUIESCE_FAST :273, CTL_KICK_* :268-269,
+        # CENSUS_O1_EVICT :276, KR e17bd548b5).
+        front_dc_off_path=True,
+        front_quiesce_fast=True,
+        front_ctl_kick=True,
+        census_o1_evict=True,
+        front_park_collect_window=True,
+        deposit_lane_lookahead=True,
+        d_seat_rewake=True,
     ),
 }
 
@@ -1178,6 +1335,8 @@ PROFILE_EXPECT: Dict[str, Dict[str, Tuple[str, ...]]] = {
 #: (``front_dc_off_path`` / ``front_quiesce_fast`` / ``d_dcp_lse_merge``, LS6 30.09.).
 #: VERIFY_VOCAB_ARGMAX / VRAM_PEAK_FAST_READ / LOAD_ASYNC_INDEX + DRAIN_AGREE_EVERY /
 #: ADMISSION_WEDGE_RECOVERY_SECONDS / CTL_KICK_ARRIVAL + _AFTER_FLIP (LS12 rest 30.09.).
+#: :data:`STATED_SWITCHES` (SCHALTER-HALBPORT 1002; only a row that states one
+#: carries its key -- nextflash).
 PROFILE_SWITCH_DEFAULTS: Dict[str, Dict[str, object]] = {
     pid: prof.switch_defaults() for pid, prof in PROFILES.items()
 }

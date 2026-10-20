@@ -892,6 +892,107 @@ if __name__ == "__main__":
 #: writes the death -- no log parsing, no deadman interval.
 RANK_EXCEPTION_CODE = "RANK_EXCEPTION"
 
+#: NF 20.10. 14:18:29Z (rc26, boot ...dauer10201307): the kernel's cgroup OOM
+#: killer SIGKILLed D TP0 (host journal: "Memory cgroup out of memory: Killed
+#: process 1798627 (flliper::schedu) ... shmem-rss:72993760kB", memory: usage
+#: 109051904kB, limit 109051904kB). A SIGKILLed rank writes nothing, so the
+#: FIRST cause in state.json came from a SURVIVOR: TP2's gloo "Connection
+#: closed by peer" as RANK_EXCEPTION -- the consequence filed as the cause, and
+#: the death searched for as a code defect. The survivors CAN see the cause:
+#: the container's own cgroup ``memory.events oom_kill`` counter. Every rank
+#: arms a baseline at process start (:func:`arm_oom_witness`) and, at its own
+#: death, files KERNEL_OOM_KILL instead of RANK_EXCEPTION when the counter
+#: rose. RANK-UNITY: every rank of every group in the container applies the
+#: SAME rule to the SAME counter, so whichever survivor writes first, the boot
+#: gets one answer. The rank's own exception stays in ``detail_full`` and
+#: ``exception_type`` -- nothing is overwritten, the attribution is added.
+KERNEL_OOM_KILL_CODE = "KERNEL_OOM_KILL"
+
+#: (baseline, armed): the cgroup oom_kill count read at this process's start.
+_OOM_WITNESS = {"baseline": None, "armed": False}
+#: the code the last :func:`note_rank_death` call decided on (for the log line)
+_LAST_RANK_DEATH_CODE = {"code": RANK_EXCEPTION_CODE}
+
+
+def _cgroup_memory_root() -> Optional[str]:
+    """The cgroup2 directory this process's memory is accounted in.
+
+    Same order as utils/watchdog.py ``_cgroup_memory_dir``: inside the LXC
+    the namespaced root's ``.lxc`` child holds the serving processes; inside
+    the docker container (cgroupns private) ``/sys/fs/cgroup`` IS the
+    container's cgroup -- the one whose ``memory.max`` (104 GiB on NF) the
+    kernel enforced on 20.10."""
+    for path in ("/sys/fs/cgroup/.lxc", "/sys/fs/cgroup"):
+        if os.path.exists(os.path.join(path, "memory.events")):
+            return path
+    return None
+
+
+def cgroup_oom_kills(root: Optional[str] = None) -> Optional[int]:
+    """``oom_kill`` from ``memory.events`` (cumulative), None if unreadable."""
+    root = root if root is not None else _cgroup_memory_root()
+    if root is None:
+        return None
+    try:
+        with open(os.path.join(root, "memory.events")) as f:
+            m = re.search(r"^oom_kill (\d+)", f.read(), re.M)
+        return int(m.group(1)) if m else None
+    except (OSError, ValueError):
+        return None
+
+
+def _cgroup_mib(root: Optional[str], name: str) -> Optional[int]:
+    if root is None:
+        return None
+    try:
+        with open(os.path.join(root, name)) as f:
+            text = f.read().strip()
+        return None if text == "max" else int(text) // (1024 * 1024)
+    except (OSError, ValueError):
+        return None
+
+
+def arm_oom_witness(root: Optional[str] = None) -> Optional[int]:
+    """Take this process's oom_kill BASELINE (first call wins). Called at the
+    very start of a scheduler process, before any rank can have died. Never
+    raises; returns the baseline (None = unreadable, witness stays silent)."""
+    if not _OOM_WITNESS["armed"]:
+        _OOM_WITNESS["armed"] = True
+        try:
+            _OOM_WITNESS["baseline"] = cgroup_oom_kills(root)
+        except Exception:  # noqa: BLE001 -- a witness never stops a rank
+            _OOM_WITNESS["baseline"] = None
+    return _OOM_WITNESS["baseline"]
+
+
+def oom_witness(root: Optional[str] = None) -> Optional[str]:
+    """One sentence when the kernel's cgroup OOM killer killed something in
+    this container since :func:`arm_oom_witness`, else None (also None when
+    unarmed or unreadable: an absence of evidence is never a verdict).
+    Never raises."""
+    try:
+        base = _OOM_WITNESS["baseline"]
+        if base is None:
+            return None
+        root = root if root is not None else _cgroup_memory_root()
+        now = cgroup_oom_kills(root)
+        if now is None or now <= base:
+            return None
+        cur, mx = _cgroup_mib(root, "memory.current"), _cgroup_mib(root, "memory.max")
+        return ("KERNEL OOM KILL in this container: %s/memory.events oom_kill %d -> %d since this "
+                "rank started (memory.current=%s MiB, memory.max=%s MiB) -- the kernel's cgroup OOM "
+                "killer SIGKILLed a process here; a SIGKILLed rank writes nothing, and this rank's "
+                "own exception is the CONSEQUENCE (the host journal names the victim: 'Memory cgroup "
+                "out of memory: Killed process')"
+                % (root, base, now, "?" if cur is None else cur, "max" if mx is None else mx))
+    except Exception:  # noqa: BLE001 -- a witness never stops a death path
+        return None
+
+
+def last_rank_death_code() -> str:
+    """The code the last :func:`note_rank_death` of this process chose."""
+    return _LAST_RANK_DEATH_CODE["code"]
+
 
 def note_rank_death(d: Optional[str], *, group: Optional[str], tp_rank: int, pp_rank: int,
                     exc: BaseException, detail: str = "") -> bool:
@@ -910,7 +1011,13 @@ def note_rank_death(d: Optional[str], *, group: Optional[str], tp_rank: int, pp_
         cur = (st.get("lifecycle") or {}).get("state")
         rc = RC_DEAD_AFTER_SERVING if st.get("serving_since_ts") else RC_DEAD_BEFORE_SERVING
         g = group if group in ("P", "D") else None
-        cause = make_cause(RANK_EXCEPTION_CODE, "rank", (detail or "%s: %s" % (type(exc).__name__, exc))[:2000],
+        own = detail or "%s: %s" % (type(exc).__name__, exc)
+        # KERNEL_OOM_KILL (NF 20.10. 14:18:29Z): same rule, same counter, every rank.
+        witness = oom_witness()
+        code = KERNEL_OOM_KILL_CODE if witness else RANK_EXCEPTION_CODE
+        text = ("%s | this rank's own exception: %s" % (witness, own)) if witness else own
+        _LAST_RANK_DEATH_CODE["code"] = code
+        cause = make_cause(code, "rank", text[:2000],
                            group=g, rank="tp%dpp%d" % (int(tp_rank), int(pp_rank)),
                            exception_type=type(exc).__name__, rc=rc)
         out = transition(d, "dead", cause=cause, writer="rank")

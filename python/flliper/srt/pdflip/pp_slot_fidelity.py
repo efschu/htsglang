@@ -139,6 +139,50 @@ def pp_size_of(holder) -> int:
         return 1
 
 
+#: PR (pdflip/pp_room_vote.py; mem_cache.common.PP_ROOM_CAP_ATTR): the room the
+#: stages agreed for this pass (R_m), read by its literal name.
+_AGREED_ATTR = "pdflip_pp_room_cap"
+
+
+def agreed_room(tree) -> Optional[int]:
+    cap = getattr(tree, _AGREED_ATTR, None)
+    if isinstance(cap, int) and not isinstance(cap, bool):
+        return max(0, cap)
+    return None
+
+
+def agreed_floor(tree, floor: int) -> int:
+    """PR: under an agreed R_m the load-back's floor is at most R_m, on every
+    stage alike (14:11Z int20: PP1 loaded pdflip-8-75 a pass before PP0 -> #1004)."""
+    cap = agreed_room(tree)
+    return int(floor) if cap is None else min(int(floor), cap)
+
+
+class AgreedRoomShort(RuntimeError):
+    """PR: this stage cannot hold a load-back the stages agreed it can.
+
+    A ``RuntimeError`` on purpose (every catcher that expects the loud stop keeps it, with the message of before). The
+    terms ride on the exception so the one seat that can still take the pass back (PP0 of group P, on the form where the
+    followers execute its row: ``pdflip/prefill_oom_retreat.retreat_loadback``) decides on numbers, not on text. NF 13.10.
+    18:30:21Z (``..._0ea6d17efd_1013_134832.P.log`` 1012731-1012800): agreed 191744, avail 92032, evictable 99712, the
+    peel paid 64 -- the rest sat behind one un-payable frontier leaf."""
+
+    def __init__(self, message, *, rid=None, kv_tokens=0, agreed=0, avail=0, evictable=0, evicted=0, avail_after=0,
+                 lb_verdict_short=False):
+        super().__init__(message)
+        self.rid = rid
+        self.kv_tokens = int(kv_tokens)
+        self.agreed = int(agreed)
+        self.avail = int(avail)
+        self.evictable = int(evictable)
+        self.evicted = int(evicted)
+        self.avail_after = int(avail_after)
+        #: NF-RANG-AUDIT 1014 (S4): True = ``LB-VERDICT SHORT`` -- PP0's load-back verdict for this rid was already
+        #: distributed over the chain and spent on the stages that could pay. Such a short is never retreated into a
+        #: void pass (``prefill_oom_retreat.retreat_loadback``): the group stops by name.
+        self.lb_verdict_short = bool(lb_verdict_short)
+
+
 def local_pp_room(tree, kv_tokens: int, floor: int, rid=None) -> Optional[bool]:
     """The load-back room verdict on a local floor under pp > 1.
 
@@ -161,6 +205,10 @@ def local_pp_room(tree, kv_tokens: int, floor: int, rid=None) -> Optional[bool]:
     if alloc is None:
         return None
     kv_tokens = int(kv_tokens)
+    agreed = agreed_room(tree)
+    if agreed is not None and kv_tokens > agreed:
+        # every stage reads the same R_m: every stage refuses this pass
+        return False
     avail0 = int(alloc.available_size())
     evictable0 = evictable = int(tree.evictable_size())
     evicted = 0
@@ -192,6 +240,20 @@ def local_pp_room(tree, kv_tokens: int, floor: int, rid=None) -> Optional[bool]:
                 rid, kv_tokens, int(floor), avail0, evictable0, evicted, avail1, evictable,
                 rounds, n,
             )
+    elif agreed is not None:
+        # the stages agreed this load-back fits; this one cannot pay it. A local
+        # refusal would start it on the peers alone (#1004) -- stop by name.
+        from flliper.srt.pdflip.pp_room_vote import agreed_short
+
+        n = agreed_short("loadback", rid, kv_tokens, agreed, avail1)
+        raise AgreedRoomShort(
+            f"PR AGREED-ROOM SHORT rid={rid} kv_tokens={kv_tokens} agreed={agreed} "
+            f"avail={avail0} evictable={evictable} evicted={evicted} avail_after={avail1} "
+            f"(n={n}): the stages agreed this pass can hold the load-back and this "
+            "stage cannot; refusing alone would start it on the peers only (#1004)",
+            rid=rid, kv_tokens=kv_tokens, agreed=agreed, avail=avail0, evictable=evictable, evicted=evicted,
+            avail_after=avail1,
+        )
     else:
         n = _sampled(tree, "_pdflip_sf_room_residual")
         if n is not None:
@@ -231,20 +293,24 @@ def note_loaded(tree, rows: int) -> None:
         pass
 
 
-def unbacked_drop_allowed(tree, node) -> bool:
-    """UD (NF rc12q PP2 16:28:19Z): may an eviction DROP a write_back leaf whose
-    backup was refused? Only on the local-PP floor (the tree is this rank's own;
-    on a TP group a rank-local drop would split the replicas), only a node with
-    no children (#841: an un-backed node with children would orphan them) and
-    no write-through in flight."""
+def unbacked_drop_floor(tree, node) -> bool:
+    """UD's floor half: the local-PP floor (the tree is this rank's own; on a TP
+    group a rank-local drop would split the replicas) and no write-through of
+    ``node`` in flight. Children are not looked at here."""
     if not enabled() or not getattr(tree, FLOOR_LOCAL_PP_ATTR, False):
         return False
-    if getattr(node, "children", None):
-        return False
     ongoing = getattr(tree, "ongoing_write_through", None) or {}
-    if getattr(node, "id", None) in ongoing:
+    return getattr(node, "id", None) not in ongoing
+
+
+def unbacked_drop_allowed(tree, node) -> bool:
+    """UD (NF rc12q PP2 16:28:19Z): may an eviction DROP a write_back leaf whose
+    backup was refused? Only on the local-PP floor, only a node with no children
+    (#841: an un-backed node with children would orphan them) and no
+    write-through in flight."""
+    if not unbacked_drop_floor(tree, node):
         return False
-    return True
+    return not getattr(node, "children", None)
 
 
 #: Q-1500 (V1, desk analysis 1290): the dual-P extension of UD below. Default ON, and
@@ -601,7 +667,7 @@ def replan_after_move(scheduler, adder, req, new_pos: int, box) -> Optional[int]
                     "rem_chunk=%s initial=%s can_run=%d (n=%d): the pass budget was "
                     "already spent on another request; the next pass replans at the "
                     "executed position",
-                    rid[:16], plan.pos, new_pos, rem, initial,
+                    rid, plan.pos, new_pos, rem, initial,
                     len(getattr(adder, "can_run_list", None) or ()), n,
                 )
             return None
@@ -624,7 +690,7 @@ def replan_after_move(scheduler, adder, req, new_pos: int, box) -> Optional[int]
                 "width %d -> %d (plan %d, never widened) (n=%d): the pass budget was "
                 "planned for another start; #988 moved the prefix, so the plan is "
                 "redone at the moved prefix on every rank alike",
-                rid[:16], plan.pos, plan.src, new_pos, int(initial), new_budget, width, n,
+                rid, plan.pos, plan.src, new_pos, int(initial), new_budget, width, n,
             )
         return new_budget
     except Exception as exc:  # noqa: BLE001 -- a plan must never stop a pass

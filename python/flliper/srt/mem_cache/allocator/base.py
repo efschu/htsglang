@@ -27,6 +27,40 @@ if TYPE_CHECKING:
     from flliper.srt.mem_cache.memory_pool import KVCache
 
 
+# ---------------------------------------------------------------------------
+# S84: what a free/clear listener IS, declared by the listener itself.
+#
+# A page move (pdflip/d_kv_compact, S77-A KV-COMPACT) claims destination ids
+# from the free lists, copies, re-points the tree and frees the sources through
+# ``free()``. Whether a listener survives that depends on its semantics, not on
+# its existence: an id-SET filter that follows every free()/clear() (KvRowCap,
+# the KV stage cap) stays exact; a per-slot MIRROR (DFlash DraftKVSlotMapper)
+# keeps rows keyed by the old slot id and would silently point at the wrong
+# draft rows. The guard reads this marker; a listener WITHOUT one is unknown
+# and refuses the move (fail-closed, named) -- no guessing from names.
+LISTENER_ROLE_ATTR = "flliper_listener_role"
+LISTENER_OWNER_ATTR = "flliper_listener_owner"
+#: id-set filter: holds no per-slot payload, re-derives its set from the free
+#: lists on every free()/clear() (KvRowCap). Compatible with a page move whose
+#: destinations come from the free lists below its cap.
+LISTENER_ROLE_CAP_FILTER = "cap-filter"
+#: per-slot lifetime mirror: payload keyed by the slot id (DFlash
+#: DraftKVSlotMapper). A page move would orphan it -> refused.
+LISTENER_ROLE_SLOT_MIRROR = "slot-mirror"
+
+
+def mark_listener(fn, role: str, owner=None):
+    """Declare ``fn``'s listener role (and the object behind it); returns ``fn``."""
+    setattr(fn, LISTENER_ROLE_ATTR, role)
+    setattr(fn, LISTENER_OWNER_ATTR, owner)
+    return fn
+
+
+def listener_role(fn):
+    """The role ``fn`` declared through :func:`mark_listener`, or None (unknown)."""
+    return getattr(fn, LISTENER_ROLE_ATTR, None) if fn is not None else None
+
+
 class BaseTokenToKVPoolAllocator(abc.ABC):
     @abc.abstractmethod
     def __init__(

@@ -1581,7 +1581,7 @@ FIELD_CLASS: Dict[str, Tuple[str, str]] = {
     "inline_system_in_place": ("policy", "RG/MZ Agentenlast-Präfixschalter: am Agentenlast-Boot bewiesen"),
     "told_probe_tree_key": ("policy", "RG/TK Agentenlast-Präfixschalter"), "told_paced": ("policy", "RG/PX2 Agentenlast-Präfixschalter"),
     "p_twin_defer": ("policy", "RG/TW Agentenlast-Präfixschalter"), "front_span_inflight": ("policy", "RG/#49-Rest"),
-    "told_group_fallback": ("policy", "RG/PF: 27B nach Boot z30y14"),
+    "told_group_fallback": ("policy", "RG/PF: NF an seit 14.10. (h16g WIDTH GUARD), 27B nach Boot z30y14"),
     "vision": ("policy", "Sichtturm: 27B 'transient', NF 'off' -- beide tragen ein vision_config, es ist eine Bootwahl"),
     "records": ("policy", "Schlüssel der Messquellen: 27B mit Zeilen-Linie, NF ohne"),
     "early_read_flags": ("policy", "#1235 Frühlese-Flags: 27B TP-D"), "group_env": ("policy", "Gruppen-Env: NF uneven-DCP"),
@@ -1605,6 +1605,17 @@ FIELD_CLASS: Dict[str, Tuple[str, str]] = {
     "d_kv_token_cut": ("policy", "#239: NF 'owned'"), "handback_claim_n": ("policy", "HANDBACK N-1: 27B"),
     # INT8-Fixsatz (cand2-Merge 1005): Q-711 SHORT-KEPT-BOUND kam als ModelProfile-Feld in ``form.ModelProfile``
     "short_kept_max_wait_s": ("policy", "Q-711 SHORT-KEPT-BOUND: 27B-Zeile 30 s, NF 0 (aus), FLLIPER_PDFLIP_SHORT_KEPT_MAX_WAIT_S"),
+    # Felder, die nur die NF-Linie in ``form.ModelProfile`` führt (FIELD_CLASS ist die Vereinigung beider Linien, damit dieselbe
+    # Datei auf 27B und NF läuft; die Gleichheit "jedes Feld der Dataclass ist eingeordnet" prüft der Test einseitig)
+    "vision_arg_default": ("policy", "NF: ``--pdflip-vision`` ungesetzt = transient (nf-int4.env:229); 27B nennt das Flag im Profil"),
+    "p_anchor_presence": ("policy", "SCHALTER-HALBPORT 1002 K1: NF-Front-Schalter, am Metall bewiesen"),
+    "vision_flip_urgent": ("policy", "SCHALTER-HALBPORT 1002: NF-Front-Schalter 'VISION-FLIP-URGENT'"),
+    "bar1_canon_order": ("policy", "SCHALTER-HALBPORT 1002: BAR1 oneshot in kanonischer Rangfolge, NF"),
+    "census_o1_evict": ("policy", "SCHALTER-HALBPORT 1002: 'KR CENSUS-O1-EVICT', NF"),
+    # nf-boot-merge-1005b brachte drei weitere NF-Front-/Rang-Schalter in ``form.ModelProfile`` (Release-Merge 1005)
+    "front_park_collect_window": ("policy", "NF: FLLIPER_PDFLIP_ENABLE_PARK_COLLECT_WINDOW (z30y Sammelfenster), Front"),
+    "deposit_lane_lookahead": ("policy", "NF: FLLIPER_PDFLIP_DEPOSIT_LANE_LOOKAHEAD (H111b), Rang/weight_updater"),
+    "d_seat_rewake": ("policy", "NF: FLLIPER_PDFLIP_D_SEAT_REWAKE (SITZ-REWAKE 47539d581e), Front + D-Raenge"),
 }
 
 #: Standard der erzeugten Zeile für Pflichtfelder der Klasse ``policy`` (jedes andere Feld nimmt den Dataclass-Standard, Schalter aus)

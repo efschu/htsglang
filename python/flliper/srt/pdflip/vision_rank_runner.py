@@ -67,6 +67,7 @@ from flliper.srt.planner.vision_stage_load import (
     map_tower_param_name,
     tower_source_dir,
 )
+from flliper.srt.pdflip import rank_timing
 from flliper.srt.pdflip import vision_rank_stage as vrs
 from flliper.srt.pdflip import vision_verdict as _vv
 from flliper.srt.pdflip.vision_stage_service import (
@@ -260,11 +261,201 @@ def arm_ram_source(model_dir: str, env: Optional[Dict[str, str]] = None,
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# S66c EMB-CACHE: an image P encoded once is not encoded again
+# ---------------------------------------------------------------------------
+# rc17 boot 171636, P PP0, pdflip-6-245 / pdflip-8-254: P-KNOWN-IMAGE hit, told
+# 96768 (1512 pages; the store's KV is page/anchor-granular), image_end 96799
+# -- the last 31 image positions lie past the deepest cached page, so the told
+# cannot cover the image and the verdict is STAGE: pixel FETCH 1594-2963 ms
+# (ATTACHED wait_ms) plus the tower (~0.6 s) for 210 / 917 new tokens. The
+# rows of exactly these two images had been computed by this very rank one
+# turn earlier.
+#
+# Upstream SGLang keeps such rows in ``MultiModalStaticCache`` keyed by the
+# item's content hash (``mm_utils.embedding_cache``, ``get_single``/``set``,
+# consulted in ``_get_chunked_embedding_by_item`` before the ViT). On P that
+# path is never reached for a staged image: the transient stage decides
+# before the embed routine. So the stage keeps its rows in the SAME upstream
+# class (its own instance on PP0: the module global is re-made by
+# ``kv_cache_builder`` and sized for the in-model ViT path) and, when a
+# verdict says STAGE, attaches cached rows instead of fetching pixels and
+# loading the tower -- for every pending item or for none. Key: ``item.hash``
+# = ``hash_feature(pixels)``, the content hash the prefix is keyed with
+# (equal on the known-image path, S70 condition); the row count must equal
+# the item's placeholder count and the width the tower's ``out_hidden_size``.
+# Rows are stored and handed out as host copies (a request never shares its
+# rows tensor with the cache). Bounded in bytes, LRU.
+#
+# S66c-r B1 (review S66c): the content hash covers the pixel BYTES only, not
+# the grid -- a blank A4 page portrait (grid 1x84x60) and landscape (1x60x84)
+# hash alike (measured, Qwen2VLImageProcessor) and give 1260 rows each, while
+# the tower adds pos_embed interpolated to the grid: other rows. The identity
+# of an entry is therefore (hash, image_grid_thw): the key carries the grid,
+# the entry carries it again and the attach compares it; an item without a
+# readable grid is never stored nor served. (The radix shares such a page
+# only under a whole equal prefix, which pins the grid by the ids.)
+# ``FLLIPER_PDFLIP_VISION_EMB_CACHE_MB`` (default 1024; 0 = off).
+VISION_EMB_CACHE_ENV = "FLLIPER_PDFLIP_VISION_EMB_CACHE_MB"
+W_EMB_CACHE = "W102 PdFlipVisionStage EMB-CACHE"
+_EMB_CACHE = None
+
+
+def emb_cache(env: Optional[Dict[str, str]] = None):
+    """The stage's row cache (upstream ``MultiModalStaticCache``), or None when off."""
+    global _EMB_CACHE
+    e = os.environ if env is None else env
+    try:
+        mb = int(str(e.get(VISION_EMB_CACHE_ENV, "1024") or "1024").strip())
+    except ValueError:
+        mb = 1024
+    if mb <= 0:
+        return None
+    if _EMB_CACHE is None or int(_EMB_CACHE.max_size) != mb << 20:
+        from flliper.srt.mem_cache.multimodal_cache import MultiModalStaticCache
+
+        old = _EMB_CACHE
+        _EMB_CACHE = MultiModalStaticCache(mb << 20)
+        if old is not None:
+            for h, er in old.mm_cache.items():
+                _EMB_CACHE.set(h, er)
+    return _EMB_CACHE
+
+
+def _item_grid(it) -> Optional[Tuple[int, ...]]:
+    """The item's ``image_grid_thw`` as an int tuple, or None when it cannot be read."""
+    msd = getattr(it, "model_specific_data", None)
+    g = msd.get("image_grid_thw") if isinstance(msd, dict) else None
+    if g is None:
+        try:
+            g = getattr(it, "image_grid_thw", None)
+        except Exception:  # noqa: BLE001 -- MultimodalDataItem.__getattr__ may raise
+            g = None
+    if g is None:
+        return None
+    try:
+        flat = torch.as_tensor(g).reshape(-1).tolist()
+    except Exception:  # noqa: BLE001
+        return None
+    return tuple(int(x) for x in flat) if flat else None
+
+
+def _emb_key(h: Any, grid: Tuple[int, ...]) -> Tuple[int, Tuple[int, ...]]:
+    return (int(h), grid)
+
+
+def _item_rows(it) -> int:
+    offs = getattr(it, "offsets", None)
+    return sum(int(b) - int(a) + 1 for a, b in (() if offs is None else offs))
+
+
+def _tower_width(scheduler) -> Optional[int]:
+    hf = getattr(getattr(scheduler, "model_config", None), "hf_config", None)
+    vc = getattr(hf, "vision_config", None)
+    w = getattr(vc, "out_hidden_size", None)
+    if w is None:
+        return None
+    deep = getattr(vc, "deepstack_visual_indexes", None) or ()
+    return int(w) * (1 + len(deep))
+
+
+def emb_cache_store(items: Sequence[Any]) -> int:
+    """After an attach: keep each item's rows under its content hash. Returns how many."""
+    cache = emb_cache()
+    if cache is None:
+        return 0
+    from flliper.srt.mem_cache.multimodal_cache import EmbeddingResult
+
+    n = 0
+    for it in items:
+        h, rows = getattr(it, "hash", None), getattr(it, "precomputed_embeddings", None)
+        if h is None or not isinstance(rows, torch.Tensor) or rows.is_cuda or rows.dim() != 2:
+            continue
+        if int(rows.shape[0]) != _item_rows(it):
+            continue
+        grid = _item_grid(it)
+        if grid is None:
+            continue  # B1: no grid, no identity -- never stored
+        er = EmbeddingResult(embedding=rows.detach().clone())
+        er.pdflip_grid = grid
+        if cache.set(_emb_key(h, grid), er):
+            n += 1
+    return n
+
+
+def _note_grid_miss(scheduler, req, it, grid) -> None:
+    """H2: a hash that IS cached under another grid is named (the B1 collision class)."""
+    cache = emb_cache()
+    h = int(getattr(it, "hash"))
+    other = [k[1] for k in (cache.mm_cache.keys() if cache is not None else ()) if isinstance(k, tuple) and k[0] == h]
+    if not other:
+        return
+    scheduler._pdflip_vision_emb_grid_miss = getattr(scheduler, "_pdflip_vision_emb_grid_miss", 0) + 1
+    logger.info("%s GRID-MISS rid=%s hash=%d grid=%s cached_grids=%s n=%d (same pixel bytes, another grid: the "
+                "rows differ -- no attach)", W_EMB_CACHE, req.rid, h, list(grid), [list(g) for g in other],
+                scheduler._pdflip_vision_emb_grid_miss)
+
+
+def emb_cache_attach(scheduler, req) -> bool:
+    """A STAGE verdict: attach cached rows to EVERY pending item of ``req`` (True),
+    or touch nothing (False)."""
+    cache = emb_cache()
+    items = pending_items(req)
+    if cache is None or not items:
+        return False
+    width = _tower_width(scheduler)
+    rows = []
+    for it in items:
+        h = getattr(it, "hash", None)
+        grid = _item_grid(it)
+        er = cache.get_single(_emb_key(h, grid)) if (h is not None and grid is not None) else None
+        if er is not None and getattr(er, "pdflip_grid", None) != grid:
+            er = None  # B1 belt: the entry's own grid must equal the item's
+        if er is None and h is not None and grid is not None:
+            _note_grid_miss(scheduler, req, it, grid)
+        emb = getattr(er, "embedding", None)
+        if not isinstance(emb, torch.Tensor) or emb.dim() != 2 or emb.is_cuda:
+            return False
+        if int(emb.shape[0]) != _item_rows(it):
+            return False
+        if width is not None and int(emb.shape[1]) != width:
+            return False
+        rows.append(emb.clone())
+    w = width if width is not None else int(rows[0].shape[1])
+    saved = [(it.feature, it.precomputed_embeddings) for it in items]
+    try:
+        attach_precomputed_embeddings(items, rows, expected_width=w)
+    except Exception as exc:  # noqa: BLE001 -- H3: a named fall back to FETCH / STAGE, never half attached
+        for it, (f, pe) in zip(items, saved):
+            it.feature, it.precomputed_embeddings = f, pe
+        logger.warning("%s REFUSED rid=%s %s: %s -- the verdict falls back to FETCH / STAGE", W_EMB_CACHE,
+                       req.rid, type(exc).__name__, exc)
+        return False
+    scheduler._pdflip_vision_emb_hits = getattr(scheduler, "_pdflip_vision_emb_hits", 0) + 1
+    logger.info("%s HIT rid=%s items=%d rows=%d entries=%d bytes=%d n=%d (rows this rank encoded before, by "
+                "content hash: no pixel fetch, no tower)", W_EMB_CACHE, req.rid, len(items),
+                sum(int(r.shape[0]) for r in rows), len(cache), int(cache.current_size),
+                scheduler._pdflip_vision_emb_hits)
+    return True
+
+
+def pending_items(req) -> List[Any]:
+    """What PP0's vision pass still owes ``req`` (S66): the items with pixels
+    and no rows, plus the known images P's tokenizer sent without pixels
+    (``p_known_image``) -- those need a verdict before any rank admits it."""
+    from flliper.srt.pdflip import p_known_image as _pki
+
+    if getattr(req, "_pdflip_vision_skip", False):
+        return []
+    return unstaged_items(req) + _pki.featureless_items(req)
+
+
 def unstaged_items(req) -> List[Any]:
     if getattr(req, "_pdflip_vision_skip", False):
         return []  # W102 SKIP: every image position is inside the admitted prefix
     mm = getattr(req, "multimodal_inputs", None)
-    items = getattr(mm, "mm_items", None) or []
+    items = getattr(mm, "mm_items", None)
+    items = [] if items is None else items  # never truth-tested (tensor class, y7m)
     return [it for it in items
             if getattr(it, "precomputed_embeddings", None) is None
             and getattr(it, "feature", None) is not None]
@@ -288,17 +479,173 @@ def unstaged_items(req) -> List[Any]:
 W_STAGE_SKIP = "W102 PdFlipVisionStage SKIP"
 SKIP, WAIT, STAGE = "skip", "wait", "stage"
 
+# S66 PROBE-WAIT (NF rc15 boot 092806, P PP0, pdflip-12-340; review S63 (6)):
+# the images end at 20556, PP0's store probe answered 42240 at 10:08:06
+# (``PDFLIP-CLAIM-SHORT ... claimed=660 tokens=42240``, ``#257 PROBE-HOLD
+# pages=660``), yet the tower ran at 10:08:09 (load 251, encode 1675) and only
+# then came ``#1416d TOLD-PROBE told=42240``. A P that reads from the store
+# after its sleep holds NOTHING locally (prefix 0, host hit 0 at the vision
+# pass), and its told is published at the top of the pass AFTER the read
+# terminated -- for a dormant-held request only once the release has queued it
+# (pdflip_store_told, TK path 4), i.e. one pass after the vision pass that
+# found it. The local-WAIT above never fires there: every such image was
+# staged. rc15, three boots: 31 of 90 tower runs were for images inside the
+# prefix P then admitted (82.5 s of PP0, the stage is synchronous).
+#
+# Now (S66 + S66b, user order 19.10. "auch FETCH und Stage warten bis zum
+# told, wenn ein told aussteht"): a rid held by #1400 ALWAYS waits for its
+# told -- neither the tower nor a known-image pixel fetch runs before it. The
+# WAIT names why (src): PP0's own store read covers the image (``probe``: the
+# anchor-clamped answer ``note_probe_hit`` on the registration head, the
+# number the told reuses; ``read``: the completed prefix), a fork twin held
+# without a read (``twin-deferred``), a probe not answered yet
+# (``probe-pending``), or the probe short of the image (``told-pending``).
+# In the paced form (#1416e) the rid waits for its Admit while the Admit can
+# still reach the image: told >= image_end, or an S64 raise may still come
+# (``paced-raise``); it stages at once only when no raise can come. WAIT
+# never skips: SKIP stays ``told >= image_end``, the admission belt
+# (:func:`skip_still_covered`) stays. The admission cannot take the request
+# before its told anyway (``pdflip_store_told_pending``), so a WAIT costs no
+# admission pass -- only the overlap of a tower the told then still needs
+# with the read. PP0 alone decides; the followers hold the request until
+# PP0's verdict reaches them (H125f).
+VISION_PROBE_WAIT_ENV = "FLLIPER_PDFLIP_VISION_PROBE_WAIT"
+W_PROBE_WAIT = "W102 PdFlipVisionStage PROBE-WAIT"
+
+
+def probe_wait_on(scheduler=None, env: Optional[Dict[str, str]] = None) -> bool:
+    """S66 (default on): resolved once per scheduler -- PP0 alone reads it."""
+    cached = getattr(scheduler, "_pdflip_vision_probe_wait_on", None) if scheduler is not None else None
+    if cached is not None:
+        return bool(cached)
+    e = os.environ if env is None else env
+    on = str(e.get(VISION_PROBE_WAIT_ENV, "1") or "1").strip().lower() not in ("0", "false", "no", "off")
+    if scheduler is not None:
+        try:
+            scheduler._pdflip_vision_probe_wait_on = on
+        except Exception:  # noqa: BLE001 -- a frozen double keeps no cache
+            pass
+    return on
+
+
+def probe_promise(scheduler, req) -> Tuple[Optional[int], str]:
+    """(depth, source): the absolute token depth PP0's own store read promises
+    for ``req`` before its told -- the larger of the read's completed prefix
+    (``completed_prefetch_tokens``: head + loaded) and the probe's
+    anchor-clamped answer on the registration head
+    (``_prefetch_registered_prefix_len`` + hit pages x page size). ``None``
+    when neither has said anything yet."""
+    rid = str(getattr(req, "rid", ""))
+    tree = getattr(scheduler, "tree_cache", None)
+    best: Optional[int] = None
+    src = "none"
+    fn = getattr(tree, "completed_prefetch_tokens", None)
+    if callable(fn):
+        try:
+            v = fn(rid)
+        except Exception:  # noqa: BLE001 -- an accelerator, never a wall
+            v = None
+        if v is not None:
+            best, src = int(v), "read"
+    cc = getattr(scheduler, "cache_controller", None) or getattr(tree, "cache_controller", None)
+    hits = getattr(cc, "_pdflip_probe_hit_pages", None) if cc is not None else None
+    pages = hits.get(rid) if isinstance(hits, dict) else None
+    if pages is not None:
+        page = int(getattr(cc, "page_size", 1) or 1)
+        head = int(getattr(req, "_prefetch_registered_prefix_len", 0) or 0)
+        v = head + int(pages) * page
+        if best is None or v > best:
+            best, src = v, "probe"
+    return best, src
+
+
+def _read_open(scheduler, rid: str) -> bool:
+    tree = getattr(scheduler, "tree_cache", None)
+    fn = getattr(tree, "prefetch_is_ongoing", None)
+    if callable(fn):
+        try:
+            return bool(fn(rid))
+        except Exception:  # noqa: BLE001
+            return False
+    return rid in (getattr(tree, "ongoing_prefetch", None) or {})
+
+
+def _probe_wait(scheduler, req, end: int) -> Optional[Tuple[int, str]]:
+    """S66: (covered, source) when PP0 waits for an outstanding told on its own
+    store probe, else None."""
+    if not probe_wait_on(scheduler):
+        return None
+    rid = str(getattr(req, "rid", ""))
+    # #1416e paced form (NF rc16, boot 121629, pdflip-2-9: PACED-TOLD
+    # told=171776, images end ~21k, the tower ran anyway): between the
+    # read-ahead and PP0's PdFlipStoreAdmit the rid has left ``held`` for
+    # ``pacing``, the told is known there and ``_pdflip_store_told`` is still
+    # empty -- the admission waits for the Admit, so the verdict does too (the
+    # Admit's told, maybe a fallback 0 or a floor, decides SKIP or STAGE)
+    pace = (getattr(scheduler, "_pdflip_told_pacing", None) or {}).get(rid)
+    if pace is not None:
+        p_told = int(getattr(pace, "told", 0) or 0)
+        if p_told >= end:
+            return p_told, "paced"
+        # S66b A1 (review S66b): the Admit does NOT only lower the read-ahead told -- the S64 S-1400 (b) raise
+        # (pdflip_told_raise, default on) admits told_final > p.told, the depth every follower proved. While a
+        # raise can still come the verdict waits for the Admit; the wait is bounded by the paced machinery itself
+        # (window, PF Frist, FLLIPER_PDFLIP_S64_TOLD_RAISE_WAIT_S): the Admit pops the rid from pacing and sets the
+        # told. Stage at once only when no raise can come (switch off, or this rid's one raise attempt failed).
+        raise_pending = False
+        try:
+            from flliper.srt.managers import pdflip_told_raise as _raise
+
+            if _raise.raise_on():
+                rs = (getattr(scheduler, _raise._ATTR, None) or {}).get(rid)
+                raise_pending = rs is None or getattr(rs, "state", "") != "failed"
+                if rs is not None and getattr(rs, "state", "") in ("issued", "done") and int(rs.target) < end:
+                    raise_pending = False  # the one raise of this rid targets a depth short of the image
+        except Exception:  # noqa: BLE001 -- unknown: wait for the Admit, it is bounded
+            raise_pending = True
+        if raise_pending:
+            return p_told, "paced-raise"
+        return None
+    held = getattr(scheduler, "_pdflip_store_held", None)
+    if not isinstance(held, dict) or rid not in held:
+        return None  # no #1400 verdict is coming for it: nothing to wait for
+    # S66b (NF rc17 boot 171636, P PP0, pdflip-1-13): a fork twin (#TW) is held by #1400 WITHOUT a store read until
+    # its sibling finished -- no probe, no open read -- so the probe rule above staged it: KNOWN-IMAGE FETCH
+    # 17:21:35 (covered=0 src=local), pixels 1879 ms, tower 17:21:40, and only at 17:21:52 the sibling's finish
+    # released the twin: told=81664 >= image_end 72215, P computed 61 tokens. Whatever PP0's own read says, the told
+    # decides and the admission takes nothing before it: while it is outstanding neither the stage nor the pixel
+    # fetch runs (user order 19.10.: "auch FETCH und Stage warten bis zum told, wenn ein told aussteht").
+    depth, src = probe_promise(scheduler, req)
+    if depth is not None and depth >= end:
+        return depth, src
+    try:
+        from flliper.srt.pdflip import p_twin_defer as _twin
+
+        if _twin.is_deferred(scheduler, rid):
+            return 0, "twin-deferred"
+    except Exception:  # noqa: BLE001 -- the told-pending wait below holds it anyway
+        pass
+    if depth is None and _read_open(scheduler, rid):
+        return 0, "probe-pending"
+    return (0 if depth is None else int(depth)), "told-pending"
+
 
 def stage_skip_verdict(scheduler, req) -> Tuple[str, int, str]:
     """(verdict, covered, source): ``skip`` when every image position of
-    ``req`` lies inside the prefix this group admits it with, ``wait`` while a
-    store-told is outstanding and the rank's own match covers the image,
-    ``stage`` otherwise."""
+    ``req`` lies inside the prefix this group admits it with (the told);
+    ``wait`` while a store-told is outstanding -- a rid held by #1400 always
+    waits for its told (S66b), a paced rid for its Admit while the Admit can
+    still reach the image (S66b A1) -- or the rank's own match covers the
+    image; ``stage`` otherwise."""
     from flliper.srt.pdflip.vision_d_guard import image_end
 
     end = image_end(req)
     if not end:
         return STAGE, 0, "none"
+    if getattr(req, "_pdflip_vision_skip_refuted", False):
+        # S66: the admission refuted a skip of this request once -- the next
+        # verdict stages it (before, the same told re-skipped it every pass)
+        return STAGE, 0, "refuted"
     # prefix_indices is a tensor on the cached path: `tensor or ()` raises on an empty one (y7m 13:17Z P death)
     _pi = getattr(req, "prefix_indices", None)
     local = ((0 if _pi is None else len(_pi))
@@ -309,6 +656,9 @@ def stage_skip_verdict(scheduler, req) -> Tuple[str, int, str]:
             return (SKIP if int(told) >= end else STAGE), int(told), "told"
         if local >= end:
             return WAIT, local, "local"
+        pw = _probe_wait(scheduler, req, end)
+        if pw is not None:
+            return WAIT, pw[0], pw[1]
         return STAGE, local, "local"
     return (SKIP if local >= end else STAGE), local, "local"
 
@@ -318,6 +668,8 @@ def skip_cached(scheduler, pending: Sequence[Any]) -> Tuple[List[Any], List[Any]
     hold one pass); a request every image position of which is covered is
     marked skipped and leaves both."""
     from flliper.srt.pdflip.vision_d_guard import image_end
+
+    from flliper.srt.pdflip import p_known_image as _pki
 
     stage, wait = [], []
     for r in pending:
@@ -329,10 +681,46 @@ def skip_cached(scheduler, pending: Sequence[Any]) -> Tuple[List[Any], List[Any]
                         "every image position lies in the prefix this group admits)",
                         W_STAGE_SKIP, r.rid, covered, src, image_end(r))
         elif v == WAIT:
+            if src not in ("local",):
+                _note_probe_wait(scheduler, r, covered, src)
+            wait.append(r)
+        elif emb_cache_attach(scheduler, r):
+            # S66c: rows this rank encoded before -- the request is staged without the tower
+            pass
+        elif _pki.featureless_items(r):
+            # S66 P-KNOWN-IMAGE: P's tokenizer built this request from known
+            # images without pixels; the verdict needs the tower, so the
+            # pixels are fetched first and the request is held until they are
+            # attached (or refused by name) -- never admitted without rows
+            _pki.request_features(scheduler, r, covered=covered, src=src)
             wait.append(r)
         else:
             stage.append(r)
     return stage, wait
+
+
+def _note_probe_wait(scheduler, req, covered: int, src: str) -> None:
+    """One line per rid and source (a wait lasts a pass or a few)."""
+    from flliper.srt.pdflip.vision_d_guard import image_end
+
+    said = getattr(scheduler, "_pdflip_vision_probe_wait_said", None)
+    if said is None:
+        said = {}
+        try:
+            scheduler._pdflip_vision_probe_wait_said = said
+        except Exception:  # noqa: BLE001
+            return
+    key = (str(req.rid), src)
+    if key in said:
+        return
+    said[key] = True
+    while len(said) > 1024:
+        said.pop(next(iter(said)))
+    scheduler._pdflip_vision_probe_waits = getattr(scheduler, "_pdflip_vision_probe_waits", 0) + 1
+    logger.info("%s rid=%s promise=%d src=%s image_end=%d n=%d (told outstanding; PP0's own store "
+                "read covers the image -- the verdict waits for the told, the tower does not run "
+                "ahead of it)", W_PROBE_WAIT, req.rid, covered, src, image_end(req),
+                scheduler._pdflip_vision_probe_waits)
 
 
 def skip_still_covered(scheduler, req) -> bool:
@@ -348,6 +736,7 @@ def skip_still_covered(scheduler, req) -> bool:
     if covered >= end:
         return True
     req._pdflip_vision_skip = False
+    req._pdflip_vision_skip_refuted = True  # S66: the next verdict stages, it does not re-skip
     logger.warning("%s-REFUTED rid=%s covered=%d image_end=%d (the admitted prefix ends before "
                    "an image position: the tower is staged in the next pass)",
                    W_STAGE_SKIP, req.rid, covered, end)
@@ -655,11 +1044,23 @@ class StageOutcome:
     host_current_delta: str = "n/a"
     host_anon_delta: str = "n/a"
     legs_ms: Dict[str, float] = field(default_factory=dict)
+    #: 02.10. (dashboard phase list, rank_timing.note_vision_run): each leg's
+    #: wall-clock (start, end) -- legs_ms keeps the perf_counter durations
+    legs_wall: Dict[str, Tuple[float, float]] = field(default_factory=dict)
     teardown_ms: Dict[str, float] = field(default_factory=dict)
     encode_ms: Dict[str, float] = field(default_factory=dict)
     #: 27B review of H125e: the wait for PP0's last forward before a tower in
     #: free VRAM (None: not asked -- the tower sat on the KV tail)
     sync_ms: Optional[float] = None
+    #: VISION-GC-SKIP-1002: "skipped" (every tower tensor dead after the
+    #: strip) | "full" (gc.collect ran) | "" (nothing built); the tensors
+    #: still alive after the strip, before any gc
+    gc_mode: str = ""
+    gc_alive: int = 0
+    #: VISION-LOAD-WARM-1002: bytes the read took from the host cache, and
+    #: whether the tower's index came from the per-rank cache
+    cached_bytes: int = 0
+    index_cached: bool = False
     #: VISION-WEIGHTS: the W102 additions of a weights stage, the checksum
     #: verdict, the encode's measured allocator peak vs its planned work, the
     #: host-RAM line, and -- non-empty = W110c -- the FATAL non-return
@@ -669,12 +1070,6 @@ class StageOutcome:
     planned_work_bytes: Optional[int] = None
     victim_host_line: str = ""
     fatal: str = ""
-    #: VISION-GC-SKIP (AP5, ported from NF c651892375, weights stage only):
-    #: "skipped" (every tower tensor dead after the strip) | "full" (gc.collect
-    #: ran) | "" (not a weights stage: the full gc as before); the tensors
-    #: still alive after the strip, before any gc
-    gc_mode: str = ""
-    gc_alive: int = 0
 
 
 class _StageDeadline(vrs.VisionRankStageRefused):
@@ -829,7 +1224,18 @@ def run_rank_stage(scheduler, reqs: Sequence[Any], *, model_dir: str, hf_config:
     # stream joins below) -- the survivors are judged against these
     blocks0 = live_blocks(device) if on_card else None
     own_streams = [_stream_id(torch.cuda.current_stream(device))] if on_card else []
+    # 02.10.: the live leg and each leg's wall clock for the dashboard (IPC via
+    # rankstats ``vision``); a handful of dict operations, no sync
+    run_no = int(getattr(scheduler, "_pdflip_vision_runs", 0) or 0)
+    rids = [str(getattr(r, "rid", "?")) for r in reqs]
+
+    def _enter(name: str) -> float:
+        w = time.time()
+        rank_timing.note_vision_leg(run_no, name, rids, w)
+        return w
+
     leg, t0 = "items", clock()
+    w0 = _enter("build")
     try:
         try:
             non_image = [it for it in items if not it.is_image()]
@@ -853,7 +1259,9 @@ def run_rank_stage(scheduler, reqs: Sequence[Any], *, model_dir: str, hf_config:
                         raise
                     tail_why = f"no KV tail to place on ({exc})"
             out.legs_ms["build"] = (clock() - t0) * 1e3
+            out.legs_wall["build"] = (w0, time.time())
             leg, t0 = "reserve", clock()
+            w0 = _enter("reserve")
             if on_card:
                 # A freed page may still be read by forward work queued before
                 # it was freed; nothing of the tower lands on it before that
@@ -895,14 +1303,18 @@ def run_rank_stage(scheduler, reqs: Sequence[Any], *, model_dir: str, hf_config:
                 segments = [slab]
                 logger.info("%s place=free on PP0 (%s)%s", W_STAGE_OK, why,
                             f" -- {tail_why}" if tail_why else "")
+            out.legs_wall["reserve"] = (w0, time.time())
             _check_deadline(deadline_s, t_stage0, clock, "load")
             leg, t0 = "load", clock()
+            w0 = _enter("load")
             views = vrs.place_parameters(
                 module, lease.slab() if lease is not None else vrs.SlabAllocator(segments))
             segments = None
-            shard = find_tower_shard(model_dir)
-            ck_tensors, ck_name = vrs.checkpoint_tensors(shard, is_vision_weight), _tower_name
-            if lease is not None:  # a row-split tower (AP2) reads its pieces
+            # VISION-LOAD-WARM-1002: the 47-shard index + header once per rank
+            shard, ck_tensors, out.index_cached = vrs.tower_index(
+                model_dir, find_tower_shard, is_vision_weight)
+            ck_name = _tower_name
+            if lease is not None:  # VISION-WEIGHTS: a row-split tower (AP2) reads its pieces
                 ck_tensors, ck_name = vv.split_checkpoint(ck_tensors, lease.split, _tower_name)
             plan = vrs.plan_checkpoint_into(views, ck_tensors, ck_name)
             src = source if source is not None else vrs.disk_source(shard)
@@ -920,11 +1332,14 @@ def run_rank_stage(scheduler, reqs: Sequence[Any], *, model_dir: str, hf_config:
             stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
             own_streams.append(_stream_id(stream))
             rep = vrs.read_into(src.path, vrs.shift_plan(plan, src.shift), stream=stream,
-                                direct=src.direct)
+                                direct=src.direct, cached_first=load_warm_on())
             out.read_bytes, out.direct = rep.bytes_read, rep.direct
+            out.cached_bytes = rep.cached_bytes
             out.legs_ms["load"] = (clock() - t0) * 1e3
+            out.legs_wall["load"] = (w0, time.time())
             _check_deadline(deadline_s, t_stage0, clock, "encode")
             leg, t0 = "encode", clock()
+            w0 = _enter("encode")
             peak0 = vv.encode_peak_start(device) if lease is not None else None
             with torch.inference_mode(), attention_backend_scope(backend):
                 rows = encode(module, items)
@@ -938,9 +1353,13 @@ def run_rank_stage(scheduler, reqs: Sequence[Any], *, model_dir: str, hf_config:
             # inference mode.
             rows = [r.clone() if r.is_inference() else r for r in rows]
             out.legs_ms["encode"] = (clock() - t0) * 1e3
+            out.legs_wall["encode"] = (w0, time.time())
             leg, t0 = "attach", clock()
+            w0 = _enter("attach")
             attach_precomputed_embeddings(items, rows, expected_width=int(module.out_hidden_size))
+            emb_cache_store(items)  # S66c: kept by content hash for the next turn
             out.legs_ms["attach"] = (clock() - t0) * 1e3
+            out.legs_wall["attach"] = (w0, time.time())
         except Exception as exc:  # noqa: BLE001 -- every seam is a named verdict
             out.ok = False
             out.code = (W_NO_ROOM if leg == "reserve"
@@ -961,6 +1380,12 @@ def run_rank_stage(scheduler, reqs: Sequence[Any], *, model_dir: str, hf_config:
         refs = [weakref.ref(v) for v in (views or {}).values() if isinstance(v, torch.Tensor)]
         if slab is not None:
             refs.append(weakref.ref(slab))
+        w0 = _enter("teardown")
+        # VISION-GC-SKIP-1002: every tensor the tower held, weakly -- the full
+        # gc.collect below runs only when one of them is still alive after
+        # the strip (a cycle or a traceback holds it)
+        refs = [] if slab is None else [weakref.ref(slab)]
+        refs.extend(weakref.ref(v) for v in (views or {}).values() if isinstance(v, torch.Tensor))
         views = plan = rows = segments = slab = None
         if module is not None:
             refs.extend(_strip_module(module))
@@ -968,15 +1393,14 @@ def run_rank_stage(scheduler, reqs: Sequence[Any], *, model_dir: str, hf_config:
         for key in set(rope_factory._ROPE_DICT) - rope_keys:
             rope_factory._ROPE_DICT.pop(key, None)
         _tg = clock()
-        if touched and place == vrs.PLACE_WEIGHTS:
+        if touched:
             out.gc_alive = sum(1 for r in refs if r() is not None)
-            if out.ok and out.gc_alive == 0:
+            # 27B weights stage: the skip as ported (AP5); every other place: NF VISION-GC-SKIP-1002 (switch)
+            if out.ok and out.gc_alive == 0 and (place == vrs.PLACE_WEIGHTS or gc_skip_on()):
                 out.gc_mode = "skipped"
             else:
                 gc.collect()
                 out.gc_mode = "full"
-        elif touched:
-            gc.collect()
         _ts = clock()
         if on_card and touched:
             # The encode ran on this stream and the read's copies are already
@@ -991,6 +1415,7 @@ def run_rank_stage(scheduler, reqs: Sequence[Any], *, model_dir: str, hf_config:
             torch.cuda.empty_cache()
         _t1 = clock()
         out.legs_ms["teardown"] = (_t1 - t0) * 1e3
+        out.legs_wall["teardown"] = (w0, time.time())
         # (d) Befund 28.09.: where the 370-470 ms teardown goes (strip, gc,
         # stream sync, tail return, empty_cache) -- instrument only.
         out.teardown_ms = {"strip": (_tg - t0) * 1e3, "gc": (_ts - _tg) * 1e3,
@@ -1013,14 +1438,16 @@ def _strip_module(module: torch.nn.Module) -> List["weakref.ref"]:
     """Drop every parameter (the views), buffer (the rope cache) and plain
     tensor attribute the tower holds; the module object itself may live on
     in a cycle (graph_runners -> module) until a gc, empty. Returns a weak
-    reference to each tensor dropped (VISION-GC-SKIP, NF c651892375: all dead
-    = no tensor of the tower survives, the full ``gc.collect`` is not
-    needed)."""
+    reference to each tensor dropped (VISION-GC-SKIP-1002: all dead = no
+    tensor of the tower survives, the full ``gc.collect`` is not needed)."""
     refs: List[weakref.ref] = []
 
     def _drop(t: Any) -> None:
         if isinstance(t, torch.Tensor):
-            refs.append(weakref.ref(t))
+            try:
+                refs.append(weakref.ref(t))
+            except TypeError:  # pragma: no cover -- every torch.Tensor is weakref-able
+                pass
 
     for mod in list(module.modules()):
         for name in list(mod._parameters):
@@ -1036,7 +1463,28 @@ def _strip_module(module: torch.nn.Module) -> List["weakref.ref"]:
     return refs
 
 
+def gc_skip_on() -> bool:
+    """VISION-GC-SKIP-1002 (default on): the teardown skips the full
+    ``gc.collect`` when every tensor of the tower is already dead."""
+    from flliper.srt.environ import envs
+
+    return bool(envs.FLLIPER_PDFLIP_ENABLE_VISION_GC_SKIP.get())
+
+
+def load_warm_on() -> bool:
+    """VISION-LOAD-WARM-1002 (default on): the front warms the host cache with
+    the tower extent at an image arrival; the stage reads each chunk from that
+    cache when it holds it whole (``RWF_NOWAIT``), else O_DIRECT as before."""
+    from flliper.srt.environ import envs
+
+    return bool(envs.FLLIPER_PDFLIP_ENABLE_VISION_LOAD_WARM.get())
+
+
 def log_outcome(out: StageOutcome, rids: Sequence[str], run: int) -> None:
+    # 02.10.: the stage as IPC (rankstats ``vision``) for the dashboard phase list
+    rank_timing.note_vision_run(run, ok=out.ok, code=out.code, rids=rids, legs_wall=out.legs_wall,
+                                legs_ms=out.legs_ms, tower_bytes=out.tower_bytes,
+                                place=out.place, card=out.card)
     legs = ", ".join(f"{k} {v:.0f}" for k, v in out.legs_ms.items())
     residue = "n/a" if out.residue_bytes is None else f"{out.residue_bytes / vrs.MIB:+.1f}"
     torch_res = ("n/a" if out.torch_residue_bytes is None
@@ -1057,11 +1505,15 @@ def log_outcome(out: StageOutcome, rids: Sequence[str], run: int) -> None:
         line += " encode_split_ms=(%s) teardown_split_ms=(%s)" % (
             ", ".join(f"{k} {v:.0f}" for k, v in out.encode_ms.items()),
             ", ".join(f"{k} {v:.0f}" for k, v in out.teardown_ms.items()))
+    if out.gc_mode or out.read_bytes:
+        # VISION-GC-SKIP-1002 / VISION-LOAD-WARM-1002
+        line += (f" gc={out.gc_mode or 'none'} gc_alive={out.gc_alive} "
+                 f"read_cached_mib={out.cached_bytes / vrs.MIB:.1f} "
+                 f"index={'cached' if out.index_cached else 'parsed'}")
     if out.victim_fields:  # VISION-WEIGHTS: only a weights stage adds these
         line += (f" {out.victim_fields} checksum={out.checksum or 'n/a'} "
                  f"encode_peak_mib={_mib_or_na(out.encode_peak_bytes)} "
-                 f"planned_work_mib={_mib_or_na(out.planned_work_bytes)} "
-                 f"gc={out.gc_mode or 'none'} gc_alive={out.gc_alive}")
+                 f"planned_work_mib={_mib_or_na(out.planned_work_bytes)}")
     if out.ok:
         logger.info("%s %s rids=%s", W_STAGE_OK, line, list(rids))
     else:
@@ -1126,11 +1578,18 @@ VISION_ASYNC_ENV = "FLLIPER_PDFLIP_VISION_ASYNC"
 
 
 def vision_async_on(env: Optional[Dict[str, str]] = None) -> bool:
-    """(d) default ON: the tower's read + encode run on a worker thread and
-    their own CUDA stream while the scheduler keeps passing; ``0`` = the
-    synchronous stage of H125e byte for byte."""
+    """(d) ``1``: the tower's read + encode run on a worker thread and their own
+    CUDA stream while the scheduler keeps passing (a KV-tail lease held across
+    passes). Default OFF for every profile -- VISION-SYNC LAW (user 02.10.
+    ~08:00Z, both lines): vision runs ONLY synchronously, BEFORE the real
+    prefill; spare VRAM goes to MoE experts (NF) and the L15 cache (27B), never
+    to a vision tower that sits there across passes. Until then the stage was
+    synchronous only because :func:`vision_async_admissible` refused without
+    FLLIPER_PDFLIP_P_ROW_VISION_ASYNC; the launcher now refuses either switch on
+    (``launcher.vision_async_refusal``). Unset/``0`` = the synchronous stage
+    of H125e byte for byte. The async code stays (not reachable by default)."""
     e = os.environ if env is None else env
-    return str(e.get(VISION_ASYNC_ENV, "1")).strip().lower() not in ("0", "false", "no", "off")
+    return str(e.get(VISION_ASYNC_ENV, "0")).strip().lower() not in ("", "0", "false", "no", "off")
 
 
 #: the async stage withholds an image request on PP0 for several passes; that
@@ -1315,6 +1774,7 @@ def finish_async_stage(st: AsyncStage, clock: Callable[[], float] = time.perf_co
         out.encode_ms = dict(getattr(st.module, "_pdflip_encode_ms", {}) or {})
         t0 = clock()
         attach_precomputed_embeddings(st.items, rows, expected_width=int(st.module.out_hidden_size))
+        emb_cache_store(st.items)  # S66c
         out.legs_ms["attach"] = (clock() - t0) * 1e3
     except Exception as exc:  # noqa: BLE001 -- a named verdict, as the sync stage
         out.ok = False
@@ -1372,7 +1832,7 @@ def vision_rank_pass(scheduler) -> List[Tuple[int, Any]]:
     refused = scheduler._pdflip_vision_refused
     if refused:
         refused.intersection_update({r.rid for r in wq})  # an aborted rid leaves the set
-    pending = [r for r in wq if r.rid not in refused and unstaged_items(r)]
+    pending = [r for r in wq if r.rid not in refused and pending_items(r)]
     held = [r for r in wq if r.rid in refused]
     if pending:
         # W102 SKIP: a cached image needs no tower; one whose told is still
@@ -1475,7 +1935,9 @@ def vision_rank_pass(scheduler) -> List[Tuple[int, Any]]:
     # holds it here like every follower does in vision_verdict.follower_pass,
     # and all of them release it in the pass that absorbs the verdict.
     if getattr(scheduler, "_pdflip_vision_gate", False):
-        _vv.queue_verdicts(scheduler, wq, unstaged_items, scheduler._pdflip_vision_refused)
+        # S66: a known image without pixels is pending too -- no verdict on the
+        # wire before PP0 skipped it or staged it (the followers hold it alike)
+        _vv.queue_verdicts(scheduler, wq, pending_items, scheduler._pdflip_vision_refused)
         held = held + _vv.gate_held(scheduler, wq, held)
     if not held:
         return []

@@ -818,7 +818,7 @@ def build_flip_quiescence_fn(scheduler) -> Callable[[], bool]:
                 "(cutover-full-reset design). The strict hold that livelocked "
                 "tp_to_pp on 2026-09-01 is deleted.",
                 LOG_PREFIX,
-                str(getattr(chunked, "rid", "?"))[:8],
+                str(getattr(chunked, "rid", "?")),
             )
         # #631 DEFECT L, and it is the SAME CATEGORY ERROR as the
         # _pp_microbatches_drained one two paragraphs down -- found the
@@ -1481,7 +1481,7 @@ def cutover_resident_set(scheduler, armed_snapshot=None):
             continue
         out.append(req)
         report["carried_from_arm"] += 1
-        report["carried_rids"].append(str(getattr(req, "rid", "?"))[:8])
+        report["carried_rids"].append(str(getattr(req, "rid", "?")))
     return out, report
 
 

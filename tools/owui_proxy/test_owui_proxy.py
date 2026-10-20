@@ -23,6 +23,7 @@ class FakeBackend:
         self.model = model
         self.up = True
         self.requests = []
+        self.xff = []          # X-Forwarded-For of every request the backend got
 
     def app(self):
         app = web.Application()
@@ -72,6 +73,7 @@ class FakeBackend:
             return web.Response(status=502)
         body = await request.json()
         self.requests.append(body)
+        self.xff.append(request.headers.get("X-Forwarded-For"))
         resp = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
         await resp.prepare(request)
         sent = 0
@@ -223,3 +225,47 @@ def test_client_gone_is_not_resumed(tmp_path):
             await brun.cleanup()
         return b.requests
     assert len(asyncio.run(go())) == 1
+
+
+def test_front_gets_the_client_address_in_x_forwarded_for(tmp_path):
+    """08.10.: the front sees only the proxy as peer; the origin IP of a session reaches it in X-Forwarded-For, also on a resume
+    after a backend break.  A value the client already sent stays in front of the peer."""
+    async def go(extra):
+        b = FakeBackend(die_after=3)
+        brun, bport = await _serve(b.app())
+        cfg = owui_proxy.Cfg("http://127.0.0.1:%d" % bport, 10, 0.2, 0.1, str(tmp_path / "m.json"), 4)
+        prun, pport = await _serve(owui_proxy.build_app(cfg))
+        try:
+            async with aiohttp.ClientSession() as s:
+                body = {"model": "x", "stream": True, "messages": [{"role": "user", "content": "hi"}]}
+                async with s.post("http://127.0.0.1:%d/v1/chat/completions" % pport, json=body, headers=extra) as r:
+                    await r.read()
+        finally:
+            await prun.cleanup()
+            await brun.cleanup()
+        return b.xff
+    assert asyncio.run(go({})) == ["127.0.0.1", "127.0.0.1"]                          # the first leg and the resume
+    assert asyncio.run(go({"X-Forwarded-For": "10.1.2.3"}))[0] == "10.1.2.3, 127.0.0.1"
+
+
+def test_held_request_gets_x_forwarded_for_too(tmp_path):
+    async def go():
+        seen = []
+
+        async def echo(request):
+            seen.append(request.headers.get("X-Forwarded-For"))
+            return web.json_response({"ok": True})
+        up = web.Application()
+        up.router.add_get("/v1/models", FakeBackend().models)
+        up.router.add_post("/v1/embeddings", echo)
+        brun, bport = await _serve(up)
+        cfg = owui_proxy.Cfg("http://127.0.0.1:%d" % bport, 10, 0.2, 0.1, str(tmp_path / "m.json"), 2)
+        prun, pport = await _serve(owui_proxy.build_app(cfg))
+        try:
+            async with aiohttp.ClientSession() as s:
+                await (await s.post("http://127.0.0.1:%d/v1/embeddings" % pport, json={"input": "x"}, headers={"X-Forwarded-For": "10.9.9.9"})).read()
+        finally:
+            await prun.cleanup()
+            await brun.cleanup()
+        return seen
+    assert asyncio.run(go()) == ["10.9.9.9, 127.0.0.1"]
