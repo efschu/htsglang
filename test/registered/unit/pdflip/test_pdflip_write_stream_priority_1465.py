@@ -36,7 +36,9 @@ class Test1465(unittest.TestCase):
 
     def test_flush_drain_stamp_is_before_the_return(self):
         src = inspect.getsource(urc.UnifiedRadixCache.writing_check)
-        a = src.index("assert len(self.ongoing_write_through) == 0")
+        # S108 A1: the drain no longer asserts an EMPTY in-flight set (turn-end copies stay in flight,
+        # polled, never waited for); the stamp still follows the drain loop and precedes the return
+        a = src.index("cc.ack_write_queue[0:0] = keep")
         stamp = src.index("#1465 WRITE-BACK DRAIN")
         ret = src.index("            return\n", a)
         self.assertLess(a, stamp)

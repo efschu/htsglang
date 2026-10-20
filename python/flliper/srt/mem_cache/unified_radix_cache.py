@@ -3193,6 +3193,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self._pdflip_mark_park_end(req, radix_key)   # PARK-END-ANCHOR-FIRST (park_running only)
             self._pdflip_stamp_lane(req, radix_key)      # LANE-ANCHOR-RANK (lane >= 1 only)
             self._pdflip_publish_at_retain(req, radix_key)
+            UnifiedRadixCache._s108_turn_end_l2(self, req, radix_key)   # S108: D -- the finished turn to L2 now, async
         else:
             self.token_to_kv_pool_allocator.free(kv_indices[req.cache_protected_len :])
 
@@ -4778,7 +4779,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 # stop (form_a_host_shadow.K21RankDivergence). The peel frees nothing here and
                 # moves on to the same next leaf everywhere.
                 node._k21_orphan_ack = False
-                self.writing_check(write_back=True)
+                UnifiedRadixCache._s108_drain_own(self, node.id)   # S108 A1: this node's own ack
                 if getattr(node, "_k21_orphan_ack", False) or node.evicted or not node.backuped:
                     node._k21_orphan_ack = False
                     UnifiedRadixCache._k21_note_skip(self, node)
@@ -5891,10 +5892,24 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         node a full arena still refuses spills a releasable anchor without
         park reference to L3 (see :meth:`_pdflip_park_spill_room`). Without a
         marked park the second step is not entered: the H19 answer stands."""
+        if self.__dict__.get("_s108_turn_end_active", False):
+            # S108 review A2: a turn end claims an anchor slot only into FREE room -- no H19
+            # displacement (_pdflip_release_anchor -> drop_unreferenced -> _secure_before_drop ->
+            # arena_secure_to_disk: stat, 56 MiB write + fsync), no park spill. No room = None.
+            return self._s108_mamba_free_claim(mp, last_hash)
         mrows = self._pdflip_mamba_claim_h19(node, mp, last_hash)
         if mrows is None and self._pdflip_park_first_node(node) and self._pdflip_park_spill_room(node, mp):
             mrows = mp.alloc_write([last_hash])
         return mrows
+
+    def _s108_mamba_free_claim(self, mp, last_hash):
+        """S108 A2: the anchor slot from FREE room only (``claim_needs_room``: no reap, no evict, no
+        I/O), else None. A pool without the probe is not claimed at all at a turn end."""
+        probe = getattr(mp, "claim_needs_room", None)
+        if not callable(probe) or probe([last_hash]):
+            self._s108_mamba_room_n = self.__dict__.get("_s108_mamba_room_n", 0) + 1
+            return None
+        return mp.alloc_write([last_hash])
 
     def _pdflip_mamba_claim_h19(self, node, mp, last_hash):
         """SHARE: a request at its per-rank share releases its shallowest
@@ -6746,7 +6761,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if mp is None or not self._pdflip_evict_spill_room(node, mp):
                 break
         if written:
-            self.writing_check(write_back=True)
+            UnifiedRadixCache._s108_drain_own(self, node.id)   # S108 A1: the anchor save's own ack
         # S25: a KV-in-store anchor-only copy lives in its arena slot, not in the tree (host_value stays None)
         # S90b: so does the detached copy of a device-KV node (secured at the joined ack)
         ok = (node.component_data[ComponentType.MAMBA].host_value is not None
@@ -6979,6 +6994,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             _w3rs.apply_if_new(self, pool, claimer=node, debts=False)
         except Exception:  # noqa: BLE001 - room making never breaks a claim
             logger.warning("W3-ROOM-SET apply failed", exc_info=True)
+        if self.__dict__.get("_s108_turn_end_active", False):
+            # S108: a turn end claims only into FREE room -- the claim's room-making (reap,
+            # _evict_for_claim + its L3 secure) is disk work in this thread; deferred by name
+            _probe = getattr(pool, "claim_needs_room", None)
+            if callable(_probe) and _probe(hashes):
+                self._pdflip_sweep_last_refusal = "arena_claim"
+                self._1421_refused("arena_room", node)
+                return False
         pre = pool.alloc_write(hashes)
         if pre is None and self._w3_arena_spill(pool, len(hashes), claimer=node) > 0:
             # W3-ARENA: the spill handed this rank's references back; the
@@ -7012,7 +7035,30 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 comp_xfers.pop(mct, None)
                 self._pfund_note_kv_only(node)
             mxfer = None
+        if mxfer is not None and self.__dict__.get("_s108_turn_end_active", False):
+            # S108 review A2/A3: at a turn end the anchor takes FREE room or the node goes KV-only --
+            # never displacement or disk I/O, and never a TP0-only refusal of the node (the KV goes
+            # out on every rank alike; the anchor is deferred BY NAME for the anchor-only backup)
+            mp = self._pdflip_mamba_pool()
+            mrows = self._s108_mamba_free_claim(mp, hashes[-1]) if mp is not None else None
+            if mrows is None:
+                comp_xfers.pop(mct, None)
+                ad = self.__dict__.get("_s108_anchor_deferred")
+                if ad is None:
+                    ad = self._s108_anchor_deferred = {}
+                ad[node.id] = node
+                while len(ad) > 4096:
+                    ad.pop(next(iter(ad)))
+                mxfer = None
+            else:
+                mxfer.host_indices = mrows
+                pend = getattr(self, "_pdflip_direct_mamba_rows", None)
+                if pend is None:
+                    pend = self._pdflip_direct_mamba_rows = {}
+                pend[node.id] = mrows
+                mxfer = None
         if mxfer is not None:
+            # (_s108_turn_end_active never gets here with an anchor: free room above, or KV-only)
             mp = self._pdflip_mamba_pool()
             mrows = self._pdflip_mamba_claim(node, mp, hashes[-1]) if mp is not None else None
             if mrows is None and mp is not None and kv_only_if_mamba_refused \
@@ -7122,6 +7168,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         header it reads. Returns the pages released here; ``released_out`` (a
         list) gets the arena slots whose reference this rank let go (READ-ROOM
         review A3: a re-post of the same read never spills again for them)."""
+        if self.__dict__.get("_s108_turn_end_active", False):
+            # S108: a turn end never spills -- the spill writes L3 in this thread; a full arena
+            # defers the node by name (S108 TURN-END-DEFER) for the sweep and the flush
+            self._s108_spill_skipped = self.__dict__.get("_s108_spill_skipped", 0) + 1
+            return 0
         if pool is None or getattr(pool, "arena", None) is None:
             return 0
         if not hasattr(pool, "secure_rows_to_l3"):
@@ -8163,6 +8214,88 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             except Exception:  # noqa: BLE001 -- an instrument never takes the retain down
                 pass
 
+    def _s108_turn_end_l2(self, req, radix_key=None) -> None:
+        """S108 (20.10.): group D copies the finished turn's chain (RETAIN / #59 FINISH-TRACK /
+        PARK-END anchors ride the same nodes) from the card to L2 NOW; the L2->L3 write-behind
+        carries it to L3. User: "UND WEHE DAS SCHREIBEN IN DEN CACHE BLOCKIERT DURCH IRGENDEINE
+        SYNCHRON ODER WARTESCHEISSE" -- so this thread only claims, commits and records one event;
+        the copy is the copier thread's (pdflip.d_turn_end_l2). Only the request's own chain
+        (parents first), no join, no budget wait, no collective; a refused node (full arena,
+        mamba pin, budget) is deferred BY NAME and stays for the next turn end, the idle sweep
+        and the flush. Rank-local like every backup; COMPLETE comes from the ack drain."""
+        try:
+            from flliper.srt.pdflip import d_turn_end_l2 as _te
+            from flliper.srt.pdflip import retain_publish as _rp
+
+            cc = self.cache_controller
+            if (not _te.turn_end_on() or not self.enable_storage or cc is None
+                    or not hasattr(cc, "_s108_submit") or self._pdflip_direct_pool() is None):
+                return   # (a refused copy is undone through the arena claim: arena-bound trees only)
+            rid = str(getattr(req, "rid", "?"))
+            clock = _te.IssueClock()
+            chain = self._pdflip_chain_nodes(radix_key) if radix_key is not None else []
+            old = [n for n in list((self.__dict__.get("_s108_deferred") or {}).values())[-_rp.max_issue():]
+                   if n not in chain and not n.evicted and not n.backuped and not n.l3_present
+                   and self._s108_in_tree(n)]   # the newest deferred, bounded
+            first = list(chain) + old
+            ops0 = int(cc.__dict__.get("_s108_ops_submitted", 0))
+            self._s108_turn_end_active = True
+            try:
+                with _te.deferred_issue(cc, rid):
+                    # S108 A3: no wall-clock budget (rank-local); the request's own chain plus at most
+                    # max_issue deferred nodes is the bound, the same on every rank
+                    stats = self.publish_unbacked_sweep(
+                        max_issue=_rp.max_issue(), clock=None, first=first, chain_only=True) or {}
+            finally:
+                self._s108_turn_end_active = False
+            wall, cpu, blocked = clock.read()
+            # what is still un-backed and not in flight is deferred (named), the rest is issued
+            dq = self.__dict__.get("_s108_deferred")
+            if dq is None:
+                dq = self._s108_deferred = {}
+            left = []
+            for n in first:
+                if (n.backuped or n.l3_present or n.evicted or n.write_through_pending_id is not None
+                        or n.component_data[BASE_COMPONENT_TYPE].value is None):
+                    dq.pop(n.id, None)
+                    continue
+                left.append(n)
+                dq[n.id] = n
+            while len(dq) > _te.DEFER_KEEP:
+                dq.pop(next(iter(dq)))
+            if left:
+                parts = [f"{k}:{v}" for k, v in (stats.get("refused_by") or {}).items()]
+                if stats.get("skipped_pending"):
+                    parts.append("pin_or_in_flight:%d" % int(stats["skipped_pending"]))
+                if stats.get("stopped"):
+                    parts.insert(0, "stopped_%s" % stats["stopped"])
+                why = ",".join(parts) or "not_issued"
+                logger.warning("%s", _te.format_defer_line(rid=rid, why=why, nodes=left))
+            n = self.__dict__.get("_s108_turn_end_n", 0) + 1
+            self._s108_turn_end_n = n
+            tokens = sum(len(x.key) for x in chain if x.key is not None)
+            logger.info("%s", _te.format_turn_line(
+                rid=rid, chain=len(chain), stats=stats,
+                ops=int(cc.__dict__.get("_s108_ops_submitted", 0)) - ops0, tokens=tokens,
+                share=_te.owner_share(cc._dcp_owner_ctx() if hasattr(cc, "_dcp_owner_ctx") else None),
+                wall=wall, cpu=cpu, blocked=blocked, n=n, deferred_open=len(dq),
+                anchor_deferred=len(self.__dict__.get("_s108_anchor_deferred") or {})))
+        except Exception as exc:  # noqa: BLE001 -- the copy never takes the finish down
+            self._s108_turn_end_active = False
+            logger.warning("S108 TURN-END-L2 raised %s: %s", type(exc).__name__, exc)
+
+    def _s108_in_tree(self, node) -> bool:
+        """A deferred node is retried only while it is still hung into this tree."""
+        try:
+            while node is not None and node is not self.root_node:
+                p = node.parent
+                if p is None or not any(c is node for c in p.children.values()):
+                    return False
+                node = p
+            return node is self.root_node
+        except Exception:  # noqa: BLE001
+            return False
+
     def _pdflip_tag_retain_chain(self, chain, rid: str) -> None:
         """H19: the finished request owns its final node and its END-ANCHOR
         node (#1481); shared-prefix nodes keep the tag of their creator."""
@@ -8614,7 +8747,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if clock is not None and clock.expired():
                 stats["stopped"] = "budget"
                 break
-            if _rp.mamba_full_stops_sweep(self._pdflip_sweep_last_refusal):
+            if (_rp.mamba_full_stops_sweep(self._pdflip_sweep_last_refusal)
+                    and not self.__dict__.get("_s108_turn_end_active", False)):   # S108 A3: no TP0-only stop
                 stats["stopped"] = "mamba_full"
                 break
             for child in list(node.children.values()):
@@ -13387,28 +13521,63 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             left = queued()
         return len(first) - len(left), len(left), (time.perf_counter() - t0) * 1000.0
 
-    def writing_check(self, write_back: bool = False) -> None:
-        """Poll write-through completions."""
+    def writing_check(self, write_back: bool = False, only=None) -> None:
+        """Poll write-through completions.
+
+        ``write_back``: the blocking drain. S108 review A1 (nf-s108-s109-review-1020): it waits only for
+        the acks it NEEDS -- never for an S108 turn-end copy (a ``DoneEvent``: the copier's op of a
+        write-through-LOCKED node no eviction can free; it is polled without waiting and left in the
+        queue), and with ``only`` (ack ids) only for those. An ack that is not needed but already
+        complete is processed on the way. The flush does not need the turn-end copies either: it
+        re-polls until its in-flight terms are zero, and ``reset()`` joins the copier."""
         cc = self.cache_controller
         if cc is None:
             return
 
         if write_back:
-            # Blocking: wait for all pending write-backs
+            from flliper.srt.pdflip import d_turn_end_l2 as _te
+
+            if only is None:
+                only = self.__dict__.get("_s108_drain_only")   # set by _s108_drain_own (K21, K15)
+
             _1465_t0 = time.perf_counter()
             _1465_n = len(self.ongoing_write_through)
+            _waited = _skip_te = _skip_other = 0
             with _pdflip_p_overlap.span("evict_drain"):  # #PGAP
-                while self.ongoing_write_through:
-                    for _, finish_event, ack_list in cc.ack_write_queue:
-                        finish_event.synchronize()
+                while True:
+                    queue_now = list(cc.ack_write_queue)
+                    cc.ack_write_queue.clear()
+                    keep = []
+                    for entry in queue_now:
+                        _, finish_event, ack_list = entry
+                        turn_end = isinstance(finish_event, _te.DoneEvent)
+                        needed = (not turn_end) and (only is None or any(a in only for a in ack_list))
+                        if needed:
+                            finish_event.synchronize()
+                            _waited += 1
+                        elif not finish_event.query():
+                            keep.append(entry)
+                            if turn_end:
+                                _skip_te += 1
+                            else:
+                                _skip_other += 1
+                            continue
                         for ack_id in ack_list:
                             if ack_id in self.ongoing_write_through:
-                                self._finish_write_through_ack(ack_id)
-                    cc.ack_write_queue.clear()
-                    assert len(self.ongoing_write_through) == 0
+                                UnifiedRadixCache._s108_ack(self, ack_id, finish_event)
+                    # acks appended while processing go behind the kept ones (issue order holds)
+                    cc.ack_write_queue[0:0] = keep
+                    if not any(
+                        not isinstance(e[1], _te.DoneEvent) and (only is None or any(a in only for a in e[2]))
+                        for e in cc.ack_write_queue
+                    ):
+                        break
             if _1465_n:
-                logger.info("#1465 WRITE-BACK DRAIN n=%d ms=%.0f (the flush waited for this many in-flight write-throughs)",
-                            _1465_n, (time.perf_counter() - _1465_t0) * 1000.0)
+                logger.info("#1465 WRITE-BACK DRAIN n=%d ms=%.0f waited=%d skipped_turn_end=%d skipped_not_needed=%d "
+                            "own=%s (the drain waited for this many write ops; S108 copies and acks it does not need "
+                            "are polled, never waited for)",
+                            _1465_n, (time.perf_counter() - _1465_t0) * 1000.0, _waited, _skip_te, _skip_other,
+                            "all" if only is None else len(only))
             return
         finish_count = self._count_ready_acks(cc.ack_write_queue, "writing_check")
 
@@ -13425,8 +13594,63 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             except Exception:  # noqa: BLE001 -- an instrument, never the ack
                 pass
             for ack_id in ack_list:
-                self._finish_write_through_ack(ack_id)
+                UnifiedRadixCache._s108_ack(self, ack_id, finish_event)
             finish_count -= 1
+
+    def _s108_drain_own(self, ack_id) -> None:
+        """S108 A1: the blocking drain for ONE node's own write (K21, K15) -- ``writing_check(write_back=True)``
+        restricted to that ack (the restriction rides an attribute, so a harness that replaces
+        ``writing_check`` keeps its signature)."""
+        prev = self.__dict__.get("_s108_drain_only")
+        self._s108_drain_only = {ack_id}
+        try:
+            self.writing_check(write_back=True)
+        finally:
+            self._s108_drain_only = prev
+
+    def _s108_ack(self, ack_id, finish_event) -> None:
+        """The ack of one write op: complete it -- or, for an S108 turn-end copy the copier REFUSED
+        (review A4: a #923 row, a raising pool), undo the commit like the inline refusal would have
+        prevented it: claim back, host values off, lock released, node unbacked, named and reported
+        through the refusal path (R12 for Form A). Never a single rank's death."""
+        why = getattr(finish_event, "refused", None)
+        if not why:
+            self._finish_write_through_ack(ack_id)
+            return
+        lock_node, lock_params, publish_nodes = self.ongoing_write_through.pop(ack_id)
+        (self.__dict__.get("_1472_issued_at") or {}).pop(ack_id, None)
+        ao = getattr(self, "_pdflip_anchor_only_ids", None)
+        for node in publish_nodes:
+            if node.write_through_pending_id == ack_id:
+                node.write_through_pending_id = None
+            anchor_only = bool(ao) and node.id in ao
+            if anchor_only:
+                ao.discard(node.id)
+            full = node.component_data[BASE_COMPONENT_TYPE]
+            rows = None if anchor_only else full.host_value
+            try:
+                self._pdflip_direct_abort(rows if rows is not None else torch.empty(0, dtype=torch.int64), node)
+            except Exception as exc:  # noqa: BLE001 - loud; the node stays unbacked either way
+                logger.warning("S108 TURN-END-REFUSED abort raised on node %s: %r", node.id, exc)
+            for ct in self.tree_components:
+                if ct == BASE_COMPONENT_TYPE and anchor_only:
+                    continue
+                try:
+                    cd = node.component_data[ct]
+                except (IndexError, KeyError):
+                    continue
+                if getattr(cd, "host_value", None) is not None:
+                    cd.host_value = None
+            self._1421_refused("s108_copy:%s" % str(why).split(" ", 1)[0], node)
+        if lock_params is not None:
+            self.dec_lock_ref(lock_node, lock_params)
+        if self.staging_write_ring is not None:
+            self.staging_write_ring.release(ack_id)
+        n = self.__dict__.get("_s108_refused_n", 0) + 1
+        self._s108_refused_n = n
+        logger.error("S108 TURN-END-REFUSED ack=%s nodes=%d why=%s n=%d (the copier refused the copy; the commit is "
+                     "undone, the nodes stay unbacked for the sweep -- no rank stops)",
+                     ack_id, len(publish_nodes), why, n)
 
     def _mark_l3_present_span(
         self,
