@@ -215,7 +215,7 @@ def _pp0_announce(scheduler, mb_id: int) -> Optional[int]:
     carried = getattr(scheduler, "chunked_req", None) is not None
     from flliper.srt.managers import pdflip_store_told as _told
 
-    rids = [] if (others or carried) else _told.w2c_publishable(scheduler)
+    rids = _told.w2c_publishable(scheduler)   # the verdict below is the single place that weighs the slots
     if not pp0_should_announce(armed=True, others_in_flight=others, carried=carried, publishable=rids):
         return None
     sent = _local_sent(scheduler)

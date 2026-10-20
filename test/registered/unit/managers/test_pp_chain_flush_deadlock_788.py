@@ -242,12 +242,27 @@ def _make_holder(rank):
         pp_phase_flip_armed=lambda: False,
         pp_flip_service=lambda: None,
         _pp_flip_bump_sent=lambda chan: None,
+        # HARNESS REPAIR 20.10. (interface drift, no assertion touched): the shipped pass now runs the #1268 idle-vote
+        # lap, the PR room vote and the lane-floor vote at its top, and the vote object leaves the list after the
+        # forward. None of them blocks (their own docstrings); on this stand-in they are the no-ops a boot without
+        # those features runs.
+        _pdflip_vote_pass_hook=lambda recv_reqs: None,
+        _pdflip_pp_room_pass_hook=lambda: None,
+        _pdflip_lane_floor_pass_hook=lambda: None,
+        _pdflip_vote_after_forward=lambda recv_reqs: recv_reqs,
+        # z30j: a follower applies PP0's flush verdicts to the flushes it parked (none here)
+        flush_wrapper=types.SimpleNamespace(apply_pp0_verdict=lambda *a, **k: None),
     )
     for name in (
         "_pp_forward_and_process_input_requests",
         "_pp_commit_comm_work",
         "_pp_send_pyobj_to_next_stage",
         "_pp_commit_pending_req_work",
+        # HARNESS REPAIR 20.10.: the shipped pass books its sends lap-late (#1015e) and joins them a lap later
+        "_pp_post_send",
+        "_pp_drain_due_sends",
+        "_pp_send_join_lag",
+        "_pp_join_comm_work",
     ):
         setattr(h, name, types.MethodType(getattr(SchedulerPPMixin, name), h))
     return h
