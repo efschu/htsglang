@@ -393,6 +393,9 @@ def test_set_wait_opens_at_the_members_arrival_and_a_p1_long_waits_t_halb_too(ca
         assert asyncio.run(main(1))[0] == "hold"
 
 
+@pytest.mark.usefixtures("decider_off")  # EZ-S2a: describes the S1 code (reachable until S4)
+
+
 def test_flip_economics_latch_is_satisfied_neither_by_a_p1_nor_by_a_p0():
     # S45 (SOLL v2 R4/R7): priority orders, it is no flip reason of its own
     async def main(lane):

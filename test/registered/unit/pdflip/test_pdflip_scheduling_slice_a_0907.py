@@ -549,7 +549,7 @@ def test_t9b2_a_pending_store_read_DEFERS_it_never_refuses_it():
     assert Scheduler._pdflip_store_read_is_pending(sched, req_c) is False
 
 
-@pytest.mark.usefixtures("_pdflip_band_off")
+@pytest.mark.usefixtures("_pdflip_band_off", "decider_off")  # EZ-S2b: a refusal without an extent is MEASURE now (test_ez_s2b_1020)
 def test_t9c_the_front_requeues_a_w31_once_and_then_raises_w35():
     """T9 front half: a W31 body re-joins route BATCH exactly once; a second
     W31 on the same rid is W35 by name, never a third pass."""
@@ -592,6 +592,7 @@ def test_t9d_all_four_front_sites_read_one_x():
 
 
 # -------------------------------------------------------------- T10, R-5
+@pytest.mark.usefixtures("decider_off")  # EZ-S2a: describes the S1 code (reachable until S4)
 def test_t10_a_trickle_below_the_threshold_does_not_buy_a_round_trip():
     """T10, ADAPTED TO #1271 RULE (c): THE BACKLOG SUM IS OVER UNCACHED TOKENS.
 

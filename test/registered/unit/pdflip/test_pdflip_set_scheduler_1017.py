@@ -357,6 +357,9 @@ def test_t_half_zero_keeps_the_immediate_paths(monkeypatch):
     assert f._decode_collect(now) == "P"
 
 
+@pytest.mark.usefixtures("decider_off")  # EZ-S2a: describes the S1 code (reachable until S4)
+
+
 def test_set_verdict_line_has_the_exact_format(monkeypatch, caplog):
     _on(monkeypatch)
     f = _fx()
@@ -567,6 +570,9 @@ def test_a8_a_queue_under_x_is_no_flip_reason(monkeypatch, caplog):  # (a P-by-s
         wf, _fair, imm = asyncio.run(f._arrival_seat_step(f.groups["D"], now))
     assert wf is False and imm is None, "WAIT-BOUND-ANY must not flip a queue under X"
     assert f.counters["flip_held_under_x"] == 1
+
+
+@pytest.mark.usefixtures("decider_off")  # EZ-S2a: describes the S1 code (reachable until S4)
 
 
 def test_a8_a_queue_sum_over_x_flips_through_set_verdict_and_is_logged(monkeypatch, caplog):
@@ -820,6 +826,7 @@ def test_s28_flip_price_stale_needs_a_price_under_x(monkeypatch):
 
 
 # ----- review probes (Opus review S28, A4): P1 queue-sum, P2 N1, P3/P3b/P3c R1a + X-SUM
+@pytest.mark.usefixtures("decider_off")  # EZ-S2a: describes the S1 code (reachable until S4)
 def test_p1_queue_sum_flip_is_made_on_the_current_price(monkeypatch, caplog):
     _on(monkeypatch)
     f = _exact(_fx(running=()), 34)

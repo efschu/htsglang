@@ -35,6 +35,15 @@ uncached=977) -- S=8005 > X=6216 flipped for 4492 tokens. Every extend batch of 
 starts (``len(origin_input_ids) + len(output_ids) - len(prefix_indices)``, the in-flight chunk included), ``seq`` the
 rank's write counter (the newest record of a rid wins). The ranks only report the number; the front decides (R11).
 Several ranks: the newest record per rank, the MAX over ranks (deterministic, independent of the file order).
+
+EZ-S2b review A2 (VERSION 3, SOLL R6 "laufend"; NF rc19: 26 of 43 counted rests were ALREADY COMPUTED, the verdict fell 22-211 ms
+after the forward ended -- pdflip-104-2646 05:26:34.960 vs forward end .918, pdflip-0-1 23:06:43.576 vs .498): v2 wrote ``rest``
+only at the batch START, and a decode batch writes no extend record, so the record kept a rest D had long computed. v3 writes a
+SECOND record when the extend batch's forward has ended (``note_extend_done``, called from ``Scheduler.process_batch_result``
+after the result is synchronised): same rid, same first-extend start, newer ``seq``, ``rest`` = ``rest_at_start - extend_len``
+(0 for a single-chunk prefill; the later chunks of a chunked prefill report their own start rest again). The front counts a
+rest only while it is > 0. Ranks still only report a number (R11); with several ranks the MAX rest is kept, so a rank that has
+not finished its forward keeps the rest alive (agreement by MAX, as before).
 """
 from __future__ import annotations
 
@@ -53,7 +62,8 @@ SUBDIR = "d_extend"
 _HDR_FMT = "<IIIqq"
 _HDR_SIZE = struct.calcsize(_HDR_FMT)
 _MAGIC = 0x44455842  # "DEXB"
-_VERSION = 2
+#: v3 (EZ-S2b review A2): the record LAYOUT is v2's; the SEMANTICS of ``rest`` gain the forward end -- see ``note_extend_done``
+_VERSION = 3
 #: one record (v2): rid key (u64, 0 = empty), FIRST extend start (epoch ns), rest tokens D has not computed at the
 #: batch start (-1 = not known), the rank's write counter (newest record of a key wins)
 _REC_FMT = "<Qqqq"
@@ -99,6 +109,8 @@ class DExtendBeacon:
         #: S56: rid -> its FIRST extend start (ns) while it keeps extending (chunked prefill: every chunk re-reports
         #: the rest under the same start); bounded like ``_armed``
         self._live: "collections.OrderedDict[str, int]" = collections.OrderedDict()
+        #: v3: rid -> the rest once the CURRENT extend batch's forward has ended (rest at start - extend_len)
+        self._after: "collections.OrderedDict[str, int]" = collections.OrderedDict()
         self._head = 0
         self.mm = None
         size = _HDR_SIZE + self._slots * _REC_SIZE
@@ -121,14 +133,18 @@ class DExtendBeacon:
         while len(self._armed) > ARMED_CAP:
             self._armed.popitem(last=False)
 
-    def note_extend(self, *, rids: Iterable[str], rests: Optional[Iterable[int]] = None) -> None:
+    def note_extend(self, *, rids: Iterable[str], rests: Optional[Iterable[int]] = None,
+                    extend_lens: Optional[Iterable[int]] = None) -> None:
         """An extend batch runs: record every rid of it. A rid's FIRST extend after its arrival stamps its start; every
         later extend (the next chunk) re-reports the rest under that start. ``rests`` (S56, parallel to ``rids``): the
-        tokens D has not computed for each rid when this batch starts; None = not known (-1 in the record)."""
+        tokens D has not computed for each rid when this batch starts; None = not known (-1 in the record).
+        ``extend_lens`` (v3, parallel): the tokens this batch computes for each rid; with it the rest after the forward
+        is known (``note_extend_done`` writes it)."""
         if self.mm is None:
             return
         now = None
         rest_list = list(rests) if rests is not None else None
+        len_list = list(extend_lens) if extend_lens is not None else None
         for i, rid in enumerate(rids):
             if rid in self._armed:
                 del self._armed[rid]
@@ -149,6 +165,18 @@ class DExtendBeacon:
                     rest = max(0, int(rest_list[i]))
                 except (TypeError, ValueError):
                     rest = -1
+            if rest >= 0 and len_list is not None and i < len(len_list):
+                try:
+                    # FIFO per rid (review A2a): with overlap scheduling chunk k+1 is launched before chunk k's result is
+                    # processed, so one value would hand chunk k's done the after-rest of the LAST chunk
+                    q = self._after.get(rid)
+                    if q is None:
+                        q = self._after[rid] = collections.deque(maxlen=64)
+                    q.append(max(0, rest - max(0, int(len_list[i]))))
+                    while len(self._after) > ARMED_CAP:
+                        self._after.popitem(last=False)
+                except (TypeError, ValueError):
+                    pass
             try:
                 off = _HDR_SIZE + (self._head % self._slots) * _REC_SIZE
                 self._head += 1
@@ -157,9 +185,31 @@ class DExtendBeacon:
             except Exception:  # noqa: BLE001
                 return
 
+    def note_extend_done(self, *, rids: Iterable[str]) -> None:
+        """v3: the forward of the extend batch ``rids`` has ended on this rank: re-report each rid under its first-extend
+        start with the rest AFTER the batch (``rest_at_start - extend_len``; 0 when the batch finished the prefill)."""
+        if self.mm is None:
+            return
+        for rid in rids:
+            q = self._after.get(rid)
+            t_first = self._live.get(rid)
+            if not q or t_first is None:
+                continue
+            after = q.popleft()
+            if not q:
+                self._after.pop(rid, None)
+            try:
+                off = _HDR_SIZE + (self._head % self._slots) * _REC_SIZE
+                self._head += 1
+                struct.pack_into(_REC_FMT, self.mm, off, rid_key(rid), int(t_first), int(after), int(self._head))
+                struct.pack_into("<q", self.mm, 12, self._head)
+            except Exception:  # noqa: BLE001
+                return
+
     def note_done(self, *, rid: str) -> None:
         """The rid left this rank (finished, aborted): no later extend re-reports it."""
         self._live.pop(rid, None)
+        self._after.pop(rid, None)
         self._armed.pop(rid, None)
 
 
@@ -170,6 +220,14 @@ def req_rest(req) -> int:
         total = len(req.origin_input_ids) + len(getattr(req, "output_ids", None) or ())
         pre = getattr(req, "prefix_indices", None)
         return max(0, int(total) - (len(pre) if pre is not None else 0))
+    except Exception:  # noqa: BLE001
+        return -1
+
+
+def req_extend_len(req) -> int:
+    """v3: the tokens the extend batch computes for ``req`` (``extend_input_len``: the chunk). Never raises; -1 = unknown."""
+    try:
+        return max(0, int(req.extend_input_len))
     except Exception:  # noqa: BLE001
         return -1
 
@@ -189,7 +247,7 @@ def read_group_full(directory: str, group: str, sid: int,
                     ) -> Optional[Dict[int, Tuple[int, int]]]:
     """``{rid_key: (first extend start ns, rest)}`` over the group's LIVE ranks (pid in the group's session); None when
     no such file is readable (no channel -- nothing is proven running). Per rank the NEWEST record of a key (its write
-    counter); over ranks the larger start, then the larger rest (deterministic: the file order never decides).
+    counter); over ranks the larger start and, separately, the larger rest (deterministic: the file order never decides).
     ``rest`` -1 = the rank did not report one (a v1 file)."""
     if not directory or not sid:
         return None
@@ -204,7 +262,7 @@ def read_group_full(directory: str, group: str, sid: int,
             magic, ver, slots, _head, pid = struct.unpack_from(_HDR_FMT, raw, 0)
         except Exception:  # noqa: BLE001
             continue
-        if magic != _MAGIC or ver not in (1, _VERSION) or session_of(int(pid)) != int(sid):
+        if magic != _MAGIC or ver not in (1, 2, _VERSION) or session_of(int(pid)) != int(sid):
             continue
         seen = True
         own: Dict[int, Tuple[int, int, int]] = {}  # key -> (seq, t_first, rest)
@@ -221,8 +279,9 @@ def read_group_full(directory: str, group: str, sid: int,
                     own[key] = (int(seq), int(t_ns), int(rest))
         for key, (_seq, t_ns, rest) in own.items():
             prev = out.get(key)
-            if prev is None or (t_ns, rest) > prev:
-                out[key] = (t_ns, rest)
+            # review A2b (R11): the start stamp and the rest are merged SEPARATELY -- the later start never decides the rest;
+            # the MAX rest over the ranks does (a rank that has not finished keeps it alive)
+            out[key] = (t_ns, rest) if prev is None else (max(prev[0], t_ns), max(prev[1], rest))
     return out if seen else None
 
 

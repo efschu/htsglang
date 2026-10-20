@@ -66,6 +66,9 @@ def test_a2_x_of_k_never_moves_a_verdict_and_is_named_in_the_why(monkeypatch, ca
     assert re.search(r"S=5400 X=5222 ", line) and re.search(r" xk=62\d\d", line), line
 
 
+@pytest.mark.usefixtures("decider_off")  # EZ-S2a: describes the S1 code (reachable until S4)
+
+
 def test_a2_the_queue_sum_path_decides_on_the_own_x_too(monkeypatch, caplog):
     from test_pdflip_arrival_seat_rule_0929 import _pending
 
@@ -197,11 +200,12 @@ def test_a4_the_age_plan_reads_the_seat_count_again_before_the_plan():
 
 # ------------------------------------------------------------------------------------------------ A5
 
-def test_a5_set_verdict_decides_on_the_own_figures_and_reports_nothing_else_in_s():
+def test_a5_set_verdict_decides_on_the_union_figure_r1u():
     a, b = M("a", 4000, 0.0), M("b", 2100, 0.5, own_uncached=4100)       # b's 2000 shared tokens P counts once
     v = pp.set_verdict([a, b], x_tokens=6185, half_frac=0.5, t_half_s=4.5, now=0.6, t_open=0.0, d_decoding=True,
                        seats_free=4)
-    assert v.s_tokens == 8100 and v.verdict == pp.V_FLIP_P               # P-side 6100 < X would have collected
+    # SOLL R1u (user decision 20.10., supersedes the A5 own-figure sum): S counts the shared piece ONCE
+    assert v.s_tokens == 6100 and v.verdict == pp.V_COLLECT
 
 
 def test_a5_the_docstring_states_that_the_discount_is_p_side_only():

@@ -15,6 +15,7 @@ Hermetic, CPU. Each test named red_* is red on e90d7fcf88.
 from __future__ import annotations
 
 import os
+import pytest
 import types
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
@@ -63,6 +64,9 @@ def test_switch_off_restores_the_band_floor():
             assert F.Front._x_band_floor(ns) == 4096
     with envs.FLLIPER_PDFLIP_ENABLE_X_COST_LINE.override(False):
         assert F.Front._x_band_floor(ns) == 4096
+
+
+@pytest.mark.usefixtures("decider_off")  # EZ-S2a: describes the S1 code (reachable until S4)
 
 
 def test_red_flip_economics_compares_the_backlog_with_the_live_x(caplog):

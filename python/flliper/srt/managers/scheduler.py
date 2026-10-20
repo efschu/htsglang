@@ -19956,6 +19956,7 @@ class Scheduler(
             self.pdflip_d_ext_beacon.note_extend(
                 rids=[req.rid for req in batch.reqs],
                 rests=[_pdflip_d_ext.req_rest(req) for req in batch.reqs],
+                extend_lens=[_pdflip_d_ext.req_extend_len(req) for req in batch.reqs],
             )
 
         # #861 fix (b): a request admitted on a cached prefix whose DRAFT rows
@@ -20617,6 +20618,12 @@ class Scheduler(
             self.batch_result_processor.process_batch_result_prebuilt(batch)
         elif batch.forward_mode.is_idle():
             self.batch_result_processor.process_batch_result_idle(batch, result)
+
+        if self.pdflip_d_ext_beacon is not None and batch.forward_mode.is_extend():
+            # (review A2c: a skip batch reports too -- note_extend queued its after-rest, the FIFO stays aligned)
+            # EZ-S2b review A2 (SOLL R6, D-EXTEND-BEACON v3): the extend forward has ended and its result is processed --
+            # re-report the REST AFTER it (0 for a finished prefill); R6 counts nothing D has already computed
+            self.pdflip_d_ext_beacon.note_extend_done(rids=[req.rid for req in batch.reqs])
 
         self.metrics_reporter.log_batch_result_stats(batch, result)
         # nf-pd-post: a skip batch's #639 ballot is decided after its result

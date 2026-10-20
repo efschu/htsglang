@@ -271,6 +271,9 @@ def test_f1_a_slow_store_read_costs_one_round_never_a_loop(monkeypatch, caplog):
     assert len(d.asked) == 1 and f.counters["set_reprobe_begin"] == 1, d.asked
 
 
+@pytest.mark.usefixtures("decider_off")  # EZ-S2a: describes the S1 code (reachable until S4)
+
+
 def test_f1_the_queue_sum_verdict_is_gated_too(monkeypatch):
     _on(monkeypatch)
     f = _fx()

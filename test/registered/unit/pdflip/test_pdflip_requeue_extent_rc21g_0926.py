@@ -16,6 +16,7 @@ Hermetisch, CPU: die ECHTE ``Front._requeue_after_x_refusal`` und die ECHTE
 from __future__ import annotations
 
 import asyncio
+import pytest
 from types import SimpleNamespace
 
 from flliper.srt.pdflip.front import Front
@@ -83,6 +84,9 @@ def test_red_first_the_nf_pin_4096_class():
 
     est, ok = asyncio.run(run())
     assert (est, ok) == (13000, True)
+
+
+@pytest.mark.usefixtures("decider_off")  # EZ-S2a: describes the S1 code (reachable until S4)
 
 
 def test_without_a_parsed_extent_the_estimate_stands():

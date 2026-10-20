@@ -31,6 +31,7 @@ import types
 import unittest
 from unittest import mock
 
+from flliper.srt.environ import envs
 from flliper.srt.pdflip import front
 
 X = 12288
@@ -125,6 +126,11 @@ class TheTakeIsTheIdentityBelowX(unittest.TestCase):
 
 class TheHandOverMatchesThePreFixBody(unittest.TestCase):
     def test_below_x_moves_exactly_what_the_pre_fix_body_moved(self):
+        # EZ-S2a review A1: the pre-fix body is the S1 gate (x_deferred under X = P's by state); the ON path hands it to D
+        with envs.FLLIPER_PDFLIP_DECIDER.override(False):
+            self._below_x_pre_fix()
+
+    def _below_x_pre_fix(self):
         rng = random.Random(15031)
         for _ in range(300):
             n = rng.randint(0, 9)
@@ -183,6 +189,35 @@ class TheGateIsUnchanged(unittest.TestCase):
             self._assert_untouched(_Fake(qs, **kw), qs)
 
     def test_ineligible_entries_never_reach_the_take_and_stay_queued(self):
+        # EZ-S2a review A1: describes the S1 gate (x_requeues / x_deferred under X are P's by state) -- reachable until S4
+        with envs.FLLIPER_PDFLIP_DECIDER.override(False):
+            self._ineligible_s1()
+
+    def test_a1_on_state_entries_under_x_reach_the_take_everything_else_stays_out(self):
+        """EZ-S2a review A1 (SOLL R7, WAIT_SEAT owner): with the decider ON an entry D refused with a named extent
+        (``x_requeues``) or deferred (``x_deferred``) UNDER X is D's again -- it reaches the take; not eligible, stalled,
+        leg 1 done, leg-2 reroute, p_only and over X still stay out."""
+        with envs.FLLIPER_PDFLIP_DECIDER.override(True):
+            bad = [_p("not-elig", 10, 1.0, d_eligible=False), _p("stalled", 10, 2.0, intake_stalled=True),
+                   _p("leg1", 10, 3.0, leg1_done=True), _p("rer", 10, 4.0, reroutes=1),
+                   _p("ponly", 10, 6.0, p_only=True), _p("big", X + 1, 8.0)]
+            own = [_p("xrq", 10, 5.0, x_requeues=1), _p("xdef", 10, 7.0, x_deferred=True)]
+            fake = _Fake(bad + own)
+            seen = []
+            real = front._sum_priced_take
+
+            def spy(entries, **kw):
+                seen.append(sorted(p.rid for p in entries))
+                return real(entries, **kw)
+
+            with mock.patch.object(front, "_sum_priced_take", side_effect=spy):
+                moved = _hand(fake)
+            self.assertEqual(seen, [["xdef", "xrq"]])
+            self.assertEqual(sorted(p.rid for p in moved), ["xdef", "xrq"])
+            self.assertEqual([p.rid for p in fake.queue], [p.rid for p in bad])
+            self.assertTrue(all(p.d_direct is False for p in bad))
+
+    def _ineligible_s1(self):
         bad = [_p("not-elig", 10, 1.0, d_eligible=False), _p("stalled", 10, 2.0, intake_stalled=True),
                _p("leg1", 10, 3.0, leg1_done=True), _p("rer", 10, 4.0, reroutes=1),
                _p("xrq", 10, 5.0, x_requeues=1), _p("ponly", 10, 6.0, p_only=True),
