@@ -198,6 +198,64 @@ def quiesce_verdict(scheduler, group_idle: bool, tp_group_verdict: bool) -> Opti
     )
 
 
+LINE_S104_DEFER = "S104 FLUSH-DEFER-RESET"
+_S104_N = [0]
+
+
+def s104_defer_reset_verdict(scheduler, group_idle: bool, tp_group_verdict: bool,
+                             unbacked_left: int = 0) -> Optional[str]:
+    """S104: the detail of a DEFERRED reset, or None (the flush resets as before).
+
+    THE METAL (rc22 boot ..._9c40fe40a2_1020_094747, D TP=3 Form A, 09:54:35Z). The front's quiesce
+    ``/flush_cache`` ran its #1470 loop against a KV arena held in full by the trees (``S83 VICTIM-CENSUS
+    site=flush_end slots=6485 free=0 pinned=6485 tree_slots=6485 unpinned_complete=0``): every claim refused
+    (``#1421 BACKUP-REFUSED why=arena_claim`` / ``parent_unbacked``), ``#1470 FLUSH-PUBLISH issued=0
+    unbacked_left=14 in_flight_after=0``. Nothing was in flight, so the group verdict was IDLE, B1 had nothing to
+    hand over, and THIS flush reset the tree: ``#1470 FLUSH-UNBACKED site=flush nodes=14 tokens=10432``, five park
+    ends ``S85 PARK-END-UNBACKED lost_tokens=1536/1792/2496/1920/1920``. The sleep leg's S86 SLEEP-L3-RELEASE --
+    the step built for exactly this arena (it gives back the slots L3 holds, agreed over the group, BEFORE the
+    #1470 loop claims) -- ran one second later on the empty tree (``PDFLIP-RELEASE-FLUSH-DEDUP ... the quiesce
+    flush's reset is current``; rc22: 3 of 17 sleeps, rc24: 1 of 9, rc25: 1 of 2 took this quiesce reset).
+
+    THE RULE. On group D, in the tp-group verdict path (every rank runs this flush in the same pass, ``group_idle``
+    already reduced over the group), an idle quiesce asks the group once (one MAX, posted uniformly) whether any
+    rank's tree still holds device KV the reset would drop (``unbacked_census``: neither ``backuped`` nor
+    ``l3_present`` -- the FLUSH-UNBACKED predicate, so a byteless anchor or a host-backed node never defers). If so
+    the reset moves to the sleep leg, exactly as B1 moves it for a publish in flight: the tree, pools and arena
+    references stay, the answer is "quiesced" (200), and the release leg runs S86 (release the L3-proven slots),
+    its own #1470 loop (now with room), the store join and the reset. Nothing is kept back and no reserve is made:
+    the reset that would have dropped the nodes simply runs after the step that frees their room. Other groups,
+    a rank-local verdict and an idle tree with nothing to drop answer None (the flush as before)."""
+    if not group_idle or not tp_group_verdict:
+        return None
+    if _group() != "D" or not getattr(scheduler, "enable_hierarchical_cache", False):
+        return None
+    pp_size = int(getattr(getattr(scheduler, "ps", None), "pp_size", 1) or 1)
+    if pp_size > 1:
+        return None
+    tc = getattr(scheduler, "tree_cache", None)
+    gm = getattr(tc, "hicache_group_max", None)
+    if not callable(gm):
+        return None
+    try:
+        cen = unbacked_census(tc)
+    except Exception:  # noqa: BLE001 - a census that cannot answer counts as "drops something": defer (fail safe)
+        logger.warning("%s census raised: this rank votes defer", LINE_S104_DEFER, exc_info=True)
+        cen = {"nodes": 1, "tokens": 0, "ids": []}
+    mine = int(cen.get("nodes", 0) or 0)
+    (any_drop,) = gm([int(mine > 0)], label="flush_cache/s104_defer_reset")
+    if int(any_drop) == 0:
+        return None
+    _S104_N[0] += 1
+    return (
+        "%s n=%d quiesced: the group is idle but a reset now would drop device KV with no copy (this rank "
+        "nodes=%d tokens=%d ids=%s unbacked_left=%d) -- tree, pools and arena references kept; the sleep leg "
+        "runs S86 SLEEP-L3-RELEASE, publishes the rest (#1470), joins the store queue (#1470b) and resets "
+        "BEFORE the kv_cache pause" % (LINE_S104_DEFER, _S104_N[0], mine, int(cen.get("tokens", 0) or 0),
+                                       list(cen.get("ids", []) or [])[:16], int(unbacked_left or 0))
+    )
+
+
 def quiesce_sweep_blocking(scheduler, stats: dict, tp_group_verdict: bool) -> bool:
     """Part 2: must the quiesce's FLUSH-PUBLISH keep its blocking #1470 loop
     (drain, re-sweep)? False = one issuing pass was enough: nothing is left

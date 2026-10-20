@@ -5584,6 +5584,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return False
         if node is self.root_node or node.evicted:
             return False
+        if self._s104_byteless_anchor_rank():
+            return False    # S104: a Form A worker's anchor has no bytes -- nothing to back up, nothing un-backed
         if getattr(node, "pdflip_park_anchor_dropped", False):
             return False    # PARK-END-ANCHOR-FIRST: given up on purpose, not retried
         if not (node.backuped or node.l3_present):
@@ -5604,6 +5606,26 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return False
         cd = node.component_data[ComponentType.MAMBA]
         return cd.value is not None and cd.host_value is None and bool(node.hash_value)
+
+    def _s104_byteless_anchor_rank(self) -> bool:
+        """S104 (rc22 boot ..._9c40fe40a2_1020_094747 D, rc24 ..._781238542c_1020_113244 D): on a Form A worker
+        (TP1/TP2: ``Mamba Cache ... ssm_state size: 0.00GB``, no mamba arena pool -- ``_pdflip_mamba_pool()`` is
+        None) the tree's Mamba anchors are byteless bookkeeping. The publish sweep counted every such node whose KV
+        is backed as an ANCHOR-ONLY candidate, its write was refused by construction (``#1421 BACKUP-REFUSED
+        why=anchor_only_no_arena``, ``R12 SHADOW-SHORT``), and the node stayed in ``unbacked``: rc24 9 of 9 sleeps
+        ``#1470 FLUSH-PUBLISH unbacked_left`` 6..27 on TP1/TP2 (179 nodes) with TP0 at 0 and ``#1470
+        FLUSH-UNBACKED nodes=0`` -- an un-backed count with no un-backed byte behind it, which hid the one real
+        leftover class (TP0 ``arena_claim``) and made every group-reduced "anything left?" answer yes. Both
+        conditions, so a rank that holds mamba state (or an arena to write it to) is never exempted: the role is
+        the installed plan (replicated), the pool is this rank's own configuration."""
+        try:
+            from flliper.srt.rank_role import this_rank_is_form_a_worker
+
+            if not this_rank_is_form_a_worker():
+                return False
+        except Exception:  # noqa: BLE001 - no plan readable: not exempted (the pre-S104 form)
+            return False
+        return self._pdflip_mamba_pool() is None
 
     def _pdflip_anchor_secured_holds(self, node: UnifiedTreeNode) -> bool:
         """y6b (review a54a22e54d F1): ``pdflip_anchor_secured`` was set once at
