@@ -1718,11 +1718,27 @@ async def pdflip_ple_prefetch_hint(raw_request: Request):
     )
 
 
+async def _s104_flip_quiesce_flag(request) -> bool:
+    """S104 review A1: True only for a POST whose JSON body says ``pdflip_flip_quiesce: true``; an empty or
+    unreadable body (curl, GET, tests) is a plain flush."""
+    if getattr(request, "method", "GET") != "POST":
+        return False
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001 - no body / not JSON: a plain flush
+        return False
+    return isinstance(body, dict) and body.get("pdflip_flip_quiesce") is True
+
+
 @app.api_route("/flush_cache", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def flush_cache(timeout: float = Query(0.0, ge=0.0)):
-    """Flush the radix cache."""
-    ret = await _global_state.tokenizer_manager.flush_cache(timeout_s=timeout)
+async def flush_cache(request: Request, timeout: float = Query(0.0, ge=0.0)):
+    """Flush the radix cache.
+
+    S104 review A1: a JSON body ``{"pdflip_flip_quiesce": true}`` marks the front's flip quiesce (the only flush
+    a sleep leg follows); without it -- every operator/test flush -- the reset is never deferred."""
+    ret = await _global_state.tokenizer_manager.flush_cache(
+        timeout_s=timeout, flip_quiesce=await _s104_flip_quiesce_flag(request))
     if ret.success:
         content = (
             "Cache flushed.\nPlease check backend logs for more details. "

@@ -115,7 +115,7 @@ def _sched(tree):
                                  tree_cache=tree)
 
 
-def _run_three(trees, monkeypatch, *, group_idle=True, tp_group_verdict=True, local=False):
+def _run_three(trees, monkeypatch, *, group_idle=True, tp_group_verdict=True, local=False, flip_quiesce=True):
     monkeypatch.setenv("FLLIPER_PDFLIP_GROUP", "D")
     g = _GroupMax(len(trees))
     out, errs = {}, {}
@@ -126,7 +126,8 @@ def _run_three(trees, monkeypatch, *, group_idle=True, tp_group_verdict=True, lo
                 tree.hicache_group_max = lambda values, label="": list(values)
             else:
                 tree.hicache_group_max = g.for_rank(r)
-            out[r] = fnb.s104_defer_reset_verdict(_sched(tree), group_idle, tp_group_verdict, 0)
+            out[r] = fnb.s104_defer_reset_verdict(_sched(tree), group_idle, tp_group_verdict, 0,
+                                                  flip_quiesce=flip_quiesce)
         except Exception as e:  # noqa: BLE001
             errs[r] = e
 
@@ -212,11 +213,160 @@ def test_f1_other_groups_and_pp_untouched(monkeypatch):
     t, ns = _tree([64])
     t.hicache_group_max = lambda values, label="": pytest.fail("no collective outside group D / pp=1")
     monkeypatch.setenv("FLLIPER_PDFLIP_GROUP", "P")
-    assert fnb.s104_defer_reset_verdict(_sched(t), True, True, 3) is None
+    assert fnb.s104_defer_reset_verdict(_sched(t), True, True, 3, flip_quiesce=True) is None
     monkeypatch.setenv("FLLIPER_PDFLIP_GROUP", "D")
     s = _sched(t)
     s.ps.pp_size = 3
-    assert fnb.s104_defer_reset_verdict(s, True, True, 3) is None
+    assert fnb.s104_defer_reset_verdict(s, True, True, 3, flip_quiesce=True) is None
+
+
+# ---------------------------------------------------------------- review A1: only the flip quiesce defers -----
+def test_a1_an_operator_flush_never_defers_and_posts_no_collective(monkeypatch):
+    """A1 (nf-review-s104-1020): the same idle D with un-backed KV (full arena) -- a /flush_cache that is NOT the
+    front's flip quiesce (operator, test, removing wrong data) resets as before on every rank."""
+    trees = _three()
+    for t, ns in trees:
+        _back_all(ns)
+    sorted(trees[0][1], key=lambda n: _depth_end(trees[0][0], n))[1].l3_present = False
+    out, g = _run_three([x[0] for x in trees], monkeypatch, flip_quiesce=False)
+    assert out == {0: None, 1: None, 2: None} and g.labels == {}
+    out, g = _run_three([x[0] for x in trees], monkeypatch, flip_quiesce=True)
+    assert all(v is not None for v in out.values())
+
+
+def test_a1_the_default_request_is_no_flip_quiesce():
+    from flliper.srt.managers.io_struct import FlushCacheReqInput
+
+    assert FlushCacheReqInput(timeout_s=0.0).pdflip_flip_quiesce is False
+    import inspect
+
+    assert inspect.signature(fnb.s104_defer_reset_verdict).parameters["flip_quiesce"].default is False
+
+
+def _wrapper(calls):
+    from flliper.srt.managers.scheduler_components.flush_wrapper import SchedulerFlushWrapper
+
+    def flush(**kw):
+        calls.append(kw)
+        return True
+
+    return SchedulerFlushWrapper(flush_cache=flush, is_fully_idle=lambda: True, ipc_channels=None)
+
+
+@pytest.mark.parametrize("mark", [False, True])
+def test_a1_the_wrapper_carries_the_mark_only_when_set(mark):
+    from flliper.srt.managers.io_struct import FlushCacheReqInput
+
+    calls = []
+    out = _wrapper(calls).handle(FlushCacheReqInput(timeout_s=0.0, pdflip_flip_quiesce=mark))
+    assert out.success
+    assert calls == ([dict(tp_group_verdict=True, pdflip_flip_quiesce=True)] if mark
+                     else [dict(tp_group_verdict=True)])
+
+
+def test_a1_the_front_quiesce_marks_itself_and_the_endpoint_reads_only_a_post_body():
+    import inspect
+
+    from flliper.srt.pdflip.front import Front
+
+    assert '"/flush_cache", {"pdflip_flip_quiesce": True}' in inspect.getsource(Front.quiesce)
+    src = open(os.path.join(HERE, "..", "..", "..", "..", "python", "flliper", "srt", "entrypoints",
+                            "http_server.py")).read()
+    i = src.index("async def _s104_flip_quiesce_flag")
+    body = src[i:src.index("@app.api_route", i)]
+    assert 'getattr(request, "method", "GET") != "POST"' in body and 'body.get("pdflip_flip_quiesce") is True' in body
+    j = src.index('@app.api_route("/flush_cache"')
+    assert "flip_quiesce=await _s104_flip_quiesce_flag(request)" in src[j:j + 900]
+
+
+def test_a1_the_flag_parser_on_fake_requests():
+    """The endpoint helper, run on stand-in requests: only POST + JSON body {"pdflip_flip_quiesce": true}."""
+    import asyncio
+    import ast
+
+    src = open(os.path.join(HERE, "..", "..", "..", "..", "python", "flliper", "srt", "entrypoints",
+                            "http_server.py")).read()
+    tree = ast.parse(src)
+    fn = next(n for n in tree.body if isinstance(n, ast.AsyncFunctionDef) and n.name == "_s104_flip_quiesce_flag")
+    ns = {}
+    exec(compile(ast.Module(body=[fn], type_ignores=[]), "x", "exec"), ns)
+    flag = ns["_s104_flip_quiesce_flag"]
+
+    class R:
+        def __init__(self, method, body):
+            self.method, self._b = method, body
+
+        async def json(self):
+            if isinstance(self._b, Exception):
+                raise self._b
+            return self._b
+
+    cases = [(R("POST", {"pdflip_flip_quiesce": True}), True), (R("POST", {}), False),
+             (R("POST", {"pdflip_flip_quiesce": 1}), False), (R("POST", ValueError("no body")), False),
+             (R("GET", {"pdflip_flip_quiesce": True}), False), (R("POST", [1]), False)]
+    assert [asyncio.run(flag(r)) for r, _ in cases] == [w for _, w in cases]
+
+
+# ---------------------------------------------------------------- review A2: teardown kills a stuck owner ------
+_STUCK = textwrap.dedent("""
+    import signal, sys, time, setproctitle
+    setproctitle.setproctitle({title!r})
+    if {stuck}:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)   # an owner whose handler never runs (main thread in C)
+    print("ready", flush=True)
+    time.sleep(60)
+""")
+
+
+def _child(title, stuck):
+    p = subprocess.Popen([sys.executable, "-c", _STUCK.format(title=title, stuck=stuck)], stdout=subprocess.PIPE)
+    assert p.stdout.readline().strip() == b"ready"
+    return p
+
+
+def test_a2_a_stuck_scheduler_is_killed_after_the_bound_and_named():
+    from flliper.srt.pdflip import launcher as L
+
+    stuck = _child("flliper::scheduler_TP0", True)
+    healthy = _child("flliper::scheduler_TP1", False)
+    other = _child("flliper.srt.pdflip.front-stand-in", True)
+    try:
+        pids = {stuck.pid, healthy.pid, other.pid}
+        sched = L.s104_scheduler_pids(pids)
+        assert sched == sorted([stuck.pid, healthy.pid]), "named before the TERM, by process title"
+        for p in pids:
+            os.kill(p, signal.SIGTERM)
+        healthy.wait(5)
+        lines = []
+        t0 = time.monotonic()
+        killed = L.s104_escalate_schedulers(sched, bound_s=1.0, log=lambda m, **k: lines.append(m))
+        assert killed == [stuck.pid] and time.monotonic() - t0 < 3.0
+        assert stuck.wait(5) == -signal.SIGKILL
+        assert healthy.returncode == -signal.SIGTERM
+        assert lines and lines[0].startswith("S104 TEARDOWN-SCHED-KILL pids=[%d]" % stuck.pid)
+        assert other.poll() is None, "a non-scheduler keeps the teardown's 60 s bound"
+    finally:
+        for p in (stuck, healthy, other):
+            if p.poll() is None:
+                p.kill()
+                p.wait(5)
+
+
+def test_a2_the_bound_is_the_drain_plus_two_and_wired_before_the_60s_wait():
+    import inspect
+
+    from flliper.srt.pdflip import launcher as L
+
+    assert L.S104_SCHED_KILL_S == fd.FINAL_DRAIN_S + 2.0
+    src = inspect.getsource(L.teardown)
+    assert src.index("s104_scheduler_pids(pids)") < src.index('print(f"TERM {sorted(pids)}")') \
+        < src.index("s104_escalate_schedulers(s104_sched)") < src.index("while time.time() - t0 < 60")
+
+
+def test_a2_nothing_to_wait_for_returns_at_once():
+    from flliper.srt.pdflip import launcher as L
+
+    assert L.s104_escalate_schedulers([], alive=lambda p: pytest.fail("no wait")) == []
 
 
 def test_f1_wired_between_b1_and_the_reset():

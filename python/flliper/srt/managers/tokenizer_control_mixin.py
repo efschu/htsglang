@@ -318,11 +318,12 @@ class TokenizerControlMixin:
         )
 
     async def flush_cache(
-        self: TokenizerManager, timeout_s: Optional[float] = None
+        self: TokenizerManager, timeout_s: Optional[float] = None, flip_quiesce: bool = False
     ) -> FlushCacheReqOutput:
         self.auto_create_handle_loop()
         return (
-            await self.flush_cache_communicator(FlushCacheReqInput(timeout_s=timeout_s))
+            await self.flush_cache_communicator(
+                FlushCacheReqInput(timeout_s=timeout_s, pdflip_flip_quiesce=bool(flip_quiesce)))
         )[0]
 
     async def kv_reshard(

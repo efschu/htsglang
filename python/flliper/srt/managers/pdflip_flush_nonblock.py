@@ -203,7 +203,7 @@ _S104_N = [0]
 
 
 def s104_defer_reset_verdict(scheduler, group_idle: bool, tp_group_verdict: bool,
-                             unbacked_left: int = 0) -> Optional[str]:
+                             unbacked_left: int = 0, flip_quiesce: bool = False) -> Optional[str]:
     """S104: the detail of a DEFERRED reset, or None (the flush resets as before).
 
     THE METAL (rc22 boot ..._9c40fe40a2_1020_094747, D TP=3 Form A, 09:54:35Z). The front's quiesce
@@ -225,8 +225,13 @@ def s104_defer_reset_verdict(scheduler, group_idle: bool, tp_group_verdict: bool
     references stay, the answer is "quiesced" (200), and the release leg runs S86 (release the L3-proven slots),
     its own #1470 loop (now with room), the store join and the reset. Nothing is kept back and no reserve is made:
     the reset that would have dropped the nodes simply runs after the step that frees their room. Other groups,
-    a rank-local verdict and an idle tree with nothing to drop answer None (the flush as before)."""
-    if not group_idle or not tp_group_verdict:
+    a rank-local verdict and an idle tree with nothing to drop answer None (the flush as before).
+
+    Review A1 (nf-review-s104-1020): ONLY the front's flip quiesce (``flip_quiesce``, the replicated
+    ``FlushCacheReqInput.pdflip_flip_quiesce`` the front sets in ``Front.quiesce``) may defer -- a sleep leg follows
+    it. Every other /flush_cache (operator, test, removing wrong data, user order 15.10.) resets as before; it
+    posts no collective here."""
+    if not flip_quiesce or not group_idle or not tp_group_verdict:
         return None
     if _group() != "D" or not getattr(scheduler, "enable_hierarchical_cache", False):
         return None

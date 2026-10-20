@@ -17533,7 +17533,8 @@ class Front:
         t_pending = None
         _lane_net: Dict[str, Any] = {}
         while time.time() - t0 < QUIESCE_DEADLINE_S:
-            code, body = await self.rpc(g, "/flush_cache", None, 60)
+            # S104 review A1: the flip quiesce marks itself -- only this flush may hand its reset to the sleep leg
+            code, body = await self.rpc(g, "/flush_cache", {"pdflip_flip_quiesce": True}, 60)
             polls += 1
             if code == 200:
                 if pending_polls:

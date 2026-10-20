@@ -21282,8 +21282,11 @@ class Scheduler(
         empty_cache: bool = True,
         zero_kv: Optional[bool] = None,
         tp_group_verdict: bool = False,
+        pdflip_flip_quiesce: bool = False,
     ):
         """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache.
+        ``pdflip_flip_quiesce``: S104 review A1 -- the front's flip quiesce (a sleep leg follows); only then
+        may an idle flush with un-backed device KV hand its reset to the sleep leg.
         ``tp_group_verdict``: fnFL2x105 -- the caller guarantees every TP rank
         runs this flush in the same pass (the immediate /flush_cache RPC), so
         the idle verdict is reduced over the HiCache group instead of read
@@ -21479,7 +21482,7 @@ class Scheduler(
         # S104 (rc22 D 09:54:35, 10432 tokens): an idle quiesce whose #1470 loop left un-backed nodes (KV arena
         # full of tree references) hands its reset to the sleep leg, where S86 releases the L3-proven slots first
         _s104_deferred = _pdflip_flush_nonblock.s104_defer_reset_verdict(
-            self, group_idle, tp_group_verdict, _s104_unbacked_left
+            self, group_idle, tp_group_verdict, _s104_unbacked_left, flip_quiesce=pdflip_flip_quiesce
         )
         if _s104_deferred is not None:
             logger.info("%s | #1268 group verdict: %s", _s104_deferred, verdict_detail)
