@@ -181,7 +181,7 @@ def test_held_after_the_commit_is_resume_via_p(d_env):
         rvp.write_request("pdflip-16-59", list(range(10)), 18749, 12288, "x_refusal_midstream")
         assert ns._rvp_take() == 1
         p = ns.queue[0]
-        assert p.resume_via_p and p.p_only and p.rid == "pdflip-16-59"
+        assert p.resume_via_p and not p.p_only and p.rid == "pdflip-16-59"  # S107: a text leg is no p_only by state (R7 R9)
 
     asyncio.new_event_loop().run_until_complete(body())
 
