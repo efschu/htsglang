@@ -244,16 +244,28 @@ def _mixed_block(cands: List[tuple], agreed: torch.Tensor) -> torch.Tensor:
     return out
 
 
-def _residual(cands: List[tuple], agreed: torch.Tensor, released: List[int]) -> int:
-    """S86c: agreed slots (no rank vetoes them) this rank holds in a candidate node but did not let go -- 0 on
-    every rank when the group is one."""
-    rel = set(int(s) for s in released)
-    held = set()
-    for _node, sl in cands:
-        for s in sl:
+def _residual_after(tree: Any, pool: Any, agreed: torch.Tensor) -> int:
+    """S86d (review S86c A1): the agreed slots whose reference still EXISTS on this rank AFTER the release, read from
+    the tree's state, not from the release's own bookkeeping: every node of this rank's tree that still names an
+    agreed slot in its Full host rows (a release that "gave back" a node but kept its host rows, a node the
+    candidate scan never saw). 0 on every rank when the group is one.
+
+    Deliberately NOT the arena's per-process RefLedger: on a Form A group the workers QUEUE their arena references
+    (host_mem_release_queue, S83) and give them back before each #1470 round -- right after the release their
+    ledger still holds them, a correct release would read as a residual and stop the group (false W86)."""
+    from flliper.srt.mem_cache.unified_radix_cache import BASE_COMPONENT_TYPE
+
+    left = set()
+    for node in tree._collect_all_nodes():
+        if node is tree.root_node:
+            continue
+        hv = node.component_data[BASE_COMPONENT_TYPE].host_value
+        if hv is None or int(hv.numel()) == 0:
+            continue
+        for s in _slots(pool, hv):
             if not int(agreed[s]):
-                held.add(int(s))
-    return len(held - rel)
+                left.add(int(s))
+    return len(left)
 
 
 def _digest(slots: List[int]) -> int:
@@ -345,7 +357,7 @@ def _after_first_collective(tree, pool, group_max, mine: int, n_slots: int, out:
         # S86c: the unity check reads what must be one -- the agreed release set (its digest, the same on every rank)
         # and the RESIDUAL: agreed slots this rank holds but did not let go (0 on every rank). A rank that holds a
         # slot nobody else holds (TP0's tree is not the workers') releases a different COUNT, which is no divergence.
-        res = _residual(cands, agreed, released)
+        res = _residual_after(tree, pool, agreed)
         dig = _digest(torch.nonzero(agreed == 0).reshape(-1).tolist())
     except Exception:  # noqa: BLE001
         cnt, res, dig, err = len(released), 0, 0, 1
