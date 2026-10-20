@@ -21,6 +21,10 @@ import unittest
 from flliper.srt.environ import envs
 from flliper.srt.managers.scheduler_components import invariant_checker as IC
 
+raise unittest.SkipTest("27B port 20.10.: the 27B line keeps its own admission-wedge clock (deskq 1981, bound to the dual "
+                        "layout, invariant_checker) -- the NF 1507/1515 queue clock is not ported (no profile sets "
+                        "FLLIPER_ADMISSION_WEDGE_QUEUE_CLOCK; runtime unchanged)")
+
 
 class _Base(unittest.TestCase):
     def tearDown(self):  # Env.override() does not restore on an exception inside the block
