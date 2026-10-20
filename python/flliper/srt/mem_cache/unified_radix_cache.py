@@ -3899,7 +3899,37 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 value_chunks=value,
                 best_value_len=best_match_device_value_len,
             )
-        return result
+        # KNOTENTEILUNG 1 (pdflip/rank_uniform_split.py): on a Form A group the
+        # branching point cuts the chunk insert (the mamba track) on EVERY rank. Set
+        # here, after the components (the worker's follow re-match and the host's H96
+        # re-match walk a key CUT at the group depth and carry none), by one rule on
+        # every rank: the outer walk's reach against the depth this rank admits
+        # (the group's). rc28 pdflip-4-201: TP0 83072, workers none -> chunk 1 went
+        # into TP0's tree up to 83072 and into the workers' up to 85248.
+        return UnifiedRadixCache._knoten_uniform_branching(self, result, value)
+
+    def _knoten_uniform_branching(self, result, value):
+        from flliper.srt.pdflip import rank_uniform_split as _rus
+
+        if not _rus.uniform_branching_on():
+            return result
+        from flliper.srt.managers.tp_match_floor import following_walk
+        from flliper.srt.runtime_context import get_server_args
+
+        if following_walk(self):
+            return result   # the nested follow walk: the outer walk sets it
+        comp = None
+        for c in self._components_tuple:
+            if c.component_type == ComponentType.MAMBA:
+                comp = c
+        if comp is None:
+            return result
+        return _rus.apply_uniform_branching(
+            result,
+            [len(v) for v in value],
+            getattr(comp, "mamba_checkpoint_interval", None),
+            lambda: get_server_args().mamba_cache_chunk_size,
+        )
 
     def _split_node(
         self, key: RadixKey, child: UnifiedTreeNode, split_len: int
@@ -4091,6 +4121,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 node._pdflip_fork = True
             target_node = self._add_new_node(node, key, value, priority=priority)
             is_new_leaf = True
+            # KNOTENTEILUNG 2 (pdflip/rank_uniform_split.py): a leaf longer than the
+            # group-uniform publish window is cut HERE at absolute multiples of it --
+            # this insert runs on every rank at the same step with the same key, the
+            # publish sweep (rank-local reach) never has to split it.
+            target_node = self._knoten_grid_split_new_leaf(target_node, total_prefix_length)
         else:
             target_node = node
 
@@ -8786,13 +8821,62 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         w = (size // 4) // chunk * chunk
         return max(chunk, w) // page * page
 
+    def _knoten_grid_split_new_leaf(self, leaf, start: int):
+        """KNOTENTEILUNG 2: cut a freshly inserted device leaf spanning
+        ``[start, start + len(key))`` at every absolute multiple of the H74 window
+        inside it (only when it is longer than the window). Heads are KV-only nodes
+        (the mamba value is attached to the tail by the insert's commit); they are
+        NOT marked as transit chain pieces -- an ordinary node of window size keeps
+        its host copy (L2) after the store write, and so do these. Returns the tail.
+        Off (switch, single-rank group, no H74) -> the leaf unchanged."""
+        from flliper.srt.pdflip import rank_uniform_split as _rus
+
+        if not _rus.split_grid_on(self):
+            return leaf
+        window = self._pdflip_publish_window()
+        cuts = _rus.grid_cuts(start, len(leaf.key), window)
+        if not cuts:
+            return leaf
+        consumed = 0
+        for c in cuts:
+            self._split_node(leaf.key, leaf, c - consumed)
+            consumed = c
+        _rus.note_eager_split(getattr(leaf, "id", "?"), start, consumed + len(leaf.key),
+                              len(cuts) + 1, window)
+        return leaf
+
     def _pdflip_split_for_publish(self, node, window: int):
         """Split ``node`` (longer than ``window``) into a chain of pieces of
         at most ``window`` tokens: head pieces are new KV-only nodes, the
         original node becomes the tail (keeping its mamba anchor and its
         children). Returns the tail, whose parent is the last head piece;
-        the caller backs the pieces up parents-first as the walk proceeds."""
+        the caller backs the pieces up parents-first as the walk proceeds.
+
+        KNOTENTEILUNG 2: with ``FLLIPER_PDFLIP_PUBLISH_SPLIT_GRID`` on a TP group the
+        cuts are the ABSOLUTE multiples of ``window`` inside the node's span (a pure
+        function of the span, the same on every rank whenever it runs), not pieces
+        counted from the node's start."""
         try:
+            from flliper.srt.pdflip import rank_uniform_split as _rus
+
+            if _rus.split_grid_on(self):
+                start = _rus.node_depth(node)
+                cuts = _rus.grid_cuts(start, len(node.key), window)
+                consumed = 0
+                for c in cuts:
+                    head = self._split_node(node.key, node, c - consumed)
+                    head._pdflip_chain_piece = True
+                    consumed = c
+                pieces = len(cuts)
+                if pieces:
+                    n = getattr(self, "_pdflip_split_publish_n", 0) + 1
+                    self._pdflip_split_publish_n = n
+                    if n <= 16 or n % 64 == 0:
+                        logger.info(
+                            "PDFLIP PUBLISH-SPLIT n=%d node=%s pieces=%d window=%d tail_tokens=%d grid=abs start=%d",
+                            n, getattr(node, "id", "?"), pieces + 1, window, len(node.key), start,
+                        )
+                return node if pieces else None
             pieces = 0
             while len(node.key) > window:
                 head = self._split_node(node.key, node, window)

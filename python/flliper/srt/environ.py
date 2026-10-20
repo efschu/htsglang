@@ -3559,6 +3559,21 @@ class Envs:
     # PP stages) keep the quarter-of-the-pool window. False restores the
     # per-rank window.
     FLLIPER_PDFLIP_ENABLE_TP_UNIFORM_PUBLISH_WINDOW = EnvBool(True)
+    # KNOTENTEILUNG 2 (NF rc28 20.10., pdflip/rank_uniform_split.py): on a TP group
+    # with the H74 window, a device leaf longer than the window is cut where it is
+    # inserted, at ABSOLUTE multiples of the window, and the publish sweep's split
+    # cuts at the same absolute points. rc28: the sweep split counted from the
+    # node's start and ran only where the rank's sweep reached (a mamba_claim
+    # refusal stops TP0's sweep alone) -- TP0 7 PUBLISH-SPLITs, TP1/TP2 8, R12 keys
+    # missed. False = the rc28 form (split at publish, from the node's start).
+    FLLIPER_PDFLIP_PUBLISH_SPLIT_GRID = EnvBool(True)
+    # KNOTENTEILUNG 1 (NF rc28 20.10.): on a Form A group every rank derives the
+    # match's branching point (the mamba track that cuts the chunk insert) by the
+    # same rule from its own full-key walk, and the worker's follow re-match and
+    # the host's H96 re-match carry it. rc28: TP0 inserted pdflip-4-201's first
+    # chunk up to its branching track 83072, the workers (follow re-match: no
+    # branching point) up to the chunk end 85248. False = the rc28 form.
+    FLLIPER_PDFLIP_FORM_A_UNIFORM_BRANCHING = EnvBool(True)
     # H98 (rc2.1k, rc9l/rc9m): on a Form A group (--rank-role) the attention
     # host is the ONLY authority for prefix match, anchor verdict and resume
     # depth. The expert workers hold no KV, mamba or host bytes (0.00 GB pools,
