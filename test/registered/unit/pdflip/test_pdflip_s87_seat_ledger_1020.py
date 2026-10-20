@@ -328,8 +328,9 @@ def test_metal_park_no_seat_pattern_the_waiting_short_gets_its_seat_in_age_order
     seats and 3 legs without one -- the rotated pdflip-190-3140, -214-3200, -230-3244. RED on rc19: those three hold
     no seat, the count under-reads D by 3. GREEN: each holds exactly one (a debt); the kurz pdflip-226-3228 waiting at
     the arrival seat is not passed over by the YOUNGER debtor 3244 -- the freed seats go 3140, 3200 (older), then the
-    short, never a younger request first. (Whether a kurz request without a seat may go to P at all is the arrival
-    rule's -- S2b, R2.)"""
+    short, never a younger request first. Nothing here asserts where a seatless kurz request goes: under SOLL R1a it
+    may ride a flip decided by the rules; the 06:53 flip's own defects (p_only by state counted as big, R7; the R6
+    rest of a prefill not really running) are S2b's (planner correction 20.10. 07:45Z)."""
     f = _front()
     seated = ["pdflip-150-3050", "pdflip-150-3051", "pdflip-150-3052"]
     rotated = ["pdflip-190-3140", "pdflip-214-3200", "pdflip-230-3244"]
