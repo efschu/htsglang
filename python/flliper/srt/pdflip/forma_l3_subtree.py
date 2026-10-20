@@ -249,6 +249,7 @@ def _secure_child_anchors(tree: Any, order: List[Any], budget: List[int]) -> Opt
         if not bool(ok.all()):
             _l3s.request(arena, [int(s) for s, k in zip(slots, ok.tolist()) if not k])
             return "child_anchor_pending", getattr(d, "id", "?")
+        _l3s.promote(arena, slots, getattr(mp, "_backend", None))   # S109-A6: the relied-on copy goes MRU (queued)
     return None
 
 

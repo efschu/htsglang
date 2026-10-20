@@ -35,8 +35,21 @@ M = [
   "        if ok:\n            free_evicted_named(arena, [cand[0]], \"evict_handover\")", "        if True:\n            free_evicted_named(arena, [cand[0]], \"evict_handover\")"),
  ("A4 request does not wake the write-behind", R+"mem_cache/l3_secured.py",
   "    WAKE.set()   # S109-A4", "    pass   # S109-A4"),
+ ("A5a pass ignores the shared record", R+"mem_cache/hicache_storage.py",
+  "_stale |= np.asarray(_pub[0][slots]) != gens", "pass"),
+ ("A5b invalidate leaves the write-behind baseline", R+"mem_cache/l3_secured.py",
+  "                base[0][_f] = -1", "                pass"),
+ ("A6 release queues no LRU promotion", R+"mem_cache/l3_secured.py",
+  "            ent[1][st] = None", "            pass"),
+ ("A7 quiesce entrance wakes nothing", R+"managers/pdflip_bubble_publish.py",
+  "_l3s.queue_unsecured_all(\"quiesce\")", "pass"),
+ ("A8a hand-over copies a reaped / reclaimed slot", R+"mem_cache/l3_secured.py",
+  "if st != 3 or (gen is not None and g != int(gen)):", "if False:"),
+ ("A8b failed hand-over copy not counted dropped", R+"mem_cache/l3_secured.py",
+  "            HAND_STATS[\"copy_failed\"] += 1\n            _dropped_without_l3(1)", "            HAND_STATS[\"copy_failed\"] += 1"),
 ]
 TEST = "test/registered/unit/mem_cache/test_s109_backup_wall_aux_leaves_1020.py"
+TEST2 = "test/registered/unit/mem_cache/test_review_s108_s109_1020.py"   # the review's R8/R11 count as well
 res = []
 for name, path, old, new in M:
     src = open(path).read()
@@ -47,7 +60,7 @@ for name, path, old, new in M:
         p = subprocess.run(["flock", "/spinning/gpu-arb/pytest.lock", "timeout", "600", "systemd-run", "--scope", "-q",
                             "-p", "MemoryMax=2G", "-E", "PYTHONPATH=python:test/registered/unit/mem_cache:test/registered/unit/pdflip:test/registered/unit/managers",
                             "-E", "CUDA_VISIBLE_DEVICES=", "/spinning/shvllm/.venv/bin/python", "-m", "pytest", "-q",
-                            "-p", "no:cacheprovider", "--color=no", "--tb=no", TEST],
+                            "-p", "no:cacheprovider", "--color=no", "--tb=no", TEST, TEST2],
                            cwd="/spinning/wt-s109", capture_output=True, text=True)
         tail = [l for l in p.stdout.splitlines() if "passed" in l or "failed" in l][-1:]
         killed = "failed" in (tail[0] if tail else "")

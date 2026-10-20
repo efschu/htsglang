@@ -2555,6 +2555,10 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         _pending = _sl[~_ok]
         if _pending.shape[0]:
             _l3s.request(arena, _pending)
+        if _ok.any():
+            # S109-A6 (re-review R8, ZERO-ANCHOR 1015): the copy this release relies on goes MRU in the store's LRU --
+            # queued, the hand-over thread promotes it (never the evictor lock here)
+            _l3s.promote(arena, _sl[_ok], getattr(self, "_backend", None))
         out["on_disk"] = int(_ok.sum())
         out["written"] = 0
         out["pending_l3"] = int(_pending.shape[0])
