@@ -210,6 +210,10 @@ def prepare(sched, running: List, admissible: List, page: int) -> Plan:
     pl.on = True
     bk = book(sched)
     seen = set()
+    # review R2 (nf-review-d-mem-share-1020): the credits ride an ELEMENT-WISE MIN, so the vector's slots must
+    # be the same pairs on every rank. The queued part is taken in rid order (a set-determined order), never in
+    # queue order -- a different queue order would put other pairs into the same slot or change the length.
+    admissible = sorted(admissible, key=_rid)
     for k, r in enumerate(list(running) + list(admissible)):
         if id(r) not in seen:
             seen.add(id(r))
@@ -224,6 +228,9 @@ def prepare(sched, running: List, admissible: List, page: int) -> Plan:
         if cached is None or cached < page:
             continue
         for i in range(j):
+            # review R1: one tree path per (extra_key, token ids) -- other key, other pages (replicated field)
+            if getattr(pl.members[i], "extra_key", None) != getattr(pl.members[j], "extra_key", None):
+                continue
             if (bk.lcp_of(pl.rids[i], pl.rids[j], pl.members[i], pl.members[j]) // page) * page > 0:
                 pl.cands.append((i, j))
                 pl.local.append(_local_credit(bk, pl.members[i], pl.members[j], page, cap=cached))
@@ -236,19 +243,28 @@ def finish(sched, pl: Plan, agreed: Optional[Sequence[int]]) -> Tuple[int, int, 
     if not pl.on:
         return pl.used_raw, pl.incoming_raw, 0, 0
     bk = book(sched)
+    now: Set[FrozenSet[str]] = set()
     if pl.cands:
         vals = list(agreed) if agreed is not None else []
         if len(vals) != len(pl.cands):
             vals = [0] * len(pl.cands)
         for (i, j), v in zip(pl.cands, vals):
-            bk.agreed[_key(pl.rids[i], pl.rids[j])] = max(0, int(v))
+            k = _key(pl.rids[i], pl.rids[j])
+            bk.agreed[k] = max(0, int(v))
+            now.add(k)
 
     def distinct(upto: int) -> Tuple[int, int]:
         total, shared = 0, 0
         for j in range(upto):
             c = 0
             for i in range(j):
-                c = max(c, int(bk.agreed.get(_key(pl.rids[i], pl.rids[j]), 0)))
+                k = _key(pl.rids[i], pl.rids[j])
+                # review R3: a QUEUED member is credited only by a pair agreed in THIS tick's call (so the
+                # NO_TOKEN guard and its tree prefix are re-read); the book serves running pairs only. A
+                # request parked / retracted back into the queue is no candidate -> it counts whole.
+                if j >= pl.n_run and k not in now:
+                    continue
+                c = max(c, int(bk.agreed.get(k, 0)))
             t = _tokens(pl.members[j])
             c = min(c, t)
             total += t - c
