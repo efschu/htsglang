@@ -165,10 +165,14 @@ class DExtendBeacon:
                     rest = max(0, int(rest_list[i]))
                 except (TypeError, ValueError):
                     rest = -1
-            self._after.pop(rid, None)
             if rest >= 0 and len_list is not None and i < len(len_list):
                 try:
-                    self._after[rid] = max(0, rest - max(0, int(len_list[i])))
+                    # FIFO per rid (review A2a): with overlap scheduling chunk k+1 is launched before chunk k's result is
+                    # processed, so one value would hand chunk k's done the after-rest of the LAST chunk
+                    q = self._after.get(rid)
+                    if q is None:
+                        q = self._after[rid] = collections.deque(maxlen=64)
+                    q.append(max(0, rest - max(0, int(len_list[i]))))
                     while len(self._after) > ARMED_CAP:
                         self._after.popitem(last=False)
                 except (TypeError, ValueError):
@@ -187,10 +191,13 @@ class DExtendBeacon:
         if self.mm is None:
             return
         for rid in rids:
-            after = self._after.pop(rid, None)
+            q = self._after.get(rid)
             t_first = self._live.get(rid)
-            if after is None or t_first is None:
+            if not q or t_first is None:
                 continue
+            after = q.popleft()
+            if not q:
+                self._after.pop(rid, None)
             try:
                 off = _HDR_SIZE + (self._head % self._slots) * _REC_SIZE
                 self._head += 1
@@ -240,7 +247,7 @@ def read_group_full(directory: str, group: str, sid: int,
                     ) -> Optional[Dict[int, Tuple[int, int]]]:
     """``{rid_key: (first extend start ns, rest)}`` over the group's LIVE ranks (pid in the group's session); None when
     no such file is readable (no channel -- nothing is proven running). Per rank the NEWEST record of a key (its write
-    counter); over ranks the larger start, then the larger rest (deterministic: the file order never decides).
+    counter); over ranks the larger start and, separately, the larger rest (deterministic: the file order never decides).
     ``rest`` -1 = the rank did not report one (a v1 file)."""
     if not directory or not sid:
         return None
@@ -272,8 +279,9 @@ def read_group_full(directory: str, group: str, sid: int,
                     own[key] = (int(seq), int(t_ns), int(rest))
         for key, (_seq, t_ns, rest) in own.items():
             prev = out.get(key)
-            if prev is None or (t_ns, rest) > prev:
-                out[key] = (t_ns, rest)
+            # review A2b (R11): the start stamp and the rest are merged SEPARATELY -- the later start never decides the rest;
+            # the MAX rest over the ranks does (a rank that has not finished keeps it alive)
+            out[key] = (t_ns, rest) if prev is None else (max(prev[0], t_ns), max(prev[1], rest))
     return out if seen else None
 
 

@@ -271,3 +271,38 @@ def test_a2_the_scheduler_reports_the_rest_after_the_forward_ends():
     assert "note_extend_done(rids=" in src and "pdflip_skip_extend" in src
     assert "extend_lens=[_pdflip_d_ext.req_extend_len(req)" in inspect.getsource(S.Scheduler._run_batch_forward)
     assert dxb._VERSION == 3 and dxb.req_extend_len(type("R", (), {"extend_input_len": 7})()) == 7
+
+
+# ---------------------------------------------------------------------------------------------------- A2a / A2b (review of the Auflagen)
+_RID9, _SID9 = "pdflip-9-1", 7
+
+
+def _read9(d):
+    return dxb.read_group_full(str(d), "D", _SID9, session_of=lambda pid: _SID9)[dxb.rid_key(_RID9)][1]
+
+
+def test_a2a_overlap_chunked_done_of_chunk1_after_chunk2_started_keeps_chunk2_rest(tmp_path):
+    """SOLL R6: overlap scheduling launches chunk 2 before chunk 1's result is processed; the done of chunk 1 must report
+    chunk 1's after-rest (2904), never the 0 of the last chunk (FIFO per rid)."""
+    bc = dxb.DExtendBeacon(str(tmp_path / "D-pid1.bin"), clock_ns=lambda: 10**9)
+    bc.note_recv(rid=_RID9)
+    bc.note_extend(rids=[_RID9], rests=[7000], extend_lens=[4096])
+    bc.note_extend(rids=[_RID9], rests=[2904], extend_lens=[2904])
+    assert _read9(tmp_path) == 2904
+    bc.note_extend_done(rids=[_RID9])
+    assert _read9(tmp_path) == 2904
+    bc.note_extend_done(rids=[_RID9])
+    assert _read9(tmp_path) == 0
+
+
+def test_a2b_ranks_merge_by_max_rest_not_by_the_later_start_stamp(tmp_path):
+    """SOLL R6/R11: TP0 stamped 100 ns later and finished first (0); TP1 still computes (182): the group's rest is 182."""
+    a = dxb.DExtendBeacon(str(tmp_path / "D-pid1.bin"), clock_ns=lambda: 1_000_000_100)
+    b = dxb.DExtendBeacon(str(tmp_path / "D-pid2.bin"), clock_ns=lambda: 1_000_000_000)
+    for bc in (a, b):
+        bc.note_recv(rid=_RID9)
+        bc.note_extend(rids=[_RID9], rests=[182], extend_lens=[182])
+    a.note_extend_done(rids=[_RID9])
+    assert _read9(tmp_path) == 182
+    b.note_extend_done(rids=[_RID9])
+    assert _read9(tmp_path) == 0
