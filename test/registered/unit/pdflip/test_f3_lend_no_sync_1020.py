@@ -476,3 +476,17 @@ def test_m9_the_fetch_stream_helper_registers_and_install_uses_it(monkeypatch):
     src = inspect.getsource(eo)
     assert "self._stream = _new_row_stream() if cuda else None" in src
     assert "self._stream = torch.cuda.Stream()" not in src
+
+
+def test_copy_ms_is_booked_when_the_mover_books_on_the_device(ops):
+    """F3 review (copy_ms on CUDA): the device mover's bytes go to a device counter, so the host int shows no
+    move -- the rows-OFF host ms must still be booked as copy_ms."""
+    tms = h.CoreTms()
+    with h._armed(tms), _floor():
+        r, ctl = _lent(tms)
+        for c in r.caches:
+            c._pdflip_bank_bytes_dev = torch.zeros(1, dtype=torch.int64)
+        before = ctl.copy_ms
+        with mock.patch("time.perf_counter", side_effect=[0.0, 0.004] * 4 + [0.0] * 20):
+            ctl.unlend()
+        assert ctl.copy_ms > before

@@ -2250,6 +2250,10 @@ class SeatVram:
         if moved > 0:
             self.bytes_copied += moved
             self.copy_ms += ms
+        elif any(getattr(c, "_pdflip_bank_bytes_dev", None) is not None for c in self.caches):
+            # F3 review (copy_ms on CUDA): the device mover books its bytes on the device (bytes_copied_dev,
+            # read back without a wait); the host ms of the rows-OFF move is booked here unconditionally
+            self.copy_ms += ms
         return fence
 
     def _release_behind(self, fence, plans, census) -> None:

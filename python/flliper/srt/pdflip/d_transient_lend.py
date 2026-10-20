@@ -602,7 +602,9 @@ def _bytes_now(sched, ctl, why: str) -> None:
     """F3: an extend (or its width vote) needs the returned bytes in THIS pass -- the deferred unmaps go now,
     waiting on their ROW-FENCE's E1 alone (the rows' last readers: the forward in flight). The wait overlaps
     that forward on the device; the line names it."""
-    if not getattr(ctl, "pending_releases", None):
+    # F3 review B1: an unmap already handed to the map thread (release_jobs) is joined too -- the width
+    # vote and the extend must read the card with the cells back
+    if not (getattr(ctl, "pending_releases", None) or getattr(ctl, "release_jobs", None)):
         return
     ms = ctl.drain_releases(block=True)
     _gap_note(sched, "lend_return", ms)
