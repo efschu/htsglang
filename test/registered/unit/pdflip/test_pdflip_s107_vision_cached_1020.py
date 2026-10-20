@@ -94,13 +94,18 @@ def test_a_text_leg_over_x_still_needs_p(d_env):
     assert pp.immediate_park_trigger([p], X) is p
 
 
-def test_a_wall_record_without_a_probe_price_keeps_the_rows_named(d_env, caplog):
+def test_a_wall_record_without_any_price_is_unpriced_never_the_rows(d_env, caplog):
+    """NF-VISION-CACHED (20.10., rc28 pdflip-4-226): before, no probe price -> the rows (the whole context) were the class
+    (u_src=d_rows) and R4 flipped. Now: no D price and no store depth -> UNPRICED (u=0: no set member, no flip reason,
+    R7), named, and a store re-probe prices it (test_nf_vision_cached_flip_1020)."""
     f = _front()
     rvp.write_request("pdflip-9-9", list(range(30000)), 30000, X, rvp.REASON_WALL)
     with caplog.at_level("INFO"):
         assert _take(f) == 1
-    assert f.queue[-1].est_uncached == 30000
-    assert any("RESUME-VIA-P CLASS rid=pdflip-9-9" in m and "u_src=d_rows" in m for m in caplog.messages)
+    assert f.queue[-1].est_uncached == 0 and f.queue[-1].p_only is False
+    assert f.counters["rvp_text_unpriced"] == 1
+    assert any("RESUME-VIA-P CLASS rid=pdflip-9-9" in m and "u_src=unpriced" in m for m in caplog.messages)
+    assert not any("u_src=d_rows" in m for m in caplog.messages)
 
 
 def test_streamed_output_past_the_probed_prompt_counts_as_uncached(d_env):
@@ -150,7 +155,7 @@ def test_the_requeue_path_calls_the_wall_conversion_before_any_use_of_the_extent
     import inspect
     src = inspect.getsource(F.Front._requeue_after_x_refusal)
     i_parse = src.index("d_extent = _d_refusal_extent(body)")
-    i_conv = src.index("Front._wall_extent_to_u(self, rid, body, d_extent)")
+    i_conv = src.index("Front._wall_extent_to_u(self, rid, body, d_extent,")
     i_use = src.index("handback_empty = (")
     assert i_parse < i_conv < i_use
 
