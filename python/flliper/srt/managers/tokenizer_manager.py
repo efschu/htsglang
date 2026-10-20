@@ -3770,6 +3770,19 @@ class SignalHandler:
         logger.error(
             f"SIGQUIT received. {signum=}, {frame=}. It usually means one child failed."
         )
+        # EXIT WITNESS (NF 20.10. 14:18:29Z): name every child that is already
+        # gone BEFORE the watch stops -- the peers' SIGQUIT beat the 1 s poll,
+        # and the OOM-killed rank 0 was never reported. Never raises.
+        try:
+            _sweep = getattr(
+                self.tokenizer_manager._subprocess_watchdog,
+                "report_dead_children",
+                None,
+            )
+            if _sweep is not None:
+                _sweep("SIGQUIT")
+        except Exception:  # noqa: BLE001 - the witness may not stop the kill
+            logger.error("EXIT-WITNESS sweep failed at SIGQUIT", exc_info=True)
         # Stop subprocess watchdog before killing processes to prevent false-positive
         # crash detection during normal shutdown
         if self.tokenizer_manager._subprocess_watchdog is not None:
