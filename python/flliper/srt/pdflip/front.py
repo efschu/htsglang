@@ -12484,7 +12484,8 @@ class Front:
             counted = dict(self.__dict__.get("_r6_counted") or {})
             ids = self.__dict__.get("_set_ids") or {}
             sess_of = self.__dict__.get("_sess_by_rid") or {}
-            depths = self._set_st().get("depths") or {}
+            book = self.__dict__.get("_set_depth") or {}
+            by_rid = {str(q.rid): q for q in list(getattr(self, "queue", ()) or ())}
             runs = []
             for rid, rest in counted.items():
                 ia = ids.get(str(rid))
@@ -12492,7 +12493,18 @@ class Front:
                     self.counters["r1u_overlap_unknown"] += 1
                     continue
                 runs.append((str(rid), len(ia) - int(rest), int(rest), str(sess_of.get(str(rid)))))
-            mem = [(m.rid, int(depths.get(m.rid, 0)), str(sess_of.get(str(m.rid)) or "")) for m in members]
+            mem = []
+            for m in members:
+                d = book.get(str(m.rid))
+                if d is None:
+                    q = by_rid.get(str(m.rid))
+                    if q is not None and int(getattr(q, "est_prompt", 0) or 0) > 0:
+                        d = max(0, int(q.est_prompt) - int(getattr(q, "est_uncached", 0) or 0))
+                if d is None:
+                    # review A3 (user order "nichts schaetzen"): no depth known = no overlap known: nothing is taken off, named
+                    self.counters["r1u_depth_unknown"] += 1
+                    continue
+                mem.append((m.rid, int(d), str(sess_of.get(str(m.rid)) or "")))
             ov = phase_policy.running_overlap(runs, mem, lambda a, b: Front._set_common(self, a, b))
         except Exception:  # noqa: BLE001 -- an exactness aid never breaks a verdict: the naive figure stands
             return running

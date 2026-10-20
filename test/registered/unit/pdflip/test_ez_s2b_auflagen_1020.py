@@ -268,7 +268,7 @@ def test_a2_the_scheduler_reports_the_rest_after_the_forward_ends():
     from flliper.srt.managers import scheduler as S
 
     src = inspect.getsource(S.Scheduler.process_batch_result)
-    assert "note_extend_done(rids=" in src and "pdflip_skip_extend" in src
+    assert "note_extend_done(rids=" in src       # review A2c: skip batches report too
     assert "extend_lens=[_pdflip_d_ext.req_extend_len(req)" in inspect.getsource(S.Scheduler._run_batch_forward)
     assert dxb._VERSION == 3 and dxb.req_extend_len(type("R", (), {"extend_input_len": 7})()) == 7
 
@@ -463,3 +463,46 @@ def test_rc26_pdflip_46_451_a_chunked_prefill_counts_only_what_is_left(monkeypat
     with envs.FLLIPER_PDFLIP_DECIDER.override(True):
         assert f._dc_carried_running() == 540
         assert f._decode_collect(now) == "P" and f.__dict__["_r6_counted"] == {"pdflip-46-451": 540}
+
+
+# ---------------------------------------------------------------------------------------------------- A2c / A3 (review R1u)
+def test_a2c_a_skip_batch_reports_its_done_too():
+    """The scheduler reports note_extend_done for every extend batch, a skip batch included (FIFO stays aligned)."""
+    import inspect
+    from flliper.srt.managers import scheduler as S
+    src = inspect.getsource(S.Scheduler.process_batch_result)
+    i = src.index("note_extend_done")
+    assert "pdflip_skip_extend" not in src[src.rindex("if self.pdflip_d_ext_beacon", 0, i):i]
+
+
+def test_a2c_fifo_stays_aligned_when_a_skip_batch_is_followed_by_a_real_chunk(tmp_path):
+    """A skip resume (note_extend + done, nothing computed in the rest after it: reported as sent) then a real chunk: the
+    done of the real chunk reads ITS rest, not the skip batch's."""
+    bc = dxb.DExtendBeacon(str(tmp_path / "D-pid1.bin"), clock_ns=lambda: 10**9)
+    bc.note_recv(rid=_RID9)
+    bc.note_extend(rids=[_RID9], rests=[5000], extend_lens=[1000])      # skip batch
+    bc.note_extend_done(rids=[_RID9])                                   # now reported (A2c)
+    assert _read9(tmp_path) == 4000
+    bc.note_extend(rids=[_RID9], rests=[4000], extend_lens=[4000])      # real chunk
+    bc.note_extend_done(rids=[_RID9])
+    assert _read9(tmp_path) == 0
+
+
+def test_a3_r1u_unknown_member_depth_takes_nothing_off_and_is_named(monkeypatch, tmp_path):
+    """User order "nichts schaetzen": a member whose cached depth is not known is not assumed at depth 0 (that would count its
+    whole prefix as shared): no overlap is taken off, ``r1u_depth_unknown`` names it. With the depth known the live case
+    still counts once."""
+    _on(monkeypatch)
+    now = time.time()
+    f = _front_r1u(now, tmp_path)
+    rb = "pdflip-10-81"
+    f.__dict__["_set_depth"].pop(rb)
+    f._set_st()["shorts"][rb] = (now - 1.0, 3068, 5229)
+    members = [pp.SetMember(rb, 3068, now - 1.0, False)]
+    with envs.FLLIPER_PDFLIP_DECIDER.override(True):
+        running = f._dc_carried_running()
+        assert F.Front._r1u_running(f, running, members) == running == 2911
+    assert f.counters["r1u_depth_unknown"] == 1 and f.counters["r1u_overlap_tokens"] == 0
+    f.__dict__["_set_depth"][rb] = 7000
+    with envs.FLLIPER_PDFLIP_DECIDER.override(True):
+        assert F.Front._r1u_running(f, f._dc_carried_running(), members) == 0
