@@ -62,6 +62,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -3662,13 +3663,93 @@ def _kv_compact_plans_from_vote(sv, group: List[int], floor_page: int, top_page:
     lo = group[1 + B:1 + B + (T - B)]
     hi = [-int(x) for x in group[1 + B + (T - B):]]
     agreed = KC.agreed_survey(sv, T, dest, lo, hi)
-    plans, why = [], ""
+    plans, why = _Plans(), ""
     for b in boundaries:
         pl, w = KC.plan_for(agreed, int(b))
         plans.append(pl)
+        plans.whys.append("" if pl is not None else w)
         if pl is None and not why:
             why = w
     return plans, why
+
+
+class _Plans(list):
+    """S98e: the plans per candidate, carrying each candidate's reason (``whys``) so
+    the refusal names every candidate stage, not only the first."""
+
+    def __init__(self, *a):
+        super().__init__(*a)
+        self.whys: List[str] = []
+
+
+def _kv_compact_stage_reasons(cands, whys) -> str:
+    """'S1..S7: <reason>; S0: <reason>' -- consecutive equal reasons folded."""
+    out, run = [], []
+    for jj, w in zip(cands, whys):
+        w = re.sub(r"\b\d{3,}\b", "N", w or "plan ok")[:110]
+        if run and run[-1][1] == w:
+            run[-1][0].append(jj)
+        else:
+            run.append(([jj], w))
+    for js, w in run:
+        out.append("S%d%s: %s" % (js[0], "" if len(js) == 1 else "..S%d" % js[-1], w))
+    return "; ".join(out)
+
+
+def _kv_compact_page_witness(sched, sv, page: int, vec=None, floor_page: int = 0) -> str:
+    """S98e: what holds ``page`` on THIS rank, read where it lives -- rank-local, no
+    collective, logged only on a refusal. Kinds: free / release list / staged free /
+    withheld by a cap / tree node (id, lock, write-through, load-back, backed, two
+    owners) / a running or waiting request (rid, from req_to_token) / nobody known."""
+    import torch
+
+    from flliper.srt.pdflip import d_kv_compact as KC
+
+    P = _page_size(sched)
+    alloc = _kv_allocator(sched)
+    p = int(page)
+    kinds = []
+    if vec is not None and p > int(floor_page):
+        B = int(floor_page)
+        T = (len(vec) - 1 - B) // 2 + B
+        if p <= T:
+            kinds.append("vote=%d" % int(vec[1 + B + (p - B - 1)]))
+    for name in ("free_pages", "release_pages"):
+        ids = KC._id_tensor(getattr(alloc, name, None))
+        if bool((ids == p).any()):
+            kinds.append(name)
+    for t in (getattr(alloc, "free_group", None) or []):
+        if bool((KC._id_tensor(t) // P == p).any()):
+            kinds.append("staged-free(free_group)")
+            break
+    for cap in KC.cap_filters(alloc):
+        if bool((KC._id_tensor(getattr(cap, "_withheld", None)) == p).any()):
+            kinds.append("withheld(cap=%s)" % getattr(cap, "cap", "?"))
+    np_ = getattr(sv, "owner", {}).get(p) if sv is not None else None
+    if np_ is not None:
+        node = np_.node
+        nid = getattr(node, "id", "?")
+        tree = getattr(sched, "tree_cache", None)
+        locks = [int(getattr(cd, "lock_ref", 0) or 0) for cd in node.component_data]
+        kinds.append("tree(node=%s locks=%s wt=%s lb=%s backed=%s pinned=%s)" % (
+            nid, locks, nid in (getattr(tree, "ongoing_write_through", None) or {}) or
+            getattr(node, "write_through_pending_id", None) is not None,
+            nid in (getattr(tree, "ongoing_load_back", None) or {}), np_.backed, np_.pinned))
+    rtt = getattr(_req_pool(sched), "req_to_token", None)
+    reqs = list(getattr(getattr(sched, "running_batch", None), "reqs", None) or [])
+    for r in reqs + list(getattr(sched, "waiting_queue", None) or []):
+        idx = getattr(r, "req_pool_idx", None)
+        if rtt is None or idx is None:
+            continue
+        try:
+            n = int(len(getattr(r, "origin_input_ids", ()) or ()) + len(getattr(r, "output_ids", ()) or ()))
+            row = rtt[int(idx), :max(1, n)].to("cpu", torch.int64) // P
+            if bool((row == p).any()):
+                kinds.append("request(rid=%s %s)" % (getattr(r, "rid", "?"),
+                                                    "running" if r in reqs else "waiting"))
+        except Exception:  # noqa: BLE001 -- a witness never fails the tick
+            continue
+    return ", ".join(kinds) or "nobody known here (live, no tree node, no request row)"
 
 
 def _kv_compact_rank_plans(sched, boundaries: Sequence[int], top_page: Optional[int] = None):
@@ -3770,7 +3851,23 @@ def _kv_compact_for_shrink(sched, ms, fr, want: int, end: bool, floor_tokens: in
                         KV_COMPACT_MARK, n, int(want), int(ms.stage), int(floor_tokens),
                         "yes" if end else "no", "".join(str(x) for x in anys),
                         why or "a peer rank cannot clear the boundary")
+            _refusal_detail()
         return None
+
+    def _refusal_detail():
+        # S98e: every candidate stage's reason (the line above names the first only), and
+        # for a named page what holds it HERE -- rank-local, no collective
+        try:
+            whys = getattr(plans, "whys", None)
+            if whys is not None and len(whys) == len(cands):
+                logger.info("%s n=%d STAGES %s", KV_COMPACT_MARK, n,
+                            _kv_compact_stage_reasons(cands, whys))
+            pages = sorted({int(x) for x in re.findall(r"page (\d+)", why or "")})
+            for pg in pages[:2]:
+                logger.info("%s n=%d WITNESS page=%d (tokens from %d) here: %s", KV_COMPACT_MARK, n,
+                            pg, pg * page, _kv_compact_page_witness(sched, sv, pg, vec, floor_page))
+        except Exception as exc:  # noqa: BLE001 -- an instrument never fails the tick
+            logger.info("%s n=%d WITNESS failed: %s: %s", KV_COMPACT_MARK, n, type(exc).__name__, exc)
 
     if int(group[0]) != 1:          # the group said no: replicated, every rank returns here
         return _refused()
@@ -3795,6 +3892,7 @@ def _kv_compact_for_shrink(sched, ms, fr, want: int, end: bool, floor_tokens: in
         if d <= 16 or (d & (d - 1)) == 0:
             logger.warning("%s n=%d verdict=refused-plan-diff diffs=%d want=S%d stage=S%d floor=%d -- %s",
                            KV_COMPACT_MARK, n, d, int(want), int(ms.stage), int(floor_tokens), why)
+            _refusal_detail()
         return None
     if plan is None:
         return _refused()
