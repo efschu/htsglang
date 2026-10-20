@@ -357,18 +357,21 @@ class ArenaMambaPoolHost(MambaPoolHost):
         A detached anchor-only write (KV only in the store) hands its reference
         back at the ack, so its slot is a clock candidate from then on; this is
         how the tree learns that a ``pdflip_anchor_secured`` mark no longer holds.
-        One C lookup; the L3 index (#1459) only when the arena misses. None =
-        cannot tell (unbound pool, backend without a stat)."""
+        One C lookup; the L3 index (#1459) only when the arena misses -- S109d:
+        the index alone, never a stat. None = cannot tell (unbound pool, no
+        opened index)."""
         if self.arena is None or self._backend is None or last_hash is None:
             return None
         stem = self._stems([last_hash])[0]
         slot, state = self.arena.find_slots([stem])[0]
         if slot >= 0 and state == 2:
             return True
-        stat = getattr(self._backend, "_stat_stems", None)
-        if not callable(stat):
+        # S109d (user 20.10.: no synchronous I/O in the scheduler thread): the L3 side is the shared #1459 stem index
+        # (the evictor's exact bookkeeping, a shm table) -- no stat. Without an opened index: cannot tell (None).
+        listed = getattr(self._backend, "l3_listed", None)
+        if not callable(listed) or getattr(self._backend, "_l3idx", None) is None:
             return None
-        return stem in stat([stem])
+        return bool(listed([stem])[0])
 
     # -- fnFL2 H19: anchor displacement -----------------------------------------------
     def settled_anchor_slots(self, host_value: Optional[torch.Tensor]) -> Optional[list]:
@@ -400,10 +403,17 @@ class ArenaMambaPoolHost(MambaPoolHost):
         if self.arena is None or not slots:
             return 0
         slots = [int(s) for s in slots]
-        self._secure_before_drop(slots)
-        return self.arena.drop_unreferenced(slots)
+        # S109-A2 (review 20.10.): read and queue, never write -- an unreferenced anchor WITHOUT an L3 copy (record AND
+        # index) is NOT dropped; it stays COMPLETE in its slot (the clock's keep list holds it) and is queued for the
+        # write-behind. Only copied ones leave.
+        keep = self._secure_before_drop(slots)
+        drop = [s for s in slots if s not in keep]
+        return self.arena.drop_unreferenced(drop) if drop else 0
 
-    def _secure_before_drop(self, slots) -> dict:
+    def _secure_before_drop_now(self, slots) -> dict:
+        """S109-A2: the WRITER's form -- the pre-S109-A2 synchronous body (pin, ``arena_secure_to_disk``, unpin), never
+        on the scheduler path; the unit tests of the H19 / #257 (ii) LOGIC use it as "the write-behind has run"
+        (conftest seam)."""
         arena = self.arena
         out = {"on_disk": 0, "written": 0, "lost": 0}
         try:
@@ -451,6 +461,38 @@ class ArenaMambaPoolHost(MambaPoolHost):
                         ArenaMHAHostPool._257_written_to_l3, ArenaMHAHostPool._257_dropped_without_l3)
         return out
 
+
+    def _secure_before_drop(self, slots) -> set:
+        """S109-A2: which of ``slots`` must NOT be dropped -- unreferenced, COMPLETE, and without an L3 copy by the
+        write-behind's record AND the #1459 index (``l3_secured.check``: memory only; the missing ones are queued for
+        the write-behind). A referenced or not-COMPLETE slot is ``drop_unreferenced``'s own business (it never drops
+        those). No stat, no write: the pre-S109-A2 synchronous copy (``arena_secure_to_disk`` with fsync, 56 MiB per
+        anchor) ran here in the scheduler thread (H19 displacement, park / flush spill room)."""
+        arena = self.arena
+        try:
+            idle = [s for s, r in zip(slots, arena.slot_refs(slots)) if r == 0]
+        except Exception as exc:  # noqa: BLE001 - unreadable: keep every slot (fail closed)
+            logger.warning("#257 ANCHOR-DROP refs unreadable (%r): %d slot(s) kept", exc, len(slots))
+            return set(int(s) for s in slots)
+        if not idle:
+            return set()
+        try:
+            states = arena.slot_states(idle)
+        except Exception:  # noqa: BLE001
+            return set(int(s) for s in idle)
+        complete = [s for s, st in zip(idle, states) if int(st) == 2]
+        if not complete:
+            return set()
+        from flliper.srt.mem_cache import l3_secured as _l3s
+
+        ok = _l3s.check(arena, complete, self._backend, writer="anchor_drop")
+        keep = {int(s) for s, k in zip(complete, ok.tolist()) if not k}
+        n = getattr(ArenaMambaPoolHost, "_257_anchor_drop_n", 0) + 1
+        ArenaMambaPoolHost._257_anchor_drop_n = n
+        if keep and (n <= 16 or n % 64 == 0):
+            logger.info("#257 ANCHOR-DROP S109-A2 n=%d kept=%d of %d unreferenced (no L3 copy yet: queued for the "
+                        "write-behind, dropped at a later release once copied)", n, len(keep), len(complete))
+        return keep
     def is_arena_id(self, i: int) -> bool:
         return self.staging_rows <= int(i) < self.staging_rows + self.arena_slots
 

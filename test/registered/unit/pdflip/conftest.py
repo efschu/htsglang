@@ -185,6 +185,13 @@ def _s109b_write_behind_instant(request, monkeypatch):
         from flliper.srt.mem_cache import l3_secured as _l3s
 
         monkeypatch.setattr(_l3s, "check", _l3s.check_now)
+        monkeypatch.setattr(_l3s, "unsecured_keys_lo", _l3s.unsecured_keys_lo_none)
+        monkeypatch.setattr(_l3s, "verify_candidates", _l3s.verify_candidates_now)
+        from flliper.srt.mem_cache.pool_host import arena_mamba_pool as _amp
+
+        if hasattr(_amp.ArenaMambaPoolHost, "_secure_before_drop_now"):
+            monkeypatch.setattr(_amp.ArenaMambaPoolHost, "_secure_before_drop",
+                                lambda self, slots: (self._secure_before_drop_now(slots), set())[1])
     except Exception:  # noqa: BLE001
         pass
     yield

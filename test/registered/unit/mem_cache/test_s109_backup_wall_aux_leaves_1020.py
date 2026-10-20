@@ -337,6 +337,8 @@ def test_the_shared_record_is_one_mapping_for_every_process(tmp_path):
     g, _lo = L3S.arrays(owner, create=True)
     g[4] = 5
     g.flush()
+    assert L3S.secured(reader, [3, 4]).tolist() == [False, False], "the reader re-tries attaching at most once a second"
+    reader._l3sec_retry_at = 0.0                             # a second later
     assert L3S.secured(reader, [3, 4]).tolist() == [False, True]
 
 
@@ -434,3 +436,466 @@ def test_the_write_behind_keeps_its_record_in_the_shared_mapping_and_serves_requ
     i_cur = src.index("new = new[int(np.searchsorted(slots[new], cur)):]")
     i_cat = src.index("new = np.concatenate([_urg_new, new])")
     assert i_take < i_cur < i_cat
+
+
+# ---------------------------------------------------------------------------------------------------- S109d claim / clock / anchor
+_needs_gcc = pytest.mark.skipif(__import__("shutil").which("gcc") is None, reason="needs gcc")
+
+
+class _Idx:
+    """The #1459 L3 stem index (shm): the evictor lists a file on commit and unlists it on its LRU unlink."""
+
+    def __init__(self):
+        self.files = set()
+
+    def has(self, stems):
+        return [st in self.files for st in stems]
+
+
+def _write_behind(arena, idx, slots):
+    """What one write-behind pass leaves behind for ``slots``: the file in the store (index) AND the record."""
+    from flliper.srt.mem_cache import l3_secured as L3S
+
+    for s_ in slots:
+        idx.files.add(arena.slot_stem(int(s_)))
+    L3S.mark(arena, slots)
+
+
+def _unreferenced_full_arena(tmp_path, n=6):
+    """A real C arena: ``n`` COMPLETE pages nobody references (the clock's candidates), a backend whose WRITER raises."""
+    from test_w3_arena_spill_0929 import _finished, _pool
+
+    p, arena, root = _pool(tmp_path, n)
+    rows = [_finished(p, arena, [f"u{i}"], 0x50 + i) for i in range(n)]
+    slots = []
+    for r in rows:
+        s_ = [int(x) for x in p.arena_ids(r).tolist()] if hasattr(p, "arena_ids") else []
+        slots.extend(s_)
+    stems = p._stems([f"u{i}" for i in range(n)])
+    slots = [int(s) for s, _st in arena.find_slots(stems)]
+    assert arena.ref_slots(slots, -1) == len(slots)          # the tree let go: unreferenced, COMPLETE
+
+    def _no_write(*a, **k):
+        raise AssertionError("S109d: no L3 write on the claim / clock path")
+
+    p._backend.arena_secure_to_disk = _no_write
+    p._backend._stat_stems = _no_write
+    p._backend._l3idx = _Idx()
+    return p, arena, slots
+
+
+@_needs_gcc
+def test_s109d_a_claim_frees_only_pages_with_a_published_copy_and_queues_the_rest(tmp_path):
+    from flliper.srt.mem_cache import l3_secured as L3S
+
+    p, arena, slots = _unreferenced_full_arena(tmp_path)
+    assert p._evict_for_claim(arena, 2) == 0, "no page has an L3 copy yet: nothing is freed, nothing written"
+    assert set(getattr(arena, "_l3wb_urgent", set())) == set(slots), "all queued for the write-behind"
+    L3S.take_urgent(arena)
+    _write_behind(arena, p._backend._l3idx, slots[:2])      # the write-behind's pass
+    assert p._evict_for_claim(arena, 2) == 2
+    assert arena.slot_states(slots[:2]) != [2, 2]
+    assert arena.slot_states(slots[2:]) == [2] * (len(slots) - 2), "uncopied pages stay in L2"
+
+
+@_needs_gcc
+def test_s109d_the_clock_evict_frees_only_copied_pages(tmp_path):
+    from flliper.srt.mem_cache import l3_secured as L3S
+
+    p, arena, slots = _unreferenced_full_arena(tmp_path)
+    from flliper.srt.mem_cache.hicache_storage import HiCacheFile
+
+    be = p._backend
+    be.pins = None
+    assert HiCacheFile._arena_evict_to_disk(be, arena, 4) == 0
+    assert arena.slot_states(slots) == [2] * len(slots), "no page has a copy: the clock frees nothing"
+    _write_behind(arena, be._l3idx, slots[:3])
+    # the clock takes at most an eighth of the arena per call (EVICT-KEEP): one page here; it WRITES nothing (returns 0)
+    assert [HiCacheFile._arena_evict_to_disk(be, arena, 4) for _ in range(4)] == [0, 0, 0, 0]
+    assert all(st != 2 for st in arena.slot_states(slots[:3])), "the copied pages left L2"
+    assert arena.slot_states(slots[3:]) == [2] * (len(slots) - 3), "uncopied pages stay in L2"
+
+
+@_needs_gcc
+def test_s109_a1_record_and_index_both_or_nothing(tmp_path):
+    """Review S109-1 (R4): a page the write-behind copied whose L3 file the store's LRU then unlinked is NOT secured;
+    a file in the index without the record of THIS generation is not either."""
+    from flliper.srt.mem_cache import l3_secured as L3S
+
+    p, arena, slots = _unreferenced_full_arena(tmp_path)
+    be = p._backend
+    _write_behind(arena, be._l3idx, slots[:3])
+    assert L3S.secured(arena, slots[:3], be).tolist() == [True, True, True]
+    be._l3idx.files.discard(arena.slot_stem(slots[0]))       # the L3 LRU took the file of slot 0
+    L3S.invalidate_stems(arena, [arena.slot_stem(slots[1])])  # ... and of slot 1, with the evict hook
+    assert L3S.secured(arena, slots[:3], be).tolist() == [False, False, True]
+    be._l3idx.files.add(arena.slot_stem(slots[4]))           # a file in the store, no record of this generation
+    assert L3S.secured(arena, [slots[4]], be).tolist() == [False]
+    assert p._evict_for_claim(arena, 3) == 1, "only the page both sources hold leaves L2"
+
+def test_s109d_anchor_held_asks_the_index_never_a_stat():
+    from flliper.srt.mem_cache.pool_host.arena_mamba_pool import ArenaMambaPoolHost
+
+    def _stat(stems):
+        raise AssertionError("S109d: no stat")
+
+    def _pool(idx, listed):
+        return types.SimpleNamespace(arena=types.SimpleNamespace(find_slots=lambda st: [(-1, 0)]),
+                                     _stems=lambda hs: ["anc"],
+                                     _backend=types.SimpleNamespace(_l3idx=idx, l3_listed=listed, _stat_stems=_stat))
+
+    assert ArenaMambaPoolHost.anchor_held(_pool(object(), lambda st: [True]), "h") is True
+    assert ArenaMambaPoolHost.anchor_held(_pool(object(), lambda st: [False]), "h") is False
+    assert ArenaMambaPoolHost.anchor_held(_pool(None, lambda st: [True]), "h") is None, "no opened index: cannot tell"
+
+
+def test_s109d_zero_file_io_on_every_scheduler_form():
+    """The source check over ALL scheduler forms (S109b + S109d)."""
+    import inspect
+
+    from flliper.srt.mem_cache import l3_secured as L3S
+    from flliper.srt.mem_cache.hicache_storage import HiCacheFile
+    from flliper.srt.mem_cache.pool_host.arena_mamba_pool import ArenaMambaPoolHost
+    from flliper.srt.mem_cache.pool_host.arena_pool import ArenaMHAHostPool
+    from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache as URC
+    from flliper.srt.pdflip import forma_l3_subtree as FLS
+
+    fns = (ArenaMHAHostPool.secure_rows_to_l3, ArenaMHAHostPool._evict_for_claim, HiCacheFile._arena_evict_to_disk,
+           HiCacheFile._arena_evict_candidates, HiCacheFile.l3_listed, ArenaMambaPoolHost.anchor_held,
+           FLS._secure_child_anchors, HOS.spill_host_only, HOS._secure_anchor, L3S.secured, L3S.request, L3S.check,
+           L3S.unsecured_keys_lo, URC._pdflip_flush_spill_room, URC._pdflip_park_spill_room,
+           URC._s109c_aux_device_round, URC._pdflip_mamba_claim_h19)
+    bad_tokens = ("secure(arena", "arena_secure_to_disk(", "_stat_stems(", "stat(", "write_pages(", "stat_sizes(",
+                  "fsync", "open(")
+    for fn in fns:
+        src = inspect.getsource(fn)
+        lines, in_doc = [], False
+        for ln in src.splitlines():
+            st = ln.strip()
+            if st.count('"""') == 1:
+                in_doc = not in_doc
+                continue
+            if in_doc or st.startswith(('"""', '"', "'", "#")):
+                continue
+            lines.append(ln.split("#", 1)[0])
+        code = "\n".join(lines)
+        for bad in bad_tokens:
+            assert bad not in code, (fn.__qualname__, bad)
+
+
+@_needs_gcc
+def test_s109b_secure_rows_to_l3_reads_and_queues_never_writes(tmp_path):
+    """The real pool's scheduler form: an uncopied page is pending (kept by every caller), queued, never written."""
+    from test_w3_arena_spill_0929 import _finished, _pool
+
+    from flliper.srt.mem_cache import l3_secured as L3S
+
+    p, arena, root = _pool(tmp_path, 4)
+
+    def _no_write(*a, **k):
+        raise AssertionError("S109b: no L3 write / stat in secure_rows_to_l3")
+
+    p._backend.arena_secure_to_disk = _no_write
+    p._backend._stat_stems = _no_write
+    p._backend._l3idx = _Idx()
+    rows = _finished(p, arena, ["r0", "r1"], 0x61)
+    out = p.secure_rows_to_l3(rows)
+    assert (out["pages"], out["on_disk"], out["written"], out["pending_l3"]) == (2, 0, 0, 2)
+    assert out["lost"] == 2 and out["incomplete"] == 2, "every caller keeps the node"
+    slots = sorted(getattr(arena, "_l3wb_urgent", set()))
+    assert len(slots) == 2
+    _write_behind(arena, p._backend._l3idx, L3S.take_urgent(arena))
+    out = p.secure_rows_to_l3(rows)
+    assert (out["on_disk"], out["pending_l3"], out["lost"]) == (2, 0, 0)
+
+
+# ---------------------------------------------------------------------------------------------------- S109-A2 transitive guard
+import builtins as _builtins  # noqa: E402
+import contextlib as _contextlib  # noqa: E402
+import io as _io  # noqa: E402
+import threading as _threading  # noqa: E402
+
+
+@_contextlib.contextmanager
+def _no_file_io_in_this_thread():
+    """S109-A2 (review 20.10.): the TRANSITIVE check -- every call the code under test makes on THIS thread (the
+    scheduler's) to the file system or the store's writer is counted, whatever function it went through. Other threads
+    (the write-behind, the hand-over writer) are not counted."""
+    from flliper.srt.mem_cache.hicache_storage import HiCacheFile
+    from flliper.srt.pdflip import w3_room_set  # noqa: F401  (imported at boot: reads /proc once)
+
+    me = _threading.get_ident()
+    hits = []
+    busy = []
+    orig_open = _builtins.open
+
+    def _wrap(owner, name):
+        orig = getattr(owner, name)
+
+        def w(*a, **k):
+            if _threading.get_ident() == me and not busy:
+                hits.append(name)
+                if os.environ.get("S109_IO_TRACE"):
+                    import traceback as _tb
+                    busy.append(1)
+                    try:
+                        with orig_open("/tmp/s105/io_trace.txt", "a") as fh:
+                            fh.write("IO %s %r\n%s\n" % (name, a[:1], "".join(_tb.format_stack(limit=9)[:-1])))
+                    finally:
+                        busy.pop()
+            return orig(*a, **k)
+        return orig, w
+
+    targets = [(os, "stat"), (os, "lstat"), (os, "open"), (os, "fsync"), (_builtins, "open"), (_io, "open"),
+               (HiCacheFile, "arena_secure_to_disk"), (HiCacheFile, "_stat_stems")]
+    saved = []
+    try:
+        for owner, name in targets:
+            orig, w = _wrap(owner, name)
+            saved.append((owner, name, orig))
+            setattr(owner, name, w)
+        yield hits
+    finally:
+        for owner, name, orig in saved:
+            setattr(owner, name, orig)
+
+
+@_needs_gcc
+def test_s109_a2_claim_clock_and_secure_rows_make_no_file_io_transitively(tmp_path):
+    from test_w3_arena_spill_0929 import _finished
+    from flliper.srt.mem_cache import l3_secured as L3S
+    from flliper.srt.mem_cache.hicache_storage import HiCacheFile
+
+    p, arena, slots = _unreferenced_full_arena(tmp_path)
+    be = p._backend
+    be.pins = None
+    del be.arena_secure_to_disk, be._stat_stems            # the class methods, counted by the guard
+    L3S.arrays(arena, create=True)                           # attached at the arena's open (HiCacheFile._open_arena)
+    _write_behind(arena, be._l3idx, slots[:2])
+    with _no_file_io_in_this_thread() as hits:
+        p._evict_for_claim(arena, 2)
+        HiCacheFile._arena_evict_to_disk(be, arena, 4)
+    assert hits == [], "file I/O on the scheduler thread: %s" % hits
+    rows = _finished(p, arena, ["g0"], 0x71)               # a slot the claim freed
+    with _no_file_io_in_this_thread() as hits:
+        p.secure_rows_to_l3(rows)
+    assert hits == [], "file I/O on the scheduler thread: %s" % hits
+
+
+@_needs_gcc
+def test_s109_a2_h19_displacement_drops_no_anchor_without_a_copy_and_makes_no_file_io(tmp_path):
+    """S108-2/S109-2: H19's SHARE displacement -> _pdflip_release_anchor -> drop_unreferenced -> _secure_before_drop
+    made a stat and a 56-MiB write with fsync on the scheduler thread. Now: read the record, keep and queue."""
+    import importlib.util
+
+    from flliper.srt.mem_cache import l3_secured as L3S
+
+    spec = importlib.util.spec_from_file_location(
+        "_h19_s109", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "pdflip",
+                                  "test_pdflip_mamba_arena_displace_h19.py"))
+    h19 = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(h19)
+    arena = h19._arena(tmp_path, 6)
+    L3S.arrays(arena, create=True)
+    ranks = [h19._Rank(arena, r, cfg=2) for r in range(h19.RANKS)]
+    with _no_file_io_in_this_thread() as hits:
+        hs = h19._prefill(ranks, "pdflip-9-1", 5)
+    assert hits == [], "file I/O on the scheduler thread: %s" % hits
+    # no displaced anchor left L2 without a copy: every anchor is still in its slot (nothing was secured)
+    assert all(h19._state(arena, h) == 2 for h in hs), [h19._state(arena, h) for h in hs]
+    assert getattr(arena, "_l3wb_urgent", set()), "the anchors to give up were queued for the write-behind"
+
+
+# ---------------------------------------------------------------------------------------------------- S86 before the sleep
+def _s86_group(tmp_path, copied):
+    """The rc19 shape (test_s86_sleep_l3_release_1020): TP0 and a worker on ONE arena, every slot COMPLETE and held by
+    both trees, a park-end chain of two nodes below. ``copied`` = the pages the write-behind has copied (record AND
+    index) by the time the sleep comes -- the S109 async form never writes them itself."""
+    import test_s86_sleep_l3_release_1020 as S86T
+
+    from flliper.srt.mem_cache import form_a_host_shadow as Rr
+    from flliper.srt.mem_cache import l3_secured as L3S
+
+    Rr._reset_state_for_tests()
+    g = S86T._group(tmp_path)
+    idx = _Idx()
+    for be in (g.p0._backend, g.p1._backend):
+        be._l3idx = idx
+    L3S.arrays(g.a0, create=True)
+    pinned = sorted({int(x) for n in g.n0 for x in g.p0.arena_ids(n.component_data[FULL].host_value).tolist()}) \
+        if hasattr(g.p0, "arena_ids") else []
+    stems = [g.p0._stems([f"a{i}"])[0] for i in range(S86T.SLOTS)]
+    slots = [int(s) for s, _st in g.a0.find_slots(stems)]
+    _write_behind(g.a0, idx, slots[:copied])
+    g.c0 = S86T._chain(g.t0, g.n0[-1], ["c0", "c1"], "pdflip-112-2708")
+    g.c1 = S86T._chain(g.t1, g.n1[-1], ["c0", "c1"], "pdflip-112-2708")
+    return S86T, g, slots
+
+
+@_needs_gcc
+def test_s109_a4_rc19_the_sleep_release_still_lets_the_park_end_chain_in(tmp_path):
+    """Review S109-4: S86 now refuses uncopied pages (``not_on_l3``) instead of writing them. rc19's pinned pages had
+    their L3 copies (the boot freed only ``on_disk`` slots); the write-behind never pauses (S109d: 0 gate changes,
+    passes during sleep). With the copies published, the chain is backed up: lost_tokens 0 -- and no file I/O."""
+    S86T, g, slots = _s86_group(tmp_path, copied=8)
+    with _no_file_io_in_this_thread() as hits:
+        S86T._sleep_release(g)
+        S86T._flush_round(g)
+    assert hits == [], hits
+    assert S86T._lost(g.t0) == 0
+
+
+@_needs_gcc
+def test_s109_a4_a_write_behind_backlog_keeps_the_uncopied_pages_and_still_lets_the_chain_in(tmp_path):
+    """Half the pinned pages not yet copied: S86 keeps them (no loss) and releases the copied half -- room enough for
+    the two-node chain; the uncopied ones are queued for the write-behind (woken)."""
+    from flliper.srt.mem_cache import l3_secured as L3S
+
+    S86T, g, slots = _s86_group(tmp_path, copied=4)
+    L3S.WAKE.clear()
+    S86T._sleep_release(g)
+    S86T._flush_round(g)
+    assert S86T._lost(g.t0) == 0
+    kept = [n for n in g.n0 if n.component_data[FULL].host_value is not None]
+    assert len(kept) >= 4, "the uncopied pages kept their host copies"
+    assert L3S.WAKE.is_set(), "the request woke the write-behind (S109-A4)"
+
+
+# ---------------------------------------------------------------------------------------------------- S109-A3 / A4
+@_needs_gcc
+def test_s109_a3_a_race_candidate_is_handed_over_not_freed(tmp_path):
+    """A clock candidate that re-completed between the census and the clock (no copy): never freed on the scheduler
+    thread; the hand-over writer copies it on its own thread, then frees it."""
+    import time as _t
+
+    from flliper.srt.mem_cache import l3_secured as L3S
+    from flliper.srt.mem_cache.hicache_storage import HiCacheFile
+
+    p, arena, slots = _unreferenced_full_arena(tmp_path)
+    be = p._backend
+    be.pins = None
+    copied = []
+
+    def _writer(ar, cands, writer="claim_room"):
+        copied.append((writer, [int(c[0]) for c in cands], _threading.current_thread().name))
+        return {"on_disk": 0, "written": len(cands), "lost": 0}
+
+    be.arena_secure_to_disk = _writer
+    # the race: the census saw no candidate, the clock took one anyway (an empty keep list stands in for it)
+    import unittest.mock as _m
+
+    with _m.patch.object(L3S, "unsecured_keys_lo", lambda a, b=None: np.zeros(0, dtype=np.uint64)):
+        assert HiCacheFile._arena_evict_to_disk(be, arena, 4) == 0
+    took = [s_ for s_ in slots if arena.slot_states([s_])[0] == 3]
+    assert len(took) == 1, "the candidate is EVICTING, not freed"
+    for _ in range(200):
+        if copied and arena.slot_states(took)[0] != 3:
+            break
+        _t.sleep(0.01)
+    assert copied and copied[0][0] == "evict_handover" and copied[0][2] == "pdflip-l3-evict-handover"
+    assert arena.slot_states(took)[0] not in (2, 3), "copied, then freed by the hand-over writer"
+
+
+def test_s109_a4_request_wakes_the_write_behind():
+    from flliper.srt.mem_cache import l3_secured as L3S
+
+    a = _Arena(n=4)
+    stop = _threading.Event()
+    L3S.WAKE.clear()
+    t0 = __import__("time").monotonic()
+    th = _threading.Thread(target=lambda: L3S.wait_or_stop(stop, 5.0))
+    th.start()
+    L3S.request(a, [1])
+    th.join(2.0)
+    assert not th.is_alive() and __import__("time").monotonic() - t0 < 2.0, "the pass did not wake at the request"
+
+
+@_needs_gcc
+def test_s109_a1_the_l3_lru_evict_voids_the_published_record(tmp_path):
+    """S109-A1 preferred form: the store's LRU on_evict (``HiCacheFile._l3sec_on_evict``, wired into LRUFileEvictor)
+    voids the record of every slot holding the evicted stem -- independent of the index AND."""
+    import inspect
+
+    from flliper.srt.mem_cache import l3_secured as L3S
+    from flliper.srt.mem_cache.hicache_storage import HiCacheFile
+
+    p, arena, slots = _unreferenced_full_arena(tmp_path)
+    _write_behind(arena, p._backend._l3idx, slots[:2])
+    yes = types.SimpleNamespace(l3_listed=lambda stems: [True] * len(stems))  # the index alone would still say yes
+    assert L3S.secured(arena, slots[:2], yes).tolist() == [True, True]
+    HiCacheFile._l3sec_on_evict(types.SimpleNamespace(metadata_cache=None, _arenas={"kv": arena}),
+                                arena.slot_stem(slots[0]))
+    assert L3S.secured(arena, slots[:2], yes).tolist() == [False, True]
+    src = inspect.getsource(HiCacheFile)
+    assert "self._l3sec_on_evict" in src.split("LRUFileEvictor(", 1)[1].split("pins=", 1)[0], "hook not wired"
+
+
+@_needs_gcc
+def test_s109_a3_a_claim_race_candidate_is_handed_over_not_freed(tmp_path):
+    import time as _t
+    import unittest.mock as _m
+
+    from flliper.srt.mem_cache import l3_secured as L3S
+
+    p, arena, slots = _unreferenced_full_arena(tmp_path)
+    be = p._backend
+    be.pins = None
+    copied = []
+
+    def _writer(ar, cands, writer="claim_room"):
+        copied.append((writer, len(cands), _threading.current_thread().name))
+        return {"on_disk": 0, "written": len(cands), "lost": 0}
+
+    be.arena_secure_to_disk = _writer
+    with _m.patch.object(L3S, "unsecured_keys_lo", lambda a, b=None: np.zeros(0, dtype=np.uint64)):
+        p._evict_for_claim(arena, 2)
+    st = arena.slot_states(slots)
+    assert sum(1 for x in st if x == 3) == 2 and sum(1 for x in st if x == 0) == 0, st
+    for _ in range(200):
+        if copied and sum(1 for x in arena.slot_states(slots) if x == 0) == 2:
+            break
+        _t.sleep(0.01)
+    assert copied and copied[0][0] == "evict_handover" and copied[0][2] == "pdflip-l3-evict-handover"
+    assert sum(1 for x in arena.slot_states(slots) if x == 0) == 2
+
+
+@_needs_gcc
+def test_s109_a3_a_handover_whose_copy_fails_keeps_the_page(tmp_path):
+    from flliper.srt.mem_cache import l3_secured as L3S
+
+    p, arena, slots = _unreferenced_full_arena(tmp_path)
+    be = p._backend
+    seen = []
+
+    def _writer(ar, cands, writer="x"):
+        seen.append(ar.slot_states([cands[0][0]])[0])          # still EVICTING while it copies
+        return {"on_disk": 0, "written": 0, "lost": 1}
+
+    be.arena_secure_to_disk = _writer
+    cands = arena.evict_candidates(1)
+    with L3S._HAND_LOCK:
+        L3S._HAND.extend((arena, be, c, "test") for c in cands)
+    L3S._hand_drain()                                         # (or the live hand-over thread drains it first)
+    for _ in range(300):
+        if seen:
+            break
+        __import__("time").sleep(0.01)
+    assert seen == [3]
+    assert arena.slot_states([cands[0][0]])[0] == 3, "no copy: never freed"
+
+
+@_needs_gcc
+def test_s109_a1_the_census_keeps_a_page_whose_l3_file_is_gone(tmp_path):
+    """The census of the uncopied (the clock's/claim's keep list) asks record AND index too: a page whose L3 file
+    left the index is kept in L2 -- not even made a candidate (no hand-over, no EVICTING)."""
+    from flliper.srt.mem_cache import l3_secured as L3S
+
+    p, arena, slots = _unreferenced_full_arena(tmp_path)
+    be = p._backend
+    be.pins = None
+    _write_behind(arena, be._l3idx, slots[:3])
+    be._l3idx.files.discard(arena.slot_stem(slots[0]))       # the file is gone; the record was not voided
+    q0 = L3S.HAND_STATS["queued"]
+    assert p._evict_for_claim(arena, 3) == 2
+    assert arena.slot_states([slots[0]])[0] == 2, "kept COMPLETE in L2, never a candidate"
+    assert L3S.HAND_STATS["queued"] == q0

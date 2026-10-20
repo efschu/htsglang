@@ -2551,7 +2551,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
 
         import numpy as _np_s109
         _sl = _np_s109.asarray(slot_list, dtype=_np_s109.int64)
-        _ok = _l3s.secured(arena, _sl)
+        _ok = _l3s.secured(arena, _sl, getattr(self, "_backend", None))
         _pending = _sl[~_ok]
         if _pending.shape[0]:
             _l3s.request(arena, _pending)
@@ -2699,6 +2699,21 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         except Exception:  # noqa: BLE001 - the protection is an improvement, never a wall
             prot = None
         _kl = None if prot is None or not len(prot) else prot
+        # S109d (user 20.10.: "UND WEHE DAS SCHREIBEN IN DEN CACHE BLOCKIERT DURCH IRGENDEINE SYNCHRON ODER
+        # WARTESCHEISSE"): a claim (scheduler thread: chunk and retain publishes) frees only pages that ALREADY have
+        # their L3 copy -- by the write-behind's published record or the #1459 index (mem_cache/l3_secured). Every
+        # other COMPLETE page joins the keep list of EVERY stage and is queued for the write-behind; #257 (d) now holds
+        # by selection, not by a write here (no stat, no write). The claim finds less room until the write-behind ran.
+        try:
+            from flliper.srt.mem_cache import l3_secured as _l3s
+
+            _unsec = _l3s.unsecured_keys_lo(arena, getattr(self, "_backend", None))
+            if _unsec.shape[0]:
+                import numpy as _np_s109d
+
+                _kl = _unsec if _kl is None else _np_s109d.union1d(_np_s109d.asarray(_kl, dtype=_np_s109d.uint64), _unsec)
+        except Exception:  # noqa: BLE001 -- no reading: keep the claim as it was, named
+            logger.warning("S109d unsecured keep list unavailable for the claim", exc_info=True)
         try:
             if keep is not None and len(keep):
                 # (i) unreferenced, kept by nobody
@@ -2739,22 +2754,33 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                 # copy is written first (the clock evict's own write, bounded
                 # by this claim's `need`). Only what the write could not save
                 # is lost -- counted as dropped_without_l3, target 0.
-                secure = getattr(getattr(self, "_backend", None), "arena_secure_to_disk", None)
-                if callable(secure):
-                    sec = secure(arena, cands)
-                    l3_state[0] += int(sec.get("on_disk", 0))
-                    l3_state[1] += int(sec.get("written", 0))
+                # S109d: verified, never written -- the keep list above took every uncopied page out; a candidate that
+                # re-completed between the census and the clock is the old stage-iii loss, by name
+                from flliper.srt.mem_cache import l3_secured as _l3s
+
+                sec = _l3s.verify_candidates(arena, cands, getattr(self, "_backend", None))
+                l3_state[0] += int(sec.get("on_disk", 0))
+                l3_state[1] += int(sec.get("written", 0))
+                # S109-A3 (review 20.10.): a candidate WITHOUT a copy (it re-completed between the census and the clock)
+                # is NOT freed -- it goes to the hand-over writer (its own thread: copy to L3, then free); it is not
+                # counted lost, nothing leaves L2 without its L3 copy
+                _mask = sec.get("mask")
+                _free = list(cands) if _mask is None else [c for c, k in zip(cands, _mask) if k]
+                _hand = [] if _mask is None else [c for c, k in zip(cands, _mask) if not k]
+                if _mask is None:
                     l3_state[2] += int(sec.get("lost", 0))
-                else:
-                    l3_state[2] += len(cands)
+                if _hand:
+                    _l3s.hand_over(arena, _hand, getattr(self, "_backend", None), "claim_room")
                 # ARENA-FREE-GEN (READ-DEPTH 1014): only this evictor's candidates, generation-bound
                 from flliper.srt.mem_cache.storage.file.hicache_arena import free_evicted_named
 
-                free_evicted_named(arena, [c[0] for c in cands], "claim_room")
+                if _free:
+                    free_evicted_named(arena, [c[0] for c in _free], "claim_room")
                 stems = getattr(arena, "_stems", None)
                 if isinstance(stems, dict):
-                    for c in cands:
+                    for c in _free:
                         stems.pop((c[1], c[2]), None)
+                cands = _free
         except Exception as exc:  # noqa: BLE001 - loud, the claim below decides
             logger.warning("#1427 ARENA-DROP failed: %r", exc)
             return len(reaped0)

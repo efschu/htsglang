@@ -363,8 +363,15 @@ _FREE_EVICTED_REFUSED = [0, 0]
 _EVICT_GENS: dict = {}
 
 
+_REALPATH: dict = {}
+
+
 def _evict_gens_for(path: str) -> dict:
-    key = os.path.realpath(str(path))
+    # S109-A2: realpath() is one lstat per path component; on the clock/claim
+    # path that ran on the scheduler thread every call. Resolved once per path.
+    key = _REALPATH.get(path)
+    if key is None:
+        key = _REALPATH.setdefault(path, os.path.realpath(str(path)))
     d = _EVICT_GENS.get(key)
     if d is None:
         d = _EVICT_GENS.setdefault(key, {})
@@ -574,6 +581,7 @@ class ShmArena:
             raise RuntimeError("arena helper unavailable")
         self._lib = lib
         self.path = path
+        _evict_gens_for(path)  # S109-A2: the realpath resolved at attach, never on the clock/claim path
         self.slot_bytes = int(slot_bytes)
         self.slots = int(slots)
         out = (ctypes.c_int64 * 6)()

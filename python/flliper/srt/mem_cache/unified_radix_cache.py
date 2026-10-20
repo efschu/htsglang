@@ -6430,7 +6430,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         from flliper.srt.mem_cache import l3_secured as _l3s
 
         _backend = getattr(mp, "_backend", None)
-        _ok_c = [a for a in cands if a.slots and bool(_l3s.secured(arena, a.slots).all())]
+        _ok_c = [a for a in cands if a.slots and bool(_l3s.secured(arena, a.slots, getattr(mp, "_backend", None)).all())]
         cands = _ok_c or cands
         # K15c review A1 (16.10., boot 1016_103428 10:42:16 TP0 DISPLACE why=park_first node=59
         # dropped=0): the park spill takes the same victims -- on the Form A host only ref-free ones
@@ -6507,7 +6507,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         _backend = getattr(mp, "_backend", None)
         # victims the write-behind already copied first; none of them: the usual choice, its copy checked below
-        _sec_ok = [a for a in tree if a.slots and bool(_l3s.secured(arena, a.slots).all())]
+        _sec_ok = [a for a in tree if a.slots and bool(_l3s.secured(arena, a.slots, getattr(mp, "_backend", None)).all())]
         _n_pending = len(tree) - len(_sec_ok)
         tree = _sec_ok or tree
         tree = _mad.lane_filter(tree, self._pdflip_claim_lane(node))   # LANE-ANCHOR-RANK
