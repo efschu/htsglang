@@ -83,19 +83,24 @@ before; the switch off = the full return byte for byte. Lines::
     PDFLIP D-TRANSIENT-LEND rank=0 return rows_on 15->11 (short extend pending ...)
 
 KEEP-PRICE (20.10., nf-expert-h2d-1020): the short extend's price is ``max(lend floor,
-300 + rate x rows)`` -- no longer their SUM. Both terms are the planner's (the launcher's
+300 + rate x rows)`` -- no longer their SUM -- on a rank whose chunk rate is MEASURED (review A:
+Q-694b armed for the rank and a measurement held; NF TP1/TP2). A start-rate rank (NF TP0) keeps
+the sum: its start rate underprices short extends (rc28 _201023 TP0 20:43:30, 2139 rows, card use
+1596 MiB from the trim before the forward to the extend's record, max-price 1556). Both terms are the planner's (the launcher's
 ``FLLIPER_PDFLIP_D_LEND_FLOOR_MIB`` and the rc12g chunk model ``extend_trim.chunk_need_mib``),
 nothing new is priced. The sum stacked two safety lines that are never stacked anywhere else:
 every big chunk runs on ``300 + rate x rows`` alone (the #794 width vote, ``rows_cap``) and ends
 below the lend floor (rc28 D ``..._1020_174205``: TP1 688, TP2 434, TP0 385 MiB after a 2812
 chunk). The width vote is still funded (``free >= 300 + rate x rows`` = ``rows_cap >= rows``:
 the short request still runs in one chunk) and the card keeps its near-OOM edge between extends.
-Measured both ways over every extend of rc28 D ``_174205`` and ``_201023`` (PDFLIP-VRAM-PEAK
-phase=chunk, all three ranks, 752 + 101 windows): started at exactly the new price, the card would
-have kept >= 397 MiB free at the forward's peak in every one of them (the 300 HALT line holds);
-the old sum returned rows before 2184 short extends in ``_174205`` of which 1795 need no return
-at all at the new price (TP1: 604 of 732, >= 2206 rows of return + re-lend saved). Rows kept
-through the extend are its expert rows: the same experts are not copied again over the link.
+Measured both ways (review A method, rc28 D ``_174205`` 2.4 h and ``_201023`` to 21:12): card use
+of every extend actually priced short = ``card_free_after`` of the EXTEND-CACHE-TRIM right before
+the forward minus ``card_free_mib`` at its PDFLIP-VRAM-PEAK record, plus the draft extend's reserved
+growth after it. Started at exactly the gated price, the card keeps at its peak >= 526 / 531 MiB
+free on TP1 / TP2 (_174205, 529 / 508 extends) and >= 528 / 549 (_201023, 291 / 283); TP0 keeps the
+sum (>= 859 / 727). At the gated price 592 of 732 short returns on TP1 and 610 of 758 on TP2 need no
+return at all (_174205). Rows kept through the extend are its expert rows: the same experts are not
+copied again over the link.
 """
 
 from __future__ import annotations
@@ -436,7 +441,11 @@ def short_extend_need_mib(rank: int, rows: int) -> Optional[float]:
     The old S78 price was their SUM (``floor + 300 + rate x rows``): 1002 MiB on TP1 for a 4-row
     extend whose card use was <= 20 MiB (rc28 ``_174205``, <=64 rows, PDFLIP-VRAM-PEAK), so ~2.5
     expert rows went back -- and were re-lent after it -- around every short request. ``None``
-    (= the full return) when this rank has no floor or no chunk rate: nothing is guessed."""
+    (= the full return) when this rank has no floor or no chunk rate: nothing is guessed.
+
+    Review A (20.10.): the max applies ONLY on a rank whose rate is measured (:func:`rate_measured`);
+    a start-rate rank (NF TP0: real 0.6-0.84 MiB/row at 700-2139 rows against the start 0.5871) keeps
+    the S78 sum ``floor + 300 + rate x rows``."""
     from flliper.srt.pdflip import d_seat_vram as dsv
     from flliper.srt.pdflip import extend_trim
 
@@ -447,7 +456,24 @@ def short_extend_need_mib(rank: int, rows: int) -> Optional[float]:
         return None
     if floor is None or price is None:
         return None
+    if not rate_measured(int(rank)):
+        # review A (20.10.): a rank that prices with the START rate only (NF: TP0 keeps its recorded rate,
+        # FLLIPER_PDFLIP_EXTEND_RATE_MEASURE_RANKS) or has not measured yet keeps the S78 sum -- the floor
+        # covers the fixed part a start rate does not see (rc28 _201023 TP0 20:43:30, 2139 rows: card use
+        # 1596 MiB against max-price 1556)
+        return float(floor) + float(price)
     return max(float(floor), float(price))
+
+
+def rate_measured(rank: int) -> bool:
+    """KEEP-PRICE review A: this rank's chunk rate is MEASURED on this process (Q-694b EXTEND-RATE armed for
+    the rank AND a measurement is held) -- only then does the max price apply."""
+    try:
+        from flliper.srt.pdflip import extend_trim
+
+        return bool(extend_trim.measure_armed(int(rank))) and extend_trim.measured_rate() is not None
+    except Exception:  # noqa: BLE001 -- unreadable: not measured (the conservative side, the S78 sum)
+        return False
 
 
 def _keep_short(sched, ctl, rows: int, why: str) -> Optional[str]:

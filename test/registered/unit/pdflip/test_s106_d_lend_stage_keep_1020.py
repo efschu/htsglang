@@ -20,7 +20,7 @@ WHAT MUST HOLD.
 (5) The return after a kept move gives back exactly to the new phase rows (no wipe).
 (6) A live re-seat keeps the lend the same way: a SHRINK maps nothing, a GROW prices the new seats'
     GDN cells (RB: the rows' cells go first); without a price both end it as before.
-(7) The price: floor with nothing pending, max(floor, KEEP-SHORT price) with a short extend pending (KEEP-PRICE),
+(7) The price: floor with nothing pending, + the KEEP-SHORT price with a short extend pending,
     None for a big/unpriced/chunked one, no floor, or nothing lent.
 (8) The runtime tick hands the price to ``apply_stage`` and the gate tops up only after a partial keep.
 (9) Rank unity: three ranks with different cards run the same group-verdict moves, keep rank-local
@@ -245,11 +245,7 @@ def test_the_price_is_the_lends_own():
         assert dtl.stage_keep_need_bytes(_price_sched(), ctl) == 700 * MIB       # floor only
         with mock.patch.object(dtl, "short_pending_rows", lambda s: 200), \
                 mock.patch("flliper.srt.pdflip.extend_trim.chunk_need_mib", lambda rank, rows: 300 + rows):
-            # KEEP-PRICE (20.10.): the larger of floor and chunk price, not their sum
-            assert dtl.stage_keep_need_bytes(_price_sched([object()]), ctl) == 700 * MIB
-        with mock.patch.object(dtl, "short_pending_rows", lambda s: 600), \
-                mock.patch("flliper.srt.pdflip.extend_trim.chunk_need_mib", lambda rank, rows: 300 + rows):
-            assert dtl.stage_keep_need_bytes(_price_sched([object()]), ctl) == 900 * MIB
+            assert dtl.stage_keep_need_bytes(_price_sched([object()]), ctl) == (700 + 500) * MIB
         with mock.patch.object(dtl, "short_pending_rows", lambda s: None):  # big / unpriced pending
             assert dtl.stage_keep_need_bytes(_price_sched([object()]), ctl) is None
         with mock.patch.object(dtl, "short_pending_rows", lambda s: 200), \

@@ -16,7 +16,11 @@ What must hold (the S78 desk rank, lattice step 4 rows, S0 = 32 rows ON, lend to
 (4) danger (OOM): whatever stays after a return, free + released >= the price;
 (5) the built extend's exact rows are priced the same way (``on_batch``);
 (6) the S106 stage-keep price is the same max (floor alone with nothing pending);
-(7) a big / unpriced pending extend still returns everything (the width is worth more than a row there).
+(7) a big / unpriced pending extend still returns everything (the width is worth more than a row there);
+(8) review A (20.10.): the max applies ONLY on a rank whose chunk rate is MEASURED (Q-694b armed for the
+    rank AND a measurement held). A start-rate rank (NF TP0) or a rank before its first measurement keeps
+    the S78 sum -- rc28 _201023 TP0 20:43:30, 2139 rows: card use 1596 MiB (trim-after before the forward
+    to the extend's record) against a max price of 1556. Tests (1)-(7) run on a measured rank (fixture).
 """
 from __future__ import annotations
 
@@ -45,9 +49,14 @@ CHUNK_MIB = 300 + 0.5 * ROWS         # rate 0.5 -> 350 MiB
 
 
 @pytest.fixture(autouse=True)
-def _fresh_trim_cache():
+def _fresh_trim_cache(request):
     extend_trim.reset_for_tests()
-    yield
+    if "unmeasured" in request.keywords or "gate" in request.node.name:
+        yield
+    else:
+        # (1)-(7): a rank whose rate is measured (NF TP1/TP2) -- review A's gate open
+        with mock.patch.object(dtl, "rate_measured", lambda rank: True):
+            yield
     extend_trim.reset_for_tests()
 
 
@@ -177,3 +186,70 @@ def test_a_big_pending_extend_still_returns_everything():
         r.sched.waiting_queue = [s78._short(priced=3200, halfx=3200)]   # not short by R2
         assert dtl.round_start(r.sched) == "return"
         assert ctl.rows_on == 32 and ctl.lent_from is None
+
+
+# ---- (8) review A: the max only on a rank with a MEASURED rate ---------------------------------------
+
+def test_gate_unmeasured_rank_keeps_the_s78_sum():
+    """NF TP0 (start rate only): the sum, also for a tiny extend -- the max would leave the floor's fixed
+    part uncovered (rc28 _201023 TP0 20:43:30)."""
+    with envs.FLLIPER_PDFLIP_D_LEND_FLOOR_MIB.override("767,700,701"), \
+            envs.FLLIPER_PDFLIP_EXTEND_GROWTH_PER_ROW_MIB.override("0.5871"), \
+            envs.FLLIPER_PDFLIP_EXTEND_RATE_MEASURE.override(True), \
+            envs.FLLIPER_PDFLIP_EXTEND_RATE_MEASURE_RANKS.override("1,2"):
+        extend_trim.reset_for_tests()
+        extend_trim._CACHE["measured"] = 0.5131  # even with a value held: rank 0 is not armed
+        assert not dtl.rate_measured(0)
+        assert dtl.short_extend_need_mib(0, 2139) == pytest.approx(767 + 300 + 0.5871 * 2139)
+        assert dtl.short_extend_need_mib(0, 4) == pytest.approx(767 + 300 + 0.5871 * 4)
+
+
+def test_gate_armed_rank_before_its_first_measurement_keeps_the_sum():
+    with envs.FLLIPER_PDFLIP_D_LEND_FLOOR_MIB.override("767,700,701"), \
+            envs.FLLIPER_PDFLIP_EXTEND_GROWTH_PER_ROW_MIB.override("0.5871"), \
+            envs.FLLIPER_PDFLIP_EXTEND_RATE_MEASURE.override(True), \
+            envs.FLLIPER_PDFLIP_EXTEND_RATE_MEASURE_RANKS.override("1,2"):
+        extend_trim.reset_for_tests()
+        assert extend_trim.measured_rate() is None
+        assert not dtl.rate_measured(1)
+        assert dtl.short_extend_need_mib(1, 4) == pytest.approx(700 + 300 + 0.5871 * 4)
+        # the first measurement (>= 2048 rows) opens the gate on this rank
+        extend_trim._CACHE["measured"] = 0.5131
+        assert dtl.rate_measured(1)
+        eff = extend_trim.effective_rate(0.5871, 1)
+        assert dtl.short_extend_need_mib(1, 4) == pytest.approx(700.0)
+        assert dtl.short_extend_need_mib(1, 2000) == pytest.approx(300 + eff * 2000)
+
+
+def test_gate_measurement_switched_off_keeps_the_sum():
+    with envs.FLLIPER_PDFLIP_D_LEND_FLOOR_MIB.override("700"), \
+            envs.FLLIPER_PDFLIP_EXTEND_GROWTH_PER_ROW_MIB.override("0.5871"), \
+            envs.FLLIPER_PDFLIP_EXTEND_RATE_MEASURE.override(False):
+        extend_trim.reset_for_tests()
+        extend_trim._CACHE["measured"] = 0.5131
+        assert not dtl.rate_measured(1)
+        assert dtl.short_extend_need_mib(1, 4) == pytest.approx(700 + 300 + 0.5871 * 4)
+
+
+def test_gate_danger_unmeasured_live_rank_returns_at_the_max_price():
+    """DANGER (OOM) on the live desk rank: an unmeasured rank with free = max price (but under the sum)
+    gives rows back -- the max must not apply there."""
+    tms = h.CoreTms()
+    floor = 200
+    with s78._Ctx(tms, int(CHUNK_MIB * MIB), floor=str(floor)), \
+            envs.FLLIPER_PDFLIP_EXTEND_RATE_MEASURE.override(False):
+        r, ctl = s78._live_lent(tms)
+        assert dtl.round_start(r.sched) == "return" and ctl.rows_on < 40
+        released = ctl._bank_bytes_at(40) - ctl._bank_bytes_at(ctl.rows_on)
+        assert int(CHUNK_MIB * MIB) + released >= int((floor + CHUNK_MIB) * MIB) or ctl.lent_from is None
+
+
+def test_gate_stage_keep_on_an_unmeasured_rank_is_the_sum():
+    ctl = types.SimpleNamespace(lent_from=16)
+    with envs.FLLIPER_PDFLIP_D_LEND_FLOOR_MIB.override("767,700,701"), \
+            envs.FLLIPER_PDFLIP_EXTEND_GROWTH_PER_ROW_MIB.override("0.5871"), \
+            envs.FLLIPER_PDFLIP_D_LEND_KEEP_SHORT.override(True), \
+            envs.FLLIPER_PDFLIP_EXTEND_RATE_MEASURE.override(False):
+        extend_trim.reset_for_tests()
+        with mock.patch.object(dtl, "short_pending_rows", lambda s: 5):
+            assert dtl.stage_keep_need_bytes(_price_sched([object()]), ctl) == int((700 + 300 + 0.5871 * 5) * MIB)

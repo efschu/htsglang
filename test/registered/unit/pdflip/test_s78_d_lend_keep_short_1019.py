@@ -8,7 +8,7 @@ free (p50, ``PDFLIP-VRAM-PEAK phase=chunk card_free_start_mib``) and grew the al
 What must hold (desk rank of test_pdflip_d_seat_live_wipe_s1_0928, lattice step 4 rows, S0 = 32 rows ON,
 lend to 40):
 (1) all pending work SHORT by the front's R2 verdict -> only the cells above the largest lattice k that
-    leaves ``max(floor, 300 + rate x rows)`` MiB free go back (KEEP-PRICE 20.10.; S78 summed them); the rows up to k keep their bytes and stay ON;
+    leaves ``floor + 300 + rate x rows`` MiB free go back; the rows up to k keep their bytes and stay ON;
 (2) the card already holds the price -> nothing moves (``keep``);
 (3) no cell can stay -> the full return (as before);
 (4) big / unpriced / chunked / resumed pending work, a rank without a chunk rate, or the switch off ->
@@ -145,21 +145,15 @@ def test_a_short_extend_keeps_the_cells_the_price_leaves():
         assert free + released >= NEED  # (7)
 
 
-def test_the_lend_floor_binds_only_above_the_chunk_price():
-    """KEEP-PRICE (20.10.): the price is max(floor, 300 + rate x rows), not their sum (S78 summed).
-    A floor under the chunk price adds nothing: free = chunk price keeps everything. A floor above it is
-    the price: one MiB short of the floor gives a step back (test_keep_price_max_1020 has the full grid)."""
+def test_the_lend_floor_is_part_of_the_price():
+    """The kept lend must leave the near-OOM edge AND the extend's price: free = price without the floor
+    is one floor short, so a step goes back."""
     tms = h.CoreTms()
     with _Ctx(tms, NEED, floor="1"):
         r, ctl = _live_lent(tms)
-        assert dtl.round_start(r.sched) == "keep" and ctl.rows_on == 40
-    tms = h.CoreTms()
-    floor_mib = NEED // MIB + 1
-    with _Ctx(tms, NEED, floor=str(floor_mib)):
-        r, ctl = _live_lent(tms)
         assert dtl.round_start(r.sched) == "return" and ctl.rows_on < 40
         released = ctl._bank_bytes_at(40) - ctl._bank_bytes_at(ctl.rows_on)
-        assert NEED + released >= floor_mib * MIB or ctl.lent_from is None
+        assert NEED + released >= NEED + MIB or ctl.lent_from is None
 
 
 def test_the_card_holding_the_price_moves_nothing():
