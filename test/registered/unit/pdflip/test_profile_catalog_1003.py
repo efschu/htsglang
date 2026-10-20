@@ -41,7 +41,7 @@ ABSENT_ON_NF_LINE = frozenset((
 #: curated names the code of the 27B line does not carry: the NF line's own curated entry (``baeume`` ["nf"] in the catalog; measured 07.10. on
 #: 65fc0e2076: --pdflip-xchg-census-map is neither a launcher flag nor a server_args flag of the 27B tree).  It stays curated (user/27B seat 07.10.:
 #: do not delete it) and this test names it.  The curated total is therefore 119 on both lines (118 + this entry).
-ABSENT_ON_27B_LINE = frozenset(("--pdflip-xchg-census-map",))
+ABSENT_ON_27B_LINE = frozenset()   # 27B port 20.10.: --pdflip-xchg-census-map (AP4 1526) came with the NF merge
 
 
 def _load(name, path):
