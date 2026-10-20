@@ -552,6 +552,48 @@ def publish_on(env=None) -> bool:
 
 
 CUT_L3_PUBLISH_ENV = "FLLIPER_PDFLIP_CUT_L3_PUBLISH"
+
+# ------------------------- S74b (20.10., rc28 boot ..._297198745d_1020_174205, pdflip-4-223 ANKER-VERFEHLT-P)
+#: THE METAL. D TP0 direct-wrote share 0 of the session prefix pages 1332..1368 ([85248, 87616), TP0 nodes 447/437)
+#: at 18:10:19; the page was incomplete, the direct ack's S74 CUT-L3-WAIT sent its PUBLISH. In the SAME ack drain
+#: the node's second store operation -- the plain-sidecar (QSA index) write, registered in ``ongoing_backup`` --
+#: acked and ran the generic store-ack verdict: ``_pdflip_rebind_host_to_arena`` answers True for rows that ARE
+#: arena rows already (no COMPLETE check), so TP0 sent REBIND + L3 and set ``l3_present``. The workers got
+#: PUBLISH (refused: ``#1421 BACKUP-REFUSED why=arena_claim node=457``, arena full), REBIND (``R12
+#: CUT-REBIND-MISS``) and L3 in one broadcast: their node 457 became ``l3_present`` and no worker sweep ever wrote
+#: its share again (0 BACKUP-REFUSED for node 457 after 18:10:19, although TP0's W3 spill freed 69 pages for
+#: exactly that claim in the same second). TP0's S81 entry left silently ("another path marked it"; 0 ``S81
+#: HOLE-*`` lines in the boot). TP0's share-0 claims stayed CLAIMED/open0 (``ARENA-REF-CENSUS-CLAIM claimed=42
+#: oldest=950/55575ms ... open0``) until the sleep at 18:13:12 (``L3-COMPLETE-ONLY incomplete=30 of 64`` +
+#: ``7 of 7``, ``PARK-DEMOTE-INCOMPLETE absent=37 busy=37``); the store's KV chain ended at page 1332, the wake read
+#: 83072 of the parked 100608, P recomputed 17690 tokens.
+#: NOW (R11: TP0 decides from the shared arena header, the workers follow its events; no collective, no wait):
+#: under the token cut a store ack of a node whose KV host rows are arena rows sets no ``l3_present``, sends no
+#: REBIND/L3 while a page is not COMPLETE -- the node stays watched by S74/S81 (republish to the owners, or revoke)
+#: and gets ``l3_present`` + L3 only when every owner wrote. ``0`` = the rc28 form.
+S74B_STORE_ACK_HOLD_ENV = "FLLIPER_PDFLIP_S74B_STORE_ACK_HOLD"
+
+
+def s74b_on(env=None) -> bool:
+    """S74b switch ``FLLIPER_PDFLIP_S74B_STORE_ACK_HOLD`` (default ON), see :data:`S74B_STORE_ACK_HOLD_ENV`."""
+    env = os.environ if env is None else env
+    return str(env.get(S74B_STORE_ACK_HOLD_ENV, "1")).strip().lower() not in ("0", "false", "no", "off", "")
+
+
+def watch_incomplete(tree: Any, node: Any) -> bool:
+    """S74b, TP0 under the token cut: a store ack found ``node``'s page incomplete. Keep it watched by the S74/S81
+    wait list -- an entry the node already has (its direct ack's CUT-L3-WAIT, with the PUBLISH already sent) stays as
+    it is; otherwise :func:`await_l3` adds it (and sends the PUBLISH). False = not keyable (nothing is marked either:
+    the caller sets no ``l3_present``)."""
+    k = node_key(node)
+    if k is None:
+        return False
+    ent = _S.l3_wait.get(k)
+    if ent is not None and ent[0] is node:
+        return True
+    return await_l3(tree, node)
+
+
 #: S74 review A2: pages ``_retry_l3_waits`` re-checks per broadcast (find_states over the waiting nodes' KV stems);
 #: the rest waits for the next broadcast in round-robin order
 CUT_L3_RETRY_PAGES_ENV = "FLLIPER_PDFLIP_CUT_L3_RETRY_PAGES"

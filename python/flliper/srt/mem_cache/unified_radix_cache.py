@@ -7658,6 +7658,33 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             logger.warning("S74 CUT-L3 completeness probe raised on node %s: %r", getattr(node, "id", "?"), exc)
             return True
 
+    def _s74b_store_ack_hold(self, node) -> bool:
+        """S74b (``form_a_host_shadow.S74B_STORE_ACK_HOLD_ENV``), TP0 under the token cut at a STORE ack: True = the
+        node's KV host rows are arena rows (a direct write -- ``_pdflip_rebind_host_to_arena`` would answer "already
+        arena rows" without looking at the slots) and some page is not COMPLETE in the shared header. The caller then
+        sets no ``l3_present`` and sends no REBIND/L3; the node is (kept) on the S74/S81 wait list. False everywhere
+        else (switch off, S74 off, staging rows -- their rebind checks every slot itself --, a page state that cannot
+        be read): the rc28 verdict. TP0's decision from the shared header only; no collective, no wait."""
+        if not (_r12.s74b_on() and _r12.cut_l3_complete_on()):
+            return False
+        if not UnifiedRadixCache._pdflip_direct_kv_rows(self, node):
+            return False
+        if UnifiedRadixCache._s74_cut_page_complete(self, node):
+            return False
+        _r12.watch_incomplete(self, node)
+        n = getattr(UnifiedRadixCache, "_s74b_hold_n", 0) + 1
+        UnifiedRadixCache._s74b_hold_n = n
+        if n <= 16 or n % 256 == 0:
+            logger.info(
+                "S74b STORE-ACK-HOLD node=%s depth=%d pages=%d chain_piece=%d n=%d (TP0, token cut: a store ack of "
+                "a direct-written node whose page is not COMPLETE -- no REBIND, no L3, no l3_present; the owners' "
+                "shares are still asked for, L3 follows the complete page)",
+                getattr(node, "id", "?"), _r12.node_key(node)[1] if _r12.node_key(node) else -1,
+                len(getattr(node, "hash_value", None) or ()),
+                int(bool(getattr(node, "_pdflip_chain_piece", False))), n,
+            )
+        return True
+
     def _k12_republish_orphaned(self, node, orphaned: int) -> bool:
         """K12c review A3: give the orphaned node's host layer back so the node
         is an un-backed DEVICE node again -- the publish sweep then writes it
@@ -12460,6 +12487,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     # complete page (REBIND) or waits for it.
                     if _cut == "worker":
                         _r12.worker_keeps(self, "store-ack-cut", node)
+                    elif _cut == "host" and UnifiedRadixCache._s74b_store_ack_hold(self, node):
+                        # S74b (rc28 pdflip-4-223): the page is not COMPLETE -- no REBIND, no L3, no
+                        # l3_present (the rebind's "already arena rows" answer is no completeness proof);
+                        # S74/S81 keep watching it, L3 follows when every owner wrote
+                        pass
                     elif self._pdflip_rebind_host_to_arena(node):
                         # #1424: the rows now ARE the arena slots
                         if _cut == "host":

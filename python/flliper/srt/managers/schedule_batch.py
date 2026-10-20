@@ -3660,8 +3660,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             _n = getattr(ScheduleBatch, "_969_extent_n", 0) + 1
             ScheduleBatch._969_extent_n = _n
             if _n <= 400 or _n % 64 == 0:
+                # ANKER-D (rc28 pdflip-18-315): an E2 skip request's [c, N) runs NO target forward (P's END state
+                # is installed at N) -- named after the list, so a reader does not take its start c for the cache
+                # start (the tuple stays the forward-width probe it was)
+                try:
+                    from flliper.srt.pdflip import tail_adopt as _ta
+
+                    _skip = [str(r.rid) for r in reqs if str(r.rid) in _ta.SKIP_PLANS]
+                except Exception:  # noqa: BLE001 - a probe never breaks a forward
+                    _skip = []
                 logger.warning(
-                    "#969 EXTENT n=%d fwd=%s reqs=%s",
+                    "#969 EXTENT n=%d fwd=%s reqs=%s%s",
                     _n,
                     getattr(self, "forward_mode", "?"),
                     [
@@ -3674,6 +3683,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         )
                         for r, _i in zip(reqs, input_ids)
                     ],
+                    (" skip_no_target_fwd=%s" % _skip) if _skip else "",
                 )
         except Exception:  # noqa: BLE001 - a probe may never break a forward
             pass

@@ -1941,6 +1941,7 @@ def _commit_skip(req, entry: Agreed, tree_cache, page_size: int) -> int:
         # before the park and re-sends nothing (send_token_offset is past it)
         req.output_ids.pop()
         req.full_untruncated_fill_ids = req.origin_input_ids + req.output_ids
+    skip_cached_credit(req, int(spec.n_tokens) - int(spec.cut))
     _log_ready(st, "done", skip=True, waited_ms=entry.waited_ms)
     inst = None
     if st.end_verdict == "ready":
@@ -1950,6 +1951,27 @@ def _commit_skip(req, entry: Agreed, tree_cache, page_size: int) -> int:
     while len(SKIP_PLANS) > KEEP_AGREED:  # an admitted batch that never ran
         SKIP_PLANS.pop(next(iter(SKIP_PLANS)))
     return spec.cut
+
+
+def skip_cached_credit(req, skipped: int) -> int:
+    """ANKER-D (``FLLIPER_PDFLIP_TAIL_SKIP_CACHED_CREDIT``, default on): the E2 skip's [c, N) runs no target
+    forward -- P's END state at N is installed -- so those ``skipped`` tokens are cached, not computed.
+    ``prepare_for_extend`` books only ``len(prefix_indices)`` (= c); the commit adds the rest to the counter that
+    booking feeds: the lifetime ``cached_tokens`` (a fresh hand-off) or ``readmit_cached_tokens`` (a request that
+    was retracted -- a park resume; the booking ASSIGNS that one to ``cached_tokens``). Returns the credit."""
+    n = int(skipped)
+    if n <= 0:
+        return 0
+    try:
+        if not envs.FLLIPER_PDFLIP_TAIL_SKIP_CACHED_CREDIT.get():
+            return 0
+    except Exception:  # noqa: BLE001 - a hermetic env without the field: on (the default)
+        pass
+    if getattr(req, "retracted_stain", False):
+        req.readmit_cached_tokens = int(getattr(req, "readmit_cached_tokens", 0) or 0) + n
+    else:
+        req.cached_tokens = int(getattr(req, "cached_tokens", 0) or 0) + n
+    return n
 
 
 def _skip_install(st: Staged, tree_cache) -> Install:
