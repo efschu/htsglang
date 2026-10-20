@@ -5465,11 +5465,14 @@ class Front:
                 self.counters["rvp_text_classed"] = self.counters.get("rvp_text_classed", 0) + 1
                 if _usrc == "unpriced":
                     self.counters["rvp_text_unpriced"] = self.counters.get("rvp_text_unpriced", 0) + 1
-                    try:
-                        self.__dict__.setdefault("_rvp_reprice_tasks", {})[rid] = asyncio.ensure_future(
-                            Front._rvp_reprice(self, rid, p, ids, payload.get("extra_key")))
-                    except RuntimeError:  # no running loop (unit stand-ins): stays unpriced, named
-                        pass
+                    _cls = "unpriced"  # B5: the line never says kurz for an entry that has no number
+                if str(r.get("reason", "")) == _rvp.REASON_WALL:
+                    # NF-VISION-CACHED A2: the arrival's S63 key asks on the PROMPT ids -- applied to this leg it would drop
+                    # the streamed output. The leg's own key (its context ids) replaces it when its exact number lands.
+                    _rb = self.__dict__.get("_reprobe_book")
+                    if _rb is not None:
+                        _rb.pop(str(rid), None)
+                    Front._rvp_reprice_start(self, rid, p, ids=ids, extra_key=payload.get("extra_key"), site="rvp_leg")
                 logger.info("RESUME-VIA-P CLASS rid=%s u=%d u_src=%s class=%s X=%d d_extent=%d reason=%s -- a text leg classes "
                             "by its exact u, never p_only by state (S107, SOLL R7 R9)", rid, int(_u), _usrc, _cls, _xo,
                             int(r.get("d_extent") or 0), r.get("reason", "?"))
@@ -5497,96 +5500,213 @@ class Front:
             self._kick_controller("arrival")
         return len(reqs)
 
-    def _rvp_text_u(self, rid: str, rec: dict) -> Tuple[int, str]:
-        """S107: the u a TEXT RESUME-VIA-P leg classes by. D's ``d_extent`` is its X gate's uncached extent -- except for
-        a wall refusal (``REASON_WALL``): that extent is the device rows the head needs (load-back + extend), so the
-        request's exact number is the front's D-probe price (D tree + store, ``class_uncached``); without one the rows
-        stand (named, ``u_src=d_rows``) -- never a number invented here."""
-        d_ext = int(rec.get("d_extent") or len(rec.get("input_ids") or ()))
-        if str(rec.get("reason", "")) != _rvp.REASON_WALL:
-            return d_ext, "d_extent"
+    def _wall_interim(self, rid: str, n_ctx: int, cap: int) -> Tuple[int, str]:
+        """NF-VISION-CACHED A1 (review 20.10. B1/B2; user 19.10. "NICHTS SCHÄTZEN, EXAKTE ZAHLEN"; the EZ-S1 ladder
+        ``decision_numbers.class_basis``): the INTERIM class of a request D refused on its backup wall (D-WALL-HEAD: the
+        extent is device rows, no uncached count) until D's exact number NOW lands (``_rvp_reprice``). Two numbers exist
+        here and NEITHER is D's number at the decision:
+          * the rid's D price (arrival probe, or the late NF-1b answer) -- exact at ITS time, older now;
+          * u_p = n_ctx - the store depth the arrival read -- an UPPER bound (D reads the store plus its radix; and the
+            store only grew since: 33 of 185 re-probes on 20.10. found it deeper, median +4544).
+        Either may say ONE thing: below halbX (of the X at the depth n_ctx - u) => kurz -- the safe direction: no set
+        member, no flip reason (R7), a wrong kurz only waits for the exact number. Anything at or above halbX is no class
+        number: UNPRICED (u=0, no member, no flip reason; it rides a decided flip, R1a) until the fresh probe. On 20.10.
+        391 of 3563 D probes had u_d < X while u_p >= X -- each a flip under X if u_p were the class."""
+        frac = Front._set_cfg()[0]
+
+        def kurz(u: int) -> bool:
+            try:
+                x = Front._x_at_depth(self, max(0, int(n_ctx) - int(u)))
+                return phase_policy.classify_arrival(int(u), int(x), frac, False) == phase_policy.CLASS_KURZ
+            except Exception:  # noqa: BLE001 -- no X: no class
+                return False
+
         xp = (self.__dict__.get("_probe_price") or {}).get(str(rid))
-        n_ctx = len(rec.get("input_ids") or ())
         if xp is not None:
             try:
                 # the context D holds is prompt + streamed output: the output past the probed prompt is uncached too
-                extra = max(0, n_ctx - (int(xp.covered) + int(xp.uncached))) if n_ctx else 0
-                return min(d_ext, int(_dmp.class_uncached(xp)) + extra), "d_probe"
-            except Exception:  # noqa: BLE001 -- a malformed price: the store's number below, else unpriced
+                extra = max(0, int(n_ctx) - (int(xp.covered) + int(xp.uncached))) if n_ctx else 0
+                u = min(int(cap), int(_dmp.class_uncached(xp)) + extra)
+                if not bool(xp.image_in_tail) and kurz(u):
+                    return u, "d_probe"
+            except Exception:  # noqa: BLE001 -- a malformed price: the bound below, else unpriced
                 pass
-        # NF-VISION-CACHED (20.10., rc28 _174205 pdflip-4-226: no D price -> the rows 226683 = the whole prompt were the
-        # class, R4 flipped for 379 uncached tokens; user 20.10. "WARUM SOLLTE IRGENDWAS FLIPPEN ODER LADEN WENN DAS BILD
-        # UND DER GANZE KONTEXT GECACHT IST"): the rows are NEVER a class. Without D's price the P leg's exact work is
-        # what the shared store does not hold: n_ctx minus the anchored store depth the arrival READ (L3-INDEX-PRESENCE,
-        # P reads exactly that store). Without that either the leg is UNPRICED: no class of its own (u=0: no set member,
-        # no flip reason, R7), it rides a decided flip (R1a) and a store probe prices it (``_rvp_reprice``).
         zp = (self.__dict__.get("_za_presence") or {}).get(str(rid))
         if zp is not None and int(zp[0]) > 0 and n_ctx:
-            return max(0, min(d_ext, n_ctx - int(zp[0]))), "p_store"
+            u = max(0, min(int(cap), int(n_ctx) - int(zp[0])))
+            if kurz(u):
+                return u, "p_upper"
         return 0, "unpriced"
 
-    async def _rvp_reprice(self, rid: str, p: "Pending", ids, extra_key: Optional[str]) -> None:
-        """NF-VISION-CACHED: an UNPRICED text RESUME-VIA-P leg gets its exact P-side number from the shared store (the
-        store P reads for it): u = n_ctx - store depth. Until then it is no set member and no flip reason (R7)."""
+    def _rvp_text_u(self, rid: str, rec: dict) -> Tuple[int, str]:
+        """S107: the u a TEXT RESUME-VIA-P leg classes by. D's ``d_extent`` is its X gate's uncached extent (D's own
+        measurement at the refusal) -- except for a wall refusal (``REASON_WALL``): that extent is the device rows the
+        head needs (load-back + extend). NF-VISION-CACHED (20.10., rc28 _174205 pdflip-4-226: the rows 226683 = the whole
+        prompt were the class, R4 flipped for 379 uncached tokens; user 20.10. "WARUM SOLLTE IRGENDWAS FLIPPEN ODER LADEN
+        WENN DAS BILD UND DER GANZE KONTEXT GECACHT IST"): the rows are NEVER a class -- the interim class of
+        ``_wall_interim`` (kurz or unpriced), and D's exact number on the leg's context ids NOW (``_rvp_reprice``)."""
+        d_ext = int(rec.get("d_extent") or len(rec.get("input_ids") or ()))
+        if str(rec.get("reason", "")) != _rvp.REASON_WALL:
+            return d_ext, "d_extent"
+        return Front._wall_interim(self, rid, len(rec.get("input_ids") or ()), d_ext)
+
+    #: NF-VISION-CACHED A3: pause between two rounds of an unpriced wall request's exact number (each round itself is
+    #: bounded by the probe deadline and two store reads)
+    RVP_REPRICE_RETRY_S = 2.0
+
+    async def _rvp_reprice(self, rid: str, p: "Pending", *, ids=None, extra_key: Optional[str] = None,
+                           path: Optional[str] = None, payload: Any = None, site: str = "rvp_leg") -> bool:
+        """NF-VISION-CACHED A1/A2/A3 (review 20.10.): D's EXACT number NOW for a request D refused on its backup wall --
+        D's tree read-only + the shared store, the S56/S63 probe:
+          * a RESUME-VIA-P leg (``ids``): on the leg's CONTEXT ids (prompt + streamed output, D's own token space, the ids
+            P prefills) in the leg's namespace -- the output is part of the number, never dropped (A2);
+          * a fresh refusal (``path``/``payload``): the request's own body, D tokenizes it.
+        The number becomes the entry's u (``class_uncached``: R9 an image in the uncached tail -> what P computes) and the
+        rid's price and S63 re-probe key (later rounds ask on THESE ids). Without an answer the entry stays as it is
+        (kurz interim or unpriced: no member, no flip reason) and is ASKED AGAIN after ``RVP_REPRICE_RETRY_S`` while it
+        waits (A3; every failed round names the entry's age: ``RESUME-VIA-P REPRICE-FAILED ... age_s=``, the monitor's
+        instrument). Runs as its own task: the front loop never waits for it. Returns True when a number landed."""
         import numpy as _np
 
+        t0 = time.monotonic()
+        attempt = 0
+        ns_known, ns = True, extra_key
+        if ids is None:
+            note = (self.__dict__.get("_ns_ek") or {}).get(str(rid))
+            ns_known, ns = (bool(note[0]), note[1]) if note is not None else (True, None)
+        while True:
+            if p.fut.done() or not any(q is p for q in self.queue):
+                self.counters["rvp_reprice_gone"] = self.counters.get("rvp_reprice_gone", 0) + 1
+                logger.info("RESUME-VIA-P REPRICE-END rid=%s site=%s attempts=%d age_s=%.1f -- the entry left the queue "
+                            "before an exact number landed", rid, site, attempt, time.monotonic() - t0)
+                return False
+            attempt += 1
+            why, ans = "", None
+            if ids is not None:
+                _ids = _np.asarray(list(ids), dtype=_np.int64)
+                body: Dict[str, Any] = {"rid": rid, "input_ids_b64": _dmp.ids_to_b64(_ids)}
+                if extra_key is not None:
+                    body["extra_key"] = str(extra_key)
+                task = Front._d_probe_start(self, rid, "/generate", body)
+            else:
+                _ids = None
+                task = Front._d_probe_start(self, rid, str(path or ""), payload)
+            if task is None:
+                why = "probe off / no D group / unpriced shape"
+            else:
+                try:
+                    ans = await Front._d_probe_result(self, rid, task)
+                except Exception as e:  # noqa: BLE001
+                    ans, why = None, "%s: %s" % (type(e).__name__, str(e)[:120])
+                if ans is None and not why:
+                    why = "no exact D number by the deadline"
+                elif ans is not None and _ids is not None and not (
+                        int(ans.n) == int(_ids.size) and bool(_np.array_equal(_np.asarray(ans.ids), _ids))):
+                    why, ans = "identity: D answered n=%d for the leg's n=%d" % (int(ans.n), int(_ids.size)), None
+            store = 0
+            if ans is not None and ns_known:
+                tmo = envs.FLLIPER_PDFLIP_FRONT_EXACT_TIMEOUT_MS.get() / 1000.0
+                tier = "unread"
+                for _ in range(2):
+                    try:
+                        store, tier = await self._store_probe_depth(rid, _np.asarray(ans.ids, dtype=_np.int64), tmo,
+                                                                    extra_key=ns)
+                    except Exception:  # noqa: BLE001
+                        store, tier = 0, "unread"
+                    if tier == "none" and self.__dict__.get("store_probe") is None:
+                        tier = "unread"  # (0, "none") from a probe that is not open: not askable, no number
+                    if tier != "unread":
+                        break
+                if tier == "unread":
+                    why, ans = "store unread twice", None
+            if ans is None:
+                self.counters["rvp_reprice_failed"] = self.counters.get("rvp_reprice_failed", 0) + 1
+                stop = why.startswith("probe off")
+                logger.warning("RESUME-VIA-P REPRICE-FAILED rid=%s site=%s attempt=%d why=%s age_s=%.1f u=%d next=%s -- no "
+                               "exact D number for this wall entry: it stays %s (no set member, no flip reason, R7; it "
+                               "rides a decided flip, R1a)", rid, site, attempt, why, time.monotonic() - t0,
+                               int(p.est_uncached or 0), "stop" if stop else "retry_s=%.1f" % Front.RVP_REPRICE_RETRY_S,
+                               "unpriced" if not int(p.est_uncached or 0) else "kurz on its interim number")
+                if stop:
+                    return False
+                await asyncio.sleep(Front.RVP_REPRICE_RETRY_S)
+                continue
+            if p.fut.done() or not any(q is p for q in self.queue):
+                continue  # gone meanwhile: named at the loop head
+            xp = _dmp.exact_price(ans, int(store) if ns_known else 0)
+            u = int(_dmp.class_uncached(xp))
+            old = int(p.est_uncached or 0)
+            p.est_uncached = u
+            p.est_uncached_p = int(xp.uncached_p)
+            if ids is None and bool(xp.image_in_tail):
+                p.p_only = True  # R9: an image in the uncached tail of a fresh request needs P's tower
+            t_ans = time.monotonic()
+            pbook = self.__dict__.setdefault("_probe_price", collections.OrderedDict())
+            pbook[str(rid)] = xp
+            while len(pbook) > 4096:
+                pbook.popitem(last=False)
+            Front._reprobe_note(self, rid, _dmp.ReprobeEntry(
+                ids=_np.asarray(ans.ids, dtype=_np.int64), spans=tuple(ans.mm_spans),
+                extra_key=(extra_key if ids is not None else ans.extra_key),
+                extra_key_known=(True if ids is not None else bool(ans.extra_key_known)),
+                path=("/generate" if ids is not None else str(path or "")),
+                payload=(None if (ids is not None or (ans.extra_key_known and ns_known)) else payload),
+                ns_known=bool(ns_known), ns=ns, t=t_ans, price=xp,
+                landed=t_ans))
+            self.counters["rvp_repriced"] = self.counters.get("rvp_repriced", 0) + 1
+            try:
+                x = Front._x_at_depth(self, max(0, int(ans.n) - u))
+                klass = phase_policy.classify_arrival(u, int(x), Front._set_cfg()[0], bool(getattr(p, "p_only", False)))
+            except Exception:  # noqa: BLE001 -- an instrument
+                x, klass = 0, "?"
+            logger.info("RESUME-VIA-P REPRICE rid=%s site=%s u %d -> %d class=%s X=%d n=%d device=%d host=%d store=%d "
+                        "image_in_tail=%d attempt=%d age_s=%.1f -- D's exact number NOW on the entry's own ids "
+                        "(NF-VISION-CACHED; SOLL R7 R9)", rid, site, old, u, klass, int(x), int(ans.n),
+                        int(ans.device_tokens), int(ans.host_tokens), int(xp.store_tokens), int(xp.image_in_tail),
+                        attempt, t_ans - t0)
+            self._kick_controller("arrival")
+            return True
+
+    def _rvp_reprice_start(self, rid: str, p: "Pending", **kw) -> None:
+        """Start ``_rvp_reprice`` as its own task (bounded book, the entry leaves it when the task ends -- B5)."""
         try:
-            st, tier = await self._store_probe_depth(
-                rid, _np.asarray(list(ids), dtype=_np.int64), envs.FLLIPER_PDFLIP_FRONT_EXACT_TIMEOUT_MS.get() / 1000.0,
-                extra_key=extra_key)
-        except Exception:  # noqa: BLE001 -- no store number: the leg stays unpriced, named
-            st, tier = 0, "unread"
-        if tier == "none" and self.__dict__.get("store_probe") is None:
-            # (0, "none") also means "not askable" (no store probe open): that is no number, never "the store holds
-            # nothing" -- pricing the whole context on it would be the estimate this path removes
-            tier = "unread"
-        if tier == "unread":
-            self.counters["rvp_reprice_unread"] = self.counters.get("rvp_reprice_unread", 0) + 1
-            logger.warning("RESUME-VIA-P REPRICE rid=%s tier=unread -- no exact number: the leg stays unpriced (no class, "
-                           "no flip reason, it rides a decided flip; R7)", rid)
-            return
-        u = max(0, len(ids) - int(st))
-        p.est_uncached = int(u)
-        self.counters["rvp_repriced"] = self.counters.get("rvp_repriced", 0) + 1
-        logger.info("RESUME-VIA-P REPRICE rid=%s u=%d u_src=p_store store=%d tier=%s n_ctx=%d -- the unpriced leg classes "
-                    "by the store P reads (NF-VISION-CACHED)", rid, u, int(st), tier, len(ids))
-        self._kick_controller("arrival")
+            book = self.__dict__.setdefault("_rvp_reprice_tasks", {})
+            old = book.get(rid)
+            if old is not None and not old.done():
+                old.cancel()
+            t = asyncio.ensure_future(Front._rvp_reprice(self, rid, p, **kw))
+            book[rid] = t
+            t.add_done_callback(lambda _t, _r=rid, _b=book: (_b.pop(_r, None) if _b.get(_r) is _t else None))
+        except RuntimeError:  # no running loop (unit stand-ins): stays on its interim class, named
+            self.counters["rvp_reprice_no_loop"] = self.counters.get("rvp_reprice_no_loop", 0) + 1
 
     def _wall_extent_to_u(self, rid: str, body: bytes, d_extent: Optional[int],
                           n_prompt: Optional[int] = None) -> Optional[int]:
         """S107 (SOLL R7 R9; user 20.10. "Ist das Bild samt Kontext gecacht, wird nichts geladen und nicht geflippt"): a
         fresh W50 that names ``D-WALL-HEAD`` carries the DEVICE ROWS the head needs (load-back + extend) as its extent,
-        not its uncached tokens. Priced on the rows, a request of 246 uncached tokens (image + context cached) became
-        "gross 85494" and flipped D to P (NF rc19 boot _074525 pdflip-22-78, 08:04:07Z; P computed 246). The class takes
-        the request's exact number instead (the front's D-probe price: D tree + store); without one the rows stand,
-        named. Every other refusal keeps D's extent untouched."""
+        not its uncached tokens (rc19 _074525 pdflip-22-78: 246 uncached tokens, image + context cached, became "gross
+        85494" and flipped; P computed 246). NF-VISION-CACHED A1: the rows are never a class; the interim class of
+        ``_wall_interim`` (kurz below halbX on the rid's D price or the store bound, else UNPRICED = 0, recorded in
+        ``_wall_unpriced`` for the caller) and D's exact number NOW from ``_rvp_reprice`` (started by the caller).
+        Every other refusal keeps D's extent untouched."""
         try:
             wall = b"D-WALL-HEAD" in body
         except TypeError:
             wall = False
         if not wall or d_extent is None:
             return d_extent
-        xp = (self.__dict__.get("_probe_price") or {}).get(str(rid))
-        if xp is None:
-            # NF-VISION-CACHED: without D's price the store depth the arrival READ prices it (P reads that store)
-            zp = (self.__dict__.get("_za_presence") or {}).get(str(rid))
-            if zp is not None and int(zp[0]) > 0 and n_prompt:
-                u = max(0, min(int(d_extent), int(n_prompt) - int(zp[0])))
-                self.counters["wall_extent_to_u_store"] = self.counters.get("wall_extent_to_u_store", 0) + 1
-                logger.warning("PDFLIP WALL-EXTENT rid=%s rows=%d u=%d u_src=p_store -- D-WALL-HEAD refusal without a D "
-                               "price: the class stands on the store P reads, never on the rows (NF-VISION-CACHED, R7)",
-                               rid, int(d_extent), u)
-                return u
-            self.counters["wall_extent_rows_kept"] = self.counters.get("wall_extent_rows_kept", 0) + 1
-            logger.warning("PDFLIP WALL-EXTENT rid=%s rows=%d u=unknown -- D-WALL-HEAD refusal without a probe price: the "
-                           "rows stand as the extent (S107)", rid, int(d_extent))
-            return d_extent
-        u = min(int(d_extent), int(_dmp.class_uncached(xp)))
-        self.counters["wall_extent_to_u"] = self.counters.get("wall_extent_to_u", 0) + 1
-        logger.warning("PDFLIP WALL-EXTENT rid=%s rows=%d u=%d u_src=d_probe image_in_tail=%d -- D could not HOLD the "
-                       "rows (backup wall), it did not refuse an extent over X: the class stands on the exact u (S107, "
-                       "SOLL R7: a request D cannot take under X is a defect of D, no flip reason)", rid, int(d_extent),
-                       u, int(bool(xp.image_in_tail)))
+        n = int(n_prompt or 0) or int(d_extent)
+        u, src = Front._wall_interim(self, rid, n, int(d_extent))
+        _wf = self.__dict__.setdefault("_wall_fresh", collections.OrderedDict())
+        _wf[str(rid)] = src  # read (popped) by the requeue that called this; bounded for a terminal refusal
+        while len(_wf) > 4096:
+            _wf.popitem(last=False)
+        self.counters["wall_extent_" + src] = self.counters.get("wall_extent_" + src, 0) + 1
+        logger.warning("PDFLIP WALL-EXTENT rid=%s rows=%d u=%d u_src=%s class=%s -- D could not HOLD the rows (backup "
+                       "wall), it named no uncached extent: the rows are no class; %s (NF-VISION-CACHED, SOLL R7)",
+                       rid, int(d_extent), u, src, "unpriced" if src == "unpriced" else "kurz",
+                       "D's exact number NOW follows" if src != "unpriced" else
+                       "no member, no flip reason until D's exact number NOW lands")
         return u
 
     def _rvp_p_finished(self, p: "Pending") -> None:
@@ -7287,6 +7407,10 @@ class Front:
             u_d = max(0, int(ans.n) - covered)
             ok = u_d <= up and int(ans.n) == int(n)
             try:
+                if int(ans.n) != int(n):
+                    # B5: a different n is the violation this line names -- the store depth (front ids) and D's ids would
+                    # mix: no price, the entry stays on its store bound
+                    raise ValueError("n_d=%d != n_front=%d: not booked" % (int(ans.n), int(n)))
                 # the exact D price of this rid, kept as an answered arrival probe keeps it (NF-VISION-CACHED)
                 _xp = _dmp.exact_price(ans, int(store) if ns_known else 0)
                 _pbook = self.__dict__.setdefault("_probe_price", collections.OrderedDict())
@@ -7299,9 +7423,9 @@ class Front:
                     payload=(None if (ans.extra_key_known and ns_known) else payload),
                     ns_known=bool(ns_known), ns=ns, t=time.monotonic(), price=_xp))
                 self.counters["d_probe_late_priced"] += 1
-            except Exception:  # noqa: BLE001 -- an unpriceable answer leaves the book as it was
-                logger.warning("PDFLIP D-PROBE-LATE rid=%s: the late answer could not be booked as a price", rid,
-                               exc_info=True)
+            except Exception as _e:  # noqa: BLE001 -- an unpriceable answer leaves the book as it was
+                self.counters["d_probe_late_unbooked"] += 1
+                logger.warning("PDFLIP D-PROBE-LATE rid=%s: the late answer is not booked as a price (%s)", rid, _e)
             self.counters["d_probe_late_ok" if ok else "d_probe_late_violation"] += 1
             (logger.info if ok else logger.warning)(
                 "PDFLIP D-PROBE-LATE rid=%s u_d=%d u_p=%d n_d=%d n_front=%d device=%d host=%d store=%d %s "
@@ -14006,8 +14130,10 @@ class Front:
         number IS D's admission measurement, S56r B2, and a second W31 is terminal, W35 --, a leg-2 reroute, a lost
         hand-off, an intake stall, a leg 1 done or skipped). It stays P's on D's admission number, named
         ``route=p_by_state``. Returns the route named in the line."""
+        if Front._rvp_other_key(self, rid, e, "unpriced", site):
+            return "rvp_own_key"
         book = self.__dict__.get("_reprobe_book")
-        if book is not None:
+        if book is not None and book.get(str(rid)) is e:
             book.pop(str(rid), None)
         routes = []
         for p in self.queue:
@@ -14055,6 +14181,21 @@ class Front:
                           if d_down else ""))
         return route
 
+    def _rvp_other_key(self, rid: str, e: "_dmp.ReprobeEntry", what: str, site: str) -> bool:
+        """NF-VISION-CACHED A2 (review 20.10. B3): a RESUME-VIA-P leg of ``rid`` is priced on its CONTEXT ids (prompt +
+        streamed output). A re-probe round on another key -- the arrival's PROMPT ids, asked before the reroute -- answers
+        for fewer tokens; applied to the leg it would drop the output from its u (379 + 20000 gross -> 379 kurz: the flip
+        lost) or unprice it. Such a round touches nothing of the rid (named); the leg's own key comes with its number."""
+        for p in self.queue:
+            if p.rid == rid and not p.fut.done() and getattr(p, "resume_via_p", False) and \
+                    int(e.n) != int(getattr(p, "est_prompt", 0) or 0):
+                self.counters["set_reprobe_rvp_other_key"] += 1
+                logger.info("PDFLIP SET-REPROBE-SKIP rid=%s site=%s what=%s key_n=%d leg_n=%d -- the round asked on "
+                            "another key than the RESUME-VIA-P leg's context ids: it does not touch the leg "
+                            "(NF-VISION-CACHED A2)", rid, site, what, int(e.n), int(getattr(p, "est_prompt", 0) or 0))
+                return True
+        return False
+
     def _set_reprobe_apply(self, rid: str, e: "_dmp.ReprobeEntry", ans: "_dmp.ProbeAnswer", store: int,
                            t_ans: float, site: str) -> bool:
         """S63 F1: the re-probed exact number replaces the arrival's -- in BOTH directions (D's coverage grew:
@@ -14062,6 +14203,8 @@ class Front:
         SHORT and in the probe book. A queue entry that crosses X downwards is a SHORT now (d_eligible, as the
         STORE-PRESENCE reprice does); a probe-priced image request is P-only exactly while an image lies in the
         uncached tail (R9). Returns True when the class number moved."""
+        if Front._rvp_other_key(self, rid, e, "apply", site):
+            return False
         xp = _dmp.exact_price(ans, int(store) if e.ns_known else 0)
         u = int(_dmp.class_uncached(xp))
         old_xp = e.price
@@ -17699,7 +17842,9 @@ class Front:
             # probe's number gives way too -- D's extent is measured at D's admission, LATER than the probe (the
             # number at the decision, user 19.10.); the W123 branch below still sets P's own number for a P-only one
             p.est_uncached = int(d_extent)
-        _mclass = Front._measure_return(self, rid, p, d_extent, int(getattr(p, "est_prompt", 0) or 0))  # N1/N2: the prompt length, not the counter n; # EZ-S1: MEASURE_ON_D's report -> the class on D's extent
+        _wall_src = (self.__dict__.get("_wall_fresh") or {}).pop(str(rid), None)  # NF-VISION-CACHED: a wall refusal
+        _mclass = Front._measure_return(self, rid, p, (None if _wall_src == "unpriced" else d_extent),
+                                        int(getattr(p, "est_prompt", 0) or 0))  # N1/N2: the prompt length, not the counter n; # EZ-S1: MEASURE_ON_D's report -> the class on D's extent
         try:
             _vis_reroute = b"(vision reroute)" in body or b"W123" in body
         except TypeError:
@@ -17749,6 +17894,11 @@ class Front:
         self.queue.append(p)
         self._dp_mark(p, "reroute")  # R28
         self._kick_controller("arrival")  # 27B flipfast F2 (no-op when off)
+        if _wall_src is not None:
+            # NF-VISION-CACHED A1: a D-WALL-HEAD refusal carried device rows, no number: D's exact number NOW (A3: asked
+            # again while it waits)
+            Front._rvp_reprice_start(self, rid, p, path=getattr(p, "path", None), payload=getattr(p, "payload", None),
+                                     site="fresh_wall")
         self._d_pf_book().done(rid=rid)  # X-SUM-PRICE: D refused it -- back on P, no phantom while it waits
         try:
             await p.fut
