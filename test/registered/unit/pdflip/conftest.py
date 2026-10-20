@@ -202,4 +202,7 @@ def _pdflip_decode_collect_old_path(monkeypatch):
     if "FLLIPER_PDFLIP_HALF_FLIP_S" not in os.environ:
         # A7: ``FLLIPER_PDFLIP_TEST_T_HALF=4.5 pytest <arrival/flip files>`` runs the same files with the production T_halb
         monkeypatch.setenv("FLLIPER_PDFLIP_HALF_FLIP_S", os.environ.get("FLLIPER_PDFLIP_TEST_T_HALF", "0"))
+    if "FLLIPER_PDFLIP_DECODE_COLLECT_WINDOW_S" not in os.environ:
+        # 27B port: the dual layout keeps the 27B DECODE-COLLECT window (default 15 s); the suite pins it 0 as before
+        monkeypatch.setenv("FLLIPER_PDFLIP_DECODE_COLLECT_WINDOW_S", "0")
     yield
