@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import math
 import logging
 import os
 import select
@@ -318,6 +319,33 @@ def _read_exact(fd: int, n: int) -> bytes:
     return b"".join(parts)
 
 
+#: S89: what poll() reports as "this pipe has something for us" -- data, or the
+#: end of it (a dead worker: HUP/ERR; a closed fd: NVAL). select() reported all of
+#: these as readable; the reader then gets EOF and raises PleWorkerLost, as before.
+_POLL_READY = select.POLLIN | select.POLLPRI | select.POLLHUP | select.POLLERR | select.POLLNVAL
+
+
+def _poll_readable(fds: Sequence[int], timeout_s: float) -> List[int]:
+    """S89: the fds of ``fds`` that are readable within ``timeout_s`` seconds.
+
+    poll(), never select(): select() takes an fd_set of FD_SETSIZE (1024) bits and
+    raises ``ValueError: filedescriptor out of range in select()`` for any fd >= 1024.
+    A D rank holds thousands of fds BY DESIGN -- S36 KV-DURCHLAUF keeps one L3 file
+    open per live disk page (rc19 NF D TP0 07:30:42Z: live 4070, peak 5465) and raises
+    RLIMIT_NOFILE for it -- so a pipe made after that point is numbered above 1023.
+    NF rc19 boot 1020_072658: the PLE-PREFETCH workers started 07:30:50Z, 8 s after
+    the first DURCHLAUF burst; the first ``ready()`` with a gather in flight
+    (07:43:23Z, a vision extend) killed D TP0. poll() does not care about the number."""
+    fds = list(fds)
+    if not fds:
+        return []
+    p = select.poll()
+    for fd in fds:
+        p.register(fd, select.POLLIN | select.POLLPRI)
+    ms = int(math.ceil(max(0.0, float(timeout_s)) * 1000.0))
+    return [fd for fd, ev in p.poll(ms) if ev & _POLL_READY]
+
+
 class PlePreadProcs:
     """``procs`` worker processes that read rows into ``depth`` shared slots."""
 
@@ -485,7 +513,7 @@ class PlePreadProcs:
         deadline = time.monotonic() + max(0.0, float(timeout_s))
         while pending:
             left = deadline - time.monotonic()
-            readable, _, _ = select.select(list(pending), [], [], max(0.0, left))
+            readable = _poll_readable(list(pending), max(0.0, left))
             if not readable:
                 break
             for fd in readable:
@@ -502,7 +530,7 @@ class PlePreadProcs:
         fds = [self._procs[i].stdout.fileno() for i in self._inflight[1]]
         if not fds:
             return True
-        readable, _, _ = select.select(fds, [], [], 0)
+        readable = _poll_readable(fds, 0.0)
         return len(readable) == len(fds)
 
     def join(self, seq: int) -> float:

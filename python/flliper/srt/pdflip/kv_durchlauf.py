@@ -142,6 +142,37 @@ def _raise_nofile() -> None:
         pass
 
 
+#: S89: the named invariant on the fds this process HOLDS for disk pages (one L3 file per live disk page, plus a
+#: QSA sidecar where held). They are held by design (the inode outlives an L3 unlink) and released with the host
+#: rows -- rc19 NF D TP0 (boot 1020_072658) went 892 -> 4070 live in one second and peaked at 5465, back to 382:
+#: no leak, a load. What must hold: the process stays below ``FD_BUDGET_FRAC`` of its soft RLIMIT_NOFILE. Every
+#: time the held count crosses the next power of two from 1024 one census line is written (``FD_BUDGET_MARK``,
+#: held / open_fds / soft limit), as a WARNING once open_fds reaches the fraction -- the EMFILE that would follow
+#: is then named in advance. And anything in this process that waits on fds must not use select() (FD_SETSIZE
+#: 1024): S89, ``qwen4_exp_ple_prefetch._poll_readable``.
+FD_BUDGET_FRAC = 0.8
+FD_BUDGET_MARK = "PDFLIP FD-BUDGET"
+FD_BUDGET_FIRST = 1024
+
+
+def open_fds() -> int:
+    """The fds this process has open right now (-1 = unknown)."""
+    try:
+        return len(os.listdir("/proc/self/fd"))
+    except OSError:
+        return -1
+
+
+def nofile_soft() -> int:
+    try:
+        import resource
+
+        soft = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+        return -1 if soft == resource.RLIM_INFINITY else int(soft)
+    except Exception:  # noqa: BLE001 - no limit known
+        return -1
+
+
 class _Entry:
     __slots__ = ("key", "stem", "path", "fd", "direct", "total", "qsa_fd", "qsa_mode")
 
@@ -175,9 +206,30 @@ class DiskPages:
                       "read_pages": 0, "read_direct": 0, "read_failed": 0, "qsa_fd": 0, "qsa_store": 0,
                       "qsa_miss": 0}
         self._raised = False
+        self._qsa_live = 0              # S89: QSA sidecar fds held right now
+        self._fd_mark = FD_BUDGET_FIRST  # S89: the next census threshold (powers of two)
 
     def live(self) -> int:
         return len(self._e)
+
+    def held_fds(self) -> int:
+        """S89: the fds this registry holds right now (disk-page files + QSA sidecars)."""
+        return len(self._e) + self._qsa_live
+
+    def _fd_budget(self) -> None:
+        """S89 FD-BUDGET census (module constants): one line per crossed power of two."""
+        held = self.held_fds()
+        if held < self._fd_mark:
+            return
+        while self._fd_mark <= held:
+            self._fd_mark *= 2
+        n_open, soft = open_fds(), nofile_soft()
+        over = soft > 0 and n_open >= FD_BUDGET_FRAC * soft
+        (logger.warning if over else logger.info)(
+            "%s held=%d (disk pages %d + qsa %d) open_fds=%d nofile_soft=%d frac=%.2f%s -- the KV-DURCHLAUF disk "
+            "pages hold their L3 files open by design; waits on fds must use poll() (S89), never select()",
+            FD_BUDGET_MARK, held, len(self._e), self._qsa_live, n_open, soft, FD_BUDGET_FRAC,
+            " OVER the budget: EMFILE is near" if over else "")
 
     def _open(self, path: str):
         if not self._raised:
@@ -214,6 +266,7 @@ class DiskPages:
                 if direct:
                     self.stats["direct_fds"] += 1
             out.append(d)
+        self._fd_budget()
         return out
 
     def entry(self, d: int) -> Optional[_Entry]:
@@ -227,6 +280,9 @@ class DiskPages:
             if e is None:
                 continue
             n += 1
+            if e.qsa_fd is not None and e.qsa_fd >= 0:
+                with self._lock:
+                    self._qsa_live -= 1
             for fd in (e.fd, e.qsa_fd):
                 if fd is not None and fd >= 0:
                     try:
@@ -269,6 +325,9 @@ class DiskPages:
                 e.qsa_fd = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
                 e.qsa_mode = "fd"
                 self.stats["qsa_fd"] += 1
+                with self._lock:
+                    self._qsa_live += 1
+                self._fd_budget()
                 return True
             except OSError:
                 pass
