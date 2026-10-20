@@ -4162,6 +4162,14 @@ class Envs:
     #   rate) return everything as before. False = the full return, byte for
     #   byte.
     FLLIPER_PDFLIP_D_LEND_KEEP_SHORT = EnvBool(True)
+    #   S93 (20.10., Grundgesetz VRAM=Experten; S91 nf-s91-decode-regression-1020.md): "extend pending" counts
+    #   only waiting requests D's admission can TAKE -- not the ones its own verdicts hold out (the park gate's
+    #   older_live / held_for_older / park-first barrier, ``AdmissionGate.skip``; a DQH-held queue,
+    #   ``DHeadHold`` armed on the unchanged fingerprint). rc20 D (1020_081757): the waiting queue was non-empty
+    #   in 99 % of the decode rounds (best boot 1017_183228: 0 %), every lend went back 0-2 s later, decode ran
+    #   on 4-7 expert rows instead of > 20 (bs1 34.3 vs 22.9 gpu-ms). False = any waiting request is pending,
+    #   as before.
+    FLLIPER_PDFLIP_D_LEND_HOLD_AWARE = EnvBool(True)
     # S78 EM-FETCH (19.10.): per EAGER-DEVICE-EM forward and rank, the rows
     #   and bytes the pool steps copied host->device and the device time of
     #   those copies (CUDA events around copy_rows) beside the device time of

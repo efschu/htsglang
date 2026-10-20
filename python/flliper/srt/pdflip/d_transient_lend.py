@@ -151,12 +151,138 @@ def _card_free_bytes() -> Optional[int]:
         return None
 
 
+#: S93: the admission's own park verdict of the last pass (``note_gate``) and the running rids it was taken on
+GATE_SEEN_ATTR = "_pdflip_d_lend_gate_seen"
+#: S93: the last logged hold census (waiting, held, reasons) -- a line only on a change
+HOLD_SEEN_ATTR = "_pdflip_d_lend_hold_seen"
+
+
+def hold_aware_on() -> bool:
+    """S93 switch (default ON): only a TAKEABLE waiting request is pending extend work."""
+    try:
+        from flliper.srt.environ import envs
+
+        return bool(envs.FLLIPER_PDFLIP_D_LEND_HOLD_AWARE.get())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _running_rids(sched, running_batch=None) -> frozenset:
+    rb = running_batch if running_batch is not None else getattr(sched, "running_batch", None)
+    try:
+        return frozenset(str(getattr(r, "rid", "")) for r in (getattr(rb, "reqs", None) or ()))
+    except Exception:  # noqa: BLE001
+        return frozenset()
+
+
+def note_gate(sched, gate, running_batch) -> None:
+    """S93: D's admission hands its park verdict of this pass here (``Scheduler._pdflip_d_park_admission``).
+    ``gate`` is ``d_seats.AdmissionGate`` (None = no barrier stands: the gate holds nobody). Kept with the
+    running rids it was taken on -- a change of the running set voids it (an older one may have finished)."""
+    try:
+        setattr(sched, GATE_SEEN_ATTR, (gate, _running_rids(sched, running_batch)))
+    except Exception:  # noqa: BLE001 -- an instrument input never stops the admission
+        pass
+
+
+def _dqh_holds_queue(sched) -> bool:
+    """S93: DQH (pdflip/d_head_hold.py) holds the queue -- armed by a pass that built nothing while requests
+    waited, and nothing its verdict reads has changed (the scheduler's own fingerprint, replicated values).
+    Read only: ``should_hold`` (which ticks) is never called here."""
+    dqh = getattr(sched, "pdflip_d_head_hold", None)
+    if dqh is None:
+        return False
+    try:
+        st = dqh.state
+        if not dqh.enabled or st.fingerprint is None:
+            return False
+        fp_of = getattr(sched, "_pdflip_d_head_fingerprint", None)
+        if not callable(fp_of):
+            return False
+        fp = fp_of(getattr(sched, "running_batch", None), sched.__dict__.get("_pass_prefetch_verdicts"))
+        return fp is not None and fp == st.fingerprint
+    except Exception:  # noqa: BLE001 -- unreadable: not held (the conservative side: the lend goes back)
+        return False
+
+
+def held_reason(sched, req, dqh: Optional[bool] = None) -> Optional[str]:
+    """S93: why D's admission will NOT take ``req`` (its own verdicts, no second one), else None (takeable).
+
+    * ``pdflip_d_head_hold``: DQH holds the queue (covers the group's NO_TOKEN / D-WALL-HEAD refusal of the
+      head: DQH is armed exactly by a pass that built nothing, on replicated values);
+    * the park gate's census key (``AdmissionGate.skip``): ``pdflip_d_park_older_live`` (older_live and
+      held_for_older), ``pdflip_d_park_first`` (the barrier for a newcomer), ``pdflip_d_park_decode_first``.
+
+    The gate counts only while the running set is the one it was taken on. A rank-local NO_TOKEN of a single
+    rank is NOT read (it is rank-local; the group's verdict on it is DQH's)."""
+    if (_dqh_holds_queue(sched) if dqh is None else dqh):
+        return "pdflip_d_head_hold"
+    seen = getattr(sched, GATE_SEEN_ATTR, None)
+    if not seen:
+        return None
+    gate, running = seen
+    if gate is None or running != _running_rids(sched):
+        return None
+    try:
+        return gate.skip(req, admitted=())
+    except Exception:  # noqa: BLE001 -- unreadable: takeable (the lend goes back)
+        return None
+
+
+def takeable_waiting(sched) -> list:
+    """S93: the waiting requests D's admission can take (all of them with the switch off)."""
+    queue = list(getattr(sched, "waiting_queue", None) or ())
+    if not queue or not hold_aware_on():
+        return queue
+    dqh = _dqh_holds_queue(sched)
+    return [r for r in queue if held_reason(sched, r, dqh) is None]
+
+
+def _note_hold(sched, queue, takeable) -> None:
+    """S93 line: a non-empty queue that lends anyway, named once per change (waiting, held, reasons)."""
+    if len(takeable) == len(queue):
+        setattr(sched, HOLD_SEEN_ATTR, None)
+        return
+    dqh = _dqh_holds_queue(sched)
+    reasons = {}
+    for r in queue:
+        k = held_reason(sched, r, dqh)
+        if k is not None:
+            reasons[k] = reasons.get(k, 0) + 1
+    key = (len(queue), len(queue) - len(takeable), tuple(sorted(reasons.items())))
+    if key == getattr(sched, HOLD_SEEN_ATTR, None):
+        return
+    setattr(sched, HOLD_SEEN_ATTR, key)
+    sched.__dict__["_pdflip_d_lend_hold_n"] = int(sched.__dict__.get("_pdflip_d_lend_hold_n", 0) or 0) + 1
+    logger.info("%s rank=%d hold-aware waiting=%d held=%d reasons=%s first_held=%s -- D's admission holds "
+                "them out this pass (its own verdicts): no extend is coming, the expert rows stay lent (S93)",
+                MARK, _rank(sched), len(queue), len(queue) - len(takeable), dict(sorted(reasons.items())),
+                next((str(getattr(r, "rid", "?")) for r in queue if id(r) not in {id(t) for t in takeable}), "-"))
+
+
+def pending_trigger(sched) -> Optional[str]:
+    """S93: what makes extend work pending -- ``chunked`` or the rid of the first takeable waiting request;
+    None = nothing pending (an empty queue, or every waiting request held by the admission's verdicts)."""
+    if getattr(sched, "chunked_req", None) is not None:
+        return "chunked"
+    queue = list(getattr(sched, "waiting_queue", None) or ())
+    if not queue:
+        return None
+    takeable = takeable_waiting(sched)
+    if hold_aware_on():
+        _note_hold(sched, queue, takeable)
+    if not takeable:
+        return None
+    return "rid=%s" % getattr(takeable[0], "rid", "?")
+
+
 def extend_pending(sched) -> bool:
     """Extend work the next batches may build: a chunked request or a waiting
-    one (rc12g ``width_vote``'s predicate; the queue is replicated over D's
-    ranks)."""
-    return getattr(sched, "chunked_req", None) is not None or bool(
-        getattr(sched, "waiting_queue", None))
+    one D's admission can take (rc12g ``width_vote``'s predicate, S93: minus the
+    waiting requests the admission's own verdicts hold out -- park gate, DQH;
+    the queue, the running set, the gate's inputs and DQH's fingerprint are
+    replicated over D's ranks)."""
+    return pending_trigger(sched) is not None
 
 
 def _controller(sched):
@@ -235,7 +361,7 @@ def short_pending_rows(sched) -> Optional[int]:
     the carried headers are the same on every D rank)."""
     if getattr(sched, "chunked_req", None) is not None:
         return None
-    queue = list(getattr(sched, "waiting_queue", None) or ())
+    queue = takeable_waiting(sched)  # S93: the held ones build no extend this pass
     if not queue:
         return None
     try:
@@ -308,15 +434,18 @@ def round_start(sched) -> Optional[str]:
     back BEFORE the round's width vote and EXTEND-TRIM read the card (S78: only
     the short extend's price when all pending work is short)."""
     ctl = _controller(sched)
-    if ctl is None or not extend_pending(sched):
+    if ctl is None:
+        return None
+    trigger = pending_trigger(sched)
+    if trigger is None:
         return None
     _gate(sched).streak = 0
     if ctl.lent_from is None:
         return None
     rows = short_pending_rows(sched) if keep_short_on() else None
     if rows is not None:
-        return _keep_short(sched, ctl, rows, "short extend pending")
-    return _give_back(sched, ctl, "extend pending")
+        return _keep_short(sched, ctl, rows, "short extend pending %s" % trigger)
+    return _give_back(sched, ctl, "extend pending %s" % trigger)
 
 
 def on_batch(sched, batch) -> Optional[str]:
