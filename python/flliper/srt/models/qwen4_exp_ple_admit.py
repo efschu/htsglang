@@ -290,7 +290,7 @@ class PleAdmitPrefetchGather(_pf.PlePrefetchGather):
                 _SINKS.remove(self)
             super()._disable()
 
-    def _gather_into(self, flat_ids, out, vocab_start, vocab_end):
+    def _gather_into(self, flat_ids, out, vocab_start, vocab_end, small_launch=None):
         global _BATCH
         with self._lock:
             end = self._table.total_rows if vocab_end is None else vocab_end
@@ -299,7 +299,7 @@ class PleAdmitPrefetchGather(_pf.PlePrefetchGather):
             w = self._ensure_workers()
             self._before_gather(w)
             try:
-                out = super()._gather_into(flat_ids, out, vocab_start, vocab_end)
+                out = super()._gather_into(flat_ids, out, vocab_start, vocab_end, small_launch=small_launch)
             finally:
                 _BATCH = ()
             # the ring's first idle moment (the running request's last chunk

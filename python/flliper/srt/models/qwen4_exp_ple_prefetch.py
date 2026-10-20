@@ -77,6 +77,15 @@ _KIND_ROUND = 5
 _F_SETPIPE_SZ = 1031
 _PIPE_BYTES = 1 << 20
 _CUDA_HOST_REGISTER_PORTABLE = 1
+# NF-PLE-SMALL (20.10.): the slots are also read by the device (the staged
+# gather of a small extend, below), so they are mapped as well -- the decode
+# stage's flags (qwen4_exp_ple_decode_pread._CUDA_HOST_REGISTER_PORTABLE_MAPPED)
+_CUDA_HOST_REGISTER_PORTABLE_MAPPED = 3
+#: NF-PLE-SMALL: the scheduler publishes the CURRENT chunk's tokens too when the
+#: chunk is at most this long, so a small extend with no prefetch behind it is
+#: still predicted on the host (its rows: tokens x 16 <= 8192, the pread
+#: gather's own range starts at 2048 rows = 128 tokens)
+PLE_SMALL_CUR_TOKENS = 512
 _WORKER_SCRIPT = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "qwen4_exp_ple_pread_worker.py"
 )
@@ -206,6 +215,11 @@ class PleChunkHint(NamedTuple):
     next_start: int  # token position of the next chunk (-1: none)
     next_tokens: Optional[torch.Tensor]  # int64, lead + next chunk
     lead: int
+    #: NF-PLE-SMALL: THIS batch's tokens as the forward lays them out -- one
+    #: (lead + the request's extend range, lead) per request in batch order
+    #: (a mixed batch: the extend requests, then one row per running decode
+    #: request) -- None unless they are at most PLE_SMALL_CUR_TOKENS together
+    cur_parts: Optional[tuple] = None
 
 
 _CONSUMERS = 0
@@ -281,8 +295,31 @@ def publish_ple_next_chunk(reqs: Sequence, chunk_size: Optional[int]) -> Optiona
         nstart = int(rng.end)
         lead = min(nstart, PLE_PREFETCH_LEAD_TOKENS)
         nxt = _as_int64(fill[nstart - lead : min(len(fill), nstart + size)])
-    _HINT = PleChunkHint(_GEN, int(rng.start), size, nstart, nxt, lead)
+    _HINT = PleChunkHint(_GEN, int(rng.start), size, nstart, nxt, lead, _cur_parts(reqs))
     return _HINT
+
+
+def _cur_parts(reqs: Sequence) -> Optional[tuple]:
+    """NF-PLE-SMALL: a small batch's own tokens, laid out as the forward
+    gathers them (request order, each request's extend range with its n-gram
+    lead), so its PLE rows can be predicted on the host without reading the
+    device's lookup ids back. None when a request's range is unknown or the
+    batch is longer than PLE_SMALL_CUR_TOKENS (the pread range serves it)."""
+    parts, total = [], 0
+    for req in reqs:
+        rng = getattr(req, "extend_range", None)
+        fill = getattr(req, "full_untruncated_fill_ids", None)
+        if rng is None or fill is None:
+            return None
+        c0, c1 = int(rng.start), min(int(rng.end), len(fill))
+        if c0 < 0 or c1 <= c0:
+            return None
+        total += c1 - c0
+        if total > PLE_SMALL_CUR_TOKENS:
+            return None
+        lead = min(c0, PLE_PREFETCH_LEAD_TOKENS)
+        parts.append((_as_int64(fill[c0 - lead : c1]), lead))
+    return tuple(parts) if parts else None
 
 
 def take_ple_next_chunk(last_gen: int) -> Optional[PleChunkHint]:
@@ -565,6 +602,22 @@ class PlePreadProcs:
         self.slot_fds = []
 
 
+def _small_device(t: torch.Tensor) -> bool:
+    """NF-PLE-SMALL: the staged kernel runs on CUDA only (tests patch this)."""
+    return bool(getattr(t, "is_cuda", False))
+
+
+def _capturing(t: torch.Tensor) -> bool:
+    """Under graph capture the decode stage / kernel keep the gather."""
+    return bool(getattr(t, "is_cuda", False)) and torch.cuda.is_current_stream_capturing()
+
+
+def _small_needs_pin(t: torch.Tensor) -> bool:
+    """The device reads the slot directly: it must be page-locked AND mapped
+    (an unregistered slot keeps the old gather). Tests on CPU patch this."""
+    return bool(getattr(t, "is_cuda", False))
+
+
 class _Slot:
     """The owner's view of one shared slot: host tensor, pin state, last H2D."""
 
@@ -573,6 +626,19 @@ class _Slot:
         self.bytes: Optional[torch.Tensor] = None
         self.pinned = False
         self.event = None
+        # NF-PLE-SMALL: the predicted id of every staged row (page-locked
+        # int64, read by the staged kernel) and the device copies of
+        # [ids address, rows address] per (device, row offset)
+        self.stage_ids: Optional[torch.Tensor] = None
+        self.addrs: dict = {}
+
+    def stage_ids_for(self, n: int) -> torch.Tensor:
+        """At least ``n`` page-locked int64 ids (content not kept on growth)."""
+        if self.stage_ids is None or self.stage_ids.numel() < n:
+            cap = max(int(n), 1 << 13)
+            self.stage_ids = torch.empty(cap, dtype=torch.int64, pin_memory=torch.cuda.is_available())
+            self.addrs = {}
+        return self.stage_ids
 
     def wait_copy(self) -> None:
         if self.event is not None:
@@ -586,6 +652,7 @@ class _Slot:
         self.pinned = False
         self.bytes = None
         self.rows = 0
+        self.addrs = {}
 
 
 class _Pending(NamedTuple):
@@ -659,6 +726,49 @@ class PlePrefetchGather:
     def wants(self, flat_ids: torch.Tensor) -> bool:
         return self._base.wants(flat_ids)
 
+    def wants_small(self, flat_ids: torch.Tensor) -> bool:
+        """NF-PLE-SMALL (20.10.): an EXTEND gather below the pread range.
+
+        Measured (rc28 D ``..._1020_174205``, TP0 = the only PLE rank of Form
+        A): every extend whose PLE gather had fewer than ``min_rows`` rows went
+        through the HMM kernel -- cold checkpoint pages faulted in one at a
+        time on ZFS -- and paid 0.11-1.42 s outside the expert span (T=95:
+        gpu-ms 1875.7 against em_ms 443.2, TP1/TP2 waiting 1472/1516 ms in
+        tp.all_reduce); every gather of >= 2048 rows (pread) paid 25-145 ms.
+        Taken only for a gather the scheduler published a NEW extend hint for
+        (a decode / verify gather never publishes one, so it keeps the decode
+        stage and the kernel exactly as before), never under graph capture,
+        never on a device the staged kernel cannot read (``_small_device``)."""
+        n = int(flat_ids.numel())
+        if self._disabled or n == 0 or n >= self.min_rows:
+            return False
+        if not _small_device(flat_ids) or _capturing(flat_ids):
+            return False
+        h = _HINT
+        return h is not None and h.gen != self._last_gen
+
+    def gather_small(self, flat_ids, out, *, vocab_start: int = 0, vocab_end: Optional[int] = None,
+                     launch: Callable) -> bool:
+        """NF-PLE-SMALL: serve a small extend gather from a host slot WITHOUT
+        reading the device's lookup ids back (no sync): the rows are those of
+        the prefetch the previous chunk queued for this one, or -- none queued
+        -- of this chunk's own tokens hashed on the host and read now on the
+        worker processes. ``launch(flat_ids, out, addrs, counters)`` runs the
+        staged gather kernel (``_gather_ple_embedding_staged_kernel``): row
+        ``r`` from the slot when its predicted id equals the device's id, else
+        from the table (HMM) -- a wrong prediction costs a cold read, never
+        bytes. False = not served (the caller gathers as before)."""
+        if self._disabled:
+            return False
+        try:
+            return self._gather_into(flat_ids, out, vocab_start, vocab_end, small_launch=launch) is not None
+        except (PleWorkerLost, OSError) as exc:
+            logger.error(
+                "PLE-PREFETCH disabled: %s -- this process gathers serially from now on", exc
+            )
+            self._disable()
+            return False
+
     def gather_into(self, flat_ids, out, *, vocab_start: int = 0, vocab_end: Optional[int] = None):
         if self._disabled:
             return self._base.gather_into(flat_ids, out, vocab_start=vocab_start, vocab_end=vocab_end)
@@ -720,7 +830,7 @@ class PlePrefetchGather:
         t = torch.from_file(f"/proc/self/fd/{w.slot_fds[k]}", shared=True, size=nbytes, dtype=torch.uint8)
         pinned = False
         if torch.cuda.is_available():
-            rc = int(torch.cuda.cudart().cudaHostRegister(t.data_ptr(), nbytes, _CUDA_HOST_REGISTER_PORTABLE))
+            rc = int(torch.cuda.cudart().cudaHostRegister(t.data_ptr(), nbytes, _CUDA_HOST_REGISTER_PORTABLE_MAPPED))
             pinned = rc == 0
             if not pinned:
                 logger.warning("PLE-PREFETCH: cudaHostRegister(slot %d, %d B) failed (%d); pageable copy", k, nbytes, rc)
@@ -731,7 +841,136 @@ class PlePrefetchGather:
         dim = self._table.embedding_dim
         return slot.bytes[: n * self._table.row_bytes].view(self._table.dtype).view(n, dim)
 
-    def _gather_into(self, flat_ids, out, vocab_start, vocab_end):
+    def _queue_next(self, hint, k: int, vocab: tuple, w) -> str:
+        """The next chunk, into the other slot, while this forward runs.
+
+        NF-PLE-SMALL: queued whatever its size -- a small tail chunk (rc28 D
+        17:51:03, pdflip-2-50: 95 tokens = 1520 rows behind a 2812-token
+        chunk) is exactly the gather the HMM kernel made slow; its read now
+        overlaps the chunk before it and its gather (``gather_small``) takes
+        the rows from the slot."""
+        if hint is None or hint.next_tokens is None:
+            return "none"
+        nids = self._hasher(hint.next_tokens, hint.lead).to(torch.int64).reshape(-1)
+        if int(nids.numel()) <= 0:
+            return "none"
+        k2 = (k + 1) % PLE_PREFETCH_DEPTH
+        other = self._slots[k2]
+        other.wait_copy()
+        self._ensure_rows(k2, int(nids.numel()))
+        n_in = (nids >= vocab[0]) & (nids < vocab[1]) & (nids < self._table.total_rows)
+        seq = w.submit(k2, torch.arange(nids.numel()), ple_row_keys(nids, n_in, self._table, self._file_index))
+        self._pending = _Pending(seq, k2, nids, vocab)
+        self.stats["prefetches"] += 1
+        return f"queued:{int(nids.numel())}"
+
+    def _small_addrs(self, slot: _Slot, off: int, device) -> torch.Tensor:
+        """[stage ids address, stage rows address (+ ``off`` rows)] on
+        ``device``, cached; made from page-locked memory with a non-blocking
+        copy (no host sync)."""
+        key = (str(device), int(off))
+        a = slot.addrs.get(key)
+        if a is None:
+            host = torch.tensor(
+                [slot.stage_ids.data_ptr(), slot.bytes.data_ptr() + int(off) * int(self._table.row_bytes)],
+                dtype=torch.int64,
+            )
+            if getattr(device, "type", str(device)) != "cpu" and torch.cuda.is_available():
+                host = host.pin_memory()
+                a = host.to(device, non_blocking=True)
+            else:
+                a = host
+            slot.addrs[key] = a
+        return a
+
+    def _small_counters(self, device) -> torch.Tensor:
+        ctr = getattr(self, "_small_ctr", None)
+        if ctr is None:
+            ctr = self._small_ctr = {}
+        key = str(device)
+        c = ctr.get(key)
+        if c is None:
+            c = ctr[key] = torch.zeros(2, dtype=torch.int32, device=device)
+        return c
+
+    def _gather_small_into(self, flat_ids, out, vocab_start, vocab_end, hint, launch, t0):
+        """NF-PLE-SMALL body (see ``gather_small``). Returns ``out`` when
+        served, None when there was nothing to predict (the caller gathers as
+        before; the next chunk is queued either way)."""
+        n = int(flat_ids.numel())
+        dim = self._table.embedding_dim
+        if out.numel() != n * dim or (out.dim() >= 1 and out.shape[-1] != dim):
+            raise ValueError(f"PLE staged gather: output {tuple(out.shape)} does not match {n} ids x {dim}")
+        if vocab_end is None:
+            vocab_end = self._table.total_rows
+        vocab = (int(vocab_start), int(vocab_end))
+        w = self._ensure_workers()
+        wait_s = 0.0
+        gather_s = 0.0
+        ready = "none"
+        src = "none"
+        pred = None
+        k, off = 0, 0
+        pend, self._pending = self._pending, None
+        if pend is not None:
+            was_ready = w.ready(pend.seq)
+            tj = time.monotonic()
+            gather_s += w.join(pend.seq)
+            wait_s += time.monotonic() - tj
+            if pend.vocab == vocab:
+                pred, k, off = pend.ids, pend.slot, max(0, int(pend.off))
+                ready = "yes" if was_ready else "no"
+                src = "next"
+            else:
+                k = pend.slot
+        if pred is None and hint is not None and hint.cur_parts:
+            # nothing queued for this batch: its own tokens, hashed here, read now
+            pred = torch.cat(
+                [self._hasher(t, lead).to(torch.int64).reshape(-1) for t, lead in hint.cur_parts]
+            )[:n]
+            if int(pred.numel()) > 0:
+                k = (k + 1) % PLE_PREFETCH_DEPTH if pend is not None else 0
+                self._slots[k].wait_copy()
+                self._ensure_rows(k, int(pred.numel()))
+                p_in = (pred >= vocab[0]) & (pred < vocab[1]) & (pred < self._table.total_rows)
+                tr = time.monotonic()
+                seq = w.submit(k, torch.arange(pred.numel()), ple_row_keys(pred, p_in, self._table, self._file_index))
+                gather_s += w.join(seq)
+                wait_s += time.monotonic() - tr
+                off = 0
+                src = "cur"
+            else:
+                pred = None
+        slot = self._slots[k]
+        served = pred is not None and slot.bytes is not None and (slot.pinned or not _small_needs_pin(flat_ids))
+        m = 0
+        if served:
+            m = min(n, int(pred.numel()), max(0, slot.rows - off))
+            ids_buf = slot.stage_ids_for(n)
+            ids_buf[:m].copy_(pred[:m])
+            if m < n:
+                ids_buf[m:n].fill_(-1)  # no prediction: the kernel reads these rows from the table
+            launch(flat_ids, out, self._small_addrs(slot, off, flat_ids.device), self._small_counters(flat_ids.device))
+            if out.is_cuda:
+                slot.event = torch.cuda.Event()
+                slot.event.record()
+        nxt = self._queue_next(hint, k, vocab, w)
+        wall = time.monotonic() - t0
+        self.stats["small_gathers"] = self.stats.get("small_gathers", 0) + (1 if served else 0)
+        self.stats["small_rows"] = self.stats.get("small_rows", 0) + (m if served else 0)
+        self.stats["wait_s"] += wait_s
+        _rank_timing.note_ple("prefill", wall * 1000.0, hit=m, miss=n - m, wait_ms=wait_s * 1000.0,
+                              nbytes=0)
+        logger.info(
+            "PLE-PREFETCH-SMALL rows=%d staged=%d src=%s ready=%s served=%s wait_ms=%.1f gather_ms=%.1f "
+            "host_ms=%.1f next=%s (extend below the pread range: rows from the slot, a row whose id the "
+            "device does not confirm from the table; no device read-back)",
+            n, m, src, ready, "yes" if served else "no", wait_s * 1000.0, gather_s * 1000.0,
+            wall * 1000.0, nxt,
+        )
+        return out if served else None
+
+    def _gather_into(self, flat_ids, out, vocab_start, vocab_end, small_launch=None):
         from flliper.srt.layers.prefill_timing import log_ple_gather
         from flliper.srt.models.qwen4_exp_ple_table import note_ple_prefill_rows
 
@@ -739,6 +978,8 @@ class PlePrefetchGather:
         hint = take_ple_next_chunk(self._last_gen)
         if hint is not None:
             self._last_gen = hint.gen
+        if small_launch is not None:
+            return self._gather_small_into(flat_ids, out, vocab_start, vocab_end, hint, small_launch, t0)
         ids = flat_ids.detach().reshape(-1).cpu().to(torch.int64)
         n = int(ids.numel())
         dim = self._table.embedding_dim
@@ -796,19 +1037,7 @@ class PlePrefetchGather:
             slot.event.record()
 
         # the next chunk, into the other slot, while this forward runs
-        nxt = "none"
-        if hint is not None and hint.next_tokens is not None:
-            nids = self._hasher(hint.next_tokens, hint.lead).to(torch.int64).reshape(-1)
-            if int(nids.numel()) >= self.min_rows:
-                k2 = (k + 1) % PLE_PREFETCH_DEPTH
-                other = self._slots[k2]
-                other.wait_copy()
-                self._ensure_rows(k2, int(nids.numel()))
-                n_in = (nids >= vocab[0]) & (nids < vocab[1]) & (nids < self._table.total_rows)
-                seq = w.submit(k2, torch.arange(nids.numel()), ple_row_keys(nids, n_in, self._table, self._file_index))
-                self._pending = _Pending(seq, k2, nids, vocab)
-                self.stats["prefetches"] += 1
-                nxt = f"queued:{int(nids.numel())}"
+        nxt = self._queue_next(hint, k, vocab, w)
 
         wall = time.monotonic() - t0
         chunk = self._gathers
