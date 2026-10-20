@@ -6138,7 +6138,42 @@ class Front:
             # is not evidence that D answered, nor that it did not).
             self.counters["d_pool_read_suppressed"] += 1
             return None
-        t0 = now
+        # NF-R2-DPOOL (20.10., SOLL R2 "kurz sofort auf D, keine Wartezeit"; rc26 _142108 14:25:07/14:25:10 and
+        # _143107 14:36:01: three kurz requests waited 1.0-1.1 s before D_NOW, each exactly the
+        # D_POOL_READ_TIMEOUT_S of this read, PDFLIP D-POOL UNREADABLE cause=TimeoutError). D answers
+        # `/server_info` only at its scheduler pass boundary; inside a D prefill pass (3-6 s on NF) the awaited
+        # read could only time out -- and a timed-out read ends in the gate OFF anyway. The decision therefore
+        # waits for the read at most the arrival KV read budget (``_asr.kv_read_budget_s``, the SAME bound the
+        # sibling ``/server_info`` read of the arrival seat already waits, ``_arrival_seat_kv_reading``); the
+        # read itself runs as ONE shared task with its unchanged 1.0 s timeout and lands for the next decision.
+        # No reading by then = no reading (EZ-S1 A10: never an estimate, never an old number): the gate is off
+        # for THIS decision, exactly what the 1.0 s timeout produced, without the 1.0 s.
+        task = self.__dict__.get("_d_pool_task")
+        if task is None or task.done():
+            task = asyncio.ensure_future(self._d_pool_fetch())
+            self._d_pool_task = task
+        budget = _asr.kv_read_budget_s()
+        if not task.done() and budget > 0:
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=budget)
+            except asyncio.TimeoutError:
+                pass
+        if task.done():
+            return None if task.cancelled() else task.result()
+        self.counters["d_pool_read_pending"] += 1
+        _n = self.counters["d_pool_read_pending"]
+        if _n <= 16 or _n % 64 == 0:
+            logger.info("PDFLIP D-POOL READ-PENDING n=%d budget_s=%.3f timeout_s=%.1f -- group D has not answered "
+                        "`/server_info` inside the decision's read budget (D inside a pass answers only at its "
+                        "boundary): no reading for THIS decision, the gate is off for it (EZ-S1 A10, never an old "
+                        "number); the read keeps running and lands for the next decision (NF-R2-DPOOL, SOLL R2)",
+                        _n, budget, D_POOL_READ_TIMEOUT_S)
+        return None
+
+    async def _d_pool_fetch(self) -> Optional[Dict[str, Any]]:
+        """NF-R2-DPOOL: the one `/server_info` round trip of :meth:`_d_pool_reading`, run as a shared task; its
+        outcome is written to ``_d_pool`` / ``_d_pool_retry_after`` exactly as the inline read did (FIX 4/5)."""
+        t0 = time.time()
         got = None
         # #1288: WHY the read failed, not just THAT it did.  On weg2sb5f the
         # only clue in the whole front log was one line saying group D

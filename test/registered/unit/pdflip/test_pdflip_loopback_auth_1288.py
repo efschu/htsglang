@@ -258,7 +258,7 @@ class TheFrontSendsNoHeaderOnItsInternalReads(CustomTestCase):
     def test_the_pool_read_sends_no_auth_header(self):
         from flliper.srt.pdflip.front import Front
 
-        src = inspect.getsource(Front._d_pool_reading)
+        src = inspect.getsource(Front._d_pool_fetch)   # NF-R2-DPOOL: the round trip lives in the shared task
         self.assertNotIn("auth_headers", src)
         self.assertIn("/server_info", src)
 
@@ -280,7 +280,8 @@ class TheFrontSendsNoHeaderOnItsInternalReads(CustomTestCase):
         "published no reading", while D was answering 401 to everything."""
         from flliper.srt.pdflip.front import Front
 
-        src = inspect.getsource(Front._d_pool_reading)
+        # NF-R2-DPOOL (20.10.): the round trip and its refusal live in the shared read task
+        src = inspect.getsource(Front._d_pool_fetch)
         self.assertIn("D-POOL UNREADABLE (cause=%s)", src)
         self.assertIn("HTTP {status}", src)
 
