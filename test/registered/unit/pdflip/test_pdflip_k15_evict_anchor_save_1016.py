@@ -40,6 +40,9 @@ PROMPT, ANCHOR_TOMBSTONED, ANCHOR_LEFT = 75323, 73984, 65536
 @pytest.fixture(autouse=True)
 def _env(monkeypatch):
     monkeypatch.delenv("FLLIPER_PDFLIP_EVICT_ANCHOR_SAVE", raising=False)
+    # S90b review A1: the K15 ANCHOR-SAVED line is rate limited by a CLASS counter (n <= 32); saves of other test files
+    # in the same process (S90b's 17 live tombstones, S25) must not push this file's log assertions past the limit
+    monkeypatch.setattr(UnifiedRadixCache, "_k15_saved_n", 0)
 
 
 def _node(nid, depth, backuped=False):
@@ -124,7 +127,7 @@ def _tree(written_seq, spill_ok=True):
                 n.component_data[ComponentType.MAMBA].host_value = object()
 
     t.write_backup = _wb
-    t.write_backup_anchor_only = lambda node: _wb(node)
+    t.write_backup_anchor_only = lambda node, kv_on_device=False: _wb(node)
     t.writing_check = _wc
     t._pdflip_mamba_pool = lambda: object()
     t._pdflip_flush_spill_room = lambda node, mp: (t.calls.append("spill"), spill_ok)[1]
@@ -208,7 +211,9 @@ def test_a1_only_a_mamba_arena_refusal_spills(reason):
     t, n = _tree([0, 0]), _node(7, ANCHOR_TOMBSTONED)
     t.refusal = reason
     assert _save(t, n) is False
-    assert "spill" not in t.calls and t.calls == ["backup"]
+    # S90b: a KV-arena refusal (arena_claim) of a device-KV node asks the anchor alone once (the 2nd "backup"
+    # here, refused again by the stub) -- still no spill
+    assert "spill" not in t.calls and t.calls == (["backup", "backup"] if reason == "arena_claim" else ["backup"])
 
 
 @pytest.mark.parametrize("reason", ["mamba_claim", "anchor_only_claim"])

@@ -46,9 +46,12 @@ def _tree(kv_arena_full=True):
         t._k15_last_refusal = "arena_claim" if kv_arena_full else None
         return 0
 
-    def _anchor_only(node):
-        t.calls.append("anchor_only")
-        node.pdflip_anchor_secured = not node.backuped and node.l3_present   # detached slot, acked at the join
+    def _anchor_only(node, kv_on_device=False):
+        t.calls.append("anchor_only_dev" if kv_on_device else "anchor_only")
+        if os.environ.get("FLLIPER_PDFLIP_ANCHOR_ONLY_BACKUP", "1") == "0":
+            return 0                     # the real candidate refuses with the switch off
+        # detached slot, acked at the join (S90b: also for a device-KV node)
+        node.pdflip_anchor_secured = not node.backuped and (node.l3_present or kv_on_device)
         if node.backuped:
             node.component_data[ComponentType.MAMBA].host_value = object()
         return 1
@@ -76,7 +79,16 @@ def test_store_backed_node_saves_its_anchor_without_a_kv_claim(caplog):
     assert not any("PDFLIP-ANCHOR-LOST" in m for m in caplog.messages)
 
 
-def test_unbacked_unstored_node_still_takes_the_full_backup():
+def test_unbacked_unstored_node_still_takes_the_full_backup_first():
+    """S90b (rc16 bf9ca46f45, 17x ANCHOR-LOST at=evict l3_present=False): the full backup is still tried first;
+    its KV-arena refusal no longer tombstones the anchor -- the anchor alone goes to its slot (detached)."""
+    t, n = _tree(), _node()
+    assert _save(t, n) is True
+    assert t.calls == ["full_kv_backup", "anchor_only_dev", "join"]
+
+
+def test_unbacked_unstored_node_s90b_off_is_the_old_loss(monkeypatch):
+    monkeypatch.setenv("FLLIPER_PDFLIP_EVICT_ANCHOR_DEVICE_KV", "0")
     t, n = _tree(), _node()
     assert _save(t, n) is False
     assert t.calls == ["full_kv_backup"]
@@ -97,10 +109,12 @@ def test_secured_anchor_is_not_saved_again(monkeypatch):
 def test_anchor_only_switch_off_is_the_old_path(monkeypatch):
     monkeypatch.setenv("FLLIPER_PDFLIP_ANCHOR_ONLY_BACKUP", "0")
     t, n = _tree(), _node(l3_present=True)
-    assert _save(t, n) is False and t.calls == ["full_kv_backup"]
+    # S90b: the KV-side refusal asks the anchor-only write once more; the switch refuses it there too
+    assert _save(t, n) is False and t.calls == ["full_kv_backup", "anchor_only_dev"]
 
 
-def test_anchor_lost_line_names_l3_present(caplog):
+def test_anchor_lost_line_names_l3_present(caplog, monkeypatch):
+    monkeypatch.setenv("FLLIPER_PDFLIP_EVICT_ANCHOR_DEVICE_KV", "0")
     t, n = _tree(), _node()
     with caplog.at_level(logging.WARNING):
         _save(t, n)
@@ -208,8 +222,10 @@ def test_mark_set_but_kv_not_in_store_gives_no_early_return(monkeypatch):
     monkeypatch.setattr(UnifiedRadixCache, "_pdflip_anchor_secured_holds", lambda self, node: True)
     t, n = _tree(), _node()          # not backuped, not l3_present
     n.pdflip_anchor_secured = True
-    assert _save(t, n) is False
-    assert t.calls == ["full_kv_backup"]
+    # S90b: still no early return on the mark; the full backup first, then (KV arena refused, the mark is no proof
+    # -- the pool cannot answer anchor_held) the anchor alone is written again
+    assert _save(t, n) is True
+    assert t.calls == ["full_kv_backup", "anchor_only_dev", "join"]
 
 
 def test_unbacked_anchors_counts_a_marked_node_without_store_kv(monkeypatch):

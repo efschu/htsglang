@@ -1490,6 +1490,11 @@ def _satisfied_resumable(scheduler, req, rid: str, told: int) -> int:
         return told
     if res is None or int(res) >= told:
         return told
+    # S90b FOLLOWER-STATE-AT-TOLD: the span is held -- read the anchor of told from the store before acking less
+    from flliper.srt.managers import pdflip_store_told as _st
+
+    if int(_st._s90b_state_at_told(scheduler, req, told, int(res))) >= told:
+        return told
     # H64-AUFLAGE 1 (B1, ARENAFULL-1015): GROUP-FLOOR admits equal follower acks below told AT that depth --
     # the reach acked here must be one this rank can also LOAD BACK, or a floor m runs into ROW-ROOM SHORT
     res = _room_own(scheduler, req, rid, int(res))
