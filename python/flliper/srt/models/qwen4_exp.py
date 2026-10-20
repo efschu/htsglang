@@ -214,6 +214,7 @@ from flliper.srt.models.qwen4_exp_ple_prefetch import (
     make_ple_prefetch_gather,
     ple_next_chunk_hasher,
 )
+from flliper.srt.models import qwen4_exp_ple_decode_pread as _ple_decode_pread
 from flliper.srt.models.qwen4_exp_ple_decode_pread import make_ple_decode_stager
 from flliper.srt.models.qwen4_exp_ple_fp8 import ple_fp8_bytes_to_bf16, ple_fp8_decode_arg
 from flliper.srt.pdflip import ple_state as _ple_handoff
@@ -1328,6 +1329,22 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                     vocab_start=self.shard_indices.org_vocab_start_index,
                     vocab_end=self.shard_indices.org_vocab_end_index,
                 )
+            # NF-PLE-SMALL (20.10.): an extend gather below the pread range
+            # (T < 128 tokens) reads its rows from a host slot the pread
+            # workers filled (the previous chunk's prefetch, or this chunk's
+            # tokens hashed on the host) through the staged kernel -- no
+            # device read-back; before, it went to the HMM kernel below and
+            # faulted cold checkpoint pages one by one (rc28 D: 0.11-1.42 s
+            # of a whole TP group per such forward)
+            wants_small = getattr(pread, "wants_small", None) if pread is not None else None
+            if wants_small is not None and wants_small(flat_ids) and pread.gather_small(
+                flat_ids,
+                output,
+                vocab_start=self.shard_indices.org_vocab_start_index,
+                vocab_end=self.shard_indices.org_vocab_end_index,
+                launch=functools.partial(self._launch_staged_small, table),
+            ):
+                return output
             prefetcher = getattr(self, "_ckpt_prefetcher", None)
             if prefetcher is not None:
                 prefetcher.enqueue(
@@ -1378,6 +1395,25 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                 FP8_DECODE=ple_fp8_decode_arg(self.weight.dtype, flat_ids.device),
             )
         return output
+
+    def _launch_staged_small(self, table, flat_ids, output, addrs, counters) -> None:
+        """NF-PLE-SMALL: the H40 staged kernel over a prefetch slot (row from
+        the slot when its predicted id is the device's id, else from the
+        table) -- the decode stage's launch, with the slot's addresses."""
+        _ple_decode_pread._gather_ple_embedding_staged_kernel[(int(flat_ids.numel()),)](
+            table.bases_on(flat_ids.device),
+            table.shard_rows,
+            flat_ids,
+            addrs,
+            counters,
+            output,
+            embedding_dim=table.embedding_dim,
+            tp_vocab_start=self.shard_indices.org_vocab_start_index,
+            tp_vocab_end=self.shard_indices.org_vocab_end_index,
+            is_fp8=table.dtype == torch.float8_e4m3fn,
+            BLOCK_D=self._block_d,
+            FP8_DECODE=ple_fp8_decode_arg(table.dtype, flat_ids.device),
+        )
 
     def reduce(self, output: torch.Tensor) -> torch.Tensor:
         # FORM A (F12): the dense side is not split across ranks -- this
