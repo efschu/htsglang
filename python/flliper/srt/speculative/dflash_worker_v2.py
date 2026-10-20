@@ -1233,8 +1233,20 @@ class DFlashWorkerV2(BaseSpecWorker):
                 "the per-round rebuild / draft-KV append; exact reads only "
                 "for writes beyond the free-count bound."
             )
+        # S84: declared a per-slot MIRROR -- a page move (d_kv_compact) must not
+        # re-point slots under it (its draft rows are keyed by the old slot id).
+        from flliper.srt.mem_cache.allocator.base import (
+            LISTENER_ROLE_SLOT_MIRROR,
+            mark_listener,
+        )
+
         token_to_kv_pool_allocator.register_free_listener(
-            mapper.on_global_free, mapper.on_global_clear
+            mark_listener(
+                lambda idx: mapper.on_global_free(idx), LISTENER_ROLE_SLOT_MIRROR, mapper
+            ),
+            mark_listener(
+                lambda: mapper.on_global_clear(), LISTENER_ROLE_SLOT_MIRROR, mapper
+            ),
         )
         # FLLIPER_DFLASH_WINDOW_POOL_DEDUP_CARRY (default off): a D prefill of a
         # span the radix already holds (e.g. past a mamba-refused match) writes
