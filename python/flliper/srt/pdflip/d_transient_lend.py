@@ -435,7 +435,8 @@ def _keep_short(sched, ctl, rows: int, why: str) -> Optional[str]:
             gate.last_keep = key
             logger.info("%s rank=%d keep rows_on %d (%s rows=%d need_mib=%d card_free_mib=%d)",
                         MARK, rank, before, why, int(rows), int(need_mib), free // MIB)
-        gate.topup = False
+        # TOPUP (20.10.): a keep moves nothing -- it must not cancel a top-up a partial return armed (rc27:
+        # the extend-time keep cleared it after every KEEP-SHORT return, the lend never grew back)
         return "keep"
     gate.last_keep = None
     n, ms = _timed(ctl.unlend_to, k)
@@ -491,17 +492,19 @@ def stage_keep_need_bytes(sched, ctl=None) -> Optional[int]:
 
 
 def after_phase_move(sched, ctl, rows_before: int) -> None:
-    """S106: a live phase move that KEPT part of an open lend gave rows back -- like S78's partial
-    return, the next lend verdict may top the difference up (``topup``). A move that kept the whole
-    lend changes nothing in the gate (one lend per settle); a move that ended it clears ``topup``."""
+    """S106: a live phase move that KEPT an open lend arms a top-up (``topup``): the move changed what the
+    card holds (a stage shrink frees KV bytes, a partial keep gave rows back) -- the next lend verdict maps
+    whatever difference now fits (TOPUP 20.10.: before, a whole keep left the lend as it was; with S106 no
+    stage move dropped the lend any more, so the lend only ever shrank -- rc27 TP0 bs2 rows_on p50 13 against
+    rc26 24). A move that ended the lend clears it (the full lend follows the settle)."""
     try:
         gate = _gate(sched)
         if ctl is None or getattr(ctl, "lent_from", None) is None:
             gate.topup = False
             gate.last_keep = None
             return
+        gate.topup = True
         if int(ctl.rows_on) < int(rows_before):
-            gate.topup = True
             gate.last_keep = None
     except Exception:  # noqa: BLE001 -- the gate is advice; the move already ran
         pass
@@ -704,8 +707,11 @@ def on_batch(sched, batch) -> Optional[str]:
     if getattr(ctl, "lend_job", None) is not None:
         return None  # F3: one lend in flight (its map thread runs; poll lands it)
     topup = ctl.lent_from is not None
-    if topup and not gate.topup:
-        return None  # one lend per settle (a full lend stays as it is)
+    if topup and not gate.topup and gate.streak != gate.settle:
+        # one lend per settle: an open lend is topped up when a move armed it, or once at the settle of every
+        # decode streak (after each extend) -- whatever the card frees in between becomes rows again
+        # (TOPUP 20.10., user law: free VRAM = experts); the map covers only the difference
+        return None
     gate.topup = False
     floor = dsv.lend_floor_mib_for_rank(rank)
     free = _card_free_bytes()

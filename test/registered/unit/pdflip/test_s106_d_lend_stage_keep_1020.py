@@ -291,8 +291,10 @@ class _LentCtl:
         return 0
 
 
-@pytest.mark.parametrize("after,topup", [((40, 16), False), ((36, 16), True), ((16, None), False)])
-def test_the_tick_hands_the_price_and_the_gate_tops_up_only_after_a_partial_keep(tick_env, after, topup):
+@pytest.mark.parametrize("after,topup", [((40, 16), True), ((36, 16), True), ((16, None), False)])
+def test_the_tick_hands_the_price_and_the_gate_tops_up_after_a_kept_lend(tick_env, after, topup):
+    """TOPUP (20.10.): every move that keeps the lend arms a top-up (the card changed); one that ends it does
+    not (the full lend follows the settle)."""
     dsv_, sched, _caps, _floor_, _votes, _grid = tick_env
     ctl = _LentCtl(after)
     setattr(sched, dsv_.CTL_ATTR, ctl)
