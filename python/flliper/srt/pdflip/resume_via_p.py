@@ -141,6 +141,11 @@ def open_stream_enabled(env=None) -> bool:
 #: the needs-p reason of a VISION hold (D cannot cover an image of a request
 #: that has already streamed): the front's P leg sends the ORIGINAL body.
 REASON_VISION = "vision_not_in_prefix"
+#: S107 (NF 20.10.): D refused the head because its DEVICE cannot hold the rows (PW-R, ``pdflip/d_wall_head.py``: the
+#: backup wall stands) -- ``d_extent`` is then the device rows the request needs (load-back + extend), NOT its uncached
+#: extent. The front classes such a record by the request's exact u (SOLL R1-R8), never by the rows (R7: a request D
+#: cannot take under X is a defect of D, no flip reason).
+REASON_WALL = "wall_head_midstream"
 
 
 def eligible(req, env=None, sched=None, vision: bool = False) -> bool:

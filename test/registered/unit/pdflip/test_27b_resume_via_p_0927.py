@@ -169,7 +169,8 @@ def test_front_queues_a_p_only_leg1_and_closes_the_record(d_env, caplog):
         with caplog.at_level("INFO"):
             assert ns._rvp_take() == 1
             p = ns.queue[0]
-            assert p.resume_via_p and p.p_only and p.path == "/generate" and p.rid == "pdflip-24-100"
+            # S107 (SOLL R7 R9): a text leg is no p_only by state -- over X (80508 > 12288) it is gross by its exact u
+            assert p.resume_via_p and not p.p_only and p.path == "/generate" and p.rid == "pdflip-24-100"
             assert p.payload["input_ids"][-1] == 80509 and p.payload["sampling_params"]["max_new_tokens"] == 1
             assert p.est_uncached == 80508 and p.est_prompt == 80510
             assert ns.kicks == ["arrival"]
