@@ -7073,7 +7073,95 @@ class Front:
                 return None
             attempt += 1
 
-    def _x_unpriced(self, rid: str, c: Any, est_prompt: int, uncached_p: int, media: bool, fallback: bool = False):
+    def _d_extending_rids(self) -> List[str]:
+        """NF-1b: the rids group D is computing an extend of RIGHT NOW -- posted to D (``outstanding``), and D's own
+        D-EXTEND-BEACON shows their extend began at/after that post with a rest > 0 (NF-R6-BEACON-DONE writes rest=0
+        at the prefill's end). D reports the fact, the front decides (R11). Empty when the beacon is off/unreadable."""
+        if not _dxb.enabled():
+            return []
+        if not (self.awake == "D" and self.state == "serving"):
+            return []
+        D = self.groups.get("D") if isinstance(getattr(self, "groups", None), dict) else None
+        out = dict(getattr(D, "outstanding", None) or {}) if D is not None else {}
+        if not out:
+            return []
+        reading = self._d_ext_reading_full()
+        if not reading:
+            return []
+        rids = []
+        for r, t_post in out.items():
+            try:
+                rest = _dxb.rest_of(reading, str(r), float(t_post))
+            except (TypeError, ValueError):
+                continue
+            if rest is not None and rest > 0:
+                rids.append(str(r))
+        return rids
+
+    async def _x_kurz_while_d_extends(self, rid: str, c: Any, path: str, payload: Any, est_prompt: int,
+                                      probe_task: "asyncio.Future"):
+        """NF-1b: the arrival's verdict WITHOUT waiting for D's pass end, or None (then D's answer is awaited).
+
+        Decides only when (1) D computes an extend now (:meth:`_d_extending_rids`) and its probe has not answered
+        yet, (2) the store (L2/L3, the request's namespace) was READ for these ids -- an exact number, never a
+        guess -- and (3) ``u_p = n - store`` is below halbX at its depth: then ``u_d <= u_p < halbX`` (D covers at
+        least the store) and the class is kurz whatever D answers. It is the EZ-S1 ladder's KIND_P_UPPER rung
+        (``_x_unpriced``), reached at once instead of after the probe deadline."""
+        if probe_task.done():
+            return None
+        ns_known, ns = payload_namespace(payload)
+        if not ns_known:
+            return None
+        ext = Front._d_extending_rids(self)
+        if not ext:
+            return None
+        try:
+            st, tier = await self._store_probe_depth(
+                rid, c.ids, envs.FLLIPER_PDFLIP_FRONT_EXACT_TIMEOUT_MS.get() / 1000.0, extra_key=ns)
+        except Exception:  # noqa: BLE001 -- no store number: D's answer decides
+            return None
+        if tier == "unread" or probe_task.done():
+            return None  # no exact store number, or D answered meanwhile: its exact number decides as always
+        n = int(c.n)
+        up = max(0, n - int(st))
+        hx = phase_policy.half_x_of(Front._x_at_depth(self, max(0, n - up)), Front._set_cfg()[0])
+        if up >= hx:
+            return None  # u_p is only an upper bound here: no class without D's number
+        Front._send_ids_note(self, rid, path, payload, c)  # FRONT-SEND-IDS-1007: the leg still skips D's tokenizer
+        Front._d_probe_late_note(self, rid, probe_task, n, int(st), up)
+        return Front._x_unpriced(self, rid, c, est_prompt, up, False, d_extending=ext)
+
+    def _d_probe_late_note(self, rid: str, task: "asyncio.Future", n: int, store: int, up: int) -> None:
+        """NF-1b instrument: when the skipped probe lands, its exact numbers beside the store bound the verdict stood
+        on (``u_d <= u_p`` by construction; a violation is named). Log only, decides nothing."""
+
+        def _done(t: "asyncio.Future") -> None:
+            try:
+                code, text = t.result()
+                ans = _dmp.parse_answer(json.loads(text)) if int(code) == 200 else None
+            except Exception:  # noqa: BLE001
+                ans = None
+            if ans is None:
+                logger.info("PDFLIP D-PROBE-LATE rid=%s answer=none u_p=%d (NF-1b: the class stood on the store)",
+                            rid, up)
+                return
+            covered = max(int(ans.device_tokens) + int(ans.host_tokens), int(store))
+            u_d = max(0, int(ans.n) - covered)
+            ok = u_d <= up and int(ans.n) == int(n)
+            self.counters["d_probe_late_ok" if ok else "d_probe_late_violation"] += 1
+            (logger.info if ok else logger.warning)(
+                "PDFLIP D-PROBE-LATE rid=%s u_d=%d u_p=%d n_d=%d n_front=%d device=%d host=%d store=%d %s "
+                "(NF-1b: the class stood on the store while D extended)", rid, u_d, up, int(ans.n), int(n),
+                int(ans.device_tokens), int(ans.host_tokens), int(store),
+                "ok" if ok else "VIOLATION u_d > u_p or n differs -- D_NOW_BARRIER measures it")
+
+        try:
+            task.add_done_callback(_done)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _x_unpriced(self, rid: str, c: Any, est_prompt: int, uncached_p: int, media: bool, fallback: bool = False,
+                    d_extending: Optional[List[str]] = None):
         """S56r A1 + EZ-S1 (plan A1): the arrival WITHOUT an exact D number (D's probe gave up). Nothing is classified on an
         estimate -- not the front's count, not the ledger, not chars/3.
 
@@ -7087,7 +7175,7 @@ class Front:
         D's admission measures, no barrier)."""
         from types import SimpleNamespace
 
-        self.counters["d_probe_unpriced"] += 1
+        self.counters["d_probe_skipped_d_extending" if d_extending else "d_probe_unpriced"] += 1
         exact_on = bool(envs.FLLIPER_PDFLIP_EXACT_CLASS.get())
         text_ids = c is not None and not media
         n = int(c.n) if text_ids else int(est_prompt)
@@ -7105,12 +7193,20 @@ class Front:
                 n_from_d_ids=text_ids, x_tokens=_x, half_x=_hx, now=time.monotonic())
             depth_hint = _depth
             self.counters["exact_class_" + basis.kind] += 1
-        logger.warning("PDFLIP %s rid=%s n=%d n_src=%s p_uncached=%s -- no exact D number by the "
-                       "deadline: the request is NOT classified on an estimate; route = D's admission (it measures: "
-                       "X-GATE W31 / W123 requeue with D's own extent) or, P awake, P's batch (S56r A1)%s",
-                       "X-EXACT-FALLBACK-MEASURE" if fallback else "D-PROBE-UNPRICED",
-                       rid, n, n_src, up if up >= 0 else "unknown",
-                       "" if basis is None else " class_basis=%s (%s)" % (basis.kind, basis.why))
+        if d_extending:
+            logger.info("PDFLIP D-PROBE-SKIPPED rid=%s n=%d n_src=%s p_uncached=%s d_extending=%s class_basis=%s (%s) "
+                        "-- NF-1b (SOLL R2 'sofort'): group D computes an extend now and answers its probe only at "
+                        "that pass's end; the store's EXACT number already decides kurz (u_d <= u_p), the leg carries "
+                        "the halfX-1 barrier (D_NOW_BARRIER: D refuses by name above it with its exact extent)",
+                        rid, n, n_src, up if up >= 0 else "unknown", ",".join(d_extending[:4]),
+                        "-" if basis is None else basis.kind, "-" if basis is None else basis.why)
+        else:
+            logger.warning("PDFLIP %s rid=%s n=%d n_src=%s p_uncached=%s -- no exact D number by the "
+                           "deadline: the request is NOT classified on an estimate; route = D's admission (it "
+                           "measures: X-GATE W31 / W123 requeue with D's own extent) or, P awake, P's batch (S56r A1)%s",
+                           "X-EXACT-FALLBACK-MEASURE" if fallback else "D-PROBE-UNPRICED",
+                           rid, n, n_src, up if up >= 0 else "unknown",
+                           "" if basis is None else " class_basis=%s (%s)" % (basis.kind, basis.why))
         pending = int(basis.u) if (basis is not None and basis.kind == _dn.KIND_P_UPPER) else 0
         return SimpleNamespace(pending=pending, n=n, known=False, credit=0, src="d_probe_unpriced", store_depth=0,
                                credit_epoch=None, mm=False, mm_cached=False, image_end=0, d_reach=0, d_floor=0,
@@ -7198,6 +7294,17 @@ class Front:
             else:
                 # no front count, or a namespace only D forms the key of: D tokenizes it itself
                 _probe_task = Front._d_probe_start(self, rid, path, payload)
+        # NF-1b (SOLL R2 "kurz sofort auf D, keine Wartezeit"): D answers its probe only at its scheduler pass boundary;
+        # while D computes an extend that is the extend's whole pass (rc27 pdflip-4-53 probe_ms=1714.8, rc26 pdflip-0-4
+        # 4175.4). A text prompt whose EXACT store number already decides kurz needs no D number for its class
+        # (u_d <= u_p: D reads the same store plus its radix -- the EZ-S1 KIND_P_UPPER rung, its leg carries the
+        # halfX-1 barrier). Only then, and only while D's own beacon shows an extend running; otherwise D's answer
+        # is awaited as before. The probe keeps running; its late answer is logged (D-PROBE-LATE).
+        if (_probe_task is not None and c is not None and mm is None and not _media
+                and envs.FLLIPER_PDFLIP_EXACT_CLASS.get()):
+            _early = await Front._x_kurz_while_d_extends(self, rid, c, path, payload, est_prompt, _probe_task)
+            if _early is not None:
+                return _early
         # S56: D's answer replaces the front's ids (D's token space: images expanded, pad values = the store keys)
         _probe = await Front._d_probe_result(self, rid, _probe_task) if _probe_task is not None else None
         _t_probe_ans = time.monotonic()  # S63 F1: the D number below is D's at this instant
