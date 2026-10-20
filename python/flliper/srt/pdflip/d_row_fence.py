@@ -35,24 +35,44 @@ Rank-local, no collective; the verdicts that call it are replicated by their cal
 from __future__ import annotations
 
 import logging
-import weakref
-from typing import Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-_ROW_STREAMS: "weakref.WeakSet" = weakref.WeakSet()
-_ROW_STREAMS_STRONG: List[object] = []  # streams that are not weak-referenceable (kept alive, rare)
+# NF-TOD 20.10. 20:08:05Z (rc28, P PP1 pid 909 SIGSEGV in PyObject_RichCompare under
+# ``WeakSet.add`` <- ``register_row_stream`` <- ``DeferredRowsFill.start``): the registry is STRONG and keyed
+# by the CUDA stream's identity, never a ``weakref``. torch 2.11's ``torch.cuda.Stream`` inherits its weakref
+# slot from ``torch._C.Stream`` (``__weakrefoffset__`` 48 on Stream, _CudaStreamBase AND torch.cuda.Stream),
+# so CPython's ``subtype_dealloc`` leaves the clearing to the C base -- and ``THCPStream_dealloc``
+# (torch/csrc/cuda/Stream.cpp) only destroys the CUDAStream and calls ``tp_free``, it never calls
+# ``PyObject_ClearWeakRefs``. A weakref to a dead ``torch.cuda.Stream`` therefore keeps pointing at freed
+# memory: no callback fires, the WeakSet entry stays, and the next stream from the 32-stream pool with the
+# same handle (same hash) makes ``set.add`` compare against the freed object. Same holds for
+# ``torch.cuda.Event`` (``THCPEvent_dealloc``). Holding the streams strongly is also the fence's own rule:
+# a pool stream whose Python handle died can still run a kernel that reads a row, and the pool hands the
+# same stream out again -- it stays a row stream. The registry is bounded by the distinct streams of the
+# process (pool size x priorities + the few dedicated ones), not by the number of handles created.
+_ROW_STREAMS: Dict[Tuple, object] = {}
+
+
+def _stream_key(stream) -> Tuple:
+    """One key per CUDA stream: ``(device_type, device_index, stream_id)`` of a torch stream (every handle
+    of one stream -- ``current_stream()`` returns a fresh object per call -- gives the same key); any other
+    object (CPU desk fakes) by identity, which the strong reference keeps valid."""
+    sid = getattr(stream, "stream_id", None)
+    dix = getattr(stream, "device_index", None)
+    dty = getattr(stream, "device_type", None)
+    if isinstance(sid, int) and isinstance(dix, int) and isinstance(dty, int):
+        return ("stream", dty, dix, sid)
+    return ("id", id(stream))
 
 
 def register_row_stream(stream) -> None:
-    """A stream that may read or write expert bank rows (idempotent; None ignored)."""
+    """A stream that may read or write expert bank rows (idempotent; None ignored). Held strongly -- see the
+    NF-TOD 20.10. note above: a weakref to a torch stream dangles once the stream object dies."""
     if stream is None:
         return
-    try:
-        _ROW_STREAMS.add(stream)
-    except TypeError:
-        if all(s is not stream for s in _ROW_STREAMS_STRONG):
-            _ROW_STREAMS_STRONG.append(stream)
+    _ROW_STREAMS.setdefault(_stream_key(stream), stream)
 
 
 def _same(a, b) -> bool:
@@ -69,16 +89,14 @@ def _same(a, b) -> bool:
 def row_streams(extra: Iterable[object] = ()) -> List[object]:
     """Every registered row stream plus ``extra`` (the caller's forward stream), duplicates removed."""
     out: List[object] = []
-    for s in list(_ROW_STREAMS) + list(_ROW_STREAMS_STRONG) + [x for x in extra if x is not None]:
+    for s in list(_ROW_STREAMS.values()) + [x for x in extra if x is not None]:
         if not any(_same(s, o) for o in out):
             out.append(s)
     return out
 
 
 def reset_for_tests() -> None:
-    for s in list(_ROW_STREAMS):
-        _ROW_STREAMS.discard(s)
-    _ROW_STREAMS_STRONG.clear()
+    _ROW_STREAMS.clear()
     global _OPS, _WARM_STREAM
     _OPS = None
     _WARM_STREAM = None
