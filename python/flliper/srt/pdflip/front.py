@@ -12512,6 +12512,41 @@ class Front:
         return bool(int(g("x_requeues") or 0) > 0 or g("x_deferred", False) or int(g("x_routed") or 0) > 0
                     or int(g("handoff_lost_reroutes") or 0) > 0)
 
+    def _wait_seat_owned(self, q: Any) -> bool:
+        """EZ-S2a review A1 (S2a-1, SOLL R7; plan B2/E11 WAIT_SEAT owner): an entry P was chosen for BY STATE (D refused it
+        with a named extent, routed to P on a smaller X_busy, deferred) that is UNDER its own X, is no P work (R7: no flip
+        under X) -- and must not be an orphan either (#246b / S28-A2: neither D's nor P's). Its owner is WAIT_SEAT: kurz
+        (u < halbX) is D's again (``d_eligible``, handed by ``_asr_queued_short_to_d`` at the decision X >= u), halb is a
+        set member (R3) that goes to D at ``D_AFTER_TIMER`` or rides a decided flip (R1a). Not owned here: a MEASURED
+        entry (B1 executes it by D's class), p_only / leg-2 reroute (R9/N1), a refusal without a number (D's word, P)."""
+        if not _fd.enabled() or not Front._state_p_flag(q):
+            return False
+        g = lambda k, d=None: getattr(q, k, d)  # noqa: E731 -- partial test doubles
+        if (g("measure_class", "") or g("p_only", False) or g("reroutes", 0) or g("skip_leg1", False)
+                or g("leg1_done", False) or g("intake_stalled", False) or g("handoff_lost_reroutes", 0)
+                or (int(g("x_requeues", 0) or 0) > 0 and g("x_ref_nonum", False))):
+            return False
+        return phase_policy.immediate_park_trigger([q], int(self.tp_prefill_max_tokens)) is None
+
+    def _wait_seat_adopt(self, live_q: List["Pending"]) -> int:
+        """The WAIT_SEAT owner of a KURZ state-chosen entry (u < halbX of its own X): D's again. One counter and one edge
+        record per rid; a halb entry is a set member instead (:meth:`_decode_collect` hands it to D after the timer)."""
+        if not _fd.enabled():
+            return 0
+        frac = Front._set_cfg()[0]
+        n = 0
+        for q in live_q:
+            if getattr(q, "d_eligible", False) or not Front._wait_seat_owned(self, q):
+                continue
+            u, xq = int(getattr(q, "est_uncached", 0) or 0), Front._set_x_of_entry(self, q)
+            if u >= phase_policy.half_x_of(xq, frac):
+                continue
+            q.d_eligible = True
+            n += 1
+            self.counters["wait_seat_kurz_to_d"] += 1
+            _fd.wait_seat_owner(self, q.rid, u, xq, "kurz: D's again (d_eligible), handed at the decision X >= u")
+        return n
+
     def _set_cands(self, live_q: List["Pending"], st: dict) -> List["Pending"]:
         """The queued entries that need P (LONG, P-only, requeued, carrier) and are not yet committed to a flip."""
         x_tok = int(self.tp_prefill_max_tokens)
@@ -12523,6 +12558,8 @@ class Front:
             for q in live_q:
                 if q.rid in st["go_p"]:
                     continue
+                if q.rid in st.get("d_after", ()):
+                    continue                       # A1: the timer ended with D's verdict -- D's now, no second verdict per tick
                 if phase_policy.immediate_park_trigger([q], x_tok) is not None or Front._measured_halb_member(q):
                     out.append(q)
                     continue
@@ -13563,6 +13600,13 @@ class Front:
                     # takes it under the decision X (``_asr_queued_short_to_d``), not the barrier
                     _q.d_eligible = True
                     self.counters["measure_halb_to_d"] += 1
+                elif _q.rid in st["xs"] and Front._wait_seat_owned(self, _q):
+                    # EZ-S2a review A1 (R7/R3, WAIT_SEAT owner): a halb entry D refused / routed / deferred is a member
+                    # by its exact u; the timer ended without S >= X -- it is D's now, handed by ``_asr_queued_short_to_d``
+                    # at the decision X. Marked decided: no member again, no verdict again per tick
+                    _q.d_eligible = True
+                    st.setdefault("d_after", set()).add(_q.rid)
+                    self.counters["wait_seat_halb_to_d"] += 1
         for rid in list(st["shorts"]):
             st["released"][rid] = route
             if route == "D" and envs.FLLIPER_PDFLIP_ENABLE_DECODE_COLLECT_PREFILL_BUSY.get():
@@ -13571,6 +13615,10 @@ class Front:
             st["go_p"].update(m.rid for m in members)
             for _m in members:
                 Front._flip_trig_note(self, _m.rid, int(_m.own_uncached or _m.uncached), "set-verdict")
+            for _q in live_q:
+                if _q.rid not in st["go_p"] and Front._wait_seat_owned(self, _q):
+                    st["go_p"].add(_q.rid)           # A1 / R1a: a WAIT_SEAT entry rides the decided flip
+                    self.counters["wait_seat_rides_flip"] += 1
         if sv.verdict == phase_policy.V_REROUTE_P:
             # S56: the running D prefill(s) R6 counted move to P NOW (PARK-HANDBACK), not after the flip
             Front._r6_redirect(self, "set-verdict")
@@ -14813,12 +14861,15 @@ class Front:
         x = self._x_band_floor() if d_busy else int(self.tp_prefill_max_tokens)
         def _g(p, k, d=None):  # getattr: partial test doubles (phase_policy's convention)
             return getattr(p, k, d)
+        Front._wait_seat_adopt(self, live_q)   # EZ-S2a review A1: the WAIT_SEAT owner of a kurz state-chosen entry
         eligible = [p for p in live_q
                     if _g(p, "d_eligible", False) and not _g(p, "intake_stalled", False)
                     and not _g(p, "leg1_done", False) and not _g(p, "reroutes", 0)
-                    and (not _g(p, "x_requeues", 0) or _g(p, "measure_class", "") in (_dn.CLASS_KURZ, _dn.CLASS_HALB))
+                    and (not _g(p, "x_requeues", 0) or _g(p, "measure_class", "") in (_dn.CLASS_KURZ, _dn.CLASS_HALB)
+                         or Front._wait_seat_owned(self, p))
                     and not _g(p, "p_only", False)
-                    and not _g(p, "x_deferred", False) and 0 <= int(_g(p, "est_uncached", 0) or 0) <= x]
+                    and (not _g(p, "x_deferred", False) or Front._wait_seat_owned(self, p))
+                    and 0 <= int(_g(p, "est_uncached", 0) or 0) <= x]
         # X-SUM-PRICE (Nutzer 05.10. "pending token werden gesammelt und als SUMME bepreist"):
         # X prices what D prefills IN TOTAL, not per request. Boot 063507: the P
         # phase's seat cap left 8-32/8-34/8-37 (12.2k each) in the queue; each

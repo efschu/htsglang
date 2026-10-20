@@ -65,3 +65,14 @@ def rider_under_x(front: Any, rid: str, u: int, x_own: int, why: str) -> None:
                                          x=int(x_own), **front._dec_group()), edge=True)
     except Exception:  # noqa: BLE001
         pass
+
+
+def wait_seat_owner(front: Any, rid: str, u: int, x_own: int, why: str) -> None:
+    """A1 (SOLL R7, plan B2/E11): the owner of an entry D refused / routed / deferred under its X is named once per rid --
+    ``DECISION rule=R7 action=WAIT_SEAT owner=...`` (edge record), so an entry nobody owns shows as a missing line."""
+    try:
+        front._dec().record(_dr.Decision(kind="set", action="WAIT_SEAT", rule="R7", rid=str(rid),
+                                         why="owner=WAIT_SEAT u=%d X=%d %s" % (int(u), int(x_own), why),
+                                         x=int(x_own), **front._dec_group()), edge=True)
+    except Exception:  # noqa: BLE001
+        pass
