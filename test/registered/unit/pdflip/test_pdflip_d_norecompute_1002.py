@@ -67,8 +67,9 @@ def test_a_flush_spills_a_foreign_intermediate_anchor_to_l3(tmp_path, secured):
         assert not any(rk.unbacked for rk in ranks)
         # the victim: pdflip-12-43's SHALLOWEST intermediate anchor, never its deepest
         assert H._state(arena, hs[0]) != 2 and H._state(arena, hs[-1]) == 2
-        assert sum(1 for w, _ in spilled if w == "flush_spill") == H.RANKS, \
-            "one flush spill per rank (once per node)"
+        # S109b: the L3 copy is made ONCE (the write-behind's shared record, every rank reads it), not per rank
+        assert sum(1 for w, _ in spilled if w == "flush_spill") == 1, \
+            "one L3 copy of the victim, read by every rank"
     else:
         assert not landed and all(rk.unbacked for rk in ranks)
         assert all(H._state(arena, h) == 2 for h in hs), "an unsecured victim is never released"

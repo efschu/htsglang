@@ -38,9 +38,10 @@ why=arena_claim``), the peel delivered 0 and D refused requests under X (SOLL R7
 THE RULE: after every plain leaf, a host-only leaf whose ONLY refusal is a host-only MAMBA anchor is a candidate too
 (heap key ``(1, ...)`` behind ``(0, ...)``). It leaves like a plain one -- every KV page gets its L3 copy first
 (``secure_rows_to_l3``) -- and its anchor gets its L3 copy too, by the S39 helper
-(``forma_l3_subtree._secure_child_anchors``: a stat when the store already holds it, else the bounded write,
-``ANCHOR_SECURE_PER_CALL`` anchors per call). An anchor in flight, not settled or not secured keeps the leaf, named
-(``aux_kept``). Any other host-only aux component keeps the old refusal. No switch, no timer, no reserve; on a Form A
+(``forma_l3_subtree._secure_child_anchors``). S109b: neither the KV pages nor the anchor are written or stat'ed
+here -- the write-behind thread's shared record (``mem_cache/l3_secured``) says which have their copy; the rest is
+queued for its next pass and the leaf stays (``incomplete`` / ``aux_kept=child_anchor_pending``), asked again at the
+next spill. An anchor in flight, not settled or not secured keeps the leaf, named (``aux_kept``). Any other host-only aux component keeps the old refusal. No switch, no timer, no reserve; on a Form A
 group TP0 decides and the drop goes to the workers as a node STATE, exactly like a plain leaf (K23).
 
 K23 (17.10.): the gate also opens on TP0 of a Form A group (``form_a_host``); its
@@ -314,7 +315,7 @@ def spill_host_only(cache: Any, pool: Any, want: int, page_size: int, skip: set,
         logger.info(
             "%s n=%d want=%d released_pages=%d leaves=%d candidates=%d unsecured_kept=%d incomplete=%d stale=%d "
             "secure_pages=%d cap=%d over_cap=%d "
-            "l3=on_disk:%d,written:%d refused=%s aux_candidates=%d aux_leaves=%d aux_kept=%s anchors_secured=%d "
+            "l3=on_disk:%d,written:%d refused=%s aux_candidates=%d aux_leaves=%d aux_kept=%s "
             "(a host-only leaf leaves L2 only with its L3 copy "
             "for every page; incomplete = leaves kept because a slot is not COMPLETE yet, no loss; "
             "port of the 27B Q-697c spill, local-PP floor only; S109 aux = a leaf whose host-only mamba anchor got its "
@@ -322,8 +323,7 @@ def spill_host_only(cache: Any, pool: Any, want: int, page_size: int, skip: set,
             MARK, k, int(want), released, leaves, candidates, unsecured, incomplete, stale,
             cap_used, int(max_secure_pages), over_cap, on_disk, written,
             ",".join("%s:%d" % kv for kv in top) or "-", aux_candidates, aux_leaves,
-            ",".join("%s:%d" % kv for kv in sorted(aux_kept.items())) or "-",
-            ANCHOR_SECURE_PER_CALL - max(0, anchor_budget[0]))
+            ",".join("%s:%d" % kv for kv in sorted(aux_kept.items())) or "-")
     return {"released": released, "leaves": leaves, "candidates": candidates,
             "unsecured": unsecured, "incomplete": incomplete,
             "secure_pages": cap_used, "over_cap": over_cap, "aux_leaves": aux_leaves}
