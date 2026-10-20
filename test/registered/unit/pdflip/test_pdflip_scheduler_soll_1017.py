@@ -293,3 +293,31 @@ def test_r6k_class_comes_from_the_arrival_classification():
     assert 'Front._r6k_note_class(self, rid, klass, "arrival")' in src
     assert 'Front._r6k_note_class(self, rid, phase_policy.CLASS_KURZ, "measure_barrier")' in src
     assert "Front._r6k_note_class(self, rid, klass, _dn.SRC_D_EXTENT)" in inspect.getsource(F.Front._measure_return)
+
+
+def test_r6k_the_kurz_rest_ends_on_d_before_the_flip_not_parked_at_a_chunk_boundary(monkeypatch, tmp_path):
+    """R6k "laeuft nach R2 auf D zu Ende" (Planer-Entscheid 20.10.): der D->P-Park wartet, bis der laufende kurze Prefill auf D
+    fertig ist (R6K_HOLD, kein Park-RPC, Versuch nicht verbraucht); danach geht der Park raus. Begrenzt (T_halb / gemessene
+    Restzeit), ohne Sync: die Front fragt im eigenen Takt neu."""
+    import asyncio as _a
+
+    from flliper.srt.pdflip import front as F
+    from test_nf_r6_rest_exakt_1020 import REST_AFTER, RID_K, _park_rpc, end_forward
+
+    now, f = _r6k_front(monkeypatch, tmp_path, member_u=9875, klass="kurz", waited=4.6, ended=False)
+    calls = []
+    _park_rpc(f, calls)
+    loop = _a.new_event_loop()
+    try:
+        assert loop.run_until_complete(f._wait_bound_park(None, immediate=f.queue[0], cause="before-flip")) == F.R6K_HOLD
+        assert calls == []
+        ws, _ev = f._test_running[RID_K]
+        for w in ws:
+            w.note_extend(rids=[RID_K], rests=[REST_AFTER], extend_lens=[REST_AFTER])
+        end_forward(f, RID_K)
+        for w in ws:
+            w.note_extend_done(rids=[RID_K])
+        assert loop.run_until_complete(f._wait_bound_park(None, immediate=f.queue[0], cause="before-flip")) != F.R6K_HOLD
+    finally:
+        loop.close()
+    assert calls

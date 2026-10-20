@@ -241,14 +241,27 @@ def add_running(f, now, tmp_path, rid, *, rest_start, ext_len, ended, ranks=3, k
     f.__dict__.setdefault("_d_prefill_legs", {})[rid] = now - 1.86
     f._leg2_lookahead.add(rid)
     clock = {"t": int((now - 1.0) * 1e9)}
+    ev = {"done": bool(ended)}
+    ws = []
     for r in range(ranks):
         w = dxb.DExtendBeacon(str(tmp_path / ("D-pid%d%d.bin" % (r + 1, sum(map(ord, rid)) % 1000))), clock_ns=lambda: clock["t"])
         w.note_recv(rid=rid)
         w.note_extend(rids=[rid], rests=[rest_start], extend_lens=[ext_len])
-        w.arm_done(key=key, rids=[rid], ready=lambda: ended)
+        w.arm_done(key=key, rids=[rid], ready=lambda: ev["done"])
         w.poll_done()
+        ws.append(w)
     if klass is not None:
         F.Front._r6k_note_class(f, rid, klass, "arrival")
+    f.__dict__.setdefault("_test_running", {})[rid] = (ws, ev)
+    return ws, ev
+
+
+def end_forward(f, rid):
+    """The running prefill's forward ends on the device: every rank's poll writes its after-rest."""
+    ws, ev = f._test_running[rid]
+    ev["done"] = True
+    for w in ws:
+        w.poll_done()
 
 
 def test_front_live_12_275_class_unknown_r6_counts_the_exact_626(monkeypatch, caplog, tmp_path):
@@ -320,3 +333,111 @@ def test_the_armed_event_is_held_strongly_never_a_weakref(tmp_path):
     gc.collect()
     assert w.poll_done() == 1 and _read(tmp_path) == REST_AFTER
     assert "weakref" not in inspect.getsource(dxb)
+
+
+
+# ------------------------------------------------------------------------------------------------ R6k: finished on D before the flip
+def _hold_front(monkeypatch, tmp_path, *, klass="kurz", ended=False, rest_start=1394, ext_len=768):
+    _on(monkeypatch)
+    now = time.time()
+    return now, _front_live(now, tmp_path, member_u=U_G, ended=ended, rest_start=rest_start, ext_len=ext_len, klass=klass)
+
+
+def test_r6k_hold_measured_limit_then_done_when_the_kurz_rest_ended(monkeypatch, caplog, tmp_path):
+    """12-275 after chunk 1 (768 of 1394 in 1.0 s, rest 626): the flip waits; limit = 2 x 626 x 1.0/768 s = 1630 ms
+    (basis=measured, < T_halb). Chunk 2 ends -> rest 0 -> outcome=done, the flip may begin."""
+    now, f = _hold_front(monkeypatch, tmp_path, ended=True)
+    end_forward(f, RID_K)                                     # chunk 1 polled: rest 626
+    with caplog.at_level(logging.INFO, logger="pdflip.front"):
+        assert F.Front._r6k_finish_hold(f, now) is True
+        assert F.Front._r6k_finish_hold(f, now + 0.5) is True
+        ws, _ev = f._test_running[RID_K]
+        for w in ws:                                          # chunk 2 (626) launched and ended on every rank
+            w.note_extend(rids=[RID_K], rests=[REST_AFTER], extend_lens=[REST_AFTER])
+            w.note_extend_done(rids=[RID_K])
+        assert F.Front._r6k_finish_hold(f, now + 0.9) is False
+    hold = [m for m in caplog.messages if "R6K-FINISH-BEFORE-FLIP outcome=hold" in m]
+    done = [m for m in caplog.messages if "R6K-FINISH-BEFORE-FLIP outcome=done" in m]
+    assert hold and "rests=626" in hold[0] and "basis=measured" in hold[0] and "limit_ms=1630" in hold[0], hold
+    assert done and "wait_ms=900" in done[0] and RID_K in done[0], done
+    assert f.counters["r6k_finish_before_flip_done"] == 1
+
+
+def test_r6k_hold_first_chunk_in_flight_limit_is_t_half_and_the_timeout_is_named(monkeypatch, caplog, tmp_path):
+    """No rate measured yet (chunk 1 in flight): limit = T_halb 4.5 s. Past it the flip goes as before, named -- never an endless
+    block; in the same D phase it never holds again."""
+    now, f = _hold_front(monkeypatch, tmp_path, ended=False)
+    with caplog.at_level(logging.INFO, logger="pdflip.front"):
+        assert F.Front._r6k_finish_hold(f, now) is True
+        assert F.Front._r6k_finish_hold(f, now + 4.4) is True
+        assert F.Front._r6k_finish_hold(f, now + 4.6) is False
+        assert F.Front._r6k_finish_hold(f, now + 5.0) is False
+    assert any("outcome=hold" in m and "basis=t_half" in m and "limit_ms=4500" in m for m in caplog.messages)
+    assert any("outcome=timeout" in m and "wait_ms=4600" in m for m in caplog.messages)
+    assert f.counters["r6k_finish_before_flip_timeout"] == 1
+
+
+def test_r6k_no_hold_for_a_halb_running_prefill_or_a_computed_kurz(monkeypatch, tmp_path):
+    """Only a RUNNING kurz with a rest holds: a halb one is R6's (redirect), a kurz whose last forward ended holds nothing."""
+    now, f = _hold_front(monkeypatch, tmp_path, klass="halb", rest_start=4000, ext_len=2048)
+    assert F.Front._r6k_finish_hold(f, now) is False
+    d2 = tmp_path / "done"
+    d2.mkdir()
+    now, f = _hold_front(monkeypatch, d2, ended=False, rest_start=600, ext_len=600)
+    end_forward(f, RID_K)
+    assert F.Front._r6k_finish_hold(f, now) is False
+
+
+def _park_rpc(f, calls):
+    async def _rpc(group, path, body, timeout):
+        calls.append(path)
+        return 404, ""
+    f.rpc = _rpc
+    f._park_attempt_epoch = -1
+    f._park_unsupported = False
+
+
+def test_r6k_the_park_waits_for_the_kurz_rest_and_its_attempt_is_not_spent(monkeypatch, caplog, tmp_path):
+    """The D->P quiesce: ``_wait_bound_park`` answers R6K_HOLD (admission closed, NO park RPC, the once-per-phase attempt not
+    spent) while the kurz rest runs; once D reported it ended, the park goes out. Mutant 'parks again at the chunk boundary'
+    (no hold) sends the park at once."""
+    now, f = _hold_front(monkeypatch, tmp_path, ended=False)
+    calls = []
+    _park_rpc(f, calls)
+    loop = asyncio.new_event_loop()
+    try:
+        with caplog.at_level(logging.INFO, logger="pdflip.front"):
+            got = loop.run_until_complete(f._wait_bound_park(None, immediate=f.queue[0], cause="before-flip"))
+            assert got == F.R6K_HOLD and calls == [] and f.admit_d is False
+            assert f._park_attempt_epoch != f.epoch
+            ws, _ev = f._test_running[RID_K]
+            for w in ws:
+                w.note_extend(rids=[RID_K], rests=[REST_AFTER], extend_lens=[REST_AFTER])
+            end_forward(f, RID_K)                             # chunk 1 ended (rest 626) ...
+            assert loop.run_until_complete(f._wait_bound_park(None, immediate=f.queue[0], cause="before-flip")) == F.R6K_HOLD
+            for w in ws:
+                w.note_extend_done(rids=[RID_K])              # ... chunk 2 ended: computed
+            got = loop.run_until_complete(f._wait_bound_park(None, immediate=f.queue[0], cause="before-flip"))
+    finally:
+        loop.close()
+    assert got != F.R6K_HOLD and calls, (got, calls)          # the park went out after the kurz ended on D
+    assert any("R6K-FINISH-BEFORE-FLIP outcome=done" in m for m in caplog.messages)
+
+
+def test_r6k_the_manual_flip_does_not_wait(monkeypatch, tmp_path):
+    now, f = _hold_front(monkeypatch, tmp_path, ended=False)
+    calls = []
+    _park_rpc(f, calls)
+    loop = asyncio.new_event_loop()
+    try:
+        got = loop.run_until_complete(f._wait_bound_park(None, cause=F.MANUAL_FLIP_PARK_CAUSE))
+    finally:
+        loop.close()
+    assert got != F.R6K_HOLD and calls
+
+
+def test_r6k_controller_holds_the_flip_on_both_paths():
+    src = inspect.getsource(F.Front.controller)
+    assert src.count("== R6K_HOLD") == 2
+    i = src.index("elif Front._r6k_finish_hold(self):")
+    assert i < src.index('await self.flip("D", "P")', i)

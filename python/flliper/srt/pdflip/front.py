@@ -235,6 +235,8 @@ X_EXACT_VERDICT_NOTE = ("; X-EXACT: uncached, est_prompt and carrier_est are the
 #: argparse default -- the runtime reads ``Front.drain_deadline_s``.
 DRAIN_DEADLINE_DEFAULT_S = 120.0
 #: y3k-korr 09292034: the park cause (and D reason) of a POST /pdflip/flip from D
+#: SOLL R6k: ``_wait_bound_park``'s answer while a running kurz D prefill ends on D before the flip
+R6K_HOLD = "r6k-hold"
 MANUAL_FLIP_PARK_CAUSE = "manual-flip"
 #: Spec C10/K5: the recorded PRE-BARLINK break-even inputs (record 1l/1o
 #: weg2zr2 pair) that produce X's fallback.  Only the FRONT's default; the
@@ -6066,6 +6068,11 @@ class Front:
         """
         if self._park_attempt_epoch == self.epoch:
             return "already"
+        if cause != MANUAL_FLIP_PARK_CAUSE and Front._r6k_finish_hold(self):
+            # SOLL R6k: a running kurz D prefill ends on D first -- admission closes (the flip is decided, R1a: waiting
+            # kurz requests ride it), the park waits for the next controller tick; the attempt is not spent
+            self.admit_d = False
+            return R6K_HOLD
         self._park_attempt_epoch = self.epoch
         D = self.groups["D"]
         if _lctl.enabled():
@@ -12937,6 +12944,85 @@ class Front:
                         "prefill runs to its end on D: its rest is not in S, it makes no flip and pulls none forward, it "
                         "is not redirected to P (SOLL R6k, user 20.10. \"b\"; R2)", rid, int(rest), int(granted), src,
                         self.epoch)
+        return True
+
+    def _r6k_running_kurz(self, now: float) -> List[Tuple[str, int, int, float]]:
+        """SOLL R6k: the RUNNING kurz D prefills with a rest left -- ``(rid, rest, granted, t_first_extend_s)``. Running =
+        posted to D (``outstanding``) and D's own D-EXTEND-BEACON record at/after the grant with rest > 0 (v3 + the poll at
+        the forward's device end: rest 0 = computed). Class = the one it went to D with (``_r6k_note_class``). No reading:
+        nothing is proven running, nothing is held."""
+        if not _dxb.enabled():
+            return []
+        book = self.__dict__.get("_d_pf")
+        D = self.groups.get("D") if isinstance(getattr(self, "groups", None), dict) else None
+        if book is None or D is None:
+            return []
+        classes = self.__dict__.get("_r6k_class") or {}
+        rows = [(rid, row) for rid, row in list(getattr(book, "_rows", {}).items())
+                if rid in D.outstanding and (classes.get(rid) or ("",))[0] == phase_policy.CLASS_KURZ]
+        if not rows:
+            return []
+        reading = self._d_ext_reading_full()
+        if not reading:
+            return []
+        out = []
+        for rid, row in rows:
+            e = _dxb._entry(reading, rid)
+            if e is None or e[0] < int(float(row.t_grant) * 1e9) or e[1] <= 0:
+                continue
+            out.append((str(rid), int(e[1]), int(row.tokens), e[0] / 1e9))
+        return out
+
+    def _r6k_finish_hold(self, now: Optional[float] = None) -> bool:
+        """SOLL R6k (user 20.10. "b": "läuft nach R2 auf D zu Ende"; planner decision 20.10.: finished on D BEFORE the flip,
+        never parked at a chunk boundary): True = the D->P flip (its park / quiesce) waits this controller tick, because a
+        running kurz D prefill still has a rest. No sync, no busy wait: the controller's own tick asks again, D reports the
+        end through its beacon (rest 0 at the forward's device end). Bounded: the deadline is 2x the time the measured rest
+        needs at this prefill's OWN measured rate (computed tokens / time since its first extend), never longer than T_halb
+        (the SOLL flag); no rate measured yet (first chunk in flight) -> T_halb. After the deadline the flip goes as before,
+        named. R11: the front decides, the D group follows the park it then gets."""
+        now = time.time() if now is None else float(now)
+        st = self.__dict__.get("_r6k_hold")
+        if st is not None and st.get("epoch") != self.epoch:
+            st = None
+            self.__dict__["_r6k_hold"] = None
+        if st is not None and st.get("timed_out"):
+            return False
+        run = Front._r6k_running_kurz(self, now)
+        if not run:
+            if st is not None and not st.get("closed"):
+                st["closed"] = True
+                self.counters["r6k_finish_before_flip_done"] += 1
+                logger.info("PDFLIP R6K-FINISH-BEFORE-FLIP outcome=done wait_ms=%d rids=%s epoch=%d -- the running kurz D "
+                            "prefill(s) ended on D, the flip begins now (SOLL R6k, R2)", int(round((now - st["t0"]) * 1000)),
+                            ",".join(st["rids"]), self.epoch)
+            return False
+        if st is None or st.get("closed"):
+            t_half = float(Front._set_cfg()[1])
+            exp = []
+            for _rid, rest, granted, t_first in run:
+                done_tok, el = max(0, int(granted) - int(rest)), max(0.0, now - float(t_first))
+                exp.append(rest * el / done_tok if done_tok > 0 and el > 0 else None)
+            if exp and all(e is not None for e in exp):
+                limit, basis = min(t_half, 2.0 * max(exp)), "measured"
+            else:
+                limit, basis = t_half, "t_half"
+            st = {"epoch": self.epoch, "t0": now, "deadline": now + limit, "rids": [r[0] for r in run]}
+            self.__dict__["_r6k_hold"] = st
+            self.counters["r6k_finish_before_flip_held"] += 1
+            logger.info("PDFLIP R6K-FINISH-BEFORE-FLIP outcome=hold rids=%s rests=%s limit_ms=%d basis=%s epoch=%d -- the flip "
+                        "waits for the running kurz D prefill(s) to end on D, not parked at a chunk boundary (SOLL R6k: "
+                        "\"läuft nach R2 auf D zu Ende\"; R11)", ",".join(r[0] for r in run),
+                        ",".join(str(r[1]) for r in run), int(round(limit * 1000)), basis, self.epoch)
+            return True
+        if now >= st["deadline"]:
+            st["timed_out"] = True
+            self.counters["r6k_finish_before_flip_timeout"] += 1
+            logger.warning("PDFLIP R6K-FINISH-BEFORE-FLIP outcome=timeout wait_ms=%d rids=%s rests=%s epoch=%d -- the deadline "
+                           "passed with a kurz rest left: the flip goes as before (D parks it at its chunk boundary)",
+                           int(round((now - st["t0"]) * 1000)), ",".join(r[0] for r in run), ",".join(str(r[1]) for r in run),
+                           self.epoch)
+            return False
         return True
 
     def _r6_redirect(self, why: str) -> List[str]:
@@ -20799,7 +20885,8 @@ class Front:
                         # per D phase; admission to D closes). A hand-off in
                         # flight is waited for first -- it registers within
                         # ms, bounded by the W36 barrier -- so the park sees it.
-                        await self._wait_bound_park(wait_s, immediate=immediate)
+                        if await self._wait_bound_park(wait_s, immediate=immediate) == R6K_HOLD:
+                            continue  # SOLL R6k: the running kurz D prefill ends on D first (next tick asks again)
                     # H91 part C rule 2: D's work is exhausted only when it
                     # runs nothing (the wait-bound-parked ones excepted), holds
                     # no hand-off AND no prefilled request still waits in
@@ -20838,8 +20925,11 @@ class Front:
                         # fired; parked, they resume first after the flip back.
                         if (getattr(self, "d_park_immediate", False) and self.queue
                                 and self._flip_ledger(D)):
-                            await self._wait_bound_park(None, immediate=self.queue[0],
-                                                        cause="before-flip")
+                            if await self._wait_bound_park(None, immediate=self.queue[0],
+                                                           cause="before-flip") == R6K_HOLD:
+                                continue  # SOLL R6k: finished on D before the flip
+                        elif Front._r6k_finish_hold(self):
+                            continue  # SOLL R6k: no park on this path -- the flip still begins only after the kurz rest
                         await self.flip("D", "P")
                     continue
                 # awake == P: prefill the backlog until empty (#1011 PP exit
