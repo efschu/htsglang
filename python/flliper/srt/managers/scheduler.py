@@ -6895,7 +6895,10 @@ class Scheduler(
     def _pdflip_d_park_admission(self, running_batch):
         from flliper.srt.pdflip import d_park_runtime
 
-        return d_park_runtime.admission(self, running_batch)
+        gate = d_park_runtime.admission(self, running_batch)
+        # S93: the lend reads THIS verdict (which waiting request the admission holds out), never a second one
+        _pdflip_d_transient_lend.note_gate(self, gate, running_batch)
+        return gate
 
     def _pdflip_sa_exclude_displaced(self, prefetch_verdicts) -> None:
         from flliper.srt.pdflip import d_park_runtime
