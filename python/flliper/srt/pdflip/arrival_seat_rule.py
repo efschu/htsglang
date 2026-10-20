@@ -198,9 +198,33 @@ def shared_prefix_credit(est_prompt: int, est_uncached: Optional[int], common: O
         return 0
 
 
+def backup_wall(kv_reading: Optional[Mapping]) -> bool:
+    """S94: D publishes its backup wall (``pdflip_kv.backup_wall``: payable < reported evictable). True only when D
+    says so -- an old D without the field reads False (unchanged)."""
+    try:
+        return bool(kv_reading and kv_reading.get("backup_wall"))
+    except AttributeError:
+        return False
+
+
+def payable_room(kv_reading: Optional[Mapping]) -> Optional[int]:
+    """S94: under D's backup wall, the rows D can really give a new leg: ``available + payable_evictable`` -- D's own
+    test (``d_wall_head.wall_unservable``, ``schedule_policy._h105d_cut_load_back_room``). None without the wall or
+    without D's number (then nothing changes)."""
+    if not backup_wall(kv_reading):
+        return None
+    try:
+        if kv_reading.get("payable_evictable") is None:
+            return None
+        return max(0, int(kv_reading.get("available", 0) or 0)) + max(0, int(kv_reading["payable_evictable"]))
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
 def kv_free(kv_reading: Optional[Mapping]) -> Optional[int]:
     """The free tokens :func:`kv_fits` tests against (the larger of D's stage
-    reading and its ladder room), or None without a reading."""
+    reading and its ladder room), or None without a reading. S94: under D's backup wall never more than D's
+    payable room (:func:`payable_room`)."""
     if not kv_reading:
         return None
     try:
@@ -208,7 +232,9 @@ def kv_free(kv_reading: Optional[Mapping]) -> Optional[int]:
     except (TypeError, ValueError, AttributeError):
         return None
     lad = ladder_free(kv_reading)
-    return max(free, lad[0]) if lad is not None else free
+    free = max(free, lad[0]) if lad is not None else free
+    room = payable_room(kv_reading)
+    return min(free, room) if room is not None else free
 
 
 def _younger(head_arrival: float, running: Iterable[str], arrival_of: Mapping[str, float],
@@ -353,6 +379,13 @@ def kv_fits(need: int, kv_reading: Optional[Mapping]) -> Tuple[bool, str]:
     if lad is not None:
         tail = f" (ladder {lad[1]}-{lad[2]}={lad[0]}, stage free {free})"
         free = max(free, lad[0])
+    room = payable_room(kv_reading)
+    if room is not None and room < free:
+        # S94: D's backup wall stands -- the reported evictable rows are not D's to give (rc19 07:15:57 D-WALL-HEAD
+        # available=13568 reported_evictable=305024 payable_evictable=0 while the front read free=312036)
+        tail += f" [S94 backup wall: payable room {room} = available {int(kv_reading.get('available', 0) or 0)} + " \
+                f"payable {int(kv_reading.get('payable_evictable', 0) or 0)}]"
+        free = room
     if int(need) <= free:
         return True, f"kv need={int(need)} free={free}{tail}"
     return False, f"kv need={int(need)} > free={free}{tail}"

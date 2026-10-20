@@ -13863,6 +13863,11 @@ class Front:
         fits, why = _asr.kv_fits(need, reading)
         free = _asr.kv_free(reading)
         self._asr_st()["last_kv_free"] = free   # S60 F2: the room this tick's verdicts were formed on
+        # S94: the AGE PLAN below reads whether D had a number at all and whether its backup wall stands
+        self._asr_st()["last_kv_unread"] = not reading
+        self._asr_st()["last_kv_wall"] = _asr.backup_wall(reading)
+        _rr = reading.get("running_rids") if reading else None
+        self._asr_st()["last_kv_running"] = set(str(r) for r in _rr) if isinstance(_rr, (list, tuple)) else None
         deficit = 0 if (fits or free is None) else int(need) - int(free)
         if shared or decode < reserve:
             why = "%s [need = prompt %d - shared %d + decode %d of max_tokens %d, D clip %s]" % (
@@ -13976,12 +13981,26 @@ class Front:
                 _av.pop(_g, None)
         running = [r for r in self._flip_ledger(self.groups["D"])
                    if r not in st["parked"] and r != head_rid and r not in _claimed]
+        d_running = st.get("last_kv_running")
+        if d_running is not None:
+            # S94 F3 (R5): only a decode D RUNS can be displaced for the head (D's ``displace_for_age`` walks its running
+            # batch). The front's ledger also holds legs D keeps but does not run -- a queued load-back (rc20 08:34:48
+            # pdflip-8-58), a hand-off still in the D line (08:33:41 pdflip-8-47), a credit head granted 57 ms before
+            # (rc19 07:15:49 pdflip-262-3339 for 3338) -- planning on those handed heads to a D that could not seat
+            # them. D's own reading decides; an old D without the field: unchanged.
+            running = [r for r in running if r in d_running]
         arrivals = {}
         for r in running:
             t = self._asr_arrival_of(r)
             if t is not None:
                 arrivals[r] = t
         tokens = {s.rid: int(s.tokens) for s in (getattr(self, "_d_seats_live", ()) or ())}
+        if st.get("last_kv_wall"):
+            # S94 (R5): under D's backup wall a displaced decode frees no KV row -- D sizes every victim 0
+            # (``d_park_runtime.kv_displace_would_fit``: "a victim's retained KV goes back to the tree and is as
+            # unpayable as the rest"). The front plans with D's numbers: a KV deficit is not coverable by victims, only
+            # a missing SEAT is (the head then still has to fit D's payable room).
+            tokens = {r: 0 for r in tokens}
         plan = _asr.displace_plan(head_arrival, seat_is_free, deficit, running, arrivals, tokens,
                                   lane_of={r: Front._prio_lane(self, r) for r in running},  # PRIO-AS-AGE 1014
                                   head_lane=Front._prio_lane(self, head_rid))
@@ -13993,8 +14012,11 @@ class Front:
                 self.counters["arrival_seat_age_blocked_by_elders"] += 1
             logger.info("%s head=%s plan=%s seat_free=%s deficit=%d younger_victims_by_front_price=%s -- %s",
                         _asr.AGE_MARKER, head_rid, key, bool(seat_is_free), int(deficit), plan or [],
-                        "older running requests block it: it waits here, younger ones that fit are "
-                        "backfilled" if plan is None else
+                        ("S94 backup wall on D: displacing frees no KV row and the head does not fit D's payable "
+                         "room -- it waits for room (R5), younger ones that fit are backfilled"
+                         if st.get("last_kv_wall") and int(deficit) > 0 else
+                         "older running requests block it: it waits here, younger ones that fit are "
+                         "backfilled") if plan is None else
                         ("it fits" if not plan else
                          "it goes to D; D's SEAT-AGE decides the displacement on its real KV"))
         return plan
@@ -14297,6 +14319,15 @@ class Front:
             else:
                 plan = self._arrival_seat_age_verdict(rid, arrival, free, 0 if fits_kv else deficit)
         to_d = bool(plan)   # does not fit, but D can make it fit by displacing younger ones
+        if to_d and st.get("last_kv_unread"):
+            # S94 (R5, Order 19.10. "nichts schätzen"): no D reading -> no AGE PLAN grant. rc19 07:15:57 pdflip-262-3340
+            # went to D at taken=7 n=6 with ``kv=unread`` (seat 9/6 ON-CREDIT) onto a D whose wall stood. Without D's
+            # number the head waits for its seat (R5) -- the plain seat path is unchanged.
+            self.counters["arrival_seat_age_no_reading"] += 1
+            logger.info("%s head=%s plan=held-no-reading victims=%s -- S94: D gave no KV reading this tick, the AGE "
+                        "PLAN does not hand a head to D on no number; it waits for its seat (R5)",
+                        _asr.AGE_MARKER, rid, list(plan))
+            to_d, plan = False, None
         if fits:
             # H16V F4 (root of the 5 s gap, NF 16:03:32,957: pdflip-96-1178/1179/1180 were ALL granted at taken=5 n=6 --
             # ONE free seat): ``free`` was read BEFORE the awaits above (KV reading, older-blocked), so every waiter of

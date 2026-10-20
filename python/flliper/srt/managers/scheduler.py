@@ -22213,6 +22213,23 @@ class Scheduler(
             from flliper.srt.pdflip.arrival_seat_rule import d_decode_clip
 
             ret["pdflip_kv"]["decode_clip"] = d_decode_clip()
+            # S94 (rc19 07:15:48 pdflip-262-3339: the front read free=312036 = available + REPORTED evictable while D
+            # had available=13568 payable_evictable=0 -- D-WALL-HEAD 07:15:57): what D can really pay. Under the
+            # backup wall (payable < reported) a row going back to the tree frees no device row, a displaced decode
+            # frees none either (d_park_runtime.kv_displace_would_fit sizes victims 0) -- the front's ARRIVAL-SEAT
+            # verdict reads this instead of the reported count. TP0's reading, like available/evictable above.
+            from flliper.srt.mem_cache.common import payable_evictable_or
+
+            _rep = int(ret["pdflip_kv"]["evictable"])
+            _pay = int(payable_evictable_or(self.tree_cache, self.tree_cache.evictable_size) or 0)
+            ret["pdflip_kv"]["payable_evictable"] = _pay
+            ret["pdflip_kv"]["backup_wall"] = bool(_pay < _rep)
+            # S94 F3 (rc20 08:34:48 pdflip-12-82: the AGE PLAN's victim pdflip-8-58 was no running decode -- D held it
+            # as a queued load-back, 08:34:51 LOAD-BACK ROOM need=81475 available=33728): the decodes D RUNS, the only
+            # ones its SEAT-AGE can displace (``displace_for_age`` walks the running batch). Replicated across D's TP
+            # ranks (one schedule); capped -- D's bs is single digits.
+            ret["pdflip_kv"]["running_rids"] = [str(r.rid) for r in list(
+                getattr(getattr(self, "running_batch", None), "reqs", None) or ())[:64]]
         except Exception:  # noqa: BLE001 -- an instrument never breaks the info route
             pass
         # PDFLIP MODE-PARITY (h16m 1014, N4): this group's priority mode for the
