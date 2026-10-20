@@ -3491,6 +3491,15 @@ class Envs:
     # allocation: no mirrored allocator to keep in step); the non-arena rows stay queued in place
     # for the MIN. False restores the MIN-only release.
     FLLIPER_PDFLIP_RELEASE_QUEUE_LOCAL_REFS = EnvBool(True)
+    # S86 (rc19 boot ..._1019_230333, D 05:37:22-23: ARENA-REF-HOLDERS tree=6409 queue=0 -- the trees'
+    # references alone pinned the KV arena; #1427 ARENA-DROP freed=0, #1421 arena_claim, #1470
+    # ARENA-FULL-STOP, FLUSH-UNBACKED nodes=17 tokens=13632 with three park-end chains): at the sleep leg,
+    # after the group drain and before the sleep flush (group D), every rank gives back the arena
+    # references of its device-resident nodes whose every page has a proven L3 copy, agreed over the
+    # group (MAX of the veto vector; digest + barrier after), so the #1470 flush finds room for the
+    # nodes with no copy. A page without an L3 copy is never released (pdflip/sleep_l3_release.py).
+    # False: the sleep flush as before.
+    FLLIPER_PDFLIP_SLEEP_L3_RELEASE = EnvBool(True)
     # fnFL2 H74 (x172): on a TP group the publish split window (#1407) is the
     # chunk (4096, page-aligned) on every rank instead of a quarter of the
     # rank's OWN host pool -- x172 split a 6080-token node into 4096 + 1984 on
