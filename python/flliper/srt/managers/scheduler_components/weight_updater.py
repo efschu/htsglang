@@ -4622,6 +4622,20 @@ class SchedulerWeightUpdaterManager:
                         "device-side wait, before any pause; host halves stay for the lap-late join)",
                         frames, nbytes / float(1 << 20), kept)
 
+    def _pdflip_quiesce_lend_before_sleep(self) -> None:
+        """F3: ``d_transient_lend.quiesce_for_sleep`` -- nothing of D's expert bank may move under the pause
+        (the lend's map thread, a deferred unmap, a warm copy). A rank without a seat controller does nothing.
+        Never raises: a failure is named and the sleep goes on (the pause serialises with the saver's mutex)."""
+        sched = getattr(self, "scheduler", None)
+        if sched is None:
+            return
+        try:
+            from flliper.srt.pdflip import d_transient_lend as _dtl
+
+            _dtl.quiesce_for_sleep(sched)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("PDFLIP-SLEEP LEND-QUIESCE skipped (%s: %s)", type(exc).__name__, str(exc)[:160])
+
     def _pdflip_drain_hicache_before_sleep(
         self, bound_s: float = PDFLIP_SLEEP_DRAIN_BOUND_S
     ) -> None:
@@ -9174,6 +9188,9 @@ class SchedulerWeightUpdaterManager:
         # BEFORE any pause and before the sleep's empty_cache -- they are untagged, no pause covers them, and
         # they sat in the group-P dormant residue D's expert residency is priced against (rc22 PP0/PP1 +600 MiB).
         self._pdflip_retire_pp_sends_before_sleep()
+        # F3: D's bank -- an in-flight lend's map lands, the deferred unmaps go (their E1), the warm copies
+        # land -- before any pause; rank-local, no collective
+        self._pdflip_quiesce_lend_before_sleep()
         _pdflip_ph("pp_sends")
         if self._pdflip_group_name() == "D":
             # RW: the LRU owners of every pool layer, BEFORE any pause (the

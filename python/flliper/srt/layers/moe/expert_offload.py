@@ -1024,7 +1024,18 @@ def pool_prefetch_stream():
         import torch
 
         _POOL_PREFETCH_STREAM = torch.cuda.Stream()
+        _register_row_stream(_POOL_PREFETCH_STREAM)  # F3: it writes bank rows
     return _POOL_PREFETCH_STREAM
+
+
+def _register_row_stream(stream) -> None:
+    """F3: a stream that reads or writes expert bank rows joins the ROW-FENCE's set (d_row_fence)."""
+    try:
+        from flliper.srt.pdflip.d_row_fence import register_row_stream
+
+        register_row_stream(stream)
+    except Exception:  # noqa: BLE001 -- the fence module is part of the tree; never stops a stream
+        pass
 
 
 def resident_slot_count(num_local_experts: int, fraction: float) -> int:
@@ -4149,6 +4160,7 @@ class MoEExpertOffloadCache:
         # has a context, so the CUDA branch is unchanged.
         cuda = torch.cuda.is_available()
         self._stream = torch.cuda.Stream() if cuda else None
+        _register_row_stream(self._stream)  # F3: the layer's fetch stream writes bank rows
         dev = torch.cuda.current_device() if cuda else torch.device("cpu")
         R = self.resident_count
         buf_slots = self.planner.buffer_size  # R + C
@@ -4981,26 +4993,85 @@ class MoEExpertOffloadCache:
                 raise ValueError("H95c: seat rows on a layer without seat rows / pool")
             return 0
         from flliper.srt.environ import envs
-        from flliper.srt.layers.moe.expert_pool_device import set_seat_rows_on
+        from flliper.srt.layers.moe.expert_pool_device import seat_rows_off_device, set_seat_rows_on
 
-        # D-MEM-SCHED (29.09.): a shrink moves the dropped rows' experts into
-        # the coldest kept rows first (Not-Aus: FLLIPER_PDFLIP_DISABLE_D_ELASTIC_ROWS)
-        mover = None
-        if (device_write and getattr(self, "_resident", None)
-                and not envs.FLLIPER_PDFLIP_DISABLE_D_ELASTIC_ROWS.get()):
-            mover = functools.partial(MoEExpertOffloadCache._move_bank_rows, self)
         # KV-STAGE warm refill (01.10.): a shrink remembers the experts it sent
         # to the store (hottest first); the grow that follows hands them their
         # rows back at once instead of one cold miss each. This method is bound
         # onto test doubles too (types.MethodType); only a real cache warms.
         warm = (device_write and isinstance(self, MoEExpertOffloadCache)
                 and envs.FLLIPER_PDFLIP_D_SEAT_WARM_REFILL.get())
-        departed = [] if warm else None
-        old = set_seat_rows_on(self._pool_tables, int(k), device_write=device_write,
-                               move_rows=mover, departed_out=departed)
-        if warm:
-            self._seat_warm_step(int(k), old, departed)
+        if device_write and int(k) < int(self._pool_tables.seat_on):
+            # F3: the SHRINK on the device -- no .cpu(); the caller's ROW-FENCE (d_seat_vram._rows_off_live)
+            # orders it behind every row stream and every row stream's later work behind it. D-MEM-SCHED
+            # (29.09.): the dropped rows' experts move into the coldest kept rows first (Not-Aus:
+            # FLLIPER_PDFLIP_DISABLE_D_ELASTIC_ROWS); pending warm rows of this layer go back free first.
+            from flliper.srt.pdflip import d_row_fence
+
+            d_row_fence.drop_warm(self)
+            mover = None
+            if getattr(self, "_resident", None) and not envs.FLLIPER_PDFLIP_DISABLE_D_ELASTIC_ROWS.get():
+                mover = functools.partial(MoEExpertOffloadCache._move_bank_rows_device, self)
+            recall = functools.partial(MoEExpertOffloadCache._seat_recall_snapshot, self) if warm else None
+            return seat_rows_off_device(self._pool_tables, int(k), move_rows=mover, recall=recall)
+        old = set_seat_rows_on(self._pool_tables, int(k), device_write=device_write)
+        if warm and int(k) > old:
+            self._seat_warm_grow(int(k), old)
         return old
+
+    def _seat_recall_snapshot(self, keys_before, uses_before, hot_after) -> None:
+        """F3: the shrink's departed-expert inputs, read back to the host WITHOUT a wait (pinned, side
+        stream, event); the next grow uses them once ready (``departed_experts``), else the older recall."""
+        from flliper.srt.pdflip.d_row_fence import DeferredRead
+
+        self._pdflip_seat_recall_read = DeferredRead((keys_before, uses_before, hot_after))
+
+    def _seat_warm_grow(self, k: int, old: int) -> None:
+        """F3: the grow's warm refill without a host read of the tables: the recalled experts (cold ones only,
+        checked on the device) take the rows this grow just turned ON -- known free in stream order --,
+        reserved at once; their bytes come on the warm stream; the commit follows the copies' event."""
+        import torch
+
+        from flliper.srt.layers.moe.expert_pool_device import departed_experts, reserve_warm_rows
+        from flliper.srt.pdflip import d_row_fence
+
+        t = self._pool_tables
+        recall = list(getattr(self, "_pdflip_seat_recall", []) or [])
+        rd = getattr(self, "_pdflip_seat_recall_read", None)
+        if rd is not None and rd.ready():
+            kb, ub, ha = rd.get()
+            departed = departed_experts(kb.tolist(), ub.tolist(), ha.tolist(), num_experts=int(t.num_experts))
+            seen = set(departed)
+            recall = (departed + [e for e in recall if e not in seen])[: max(1, int(self.seat_rows)) * 2]
+            self._pdflip_seat_recall_read = None
+        n = min(len(recall), int(k) - int(old))
+        if n <= 0:
+            self._pdflip_seat_recall = recall
+            return
+        self._pdflip_seat_recall = []
+        dev = t.row_key.device
+        ids = torch.tensor(recall[:n], dtype=torch.int64)
+        if dev.type == "cuda":
+            ids = ids.pin_memory().to(dev, non_blocking=True)
+        row0 = int(t.seat_base) + int(old)
+        rows = torch.arange(row0, row0 + n, device=dev, dtype=torch.int64)
+        hr = t.host_row.index_select(0, ids).to(torch.int64)
+        reserve_warm_rows(t, rows)
+        d_row_fence.submit_warm(self, ids, rows, hr >= 0, hr.clamp(min=0))
+
+    def _move_bank_rows_device(self, src, dst) -> None:
+        """F3: :meth:`_move_bank_rows` for fixed-length device pairs (no-op lanes copy a row onto itself);
+        the bound is checked statically against the seat block's top -- no host read of the pairs."""
+        top = int(self._pool_tables.seat_base) + int(self._pool_tables.seat_rows)
+        copied = 0
+        for attr, buf in self._resident.items():
+            if int(buf.shape[0]) < top:
+                raise RuntimeError(
+                    "D-MEM-SCHED: bank buffer %s has %d rows, the seat block ends at row %d"
+                    % (attr, int(buf.shape[0]), top))
+            buf.index_copy_(0, dst, buf.index_select(0, src))
+            copied += int(dst.numel()) * (buf.numel() // int(buf.shape[0])) * buf.element_size()
+        self._pdflip_bank_bytes_copied = int(getattr(self, "_pdflip_bank_bytes_copied", 0)) + copied
 
     def _seat_warm_step(self, k: int, old: int, departed: List[int]) -> None:
         """KV-STAGE warm refill: remember on a shrink, refill on a grow. The
@@ -5207,7 +5278,7 @@ class MoEExpertOffloadCache:
                 copy_rows(self._pool_srcs, self._pool_dsts, buffers.gather_src,
                           buffers.gather_dst, buffers.gather_count)
                 if probe is not None:
-                    probe.copied(e0, buffers.gather_count, self._em_fetch_row_bytes())
+                    probe.copied(e0, buffers.gather_count, self._em_fetch_row_bytes(), wave=wave)
                 # read this wave's routes before the next step rewrites them
                 routes_e = buffers.routes[:E].to(torch.int64)
                 lane_route = routes_e.index_select(0, safe)
@@ -5251,6 +5322,8 @@ class MoEExpertOffloadCache:
                     partials[a:b] = torch.where(
                         srv.unsqueeze(1), part.to(partials.dtype), partials[a:b]
                     )
+                if probe is not None:
+                    probe.applied(wave, served)  # F3: this wave's apply time and served lanes
         finally:
             cfg.routed_scaling_factor = saved_rsf
         out_full = torch.empty((T, partials.shape[-1]), dtype=partials.dtype, device=device)
@@ -8546,7 +8619,9 @@ class _CudaStreamOps:
     def new_stream(self):
         import torch
 
-        return torch.cuda.Stream()
+        s = torch.cuda.Stream()
+        _register_row_stream(s)  # F3: H31 rearm / deferred rows / resume warm streams write bank rows
+        return s
 
     def stream_ctx(self, stream):
         import torch

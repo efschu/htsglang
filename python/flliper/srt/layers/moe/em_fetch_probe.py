@@ -25,6 +25,14 @@ scheduler funnel closes the forward at the next forward's start: one non-blockin
 pinned memory plus an event; the line is written when that event has completed (``query``), a forward or
 two later. Never a ``synchronize``, never an ``item`` on a busy stream. Rank-local, read-only, no collective;
 off under graph capture. Switch ``FLLIPER_PDFLIP_EM_FETCH`` (default ON).
+
+F3 (20.10.) TIME PER WAVE. ``run_pool_em`` runs every wave's apply over ALL ``T x K`` lanes (a lane the wave does
+not serve points at the zero row with weight 0). On today's D prefills every wave-1 copy fits the 105 rows of LRU +
+staging (rows <= ~63 per layer), so wave 2 would serve nothing -- yet its apply still runs: a possible second full
+expert GEMM per layer that ``em_ms - copy_ms`` cannot separate. The line therefore also carries, per wave index
+(summed over the forward's EM layers): ``wave_copy_ms`` (copy events), ``wave_apply_ms`` (copy end -> the wave's
+last apply slice, device time) and ``wave_served`` (lanes the wave served, device counter, read with the same
+non-blocking D2H). ``wave_served`` 0 with ``wave_apply_ms`` > 0 is the empty wave's GEMM, measured. No sync.
 """
 from __future__ import annotations
 
@@ -35,6 +43,8 @@ logger = logging.getLogger(__name__)
 
 MARK = "EM-FETCH"
 MAX_PENDING = 16
+#: F3: per-wave counters kept (EM waves are capped far below this; a higher wave index folds into the last)
+MAX_WAVES = 8
 #: the device types the probe times (a CPU harness adds "cpu" with a fake event class)
 DEVICE_TYPES = ("cuda",)
 _STATE = {"on": None, "cur": None, "pending": [], "fwd": 0, "dropped": 0}
@@ -58,7 +68,8 @@ def reset_for_tests() -> None:
 class Record:
     """One forward's EM layers on this rank (device counters + timing events)."""
 
-    __slots__ = ("fwd", "stream", "start", "end", "pairs", "counter", "layers", "waves", "tokens", "host", "done")
+    __slots__ = ("fwd", "stream", "start", "end", "pairs", "counter", "layers", "waves", "tokens", "host", "done",
+                 "wave_copy", "wave_apply", "last_copy_end")
 
     def __init__(self, fwd: int, device, cuda):
         import torch
@@ -69,7 +80,11 @@ class Record:
         self.start.record()
         self.end = None
         self.pairs: List[tuple] = []
-        self.counter = torch.zeros(2, dtype=torch.int64, device=device)  # [rows, bytes]
+        # [rows, bytes, served lanes of wave 1 .. MAX_WAVES] (F3)
+        self.counter = torch.zeros(2 + MAX_WAVES, dtype=torch.int64, device=device)
+        self.wave_copy: dict = {}   # F3: wave -> [(copy start, copy end)]
+        self.wave_apply: dict = {}  # F3: wave -> [(copy end, apply end)]
+        self.last_copy_end = None
         self.layers = 0
         self.waves = 0
         self.tokens = 0
@@ -81,17 +96,33 @@ class Record:
         ev.record()
         return ev
 
-    def copied(self, e0, gather_count, row_bytes: int) -> None:
+    def copied(self, e0, gather_count, row_bytes: int, wave: int = 0) -> None:
         """After one wave's ``copy_rows``: close its timing pair, add its rows and bytes (device ops only)."""
         import torch
 
         e1 = _cuda().Event(enable_timing=True)
         e1.record()
         self.pairs.append((e0, e1))
+        if wave > 0:
+            self.wave_copy.setdefault(min(int(wave), MAX_WAVES), []).append((e0, e1))
+            self.last_copy_end = e1
         self.waves += 1
         n = gather_count.reshape(-1)[:1].to(torch.int64)
         self.counter[0:1].add_(n)
         self.counter[1:2].add_(n * int(row_bytes))
+
+    def applied(self, wave: int, served) -> None:
+        """F3: after one wave's apply slices -- its device time (copy end -> now) and its served lanes (a device
+        sum into the counter; no host read)."""
+        import torch
+
+        e2 = _cuda().Event(enable_timing=True)
+        e2.record()
+        w = min(max(1, int(wave)), MAX_WAVES)
+        if self.last_copy_end is not None:
+            self.wave_apply.setdefault(w, []).append((self.last_copy_end, e2))
+            self.last_copy_end = None
+        self.counter[1 + w:2 + w].add_(served.reshape(-1).to(torch.int64).sum().reshape(1))
 
     def end_layer(self, tokens: int) -> None:
         ev = _cuda().Event(enable_timing=True)
@@ -136,7 +167,7 @@ def _close_current(cuda) -> None:
     _STATE["cur"] = None
     if rec is None or rec.end is None:
         return
-    rec.host = torch.empty(2, dtype=torch.int64, pin_memory=bool(torch.cuda.is_available()))
+    rec.host = torch.empty(int(rec.counter.numel()), dtype=torch.int64, pin_memory=bool(torch.cuda.is_available()))
     rec.done = cuda.Event()
     # review A1: behind the counter's adds and the end event in stream order (the funnel runs on the
     # schedule stream, the EM work on the forward stream)
@@ -156,9 +187,26 @@ def line_of(rec: Record) -> str:
     rows, nbytes = int(rec.host[0]), int(rec.host[1])
     gbps = (nbytes / (copy_ms / 1000.0) / 1e9) if copy_ms > 0 else 0.0
     return ("%s fwd=%d T=%d layers=%d waves=%d rows=%d gib=%.3f copy_ms=%.1f em_ms=%.1f link_gbps=%.2f "
-            "dropped=%d (device time of this forward's EAGER-DEVICE-EM row copies vs the whole EM span; rank-local)"
+            "dropped=%d (device time of this forward's EAGER-DEVICE-EM row copies vs the whole EM span; rank-local)%s"
             % (MARK, rec.fwd, rec.tokens, rec.layers, rec.waves, rows, nbytes / float(1 << 30), copy_ms, em_ms,
-               gbps, _STATE["dropped"]))
+               gbps, _STATE["dropped"], wave_terms(rec)))
+
+
+def wave_terms(rec: Record) -> str:
+    """F3: `` wave_copy_ms=a/b wave_apply_ms=a/b wave_served=a/b`` over the wave indices seen ('' when none)."""
+    waves = sorted(set(getattr(rec, "wave_copy", {}) or {}) | set(getattr(rec, "wave_apply", {}) or {}))
+    if not waves:
+        return ""
+
+    def _ms(pairs):
+        return sum(float(a.elapsed_time(b)) for a, b in pairs)
+
+    host = rec.host
+    served = [int(host[1 + w]) if host is not None and 1 + w < len(host) else 0 for w in waves]
+    return (" wave_copy_ms=%s wave_apply_ms=%s wave_served=%s"
+            % ("/".join("%.1f" % _ms(rec.wave_copy.get(w, ())) for w in waves),
+               "/".join("%.1f" % _ms(rec.wave_apply.get(w, ())) for w in waves),
+               "/".join(str(x) for x in served)))
 
 
 def drain() -> int:

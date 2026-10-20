@@ -381,6 +381,129 @@ def departed_experts(row_key: Sequence[int], row_use: Sequence[int],
     return [e for _u, e in sorted(gone, key=lambda p: -p[0])]
 
 
+def _hot_put(hot, idx, vals, E: int, mask) -> None:
+    """F3: ``hot[idx[i]] = vals[i]`` where ``mask[i]`` -- on the device, no host read, no boolean indexing
+    (that would read the mask's count back). Masked-out lanes write into a dump slot ``E`` of a scratch copy."""
+    import torch
+
+    ext = torch.cat([hot, hot.new_full((1,), -1)])
+    ext.index_put_((torch.where(mask, idx.to(torch.int64), torch.full_like(idx, E, dtype=torch.int64)),),
+                   vals.to(ext.dtype))
+    hot.copy_(ext[: int(E)])
+
+
+def coldest_first_pairs_device(tables: PoolTables, lo: int, hi: int):
+    """F3: :func:`coldest_first_moves` ON THE DEVICE -- the same pairs, as fixed-length tensors
+    ``(src, dst, take)``: ``take`` marks the moves (a prefix: the host loop's ``break``), the other lanes
+    are no-ops. Stable sorts keep the host order (hottest source first; free rows in row order, then held rows
+    coldest first). No host read."""
+    import torch
+
+    E, lru = int(tables.num_experts), int(tables.lru_start)
+    key, use = tables.row_key, tables.row_use
+    dev = key.device
+    m = min(int(hi) - int(lo), int(lo) - lru)
+    if m <= 0:
+        return None
+    BIG = 1 << 62
+    kd, ud = key[lo:hi].to(torch.int64), use[lo:hi].to(torch.int64)
+    vs = (kd >= 0) & (kd < E)
+    o_s = torch.sort(torch.where(vs, -ud, torch.full_like(ud, BIG)), stable=True).indices
+    src, src_ok = int(lo) + o_s, vs.index_select(0, o_s)
+    kk, uk = key[lru:lo].to(torch.int64), use[lru:lo].to(torch.int64)
+    clock = tables.clock.reshape(-1)[:1].to(torch.int64)
+    free = kk == -1
+    held = (kk >= 0) & (kk < E) & (uk < clock)
+    idx = torch.arange(int(lo) - lru, device=dev, dtype=torch.int64)
+    o_d = torch.sort(torch.where(free, idx - BIG, torch.where(held, uk, torch.full_like(uk, BIG))),
+                     stable=True).indices
+    dst, dst_ok = lru + o_d, (free | held).index_select(0, o_d)
+    s_, d_ = src[:m], dst[:m]
+    ok = src_ok[:m] & dst_ok[:m] & ((key.index_select(0, d_) == -1)
+                                    | (use.index_select(0, d_).to(torch.int64)
+                                       < use.index_select(0, s_).to(torch.int64)))
+    take = torch.cumprod(ok.to(torch.int64), 0).bool()
+    return s_, d_, take
+
+
+def apply_row_moves_device(tables: PoolTables, src, dst, take) -> None:
+    """F3: :func:`apply_row_moves` on the device for the ``take`` lanes (the bytes already copied)."""
+    import torch
+
+    E = int(tables.num_experts)
+    key, use, hot = tables.row_key, tables.row_use, tables.hot_phys
+    old_d = key.index_select(0, dst).to(torch.int64)
+    e_s = key.index_select(0, src).to(torch.int64)
+    u_s, u_d = use.index_select(0, src), use.index_select(0, dst)
+    owned = hot.index_select(0, old_d.clamp(0, E - 1)).to(torch.int64) == dst
+    _hot_put(hot, old_d, torch.full_like(old_d, -1), E, take & (old_d >= 0) & (old_d < E) & owned)
+    _hot_put(hot, e_s, dst, E, take & (e_s >= 0) & (e_s < E))
+    key.index_copy_(0, dst, torch.where(take, e_s.to(key.dtype), old_d.to(key.dtype)))
+    use.index_copy_(0, dst, torch.where(take, u_s, u_d))
+    key.index_copy_(0, src, torch.where(take, torch.full_like(e_s, -1).to(key.dtype), e_s.to(key.dtype)))
+    pf = getattr(tables, "pf_row", None)
+    if pf is not None:
+        pf.index_copy_(0, dst, torch.where(take, torch.full_like(pf.index_select(0, dst), -1),
+                                           pf.index_select(0, dst)))
+
+
+def seat_rows_off_device(tables: PoolTables, k: int, *, move_rows=None, recall=None) -> int:
+    """F3: :func:`set_seat_rows_on`'s SHRINK with ``device_write=True`` -- byte for byte the same tables, but
+    no ``.cpu()``: the coldest-first pairs, the moves, the ``hot_phys`` drops and the OFF writes are device ops
+    on the current stream (the caller's ROW-FENCE orders them). ``move_rows(src, dst)`` copies the bytes of
+    fixed-length pairs (no-op lanes copy a row onto itself). ``recall(keys_before, uses_before, hot_after)``
+    gets device snapshots (the warm refill's ``departed_experts`` input, read back later without a wait).
+    Returns the previous k. A grow (``k >= seat_on``) is :func:`set_seat_rows_on`'s, unchanged."""
+    import torch
+
+    k = int(k)
+    X = int(tables.seat_rows)
+    if not 0 <= k <= X:
+        raise ValueError(f"seat rows on {k} outside [0, {X}]")
+    old = int(tables.seat_on)
+    if k >= old:
+        return set_seat_rows_on(tables, k, device_write=True)
+    tables.seat_on = k
+    base = int(tables.seat_base)
+    lo, hi = base + k, base + old
+    E, lru = int(tables.num_experts), int(tables.lru_start)
+    snap = (tables.row_key[lru:].clone(), tables.row_use[lru:].clone()) if recall is not None else None
+    if move_rows is not None:
+        pairs = coldest_first_pairs_device(tables, lo, hi)
+        if pairs is not None:
+            s_, d_, take = pairs
+            move_rows(torch.where(take, s_, d_), d_)
+            apply_row_moves_device(tables, s_, d_, take)
+    keys = tables.row_key[lo:hi].to(torch.int64)
+    rows = torch.arange(lo, hi, device=keys.device, dtype=torch.int64)
+    valid = (keys >= 0) & (keys < E)
+    cur = tables.hot_phys.index_select(0, keys.clamp(0, E - 1)).to(torch.int64)
+    _hot_put(tables.hot_phys, keys, torch.full_like(keys, -1), E, valid & (cur == rows))
+    if snap is not None:
+        recall(snap[0], snap[1], tables.hot_phys.clone())
+    tables.row_key[lo:hi].fill_(SEAT_OFF_KEY)
+    tables.row_use[lo:hi].fill_(ROW_USE_NEVER)
+    tables.pf_row[lo:hi].fill_(-1)
+    return old
+
+
+def commit_warm_rows_masked(tables: PoolTables, experts, rows, valid) -> None:
+    """F3: :func:`commit_warm_rows` for the ``valid`` lanes only (an expert without a store row, or an
+    expert a step made hot meanwhile, leaves its reserved row FREE). Device writes, no host read."""
+    import torch
+
+    E = int(tables.num_experts)
+    hot = tables.hot_phys
+    ex = experts.to(torch.int64)
+    ok = valid & (ex >= 0) & (ex < E) & (hot.index_select(0, ex.clamp(0, E - 1)) < 0)
+    _hot_put(hot, ex, rows.to(torch.int64), E, ok)
+    key = tables.row_key
+    key.index_copy_(0, rows, torch.where(ok, ex.to(key.dtype), torch.full_like(ex, -1).to(key.dtype)))
+    use = tables.row_use
+    clk = tables.clock.reshape(-1)[:1].to(use.dtype).expand(rows.numel())
+    use.index_copy_(0, rows, torch.where(ok, clk, torch.zeros_like(clk)))
+
+
 def set_seat_rows_on(tables: PoolTables, k: int, *, device_write: bool = True,
                      move_rows=None, departed_out: Optional[List[int]] = None) -> int:
     """H95c: turn the first ``k`` seat rows ON (ordinary free LRU rows) and

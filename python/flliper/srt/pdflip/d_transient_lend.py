@@ -507,23 +507,143 @@ def after_phase_move(sched, ctl, rows_before: int) -> None:
         pass
 
 
+#: F3: the lend's map on the helper thread (None = auto: on with a CUDA context; CPU desk ranks map inline)
+ASYNC_LEND: Optional[bool] = None
+#: F3: the gate's view of an in-flight lend (card_free, floor, budget) for its line at the finish
+PENDING_ATTR = "_pdflip_d_lend_pending"
+
+
+def async_lend_on() -> bool:
+    if ASYNC_LEND is not None:
+        return bool(ASYNC_LEND)
+    try:
+        import torch
+
+        return bool(torch.cuda.is_available() and torch.cuda.is_initialized())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _log_lend_done(sched, ctl, done: Optional[dict], how: str) -> None:
+    """F3: the finished lend's line (the S78/S93 shape plus map/join/on ms) and its gap note: what the
+    SCHEDULER thread spent (join + rows ON), not the map, which ran beside the decode."""
+    if not done:
+        return
+    pend = getattr(sched, PENDING_ATTR, None) or (0, 0, 0)
+    try:
+        setattr(sched, PENDING_ATTR, None)
+    except Exception:  # noqa: BLE001
+        pass
+    if int(done.get("rows", 0)) <= 0:
+        return
+    host_ms = float(done.get("join_ms", 0.0)) + float(done.get("on_ms", 0.0))
+    _gate(sched).last_keep = None
+    _gap_note(sched, "lend", host_ms)
+    logger.info("%s rank=%d lend rows_on %d->%d card_free_mib=%d floor_mib=%d budget_mib=%d "
+                "lent_total=%d returned_total=%d ms=%.0f map_ms=%.0f join_ms=%.0f (%s; F3: the map ran on the "
+                "helper thread, the rows went ON after it)", MARK, _rank(sched), int(done["before"]),
+                int(done["after"]), int(pend[0]) // MIB, int(pend[1]), int(pend[2]) // MIB, ctl.lent_rows,
+                ctl.returned_rows, host_ms, float(done.get("map_ms", 0.0)), float(done.get("join_ms", 0.0)), how)
+
+
+def _register_streams(sched) -> None:
+    """F3: the scheduler's forward stream reads the bank rows (the overlap loop's forward_stream)."""
+    try:
+        from flliper.srt.pdflip.d_row_fence import register_row_stream
+
+        register_row_stream(getattr(sched, "forward_stream", None))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def poll(sched, ctl=None) -> None:
+    """F3, once per pass (top of ``round_start``): a lend whose map finished goes ON, the deferred unmaps
+    whose ROW-FENCE completed go, the warm copies that landed are committed -- event queries and a done
+    future only, never a wait."""
+    try:
+        _register_streams(sched)
+        if ctl is None:
+            ctl = _controller(sched)
+        if ctl is None:
+            return
+        done = getattr(ctl, "lend_done", None)
+        if done is not None:
+            ctl.lend_done = None
+            _log_lend_done(sched, ctl, done, "landed in a move")
+        if getattr(ctl, "lend_job", None) is not None:
+            t0 = time.perf_counter()
+            done = ctl.finish_lend(block=False)
+            if done is not None:
+                done["on_ms"] = (time.perf_counter() - t0) * 1000.0
+                _log_lend_done(sched, ctl, done, "map done")
+        if getattr(ctl, "pending_releases", None):
+            ctl.drain_releases(block=False)
+        from flliper.srt.pdflip.d_row_fence import poll_warm
+
+        poll_warm()
+    except Exception:  # noqa: BLE001 -- the poll is advice; the next move settles
+        logger.debug("%s poll skipped", MARK, exc_info=True)
+
+
+def _bytes_now(sched, ctl, why: str) -> None:
+    """F3: an extend (or its width vote) needs the returned bytes in THIS pass -- the deferred unmaps go now,
+    waiting on their ROW-FENCE's E1 alone (the rows' last readers: the forward in flight). The wait overlaps
+    that forward on the device; the line names it."""
+    if not getattr(ctl, "pending_releases", None):
+        return
+    ms = ctl.drain_releases(block=True)
+    _gap_note(sched, "lend_return", ms)
+    if ms >= 1.0:
+        logger.info("%s rank=%d fence-wait ms=%.1f (%s: E1 of the return's ROW-FENCE only -- never device-wide)",
+                    MARK, _rank(sched), ms, why)
+
+
+def quiesce_for_sleep(sched) -> None:
+    """F3: before D sleeps (the bank pauses): an in-flight lend's map is joined and landed, every deferred
+    unmap goes (E1), every warm copy lands (its own event) -- nothing of the bank moves under the pause.
+    Rank-local; the sleep is the group's verdict."""
+    from flliper.srt.pdflip import d_seat_vram as dsv
+    from flliper.srt.pdflip.d_row_fence import quiesce_warm
+
+    try:
+        ctl = dsv.controller(sched)
+    except Exception:  # noqa: BLE001
+        ctl = None
+    if ctl is not None:
+        ctl.settle()
+        ctl.lend_done = None
+    quiesce_warm()
+
+
 def round_start(sched) -> Optional[str]:
     """Top of ``get_next_batch_to_run``: extend work pending -> the lend goes
     back BEFORE the round's width vote and EXTEND-TRIM read the card (S78: only
-    the short extend's price when all pending work is short)."""
+    the short extend's price when all pending work is short). F3: first the pass's poll; with extend work
+    pending an in-flight lend is joined (its map thread) and landed, and the returned cells go before the
+    width vote reads the card (``_bytes_now``: E1 only)."""
     ctl = _controller(sched)
+    poll(sched, ctl)
     if ctl is None:
         return None
     trigger = pending_trigger(sched)
     if trigger is None:
         return None
     _gate(sched).streak = 0
+    if getattr(ctl, "lend_job", None) is not None:
+        t0 = time.perf_counter()
+        done = ctl.finish_lend(block=True)
+        if done is not None:
+            done["on_ms"] = (time.perf_counter() - t0) * 1000.0 - float(done.get("join_ms", 0.0))
+            _log_lend_done(sched, ctl, done, "joined: extend pending")
     if ctl.lent_from is None:
         return None
     rows = short_pending_rows(sched) if keep_short_on() else None
     if rows is not None:
-        return _keep_short(sched, ctl, rows, "short extend pending %s" % trigger)
-    return _give_back(sched, ctl, "extend pending %s" % trigger)
+        out = _keep_short(sched, ctl, rows, "short extend pending %s" % trigger)
+    else:
+        out = _give_back(sched, ctl, "extend pending %s" % trigger)
+    _bytes_now(sched, ctl, "the pending extend's width vote")
+    return out
 
 
 def on_batch(sched, batch) -> Optional[str]:
@@ -542,6 +662,10 @@ def on_batch(sched, batch) -> Optional[str]:
     verdict = gate.step(kind)
     rank = _rank(sched)
     if verdict == "return":
+        if getattr(ctl, "lend_job", None) is not None:
+            done = ctl.finish_lend(block=True)  # F3: the extend's bytes -- the map thread lands first
+            _log_lend_done(sched, ctl, done, "joined: before the extend")
+        out, priced = None, False
         if keep_short_on() and ctl.lent_from is not None:
             # S78: the built extend's exact rows price it; a decode batch with a
             # waiting queue reprices the pending work (big/unpriced: full return)
@@ -549,10 +673,17 @@ def on_batch(sched, batch) -> Optional[str]:
             if rows is None:
                 rows = short_pending_rows(sched)
             if rows is not None:
-                return _keep_short(sched, ctl, rows, "before the short extend")
-        return _give_back(sched, ctl, "before the extend")
+                priced = True
+                out = _keep_short(sched, ctl, rows, "before the short extend")
+        if not priced:
+            out = _give_back(sched, ctl, "before the extend")
+        if batch_kind(batch) == "extend":
+            _bytes_now(sched, ctl, "the built extend allocates next")
+        return out
     if verdict != "lend":
         return None
+    if getattr(ctl, "lend_job", None) is not None:
+        return None  # F3: one lend in flight (its map thread runs; poll lands it)
     topup = ctl.lent_from is not None
     if topup and not gate.topup:
         return None  # one lend per settle (a full lend stays as it is)
@@ -563,6 +694,19 @@ def on_batch(sched, batch) -> Optional[str]:
         return None
     budget = lend_budget_bytes(free, floor)
     before = int(ctl.rows_on)
+    if async_lend_on() and hasattr(ctl, "start_lend"):
+        # F3: the map (cuMem* per cell) runs on the helper thread; the rows go ON at a later pass's poll
+        aim, ms = _timed(ctl.start_lend, budget)
+        if aim <= 0:
+            return None
+        try:
+            setattr(sched, PENDING_ATTR, (free, floor, budget))
+        except Exception:  # noqa: BLE001
+            pass
+        logger.info("%s rank=%d lend-start rows_on %d->%d (map on the helper thread) card_free_mib=%d "
+                    "floor_mib=%d budget_mib=%d ms=%.0f", MARK, rank, before, before + int(aim), free // MIB,
+                    int(floor), budget // MIB, ms)
+        return "lend"
     n, ms = _timed(ctl.lend, budget)
     if n:
         gate.last_keep = None
