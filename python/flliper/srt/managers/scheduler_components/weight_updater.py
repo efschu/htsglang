@@ -4721,12 +4721,35 @@ class SchedulerWeightUpdaterManager:
         if tc is None:
             self.flush_cache(zero_kv=False)
             return 0
+        if self._pdflip_group_name() == "D" and getattr(sch, "enable_hierarchical_cache", False):
+            # S86 (rc19 D 05:37:22-23, three park-end chains dropped un-backed): the pages L3 holds give their
+            # tree references back on every rank, agreed, BEFORE the flush's #1470 loop claims room (every rank,
+            # this point, a rank-uniform gate: group, HiCache, the switch inside)
+            self._pdflip_sleep_l3_release(sch, tc)
         return sleep_flush_until_reset(
             flush=lambda: self.flush_cache(zero_kv=False),
             tree=tc,
             drain=self._pdflip_drain_hicache_before_sleep,
             log=logger,
         )
+
+    def _pdflip_sleep_l3_release(self, sch, tc) -> dict:
+        """S86 SLEEP-L3-RELEASE (``pdflip/sleep_l3_release.py``): every rank of group D, after the group drain and
+        before the sleep flush. A release the group made voids the quiesce's no-progress memo (the #1470 loop must
+        run again: the slots it found pinned are unreferenced now). Never raises past the step."""
+        from flliper.srt.managers import pdflip_flush_nonblock as _fnb
+        from flliper.srt.pdflip import sleep_l3_release as _s86
+
+        try:
+            res = _s86.run(tc)
+        except _s86.SleepL3ReleaseDivergence:
+            raise   # review S86 A1: the ranks are not one -- the group stops by name, it never flushes on
+        except Exception:  # noqa: BLE001 - only before the first collective (run converts every later one): as before
+            logger.warning("%s raised: the sleep flush runs without it", _s86.MARK, exc_info=True)
+            return {}
+        if int(res.get("group_released", 0) or 0) > 0:
+            _fnb.sweep_memo_clear(sch)
+        return res
 
     def _pdflip_hold_owned_prefetch(self) -> frozenset:
         """H91e: the open prefetch records of the #1443 dormant hold (empty

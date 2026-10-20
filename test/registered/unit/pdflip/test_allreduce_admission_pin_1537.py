@@ -633,3 +633,65 @@ def test_p7_chunked_rest_reads_only_the_prefix_length_and_the_fill_boundary():
     src = ast.unparse(fn)
     for banned in ("tp_rank", "pp_rank", "distributed", "group_min", "get_rank"):
         assert banned not in src, banned
+
+
+# --------------------------------------------------------------------------
+# P8  the S86 sleep-leg collectives (review S86 A2): pdflip/sleep_l3_release.py posts its three group
+#     reductions through ``hicache_group_max`` -- outside scheduler.py and outside the three helpers above, so
+#     P1-P6 cannot see them. Pinned here: which calls, in which order, behind which guard, and the one caller.
+# --------------------------------------------------------------------------
+
+S86_PATH = SRT / "pdflip" / "sleep_l3_release.py"
+S86_EXPECTED = {
+    "run": [("s86_sleep_l3_release/slots", [])],
+    "_after_first_collective": [("s86_sleep_l3_release/veto", []), ("s86_sleep_l3_release/digest", [])],
+}
+
+
+def _s86_group_calls() -> dict:
+    tree = _tree(S86_PATH)
+    parent = _parents(tree)
+    out = {}
+    for fn in [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]:
+        for c in ast.walk(fn):
+            if isinstance(c, ast.Call) and _chain(c.func).split(".")[-1] in ("group_max", "hicache_group_max"):
+                label = next((k.value.value for k in c.keywords if k.arg == "label"
+                              and isinstance(k.value, ast.Constant)), None)
+                out.setdefault(fn.name, []).append((c.lineno, label, _guards(c, fn, parent)))
+    return {k: [(lab, g) for _ln, lab, g in sorted(v)] for k, v in out.items()}
+
+
+def test_p8_s86_posts_exactly_three_collectives_in_order_with_no_local_guard():
+    assert _s86_group_calls() == S86_EXPECTED, _s86_group_calls()
+
+
+def test_p8_s86_the_only_early_return_after_the_first_collective_reads_the_reduced_slot_count():
+    fn = _find_fn(_tree(S86_PATH), "run")
+    src = ast.unparse(fn)
+    i = src.index("label='s86_sleep_l3_release/slots'")
+    after = src[i:]
+    # the reduced value, never the rank's own ``mine``, decides whether the next two collectives come
+    assert "n_slots = int(n_slots)" in after and "if n_slots <= 0:" in after
+    assert "if mine" not in after.split("_after_first_collective")[0], "a local value gates the next collectives"
+    # every exception after the first collective becomes the named stop (review A1)
+    assert "except SleepL3ReleaseDivergence:" in after and "raise SleepL3ReleaseDivergence(" in after
+
+
+def test_p8_s86_has_one_caller_behind_a_rank_uniform_gate():
+    refs = []
+    for path in SRT.rglob("*.py"):
+        if path == S86_PATH:
+            continue
+        tree_ = _tree(path) if "sleep_l3_release" in path.read_text(encoding="utf-8", errors="replace") else None
+        if tree_ is not None and any(isinstance(n, (ast.Import, ast.ImportFrom)) and any(
+                "sleep_l3_release" in (a.name or "") for a in n.names) for n in ast.walk(tree_)):
+            refs.append(path.relative_to(SRT).as_posix())    # importers only (a comment names it too: environ.py)
+    assert refs == ["managers/scheduler_components/weight_updater.py"], refs
+    tree = _tree(SRT / "managers" / "scheduler_components" / "weight_updater.py")
+    parent = _parents(tree)
+    fn = _find_fn(tree, "_pdflip_sleep_flush")
+    calls = [c for c in ast.walk(fn) if isinstance(c, ast.Call) and _chain(c.func) == "self._pdflip_sleep_l3_release"]
+    assert len(calls) == 1
+    assert _guards(calls[0], fn, parent) == [
+        "If:self._pdflip_group_name() == 'D' and getattr(sch, 'enable_hierarchical_cache', False)"], \
+        _guards(calls[0], fn, parent)
