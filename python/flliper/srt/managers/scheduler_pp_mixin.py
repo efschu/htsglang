@@ -57,6 +57,7 @@ from flliper.srt.layers.dp_attention import (
 )
 from flliper.srt.managers import pp_admission_bulletin as pp_bulletin
 from flliper.srt.managers.overlap_utils import RelayPayload
+from flliper.srt.pdflip import pp_chain_announce as _pp_w2c  # W2C C2/C3 (20.10.)
 from flliper.srt.managers.pp_wire_channels import (
     CHAN_DICT,
     CHAN_REQ,
@@ -6198,7 +6199,12 @@ class SchedulerPPMixin:
                                 # its own receive, and every rank forwards
                                 # whatever it holds. None on a rank that
                                 # learned nothing this pass.
-                                load_back=getattr(self, "_pp_load_back_wire", None),
+                                # W2C C2/V2 (pdflip/pp_chain_announce.py): PP0
+                                # announces its next chain in this frame, a
+                                # middle rank relays the announcement.
+                                load_back=_pp_w2c.proxy_extra(
+                                    self, mb_id, getattr(self, "_pp_load_back_wire", None)
+                                ),
                             )
                         if _pov.p_host_overlap_on():
                             _pov.note_proxy_send(self, self.send_proxy_work)
@@ -6987,6 +6993,8 @@ class SchedulerPPMixin:
                 # PP0 serves its own order AFTER the send: the followers start theirs at once
                 _das_trim.execute(self, _arena_trim_cmd)
                 _pp_seg(self, "in.arena_trim")
+            if self.pp_group.is_first_rank:
+                _pp_w2c.pp0_after_chain_send(self)  # W2C: the announced chain k is on the wire
             # NOTE: no blocking commit here, deliberately. Committing the
             # arm-carrying send in-pass is corpse B' (boot 13): this rank
             # blocked in _pp_commit_comm_work while its peers sat in the
@@ -10261,6 +10269,12 @@ class SchedulerPPMixin:
             return True
         epoch = pp_flip_epoch_of(self)
         if pp_proxy_stamp_names_pass(stamp, mb_id, epoch):
+            # W2C C3 (pdflip/pp_chain_announce.py): the frame announces PP0's next chain (a read-ahead this rank acks
+            # before the row). Left in the inbox until this rank absorbed it -- no receive here, the counter-gated
+            # chain receive at the loop top takes it once posted; past the readiness budget a named #789 stop (V4).
+            if _pp_w2c.follower_defer(self, mb_id, head):
+                _trace("w2c_chain_announced")
+                return False
             # THE FRAME MUST NOT OVERTAKE ITS REQUESTS (boot 631row14,
             # ROW-DELIVER d2: frame consumed with queue=0 -- the request
             # chain hop and the proxy frame travel on two wires with no
@@ -11716,6 +11730,9 @@ class SchedulerPPMixin:
         # entry SURVIVES THE WIRE; it does not show one is safe to compute
         # on.
         stamp = raw.pop("__stamp__", None) if isinstance(raw, dict) else None
+        # W2C (pdflip/pp_chain_announce.py): the announcement is popped under the same law as the stamp (an int left
+        # in the dict would reach the slice path) and kept for this rank's relay of the slot (V2).
+        _pp_w2c.note_frame(self, mb_id, raw)
         # FIXES Nr. 45 PP-VOID-PASS: a VOID frame (the upstream stage discarded this pass) carries no hidden states. The
         # statement is popped here (before anything maps over the dict); the identity check below (slot, epoch) judges the
         # void frame like any frame, and only after it the statement is handed to the event loop
