@@ -657,6 +657,8 @@ class HybridCacheController(BaseHiCacheController):
             )
 
     def reset(self):
+        # S108: a turn-end copy still on the copier would write into the pools reset() clears
+        self._s108_join()
         super().reset()
         if self.enable_storage:
             self.host_mem_release_queue.queue.clear()
@@ -692,7 +694,10 @@ class HybridCacheController(BaseHiCacheController):
         # cutover: below the row count it copies another token's KV under this
         # request's key, above it the kernel's slice clamps to empty and the
         # copy dies with a bare tensor-size RuntimeError.
-        if self._refuse_unaddressable_kv_rows(device_indices, "write"):
+        # S108: a turn-end op (``_s108_defer_issue``) asks the #923 question on the copier thread,
+        # exactly and before its copy (``_s108_issue``) -- here it would read the device rows.
+        if not self.__dict__.get("_s108_defer_issue", False) and self._refuse_unaddressable_kv_rows(
+                device_indices, "write"):
             return None
         if host_indices is None:  # #1427: a direct write brings its arena slots along
             host_indices = self.mem_pool_host.alloc(len(device_indices))
@@ -730,6 +735,9 @@ class HybridCacheController(BaseHiCacheController):
         # a write-back queued before a cutover is consumed after it, which is
         # the shape this file's own #760 note describes.
         if not consume_gate(self, "write_queue", "write"):
+            return
+        if self.__dict__.get("_s108_defer_issue", False):
+            self._s108_submit()   # S108: a finished turn's copy -- the copier issues it, not this thread
             return
         op = CacheOperation.merge_ops(self.write_queue)
         # H2: the op's host cost is timed; `busy` = the compute stream still
@@ -823,6 +831,131 @@ class HybridCacheController(BaseHiCacheController):
                             "recurrent-state D2H; switch FLLIPER_PDFLIP_MAMBA_SNAPSHOT_FENCE)", n_f)
         self.ack_write_queue.append(HiCacheAck(start_event, finish_event, op.node_ids))
         clock.finish(device=on_card, reason=refusal)
+
+    # ---------------------------------------------------------------- S108 turn end
+    def _s108_submit(self) -> None:
+        """S108, scheduler thread: hand the queued turn-end op to the copier.
+
+        Host work only: merge the queue, record ONE event on the current (compute) stream --
+        asynchronous, it waits for nothing -- and queue the ack. No device value is read, no
+        stream or event is waited on, no lock is taken (``SimpleQueue.put`` never blocks)."""
+        from flliper.srt.pdflip import d_turn_end_l2 as _te
+
+        op = CacheOperation.merge_ops(self.write_queue)
+        self.write_queue.clear()
+        start_event = device_module.Event()
+        start_event.record()
+        done = _te.DoneEvent(tag=str(self.__dict__.get("_s108_tag", "")))
+        self.ack_write_queue.append(HiCacheAck(start_event, done, op.node_ids))
+        self._s108_ops_submitted = self.__dict__.get("_s108_ops_submitted", 0) + 1
+        _te.copier_of(self).submit(self._s108_issue, op, start_event, done)
+
+    def _s108_issue(self, op: CacheOperation, start_event, done) -> None:
+        """S108, COPIER THREAD: the issue ``start_writing`` does inline, for one turn-end op.
+
+        Everything runs on the write stream behind ``start_event`` (the compute stream's work at
+        the turn end), so the owner rows, the #923 check and the direct backend's index moves --
+        the reads that would wait for the card -- wait in THIS thread only. No mamba fence: the
+        finished turn's anchor is the tree's copy-on-match slot (module docstring of
+        ``pdflip.d_turn_end_l2``). A #923 hit copies nothing and fails the op by name; the
+        scheduler thread raises it at its next ack poll."""
+        from flliper.srt.pdflip import d_turn_end_l2 as _te
+
+        t0 = time.perf_counter()
+        with device_module.stream(self.write_stream):
+            start_event.wait(self.write_stream)
+            # #923, exact (the inline write asks it before the commit; here the op is committed,
+            # so a hit is a named stop, never a silent copy from another token's row)
+            cap = self._kv_device_row_capacity()
+            if cap is not None and op.device_indices is not None and op.device_indices.numel():
+                _, rows = self._dcp_owned_device_rows(op.device_indices)
+                if rows.numel():
+                    lo_r, hi_r = int(rows.min()), int(rows.max())
+                    if lo_r < 0 or hi_r >= cap:
+                        self._unaddressable_kv_rows_refused = (
+                            getattr(self, "_unaddressable_kv_rows_refused", 0) + 1)
+                        raise _te.TurnEndCopyError(
+                            "#923 HICACHE write ROW OUT OF RANGE (S108 turn end): rows [%d, %d] of a "
+                            "pool with %d rows, owner ctx %s -- nothing was copied"
+                            % (lo_r, hi_r, cap, self._dcp_owner_ctx()))
+            t_wait = time.perf_counter()
+            refusal = self._device_index_write_refusal(op)
+            on_card = not refusal
+            if on_card or (
+                self.io_backend == "kernel"
+                and self.mem_pool_host.layout == "page_first"
+                and getattr(self.mem_pool_host, "can_use_write_back_jit", False)
+            ):
+                host_indices = op.host_indices
+                device_indices = op.device_indices
+                resolved_pool_transfers = op.pool_transfers
+            else:
+                host_indices, device_indices, resolved_pool_transfers = (
+                    self.move_hybrid_indices(op)
+                )
+            kv_host_indices, kv_device_indices = self._dcp_kv_transfer_pairs(
+                host_indices, device_indices
+            )
+            finish_event = device_module.Event()
+            if on_card:
+                self.mem_pool_host.backup_from_device_indices(
+                    self.mem_pool_device,
+                    kv_host_indices,
+                    kv_device_indices,
+                    pool_transfers=resolved_pool_transfers,
+                )
+            else:
+                self.mem_pool_host.backup_from_device_all_layer(
+                    self.mem_pool_device,
+                    kv_host_indices,
+                    kv_device_indices,
+                    self.io_backend,
+                    pool_transfers=resolved_pool_transfers,
+                )
+            if not on_card and self.draft_tier_armed("write") and host_indices.numel() > 0:
+                self.mem_pool_host_draft.backup_from_device_all_layer(
+                    self.mem_pool_device_draft,
+                    host_indices,
+                    _draft_device_rows(self.mem_pool_device_draft, device_indices, "write"),
+                    self.io_backend,
+                )
+            finish_event.record()
+            self._record_transfer_indices_on_stream(
+                self.write_stream, host_indices, device_indices, resolved_pool_transfers,
+            )
+            self._record_transfer_indices_on_stream(
+                self.write_stream, kv_host_indices, kv_device_indices
+            )
+        finish_event.synchronize()   # the copier waits for its own copy; nobody else does
+        done.kv_rows = int(kv_device_indices.numel()) if kv_device_indices is not None else 0
+        done.kv_bytes = done.kv_rows * self._s108_kv_row_bytes()
+        done.wait_ms = (t_wait - t0) * 1000.0
+        done.copy_ms = (time.perf_counter() - t0) * 1000.0
+        done.set_done(finish_event)
+        n = self._s108_ops_copied = self.__dict__.get("_s108_ops_copied", 0) + 1
+        if n <= 32 or n % 64 == 0:
+            logger.info("%s", _te.format_copy_line(done, n))
+
+    def _s108_kv_row_bytes(self) -> int:
+        """Bytes of one token row of this rank's device KV (every layer, K and V); 0 if unreadable."""
+        b = self.__dict__.get("_s108_row_bytes")
+        if b is not None:
+            return b
+        total = 0
+        try:
+            for name in ("k_buffer", "v_buffer"):
+                for t in getattr(self.mem_pool_device, name, None) or ():
+                    total += int(t[0].numel()) * int(t.element_size())
+        except Exception:  # noqa: BLE001 - an instrument
+            total = 0
+        self._s108_row_bytes = total
+        return total
+
+    def _s108_join(self, timeout: Optional[float] = 120.0) -> None:
+        """Reset/flush only: let the copier finish what it holds (never on the turn-end path)."""
+        c = self.__dict__.get("_s108_copier")
+        if c is not None and c.inflight > 0 and not c.join(timeout):
+            logger.error("S108 TURN-END-COPY join timed out with %d op(s) in flight", c.inflight)
 
     def _device_index_write_refusal(self, op: CacheOperation) -> str:
         """H2: "" = this write op goes out with its device indices on the card
