@@ -3715,6 +3715,8 @@ def _kv_compact_for_shrink(sched, ms, fr, want: int, end: bool, floor_tokens: in
        named refusal (nothing moved yet), no longer a crash-stop;
     3. N3 the MOVES' outcome as MIN/MAX: all moved -> go on; none moved (each
        rolled back) -> refused, nothing changed anywhere; mixed -> crash-stop;
+       S98c: any other exception in the move step enters as -1 (state unknown) ->
+       the named crash-stop on every rank, never a rank that skips the collective;
     4. only then the evictions (the d_seat_compact order: move first), outcome
        MIN/MAX: anything but "all evicted" -> crash-stop;
     5. the floor re-read (MAX)."""
@@ -3803,7 +3805,22 @@ def _kv_compact_for_shrink(sched, ms, fr, want: int, end: bool, floor_tokens: in
     except KC.CompactRefused as exc:   # rolled back on THIS rank
         logger.warning("%s n=%d moves refused here (rolled back): %s", KV_COMPACT_MARK, n, exc)
         ok = 0
+    except Exception as exc:  # noqa: BLE001 -- S98c review hint: never leave the peers waiting
+        # Anything else (e.g. the final allocator.free of the sources, outside the
+        # rollback) leaves THIS rank's state unknown -- nodes possibly re-pointed, sources
+        # not freed. The rank still enters the outcome collective, with -1: not 0, which
+        # means "rolled back cleanly" (a uniform 0 reads as "nothing moved anywhere").
+        # Any -1 in the group is the named crash-stop on EVERY rank, in the same pass --
+        # no rank leaves before the collective, so no peer hangs to the gloo timeout.
+        logger.error("%s n=%d moves FAILED here (state unknown, not rolled back): %s: %s",
+                     KV_COMPACT_MARK, n, type(exc).__name__, exc)
+        ok = -1
     lo, hi = _group_same(sched, ok)
+    if lo < 0:
+        raise PdFlipKvCompactDivergence(
+            "%s n=%d: the moves for S%d FAILED on a rank (here: %s) -- page placement there "
+            "is unknown and cannot be undone; every rank stops in the same pass" % (
+                KV_COMPACT_MARK, n, jj, {1: "moved", 0: "rolled back", -1: "failed"}[ok]))
     if lo != hi:
         raise PdFlipKvCompactDivergence(
             "%s n=%d: the moves for S%d went through on some ranks and were rolled back on "

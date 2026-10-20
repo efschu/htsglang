@@ -621,3 +621,92 @@ def test_an_eviction_that_frees_pages_below_the_floor_differs_by_those_pages(flo
 
 def _tokens_of(pages):
     return torch.tensor([p * PG + o for p in pages for o in range(PG)], dtype=torch.int64)
+
+
+# ---- (7) review S98c hint: an exception in the move step never leaves a peer waiting ----
+
+class _ThreeRankGroup:
+    """A real three-party collective on the desk: every rank thread deposits its vector,
+    waits for the other two (barrier with a timeout -- a rank that skips a collective
+    breaks it), and gets the element-wise MIN. Lengths must match, as in gloo."""
+
+    def __init__(self, n=3, timeout=15.0):
+        import threading
+
+        self.n, self.timeout = n, timeout
+        self.bar = threading.Barrier(n, timeout=timeout)
+        self.box = {}
+        self.calls = {}
+
+    def min_ints(self, rank):
+        def f(vals):
+            vals = [int(v) for v in vals]
+            self.box[rank] = vals
+            self.calls[rank] = self.calls.get(rank, 0) + 1
+            self.bar.wait()
+            lens = {len(v) for v in self.box.values()}
+            assert len(lens) == 1, "ranks entered a collective with unequal lengths %s" % lens
+            out = [min(col) for col in zip(*self.box.values())]
+            self.bar.wait()
+            return out
+        return f
+
+
+def test_a_rank_whose_source_free_throws_still_enters_the_outcome_collective(
+        floor_env, monkeypatch, caplog):
+    """Three rank threads, the real _kv_compact_for_shrink, a real 3-party collective.
+    TP1's final allocator.free of the sources raises RuntimeError (outside the rollback).
+    Every rank must enter the outcome collective (no hang to the gloo timeout) and every
+    rank must stop by name in the same pass."""
+    import threading
+
+    caplog.set_level(logging.INFO)
+    owners = {"TP0": (0, 0), "TP1": (S, CUT[1]), "TP2": (S, CUT[2])}
+    group = _ThreeRankGroup()
+    ranks = []
+    for name, form in (("TP0", _tp0), ("TP1", _tp1), ("TP2", _tp2)):
+        target, dw = form(monkeypatch)
+        alloc = _alloc(TOP // PG, PG)
+        alloc._kvcache = target
+        tree = Tree(alloc)
+        _take(alloc, list(range(1, 5000)))
+        _node(tree, alloc, list(range(6200, 6208)), PG, backed=True)
+        sched = types.SimpleNamespace(token_to_kv_pool_allocator=alloc, page_size=PG,
+                                      draft_worker=dw, tree_cache=tree,
+                                      _pdflip_group_min_ints=group.min_ints(name))
+        if name == "TP1":
+            real_free = alloc.free
+
+            def free(idx, _real=real_free, _n=[0]):
+                _n[0] += 1
+                raise RuntimeError("cudaErrorIllegalAddress (desk: TP1's source free)")
+            alloc.free = free
+        ranks.append((name, sched))
+    # the form helpers above patch kv_owner_block with their own rank's block; the
+    # threads need each rank's own one at the same time
+    monkeypatch.setattr(dsv, "kv_owner_block", lambda: owners[threading.current_thread().name])
+    ms = types.SimpleNamespace(stage=9, stage_tokens=list(FLOOR_LADDER),
+                               _smallest_holding=lambda floor: 9)
+    out = {}
+
+    def run(name, sched):
+        try:
+            dsv._kv_compact_for_shrink(sched, ms, {}, 8, True, FLOOR_LADDER[8] + PG)
+            out[name] = "returned"
+        except Exception as exc:  # noqa: BLE001 -- the outcome is the assertion
+            out[name] = exc
+
+    threads = [threading.Thread(target=run, args=r, name=r[0]) for r in ranks]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+    assert not any(t.is_alive() for t in threads), "a rank hangs"
+    for name, _s in ranks:
+        exc = out[name]
+        assert not isinstance(exc, threading.BrokenBarrierError), \
+            "%s waited for a peer that skipped the collective (the gloo-timeout hang)" % name
+        assert isinstance(exc, dsv.PdFlipKvCompactDivergence) and "FAILED on a rank" in str(exc), \
+            (name, exc)
+    assert group.calls["TP0"] == group.calls["TP1"] == group.calls["TP2"] == 3   # vote, digest, outcome
+    assert any("moves FAILED here" in m and "RuntimeError" in m for m in caplog.messages)
