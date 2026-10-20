@@ -260,7 +260,7 @@ def test_metal_2042_acks_landing_in_the_receive_admit_in_this_pass(pp0, monkeypa
     assert n["i"] >= 3
     st = cp.stats()
     assert st["n"] == 1 and st["acks"] == 1 and pp0._s82_park_ms >= 0.0
-    assert st.get("age_admit") == 1 and pp0._s82_park_admit is not None   # Prio = Alter: the twin ends in time
+    assert st.get("park_admit") == 1 and pp0._s82_park_admit is not None   # S103: PARK-ADMIT, A3 as instrument
 
 
 def test_output_first_is_the_pre_s82_pass(pp0, monkeypatch):
@@ -421,7 +421,7 @@ def test_a1_park_and_receive_share_one_deadline(pp0, monkeypatch):
     with pytest.raises(RuntimeError, match="READINESS TIMEOUT"):
         SchedulerPPMixin._pp_wait_for_dict_readiness(pp0, 0, kind="output")
     assert _time.monotonic() - t1 < 0.12                     # the rest of the shared budget, not 0.3 s more
-    assert RID in pp0._s82_hold                              # nothing admitted past the older output
+    assert getattr(pp0, "_s82_park_admit", None) is None     # 'bound': nothing became admissible, nothing admitted
 
 
 def test_a1_receive_without_park_keeps_its_own_budget(pp0, monkeypatch):
@@ -454,7 +454,9 @@ def test_a3_measured_prices_of_the_two_metal_cases():
         cp.reset_rings()
 
 
-def test_a3_metal_2016_the_younger_set_waits_for_the_older_output(pp0, monkeypatch):
+def test_s103_metal_2016_the_younger_set_runs_in_the_park_pass(pp0, monkeypatch):
+    """S103 replaces A3's hold: the four younger (2431 on 409472) are admitted while 8-74 is downstream --
+    A3 would have held them (price 3338 > 1754 left), the verdict rides along as an instrument only."""
     req = pp0.waiting_queue[0]
     req.origin_input_ids = list(range(409472 + 2431))
     pp0._pdflip_told_pacing[RID].told = 409472
@@ -470,25 +472,27 @@ def test_a3_metal_2016_the_younger_set_waits_for_the_older_output(pp0, monkeypat
 
     monkeypatch.setattr(fb, "pp0_harvest", harvest)
     out = told.pp0_publish(pp0, [])
-    assert _admits(out) == [] and RID in pp0._s82_hold and RID in pp0._pdflip_told_pacing
-    assert cp.stats().get("age_hold") == 1
-    # next pass: the older output was received and processed (slot 0 empty now) -> the Admit follows
-    pp0.mbs[0] = None
-    out2 = told.pp0_publish(pp0, [])
-    assert [a.rid for a in _admits(out2)] == [RID]
+    assert [a.rid for a in _admits(out)] == [RID] and _admits(out)[0].told == 409472
+    st = cp.stats()
+    assert st.get("park_admit") == 1 and st.get("a3_would_hold") == 1 and pp0._s82_park_admit is not None
 
 
-def test_a3_unmeasured_holds(pp0, monkeypatch):
+def test_s103_unmeasured_price_admits(pp0, monkeypatch):
+    """rc24 shape: no measured price yet (A3 'price-unmeasured', 9 of rc24's 14 verdicts) -> admitted all the same."""
     cp.reset_rings()                                          # no START-LOADING / downstream samples yet
     _acks_after(monkeypatch, pp0, k=3)
     out = told.pp0_publish(pp0, [])
-    assert _admits(out) == [] and RID in pp0._s82_hold
+    assert [a.rid for a in _admits(out)] == [RID]
+    assert cp.stats().get("a3_would_hold") == 1
 
 
-def test_a3_output_first_holds_the_acked_rid(pp0, monkeypatch):
+def test_s103_output_first_is_the_pre_s82_pass(pp0, monkeypatch):
+    """The owed output is posted before the acks: the park ends on 'output', nothing was admitted BY the park
+    and nothing is held either (A3's hold set is gone) -- the publish decides as before S82."""
     _acks_after(monkeypatch, pp0, k=4, ctr_post_at=2)         # output posted before the acks
     told.pp0_publish(pp0, [])
-    assert RID in pp0._s82_hold
+    assert cp.stats()["output"] == 1 and getattr(pp0, "_s82_park_admit", None) is None
+    assert not hasattr(pp0, "_s82_hold")
 
 
 def test_a3_after_commit_samples_and_output_late(pp0):
@@ -618,21 +622,150 @@ def _tolds(out):
     return [o for o in out if isinstance(o, told.PdFlipStoreTold)]
 
 
-def test_d9_a_single_phase_read_landing_in_the_park_is_held_when_the_older_comes_first(pp0, monkeypatch):
-    """D9: the non-paced told IS the admission -- a read that landed in the park is held like an ack."""
+def test_d9_a_single_phase_read_landing_in_the_park_is_admitted_in_this_pass(pp0, monkeypatch):
+    """D9 (S103): the non-paced told IS the admission -- a read that landed in the park is admitted like an ack."""
     _single_phase(pp0, monkeypatch)
-    cp.reset_rings()                                             # unmeasured -> the older set first
+    cp.reset_rings()                                             # unmeasured: A3 would have held it
     told._commit_park(pp0, [])
-    assert cp.stats()["read"] == 1 and RID in pp0._s82_hold
+    assert cp.stats()["read"] == 1 and cp.stats()["park_admit"] == 1 and cp.stats()["a3_would_hold"] == 1
 
 
-def test_d8_the_single_phase_publish_honours_the_hold(pp0, monkeypatch):
-    """D8: with the rid held, the single-phase publish puts no told on the wire this pass."""
+def test_d8_the_single_phase_publish_puts_the_parked_read_on_the_wire_this_pass(pp0, monkeypatch):
+    """D8 (S103): the read that landed in the park is told in THIS pass (A3 held it until the next one)."""
     _single_phase(pp0, monkeypatch)
     cp.reset_rings()
     out = told.pp0_publish(pp0, [])
-    assert _tolds(out) == [] and RID in pp0._pdflip_store_held and RID not in pp0._pdflip_store_told
-    # positive control: the next pass (older output received, slot 0 empty) publishes it
-    pp0.mbs[0] = None
-    out2 = told.pp0_publish(pp0, [])
-    assert [t.rid for t in _tolds(out2)] == [RID]
+    assert [t.rid for t in _tolds(out)] == [RID] and pp0._pdflip_store_told[RID] == TOLD
+    assert RID not in pp0._pdflip_store_held
+
+
+# ---------------------------------------------------------------------------
+# S103 (20.10.2026): the park's ready set runs in THIS pass; every park and every non-park with a waiter is printed.
+#
+# Metal rc24 781238542c, P log ..._1020_113244, PP0:
+#   11:47:50  '#969N ADMIT slot=0 fwd_ct=7 bs=1 extend=6672 rids=[pdflip-2-141]'   (104192 cached)
+#   11:47:52  'S82 COMMIT-PARK n=5 outcome=acks rid=pdflip-2-138 waited_ms=6.8'
+#   11:47:52  'S82 PARK-AGE HOLD rids=['pdflip-2-138', 'pdflip-2-139'] reason=price-unmeasured'
+#   11:47:55  '#1463 PASS-TAIL pp_rank=0 bs=1 finished=1 recv_ms=0 commit_ms=2608 process_ms=185'
+#   11:47:59  '#PGAP pp_rank=0 fwd=9 tokens=84 gpu_gap_ms=3004.9 ... output_commit=2608'   (the 5090 idle 3.0 s)
+# front: 'LEG2-FIRST-CONTENT rid=pdflip-2-138 epoch=4 via=after_p', 'P-DRAIN epoch=3 ... queue_at_exit=0',
+# 'kind=phase_end action=FLIP_D' -- nobody saw pdflip-2-141's P output before the P phase drained.
+
+RC24_FWD = [(6038, 83328, 2603.9), (18, 140608, 931.1), (769, 249664, 1825.8), (53, 71104, 1531.2),
+            (173, 63552, 1192.1), (180, 132736, 1196.0), (215, 71104, 1370.8)]
+RC24_LOAD = [(83328, 190.0), (103872, 126.0), (159168, 186.0), (52864, 64.0), (104192, 207.0)]
+RC24_TOLD = 103232          # '#1416 STORE-TOLD ANCHOR-CLAMP rid=pdflip-2-138 completed=103360 anchored=103232'
+
+
+class _Log:
+    def __init__(self):
+        self.lines = []
+
+    def info(self, fmt, *args):
+        self.lines.append(fmt % args)
+
+    warning = info
+
+
+def test_s103_metal_rc24_1147_the_acked_pair_runs_while_the_6672_set_is_downstream(pp0, monkeypatch):
+    """RED on rc25 e1dea5463a: PARK-AGE HOLD price-unmeasured, no Admit, PP0 idles 2608 ms in the receive."""
+    pfc._reset_for_tests()
+    cp.reset_rings()
+    for n_, c_, ms in RC24_FWD:
+        pfc.note_batch_cost(n_, c_, ms, 1)
+    for n_, ms in RC24_LOAD:
+        cp.note_start_loading(n_, ms)
+    req = pp0.waiting_queue[0]
+    req.origin_input_ids = list(range(RC24_TOLD + 40))
+    pp0._pdflip_told_pacing[RID].told = RC24_TOLD
+    fb._pp0_open_map(pp0)[RID].told = RC24_TOLD
+    pp0._s82_launch_rec = {0: (_time.monotonic() - 0.007, 6672, 104192)}
+    n = {"i": 0}
+
+    def harvest(s, now=None):
+        n["i"] += 1
+        if n["i"] >= 2:
+            fb._pp0_open_map(s)[RID].acks.update({1: RC24_TOLD, 2: RC24_TOLD})
+        return 0
+
+    log = _Log()
+    monkeypatch.setattr(fb, "pp0_harvest", harvest)
+    monkeypatch.setattr(cp, "logger", log)
+    out = told.pp0_publish(pp0, [])
+    assert [a.rid for a in _admits(out)] == [RID] and _admits(out)[0].told == RC24_TOLD
+    assert pp0._pdflip_store_told[RID] == RC24_TOLD          # PP0's own plan runs it in this pass
+    admit = [ln for ln in log.lines if ln.startswith("S82 PARK-ADMIT")]
+    assert len(admit) == 1 and "a3=hold:price-unmeasured" in admit[0]
+    assert any(ln.startswith("S82 COMMIT-PARK n=1 outcome=acks") for ln in log.lines)
+
+
+def test_s103_a_blocking_receive_without_park_names_its_reason(pp0, monkeypatch):
+    """rc24 11:40:00 shape (B1): a newcomer arrives in the pass, the acked rid waits, the receive blocks 3380 ms --
+    the pass does not park and now says why."""
+    log = _Log()
+    monkeypatch.setattr(cp, "logger", log)
+    _acks_after(monkeypatch, pp0, k=3)
+    told.pp0_publish(pp0, [_arrival()])
+    np_ = [ln for ln in log.lines if ln.startswith("S82 NO-PARK")]
+    assert len(np_) == 1 and "reason=arrivals" in np_[0] and RID in np_[0]
+    assert cp.stats()["no_park_arrivals"] == 1 and cp.stats()["n"] == 0
+
+
+def test_s103_no_trace_without_a_waiter_or_without_a_blocking_receive(pp0, monkeypatch):
+    log = _Log()
+    monkeypatch.setattr(cp, "logger", log)
+    pp0.mbs[0] = None                                          # the receive will not block: no verdict at all
+    told._commit_park(pp0, [_arrival()])
+    pp0.mbs[0] = _batch()
+    pp0.waiting_queue = []                                     # nobody waiting: no trace
+    told._commit_park(pp0, [_arrival()])
+    assert not [ln for ln in log.lines if ln.startswith("S82 NO-PARK")]
+
+
+def test_s103_every_park_is_printed():
+    """rc24 printed parks n=1..16 only; its parks after 12:09:18 were invisible."""
+    cp.reset()
+    log = _Log()
+    orig = cp.logger
+    cp.logger = log
+    try:
+        v = cp.Verdict(True, "park", (), (RID,))
+        for _ in range(40):
+            cp.log_park(v, "acks", RID, 0.01, (2, 0))
+    finally:
+        cp.logger = orig
+    assert len([ln for ln in log.lines if ln.startswith("S82 COMMIT-PARK")]) == 40
+
+
+def _follower(rank):
+    return SimpleNamespace(ps=SimpleNamespace(pp_rank=rank, pp_size=3), _pdflip_store_told={}, _pdflip_store_held={},
+                           _pdflip_fb_follower=None, _pdflip_told_early={RID: RC24_TOLD})
+
+
+def test_s103_three_ranks_absorb_the_park_admit_identically(pp0, monkeypatch):
+    """Rank uniformity (R11, RAENGE-NIE-UNEINS): the Admit PP0 decides in the park is the ordinary wire object --
+    PP1 and PP2 apply exactly PP0's told, one PP0 pass earlier than under A3, nothing decided off PP0."""
+    cp.reset_rings()                                             # A3 would hold (price-unmeasured)
+    req = pp0.waiting_queue[0]
+    req.origin_input_ids = list(range(RC24_TOLD + 40))
+    pp0._pdflip_told_pacing[RID].told = RC24_TOLD
+    fb._pp0_open_map(pp0)[RID].told = RC24_TOLD
+    _acks = {"i": 0}
+
+    def harvest(s, now=None):
+        _acks["i"] += 1
+        if _acks["i"] >= 2:
+            fb._pp0_open_map(s)[RID].acks.update({1: RC24_TOLD, 2: RC24_TOLD})
+        return 0
+
+    monkeypatch.setattr(fb, "pp0_harvest", harvest)
+    out = told.pp0_publish(pp0, [])
+    admits = _admits(out)
+    assert [a.rid for a in admits] == [RID]
+    ranks = {0: pp0._pdflip_store_told[RID]}
+    for rank in (1, 2):
+        f = _follower(rank)
+        for a in admits:
+            told._follower_admit(f, a)
+        ranks[rank] = f._pdflip_store_told[RID]
+    assert set(ranks.values()) == {RC24_TOLD}, ranks
