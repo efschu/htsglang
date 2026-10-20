@@ -349,8 +349,6 @@ D_POOL_MAX_AGE_S = 1.0
 #: round 4, which was a hand number and could add 5 s to a D admission
 #: decision -- on the critical path, and even with the gate flag off.
 D_POOL_READ_TIMEOUT_S = D_POOL_MAX_AGE_S
-#: EZ-S2b review A3 (R2): how long a KURZ arrival waits for a refreshed D pool reading before it goes on without the gate
-D_POOL_KURZ_WAIT_S = 0.05
 RPC_TIMEOUT_S = 900.0
 
 # ---------------------------------------------------------------------------
@@ -6149,7 +6147,42 @@ class Front:
             # is not evidence that D answered, nor that it did not).
             self.counters["d_pool_read_suppressed"] += 1
             return None
-        t0 = now
+        # NF-R2-DPOOL (20.10., SOLL R2 "kurz sofort auf D, keine Wartezeit"; rc26 _142108 14:25:07/14:25:10 and
+        # _143107 14:36:01: three kurz requests waited 1.0-1.1 s before D_NOW, each exactly the
+        # D_POOL_READ_TIMEOUT_S of this read, PDFLIP D-POOL UNREADABLE cause=TimeoutError). D answers
+        # `/server_info` only at its scheduler pass boundary; inside a D prefill pass (3-6 s on NF) the awaited
+        # read could only time out -- and a timed-out read ends in the gate OFF anyway. The decision therefore
+        # waits for the read at most the arrival KV read budget (``_asr.kv_read_budget_s``, the SAME bound the
+        # sibling ``/server_info`` read of the arrival seat already waits, ``_arrival_seat_kv_reading``); the
+        # read itself runs as ONE shared task with its unchanged 1.0 s timeout and lands for the next decision.
+        # No reading by then = no reading (EZ-S1 A10: never an estimate, never an old number): the gate is off
+        # for THIS decision, exactly what the 1.0 s timeout produced, without the 1.0 s.
+        task = self.__dict__.get("_d_pool_task")
+        if task is None or task.done():
+            task = asyncio.ensure_future(self._d_pool_fetch())
+            self._d_pool_task = task
+        budget = _asr.kv_read_budget_s()
+        if not task.done() and budget > 0:
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=budget)
+            except asyncio.TimeoutError:
+                pass
+        if task.done():
+            return None if task.cancelled() else task.result()
+        self.counters["d_pool_read_pending"] += 1
+        _n = self.counters["d_pool_read_pending"]
+        if _n <= 16 or _n % 64 == 0:
+            logger.info("PDFLIP D-POOL READ-PENDING n=%d budget_s=%.3f timeout_s=%.1f -- group D has not answered "
+                        "`/server_info` inside the decision's read budget (D inside a pass answers only at its "
+                        "boundary): no reading for THIS decision, the gate is off for it (EZ-S1 A10, never an old "
+                        "number); the read keeps running and lands for the next decision (NF-R2-DPOOL, SOLL R2)",
+                        _n, budget, D_POOL_READ_TIMEOUT_S)
+        return None
+
+    async def _d_pool_fetch(self) -> Optional[Dict[str, Any]]:
+        """NF-R2-DPOOL: the one `/server_info` round trip of :meth:`_d_pool_reading`, run as a shared task; its
+        outcome is written to ``_d_pool`` / ``_d_pool_retry_after`` exactly as the inline read did (FIX 4/5)."""
+        t0 = time.time()
         got = None
         # #1288: WHY the read failed, not just THAT it did.  On weg2sb5f the
         # only clue in the whole front log was one line saying group D
@@ -6258,11 +6291,13 @@ class Front:
     async def _d_reading_kurz(self, rid: str = "") -> Optional[Dict[str, Any]]:
         """EZ-S2b review A3 (R2; N5): the D pool reading for a KURZ arrival, waited for with a SHORT BOUND -- never the 1.0 s
         read timeout (pdflip-2-115), and never the end of the gate either. A fresh reading is used as it is; a stale one is
-        refreshed (ONE refresh in flight, shared) and awaited for ``D_POOL_KURZ_WAIT_S``: D answers in milliseconds, the
-        FIX 4a gate then decides on the NEW reading ("the gate may delay, never admit on a stale reading" stays true).
-        Only a D that does NOT answer within the bound (or one whose last read failed less than an age window ago:
-        ``_d_pool_retry_after``, no round trip at all) goes on without the gate -- named by ``r2_kurz_pool_nowait``; the
-        refresh keeps running in the background."""
+        refreshed through ``_d_pool_reading`` -- its ONE shared fetch task, awaited at most the arrival KV read budget
+        (``_asr.kv_read_budget_s``, NF-R2-DPOOL). rc28 integration (review nf-review-front-r2dpool-1b-1020): this helper
+        had its own refresh task and its own 0.05 s bound ON TOP of that one -- two 50 ms wait points stacked; the
+        arrival KV budget is the one wait point now. D answers in milliseconds, the FIX 4a gate then decides on the NEW
+        reading ("the gate may delay, never admit on a stale reading" stays true). Only a D that does NOT answer within
+        the budget (or one whose last read failed less than an age window ago: ``_d_pool_retry_after``, no round trip at
+        all) goes on without the gate -- named by ``r2_kurz_pool_nowait``; the read keeps running in the background."""
         try:
             if not self._d_gate_armed():
                 return None
@@ -6271,18 +6306,9 @@ class Front:
             return None
         if r is not None and time.time() - r["t"] <= D_POOL_MAX_AGE_S:
             return r
-        t = self.__dict__.get("_d_pool_refresh")
-        if t is None or t.done():
-            try:
-                t = asyncio.ensure_future(self._d_pool_reading())
-                self.__dict__["_d_pool_refresh"] = t
-            except RuntimeError:
-                return None
         try:
-            got = await asyncio.wait_for(asyncio.shield(t), D_POOL_KURZ_WAIT_S)
-        except asyncio.TimeoutError:
-            got = None
-        except Exception:  # noqa: BLE001 -- the refresh's failure is its own named UNREADABLE line
+            got = await self._d_pool_reading()      # the ONE wait point: the arrival KV read budget (NF-R2-DPOOL)
+        except Exception:  # noqa: BLE001 -- the read's failure is its own named UNREADABLE line
             got = None
         if got is not None:
             self.counters["r2_kurz_pool_waited_ok"] += 1
@@ -6290,7 +6316,7 @@ class Front:
         self.counters["r2_kurz_pool_nowait"] += 1
         _fd.kurz_wait_free(self, rid, "kurz arrival: D did not answer the pool read within %.0f ms (or it failed lately), it goes "
                                       "on without the gate and does not wait for one (R2); the refresh runs on in the "
-                                      "background" % (D_POOL_KURZ_WAIT_S * 1000.0))
+                                      "background" % (_asr.kv_read_budget_s() * 1000.0))
         return None
 
     def _d_token_budget_blocks(self, rid: str, est_tokens: int,

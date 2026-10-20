@@ -1339,7 +1339,9 @@ def test_a13_the_read_timeout_is_derived_from_its_own_freshness_bound():
     than ``D_POOL_MAX_AGE_S`` describes a pool state the next freshness check
     would discard anyway, so the timeout IS that bound."""
     assert front_mod.D_POOL_READ_TIMEOUT_S == front_mod.D_POOL_MAX_AGE_S
-    tree = _fn_ast(Front._d_pool_reading)
+    # NF-R2-DPOOL (20.10.): the round trip lives in ``_d_pool_fetch`` (a shared task); the decision in
+    # ``_d_pool_reading`` waits at most the arrival KV read budget (test_nf_r2_dpool_nowait_1020.py)
+    tree = _fn_ast(Front._d_pool_fetch)
     timeouts = [
         kw.value
         for node in ast.walk(tree)
