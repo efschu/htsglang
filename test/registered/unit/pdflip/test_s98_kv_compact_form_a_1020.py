@@ -710,3 +710,129 @@ def test_a_rank_whose_source_free_throws_still_enters_the_outcome_collective(
             (name, exc)
     assert group.calls["TP0"] == group.calls["TP1"] == group.calls["TP2"] == 3   # vote, digest, outcome
     assert any("moves FAILED here" in m and "RuntimeError" in m for m in caplog.messages)
+
+
+# ---- (8) planner 20.10. rc26: the deepest feasible stage, and what holds a page ----------
+#
+# rc26 10d681a721 (_130752 D, 13:12:25): "KV-COMPACT n=1 verdict=refused want=S0 stage=S8
+# ... local=00000000 -- no free page below 512 for un-backed node 38 (8 pages)". The eight
+# flags are the candidates S0..S7 -- every intermediate stage WAS planned in the same vote;
+# the line named only the first reason. Below: the vote takes the deepest stage that is
+# feasible (S5 when S0..S4 are not), and the refusal names every stage and each rank's
+# holder of the named page.
+
+def _three_threads(monkeypatch, build, stage, floor_tokens, want):
+    import threading
+
+    owners = {"TP0": (0, 0), "TP1": (S, CUT[1]), "TP2": (S, CUT[2])}
+    group = _ThreeRankGroup()
+    ranks = []
+    for name, form in (("TP0", _tp0), ("TP1", _tp1), ("TP2", _tp2)):
+        target, dw = form(monkeypatch)
+        alloc = _alloc(TOP // PG, PG)
+        alloc._kvcache = target
+        tree = Tree(alloc)
+        build(alloc, tree)
+        sched = types.SimpleNamespace(token_to_kv_pool_allocator=alloc, page_size=PG,
+                                      draft_worker=dw, tree_cache=tree,
+                                      _pdflip_group_min_ints=group.min_ints(name))
+        ranks.append((name, sched))
+    monkeypatch.setattr(dsv, "kv_owner_block", lambda: owners[threading.current_thread().name])
+    from test_s77_kv_compact_s9_hold_1019 import _REAL_MAX_LIVE_PAGE
+    monkeypatch.setattr(dsv, "max_live_page", _REAL_MAX_LIVE_PAGE)   # tick_env stubs it
+    out = {}
+
+    def run(name, sched):
+        ms = types.SimpleNamespace(stage=stage, stage_tokens=list(FLOOR_LADDER),
+                                   _smallest_holding=lambda f: next(
+                                       j for j, t in enumerate(FLOOR_LADDER) if t >= f))
+        try:
+            out[name] = dsv._kv_compact_for_shrink(sched, ms, {}, want, True, floor_tokens)
+        except Exception as exc:  # noqa: BLE001 -- the outcome is the assertion
+            out[name] = exc
+
+    threads = [threading.Thread(target=run, args=r, name=r[0]) for r in ranks]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+    assert not any(t.is_alive() for t in threads), "a rank hangs"
+    return ranks, out
+
+
+def test_three_ranks_s0_does_not_fit_s5_does_and_every_rank_takes_s5(floor_env, monkeypatch, caplog):
+    """Un-backed tree pages 1..2900 (not evictable, nothing free below S0..S4) and an
+    un-backed turn at 5000..5099 above S5: S0..S4 cannot clear, S5 can (172 free pages
+    2901..3072). All three ranks move the turn below S5 -- the deepest feasible stage."""
+    caplog.set_level(logging.INFO)
+    s5 = FLOOR_LADDER[5] // PG
+
+    def build(alloc, tree):
+        _node(tree, alloc, list(range(1, 2901)), PG, backed=False)
+        _node(tree, alloc, list(range(5000, 5100)), PG, backed=False)
+    floor = 5100 * PG
+    ranks, out = _three_threads(monkeypatch, build, 8, floor, 0)
+    for name, sched in ranks:
+        assert isinstance(out[name], int), (name, out[name])
+        assert FLOOR_LADDER[4] < out[name] <= FLOOR_LADDER[5], (name, out[name])   # the new floor
+        pages = sorted({int(x) for n in sched.tree_cache._collect_all_nodes()
+                        if n is not sched.tree_cache.root_node
+                        for x in (n.component_data[FULL].value // PG).unique().tolist()})
+        assert max(pages) <= s5, name
+    moved = [m for m in caplog.messages if "verdict=moved" in m]
+    assert len(moved) == 3 and all("target=S5" in m for m in moved), moved
+    assert len({m.split("digest=")[1].split()[0] for m in moved}) == 1
+
+
+def test_a_refusal_names_every_candidate_stage(floor_env, monkeypatch, caplog):
+    caplog.set_level(logging.INFO)
+
+    def build(alloc, tree):
+        _node(tree, alloc, list(range(1, 4097)), PG, backed=False)    # nothing free up to S7
+        _node(tree, alloc, list(range(5000, 5100)), PG, backed=False)
+    ranks, out = _three_threads(monkeypatch, build, 8, 5100 * PG, 0)
+    assert all(out[n] is None for n, _s in ranks), out
+    stages = [m for m in caplog.messages if " STAGES " in m]
+    assert len(stages) == 3
+    assert "S0..S7: no free page below N for un-backed node" in stages[0], stages[0]
+
+
+def _witness_sched():
+    t0, dw0 = _tp0_form_plain()
+    alloc = _alloc(TOP // PG, PG)
+    alloc._kvcache = t0
+    tree = Tree(alloc)
+    return types.SimpleNamespace(token_to_kv_pool_allocator=alloc, page_size=PG, draft_worker=dw0,
+                                 tree_cache=tree, running_batch=types.SimpleNamespace(reqs=[]),
+                                 waiting_queue=[]), alloc, tree
+
+
+def _tp0_form_plain():
+    target = _qsa_pool(0, index_on_rank=True)
+    return target, _host_draft_worker(_solo_draft_pool())
+
+
+def test_the_witness_names_a_running_requests_page(floor_env, monkeypatch):
+    sched, alloc, tree = _witness_sched()
+    _take(alloc, [6145, 6146])
+    rtt = torch.zeros(4, 256, dtype=torch.int64)
+    rtt[2, :128] = _tokens_of([6145, 6146])
+    sched.req_to_token_pool = types.SimpleNamespace(req_to_token=rtt)
+    sched.running_batch.reqs = [types.SimpleNamespace(rid="pdflip-4-16", req_pool_idx=2,
+                                                      origin_input_ids=[0] * 100, output_ids=[0] * 28)]
+    sv = KC.survey(tree, alloc, PG, S8_PAGE)
+    w = dsv._kv_compact_page_witness(sched, sv, 6146)
+    assert "request(rid=pdflip-4-16 running)" in w, w
+
+
+def test_the_witness_names_a_staged_free_a_tree_write_through_and_a_free_page(floor_env, monkeypatch):
+    sched, alloc, tree = _witness_sched()
+    n = _node(tree, alloc, [6200, 6201], PG, backed=False)
+    tree.ongoing_write_through[n.id] = object()
+    _take(alloc, [6238])
+    alloc.free_group = [_tokens_of([6238])]
+    sv = KC.survey(tree, alloc, PG, S8_PAGE)
+    assert "staged-free(free_group)" in dsv._kv_compact_page_witness(sched, sv, 6238)
+    w = dsv._kv_compact_page_witness(sched, sv, 6201)
+    assert "tree(node=%d" % n.id in w and "wt=True" in w, w
+    assert "free_pages" in dsv._kv_compact_page_witness(sched, sv, 7000)
