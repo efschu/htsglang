@@ -4604,6 +4604,24 @@ class SchedulerWeightUpdaterManager:
             census.get("mode", "walk"),
         )
 
+    def _pdflip_retire_pp_sends_before_sleep(self) -> None:
+        """S95b: ``Scheduler._pp_retire_device_sends_at_sleep`` at the sleep, one line when frames went. Rank-local,
+        no collective (every rank of the group runs it in this RPC). Never raises: a frame that cannot be retired
+        stays in its book and is joined lap-late as before."""
+        fn = getattr(getattr(self, "scheduler", None), "_pp_retire_device_sends_at_sleep", None)
+        if not callable(fn):
+            return
+        try:
+            frames, nbytes, kept = fn()
+        except Exception as exc:  # noqa: BLE001 -- the sleep goes on; the frames stay for the lap-late join
+            logger.warning("PDFLIP-SLEEP PP-SENDS-RETIRE skipped (%s: %s)", type(exc).__name__, str(exc)[:160])
+            return
+        if frames:
+            logger.info("PDFLIP-SLEEP PP-SENDS-RETIRED frames=%d mib=%.1f host_kept=%d (S95b: the device frames "
+                        "this rank sent and still held -- lap-late join book, P-overlap lead -- went after a "
+                        "device-side wait, before any pause; host halves stay for the lap-late join)",
+                        frames, nbytes / float(1 << 20), kept)
+
     def _pdflip_drain_hicache_before_sleep(
         self, bound_s: float = PDFLIP_SLEEP_DRAIN_BOUND_S
     ) -> None:
@@ -9152,6 +9170,11 @@ class SchedulerWeightUpdaterManager:
         # verdict over that group first and raises W120 on every rank alike.
         self._pdflip_drain_hicache_before_sleep()
         _pdflip_ph("drain_hicache")
+        # S95b: the device frames this rank sent and still holds (lap-late join book, P-overlap lead deque) go
+        # BEFORE any pause and before the sleep's empty_cache -- they are untagged, no pause covers them, and
+        # they sat in the group-P dormant residue D's expert residency is priced against (rc22 PP0/PP1 +600 MiB).
+        self._pdflip_retire_pp_sends_before_sleep()
+        _pdflip_ph("pp_sends")
         if self._pdflip_group_name() == "D":
             # RW: the LRU owners of every pool layer, BEFORE any pause (the
             # tables live under a paused tag); ids only, no expert bytes.
