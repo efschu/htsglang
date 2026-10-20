@@ -723,6 +723,11 @@ def fused_marlin_moe(
 
     if global_num_experts == -1:
         global_num_experts = E
+    # W2-APPLY: a pool EM wave's unserved lanes carry expert id -1 -- the upstream EP form (moe_align puts them
+    # in blocks with expert id -1, the GEMMs skip those blocks); no expert map is needed for that
+    from flliper.srt.layers.moe.filtered_lanes import ep_form
+
+    is_ep = ep_form(expert_map)
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
         topk_ids, block_size_m, global_num_experts
     )
@@ -821,7 +826,7 @@ def fused_marlin_moe(
         moe_block_size=block_size_m,
         top_k=topk,
         mul_topk_weights=False,
-        is_ep=expert_map is not None,
+        is_ep=is_ep,
         b_q_type=scalar_type1,
         size_m=M,
         size_n=gemm1_n,
@@ -879,7 +884,7 @@ def fused_marlin_moe(
         except Exception as exc:  # noqa: BLE001
             logger.debug("[nan-probe-in] act scan skipped: %s", exc)
 
-    if expert_map is not None:
+    if is_ep:
         intermediate_cache3.zero_()
 
     intermediate_cache3 = moe_wna16_marlin_gemm(
@@ -900,7 +905,7 @@ def fused_marlin_moe(
         moe_block_size=block_size_m,
         top_k=1,
         mul_topk_weights=True,
-        is_ep=expert_map is not None,
+        is_ep=is_ep,
         b_q_type=scalar_type2,
         size_m=M * topk,
         size_n=K,

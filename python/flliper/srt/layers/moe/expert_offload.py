@@ -5185,6 +5185,15 @@ class MoEExpertOffloadCache:
         neg = torch.full_like(lane_e, -1)
         pending = torch.where(mark[:E] > 0, lane_e, neg)
         zero_row = self._pool_zero_row().to(torch.int64)
+        # W2-APPLY: a runner with the EP skip gets ONLY the wave's own lanes -- every other lane carries expert
+        # id -1 and its GEMM blocks are skipped (layers/moe/filtered_lanes.py); else the zero-row form
+        from contextlib import nullcontext
+
+        from flliper.srt.layers.moe import filtered_lanes
+
+        filtered = filtered_lanes.layer_supports(self.layer)
+        off_lane = torch.full((), -1, dtype=torch.int64, device=device) if filtered else zero_row
+        apply_ctx = filtered_lanes.active if filtered else nullcontext
 
         cfg = self.layer.moe_runner_config
         saved_rsf = cfg.routed_scaling_factor
@@ -5207,7 +5216,7 @@ class MoEExpertOffloadCache:
                 copy_rows(self._pool_srcs, self._pool_dsts, buffers.gather_src,
                           buffers.gather_dst, buffers.gather_count)
                 if probe is not None:
-                    probe.copied(e0, buffers.gather_count, self._em_fetch_row_bytes())
+                    probe.copied(e0, buffers.gather_count, self._em_fetch_row_bytes(), wave=wave)
                 # read this wave's routes before the next step rewrites them
                 routes_e = buffers.routes[:E].to(torch.int64)
                 lane_route = routes_e.index_select(0, safe)
@@ -5218,7 +5227,7 @@ class MoEExpertOffloadCache:
                     b = min(n_lanes, a + slice_pairs)
                     srv = served[a:b]
                     rows = torch.div(torch.arange(a, b, device=device), K, rounding_mode="floor")
-                    tid_w = torch.where(srv, lane_route[a:b], zero_row).to(topk_ids.dtype)
+                    tid_w = torch.where(srv, lane_route[a:b], off_lane).to(topk_ids.dtype)
                     tw_w = torch.where(
                         srv.unsqueeze(1), flat_weights[a:b], torch.zeros_like(flat_weights[a:b])
                     )
@@ -5242,7 +5251,8 @@ class MoEExpertOffloadCache:
                             topk_weights=tw_w, topk_ids=tid_w.unsqueeze(1), router_logits=rl_w
                         ),
                     )
-                    combine_out = apply_fn(sub)
+                    with apply_ctx():
+                        combine_out = apply_fn(sub)
                     part = combine_out.hidden_states
                     if partials is None:
                         partials = torch.zeros(
@@ -5251,6 +5261,9 @@ class MoEExpertOffloadCache:
                     partials[a:b] = torch.where(
                         srv.unsqueeze(1), part.to(partials.dtype), partials[a:b]
                     )
+                if probe is not None:
+                    # F3: this wave's apply time and served lanes; W2-APPLY: the lanes its GEMMs computed
+                    probe.applied(wave, served, served if filtered else n_lanes)
         finally:
             cfg.routed_scaling_factor = saved_rsf
         out_full = torch.empty((T, partials.shape[-1]), dtype=partials.dtype, device=device)
