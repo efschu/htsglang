@@ -5864,6 +5864,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return
         end = chain[-1]
         end.pdflip_park_end = True
+        end.pdflip_park_rid = str(getattr(req, "rid", "?"))   # S85: the reset census names whose chain it is
         if self.pdflip_lane_rank_on():
             # LANE-ANCHOR-RANK: the chain claims with the PARKED request's lane
             # (a lane park holds lanes below the floor), not with the higher

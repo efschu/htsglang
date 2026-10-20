@@ -319,6 +319,59 @@ def unbacked_census(tree_cache) -> dict:
     return out
 
 
+def _dropped_by_reset(node, root) -> bool:
+    """``unbacked_census``'s predicate for one node: device KV neither on the host nor in the store."""
+    if node is None or node is root or getattr(node, "evicted", False) or getattr(node, "backuped", False) \
+            or getattr(node, "l3_present", False):
+        return False
+    try:
+        from flliper.srt.mem_cache.unified_radix_cache import BASE_COMPONENT_TYPE
+
+        return node.component_data[BASE_COMPONENT_TYPE].value is not None
+    except Exception:  # noqa: BLE001
+        return False
+
+
+#: S85 (rc19 boot ..._10e9b2b492_1019_230333, pdflip-106-2655): the park-end chain of a parked request went into
+#: the sleep reset un-backed -- the KV arena was pinned in full (complete=6485 pinned=6485), every write-through of
+#: the chain refused (``#1421 BACKUP-REFUSED why=arena_claim node=6298 depth=199232``), and the reset dropped it
+#: (``#1470 FLUSH-UNBACKED nodes=27 ... ids=[6298, 6305, ..., 6333]``, 6333 = the PARK-END-ANCHOR-FIRST node,
+#: depth 206080). The resume read the store to 198592 and 7488 tokens were recomputed; no line said so: S80 asks
+#: only at P's wake probe of a read that ran during the flip, S81 watches only CLAIMED share-0 slots (these pages
+#: were never claimed). Named here, at the moment of the loss, per park-end node.
+LINE_PARK_END = "S85 PARK-END-UNBACKED"
+
+
+def park_end_unbacked(tree_cache) -> list:
+    """S85: every park-end node (``_pdflip_park_end_nodes``, PARK-END-ANCHOR-FIRST) whose chain loses KV with this
+    reset: the store then ends at the START of the shallowest dropped node of the chain -- everything from there to
+    the park-end depth is unreadable for the resume (exact, from the tree; read-only)."""
+    out = []
+    ends = list(getattr(tree_cache, "_pdflip_park_end_nodes", None) or ())
+    root = getattr(tree_cache, "root_node", None)
+    depth_of = getattr(tree_cache, "pdflip_node_depth", None)
+    if not ends or not callable(depth_of):
+        return out
+    for end in ends:
+        if getattr(end, "evicted", False):
+            continue
+        chain = []
+        n = end
+        while n is not None and n is not root:
+            chain.append(n)
+            n = getattr(n, "parent", None)
+        dropped = [n for n in chain if _dropped_by_reset(n, root)]
+        if not dropped:
+            continue
+        top = dropped[-1]                                      # the shallowest dropped node of the chain
+        depth = int(depth_of(end))
+        store_end = int(depth_of(top)) - len(getattr(top, "key", ()) or ())
+        out.append({"rid": getattr(end, "pdflip_park_rid", "?"), "node": getattr(end, "id", "?"),
+                    "depth": depth, "store_end": store_end, "lost_tokens": depth - store_end,
+                    "unbacked_nodes": len(dropped)})
+    return out
+
+
 _UNBACKED_N = [0, 0]   # resets seen, resets with un-backed KV
 
 
@@ -336,4 +389,14 @@ def note_unbacked_at_reset(tree_cache, site: str = "flush", paused: int = -1, op
             "request recomputes it; paused_sweeps = bubble sweeps the open quiesce left to the #1470 loop)",
             LINE_UNBACKED, site, c["nodes"], c["tokens"], c["pending"], c["ids"], _UNBACKED_N[0], _UNBACKED_N[1],
             int(paused), float(open_ms))
+    try:
+        c["park_end"] = park_end_unbacked(tree_cache) if c["nodes"] else []
+    except Exception:  # noqa: BLE001 - an instrument never blocks the reset
+        c["park_end"] = []
+    for pe in c["park_end"]:
+        logger.warning(
+            "%s rid=%s node=%s depth=%d store_end=%d lost_tokens=%d unbacked_nodes=%d site=%s (the park-end chain of "
+            "a parked request goes into this reset un-backed: its resume reads the store only to store_end -- P or D "
+            "recomputes lost_tokens; target 0)", LINE_PARK_END, pe["rid"], pe["node"], pe["depth"], pe["store_end"],
+            pe["lost_tokens"], pe["unbacked_nodes"], site)
     return c
