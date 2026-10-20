@@ -5,7 +5,7 @@ switch ``FLLIPER_PDFLIP_DECIDER`` ON = the new path, OFF = the S2a code (the way
 
 (a) P-PREFILL-UNTER-X  pdflip-0-5 (25 tokens, 23:06:43,825 ``BATCH queued awake=D admit_d=False``)
 (b) R2-WARTEN          pdflip-2-115 (u=2733 < halbX 4000, 1.0 s D-POOL UNREADABLE before D_NOW)
-(c) R2/R6              pdflip-104-2646 (kurz on D, REROUTE_P why=R6 S=198182 at 2.4 s: the rest 182 of a KURZ prefill in S)
+(c) R6                 pdflip-104-2646 (REROUTE_P why=R6 S=198182 at 2.4 s: the rest 182 of a prefill D had already COMPUTED; review A1/A2)
 (d) open points of S2a EARLY-FLIP gate, x_ref_nonum -> MEASURE (review H1)
 """
 import asyncio
@@ -192,7 +192,23 @@ X_C = 7622                                    # rc19 05:26 X
 RID_K, RID_G = "pdflip-104-2646", "pdflip-104-2647"
 
 
-def _front_c(now, kurz_u):
+def _beacon_reading(f, tmp_path, rid, t_start_s, rest_start, ext_len, *, done, ranks=1, done_ranks=None, sid=7):
+    """The REAL beacon (v3 writer ``DExtendBeacon`` on ``ranks`` files, v3 reader ``read_group_full``) behind the front's reading:
+    the rid is received, its extend batch starts at ``t_start_s`` (rest ``rest_start``, ``ext_len`` computed by the batch) and, with
+    ``done``, the forward ENDS (``note_extend_done``) -- on ``done_ranks`` of the ranks (default all)."""
+    clock = {"t": 0}
+    done_ranks = ranks if done_ranks is None else done_ranks
+    for r in range(ranks):
+        bc = dxb.DExtendBeacon(str(tmp_path / ("D-pid%d.bin" % (r + 1))), clock_ns=lambda: clock["t"])
+        bc.note_recv(rid=rid)
+        clock["t"] = int(t_start_s * 1e9)
+        bc.note_extend(rids=[rid], rests=[rest_start], extend_lens=[ext_len])
+        if done and r < done_ranks:
+            bc.note_extend_done(rids=[rid])
+    f._d_ext_reading = lambda: dxb.read_group_full(str(tmp_path), "D", sid, session_of=lambda pid: sid)
+
+
+def _front_c(now, kurz_u, tmp_path=None, *, done=True, ranks=1, done_ranks=None):
     f = _fake_front(running=["dec"], n=6, kv={"available": 400000, "evictable": 0})   # D decodes (R4 waits)
     f.tp_prefill_max_tokens = X_C
     f.t_awake = now - 60.0
@@ -204,7 +220,11 @@ def _front_c(now, kurz_u):
     f.__dict__.setdefault("_d_prefill_legs", {})[RID_K] = now - 0.9
     f._leg2_lookahead.add(RID_K)
     F.Front._note_x_decision(f, RID_K, X_C, kurz_u)              # D-NOW at the decision X, priced 566
-    f._d_ext_reading = lambda: {dxb.rid_key(RID_K): (int((now - 0.8) * 1e9), 182)}
+    # leg2 POSTs the hand-over: _front_x_headers POPS the arrival's decision record (front.py leg2) before D can begin the extend
+    F.Front._front_x_headers(f, RID_K, None, False)
+    assert RID_K not in (f.__dict__.get("_x_decision") or {})
+    # rc19 05:26:34: the extend begins .243 (182 tokens left of the 566 after the prefix), the forward ENDS .918, the verdict falls .960
+    _beacon_reading(f, tmp_path, RID_K, now - 0.717, 182, 182, done=done, ranks=ranks, done_ranks=done_ranks)
     big = F.Pending(RID_G, "/v1/messages", {}, "t", now - 2.4, asyncio.new_event_loop().create_future(),
                     est_prompt=200000, est_uncached=198000)
     big.x_set = X_C
@@ -212,50 +232,79 @@ def _front_c(now, kurz_u):
     return f
 
 
-def test_c_the_rest_of_a_kurz_d_prefill_is_no_part_of_s_no_r6(monkeypatch, caplog):
+def test_c_a_prefill_whose_forward_has_ended_is_no_part_of_s_no_r6(monkeypatch, caplog, tmp_path):
+    """(c) rc19 05:26:34.960 pdflip-104-2646: D's forward of the 182-token rest ended at .918, the verdict fell 42 ms later with
+    ``S=198182``. SOLL R6 counts a prefill that is RUNNING; a computed one is not. Beacon v3 reports rest_after = 0 -> nothing
+    counts, the big request waits its T_halb (R4). After the real leg2 header POP of the arrival record."""
     _on(monkeypatch)
     now = time.time()
-    f = _front_c(now, 566)
+    f = _front_c(now, 566, tmp_path)
     with envs.FLLIPER_PDFLIP_DECIDER.override(True), caplog.at_level(logging.INFO, logger="pdflip.front"):
-        assert f._dc_carried_running() == 0                      # R2: the kurz rest (182) is not counted
+        assert f._dc_carried_running() == 0                      # the rest after the forward is 0
         dc = f._decode_collect(now)
     sv = [m for m in caplog.messages if "PDFLIP SET-VERDICT" in m]
     assert dc == "hold", (dc, sv)                                  # R4: the big request waits T_halb (2.4 s < 4.5 s)
     assert not any("verdict=REROUTE_P" in m for m in sv), sv
     assert f.counters["set_reroute_p"] == 0 and f.counters["r6_redirected"] == 0 and RID_K not in f._rvp_requeue
-    assert f.counters["r6_rest_kurz_skipped"] >= 1 and any("R6-REST-KURZ" in m for m in caplog.messages)
+    assert f.counters["r6_rest_computed"] >= 1
 
 
-def test_c_off_is_the_s2a_code_s_includes_the_kurz_rest(monkeypatch, caplog):
+def test_c_a_prefill_whose_forward_is_still_running_counts_r6_stays(monkeypatch, tmp_path):
+    """The SOLL R6 / user decision 18.10. side, same fixture, same real pop: the extend batch has STARTED and its forward has not
+    ended -> the rest (182) counts, S = 198182 > X -> REROUTE_P. A GESTARTETER kurzer D prefill counts (no class rule)."""
     _on(monkeypatch)
     now = time.time()
-    f = _front_c(now, 566)
+    f = _front_c(now, 566, tmp_path, done=False)
+    with envs.FLLIPER_PDFLIP_DECIDER.override(True):
+        assert f._dc_carried_running() == 182
+        assert f._decode_collect(now) == "P" and f.counters["set_reroute_p"] == 1 and f.counters["r6_redirected"] == 1
+
+
+def test_c_rank_equality_the_max_over_ranks_keeps_the_rest_until_every_rank_is_done(monkeypatch, tmp_path):
+    """R11: the front takes the MAX over the ranks -- one rank that has not finished its forward keeps the rest alive; all ranks
+    done -> 0. Same answer whatever the file order."""
+    _on(monkeypatch)
+    now = time.time()
+    f = _front_c(now, 566, tmp_path, ranks=2, done_ranks=1)
+    with envs.FLLIPER_PDFLIP_DECIDER.override(True):
+        assert f._dc_carried_running() == 182
+    d2 = tmp_path / "all_done"
+    d2.mkdir()
+    f = _front_c(now, 566, d2, ranks=2, done_ranks=2)
+    with envs.FLLIPER_PDFLIP_DECIDER.override(True):
+        assert f._dc_carried_running() == 0
+
+
+def test_c_chunked_prefill_between_two_chunks_still_has_a_rest(monkeypatch, tmp_path):
+    """A chunked prefill (rest 1000, chunk 400) has 600 left after the first forward: it still runs, the 600 count."""
+    _on(monkeypatch)
+    now = time.time()
+    f = _front_c(now, 566, tmp_path)
+    d2 = tmp_path / "chunk"
+    d2.mkdir()
+    _beacon_reading(f, d2, RID_K, now - 0.717, 1000, 400, done=True)
+    with envs.FLLIPER_PDFLIP_DECIDER.override(True):
+        assert f._dc_carried_running() == 600
+
+
+def test_c_off_is_the_s2a_code_s_includes_the_rest_of_a_running_prefill(monkeypatch, caplog, tmp_path):
+    _on(monkeypatch)
+    now = time.time()
+    f = _front_c(now, 566, tmp_path, done=False)
     with envs.FLLIPER_PDFLIP_DECIDER.override(False), caplog.at_level(logging.INFO, logger="pdflip.front"):
         assert f._dc_carried_running() == 182
         f._decode_collect(now)
     sv = [m for m in caplog.messages if "PDFLIP SET-VERDICT" in m]
-    assert any("verdict=REROUTE_P" in m and "S=198182" in m for m in sv), sv       # the live defect, on the S2a path
+    assert any("verdict=REROUTE_P" in m and "S=198182" in m for m in sv), sv
 
 
-def test_c_a_halb_member_rest_still_counts_r6_stays_for_set_members(monkeypatch):
-    """R6 stays for a SET member: a running prefill that began as halb (u >= halbX) counts its rest."""
+def test_c_a_halb_member_that_is_running_counts_its_rest(monkeypatch, tmp_path):
+    """R6 for a prefill that began as halb (u >= halbX): while its forward runs, its rest counts."""
     _on(monkeypatch)
     now = time.time()
-    f = _front_c(now, 5000)                                       # 5000 >= halbX 3811: a halb member that D runs
+    f = _front_c(now, 5000, tmp_path, done=False)
     with envs.FLLIPER_PDFLIP_DECIDER.override(True):
         assert f._dc_carried_running() == 182
-
-
-def test_c_a_running_prefill_without_a_number_counts_as_before(monkeypatch):
-    _on(monkeypatch)
-    now = time.time()
-    f = _front_c(now, 566)
-    f.__dict__["_x_decision"] = {}
-    f._d_pf_book().done(rid=RID_K)
-    f._d_pf_book().grant(rid=RID_K, tokens=0, now=now - 0.9)
-    f._d_pf_book().enter_leg2(rid=RID_K)
-    with envs.FLLIPER_PDFLIP_DECIDER.override(True):
-        assert F.Front._r6_kurz_running(f, RID_K, 0) is False
 
 
 # ------------------------------------------------------------------------------------------------ (d) open points

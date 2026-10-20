@@ -349,6 +349,8 @@ D_POOL_MAX_AGE_S = 1.0
 #: round 4, which was a hand number and could add 5 s to a D admission
 #: decision -- on the critical path, and even with the gate flag off.
 D_POOL_READ_TIMEOUT_S = D_POOL_MAX_AGE_S
+#: EZ-S2b review A3 (R2): how long a KURZ arrival waits for a refreshed D pool reading before it goes on without the gate
+D_POOL_KURZ_WAIT_S = 0.05
 RPC_TIMEOUT_S = 900.0
 
 # ---------------------------------------------------------------------------
@@ -6209,9 +6211,14 @@ class Front:
             return None
         return await self._d_pool_reading()
 
-    def _d_reading_nowait(self, rid: str = "") -> Optional[Dict[str, Any]]:
-        """EZ-S2b (R2): the D pool reading WITHOUT a round trip -- the fresh cached reading, else ``None`` while one refresh
-        runs in the background (one in flight, its failure is swallowed: the named UNREADABLE line stays the refresh's)."""
+    async def _d_reading_kurz(self, rid: str = "") -> Optional[Dict[str, Any]]:
+        """EZ-S2b review A3 (R2; N5): the D pool reading for a KURZ arrival, waited for with a SHORT BOUND -- never the 1.0 s
+        read timeout (pdflip-2-115), and never the end of the gate either. A fresh reading is used as it is; a stale one is
+        refreshed (ONE refresh in flight, shared) and awaited for ``D_POOL_KURZ_WAIT_S``: D answers in milliseconds, the
+        FIX 4a gate then decides on the NEW reading ("the gate may delay, never admit on a stale reading" stays true).
+        Only a D that does NOT answer within the bound (or one whose last read failed less than an age window ago:
+        ``_d_pool_retry_after``, no round trip at all) goes on without the gate -- named by ``r2_kurz_pool_nowait``; the
+        refresh keeps running in the background."""
         try:
             if not self._d_gate_armed():
                 return None
@@ -6222,18 +6229,24 @@ class Front:
             return r
         t = self.__dict__.get("_d_pool_refresh")
         if t is None or t.done():
-            async def _bg() -> None:
-                try:
-                    await self._d_pool_reading()
-                except Exception:  # noqa: BLE001
-                    pass
             try:
-                self.__dict__["_d_pool_refresh"] = asyncio.ensure_future(_bg())
+                t = asyncio.ensure_future(self._d_pool_reading())
+                self.__dict__["_d_pool_refresh"] = t
             except RuntimeError:
-                pass
+                return None
+        try:
+            got = await asyncio.wait_for(asyncio.shield(t), D_POOL_KURZ_WAIT_S)
+        except asyncio.TimeoutError:
+            got = None
+        except Exception:  # noqa: BLE001 -- the refresh's failure is its own named UNREADABLE line
+            got = None
+        if got is not None:
+            self.counters["r2_kurz_pool_waited_ok"] += 1
+            return got
         self.counters["r2_kurz_pool_nowait"] += 1
-        _fd.kurz_wait_free(self, rid, "kurz arrival: no D pool reading in hand, it does not wait for one (R2); refresh in the "
-                                      "background")
+        _fd.kurz_wait_free(self, rid, "kurz arrival: D did not answer the pool read within %.0f ms (or it failed lately), it goes "
+                                      "on without the gate and does not wait for one (R2); the refresh runs on in the "
+                                      "background" % (D_POOL_KURZ_WAIT_S * 1000.0))
         return None
 
     def _d_token_budget_blocks(self, rid: str, est_tokens: int,
@@ -11391,8 +11404,7 @@ class Front:
                 return
             frac, _t = Front._set_cfg()
             d_open = bool(self.awake == "D" and self.admit_d and self.state == "serving")
-            closing = bool(self.awake == "D" and self.state == "serving" and not self.admit_d)
-            decided = closing or bool(self._set_st()["go_p"])
+            decided = Front._flip_decided(self)
             if getattr(p, "d_direct", False):
                 cls = phase_policy.classify_arrival(int(remainder), int(x_set), frac, bool(getattr(p, "p_only", False)))
                 ad = phase_policy.ArrivalDecision(phase_policy.ACT_WAIT_SEAT, "R5", cls,
@@ -12093,7 +12105,7 @@ class Front:
             # EZ-S2b (R2, pdflip-2-115: 1.0 s ``D-POOL UNREADABLE`` timeout before D_NOW): a kurz request has no wait of its
             # own. A stale pool reading is refreshed in the background; this arrival goes on with the reading it has (none =
             # the gate is off by name, as with an unreadable pool) -- an unreadable pool is no reason to wait
-            _rd = Front._d_reading_nowait(self, rid)
+            _rd = await Front._d_reading_kurz(self, rid)
         else:
             _rd = await self._d_reading_if_armed()
         if self._d_token_budget_blocks(rid, est_tokens, _rd):
@@ -12342,6 +12354,12 @@ class Front:
             if rest is None:
                 self.counters["r6_rest_unreported"] += 1
                 return 0
+            if rest <= 0:
+                # EZ-S2b review A2 (SOLL R6 "laufend", rc19 pdflip-104-2646 / pdflip-0-1): D's forward of this prefill has ENDED
+                # (beacon v3 ``rest_after`` = rest - extend_len = 0): there is nothing left to move to P, so nothing counts
+                # into S. Before v3 the record kept the rest of the batch START and R6 counted a computed prefill.
+                self.counters["r6_rest_computed"] += 1
+                return 0
             if not Front._r6_redirectable(self, rid):
                 self.counters["r6_rest_not_redirectable"] += 1
                 if rest > 0 and self.__dict__.get("_r6_nr_last") != (rid, rest):
@@ -12350,38 +12368,10 @@ class Front:
                                 "to its end (stream committed or no D-prefill leg): it is no part of what P would get, "
                                 "R6 does not count it (S56, SOLL R6)", rid, rest, int(_granted), self.epoch)
                 return 0
-            if _fd.enabled() and Front._r6_kurz_running(self, rid, int(_granted)):
-                # EZ-S2b (SOLL R2 + R6, rc19 pdflip-104-2646 -> REROUTE_P why=R6 S=198182): the rest of a running prefill that
-                # began as KURZ (u < halbX at its own X) is no part of S -- kurz never belongs to a set and never makes a
-                # flip; R6 counts running prefills of set members only. A big arrival then waits its T_halb (R4).
-                self.counters["r6_rest_kurz_skipped"] += 1
-                if self.__dict__.get("_r6_kz_last") != (rid, rest):
-                    self.__dict__["_r6_kz_last"] = (rid, rest)
-                    logger.info("PDFLIP R6-REST-KURZ rid=%s d_rest=%d granted=%d epoch=%d -- a kurz D prefill (R2) is no set "
-                                "member: its rest is not counted into S, no flip for it (R2/R6, EZ-S2b)", rid, rest,
-                                int(_granted), self.epoch)
-                return 0
             counted[str(rid)] = int(rest)
             return int(rest)
 
         return _tok
-
-    def _r6_kurz_running(self, rid: str, granted: int) -> bool:
-        """S2b: did this running D prefill begin as kurz -- its priced tokens (the hand-over's, else the grant's) under halbX of
-        the X it was decided on (R2a)? No number = not provable = counted as before (the safe direction of R6)."""
-        try:
-            # the class is read from the arrival's DECISION record (``_note_x_decision``: the X and the price the hand-over was
-            # decided on), not re-derived from the grant -- a prefill with no such record is not provably kurz
-            xd = (self.__dict__.get("_x_decision") or {}).get(str(rid))
-            if xd is None or xd[1] is None:
-                return False
-            u = int(xd[1])
-            x = int(xd[0]) if int(xd[0]) > 0 else int(self.tp_prefill_max_tokens)
-            if u <= 0:
-                return False
-            return phase_policy.classify_arrival(u, x, Front._set_cfg()[0], False) == phase_policy.CLASS_KURZ
-        except Exception:  # noqa: BLE001
-            return False
 
     def _r6_redirect(self, why: str) -> List[str]:
         """S56 (SOLL R6 "auch ein laufender D prefill wird dann geflippt"): a REROUTE_P verdict MOVES the running D
@@ -13740,6 +13730,12 @@ class Front:
                 self._d_pf_book().grant(rid=rid, tokens=int(st["shorts"][rid][1]), now=now)  # X-SUM-PRICE
         if route == "P":
             st["go_p"].update(m.rid for m in members)
+            if sv.verdict == phase_policy.V_PARK_NO_SEAT:
+                # R5: no seat for the set on D = prefill and park, NO flip begins -- committed, but not a DECIDED flip
+                # (``_flip_decided``): a kurz arrival keeps waiting for its D seat
+                st.setdefault("park_no_seat", set()).update(m.rid for m in members)
+            elif st.get("park_no_seat"):
+                st["park_no_seat"].difference_update(m.rid for m in members)          # a later FLIP_P/REROUTE_P decides it
             for _m in members:
                 Front._flip_trig_note(self, _m.rid, int(_m.own_uncached or _m.uncached), "set-verdict")
             for _q in live_q:
@@ -13832,6 +13828,10 @@ class Front:
             if sv.verdict == phase_policy.V_REROUTE_P:
                 Front._r6_redirect(self, "queue-sum")  # S56
             st["go_p"].update(m.rid for m in members)
+            if sv.verdict == phase_policy.V_PARK_NO_SEAT:
+                st.setdefault("park_no_seat", set()).update(m.rid for m in members)     # R5: not a decided flip
+            elif st.get("park_no_seat"):
+                st["park_no_seat"].difference_update(m.rid for m in members)
             for _m in members:  # S28 A1: FLIP-PRICE-STALE sees this decision site too
                 Front._flip_trig_note(self, _m.rid, int(_m.own_uncached or _m.uncached), "queue-sum")
             return True
@@ -14255,6 +14255,17 @@ class Front:
                          "it goes to D; D's SEAT-AGE decides the displacement on its real KV"))
         return plan
 
+    def _flip_decided(self) -> bool:
+        """EZ-S2b review A5 (SOLL R1a): the ONE meaning of "a D->P flip is decided" -- D is CLOSING for it (admission closed, the
+        park runs) or a set is committed to it (``go_p``, D still open, e.g. KV for it not yet read) -- a PARK_NO_SEAT commitment
+        (R5: no seat = prefill and park, no flip begins) is not one. A flip that is merely
+        foreseeable (a big request waits its T_halb, R4) is not decided. Read by the arrival record (``RIDE_P``), by
+        ``_d_direct_yields`` and by the seat wait, so the three can never answer differently for one state."""
+        if self.awake != "D" or self.state != "serving":
+            return False
+        st = self._set_st()
+        return bool(not self.admit_d or (st["go_p"] - (st.get("park_no_seat") or set())))
+
     def _d_direct_yields(self, rid: str, uncached: Optional[int] = None) -> bool:
         """FLIPCYCLE H5b (02.10.): no D-direct prefill when the D->P flip is
         already foreseeable -- a request that needs P is queued. A D pass with
@@ -14272,12 +14283,16 @@ class Front:
             # it, or committed to ``go_p``). A flip that is merely foreseeable (a big request waits its T_halb, R4) is no
             # reason: D takes the kurz request (R2) -- it is not prefilled on P (rc18: 16 of 17 P legs under half X)
             try:
-                # decided = D is CLOSING for the flip (admission closed, the park runs). A committed set whose flip has not
-                # begun (go_p, D still open, e.g. no seat / KV for it yet) is not a reason: a later arrival is D's (R2/R7: no
-                # epoch rule), not a rider -- the seat path itself never reaches here with a closed door, so this reads the
-                # state the route placement and the second look after a seat wait see.
-                if not (self.awake == "D" and not self.admit_d):
+                # ONE meaning of "decided" (review A5, ``_flip_decided``, the same the arrival record reads): D is CLOSING for
+                # the flip, or a set is committed to ``go_p``. Closed door: the request rides. Committed flip at an OPEN door
+                # (no seat / KV for it yet): a request that can take a D seat NOW is D's (R2, no epoch rule); one that cannot
+                # rides the decided flip (R1a/R5) -- it never waits behind it (review A6, the hang of N9)
+                if not Front._flip_decided(self):
                     return False
+                if self.admit_d:
+                    _taken, _n = self._arrival_seat_taken(for_rid=rid)
+                    if _asr.seat_free(_taken, _n):
+                        return False
             except Exception:  # noqa: BLE001 -- no set state: nothing decided
                 return False
             self.counters["d_direct_yield"] += 1
@@ -14415,6 +14430,18 @@ class Front:
                 return False
         return True
 
+    def _rides_decided_flip(self, rid: str, taken: int, n: int) -> bool:
+        """EZ-S2b review A6 (R5/R1a, N9): a kurz request with no D seat of its own to take WAITS for the seat OR RIDES the DECIDED
+        flip -- never for ever behind a committed set (its older P members take no D seat, the seat order would hold it). Called
+        each tick after the grant was not given; True = the caller leaves the wait (routes BATCH: the flip serves it)."""
+        if not (_fd.enabled() and self.admit_d and Front._flip_decided(self)):
+            return False
+        self.counters["arrival_seat_rides_decided_flip"] += 1
+        self.counters["d_direct_yield"] += 1       # the same fact as the yield of ``_d_direct_yields`` (one decided flip, one answer)
+        logger.info("%s rid=%s verdict=ride_decided_flip taken=%d n=%d (R1a/R5: a flip is decided, this request has no D seat "
+                    "to take now: it rides P's batch instead of waiting behind the committed set)", _asr.MARKER, rid, taken, n)
+        return True
+
     async def _arrival_seat_wait(self, rid: str, est_tokens: int, max_tokens: Optional[int],
                                  uncached: Optional[int] = None, t_arrive: Optional[float] = None) -> bool:
         """ARRIVAL-SEAT (a)/(b) for an arrival D prefills itself (uncached <= X):
@@ -14456,6 +14483,8 @@ class Front:
                     if await self._arrival_seat_wait_age(rid, est_tokens, max_tokens, uncached,
                                                          waiters[rid], free, taken, n):
                         return True
+                    if Front._rides_decided_flip(self, rid, taken, n):
+                        return False
                     await asyncio.sleep(0.05)
                     continue
                 fits, why, deficit = (await self._arrival_seat_kv(est_tokens, max_tokens, rid, uncached)
@@ -14494,6 +14523,8 @@ class Front:
                                 taken, n, why, ("; backfill past head %s" % head) if backfill else "",
                                 time.time() - waiters[rid], ms)
                     return True
+                if Front._rides_decided_flip(self, rid, taken, n):
+                    return False
                 why_wait = "kv" if (free and not fits) else ("order" if free else "seat")
                 st.setdefault("wait_named", {})[rid] = why_wait   # H16V F4: the caller names the wait
                 if told != why_wait:
