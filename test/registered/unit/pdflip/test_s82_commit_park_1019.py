@@ -528,3 +528,111 @@ def test_h2_paced_read_does_not_end_a_park_with_an_ack_waiter(pp0, monkeypatch):
     _acks_after(monkeypatch, pp0, k=4)
     told._commit_park(pp0, [])
     assert cp.stats()["acks"] == 1 and cp.stats()["read"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Nach-Review 20.10.: B1 (a new request is never read behind the park), B2 (D2, D5, D8, D9)
+
+def _arrival(rid="pdflip-28-240"):
+    return type("TokenizedGenerateReqInput", (), {"rid": rid})()
+
+
+def test_b1_a_request_arriving_at_the_parking_top_is_not_read_behind_the_park(pp0, monkeypatch):
+    """rc18 20:42 shape: a request reaches PP0 in the pass whose top would park ~4 s. Its intake + store read
+    run in process_input_requests AFTER pp0_publish -- so that pass must not park (before S82 the read ran
+    while PP0 sat in the receive). RED on c36320ceac: it parks and the newcomer's read waits."""
+    n = _acks_after(monkeypatch, pp0, k=3)
+    out = told.pp0_publish(pp0, [_arrival()])
+    assert cp.stats()["n"] == 0 and n["i"] == 1                # the paced top's one harvest, no park
+    assert _admits(out) == []                                  # the acked rid follows at a later top
+    v = cp.decide(output_pending=True, control=False, carried=False, arrivals=True, admissible_any=False,
+                  decidable_any=False, open_reads=(), ack_waits=(RID,))
+    assert (v.park, v.reason) == (False, "arrivals")
+
+
+@pytest.mark.parametrize("name,arrival", [("TokenizedGenerateReqInput", True), ("BatchTokenizedGenerateReqInput", True),
+                                          ("TokenizedEmbeddingReqInput", True), ("PdFlipStoreTold", False),
+                                          ("FlushCacheReqInput", False), ("PdFlipBurstClock", False)])
+def test_b1_arrival_kinds(name, arrival):
+    assert cp.is_arrival(type(name, (), {})()) is arrival
+
+
+def test_d2_the_parks_deadline_never_outlives_its_pass(pp0):
+    """D2: a deadline left from an earlier pass would fail a later receive at once (#789, group death). The
+    slot top resets it before the park can run, and the pass's receive drops it after use."""
+    from flliper.srt.managers import scheduler_pp_mixin as m
+
+    body = inspect.getsource(m.SchedulerPPMixin._event_loop_pp_body)
+    slot = body.index("self._s82_slot = (mb_id, next_mb_id)")
+    reset = body.index("self._s82_receive_deadline = None")
+    intake = body.index("self._pp_forward_and_process_input_requests(")   # pp0_publish -> the park runs in here
+    assert slot < reset < intake
+    pp0._s82_receive_deadline = _time.monotonic() - 100.0       # a stale deadline
+    told.s82_after_commit(pp0, 0, (_time.monotonic(), True))
+    assert pp0._s82_receive_deadline is None
+
+
+def test_d5_the_price_carries_the_load(monkeypatch):
+    """D5: without START-LOADING the younger set looks cheap enough and delays the older output."""
+    _seed_rings()
+    try:
+        line = cp._fit(cp.fwd_rows())
+        fwd = cp._line_ms(line, 2431, 409472)
+        price = cp.price_ms(2431, 409472)
+        rates = sorted(v / n for n, v in LOAD)
+        assert abs(price - fwd - rates[len(rates) // 2] * 409472) < 1e-6 and price - fwd > 500.0
+        due_in = (fwd + price) / 2.0                               # forward alone would fit, with the load not
+        v = cp.age_rule(now=100.0, price=price, launch_old=100.0, down=due_in)
+        assert not v.admit and v.reason == "older-first"
+    finally:
+        pfc._reset_for_tests()
+        cp.reset_rings()
+
+
+def _single_phase(pp0, monkeypatch, k_read=3):
+    """The non-paced (#1400 single-phase) form: the park waits on PP0's own open read of a held rid."""
+    req = pp0.waiting_queue[0]
+    req.prefetch_deferred = None
+    pp0._pdflip_told_paced_on = False
+    pp0._pdflip_told_fallback_on = False
+    pp0._pdflip_told_pacing = {}
+    pp0._pdflip_store_held = {RID: req}
+    n = {"i": 0}
+
+    def can_terminate(op, tail_hold=0):
+        n["i"] += 1
+        return n["i"] >= k_read
+
+    op = SimpleNamespace(host_indices=[1], hash_value=[1])
+    pp0.tree_cache = SimpleNamespace(ongoing_prefetch={RID: SimpleNamespace(operation=op)},
+                                     can_terminate_prefetch=can_terminate,
+                                     check_prefetch_progress=lambda rid: True)
+    monkeypatch.setattr(told, "_p_held_short_reread", lambda *a, **k: False)
+    monkeypatch.setattr(told, "_pp0_told_any", lambda s, tree, req, rid, twin: (TOLD, True))
+    monkeypatch.setattr(told, "_ple_admit_at_told", lambda *a, **k: None)
+    monkeypatch.setattr(told, "_pp0_fork", lambda *a, **k: 0)
+    return req
+
+
+def _tolds(out):
+    return [o for o in out if isinstance(o, told.PdFlipStoreTold)]
+
+
+def test_d9_a_single_phase_read_landing_in_the_park_is_held_when_the_older_comes_first(pp0, monkeypatch):
+    """D9: the non-paced told IS the admission -- a read that landed in the park is held like an ack."""
+    _single_phase(pp0, monkeypatch)
+    cp.reset_rings()                                             # unmeasured -> the older set first
+    told._commit_park(pp0, [])
+    assert cp.stats()["read"] == 1 and RID in pp0._s82_hold
+
+
+def test_d8_the_single_phase_publish_honours_the_hold(pp0, monkeypatch):
+    """D8: with the rid held, the single-phase publish puts no told on the wire this pass."""
+    _single_phase(pp0, monkeypatch)
+    cp.reset_rings()
+    out = told.pp0_publish(pp0, [])
+    assert _tolds(out) == [] and RID in pp0._pdflip_store_held and RID not in pp0._pdflip_store_told
+    # positive control: the next pass (older output received, slot 0 empty) publishes it
+    pp0.mbs[0] = None
+    out2 = told.pp0_publish(pp0, [])
+    assert [t.rid for t in _tolds(out2)] == [RID]
