@@ -213,3 +213,67 @@ def test_f1_under_the_wall_a_big_victim_frees_nothing():
     f = _full_front(kv, victim_tokens=200000)
     assert _try(f, "pdflip-262-3339", 130667, 0.8) is None
     assert f.counters["arrival_seat_age_to_d"] == 0
+
+
+# ------------------------------------------------------------------------------- review A2: the basis is the head's own
+def test_a2_another_waiters_reading_between_the_heads_test_and_its_grant_does_not_lend_it_a_number(caplog):
+    """S94 review A2: the head's own KV test had NO reading (``kv=unread``); during its later await (an older waiter
+    keeps it from being ``first`` -> ``_asr_older_blocked``) another waiter's KV test read a number. The AGE PLAN and
+    F2 must decide on the HEAD's basis -- before, the shared ``st["last_kv_*"]`` slot carried the other reading into
+    F2 and the head went to D on credit without a number of its own."""
+    f = _full_front(None)
+    present = {"available": 400000, "evictable": 0, "decode_clip": 4096, "running_rids": OLD + ["pdflip-9-50"]}
+    st = f._asr_st()
+    st["waiters"]["pdflip-0-1"] = time.time() - 50.0            # an older waiter: the head is not ``first``
+    st.setdefault("fits", {})["pdflip-0-1"] = False
+    st.setdefault("age_plan", {})["pdflip-0-1"] = "none"
+    own_reading = f._arrival_seat_kv_reading
+
+    async def _older_blocked_with_a_foreign_reading(rid, t_mine, seat_is_free):
+        async def _present():
+            return present
+        f._arrival_seat_kv_reading = _present
+        try:
+            await F.Front._arrival_seat_kv(f, 2000, 256, "pdflip-0-1", 400)   # the other waiter's test of the tick
+        finally:
+            f._arrival_seat_kv_reading = own_reading
+        return True
+
+    f._asr_older_blocked = _older_blocked_with_a_foreign_reading
+    caplog.set_level(logging.INFO, logger="pdflip.front")
+    assert _try(f, "pdflip-262-3340", 2000, 0.8) is None
+    assert f.counters["arrival_seat_age_to_d"] == 0
+    assert f.counters["arrival_seat_age_seat_on_credit"] == 0
+    assert f.counters["arrival_seat_age_no_reading"] >= 1
+
+
+def test_a2_the_heads_own_number_still_takes_it_to_d_when_a_foreign_test_read_none():
+    """The other direction: the head HAD a number (D runs the younger decode, KV fits) and a foreign test in between
+    read none -- the head's own basis decides, it still goes to D by displacement."""
+    kv = {"available": 400000, "evictable": 0, "decode_clip": 4096, "running_rids": OLD + ["pdflip-9-50"]}
+    f = _full_front(kv)
+    st = f._asr_st()
+    st["waiters"]["pdflip-0-1"] = time.time() - 50.0
+    st.setdefault("fits", {})["pdflip-0-1"] = False
+    st.setdefault("age_plan", {})["pdflip-0-1"] = "none"
+    own_reading = f._arrival_seat_kv_reading
+
+    async def _older_blocked_with_no_reading(rid, t_mine, seat_is_free):
+        async def _none():
+            return None
+        f._arrival_seat_kv_reading = _none
+        try:
+            await F.Front._arrival_seat_kv(f, 2000, 256, "pdflip-0-1", 400)
+        finally:
+            f._arrival_seat_kv_reading = own_reading
+        return True
+
+    f._asr_older_blocked = _older_blocked_with_no_reading
+    seat = _try(f, "pdflip-9-40", 2000, 1.5)
+    assert seat is not None and seat.on_credit is True
+
+
+def test_a1_the_wall_room_is_named_tp0():
+    """S94 review A1 (transition): the room is D TP0's -- an upper bound of the group -- and the line says so."""
+    fits, why = R.kv_fits(130667 + 4096, RC19_WALL)
+    assert not fits and "room=TP0" in why

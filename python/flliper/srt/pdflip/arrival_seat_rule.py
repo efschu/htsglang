@@ -383,8 +383,10 @@ def kv_fits(need: int, kv_reading: Optional[Mapping]) -> Tuple[bool, str]:
     if room is not None and room < free:
         # S94: D's backup wall stands -- the reported evictable rows are not D's to give (rc19 07:15:57 D-WALL-HEAD
         # available=13568 reported_evictable=305024 payable_evictable=0 while the front read free=312036)
+        # S94 review A1 (transition until D exports its group MIN): the three numbers are D TP0's; D's admission binds
+        # per rank, so this room is an UPPER bound of what the group can begin -- the line says so (room=TP0)
         tail += f" [S94 backup wall: payable room {room} = available {int(kv_reading.get('available', 0) or 0)} + " \
-                f"payable {int(kv_reading.get('payable_evictable', 0) or 0)}]"
+                f"payable {int(kv_reading.get('payable_evictable', 0) or 0)}, room=TP0]"
         free = room
     if int(need) <= free:
         return True, f"kv need={int(need)} free={free}{tail}"
