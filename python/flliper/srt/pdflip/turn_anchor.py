@@ -97,6 +97,10 @@ GEN_PENDING_ATTR = "_pdflip_gen_pending"
 #: first message's grid (system prompt + tool list), a list of plans of the same
 #: shape as PENDING_ATTR's, ascending by position
 SYSGRID_PENDING_ATTR = "_pdflip_sysgrid_pending"
+#: CLOSE-FORK TRACK (20.10., NF rc27 pdflip-50-825 / 51-826): the step's track at the
+#: close of the message BEFORE the last one, ``floor_page(e - 1)``, when the turn
+#: track ``floor_page(i)`` lies past it -- one plan of the same shape as PENDING_ATTR's
+CLOSE_PENDING_ATTR = "_pdflip_close_pending"
 
 #: the generation prompt of a thinking Qwen3.x turn is 5 tokens, the
 #: non-thinking one 8; the same window the FORK ANCHOR uses.
@@ -381,6 +385,11 @@ def note_step(batch: Any, desc: Optional[TurnTracks], req: Any, row: int,
         _decline_unconsumed(req, sg_pend[0])
     if getattr(req, SYSGRID_PENDING_ATTR, None):
         setattr(req, SYSGRID_PENDING_ATTR, None)
+    cl_stale = getattr(req, CLOSE_PENDING_ATTR, None)
+    if cl_stale is not None:
+        _free_slot(batch, cl_stale[1])
+        _decline_unconsumed(req, cl_stale[0])
+        setattr(req, CLOSE_PENDING_ATTR, None)
     if not track_mask or len(getattr(req, "output_ids", None) or ()) > 0:
         return desc
     desc = _note_turn_twin_steps(batch, desc, req, row, prefix, end, main_track,
@@ -391,6 +400,10 @@ def note_step(batch: Any, desc: Optional[TurnTracks], req: Any, row: int,
     if tok is not None and gen_fork_armed():
         desc = _note_gen_step(batch, desc, req, row, prefix, end, main_track,
                               chunk, page, tok)
+    if tok is not None:
+        # CLOSE-FORK TRACK: armed wherever the turn anchor is (``tok``), no own switch
+        desc = _note_close_step(batch, desc, req, row, prefix, end, main_track,
+                                chunk, page, tok)
     if tok is not None and sys_grid_armed():
         desc = _note_sysgrid_steps(batch, desc, req, row, prefix, end, main_track,
                                    chunk, page, tok)
@@ -727,6 +740,137 @@ def _note_gen_step(batch: Any, desc: Optional[TurnTracks], req: Any, row: int,
     return desc
 
 
+# -- CLOSE-FORK TRACK (20.10.) -----------------------------------------------------
+CLOSE_POS_ATTR = "_pdflip_close_pos"
+#: ids between a message's close token and the next turn-start token: ``<|im_end|>``
+#: ``\n`` on the Qwen chat template. Not trusted blindly: :func:`close_fork_pos` checks
+#: that the last message and the generation prompt are opened behind the SAME two ids.
+CLOSE_SEP = 2
+
+
+def close_fork_pos(ids: Optional[Sequence[int]], tok: Optional[int], grain: int,
+                   tail: int = GEN_TAIL) -> Optional[int]:
+    """The close-fork position ``floor_grain(e - 1)``, ``e = i - CLOSE_SEP``.
+
+    ``i`` is the index of the ``<|im_start|>`` that opens the prompt's LAST message
+    (:func:`boundary`), ``e`` the index of the close token of the message before it.
+    A SIBLING that continues that earlier message (a Claude-Code side request appends
+    its instruction as one more content block to it, rc27 pdflip-51-826: PROMPT-DIVERGE
+    at=29055, prev ``</system-reminder><|im_end|>\\n<|im_start|>user``, new
+    ``</system-reminder>\\nDescribe ...``) shares ``ids[:e]`` and claims at most
+    ``floor_page(e - 1)`` (bigram keys take the next token too -- the bound turn/twin/gen
+    anchors sit on, ``twin_anchor.boundary(e)``). The turn anchor ``floor_page(i)``
+    serves it only when ``floor_page(i) <= e - 1``; on page 64 it misses
+    ``i % 64 in {0, 1, 2}``.
+
+    The separator is verified, not assumed: ``ids[i - 2:i]`` must equal the two ids in
+    front of the generation prompt's ``<|im_start|>`` (``fork_anchor.fork_cut``), which
+    the template closes the same way, and neither may be the turn-start token. Pure
+    function of the ids, the env token and the page: every PP rank derives the same
+    position, nothing is transported."""
+    i = boundary(ids, tok, tail)
+    if i is None:
+        return None
+    from flliper.srt.pdflip import fork_anchor as _fa
+
+    g = _fa.fork_cut(ids, tok, tail)
+    e = int(i) - CLOSE_SEP
+    if g is None or e < 1 or int(g) - CLOSE_SEP <= int(i):
+        return None
+    sep_last = tuple(int(x) for x in ids[e:int(i)])
+    sep_gen = tuple(int(x) for x in ids[int(g) - CLOSE_SEP:int(g)])
+    if sep_last != sep_gen or int(tok) in sep_last:
+        return None
+    grain = max(1, int(grain))
+    t = ((e - 1) // grain) * grain
+    return t if t > 0 else None
+
+
+def req_close_pos(req: Any, tok: int, grain: int) -> Optional[int]:
+    """``close_fork_pos`` of a request's PROMPT, cached on the request."""
+    ids = getattr(req, "origin_input_ids", None)
+    if ids is None:
+        return None
+    key = (len(ids), int(tok), int(grain))
+    cached = getattr(req, CLOSE_POS_ATTR, None)
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    t = close_fork_pos(ids, tok, grain)
+    try:
+        setattr(req, CLOSE_POS_ATTR, (key, t))
+    except Exception:  # noqa: BLE001
+        pass
+    return t
+
+
+def _note_close_step(batch: Any, desc: Optional[TurnTracks], req: Any, row: int,
+                     prefix: int, end: int, main_track: Optional[int], chunk: int,
+                     page: int, tok: int) -> Optional[TurnTracks]:
+    """CLOSE-FORK TRACK (20.10.; NF rc27 ..._1020_145331, pdflip-50-825 / 51-826).
+
+    THE MEASURED GAP. 50-825 (N=36064) ran [18240, 34624) + [34624, 36064) on P; its
+    tracks: 'TURN-ANCHOR TRACK ... step=[18240,34624) turn=29056 boundary=29057', the
+    chunk end 34624 and 'END-ANCHOR ... anchor=36032'. The side request 51-826 of the
+    same session ('SESSION-PREFIX ... common=29055') shares ids[:29055] = up to the
+    ``<|im_end|>`` at e = i - 2 and claims floor_page(29054) = 28992. P's own tree held
+    the KV there ('MATCH-CENSUS-DEEP rid=pdflip-51-826 reached=28992 accepted=18240
+    branching=28992') -- 50-825 had FINISHED before 51-826 was admitted, the store was
+    not consulted for that span -- but the deepest recurrent anchor at or below 28992
+    was the step start 18240: the turn anchor 29056 lay ONE token past the fork
+    (i % 64 = 1). '#969 EXTENT ... ('pdflip-51-826', 18240, 28992, 18240, 10752)':
+    10752 tokens recomputed that P's device tree held.
+
+    THE REPAIR: in exactly that geometry -- floor_page(e - 1) strictly inside the step,
+    below the step's own track, on its FLA grid (``step_target``), and not the position
+    another track already writes -- one more track in the same forward (the turn
+    anchor's machinery: one gather row per GDN/PLE layer, one mamba slot from the free
+    list; none free = no anchor, counted; no eviction, no reserve), inserted as its own
+    node before the step's insert and published with the chain. A promise to a later
+    twin like the turn/gen tracks (S52 ledger). Armed wherever the turn anchor is."""
+    t = step_target(prefix, end, req_close_pos(req, tok, page), chunk, main_track)
+    if t is None or t % max(1, int(page)) != 0:
+        return desc
+    rid = str(getattr(req, "rid", "?"))
+    if int(getattr(req, "cache_protected_len", 0) or 0) >= t:
+        return desc
+    taken = {int(p[0]) for p in (getattr(req, TWIN_PENDING_ATTR, None) or ())}
+    for attr in (PENDING_ATTR, FORK_PENDING_ATTR, GEN_PENDING_ATTR):
+        p = getattr(req, attr, None)
+        if p is not None:
+            taken.add(int(p[0]))
+    if t in taken:
+        n = _count("close_shared")
+        if _log_due(n):
+            logger.info("PDFLIP CLOSE-FORK-ANCHOR SHARED rid=%s at=%d step=[%d,%d) (n=%d; the "
+                        "turn/twin/fork/gen track writes this very position)", rid, t, prefix,
+                        end, n)
+        return desc
+    slot = _alloc_slot(batch)
+    if slot is None:
+        n = _count("close_no_slot")
+        if _log_due(n):
+            logger.info("PDFLIP CLOSE-FORK-ANCHOR SKIP rid=%s reason=no_free_slot at=%d "
+                        "step=[%d,%d) (n=%d; no eviction, no reserve)", rid, t, prefix, end, n)
+        return desc
+    if desc is None:
+        desc = TurnTracks(len(batch.reqs), need=slot_state_kinds(batch.req_to_token_pool))
+    desc.add(row, slot, t, prefix, end - prefix)
+    setattr(req, CLOSE_PENDING_ATTR, (t, slot, desc, int(prefix), int(end)))
+    from flliper.srt.pdflip import twin_anchor as _tw
+
+    _tw.note_track_planned(rid, t)
+    n = _count("close_planned")
+    if _log_due(n):
+        logger.info(
+            "PDFLIP CLOSE-FORK-ANCHOR TRACK n=%d rid=%s step=[%d,%d) at=%d turn=%s prompt=%d "
+            "main=%s (extra extend track at the close of the message before the last one: "
+            "the turn anchor lies past it, a side request continuing that message resumes "
+            "here instead of the previous anchor)", n, rid, prefix, end, t,
+            req_anchor_pos(req, tok, page), len(getattr(req, "origin_input_ids", None) or ()),
+            main_track)
+    return desc
+
+
 # -- SYS-GRID TRACK (S62 4b) ------------------------------------------------------
 SYSGRID_POS_ATTR = "_pdflip_sysgrid_pos"
 
@@ -936,7 +1080,7 @@ def _note_sysgrid_steps(batch: Any, desc: Optional[TurnTracks], req: Any, row: i
     rid = str(getattr(req, "rid", "?"))
     protected = int(getattr(req, "cache_protected_len", 0) or 0)
     taken = {int(p[0]) for p in (getattr(req, TWIN_PENDING_ATTR, None) or ())}
-    for attr in (PENDING_ATTR, FORK_PENDING_ATTR, GEN_PENDING_ATTR):
+    for attr in (PENDING_ATTR, FORK_PENDING_ATTR, GEN_PENDING_ATTR, CLOSE_PENDING_ATTR):
         p = getattr(req, attr, None)
         if p is not None:
             taken.add(int(p[0]))
@@ -986,7 +1130,8 @@ def has_pending(req: Any) -> bool:
             or bool(getattr(req, TWIN_PENDING_ATTR, None))
             or getattr(req, FORK_PENDING_ATTR, None) is not None
             or getattr(req, GEN_PENDING_ATTR, None) is not None
-            or bool(getattr(req, SYSGRID_PENDING_ATTR, None)))
+            or bool(getattr(req, SYSGRID_PENDING_ATTR, None))
+            or getattr(req, CLOSE_PENDING_ATTR, None) is not None)
 
 
 def pop_all_pending(req: Any) -> List[Tuple[str, Any]]:
@@ -1012,6 +1157,10 @@ def pop_all_pending(req: Any) -> List[Tuple[str, Any]]:
     if grid:
         setattr(req, SYSGRID_PENDING_ATTR, None)
         out.extend(("grid", p) for p in grid)
+    close = getattr(req, CLOSE_PENDING_ATTR, None)
+    if close is not None:
+        setattr(req, CLOSE_PENDING_ATTR, None)
+        out.append(("close", close))
     out.sort(key=lambda kp: int(kp[1][0]))
     return out
 
@@ -1131,11 +1280,12 @@ def insert_verdict(pend) -> Tuple[bool, str]:
 
 def _label(kind: str) -> str:
     return {"twin": "TWIN-ANCHOR", "fork": "FORK-ANCHOR",
-            "gen": "GEN-FORK-ANCHOR", "grid": "SYS-GRID-ANCHOR"}.get(kind, "TURN-ANCHOR")
+            "gen": "GEN-FORK-ANCHOR", "grid": "SYS-GRID-ANCHOR",
+            "close": "CLOSE-FORK-ANCHOR"}.get(kind, "TURN-ANCHOR")
 
 
 def _kind_prefix(kind: str) -> str:
-    return kind + "_" if kind in ("twin", "fork", "gen", "grid") else ""
+    return kind + "_" if kind in ("twin", "fork", "gen", "grid", "close") else ""
 
 
 def note_insert(req: Any, t: int, prefix_len: int, taken: bool, prompt: int,

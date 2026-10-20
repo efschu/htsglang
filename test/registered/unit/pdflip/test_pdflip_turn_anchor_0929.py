@@ -181,16 +181,20 @@ def test_the_scheduler_plans_one_slot_per_turn_row_and_frees_a_stale_one(monkeyp
     monkeypatch.setenv("FLLIPER_PDFLIP_SYS_GRID_ANCHOR", "0")
     from flliper.srt.pdflip import turn_anchor as ta
 
-    alloc = _Alloc([11, 12])
+    # CLOSE-FORK TRACK (20.10.): page 1 -- the turn anchor i never serves a side request that
+    # continues the message before LAST (claim i - 3), so the close track (no switch) joins the
+    # plan at I_LAST - 3; pinned in test_pdflip_close_fork_anchor_1020.py
+    alloc = _Alloc([11, 12, 13, 14])
     req = _sreq(PROMPT)
     desc = _plan(None, req, alloc, 0, N, N - 1)
-    assert desc is not None and desc.rows == [0] and desc.targets == [I_LAST]
+    assert desc is not None and desc.rows == [0, 0] and desc.targets == [I_LAST, I_LAST - 3]
     t, slot, d, s0, s1 = getattr(req, ta.PENDING_ATTR)
     assert (t, int(slot), d, s0, s1) == (I_LAST, 11, desc, 0, N)
+    assert getattr(req, ta.CLOSE_PENDING_ATTR)[0] == I_LAST - 3
     assert not desc.complete(), "nothing written yet"
-    # a second plan while the first was never consumed: the first slot goes back
+    # a second plan while the first was never consumed: the first slots go back
     desc2 = _plan(None, req, alloc, 0, N, N - 1)
-    assert alloc.freed == [11] and int(getattr(req, ta.PENDING_ATTR)[1]) == 12
+    assert alloc.freed == [11, 12] and int(getattr(req, ta.PENDING_ATTR)[1]) == 13
     assert desc2 is not desc
 
 
@@ -211,7 +215,14 @@ def test_the_scheduler_plans_nothing(why, kw, monkeypatch):
     alloc = _Alloc(kw.pop("alloc"))
     req = _sreq(PROMPT)
     desc = _plan(None, req, alloc, kw["prefix"], kw["end"], kw["main"], kw.get("mask", True))
-    assert desc is None and getattr(req, ta.PENDING_ATTR, None) is None, why
+    assert getattr(req, ta.PENDING_ATTR, None) is None, why
+    if why == "step before the boundary":
+        # CLOSE-FORK TRACK (20.10.): the step ends at LAST's <|im_start|>; the close fork
+        # I_LAST - 3 lies inside it and below its own track -- that track (not a turn track)
+        assert desc is not None and desc.targets == [I_LAST - 3], why
+        assert getattr(req, ta.CLOSE_PENDING_ATTR)[0] == I_LAST - 3
+    else:
+        assert desc is None, why
     assert alloc.freed == []
 
 
