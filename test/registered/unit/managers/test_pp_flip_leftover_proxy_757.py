@@ -143,6 +143,13 @@ def _victim(rank, wire):
         # "if counters is None: return" fast path makes this a true no-op --
         # restoring, not changing, this file's behaviour.
         "_pp_wait_for_proxy_readiness",
+        # HARNESS REPAIR 20.10. (interface drift, no assertion touched): the shipped receive now runs the #1057
+        # per-epoch seq guard and the #631 stamp helpers on the holder; bound off the mixin like the rest.
+        "_pp_proxy_is_not_stale",
+        "_pp_note_proxy_consumed",
+        "_pp_note_stale_proxy_dropped",
+        "_pp_stamp_of",
+        "_pp_proxy_seq_key",
     ):
         setattr(h, name, types.MethodType(getattr(SchedulerPPMixin, name), h))
     return h
@@ -236,10 +243,12 @@ class PreArmLeftover(unittest.TestCase):
         res = _run("no_drain")
         v = res.get(VICTIM, {})
         self.assertIsNotNone(v.get("error"), f"guard did not fire: {v}")
-        self.assertIn("#631 PROXY LEFTOVER REFUSED", v["error"])
-        self.assertIn(f"mb_id={LEFTOVER_STAMP[0]}", v["error"])
-        self.assertIn(f"seq={LEFTOVER_STAMP[1]}", v["error"])
-        self.assertIn(f"this rank is on mb_id={LIVE_MB}", v["error"])
+        # TEST REPAIR 20.10.: the refusal is the #1004 named stop now (pp_slot_disagreement_message, pinned by
+        # test_pdflip_p_burst_clock_h42c::test_1004_slot_mismatch_is_a_named_stop); same rule, same specimen numbers.
+        self.assertIn("#1004 SLOT DISAGREEMENT", v["error"])
+        self.assertIn(f"proxy names slot {LEFTOVER_STAMP[0]} (seq={LEFTOVER_STAMP[1]} rows={LEFTOVER_STAMP[2]}",
+                      v["error"])
+        self.assertIn(f"is launching slot {LIVE_MB}", v["error"])
 
     def test_an_output_is_never_eaten(self):
         """CORPSE S REGRESSION. The 2026-08-09 drain ate an output and PP1

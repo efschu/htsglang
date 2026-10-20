@@ -498,13 +498,19 @@ def _p_held_short_reread(scheduler, tree, req, rid: str) -> bool:
     from flliper.srt.pdflip import short_read as _sr
 
     have = _completed_prefix(tree, rid)
+    # P-PP3 1020 (rc27 _145331): the record is span-relative (the host insert is rooted at the registration's match,
+    # ``_twin_pp0_told``) while the hint and the store depth count from token 0. 13 of 23 hint re-reads compared the bare
+    # span: '#TW TWIN-REGISTER rid=pdflip-34-634 ... head=91520' then 'P-HELD-REREAD rid=pdflip-34-634 have=0 ...
+    # hint=87040' -- a re-read of a prefix PP0 already holds, which ran into the output receive (policy=timeout 3.03 s,
+    # PP0 #PGAP gpu_gap_ms=3133.3 with the queue waiting). The absolute depth is head + span, exactly the told.
+    have_abs = int(_twin.registered_head(req)) + int(have)
     why = "store"
     if not _sr.store_holds_more(rid):
         # ZERO-ANCHOR 1015 (Typ A): the store held no more at the read, but D
         # was measured to hold more (the front's hint) -- D's flush publishes
         # it at the flip; re-read after the flush, i.e. once PP0 is awake
         _ps = int(getattr(scheduler, "page_size", 0) or getattr(tree, "page_size", 1) or 1)
-        if p_hint_reread_on() and _sr.hint_beyond(rid, have, _ps):
+        if p_hint_reread_on() and _sr.hint_beyond(rid, have_abs, _ps):
             why = "hint"
         elif p_wake_probe_on() and getattr(req, WAKE_PROBE_ATTR, None) is not None:
             # ZERO-ANCHOR 1015 (3): a read issued DURING the flip (#1443) raced
@@ -512,9 +518,9 @@ def _p_held_short_reread(scheduler, tree, req, rid: str) -> bool:
             if getattr(scheduler, "pdflip_dormant", False):
                 why = "wake_probe"
             else:
-                depth = _wake_store_depth(scheduler, req, have)
+                depth = _wake_store_depth(scheduler, req, have_abs)
                 setattr(req, WAKE_PROBE_ATTR, None)   # once per dormant read
-                if depth is None or int(depth) - int(have) < _ps:
+                if depth is None or int(depth) - int(have_abs) < _ps:
                     return False
                 why = "wake_probe"
                 _sr.note_hint(rid, int(depth))   # the record the re-read must reach
@@ -550,11 +556,11 @@ def _p_held_short_reread(scheduler, tree, req, rid: str) -> bool:
     scheduler._p_held_reread_n = k
     if k <= 32 or k % 128 == 0:
         logger.info(
-            "PDFLIP P-HELD-REREAD rid=%s n=%d/%d have=%d verdict=%s why=%s hint=%d (k=%d): the read "
+            "PDFLIP P-HELD-REREAD rid=%s n=%d/%d have=%d abs=%d verdict=%s why=%s hint=%d (k=%d): the read "
             "ended short of a span the store holds (why=store) or of the depth D was measured to "
             "hold (why=hint) -- PP0 re-reads before its told (reading beats recomputing); the "
             "told follows the re-read's record",
-            _rt(rid), n + 1, cap, have, verdict, why, _sr.hint_tokens(rid), k)
+            _rt(rid), n + 1, cap, have, have_abs, verdict, why, _sr.hint_tokens(rid), k)
     if not issued:
         _sr.forget(rid)
     return issued
@@ -1485,12 +1491,17 @@ def pp0_publish(scheduler, recv_reqs: List) -> List:
     # also when nothing is held -- a twin arriving right after its sibling's
     # finish is held until that finish settled (the end anchor published).
     _twin.tick(scheduler)
-    # P-MINIFWD: a lone final rest waits (bounded, measured) for the read of a
-    # queued request, so this pass's told carries it into the same forward.
-    _minifwd_hold(scheduler, recv_reqs)
-    # S82: a pass whose output receive will block parks HERE for the first of {ack set complete, read
-    # terminable, owed output posted}, so what lands meanwhile is published/admitted in THIS pass.
-    _commit_park(scheduler, recv_reqs)
+    # W2C V1 (pdflip/pp_chain_announce.py): this pass sends the chain PP0 announced in its last frame -- the followers
+    # hold that row until they absorbed it, so NOTHING here may wait for them (S82 acks/output) or delay them (MINIFWD).
+    from flliper.srt.pdflip import pp_chain_announce as _w2c
+
+    if _w2c.pp0_take_announced(scheduler) is None:
+        # P-MINIFWD: a lone final rest waits (bounded, measured) for the read of a
+        # queued request, so this pass's told carries it into the same forward.
+        _minifwd_hold(scheduler, recv_reqs)
+        # S82: a pass whose output receive will block parks HERE for the first of {ack set complete, read
+        # terminable, owed output posted}, so what lands meanwhile is published/admitted in THIS pass.
+        _commit_park(scheduler, recv_reqs)
     paced_on = bool(getattr(scheduler, "_pdflip_told_paced_on", False))
     if paced_on:
         return _pp0_publish_paced(scheduler, recv_reqs)
@@ -1552,6 +1563,26 @@ def pp0_publish(scheduler, recv_reqs: List) -> List:
     if not out:
         return recv_reqs
     return list(recv_reqs) + out
+
+
+def w2c_publishable(scheduler) -> List[str]:
+    """W2C C2: the held, queued rids whose read-ahead the NEXT PP0 pass top publishes -- store read registered (not a
+    deferred twin, no A12.2 deferral) and terminable now. Read-only: the same predicates the publish loop (b) applies,
+    without the termination."""
+    held: Dict[str, Any] = getattr(scheduler, "_pdflip_store_held", None) or {}
+    if not held:
+        return []
+    tree = scheduler.tree_cache
+    queued = {_rid(r) for r in scheduler.waiting_queue}
+    out: List[str] = []
+    for rid, req in list(held.items()):
+        if rid not in queued or _twin.is_deferred(scheduler, rid):
+            continue
+        if getattr(req, "prefetch_deferred", None) is not None:
+            continue
+        if _read_terminable(tree, rid):
+            out.append(rid)
+    return out
 
 
 def _read_open(scheduler, tree, rid: str, held: Dict[str, Any]) -> bool:
