@@ -970,6 +970,12 @@ class HybridCacheController(BaseHiCacheController):
         _comp_txt = ",".join(f"{k}={v:.0f}" for k, v in sorted((_comp or {}).items()))
         if isinstance(_comp, dict):
             _comp.clear()
+        try:  # S82 A3 (pdflip/pp0_commit_park): PP0's measured START-LOADING rate prices a park admit
+            from flliper.srt.pdflip import pp0_commit_park as _s82cp
+
+            _s82cp.note_start_loading(_n_tok, (_sl_t3 - _sl_t0) * 1000.0)
+        except Exception:  # noqa: BLE001 -- an instrument feed never breaks the load
+            pass
         if _n_tok >= 8192 or (_sl_t3 - _sl_t0) > 0.05:
             logger.info(
                 "PDFLIP-START-LOADING tokens=%d nodes=%d total_ms=%.0f merge_move_ms=%.0f dcp_pairs_ms=%.0f "

@@ -1442,6 +1442,9 @@ def pp0_publish(scheduler, recv_reqs: List) -> List:
     # P-MINIFWD: a lone final rest waits (bounded, measured) for the read of a
     # queued request, so this pass's told carries it into the same forward.
     _minifwd_hold(scheduler, recv_reqs)
+    # S82: a pass whose output receive will block parks HERE for the first of {ack set complete, read
+    # terminable, owed output posted}, so what lands meanwhile is published/admitted in THIS pass.
+    _commit_park(scheduler, recv_reqs)
     paced_on = bool(getattr(scheduler, "_pdflip_told_paced_on", False))
     if paced_on:
         return _pp0_publish_paced(scheduler, recv_reqs)
@@ -1473,6 +1476,8 @@ def pp0_publish(scheduler, recv_reqs: List) -> List:
         if _twin.is_deferred(scheduler, rid):
             # TW: no store read registered yet -- nothing to publish.
             continue
+        if rid in (getattr(scheduler, "_s82_hold", None) or ()):
+            continue  # S82 A3: held by this pass's park -- the older set's output first (Prio = Alter)
         if getattr(req, "prefetch_deferred", None) is not None:
             # A12.2 deferral: PP0 will re-issue; the verdict is not final.
             continue
@@ -1589,6 +1594,268 @@ def _minifwd_hold(scheduler, recv_reqs: List) -> None:
         _mh.log_hold(_rid(scheduler.chunked_req), verdict, outcome, rid, waited, bound)
     except Exception as exc:  # noqa: BLE001 -- the hold is an optimisation, the pass must run
         logger.warning("P-MINIFWD-HOLD skipped (%s: %s)", type(exc).__name__, exc)
+
+
+def _s82_output_pending(scheduler) -> Optional[bool]:
+    """S82 (pdflip/pp0_commit_park.py): will the output receive at the END of this PP0 pass block?
+
+    True = the next slot (``scheduler._s82_slot``, set at the loop top) holds an in-flight batch whose
+    output is owed (``_do_recv``'s own gate: not None, not prebuilt, not skip-output) and the upstream
+    has neither posted nor started posting it -- the very counters ``_pp_wait_for_dict_readiness``
+    polls for ``kind='output'``, per-kind only. False = it will not block. None = cannot be told
+    (no slot context, no counters, an unlabelled wire, a gapped wire, async batch depth) -- no park."""
+    slot = getattr(scheduler, "_s82_slot", None)
+    if not slot:
+        return None
+    try:
+        target = scheduler.mbs[int(slot[1])]
+    except Exception:  # noqa: BLE001 - no slot ring: no statement
+        return None
+    if target is None:
+        return False
+    fm = getattr(target, "forward_mode", None)
+    if fm is not None and fm.is_prebuilt():
+        return False
+    if getattr(scheduler, "_pp_gapped_wire", False):
+        return None
+    if int(getattr(getattr(scheduler, "server_args", None), "pp_async_batch_depth", 0) or 0) > 0:
+        return None
+    from flliper.srt.managers.scheduler_pp_mixin import _pp_can_skip_output_comm
+
+    if _pp_can_skip_output_comm(target):
+        return False
+    counters = getattr(scheduler, "pp_flip_counters", None)
+    if counters is None:
+        return None
+    from flliper.srt.distributed.pp_typed_channel import resolve_src, typed_inbox
+    from flliper.srt.managers.pp_wire_channels import CHAN_DICT, kind_axis_covers
+
+    if typed_inbox(scheduler.pp_group).get((resolve_src(scheduler.pp_group, None), "output")):
+        return False  # already off the wire and stashed for the receive
+    upstream = scheduler._pp_flip_upstream()
+    if not kind_axis_covers(counters, CHAN_DICT, upstream):
+        return None
+    consumed = counters.local_consumed_of_kind(CHAN_DICT, "output")
+    if consumed < counters.sent_of_kind(CHAN_DICT, "output", upstream):
+        return False
+    if consumed < counters.attempted_of_kind(CHAN_DICT, "output", upstream):
+        return False
+    return True
+
+
+def _commit_park(scheduler, recv_reqs: List) -> None:
+    """S82 COMMIT-PARK adapter (pdflip/pp0_commit_park.py): read the pass state, let the pure verdict
+    decide, park if it says so. Never raises into the pass."""
+    from flliper.srt.pdflip import pp0_commit_park as _cp
+
+    try:
+        scheduler._s82_hold = frozenset()   # A3: this pass's held Admits (none unless the park says so)
+    except Exception:  # noqa: BLE001 - a frozen double holds nothing
+        pass
+    if not _cp.on():
+        return
+    try:
+        held: Dict[str, Any] = getattr(scheduler, "_pdflip_store_held", None) or {}
+        pacing: Dict[str, Any] = getattr(scheduler, "_pdflip_told_pacing", None) or {}
+        # cheapest facts first: nobody held or paced -> nothing can become admissible by waiting
+        if (not held and not pacing) or getattr(scheduler, "pdflip_dormant", False):
+            return
+        if _s82_output_pending(scheduler) is not True:
+            return
+        from flliper.srt.pdflip import p_minifwd_hold as _mh
+
+        tree = scheduler.tree_cache
+        told_map: Dict[str, int] = getattr(scheduler, "_pdflip_store_told", None) or {}
+        queued = [_rid(r) for r in scheduler.waiting_queue]
+        qset = set(queued)
+        paced_on = bool(getattr(scheduler, "_pdflip_told_paced_on", False))
+        fb_on = bool(getattr(scheduler, "_pdflip_told_fallback_on", False))
+        followers = range(1, int(getattr(getattr(scheduler, "ps", None), "pp_size", 1) or 1))
+
+        def _admit_state(rid: str) -> str:
+            # 'wait' = the paced Admit waits for something outside PP0; anything else decides this pass
+            if fb_on:
+                o = _fb._pp0_open_map(scheduler).get(rid)
+                if o is None or any(own != o.told for own in o.acks.values()):
+                    return "decidable"  # untracked -> FRIST 0, a mismatch -> floor/0: pp0_decide answers now
+                return "done" if all(r in o.acks for r in followers) else "wait"
+            p = pacing.get(rid)
+            if p is None or _clock() - float(p.published_at) >= float(p.window_s):
+                return "decidable"
+            return "wait"
+
+        ack_waits: List[str] = []
+        decidable_any = False
+        if paced_on:
+            for rid in list(pacing):
+                if rid not in qset:
+                    continue
+                if _admit_state(rid) == "wait":
+                    ack_waits.append(rid)
+                else:
+                    decidable_any = True
+        open_reads = [r for r in queued if _read_open(scheduler, tree, r, held)]
+        if paced_on and ack_waits:
+            # a landed read publishes only a read-ahead this pass (its Admit follows a pass later): an
+            # Admit waiting for acks is the waiter that admits IN this pass, the read does not end it
+            open_reads = []
+        verdict = _cp.decide(
+            output_pending=True,
+            control=any(type(r).__name__ in _mh.CONTROL_KINDS for r in (recv_reqs or ())),
+            carried=getattr(scheduler, "chunked_req", None) is not None,
+            admissible_any=any(r in told_map and r not in held and r not in pacing for r in queued),
+            decidable_any=decidable_any,
+            open_reads=open_reads,
+            ack_waits=ack_waits,
+        )
+        if not verdict.park:
+            return
+        harvest = (lambda: _fb.pp0_harvest(scheduler)) if (fb_on and _fb.pp0_has_stream(scheduler)) else (lambda: None)
+        from flliper.srt.managers.scheduler_pp_mixin import _pp_proxy_readiness_budget_s
+
+        bound = _pp_proxy_readiness_budget_s()
+        # A1: ONE deadline for the park and this pass's output receive (_pp_wait_for_dict_readiness takes
+        # only the rest) -- a wedge is named after the budget, never after twice the budget
+        scheduler._s82_receive_deadline = time.monotonic() + bound
+        outcome, rid, waited = _cp.wait(
+            verdict,
+            output_pending=lambda: _s82_output_pending(scheduler),
+            read_done=lambda r: _read_terminable(tree, r),
+            acks_done=lambda r: _admit_state(r) != "wait",
+            harvest=harvest,
+            bound_s=bound,
+        )
+        scheduler._s82_park_ms = float(getattr(scheduler, "_s82_park_ms", 0.0) or 0.0) + waited * 1000.0
+        _cp.log_park(verdict, outcome, rid, waited, getattr(scheduler, "_s82_slot", None))
+        # A3 (Prio = Alter): which rids would this pass admit because of the park?
+        if outcome == "acks":
+            ready = [r for r in verdict.acks if _admit_state(r) != "wait"]
+        elif outcome == "read" and not paced_on:
+            ready = [r for r in verdict.reads if _read_terminable(tree, r)]
+        else:
+            ready = []   # paced read: a read-ahead only; output/bound/error: nothing became ready by the park
+        hold = set(verdict.acks) | (set() if paced_on else set(verdict.reads))
+        if ready:
+            v = _s82_age_verdict(scheduler, ready, tree, pacing)
+            _cp.log_age(v, ready)
+            if v.admit:
+                hold -= set(ready)
+                scheduler._s82_park_admit = (time.monotonic(), v.due_in_ms)
+        scheduler._s82_hold = frozenset(hold)
+    except Exception as exc:  # noqa: BLE001 -- the park is an optimisation, the pass must run
+        logger.warning("S82 COMMIT-PARK skipped (%s: %s)", type(exc).__name__, exc)
+
+
+def _s82_cached_new(scheduler, tree, pacing, rid: str, req) -> int:
+    """The cached depth the park's ready rid is admitted at: its paced told (absolute, or span-relative to the
+    registered head), else the registered head plus what its read completed."""
+    p = pacing.get(rid)
+    head = int(_twin.registered_head(req) or 0)
+    if p is not None:
+        return int(p.told) if bool(getattr(p, "absolute", True)) else head + int(p.told)
+    entry = (getattr(tree, "ongoing_prefetch", None) or {}).get(rid)
+    op = getattr(entry, "operation", None)
+    return head + int(getattr(op, "completed_tokens", 0) or 0)
+
+
+def _s82_age_verdict(scheduler, ready, tree, pacing):
+    """A3: the Prio = Alter rule for the set the park would admit (pdflip/pp0_commit_park.age_rule)."""
+    from flliper.srt.pdflip import pp0_commit_park as _cp
+
+    reqs = {_rid(r): r for r in scheduler.waiting_queue}
+    n_new = cached_new = 0
+    for rid in ready:
+        req = reqs.get(rid)
+        if req is None:
+            continue
+        c = _s82_cached_new(scheduler, tree, pacing, rid, req)
+        cached_new += c
+        n_new += max(0, len(getattr(req, "origin_input_ids", None) or ()) - c)
+    slot = getattr(scheduler, "_s82_slot", None)
+    rec = (getattr(scheduler, "_s82_launch_rec", None) or {}).get(int(slot[1])) if slot else None
+    return _cp.age_rule(
+        now=time.monotonic(),
+        price=_cp.price_ms(n_new, cached_new),
+        launch_old=None if rec is None else float(rec[0]),
+        down=None if rec is None else _cp.down_ms(int(rec[1]), int(rec[2])),
+    )
+
+
+def s82_note_launch(scheduler, mb_id: int, batch) -> None:
+    """PP0, right after a launch returned: the slot's launch end and its size (A3 downstream samples)."""
+    try:
+        reqs = getattr(batch, "reqs", None) or ()
+        n = int(getattr(batch, "extend_num_tokens", 0) or 0)
+        cached = 0
+        for r in reqs:
+            pi = getattr(r, "prefix_indices", None)
+            cached += 0 if pi is None else len(pi)
+        recs = getattr(scheduler, "_s82_launch_rec", None)
+        if recs is None:
+            recs = scheduler._s82_launch_rec = {}
+        recs[int(mb_id)] = (time.monotonic(), n, cached)
+    except Exception:  # noqa: BLE001 -- an instrument never breaks the pass
+        pass
+
+
+def s82_output_pending_at_entry(scheduler) -> tuple:
+    """PP0, right before the output receive: ``(t_entry, pending)``; pending as ``_s82_output_pending``."""
+    try:
+        return time.monotonic(), _s82_output_pending(scheduler)
+    except Exception:  # noqa: BLE001
+        return time.monotonic(), None
+
+
+def s82_after_commit(scheduler, next_mb_id: int, entry: tuple) -> None:
+    """PP0, right after the output receive of slot ``next_mb_id``: an EXACT downstream sample when the output
+    was provably not posted at entry (the receive end is its arrival), and the A3 OUTPUT-LATE instrument when
+    this pass's park admitted the younger set. Never raises into the pass."""
+    from flliper.srt.pdflip import pp0_commit_park as _cp
+
+    try:
+        t_entry, pending = entry
+        now = time.monotonic()
+        recs = getattr(scheduler, "_s82_launch_rec", None) or {}
+        rec = recs.pop(int(next_mb_id), None)
+        if pending is True and rec is not None:
+            _cp.note_downstream(int(rec[1]), int(rec[2]), (now - float(rec[0])) * 1000.0)
+        pa = getattr(scheduler, "_s82_park_admit", None)
+        if pa is not None:
+            scheduler._s82_park_admit = None
+            park_end, due_in_ms = pa
+            late_max = 0.0 if pending is True else ((t_entry - park_end) * 1000.0 if pending is False else None)
+            predicted = None if due_in_ms is None else (t_entry - park_end) * 1000.0 - float(due_in_ms)
+            _cp.log_output_late(next_mb_id, late_max, predicted)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("S82 after-commit instrument skipped (%s: %s)", type(exc).__name__, exc)
+
+
+def pp0_after_plan(scheduler) -> None:
+    """S82 TWIN-AT-PLAN: right after PP0's plan, before its forward -- the held twins whose wait the
+    plan just resolved (the source's start depth ``s0`` is known now, p_twin_defer rule 4/5) register
+    their store read NOW, so it runs during PP0's forward instead of after it. The same
+    ``release_due`` / ``_twin_register`` the pass top runs; the told still goes on the wire at the next
+    pass top (``pp0_publish``). Nothing off PP0 changes (the followers hold the request until PP0's told
+    either way). Never raises into the pass."""
+    from flliper.srt.pdflip import pp0_commit_park as _cp
+
+    if not _cp.twin_at_plan_on():
+        return
+    try:
+        st = getattr(scheduler, _twin._ATTR, None)
+        if not st or not st.waits:
+            return
+        # s0 = the prefix the source holds when PP0 FIRST sees it admitted: here, at its plan, it is the
+        # matched prefix (at the next top a chunked source would already have grown)
+        _twin._note_s0(st, scheduler, _twin.inflight(scheduler))
+        queued = {_rid(r) for r in scheduler.waiting_queue} | _parked(scheduler)
+        released = _twin.release_due(scheduler, queued)
+        for _treq, _is_twin in released:
+            _twin_register(scheduler, _treq, _is_twin)
+        if released:
+            _cp.log_twin_at_plan([_rid(t) for t, _ in released])
+    except Exception as exc:  # noqa: BLE001 -- an accelerator, never a wall
+        logger.warning("S82 TWIN-AT-PLAN skipped (%s: %s)", type(exc).__name__, exc)
 
 
 def _note_fork(scheduler, rid: str, fork) -> None:
@@ -1904,6 +2171,7 @@ def _pp0_publish_paced(scheduler, recv_reqs: List) -> List:
     # register their store read now (the paced read clock starts here).
     for _treq, _is_twin in _twin.release_due(scheduler, queued | _parked(scheduler)):  # TW-WAKE
         _twin_register(scheduler, _treq, _is_twin)
+    _s82_hold = getattr(scheduler, "_s82_hold", None) or ()
     # (a) Admits first: an entry created in THIS pass is never admitted in it,
     # so the read-ahead always precedes its Admit by at least one pass.
     for rid in list(pacing):
@@ -1924,6 +2192,8 @@ def _pp0_publish_paced(scheduler, recv_reqs: List) -> List:
                 _fb.pp0_forget(scheduler, rid)
             logger.info("#1416e PACED-DROP rid=%s told=%d: left the queue inside the window", _rt(rid), p.told)
             continue
+        if rid in _s82_hold:
+            continue  # S82 A3: held by this pass's park -- the older set's output first (Prio = Alter)
         if fb_on:
             # PF: PP0 alone decides -- told once every follower's read
             # reproduced it, told=0 for every rank on a short read or at the

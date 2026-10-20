@@ -64717,7 +64717,7 @@
    "id": "FLLIPER_PDFLIP_FOLLOWER_REACH_TOLD",
    "kind": "env",
    "lesestellen": [
-    "managers/pdflip_store_told.py:2193"
+    "managers/pdflip_store_told.py:2463"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_FOLLOWER_REACH_TOLD",
@@ -64726,7 +64726,7 @@
    "source": {
     "file": "managers/pdflip_store_told.py",
     "kind": "os.environ",
-    "line": 2193,
+    "line": 2463,
     "tree": "nf"
    },
    "status": "harvested",
@@ -74371,6 +74371,68 @@
    ],
    "type": "os.environ"
   },
+  "FLLIPER_PDFLIP_S82_COMMIT_PARK": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": null,
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "",
+   "id": "FLLIPER_PDFLIP_S82_COMMIT_PARK",
+   "kind": "env",
+   "lesestellen": [
+    "pdflip/pp0_commit_park.py:94"
+   ],
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_S82_COMMIT_PARK",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "pdflip/pp0_commit_park.py",
+    "kind": "os.environ",
+    "line": 94,
+    "tree": "nf"
+   },
+   "status": "unexplained",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "os.environ"
+  },
+  "FLLIPER_PDFLIP_S82_TWIN_AT_PLAN": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": null,
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "",
+   "id": "FLLIPER_PDFLIP_S82_TWIN_AT_PLAN",
+   "kind": "env",
+   "lesestellen": [
+    "pdflip/pp0_commit_park.py:98"
+   ],
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_S82_TWIN_AT_PLAN",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "pdflip/pp0_commit_park.py",
+    "kind": "os.environ",
+    "line": 98,
+    "tree": "nf"
+   },
+   "status": "unexplained",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "os.environ"
+  },
   "FLLIPER_PDFLIP_SEAM_DIGEST": {
    "bare": false,
    "choices": null,
@@ -78434,7 +78496,7 @@
    "id": "FLLIPER_PDFLIP_W27_HELD_STOP",
    "kind": "env",
    "lesestellen": [
-    "managers/pdflip_store_told.py:2250"
+    "managers/pdflip_store_told.py:2520"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_W27_HELD_STOP",
@@ -78443,7 +78505,7 @@
    "source": {
     "file": "managers/pdflip_store_told.py",
     "kind": "os.environ",
-    "line": 2250,
+    "line": 2520,
     "tree": "nf"
    },
    "status": "harvested",
@@ -91444,8 +91506,8 @@
  "schema": "flliper.catalog/1",
  "stats": {
   "curated": 125,
-  "entries": 2886,
-  "envs": 2007,
+  "entries": 2888,
+  "envs": 2009,
   "explained": 310,
   "flags": 864,
   "harvested": 1785,
@@ -91453,19 +91515,19 @@
    "abweichung": 53,
    "beide": 2463,
    "nur_27b": 180,
-   "nur_nf": 225
+   "nur_nf": 227
   },
-  "unexplained": 666
+  "unexplained": 668
  },
- "tree_rev": "27b=0798c91fcd+nf=89df5c1091",
+ "tree_rev": "27b=0798c91fcd+nf=135d2829cf",
  "trees": {
   "27b": {
    "entries": 2643,
    "rev": "0798c91fcd"
   },
   "nf": {
-   "entries": 2688,
-   "rev": "89df5c1091"
+   "entries": 2690,
+   "rev": "135d2829cf"
   }
  },
  "warnungen": []
