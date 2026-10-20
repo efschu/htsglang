@@ -5118,6 +5118,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         order = []
         stack = list(node.children.values())
         self._ud_h_refusal = None
+        if str(os.environ.get("FLLIPER_PDFLIP_DUAL_LAYOUT", "")).strip() == "1":
+            # 27B DUAL (port 20.10., user 20.10.: dual unchanged): the dual P keeps its own host-children rule
+            # (FLLIPER_PDFLIP_DUAL_UD_HOST_CHILDREN, pp_slot_fidelity.unbacked_drop_subtree); rank-uniform env
+            self._ud_h_refusal = ("dual_layout_27b_rule", getattr(node, "id", "?"))
+            return False
         while stack:
             d = stack.pop()
             if not d.evicted or not d.backuped:
@@ -5130,6 +5135,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     "child_device_locked" if any(cd.lock_ref > 0 for cd in d.component_data)
                     else "child_host_locked", getattr(d, "id", "?"))
                 return False
+            if getattr(d, "_pdflip_end_anchor", False) and getattr(d, "pdflip_anchor_rid", None):
+                # 27B 1006 (test_dual_p_evict_end_anchor_1006, port 20.10.): a #1481 END anchor named for a rid is the
+                # hand-back D still reads -- the subtree stays, nothing held/locked/named is dropped (no recompute)
+                from flliper.srt.pdflip import dual_anchor_release as _dar_ud
+
+                if not _dar_ud.rid_done(getattr(d, "pdflip_anchor_rid", None)):
+                    self._ud_h_refusal = ("child_named_end_anchor", getattr(d, "id", "?"))
+                    return False
             order.append(d)
             stack.extend(d.children.values())
         host_tracker = {ct: 0 for ct in self.tree_components}

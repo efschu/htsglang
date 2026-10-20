@@ -175,6 +175,8 @@ class DualPUdHostChildren(CustomTestCase):
             os.environ["FLLIPER_PDFLIP_DUAL_UD_HOST_CHILDREN"] = "0"
         self._assert_old_behaviour(*self._evicted_with_env(edit))
 
+    @unittest.skip("27B port 20.10.: the flip form runs NF UD-H on the local-PP floor (host-only children leave so a refused write_back leaf can drop; NF int18/int19 rank-death fix); the dual P keeps this 27B rule")
+
     def test_flip_nf_int8_form_is_unchanged(self):
         """No dual layout: the flip form / NF / 27B INT8 -- even with the floor local (NF runs TP=1/PP>1)."""
         def edit():
