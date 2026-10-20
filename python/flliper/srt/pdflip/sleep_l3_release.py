@@ -85,6 +85,29 @@ def enabled() -> bool:
         return True
 
 
+def _arena_pool(pool: Any) -> Any:
+    """S86b (rc22 boot ..._9c40fe40a2_1020_094747, D 10:11:49Z, 6x): D's direct pool is the hybrid
+    ``HostPoolGroup`` (KV + Mamba). It forwards the arena calls (alloc_write, complete_write, ...) to its anchor
+    pool, the KV ``ArenaMHAHostPool``, but not ``secure_rows_to_l3`` -- ``__getattr__`` raised, every veto failed
+    closed (``vetoed_by_group=6485/6485 group_released=0``): S86 never released anything on D. The pool this step
+    works on is therefore the one that HOLDS the arena: the pool itself when it carries the call, else the group's
+    anchor pool (the FULL host rows are in its id space -- the group forwards resolve_rows/is_arena_id/staging_rows
+    to it). None = no such pool (the full veto, fail closed). Not added to the group's forward list: W3 reads
+    ``hasattr(pool, "secure_rows_to_l3")`` and would change behind its own switch
+    (FLLIPER_PDFLIP_ENABLE_W3_SPILL_ANCHOR_POOL)."""
+    if pool is None:
+        return None
+    try:
+        if callable(getattr(pool, "secure_rows_to_l3", None)):
+            return pool
+    except Exception:  # noqa: BLE001 - a forwarding pool that raises on the name: try its anchor
+        pass
+    host = getattr(getattr(pool, "anchor_entry", None), "host_pool", None)
+    if host is not None and callable(getattr(host, "secure_rows_to_l3", None)):
+        return host
+    return None
+
+
 def _slots(pool: Any, host_value: Any) -> List[int]:
     from flliper.srt.mem_cache.pool_host.arena_pool import arena_ref_slots
 
@@ -225,6 +248,7 @@ def run(tree: Any, group_max: Optional[Callable[..., List[int]]] = None, pool: A
             pool = fn() if callable(fn) else None
         except Exception:  # noqa: BLE001 - no pool: no slot to name, still every collective
             pool = None
+    pool = _arena_pool(pool)
     arena = getattr(pool, "arena", None)
     mine = int(getattr(arena, "slots", 0) or 0) if arena is not None else 0
     (n_slots,) = group_max([mine], label="s86_sleep_l3_release/slots")

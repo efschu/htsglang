@@ -601,7 +601,9 @@ def _s86_tree(nodes=()):
 
 
 def _s86_pool(slots):
-    return types.SimpleNamespace(arena=types.SimpleNamespace(slots=slots), staging_rows=0)
+    # S86b: the pool the step works on is the one that holds the arena AND secures to L3 (sleep_l3_release._arena_pool)
+    return types.SimpleNamespace(arena=types.SimpleNamespace(slots=slots), staging_rows=0,
+                                 secure_rows_to_l3=lambda hv: {"pages": 0, "lost": 0})
 
 
 def _s86_lockstep(pools, monkeypatch=None):
