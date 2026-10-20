@@ -133,6 +133,34 @@ logger = logging.getLogger(__name__)
 device_module = get_device_module()
 
 
+#: QSA-PAIR (S99): marks an operation queued by :func:`put_backup_ahead`.
+BACKUP_AHEAD_ATTR = "_qsa_pair_ahead"
+
+
+def put_backup_ahead(q, operation) -> int:
+    """QSA-PAIR (S99, NF rc22 P 10:19:45, pdflip-12-238): a direct write's
+    plain-sidecar store write (the QSA index, #106S) is what its KV slot's
+    completion waits for (``UnifiedRadixCache._qsa_pair_settle``) -- queued
+    behind D's flip backlog (``hicache_backup(34)`` on TP0) it kept 192 KV
+    pages unreadable-by-claim for the whole backlog. It goes ahead of every
+    queued KV backup instead, FIFO among the sidecar writes, in the SAME
+    queue (``join_storage_backups``, ``qsize`` and the K12 guard see it as
+    before). Small: 768 B/token against 12288 B/token of KV. Returns its
+    position in the queue."""
+    setattr(operation, BACKUP_AHEAD_ATTR, True)
+    with q.mutex:
+        dq = q.queue
+        pos = 0
+        for item in dq:
+            if item is None or not getattr(item, BACKUP_AHEAD_ATTR, False):
+                break
+            pos += 1
+        dq.insert(pos, operation)
+        q.unfinished_tasks += 1
+        q.not_empty.notify()
+    return pos
+
+
 def _mamba_snapshot_fence_needed(pool_transfers) -> bool:
     """MAMBA-SNAPSHOT-FENCE (N2): does this write op snapshot recurrent state
     (a MAMBA pool transfer with rows)? Switch FLLIPER_PDFLIP_MAMBA_SNAPSHOT_FENCE."""
@@ -1048,7 +1076,10 @@ class HybridCacheController(BaseHiCacheController):
         )
         operation.kv_page_owner_mask = kv_page_owner_mask
         operation.sidecar_only = bool(sidecar_only)
-        self.backup_queue.put(operation)
+        if operation.sidecar_only:
+            put_backup_ahead(self.backup_queue, operation)
+        else:
+            self.backup_queue.put(operation)
         return operation.id
 
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
