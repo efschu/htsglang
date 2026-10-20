@@ -31,7 +31,8 @@ wire -- the P-MINIFWD place), PP0 parks when
   (the plan would run it anyway);
 * a queued request waits on an event that resolves WITHOUT PP0: its own store read is open (held,
   no deferral) or its paced Admit waits for the followers' acks;
-* the pass carries no flip/flush/abort control request.
+* the pass carries no flip/flush/abort control request and NO new request (B1: its intake and store read
+  run right after this pass top, as before S82 -- never behind the park).
 
 It waits for the FIRST of: an ack set completes, an open read can terminate, the owed output is posted
 or the probe can no longer tell (or the readiness budget runs out). No new clock: the park and the pass's
@@ -109,6 +110,16 @@ def stats() -> dict:
     return dict(_STATE)
 
 
+#: S82 B1 (Nach-Review 20.10.): request kinds whose intake registers a store read (#1400 intake). A pass that
+#: carries one never parks -- its intake and read run right after the pass top, as before S82, not after the park.
+ARRIVAL_SUFFIXES = ("GenerateReqInput", "EmbeddingReqInput")
+
+
+def is_arrival(req) -> bool:
+    """A new request whose intake (and store read) this pass's ``process_input_requests`` runs."""
+    return type(req).__name__.endswith(ARRIVAL_SUFFIXES)
+
+
 class Verdict(NamedTuple):
     park: bool
     reason: str
@@ -121,6 +132,7 @@ def decide(
     output_pending: Optional[bool],
     control: bool,
     carried: bool,
+    arrivals: bool = False,
     admissible_any: bool,
     decidable_any: bool,
     open_reads: Sequence[str],
@@ -136,6 +148,10 @@ def decide(
         return Verdict(False, "no-blocking-commit", (), ())
     if control:
         return Verdict(False, "control", (), ())
+    if arrivals:
+        # B1: a new request's intake + store read must never wait behind the park (before S82 its read ran
+        # while PP0 sat in the receive) -- the class 'P waits for a read' this module exists to end
+        return Verdict(False, "arrivals", (), ())
     if carried:
         return Verdict(False, "carried-chunk", (), ())
     if admissible_any or decidable_any:

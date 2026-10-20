@@ -1597,6 +1597,7 @@ def _commit_park(scheduler, recv_reqs: List) -> None:
         verdict = _cp.decide(
             output_pending=True,
             control=any(type(r).__name__ in _mh.CONTROL_KINDS for r in (recv_reqs or ())),
+            arrivals=any(_cp.is_arrival(r) for r in (recv_reqs or ())),
             carried=getattr(scheduler, "chunked_req", None) is not None,
             admissible_any=any(r in told_map and r not in held and r not in pacing for r in queued),
             decidable_any=decidable_any,
@@ -1708,6 +1709,9 @@ def s82_after_commit(scheduler, next_mb_id: int, entry: tuple) -> None:
     from flliper.srt.pdflip import pp0_commit_park as _cp
 
     try:
+        # A1/D2: the park's deadline belonged to THIS pass's receive -- never to a later pass (the slot top
+        # resets it too)
+        scheduler._s82_receive_deadline = None
         t_entry, pending = entry
         now = time.monotonic()
         recs = getattr(scheduler, "_s82_launch_rec", None) or {}
