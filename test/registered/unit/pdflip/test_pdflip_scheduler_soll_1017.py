@@ -290,9 +290,11 @@ def test_r6k_class_comes_from_the_arrival_classification():
     from flliper.srt.pdflip import front as F
 
     src = inspect.getsource(F.Front._dec_arrival)
-    assert 'Front._r6k_note_class(self, rid, klass, "arrival")' in src
-    assert 'Front._r6k_note_class(self, rid, phase_policy.CLASS_KURZ, "measure_barrier")' in src
-    assert "Front._r6k_note_class(self, rid, klass, _dn.SRC_D_EXTENT)" in inspect.getsource(F.Front._measure_return)
+    assert "phase_policy.classify_arrival(int(remainder), _x6, _f6, bool(p_only)))" in src
+    assert src.index("Front._r6k_note_class(self, rid, _k6") < src.index("now = time.monotonic()")   # review K2
+    mr = inspect.getsource(F.Front._measure_return)
+    assert "Front._r6k_note_class(self, rid, klass, _dn.SRC_D_EXTENT, hx)" in mr
+    assert mr.index("Front._r6k_clear_class(self, rid)") < mr.index("sent = ")                     # review K1
 
 
 def test_r6k_the_kurz_rest_ends_on_d_before_the_flip_not_parked_at_a_chunk_boundary(monkeypatch, tmp_path):

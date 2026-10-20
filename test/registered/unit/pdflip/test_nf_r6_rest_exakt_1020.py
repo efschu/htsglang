@@ -120,7 +120,7 @@ def test_the_poll_stops_at_the_first_forward_that_has_not_ended(tmp_path):
     w.arm_done(key=1, rids=[RID_K], ready=ev1.query)
     w.note_extend(rids=[RID_K], rests=[2000], extend_lens=[1000])
     w.arm_done(key=2, rids=[RID_K], ready=ev2.query)
-    assert w.poll_done() == 0 and _read(tmp_path) == 2000                       # chunk 2 start record, nothing ended
+    assert w.poll_done() == 0 and _read(tmp_path) == 3000                       # review A1: chunk 1 still runs -> its start rest
     ev1.done = True
     assert w.poll_done() == 2 and _read(tmp_path) == 1000
 
@@ -210,7 +210,7 @@ def test_arm_helper_records_on_the_forward_stream_and_hands_the_query(tmp_path):
 
 # ------------------------------------------------------------------------------------------------ the front's verdict (R6)
 def _front_live(now, tmp_path, *, member_u, ended, rest_start=U_K, ext_len=CHUNK1, x=X_LIVE, ranks=3, klass=None, waited=3.9,
-                rid_run=RID_K):
+                rid_run=RID_K, half_x=3508):
     """The real front: D decodes, the running D prefill ``rid_run`` granted at now-1.86 and posted, its leg redirectable; its
     chunk began at now-1.0; ``ended`` = its forward's device end was polled. The set member waits ``waited`` s (live 3.9 <
     T_halb). ``klass`` = the class the running prefill went to D with (SOLL R6k; None = unknown, named)."""
@@ -219,7 +219,8 @@ def _front_live(now, tmp_path, *, member_u, ended, rest_start=U_K, ext_len=CHUNK
     f.tp_prefill_max_tokens = x
     f.t_awake = now - 60.0
     f._sync_batch_gate = lambda: None
-    add_running(f, now, tmp_path, rid_run, rest_start=rest_start, ext_len=ext_len, ended=ended, ranks=ranks, klass=klass)
+    add_running(f, now, tmp_path, rid_run, rest_start=rest_start, ext_len=ext_len, ended=ended, ranks=ranks, klass=klass,
+                half_x=half_x)
     f._d_ext_reading = lambda: dxb.read_group_full(str(tmp_path), "D", SID, session_of=lambda pid: SID)
     if member_u >= x:                                    # gross: a queued P candidate (R4)
         g = F.Pending(RID_G, "/v1/messages", {}, "t", now - waited, _a.new_event_loop().create_future(),
@@ -231,7 +232,7 @@ def _front_live(now, tmp_path, *, member_u, ended, rest_start=U_K, ext_len=CHUNK
     return f
 
 
-def add_running(f, now, tmp_path, rid, *, rest_start, ext_len, ended, ranks=3, klass=None, key=37869):
+def add_running(f, now, tmp_path, rid, *, rest_start, ext_len, ended, ranks=3, klass=None, key=37869, half_x=3508):
     """A RUNNING D prefill ``rid`` (granted, posted, leg redirectable, its chunk begun at now-1.0 on ``ranks`` real beacon
     writers, ``ended`` polled) and the class it went to D with (SOLL R6k)."""
     f._d_pf_book().grant(rid=rid, tokens=rest_start, now=now - 1.86)
@@ -251,7 +252,7 @@ def add_running(f, now, tmp_path, rid, *, rest_start, ext_len, ended, ranks=3, k
         w.poll_done()
         ws.append(w)
     if klass is not None:
-        F.Front._r6k_note_class(f, rid, klass, "arrival")
+        F.Front._r6k_note_class(f, rid, klass, "arrival", half_x)
     f.__dict__.setdefault("_test_running", {})[rid] = (ws, ev)
     return ws, ev
 
@@ -441,3 +442,74 @@ def test_r6k_controller_holds_the_flip_on_both_paths():
     assert src.count("== R6K_HOLD") == 2
     i = src.index("elif Front._r6k_finish_hold(self):")
     assert i < src.index('await self.flip("D", "P")', i)
+
+
+
+# ------------------------------------------------------------------------------------------------ review auflagen K1 K2 N1 A1 (20.10.)
+def test_a1_overlap_start_record_of_chunk2_keeps_chunk1_start_rest_until_chunk1_ended(tmp_path):
+    """Review A1 (SOLL R6, danger direction 'rest too small'): chunk 2 launched on the host while chunk 1 (3000 left, 1000 in it)
+    still runs on the device: the record stays 3000 (FIFO head), not chunk 2's 2000; chunk 1 ends -> 2000; chunk 2 ends -> 1000."""
+    (w,) = _writers(tmp_path, ranks=1)
+    ev1, ev2 = _Ev(), _Ev()
+    w.note_extend(rids=[RID_K], rests=[3000], extend_lens=[1000])
+    w.arm_done(key=1, rids=[RID_K], ready=ev1.query)
+    w.note_extend(rids=[RID_K], rests=[2000], extend_lens=[1000])
+    w.arm_done(key=2, rids=[RID_K], ready=ev2.query)
+    assert _read(tmp_path) == 3000
+    ev1.done = True
+    assert w.poll_done() == 1 and _read(tmp_path) == 2000
+    ev2.done = True
+    assert w.poll_done() == 1 and _read(tmp_path) == 1000
+
+
+def test_k1_a_kurz_class_contradicted_by_ds_exact_rest_counts_r6(monkeypatch, caplog, tmp_path):
+    """Review K1 (user 19.10. exact numbers): noted kurz at halfX 3508, but D's exact rest is 5000 >= halfX -> u >= halfX proven:
+    not kurz, R6 counts it (S = 3600 + 5000 > X -> REROUTE_P), named r6k_kurz_contradicted; no finish-hold for it."""
+    _on(monkeypatch)
+    now = time.time()
+    f = _front_live(now, tmp_path, member_u=3600, ended=False, rest_start=5000, ext_len=2048, klass="kurz")
+    with envs.FLLIPER_PDFLIP_DECIDER.override(True), caplog.at_level(logging.INFO, logger="pdflip.front"):
+        assert F.Front._r6k_finish_hold(f, now) is False
+        assert f._dc_carried_running() == 5000
+        assert f._decode_collect(now) == "P"
+    assert f.counters["r6k_kurz_contradicted"] >= 1 and f.counters["r6_redirected"] == 1
+    assert any("R6K-KURZ-CONTRADICTED rid=%s d_rest=5000 halfX=3508" % RID_K in m for m in caplog.messages)
+
+
+def test_k1_b_every_d_refusal_clears_the_kurz_note(monkeypatch, tmp_path):
+    """Review K1: D refused (no extent; and the early return of an entry without measure_class) -> the kurz note is gone, the
+    class is unknown, R6 applies as before (named)."""
+    from types import SimpleNamespace
+
+    _on(monkeypatch)
+    now = time.time()
+    f = _front_live(now, tmp_path, member_u=U_G, ended=False, klass="kurz")
+    assert RID_K in f._r6k_class
+    F.Front._measure_return(f, RID_K, SimpleNamespace(measure_class=""), None, 27890)
+    assert RID_K not in f._r6k_class
+    F.Front._r6k_note_class(f, RID_K, "kurz", "arrival", 3508)
+    F.Front._measure_return(f, RID_K, SimpleNamespace(measure_class="kurz", measured_u=1, measure_src="x"), None, 27890)
+    assert RID_K not in f._r6k_class
+
+
+def test_k2_the_class_is_noted_even_when_the_instrument_raises(monkeypatch, tmp_path):
+    """Review K2: the note stands before the instrument's try -- an instrument that raises leaves the class known."""
+    _on(monkeypatch)
+    f = _fake_front(running=["dec"], n=6, kv={"available": 400000, "evictable": 0})
+    f.tp_prefill_max_tokens = X_LIVE
+
+    def _boom(self):
+        raise RuntimeError("instrument")
+
+    monkeypatch.setattr(F.Front, "_dec_group", _boom)
+    F.Front._dec_arrival(f, RID_K, None, remainder=U_K, x_set=X_LIVE, route="short", p_only=False,
+                         t_arrive_m=time.monotonic(), n_prompt=27890)
+    assert f._r6k_class[RID_K][0] == "kurz" and f._r6k_class[RID_K][2] == 3508
+
+
+def test_n1_the_no_park_hold_closes_admission():
+    """Review N1 (R1a): on the controller path without a park the R6K hold closes admission -- no new kurz goes to D meanwhile."""
+    src = inspect.getsource(F.Front.controller)
+    i = src.index("elif Front._r6k_finish_hold(self):")
+    j = src.index("continue", i)
+    assert "self.admit_d = False" in src[i:j]

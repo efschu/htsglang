@@ -289,7 +289,7 @@ def test_a2a_overlap_chunked_done_of_chunk1_after_chunk2_started_keeps_chunk2_re
     bc.note_recv(rid=_RID9)
     bc.note_extend(rids=[_RID9], rests=[7000], extend_lens=[4096])
     bc.note_extend(rids=[_RID9], rests=[2904], extend_lens=[2904])
-    assert _read9(tmp_path) == 2904
+    assert _read9(tmp_path) == 7000      # review A1 (NF-R6-REST-EXAKT): chunk 1 not done -> its start rest (FIFO head)
     bc.note_extend_done(rids=[_RID9])
     assert _read9(tmp_path) == 2904
     bc.note_extend_done(rids=[_RID9])

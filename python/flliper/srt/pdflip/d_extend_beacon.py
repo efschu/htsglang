@@ -183,6 +183,11 @@ class DExtendBeacon:
                     rest = max(0, int(rest_list[i]))
                 except (TypeError, ValueError):
                     rest = -1
+            # review A1 (SOLL R6, danger direction "rest too small"): under overlap chunk k+1 is launched on the host while
+            # chunk k still runs on the device -- its prefix already moved past chunk k. The record then reports the start
+            # rest of the OLDEST batch of this rid whose done is not written yet (the FIFO head), never less
+            q0 = self._after.get(rid)
+            report = int(q0[0][0]) if (q0 and rest >= 0) else rest
             if rest >= 0 and len_list is not None and i < len(len_list):
                 try:
                     # FIFO per rid (review A2a): with overlap scheduling chunk k+1 is launched before chunk k's result is
@@ -190,11 +195,12 @@ class DExtendBeacon:
                     q = self._after.get(rid)
                     if q is None:
                         q = self._after[rid] = collections.deque(maxlen=64)
-                    q.append(max(0, rest - max(0, int(len_list[i]))))
+                    q.append((rest, max(0, rest - max(0, int(len_list[i])))))
                     while len(self._after) > ARMED_CAP:
                         self._after.popitem(last=False)
                 except (TypeError, ValueError):
                     pass
+            rest = report
             try:
                 off = _HDR_SIZE + (self._head % self._slots) * _REC_SIZE
                 self._head += 1
@@ -264,7 +270,7 @@ class DExtendBeacon:
             t_first = self._live.get(rid)
             if not q or t_first is None:
                 continue
-            after = q.popleft()
+            after = q.popleft()[1]
             if not q:
                 self._after.pop(rid, None)
             try:

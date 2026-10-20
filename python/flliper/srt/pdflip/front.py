@@ -12913,13 +12913,17 @@ class Front:
 
         return _tok
 
-    def _r6k_note_class(self, rid: str, klass: str, src: str) -> None:
+    def _r6k_clear_class(self, rid: str) -> None:
+        """SOLL R6k (review K1): forget the class of ``rid`` (a D refusal): unknown -> R6 as before, named."""
+        (self.__dict__.get("_r6k_class") or {}).pop(str(rid), None)
+
+    def _r6k_note_class(self, rid: str, klass: str, src: str, half_x: int = 0) -> None:
         """SOLL R6k (user decision 20.10. 21:30:15Z, "b"): the class a request was put on D with -- the arrival's exact
         CLASSIFY (R2/R3/R4/R9), D's barrier for a measured arrival (u < halfX), D's measured class after a refusal.
         Bounded like the other per-rid books."""
         book = self.__dict__.setdefault("_r6k_class", collections.OrderedDict())
         book.pop(str(rid), None)
-        book[str(rid)] = (str(klass), str(src))
+        book[str(rid)] = (str(klass), str(src), int(half_x or 0))
         while len(book) > 4096:
             book.popitem(last=False)
 
@@ -12934,8 +12938,10 @@ class Front:
         if got is None:
             self.counters["r6k_class_unknown"] += 1
             return False
-        klass, src = got
+        klass, src = got[0], got[1]
         if klass != phase_policy.CLASS_KURZ:
+            return False
+        if Front._r6k_contradicted(self, rid, rest, got):
             return False
         self.counters["r6k_kurz_stays_on_d"] += 1
         if self.__dict__.get("_r6k_last") != (rid, rest):
@@ -12944,6 +12950,22 @@ class Front:
                         "prefill runs to its end on D: its rest is not in S, it makes no flip and pulls none forward, it "
                         "is not redirected to P (SOLL R6k, user 20.10. \"b\"; R2)", rid, int(rest), int(granted), src,
                         self.epoch)
+        return True
+
+    def _r6k_contradicted(self, rid: str, rest: int, got: Tuple) -> bool:
+        """SOLL R6k + user order 19.10. "NICHTS SCHÄTZEN, EXAKTE ZAHLEN" (review K1): D's exact rest of the running prefill is
+        never larger than D's u -- a rest >= the halfX the kurz class stood on PROVES u >= halfX: the request is not kurz,
+        R6 applies as before. Named once per (rid, rest): ``r6k_kurz_contradicted``. No halfX noted: not provable, no
+        contradiction."""
+        hx = int(got[2]) if len(got) > 2 else 0
+        if hx <= 0 or int(rest) < hx:
+            return False
+        self.counters["r6k_kurz_contradicted"] += 1
+        if self.__dict__.get("_r6k_contra_last") != (rid, rest):
+            self.__dict__["_r6k_contra_last"] = (rid, rest)
+            logger.warning("PDFLIP R6K-KURZ-CONTRADICTED rid=%s d_rest=%d halfX=%d src=%s epoch=%d -- D's exact rest proves "
+                           "u >= halfX: not kurz, R6 applies (SOLL R6k; user 19.10. exact numbers)", rid, int(rest), hx,
+                           got[1], self.epoch)
         return True
 
     def _r6k_running_kurz(self, now: float) -> List[Tuple[str, int, int, float]]:
@@ -12970,6 +12992,8 @@ class Front:
             e = _dxb._entry(reading, rid)
             if e is None or e[0] < int(float(row.t_grant) * 1e9) or e[1] <= 0:
                 continue
+            if Front._r6k_contradicted(self, rid, int(e[1]), classes[rid]):
+                continue                               # review K1: not kurz -> R6's, not held
             out.append((str(rid), int(e[1]), int(row.tokens), e[0] / 1e9))
         return out
 
@@ -13780,6 +13804,18 @@ class Front:
             _n_exact = str(getattr(xx, "n_src", "")) == "front_ids"
             Front._measure_arm(self, rid, x_set, n_prompt if _n_exact else 0, int(getattr(xx, "uncached_p", -1)),
                                p_upper=bool(p_upper and not measure))
+        # SOLL R6k (review K2): the class R6 reads for a running D prefill is noted BEFORE any instrument call, outside the
+        # instrument's ``except`` (like the barrier above, review B4). A measured arrival is prefilled by D only under its
+        # barrier halfX-1 (kurz); a refusal names the measured class or clears the note (``_measure_return``)
+        try:
+            _x6 = int(x_set) if x_set else int(getattr(self, "tp_prefill_max_tokens", 0) or 0)
+            _f6 = Front._set_cfg()[0]
+            _k6 = (phase_policy.CLASS_KURZ if measure
+                   else phase_policy.classify_arrival(int(remainder), _x6, _f6, bool(p_only)))
+            Front._r6k_note_class(self, rid, _k6, "measure_barrier" if measure else "arrival",
+                                  phase_policy.half_x_of(_x6, _f6))
+        except Exception:  # noqa: BLE001 -- no class: R6 applies as before, named (r6k_class_unknown)
+            Front._r6k_clear_class(self, rid)
         try:
             now = time.monotonic()
             frac = Front._set_cfg()[0]
@@ -13791,9 +13827,6 @@ class Front:
                                  why="uncached=%d X=%d (#11: the route verdict)" % (int(remainder), int(x)))
             if measure:
                 cb = getattr(xx, "class_basis", None)
-                # SOLL R6k: D prefills a measured request only under its barrier halfX-1 (D's exact u < halfX) -- what runs on
-                # D from here is kurz; a refusal names the measured class (``_measure_return`` overwrites it)
-                Front._r6k_note_class(self, rid, phase_policy.CLASS_KURZ, "measure_barrier")
                 Front._measure_start(self, rid, x, "%s; route=%s" % (cb.why if cb is not None else "no exact number", route),
                                      u_p=int(getattr(xx, "uncached_p", -1)), t_dec=t_dec, grp=grp,
                                      n_prompt=n_prompt if _n_exact else 0)
@@ -13811,7 +13844,6 @@ class Front:
                 why = cb.why if cb is not None else "u from %s" % src
             Front._num_note(self, rid, src, now - age / 1000.0)
             klass = phase_policy.classify_arrival(int(remainder), x, frac, bool(p_only))
-            Front._r6k_note_class(self, rid, klass, "arrival")  # SOLL R6k: the class R6 reads for a running D prefill
             rule = {phase_policy.CLASS_KURZ: "R2", phase_policy.CLASS_HALB: "R3", phase_policy.CLASS_GROSS: "R4",
                     phase_policy.CLASS_P_ONLY: "R9"}[klass]
             seq = Front._dec(self).record(_dr.Decision(
@@ -13863,6 +13895,9 @@ class Front:
         class is deleted (the state path takes it as before). The caller sets the owner (kurz -> D, halb -> the set,
         gross -> R4/R8) from the returned class. ``n_prompt`` is the PROMPT length (the depth of the class is
         ``n_prompt - u``), never the requeue counter."""
+        # SOLL R6k (review K1): D refused this request -- a kurz note no longer stands (with an extent the measured class
+        # is noted below; without one the class is unknown and R6 applies as before, named)
+        Front._r6k_clear_class(self, rid)
         try:
             sent = (self.__dict__.get("_measure_sent") or {}).pop(str(rid), None)
             if not envs.FLLIPER_PDFLIP_EXACT_CLASS.get():
@@ -13891,7 +13926,7 @@ class Front:
             page = Front._d_page_size(self)
             self.counters["measure_return_" + klass] += 1
             p.measured_u, p.measure_src, p.measure_class = u, _dn.SRC_D_EXTENT, klass
-            Front._r6k_note_class(self, rid, klass, _dn.SRC_D_EXTENT)  # SOLL R6k: D's measured class replaces the barrier's
+            Front._r6k_note_class(self, rid, klass, _dn.SRC_D_EXTENT, hx)  # SOLL R6k: D's measured class
             if reclass:
                 self.counters["measure_reclass_" + klass] += 1
             under = klass == _dn.CLASS_KURZ
@@ -20929,7 +20964,10 @@ class Front:
                                                            cause="before-flip") == R6K_HOLD:
                                 continue  # SOLL R6k: finished on D before the flip
                         elif Front._r6k_finish_hold(self):
-                            continue  # SOLL R6k: no park on this path -- the flip still begins only after the kurz rest
+                            # SOLL R6k: no park on this path -- the flip still begins only after the kurz rest; admission closes
+                            # (review N1, R1a: a new kurz request rides the decided flip instead of starting on D now)
+                            self.admit_d = False
+                            continue
                         await self.flip("D", "P")
                     continue
                 # awake == P: prefill the backlog until empty (#1011 PP exit
