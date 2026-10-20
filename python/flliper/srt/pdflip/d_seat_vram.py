@@ -3015,15 +3015,39 @@ def _air(sched) -> int:
     return air_tokens(max(0, chunk), _cap_of(sched), verify)
 
 
+def _kv_blockers_local(sched) -> Tuple[int, int]:
+    """S112: this rank's in-flight write-throughs and load-backs (tree bookkeeping, no
+    device read) -- what a refused KV-COMPACT may be waiting on besides an end event."""
+    tree = getattr(sched, "tree_cache", None)
+    return (len(getattr(tree, "ongoing_write_through", None) or {}),
+            len(getattr(tree, "ongoing_load_back", None) or {}))
+
+
 def _group_floor_tokens(sched) -> int:
     """The group's highest live KV page in tokens -- MAX over the ranks, one
-    collective, entered only when the replicated machine may shrink."""
+    collective, entered only when the replicated machine may shrink.
+
+    S112: the same collective carries the group MIN/MAX of the in-flight write-through
+    and load-back counts (``_kv_blockers_local``); the reduced fingerprint is kept on
+    the scheduler (``KV_BLOCKERS_ATTR``). A refused compaction is looked at again when
+    it changed -- a write-through that landed (S108 puts one in flight at every turn
+    end) frees what the refusal waited for without an end event (S98e gap). Replicated:
+    the reduced values, the same on every rank; no new collective."""
     alloc = _kv_allocator(sched)
     local = max_live_page(alloc) * _page_size(sched) if alloc is not None else 0
+    wt, lb = _kv_blockers_local(sched)
     gmin = getattr(sched, "_pdflip_group_min_ints", None)
     if gmin is None:
+        setattr(sched, KV_BLOCKERS_ATTR, (wt, wt, lb, lb))
         return int(local)
-    return -int(gmin([-int(local)])[0])
+    out = [int(x) for x in gmin([-int(local), int(wt), -int(wt), int(lb), -int(lb)])]
+    if len(out) >= 5:
+        setattr(sched, KV_BLOCKERS_ATTR, (out[1], -out[2], out[3], -out[4]))
+    return -int(out[0])
+
+
+#: S112: the group fingerprint of in-flight write-throughs / load-backs (floor read)
+KV_BLOCKERS_ATTR = "_pdflip_kv_compact_blockers"
 
 
 #: NF1d 09291811: the line a pending shrink's cap is handed back to the
@@ -3693,8 +3717,21 @@ def _kv_compact_tree_ok(sched) -> bool:
     return KC.tree_why(getattr(sched, "tree_cache", None)) is None
 
 
-#: S98c: how often the ranks' page plans differed (uniform refusal, nothing moved)
+#: S98c: how often the ranks' eviction plans differed (uniform refusal, nothing moved)
 _KV_COMPACT_PLAN_DIFF = [0]
+#: S112: refusal reasons by class (digits folded) -- the logged-line gate (n <= 16 and
+#: powers of two) hid every class after n=16 (rc27 1020_145331: n=17..31 and 33..63
+#: unlogged while 6 blocked shrinks stood in the log, among them used=0 at 15:06:12)
+_KV_COMPACT_REASONS: Dict[str, int] = {}
+
+
+def _kv_compact_running(sched) -> list:
+    """S112: the running DECODE requests -- the only lock holders a page move may
+    follow (their rows and prefix tensors are re-pointed). A chunked request, the
+    requests of an unmerged extend and every other holder are not here: their locks
+    stay unexplained, their pages stay pins."""
+    return [r for r in list(getattr(getattr(sched, "running_batch", None), "reqs", None) or ())
+            if getattr(r, "req_pool_idx", None) is not None]
 
 
 def _kv_compact_rank_survey(sched, floor_page: int):
@@ -3713,21 +3750,35 @@ def _kv_compact_rank_survey(sched, floor_page: int):
         copier = KvPageCopier.from_buffers(bufs, page)
     except KvCopyRefused as exc:
         return None, "copier: %s" % exc, None
-    sv = KC.survey(getattr(sched, "tree_cache", None), alloc, page, int(floor_page))
+    rtt = getattr(_req_pool(sched), "req_to_token", None)
+    sv = KC.survey(getattr(sched, "tree_cache", None), alloc, page, int(floor_page),
+                   running=_kv_compact_running(sched) if rtt is not None else (), req_to_token=rtt)
     return sv, sv.why, copier
 
 
-def _kv_compact_vote(sv, why, floor_page: int, top_page: int) -> List[int]:
-    """S98: this rank's ONE vote vector (fixed length from the replicated floor/top):
-    [ok] + destinations (MIN) + page codes (MIN) + negated page codes (-> MAX)."""
+def _kv_compact_local_gaps(sv, boundaries: Sequence[int]) -> List[int]:
     from flliper.srt.pdflip import d_kv_compact as KC
 
-    B, T = int(floor_page), int(top_page)
     if sv is None:
-        return [0] + [0] * B + [KC.CODE_BLOCK] * (T - B) + [-KC.CODE_BLOCK] * (T - B)
-    dest, above, w = KC.page_codes(sv, T)
+        return [1 << 30] * len(boundaries)
+    return [int(KC.local_gap(sv, int(b))) for b in boundaries]
+
+
+def _kv_compact_vote(sv, why, floor_page: int, top_page: int,
+                     boundaries: Optional[Sequence[int]] = None) -> List[int]:
+    """S112: this rank's ONE vote vector, fixed length from replicated inputs (the top
+    page and the candidates): [ok] + negated local gap per candidate (-> MAX) + a code
+    for EVERY page 1..top (MIN) + the negated codes (-> MAX). The pages below the
+    lowest boundary are voted too: a backed idle unit there is room once evicted."""
+    from flliper.srt.pdflip import d_kv_compact as KC
+
+    T = int(top_page)
+    bounds = [int(floor_page)] if boundaries is None else [int(b) for b in boundaries]
+    if sv is None:
+        return [0] + [-(1 << 30)] * len(bounds) + [KC.CODE_BLOCK] * T + [-KC.CODE_BLOCK] * T
+    codes, w = KC.page_codes(sv, T)
     ok = 1 if (why is None and w is None) else 0
-    return [ok] + dest + above + [-c for c in above]
+    return [ok] + [-g for g in _kv_compact_local_gaps(sv, bounds)] + codes + [-c for c in codes]
 
 
 def _kv_compact_group_vote(sched, vec: List[int]) -> List[int]:
@@ -3740,21 +3791,28 @@ def _kv_compact_group_vote(sched, vec: List[int]) -> List[int]:
     return out
 
 
-def _kv_compact_plans_from_vote(sv, group: List[int], floor_page: int, top_page: int,
-                                boundaries: Sequence[int]):
-    """(plans, why) per candidate boundary, planned on the GROUP-agreed survey."""
+def _kv_compact_agreement(group: List[int], top_page: int, boundaries: Sequence[int]):
     from flliper.srt.pdflip import d_kv_compact as KC
 
-    B, T = int(floor_page), int(top_page)
+    T, k = int(top_page), len(boundaries)
+    gaps = {int(b): -int(group[1 + i]) for i, b in enumerate(boundaries)}
+    lo = [int(x) for x in group[1 + k:1 + k + T]]
+    hi = [-int(x) for x in group[1 + k + T:1 + k + 2 * T]]
+    return KC.Agreement(lo, hi, gaps)
+
+
+def _kv_compact_plans_from_vote(sv, group: List[int], floor_page: int, top_page: int,
+                                boundaries: Sequence[int]):
+    """(plans, why) per candidate boundary: the evictions from the GROUP-agreed codes
+    and gaps (the same on every rank), the moves from this rank's own pages (S112)."""
+    from flliper.srt.pdflip import d_kv_compact as KC
+
     if sv is None or int(group[0]) != 1:
         return [None] * len(boundaries), ""
-    dest = group[1:1 + B]
-    lo = group[1 + B:1 + B + (T - B)]
-    hi = [-int(x) for x in group[1 + B + (T - B):]]
-    agreed = KC.agreed_survey(sv, T, dest, lo, hi)
+    ag = _kv_compact_agreement(group, top_page, boundaries)
     plans, why = _Plans(), ""
     for b in boundaries:
-        pl, w = KC.plan_for(agreed, int(b))
+        pl, w = KC.plan_for(sv, int(b), ag)
         plans.append(pl)
         plans.whys.append("" if pl is not None else w)
         if pl is None and not why:
@@ -3785,11 +3843,19 @@ def _kv_compact_stage_reasons(cands, whys) -> str:
     return "; ".join(out)
 
 
-def _kv_compact_page_witness(sched, sv, page: int, vec=None, floor_page: int = 0) -> str:
+def _kv_compact_reason_class(why: str) -> str:
+    """S112: the refusal's class -- digits folded, cut at the first ':' detail."""
+    w = re.sub(r"\b\d+\b", "N", why or "a peer rank cannot clear the boundary")
+    return w.split(" -- ")[0].split(":")[0][:80]
+
+
+def _kv_compact_page_witness(sched, sv, page: int, vec=None, floor_page: int = 0,
+                             top_page: Optional[int] = None, k: int = 1) -> str:
     """S98e: what holds ``page`` on THIS rank, read where it lives -- rank-local, no
     collective, logged only on a refusal. Kinds: free / release list / staged free /
     withheld by a cap / tree node (id, lock, write-through, load-back, backed, two
-    owners) / a running or waiting request (rid, from req_to_token) / nobody known."""
+    owners, move-only) / a running or waiting request (rid, from req_to_token) /
+    nobody known."""
     import torch
 
     from flliper.srt.pdflip import d_kv_compact as KC
@@ -3798,11 +3864,10 @@ def _kv_compact_page_witness(sched, sv, page: int, vec=None, floor_page: int = 0
     alloc = _kv_allocator(sched)
     p = int(page)
     kinds = []
-    if vec is not None and p > int(floor_page):
-        B = int(floor_page)
-        T = (len(vec) - 1 - B) // 2 + B
-        if p <= T:
-            kinds.append("vote=%d" % int(vec[1 + B + (p - B - 1)]))
+    if vec is not None:
+        T = int(top_page) if top_page is not None else (len(vec) - 1 - int(k)) // 2
+        if 1 <= p <= T:
+            kinds.append("vote=%d" % int(vec[1 + int(k) + (p - 1)]))
     for name in ("free_pages", "release_pages"):
         ids = KC._id_tensor(getattr(alloc, name, None))
         if bool((ids == p).any()):
@@ -3815,15 +3880,16 @@ def _kv_compact_page_witness(sched, sv, page: int, vec=None, floor_page: int = 0
         if bool((KC._id_tensor(getattr(cap, "_withheld", None)) == p).any()):
             kinds.append("withheld(cap=%s)" % getattr(cap, "cap", "?"))
     np_ = getattr(sv, "owner", {}).get(p) if sv is not None else None
-    if np_ is not None:
+    if np_ is not None and np_.node is not None:
         node = np_.node
         nid = getattr(node, "id", "?")
         tree = getattr(sched, "tree_cache", None)
         locks = [int(getattr(cd, "lock_ref", 0) or 0) for cd in node.component_data]
-        kinds.append("tree(node=%s locks=%s wt=%s lb=%s backed=%s pinned=%s)" % (
+        kinds.append("tree(node=%s locks=%s wt=%s lb=%s backed=%s pinned=%s move_only=%s)" % (
             nid, locks, nid in (getattr(tree, "ongoing_write_through", None) or {}) or
             getattr(node, "write_through_pending_id", None) is not None,
-            nid in (getattr(tree, "ongoing_load_back", None) or {}), np_.backed, np_.pinned))
+            nid in (getattr(tree, "ongoing_load_back", None) or {}), np_.backed, np_.pinned,
+            np_.move_only))
     rtt = getattr(_req_pool(sched), "req_to_token", None)
     reqs = list(getattr(getattr(sched, "running_batch", None), "reqs", None) or [])
     for r in reqs + list(getattr(sched, "waiting_queue", None) or []):
@@ -3849,52 +3915,146 @@ def _kv_compact_rank_plans(sched, boundaries: Sequence[int], top_page: Optional[
     T = int(top_page) if top_page is not None else int(getattr(alloc, "num_pages", 0) or 0)
     T = max(T, max(int(b) for b in boundaries))
     sv, why, copier = _kv_compact_rank_survey(sched, B)
-    vec = _kv_compact_vote(sv, why, B, T)
+    vec = _kv_compact_vote(sv, why, B, T, boundaries)
     if vec[0] != 1:
         return [None] * len(boundaries), why or "this rank cannot vote", copier
     plans, w = _kv_compact_plans_from_vote(sv, vec, B, T, boundaries)
     return plans, w, copier
 
 
-def _group_same(sched, value: int) -> Tuple[int, int]:
-    """(MIN, MAX) of one int over the group (one collective); local without a group."""
+def _group_same(sched, value):
+    """(MIN, MAX) over the group -- of one int, or element-wise of a list of ints (one
+    collective either way); local without a group."""
+    vals = [int(value)] if not isinstance(value, (list, tuple)) else [int(v) for v in value]
     gmin = getattr(sched, "_pdflip_group_min_ints", None)
     if gmin is None:
-        return int(value), int(value)
-    r = [int(x) for x in gmin([int(value), -int(value)])]
-    return r[0], -r[1]
+        lo, hi = list(vals), list(vals)
+    else:
+        r = [int(x) for x in gmin(vals + [-v for v in vals])]
+        lo, hi = r[:len(vals)], [-x for x in r[len(vals):2 * len(vals)]]
+    if not isinstance(value, (list, tuple)):
+        return lo[0], hi[0]
+    return lo, hi
+
+
+def _kv_compact_remap_requests(sched, page_size: int):
+    """S112: the request side of a page move -- a callable for ``execute_moves`` that
+    re-points every request row (``req_to_token``, up to its allocated length) and every
+    ``prefix_indices`` naming a moved page: the running decode batch, the queue, the
+    chunked request and the last batch's requests. Computed first, assigned at once (the
+    row in place: CUDA graphs captured the tensor, not its values). Runs after the
+    compaction's own device sync, before the next batch is prepared
+    (``get_next_batch_to_run``): the next forward reads the new rows; the previous one
+    has landed. Returns the number of rows and tensors it re-pointed."""
+    import torch
+
+    P = max(1, int(page_size))
+
+    def _reqs():
+        out, seen = [], set()
+        groups = [list(getattr(getattr(sched, "running_batch", None), "reqs", None) or ()),
+                  list(getattr(sched, "waiting_queue", None) or ()),
+                  [getattr(sched, "chunked_req", None)],
+                  list(getattr(getattr(sched, "last_batch", None), "reqs", None) or ())]
+        for g in groups:
+            for r in g:
+                if r is not None and id(r) not in seen:
+                    seen.add(id(r))
+                    out.append(r)
+        return out
+
+    def _apply(t, lut, hi):
+        v = t.to(torch.int64)
+        pg = torch.div(v, P, rounding_mode="floor")
+        ok = (v >= 0) & (pg <= hi)
+        new = torch.where(ok, lut[pg.clamp(0, hi)] * P + (v - pg * P), v)
+        return new.to(t.dtype), bool((new != v).any())
+
+    def remap(pairs: Dict[int, int]) -> int:
+        if not pairs:
+            return 0
+        rtt = getattr(_req_pool(sched), "req_to_token", None)
+        hi = max(max(pairs), max(pairs.values()))
+        rows, tens = [], []
+        reqs = _reqs()
+        if rtt is not None:
+            lut = torch.arange(hi + 1, dtype=torch.int64, device=rtt.device)
+            lut[torch.tensor(list(pairs.keys()), dtype=torch.int64, device=rtt.device)] = torch.tensor(
+                list(pairs.values()), dtype=torch.int64, device=rtt.device)
+            done_idx = set()
+            for r in reqs:
+                idx = getattr(r, "req_pool_idx", None)
+                if idx is None or int(idx) in done_idx:
+                    continue
+                done_idx.add(int(idx))
+                m = min(int(rtt.shape[1]), max(1, _kv_req_alloc_len(r)))
+                new, changed = _apply(rtt[int(idx), :m], lut, hi)
+                if changed:
+                    rows.append((int(idx), m, new))
+        for r in reqs:
+            pi = getattr(r, "prefix_indices", None)
+            if isinstance(pi, torch.Tensor) and pi.numel():
+                lut2 = torch.arange(hi + 1, dtype=torch.int64, device=pi.device)
+                lut2[torch.tensor(list(pairs.keys()), dtype=torch.int64, device=pi.device)] = torch.tensor(
+                    list(pairs.values()), dtype=torch.int64, device=pi.device)
+                new, changed = _apply(pi, lut2, hi)
+                if changed:
+                    tens.append((r, new))
+        for idx, m, new in rows:
+            rtt[idx, :m].copy_(new)
+        for r, new in tens:
+            r.prefix_indices = new
+        return len(rows) + len(tens)
+
+    return remap
+
+
+def _kv_req_alloc_len(r) -> int:
+    n = int(getattr(r, "kv_allocated_len", 0) or 0)
+    seq = int(len(getattr(r, "origin_input_ids", ()) or ()) + len(getattr(r, "output_ids", ()) or ()))
+    return max(n, seq)
 
 
 def _kv_compact_for_shrink(sched, ms, fr, want: int, end: bool, floor_tokens: int) -> Optional[int]:
-    """S77-A: the floor blocks the shrink to ``want``: move the tree's idle pages
-    above the boundary down (``d_kv_compact``), then return the GROUP floor read
-    afresh -- or None when no rank moved.
+    """S77-A: the floor blocks the shrink to ``want``: move the pages above the
+    boundary down (``d_kv_compact``), evicting agreed backed idle units for room, then
+    return the GROUP floor read afresh -- or None when no rank moved.
 
     REPLICATED entry: MemSched calls this only on a shrink the GROUP floor blocks.
     Every input of the decision is replicated (want, end, the floor, the stage); a
-    refused (or fruitless) attempt is not repeated for the same (want, stage)
-    before the next end event -- also while the shrink is pending.
+    refused attempt is not repeated for the same (want, stage) before the next end
+    event -- S112: or before the group's write-through / load-back fingerprint (read in
+    the floor collective) changed.
 
     Collectives, all entered by every rank on the same path:
-    1. S98: the VOTE, one MIN over [ok, destinations free here, page codes, negated
-       page codes] (``_kv_compact_vote``); every rank plans every candidate on the
-       agreed survey (``d_kv_compact.agreed_survey``: backed = group AND) and picks
-       the lowest stage it clears (moves only first) -- replicated input, same pick;
-    2. N3 the plan DIGEST (jj, page pairs, evicted pages) as MIN/MAX, entered by
-       every rank after a yes vote (-1 without a plan): S98c unequal = a uniform,
-       named refusal (nothing moved yet), no longer a crash-stop;
-    3. N3 the MOVES' outcome as MIN/MAX: all moved -> go on; none moved (each
-       rolled back) -> refused, nothing changed anywhere; mixed -> crash-stop;
-       S98c: any other exception in the move step enters as -1 (state unknown) ->
+    1. the VOTE, one MIN over [ok, negated local gap per candidate, a code per page,
+       negated codes] (``_kv_compact_vote``);
+    2. the PLAN check, one MIN/MAX over [plan here per candidate, eviction per
+       candidate, eviction digest per candidate]: the stage is the lowest candidate
+       every rank can clear with the same evictions (moves first, as before); a
+       candidate every rank can clear but with other evictions is a uniform, named
+       refusal (``refused-plan-diff``), nothing moved;
+    3. the MOVES' outcome as MIN/MAX: all moved -> go on; none moved (each rolled
+       back) -> refused; mixed -> crash-stop; any other exception enters as -1 ->
        the named crash-stop on every rank, never a rank that skips the collective;
-    4. only then the evictions (the d_seat_compact order: move first), outcome
-       MIN/MAX: anything but "all evicted" -> crash-stop;
-    5. the floor re-read (MAX)."""
+    4. the EVICTIONS (agreed units of backed idle device leaves), outcome MIN/MAX:
+       anything but "all evicted" -> crash-stop. S112: evictions that free a page at
+       or below the boundary make the room the moves take and go BEFORE 3
+       (``Plan.evict_first``, from agreed pages: the same order on every rank);
+    5. the floor re-read (MAX).
+
+    S112 (NF rc27 893d09fa3f, boot 1020_145331): the MOVES are rank-local. The
+    allocators of the D ranks are no replicas under Form A (n=64, 15:16:55: page 3996
+    free on TP0, node 189 on TP1/TP2 -- the finish of pdflip-4-73 inserted at anchor
+    depth 90880 on TP0 and 90624 on the workers); a move changes no tree, only page
+    ids, so each rank moves its own pages onto its own room. The group decides the
+    stage and the evictions (R11: one verdict, the same on every rank)."""
     from flliper.srt.pdflip import d_kv_compact as KC
 
     tokens = ms.stage_tokens
     key = (int(want), int(ms.stage))
-    if not end and fr.get("compact_refused") == key:
+    blockers = getattr(sched, KV_BLOCKERS_ATTR, None)
+    if not end and fr.get("compact_refused") == key and fr.get("compact_refused_fp") == blockers:
         fr["compact_skipped"] = int(fr.get("compact_skipped", 0)) + 1
         return None
     f = ms._smallest_holding(int(floor_tokens))
@@ -3907,39 +4067,43 @@ def _kv_compact_for_shrink(sched, ms, fr, want: int, end: bool, floor_tokens: in
     bounds = [int(tokens[jj]) // page for jj in cands]
     floor_page = min(bounds)
     top_page = int(tokens[int(ms.stage)]) // page
-    # S98: ONE collective -- the vote. Every rank plans on the group-agreed survey
-    # (backed = group AND, blocking = group OR, destinations = free on every rank),
-    # so the pick, the moves and the evictions are the same on every rank whose tree
-    # holds the same nodes; the digest below still checks exactly that.
+    k = len(cands)
     try:
         sv, why, copier = _kv_compact_rank_survey(sched, floor_page)
     except Exception as exc:  # noqa: BLE001 -- a survey failure is this rank's "no"
         sv, why, copier = None, "%s: %s" % (type(exc).__name__, exc), None
-    vec = _kv_compact_vote(sv, why, floor_page, top_page)
+    vec = _kv_compact_vote(sv, why, floor_page, top_page, bounds)
     if vec[0] != 1 and not why:
         why = "this rank cannot vote"
     group = _kv_compact_group_vote(sched, vec)
     try:
         plans, pwhy = _kv_compact_plans_from_vote(sv, group, floor_page, top_page, bounds)
-    except Exception as exc:  # noqa: BLE001 -- replicated input: every rank fails alike
-        plans, pwhy = [None] * len(cands), "%s: %s" % (type(exc).__name__, exc)
+    except Exception as exc:  # noqa: BLE001 -- planning failed here: this rank answers "no plan"
+        plans, pwhy = [None] * k, "%s: %s" % (type(exc).__name__, exc)
     if not why:
         why = pwhy if int(group[0]) == 1 else ""
-    k = len(cands)
     anys = [1 if p is not None else 0 for p in plans]
-    pick = next((i for i in range(k) if plans[i] is not None and not plans[i].evicts), None)
-    if pick is None:
-        pick = next((i for i in range(k) if plans[i] is not None), None)
     _KV_COMPACT_N[0] += 1
     n = _KV_COMPACT_N[0]
 
-    def _refused():
+    def _log_gate(cls: str) -> bool:
+        c = _KV_COMPACT_REASONS.get(cls, 0) + 1
+        _KV_COMPACT_REASONS[cls] = c
+        return n <= 16 or (n & (n - 1)) == 0 or c == 1
+
+    def _census() -> str:
+        return ",".join("%s=%d" % (re.sub(r"\W+", "_", c)[:28].strip("_"), v)
+                        for c, v in sorted(_KV_COMPACT_REASONS.items(), key=lambda kv: -kv[1])[:6])
+
+    def _refused(kind: str = "refused"):
         fr["compact_refused"] = key
-        if n <= 16 or (n & (n - 1)) == 0:
-            logger.info("%s n=%d verdict=refused want=S%d stage=S%d floor=%d end=%s local=%s -- %s",
-                        KV_COMPACT_MARK, n, int(want), int(ms.stage), int(floor_tokens),
-                        "yes" if end else "no", "".join(str(x) for x in anys),
-                        why or "a peer rank cannot clear the boundary")
+        fr["compact_refused_fp"] = getattr(sched, KV_BLOCKERS_ATTR, None)
+        w = why or "a peer rank cannot clear the boundary"
+        if _log_gate(_kv_compact_reason_class(w)):
+            logger.info("%s n=%d verdict=%s want=S%d stage=S%d floor=%d end=%s local=%s -- %s "
+                        "[classes %s skipped=%d]", KV_COMPACT_MARK, n, kind, int(want), int(ms.stage),
+                        int(floor_tokens), "yes" if end else "no", "".join(str(x) for x in anys), w,
+                        _census(), int(fr.get("compact_skipped", 0)))
             _refusal_detail()
         return None
 
@@ -3954,40 +4118,64 @@ def _kv_compact_for_shrink(sched, ms, fr, want: int, end: bool, floor_tokens: in
             pages = sorted({int(x) for x in re.findall(r"page (\d+)", why or "")})
             for pg in pages[:2]:
                 logger.info("%s n=%d WITNESS page=%d (tokens from %d) here: %s", KV_COMPACT_MARK, n,
-                            pg, pg * page, _kv_compact_page_witness(sched, sv, pg, vec, floor_page))
+                            pg, pg * page, _kv_compact_page_witness(sched, sv, pg, vec, floor_page,
+                                                                    top_page, k))
         except Exception as exc:  # noqa: BLE001 -- an instrument never fails the tick
             logger.info("%s n=%d WITNESS failed: %s: %s", KV_COMPACT_MARK, n, type(exc).__name__, exc)
 
     if int(group[0]) != 1:          # the group said no: replicated, every rank returns here
         return _refused()
-    # S98: the pick comes from the agreed survey. The digest collective is entered on
-    # EVERY rank once the group said yes -- with a plan or with the sentinel -1 -- so no
-    # rank leaves its peers waiting in a collective it skipped.
-    # S98c (rang review nf-review-s98-1020.md, Auflage 3): the digest is over PAGES
-    # (d_kv_compact.plan_digest); unequal means the ranks would do different things to
-    # the pages -- but NOTHING has moved yet and lo/hi are the reduced values every
-    # rank sees alike: a uniform, named refusal, not a crash-stop. The crash-stop stays
-    # for what cannot be undone: a mixed move outcome, a failed eviction.
-    jj, plan = (cands[pick], plans[pick]) if pick is not None else (-1, None)
-    digest = KC.plan_digest(jj, plan) if plan is not None else -1
-    lo, hi = _group_same(sched, digest)
-    if lo != hi:
-        why = ("the ranks' plans for S%d differ (digest here %d, group %d..%d: other node cuts "
-               "or another fallback eviction) -- refused on every rank, nothing moved"
-               % (jj, digest, lo, hi))
-        _KV_COMPACT_PLAN_DIFF[0] += 1
-        d = _KV_COMPACT_PLAN_DIFF[0]
-        fr["compact_refused"] = key
-        if d <= 16 or (d & (d - 1)) == 0:
-            logger.warning("%s n=%d verdict=refused-plan-diff diffs=%d want=S%d stage=S%d floor=%d -- %s",
-                           KV_COMPACT_MARK, n, d, int(want), int(ms.stage), int(floor_tokens), why)
-            _refusal_detail()
-        return None
-    if plan is None:
+    # 2. the plan check -- entered by EVERY rank once the group said yes, with or without
+    # plans of its own (no rank leaves its peers waiting in a collective it skipped)
+    fl = [1 if p is not None else 0 for p in plans]
+    ev = [1 if (p is not None and p.evicts) else 0 for p in plans]
+    dg = [KC.plan_digest(cands[i], p) if p is not None else -1 for i, p in enumerate(plans)]
+    lo, hi = _group_same(sched, fl + ev + dg)
+    flo, elo, ehi, dlo, dhi = lo[:k], lo[k:2 * k], hi[k:2 * k], lo[2 * k:], hi[2 * k:]
+    agreed = [i for i in range(k) if flo[i] == 1 and dlo[i] == dhi[i] and elo[i] == ehi[i]]
+    pick = next((i for i in agreed if ehi[i] == 0), None)
+    if pick is None and agreed:
+        pick = agreed[0]
+    if pick is None:
+        diff = next((i for i in range(k) if flo[i] == 1), None)
+        if diff is not None:
+            why = ("the ranks' evictions for S%d differ (digest here %d, group %d..%d: other node "
+                   "cuts or other agreed units) -- refused on every rank, nothing moved"
+                   % (cands[diff], dg[diff], dlo[diff], dhi[diff]))
+            _KV_COMPACT_PLAN_DIFF[0] += 1
+            return _refused("refused-plan-diff")
+        if not why:
+            why = "a peer rank cannot clear the boundary"
         return _refused()
+    jj, plan = cands[pick], plans[pick]
+    digest = dg[pick]
+    tree = getattr(sched, "tree_cache", None)
+    alloc = _kv_allocator(sched)
+    evicted = (0, 0)
+
+    def _evict():
+        try:
+            out = KC.execute_evicts(tree, plan)
+            ok_ = 1
+        except Exception as exc:  # noqa: BLE001 -- named below as a group stop
+            logger.error("%s n=%d eviction failed here: %s: %s", KV_COMPACT_MARK, n,
+                         type(exc).__name__, exc)
+            out, ok_ = (0, 0), 0
+        lo1, hi1 = _group_same(sched, ok_)
+        if lo1 != 1 or hi1 != 1:
+            raise PdFlipKvCompactDivergence(
+                "%s n=%d: the agreed evictions for S%d did not go through on every rank "
+                "(here: %s) -- device presence of the tree differs" % (
+                    KV_COMPACT_MARK, n, jj, "ok" if ok_ else "failed"))
+        return out
+
+    if plan.evicts and plan.evict_first:
+        # 3. S112: evictions that make the room the moves take go first (agreed order)
+        evicted = _evict()
     res = None
     try:
-        res = KC.execute_moves(getattr(sched, "tree_cache", None), _kv_allocator(sched), plan, copier)
+        res = KC.execute_moves(tree, alloc, plan, copier,
+                               remap_refs=_kv_compact_remap_requests(sched, page))
         ok = 1
     except KC.CompactRefused as exc:   # rolled back on THIS rank
         logger.warning("%s n=%d moves refused here (rolled back): %s", KV_COMPACT_MARK, n, exc)
@@ -4002,51 +4190,44 @@ def _kv_compact_for_shrink(sched, ms, fr, want: int, end: bool, floor_tokens: in
         logger.error("%s n=%d moves FAILED here (state unknown, not rolled back): %s: %s",
                      KV_COMPACT_MARK, n, type(exc).__name__, exc)
         ok = -1
-    lo, hi = _group_same(sched, ok)
-    if lo < 0:
+    lo2, hi2 = _group_same(sched, ok)
+    if lo2 < 0:
         raise PdFlipKvCompactDivergence(
             "%s n=%d: the moves for S%d FAILED on a rank (here: %s) -- page placement there "
             "is unknown and cannot be undone; every rank stops in the same pass" % (
                 KV_COMPACT_MARK, n, jj, {1: "moved", 0: "rolled back", -1: "failed"}[ok]))
-    if lo != hi:
+    if lo2 != hi2:
         raise PdFlipKvCompactDivergence(
             "%s n=%d: the moves for S%d went through on some ranks and were rolled back on "
             "others (here: %s) -- page placement differs" % (KV_COMPACT_MARK, n, jj,
                                                             "moved" if ok else "rolled back"))
     if not ok:
         fr["compact_refused"] = key
-        logger.warning("%s n=%d verdict=refused-all target=S%d: every rank rolled back, nothing moved",
-                       KV_COMPACT_MARK, n, jj)
+        fr["compact_refused_fp"] = getattr(sched, KV_BLOCKERS_ATTR, None)
+        logger.warning("%s n=%d verdict=refused-all target=S%d: every rank rolled back, nothing moved"
+                       "%s", KV_COMPACT_MARK, n, jj,
+                       " (the agreed evictions stand: %d nodes, host copies kept)" % evicted[0]
+                       if evicted[0] else "")
         return None
-    evicted = (0, 0)
-    if plan.evicts:
-        try:
-            evicted = KC.execute_evicts(getattr(sched, "tree_cache", None), plan)
-            ok = 1
-        except Exception as exc:  # noqa: BLE001 -- named below as a group stop
-            logger.error("%s n=%d eviction failed here: %s: %s", KV_COMPACT_MARK, n,
-                         type(exc).__name__, exc)
-            ok = 0
-        lo, hi = _group_same(sched, ok)
-        if lo != 1 or hi != 1:
-            raise PdFlipKvCompactDivergence(
-                "%s n=%d: the fallback evictions for S%d did not go through on every rank "
-                "(here: %s) -- device presence of the tree differs" % (
-                    KV_COMPACT_MARK, n, jj, "ok" if ok else "failed"))
+    if plan.evicts and not plan.evict_first:
+        evicted = _evict()             # the S77 order: moves first, then the fallback
     new_floor = int(_group_floor_tokens(sched))
     fr["floor"] = None
     if new_floor >= int(floor_tokens):
         fr["compact_refused"] = key
+        fr["compact_refused_fp"] = getattr(sched, KV_BLOCKERS_ATTR, None)
     else:
         fr.pop("compact_refused", None)
     logger.info(
         "%s n=%d verdict=moved want=S%d target=S%d boundary=%d floor %d->%d moved_nodes=%d "
-        "moved_pages=%d evicted_nodes=%d evicted_tokens=%d bytes=%d buffers=%d digest=%d ms=%.1f "
-        "(the tree's idle pages above the boundary moved down in every token-indexed KV buffer, "
-        "node values re-pointed; evicted = backed nodes with no free page below, host copy stays)",
+        "moved_pages=%d evicted_nodes=%d evicted_tokens=%d bytes=%d buffers=%d req_rows=%d "
+        "run_pages=%d digest=%d ms=%.1f (pages above the boundary moved down in every "
+        "token-indexed KV buffer, node values and running request rows re-pointed -- rank-local "
+        "pages, group-agreed stage; evicted = agreed backed idle units, host copy stays)",
         KV_COMPACT_MARK, n, int(want), jj, int(tokens[jj]), int(floor_tokens), new_floor,
         res.moved_nodes, res.moved_pages, evicted[0], evicted[1], res.bytes,
-        len(getattr(copier, "items", ()) or ()), digest, (time.perf_counter() - t0) * 1000.0)
+        len(getattr(copier, "items", ()) or ()), int(getattr(res, "remapped_rows", 0)),
+        int(getattr(sv, "run_pages", 0) or 0), digest, (time.perf_counter() - t0) * 1000.0)
     return new_floor
 
 

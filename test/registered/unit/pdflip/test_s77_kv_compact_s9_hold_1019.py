@@ -270,13 +270,32 @@ def test_an_anchor_without_its_host_copy_is_not_backed():
 
 
 def test_a_backed_node_with_a_device_child_that_stays_is_not_evicted():
+    """S112: the child that STAYS is an un-backed one (a backed child is evicted with
+    its parent as one unit, see the next test) -- the parent is never evicted under it."""
     alloc, tree, cop = _world()
     _take(alloc, list(range(1, 16)))                       # one free page below: 16
     parent = _node(tree, alloc, [20, 21], P, backed=True, last=1)
     child = Node(parent)                                   # holds page 1 (below): stays on device
+    child.component_data[FULL] = CD(_tokens([1], P), host=None)
+    plan, why = KC.plan_for(KC.survey(tree, alloc, P, B), B)
+    assert plan is None and "no evictable unit" in why, why
+
+
+def test_a_backed_chain_is_evicted_leaf_first_as_one_unit():
+    """S112 (rc27 1020_145331 n=3 class): the old plan gave the room to the newest pages
+    -- the chain's LEAF -- and then could not evict the ancestor ("a device child that
+    stays"). A backed chain is one unit, evicted leaf first."""
+    alloc, tree, cop = _world()
+    _take(alloc, list(range(1, 16)))                       # one free page below: 16
+    parent = _node(tree, alloc, [20, 21], P, backed=True, last=1)
+    child = Node(parent)
     child.component_data[FULL] = CD(_tokens([1], P), host=object())
     plan, why = KC.plan_for(KC.survey(tree, alloc, P, B), B)
-    assert plan is None and "device child" in why
+    assert plan is not None, why
+    assert [m.node for m in plan.evicts] == [child, parent] and plan.evict_pages == [1, 20, 21]
+    assert plan.evict_first                                # page 1 is room below the boundary
+    KC.execute(tree, alloc, plan, cop)
+    assert tree.evicted == [child.id, parent.id]
 
 
 def test_newest_pages_get_the_room_not_the_rank_local_clock():
@@ -656,12 +675,21 @@ def test_guard_on_the_real_mha_pool_class():
 # ---- review N3: digest, outcome AND, crash-stop ------------------------------------------
 
 def _scripted_same(monkeypatch, dsv_, answers):
-    """The N3 MIN/MAX collectives answer from a script: (lo, hi) per call."""
+    """The N3 MIN/MAX collectives answer from a script: (lo, hi) per call. S112: the plan
+    check is a LIST [plan here per candidate, eviction per candidate, eviction digest per
+    candidate]; an answer ``"digest-differs"`` makes a peer's digest one higher."""
     calls = []
 
     def same(sched, value):
-        calls.append(int(value))
-        return answers[len(calls) - 1] if len(calls) <= len(answers) else (int(value), int(value))
+        calls.append(list(value) if isinstance(value, list) else int(value))
+        a = answers[len(calls) - 1] if len(calls) <= len(answers) else None
+        if isinstance(value, list):
+            lo, hi = list(value), list(value)
+            if a == "digest-differs":
+                k = len(value) // 3
+                hi[2 * k:] = [d + 1 for d in hi[2 * k:]]
+            return lo, hi
+        return a if a is not None else (int(value), int(value))
     monkeypatch.setattr(dsv_, "_group_same", same)
     return calls
 
@@ -675,7 +703,7 @@ def test_unequal_plan_digests_refuse_uniformly_before_anything_moved(floor_env, 
     _take(alloc, list(range(1, 5000)))
     turn = _node(tree, alloc, list(range(6145, 6200)), PG)
     v0 = turn.component_data[FULL].value
-    _scripted_same(monkeypatch, dsv_, [(1, 2)])                          # a peer planned otherwise
+    _scripted_same(monkeypatch, dsv_, ["digest-differs"])                # a peer evicts otherwise
     sched.running_batch.reqs = [_req("pdflip-2-70", 150_000)]
     st = dsv_.runtime_tick(sched)
     assert not st.changed and ms.stage == 9
@@ -688,14 +716,7 @@ def test_moves_landed_here_but_not_on_a_peer_crash_stop(floor_env, monkeypatch):
     ms = _to_s9(dsv_, sched)
     _take(alloc, list(range(1, 5000)))
     _node(tree, alloc, list(range(6145, 6200)), PG)
-    calls = []
-
-    def same(sched_, value):
-        calls.append(int(value))
-        if len(calls) == 1:
-            return int(value), int(value)                                # digests equal
-        return 0, 1                                                      # a peer rolled back
-    monkeypatch.setattr(dsv_, "_group_same", same)
+    _scripted_same(monkeypatch, dsv_, [None, (0, 1)])                    # plans equal; a peer rolled back
     sched.running_batch.reqs = [_req("pdflip-2-70", 150_000)]
     with pytest.raises(dsv_.PdFlipKvCompactDivergence, match="rolled back on"):
         dsv_.runtime_tick(sched)
@@ -721,12 +742,7 @@ def test_a_failed_fallback_eviction_on_a_rank_crash_stops(floor_env, monkeypatch
     ms = _to_s9(dsv_, sched)
     _take(alloc, [p for p in range(1, S8_PAGE + 1)])                    # nothing free below S8
     _node(tree, alloc, list(range(6145, 6150)), PG, backed=True)
-    calls = []
-
-    def same(sched_, value):
-        calls.append(int(value))
-        return (int(value), int(value)) if len(calls) < 3 else (0, 1)   # the eviction AND
-    monkeypatch.setattr(dsv_, "_group_same", same)
+    _scripted_same(monkeypatch, dsv_, [None, None, (0, 1)])              # the eviction AND
     sched.running_batch.reqs = [_req("pdflip-2-70", 150_000)]
     with pytest.raises(dsv_.PdFlipKvCompactDivergence, match="evictions"):
         dsv_.runtime_tick(sched)
