@@ -70,7 +70,9 @@ class TestBuildView(unittest.TestCase):
         self.assertEqual(dec["round_ms_by_bs"]["1"]["median_ms"], 40.0)
         pre = self.v["prefill"]["P"]
         self.assertEqual(pre["now"]["tokens"], 20000)                   # the 60-s window still holds P's burst
-        self.assertAlmostEqual(pre["last_burst"]["wall_tps"], 1000.0)
+        # 20.10.: a chunk passes PP0 then PP1 (1000 ms each): its start is last-stage end - 2000 ms, so the 20 chunks that
+        # flush once a second span 21 s (prefill.last.t of PP0 is the flush, not its forward end) -- was 20 s / 1000 tok/s
+        self.assertAlmostEqual(pre["last_burst"]["wall_tps"], 20000 / 21.0)
         self.assertAlmostEqual(pre["last_burst"]["tps_gpu"], 2000.0)     # 1000 tok per 500 compute-ms
         self.assertEqual(self.v["live"], True)
 

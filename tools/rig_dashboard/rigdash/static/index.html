@@ -971,6 +971,12 @@ const DEPTH_I18N = {
   keineanfr: {de: "je Anfrage: fehlt in IPC (rankstats decode.reqs); request_done kommt erst am Anfrageende",
               en: "per request: missing in IPC (rankstats decode.reqs); request_done only arrives when the request ends"},
   nachprefill: {de: "nach Prefill", en: "after prefill"},
+  prun: {de: "P-Durchlauf", en: "P run"},
+  ausloeser: {de: "Auslöser", en: "trigger"},
+  ausloeserlang: {de: "Auslöser des Flips (weckte P)", en: "trigger of the flip (woke P)"},
+  cached: {de: "gecacht", en: "cached"},
+  nochoffen: {de: "Token erst mit request_done", en: "tokens only with request_done"},
+  schuebe: {de: "Schübe", en: "bursts"},
 };
 const dt = (k) => {
   const e = DEPTH_I18N[k] || {};
@@ -981,14 +987,23 @@ const dt = (k) => {
 const tokRange = (x, y, n) => `${dt("tok")} ${fmt(x)}&ndash;${fmt(y)} (${fmt(n)} ${dt("neu")})`;
 function depthTip(d) {
   if (!d || d.n == null || d.x == null) return "";
-  let h = `<br><b>${tokRange(d.x, d.y, d.n)}</b>`;
+  // several requests in one burst: x-y of the whole burst is no depth of anything (20.10.) -- the sum, the rows follow below
+  let h = `<br><b>${(d.reqs || []).length > 1 ? `${dt("tok")} ${fmt(d.n)} ${dt("neu")}` : tokRange(d.x, d.y, d.n)}</b>`;
   if (d.tps_start != null || d.tps_end != null) h += ` &middot; <b>${fmt(d.tps_start)} &rarr; ${fmt(d.tps_end)}</b> tok/s <span class="muted">(${dt("anfang")} &rarr; ${dt("ende")})</span>`;
   const rq = d.reqs || [];
-  if (rq.length === 1 && rq[0].rid) h += ` <span class="muted mono">${esc(rq[0].rid)}</span>`;
-  if (rq.length > 1) h += "<br>" + rq.slice(0, 6).map((r) => `<span class="mono">${esc(r.rid)}</span> ${tokRange(r.x, r.y, r.n)}`).join("<br>")
+  const trg = (r) => r.trigger ? ` <b>&#9664; ${dt("ausloeser")}</b>` : "";
+  if (rq.length === 1 && rq[0].rid) h += ` <span class="muted mono">${esc(rq[0].rid)}</span>${trg(rq[0])}`;
+  if (rq.length > 1) h += "<br>" + rq.slice(0, 6).map((r) => `<span class="mono">${esc(r.rid)}</span> ${tokRange(r.x, r.y, r.n)}${trg(r)}`).join("<br>")
     + (rq.length > 6 ? `<br>+${rq.length - 6} ${dt("weitere")}` : "");
   const note = d.exact ? "" : (String(d.src || "").startsWith("rankstats prefill.cached") ? dt("prefix") : dt("teil"));
   return h + `<br><span class="muted">${dt("quelle")}: ${esc(d.src || "")}${note ? " &middot; " + note : ""}</span>`;
+}
+// the request that woke P (front's flip_user_time/flip_first_work rid), on the first P segment of its run
+function triggerTip(x) {
+  const t = x && x.trigger;
+  if (!t || !t.rid) return "";
+  return `<br><b>${dt("ausloeserlang")}</b>: <span class="mono">${esc(t.rid)}</span>`
+    + (t.n != null ? ` &middot; ${fmt(t.n)} ${dt("neu")}${t.cached != null ? ", " + fmt(t.cached) + " " + dt("cached") : ""}` : ` <span class="muted">(${dt("nochoffen")})</span>`);
 }
 function decodeDetailTip(x) {
   let h = "";
@@ -1042,11 +1057,11 @@ function phaseTip(x, single) {
     return `<b>${PHASE[CO_KEY[x.co]][0]}</b> <span class="muted">(dual: P and D run in parallel, no flip)</span><br>${when}${x.running ? " &middot; running" : ""}`
       + `<br>${sw("P")} <b>${nm}</b> &middot; ${x.tps != null ? `<b>${fmt(x.tps)}</b> tok/s <span class="muted">(chunks at compute time)</span>` : "&mdash;"} &middot; ${fmt(x.tok)} tok`
       + `<br>${sw(dec ? "dec" : "D")} <b>${PHASE[dec ? "dec" : "D"][0]}</b> &middot; ${coDetail(x, dec)}`
-      + (dec ? decodeDetailTip({by_bs: x.co_by_bs}) + coRoundTip(x) : "") + depthTip(x.depth);
+      + (dec ? decodeDetailTip({by_bs: x.co_by_bs}) + coRoundTip(x) : "") + triggerTip(x) + depthTip(x.depth);
   }
   if (x.k === "dec") return `<b>${nm}</b> &middot; ${x.tps != null ? `<b>${fmt(x.tps, 1)}</b> tok/s <span class="muted">(&Delta;decode.tokens / duration)</span>` : "&mdash;"}<br>${when}${x.running ? " &middot; running" : ""}${decodeDetailTip(x)}`;
   const adm = x.k === "D" && x.admit_n ? `<br>D admit/extend (tokens per request): <b>${fmt(x.admit_n)}</b> extends &middot; ${fmt(x.admit_tok)} tok &middot; avg ${fmt(x.admit_tok / x.admit_n, 1)} tok per request <span class="muted">(no prefill rate)</span>` : "";
-  return `<b>${nm}</b> &middot; ${x.tps != null ? `<b>${fmt(x.tps)}</b> tok/s <span class="muted">(chunks at compute time${x.k === "D" ? ", only chunks &ge; 64 tok" : ""})</span>` : "&mdash;"}<br>${when} &middot; ${fmt(x.tok)} tok${x.running ? " &middot; running" : ""}${adm}${depthTip(x.depth)}`;
+  return `<b>${nm}</b> &middot; ${x.tps != null ? `<b>${fmt(x.tps)}</b> tok/s <span class="muted">(chunks at compute time${x.k === "D" ? ", only chunks &ge; 64 tok" : ""})</span>` : "&mdash;"}<br>${when} &middot; ${fmt(x.tok)} tok${x.running ? " &middot; running" : ""}${adm}${triggerTip(x)}${depthTip(x.depth)}`;
 }
 function phaseHtml(b, pre) {
   const tl = b.timeline;
@@ -1819,7 +1834,22 @@ function flipMissing(b, dir) {
 // the depth detail of the P side belongs to the last flip only if it carries its start
 function flipDepth(b, dir, f) {
   const dg = ((b.flip_diag || {})[dir]) || {}, pd = dg.p_depth;
-  if (!pd || pd.x == null || f.last_t == null || dg.p_depth_t == null || Math.abs(dg.p_depth_t - f.last_t) > 0.01) return "";
+  if (f.last_t == null || dg.p_depth_t == null || Math.abs(dg.p_depth_t - f.last_t) > 0.01) return "";
+  if (dir === "D>P") {
+    const t = dg.trigger;
+    return t && t.rid ? `<br><span class="muted">${dt("ausloeserlang")}: <span class="mono">${esc(t.rid)}</span>${t.n != null ? ` &middot; ${fmt(t.n)} ${dt("neu")}${t.cached != null ? ", " + fmt(t.cached) + " " + dt("cached") : ""}` : ` (${dt("nochoffen")})`}</span>` : "";
+  }
+  const run = dg.p_run;
+  if (!pd && !run) return "";
+  if (run && run.n != null) {
+    // the whole P run (every burst, every request it names), not the last burst alone (20.10.)
+    const rq = run.reqs || [], trg = (r) => r.trigger ? ` <b>&#9664; ${dt("ausloeser")}</b>` : "";
+    return `<br><span class="muted">${dt("prun")}: <b>${fmt(run.n)}</b> ${dt("neu")}${run.bursts > 1 ? ` (${run.bursts} ${dt("schuebe")})` : ""}</span>`
+      + rq.slice(0, 6).map((r) => `<br><span class="muted mono">${esc(r.rid)}</span> <span class="muted">${tokRange(r.x, r.y, r.n)}</span>${trg(r)}`).join("")
+      + (rq.length > 6 ? `<br><span class="muted">+${rq.length - 6} ${dt("weitere")}</span>` : "")
+      + (run.trigger && !run.trigger.matched ? `<br><span class="muted">${dt("ausloeser")}: <span class="mono">${esc(run.trigger.rid)}</span>${run.trigger.n != null ? " " + fmt(run.trigger.n) + " " + dt("neu") : " (" + dt("nochoffen") + ")"}</span>` : "");
+  }
+  if (!pd || pd.x == null) return "";
   return `<br><span class="muted">${dt("nachprefill")} ${tokRange(pd.x, pd.y, pd.n)}</span>`;
 }
 // The front's TTFT counters (08.10.): front.arrival_seat.ttft_* exists only while the arrival-seat rule is armed, while

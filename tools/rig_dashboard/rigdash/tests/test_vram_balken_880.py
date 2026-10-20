@@ -186,7 +186,7 @@ class TestFlipBootOnlyDSegmentsChange(unittest.TestCase):
     def test_only_d_segments_are_touched(self):
         from rigdash.tests.boot_replay import replay_boot
         segs = replay_boot("y8c_0cf3")["segs"]
-        self.assertEqual(len(segs), 125)
+        self.assertEqual(len(segs), 123)     # 20.10.: 125 -> 123, the 315-token P chunk joins the P bar before it (pipeline-sum start)
         for x in segs:
             if x["k"] != "D":
                 self.assertNotIn("admit_n", x)

@@ -114,8 +114,8 @@ class TestFlipBootUnchanged(unittest.TestCase):
     # mapping (structured diff of the two JSON dumps: empty); old pins: segs 9a04f69aa116, timeline 1502f91e5bc7.
     # 21.10. (carried 299945f808, D prefill rate at compute time, onto the renamed tree): SEGS re-pinned -- the old line re-pinned the
     # same change (9a04f69a -> 95697829); here f08946c2 -> 9d77fec8, the difference to the old pin being the rename mapping above.
-    SEGS = "9d77fec8fd55262a45ca729cf1580db2cefb316731d0af15c414ab17f7502545"      # was f08946c2... (07.10. English texts)
-    TIMELINE = "90b171a20f6e9a508caf4ceecdc66f763b627fe41c82d9b9f8ad49aabbedc484"   # 21.10. carried 299945f808 (old line: 5e1ec9e1); was bd2199ac...
+    SEGS = "cc752a4ea35896d9a3b265da54695e2e4b949b703de1cef36a905ce44fc647d0"      # 21.10. + carried 8d32c66997 (P run); was 9d77fec8 (299945f808), f08946c2 (07.10.)
+    TIMELINE = "06a5a662e147a6253806e2fa68cd703450b1195fe6851abdaa87814f1435789f"   # 21.10. carried 299945f808 + 8d32c66997 (old line: c0dd0c8b); was bd2199ac...
 
     def test_flip_boot_bytes(self):
         r = replay_boot("y8c_0cf3")

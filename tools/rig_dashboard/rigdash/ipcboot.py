@@ -774,6 +774,52 @@ def _round_last(rounds, t_from: Optional[float], t_to: float):
     return best
 
 
+def _run_of(segs: List[dict], lo: float, hi: float) -> Optional[dict]:
+    """Everything the P side prefilled in one P run (the stretch between the D>P flip's done ``lo`` and the P>D flip's
+    begin ``hi``): all bursts, every request the bursts name, the summed new tokens.  20.10. (NF 06:26Z): the flip
+    row used to carry only the LAST burst's depth (2,4k of a 10,4k run) -- the trigger's 7,9k pass was not in it."""
+    uniq: Dict[Tuple[float, float], dict] = {}
+    for x in segs:
+        d = x.get("depth")
+        if x["k"] in ("P", "single") and d and x["s"] < hi and x["e"] > lo:
+            uniq[(d.get("t0") or x["s"], d.get("t1") or x["e"])] = d
+    if not uniq:
+        return None
+    ds = [uniq[k] for k in sorted(uniq)]
+    reqs, seen = [], set()
+    for d in ds:
+        for r in d.get("reqs") or []:
+            if r.get("rid") not in seen:
+                seen.add(r.get("rid"))
+                reqs.append(r)
+    return {"n": sum(int(d.get("n") or 0) for d in ds), "bursts": len(ds), "reqs": reqs,
+            "t0": min(k[0] for k in uniq), "t1": max(k[1] for k in uniq),
+            "n_reqs_tokens": sum(int(r.get("n") or 0) for r in reqs)}
+
+
+def _mark_trigger(segs: List[dict], lo: float, hi: float, rid: Optional[str], req: Optional[dict]) -> Optional[dict]:
+    """The request that woke P (flip_user_time.rid / flip_first_work.rid, the front's own stamp) marked in the P run
+    it triggered: on the first P segment after ``lo`` (``seg.trigger``) and on its row of that burst's request list
+    (``reqs[].trigger``).  Tokens only once request_done exists (u is the front's number; the rank has no rid)."""
+    if not rid:
+        return None
+    pre = ((req or {}).get("prefill") or {}).get("P") or {}
+    trig = {"rid": rid, "n": pre.get("tokens"), "cached": pre.get("cached"), "prompt": pre.get("prompt"),
+            "src": "front flip_user_time/flip_first_work rid" + ("; tokens: events request_done prefill.P" if pre else
+                                                                  " (tokens appear with request_done)")}
+    first = None
+    for x in sorted(segs, key=lambda x: x["s"]):
+        if x["k"] in ("P", "single") and x["e"] > lo and x["s"] < hi:
+            first = first or x
+            for r in (x.get("depth") or {}).get("reqs") or []:
+                if r.get("rid") == rid:
+                    r["trigger"] = True
+                    trig["matched"] = True
+    if first is not None:
+        first["trigger"] = trig
+    return trig
+
+
 def flip_views(segs: List[dict], ipc: dict, now: float, ring=None, d_rounds=AUTO, arrivals=AUTO) -> List[dict]:
     """One row per flip of the ring window, newest last (Nutzer 02.10., FLIPZEIT fuer beide Richtungen und
     beide Modelle): total_ms = vom LETZTEN Token der abgebenden Phase bis zum ERSTEN Token der annehmenden,
@@ -825,6 +871,8 @@ def flip_views(segs: List[dict], ipc: dict, now: float, ring=None, d_rounds=AUTO
     ring_lo = min((s["t"] for s in ring), default=None) if ring else None
     lo = segs[0]["s"] if segs else now
     out = []
+    req_by_rid = {r.get("rid"): r for r in (ipc.get("request_done") or []) if r.get("rid")}
+    last_trigger = None   # rid that woke P in the newest D>P flip seen (the trigger of the P run that follows)
     prev_done = None   # the previous flip's done: P cannot have ended a chunk before it was woken
     for i, (b, bd) in enumerate(begins):
         if i > 0:
@@ -871,6 +919,10 @@ def flip_views(segs: List[dict], ipc: dict, now: float, ring=None, d_rounds=AUTO
                             and x["e"] > p_lo), key=lambda x: x["e"], default=None)
                 if pseg is not None:
                     row["p_depth"] = {k: pseg["depth"].get(k) for k in ("x", "y", "n", "exact", "src", "tps_start", "tps_end")}
+                run = _run_of(segs, p_lo, b + 0.3)
+                if run is not None:
+                    run["trigger"] = _mark_trigger(segs, p_lo, b + 0.3, last_trigger, req_by_rid.get(last_trigger))
+                    row["p_run"] = run
             # D cannot emit before its layers are back: the floor is flip_begin + flip_ms (0,3 s tolerance); it
             # rejects the NF y6d early-fire class (+0,02..0,99 s after begin), not D's real tokens during wake-kv/dc
             floor = (b + float(flip_ms) / 1000.0 if flip_ms is not None else t_done) - 0.3
@@ -936,9 +988,13 @@ def flip_views(segs: List[dict], ipc: dict, now: float, ring=None, d_rounds=AUTO
                 row["park_rpc_ms"] = p.get("park_rpc_ms")
             # the Vorlauf split: arrival of the request that triggered the flip (front PDFLIP SESSION of its rid; else
             # the pricing verdict the front stamps as oldest_waiter_arrival), the park RPC from flip_user_time
-            rid = (u or {}).get("rid")
+            rid = (u or {}).get("rid") or f.get("rid")
+            last_trigger = rid       # None when this flip names no rid: never the previous run's trigger
             if rid:
                 row["rid"] = rid
+                pre = ((req_by_rid.get(rid) or {}).get("prefill") or {}).get("P") or {}
+                row["trigger"] = {"rid": rid, "n": pre.get("tokens"), "cached": pre.get("cached"),
+                                  "src": "front flip_user_time/flip_first_work rid"}
             # the waiting request(s): the dispatch rid's arrival at the front and, when the front priced an older
             # waiter, its arrival -- the EARLIEST is when Prefill became pending (Nutzer 06.10.: Server-Leerlauf vor
             # diesem Moment ist keine Flipzeit)
@@ -1035,7 +1091,8 @@ def flip_diag(views: List[dict]) -> dict:
         out[d] = {"missing_n": sum(1 for x in mine if x["kind"] == "fehlt"),
                   "missing": newest.get("missing") if newest and newest["kind"] == "fehlt" else None,
                   "open": any(x["kind"] == "offen" for x in mine),
-                  "p_depth": last.get("p_depth") if last else None, "p_depth_t": last["begin"] if last else None}
+                  "p_depth": last.get("p_depth") if last else None, "p_depth_t": last["begin"] if last else None,
+                  "p_run": last.get("p_run") if last else None, "trigger": last.get("trigger") if last else None}
     return out
 
 
