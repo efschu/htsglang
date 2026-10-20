@@ -324,6 +324,26 @@ def _host_memory_state() -> str:
     return ", ".join(parts) if parts else "host memory state unavailable"
 
 
+def _proc_state(pid: Optional[int]) -> Optional[str]:
+    """The one-letter state of ``pid`` from /proc (``Z`` = zombie leader),
+    None when unreadable or gone. Never raises."""
+    if pid is None:
+        return None
+    try:
+        with open(f"/proc/{int(pid)}/stat") as fh:
+            return fh.read().rsplit(")", 1)[-1].split()[0]
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _dying(proc) -> bool:
+    """Leader already a zombie, exit not yet reportable. Never raises."""
+    try:
+        return _proc_state(proc.pid) == "Z" and proc.is_alive()
+    except Exception:  # noqa: BLE001 - a foreign-parent Process
+        return False
+
+
 def describe_exit(exitcode: Optional[int]) -> str:
     """Render a multiprocessing exitcode as something a human can act on.
 
@@ -455,6 +475,79 @@ class SubprocessWatchdog:
                 "recorded here rather than passed over in silence."
             )
         logger.error("\n".join(lines))
+
+    #: report_dead_children: bounded wait for a zombie-leader child's exit
+    DYING_WAIT_S = 2.0
+
+    def report_dead_children(self, why: str) -> int:
+        """EXIT WITNESS: report every child that is already gone, NOW.
+
+        NF 20.10. 14:18:29Z (rc26, D TP0): the kernel's cgroup OOM killer
+        SIGKILLed D rank 0 at 14:18:29.514; TP1/TP2 died of the peer-gone
+        consequence ~0.5 s later and SIGQUIT the parent. This watchdog polls
+        once per ``interval`` (1 s), so the peers' SIGQUIT arrived BEFORE its
+        next poll -- and the SIGQUIT handler's first act was ``stop()``. The
+        one observer that could have printed ``killed by SIGKILL ... oom_kill
+        0 -> 1`` never polled again, and the rank's death read as SILENT for
+        a whole investigation (the kernel's own report sits in the host
+        journal, not in any boot log).
+
+        So the handler calls THIS before it stops the watch: one synchronous
+        sweep, every child, the same ``_report_death`` text the poll would
+        have written (``is_alive`` reaps a zombie child, so the exit code of
+        a rank killed a moment ago is there to be read). A child already
+        reported by the poll is not reported twice. Never raises; returns the
+        number of children found dead (0 is printed too, because "SIGQUIT
+        with every child alive" is itself a finding).
+        """
+        dead = 0
+        try:
+            # A SIGKILLed process whose leader is already a zombie ("Z" in
+            # /proc) can still have threads finishing their exit -- a rank
+            # with ~250 GB of mappings tears down for a while -- and until the
+            # last one is gone waitpid answers "still running". Measured in
+            # this ticket's test: leader "Z", waitpid (0, 0), is_alive() True.
+            # Give such DYING children a bounded moment (DYING_WAIT_S) so the
+            # sweep can read their exit code, and name any still dying.
+            deadline = time.monotonic() + self.DYING_WAIT_S
+            while time.monotonic() < deadline:
+                if not any(_dying(p) for p in self._processes):
+                    break
+                time.sleep(0.02)
+            for proc, name in zip(self._processes, self._names):
+                try:
+                    alive = proc.is_alive()
+                except Exception:  # noqa: BLE001 - a foreign-parent Process
+                    continue
+                if alive:
+                    if _proc_state(proc.pid) == "Z":
+                        dead += 1
+                        logger.error(
+                            "Subprocess %s (pid=%s) is DYING: its leader is a "
+                            "zombie but the exit is not reportable yet (threads "
+                            "still tearing down after %.1f s).\n  %s",
+                            name, proc.pid, self.DYING_WAIT_S,
+                            self._oom_attribution(),
+                        )
+                    continue
+                dead += 1
+                self._report_death(proc, name)
+            if dead == 0:
+                logger.error(
+                    "EXIT-WITNESS at %s: all %d tracked children still alive "
+                    "(the signal did not come from a child that already exited)",
+                    why, len(self._processes),
+                )
+            else:
+                logger.error(
+                    "EXIT-WITNESS at %s: %d of %d tracked children gone (each "
+                    "named above with its exit code; a negative code is the "
+                    "signal that ended it)",
+                    why, dead, len(self._processes),
+                )
+        except Exception:  # noqa: BLE001 - a witness may not mask the stop
+            logger.error("EXIT-WITNESS at %s: sweep failed", why, exc_info=True)
+        return dead
 
     def _check_processes(self) -> bool:
         # Report EVERY dead child before acting on any of them: when one rank
