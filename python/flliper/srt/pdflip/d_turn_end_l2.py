@@ -29,11 +29,15 @@ THE FORM (this module + ``HybridCacheController._s108_submit/_s108_issue`` +
   (``writing_check`` -> ``_finish_write_through_ack`` -> arena ``complete_write``; S74/S99) sees it
   ready once the copier has finished the op. COMPLETE therefore still comes from every owner's merged
   extents -- group-equal, after the fact, no new collective.
-* A copier failure (a #923 hit, a raising pool) is not swallowed: the next ack poll in the scheduler
-  thread raises it by name (late loud stop -- the P-NOSYNC #923 rule).
-* A full arena / a busy mamba pin / the budget: the node is DEFERRED by name (``S108 TURN-END-DEFER``)
+* A copier failure (a #923 hit, a raising pool) copies nothing and REFUSES the op (review A4): the
+  ack drain undoes the commit (claim back, host values off, lock released), names it
+  (``S108 TURN-END-REFUSED``) and reports it through the refusal path (R12 on Form A) -- never a single
+  rank's death with an open claim.
+* A full KV arena / a busy mamba pin: the node is DEFERRED by name (``S108 TURN-END-DEFER``)
   and stays unbacked for the next turn end, the idle sweep and the flush -- never dropped, never a
-  spill (the W3 spill writes L3 in the caller's thread), never a wait.
+  spill (the W3 spill writes L3 in the caller's thread), never a wait. A full MAMBA arena makes the
+  node KV-only on that rank (review A2/A3): no H19 displacement or disk secure, no TP0-only refusal;
+  the anchor is deferred by name for the anchor-only backup. No wall-clock budget (rank-local).
 
 WHY NO MAMBA FENCE ON THESE OPS. ``MAMBA-SNAPSHOT-FENCE`` makes the compute stream wait for a write
 op that snapshots recurrent state, because a running request's state is updated in place. A finished
@@ -57,7 +61,6 @@ logger = logging.getLogger(__name__)
 TURN_LINE = "S108 TURN-END-L2"
 DEFER_LINE = "S108 TURN-END-DEFER"
 COPY_LINE = "S108 TURN-END-COPY"
-BUDGET_ENV = "FLLIPER_S108_TURN_END_BUDGET_MS"
 DEFER_KEEP = 4096
 
 
@@ -65,18 +68,6 @@ def turn_end_on(env: Optional[Mapping[str, str]] = None) -> bool:
     """Group D, always (user order: no switch). Group P has its own retain publish (xsn338)."""
     env = os.environ if env is None else env
     return str(env.get("FLLIPER_PDFLIP_GROUP", "")).strip().upper() == "D"
-
-
-def budget_s(env: Optional[Mapping[str, str]] = None) -> float:
-    """Host-work bound of one turn end's issue in the scheduler thread (ms, default 50; 0 = none).
-    It bounds CPU work (claims, commits) -- there is no wait left to bound. What it leaves is
-    deferred by name, never dropped."""
-    env = os.environ if env is None else env
-    try:
-        ms = float(env.get(BUDGET_ENV, "50"))
-    except ValueError:
-        ms = 50.0
-    return max(0.0, ms) / 1000.0
 
 
 class TurnEndCopyError(RuntimeError):
@@ -90,7 +81,7 @@ class DoneEvent:
     complete), raises the copier's named error if it failed. ``synchronize()`` waits -- only the
     blocking drains call it (write_back eviction, reset), never the turn-end path."""
 
-    __slots__ = ("_done", "_err", "finish_event", "copy_ms", "wait_ms", "kv_rows", "kv_bytes", "tag")
+    __slots__ = ("_done", "_err", "finish_event", "copy_ms", "wait_ms", "kv_rows", "kv_bytes", "tag", "refused")
 
     def __init__(self, tag: str = "") -> None:
         self._done = threading.Event()
@@ -101,6 +92,15 @@ class DoneEvent:
         self.kv_rows = 0
         self.kv_bytes = 0
         self.tag = tag
+        #: review A4: why the copier refused the op (nothing copied); the ack undoes the commit
+        self.refused: Optional[str] = None
+
+    def refuse(self, why: str) -> None:
+        """The copier did not copy (a #923 row, a raising pool): the ack is READY and carries the
+        reason; ``UnifiedRadixCache._s108_ack`` undoes the commit, names it, reports it through the
+        refusal path. Never an exception in the scheduler thread (review A4: no single-rank death)."""
+        self.refused = str(why) or "refused"
+        self._done.set()
 
     def set_done(self, finish_event=None) -> None:
         self.finish_event = finish_event
@@ -108,19 +108,13 @@ class DoneEvent:
 
     def fail(self, exc: BaseException) -> None:
         self._err = exc
-        self._done.set()
+        self.refuse("copier_raised:%s:%s" % (type(exc).__name__, str(exc)[:160]))
 
     def query(self) -> bool:
-        if not self._done.is_set():
-            return False
-        if self._err is not None:
-            raise TurnEndCopyError(f"{COPY_LINE} FAILED tag={self.tag}: {self._err!r}") from self._err
-        return True
+        return self._done.is_set()
 
     def synchronize(self) -> None:
         self._done.wait()
-        if self._err is not None:
-            raise TurnEndCopyError(f"{COPY_LINE} FAILED tag={self.tag}: {self._err!r}") from self._err
 
     def elapsed_time(self, other) -> float:  # pragma: no cover - the ack instrument's try/except
         raise TypeError("DoneEvent carries copy_ms instead of device timing")
@@ -234,15 +228,15 @@ def owner_share(ctx) -> str:
 
 def format_turn_line(*, rid: str, chain: int, stats: Mapping[str, Any], ops: int, tokens: int,
                      share: str, wall: float, cpu: float, blocked: float, n: int,
-                     deferred_open: int) -> str:
+                     deferred_open: int, anchor_deferred: int = 0) -> str:
     return (
         "%s rid=%s chain=%d unbacked=%d issued=%d deferred=%d ops=%d tokens=%d share=%s "
-        "issue_ms=%.2f issue_cpu_ms=%.2f blocked_ms=%.2f deferred_open=%d n=%d "
+        "issue_ms=%.2f issue_cpu_ms=%.2f blocked_ms=%.2f deferred_open=%d anchor_deferred=%d n=%d "
         "(scheduler thread only: host claims/commits, one event record; the copy runs on the "
         "copier thread, its bytes and ms are the %s lines)"
         % (TURN_LINE, rid, chain, int(stats.get("unbacked", 0) or 0), int(stats.get("issued", 0) or 0),
            max(0, int(stats.get("unbacked", 0) or 0) - int(stats.get("issued", 0) or 0)), ops, tokens, share,
-           wall, cpu, blocked, deferred_open, n, COPY_LINE)
+           wall, cpu, blocked, deferred_open, anchor_deferred, n, COPY_LINE)
     )
 
 

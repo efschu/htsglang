@@ -172,6 +172,9 @@ class _HostPool:
     def free(self, h):
         pass
 
+    def abort_write(self, rows):
+        pass
+
     def backup_from_device_all_layer(self, device_pool, host, device, io_backend, pool_transfers=None):
         if self.gate is not None:
             assert self.gate.wait(10), "test gate never opened"
@@ -342,6 +345,7 @@ def _tree(cc, cuts, slots, refuse=()):
         at += n
     t.chain = chain
     t._pdflip_chain_nodes = lambda key: list(chain)
+    t._pdflip_direct_pool = lambda: object()          # arena-bound (a refused copy is undone via the claim)
     t._s108_in_tree = lambda n: urc.UnifiedRadixCache._s108_in_tree(t, n)
     t.calls = []
     t.refuse = set(refuse)
@@ -453,15 +457,96 @@ def test_full_arena_defers_by_name_never_spills_and_retries(card, caplog):
     assert not t._s108_deferred and len(c.mem_pool_host.pairs) == 2
 
 
-# ----------------------------------------------------------------------------- (6) #923 on the copier
-def test_a_923_hit_on_the_copier_is_raised_by_name_at_the_ack_poll(card):
+# ----------------------------------------------------------------------------- (6) #923 on the copier (A4)
+def _ack_tree(c, node_ids):
+    """A stub tree that processes acks through the REAL writing_check/_s108_ack."""
+    t = types.SimpleNamespace(cache_controller=c, _drain_depth_every=0, pp_rank=0, staging_write_ring=None,
+                              tree_components=(urc.BASE_COMPONENT_TYPE,))
+    t.nodes = {}
+    t.ongoing_write_through = {}
+    t.finished, t.aborted, t.refused, t.unlocked = [], [], [], []
+    for nid in node_ids:
+        n = types.SimpleNamespace(id=nid, write_through_pending_id=nid, component_data={
+            urc.BASE_COMPONENT_TYPE: types.SimpleNamespace(value=None, host_value=torch.arange(4))})
+        t.nodes[nid] = n
+        t.ongoing_write_through[nid] = (n, "lock-%d" % nid, [n])
+    t._finish_write_through_ack = lambda a: (t.finished.append(a), t.ongoing_write_through.pop(a))
+    t._pdflip_direct_abort = lambda rows, node=None: t.aborted.append((node.id, int(rows.numel())))
+    t._1421_refused = lambda why, node: t.refused.append((why, node.id))
+    t.dec_lock_ref = lambda node, params: t.unlocked.append(params)
+    t._count_ready_acks = lambda q, label: urc.UnifiedRadixCache._count_ready_acks(t, q, label)
+    return t
+
+
+def test_a_923_hit_on_the_copier_is_a_named_refusal_the_ack_undoes(card, caplog):
+    """Review A4: no TurnEndCopyError in the scheduler thread (a single rank's death with an open
+    claim); the ack is ready, carries the refusal, and the drain undoes the commit by name."""
     c = _controller(CUT[1], compact_rows=8)                    # a pool far too small for the rows
     with te.deferred_issue(c, "rid-923"):
         assert c.write(dev(_slots(1, seed=9)), node_id=31) is not None
     _wait_copier(c)
-    with pytest.raises(te.TurnEndCopyError, match="#923 HICACHE write ROW OUT OF RANGE"):
-        c.ack_write_queue[0].finish_event.query()
+    ev = c.ack_write_queue[0].finish_event
+    assert ev.query() is True and ev.refused.startswith("923:")
     assert c.mem_pool_host.pairs == []                          # nothing was copied
+    t = _ack_tree(c, [31])
+    with caplog.at_level(logging.ERROR):
+        urc.UnifiedRadixCache.writing_check(t)                  # the scheduler's ack poll: no raise
+    n = t.nodes[31]
+    assert t.finished == [] and t.ongoing_write_through == {}
+    assert t.aborted == [(31, 4)] and t.unlocked == ["lock-31"]
+    assert n.write_through_pending_id is None and n.component_data[urc.BASE_COMPONENT_TYPE].host_value is None
+    assert t.refused == [("s108_copy:923:rows%s" % ev.refused[len("923:rows"):].split(" ")[0], 31)]
+    assert any("S108 TURN-END-REFUSED ack=31" in r.message for r in caplog.records)
+
+
+# ----------------------------------------------------------------------------- (6b) drains (A1)
+class _InlineAck:
+    def __init__(self):
+        self.synced = 0
+
+    def query(self):
+        return False                                            # still on the card: only sync gets it
+
+    def synchronize(self):
+        self.synced += 1
+
+
+def test_write_back_drain_waits_only_for_what_it_needs(card):
+    """Review A1: the blocking drain (evict tail, #1426, K21, K15) never waits for a turn-end copy;
+    with ``only`` it waits for its own ack alone. A held S108 op stays queued, in order."""
+    gate = threading.Event()
+    c = _controller(CUT[1], gate)
+    with te.deferred_issue(c, "rid-a1"):
+        c.write(dev(_slots(1, seed=13)), node_id=61)
+    own, other = _InlineAck(), _InlineAck()
+    c.ack_write_queue.append(hcc.HiCacheAck(None, own, [62]))
+    c.ack_write_queue.append(hcc.HiCacheAck(None, other, [63]))
+    t = _ack_tree(c, [61, 62, 63])
+    out = {}
+
+    def drain():
+        urc.UnifiedRadixCache.writing_check(t, write_back=True, only={62})
+        out["ok"] = True
+
+    th = threading.Thread(target=drain, name="scheduler")
+    th.start()
+    th.join(2.0)
+    returned = "ok" in out
+    gate.set()
+    th.join(10)
+    _wait_copier(c)
+    assert returned                                             # did not wait for the copier
+    assert own.synced == 1 and other.synced == 0                # its own ack only
+    assert t.finished == [62]
+    assert [a.node_ids for a in c.ack_write_queue] == [[61], [63]]   # kept, issue order
+    urc.UnifiedRadixCache.writing_check(t, write_back=True)     # default: every inline ack, still no S108 wait
+    assert other.synced == 1 and sorted(t.finished) == [61, 62, 63] and c.ack_write_queue == []
+
+
+def test_the_four_tree_drains_wait_for_their_own_ack_or_no_turn_end_copy():
+    src = inspect.getsource(urc.UnifiedRadixCache)
+    assert src.count("UnifiedRadixCache._s108_drain_own(self, node.id)") == 2   # K21, K15
+    assert "self.writing_check(write_back=True)" in inspect.getsource(urc.UnifiedRadixCache.evict)
 
 
 # ----------------------------------------------------------------------------- (7) instrument, reset
@@ -517,3 +602,138 @@ def test_turn_end_claims_only_free_room_never_makes_room(monkeypatch):
                                  _1421_refused=lambda w, n: why.append(w))
     assert urc.UnifiedRadixCache._pdflip_direct_claim(stub, node) is False
     assert why == ["arena_room"] and stub._pdflip_sweep_last_refusal == "arena_claim"
+
+
+# ----------------------------------------------------------------------------- (5c) REAL sweep (A2/A3)
+class _Real:
+    """The REAL UnifiedRadixCache methods on a small object: every attribute not set here is the class
+    function bound to it (turn end, publish_unbacked_sweep, write_backup, _pdflip_direct_claim,
+    _pdflip_mamba_claim, _track_write_through_node, ...)."""
+
+    def __getattr__(self, name):
+        f = getattr(urc.UnifiedRadixCache, name)
+        return f.__get__(self) if callable(f) and not isinstance(f, type) else f
+
+
+def _real_tree(c, mamba_room: bool):
+    from flliper.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+
+    MAMBA = urc.ComponentType.MAMBA
+    t = _Real()
+    t.calls = {"h19": 0, "m_alloc": 0, "kv_alloc": 0, "secure": 0}
+
+    class _Comp:
+        def __init__(self, ct):
+            self.component_type = ct
+
+        def build_hicache_transfers(self, node, phase):
+            if self.component_type != MAMBA:
+                return None
+            return [PoolTransfer(name=PoolName.MAMBA, host_indices=None, device_indices=dev(torch.tensor([5])))]
+
+        def commit_hicache_transfer(self, node, phase, transfers):
+            node.component_data[self.component_type].host_value = transfers[0].host_indices
+
+    class _KvPool:
+        def claim_needs_room(self, hs):
+            return False
+
+        def alloc_write(self, hs):
+            t.calls["kv_alloc"] += 1
+            return torch.arange(1000, 1000 + PAGE * len(hs))
+
+        def abort_write(self, rows):
+            pass
+
+    class _MambaPool:
+        def claim_needs_room(self, hs):
+            return not mamba_room
+
+        def alloc_write(self, hs):
+            t.calls["m_alloc"] += 1
+            return torch.tensor([77])
+
+    t.__dict__.update(
+        cache_controller=c, disable=False, enable_storage=True, page_size=PAGE,
+        _components_tuple=(_Comp(urc.BASE_COMPONENT_TYPE), _Comp(MAMBA)),
+        tree_components=(urc.BASE_COMPONENT_TYPE, MAMBA), staging_write_ring=None,
+        ongoing_write_through={}, ongoing_backup={}, component_protected_size_={}, _mamba_pin_budget=8,
+        _pdflip_park_track=None, refusals=[])
+    t.components = {ct.component_type: ct for ct in t._components_tuple}
+    c.mem_pool_host.entry_map = {PoolName.MAMBA: types.SimpleNamespace()}
+    kv, mp = _KvPool(), _MambaPool()
+    t._pdflip_direct_pool = lambda: kv
+    t._pdflip_mamba_pool = lambda: mp
+    t._pdflip_kv_only_shadow_anchor = lambda: False
+    t._mamba_write_through_pin_admissible = lambda node, write_back=False: True
+    t._build_sidecar_transfers = lambda *a: []
+    t._pdflip_full_arena_skip_armed = lambda: False
+    t._pdflip_publish_window = lambda: 0
+    t._pdflip_anchor_only_candidate = lambda node, kv_on_device=False: False
+    t._mamba_pins_held = lambda: 0
+    t._1421_refused = lambda why, node: t.refusals.append(why)
+    t.inc_lock_ref = lambda node: types.SimpleNamespace(to_dec_params=lambda: "lock")
+
+    def h19(*a, **k):
+        t.calls["h19"] += 1
+        raise AssertionError("H19 displacement (-> drop_unreferenced -> arena_secure_to_disk) at a turn end")
+
+    t._pdflip_mamba_claim_h19 = h19
+    root = types.SimpleNamespace(id=0, children={}, parent=None, evicted=False, backuped=True, l3_present=False)
+    t.root_node = root
+    node = types.SimpleNamespace(
+        id=901, parent=root, children={}, key=list(range(PAGE)), hash_value=["h901"], evicted=False,
+        backuped=False, l3_present=False, write_through_pending_id=None,
+        component_data={urc.BASE_COMPONENT_TYPE: types.SimpleNamespace(value=dev(_slots(1, seed=14)), host_value=None),
+                        MAMBA: types.SimpleNamespace(value=dev(torch.tensor([5])), host_value=None)})
+    root.children[1] = node
+    t._pdflip_chain_nodes = lambda key: [node]
+    return t, node
+
+
+@pytest.mark.parametrize("room", [False, True])
+def test_real_sweep_turn_end_mamba_claim_never_displaces_and_full_goes_kv_only(card, monkeypatch, room):
+    """Review A2/A3 through the REAL turn end -> publish_unbacked_sweep -> write_backup ->
+    _pdflip_direct_claim -> controller write: a full mamba arena never reaches H19 displacement (its
+    drop_unreferenced -> _secure_before_drop -> arena_secure_to_disk), never refuses the node on TP0
+    alone -- the KV goes out (as on the workers), the anchor is deferred by name; with room the anchor
+    claims free room only. The scheduler thread reads no device value."""
+    monkeypatch.setattr(urc._r12, "note_backup_ok", lambda tree, node: None)
+    c = _controller(CUT[0])
+    t, node = _real_tree(c, mamba_room=room)
+    with SyncCounter() as sc:
+        urc.UnifiedRadixCache._s108_turn_end_l2(t, types.SimpleNamespace(rid="rid-m"), radix_key=object())
+    assert sc.hits == [], sc.hits
+    assert t.calls["h19"] == 0 and t.calls["kv_alloc"] == 1
+    assert node.write_through_pending_id == 901 and len(c.ack_write_queue) == 1   # KV issued via the copier
+    assert t.refusals == []                                                        # no node refusal
+    mamba_hv = node.component_data[urc.ComponentType.MAMBA].host_value
+    if room:
+        assert t.calls["m_alloc"] == 1 and int(mamba_hv[0]) == 77
+        assert not t.__dict__.get("_s108_anchor_deferred")
+    else:
+        assert t.calls["m_alloc"] == 0 and mamba_hv is None
+        assert set(t._s108_anchor_deferred) == {901}
+    assert t._s108_turn_end_active is False and c.__dict__.get("_s108_defer_issue") is False
+    _wait_copier(c)
+
+
+def test_anchor_only_claim_at_a_turn_end_takes_free_room_only():
+    t = _Real()
+    t.__dict__["_s108_turn_end_active"] = True
+    t._pdflip_mamba_claim_h19 = lambda *a: (_ for _ in ()).throw(AssertionError("H19 at a turn end"))
+    full = types.SimpleNamespace(claim_needs_room=lambda hs: True,
+                                 alloc_write=lambda hs: (_ for _ in ()).throw(AssertionError("claimed")))
+    assert urc.UnifiedRadixCache._pdflip_mamba_claim(t, object(), full, "h") is None
+    free = types.SimpleNamespace(claim_needs_room=lambda hs: False, alloc_write=lambda hs: torch.tensor([3]))
+    assert int(urc.UnifiedRadixCache._pdflip_mamba_claim(t, object(), free, "h")[0]) == 3
+
+
+def test_turn_end_issue_has_no_wall_clock_budget_and_no_tp0_only_mamba_stop():
+    """Review A3: what a turn end issues must not depend on a rank-local wall clock or on a stop only
+    TP0 (the only mamba-arena holder) can take."""
+    src = inspect.getsource(urc.UnifiedRadixCache._s108_turn_end_l2)
+    assert "clock=None" in src and "SweepClock" not in src
+    sweep = inspect.getsource(urc.UnifiedRadixCache.publish_unbacked_sweep)
+    i = sweep.index("mamba_full_stops_sweep(")
+    assert "_s108_turn_end_active" in sweep[i:i + 200]
