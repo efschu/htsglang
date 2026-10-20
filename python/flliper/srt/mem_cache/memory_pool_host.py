@@ -2363,7 +2363,7 @@ class HostPoolGroup:
         # take_lost_slots / settle_lost_rows -- without them here it got None
         # and silently settled nothing on every hybrid (NF) host rank.
         if name in ("alloc_read", "alloc_write", "complete_write", "abort_write", "pin_slots",
-                    "claim_would_refuse", "take_lost_slots", "settle_lost_rows"):
+                    "claim_would_refuse", "claim_needs_room", "take_lost_slots", "settle_lost_rows"):
             fn = getattr(self.anchor_entry.host_pool, name, None)
             if callable(fn):
                 return fn

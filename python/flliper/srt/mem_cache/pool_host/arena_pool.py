@@ -2831,6 +2831,17 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
             return None
         return self.arena_ids(slots)  # x59: P ids per page hash
 
+    def claim_needs_room(self, hashes) -> bool:
+        """S108: would ``alloc_write(hashes)`` have to MAKE room (reap, ``_evict_for_claim`` with its
+        L3 secure) right now? True when the absent pages exceed the free slots. Never claims, never
+        reaps, never evicts, no disk I/O -- the turn end of group D defers such a node by name
+        instead of making room in the scheduler thread. False without a bound arena."""
+        arena = self.arena
+        if arena is None or self._backend is None or not hashes:
+            return False
+        absent = sum(1 for s in arena.find_states(self._stems(hashes)) if int(s) == 0)
+        return absent > _arena_free_slots(arena)
+
     def claim_would_refuse(self, hashes) -> bool:
         """SWEEP-FULL-ARENA (NF boot 1007_2142, P->D flip epoch 2): would
         ``alloc_write(hashes)`` be refused right now for want of room?
