@@ -188,3 +188,138 @@ def test_r9_s56_an_image_in_the_uncached_tail_is_p_only():
     p = _dmp.exact_price(a, 79872)
     assert p.image_in_tail and _dmp.class_uncached(p) == 5718
     assert pp.classify_arrival(_dmp.class_uncached(p), X, HALF, p.image_in_tail) == pp.CLASS_P_ONLY
+
+
+# ---------------------------------------------------------------------------------------------------------------- R6k (20.10.)
+# SOLL R6k (Nutzerentscheid 20.10., Eintrag 21:30:15Z, woertlich "b"): ein laufender KURZER D-Prefill (bei Ankunft u < halbX, R2)
+# wird NICHT nach P umgeleitet, rechnet auf D zu Ende, sein Rest zaehlt NICHT in S, loest keinen Flip aus und zieht keinen vor.
+# R6 gilt nur fuer laufende Halb- und Gross-Prefills. R1a bleibt (wartende kurze fahren mit). Front-Kante, live-Zahlen rc28
+# pdflip-12-274 (gross, u=9875) / pdflip-12-275 (kurz, u=1394), X=7016, halbX=3508, T_halb=4,5 s.
+def _r6k_front(monkeypatch, tmp_path, *, member_u, klass, waited=3.9, ended=True, rest_start=1394, ext_len=768):
+    import time as _time
+
+    from test_nf_r6_rest_exakt_1020 import _front_live
+    from test_pdflip_set_scheduler_1017 import _on
+
+    _on(monkeypatch)
+    now = _time.time()
+    return now, _front_live(now, tmp_path, member_u=member_u, ended=ended, rest_start=rest_start, ext_len=ext_len,
+                            klass=klass, waited=waited)
+
+
+def _r6k_lines(caplog, token):
+    return [m for m in caplog.messages if token in m]
+
+
+def test_r6k_kurz_running_and_a_big_set_flip_without_the_kurz_it_stays_on_d(monkeypatch, caplog, tmp_path):
+    """R6k + R4: kurzer laufender (12-275) + grosses Set. Vor T_halb: kein Flip (der kurze zieht keinen vor). Nach T_halb: Flip
+    nach P OHNE den kurzen -- S = 9875 (nur das Mitglied), verdict kein REROUTE_P, kein R6-REDIRECT / PARK-HANDBACK des kurzen."""
+    import logging as _lg
+
+    from flliper.srt.environ import envs
+
+    now, f = _r6k_front(monkeypatch, tmp_path, member_u=9875, klass="kurz", waited=3.9)
+    with envs.FLLIPER_PDFLIP_DECIDER.override(True), caplog.at_level(_lg.INFO, logger="pdflip.front"):
+        assert f._dc_carried_running() == 0
+        assert f._decode_collect(now) == "hold"                       # R4 waits; the kurz rest pulls nothing forward
+    caplog.clear()
+    tp = tmp_path / "late"
+    tp.mkdir()
+    now, f = _r6k_front(monkeypatch, tp, member_u=9875, klass="kurz", waited=4.6)
+    with envs.FLLIPER_PDFLIP_DECIDER.override(True), caplog.at_level(_lg.INFO, logger="pdflip.front"):
+        assert f._decode_collect(now) == "P"                          # T_halb over: the big set flips
+    sv = _r6k_lines(caplog, "PDFLIP SET-VERDICT")
+    assert sv and all("verdict=REROUTE_P" not in m for m in sv), sv
+    assert any("S=9875 " in m for m in sv), sv                        # the kurz rest is not in S
+    assert not _r6k_lines(caplog, "R6-REDIRECT") and not _r6k_lines(caplog, "PARK-HANDBACK")
+    assert f.counters["r6_redirected"] == 0 and "pdflip-12-275" not in f._rvp_requeue
+
+
+def test_r6k_kurz_running_and_a_halb_set_under_x_no_flip(monkeypatch, caplog, tmp_path):
+    """R6k + R3/R7: kurzer laufender (Rest 3400, Forward laeuft noch) + halbes Set u=4000: S = 4000 < X -> kein Flip. (Vor R6k:
+    S = 7400 > X -> REROUTE_P.)"""
+    import logging as _lg
+
+    from flliper.srt.environ import envs
+
+    now, f = _r6k_front(monkeypatch, tmp_path, member_u=4000, klass="kurz", ended=False, rest_start=3400, ext_len=2048)
+    with envs.FLLIPER_PDFLIP_DECIDER.override(True), caplog.at_level(_lg.INFO, logger="pdflip.front"):
+        assert f._dc_carried_running() == 0
+        assert f._decode_collect(now) == "hold"
+    assert all("verdict=REROUTE_P" not in m for m in _r6k_lines(caplog, "PDFLIP SET-VERDICT"))
+    assert f.counters["set_reroute_p"] == 0 and f.counters["r6_redirected"] == 0
+
+
+def test_r6k_halb_running_r6_as_before(monkeypatch, caplog, tmp_path):
+    """R6 bleibt fuer laufende Halb-Prefills: halber laufender (Rest 4000, Forward laeuft) + halbes Set u=3600: S = 7600 > X ->
+    REROUTE_P why=R6, der halbe wird nach P umgeleitet (R6-REDIRECT)."""
+    import logging as _lg
+
+    from flliper.srt.environ import envs
+
+    now, f = _r6k_front(monkeypatch, tmp_path, member_u=3600, klass="halb", ended=False, rest_start=4000, ext_len=2048)
+    with envs.FLLIPER_PDFLIP_DECIDER.override(True), caplog.at_level(_lg.INFO, logger="pdflip.front"):
+        assert f._dc_carried_running() == 4000
+        assert f._decode_collect(now) == "P"
+    assert any("verdict=REROUTE_P" in m and "why=R6" in m for m in _r6k_lines(caplog, "PDFLIP SET-VERDICT"))
+    assert f.counters["r6_redirected"] == 1
+
+
+def test_r6k_halb_and_kurz_running_r6_moves_only_the_halb(monkeypatch, caplog, tmp_path):
+    """R6k + R6 zusammen: ein halber UND ein kurzer laufen. S zaehlt nur den halben Rest; REROUTE_P leitet nur den halben um,
+    der kurze rechnet auf D zu Ende."""
+    import logging as _lg
+
+    from test_nf_r6_rest_exakt_1020 import add_running
+    from flliper.srt.environ import envs
+
+    now, f = _r6k_front(monkeypatch, tmp_path, member_u=3600, klass="halb", ended=False, rest_start=4000, ext_len=2048)
+    add_running(f, now, tmp_path, "pdflip-12-276", rest_start=900, ext_len=900, ended=False, klass="kurz", key=37870)
+    with envs.FLLIPER_PDFLIP_DECIDER.override(True), caplog.at_level(_lg.INFO, logger="pdflip.front"):
+        assert f._dc_carried_running() == 4000
+        assert f._decode_collect(now) == "P"
+    red = _r6k_lines(caplog, "R6-REDIRECT")
+    assert red and "pdflip-12-275" in red[0] and "pdflip-12-276" not in red[0], red
+    assert f.counters["r6_redirected"] == 1
+
+
+def test_r6k_class_comes_from_the_arrival_classification():
+    """R6k: die Klasse ist die der Ankunfts-Einstufung (``_dec_arrival`` CLASSIFY / D's Messung), keine Schaetzung."""
+    import inspect
+
+    from flliper.srt.pdflip import front as F
+
+    src = inspect.getsource(F.Front._dec_arrival)
+    assert "phase_policy.classify_arrival(int(remainder), _x6, _f6, bool(p_only)))" in src
+    assert src.index("Front._r6k_note_class(self, rid, _k6") < src.index("now = time.monotonic()")   # review K2
+    mr = inspect.getsource(F.Front._measure_return)
+    assert "Front._r6k_note_class(self, rid, klass, _dn.SRC_D_EXTENT, hx)" in mr
+    assert mr.index("Front._r6k_clear_class(self, rid)") < mr.index("sent = ")                     # review K1
+
+
+def test_r6k_the_kurz_rest_ends_on_d_before_the_flip_not_parked_at_a_chunk_boundary(monkeypatch, tmp_path):
+    """R6k "laeuft nach R2 auf D zu Ende" (Planer-Entscheid 20.10.): der D->P-Park wartet, bis der laufende kurze Prefill auf D
+    fertig ist (R6K_HOLD, kein Park-RPC, Versuch nicht verbraucht); danach geht der Park raus. Begrenzt (T_halb / gemessene
+    Restzeit), ohne Sync: die Front fragt im eigenen Takt neu."""
+    import asyncio as _a
+
+    from flliper.srt.pdflip import front as F
+    from test_nf_r6_rest_exakt_1020 import REST_AFTER, RID_K, _park_rpc, end_forward
+
+    now, f = _r6k_front(monkeypatch, tmp_path, member_u=9875, klass="kurz", waited=4.6, ended=False)
+    calls = []
+    _park_rpc(f, calls)
+    loop = _a.new_event_loop()
+    try:
+        assert loop.run_until_complete(f._wait_bound_park(None, immediate=f.queue[0], cause="before-flip")) == F.R6K_HOLD
+        assert calls == []
+        ws, _ev = f._test_running[RID_K]
+        for w in ws:
+            w.note_extend(rids=[RID_K], rests=[REST_AFTER], extend_lens=[REST_AFTER])
+        end_forward(f, RID_K)
+        for w in ws:
+            w.note_extend_done(rids=[RID_K])
+        assert loop.run_until_complete(f._wait_bound_park(None, immediate=f.queue[0], cause="before-flip")) != F.R6K_HOLD
+    finally:
+        loop.close()
+    assert calls

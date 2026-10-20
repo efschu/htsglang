@@ -4602,6 +4602,9 @@ class Scheduler(
             self._dual_group_lane_tick()
             _slow.span("lane_ms", _t_slow)
 
+            # NF-R6-REST-EXAKT (SOLL R6): an extend forward that ended reports its after-rest now, not after the next launch
+            self._pdflip_d_ext_poll()
+
             # #616 instrument: consume/stage the index-race counters. Sync-free
             # (staged D2H + event query), no-op unless the guard is armed.
             index_race_guard.poll()
@@ -4644,6 +4647,8 @@ class Scheduler(
                 # idle poll ladder to its zero-poll rung.
                 if self.idle_sleeper is not None:
                     self.idle_sleeper.reset()
+                # NF-R6-REST-EXAKT: building this batch can take 100 ms (lend return, fences) -- the previous extend's end first
+                self._pdflip_d_ext_poll()
                 _t_slow = time.perf_counter()
                 batch_result = self.run_batch(batch)
                 _slow.span("run_ms", _t_slow)
@@ -20355,6 +20360,9 @@ class Scheduler(
                     batch.input_ids = None
                 self.update_cache_from_scheduler(batch, batch_result)
 
+            if self.pdflip_d_ext_beacon is not None and batch.forward_mode.is_extend():
+                self._pdflip_d_ext_arm_done(batch)
+
             # These 2 values are needed for processing the output, but the values can be
             # modified by overlap schedule. So we have to copy them here so that
             # we can use the correct values in output processing.
@@ -20394,6 +20402,33 @@ class Scheduler(
         self._maybe_report_active_ranks()
 
         return ret
+
+    def _pdflip_d_ext_arm_done(self, batch: ScheduleBatch) -> None:
+        """NF-R6-REST-EXAKT (SOLL R6 + R11, user order 19.10. "NICHTS SCHÄTZEN, EXAKTE ZAHLEN"): a device event behind this
+        extend forward; ``_pdflip_d_ext_poll`` writes the batch's after-rest (D-EXTEND-BEACON v3) as soon as it has
+        completed -- not only from ``process_batch_result``, which under overlap runs after the NEXT batch was built and
+        launched (rc28 pdflip-12-275: the front read the chunk-start rest 1394 at 18:36:32.98, 50 ms after chunk 1's
+        forward had ended; D's exact rest was 626). Never a sync: the event is only queried."""
+        try:
+            ev = self.device_module.Event()
+            if self.enable_overlap:
+                ev.record(self.forward_stream)
+            else:
+                ev.record()
+            self.pdflip_d_ext_beacon.arm_done(
+                key=int(batch.forward_iter), rids=[req.rid for req in batch.reqs], ready=ev.query
+            )
+        except Exception:  # noqa: BLE001 -- no event: the result path writes the after-rest as before
+            pass
+
+    def _pdflip_d_ext_poll(self) -> None:
+        """NF-R6-REST-EXAKT: write the after-rest of every extend batch whose forward has ended (non-blocking)."""
+        b = self.pdflip_d_ext_beacon
+        if b is not None:
+            try:
+                b.poll_done()
+            except Exception:  # noqa: BLE001 -- an instrument never stops the scheduler
+                pass
 
     def _draft_kv_producer_wants(self, batch: ScheduleBatch) -> bool:
         """#1233 (C7): the last stage's extend chunk, and nothing else.
@@ -20644,7 +20679,9 @@ class Scheduler(
             # (review A2c: a skip batch reports too -- note_extend queued its after-rest, the FIFO stays aligned)
             # EZ-S2b review A2 (SOLL R6, D-EXTEND-BEACON v3): the extend forward has ended and its result is processed --
             # re-report the REST AFTER it (0 for a finished prefill); R6 counts nothing D has already computed
-            self.pdflip_d_ext_beacon.note_extend_done(rids=[req.rid for req in batch.reqs])
+            # NF-R6-REST-EXAKT: the backstop -- what the poll already wrote at the forward's device end is not written twice
+            self.pdflip_d_ext_beacon.note_extend_done(rids=[req.rid for req in batch.reqs],
+                                                      key=getattr(batch, "forward_iter", None))
 
         self.metrics_reporter.log_batch_result_stats(batch, result)
         # nf-pd-post: a skip batch's #639 ballot is decided after its result
