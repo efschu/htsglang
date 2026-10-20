@@ -62,8 +62,13 @@ DEFER_KEEP = 4096
 
 
 def turn_end_on(env: Optional[Mapping[str, str]] = None) -> bool:
-    """Group D, always (user order: no switch). Group P has its own retain publish (xsn338)."""
+    """Group D, always (user order: no switch). Group P has its own retain publish (xsn338).
+    27B DUAL-TP3PP3 (port 20.10., user 20.10.: the dual layout stays as it was): not in the dual
+    layout -- FLLIPER_PDFLIP_DUAL_LAYOUT=1 is set on every rank of both groups, so the gate is
+    rank-uniform."""
     env = os.environ if env is None else env
+    if str(env.get("FLLIPER_PDFLIP_DUAL_LAYOUT", "")).strip() == "1":
+        return False
     return str(env.get("FLLIPER_PDFLIP_GROUP", "")).strip().upper() == "D"
 
 
