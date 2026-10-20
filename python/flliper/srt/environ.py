@@ -1842,6 +1842,17 @@ class Envs:
     # waited there for TP1's load-back issue (prepare_ms 240-295) before it could
     # stream P's token. Read once at import. 0 = decide in prepare.
     FLLIPER_DCP_PREFIX_LENS_DEFER_SKIP = EnvBool(True)
+    # TAIL_SKIP_CACHED_CREDIT (ANKER-D, rc28 boot ..._297198745d_1020_174205,
+    # pdflip-18-315 18:41:37): an E2 skip admits the request with prefix c =
+    # floor_r(N-1) and runs NO target forward over [c, N) (PDFLIP-HANDBACK
+    # d_compute=0 path=skip; only the draft seeds over those rows) -- P's END
+    # state is installed at N. The cached-token count still stopped at c
+    # (prepare_for_extend books len(prefix_indices)), so the usage said
+    # d_computed=4 / cached 78460 of 78464 and the monitor read an anchor miss
+    # that never ran. The admission commit credits the skipped [c, N) as cached
+    # (lifetime counter, or the re-admission counter of a parked request).
+    # Reporting only; rank-uniform (the skip is the group's vote). 0 = count c.
+    FLLIPER_PDFLIP_TAIL_SKIP_CACHED_CREDIT = EnvBool(True)
     # TAIL_WAIT_MS (H45, metal fnFL2x150/x151): P's PP ranks write their tail
     # parts from background threads; D's vote used to read the part list ONCE
     # at the first prefetch check and fell on a partial manifest (parts=1-2 of
