@@ -273,3 +273,42 @@ def test_the_rank_local_answer_enters_the_group_min(floor_env, monkeypatch, role
     else:
         assert st.changed and ms.stage == 8, st.reason
         assert any(any(f) for f in flags)
+
+
+# ---- review A1 (nf-review-s84-1019): the two cap edges the first test set left open ----------
+
+def test_review_a1_the_id_right_above_the_cap_is_no_destination():
+    """X1 (off-by-one): cap 12 -- page 13 (cap+1) back in a free list past the hook is
+    above the cap as much as 15 is; the plan must not take it."""
+    alloc, tree, cop = _cap_world(12)
+    _take(alloc, [9, 10, 11])                                   # below the cap only 12 is free
+    _node(tree, alloc, [20, 21], P, backed=False)               # un-backed, above B, 2 pages
+    _take(alloc, [13])                                          # live at the engage
+    cap = alloc._pdflip_kv_stage_cap = KvRowCap(alloc)
+    cap.engage(12)
+    alloc.free_pages = torch.cat([alloc.free_pages, torch.tensor([13])])   # past the hook
+    plan, why = KC.plan_for(KC.survey(tree, alloc, P, B), B)
+    assert plan is None or all(d <= 12 for _m, _s, dd in plan.moves for d in dd), plan.moves
+    assert plan is None and "no free page below" in why
+
+
+def test_review_a1_a_lower_cap_filter_bounds_the_destinations_after_the_stage_caps_release():
+    """X4 / the release() bypass: a cap filter BELOW the stage cap (relief at 12) and the
+    stage cap's release() (a stage that rises) hands its withheld ids straight into the free
+    list -- past the relief hook. They are free, withheld by nobody, above 12: no
+    destination may come from them (the lowest engaged cap bounds the plan)."""
+    alloc, tree, cop = _cap_world(12)
+    _take(alloc, [9, 10, 11])                                   # below 12 only 12 is free
+    _node(tree, alloc, [20, 21], P, backed=False)
+    stage = alloc._pdflip_kv_stage_cap = KvRowCap(alloc)
+    stage.engage(14)                                            # withholds every free id above 14
+    relief = KvRowCap(alloc)
+    relief.engage(12)                                           # a listener-registered cap filter: 13, 14
+    assert {15, 16} <= set(stage._withheld.tolist()) and set(relief._withheld.tolist()) == {13, 14}
+    stage.release()                                             # 15.. back, the relief hook bypassed
+    assert {15, 16} <= set(alloc.free_pages.tolist())
+    sv = KC.survey(tree, alloc, P, B)
+    assert sv.held_above == [] and all(f <= 12 for f in sv.free), sv.free
+    plan, why = KC.plan_for(sv, B)
+    assert plan is None or all(d <= 12 for _m, _s, dd in plan.moves for d in dd), plan.moves
+    assert plan is None and "no free page below" in why
