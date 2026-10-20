@@ -13560,6 +13560,7 @@ class Front:
         # write ``D_NOW`` with a member ``u=0`` for it -- that line would be an R2 claim on a number nobody measured.
         # Its record is the ``DECISION kind=measure`` of the arrival and D's report after it.
         if (rid not in (self.__dict__.get("_measure_on_d") or ())
+                and not getattr(self, "dual_layout", False)   # 27B DUAL: no set scheduler, no SET-VERDICT line
                 and phase_policy.classify_arrival(_unc, _x, Front._set_cfg()[0], False) == phase_policy.CLASS_KURZ):
             if seat is not None:
                 _w = time.time() - t_in
