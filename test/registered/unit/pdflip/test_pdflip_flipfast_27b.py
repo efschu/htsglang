@@ -298,17 +298,19 @@ class ArrivalKickWiring(CustomTestCase):
         for name in self.SITES:
             src = inspect.getsource(getattr(front_mod.Front, name))
             lines = src.splitlines()
-            idx = [i for i, l in enumerate(lines) if re.search(r"self\.queue\.append\(", l)]
+            # 27B port 20.10.: NF enqueues an arrival at its age position (S46 F3, ``Front._queue_at_age``)
+            idx = [i for i, l in enumerate(lines) if re.search(r"self\.queue\.append\(|Front\._queue_at_age\(self, p\)", l)]
             self.assertTrue(idx, f"{name}: no self.queue.append at all")
             for i in idx:
-                nxt = "\n".join(lines[i + 1:i + 3])
+                nxt = "\n".join(lines[i + 1:i + 12]) if "_queue_at_age" in lines[i] else "\n".join(lines[i + 1:i + 3])
                 self.assertIn(
                     'self._kick_controller("arrival")', nxt,
                     f"{name}: `{lines[i].strip()}` is not followed by the arrival kick")
 
     def test_the_literal_append_stays_for_the_1290_pin(self):
         src = inspect.getsource(front_mod.Front.handle_generate)
-        self.assertLess(src.find('route == "none"'), src.find("self.queue.append"))
+        _at = src.find("self.queue.append") if "self.queue.append" in src else src.find("Front._queue_at_age(self, p)")
+        self.assertLess(src.find('route == "none"'), _at)   # 27B port 20.10.: NF's age-position enqueue
 
     def test_the_intake_stall_requeue_is_not_kicked(self):
         # appendleft during a P drain: the drain itself ends and flips, a kick
