@@ -78,7 +78,10 @@ class FrontWakePlan(unittest.TestCase):
         self.assertEqual(out, [R(9), R(10)])
         lines = [m for m in cap.output if "SEAT-ROTATE" in m]
         self.assertIn(f"rid_in={R(3)} rid_out={R(9)} reason=age", lines[0])
-        self.assertTrue(any(f"D-REFILL rid={R(9)} freed_by=rotate" in m for m in cap.output))
+        # S87 (rc19 pdflip-166-3095): D resumes a deferred rid anyway -- it keeps its seat as a debt, the permit
+        # goes on to the older taker (was: D-REFILL freed_by=rotate, a seatless leg on D)
+        self.assertTrue(any(f"D-SEAT-CREDIT rid={R(9)} why=rotate" in m for m in cap.output))
+        self.assertTrue(all(s.held for s in f._d_seats_live if s.rid in (R(9), R(10))))
 
     def test_the_old_long_runs_keep_their_seats_against_younger_waiters(self):
         # the NF finding re-read: the five long runs are OLDER than the waiters -> they keep the
