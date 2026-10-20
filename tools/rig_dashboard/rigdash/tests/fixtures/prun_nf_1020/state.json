@@ -1,0 +1,22 @@
+{
+ "boot_id": "nfint4h6ablxcw3spmlrhlvwfldauer-boot-20261019T230301Z-0d0f",
+ "schema": "pdflip.state/1",
+ "kind": "boot",
+ "line": "nf",
+ "tag": "dkrnfint4h6ablxcw3spmlrhlvwflbar1dauer10192303",
+ "rev": "10e9b2b492",
+ "image": "flliper:0.1.0-rc19-cu130",
+ "profile": "nf-int4-h6-abl-xc-w3sp-mlr-hl-vw-fl",
+ "container": "htsglang-acc-nf-int4h6ablxcw3spmlrhlvwflbar1dauer",
+ "cause": null,
+ "serving_since_ts": 1792451201.876,
+ "seq": 26933,
+ "lifecycle": {
+  "prev": "flipping",
+  "since_ts": 1792477591.6,
+  "state": "serving"
+ },
+ "front": {
+  "awake": "D"
+ }
+}

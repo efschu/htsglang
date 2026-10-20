@@ -152,10 +152,18 @@ def chunks(ring, keys, g: str, kind: Optional[str] = None) -> List[dict]:
     if k0 is None:
         return []
     last_recs: List[Tuple[float, float]] = []            # (counter, last.t) of the last stage
+    stage_ms: Dict[float, List[Optional[float]]] = {}    # counter -> own time (ms) of that chunk on every later stage
     if kl != k0:
         for a, b in rank_pairs(ring, kl):
             if (_d(b, a, "pchunks") or 0) > 0 and b.get("plast_t") is not None:
                 last_recs.append((b["pchunks"], b["plast_t"]))
+        for kk in [k for k in sorted(keys) if _grp(k) == g and _tp_pp(k)[0] == 0 and _tp_pp(k)[1] > _tp_pp(k0)[1]]:
+            for a, b in rank_pairs(ring, kk):
+                dn = _d(b, a, "pchunks") or 0
+                if dn > 0 and b.get("pchunks") is not None:
+                    ms = b.get("plast_own") if b.get("plast_own") is not None else b.get("plast_gpu")
+                    stage_ms.setdefault(b["pchunks"], []).append(ms if dn == 1 else None)
+    n_later = len([k for k in keys if _grp(k) == g and _tp_pp(k)[0] == 0 and _tp_pp(k)[1] > _tp_pp(k0)[1]]) if kl != k0 else 0
     out = []
     for a, b in rank_pairs(ring, k0):
         n = _d(b, a, "pchunks") or 0
@@ -186,6 +194,17 @@ def chunks(ring, keys, g: str, kind: Optional[str] = None) -> List[dict]:
                 s = min(s, e0 - (_d(b, a, "pgpu") or 0.0) / 1000.0)
         cnt = b.get("pchunks")
         el = next((t for c, t in last_recs if cnt is not None and c >= cnt), None) if kl != k0 else e0
+        if kl != k0 and n == 1 and el is not None and cnt is not None:
+            # 20.10. (NF 06:26Z, P run epoch 181): prefill.last.t is the time the rank FLUSHED the chunk's line, not its
+            # forward end.  The last stage flushes when its forward is done, but PP0/PP1 flush only once the chunk has
+            # left the whole pipeline (7903 tokens: PP0 forward 2.64 s from 12.06 s, flushed with PP2 at 17.43 s), so
+            # t - gpu_ms put the chunk 2.5 s late and the P run fell apart into bursts with fake holes.  A chunk
+            # passes the stages one after the other: it cannot have started later than (last-stage end - the sum of
+            # its own stage times) -- the true start is that or earlier (waits in between), never later.
+            ms = stage_ms.get(cnt)
+            own0 = own if own is not None else (b.get("plast_gpu") or 0.0)
+            if ms is not None and len(ms) == n_later and all(x is not None for x in ms) and own0:
+                s = min(s, el - (own0 + sum(ms)) / 1000.0)
         out.append({"s": s, "e0": e0, "e": max(e0, el if el is not None else e0), "tok": tok,
                     "cached": _d(b, a, "pcached") or 0.0, "n": n, "comp_ms": _d(b, a, "pcomp") or 0.0, "g": g,
                     "ext": b.get("plast_ext"), "timed": True,

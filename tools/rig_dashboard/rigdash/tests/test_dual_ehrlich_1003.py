@@ -116,8 +116,13 @@ class TestFlipBootUnchanged(unittest.TestCase):
     sample fill-in.  Verified by structured diff against 19393ee2cb: 24 of 125 segments changed, all D, only the key
     tps (62,9 -> 64,5 ... 352,5 -> 452,2; never None, never lower), every other key and the rest of the timeline
     unchanged; y8c has no untimed chunk (its rankstats predate MIXED-D)."""
-    SEGS = "95697829d49f4b78ad40a03874791ba7a88bcd31e8b0b47789ce3ed5d322a53a"      # 19.10. D tps at compute time (was 9a04f69a..., 07.10. English texts)
-    TIMELINE = "5e1ec9e1750dd5b8f71c7abe312fec647388e5b75bf18af69539dc4a09e7d15e"
+    # 20.10. P chunk start = min(flush - own, last-stage end - sum of the stages' own times) (prefill.last.t of PP0/PP1 is
+    # the flush, not the forward end) + the trigger rid on the first P segment of a run.  y8c diff against 299945f808:
+    # the 315-token P chunk after the 44.5k burst starts 29.77 -> 29.24 s, so the two P bars (hole "Rank counter moves,
+    # but without assignable tokens" 27.5-29.5 s) become ONE bar 44,864 tok at 4,280 tok/s; plus seg.trigger on the P
+    # bar after the D>P flip (weg2-0-1, 44,083 new / 64,704 cached); nothing else changed (was SEGS 95697829..., TIMELINE 5e1ec9e1...)
+    SEGS = "5a2ceeb463d6ac35dc721866c210ac8d8e2384264cb0e745e833d8ca1c3f2d85"      # 19.10. D tps at compute time (was 9a04f69a..., 07.10. English texts)
+    TIMELINE = "c0dd0c8b4949563a9e45dea2ef5c1270057465ce07d23e769cbbac3f556798ec"
 
     def test_flip_boot_bytes(self):
         r = replay_boot("y8c_0cf3")
