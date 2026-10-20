@@ -13982,6 +13982,16 @@ class Front:
         fits, why = _asr.kv_fits(need, reading)
         free = _asr.kv_free(reading)
         self._asr_st()["last_kv_free"] = free   # S60 F2: the room this tick's verdicts were formed on
+        # S94: the AGE PLAN reads whether D had a number at all, whether its backup wall stands and which decodes D
+        # runs. S94 review A2: ONE basis object of THIS reading; a caller takes it with :meth:`_asr_kv_basis` right
+        # after its own await (no await in between) and hands it on -- the shared slot is overwritten by every other
+        # waiter's KV test during the caller's later awaits (``_asr_older_blocked``, the other waiters of the tick).
+        _rr = reading.get("running_rids") if reading else None
+        self._asr_st()["last_kv_basis"] = {
+            "unread": not reading,
+            "wall": _asr.backup_wall(reading),
+            "running": set(str(r) for r in _rr) if isinstance(_rr, (list, tuple)) else None,
+        }
         deficit = 0 if (fits or free is None) else int(need) - int(free)
         if shared or decode < reserve:
             why = "%s [need = prompt %d - shared %d + decode %d of max_tokens %d, D clip %s]" % (
@@ -13997,6 +14007,12 @@ class Front:
                 why, stale_ms)
         st["need_terms"] = (shared, decode, reserve)
         return fits, why, deficit
+
+    def _asr_kv_basis(self) -> Dict[str, Any]:
+        """S94 review A2: the basis of the KV test that JUST returned (call it with no await after that test): D gave a
+        number (``unread``), its backup wall (``wall``), the decodes it runs (``running``, None = an old D)."""
+        b = self._asr_st().get("last_kv_basis")
+        return dict(b) if isinstance(b, dict) else {"unread": True, "wall": False, "running": None}
 
     def _asr_note_need_terms(self) -> None:
         """Counters for the two honest terms of the verdict just granted."""
@@ -14069,7 +14085,8 @@ class Front:
         (st.get("age_victims") or {}).pop(rid, None)
 
     def _arrival_seat_age_verdict(self, head_rid: str, head_arrival: Optional[float],
-                                  seat_is_free: bool, deficit: int) -> Optional[List[str]]:
+                                  seat_is_free: bool, deficit: int,
+                                  basis: Optional[Dict[str, Any]] = None) -> Optional[List[str]]:
         """AGE PLAN (Nutzer 30.09. ~14:40Z/14:45Z), the FRONT's half: may the
         oldest waiter go to D although it does not fit now? ``_asr.displace_plan``
         over the running decodes that arrived after it, on the front's own
@@ -14095,12 +14112,28 @@ class Front:
                 _av.pop(_g, None)
         running = [r for r in self._flip_ledger(self.groups["D"])
                    if r not in st["parked"] and r != head_rid and r not in _claimed]
+        if basis is None:
+            basis = Front._asr_kv_basis(self)   # a caller without its own basis: the last KV test's
+        d_running = basis.get("running")
+        if d_running is not None:
+            # S94 F3 (R5): only a decode D RUNS can be displaced for the head (D's ``displace_for_age`` walks its running
+            # batch). The front's ledger also holds legs D keeps but does not run -- a queued load-back (rc20 08:34:48
+            # pdflip-8-58), a hand-off still in the D line (08:33:41 pdflip-8-47), a credit head granted 57 ms before
+            # (rc19 07:15:49 pdflip-262-3339 for 3338) -- planning on those handed heads to a D that could not seat
+            # them. D's own reading decides; an old D without the field: unchanged.
+            running = [r for r in running if r in d_running]
         arrivals = {}
         for r in running:
             t = self._asr_arrival_of(r)
             if t is not None:
                 arrivals[r] = t
         tokens = {s.rid: int(s.tokens) for s in (getattr(self, "_d_seats_live", ()) or ())}
+        if basis.get("wall"):
+            # S94 (R5): under D's backup wall a displaced decode frees no KV row -- D sizes every victim 0
+            # (``d_park_runtime.kv_displace_would_fit``: "a victim's retained KV goes back to the tree and is as
+            # unpayable as the rest"). The front plans with D's numbers: a KV deficit is not coverable by victims, only
+            # a missing SEAT is (the head then still has to fit D's payable room).
+            tokens = {r: 0 for r in tokens}
         plan = _asr.displace_plan(head_arrival, seat_is_free, deficit, running, arrivals, tokens,
                                   lane_of={r: Front._prio_lane(self, r) for r in running},  # PRIO-AS-AGE 1014
                                   head_lane=Front._prio_lane(self, head_rid))
@@ -14112,8 +14145,11 @@ class Front:
                 self.counters["arrival_seat_age_blocked_by_elders"] += 1
             logger.info("%s head=%s plan=%s seat_free=%s deficit=%d younger_victims_by_front_price=%s -- %s",
                         _asr.AGE_MARKER, head_rid, key, bool(seat_is_free), int(deficit), plan or [],
-                        "older running requests block it: it waits here, younger ones that fit are "
-                        "backfilled" if plan is None else
+                        ("S94 backup wall on D: displacing frees no KV row and the head does not fit D's payable "
+                         "room -- it waits for room (R5), younger ones that fit are backfilled"
+                         if basis.get("wall") and int(deficit) > 0 else
+                         "older running requests block it: it waits here, younger ones that fit are "
+                         "backfilled") if plan is None else
                         ("it fits" if not plan else
                          "it goes to D; D's SEAT-AGE decides the displacement on its real KV"))
         return plan
@@ -14377,6 +14413,7 @@ class Front:
         st = self._asr_st()
         fits_of = st.setdefault("fits", {})
         fits_kv, why, deficit = await self._arrival_seat_kv(est_tokens, max_tokens, rid, uncached)
+        kv_basis = Front._asr_kv_basis(self)   # S94 review A2: THIS test's basis, taken before any further await
         kv_why = why
         terms = st.get("need_terms")
         fits = bool(free and fits_kv)
@@ -14414,8 +14451,18 @@ class Front:
                     eligible = await self._asr_older_blocked(rid, t_mine, True)
                     st["need_terms"] = terms
             else:
-                plan = self._arrival_seat_age_verdict(rid, arrival, free, 0 if fits_kv else deficit)
+                plan = self._arrival_seat_age_verdict(rid, arrival, free, 0 if fits_kv else deficit,
+                                                      basis=kv_basis)
         to_d = bool(plan)   # does not fit, but D can make it fit by displacing younger ones
+        if to_d and kv_basis.get("unread"):
+            # S94 (R5, Order 19.10. "nichts schätzen"): no D reading -> no AGE PLAN grant. rc19 07:15:57 pdflip-262-3340
+            # went to D at taken=7 n=6 with ``kv=unread`` (seat 9/6 ON-CREDIT) onto a D whose wall stood. Without D's
+            # number the head waits for its seat (R5) -- the plain seat path is unchanged.
+            self.counters["arrival_seat_age_no_reading"] += 1
+            logger.info("%s head=%s plan=held-no-reading victims=%s -- S94: D gave no KV reading this tick, the AGE "
+                        "PLAN does not hand a head to D on no number; it waits for its seat (R5)",
+                        _asr.AGE_MARKER, rid, list(plan))
+            to_d, plan = False, None
         if fits:
             # H16V F4 (root of the 5 s gap, NF 16:03:32,957: pdflip-96-1178/1179/1180 were ALL granted at taken=5 n=6 --
             # ONE free seat): ``free`` was read BEFORE the awaits above (KV reading, older-blocked), so every waiter of
@@ -14908,6 +14955,7 @@ class Front:
             fits_kv, why, deficit = await self._arrival_seat_kv(
                 int(getattr(q, "est_prompt", 0) or 0), _asr.max_tokens_of(getattr(q, "payload", None)),
                 q.rid, int(getattr(q, "est_uncached", 0) or 0))
+            q_basis = Front._asr_kv_basis(self)   # S94 review A2: q's own basis, before the awaits below
             terms = st.get("need_terms")
             fits = bool(free and fits_kv)
             st.setdefault("fits", {})[q.rid] = fits
@@ -14916,7 +14964,7 @@ class Front:
                 break                                   # an older one keeps its right of way
             st["need_terms"] = terms
             plan = (None if fits else self._arrival_seat_age_verdict(
-                q.rid, self._asr_arrival_of(q.rid) or t_q, free, 0 if fits_kv else deficit))
+                q.rid, self._asr_arrival_of(q.rid) or t_q, free, 0 if fits_kv else deficit, basis=q_basis))
             _x_p = int(getattr(q, "x_routed", 0) or 0)
             # a plan = D can make it fit by displacing younger ones: admissible
             v = _asr.verdict(True if plan else free, True if plan else fits_kv,
