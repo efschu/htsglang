@@ -85,6 +85,7 @@ from flliper.srt.mem_cache.hicache_drain_budget import (
     drain_budget_tokens,
 )
 from flliper.srt.mem_cache.hicache_storage import (
+    PoolHitPolicy,
     PoolName,
     PoolTransfer,
     PrefetchOutcome,
@@ -2297,6 +2298,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # D's arena stayed 6485/6485 pinned for 45 s. Every rank registers its tree HERE (construction runs
         # ``reset``), so the verdict is applied at the broadcast it rides, as TP0 assumes.
         _r12.register_tree(self)
+        # QSA-PAIR: a KV slot still waiting for its index write completes now,
+        # before the arena release below gives the tree's references back (the
+        # order the slot had before the pair rule; nothing stays WRITING).
+        UnifiedRadixCache._qsa_pair_settle_all(self, "reset")
         # rc12 (D, all ranks, 23:12:47Z: "H-leaf extra: [62, 64, 60, 63]" +
         # "4 stale nodes in host_leaves"): the #1417 prefetch pins name nodes
         # of the tree being destroyed. Kept across the sleep flush, the held
@@ -3926,6 +3931,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         if child.backuped:
             self._replace_pending_write_through_node(child, [new_node, child])
+            UnifiedRadixCache._qsa_pair_on_split(self, child, new_node)   # QSA-PAIR: both fragments wait
 
         self._for_each_component_lru(
             new_node, UnifiedLRUList.insert_mru, skip_existing=True
@@ -7811,11 +7817,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         except Exception:  # noqa: BLE001
             pass
         direct = set()
+        pair_xfers: dict = {}   # QSA-PAIR: id(node) -> its plain sidecars (KV completes after them)
         for node in publish_nodes:
             if node.write_through_pending_id == ack_id:
                 node.write_through_pending_id = None
             self._record_store_event(node, medium=StorageMedium.CPU)
-            if self._pdflip_direct_complete(node):
+            xf = UnifiedRadixCache._qsa_pair_xfers_to_defer(self, node)
+            if xf:   # the KV slot stays WRITING until its index is in the store
+                direct.add(id(node))
+                pair_xfers[id(node)] = xf
+            elif self._pdflip_direct_complete(node):
                 direct.add(id(node))
         if lock_params is not None:
             self.dec_lock_ref(lock_node, lock_params)
@@ -7836,6 +7847,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             for node in publish_nodes:
                 if id(node) not in direct:  # #1427: a direct write is in the store already
                     self.write_backup_storage(node)
+                elif id(node) in pair_xfers:
+                    # QSA-PAIR: the index goes to the store FIRST; the KV slot
+                    # completes (becomes readable) at that write's ack drain
+                    op = self._pdflip_write_plain_sidecars(node, xfers=pair_xfers[id(node)])
+                    if op is None:
+                        self._pdflip_direct_complete(node)   # nothing issued: the old order
+                    else:
+                        UnifiedRadixCache._qsa_pair_defer(self, op, node)
                 else:  # fnFL2x62: ... except its sidecars without an arena home
                     self._pdflip_write_plain_sidecars(node)
 
@@ -9207,7 +9226,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
         return True
 
-    def _pdflip_write_plain_sidecars(self, node: UnifiedTreeNode) -> None:
+    def _pdflip_write_plain_sidecars(self, node: UnifiedTreeNode, xfers=None) -> Optional[int]:
         """fnFL2x62: a direct write completes the KV page in the arena and the
         mamba blob / draft page in THEIR arenas, and the write-through ack then
         skips ``write_backup_storage`` -- so a sidecar pool WITHOUT an arena
@@ -9216,28 +9235,21 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         held the request in a zero-answer loop and the group died on the
         refetch vote. Issue the store write for exactly those pools, KV
         skipped (``sidecar_only``): the same transfers ``write_backup_storage``
-        builds, filtered by :meth:`_plain_sidecar_transfers`."""
+        builds, filtered by :meth:`_plain_sidecar_transfers`.
+
+        Returns the store operation's id, None when nothing was issued.
+        ``xfers``: the transfers :meth:`_pdflip_plain_sidecar_xfers` already
+        built for this node (QSA-PAIR, the write-through ack)."""
         cc = self.cache_controller
         if not self.enable_storage or cc is None or not node.backuped:
-            return
+            return None
         if UnifiedRadixCache._k12_refuse_unreal_backup(self, node, "plain_sidecars"):
-            return
-        comp_xfers: dict[ComponentType, list[PoolTransfer]] = {}
-        for comp in self._components_tuple:
-            if comp.component_type == BASE_COMPONENT_TYPE:
-                continue
-            transfers = comp.build_hicache_transfers(node, CacheTransferPhase.BACKUP_STORAGE)
-            if transfers:
-                comp_xfers[comp.component_type] = transfers
-        hv = node.component_data[BASE_COMPONENT_TYPE].host_value
-        kv_xfer = PoolTransfer(name=PoolName.KV, host_indices=hv, keys=node.hash_value)
-        xfers = [x for xs in comp_xfers.values() for x in xs]
-        xfers.extend(self._build_sidecar_transfers(CacheTransferPhase.BACKUP_STORAGE, kv_xfer, comp_xfers))
-        xfers = self._plain_sidecar_transfers(
-            xfers, getattr(cc.storage_backend, "registered_pools", None)
-        )
+            return None
+        if xfers is None:
+            xfers = self._pdflip_plain_sidecar_xfers(node)
         if not xfers:
-            return
+            return None
+        hv = node.component_data[BASE_COMPONENT_TYPE].host_value
         prefix_keys = None
         if self.hicache_storage_pass_prefix_keys:
             prefix_keys = node.get_prefix_hash_values(node.parent)
@@ -9260,6 +9272,165 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
         if self.staging_write_ring is not None:
             self.staging_write_ring.occupy(operation_id, len(hv))
+        return operation_id
+
+    # ------------------------------------------------------------------
+    # QSA-PAIR (S99, NF rc22 9c40fe40a2, P 10:19:45, pdflip-12-238): THE KV
+    # PAGE BECOMES READABLE ONLY TOGETHER WITH ITS QSA INDEX.
+    #
+    # ``#1028B FETCH CAP n=7: kv=952 claimed=760 lost=192 caps={qsa_indexer:
+    # 760, mamba: 760}`` on PP0/PP1/PP2: D's direct writes (#1427) had made the
+    # KV slots of pages 760..951 COMPLETE at the write-through ack
+    # (``_pdflip_direct_complete``), while their QSA index -- a plain sidecar
+    # without an arena home -- was only QUEUED on the backup thread
+    # (``_pdflip_write_plain_sidecars``, #106S) behind D's flip backlog
+    # (``hicache_backup(34)`` on TP0 against 18 on TP1/TP2 at 10:19:45). P's
+    # dormant read in that window met KV without index: the ALL_PAGES cap
+    # took 192 pages (12288 tokens), recovered only because PP0's wake probe
+    # re-read them 2 s later. 29 such reads in 9 boots (10-18..10-20), 116160
+    # tokens never re-read. The L3 pair rule (KV only with its index,
+    # ``_l3_pair_gate``) held for the disk; the arena -- the store P and D
+    # read first -- had no such rule.
+    #
+    # THE RULE: a direct-written node whose plain sidecars include a
+    # claim-capping ALL_PAGES pool of this rank (the QSA index) issues that
+    # store write FIRST (ahead of the queued KV backups, hybrid
+    # ``write_storage``) and completes its KV slot -- ``_pdflip_direct_complete``,
+    # whole and unchanged -- at that write's ack drain. Every exit settles it:
+    # the ack (also a failed one: the old order, named), the K12 abandon, the
+    # reset, and a split hands the deferral to both fragments. No collective,
+    # no rank decision: the slot's COMPLETE is the arena's merge of every
+    # writer's extents, which now includes "this writer's index is stored".
+    # ------------------------------------------------------------------
+
+    def _pdflip_direct_kv_rows(self, node: UnifiedTreeNode) -> bool:
+        """True = ``_pdflip_direct_complete`` would complete KV arena rows of
+        ``node`` (not an anchor-only write, arena rows) -- the same tests, no
+        side effect."""
+        _ao = getattr(self, "_pdflip_anchor_only_ids", None)
+        if _ao and node.id in _ao:
+            return False
+        cc = self.cache_controller
+        pool = getattr(cc, "mem_pool_host", None) if cc is not None else None
+        if getattr(pool, "arena", None) is None:
+            return False
+        hv = node.component_data[BASE_COMPONENT_TYPE].host_value
+        if hv is None or hv.numel() == 0:
+            return False
+        return int(hv.min()) >= int(pool.staging_rows)
+
+    def _qsa_pair_xfers_to_defer(self, node: UnifiedTreeNode) -> list:
+        """QSA-PAIR: the plain sidecar transfers of a direct-written ``node``
+        when its KV completion must wait for them (a claim-capping ALL_PAGES
+        pool this rank writes itself is among them); [] = complete now."""
+        try:
+            if not self.enable_storage or not node.backuped:
+                return []
+            if not UnifiedRadixCache._pdflip_direct_kv_rows(self, node):
+                return []
+            xfers = self._pdflip_plain_sidecar_xfers(node)
+            if not xfers:
+                return []
+            from flliper.srt.managers.cache_controller import split_host_state_pools
+
+            own, _host = split_host_state_pools(self.cache_controller, xfers)
+            if any(t.hit_policy == PoolHitPolicy.ALL_PAGES and getattr(t, "caps_claim", True)
+                   for t in own):
+                return xfers
+        except Exception as exc:  # noqa: BLE001 - an unanswerable test keeps the old order
+            logger.warning("QSA-PAIR defer test raised on node %s: %r (completed at the ack)",
+                           getattr(node, "id", "?"), exc)
+        return []
+
+    def _qsa_pair_defer(self, op_id: int, node: UnifiedTreeNode) -> None:
+        d = self.__dict__.setdefault("_qsa_pair_deferred", {})
+        of = self.__dict__.setdefault("_qsa_pair_op_of", {})
+        d[op_id] = ([node], time.perf_counter())
+        of[id(node)] = op_id
+
+    def _qsa_pair_on_split(self, child: UnifiedTreeNode, new_node: UnifiedTreeNode) -> None:
+        """A node waiting for its index write was split: the upper fragment's
+        rows complete at the same ack (each fragment carries its own rows)."""
+        of = self.__dict__.get("_qsa_pair_op_of")
+        if not of:
+            return
+        op_id = of.get(id(child))
+        if op_id is None:
+            return
+        entry = (self.__dict__.get("_qsa_pair_deferred") or {}).get(op_id)
+        if entry is None:
+            of.pop(id(child), None)
+            return
+        entry[0].append(new_node)
+        of[id(new_node)] = op_id
+
+    def _qsa_pair_settle(self, op_id, why: str, written: Optional[int] = None) -> int:
+        """Complete the KV slots that waited for store write ``op_id``.
+        ``why``: ack | failed | abandon | reset. Returns the nodes completed."""
+        d = self.__dict__.get("_qsa_pair_deferred")
+        if not d:
+            return 0
+        entry = d.pop(op_id, None)
+        if entry is None:
+            return 0
+        nodes, t0 = entry
+        of = self.__dict__.get("_qsa_pair_op_of") or {}
+        done = 0
+        for node in nodes:
+            of.pop(id(node), None)
+            try:
+                if self._pdflip_direct_complete(node):
+                    done += 1
+            except Exception as exc:  # noqa: BLE001 - the drain must go on
+                logger.warning("QSA-PAIR complete raised on node %s (op=%s why=%s): %r",
+                               getattr(node, "id", "?"), op_id, why, exc)
+        pages = sum(len(getattr(n, "hash_value", None) or ()) for n in nodes)
+        short = written is not None and int(written) < pages
+        n = getattr(UnifiedRadixCache, "_qsa_pair_n", 0) + 1
+        UnifiedRadixCache._qsa_pair_n = n
+        if why != "ack" or short:
+            k = getattr(UnifiedRadixCache, "_qsa_pair_bad_n", 0) + 1
+            UnifiedRadixCache._qsa_pair_bad_n = k
+            if k <= 32 or (k & (k - 1)) == 0:
+                logger.warning(
+                    "QSA-PAIR KV-COMPLETE WITHOUT INDEX op=%s why=%s nodes=%d pages=%d index_written=%s "
+                    "waited_ms=%.0f (n=%d): the index write did not land whole -- the KV slots complete "
+                    "anyway (the order before the pair rule), the claim caps them by=qsa_indexer",
+                    op_id, why, len(nodes), pages, "-" if written is None else int(written),
+                    (time.perf_counter() - t0) * 1000.0, k)
+        elif n <= 16 or n % 256 == 0:
+            logger.info(
+                "QSA-PAIR KV-COMPLETE AFTER INDEX op=%s nodes=%d pages=%d completed=%d waited_ms=%.0f "
+                "(n=%d): the index is in the store, the KV slots become readable now",
+                op_id, len(nodes), pages, done, (time.perf_counter() - t0) * 1000.0, n)
+        return done
+
+    def _qsa_pair_settle_all(self, why: str) -> int:
+        d = self.__dict__.get("_qsa_pair_deferred")
+        if not d:
+            return 0
+        return sum(UnifiedRadixCache._qsa_pair_settle(self, op_id, why) for op_id in list(d.keys()))
+
+    def _pdflip_plain_sidecar_xfers(self, node: UnifiedTreeNode) -> list:
+        """fnFL2x62: the store transfers of ``node`` that a direct write leaves
+        unwritten (its plain sidecars, KV excluded); [] = none."""
+        cc = self.cache_controller
+        if cc is None:
+            return []
+        comp_xfers: dict[ComponentType, list[PoolTransfer]] = {}
+        for comp in self._components_tuple:
+            if comp.component_type == BASE_COMPONENT_TYPE:
+                continue
+            transfers = comp.build_hicache_transfers(node, CacheTransferPhase.BACKUP_STORAGE)
+            if transfers:
+                comp_xfers[comp.component_type] = transfers
+        hv = node.component_data[BASE_COMPONENT_TYPE].host_value
+        kv_xfer = PoolTransfer(name=PoolName.KV, host_indices=hv, keys=node.hash_value)
+        xfers = [x for xs in comp_xfers.values() for x in xs]
+        xfers.extend(self._build_sidecar_transfers(CacheTransferPhase.BACKUP_STORAGE, kv_xfer, comp_xfers))
+        return self._plain_sidecar_transfers(
+            xfers, getattr(cc.storage_backend, "registered_pools", None)
+        )
 
     def write_backup_storage(self, node: UnifiedTreeNode) -> None:
         # #1233 STORE-WRITE census (boots weg2ls3b1/b2): group P's FIRST
@@ -11955,6 +12126,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             drained = 0
             for operation in _drain_queue(cc.ack_backup_queue, n_backup):
                 drained += 1
+                # QSA-PAIR: the index write of a direct-written node acked --
+                # its KV slots complete now, before this ack's own bookkeeping
+                # (which ran after the completion before the pair rule)
+                if self.__dict__.get("_qsa_pair_deferred"):
+                    _psr = getattr(operation, "pool_storage_result", None)
+                    _pw = (getattr(_psr, "extra_pool_hit_pages", None) or {}).get(PoolName.QSA_INDEXER)
+                    UnifiedRadixCache._qsa_pair_settle(
+                        self, operation.id,
+                        "failed" if _k12_guard.is_failed(operation) else "ack", written=_pw)
                 entry = self.ongoing_backup.pop(operation.id, None)
                 if entry is not None and _k12_guard.is_failed(operation):
                     # K12: the write did not land (an exception in its body, or

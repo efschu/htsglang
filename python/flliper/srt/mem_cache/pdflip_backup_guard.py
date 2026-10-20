@@ -184,6 +184,14 @@ def abandon(tree, why: str) -> Tuple[int, int]:
                     continue
                 st["cancelled"].add(op_id)
         entry = ob.pop(op_id, None)
+        settle = getattr(tree, "_qsa_pair_settle", None)
+        if callable(settle):
+            # QSA-PAIR: a KV slot waiting for this (now abandoned) index write
+            # completes before the host lock goes -- never left WRITING
+            try:
+                settle(op_id, "abandon")
+            except Exception:  # noqa: BLE001 - the abandon names, it never raises
+                logger.warning("QSA-PAIR settle at abandon failed op=%s", op_id, exc_info=True)
         if entry is not None:
             try:
                 _release_entry(tree, entry)
