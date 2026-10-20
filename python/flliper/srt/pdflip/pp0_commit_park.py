@@ -34,11 +34,18 @@ wire -- the P-MINIFWD place), PP0 parks when
 * the pass carries no flip/flush/abort control request.
 
 It waits for the FIRST of: an ack set completes, an open read can terminate, the owed output is posted
-(or the readiness budget of that very receive runs out). No new clock: the wait ends no later than the
-receive it replaces would have; then the pass runs exactly as before, with the Admit / told decided on
-facts that are already true. An Admit decided in the park is admitted in THIS pass (the set runs on PP0
-while PP1/PP2 still compute the previous one -- upstream's launch-before-exchange order, sglang
-PR #40499), instead of one lap later.
+or the probe can no longer tell (or the readiness budget runs out). No new clock: the park and the pass's
+output receive share ONE deadline (review A1: ``_s82_receive_deadline``, the receive's readiness gate takes
+only the rest), so a wedge is named after one budget as before.
+
+PRIO = ALTER (review A3, user order 14.10.). An Admit decided in the park would run the younger set on PP0
+before PP0 receives the OLDER set's output. It is admitted in THIS pass only when its MEASURED PP0 price
+(START-LOADING + forward, :func:`price_ms`) ends before that output is due (:func:`down_ms` from the older
+set's launch end); unmeasured, too late, or any other park ending -> the park's rids are HELD for this pass
+(``_s82_hold``) and follow at the next pass top, after the older output -- the pre-S82 order. Instrument:
+``S82 PARK-AGE`` per decision, ``S82 OUTPUT-LATE`` for the older output after a park admit. Metal check:
+20:42 twin (30 tokens) 1754 ms against 3746 ms left -> admitted; 20:16 four younger (2431 on 409472 cached)
+3338 ms against 1754 ms left -> held.
 
 RANK-UNIFORM BY CONSTRUCTION (R11, RAENGE-NIE-UNEINS). Only PP0 waits, only BEFORE its tolds/Admits go
 on the wire; the followers see the same objects on the request chain they always see, one pass of PP0
@@ -62,7 +69,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-from typing import Callable, NamedTuple, Optional, Sequence
+from typing import Callable, List, NamedTuple, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +100,7 @@ def twin_at_plan_on(env=None) -> bool:
 
 def reset() -> None:
     """Tests: forget the counters."""
+    _STATE.clear()
     _STATE.update({"n": 0, "acks": 0, "read": 0, "output": 0, "bound": 0, "error": 0, "waited_ms": 0.0,
                    "twin_at_plan": 0})
 
@@ -188,6 +196,153 @@ def log_park(verdict: Verdict, outcome: str, rid: Optional[str], waited_s: float
             "output receive",
             n, outcome, rid, waited_s * 1000.0, slot, len(verdict.reads), len(verdict.acks),
             _STATE["acks"], _STATE["read"], _STATE["output"], _STATE["bound"], _STATE["waited_ms"],
+        )
+
+
+# ---------------------------------------------------------------------------
+# S82 A3 (review nf-review-s82-1019, user order 'Prio = Alter' 14.10.): an Admit decided in the park may
+# NOT make the OLDER set wait. The new set runs on PP0 (START-LOADING + forward, host-blocking) before PP0
+# receives the older set's output, so it is admitted from the park only when its MEASURED PP0 price ends
+# before the older output is due:
+#
+#     now + load(cached_new) + fwd(n_new, cached_new)  <=  t_launch_old + down(n_old, cached_old)
+#
+# * fwd  -- PP0's own cost line ``ms = a + b*n + c*n*p_k`` (phase_policy.fit_cost_line, the X-COST-LINE fit)
+#           over PP0's ``Prefill rank batch`` records (prefill_clock cost ring, this process);
+# * load -- PP0's measured START-LOADING rate (ms per loaded token, median of this process's records);
+# * down -- the same line fitted over PP0's EXACT downstream samples: launch end -> output received, taken
+#           only from passes whose output was provably NOT posted when PP0 entered the receive (so the
+#           receive end is the arrival, not PP0's lateness).
+# Any of them unmeasured -> no Admit from the park (the older set first). Otherwise -- outcome 'output',
+# 'bound', 'error', or the rule says no -- the park's ack rids are HELD for this pass: the older output is
+# received and processed first, the younger Admit follows at the next pass top, exactly the pre-S82 order.
+
+#: rings of measured samples (per process; only PP0 decides with them)
+RING_MAX = 64
+_LOAD: List[Tuple[int, float]] = []          # (loaded tokens, START-LOADING ms)
+_DOWN: List[Tuple[int, int, float]] = []     # (new tokens, cached tokens, launch end -> output ms)
+#: START-LOADING records below this many tokens carry the fixed cost, not the rate
+LOAD_MIN_TOKENS = 8192
+
+
+def _push(ring: list, item) -> None:
+    ring.append(item)
+    if len(ring) > RING_MAX:
+        del ring[: len(ring) - RING_MAX]
+
+
+def note_start_loading(tokens: int, ms: float) -> None:
+    """``PDFLIP-START-LOADING`` of this rank: one measured load (scheduler-thread ms)."""
+    try:
+        n, v = int(tokens), float(ms)
+    except (TypeError, ValueError):
+        return
+    if n >= LOAD_MIN_TOKENS and v > 0.0:
+        _push(_LOAD, (n, v))
+
+
+def note_downstream(new_tokens: int, cached_tokens: int, ms: float) -> None:
+    """One EXACT downstream sample of PP0 (launch end -> output received, output not posted at entry)."""
+    try:
+        n, p, v = int(new_tokens), int(cached_tokens), float(ms)
+    except (TypeError, ValueError):
+        return
+    if n > 0 and v > 0.0:
+        _push(_DOWN, (n, max(0, p), v))
+
+
+def reset_rings() -> None:
+    """Tests: forget the measured samples."""
+    del _LOAD[:]
+    del _DOWN[:]
+
+
+def _line_ms(line: Optional[dict], n: int, cached: int) -> Optional[float]:
+    if not line:
+        return None
+    return float(line["a_ms"]) + float(line["b_ms"]) * n + float(line["c_ms"]) * n * (cached / 1000.0)
+
+
+def _fit(rows) -> Optional[dict]:
+    from flliper.srt.pdflip.phase_policy import fit_cost_line
+
+    line, _why = fit_cost_line(list(rows), min_tokens=1, min_samples=3)
+    return line
+
+
+def fwd_rows() -> list:
+    """PP0's own forward records (prefill_clock cost ring: one per flushed ``Prefill rank batch``)."""
+    from flliper.srt.pdflip import prefill_clock as _pfc
+
+    return [(int(r["n"]), int(r["cached"]), float(r["ms"])) for r in _pfc.cost_snapshot()["recent"]
+            if int(r.get("chunks", 1) or 1) == 1]
+
+
+def price_ms(n_new: int, cached_new: int, *, fwd: Optional[Sequence] = None,
+             load: Optional[Sequence] = None) -> Optional[float]:
+    """The new set's measured PP0 price (START-LOADING + forward), or None (unmeasured)."""
+    line = _fit(fwd_rows() if fwd is None else fwd)
+    f = _line_ms(line, int(n_new), int(cached_new))
+    rates = sorted(v / n for n, v in (_LOAD if load is None else load) if n > 0)
+    if f is None or not rates:
+        return None
+    rate = rates[len(rates) // 2]
+    return f + rate * max(0, int(cached_new))
+
+
+def down_ms(n_old: int, cached_old: int, *, down: Optional[Sequence] = None) -> Optional[float]:
+    """The older set's measured downstream time (launch end -> output), or None (unmeasured)."""
+    return _line_ms(_fit(_DOWN if down is None else down), int(n_old), int(cached_old))
+
+
+class AgeVerdict(NamedTuple):
+    admit: bool
+    reason: str
+    price_ms: Optional[float]
+    due_in_ms: Optional[float]
+
+
+def age_rule(*, now: float, price: Optional[float], launch_old: Optional[float],
+             down: Optional[float]) -> AgeVerdict:
+    """Prio = Alter: admit the younger set from the park only if its PP0 price ends before the older
+    set's output is due (all times monotonic seconds, prices ms). Unmeasured -> no."""
+    if price is None:
+        return AgeVerdict(False, "price-unmeasured", None, None)
+    if launch_old is None or down is None:
+        return AgeVerdict(False, "due-unmeasured", price, None)
+    due_in = (float(launch_old) + float(down) / 1000.0 - float(now)) * 1000.0
+    if price <= due_in:
+        return AgeVerdict(True, "before-due", price, due_in)
+    return AgeVerdict(False, "older-first", price, due_in)
+
+
+def log_age(v: AgeVerdict, rids: Sequence[str]) -> None:
+    k = "age_admit" if v.admit else "age_hold"
+    _STATE[k] = _STATE.get(k, 0) + 1
+    n = _STATE[k]
+    if n <= _LOG_FIRST or n % _LOG_EVERY == 0:
+        logger.info(
+            "S82 PARK-AGE %s rids=%s reason=%s price_ms=%s due_in_ms=%s (n=%d): Prio = Alter -- the younger set "
+            "is admitted from the park only if its measured PP0 price ends before the older set's output is due",
+            "ADMIT" if v.admit else "HOLD", list(rids), v.reason,
+            None if v.price_ms is None else round(v.price_ms), None if v.due_in_ms is None else round(v.due_in_ms), n,
+        )
+
+
+def log_output_late(slot, late_max_ms: Optional[float], predicted_late_ms: Optional[float]) -> None:
+    """A3 instrument: the older set's output after a park that admitted the younger one -- ``late_max_ms``
+    = receive entry minus park end when the output was already posted at entry (it was posted inside that
+    interval; 0 = not yet posted at entry: no lateness); ``predicted_late_ms`` = receive entry minus the
+    due time the rule used."""
+    _STATE["late_n"] = _STATE.get("late_n", 0) + 1
+    _STATE["late_max_ms_sum"] = _STATE.get("late_max_ms_sum", 0.0) + float(late_max_ms or 0.0)
+    n = _STATE["late_n"]
+    if n <= _LOG_FIRST or n % _LOG_EVERY == 0 or (late_max_ms or 0.0) > 0.0:
+        logger.info(
+            "S82 OUTPUT-LATE n=%d slot=%s output_late_ms<=%s predicted_late_ms=%s late_max_ms_sum=%.0f: how much "
+            "later the OLDER set's output was received than posted, after the park admitted the younger set",
+            n, slot, None if late_max_ms is None else round(late_max_ms),
+            None if predicted_late_ms is None else round(predicted_late_ms), _STATE["late_max_ms_sum"],
         )
 
 

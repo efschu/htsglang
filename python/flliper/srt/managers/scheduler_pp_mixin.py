@@ -4621,6 +4621,8 @@ class SchedulerPPMixin:
                 # S82 COMMIT-PARK: the slot pair this pass plans and then receives the output of
                 # (pdflip_store_told._s82_output_pending reads it at PP0's pass top).
                 self._s82_slot = (mb_id, next_mb_id)
+                self._s82_receive_deadline = None   # A1: set by this pass's park, consumed by its receive
+                self._s82_park_admit = None         # A3: set when this pass's park admits the younger set
                 self._pp_flip_pass_tick(mb_id)
                 # #1466 PASS-STALL: boot weg2xsn221 (P running-req 2) still shows
                 # whole seconds without a forward on ALL P ranks, twice per
@@ -5711,6 +5713,9 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
+                    if self.ps.pp_size > 1 and self.ps.pp_rank == 0:
+                        # S82 A3: the slot's launch end and size (exact downstream samples, Prio = Alter rule)
+                        pdflip_store_told.s82_note_launch(self, mb_id, cur_batch)
                 else:
                     # FIX 1r/2: this visit launches NO forward on this
                     # rank. The gap that is open right now therefore
@@ -5734,6 +5739,10 @@ class SchedulerPPMixin:
                         if _flush is not None:
                             _flush()
                 if self.server_args.pp_async_batch_depth == 0:
+                    _s82_pp0 = self.ps.pp_size > 1 and self.ps.pp_rank == 0
+                    _s82_entry = (
+                        pdflip_store_told.s82_output_pending_at_entry(self) if _s82_pp0 else None
+                    )
                     with _pov.span("output_commit"):
                         next_pp_outputs, next_batch_result, d2h_event = (
                             self._pp_commit_send_output_work_and_preprocess_output_tensors(
@@ -5741,6 +5750,9 @@ class SchedulerPPMixin:
                                 next_mb_id,
                             )
                         )
+                    if _s82_pp0:
+                        # S82 A3: exact downstream sample + OUTPUT-LATE of the older set after a park admit
+                        pdflip_store_told.s82_after_commit(self, next_mb_id, _s82_entry)
                 if self.mbs[next_mb_id] is not None:
                     # #1002d: a declined output leaves this unset by design.
                     if d2h_event is not None:
@@ -11224,6 +11236,12 @@ class SchedulerPPMixin:
             now = time.monotonic()
             if deadline is None:
                 deadline = now + _pp_proxy_readiness_budget_s()
+                if kind == "output":
+                    # S82 A1: the pass's COMMIT-PARK and this receive share ONE readiness budget -- the
+                    # receive takes only what the park left (a wedge is named after 30 s, not 60 s)
+                    _s82_dl = getattr(self, "_s82_receive_deadline", None)
+                    if _s82_dl is not None:
+                        deadline = min(deadline, float(_s82_dl))
             if now < deadline:
                 time.sleep(PROXY_READINESS_POLL_STEP_S)
                 continue

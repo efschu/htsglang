@@ -21,6 +21,7 @@ Pinned (hermetic, CPU; RED on rc18 7737b78948 -- no park, no twin-at-plan):
 import inspect
 import os
 import sys
+import time as _time
 from types import SimpleNamespace
 
 import pytest
@@ -33,6 +34,7 @@ from flliper.srt.managers import pdflip_told_fidelity as tf  # noqa: E402
 from flliper.srt.managers import pdflip_told_raise as traise  # noqa: E402
 from flliper.srt.pdflip import p_twin_defer as tw  # noqa: E402
 from flliper.srt.pdflip import pp0_commit_park as cp  # noqa: E402
+from flliper.srt.pdflip import prefill_clock as pfc  # noqa: E402
 from flliper.test.ci.ci_register import register_cpu_ci  # noqa: E402
 
 register_cpu_ci(est_time=10, suite="stage-a-test-cpu")
@@ -146,7 +148,7 @@ def _batch():
 
 
 def _sched():
-    req = SimpleNamespace(rid=RID, origin_input_ids=list(range(10)), extra_key=None)
+    req = SimpleNamespace(rid=RID, origin_input_ids=list(range(TOLD + 30)), extra_key=None)
     now = told._clock()
     s = SimpleNamespace(
         ps=SimpleNamespace(pp_rank=0, pp_size=3, tp_size=1),
@@ -161,8 +163,33 @@ def _sched():
         server_args=SimpleNamespace(pp_async_batch_depth=0),
         pp_flip_counters=_Ctr(), pp_group=SimpleNamespace(rank_in_group=0, world_size=3),
         _pp_flip_upstream=lambda: 2,
+        # the older set in slot 0: pdflip-28-233 (16117 new on 17984 cached), launched just before the park
+        _s82_launch_rec={0: (_time.monotonic() - 0.1, 16117, 17984)},
     )
     return s
+
+
+# PP0's measured rings, numbers from the rc18/181004 P logs (Prefill rank batch PP0, PDFLIP-START-LOADING PP0,
+# PP0 commit of passes whose output was not posted at entry = launch end -> output)
+FWD = [(16117, 17984, 3134.7), (30, 103872, 691.8), (2431, 409472, 2300.1), (2243, 132096, 2355.1),
+       (13025, 24576, 2877.9), (9620, 25024, 2685.4), (538, 82432, 1617.2), (56, 83072, 1662.5), (186, 0, 1293.5),
+       (16384, 17920, 3126.0), (9013, 28672, 3246.0), (12083, 65536, 3615.0), (10159, 112384, 2752.0),
+       (7949, 26304, 2558.0), (4900, 85760, 2652.0), (11595, 17984, 2801.0)]
+LOAD = [(337024, 807.0), (132096, 165.0), (85888, 109.0), (17984, 217.0)]
+DOWN = [(16117, 17984, 4153.0), (2431, 409472, 3064.0), (9013, 28672, 2667.0), (12083, 65536, 3446.0),
+        (10159, 112384, 3402.0), (7949, 26304, 2411.0), (16334, 17984, 4171.0), (4900, 85760, 2124.0),
+        (11595, 17984, 3222.0), (2915, 318272, 2017.0), (2711, 0, 2052.0), (3163, 0, 2256.0), (315, 96768, 2521.0)]
+
+
+def _seed_rings():
+    pfc._reset_for_tests()
+    cp.reset_rings()
+    for n, c, ms in FWD:
+        pfc.note_batch_cost(n, c, ms, 1)
+    for n, ms in LOAD:
+        cp.note_start_loading(n, ms)
+    for n, c, ms in DOWN:
+        cp.note_downstream(n, c, ms)
 
 
 @pytest.fixture
@@ -174,7 +201,10 @@ def pp0(monkeypatch):
     monkeypatch.setattr(fb, "_frist_verdict", lambda *a, **k: None)          # inside the Frist: keep waiting
     monkeypatch.setattr(traise, "pp0_raise_step", lambda *a, **k: None)
     monkeypatch.setattr(tf, "pp0_verdict", lambda s, req, t, absolute: (t, t))
-    return _sched()
+    _seed_rings()
+    yield _sched()
+    pfc._reset_for_tests()
+    cp.reset_rings()
 
 
 def _acks_after(monkeypatch, sched, k, ctr_post_at=None):
@@ -230,6 +260,7 @@ def test_metal_2042_acks_landing_in_the_receive_admit_in_this_pass(pp0, monkeypa
     assert n["i"] >= 3
     st = cp.stats()
     assert st["n"] == 1 and st["acks"] == 1 and pp0._s82_park_ms >= 0.0
+    assert st.get("age_admit") == 1 and pp0._s82_park_admit is not None   # Prio = Alter: the twin ends in time
 
 
 def test_output_first_is_the_pre_s82_pass(pp0, monkeypatch):
@@ -342,3 +373,158 @@ def test_loop_wiring():
     assert a < b < c                                   # after the final plan, before the forward
     pub = inspect.getsource(told.pp0_publish)
     assert pub.index("_commit_park(scheduler, recv_reqs)") < pub.index("_pp0_publish_paced(scheduler, recv_reqs)")
+
+
+# ---------------------------------------------------------------------------
+# review nf-review-s82-1019: A1 one deadline, A2 a probe that turns unknown, A3 Prio = Alter, H2
+
+def test_a2_a_probe_that_turns_unknown_mid_park_ends_it():
+    """M3 (``is False`` instead of ``is not True``) would park on until the budget."""
+    v = cp.Verdict(True, "park", (), (RID,))
+    clk = _Clock()
+    n = {"i": 0}
+
+    def harvest():
+        n["i"] += 1
+
+    o, rid, waited = cp.wait(v, output_pending=lambda: None if n["i"] >= 3 else True,
+                             read_done=lambda r: False, acks_done=lambda r: False, harvest=harvest,
+                             bound_s=30.0, clock=clk, sleep=clk.sleep)
+    assert (o, n["i"]) == ("output", 3) and waited < 0.01
+
+
+def test_a2_wire_turning_gapped_mid_park_ends_it(pp0, monkeypatch):
+    monkeypatch.setenv("FLLIPER_PP_PROXY_READINESS_BUDGET_S", "5")
+
+    def harvest(s, now=None):
+        s._hv = getattr(s, "_hv", 0) + 1
+        if s._hv >= 3:
+            s._pp_gapped_wire = True        # the probe can no longer tell
+        return 0
+
+    monkeypatch.setattr(fb, "pp0_harvest", harvest)
+    t0 = _time.monotonic()
+    told._commit_park(pp0, [])
+    assert cp.stats()["output"] == 1 and _time.monotonic() - t0 < 1.0
+
+
+def test_a1_park_and_receive_share_one_deadline(pp0, monkeypatch):
+    """A park ending on 'bound' leaves the receive no fresh budget: #789 is named after ONE budget."""
+    from flliper.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+
+    monkeypatch.setenv("FLLIPER_PP_PROXY_READINESS_BUDGET_S", "0.3")
+    _acks_after(monkeypatch, pp0, k=10 ** 9)                 # acks never, output never: a wedge
+    t0 = _time.monotonic()
+    told._commit_park(pp0, [])
+    assert cp.stats()["bound"] == 1 and 0.3 <= _time.monotonic() - t0 < 0.45
+    t1 = _time.monotonic()
+    with pytest.raises(RuntimeError, match="READINESS TIMEOUT"):
+        SchedulerPPMixin._pp_wait_for_dict_readiness(pp0, 0, kind="output")
+    assert _time.monotonic() - t1 < 0.12                     # the rest of the shared budget, not 0.3 s more
+    assert RID in pp0._s82_hold                              # nothing admitted past the older output
+
+
+def test_a1_receive_without_park_keeps_its_own_budget(pp0, monkeypatch):
+    from flliper.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+
+    monkeypatch.setenv("FLLIPER_PP_PROXY_READINESS_BUDGET_S", "0.2")
+    pp0._s82_receive_deadline = None
+    t1 = _time.monotonic()
+    with pytest.raises(RuntimeError, match="READINESS TIMEOUT"):
+        SchedulerPPMixin._pp_wait_for_dict_readiness(pp0, 0, kind="output")
+    assert _time.monotonic() - t1 >= 0.2
+
+
+def test_a3_measured_prices_of_the_two_metal_cases():
+    """20:42: the 30-token twin ends long before 28-233's output; 20:16: the four younger (2431 new on
+    409472 cached) cost more than the time left until 8-74's output -- the older first."""
+    _seed_rings()
+    try:
+        twin = cp.price_ms(30, TOLD)
+        old42 = cp.down_ms(16117, 17984)
+        v42 = cp.age_rule(now=100.0, price=twin, launch_old=100.0 - 0.05, down=old42)
+        assert v42.admit and v42.reason == "before-due"
+        four = cp.price_ms(2431, 409472)
+        old16 = cp.down_ms(2243, 132096)
+        # 8-74 launched (forward end) 20:16:38.36, the reads landed ~38.8: 0.45 s into its downstream
+        v16 = cp.age_rule(now=100.0, price=four, launch_old=100.0 - 0.45, down=old16)
+        assert not v16.admit and v16.reason == "older-first" and four > v16.due_in_ms
+    finally:
+        pfc._reset_for_tests()
+        cp.reset_rings()
+
+
+def test_a3_metal_2016_the_younger_set_waits_for_the_older_output(pp0, monkeypatch):
+    req = pp0.waiting_queue[0]
+    req.origin_input_ids = list(range(409472 + 2431))
+    pp0._pdflip_told_pacing[RID].told = 409472
+    fb._pp0_open_map(pp0)[RID].told = 409472
+    pp0._s82_launch_rec = {0: (_time.monotonic() - 0.45, 2243, 132096)}
+    n = {"i": 0}
+
+    def harvest(s, now=None):
+        n["i"] += 1
+        if n["i"] >= 3:
+            fb._pp0_open_map(s)[RID].acks.update({1: 409472, 2: 409472})
+        return 0
+
+    monkeypatch.setattr(fb, "pp0_harvest", harvest)
+    out = told.pp0_publish(pp0, [])
+    assert _admits(out) == [] and RID in pp0._s82_hold and RID in pp0._pdflip_told_pacing
+    assert cp.stats().get("age_hold") == 1
+    # next pass: the older output was received and processed (slot 0 empty now) -> the Admit follows
+    pp0.mbs[0] = None
+    out2 = told.pp0_publish(pp0, [])
+    assert [a.rid for a in _admits(out2)] == [RID]
+
+
+def test_a3_unmeasured_holds(pp0, monkeypatch):
+    cp.reset_rings()                                          # no START-LOADING / downstream samples yet
+    _acks_after(monkeypatch, pp0, k=3)
+    out = told.pp0_publish(pp0, [])
+    assert _admits(out) == [] and RID in pp0._s82_hold
+
+
+def test_a3_output_first_holds_the_acked_rid(pp0, monkeypatch):
+    _acks_after(monkeypatch, pp0, k=4, ctr_post_at=2)         # output posted before the acks
+    told.pp0_publish(pp0, [])
+    assert RID in pp0._s82_hold
+
+
+def test_a3_after_commit_samples_and_output_late(pp0):
+    cp.reset_rings()
+    pp0._s82_launch_rec = {0: (_time.monotonic() - 2.0, 16117, 17984)}
+    told.s82_after_commit(pp0, 0, (_time.monotonic(), True))   # not posted at entry: exact sample
+    assert len(cp._DOWN) == 1 and 1900.0 <= cp._DOWN[0][2] <= 2500.0
+    pp0._s82_launch_rec = {0: (_time.monotonic() - 2.0, 9000, 1000)}
+    told.s82_after_commit(pp0, 0, (_time.monotonic(), False))  # already posted at entry: no sample
+    assert len(cp._DOWN) == 1
+    cp.reset()
+    pp0._s82_park_admit = (_time.monotonic() - 1.0, 500.0)
+    told.s82_after_commit(pp0, 0, (_time.monotonic(), False))
+    st = cp.stats()
+    assert st["late_n"] == 1 and 900.0 <= st["late_max_ms_sum"] <= 1200.0 and pp0._s82_park_admit is None
+    pp0._s82_park_admit = (_time.monotonic() - 1.0, 500.0)
+    told.s82_after_commit(pp0, 0, (_time.monotonic(), True))   # not yet posted at entry: no lateness
+    assert cp.stats()["late_n"] == 2 and cp.stats()["late_max_ms_sum"] <= 1200.0
+
+
+def test_h2_no_park_while_p_sleeps(pp0, monkeypatch):
+    n = _acks_after(monkeypatch, pp0, k=2)
+    pp0.pdflip_dormant = True
+    told._commit_park(pp0, [])
+    assert cp.stats()["n"] == 0 and n["i"] == 0
+
+
+def test_h2_paced_read_does_not_end_a_park_with_an_ack_waiter(pp0, monkeypatch):
+    """M11: a landed read only publishes a read-ahead (its Admit is a pass later); the waiting Admit ends it."""
+    other = SimpleNamespace(rid="pdflip-28-240", origin_input_ids=list(range(50)), extra_key=None,
+                            prefetch_deferred=None)
+    pp0.waiting_queue.append(other)
+    pp0._pdflip_store_held = {other.rid: other}
+    op = SimpleNamespace(host_indices=[1], hash_value=[1])
+    pp0.tree_cache = SimpleNamespace(ongoing_prefetch={other.rid: SimpleNamespace(operation=op)},
+                                     can_terminate_prefetch=lambda op, tail_hold=0: True)
+    _acks_after(monkeypatch, pp0, k=4)
+    told._commit_park(pp0, [])
+    assert cp.stats()["acks"] == 1 and cp.stats()["read"] == 0
