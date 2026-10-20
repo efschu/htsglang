@@ -1848,6 +1848,178 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 "back first)", released, entries, len(todo), ms)
         return released
 
+    #: S83: queued release entries one local pass walks at most (the rest: the next pass)
+    S83_QUEUE_REF_PASS_MAX = 1024
+
+    def _s83_release_queue_surplus_refs(self, group_min: int = -1, site: str = "drain") -> int:
+        """S83 (rc18 ``..._1019_200330``, D 20:21:22): the ARENA references still queued
+        in this rank's ``host_mem_release_queue`` after the group drain, given back here.
+
+        THE DEFECT. ``drain_storage_control_queues`` releases ``MIN(qsize)`` entries over
+        the TP group (upstream ``check_hicache_events``: the ranks' host allocators are
+        mirrored, so every rank frees the same entries). Form A breaks the presumption of
+        equal producers: TP0 released at once, the workers queued (``ARENA-REF-HOLDERS``
+        TP0 queue=0, TP1/TP2 queue=4160 at 20:21:22), the MIN was 0 and the workers'
+        references waited for the reset (#1424g). 1249 of 6485 KV-arena slots were pinned
+        by those queued references alone (pinned=5180, tree=3931 on every D rank, P
+        own_held=0), the claim clock found no unreferenced slot (``ARENA-DROP freed=0``
+        in all three stages), the flush stopped (``ARENA-FULL-STOP``) and the reset
+        dropped 16 un-backed nodes / 8512 tokens (``FLUSH-UNBACKED``).
+
+        WHY RANK-LOCAL IS RIGHT HERE. An arena row is a reader REFERENCE on a shared,
+        content-addressed slot, not an allocation of a per-rank pool (#989b,
+        ``split_arena_rows``): no rank's allocator has to stay in step with another's.
+        The release was decided when the entry was queued (the producer finished with
+        the rows); TP0 has already given its own back. A worker that follows is the
+        group catching up with TP0's verdict, not a rank-local decision (R11). The rows
+        go back by the drain's own rule (``mem_pool_host.free`` -> ``_free_arena_rows``:
+        pending writes belong to their writer, never beyond this process's ledger).
+        Non-arena rows of an entry stay queued IN PLACE (same order) for the MIN.
+
+        Returns the arena rows given back (references, one per row of P ids)."""
+        try:
+            if not envs.FLLIPER_PDFLIP_RELEASE_QUEUE_LOCAL_REFS.get():
+                return 0
+        except Exception:  # noqa: BLE001 - a hermetic tree without the field: default on
+            pass
+        cc = getattr(self, "cache_controller", None)
+        q = getattr(cc, "host_mem_release_queue", None) if cc is not None else None
+        pool = getattr(cc, "mem_pool_host", None) if cc is not None else None
+        split = getattr(pool, "split_arena_rows", None)
+        if q is None or not callable(split) or not callable(getattr(pool, "free", None)):
+            return 0
+        if q.qsize() == 0:
+            return 0
+        refs_list = []
+        walked = kept = 0
+        with q.mutex:
+            dq = q.queue
+            n = min(len(dq), int(self.S83_QUEUE_REF_PASS_MAX))
+            taken = [dq.popleft() for _ in range(n)]
+            keep = []
+            for e in taken:
+                walked += 1
+                try:
+                    refs, other = split(e)
+                except Exception:  # noqa: BLE001 - an entry the split cannot read stays as it is
+                    refs, other = None, e
+                if refs is None or not int(refs.numel()):
+                    keep.append(e)   # split inactive / no arena row: the entry unchanged
+                    continue
+                refs_list.append(refs)
+                if int(other.numel()):
+                    keep.append(other)   # the non-arena rows keep the entry's place
+            for e in reversed(keep):
+                dq.appendleft(e)
+            kept = len(keep)
+            left = len(dq)
+        rows = 0
+        for r in refs_list:
+            try:
+                pool.free(r)
+                rows += int(r.numel())
+            except Exception as exc:  # noqa: BLE001 - loud; the reset (#1424g) remains the backstop
+                logger.warning("S83 QUEUE-REFS release raised: %r", exc)
+        if rows:
+            k = getattr(UnifiedRadixCache, "_s83_queue_refs_n", 0) + 1
+            UnifiedRadixCache._s83_queue_refs_n = k
+            UnifiedRadixCache._s83_queue_refs_rows = getattr(UnifiedRadixCache, "_s83_queue_refs_rows", 0) + rows
+            if k <= 16 or k % 256 == 0 or site != "drain":
+                P = max(1, int(getattr(self, "page_size", 1) or 1))
+                logger.info(
+                    "S83 QUEUE-REFS site=%s n=%d entries_walked=%d ref_rows=%d pages=%d kept_entries=%d queue_left=%d "
+                    "group_min=%s total_rows=%d (arena references still queued on this rank after the group drain, "
+                    "given back rank-locally: TP0 released its own at once, the MIN left the rest to the reset)",
+                    site, k, walked, rows, rows // P, kept, left, group_min,
+                    UnifiedRadixCache._s83_queue_refs_rows)
+        return rows
+
+    #: S83: seconds between two VICTIM-CENSUS lines of the same site (the flush sites always speak)
+    S83_VICTIM_CENSUS_EVERY_S = 5.0
+
+    def s83_victim_census(self, site: str, pool=None) -> Optional[str]:
+        """S83 instrument: WHO holds the KV arena when a claim finds no victim.
+
+        One line, never a decision: the arena header (slots / free / complete / claimed
+        / pinned / references), this process's ledger (own references, own slots, slots
+        only OTHER processes hold), the tree's slots split into device-resident and
+        host-only nodes, the slots only this rank's release queue still references, and
+        the reasons the last W3 device round passed its candidates over (nodes:pages).
+        ``site``: spill (a W3 round released 0), flush_stop (#1470 ARENA-FULL-STOP),
+        flush_end (a #1470 loop left un-backed nodes). Rate-limited per site except the
+        flush sites."""
+        now = time.monotonic()
+        last = self.__dict__.setdefault("_s83_census_last", {})
+        if not site.startswith("flush") and now - last.get(site, -1e9) < self.S83_VICTIM_CENSUS_EVERY_S:
+            return None
+        last[site] = now
+        try:
+            if pool is None:
+                pool = self._pdflip_direct_pool()
+            arena = getattr(pool, "arena", None)
+            if arena is None:
+                return None
+            from flliper.srt.mem_cache.pool_host.arena_pool import arena_ref_pages, arena_ref_slots
+
+            slots = int(arena.slots)
+            pinned, refs, complete = arena.ref_census()
+            try:
+                oc = arena.oldest_claim()
+                claimed, other_state = int(oc.get("claimed", 0)), int(oc.get("other_state", 0))
+            except Exception:  # noqa: BLE001
+                claimed = other_state = -1
+            free = slots - int(complete) - max(0, claimed) - max(0, other_state)
+            led = getattr(arena, "_ledger", None)
+            own_refs = own_slots = other_only = -1
+            if led is not None:
+                with led.lock:
+                    held = led.held.clone()
+                own_refs = int(held.sum())
+                own_slots = int((held > 0).sum())
+                try:
+                    srefs = arena.slot_refs(list(range(slots)))
+                    other_only = sum(1 for s, r in enumerate(srefs)
+                                     if int(r) > 0 and (s >= int(held.numel()) or int(held[s]) == 0))
+                except Exception:  # noqa: BLE001
+                    other_only = -1
+            tree_dev, tree_host = set(), set()
+            root = getattr(self, "root_node", None)
+            stack = list(root.children.values()) if root is not None else []
+            while stack:
+                node = stack.pop()
+                stack.extend(list(node.children.values()))
+                cd = node.component_data[BASE_COMPONENT_TYPE]
+                if cd.host_value is None:
+                    continue
+                named = set(arena_ref_slots(pool, cd.host_value).tolist())
+                (tree_dev if cd.value is not None else tree_host).update(named)
+            tree = tree_dev | tree_host
+            cc = getattr(self, "cache_controller", None)
+            q = getattr(cc, "host_mem_release_queue", None) if cc is not None else None
+            q_refs = 0
+            q_slots = set()
+            for t in list(getattr(q, "queue", ()) if q is not None else ()):
+                q_refs += int(arena_ref_pages(pool, t))
+                q_slots.update(arena_ref_slots(pool, t).tolist())
+            why = getattr(self, "_s83_spill_why", None) or {}
+            why_s = ",".join("%s:%d/%d" % (k, v[0], v[1]) for k, v in sorted(why.items())) or "-"
+            line = (
+                "S83 VICTIM-CENSUS site=%s slots=%d free=%d complete=%d claimed=%d pinned=%d "
+                "unpinned_complete=%d refs=%d own_refs=%d own_slots=%d other_only=%d tree_slots=%d "
+                "tree_device=%d tree_host_only=%d queue_refs=%d queue_only_slots=%d spill_need=%s "
+                "spill_released=%s spill_why=%s"
+                % (site, slots, free, int(complete), claimed, int(pinned), max(0, int(complete) - int(pinned)),
+                   int(refs), own_refs, own_slots, other_only, len(tree), len(tree_dev), len(tree_host - tree_dev),
+                   q_refs, len(q_slots - tree), getattr(self, "_s83_spill_need", "-"),
+                   getattr(self, "_s83_spill_released", "-"), why_s))
+        except Exception as exc:  # noqa: BLE001 - an instrument never breaks a claim or a flush
+            line = "S83 VICTIM-CENSUS site=%s failed=%r" % (site, exc)
+        logger.info("%s (who holds the KV arena when a claim finds no victim: unpinned_complete = the clock's "
+                    "candidates; other_only = slots only other processes reference; queue_only_slots = slots "
+                    "only this rank's release queue references; spill_why = reason:nodes/pages the last W3 "
+                    "device round passed over)", line)
+        return line
+
     def _pdflip_release_orphan_refs(self, where: str) -> int:
         """#1424g (rc12q D-TP0 15:56:23 / 16:00:05: ``ARENA-REF-HOLDERS
         at=reset tree=0 sum=0 own_held=1016 gap=1016``, 18.6 % of the KV arena
@@ -6681,15 +6853,38 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         kept_payable = 0
         told_head = UnifiedRadixCache._told_head_ids(self)
         kept_told = 0
+        # S83 instrument: every reason the device round passes a host-holding node over, as
+        # reason -> [nodes, pages] (VICTIM-CENSUS spill_why); counting only, no decision changes
+        _why = {}
+
+        def _pass(reason, hv_):
+            w = _why.setdefault(reason, [0, 0])
+            w[0] += 1
+            try:
+                w[1] += -(-int(hv_.numel()) // P)
+            except Exception:  # noqa: BLE001 - an instrument never breaks the spill
+                pass
+
         for node in self._collect_all_nodes():
-            if node is self.root_node or id(node) in skip:
+            if node is self.root_node:
                 continue
-            if id(node) in told_head:
-                kept_told += 1    # A7 TOLD-HEAD: the head above an open told's pinned span keeps its host copy
+            if id(node) in skip or id(node) in told_head:
+                _told = id(node) not in skip
+                if _told:
+                    kept_told += 1    # A7 TOLD-HEAD: the head above an open told's pinned span keeps its host copy
+                try:   # S83 instrument only: these nodes were never read before their skip
+                    _hv0 = node.component_data[BASE_COMPONENT_TYPE].host_value
+                except Exception:  # noqa: BLE001
+                    _hv0 = None
+                if _hv0 is not None:
+                    _pass("told_head" if _told else "claimer_chain", _hv0)
                 continue
             cd = node.component_data[BASE_COMPONENT_TYPE]
             hv = cd.host_value
-            if hv is None or cd.value is None or hv.numel() == 0:
+            if hv is None or hv.numel() == 0:
+                continue
+            if cd.value is None:
+                _pass("host_only", hv)   # W3-HOST-LEAF's round, not this one
                 continue   # host-only nodes stay: their host copy is their only copy on P
             if keep_payable is not None and not all(
                     keep_payable.get(id(c), (0, False, False))[2] for c in node.children.values()):
@@ -6697,33 +6892,44 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 # leaves the device only by the drop, and the drop needs every child below removable from
                 # the host -- one is not (host-locked / device-locked): the spill would pin 206848 tokens
                 kept_payable += 1
+                _pass("keep_payable", hv)
                 continue
             if node.id in self.ongoing_write_through:
+                _pass("write_pending", hv)
                 continue   # pending write: the slots are not COMPLETE yet
             if any(int(getattr(c, "host_lock_ref", 0) or 0) > 0 for c in node.component_data):
+                _pass("host_locked", hv)
                 continue   # a load-back reads these rows
             if any(
                 node.component_data[c.component_type].host_value is not None
                 and node.component_data[c.component_type].value is None
                 for c in _aux_components(self)
             ):
+                _pass("aux_host_only", hv)
                 continue   # y5h/park_l3: an aux state lives on the host only -- the node keeps its host life
             if int(hv.min()) < int(getattr(pool, "staging_rows", 0)):
+                _pass("staging", hv)
                 continue   # staging rows are not arena slots
             if _role == "host":
                 _nk = _r12.node_key(node)
                 if _nk is None:
                     kept_unkeyed += 1   # no R12 verdict can name it: TP0 alone would change
+                    _pass("unkeyed", hv)
                     continue
                 if _nk in wev:
                     kept_wev += 1       # a worker has it off the device: TP0's host drop is not applicable there
+                    _pass("worker_evicted", hv)
                     continue
             cands.append(node)
+        self._s83_spill_why = _why
         keys = self._w3_spill_keys(pool, cands)
         # L3-COMPLETE review A1: a node with a slot not COMPLETE is treated like a pending write -- not a
         # candidate (before the order and the FORMA cap: the cap counts only nodes secure_rows_to_l3 can take)
         incomplete = sum(1 for c in cands if keys.incomplete(c))
         if incomplete:
+            for c in cands:
+                if keys.incomplete(c):
+                    _pass("incomplete", c.component_data[BASE_COMPONENT_TYPE].host_value)
             cands = [c for c in cands if not keys.incomplete(c)]
         cands.sort(key=lambda x: keys[id(x)])
         released = secured = written = lost = unpaired = 0
@@ -6822,6 +7028,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self._w3_spill_n = k
         if released == 0:
             self._w3_spill_quiet_until = now + self.W3_SPILL_EMPTY_BACKOFF_S
+            # S83 instrument: a round that found no victim says who holds the arena (rate-limited;
+            # the k <= 8 cap below hid every empty round of rc18 after 20:22:10)
+            self._s83_spill_need, self._s83_spill_released = int(need_pages), released
+            try:
+                UnifiedRadixCache.s83_victim_census(
+                    self, "flush_spill" if getattr(self, "_pdflip_flush_spill", False) else "spill", pool=pool)
+            except Exception:  # noqa: BLE001 - an instrument never breaks the spill
+                pass
         if k <= 8 or k % 64 == 0 or lost or unpaired:
             logger.info(
                 "W3-ARENA SPILL n=%d need=%d released_pages=%d nodes=%d candidates=%d "
@@ -12068,6 +12282,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             log_metrics=True,
             **({} if _budget is None else {"budget": _budget}),
         )
+        # S83: the arena references the MIN left queued on THIS rank go back now (no collective;
+        # see _s83_release_queue_surplus_refs). After the agreement, so its count is unchanged.
+        try:
+            self._s83_release_queue_surplus_refs(group_min=n_release)
+        except Exception:  # noqa: BLE001 - loud, never the drain; the reset (#1424g) stays the backstop
+            logger.warning("S83 QUEUE-REFS pass raised", exc_info=True)
         return any(v > 0 for v in qsize_list)
 
     def _drain_agreement_is_collective(self) -> bool:
