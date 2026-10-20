@@ -97,7 +97,7 @@ def test_a_group_whose_anchor_cannot_secure_vetoes_everything(rc19):
     res, grp = _both(g, (_hybrid(g.p0), blind))
     assert not any(isinstance(r, BaseException) for r in res), res
     assert B._refs(g) == [2] * SLOTS
-    assert grp.calls[0] == grp.calls[1] and len(grp.calls[0]) == 3
+    assert grp.calls[0] == grp.calls[1] and len(grp.calls[0]) == 4   # slots, veto, veto_fix (S86c), digest
 
 
 def test_an_unpaired_page_stays_through_the_group_too(rc19, monkeypatch):
