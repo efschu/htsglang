@@ -1522,8 +1522,6 @@ def pp0_publish(scheduler, recv_reqs: List) -> List:
         if _twin.is_deferred(scheduler, rid):
             # TW: no store read registered yet -- nothing to publish.
             continue
-        if rid in (getattr(scheduler, "_s82_hold", None) or ()):
-            continue  # S82 A3: held by this pass's park -- the older set's output first (Prio = Alter)
         if getattr(req, "prefetch_deferred", None) is not None:
             # A12.2 deferral: PP0 will re-issue; the verdict is not final.
             continue
@@ -1694,10 +1692,6 @@ def _commit_park(scheduler, recv_reqs: List) -> None:
     decide, park if it says so. Never raises into the pass."""
     from flliper.srt.pdflip import pp0_commit_park as _cp
 
-    try:
-        scheduler._s82_hold = frozenset()   # A3: this pass's held Admits (none unless the park says so)
-    except Exception:  # noqa: BLE001 - a frozen double holds nothing
-        pass
     if not _cp.on():
         return
     try:
@@ -1756,6 +1750,10 @@ def _commit_park(scheduler, recv_reqs: List) -> None:
             ack_waits=ack_waits,
         )
         if not verdict.park:
+            # S103: a blocking receive with a held/paced rid waiting and no park leaves a trace (its reason)
+            waiting = [r for r in queued if r in held or r in pacing]
+            if waiting:
+                _cp.log_no_park(verdict, waiting, getattr(scheduler, "_s82_slot", None))
             return
         harvest = (lambda: _fb.pp0_harvest(scheduler)) if (fb_on and _fb.pp0_has_stream(scheduler)) else (lambda: None)
         from flliper.srt.managers.scheduler_pp_mixin import _pp_proxy_readiness_budget_s
@@ -1774,21 +1772,20 @@ def _commit_park(scheduler, recv_reqs: List) -> None:
         )
         scheduler._s82_park_ms = float(getattr(scheduler, "_s82_park_ms", 0.0) or 0.0) + waited * 1000.0
         _cp.log_park(verdict, outcome, rid, waited, getattr(scheduler, "_s82_slot", None))
-        # A3 (Prio = Alter): which rids would this pass admit because of the park?
+        # S103: what became admissible in the park is admitted IN THIS pass (the publish below decides it as
+        # always) -- no A3 hold: leg 1 is not user-visible and the P->D flip waits for P-DRAIN, so holding the
+        # younger set only lengthened the P phase (rc24: 5 holds, PP0 idle 1.7-4.7 s each, 0 admits). The A3
+        # price/due ride along as an instrument; OUTPUT-LATE measures the older output after the commit.
         if outcome == "acks":
             ready = [r for r in verdict.acks if _admit_state(r) != "wait"]
         elif outcome == "read" and not paced_on:
             ready = [r for r in verdict.reads if _read_terminable(tree, r)]
         else:
             ready = []   # paced read: a read-ahead only; output/bound/error: nothing became ready by the park
-        hold = set(verdict.acks) | (set() if paced_on else set(verdict.reads))
         if ready:
             v = _s82_age_verdict(scheduler, ready, tree, pacing)
-            _cp.log_age(v, ready)
-            if v.admit:
-                hold -= set(ready)
-                scheduler._s82_park_admit = (time.monotonic(), v.due_in_ms)
-        scheduler._s82_hold = frozenset(hold)
+            _cp.log_admit(v, ready)
+            scheduler._s82_park_admit = (time.monotonic(), v.due_in_ms)
     except Exception as exc:  # noqa: BLE001 -- the park is an optimisation, the pass must run
         logger.warning("S82 COMMIT-PARK skipped (%s: %s)", type(exc).__name__, exc)
 
@@ -2221,7 +2218,6 @@ def _pp0_publish_paced(scheduler, recv_reqs: List) -> List:
     # register their store read now (the paced read clock starts here).
     for _treq, _is_twin in _twin.release_due(scheduler, queued | _parked(scheduler)):  # TW-WAKE
         _twin_register(scheduler, _treq, _is_twin)
-    _s82_hold = getattr(scheduler, "_s82_hold", None) or ()
     # (a) Admits first: an entry created in THIS pass is never admitted in it,
     # so the read-ahead always precedes its Admit by at least one pass.
     for rid in list(pacing):
@@ -2242,8 +2238,6 @@ def _pp0_publish_paced(scheduler, recv_reqs: List) -> List:
                 _fb.pp0_forget(scheduler, rid)
             logger.info("#1416e PACED-DROP rid=%s told=%d: left the queue inside the window", _rt(rid), p.told)
             continue
-        if rid in _s82_hold:
-            continue  # S82 A3: held by this pass's park -- the older set's output first (Prio = Alter)
         if fb_on:
             # PF: PP0 alone decides -- told once every follower's read
             # reproduced it, told=0 for every rank on a short read or at the

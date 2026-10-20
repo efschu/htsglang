@@ -39,14 +39,29 @@ or the probe can no longer tell (or the readiness budget runs out). No new clock
 output receive share ONE deadline (review A1: ``_s82_receive_deadline``, the receive's readiness gate takes
 only the rest), so a wedge is named after one budget as before.
 
-PRIO = ALTER (review A3, user order 14.10.). An Admit decided in the park would run the younger set on PP0
-before PP0 receives the OLDER set's output. It is admitted in THIS pass only when its MEASURED PP0 price
-(START-LOADING + forward, :func:`price_ms`) ends before that output is due (:func:`down_ms` from the older
-set's launch end); unmeasured, too late, or any other park ending -> the park's rids are HELD for this pass
-(``_s82_hold``) and follow at the next pass top, after the older output -- the pre-S82 order. Instrument:
-``S82 PARK-AGE`` per decision, ``S82 OUTPUT-LATE`` for the older output after a park admit. Metal check:
-20:42 twin (30 tokens) 1754 ms against 3746 ms left -> admitted; 20:16 four younger (2431 on 409472 cached)
-3338 ms against 1754 ms left -> held.
+PRIO = ALTER AND THE OLDER OUTPUT (review A3 19.10., replaced by S103 20.10.). An Admit decided in the park
+runs the younger set on PP0 before PP0 receives the OLDER set's output, so that output is processed up to
+``price - due`` later. Review A3 held the younger set unless its measured PP0 price ended before the older
+output was due ("the price hits the older request"). On the Weg-2 P group that premise does not hold, and
+S103 admits whatever became admissible in the park IN THIS pass:
+
+* leg 1 (P) output is never user-visible: P runs no decode (0 ``Decode batch`` lines on PP0 in rc22/rc24),
+  every P-served request's first content comes from D after the flip (front ``LEG2-FIRST-CONTENT ...
+  via=after_p`` for every P-served rid that got a first content: rc24 45 of 48, rc22 _094747 52 of 60,
+  the rest none at all -- aborted or still open at the boot's end);
+* the P->D flip begins only when P has drained (front ``PDFLIP P-DRAIN ... queue_at_exit=0`` then
+  ``WEG2 DECISION kind=phase_end action=FLIP_D``), i.e. after the younger set too. Holding the younger set
+  therefore moves the phase end -- and with it the older request's own leg 2 -- LATER by ``due + process``;
+  admitting it moves both EARLIER. Nobody younger is served before anybody older (the older set is already
+  admitted and forwarded on PP0); only PP0's private bookkeeping of the older output moves.
+* MEASURED cost of the A3 hold (rc24 781238542c, P log ..._1020_113244, PP0 ``#PGAP gpu_gap_ms``): 5 holds
+  with a queue left the 5090 idle 1650/3005/3081/4126/4686 ms (11:40:09, 11:47:59, 11:53:15, 12:03:30,
+  12:13:27); 9 of its 14 logged verdicts were ``price-unmeasured`` (the X-line fit gate of 8 forwards
+  >= 1024 tokens is rarely met by P's ~60 forwards per boot), 4 ``older-first`` (PP0's fixed forward
+  cost ~1.4 s against ~0.4-1.0 s downstream of a small set) -- 0 admits.
+
+The A3 price/due are still computed and printed with every park admit (``S82 PARK-ADMIT ... a3=``) and
+``S82 OUTPUT-LATE`` still measures how late the older output was received: instruments, not gates.
 
 RANK-UNIFORM BY CONSTRUCTION (R11, RAENGE-NIE-UNEINS). Only PP0 waits, only BEFORE its tolds/Admits go
 on the wire; the followers see the same objects on the request chain they always see, one pass of PP0
@@ -204,24 +219,39 @@ def log_park(verdict: Verdict, outcome: str, rid: Optional[str], waited_s: float
     n = _STATE["n"]
     _STATE[outcome] = _STATE.get(outcome, 0) + 1
     _STATE["waited_ms"] += waited_s * 1000.0
-    if n <= _LOG_FIRST or n % _LOG_EVERY == 0 or outcome in ("bound", "error"):
-        logger.info(
-            "S82 COMMIT-PARK n=%d outcome=%s rid=%s waited_ms=%.1f slot=%s reads=%d acks=%d "
-            "(acks=%d read=%d output=%d bound=%d waited_ms_sum=%.0f): PP0 waited at its pass top for the "
-            "first of {ack set complete, read terminable, owed output posted} instead of inside the "
-            "output receive",
-            n, outcome, rid, waited_s * 1000.0, slot, len(verdict.reads), len(verdict.acks),
-            _STATE["acks"], _STATE["read"], _STATE["output"], _STATE["bound"], _STATE["waited_ms"],
-        )
+    # S103: EVERY park is printed -- at most one per PP0 pass; the old first-16 cap hid all of rc24's parks
+    # after 12:09:18, so its 12:10 pauses could not be attributed from the log
+    logger.info(
+        "S82 COMMIT-PARK n=%d outcome=%s rid=%s waited_ms=%.1f slot=%s reads=%d acks=%d "
+        "(acks=%d read=%d output=%d bound=%d waited_ms_sum=%.0f): PP0 waited at its pass top for the "
+        "first of {ack set complete, read terminable, owed output posted} instead of inside the "
+        "output receive",
+        n, outcome, rid, waited_s * 1000.0, slot, len(verdict.reads), len(verdict.acks),
+        _STATE["acks"], _STATE["read"], _STATE["output"], _STATE["bound"], _STATE["waited_ms"],
+    )
+
+
+def log_no_park(verdict: Verdict, waiting: Sequence[str], slot) -> None:
+    """S103: a PP0 pass whose output receive WILL block while a held/paced rid waits in the queue, and the
+    park did not run -- the reason is the class (arrivals / carried-chunk / joins-anyway / no-waiter /
+    control). Before S103 such a pass left no trace: rc24's gaps before PP0 forwards 34 and 40 (PP0 idle
+    4.6 s / 4.1 s behind ``PF TOLD-FRIST HELD``, 11:59:23 / 12:09:04) could not be told apart from a park."""
+    _STATE["no_park"] = _STATE.get("no_park", 0) + 1
+    k = "no_park_" + verdict.reason
+    _STATE[k] = _STATE.get(k, 0) + 1
+    logger.info(
+        "S82 NO-PARK reason=%s waiting=%s slot=%s (n=%d, this reason %d): PP0's output receive will block "
+        "while these rids wait, and the pass does not park for them",
+        verdict.reason, list(waiting)[:8], slot, _STATE["no_park"], _STATE[k],
+    )
 
 
 # ---------------------------------------------------------------------------
-# S82 A3 (review nf-review-s82-1019, user order 'Prio = Alter' 14.10.): an Admit decided in the park may
-# NOT make the OLDER set wait. The new set runs on PP0 (START-LOADING + forward, host-blocking) before PP0
-# receives the older set's output, so it is admitted from the park only when its MEASURED PP0 price ends
-# before the older output is due:
+# S82 A3 PRICE/DUE -- since S103 an INSTRUMENT, no longer a gate (module docstring: leg 1 is not
+# user-visible, the P->D flip waits for P-DRAIN). Printed with every park admit, so the metal shows how late
+# the older output would have been predicted against what S82 OUTPUT-LATE measures:
 #
-#     now + load(cached_new) + fwd(n_new, cached_new)  <=  t_launch_old + down(n_old, cached_old)
+#     now + load(cached_new) + fwd(n_new, cached_new)   vs   t_launch_old + down(n_old, cached_old)
 #
 # * fwd  -- PP0's own cost line ``ms = a + b*n + c*n*p_k`` (phase_policy.fit_cost_line, the X-COST-LINE fit)
 #           over PP0's ``Prefill rank batch`` records (prefill_clock cost ring, this process);
@@ -229,9 +259,6 @@ def log_park(verdict: Verdict, outcome: str, rid: Optional[str], waited_s: float
 # * down -- the same line fitted over PP0's EXACT downstream samples: launch end -> output received, taken
 #           only from passes whose output was provably NOT posted when PP0 entered the receive (so the
 #           receive end is the arrival, not PP0's lateness).
-# Any of them unmeasured -> no Admit from the park (the older set first). Otherwise -- outcome 'output',
-# 'bound', 'error', or the rule says no -- the park's ack rids are HELD for this pass: the older output is
-# received and processed first, the younger Admit follows at the next pass top, exactly the pre-S82 order.
 
 #: rings of measured samples (per process; only PP0 decides with them)
 RING_MAX = 64
@@ -332,17 +359,20 @@ def age_rule(*, now: float, price: Optional[float], launch_old: Optional[float],
     return AgeVerdict(False, "older-first", price, due_in)
 
 
-def log_age(v: AgeVerdict, rids: Sequence[str]) -> None:
-    k = "age_admit" if v.admit else "age_hold"
-    _STATE[k] = _STATE.get(k, 0) + 1
-    n = _STATE[k]
-    if n <= _LOG_FIRST or n % _LOG_EVERY == 0:
-        logger.info(
-            "S82 PARK-AGE %s rids=%s reason=%s price_ms=%s due_in_ms=%s (n=%d): Prio = Alter -- the younger set "
-            "is admitted from the park only if its measured PP0 price ends before the older set's output is due",
-            "ADMIT" if v.admit else "HOLD", list(rids), v.reason,
-            None if v.price_ms is None else round(v.price_ms), None if v.due_in_ms is None else round(v.due_in_ms), n,
-        )
+def log_admit(v: AgeVerdict, rids: Sequence[str]) -> None:
+    """S103: the set that became admissible in the park runs in THIS pass; the A3 verdict rides along as an
+    instrument (``a3=admit|hold:<reason>``) -- how the old gate would have decided."""
+    _STATE["park_admit"] = _STATE.get("park_admit", 0) + 1
+    if not v.admit:
+        _STATE["a3_would_hold"] = _STATE.get("a3_would_hold", 0) + 1
+    logger.info(
+        "S82 PARK-ADMIT rids=%s a3=%s price_ms=%s due_in_ms=%s (n=%d, a3 would hold %d): admitted in THIS pass "
+        "-- leg 1 is not user-visible and the P->D flip waits for P-DRAIN, so the older output processed later "
+        "costs nobody time, a held younger set lengthens the P phase for everyone (S103)",
+        list(rids), ("admit" if v.admit else "hold:" + v.reason),
+        None if v.price_ms is None else round(v.price_ms), None if v.due_in_ms is None else round(v.due_in_ms),
+        _STATE["park_admit"], _STATE.get("a3_would_hold", 0),
+    )
 
 
 def log_output_late(slot, late_max_ms: Optional[float], predicted_late_ms: Optional[float]) -> None:
