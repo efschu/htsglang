@@ -307,7 +307,9 @@ def test_an_unpriced_media_request_is_not_context_refused_as_exact(caplog):
     f = _front(True)
     f._context_len = lambda: 1000
     xx = f._x_unpriced("r", None, 5000, -1, True)            # media, no D tokenization: n is a size figure only
-    assert xx.unpriced and xx.pending == 0 and xx.n_src == "size_only" and xx.src == "d_probe_unpriced"
+    # EZ-S1: the size of an unpriced media request is named n_est (an estimate, display only); with
+    # FLLIPER_PDFLIP_EXACT_CLASS off it keeps the rc17 name "size_only"
+    assert xx.unpriced and xx.pending == 0 and xx.n_src == "n_est" and xx.src == "d_probe_unpriced"
     with caplog.at_level(logging.WARNING, logger="pdflip.front"):
         f._context_gate("r", "x" * 30, xx, 5000)
     assert not any("by=exact" in r.getMessage() for r in caplog.records)

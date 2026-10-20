@@ -299,11 +299,24 @@ def test_f4_a_reading_from_before_this_d_phase_never_decides():
 
 
 def test_f4_inside_one_phase_the_budget_still_decides_on_the_last_reading():
+    # EZ-S1 (plan A10): the form below is the rc17 one (switch FLLIPER_PDFLIP_EXACT_CLASS off); with it on a reading
+    # older than FLLIPER_PDFLIP_KV_FRESH_MS is ABSENT -- see the next test
+    from flliper.srt.environ import envs
+
+    with envs.FLLIPER_PDFLIP_EXACT_CLASS.override(False):
+        now = time.time()
+        f, calls = _f4_front(cached_t=now - 3.0, awake_t=now - 16.0)
+        got = asyncio.run(Front._arrival_seat_kv_reading(f))
+        assert got["available"] == 393479          # a pass boundary late, same phase: the budget's trade, unchanged
+        assert f.counters["arrival_seat_kv_prev_phase"] == 0
+
+
+def test_f4_ez_s1_inside_one_phase_a_reading_older_than_the_bound_is_absent():
     now = time.time()
     f, calls = _f4_front(cached_t=now - 3.0, awake_t=now - 16.0)
     got = asyncio.run(Front._arrival_seat_kv_reading(f))
-    assert got["available"] == 393479          # a pass boundary late, same phase: the budget's trade, unchanged
-    assert f.counters["arrival_seat_kv_prev_phase"] == 0
+    assert got is None                         # older than FLLIPER_PDFLIP_KV_FRESH_MS: not a number (plan A10)
+    assert f.counters["arrival_seat_kv_prev_phase"] == 0 and f.counters["arrival_seat_kv_absent"] == 1
 
 
 # ------------------------------------------------------------------------------------------------------------ F5

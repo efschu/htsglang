@@ -3119,9 +3119,13 @@ def _front_source():
 
 def test_S11_front_logs_the_set_verdict_line_in_the_soll_format():
     """The front's format string carries every §4 key, in order, after 'PDFLIP SET-VERDICT'."""
-    src = _front_source()
-    at = src.find("PDFLIP SET-VERDICT")
-    assert at >= 0, "front.py never logs 'PDFLIP SET-VERDICT' (S1 not in this tree)"
+    # EZ-S1: the format string lives in ONE place, ``decision_record.set_verdict_line`` (byte-identical to the H91 line,
+    # golden test_decision_record_1019); ``Front._set_log`` writes the line only through it
+    from flliper.srt.pdflip import decision_record as DR
+    assert "_dr.set_verdict_line(" in _front_source(), "front.py no longer logs SET-VERDICT through the derived formatter"
+    src = open(DR.__file__).read()
+    at = src.find("PDFLIP SET-VERDICT epoch=")
+    assert at >= 0, "decision_record.py never writes 'PDFLIP SET-VERDICT' (S1 not in this tree)"
     window = src[at:at + 3000]
     pos = 0
     for key in SET_KEYS:

@@ -229,7 +229,11 @@ def test_front_names_a_failed_probe_asks_again_and_never_keeps_its_own_count(cap
     with caplog.at_level(logging.INFO, logger="pdflip.front"):
         xx = asyncio.run(f._x_exact_price("r", "/v1/messages", _payload(100), "t", 1000, 3000))
     assert len(calls) >= 3, "asked again inside the deadline"
-    assert xx.unpriced is True and xx.pending == 0 and xx.src == "d_probe_unpriced" and xx.known is False
+    # EZ-S1 (plan A1): u_p = 2000 < halbX = 2048 is the ONE number an upper bound may classify: kurz, the safe direction
+    # (pending = u_p). With FLLIPER_PDFLIP_EXACT_CLASS off it is the rc17 form (pending 0, D's admission measures);
+    # u_p >= halbX is MEASURE_ON_D under both forms (test_decision_numbers_1019 / test_measure_on_d_1019).
+    assert xx.unpriced is True and xx.pending == 2000 and xx.src == "d_probe_unpriced" and xx.known is False
+    assert xx.class_basis.kind == "p_upper" and xx.measure is False
     assert xx.uncached_p == 2000, "P's exact number: the text prompt's ids are D's ids, n - store"
     assert f.counters["d_probe_failed"] == len(calls) and f.counters["d_probe_unpriced"] == 1
     msgs = [r.getMessage() for r in caplog.records]
