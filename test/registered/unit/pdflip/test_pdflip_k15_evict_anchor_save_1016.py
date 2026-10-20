@@ -40,6 +40,9 @@ PROMPT, ANCHOR_TOMBSTONED, ANCHOR_LEFT = 75323, 73984, 65536
 @pytest.fixture(autouse=True)
 def _env(monkeypatch):
     monkeypatch.delenv("FLLIPER_PDFLIP_EVICT_ANCHOR_SAVE", raising=False)
+    # S90b review A1: the K15 ANCHOR-SAVED line is rate limited by a CLASS counter (n <= 32); saves of other test files
+    # in the same process (S90b's 17 live tombstones, S25) must not push this file's log assertions past the limit
+    monkeypatch.setattr(UnifiedRadixCache, "_k15_saved_n", 0)
 
 
 def _node(nid, depth, backuped=False):

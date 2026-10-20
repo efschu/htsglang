@@ -55,6 +55,10 @@ def _env(monkeypatch):
     for k in ("FLLIPER_PDFLIP_EVICT_ANCHOR_SAVE", "FLLIPER_PDFLIP_ANCHOR_ONLY_BACKUP",
               "FLLIPER_PDFLIP_EVICT_ANCHOR_DEVICE_KV", "FLLIPER_PDFLIP_FOLLOWER_STATE_AT_TOLD"):
         monkeypatch.delenv(k, raising=False)
+    # S90b review A1: the class-level log-rate counters advance per save; restored after every test so this file does
+    # not push a later file's K15 / S90b log assertions past their n <= 32 limit (k15 test_save_backs_up_and_joins)
+    for attr in ("_k15_saved_n", "_s90b_saved_n", "_s90b_follower_n"):
+        monkeypatch.setattr(urc.UnifiedRadixCache, attr, 0, raising=False)
 
 
 # ---------------------------------------------------------------------------
@@ -476,6 +480,72 @@ def test_no_device_slot_attaches_nothing(monkeypatch):
     t, n1, _, hp, _ = _ftree(monkeypatch, be, slots_free=())
     assert t.pdflip_follower_state_at_told(_freq(), D_TOLD) == 0
     assert hp.freed == [5] and hp.loads == []
+    assert n1.component_data[ComponentType.MAMBA].value is None
+
+
+class _CommitRaises(Exception):
+    pass
+
+
+def _raising_commit(monkeypatch, t, set_value_first):
+    comp = t.components[ComponentType.MAMBA]
+    real = comp.commit_hicache_transfer
+
+    def _commit(node, phase, transfers=None):
+        if set_value_first:
+            real(node, phase, transfers=transfers)     # the tree took the slot, then the bookkeeping raised
+        raise _CommitRaises("commit failed")
+
+    monkeypatch.setattr(comp, "commit_hicache_transfer", _commit)
+
+
+def test_a2_a_commit_that_raises_before_the_tree_took_the_slot_frees_slot_and_row_once(monkeypatch):
+    """S90b review A2: the LOAD_BACK commit runs inside the guard. It raised before setting the node's value: the
+    device slot and the read row are released exactly once, nothing is attached."""
+    be = _Backend()
+    t, n1, _, hp, _ = _ftree(monkeypatch, be)
+    _raising_commit(monkeypatch, t, set_value_first=False)
+    assert t.pdflip_follower_state_at_told(_freq(), D_TOLD) == 0
+    assert t.req_to_token_pool.mamba_allocator.freed == [7]
+    assert hp.freed == [5]
+    assert n1.component_data[ComponentType.MAMBA].value is None
+
+
+def test_a2_a_commit_that_raises_after_the_tree_took_the_slot_does_not_free_it(monkeypatch):
+    """S90b review A2: the commit set the node's value (the tree holds the slot) and then raised -- freeing the slot
+    here would leave the tree with a freed slot (a later double free by its eviction)."""
+    be = _Backend()
+    t, n1, _, hp, _ = _ftree(monkeypatch, be)
+    _raising_commit(monkeypatch, t, set_value_first=True)
+    assert t.pdflip_follower_state_at_told(_freq(), D_TOLD) == 0
+    assert t.req_to_token_pool.mamba_allocator.freed == []
+    assert int(n1.component_data[ComponentType.MAMBA].value[0]) == 7
+    assert hp.freed == [5]
+
+
+def test_a2_a_raising_free_on_node_changed_is_not_followed_by_a_second_free(monkeypatch):
+    """S90b review A2: on the node-changed exit ``free(dst)`` raised -- the handler must not free the slot again;
+    the read row is still released once."""
+    be = _Backend()
+    t, n1, _, hp, _ = _ftree(monkeypatch, be)
+    comp = t.components[ComponentType.MAMBA]
+    real = comp._alloc_mamba_slot
+    alloc = t.req_to_token_pool.mamba_allocator
+    calls = []
+
+    def _alloc_evicting():
+        n1.component_data[ComponentType.FULL].value = None
+        return real()
+
+    def _free_raises(s):
+        calls.append(int(s[0]))
+        raise RuntimeError("free failed")
+
+    comp._alloc_mamba_slot = _alloc_evicting
+    alloc.free = _free_raises
+    assert t.pdflip_follower_state_at_told(_freq(), D_TOLD) == 0
+    assert calls == [7]
+    assert hp.freed == [5]
     assert n1.component_data[ComponentType.MAMBA].value is None
 
 

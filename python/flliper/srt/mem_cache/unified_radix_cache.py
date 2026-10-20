@@ -6180,17 +6180,28 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if not ok:
             self._s90b_free_rows(mp, idx)
             return self._s90b_follower_note(req, told, "store_miss")
+        # S90b review A2 (OWNERSHIP MARKS): ``dst_owned`` -- this call holds the device slot (allocated, neither freed
+        # nor handed to the tree); ``rows_owned`` -- it holds the read row. Every exit releases exactly what it still
+        # holds, once: a raising ``free(dst)`` on the node-changed exit is not followed by a second free in the handler,
+        # and a raising LOAD_BACK commit releases the slot only if the tree did not take it (the commit set no value).
         dst = None
+        dst_owned = False
+        rows_owned = True
+        commit_started = False
         try:
             dst = comp._alloc_mamba_slot()
             if dst is None:
+                rows_owned = False
                 self._s90b_free_rows(mp, idx)
                 return self._s90b_follower_note(req, told, "no_device_slot")
+            dst_owned = True
             if (node.component_data[ComponentType.MAMBA].value is not None
                     or node.component_data[BASE_COMPONENT_TYPE].value is None):
                 # the slot's eviction walk may have changed the tree: never two states on one node, never a
                 # state on a node whose device KV left meanwhile
+                dst_owned = False
                 self.req_to_token_pool.mamba_allocator.free(dst)
+                rows_owned = False
                 self._s90b_free_rows(mp, idx)
                 return self._s90b_follower_note(req, told, "node_changed")
             io_backend = getattr(cc, "io_backend", "direct")
@@ -6209,20 +6220,28 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     hp._state_loaded_key = None
             if torch.cuda.is_available():
                 torch.cuda.current_stream().synchronize()   # the read row (slot reference) outlives the copy
-        except Exception:  # noqa: BLE001 - a failed copy attaches nothing
+            # the LOAD_BACK commit: the device value, the device LRU, the evictable size -- inside the guard
+            commit_started = True
+            comp.commit_hicache_transfer(
+                node, CacheTransferPhase.LOAD_BACK,
+                transfers=[PoolTransfer(name=PoolName.MAMBA, host_indices=idx, device_indices=dst)])
+            dst_owned = False   # the tree owns the slot now; its eviction frees it
+        except Exception:  # noqa: BLE001 - a failed copy / commit attaches nothing
             logger.warning("S90b FOLLOWER-STATE-AT-TOLD device copy failed rid=%s", getattr(req, "rid", "?"),
                            exc_info=True)
-            if dst is not None:
+            if dst_owned and commit_started and node.component_data[ComponentType.MAMBA].value is not None:
+                dst_owned = False   # the commit set the node's value before it raised: the tree holds the slot
+            if dst_owned:
+                dst_owned = False
                 try:
                     self.req_to_token_pool.mamba_allocator.free(dst)
                 except Exception:  # noqa: BLE001
                     pass
-            self._s90b_free_rows(mp, idx)
+            if rows_owned:
+                rows_owned = False
+                self._s90b_free_rows(mp, idx)
             return self._s90b_follower_note(req, told, "copy_failed")
-        # the LOAD_BACK commit: the device value, the device LRU, the evictable size
-        comp.commit_hicache_transfer(
-            node, CacheTransferPhase.LOAD_BACK,
-            transfers=[PoolTransfer(name=PoolName.MAMBA, host_indices=idx, device_indices=dst)])
+        rows_owned = False
         self._s90b_free_rows(mp, idx)
         try:
             self._update_evictable_leaf_sets(node)
