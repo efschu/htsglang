@@ -66,6 +66,9 @@ def test_a2_x_of_k_never_moves_a_verdict_and_is_named_in_the_why(monkeypatch, ca
     assert re.search(r"S=5400 X=5222 ", line) and re.search(r" xk=62\d\d", line), line
 
 
+@pytest.mark.usefixtures("decider_off")  # EZ-S2a: describes the S1 code (reachable until S4)
+
+
 def test_a2_the_queue_sum_path_decides_on_the_own_x_too(monkeypatch, caplog):
     from test_pdflip_arrival_seat_rule_0929 import _pending
 

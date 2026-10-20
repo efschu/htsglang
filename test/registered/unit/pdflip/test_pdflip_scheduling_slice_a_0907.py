@@ -592,6 +592,7 @@ def test_t9d_all_four_front_sites_read_one_x():
 
 
 # -------------------------------------------------------------- T10, R-5
+@pytest.mark.usefixtures("decider_off")  # EZ-S2a: describes the S1 code (reachable until S4)
 def test_t10_a_trickle_below_the_threshold_does_not_buy_a_round_trip():
     """T10, ADAPTED TO #1271 RULE (c): THE BACKLOG SUM IS OVER UNCACHED TOKENS.
 

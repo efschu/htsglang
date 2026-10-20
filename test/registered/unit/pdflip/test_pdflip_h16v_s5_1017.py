@@ -101,6 +101,9 @@ def test_f1_a_shared_prefix_does_not_lower_the_deciding_s_a5(monkeypatch, caplog
     assert f2._decode_collect(t0 + 0.6) == "P"
 
 
+@pytest.mark.usefixtures("decider_off")  # EZ-S2a: describes the S1 code (reachable until S4)
+
+
 def test_f1_the_queue_sum_flip_decides_on_the_d_side_sum_too_a5(monkeypatch):
     _on(monkeypatch)
     f = _fx(running=())

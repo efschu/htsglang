@@ -240,6 +240,8 @@ _RULE_IN_WHY = re.compile(r"\b(R[1-9]a?|R1[01]|R2a)\b")
 def rule_of_set_why(why: str, verdict: str) -> str:
     """The rule tag of a SET-VERDICT's ``why`` (``R2``, ``R4`` ...); a verdict whose why names none (``yield_or_gate``,
     ``d_budget``: the front's own words) keeps the front's word as an ALT-free note ``R?``."""
+    if (why or "").startswith("NS:S49"):
+        return "NS:S49"          # EZ-S2a plan 2.6: the granted-not-started hold carries its own tag
     m = _RULE_IN_WHY.search(why or "")
     if m:
         return m.group(1)
