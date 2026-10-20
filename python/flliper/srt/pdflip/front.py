@@ -12606,18 +12606,74 @@ class Front:
         Front._dec(self).tick()
         Front._kv_refresh_tick(self, time.time())
 
-    def _x_kink_table(self) -> Tuple[List[int], List[int]]:
-        """EZ-S1 nach-review N2: the depths where X(depth) can have its minimum, and X at each (cached per curve set).
+    def _x_sig(self, depth: int, moving: Sequence[int], fixed: "frozenset[int]") -> Tuple[Any, Any]:
+        """EZ-S1 nach-review N2': WHICH segment of ``_first_crossing`` holds X at ``depth``: ``(previous candidate, first
+        dearer candidate)``, each named by its ``n`` -- or ``("m", fd)`` for the candidate the flip price's support depth
+        ``fd`` makes (``fd - depth``, it MOVES with the depth, so its ``n`` is no name). The same loop as
+        ``x_curves._first_crossing`` (k = 1, no extra P cost), returning the identity instead of the number."""
+        setup = getattr(self, "_x_setup", None)
+        curves = getattr(setup, "curves", None) if setup is not None else None
+        if curves is None:
+            return None, None
+        try:
+            d = float(max(0, min(int(depth), _xcurves.reach_depth(curves))))
+            notes: Set[str] = set()
+            n_lo, n_hi, d_pts = _xcurves._d_domain(curves.d_curve, d, _xcurves.reach_depth(curves))
+            cand = _xcurves._candidates(curves, d, n_lo, n_hi, d_pts)
+            mv = {int(fd - d): fd for fd in moving}
 
-        X(depth) is the first crossing of ``_first_crossing`` -- a quotient of piecewise linear terms. Between two KINKS
-        it is monotone (a Moebius function of the depth), so the minimum over any depth interval sits on a kink or on the
-        interval's end. The kinks (every one of them is a candidate here, nothing is sampled):
+            def nm(n: int) -> Any:
+                return n if (n in fixed or n not in mv) else ("m", mv[n])
+            prev = None
+            for n in cand:
+                if _xcurves._excess_ms(curves, d, float(n), 1.0, notes, 0.0) > 0.0:
+                    return prev, nm(n)
+                prev = nm(n)
+            return prev, "hi"
+        except Exception:  # noqa: BLE001 -- an unreadable depth: no signature, the caller's grid stands
+            return None, None
+
+    @staticmethod
+    def _x_flip_crossings(xat: Callable[[int], int], grid: Sequence[int], fd: int) -> Set[int]:
+        """EZ-S1 N2'/H4: on every sign change of ``depth + X(depth) - fd`` between neighbouring raster points an integer
+        bisection finds the crossing ``(a, b = a + 1)``; BOTH integers and their outer neighbours are candidates (the
+        minimum can sit on the right side, ``b``)."""
+        out: Set[int] = set()
+        for lo, hi in zip(grid, grid[1:]):
+            glo, ghi = lo + xat(lo) - fd, hi + xat(hi) - fd
+            if (glo < 0) == (ghi < 0) or hi - lo < 2:
+                continue
+            a, b = lo, hi            # glo and ghi differ in sign: bisect the integer where it flips
+            while b - a > 1:
+                m = (a + b) // 2
+                if (m + xat(m) - fd < 0) == (glo < 0):
+                    a = m
+                else:
+                    b = m
+            out.update((a, b, a - 1 if a > 0 else a, b + 1))
+        return out
+
+    def _x_kink_table(self) -> Tuple[List[int], List[int]]:
+        """EZ-S1 nach-review N2 + N2': the depths where X(depth) can have its minimum, and X at each (cached per curve set).
+
+        X(depth) is the first crossing of ``_first_crossing``: the first candidate ``n`` with ``excess(depth, n) > 0``,
+        linear between that candidate and the one before. Candidates of two kinds: FIXED ones (curve row ``n``, chunk
+        edges ``i*chunk (+row n)``: independent of the depth inside a bracket) and the MOVING ones ``fd - depth`` (the
+        flip price's support depths). Every candidate's excess is piecewise linear in the depth, its kinks the raster
+        (nothing is sampled):
           * the measured row depths of either curve (the bracket changes) and the deepest common depth ``reach`` (the clamp);
-          * ``row - k*chunk`` for every row and either curve's chunk (``request_ms`` prices chunk ``i`` at ``depth + i*chunk``:
-            the chunk crosses a row depth) and ``reach - j*chunk`` (``_d_domain`` counts the chunks that start within
-            reach: a STEP in the depth), each with ``+-1`` (both sides of a step);
-          * the depths where the flip price changes slope inside the request: ``depth + X(depth) == flip depth`` -- found
-            by integer bisection between the neighbouring candidates on every sign change of ``depth + X(depth) - fd``.
+          * ``row - k*chunk`` for every row and either curve's chunk (``request_ms`` prices chunk ``i`` at ``depth + i*chunk``)
+            and ``reach - j*chunk`` (``_d_domain`` counts the chunks that start within reach: a STEP), each ``+-1``;
+          * N2': ``fd - n`` for every fixed candidate ``n`` and flip depth ``fd`` (the flip price kinks at ``depth + n == fd``:
+            there the excess of the fixed candidate ``n`` changes slope), each ``+-1``.
+        Between two raster points every FIXED candidate's excess is LINEAR in the depth, so if the segment ``(previous,
+        first dearer)`` that holds X is the same at both ends it is the same throughout (a candidate dearer-or-equal at
+        both ends of a linear stretch is so inside, one not dearer at both is not dearer inside), and X is a Moebius
+        function of the depth there, monotone: the minimum is at an end. Where the segment DIFFERS between two raster
+        points there is a FOLD (X jumps, N2'): the depth is bisected on the segment identity down to the adjacent
+        integers (``_x_sig``); both sides become candidates. The moving candidate is not linear, so beyond that the old
+        sign search stays: on every sign change of ``depth + X(depth) - fd`` between neighbouring candidates (of the
+        REFINED raster) an integer bisection finds the crossing and keeps ``a``, ``b``, ``a-1``, ``b+1``.
         Without curves: ``([], [])``. Never raises (an unreadable curve set gives the end points a caller adds)."""
         setup = getattr(self, "_x_setup", None)
         curves = getattr(setup, "curves", None) if setup is not None else None
@@ -12629,12 +12685,14 @@ class Front:
         if hit is not None and hit[0] is curves:
             return hit[1], hit[2]
         cap = int(self.tp_prefill_max_tokens)
-        rows, chunks = set(), set()
+        rows, chunks, rown = set(), set(), set()
         reach = None
         try:
             ends = []
             for crv in (curves.p_curve, curves.d_curve):
                 rows.update(int(r.depth) for r in crv.rows)
+                for r in crv.rows:
+                    rown.update(int(n) for n in r.n)
                 ends.append(int(crv.rows[-1].depth))
                 c = int(getattr(crv, "chunk_tokens", 0) or 0)
                 if c > 0:
@@ -12654,6 +12712,26 @@ class Front:
                 for k in range(1, cap // c + 3):
                     if r - k * c > 0:
                         base.add(r - k * c)
+        fps = []
+        try:
+            fps = [int(d) for d in getattr(getattr(curves, "flip_price", None), "depth", ())]
+        except Exception:  # noqa: BLE001
+            fps = []
+        # N2': the fixed candidates n (<= cap + 2: a crossing beyond the cap is the cap) and their flip kinks fd - n
+        fixed = {0, 1} | {n for n in rown if n <= cap + 2}
+        for c in chunks | {0}:
+            for i in range(0, (cap // c + 3) if c > 0 else 1):
+                fixed.update((i * c, i * c + 1))
+                for n in rown:
+                    if i * c + n <= cap + 2:
+                        fixed.add(i * c + n)
+                    if c > 0 and i * c + min(n, c) <= cap + 2:
+                        fixed.add(i * c + min(n, c))
+        fixed = {n for n in fixed if n <= cap + 2}
+        for fd in fps:
+            for n in fixed:
+                if fd - n > 0:
+                    base.add(fd - n)
         cand = set(base)
         for d in base:
             cand.add(d + 1)
@@ -12665,25 +12743,33 @@ class Front:
             if d not in xs:
                 xs[d] = int(Front._x_at_depth(self, d))
             return xs[d]
-        fps = []
-        try:
-            fps = [int(d) for d in getattr(getattr(curves, "flip_price", None), "depth", ())]
-        except Exception:  # noqa: BLE001
-            fps = []
+        # N2': folds -- the segment holding X differs between raster neighbours: bisect on the identity
+        fz, sg = frozenset(fixed), {}
+
+        def sig(d: int) -> Any:
+            if d not in sg:
+                sg[d] = Front._x_sig(self, d, fps, fz)
+            return sg[d]
+
+        grid = sorted(cand)
+        for lo, hi in zip(grid, grid[1:]):
+            stack = [(lo, hi)]
+            while stack:                  # a change of segment lies in (x, y): bisect down to the adjacent integers
+                x, y = stack.pop()
+                if y - x < 1 or sig(x) == sig(y):
+                    continue
+                cand.update((x, y))
+                if y - x >= 2:
+                    mid = (x + y) // 2
+                    stack.append((x, mid))
+                    stack.append((mid, y))
+        for d in list(cand):
+            for e in (d - 1, d + 1):
+                if e >= 0:
+                    cand.add(e)
         grid = sorted(cand)
         for fd in fps:
-            for lo, hi in zip(grid, grid[1:]):
-                glo, ghi = lo + xat(lo) - fd, hi + xat(hi) - fd
-                if (glo < 0) == (ghi < 0) or hi - lo < 2:
-                    continue
-                a, b = lo, hi            # glo and ghi differ in sign: bisect the integer where it flips
-                while b - a > 1:
-                    m = (a + b) // 2
-                    if (m + xat(m) - fd < 0) == (glo < 0):
-                        a = m
-                    else:
-                        b = m
-                cand.update((a, b, a - 1 if a > 0 else a, b + 1))
+            cand.update(Front._x_flip_crossings(xat, grid, fd))
         depths = sorted(cand)
         vals = [xat(d) for d in depths]
         cache[key] = (curves, depths, vals)
