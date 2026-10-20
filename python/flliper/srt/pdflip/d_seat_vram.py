@@ -3124,8 +3124,13 @@ RESERVE_AGREE_MARK = "PDFLIP D-MEM-SCHED RESERVE-AGREE"
 _RESERVE_AGREE_N = [0]
 
 
-def _agree_reserve(sched, admissible, reserve: int) -> int:
+def _agree_reserve(sched, admissible, reserve: int, credits=None):
     """The gate reservation as ONE group number: MAX over the D ranks.
+
+    D-MEM-SHARE (nf-decode-host-1020): with ``credits`` (the shared-prefix credits of
+    ``d_mem_share.prepare``, a replicated-length list) they ride in the same call --
+    ``[-reserve] + credits``, element-wise MIN -- and the answer is ``(reserve, agreed
+    credits)``; without, the plain int as before.
 
     NF y6h 10011531 (01.10. 16:07:53): ``new_token_ratio`` is rank-local --
     TP0 priced the queue at 4964, TP1/TP2 at 6592 for the same requests, so
@@ -3139,12 +3144,15 @@ def _agree_reserve(sched, admissible, reserve: int) -> int:
     Entered only with something queued (``admissible`` is a request list,
     the same on every D rank), so a decode round with an empty queue pays no
     collective."""
+    extra = [] if credits is None else [int(c) for c in credits]
     if not admissible:
-        return int(reserve)
+        return int(reserve) if credits is None else (int(reserve), extra)
     gmin = getattr(sched, "_pdflip_group_min_ints", None)
     if gmin is None:
-        return int(reserve)
-    agreed = -int(gmin([-int(reserve)])[0])
+        return int(reserve) if credits is None else (int(reserve), extra)
+    got = list(gmin([-int(reserve)] + extra))
+    agreed = -int(got[0])
+    shared = [int(v) for v in got[1:]] if len(got) == 1 + len(extra) else [0] * len(extra)
     if agreed != int(reserve):
         _RESERVE_AGREE_N[0] += 1
         n = _RESERVE_AGREE_N[0]
@@ -3152,7 +3160,7 @@ def _agree_reserve(sched, admissible, reserve: int) -> int:
             logger.info("%s n=%d local=%d group=%d ratio=%.4f -- the reservation the stage "
                         "machine steps on is the group's, not this rank's",
                         RESERVE_AGREE_MARK, n, int(reserve), agreed, _new_token_ratio(sched))
-    return agreed
+    return agreed if credits is None else (agreed, shared)
 
 
 def kv_ladder_reading(sched) -> Optional[Dict[str, int]]:
@@ -4325,12 +4333,24 @@ def runtime_tick(sched):
         ms._rids = None
         setattr(sched, MEM_SCHED_ATTR, ms)
     running, admissible = _demand_lists(sched)
-    used = sum(_req_tokens(r) for r in running)
-    incoming = sum(_req_tokens(r) for r in admissible)
+    used_raw = sum(_req_tokens(r) for r in running)
+    incoming_raw = sum(_req_tokens(r) for r in admissible)
+    # D-MEM-SHARE (nf-decode-host-1020): the machine steps on the DISTINCT tokens -- a prompt prefix two
+    # requests hold in one set of tree pages counts once (group-agreed credit; switch off = the sums above).
+    # The cap-lift verdict below keeps the plain sums (its conservative side: more demand lifts the cap).
+    from flliper.srt.pdflip import d_mem_share as _dms
+
+    share = _dms.prepare(sched, running, admissible, _page_size(sched))
     rids = frozenset(getattr(r, "rid", id(r)) for r in running)
     # NF y3z ep44/ep58 (30.09.): the machine grows for what the GATE charges,
-    # not for the bare census -- else it holds a stage the gate refuses in
-    reserve = _agree_reserve(sched, admissible, admission_reserve(sched, running, admissible))
+    # not for the bare census -- else it holds a stage the gate refuses in.
+    # D-MEM-SHARE: the shared-prefix credits ride in the SAME group call (no new collective)
+    if share.cands:
+        reserve, agreed = _agree_reserve(sched, admissible, admission_reserve(sched, running, admissible),
+                                         credits=share.local)
+    else:
+        reserve, agreed = _agree_reserve(sched, admissible, admission_reserve(sched, running, admissible)), None
+    used, incoming, shared_used, shared_in = _dms.finish(sched, share, agreed)
     ended = ms._rids is not None and bool(ms._rids - rids)
     ms._rids = rids
     fr = _floor_room_state(ms)
@@ -4368,7 +4388,8 @@ def runtime_tick(sched):
     # group has demand the cap goes back to the stage unless the free ids
     # below it pay (replicated verdict); with no demand it returns to pending.
     lifted_before = bool(getattr(ms, "_cap_lifted", False))
-    lifted, need, rest = _cap_lift_verdict(sched, ms, fr, alloc, tokens, used, incoming, admissible, rids, page)
+    lifted, need, rest = _cap_lift_verdict(sched, ms, fr, alloc, tokens, used_raw, incoming_raw, admissible, rids,
+                                           page)
     if fr["ticks"] % FLOOR_CHECK_EVERY == 0:
         logger.info(
             "%s ticks=%d floor_reads=%d floor_cached=%d room_reads=%d room_cached=%d "
@@ -4460,7 +4481,8 @@ def runtime_tick(sched):
     st.stage, st.stage_tokens = ms.stage, tokens[ms.stage]
     if ms.stage > before:
         _reopen_admission(sched)
-    logger.info("%s from=S%d to=S%d used=%d incoming=%d ended=%s floor=%d -- %s%s gate_reserve=%d",
+    logger.info("%s from=S%d to=S%d used=%d incoming=%d ended=%s floor=%d -- %s%s gate_reserve=%d "
+                "shared_used=%d shared_incoming=%d",
                 ms.line(), before, ms.stage, used, incoming, "yes" if ended else "no", floor,
                 step.reason,
                 "" if ctl is None else (" evicted_rows=%d refilled_rows=%d warm_rows=%d "
@@ -4468,5 +4490,5 @@ def runtime_tick(sched):
                 % (ctl.evicted_rows, ctl.refilled_rows, ctl.warm_rows(), ctl.sync_ms,
                    ctl.bytes_copied + int(getattr(ctl, "bytes_copied_dev", 0) or 0), ctl.copy_ms,
                    "-" if applied is None else int(applied.extra_rows)),
-                int(reserve))
+                int(reserve), int(shared_used), int(shared_in))
     return step

@@ -46,6 +46,17 @@ stamps, 388 / 473.9 s were opened by a MIXED-D round (its forward 444.8 s) and 2
 round whose tail carried a lend or a return. ``run_ms``/``host_ms`` are filled for every decode-advancing
 opener (a decode round's ``run_ms`` is its launch, the overlap loop returns before the device ends).
 
+nf-decode-host-1020 (20.10.): ``spans=`` names WHERE the host time of the gap went, per function, from
+``perf_counter`` spans the scheduler already passes through (no sync, no collective): ``recv`` (recv +
+process_input), ``lend_start`` (D-TRANSIENT-LEND ``round_start``: the return before the width vote, its
+E1 + unmap join), ``seat_stage`` (``d_seat_rewake.round_boundary``: the seat re-plan or the D-MEM-SCHED
+stage tick and its live move), ``admit`` (``get_new_batch_prefill``), inside it ``match``
+(``policy.calc_priority``, nested, not added), ``lend_end`` (D-TRANSIENT-LEND ``on_batch``), ``result``
+(``pop_and_process``); ``rest`` = ``host_ms`` minus the top-level spans (the loop, the merge, aborts, the
+sample launch, the opener's post-launch work). Time inside a pure extend's window is ``d_prefill_ms``.
+rc28 TP0 (1020_174205): 133 gaps ``cause=other`` with a return held host p50 512 ms, of it the return
+p50 175 ms -- the remaining ~300 ms had no name.
+
 Rank-local, read-only, no collective, no decision (nothing here can split the ranks; R11 untouched). Logged on the
 first TP rank of group D only. Switch ``FLLIPER_PDFLIP_D_DECODE_GAP`` (default on), bound
 ``FLLIPER_PDFLIP_D_DECODE_GAP_MS`` (400), census window ``FLLIPER_PDFLIP_D_DECODE_GAP_CENSUS_S`` (300).
@@ -100,6 +111,7 @@ class Tracker:
         self.notes: Dict[str, int] = {}
         self.notes_ms: Dict[str, float] = {}  # S106: the measured wall of the timed notes in this gap
         self.last_rids: Optional[frozenset] = None  # S106: the requests the opener advanced
+        self.spans: Dict[str, float] = {}  # nf-decode-host-1020: host ms per function in this gap
         self.window_t0 = now
         self.census: Dict[str, list] = {c: [0, 0.0] for c in CAUSES}
         self.rounds = 0
@@ -112,6 +124,14 @@ class Tracker:
         """S106: a timed note -- counted like ``note`` and its own wall summed."""
         self.note(cause)
         self.notes_ms[cause] = self.notes_ms.get(cause, 0.0) + max(0.0, float(ms))
+
+    def span(self, name: str, ms: float) -> None:
+        """nf-decode-host-1020: ``ms`` of host time of ``name`` inside the gap that is open. Time inside a pure
+        extend's window is that extend's (``d_prefill_ms``) and is not spanned again; before the first decode
+        round there is no gap to charge."""
+        if self.ext_open is not None or self.last_decode_t is None:
+            return
+        self.spans[name] = self.spans.get(name, 0.0) + max(0.0, float(ms))
 
     def _close_extend(self, now: float) -> None:
         if self.ext_open is not None:
@@ -177,7 +197,8 @@ class Tracker:
         rec = {"gap_ms": gap_ms, "cause": cause, "rows": self.last_rows, "d_prefill_ms": self.ext_ms,
                "extends": self.ext_n, "prefill_tokens": self.ext_tokens, "notes": notes, "other_ms": other_ms,
                "flip": flip, "mixed_tokens": mixed, "run_ms": run_ms, "host_ms": host_ms,
-               "lend_ms": notes_ms.get("lend"), "return_ms": notes_ms.get("lend_return")}
+               "lend_ms": notes_ms.get("lend"), "return_ms": notes_ms.get("lend_return"),
+               "spans": dict(self.spans)}
         self.gaps += 1
         self.census[cause][0] += 1
         self.census[cause][1] += gap_ms
@@ -190,6 +211,7 @@ class Tracker:
         self.ext_tokens = 0
         self.notes = {}
         self.notes_ms = {}
+        self.spans = {}
 
     def census_due(self, now: float) -> Optional[dict]:
         if self.census_s <= 0 or now - self.window_t0 < self.census_s:
@@ -244,6 +266,37 @@ def note_ms(sched, cause: str, ms: float) -> None:
         pass
 
 
+#: nf-decode-host-1020: the spans nested inside another (printed, never added into ``rest``)
+NESTED_SPANS = ("match",)
+SPAN_ORDER = ("recv", "lend_start", "seat_stage", "admit", "match", "lend_end", "result")
+
+
+def span(sched, name: str, t0: float) -> None:
+    """nf-decode-host-1020: close a host span opened at ``t0`` (``time.perf_counter()``) into the open gap.
+    No-op off group D / off the log rank / with the switch off; never raises."""
+    try:
+        tr = tracker(sched)
+        if tr is not None:
+            tr.span(str(name), (time.perf_counter() - float(t0)) * 1000.0)
+    except Exception:  # noqa: BLE001 -- an instrument never breaks the pass
+        pass
+
+
+def format_spans(rec: dict) -> str:
+    """``name:ms,...,rest:ms`` (rest = gap - the closer's own run - the extends - the top-level spans;
+    ``-`` when no span was recorded)."""
+    sp = rec.get("spans") or {}
+    if not sp:
+        return "-"
+    names = [n for n in SPAN_ORDER if n in sp] + sorted(n for n in sp if n not in SPAN_ORDER)
+    top = sum(v for n, v in sp.items() if n not in NESTED_SPANS)
+    host = rec.get("host_ms")
+    base = float(host) if host is not None else float(rec.get("other_ms") or 0.0)
+    parts = ["%s:%.0f" % (n, sp[n]) for n in names]
+    parts.append("rest:%.0f" % (base - top))
+    return ",".join(parts)
+
+
 def _batch_rids(batch) -> Optional[frozenset]:
     """S106: the requests a decode-advancing batch advances (decode: all; MIXED-D: the folded decodes)."""
     try:
@@ -293,15 +346,16 @@ def on_batch(sched, batch, now: Optional[float] = None) -> None:
             logger.info(
                 "%s gap_ms=%.0f cause=%s rows=%d d_prefill_ms=%.0f extends=%d prefill_tokens=%d other_ms=%.0f "
                 "mixed_tokens=%d run_ms=%s host_ms=%s "
-                "notes=%s lend_ms=%s return_ms=%s (start-to-start between two decode-advancing batches; D group, "
-                "rank-local)",
+                "notes=%s lend_ms=%s return_ms=%s spans=%s (start-to-start between two decode-advancing batches; "
+                "D group, rank-local; spans = host ms per function in the gap, match nested in admit)",
                 MARK, rec["gap_ms"], rec["cause"], rec["rows"], rec["d_prefill_ms"], rec["extends"],
                 rec["prefill_tokens"], rec["other_ms"], rec["mixed_tokens"],
                 "-" if rec["run_ms"] is None else "%.0f" % rec["run_ms"],
                 "-" if rec["host_ms"] is None else "%.0f" % rec["host_ms"],
                 ",".join("%s:%d" % kv for kv in sorted(rec["notes"].items())) or "-",
                 "-" if rec["lend_ms"] is None else "%.0f" % rec["lend_ms"],
-                "-" if rec["return_ms"] is None else "%.0f" % rec["return_ms"])
+                "-" if rec["return_ms"] is None else "%.0f" % rec["return_ms"],
+                format_spans(rec))
         cen = tr.census_due(now)
         if cen is not None:
             logger.info(

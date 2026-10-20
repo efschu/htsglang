@@ -265,6 +265,7 @@ from flliper.srt.pdflip import d_transient_lend as _pdflip_d_transient_lend  # D
 from flliper.srt.pdflip import d_seat_rewake as _pdflip_d_seat_rewake  # D-SEAT-REWAKE: live seat re-plan
 from flliper.srt.pdflip import skip_first as _pdflip_skip_first  # E2 in a mixed wake cohort
 from flliper.srt.pdflip import d_decode_gap as _pdflip_d_decode_gap  # S48 D-DECODE-GAP instrument
+from flliper.srt.pdflip import d_mem_share as _pdflip_d_mem_share  # D-MEM-SHARE (nf-decode-host-1020)
 from flliper.srt.layers.moe import em_fetch_probe as _em_fetch_probe  # S78 EM-FETCH instrument
 from flliper.srt.layers.dcp import prefix_lens_check as _prefix_lens_check  # #639 ballot (skip: deferred)
 from flliper.srt.pdflip import short_read as _pdflip_short_read  # held short wake reads
@@ -4573,6 +4574,7 @@ class Scheduler(
             _stage_sync(f"result-{tmp_batch.forward_mode.name}")
             _h58_span("result_ms", _h58_t0)
             _slow.span("result_ms", _h58_t0)
+            _pdflip_d_decode_gap.span(self, "result", _h58_t0)  # nf-decode-host-1020: D-DECODE-GAP spans
 
         # nf-pd-post: the last batch's result was processed in the iteration
         # that launched it (pdflip/skip_first.result_now) -- nothing to pop for it.
@@ -4589,6 +4591,7 @@ class Scheduler(
             self.process_input_requests(recv_reqs)
             _h58_span("recv_ms", _h58_t0)
             _slow.span("recv_ms", _h58_t0)
+            _pdflip_d_decode_gap.span(self, "recv", _h58_t0)  # nf-decode-host-1020: D-DECODE-GAP spans
             if self._engine_paused:
                 continue
 
@@ -12839,8 +12842,12 @@ class Scheduler(
         # are replicated)
         # D-TRANSIENT-LEND: extend work pending -> the lent rows go back
         # first, before the stage tick and the #794 width vote read the card
+        _t_gap = time.perf_counter()  # nf-decode-host-1020: D-DECODE-GAP spans (host ms, rank-local)
         _pdflip_d_transient_lend.round_start(self)
+        _pdflip_d_decode_gap.span(self, "lend_start", _t_gap)
+        _t_gap = time.perf_counter()
         _pdflip_d_seat_rewake.round_boundary(self)
+        _pdflip_d_decode_gap.span(self, "seat_stage", _t_gap)
 
         if self.enable_fpm:
             self._fpm_batch_t0 = time.monotonic()
@@ -13525,7 +13532,9 @@ class Scheduler(
                 self._retry_deferred_prefetches()
         else:
             _dqh_verdicts = self.__dict__.get("_pass_prefetch_verdicts")
+            _t_gap = time.perf_counter()
             prefill_plan = self.get_new_batch_prefill(running_batch)
+            _pdflip_d_decode_gap.span(self, "admit", _t_gap)  # nf-decode-host-1020
             new_batch = prefill_plan.batch_to_run
             running_batch = prefill_plan.running_batch
             self.pdflip_d_head_hold.note_pass(
@@ -13683,7 +13692,9 @@ class Scheduler(
         # D-TRANSIENT-LEND: the booked transient is expert rows between two
         # extends -- returned here before an extend runs, lent after SETTLE
         # decode rounds; the verdict is the batch's kind (rank-symmetric)
+        _t_gap = time.perf_counter()
         _pdflip_d_transient_lend.on_batch(self, ret)
+        _pdflip_d_decode_gap.span(self, "lend_end", _t_gap)  # nf-decode-host-1020
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
 
@@ -16888,7 +16899,9 @@ class Scheduler(
             return None, running_batch
 
         # Get priority queue
+        _t_gap = time.perf_counter()  # nf-decode-host-1020: D-DECODE-GAP span (nested in admit)
         self.policy.calc_priority(self.waiting_queue, running_batch)
+        _pdflip_d_decode_gap.span(self, "match", _t_gap)
         # #823 W9: and then put its HEAD in the group's order. calc_priority
         # sorts by this rank's own num_matched_prefix_tokens, which is read
         # from the rank-local radix tree and therefore differs between TP
@@ -18524,6 +18537,9 @@ class Scheduler(
                         from flliper.srt.pdflip import d_park_runtime as _dpr_q702
 
                         _dpr_q702.note_adder_refusal(self, adder, req, running_batch)
+                    # D-MEM-SHARE guard (nf-decode-host-1020): a request this rank could not fund gets no
+                    # shared-prefix credit from the next tick on (group MIN -> the stage grows for its length)
+                    _pdflip_d_mem_share.note_refused(self, req)
                     _hol_go_on = _hol.may_overtake(req)
                     if _hol_go_on:
                         pass  # D-HOL backfill: later requests that fit the free KV still run
