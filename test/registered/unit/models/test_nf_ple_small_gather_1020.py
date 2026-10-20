@@ -176,7 +176,7 @@ class TestSmallExtendGather(_Base):
         self.assertEqual((how0, how1), ("pread", "small"))
         text = "\n".join(r.getMessage() for r in cm.records)
         self.assertIn("next=queued:10", text)  # the tail is queued although below min_rows
-        m = re.search(r"PLE-PREFETCH-SMALL rows=(\d+) staged=(\d+) src=(\w+) ready=(\w+) served=(\w+)", text)
+        m = re.search(r"PLE-PREFETCH-SMALL gather=\d+ rows=(\d+) staged=(\d+) src=(\S+) ready=(\w+) served=(\w+)", text)
         self.assertIsNotNone(m)
         self.assertEqual((m[1], m[2], m[3], m[5]), ("10", "10", "next", "yes"))
         self.assertTrue(_same(out1, _serial(self.table, self.ids[90:100])))
@@ -381,3 +381,136 @@ class TestEmbeddingDispatch(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _Ev:
+    """A recorded CUDA event stand-in: ``query`` answers ``done``; a
+    ``synchronize`` is logged (the host wait the review forbids)."""
+
+    def __init__(self, log, tag, done=False):
+        self.log, self.tag, self.done = log, tag, done
+
+    def query(self):
+        return self.done
+
+    def synchronize(self):
+        self.log.append(self.tag)
+
+
+class TestReviewFollowUps(_Base):
+    """Review nf-review-ple-small-1020 A1-A6 (R1 = A2, R2 = A3 taken over, inverted to the fixed behaviour)."""
+
+    def _hits(self, cm):
+        return [tuple(int(x) for x in m.groups()) for m in
+                (re.search(r"PLE-PREFETCH-SMALL-HIT gather=\d+ rows=(\d+) staged=(\d+) kernel_hit=(\d+) in_range=(\d+)",
+                           r.getMessage()) for r in cm.records) if m]
+
+    def test_r1_a2_second_fresh_small_extend_takes_the_other_slot_without_a_wait(self):
+        log = []
+        req1 = types.SimpleNamespace(extend_range=Range(0, 12), full_untruncated_fill_ids=array("q", self.ids[0:12].tolist()))
+        pf.publish_ple_next_chunk([req1], 4096)
+        _, how = self.gather(self.ids[0:12])
+        self.assertEqual(how, "small")
+        self.assertIsNotNone(self.g._slots[0].stage_ids)
+        self.g._slots[0].event = _Ev(log, "slot0-kernel-1")  # still running
+        req2 = types.SimpleNamespace(extend_range=Range(0, 9), full_untruncated_fill_ids=array("q", self.ids[20:29].tolist()))
+        pf.publish_ple_next_chunk([req2], 4096)
+        out2, how2 = self.gather(self.ids[20:29])
+        self.assertEqual(how2, "small")
+        self.assertEqual(log, [])  # no host wait on the first kernel
+        self.assertIsNotNone(self.g._slots[1].stage_ids)
+        self.assertTrue(_same(out2, _serial(self.table, self.ids[20:29])))
+
+    def test_a2_every_slot_busy_falls_back_without_a_wait(self):
+        log = []
+        for k in range(pf.PLE_PREFETCH_DEPTH):
+            self.g._slots[k].event = _Ev(log, f"slot{k}")
+        self.publish(0, 12, 4096)
+        with self.assertLogs(LOGGER, level=logging.INFO) as cm:
+            _, how = self.gather(self.ids[0:12])
+        self.assertEqual(how, "old")
+        self.assertEqual(log, [])
+        self.assertRegex("\n".join(r.getMessage() for r in cm.records), r"served=no reason=slots_busy")
+
+    def test_a2_next_chunk_is_not_queued_into_a_busy_slot(self):
+        log = []
+        self.publish(0, 12, 4096)  # small, its next chunk would go to slot 1
+        self.g._slots[1].event = _Ev(log, "slot1")
+        with self.assertLogs(LOGGER, level=logging.INFO) as cm:
+            _, how = self.gather(self.ids[0:12])
+        self.assertEqual(how, "small")
+        self.assertEqual(log, [])
+        self.assertRegex("\n".join(r.getMessage() for r in cm.records), r"next=skip:busy")
+        self.assertIsNone(self.g._pending)
+
+    def test_r2_a3_tail_plus_new_short_request_all_rows_from_the_slot(self):
+        self.publish(0, 90, 90)
+        _, how0 = self.gather(self.ids[0:90])
+        self.assertEqual(how0, "pread")
+        self.req.extend_range = Range(90, 100)
+        other = types.SimpleNamespace(extend_range=Range(0, 4), full_untruncated_fill_ids=array("q", self.ids[40:44].tolist()))
+        pf.publish_ple_next_chunk([self.req, other], 90)
+        batch_ids = torch.cat([self.ids[90:100], self.ids[40:44]])
+        with self.assertLogs(LOGGER, level=logging.INFO) as cm:
+            out, how1 = self.gather(batch_ids)
+        self.assertEqual(how1, "small")
+        self.assertEqual(self.emu.calls[-1], (14, 14))
+        self.assertTrue(_same(out, _serial(self.table, batch_ids)))
+        self.assertRegex("\n".join(r.getMessage() for r in cm.records), r"src=next\+cur .*read_rows=4 ")
+
+    def test_a1_kernel_hit_is_the_devices_count_not_the_prediction(self):
+        self.publish(0, 12, 4096)
+        actual = self.ids[0:12].clone()
+        actual[3] = (actual[3] + 1) % (ROWS_PER_SHARD * SHARDS)
+        actual[7] = (actual[7] + 5) % (ROWS_PER_SHARD * SHARDS)
+        with self.assertLogs(LOGGER, level=logging.INFO) as cm:
+            self.gather(actual)
+        self.assertEqual(self._hits(cm), [(12, 12, 10, 12)])  # staged 12 (host), kernel_hit 10 (device)
+        self.assertEqual(self.g.stats["small_kernel_hit"], 10)
+
+    def test_a1_counters_are_read_only_after_their_event_landed(self):
+        q = self.g.__dict__.setdefault("_small_hits", __import__("collections").deque())
+        ev = _Ev([], "ctr", done=False)
+        host = torch.tensor([5, 4], dtype=torch.int32)
+        q.append((ev, host, None, {"gather": 1, "rows": 5, "staged": 5, "src": "cur", "decode": 0}))
+        self.assertEqual(self.g._harvest_small(), 0)  # not landed: not read, no wait
+        self.assertEqual(ev.log, [])
+        ev.done = True
+        with self.assertLogs(LOGGER, level=logging.INFO) as cm:
+            self.assertEqual(self.g._harvest_small(), 1)
+        self.assertEqual(self._hits(cm), [(5, 5, 4, 5)])
+
+    def test_a4_mixed_decode_rows_are_counted(self):
+        dec = types.SimpleNamespace(extend_range=Range(79, 80), output_ids=[1, 2],
+                                    full_untruncated_fill_ids=array("q", self.ids[:80].tolist()))
+        ext = types.SimpleNamespace(extend_range=Range(0, 6), output_ids=[],
+                                    full_untruncated_fill_ids=array("q", self.ids[:6].tolist()))
+        pf.publish_ple_next_chunk([ext, dec], 4096)
+        self.assertEqual(pf._HINT.cur_decode_tokens, 1)
+        with self.assertLogs(LOGGER, level=logging.INFO) as cm:
+            self.gather(torch.cat([self.ids[0:6], self.ids[79:80]]))
+        self.assertRegex("\n".join(r.getMessage() for r in cm.records), r"PLE-PREFETCH-SMALL-HIT .*decode_tokens=1")
+
+    def test_a5_large_gather_waits_for_the_slots_last_reader_explicitly(self):
+        log = []
+        self.g._ensure_rows(0, 200)  # mapped already: no remap that would wait on its own
+        self.g._slots[0].event = _Ev(log, "small-kernel-on-slot0", done=False)
+        self.publish(0, 90, 4096)
+        _, how = self.gather(self.ids[0:90])
+        self.assertEqual(how, "pread")
+        self.assertEqual(log, ["small-kernel-on-slot0"])
+
+    def test_a6_addrs_are_bounded_and_cur_bytes_counted(self):
+        slot = self.g._slots[0]
+        self.g._ensure_rows(0, 16)
+        slot.stage_ids_for(16)
+        for off in range(3 * pf._SMALL_ADDRS_MAX):
+            self.g._small_addrs(slot, off, torch.device("cpu"))
+        self.assertLessEqual(len(slot.addrs), pf._SMALL_ADDRS_MAX)
+        seen = []
+        # (hit > 0: the small path's own note; the emulator's serial reads note hit=0)
+        with mock.patch.object(pf._rank_timing, "note_ple",
+                               lambda *a, **k: seen.append(k["nbytes"]) if k.get("hit") else None):
+            self.publish(0, 12, 4096)
+            self.gather(self.ids[0:12])
+        self.assertEqual(seen, [12 * RB])
