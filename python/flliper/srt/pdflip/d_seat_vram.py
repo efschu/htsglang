@@ -4077,9 +4077,10 @@ def _kv_compact_vote(sv, why, floor_page: int, top_page: int,
 
     bounds = [int(floor_page)] if boundaries is None else [int(b) for b in boundaries]
     if sv is None or not ready:
-        return [0, 1 if ready else 0] + [-(1 << 30)] * len(bounds) + [0] * KC.BITMAP
+        return [0, 1 if ready else 0] + [-(1 << 30)] * len(bounds) + [0] * (2 * KC.BITMAP)
     ok = 1 if (why is None and sv.why is None) else 0
-    return [ok, 1] + [-g for g in _kv_compact_local_gaps(sv, bounds)] + KC.local_bitmap(sv)
+    return ([ok, 1] + [-g for g in _kv_compact_local_gaps(sv, bounds)] + KC.local_bitmap(sv)
+            + KC.local_sizes(sv))
 
 
 def _kv_compact_group_vote(sched, vec: List[int]) -> List[int]:
@@ -4097,7 +4098,8 @@ def _kv_compact_agreement(group: List[int], top_page: int, boundaries: Sequence[
 
     k = len(boundaries)
     gaps = {int(b): -int(group[2 + i]) for i, b in enumerate(boundaries)}
-    return KC.Agreement(bitmap=[int(x) for x in group[2 + k:2 + k + KC.BITMAP]], gaps=gaps)
+    return KC.Agreement(bitmap=[int(x) for x in group[2 + k:2 + k + KC.BITMAP]], gaps=gaps,
+                        sizes=[int(x) for x in group[2 + k + KC.BITMAP:2 + k + 2 * KC.BITMAP]])
 
 
 def _kv_compact_plans_from_vote(sv, group: List[int], floor_page: int, top_page: int,
@@ -4239,7 +4241,7 @@ def _kv_compact_remap_requests(sched, page_size: int, sv=None):
 
         def lut(dev):
             if dev not in luts:
-                luts[dev] = KC.lut_for(pairs, dev, KC.ops_for(torch.empty(0, device=dev)))
+                luts[dev] = KC.lut_for(pairs, dev)
             return luts[dev]
 
         n = 0
@@ -4260,8 +4262,15 @@ def _kv_compact_remap_requests(sched, page_size: int, sv=None):
             pi = getattr(r, "prefix_indices", None)
             if isinstance(pi, torch.Tensor) and pi.numel():
                 tens.append((r, KC._remap_tensor(pi, P, lut(pi.device))))
-        for idx, m, new in rows:
-            rtt[idx, :m].copy_(new)
+        olds = []
+        try:
+            for idx, m, new in rows:
+                olds.append((idx, m, rtt[idx, :m].clone()))      # B7: a failed copy rolls back
+                rtt[idx, :m].copy_(new)
+        except Exception:
+            for idx, m, old in reversed(olds):
+                rtt[idx, :m].copy_(old)
+            raise
         for r, new in tens:
             r.prefix_indices = new
         return n + len(tens)
@@ -4282,9 +4291,11 @@ def _kv_compact_snapshot(sched, alloc, tree, page):
 
     run = _kv_compact_running(sched)
     snap = getattr(sched, KV_SNAP_ATTR, None)
-    if snap is None or not snap.valid(tree, alloc, run):
+    changed = "new" if snap is None else snap.changed(tree, alloc, run)
+    if changed is not None:
         rtt = getattr(_req_pool(sched), "req_to_token", None)
         snap = KC.Snapshot(tree, alloc, page, run, rtt)
+        snap.reissued_for = changed
         setattr(sched, KV_SNAP_ATTR, snap)
     snap.passes += 1
     return snap, snap.ready()
@@ -4359,9 +4370,21 @@ def _kv_compact_for_shrink(sched, ms, fr, want: int, end: bool, floor_tokens: in
         why = "this rank cannot vote"
     group = _kv_compact_group_vote(sched, vec)
     if int(group[1]) != 1:
-        # a rank's snapshot has not landed yet: defer to the next pass, never wait
+        # a rank's snapshot has not landed yet: defer to the next pass, never wait. B5: named --
+        # the first deferral and every power of two in a row print which part of THIS rank's
+        # snapshot was re-issued (free / release / group / caps / nodes / running / new)
         fr["compact_deferred"] = int(fr.get("compact_deferred", 0)) + 1
+        run_d = int(fr.get("compact_deferred_run", 0)) + 1
+        fr["compact_deferred_run"] = run_d
+        if run_d == 1 or (run_d & (run_d - 1)) == 0:
+            logger.info("%s verdict=deferred want=S%d stage=S%d in_a_row=%d total=%d ready_here=%d "
+                        "snapshot_reissued_for=%s passes=%d -- a rank's survey snapshot has not landed; "
+                        "the next pass looks again, nothing waits%s", KV_COMPACT_MARK, int(want),
+                        int(ms.stage), run_d, int(fr["compact_deferred"]), int(ready),
+                        getattr(snap, "reissued_for", "-"), int(getattr(snap, "passes", 0) or 0),
+                        " (64 in a row: a finding)" if run_d >= 64 else "")
         return None
+    fr["compact_deferred_run"] = 0
     try:
         plans, pwhy = _kv_compact_plans_from_vote(sv, group, floor_page, top_page, bounds)
     except Exception as exc:  # noqa: BLE001 -- planning failed here: this rank answers "no plan"
@@ -4441,11 +4464,14 @@ def _kv_compact_for_shrink(sched, ms, fr, want: int, end: bool, floor_tokens: in
     setattr(sched, KV_SNAP_ATTR, None)
     run_now = _kv_compact_running(sched)
     evicted = (0, 0)
+    waits_evict = waits_move = 0
     if plan.evict_first:
         # 3. the agreed evictions first (content-agreed; with rank-local page ids "is it
         # room?" is a local question, "always first" is replicated)
         try:
-            evicted = KC.execute_evicts(tree, plan)
+            with KC.SyncCount() as sc_ev:
+                evicted = KC.execute_evicts(tree, plan)
+            waits_evict = sc_ev.n
             ok = 1
         except Exception as exc:  # noqa: BLE001 -- named below as a group stop
             logger.error("%s n=%d eviction failed here: %s: %s", KV_COMPACT_MARK, n,
@@ -4460,10 +4486,14 @@ def _kv_compact_for_shrink(sched, ms, fr, want: int, end: bool, floor_tokens: in
     res = None
     t_exec = time.perf_counter()
     try:
-        res = KC.execute_moves(tree, alloc, plan, copier, streams=_kv_streams(sched),
-                               remap_refs=_kv_compact_remap_requests(sched, page, sv),
-                               check=(None if (snap is None or plan.evicts)
-                                      else (lambda: snap.valid(tree, alloc, run_now))))
+        counts = KC._take_counts(snap, alloc, [d for _s, d in plan.pairs], plan.evict_pages)
+        with KC.SyncCount() as sc_mv:
+            res = KC.execute_moves(tree, alloc, plan, copier, streams=_kv_streams(sched),
+                                   remap_refs=_kv_compact_remap_requests(sched, page, sv),
+                                   check=(None if (snap is None or plan.evicts)
+                                          else (lambda: snap.valid(tree, alloc, run_now))),
+                                   counts=counts)
+        waits_move = sc_mv.n
         ok = 1
     except KC.CompactRefused as exc:   # rolled back on THIS rank
         logger.warning("%s n=%d moves refused here (rolled back): %s", KV_COMPACT_MARK, n, exc)
@@ -4508,7 +4538,7 @@ def _kv_compact_for_shrink(sched, ms, fr, want: int, end: bool, floor_tokens: in
     logger.info(
         "%s n=%d verdict=moved want=S%d target=S%d boundary=%d floor %d->%d moved_nodes=%d "
         "moved_pages=%d evicted_nodes=%d evicted_tokens=%d bytes=%d buffers=%d req_rows=%d "
-        "run_pages=%d digest=%d ms=%.1f %s exec_ms=%.1f host_waits=0 (pages above the boundary "
+        "run_pages=%d digest=%d ms=%.1f %s exec_ms=%.1f host_waits_move=%d host_waits_evict=%d (pages above the boundary "
         "moved down in every token-indexed KV buffer, node values and request rows re-pointed -- "
         "rank-local pages, group-agreed stage and evicted CONTENT; evicted = backed idle content, "
         "host copy stays)",
@@ -4516,7 +4546,7 @@ def _kv_compact_for_shrink(sched, ms, fr, want: int, end: bool, floor_tokens: in
         res.moved_nodes, res.moved_pages, evicted[0], evicted[1], res.bytes,
         len(getattr(copier, "items", ()) or ()), int(getattr(res, "remapped_rows", 0)),
         int(getattr(sv, "run_pages", 0) or 0), digest, (time.perf_counter() - t0) * 1000.0,
-        _cost(), exec_ms)
+        _cost(), exec_ms, waits_move, waits_evict)
     return new_floor
 
 

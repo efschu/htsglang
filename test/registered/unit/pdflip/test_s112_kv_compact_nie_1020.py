@@ -482,13 +482,11 @@ def test_the_content_key_of_a_segment_does_not_depend_on_the_node_cut():
 
 # ---- A2: no host wait -- the survey reads a snapshot, the move is ordered by events -----------
 
-class _RecOps(KC.HostOps):
-    """CUDA-like stream handles that only RECORD (desk): the order of E0 / copy / E1, and
-    a snapshot event that lands when the test says so."""
+class _RecOps:
+    """CUDA-like stream handles in F3's ``d_row_fence`` interface that only RECORD (desk)."""
 
-    def __init__(self, landed=True):
+    def __init__(self):
         self.log = []
-        self.landed = landed
 
     def current_stream(self):
         return "cur"
@@ -499,31 +497,34 @@ class _RecOps(KC.HostOps):
     def record(self, ev, stream):
         self.log.append(("record", stream))
 
-    def wait_event(self, stream, ev):
-        self.log.append(("wait_event", stream))
-
-    def wait_stream(self, stream, other):
-        self.log.append(("wait_stream", stream, other))
+    def wait(self, stream, ev):
+        self.log.append(("wait", stream))
 
     def query(self, ev):
-        self.log.append(("query",))
-        return self.landed
+        return True
+
+    def synchronize(self, ev):
+        self.log.append(("synchronize",))
 
 
-def test_the_move_is_fenced_by_events_and_never_waits():
-    """E0 (the current stream waits on the forward and HiCache tails) -> claim/copy/re-point
-    -> E1 (they wait on the current stream); no synchronize anywhere."""
+def test_the_move_is_fenced_by_events_and_never_waits(monkeypatch):
+    """E0 (an event at the tail of every KV stream, the current stream waits on it) ->
+    claim/copy/re-point -> E1 (the KV streams wait on the current stream): F3's RowFence
+    with an explicit KV stream set; no synchronize anywhere."""
+    from flliper.srt.pdflip import d_row_fence as RF
+
     alloc, tree, cop, x, req, rtt, sched = _running_world()
     sv = KC.survey(tree, alloc, P, B, running=[req], req_to_token=rtt)
     plan, why = KC.plan_for(sv, B)
     ops = _RecOps()
+    monkeypatch.setattr(RF, "_OPS", ops)
     real_copy = cop.copy
     cop.copy = lambda s, d: ops.log.append(("copy",)) or real_copy(s, d)
-    KC.execute_moves(tree, alloc, plan, cop, ops=ops, streams=["fwd", "write", "load"],
+    KC.execute_moves(tree, alloc, plan, cop, streams=["fwd", "write", "load"],
                      remap_refs=dsv._kv_compact_remap_requests(sched, P, sv))
-    kinds = [e[0] for e in ops.log]
-    assert kinds == ["wait_stream"] * 3 + ["copy", "record"] + ["wait_event"] * 3, ops.log
-    assert [e[2] for e in ops.log[:3]] == ["fwd", "write", "load"]
+    assert ops.log == ([("record", "fwd"), ("wait", "cur"), ("record", "write"), ("wait", "cur"),
+                        ("record", "load"), ("wait", "cur"), ("copy",), ("record", "cur")]
+                       + [("wait", s) for s in ("fwd", "write", "load")]), ops.log
 
 
 def test_no_host_read_in_the_move_path():
@@ -545,13 +546,13 @@ def test_no_host_read_in_the_move_path():
                 body.pop(0)
         return ast.unparse(tree)
 
-    for fn in (KC.execute_moves, KC.fence_begin, KC.fence_close, KC._give_back, KC._remap_tensor,
-               KC.lut_for, dsv._kv_compact_remap_requests):
+    for fn in (KC.execute_moves, KC.kv_fence_begin, KC._give_back, KC._remap_tensor, KC.lut_for,
+               KC._take_pages, dsv._kv_compact_remap_requests):
         src = code(fn)
-        for banned in ("synchronize", ".cpu(", ".item(", ".tolist(", ".any(", "_sync_device"):
+        for banned in ("synchronize", ".cpu(", ".item(", ".tolist(", ".any(", "_sync_device",
+                       "[~", ".nonzero(", "masked_select"):
             assert banned not in src, (fn.__name__, banned)
-    snap_src = inspect.getsource(KC._to_host)
-    assert "non_blocking=True" in snap_src and "pin_memory=True" in snap_src
+    assert "DeferredRead" in inspect.getsource(KC.Snapshot.__init__)
 
 
 def _tick_world(monkeypatch):
@@ -566,34 +567,43 @@ def _tick_world(monkeypatch):
     return alloc, tree, cop, n, sched, ms
 
 
-def test_a_snapshot_in_flight_defers_by_name_and_moves_in_a_later_pass(monkeypatch):
-    """Pass 1: the snapshot's event has not completed -> the vote's ready=0 -> deferred, no
-    memo, nothing surveyed or moved, no wait. Pass 2: landed, keys unchanged -> moved."""
-    alloc, tree, cop, n, sched, ms = _tick_world(monkeypatch)
-    ops = _RecOps(landed=False)
-    real = KC.Snapshot.__init__
+def test_a_snapshot_in_flight_defers_by_name_and_moves_in_a_later_pass(monkeypatch, caplog):
+    """Pass 1: the snapshot's DeferredRead has not landed -> the vote's ready=0 -> deferred,
+    named (B5), no memo, nothing surveyed or moved, no wait. Pass 2: landed, sources the
+    same objects -> moved."""
+    import logging
 
-    def init(self, *a, **kw):
-        kw["ops"] = ops
-        real(self, *a, **kw)
-    monkeypatch.setattr(KC.Snapshot, "__init__", init)
+    from flliper.srt.pdflip import d_row_fence as RF
+
+    caplog.set_level(logging.INFO)
+    alloc, tree, cop, n, sched, ms = _tick_world(monkeypatch)
+    landed = {"v": False}
+    monkeypatch.setattr(RF.DeferredRead, "ready", lambda self: landed["v"])
     fr = {}
     v0 = n.component_data[FULL].value
     assert dsv._kv_compact_for_shrink(sched, ms, fr, 0, True, 22 * P) is None
     assert fr["compact_deferred"] == 1 and "compact_refused" not in fr
     assert n.component_data[FULL].value is v0
-    ops.landed = True
+    lines = [m for m in caplog.messages if "verdict=deferred" in m]
+    assert lines and "in_a_row=1" in lines[0] and "snapshot_reissued_for=new" in lines[0], lines
+    landed["v"] = True
     got = dsv._kv_compact_for_shrink(sched, ms, fr, 0, False, 22 * P)
     assert got is not None and got <= 16 * P, got
     assert int((n.component_data[FULL].value // P).max()) <= 16
+    moved = [m for m in caplog.messages if "verdict=moved" in m]
+    assert moved and "host_waits_move=0" in moved[0] and "host_waits=0 " not in moved[0]
 
 
 def test_a_snapshot_whose_keys_changed_is_issued_anew(monkeypatch):
     alloc, tree, cop, n, sched, ms = _tick_world(monkeypatch)
     snap = KC.Snapshot(tree, alloc, P, (), None)
     assert snap.valid(tree, alloc, ())
+    assert snap.free.data_ptr() != alloc.free_pages.data_ptr()   # B3: a real copy on the desk
     _take(alloc, [3])                                         # an allocation since
-    assert not snap.valid(tree, alloc, ())
+    assert snap.changed(tree, alloc, ()) == "free"
+    snap2 = KC.Snapshot(tree, alloc, P, (), None)
+    alloc.free_pages = alloc.free_pages[:]                    # B2: a NEW tensor, same block
+    assert snap2.changed(tree, alloc, ()) == "free"
 
 
 # ---- A3: every holder of a request is re-pointed; overlap + spec v2 result path ---------------
@@ -653,3 +663,71 @@ def test_overlap_spec_v2_a_move_between_launch_and_result_frees_through_the_rows
     pages = alloc.free_pages.tolist()
     assert len(pages) == len(set(pages)), "a page was freed twice"
     assert set(pages) - set(free_before.tolist()) == set(tail)
+
+
+# ==== S112c: re-review nf-rereview-s112b-1020 (B7, B8) ==========================================
+
+def test_b7_a_row_copy_that_fails_midway_rolls_the_rows_back(monkeypatch):
+    """Two holders; the second row's copy raises: the first row is restored, the nodes and the free
+    lists are rolled back, the move is refused by name."""
+    alloc, tree, cop = _world()
+    x = _node(tree, alloc, [20, 21], P)
+    v = x.component_data[FULL].value.clone()
+    r1 = _req("a", 1, None, v, prefix=None)
+    r2 = _req("b", 2, None, v, prefix=None)
+    rtt = _rtt([torch.zeros(0), v, v], 64)
+    before = rtt.clone()
+    sched = types.SimpleNamespace(req_to_token_pool=types.SimpleNamespace(req_to_token=rtt),
+                                  running_batch=types.SimpleNamespace(reqs=[]), waiting_queue=[r1, r2],
+                                  chunked_req=None, last_batch=None)
+    plan, why = KC.plan_for(KC.survey(tree, alloc, P, B), B)
+    real = KC._remap_tensor
+    calls = {"n": 0}
+
+    def bad(t, P_, lut):
+        calls["n"] += 1
+        out = real(t, P_, lut)
+        return out[:-1] if calls["n"] == 3 else out          # node, row a, row b (bad shape)
+    monkeypatch.setattr(KC, "_remap_tensor", bad)
+    free0 = alloc.free_pages.clone()
+    with pytest.raises(KC.CompactRefused):
+        KC.execute(tree, alloc, plan, cop, remap_refs=dsv._kv_compact_remap_requests(sched, P))
+    assert torch.equal(rtt, before), "a row kept the new pages after the move was refused"
+    assert torch.equal(x.component_data[FULL].value, v) and torch.equal(alloc.free_pages, free0)
+
+
+def test_b8_no_move_inside_a_free_group():
+    alloc, tree, cop = _world()
+    _node(tree, alloc, [20, 21], P)
+    plan, why = KC.plan_for(KC.survey(tree, alloc, P, B), B)
+    alloc.is_not_in_free_group = False
+    with pytest.raises(KC.CompactRefused, match="free group"):
+        KC.execute_moves(tree, alloc, plan, cop)
+
+
+def test_b4_the_choice_counts_the_groups_min_size_so_both_ranks_pick_alike():
+    """Same head S on both ranks, TP0's one page longer (Form A leaf depth); T backed idle below the
+    boundary on both. Gap: TP0 4, worker 3 (group 4). Counted with the local size TP0 would take S
+    alone (4 fits) and the worker S and T -- two digests. With the group MIN (3) both take S and T."""
+    from test_s77_kv_compact_s9_hold_1019 import _key
+
+    head = list(range(7000, 7000 + 4 * P))
+    ranks = []
+    for rank in (0, 1):
+        alloc, tree, cop = _world()
+        _take(alloc, [p for p in range(1, 17) if p not in (5, 6, 7)])
+        t = _node(tree, alloc, [5, 6, 7], P)
+        t.key = _key(list(range(9000, 9000 + 3 * P)))
+        pages = [17, 18, 19, 20] if rank == 0 else [17, 18, 19]
+        s_ = _node(tree, alloc, pages, P)
+        s_.key = _key(head[:len(pages) * P])
+        ranks.append((alloc, tree))
+    vecs = []
+    for alloc, tree in ranks:
+        sv = KC.survey(tree, alloc, P, 16)
+        vecs.append((sv, dsv._kv_compact_vote(sv, None, 16, NP, [16])))
+    group = [min(c) for c in zip(*[v for _s, v in vecs])]
+    plans = [dsv._kv_compact_plans_from_vote(sv, group, 16, NP, [16])[0][0] for sv, _v in vecs]
+    assert all(p is not None for p in plans)
+    assert [len(p.evict_keys) for p in plans] == [2, 2]
+    assert KC.plan_digest(5, plans[0]) == KC.plan_digest(5, plans[1])

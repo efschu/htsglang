@@ -331,7 +331,7 @@ def test_a_tp0_peer_refusal_keeps_the_worker_on_s9(floor_env, monkeypatch, caplo
 # (TP0) vs ``aux_host_only:8`` (TP1/TP2) -- the host and the expert workers do not hold
 # the same host-side state. KV-COMPACT's ``backed`` reads exactly such state.
 
-from test_s77_kv_compact_s9_hold_1019 import MAMBA  # noqa: E402
+from test_s77_kv_compact_s9_hold_1019 import MAMBA, _key  # noqa: E402
 
 
 def _three_ranks(monkeypatch, *, host_backs_x):
@@ -612,11 +612,13 @@ def test_an_eviction_frees_pages_below_the_floor_alike_on_both_cuts(floor_env, m
         _take(alloc, list(range(1, S8_PAGE + 1)))                     # no room below S8
         low, high = list(range(6140, 6144)), list(range(6200, 6208))
         if name == "TP0":                                             # low: taken above
-            _node(tree, alloc, high, PG, backed=True).component_data[FULL].value = \
-                torch.cat([_tokens_of(low), _tokens_of(high)])
+            one = _node(tree, alloc, high, PG, backed=True)
+            one.component_data[FULL].value = torch.cat([_tokens_of(low), _tokens_of(high)])
+            one.key = _key(torch.cat([_tokens_of(low), _tokens_of(high)]).tolist())
         else:
             a = _node(tree, alloc, [], PG, backed=True)
             a.component_data[FULL].value = _tokens_of(low)
+            a.key = _key(_tokens_of(low).tolist())
             _node(tree, alloc, high, PG, backed=True, parent=a)
         sched = types.SimpleNamespace(token_to_kv_pool_allocator=alloc, page_size=PG,
                                       draft_worker=dw, tree_cache=tree)
@@ -690,10 +692,10 @@ def test_a_rank_whose_source_free_throws_still_enters_the_outcome_collective(
         ranks.append((name, sched))
     real_give_back = KC._give_back
 
-    def give_back(allocator, pages, ops):          # S112b: the sources go back host-informed
+    def give_back(allocator, pages):               # S112b: the sources go back host-informed
         if threading.current_thread().name == "TP1":
             raise RuntimeError("cudaErrorIllegalAddress (desk: TP1's source free)")
-        return real_give_back(allocator, pages, ops)
+        return real_give_back(allocator, pages)
     monkeypatch.setattr(KC, "_give_back", give_back)
     # the form helpers above patch kv_owner_block with their own rank's block; the
     # threads need each rank's own one at the same time

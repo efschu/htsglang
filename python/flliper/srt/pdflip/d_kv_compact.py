@@ -305,84 +305,52 @@ def _req_len(req: Any) -> int:
     return max(n, seq)
 
 
-# ---- S112b (review A2): the survey reads a HOST SNAPSHOT, issued without waiting -------------
+# ---- S112b/c: the survey reads a HOST SNAPSHOT, the move is ordered by events ---------------------
+#
+# S112c (re-review nf-rereview-s112b-1020, item 0): the stream handles, the E0/E1 fence and the deferred
+# D2H read are F3's (``pdflip.d_row_fence``: ``ops()``, ``RowFence``, ``DeferredRead``) -- one fence
+# implementation on the line. KV-COMPACT keeps only its own stream SET (the KV streams, not the expert
+# row streams ``RowFence.begin`` would take).
 
-class HostOps:
-    """The stream handles without CUDA (the CPU desk ranks): every event is complete at
-    once, the order degenerates to program order."""
-
-    def current_stream(self):
-        return None
-
-    def event(self):
-        return None
-
-    def record(self, ev, stream) -> None:
-        return None
-
-    def wait_event(self, stream, ev) -> None:
-        return None
-
-    def wait_stream(self, stream, other) -> None:
-        return None
-
-    def query(self, ev) -> bool:
-        return True
-
-    pinned = False
+_KV_STREAMS: List[Any] = []
 
 
-class CudaOps(HostOps):
-    """Device-side ordering only (F3 ROW-FENCE pattern, ``d_row_fence`` on rc28): the
-    host never waits on an event or a stream here."""
-
-    pinned = True
-
-    def current_stream(self):
-        import torch
-
-        return torch.cuda.current_stream()
-
-    def event(self):
-        import torch
-
-        return torch.cuda.Event()
-
-    def record(self, ev, stream) -> None:
-        ev.record(stream)
-
-    def wait_event(self, stream, ev) -> None:
-        if stream is not None:
-            stream.wait_event(ev)
-
-    def wait_stream(self, stream, other) -> None:
-        if stream is not None and other is not None:
-            stream.wait_stream(other)
-
-    def query(self, ev) -> bool:
-        return True if ev is None else bool(ev.query())
+def register_kv_stream(stream) -> None:
+    """S112c (B6): a stream that reads or writes KV pages (idempotent; None ignored). The move's fence
+    orders against every registered one besides the caller's explicit set."""
+    if stream is None:
+        return
+    for s in _KV_STREAMS:
+        if s is stream:
+            return
+    _KV_STREAMS.append(stream)
 
 
-def ops_for(tensor) -> HostOps:
-    dev = getattr(tensor, "device", None)
-    if dev is not None and getattr(dev, "type", "cpu") == "cuda":
-        return CudaOps()
-    return HostOps()
+def _rf():
+    from flliper.srt.pdflip import d_row_fence as RF
+
+    return RF
 
 
-def _to_host(t, ops: HostOps):
-    """A D2H copy into pinned host memory, non-blocking on CUDA (the caller reads it
-    only after its event completed); a plain view on the CPU."""
-    import torch
+def kv_fence_begin(streams: Sequence[Any]):
+    """E0 with an EXPLICIT stream set: the current stream waits (device side) on an event at the tail of
+    every KV stream; returns F3's ``RowFence`` (``close()`` = E1, those streams wait on the current one)."""
+    RF = _rf()
+    o = RF.ops()
+    cur = o.current_stream()
+    out: List[Any] = []
+    for s in list(streams) + list(_KV_STREAMS):
+        if s is None or RF._same(s, cur) or any(RF._same(s, x) for x in out):
+            continue
+        out.append(s)
+    for s in out:
+        ev = o.event()
+        o.record(ev, s)
+        o.wait(cur, ev)
+    return RF.RowFence(o, cur, out)
 
-    if getattr(t.device, "type", "cpu") != "cuda":
-        return t.detach().reshape(-1).to(torch.int64)
-    h = torch.empty(t.numel(), dtype=t.dtype, pin_memory=True)
-    h.copy_(t.detach().reshape(-1), non_blocking=True)
-    return h
 
-
-def _to_dev(vals: Sequence[int], device, ops: HostOps):
+def _to_dev(vals: Sequence[int], device):
     """Host ints onto ``device`` without a host wait (pinned, non-blocking H2D)."""
     import torch
 
@@ -392,83 +360,167 @@ def _to_dev(vals: Sequence[int], device, ops: HostOps):
     return t.to(device)
 
 
-def _tkey(t):
-    if t is None:
-        return None
-    try:
-        return (int(t.data_ptr()), int(t.numel()), int(t.storage_offset()))
-    except Exception:  # noqa: BLE001
-        return (id(t), int(getattr(t, "numel", lambda: 0)()))
+class SyncCount:
+    """S112c (B1): MEASURED host waits -- ``torch.cuda.set_sync_debug_mode('warn')`` around a block counts
+    every synchronizing call PyTorch reports there (``nonzero`` of a mask index, ``.item()``, a pageable
+    copy, ...). 0 without CUDA (nothing can wait there)."""
 
+    def __init__(self):
+        self.n = 0
+        self._prev = None
+        self._rec = None
+        self._cm = None
 
-def snapshot_keys(cache: Any, allocator: Any, running: Sequence[Any], page_size: int) -> tuple:
-    """Host-side identity of everything the survey reads (no device read): the free-list
-    tensors (pointer, length, offset -- an allocation or a free makes new ones), staged
-    frees, the caps, every device node's value tensor, the running rows' page counts. A
-    snapshot is valid exactly while these keys are unchanged."""
-    P = max(1, int(page_size))
-    full = int(_full_ct().FULL) if cache is not None and tree_why(cache) is None else 0
-    nodes = ()
-    if cache is not None and hasattr(cache, "_collect_all_nodes"):
-        root = getattr(cache, "root_node", None)
-        nodes = tuple((id(n), id(n.component_data[full].value), int(n.component_data[full].value.numel()))
-                      for n in cache._collect_all_nodes()
-                      if n is not root and n.component_data[full].value is not None)
-    caps = tuple((getattr(c, "cap", None), _tkey(getattr(c, "_withheld", None))) for c in cap_filters(allocator))
-    return (_tkey(getattr(allocator, "free_pages", None)), _tkey(getattr(allocator, "release_pages", None)),
-            tuple(_tkey(t) for t in (getattr(allocator, "free_group", None) or [])), caps, nodes,
-            tuple((id(r), int(r.req_pool_idx), -(-_req_len(r) // P)) for r in running))
+    def __enter__(self):
+        try:
+            import torch
+
+            if torch.cuda.is_available() and torch.cuda.is_initialized():
+                import warnings
+
+                self._prev = torch.cuda.get_sync_debug_mode()
+                self._cm = warnings.catch_warnings(record=True)
+                self._rec = self._cm.__enter__()
+                warnings.simplefilter("always")
+                torch.cuda.set_sync_debug_mode("warn")
+        except Exception:  # noqa: BLE001 -- an instrument never fails the move
+            self._prev = None
+        return self
+
+    def __exit__(self, *exc):
+        if self._prev is not None:
+            import torch
+
+            torch.cuda.set_sync_debug_mode(self._prev)
+            self.n = sum(1 for w in (self._rec or []) if "synchroniz" in str(w.message).lower())
+            self._cm.__exit__(*exc)
+        return False
 
 
 class Snapshot:
-    """S112b (review A2): the survey's inputs copied device -> pinned host memory,
-    NON-BLOCKING, behind one event on the current stream. Issued in one pass, read in a
-    later one once the event completed (``ready``: a query, never a wait) and only while
-    the host-side keys still match (``valid``). The scheduler thread never waits for the
-    forward in flight to read a free list, a node value or a running row."""
+    """S112b/c: the survey's inputs read device -> host by F3's ``DeferredRead`` (pinned, non-blocking, on
+    a side stream behind an event of the current stream; on a CPU desk rank a real CLONE, B3). Issued in
+    one pass, read in a later one once landed (``ready``: a query, never a wait), and only while every
+    source is still the SAME OBJECT (``valid``, B2): the snapshot HOLDS the free-list tensors, the staged
+    frees, each cap's withheld tensor and cap, every device node with its value tensor and every running
+    request with its row's page count -- an identity check, so a block the caching allocator handed to a
+    new tensor (same pointer, length, offset) is never mistaken for the old one."""
 
     def __init__(self, cache: Any, allocator: Any, page_size: int, running: Sequence[Any] = (),
-                 req_to_token: Any = None, ops: Optional[HostOps] = None):
-        import torch
-
+                 req_to_token: Any = None):
+        RF = _rf()
         self.P = max(1, int(page_size))
-        fp = getattr(allocator, "free_pages", None)
-        self.ops = ops if ops is not None else ops_for(fp)
-        self.running = [r for r in (running or ()) if getattr(r, "req_pool_idx", None) is not None]
-        self.keys = snapshot_keys(cache, allocator, self.running, self.P)
         self.t0 = time.perf_counter()
-        empty = torch.empty(0, dtype=torch.int64)
-        self.free = _to_host(fp, self.ops) if fp is not None and fp.numel() else empty
-        rp = getattr(allocator, "release_pages", None)
-        self.release = _to_host(rp, self.ops) if rp is not None and rp.numel() else empty
-        self.group = [_to_host(t, self.ops) for t in (getattr(allocator, "free_group", None) or [])
-                      if t is not None and t.numel()]
-        self.values: Dict[int, Any] = {}
+        self.running = [r for r in (running or ()) if getattr(r, "req_pool_idx", None) is not None]
+        self.src_free = getattr(allocator, "free_pages", None)
+        self.src_release = getattr(allocator, "release_pages", None)
+        self.src_group = list(getattr(allocator, "free_group", None) or [])
+        self.src_caps = [(c, getattr(c, "cap", None), getattr(c, "_withheld", None)) for c in cap_filters(allocator)]
+        self.src_nodes: List[Tuple[Any, Any]] = []
         if cache is not None and tree_why(cache) is None:
             full = int(_full_ct().FULL)
             root = getattr(cache, "root_node", None)
             for n in cache._collect_all_nodes():
                 v = None if n is root else n.component_data[full].value
-                if v is not None and v.numel():
-                    self.values[id(n)] = _to_host(v, self.ops)
-        self.rows: Dict[int, Any] = {}
+                if v is not None:
+                    self.src_nodes.append((n, v))
+        self.src_rows = [(r, int(r.req_pool_idx), -(-_req_len(r) // self.P)) for r in self.running]
+        tensors, self._lay = [], []
+
+        def put(tag, t):
+            if t is not None and getattr(t, "numel", lambda: 0)():
+                self._lay.append(tag)
+                tensors.append(t.detach().reshape(-1))
+
+        put(("free",), self.src_free)
+        put(("release",), self.src_release)
+        for i, t in enumerate(self.src_group):
+            put(("group", i), t)
+        for n, v in self.src_nodes:
+            put(("node", id(n)), v)
         if req_to_token is not None:
-            for r in self.running:
+            for r, idx, _pc in self.src_rows:
                 m = min(_req_len(r), int(req_to_token.shape[1]))
                 if m > 0:
-                    row = req_to_token[int(r.req_pool_idx), :m]
-                    self.rows[id(r)] = _to_host(row.clone() if row.device.type == "cuda" else row, self.ops)
-        self.event = self.ops.event()
-        self.ops.record(self.event, self.ops.current_stream())
+                    put(("row", id(r)), req_to_token[idx, :m])
+        self.read = RF.DeferredRead(tensors) if tensors else None
         self.issue_ms = (time.perf_counter() - self.t0) * 1000.0
         self.passes = 0
+        self._host = None
 
     def ready(self) -> bool:
-        return bool(self.ops.query(self.event))
+        return self.read is None or bool(self.read.ready())
+
+    def _materialize(self) -> None:
+        import torch
+
+        if self._host is not None:
+            return
+        got = self.read.get() if self.read is not None else []
+        if got is None:
+            raise RuntimeError("KV-COMPACT snapshot read before it landed")
+        self._host = {}
+        for tag, h in zip(self._lay, got):
+            self._host[tag] = h.to(torch.int64)
+
+    def _get(self, tag):
+        import torch
+
+        self._materialize()
+        return self._host.get(tag, torch.empty(0, dtype=torch.int64))
+
+    @property
+    def free(self):
+        return self._get(("free",))
+
+    @property
+    def release(self):
+        return self._get(("release",))
+
+    @property
+    def group(self):
+        return [self._get(("group", i)) for i in range(len(self.src_group))]
+
+    def value(self, node):
+        return self._get(("node", id(node)))
+
+    def row(self, req):
+        tag = ("row", id(req))
+        self._materialize()
+        return self._host.get(tag)
+
+    def changed(self, cache: Any, allocator: Any, running: Sequence[Any]) -> Optional[str]:
+        """None while every source is the same object; else WHICH part changed (B5: named in the
+        deferral line): free / release / group / caps / nodes / running."""
+        if getattr(allocator, "free_pages", None) is not self.src_free:
+            return "free"
+        if getattr(allocator, "release_pages", None) is not self.src_release:
+            return "release"
+        g = list(getattr(allocator, "free_group", None) or [])
+        if len(g) != len(self.src_group) or any(a is not b for a, b in zip(g, self.src_group)):
+            return "group"
+        caps = cap_filters(allocator)
+        if len(caps) != len(self.src_caps) or any(
+                c is not c0 or getattr(c, "cap", None) != cap0 or getattr(c, "_withheld", None) is not w0
+                for c, (c0, cap0, w0) in zip(caps, self.src_caps)):
+            return "caps"
+        if cache is not None and tree_why(cache) is None:
+            full = int(_full_ct().FULL)
+            root = getattr(cache, "root_node", None)
+            now = [(n, n.component_data[full].value) for n in cache._collect_all_nodes()
+                   if n is not root and n.component_data[full].value is not None]
+            if len(now) != len(self.src_nodes) or any(
+                    a is not c or v is not w for (a, v), (c, w) in zip(now, self.src_nodes)):
+                return "nodes"
+        run = [r for r in (running or ()) if getattr(r, "req_pool_idx", None) is not None]
+        if len(run) != len(self.src_rows) or any(
+                r is not r0 or int(r.req_pool_idx) != i0 or -(-_req_len(r) // self.P) != pc0
+                for r, (r0, i0, pc0) in zip(run, self.src_rows)):
+            return "running"
+        return None
 
     def valid(self, cache: Any, allocator: Any, running: Sequence[Any]) -> bool:
-        run = [r for r in (running or ()) if getattr(r, "req_pool_idx", None) is not None]
-        return snapshot_keys(cache, allocator, run, self.P) == self.keys
+        return self.changed(cache, allocator, running) is None
 
 
 def _content_state(node: Any, parent_state: Any, root: Any):
@@ -519,12 +571,55 @@ def _root_state(cache: Any, extra_key: Any = None):
     return (st, 0)
 
 
+def content_key_of_tokens(tokens: Sequence[int], page_size: int, extra_key: Any = None) -> int:
+    """The head key (``_head_key``) of a segment whose head is a child of the root holding ``tokens``
+    (tests, probes)."""
+    from array import array
+    from types import SimpleNamespace
+
+    node = SimpleNamespace(key=SimpleNamespace(token_ids=array("q", [int(t) for t in tokens]),
+                                               extra_key=extra_key, is_bigram=False, limit=None),
+                           parent=None)
+    return _head_key(_root_state(None, extra_key), node, None, page_size)
+
+
 def _seg_key(bottom_state, top_depth: int, tokens: int) -> int:
     import hashlib
 
     h = hashlib.blake2b(digest_size=8)
     h.update(bottom_state.digest())
     h.update(repr((int(top_depth), int(tokens))).encode())
+    return int.from_bytes(h.digest(), "big") >> 2
+
+
+def _head_key(parent_state, node: Any, root: Any, page_size: int) -> int:
+    """S112c (B4): a segment is keyed at its HEAD -- the path state up to its first node plus that
+    node's first page of tokens and the start depth. Under Form A the same session ends at different
+    depths per rank (rc27 n=64: anchor depth 90880 on TP0, 90624 on the workers); a key at the bottom
+    made the whole branch unagreeable ("no evictable unit left"), the head is the same on every rank.
+    -1 without a readable key (fail-closed: never evicted)."""
+    import hashlib
+
+    key = getattr(node, "key", None)
+    toks = getattr(key, "token_ids", None)
+    if toks is None or parent_state is None:
+        return -1
+    start = 1 if (getattr(key, "is_bigram", False) and getattr(node, "parent", None) is not root) else 0
+    n = len(toks)
+    lim = getattr(key, "limit", None)
+    if lim is not None and lim < n:
+        n = int(lim)
+    end = min(n, start + max(1, int(page_size)))
+    try:
+        raw = memoryview(toks)[start:end].tobytes()
+    except TypeError:
+        from array import array
+
+        raw = array("q", [int(x) for x in list(toks)[start:end]]).tobytes()
+    h = hashlib.blake2b(digest_size=8)
+    h.update(parent_state[0].digest())
+    h.update(raw)
+    h.update(repr(int(parent_state[1])).encode())
     return int.from_bytes(h.digest(), "big") >> 2
 
 
@@ -559,6 +654,11 @@ def segments(cache: Any, nodes: List[NodePages], page_size: int) -> List[Segment
         states[id(nd)] = _content_state(nd, ps, root)
         order.append(nd)
         stack.extend(dkids(nd))
+    pstates: Dict[int, Any] = {}
+    for nd in order:
+        par = nd.parent
+        pstates[id(nd)] = (_root_state(cache, getattr(getattr(nd, "key", None), "extra_key", None))
+                           if par is root else states.get(id(par)))
     for nd in order:
         np_ = by_node[id(nd)]
         par = nd.parent
@@ -576,7 +676,7 @@ def segments(cache: Any, nodes: List[NodePages], page_size: int) -> List[Segment
         pages = sorted({int(p) for m in chain for p in m.pages})
         toks = sum(int(m.node.component_data[full].value.numel()) for m in chain)
         evict = bool(ev(np_) and bot is not None and all(states.get(id(m.node)) is not None for m in chain))
-        key = _seg_key(bot[0], bot[1] - toks, toks) if bot is not None else -1
+        key = _head_key(pstates.get(id(nd)), nd, root, P) if bot is not None else -1
         seg = Segment(nodes=chain, key=key, tokens=toks, pages=pages, evictable=evict)
         out.append(seg)
         seg_of[id(chain[0].node)] = seg
@@ -657,7 +757,8 @@ def survey(cache: Any, allocator: Any, page_size: int, floor_page: int = 0, *,
             continue
         v = node.component_data[full].value
         if v is not None and v.numel():
-            hv = snap.values.get(id(node)) if snap is not None else _id_tensor(v)
+            hv = (snap.value(node) if ("node", id(node)) in snap._lay else None) if snap is not None \
+                else _id_tensor(v)
             if hv is None:
                 return _mk({}, [], why="node %s not in the snapshot" % getattr(node, "id", "?"))
             rows.append((node, hv.to(torch.int64)))
@@ -722,7 +823,7 @@ def survey(cache: Any, allocator: Any, page_size: int, floor_page: int = 0, *,
         seen = set()
         for r in running:
             if snap is not None:
-                hrow = snap.rows.get(id(r))
+                hrow = snap.row(r)
             else:
                 m = min(_req_len(r), int(req_to_token.shape[1]))
                 hrow = _id_tensor(req_to_token[int(r.req_pool_idx), :m]) if m > 0 else None
@@ -769,6 +870,18 @@ def local_bitmap(s: Survey) -> List[int]:
     return out
 
 
+def local_sizes(s: Survey) -> List[int]:
+    """S112c (B4): per content slot this rank's segment size (pages; the smallest when two share a
+    slot). The group MIN is the size the choice counts on every rank -- each rank frees at least that
+    much (its own segment is never smaller), so the agreed choice closes every rank's gap."""
+    out = [0] * BITMAP
+    for seg in s.segments:
+        if seg.evictable and seg.key >= 0:
+            i = seg.key % BITMAP
+            out[i] = seg.size if out[i] == 0 else min(out[i], seg.size)
+    return out
+
+
 @dataclass
 class Agreement:
     """S112b: what the GROUP agreed in the vote -- the content map of segments evictable
@@ -776,11 +889,18 @@ class Agreement:
 
     bitmap: Optional[Sequence[int]] = None      # None: this rank's own (single-rank form)
     gaps: Dict[int, int] = field(default_factory=dict)
+    #: S112c (B4): per slot the group MIN of the segment sizes (None: the local size)
+    sizes: Optional[Sequence[int]] = None
 
     def agreed(self, seg: Segment) -> bool:
         if not seg.evictable or seg.key < 0:
             return False
         return True if self.bitmap is None else int(self.bitmap[seg.key % BITMAP]) >= 1
+
+    def size(self, seg: Segment) -> int:
+        if self.sizes is None:
+            return seg.size
+        return max(0, int(self.sizes[seg.key % BITMAP]))
 
 
 def local_gap(s: Survey, boundary_page: int) -> int:
@@ -802,14 +922,21 @@ def choose_evictions(s: Survey, ag: Agreement, gap: int) -> Tuple[Optional[List[
     while rest > 0:
         avail = [g for g in s.segments if id(g) not in done and ag.agreed(g)
                  and all(id(c) in done for c in g.children)]
+        sz = {id(g): ag.size(g) for g in avail}
+        avail = [g for g in avail if sz[id(g)] > 0]
         if not avail:
+            if chosen:
+                # S112c (B4): the agreed sizes are the group MIN -- a rank whose segment is longer
+                # (Form A: TP0's leaf deeper) frees more; whether its room now suffices is its own
+                # check in plan_for, and the plan check's MIN makes that verdict the group's
+                return chosen, ""
             return None, "no evictable unit left (agreed backed idle content) for %d pages" % rest
-        fits = [g for g in avail if g.size >= rest]
-        pick = (min(fits, key=lambda g: (g.size, g.key)) if fits
-                else max(avail, key=lambda g: (g.size, -g.key)))
+        fits = [g for g in avail if sz[id(g)] >= rest]
+        pick = (min(fits, key=lambda g: (sz[id(g)], g.key)) if fits
+                else max(avail, key=lambda g: (sz[id(g)], -g.key)))
         chosen.append(pick)
         done.add(id(pick))
-        rest -= pick.size
+        rest -= sz[id(pick)]
     return chosen, ""
 
 
@@ -892,57 +1019,55 @@ def plan_digest(stage: int, plan: Plan) -> int:
 
 # ---- S112b (review A2): the move, ordered by events, never a host wait -----------------------
 
-def fence_begin(ops: HostOps, streams: Sequence[Any]) -> Any:
-    """E0: the current stream waits (device side) on the tail of every stream that may
-    still read or write a KV page -- the forward in flight, the HiCache write and load
-    streams. The host does not wait."""
-    cur = ops.current_stream()
-    for st in streams:
-        if st is not None and st is not cur:
-            ops.wait_stream(cur, st)
-    return cur
+def _take_counts(snap: Optional["Snapshot"], allocator: Any, pages: Sequence[int],
+                 evicted: Sequence[int]) -> Dict[str, int]:
+    """S112c (B1): how many of ``pages`` each free list holds -- known on the HOST: from the snapshot's
+    host copy (exact, its sources unchanged, B2) plus the pages this pass's evictions handed back (they
+    land in ``release_pages`` under ``need_sort``, else ``free_pages``). Without a snapshot (the CPU
+    desk) from the live host lists."""
+    want = {int(p) for p in pages}
+    if snap is not None:
+        lists = {"free_pages": set(int(x) for x in snap.free.tolist()),
+                 "release_pages": set(int(x) for x in snap.release.tolist())}
+    else:
+        lists = {nm: set(int(x) for x in _id_tensor(getattr(allocator, nm, None)).tolist())
+                 for nm in ("free_pages", "release_pages")}
+    ev_list = "release_pages" if getattr(allocator, "need_sort", False) else "free_pages"
+    lists[ev_list] |= {int(p) for p in evicted}
+    return {nm: len(want & ids) for nm, ids in lists.items()}
 
 
-def fence_close(ops: HostOps, cur: Any, streams: Sequence[Any]) -> Any:
-    """E1: one event after the copy and the re-points; every KV stream waits on it
-    (device side): a later kernel reads the new pages, and a freed source is rewritten
-    only after the copy read it."""
-    ev = ops.event()
-    ops.record(ev, cur)
-    for st in streams:
-        if st is not None and st is not cur:
-            ops.wait_event(st, ev)
-    return ev
-
-
-def _take_pages(allocator: Any, pages: Sequence[int], ops: HostOps) -> bool:
-    """Take ``pages`` out of the free lists. On the device: device ops only, no host
-    read -- the caller proved them free (the snapshot, still valid in this pass). On a
-    host list (the CPU desk) the presence is checked: all of them, or none."""
+def _take_pages(allocator: Any, pages: Sequence[int], counts: Optional[Dict[str, int]] = None) -> bool:
+    """Take ``pages`` out of the free lists. S112c (B1): no boolean-mask index on the device (that is a
+    ``nonzero``: the host waits for the current stream, which waits on the forward in flight). Each list
+    is reordered by a STABLE argsort of its hit mask (the kept ids first, in their order) and cut at the
+    length the host knows (``numel - counts[list]``, ``_take_counts``) -- an int-index gather, no host
+    read. On host lists (the CPU desk) the hits are counted and checked: all of them, or none."""
     import torch
 
-    found = 0
-    out = {}
-    host = True
+    out, found = {}, 0
     for name in ("free_pages", "release_pages"):
         t = getattr(allocator, name, None)
         if t is None or not t.numel():
             continue
-        want = _to_dev(pages, t.device, ops)
-        hit = torch.isin(t, want)
-        out[name] = t[~hit]
+        hit = torch.isin(t, _to_dev(pages, t.device))
         if t.device.type == "cuda":
-            host = False
+            k = int((counts or {}).get(name, 0))
         else:
-            found += int(hit.sum())
-    if host and found != len(set(int(p) for p in pages)):
+            k = int(hit.sum())
+            if counts is not None and k != int(counts.get(name, 0)):
+                return False
+        found += k
+        order = torch.argsort(hit.to(torch.int8), stable=True)
+        out[name] = t.index_select(0, order[:int(t.numel()) - k])
+    if found != len({int(p) for p in pages}):
         return False
     for name, t in out.items():
         setattr(allocator, name, t)
     return True
 
 
-def _give_back(allocator: Any, pages: Sequence[int], ops: HostOps) -> None:
+def _give_back(allocator: Any, pages: Sequence[int]) -> None:
     """Hand ``pages`` back, host-informed: the ids are known on the host, so the cap
     filters' share (ids above their cap: withheld, KvRowCap's ``_apply``) is booked on
     the host and the rest goes to the free list by a device cat -- no ``.any()`` /
@@ -951,11 +1076,6 @@ def _give_back(allocator: Any, pages: Sequence[int], ops: HostOps) -> None:
 
     keep = sorted({int(p) for p in pages})
     if not keep:
-        return
-    if not getattr(allocator, "is_not_in_free_group", True):
-        P = int(getattr(allocator, "page_size", 1) or 1)
-        allocator.free(_to_dev([p * P + o for p in keep for o in range(P)],
-                               allocator.free_pages.device, ops))
         return
     for cap in cap_filters(allocator):
         c = getattr(cap, "cap", None)
@@ -976,7 +1096,7 @@ def _give_back(allocator: Any, pages: Sequence[int], ops: HostOps) -> None:
         return
     name = "release_pages" if getattr(allocator, "need_sort", False) else "free_pages"
     cur = getattr(allocator, name)
-    setattr(allocator, name, torch.cat((_to_dev(keep, cur.device, ops), cur)))
+    setattr(allocator, name, torch.cat((_to_dev(keep, cur.device), cur)))
     touch = getattr(allocator, "_owner_placement_touch", None)
     if getattr(allocator, "_owner_placement", None) is not None and callable(touch):
         touch()
@@ -995,7 +1115,7 @@ def _remap_tensor(t, P: int, lut):
     return out.to(t.dtype)
 
 
-def lut_for(pairs: Dict[int, int], device, ops: HostOps):
+def lut_for(pairs: Dict[int, int], device):
     import torch
 
     hi = max(max(pairs), max(pairs.values()))
@@ -1007,37 +1127,35 @@ def lut_for(pairs: Dict[int, int], device, ops: HostOps):
 
 
 def execute_moves(cache: Any, allocator: Any, plan: Plan, copier: Any, *, remap_refs=None,
-                  ops: Optional[HostOps] = None, streams: Sequence[Any] = (), sync=None,
-                  check=None) -> Result:
+                  streams: Sequence[Any] = (), sync=None, check=None,
+                  counts: Optional[Dict[str, int]] = None) -> Result:
     """The MOVES of the plan on this rank: claim the destinations, E0, copy, re-point the
     nodes and the request references, E1, free the sources. Raises CompactRefused (named)
     with everything rolled back.
 
-    S112b (review A2): no host wait. The destinations are known free (the snapshot,
-    still valid), so the claim is a device op; E0 orders the copy after every kernel the
-    forward in flight and the HiCache streams enqueued (device side), E1 orders every
-    later kernel of those streams after the copy and the re-points; the next forward
-    waits on the schedule stream anyway (``run_batch``). The sources go back host-
-    informed (``_give_back``). ``sync`` is accepted for old callers and ignored."""
+    No host wait (S112b/c): the destinations are known free (the snapshot, valid by identity
+    in this pass), the claim is a stable-argsort gather to a host-known length (B1); E0/E1
+    are F3's ``RowFence`` over the KV streams (``kv_fence_begin``); the next forward waits on
+    the schedule stream anyway (``run_batch``). The sources go back host-informed
+    (``_give_back``). ``sync`` is accepted for old callers and ignored."""
     t0 = time.perf_counter()
     P = int(copier.page_size)
     full = _full_ct().FULL
-    fp = getattr(allocator, "free_pages", None)
-    ops = ops if ops is not None else ops_for(fp)
-    dev = getattr(fp, "device", "cpu")
     if not plan.moves:
         return Result(moved_nodes=0, moved_pages=0, evicted_nodes=0, evicted_tokens=0, bytes=0,
                       ms=(time.perf_counter() - t0) * 1000.0)
-    src_all = [p for _m, s, _d in plan.moves for p in s]
-    dst_all = [p for _m, _s, d in plan.moves for p in d]
-    pairs = dict(zip(src_all, dst_all))
+    if not getattr(allocator, "is_not_in_free_group", True):
+        raise CompactRefused("inside a free group: freed pages are staged, not free -- no move (B8)")
     if check is not None and not check():
         raise CompactRefused("the survey snapshot no longer holds (an allocation or a tree "
                              "change since): nothing moved")
+    src_all = [p for _m, s, _d in plan.moves for p in s]
+    dst_all = [p for _m, _s, d in plan.moves for p in d]
+    pairs = dict(zip(src_all, dst_all))
     saved = (getattr(allocator, "free_pages", None), getattr(allocator, "release_pages", None))
-    if not _take_pages(allocator, dst_all, ops):
+    if not _take_pages(allocator, dst_all, counts):
         raise CompactRefused("destination pages %s.. not all free" % dst_all[:8])
-    cur = fence_begin(ops, streams)
+    fence = kv_fence_begin(streams)
     try:
         nbytes = copier.copy(src_all, dst_all)
     except Exception as exc:  # noqa: BLE001 -- nothing re-pointed yet: the lists go back
@@ -1055,7 +1173,7 @@ def execute_moves(cache: Any, allocator: Any, plan: Plan, copier: Any, *, remap_
             orig = cd.value
             d = orig.device
             if d not in luts:
-                luts[d] = lut_for(pairs, d, ops)
+                luts[d] = lut_for(pairs, d)
             cd.value = _remap_tensor(orig, P, luts[d]).reshape(orig.shape)
             done.append((cd, orig))
         if remap_refs is not None:
@@ -1067,8 +1185,8 @@ def execute_moves(cache: Any, allocator: Any, plan: Plan, copier: Any, *, remap_
         raise CompactRefused("repoint failed after %d of %d nodes (rolled back, destinations "
                              "freed): %s: %s" % (len(done), len(plan.moves), type(exc).__name__,
                                                  exc)) from exc
-    fence_close(ops, cur, streams)
-    _give_back(allocator, src_all, ops)
+    fence.close()
+    _give_back(allocator, src_all)
     return Result(moved_nodes=len(plan.moves), moved_pages=plan.moved_pages, evicted_nodes=0,
                   evicted_tokens=0, bytes=int(nbytes), ms=(time.perf_counter() - t0) * 1000.0,
                   remapped_rows=remapped)
@@ -1091,11 +1209,11 @@ def execute_evicts(cache: Any, plan: Plan) -> Tuple[int, int]:
 
 
 def execute(cache: Any, allocator: Any, plan: Plan, copier: Any, *, sync=None,
-            remap_refs=None, ops: Optional[HostOps] = None, streams: Sequence[Any] = ()) -> Result:
+            remap_refs=None, streams: Sequence[Any] = ()) -> Result:
     """Single-rank form (tests, no group): the agreed evictions first (``evict_first``),
     then the moves; the group path keeps a collective between the two. An eviction is
     never a loss: only backed nodes go, their host copy stays."""
     ev = execute_evicts(cache, plan) if plan.evict_first else (0, 0)
-    res = execute_moves(cache, allocator, plan, copier, remap_refs=remap_refs, ops=ops, streams=streams)
+    res = execute_moves(cache, allocator, plan, copier, remap_refs=remap_refs, streams=streams)
     res.evicted_nodes, res.evicted_tokens = ev
     return res
