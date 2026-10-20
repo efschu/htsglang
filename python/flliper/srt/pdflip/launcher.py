@@ -23225,21 +23225,6 @@ def build_parser() -> argparse.ArgumentParser:
                          "nextflash = P PP3 + D Form A, uneven-DCP env per group, no DCP flag half.")
     # PDFLIP-FORM: --form-arch/--form-experts/--form-draft/--form-p-draft/--form-kv
     pdflip_form.add_form_arguments(ap)
-    # DUAL-TP3PP3 (27B line, 03.10.): the two dual forms. The NF release ships no
-    # dual LAYOUT, but the 27B release profiles carry these flags in their argv
-    # and :func:`topology_context` / :func:`apply_bar1_windows` read both off the
-    # namespace (getattr default False); without the flags defined here a 27B
-    # dual argv could not even PARSE on this tree (argparse exit 2, HW-PORT
-    # 1449). store_true, default False: the standard single-group N = 3 form is
-    # byte-identical.
-    ap.add_argument("--dual-layout", action="store_true",
-                    help="27B line: run groups P and D on the SAME cards at once "
-                         "(dual layout); the BAR1 windows derive from the dual plan. "
-                         "Accepted here so a 27B profile argv parses; absent = single group.")
-    ap.add_argument("--dual-share", action="store_true",
-                    help="27B line: the dual shares one KV budget across both groups "
-                         "(the front loans KV between P and D). Same acceptance as "
-                         "--dual-layout; absent = single group.")
     ap.add_argument(
         "--tokenizer-path", default="",
         help="27B line G2: the tokenizer directory BOTH groups load "
@@ -23955,13 +23940,6 @@ def build_parser() -> argparse.ArgumentParser:
              "graphs captured), so gen-2 collections no longer walk the boot objects (NF "
              "13.10.: 4.4-5.4 s PP0/PP1 collections inside flips). 'off' (default) = no env "
              "from this flag; the profile rows (qwen27b, nextflash) turn the switch on for P and D by default "
-             "(--env-p/--env-d FLLIPER_PDFLIP_GC_FREEZE=0 = off there).")
-    ap.add_argument(
-        "--p-gc-freeze", choices=["off", "on"], default=P_GC_FREEZE_DEFAULT,
-        help="Group P: 'on' = every P scheduler calls gc.freeze() once after boot (all CUDA "
-             "graphs captured), so gen-2 collections no longer walk the boot objects (NF "
-             "13.10.: 4.4-5.4 s PP0/PP1 collections inside flips). 'off' (default) = no env "
-             "from this flag; the nextflash profile turns the switch on for P and D by default "
              "(--env-p/--env-d FLLIPER_PDFLIP_GC_FREEZE=0 = off there).")
     ap.add_argument(
         "--d-reshard-presets", default="auto", metavar="SPEC",
