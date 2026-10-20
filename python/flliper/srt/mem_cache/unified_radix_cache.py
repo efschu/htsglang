@@ -5517,9 +5517,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         adopted = int(getattr(insert_result, "anchor_adopted_tokens", 0) or 0)
         return max(0, int(insert_result.prefix_len) - adopted)
 
-    def _pdflip_anchor_only_candidate(self, node: UnifiedTreeNode) -> bool:
+    def _pdflip_anchor_only_candidate(self, node: UnifiedTreeNode, kv_on_device: bool = False) -> bool:
         """ANCHOR-ONLY BACKUP: a node whose KV is backed (host copy or store)
-        and whose Mamba anchor is on the device only, with nothing in flight."""
+        and whose Mamba anchor is on the device only, with nothing in flight.
+
+        ``kv_on_device`` (S90b, the K15 eviction save only): the node's KV is
+        on the device only (neither ``backuped`` nor ``l3_present``) and its
+        FULL backup was refused by the KV arena -- the anchor alone still goes
+        into its mamba arena slot (detached: keyed by the last page hash, not
+        in the tree), see :meth:`pdflip_save_anchor_before_tombstone`."""
         if not envs.FLLIPER_PDFLIP_ANCHOR_ONLY_BACKUP.get():
             return False
         if node is self.root_node or node.evicted:
@@ -5527,7 +5533,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if getattr(node, "pdflip_park_anchor_dropped", False):
             return False    # PARK-END-ANCHOR-FIRST: given up on purpose, not retried
         if not (node.backuped or node.l3_present):
-            return False
+            if not kv_on_device:
+                return False
+            # S90b: the KV must really be on the device (the key the slot is
+            # filed under is that KV's last page hash)
+            _full = node.component_data[BASE_COMPONENT_TYPE]
+            if getattr(_full, "value", None) is None:
+                return False
         if node.write_through_pending_id is not None:
             return False
         if self._pdflip_anchor_secured_holds(node):
@@ -5576,7 +5588,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
         return False
 
-    def write_backup_anchor_only(self, node: UnifiedTreeNode) -> int:
+    def write_backup_anchor_only(self, node: UnifiedTreeNode, kv_on_device: bool = False) -> int:
         """ANCHOR-ONLY BACKUP (NF y5a 30.09.): copy ONLY the node's Mamba anchor
         D->H into the Mamba arena -- the KV is already backed (``backuped`` or
         ``l3_present``), so no KV row is claimed or copied.
@@ -5586,8 +5598,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         and tracked like a write-through (``ongoing_write_through``), and its
         ack completes the anchor's arena slot only
         (``_pdflip_direct_complete``); the arena later writes it to L3 before its
-        slot is freed (#257). Returns 1 when issued, 0 when not (named)."""
-        if self.cache_controller is None or not self._pdflip_anchor_only_candidate(node):
+        slot is freed (#257). Returns 1 when issued, 0 when not (named).
+
+        ``kv_on_device`` (S90b): see :meth:`_pdflip_anchor_only_candidate` --
+        the write is detached (the node has no Full host copy), the slot carries
+        the anchor to L3, the publish sweep the KV."""
+        if self.cache_controller is None or not self._pdflip_anchor_only_candidate(
+                node, kv_on_device=kv_on_device):
             return 0
         mp = self._pdflip_mamba_pool()
         if mp is None:
@@ -5646,7 +5663,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 "PDFLIP ANCHOR-ONLY-BACKUP n=%d node=%s depth=%d kv=%s (the KV is backed; only the "
                 "device Mamba anchor is copied into the arena -- no flush drops it; %s)",
                 n, node.id, self.pdflip_node_depth(node),
-                "host" if node.backuped else "store",
+                "host" if node.backuped else ("store" if node.l3_present else "device"),
                 "tree host value" if node.backuped else "arena slot only, not in the tree: Full has no host copy",
             )
         return 1
@@ -6075,6 +6092,160 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         tried.add(depth)
         return self._pdflip_aor_read_attach(req, mp, backend, depth, 0, site=site)
 
+    def pdflip_follower_state_at_told(self, req, told: int, site: str = "follower_told") -> int:
+        """S90b FOLLOWER-STATE-AT-TOLD (NF rc16 bf9ca46f45, P PP2 09:13:10, pdflip-1-23): PP0 told 19200;
+        PP2's device KV reached 47808 but its recurrent states there had been tombstoned (state only at
+        3072): ``#1400 OVER-UNRESUMABLE told=19200 own=47808 resumable_at_told=3072``, the ack named 3072 and
+        PF floored EVERY rank to 3072 (16128 tokens recomputed) -- while the anchor of 19200 sat COMPLETE in
+        its mamba arena slot (``S25 ANCHOR-SECURED-HELD node=54 depth=19200``).
+
+        The follower now reads THAT anchor from the store (arena slot in place, L3 fill or the ANCHOR-BYPASS
+        staging row -- the e1 read, keyed by the node's last page hash) and attaches it to its node at
+        exactly ``told``: as the node's HOST value when the node's KV has a host copy (e1 /
+        :meth:`pdflip_anchor_only_read_at`, AUX-HOST-LAW kept), else -- the KV on the device only -- straight
+        into a DEVICE mamba slot (the load-back's own per-layer copy, joined before the read row goes), so no
+        host state ever sits on a node without a Full host copy. Nothing is decided here: PP0's told is the
+        one verdict (SOLL R11); the follower only materialises the state that verdict names, and its ack
+        says whether it could. No collective. One read per depth per request. Returns ``told`` on an
+        attach, 0 otherwise (named). ``FLLIPER_PDFLIP_FOLLOWER_STATE_AT_TOLD=0``: off."""
+        if not envs.FLLIPER_PDFLIP_FOLLOWER_STATE_AT_TOLD.get():
+            return 0
+        told = int(told)
+        if told < int(self.page_size) or told % int(self.page_size):
+            return self._s90b_follower_note(req, told, "unaligned")
+        ids = getattr(req, "full_untruncated_fill_ids", None)
+        if ids is None or len(ids) == 0:
+            return self._s90b_follower_note(req, told, "no_ids")
+        node = self._pdflip_kv_chain_end(ids, getattr(req, "extra_key", None), told)
+        if node is None:
+            return self._s90b_follower_note(req, told, "no_node_at_told")
+        cd = node.component_data[ComponentType.MAMBA]
+        if cd.value is not None or (cd.host_value is not None and cd.host_value.numel() > 0):
+            return self._s90b_follower_note(req, told, "node_has_state")
+        full = node.component_data[BASE_COMPONENT_TYPE]
+        if getattr(full, "host_value", None) is not None:
+            got = int(self.pdflip_anchor_only_read_at(req, told, site=site) or 0)
+            return self._s90b_follower_note(req, told, "host_attach" if got else "host_read_miss", got)
+        if getattr(full, "value", None) is None:
+            return self._s90b_follower_note(req, told, "kv_absent")
+        return self._s90b_device_attach(req, node, told, site)
+
+    def _s90b_device_attach(self, req, node, told: int, site: str) -> int:
+        """S90b: the anchor of ``node`` (device KV, no state) read from the store into a device mamba slot."""
+        cc = self.cache_controller
+        backend = getattr(cc, "storage_backend", None) if cc is not None else None
+        if backend is None or not hasattr(backend, "batch_get_v2"):
+            return self._s90b_follower_note(req, told, "no_store")
+        try:
+            from flliper.srt.managers.cache_controller import rank_holds_gdn_state
+
+            if not rank_holds_gdn_state(cc):
+                return self._s90b_follower_note(req, told, "no_gdn_state")
+        except Exception:  # noqa: BLE001 - an unanswerable rank form reads nothing
+            return self._s90b_follower_note(req, told, "no_gdn_state")
+        comp = (getattr(self, "components", None) or {}).get(ComponentType.MAMBA)
+        mp = getattr(comp, "_mamba_pool_host", None)
+        entry = (getattr(getattr(cc, "mem_pool_host", None), "entry_map", None) or {}).get(PoolName.MAMBA)
+        if mp is None or not callable(getattr(mp, "alloc_read", None)) or entry is None:
+            return self._s90b_follower_note(req, told, "no_mamba_pool")
+        tried = getattr(req, "_pdflip_s90b_tried_at", None)
+        if not isinstance(tried, set):
+            tried = set()
+            try:
+                req._pdflip_s90b_tried_at = tried
+            except Exception:  # noqa: BLE001
+                pass
+        if told in tried:
+            return 0   # one read per depth: a miss is not re-read on every settle
+        tried.add(told)
+        last_hash = node.get_last_hash_value()
+        if last_hash is None:
+            return self._s90b_follower_note(req, told, "no_hash")
+        host_indices = mp.alloc_read(1)
+        if host_indices is None:
+            return self._s90b_follower_note(req, told, "no_read_row")
+        from flliper.srt.mem_cache.hicache_storage import PoolHitPolicy
+
+        transfer = PoolTransfer(name=PoolName.MAMBA, host_indices=host_indices, keys=[last_hash],
+                                hit_policy=PoolHitPolicy.TRAILING_PAGES)
+        ok = False
+        try:
+            ok = bool((backend.batch_get_v2([transfer]) or {}).get(PoolName.MAMBA, [False])[0])
+        except Exception:  # noqa: BLE001 - a failed read is an unread anchor
+            logger.warning("S90b FOLLOWER-STATE-AT-TOLD read failed rid=%s", getattr(req, "rid", "?"), exc_info=True)
+            ok = False
+        idx = transfer.host_indices
+        if ok and callable(getattr(mp, "is_placeholder", None)) and mp.is_placeholder(int(idx[0])):
+            ok = False
+        if not ok:
+            self._s90b_free_rows(mp, idx)
+            return self._s90b_follower_note(req, told, "store_miss")
+        dst = None
+        try:
+            dst = comp._alloc_mamba_slot()
+            if dst is None:
+                self._s90b_free_rows(mp, idx)
+                return self._s90b_follower_note(req, told, "no_device_slot")
+            if (node.component_data[ComponentType.MAMBA].value is not None
+                    or node.component_data[BASE_COMPONENT_TYPE].value is None):
+                # the slot's eviction walk may have changed the tree: never two states on one node, never a
+                # state on a node whose device KV left meanwhile
+                self.req_to_token_pool.mamba_allocator.free(dst)
+                self._s90b_free_rows(mp, idx)
+                return self._s90b_follower_note(req, told, "node_changed")
+            io_backend = getattr(cc, "io_backend", "direct")
+            hp = entry.host_pool
+            try:
+                for local in sorted(set(int(v) for v in entry.layer_mapping.values())):
+                    hp.load_to_device_per_layer(entry.device_pool, idx, dst, local, io_backend)
+            finally:
+                # the arena pool remembers the (id(host), id(device)) key of a state load for its later layers;
+                # these two tensors die here -- a reused id must never pass for "already loaded"
+                _keys = getattr(hp, "_state_loaded_keys", None)
+                if isinstance(_keys, list):
+                    _keys[:] = [k for k in _keys if not (k[0] == id(idx) and k[1] == id(dst))]
+                _k1 = getattr(hp, "_state_loaded_key", None)
+                if isinstance(_k1, tuple) and _k1[:2] == (id(idx), id(dst)):
+                    hp._state_loaded_key = None
+            if torch.cuda.is_available():
+                torch.cuda.current_stream().synchronize()   # the read row (slot reference) outlives the copy
+        except Exception:  # noqa: BLE001 - a failed copy attaches nothing
+            logger.warning("S90b FOLLOWER-STATE-AT-TOLD device copy failed rid=%s", getattr(req, "rid", "?"),
+                           exc_info=True)
+            if dst is not None:
+                try:
+                    self.req_to_token_pool.mamba_allocator.free(dst)
+                except Exception:  # noqa: BLE001
+                    pass
+            self._s90b_free_rows(mp, idx)
+            return self._s90b_follower_note(req, told, "copy_failed")
+        # the LOAD_BACK commit: the device value, the device LRU, the evictable size
+        comp.commit_hicache_transfer(
+            node, CacheTransferPhase.LOAD_BACK,
+            transfers=[PoolTransfer(name=PoolName.MAMBA, host_indices=idx, device_indices=dst)])
+        self._s90b_free_rows(mp, idx)
+        try:
+            self._update_evictable_leaf_sets(node)
+        except Exception:  # noqa: BLE001 - bookkeeping only
+            pass
+        return self._s90b_follower_note(req, told, "device_attach", told)
+
+    @staticmethod
+    def _s90b_free_rows(mp, idx) -> None:
+        try:
+            mp.free(idx)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _s90b_follower_note(self, req, told: int, how: str, got: int = 0) -> int:
+        n = getattr(UnifiedRadixCache, "_s90b_follower_n", 0) + 1
+        UnifiedRadixCache._s90b_follower_n = n
+        if n <= 32 or n % 64 == 0 or got:
+            logger.info("S90b FOLLOWER-STATE-AT-TOLD n=%d rid=%s told=%d how=%s attached=%d (the follower holds the KV "
+                        "past PP0's told but no state AT told: the anchor of told is read from the store instead of "
+                        "acking a shallower depth)", n, getattr(req, "rid", "?"), int(told), how, int(bool(got)))
+        return int(got)
+
     def pdflip_lane_rank_on(self) -> bool:
         return bool(envs.FLLIPER_PDFLIP_LANE_ANCHOR_RANK.get())
 
@@ -6357,6 +6528,31 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         return (bool(getattr(node, "l3_present", False)) and not node.backuped
                 and bool(envs.FLLIPER_PDFLIP_ANCHOR_ONLY_BACKUP.get()))
 
+    #: S90b: refusals of the KV side of a full backup -- they say nothing about the anchor's own (mamba) pool
+    _S90B_KV_SIDE = frozenset({"arena_claim", "host_floor", "host_evict_short", "staging_ring"})
+
+    @staticmethod
+    def _s90b_kv_side_refusal(why) -> bool:
+        """S90b: ``why`` (``_k15_last_refusal``) refused the KV half of a full backup; the switch is on."""
+        if not envs.FLLIPER_PDFLIP_EVICT_ANCHOR_DEVICE_KV.get():
+            return False
+        return str(why or "").split(":", 1)[0] in UnifiedRadixCache._S90B_KV_SIDE
+
+    def _s90b_anchor_held(self, node) -> bool:
+        """S90b: the anchor of ``node``'s last page hash DEMONSTRABLY has its bytes (a COMPLETE mamba arena slot or
+        an L3 copy) -- ``ArenaMambaPoolHost.anchor_held`` answered True. The mark alone, an unbound pool or an
+        unanswerable probe is no proof for a device-KV node (S25's gate); then the anchor is written."""
+        if not getattr(node, "pdflip_anchor_secured", False) or not getattr(node, "hash_value", None):
+            return False
+        mp = self._pdflip_mamba_pool()
+        probe = getattr(mp, "anchor_held", None)
+        if not callable(probe):
+            return False
+        try:
+            return probe(node.hash_value[-1]) is True
+        except Exception:  # noqa: BLE001 - unreadable = not proven, the write goes ahead
+            return False
+
     def pdflip_save_anchor_before_tombstone(self, node) -> bool:
         """K15 (pdflip-56-530, 00:21:41-00:22:06): the device mamba eviction
         TOMBSTONES an internal node's anchor (mamba_component.drive_eviction,
@@ -6407,6 +6603,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # mamba arena -- TP0 decides and saves; the worker names no loss
             return False
         written = 0
+        kv_dev = None   # S90b: the KV-arena refusal that sent a device-KV node's anchor alone to its slot
         for attempt in range(2):
             self._k15_last_refusal = None
             self._pdflip_sweep_last_refusal = None
@@ -6420,6 +6617,24 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     written = self.write_backup_anchor_only(node)
                 else:
                     written = self.write_backup(node, write_back=True)
+                    _kv_why = getattr(self, "_k15_last_refusal", None)
+                    if not written and UnifiedRadixCache._s90b_kv_side_refusal(_kv_why):
+                        # S90b (NF rc16 bf9ca46f45, P 09:11:44-09:13:03, 17x ANCHOR-LOST at=evict
+                        # backuped=False l3_present=False why=arena_claim; MAMBA-ARENA displaced=0
+                        # refused=0): the KV ARENA refused the full backup of a node whose KV is on the
+                        # device only -- that refusal says nothing about the anchor's own pool. The anchor
+                        # alone goes into its mamba arena slot (detached, keyed by the last page hash), the
+                        # slot carries it to L3 (#257 / write-behind); the KV stays on the device and the
+                        # publish sweep stores it when the arena has room (upstream sglang #39856 "eager
+                        # Mamba L3 write": the Mamba state written without waiting for the KV write).
+                        if UnifiedRadixCache._s90b_anchor_held(self, node):
+                            # the slot / L3 already holds these bytes: nothing to write, nothing to join
+                            kv_dev = _kv_why
+                            break
+                        else:
+                            written = self.write_backup_anchor_only(node, kv_on_device=True)
+                            if written:
+                                kv_dev = _kv_why
             except Exception as exc:  # noqa: BLE001 - the tombstone below is the old path
                 logger.warning("K15 ANCHOR-SAVE node=%s raised %s: %s", getattr(node, "id", "?"),
                                type(exc).__name__, exc)
@@ -6438,8 +6653,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if written:
             self.writing_check(write_back=True)
         # S25: a KV-in-store anchor-only copy lives in its arena slot, not in the tree (host_value stays None)
+        # S90b: so does the detached copy of a device-KV node (secured at the joined ack)
         ok = (node.component_data[ComponentType.MAMBA].host_value is not None
-              or (UnifiedRadixCache._s25_kv_in_store(node) and getattr(node, "pdflip_anchor_secured", False)))
+              or ((UnifiedRadixCache._s25_kv_in_store(node) or kv_dev is not None)
+                  and getattr(node, "pdflip_anchor_secured", False)))
+        if ok and kv_dev is not None:
+            UnifiedRadixCache._s90b_saved_n = getattr(UnifiedRadixCache, "_s90b_saved_n", 0) + 1
+            n90 = UnifiedRadixCache._s90b_saved_n
+            if n90 <= 32 or n90 % 256 == 0:
+                logger.info("S90b EVICT-ANCHOR-DEVICE-KV n=%d node=%s depth=%d kv_refusal=%s (the KV arena refused "
+                            "the full backup of a device-KV node: its anchor alone went to its mamba arena slot, "
+                            "detached, on to L3 -- not tombstoned)", n90, getattr(node, "id", "?"),
+                            self.pdflip_node_depth(node), kv_dev)
         if ok:
             # S25 (h16v3 9/9, h16v4b 2/2 ``why=mamba_claim`` losses): the once-per-node spill latch served THIS save.
             # A node whose anchor was saved (spill 23:55:53 for node 1422), loaded back and evicted again a minute later

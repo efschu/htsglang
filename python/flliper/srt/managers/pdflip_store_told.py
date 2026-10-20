@@ -669,6 +669,29 @@ def settle_ack_now_on(env=None) -> bool:
     return str(env.get(ENV_SETTLE_ACK_NOW, "1") or "1").strip().lower() not in ("0", "false", "no", "off")
 
 
+def _s90b_state_at_told(scheduler, req, told: int, res: int) -> int:
+    """S90b FOLLOWER-STATE-AT-TOLD (NF rc16 bf9ca46f45, PP2 09:13:10 pdflip-1-23: told=19200 own=47808
+    resumable_at_told=3072 -> PF TOLD-FLOOR 3072 for every rank, 16128 tokens recomputed): before this rank
+    reports "cannot resume at told", it reads the anchor of told from the store and attaches it to its node at
+    told (``UnifiedRadixCache.pdflip_follower_state_at_told``), then asks the same probe again. Returns the
+    probe's new answer (``res`` unchanged when nothing was attached or the tree cannot do it). PP0's told stays
+    the one verdict (SOLL R11): the follower only materialises what that verdict names."""
+    tree = getattr(scheduler, "tree_cache", None)
+    attach = getattr(tree, "pdflip_follower_state_at_told", None)
+    if not callable(attach):
+        return int(res)
+    try:
+        if int(attach(req, int(told)) or 0) < int(told):
+            return int(res)
+        again = _tf.rank_resumable(scheduler, req, int(told))
+    except Exception:  # noqa: BLE001 - a read never breaks the settle; the old ack stands
+        logger.warning("S90b FOLLOWER-STATE-AT-TOLD raised rid=%s", _rt(_rid(req)), exc_info=True)
+        return int(res)
+    if again is None:
+        return int(res)
+    return int(again)
+
+
 def _over_resumable_at_told(scheduler, req, told: int, own: int) -> bool:
     """True = this rank can resume ``req`` at ``told`` (or no probe/verdict):
     the "over" settle stands. False = KV past told but no recurrent state
@@ -687,6 +710,9 @@ def _over_resumable_at_told(scheduler, req, told: int, own: int) -> bool:
     except Exception:  # noqa: BLE001 - a probe never breaks the settle
         return True
     if res is None or int(res) >= int(told):
+        return True
+    res = _s90b_state_at_told(scheduler, req, int(told), int(res))
+    if int(res) >= int(told):
         return True
     n = getattr(scheduler, "_pdflip_over_unresumable_n", 0) + 1
     scheduler._pdflip_over_unresumable_n = n

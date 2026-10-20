@@ -2672,6 +2672,27 @@ class Envs:
     # arena (no KV copy); the publish sweep skipped such nodes and the flush
     # reset dropped the anchor.
     FLLIPER_PDFLIP_ANCHOR_ONLY_BACKUP = EnvBool(True)
+    # S90b EVICT-ANCHOR-DEVICE-KV (NF rc16 bf9ca46f45, P PP0/PP1/PP2 09:11:44-
+    # 09:13:03, 17x PDFLIP-ANCHOR-LOST at=evict backuped=False l3_present=False
+    # why=arena_claim): the device mamba eviction of an internal node whose KV
+    # is on the device only asked for a FULL backup; the KV arena refused it
+    # and the anchor was tombstoned although the mamba arena had room
+    # (MAMBA-ARENA displaced=0 refused=0). The anchor alone now goes into its
+    # mamba arena slot (detached, keyed by the node's last page hash -- not in
+    # the tree, Full keeps no host copy) and from there to L3 (#257 clock /
+    # write-behind); the KV follows with the publish sweep. 0 = the old
+    # tombstone.
+    FLLIPER_PDFLIP_EVICT_ANCHOR_DEVICE_KV = EnvBool(True)
+    # S90b FOLLOWER-STATE-AT-TOLD (same boot, PP2 09:13:10 pdflip-1-23
+    # OVER-UNRESUMABLE told=19200 own=47808 resumable_at_told=3072 -> PF
+    # TOLD-FLOOR 3072 for every rank): a follower whose device KV reaches past
+    # PP0's told but holds no recurrent state AT told reads the anchor of told
+    # from the store (arena slot / L3) and attaches it to its node at told --
+    # as the node's host value when its KV has a host copy (e1, AUX-HOST-LAW),
+    # else straight into a device mamba slot -- instead of acking the
+    # shallower depth. PP0's told stays the one verdict (SOLL R11). 0 = the
+    # old ack.
+    FLLIPER_PDFLIP_FOLLOWER_STATE_AT_TOLD = EnvBool(True)
     # PARK-END-ANCHOR-FIRST (NF y9nf4 03:33:18, auftrag 1303): the chain of a
     # parked request (the node its retraction ended at and every ancestor)
     # outranks the Mamba anchors without park reference when the host arena
