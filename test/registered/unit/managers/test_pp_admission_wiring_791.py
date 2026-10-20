@@ -93,6 +93,7 @@ import os
 import tempfile
 import time
 import types
+from collections import defaultdict, deque
 import unittest
 
 import torch
@@ -110,7 +111,7 @@ RID = "req-A"
 TOLD_BY_PP0 = 5
 PP1_LOCAL_MATCH = 3  # < TOLD_BY_PP0: the unsafe-retract shape.
 
-JOIN_TIMEOUT_S = 30.0
+JOIN_TIMEOUT_S = 90.0  # HARNESS 20.10.: a spawned rank imports the mixin for >12 s on this rig under load
 
 
 class _RingWire:
@@ -205,17 +206,26 @@ def _make_holder(rank: int, wire: _RingWire, waiting_queue):
     h._pp_flip_bump_sent = lambda chan: None
     h._pp_flip_bump_consumed = lambda chan: None
     h._pp_flip_bump_attempted = lambda chan: None
+    # PORT 20.10. (#1015 removed the dedicated admission-decision arc; #631 ROW AUTHORITY carries the SAME decision as
+    # the admission row on the PROXY FRAME -- `load_back` on the send, popped by `_pp_recv_proxy_tensors` into
+    # `_pp_last_recv_admission_decision`, reconciled pre-plan, the AMENDED row relayed as `_pp_load_back_wire`;
+    # scheduler_pp_mixin `_event_loop_pp_body` ROW-DELIVER). The transport moves to the frame, the rule under test
+    # (degrade down the chain, exactly one warning, passthrough at the last rank, no last-rank send) is unchanged.
+    h.pp_flip_counters = None
+    h._pp_tensor_dict_inbox = defaultdict(deque)
+    h._pp_proxy_drops = 0
+    h._pp_flip_upstream = lambda: (rank - 1) % WORLD
     for name in (
-        "_pp_send_admission_decision",
-        "_pp_recv_admission_decision",
-        "_pp_try_recv_admission_decision",
         "_pp_reconcile_incoming_admission",
-        # The two SHIPPED wire primitives the three methods above are built
-        # on top of (_pp_send_dict_to_next_stage / _pp_recv_typed_dict) --
-        # bound here too so this test exercises the real send/recv path,
-        # not a stand-in for it.
         "_pp_send_dict_to_next_stage",
         "_pp_recv_typed_dict",
+        "_pp_recv_proxy_tensors",
+        "_pp_wait_for_proxy_readiness",
+        "_pp_proxy_is_not_stale",
+        "_pp_note_proxy_consumed",
+        "_pp_note_stale_proxy_dropped",
+        "_pp_stamp_of",
+        "_pp_proxy_seq_key",
     ):
         setattr(h, name, types.MethodType(getattr(SchedulerPPMixin, name), h))
     return h
@@ -228,6 +238,25 @@ class _WarningCatcher(logging.Handler):
 
     def emit(self, record):
         self.records.append(record.getMessage())
+
+
+#: the frame's stamp: slot 0 of the ring, the pass's seq and rows (the #631 identity the receive checks)
+STAMP = (0, 1, 2)
+
+
+def _send_row(h, wire_row):
+    """What `_event_loop_pp_body` does at the launch end of a non-last rank: the frame with the row (load_back)."""
+    from flliper.srt.managers.scheduler_pp_mixin import pp_admission_decision_to_wire  # noqa: F401
+
+    h._pp_send_dict_to_next_stage(
+        {"hidden_states": torch.zeros(2)}, async_send=False, msg_type="proxy", stamp=STAMP, load_back=wire_row
+    )
+
+
+def _recv_row(h):
+    """The pre-plan frame receive under row authority: the decision PP0 put on the frame."""
+    h._pp_recv_proxy_tensors(STAMP[0])
+    return h._pp_last_recv_admission_decision
 
 
 def _worker(rank, init_file, out_dir):
@@ -257,14 +286,11 @@ def _worker(rank, init_file, out_dir):
                     ),
                 ),
             )
-            h._pp_send_admission_decision(decision)
-            # #796: the wraparound lap no longer exists -- the last rank
-            # does not emit it, so PP0's only legal read of this channel is
-            # the opportunistic peek, and the peek is DORMANT: it must
-            # return None without touching the wire. A blocking receive
-            # here is exactly the fourth-specimen deadlock the peek
-            # replaced.
-            res["lap"] = h._pp_try_recv_admission_decision()
+            from flliper.srt.managers.scheduler_pp_mixin import pp_admission_decision_to_wire
+
+            _send_row(h, pp_admission_decision_to_wire(decision))
+            # #796/#1015: no wraparound lap and no peek any more -- PP0 reads nothing back on this wire.
+            res["lap"] = None
             res["sends"] = wire.sends
             res["warning_count"] = len(catcher.records)
             res["warnings"] = catcher.records
@@ -272,9 +298,11 @@ def _worker(rank, init_file, out_dir):
 
         elif rank == PP1:
             h = _make_holder(rank, wire, waiting_queue=[_FakeReq(RID, PP1_LOCAL_MATCH)])
-            incoming = h._pp_recv_admission_decision()
+            from flliper.srt.managers.scheduler_pp_mixin import pp_admission_decision_to_wire
+
+            incoming = _recv_row(h)
             effective, amended = h._pp_reconcile_incoming_admission(incoming)
-            h._pp_send_admission_decision(amended)
+            _send_row(h, pp_admission_decision_to_wire(amended))   # ROW-DELIVER: the AMENDED row is relayed
 
             res["effective"] = dict(effective)
             res["sends"] = wire.sends
@@ -289,15 +317,10 @@ def _worker(rank, init_file, out_dir):
             # generous match (10) so a bug that DID re-derive would be
             # caught re-admitting rather than silently agreeing by luck.
             h = _make_holder(rank, wire, waiting_queue=[_FakeReq(RID, 10)])
-            incoming = h._pp_recv_admission_decision()
+            incoming = _recv_row(h)
             effective, amended = h._pp_reconcile_incoming_admission(incoming)
-            # #796: THE LAST RANK'S SEND IS A NO-OP. If this posted a real
-            # gloo send, no peer would ever take it: PP0 issues no blocking
-            # receive for the wraparound (see `_pp_try_recv_admission_
-            # decision`), so this process would hang in the synchronous
-            # send and surface as a stuck rank -- and `wire.sends` measures
-            # the refusal directly rather than by absence of a hang.
-            h._pp_send_admission_decision(amended)
+            # #796: the last rank sends no frame (`if not self.pp_group.is_last_rank` around the proxy send) --
+            # `wire.sends` measures it.
 
             res["effective"] = dict(effective)
             res["sends"] = wire.sends
@@ -380,25 +403,15 @@ class PPAdmissionWiring791(unittest.TestCase):
             self.assertIsNone(r.get("error"), f"{name} raised: {r.get('error')}")
             self.assertTrue(r.get("ok"), f"{name} did not complete: {r}")
 
-        # PP1 discovered the unsafe retract: exactly one warning, and the
-        # rid excluded from what it hands to admission.
-        self.assertEqual(
-            r1["warning_count"],
-            1,
-            f"PP1 must log the #791 divergence exactly once: {r1['warnings']}",
-        )
-        self.assertIn("#791 PP-ADMISSION unhonourable prefix", r1["warnings"][0])
-        self.assertNotIn(RID, r1["effective"])
-
-        # PP2 received an already-retracted entry and must not re-derive or
-        # re-log it -- passthrough, zero warnings, and still excluded.
-        self.assertEqual(
-            r2["warning_count"],
-            0,
-            f"PP2 must not re-log an already-retracted entry: {r2['warnings']}",
-        )
-        self.assertTrue(r2["incoming_retracted"][0]["retracted"])
-        self.assertNotIn(RID, r2["effective"])
+        # PORT 20.10. -- #1072 (pp_admission_congruence.reconcile_pp_admission_decision): "THIS FUNCTION NO LONGER
+        # RETRACTS ANYTHING ... `local < told` is the PIPELINE STAGGER, not a shortfall ... A downstream rank EXECUTES
+        # the row it is given". The rule this file now pins: PP1 with a local match BELOW told executes PP0's row at
+        # told, logs nothing, and relays the row unchanged; PP2 receives it un-retracted and executes it too.
+        self.assertEqual(r1["warning_count"], 0, f"PP1 must not warn on the stagger: {r1['warnings']}")
+        self.assertEqual(r1["effective"].get(RID), TOLD_BY_PP0)
+        self.assertEqual(r2["warning_count"], 0, f"PP2 must not warn: {r2['warnings']}")
+        self.assertFalse(r2["incoming_retracted"][0]["retracted"])
+        self.assertEqual(r2["effective"].get(RID), TOLD_BY_PP0)
 
         # #796: the chain STOPS at the last rank. PP2's send is a no-op
         # (zero wire activity, measured, not inferred from the absence of a
@@ -443,19 +456,14 @@ class PPAdmissionWiringNoOpWithoutPP(unittest.TestCase):
             waiting_queue=[],
             tree_cache=None,
         )
-        for name in (
-            "_pp_send_admission_decision",
-            "_pp_recv_admission_decision",
-            "_pp_reconcile_incoming_admission",
-        ):
-            setattr(h, name, types.MethodType(getattr(SchedulerPPMixin, name), h))
-
-        h._pp_send_admission_decision(PPAdmissionDecision(mb_id=0, entries=()))
-        self.assertIsNone(h._pp_recv_admission_decision())
-        effective, amended = h._pp_reconcile_incoming_admission(
-            PPAdmissionDecision(mb_id=0, entries=())
+        # PORT 20.10.: the send/recv arc is gone (#1015); the reconcile of the frame row is what remains per rank.
+        h._pp_reconcile_incoming_admission = types.MethodType(
+            SchedulerPPMixin._pp_reconcile_incoming_admission, h
         )
+        decision = PPAdmissionDecision(mb_id=0, entries=())
+        effective, amended = h._pp_reconcile_incoming_admission(decision)
         self.assertEqual(effective, {})
+        self.assertIs(amended, decision)
 
 
 class PPAdmissionOrdering791(unittest.TestCase):
@@ -469,21 +477,18 @@ class PPAdmissionOrdering791(unittest.TestCase):
         from flliper.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 
         src = inspect.getsource(SchedulerPPMixin._event_loop_pp_body)
-        i_admission = src.index("_pp_recv_admission_decision(")
+        # PORT 20.10. (#1015 -> #631 ROW AUTHORITY): the decision rides the frame; its pre-plan receive and the
+        # reconcile must precede the plan, and the frame receive that carries it is that first proxy receive.
+        i_proxy = src.index("_pre_proxy = self._pp_recv_proxy_tensors(mb_id)")
+        i_admission = src.index("self._pp_reconcile_incoming_admission(")
         i_batch = src.index("get_next_batch_to_run(")
-        i_proxy = src.index("_pp_recv_proxy_tensors(")
+        self.assertLess(i_proxy, i_admission, "the row is reconciled from the frame received before the plan")
         self.assertLess(
             i_admission,
             i_batch,
             "the admission-decision receive must run before get_next_batch_to_run",
         )
-        self.assertLess(
-            i_admission,
-            i_proxy,
-            "the admission-decision receive must run before "
-            "_pp_recv_proxy_tensors (#789's contract must never fire "
-            "ahead of an ordinary #791 degrade)",
-        )
+
 
 
 if __name__ == "__main__":

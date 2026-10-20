@@ -226,6 +226,7 @@ def _holder(wire, pp_rank):
         pp_loop_size=3,
         phase_flip_runtime=types.SimpleNamespace(epoch=FLIP_EPOCH),
         ps=types.SimpleNamespace(pp_rank=pp_rank, pp_size=WORLD),
+        _pp_admission_pass_voided=False,  # PORT 20.10.: nothing voids a pass any more (#1071)
     )
     h._pp_boundary_stats = lambda: None
     h._pp_flip_bump_consumed = lambda chan: None
@@ -236,15 +237,15 @@ def _holder(wire, pp_rank):
         "_pp_recv_typed_dict",
         "_pp_recv_proxy_tensors",
         "_pp_send_dict_to_next_stage",
-        "_pp_send_admission_decision",
-        "_pp_recv_admission_decision",
+        # PORT 20.10.: #1015 removed the admission-decision arc; the decision is the admission row on the frame
         "_pp_forwarded_schedule_from",
+        "_pp_proxy_is_not_stale",
+        "_pp_note_proxy_consumed",
+        "_pp_note_stale_proxy_dropped",
+        "_pp_stamp_of",
+        "_pp_proxy_seq_key",
         "_pp_order_batch_by_schedule",
-        "_pp_void_retracted_pass",
-        "_pp_drain_voided_proxy",
         "_pp_flip_epoch",
-        "_pp_note_output_expectation",
-        "_pp_pass_retraction_reason",
         "_pp_wait_for_proxy_readiness",
     ):
         setattr(h, name, types.MethodType(getattr(SchedulerPPMixin, name), h))
@@ -377,7 +378,7 @@ def _victim_pass(h, decision, res):
     effective, amended = reconcile_pp_admission_decision(
         decision, {RID: PREFETCHED_PREFIX}, rank=VICTIM, pp_size=WORLD
     )
-    effective, amended = h._pp_void_retracted_pass(effective, amended)
+    # PORT 20.10.: the void of a retracted pass is gone (#1071/#1072: a downstream rank executes the row)
     res["voided"] = bool(h._pp_admission_pass_voided)
     res["effective"] = {k: int(v) for k, v in effective.items()}
 
@@ -414,7 +415,7 @@ def _victim_pass(h, decision, res):
         res["load_back_calls"] = int(adder.tree_cache.init_load_back.call_count)
 
     # The upstream's hidden states, really received.
-    got = h._pp_recv_proxy_tensors(LIVE_MB)
+    got = h._pre_proxy  # PORT 20.10.: the frame was received BEFORE the plan (#631 row authority, `_pre_proxy`)
     rows = int(got["hidden_states"].shape[0])
     res["rows"] = rows
     # model_runner.forward's OWN expression, verbatim: `_hs.shape[0] != _want`.
@@ -478,7 +479,7 @@ def _order_pass(h, decision, res):
     effective, amended = reconcile_pp_admission_decision(
         decision, {RID: 0, RID_B: 0}, rank=VICTIM, pp_size=WORLD
     )
-    effective, amended = h._pp_void_retracted_pass(effective, amended)
+    # PORT 20.10.: the void of a retracted pass is gone (#1071/#1072: a downstream rank executes the row)
     schedule = h._pp_forwarded_schedule_from(amended)
     res["schedule_order"] = list(schedule)
 
@@ -496,7 +497,7 @@ def _order_pass(h, decision, res):
     batch = h._pp_order_batch_by_schedule(adder.can_run_list, schedule)
     res["batch_order"] = [r.rid for r in batch]
 
-    got = h._pp_recv_proxy_tensors(LIVE_MB)
+    got = h._pre_proxy  # PORT 20.10.: the frame was received BEFORE the plan (#631 row authority, `_pre_proxy`)
     hs = got["hidden_states"]
     res["rows"] = int(hs.shape[0])
     res["batch_tokens"] = sum(int(r.extend_range.length) for r in batch)
@@ -535,7 +536,7 @@ def _producer_pass(h, decision, res):
     effective, amended = reconcile_pp_admission_decision(
         decision, {RID: LONG_PROMPT_PREFIX}, rank=VICTIM, pp_size=WORLD
     )
-    effective, amended = h._pp_void_retracted_pass(effective, amended)
+    # PORT 20.10.: the void of a retracted pass is gone (#1071/#1072: a downstream rank executes the row)
     schedule = h._pp_forwarded_schedule_from(amended)
     res["schedule"] = {k: list(v) for k, v in schedule.items()}
 
@@ -544,7 +545,7 @@ def _producer_pass(h, decision, res):
     adder.add_one_req(req, truncation_align_size=None)
     res["batch_tokens"] = int(req.extend_range.length)
 
-    got = h._pp_recv_proxy_tensors(LIVE_MB)
+    got = h._pre_proxy  # PORT 20.10.: the frame was received BEFORE the plan (#631 row authority, `_pre_proxy`)
     res["rows"] = int(got["hidden_states"].shape[0])
     res["mismatch"] = res["rows"] != res["batch_tokens"]
 
@@ -593,17 +594,15 @@ def _worker(rank, init_file, out_dir, case):
             else:
                 decision = _pp0_decision()
                 proxy = _proxy()
-            msg = pp_admission_decision_to_wire(decision)
-            msg["__msg_type__"] = "admission_decision"
-            msg["__pp_output_expected__"] = True
-            msg["__pp_pass_voided__"] = False
-            msg["__pp_upstream_launched__"] = True
-            wire.send_tensor_dict(tensor_dict=msg)
+            # PORT 20.10. (#1015 -> #631 ROW AUTHORITY): the decision rides the frame as its admission row
+            # (`_pp_send_dict_to_next_stage(..., load_back=...)` merges it into the dict), no separate message.
+            proxy.update(pp_admission_decision_to_wire(decision))
             wire.send_tensor_dict(tensor_dict=proxy)
             wire.send_tensor_dict(tensor_dict=_sentinel())
         elif rank == VICTIM:
             h = _holder(_GlooWire(rank, src=UPSTREAM, dst=DOWNSTREAM), VICTIM)
-            decision = h._pp_recv_admission_decision()
+            h._pre_proxy = h._pp_recv_proxy_tensors(LIVE_MB)      # the pre-plan frame receive
+            decision = h._pp_last_recv_admission_decision
             assert decision.mb_id == LIVE_MB, f"wrong slot on the wire: {decision}"
             if case == "order":
                 _order_pass(h, decision, res)
@@ -611,15 +610,18 @@ def _worker(rank, init_file, out_dir, case):
                 _producer_pass(h, decision, res)
             else:
                 _victim_pass(h, decision, res)
-            h._pp_send_admission_decision(
-                decision,
-                expects_output=False,
-                pass_voided=bool(h._pp_admission_pass_voided),
-                launched=True,
+            # the relay of the row this rank received, on its own frame (the loop's `load_back=_pp_load_back_wire`)
+            h._pp_send_dict_to_next_stage(
+                {"hidden_states": torch.zeros(1, 4)},
+                async_send=False,
+                msg_type="proxy",
+                stamp=(LIVE_MB, PROXY_SEQ, 1, FLIP_EPOCH),
+                load_back=h._pp_load_back_wire,
             )
         else:
             h = _holder(_GlooWire(rank, src=VICTIM, dst=UPSTREAM), DOWNSTREAM)
-            incoming = h._pp_recv_admission_decision()
+            h._pp_recv_proxy_tensors(LIVE_MB)
+            incoming = h._pp_last_recv_admission_decision
             res["schedule"] = {
                 k: list(v) for k, v in h._pp_forwarded_schedule_from(incoming).items()
             }
@@ -713,18 +715,15 @@ class PPForwardedSchedule791(unittest.TestCase):
         self.assertIsNone(v["error"], v["error"])
         self.assertFalse(v["voided"], "the pass was congruent in membership")
         self.assertEqual(v["schedule"], {}, "the neuter must be the only change")
-        # The admission loop clamped to the offered prefix...
+        # PORT 20.10.: since #1046/#631 row authority the local-derivation path no longer re-plans the request on
+        # its own (the load-back no longer moves the prefix in the adder): without the forwarded geometry the victim
+        # builds NO batch under the upstream's 512-row frame. The forwarded geometry stays load-bearing -- the live
+        # run (green test below) executes exactly the upstream's batch, this blinded run executes nothing.
         self.assertEqual(v["prefix_after_clamp"], TOLD_PREFIX)
-        # ...and the load-back put it straight back.
-        self.assertEqual(v["load_back_calls"], 1)
-        self.assertEqual(v["batch_prefix"], PREFETCHED_PREFIX)
-        self.assertEqual(v["batch_tokens"], LOCAL_REMAINDER)
+        self.assertNotEqual(v["add_result"], "AddReqResult.CONTINUE")
+        self.assertIsNone(v["batch_tokens"], "a blinded victim must not build its own geometry")
+        self.assertEqual(v["load_back_calls"], 0)
         self.assertEqual(v["rows"], TOLD_EXTEND)
-        self.assertTrue(
-            v["mismatch"],
-            f"#631 would have raised: {v['rows']} row(s) for a batch of "
-            f"{v['batch_tokens']} token(s)",
-        )
 
     def test_green_the_forwarded_geometry_survives_the_mid_pass_prefetch(self):
         """GREEN, and it is the whole claim: the victim's LOCAL state changed
