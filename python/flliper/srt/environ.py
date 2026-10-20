@@ -4200,6 +4200,12 @@ class Envs:
     #   rate) return everything as before. False = the full return, byte for
     #   byte.
     FLLIPER_PDFLIP_D_LEND_KEEP_SHORT = EnvBool(True)
+    #   D-MEM-SHARE (20.10., nf-decode-host-1020): the D-MEM-SCHED census counts a prompt prefix two
+    #   requests hold in ONE set of tree pages once (group-agreed credit, pdflip/d_mem_share.py). rc28 D
+    #   (1020_174205): 106 of 116 KV-stage grows were held by the stage they left once the matched prefix
+    #   counted once -- each a live move (and an end-event shrink) inside a decode pause. False = the plain
+    #   sums byte for byte.
+    FLLIPER_PDFLIP_D_MEM_SHARE = EnvBool(True)
     #   S93 (20.10., Grundgesetz VRAM=Experten; S91 nf-s91-decode-regression-1020.md): "extend pending" counts
     #   only waiting requests D's admission can TAKE -- not the ones its own verdicts hold out (the park gate's
     #   older_live / held_for_older / park-first barrier, ``AdmissionGate.skip``; a DQH-held queue,
