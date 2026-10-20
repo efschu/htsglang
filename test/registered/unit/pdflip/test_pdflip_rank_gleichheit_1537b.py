@@ -587,3 +587,60 @@ def test_c4_the_group_end_is_read_before_the_witness_term_is_written():
         if isinstance(n, ast.Attribute) and n.attr == "_pdflip_store_delivered" and isinstance(n.ctx, ast.Store):
             pos.setdefault("write", n.lineno)
     assert set(pos) == {"read", "write"} and pos["read"] < pos["write"], pos
+
+
+# ---------------------------------------------------------------------------
+# (d) S86 SLEEP-L3-RELEASE (review S86 A2): three ranks with different LOCAL inputs -- an arena, none, another
+#     slot count, a veto that raises -- take the same three collectives, same order, same vector lengths.
+#     The reviewer's S8 (the count following the rank's own slot value) leaves the pool-less rank behind: Hang.
+# ---------------------------------------------------------------------------
+def _s86_tree(nodes=()):
+    root = object()
+    return types.SimpleNamespace(root_node=root, _collect_all_nodes=lambda: [root, *nodes], components={},
+                                 _pdflip_direct_pool=lambda: None)
+
+
+def _s86_pool(slots):
+    return types.SimpleNamespace(arena=types.SimpleNamespace(slots=slots), staging_rows=0)
+
+
+def _s86_lockstep(pools, monkeypatch=None):
+    from flliper.srt.pdflip import sleep_l3_release as S86
+
+    rz = Rendezvous()
+
+    def one(r):
+        gm = lambda vals, label="": [-x for x in rz.reduce(r, [-int(v) for v in vals])]   # noqa: E731 - MAX
+        return S86.run(_s86_tree(), group_max=gm, pool=pools[r])
+
+    return rz, lockstep(list(range(N)), one)
+
+
+def test_d1_s86_the_collective_count_follows_no_local_value():
+    rz, res = _s86_lockstep([_s86_pool(8), None, _s86_pool(7)])
+    assert [e for _v, e in res if e is not None] == []
+    assert rz.count() == [3, 3, 3]
+    assert [[len(v) for v in c] for c in rz.calls] == [[1, 8, 5]] * N
+
+
+def test_d2_s86_no_arena_anywhere_takes_one_collective_on_every_rank():
+    rz, res = _s86_lockstep([None, None, None])
+    assert [e for _v, e in res if e is not None] == []
+    assert rz.count() == [1, 1, 1]
+
+
+def test_d3_s86_a_rank_whose_veto_raises_still_takes_every_collective(monkeypatch):
+    from flliper.srt.pdflip import sleep_l3_release as S86
+
+    pools = [_s86_pool(8), _s86_pool(8), _s86_pool(8)]
+    real = S86.local_veto
+
+    def veto(t, p, n):
+        if p is pools[1]:
+            raise RuntimeError("veto read failed on rank 1")
+        return real(t, p, n)
+
+    monkeypatch.setattr(S86, "local_veto", veto)
+    rz, res = _s86_lockstep(pools)
+    assert [e for _v, e in res if e is not None] == []
+    assert rz.count() == [3, 3, 3]

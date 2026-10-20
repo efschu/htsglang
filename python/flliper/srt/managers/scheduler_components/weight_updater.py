@@ -4742,7 +4742,9 @@ class SchedulerWeightUpdaterManager:
 
         try:
             res = _s86.run(tc)
-        except Exception:  # noqa: BLE001 - the sleep flush as before; a collective error surfaces in the drain
+        except _s86.SleepL3ReleaseDivergence:
+            raise   # review S86 A1: the ranks are not one -- the group stops by name, it never flushes on
+        except Exception:  # noqa: BLE001 - only before the first collective (run converts every later one): as before
             logger.warning("%s raised: the sleep flush runs without it", _s86.MARK, exc_info=True)
             return {}
         if int(res.get("group_released", 0) or 0) > 0:
