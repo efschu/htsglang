@@ -611,7 +611,10 @@ def set_verdict(members: Sequence[SetMember], *, x_tokens: int, half_frac: float
     running = max(0, int(d_prefill_running_uncached))
     if not members:
         return SetVerdict(V_COLLECT, "empty", 0.0, running, hx)
-    s = sum(max(0, int(m.own_uncached or m.uncached)) for m in members) + running   # H16V A5: the D-side sum decides
+    # R1u (user decision 20.10.): S = the tokens to compute NEW, a shared uncached piece once (``uncached`` already is the
+    # members' union figure, ``own_uncached`` the figure at arrival: it classes the member, R2, and no longer sums); the
+    # running D prefill's rest arrives with its overlap against the members already taken out (``running_overlap``)
+    s = sum(max(0, int(m.uncached)) for m in members) + running
     classes = [classify_arrival(m.own_uncached or m.uncached, int(m.x_own) or xc, half_frac, m.p_only) for m in members]
     big = any(c in (CLASS_GROSS, CLASS_P_ONLY) for c in classes)
     t0 = float(t_open) if t_open is not None else min(float(m.t_arrive) for m in members)
@@ -781,6 +784,46 @@ def shared_prefix_discount(entries: Sequence[Tuple[str, int, int, float, str]],
         out[rid] = max(0, u - max(0, best))
         seen.append((rid, int(depth), sess))
     return out
+
+
+def running_overlap(runs: Sequence[Tuple[str, int, int, str]], members: Sequence[Tuple[str, int, str]],
+                    common: Callable[[str, str], int]) -> int:
+    """SOLL R1u (user decision 20.10.): how many of the running D prefills' REST tokens a member of the set brings too (counted
+    ONCE in S). ``runs`` = ``(rid, depth_A, rest, session)`` of a running prefill A: its uncached positions are
+    ``[depth_A, depth_A + rest)`` (depth_A = N_A - rest); ``members`` = ``(rid, depth_B, session)``. A member B of the same
+    session shares ids ``[0, common(A, B))`` with A, so the piece ``[max(depth_A, depth_B), min(common, N_A))`` is computed
+    for both: the UNION of those pieces over the members is taken out of A's rest (members already discount one another,
+    ``shared_prefix_discount``). Exact from ids and depths; ``common`` failing / a session unknown discounts nothing."""
+    total = 0
+    for _arid, adepth, rest, asess in runs:
+        rest = max(0, int(rest))
+        if rest <= 0 or not asess:
+            continue
+        a_end = int(adepth) + rest
+        spans: List[Tuple[int, int]] = []
+        for brid, bdepth, bsess in members:
+            if bsess != asess:
+                continue
+            try:
+                c = int(common(_arid, brid))
+            except Exception:  # noqa: BLE001
+                c = 0
+            lo, hi = max(int(adepth), int(bdepth)), min(c, a_end)
+            if hi > lo:
+                spans.append((lo, hi))
+        cur_lo = cur_hi = None
+        covered = 0
+        for lo, hi in sorted(spans):
+            if cur_hi is None or lo > cur_hi:
+                if cur_hi is not None:
+                    covered += cur_hi - cur_lo
+                cur_lo, cur_hi = lo, hi
+            else:
+                cur_hi = max(cur_hi, hi)
+        if cur_hi is not None:
+            covered += cur_hi - cur_lo
+        total += min(rest, covered)
+    return total
 
 
 def _nearest_rank(vals: Sequence[float], q: float) -> float:

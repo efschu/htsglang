@@ -100,11 +100,11 @@ def test_r9_p_only_counts_big():
     assert D([M("v", 100, p_only=True)], decoding=False).verdict.verdict == pp.V_FLIP_P
 
 
-def test_m8_s_is_the_sum_of_own_u_not_of_s_p():
-    """A4/M8: P prefills the shared prefix once (uncached 1000 each), D must be assumed to prefill the own figures
-    (3500 + 3200): S = 6700 >= X flips; S_P = 2000 would not."""
+def test_m8_s_is_the_union_figure_r1u_not_the_sum_of_own_u():
+    """SOLL R1u (user decision 20.10., supersedes A4/M8): a shared uncached piece counts ONCE in S (uncached 1000 each after the
+    discount, own 3500 + 3200 only class the members): S = 2000 < X, no flip."""
     d = D([M("a", 1000, own=3500), M("b", 1000, 1.0, own=3200)], now=2.0)
-    assert d.verdict.s_tokens == 6700 and d.verdict.verdict == pp.V_FLIP_P
+    assert d.verdict.s_tokens == 2000 and d.verdict.verdict != pp.V_FLIP_P
 
 
 def test_s49_granted_unstarted_is_no_r6_reason_but_holds_a_d_verdict_m6():

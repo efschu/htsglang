@@ -132,7 +132,8 @@ def test_n1_second_refusal_without_extent_deletes_the_class_and_the_state_path_t
     p = _second_leg(f, p, "pdflip-0-1", 0, body=b'{"error": "W50: refused, no extent named"}')
     assert p.measure_class == "" and p.measure_src == "" and p.measured_u is None
     assert f.counters["measure_reclass_cleared"] == 1 and p in f.queue
-    assert not p.d_eligible, "no class: the pre-EZ state path (P) as before, not a stale kurz"
+    # EZ-S2b (review H1, R7): a refusal that names no extent is a MEASURE re-offer to D under the barrier -- no class, no P by state
+    assert p.measure_reoffer and p.d_eligible, "no class: re-offered to D (MEASURE_ON_D), not a stale kurz and not P by state"
 
 
 def test_n1_a_non_measured_entry_is_untouched():

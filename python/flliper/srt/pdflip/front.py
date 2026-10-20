@@ -12473,6 +12473,39 @@ class Front:
                             "big member waits its T_halb, R4)", granted, running, self.epoch)
         return running
 
+    def _r1u_running(self, running: int, members: Sequence["phase_policy.SetMember"]) -> int:
+        """SOLL R1u (user decision 20.10., rc26 13:21:56Z pdflip-10-81 u=3068 + R6 rest 2911 of pdflip-10-80, same session: S=5979 > X
+        flipped, P computed 797): the R6 rest and the members share an uncached piece -> counted ONCE. Takes the union of the
+        pieces out of the counted rests (``phase_policy.running_overlap``), exact from the front token ids and the depths; a
+        counted prefill whose ids are not kept is NAMED (``r1u_overlap_unknown``) and counts in full."""
+        if running <= 0 or not _fd.enabled():
+            return running
+        try:
+            counted = dict(self.__dict__.get("_r6_counted") or {})
+            ids = self.__dict__.get("_set_ids") or {}
+            sess_of = self.__dict__.get("_sess_by_rid") or {}
+            depths = self._set_st().get("depths") or {}
+            runs = []
+            for rid, rest in counted.items():
+                ia = ids.get(str(rid))
+                if ia is None or not sess_of.get(str(rid)):
+                    self.counters["r1u_overlap_unknown"] += 1
+                    continue
+                runs.append((str(rid), len(ia) - int(rest), int(rest), str(sess_of.get(str(rid)))))
+            mem = [(m.rid, int(depths.get(m.rid, 0)), str(sess_of.get(str(m.rid)) or "")) for m in members]
+            ov = phase_policy.running_overlap(runs, mem, lambda a, b: Front._set_common(self, a, b))
+        except Exception:  # noqa: BLE001 -- an exactness aid never breaks a verdict: the naive figure stands
+            return running
+        if ov > 0:
+            self.counters["r1u_overlap_tokens"] += ov
+            key = (running, ov)
+            if self.__dict__.get("_r1u_last") != key:
+                self.__dict__["_r1u_last"] = key
+                logger.info("PDFLIP R1U rest=%d overlap=%d counted_once=%d epoch=%d -- the running D prefill's rest and the set "
+                            "members share an uncached piece: counted ONCE in S (SOLL R1u, R1, R6)", running, ov, running - ov,
+                            self.epoch)
+        return max(0, running - ov)
+
     def _dc_d_busy(self) -> bool:
         """D decodes, or prefills a granted SHORT: the arrivals are priced as a SET (X-SUM-PRICE, ``carried`` in the sum).
         Only a decode lets the set WAIT (``_decode_collect``: ``decoding``); with ``carried`` alone the set is
@@ -13259,8 +13292,8 @@ class Front:
                    for m in members]
         _shared = sum(m.own_uncached - m.uncached for m in members if m.own_uncached)
         if _shared > 0:
-            # H16V F1/A5: S (decision, D side) is the sum of the own figures; P prefills the shared prefix once (S_P)
-            why = "%s [prefix-shared=%d: P counts once, S_P=%d]" % (why, _shared, max(0, int(sv.s_tokens) - _shared))
+            # R1u (20.10.): S is already the union figure (a shared piece once); the own figures only class the members
+            why = "%s [prefix-shared=%d counted once in S (R1u), S_own=%d]" % (why, _shared, int(sv.s_tokens) + _shared)
         if xk > 0:
             why = "%s xk=%d" % (why, xk)   # H16V review A2: X(k) is information only
         # EZ-S1: ONE record, SET-VERDICT (SOLL section 4, byte-identical to the H91 line) derived from the same data as the
@@ -13281,7 +13314,7 @@ class Front:
             Front._dec(self).record(_dr.Decision(
                 kind="set", action=verdict, rule=_rule, why=why, set_id=int(st["set_id"]),
                 rid=members[0].rid if len(members) == 1 else None, members=tuple(_mem), s_tokens=int(sv.s_tokens),
-                s_p_tokens=max(0, int(sv.s_tokens) - int(_shared if _shared > 0 else 0)), x=int(x_tok), half_x=int(sv.half_x),
+                s_p_tokens=max(0, int(sv.s_tokens)), x=int(x_tok), half_x=int(sv.half_x),
                 classes=tuple(classes), t_half_s=float(t_half), waited_s=float(waited),
                 numbers_age_ms_max=max([a.age_ms for a in _mem] or [0]), r6_rest=max(0, int(self._dc_carried_running())),
                 unstarted=int(unstarted), **_grp), edge=True)
@@ -13313,7 +13346,7 @@ class Front:
         # the user's word, and SOLL v2 has no such exception: a big member waits T_halb for company at EVERY
         # priority. ``urgent`` stays for the log only.
         urgent = Front._prio_urgent(self, cands)
-        running = self._dc_carried_running()
+        running = Front._r1u_running(self, self._dc_carried_running(), members)
         unstarted = 0
         if _fd.enabled():
             # EZ-S2a: ONE decision. S49's granted-not-started term is an INPUT of the verdict (NS:S49), not a second pass
@@ -13816,7 +13849,7 @@ class Front:
         decoding, seats = self._dc_decoding(), self._set_seats_free()
         sv = phase_policy.set_verdict(members=members, x_tokens=x_tok, half_frac=frac, t_half_s=0.0, now=now,
                                       t_open=min(m.t_arrive for m in members), d_decoding=decoding, seats_free=seats,
-                                      d_prefill_running_uncached=self._dc_carried_running(), new_since_last=0,
+                                      d_prefill_running_uncached=Front._r1u_running(self, self._dc_carried_running(), members), new_since_last=0,
                                       class_x_tokens=x_cls)
         self._set_log(st, members, sv, verdict=sv.verdict, why="queue-sum " + sv.why, x_tok=x_tok, frac=frac,
                       t_half=t_half, decoding=decoding, seats=seats, waited=0.0, x_cls=x_cls, xk=xk)

@@ -306,3 +306,64 @@ def test_a2b_ranks_merge_by_max_rest_not_by_the_later_start_stamp(tmp_path):
     assert _read9(tmp_path) == 182
     b.note_extend_done(rids=[_RID9])
     assert _read9(tmp_path) == 0
+
+
+# ---------------------------------------------------------------------------------------------------- R1u (user decision 20.10.)
+def _front_r1u(now, tmp_path, *, sess_a="s1", sess_b="s1", common_len=10000, depth_b=7000):
+    """rc26 13:21:56Z: pdflip-10-80 runs on D (N=10000, rest 2911 -> uncached [7089, 10000)), the halb member pdflip-10-81 (u=3068,
+    ids = A's 10000 + its own tail, depth 7000, same session) waits; X=5229. Naive S = 3068 + 2911 = 5979 > X -> REROUTE_P;
+    the union is S = 3068 (the 2911 are the member's own tail's front)."""
+    import numpy as np
+    xx = 5229
+    f = _fake_front(running=["dec"], n=6, kv={"available": 400000, "evictable": 0})
+    f.tp_prefill_max_tokens = xx
+    f.t_awake = now - 60.0
+    f._sync_batch_gate = lambda: None
+    ra, rb = "pdflip-10-80", "pdflip-10-81"
+    f._d_pf_book().grant(rid=ra, tokens=2911, now=now - 2.0)
+    f._d_pf_book().enter_leg2(rid=ra)
+    f.groups["D"].outstanding[ra] = now - 2.0
+    f._rvp_state()
+    f.__dict__.setdefault("_d_prefill_legs", {})[ra] = now - 2.0
+    f._leg2_lookahead.add(ra)
+    _beacon_reading(f, tmp_path, ra, now - 1.5, 2911, 1000, done=False)       # chunk running: rest 2911 counts
+    ids_a = np.arange(10000, dtype=np.int32)
+    ids_b = np.concatenate([ids_a[:common_len], np.arange(50000, 50000 + (7000 + 3068 - common_len), dtype=np.int32)])
+    f.__dict__["_set_ids"] = {ra: ids_a, rb: ids_b}
+    f.__dict__["_sess_by_rid"] = {ra: sess_a, rb: sess_b}
+    f.__dict__["_set_depth"] = {ra: 7089, rb: depth_b}
+    f._set_st()["shorts"][rb] = (now - 1.0, 3068, xx)
+    return f
+
+
+def test_r1u_a_shared_piece_of_the_running_rest_and_a_member_counts_once_no_flip(monkeypatch, caplog, tmp_path):
+    """SOLL R1u/R1/R6, the live case: S_union = 3068 < X = 5229 -> COLLECT (R3), no REROUTE_P (naive S = 5979)."""
+    _on(monkeypatch)
+    now = time.time()
+    f = _front_r1u(now, tmp_path)
+    with envs.FLLIPER_PDFLIP_DECIDER.override(True), caplog.at_level(logging.INFO, logger="pdflip.front"):
+        dc = f._decode_collect(now)
+    sv = [m for m in caplog.messages if "PDFLIP SET-VERDICT" in m]
+    assert dc == "hold", (dc, sv)
+    assert not any("verdict=REROUTE_P" in m for m in sv) and f.counters["set_reroute_p"] == 0
+    assert any(" S=3068 " in m for m in sv), sv
+    assert f.counters["r1u_overlap_tokens"] == 2911 and any("PDFLIP R1U" in m for m in caplog.messages)
+
+
+def test_r1u_siblings_without_overlap_keep_the_sum(monkeypatch, tmp_path):
+    """Another session, and the same session whose prompts diverge before the uncached range: no overlap, S = 5979 > X -> flip."""
+    _on(monkeypatch)
+    now = time.time()
+    for kw in ({"sess_b": "s2"}, {"common_len": 100}):
+        f = _front_r1u(now, tmp_path, **kw)
+        with envs.FLLIPER_PDFLIP_DECIDER.override(True):
+            assert f._decode_collect(now) == "P" and f.counters["set_reroute_p"] == 1
+        assert f.counters["r1u_overlap_tokens"] == 0
+
+
+def test_r1u_pure_union_of_member_pieces_counts_each_token_once():
+    """Two members covering overlapping parts of A's rest: the union, not the sum, is taken out."""
+    ids = {("A", "B"): 9000, ("A", "C"): 9500}
+    ov = pp.running_overlap([("A", 7000, 3000, "s")], [("B", 7000, "s"), ("C", 8000, "s")], lambda a, b: ids[(a, b)])
+    assert ov == 2500          # B: [7000,9000), C: [8000,9500) -> union [7000,9500)
+    assert pp.running_overlap([("A", 7000, 3000, "")], [("B", 7000, "")], lambda a, b: 9000) == 0     # unknown session
