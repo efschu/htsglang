@@ -5,7 +5,7 @@ THE METAL, reconstructed rid by rid:
   The open leg 2s rebuilt from acquire/release equal the logged ``d_outstanding``, the P-served hand-offs not yet
   admitted equal ``ready_for_d`` (every DP-WAIT sample) -- ``taken`` counts no dead rid. Its excess over ``n`` after
   06:00 is the live D line (4-11 hand-offs waiting for a seat) and legs D holds without a seat.
-* The seat-count defect: ``SEAT-ROTATE`` (43x, 41 in hour 06) released the deferred parked rid's seat
+* The seat-count defect: ``SEAT-ROTATE`` (54x, 47 in hour 06) released the deferred parked rid's seat
   (``D-REFILL freed_by=rotate``) and passed its permit on, while D resumed the rid anyway (``PARK-RESUME`` lists it
   beside ``PARK-RESUME-DEFERRED``) and decoded it: up to 3 legs at a time without a seat next to 6 seated ones
   (``PARK-RUNNING parked=7``). pdflip-166-3095: rotated 4 times (06:25:50, 06:26:23, 06:26:52, 06:27:15), released
@@ -179,6 +179,10 @@ def _sse(obj) -> bytes:
 
 def _fake_d(mode):
     async def chat(request):
+        if mode == "w50":
+            # D's named X refusal (W31 PdFlipTpPrefillExceeded), the non-stream 503 shape
+            return web.json_response({"error": {"message": "W31 " + F.X_REFUSAL_MARKER + " rid=r1 extent=20000 > "
+                                                "riegel=4096"}}, status=503)
         if mode == "reroute":
             return web.json_response({"choices": [{"message": {"content": "x"}, "finish_reason": "stop"}],
                                       "usage": {"prompt_tokens": 20000, "completion_tokens": 1,
@@ -223,9 +227,9 @@ async def _leg(mode, hang_up=False, state=None):
     v0 = front._d_seat._value
     state = {} if state is None else state
     state["front"], state["seat"], state["v0"] = front, seat, v0
-    stream = mode != "reroute"
+    stream = mode not in ("reroute", "w50")
     pending = None
-    if mode == "reroute":
+    if mode in ("reroute", "w50"):
         pending = F.Pending("r1", "/v1/chat/completions", {}, PROMPT, time.time(),
                             asyncio.get_running_loop().create_future(), est_prompt=20000, est_uncached=100)
         pending.seat = seat
@@ -249,7 +253,7 @@ async def _leg(mode, hang_up=False, state=None):
             task = asyncio.ensure_future(cs.post(f"http://{host}:{port}/v1/chat/completions",
                                                  json={"messages": [{"role": "user", "content": PROMPT}],
                                                        "stream": stream}))
-            if mode == "reroute":
+            if mode in ("reroute", "w50"):
                 for _ in range(200):                      # the re-queue: the seat must be back BEFORE it waits
                     if pending in front.queue:
                         break
@@ -273,7 +277,7 @@ async def _leg(mode, hang_up=False, state=None):
                 except (asyncio.TimeoutError, aiohttp.ClientError):
                     pass
                 resp.close()
-        for _ in range(100 if mode != "reroute" else 10):
+        for _ in range(100 if mode not in ("reroute", "w50") else 10):
             if state.get("done"):
                 break
             await asyncio.sleep(0.02)
@@ -358,3 +362,241 @@ def test_metal_park_no_seat_pattern_the_waiting_short_gets_its_seat_in_age_order
             order.append(next(x for x in rotated if not _seats_of(f, x)[0].on_credit and x not in order))
     assert order == ["pdflip-190-3140", "pdflip-214-3200", short], order
     assert _seats_of(f, "pdflip-230-3244")[0].on_credit, "the younger debtor took the seat before the older short"
+
+
+# ---- S87r (review done/nf-review-s87-1020.md): A1 the permit is never lost, A3 the three untested end paths,
+# ---- A4 the D-line waiters the admitter skips do not hold a debt's settlement back.
+
+
+def test_a1_exception_in_age_check_must_not_lose_a_permit(loop, monkeypatch):
+    """A1 (reviewer test test_danger_exception_in_age_check_must_not_lose_a_permit, RED on 69835d46f1: permits 0):
+    release() runs in leg 2's finally and has set held=False / left _d_seats_live BEFORE _pass_permit; a raising age
+    check (_older_waiter_than / _sa_key / _asr_verdict_stale) must still return the permit."""
+    f = _front()
+    s1 = F.Seat(f, "pdflip-1-10", "batch")
+    s2 = F.Seat(f, "pdflip-1-20", "short", on_credit=True)
+
+    def boom(*a, **k):
+        raise KeyError("x")
+    monkeypatch.setattr(Front, "_older_waiter_than", boom)
+    s1.release("leg2_finished")          # must not raise out of leg 2's finally either
+    s2.release("leg2_finished")
+    assert f._d_seat._value == 1, "the permit of s1 was lost (permits %d)" % f._d_seat._value
+    assert f.counters["d_seat_pass_permit_raised"] == 1
+
+
+def test_a3_end_path_w50_requeue_returns_the_seat_before_the_requeue():
+    """A3: D refuses by name (W31 -> W50 requeue): the seat is back BEFORE the request waits in P's queue, once."""
+    front, seat, v0, st = asyncio.run(_leg("w50"))
+    held, gained, pseat = st["at_requeue"]
+    assert held is False and gained == 1 and pseat is None, st["at_requeue"]
+    assert front.counters["W50_PdFlipTpPrefillExceeded"] == 1
+    assert front._d_seat._value - v0 == 1, "the W50 requeue's seat came back twice or not at all"
+
+
+def _bare_front():
+    front = Front("http://p", "http://d", "D", "t", "", 0, 0, {}, 45.0, carrier_max_tokens=27466,
+                  tp_prefill_max_tokens=4096)
+    return front
+
+
+def test_a3_end_path_park_handback_returns_the_seat_before_the_requeue():
+    """A3: PARK-HANDBACK closes D's unstarted prefill leg; the seat is back before the request joins P's queue."""
+    async def run():
+        front = _bare_front()
+
+        async def rpc(*a, **k):
+            raise ConnectionError("no D in this test")
+        front.rpc = rpc
+        seat = F.Seat(front, "r1", "batch")
+        v0 = front._d_seat._value
+        p = F.Pending("r1", "/v1/chat/completions", {}, PROMPT, time.time(),
+                      asyncio.get_running_loop().create_future(), est_prompt=20000, est_uncached=100)
+        p.seat = seat
+        task = asyncio.ensure_future(front._requeue_park_handback(None, "r1", {}, PROMPT, False, p, seat))
+        for _ in range(200):
+            if p in front.queue:
+                break
+            await asyncio.sleep(0.01)
+        at_requeue = (p in front.queue, seat.held, front._d_seat._value - v0, p.seat)
+        p.fut.set_exception(F.PdFlipStop("W0", "test end"))
+        resp = await asyncio.wait_for(task, 3.0)
+        return front, seat, v0, at_requeue, resp
+
+    front, seat, v0, at_requeue, resp = asyncio.run(run())
+    assert at_requeue == (True, False, 1, None), at_requeue
+    assert resp.status == 503
+    assert front._d_seat._value - v0 == 1 and seat not in front._d_seats_live
+
+
+def test_a3_end_path_client_gone_before_d_returns_the_seat(monkeypatch):
+    """A3: H102 -- the client left before its leg 2 was posted: D is not asked, the seat goes straight back, once."""
+    monkeypatch.setattr(F, "client_gone", lambda request: True)
+    monkeypatch.setattr(F, "response_complete", lambda request: False)
+
+    async def run():
+        front = _bare_front()
+        seat = F.Seat(front, "r1", "batch")
+        v0 = front._d_seat._value
+        resp = await front.leg2(object(), "r1", {}, PROMPT, False, None, seat=seat)
+        return front, seat, v0, resp
+
+    front, seat, v0, resp = asyncio.run(run())
+    assert resp.status == 499
+    assert front.counters["client_gone_pre_d"] == 1
+    assert not seat.held and seat not in front._d_seats_live
+    assert front._d_seat._value - v0 == 1
+    assert "r1" not in front.groups["D"].outstanding, "D must not be asked for it"
+
+
+HEAD_OLD = "pdflip-1-10"      # the D line's head, older than the debtor
+DEBTOR = "pdflip-1-30"        # an S46 F5 AGE PLAN head seated on credit
+YOUNG = "pdflip-1-50"         # a younger hand-off the SA backfill would seat
+
+
+@pytest.mark.parametrize("why", ["kv_blocked", "token_budget", "s46_f4_hold", "s60_f3_yield"])
+def test_a4_skipped_older_d_line_entry_does_not_hold_the_settlement_back(loop, why):
+    """A4: the admitter skipped the older head on its last pass (``_d_admit_skip``) -- it would not take a passed
+    permit, so the freed permit settles the debt (as rc19 did) instead of going to the semaphore, where the admitter
+    would seat a YOUNGER request and leave the debt standing (D longer over d_bs, exactly under KV pressure)."""
+    f = _front()
+    victim = F.Seat(f, "pdflip-1-5", "batch")
+    head = F.Seat(f, DEBTOR, "short", on_credit=True)
+    f._ready_for_d.append(_waiter(loop, HEAD_OLD))
+    Front._d_admit_skip_note(f, HEAD_OLD, why)
+    assert Front._older_waiter_than(f, DEBTOR) is False
+    victim.release("leg2_finished")
+    assert head.on_credit is False and f._d_seat._value == 0, (head.on_credit, f._d_seat._value)
+
+
+def test_a4_an_older_head_the_admitter_takes_still_wins_the_permit(loop):
+    """A4, the other direction (S87 PRIO=ALTER unchanged): an older head the admitter would seat (no skip verdict,
+    or a cleared one) takes the permit; the debt waits."""
+    f = _front()
+    victim = F.Seat(f, "pdflip-1-5", "batch")
+    head = F.Seat(f, DEBTOR, "short", on_credit=True)
+    f._ready_for_d.append(_waiter(loop, HEAD_OLD))
+    Front._d_admit_skip_note(f, HEAD_OLD, "kv_blocked")
+    Front._d_admit_skip_note(f, HEAD_OLD, None)          # the next pass found it admissible
+    assert Front._older_waiter_than(f, DEBTOR) is True
+    victim.release("leg2_finished")
+    assert head.on_credit is True and f._d_seat._value == 1
+
+
+def _admitter_front(loop_entries, fits, monkeypatch, token_blocks=False, dormant=False, yields=False):
+    front = _bare_front()
+    front._d_seat = asyncio.Semaphore(0)       # every seat held: the admitter parks at the acquire
+    front._d_accepts_leg2 = lambda: True
+
+    async def reading():
+        return {}
+    front._d_reading_if_armed = reading
+    front._d_budget_fits = lambda est, rd, l1: fits(est)
+    front._d_token_budget_blocks = (lambda rid, est, rd, l1: token_blocks(est)) if callable(token_blocks) else (
+        lambda rid, est, rd, l1: token_blocks)
+    front._hl_check = lambda p, where: False
+    monkeypatch.setattr(Front, "_dormant_hold_for_older", lambda self, p: dormant and p.rid == HEAD_OLD)
+    monkeypatch.setattr(Front, "_d_line_admit_yields", lambda self, p: yields and p.rid == HEAD_OLD)
+    for q in loop_entries:
+        front._ready_for_d.append(q)
+    return front
+
+
+def _pend_est(rid, est):
+    p = F.Pending(rid, "/v1/messages", {}, "t", time.time() - 300, asyncio.get_running_loop().create_future(),
+                  est_prompt=est, est_uncached=est, span_known=True)
+    p.leg1_done, p.t_ready = True, time.time() - 250
+    return p
+
+
+@pytest.mark.parametrize("case", ["kv_blocked", "token_budget", "s46_f4_hold", "s60_f3_yield"])
+def test_a4_the_real_d_admitter_records_its_skip_and_the_debt_settles(monkeypatch, case):
+    """A4 against the REAL ``d_admitter`` loop: the older head is skipped (KV-blocked with a fitting younger
+    backfill / token budget / S46 F4 hold / S60 F3 yield). A normal seat then frees: the debt of the AGE PLAN head
+    DEBTOR (younger than the skipped head, older than the backfill) is settled -- the permit does not go to the
+    semaphore for the younger one. Before A4 the skipped head counted as an older waiter: permit to the semaphore,
+    the admitter seats YOUNG, the debt stands."""
+    async def run():
+        head = _pend_est(HEAD_OLD, 5000)
+        young = _pend_est(YOUNG, 500)
+        front = _admitter_front(
+            [head, young], fits=lambda est: est <= (1000 if case == "kv_blocked" else 10 ** 9),
+            monkeypatch=monkeypatch, token_blocks=(case == "token_budget"),
+            dormant=(case == "s46_f4_hold"), yields=(case == "s60_f3_yield"))
+        victim = F.Seat(front, "pdflip-1-5", "batch")
+        debt = F.Seat(front, DEBTOR, "short", on_credit=True)
+        task = asyncio.ensure_future(front.d_admitter())
+        for _ in range(40):
+            await asyncio.sleep(0.05)
+            if HEAD_OLD in (front.__dict__.get("_d_admit_skip") or {}):
+                break
+        skip = dict(front.__dict__.get("_d_admit_skip") or {})
+        victim.release("leg2_finished")
+        await asyncio.sleep(0.2)
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            pass
+        return front, skip, debt
+
+    front, skip, debt = asyncio.run(run())
+    assert skip.get(HEAD_OLD) == case, skip
+    assert debt.on_credit is False, "the skipped older head held the debt's settlement back (S87r A4)"
+    assert front.counters["d_seat_credit_settled"] == 1
+    assert not any(s.rid == YOUNG for s in front._d_seats_live), "the younger one took the permit past the debt"
+
+
+def test_a4_an_older_done_entry_does_not_hold_the_settlement_back(loop):
+    """A resolved / failed / cancelled D-line entry takes no seat (the admitter pops it, d_admit_skipped_done): it
+    is no older waiter, the freed permit settles the debt (review mutant ML)."""
+    f = _front()
+    victim = F.Seat(f, "pdflip-1-5", "batch")
+    head = F.Seat(f, DEBTOR, "short", on_credit=True)
+    gone = _waiter(loop, HEAD_OLD)
+    gone.fut.cancel()
+    f._ready_for_d.append(gone)
+    victim.release("leg2_finished")
+    assert head.on_credit is False and f._d_seat._value == 0
+
+
+def test_a4_the_real_d_admitter_clears_its_skip_when_the_head_becomes_admissible(monkeypatch):
+    """A4, the clearing half against the REAL ``d_admitter``: the older head is skipped on one pass (no room: no
+    younger fits, its token budget blocks), then the room is there. The admitter clears its verdict, so the head counts again as the older waiter: the
+    freed permit goes to the semaphore and the HEAD takes it -- the younger debt waits (PRIO=ALTER)."""
+    async def run():
+        room = {"fits": False}
+        head = _pend_est(HEAD_OLD, 5000)
+        young = _pend_est(YOUNG, 6000)
+        # the gate prices with the same room the probe reads: no room -> no backfill fits AND the head's token
+        # budget blocks (FIX 4a), the head is skipped; room -> it passes both and takes the next permit
+        front = _admitter_front([head, young], fits=lambda est: room["fits"], monkeypatch=monkeypatch,
+                                token_blocks=lambda est: not room["fits"])
+        victim = F.Seat(front, "pdflip-1-5", "batch")
+        debt = F.Seat(front, DEBTOR, "short", on_credit=True)
+        task = asyncio.ensure_future(front.d_admitter())
+        for _ in range(40):
+            await asyncio.sleep(0.05)
+            if (front.__dict__.get("_d_admit_skip") or {}).get(HEAD_OLD) == "token_budget":
+                break
+        blocked = dict(front.__dict__.get("_d_admit_skip") or {})
+        room["fits"] = True
+        for _ in range(40):
+            await asyncio.sleep(0.05)
+            if HEAD_OLD not in (front.__dict__.get("_d_admit_skip") or {}):
+                break
+        cleared = dict(front.__dict__.get("_d_admit_skip") or {})
+        victim.release("leg2_finished")
+        await asyncio.sleep(0.3)
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            pass
+        return front, blocked, cleared, debt
+
+    front, blocked, cleared, debt = asyncio.run(run())
+    assert blocked.get(HEAD_OLD) == "token_budget", blocked
+    assert HEAD_OLD not in cleared, cleared
+    assert debt.on_credit is True, "the debt was settled past the older admissible head"
+    assert front.counters["d_seat_credit_yield_older"] == 1

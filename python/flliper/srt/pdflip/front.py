@@ -3995,14 +3995,25 @@ class Seat:
         permit goes to the semaphore and the older waiter takes it (S87, PRIO=ALTER: settling a debt never overtakes
         an older request; the debt stays for the next freed seat). The permits stay the count of normal seats."""
         front = self.front
-        debtor, dk = None, None
-        for s in list(front._d_seats_live):
-            if s is self or not getattr(s, "on_credit", False):
-                continue
-            k = Front._seat_age_key(front, s)
-            if debtor is None or k < dk:
-                debtor, dk = s, k
-        if debtor is not None and not Front._older_waiter_than(front, debtor.rid):
+        try:
+            debtor, dk = None, None
+            for s in list(front._d_seats_live):
+                if s is self or not getattr(s, "on_credit", False):
+                    continue
+                k = Front._seat_age_key(front, s)
+                if debtor is None or k < dk:
+                    debtor, dk = s, k
+            settle = debtor is not None and not Front._older_waiter_than(front, debtor.rid)
+        except Exception:  # noqa: BLE001 -- S87r A1: the permit is never lost
+            # release() already set held=False and left _d_seats_live; it runs in leg 2's finally, so a raising age
+            # check here would drop this permit for the rest of the boot (the rc19 loop could not raise). The permit
+            # goes to the semaphore -- the plain rc19 return -- and an open debt waits for the next freed seat.
+            front.counters["d_seat_pass_permit_raised"] += 1
+            logger.warning("PDFLIP D-SEAT-PASS-PERMIT rid=%s raised in the age check -- the permit goes to the "
+                           "semaphore (S87r A1: never lost)", self.rid, exc_info=True)
+            front._d_seat.release()
+            return
+        if settle:
             debtor.on_credit = False
             front.counters["d_seat_credit_settled"] += 1
         else:
@@ -4011,7 +4022,7 @@ class Seat:
             front._d_seat.release()
 
     def to_credit(self, why: str) -> bool:
-        """S87 (rc19 ..._1019_230333, 41 SEAT-ROTATE in hour 06): the rid keeps its seat as a DEBT -- D goes on
+        """S87 (rc19 ..._1019_230333, 54 SEAT-ROTATE, 47 in hour 06): the rid keeps its seat as a DEBT -- D goes on
         holding it (PARK-RESUME resumes the deferred rid; the deferral is the front's only) -- and the permit it held
         goes on now (to the older request the rotation chose). The next freed permit settles the debt before a
         younger request is admitted; the seat itself is released only where every seat is: at leg 2's end. False =
@@ -12014,8 +12025,15 @@ class Front:
             k = Front._sa_key(self, rid)
         except Exception:  # noqa: BLE001 - no SA order: nobody is older by it
             return False
+        # S87r A4: a D-line entry the admitter SKIPS on its last pass would not take the permit -- the KV-blocked
+        # head (SA BACKFILL seats a younger one), the token-budget-blocked head, the S46 F4 D-ADMIT-HOLD, the S60 F3
+        # D-LINE-YIELD -- so it does not count, exactly as the ARRIVAL-SEAT branch below skips a blocked waiter.
+        # The admitter's own verdict, recorded per rid (``_d_admit_skip``), never a re-derivation here.
+        skipped = self.__dict__.get("_d_admit_skip") or {}
         for q in list(getattr(self, "_ready_for_d", ()) or ()):
             if getattr(q, "rid", None) == rid or getattr(getattr(q, "fut", None), "done", lambda: True)():
+                continue
+            if getattr(q, "rid", None) in skipped:
                 continue
             if Front._sa_key(self, q) < k:
                 return True
@@ -12029,6 +12047,21 @@ class Front:
                 continue    # blocked by its own elders / its KV: it would not take the permit
             return True
         return False
+
+    def _d_admit_skip_note(self, rid: str, why: Optional[str]) -> None:
+        """S87r A4: the d_admitter's verdict on a D-line entry at its last pass -- ``why`` = it skipped it
+        (``kv_blocked`` SA BACKFILL head / non-fitting backfill candidate, ``token_budget`` FIX 4a, ``s46_f4_hold``,
+        ``s60_f3_yield``), None = it takes the next permit. ``_older_waiter_than`` reads it: a skipped entry would not
+        take a passed permit, so it does not hold a debt's settlement back. Written only by the admitter."""
+        d = self.__dict__.setdefault("_d_admit_skip", {})
+        if why is None:
+            d.pop(rid, None)
+            return
+        d[rid] = why
+        if len(d) > 1024:
+            live = {getattr(q, "rid", None) for q in (getattr(self, "_ready_for_d", ()) or ())}
+            for r in [r for r in d if r not in live]:
+                d.pop(r, None)
 
     def _seat_leg_unseated(self, outstanding, rvp) -> List[str]:
         """S87 SEAT-LEG-UNSEATED, the invariant: every leg 2 D holds (``D.outstanding`` minus the RESUME-VIA-P holds,
@@ -14545,6 +14578,7 @@ class Front:
                     # PROBES ONLY (_d_budget_fits, pure): the one gate call
                     # below prices the request that is then seated, with the
                     # same derivation the Seat charge uses (FIX 7 C3e).
+                    Front._d_admit_skip_note(self, p.rid, "kv_blocked")   # S87r A4
                     for _q in list(self._ready_for_d)[1:8]:
                         if _q.fut.done():
                             continue
@@ -14557,6 +14591,7 @@ class Front:
                             continue
                         if self._d_budget_fits(_q.est_prompt, _reading,
                                                _q.leg1_prompt_tokens):
+                            Front._d_admit_skip_note(self, _q.rid, None)   # S87r A4: the backfill takes it
                             self._ready_for_d_drop(_q)
                             self._ready_for_d.appendleft(_q)
                             self.counters["seat_age_backfill"] += 1
@@ -14565,6 +14600,7 @@ class Front:
                                         _q.rid, p.rid)
                             p = _q
                             break
+                        Front._d_admit_skip_note(self, _q.rid, "kv_blocked")   # S87r A4: does not fit either
                 if self._d_token_budget_blocks(p.rid, p.est_prompt,
                                                _reading,
                                                p.leg1_prompt_tokens):
@@ -14573,16 +14609,21 @@ class Front:
                     # the refill the budget is waiting for.  `continue` and
                     # not a pop: the head STAYS the head (law 2), so a younger
                     # request that would fit cannot be admitted past it.
+                    Front._d_admit_skip_note(self, p.rid, "token_budget")   # S87r A4
                     continue
                 if Front._dormant_hold_for_older(self, p):
+                    Front._d_admit_skip_note(self, p.rid, "s46_f4_hold")   # S87r A4
                     continue   # S46 F4: an older request is still on P -- D is asleep, the seat waits for it
                 if Front._d_line_admit_yields(self, p):
+                    Front._d_admit_skip_note(self, p.rid, "s60_f3_yield")   # S87r A4
                     continue   # S60 F3: an older kurz request waits for a D seat -- it goes first (PRIO=ALTER)
+                Front._d_admit_skip_note(self, p.rid, None)   # S87r A4: this head takes the next permit
                 _line_seen = {id(q) for q in self._ready_for_d}
                 await self._d_seat.acquire()
                 if Front._d_line_admit_yields(self, p):
                     # S60 F3: an older kurz request became due while this admitter waited -- the permit goes back
                     # (to the next one at the semaphore: the older request's own acquire)
+                    Front._d_admit_skip_note(self, p.rid, "s60_f3_yield")   # S87r A4
                     self._d_seat.release()
                     continue
                 if Front._d_line_older_newcomer(self, p, _line_seen):
