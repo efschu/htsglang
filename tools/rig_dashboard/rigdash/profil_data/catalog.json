@@ -55615,7 +55615,7 @@
      "source": {
       "file": "pdflip/front.py",
       "kind": "os.environ",
-      "line": 4398
+      "line": 4439
      }
     }
    },
@@ -69876,7 +69876,7 @@
    "id": "FLLIPER_PDFLIP_MODE_PARITY_CHECK",
    "kind": "env",
    "lesestellen": [
-    "pdflip/front.py:6626"
+    "pdflip/front.py:6670"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_MODE_PARITY_CHECK",
@@ -69885,7 +69885,7 @@
    "source": {
     "file": "pdflip/front.py",
     "kind": "os.environ",
-    "line": 6626,
+    "line": 6670,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -78246,7 +78246,7 @@
      "source": {
       "file": "pdflip/front.py",
       "kind": "os.environ",
-      "line": 4496
+      "line": 4537
      }
     }
    },
@@ -91631,7 +91631,7 @@
   },
   "unexplained": 668
  },
- "tree_rev": "27b=0798c91fcd+nf=0df2aa617d",
+ "tree_rev": "27b=0798c91fcd+nf=5921ccc3ba",
  "trees": {
   "27b": {
    "entries": 2643,
@@ -91639,7 +91639,7 @@
   },
   "nf": {
    "entries": 2694,
-   "rev": "0df2aa617d"
+   "rev": "5921ccc3ba"
   }
  },
  "warnungen": []
