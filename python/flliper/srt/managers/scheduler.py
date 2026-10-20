@@ -15701,7 +15701,12 @@ class Scheduler(
                     self.tree_cache.release_aborted_request(req.rid)
                 elif self.enable_hierarchical_cache:
                     self.tree_cache.terminate_prefetch(req.rid)
-                _pdflip_rvp.keep_on_d(self, req, uncached, x)
+                # S107 (SOLL R7): a wall-row extent is the device rows the head needs, not its uncached extent -- the
+                # record says so (the same replicated term on every rank; only TP0 writes the file)
+                if wall_rows is not None and id(req) in wall_rows:
+                    _pdflip_rvp.keep_on_d(self, req, uncached, x, reason=_pdflip_rvp.REASON_WALL)
+                else:
+                    _pdflip_rvp.keep_on_d(self, req, uncached, x)
                 continue
             message = (
                 f"W50 PdFlipTpPrefillExceeded: this group may prefill at most {x} uncached "

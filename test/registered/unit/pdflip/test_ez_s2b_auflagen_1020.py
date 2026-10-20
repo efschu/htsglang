@@ -171,15 +171,16 @@ def _rvp_text_member(monkeypatch, tmp_path):
     return p, mem[0]
 
 
-@pytest.mark.xfail(strict=True, reason="EZ-S2b review A4 / N6 (07:20Z KURZ-NACH-P-R5): a TEXT rvp pending is p_only by state (front.py "
-                   "_rvp_take, text branch), so a kurz u=875 is classed p_only (R9 is vision only) and PBOUND-FLIP-NOW fired at "
-                   "S_eff 7361 < X. NOT fixed here: its P leg is the only way D's PARKED stream gets its context (resume_via_p); "
-                   "class kurz alone would make it no flip trigger (R7) and leave D's stream waiting for a P phase nobody "
-                   "starts -- a hang risk that needs the planner's decision on who serves a midstream-refused kurz request "
-                   "(S3a). The pin turns green when the class comes from d_extent and a serving owner exists.")
 def test_a4_a_text_rvp_pending_is_not_p_only_by_state(monkeypatch, tmp_path):
+    """S107 (was the strict-xfail pin of EZ-S2b review A4 / N6, 07:20Z KURZ-NACH-P-R5): a TEXT rvp leg classes by its
+    exact u (d_extent 875 < X 7647: kurz), never p_only by state (R9 is vision only, R7 no flip under X). Its owner: it
+    rides a decided flip (R1a) and D's own park re-offer serves the held stream -- the leg is never handed to D's line."""
     p, m = _rvp_text_member(monkeypatch, tmp_path)
     assert m.p_only is False
+    assert p.p_only is False and p.est_uncached == 875
+    assert pp.classify_arrival(875, 7647, 0.5, False) == pp.CLASS_KURZ
+    p.d_eligible = True
+    assert p.d_eligible is False, "a RESUME-VIA-P leg is P's by routing: no D line may take it"
 
 
 def test_a4_a_vision_rvp_pending_is_p_only_r9(monkeypatch, tmp_path):

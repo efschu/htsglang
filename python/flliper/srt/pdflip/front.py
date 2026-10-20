@@ -4102,6 +4102,15 @@ class Pending:
     #: context of a request D keeps parked mid-stream; no leg 2 follows (D
     #: still holds the client's stream).
     resume_via_p: bool = False
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        # S107 (SOLL R7/R9, NF 20.10.): a RESUME-VIA-P leg is a P-only leg 1 BY ROUTING (``/generate`` with D's context
+        # ids, max_new_tokens=1; D holds the client's stream and re-offers it itself) -- never a request D's admission
+        # line may take. Its CLASS is its exact u (a text leg is no longer ``p_only`` by state), so every path that hands
+        # a kurz queue entry to D (``d_eligible``) would otherwise reach it: the one guard sits here, not at N sites.
+        if name == "d_eligible" and value and self.__dict__.get("resume_via_p", False):
+            value = False
+        object.__setattr__(self, name, value)
     #: #243 seam (pdflip/handoff_seam.py): how often this rid went back to P
     #: because its hand-off was LOST while it waited for a D seat. Bounded at
     #: one -- a second loss over X ends the rid by name (W35), never sent to D.
@@ -5774,16 +5783,32 @@ class Front:
                     payload["extra_key"] = str(_ek)
                     logger.info("PDFLIP NS-ISOLATED rvp rid=%s ns=salted (Q-530: the needs-P leg runs "
                                 "in the request's namespace)", rid)
+                # S107 (SOLL R7, R9; user 19.10. "Bild-Token im gecachten Präfix brauchen keinen Tower", user 20.10.
+                # "Ist das Bild samt Kontext gecacht, wird nichts geladen und nicht geflippt"): a TEXT leg is no p_only by
+                # state -- R9 is the vision branch above (an image in D's uncached tail). It classes by its exact u: D's
+                # measured extent, or -- for a wall refusal, whose extent is DEVICE ROWS, not uncached tokens -- the
+                # request's exact number (D tree + store). Over X it needs P as before (gross); under X it is no flip reason
+                # (R7): it rides a decided flip (R1a) and D's own park re-offer serves the held stream when D has room.
+                _u, _usrc = Front._rvp_text_u(self, rid, r)
                 p = Pending(rid=rid, path="/generate", payload=payload, text=f"\x00rvp:{rid}",
                             t_arrive=now, fut=asyncio.get_event_loop().create_future(),
-                            est_prompt=len(ids), est_uncached=int(r.get("d_extent") or len(ids)),
-                            span_known=True, p_only=True, resume_via_p=True,
+                            est_prompt=len(ids), est_uncached=int(_u),
+                            span_known=True, p_only=False, resume_via_p=True,
                             lane=Front._lane_for(self, rid))
+                _xo = int(r.get("x") or 0) or int(getattr(self, "tp_prefill_max_tokens", 0) or 0)
+                try:
+                    _cls = phase_policy.classify_arrival(int(_u), _xo, Front._set_cfg()[0], False)
+                except Exception:  # noqa: BLE001 -- an instrument
+                    _cls = "?"
+                self.counters["rvp_text_classed"] = self.counters.get("rvp_text_classed", 0) + 1
+                logger.info("RESUME-VIA-P CLASS rid=%s u=%d u_src=%s class=%s X=%d d_extent=%d reason=%s -- a text leg classes "
+                            "by its exact u, never p_only by state (S107, SOLL R7 R9)", rid, int(_u), _usrc, _cls, _xo,
+                            int(r.get("d_extent") or 0), r.get("reason", "?"))
             self.queue.append(p)
             self._rvp_inflight.add(rid)
             self.counters["rvp_rerouted"] += 1
             Front._lane_reprefill(self, rid)  # PRIORITY LANES 1008 (L4): a lane resume without a prefix is counted
-            if str(r.get("reason", "")).startswith("x_refusal_midstream"):
+            if str(r.get("reason", "")).startswith(("x_refusal_midstream", _rvp.REASON_WALL)):
                 self.counters["route_reroute_midstream"] = self.counters.get("route_reroute_midstream", 0) + 1  # FEHLT 8
             logger.warning(
                 "PDFLIP W50-REROUTE rid=%s front_price=%s d_extent=%d reason=%s path=%s "
@@ -5802,6 +5827,52 @@ class Front:
         if reqs:
             self._kick_controller("arrival")
         return len(reqs)
+
+    def _rvp_text_u(self, rid: str, rec: dict) -> Tuple[int, str]:
+        """S107: the u a TEXT RESUME-VIA-P leg classes by. D's ``d_extent`` is its X gate's uncached extent -- except for
+        a wall refusal (``REASON_WALL``): that extent is the device rows the head needs (load-back + extend), so the
+        request's exact number is the front's D-probe price (D tree + store, ``class_uncached``); without one the rows
+        stand (named, ``u_src=d_rows``) -- never a number invented here."""
+        d_ext = int(rec.get("d_extent") or len(rec.get("input_ids") or ()))
+        if str(rec.get("reason", "")) != _rvp.REASON_WALL:
+            return d_ext, "d_extent"
+        xp = (self.__dict__.get("_probe_price") or {}).get(str(rid))
+        if xp is None:
+            return d_ext, "d_rows"
+        try:
+            # the context D holds is prompt + streamed output: the output past the probed prompt is uncached too
+            n_ctx = len(rec.get("input_ids") or ())
+            extra = max(0, n_ctx - (int(xp.covered) + int(xp.uncached))) if n_ctx else 0
+            return min(d_ext, int(_dmp.class_uncached(xp)) + extra), "d_probe"
+        except Exception:  # noqa: BLE001 -- a malformed price: the rows, named
+            return d_ext, "d_rows"
+
+    def _wall_extent_to_u(self, rid: str, body: bytes, d_extent: Optional[int]) -> Optional[int]:
+        """S107 (SOLL R7 R9; user 20.10. "Ist das Bild samt Kontext gecacht, wird nichts geladen und nicht geflippt"): a
+        fresh W50 that names ``D-WALL-HEAD`` carries the DEVICE ROWS the head needs (load-back + extend) as its extent,
+        not its uncached tokens. Priced on the rows, a request of 246 uncached tokens (image + context cached) became
+        "gross 85494" and flipped D to P (NF rc19 boot _074525 pdflip-22-78, 08:04:07Z; P computed 246). The class takes
+        the request's exact number instead (the front's D-probe price: D tree + store); without one the rows stand,
+        named. Every other refusal keeps D's extent untouched."""
+        try:
+            wall = b"D-WALL-HEAD" in body
+        except TypeError:
+            wall = False
+        if not wall or d_extent is None:
+            return d_extent
+        xp = (self.__dict__.get("_probe_price") or {}).get(str(rid))
+        if xp is None:
+            self.counters["wall_extent_rows_kept"] = self.counters.get("wall_extent_rows_kept", 0) + 1
+            logger.warning("PDFLIP WALL-EXTENT rid=%s rows=%d u=unknown -- D-WALL-HEAD refusal without a probe price: the "
+                           "rows stand as the extent (S107)", rid, int(d_extent))
+            return d_extent
+        u = min(int(d_extent), int(_dmp.class_uncached(xp)))
+        self.counters["wall_extent_to_u"] = self.counters.get("wall_extent_to_u", 0) + 1
+        logger.warning("PDFLIP WALL-EXTENT rid=%s rows=%d u=%d u_src=d_probe image_in_tail=%d -- D could not HOLD the "
+                       "rows (backup wall), it did not refuse an extent over X: the class stands on the exact u (S107, "
+                       "SOLL R7: a request D cannot take under X is a defect of D, no flip reason)", rid, int(d_extent),
+                       u, int(bool(xp.image_in_tail)))
+        return u
 
     def _rvp_p_finished(self, p: "Pending") -> None:
         """P's leg 1 of a RESUME-VIA-P request is done: no leg 2 (D holds the
@@ -18740,6 +18811,7 @@ class Front:
         # matching is {uncached}"); when it cannot be parsed the answer is
         # UNKNOWN and the plain W35 503 stands, never a refusal on a guess.
         d_extent = _d_refusal_extent(body)
+        d_extent = Front._wall_extent_to_u(self, rid, body, d_extent)  # S107 (SOLL R7): device rows are no uncached extent
         measured_whole = int(getattr(pending, "leg1_prompt_tokens", 0) or 0)
         handback_empty = (
             d_extent is not None
