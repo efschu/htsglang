@@ -11363,8 +11363,13 @@ class Front:
                                                                           int(bool(p.p_only)), int(bool(p.d_eligible))))
         self._kick_controller("arrival")  # 27B flipfast F2 (no-op when off)
         self._arm_client_watch(request, rid, p)  # H102
-        logger.info("PDFLIP-ROUTE rid=%s BATCH queued (awake=%s admit_d=%s est_prompt=%d remainder=%d queue=%d)",
-                    rid, self.awake, self.admit_d, est_prompt, remainder, len(self.queue))
+        _bq_src, _bq_class = Front._batch_queued_basis(self, _xx, remainder, _x_set, bool(p.p_only))
+        logger.info("PDFLIP-ROUTE rid=%s BATCH queued (awake=%s admit_d=%s est_prompt=%d remainder=%d queue=%d "
+                    "u_src=%s class=%s p_phase_rider=%d) -- remainder is u, the number the class stands on (S105: "
+                    "est_prompt is the whole prompt, never the class basis; p_phase_rider=1 = a kurz request in P's "
+                    "phase joins P's batch, P-BATCH-ALL user 02.10. / SOLL R1a, not a flip under X)",
+                    rid, self.awake, self.admit_d, est_prompt, remainder, len(self.queue),
+                    _bq_src, _bq_class, int(bool(_p_phase and short_ok)))
         self._maybe_ple_admit_hint(p)  # fnFL2 H43
         try:
             await fut  # leg 1 done and D awake
@@ -12507,6 +12512,24 @@ class Front:
         except (TypeError, ValueError):
             t_half = 4.5
         return frac, t_half
+
+    def _batch_queued_basis(self, xx: Any, remainder: int, x_set: int, p_only: bool) -> Tuple[str, str]:
+        """S105 (NF 20.10.): ``(u_src, class)`` for the ``PDFLIP-ROUTE ... BATCH queued`` line -- the source of the
+        number the arrival was classified on and the class it got, the same derivation as ``_dec_arrival``'s CLASSIFY
+        record. Six boots on 20.10. were read as "classified on est_prompt" from this line (it printed est_prompt next
+        to remainder and nothing else); every CLASSIFY of those boots stood on ``d_probe``. Instrument only: never
+        raises, never decides."""
+        try:
+            if xx is None:
+                src = "n_est"
+            else:
+                src = str(getattr(xx, "u_src", None) or ("p_store" if getattr(xx, "unpriced", False) else
+                                                          getattr(xx, "src", "none")))
+            x = int(x_set) if x_set else int(getattr(self, "tp_prefill_max_tokens", 0) or 0)
+            klass = phase_policy.classify_arrival(int(remainder), x, Front._set_cfg()[0], bool(p_only))
+            return src, str(klass)
+        except Exception:  # noqa: BLE001 -- an instrument never breaks an arrival
+            return "?", "?"
 
     def _set_seats_free(self) -> int:
         """D's free decode seats for NEW sessions (R5). ARRIVAL-SEAT's count when the rule is on; without the rule
