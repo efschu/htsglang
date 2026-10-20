@@ -25,8 +25,24 @@ next when it became an eligible leaf. A leaf with a host-only aux state (mamba
 anchor), one in flight (the V1 guards of ``_subtree_blocked``) or without page
 hashes stays.
 
-NOT PORTED: the #1500i census (``dual_pkvwait_instr``), the Q-1190b ``allow_aux``
-stage and the ``budget_s`` brake (callers on the 27B line only).
+NOT PORTED: the #1500i census (``dual_pkvwait_instr``) and the ``budget_s`` brake (callers on the 27B line only).
+
+S109 (NF 20.10.) THE AUX STAGE -- the Q-1190b ``allow_aux`` stage of the 27B line (``dual_arena_spill``), without its
+timer. METAL: the D backup wall (``PDFLIP D-WALL-HEAD ... payable_evictable=0``, 55 heads on D TP0 in the boots of 20.10.
+07:26-09:47) stood on a KV arena held by D's OWN host-only leaves whose END mamba anchor lives on the host only:
+``S83 VICTIM-CENSUS ... pinned=6485 tree_host_only=6130 spill_why=host_only:4/6130`` next to ``W3-HOST-LEAF SPILL
+candidates=0 refused=...,aux_host_only:3`` (rc20 _081757 08:23:03Z; the same shape 08:57:05Z ``host_only:3/7145`` and
+rc22 09:54:29Z ``aux_host_only:4/4908``). Every one of those leaves was refused by the single rule "an aux state lives
+on the host only" -- so no claim found a victim, no device leaf could be backed up (``#1421 BACKUP-REFUSED
+why=arena_claim``), the peel delivered 0 and D refused requests under X (SOLL R7: a defect, no flip reason).
+THE RULE: after every plain leaf, a host-only leaf whose ONLY refusal is a host-only MAMBA anchor is a candidate too
+(heap key ``(1, ...)`` behind ``(0, ...)``). It leaves like a plain one -- every KV page gets its L3 copy first
+(``secure_rows_to_l3``) -- and its anchor gets its L3 copy too, by the S39 helper
+(``forma_l3_subtree._secure_child_anchors``). S109b: neither the KV pages nor the anchor are written or stat'ed
+here -- the write-behind thread's shared record (``mem_cache/l3_secured``) says which have their copy; the rest is
+queued for its next pass and the leaf stays (``incomplete`` / ``aux_kept=child_anchor_pending``), asked again at the
+next spill. An anchor in flight, not settled or not secured keeps the leaf, named (``aux_kept``). Any other host-only aux component keeps the old refusal. No switch, no timer, no reserve; on a Form A
+group TP0 decides and the drop goes to the workers as a node STATE, exactly like a plain leaf (K23).
 
 K23 (17.10.): the gate also opens on TP0 of a Form A group (``form_a_host``); its
 drops are sent to the workers as node STATEs by the caller (``_w3_arena_spill``).
@@ -122,9 +138,29 @@ def _subtree_blocked(tree: Any, n: Any, ongoing) -> bool:
     return False
 
 
-def _reason(cache: Any, node: Any, pool: Any, skip: set) -> Optional[str]:
+#: S109: host anchors put on L3 per spill call (each ~59 MB on NF; already on disk = a stat only) -- the S39 bound
+ANCHOR_SECURE_PER_CALL = 4
+
+
+def _aux_host_only_kinds(cache: Any, node: Any) -> list:
+    """The aux component types that keep a HOST-ONLY state on ``node``."""
+    from flliper.srt.mem_cache.unified_radix_cache import _aux_components
+
+    return [c.component_type for c in _aux_components(cache)
+            if node.component_data[c.component_type].host_value is not None
+            and node.component_data[c.component_type].value is None]
+
+
+def _mamba_ct():
+    from flliper.srt.mem_cache.unified_cache_components.tree_component import ComponentType
+
+    return getattr(ComponentType, "MAMBA", None)
+
+
+def _reason(cache: Any, node: Any, pool: Any, skip: set, allow_aux: bool = False) -> Optional[str]:
     """None = a host-only H-leaf whose host copy may leave L2 once it has an L3 copy;
-    else the NAME of the first check that refused it (27B ``_reason``, allow_aux=False)."""
+    else the NAME of the first check that refused it (27B ``_reason``). ``allow_aux`` (S109, the AUX stage): a leaf whose
+    only host-only aux state is its MAMBA anchor is a candidate too; any other host-only aux component still refuses."""
     from flliper.srt.mem_cache.unified_radix_cache import BASE_COMPONENT_TYPE, _aux_components
 
     if node is cache.root_node:
@@ -145,11 +181,8 @@ def _reason(cache: Any, node: Any, pool: Any, skip: set) -> Optional[str]:
         return "blocked"
     if not getattr(node, "hash_value", None):
         return "no_hash"                  # the page count cannot be checked
-    if any(
-        node.component_data[c.component_type].host_value is not None
-        and node.component_data[c.component_type].value is None
-        for c in _aux_components(cache)
-    ):
+    _kinds = _aux_host_only_kinds(cache, node)
+    if _kinds and not (allow_aux and all(k == _mamba_ct() for k in _kinds)):
         return "aux_host_only"            # an aux state lives on the host only (anchor, park_l3)
     if any(node.component_data[c.component_type].value is not None for c in _aux_components(cache)):
         return "aux_device_value"         # K15b A4: _evict_host_leaf(ALL) would free a live device state
@@ -158,8 +191,23 @@ def _reason(cache: Any, node: Any, pool: Any, skip: set) -> Optional[str]:
     return None
 
 
-def _eligible(cache: Any, node: Any, pool: Any, skip: set) -> bool:
-    return _reason(cache, node, pool, skip) is None
+def _eligible(cache: Any, node: Any, pool: Any, skip: set, allow_aux: bool = False) -> bool:
+    return _reason(cache, node, pool, skip, allow_aux) is None
+
+
+def _secure_anchor(cache: Any, node: Any, budget: list) -> Optional[str]:
+    """S109: the host-only MAMBA anchor of ``node`` gets its L3 copy (the S39 helper); None = secured, else the name
+    of the refusal (the leaf stays)."""
+    if not _aux_host_only_kinds(cache, node):
+        return None
+    try:
+        from flliper.srt.pdflip import forma_l3_subtree as _fls
+
+        r = _fls._secure_child_anchors(cache, [node], budget)
+    except Exception as exc:  # noqa: BLE001 -- fail closed: the leaf keeps its anchor
+        logger.warning("%s aux anchor secure raised: %r", MARK, exc)
+        return "anchor_secure_raised"
+    return None if r is None else str(r[0])
 
 
 def spill_host_only(cache: Any, pool: Any, want: int, page_size: int, skip: set,
@@ -184,7 +232,7 @@ def spill_host_only(cache: Any, pool: Any, want: int, page_size: int, skip: set,
     # worker that has the node device-resident or with children cannot delete it and would keep a node TP0 dropped
     nodel = _r12.worker_nodelete_keys(cache) if _r12.role() == "host" else ()
     for n in cache._collect_all_nodes():
-        r = _reason(cache, n, pool, skip)
+        r = _reason(cache, n, pool, skip, True)
         if r is None and nodel and _r12.node_key(n) in nodel:
             r = "worker_cannot_delete"
         if r is None:
@@ -198,14 +246,20 @@ def spill_host_only(cache: Any, pool: Any, want: int, page_size: int, skip: set,
     # L3-COMPLETE review A1 (16.10.): a leaf with a slot not COMPLETE in the shared header is no
     # candidate (like a pending write) -- counted apart as ``incomplete``, never as a loss
     incomplete = sum(1 for n in eligible if _incomplete(keys, n))
-    heap = [(keys[id(n)], n.id, n) for n in eligible if not _incomplete(keys, n)]
+    # S109: plain leaves first, the aux-anchor leaves behind them (``(aux, key, id)``)
+    heap = [(int(bool(_aux_host_only_kinds(cache, n))), keys[id(n)], n.id, n)
+            for n in eligible if not _incomplete(keys, n)]
     candidates = len(heap)
+    aux_candidates = sum(1 for h in heap if h[0])
     heapq.heapify(heap)
     released = leaves = unsecured = on_disk = written = stale = 0
     cap_used = over_cap = 0
+    aux_leaves = 0
+    aux_kept: Dict[str, int] = {}
+    anchor_budget = [ANCHOR_SECURE_PER_CALL]
     while heap and released < want:
-        _key, _id, node = heapq.heappop(heap)
-        if not _eligible(cache, node, pool, skip) or (nodel and _r12.node_key(node) in nodel):
+        _aux, _key, _id, node = heapq.heappop(heap)
+        if not _eligible(cache, node, pool, skip, True) or (nodel and _r12.node_key(node) in nodel):
             # REVIEW S27 A1: a cascaded parent is checked against the workers' nodelete set like a first-level leaf
             stale += 1
             continue
@@ -229,6 +283,12 @@ def spill_host_only(cache: Any, pool: Any, want: int, page_size: int, skip: set,
         if not _l3_complete(node, sec):
             unsecured += 1                # review readroomd B3: a page neither on disk nor written now: it stays
             continue
+        is_aux = bool(_aux_host_only_kinds(cache, node))
+        if is_aux:
+            _aw = _secure_anchor(cache, node, anchor_budget)
+            if _aw is not None:
+                aux_kept[_aw] = aux_kept.get(_aw, 0) + 1   # S109: the anchor has no L3 copy (yet): the leaf stays
+                continue
         on_disk += int(sec.get("on_disk", 0))
         written += int(sec.get("written", 0))
         if released_out is not None:
@@ -239,29 +299,34 @@ def spill_host_only(cache: Any, pool: Any, want: int, page_size: int, skip: set,
         cache._evict_host_leaf(node, tracker)
         released += int(tracker.get(BASE_COMPONENT_TYPE, 0)) // P
         leaves += 1
-        if (parent is not None and parent is not cache.root_node and _eligible(cache, parent, pool, skip)
+        aux_leaves += int(is_aux)
+        if (parent is not None and parent is not cache.root_node and _eligible(cache, parent, pool, skip, True)
                 and not (nodel and _r12.node_key(parent) in nodel)):
             _pk = cache._w3_spill_keys(pool, [parent])
             if _incomplete(_pk, parent):
                 incomplete += 1
             else:
-                heapq.heappush(heap, (_pk[id(parent)], parent.id, parent))
+                heapq.heappush(heap, (int(bool(_aux_host_only_kinds(cache, parent))), _pk[id(parent)], parent.id,
+                                      parent))
     _N["calls"] += 1
     k = _N["calls"]
-    if k <= 8 or k % 64 == 0 or unsecured:
+    if k <= 8 or k % 64 == 0 or unsecured or aux_leaves or aux_kept:
         top = sorted(refused.items(), key=lambda kv: -kv[1])[:4]
         logger.info(
             "%s n=%d want=%d released_pages=%d leaves=%d candidates=%d unsecured_kept=%d incomplete=%d stale=%d "
             "secure_pages=%d cap=%d over_cap=%d "
-            "l3=on_disk:%d,written:%d refused=%s (a host-only leaf leaves L2 only with its L3 copy "
+            "l3=on_disk:%d,written:%d refused=%s aux_candidates=%d aux_leaves=%d aux_kept=%s "
+            "(a host-only leaf leaves L2 only with its L3 copy "
             "for every page; incomplete = leaves kept because a slot is not COMPLETE yet, no loss; "
-            "port of the 27B Q-697c spill, local-PP floor only)",
+            "port of the 27B Q-697c spill, local-PP floor only; S109 aux = a leaf whose host-only mamba anchor got its "
+            "L3 copy too, after every plain leaf)",
             MARK, k, int(want), released, leaves, candidates, unsecured, incomplete, stale,
             cap_used, int(max_secure_pages), over_cap, on_disk, written,
-            ",".join("%s:%d" % kv for kv in top) or "-")
+            ",".join("%s:%d" % kv for kv in top) or "-", aux_candidates, aux_leaves,
+            ",".join("%s:%d" % kv for kv in sorted(aux_kept.items())) or "-")
     return {"released": released, "leaves": leaves, "candidates": candidates,
             "unsecured": unsecured, "incomplete": incomplete,
-            "secure_pages": cap_used, "over_cap": over_cap}
+            "secure_pages": cap_used, "over_cap": over_cap, "aux_leaves": aux_leaves}
 
 
 def _incomplete(keys: Any, node: Any) -> bool:

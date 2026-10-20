@@ -1194,6 +1194,26 @@ int64_t arena_free_evicting(uint8_t *base, int64_t n, const int64_t *slots, cons
     return freed;
 }
 
+/* S109-A8-N1 (re-review 20.10.): the hand-over writer (l3_secured._hand_drain)
+ * keeps ITS candidate from the aged reaper while it copies it: touched_ms is
+ * stamped only while the slot is EVICTING under `gen`, then the state and the
+ * generation are read again. arena_reap_stale_aged re-reads touched_ms after
+ * its CAS to S_REAPING and backs off when it moved -- so either the reaper
+ * committed before this stamp (the re-read here sees REAPING/FREE or a new
+ * generation: 0, no copy) or it backs off (1: the slot stays this candidate
+ * for at least the stale age). No wait, no lock. Returns 1 / 0. */
+int64_t arena_touch_evicting(uint8_t *base, int64_t slot, int64_t gen) {
+    ArenaHeader *h = hdr(base);
+    if (slot < 0 || (uint64_t)slot >= h->slots) return 0;
+    SlotHeader *sh = slot_hdr(base, (uint64_t)slot);
+    if (atomic_load(&sh->state) != S_EVICTING) return 0;
+    if (gen >= 0 && (int64_t)sh->generation != gen) return 0;
+    atomic_store(&sh->touched_ms, mono_ms());
+    if (atomic_load(&sh->state) != S_EVICTING) return 0;
+    if (gen >= 0 && (int64_t)sh->generation != gen) return 0;
+    return 1;
+}
+
 /* the historical entry point: the default stale age */
 #define ARENA_REAP_STALE_MS 60000
 int64_t arena_reap_stale(uint8_t *base) {

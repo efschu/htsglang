@@ -111,7 +111,8 @@ def test_an_arena_of_end_anchors_spills_the_shallowest_one_secured_first(tmp_pat
     assert not any(rk.unbacked for rk in L.ranks)
     assert L.state(L.ends[0]) != 2, "the shallowest END anchor gave its slot"
     assert [L.state(h) for h in L.ends[1:]] == [2] * 3
-    assert sum(1 for w, _ in L.spilled if w == "flush_spill") == L.H.RANKS, "secured to L3 first, on every rank"
+    # S109b: one L3 copy (the shared record), every rank reads it
+    assert sum(1 for w, _ in L.spilled if w == "flush_spill") == 1, "secured to L3 first, once for every rank"
 
 
 @needs_gcc
@@ -138,7 +139,7 @@ def test_default_unset_is_on_the_shallowest_end_anchor_gives_its_slot(tmp_path, 
     assert not any(rk.unbacked for rk in L.ranks)
     assert L.state(L.ends[0]) != 2
     assert [L.state(h) for h in L.ends[1:]] == [2] * 3
-    assert sum(1 for w, _ in L.spilled if w == "flush_spill") == L.H.RANKS
+    assert sum(1 for w, _ in L.spilled if w == "flush_spill") == 1   # S109b: one copy for every rank
 
 
 def test_env_default_is_on_and_0_is_off(monkeypatch):

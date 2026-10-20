@@ -137,7 +137,7 @@ def test_park_chain_takes_slots_from_untagged_anchors_off_the_chain(tmp_path, mo
     assert not any(rk.unbacked for rk in L.ranks)
     assert all(L.state(h) != 2 for h in L.off[:3]), "the three shallowest older anchors were spilled"
     assert L.state(L.off[3]) == 2, "the deepest older anchor was not needed"
-    assert sum(1 for w, _ in L.spilled if w == "park_first_spill") == 3 * L.H.RANKS
+    assert sum(1 for w, _ in L.spilled if w == "park_first_spill") == 3   # S109b: one L3 copy per victim, every rank reads it
 
 
 @needs_gcc
@@ -177,7 +177,9 @@ def test_end_node_takes_a_chain_intermediate_when_nothing_is_off_the_chain(tmp_p
     assert L.state("END") == 2
     assert L.state("A") != 2, "the shallowest chain intermediate gave its slot"
     assert [L.state(h) for h in ("B", "C")] == [2, 2]
-    assert sum(1 for w, _ in L.spilled if w == "park_first_spill") == L.H.RANKS
+    # S109b: only the victim's page is copied (by the writer, then read from the shared record); how many ranks find it
+    # already copied depends on whether the arena carries the shared record -- the copied set is what counts
+    assert {tuple(c) for w, c in L.spilled if w == "park_first_spill"} == {(0,)}
 
 
 @needs_gcc

@@ -219,7 +219,45 @@ def _anchor_ready(tree: Any, node: Any) -> Tuple[bool, str]:
 
 
 def _secure_child_anchors(tree: Any, order: List[Any], budget: List[int]) -> Optional[Tuple[str, Any]]:
-    """Every host anchor of the subtree gets its L3 copy before its node leaves (#257 holds for an unreferenced slot;
+    """Every host anchor of the subtree has its L3 copy before its node leaves (#257 holds for an unreferenced slot;
+    this makes it independent of the clock). None = all secured; else the refusal. TP0 only.
+
+    S109b (user 20.10.: "UND WEHE DAS SCHREIBEN IN DEN CACHE BLOCKIERT DURCH IRGENDEINE SYNCHRON ODER WARTESCHEISSE"):
+    no stat and no write here any more -- the write-behind thread is the one writer, its shared record
+    (``mem_cache/l3_secured``) says which anchor slots have their copy. An anchor without one is QUEUED for the
+    write-behind's next pass and the node stays (``child_anchor_pending``), asked again at the next call. ``budget``
+    is kept for the callers' signature; nothing is written against it."""
+    needs = [d for d in order if _child_anchor_host(d) is not None]
+    if not needs:
+        return None
+    mp = tree._pdflip_mamba_pool() if hasattr(tree, "_pdflip_mamba_pool") else None
+    arena = getattr(mp, "arena", None)
+    settled = getattr(mp, "settled_anchor_slots", None)
+    if arena is None or not callable(settled):
+        return "child_anchor_no_pool", getattr(needs[0], "id", "?")
+    from flliper.srt.mem_cache import l3_secured as _l3s
+
+    for d in needs:
+        slots = settled(_child_anchor_host(d))
+        if not slots:
+            return "child_anchor_in_flight", getattr(d, "id", "?")
+        try:
+            ok = _l3s.secured(arena, slots, getattr(mp, "_backend", None))
+        except Exception as exc:  # noqa: BLE001 - fail closed
+            logger.warning("%s child anchor secured-read raised: %r", MARK, exc)
+            return "child_anchor_pending", getattr(d, "id", "?")
+        if not bool(ok.all()):
+            _l3s.request(arena, [int(s) for s, k in zip(slots, ok.tolist()) if not k])
+            return "child_anchor_pending", getattr(d, "id", "?")
+        _l3s.promote(arena, slots, getattr(mp, "_backend", None))   # S109-A6: the relied-on copy goes MRU (queued)
+    return None
+
+
+def _secure_child_anchors_now(tree: Any, order: List[Any], budget: List[int]) -> Optional[Tuple[str, Any]]:
+    """S109b: the WRITER's form (the pre-S109b synchronous body), plus the shared record marked for every anchor it
+    proved -- never from the scheduler thread; the unit tests use it as "the write-behind has run" (conftest seam).
+
+    Every host anchor of the subtree gets its L3 copy before its node leaves (#257 holds for an unreferenced slot;
     this makes it independent of the clock). None = all secured; else the refusal. TP0 only."""
     needs = [d for d in order if _child_anchor_host(d) is not None]
     if not needs:
@@ -240,6 +278,9 @@ def _secure_child_anchors(tree: Any, order: List[Any], budget: List[int]) -> Opt
         try:
             stems = [arena.slot_stem(int(s)) for s in slots]
             if callable(stat) and all(stems) and set(stems) <= set(stat(stems)):
+                from flliper.srt.mem_cache import l3_secured as _l3s
+
+                _l3s.mark(arena, slots)
                 continue
         except Exception:  # noqa: BLE001 - no reading: write it below
             pass
@@ -253,6 +294,9 @@ def _secure_child_anchors(tree: Any, order: List[Any], budget: List[int]) -> Opt
             return "child_anchor_lost", getattr(d, "id", "?")
         if int(res.get("lost", 0)) or int(res.get("on_disk", 0)) + int(res.get("written", 0)) < len(slots):
             return "child_anchor_lost", getattr(d, "id", "?")
+        from flliper.srt.mem_cache import l3_secured as _l3s
+
+        _l3s.mark(arena, slots)
     return None
 
 

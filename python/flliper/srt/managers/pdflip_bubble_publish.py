@@ -71,6 +71,15 @@ def quiesce_begin(scheduler) -> None:
         scheduler._pdflip_quiesce_open = True
         scheduler._pdflip_quiesce_paused = 0
         scheduler._pdflip_quiesce_t0 = time.monotonic()
+        # S109-A7 (re-review 20.10.): the quiesce entrance (flip or sleep) queues every COMPLETE page without its L3
+        # copy for the write-behind and wakes it -- the quiesce is its time before the S86 veto. Memory reads and one
+        # C census per arena on the write-behind's rank only (D TP0 / P PP0); never I/O, never a wait.
+        try:
+            from flliper.srt.mem_cache import l3_secured as _l3s
+
+            _l3s.queue_unsecured_all("quiesce")
+        except Exception:  # noqa: BLE001 -- a wake-up, never a failure of the quiesce
+            logger.warning("S109-A7 QUIESCE-WAKE failed", exc_info=True)
 
 
 def quiesce_end(scheduler, why: str) -> None:

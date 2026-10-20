@@ -2168,8 +2168,8 @@ class HiCacheFile(HiCacheStorage):
             # each carrying a cap already divided by N.
             scan_suffixes=(self._group_scan_suffixes() if shared_keys else None),
             extra_config=storage_config.extra_config,
-            on_evict=(
-                self.metadata_cache.remove if self.metadata_cache is not None else None
+            on_evict=(  # S109-A1: the L3 LRU unlink also voids the l3sec record of the page (l3_secured)
+                self._l3sec_on_evict
             ),
             writer_count=writer_count,
             path_for_stem=self._existing_path,
@@ -3610,6 +3610,15 @@ class HiCacheFile(HiCacheStorage):
             arena = None
         arenas[total_bytes] = arena
         if arena is not None:
+            # S109-A1/A2: the record is attached (or made) HERE, at the arena's open -- never on the scheduler path --
+            # and the arena knows its backend, so every reader judges with the #1459 index too (record AND index)
+            try:
+                from flliper.srt.mem_cache import l3_secured as _l3s
+
+                _l3s.register_backend(arena, self)
+                _l3s.arrays(arena, create=True)
+            except Exception:  # noqa: BLE001 -- no record: nothing reads as copied (fail closed)
+                logger.warning("S109b l3sec record unavailable for %s", getattr(arena, "path", "?"), exc_info=True)
             self._l3_write_behind_start()
         return arena
 
@@ -3646,7 +3655,10 @@ class HiCacheFile(HiCacheStorage):
             wait_s = every
             cont = False
             cycle_t0 = time.monotonic()
-            while not stop.wait(wait_s):
+            # S109-A4: a spill's request (l3_secured.request) wakes the pass at once; the tick stays the floor
+            from flliper.srt.mem_cache import l3_secured as _l3s_wake
+
+            while not _l3s_wake.wait_or_stop(stop, wait_s):
                 tot = None
                 if not cont:
                     cycle_t0 = time.monotonic()
@@ -3723,6 +3735,42 @@ class HiCacheFile(HiCacheStorage):
             return max(1, int(envs.FLLIPER_PDFLIP_L3_WRITE_BEHIND_MIB.get())) << 20
         except Exception:  # noqa: BLE001
             return 256 << 20
+
+    def _l3wb_publish(self, arena, slots, gens, stems, base_gen) -> int:
+        """S109b: publish secured (slot, generation) pairs into the shared record -- then S109-A5-N1 (re-review
+        20.10., Q1): read the stems once more in the #1459 index (memory). The L3 LRU (its own thread) unlinks a file,
+        removes its index entry and THEN calls on_evict (``invalidate_stems``); an unlink between this pass's stat
+        (or commit) and its publish would be overwritten by the publish -- record and baseline say "copied", the file
+        is gone, the page is never ``new`` again (R11 through a race). A stem the index does not list after the
+        publish is voided in both. Linearizable: index removal precedes on_evict. Returns the slots voided."""
+        import numpy as np
+
+        from flliper.srt.mem_cache import l3_secured as _l3s
+
+        _l3s.publish(arena, slots, gens)
+        if not len(stems):
+            return 0
+        idx = self._l3_index()
+        if idx is None:
+            return 0
+        try:
+            listed = idx.has(list(stems))
+        except Exception:  # noqa: BLE001 -- cannot re-read: void (the next pass stats again)
+            listed = [False] * len(stems)
+        bad = [int(s_) for s_, ok in zip(np.asarray(slots, dtype=np.int64).tolist(), listed) if not ok]
+        if not bad:
+            return 0
+        _b = np.asarray(bad, dtype=np.int64)
+        base_gen[_b] = -1
+        sec = _l3s.arrays(arena, create=False)
+        if sec is not None:
+            sec[0][_b] = -1
+        n = getattr(HiCacheFile, "_a5n1_voided", 0) + len(bad)
+        HiCacheFile._a5n1_voided = n
+        logger.info("S109-A5-N1 L3WB-PUBLISH-RACE voided=%d (total %d): the L3 LRU took the file between the pass's "
+                    "stat/commit and its publish -- not recorded as copied; the next pass copies it again",
+                    len(bad), n)
+        return len(bad)
 
     def l3_write_behind_pass(self, budget_bytes: Optional[int] = None, quiet=None,
                              cont: bool = False, slice_s: Optional[float] = None) -> dict:
@@ -3836,6 +3884,10 @@ class HiCacheFile(HiCacheStorage):
                 continue                    # this cycle has visited all of it already
             tot["arenas"] += 1
             nslots = int(arena.slots)
+            # S109b: the record is SHARED (``<arena>.l3sec``): every rank reads which pages have their L3 copy as
+            # memory (l3_secured.secured) -- the spills give a page up only then, never by a write of their own
+            from flliper.srt.mem_cache import l3_secured as _l3s
+
             sec = getattr(arena, "_l3wb_sec", None)
             if sec is None:
                 sec = arena._l3wb_sec = (np.full(nslots, -1, dtype=np.int64),
@@ -3845,15 +3897,33 @@ class HiCacheFile(HiCacheStorage):
             tot["complete"] += int(slots.shape[0])
             # L3WB-SLICE: THE LINE THAT MAKES A PAGE `new` -- its (generation,
             # key) is not the one this process last secured in that slot.
-            new = np.nonzero((sec_gen[slots] != gens) | (sec_lo[slots] != klo))[0]
+            _stale = (sec_gen[slots] != gens) | (sec_lo[slots] != klo)
+            # S109-A5 (re-review R11): ... or the SHARED record does not hold this generation any more -- the L3 LRU
+            # unlinked the file (``_l3sec_on_evict`` -> ``invalidate_stems``), in this process or in the sister
+            # group's (P and D share the arena, each writer has its own baseline). Without it a page still COMPLETE
+            # in L2 whose L3 file the cap took was never copied again: on every keep list for the rest of the boot,
+            # an arena slot lost toward the D-WALL (R7).
+            _pub = _l3s.arrays(arena, create=True)
+            if _pub is not None and _pub[0] is not sec_gen:
+                _stale |= np.asarray(_pub[0][slots]) != gens
+            new = np.nonzero(_stale)[0]
             # a continuation resumes at the cursor (the census walks slots in
             # ascending order): each new page is visited at most ONCE per cycle,
             # so a head that never secures cannot eat every continuation's
             # budget, and the cycle ends. What turns new behind the cursor
             # meanwhile is the next cycle's (one tick later).
             cur = int(getattr(arena, "_l3wb_cursor", 0) or 0)
+            # S109b: the slots a spill asked for (l3_secured.request) are visited first, cursor or not
+            _urg = _l3s.take_urgent(arena)
+            _urg_new = np.zeros(0, dtype=new.dtype)
+            if _urg.shape[0] and new.shape[0]:
+                _um = np.isin(slots[new], _urg)
+                _urg_new, new = new[_um], new[~_um]
+                tot["urgent"] = int(tot.get("urgent", 0)) + int(_urg_new.shape[0])
             if cur and new.shape[0]:
                 new = new[int(np.searchsorted(slots[new], cur)):]
+            if _urg_new.shape[0]:
+                new = np.concatenate([_urg_new, new])
             if not new.shape[0]:
                 arena._l3wb_done = True
                 continue
@@ -3870,7 +3940,10 @@ class HiCacheFile(HiCacheStorage):
                     # the budget is used up at a slice edge: stop, remember
                     tot["sliced"] = True
                     tot["deferred"] += n_new - pos
-                    arena._l3wb_cursor = int(slots[new[pos]])
+                    # S109b: urgent slots lead the list out of slot order -- the cursor names the first ORDINARY
+                    # page not reached, so the continuation keeps its ascending walk
+                    _cpos = max(pos, int(_urg_new.shape[0]))
+                    arena._l3wb_cursor = int(slots[new[_cpos if _cpos < n_new else pos]])
                     stop_all = True
                     break
                 why = quiet()
@@ -3892,6 +3965,9 @@ class HiCacheFile(HiCacheStorage):
                 have = np.fromiter((bool(s) and s in on for s in stems), dtype=bool, count=len(stems))
                 sec_gen[slots[part[have]]] = gens[part[have]]
                 sec_lo[slots[part[have]]] = klo[part[have]]
+                # S109b: every rank reads it; S109-A5-N1: re-read against the #1459 index after the publish
+                self._l3wb_publish(arena, slots[part[have]], gens[part[have]],
+                                   [stems[j] for j in np.nonzero(have)[0].tolist()], sec_gen)
                 tot["on_disk"] += int(have.sum())
                 todo = part[~have & np.fromiter((bool(s) for s in stems), dtype=bool,
                                                 count=len(stems))]
@@ -3973,12 +4049,14 @@ class HiCacheFile(HiCacheStorage):
                                     self._evictor.adopt_foreign(stem)
                                     sec_gen[slots[i]] = gens[i]
                                     sec_lo[slots[i]] = klo[i]
+                                    self._l3wb_publish(arena, [slots[i]], [gens[i]], [stem], sec_gen)
                                     tot["on_disk"] += 1
                                     tot["foreign_done"] = int(tot.get("foreign_done", 0)) + 1
                                 elif st in (0, 2):
                                     self._evictor.commit(stem)
                                     sec_gen[slots[i]] = gens[i]
                                     sec_lo[slots[i]] = klo[i]
+                                    self._l3wb_publish(arena, [slots[i]], [gens[i]], [stem], sec_gen)
                                     tot["written"] += 1
                                     tot["bytes"] += total
                                     arena._l3wb_cycle_pages = int(getattr(arena, "_l3wb_cycle_pages", 0)) + 1
@@ -4725,10 +4803,38 @@ class HiCacheFile(HiCacheStorage):
             except Exception:  # noqa: BLE001
                 keep = []
         keep += fill_protected_stems()   # SELF-EVICT: the read being filled
-        cands = self._arena_evict_candidates(arena, int(want), int(need), keep)
+        # S109d (user 20.10.: "UND WEHE DAS SCHREIBEN IN DEN CACHE BLOCKIERT DURCH IRGENDEINE SYNCHRON ODER
+        # WARTESCHEISSE"): the clock frees only pages that ALREADY have their L3 copy (the write-behind's published
+        # record or the #1459 index) -- every other COMPLETE page is on the keep list and queued for the write-behind;
+        # no stat, no write here. A candidate that turns out uncopied (a slot re-completed between the census and
+        # the clock) is the old stage-iii loss, by name (dropped_without_l3).
+        from flliper.srt.mem_cache import l3_secured as _l3s
+
+        _unsec_lo = _l3s.unsecured_keys_lo(arena, self)
+        if _unsec_lo.shape[0]:
+            cands = self._arena_evict_candidates(arena, int(want), int(need), keep, extra_lo=_unsec_lo)
+        else:
+            cands = self._arena_evict_candidates(arena, int(want), int(need), keep)
         if not cands:
+            if _unsec_lo.shape[0]:
+                _n = getattr(type(self), "_s109d_clock_pending_n", 0) + 1
+                type(self)._s109d_clock_pending_n = _n
+                if _n <= 16 or _n % 256 == 0:
+                    logger.info("S109d ARENA-EVICT PENDING n=%d unsecured=%d want=%d: no COMPLETE page with an L3 copy "
+                                "to free -- queued for the write-behind, asked again at the next call", _n,
+                                int(_unsec_lo.shape[0]), int(want))
             return 0
-        moved = self.arena_secure_to_disk(arena, cands, writer="evict_clock")["written"]
+        _sec = _l3s.verify_candidates(arena, cands, self, writer="evict_clock")
+        moved = int(_sec.get("written", 0))   # pages WRITTEN to disk by this call (as before; S109d: 0, the clock writes nothing)
+        _mask = _sec.get("mask")
+        if _mask is not None and not all(_mask):
+            # S109-A3 (review 20.10.): a candidate without a copy (re-completed between the census and the clock) is NOT
+            # freed: the hand-over writer copies it to L3 on its own thread and frees it then
+            _hand = [c for c, k in zip(cands, _mask) if not k]
+            cands = [c for c, k in zip(cands, _mask) if k]
+            _l3s.hand_over(arena, _hand, self, "evict_clock")
+            if not cands:
+                return moved
         # ARENA-FREE-GEN (READ-DEPTH 1014): only this evictor's candidates, generation-bound
         from flliper.srt.mem_cache.storage.file.hicache_arena import free_evicted_named
 
@@ -4740,7 +4846,7 @@ class HiCacheFile(HiCacheStorage):
         return moved
 
     @staticmethod
-    def _arena_evict_candidates(arena, want: int, need: int, pin_stems) -> list:
+    def _arena_evict_candidates(arena, want: int, need: int, pin_stems, extra_lo=None) -> list:
         """#248e: the clock's candidates for ``_arena_evict_to_disk`` -- the
         pins always kept; the hand-off / park order of the pool that owns
         ``arena`` kept in stage (i) and spent in hold order in stage (ii).
@@ -4754,13 +4860,21 @@ class HiCacheFile(HiCacheStorage):
         except Exception:  # noqa: BLE001 - the order is an improvement, never a wall
             logger.warning("#248e ORDER unavailable for the clock evict", exc_info=True)
             order = None
+        import numpy as _np_s109d
+
+        _ex = None if extra_lo is None or not len(extra_lo) else _np_s109d.asarray(extra_lo, dtype=_np_s109d.uint64)
         if order is None or not len(order):
-            return list(arena.evict_candidates(want, keep_stems=pin_stems))
-        cands = list(arena.evict_candidates(want, keep_stems=pin_stems, keep_lo=order.keys))
+            if _ex is None:
+                return list(arena.evict_candidates(want, keep_stems=pin_stems))
+            return list(arena.evict_candidates(want, keep_stems=list(pin_stems or ()), keep_lo=_ex))
+        _keep = order.keys if _ex is None else _np_s109d.union1d(_np_s109d.asarray(order.keys, dtype=_np_s109d.uint64), _ex)
+        cands = list(arena.evict_candidates(want, keep_stems=pin_stems, keep_lo=_keep))
         if len(cands) < need:
             from flliper.srt.mem_cache.storage.file.hicache_arena import stem_keys_lo
 
             protect = stem_keys_lo(pin_stems) if pin_stems else None
+            if _ex is not None:
+                protect = _ex if protect is None else _np_s109d.union1d(_np_s109d.asarray(protect, dtype=_np_s109d.uint64), _ex)
             cands += _hp.evict_ordered(arena, order, need - len(cands), protect_lo=protect, site="l3fill")
         return cands
 
@@ -5241,6 +5355,48 @@ class HiCacheFile(HiCacheStorage):
         logger.info("L3-PERSIST index_seeded=%d source=%s seed_s=%.1f dir=%s index=%s",
                     n, source, time.monotonic() - t0, self.file_path, idx.path)
         return n
+
+    def _l3sec_on_evict(self, stem: str) -> None:
+        """The L3 LRU evictor took ``stem``'s file (``LRUFileEvictor`` on_evict, its own thread): the metadata cache
+        forgets it (as before) and -- S109-A1 (review 20.10., R4/R5) -- the write-behind's published record of every
+        arena slot that holds this stem is voided, so no spill reads the page as copied any more (the #1459 index
+        entry went with the unlink; ``secured`` asks both). Memory only."""
+        mc = getattr(self, "metadata_cache", None)
+        if mc is not None:
+            try:
+                mc.remove(stem)
+            except Exception:  # noqa: BLE001 -- the metadata cache is an accelerator
+                pass
+        try:
+            from flliper.srt.mem_cache import l3_secured as _l3s
+
+            for arena in list((getattr(self, "_arenas", None) or {}).values()):
+                if arena is not None:
+                    _n = _l3s.invalidate_stems(arena, [stem])
+                    if _n:
+                        # S109-A5-M (re-review): the L3 LRU took the file of a page still COMPLETE in L2 -- the
+                        # write-behind copies it again (the rewrite trigger); counted so the ping-pong is visible
+                        st = _l3s.LRU_L2_STATS
+                        st["n"] += int(_n)
+                        st["bytes"] += int(_n) * int(getattr(arena, "slot_bytes", 0) or 0)
+                        if st["n"] <= 32 or st["n"] % 1024 == 0:
+                            logger.info("S109-A5-M L3-LRU-TOOK-L2-PAGE n=%d bytes=%d (the L3 LRU unlinked the file of "
+                                        "a page still COMPLETE in L2 -- the write-behind rewrites it; bound: 0.9 x "
+                                        "cap - foreign/pins > L2 bytes, else ping-pong)", st["n"], st["bytes"])
+        except Exception:  # noqa: BLE001 -- the AND with the index still answers "not on L3"
+            logger.warning("S109-A1 l3sec invalidate on L3 evict failed", exc_info=True)
+
+    def l3_listed(self, stems: List[str]) -> List[bool]:
+        """S109d: is each stem on the disk store, by the shared #1459 L3 stem index ALONE -- the evictor's exact
+        bookkeeping (commit / evict / clear) in a shm table: memory, no stat, no open. Only an index this process has
+        ALREADY opened is asked (``_l3idx``); none = nothing listed (fail closed: the caller keeps the page)."""
+        idx = getattr(self, "_l3idx", None)
+        if idx is None or not stems:
+            return [False] * len(stems or ())
+        try:
+            return [bool(x) for x in idx.has(list(stems))]
+        except Exception:  # noqa: BLE001 -- fail closed
+            return [False] * len(stems)
 
     def _stat_stems(self, stems: List[str]) -> dict:
         """``{stem: size}`` for the stems that are on disk; one C call when
