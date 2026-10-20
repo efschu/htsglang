@@ -19956,6 +19956,7 @@ class Scheduler(
             self.pdflip_d_ext_beacon.note_extend(
                 rids=[req.rid for req in batch.reqs],
                 rests=[_pdflip_d_ext.req_rest(req) for req in batch.reqs],
+                extend_lens=[_pdflip_d_ext.req_extend_len(req) for req in batch.reqs],
             )
 
         # #861 fix (b): a request admitted on a cached prefix whose DRAFT rows
@@ -20617,6 +20618,12 @@ class Scheduler(
             self.batch_result_processor.process_batch_result_prebuilt(batch)
         elif batch.forward_mode.is_idle():
             self.batch_result_processor.process_batch_result_idle(batch, result)
+
+        if self.pdflip_d_ext_beacon is not None and batch.forward_mode.is_extend():
+            # (review A2c: a skip batch reports too -- note_extend queued its after-rest, the FIFO stays aligned)
+            # EZ-S2b review A2 (SOLL R6, D-EXTEND-BEACON v3): the extend forward has ended and its result is processed --
+            # re-report the REST AFTER it (0 for a finished prefill); R6 counts nothing D has already computed
+            self.pdflip_d_ext_beacon.note_extend_done(rids=[req.rid for req in batch.reqs])
 
         self.metrics_reporter.log_batch_result_stats(batch, result)
         # nf-pd-post: a skip batch's #639 ballot is decided after its result
@@ -23955,6 +23962,15 @@ def run_scheduler_process(
     pipe_writer,
 ):
     _pdflip_arm_dc_snapshot_history()  # #1452
+    # EXIT WITNESS (NF 20.10. 14:18:29Z, D TP0 OOM-killed in silence): the
+    # cgroup oom_kill baseline, read before this rank can have died, so the
+    # death path below can name a kernel OOM kill as the cause. Never raises.
+    try:
+        from flliper.srt.pdflip import state_file as _ow_state
+
+        _ow_state.arm_oom_witness()
+    except Exception:  # noqa: BLE001 - a witness never stops a rank
+        pass
     # Load plugins so hooks can override Scheduler and its dependencies.
     load_plugins()
     # #1402 (boot xsn133, 2026-09-15): the HiCache prefetch threads read the
@@ -24175,6 +24191,12 @@ def run_scheduler_process(
             from flliper.srt.environ import envs as _rd_envs
             from flliper.srt.pdflip import state_file as _rd_state
 
+            # EXIT WITNESS (NF 20.10.): on EVERY rank, whether or not this
+            # rank's state write wins -- the D log then says on all survivors
+            # that the kernel killed a process here, not only in state.json.
+            _ow_line = _rd_state.oom_witness()
+            if _ow_line:
+                logger.error("PDFLIP EXIT-WITNESS %s", _ow_line)
             if _rd_state.note_rank_death(
                 _rd_envs.PDFLIP_STATE_DIR.get() or None,
                 group=(os.environ.get("FLLIPER_PDFLIP_GROUP", "") or "").strip().upper() or None,
@@ -24182,7 +24204,7 @@ def run_scheduler_process(
                 detail=traceback.strip().splitlines()[-1] if traceback else "",
             ):
                 logger.error("PDFLIP RANK-DEATH lifecycle=dead written (origin rank, code %s)",
-                             _rd_state.RANK_EXCEPTION_CODE)
+                             _rd_state.last_rank_death_code())
         except Exception:  # noqa: BLE001 - a record may not mask the death
             pass
         # #1058b: the census goes out HERE, ahead of every signal, not only in

@@ -2053,6 +2053,12 @@ class Envs:
     # (the front hands D the measuring barrier halbX - 1). Media n is n_est (display), never exact; carrier_est is not set
     # from n_est. Default ON (user 14.10.: new features on); off = the rc17 classification of an unpriced arrival.
     FLLIPER_PDFLIP_EXACT_CLASS = EnvBool(True)
+    # EZ-S2a (plan nf-entscheidungszentrale-plan-1019, SOLL R1-R9, R11): ONE decision for the set/controller core --
+    # ``phase_policy.decide(kind="set")``: one X per member (x_own), S from the members' own u, p_only only by R9, a kurz
+    # member never in a set, the queue-sum second set and FLIP-ECONOMICS / VISION-FLIP-URGENT / _set_flip_foreseeable no
+    # longer verdicts, the S49 hold inside the verdict. Default ON (user 14.10.: new features on); off = the S1 code, which
+    # stays reachable until S4.
+    FLLIPER_PDFLIP_DECIDER = EnvBool(True)
     # EZ-S1 (plan A10): a background /server_info read of D's free KV at the end of every P->D flip and every this-many ms
     # while D is awake (never awaited in a tick, one in flight); 0 = off. Default ON.
     FLLIPER_PDFLIP_KV_REFRESH_MS = EnvInt(250)

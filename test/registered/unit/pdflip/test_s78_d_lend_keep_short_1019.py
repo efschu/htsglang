@@ -267,12 +267,17 @@ def test_review_a2_a_waiting_short_request_logs_keep_once(caplog):
 
 
 def test_review_h1_a_full_lend_below_x_max_is_not_relent():
-    """The one-lend-per-settle lock (no partial return before) holds even with headroom above the lend."""
+    """The one-lend-per-settle lock holds within a decode streak, even with headroom above the lend. TOPUP
+    (20.10., rc27): at the settle of the NEXT streak (after an extend) the headroom becomes rows -- before,
+    a full lend never grew again and, with S106, never got dropped and re-lent either (rc27 TP0 bs2
+    rows_on p50 13 against rc26 24, decode 1.3-8 ms slower per round at the same stage)."""
     from flliper.srt.model_executor.forward_batch_info import ForwardMode
 
     decode = types.SimpleNamespace(forward_mode=ForwardMode.DECODE)
+    extend = types.SimpleNamespace(forward_mode=ForwardMode.EXTEND, extend_num_tokens=10 ** 6)
     tms = h.CoreTms()
-    with _Ctx(tms, NEED), envs.FLLIPER_PDFLIP_D_LEND_SETTLE_ROUNDS.override(1):
+    with _Ctx(tms, NEED), envs.FLLIPER_PDFLIP_D_LEND_SETTLE_ROUNDS.override(1), \
+            envs.FLLIPER_PDFLIP_D_LEND_KEEP_SHORT.override(False):
         r = h._rank(tms)
         h._pause_all(tms)
         dsv.on_wake(r.sched, types.SimpleNamespace(epoch="e1"), None)
@@ -281,5 +286,8 @@ def test_review_h1_a_full_lend_below_x_max_is_not_relent():
         ctl = r.sched._pdflip_d_seat_vram
         r.sched.waiting_queue, r.sched.chunked_req = [], None
         assert ctl.lend(STEP_BYTES) == 4 and ctl.rows_on == 36  # a full lend of what the card had then
+        dtl._gate(r.sched).streak = 1                           # ... at this streak's settle
         with mock.patch.object(dtl, "_card_free_bytes", lambda: 10 * STEP_BYTES):
-            assert dtl.on_batch(r.sched, decode) is None and ctl.rows_on == 36
+            assert dtl.on_batch(r.sched, decode) is None and ctl.rows_on == 36   # same streak: no relend
+            assert dtl.on_batch(r.sched, extend) == "return" and ctl.rows_on == 32
+            assert dtl.on_batch(r.sched, decode) == "lend" and ctl.rows_on == 40  # next settle: the headroom

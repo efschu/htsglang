@@ -19,6 +19,7 @@ Now a queued request needs P above the X it was ROUTED on."""
 from __future__ import annotations
 
 import asyncio
+import pytest
 import inspect
 import os
 import time
@@ -62,6 +63,9 @@ def test_y4c_the_band_arrival_flips_now_with_free_seats(monkeypatch):
     assert (wait_fired, fairness_fired) == (True, True)
     assert f.counters["arrival_seat_flip_now"] == 1
     assert f.rpc_calls == []                       # no youngest park: a flip, at once
+
+
+@pytest.mark.usefixtures("decider_off")  # EZ-S2a: describes the S1 code (reachable until S4)
 
 
 def test_the_collect_window_trigger_sees_it_too():

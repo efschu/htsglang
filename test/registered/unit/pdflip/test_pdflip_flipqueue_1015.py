@@ -118,6 +118,8 @@ class TestRealDoubleFlips:
         assert order == ["pdflip-0-1", "pdflip-0-2", "pdflip-0-3", "pdflip-0-4", "pdflip-0-5", "pdflip-0-6",
                          "pdflip-0-7", "pdflip-0-8", "pdflip-0-9", "pdflip-0-10", "pdflip-1-11"]
 
+    @pytest.mark.usefixtures("decider_off")  # EZ-S2a: describes the S1 code (reachable until S4)
+
     def test_1216_routed_long_on_the_band_floor_is_not_a_short_but_needs_p(self, loop):
         """12:16:23Z pdflip-28-76: uncached 1258 <= live X 7036 (so below X), but routed LONG on X_busy 1205 -- the
         park reads it as needing P (#246b), the SHORT ride predicate does not (d_eligible False)."""
@@ -154,6 +156,8 @@ class TestThePredicate:
         p = _real_pending(loop, "l", 20_000)
         p.fut.set_result(None)
         assert not F.Front._p_phase_needs_p(f, p)
+
+    @pytest.mark.usefixtures("decider_off")  # EZ-S2a: describes the S1 code (reachable until S4)
 
     def test_p_only_and_refused_over_x_need_p(self, loop):
         f = _front(5713)

@@ -109,6 +109,7 @@ def test_text_and_resident_images_are_not_p_only():
 
 
 # ---------------------------------------------------------------- latch half
+@pytest.mark.usefixtures("decider_off")  # EZ-S2a: describes the S1 code (reachable until S4)
 def test_switch_off_keeps_the_hold_the_boot_showed():
     f = _front()
     f.vision_flip_urgent = False
@@ -122,6 +123,9 @@ def test_switch_on_flips_on_p_only_work_below_the_threshold():
     f.vision_flip_urgent = True
     _route_one(f, _payload())
     assert f._flip_economics_ok(fairness_fired=False) is True
+
+
+@pytest.mark.usefixtures("decider_off")  # EZ-S2a: describes the S1 code (reachable until S4)
 
 
 def test_switch_on_leaves_text_below_the_threshold_on_hold():

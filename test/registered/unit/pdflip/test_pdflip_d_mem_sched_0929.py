@@ -409,14 +409,58 @@ def _live_ctl(events, *, moved_per_cache):
     return dsv, ctl
 
 
-def test_the_coldest_first_copy_runs_between_two_syncs_and_is_counted(monkeypatch):
+class _FenceOps:
+    """F3: the ROW-FENCE's stream handles, recorded (CUDA's shape, no device)."""
+
+    def __init__(self, events):
+        self.events, self.n = events, 0
+
+    def current_stream(self):
+        return "cur"
+
+    def event(self):
+        self.n += 1
+        return "e%d" % self.n
+
+    def record(self, ev, stream):
+        self.events.append("record:%s@%s" % (ev, stream))
+
+    def wait(self, stream, ev):
+        self.events.append("wait:%s<-%s" % (stream, ev))
+
+    def query(self, ev):
+        return True
+
+    def synchronize(self, ev):
+        self.events.append("host-wait:%s" % ev)
+
+
+class _Stream:
+    def __repr__(self):
+        return "fwd"
+
+
+def test_the_coldest_first_copy_runs_between_e0_and_e1_and_never_a_device_sync(monkeypatch):
+    """F3 (was: between two device-wide syncs). Every kernel a row stream had enqueued is ordered before a
+    byte moves (E0: the current stream waits on the row stream's tail); the copies and the table writes of
+    all layers come next on the current stream; E1 after them, and the row stream's later kernels wait on it.
+    No ``torch.cuda.synchronize`` at all."""
+    from flliper.srt.pdflip import d_row_fence as F
+
     events = []
     monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: events.append("sync"))
-    dsv, ctl = _live_ctl(events, moved_per_cache=4096)
-    dsv.SeatVram._rows_off_live(ctl, 3, True)
-    # every in-flight kernel is done before a byte moves; the copies and the
-    # table writes of all layers land before the next forward and before unmap
-    assert events == ["sync", "copy+tables", "copy+tables", "sync"]
+    F.reset_for_tests()
+    fwd = _Stream()
+    F.register_row_stream(fwd)
+    F.set_ops_for_tests(_FenceOps(events))
+    try:
+        dsv, ctl = _live_ctl(events, moved_per_cache=4096)
+        fence = dsv.SeatVram._rows_off_live(ctl, 3, True)
+    finally:
+        F.reset_for_tests()
+    assert events == ["record:e1@fwd", "wait:cur<-e1", "copy+tables", "copy+tables",
+                      "record:e2@cur", "wait:fwd<-e2"]
+    assert fence.e1 == "e2" and fence.done()
     assert ctl.bytes_copied == 2 * 4096 and ctl.copy_ms >= 0.0
 
 

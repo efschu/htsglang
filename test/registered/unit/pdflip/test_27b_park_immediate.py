@@ -443,6 +443,9 @@ def _p(**kw):
     return types.SimpleNamespace(**base)
 
 
+@pytest.mark.usefixtures("decider_off")  # EZ-S2a: describes the S1 code (reachable until S4)
+
+
 def test_needs_p_is_exactly_over_x_or_p_only():
     X = 12288
     assert not pp.needs_p(X, X)                         # AT X: D may prefill it (law 4)

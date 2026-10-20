@@ -69,11 +69,12 @@ def test_f1_the_log_case_of_15_36_s_is_counted_once_at_the_front_edge(monkeypatc
     with caplog.at_level(logging.INFO, logger="pdflip.front"):
         f._decode_collect(t0 + 1.5)
     (line,) = _verdicts(caplog)
-    assert "S=10930 " in line and "members=pdflip-80-912:5396,pdflip-80-913:5534" in line, line
-    assert "classes=halb,halb" in line and "prefix-shared=4032" in line and "S_P=6898" in line, line
+    # SOLL R1u (user decision 20.10.): S is the union figure 5396 + 1502 = 6898; the own sum 10930 is reported only
+    assert "S=6898 " in line and "members=pdflip-80-912:5396,pdflip-80-913:5534" in line, line
+    assert "classes=halb,halb" in line and "prefix-shared=4032" in line and "S_own=10930" in line, line
 
 
-def test_f1_a_shared_prefix_does_not_lower_the_deciding_s_a5(monkeypatch, caplog):
+def test_f1_a_shared_prefix_is_counted_once_in_the_deciding_s_r1u(monkeypatch, caplog):
     """H16V review A5: X=6185, raw 4000 + 4100 = 8100 flips; the second brings 2000 shared tokens (S_P = 6100 < X) --
     P counts them once, but D is not shown to (schedule_policy's in-batch dedupe only runs for lpm/dfs-weight and a
     cached match <= 32 tokens), so the D-side S decides: the same session flips like another one."""
@@ -87,9 +88,9 @@ def test_f1_a_shared_prefix_does_not_lower_the_deciding_s_a5(monkeypatch, caplog
     st["shorts"]["a"] = (t0, 4000, 6185)
     st["shorts"]["b"] = (t0 + 0.5, 4100, 6185)
     with caplog.at_level(logging.INFO, logger="pdflip.front"):
-        assert f._decode_collect(t0 + 0.6) == "P"
+        assert f._decode_collect(t0 + 0.6) == "hold"      # R1u: S = 6100 < X, the shared 2000 count once (was A5: 8100 flips)
     (line,) = _verdicts(caplog)
-    assert "S=8100 " in line and "S_P=6100" in line, line
+    assert "S=6100 " in line, line
     # another session: no shared prefix, S = 8100 >= X -> flip
     f2 = _fx()
     f2.tp_prefill_max_tokens = 6185
@@ -101,7 +102,10 @@ def test_f1_a_shared_prefix_does_not_lower_the_deciding_s_a5(monkeypatch, caplog
     assert f2._decode_collect(t0 + 0.6) == "P"
 
 
-def test_f1_the_queue_sum_flip_decides_on_the_d_side_sum_too_a5(monkeypatch):
+@pytest.mark.usefixtures("decider_off")  # EZ-S2a: describes the S1 code (reachable until S4)
+
+
+def test_f1_the_queue_sum_counts_the_shared_prefix_once_r1u(monkeypatch):
     _on(monkeypatch)
     f = _fx(running=())
     f.tp_prefill_max_tokens = 6185
@@ -109,7 +113,7 @@ def test_f1_the_queue_sum_flip_decides_on_the_d_side_sum_too_a5(monkeypatch):
     _session(f, "b", "s", list(range(22000)) + [-1] * 2100, 20000)
     now = time.time()
     f.queue = [_pending("a", 4000, now - 9.0), _pending("b", 4100, now - 8.0)]
-    assert f._set_flip_justified(now) is True and f.counters["flip_held_under_x"] == 0
+    assert f._set_flip_justified(now) is False     # R1u: S = 6100 < X
 
 
 # ------------------------------------------------------------------------------------------------ F2
@@ -342,8 +346,8 @@ def test_user_case_15_36z_is_reroute_p_by_the_soll_not_by_a_moved_threshold(monk
         assert f._decode_collect(t0 + 1.6) == "P"
     (line,) = _verdicts(caplog)
     m = re.search(r"S=(\d+) X=(\d+) ", line)
-    assert m and int(m.group(1)) == 5396 + 5534 + 177 and int(m.group(2)) == x1, line   # X = the members' own X
-    assert "verdict=REROUTE_P" in line and "S_P=7075" in line, line
+    assert m and int(m.group(1)) == 5396 + 1502 + 177 and int(m.group(2)) == x1, line   # R1u: union S; X = the members' own X
+    assert "verdict=REROUTE_P" in line and "S_own=11107" in line, line
     assert re.search(r"xk=7[56]\d\d", line), line   # X(k=2) ~7620 is reported, never decided on
     # F1 alone: with only the deduplicated S_P = 7075 against the same real X the SOLL gives REROUTE_P as well
     assert pp.set_verdict([M("a", 5396, 0.0), M("b", 1502, 1.5)], x_tokens=x1, half_frac=0.5, t_half_s=4.5, now=1.6,

@@ -65,6 +65,7 @@ def d27(clean):
 
 
 # ---------------------------------------------------------------- (b) fix 1
+@pytest.mark.usefixtures("decider_off")  # EZ-S2a: describes the S1 code (reachable until S4)
 def test_a_band_deferred_request_fires_the_immediate_park():
     """pdflip-28-62: est_uncached 4172, live X 7290, X_busy 4096, x_deferred."""
     band = types.SimpleNamespace(rid="pdflip-28-62", est_uncached=4172, skip_leg1=False,
@@ -84,6 +85,9 @@ def _h91c():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+@pytest.mark.usefixtures("decider_off")  # EZ-S2a: describes the S1 code (reachable until S4)
 
 
 def test_a_fairness_flip_under_the_immediate_park_parks_instead_of_draining(clean, monkeypatch):

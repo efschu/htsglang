@@ -309,6 +309,9 @@ def test_pbound_flip_now_on_a_full_d_is_unchanged(monkeypatch):
     assert _step(f, time.time()) == (True, True, p)
 
 
+@pytest.mark.usefixtures("decider_off")  # EZ-S2b: H5b yields only for a DECIDED flip now (R1a); this pins the S2a foreseeable-flip yield (reachable until S4)
+
+
 def test_a_d_direct_short_still_yields_to_a_p_bound_request(monkeypatch):
     _on(monkeypatch)
     monkeypatch.setenv("FLLIPER_PDFLIP_HALF_FLIP_S", "0")   # the flip is DECIDED (a collecting set makes none foreseeable, R2)

@@ -22,6 +22,9 @@ def _pbound_flip_now_off(monkeypatch):
     need P -- the rule PBOUND-FLIP-NOW (default on, 02.10.) replaces; they keep
     covering it as the switch-off path."""
     monkeypatch.setenv("FLLIPER_PDFLIP_PBOUND_FLIP_NOW", "0")
+    # EZ-S2b (#20 H5b, #93 FETCH-COST-YIELD): with the decider ON a kurz request yields only for a DECIDED flip (R1a, test_ez_s2b_1020);
+    # this file pins the S2a foreseeable-flip yield, reachable until S4
+    monkeypatch.setenv("FLLIPER_PDFLIP_DECIDER", "0")
 
 
 

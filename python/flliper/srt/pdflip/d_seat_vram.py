@@ -181,6 +181,79 @@ class CardRoom:
 _CARD = CardRoom()
 
 
+def _fold_device_bytes(ctl) -> None:
+    """F3 review A5: the device mover books on the device; its cumulative total is read back without a wait
+    (``DeferredRead``) and folded into ``ctl.bytes_copied_dev`` once ready."""
+    rd = getattr(ctl, "_bytes_dev_read", None)
+    if rd is not None and rd.ready():
+        host = rd.get()
+        ctl.bytes_copied_dev = int(host[0].reshape(-1)[0])
+        ctl._bytes_dev_read = None
+        rd = None
+    accs = [a for a in (getattr(c, "_pdflip_bank_bytes_dev", None) for c in getattr(ctl, "caches", ())) if a is not None]
+    if accs and rd is None:
+        import torch
+
+        from flliper.srt.pdflip.d_row_fence import DeferredRead
+
+        ctl._bytes_dev_read = DeferredRead([torch.stack([a.reshape(()) for a in accs]).sum().reshape(1)])
+
+
+class _LendJob:
+    """F3: one lend whose map runs on the helper thread."""
+
+    __slots__ = ("base", "want", "census", "future")
+
+    def __init__(self, base: int, want: int, census: dict, future):
+        self.base, self.want, self.census, self.future = int(base), int(want), census, future
+
+
+class _Inline:
+    """F3: an executor that runs the map in the caller (the synchronous ``lend`` and CPU desk ranks)."""
+
+    def submit(self, fn, *args):
+        import concurrent.futures
+
+        fut = concurrent.futures.Future()
+        try:
+            fut.set_result(fn(*args))
+        except BaseException as exc:  # noqa: BLE001 -- re-raised by finish_lend on the scheduler thread
+            fut.set_exception(exc)
+        return fut
+
+
+_INLINE = _Inline()
+_LEND_EXECUTOR = None
+
+
+def _lend_executor():
+    """F3: ONE map thread per rank. ``tms_set_spans`` (ctypes, GIL released) takes the saver's metadata mutex
+    per allocation, so it serialises with the scheduler's own saver calls; the CUDA device of the scheduler
+    thread is made current on the thread first (the VMM calls need no stream; no kernel is launched there)."""
+    global _LEND_EXECUTOR
+    if _LEND_EXECUTOR is None:
+        import concurrent.futures
+
+        dev = None
+        try:
+            import torch
+
+            if torch.cuda.is_available() and torch.cuda.is_initialized():
+                dev = torch.cuda.current_device()
+        except Exception:  # noqa: BLE001
+            dev = None
+
+        def _init():
+            if dev is not None:
+                import torch
+
+                torch.cuda.set_device(dev)
+
+        _LEND_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="pdflip-lend-map", initializer=_init)
+    return _LEND_EXECUTOR
+
+
 class PdFlipDSeatVramWipe(PdFlipDSeatVramRefused):
     """W-SEAT-WIPE: a live span plan would release an extent holding bytes it
     keeps. Never swallowed into "no controller on this rank" (``controller``):
@@ -1606,6 +1679,15 @@ class SeatVram:
     #: the last span plan set on each managed allocation; after its tag's
     #: resume or a live apply it IS the saver's extents (one per range)
     spans_by_ptr: Dict[int, Tuple[Tuple[int, int], ...]] = field(default_factory=dict)
+    #: F3: unmaps deferred behind their ROW-FENCE (FIFO), the lend whose map runs on the helper thread, the
+    #: finished lend for the lend gate's line, and the host ms spent waiting on fences (E1 only)
+    pending_releases: List[object] = field(default_factory=list)
+    #: F3 review A4: unmaps handed to the map thread (futures, FIFO); None executor = auto (thread with CUDA)
+    release_jobs: List[object] = field(default_factory=list)
+    release_executor: Optional[object] = None
+    lend_job: Optional[object] = None
+    lend_done: Optional[dict] = None
+    fence_wait_ms: float = 0.0
 
     def __post_init__(self):
         x_max = min((int(getattr(c, "seat_rows", 0)) for c in self.caches), default=0)
@@ -1808,6 +1890,7 @@ class SeatVram:
         no reserve. ``k_cell`` (the old behaviour: the lend ends) when nothing is lent, no
         price is given (a big or unpriced extend pending: its full return already ran),
         or no card is measured (CPU, no context). Pure arithmetic over one card reading."""
+        self.settle()
         cur = int(self.rows_on)
         k_cell = int(k_cell)
         if self.lent_from is None or keep_need_bytes is None or cur <= k_cell:
@@ -1861,6 +1944,7 @@ class SeatVram:
         33 -> 23 and mapped fresh (``refuse_wipes`` stops that by name)."""
         import torch
 
+        self.settle()  # F3: an in-flight lend lands and the deferred unmaps go before any move
         n = max(1, min(int(n), self.cap))
         j = max(0, min(int(stage), len(self.form.tokens) - 1))
         cell, k, keep, notes, infos = self._stage_rows(n, j)
@@ -1957,6 +2041,7 @@ class SeatVram:
         is voted. A wake path that ever maps KV LIVE must take the same group vote
         as ``runtime_tick`` (``_grow_room_refused``) before its ``apply_stage``;
         without it a short rank stops by name here, before anything moved."""
+        self.settle()  # F3: the spans and the card as they are after an in-flight lend / deferred unmap
         n = max(1, min(int(n), self.cap))
         j = max(0, min(int(j), len(self.form.tokens) - 1))
         if k is None:
@@ -2053,8 +2138,7 @@ class SeatVram:
         self.refuse_wipes([(m.ptr, m.geom.geom.name, sp, lv) for m, sp, lv in kv_plans]
                           + [(m.ptr, m.geom.name, sp, lv) for m, sp, lv in bank_plans])
         shrink = k < int(self.rows_on)
-        if shrink:
-            self._rows_off_live(k, experts_live)
+        fence = self._rows_off_live(k, experts_live) if shrink else None
         self._plan_mamba(infos, keep)
         census = {"kept": 0, "freed": 0, "mapped": 0, "tensors": 0}
         # D-MEM-SCHED: a LIVE KV prefix that shrinks between rounds -- every
@@ -2078,7 +2162,7 @@ class SeatVram:
         # a bank that shrinks gives its cells back before the KV maps, a KV
         # that shrinks (the loop order below, unchanged) before the bank maps.
         if shrink:
-            self._set_bank_plans(bank_plans, census)
+            self._release_behind(fence, bank_plans, census)  # F3: E1, then the cells (RB unchanged)
         for m, sp, live in kv_plans:
             self.set_plan(m.ptr, m.geom.geom.name, sp, live=live, census=census)
         page = int(self.kv_tensors[0].geom.token_pad) if self.kv_tensors else 0
@@ -2147,40 +2231,124 @@ class SeatVram:
                                LINE_MARK, floor, k, want)
             return k
 
-    def _rows_off_live(self, k: int, experts_live: bool) -> None:
-        """Turn bank rows OFF (coldest first) on a live bank: sync, then the
-        copies and table writes of every layer, then a sync that lands them
-        before the next forward and before a page goes."""
+    def _rows_off_live(self, k: int, experts_live: bool):
+        """Turn bank rows OFF (coldest first) on a live bank -- F3: ordered by a ROW-FENCE
+        (``d_row_fence``), no device-wide sync, no host read. E0: the current stream waits on the tail of
+        every row stream (every kernel that may still read a row -- source or coldest-first destination --
+        is ordered before a byte moves); W: the copies and the OFF table writes of EVERY layer on the current
+        stream (device ops only, ``seat_rows_off_device``); E1: after W, and every row stream's later kernels
+        wait on it (the next forward reads the OFF routing). Returns the closed fence: a page of the dropped
+        rows may go only after ``fence.done()`` / ``fence.wait()`` (E1 alone, never device-wide)."""
         import time
 
-        import torch
+        from flliper.srt.pdflip.d_row_fence import RowFence
 
-        live_cuda = experts_live and any(
-            getattr(getattr(getattr(c, "_pool_tables", None), "row_key", None),
-                    "is_cuda", False) for c in self.caches)
-        # D-MEM-SCHED (27B 29.09.): every kernel that may still read a
-        # row -- source or coldest-first destination -- is done before a
-        # byte moves; the copies and the table writes of EVERY layer then
-        # land (second sync) before the next forward reads the routing
-        # and before a page of the dropped rows goes
-        if live_cuda:
-            self._timed_sync()
         moved0 = self._bank_bytes_copied()
         t0 = time.perf_counter()
+        fence = RowFence.begin()
         for cache in self.caches:
             cache.set_seat_rows_on(k, device_write=experts_live)
-        if live_cuda:
-            torch.cuda.synchronize()
+        fence.close()
+        _fold_device_bytes(self)
         ms = (time.perf_counter() - t0) * 1000.0
         moved = self._bank_bytes_copied() - moved0
         if moved > 0:
             self.bytes_copied += moved
             self.copy_ms += ms
-        elif live_cuda:
-            self.sync_ms += ms
+        elif any(getattr(c, "_pdflip_bank_bytes_dev", None) is not None for c in self.caches):
+            # F3 review (copy_ms on CUDA): the device mover books its bytes on the device (bytes_copied_dev,
+            # read back without a wait); the host ms of the rows-OFF move is booked here unconditionally
+            self.copy_ms += ms
+        return fence
+
+    def _release_behind(self, fence, plans, census) -> None:
+        """F3: release cells NOW (a map follows in the same move): the host waits on E1 of ``fence`` alone --
+        the rows' last readers and the OFF writes -- then the plans go (never before E1 completed)."""
+        self.fence_wait_ms += fence.wait()
+        self._set_bank_plans(plans, census)
+
+    def drain_releases(self, block: bool) -> float:
+        """F3: the deferred unmaps (FIFO) whose fence is done go -- F3 review A4: on the single map thread
+        (``cuMemUnmap``/``cuMemRelease`` per cell is 60-130 ms of driver work, rc27 SEAT-REWAKE unmap_ms),
+        serialised with the lend's maps; ``block`` (the bytes are needed in this pass) waits on E1 of each in
+        turn AND joins the unmaps. Returns the ms waited on the scheduler thread. One LIVE-SPANS line each,
+        with ``unmap_ms``."""
+        import time
+
+        waited = 0.0
+        while self.pending_releases:
+            pr = self.pending_releases[0]
+            if not pr.fence.done():
+                if not block:
+                    break
+                w = pr.fence.wait()
+                waited += w
+                self.fence_wait_ms += w
+            self.pending_releases.pop(0)
+            self.release_jobs.append(self._release_executor().submit(self._apply_release, pr))
+        if block and self.release_jobs:
+            t0 = time.perf_counter()
+            self._join_releases()
+            w = (time.perf_counter() - t0) * 1000.0
+            waited += w
+            self.fence_wait_ms += w
+        else:
+            self._reap_releases()
+        return waited
+
+    def _release_executor(self):
+        if self.release_executor is not None:
+            return self.release_executor
+        from flliper.srt.pdflip.d_row_fence import CudaOps, ops
+
+        return _lend_executor() if isinstance(ops(), CudaOps) else _INLINE
+
+    def _apply_release(self, pr) -> float:
+        """The map thread: one deferred unmap (its fence is done), timed; the LIVE-SPANS line names it."""
+        import time
+
+        t0 = time.perf_counter()
+        census = {"kept": 0, "freed": 0, "mapped": 0, "tensors": 0}
+        self._set_bank_plans(pr.plans, census)
+        ms = (time.perf_counter() - t0) * 1000.0
+        log_live_spans(census, n=pr.log.get("n", 0), stage=pr.log.get("stage"),
+                       rows_from=pr.log.get("rows_from", 0), rows_to=pr.log.get("rows_to", 0),
+                       mamba_keep=self.mamba_keep, order=pr.log.get("order", "return"), unmap_ms=ms)
+        return ms
+
+    def _reap_releases(self) -> None:
+        """Finished unmaps leave the list; a refused one re-raises here (stops by name)."""
+        while self.release_jobs and self.release_jobs[0].done():
+            self.release_jobs.pop(0).result()
+
+    def _join_releases(self) -> None:
+        while self.release_jobs:
+            self.release_jobs.pop(0).result()
+
+    def _defer_release(self, fence, plans, **log) -> None:
+        from flliper.srt.pdflip.d_row_fence import PendingRelease
+
+        self.pending_releases.append(PendingRelease(fence, plans, log))
+        self.drain_releases(block=False)
+
+    # ---- F3: the lend's map on the helper thread ----------------------------------------------------------
+
+    def lend_in_flight(self) -> bool:
+        return self.lend_job is not None
+
+    def settle(self) -> None:
+        """F3: every move of the bank first lands an in-flight lend (joins its map thread -- the only wait,
+        and only while a lend's map runs) and the deferred unmaps (blocking on their E1)."""
+        if self.lend_job is not None:
+            done = self.finish_lend(block=True)
+            if done is not None:
+                self.lend_done = done
+        if self.pending_releases or self.release_jobs:
+            self.drain_releases(block=True)
 
     def _bank_bytes_copied(self) -> int:
         return sum(int(getattr(c, "_pdflip_bank_bytes_copied", 0) or 0) for c in self.caches)
+
 
     def warm_rows(self) -> int:
         """KV-STAGE warm refill: rows the grows refilled with the experts the
@@ -2225,7 +2393,19 @@ class SeatVram:
         ON (no sync, no kernel reads a moved byte), halved if the card says
         no (``_grow_bank_elastic``). The phase cell is not touched: the lend
         rides above it until ``unlend`` or the next phase move. Returns the
-        rows added."""
+        rows added. F3: :meth:`start_lend` + :meth:`finish_lend` in one call
+        (the lend gate uses the two halves: the map on the helper thread)."""
+        if self.start_lend(budget_bytes, executor=_INLINE) <= 0:
+            return 0
+        done = self.finish_lend(block=True)
+        return 0 if done is None else int(done["rows"])
+
+    def start_lend(self, budget_bytes: int, executor=None) -> int:
+        """F3: the lend's MAP (cuMemCreate/Map/SetAccess of every new cell, ~0.2 ms each, 600-960 per lend)
+        runs on the helper thread (``executor``; default the controller's single map thread); the rows stay
+        OFF -- nothing routes to them -- until :meth:`finish_lend` turns them ON on the scheduler thread.
+        Returns the rows the map aims at (0 = nothing to lend)."""
+        self.settle()
         if self.applied is None or not self.row_tensors or not self._bank_live():
             return 0
         base = int(self.rows_on)
@@ -2235,7 +2415,37 @@ class SeatVram:
         plans = [(m, self.bank_spans(m, want), True) for m in self.row_tensors]
         self.refuse_wipes([(m.ptr, m.geom.name, sp, lv) for m, sp, lv in plans])
         census = {"kept": 0, "freed": 0, "mapped": 0, "tensors": 0}
+        ex = executor if executor is not None else _lend_executor()
+        self.lend_job = _LendJob(base, want, census, ex.submit(self._timed_grow, plans, want, census))
+        return want - base
+
+    def _timed_grow(self, plans, want, census):
+        import time
+
+        t0 = time.perf_counter()
         k = self._grow_bank_elastic(plans, want, census)
+        return k, (time.perf_counter() - t0) * 1000.0
+
+    def finish_lend(self, block: bool) -> Optional[dict]:
+        """F3: the lend's map landed (or ``block``: join it) -> the rows go ON on the scheduler thread
+        (device writes on the current stream, ordered before the next forward; the warm refill copies on the
+        warm stream, committed only after their event). Returns ``{rows, before, after, map_ms, join_ms,
+        census}`` or None (nothing in flight / not done yet). A failed map re-raises here."""
+        import time
+
+        job = self.lend_job
+        if job is None:
+            return None
+        if not block and not job.future.done():
+            return None
+        t0 = time.perf_counter()
+        try:
+            k, map_ms = job.future.result()
+        finally:
+            self.lend_job = None
+        join_ms = (time.perf_counter() - t0) * 1000.0
+        base = int(job.base)
+        census = job.census
         for cache in self.caches:
             cache.set_seat_rows_on(k, device_write=True)
         if k > base:
@@ -2245,15 +2455,19 @@ class SeatVram:
             self.lent_rows += k - base
         self.rows_on = int(k)
         applied = self.applied
-        log_live_spans(census, n=applied.n, stage=applied.stage, rows_from=base,
+        log_live_spans(census, n=applied.n if applied is not None else 0,
+                       stage=applied.stage if applied is not None else None, rows_from=base,
                        rows_to=int(k), mamba_keep=self.mamba_keep, order="lend")
-        return int(k) - base
+        return {"rows": int(k) - base, "before": base, "after": int(k), "map_ms": float(map_ms),
+                "join_ms": join_ms, "census": dict(census)}
 
     def unlend(self) -> int:
         """D-TRANSIENT-LEND: the lent rows go back before anything that needs
         the bytes (an extend, a stage move): rows OFF coldest first, sync,
         then the cells above the phase's k are released (whole lattice cells,
-        S1-Wisch). Returns the rows given back."""
+        S1-Wisch). Returns the rows given back. F3: rows OFF behind a ROW-FENCE, the cells released once
+        its E1 completed (deferred; :meth:`drain_releases`)."""
+        self.settle()
         if self.lent_from is None:
             return 0
         base = int(self.lent_from)
@@ -2264,16 +2478,14 @@ class SeatVram:
         live = self._bank_live()
         plans = [(m, self.bank_spans(m, base), live) for m in self.row_tensors]
         self.refuse_wipes([(m.ptr, m.geom.name, sp, lv) for m, sp, lv in plans])
-        self._rows_off_live(base, live)
-        census = {"kept": 0, "freed": 0, "mapped": 0, "tensors": 0}
-        self._set_bank_plans(plans, census)
+        fence = self._rows_off_live(base, live)
         self.evicted_rows += cur - base
         self.returned_rows += cur - base
         self.rows_on = base
         applied = self.applied
-        log_live_spans(census, n=applied.n if applied is not None else 0,
-                       stage=applied.stage if applied is not None else None,
-                       rows_from=cur, rows_to=base, mamba_keep=self.mamba_keep, order="return")
+        self._defer_release(fence, plans, n=applied.n if applied is not None else 0,
+                            stage=applied.stage if applied is not None else None,
+                            rows_from=cur, rows_to=base, order="return")
         return cur - base
 
     def unlend_target(self, need_free_bytes: int, free_bytes: int) -> int:
@@ -2283,6 +2495,7 @@ class SeatVram:
         mirror of :meth:`lend_target`). ``rows_on`` when the card already holds
         the need, ``lent_from`` when no lent cell can stay; ``rows_on`` with
         nothing lent."""
+        self.settle()
         cur = int(self.rows_on)
         if self.lent_from is None:
             return cur
@@ -2304,6 +2517,7 @@ class SeatVram:
         order and plans, cut at ``k`` instead of the phase's rows). The lend
         stays open (``lent_from`` kept) while rows above the phase remain;
         ``k <= lent_from`` is the full :meth:`unlend`. Returns the rows given back."""
+        self.settle()
         if self.lent_from is None:
             return 0
         base = int(self.lent_from)
@@ -2316,16 +2530,14 @@ class SeatVram:
         live = self._bank_live()
         plans = [(m, self.bank_spans(m, k), live) for m in self.row_tensors]
         self.refuse_wipes([(m.ptr, m.geom.name, sp, lv) for m, sp, lv in plans])
-        self._rows_off_live(k, live)
-        census = {"kept": 0, "freed": 0, "mapped": 0, "tensors": 0}
-        self._set_bank_plans(plans, census)
+        fence = self._rows_off_live(k, live)
         self.evicted_rows += cur - k
         self.returned_rows += cur - k
         self.rows_on = k
         applied = self.applied
-        log_live_spans(census, n=applied.n if applied is not None else 0,
-                       stage=applied.stage if applied is not None else None,
-                       rows_from=cur, rows_to=k, mamba_keep=self.mamba_keep, order="return-short")
+        self._defer_release(fence, plans, n=applied.n if applied is not None else 0,
+                            stage=applied.stage if applied is not None else None,
+                            rows_from=cur, rows_to=k, order="return-short")
         return cur - k
 
     def apply(self, n: int) -> PhaseApplied:
@@ -2335,8 +2547,7 @@ class SeatVram:
         or shrinks in place). A live shrink goes as in ``apply_stage``: rows
         OFF in the tables first, synchronize, then the pages (PA review of
         1bab093912: the pages went first here)."""
-        import torch
-
+        self.settle()  # F3
         n = max(1, min(int(n), self.cap))
         notes = []
         k = self.row_for(n).extra_rows if (self.slot_tensors and self.row_tensors) else 0
@@ -2357,13 +2568,11 @@ class SeatVram:
         self.refuse_wipes([(m.ptr, m.geom.name, sp, lv) for m, sp, lv in bank_plans])
         experts_live = any(lv for _m, _sp, lv in bank_plans)
         shrink = int(k) < int(self.rows_on)
+        fence = None
         if shrink:
-            for cache in self.caches:
-                cache.set_seat_rows_on(k, device_write=experts_live)
-            if experts_live and any(
-                    getattr(getattr(getattr(c, "_pool_tables", None), "row_key", None),
-                            "is_cuda", False) for c in self.caches):
-                torch.cuda.synchronize()
+            # F3: rows OFF behind a ROW-FENCE; the plans below release cells only after its E1
+            fence = self._rows_off_live(k, experts_live)
+            self.fence_wait_ms += fence.wait()
         census = {"kept": 0, "freed": 0, "mapped": 0, "tensors": 0}
         for m, sp, live in bank_plans:
             self.set_plan(m.ptr, m.geom.name, sp, live=live, census=census)
@@ -2419,6 +2628,7 @@ class SeatVram:
         then the bank grows elastically (a row the card cannot back stays in
         the host store). Every plan is cut at the lattice (``refuse_wipes``
         stops a plan that would release a kept cell before anything moves)."""
+        self.settle()  # F3
         n = max(1, min(int(n), self.cap))
         k, keep = self.reseat_target(n, stage)
         cur_keep = self.pool_size + 1 if self.mamba_keep is None else int(self.mamba_keep)
@@ -2451,12 +2661,14 @@ class SeatVram:
         parts = {"off_copy_ms": 0.0, "unmap_ms": 0.0, "map_ms": 0.0, "sync_ms": 0.0}
 
         def _off(k_to: int) -> None:
-            s0, t = self.sync_ms, _time.perf_counter()
-            self._rows_off_live(k_to, True)
+            # F3: rows OFF behind a ROW-FENCE; the host waits on its E1 alone before the cells go
+            t = _time.perf_counter()
+            fence = self._rows_off_live(k_to, True)
             wall = (_time.perf_counter() - t) * 1000.0
-            ds = max(0.0, self.sync_ms - s0)
-            parts["sync_ms"] += ds
-            parts["off_copy_ms"] += max(0.0, wall - ds)
+            w = fence.wait()
+            self.fence_wait_ms += w
+            parts["sync_ms"] += w
+            parts["off_copy_ms"] += wall
 
         def _timed(key: str, fn) -> None:
             t = _time.perf_counter()
@@ -2530,7 +2742,8 @@ class SeatVram:
 
 
 def log_live_spans(census: Dict[str, int], *, n: int, stage: Optional[int], rows_from: int,
-                   rows_to: int, mamba_keep: Optional[int] = None, order: str = "-") -> None:
+                   rows_to: int, mamba_keep: Optional[int] = None, order: str = "-",
+                   unmap_ms: Optional[float] = None) -> None:
     """The metal marker of a live apply (none when every allocation was
     paused: a plan moves no byte). ``wiped=0`` by construction --
     ``refuse_wipes`` stopped the apply otherwise."""
@@ -2538,13 +2751,14 @@ def log_live_spans(census: Dict[str, int], *, n: int, stage: Optional[int], rows
         return
     logger.info(
         "%s n=%d stage=%s rows_on %d->%d tensors=%d extents_kept=%d cells_freed=%d "
-        "cells_mapped=%d wiped=0 mamba_keep=%s order=%s (a live move releases whole lattice "
+        "cells_mapped=%d wiped=0 mamba_keep=%s order=%s%s (a live move releases whole lattice "
         "cells only; mamba_keep = the GDN slots with pages = the flush's reset range, all = "
         "cap form -- a live apply never moves it; order = which side moved first, RB: the "
         "shrinking side always releases before the growing side maps)",
         LIVE_MARK, int(n), "-" if stage is None else "S%d" % int(stage), int(rows_from),
         int(rows_to), census["tensors"], census["kept"], census["freed"], census["mapped"],
-        "all" if mamba_keep is None else int(mamba_keep), order)
+        "all" if mamba_keep is None else int(mamba_keep), order,
+        "" if unmap_ms is None else " unmap_ms=%.1f (map thread, F3 review A4)" % float(unmap_ms))
 
 
 # ---------------------------------------------------------------------------
@@ -4508,7 +4722,7 @@ def runtime_tick(sched):
                 "" if ctl is None else (" evicted_rows=%d refilled_rows=%d warm_rows=%d "
                                         "sync_ms=%.1f bytes_copied=%d copy_ms=%.1f rows_on=%s")
                 % (ctl.evicted_rows, ctl.refilled_rows, ctl.warm_rows(), ctl.sync_ms,
-                   ctl.bytes_copied, ctl.copy_ms,
+                   ctl.bytes_copied + int(getattr(ctl, "bytes_copied_dev", 0) or 0), ctl.copy_ms,
                    "-" if applied is None else int(applied.extra_rows)),
                 int(reserve))
     return step

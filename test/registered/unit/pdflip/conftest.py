@@ -155,3 +155,13 @@ def _pdflip_decode_collect_old_path(monkeypatch):
         # A7: ``FLLIPER_PDFLIP_TEST_T_HALF=4.5 pytest <arrival/flip files>`` runs the same files with the production T_halb
         monkeypatch.setenv("FLLIPER_PDFLIP_HALF_FLIP_S", os.environ.get("FLLIPER_PDFLIP_TEST_T_HALF", "0"))
     yield
+
+
+@pytest.fixture
+def decider_off():
+    """EZ-S2a: pins ``FLLIPER_PDFLIP_DECIDER`` OFF for a test that describes the S1 set code (the queue-sum second set, FLIP-ECONOMICS as
+    a verdict, P-by-state under X). The old code stays reachable until S4 (plan A13); the new behaviour is pinned by
+    ``test_decide_set_1019``."""
+    from flliper.srt.environ import envs
+    with envs.FLLIPER_PDFLIP_DECIDER.override(False):
+        yield
