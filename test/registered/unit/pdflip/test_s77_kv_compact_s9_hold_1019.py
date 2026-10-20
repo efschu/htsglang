@@ -129,10 +129,20 @@ def _tokens(pages, P):
     return torch.tensor([p * P + o for p in pages for o in range(P)], dtype=torch.int64)
 
 
+def _key(tokens):
+    """S112b: a RadixKey-shaped content key (the content travels with the node, never
+    with its pages: a move keeps it)."""
+    from array import array
+
+    return types.SimpleNamespace(token_ids=array("q", [int(t) for t in tokens]), extra_key=None,
+                                 is_bigram=False, limit=None)
+
+
 def _node(tree, alloc, pages, P, *, parent=None, backed=True, lock=0, last=0, mamba=None):
     _take(alloc, pages)
     n = Node(parent or tree.root_node, last=last)
     n.component_data[FULL] = CD(_tokens(pages, P), host=(object() if backed else None), lock=lock)
+    n.key = _key(_tokens(pages, P).tolist())
     if mamba is not None:
         n.component_data[MAMBA] = CD(torch.tensor([1]), host=mamba)
     return n
@@ -290,6 +300,7 @@ def test_a_backed_chain_is_evicted_leaf_first_as_one_unit():
     parent = _node(tree, alloc, [20, 21], P, backed=True, last=1)
     child = Node(parent)
     child.component_data[FULL] = CD(_tokens([1], P), host=object())
+    child.key = _key([9001, 9002, 9003, 9004])
     plan, why = KC.plan_for(KC.survey(tree, alloc, P, B), B)
     assert plan is not None, why
     assert [m.node for m in plan.evicts] == [child, parent] and plan.evict_pages == [1, 20, 21]
@@ -306,16 +317,21 @@ def test_newest_pages_get_the_room_not_the_rank_local_clock():
     newer = _node(tree, alloc, [21], P, last=1)            # the clock calls it cold
     older = _node(tree, alloc, [20], P, last=9)            # the clock calls it hot
     plan, _ = KC.plan_for(KC.survey(tree, alloc, P, B), B)
-    assert [m.node for m, _s, _d in plan.moves] == [newer] and [m.node for m in plan.evicts] == [older]
+    # S112b: the tie between the two one-page leaves is broken by CONTENT (replicated),
+    # never by the clock; one goes, the other takes the room
+    assert len(plan.evicts) == 1 and len(plan.moves) == 1
+    assert {m.node for m, _s, _d in plan.moves} | {m.node for m in plan.evicts} == {newer, older}
     # the same allocator and tree with the clocks swapped: the very same plan
     newer.last_access_time, older.last_access_time = 9, 1
     plan2, _ = KC.plan_for(KC.survey(tree, alloc, P, B), B)
     assert KC.plan_digest(8, plan2) == KC.plan_digest(8, plan)
 
 
-def test_a_refused_move_leaves_nothing_evicted():
-    """Review test_rv77a_evict_then_refuse, turned: the MOVES go first (d_seat_compact's
-    order); a destination gone before execute refuses with nothing evicted."""
+def test_a_refused_move_after_the_agreed_eviction_loses_nothing():
+    """S112b: the agreed evictions go FIRST (with rank-local page ids "is it room?" is a
+    local question, "always first" is replicated). A destination gone before the move
+    refuses the move by name; the evicted leaf was backed: its host copy stays, nothing
+    is lost, and the mover stays where it was."""
     alloc, tree, cop = _world()
     below = list(range(1, B + 1))
     _take(alloc, below[:-1])                               # exactly one free page below
@@ -323,10 +339,11 @@ def test_a_refused_move_leaves_nothing_evicted():
     leaf = _node(tree, alloc, [B + 5], P, backed=True, last=1)
     plan, why = KC.plan_for(KC.survey(tree, alloc, P, B), B)
     assert plan is not None and plan.moves and [m.node for m in plan.evicts] == [leaf], why
+    assert plan.evict_first
     _take(alloc, [below[-1]])                              # the destination is gone
     with pytest.raises(KC.CompactRefused):
         KC.execute(tree, alloc, plan, cop)
-    assert tree.evicted == [] and leaf.component_data[FULL].value is not None
+    assert tree.evicted == [leaf.id] and leaf.component_data[FULL].host_value is not None
     assert int((mover.component_data[FULL].value // P).max()) == B + 4
 
 
@@ -451,9 +468,9 @@ def test_a_peer_that_cannot_clear_keeps_every_rank_on_s9(floor_env, monkeypatch)
     surveys = []
     real = dsv_._kv_compact_rank_survey
 
-    def counted(sched_, floor_page):
+    def counted(sched_, floor_page, snap=None):
         surveys.append(int(floor_page))
-        return real(sched_, floor_page)
+        return real(sched_, floor_page, snap)
     monkeypatch.setattr(dsv_, "_kv_compact_rank_survey", counted)
 
     # the peer clears no stage: its vote says no (S98: the one vote collective, ok = 0)
@@ -742,7 +759,7 @@ def test_a_failed_fallback_eviction_on_a_rank_crash_stops(floor_env, monkeypatch
     ms = _to_s9(dsv_, sched)
     _take(alloc, [p for p in range(1, S8_PAGE + 1)])                    # nothing free below S8
     _node(tree, alloc, list(range(6145, 6150)), PG, backed=True)
-    _scripted_same(monkeypatch, dsv_, [None, None, (0, 1)])              # the eviction AND
+    _scripted_same(monkeypatch, dsv_, [None, (0, 1)])                    # the eviction AND (first)
     sched.running_batch.reqs = [_req("pdflip-2-70", 150_000)]
     with pytest.raises(dsv_.PdFlipKvCompactDivergence, match="evictions"):
         dsv_.runtime_tick(sched)

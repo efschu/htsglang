@@ -384,10 +384,6 @@ def test_three_ranks_with_unequal_backed_choose_the_same_eviction_and_digest(flo
     local_backed = {n: {k: sv.owner[min(v.component_data[FULL].value.tolist()) // PG].backed
                         for k, v in nodes.items()} for n, _s, sv, nodes in ranks}
     assert local_backed["TP0"]["x"] is False and local_backed["TP1"]["x"] is True   # the premise
-    # the class: planned on each rank's OWN survey (beef9035eb and before), the host keeps X
-    # and evicts Y while the workers evict X -- different digests, the W86-style group death
-    rank_local = [KC.plan_for(sv, S8_PAGE)[0] for _n, _s, sv, _x in ranks]
-    assert len({KC.plan_digest(8, p) for p in rank_local}) > 1
     res = _vote_and_plan(ranks)
     digests = set()
     for name, plan, why, nodes in res:
@@ -416,11 +412,14 @@ def test_a_page_live_on_one_rank_and_free_on_another_no_longer_refuses(floor_env
     sv.live_above = [p for p in sv.live_above if p != 6400]                  # TP2: page free
     sv.owner.pop(6400)
     res = _vote_and_plan(ranks)
+    evicted = []
     for name, plan, why, nodes in res:
         assert plan is not None, (name, why)
-        assert [m.node for m in plan.evicts] == [nodes["x"]], name            # best fit, oldest
+        lab = {id(v): k for k, v in nodes.items()}
+        evicted.append([lab[id(m.node)] for m in plan.evicts])               # best fit, by content
         moved = sorted(p for _m, src, _d in plan.moves for p in src)
         assert 6400 not in moved if name == "TP2" else 6400 in moved, name
+    assert evicted[0] == evicted[1] == evicted[2] and evicted[0] in (["x"], ["y"]), evicted
     assert len({KC.plan_digest(8, p) for _n, p, _w, _x in res}) == 1
 
 
@@ -428,8 +427,10 @@ def test_a_page_blocked_on_one_rank_blocks_every_rank(floor_env, monkeypatch):
     ranks = _three_ranks(monkeypatch, host_backs_x=True)
     ranks[1][2].owner[6300].pinned = True                                     # TP1: Y pinned
     res = _vote_and_plan(ranks)
-    assert all(p is None and "blocks on a rank" in w for _n, p, w, _x in res), \
-        [w for _n, _p, w, _x in res]
+    # S112b: page ids name other content on another rank, so a block is TP1's own
+    # verdict; the plan check's MIN over "plan here" refuses the stage on every rank
+    assert res[1][1] is None and "pinned" in res[1][2], res[1][2]
+    assert min(1 if p is not None else 0 for _n, p, _w, _x in res) == 0
 
 
 def test_a_destination_free_on_one_rank_only_is_no_destination_there(floor_env, monkeypatch):
@@ -686,14 +687,14 @@ def test_a_rank_whose_source_free_throws_still_enters_the_outcome_collective(
         sched = types.SimpleNamespace(token_to_kv_pool_allocator=alloc, page_size=PG,
                                       draft_worker=dw, tree_cache=tree,
                                       _pdflip_group_min_ints=group.min_ints(name))
-        if name == "TP1":
-            real_free = alloc.free
-
-            def free(idx, _real=real_free, _n=[0]):
-                _n[0] += 1
-                raise RuntimeError("cudaErrorIllegalAddress (desk: TP1's source free)")
-            alloc.free = free
         ranks.append((name, sched))
+    real_give_back = KC._give_back
+
+    def give_back(allocator, pages, ops):          # S112b: the sources go back host-informed
+        if threading.current_thread().name == "TP1":
+            raise RuntimeError("cudaErrorIllegalAddress (desk: TP1's source free)")
+        return real_give_back(allocator, pages, ops)
+    monkeypatch.setattr(KC, "_give_back", give_back)
     # the form helpers above patch kv_owner_block with their own rank's block; the
     # threads need each rank's own one at the same time
     monkeypatch.setattr(dsv, "kv_owner_block", lambda: owners[threading.current_thread().name])
@@ -720,7 +721,7 @@ def test_a_rank_whose_source_free_throws_still_enters_the_outcome_collective(
             "%s waited for a peer that skipped the collective (the gloo-timeout hang)" % name
         assert isinstance(exc, dsv.PdFlipKvCompactDivergence) and "FAILED on a rank" in str(exc), \
             (name, exc)
-    assert group.calls["TP0"] == group.calls["TP1"] == group.calls["TP2"] == 3   # vote, digest, outcome
+    assert group.calls["TP0"] == group.calls["TP1"] == group.calls["TP2"] == 3   # vote, plan check, outcome
     assert any("moves FAILED here" in m and "RuntimeError" in m for m in caplog.messages)
 
 
@@ -832,7 +833,7 @@ def test_the_witness_names_a_running_requests_page(floor_env, monkeypatch):
     sched.req_to_token_pool = types.SimpleNamespace(req_to_token=rtt)
     sched.running_batch.reqs = [types.SimpleNamespace(rid="pdflip-4-16", req_pool_idx=2,
                                                       origin_input_ids=[0] * 100, output_ids=[0] * 28)]
-    sv = KC.survey(tree, alloc, PG, S8_PAGE)
+    sv = KC.survey(tree, alloc, PG, S8_PAGE, running=sched.running_batch.reqs, req_to_token=rtt)
     w = dsv._kv_compact_page_witness(sched, sv, 6146)
     assert "request(rid=pdflip-4-16 running)" in w, w
 
