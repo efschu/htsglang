@@ -873,8 +873,8 @@ class HybridCacheController(BaseHiCacheController):
         the turn end), so the owner rows, the #923 check and the direct backend's index moves --
         the reads that would wait for the card -- wait in THIS thread only. No mamba fence: the
         finished turn's anchor is the tree's copy-on-match slot (module docstring of
-        ``pdflip.d_turn_end_l2``). A #923 hit copies nothing and fails the op by name; the
-        scheduler thread raises it at its next ack poll."""
+        ``pdflip.d_turn_end_l2``). A #923 hit copies nothing and REFUSES the op by name; the
+        ack drain undoes the commit (review A4)."""
         from flliper.srt.pdflip import d_turn_end_l2 as _te
 
         t0 = time.perf_counter()
@@ -890,10 +890,12 @@ class HybridCacheController(BaseHiCacheController):
                     if lo_r < 0 or hi_r >= cap:
                         self._unaddressable_kv_rows_refused = (
                             getattr(self, "_unaddressable_kv_rows_refused", 0) + 1)
-                        raise _te.TurnEndCopyError(
-                            "#923 HICACHE write ROW OUT OF RANGE (S108 turn end): rows [%d, %d] of a "
-                            "pool with %d rows, owner ctx %s -- nothing was copied"
-                            % (lo_r, hi_r, cap, self._dcp_owner_ctx()))
+                        logger.error(
+                            "#923 HICACHE write REFUSED (S108 turn end): rows [%d, %d] of a pool with %d "
+                            "rows, owner ctx %s -- nothing was copied, the ack undoes the commit",
+                            lo_r, hi_r, cap, self._dcp_owner_ctx())
+                        done.refuse("923:rows[%d,%d]>=%d" % (lo_r, hi_r, cap))
+                        return
             t_wait = time.perf_counter()
             refusal = self._device_index_write_refusal(op)
             on_card = not refusal

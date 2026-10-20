@@ -333,6 +333,7 @@ class ArenaMambaPoolHost(MambaPoolHost):
     # -- shared arena helpers (row path, no draft mapping) -------------------------
     pin_slots = ArenaMHAHostPool.pin_slots
     _claim = ArenaMHAHostPool._claim
+    claim_needs_room = ArenaMHAHostPool.claim_needs_room     # S108 A2: the turn end's no-room-making probe
     _evict_for_claim = ArenaMHAHostPool._evict_for_claim     # H81: the claim's room, no disk I/O
     release_tree_rows = ArenaMHAHostPool.release_tree_rows   # H81: the tree reset's release
     complete_write = ArenaMHAHostPool.complete_write
