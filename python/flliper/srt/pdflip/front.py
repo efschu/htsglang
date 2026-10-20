@@ -6306,8 +6306,14 @@ class Front:
             return None
         if r is not None and time.time() - r["t"] <= D_POOL_MAX_AGE_S:
             return r
+        budget = _asr.kv_read_budget_s()
         try:
-            got = await self._d_pool_reading()      # the ONE wait point: the arrival KV read budget (NF-R2-DPOOL)
+            # the ONE wait point: the arrival KV read budget. _d_pool_reading (NF-R2-DPOOL) bounds itself by the same
+            # budget -- the two coincide, nothing stacks; the cap here only holds a reading path that does not bound
+            # itself (the S2b A3 contract). R2's shared fetch task is shielded inside and runs on.
+            got = (await asyncio.wait_for(self._d_pool_reading(), timeout=budget)) if budget > 0 else None
+        except asyncio.TimeoutError:
+            got = None
         except Exception:  # noqa: BLE001 -- the read's failure is its own named UNREADABLE line
             got = None
         if got is not None:
