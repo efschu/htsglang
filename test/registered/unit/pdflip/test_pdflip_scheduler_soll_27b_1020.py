@@ -119,3 +119,49 @@ class Soll27bCurves(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_r6k_a_running_kurz_d_prefill_is_not_rerouted_and_not_in_s():
+    """SOLL R6k (user 20.10. 21:30Z "b"): a running KURZ D prefill runs on D to its end -- its rest is not in S and
+    triggers no flip; R6 stays for halb/gross. Same scene as the SOLL file's R6 front test (big member g waits its
+    T_halb while D decodes; D began the extend of k and reports its real rest), once with k a halb (R6 redirects) and
+    once with k classed kurz at its arrival (R6k: hold, nothing redirected)."""
+    import time as _time
+    from unittest import mock
+
+    from test_pdflip_arrival_seat_rule_0929 import _front, _pending
+
+    from flliper.srt.pdflip import d_extend_beacon as dxb
+
+    env = {"FLLIPER_PDFLIP_HALF_FLIP_S": str(T_HALF), "FLLIPER_PDFLIP_HALF_X_FRAC": str(HALF),
+           "FLLIPER_PDFLIP_ENABLE_ARRIVAL_SEAT_RULE": "1"}
+
+    def scene(kurz: bool):
+        f = _front(running=["dec"], n=6, kv={"available": 400000, "evictable": 0})
+        f.tp_prefill_max_tokens = 7543
+        now = _time.time()
+        f.t_awake = now - 60.0
+        g = _pending("g", 8793, now - 1.4)
+        g.p_only = True
+        f.queue = [g]
+        f._d_pf_book().grant(rid="k", tokens=1426, now=now - 0.136)
+        f._d_pf_book().enter_leg2(rid="k")
+        f.groups["D"].outstanding["k"] = now - 0.1
+        f._rvp_state()
+        f.__dict__.setdefault("_d_prefill_legs", {})["k"] = now
+        f._leg2_lookahead.add("k")
+        f._d_ext_reading = lambda: {dxb.rid_key("k"): (_time.time_ns(), 1426)}
+        if kurz:
+            f._r6k_mark_kurz("k")
+        return f
+
+    with mock.patch.dict(os.environ, env):
+        f = scene(kurz=False)
+        assert f._dc_carried_running() == 1426
+        assert f._decode_collect(_time.time()) == "P"            # R6: halb/gross running rest moves S over X
+        assert f.counters["set_reroute_p"] == 1
+        f = scene(kurz=True)
+        assert f._dc_carried_running() == 0                      # R6k: the kurz rest is not in S
+        assert f._decode_collect(_time.time()) == "hold"         # g waits its T_halb (R4), no flip by k
+        assert f.counters["set_reroute_p"] == 0
+        assert f.counters["r6k_kurz_stays_on_d"] >= 1

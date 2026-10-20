@@ -13563,6 +13563,8 @@ class Front:
                 and not getattr(self, "dual_layout", False)   # 27B DUAL: no set scheduler, no SET-VERDICT line
                 and phase_policy.classify_arrival(_unc, _x, Front._set_cfg()[0], False) == phase_policy.CLASS_KURZ):
             if seat is not None:
+                Front._r6k_mark_kurz(self, rid)   # SOLL R6k: its running D prefill is never R6's
+            if seat is not None:
                 _w = time.time() - t_in
                 # SOLL R5 (corrected): a kurz request waits for a D seat when D had none -- named, not an R2 finding
                 # H16V F4: ANY wait for a seat/KV is named seat_wait, not R2 -- the ARRIVAL-SEAT wait verdict the request
@@ -13946,6 +13948,16 @@ class Front:
         return book.pending_tokens(now=time.time(), live=D.outstanding, idle=_idle, started=started,
                                    tokens_of=tokens_of)
 
+    def _r6k_mark_kurz(self, rid: str) -> None:
+        """SOLL R6k (user 20.10. 21:30Z "b", SCHEDULER-SOLL.md section 3): a request classed kurz at its arrival (R2)
+        and seated on D -- R6 never counts or redirects its running D prefill. Front-only, bounded."""
+        m = self.__dict__.get("_r6k_kurz")
+        if m is None:
+            m = self.__dict__["_r6k_kurz"] = collections.OrderedDict()
+        m[str(rid)] = True
+        while len(m) > 4096:
+            m.popitem(last=False)
+
     def _r6_redirectable(self, rid: str) -> bool:
         """S56 (SOLL R6 "wird ... umgeleitet", user finding 19.10.): a running D prefill the front CAN move to P -- a
         D-prefill leg (no P leg 1, ``_d_prefill_legs``) whose stream is still in the lookahead (nothing committed to
@@ -13976,6 +13988,16 @@ class Front:
                 # (beacon v3 ``rest_after`` = rest - extend_len = 0): there is nothing left to move to P, so nothing counts
                 # into S. Before v3 the record kept the rest of the batch START and R6 counted a computed prefill.
                 self.counters["r6_rest_computed"] += 1
+                return 0
+            if str(rid) in (self.__dict__.get("_r6k_kurz") or ()):
+                # SOLL R6k (user 20.10. 21:30Z "b"): a running KURZ D prefill (u < halbX at its arrival, R2) runs on D
+                # to its end -- its rest is no part of S, it neither triggers nor pulls a flip; R6 is halb/gross only
+                self.counters["r6k_kurz_stays_on_d"] += 1
+                if self.__dict__.get("_r6k_last") != (rid, rest):
+                    self.__dict__["_r6k_last"] = (rid, rest)
+                    logger.info("PDFLIP R6K-KURZ-STAYS-ON-D rid=%s d_rest=%d granted=%d epoch=%d -- a kurz D prefill runs "
+                                "on D to its end; its rest is not in S, no flip by it (SOLL R6k, user 20.10. \"b\")",
+                                rid, rest, int(_granted), self.epoch)
                 return 0
             if not Front._r6_redirectable(self, rid):
                 self.counters["r6_rest_not_redirectable"] += 1
