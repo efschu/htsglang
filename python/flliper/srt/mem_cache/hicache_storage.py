@@ -3924,6 +3924,42 @@ class HiCacheFile(HiCacheStorage):
         except Exception:  # noqa: BLE001
             return 256 << 20
 
+    def _l3wb_publish(self, arena, slots, gens, stems, base_gen) -> int:
+        """S109b: publish secured (slot, generation) pairs into the shared record -- then S109-A5-N1 (re-review
+        20.10., Q1): read the stems once more in the #1459 index (memory). The L3 LRU (its own thread) unlinks a file,
+        removes its index entry and THEN calls on_evict (``invalidate_stems``); an unlink between this pass's stat
+        (or commit) and its publish would be overwritten by the publish -- record and baseline say "copied", the file
+        is gone, the page is never ``new`` again (R11 through a race). A stem the index does not list after the
+        publish is voided in both. Linearizable: index removal precedes on_evict. Returns the slots voided."""
+        import numpy as np
+
+        from flliper.srt.mem_cache import l3_secured as _l3s
+
+        _l3s.publish(arena, slots, gens)
+        if not len(stems):
+            return 0
+        idx = self._l3_index()
+        if idx is None:
+            return 0
+        try:
+            listed = idx.has(list(stems))
+        except Exception:  # noqa: BLE001 -- cannot re-read: void (the next pass stats again)
+            listed = [False] * len(stems)
+        bad = [int(s_) for s_, ok in zip(np.asarray(slots, dtype=np.int64).tolist(), listed) if not ok]
+        if not bad:
+            return 0
+        _b = np.asarray(bad, dtype=np.int64)
+        base_gen[_b] = -1
+        sec = _l3s.arrays(arena, create=False)
+        if sec is not None:
+            sec[0][_b] = -1
+        n = getattr(HiCacheFile, "_a5n1_voided", 0) + len(bad)
+        HiCacheFile._a5n1_voided = n
+        logger.info("S109-A5-N1 L3WB-PUBLISH-RACE voided=%d (total %d): the L3 LRU took the file between the pass's "
+                    "stat/commit and its publish -- not recorded as copied; the next pass copies it again",
+                    len(bad), n)
+        return len(bad)
+
     def l3_write_behind_pass(self, budget_bytes: Optional[int] = None, quiet=None,
                              cont: bool = False, slice_s: Optional[float] = None) -> dict:
         """One pass: every COMPLETE page of every arena this process opened
@@ -4139,7 +4175,9 @@ class HiCacheFile(HiCacheStorage):
                 have = np.fromiter((bool(s) and s in on for s in stems), dtype=bool, count=len(stems))
                 sec_gen[slots[part[have]]] = gens[part[have]]
                 sec_lo[slots[part[have]]] = klo[part[have]]
-                _l3s.publish(arena, slots[part[have]], gens[part[have]])   # S109b: every rank reads it
+                # S109b: every rank reads it; S109-A5-N1: re-read against the #1459 index after the publish
+                self._l3wb_publish(arena, slots[part[have]], gens[part[have]],
+                                   [stems[j] for j in np.nonzero(have)[0].tolist()], sec_gen)
                 tot["on_disk"] += int(have.sum())
                 todo = part[~have & np.fromiter((bool(s) for s in stems), dtype=bool,
                                                 count=len(stems))]
@@ -4249,14 +4287,14 @@ class HiCacheFile(HiCacheStorage):
                                     self._evictor.adopt_foreign(stem)
                                     sec_gen[slots[i]] = gens[i]
                                     sec_lo[slots[i]] = klo[i]
-                                    _l3s.publish(arena, [slots[i]], [gens[i]])
+                                    self._l3wb_publish(arena, [slots[i]], [gens[i]], [stem], sec_gen)
                                     tot["on_disk"] += 1
                                     tot["foreign_done"] = int(tot.get("foreign_done", 0)) + 1
                                 elif st in (0, 2):
                                     self._evictor.commit(stem)
                                     sec_gen[slots[i]] = gens[i]
                                     sec_lo[slots[i]] = klo[i]
-                                    _l3s.publish(arena, [slots[i]], [gens[i]])
+                                    self._l3wb_publish(arena, [slots[i]], [gens[i]], [stem], sec_gen)
                                     tot["written"] += 1
                                     tot["bytes"] += total
                                     if _anchor_arena:
@@ -5682,7 +5720,17 @@ class HiCacheFile(HiCacheStorage):
 
             for arena in list((getattr(self, "_arenas", None) or {}).values()):
                 if arena is not None:
-                    _l3s.invalidate_stems(arena, [stem])
+                    _n = _l3s.invalidate_stems(arena, [stem])
+                    if _n:
+                        # S109-A5-M (re-review): the L3 LRU took the file of a page still COMPLETE in L2 -- the
+                        # write-behind copies it again (the rewrite trigger); counted so the ping-pong is visible
+                        st = _l3s.LRU_L2_STATS
+                        st["n"] += int(_n)
+                        st["bytes"] += int(_n) * int(getattr(arena, "slot_bytes", 0) or 0)
+                        if st["n"] <= 32 or st["n"] % 1024 == 0:
+                            logger.info("S109-A5-M L3-LRU-TOOK-L2-PAGE n=%d bytes=%d (the L3 LRU unlinked the file of "
+                                        "a page still COMPLETE in L2 -- the write-behind rewrites it; bound: 0.9 x "
+                                        "cap - foreign/pins > L2 bytes, else ping-pong)", st["n"], st["bytes"])
         except Exception:  # noqa: BLE001 -- the AND with the index still answers "not on L3"
             logger.warning("S109-A1 l3sec invalidate on L3 evict failed", exc_info=True)
 
