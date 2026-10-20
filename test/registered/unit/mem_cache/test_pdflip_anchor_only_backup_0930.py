@@ -323,7 +323,12 @@ def test_y6b_anchor_held_reads_the_arena_then_the_l3_index():
     states = {"s:a": (3, 2), "s:b": (4, 1)}        # a COMPLETE, b CLAIMED (not readable)
     disk = {"s:c"}
     arena = SimpleNamespace(find_slots=lambda stems: [states.get(s, (-1, 0)) for s in stems])
-    backend = SimpleNamespace(_stat_stems=lambda stems: {s: 1 for s in stems if s in disk})
+    # S109d (user 20.10.: no file I/O in the scheduler thread): the L3 side is the #1459 index, never a stat
+    def _no_stat(stems):
+        raise AssertionError("S109d: anchor_held must not stat")
+
+    backend = SimpleNamespace(_l3idx=object(), l3_listed=lambda stems: [s in disk for s in stems],
+                              _stat_stems=_no_stat)
     pool = SimpleNamespace(arena=arena, _backend=backend, _stems=lambda hs: ["s:" + h for h in hs])
     held = lambda h: ArenaMambaPoolHost.anchor_held(pool, h)  # noqa: E731
     assert held("a") is True, "COMPLETE slot"

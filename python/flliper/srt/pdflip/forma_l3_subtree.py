@@ -242,7 +242,7 @@ def _secure_child_anchors(tree: Any, order: List[Any], budget: List[int]) -> Opt
         if not slots:
             return "child_anchor_in_flight", getattr(d, "id", "?")
         try:
-            ok = _l3s.secured(arena, slots)
+            ok = _l3s.secured(arena, slots, getattr(mp, "_backend", None))
         except Exception as exc:  # noqa: BLE001 - fail closed
             logger.warning("%s child anchor secured-read raised: %r", MARK, exc)
             return "child_anchor_pending", getattr(d, "id", "?")
