@@ -13171,7 +13171,7 @@ class Front:
                 "set", members=members, x_tokens=x_tok, half_frac=frac, t_half_s=t_half,
                 now=now, t_open=min(st["t_open"], now),
                 d_decoding=decoding, seats_free=seats,
-                d_prefill_running_uncached=running,  # R6: what D REALLY prefills right now counts into S
+                d_prefill_running_uncached=running,  # R6: only a D prefill that really RUNS counts (S49)
                 new_since_last=max(0, len(members) - st["seen"]), class_x_tokens=x_cls,
                 d_granted_unstarted=unstarted)
             sv = _dec.verdict
