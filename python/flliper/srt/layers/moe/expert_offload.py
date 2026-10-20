@@ -1028,6 +1028,15 @@ def pool_prefetch_stream():
     return _POOL_PREFETCH_STREAM
 
 
+def _new_row_stream():
+    """F3 review (M9): a new CUDA stream that reads or writes expert bank rows -- created AND registered."""
+    import torch
+
+    s = torch.cuda.Stream()
+    _register_row_stream(s)
+    return s
+
+
 def _register_row_stream(stream) -> None:
     """F3: a stream that reads or writes expert bank rows joins the ROW-FENCE's set (d_row_fence)."""
     try:
@@ -4159,8 +4168,7 @@ class MoEExpertOffloadCache:
         # hermetic desk test instead of a GPU-window claim. Production always
         # has a context, so the CUDA branch is unchanged.
         cuda = torch.cuda.is_available()
-        self._stream = torch.cuda.Stream() if cuda else None
-        _register_row_stream(self._stream)  # F3: the layer's fetch stream writes bank rows
+        self._stream = _new_row_stream() if cuda else None  # F3: the layer's fetch stream writes bank rows
         dev = torch.cuda.current_device() if cuda else torch.device("cpu")
         R = self.resident_count
         buf_slots = self.planner.buffer_size  # R + C
@@ -5060,18 +5068,36 @@ class MoEExpertOffloadCache:
         d_row_fence.submit_warm(self, ids, rows, hr >= 0, hr.clamp(min=0))
 
     def _move_bank_rows_device(self, src, dst) -> None:
-        """F3: :meth:`_move_bank_rows` for fixed-length device pairs (no-op lanes copy a row onto itself);
-        the bound is checked statically against the seat block's top -- no host read of the pairs."""
+        """F3: :meth:`_move_bank_rows` for the device pairs of ``seat_rows_off_device``. F3 review A5: only
+        the MOVES are copied and booked -- a move has ``src != dst`` (drop range vs kept range), a no-op lane
+        ``src == dst``, and the moves are a prefix; ``copy_rows`` takes that count as a DEVICE scalar (no
+        host read; a no-op lane costs nothing). The booking is a host int on a CPU desk rank, a device counter
+        on CUDA (``_pdflip_bank_bytes_dev``, read back without a wait by the controller). The bound is checked
+        statically against the seat block's top."""
+        import torch
+
+        from flliper.srt.layers.moe.expert_pool_device import copy_rows
+
         top = int(self._pool_tables.seat_base) + int(self._pool_tables.seat_rows)
-        copied = 0
+        bufs = list(self._resident.values())
+        row_bytes = 0
         for attr, buf in self._resident.items():
             if int(buf.shape[0]) < top:
                 raise RuntimeError(
                     "D-MEM-SCHED: bank buffer %s has %d rows, the seat block ends at row %d"
                     % (attr, int(buf.shape[0]), top))
-            buf.index_copy_(0, dst, buf.index_select(0, src))
-            copied += int(dst.numel()) * (buf.numel() // int(buf.shape[0])) * buf.element_size()
-        self._pdflip_bank_bytes_copied = int(getattr(self, "_pdflip_bank_bytes_copied", 0)) + copied
+            row_bytes += (buf.numel() // int(buf.shape[0])) * buf.element_size()
+        count = (src != dst).to(torch.int32).sum().reshape(1)
+        copy_rows(bufs, bufs, src.to(torch.int32), dst.to(torch.int32), count)
+        if count.device.type == "cpu":
+            self._pdflip_bank_bytes_copied = (int(getattr(self, "_pdflip_bank_bytes_copied", 0))
+                                              + int(count[0]) * row_bytes)
+        else:
+            acc = getattr(self, "_pdflip_bank_bytes_dev", None)
+            if acc is None:
+                acc = torch.zeros(1, dtype=torch.int64, device=count.device)
+                self._pdflip_bank_bytes_dev = acc
+            acc.add_(count.to(torch.int64) * int(row_bytes))
 
     def _seat_warm_step(self, k: int, old: int, departed: List[int]) -> None:
         """KV-STAGE warm refill: remember on a shrink, refill on a grow. The

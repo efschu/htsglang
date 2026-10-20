@@ -407,3 +407,72 @@ def test_three_ranks_same_verdicts_rank_local_timing_no_collective_no_early_unma
     assert {tuple(v[0]) for v in results.values()} == {(True, True, True)}   # one verdict sequence
     assert {v[1] for v in results.values()} == {32}
     assert len({v[2] for v in results.values()}) == 3                       # amounts rank-local
+
+
+# ---- F3 review A4: the deferred unmap runs on the map thread, settle joins it -------------------------------------
+
+def test_a4_the_deferred_unmap_runs_on_the_map_thread_and_settle_joins_it(ops, caplog):
+    import logging
+
+    caplog.set_level(logging.INFO)
+    tms = h.CoreTms()
+    ex = ManualExecutor()
+    with h._armed(tms), _floor():
+        r, ctl = _lent(tms)
+        ctl.release_executor = ex
+        mapped_lent = _bank_mapped(tms, r)
+        ctl.unlend()
+        ops.complete_all()
+        ctl.drain_releases(block=False)               # E1 done: handed to the map thread, not run here
+        assert len(ex.jobs) == 1 and ctl.release_jobs and _bank_mapped(tms, r) == mapped_lent
+
+        def _join():
+            ex.run_all()
+            return dsv.SeatVram._join_releases(ctl)
+
+        with mock.patch.object(ctl, "_join_releases", _join):
+            ctl.settle()                              # a bank move joins the unmap first
+        assert not ctl.release_jobs
+        m = ctl.row_tensors[0]
+        assert tms.mapped(m.ptr) == dsv.span_bytes(ctl.bank_spans(m, 32))
+    live = [x.getMessage() for x in caplog.records if dsv.LIVE_MARK in x.getMessage() and "order=return" in
+            x.getMessage()]
+    assert live and "unmap_ms=" in live[-1]
+
+
+def test_a4_a_refused_unmap_on_the_map_thread_stops_by_name(ops):
+    tms = h.CoreTms()
+    ex = ManualExecutor()
+    with h._armed(tms), _floor():
+        r, ctl = _lent(tms)
+        ctl.release_executor = ex
+        ctl.unlend()
+        ops.complete_all()
+        ctl.drain_releases(block=False)
+        fut = ex.jobs[0][0]
+        fut.set_exception(dsv.PdFlipDSeatVramRefused("tms_set_spans(bank, now=True) rc=-1"))
+        with pytest.raises(dsv.PdFlipDSeatVramRefused):
+            ctl.drain_releases(block=False)
+
+
+# ---- F3 review (M9): every per-layer fetch stream is created registered --------------------------------------------
+
+def test_m9_the_fetch_stream_helper_registers_and_install_uses_it(monkeypatch):
+    import inspect
+
+    from flliper.srt.layers.moe import expert_offload as eo
+
+    F.reset_for_tests()
+
+    class _S:
+        pass
+
+    monkeypatch.setattr(torch.cuda, "Stream", _S)
+    s = eo._new_row_stream()
+    try:
+        assert any(x is s for x in F.row_streams())
+    finally:
+        F.reset_for_tests()
+    src = inspect.getsource(eo)
+    assert "self._stream = _new_row_stream() if cuda else None" in src
+    assert "self._stream = torch.cuda.Stream()" not in src

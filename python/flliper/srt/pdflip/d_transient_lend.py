@@ -552,6 +552,8 @@ def _register_streams(sched) -> None:
         from flliper.srt.pdflip.d_row_fence import register_row_stream
 
         register_row_stream(getattr(sched, "forward_stream", None))
+        # F3 review A1: FLLIPER_KVSO_DECOUPLE runs a second full forward per iteration on spill_stream
+        register_row_stream(getattr(sched, "spill_stream", None))
     except Exception:  # noqa: BLE001
         pass
 
@@ -570,19 +572,30 @@ def poll(sched, ctl=None) -> None:
         if done is not None:
             ctl.lend_done = None
             _log_lend_done(sched, ctl, done, "landed in a move")
-        if getattr(ctl, "lend_job", None) is not None:
-            t0 = time.perf_counter()
-            done = ctl.finish_lend(block=False)
-            if done is not None:
-                done["on_ms"] = (time.perf_counter() - t0) * 1000.0
-                _log_lend_done(sched, ctl, done, "map done")
-        if getattr(ctl, "pending_releases", None):
-            ctl.drain_releases(block=False)
-        from flliper.srt.pdflip.d_row_fence import poll_warm
-
-        poll_warm()
-    except Exception:  # noqa: BLE001 -- the poll is advice; the next move settles
+    except Exception:  # noqa: BLE001 -- the poll's bookkeeping is advice; the next move settles
         logger.debug("%s poll skipped", MARK, exc_info=True)
+        return
+    if ctl is None:
+        return
+    # F3 review A2: a lend whose map landed -- a REFUSED map (finish_lend re-raises the helper thread's
+    # PdFlipDSeatVram* error) is named at WARNING and stops the scheduler by name, as before F3; never DEBUG
+    if getattr(ctl, "lend_job", None) is not None:
+        t0 = time.perf_counter()
+        try:
+            done = ctl.finish_lend(block=False)
+        except Exception as exc:
+            logger.warning("%s rank=%d lend map REFUSED on the helper thread: %s: %s -- stopping by name "
+                           "(F3 review A2)", MARK, _rank(sched), type(exc).__name__, exc)
+            raise
+        if done is not None:
+            done["on_ms"] = (time.perf_counter() - t0) * 1000.0
+            _log_lend_done(sched, ctl, done, "map done")
+    # a refused unmap (tms rc) or a failed warm commit stops by name, as every bank move did before F3
+    if getattr(ctl, "pending_releases", None) or getattr(ctl, "release_jobs", None):
+        ctl.drain_releases(block=False)
+    from flliper.srt.pdflip.d_row_fence import poll_warm
+
+    poll_warm()
 
 
 def _bytes_now(sched, ctl, why: str) -> None:
@@ -609,10 +622,14 @@ def quiesce_for_sleep(sched) -> None:
         ctl = dsv.controller(sched)
     except Exception:  # noqa: BLE001
         ctl = None
-    if ctl is not None:
-        ctl.settle()
-        ctl.lend_done = None
-    quiesce_warm()
+    try:
+        if ctl is not None:
+            ctl.settle()
+            ctl.lend_done = None
+    finally:
+        # F3 review A3: the warm jobs never outlive the sleep, whatever settle raised -- a job committed after
+        # the wake would route an expert to a row whose bytes the pause dropped
+        quiesce_warm()
 
 
 def round_start(sched) -> Optional[str]:

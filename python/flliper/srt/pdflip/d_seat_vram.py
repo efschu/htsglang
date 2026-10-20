@@ -180,6 +180,24 @@ class CardRoom:
 _CARD = CardRoom()
 
 
+def _fold_device_bytes(ctl) -> None:
+    """F3 review A5: the device mover books on the device; its cumulative total is read back without a wait
+    (``DeferredRead``) and folded into ``ctl.bytes_copied_dev`` once ready."""
+    rd = getattr(ctl, "_bytes_dev_read", None)
+    if rd is not None and rd.ready():
+        host = rd.get()
+        ctl.bytes_copied_dev = int(host[0].reshape(-1)[0])
+        ctl._bytes_dev_read = None
+        rd = None
+    accs = [a for a in (getattr(c, "_pdflip_bank_bytes_dev", None) for c in getattr(ctl, "caches", ())) if a is not None]
+    if accs and rd is None:
+        import torch
+
+        from flliper.srt.pdflip.d_row_fence import DeferredRead
+
+        ctl._bytes_dev_read = DeferredRead([torch.stack([a.reshape(()) for a in accs]).sum().reshape(1)])
+
+
 class _LendJob:
     """F3: one lend whose map runs on the helper thread."""
 
@@ -1659,6 +1677,9 @@ class SeatVram:
     #: F3: unmaps deferred behind their ROW-FENCE (FIFO), the lend whose map runs on the helper thread, the
     #: finished lend for the lend gate's line, and the host ms spent waiting on fences (E1 only)
     pending_releases: List[object] = field(default_factory=list)
+    #: F3 review A4: unmaps handed to the map thread (futures, FIFO); None executor = auto (thread with CUDA)
+    release_jobs: List[object] = field(default_factory=list)
+    release_executor: Optional[object] = None
     lend_job: Optional[object] = None
     lend_done: Optional[dict] = None
     fence_wait_ms: float = 0.0
@@ -2223,6 +2244,7 @@ class SeatVram:
         for cache in self.caches:
             cache.set_seat_rows_on(k, device_write=experts_live)
         fence.close()
+        _fold_device_bytes(self)
         ms = (time.perf_counter() - t0) * 1000.0
         moved = self._bank_bytes_copied() - moved0
         if moved > 0:
@@ -2237,8 +2259,13 @@ class SeatVram:
         self._set_bank_plans(plans, census)
 
     def drain_releases(self, block: bool) -> float:
-        """F3: apply the deferred unmaps (FIFO) whose fence is done; ``block`` waits on E1 of each in turn
-        (only when the bytes are needed in this pass). Returns the ms waited. One LIVE-SPANS line each."""
+        """F3: the deferred unmaps (FIFO) whose fence is done go -- F3 review A4: on the single map thread
+        (``cuMemUnmap``/``cuMemRelease`` per cell is 60-130 ms of driver work, rc27 SEAT-REWAKE unmap_ms),
+        serialised with the lend's maps; ``block`` (the bytes are needed in this pass) waits on E1 of each in
+        turn AND joins the unmaps. Returns the ms waited on the scheduler thread. One LIVE-SPANS line each,
+        with ``unmap_ms``."""
+        import time
+
         waited = 0.0
         while self.pending_releases:
             pr = self.pending_releases[0]
@@ -2249,12 +2276,45 @@ class SeatVram:
                 waited += w
                 self.fence_wait_ms += w
             self.pending_releases.pop(0)
-            census = {"kept": 0, "freed": 0, "mapped": 0, "tensors": 0}
-            self._set_bank_plans(pr.plans, census)
-            log_live_spans(census, n=pr.log.get("n", 0), stage=pr.log.get("stage"),
-                           rows_from=pr.log.get("rows_from", 0), rows_to=pr.log.get("rows_to", 0),
-                           mamba_keep=self.mamba_keep, order=pr.log.get("order", "return"))
+            self.release_jobs.append(self._release_executor().submit(self._apply_release, pr))
+        if block and self.release_jobs:
+            t0 = time.perf_counter()
+            self._join_releases()
+            w = (time.perf_counter() - t0) * 1000.0
+            waited += w
+            self.fence_wait_ms += w
+        else:
+            self._reap_releases()
         return waited
+
+    def _release_executor(self):
+        if self.release_executor is not None:
+            return self.release_executor
+        from flliper.srt.pdflip.d_row_fence import CudaOps, ops
+
+        return _lend_executor() if isinstance(ops(), CudaOps) else _INLINE
+
+    def _apply_release(self, pr) -> float:
+        """The map thread: one deferred unmap (its fence is done), timed; the LIVE-SPANS line names it."""
+        import time
+
+        t0 = time.perf_counter()
+        census = {"kept": 0, "freed": 0, "mapped": 0, "tensors": 0}
+        self._set_bank_plans(pr.plans, census)
+        ms = (time.perf_counter() - t0) * 1000.0
+        log_live_spans(census, n=pr.log.get("n", 0), stage=pr.log.get("stage"),
+                       rows_from=pr.log.get("rows_from", 0), rows_to=pr.log.get("rows_to", 0),
+                       mamba_keep=self.mamba_keep, order=pr.log.get("order", "return"), unmap_ms=ms)
+        return ms
+
+    def _reap_releases(self) -> None:
+        """Finished unmaps leave the list; a refused one re-raises here (stops by name)."""
+        while self.release_jobs and self.release_jobs[0].done():
+            self.release_jobs.pop(0).result()
+
+    def _join_releases(self) -> None:
+        while self.release_jobs:
+            self.release_jobs.pop(0).result()
 
     def _defer_release(self, fence, plans, **log) -> None:
         from flliper.srt.pdflip.d_row_fence import PendingRelease
@@ -2274,11 +2334,12 @@ class SeatVram:
             done = self.finish_lend(block=True)
             if done is not None:
                 self.lend_done = done
-        if self.pending_releases:
+        if self.pending_releases or self.release_jobs:
             self.drain_releases(block=True)
 
     def _bank_bytes_copied(self) -> int:
         return sum(int(getattr(c, "_pdflip_bank_bytes_copied", 0) or 0) for c in self.caches)
+
 
     def warm_rows(self) -> int:
         """KV-STAGE warm refill: rows the grows refilled with the experts the
@@ -2672,7 +2733,8 @@ class SeatVram:
 
 
 def log_live_spans(census: Dict[str, int], *, n: int, stage: Optional[int], rows_from: int,
-                   rows_to: int, mamba_keep: Optional[int] = None, order: str = "-") -> None:
+                   rows_to: int, mamba_keep: Optional[int] = None, order: str = "-",
+                   unmap_ms: Optional[float] = None) -> None:
     """The metal marker of a live apply (none when every allocation was
     paused: a plan moves no byte). ``wiped=0`` by construction --
     ``refuse_wipes`` stopped the apply otherwise."""
@@ -2680,13 +2742,14 @@ def log_live_spans(census: Dict[str, int], *, n: int, stage: Optional[int], rows
         return
     logger.info(
         "%s n=%d stage=%s rows_on %d->%d tensors=%d extents_kept=%d cells_freed=%d "
-        "cells_mapped=%d wiped=0 mamba_keep=%s order=%s (a live move releases whole lattice "
+        "cells_mapped=%d wiped=0 mamba_keep=%s order=%s%s (a live move releases whole lattice "
         "cells only; mamba_keep = the GDN slots with pages = the flush's reset range, all = "
         "cap form -- a live apply never moves it; order = which side moved first, RB: the "
         "shrinking side always releases before the growing side maps)",
         LIVE_MARK, int(n), "-" if stage is None else "S%d" % int(stage), int(rows_from),
         int(rows_to), census["tensors"], census["kept"], census["freed"], census["mapped"],
-        "all" if mamba_keep is None else int(mamba_keep), order)
+        "all" if mamba_keep is None else int(mamba_keep), order,
+        "" if unmap_ms is None else " unmap_ms=%.1f (map thread, F3 review A4)" % float(unmap_ms))
 
 
 # ---------------------------------------------------------------------------
@@ -4301,7 +4364,7 @@ def runtime_tick(sched):
                 "" if ctl is None else (" evicted_rows=%d refilled_rows=%d warm_rows=%d "
                                         "sync_ms=%.1f bytes_copied=%d copy_ms=%.1f rows_on=%s")
                 % (ctl.evicted_rows, ctl.refilled_rows, ctl.warm_rows(), ctl.sync_ms,
-                   ctl.bytes_copied, ctl.copy_ms,
+                   ctl.bytes_copied + int(getattr(ctl, "bytes_copied_dev", 0) or 0), ctl.copy_ms,
                    "-" if applied is None else int(applied.extra_rows)),
                 int(reserve))
     return step
