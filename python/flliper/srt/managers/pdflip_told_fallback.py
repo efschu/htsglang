@@ -1839,6 +1839,10 @@ def follower_pump(scheduler) -> None:
             st.outbox.append((rid, own, tuple(ack_anchors(scheduler, req, rid, own, told))))
         else:
             st.outbox.append((rid, own))
+        # P-COMMIT MESSTOR (2): S50 WOULD-ACK -- how much earlier a told-less ack could have left (log only)
+        from flliper.srt.managers import pdflip_told_ack_early as _tae
+
+        _tae.note_ack(scheduler, rid, own, told)
     ch = _channel(scheduler)
     if not st.outbox:
         ch.pump()

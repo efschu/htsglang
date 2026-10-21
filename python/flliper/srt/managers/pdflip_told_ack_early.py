@@ -35,7 +35,7 @@ import contextlib
 import logging
 import threading
 import time
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -54,8 +54,26 @@ def enabled() -> bool:
         return True
 
 
+#: P-COMMIT MESSTOR (2) S50 WOULD-ACK (review nf-rc30-pcommit-review-1021 §2.5, instrument only): the monotonic
+#: time each store read ENDED on this process, by request id -- stamped by the read thread below, read by the follower
+#: when its real ack leaves (``note_ack``). Bounded; a plain dict under the GIL (one writer thread, one reader).
+_READ_END: "Dict[str, float]" = {}
+_READ_END_MAX = 2048
+#: rid -> (absorb time of the paced read-ahead, its told, keys_digest equal?) on a follower
+_AHEAD: "Dict[str, tuple]" = {}
+_WOULD = {"n": 0, "gain_ms_sum": 0.0, "eq_n": 0}
+
+
 def note_read_end(operation: Any = None) -> None:
     """HiCache read thread: a store read just ended. Wakes every worker (cheap; no-op without one)."""
+    try:
+        rid = getattr(operation, "request_id", None)
+        if rid is not None:
+            _READ_END[str(rid)] = time.monotonic()
+            while len(_READ_END) > _READ_END_MAX:
+                _READ_END.pop(next(iter(_READ_END)))
+    except Exception:  # noqa: BLE001 -- an instrument on the read thread never raises
+        pass
     if not _LISTENERS:
         return
     with _LIST_LOCK:
@@ -214,3 +232,60 @@ def forward_window(scheduler):
 
 def instance(scheduler) -> Optional[EarlyAck]:
     return getattr(scheduler, ATTR, None)
+
+
+# ---------------------------------------------------------------------------
+# P-COMMIT MESSTOR (2): S50 WOULD-ACK -- how much earlier a told-less ack could have left (instrument only)
+# ---------------------------------------------------------------------------
+#: The review's (b): the follower's ack needs PP0's read-ahead today (``follower_pump`` reports only rids in
+#: ``st.expect``), so it leaves after the follower ABSORBED the read-ahead -- at its pass boundary, behind its forward of
+#: the older set. A told-less ack could leave when the follower's own read ended. Per real ack this line names that gap
+#: (``read_end_before_ack_ms``), whether the ack's depth equals told (the combined Admit's precondition) and whether the
+#: follower's own key chain digests to PP0's (``keys_digest``, TK #1442). Nothing on the wire changes.
+
+
+def note_read_ahead(scheduler: Any, rid: str, told: int, digest_eq: Optional[bool]) -> None:
+    """Follower, absorbing a paced read-ahead carrying ``ack``."""
+    try:
+        _AHEAD[str(rid)] = (time.monotonic(), int(told), digest_eq)
+        while len(_AHEAD) > 1024:
+            _AHEAD.pop(next(iter(_AHEAD)))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def note_ack(scheduler: Any, rid: str, own: int, told: int) -> None:
+    """Follower, ``follower_pump`` just queued the REAL ack of ``rid`` (any thread: pass boundary or S50 window)."""
+    try:
+        rid = str(rid)
+        now = time.monotonic()
+        end = _READ_END.pop(rid, None)
+        ahead = _AHEAD.pop(rid, None)
+        gain = None if end is None else max(0.0, (now - end) * 1000.0)
+        eq = int(own) == int(told)
+        _WOULD["n"] += 1
+        if eq and gain is not None:
+            _WOULD["eq_n"] += 1
+            _WOULD["gain_ms_sum"] += gain
+        logger.info(
+            "S50 WOULD-ACK pp=%s rid=%s told=%d own=%d eq=%d digest_eq=%s read_end_before_ack_ms=%s "
+            "read_end_before_absorb_ms=%s (n=%d eq_n=%d gain_ms_sum=%.0f): a told-less ack could have left at the "
+            "read end -- instrument only, the ack itself is unchanged",
+            getattr(getattr(scheduler, "ps", None), "pp_rank", "?"), rid, int(told), int(own), 1 if eq else 0,
+            "-" if ahead is None or ahead[2] is None else int(bool(ahead[2])),
+            "-" if gain is None else "%.0f" % gain,
+            "-" if end is None or ahead is None else "%.0f" % ((ahead[0] - end) * 1000.0),
+            _WOULD["n"], _WOULD["eq_n"], _WOULD["gain_ms_sum"],
+        )
+    except Exception:  # noqa: BLE001 -- an instrument
+        pass
+
+
+def would_stats() -> dict:
+    return dict(_WOULD)
+
+
+def reset_would() -> None:
+    _READ_END.clear()
+    _AHEAD.clear()
+    _WOULD.update({"n": 0, "gain_ms_sum": 0.0, "eq_n": 0})

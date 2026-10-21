@@ -65,6 +65,7 @@ def stats() -> dict:
 def reset() -> None:
     for k in _N:
         _N[k] = 0
+    _WOULD.update({"n": 0, "qual": 0})
 
 
 def _say(key: str) -> bool:
@@ -189,7 +190,10 @@ def proxy_extra(scheduler, mb_id: int, base: Optional[dict]) -> Optional[dict]:
         if size <= 1:
             return base
         if rank == 0:
-            return with_key(base, _pp0_announce(scheduler, mb_id))
+            k = _pp0_announce(scheduler, mb_id)
+            if k is None:
+                note_would_announce(scheduler, mb_id)
+            return with_key(base, k)
         up = (getattr(scheduler, "_w2c_upstream_by_slot", None) or {}).pop(int(mb_id), None)
         if up is None:
             return base
@@ -227,6 +231,89 @@ def _pp0_announce(scheduler, mb_id: int) -> Optional[int]:
         logger.info("W2C CHAIN-ANNOUNCE slot=%d k=%d rids=%s (n=%d): PP0's next chain carries a read-ahead the "
                     "followers ack before computing this row (C2)", int(mb_id), k, list(rids)[:4], _N["announce"])
     return k
+
+
+# ---------------------------------------------------------------------------
+# P-COMMIT MESSTOR (1): W2C WOULD-ANNOUNCE (review nf-rc30-pcommit-review-1021 §2.5; instrument only, no frame change)
+#
+# The class "arrival during PP0's host-blocking launch" (rc30: 28 drains / 40.6 s) would need C2 to announce on a
+# READABLE request socket instead of a terminable held read. Before anything is built: at the launch end PP0 asks the
+# socket (``request_receiver.control_message_pending``: a zero-timeout zmq poll, nothing consumed) and C2(b) (no other
+# slot in flight, no carried chunk); at the NEXT pass top -- where the frames are received anyway -- it names what they
+# were: generate/embedding arrivals vs control requests (W2C review V3: only a pure-arrival chain may be announced).
+# ``qualifies`` = readable AND C2(b) AND arrivals only. The qualifying rids are kept for #PDRAIN, which sums the drain
+# wait they sat behind (``w2c_would_ms_sum``) -- the per-boot seconds the build gate (~20 s/boot) is read from.
+_W2C_GEN_SUFFIXES = ("GenerateReqInput", "EmbeddingReqInput")
+_W2C_INTERNAL = ("PdFlipVisionVerdict",)
+_WOULD: Dict[str, Any] = {"n": 0, "qual": 0}
+
+
+def note_would_announce(scheduler, mb_id: int) -> None:
+    """PP0 at a launch end whose frame carries NO announcement: is the request socket readable, is C2(b) met?"""
+    try:
+        if not _armed_pp0(scheduler):
+            return
+        rr = getattr(scheduler, "request_receiver", None)
+        probe = getattr(rr, "control_message_pending", None)
+        if not callable(probe) or not probe():
+            return
+        mbs = getattr(scheduler, "mbs", None)
+        others = isinstance(mbs, (list, tuple)) and any(b is not None for j, b in enumerate(mbs) if j != int(mb_id))
+        carried = getattr(scheduler, "chunked_req", None) is not None
+        scheduler._w2c_would = {"t": _clock(), "slot": int(mb_id), "others": bool(others), "carried": bool(carried)}
+    except Exception:  # noqa: BLE001 -- an instrument
+        pass
+
+
+def classify_kinds(reqs) -> Dict[str, Any]:
+    gen, ctrl, other, rids = 0, 0, 0, []
+    for r in reqs or ():
+        name = type(r).__name__
+        if name.endswith(_W2C_GEN_SUFFIXES):
+            gen += 1
+            rid = getattr(r, "rid", None)
+            if isinstance(rid, str):
+                rids.append(rid)
+        elif name in _W2C_INTERNAL:
+            other += 1
+        else:
+            ctrl += 1
+    return {"gen": gen, "ctrl": ctrl, "other": other, "rids": rids}
+
+
+def pp0_would_at_top(scheduler, recv_reqs) -> None:
+    """PP0 pass top (``pdflip_store_told.pp0_publish``), the frames this pass received: close the launch end's probe."""
+    w = getattr(scheduler, "_w2c_would", None)
+    if w is None:
+        return
+    scheduler._w2c_would = None
+    try:
+        k = classify_kinds(recv_reqs)
+        c2b = not w["others"] and not w["carried"]
+        qualifies = c2b and k["gen"] > 0 and k["ctrl"] == 0
+        _WOULD["n"] += 1
+        if qualifies:
+            _WOULD["qual"] += 1
+            d = getattr(scheduler, "_w2c_would_rids", None)
+            if d is None:
+                d = scheduler._w2c_would_rids = {}
+            for rid in k["rids"]:
+                d[rid] = _clock()
+            while len(d) > 256:
+                d.pop(next(iter(d)))
+        logger.info(
+            "W2C WOULD-ANNOUNCE slot=%d readable_at_launch_end=1 others_in_flight=%d carried=%d c2b=%d gen=%d ctrl=%d "
+            "other=%d qualifies=%d rids=%s after_ms=%.0f (n=%d qual=%d): instrument only -- the frame carried no "
+            "announcement; a socket trigger would have announced this chain",
+            w["slot"], int(w["others"]), int(w["carried"]), int(c2b), k["gen"], k["ctrl"], k["other"],
+            int(qualifies), k["rids"][:4], (_clock() - w["t"]) * 1000.0, _WOULD["n"], _WOULD["qual"],
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def would_stats() -> dict:
+    return dict(_WOULD)
 
 
 def pp0_take_announced(scheduler) -> Optional[int]:
