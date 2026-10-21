@@ -271,13 +271,26 @@ def test_pdrain_names_who_waited_behind_the_receive(caplog):
     s._s82_launch_rec = {0: (_time.monotonic() - 3.987, 15019, 58880)}
     t, pending = told.s82_output_pending_at_entry(s)
     assert pending is True and s._pdrain_entry is not None
+    s._pdrain_entry = (s._pdrain_entry[0] - 3.987, s._pdrain_entry[1])   # the receive waited 3987 ms (metal)
     with caplog.at_level(logging.INFO, logger=told.logger.name):
         told.s82_after_commit(s, 0, (t, pending))
     line = [r.getMessage() for r in caplog.records if r.getMessage().startswith("#PDRAIN")]
     assert len(line) == 1
-    assert "cause=paced" in line[0] and "queued=1" in line[0] and "paced=1" in line[0]
+    assert "cause=paced" in line[0] and "queued=1" in line[0] and "paced=1" in line[0] and "sig=1" in line[0]
     assert "new=15019 cached=58880" in line[0]
     assert s._pdrain_entry is None and s._pdrain_pause_n == 1
+    assert 3980 <= s._pdrain_ms_sums["paced"] <= 4100 and s._pdrain_ms_sums["pause"] == s._pdrain_ms_sums["paced"]
+
+
+def test_pdrain_short_wait_is_logged_but_not_summed(caplog):
+    """review B4: the entry PREDICTS a blocking receive; a drain under PDRAIN_SIG_MS is no pause in the sums."""
+    s = _sched(_text_req("pdflip-141-1469"))
+    t, pending = told.s82_output_pending_at_entry(s)
+    with caplog.at_level(logging.INFO, logger=told.logger.name):
+        told.s82_after_commit(s, 0, (t, pending))
+    line = [r.getMessage() for r in caplog.records if r.getMessage().startswith("#PDRAIN")]
+    assert len(line) == 1 and "sig=0" in line[0]
+    assert getattr(s, "_pdrain_pause_n", 0) == 0 and s._pdrain_ms_sums["pause"] == 0.0
 
 
 @pytest.mark.parametrize("kind,cause", [("empty", "idle"), ("vision", "vision"), ("held_open", "held_open"),
