@@ -64057,7 +64057,7 @@
    "id": "FLLIPER_PDFLIP_EVICT_ANCHOR_SAVE",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/unified_radix_cache.py:6603"
+    "mem_cache/unified_radix_cache.py:6615"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_EVICT_ANCHOR_SAVE",
@@ -64066,7 +64066,38 @@
    "source": {
     "file": "mem_cache/unified_radix_cache.py",
     "kind": "os.environ",
-    "line": 6603,
+    "line": 6615,
+    "tree": "nf"
+   },
+   "status": "unexplained",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "os.environ"
+  },
+  "FLLIPER_PDFLIP_EVICT_FIT": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"1\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "",
+   "id": "FLLIPER_PDFLIP_EVICT_FIT",
+   "kind": "env",
+   "lesestellen": [
+    "pdflip/evict_fit.py:41"
+   ],
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_EVICT_FIT",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "pdflip/evict_fit.py",
+    "kind": "os.environ",
+    "line": 41,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -75796,7 +75827,7 @@
    "id": "FLLIPER_PDFLIP_SPILL_REF_FREE",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/unified_radix_cache.py:6835"
+    "mem_cache/unified_radix_cache.py:6847"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_SPILL_REF_FREE",
@@ -75805,7 +75836,38 @@
    "source": {
     "file": "mem_cache/unified_radix_cache.py",
     "kind": "os.environ",
-    "line": 6835,
+    "line": 6847,
+    "tree": "nf"
+   },
+   "status": "unexplained",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "os.environ"
+  },
+  "FLLIPER_PDFLIP_SPILL_STATE_MEMO": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"1\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "",
+   "id": "FLLIPER_PDFLIP_SPILL_STATE_MEMO",
+   "kind": "env",
+   "lesestellen": [
+    "pdflip/spill_memo.py:51"
+   ],
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_SPILL_STATE_MEMO",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "pdflip/spill_memo.py",
+    "kind": "os.environ",
+    "line": 51,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -76253,7 +76315,7 @@
    "id": "FLLIPER_PDFLIP_SWEEP_REFUSED_MEMO",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/unified_radix_cache.py:9052"
+    "mem_cache/unified_radix_cache.py:9082"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_SWEEP_REFUSED_MEMO",
@@ -76262,7 +76324,7 @@
    "source": {
     "file": "mem_cache/unified_radix_cache.py",
     "kind": "os.environ",
-    "line": 9052,
+    "line": 9082,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -78114,6 +78176,37 @@
     "nf"
    ],
    "type": "EnvBool"
+  },
+  "FLLIPER_PDFLIP_UD_LAST": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"1\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "",
+   "id": "FLLIPER_PDFLIP_UD_LAST",
+   "kind": "env",
+   "lesestellen": [
+    "pdflip/ud_last.py:56"
+   ],
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_UD_LAST",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "pdflip/ud_last.py",
+    "kind": "os.environ",
+    "line": 56,
+    "tree": "nf"
+   },
+   "status": "unexplained",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "os.environ"
   },
   "FLLIPER_PDFLIP_UNION_DIR": {
    "bare": false,
@@ -91817,8 +91910,8 @@
  "schema": "flliper.catalog/1",
  "stats": {
   "curated": 125,
-  "entries": 2899,
-  "envs": 2020,
+  "entries": 2902,
+  "envs": 2023,
   "explained": 310,
   "flags": 864,
   "harvested": 1796,
@@ -91826,19 +91919,19 @@
    "abweichung": 53,
    "beide": 2463,
    "nur_27b": 180,
-   "nur_nf": 238
+   "nur_nf": 241
   },
-  "unexplained": 668
+  "unexplained": 671
  },
- "tree_rev": "27b=0798c91fcd+nf=1c7f12e839",
+ "tree_rev": "27b=0798c91fcd+nf=a2ab51053d",
  "trees": {
   "27b": {
    "entries": 2643,
    "rev": "0798c91fcd"
   },
   "nf": {
-   "entries": 2701,
-   "rev": "1c7f12e839"
+   "entries": 2704,
+   "rev": "a2ab51053d"
   }
  },
  "warnungen": []
