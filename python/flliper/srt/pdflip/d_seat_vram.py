@@ -3054,6 +3054,42 @@ def _demand_lists(sched) -> Tuple[list, list]:
     return running, _admissible_queue(queue, _cap_of(sched) - len(running))
 
 
+#: KVZIEL-1021: the requests D holds parked (flip park, decode-pressure park, settle, lane hold)
+PARKED_MARK = "PDFLIP D-MEM-SCHED PARKED-DEMAND"
+_PARKED_N = [0]
+
+
+def _parked_demand(sched, running, admissible) -> list:
+    """KVZIEL-1021 (NF rc29 a773b4ebc4, boot 1021_022209, D.log 02:27:54): the requests D
+    holds PARKED -- ``pdflip_d_parked``: a flip park's retracted running requests (their
+    spans RETAINED in the tree, ``PDFLIP-D-PARK RETAINED retained=192129 of 192169``), the
+    queue the park took along, a decode-pressure park, the settle -- resume on THIS D. They
+    are the stage's demand like the running ones: at the D->P flip park
+    (``PDFLIP-PARK-RETRACT-SPLIT epoch=0 n=5``) the census read used=0 incoming=0, an END
+    event, ``pending S-->S0`` (cap 32768) and a KV-COMPACT toward S0 against exactly the
+    ~650k tokens the five resumed 30 s later (pdflip-0-28 / -30 finished 02:28:34 at
+    cache_len 192256) -- the UNMERGED-EXTEND class (y3j 09291933) for the park.
+
+    REPLICATED: the park list is built and shrunk by group verdicts only (every D rank parks
+    the same list, ``d_park_runtime``), the token counts are the requests' own. A request
+    already in the running census or the admissible queue head is not counted twice; a
+    finished one (an abort that reached it while parked) not at all."""
+    parked = getattr(sched, "pdflip_d_parked", None) or ()
+    if not parked:
+        return []
+    have = {id(r) for r in running} | {id(r) for r in admissible}
+    out = []
+    for r in list(parked):
+        if id(r) in have:
+            continue
+        fin = getattr(r, "finished", None)
+        if callable(fin) and fin():
+            continue
+        out.append(r)
+        have.add(id(r))
+    return out
+
+
 def global_demand(sched) -> Tuple[int, int, frozenset]:
     """REPLICATED (27B condition 2): the tokens the running requests hold,
     the tokens the queue head wants, the running rids -- the request lists
@@ -4064,8 +4100,19 @@ def _kv_compact_rank_survey(sched, floor_page: int, snap=None):
     rtt = getattr(_req_pool(sched), "req_to_token", None)
     run = _kv_compact_running(sched) if (rtt is not None or snap is not None) else ()
     sv = KC.survey(getattr(sched, "tree_cache", None), alloc, page, int(floor_page),
-                   running=run, req_to_token=rtt, snap=snap)
+                   running=run, req_to_token=rtt, snap=snap, store_ok=_kv_compact_store_ok())
     return sv, sv.why, copier
+
+
+def _kv_compact_store_ok() -> bool:
+    """KVZIEL-1021: store-backed content is evictable only through the S39 drop -- with it on
+    (``FLLIPER_PDFLIP_FORMA_L3_SUBTREE``, default on; an env read, the same on every rank)."""
+    try:
+        from flliper.srt.pdflip import forma_l3_subtree as _s39
+
+        return bool(_s39.on())
+    except Exception:  # noqa: BLE001 -- no S39 module: the L2-backed content alone
+        return False
 
 
 def _kv_compact_local_gaps(sv, boundaries: Sequence[int]) -> List[int]:
@@ -4086,10 +4133,11 @@ def _kv_compact_vote(sv, why, floor_page: int, top_page: int,
 
     bounds = [int(floor_page)] if boundaries is None else [int(b) for b in boundaries]
     if sv is None or not ready:
-        return [0, 1 if ready else 0] + [-(1 << 30)] * len(bounds) + [0] * (2 * KC.BITMAP)
+        return [0, 1 if ready else 0] + [-(1 << 30)] * len(bounds) + [0] * (3 * KC.BITMAP)
     ok = 1 if (why is None and sv.why is None) else 0
+    # KVZIEL-1021: the SECURED map (L2 or store) rides at the end of the same vector -- one collective
     return ([ok, 1] + [-g for g in _kv_compact_local_gaps(sv, bounds)] + KC.local_bitmap(sv)
-            + KC.local_sizes(sv))
+            + KC.local_sizes(sv) + KC.local_secured_bitmap(sv))
 
 
 def _kv_compact_group_vote(sched, vec: List[int]) -> List[int]:
@@ -4107,8 +4155,10 @@ def _kv_compact_agreement(group: List[int], top_page: int, boundaries: Sequence[
 
     k = len(boundaries)
     gaps = {int(b): -int(group[2 + i]) for i, b in enumerate(boundaries)}
+    sec = group[2 + k + 2 * KC.BITMAP:2 + k + 3 * KC.BITMAP]
     return KC.Agreement(bitmap=[int(x) for x in group[2 + k:2 + k + KC.BITMAP]], gaps=gaps,
-                        sizes=[int(x) for x in group[2 + k + KC.BITMAP:2 + k + 2 * KC.BITMAP]])
+                        sizes=[int(x) for x in group[2 + k + KC.BITMAP:2 + k + 2 * KC.BITMAP]],
+                        secured=[int(x) for x in sec] if len(sec) == KC.BITMAP else None)
 
 
 def _kv_compact_plans_from_vote(sv, group: List[int], floor_page: int, top_page: int,
@@ -4439,6 +4489,17 @@ def _kv_compact_for_shrink(sched, ms, fr, want: int, end: bool, floor_tokens: in
             if whys is not None and len(whys) == len(cands):
                 logger.info("%s n=%d STAGES %s", KV_COMPACT_MARK, n,
                             _kv_compact_stage_reasons(cands, whys))
+            if sv is not None and getattr(sv, "why", None) is None:
+                # KVZIEL-1021: what holds the pages above the deepest and the shallowest candidate
+                ag = (_kv_compact_agreement(group, top_page, bounds)
+                      if int(group[0]) == 1 and int(group[1]) == 1 else None)
+                for jj_, b_ in sorted({(cands[0], bounds[0]), (cands[-1], bounds[-1])}):
+                    cen = KC.holder_census(sv, b_, ag)
+                    logger.info("%s n=%d HOLDERS S%d boundary_page=%d %s (pages; rank-local -- "
+                                "l2/store = backed in L2 / in the store only, _ok = can go, "
+                                "_child_blocked = waits behind a device child that cannot, "
+                                "_not_agreed = not secured on every rank)", KV_COMPACT_MARK, n, jj_, b_,
+                                " ".join("%s=%d" % kv for kv in sorted(cen.items())))
             pages = sorted({int(x) for x in re.findall(r"page (\d+)", why or "")})
             for pg in pages[:2]:
                 logger.info("%s n=%d WITNESS page=%d (tokens from %d) here: %s", KV_COMPACT_MARK, n,
@@ -4450,7 +4511,7 @@ def _kv_compact_for_shrink(sched, ms, fr, want: int, end: bool, floor_tokens: in
         return _refused()
     # 2. the plan check -- entered by EVERY rank once the group said yes
     fl = [1 if p is not None else 0 for p in plans]
-    ev = [1 if (p is not None and p.evicts) else 0 for p in plans]
+    ev = [1 if (p is not None and (p.evicts or p.staged)) else 0 for p in plans]
     dg = [KC.plan_digest(cands[i], p) if p is not None else -1 for i, p in enumerate(plans)]
     lo, hi = _group_same(sched, fl + ev + dg)
     flo, elo, ehi, dlo, dhi = lo[:k], lo[k:2 * k], hi[k:2 * k], lo[2 * k:], hi[2 * k:]
@@ -4492,6 +4553,36 @@ def _kv_compact_for_shrink(sched, ms, fr, want: int, end: bool, floor_tokens: in
                 "%s n=%d: the agreed evictions for S%d did not go through on every rank "
                 "(here: %s) -- device presence of the tree differs" % (
                     KV_COMPACT_MARK, n, jj, "ok" if ok else "failed"))
+    if plan.staged:
+        # KVZIEL-1021: the room needs store-backed content -- it leaves through the S39 drop at
+        # TP0's next broadcast (every rank follows there); this pass evicted what could go now
+        # (agreed, outcome checked above) and hands the rest over. No move: the destinations are
+        # planned in a later pass, after the drops. No memo: the next pass looks again.
+        queued = 0
+        try:
+            from flliper.srt.pdflip import forma_l3_subtree as _s39
+
+            queued = int(_s39.queue_for_room(tree, [m.node for m in plan.handoff], "kv_compact") or 0)
+        except Exception as exc:  # noqa: BLE001 -- the hand-off is TP0's queue; a failure stages nothing
+            logger.warning("%s n=%d S39 hand-off failed here: %s: %s", KV_COMPACT_MARK, n,
+                           type(exc).__name__, exc)
+        fr["floor"] = None
+        fr.pop("compact_refused", None)
+        st_n = int(fr.get("compact_staged", 0)) + 1
+        fr["compact_staged"] = st_n
+        if st_n <= 16 or (st_n & (st_n - 1)) == 0:
+            full_ct = int(KC._full_ct().FULL)
+            logger.info(
+                "%s n=%d verdict=staged want=S%d target=S%d boundary=%d floor=%d evicted_nodes=%d "
+                "evicted_tokens=%d handoff_nodes=%d handoff_tokens=%d waiting_segments=%d queued_here=%d "
+                "staged=%d digest=%d %s (the room needs store-backed content: l3_present, no host copy -- "
+                "it leaves every device through the S39 drop at TP0's next broadcast; the moves follow in a "
+                "later pass)", KV_COMPACT_MARK, n, int(want), jj, int(tokens[jj]), int(floor_tokens),
+                evicted[0], evicted[1], len(plan.handoff),
+                sum(int(getattr(m.node.component_data[full_ct].value, "numel", lambda: 0)())
+                    for m in plan.handoff if m.node is not None),
+                sum(1 for _k, st in plan.split if st == 3), queued, st_n, digest, _cost())
+        return None
     res = None
     t_exec = time.perf_counter()
     try:
@@ -4638,6 +4729,18 @@ def runtime_tick(sched):
     else:
         reserve, agreed = _agree_reserve(sched, admissible, admission_reserve(sched, running, admissible)), None
     used, incoming, shared_used, shared_in = _dms.finish(sched, share, agreed)
+    # KVZIEL-1021: the parked requests resume on this D -- their tokens are the stage's demand
+    # (the plain sum: a prefix two parked requests share counts twice, the conservative side)
+    parked = _parked_demand(sched, running, admissible)
+    parked_tokens = sum(_req_tokens(r) for r in parked)
+    if parked:
+        _PARKED_N[0] += 1
+        pn = _PARKED_N[0]
+        if pn <= 16 or (pn & (pn - 1)) == 0:
+            logger.info("%s n=%d parked=%d tokens=%d used=%d incoming=%d stage=S%d -- the parked "
+                        "requests resume on this D: their spans are its demand (no shrink below them, no "
+                        "compaction toward a stage they do not fit)", PARKED_MARK, pn, len(parked),
+                        parked_tokens, used, incoming, ms.stage)
     ended = ms._rids is not None and bool(ms._rids - rids)
     ms._rids = rids
     fr = _floor_room_state(ms)
@@ -4658,7 +4761,7 @@ def runtime_tick(sched):
         (lambda want, end, cur: _kv_compact_for_shrink(sched, ms, fr, want, end, cur))
         if _kv_compact_tree_ok(sched) else None)
     # the floor is asked for only on a path that shrinks (MemSched calls it)
-    step = ms.step(used, incoming + reserve, ended=ended, floor_tokens=_floor)
+    step = ms.step(used + parked_tokens, incoming + reserve, ended=ended, floor_tokens=_floor)
     floor = floor_box[0]
     if step.changed:
         fr["floor"] = fr["room"] = None
@@ -4722,11 +4825,11 @@ def runtime_tick(sched):
             want = ms.pending if (ms.pending is not None and not lifted) else ms.stage
             _engage_kv_cap(alloc, tokens[want], page)
             logger.info(
-                "%s cap=%d pending S%s->S%s stage=S%d used=%d incoming=%d floor=%d -- %s",
+                "%s cap=%d pending S%s->S%s stage=S%d used=%d incoming=%d floor=%d -- %s parked=%d",
                 ms.line(), tokens[want],
                 "-" if pending_before is None else pending_before,
                 "-" if ms.pending is None else ms.pending, ms.stage, used, incoming,
-                floor, step.reason)
+                floor, step.reason, parked_tokens)
         return step
     ctl = controller(sched)
     if ms.stage > before:
@@ -4769,7 +4872,7 @@ def runtime_tick(sched):
     if ms.stage > before:
         _reopen_admission(sched)
     logger.info("%s from=S%d to=S%d used=%d incoming=%d ended=%s floor=%d -- %s%s gate_reserve=%d "
-                "shared_used=%d shared_incoming=%d",
+                "shared_used=%d shared_incoming=%d parked=%d",
                 ms.line(), before, ms.stage, used, incoming, "yes" if ended else "no", floor,
                 step.reason,
                 "" if ctl is None else (" evicted_rows=%d refilled_rows=%d warm_rows=%d "
@@ -4777,5 +4880,5 @@ def runtime_tick(sched):
                 % (ctl.evicted_rows, ctl.refilled_rows, ctl.warm_rows(), ctl.sync_ms,
                    ctl.bytes_copied + int(getattr(ctl, "bytes_copied_dev", 0) or 0), ctl.copy_ms,
                    "-" if applied is None else int(applied.extra_rows)),
-                int(reserve), int(shared_used), int(shared_in))
+                int(reserve), int(shared_used), int(shared_in), int(parked_tokens))
     return step

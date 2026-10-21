@@ -105,6 +105,11 @@ class NodePages:
     #: in-flight write-throughs on its path explain, a page a running request's row
     #: names, or a write-through in flight whose device read is already enqueued
     move_only: bool = False
+    #: KVZIEL-1021: STORE-backed -- ``l3_present`` (the group's store verdict), no Full host
+    #: copy (the L2 arena spilled it), no write in flight. Secured like an L2-backed node, but
+    #: it leaves the device only through the S39 drop (TP0 decides at its broadcast, every
+    #: rank follows): never by ``_evict_to_host`` (no host copy to demote to)
+    store: bool = False
 
 
 @dataclass
@@ -121,6 +126,9 @@ class Segment:
     pages: List[int]
     evictable: bool
     children: List["Segment"] = field(default_factory=list)
+    #: KVZIEL-1021: 1 = L2-backed (``_evict_to_host`` now), 2 = store-backed (the S39 drop at
+    #: TP0's next broadcast), 0 = not evictable
+    kind: int = 0
 
     @property
     def size(self) -> int:
@@ -176,6 +184,17 @@ class Plan:
     evict_pages: List[int] = field(default_factory=list)
     #: S112b: the CONTENT keys of the evicted segments -- what the group digest compares
     evict_keys: List[int] = field(default_factory=list)
+    #: KVZIEL-1021: store-backed nodes handed to the S39 drop (leaf first, in the chosen
+    #: order); a plan with any is STAGED: this pass evicts what can go now and queues these,
+    #: the moves follow in a later pass once TP0's broadcast dropped them on every rank
+    handoff: List[NodePages] = field(default_factory=list)
+    #: KVZIEL-1021: per chosen segment (content key, state: 1 now, 2 handoff, 3 waits) -- the
+    #: digest compares it, so every rank stages alike or the plan check refuses uniformly
+    split: List[Tuple[int, int]] = field(default_factory=list)
+
+    @property
+    def staged(self) -> bool:
+        return bool(self.handoff) or any(st == 3 for _k, st in self.split)
 
     @property
     def moved_pages(self) -> int:
@@ -637,9 +656,15 @@ def segments(cache: Any, nodes: List[NodePages], page_size: int) -> List[Segment
                 if c.component_data[full].value is not None and id(c) in by_node]
 
     def ev(np_):
+        # KVZIEL-1021: the eviction KIND (0 none, 1 L2-backed, 2 store-backed) -- a segment
+        # is a chain of one kind, so it leaves the device by one path
         v = np_.node.component_data[full].value
-        return (np_.backed and not np_.pinned and not np_.move_only and v is not None
-                and len(np_.pages) == -(-int(v.numel()) // P))
+        if (np_.pinned or np_.move_only or v is None
+                or len(np_.pages) != -(-int(v.numel()) // P)):
+            return 0
+        if np_.backed:
+            return 1
+        return 2 if np_.store else 0
 
     states: Dict[int, Any] = {}
     out: List[Segment] = []
@@ -677,7 +702,8 @@ def segments(cache: Any, nodes: List[NodePages], page_size: int) -> List[Segment
         toks = sum(int(m.node.component_data[full].value.numel()) for m in chain)
         evict = bool(ev(np_) and bot is not None and all(states.get(id(m.node)) is not None for m in chain))
         key = _head_key(pstates.get(id(nd)), nd, root, P) if bot is not None else -1
-        seg = Segment(nodes=chain, key=key, tokens=toks, pages=pages, evictable=evict)
+        seg = Segment(nodes=chain, key=key, tokens=toks, pages=pages, evictable=evict,
+                      kind=int(ev(np_)) if evict else 0)
         out.append(seg)
         seg_of[id(chain[0].node)] = seg
     for seg in out:
@@ -687,7 +713,7 @@ def segments(cache: Any, nodes: List[NodePages], page_size: int) -> List[Segment
 
 def survey(cache: Any, allocator: Any, page_size: int, floor_page: int = 0, *,
            running: Sequence[Any] = (), req_to_token: Any = None,
-           snap: Optional[Snapshot] = None) -> Survey:
+           snap: Optional[Snapshot] = None, store_ok: bool = False) -> Survey:
     """The allocator's live pages, the tree node holding each and the content segments.
     S112b (review A2): with ``snap`` every device value is read from the host snapshot
     (no device read here); without it (single-rank form, the CPU desk) from the live
@@ -701,7 +727,11 @@ def survey(cache: Any, allocator: Any, page_size: int, floor_page: int = 0, *,
     ``inc_lock_ref``). When a node's locks are exactly those, its pages can MOVE -- the
     requests' rows and prefix tensors are re-pointed with them -- but never be evicted
     (``move_only``). Any lock more stays a pin. ``running`` rows name the requests' own
-    pages outside the tree: those move too."""
+    pages outside the tree: those move too.
+
+    KVZIEL-1021: with ``store_ok`` (the S39 drop is on) a node whose KV is in the store
+    only (``l3_present``, no Full host copy) is ``store``-backed: secured, evictable through
+    the S39 hand-off (``Plan.handoff``)."""
     import torch
 
     P = max(1, int(page_size))
@@ -806,7 +836,9 @@ def survey(cache: Any, allocator: Any, page_size: int, floor_page: int = 0, *,
             np_ = NodePages(node=node, pages=[], pinned=bool(pinned),
                             backed=bool(cds[full].host_value is not None and not in_wt and mamba_ok),
                             last=float(getattr(node, "last_access_time", 0) or 0),
-                            move_only=bool((locked or in_wt) and not pinned))
+                            move_only=bool((locked or in_wt) and not pinned),
+                            store=bool(store_ok and getattr(node, "l3_present", False)
+                                       and cds[full].host_value is None and not in_wt))
             by_row[r] = np_
             nodes.append(np_)
         np_.pages.append(int(p))
@@ -863,6 +895,19 @@ BITMAP = 1024
 
 
 def local_bitmap(s: Survey) -> List[int]:
+    """The content map of the segments L2-backed HERE (KVZIEL-1021: kind 1 -- what every rank
+    can demote to its host copy in this pass)."""
+    out = [0] * BITMAP
+    for seg in s.segments:
+        if seg.evictable and seg.kind == 1 and seg.key >= 0:
+            out[seg.key % BITMAP] = 1
+    return out
+
+
+def local_secured_bitmap(s: Survey) -> List[int]:
+    """KVZIEL-1021: the content map of the segments SECURED here -- L2-backed or store-backed
+    (kind 1 or 2). The group MIN: a copy exists on every rank's side, so the content may leave
+    every device (now, or through the S39 drop)."""
     out = [0] * BITMAP
     for seg in s.segments:
         if seg.evictable and seg.key >= 0:
@@ -891,9 +936,24 @@ class Agreement:
     gaps: Dict[int, int] = field(default_factory=dict)
     #: S112c (B4): per slot the group MIN of the segment sizes (None: the local size)
     sizes: Optional[Sequence[int]] = None
+    #: KVZIEL-1021: per slot the group MIN of "secured here" (L2 or store); None = only the
+    #: L2 map counts (a vote without it)
+    secured: Optional[Sequence[int]] = None
 
     def agreed(self, seg: Segment) -> bool:
+        """May the content leave every device (chosen for room)?"""
         if not seg.evictable or seg.key < 0:
+            return False
+        if self.secured is not None:
+            return int(self.secured[seg.key % BITMAP]) >= 1
+        if seg.kind != 1:
+            return self.bitmap is None
+        return True if self.bitmap is None else int(self.bitmap[seg.key % BITMAP]) >= 1
+
+    def now(self, seg: Segment) -> bool:
+        """KVZIEL-1021: does it leave by ``_evict_to_host`` in this pass -- L2-backed on EVERY
+        rank (the L2 map's MIN)? Else the S39 drop takes it."""
+        if not seg.evictable or seg.kind != 1 or seg.key < 0:
             return False
         return True if self.bitmap is None else int(self.bitmap[seg.key % BITMAP]) >= 1
 
@@ -940,6 +1000,28 @@ def choose_evictions(s: Survey, ag: Agreement, gap: int) -> Tuple[Optional[List[
     return chosen, ""
 
 
+def split_evictions(segs: List[Segment], ag: Agreement) -> List[Tuple[Segment, int]]:
+    """KVZIEL-1021: how each chosen segment leaves, from REPLICATED inputs (the chosen order,
+    the agreed maps, the segment structure the digest covers): 1 = now (``_evict_to_host``,
+    L2-backed on every rank, every chosen descendant goes now too), 2 = the S39 hand-off
+    (store-backed somewhere; every chosen child goes now or is handed off before it -- the
+    S39 queue drops in insertion order, so the child leaves first and the node is a device
+    leaf at the flush), 3 = waits (an L2 segment above a hand-off: it is no device leaf
+    before the drop -- the next pass takes it). Leaf first: ``choose_evictions`` chose every
+    child before its parent."""
+    state: Dict[int, int] = {}
+    out: List[Tuple[Segment, int]] = []
+    for g in segs:
+        kids = [state.get(id(c), 3) for c in g.children]
+        if ag.now(g):
+            st = 1 if all(k == 1 for k in kids) else 3
+        else:
+            st = 2 if all(k in (1, 2) for k in kids) else 3
+        state[id(g)] = st
+        out.append((g, st))
+    return out
+
+
 def plan_for(s: Survey, boundary_page: int, ag: Optional[Agreement] = None) -> Tuple[Optional[Plan], str]:
     """Moves (rank-local) and room-making evictions (group-agreed CONTENT segments of
     backed idle device nodes) that leave no live page above ``boundary_page`` -- or None
@@ -971,25 +1053,39 @@ def plan_for(s: Survey, boundary_page: int, ag: Optional[Agreement] = None) -> T
     gap = max(len(above) - len(free), int(ag.gaps.get(B, len(above) - len(free))))
     plan = Plan(boundary_page=B)
     ev_set: set = set()
+    n_ev_nodes = 0
     if gap > 0:
         segs, why = choose_evictions(s, ag, gap)
         if segs is None:
-            stay = [s.owner[p] for p in above if not s.owner[p].backed or s.owner[p].move_only]
+            stay = [s.owner[p] for p in above if not (s.owner[p].backed or s.owner[p].store)
+                    or s.owner[p].move_only]
             if stay:
                 m = stay[-1]
                 return None, ("no free page below %d for un-backed node %s (%d pages): %s" % (
                     B, getattr(m.node, "id", "req"), sum(1 for p in above if s.owner[p] is m), why))
             return None, "no free page below %d for %d pages above it: %s" % (B, len(above), why)
-        for g in segs:
-            plan.evicts.extend(reversed(g.nodes))           # bottom-up: leaf first
+        now_pages: set = set()
+        for g, st in split_evictions(segs, ag):
+            plan.split.append((int(g.key), st))
+            if st == 1:
+                plan.evicts.extend(reversed(g.nodes))       # bottom-up: leaf first
+                now_pages.update(g.pages)
+            elif st == 2:
+                plan.handoff.extend(reversed(g.nodes))
             ev_set.update(g.pages)
         plan.evict_keys = [g.key for g in segs]
-        plan.evict_pages = sorted(ev_set)
+        plan.evict_pages = sorted(now_pages)
+        n_ev_nodes = sum(len(g.nodes) for g in segs)
     stay = [p for p in above if p not in ev_set]
     room = sorted(set(free) | {p for p in ev_set if p <= min(B, int(s.cap_top))})
     if len(room) < len(stay):
         return None, "no free page below %d for %d pages above it after %d evictions here" % (
-            B, len(stay), len(plan.evicts))
+            B, len(stay), n_ev_nodes)
+    if plan.staged:
+        # KVZIEL-1021: the room needs store-backed content the S39 drop takes at TP0's next
+        # broadcast -- this pass evicts what can go now and queues the rest; NO move (the
+        # destinations are planned once the drops landed on every rank)
+        return plan, ""
     # PAGE-level, rank-local: the pages above the boundary ascending onto this rank's
     # room ascending; the nodes only group the re-pointing
     plan.pairs = list(zip(stay, room[:len(stay)]))
@@ -1005,6 +1101,68 @@ def plan_for(s: Survey, boundary_page: int, ag: Optional[Agreement] = None) -> T
     return plan, ""
 
 
+def holder_census(s: Survey, boundary_page: int, ag: Optional[Agreement] = None) -> Dict[str, int]:
+    """KVZIEL-1021 instrument (rank-local, log only): WHAT holds the live pages above
+    ``boundary_page`` -- the refusal ``no free page below N for N pages above it after N
+    evictions here`` (rc29 1021_022209 02:27:54, all of S0..S8) named no page and so no
+    witness. Per page one class: the backing of its node (``l2`` / ``store`` / ``unbacked``,
+    or ``move_only`` / ``pinned`` / ``running_rows`` / ``outside_tree``) and for a secured
+    node whether its segment can go (``_ok``), waits behind a device child that cannot
+    (``_child_blocked``), or is not secured on every rank (``_not_agreed``). Plus the free
+    pages at or below the boundary."""
+    B = int(boundary_page)
+    ag = ag if ag is not None else Agreement(None)
+    seg_of: Dict[int, Segment] = {}
+    for g in s.segments:
+        for p in g.pages:
+            seg_of[int(p)] = g
+    avail: Dict[int, bool] = {}
+
+    def can_go(g: Segment) -> bool:
+        k = id(g)
+        if k not in avail:
+            avail[k] = False            # a cycle cannot happen; fail closed meanwhile
+            avail[k] = bool(ag.agreed(g) and all(can_go(c) for c in g.children))
+        return avail[k]
+
+    out: Dict[str, int] = {}
+
+    def add(cls: str) -> None:
+        out[cls] = out.get(cls, 0) + 1
+
+    for p in s.live_above:
+        if p <= B:
+            continue
+        m = s.owner.get(p)
+        if m is None:
+            add("outside_tree")
+            continue
+        if m.node is None:
+            add("running_rows")
+            continue
+        if m.pinned:
+            add("pinned")
+            continue
+        if m.move_only:
+            add("move_only")
+            continue
+        base = "l2" if m.backed else ("store" if m.store else None)
+        if base is None:
+            add("unbacked")
+            continue
+        g = seg_of.get(int(p))
+        if g is None or not g.evictable:
+            add(base + "_partial")
+        elif not ag.agreed(g):
+            add(base + "_not_agreed")
+        elif can_go(g):
+            add(base + "_ok")
+        else:
+            add(base + "_child_blocked")
+    out["free_below"] = sum(1 for p in s.free if p <= B)
+    return out
+
+
 def plan_digest(stage: int, plan: Plan) -> int:
     """N3: a 62-bit digest of what the GROUP must do alike -- the target stage, its
     boundary and the CONTENT of every eviction (S112b, review A1: after rank-local moves
@@ -1013,7 +1171,12 @@ def plan_digest(stage: int, plan: Plan) -> int:
     import hashlib
 
     h = hashlib.blake2b(digest_size=8)
-    h.update(repr((int(stage), int(plan.boundary_page), sorted(int(k) for k in plan.evict_keys))).encode())
+    if plan.split and any(st != 1 for _k, st in plan.split):
+        # KVZIEL-1021: a staged plan -- how each content leaves is part of what the group must do alike
+        h.update(repr((int(stage), int(plan.boundary_page), sorted(int(k) for k in plan.evict_keys),
+                       sorted((int(k), int(st)) for k, st in plan.split))).encode())
+    else:
+        h.update(repr((int(stage), int(plan.boundary_page), sorted(int(k) for k in plan.evict_keys))).encode())
     return int.from_bytes(h.digest(), "big") >> 2
 
 

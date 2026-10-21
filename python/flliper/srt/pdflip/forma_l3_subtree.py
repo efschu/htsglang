@@ -340,6 +340,29 @@ def note_refused(tree: Any, node: Any, why: str) -> bool:
     return True
 
 
+def queue_for_room(tree: Any, nodes: List[Any], why: str = "kv_compact") -> int:
+    """KVZIEL-1021: D-MEM-SCHED KV-COMPACT hands store-backed device content over (the
+    group-agreed segments a decided KV shrink needs as room), leaf first. TP0 queues each
+    node for its next broadcast like a peel refusal -- without the peel's token budget
+    (``_s39_peel``: that budget is the peel's own ask, not the compaction's). Every check
+    stays the flush's own (``_leaf_refusal``, the subtree, the anchor, worker-delete): a
+    node that does not qualify there is KEPT by name or dequeued silently; nothing is
+    dropped without a copy. A worker queues nothing (it follows TP0's L3DROP verdict).
+    Returns the nodes queued here."""
+    if not on() or _r12().role() != "host":
+        return 0
+    n = 0
+    for node in nodes:
+        if node is None:
+            continue
+        key = id(node)
+        if key not in _ST.queue:
+            _ST.queue[key] = [tree, node, 0, why]
+            _ST.n["queued"] += 1
+        n += 1
+    return n
+
+
 def _kept(tree: Any, node: Any, ent: list, why: str, extra: str = "") -> None:
     ent[2] += 1
     ent[3] = why
