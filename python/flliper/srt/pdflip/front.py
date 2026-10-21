@@ -12957,9 +12957,9 @@ class Front:
             # never computes (NF _1021_063252 pdflip-48-687 counted 3280 -> P 16, 42-671 4681 -> 9, 46-680 5151 -> 2911)
             free = _dxb.free_of(box[0], rid, t_grant)
             free = int(rest) if free is None else int(free)
-            if free == _dxb.COMMITTED and Front._r6_commit_pending(self, rid, rest):
-                return 0  # review A1: D fixed the next chunk in its recv step -- its exact free follows with its start record
-            if free <= 0:
+            if free != _dxb.COMMITTED:
+                Front._r6_commit_clear(self, rid)  # review 2 B1: a resolved marker forgets its first sighting
+            if free <= 0 and free != _dxb.COMMITTED:
                 # review A3: the whole rest is in launched forwards -- R1u still takes a member's share of it off the member
                 (self.__dict__.setdefault("_r6_in_flight", {}))[str(rid)] = int(rest)
                 self.counters["r6_rest_in_flight"] += 1
@@ -12978,6 +12978,9 @@ class Front:
                                 "to its end (stream committed or no D-prefill leg): it is no part of what P would get, "
                                 "R6 does not count it (S56, SOLL R6)", rid, rest, int(_granted), self.epoch)
                 return 0
+            # review 2 B2: only a redirectable leg's COMMITTED marker holds the verdict (a leg that stays on D never moves)
+            if free == _dxb.COMMITTED and Front._r6_commit_pending(self, rid, rest):
+                return 0  # review A1: D fixed the next chunk in its recv step -- its exact free follows with its start record
             if free < rest:
                 self.counters["r6_rest_in_flight_part"] += 1
             # review A3 (R1u): the in-flight piece of every counted run rides along (0 = none), so R1u can take a member's share
@@ -12991,6 +12994,14 @@ class Front:
     #: review A1: a COMMITTED marker older than this is a D loop that stopped between its recv step and its launch (a crash /
     #: a hang) -- a liveness guard, never a decision clock: D resolves the marker within one iteration (live 38-104 ms)
     R6_COMMIT_STALE_S = 5.0
+
+    def _r6_commit_clear(self, rid: str) -> None:
+        """Review 2 B1: ``rid``'s record is no longer COMMITTED -- the marker was resolved (start record / release), so its first
+        sighting is forgotten: a LATER commit of the same rid (next chunk boundary, narrowed chunks after a wake, a #679
+        park-in-place) starts its own clock and is never stale at once."""
+        seen = self.__dict__.get("_r6_commit_seen")
+        if seen:
+            seen.pop((str(rid), int(getattr(self, "epoch", 0) or 0)), None)
 
     def _r6_commit_pending(self, rid: str, rest: int) -> bool:
         """NF-RC30-R6STALE review A1 (SOLL R6/R7, R11): ``rid``'s record says COMMITTED -- D's recv step fixed its next chunk,

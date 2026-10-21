@@ -5,7 +5,7 @@ nf-rc30-r6stale-review-1021.md, section "Nachtrag 2".
 Green: the hold delays a state-based flip by one tick and never loses it (R4 "company" is a state, not an edge); the overlap
 order (done record written after the commit keeps the marker; the previous batch's result after the next launch keeps the exact
 free); uneven n_launch over ranks with a lagging TP0.
-Strict xfail: B1 -- the stale guard keys its first sighting on (rid, epoch) and never forgets it, so a LATER commit of the same
+B1 (strict xfail at e70a8d831b, green since the author's fix 21.10., marker removed) -- the stale guard keys its first sighting on (rid, epoch) and never forgets it, so a LATER commit of the same
 rid in the same epoch (next chunk boundary, a #679 park-in-place, >5 s after the first sighting) is named R6-COMMIT-STALE at
 once, holds nothing and counts nothing (danger direction "flip missing" + a false alarm of a line that "darf nie kommen").
 """
@@ -16,7 +16,6 @@ import os
 import sys
 import time
 
-import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
@@ -94,8 +93,6 @@ def test_uneven_n_launch_lagging_tp0_the_most_launched_rank_decides(tmp_path):
     assert dxb.free_of(reading, "r", 0.5) == 0 and dxb.rest_of(reading, "r", 0.5) == 784
 
 
-@pytest.mark.xfail(strict=True, reason="B1 (review 2): R6-COMMIT-STALE keyed on the first sighting of (rid, epoch), never reset "
-                                       "-- a later commit of the same rid >5 s later is stale at once")
 def test_b1_a_later_commit_of_the_same_rid_is_not_stale(monkeypatch, caplog, tmp_path):
     """Chunk boundary 1->2 seen COMMITTED at t (resolved by chunk 2's start), boundary 2->3 seen COMMITTED at t+6 s (narrowed
     chunks after a wake: '#794 GROUP-NARROWED ... to 64'; or a #679 park-in-place that re-commits every D iteration). The second
@@ -118,3 +115,18 @@ def test_b1_a_later_commit_of_the_same_rid_is_not_stale(monkeypatch, caplog, tmp
         assert f._dc_carried_running() == 0
     assert f.counters["r6_commit_stale"] == 0, [m for m in caplog.messages if "STALE" in m]
     assert RID_K in (f.__dict__.get("_r6_commit_now") or set())
+
+
+def test_b2_a_committed_leg_that_cannot_be_redirected_holds_nothing(monkeypatch, caplog, tmp_path):
+    """Review 2 B2 (author fix): a COMMITTED marker on a leg the front cannot redirect (stream committed / no D-prefill leg) is no
+    part of what P would get: it stays on D, holds no verdict and is not named pending."""
+    _on(monkeypatch)
+    now = time.time()
+    f = _front_live(now, tmp_path, member_u=3600, ended=False, rest_start=9000, ext_len=2048, x=7016, klass="halb", waited=6.0)
+    f._leg2_lookahead.discard(RID_K)                             # its stream is committed: not redirectable
+    _end_and_commit(f)
+    with envs.FLLIPER_PDFLIP_DECIDER.override(True), caplog.at_level(logging.INFO, logger="pdflip.front"):
+        assert f._dc_carried_running() == 0
+        f._decode_collect(now)
+    assert f.counters["r6_commit_pending"] == 0 and f.counters["set_r6_commit_hold"] == 0
+    assert f.counters["r6_rest_not_redirectable"] >= 1
