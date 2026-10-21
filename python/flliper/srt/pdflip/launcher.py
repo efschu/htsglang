@@ -20336,6 +20336,28 @@ def _d_extend_cap_floor_env(ns, log, label: str) -> None:
         f"D-Direktprefill laenger als eine Gruppenbreite unter dem Boden geht ueber P")
 
 
+def d_verdict_measured_terms(fremd, nicht_torch, card_terms, other_record, n: int, record_name: str):
+    """27B port fix 21.10. (rc29b INT8: the #145 verdict printed REST 3096 MiB on D TP1, the card held 1332 MiB free at
+    idle): ``(fremd, nichttorch, booked_from)`` for the D verdict. A flag given (``fremd`` / ``nicht_torch`` not None) is
+    kept. Unset, they are booked from what this pass and the records MEASURED -- never guessed: fremd = the budget's
+    ``dormant`` term (P's dormant footprint the budget charged), nichttorch = the budget's ``carve`` term (NVML reserved)
+    + the record ``D_TORCH_CAP_OTHER_MIB`` (D's non-torch part: context/driver/communicator/lmem, max over the awake
+    VRAM-PEAK lines of 8 boots). Without terms or record a term stays None (the verdict names it NICHT GEBUCHT)."""
+    booked: List[str] = []
+    v_fremd, v_nt = fremd, nicht_torch
+    terms = list(card_terms) if card_terms is not None else None
+    if terms is None or len(terms) != n:
+        return v_fremd, v_nt, booked
+    if v_fremd is None:
+        v_fremd = [float(t.get("dormant", 0) or 0) for t in terms]
+        booked.append("fremd=dormant_other (budget term)")
+    if v_nt is None and other_record is not None and len(list(other_record)) == n \
+            and all(o is not None for o in other_record):
+        v_nt = [float(t.get("carve", 0) or 0) + float(o) for t, o in zip(terms, other_record)]
+        booked.append("nichttorch=driver_carve (budget term) + RECORD %s" % record_name)
+    return v_fremd, v_nt, booked
+
+
 def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
                           label: str, *, p_split=None, chunk_layers=None,
                           card_terms: Optional[Sequence[Dict[str, object]]] = None) -> None:
@@ -20405,11 +20427,27 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
         _floor = float(_cg.corridor_band_floor_mib())
     except BaseException:  # noqa: BLE001 -- ohne Floor wird NICHT geprueft,
         _floor = 0.0       # und der Verdikt sagt das auch ("NICHT GEPRUEFT")
+    # 27B port fix 21.10. (rc29b INT8: the verdict printed REST 3096 MiB on D TP1, the card had 1332 MiB free at idle):
+    # without the two flags the verdict booked 0 beside torch while the BUDGET of this same pass charged the driver carve
+    # and P's dormant footprint (card_terms) -- and the card holds D's measured non-torch part on top. Unset flags are now
+    # booked from what is measured, never guessed: fremd = the budget's dormant_other term, nichttorch = the budget's
+    # driver_carve term + the profile record D_TORCH_CAP_OTHER_MIB (D's non-torch part, max over the awake VRAM-PEAK lines of
+    # 8 boots). A flag given on the command line still wins; without terms or record the term stays "NICHT GEBUCHT".
+    try:
+        _other = list(_pconst(_budget_rest.other_record_name("D"), ns.profile))
+    except KeyError:
+        _other = None
+    _v_fremd, _v_nt, _booked_from = d_verdict_measured_terms(fremd, nicht_torch, card_terms, _other, n,
+                                                            _budget_rest.other_record_name("D"))
+    if _v_fremd is not None and fremd is None and "--d-foreign-context-mib" in absent:
+        absent.remove("--d-foreign-context-mib")
+    if _v_nt is not None and nicht_torch is None and "--d-nontorch-mib" in absent:
+        absent.remove("--d-nontorch-mib")
     rank_verdicts = _pp_cut.d_rank_budget_verdict(
         budgets_mib=[float(b) for b in budgets_d],
         card_total_mib=totals,
-        foreign_context_mib=fremd if fremd is not None else [0.0] * n,
-        nontorch_mib=nicht_torch if nicht_torch is not None else [0.0] * n,
+        foreign_context_mib=_v_fremd if _v_fremd is not None else [0.0] * n,
+        nontorch_mib=_v_nt if _v_nt is not None else [0.0] * n,
         reserve_mib_by_rank=reserve,
         corridor_floor_mib=_floor,
     )
@@ -20460,6 +20498,7 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
             ((" -- DARUEBER on rank %s" % above) if above else "")
             + ((" -- KORRIDOR GERISSEN auf Rang %s: die Bytes passen, die "
                 "Betriebsregel nicht" % _corridor_riss) if _corridor_riss else "")
+            + ((" [GEBUCHT AUS MESSUNG: %s]" % "; ".join(_booked_from)) if _booked_from else "")
             + ((" [NICHT GEBUCHT: %s -- this row is therefore a OBERGRENZE, "
                 "keine Bilanz]" % ", ".join(absent)) if absent else ""),
         )
