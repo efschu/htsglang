@@ -60707,6 +60707,34 @@
    ],
    "type": "EnvBool"
   },
+  "FLLIPER_PDFLIP_D_LEND_MEASURED_PRICE": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "True",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "LEND-COST (21.10., nf-rc30-tp0lend-1021): the KEEP-SHORT price follows the MEASURED card cost of the extend's row class on this rank (target extend: Q-694b's max(allocator peak - start, reserved growth) after the trim, plus the draft extend's reserved growth; max per class <= 64 / powers of two, ratchet up, valid up to the widest extend measured in the class) -- price = max(lend floor, 300 + rate x rows, 300 + measured cost); a class without a reading keeps the old price. NF rc30 D (1021_063252): TP0, a start-rate rank, priced a 5-row extend with the S78 sum 767 + 300 + 0.5871 x 5 = 1069 MiB and gave rows back 1223x in 2 h 13 min (133.9 s host, each a decode pause), while its <= 64-row extends grew the allocator by <= 449 MiB. Only ranks with a lend floor (D) measure. Lines EXTEND-LEND-COST (new class maximum) and EXTEND-LEND-COST HALT (an extend batch ended under the 300 MiB line). False = the old price and no reading on TP0, byte for byte.",
+   "id": "FLLIPER_PDFLIP_D_LEND_MEASURED_PRICE",
+   "kind": "env",
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_D_LEND_MEASURED_PRICE",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 4212,
+    "tree": "nf"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "EnvBool"
+  },
   "FLLIPER_PDFLIP_D_LEND_SETTLE_ROUNDS": {
    "bare": false,
    "choices": null,
@@ -60928,7 +60956,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4208,
+    "line": 4218,
     "tree": "nf"
    },
    "status": "harvested",
@@ -91587,28 +91615,28 @@
  "schema": "flliper.catalog/1",
  "stats": {
   "curated": 125,
-  "entries": 2903,
-  "envs": 2024,
+  "entries": 2904,
+  "envs": 2025,
   "explained": 310,
   "flags": 864,
-  "harvested": 1794,
+  "harvested": 1795,
   "trees": {
    "abweichung": 23,
    "beide": 2697,
    "nur_27b": 179,
-   "nur_nf": 9
+   "nur_nf": 10
   },
   "unexplained": 674
  },
- "tree_rev": "27b=b5588c97aa+nf=ab74fa1313",
+ "tree_rev": "27b=b5588c97aa+nf=c099fac60d",
  "trees": {
   "27b": {
    "entries": 2876,
    "rev": "b5588c97aa"
   },
   "nf": {
-   "entries": 2706,
-   "rev": "ab74fa1313"
+   "entries": 2707,
+   "rev": "c099fac60d"
   }
  },
  "warnungen": []
