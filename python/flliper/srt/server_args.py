@@ -15609,6 +15609,8 @@ class ServerArgs:
             return
 
         self._handle_mamba_checkpoint_interval(view)
+        self._handle_mamba_track_page_grid(view)
+        view = resolved_view(self)
         self._validate_max_mamba_cache_size(view)
         self._validate_gdn_resident_state_slots(view)
 
@@ -15723,6 +15725,76 @@ class ServerArgs:
             f"--gdn-resident-state-slots to at least {floor}, or lower "
             f"--max-running-requests to at most {servable}."
         )
+
+    #: the field default of --mamba-track-interval; any other value was set on purpose
+    MAMBA_TRACK_INTERVAL_FIELD_DEFAULT = 256
+    #: speculative algorithms whose TARGET_VERIFY rebuilds the mamba track targets from the requests
+    #: (``spec_utils.prepare_mamba_track_for_verify``: eagle_utils v2 verify, ngram_worker). DFLASH does not
+    #: (l15-endanchor-1006 §0.2): a denser grid there would multiply anchors whose slot was never written.
+    MAMBA_TRACK_PAGE_GRID_SPEC = frozenset({"EAGLE", "EAGLE3", "NEXTN", "MTP", "NGRAM"})
+
+    def mamba_track_page_grid(self, view) -> Optional[int]:
+        """BP-ANCHOR (NF rc31 82784e1138, boot 1021_202608, D TP0): the decode track grid the radix tree's page grid
+        asks for, or None where the default stays.
+
+        METAL: 16 of 22 D matches that recomputed KV the tree held (``MATCH-CENSUS-DEEP ... branching=reached >
+        accepted``, 20:29:54-20:39:34) stopped at the PAGE-ALIGNED END of the previous turn of the same chat --
+        pdflip-2-7 reached=19520 = floor_page(19567-1) of pdflip-0-2 (``#59 RESUMABLE depth=19456 seq=19567
+        last_track=-``), resumed at 19456 and recomputed 64 tokens; S109R names it ``branch_point_never_anchored``
+        (on rc30 the same miss read ``store_miss``). A decode tracks a mamba state only where the sequence crosses a
+        multiple of ``--mamba-track-interval`` (256): a turn whose output crosses none ends with
+        ``mamba checkpoint interval: no tracked position at finish`` -- KV cached to the page end, no state there --
+        and one that crosses keeps its KV only to that multiple (``#1469 RETAIN ... cache_len=175104`` of 175233).
+        Either way the next turn, whose prompt carries the whole previous turn, recomputes up to 255 + 63 tokens the
+        tree's pages could have served. The grid is the tree's grid: lcm(page, mamba chunk) -- with page 64 and FLA
+        chunk 64 that is 64, so the last decode track IS the page end the next turn reaches.
+
+        Applies only where nothing else owns the grid: an extra_buffer (non-lazy) mamba radix cache, no
+        ``--mamba-checkpoint-interval``, ``--mamba-track-interval`` at its field default, and no speculative
+        algorithm or one whose verify rebuilds the track targets. The grid is raised to a multiple of itself that
+        is >= 2 * (draft tokens + 1), so one overlap round (a verify plus the extra forward planned before its
+        result) can never cross two boundaries into the same ping-pong slot. Pure function of the launch
+        arguments: every rank, every group derives the same value (rank agreement)."""
+        from flliper.srt.arg_groups.overrides import mamba_extra_buffer_of
+
+        if not mamba_extra_buffer_of(view):
+            return None
+        if getattr(view, "mamba_radix_cache_strategy", None) != "extra_buffer":
+            return None   # extra_buffer_lazy: a boundary allocates a second slot; not densified
+        if self.mamba_checkpoint_interval is not None:
+            return None   # the checkpoint interval owns the whole tracking grid
+        if int(view.mamba_track_interval) != ServerArgs.MAMBA_TRACK_INTERVAL_FIELD_DEFAULT:
+            return None   # set on purpose
+        algo = getattr(view, "speculative_algorithm", None)
+        algo = str(algo).upper() if algo is not None else None
+        if algo not in (None, "", "NONE") and algo not in ServerArgs.MAMBA_TRACK_PAGE_GRID_SPEC:
+            return None
+        page = int(getattr(view, "page_size", None) or 1)
+        chunk = int(self.mamba_cache_chunk_size or 1)
+        grid = math.lcm(page, chunk)
+        draft = int(getattr(view, "speculative_num_draft_tokens", None) or 0)
+        floor = 2 * (draft + 1) if draft else 1
+        if grid < floor:
+            grid *= -(-floor // grid)
+        default = ServerArgs.MAMBA_TRACK_INTERVAL_FIELD_DEFAULT
+        if grid >= default or default % grid != 0:
+            return None
+        return grid
+
+    def _handle_mamba_track_page_grid(self, view) -> None:
+        """BP-ANCHOR: put the decode track grid on the tree's page grid (``mamba_track_page_grid``). Idempotent: once
+        overridden the interval is no longer the field default and every later legacy slot returns at once."""
+        grid = self.mamba_track_page_grid(view)
+        if grid is None:
+            return
+        logger.info(
+            "MAMBA-TRACK-PAGE-GRID --mamba-track-interval %d -> %d (page=%s, mamba chunk=%s, spec=%s): a decode "
+            "tracks its mamba state on every tree page, so a finished turn's page-aligned end holds the anchor the "
+            "next turn resumes from (BP-ANCHOR)",
+            int(view.mamba_track_interval), grid, getattr(view, "page_size", None),
+            self.mamba_cache_chunk_size, getattr(view, "speculative_algorithm", None),
+        )
+        self.override("mamba_track_page_grid", mamba_track_interval=grid)
 
     def _handle_mamba_checkpoint_interval(self, view) -> None:
         """Validate --mamba-checkpoint-interval and unify the tracking grid.

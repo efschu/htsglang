@@ -44,6 +44,10 @@ class GenerationBatchResult:
     ] = None
     num_correct_drafts: int = 0  # no bonus included
     num_correct_drafts_per_req_cpu: Optional[List[int]] = None
+    # BP-ANCHOR review: per request, the tokens this spec round actually RETAINED (committed to KV and
+    # appended to output_ids) -- the accepted run, cut where a grammar terminated inside it
+    # (_accept_grammar_tokens). The host track boundary measures the round from it.
+    num_retained_per_req_cpu: Optional[List[int]] = None
     num_block_accept_tokens: int = 0
     num_cap_tokens: int = 0
     # FDFO dLLM batching: per-request accepted block length and carried algo state.
