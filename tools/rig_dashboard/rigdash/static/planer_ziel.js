@@ -15,6 +15,13 @@
   const shortCard = (label) => String(label || "").replace(/^NVIDIA\s+/i, "").replace(/^GeForce\s+/i, "");
   const CHIP = { ok: ["pz-ok", "possible"], tight: ["pz-warn", "possible, tight"], blocked: ["pz-bad", "not possible"], n_unsupported: ["pz-warn", "not supported yet"] };
 
+  // hardware chip: "measured" only with measured rates; a captured-only profile says "rates estimated" and offers the measurement (review A5)
+  function hwChip(hw, msg) {
+    if (!hw) return "";
+    const btn = hw.measure && (hw.measure.cards || []).length ? ` <button type="button" data-pz="measure" title="Books a GPU window on the window plan and measures memory bandwidth and compute of these cards">Measure rates</button>` : "";
+    return `<span class="pz-chip ${hw.quelle === "gemessen" ? "pz-ok" : "pz-warn"}" title="${esc(hw.text)}">hardware figures: ${esc(hw.label)}</span>${btn}${msg ? ` <span class="muted pz-hwmsg" role="status">${esc(msg)}</span>` : ""}`;
+  }
+
   // ------------------------------------------------------------------ step 2: cards
   function totalCards(counts) { return Object.keys(counts || {}).reduce((s, k) => s + (counts[k] || 0), 0); }
   const cardsBody = (counts) => Object.keys(counts || {}).filter((k) => counts[k] > 0).map((k) => ({ card: k, count: counts[k] }));
@@ -24,12 +31,12 @@
       <span class="pz-cnt"><button type="button" data-pz="dec" data-id="${esc(c.id)}" aria-label="One less ${esc(shortCard(c.label))}"${n ? "" : " disabled"}>&minus;</button>
       <output aria-live="polite">${n}</output><button type="button" data-pz="inc" data-id="${esc(c.id)}" aria-label="One more ${esc(shortCard(c.label))}"${totalCards(counts) >= 8 ? " disabled" : ""}>+</button></span></div>`;
   }
-  function renderCards(cat, counts, hw) {
+  function renderCards(cat, counts, hw, hwmsg) {
     const main = cat.cards.filter((c) => c.preset), more = cat.cards.filter((c) => !c.preset);
     const sc = (cat.shortcuts || []).map((s) => `<button type="button" data-pz="short" data-id="${esc(s.id)}">${esc(s.label)}</button>`).join("")
       + (cat.machine ? `<button type="button" data-pz="mine">This machine (${esc(cat.machine.n)} cards)</button>` : "");
     const n = totalCards(counts), tot = cat.cards.reduce((s, c) => s + (counts[c.id] || 0) * c.mib, 0);
-    const chip = hw ? `<span class="pz-chip ${hw.quelle === "gemessen" ? "pz-ok" : "pz-warn"}" title="${esc(hw.text)}">hardware figures: ${esc(hw.label)}</span>` : "";
+    const chip = hwChip(hw, hwmsg);
     return `<div class="pz-short">${sc}</div><div class="pz-cards">${main.map((c) => cardRow(c, counts)).join("")}</div>
       <details class="pz-more"><summary>more cards (datasheet values)</summary><div class="pz-cards">${more.map((c) => cardRow(c, counts)).join("")}</div></details>
       <div class="pz-sum">${n ? `<b>${n} card${n === 1 ? "" : "s"}</b> &middot; ${esc(gib(tot))} of VRAM` : `<span class="muted">no card chosen</span>`} ${chip}</div>`;
@@ -67,7 +74,7 @@
       return `${head}<div class="pz-verdict bad"><b>${t}.</b><ul>${(p.hinweise || []).map((h) => `<li>${esc(h)}</li>`).join("")}</ul></div>`;
     }
     const v = p.verdikt || {}, bad = v.outcome === "verweigert" || v.outcome === "crash";
-    const hw = p.hw ? `<span class="pz-chip ${p.hw.quelle === "gemessen" ? "pz-ok" : "pz-warn"}" title="${esc(p.hw.text)}">hardware figures: ${esc(p.hw.label)}</span>` : "";
+    const hw = p.hw ? `<span class="pz-chip ${p.hw.quelle === "gemessen" ? "pz-ok" : "pz-warn"}" title="${esc(p.hw.text)}">hardware figures: ${esc(p.hw.label)}</span>` : "";   // the button sits in step 2
     const items = (v.items || []).map((i) => `<li><span class="pz-chip ${i.blocked ? "pz-bad" : "pz-warn"}">${i.blocked ? "refused" : "needs force"}</span> <span class="mono">${esc(i.code)}</span>${i.count > 1 ? ` <span class="muted">&times;${i.count}</span>` : ""} ${esc(String(i.text).length > 200 ? String(i.text).slice(0, 198) + "…" : i.text)}</li>`).join("");
     const fit = v.fit && v.fit.level ? ` Fit: <b>${esc(({ ja: "yes", tight: "tight", nein: "no" })[v.fit.level] || v.fit.level)}</b>${v.fit.margin_mib != null ? ", margin " + num(Math.round(v.fit.margin_mib)) + " MiB" : ""}.` : "";
     const groups = (p.felder || []).map((g) => `<section class="pz-g"><h4>${esc(g.titel)}</h4><table class="pz-t"><tbody>${g.zeilen.map((r) => renderRow(r, p.karten)).join("")}</tbody></table></section>`).join("");
@@ -75,7 +82,7 @@
     return `${head}<div class="pz-verdict ${bad ? "bad" : "ok"}"><b>${esc(v.text || "")}</b>${fit} ${hw}${items ? `<details class="pz-calc"><summary>${(v.items || []).length} launcher note${(v.items || []).length === 1 ? "" : "s"}</summary><ul class="pz-vi">${items}</ul></details>` : ""}</div>${groups}${notes}`;
   }
 
-  const api = { esc, shortCard, totalCards, cardsBody, renderCards, renderLayouts, renderPlan, renderRow, CHIP };
+  const api = { esc, shortCard, totalCards, cardsBody, hwChip, renderCards, renderLayouts, renderPlan, renderRow, CHIP };
   root.PlanerZiel = api;
   if (typeof module !== "undefined" && module.exports) module.exports = api;
 
@@ -83,7 +90,7 @@
   const host = typeof document !== "undefined" ? document.getElementById("pz-root") : null;
   if (!host) return;
   const st = { cat: null, model: "", counts: {}, lay: null, layout: "", seats: null, tokens: null, seatsDirty: false, tokensDirty: false, plan: null, busy: "", err: null, exp: null,
-               started: false, cache: new Map(), seq: 0 };
+               started: false, cache: new Map(), seq: 0, hwmsg: "" };
   async function call(path, body) {
     const opt = body === undefined ? { cache: "no-store" } : { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) };
     const r = await fetch("api/profil/" + path, opt), text = await r.text();
@@ -101,7 +108,7 @@
     const canIn = st.plan && st.plan.status === "ok";
     host.innerHTML = `${st.err ? `<div class="pz-verdict bad">${esc(st.err)}</div>` : ""}
       <section class="pz-step"><h3><span class="pz-no">1</span> Model</h3><label class="pz-sel">Model <select data-k="model">${models}</select></label></section>
-      <section class="pz-step"><h3><span class="pz-no">2</span> Cards</h3>${renderCards(st.cat, st.counts, st.lay ? st.lay.hw : null)}</section>
+      <section class="pz-step"><h3><span class="pz-no">2</span> Cards</h3>${renderCards(st.cat, st.counts, st.lay ? st.lay.hw : null, st.hwmsg)}</section>
       <section class="pz-step"><h3><span class="pz-no">3</span> Layout <span class="muted">only what is possible with this model and these cards</span></h3>${renderLayouts(st.lay, st.layout)}</section>
       <section class="pz-step"><h3><span class="pz-no">4</span> Capacity</h3>
         <div class="pz-in"><label>Max seats <input type="number" data-k="seats" min="${st.cat.goals.seats[0]}" max="${st.cat.goals.seats[1]}" value="${esc(seats)}" placeholder="${esc(st.cat.defaults.seats)}"></label>
@@ -151,6 +158,15 @@
     if (a === "short") { const s = st.cat.shortcuts.find((x) => x.id === id); if (s) { setCounts(s.cards); st.layout = ""; return loadLayouts(); } }
     if (a === "mine") { setCounts(st.cat.machine.cards); st.layout = ""; return loadLayouts(); }
     if (a === "layout") { st.layout = id; return computePlan(); }
+    if (a === "measure") {
+      const m = st.lay && st.lay.hw && st.lay.hw.measure; if (!m) return;
+      st.hwmsg = "asking the window plan …"; draw();
+      fetch(m.api, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ cards: m.cards }) })
+        .then((r) => r.text().then((t) => { let j = {}; try { j = JSON.parse(t); } catch (e) { /* not JSON */ } return { ok: r.ok, j, t }; }))
+        .then((x) => { st.hwmsg = (x.j && (x.j.message || x.j.error)) || (x.ok ? "measurement requested" : "HTTP error: " + x.t.slice(0, 80)); if (x.ok && x.j && x.j.ok !== false && x.j.action === "messung_gestartet") { st.cache.clear(); return loadLayouts(); } draw(); },
+              (er) => { st.hwmsg = er.message; draw(); });
+      return;
+    }
     if (a === "tok") { st.tokens = Number(t.dataset.v); st.tokensDirty = true; return st.layout ? computePlan() : draw(); }
     if (a === "export") {
       const doc = st.plan && st.plan.intern && st.plan.intern.startprofil && st.plan.intern.startprofil.doc;

@@ -40,7 +40,8 @@ DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "planer_data
 STECKBRIEF_FILE = os.path.join(DATA_DIR, "steckbrief.json")
 MIB = float(1 << 20)
 
-#: card counts the launcher/topology serve today (``topology.plan_topology``: N = 3 is the metal-proven shape); everything else is the track NCARDS
+#: FALLBACK card counts when the topology cannot be asked (no editor / no planner gate): N = 3 is the metal-proven shape.  The page asks the topology itself
+#: (``ZielPlaner.supported_n``: ``plan_topology`` per N), so it follows the track NCARDS without an edit here (review B4).
 SUPPORTED_N = (3,)
 
 #: the three layouts of the page.  ``form`` = the form name of ``ProfilEditor.propose``.  The sentences are the user's words made plain (see profil_planer.FORMS)
@@ -68,18 +69,26 @@ MODELS = [
 ]
 _MODEL_BY_ID = {m["id"]: m for m in MODELS}
 
-#: Memory the planner keeps per card besides weights, KV and state (graphs, activations, user reserve, L1.5 posts, CUDA context).  DERIVED, not typed:
-#: the dry run of 27B INT8 on 3 x RTX 3090 (24576 MiB) budgets the P group at 18584 MiB -> 24576 - 18584 = 5992 MiB are left outside (done/planer-zielbild-1021.md, section 3).
-OVERHEAD_PER_CARD_MIB = 6000
+#: Memory per card outside weights, KV and state that a NECESSARY condition may take as a LOWER bound (graphs, activations, CUDA context).  DERIVED, not typed:
+#: the dry run of 27B INT8 on 3 x RTX 3090 (24576 MiB) leaves 24576 - 19792 = 4784 MiB per card outside the D group budget (the P group leaves 5992..7784, but
+#: that residue contains the user reserve and the L1.5 post; a necessary condition takes the SMALLEST residue of the same run and never a reserve; review A6/A6b,
+#: done/planer-zielbild-1021-review.md).  What the launcher really keeps is the planner's answer, never this pre-check's.
+OVERHEAD_PER_CARD_MIB = 4784
+#: Fixed D-group posts per card that a pool ESTIMATE subtracts besides weights and state (graphs, activations, draft KV, L1.5 posts).  CALIBRATED on the one measured
+#: pool of our rig, 27B INT8 flip, boot dkr27bbar1drei10210113 (21.10. 01:13Z, D log max_total_num_tokens 245185 + 252097 + 281698 = 778980 tokens):
+#: D budgets 27792 + 17384 + 17168 = 62344 MiB - weights 28179 - draft 2072 - state 6 x 74.8 - pool 778980 x 34816 B (25866 MiB) = 5778 MiB = 3 x 1926 MiB.
+#: Only used where the launcher sets no pool flag (27B flip/solo); a pool flag in the argv always wins (review A1/A4).
+D_FIXED_PER_CARD_MIB = 1926
 #: defaults of the two inputs (the planner's own defaults, ``ProfilEditor.ZIELE_INT`` / the proposal's ``goals``)
 DEFAULT_SEATS = 6
 DEFAULT_TOKENS = 262144
 GOALS = {"seats": [1, 256], "tokens": [1024, 8 << 20], "token_presets": [32768, 65536, 131072, 262144]}
 
-#: ready-made card sets of the page ("our rig" is only offered when the machine has the cards; see ``katalog``)
+#: ready-made card sets of the page.  "Reference rig" is the rig of the developers (the cards of the golden measurements), offered on every machine by that name;
+#: "This machine" (``katalog()["machine"]``) is the hardware profile of THIS machine and only offered when there is one (review B1)
 SHORTCUTS = [
     {"id": "3x3090", "label": "3 x RTX 3090", "cards": [{"card": "rtx3090-24", "count": 3}]},
-    {"id": "rig", "label": "Our rig (RTX 5090 + 2 x RTX 3080 20 GB)", "cards": [{"card": "rtx5090-32", "count": 1}, {"card": "rtx3080-20", "count": 2}]},
+    {"id": "rig", "label": "Reference rig (RTX 5090 + 2 x RTX 3080 20 GB)", "cards": [{"card": "rtx5090-32", "count": 1}, {"card": "rtx3080-20", "count": 2}]},
 ]
 
 
@@ -111,6 +120,7 @@ class ZielPlaner:
         self.ed = editor
         self._steck = steckbrief
         self._steck_file = steckbrief_file
+        self._supported: Optional[tuple] = None
 
     @property
     def steck(self) -> Dict[str, dict]:
@@ -179,19 +189,66 @@ class ZielPlaner:
             out.append(e)
         return out
 
+    @staticmethod
+    def _has_measured_node(node) -> bool:
+        """A value node ``{v, src}`` of the hardware profile that was MEASURED (``src == "gemessen"``), anywhere below ``node``."""
+        if isinstance(node, dict):
+            if node.get("src") == "gemessen" and node.get("v") is not None:
+                return True
+            return any(ZielPlaner._has_measured_node(x) for x in node.values())
+        if isinstance(node, list):
+            return any(ZielPlaner._has_measured_node(x) for x in node)
+        return False
+
+    def _rates_measured(self, hw: dict) -> bool:
+        """True when EVERY card of the hardware profile has measured rates (memory bandwidth / compute: ``mem_gbs``, ``compute``, ``gemm_tflops``).  A profile that
+        was only CAPTURED (NVML names and sizes) has none: its figures are catalog values and borrowed rates, not measurements (review A5)."""
+        cards = hw.get("cards") or []
+        return bool(cards) and all(any(self._has_measured_node(c.get(k)) for k in ("mem_gbs", "compute", "gemm_tflops")) for c in cards)
+
     def _measured(self, cards: List[dict]) -> bool:
         hw = self.ed._hardware_profile() if self.ed is not None else None
         if hw is None:
             return False
-        return bool(self.ed._hw_cards_match(hw, [{"entry": e} for e in cards]))
+        return bool(self.ed._hw_cards_match(hw, [{"entry": e} for e in cards])) and self._rates_measured(hw)
 
     def _hw_info(self, cards: List[dict]) -> dict:
-        if self._measured(cards):
+        hw = self.ed._hardware_profile() if self.ed is not None else None
+        same = bool(hw) and bool(self.ed._hw_cards_match(hw, [{"entry": e} for e in cards]))
+        if same and self._rates_measured(hw):
             return {"quelle": "gemessen", "label": "measured",
                     "text": "These are the cards of this machine: the hardware profile (NVML, measured rates) is used."}
+        if same:
+            idx = [c.get("nvml_index") for c in hw.get("cards") or [] if isinstance(c.get("nvml_index"), int) and not isinstance(c.get("nvml_index"), bool)]
+            return {"quelle": "erfasst", "label": "rates estimated",
+                    "text": "These are the cards of this machine (NVML names and sizes captured), but their rates (memory bandwidth, compute) were never measured: the planner "
+                            "borrows the rates of the nearest measured card. Every figure below is an estimate until the rates are measured (button below; it books a GPU window).",
+                    "measure": {"api": "api/hwprofil/measure", "cards": idx}}
         return {"quelle": "geschaetzt", "label": "estimated",
                 "text": "No measured hardware profile for these cards yet: memory sizes and bandwidth are catalog (datasheet) values, rates are borrowed from the "
                         "nearest measured card. Every figure below is an estimate; the first boot on this hardware is the measurement."}
+
+    # ------------------------------------------------------------------ Topologie (B4)
+    def supported_n(self) -> tuple:
+        """The card counts the launcher/topology serve: asked of the planner gate (``ProfilEditor._topology_verdict`` -> ``topology.plan_topology`` per N),
+        so a count that the track NCARDS makes runnable shows up here without an edit.  A count that cannot be checked is NOT offered.  Without an editor
+        or planner gate: the fallback ``SUPPORTED_N``."""
+        if self._supported is not None:
+            return self._supported
+        got = None
+        try:
+            _ci, tp = self.ed.kp._mods()
+            if tp is not None:
+                out = []
+                for n in range(1, 9):
+                    notes: List[str] = []
+                    if self.ed._topology_verdict(n, tp, notes) is None and not notes:
+                        out.append(n)
+                got = tuple(out)
+        except Exception:                                   # noqa: BLE001 -- no gate to ask: the fallback below
+            got = None
+        self._supported = got if got else SUPPORTED_N
+        return self._supported
 
     # ------------------------------------------------------------------ Katalog
     def katalog(self) -> dict:
@@ -206,15 +263,22 @@ class ZielPlaner:
             models.append({"id": m["id"], "name": m["name"], "format": m["format"],
                            "layouts": [l["id"] for l in LAYOUTS if m["profiles"].get(l["id"])],
                            "weights_mib": self._weights_mib(m["id"])})
-        return {"ok": True, "schema": SCHEMA, "models": models, "cards": cards, "layouts": [dict(l) for l in LAYOUTS], "supported_n": list(SUPPORTED_N),
+        return {"ok": True, "schema": SCHEMA, "models": models, "cards": cards, "layouts": [dict(l) for l in LAYOUTS], "supported_n": list(self.supported_n()),
                 "machine": ({"cards": [{"card": k, "count": v} for k, v in counts.items()], "n": len(mine)} if mine else None),
                 "shortcuts": [dict(x) for x in SHORTCUTS], "defaults": {"seats": DEFAULT_SEATS, "tokens": DEFAULT_TOKENS}, "goals": GOALS,
                 "overhead_per_card_mib": OVERHEAD_PER_CARD_MIB}
 
     # ------------------------------------------------------------------ Layouts (Rechenbegruendung)
     def _weights_mib(self, mid: str) -> Optional[int]:
+        """The weights of the model in MiB as the cards must hold them.  For a MoE model with experts in the host that is the sum of its parts (non-expert layers +
+        lm_head + experts); the sheet's raw ``weights_total_mib`` of such a checkpoint (NF: 167112) is the model profile's own total and is NOT additive with its
+        parts (the stored safetensors of the NF checkpoint are 69455 MiB), so it is never shown (review B5)."""
         s = self.steck.get(mid)
-        return s.get("weights_total_mib") if s else None
+        if not s:
+            return None
+        if s.get("experts"):
+            return int(s["weights_dense_mib"] + s["lm_head_mib"] + s["experts"]["total_mib"])
+        return s.get("weights_total_mib")
 
     def _resident_weights_mib(self, mid: str, layout: str, n: int) -> dict:
         """Weights that sit in VRAM at once: ``total`` and the formula, per model/layout.
@@ -279,15 +343,17 @@ class ZielPlaner:
         if s is None:
             raise ZielError("no model fact sheet for %s (planer_data/steckbrief.json)" % model["id"])
         gate = self._gate(model, cards)
+        sup = self.supported_n()
         out = []
         for l in LAYOUTS:
             calc = self._calc(model, l["id"], cards, seats, tokens)
             why: List[str] = []
             status = "ok"
             profile = model["profiles"].get(l["id"])
-            if n not in SUPPORTED_N:
+            if n not in sup:
                 status = "n_unsupported"
-                why.append("%d card%s: the launcher and topology serve exactly 3 cards today; other counts are being built (not supported yet)." % (n, "" if n == 1 else "s"))
+                why.append("%d card%s: the launcher and topology serve %s today; other counts are being built (not supported yet)." % (
+                    n, "" if n == 1 else "s", "exactly %d cards" % sup[0] if len(sup) == 1 else "%s cards" % ", ".join(str(x) for x in sup)))
             if gate:
                 status = "blocked"
                 why += gate
@@ -396,14 +462,14 @@ class ZielPlaner:
                 unit="MiB", why="--rank-gpu-memory-mib of group P (what the pipeline stage may use on the card)", raw="--rank-gpu-memory-mib (P)")
         row("weights", "d_mem", "Memory budget per card, decode group", per_card=self._csv(D.get("--rank-gpu-memory-mib")) or ([D.get("--rank-gpu-memory-mib")] if D.get("--rank-gpu-memory-mib") else None),
             unit="MiB", why="--rank-gpu-memory-mib of group D (weights shard + KV pool + state of the tensor-parallel group)", raw="--rank-gpu-memory-mib (D)")
-        # --- KV pool
-        if has_p and pc.get("chosen_pool"):
-            row("kv", "p_pool", "KV pool, prefill group (shared by all seats)", pc["chosen_pool"], unit="tokens",
-                why="solved by the launcher" + ("; floor %s = one request at the ceiling + one chunk" % pc["pool_floor"] if pc.get("pool_floor") else ""), raw="plan.pp_cut.chosen_pool")
-        d_est = self._d_pool_estimate(s, layout, cards, D, seats if seats else goals.get("seats"))
-        if d_est:
-            row("kv", "d_pool", "KV pool, decode group (shared by all seats)", d_est["tokens"], unit="tokens", source="estimate", estimate=True,
-                why=d_est["why"], raw="D budgets - weights - state, / KV bytes per token")
+        # --- KV pool: the EFFECTIVE value is what the launcher applies (a pool flag); the cut solver's pool and our own estimate are derivations only (review A1-A4)
+        pp = self._pool_p(layout, res, P, pc)
+        if pp:
+            row("kv", "p_pool", "KV pool, prefill group (shared by all seats)", pp["tokens"], unit="tokens", source=pp["source"], why=pp["why"], raw=pp["flag"])
+        dp = self._pool_d(s, layout, cards, res, D, seats if seats else goals.get("seats"))
+        if dp:
+            row("kv", "d_pool", "KV pool, decode group (shared by all seats)", dp["tokens"], unit="tokens", source=dp["source"], estimate=dp["estimate"],
+                why=dp["why"], raw=dp["flag"])
         # --- Experts (MoE only)
         if s.get("experts"):
             ex = s["experts"]
@@ -454,8 +520,65 @@ class ZielPlaner:
                      "warum": pv(flag), "schaetzung": False, "roh": flag})
 
     @staticmethod
+    def _argv_flag(res: dict, flag: str) -> Optional[str]:
+        """The value of ``flag`` in the launcher's argv of the dry run (``launch.argv``); ``None`` when it is not there."""
+        argv = [str(x) for x in ((res.get("launch") or {}).get("argv") or [])]
+        for i, a in enumerate(argv):
+            if a == flag and i + 1 < len(argv) and not argv[i + 1].startswith("--"):
+                return argv[i + 1]
+            if a.startswith(flag + "="):
+                return a.split("=", 1)[1]
+        return None
+
+    def _pool_p(self, layout: str, res: dict, P: dict, pc: dict) -> Optional[dict]:
+        """Prefill KV pool in tokens as the launcher APPLIES it: dual ``--dual-p-kv-max-tokens`` (argv), flip ``--max-total-tokens`` of group P.  The cut solver's
+        ``chosen_pool`` is only the derivation (for 27B it equals the flag; for NF the flag is the ceiling and the solver priced far more)."""
+        if layout not in ("flip", "dual"):
+            return None
+        flag = "--dual-p-kv-max-tokens" if layout == "dual" else "--max-total-tokens"
+        v = self._argv_flag(res, flag) if layout == "dual" else None
+        v = v or P.get(flag)
+        solver = pc.get("chosen_pool")
+        floor = ("; floor %s = one request at the ceiling + one chunk" % pc["pool_floor"]) if pc.get("pool_floor") not in (None, "", "none") else ""
+        if v not in (None, ""):
+            why = "%s of the launcher run" % flag
+            if solver and str(solver) != str(v):
+                why += "; the cut solver priced %s tokens, the flag caps the pool" % solver
+            return {"tokens": str(v), "source": "launcher dry run (%s)" % flag, "why": why + floor, "flag": flag}
+        if solver:
+            return {"tokens": str(solver), "source": "launcher cut solver (derivation)", "why": "no pool flag in the launcher run; the cut solver's priced pool" + floor,
+                    "flag": "plan.pp_cut.chosen_pool"}
+        return None
+
+    def _pool_d(self, s: dict, layout: str, cards: List[dict], res: dict, D: dict, seats) -> Optional[dict]:
+        """Decode KV pool in tokens: the launcher's flag when it sets one (dual ``--dual-d-kv-max-tokens``, NF ``--max-total-tokens``), else an ESTIMATE."""
+        flag = "--dual-d-kv-max-tokens" if layout == "dual" else "--max-total-tokens"
+        v = (self._argv_flag(res, flag) if layout == "dual" else None) or D.get(flag)
+        if v not in (None, ""):
+            return {"tokens": str(v), "source": "launcher dry run (%s)" % flag, "estimate": False, "flag": flag,
+                    "why": "%s of the launcher run: the pool is shared by all seats" % flag}
+        est = self._d_pool_estimate(s, layout, cards, D, seats)
+        if est:
+            return {"tokens": est["tokens"], "source": "estimate", "estimate": True, "why": est["why"], "flag": "D budgets - weights - state - fixed posts, / KV bytes per token"}
+        return None
+
+    @staticmethod
+    def _resident_experts_mib(s: dict, D: dict) -> Optional[float]:
+        """Expert weights that sit in the D budgets (MoE with experts in the host): sum over the cards of share x resident fraction x all experts
+        (``--rank-moe-ratio`` x ``--rank-moe-resident-fraction``); ``None`` when the launcher run does not say."""
+        try:
+            ratio = [float(x) for x in str(D.get("--rank-moe-ratio") or "").split(",") if x.strip()]
+            frac = [float(x) for x in str(D.get("--rank-moe-resident-fraction") or "").split(",") if x.strip()]
+        except ValueError:
+            return None
+        if not ratio or len(ratio) != len(frac) or sum(ratio) <= 0:
+            return None
+        return s["experts"]["total_mib"] * sum(r / sum(ratio) * f for r, f in zip(ratio, frac))
+
+    @staticmethod
     def _d_pool_estimate(s: dict, layout: str, cards: List[dict], D: dict, seats) -> Optional[dict]:
-        """Decode KV pool in tokens: what the D budgets leave after the weights and the state.  An ESTIMATE (the launcher sizes the pool at boot)."""
+        """Decode KV pool in tokens when the launcher sets no pool flag: the D budgets minus weights, the resident experts (MoE), the state and the fixed D posts
+        (``D_FIXED_PER_CARD_MIB`` per card, calibrated on the measured pool of our rig).  An ESTIMATE (the launcher sizes the pool at boot)."""
         budgets = D.get("--rank-gpu-memory-mib")
         if not budgets:
             return None
@@ -465,14 +588,24 @@ class ZielPlaner:
             return None
         n = len(cards)
         draft = s.get("draft_mib") or 0
-        w = (s["weights_dense_mib"] + s["lm_head_mib"] + draft) if s.get("experts") else (s["weights_total_mib"] + draft)
+        extra, extra_txt = 0.0, ""
+        if s.get("experts"):
+            w = s["weights_dense_mib"] + s["lm_head_mib"] + draft
+            ex = ZielPlaner._resident_experts_mib(s, D)
+            if ex is None:
+                return None                                 # experts sit in the same budgets: no honest estimate without their residency
+            extra, extra_txt = ex, " - resident experts %.0f MiB" % ex
+        else:
+            w = s["weights_total_mib"] + draft
         state = (seats or DEFAULT_SEATS) * s["state_mib_per_seat_bf16"]
-        free = tot - w - state
+        fixed = n * D_FIXED_PER_CARD_MIB
+        free = tot - w - extra - state - fixed
         if free <= 0:
             return None
         toks = int(free * MIB / s["kv_bytes_per_token_fp8"])
-        return {"tokens": toks, "why": "(D budgets %d MiB - weights %d MiB - state %.0f MiB) / %d B per token; an estimate, the launcher sizes the pool at boot" % (
-            tot, w, state, s["kv_bytes_per_token_fp8"])}
+        return {"tokens": toks, "why": "(D budgets %d MiB - weights %d MiB%s - state %.0f MiB - fixed posts %d x %d MiB) / %d B per token; an estimate calibrated on the measured pool of "
+                                       "our rig (27B INT8 flip: 778980 tokens), the launcher sizes the pool at boot" % (
+            tot, w, extra_txt, state, n, D_FIXED_PER_CARD_MIB, s["kv_bytes_per_token_fp8"])}
 
     @staticmethod
     def _verdict(vd: dict, prop: dict) -> dict:

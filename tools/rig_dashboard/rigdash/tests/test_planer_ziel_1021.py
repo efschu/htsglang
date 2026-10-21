@@ -35,10 +35,16 @@ X3090 = [{"card": "rtx3090-24", "count": 3}]
 MODELS = ("qwen38-27b-int8", "qwen38-27b-nvfp4", "qwen38-nf-int4")
 
 
-def hw_rig():
-    """The hardware profile of our rig (NVML order 3080, 5090, 3080)."""
+def hw_rig(measured=True):
+    """The hardware profile of our rig (NVML order 3080, 5090, 3080).  ``measured`` = the rates carry ``src: gemessen`` nodes as the measuring run writes them
+    (``mem_gbs`` / ``compute``); without them the profile is only CAPTURED (NVML names and sizes)."""
     def c(i, name, mib, cc):
-        return {"nvml_index": i, "uuid": "GPU-%d" % i, "name": name, "cc": cc, "vram_total_mib": {"v": mib, "src": "NVML"}}
+        row = {"nvml_index": i, "uuid": "GPU-%d" % i, "name": name, "cc": cc, "vram_total_mib": {"v": mib, "src": "NVML"},
+               "mem_gbs": {"nameplate": {"v": 760.0, "src": "NVML"}, "nominal": {"v": 760.0, "src": "Datasheet"}}}
+        if measured:
+            row["mem_gbs"]["read"] = {"v": 700.0, "src": "gemessen"}
+            row["compute"] = {"bf16": {"v": 50.0, "src": "gemessen"}}
+        return row
     return {"schema": "flliper.hardware/1", "cards": [c(0, "NVIDIA GeForce RTX 3080", 20480, [8, 6]), c(1, "NVIDIA GeForce RTX 5090", 32607, [12, 0]),
                                                         c(2, "NVIDIA GeForce RTX 3080", 20480, [8, 6])]}
 
@@ -194,6 +200,13 @@ class Layouts(unittest.TestCase):
         self.assertEqual(zr.layouts({"model": "qwen38-27b-int8", "cards": RIG})["hw"]["quelle"], "gemessen")
         self.assertEqual(zr.layouts({"model": "qwen38-27b-int8", "cards": X3090})["hw"]["quelle"], "geschaetzt")
         self.assertEqual(zp()[0].layouts({"model": "qwen38-27b-int8", "cards": RIG})["hw"]["quelle"], "geschaetzt")        # no hardware profile at all
+
+    def test_captured_but_never_measured_rates_are_not_measured_and_offer_the_measurement(self):
+        """Review A5: a hardware profile that only has the NVML names/sizes says "rates estimated", never "measured", and names the call that measures."""
+        hw = zp(hw_rig(measured=False))[0].layouts({"model": "qwen38-27b-int8", "cards": RIG})["hw"]
+        self.assertEqual((hw["quelle"], hw["label"]), ("erfasst", "rates estimated"))
+        self.assertEqual(hw["measure"], {"api": "api/hwprofil/measure", "cards": [0, 1, 2]})
+        self.assertNotIn("measure", zp(hw_rig())[0].layouts({"model": "qwen38-27b-int8", "cards": RIG})["hw"])
 
     def test_bad_requests_are_refused_with_a_reason(self):
         z = zp()[0]

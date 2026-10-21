@@ -107,7 +107,8 @@ details.lf details > summary { cursor: pointer; font-size: 13px; color: var(--te
 .pz-lay { border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; min-width: 0; } .pz-lay.off { background: var(--surface-2); }
 .pz-lay > button { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; text-align: left; width: 100%; padding: 8px 10px; } .pz-lay > button span { color: var(--text-2); font-weight: 400; font-size: 12px; }
 .pz-lh { margin: 6px 0 2px; } .pz-why { margin: 4px 0 2px 18px; padding: 0; font-size: 12px; overflow-wrap: anywhere; } .pz-calc ul { margin: 4px 0 4px 18px; padding: 0; font-size: 12px; overflow-wrap: anywhere; }
-.pz-chip { font-size: 11px; padding: 0 8px; border-radius: 8px; border: 1px solid var(--line); white-space: normal; background: var(--surface-2); }
+.pz-chip { display: inline-block; max-width: 100%; box-sizing: border-box; font-size: 11px; line-height: 1.5; padding: 0 8px; border-radius: 8px; border: 1px solid var(--line); white-space: normal; overflow-wrap: anywhere; background: var(--surface-2); }
+.pz-step > h3 { min-width: 0; } .pz-step > h3 > .pz-chip { flex: 0 1 auto; min-width: 0; font-weight: 400; } .pz-hwmsg { font-size: 12px; overflow-wrap: anywhere; }
 .pz-ok { border-color: var(--good); color: var(--good); } .pz-warn { border-color: var(--warn); color: var(--warn); } .pz-bad { border-color: var(--bad); color: var(--bad); font-weight: 600; }
 .pz-in { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; margin: 6px 0; } .pz-presets { display: inline-flex; flex-wrap: wrap; gap: 4px; } .pz-note { font-size: 12px; margin: 4px 0 8px; }
 .pz-h { font-size: 14px; margin: 8px 0 4px; } .pz-verdict { border: 1px solid var(--line); border-left-width: 5px; border-radius: 8px; padding: 8px 12px; margin: 8px 0; background: var(--surface); }
