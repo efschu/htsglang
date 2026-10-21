@@ -2051,7 +2051,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22846
+      "line": 22850
      }
     }
    },
@@ -6532,7 +6532,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22238
+      "line": 22242
      }
     }
    },
@@ -7101,7 +7101,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22242
+      "line": 22246
      }
     }
    },
@@ -11311,7 +11311,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22294
+      "line": 22298
      }
     }
    },
@@ -16943,7 +16943,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 23753
+      "line": 23757
      }
     }
    },
@@ -17659,7 +17659,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22556
+      "line": 22560
      }
     }
    },
@@ -18184,7 +18184,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22851
+      "line": 22855
      }
     }
    },
@@ -18269,7 +18269,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 23736
+      "line": 23740
      }
     }
    },
@@ -18973,7 +18973,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 23008
+      "line": 23012
      }
     }
    },
@@ -19265,7 +19265,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 23383
+      "line": 23387
      }
     }
    },
@@ -28425,7 +28425,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 22439
+      "line": 22443
      }
     }
    },
@@ -43493,7 +43493,7 @@
      "source": {
       "file": "mem_cache/unified_radix_cache.py",
       "kind": "os.environ",
-      "line": 740
+      "line": 741
      }
     }
    },
@@ -49975,6 +49975,62 @@
     "nf"
    ],
    "type": "EnvBool"
+  },
+  "FLLIPER_MOE_POOL_EM_PREFETCH": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "True",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "EM-PREFETCH (21.10., D prefill, rc30 D ..._1021_063252: the EAGER-DEVICE-EM row copies are 297 of 674 s EM forward time on the critical rank, every byte serial on the forward stream). An EAGER-DEVICE-EM forward predicts layer L+1's experts with L+1's router on layer L's MoE input (Mixtral-Offloading's cross-layer trick, the decode-graph pool prefetch's predictor) and copies the predicted misses into L+1's LRU rows on the pool prefetch side stream, right after L's own last row copy -- so they move while L applies and L+1 runs attention (the workers idle in the Form-A tp/dcp waits, their links too). L+1 joins on ONE event before it plans; a right guess is then a plain hit, a wrong one a miss as before. No collective, no host read, output unchanged (a hit and a miss compute the same rows). Every rank decides by the same band (graph limit < T x K <= EM_MAX_IDS); a rank whose layer has a resume-warm plan or deferred rows pending skips it (only that rank's copies stay synchronous). EM-FETCH carries pf_layers/pf_predicted/pf_fetched/pf_hits/pf_copy_ms. False = byte-identical before.",
+   "id": "FLLIPER_MOE_POOL_EM_PREFETCH",
+   "kind": "env",
+   "level": "expert",
+   "name": "FLLIPER_MOE_POOL_EM_PREFETCH",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 4002,
+    "tree": "nf"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "EnvBool"
+  },
+  "FLLIPER_MOE_POOL_EM_PREFETCH_TOPK": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "0",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "EM-PREFETCH: how many of the next router's top-k each token predicts (0 = all top-k). A prefill's union over T tokens is what is fetched, so the full top-k is the default.",
+   "id": "FLLIPER_MOE_POOL_EM_PREFETCH_TOPK",
+   "kind": "env",
+   "level": "expert",
+   "name": "FLLIPER_MOE_POOL_EM_PREFETCH_TOPK",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 4005,
+    "tree": "nf"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "EnvInt"
   },
   "FLLIPER_MOE_POOL_PREFETCH": {
    "bare": false,
@@ -60928,7 +60984,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4208,
+    "line": 4223,
     "tree": "nf"
    },
    "status": "harvested",
@@ -78389,7 +78445,8 @@
    "id": "FLLIPER_PDFLIP_VISION_ROWS_DIR",
    "kind": "env",
    "lesestellen": [
-    "pdflip/vision_row_store.py:108"
+    "pdflip/vision_row_store.py:175",
+    "pdflip/vision_row_store.py:201"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_VISION_ROWS_DIR",
@@ -78398,7 +78455,7 @@
    "source": {
     "file": "pdflip/vision_row_store.py",
     "kind": "os.environ",
-    "line": 108,
+    "line": 175,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -78420,7 +78477,7 @@
    "id": "FLLIPER_PDFLIP_VISION_ROWS_MB",
    "kind": "env",
    "lesestellen": [
-    "pdflip/vision_row_store.py:89"
+    "pdflip/vision_row_store.py:106"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_VISION_ROWS_MB",
@@ -78429,7 +78486,7 @@
    "source": {
     "file": "pdflip/vision_row_store.py",
     "kind": "os.environ",
-    "line": 89,
+    "line": 106,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -91649,28 +91706,28 @@
  "schema": "flliper.catalog/1",
  "stats": {
   "curated": 125,
-  "entries": 2905,
-  "envs": 2026,
+  "entries": 2907,
+  "envs": 2028,
   "explained": 310,
   "flags": 864,
-  "harvested": 1794,
+  "harvested": 1796,
   "trees": {
    "abweichung": 23,
    "beide": 2697,
    "nur_27b": 179,
-   "nur_nf": 11
+   "nur_nf": 13
   },
   "unexplained": 676
  },
- "tree_rev": "27b=b5588c97aa+nf=58e1022250",
+ "tree_rev": "27b=b5588c97aa+nf=54e5921011",
  "trees": {
   "27b": {
    "entries": 2876,
    "rev": "b5588c97aa"
   },
   "nf": {
-   "entries": 2708,
-   "rev": "58e1022250"
+   "entries": 2710,
+   "rev": "54e5921011"
   }
  },
  "warnungen": []
