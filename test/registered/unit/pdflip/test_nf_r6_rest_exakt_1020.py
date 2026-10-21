@@ -309,16 +309,33 @@ def test_front_halb_member_exact_rest_keeps_s_under_x_no_flip(monkeypatch, caplo
     assert f.counters["r6_redirected"] == 0
 
 
-def test_front_halb_member_while_the_chunk_still_runs_the_start_rest_counts_r6(monkeypatch, tmp_path):
-    """Danger direction 'rest too small -> flip missing': the same halb chunk whose forward has NOT ended -- its 4000 are not
-    computed, S=7600 > X -> REROUTE_P (SOLL R6, EZ-S2b review A2: a running forward counts its rest)."""
+def test_front_halb_member_while_the_chunk_still_runs_only_the_unlaunched_rest_counts_r6(monkeypatch, tmp_path):
+    """NF-RC30-R6STALE (21.10., SOLL R6 + R7): the same halb prefill whose first chunk (2048) is IN FLIGHT. Before: its whole 4000
+    counted (EZ-S2b review A2 "a running forward counts its rest") -> S=7600 > X -> REROUTE_P, but an in-flight chunk ends on D
+    and P reads it from the store (NF _1021_063252: counted 3280 -> P 16, 4681 -> 9, 5151 -> 2911). What moves to P is the part
+    no forward was launched for: 1952 -> S=5552 < X -> no flip under X (R7), the set collects (R3)."""
     _on(monkeypatch)
     now = time.time()
     f = _front_live(now, tmp_path, member_u=3600, ended=False, rest_start=4000, ext_len=2048, klass="halb")
     with envs.FLLIPER_PDFLIP_DECIDER.override(True):
-        assert f._dc_carried_running() == 4000
+        assert f._dc_carried_running() == 1952
+        assert f._decode_collect(now) == "hold"
+    assert f.counters["set_reroute_p"] == 0 and f.counters["r6_redirected"] == 0
+
+
+def test_front_halb_member_while_the_chunk_still_runs_a_big_unlaunched_rest_still_flips_r6(monkeypatch, caplog, tmp_path):
+    """Danger direction 'rest too small -> flip missing' (SOLL R6): a halb prefill of 6000 with its first chunk (2048) in flight
+    leaves 3952 no forward was launched for: S=3600+3952=7552 > X=7016 -> REROUTE_P, the redirect counts 3952 and names the
+    in-flight 2048."""
+    _on(monkeypatch)
+    now = time.time()
+    f = _front_live(now, tmp_path, member_u=3600, ended=False, rest_start=6000, ext_len=2048, klass="halb")
+    with envs.FLLIPER_PDFLIP_DECIDER.override(True), caplog.at_level(logging.INFO, logger="pdflip.front"):
+        assert f._dc_carried_running() == 3952
         assert f._decode_collect(now) == "P"
     assert f.counters["set_reroute_p"] == 1 and f.counters["r6_redirected"] == 1
+    assert any("R6-REDIRECT" in m and "counted=%s:3952" % RID_K in m and "in_flight=%s:2048" % RID_K in m
+               for m in caplog.messages)
 
 
 def test_the_armed_event_is_held_strongly_never_a_weakref(tmp_path):
@@ -464,13 +481,14 @@ def test_a1_overlap_start_record_of_chunk2_keeps_chunk1_start_rest_until_chunk1_
 
 def test_k1_a_kurz_class_contradicted_by_ds_exact_rest_counts_r6(monkeypatch, caplog, tmp_path):
     """Review K1 (user 19.10. exact numbers): noted kurz at halfX 3508, but D's exact rest is 5000 >= halfX -> u >= halfX proven:
-    not kurz, R6 counts it (S = 3600 + 5000 > X -> REROUTE_P), named r6k_kurz_contradicted; no finish-hold for it."""
+    not kurz, R6 counts it (S = 3600 + 4000 > X -> REROUTE_P), named r6k_kurz_contradicted; no finish-hold for it.
+    NF-RC30-R6STALE: S counts the 4000 no D forward was launched for (the in-flight chunk of 1000 ends on D)."""
     _on(monkeypatch)
     now = time.time()
-    f = _front_live(now, tmp_path, member_u=3600, ended=False, rest_start=5000, ext_len=2048, klass="kurz")
+    f = _front_live(now, tmp_path, member_u=3600, ended=False, rest_start=5000, ext_len=1000, klass="kurz")
     with envs.FLLIPER_PDFLIP_DECIDER.override(True), caplog.at_level(logging.INFO, logger="pdflip.front"):
         assert F.Front._r6k_finish_hold(f, now) is False
-        assert f._dc_carried_running() == 5000
+        assert f._dc_carried_running() == 4000
         assert f._decode_collect(now) == "P"
     assert f.counters["r6k_kurz_contradicted"] >= 1 and f.counters["r6_redirected"] == 1
     assert any("R6K-KURZ-CONTRADICTED rid=%s d_rest=5000 halfX=3508" % RID_K in m for m in caplog.messages)

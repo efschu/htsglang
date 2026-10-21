@@ -12946,6 +12946,7 @@ class Front:
         box: List[Optional[Dict[int, Any]]] = []
         counted: Dict[str, int] = {}
         self.__dict__["_r6_counted"] = counted
+        self.__dict__["_r6_in_flight"] = {}
 
         def _tok(rid: str, t_grant: float, _granted: int) -> int:
             if not box:
@@ -12962,6 +12963,21 @@ class Front:
                 return 0
             if Front._r6k_kurz_stays(self, rid, rest, _granted):
                 return 0
+            # NF-RC30-R6STALE (SOLL R6 + R7, R11; user order 19.10. "NICHTS SCHÄTZEN, EXAKTE ZAHLEN"): S counts what goes to P --
+            # the tokens no forward of D has been launched for (beacon v4 ``free``). A chunk D has handed to a forward ends on
+            # D (the abort lands at D's next loop top, after it) and P reads it from the store: counted, it flipped for tokens P
+            # never computes (NF _1021_063252 pdflip-48-687 counted 3280 -> P 16, 42-671 4681 -> 9, 46-680 5151 -> 2911)
+            free = _dxb.free_of(box[0], rid, t_grant)
+            free = int(rest) if free is None else int(free)
+            if free <= 0:
+                self.counters["r6_rest_in_flight"] += 1
+                if self.__dict__.get("_r6_if_last") != (rid, rest):
+                    self.__dict__["_r6_if_last"] = (rid, rest)
+                    logger.info("PDFLIP R6-REST-IN-FLIGHT rid=%s d_rest=%d free=0 granted=%d epoch=%d -- D has handed the whole "
+                                "rest of this prefill to forwards it runs now: they end on D, nothing of it reaches P, R6 "
+                                "neither counts nor redirects it (SOLL R6, R7: no flip for tokens P never computes)",
+                                rid, int(rest), int(_granted), self.epoch)
+                return 0
             if not Front._r6_redirectable(self, rid):
                 self.counters["r6_rest_not_redirectable"] += 1
                 if rest > 0 and self.__dict__.get("_r6_nr_last") != (rid, rest):
@@ -12970,8 +12986,11 @@ class Front:
                                 "to its end (stream committed or no D-prefill leg): it is no part of what P would get, "
                                 "R6 does not count it (S56, SOLL R6)", rid, rest, int(_granted), self.epoch)
                 return 0
-            counted[str(rid)] = int(rest)
-            return int(rest)
+            if free < rest:
+                self.counters["r6_rest_in_flight_part"] += 1
+                (self.__dict__.setdefault("_r6_in_flight", {}))[str(rid)] = int(rest) - free
+            counted[str(rid)] = free
+            return free
 
         return _tok
 
@@ -13120,9 +13139,12 @@ class Front:
             return []
         moved = self._park_handback(list(counted), started=list(counted))
         self.counters["r6_redirected"] += len(moved)
-        logger.info("PDFLIP R6-REDIRECT epoch=%d why=%s counted=%s moved=%s -- the running D prefill(s) R6 counted go "
-                    "to P with the set (S56, SOLL R6)", self.epoch, why,
-                    ",".join("%s:%d" % kv for kv in counted.items()), moved)
+        in_flight = self.__dict__.get("_r6_in_flight") or {}
+        logger.info("PDFLIP R6-REDIRECT epoch=%d why=%s counted=%s moved=%s in_flight=%s -- the running D prefill(s) R6 counted "
+                    "go to P with the set (S56, SOLL R6); counted = the tokens no D forward was launched for, in_flight = the "
+                    "chunk(s) D ends itself (NF-RC30-R6STALE)", self.epoch, why,
+                    ",".join("%s:%d" % kv for kv in counted.items()), moved,
+                    ",".join("%s:%d" % (r, int(in_flight.get(r, 0))) for r in counted))
         return moved
 
     def _d_ext_reading_full(self) -> Optional[Dict[int, Any]]:
@@ -13195,6 +13217,7 @@ class Front:
         (D-EXTEND-BEACON). A big member then waits its T_halb (R4); a kurz request never triggers a flip (R2).
         ``_d_carried_tokens`` (the X-SUM price of the kurz path) is unchanged: it prices every granted row."""
         self.__dict__["_r6_counted"] = {}  # S56: only this reading's counted rows may be redirected
+        self.__dict__["_r6_in_flight"] = {}
         if not envs.FLLIPER_PDFLIP_ENABLE_DECODE_COLLECT_PREFILL_BUSY.get():
             return 0
         # S56: a started row counts D's REAL rest, and only when the front redirects it to P (``_r6_tokens_of``)
