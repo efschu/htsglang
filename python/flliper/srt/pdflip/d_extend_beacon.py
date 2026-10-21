@@ -382,14 +382,19 @@ class DExtendBeacon:
         self._halt_cap = True
         self._put_cap()
 
-    def note_halt(self, *, rid: str) -> bool:
+    def note_halt(self, *, rid: str, held_free: Optional[int] = None) -> bool:
         """NF-RC31-R6REST (SOLL R6 + R7, R11): the abort of ``rid`` is APPLIED on this rank -- no forward of it is launched any
         more (a chunked prefill: ``process_pending_chunked_abort`` cleared ``chunked_req`` at the top of the scheduling step; any
         other: the abort took it out of the waiting queue / running batch). ONE halt record under ``halt_key(rid)``: ``free`` =
         the tokens no forward was launched for at the halt -- final, what an R6 redirect really moves to P (a chunk already in
         flight ends on D, its KV stays in D's tree and the store); ``rest`` = what D still computes (the in-flight chunk
         included). A COMMITTED marker of the rid is resolved (its next chunk never launches). A rid this leg never extended
-        writes nothing (D never began it; the front's R6 never counted it). Returns True when a halt record was written."""
+        writes nothing (D never began it; the front's R6 never counted it). Returns True when a halt record was written.
+
+        Review A1 (NF-RC31-R6REST, SOLL R6/R7 + user 19.10. "EXAKTE ZAHLEN"): ``held_free`` = the scheduler's exact number at the
+        halt -- the request's length minus what D's TREE holds of it after the abort (the retaining halt landed the in-flight chunk
+        and inserted it; a discarding abort holds only the prefix). Given, it is the record's ``free`` AND ``rest`` (nothing of
+        the request computes on D any more); the launch-based ``free`` above is then only the fallback of a caller without it."""
         if self.mm is None:
             return False
         t_first = self._live.get(rid)
@@ -403,6 +408,8 @@ class DExtendBeacon:
             rest = int(q0[0][0])  # the oldest launched batch whose forward has not ended (review A1): D still computes it
         if free < 0:
             free = rest  # no launch length known (a v2-style caller): the rest is all D has not computed
+        if held_free is not None and int(held_free) >= 0:
+            free = rest = int(held_free)
         if rid in self._committed:
             self._committed.discard(rid)
             self._put(rid, t_first, self._last_rest.get(rid, -1), free, n)

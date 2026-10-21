@@ -13286,39 +13286,32 @@ class Front:
             Front._r6_halt_enqueue(self, p, route, hd)
 
     def _r6_halt_enqueue(self, p: "Pending", route: str, hd: dict) -> None:
-        """The closed leg's request joins the queue on its released route: P = P's batch (the PARK-HANDBACK path); D = a queued
-        kurz/halb entry D takes like any queued SHORT (``_asr_queued_short_to_d``), priced at its halted rest, its class noted
-        from that rest (SOLL R6k)."""
+        """The closed leg's request joins its released route: P = P's batch (the PARK-HANDBACK path); D = the CONTINUATION of
+        its earlier D verdict, straight back into D's admission line (``_asr_queued_short_to_d``: seat R5, X-SUM price) at its
+        halted rest.
+
+        Review A4 (planner decision 21.10. after SOLL R1 "Flip oder nicht fällt über S gegen X, nie über einen Einzelrequest
+        (außer der Einstufung bei Ankunft)"): the class is NOT derived again from the halted rest -- the request keeps its
+        classification at ARRIVAL (``_r6k_class``, SOLL R6k "bei Ankunft u < halbX"). It is no new arrival and joins no set:
+        R6 stopped it ("auch mitten im D-Prefill"), the verdict on its exact rest said no flip (R7 "Kein Flip unter X"), so it
+        continues on D, the way the D verdict it had already received said -- at once, not after a collecting set's verdict
+        (review A2: the controller's set hold returns before the arrival-seat step; live 6-401 D would idle ~40,07 -> 41,4)."""
         if route == "P":
             self._to_p_batch(p, "r6_halt")
             p.d_eligible = False
             self.queue.append(p)
             self._dp_mark(p, "reroute")  # R28
         else:
-            u = max(0, int(hd.get("free") or 0))
-            p.est_uncached = u
+            p.est_uncached = max(0, int(hd.get("free") or 0))
             p.d_eligible = True
             p.d_direct = False
             p.leg1_done = False
-            klass = None
-            try:
-                frac = Front._set_cfg()[0]
-                x = int(self.tp_prefill_max_tokens)
-                klass = phase_policy.classify_arrival(u, x, frac, False)
-                Front._r6k_note_class(self, p.rid, klass, "r6_halt", phase_policy.half_x_of(x, frac))
-            except Exception:  # noqa: BLE001 -- the class note is an R6k input; unknown -> R6 as before (named there)
-                pass
             self.queue.append(p)
-            if klass == phase_policy.CLASS_KURZ:
-                # Review NF-RC31-R6REST A2 (SOLL R2 "kurz sofort auf D ... auch während ein Set sammelt"): noted kurz by its
-                # halted rest, it goes to D's admission line NOW (QUEUED-SHORT: seat, X-SUM price) -- not after the collecting
-                # set's verdict: the controller's set hold returns before ``_asr_queued_short_to_d`` (live 6-401: D idle from
-                # the halt ~40,07 to the set's T_halb end 41,4). A halb rest stays queued for the set's verdict (it rides a flip).
-                try:
-                    if self._asr_queued_short_to_d([p], time.time()):
-                        self.counters["r6_halt_kurz_to_d_now"] += 1
-                except Exception:  # noqa: BLE001 -- the queue entry stays; the next undecided tick hands it to D
-                    logger.warning("PDFLIP R6-HALT kurz to D raised (rid=%s), stays queued", p.rid, exc_info=True)
+            try:
+                if self._asr_queued_short_to_d([p], time.time()):
+                    self.counters["r6_halt_to_d_now"] += 1
+            except Exception:  # noqa: BLE001 -- the queue entry stays d_eligible; the next undecided tick hands it to D
+                logger.warning("PDFLIP R6-HALT back to D raised (rid=%s), stays queued", p.rid, exc_info=True)
         self._kick_controller("arrival")
 
     def _r6_halt_tick(self) -> None:

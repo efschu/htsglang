@@ -160,13 +160,13 @@ def test_build_announces_and_the_scheduler_applies_the_halt_where_the_abort_is_a
     src = inspect.getsource(dxb.build)
     assert "w.announce_halt()" in src
     pc = inspect.getsource(S.Scheduler.process_pending_chunked_abort)
-    assert pc.index("self.chunked_req = None") < pc.index("Scheduler._pdflip_d_ext_halt(self, req.rid)")
+    assert pc.index("self.chunked_req = None") < pc.index("Scheduler._pdflip_d_ext_halt(  # via the class")
     ab = inspect.getsource(S.Scheduler._abort_request_now)
     assert "Scheduler._pdflip_d_ext_halt(self, recv_req.rid)" in ab
     assert "str(_cr_halt.rid).startswith(recv_req.rid)" in ab                # the chunked one waits for its application
     S.Scheduler._pdflip_d_ext_halt(types.SimpleNamespace(), "x")            # a bare-namespace harness: no beacon, no error
     calls = []
-    ns = types.SimpleNamespace(pdflip_d_ext_beacon=types.SimpleNamespace(note_halt=lambda rid: calls.append(rid)))
+    ns = types.SimpleNamespace(pdflip_d_ext_beacon=types.SimpleNamespace(note_halt=lambda rid, **k: calls.append(rid)))
     S.Scheduler._pdflip_d_ext_halt(ns, RID)
     assert calls == [RID]
 
@@ -266,11 +266,12 @@ def test_front_the_leg_closed_before_the_verdict_waits_then_goes_back_to_d_price
                 w.note_extend(rids=[RID], rests=[FREE1], extend_lens=[CHUNK2])
                 w.note_halt(rid=RID)
             assert f._decode_collect(now + 0.1) == "hold"
-            # review A2 (SOLL R2): kurz by its halted rest -> D's admission line at once (QUEUED-SHORT), not after the set
+            # review A2/A4 (SOLL R1 "außer der Einstufung bei Ankunft", R6, R7): the continuation of its D verdict -> D's
+            # admission line at once (QUEUED-SHORT), not after the set; its class stays the one at ARRIVAL (halb)
             assert not [q for q in f.queue if q.rid == RID]
             q = [q for q in f._ready_for_d if q.rid == RID]
             assert len(q) == 1 and q[0].d_eligible and int(q[0].est_uncached) == FREE2 and q[0].d_direct
-            assert f.counters["r6_halt_kurz_to_d_now"] == 1
-            assert f._r6k_class[RID][0] == "kurz"
+            assert f.counters["r6_halt_to_d_now"] == 1
+            assert f._r6k_class[RID][0] == "halb"
         finally:
             _close(loop, task)

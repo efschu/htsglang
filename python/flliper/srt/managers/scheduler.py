@@ -10897,6 +10897,13 @@ class Scheduler(
             req.pending_bootstrap = False
         if self.enable_hicache_storage:
             self.tree_cache.release_aborted_request(req.rid)
+        # Review A1: what the tree holds of it once this discarding release is done -- the prefix it was admitted on plus the
+        # chunks a next-chunk build inserted (``prefix_indices``); the in-flight chunk is thrown away here
+        try:
+            _held_a1 = len(req.prefix_indices) if getattr(req, "prefix_indices", None) is not None else None
+            _ntok_a1 = len(req.origin_input_ids or ()) + len(req.output_ids or ())
+        except Exception:  # noqa: BLE001 -- the halt then falls back to the beacon's launch-based free
+            _held_a1 = _ntok_a1 = None
         if (
             req.req_pool_idx is not None or self.tree_cache.supports_mamba()
         ) and not req.kv_committed_freed:
@@ -10906,8 +10913,13 @@ class Scheduler(
         self._pending_chunked_abort_req = None
         self._pending_chunked_abort_delay = 0
         # NF-RC31-R6REST (SOLL R6/R7, R11): the abort is applied -- no chunk of it launches any more; the beacon's halt record
-        # carries the exact rest the front's R6 redirect moves to P
-        Scheduler._pdflip_d_ext_halt(self, req.rid)  # via the class: bare-namespace harnesses
+        # carries the exact rest the front's R6 redirect moves to P. Review A1: this is upstream's DISCARDING path (PP, an abort
+        # with a reason, the retain switch off) -- the rest is the length minus the tree-held prefix, never the launch-based free
+        # (the discarded in-flight chunk has to be computed again). The R6 stop of a TP chunked prefill retains instead
+        # (``_pdflip_halt_retain``, applied in the recv step).
+        Scheduler._pdflip_d_ext_halt(  # via the class: bare-namespace harnesses
+            self, req.rid,
+            held_free=(max(0, _ntok_a1 - _held_a1) if _held_a1 is not None and _ntok_a1 is not None else None))
         # PREFILL-OOM-RETREAT: an origin-relayed abort that names its reason (the 503 the front re-routes on) keeps it;
         # every other chunked abort answers as before.
         _reason = getattr(self, "_pending_chunked_abort_reason", None)
@@ -20593,7 +20605,69 @@ class Scheduler(
         except Exception:  # noqa: BLE001
             pass
 
-    def _pdflip_d_ext_halt(self, rid) -> None:
+    def _pdflip_halt_retain(self, req, recv_req) -> bool:
+        """Review A1 (NF-RC31-R6REST, SOLL R6 + R7, R11; user 19.10. "NICHTS SCHÄTZEN, EXAKTE ZAHLEN"): the abort of D's running
+        CHUNKED prefill -- R6's stop of it -- RETAINS what D computed, like the park (``d_park_runtime.park_rids`` for a chunked
+        request at its chunk border; #969D "the retraction must RETAIN"). Upstream's chunked abort releases with
+        ``is_insert=False`` at the top of the next scheduling step, BEFORE the overlap loop processes the in-flight chunk's
+        result: that chunk is thrown away, and the halt's rest understated what P / D then compute (review: live 6-401 the halt
+        would say 2010, P/D compute 4310 -> D prefills 8096 > X). Here, in the recv step (no chunk of it is launched between two
+        passes): the in-flight batch LANDS first (``_land_inflight``: its result processed -- that landing is the chunk border),
+        the request is released RETAINING its span (``release_req(retain=True)``: KV + the node's GDN/Mamba anchor, forced host
+        write-through so P reads it from the store when a flip follows), ``chunked_req`` is cleared, the tokenizer gets the abort,
+        and the beacon's halt record says the EXACT rest: the request's length minus what the tree holds of it
+        (``RETAINED_ATTR`` of the retaining insert). Every TP rank applies the same abort in the same recv step on the same chunk
+        border (#794): the same number on all ranks (R11). False = not applicable here (not group D / no beacon, PP, an abort
+        that names a reason, abort_all, a prefix-matched rid, the switch off, no landed rows) -- upstream's pending path runs."""
+        b = getattr(self, "pdflip_d_ext_beacon", None)
+        if b is None or req is None or getattr(recv_req, "abort_all", False):
+            return False
+        if str(getattr(req, "rid", "")) != str(getattr(recv_req, "rid", "") or ""):
+            return False
+        if getattr(recv_req, "finished_reason", None) is not None:
+            return False  # PREFILL-OOM-RETREAT names its reason: upstream's discard, as before
+        if int(getattr(getattr(self, "ps", None), "pp_size", 1) or 1) > 1:
+            return False  # a PP group stops its chunks by the xsn324 / #791C countdown (pp_abort)
+        try:
+            if not envs.FLLIPER_PDFLIP_D_HALT_RETAIN.get():
+                return False
+        except Exception:  # noqa: BLE001 -- a partial env: the switch reads off
+            return False
+        from flliper.srt.mem_cache.base_prefix_cache import FORCE_HOST_WRITE_THROUGH_ATTR
+        from flliper.srt.pdflip import d_park_read, d_park_runtime
+        from flliper.srt.pdflip import mamba_arena_displace as _mad_park
+
+        d_park_runtime._land_inflight(self, keep_chunked=req)
+        if int(getattr(req, "inflight_middle_chunks", 0) or 0) > 0 or getattr(req, "req_pool_idx", None) is None:
+            logger.warning("PDFLIP D-EXT-HALT RETAIN skipped rid=%s inflight_middle_chunks=%s req_pool_idx=%s -- no landed rows "
+                           "to retain: upstream's pending abort applies (the halt then counts the tree-held prefix)", req.rid,
+                           getattr(req, "inflight_middle_chunks", None), getattr(req, "req_pool_idx", None))
+            return False
+        setattr(req, FORCE_HOST_WRITE_THROUGH_ATTR, True)
+        setattr(req, _mad_park.PARK_REQ_ATTR, True)
+        setattr(req, d_park_read.RETAINED_ATTR, None)
+        n_tok = len(req.origin_input_ids or ()) + len(req.output_ids or ())
+        d_park_runtime._release_outside_chunk(self, req)
+        self.chunked_req = None
+        if getattr(self, "_pending_chunked_abort_req", None) is req:
+            self._pending_chunked_abort_req = None
+            self._pending_chunked_abort_delay = 0
+        retained = getattr(req, d_park_read.RETAINED_ATTR, None)
+        held = int(retained) if retained is not None else 0
+        prepare_abort(req, "Aborted")
+        try:
+            req.time_stats.trace_ctx.abort(abort_info={"reason": "Aborted"})
+        except Exception:  # noqa: BLE001 -- tracing never blocks the abort
+            pass
+        req.to_finish = None
+        Scheduler._pdflip_d_ext_halt(self, req.rid, held_free=max(0, n_tok - held))
+        logger.info("PDFLIP D-EXT-HALT RETAIN rid=%s retained=%d of %d halted_free=%d -- the stop of a running chunked prefill "
+                    "landed its in-flight chunk and kept it in the tree (is_insert=True, forced write-through); the rest no "
+                    "forward computed is what R6 moves (review A1, SOLL R6/R7, R11)", req.rid, held, n_tok, max(0, n_tok - held))
+        self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
+        return True
+
+    def _pdflip_d_ext_halt(self, rid, held_free=None) -> None:
         """NF-RC31-R6REST (SOLL R6 + R7, R11; user order 19.10. "NICHTS SCHÄTZEN, EXAKTE ZAHLEN"): the abort of ``rid`` is applied
         on this rank -- the beacon writes its halt record (the tokens no forward was launched for at the halt). D only reports
         the fact; the front decides R6 on it. Rank-local, no collective, no sync; a rid this leg never extended writes nothing."""
@@ -20601,10 +20675,11 @@ class Scheduler(
         if b is None or not rid:
             return
         try:
-            if b.note_halt(rid=str(rid)):
+            if b.note_halt(rid=str(rid), held_free=held_free):
                 logger.info("PDFLIP D-EXT-HALT rid=%s free=%d n_launch=%d -- the abort is applied on this rank: no forward of "
                             "it launches any more, the front's R6 decides on this rest (NF-RC31-R6REST, SOLL R6/R7)", rid,
-                            int(b._free.get(str(rid), -1)), int(b._nl.get(str(rid), 0)))
+                            int(held_free) if held_free is not None else int(b._free.get(str(rid), -1)),
+                            int(b._nl.get(str(rid), 0)))
         except Exception:  # noqa: BLE001 -- an instrument never stops the scheduler
             pass
 
@@ -23484,31 +23559,37 @@ class Scheduler(
                 _p_intake.forget(self, None if recv_req.abort_all else recv_req.rid)
             except Exception:  # noqa: BLE001 -- bookkeeping never blocks an abort
                 logger.warning("PDFLIP-INTAKE-STALL watch.forget raised", exc_info=True)
+        _retained_a1 = False
         if (chunked_req := self.chunked_req) is not None:
             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
-                self._pending_chunked_abort_req = chunked_req
-                self._pending_chunked_abort_reason = getattr(recv_req, "finished_reason", None)
-                from flliper.srt.pdflip.pp_abort import chunked_abort_delay, row_authority_of
-                _row_791c = row_authority_of(self)
-                self._pending_chunked_abort_delay = chunked_abort_delay(
-                    getattr(self.ps, "pp_size", 1), getattr(self.ps, "pp_rank", 0),
-                    row_authority=_row_791c)
-                # xsn324: on PP the chunk pipeline stops at the same chunk on
-                # every stage. Under the #631 row authority stage r keeps
-                # launching pp_size-1-r passes (PP0's countdown; the followers
-                # follow PP0's forwarded schedule, #791C). #791C-NF: without it
-                # the request wire is pass-aligned -- every stage reads this
-                # abort before planning the same chunk -- so every stage
-                # applies it at receipt (pdflip.pp_abort module docstring).
-                if _row_791c is False:
-                    logger.info("PDFLIP-PP-CHUNKED-ABORT recorded rid=%s pp_rank=%s: applied at receipt -- the request wire delivers the abort to every stage in the pass PP0 read it, so no stage launches a chunk after it (#791C-NF, no row authority)",
-                                chunked_req.rid, getattr(self.ps, "pp_rank", 0))
-                elif _row_791c and getattr(self.ps, "pp_rank", 0) > 0:
-                    logger.info("PDFLIP-PP-CHUNKED-ABORT recorded rid=%s pp_rank=%s: applied when PP0's forwarded schedule stops naming it (#791C, row authority)",
-                                chunked_req.rid, getattr(self.ps, "pp_rank", 0))
-                elif self._pending_chunked_abort_delay:
-                    logger.info("PDFLIP-PP-CHUNKED-ABORT recorded rid=%s pp_rank=%s: applied in %d pass(es) so the stages stop at the same chunk (xsn324)",
-                                chunked_req.rid, getattr(self.ps, "pp_rank", 0), self._pending_chunked_abort_delay)
+                if Scheduler._pdflip_halt_retain(self, chunked_req, recv_req):
+                    # Review A1 (NF-RC31-R6REST): applied NOW, retaining -- the in-flight chunk landed and sits in the
+                    # tree; nothing is left pending for process_pending_chunked_abort, its halt record is written
+                    _retained_a1 = True
+                else:
+                    self._pending_chunked_abort_req = chunked_req
+                    self._pending_chunked_abort_reason = getattr(recv_req, "finished_reason", None)
+                    from flliper.srt.pdflip.pp_abort import chunked_abort_delay, row_authority_of
+                    _row_791c = row_authority_of(self)
+                    self._pending_chunked_abort_delay = chunked_abort_delay(
+                        getattr(self.ps, "pp_size", 1), getattr(self.ps, "pp_rank", 0),
+                        row_authority=_row_791c)
+                    # xsn324: on PP the chunk pipeline stops at the same chunk on
+                    # every stage. Under the #631 row authority stage r keeps
+                    # launching pp_size-1-r passes (PP0's countdown; the followers
+                    # follow PP0's forwarded schedule, #791C). #791C-NF: without it
+                    # the request wire is pass-aligned -- every stage reads this
+                    # abort before planning the same chunk -- so every stage
+                    # applies it at receipt (pdflip.pp_abort module docstring).
+                    if _row_791c is False:
+                        logger.info("PDFLIP-PP-CHUNKED-ABORT recorded rid=%s pp_rank=%s: applied at receipt -- the request wire delivers the abort to every stage in the pass PP0 read it, so no stage launches a chunk after it (#791C-NF, no row authority)",
+                                    chunked_req.rid, getattr(self.ps, "pp_rank", 0))
+                    elif _row_791c and getattr(self.ps, "pp_rank", 0) > 0:
+                        logger.info("PDFLIP-PP-CHUNKED-ABORT recorded rid=%s pp_rank=%s: applied when PP0's forwarded schedule stops naming it (#791C, row authority)",
+                                    chunked_req.rid, getattr(self.ps, "pp_rank", 0))
+                    elif self._pending_chunked_abort_delay:
+                        logger.info("PDFLIP-PP-CHUNKED-ABORT recorded rid=%s pp_rank=%s: applied in %d pass(es) so the stages stop at the same chunk (xsn324)",
+                                    chunked_req.rid, getattr(self.ps, "pp_rank", 0), self._pending_chunked_abort_delay)
         # fnFL2 H42: an END-ANCHOR tail is finished with abort after its final
         # 1-grain forward (the running-request route), on every rank alike.
         for _tail in _anchor_tails.abort_targets(
@@ -23528,7 +23609,7 @@ class Scheduler(
         # (waiting queue / running batch): no extend of it launches any more -- its halt record. The chunked prefill's halt is
         # written when ``process_pending_chunked_abort`` applies it (it may still launch the chunk of this pass before).
         _cr_halt = getattr(self, "chunked_req", None)
-        if not getattr(recv_req, "abort_all", False) and getattr(recv_req, "rid", None) and not (
+        if not _retained_a1 and not getattr(recv_req, "abort_all", False) and getattr(recv_req, "rid", None) and not (
                 _cr_halt is not None and str(_cr_halt.rid).startswith(recv_req.rid)):
             Scheduler._pdflip_d_ext_halt(self, recv_req.rid)  # via the class: bare-namespace harnesses
 

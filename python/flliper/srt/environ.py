@@ -2014,6 +2014,11 @@ class Envs:
     # applied abort (pdflip/d_extend_beacon.py note_halt). S under X then: no flip (R7), the prefill goes back to D. Off = the
     # redirect is committed on the free read at the verdict (D may launch a chunk before the abort lands: live pdflip-6-401).
     FLLIPER_PDFLIP_R6_HALT_FIRST = EnvBool(True)
+    # NF-RC31-R6REST review A1 (SOLL R6/R7 + user 19.10. "EXAKTE ZAHLEN"): on group D the abort of the running chunked prefill
+    # (R6's stop) RETAINS what D computed -- the in-flight chunk lands and is inserted (is_insert=True, forced write-through),
+    # like the park -- instead of upstream's discard (is_insert=False before the in-flight result). Off = upstream's discard;
+    # the halt record then counts the tree-held prefix (scheduler._pdflip_halt_retain).
+    FLLIPER_PDFLIP_D_HALT_RETAIN = EnvBool(True)
     # X_ROUTED_NEEDS_P (#246b, 30.09., NF y4c ...dauer09300427 front 04:39:57):
     # a queued request needs P above the X it was ROUTED on, not only above the
     # live X. pdflip-22-37 / 22-38 (4447 / 4191 tokens) were routed LONG on the
