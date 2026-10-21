@@ -147,6 +147,9 @@ def test_install_builds_the_narrow_copy_variant_as_a_zero_row_copy(monkeypatch):
         return real(srcs, dsts, src_rows, dst_rows, count)
 
     monkeypatch.setattr(ep, "copy_rows", _copy)
+    # the no-op step writes count 0 itself; a step that left one behind must still move no row (danger direction:
+    # the compile copy would write host rows over live bank rows) -- so the count is forced on the device
+    monkeypatch.setattr(ep, "step", lambda *a, **k: None)
     before = B._tables_snapshot(b._pool_tables)
     bank = {k: v.clone() for k, v in b._resident.items()}
     assert b.em_prefetch_prebuild() is True
