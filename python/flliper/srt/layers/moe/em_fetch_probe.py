@@ -40,6 +40,8 @@ stream (``MoEExpertOffloadCache.prefetch_pool_em``) carries, summed over its lay
     pf_layers=<prefetches issued> pf_predicted=<distinct experts predicted> pf_fetched=<rows the side stream
       copied> pf_hits=<of those, rows the target layer's first wave really used> pf_copy_ms=<side-stream copy time>
       pf_wait_ms=<review A4: time the forward stream stood at a join for the side stream (join -> copy end, >= 0)>
+      pf_programs=<EM-PREFETCH-SM: the side copy's grid> pf_sm_reserve=<SMs Marlin left it inside the window>
+      pf_gbps=<landed rows x row bytes / pf_copy_ms>
 
 ``copy_ms`` stays the SYNCHRONOUS row copies on the forward stream (what the prefetch is meant to shrink);
 ``pf_fetched - pf_hits`` is the wasted prefetch. Counters are device adds on the forward stream (the
@@ -87,7 +89,8 @@ class Record:
     """One forward's EM layers on this rank (device counters + timing events)."""
 
     __slots__ = ("fwd", "stream", "start", "end", "pairs", "counter", "layers", "waves", "tokens", "host", "done",
-                 "wave_copy", "wave_apply", "last_copy_end", "pf_layers", "pf_pairs", "pf_waits")
+                 "wave_copy", "wave_apply", "last_copy_end", "pf_layers", "pf_pairs", "pf_waits",
+                 "pf_programs", "pf_row_bytes", "pf_sm_reserve")
 
     def __init__(self, fwd: int, device, cuda):
         import torch
@@ -104,6 +107,9 @@ class Record:
         self.pf_layers = 0
         self.pf_pairs: List[tuple] = []  # EM-PREFETCH: side-stream copy events
         self.pf_waits: List[tuple] = []  # review A4: (join event on the forward stream, copy end on the side)
+        self.pf_programs = 0  # EM-PREFETCH-SM: the side-stream copy's grid
+        self.pf_row_bytes = 0  # EM-PREFETCH-SM: bytes of one expert row (pf_gbps)
+        self.pf_sm_reserve = 0  # EM-PREFETCH-SM: SMs Marlin left the copy inside the window
         self.wave_copy: dict = {}   # F3: wave -> [(copy start, copy end)]
         self.wave_apply: dict = {}  # F3: wave -> [(copy end, apply end)]
         self.last_copy_end = None
@@ -161,9 +167,16 @@ class Record:
         self.pf_layers += 1
         self.counter[PF_PRED:PF_PRED + 1].add_(predicted.reshape(-1).to(torch.int64).sum().reshape(1))
 
-    def prefetch_copy(self, e0, e1) -> None:
-        """EM-PREFETCH: the side stream's copy events of one prefetch (read once the forward has joined it)."""
+    def prefetch_copy(self, e0, e1, programs: int = 0, row_bytes: int = 0) -> None:
+        """EM-PREFETCH: the side stream's copy events of one prefetch (read once the forward has joined it);
+        EM-PREFETCH-SM: the copy's grid and the bytes of one row (host ints) for ``pf_programs`` / ``pf_gbps``."""
         self.pf_pairs.append((e0, e1))
+        self.pf_programs = max(int(self.pf_programs), int(programs))
+        self.pf_row_bytes = max(int(self.pf_row_bytes), int(row_bytes))
+
+    def prefetch_sm_reserve(self, reserve: int) -> None:
+        """EM-PREFETCH-SM: the Marlin SM reserve the window opened with (host int)."""
+        self.pf_sm_reserve = max(int(self.pf_sm_reserve), int(reserve))
 
     def prefetch_wait(self, join_ev, end_ev) -> None:
         """Review A4: the forward stream reached a prefetch's join at ``join_ev``; the side stream's copy ended at
@@ -279,8 +292,15 @@ def pf_terms(rec: Record) -> str:
                 wait += max(0.0, float(a.elapsed_time(b)))
         except Exception:  # noqa: BLE001 -- an instrument never stops a forward
             pass
+    # EM-PREFETCH-SM (appended after pf_wait_ms, so every earlier field keeps its place): the copy's grid, the SMs
+    # Marlin left it, and its link rate = landed rows x row bytes / side-stream copy time. pf_gbps at the
+    # synchronous copies' link_gbps = the narrow grid is still link-bound; clearly below = raise the programs.
+    rb = int(getattr(rec, "pf_row_bytes", 0) or 0)
+    gbps = (vals[1] * rb / (ms / 1000.0) / 1e9) if (ms > 0 and rb > 0) else 0.0
     return (" pf_layers=%d pf_predicted=%d pf_fetched=%d pf_hits=%d pf_copy_ms=%.1f pf_wait_ms=%.1f"
-            % (n, vals[0], vals[1], vals[2], ms, wait))
+            " pf_programs=%d pf_sm_reserve=%d pf_gbps=%.2f"
+            % (n, vals[0], vals[1], vals[2], ms, wait, int(getattr(rec, "pf_programs", 0) or 0),
+               int(getattr(rec, "pf_sm_reserve", 0) or 0), gbps))
 
 
 def wave_terms(rec: Record) -> str:

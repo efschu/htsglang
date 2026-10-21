@@ -7,6 +7,7 @@ import torch
 import logging
 import os
 
+from flliper.jit_kernel import marlin_sm_share
 from flliper.jit_kernel.marlin_switches import (
     arch_override_applies,
     arch_override_cuda_cflags,
@@ -294,6 +295,8 @@ def moe_wna16_marlin_gemm(
         use_atomic_add,
         use_fp32_reduce,
         is_zp_float,
+        # EM-PREFETCH-SM: the SMs a side-stream prefetch copy holds right now (0 outside its window)
+        marlin_sm_share.sm_reserve(),
     )
 
     return c

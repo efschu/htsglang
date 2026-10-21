@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from flliper.jit_kernel import marlin_sm_share
 from flliper.jit_kernel.utils import cache_once_per_arch, load_jit, make_cpp_args
 from flliper.kernel_api_logging import debug_kernel_api
 
@@ -112,6 +113,8 @@ def gptq_marlin_gemm(
         use_atomic_add,
         use_fp32_reduce,
         is_zp_float,
+        # EM-PREFETCH-SM: the SMs a side-stream prefetch copy holds right now (0 outside its window)
+        marlin_sm_share.sm_reserve(),
     )
 
     return c

@@ -4003,6 +4003,17 @@ class Envs:
     # EM-PREFETCH: how many of the next router's top-k each token predicts (0 = all top-k). A prefill's
     #   union over T tokens is what is fetched, so the full top-k is the default.
     FLLIPER_MOE_POOL_EM_PREFETCH_TOPK = EnvInt(0)
+    # EM-PREFETCH-SM (21.10., rc31b D ..._1021_202608: with the 32-program copy the rest of a mixed D pass grew
+    #   170-230 ms at equal rows_on, the MoE apply ~2x at T 512-1023 -- each copy block closes its SM to every
+    #   prefill-sized Marlin block, 99 KB opt-in + 1 KB reserved = the SM's 100 KB): persistent programs of the
+    #   prefetch's SIDE-STREAM row copy (clamped to [1, 32]; the synchronous copies keep 32). The copy is
+    #   link-bound, so a few programs keep its rate. EM-FETCH carries pf_programs / pf_gbps.
+    FLLIPER_MOE_POOL_EM_PREFETCH_PROGRAMS = EnvInt(4)
+    # EM-PREFETCH-SM: while such a copy is in flight (host order: fork behind layer L's last row copy .. layer
+    #   L+1's join), every Marlin GEMM (dense + MoE) launches sms - programs blocks: one full wave beside the copy
+    #   instead of a second wave for the blocks the copy's SMs refuse. Never under graph capture; outside a
+    #   window the grid is the one before. False = Marlin always takes every SM (the copy grid stays narrow).
+    FLLIPER_MOE_POOL_EM_PREFETCH_SM_SHARE = EnvBool(True)
     # S51: the most routed ids (T x top-k) one EAGER-DEVICE-EM forward takes;
     # longer extends keep the host plan. 20480 = 2048 tokens at top-k 10 =
     # 97 % of rc13's D extends (837 of 863 on TP0). Every wave runs over all

@@ -268,6 +268,7 @@ from flliper.srt.pdflip import skip_first as _pdflip_skip_first  # E2 in a mixed
 from flliper.srt.pdflip import d_decode_gap as _pdflip_d_decode_gap  # S48 D-DECODE-GAP instrument
 from flliper.srt.pdflip import d_mem_share as _pdflip_d_mem_share  # D-MEM-SHARE (nf-decode-host-1020)
 from flliper.srt.layers.moe import em_fetch_probe as _em_fetch_probe  # S78 EM-FETCH instrument
+from flliper.jit_kernel import marlin_sm_share as _marlin_sm_share  # EM-PREFETCH-SM window (Marlin grid)
 from flliper.srt.layers.dcp import prefix_lens_check as _prefix_lens_check  # #639 ballot (skip: deferred)
 from flliper.srt.pdflip import short_read as _pdflip_short_read  # held short wake reads
 from flliper.srt.pdflip import tail_adopt as _pdflip_tail_adopt
@@ -20111,6 +20112,8 @@ class Scheduler(
         self._pdflip_d_seat_guard(batch)  # H95c W-SEAT: never wider than the phase's n
         # S78 EM-FETCH: close the previous forward's EM copy record, log the completed ones (no sync)
         _em_fetch_probe.on_forward(self.forward_ct)
+        # EM-PREFETCH-SM: every prefetch window of the previous forward was joined inside it; a leak is closed here
+        _marlin_sm_share.forward_start()
         if self.pdflip_d_lead_probe is not None and batch.forward_mode.is_extend():
             self.pdflip_d_lead_probe.note_extend(
                 rids=[req.rid for req in batch.reqs],

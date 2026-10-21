@@ -802,7 +802,8 @@ void gptq_marlin_gemm(
     bool is_k_full,
     bool use_atomic_add,
     bool use_fp32_reduce,
-    bool is_zp_float) {
+    bool is_zp_float,
+    int64_t sm_reserve) {
   using namespace host;
 
   ScalarType const b_q_type = ScalarType::from_id(b_q_type_id);
@@ -957,6 +958,13 @@ void gptq_marlin_gemm(
 
   int sms = -1;
   RuntimeDeviceCheck(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
+  // EM-PREFETCH-SM (21.10.): while a side-stream prefetch copy holds `sm_reserve` SMs, launch one full wave on
+  // the others. A prefill-sized Marlin block takes the SM's whole shared memory (99 KB opt-in + 1 KB reserved),
+  // so an SM hosting any other block is closed to it and a grid of `sms` blocks would run a second wave. Only
+  // DOWNWARD and before the workspace check: workspace and c_tmp were sized from the hardware count.
+  if (sm_reserve > 0 && sm_reserve < sms) {
+    sms -= static_cast<int>(sm_reserve);
+  }
 
   RuntimeCheck(
       workspace.size(0) >= sms, "workspace.size(0) = ", workspace.size(0), " is below min_workspace_size = ", sms);

@@ -50024,6 +50024,62 @@
    ],
    "type": "EnvBool"
   },
+  "FLLIPER_MOE_POOL_EM_PREFETCH_PROGRAMS": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "4",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "EM-PREFETCH-SM (21.10., rc31b D ..._1021_202608: with the 32-program copy the rest of a mixed D pass grew 170-230 ms at equal rows_on, the MoE apply ~2x at T 512-1023 -- each copy block closes its SM to every prefill-sized Marlin block, 99 KB opt-in + 1 KB reserved = the SM's 100 KB): persistent programs of the prefetch's SIDE-STREAM row copy (clamped to [1, 32]; the synchronous copies keep 32). The copy is link-bound, so a few programs keep its rate. EM-FETCH carries pf_programs / pf_gbps.",
+   "id": "FLLIPER_MOE_POOL_EM_PREFETCH_PROGRAMS",
+   "kind": "env",
+   "level": "expert",
+   "name": "FLLIPER_MOE_POOL_EM_PREFETCH_PROGRAMS",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 4011,
+    "tree": "nf"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "EnvInt"
+  },
+  "FLLIPER_MOE_POOL_EM_PREFETCH_SM_SHARE": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "True",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "EM-PREFETCH-SM: while such a copy is in flight (host order: fork behind layer L's last row copy .. layer L+1's join), every Marlin GEMM (dense + MoE) launches sms - programs blocks: one full wave beside the copy instead of a second wave for the blocks the copy's SMs refuse. Never under graph capture; outside a window the grid is the one before. False = Marlin always takes every SM (the copy grid stays narrow).",
+   "id": "FLLIPER_MOE_POOL_EM_PREFETCH_SM_SHARE",
+   "kind": "env",
+   "level": "expert",
+   "name": "FLLIPER_MOE_POOL_EM_PREFETCH_SM_SHARE",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 4016,
+    "tree": "nf"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "EnvBool"
+  },
   "FLLIPER_MOE_POOL_EM_PREFETCH_TOPK": {
    "bare": false,
    "choices": null,
@@ -60321,7 +60377,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4350,
+    "line": 4361,
     "tree": "nf"
    },
    "status": "harvested",
@@ -60829,7 +60885,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4227,
+    "line": 4238,
     "tree": "nf"
    },
    "status": "harvested",
@@ -61060,7 +61116,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4233,
+    "line": 4244,
     "tree": "nf"
    },
    "status": "harvested",
@@ -75985,7 +76041,7 @@
      "source": {
       "file": "managers/scheduler.py",
       "kind": "os.environ",
-      "line": 1008
+      "line": 1009
      }
     }
    },
@@ -91782,28 +91838,28 @@
  "schema": "flliper.catalog/1",
  "stats": {
   "curated": 125,
-  "entries": 2909,
-  "envs": 2030,
+  "entries": 2911,
+  "envs": 2032,
   "explained": 310,
   "flags": 864,
-  "harvested": 1798,
+  "harvested": 1800,
   "trees": {
    "abweichung": 24,
    "beide": 2697,
    "nur_27b": 179,
-   "nur_nf": 15
+   "nur_nf": 17
   },
   "unexplained": 676
  },
- "tree_rev": "27b=b5588c97aa+nf=5e7e538c4b",
+ "tree_rev": "27b=b5588c97aa+nf=6198c31070",
  "trees": {
   "27b": {
    "entries": 2876,
    "rev": "b5588c97aa"
   },
   "nf": {
-   "entries": 2712,
-   "rev": "5e7e538c4b"
+   "entries": 2714,
+   "rev": "6198c31070"
   }
  },
  "warnungen": []
