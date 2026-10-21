@@ -219,19 +219,23 @@ def test_a_store_backed_leaf_is_room_through_the_s39_hand_off():
     assert not plan.evicts and not plan.pairs            # nothing demoted, nothing moved yet
 
 
-def test_split_an_l2_parent_waits_for_its_store_child_a_store_parent_follows_its_l2_child():
+def test_split_a_mixed_chain_is_no_room_pure_chains_split_now_and_handoff():
+    """KVPLAN-1021: a single-child chain of L2 and store nodes is ONE segment of mixed kind -- never room
+    (its kind boundary is rank-local); a pure L2 branch goes now, a pure store branch is handed to S39."""
     alloc, tree = _world()
     _take(alloc, list(range(1, 17)))
     a = _node(tree, alloc, [17, 18], P)                    # L2-backed parent
-    _store(_node(tree, alloc, [19, 20], P, parent=a))      # store-backed child
-    b = _store(_node(tree, alloc, [21, 22], P))            # store-backed parent
-    _node(tree, alloc, [23, 24], P, parent=b)              # L2-backed child
+    _store(_node(tree, alloc, [19, 20], P, parent=a))      # store-backed child: one mixed segment
+    _node(tree, alloc, [21, 22], P)                        # a pure L2 branch
+    _store(_node(tree, alloc, [23, 24], P))                # a pure store branch
     sv = KC.survey(tree, alloc, P, 16, store_ok=True)
+    kinds = {tuple(g.pages): g.kind for g in sv.segments}
+    assert kinds[(17, 18, 19, 20)] == 3
     ag = KC.Agreement(None)
-    segs, _w = KC.choose_evictions(sv, ag, 8)
+    segs, _w = KC.choose_evictions(sv, ag, 4)
     st = {tuple(g.pages): s for g, s in KC.split_evictions(segs, ag)}
-    assert st[(19, 20)] == 2 and st[(17, 18)] == 3        # the L2 parent waits for the drop
-    assert st[(23, 24)] == 1 and st[(21, 22)] == 2        # the L2 child goes now, the parent drops
+    assert (17, 18, 19, 20) not in st
+    assert st[(21, 22)] == 1 and st[(23, 24)] == 2
 
 
 def _vote_world(store_here):
@@ -243,33 +247,84 @@ def _vote_world(store_here):
     return alloc, tree
 
 
-def _plans(worlds, agreement=None):
+def _plans(worlds, floor=16):
     vecs = []
     for alloc, tree in worlds:
-        sv = KC.survey(tree, alloc, P, 16, store_ok=True)
-        vecs.append((sv, dsv._kv_compact_vote(sv, None, 16, NP, [16])))
+        sv = KC.survey(tree, alloc, P, floor, store_ok=True)
+        vecs.append((sv, dsv._kv_compact_vote(sv, None, floor, NP, [floor])))
     group = [min(c) for c in zip(*[v for _s, v in vecs])]
-    return [dsv._kv_compact_plans_from_vote(sv, group, 16, NP, [16])[0][0] for sv, _v in vecs]
+    return [dsv._kv_compact_plans_from_vote(sv, group, floor, NP, [floor])[0][0] for sv, _v in vecs]
 
 
-def test_ranks_agree_how_a_content_leaves_when_its_backing_differs():
-    """TP0: the content in the store only (its host copy spilled), TP1/TP2: L2-backed. The
-    secured map's MIN says 'room', the L2 map's MIN says 'not on every rank' -> every rank
-    hands it to the S39 drop; one digest."""
-    plans = _plans([_vote_world(True), _vote_world(False), _vote_world(False)])
-    assert all(p is not None and p.staged for p in plans), plans
-    assert all(len(p.handoff) == 1 and not p.evicts for p in plans)
-    ds = {KC.plan_digest(5, p) for p in plans}
-    assert len(ds) == 1, ds
+def test_a_content_whose_backing_differs_between_ranks_is_no_room_on_any_rank():
+    """KVPLAN-1021: TP0 in the store only, TP1/TP2 L2-backed -- the ranks would take it by different paths;
+    every rank answers 'no plan' alike (a uniform refusal, never a plan difference). All-store on every rank:
+    one staged plan, one digest."""
+    assert _plans([_vote_world(True), _vote_world(False), _vote_world(False)]) == [None, None, None]
+    plans = _plans([_vote_world(True), _vote_world(True), _vote_world(True)])
+    assert all(p is not None and p.staged and len(p.handoff) == 1 for p in plans), plans
+    assert len({KC.plan_digest(5, p) for p in plans}) == 1
 
 
-def test_mutant_local_backing_decides_the_leave_path_and_the_ranks_part(monkeypatch):
-    """The danger direction: ``Agreement.now`` reads this rank's own backing instead of the
-    agreed L2 map. TP1/TP2 then demote now, TP0 hands off -- the digests must differ (the plan
-    check refuses uniformly; on the metal the device trees would part)."""
-    monkeypatch.setattr(KC.Agreement, "now", lambda self, seg: bool(seg.evictable and seg.kind == 1))
-    plans = _plans([_vote_world(True), _vote_world(False), _vote_world(False)])
-    ds = [KC.plan_digest(5, p) for p in plans]
+def _rc30_rank(tp0):
+    """rc30 06:37:26 shape: two store branches A, B and an L2 branch C1 -> C2 whose tail TP0 has not backed
+    yet (S108 TURN-END-L2: TP0 unbacked=3, TP1/TP2 1 for the same rid). 10 pages above boundary 16, 8 free below: the gap is 2."""
+    alloc, tree = _world()
+    _take(alloc, list(range(1, 9)))                        # pages 9..16 free: 8 below the boundary
+    _store(_node(tree, alloc, [17, 18, 19], P))            # A (3)
+    _store(_node(tree, alloc, [20, 21, 22, 23], P))        # B (4)
+    c1 = _node(tree, alloc, [24, 25], P)                   # C1 L2
+    _node(tree, alloc, [26], P, parent=c1, backed=not tp0)  # C2: L2 on the workers, un-backed on TP0
+    return alloc, tree
+
+
+def test_rc30_ranks_with_a_rank_local_unbacked_tail_agree_on_the_plan():
+    plans = _plans([_rc30_rank(True), _rc30_rank(False), _rc30_rank(False)])
+    assert all(p is not None for p in plans), plans
+    ds = {KC.plan_digest(4, p) for p in plans}
+    assert len(ds) == 1, "refused-plan-diff: the ranks evict other content (rc30 06:37:26)"
+
+
+def test_mutant_rank_local_structure_in_the_plan_reproduces_the_plan_diff(monkeypatch):
+    """Danger direction: the vote ignores the rank-local unsecured subtree (the S112b/KVZIEL form) -- the
+    workers best-fit C (agreed size 2), TP0 cannot reach C (its tail is unbacked there) and takes A: the digests
+    differ, TP1 = TP2 (the rc30 metal: digest here 1612949070171436656 on TP0, 3713009316671245308 on TP1/TP2)."""
+    real = KC.segments
+
+    def no_sub_ok(*a, **k):
+        out = real(*a, **k)
+        for g in out:
+            g.sub_ok = g.evictable
+        return out
+    monkeypatch.setattr(KC, "segments", no_sub_ok)
+    plans = _plans([_rc30_rank(True), _rc30_rank(False), _rc30_rank(False)])
+    ds = [KC.plan_digest(4, p) if p is not None else None for p in plans]
+    assert ds[0] != ds[1] == ds[2], ds
+
+
+def _size_rank(tp0):
+    """S112c B4 under Form A: TP0's leaf one page deeper (an extra store node below the boundary)."""
+    alloc, tree = _world()
+    _take(alloc, list(range(1, 14)))                       # 14, 15, 16 free below the boundary
+    _store(_node(tree, alloc, [17, 18, 19], P))            # A (3)
+    b = _store(_node(tree, alloc, [20, 21, 22, 23], P))    # B (4; 5 on TP0)
+    if tp0:
+        _store(_node(tree, alloc, [14], P, parent=b))      # gaps: workers 4, TP0 5 -> the group's 5
+    return alloc, tree
+
+
+def test_ranks_agree_with_a_rank_local_segment_size():
+    plans = _plans([_size_rank(True), _size_rank(False), _size_rank(False)])
+    assert all(p is not None for p in plans), plans
+    assert len({KC.plan_digest(4, p) for p in plans}) == 1
+
+
+def test_mutant_rank_local_size_in_the_plan_parts_the_ranks(monkeypatch):
+    """Danger direction 'rang-lokale Größe im Plan': the choice weighs this rank's own segment size instead
+    of the group MIN -- TP0's B (5) closes the gap alone, the workers' B (4) needs A too: digests differ."""
+    monkeypatch.setattr(KC.Agreement, "size", lambda self, seg: seg.size)
+    plans = _plans([_size_rank(True), _size_rank(False), _size_rank(False)])
+    ds = [KC.plan_digest(4, p) if p is not None else None for p in plans]
     assert ds[0] != ds[1] == ds[2], ds
 
 

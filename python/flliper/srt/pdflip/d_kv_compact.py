@@ -127,8 +127,10 @@ class Segment:
     evictable: bool
     children: List["Segment"] = field(default_factory=list)
     #: KVZIEL-1021: 1 = L2-backed (``_evict_to_host`` now), 2 = store-backed (the S39 drop at
-    #: TP0's next broadcast), 0 = not evictable
+    #: TP0's next broadcast), 0 = not evictable; KVPLAN-1021: 3 = mixed here (never chosen)
     kind: int = 0
+    #: KVPLAN-1021: the segment and every device segment below it are secured HERE
+    sub_ok: bool = False
 
     @property
     def size(self) -> int:
@@ -684,30 +686,52 @@ def segments(cache: Any, nodes: List[NodePages], page_size: int) -> List[Segment
         par = nd.parent
         pstates[id(nd)] = (_root_state(cache, getattr(getattr(nd, "key", None), "extra_key", None))
                            if par is root else states.get(id(par)))
+    def evb(np_):
+        # KVPLAN-1021: the chain is cut where SECURED changes, never where the backing KIND changes -- the
+        # kind (L2 vs store) is rank-local under Form A (turn-end backing: TP0 unbacked=3, workers 1 for the
+        # same rid), a kind cut gave the ranks other segment heads and other children
+        return ev(np_) > 0
+
     for nd in order:
         np_ = by_node[id(nd)]
         par = nd.parent
         if (par is not root and id(par) in by_node and len(dkids(par)) == 1
-                and ev(by_node[id(par)]) == ev(np_)):
+                and evb(by_node[id(par)]) == evb(np_)):
             continue                   # nd continues its parent's segment
         chain, x = [np_], nd
         while True:
             kids = dkids(x)
-            if len(kids) != 1 or ev(by_node[id(kids[0])]) != ev(np_):
+            if len(kids) != 1 or evb(by_node[id(kids[0])]) != evb(np_):
                 break
             x = kids[0]
             chain.append(by_node[id(x)])
         bot = states.get(id(chain[-1].node))
         pages = sorted({int(p) for m in chain for p in m.pages})
         toks = sum(int(m.node.component_data[full].value.numel()) for m in chain)
-        evict = bool(ev(np_) and bot is not None and all(states.get(id(m.node)) is not None for m in chain))
+        evict = bool(evb(np_) and bot is not None and all(states.get(id(m.node)) is not None for m in chain))
         key = _head_key(pstates.get(id(nd)), nd, root, P) if bot is not None else -1
-        seg = Segment(nodes=chain, key=key, tokens=toks, pages=pages, evictable=evict,
-                      kind=int(ev(np_)) if evict else 0)
+        kinds = {int(ev(m)) for m in chain}
+        kind = (next(iter(kinds)) if len(kinds) == 1 else 3) if evict else 0
+        seg = Segment(nodes=chain, key=key, tokens=toks, pages=pages, evictable=evict, kind=kind)
         out.append(seg)
         seg_of[id(chain[0].node)] = seg
     for seg in out:
         seg.children = [seg_of[id(c)] for c in dkids(seg.nodes[-1].node) if id(c) in seg_of]
+    # KVPLAN-1021: SUB_OK -- the segment and its whole device subtree are secured HERE. Voted (MIN) with the
+    # maps below: a segment the group agrees on has a fully secured subtree on EVERY rank, so no rank-local
+    # unsecured node below it (a fresh tail one rank has not backed yet) can make it unavailable on one rank
+    # only -- the leaf-first choice then walks a structure that is the same on every rank.
+    memo: Dict[int, bool] = {}
+
+    def sub_ok(g: Segment) -> bool:
+        k = id(g)
+        if k not in memo:
+            memo[k] = False
+            memo[k] = bool(g.evictable and all(sub_ok(c) for c in g.children))
+        return memo[k]
+
+    for seg in out:
+        seg.sub_ok = sub_ok(seg)
     return out
 
 
@@ -899,18 +923,20 @@ def local_bitmap(s: Survey) -> List[int]:
     can demote to its host copy in this pass)."""
     out = [0] * BITMAP
     for seg in s.segments:
-        if seg.evictable and seg.kind == 1 and seg.key >= 0:
+        if seg.evictable and seg.kind == 1 and seg.sub_ok and seg.key >= 0:
             out[seg.key % BITMAP] = 1
     return out
 
 
 def local_secured_bitmap(s: Survey) -> List[int]:
-    """KVZIEL-1021: the content map of the segments SECURED here -- L2-backed or store-backed
-    (kind 1 or 2). The group MIN: a copy exists on every rank's side, so the content may leave
-    every device (now, or through the S39 drop)."""
+    """KVZIEL-1021 / KVPLAN-1021: the content map of the segments STORE-backed here (every node in the
+    store only, kind 2) with a secured subtree. Group MIN with the L2 map's MIN: a segment is room when
+    it is all-L2 on every rank (it goes now) or all-store on every rank (the S39 drop) -- a segment whose
+    backing differs between ranks (L2 here, store or mixed there) is no room: the ranks would take it
+    by different paths."""
     out = [0] * BITMAP
     for seg in s.segments:
-        if seg.evictable and seg.key >= 0:
+        if seg.evictable and seg.kind == 2 and seg.sub_ok and seg.key >= 0:
             out[seg.key % BITMAP] = 1
     return out
 
@@ -921,7 +947,7 @@ def local_sizes(s: Survey) -> List[int]:
     much (its own segment is never smaller), so the agreed choice closes every rank's gap."""
     out = [0] * BITMAP
     for seg in s.segments:
-        if seg.evictable and seg.key >= 0:
+        if seg.evictable and seg.kind in (1, 2) and seg.sub_ok and seg.key >= 0:
             i = seg.key % BITMAP
             out[i] = seg.size if out[i] == 0 else min(out[i], seg.size)
     return out
@@ -941,14 +967,17 @@ class Agreement:
     secured: Optional[Sequence[int]] = None
 
     def agreed(self, seg: Segment) -> bool:
-        """May the content leave every device (chosen for room)?"""
-        if not seg.evictable or seg.key < 0:
+        """May the content leave every device (chosen for room)? KVPLAN-1021: all-L2 on every rank
+        (the L2 map's MIN) or all-store on every rank (the store map's MIN), its subtree secured on every
+        rank; a mixed segment here never."""
+        if not seg.evictable or seg.key < 0 or seg.kind not in (1, 2):
             return False
-        if self.secured is not None:
-            return int(self.secured[seg.key % BITMAP]) >= 1
-        if seg.kind != 1:
-            return self.bitmap is None
-        return True if self.bitmap is None else int(self.bitmap[seg.key % BITMAP]) >= 1
+        if self.bitmap is None:
+            return bool(seg.sub_ok)
+        slot = seg.key % BITMAP
+        if int(self.bitmap[slot]) >= 1:
+            return True
+        return self.secured is not None and int(self.secured[slot]) >= 1
 
     def now(self, seg: Segment) -> bool:
         """KVZIEL-1021: does it leave by ``_evict_to_host`` in this pass -- L2-backed on EVERY
@@ -1153,6 +1182,10 @@ def holder_census(s: Survey, boundary_page: int, ag: Optional[Agreement] = None)
         g = seg_of.get(int(p))
         if g is None or not g.evictable:
             add(base + "_partial")
+        elif g.kind == 3:
+            add(base + "_mixed")        # KVPLAN-1021: L2 and store in one segment here
+        elif not g.sub_ok:
+            add(base + "_child_blocked")
         elif not ag.agreed(g):
             add(base + "_not_agreed")
         elif can_go(g):
