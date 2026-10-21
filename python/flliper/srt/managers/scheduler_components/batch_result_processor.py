@@ -832,6 +832,7 @@ class SchedulerBatchResultProcessor:
 
             predict_tokens.append(accept_tokens)
 
+        result.num_retained_per_req_cpu = [len(t) for t in predict_tokens]
         return predict_tokens
 
     def _accept_grammar_tokens(
@@ -1302,7 +1303,19 @@ class SchedulerBatchResultProcessor:
                 return True, req.kv_committed_len
         elif result.num_correct_drafts_per_req_cpu is not None:
             cur = req.seqlen - 1
-            prev = cur - result.num_correct_drafts_per_req_cpu[i] - 1
+            n_round = result.num_correct_drafts_per_req_cpu[i] + 1
+            # BP-ANCHOR review: measure the round by what it RETAINED. A grammar that terminates inside
+            # the accepted run keeps k < n_round tokens (output_ids and kv_committed_len grow by k), so
+            # `cur - n_round` lands BELOW the round's real start: right after a round that ended on a
+            # multiple of the interval the host would claim that crossing a second time and swap the
+            # ping-pong slot although the device wrote nothing -- the finish then donates the older
+            # slot labelled with the grid point (a wrong mamba anchor). With the start `cur - k` the
+            # host crosses exactly where the device did inside the retained run; a device crossing
+            # above the retained end is not adopted (its key would run past output_ids).
+            retained = getattr(result, "num_retained_per_req_cpu", None)
+            if retained is not None:
+                n_round = min(n_round, int(retained[i]))
+            prev = cur - n_round
             if cur // interval != prev // interval:
                 return True, cur // interval * interval
 
