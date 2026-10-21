@@ -157,3 +157,35 @@ class FrontPlansOnDsSet(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TakenWithoutRvpHolds(unittest.TestCase):
+    """NF-C-SITZ-H (SOLL R5): a RESUME-VIA-P hold (P prefills its context, D runs nothing for it) is no owed D seat."""
+
+    def _front(self):
+        f = object.__new__(F.Front)
+        f.d_bs = 6
+        f.counters = collections.Counter()
+        f._d_seats_live = set()
+        f._ready_for_d = collections.deque()
+        f.groups = {"D": types.SimpleNamespace(outstanding={})}
+        f._handoff_in_flight = lambda: 0
+        f._asr_st()
+        return f
+
+    def test_rvp_holds_are_not_counted(self):
+        f = self._front()
+        ledger = [R(n) for n in range(20, 28)]          # 8 rids on D's ledger
+        f._rvp_inflight = {R(26), R(27)}                # two of them are RESUME-VIA-P holds
+        with mock.patch.object(F.Front, "_flip_ledger", lambda self, g: list(ledger)):
+            taken, n = f._arrival_seat_taken()
+        self.assertEqual((taken, n), (6, 6))
+
+    def test_danger_rvp_hold_double_booked(self):
+        """DANGER DIRECTION: without the exclusion the same front reads 8 > n -- a flip/park verdict on seats D does
+        not hold."""
+        f = self._front()
+        ledger = [R(n) for n in range(20, 28)]
+        f._rvp_inflight = set()
+        with mock.patch.object(F.Front, "_flip_ledger", lambda self, g: list(ledger)):
+            self.assertEqual(f._arrival_seat_taken()[0], 8)

@@ -14766,7 +14766,12 @@ class Front:
         if for_rid is not None and ready and Front._short_gate_by_age_on(self):
             _k = Front._sa_key(self, for_rid)
             ready = [p for p in ready if Front._sa_key(self, p) < _k]
-        running = [r for r in self._flip_ledger(D) if r not in parked]
+        # NF-C-SITZ-H 1021 (SOLL R5; rc27 _1021_023225 02:44:53 'ARRIVAL-SEAT rid=pdflip-2-30 verdict=flip_now ...
+        # taken=11 n=6'): a RESUME-VIA-P hold is a rid D keeps while P prefills its context -- it runs no D work and
+        # holds no D seat until its leg comes back (S87 ``_seat_leg_unseated`` excludes it for the same reason). Counted
+        # here it double-booked the owed seats and steered flip/park verdicts on a number D does not hold.
+        rvp = getattr(self, "_rvp_inflight", None) or ()
+        running = [r for r in self._flip_ledger(D) if r not in parked and r not in rvp]
         # a grant between this rule's verdict and its Seat (the caller still
         # awaits the store-budget reading) holds its seat already: no second
         # waiter may take it in that window. Settled once the rid runs or holds
