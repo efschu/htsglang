@@ -7104,6 +7104,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         to the last state above it and the tokens behind it were recomputed. The read reuses S90b's device attach (one
         blob by the node's last page hash: arena slot, L3 fill or ANCHOR-BYPASS row; the H2D copy is the load-back's);
         nothing is written, no collective: like e1 it only raises THIS rank's match, the group's MIN stays the verdict."""
+        if str(os.environ.get("FLLIPER_PDFLIP_DUAL_LAYOUT", "") or "").strip() == "1":
+            # 27B NACHT REVIEW 21.10. (Auflage A1, user 20.10. "dual unchanged"): 69000fbab8 gated only the admission
+            # re-read; the e1 intake read (``pdflip_anchor_only_read``) and S43 (``pdflip_anchor_only_read_at``)
+            # reach this branch too. Dual P (local-PP floor -> rank_alone) would take rank-local device slots per PP
+            # stage, dual D would log peer_replicas defect=1. Off on dual: the AUX-HOST-LAW branch answers 0 as before
+            # the merge. Launch env, set on every rank of both dual groups (rank-uniform).
+            return 0
         if not UnifiedRadixCache._s109r_rank_alone(self):
             # a TP group whose peers hold mamba replicas: a rank-local device slot (and the eviction behind it) would
             # leave the tombstone sets unequal (#639b) -- named, not taken
