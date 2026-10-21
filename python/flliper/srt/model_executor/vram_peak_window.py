@@ -157,6 +157,29 @@ def fold_and_rebase(cuda) -> int:
     return a
 
 
+def open_extend_window(cuda, rank: int) -> bool:
+    """LEND-COST A1 (21.10., review nf-rc30-tp0lend-review-1021): a target extend is about to run -- make the
+    allocator peak counter start at the extend, so the extend's own peak is READ, never masked by the decode
+    rounds since the last record. With rounds open (``FLLIPER_PDFLIP_VRAM_PEAK`` on) the round window is
+    closed and printed NOW (it holds the decode rounds only; ``_close`` re-bases), and the forward-end hook
+    then closes the extend as its own ``phase=chunk`` window -- before this, the forward end closed the round
+    window FIRST, with the extend's peak inside it, and the chunk record held 0..5 ms and ``transient_mib=0``
+    (rc30 D 1021_063252 TP0: 2202 of 2893 chunk records, review B1). Without open rounds, or with the
+    instrument off, the counter is folded into the shadow and re-based (``cum_peak_allocated`` keeps "since
+    the pools"). True when the counter now starts at the current allocation; False on a backend without a
+    peak reset (the caller then keeps the inherited peak as the bound). Never raises."""
+    try:
+        if not callable(getattr(cuda, "reset_peak_memory_stats", None)):
+            return False
+        if _enabled() and int(_STATE["rounds"] or 0) > 0:
+            return _close(cuda, int(rank), "round") is not None
+        fold_and_rebase(cuda)
+        return True
+    except Exception as exc:  # noqa: BLE001 -- an instrument never kills a forward
+        logger.debug("%s extend open skipped: %s", MARKER, exc)
+        return False
+
+
 def reset_since_pools() -> None:
     """``after pools`` re-based the counter: the shadow starts over with it,
     and the first window opens now."""

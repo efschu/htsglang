@@ -47,7 +47,10 @@ _UNSET = object()
 _CACHE = {"thresholds": _UNSET, "rates": _UNSET, "armed": False, "logged_cap": None,
           # Q-694b EXTEND-RATE: measurement switch + its rank list, this rank's
           # measured rate (MiB/row, ratchet up), the open extend's start reading
-          "measure": _UNSET, "measure_ranks": _UNSET, "measured": None, "pending": None}
+          "measure": _UNSET, "measure_ranks": _UNSET, "measured": None, "pending": None,
+          # LEND-COST (21.10.): the switch (per rank, read once), this rank's measured card cost of a
+          # target+draft extend per row class (MiB, ratchet up) and the extend whose draft tail is open
+          "lend_cost_on": _UNSET, "lend_cost": None, "lend_cost_tail": None}
 
 
 def parse_thresholds(text: Optional[str]) -> Optional[List[float]]:
@@ -96,6 +99,9 @@ def reset_for_tests() -> None:
     _CACHE["measure_ranks"] = _UNSET
     _CACHE["measured"] = None
     _CACHE["pending"] = None
+    _CACHE["lend_cost_on"] = _UNSET
+    _CACHE["lend_cost"] = None
+    _CACHE["lend_cost_tail"] = None
 
 
 def threshold_for(rank: int, values: Optional[Sequence[float]]) -> Optional[float]:
@@ -153,7 +159,8 @@ def before_extend(worker, batch) -> Optional[str]:
     measurement opens its reading (only with ``FLLIPER_PDFLIP_EXTEND_RATE_MEASURE``
     on this rank; off = byte-identical)."""
     line = _before_extend_trim(worker, batch)
-    if batch is not None and measure_armed(getattr(worker, "tp_rank", None)):
+    rank = getattr(worker, "tp_rank", None)
+    if batch is not None and (measure_armed(rank) or lend_cost_armed(rank)):
         measure_open(worker, batch)
     return line
 
@@ -455,8 +462,19 @@ def measure_open(worker, batch, cuda=None) -> None:
         if bool(cuda.is_current_stream_capturing()):
             return
         pa, a, r = _alloc_stats(cuda)
+        # LEND-COST A1 (review 21.10.): the counter still holds the decode rounds since the last PDFLIP-VRAM-PEAK
+        # record (TP0 rc30: up to 411 MiB) -- an extend that stays under it would read transient 0. Re-base it
+        # at the extend's start (``pa_lend`` = the allocation now); where that is impossible the inherited peak
+        # stays the BOUND. Q-694b keeps comparing against the raw ``pa`` (its rate byte for byte).
+        pa_lend = pa
+        rank = getattr(worker, "tp_rank", None)
+        if lend_cost_armed(rank):
+            from flliper.srt.model_executor import vram_peak_window
+
+            if vram_peak_window.open_extend_window(cuda, int(rank or 0)):
+                pa_lend = a
         runner = getattr(worker, "model_runner", None)
-        _CACHE["pending"] = (None if runner is None else id(runner), pa, a, r)
+        _CACHE["pending"] = (None if runner is None else id(runner), pa, a, r, pa_lend)
     except Exception as exc:  # noqa: BLE001
         _CACHE["pending"] = None
         logger.debug("%s open skipped: %s", RATE_MARKER, exc)
@@ -470,12 +488,16 @@ def measure_close(runner, forward_batch, cuda, rank: Optional[int] = None) -> Op
     if pending is None:
         return None
     try:
-        if not measure_armed(rank):
+        rate_on = measure_armed(rank)
+        # LEND-COST (21.10.): the same reading prices the D lend per row class (every row count)
+        cost_on = lend_cost_armed(rank)
+        if not rate_on and not cost_on:
             _CACHE["pending"] = None
             return None
         if getattr(runner, "is_draft_worker", False) or getattr(runner, "is_draft_model_runner", False):
             return None
-        owner, pa0, a0, r0 = pending
+        owner, pa0, a0, r0 = pending[:4]
+        pa0_lend = pending[4] if len(pending) > 4 else pa0
         if owner is not None and owner != id(runner):
             return None
         _CACHE["pending"] = None
@@ -485,13 +507,21 @@ def measure_close(runner, forward_batch, cuda, rank: Optional[int] = None) -> Op
         ids = getattr(forward_batch, "input_ids", None)
         rows = (int(ids.shape[0]) if ids is not None
                 else int(getattr(forward_batch, "extend_num_tokens", 0) or 0))
-        if rows < GROWTH_PER_ROW_MIN_ROWS:
+        if rows < GROWTH_PER_ROW_MIN_ROWS and not cost_on:
             return None
         pa1, _a1, r1 = _alloc_stats(cuda)
         # the peak counter is this extend's only if the extend raised it
         transient = (pa1 - a0) if pa1 > pa0 else 0
         growth = max(0, r1 - r0)
         cost = max(transient, growth)
+        if cost_on and rows > 0:
+            # A1 (review 21.10.): a peak the extend did not raise is not a measured 0 -- its transient is unknown
+            # up to the inherited peak, so that bound is booked (0 only where the open re-based the counter)
+            lend_transient = (pa1 - a0) if pa1 > pa0_lend else max(0, pa0_lend - a0)
+            # the draft extend that follows grows ``reserved`` on top: the tail closes at the next scheduler pass
+            _CACHE["lend_cost_tail"] = (rows, int(lend_transient), int(growth), int(r1))
+        if not rate_on or rows < GROWTH_PER_ROW_MIN_ROWS:
+            return None
         if cost <= 0:
             return None
         rate = _ceil4(cost / MIB / rows)
@@ -514,6 +544,160 @@ def measure_close(runner, forward_batch, cuda, rank: Optional[int] = None) -> Op
         _CACHE["pending"] = None
         logger.debug("%s close skipped: %s", RATE_MARKER, exc)
         return None
+
+
+# --------------------------------------------------------------------------
+# LEND-COST (21.10., nf-rc30-tp0lend-1021): what a D extend of a row class MEASURABLY costs the card,
+# so the D-TRANSIENT-LEND short-extend price follows the measurement instead of the start rate.
+#
+# Metal (NF rc30 D ``..._1021_063252``): TP0 -- the 5090, a start-rate rank (its profile record is
+# kept, Q-694b above is armed on TP1/TP2 only) -- priced every short extend with the S78 SUM
+# ``767 + 300 + 0.5871 x rows`` (1069 MiB for 5 rows) and gave expert rows back 1223x in 2 h 13 min
+# (133.9 s host, each one a decode pause of the group), TP1/TP2 (measured rate, max price) 287 / 277x;
+# the target extends of <= 64 rows on TP0 grew the allocator by at most 449 MiB (PDFLIP-VRAM-PEAK).
+#
+# The reading is Q-694b's own (``measure_open`` after the EXTEND-CACHE-TRIM .. the target forward's
+# end hook, BEFORE PDFLIP-VRAM-PEAK re-bases the peak counter):
+#
+#     forward = max(peak_allocated - allocated_at_start, reserved_after - reserved_at_start)
+#
+# A1 (review 21.10.): the open re-bases the allocator peak counter first
+# (``vram_peak_window.open_extend_window``: the open PDFLIP round window is closed and printed, else the
+# counter is folded into the shadow), so ``peak_allocated`` is the extend's own; on a backend without a
+# peak reset an extend that does not raise the inherited peak books that peak as its BOUND, never 0.
+#
+# plus the reserved growth of the draft extend that follows inside the same batch (rc12d / review A
+# method: the draft extend's reserved growth after it), closed at the next scheduler pass before any
+# lend move (``lend_cost_settle``):
+#
+#     cost = forward + max(0, reserved_at_next_pass - reserved_after)
+#
+# Kept per ROW CLASS (``lend_cost_class``: <= 64, then powers of two): the MAXIMUM cost of the class
+# and the WIDEST extend measured in it, both ratchet up only, process-local (the amount of a lend is
+# rank-local; nothing structural reads it). An extend prices from its class only up to the widest
+# measured one (rows <= widest): a class doubles its rows, so a 4000-row extend is never priced by a
+# 2100-row reading. A class without a reading, or wider than its widest, prices nothing (``None``):
+# the caller keeps its old price. No safety factor, no reserve: the price adds the card's 300 MiB
+# HALT line to the measured cost (``d_transient_lend.short_extend_need_mib``). One line per new
+# class maximum:
+#
+#     EXTEND-LEND-COST rank=0 rows=5 class=64 cost_mib=.. forward_mib=.. transient_mib=..
+#       reserved_growth_mib=.. draft_growth_mib=.. prev=.. widest=.. card_free_mib=..
+#
+# and one HALT line whenever the card ends an extend batch under the 300 MiB line (the instrument of
+# the stop criterion: ``lend_open`` says whether lent rows sat on the card through it):
+#
+#     EXTEND-LEND-COST HALT rank=0 rows=.. class=.. card_free_mib=.. cost_mib=.. lend_open=1 rows_on=..
+#
+# Armed with ``FLLIPER_PDFLIP_D_LEND_MEASURED_PRICE`` (default ON) on a rank that HAS a lend floor
+# (``FLLIPER_PDFLIP_D_LEND_FLOOR_MIB``, written for the D group only); off = byte-identical.
+# --------------------------------------------------------------------------
+
+LEND_COST_MARKER = "EXTEND-LEND-COST"
+#: the smallest row class: every extend of up to this many rows is one class
+LEND_COST_MIN_CLASS = 64
+
+
+def lend_cost_class(rows: int) -> int:
+    """The row class of an extend: ``64`` for <= 64 rows, else the next power of two (65 -> 128)."""
+    rows = int(rows)
+    if rows <= LEND_COST_MIN_CLASS:
+        return LEND_COST_MIN_CLASS
+    return 1 << (rows - 1).bit_length()
+
+
+def lend_cost_armed(rank: Optional[int] = None) -> bool:
+    """LEND-COST switch (``FLLIPER_PDFLIP_D_LEND_MEASURED_PRICE``, default ON) AND a lend floor for
+    this rank (the D group's ``FLLIPER_PDFLIP_D_LEND_FLOOR_MIB``): read once per process."""
+    seen = _CACHE["lend_cost_on"]
+    if seen is _UNSET:
+        seen = _CACHE["lend_cost_on"] = {}
+    key = None if rank is None else int(rank)
+    if key not in seen:
+        on = False
+        try:
+            from flliper.srt.environ import envs
+
+            if bool(envs.FLLIPER_PDFLIP_D_LEND_MEASURED_PRICE.get()):
+                from flliper.srt.pdflip import d_seat_vram as dsv
+
+                on = dsv.lend_floor_mib_for_rank(int(key or 0)) is not None
+        except Exception:  # noqa: BLE001 -- an instrument never kills a forward
+            on = False
+        seen[key] = on
+    return bool(seen[key])
+
+
+def lend_cost_mib(rows: int) -> Optional[float]:
+    """The measured card cost (MiB) of an extend of ``rows`` rows: the maximum of its row class on
+    this rank, ``None`` when the class has no reading yet or ``rows`` is wider than the widest extend
+    measured in it (nothing is guessed, nothing extrapolated)."""
+    table = _CACHE["lend_cost"]
+    if not table:
+        return None
+    v = table.get(lend_cost_class(int(rows)))
+    if v is None or int(rows) > int(v[1]):
+        return None
+    return float(v[0])
+
+
+def lend_cost_settle(rank: Optional[int] = None, cuda=None, lend_open: bool = False,
+                     rows_on: Optional[int] = None) -> Optional[str]:
+    """Close the open tail at the next scheduler pass (before any lend move): add the draft extend's
+    reserved growth, ratchet the class maximum, name a new maximum and an extend batch that left the card
+    under the 300 MiB HALT line. Returns the line logged last. Never raises."""
+    tail = _CACHE["lend_cost_tail"]
+    if tail is None:
+        return None
+    _CACHE["lend_cost_tail"] = None
+    try:
+        if cuda is None:
+            import torch
+
+            cuda = torch.cuda
+        rows, transient, growth, r1 = tail
+        _pa, _a, r2 = _alloc_stats(cuda)
+        draft = max(0, int(r2) - int(r1))
+        forward = max(int(transient), int(growth))
+        cost = _ceil_mib(forward + draft)
+        try:
+            free_mib = int(cuda.mem_get_info()[0] // MIB)
+        except Exception:  # noqa: BLE001 -- no reading: no HALT verdict
+            free_mib = None
+        cls = lend_cost_class(rows)
+        table = _CACHE["lend_cost"]
+        if table is None:
+            table = _CACHE["lend_cost"] = {}
+        old = table.get(cls)
+        prev = None if old is None else int(old[0])
+        widest = int(rows) if old is None else max(int(old[1]), int(rows))
+        line = None
+        rk = "?" if rank is None else int(rank)
+        if prev is None or cost > prev:
+            table[cls] = (cost, widest)
+            line = (f"{LEND_COST_MARKER} rank={rk} rows={int(rows)} class={cls} cost_mib={cost} "
+                    f"forward_mib={_ceil_mib(forward)} transient_mib={_ceil_mib(transient)} "
+                    f"reserved_growth_mib={_ceil_mib(growth)} draft_growth_mib={_ceil_mib(draft)} "
+                    f"prev={'none' if prev is None else prev} widest={widest} "
+                    f"card_free_mib={'na' if free_mib is None else free_mib}")
+            logger.info(line)
+        elif widest > int(old[1]):
+            table[cls] = (prev, widest)  # a wider extend at or under the class maximum: the reach grows, no line
+        if free_mib is not None and free_mib < CHUNKING_FLOOR_MIB:
+            line = (f"{LEND_COST_MARKER} HALT rank={rk} rows={int(rows)} class={cls} card_free_mib={free_mib} "
+                    f"cost_mib={cost} class_max_mib={table[cls][0]} lend_open={int(bool(lend_open))} "
+                    f"rows_on={'-' if rows_on is None else int(rows_on)} -- the extend batch ended under the "
+                    f"{CHUNKING_FLOOR_MIB:.0f} MiB line")
+            logger.warning(line)
+        return line
+    except Exception as exc:  # noqa: BLE001 -- an instrument never kills a pass
+        logger.debug("%s settle skipped: %s", LEND_COST_MARKER, exc)
+        return None
+
+
+def _ceil_mib(nbytes: float) -> int:
+    """Bytes -> whole MiB, rounded UP (a price is never under its reading)."""
+    return int(math.ceil(float(nbytes) / MIB - 1e-9))
 
 
 # Q-694b: the start rate where the profile has no record -- the per-row element
