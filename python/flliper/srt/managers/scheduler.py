@@ -250,6 +250,7 @@ from flliper.srt.pdflip import resume_via_p as _pdflip_rvp  # RESUME-VIA-P
 from flliper.srt.pdflip import front_x as _pdflip_front_x  # FRONT-X-MIT: the front's decision X at D's X gate
 from flliper.srt.pdflip import d_wall_head as _pdflip_d_wall_head  # PW-R
 from flliper.srt.pdflip import d_head_hold as _pdflip_d_head_hold  # DQH
+from flliper.srt.pdflip import d_admit_refusal as _d_admit_refusal  # D-ADMIT-REFUSED
 from flliper.srt.pdflip import head_vote_hold as _pdflip_head_vote_hold  # S42
 from flliper.srt.pdflip import progress_beacon as _pdflip_beacon  # FP forward-progress beacon
 from flliper.srt.pdflip.d_lead_probe import build_d_lead_probe  # D-LEAD-MS-1007
@@ -15071,6 +15072,10 @@ class Scheduler(
         )
         if verdict == "admit":
             _pdflip_rvp.clear_capacity_park(req)  # #248h: its re-read landed
+        try:  # D-ADMIT-REFUSED: what the X gate priced, for the not-added line
+            setattr(req, _d_admit_refusal.XGATE_ATTR, (int(uncached), int(limit)))
+        except Exception:  # noqa: BLE001 -- a slotted stand-in
+            pass
         if verdict == "W31":
             # #1471b (z30m 03:19-03:22, pdflip-116-141): three W31s priced the
             # WHOLE prompt right after every rank had read 28096/4352/36800 of
@@ -18483,6 +18488,7 @@ class Scheduler(
                 if _pdflip_lbv.admit_holds(self, req):
                     _lbv_held = True
                     res = AddReqResult.OTHER
+                    _d_admit_refusal.stamp(adder, req, "lbv_unreleased", res)
                 else:
                     try:
                         with _lanes_p.chunk_scope(adder, req):  # L3: a lower lane's chunk is smaller while a higher lane waits
@@ -18507,6 +18513,7 @@ class Scheduler(
                 if _lb_verdict is None:
                     raise
                 res = AddReqResult.OTHER if _lb_verdict == _prefill_oom_retreat.ABORT else AddReqResult.NO_TOKEN
+                _d_admit_refusal.stamp(adder, req, "agreed_room_short", res)
             except ArenaChainMismatch as _acm:
                 # ARENA-CHAIN (NF 14.10. 07:29:33Z, P PP0 ``#1424 CHAIN MISMATCH node=460 page=174``): ``load_back`` refused a chain page
                 # nothing proves ("the LAST latch"; the proof_cut vote that cuts the match before it runs in the TP group D only) --
@@ -18517,6 +18524,7 @@ class Scheduler(
                 if _cm_verdict is None:
                     raise
                 res = AddReqResult.OTHER if _cm_verdict == _prefill_oom_retreat.ABORT else AddReqResult.NO_TOKEN
+                _d_admit_refusal.stamp(adder, req, "arena_chain_mismatch", res)
             except PPScheduleRefused as exc:
                 # NAMED, NOT FOLDED IN (the #797 practice for a sibling with a
                 # different root): requests admitted EARLIER in this same loop
@@ -18641,6 +18649,7 @@ class Scheduler(
                 added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
                 if added:
                     _p_intake.note_intake_resumed(self, req, adder)  # review A2: names an admission out of a wait
+                    _d_admit_refusal.note_admitted(self, req)  # D-ADMIT-REFUSED: the after-line
                 if not added:
                     # init_next_round_input() may stage deferred Mamba COW/clear
                     # metadata before add_one_req() rejects the request.
@@ -18648,6 +18657,17 @@ class Scheduler(
                     req.mamba_needs_clear = False
                     acquired_here = getattr(
                         req, "mamba_slot_acquired_this_admission", False
+                    )
+                    # D-ADMIT-REFUSED (pdflip/d_admit_refusal.py, rc27 02:15:44-56
+                    # pdflip-2-30): the refusal behind this give-back is named with
+                    # its gate and numbers (throttled per rid) -- the give-back line
+                    # alone named only the slot.
+                    _d_admit_refusal.note_not_added(
+                        self, adder, req, res, site="admission_revert",
+                        gave_back=(
+                            "-" if req.mamba_pool_idx is None or getattr(req, "session", None)
+                            else ("slot" if acquired_here else "kept_owner")
+                        ),
                     )
                     if req.mamba_pool_idx is not None and not getattr(
                         req, "session", None
@@ -18696,6 +18716,10 @@ class Scheduler(
                 if _hol_go_on:
                     continue
                 break
+            # CONTINUE only (the branch above always leaves the iteration): a
+            # request D's admission refused before is in -- D-ADMIT-REFUSED after-line
+            if adder.can_run_list and req is adder.can_run_list[-1]:
+                _d_admit_refusal.note_admitted(self, req)
 
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_end()
