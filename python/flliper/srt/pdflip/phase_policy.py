@@ -620,11 +620,15 @@ def set_verdict(members: Sequence[SetMember], *, x_tokens: int, half_frac: float
     F2): the X the members are CLASSIFIED with (their own X at arrival, R2a) when ``x_tokens`` is the larger X of a set
     of k members (P fixed costs of the further members included); default: ``x_tokens``.
 
-    EZ-S2a (plan §2.6 / review S49, tag ``NS:S49``): ``d_granted_unstarted`` = tokens of D prefills D has been GRANTED
-    but has not BEGUN. They are no R6 reason (user 18.10. "Nur echt laufend zaehlt": only ``d_prefill_running_uncached``
-    reaches R6), but a set that would go to D (``D_AFTER_TIMER``) while ``S + granted > X`` WAITS (COLLECT, no flip, R7)
-    until D begins or finishes the grant. Only a D verdict is held, every flip verdict stands. 0 (default) = nothing held:
-    the verdicts are byte-identical to before S2a (the section-4 compatibility test pins it)."""
+    EZ-S2a (plan §2.6 / review S49, tag ``NS:S49``): ``d_granted_unstarted`` = tokens of halb/big D prefills D has been
+    GRANTED but has not BEGUN (a kurz grant never reaches this term: R2 "sofort auf D", R6k "sein Rest zählt nicht zu S";
+    the front leaves kurz rows out). They are no R6 reason (user 18.10. "Nur echt laufend zaehlt": only
+    ``d_prefill_running_uncached`` reaches R6), but a set whose T_halb ran out WHILE D DECODES (R3 timer end) and that
+    would go to D while ``S + granted > X`` WAITS (COLLECT, no flip, R7) until D begins or finishes the grant. Only that D
+    verdict is held, every flip verdict stands. R8 (nothing decodes on D) is NEVER held: "ohne Decode auf D wird sofort
+    entschieden: D bei S < X, P bei S >= X" -- a COLLECT at d_decoding=0 is the rc30 06:36:19Z violation (pdflip-0-4,
+    S=3821 + 2226 kurz grants). 0 (default) = nothing held: the verdicts are byte-identical to before S2a (the section-4
+    compatibility test pins it)."""
     x = int(x_tokens)
     xc = int(class_x_tokens) if class_x_tokens else x
     hx = half_x_of(xc, half_frac)
@@ -661,7 +665,8 @@ def set_verdict(members: Sequence[SetMember], *, x_tokens: int, half_frac: float
     if not d_decoding:
         if big or s >= x:
             return _flip("R8 no decode on D: decided now, S=%d >= X=%d or a big member" % (s, x))
-        return _d_verdict("R8 no decode on D: decided now, S=%d < X=%d" % (s, x), 0.0)
+        # R8: decided NOW -- never the S49 hold (a grant D has not begun is not in S: R1, R6 user 18.10.; kurz: R2/R6k)
+        return SetVerdict(V_D_AFTER_TIMER, "R8 no decode on D: decided now, S=%d < X=%d" % (s, x), 0.0, s, hx)
     if big:
         if len(members) >= 2:
             return _flip("R4 a big member and company (n=%d, S=%d, new=%d)" % (len(members), s, new))

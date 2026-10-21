@@ -12873,7 +12873,7 @@ class Front:
         return self.__dict__.setdefault("_d_pf", _dpf.DPrefillInflight())
 
     def _d_pf_pending_tokens(self, started_only: bool = False, unstarted_only: bool = False,
-                             d_rest: bool = False) -> int:
+                             d_rest: bool = False, skip_kurz: bool = False) -> int:
         """The uncached tokens D has been granted to prefill as SHORT and has
         not finished (no first content yet). DECODE-COLLECT used to look only
         at D's DECODES, so a burst arriving on an idle D went in one by one --
@@ -12884,7 +12884,10 @@ class Front:
         ``unstarted_only``: only the rows D has NOT begun (their granted price).
         ``d_rest`` (S56, with ``started_only``): a started row counts D's REAL
         rest from the D-EXTEND-BEACON, and only when the front can redirect it
-        to P (``_r6_tokens_of``) -- never the front's arrival price."""
+        to P (``_r6_tokens_of``) -- never the front's arrival price.
+        ``skip_kurz`` (rc30 R8 fix, SOLL R2 + R6k): a row whose request went to D as kurz (``_r6k_note_class``) is not
+        counted -- a kurz request runs on D at once and its tokens are never part of a set's S, neither running (R6k) nor
+        granted-not-begun (R2); counted rows with no class known count as before (named ``xsum_class_unknown``)."""
         book = self.__dict__.get("_d_pf")  # created by the first SHORT grant
         if book is None or not envs.FLLIPER_PDFLIP_ENABLE_DECODE_COLLECT_PREFILL_BUSY.get():
             return 0
@@ -12902,10 +12905,21 @@ class Front:
         ls = self.__dict__.get("_lane_state_obj")
         floor = int(getattr(ls, "lane_floor", 0) or 0) if ls is not None else 0
 
+        classes = (self.__dict__.get("_r6k_class") or {}) if skip_kurz else {}
+
         def _idle(rid: str) -> bool:
             if rid in D.outstanding and rid not in running:
                 return True
-            return floor > 0 and ls.lane_for(rid) < floor
+            if floor > 0 and ls.lane_for(rid) < floor:
+                return True
+            if skip_kurz:
+                got = classes.get(rid)
+                if got is None:
+                    self.counters["xsum_class_unknown"] += 1
+                elif got[0] == phase_policy.CLASS_KURZ:
+                    self.counters["xsum_kurz_grant_skipped"] += 1
+                    return True
+            return False
 
         started = Front._d_ext_started_pred(self) if (started_only or unstarted_only) else None
         if unstarted_only and started is not None:
@@ -14156,8 +14170,10 @@ class Front:
             # EZ-S2a: ONE decision. S49's granted-not-started term is an INPUT of the verdict (NS:S49), not a second pass
             unstarted = _fd.granted_unstarted(
                 self, running, beacon=_dxb.enabled(),
-                d_pf_unstarted=(Front._d_pf_pending_tokens(self, unstarted_only=True) if _dxb.enabled() else 0),
-                d_pf_pending=(0 if _dxb.enabled() else Front._d_pf_pending_tokens(self)))
+                # rc30 R8 fix (SOLL R2 + R6k): a kurz grant is never part of S -- only halb/big grants D has not begun
+                d_pf_unstarted=(Front._d_pf_pending_tokens(self, unstarted_only=True, skip_kurz=True)
+                                if _dxb.enabled() else 0),
+                d_pf_pending=(0 if _dxb.enabled() else Front._d_pf_pending_tokens(self, skip_kurz=True)))
             _dec = phase_policy.decide(
                 "set", members=members, x_tokens=x_tok, half_frac=frac, t_half_s=t_half,
                 now=now, t_open=min(st["t_open"], now),
@@ -14179,25 +14195,30 @@ class Front:
                 d_decoding=decoding, seats_free=seats,
                 d_prefill_running_uncached=running,  # R6: what D REALLY prefills right now counts into S (S49)
                 new_since_last=max(0, len(members) - st["seen"]), class_x_tokens=x_cls)
-            sv = Front._set_xsum_hold(self, sv, x_tok, running)
+            sv = Front._set_xsum_hold(self, sv, x_tok, running, decoding=decoding)
         kw = dict(x_tok=x_tok, x_cls=x_cls, frac=frac, t_half=t_half, decoding=decoding, seats=seats,
                   waited=max(0.0, now - st["t_open"]), xk=xk, unstarted=unstarted)
         st["urgent"] = urgent
         return members, sv, kw
 
-    def _set_xsum_hold(self, sv: "phase_policy.SetVerdict", x_tok: int, running: int) -> "phase_policy.SetVerdict":
+    def _set_xsum_hold(self, sv: "phase_policy.SetVerdict", x_tok: int, running: int,
+                       decoding: bool = True) -> "phase_policy.SetVerdict":
         """S49 (SOLL R6 after the user's decision 18.10. "Nur echt laufend zählt", with X-SUM-PRICE, user 05.10.
         "pending token werden gesammelt und als SUMME bepreist"): a granted D prefill D has NOT begun is no flip
         reason (R6 does not count it) -- but D is not handed a set on top of it either when the two together pass X.
         Before S49 that set was rerouted at once (R6 counted the grant: the NF int23xsum burst of 09.10.); now it WAITS
         (COLLECT, no flip, R7): once D begins the grant, R6 counts it as really running and decides; once D has
         finished it, the set goes to D under X. Only a D verdict (D_AFTER_TIMER) is held; every flip verdict stands.
-        Switch FLLIPER_PDFLIP_D_EXTEND_BEACON off: nothing to hold (R6 counts the book as before)."""
+        Switch FLLIPER_PDFLIP_D_EXTEND_BEACON off: nothing to hold (R6 counts the book as before).
+        rc30 R8 fix: never held when nothing decodes on D (``decoding`` False, SOLL R8 "sofort entschieden"), and a kurz
+        grant is never part of the term (SOLL R2 + R6k)."""
         if sv.verdict != phase_policy.V_D_AFTER_TIMER or not envs.FLLIPER_PDFLIP_ENABLE_DECODE_COLLECT_PREFILL_BUSY.get():
             return sv
+        if not decoding:
+            return sv
         # S56: the rows D has not begun, at their granted price (``running`` is D's rest of the started ones now)
-        unstarted = max(0, Front._d_pf_pending_tokens(self, unstarted_only=True)) if _dxb.enabled() \
-            else max(0, Front._d_pf_pending_tokens(self) - int(running))
+        unstarted = max(0, Front._d_pf_pending_tokens(self, unstarted_only=True, skip_kurz=True)) if _dxb.enabled() \
+            else max(0, Front._d_pf_pending_tokens(self, skip_kurz=True) - int(running))
         if unstarted <= 0 or sv.s_tokens + unstarted <= int(x_tok):
             return sv
         self.counters["set_xsum_hold_unstarted"] += 1

@@ -248,18 +248,18 @@ def _halb_set(f, rid, u, t):
 
 
 def test_xsum_a_set_is_not_handed_to_d_on_top_of_an_unstarted_grant_and_no_flip(monkeypatch, caplog):
-    """NF int23xsum 09.10. on an idle D (X=6008): s0 (5200) is granted, s1 (5200, halb) arrives. R8 decides at once.
-    Before S49 R6 counted the grant: REROUTE_P. Now the grant is no flip reason (not begun) -- and s1 is not put on D
-    on top of it either (5200 + 5200 > X, X-SUM-PRICE): the set WAITS. D begins s0 -> R6 (really running) reroutes;
-    D finished s0 instead -> s1 goes to D under X."""
+    """NF int23xsum 09.10. (X=6008): s0 (5200, halb) is granted, s1 (5200, halb) arrives. The grant is no flip reason (not
+    begun, R6 user 18.10.) -- and, while D DECODES and s1's T_halb is over (R3 timer end), s1 is not put on D on top of it
+    (5200 + 5200 > X, X-SUM-PRICE, NS:S49): the set WAITS. D begins s0 -> R6 (really running) reroutes.
+    rc30 R8 fix (21.10.): on an IDLE D this hold no longer exists -- R8 decides at once (test_nf_rc30_r8_1021)."""
     _on(monkeypatch)
     now = time.time()
-    f = _front(running=[], n=6, kv={"available": 400000, "evictable": 0})   # idle D: no decode
+    f = _front(running=["dec"], n=6, kv={"available": 400000, "evictable": 0})   # D decodes (R3 timer end, not R8)
     f.tp_prefill_max_tokens = 6008
     f.t_awake = now - 60.0
     f._sync_batch_gate = lambda: None
     f._d_pf_book().grant(rid="s0", tokens=5200, now=now - 0.05)
-    _halb_set(f, "s1", 5200, now)
+    _halb_set(f, "s1", 5200, now - 5.0)
     f._d_ext_reading = lambda: {}
     with caplog.at_level(logging.INFO, logger="pdflip.front"):
         assert f._decode_collect(now) == "hold"
@@ -274,11 +274,11 @@ def test_xsum_a_set_is_not_handed_to_d_on_top_of_an_unstarted_grant_and_no_flip(
 def test_xsum_hold_ends_on_d_when_the_grant_is_done(monkeypatch):
     _on(monkeypatch)
     now = time.time()
-    f = _front(running=[], n=6, kv={"available": 400000, "evictable": 0})
+    f = _front(running=["dec"], n=6, kv={"available": 400000, "evictable": 0})
     f.tp_prefill_max_tokens = 6008
     f.t_awake = now - 60.0
     f._d_pf_book().grant(rid="s0", tokens=5200, now=now - 0.05)
-    _halb_set(f, "s1", 5200, now)
+    _halb_set(f, "s1", 5200, now - 5.0)
     f._d_ext_reading = lambda: {}
     assert f._decode_collect(now) == "hold"
     f._d_pf_book().done(rid="s0")                                             # first content: D's prefill over

@@ -257,8 +257,10 @@ def test_x_own_is_the_one_x_function():
 
 
 def test_set_record_names_unstarted_and_the_s49_tag(caplog, monkeypatch):
-    """The DECISION record of a held set carries ``rule=NS:S49`` and ``unstarted=``; Vorgabe 0 elsewhere."""
+    """The DECISION record of a held set carries ``rule=NS:S49`` and ``unstarted=``; Vorgabe 0 elsewhere. The hold exists
+    only at the R3 timer end WHILE D DECODES (rc30 R8 fix: nothing decodes on D -> decided now, never held)."""
     f = _fresh()
+    f._dc_decoding = lambda: True
     p = _queue(f, "pdflip-0-1", 3500, x_requeues=1)
     monkeypatch.setattr(fd, "granted_unstarted", lambda *a, **k: 5000)
     now = time.time()
