@@ -56,6 +56,7 @@ from flliper.srt.layers.dp_attention import (
 from flliper.srt.managers import pp_admission_bulletin as pp_bulletin
 from flliper.srt.managers.overlap_utils import RelayPayload
 from flliper.srt.pdflip import pp_chain_announce as _pp_w2c  # W2C C2/C3 (20.10.)
+from flliper.srt.pdflip import twin_anchor as _pdflip_twin_row  # NF-TWIN-ROW (21.10.)
 from flliper.srt.managers.pp_wire_channels import (
     CHAN_DICT,
     CHAN_REQ,
@@ -5157,6 +5158,9 @@ class SchedulerPPMixin:
                         # would make the receive refuse its own frame.
                         self._pp_note_admission_amendment(mb_id, None)
                         _pre_proxy = self._pp_recv_proxy_tensors(mb_id)
+                        # NF-TWIN-ROW: THIS frame's twin row feeds exactly the
+                        # plan below (pdflip/twin_anchor.py plan_bounds).
+                        _pdflip_twin_row.plant_for_plan(self)
                         _decision = getattr(
                             self, "_pp_last_recv_admission_decision", None
                         )
@@ -5272,6 +5276,7 @@ class SchedulerPPMixin:
                     # (#1020 guard, #1153 sibling sweep).
                     self._pp_null_frameless_slot(mb_id)
                     pp_bulletin.clear_after_plan(self)
+                    _pdflip_twin_row.clear_after_plan(self)
                     # NF-FOLLOWER-ROUND 1014: no plan, but the same housekeeping
                     # round the plan runs (acks, revokes, backups, releases,
                     # prefetch progress) -- upstream runs it on every stage
@@ -5295,6 +5300,7 @@ class SchedulerPPMixin:
                         finally:
                             if self.ps.pp_size > 1 and self.ps.pp_rank != 0:
                                 pp_bulletin.clear_after_plan(self)
+                                _pdflip_twin_row.clear_after_plan(self)
                         logger.info(
                             "#631 ROW-DELIVER d%d planned: batch=%s",
                             _dn2,
@@ -5314,6 +5320,7 @@ class SchedulerPPMixin:
                         finally:
                             if self.ps.pp_size > 1 and self.ps.pp_rank != 0:
                                 pp_bulletin.clear_after_plan(self)
+                                _pdflip_twin_row.clear_after_plan(self)
                     if getattr(self, "_pdflip_p_row_only", False):
                         from flliper.srt.pdflip import p_row_authority as _prow
 
@@ -5330,6 +5337,7 @@ class SchedulerPPMixin:
                     finally:
                         if self.ps.pp_size > 1 and self.ps.pp_rank != 0:
                             pp_bulletin.clear_after_plan(self)
+                            _pdflip_twin_row.clear_after_plan(self)
                 # #631 ROW AUTHORITY: a downstream batch may only exist when a
                 # frame is in hand. `get_next_batch_to_run`'s local
                 # continuation logic (chunked_req, the resident running batch)
@@ -6074,8 +6082,15 @@ class SchedulerPPMixin:
                                 # W2C C2/V2 (pdflip/pp_chain_announce.py): PP0
                                 # announces its next chain in this frame, a
                                 # middle rank relays the announcement.
-                                load_back=_pp_w2c.proxy_extra(
-                                    self, mb_id, getattr(self, "_pp_load_back_wire", None)
+                                # NF-TWIN-ROW (pdflip/twin_anchor.py): PP0's twin
+                                # bounds of this batch ride the frame; a middle
+                                # rank relays the row it adopted.
+                                load_back=_pdflip_twin_row.frame_extra(
+                                    self,
+                                    cur_batch,
+                                    _pp_w2c.proxy_extra(
+                                        self, mb_id, getattr(self, "_pp_load_back_wire", None)
+                                    ),
                                 ),
                             )
                         if _pov.p_host_overlap_on():
@@ -11552,6 +11567,9 @@ class SchedulerPPMixin:
         # W2C (pdflip/pp_chain_announce.py): the announcement is popped under the same law as the stamp (an int left
         # in the dict would reach the slice path) and kept for this rank's relay of the slot (V2).
         _pp_w2c.note_frame(self, mb_id, raw)
+        # NF-TWIN-ROW: PP0's twin bounds of this pass, popped under the same law
+        # (kept for the plan of this slot, pdflip/twin_anchor.py).
+        _pdflip_twin_row.note_frame(self, raw)
         # FIXES Nr. 45 PP-VOID-PASS: a VOID frame (the upstream stage discarded this pass) carries no hidden states. The
         # statement is popped here (before anything maps over the dict); the identity check below (slot, epoch) judges the
         # void frame like any frame, and only after it the statement is handed to the event loop
