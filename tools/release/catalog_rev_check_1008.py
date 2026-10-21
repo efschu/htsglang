@@ -39,18 +39,27 @@ def cited_files(cat):
 
 
 def check(root, catalog_path=None):
-    """-> (results, drift): results = [(label, rev, state, changed_files)]; state = checked | not-ancestor | unknown-rev"""
+    """-> (results, drift): results = [(label, rev, state, changed_files)]; state = checked | not-ancestor | superseded | unknown-rev"""
     cat = json.load(open(catalog_path or os.path.join(root, CATALOG), encoding="utf-8"))
     revs = dict(p.split("=", 1) for p in str(cat.get("tree_rev", "")).split("+") if "=" in p)
     paths = [SRT + f for f in cited_files(cat)]
     results = []
     drift = []
+    known = {label: rev for label, rev in revs.items()
+             if _git(root, "cat-file", "-e", rev + "^{commit}").returncode == 0}
     for label, rev in sorted(revs.items()):
-        if _git(root, "cat-file", "-e", rev + "^{commit}").returncode != 0:
+        if label not in known:
             results.append((label, rev, "unknown-rev", []))
             continue
         if _git(root, "merge-base", "--is-ancestor", rev, "HEAD").returncode != 0:
             results.append((label, rev, "not-ancestor", []))
+            continue
+        # 27B NACHT 21.10.: the lines merge (the 27B line carries NF rc31 by a merge), so the OTHER tree's revision can be
+        # an ancestor of HEAD too. Its cited lines describe that other tree, not this one: a revision that is an ancestor
+        # of another listed revision (itself an ancestor of HEAD) is superseded by it and is not compared (the newest one is this tree's).
+        if any(o != rev and _git(root, "merge-base", "--is-ancestor", o, "HEAD").returncode == 0
+               and _git(root, "merge-base", "--is-ancestor", rev, o).returncode == 0 for o in known.values()):
+            results.append((label, rev, "superseded", []))
             continue
         out = _git(root, "diff", "--name-only", rev, "HEAD", "--", *paths).stdout.split()
         results.append((label, rev, "checked", out))

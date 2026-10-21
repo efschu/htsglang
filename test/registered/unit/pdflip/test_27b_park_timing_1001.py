@@ -171,15 +171,16 @@ def test_tp0_park_names_every_step_with_monotonic_sub_times(clk, caplog):
     assert float(f["mark_write_ms"]) == pytest.approx(2 * WRITE_S * 1e3)
     assert float(f["mark_ms"]) == pytest.approx((CHAIN_S + 2 * WRITE_S) * 1e3)
     assert int(f["mark_keys"]) == 30344 + 55255
-    # #59b: two local probes, ONE timed tp-min reduce (the default reduce's result kept)
-    assert float(f["probe_ms"]) == pytest.approx(2 * PROBE_S * 1e3)
+    # #59b: two local probes, ONE timed tp-min reduce (the default reduce's result kept); #59c PARK-SECURED (NF parkl3,
+    # merged rc31 21.10.): each request is probed once more at its secured end, the reduce carries both (twice the slots)
+    assert float(f["probe_ms"]) == pytest.approx(4 * PROBE_S * 1e3)
     assert float(f["coll_ms"]) == pytest.approx(COLL_S * 1e3)
     assert out.pdflip_resumable_depth == {"pdflip-10-26": 30344 - 3, "pdflip-16-44": 55255 - 3}
     # the laps are contiguous: their sum is the total
     parts = ("land_ms", "draft_ms", "retract_ms", "note_ms", "mark_ms", "probe_ms", "coll_ms", "rest_ms")
     assert float(f["total_ms"]) == pytest.approx(sum(float(f[k]) for k in parts), abs=0.5)
     assert float(f["total_ms"]) == pytest.approx(
-        (RETRACT_S + CHAIN_S + 2 * WRITE_S + 2 * PROBE_S + COLL_S) * 1e3, abs=0.5)
+        (RETRACT_S + CHAIN_S + 2 * WRITE_S + 4 * PROBE_S + COLL_S) * 1e3, abs=0.5)
     # sizes: seq tokens, resumable pages, what the write-through took on the host
     assert int(f["seq_tokens"]) == 30344 + 55255
     assert int(f["resumable_tokens"]) == (30344 - 3) + (55255 - 3) == int(f["pages"])

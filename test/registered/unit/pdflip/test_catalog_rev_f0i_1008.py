@@ -76,6 +76,24 @@ class Checker(unittest.TestCase):
         self.assertEqual({l: s for l, _r, s, _f in res}, {"27b": "checked", "nf": "not-ancestor"})
         self.assertEqual(drift, [])
 
+    def test_the_other_line_merged_in_is_superseded_not_drift(self):
+        """27B NACHT 21.10.: the 27B line merged NF rc31 -- NF's revision is an ancestor of HEAD, but its cited lines
+        describe the NF tree. The newest listed revision is this tree's; an ancestor of it is superseded."""
+        nf = self.rev
+        with open(self.f, "w") as fh:
+            fh.write("# the 27B line after the merge\nA = 1\nB = 2\n")
+        git(self.d, "commit", "-q", "-am", "27b on top of nf")
+        b27 = git(self.d, "rev-parse", "HEAD")
+        res, drift = CK.check(self.d, self.catalog("27b=%s+nf=%s" % (b27, nf)))
+        self.assertEqual({l: s for l, _r, s, _f in res}, {"27b": "checked", "nf": "superseded"})
+        self.assertEqual(drift, [])
+        # a later edit of a cited file on the 27B line is still drift of the 27B revision
+        with open(self.f, "w") as fh:
+            fh.write("# edited after the build\nA = 1\nB = 2\n")
+        git(self.d, "commit", "-q", "-am", "after the build")
+        res, drift = CK.check(self.d, self.catalog("27b=%s+nf=%s" % (b27, nf)))
+        self.assertEqual(drift, [("27b", b27, "python/flliper/srt/pdflip/launcher.py")])
+
 
 @unittest.skipUnless(os.environ.get("FLLIPER_CATALOG_REV_CHECK") == "1", "release gate: set FLLIPER_CATALOG_REV_CHECK=1")
 class ShippedCatalog(unittest.TestCase):

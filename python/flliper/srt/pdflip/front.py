@@ -14031,6 +14031,11 @@ class Front:
         m[str(rid)] = True
         while len(m) > 4096:
             m.popitem(last=False)
+        # 27B NACHT 21.10. (merge rc31): R6 reads NF's class book (``_r6k_note_class`` / ``_r6k_kurz_stays``, review
+        # K1/K2/N1/A1); this 27B arrival site feeds the same book, so both R6k marks reach the one rule. A class the
+        # NF sites noted already (with its halfX) is not overwritten.
+        if str(rid) not in (self.__dict__.get("_r6k_class") or {}):
+            Front._r6k_note_class(self, rid, phase_policy.CLASS_KURZ, "arrival_27b")
 
     def _r6_redirectable(self, rid: str) -> bool:
         """S56 (SOLL R6 "wird ... umgeleitet", user finding 19.10.): a running D prefill the front CAN move to P -- a
