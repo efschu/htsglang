@@ -81,5 +81,58 @@ class AltShadowNoLongerShadowsTheSetSite(unittest.TestCase):
         self.assertEqual(getattr(F.Front._set_xsum_hold, "_ez_alt_marker", None), "set_xsum_hold")
 
 
+
+class DualStaysAsItWas(unittest.TestCase):
+    """27B NACHT 21.10. (user 20.10.: the dual layout stays as it was): the NF rc29-rc31 changes that the merge made
+    active on the dual layout (gate analysis of the merge) are off under FLLIPER_PDFLIP_DUAL_LAYOUT=1 -- UD-LAST,
+    EVICT-FIT, SPILL-MEMO (dual P keeps its own eviction rule, as for UD-H in the port), VISION-ROWS (P publish and
+    D attach), P-COMMIT's verdict at admit, the S109R admission re-read on D and NF-C-SITZ's victim pool on D.
+    The flip line keeps all of them."""
+
+    DUAL = {"FLLIPER_PDFLIP_DUAL_LAYOUT": "1"}
+
+    def test_eviction_switches_are_off_on_dual_and_on_in_flip(self):
+        from flliper.srt.pdflip import evict_fit, spill_memo, ud_last
+
+        for m in (ud_last, evict_fit, spill_memo):
+            self.assertFalse(m.on(self.DUAL), m.__name__)
+            self.assertTrue(m.on({}), m.__name__)
+
+    def test_vision_rows_have_no_store_on_dual(self):
+        from flliper.srt.pdflip import vision_row_store as vrs
+
+        sa = types.SimpleNamespace(model_path="/nonexistent/model", enable_multimodal=True)
+        with mock.patch.object(vrs, "hash_ok", lambda _sa: False):
+            self.assertIsNone(vrs.store_dir_for(sa, env=dict(self.DUAL)))
+
+    def test_vision_verdict_at_admit_is_skipped_on_dual(self):
+        from flliper.srt.managers import pdflip_store_told as st
+
+        recv, wire = [], [object()]
+        with mock.patch.dict(os.environ, self.DUAL):
+            self.assertIs(st._vision_at_admit(types.SimpleNamespace(_pdflip_vision_gate=True), recv, wire), wire)
+
+    def test_s109r_admission_read_is_skipped_on_dual(self):
+        from flliper.srt.managers import scheduler as S
+
+        called = []
+        tc = types.SimpleNamespace(pdflip_anchor_only_read=lambda req: called.append(req) or 4096)
+        sched = types.SimpleNamespace(ps=types.SimpleNamespace(pp_size=1), tree_cache=tc)
+        req = types.SimpleNamespace(init_next_round_input=lambda tc: None)
+        with mock.patch.dict(os.environ, self.DUAL):
+            self.assertFalse(S._s109r_admission_anchor_read(sched, req))
+        self.assertEqual(called, [])
+        with mock.patch.dict(os.environ, {"FLLIPER_PDFLIP_DUAL_LAYOUT": ""}):
+            self.assertTrue(S._s109r_admission_anchor_read(sched, req))   # the flip line reads as NF does
+
+    def test_seat_age_victim_pool_is_the_whole_batch_on_dual(self):
+        from flliper.srt.pdflip import d_park_runtime as dpr
+
+        src = open(dpr.__file__, encoding="utf-8").read()
+        i = src.index("pool_reqs = displaceable(running_batch)")
+        self.assertIn('FLLIPER_PDFLIP_DUAL_LAYOUT', src[i:i + 300])
+        self.assertIn("pool_reqs = reqs", src[i:i + 300])
+
+
 if __name__ == "__main__":
     unittest.main()

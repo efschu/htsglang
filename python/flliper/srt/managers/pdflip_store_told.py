@@ -1816,6 +1816,8 @@ def _vision_at_admit(scheduler, recv_reqs: List, wire: List) -> List:
     Never raises into the pass."""
     if wire is recv_reqs:
         return wire
+    if str(os.environ.get("FLLIPER_PDFLIP_DUAL_LAYOUT", "") or "").strip() == "1":
+        return wire  # 27B NACHT 21.10.: the dual layout stays as it was (user 20.10.) -- off under FLLIPER_PDFLIP_DUAL_LAYOUT=1 (set on every rank of both groups: rank-uniform)
     try:
         admitted = []
         for item in wire[len(recv_reqs):]:

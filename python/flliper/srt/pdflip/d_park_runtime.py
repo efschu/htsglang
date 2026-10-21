@@ -1519,6 +1519,8 @@ def displace_for_age(sched, running_batch) -> Optional[str]:
     # NF-C-SITZ 1021: the victim is chosen among the requests D CAN park now (:func:`displaceable`) -- the set the front
     # plans on -- and the KV fit is asked for exactly that victim; never a victim D then waits for.
     pool_reqs = displaceable(running_batch)
+    if str(os.environ.get("FLLIPER_PDFLIP_DUAL_LAYOUT", "") or "").strip() == "1":
+        pool_reqs = reqs  # 27B NACHT 21.10.: the dual layout stays as it was (user 20.10.) -- off under FLLIPER_PDFLIP_DUAL_LAYOUT=1 (set on every rank of both groups: rank-uniform)
     if cap and len(reqs) >= int(cap):
         cand = _displace_candidate(sched, _sa, waiting, pool_reqs, lanes_on)
         if cand is not None:

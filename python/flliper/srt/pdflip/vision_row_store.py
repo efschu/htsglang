@@ -198,6 +198,8 @@ def store_dir_for(server_args: Any, env: Optional[Dict[str, str]] = None) -> Opt
     if hash_ok(server_args):
         return None
     e = os.environ if env is None else env
+    if str(e.get("FLLIPER_PDFLIP_DUAL_LAYOUT", "") or "").strip() == "1":
+        return None  # 27B NACHT 21.10.: the dual layout stays as it was (user 20.10.) -- off under FLLIPER_PDFLIP_DUAL_LAYOUT=1 (set on every rank of both groups: rank-uniform)
     if cap_bytes(e) > 0 and str(e.get(ENV_DIR, "") or "").strip():
         return store_dir(None, e)
     return store_dir(tower_id(getattr(server_args, "model_path", None)), e)

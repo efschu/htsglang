@@ -1835,6 +1835,10 @@ def _s109r_admission_anchor_read(sched, req) -> bool:
     ps = getattr(sched, "ps", None)
     if ps is not None and int(getattr(ps, "pp_size", 1) or 1) > 1:
         return False
+    if str(os.environ.get("FLLIPER_PDFLIP_DUAL_LAYOUT", "") or "").strip() == "1":
+        # 27B NACHT 21.10.: the dual layout stays as it was (user 20.10.) -- off under FLLIPER_PDFLIP_DUAL_LAYOUT=1 (set on every rank of both groups: rank-uniform); on the dual D every TP rank holds GDN state and no RU floor is guaranteed, so a rank-local re-match
+        # could resume deeper on one rank (W27 class)
+        return False
     tc = getattr(sched, "tree_cache", None)
     fn = getattr(tc, "pdflip_anchor_only_read", None)
     if not callable(fn):
@@ -16007,6 +16011,8 @@ class Scheduler(
         from flliper.srt.pdflip import vision_d_guard as _vdg
         from flliper.srt.pdflip import vision_row_store as _vrs
 
+        if str(os.environ.get("FLLIPER_PDFLIP_DUAL_LAYOUT", "") or "").strip() == "1":
+            return False  # 27B NACHT 21.10.: the dual layout stays as it was (user 20.10.) -- off under FLLIPER_PDFLIP_DUAL_LAYOUT=1 (set on every rank of both groups: rank-uniform)
         items = _vdg.items_past(req, bound)
         if not items:
             return False
