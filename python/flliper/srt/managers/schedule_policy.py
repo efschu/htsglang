@@ -1023,6 +1023,8 @@ def _h105c_follow_load_back(adder, req, lb_extent: int) -> torch.Tensor:
 #: H105d: how often a token-cut rank voted NO_TOKEN for want of load-back room.
 _H105D_REFUSED = {"n": 0}
 _H105G_DROPPED = {"n": 0}
+#: NF-RC31 D: ``(rid, why)`` of the last H105g refusal on this adder -- the gate name ``h105g_target_dropped``
+H105G_REFUSED_ATTR = "_h105g_refused"
 
 
 def _h105g_load_back_target_lost(tree_cache, best_match_node, req=None) -> str | None:
@@ -1097,6 +1099,12 @@ def _h105g_target_kept(adder, req, has_extent, site: str) -> bool:
     why = _h105g_load_back_target_lost(adder.tree_cache, req.best_match_node, req)
     if why is None:
         return True
+    # NF-RC31 D: the refusal's own name for the D-ADMIT-REFUSED instrument (``h105g_target_dropped``), read at the
+    # call sites in ``add_one_req`` -- an instrument only, the verdict is the bool below
+    try:
+        setattr(adder, H105G_REFUSED_ATTR, (getattr(req, "rid", None), why))
+    except Exception:  # noqa: BLE001 - a name never fails the vote
+        pass
     _H105G_DROPPED["n"] += 1
     n = _H105G_DROPPED["n"]
     if n <= 8 or (n & (n - 1)) == 0:
@@ -1108,6 +1116,18 @@ def _h105g_target_kept(adder, req, has_extent, site: str) -> bool:
             getattr(req, "rid", "?"), getattr(req.best_match_node, "id", "?"), why, site, n,
         )
     return False
+
+
+def _h105_room_gate_name(adder, req, room_name: str) -> str:
+    """NF-RC31 D (rc30 review Folgefix D): the D-ADMIT-REFUSED gate name of a False from
+    :func:`_h105d_cut_load_back_room` -- ``h105g_target_dropped`` when that call refused because the load-back
+    source left L2 (H105g / S109R, :func:`_h105g_target_kept`), else ``room_name`` (``h105d_cut_room`` /
+    ``h105f_confirm_room``: no room). Monitor class 2 then counts the H105g refusals without pairing lines.
+    Instrument only: the verdict is the bool the gather already took."""
+    st = getattr(adder, H105G_REFUSED_ATTR, None)
+    if isinstance(st, tuple) and len(st) == 2 and st[0] == getattr(req, "rid", None):
+        return "h105g_target_dropped"
+    return room_name
 
 
 def _h105d_load_back_kv_rows(best_match_node) -> int:
@@ -1189,6 +1209,10 @@ def _h105d_cut_load_back_room(adder, req, evict: bool = True) -> bool:
 
     if not form_a_token_cut_active():
         return True
+    try:
+        setattr(adder, H105G_REFUSED_ATTR, None)   # NF-RC31 D: this call's own answer names the gate
+    except Exception:  # noqa: BLE001
+        pass
     _lb_extent = _pp_load_back_extent(req)
     kv_rows = (
         _h105d_load_back_kv_rows(req.best_match_node)
@@ -3280,7 +3304,7 @@ class PrefillAdder:
                     self, req, evict=not _h105f
                 ):
                     _gate = AddReqResult.NO_TOKEN
-                    _gate_why = "h105d_cut_room"
+                    _gate_why = _h105_room_gate_name(self, req, "h105d_cut_room")
                 # H105: after every rank-local gate and BEFORE the load-back
                 # (and the tail-adopt vote behind it) -- the one point every
                 # rank of the group reaches for this rid. The host's verdict
@@ -3292,7 +3316,7 @@ class PrefillAdder:
                 if _h105f_confirm_due(_gate, _h105f):
                     _room = _h105d_cut_load_back_room(self, req, evict=True)
                     if not _room:
-                        _gate_why = "h105f_confirm_room"
+                        _gate_why = _h105_room_gate_name(self, req, "h105f_confirm_room")
                     _gate = _fa_follow(
                         req,
                         None if _room else AddReqResult.NO_TOKEN,
