@@ -16943,7 +16943,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 23753
+      "line": 23754
      }
     }
    },
@@ -16993,7 +16993,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23781,
+    "line": 23782,
     "tree": "nf"
    },
    "status": "harvested",
@@ -18268,7 +18268,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 23736
+      "line": 23737
      }
     }
    },
@@ -18317,7 +18317,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 23770
+      "line": 23771
      }
     }
    },
@@ -19284,7 +19284,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 23383
+      "line": 23384
      }
     }
    },
@@ -19595,7 +19595,7 @@
    "source": {
     "file": "pdflip/launcher.py",
     "kind": "argparse",
-    "line": 23553,
+    "line": 23554,
     "tree": "nf"
    },
    "status": "curated",
@@ -26897,6 +26897,26 @@
    "type": "str"
   },
   "--turn-anchor-token": {
+   "abweichung": {
+    "27b": {
+     "default": null,
+     "help": "TURN ANCHOR (NF, pdflip/turn_anchor.py): the chat template's turn-start token id (<|im_start|> = 248045 on Qwen3.8-27B and NF). Group P then also snapshots the recurrent state where the prompt's LAST message starts (a second extend track in the same forward, no extra forward) and inserts it as an anchor -- where the next turn and a client's side request fork (y3m pdflip-50-71: FETCH CAP lost=16 pages behind the END anchor). Adds FLLIPER_PDFLIP_TURN_ANCHOR_TOKEN to group P only; default off = argv and env byte-identical.",
+     "source": {
+      "file": "pdflip/launcher.py",
+      "kind": "argparse",
+      "line": 23708
+     }
+    },
+    "nf": {
+     "default": null,
+     "help": "TURN ANCHOR (NF, pdflip/turn_anchor.py): the chat template's turn-start token id (<|im_start|> = 248045 on Qwen3.8-27B and NF). Group P then also snapshots the recurrent state where the prompt's LAST message starts (a second extend track in the same forward, no extra forward) and inserts it as an anchor -- where the next turn and a client's side request fork (y3m pdflip-50-71: FETCH CAP lost=16 pages behind the END anchor). Adds FLLIPER_PDFLIP_TURN_ANCHOR_TOKEN to groups P and D (D: the D-FORK-ANCHOR tracks, FLLIPER_PDFLIP_D_FORK_ANCHOR=0 turns them off); default off = argv and env byte-identical.",
+     "source": {
+      "file": "pdflip/launcher.py",
+      "kind": "argparse",
+      "line": 23031
+     }
+    }
+   },
    "bare": false,
    "choices": null,
    "cost": "",
@@ -38053,7 +38073,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 5168,
+    "line": 5173,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -38371,7 +38391,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 5167,
+    "line": 5172,
     "tree": "nf"
    },
    "status": "harvested",
@@ -54112,7 +54132,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4873,
+    "line": 4878,
     "tree": "nf"
    },
    "status": "harvested",
@@ -60415,6 +60435,34 @@
    ],
    "type": "EnvBool"
   },
+  "FLLIPER_PDFLIP_D_FORK_ANCHOR": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "True",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "D-FORK-ANCHOR (pdflip/turn_anchor.py, 21.10., NF rc30 1d822bd150): the TURN / CLOSE-FORK / GEN-FORK tracks on group D too (overlap schedule allowed: the slot is written by the step's own track gather and published in the same insert call as the step's own track); a Form A worker gets a split-only plan. Default ON (new features on); 0 = group D plans nothing, byte-identical to rc30.",
+   "id": "FLLIPER_PDFLIP_D_FORK_ANCHOR",
+   "kind": "env",
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_D_FORK_ANCHOR",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 4325,
+    "tree": "nf"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "EnvBool"
+  },
   "FLLIPER_PDFLIP_D_HOL_OVERTAKE": {
    "bare": false,
    "choices": null,
@@ -61201,7 +61249,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4885,
+    "line": 4890,
     "tree": "nf"
    },
    "status": "harvested",
@@ -61954,7 +62002,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4852
+      "line": 4857
      }
     }
    },
@@ -62931,7 +62979,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4832
+      "line": 4837
      }
     }
    },
@@ -64088,7 +64136,7 @@
    "id": "FLLIPER_PDFLIP_EVICT_ANCHOR_SAVE",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/unified_radix_cache.py:6662"
+    "mem_cache/unified_radix_cache.py:6799"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_EVICT_ANCHOR_SAVE",
@@ -64097,7 +64145,7 @@
    "source": {
     "file": "mem_cache/unified_radix_cache.py",
     "kind": "os.environ",
-    "line": 6662,
+    "line": 6799,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -65714,7 +65762,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4341,
+    "line": 4346,
     "tree": "nf"
    },
    "status": "harvested",
@@ -66681,7 +66729,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4975
+      "line": 4980
      }
     }
    },
@@ -69952,7 +70000,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4761
+      "line": 4766
      }
     }
    },
@@ -73138,7 +73186,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4335,
+    "line": 4340,
     "tree": "nf"
    },
    "status": "harvested",
@@ -74895,7 +74943,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4890,
+    "line": 4895,
     "tree": "nf"
    },
    "status": "harvested",
@@ -75692,7 +75740,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4880,
+    "line": 4885,
     "tree": "nf"
    },
    "status": "harvested",
@@ -75889,7 +75937,7 @@
    "id": "FLLIPER_PDFLIP_SPILL_REF_FREE",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/unified_radix_cache.py:6894"
+    "mem_cache/unified_radix_cache.py:7031"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_SPILL_REF_FREE",
@@ -75898,7 +75946,7 @@
    "source": {
     "file": "mem_cache/unified_radix_cache.py",
     "kind": "os.environ",
-    "line": 6894,
+    "line": 7031,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -76377,7 +76425,7 @@
    "id": "FLLIPER_PDFLIP_SWEEP_REFUSED_MEMO",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/unified_radix_cache.py:9136"
+    "mem_cache/unified_radix_cache.py:9273"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_SWEEP_REFUSED_MEMO",
@@ -76386,7 +76434,7 @@
    "source": {
     "file": "mem_cache/unified_radix_cache.py",
     "kind": "os.environ",
-    "line": 9136,
+    "line": 9273,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -76414,7 +76462,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4351,
+    "line": 4356,
     "tree": "nf"
    },
    "status": "harvested",
@@ -76442,7 +76490,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4356,
+    "line": 4361,
     "tree": "nf"
    },
    "status": "harvested",
@@ -76470,7 +76518,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4363,
+    "line": 4368,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -76498,7 +76546,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4352,
+    "line": 4357,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -76526,7 +76574,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4361,
+    "line": 4366,
     "tree": "nf"
    },
    "status": "harvested",
@@ -76554,7 +76602,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4362,
+    "line": 4367,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -80188,7 +80236,7 @@
      "source": {
       "file": "environ.py",
       "kind": "environ",
-      "line": 4962
+      "line": 4967
      }
     }
    },
@@ -91972,28 +92020,28 @@
  "schema": "flliper.catalog/1",
  "stats": {
   "curated": 125,
-  "entries": 2904,
-  "envs": 2025,
+  "entries": 2905,
+  "envs": 2026,
   "explained": 310,
   "flags": 864,
-  "harvested": 1796,
+  "harvested": 1797,
   "trees": {
-   "abweichung": 53,
+   "abweichung": 54,
    "beide": 2463,
    "nur_27b": 180,
-   "nur_nf": 243
+   "nur_nf": 244
   },
   "unexplained": 673
  },
- "tree_rev": "27b=0798c91fcd+nf=801ddb6aa3",
+ "tree_rev": "27b=0798c91fcd+nf=33cf26403c",
  "trees": {
   "27b": {
    "entries": 2643,
    "rev": "0798c91fcd"
   },
   "nf": {
-   "entries": 2706,
-   "rev": "801ddb6aa3"
+   "entries": 2707,
+   "rev": "33cf26403c"
   }
  },
  "warnungen": []
