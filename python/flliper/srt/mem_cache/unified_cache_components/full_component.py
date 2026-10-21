@@ -244,6 +244,8 @@ class FullComponent(TreeComponent):
             _udl.end(self.cache, prev)
 
     def _peel_heap(self, leaves, request: int, tracker: dict[ComponentType, int]) -> None:
+        from flliper.srt.pdflip import evict_fit as _fit
+
         heap = [(self.cache.eviction_strategy.get_priority(n), n) for n in leaves]
         heapq.heapify(heap)
         ct = self.component_type
@@ -251,6 +253,10 @@ class FullComponent(TreeComponent):
             _, x = heapq.heappop(heap)
             if x not in self.cache.evictable_device_leaves:
                 continue
+            # EVICT-FIT (NF rc27 1021_023225 P PP0 18252 / PP1 18598: node 9/18, 151360 backed tokens demoted whole
+            # for a remaining need of 13376): a backed leaf longer than the remaining need is split, only the tail
+            # leaves the device (pdflip/evict_fit.py; local-PP floor only)
+            _fit.fit(self.cache, x, request - tracker[ct])
             self.cache._evict_device_leaf(x, tracker)
             if x.parent is not None and x.parent in self.cache.evictable_device_leaves:
                 heapq.heappush(
