@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import threading
+import ctypes
 import time
 import uuid
 from abc import ABC, abstractmethod
@@ -3918,6 +3919,20 @@ class HiCacheFile(HiCacheStorage):
         return os.environ.get("FLLIPER_PDFLIP_L3_WRITE_BEHIND_DIRECT", "1").strip() not in ("0", "false", "")
 
     @staticmethod
+    def _l3wb_direct_min_bytes() -> int:
+        """27B INT8 metal 21.10. 01:26Z (rc29b on c77da494f9): O_DIRECT only for pages of at least this many bytes
+        (``FLLIPER_PDFLIP_L3_WRITE_BEHIND_DIRECT_MIN_KIB``, default 1024 KiB). An O_DIRECT write leaves (and on XFS
+        drops) the page cache for its range, so every later read of that page goes to the NVMe. With 27B's KV pages of
+        ONE token (32 KiB, page_size=1) P's L3 fill read thousands of 32 KiB files cold: 4392 pages in 34.6 s on PP2
+        (0.58 ms/page at boot start, up to 8.7 ms/page once D's write-behind had written them O_DIRECT) -- a P phase of
+        over 6 min, 11 clients gone. Small pages go buffered as before the merge (they stay in the page cache for the
+        reader); big pages (NF's 64-token KV pages, the mamba anchors) keep O_DIRECT."""
+        try:
+            return max(0, int(os.environ.get("FLLIPER_PDFLIP_L3_WRITE_BEHIND_DIRECT_MIN_KIB", "") or 1024)) << 10
+        except ValueError:
+            return 1024 << 10
+
+    @staticmethod
     def _l3_write_behind_budget() -> int:
         try:
             return max(1, int(envs.FLLIPER_PDFLIP_L3_WRITE_BEHIND_MIB.get())) << 20
@@ -4254,7 +4269,8 @@ class HiCacheFile(HiCacheStorage):
                                     [b[2] for b in batch], [total] * len(batch),
                                     [((0, total),)] * len(batch),
                                     [int(arena.slot_ptr(int(slots[b[0]]))) for b in batch], fsync,
-                                    direct=direct, direct_counts=_dc,
+                                    direct=(direct and int(total) >= self._l3wb_direct_min_bytes()),
+                                    direct_counts=_dc,
                                 )
                             except TypeError:   # a pageio double without the S36 keywords
                                 statuses = pio.write_pages(
@@ -4976,13 +4992,36 @@ class HiCacheFile(HiCacheStorage):
         touch = getattr(arena, "touch_progress", None)
         slots = [t[1] for t in todo]
         gens = [t[2] for t in todo]
+        # 27B INT8 metal 21.10. 01:26Z (rc29b): every worker touched ALL claims of the batch after every 16 pages, and
+        # each touch rebuilt two ctypes arrays of the whole batch under the GIL -- quadratic in the page count. With
+        # 27B's one-token KV pages a fill is thousands of pages (PP2: 14042 pages, 91.5 s; 4392 pages, 34.6 s). The
+        # arrays are built ONCE per read and the clock is moved at most every L3_TOUCH_MIN_S (well inside the 1 s
+        # JOIN-IDLE bound the touch exists for); the first and the last touch always run.
+        _prep = {}
+        _last = [0.0]
 
-        def _touch():
-            if callable(touch):
-                try:
+        def _touch(force: bool = False):
+            if not callable(touch):
+                return
+            now = time.monotonic()
+            if not force and now - _last[0] < L3_TOUCH_MIN_S:
+                return
+            _last[0] = now
+            try:
+                lib = getattr(arena, "_lib", None)
+                base = getattr(arena, "_base", None)
+                if lib is not None and base is not None and hasattr(lib, "arena_touch_progress"):
+                    if "c" not in _prep:
+                        n = len(slots)
+                        _prep["c"] = (n, (ctypes.c_int64 * n)(*[int(x) for x in slots]),
+                                      (ctypes.c_int64 * n)(*[int(x) for x in gens]))
+                    n, c_sl, c_g = _prep["c"]
+                    if n:
+                        lib.arena_touch_progress(base, n, c_sl, c_g)
+                else:
                     touch(slots, gens)
-                except Exception:  # noqa: BLE001 - a witness never breaks a read
-                    pass
+            except Exception:  # noqa: BLE001 - a witness never breaks a read
+                pass
 
         from flliper.srt.mem_cache import l3_write_behind as _wb
 
@@ -4990,13 +5029,13 @@ class HiCacheFile(HiCacheStorage):
         try:
             if not callable(touch):
                 return l3_read_pages_parallel(pio, paths, total_bytes, ptrs)
-            _touch()
+            _touch(force=True)
             _L3_PROGRESS.cb = _touch
             try:
                 return l3_read_pages_parallel(pio, paths, total_bytes, ptrs)
             finally:
                 _L3_PROGRESS.cb = None
-                _touch()
+                _touch(force=True)
         finally:
             _wb.read_exit()
 
@@ -7073,6 +7112,8 @@ def _l3_read_split(pio, paths, total_bytes: int, ptrs, k: int, progress=None):
 #: bound even on a cold disk (metal: 65 pages 1189 ms = 18 ms/page, 16 pages = ~0.3 s) -- while the batch keeps the
 #: full parallelism of ``l3_read_pages_parallel`` (no chunk barriers, no serial tail chunk below L3_PARALLEL_MIN_PAGES).
 L3_TOUCH_PAGES = 16
+#: 27B port fix 21.10.: the reader moves its claims' progress clock at most this often (JOIN-IDLE bound 1 s)
+L3_TOUCH_MIN_S = 0.1
 _L3_PROGRESS = threading.local()    # the caller's progress callback, read by ``l3_read_pages_parallel`` in the caller thread
 
 
