@@ -101,6 +101,10 @@ SYSGRID_PENDING_ATTR = "_pdflip_sysgrid_pending"
 #: close of the message BEFORE the last one, ``floor_page(e - 1)``, when the turn
 #: track ``floor_page(i)`` lies past it -- one plan of the same shape as PENDING_ATTR's
 CLOSE_PENDING_ATTR = "_pdflip_close_pending"
+#: IMAGE-END TRACK (21.10., NF rc30 pdflip-127-1253 / 130-1258): the step's track at the first
+#: page boundary at or past the end of the step's last image, ``ceil_page(e)``, when the step's
+#: own track lies past it -- one plan of the same shape as PENDING_ATTR's
+IMAGE_PENDING_ATTR = "_pdflip_image_pending"
 
 #: the generation prompt of a thinking Qwen3.x turn is 5 tokens, the
 #: non-thinking one 8; the same window the FORK ANCHOR uses.
@@ -390,6 +394,11 @@ def note_step(batch: Any, desc: Optional[TurnTracks], req: Any, row: int,
         _free_slot(batch, cl_stale[1])
         _decline_unconsumed(req, cl_stale[0])
         setattr(req, CLOSE_PENDING_ATTR, None)
+    im_stale = getattr(req, IMAGE_PENDING_ATTR, None)
+    if im_stale is not None:
+        _free_slot(batch, im_stale[1])
+        _decline_unconsumed(req, im_stale[0])
+        setattr(req, IMAGE_PENDING_ATTR, None)
     if not track_mask or len(getattr(req, "output_ids", None) or ()) > 0:
         return desc
     desc = _note_turn_twin_steps(batch, desc, req, row, prefix, end, main_track,
@@ -407,6 +416,9 @@ def note_step(batch: Any, desc: Optional[TurnTracks], req: Any, row: int,
     if tok is not None and sys_grid_armed():
         desc = _note_sysgrid_steps(batch, desc, req, row, prefix, end, main_track,
                                    chunk, page, tok)
+    if tok is not None:
+        # IMAGE-END TRACK: armed wherever the turn anchor is (``tok``), no own switch
+        desc = _note_image_step(batch, desc, req, row, prefix, end, main_track, chunk, page)
     return desc
 
 
@@ -871,6 +883,111 @@ def _note_close_step(batch: Any, desc: Optional[TurnTracks], req: Any, row: int,
     return desc
 
 
+# -- IMAGE-END TRACK (21.10.) -------------------------------------------------------
+def image_end_in(ids: Optional[Sequence[int]], lo: int, hi: int) -> Optional[int]:
+    """One past the last image placeholder in ``ids[lo:hi]`` (a pad id >= ``MM_PAD_SHIFT_VALUE``:
+    the scheduler's ids carry every image position as its item's pad value, the radix key), or
+    None. A pure function of the ids: every PP rank derives the same position."""
+    if ids is None:
+        return None
+    lo, hi = max(0, int(lo)), min(len(ids), int(hi))
+    if hi <= lo:
+        return None
+    import numpy as np
+
+    from flliper.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
+
+    try:
+        seg = np.frombuffer(ids, dtype=np.int64)[lo:hi] if getattr(ids, "typecode", "") == "q" \
+            else np.asarray(ids[lo:hi], dtype=np.int64)
+    except (TypeError, ValueError):
+        seg = np.asarray(list(ids[lo:hi]), dtype=np.int64)
+    hit = np.flatnonzero(seg >= MM_PAD_SHIFT_VALUE)
+    return None if hit.size == 0 else lo + int(hit[-1]) + 1
+
+
+def image_end_pos(ids: Optional[Sequence[int]], prefix: int, end: int, grain: int) -> Optional[int]:
+    """The image-end position ``ceil_grain(e)`` of the step ``[prefix, end)``: ``e`` = one past its
+    last image placeholder. A reader sharing the prompt through ``ceil_grain(e)`` (bigram keys: one
+    token more) claims it, and every image of the step then lies inside a recurrent anchor."""
+    e = image_end_in(ids, prefix, end)
+    if e is None:
+        return None
+    grain = max(1, int(grain))
+    t = ((int(e) + grain - 1) // grain) * grain
+    return t if t > 0 else None
+
+
+def _note_image_step(batch: Any, desc: Optional[TurnTracks], req: Any, row: int,
+                     prefix: int, end: int, main_track: Optional[int], chunk: int,
+                     page: int) -> Optional[TurnTracks]:
+    """IMAGE-END TRACK (21.10.; NF rc30 ..._1d822bd150_1021_063252, session a4c8b097ac).
+
+    THE MEASURED GAP. pdflip-127-1253 (N=63879, images=2, image_end=63714) ran ONE step
+    [63680, 63879) on P ('#969 EXTENT ... (pdflip-127-1253, 63680, 63879, 63680, 199)'); its tracks:
+    'END-ANCHOR ... anchor=63872' and nothing else -- the last message opens inside the step's
+    first page, so turn and close positions round down onto the step start 63680 (``step_target``:
+    strictly inside). P published 998 KV pages and the END anchor ('STORE-PRESENCE src=p_flush
+    anchors=[pdflip-127-1253:63872]'). Its sibling pdflip-130-1258 (N=63880) shares the KV through
+    page 996 and diverges inside page 997: 'PDFLIP-CLAIM-SHORT rid=pdflip-130-1258 asked=998 kv=996
+    claimed=995 lost=1 short=3 by=mamba tokens=63680' -- the recurrent state exists only at 63680
+    and 63872, so the claim falls back to 63680 < image_end 63714: the image lies in the uncached
+    tail again (front 'D-PROBE ... covered=63680 ... image_in_tail=1'), P-only (SOLL R9) -> a second
+    D->P flip for 200 tokens, 64 of them (63680..63744) recomputed although their KV was stored.
+
+    THE REPAIR: one more track in the same forward at ``ceil_page(e)`` -- the first page boundary at
+    or past the step's last image -- in exactly the geometry ``step_target`` admits (strictly inside
+    the step, below the step's own track, on its FLA grid) and where no other track writes it (the
+    turn anchor's machinery: one gather row per GDN/PLE layer, one mamba slot from the free list;
+    none free = no anchor, counted; no eviction, no reserve), inserted as its own node before the
+    step's insert and published with the chain. Every later request that shares the prompt through
+    that page boundary -- the next turn, a sibling, a retry -- holds the image inside its covered
+    prefix: it is priced as text and served by D, the image is never P-only again. A promise to a
+    later twin like the turn/gen/close tracks (S52 ledger). Armed wherever the turn anchor is."""
+    ids = getattr(req, "origin_input_ids", None)
+    t = step_target(prefix, end, image_end_pos(ids, prefix, end, page), chunk, main_track)
+    if t is None or t % max(1, int(page)) != 0:
+        return desc
+    rid = str(getattr(req, "rid", "?"))
+    if int(getattr(req, "cache_protected_len", 0) or 0) >= t:
+        return desc
+    taken = {int(p[0]) for p in (getattr(req, TWIN_PENDING_ATTR, None) or ())}
+    taken |= {int(p[0]) for p in (getattr(req, SYSGRID_PENDING_ATTR, None) or ())}
+    for attr in (PENDING_ATTR, FORK_PENDING_ATTR, GEN_PENDING_ATTR, CLOSE_PENDING_ATTR):
+        p = getattr(req, attr, None)
+        if p is not None:
+            taken.add(int(p[0]))
+    if t in taken:
+        n = _count("image_shared")
+        if _log_due(n):
+            logger.info("PDFLIP IMAGE-END-ANCHOR SHARED rid=%s at=%d step=[%d,%d) (n=%d; another "
+                        "track writes this very position)", rid, t, prefix, end, n)
+        return desc
+    slot = _alloc_slot(batch)
+    if slot is None:
+        n = _count("image_no_slot")
+        if _log_due(n):
+            logger.info("PDFLIP IMAGE-END-ANCHOR SKIP rid=%s reason=no_free_slot at=%d "
+                        "step=[%d,%d) (n=%d; no eviction, no reserve)", rid, t, prefix, end, n)
+        return desc
+    if desc is None:
+        desc = TurnTracks(len(batch.reqs), need=slot_state_kinds(batch.req_to_token_pool))
+    desc.add(row, slot, t, prefix, end - prefix)
+    setattr(req, IMAGE_PENDING_ATTR, (t, slot, desc, int(prefix), int(end)))
+    from flliper.srt.pdflip import twin_anchor as _tw
+
+    _tw.note_track_planned(rid, t)
+    n = _count("image_planned")
+    if _log_due(n):
+        logger.info(
+            "PDFLIP IMAGE-END-ANCHOR TRACK n=%d rid=%s step=[%d,%d) at=%d image_end=%s prompt=%d "
+            "main=%s (extra extend track at the first page boundary past the step's last image: a "
+            "later request sharing the prompt through it holds the image inside its covered prefix, "
+            "D serves it -- no second flip)", n, rid, prefix, end, t, image_end_in(ids, prefix, end),
+            len(ids or ()), main_track)
+    return desc
+
+
 # -- SYS-GRID TRACK (S62 4b) ------------------------------------------------------
 SYSGRID_POS_ATTR = "_pdflip_sysgrid_pos"
 
@@ -1131,7 +1248,8 @@ def has_pending(req: Any) -> bool:
             or getattr(req, FORK_PENDING_ATTR, None) is not None
             or getattr(req, GEN_PENDING_ATTR, None) is not None
             or bool(getattr(req, SYSGRID_PENDING_ATTR, None))
-            or getattr(req, CLOSE_PENDING_ATTR, None) is not None)
+            or getattr(req, CLOSE_PENDING_ATTR, None) is not None
+            or getattr(req, IMAGE_PENDING_ATTR, None) is not None)
 
 
 def pop_all_pending(req: Any) -> List[Tuple[str, Any]]:
@@ -1161,6 +1279,10 @@ def pop_all_pending(req: Any) -> List[Tuple[str, Any]]:
     if close is not None:
         setattr(req, CLOSE_PENDING_ATTR, None)
         out.append(("close", close))
+    image = getattr(req, IMAGE_PENDING_ATTR, None)
+    if image is not None:
+        setattr(req, IMAGE_PENDING_ATTR, None)
+        out.append(("image", image))
     out.sort(key=lambda kp: int(kp[1][0]))
     return out
 
@@ -1281,11 +1403,11 @@ def insert_verdict(pend) -> Tuple[bool, str]:
 def _label(kind: str) -> str:
     return {"twin": "TWIN-ANCHOR", "fork": "FORK-ANCHOR",
             "gen": "GEN-FORK-ANCHOR", "grid": "SYS-GRID-ANCHOR",
-            "close": "CLOSE-FORK-ANCHOR"}.get(kind, "TURN-ANCHOR")
+            "close": "CLOSE-FORK-ANCHOR", "image": "IMAGE-END-ANCHOR"}.get(kind, "TURN-ANCHOR")
 
 
 def _kind_prefix(kind: str) -> str:
-    return kind + "_" if kind in ("twin", "fork", "gen", "grid", "close") else ""
+    return kind + "_" if kind in ("twin", "fork", "gen", "grid", "close", "image") else ""
 
 
 def note_insert(req: Any, t: int, prefix_len: int, taken: bool, prompt: int,

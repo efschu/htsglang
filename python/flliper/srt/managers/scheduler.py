@@ -15335,17 +15335,21 @@ class Scheduler(
             req, int(covered), batch_empty=batch_empty
         )
         v = _vdg.verdict(req, covered, tail_start=tail_start, tail_wait=tail_wait)
-        if v == _vdg.REFUSE and covered is not None and not getattr(req, "_pdflip_vision_rows_tried", False):
+        out = _vdg.bounded(v, str(req.rid), defers)
+        if out == _vdg.REFUSE and covered is not None and not getattr(req, "_pdflip_vision_rows_tried", False):
             # VISION-ROWS (rc30 visiontail, pdflip-10-516): an image P's tower already encoded and that ends in the
             # partial page past the group's covered prefix is computed HERE from P's published rows -- no tower,
             # no second flip. Every input of this branch is replicated (the group's covered, the tail peek, the
-            # request's items), so every rank enters it for the same request; rank 0 reads, one broadcast.
+            # request's items, the per-rid defer count), so every rank enters it for the same request; rank 0
+            # reads, one broadcast. A7: also the REFUSE ``bounded`` makes of a tail wait that never came -- the
+            # tail is then not relied on, the rows must reach from the covered prefix itself.
             req._pdflip_vision_rows_tried = True
-            bound = max(int(covered), int(tail_start or 0))
+            bound = int(covered) if v == _vdg.DEFER else max(int(covered), int(tail_start or 0))
             if Scheduler._pdflip_vision_d_rows(self, req, bound, int(covered)):
                 req._pdflip_vision_need = _vdg.image_end(req)
                 v = _vdg.verdict(req, covered, tail_start=tail_start, tail_wait=tail_wait)
-        return _vdg.bounded(v, str(req.rid), defers)
+                out = _vdg.bounded(v, str(req.rid), defers)
+        return out
 
     def _pdflip_vision_d_rows(self, req: Req, bound: int, covered: int) -> bool:
         """VISION-ROWS (D side, ``pdflip/vision_row_store.py``): attach the rows of every image of ``req`` that
@@ -15363,6 +15367,13 @@ class Scheduler(
             # no per-image rows and would ask the tower (replicated input: the same answer on every rank)
             logger.info("%s MISS rid=%s why=not per-image items -- P-only (W123 + reroute)", _vrs.TAG, req.rid)
             return False
+        if int(getattr(getattr(self, "ps", None), "pp_size", 1) or 1) > 1:
+            # A3: tp == 1 would make every PP stage read the store itself -- an eviction between two stages' reads
+            # splits them (one admits, one refuses). No reader per stage, no new chain collective: a named miss
+            # (replicated input: the same answer on every stage)
+            logger.info("%s MISS rid=%s why=pp>1: per-stage reads would split the stages -- P-only (W123 + reroute)",
+                        _vrs.TAG, req.rid)
+            return False
         tp = int(getattr(getattr(self, "ps", None), "tp_size", 1) or 1)
         src = True
         if tp > 1:
@@ -15376,7 +15387,7 @@ class Scheduler(
             try:
                 d = _vrs.store_dir_for(getattr(self, "server_args", None))
                 if d is None:
-                    why = "store off / no content hash"
+                    why = "store off / no content hash / no tower identity"
                 else:
                     hf = getattr(getattr(self, "model_config", None), "hf_config", None)
                     vc = getattr(hf, "vision_config", None)
