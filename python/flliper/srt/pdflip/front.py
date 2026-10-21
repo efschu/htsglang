@@ -5681,7 +5681,7 @@ class Front:
             while len(pbook) > 4096:
                 pbook.popitem(last=False)
             Front._reprobe_note(self, rid, _dmp.ReprobeEntry(
-                ids=_np.asarray(ans.ids, dtype=_np.int64), spans=tuple(ans.mm_spans),
+                ids=_np.asarray(ans.ids, dtype=_np.int64), spans=tuple(ans.mm_spans), rows=tuple(ans.mm_rows),
                 extra_key=(extra_key if ids is not None else ans.extra_key),
                 extra_key_known=(True if ids is not None else bool(ans.extra_key_known)),
                 path=("/generate" if ids is not None else str(path or "")),
@@ -7458,7 +7458,7 @@ class Front:
                 while len(_pbook) > 4096:
                     _pbook.popitem(last=False)
                 Front._reprobe_note(self, rid, _dmp.ReprobeEntry(
-                    ids=ans.ids, spans=tuple(ans.mm_spans), extra_key=ans.extra_key,
+                    ids=ans.ids, spans=tuple(ans.mm_spans), rows=tuple(ans.mm_rows), extra_key=ans.extra_key,
                     extra_key_known=bool(ans.extra_key_known), path=str(path),
                     payload=(None if (ans.extra_key_known and ns_known) else payload),
                     ns_known=bool(ns_known), ns=ns, t=time.monotonic(), price=_xp))
@@ -7727,7 +7727,7 @@ class Front:
                 _pbook.popitem(last=False)
             # S63 F1: the key of this price, for the re-probe right before a set verdict that flips or assigns P
             Front._reprobe_note(self, rid, _dmp.ReprobeEntry(
-                ids=_probe.ids, spans=tuple(_probe.mm_spans), extra_key=_probe.extra_key,
+                ids=_probe.ids, spans=tuple(_probe.mm_spans), rows=tuple(_probe.mm_rows), extra_key=_probe.extra_key,
                 extra_key_known=bool(_probe.extra_key_known), path=str(path),
                 # the body is kept only where a re-probe must send it again (no D namespace in the answer / LoRA):
                 # a media payload is megabytes, D's ids + namespace are the key itself
@@ -7736,12 +7736,12 @@ class Front:
             if _xp.image_in_tail:
                 self.counters["d_probe_image_in_tail"] += 1
             logger.info("PDFLIP D-PROBE rid=%s n=%d device=%d host=%d store=%d tier=%s covered=%d uncached_d=%d "
-                        "uncached_p=%d image_in_tail=%d images=%d class_u=%d ledger_pending=%d ledger_src=%s "
+                        "uncached_p=%d image_in_tail=%d tail_rows=%d images=%d class_u=%d ledger_pending=%d ledger_src=%s "
                         "front_n=%s tokenize_ms=%.1f handle_ms=%.1f probe_ms=%.1f (S56: the class from D's exact "
                         "numbers, R11 -- the front decides)",
                         rid, int(c.n), int(_probe.device_tokens), int(_probe.host_tokens), int(_xp.store_tokens),
                         tier, int(_xp.covered), int(_xp.uncached), int(_xp.uncached_p), int(_xp.image_in_tail),
-                        len(_probe.mm_spans), int(pending), int(_ledger[0]), _ledger[2],
+                        int(_xp.tail_rows), len(_probe.mm_spans), int(pending), int(_ledger[0]), _ledger[2],
                         (int(_c_front.n) if _c_front is not None else "-"), _probe.tokenize_ms,
                         _probe.handle_ms, _probe.total_ms)
         # NF-NEXT-1006-21: which entry (its rid, its kind) the credit came from --
@@ -14329,7 +14329,7 @@ class Front:
             return None, "no exact D number by the deadline"
         if not _dmp.reprobe_same_key(e, ans):
             return None, "identity: D answered n=%d for the arrival's n=%d" % (ans.n, e.n)
-        ans = _dmp.with_spans(ans, e.spans)
+        ans = _dmp.with_spans(ans, e.spans, e.rows)
         store = 0
         if e.ns_known:
             tmo = envs.FLLIPER_PDFLIP_FRONT_EXACT_TIMEOUT_MS.get() / 1000.0

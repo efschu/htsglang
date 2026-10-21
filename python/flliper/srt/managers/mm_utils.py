@@ -594,6 +594,12 @@ def _get_chunked_embedding_by_item(
         cached = embedding_cache.get_single(item.hash)
         if cached is not None:
             cached_embeddings[idx] = cached.embedding
+            continue
+        # VISION-ROWS (pdflip/vision_row_store.py): rows P's tower computed for this image, attached by a
+        # tower-less group D's scheduler from the shared store -- taken before the ViT would be asked
+        attached = item.__dict__.get("pdflip_tail_rows") if hasattr(item, "__dict__") else None
+        if attached is not None and int(attached.shape[0]) == end - start + 1:
+            cached_embeddings[idx] = attached.to(device, non_blocking=True)
         else:
             miss_items.append((idx, item, start, end))
 

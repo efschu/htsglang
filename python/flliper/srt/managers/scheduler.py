@@ -15334,11 +15334,78 @@ class Scheduler(
         tail_start, tail_wait = (None, False) if covered is None else _ta.peek_target_start(
             req, int(covered), batch_empty=batch_empty
         )
-        return _vdg.bounded(
-            _vdg.verdict(req, covered, tail_start=tail_start, tail_wait=tail_wait),
-            str(req.rid),
-            defers,
-        )
+        v = _vdg.verdict(req, covered, tail_start=tail_start, tail_wait=tail_wait)
+        if v == _vdg.REFUSE and covered is not None and not getattr(req, "_pdflip_vision_rows_tried", False):
+            # VISION-ROWS (rc30 visiontail, pdflip-10-516): an image P's tower already encoded and that ends in the
+            # partial page past the group's covered prefix is computed HERE from P's published rows -- no tower,
+            # no second flip. Every input of this branch is replicated (the group's covered, the tail peek, the
+            # request's items), so every rank enters it for the same request; rank 0 reads, one broadcast.
+            req._pdflip_vision_rows_tried = True
+            bound = max(int(covered), int(tail_start or 0))
+            if Scheduler._pdflip_vision_d_rows(self, req, bound, int(covered)):
+                req._pdflip_vision_need = _vdg.image_end(req)
+                v = _vdg.verdict(req, covered, tail_start=tail_start, tail_wait=tail_wait)
+        return _vdg.bounded(v, str(req.rid), defers)
+
+    def _pdflip_vision_d_rows(self, req: Req, bound: int, covered: int) -> bool:
+        """VISION-ROWS (D side, ``pdflip/vision_row_store.py``): attach the rows of every image of ``req`` that
+        reaches at or past ``bound`` from the shared store P publishes to -- all or none. TP rank 0 reads the files
+        and ONE broadcast hands the same tensors to every rank (no rank reads the directory itself: an eviction
+        between two ranks' reads can never split the group, R11 / Rang-Einigkeit). True when attached."""
+        from flliper.srt.pdflip import vision_d_guard as _vdg
+        from flliper.srt.pdflip import vision_row_store as _vrs
+
+        items = _vdg.items_past(req, bound)
+        if not items:
+            return False
+        if not all(_vrs.per_image(it) for it in _vdg._items(req)):
+            # one item with several offsets sends the whole request down mm_utils' combined path, which looks up
+            # no per-image rows and would ask the tower (replicated input: the same answer on every rank)
+            logger.info("%s MISS rid=%s why=not per-image items -- P-only (W123 + reroute)", _vrs.TAG, req.rid)
+            return False
+        tp = int(getattr(getattr(self, "ps", None), "tp_size", 1) or 1)
+        src = True
+        if tp > 1:
+            tpg = getattr(self, "tp_group", None)
+            if tpg is None:
+                return False
+            src = tpg.rank == tpg.ranks[0]
+        rows = None
+        why = ""
+        if src:
+            try:
+                d = _vrs.store_dir_for(getattr(self, "server_args", None))
+                if d is None:
+                    why = "store off / no content hash"
+                else:
+                    hf = getattr(getattr(self, "model_config", None), "hf_config", None)
+                    vc = getattr(hf, "vision_config", None)
+                    w = getattr(vc, "out_hidden_size", None)
+                    if w is not None:
+                        w = int(w) * (1 + len(getattr(vc, "deepstack_visual_indexes", None) or ()))
+                    rows = _vrs.load(items, d, w)
+                    if rows is None:
+                        why = "rows not published (or count/width differs)"
+            except Exception as exc:  # noqa: BLE001 -- a failed read is no rows, never a dead rank
+                rows, why = None, f"{type(exc).__name__}: {exc}"
+        if tp > 1:
+            payload = {"rows": rows, "why": why} if src else None
+            got = self._form_a_tp_exchange("pdflip-vision-rows/tp<-rows", payload) or {}
+            rows, why = got.get("rows"), str(got.get("why", "") or "")
+        if rows is None:
+            logger.info("%s MISS rid=%s items=%d covered=%d bound=%d why=%s -- the image stays P-only (W123 + "
+                        "reroute through P, SOLL R9)", _vrs.TAG, req.rid, len(items), covered, bound, why)
+            return False
+        try:
+            n = _vrs.attach(items, rows)
+        except Exception as exc:  # noqa: BLE001 -- replicated input, so the same failure on every rank
+            logger.warning("%s REFUSED rid=%s %s: %s", _vrs.TAG, req.rid, type(exc).__name__, exc)
+            return False
+        logger.info("%s HIT rid=%s items=%d rows=%d covered=%d bound=%d image_end=%d (P's tower rows from the "
+                    "shared store: D computes these image positions itself, no tower, no flip -- SOLL R9 only for "
+                    "an image D cannot compute)", _vrs.TAG, req.rid, len(items), n, covered, bound,
+                    max(int(o[1]) + 1 for it in items for o in it.offsets))
+        return True
 
     def _pdflip_answer_vision_d_refusals(self, refused: List[Req], head_inputs=None) -> None:
         """Remove the W123-refused requests and answer them BY NAME -- the
