@@ -1,0 +1,1657 @@
+{
+ "basis": {
+  "kind": "release",
+  "name": "27b",
+  "profil": {
+   "draft": "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-DFlash2-W8-lued",
+   "file_sha256": "259ce8a4cdb1204b3db218e11ff2790f91a768bd80dfaff9373f91338b5c70e0",
+   "input_sha256": "047ecc20d4be4fee1a09ab94f9def773ab7f57d0d99a1e6fd4e23533101dce5c",
+   "model": "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-INT8-gdncov-vocabembed",
+   "name": "27b",
+   "proposal_sha256": "71d062915774a8a7b8c9ee18062ea23a542215f51fc831e77ad7cda507aeea72",
+   "quelle": "27b.env",
+   "rolle": "basis",
+   "status": "abgenommen"
+  },
+  "sha256": "259ce8a4cdb1204b3db218e11ff2790f91a768bd80dfaff9373f91338b5c70e0"
+ },
+ "form": "flip",
+ "launch": {
+  "argv": [
+   "--pdflip-weight-source",
+   "exchange",
+   "--pdflip-xchg-census",
+   "/spinning/gpu-arb/weg2/census/xchg_census_weg2xsn246_27198a2711.json",
+   "--pdflip-xchg-oncard",
+   "host",
+   "--pdflip-vision",
+   "transient",
+   "--user-reserve-mib",
+   "1400,1400,1400",
+   "--store-max-gb",
+   "150",
+   "--max-kv-per-request",
+   "262144",
+   "--xchg-bounce-depth",
+   "1",
+   "--pin-ledger-arm-m",
+   "600",
+   "--host-ledger-deviation",
+   "1424e-ratchet-37gib-aus-xsn177-war-ganzarena-pinning-seit-1424e-je-slot",
+   "--host-riegel-gib",
+   "93.0",
+   "--pdflip-xchg-legs",
+   "both",
+   "--pdflip-xchg-inject",
+   "authoritative",
+   "--p-bs",
+   "1",
+   "--extra-p=--max-running-requests=2",
+   "--pdflip-weights-cpu-backup",
+   "off",
+   "--spec-form",
+   "DFLASH",
+   "--d-tp-objective",
+   "maxkv",
+   "--p-hostgap",
+   "--d-replayssm-spec",
+   "on",
+   "--p-prefill-graph-split",
+   "7",
+   "--tp-prefill-max-tokens",
+   "4096",
+   "--x-ceiling-tokens",
+   "12288",
+   "--pdflip-vision-place",
+   "weights",
+   "--idle-layout",
+   "pp",
+   "--d-hold-s",
+   "10",
+   "--d-short-drain-tokens",
+   "4096",
+   "--p-chunk-policy",
+   "dynamic",
+   "--p-chunk-max",
+   "2048",
+   "--p-chunk-model",
+   "builtin-int8",
+   "--p-chunk-mscale",
+   "int8",
+   "--d-reshard",
+   "off",
+   "--d-token-placement",
+   "bandwidth",
+   "--env-d",
+   "FLLIPER_PDFLIP_EXTEND_TRIM_MIB=0,0,0",
+   "--model",
+   "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-INT8-gdncov-vocabembed"
+  ],
+  "env": {
+   "FLLIPER_BARLINK_BAR1_ABORT_MAX_LAG": "64",
+   "FLLIPER_HICACHE_ARENA_LOAD_BLOCK_QUOTA": "16",
+   "FLLIPER_HICACHE_ARENA_MAMBA_SLOTS": "112",
+   "FLLIPER_HICACHE_ARENA_PREPIN": "1",
+   "FLLIPER_HICACHE_ARENA_QUEUE_REFS": "1",
+   "FLLIPER_HICACHE_DRAIN_BUDGET": "16384",
+   "FLLIPER_PDFLIP_DENSE_REPACK_OUTSIDE_POOL": "1",
+   "FLLIPER_PDFLIP_ENABLE_D_IDLE_PUBLISH": "1",
+   "FLLIPER_PDFLIP_ENABLE_FLUSH_QUIESCE_NONBLOCK": "1",
+   "FLLIPER_PDFLIP_ENABLE_PAUSE_COALESCE_UNMAP": "1",
+   "FLLIPER_PDFLIP_ENABLE_P_ANCHOR_PRESENCE": "1",
+   "FLLIPER_PDFLIP_ENABLE_SLEEP_PAUSE_OVERLAP": "1",
+   "FLLIPER_PDFLIP_FLUSH_NONBLOCK_GROUPS": "D",
+   "FLLIPER_PDFLIP_L15": "1",
+   "FLLIPER_PDFLIP_L15_HOT_SHARE": "1",
+   "FLLIPER_PDFLIP_L15_MIB": "c1=1792,c2=1792",
+   "FLLIPER_PDFLIP_L15_REFILL": "1",
+   "FLLIPER_PDFLIP_MAMBA_ANCHOR_INTERVAL": "4096",
+   "FLLIPER_PDFLIP_MAMBA_INNER_ANCHOR_RELEASE": "1",
+   "FLLIPER_PDFLIP_MAMBA_MAX_STATES_PER_PATH": "4",
+   "FLLIPER_PDFLIP_SEQ_SYNC_BATCH_MIB": "256",
+   "FLLIPER_PDFLIP_SEQ_SYNC_BATCH_UNITS": "128",
+   "FLLIPER_PDFLIP_SLEEP_PAUSE_OVERLAP_GROUPS": "D",
+   "FLLIPER_PDFLIP_STORE_SHORT_TAIL": "1",
+   "FLLIPER_PDFLIP_VISION_FLIP_URGENT": "1",
+   "FLLIPER_PDFLIP_VMM_EXPORTABLE": "1",
+   "HTSGLANG_INSTRUMENTS": "0",
+   "HTSGLANG_TAG": "plangate",
+   "NCCL_BUFFSIZE": "1048576",
+   "NCCL_MAX_NCHANNELS": "8"
+  }
+ },
+ "n": 3,
+ "nicht_uebernommen": [],
+ "notes": [
+  "Synthetic cards from the catalog (datasheet, synthetic UUID): what the launcher binds to card UUIDs (census) does not know them."
+ ],
+ "ok": true,
+ "oracle": {
+  "cache_key": "59d2cde4ee9fe3d9",
+  "cached": false,
+  "duration_s": 34.27,
+  "version": {
+   "hw_fit": "4896e1cfe0b97ae5",
+   "launcher": "7368c4a1a081a868",
+   "propose_oracle": "8af4b0b24e9bb2c9",
+   "refusals": "4d580c430d114481",
+   "topology": "41e859db94f603d8"
+  }
+ },
+ "proposal": {
+  "basis": "27b.env",
+  "blocker": [],
+  "cards": [
+   {
+    "arch": "sm86",
+    "class": "RTX3090/24576MiB/sm86",
+    "name": "NVIDIA GeForce RTX 3090",
+    "nvml_index": 0,
+    "ordinal": 0,
+    "tflops": 142.0,
+    "tflops_src": "datasheet/unverified (FP16 peak)",
+    "total_mib": 24576,
+    "uuid": "GPU-bc784195-d4ab-24c3-3f19-a7bdf61206f7"
+   },
+   {
+    "arch": "sm86",
+    "class": "RTX3090/24576MiB/sm86",
+    "name": "NVIDIA GeForce RTX 3090",
+    "nvml_index": 1,
+    "ordinal": 1,
+    "tflops": 142.0,
+    "tflops_src": "datasheet/unverified (FP16 peak)",
+    "total_mib": 24576,
+    "uuid": "GPU-1f1365a0-a6eb-80a3-2649-ef08c03426df"
+   },
+   {
+    "arch": "sm86",
+    "class": "RTX3090/24576MiB/sm86",
+    "name": "NVIDIA GeForce RTX 3090",
+    "nvml_index": 2,
+    "ordinal": 2,
+    "tflops": 142.0,
+    "tflops_src": "datasheet/unverified (FP16 peak)",
+    "total_mib": 24576,
+    "uuid": "GPU-f397733d-4c09-e6fa-e0db-8d7e51a6be74"
+   }
+  ],
+  "dual": null,
+  "fit": {
+   "first": "",
+   "level": "ja",
+   "lines": [],
+   "margin_mib": 25436.856,
+   "marks": [
+    "D context (foreign + non-torch): no vector in the launch argv, 0 MiB assumed (UNVERIFIED)",
+    "HW-BORROWED/unverified: P-Residuum RTX3090 <- RTX3080 2968 MiB",
+    "P_ACTIVATION_MIB: no record in 'qwen27b' (post not modelled)"
+   ]
+  },
+  "form": "flip",
+  "goals": {
+   "kv_dtype": "fp8_e4m3",
+   "kv_tokens": 262144,
+   "p_cut": "auto",
+   "seats": 6
+  },
+  "inventory": {
+   "live": [
+    "RTX3090/24576MiB/sm86",
+    "RTX3090/24576MiB/sm86",
+    "RTX3090/24576MiB/sm86"
+   ],
+   "profil": [
+    "RTX5090",
+    "RTX3080",
+    "RTX3080"
+   ],
+   "same_as_profile": false
+  },
+  "n": 3,
+  "notes": [
+   "Draft (dense, TP-symmetric D, planner estimate): per rank (weights 26895 + draft 2072 + KV obligation 8704 + Mamba 2843) / 3 = 13505 MiB against the D budgets 21608,21608,21608 MiB: smallest margin 8103 MiB (fits); the launcher prices the real D layout"
+  ],
+  "schema": "flliper.propose-a/1",
+  "seeds": {
+   "dense_d_shares": [
+    0.3333,
+    0.3333,
+    0.3333
+   ],
+   "draft": {
+    "budget_mib": 21608,
+    "margin_mib": -18906.7733,
+    "need_mib": 40514.7733,
+    "placement": "split",
+    "why": "Draft 2072 + dense weights 26895 + KV obligation 8704 + Mamba state 2843 = 40515 MiB; budget of rank 0 21608 MiB: does not fit (margin -18907 MiB)"
+   },
+   "form_a": null,
+   "fr_p": [],
+   "p_cut": {
+    "attn": [
+     5,
+     5,
+     6
+    ],
+    "basis": "datasheet/unverified: FP16 peak rate per card (no measured rate)",
+    "caps": [
+     39,
+     41,
+     32
+    ],
+    "gesetzt": false,
+    "layers": [
+     22,
+     21,
+     21
+    ]
+   }
+  },
+  "unverified": [
+   "GEMM rates: datasheet/unverified: FP16 peak rate per card (no measured rate)",
+   "--user-reserve-mib: Class maximum of the profile measurement 27b.env [RTX5090,RTX3080,RTX3080] -> [RTX3090/24576MiB/sm86,RTX3090/24576MiB/sm86,RTX3090/24576MiB/sm86]: borrowed: RTX3080 (unverified); borrowed: RTX3080 (unverified); borrowed: RTX3080 (unverified)",
+   "--env-d FLLIPER_PDFLIP_EXTEND_TRIM_MIB: Class maximum of the profile measurement 27b.env [RTX5090,RTX3080,RTX3080] -> [RTX3090/24576MiB/sm86,RTX3090/24576MiB/sm86,RTX3090/24576MiB/sm86]: borrowed: RTX3080 (unverified); borrowed: RTX3080 (unverified); borrowed: RTX3080 (unverified)",
+   "env FLLIPER_PDFLIP_L15_MIB: Rule for the cards [RTX3090/24576MiB/sm86,RTX3090/24576MiB/sm86,RTX3090/24576MiB/sm86] (profile 27b.env was written for [RTX5090,RTX3080,RTX3080])",
+   "D context per card: no --d-foreign-context-mib/--d-nontorch-mib in the profile for this inventory",
+   "--pp-stage-ratio (Seed): Rule: P cut by GEMM rate; rate: datasheet/unverified: FP16 peak rate per card (no measured rate)"
+  ],
+  "vector_lengths": {
+   "--env-d FLLIPER_PDFLIP_EXTEND_TRIM_MIB": 3,
+   "--user-reserve-mib": 3
+  },
+  "vectors_ok": true,
+  "vectors_wrong": {},
+  "vision": {
+   "aktiv": true,
+   "form": "flip",
+   "host_mib": 878.8,
+   "host_posten": {
+    "detail": "The victim bytes (= the tower bytes) wait in an anonymous pageable host image while the tower is up; allocated per image, freed after the give-back (0 afterwards). Host RAM is a warning only, never a refusal (user rule 2026-10-06).",
+    "gerechnet": true,
+    "label": "Displaced weights, temporary (host)",
+    "mib": 878.8,
+    "nach_rueckholung_mib": 0.0,
+    "name": "vision_victim_host",
+    "transient": true
+   },
+   "opferart": "dense",
+   "place": "weights",
+   "resident_mib": 0.0,
+   "schema": "flliper.vision-victim/1",
+   "turm_mib": 878.8,
+   "turm_quelle": "model profile weights.visual_bytes (safetensors index)",
+   "verdict": {
+    "code": "W105b",
+    "rest_mib": 4732.9,
+    "stage": "ja",
+    "text": "W105b PdFlipVisionVictimShort: not triggered, the victims (MLP storages of the PP0 stage (27B flip)) hold 5611.7 MiB, the tower needs 878.8 MiB (rest 4732.9 MiB)",
+    "turm_mib": 878.8,
+    "verfuegbar_mib": 5611.7
+   },
+   "verfuegbar_mib": 5611.7,
+   "verfuegbar_quelle": "MLP bytes of the model profile (per_role_bytes.mlp) / 64 layers x 22 layers of stage 0 (mean per layer: approximation)",
+   "vision": "transient",
+   "vision_transient": {
+    "detail": "Victim weights of PP0 (dense) the tower is mapped onto while an image is encoded; the victims are weights that are already counted, so this adds 0 MiB resident and nothing to the sum of the weights. At least the tower bytes: moved bytes = tower bytes (plan section 2).",
+    "gerechnet": true,
+    "in_summe": false,
+    "label": "Vision transient",
+    "mib": 878.8,
+    "name": "vision_transient",
+    "resident_mib": 0.0,
+    "source": "model profile weights.visual_bytes (safetensors index)",
+    "transient": true
+   }
+  }
+ },
+ "schema": "flliper.propose-d/1",
+ "startprofil": {
+  "doc": {
+   "args": [
+    {
+     "flag": "--pdflip-weight-source",
+     "values": [
+      "exchange"
+     ]
+    },
+    {
+     "flag": "--pdflip-xchg-census",
+     "values": [
+      "/opt/htsglang/profiles/27b/xchg_census_weg2xsn246_27198a2711.json"
+     ]
+    },
+    {
+     "flag": "--pdflip-xchg-oncard",
+     "values": [
+      "host"
+     ]
+    },
+    {
+     "flag": "--pdflip-vision",
+     "values": [
+      "transient"
+     ]
+    },
+    {
+     "flag": "--user-reserve-mib",
+     "values": [
+      "1400,1400,1400"
+     ]
+    },
+    {
+     "flag": "--store-max-gb",
+     "values": [
+      "150"
+     ]
+    },
+    {
+     "flag": "--max-kv-per-request",
+     "values": [
+      "262144"
+     ]
+    },
+    {
+     "flag": "--xchg-bounce-depth",
+     "values": [
+      "1"
+     ]
+    },
+    {
+     "flag": "--pin-ledger-arm-m",
+     "values": [
+      "600"
+     ]
+    },
+    {
+     "flag": "--host-ledger-deviation",
+     "values": [
+      "1424e-ratchet-37gib-aus-xsn177-war-ganzarena-pinning-seit-1424e-je-slot"
+     ]
+    },
+    {
+     "flag": "--host-riegel-gib",
+     "values": [
+      "93.0"
+     ]
+    },
+    {
+     "flag": "--pdflip-xchg-legs",
+     "values": [
+      "both"
+     ]
+    },
+    {
+     "flag": "--pdflip-xchg-inject",
+     "values": [
+      "authoritative"
+     ]
+    },
+    {
+     "flag": "--p-bs",
+     "values": [
+      "1"
+     ]
+    },
+    {
+     "eq": true,
+     "flag": "--extra-p",
+     "values": [
+      "--max-running-requests=2"
+     ]
+    },
+    {
+     "flag": "--pdflip-weights-cpu-backup",
+     "values": [
+      "off"
+     ]
+    },
+    {
+     "flag": "--spec-form",
+     "values": [
+      "DFLASH"
+     ]
+    },
+    {
+     "flag": "--d-tp-objective",
+     "values": [
+      "maxkv"
+     ]
+    },
+    {
+     "flag": "--p-hostgap",
+     "values": []
+    },
+    {
+     "flag": "--d-replayssm-spec",
+     "values": [
+      "on"
+     ]
+    },
+    {
+     "flag": "--p-prefill-graph-split",
+     "values": [
+      "7"
+     ]
+    },
+    {
+     "flag": "--tp-prefill-max-tokens",
+     "values": [
+      "4096"
+     ]
+    },
+    {
+     "flag": "--x-ceiling-tokens",
+     "values": [
+      "12288"
+     ]
+    },
+    {
+     "flag": "--pdflip-vision-place",
+     "values": [
+      "weights"
+     ]
+    },
+    {
+     "flag": "--idle-layout",
+     "values": [
+      "pp"
+     ]
+    },
+    {
+     "flag": "--d-hold-s",
+     "values": [
+      "10"
+     ]
+    },
+    {
+     "flag": "--d-short-drain-tokens",
+     "values": [
+      "4096"
+     ]
+    },
+    {
+     "flag": "--p-chunk-policy",
+     "values": [
+      "dynamic"
+     ]
+    },
+    {
+     "flag": "--p-chunk-max",
+     "values": [
+      "2048"
+     ]
+    },
+    {
+     "flag": "--p-chunk-model",
+     "values": [
+      "builtin-int8"
+     ]
+    },
+    {
+     "flag": "--p-chunk-mscale",
+     "values": [
+      "int8"
+     ]
+    },
+    {
+     "flag": "--d-reshard",
+     "values": [
+      "off"
+     ]
+    },
+    {
+     "flag": "--d-token-placement",
+     "values": [
+      "bandwidth"
+     ]
+    },
+    {
+     "flag": "--env-d",
+     "values": [
+      "FLLIPER_PDFLIP_EXTEND_TRIM_MIB=0,0,0"
+     ]
+    },
+    {
+     "flag": "--model",
+     "values": [
+      "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-INT8-gdncov-vocabembed"
+     ]
+    }
+   ],
+   "exports": [
+    {
+     "name": "FLLIPER_PDFLIP_L15_MIB",
+     "value": "c1=1792,c2=1792"
+    }
+   ],
+   "form": [
+    {
+     "name": "FLLIPER_HICACHE_ARENA_PREPIN",
+     "value": "1"
+    },
+    {
+     "name": "FLLIPER_HICACHE_ARENA_MAMBA_SLOTS",
+     "value": "112"
+    },
+    {
+     "name": "FLLIPER_PDFLIP_MAMBA_INNER_ANCHOR_RELEASE",
+     "value": "1"
+    },
+    {
+     "name": "FLLIPER_BARLINK_BAR1_ABORT_MAX_LAG",
+     "value": "64"
+    },
+    {
+     "name": "FLLIPER_PDFLIP_MAMBA_ANCHOR_INTERVAL",
+     "value": "4096"
+    },
+    {
+     "name": "FLLIPER_PDFLIP_MAMBA_MAX_STATES_PER_PATH",
+     "value": "4"
+    },
+    {
+     "name": "FLLIPER_PDFLIP_DENSE_REPACK_OUTSIDE_POOL",
+     "value": "1"
+    },
+    {
+     "name": "FLLIPER_HICACHE_DRAIN_BUDGET",
+     "value": "16384"
+    },
+    {
+     "name": "FLLIPER_HICACHE_ARENA_QUEUE_REFS",
+     "value": "1"
+    },
+    {
+     "name": "FLLIPER_PDFLIP_SEQ_SYNC_BATCH_MIB",
+     "value": "256"
+    },
+    {
+     "name": "FLLIPER_PDFLIP_SEQ_SYNC_BATCH_UNITS",
+     "value": "128"
+    },
+    {
+     "name": "FLLIPER_HICACHE_ARENA_LOAD_BLOCK_QUOTA",
+     "value": "16"
+    },
+    {
+     "name": "NCCL_BUFFSIZE",
+     "value": "1048576"
+    },
+    {
+     "name": "NCCL_MAX_NCHANNELS",
+     "value": "8"
+    },
+    {
+     "name": "FLLIPER_PDFLIP_VISION_FLIP_URGENT",
+     "value": "1"
+    },
+    {
+     "name": "FLLIPER_PDFLIP_STORE_SHORT_TAIL",
+     "value": "1"
+    },
+    {
+     "name": "FLLIPER_PDFLIP_ENABLE_SLEEP_PAUSE_OVERLAP",
+     "value": "1"
+    },
+    {
+     "name": "FLLIPER_PDFLIP_SLEEP_PAUSE_OVERLAP_GROUPS",
+     "value": "D"
+    },
+    {
+     "name": "FLLIPER_PDFLIP_ENABLE_PAUSE_COALESCE_UNMAP",
+     "value": "1"
+    },
+    {
+     "name": "FLLIPER_PDFLIP_ENABLE_D_IDLE_PUBLISH",
+     "value": "1"
+    },
+    {
+     "name": "FLLIPER_PDFLIP_ENABLE_FLUSH_QUIESCE_NONBLOCK",
+     "value": "1"
+    },
+    {
+     "name": "FLLIPER_PDFLIP_FLUSH_NONBLOCK_GROUPS",
+     "value": "D"
+    },
+    {
+     "name": "FLLIPER_PDFLIP_ENABLE_P_ANCHOR_PRESENCE",
+     "value": "1"
+    },
+    {
+     "name": "FLLIPER_PDFLIP_L15",
+     "value": "1"
+    },
+    {
+     "name": "FLLIPER_PDFLIP_L15_REFILL",
+     "value": "1"
+    },
+    {
+     "name": "FLLIPER_PDFLIP_L15_HOT_SHARE",
+     "value": "1"
+    },
+    {
+     "name": "FLLIPER_PDFLIP_VMM_EXPORTABLE",
+     "value": "1"
+    },
+    {
+     "name": "FLLIPER_PDFLIP_L15_MIB",
+     "value": "c1=7616,c2=1792"
+    }
+   ],
+   "id": "sha256:87b9d347fad76fe97516305963e20f79d30415eba242aa1e1cd1026278d46ebf",
+   "instr": [
+    {
+     "name": "FLLIPER_HICACHE_ROUND_TIMING",
+     "value": "512"
+    },
+    {
+     "name": "FLLIPER_PDFLIP_D_HOSTGAP",
+     "value": "512"
+    },
+    {
+     "name": "FLLIPER_HICACHE_ARENA_REF_CENSUS_S",
+     "value": "60"
+    },
+    {
+     "name": "FLLIPER_DFLASH_PHASE_TIMING",
+     "value": "${FLLIPER_PDFLIP_EVIDENCE_DIR}/dflash_phase_${HTSGLANG_TAG}"
+    },
+    {
+     "name": "FLLIPER_DEBUG_DFLASH_SYNC_TRACE",
+     "value": "20"
+    }
+   ],
+   "line": "27b",
+   "meta": {
+    "caller_switches": [
+     "FLLIPER_PDFLIP_EVIDENCE_DIR",
+     "HTSGLANG_P_CHUNK_POLICY",
+     "HTSGLANG_P_TRIM",
+     "HTSGLANG_RC10_D_PLACE"
+    ],
+    "notes": [
+     "Planner server profile from 27b (259ce8a4cdb1) for 3 cards, form flip"
+    ],
+    "origins": {
+     "env:D:FLLIPER_PDFLIP_EXTEND_TRIM_MIB": "planer",
+     "export:FLLIPER_PDFLIP_L15_MIB": "planer",
+     "flag:--d-reshard": "planer",
+     "flag:--d-reshard-presets": "planer",
+     "flag:--d-tp-objective": "planer",
+     "flag:--user-reserve-mib": "planer"
+    },
+    "planner": {
+     "env:D:FLLIPER_PDFLIP_EXTEND_TRIM_MIB": "0,0,0",
+     "export:FLLIPER_PDFLIP_L15_MIB": "c1=1792,c2=1792",
+     "flag:--d-reshard": "off",
+     "flag:--d-tp-objective": "maxkv",
+     "flag:--pp-stage-ratio": "22,21,21",
+     "flag:--user-reserve-mib": "1400,1400,1400"
+    },
+    "profile_values": {
+     "env:D:FLLIPER_PDFLIP_EXTEND_TRIM_MIB": "1200,0,0",
+     "extra:P:--max-running-requests": "2",
+     "flag:--d-hold-s": "10",
+     "flag:--d-replayssm-spec": "on",
+     "flag:--d-reshard": "wake-seg",
+     "flag:--d-reshard-presets": "drq=652:218:218",
+     "flag:--d-short-drain-tokens": "4096",
+     "flag:--d-token-placement": "bandwidth",
+     "flag:--d-tp-objective": "decode-bs1",
+     "flag:--host-ledger-deviation": "1424e-ratchet-37gib-aus-xsn177-war-ganzarena-pinning-seit-1424e-je-slot",
+     "flag:--host-riegel-gib": "93.0",
+     "flag:--idle-layout": "pp",
+     "flag:--max-kv-per-request": "262144",
+     "flag:--model": "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-INT8-gdncov-vocabembed",
+     "flag:--p-bs": "1",
+     "flag:--p-chunk-max": "2048",
+     "flag:--p-chunk-model": "builtin-int8",
+     "flag:--p-chunk-mscale": "int8",
+     "flag:--p-chunk-policy": "dynamic",
+     "flag:--p-hostgap": "",
+     "flag:--p-prefill-graph-split": "7",
+     "flag:--pdflip-vision": "transient",
+     "flag:--pdflip-vision-place": "weights",
+     "flag:--pdflip-weight-source": "exchange",
+     "flag:--pdflip-weights-cpu-backup": "off",
+     "flag:--pdflip-xchg-census": "/opt/htsglang/profiles/27b/xchg_census_weg2xsn246_27198a2711.json",
+     "flag:--pdflip-xchg-inject": "authoritative",
+     "flag:--pdflip-xchg-legs": "both",
+     "flag:--pdflip-xchg-oncard": "host",
+     "flag:--pin-ledger-arm-m": "600",
+     "flag:--spec-form": "DFLASH",
+     "flag:--store-max-gb": "150",
+     "flag:--tp-prefill-max-tokens": "4096",
+     "flag:--user-reserve-mib": "1800,1400,1400",
+     "flag:--x-ceiling-tokens": "12288",
+     "flag:--xchg-bounce-depth": "1",
+     "form:FLLIPER_BARLINK_BAR1_ABORT_MAX_LAG": "64",
+     "form:FLLIPER_HICACHE_ARENA_LOAD_BLOCK_QUOTA": "16",
+     "form:FLLIPER_HICACHE_ARENA_MAMBA_SLOTS": "112",
+     "form:FLLIPER_HICACHE_ARENA_PREPIN": "1",
+     "form:FLLIPER_HICACHE_ARENA_QUEUE_REFS": "1",
+     "form:FLLIPER_HICACHE_DRAIN_BUDGET": "16384",
+     "form:FLLIPER_PDFLIP_DENSE_REPACK_OUTSIDE_POOL": "1",
+     "form:FLLIPER_PDFLIP_ENABLE_D_IDLE_PUBLISH": "1",
+     "form:FLLIPER_PDFLIP_ENABLE_FLUSH_QUIESCE_NONBLOCK": "1",
+     "form:FLLIPER_PDFLIP_ENABLE_PAUSE_COALESCE_UNMAP": "1",
+     "form:FLLIPER_PDFLIP_ENABLE_P_ANCHOR_PRESENCE": "1",
+     "form:FLLIPER_PDFLIP_ENABLE_SLEEP_PAUSE_OVERLAP": "1",
+     "form:FLLIPER_PDFLIP_FLUSH_NONBLOCK_GROUPS": "D",
+     "form:FLLIPER_PDFLIP_L15": "1",
+     "form:FLLIPER_PDFLIP_L15_HOT_SHARE": "1",
+     "form:FLLIPER_PDFLIP_L15_MIB": "c1=7616,c2=1792",
+     "form:FLLIPER_PDFLIP_L15_REFILL": "1",
+     "form:FLLIPER_PDFLIP_MAMBA_ANCHOR_INTERVAL": "4096",
+     "form:FLLIPER_PDFLIP_MAMBA_INNER_ANCHOR_RELEASE": "1",
+     "form:FLLIPER_PDFLIP_MAMBA_MAX_STATES_PER_PATH": "4",
+     "form:FLLIPER_PDFLIP_SEQ_SYNC_BATCH_MIB": "256",
+     "form:FLLIPER_PDFLIP_SEQ_SYNC_BATCH_UNITS": "128",
+     "form:FLLIPER_PDFLIP_SLEEP_PAUSE_OVERLAP_GROUPS": "D",
+     "form:FLLIPER_PDFLIP_STORE_SHORT_TAIL": "1",
+     "form:FLLIPER_PDFLIP_VISION_FLIP_URGENT": "1",
+     "form:FLLIPER_PDFLIP_VMM_EXPORTABLE": "1",
+     "form:NCCL_BUFFSIZE": "1048576",
+     "form:NCCL_MAX_NCHANNELS": "8",
+     "instr:FLLIPER_DEBUG_DFLASH_SYNC_TRACE": "20",
+     "instr:FLLIPER_DFLASH_PHASE_TIMING": "${FLLIPER_PDFLIP_EVIDENCE_DIR}/dflash_phase_${HTSGLANG_TAG}",
+     "instr:FLLIPER_HICACHE_ARENA_REF_CENSUS_S": "60",
+     "instr:FLLIPER_HICACHE_ROUND_TIMING": "512",
+     "instr:FLLIPER_PDFLIP_D_HOSTGAP": "512",
+     "var:PROFILE_CARD_COUNT": "3",
+     "var:PROFILE_CENSUS": "/opt/htsglang/profiles/27b/xchg_census_weg2xsn246_27198a2711.json",
+     "var:PROFILE_DRAFT": "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-DFlash2-W8-lued",
+     "var:PROFILE_FORM": "rc2final+rc10+prefix+rowauth",
+     "var:PROFILE_FORMAT": "int8",
+     "var:PROFILE_GPUS": "NVIDIA GeForce RTX 5090=1;NVIDIA GeForce RTX 3080=2",
+     "var:PROFILE_INVENTORY": "RTX5090,RTX3080,RTX3080",
+     "var:PROFILE_LINE": "27b",
+     "var:PROFILE_MEMAVAIL_MIN_GIB": "78",
+     "var:PROFILE_MODEL": "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-INT8-gdncov-vocabembed",
+     "var:PROFILE_NAME": "27b",
+     "var:PROFILE_NCCL_STATUS": "unproven",
+     "var:PROFILE_OWNER": "27B-Sitz (E4 28.09.: Release 27b = 27b-release-draft + Fix B; Basis 27b-base)",
+     "var:PROFILE_P_CHUNK": "dynamic",
+     "var:PROFILE_P_CHUNK_BEST": "dynamic",
+     "var:PROFILE_P_TRIM": "1",
+     "var:PROFILE_P_TRIM_BEST": "1",
+     "var:PROFILE_RC10_D_PLACE": "drq",
+     "var:PROFILE_RC10_D_PLACE_BEST": "drq",
+     "var:PROFILE_SHM_MIN_GIB": "40",
+     "var:PROFILE_STATUS": "abgenommen"
+    },
+    "proposal": {
+     "argv_sha256": "71d062915774a8a7b8c9ee18062ea23a542215f51fc831e77ad7cda507aeea72",
+     "basis": [
+      "release",
+      "27b"
+     ],
+     "basis_sha256": "259ce8a4cdb1204b3db218e11ff2790f91a768bd80dfaff9373f91338b5c70e0",
+     "form": "flip",
+     "goals": {
+      "kv_dtype": "fp8_e4m3",
+      "kv_tokens": 262144,
+      "p_cut": "auto",
+      "seats": 6
+     },
+     "n": 3,
+     "outcome": "ok_with_force",
+     "schema": "flliper.propose-d/1"
+    }
+   },
+   "name": "27b-proposal",
+   "schema": "flliper.server/1",
+   "source": {
+    "file": "27b.env",
+    "kind": "env",
+    "rc": "0",
+    "sha256": "sha256:259ce8a4cdb1204b3db218e11ff2790f91a768bd80dfaff9373f91338b5c70e0"
+   },
+   "vars": [
+    {
+     "name": "PROFILE_CARD_COUNT",
+     "value": "3"
+    },
+    {
+     "name": "PROFILE_CENSUS",
+     "value": "/opt/htsglang/profiles/27b/xchg_census_weg2xsn246_27198a2711.json"
+    },
+    {
+     "name": "PROFILE_DRAFT",
+     "value": "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-DFlash2-W8-lued"
+    },
+    {
+     "name": "PROFILE_FORM",
+     "value": "rc2final+rc10+prefix+rowauth"
+    },
+    {
+     "name": "PROFILE_FORMAT",
+     "value": "int8"
+    },
+    {
+     "name": "PROFILE_GPUS",
+     "value": "NVIDIA GeForce RTX 5090=1;NVIDIA GeForce RTX 3080=2"
+    },
+    {
+     "name": "PROFILE_INVENTORY",
+     "value": "RTX5090,RTX3080,RTX3080"
+    },
+    {
+     "name": "PROFILE_LINE",
+     "value": "27b"
+    },
+    {
+     "name": "PROFILE_MEMAVAIL_MIN_GIB",
+     "value": "78"
+    },
+    {
+     "name": "PROFILE_MODEL",
+     "value": "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-INT8-gdncov-vocabembed"
+    },
+    {
+     "name": "PROFILE_NAME",
+     "value": "27b"
+    },
+    {
+     "name": "PROFILE_NCCL_STATUS",
+     "value": "unproven"
+    },
+    {
+     "name": "PROFILE_OWNER",
+     "value": "27B-Sitz (E4 28.09.: Release 27b = 27b-release-draft + Fix B; Basis 27b-base)"
+    },
+    {
+     "name": "PROFILE_P_CHUNK",
+     "value": "dynamic"
+    },
+    {
+     "name": "PROFILE_P_CHUNK_BEST",
+     "value": "dynamic"
+    },
+    {
+     "name": "PROFILE_P_TRIM",
+     "value": "1"
+    },
+    {
+     "name": "PROFILE_P_TRIM_BEST",
+     "value": "1"
+    },
+    {
+     "name": "PROFILE_RC10_D_PLACE",
+     "value": "drq"
+    },
+    {
+     "name": "PROFILE_RC10_D_PLACE_BEST",
+     "value": "drq"
+    },
+    {
+     "name": "PROFILE_SHM_MIN_GIB",
+     "value": "40"
+    },
+    {
+     "name": "PROFILE_STATUS",
+     "value": "abgenommen"
+    }
+   ]
+  },
+  "line": "27b",
+  "name": "27b-proposal",
+  "probleme": [],
+  "schema": "flliper.server/1",
+  "verifiziert": true
+ },
+ "values": [
+  {
+   "alt": "1800,1400,1400",
+   "changed": true,
+   "entries": 3,
+   "in_argv": true,
+   "key": "flag:--user-reserve-mib",
+   "label": "--user-reserve-mib",
+   "reason": "per card the maximum of the measured entries of its OWN class (conservative); a card without a twin in the measurement borrows the value of its arch class and is unverified",
+   "source": "Class maximum of the profile measurement 27b.env [RTX5090,RTX3080,RTX3080] -> [RTX3090/24576MiB/sm86,RTX3090/24576MiB/sm86,RTX3090/24576MiB/sm86]: borrowed: RTX3080 (unverified); borrowed: RTX3080 (unverified); borrowed: RTX3080 (unverified)",
+   "state": "unverified",
+   "value": "1400,1400,1400",
+   "verdikte": [
+    {
+     "code": "HW-UNCALIBRATED"
+    },
+    {
+     "code": "HW-BORROWED"
+    }
+   ]
+  },
+  {
+   "alt": "1200,0,0",
+   "changed": true,
+   "entries": 3,
+   "in_argv": true,
+   "key": "env:D:FLLIPER_PDFLIP_EXTEND_TRIM_MIB",
+   "label": "--env-d FLLIPER_PDFLIP_EXTEND_TRIM_MIB",
+   "reason": "per card the maximum of the measured entries of its OWN class (conservative); a card without a twin in the measurement borrows the value of its arch class and is unverified",
+   "source": "Class maximum of the profile measurement 27b.env [RTX5090,RTX3080,RTX3080] -> [RTX3090/24576MiB/sm86,RTX3090/24576MiB/sm86,RTX3090/24576MiB/sm86]: borrowed: RTX3080 (unverified); borrowed: RTX3080 (unverified); borrowed: RTX3080 (unverified)",
+   "state": "unverified",
+   "value": "0,0,0",
+   "verdikte": [
+    {
+     "code": "HW-UNCALIBRATED"
+    },
+    {
+     "code": "HW-BORROWED"
+    }
+   ]
+  },
+  {
+   "alt": "c1=7616,c2=1792",
+   "changed": true,
+   "entries": 2,
+   "in_argv": true,
+   "key": "export:FLLIPER_PDFLIP_L15_MIB",
+   "label": "env FLLIPER_PDFLIP_L15_MIB",
+   "reason": "L1.5 posts: the refill role (cap 0) as in the profile, the others the smallest named hold of their class (arch twin where the class is not calibrated): c0: cap 0 (role of calibrated c0, the refill rank); c1: RTX3080 1792 MiB (borrowed, arch twin); c2: RTX3080 1792 MiB (borrowed, arch twin); unverified on the hardware (planner calculation)",
+   "source": "Rule for the cards [RTX3090/24576MiB/sm86,RTX3090/24576MiB/sm86,RTX3090/24576MiB/sm86] (profile 27b.env was written for [RTX5090,RTX3080,RTX3080])",
+   "state": "unverified",
+   "value": "c1=1792,c2=1792",
+   "verdikte": [
+    {
+     "code": "HW-BORROWED"
+    }
+   ]
+  },
+  {
+   "alt": null,
+   "changed": true,
+   "entries": 3,
+   "in_argv": false,
+   "in_argv_planer": false,
+   "key": null,
+   "label": "--pp-stage-ratio (Seed)",
+   "profile_value": null,
+   "reason": "Layer cut proportional to the GEMM rate, limited per stage to the memory capacity; attention layers per stage 5,5,6; NOT set: the launcher solves the cut itself (p_cut=pin sets it)",
+   "seed": true,
+   "source": "Rule: P cut by GEMM rate; rate: datasheet/unverified: FP16 peak rate per card (no measured rate)",
+   "state": "unverified",
+   "value": "22,21,21",
+   "verdikte": [
+    {
+     "code": "UNVERIFIED"
+    }
+   ]
+  },
+  {
+   "alt": "wake-seg",
+   "changed": true,
+   "entries": 1,
+   "in_argv": true,
+   "key": "flag:--d-reshard",
+   "label": "--d-reshard",
+   "reason": "--d-reshard moves MLP units between UNEQUAL D ranks and is calibrated on the reference rig's D vector 58,25,25 (d_reshard.RC9_BASE, 5090:3080:3080); the launcher refuses it on any other vector. On 3 identical cards the even split is already the optimum: there is nothing to move.",
+   "source": "Rule for the cards [RTX3090/24576MiB/sm86,RTX3090/24576MiB/sm86,RTX3090/24576MiB/sm86] (profile 27b.env was written for [RTX5090,RTX3080,RTX3080])",
+   "state": "vorgeschlagen",
+   "value": "off",
+   "verdikte": []
+  },
+  {
+   "alt": "drq=652:218:218",
+   "changed": true,
+   "entries": 0,
+   "in_argv": false,
+   "key": "flag:--d-reshard-presets",
+   "label": "--d-reshard-presets",
+   "reason": "presets of the reference rig's MLP split; without --d-reshard they have no reader",
+   "source": "follows --d-reshard off",
+   "state": "vorgeschlagen",
+   "value": null,
+   "verdikte": []
+  },
+  {
+   "alt": "decode-bs1",
+   "changed": true,
+   "entries": 1,
+   "in_argv": true,
+   "key": "flag:--d-tp-objective",
+   "label": "--d-tp-objective",
+   "reason": "decode-bs1 ships the measured rate ratio of the cards; on identical cards that ratio is 1:...:1 whatever the rate, exactly the budget vector maxkv ships for equal budgets -- so the same weights, without the launcher's W61 refusal on a card-rate library that has no measured row for this class yet",
+   "source": "Rule: 3 identical cards [RTX3090/24576MiB/sm86]",
+   "state": "vorgeschlagen",
+   "value": "maxkv",
+   "verdikte": []
+  },
+  {
+   "alt": null,
+   "changed": false,
+   "entries": 0,
+   "in_argv": false,
+   "key": "flag:--pp-solve-pool-floor",
+   "label": "--pp-solve-pool-floor",
+   "reason": "lower bound of the priced KV pool size (in world KV tokens) above which the cut solver ranks; 0 = off; without the flag the launcher default applies (the pool of the ordered 3-stage cut, no bound for another stage count)",
+   "source": "not in profile 27b.env: launcher default",
+   "state": "vorgeschlagen",
+   "value": null,
+   "verdikte": []
+  },
+  {
+   "alt": "12288",
+   "changed": false,
+   "entries": 1,
+   "in_argv": true,
+   "key": "flag:--x-ceiling-tokens",
+   "label": "--x-ceiling-tokens",
+   "reason": "upper bound up to which the front may raise X (tokens from which a request goes to D instead of P) at runtime, and at the same time the bar --tp-prefill-max-tokens of D; 0 = off (D and front keep the start X)",
+   "source": "from profile 27b.env (unchanged; a scalar of the form, no card measurement)",
+   "state": "vorgeschlagen",
+   "value": "12288",
+   "verdikte": []
+  }
+ ],
+ "verdict": {
+  "argv_final_sha256": "b3b54ea4de9c4f09a6b80beca51cfd5c561578bb9fc7fc20b7884120fb95e6eb",
+  "argv_sha256": "71d062915774a8a7b8c9ee18062ea23a542215f51fc831e77ad7cda507aeea72",
+  "forced": [
+   {
+    "code": "HW-UNCALIBRATED",
+    "text": "HW-UNCALIBRATED: profile 'qwen27b' (profile_records_data/qwen27b.json inventory) was measured on the inventory [RTX5090, RTX3080, RTX3080] (card order), this rig is [RTX3090/24576MiB/sm86, RTX3090/24576MiB/sm86, RTX3090/24576MiB/sm86] (ordinal 0: live RTX3090/24576MiB/sm86 vs calibrated RTX5090; ordinal 1: live RTX3090/24576MiB/sm86 vs calibrated RTX3080; ordinal 2: live RTX3090/24576MiB/sm86 vs calibrated RTX3080). Positional measurements of the other inventory are NOT borrowed: DC_MEASURED_D_XCHG_MIB, D_AWAKE_REST_BOOKED_MIB, D_AWAKE_REST_CAPPED_MIB, D_DUAL_ALLOC_CACHE_BOOK_MIB, D_EXTEND_CAP_PER_ROW_MIB, D_OVERSHOOT_MIB, D_TORCH_CAP_OTHER_MIB, MEASURED_MS_PER_LAYER, P_CHUNK_BUILTIN, P_OVERSHOOT_MIB, P_PP_STAGE_FIXED_MIB, P_PP_STAGE_FIXED_YARN2_DELTA_MIB, --user-reserve-mib, FLLIPER_PDFLIP_EXTEND_TRIM_MIB, FLLIPER_PDFLIP_L15_MIB. Measure them on this rig: card_rate_pass --run (GEMM/membw/link rates), then one calibration boot per profile that writes the per-rank records (weg2_measured_record.json, profile_records_data/<profile>.json with this inventory), and a profile whose vectors name this inventory (--profile-inventory)."
+   },
+   {
+    "code": "HW-UNCALIBRATED",
+    "text": "HW-UNCALIBRATED: profile 'qwen27b' positional records measured on [RTX5090, RTX3080, RTX3080] are BORROWED for [RTX3090/24576MiB/sm86, RTX3090/24576MiB/sm86, RTX3090/24576MiB/sm86] (--force): D_AWAKE_REST_BOOKED_MIB, D_AWAKE_REST_CAPPED_MIB, D_DUAL_ALLOC_CACHE_BOOK_MIB, D_EXTEND_CAP_PER_ROW_MIB, D_OVERSHOOT_MIB, D_TORCH_CAP_OTHER_MIB, MEASURED_MS_PER_LAYER, P_OVERSHOOT_MIB, P_PP_STAGE_FIXED_MIB, P_PP_STAGE_FIXED_YARN2_DELTA_MIB -- class-max by card class (a class without a calibrated card: its arch twin), otherwise by stage/rank role (first, middle, last); UNMEASURED here, the first boot on these cards is the measurement (pdflip/inventory_view.py borrow_vector)"
+   },
+   {
+    "code": "HW-UNCALIBRATED",
+    "text": "W19 dormant-residue reserve (HW-UNCALIBRATED): board 'NVIDIA GeForce RTX 3090' (nvml0, RTX3090/24576MiB/sm86) belongs to no calibrated class of DC_MEASURED_D_* / DC_MEASURED_D_XCHG_* (measured on: RTX3080, RTX5090) -- a third card's dormant residue is not a property either of them has.  Measure it, do not borrow it.  --force BORROWS the dormant residue of class RTX3080 (same arch sm86) for this card: UNMEASURED here (HW-UNCALIBRATED)."
+   },
+   {
+    "code": "HW-UNCALIBRATED",
+    "text": "W19 dormant-residue reserve (HW-UNCALIBRATED): board 'NVIDIA GeForce RTX 3090' (nvml1, RTX3090/24576MiB/sm86) belongs to no calibrated class of DC_MEASURED_D_* / DC_MEASURED_D_XCHG_* (measured on: RTX3080, RTX5090) -- a third card's dormant residue is not a property either of them has.  Measure it, do not borrow it.  --force BORROWS the dormant residue of class RTX3080 (same arch sm86) for this card: UNMEASURED here (HW-UNCALIBRATED)."
+   },
+   {
+    "code": "HW-UNCALIBRATED",
+    "text": "W19 dormant-residue reserve (HW-UNCALIBRATED): board 'NVIDIA GeForce RTX 3090' (nvml2, RTX3090/24576MiB/sm86) belongs to no calibrated class of DC_MEASURED_D_* / DC_MEASURED_D_XCHG_* (measured on: RTX3080, RTX5090) -- a third card's dormant residue is not a property either of them has.  Measure it, do not borrow it.  --force BORROWS the dormant residue of class RTX3080 (same arch sm86) for this card: UNMEASURED here (HW-UNCALIBRATED)."
+   },
+   {
+    "code": "HW-BORROWED",
+    "text": "W71 PdFlipXchgResidencyUnarmable: HW-BORROWED: card GPU-bc784195-d4ab-24c3-3f19-a7bdf61206f7 (nvml0 NVIDIA GeForce RTX 3090, class RTX3090/24576MiB/sm86) is not in the census /spinning/gpu-arb/weg2/census/xchg_census_weg2xsn246_27198a2711.json; its row would be BORROWED from census row GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4 (class RTX3080, class read from the reference rig's card registry (planner/power_limit.py RIG_5090 / RIG_3080_NVML0 / RIG_3080_NVML2: UUID + NVML board name)) -- the census has no row of this card class (RTX3090/24576MiB/sm86); the most demanding row of its ARCH TWIN class RTX3080 (same compute capability, the AP1 W19 rule) stands in.  The per-tag bytes and the dormant residue are another card's measurement, applied here as if measured on this one; the serving constants must not stand in -- they contain none of the exchange lane's residency.  Measure this inventory (pdflip/xchg_census.py), name the row with --pdflip-xchg-census-map <live>=<census uuid>, or start with --force"
+   },
+   {
+    "code": "HW-BORROWED",
+    "text": "W71 PdFlipXchgResidencyUnarmable: HW-BORROWED: card GPU-1f1365a0-a6eb-80a3-2649-ef08c03426df (nvml1 NVIDIA GeForce RTX 3090, class RTX3090/24576MiB/sm86) is not in the census /spinning/gpu-arb/weg2/census/xchg_census_weg2xsn246_27198a2711.json; its row would be BORROWED from census row GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4 (class RTX3080, class read from the reference rig's card registry (planner/power_limit.py RIG_5090 / RIG_3080_NVML0 / RIG_3080_NVML2: UUID + NVML board name)) -- the census has no row of this card class (RTX3090/24576MiB/sm86); the most demanding row of its ARCH TWIN class RTX3080 (same compute capability, the AP1 W19 rule) stands in.  The per-tag bytes and the dormant residue are another card's measurement, applied here as if measured on this one; the serving constants must not stand in -- they contain none of the exchange lane's residency.  Measure this inventory (pdflip/xchg_census.py), name the row with --pdflip-xchg-census-map <live>=<census uuid>, or start with --force"
+   },
+   {
+    "code": "HW-BORROWED",
+    "text": "W71 PdFlipXchgResidencyUnarmable: HW-BORROWED: card GPU-f397733d-4c09-e6fa-e0db-8d7e51a6be74 (nvml2 NVIDIA GeForce RTX 3090, class RTX3090/24576MiB/sm86) is not in the census /spinning/gpu-arb/weg2/census/xchg_census_weg2xsn246_27198a2711.json; its row would be BORROWED from census row GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4 (class RTX3080, class read from the reference rig's card registry (planner/power_limit.py RIG_5090 / RIG_3080_NVML0 / RIG_3080_NVML2: UUID + NVML board name)) -- the census has no row of this card class (RTX3090/24576MiB/sm86); the most demanding row of its ARCH TWIN class RTX3080 (same compute capability, the AP1 W19 rule) stands in.  The per-tag bytes and the dormant residue are another card's measurement, applied here as if measured on this one; the serving constants must not stand in -- they contain none of the exchange lane's residency.  Measure this inventory (pdflip/xchg_census.py), name the row with --pdflip-xchg-census-map <live>=<census uuid>, or start with --force"
+   },
+   {
+    "code": "HW-UNCALIBRATED",
+    "text": "HW-UNCALIBRATED: the P-cut deep attention anchor (--pp-cut-attn-anchor-ms, 400 ms/layer) was measured on class RTX3080; no P stage carries that class (RTX3090/24576MiB/sm86, RTX3090/24576MiB/sm86, RTX3090/24576MiB/sm86). Measure the anchor on this rig (a 262k-prefix chunk on the slowest stage) -- not borrowed.  --force BORROWS it onto P stage 1 (RTX3090/24576MiB/sm86), the stage the reference rig measured it on: UNMEASURED on this card (HW-UNCALIBRATED)."
+   }
+  ],
+  "form": "flip",
+  "geht": false,
+  "inventory": [
+   {
+    "cc": [
+     8,
+     6
+    ],
+    "index": 0,
+    "name": "NVIDIA GeForce RTX 3090",
+    "total_mib": 24576
+   },
+   {
+    "cc": [
+     8,
+     6
+    ],
+    "index": 1,
+    "name": "NVIDIA GeForce RTX 3090",
+    "total_mib": 24576
+   },
+   {
+    "cc": [
+     8,
+     6
+    ],
+    "index": 2,
+    "name": "NVIDIA GeForce RTX 3090",
+    "total_mib": 24576
+   }
+  ],
+  "mit_force": {
+   "code": null,
+   "exc_msg": "",
+   "exc_type": null,
+   "exc_where": "",
+   "forced": [
+    {
+     "code": "HW-UNCALIBRATED",
+     "text": "HW-UNCALIBRATED: profile 'qwen27b' (profile_records_data/qwen27b.json inventory) was measured on the inventory [RTX5090, RTX3080, RTX3080] (card order), this rig is [RTX3090/24576MiB/sm86, RTX3090/24576MiB/sm86, RTX3090/24576MiB/sm86] (ordinal 0: live RTX3090/24576MiB/sm86 vs calibrated RTX5090; ordinal 1: live RTX3090/24576MiB/sm86 vs calibrated RTX3080; ordinal 2: live RTX3090/24576MiB/sm86 vs calibrated RTX3080). Positional measurements of the other inventory are NOT borrowed: DC_MEASURED_D_XCHG_MIB, D_AWAKE_REST_BOOKED_MIB, D_AWAKE_REST_CAPPED_MIB, D_DUAL_ALLOC_CACHE_BOOK_MIB, D_EXTEND_CAP_PER_ROW_MIB, D_OVERSHOOT_MIB, D_TORCH_CAP_OTHER_MIB, MEASURED_MS_PER_LAYER, P_CHUNK_BUILTIN, P_OVERSHOOT_MIB, P_PP_STAGE_FIXED_MIB, P_PP_STAGE_FIXED_YARN2_DELTA_MIB, --user-reserve-mib, FLLIPER_PDFLIP_EXTEND_TRIM_MIB, FLLIPER_PDFLIP_L15_MIB. Measure them on this rig: card_rate_pass --run (GEMM/membw/link rates), then one calibration boot per profile that writes the per-rank records (weg2_measured_record.json, profile_records_data/<profile>.json with this inventory), and a profile whose vectors name this inventory (--profile-inventory)."
+    },
+    {
+     "code": "HW-UNCALIBRATED",
+     "text": "HW-UNCALIBRATED: profile 'qwen27b' positional records measured on [RTX5090, RTX3080, RTX3080] are BORROWED for [RTX3090/24576MiB/sm86, RTX3090/24576MiB/sm86, RTX3090/24576MiB/sm86] (--force): D_AWAKE_REST_BOOKED_MIB, D_AWAKE_REST_CAPPED_MIB, D_DUAL_ALLOC_CACHE_BOOK_MIB, D_EXTEND_CAP_PER_ROW_MIB, D_OVERSHOOT_MIB, D_TORCH_CAP_OTHER_MIB, MEASURED_MS_PER_LAYER, P_OVERSHOOT_MIB, P_PP_STAGE_FIXED_MIB, P_PP_STAGE_FIXED_YARN2_DELTA_MIB -- class-max by card class (a class without a calibrated card: its arch twin), otherwise by stage/rank role (first, middle, last); UNMEASURED here, the first boot on these cards is the measurement (pdflip/inventory_view.py borrow_vector)"
+    },
+    {
+     "code": "HW-UNCALIBRATED",
+     "text": "W19 dormant-residue reserve (HW-UNCALIBRATED): board 'NVIDIA GeForce RTX 3090' (nvml0, RTX3090/24576MiB/sm86) belongs to no calibrated class of DC_MEASURED_D_* / DC_MEASURED_D_XCHG_* (measured on: RTX3080, RTX5090) -- a third card's dormant residue is not a property either of them has.  Measure it, do not borrow it.  --force BORROWS the dormant residue of class RTX3080 (same arch sm86) for this card: UNMEASURED here (HW-UNCALIBRATED)."
+    },
+    {
+     "code": "HW-UNCALIBRATED",
+     "text": "W19 dormant-residue reserve (HW-UNCALIBRATED): board 'NVIDIA GeForce RTX 3090' (nvml1, RTX3090/24576MiB/sm86) belongs to no calibrated class of DC_MEASURED_D_* / DC_MEASURED_D_XCHG_* (measured on: RTX3080, RTX5090) -- a third card's dormant residue is not a property either of them has.  Measure it, do not borrow it.  --force BORROWS the dormant residue of class RTX3080 (same arch sm86) for this card: UNMEASURED here (HW-UNCALIBRATED)."
+    },
+    {
+     "code": "HW-UNCALIBRATED",
+     "text": "W19 dormant-residue reserve (HW-UNCALIBRATED): board 'NVIDIA GeForce RTX 3090' (nvml2, RTX3090/24576MiB/sm86) belongs to no calibrated class of DC_MEASURED_D_* / DC_MEASURED_D_XCHG_* (measured on: RTX3080, RTX5090) -- a third card's dormant residue is not a property either of them has.  Measure it, do not borrow it.  --force BORROWS the dormant residue of class RTX3080 (same arch sm86) for this card: UNMEASURED here (HW-UNCALIBRATED)."
+    },
+    {
+     "code": "HW-BORROWED",
+     "text": "W71 PdFlipXchgResidencyUnarmable: HW-BORROWED: card GPU-bc784195-d4ab-24c3-3f19-a7bdf61206f7 (nvml0 NVIDIA GeForce RTX 3090, class RTX3090/24576MiB/sm86) is not in the census /spinning/gpu-arb/weg2/census/xchg_census_weg2xsn246_27198a2711.json; its row would be BORROWED from census row GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4 (class RTX3080, class read from the reference rig's card registry (planner/power_limit.py RIG_5090 / RIG_3080_NVML0 / RIG_3080_NVML2: UUID + NVML board name)) -- the census has no row of this card class (RTX3090/24576MiB/sm86); the most demanding row of its ARCH TWIN class RTX3080 (same compute capability, the AP1 W19 rule) stands in.  The per-tag bytes and the dormant residue are another card's measurement, applied here as if measured on this one; the serving constants must not stand in -- they contain none of the exchange lane's residency.  Measure this inventory (pdflip/xchg_census.py), name the row with --pdflip-xchg-census-map <live>=<census uuid>, or start with --force"
+    },
+    {
+     "code": "HW-BORROWED",
+     "text": "W71 PdFlipXchgResidencyUnarmable: HW-BORROWED: card GPU-1f1365a0-a6eb-80a3-2649-ef08c03426df (nvml1 NVIDIA GeForce RTX 3090, class RTX3090/24576MiB/sm86) is not in the census /spinning/gpu-arb/weg2/census/xchg_census_weg2xsn246_27198a2711.json; its row would be BORROWED from census row GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4 (class RTX3080, class read from the reference rig's card registry (planner/power_limit.py RIG_5090 / RIG_3080_NVML0 / RIG_3080_NVML2: UUID + NVML board name)) -- the census has no row of this card class (RTX3090/24576MiB/sm86); the most demanding row of its ARCH TWIN class RTX3080 (same compute capability, the AP1 W19 rule) stands in.  The per-tag bytes and the dormant residue are another card's measurement, applied here as if measured on this one; the serving constants must not stand in -- they contain none of the exchange lane's residency.  Measure this inventory (pdflip/xchg_census.py), name the row with --pdflip-xchg-census-map <live>=<census uuid>, or start with --force"
+    },
+    {
+     "code": "HW-BORROWED",
+     "text": "W71 PdFlipXchgResidencyUnarmable: HW-BORROWED: card GPU-f397733d-4c09-e6fa-e0db-8d7e51a6be74 (nvml2 NVIDIA GeForce RTX 3090, class RTX3090/24576MiB/sm86) is not in the census /spinning/gpu-arb/weg2/census/xchg_census_weg2xsn246_27198a2711.json; its row would be BORROWED from census row GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4 (class RTX3080, class read from the reference rig's card registry (planner/power_limit.py RIG_5090 / RIG_3080_NVML0 / RIG_3080_NVML2: UUID + NVML board name)) -- the census has no row of this card class (RTX3090/24576MiB/sm86); the most demanding row of its ARCH TWIN class RTX3080 (same compute capability, the AP1 W19 rule) stands in.  The per-tag bytes and the dormant residue are another card's measurement, applied here as if measured on this one; the serving constants must not stand in -- they contain none of the exchange lane's residency.  Measure this inventory (pdflip/xchg_census.py), name the row with --pdflip-xchg-census-map <live>=<census uuid>, or start with --force"
+    },
+    {
+     "code": "HW-UNCALIBRATED",
+     "text": "HW-UNCALIBRATED: the P-cut deep attention anchor (--pp-cut-attn-anchor-ms, 400 ms/layer) was measured on class RTX3080; no P stage carries that class (RTX3090/24576MiB/sm86, RTX3090/24576MiB/sm86, RTX3090/24576MiB/sm86). Measure the anchor on this rig (a 262k-prefix chunk on the slowest stage) -- not borrowed.  --force BORROWS it onto P stage 1 (RTX3090/24576MiB/sm86), the stage the reference rig measured it on: UNMEASURED on this card (HW-UNCALIBRATED)."
+    }
+   ],
+   "kind": null,
+   "launcher_code": null,
+   "rc": 0,
+   "zeilen": 266
+  },
+  "n": 3,
+  "ohne_force": {
+   "code": "HW-UNCALIBRATED",
+   "exc_msg": "HW-UNCALIBRATED: profile 'qwen27b' (profile_records_data/qwen27b.json inventory) was measured on the inventory [RTX5090, RTX3080, RTX3080] (card order), this rig is [RTX3090/24576MiB/sm86, RTX3090/24576MiB/sm86, RTX3090/24576MiB/sm86] (ordinal 0: live RTX3090/24576MiB/sm86 vs calibrated RTX5090; ordinal 1: live RTX3090/24576MiB/sm86 vs calibrated RTX3080; ordinal 2: live RTX3090/24576MiB/sm86 vs calibrated RTX3080). Positional measurements of the other inventory are NOT borrowed: DC_MEASURED_D_XCHG_MIB, D_AWAKE_REST_BOOKED_MIB, D_AWAKE_REST_CAPPED_MIB, D_DUAL_ALLOC_CACHE_BOOK_MIB, D_EXTEND_CAP_PER_ROW_MIB, D_OVERSHOOT_MIB, D_TORCH_CAP_OTHER_MIB, MEASURED_MS_PER_LAYER, P_CHUNK_BUILTIN, P_OVERSHOOT_MIB, P_PP_STAGE_FIXED_MIB, P_PP_STAGE_FIXED_YARN2_DELTA_MIB, --user-reserve-mib, FLLIPER_PDFLIP_EXTEND_TRIM_MIB, FLLIPER_PDFLIP_L15_MIB. Measure them on this rig: card_rate_pass --run (GEMM/membw/link rates), then one calibration boot per profile that writes the per-rank records (weg2_measured_record.json, profile_records_data/<profile>.json with this inventory), and a profile whose vectors name this inventory (--profile-inventory).",
+   "exc_type": "PdFlipLaunchRefused",
+   "exc_where": "<TREE>/python/flliper/srt/pdflip/refusals.py:265 in refuse_value",
+   "forced": [],
+   "kind": "refusal",
+   "launcher_code": null,
+   "rc": null,
+   "zeilen": 15
+  },
+  "ok_with_force": true,
+  "oracle": {
+   "duration_s": 34.27,
+   "notizen": [
+    "model: /spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-INT8-gdncov-vocabembed has no config.json -> header snapshot stub /tmp/planer_oracle_models/Qwen3.8-27B-INT8-gdncov-vocabembed",
+    "draft: /spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-DFlash2-W8-lued has no config.json -> header snapshot stub /tmp/planer_oracle_models/Qwen3.8-27B-DFlash2-W8-lued",
+    "--pdflip-xchg-census-foreign added (the census names the registry path, the farm is another path)"
+   ],
+   "runs": 2,
+   "version": {
+    "hw_fit": "4896e1cfe0b97ae5",
+    "launcher": "7368c4a1a081a868",
+    "propose_oracle": "8af4b0b24e9bb2c9",
+    "refusals": "4d580c430d114481",
+    "topology": "41e859db94f603d8"
+   }
+  },
+  "outcome": "ok_with_force",
+  "plan": {
+   "budgets": [
+    {
+     "card": "NVIDIA GeForce RTX 3090",
+     "group": "P",
+     "mib": 18584,
+     "nvml_idx": 0,
+     "ordinal": 0,
+     "pass": "P"
+    },
+    {
+     "card": "NVIDIA GeForce RTX 3090",
+     "group": "P",
+     "mib": 18584,
+     "nvml_idx": 1,
+     "ordinal": 1,
+     "pass": "P"
+    },
+    {
+     "card": "NVIDIA GeForce RTX 3090",
+     "group": "P",
+     "mib": 18584,
+     "nvml_idx": 2,
+     "ordinal": 2,
+     "pass": "P"
+    },
+    {
+     "card": "NVIDIA GeForce RTX 3090",
+     "group": "P",
+     "mib": 18584,
+     "nvml_idx": 0,
+     "ordinal": 0,
+     "pass": "P"
+    },
+    {
+     "card": "NVIDIA GeForce RTX 3090",
+     "group": "P",
+     "mib": 16792,
+     "nvml_idx": 1,
+     "ordinal": 1,
+     "pass": "P"
+    },
+    {
+     "card": "NVIDIA GeForce RTX 3090",
+     "group": "P",
+     "mib": 16792,
+     "nvml_idx": 2,
+     "ordinal": 2,
+     "pass": "P"
+    },
+    {
+     "card": "NVIDIA GeForce RTX 3090",
+     "group": "D",
+     "mib": 19792,
+     "nvml_idx": 0,
+     "ordinal": 0,
+     "pass": "D(dry, expectation)"
+    },
+    {
+     "card": "NVIDIA GeForce RTX 3090",
+     "group": "D",
+     "mib": 19792,
+     "nvml_idx": 1,
+     "ordinal": 1,
+     "pass": "D(dry, expectation)"
+    },
+    {
+     "card": "NVIDIA GeForce RTX 3090",
+     "group": "D",
+     "mib": 19792,
+     "nvml_idx": 2,
+     "ordinal": 2,
+     "pass": "D(dry, expectation)"
+    }
+   ],
+   "group_flags": {
+    "D": {
+     "--admin-api-key": "<redacted>",
+     "--barlink": "",
+     "--barlink-bar1-cap-cycles": "300000000000",
+     "--barlink-bar1-window-mib": "16,TP_0=32,DCP_0=40",
+     "--barlink-transport": "bar1",
+     "--barlink-uncovered-class": "refuse",
+     "--chat-template-default-kwargs": "{\"preserve_thinking\": true}",
+     "--chunked-prefill-size": "4096",
+     "--collective-census-interval": "50",
+     "--context-length": "262144",
+     "--enable-cache-report": "",
+     "--enable-hierarchical-cache": "",
+     "--enable-linear-replayssm-spec": "",
+     "--enable-memory-saver": "",
+     "--enable-metrics": "",
+     "--hicache-canonical-kv-page": "",
+     "--hicache-host-role": "staging",
+     "--hicache-io-backend": "direct",
+     "--hicache-mamba-host-mib": "100",
+     "--hicache-mem-layout": "layer_first",
+     "--hicache-size": "4",
+     "--hicache-storage-backend": "file",
+     "--hicache-storage-backend-extra-config": "{\"max_size\":\"150000000000\",\"min_free_space\":\"34359738368\",\"max_size_scope\":\"shared\"}",
+     "--hicache-write-policy": "write_back",
+     "--host": "127.0.0.1",
+     "--json-model-override-args": "{\"language_model_only\": true}",
+     "--kv-backing-relief": "",
+     "--kv-cache-dtype": "fp8_e4m3",
+     "--linear-replayssm-cache-len": "16",
+     "--mamba-radix-cache-strategy": "extra_buffer",
+     "--mamba-slot-reorder": "",
+     "--mamba-ssm-dtype": "bfloat16",
+     "--max-kv-per-request": "262144",
+     "--max-running-requests": "6",
+     "--model-path": "<MODELS>/Qwen3.8-27B-INT8-gdncov-vocabembed",
+     "--num-continuous-decode-steps": "2",
+     "--page-size": "1",
+     "--port": "30032",
+     "--pp-size": "1",
+     "--random-seed": "785500001",
+     "--rank-gpu-id": "0,1,2",
+     "--rank-gpu-memory-mib": "19792,19792,19792",
+     "--rank-tp-ratio": "auto",
+     "--reasoning-parser": "qwen3",
+     "--scheduler-distributed-teardown": "",
+     "--served-model-name": "Qwen3.8-27B-INT8-gdncov-vocabembed",
+     "--skip-server-warmup": "",
+     "--speculative-algorithm": "DFLASH",
+     "--speculative-draft-model-path": "<MODELS>/Qwen3.8-27B-DFlash2-W8-lued",
+     "--speculative-draft-window-size": "2048",
+     "--speculative-num-draft-tokens": "8",
+     "--tool-call-parser": "qwen3_coder",
+     "--tp-prefill-max-tokens": "12288",
+     "--tp-size": "3",
+     "--trust-remote-code": "",
+     "--uneven-dcp": "",
+     "--uneven-dcp-weighted": ""
+    },
+    "P": {
+     "--admin-api-key": "<redacted>",
+     "--barlink": "",
+     "--barlink-bar1-cap-cycles": "300000000000",
+     "--barlink-bar1-window-mib": "24,PP_0=96",
+     "--barlink-transport": "bar1",
+     "--chat-template-default-kwargs": "{\"preserve_thinking\": true}",
+     "--chunked-prefill-size": "2048",
+     "--collective-census-interval": "50",
+     "--context-length": "262144",
+     "--cuda-graph-config": "{\"prefill\":{\"backend\":\"full\",\"bs\":[512],\"full_prefill_max_req\":1}}",
+     "--disable-overlap-schedule": "",
+     "--enable-cache-report": "",
+     "--enable-hierarchical-cache": "",
+     "--enable-memory-saver": "",
+     "--enable-metrics": "",
+     "--hicache-canonical-kv-page": "",
+     "--hicache-host-role": "staging",
+     "--hicache-io-backend": "direct",
+     "--hicache-mamba-host-mib": "100",
+     "--hicache-mem-layout": "layer_first",
+     "--hicache-size": "1",
+     "--hicache-storage-backend": "file",
+     "--hicache-storage-backend-extra-config": "{\"max_size\":\"150000000000\",\"min_free_space\":\"34359738368\",\"max_size_scope\":\"shared\"}",
+     "--hicache-write-policy": "write_back",
+     "--host": "127.0.0.1",
+     "--json-model-override-args": "{\"language_model_only\": true}",
+     "--kv-backing-relief": "",
+     "--kv-cache-dtype": "fp8_e4m3",
+     "--mamba-slot-reorder": "",
+     "--mamba-ssm-dtype": "bfloat16",
+     "--max-kv-per-request": "262144",
+     "--max-mamba-cache-size": "24",
+     "--max-running-requests": "2",
+     "--max-total-tokens": "307660",
+     "--model-path": "<MODELS>/Qwen3.8-27B-INT8-gdncov-vocabembed",
+     "--page-size": "1",
+     "--port": "30031",
+     "--pp-async-batch-depth": "0",
+     "--pp-attn-stage-ratio": "6,6,4",
+     "--pp-size": "3",
+     "--pp-stage-ratio": "24,24,16",
+     "--random-seed": "785500001",
+     "--rank-gpu-id": "0,1,2",
+     "--rank-gpu-memory-mib": "18584,16792,16792",
+     "--reasoning-parser": "qwen3",
+     "--scheduler-distributed-teardown": "",
+     "--served-model-name": "Qwen3.8-27B-INT8-gdncov-vocabembed",
+     "--skip-server-warmup": "",
+     "--speculative-algorithm": "DFLASH",
+     "--speculative-draft-kv-only": "",
+     "--speculative-draft-model-path": "<MODELS>/Qwen3.8-27B-DFlash2-W8-lued",
+     "--speculative-num-draft-tokens": "8",
+     "--tool-call-parser": "qwen3_coder",
+     "--tp-size": "1",
+     "--trust-remote-code": ""
+    },
+    "front": {
+     "--admin-key-file": "/spinning/gpu-arb/weg2/boot_plangate.adminkey",
+     "--anon-preboot-bytes": "5015404544",
+     "--awake": "D",
+     "--carrier-max-tokens": "0",
+     "--d-bs": "6",
+     "--d-hold-s": "10.0",
+     "--d-short-drain-tokens": "4096",
+     "--dc-reserve": "GPU-bc784195-d4ab-24c3-3f19-a7bdf61206f7=2652,GPU-1f1365a0-a6eb-80a3-2649-ef08c03426df=2652,GPU-f397733d-4c09-e6fa-e0db-8d7e51a6be74=2652",
+     "--decode": "http://127.0.0.1:30032",
+     "--decode-sid": "0",
+     "--drain-deadline-s": "120.0",
+     "--fairness-w-s": "45.0",
+     "--flip-min-work-tokens": "4096",
+     "--host": "0.0.0.0",
+     "--host-census-arena-widths": "32768,78446592",
+     "--host-census-key": "5a324e4044bf915181537d1481662a3050e984acd2eb3977174a54aba0ab3143|arch=dense,experts=none,draft=dflash,p_draft=cold,kv=paged_dcp,flip=family,vision=transient,profile=qwen27b,model=Qwen3.8-27B-INT8-gdncov-vocabembed",
+     "--host-census-record": "/spinning/evidence-665-f1/host_census_record.json",
+     "--idle-layout": "P",
+     "--p-concurrency": "1",
+     "--port": "30030",
+     "--prefill": "http://127.0.0.1:30031",
+     "--prefill-sid": "0",
+     "--record-line": "model=<MODELS>/Qwen3.8-27B-INT8-gdncov-vocabembed|repo=<TREE>|head=HEAD|evidence=/spinning/evidence-665-f1",
+     "--store-dir": "<STORE>/l3-qwen27b-Qwen3.8-27B-INT8-gdncov-vocabembed-4e6f7b0b0b",
+     "--tag": "plangate",
+     "--tp-prefill-max-tokens": "4096",
+     "--vision": "transient",
+     "--weight-chunks": "8",
+     "--weight-form": "exchange",
+     "--x-ceiling-tokens": "12288"
+    }
+   },
+   "pp_cut": {
+    "attn": "6,6,4",
+    "chosen_pool": "307660",
+    "layers": "24,24,16",
+    "makespan_ms": "1220.0",
+    "pool_floor": "264192",
+    "pool_floor_source": "flag"
+   },
+   "w_codes": {
+    "W21": 1,
+    "W38": 1,
+    "W56": 1,
+    "W61": 1,
+    "W65": 1,
+    "W69": 1,
+    "W71": 3
+   },
+   "zeilen": 266
+  },
+  "profil": {
+   "draft": "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-DFlash2-W8-lued",
+   "file_sha256": "259ce8a4cdb1204b3db218e11ff2790f91a768bd80dfaff9373f91338b5c70e0",
+   "input_sha256": "047ecc20d4be4fee1a09ab94f9def773ab7f57d0d99a1e6fd4e23533101dce5c",
+   "model": "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-INT8-gdncov-vocabembed",
+   "name": "27b",
+   "proposal_sha256": "71d062915774a8a7b8c9ee18062ea23a542215f51fc831e77ad7cda507aeea72",
+   "quelle": "27b.env",
+   "rolle": "basis",
+   "status": "abgenommen"
+  },
+  "run": {
+   "code": null,
+   "exc_msg": "",
+   "exc_type": null,
+   "exc_where": "",
+   "forced": [
+    {
+     "code": "HW-UNCALIBRATED",
+     "text": "HW-UNCALIBRATED: profile 'qwen27b' (profile_records_data/qwen27b.json inventory) was measured on the inventory [RTX5090, RTX3080, RTX3080] (card order), this rig is [RTX3090/24576MiB/sm86, RTX3090/24576MiB/sm86, RTX3090/24576MiB/sm86] (ordinal 0: live RTX3090/24576MiB/sm86 vs calibrated RTX5090; ordinal 1: live RTX3090/24576MiB/sm86 vs calibrated RTX3080; ordinal 2: live RTX3090/24576MiB/sm86 vs calibrated RTX3080). Positional measurements of the other inventory are NOT borrowed: DC_MEASURED_D_XCHG_MIB, D_AWAKE_REST_BOOKED_MIB, D_AWAKE_REST_CAPPED_MIB, D_DUAL_ALLOC_CACHE_BOOK_MIB, D_EXTEND_CAP_PER_ROW_MIB, D_OVERSHOOT_MIB, D_TORCH_CAP_OTHER_MIB, MEASURED_MS_PER_LAYER, P_CHUNK_BUILTIN, P_OVERSHOOT_MIB, P_PP_STAGE_FIXED_MIB, P_PP_STAGE_FIXED_YARN2_DELTA_MIB, --user-reserve-mib, FLLIPER_PDFLIP_EXTEND_TRIM_MIB, FLLIPER_PDFLIP_L15_MIB. Measure them on this rig: card_rate_pass --run (GEMM/membw/link rates), then one calibration boot per profile that writes the per-rank records (weg2_measured_record.json, profile_records_data/<profile>.json with this inventory), and a profile whose vectors name this inventory (--profile-inventory)."
+    },
+    {
+     "code": "HW-UNCALIBRATED",
+     "text": "HW-UNCALIBRATED: profile 'qwen27b' positional records measured on [RTX5090, RTX3080, RTX3080] are BORROWED for [RTX3090/24576MiB/sm86, RTX3090/24576MiB/sm86, RTX3090/24576MiB/sm86] (--force): D_AWAKE_REST_BOOKED_MIB, D_AWAKE_REST_CAPPED_MIB, D_DUAL_ALLOC_CACHE_BOOK_MIB, D_EXTEND_CAP_PER_ROW_MIB, D_OVERSHOOT_MIB, D_TORCH_CAP_OTHER_MIB, MEASURED_MS_PER_LAYER, P_OVERSHOOT_MIB, P_PP_STAGE_FIXED_MIB, P_PP_STAGE_FIXED_YARN2_DELTA_MIB -- class-max by card class (a class without a calibrated card: its arch twin), otherwise by stage/rank role (first, middle, last); UNMEASURED here, the first boot on these cards is the measurement (pdflip/inventory_view.py borrow_vector)"
+    },
+    {
+     "code": "HW-UNCALIBRATED",
+     "text": "W19 dormant-residue reserve (HW-UNCALIBRATED): board 'NVIDIA GeForce RTX 3090' (nvml0, RTX3090/24576MiB/sm86) belongs to no calibrated class of DC_MEASURED_D_* / DC_MEASURED_D_XCHG_* (measured on: RTX3080, RTX5090) -- a third card's dormant residue is not a property either of them has.  Measure it, do not borrow it.  --force BORROWS the dormant residue of class RTX3080 (same arch sm86) for this card: UNMEASURED here (HW-UNCALIBRATED)."
+    },
+    {
+     "code": "HW-UNCALIBRATED",
+     "text": "W19 dormant-residue reserve (HW-UNCALIBRATED): board 'NVIDIA GeForce RTX 3090' (nvml1, RTX3090/24576MiB/sm86) belongs to no calibrated class of DC_MEASURED_D_* / DC_MEASURED_D_XCHG_* (measured on: RTX3080, RTX5090) -- a third card's dormant residue is not a property either of them has.  Measure it, do not borrow it.  --force BORROWS the dormant residue of class RTX3080 (same arch sm86) for this card: UNMEASURED here (HW-UNCALIBRATED)."
+    },
+    {
+     "code": "HW-UNCALIBRATED",
+     "text": "W19 dormant-residue reserve (HW-UNCALIBRATED): board 'NVIDIA GeForce RTX 3090' (nvml2, RTX3090/24576MiB/sm86) belongs to no calibrated class of DC_MEASURED_D_* / DC_MEASURED_D_XCHG_* (measured on: RTX3080, RTX5090) -- a third card's dormant residue is not a property either of them has.  Measure it, do not borrow it.  --force BORROWS the dormant residue of class RTX3080 (same arch sm86) for this card: UNMEASURED here (HW-UNCALIBRATED)."
+    },
+    {
+     "code": "HW-BORROWED",
+     "text": "W71 PdFlipXchgResidencyUnarmable: HW-BORROWED: card GPU-bc784195-d4ab-24c3-3f19-a7bdf61206f7 (nvml0 NVIDIA GeForce RTX 3090, class RTX3090/24576MiB/sm86) is not in the census /spinning/gpu-arb/weg2/census/xchg_census_weg2xsn246_27198a2711.json; its row would be BORROWED from census row GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4 (class RTX3080, class read from the reference rig's card registry (planner/power_limit.py RIG_5090 / RIG_3080_NVML0 / RIG_3080_NVML2: UUID + NVML board name)) -- the census has no row of this card class (RTX3090/24576MiB/sm86); the most demanding row of its ARCH TWIN class RTX3080 (same compute capability, the AP1 W19 rule) stands in.  The per-tag bytes and the dormant residue are another card's measurement, applied here as if measured on this one; the serving constants must not stand in -- they contain none of the exchange lane's residency.  Measure this inventory (pdflip/xchg_census.py), name the row with --pdflip-xchg-census-map <live>=<census uuid>, or start with --force"
+    },
+    {
+     "code": "HW-BORROWED",
+     "text": "W71 PdFlipXchgResidencyUnarmable: HW-BORROWED: card GPU-1f1365a0-a6eb-80a3-2649-ef08c03426df (nvml1 NVIDIA GeForce RTX 3090, class RTX3090/24576MiB/sm86) is not in the census /spinning/gpu-arb/weg2/census/xchg_census_weg2xsn246_27198a2711.json; its row would be BORROWED from census row GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4 (class RTX3080, class read from the reference rig's card registry (planner/power_limit.py RIG_5090 / RIG_3080_NVML0 / RIG_3080_NVML2: UUID + NVML board name)) -- the census has no row of this card class (RTX3090/24576MiB/sm86); the most demanding row of its ARCH TWIN class RTX3080 (same compute capability, the AP1 W19 rule) stands in.  The per-tag bytes and the dormant residue are another card's measurement, applied here as if measured on this one; the serving constants must not stand in -- they contain none of the exchange lane's residency.  Measure this inventory (pdflip/xchg_census.py), name the row with --pdflip-xchg-census-map <live>=<census uuid>, or start with --force"
+    },
+    {
+     "code": "HW-BORROWED",
+     "text": "W71 PdFlipXchgResidencyUnarmable: HW-BORROWED: card GPU-f397733d-4c09-e6fa-e0db-8d7e51a6be74 (nvml2 NVIDIA GeForce RTX 3090, class RTX3090/24576MiB/sm86) is not in the census /spinning/gpu-arb/weg2/census/xchg_census_weg2xsn246_27198a2711.json; its row would be BORROWED from census row GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4 (class RTX3080, class read from the reference rig's card registry (planner/power_limit.py RIG_5090 / RIG_3080_NVML0 / RIG_3080_NVML2: UUID + NVML board name)) -- the census has no row of this card class (RTX3090/24576MiB/sm86); the most demanding row of its ARCH TWIN class RTX3080 (same compute capability, the AP1 W19 rule) stands in.  The per-tag bytes and the dormant residue are another card's measurement, applied here as if measured on this one; the serving constants must not stand in -- they contain none of the exchange lane's residency.  Measure this inventory (pdflip/xchg_census.py), name the row with --pdflip-xchg-census-map <live>=<census uuid>, or start with --force"
+    },
+    {
+     "code": "HW-UNCALIBRATED",
+     "text": "HW-UNCALIBRATED: the P-cut deep attention anchor (--pp-cut-attn-anchor-ms, 400 ms/layer) was measured on class RTX3080; no P stage carries that class (RTX3090/24576MiB/sm86, RTX3090/24576MiB/sm86, RTX3090/24576MiB/sm86). Measure the anchor on this rig (a 262k-prefix chunk on the slowest stage) -- not borrowed.  --force BORROWS it onto P stage 1 (RTX3090/24576MiB/sm86), the stage the reference rig measured it on: UNMEASURED on this card (HW-UNCALIBRATED)."
+    }
+   ],
+   "kind": null,
+   "launcher_code": null,
+   "rc": 0,
+   "zeilen": 266
+  },
+  "schema": "flliper.verdict/1",
+  "vectors": {
+   "laengen": {
+    "--env-d FLLIPER_PDFLIP_EXTEND_TRIM_MIB": 3,
+    "--user-reserve-mib": 3
+   },
+   "nicht_n": {}
+  },
+  "verdikte": [
+   {
+    "code": "HW-UNCALIBRATED",
+    "durchgelassen": true,
+    "force_state": "force",
+    "force_via": "launcher",
+    "forcebar": true,
+    "level": "run",
+    "reason": "HW-UNCALIBRATED: profile 'qwen27b' (profile_records_data/qwen27b.json inventory) was measured on the inventory [RTX5090, RTX3080, RTX3080] (card order), this rig is [RTX3090/24576MiB/sm86, RTX3090/24576MiB/sm86, RTX3090/24576MiB/sm86] (ordinal 0: live RTX3090/24576MiB/sm86 vs calibrated RTX5090; ordinal 1: live RTX3090/24576MiB/sm86 vs calibrated RTX3080; ordinal 2: live RTX3090/24576MiB/sm86 vs calibrated RTX3080). Positional measurements of the other inventory are NOT borrowed: DC_MEASURED_D_XCHG_MIB, D_AWAKE_REST_BOOKED_MIB, D_AWAKE_REST_CAPPED_MIB, D_DUAL_ALLOC_CACHE_BOOK_MIB, D_EXTEND_CAP_PER_ROW_MIB, D_OVERSHOOT_MIB, D_TORCH_CAP_OTHER_MIB, MEASURED_MS_PER_LAYER, P_CHUNK_BUILTIN, P_OVE\u2026",
+    "title": "Card inventory is not the measured one",
+    "values": []
+   },
+   {
+    "code": "HW-UNCALIBRATED",
+    "durchgelassen": true,
+    "force_state": "force",
+    "force_via": "launcher",
+    "forcebar": true,
+    "level": "run",
+    "reason": "HW-UNCALIBRATED: profile 'qwen27b' positional records measured on [RTX5090, RTX3080, RTX3080] are BORROWED for [RTX3090/24576MiB/sm86, RTX3090/24576MiB/sm86, RTX3090/24576MiB/sm86] (--force): D_AWAKE_REST_BOOKED_MIB, D_AWAKE_REST_CAPPED_MIB, D_DUAL_ALLOC_CACHE_BOOK_MIB, D_EXTEND_CAP_PER_ROW_MIB, D_OVERSHOOT_MIB, D_TORCH_CAP_OTHER_MIB, MEASURED_MS_PER_LAYER, P_OVERSHOOT_MIB, P_PP_STAGE_FIXED_MIB, P_PP_STAGE_FIXED_YARN2_DELTA_MIB -- class-max by card class (a class without a calibrated card: its arch twin), otherwise by stage/rank role (first, middle, last); UNMEASURED here, the first boot on these cards is the measurement (pdflip/inventory_view.py borrow_vector)",
+    "title": "Card inventory is not the measured one",
+    "values": []
+   },
+   {
+    "code": "HW-UNCALIBRATED",
+    "durchgelassen": true,
+    "force_state": "force",
+    "force_via": "launcher",
+    "forcebar": true,
+    "level": "run",
+    "reason": "W19 dormant-residue reserve (HW-UNCALIBRATED): board 'NVIDIA GeForce RTX 3090' (nvml0, RTX3090/24576MiB/sm86) belongs to no calibrated class of DC_MEASURED_D_* / DC_MEASURED_D_XCHG_* (measured on: RTX3080, RTX5090) -- a third card's dormant residue is not a property either of them has. Measure it, do not borrow it. --force BORROWS the dormant residue of class RTX3080 (same arch sm86) for this card: UNMEASURED here (HW-UNCALIBRATED).",
+    "title": "Card inventory is not the measured one",
+    "values": []
+   },
+   {
+    "code": "HW-UNCALIBRATED",
+    "durchgelassen": true,
+    "force_state": "force",
+    "force_via": "launcher",
+    "forcebar": true,
+    "level": "run",
+    "reason": "W19 dormant-residue reserve (HW-UNCALIBRATED): board 'NVIDIA GeForce RTX 3090' (nvml1, RTX3090/24576MiB/sm86) belongs to no calibrated class of DC_MEASURED_D_* / DC_MEASURED_D_XCHG_* (measured on: RTX3080, RTX5090) -- a third card's dormant residue is not a property either of them has. Measure it, do not borrow it. --force BORROWS the dormant residue of class RTX3080 (same arch sm86) for this card: UNMEASURED here (HW-UNCALIBRATED).",
+    "title": "Card inventory is not the measured one",
+    "values": []
+   },
+   {
+    "code": "HW-UNCALIBRATED",
+    "durchgelassen": true,
+    "force_state": "force",
+    "force_via": "launcher",
+    "forcebar": true,
+    "level": "run",
+    "reason": "W19 dormant-residue reserve (HW-UNCALIBRATED): board 'NVIDIA GeForce RTX 3090' (nvml2, RTX3090/24576MiB/sm86) belongs to no calibrated class of DC_MEASURED_D_* / DC_MEASURED_D_XCHG_* (measured on: RTX3080, RTX5090) -- a third card's dormant residue is not a property either of them has. Measure it, do not borrow it. --force BORROWS the dormant residue of class RTX3080 (same arch sm86) for this card: UNMEASURED here (HW-UNCALIBRATED).",
+    "title": "Card inventory is not the measured one",
+    "values": []
+   },
+   {
+    "code": "HW-BORROWED",
+    "durchgelassen": true,
+    "force_state": "force",
+    "force_via": "launcher",
+    "forcebar": true,
+    "level": "value",
+    "reason": "W71 PdFlipXchgResidencyUnarmable: HW-BORROWED: card GPU-bc784195-d4ab-24c3-3f19-a7bdf61206f7 (nvml0 NVIDIA GeForce RTX 3090, class RTX3090/24576MiB/sm86) is not in the census /spinning/gpu-arb/weg2/census/xchg_census_weg2xsn246_27198a2711.json; its row would be BORROWED from census row GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4 (class RTX3080, class read from the reference rig's card registry (planner/power_limit.py RIG_5090 / RIG_3080_NVML0 / RIG_3080_NVML2: UUID + NVML board name)) -- the census has no row of this card class (RTX3090/24576MiB/sm86); the most demanding row of its ARCH TWIN class RTX3080 (same compute capability, the AP1 W19 rule) stands in. The per-tag bytes and the dormant\u2026",
+    "title": "Value borrowed from another card or another profile",
+    "values": []
+   },
+   {
+    "code": "HW-BORROWED",
+    "durchgelassen": true,
+    "force_state": "force",
+    "force_via": "launcher",
+    "forcebar": true,
+    "level": "value",
+    "reason": "W71 PdFlipXchgResidencyUnarmable: HW-BORROWED: card GPU-1f1365a0-a6eb-80a3-2649-ef08c03426df (nvml1 NVIDIA GeForce RTX 3090, class RTX3090/24576MiB/sm86) is not in the census /spinning/gpu-arb/weg2/census/xchg_census_weg2xsn246_27198a2711.json; its row would be BORROWED from census row GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4 (class RTX3080, class read from the reference rig's card registry (planner/power_limit.py RIG_5090 / RIG_3080_NVML0 / RIG_3080_NVML2: UUID + NVML board name)) -- the census has no row of this card class (RTX3090/24576MiB/sm86); the most demanding row of its ARCH TWIN class RTX3080 (same compute capability, the AP1 W19 rule) stands in. The per-tag bytes and the dormant\u2026",
+    "title": "Value borrowed from another card or another profile",
+    "values": []
+   },
+   {
+    "code": "HW-BORROWED",
+    "durchgelassen": true,
+    "force_state": "force",
+    "force_via": "launcher",
+    "forcebar": true,
+    "level": "value",
+    "reason": "W71 PdFlipXchgResidencyUnarmable: HW-BORROWED: card GPU-f397733d-4c09-e6fa-e0db-8d7e51a6be74 (nvml2 NVIDIA GeForce RTX 3090, class RTX3090/24576MiB/sm86) is not in the census /spinning/gpu-arb/weg2/census/xchg_census_weg2xsn246_27198a2711.json; its row would be BORROWED from census row GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4 (class RTX3080, class read from the reference rig's card registry (planner/power_limit.py RIG_5090 / RIG_3080_NVML0 / RIG_3080_NVML2: UUID + NVML board name)) -- the census has no row of this card class (RTX3090/24576MiB/sm86); the most demanding row of its ARCH TWIN class RTX3080 (same compute capability, the AP1 W19 rule) stands in. The per-tag bytes and the dormant\u2026",
+    "title": "Value borrowed from another card or another profile",
+    "values": []
+   },
+   {
+    "code": "HW-UNCALIBRATED",
+    "durchgelassen": true,
+    "force_state": "force",
+    "force_via": "launcher",
+    "forcebar": true,
+    "level": "run",
+    "reason": "HW-UNCALIBRATED: the P-cut deep attention anchor (--pp-cut-attn-anchor-ms, 400 ms/layer) was measured on class RTX3080; no P stage carries that class (RTX3090/24576MiB/sm86, RTX3090/24576MiB/sm86, RTX3090/24576MiB/sm86). Measure the anchor on this rig (a 262k-prefix chunk on the slowest stage) -- not borrowed. --force BORROWS it onto P stage 1 (RTX3090/24576MiB/sm86), the stage the reference rig measured it on: UNMEASURED on this card (HW-UNCALIBRATED).",
+    "title": "Card inventory is not the measured one",
+    "values": []
+   },
+   {
+    "code": "FIT",
+    "force_state": "geht",
+    "force_via": null,
+    "forcebar": null,
+    "level": "fit",
+    "reason": "hw_fit: yes (rest 25436.856 MiB)",
+    "rest_mib": 25436.856,
+    "stage": "ja",
+    "title": "Fit according to hw_fit (necessary condition)",
+    "values": [],
+    "zeilen": []
+   },
+   {
+    "code": "HW-BORROWED",
+    "force_state": "note",
+    "force_via": "launcher",
+    "forcebar": true,
+    "level": "value",
+    "quelle": "hw_fit",
+    "reason": "HW-BORROWED/unverified: P-Residuum RTX3090 <- RTX3080 2968 MiB",
+    "title": "Value borrowed from another card or another profile",
+    "values": []
+   },
+   {
+    "code": "VISION-VICTIM",
+    "etikett": "planner calculation",
+    "force_state": "geht",
+    "force_via": null,
+    "forcebar": null,
+    "host_mib": 878.8,
+    "level": "fit",
+    "missing_mib": null,
+    "opferart": "dense",
+    "reason": "W105b PdFlipVisionVictimShort: not triggered, the victims (MLP storages of the PP0 stage (27B flip)) hold 5611.7 MiB, the tower needs 878.8 MiB (rest 4732.9 MiB)",
+    "stage": "ja",
+    "title": "Vision tower on displaced weights: victim bytes against tower bytes (planner calculation)",
+    "turm_mib": 878.8,
+    "values": [],
+    "verfuegbar_mib": 5611.7
+   }
+  ],
+  "zaehlung": {
+   "force": 6,
+   "is_blocked": 0,
+   "ungeprueft": 0
+  }
+ }
+}

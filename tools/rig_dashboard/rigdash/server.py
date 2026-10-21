@@ -36,7 +36,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
 
 from . import (energy, features, flipzeit, health, history, hwprofil, imagechanges, ipcboot, kartenplan, launchview, live,
-               modellprofil, profil, profile_oracle, profile_recompute, redact, sampler, sources, vmpush, weg2line)
+               modellprofil, planer_ziel, profil, profile_oracle, profile_recompute, redact, sampler, sources, vmpush, weg2line)
 from . import names as N
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -68,6 +68,8 @@ STATIC_FILES = {
     "/profil_balken.js": ("profil_balken.js", "application/javascript; charset=utf-8"),
     # Profil-Planer, eine Seite (AP-H1): Betriebsform, Regler, Je-Karte-Felder, Zustands- und Verdikt-Chips, Dual-Tabelle (reine Darstellung)
     "/profil_planer.js": ("profil_planer.js", "application/javascript; charset=utf-8"),
+    # PLANER-ZIELBILD 1021: the planner in the target picture (model + cards -> layout -> seats/tokens)
+    "/planer_ziel.js": ("planer_ziel.js", "application/javascript; charset=utf-8"),
 }
 #: Kartenplaner (Item 510): nur Rig-Ausgabe (Entwicklungsstand), im Release 404
 DEV_STATIC_FILES = {
@@ -277,6 +279,8 @@ class App:
             # Auftrag 1984 (C): die Topologie-Prüfung des Trockenlaufs läuft im Kopplungs-Worker (flliper-Umgebung), nicht in diesem Prozess;
             # self.couplings entsteht erst unten, darum erst beim Aufruf aufgelöst
             topology=lambda n: self.couplings.topology(n))
+        # PLANER-ZIELBILD 1021: model + cards -> possible layouts -> seats + tokens; sits on top of self.profil.propose
+        self.planer_ui = planer_ziel.ZielPlaner(self.profil)
         # Modellprofil schätzen (S3): liest nur config.json und Kopfzeilen unter den Modellwurzeln
         self.modellprofil = modellprofil.ModelEstimator(tree=ptree, roots=getattr(args, "model_root", None) or None)
         # Profil-Editor S4b (Auftrag 1432): Kopplungen/Balken im langlebigen Worker (startet erst bei der ersten Anfrage)
@@ -655,6 +659,8 @@ def make_handler(app: App):
                     return self._json(dict(app.profil.list(), ok=True))
                 if path == "/api/profil/modelle":
                     return self._json(app.profil.known_models())
+                if path == "/api/profil/planer-katalog":
+                    return self._json(app.planer_ui.katalog())
             except profil.ProfileError as e:
                 return self._json({"ok": False, "error": str(e)}, 400)
             return self._send(404, "not found", "text/plain")
@@ -691,6 +697,10 @@ def make_handler(app: App):
                 return self._profil_recompute(body)
             if path == "/api/profil/propose":
                 return self._json(ed.propose(body))
+            if path == "/api/profil/planer-layouts":
+                return self._json(app.planer_ui.layouts(body))
+            if path == "/api/profil/planer-plan":
+                return self._json(app.planer_ui.plan(body))
             return self._send(404, "not found", "text/plain")
 
         def _profil_issue(self, body):

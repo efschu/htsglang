@@ -89,6 +89,34 @@ details.lf details > summary { cursor: pointer; font-size: 13px; color: var(--te
 .lf .miss { color: var(--warn); font-size: 12px; }
 /* <!--DEV:END--> */
 /* Profil-Editor (Auftrag 930, S1): auch in der Release-Ausgabe (Nutzer-Entscheid 05.10.) */
+/* PLANER-ZIELBILD 1021: the planner (model + cards -> layout -> seats/tokens -> computed rest) */
+#pz-root { max-width: 1280px; }
+.pz-step { border: 1px solid var(--line); border-radius: 10px; padding: 6px 12px 10px; margin: 12px 0; background: var(--surface); }
+.pz-step > h3 { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 6px 0 4px; font-size: 15px; }
+.pz-no { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 50%; background: var(--bar); color: var(--surface); font-size: 12px; font-weight: 700; }
+#pz-root button { font: inherit; font-size: 12.5px; padding: 4px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface-2); color: var(--text); cursor: pointer; }
+#pz-root button:disabled { opacity: .5; cursor: default; } #pz-root button.sel, #pz-root .pz-lay.sel > button { border-color: var(--bar); box-shadow: inset 0 0 0 1px var(--bar); }
+#pz-root select, #pz-root input[type=number] { font: inherit; font-size: 13px; padding: 4px 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); color: var(--text); max-width: 100%; }
+#pz-root input[type=number] { width: 9em; } .pz-sel select { min-width: min(280px, 100%); }
+.pz-short { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0 6px; }
+.pz-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(300px, 100%), 1fr)); gap: 6px; margin: 6px 0; }
+.pz-card { display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: center; justify-content: space-between; min-width: 0; border: 1px solid var(--line); border-radius: 8px; padding: 5px 10px; }
+.pz-card.on { border-color: var(--bar); } .pz-cn { min-width: 0; overflow-wrap: anywhere; font-size: 12.5px; } .pz-cnt { display: inline-flex; gap: 6px; align-items: center; } .pz-cnt output { min-width: 1.6em; text-align: center; font-weight: 600; }
+.pz-more { margin: 6px 0; } .pz-more > summary, .pz-calc > summary { cursor: pointer; font-size: 12px; color: var(--text-2); } .pz-sum { margin: 6px 0 2px; font-size: 13px; }
+.pz-lays { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(250px, 100%), 1fr)); gap: 8px; margin: 6px 0; }
+.pz-lay { border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; min-width: 0; } .pz-lay.off { background: var(--surface-2); }
+.pz-lay > button { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; text-align: left; width: 100%; padding: 8px 10px; } .pz-lay > button span { color: var(--text-2); font-weight: 400; font-size: 12px; }
+.pz-lh { margin: 6px 0 2px; } .pz-why { margin: 4px 0 2px 18px; padding: 0; font-size: 12px; overflow-wrap: anywhere; } .pz-calc ul { margin: 4px 0 4px 18px; padding: 0; font-size: 12px; overflow-wrap: anywhere; }
+.pz-chip { font-size: 11px; padding: 0 8px; border-radius: 8px; border: 1px solid var(--line); white-space: normal; background: var(--surface-2); }
+.pz-ok { border-color: var(--good); color: var(--good); } .pz-warn { border-color: var(--warn); color: var(--warn); } .pz-bad { border-color: var(--bad); color: var(--bad); font-weight: 600; }
+.pz-in { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; margin: 6px 0; } .pz-presets { display: inline-flex; flex-wrap: wrap; gap: 4px; } .pz-note { font-size: 12px; margin: 4px 0 8px; }
+.pz-h { font-size: 14px; margin: 8px 0 4px; } .pz-verdict { border: 1px solid var(--line); border-left-width: 5px; border-radius: 8px; padding: 8px 12px; margin: 8px 0; background: var(--surface); }
+.pz-verdict.ok { border-left-color: var(--good); } .pz-verdict.bad { border-left-color: var(--bad); } .pz-vi { margin: 6px 0 0 18px; padding: 0; font-size: 12px; overflow-wrap: anywhere; }
+.pz-g { margin: 10px 0; } .pz-g h4 { margin: 8px 0 2px; font-size: 13px; } .pz-t { width: 100%; border-collapse: collapse; } .pz-t td { vertical-align: top; padding: 5px 6px; border-top: 1px solid var(--line); font-size: 12.5px; }
+.pz-l { min-width: 14em; font-weight: 600; } .pz-v { min-width: 10em; overflow-wrap: anywhere; } .pz-s { font-size: 12px; overflow-wrap: anywhere; }
+.pz-pc { display: inline-flex; flex-wrap: wrap; gap: 4px 12px; } .pz-pc i { font-style: normal; font-size: 11px; color: var(--text-2); } .pz-src { font-size: 10.5px; color: var(--text-2); border: 1px solid var(--line); border-radius: 8px; padding: 0 6px; white-space: nowrap; }
+.pz-exp { margin-top: 10px; }
+@media (max-width: 640px) { .pz-t, .pz-t tbody, .pz-t tr, .pz-t td { display: block; width: auto; } .pz-t tr { border-top: 1px solid var(--line); padding: 6px 0; } .pz-t td { border-top: 0; min-width: 0; padding: 1px 0; } }
 #pf-root { max-width: 1280px; }
 .pf-h3 { font-size: 13.5px; margin: 10px 0 2px; }
 .pf-models { width: 100%; border-collapse: collapse; } .pf-models td, .pf-models th { padding: 4px 6px; border-top: 1px solid var(--line); font-size: 12.5px; vertical-align: top; text-align: left; }
@@ -597,7 +625,7 @@ html[data-editor-only="1"] .tab:not(#tab-profil) { display: none !important; }
   <button type="button" role="tab" data-tab="verlauf">History</button>
   <button type="button" role="tab" data-tab="sitzungen">Sessions</button>
   <button type="button" role="tab" data-tab="karten">Cards</button>
-  <button type="button" role="tab" data-tab="profil">Profile planner</button>
+  <button type="button" role="tab" data-tab="profil">Planner</button>
   <!--DEV:BEGIN-->
   <button type="button" role="tab" data-tab="entwicklung">Development <span class="cnt" id="tab-dev-cnt"></span></button>
   <!--DEV:END-->
@@ -652,9 +680,15 @@ html[data-editor-only="1"] .tab:not(#tab-profil) { display: none !important; }
   </section>
   </div>
   <div class="tab" id="tab-profil" role="tabpanel" hidden>
+    <section class="card" id="pz-card" aria-label="Planner">
+      <h2>Planner <span class="muted">choose a model and cards, then a layout, seats and tokens per seat &middot; the rest is calculated &middot; only creates, starts nothing &middot; LAN only</span></h2>
+      <div id="pz-root"><div class="muted">loading &hellip;</div></div>
+    </section>
     <section class="card" id="pf-card" aria-label="Profile editor">
-      <h2>Profile planner <span class="muted">load a server profile, edit every value with an explanation, see cards and plan alongside, check, save &middot; only creates, starts nothing &middot; LAN only</span></h2>
-      <div id="pf-root"><div class="muted">loading &hellip;</div></div>
+      <details id="pf-expert" class="pf-fold">
+        <summary><b>Expert view</b> <span class="muted">profile editor: load a server profile, edit every value with an explanation, check, save</span></summary>
+        <div id="pf-root"><div class="muted">loading &hellip;</div></div>
+      </details>
     </section>
     <!--DEV:BEGIN-->
     <section class="card" id="kp-card" aria-label="Plan for other cards">
@@ -742,6 +776,7 @@ html[data-editor-only="1"] .tab:not(#tab-profil) { display: none !important; }
 <script src="hwprofil.js"></script>
 <script src="profil_balken.js"></script>
 <script src="profil_planer.js"></script>
+<script src="planer_ziel.js"></script>
 <script src="profil.js"></script>
 <script>
 "use strict";
@@ -2209,6 +2244,7 @@ function setTab(t, fromHash) {
   try { localStorage.setItem("rigdash.tab", t); } catch (e) { /* private window */ }
   if (!fromHash) history.replaceState(null, "", "#t=" + t);
   if ((t === "verlauf" || t === "karten") && window.RigGrafik) window.RigGrafik.show();
+  if (t === "profil" && window.RigPlaner) window.RigPlaner.show();
   if (t === "profil" && window.RigProfil) window.RigProfil.show();
   refresh(true);
 }

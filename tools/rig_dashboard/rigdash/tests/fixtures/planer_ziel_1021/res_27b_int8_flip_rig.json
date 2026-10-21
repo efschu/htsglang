@@ -1,0 +1,1375 @@
+{
+ "basis": {
+  "kind": "release",
+  "name": "27b",
+  "profil": {
+   "draft": "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-DFlash2-W8-lued",
+   "file_sha256": "259ce8a4cdb1204b3db218e11ff2790f91a768bd80dfaff9373f91338b5c70e0",
+   "input_sha256": "047ecc20d4be4fee1a09ab94f9def773ab7f57d0d99a1e6fd4e23533101dce5c",
+   "model": "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-INT8-gdncov-vocabembed",
+   "name": "27b",
+   "proposal_sha256": "f28cdaa880bf6790c5ac057f6eb069deeed52d98a35ce1ae5096f9330209c605",
+   "quelle": "27b.env",
+   "rolle": "basis",
+   "status": "abgenommen"
+  },
+  "sha256": "259ce8a4cdb1204b3db218e11ff2790f91a768bd80dfaff9373f91338b5c70e0"
+ },
+ "form": "flip",
+ "launch": {
+  "argv": [
+   "--pdflip-weight-source",
+   "exchange",
+   "--pdflip-xchg-census",
+   "/spinning/gpu-arb/weg2/census/xchg_census_weg2xsn246_27198a2711.json",
+   "--pdflip-xchg-oncard",
+   "host",
+   "--pdflip-vision",
+   "transient",
+   "--user-reserve-mib",
+   "1800,1400,1400",
+   "--store-max-gb",
+   "150",
+   "--max-kv-per-request",
+   "262144",
+   "--xchg-bounce-depth",
+   "1",
+   "--pin-ledger-arm-m",
+   "600",
+   "--host-ledger-deviation",
+   "1424e-ratchet-37gib-aus-xsn177-war-ganzarena-pinning-seit-1424e-je-slot",
+   "--host-riegel-gib",
+   "93.0",
+   "--pdflip-xchg-legs",
+   "both",
+   "--pdflip-xchg-inject",
+   "authoritative",
+   "--p-bs",
+   "1",
+   "--extra-p=--max-running-requests=2",
+   "--pdflip-weights-cpu-backup",
+   "off",
+   "--spec-form",
+   "DFLASH",
+   "--d-tp-objective",
+   "decode-bs1",
+   "--p-hostgap",
+   "--d-replayssm-spec",
+   "on",
+   "--p-prefill-graph-split",
+   "7",
+   "--tp-prefill-max-tokens",
+   "4096",
+   "--x-ceiling-tokens",
+   "12288",
+   "--pdflip-vision-place",
+   "weights",
+   "--idle-layout",
+   "pp",
+   "--d-hold-s",
+   "10",
+   "--d-short-drain-tokens",
+   "4096",
+   "--p-chunk-policy",
+   "dynamic",
+   "--p-chunk-max",
+   "2048",
+   "--p-chunk-model",
+   "builtin-int8",
+   "--p-chunk-mscale",
+   "int8",
+   "--d-reshard",
+   "wake-seg",
+   "--d-reshard-presets",
+   "drq=652:218:218",
+   "--d-token-placement",
+   "bandwidth",
+   "--env-d",
+   "FLLIPER_PDFLIP_EXTEND_TRIM_MIB=1200,0,0",
+   "--model",
+   "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-INT8-gdncov-vocabembed"
+  ],
+  "env": {
+   "FLLIPER_BARLINK_BAR1_ABORT_MAX_LAG": "64",
+   "FLLIPER_HICACHE_ARENA_LOAD_BLOCK_QUOTA": "16",
+   "FLLIPER_HICACHE_ARENA_MAMBA_SLOTS": "112",
+   "FLLIPER_HICACHE_ARENA_PREPIN": "1",
+   "FLLIPER_HICACHE_ARENA_QUEUE_REFS": "1",
+   "FLLIPER_HICACHE_DRAIN_BUDGET": "16384",
+   "FLLIPER_PDFLIP_DENSE_REPACK_OUTSIDE_POOL": "1",
+   "FLLIPER_PDFLIP_ENABLE_D_IDLE_PUBLISH": "1",
+   "FLLIPER_PDFLIP_ENABLE_FLUSH_QUIESCE_NONBLOCK": "1",
+   "FLLIPER_PDFLIP_ENABLE_PAUSE_COALESCE_UNMAP": "1",
+   "FLLIPER_PDFLIP_ENABLE_P_ANCHOR_PRESENCE": "1",
+   "FLLIPER_PDFLIP_ENABLE_SLEEP_PAUSE_OVERLAP": "1",
+   "FLLIPER_PDFLIP_FLUSH_NONBLOCK_GROUPS": "D",
+   "FLLIPER_PDFLIP_L15": "1",
+   "FLLIPER_PDFLIP_L15_HOT_SHARE": "1",
+   "FLLIPER_PDFLIP_L15_MIB": "c1=7616,c2=1792",
+   "FLLIPER_PDFLIP_L15_REFILL": "1",
+   "FLLIPER_PDFLIP_MAMBA_ANCHOR_INTERVAL": "4096",
+   "FLLIPER_PDFLIP_MAMBA_INNER_ANCHOR_RELEASE": "1",
+   "FLLIPER_PDFLIP_MAMBA_MAX_STATES_PER_PATH": "4",
+   "FLLIPER_PDFLIP_SEQ_SYNC_BATCH_MIB": "256",
+   "FLLIPER_PDFLIP_SEQ_SYNC_BATCH_UNITS": "128",
+   "FLLIPER_PDFLIP_SLEEP_PAUSE_OVERLAP_GROUPS": "D",
+   "FLLIPER_PDFLIP_STORE_SHORT_TAIL": "1",
+   "FLLIPER_PDFLIP_VISION_FLIP_URGENT": "1",
+   "FLLIPER_PDFLIP_VMM_EXPORTABLE": "1",
+   "HTSGLANG_INSTRUMENTS": "0",
+   "HTSGLANG_TAG": "plangate",
+   "NCCL_BUFFSIZE": "1048576",
+   "NCCL_MAX_NCHANNELS": "8"
+  }
+ },
+ "n": 3,
+ "nicht_uebernommen": [],
+ "notes": [
+  "The selected cards are the NVML cards of this rig (hardware profile): the dry run runs with their real UUIDs."
+ ],
+ "ok": true,
+ "oracle": {
+  "cache_key": "eafc89584a549c55",
+  "cached": false,
+  "duration_s": 30.16,
+  "version": {
+   "hw_fit": "4896e1cfe0b97ae5",
+   "launcher": "7368c4a1a081a868",
+   "propose_oracle": "8af4b0b24e9bb2c9",
+   "refusals": "4d580c430d114481",
+   "topology": "41e859db94f603d8"
+  }
+ },
+ "proposal": {
+  "basis": "27b.env",
+  "blocker": [],
+  "cards": [
+   {
+    "arch": "sm120",
+    "class": "RTX5090",
+    "name": "NVIDIA GeForce RTX 5090",
+    "nvml_index": 1,
+    "ordinal": 0,
+    "tflops": 203.42,
+    "tflops_src": "measured (card_library)",
+    "total_mib": 32607,
+    "uuid": "GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d"
+   },
+   {
+    "arch": "sm86",
+    "class": "RTX3080",
+    "name": "NVIDIA GeForce RTX 3080",
+    "nvml_index": 0,
+    "ordinal": 1,
+    "tflops": 50.97,
+    "tflops_src": "measured (card_library)",
+    "total_mib": 20480,
+    "uuid": "GPU-5c648f96-be1d-42d5-0221-34d11ab137f7"
+   },
+   {
+    "arch": "sm86",
+    "class": "RTX3080",
+    "name": "NVIDIA GeForce RTX 3080",
+    "nvml_index": 2,
+    "ordinal": 2,
+    "tflops": 50.97,
+    "tflops_src": "measured (card_library)",
+    "total_mib": 20480,
+    "uuid": "GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4"
+   }
+  ],
+  "dual": null,
+  "fit": {
+   "first": "",
+   "level": "ja",
+   "lines": [],
+   "margin_mib": 24396.855999999992,
+   "marks": [
+    "D context (foreign + non-torch): no vector in the launch argv, 0 MiB assumed (UNVERIFIED)",
+    "P_ACTIVATION_MIB: no record in 'qwen27b' (post not modelled)"
+   ]
+  },
+  "form": "flip",
+  "goals": {
+   "kv_dtype": "fp8_e4m3",
+   "kv_tokens": 262144,
+   "p_cut": "auto",
+   "seats": 6
+  },
+  "inventory": {
+   "live": [
+    "RTX5090",
+    "RTX3080",
+    "RTX3080"
+   ],
+   "profil": [
+    "RTX5090",
+    "RTX3080",
+    "RTX3080"
+   ],
+   "same_as_profile": true
+  },
+  "n": 3,
+  "notes": [
+   "Draft: Draft 2072 + dense weights 26895 + KV obligation 8704 + Mamba state 2843 = 40515 MiB; budget of rank 0 27341 MiB: does not fit (margin -13174 MiB) (the draft rule applies to the form A MoE line; for a dense model the draft runs per profile)"
+  ],
+  "schema": "flliper.propose-a/1",
+  "seeds": {
+   "dense_d_shares": [
+    0.4775,
+    0.3033,
+    0.2192
+   ],
+   "draft": {
+    "budget_mib": 27341,
+    "margin_mib": -13173.7733,
+    "need_mib": 40514.7733,
+    "placement": "split",
+    "why": "Draft 2072 + dense weights 26895 + KV obligation 8704 + Mamba state 2843 = 40515 MiB; budget of rank 0 27341 MiB: does not fit (margin -13174 MiB)"
+   },
+   "form_a": null,
+   "fr_p": [],
+   "p_cut": {
+    "attn": [
+     10,
+     3,
+     3
+    ],
+    "basis": "measured: GEMM rate per card",
+    "caps": [
+     53,
+     33,
+     24
+    ],
+    "gesetzt": false,
+    "layers": [
+     42,
+     11,
+     11
+    ]
+   }
+  },
+  "unverified": [
+   "D context per card: no --d-foreign-context-mib/--d-nontorch-mib in the profile for this inventory"
+  ],
+  "vector_lengths": {
+   "--env-d FLLIPER_PDFLIP_EXTEND_TRIM_MIB": 3,
+   "--user-reserve-mib": 3
+  },
+  "vectors_ok": true,
+  "vectors_wrong": {},
+  "vision": {
+   "aktiv": true,
+   "form": "flip",
+   "host_mib": 878.8,
+   "host_posten": {
+    "detail": "The victim bytes (= the tower bytes) wait in an anonymous pageable host image while the tower is up; allocated per image, freed after the give-back (0 afterwards). Host RAM is a warning only, never a refusal (user rule 2026-10-06).",
+    "gerechnet": true,
+    "label": "Displaced weights, temporary (host)",
+    "mib": 878.8,
+    "nach_rueckholung_mib": 0.0,
+    "name": "vision_victim_host",
+    "transient": true
+   },
+   "opferart": "dense",
+   "place": "weights",
+   "resident_mib": 0.0,
+   "schema": "flliper.vision-victim/1",
+   "turm_mib": 878.8,
+   "turm_quelle": "model profile weights.visual_bytes (safetensors index)",
+   "verdict": {
+    "code": "W105b",
+    "rest_mib": 9834.4,
+    "stage": "ja",
+    "text": "W105b PdFlipVisionVictimShort: not triggered, the victims (MLP storages of the PP0 stage (27B flip)) hold 10713.2 MiB, the tower needs 878.8 MiB (rest 9834.4 MiB)",
+    "turm_mib": 878.8,
+    "verfuegbar_mib": 10713.2
+   },
+   "verfuegbar_mib": 10713.2,
+   "verfuegbar_quelle": "MLP bytes of the model profile (per_role_bytes.mlp) / 64 layers x 42 layers of stage 0 (mean per layer: approximation)",
+   "vision": "transient",
+   "vision_transient": {
+    "detail": "Victim weights of PP0 (dense) the tower is mapped onto while an image is encoded; the victims are weights that are already counted, so this adds 0 MiB resident and nothing to the sum of the weights. At least the tower bytes: moved bytes = tower bytes (plan section 2).",
+    "gerechnet": true,
+    "in_summe": false,
+    "label": "Vision transient",
+    "mib": 878.8,
+    "name": "vision_transient",
+    "resident_mib": 0.0,
+    "source": "model profile weights.visual_bytes (safetensors index)",
+    "transient": true
+   }
+  }
+ },
+ "schema": "flliper.propose-d/1",
+ "startprofil": {
+  "doc": {
+   "args": [
+    {
+     "flag": "--pdflip-weight-source",
+     "values": [
+      "exchange"
+     ]
+    },
+    {
+     "flag": "--pdflip-xchg-census",
+     "values": [
+      "/opt/htsglang/profiles/27b/xchg_census_weg2xsn246_27198a2711.json"
+     ]
+    },
+    {
+     "flag": "--pdflip-xchg-oncard",
+     "values": [
+      "host"
+     ]
+    },
+    {
+     "flag": "--pdflip-vision",
+     "values": [
+      "transient"
+     ]
+    },
+    {
+     "flag": "--user-reserve-mib",
+     "values": [
+      "1800,1400,1400"
+     ]
+    },
+    {
+     "flag": "--store-max-gb",
+     "values": [
+      "150"
+     ]
+    },
+    {
+     "flag": "--max-kv-per-request",
+     "values": [
+      "262144"
+     ]
+    },
+    {
+     "flag": "--xchg-bounce-depth",
+     "values": [
+      "1"
+     ]
+    },
+    {
+     "flag": "--pin-ledger-arm-m",
+     "values": [
+      "600"
+     ]
+    },
+    {
+     "flag": "--host-ledger-deviation",
+     "values": [
+      "1424e-ratchet-37gib-aus-xsn177-war-ganzarena-pinning-seit-1424e-je-slot"
+     ]
+    },
+    {
+     "flag": "--host-riegel-gib",
+     "values": [
+      "93.0"
+     ]
+    },
+    {
+     "flag": "--pdflip-xchg-legs",
+     "values": [
+      "both"
+     ]
+    },
+    {
+     "flag": "--pdflip-xchg-inject",
+     "values": [
+      "authoritative"
+     ]
+    },
+    {
+     "flag": "--p-bs",
+     "values": [
+      "1"
+     ]
+    },
+    {
+     "eq": true,
+     "flag": "--extra-p",
+     "values": [
+      "--max-running-requests=2"
+     ]
+    },
+    {
+     "flag": "--pdflip-weights-cpu-backup",
+     "values": [
+      "off"
+     ]
+    },
+    {
+     "flag": "--spec-form",
+     "values": [
+      "DFLASH"
+     ]
+    },
+    {
+     "flag": "--d-tp-objective",
+     "values": [
+      "decode-bs1"
+     ]
+    },
+    {
+     "flag": "--p-hostgap",
+     "values": []
+    },
+    {
+     "flag": "--d-replayssm-spec",
+     "values": [
+      "on"
+     ]
+    },
+    {
+     "flag": "--p-prefill-graph-split",
+     "values": [
+      "7"
+     ]
+    },
+    {
+     "flag": "--tp-prefill-max-tokens",
+     "values": [
+      "4096"
+     ]
+    },
+    {
+     "flag": "--x-ceiling-tokens",
+     "values": [
+      "12288"
+     ]
+    },
+    {
+     "flag": "--pdflip-vision-place",
+     "values": [
+      "weights"
+     ]
+    },
+    {
+     "flag": "--idle-layout",
+     "values": [
+      "pp"
+     ]
+    },
+    {
+     "flag": "--d-hold-s",
+     "values": [
+      "10"
+     ]
+    },
+    {
+     "flag": "--d-short-drain-tokens",
+     "values": [
+      "4096"
+     ]
+    },
+    {
+     "flag": "--p-chunk-policy",
+     "values": [
+      "dynamic"
+     ]
+    },
+    {
+     "flag": "--p-chunk-max",
+     "values": [
+      "2048"
+     ]
+    },
+    {
+     "flag": "--p-chunk-model",
+     "values": [
+      "builtin-int8"
+     ]
+    },
+    {
+     "flag": "--p-chunk-mscale",
+     "values": [
+      "int8"
+     ]
+    },
+    {
+     "flag": "--d-reshard",
+     "values": [
+      "wake-seg"
+     ]
+    },
+    {
+     "flag": "--d-reshard-presets",
+     "values": [
+      "drq=652:218:218"
+     ]
+    },
+    {
+     "flag": "--d-token-placement",
+     "values": [
+      "bandwidth"
+     ]
+    },
+    {
+     "flag": "--env-d",
+     "values": [
+      "FLLIPER_PDFLIP_EXTEND_TRIM_MIB=1200,0,0"
+     ]
+    },
+    {
+     "flag": "--model",
+     "values": [
+      "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-INT8-gdncov-vocabembed"
+     ]
+    }
+   ],
+   "exports": [],
+   "form": [
+    {
+     "name": "FLLIPER_HICACHE_ARENA_PREPIN",
+     "value": "1"
+    },
+    {
+     "name": "FLLIPER_HICACHE_ARENA_MAMBA_SLOTS",
+     "value": "112"
+    },
+    {
+     "name": "FLLIPER_PDFLIP_MAMBA_INNER_ANCHOR_RELEASE",
+     "value": "1"
+    },
+    {
+     "name": "FLLIPER_BARLINK_BAR1_ABORT_MAX_LAG",
+     "value": "64"
+    },
+    {
+     "name": "FLLIPER_PDFLIP_MAMBA_ANCHOR_INTERVAL",
+     "value": "4096"
+    },
+    {
+     "name": "FLLIPER_PDFLIP_MAMBA_MAX_STATES_PER_PATH",
+     "value": "4"
+    },
+    {
+     "name": "FLLIPER_PDFLIP_DENSE_REPACK_OUTSIDE_POOL",
+     "value": "1"
+    },
+    {
+     "name": "FLLIPER_HICACHE_DRAIN_BUDGET",
+     "value": "16384"
+    },
+    {
+     "name": "FLLIPER_HICACHE_ARENA_QUEUE_REFS",
+     "value": "1"
+    },
+    {
+     "name": "FLLIPER_PDFLIP_SEQ_SYNC_BATCH_MIB",
+     "value": "256"
+    },
+    {
+     "name": "FLLIPER_PDFLIP_SEQ_SYNC_BATCH_UNITS",
+     "value": "128"
+    },
+    {
+     "name": "FLLIPER_HICACHE_ARENA_LOAD_BLOCK_QUOTA",
+     "value": "16"
+    },
+    {
+     "name": "NCCL_BUFFSIZE",
+     "value": "1048576"
+    },
+    {
+     "name": "NCCL_MAX_NCHANNELS",
+     "value": "8"
+    },
+    {
+     "name": "FLLIPER_PDFLIP_VISION_FLIP_URGENT",
+     "value": "1"
+    },
+    {
+     "name": "FLLIPER_PDFLIP_STORE_SHORT_TAIL",
+     "value": "1"
+    },
+    {
+     "name": "FLLIPER_PDFLIP_ENABLE_SLEEP_PAUSE_OVERLAP",
+     "value": "1"
+    },
+    {
+     "name": "FLLIPER_PDFLIP_SLEEP_PAUSE_OVERLAP_GROUPS",
+     "value": "D"
+    },
+    {
+     "name": "FLLIPER_PDFLIP_ENABLE_PAUSE_COALESCE_UNMAP",
+     "value": "1"
+    },
+    {
+     "name": "FLLIPER_PDFLIP_ENABLE_D_IDLE_PUBLISH",
+     "value": "1"
+    },
+    {
+     "name": "FLLIPER_PDFLIP_ENABLE_FLUSH_QUIESCE_NONBLOCK",
+     "value": "1"
+    },
+    {
+     "name": "FLLIPER_PDFLIP_FLUSH_NONBLOCK_GROUPS",
+     "value": "D"
+    },
+    {
+     "name": "FLLIPER_PDFLIP_ENABLE_P_ANCHOR_PRESENCE",
+     "value": "1"
+    },
+    {
+     "name": "FLLIPER_PDFLIP_L15",
+     "value": "1"
+    },
+    {
+     "name": "FLLIPER_PDFLIP_L15_REFILL",
+     "value": "1"
+    },
+    {
+     "name": "FLLIPER_PDFLIP_L15_HOT_SHARE",
+     "value": "1"
+    },
+    {
+     "name": "FLLIPER_PDFLIP_VMM_EXPORTABLE",
+     "value": "1"
+    },
+    {
+     "name": "FLLIPER_PDFLIP_L15_MIB",
+     "value": "c1=7616,c2=1792"
+    }
+   ],
+   "id": "sha256:349f712b50a151bfc96d1043975b0f473c236a80f5b3d85796f4cc58ea0b5719",
+   "instr": [
+    {
+     "name": "FLLIPER_HICACHE_ROUND_TIMING",
+     "value": "512"
+    },
+    {
+     "name": "FLLIPER_PDFLIP_D_HOSTGAP",
+     "value": "512"
+    },
+    {
+     "name": "FLLIPER_HICACHE_ARENA_REF_CENSUS_S",
+     "value": "60"
+    },
+    {
+     "name": "FLLIPER_DFLASH_PHASE_TIMING",
+     "value": "${FLLIPER_PDFLIP_EVIDENCE_DIR}/dflash_phase_${HTSGLANG_TAG}"
+    },
+    {
+     "name": "FLLIPER_DEBUG_DFLASH_SYNC_TRACE",
+     "value": "20"
+    }
+   ],
+   "line": "27b",
+   "meta": {
+    "caller_switches": [
+     "FLLIPER_PDFLIP_EVIDENCE_DIR",
+     "HTSGLANG_P_CHUNK_POLICY",
+     "HTSGLANG_P_TRIM",
+     "HTSGLANG_RC10_D_PLACE"
+    ],
+    "notes": [
+     "Planner server profile from 27b (259ce8a4cdb1) for 3 cards, form flip"
+    ],
+    "origins": {},
+    "planner": {
+     "flag:--pp-stage-ratio": "42,11,11"
+    },
+    "profile_values": {
+     "env:D:FLLIPER_PDFLIP_EXTEND_TRIM_MIB": "1200,0,0",
+     "extra:P:--max-running-requests": "2",
+     "flag:--d-hold-s": "10",
+     "flag:--d-replayssm-spec": "on",
+     "flag:--d-reshard": "wake-seg",
+     "flag:--d-reshard-presets": "drq=652:218:218",
+     "flag:--d-short-drain-tokens": "4096",
+     "flag:--d-token-placement": "bandwidth",
+     "flag:--d-tp-objective": "decode-bs1",
+     "flag:--host-ledger-deviation": "1424e-ratchet-37gib-aus-xsn177-war-ganzarena-pinning-seit-1424e-je-slot",
+     "flag:--host-riegel-gib": "93.0",
+     "flag:--idle-layout": "pp",
+     "flag:--max-kv-per-request": "262144",
+     "flag:--model": "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-INT8-gdncov-vocabembed",
+     "flag:--p-bs": "1",
+     "flag:--p-chunk-max": "2048",
+     "flag:--p-chunk-model": "builtin-int8",
+     "flag:--p-chunk-mscale": "int8",
+     "flag:--p-chunk-policy": "dynamic",
+     "flag:--p-hostgap": "",
+     "flag:--p-prefill-graph-split": "7",
+     "flag:--pdflip-vision": "transient",
+     "flag:--pdflip-vision-place": "weights",
+     "flag:--pdflip-weight-source": "exchange",
+     "flag:--pdflip-weights-cpu-backup": "off",
+     "flag:--pdflip-xchg-census": "/opt/htsglang/profiles/27b/xchg_census_weg2xsn246_27198a2711.json",
+     "flag:--pdflip-xchg-inject": "authoritative",
+     "flag:--pdflip-xchg-legs": "both",
+     "flag:--pdflip-xchg-oncard": "host",
+     "flag:--pin-ledger-arm-m": "600",
+     "flag:--spec-form": "DFLASH",
+     "flag:--store-max-gb": "150",
+     "flag:--tp-prefill-max-tokens": "4096",
+     "flag:--user-reserve-mib": "1800,1400,1400",
+     "flag:--x-ceiling-tokens": "12288",
+     "flag:--xchg-bounce-depth": "1",
+     "form:FLLIPER_BARLINK_BAR1_ABORT_MAX_LAG": "64",
+     "form:FLLIPER_HICACHE_ARENA_LOAD_BLOCK_QUOTA": "16",
+     "form:FLLIPER_HICACHE_ARENA_MAMBA_SLOTS": "112",
+     "form:FLLIPER_HICACHE_ARENA_PREPIN": "1",
+     "form:FLLIPER_HICACHE_ARENA_QUEUE_REFS": "1",
+     "form:FLLIPER_HICACHE_DRAIN_BUDGET": "16384",
+     "form:FLLIPER_PDFLIP_DENSE_REPACK_OUTSIDE_POOL": "1",
+     "form:FLLIPER_PDFLIP_ENABLE_D_IDLE_PUBLISH": "1",
+     "form:FLLIPER_PDFLIP_ENABLE_FLUSH_QUIESCE_NONBLOCK": "1",
+     "form:FLLIPER_PDFLIP_ENABLE_PAUSE_COALESCE_UNMAP": "1",
+     "form:FLLIPER_PDFLIP_ENABLE_P_ANCHOR_PRESENCE": "1",
+     "form:FLLIPER_PDFLIP_ENABLE_SLEEP_PAUSE_OVERLAP": "1",
+     "form:FLLIPER_PDFLIP_FLUSH_NONBLOCK_GROUPS": "D",
+     "form:FLLIPER_PDFLIP_L15": "1",
+     "form:FLLIPER_PDFLIP_L15_HOT_SHARE": "1",
+     "form:FLLIPER_PDFLIP_L15_MIB": "c1=7616,c2=1792",
+     "form:FLLIPER_PDFLIP_L15_REFILL": "1",
+     "form:FLLIPER_PDFLIP_MAMBA_ANCHOR_INTERVAL": "4096",
+     "form:FLLIPER_PDFLIP_MAMBA_INNER_ANCHOR_RELEASE": "1",
+     "form:FLLIPER_PDFLIP_MAMBA_MAX_STATES_PER_PATH": "4",
+     "form:FLLIPER_PDFLIP_SEQ_SYNC_BATCH_MIB": "256",
+     "form:FLLIPER_PDFLIP_SEQ_SYNC_BATCH_UNITS": "128",
+     "form:FLLIPER_PDFLIP_SLEEP_PAUSE_OVERLAP_GROUPS": "D",
+     "form:FLLIPER_PDFLIP_STORE_SHORT_TAIL": "1",
+     "form:FLLIPER_PDFLIP_VISION_FLIP_URGENT": "1",
+     "form:FLLIPER_PDFLIP_VMM_EXPORTABLE": "1",
+     "form:NCCL_BUFFSIZE": "1048576",
+     "form:NCCL_MAX_NCHANNELS": "8",
+     "instr:FLLIPER_DEBUG_DFLASH_SYNC_TRACE": "20",
+     "instr:FLLIPER_DFLASH_PHASE_TIMING": "${FLLIPER_PDFLIP_EVIDENCE_DIR}/dflash_phase_${HTSGLANG_TAG}",
+     "instr:FLLIPER_HICACHE_ARENA_REF_CENSUS_S": "60",
+     "instr:FLLIPER_HICACHE_ROUND_TIMING": "512",
+     "instr:FLLIPER_PDFLIP_D_HOSTGAP": "512",
+     "var:PROFILE_CARD_COUNT": "3",
+     "var:PROFILE_CENSUS": "/opt/htsglang/profiles/27b/xchg_census_weg2xsn246_27198a2711.json",
+     "var:PROFILE_DRAFT": "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-DFlash2-W8-lued",
+     "var:PROFILE_FORM": "rc2final+rc10+prefix+rowauth",
+     "var:PROFILE_FORMAT": "int8",
+     "var:PROFILE_GPUS": "NVIDIA GeForce RTX 5090=1;NVIDIA GeForce RTX 3080=2",
+     "var:PROFILE_INVENTORY": "RTX5090,RTX3080,RTX3080",
+     "var:PROFILE_LINE": "27b",
+     "var:PROFILE_MEMAVAIL_MIN_GIB": "78",
+     "var:PROFILE_MODEL": "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-INT8-gdncov-vocabembed",
+     "var:PROFILE_NAME": "27b",
+     "var:PROFILE_NCCL_STATUS": "unproven",
+     "var:PROFILE_OWNER": "27B-Sitz (E4 28.09.: Release 27b = 27b-release-draft + Fix B; Basis 27b-base)",
+     "var:PROFILE_P_CHUNK": "dynamic",
+     "var:PROFILE_P_CHUNK_BEST": "dynamic",
+     "var:PROFILE_P_TRIM": "1",
+     "var:PROFILE_P_TRIM_BEST": "1",
+     "var:PROFILE_RC10_D_PLACE": "drq",
+     "var:PROFILE_RC10_D_PLACE_BEST": "drq",
+     "var:PROFILE_SHM_MIN_GIB": "40",
+     "var:PROFILE_STATUS": "abgenommen"
+    },
+    "proposal": {
+     "argv_sha256": "f28cdaa880bf6790c5ac057f6eb069deeed52d98a35ce1ae5096f9330209c605",
+     "basis": [
+      "release",
+      "27b"
+     ],
+     "basis_sha256": "259ce8a4cdb1204b3db218e11ff2790f91a768bd80dfaff9373f91338b5c70e0",
+     "form": "flip",
+     "goals": {
+      "kv_dtype": "fp8_e4m3",
+      "kv_tokens": 262144,
+      "p_cut": "auto",
+      "seats": 6
+     },
+     "n": 3,
+     "outcome": "geht",
+     "schema": "flliper.propose-d/1"
+    }
+   },
+   "name": "27b-proposal",
+   "schema": "flliper.server/1",
+   "source": {
+    "file": "27b.env",
+    "kind": "env",
+    "rc": "0",
+    "sha256": "sha256:259ce8a4cdb1204b3db218e11ff2790f91a768bd80dfaff9373f91338b5c70e0"
+   },
+   "vars": [
+    {
+     "name": "PROFILE_CARD_COUNT",
+     "value": "3"
+    },
+    {
+     "name": "PROFILE_CENSUS",
+     "value": "/opt/htsglang/profiles/27b/xchg_census_weg2xsn246_27198a2711.json"
+    },
+    {
+     "name": "PROFILE_DRAFT",
+     "value": "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-DFlash2-W8-lued"
+    },
+    {
+     "name": "PROFILE_FORM",
+     "value": "rc2final+rc10+prefix+rowauth"
+    },
+    {
+     "name": "PROFILE_FORMAT",
+     "value": "int8"
+    },
+    {
+     "name": "PROFILE_GPUS",
+     "value": "NVIDIA GeForce RTX 5090=1;NVIDIA GeForce RTX 3080=2"
+    },
+    {
+     "name": "PROFILE_INVENTORY",
+     "value": "RTX5090,RTX3080,RTX3080"
+    },
+    {
+     "name": "PROFILE_LINE",
+     "value": "27b"
+    },
+    {
+     "name": "PROFILE_MEMAVAIL_MIN_GIB",
+     "value": "78"
+    },
+    {
+     "name": "PROFILE_MODEL",
+     "value": "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-INT8-gdncov-vocabembed"
+    },
+    {
+     "name": "PROFILE_NAME",
+     "value": "27b"
+    },
+    {
+     "name": "PROFILE_NCCL_STATUS",
+     "value": "unproven"
+    },
+    {
+     "name": "PROFILE_OWNER",
+     "value": "27B-Sitz (E4 28.09.: Release 27b = 27b-release-draft + Fix B; Basis 27b-base)"
+    },
+    {
+     "name": "PROFILE_P_CHUNK",
+     "value": "dynamic"
+    },
+    {
+     "name": "PROFILE_P_CHUNK_BEST",
+     "value": "dynamic"
+    },
+    {
+     "name": "PROFILE_P_TRIM",
+     "value": "1"
+    },
+    {
+     "name": "PROFILE_P_TRIM_BEST",
+     "value": "1"
+    },
+    {
+     "name": "PROFILE_RC10_D_PLACE",
+     "value": "drq"
+    },
+    {
+     "name": "PROFILE_RC10_D_PLACE_BEST",
+     "value": "drq"
+    },
+    {
+     "name": "PROFILE_SHM_MIN_GIB",
+     "value": "40"
+    },
+    {
+     "name": "PROFILE_STATUS",
+     "value": "abgenommen"
+    }
+   ]
+  },
+  "line": "27b",
+  "name": "27b-proposal",
+  "probleme": [],
+  "schema": "flliper.server/1",
+  "verifiziert": true
+ },
+ "values": [
+  {
+   "alt": "1800,1400,1400",
+   "changed": false,
+   "entries": 3,
+   "in_argv": true,
+   "key": "flag:--user-reserve-mib",
+   "label": "--user-reserve-mib",
+   "reason": "Value of the profile (measured or set by the operator) unchanged: the profile applies to exactly these cards",
+   "source": "Profile 27b.env, same inventory [RTX5090,RTX3080,RTX3080]",
+   "state": "vorgeschlagen",
+   "value": "1800,1400,1400",
+   "verdikte": []
+  },
+  {
+   "alt": "1200,0,0",
+   "changed": false,
+   "entries": 3,
+   "in_argv": true,
+   "key": "env:D:FLLIPER_PDFLIP_EXTEND_TRIM_MIB",
+   "label": "--env-d FLLIPER_PDFLIP_EXTEND_TRIM_MIB",
+   "reason": "Value of the profile (measured or set by the operator) unchanged: the profile applies to exactly these cards",
+   "source": "Profile 27b.env, same inventory [RTX5090,RTX3080,RTX3080]",
+   "state": "vorgeschlagen",
+   "value": "1200,0,0",
+   "verdikte": []
+  },
+  {
+   "alt": "c1=7616,c2=1792",
+   "changed": false,
+   "entries": 2,
+   "in_argv": true,
+   "key": "export:FLLIPER_PDFLIP_L15_MIB",
+   "label": "env FLLIPER_PDFLIP_L15_MIB",
+   "reason": "Value of the profile (measured or set by the operator) unchanged: the profile applies to exactly these cards (no card vector of the topology check of the launcher: unchanged from the profile)",
+   "source": "Profile 27b.env, same inventory [RTX5090,RTX3080,RTX3080]",
+   "state": "vorgeschlagen",
+   "value": "c1=7616,c2=1792",
+   "verdikte": []
+  },
+  {
+   "alt": "drq=652:218:218",
+   "changed": false,
+   "entries": 1,
+   "in_argv": true,
+   "key": "flag:--d-reshard-presets",
+   "label": "--d-reshard-presets",
+   "reason": "Value of the profile (measured or set by the operator) unchanged: the profile applies to exactly these cards (no card vector of the topology check of the launcher: unchanged from the profile)",
+   "source": "Profile 27b.env, same inventory [RTX5090,RTX3080,RTX3080]",
+   "state": "vorgeschlagen",
+   "value": "drq=652:218:218",
+   "verdikte": []
+  },
+  {
+   "alt": null,
+   "changed": true,
+   "entries": 3,
+   "in_argv": false,
+   "in_argv_planer": false,
+   "key": null,
+   "label": "--pp-stage-ratio (Seed)",
+   "profile_value": null,
+   "reason": "Layer cut proportional to the GEMM rate, limited per stage to the memory capacity; attention layers per stage 10,3,3; NOT set: the launcher solves the cut itself (p_cut=pin sets it)",
+   "seed": true,
+   "source": "Rule: P cut by GEMM rate; rate: measured: GEMM rate per card",
+   "state": "vorgeschlagen",
+   "value": "42,11,11",
+   "verdikte": []
+  },
+  {
+   "alt": "decode-bs1",
+   "changed": false,
+   "entries": 1,
+   "in_argv": true,
+   "key": "flag:--d-tp-objective",
+   "label": "--d-tp-objective",
+   "reason": "the goal value of the profile stays (a scalar of the form, no card measurement)",
+   "source": "Profile 27b.env (unchanged)",
+   "state": "vorgeschlagen",
+   "value": "decode-bs1",
+   "verdikte": []
+  },
+  {
+   "alt": null,
+   "changed": false,
+   "entries": 0,
+   "in_argv": false,
+   "key": "flag:--pp-solve-pool-floor",
+   "label": "--pp-solve-pool-floor",
+   "reason": "lower bound of the priced KV pool size (in world KV tokens) above which the cut solver ranks; 0 = off; without the flag the launcher default applies (the pool of the ordered 3-stage cut, no bound for another stage count)",
+   "source": "not in profile 27b.env: launcher default",
+   "state": "vorgeschlagen",
+   "value": null,
+   "verdikte": []
+  },
+  {
+   "alt": "12288",
+   "changed": false,
+   "entries": 1,
+   "in_argv": true,
+   "key": "flag:--x-ceiling-tokens",
+   "label": "--x-ceiling-tokens",
+   "reason": "upper bound up to which the front may raise X (tokens from which a request goes to D instead of P) at runtime, and at the same time the bar --tp-prefill-max-tokens of D; 0 = off (D and front keep the start X)",
+   "source": "from profile 27b.env (unchanged; a scalar of the form, no card measurement)",
+   "state": "vorgeschlagen",
+   "value": "12288",
+   "verdikte": []
+  }
+ ],
+ "verdict": {
+  "argv_final_sha256": "3ca8c21a07599cc46c92e79dfd13902b6e2bb686cfb0ba5c32299bfbf203676d",
+  "argv_sha256": "f28cdaa880bf6790c5ac057f6eb069deeed52d98a35ce1ae5096f9330209c605",
+  "forced": [],
+  "form": "flip",
+  "geht": true,
+  "inventory": [
+   {
+    "cc": [
+     8,
+     6
+    ],
+    "index": 0,
+    "name": "NVIDIA GeForce RTX 3080",
+    "total_mib": 20480
+   },
+   {
+    "cc": [
+     12,
+     0
+    ],
+    "index": 1,
+    "name": "NVIDIA GeForce RTX 5090",
+    "total_mib": 32607
+   },
+   {
+    "cc": [
+     8,
+     6
+    ],
+    "index": 2,
+    "name": "NVIDIA GeForce RTX 3080",
+    "total_mib": 20480
+   }
+  ],
+  "mit_force": null,
+  "n": 3,
+  "ohne_force": {
+   "code": null,
+   "exc_msg": "",
+   "exc_type": null,
+   "exc_where": "",
+   "forced": [],
+   "kind": null,
+   "launcher_code": null,
+   "rc": 0,
+   "zeilen": 248
+  },
+  "ok_with_force": true,
+  "oracle": {
+   "duration_s": 30.16,
+   "notizen": [
+    "model: /spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-INT8-gdncov-vocabembed has no config.json -> header snapshot stub /tmp/planer_oracle_models/Qwen3.8-27B-INT8-gdncov-vocabembed",
+    "draft: /spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-DFlash2-W8-lued has no config.json -> header snapshot stub /tmp/planer_oracle_models/Qwen3.8-27B-DFlash2-W8-lued",
+    "--pdflip-xchg-census-foreign added (the census names the registry path, the farm is another path)"
+   ],
+   "runs": 1,
+   "version": {
+    "hw_fit": "4896e1cfe0b97ae5",
+    "launcher": "7368c4a1a081a868",
+    "propose_oracle": "8af4b0b24e9bb2c9",
+    "refusals": "4d580c430d114481",
+    "topology": "41e859db94f603d8"
+   }
+  },
+  "outcome": "geht",
+  "plan": {
+   "budgets": [
+    {
+     "card": "NVIDIA GeForce RTX 5090",
+     "group": "P",
+     "mib": 26064,
+     "nvml_idx": 1,
+     "ordinal": 0,
+     "pass": "P"
+    },
+    {
+     "card": "NVIDIA GeForce RTX 3080",
+     "group": "P",
+     "mib": 15840,
+     "nvml_idx": 0,
+     "ordinal": 1,
+     "pass": "P"
+    },
+    {
+     "card": "NVIDIA GeForce RTX 3080",
+     "group": "P",
+     "mib": 15328,
+     "nvml_idx": 2,
+     "ordinal": 2,
+     "pass": "P"
+    },
+    {
+     "card": "NVIDIA GeForce RTX 5090",
+     "group": "P",
+     "mib": 26064,
+     "nvml_idx": 1,
+     "ordinal": 0,
+     "pass": "P"
+    },
+    {
+     "card": "NVIDIA GeForce RTX 3080",
+     "group": "P",
+     "mib": 8224,
+     "nvml_idx": 0,
+     "ordinal": 1,
+     "pass": "P"
+    },
+    {
+     "card": "NVIDIA GeForce RTX 3080",
+     "group": "P",
+     "mib": 13536,
+     "nvml_idx": 2,
+     "ordinal": 2,
+     "pass": "P"
+    },
+    {
+     "card": "NVIDIA GeForce RTX 5090",
+     "group": "D",
+     "mib": 27800,
+     "nvml_idx": 1,
+     "ordinal": 0,
+     "pass": "D(dry, expectation)"
+    },
+    {
+     "card": "NVIDIA GeForce RTX 3080",
+     "group": "D",
+     "mib": 17520,
+     "nvml_idx": 0,
+     "ordinal": 1,
+     "pass": "D(dry, expectation)"
+    },
+    {
+     "card": "NVIDIA GeForce RTX 3080",
+     "group": "D",
+     "mib": 17328,
+     "nvml_idx": 2,
+     "ordinal": 2,
+     "pass": "D(dry, expectation)"
+    }
+   ],
+   "group_flags": {
+    "D": {
+     "--admin-api-key": "<redacted>",
+     "--barlink": "",
+     "--barlink-bar1-cap-cycles": "300000000000",
+     "--barlink-bar1-window-mib": "16,TP_0=32,DCP_0=40",
+     "--barlink-transport": "bar1",
+     "--barlink-uncovered-class": "refuse",
+     "--chat-template-default-kwargs": "{\"preserve_thinking\": true}",
+     "--chunked-prefill-size": "4096",
+     "--collective-census-interval": "50",
+     "--context-length": "262144",
+     "--enable-cache-report": "",
+     "--enable-hierarchical-cache": "",
+     "--enable-linear-replayssm-spec": "",
+     "--enable-memory-saver": "",
+     "--enable-metrics": "",
+     "--hicache-canonical-kv-page": "",
+     "--hicache-host-role": "staging",
+     "--hicache-io-backend": "direct",
+     "--hicache-mamba-host-mib": "100",
+     "--hicache-mem-layout": "layer_first",
+     "--hicache-size": "4",
+     "--hicache-storage-backend": "file",
+     "--hicache-storage-backend-extra-config": "{\"max_size\":\"150000000000\",\"min_free_space\":\"34359738368\",\"max_size_scope\":\"shared\"}",
+     "--hicache-write-policy": "write_back",
+     "--host": "127.0.0.1",
+     "--json-model-override-args": "{\"language_model_only\": true}",
+     "--kv-backing-relief": "",
+     "--kv-cache-dtype": "fp8_e4m3",
+     "--linear-replayssm-cache-len": "16",
+     "--mamba-radix-cache-strategy": "extra_buffer",
+     "--mamba-slot-reorder": "",
+     "--mamba-ssm-dtype": "bfloat16",
+     "--max-kv-per-request": "262144",
+     "--max-running-requests": "6",
+     "--model-path": "<MODELS>/Qwen3.8-27B-INT8-gdncov-vocabembed",
+     "--num-continuous-decode-steps": "2",
+     "--page-size": "1",
+     "--port": "30032",
+     "--pp-size": "1",
+     "--random-seed": "785500001",
+     "--rank-gpu-id": "0,1,2",
+     "--rank-gpu-memory-mib": "27800,17520,17328",
+     "--rank-mlp-ratio": "652,218,218",
+     "--rank-tp-ratio": "58,25,25",
+     "--reasoning-parser": "qwen3",
+     "--scheduler-distributed-teardown": "",
+     "--served-model-name": "Qwen3.8-27B-INT8-gdncov-vocabembed",
+     "--skip-server-warmup": "",
+     "--speculative-algorithm": "DFLASH",
+     "--speculative-draft-model-path": "<MODELS>/Qwen3.8-27B-DFlash2-W8-lued",
+     "--speculative-draft-window-size": "2048",
+     "--speculative-num-draft-tokens": "8",
+     "--tool-call-parser": "qwen3_coder",
+     "--tp-prefill-max-tokens": "12288",
+     "--tp-size": "3",
+     "--trust-remote-code": "",
+     "--uneven-dcp": "",
+     "--uneven-dcp-weighted": ""
+    },
+    "P": {
+     "--admin-api-key": "<redacted>",
+     "--barlink": "",
+     "--barlink-bar1-cap-cycles": "300000000000",
+     "--barlink-bar1-window-mib": "24,PP_0=96",
+     "--barlink-transport": "bar1",
+     "--chat-template-default-kwargs": "{\"preserve_thinking\": true}",
+     "--chunked-prefill-size": "2048",
+     "--collective-census-interval": "50",
+     "--context-length": "262144",
+     "--cuda-graph-config": "{\"prefill\":{\"backend\":\"full\",\"bs\":[512],\"full_prefill_max_req\":1}}",
+     "--disable-overlap-schedule": "",
+     "--enable-cache-report": "",
+     "--enable-hierarchical-cache": "",
+     "--enable-memory-saver": "",
+     "--enable-metrics": "",
+     "--hicache-canonical-kv-page": "",
+     "--hicache-host-role": "staging",
+     "--hicache-io-backend": "direct",
+     "--hicache-mamba-host-mib": "100",
+     "--hicache-mem-layout": "layer_first",
+     "--hicache-size": "1",
+     "--hicache-storage-backend": "file",
+     "--hicache-storage-backend-extra-config": "{\"max_size\":\"150000000000\",\"min_free_space\":\"34359738368\",\"max_size_scope\":\"shared\"}",
+     "--hicache-write-policy": "write_back",
+     "--host": "127.0.0.1",
+     "--json-model-override-args": "{\"language_model_only\": true}",
+     "--kv-backing-relief": "",
+     "--kv-cache-dtype": "fp8_e4m3",
+     "--mamba-slot-reorder": "",
+     "--mamba-ssm-dtype": "bfloat16",
+     "--max-kv-per-request": "262144",
+     "--max-mamba-cache-size": "24",
+     "--max-running-requests": "2",
+     "--max-total-tokens": "289250",
+     "--model-path": "<MODELS>/Qwen3.8-27B-INT8-gdncov-vocabembed",
+     "--page-size": "1",
+     "--port": "30031",
+     "--pp-async-batch-depth": "0",
+     "--pp-attn-stage-ratio": "10,3,3",
+     "--pp-size": "3",
+     "--pp-stage-ratio": "40,14,10",
+     "--random-seed": "785500001",
+     "--rank-gpu-id": "0,1,2",
+     "--rank-gpu-memory-mib": "26064,8224,13536",
+     "--reasoning-parser": "qwen3",
+     "--scheduler-distributed-teardown": "",
+     "--served-model-name": "Qwen3.8-27B-INT8-gdncov-vocabembed",
+     "--skip-server-warmup": "",
+     "--speculative-algorithm": "DFLASH",
+     "--speculative-draft-kv-only": "",
+     "--speculative-draft-model-path": "<MODELS>/Qwen3.8-27B-DFlash2-W8-lued",
+     "--speculative-num-draft-tokens": "8",
+     "--tool-call-parser": "qwen3_coder",
+     "--tp-size": "1",
+     "--trust-remote-code": ""
+    },
+    "front": {
+     "--admin-key-file": "/spinning/gpu-arb/weg2/boot_plangate.adminkey",
+     "--anon-preboot-bytes": "5015404544",
+     "--awake": "D",
+     "--carrier-max-tokens": "0",
+     "--d-bs": "6",
+     "--d-hold-s": "10.0",
+     "--d-short-drain-tokens": "4096",
+     "--dc-reserve": "GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d=2392,GPU-5c648f96-be1d-42d5-0221-34d11ab137f7=1810,GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4=1810",
+     "--decode": "http://127.0.0.1:30032",
+     "--decode-sid": "0",
+     "--drain-deadline-s": "120.0",
+     "--fairness-w-s": "45.0",
+     "--flip-min-work-tokens": "4096",
+     "--host": "0.0.0.0",
+     "--host-census-arena-widths": "32768,78446592",
+     "--host-census-key": "5a324e4044bf915181537d1481662a3050e984acd2eb3977174a54aba0ab3143|arch=dense,experts=none,draft=dflash,p_draft=cold,kv=paged_dcp,flip=family,vision=transient,profile=qwen27b,model=Qwen3.8-27B-INT8-gdncov-vocabembed",
+     "--host-census-record": "/spinning/evidence-665-f1/host_census_record.json",
+     "--idle-layout": "P",
+     "--p-concurrency": "1",
+     "--port": "30030",
+     "--prefill": "http://127.0.0.1:30031",
+     "--prefill-sid": "0",
+     "--record-line": "model=<MODELS>/Qwen3.8-27B-INT8-gdncov-vocabembed|repo=<TREE>|head=HEAD|evidence=/spinning/evidence-665-f1",
+     "--store-dir": "<STORE>/l3-qwen27b-Qwen3.8-27B-INT8-gdncov-vocabembed-4e6f7b0b0b",
+     "--tag": "plangate",
+     "--tp-prefill-max-tokens": "4096",
+     "--vision": "transient",
+     "--weight-chunks": "8",
+     "--weight-form": "exchange",
+     "--x-ceiling-tokens": "12288"
+    }
+   },
+   "pp_cut": {
+    "attn": "10,3,3",
+    "chosen_pool": "289250",
+    "layers": "40,14,10",
+    "makespan_ms": "99.9",
+    "pool_floor": "264192",
+    "pool_floor_source": "flag"
+   },
+   "w_codes": {
+    "W21": 1,
+    "W38": 1,
+    "W56": 1,
+    "W65": 1,
+    "W69": 1
+   },
+   "zeilen": 248
+  },
+  "profil": {
+   "draft": "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-DFlash2-W8-lued",
+   "file_sha256": "259ce8a4cdb1204b3db218e11ff2790f91a768bd80dfaff9373f91338b5c70e0",
+   "input_sha256": "047ecc20d4be4fee1a09ab94f9def773ab7f57d0d99a1e6fd4e23533101dce5c",
+   "model": "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-INT8-gdncov-vocabembed",
+   "name": "27b",
+   "proposal_sha256": "f28cdaa880bf6790c5ac057f6eb069deeed52d98a35ce1ae5096f9330209c605",
+   "quelle": "27b.env",
+   "rolle": "basis",
+   "status": "abgenommen"
+  },
+  "run": {
+   "code": null,
+   "exc_msg": "",
+   "exc_type": null,
+   "exc_where": "",
+   "forced": [],
+   "kind": null,
+   "launcher_code": null,
+   "rc": 0,
+   "zeilen": 248
+  },
+  "schema": "flliper.verdict/1",
+  "vectors": {
+   "laengen": {
+    "--env-d FLLIPER_PDFLIP_EXTEND_TRIM_MIB": 3,
+    "--user-reserve-mib": 3
+   },
+   "nicht_n": {}
+  },
+  "verdikte": [
+   {
+    "code": "FIT",
+    "force_state": "geht",
+    "force_via": null,
+    "forcebar": null,
+    "level": "fit",
+    "reason": "hw_fit: yes (rest 24396.855999999992 MiB)",
+    "rest_mib": 24396.855999999992,
+    "stage": "ja",
+    "title": "Fit according to hw_fit (necessary condition)",
+    "values": [],
+    "zeilen": []
+   },
+   {
+    "code": "VISION-VICTIM",
+    "etikett": "planner calculation",
+    "force_state": "geht",
+    "force_via": null,
+    "forcebar": null,
+    "host_mib": 878.8,
+    "level": "fit",
+    "missing_mib": null,
+    "opferart": "dense",
+    "reason": "W105b PdFlipVisionVictimShort: not triggered, the victims (MLP storages of the PP0 stage (27B flip)) hold 10713.2 MiB, the tower needs 878.8 MiB (rest 9834.4 MiB)",
+    "stage": "ja",
+    "title": "Vision tower on displaced weights: victim bytes against tower bytes (planner calculation)",
+    "turm_mib": 878.8,
+    "values": [],
+    "verfuegbar_mib": 10713.2
+   }
+  ],
+  "zaehlung": {
+   "force": 0,
+   "is_blocked": 0,
+   "ungeprueft": 0
+  }
+ }
+}
