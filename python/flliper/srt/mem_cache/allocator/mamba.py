@@ -590,6 +590,13 @@ class MambaSlotAllocator:
         )
 
     def clear(self):
+        # D-FORK-ANCHOR review N1: every in-flight fork plan drawn from THIS allocator loses its slot here -- the
+        # plans turn split-only before any later donation could revoke (or a stale free release) a slot that a new
+        # owner of the fresh generation holds
+        self._pdflip_clear_epoch = getattr(self, "_pdflip_clear_epoch", 0) + 1
+        from flliper.srt.pdflip import turn_anchor as _ta
+
+        _ta.on_pool_clear(self)
         # #1051b: a flush/reset invalidates every outstanding slot id, so an
         # open group iterator must die with the generation that minted it.
         # Surviving it would let `alloc()` hand out an id from the OLD

@@ -676,6 +676,11 @@ class UnifiedMambaSlotAllocator:
         return self._multi_ended_allocator.free(free_index)
 
     def clear(self):
+        # D-FORK-ANCHOR review N1: in-flight fork plans of this allocator lose their slots (turn_anchor.on_pool_clear)
+        self._pdflip_clear_epoch = getattr(self, "_pdflip_clear_epoch", 0) + 1
+        from flliper.srt.pdflip import turn_anchor as _ta
+
+        _ta.on_pool_clear(self)
         self._alloc_iter = None
         return self._multi_ended_allocator.clear()
 

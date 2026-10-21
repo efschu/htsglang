@@ -143,17 +143,92 @@ def token() -> Optional[int]:
     return tok if tok is not None and tok > 0 else None
 
 
+def _group() -> str:
+    return (os.environ.get("FLLIPER_PDFLIP_GROUP", "") or "").strip().upper()
+
+
+def d_fork_anchor_on() -> bool:
+    """``FLLIPER_PDFLIP_D_FORK_ANCHOR`` (default ON): the fork tracks on group D.
+
+    Review F6 (H99, no fallback): an unreadable value is NOT turned into a default here -- one rank answering True
+    from an exception while its peers read the env would split ``d_mode``; the error propagates and stops by name."""
+    from flliper.srt.environ import envs
+
+    return bool(envs.FLLIPER_PDFLIP_D_FORK_ANCHOR.get())
+
+
+def d_mode() -> bool:
+    """D-FORK-ANCHOR: True on a group-D process with the token and the switch -- the plans are POSITION plans
+    (every rank of the group plans the same positions from the same ids) and a plan without a written state is
+    inserted SPLIT-ONLY instead of dropped (``_pdflip_turn_insert_one``), so every rank's tree has the same
+    nodes. Env reads only (the same answer on every rank of the group)."""
+    return _group() == "D" and token() is not None and d_fork_anchor_on()
+
+
+def d_split_only_rank() -> bool:
+    """D-FORK-ANCHOR: a rank that holds no recurrent state (a Form A expert worker, a KV-only rank) plans
+    every fork track SPLIT-ONLY -- no slot, no gather row, the node ``key[:t]`` without a mamba value; its
+    anchors are bookkeeping and it follows the host's depth with the mamba rule suspended (H98).
+
+    Review A4 (21.10.), DELIBERATE ASYMMETRY: on a D fork node the worker's mamba bookkeeping does NOT mirror TP0's
+    (TP0: the state, workers: none). Consequences, all accepted by design: (a) the #639b premise "same count,
+    replicated LRU, same tombstone set" (mem_cache/common.py peer_needs_mamba_evict) does not hold for fork nodes --
+    harmless on Form A, a worker in the follow walk reads no mamba validity; (b) an R12 STATE of TP0 that names an
+    anchor host copy on a fork node reconciles to ``short`` on the worker (form_a_host_shadow._reconcile) -- EXPECTED
+    for fork anchors, no action; (c) TP0 holds one more slot per taken fork: the review A1 guard
+    (UnifiedRadixCache._d_fork_donation_room) keeps it from ever costing the step's donation that slot, so the step
+    node is inserted on every rank alike. E1 (workers draw a byteless mirror slot) was weighed and not built: a worker
+    runs no GDN forward, so its "marks" would be a second, unverified verdict, and TP0-only slots exist anyway
+    (S109R device reads) -- the guard covers the one place the asymmetry could split the tree."""
+    # No bare except (H99 audit, the bare-except trap): an undecidable rank form is a named stop in
+    # ``form_a_follow_active`` -- swallowing it into "holds state" would let this rank plan a slot its peers do not.
+    from flliper.srt.managers.tp_match_floor import this_rank_follows
+    from flliper.srt.rank_role import kv_only_rank
+
+    return bool(this_rank_follows()) or bool(kv_only_rank())
+
+
 def armed(server_args: Any = None) -> Optional[int]:
     """The token id when the turn anchor runs on THIS process, else None.
 
-    Group P only (the group that writes the END anchor the next turn cannot
-    use), extra_buffer tracks without a checkpoint interval (the track form
-    the second row joins), and no overlap schedule (the insert must follow
-    the forward launch on the same thread, see the module doc)."""
+    Group P (the group that writes the END anchor the next turn cannot use) with extra_buffer tracks without a
+    checkpoint interval (the track form the second row joins) and no overlap schedule.
+
+    D-FORK-ANCHOR (21.10.): group D too (``d_mode``), WITH the overlap schedule. THE ORDERING, proven from the
+    code: (a) the second row is appended to the SAME gather tensors as the step's own track
+    (``GDNAttnBackend._pdflip_turn_rows`` extends ``track_ssm_h_src/dst`` and ``track_conv_indices`` in
+    ``init_forward_metadata``), so ONE kernel launch writes the step's slot and the fork slot; (b) the marks
+    are set in that same Python call, i.e. inside ``run_batch`` of the step's batch, and the plan is consumed
+    only by the request's next tree insert (``cache_unfinished_req`` at the next batch's scheduling or in
+    ``process_batch_result``, ``cache_finished_req``) -- both after ``run_batch`` returned on this thread;
+    (c) the fork node is inserted in the SAME insert call, immediately before the step's own node, with no GPU
+    read in between (insert / match / lock are bookkeeping). So every reader ordering that is correct for the
+    step's own track slot under overlap is correct for the fork slot. A plan consumed without its marks (a
+    batch that never ran, a geometry change, a captured graph) is inserted split-only and its slot freed: no
+    anchor, no error."""
     tok = token()
     if tok is None:
         return None
-    if (os.environ.get("FLLIPER_PDFLIP_GROUP", "") or "").strip().upper() != "P":
+    grp = _group()
+    if grp == "D":
+        if not d_fork_anchor_on():
+            return None
+        if server_args is None:
+            try:
+                from flliper.srt.runtime_context import get_server_args
+
+                server_args = get_server_args()
+            except Exception:  # noqa: BLE001
+                return None
+        try:
+            if not server_args.enable_mamba_extra_buffer():
+                return None
+        except Exception:  # noqa: BLE001
+            return None
+        if getattr(server_args, "mamba_checkpoint_interval", None) is not None:
+            return None
+        return tok
+    if grp != "P":
         return None
     if server_args is None:
         try:
@@ -401,6 +476,10 @@ def note_step(batch: Any, desc: Optional[TurnTracks], req: Any, row: int,
         setattr(req, IMAGE_PENDING_ATTR, None)
     if not track_mask or len(getattr(req, "output_ids", None) or ()) > 0:
         return desc
+    if d_mode():
+        # D-FORK-ANCHOR: the TURN, GEN-FORK, CLOSE-FORK and IMAGE-END tracks only (the twin / told-fork / sys-grid
+        # tracks are P's -- their positions come from PP0's rows, not from the ids alone)
+        twin_bounds, fork_told = (), 0
     desc = _note_turn_twin_steps(batch, desc, req, row, prefix, end, main_track,
                                  chunk, page, tok, twin_bounds)
     if fork_told:
@@ -413,7 +492,7 @@ def note_step(batch: Any, desc: Optional[TurnTracks], req: Any, row: int,
         # CLOSE-FORK TRACK: armed wherever the turn anchor is (``tok``), no own switch
         desc = _note_close_step(batch, desc, req, row, prefix, end, main_track,
                                 chunk, page, tok)
-    if tok is not None and sys_grid_armed():
+    if tok is not None and sys_grid_armed() and not d_mode():
         desc = _note_sysgrid_steps(batch, desc, req, row, prefix, end, main_track,
                                    chunk, page, tok)
     if tok is not None:
@@ -455,9 +534,9 @@ def _note_turn_twin_steps(batch: Any, desc: Optional[TurnTracks], req: Any, row:
         return desc
     if int(getattr(req, "cache_protected_len", 0) or 0) >= t:
         return desc
-    slot = _alloc_slot(batch)
+    slot, split_ok = _draw_slot(batch)
     rid = str(getattr(req, "rid", "?"))
-    if slot is None:
+    if slot is None and not split_ok:
         n = _count("no_slot")
         if _log_due(n):
             logger.info("PDFLIP TURN-ANCHOR SKIP rid=%s reason=no_free_slot turn=%d "
@@ -469,16 +548,16 @@ def _note_turn_twin_steps(batch: Any, desc: Optional[TurnTracks], req: Any, row:
         if _tw.status(rid, t) == "planned":
             _tw.note_declined(rid, t)
         return desc
-    if desc is None:
-        desc = TurnTracks(len(batch.reqs), need=slot_state_kinds(batch.req_to_token_pool))
     # the slot stays a tensor: no device read on the scheduler thread
-    desc.add(row, slot, t, prefix, end - prefix)
-    setattr(req, PENDING_ATTR, (t, slot, desc, int(prefix), int(end)))
-    # S52 (pdflip-1-30): the turn anchor is a promise to every twin with shared > t, also
-    # one that reaches PP0 only after this step was planned (twin_anchor.deepest_track)
-    from flliper.srt.pdflip import twin_anchor as _tw
+    desc = _put_plan(batch, desc, req, row, PENDING_ATTR, t, slot, prefix, end)
+    if not d_mode():
+        # S52 (pdflip-1-30): the turn anchor is a promise to every twin with shared > t, also
+        # one that reaches PP0 only after this step was planned (twin_anchor.deepest_track)
+        from flliper.srt.pdflip import twin_anchor as _tw
 
-    _tw.note_track_planned(rid, t)
+        _tw.note_track_planned(rid, t)
+    else:
+        note_d_planned(req, "turn", t, prefix, end, slot)
     n = _count("planned")
     if _log_due(n):
         logger.info(
@@ -727,20 +806,20 @@ def _note_gen_step(batch: Any, desc: Optional[TurnTracks], req: Any, row: int,
             logger.info("PDFLIP GEN-FORK-ANCHOR SHARED rid=%s at=%d step=[%d,%d) (n=%d; the "
                         "turn/twin/fork track writes this very position)", rid, t, prefix, end, n)
         return desc
-    slot = _alloc_slot(batch)
-    if slot is None:
+    slot, split_ok = _draw_slot(batch)
+    if slot is None and not split_ok:
         n = _count("gen_no_slot")
         if _log_due(n):
             logger.info("PDFLIP GEN-FORK-ANCHOR SKIP rid=%s reason=no_free_slot at=%d "
                         "step=[%d,%d) (n=%d; no eviction, no reserve)", rid, t, prefix, end, n)
         return desc
-    if desc is None:
-        desc = TurnTracks(len(batch.reqs), need=slot_state_kinds(batch.req_to_token_pool))
-    desc.add(row, slot, t, prefix, end - prefix)
-    setattr(req, GEN_PENDING_ATTR, (t, slot, desc, int(prefix), int(end)))
-    from flliper.srt.pdflip import twin_anchor as _tw
+    desc = _put_plan(batch, desc, req, row, GEN_PENDING_ATTR, t, slot, prefix, end)
+    if not d_mode():
+        from flliper.srt.pdflip import twin_anchor as _tw
 
-    _tw.note_track_planned(rid, t)
+        _tw.note_track_planned(rid, t)
+    else:
+        note_d_planned(req, "gen", t, prefix, end, slot)
     n = _count("gen_planned")
     if _log_due(n):
         logger.info(
@@ -857,20 +936,20 @@ def _note_close_step(batch: Any, desc: Optional[TurnTracks], req: Any, row: int,
                         "turn/twin/fork/gen track writes this very position)", rid, t, prefix,
                         end, n)
         return desc
-    slot = _alloc_slot(batch)
-    if slot is None:
+    slot, split_ok = _draw_slot(batch)
+    if slot is None and not split_ok:
         n = _count("close_no_slot")
         if _log_due(n):
             logger.info("PDFLIP CLOSE-FORK-ANCHOR SKIP rid=%s reason=no_free_slot at=%d "
                         "step=[%d,%d) (n=%d; no eviction, no reserve)", rid, t, prefix, end, n)
         return desc
-    if desc is None:
-        desc = TurnTracks(len(batch.reqs), need=slot_state_kinds(batch.req_to_token_pool))
-    desc.add(row, slot, t, prefix, end - prefix)
-    setattr(req, CLOSE_PENDING_ATTR, (t, slot, desc, int(prefix), int(end)))
-    from flliper.srt.pdflip import twin_anchor as _tw
+    desc = _put_plan(batch, desc, req, row, CLOSE_PENDING_ATTR, t, slot, prefix, end)
+    if not d_mode():
+        from flliper.srt.pdflip import twin_anchor as _tw
 
-    _tw.note_track_planned(rid, t)
+        _tw.note_track_planned(rid, t)
+    else:
+        note_d_planned(req, "close", t, prefix, end, slot)
     n = _count("close_planned")
     if _log_due(n):
         logger.info(
@@ -963,20 +1042,23 @@ def _note_image_step(batch: Any, desc: Optional[TurnTracks], req: Any, row: int,
             logger.info("PDFLIP IMAGE-END-ANCHOR SHARED rid=%s at=%d step=[%d,%d) (n=%d; another "
                         "track writes this very position)", rid, t, prefix, end, n)
         return desc
-    slot = _alloc_slot(batch)
-    if slot is None:
+    # V1 (review of the rc31 merge with D-FORK-ANCHOR): on group D the image track is a POSITION plan like the
+    # turn / close / gen tracks -- split-only on a Form A worker, split-only on a state rank without a free slot, its
+    # slot in the G1 registry, no S52 ledger -- so whether the node at t exists never hangs on a rank-local free list
+    slot, split_ok = _draw_slot(batch)
+    if slot is None and not split_ok:
         n = _count("image_no_slot")
         if _log_due(n):
             logger.info("PDFLIP IMAGE-END-ANCHOR SKIP rid=%s reason=no_free_slot at=%d "
                         "step=[%d,%d) (n=%d; no eviction, no reserve)", rid, t, prefix, end, n)
         return desc
-    if desc is None:
-        desc = TurnTracks(len(batch.reqs), need=slot_state_kinds(batch.req_to_token_pool))
-    desc.add(row, slot, t, prefix, end - prefix)
-    setattr(req, IMAGE_PENDING_ATTR, (t, slot, desc, int(prefix), int(end)))
-    from flliper.srt.pdflip import twin_anchor as _tw
+    desc = _put_plan(batch, desc, req, row, IMAGE_PENDING_ATTR, t, slot, prefix, end)
+    if not d_mode():
+        from flliper.srt.pdflip import twin_anchor as _tw
 
-    _tw.note_track_planned(rid, t)
+        _tw.note_track_planned(rid, t)
+    else:
+        note_d_planned(req, "image", t, prefix, end, slot)
     n = _count("image_planned")
     if _log_due(n):
         logger.info(
@@ -1345,6 +1427,129 @@ def _alloc_slot(batch: Any):
     return slot
 
 
+def _draw_slot(batch: Any) -> Tuple[Any, bool]:
+    """(slot, plan_without_slot). Group P: a slot or no plan (unchanged). Group D (``d_mode``): the plan is a
+    POSITION plan on every rank -- a split-only rank draws nothing, a state-holding rank draws a slot when one
+    is free and plans split-only when none is (no eviction, no reserve) -- so the plan/no-plan decision never
+    depends on a rank-local quantity."""
+    if d_mode():
+        if d_split_only_rank():
+            return None, True
+        return _alloc_slot(batch), True
+    return _alloc_slot(batch), False
+
+
+def _put_plan(batch: Any, desc: Optional["TurnTracks"], req: Any, row: int, attr: str, t: int,
+              slot: Any, prefix: int, end: int) -> Optional["TurnTracks"]:
+    """Record one plan; only a plan with a slot gets a gather row (``desc``)."""
+    if slot is not None:
+        if desc is None:
+            desc = TurnTracks(len(batch.reqs), need=slot_state_kinds(batch.req_to_token_pool))
+        desc.add(row, slot, t, prefix, end - prefix)
+        plan = (t, slot, desc, int(prefix), int(end))
+        setattr(req, attr, plan)
+        if d_mode():
+            _register_inflight(req, attr, plan,
+                               getattr(getattr(batch, "req_to_token_pool", None), "mamba_allocator", None))
+    else:
+        setattr(req, attr, (t, None, None, int(prefix), int(end)))   # D split-only
+    return desc
+
+
+# -- D-FORK-ANCHOR review G1 (21.10.): the in-flight fork slots of THIS rank -----------------------------------------
+#: (req, attr, plan, allocator, clear epoch) of every D fork plan that holds a slot and was not consumed yet. Validated
+#: lazily: an entry whose request no longer carries that very plan tuple (consumed by the insert, freed as stale), or
+#: whose allocator was cleared since (review N1), is dropped on the next walk.
+_INFLIGHT: List[Tuple[Any, str, Any, Any, int]] = []
+
+
+def _epoch(alloc: Any) -> int:
+    return int(getattr(alloc, "_pdflip_clear_epoch", 0) or 0)
+
+
+def _register_inflight(req: Any, attr: str, plan: Any, alloc: Any = None) -> None:
+    _prune_inflight()
+    _INFLIGHT.append((req, attr, plan, alloc, _epoch(alloc)))
+
+
+def _live(e) -> bool:
+    req, attr, plan, alloc, ep = e
+    return getattr(req, attr, None) is plan and _epoch(alloc) == ep
+
+
+def _prune_inflight() -> None:
+    _INFLIGHT[:] = [e for e in _INFLIGHT if _live(e)]
+
+
+def on_pool_clear(alloc: Any) -> int:
+    """Review N1 (21.10.): ``clear()`` of a mamba allocator (flush / sleep-leg reset, wake restore, vram_dial shrink)
+    puts every slot back on the free list of a fresh generation. A request object that survives it still carries its
+    unconsumed fork plan -- whose slot a new owner may hold from now on. Every such plan drawn from ``alloc`` turns
+    split-only here (desc field ``"pool_reset"``): no later donation revokes that slot, no stale free and no insert
+    release it again. Returns how many plans were neutralised."""
+    n = 0
+    keep = []
+    for e in _INFLIGHT:
+        req, attr, plan, a, _ep = e
+        if a is not alloc:
+            keep.append(e)
+            continue
+        if getattr(req, attr, None) is plan:
+            t, _slot, _desc, prefix, end = plan
+            setattr(req, attr, (t, None, "pool_reset", int(prefix), int(end)))
+            n += 1
+    _INFLIGHT[:] = keep
+    if n:
+        k = _count("d_pool_reset")
+        if _log_due(k):
+            logger.info("PDFLIP D-FORK-ANCHOR POOL-RESET n=%d plans=%d (the mamba allocator was cleared: the "
+                        "unconsumed fork plans lost their slots and turn split-only)", k, n)
+    return n
+
+
+def inflight_count() -> int:
+    _prune_inflight()
+    return len(_INFLIGHT)
+
+
+def revoke_for_donation() -> Any:
+    """Review G1: a fork slot is drawn at ``prepare_for_extend`` (batch N) but a last-step plan is consumed only by
+    ``process_batch_result(N)`` -- after the next scheduling. In that window ANOTHER request's step donation
+    (``cache_unfinished_req`` of the chunked request, an earlier entry of the same result loop) draws from a pool that
+    is short by exactly that slot on TP0 alone (a split-only worker drew none): TP0 alone would skip that request's
+    node. So the state-holding D rank's donation, when the free list is empty, takes back the slot of the OLDEST
+    unconsumed fork plan BEFORE it evicts anything: the plan turns split-only (``why=revoked_for_donation``), its node
+    at t is still inserted on every rank. TP0's donation sources are then a superset of every worker's (the workers
+    hold exactly these slots free). No reserve, no eviction.
+
+    STREAM ORDER (checked at the code): the three callers are the step donations of
+    ``MambaComponent.prepare_for_caching_req``. The two extra_buffer branches hand the slot to the donating request as
+    its PING-PONG track buffer (``donate_mamba_ping_pong_slot``): its first write is a later forward's track gather on
+    the forward stream, i.e. after batch N's late fork row into the same slot on that stream -- the old row is dead
+    bytes, overwritten. The copy branch (no extra_buffer -- unreachable with D fork plans, ``armed`` requires
+    extra_buffer) fences the device before its current-stream copy. No other allocation (S90b/S109R device reads,
+    the admission COW) may take a fork slot. A plan whose request left without consuming it (the F5 leak) is
+    revoked like any other -- its slot comes back. Returns the slot (a one-element tensor) or None."""
+    if not d_mode() or d_split_only_rank():
+        return None
+    _prune_inflight()
+    while _INFLIGHT:
+        e = _INFLIGHT.pop(0)
+        if not _live(e):
+            continue
+        req, attr, plan, _alloc, _ep = e
+        t, slot, _desc, prefix, end = plan
+        setattr(req, attr, (t, None, "revoked_for_donation", int(prefix), int(end)))
+        n = _count("d_revoked")
+        if n <= 64 or (n & (n - 1)) == 0:
+            logger.info("PDFLIP D-FORK-ANCHOR REVOKED n=%d rid=%s kind=%s at=%d (an unconsumed fork plan gave its "
+                        "slot to another request's step donation: the free list was empty on this rank and the "
+                        "workers hold this slot free -- the fork goes split-only)", n,
+                        str(getattr(req, "rid", "?")), _ATTR_KIND.get(attr, "?"), int(t))
+        return slot
+    return None
+
+
 def _free_slot(batch_or_pool: Any, slot) -> None:
     if slot is None:
         return
@@ -1390,8 +1595,10 @@ def forward_rows(forward_batch: Any) -> Optional[TurnTracks]:
 
 
 def insert_verdict(pend) -> Tuple[bool, str]:
-    """(insert?, reason) for a consumed plan."""
+    """(insert?, reason) for a consumed plan. A revoked D plan (review G1) carries its reason in the desc field."""
     t, slot, desc, prefix, end = pend
+    if isinstance(desc, str):
+        return False, desc
     if desc is None or slot is None:
         return False, "no_plan"
     if not desc.complete():
@@ -1437,3 +1644,39 @@ def note_skip(req: Any, reason: str, t: int, kind: str = "turn") -> None:
     if _log_due(n):
         logger.info("PDFLIP %s SKIP rid=%s reason=%s turn=%d (n=%d) -- slot freed",
                     label, str(getattr(req, "rid", "?")), reason, t, n)
+
+
+# -- D-FORK-ANCHOR witnesses (21.10.) ------------------------------------------------
+D_FORK_KIND_ATTR = "pdflip_d_fork_kind"
+_ATTR_KIND = {PENDING_ATTR: "turn", CLOSE_PENDING_ATTR: "close", GEN_PENDING_ATTR: "gen", IMAGE_PENDING_ATTR: "image"}
+
+
+def _d_role() -> str:
+    return "worker" if d_split_only_rank() else "host"
+
+
+def note_d_planned(req: Any, kind: str, t: int, prefix: int, end: int, slot: Any) -> None:
+    n = _count("d_planned")
+    if _log_due(n):
+        logger.info("PDFLIP D-FORK-ANCHOR PLAN n=%d rid=%s kind=%s at=%d step=[%d,%d) role=%s state=%s",
+                    n, str(getattr(req, "rid", "?")), kind, int(t), int(prefix), int(end), _d_role(),
+                    "slot" if slot is not None else "split_only")
+
+
+def note_d_set(req: Any, kind: str, t: int, state: str, why: str, depth: int) -> None:
+    """Live witness: one line per fork node group D put into its tree (``state=taken`` = the recurrent state
+    at t, ``split_only`` = the node without a state, ``exists`` = the node was already there)."""
+    n = _count("d_set:" + state)
+    if n <= 64 or (n & (n - 1)) == 0:
+        logger.info("PDFLIP D-FORK-ANCHOR SET n=%d rid=%s kind=%s at=%d state=%s why=%s role=%s prefix_len=%d "
+                    "(group D's fork node: the next turn / a side request forking there resumes at t)",
+                    n, str(getattr(req, "rid", "?")), kind, int(t), state, why, _d_role(), int(depth))
+
+
+def note_d_read(req: Any, kind: str, depth: int) -> None:
+    """Live witness: a match resumed on a state group D's fork track wrote."""
+    n = _count("d_read")
+    if n <= 64 or (n & (n - 1)) == 0:
+        logger.info("PDFLIP D-FORK-ANCHOR READ n=%d rid=%s kind=%s depth=%d (a match resumed on a group-D fork "
+                    "anchor instead of the last state below it)", n, str(getattr(req, "rid", "?")), kind,
+                    int(depth))

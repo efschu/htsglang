@@ -246,8 +246,13 @@ def test_the_switch_needs_group_p_extra_buffer_and_no_overlap(monkeypatch):
     assert ta.armed(sa) is None, "off without the token"
     monkeypatch.setenv(TOKEN_ENV, str(IM))
     assert ta.armed(sa) == IM
+    # D-FORK-ANCHOR (21.10.): group D plans the fork tracks too, WITH the overlap schedule (the
+    # ordering proof is in turn_anchor.armed); its own switch turns it off (test_nf_rc30_d_fork_anchor_1021.py)
     monkeypatch.setenv("FLLIPER_PDFLIP_GROUP", "D")
-    assert ta.armed(sa) is None, "group D: overlap schedule, no END anchor"
+    assert ta.armed(SimpleNamespace(**{**sa.__dict__, "disable_overlap_schedule": False})) == IM
+    monkeypatch.setenv("FLLIPER_PDFLIP_D_FORK_ANCHOR", "0")
+    assert ta.armed(sa) is None, "group D with FLLIPER_PDFLIP_D_FORK_ANCHOR=0: rc30's D"
+    monkeypatch.delenv("FLLIPER_PDFLIP_D_FORK_ANCHOR")
     monkeypatch.setenv("FLLIPER_PDFLIP_GROUP", "P")
     assert ta.armed(SimpleNamespace(**{**sa.__dict__, "disable_overlap_schedule": False})) is None
     assert ta.armed(SimpleNamespace(**{**sa.__dict__, "mamba_checkpoint_interval": 4096})) is None

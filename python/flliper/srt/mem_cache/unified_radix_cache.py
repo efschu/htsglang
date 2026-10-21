@@ -3443,6 +3443,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         t, slot, _desc, step_start, step_end = pend
         ok, why = _ta.insert_verdict(pend)
+        # D-FORK-ANCHOR (21.10.): on group D a plan is a POSITION plan on every rank. A plan whose state was not
+        # written (a split-only rank, no free slot, a missing mark) still puts the node key[:t] into the tree --
+        # WITHOUT a mamba value -- so every rank of the group holds the same nodes (R12 node keys); only the
+        # rank-uniform reasons below (no insert, protected prefix, key length) skip it everywhere alike.
+        d_mode = _ta.d_mode()
+        state_ok = ok
+        if not ok and d_mode:
+            ok = True
         if ok and (not is_insert or self.disable):
             ok, why = False, "no_insert"
         if ok and int(req.cache_protected_len or 0) >= t:
@@ -3460,7 +3468,22 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if not ok:
             self._pdflip_turn_free(slot)
             _ta.note_skip(req, why, t, kind=kind)
+            if d_mode:
+                _ta.note_d_set(req, kind, t, "skipped", why, int(req.cache_protected_len or 0))
             return
+        if state_ok and d_mode and slot is not None and not UnifiedRadixCache._d_fork_donation_room(self):
+            # D-FORK-ANCHOR review A1/F1 (21.10.): the fork slot is TP0's alone (a split-only worker draws none) and
+            # the request's lock pins it from here until the step's own insert moves the lock on. If the pool has
+            # neither a free slot nor an evictable state left for THAT step's donation
+            # (MambaComponent.prepare_for_caching_req -> _alloc_mamba_slot), TP0 alone would skip the step's node
+            # every worker inserts (R12 keys / cache_protected_len split). The fork state yields instead: split-only,
+            # its slot back -- TP0 then has free + evictable >= every worker for the donation. The node at t is put
+            # in either way, so the structure stays the group's.
+            state_ok, why = False, "no_donation_room"
+        if not state_ok:
+            # D split-only: the slot (if any) holds no written state -- it goes back before the insert
+            self._pdflip_turn_free(slot)
+            slot = None
         # #811: the old anchor's pin may already be gone (released at its ack);
         # its MAMBA half is then not decremented again below.
         mamba_anchor_released = bool(
@@ -3478,7 +3501,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self._pdflip_cap_tail = None
         result = self.insert(insert_params)
 
-        match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
+        if d_mode:
+            # D-FORK-ANCHOR: the re-match follows the KV path to t with the mamba rule suspended (the H98 follow
+            # walk) -- the protected length is t on EVERY rank, whether its node at t carries the state (host),
+            # carries none (split-only), or the rank's anchors are bookkeeping (Form A worker)
+            from flliper.srt.managers.tp_match_floor import follow_walk as _follow_walk
+
+            with _follow_walk(self):
+                match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
+        else:
+            match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
         new_indices = match_result.device_indices
         new_last_node = match_result.last_device_node
         assert req.cache_protected_len <= len(new_indices) + self.page_size - 1, (
@@ -3504,9 +3536,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         req.swa_uuid_for_lock = lock_result.swa_uuid_for_lock
         self.note_anchor_pin(req, lock_result, settle=True)
 
-        taken = result is not None and not result.mamba_exist
+        taken = slot is not None and result is not None and not result.mamba_exist
         if not taken:
             self._pdflip_turn_free(slot)
+        if d_mode:
+            try:
+                # F7: (kind, end depth) -- the READ witness names a resume only at exactly this depth
+                setattr(new_last_node, _ta.D_FORK_KIND_ATTR, (kind, int(t)))
+            except Exception:  # noqa: BLE001 - a witness mark only
+                pass
+            _ta.note_d_set(req, kind, t, "taken" if taken else ("split_only" if not state_ok else "exists"),
+                           why if not state_ok else "ok", len(new_indices))
         self._pdflip_cap_after_insert()
         # No publish of its own: the step's insert follows in this same call
         # and publishes the request's chain parents-first (chunk publish /
@@ -3517,9 +3557,22 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             prompt=len(req.origin_input_ids), step=(step_start, step_end), kind=kind,
         )
 
+    def _d_fork_donation_room(self) -> bool:
+        """D-FORK-ANCHOR A1: may a fork state stay pinned by the request through the step's own donation? True when the
+        mamba pool still has a free slot or an evictable (unlocked) state for it -- the two sources
+        ``MambaComponent._alloc_mamba_slot`` draws from (alloc, then ``evict(mamba_num=1)``). Host bookkeeping only."""
+        alloc = getattr(self.req_to_token_pool, "mamba_allocator", None)
+        if alloc is None:
+            return True
+        free = int(alloc.available_size())
+        evictable = int((getattr(self, "component_evictable_size_", None) or {}).get(ComponentType.MAMBA, 0) or 0)
+        return free + evictable >= 1
+
     def _pdflip_turn_free(self, slot) -> None:
         """Give an unused turn slot back (through the component's free, so
         the #1469 provenance sees it)."""
+        if slot is None:
+            return   # D-FORK-ANCHOR: a split-only plan holds no slot
         comp = self.components.get(ComponentType.MAMBA)
         if comp is not None:
             comp._free_mamba_value(slot)
