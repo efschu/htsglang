@@ -552,14 +552,17 @@ def measure_close(runner, forward_batch, cuda, rank: Optional[int] = None) -> Op
 #
 #     cost = forward + max(0, reserved_at_next_pass - reserved_after)
 #
-# Kept per ROW CLASS (``lend_cost_class``: <= 64, then powers of two), the MAXIMUM of the class,
-# ratchet up only, process-local (the amount of a lend is rank-local; nothing structural reads it).
-# A class without a reading prices nothing (``None``): the caller keeps its old price. No safety
-# factor, no reserve: the price adds the card's 300 MiB HALT line to the measured cost
-# (``d_transient_lend.short_extend_need_mib``). One line per new class maximum:
+# Kept per ROW CLASS (``lend_cost_class``: <= 64, then powers of two): the MAXIMUM cost of the class
+# and the WIDEST extend measured in it, both ratchet up only, process-local (the amount of a lend is
+# rank-local; nothing structural reads it). An extend prices from its class only up to the widest
+# measured one (rows <= widest): a class doubles its rows, so a 4000-row extend is never priced by a
+# 2100-row reading. A class without a reading, or wider than its widest, prices nothing (``None``):
+# the caller keeps its old price. No safety factor, no reserve: the price adds the card's 300 MiB
+# HALT line to the measured cost (``d_transient_lend.short_extend_need_mib``). One line per new
+# class maximum:
 #
 #     EXTEND-LEND-COST rank=0 rows=5 class=64 cost_mib=.. forward_mib=.. transient_mib=..
-#       reserved_growth_mib=.. draft_growth_mib=.. prev=.. card_free_mib=..
+#       reserved_growth_mib=.. draft_growth_mib=.. prev=.. widest=.. card_free_mib=..
 #
 # and one HALT line whenever the card ends an extend batch under the 300 MiB line (the instrument of
 # the stop criterion: ``lend_open`` says whether lent rows sat on the card through it):
@@ -607,12 +610,15 @@ def lend_cost_armed(rank: Optional[int] = None) -> bool:
 
 def lend_cost_mib(rows: int) -> Optional[float]:
     """The measured card cost (MiB) of an extend of ``rows`` rows: the maximum of its row class on
-    this rank, ``None`` when the class has no reading yet (nothing is guessed)."""
+    this rank, ``None`` when the class has no reading yet or ``rows`` is wider than the widest extend
+    measured in it (nothing is guessed, nothing extrapolated)."""
     table = _CACHE["lend_cost"]
     if not table:
         return None
     v = table.get(lend_cost_class(int(rows)))
-    return None if v is None else float(v)
+    if v is None or int(rows) > int(v[1]):
+        return None
+    return float(v[0])
 
 
 def lend_cost_settle(rank: Optional[int] = None, cuda=None, lend_open: bool = False,
@@ -642,20 +648,24 @@ def lend_cost_settle(rank: Optional[int] = None, cuda=None, lend_open: bool = Fa
         table = _CACHE["lend_cost"]
         if table is None:
             table = _CACHE["lend_cost"] = {}
-        prev = table.get(cls)
+        old = table.get(cls)
+        prev = None if old is None else int(old[0])
+        widest = int(rows) if old is None else max(int(old[1]), int(rows))
         line = None
         rk = "?" if rank is None else int(rank)
         if prev is None or cost > prev:
-            table[cls] = cost
+            table[cls] = (cost, widest)
             line = (f"{LEND_COST_MARKER} rank={rk} rows={int(rows)} class={cls} cost_mib={cost} "
                     f"forward_mib={_ceil_mib(forward)} transient_mib={_ceil_mib(transient)} "
                     f"reserved_growth_mib={_ceil_mib(growth)} draft_growth_mib={_ceil_mib(draft)} "
-                    f"prev={'none' if prev is None else prev} "
+                    f"prev={'none' if prev is None else prev} widest={widest} "
                     f"card_free_mib={'na' if free_mib is None else free_mib}")
             logger.info(line)
+        elif widest > int(old[1]):
+            table[cls] = (prev, widest)  # a wider extend at or under the class maximum: the reach grows, no line
         if free_mib is not None and free_mib < CHUNKING_FLOOR_MIB:
             line = (f"{LEND_COST_MARKER} HALT rank={rk} rows={int(rows)} class={cls} card_free_mib={free_mib} "
-                    f"cost_mib={cost} class_max_mib={table.get(cls)} lend_open={int(bool(lend_open))} "
+                    f"cost_mib={cost} class_max_mib={table[cls][0]} lend_open={int(bool(lend_open))} "
                     f"rows_on={'-' if rows_on is None else int(rows_on)} -- the extend batch ended under the "
                     f"{CHUNKING_FLOOR_MIB:.0f} MiB line")
             logger.warning(line)

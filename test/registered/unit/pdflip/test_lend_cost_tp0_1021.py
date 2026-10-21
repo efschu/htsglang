@@ -14,7 +14,8 @@ What must hold (S78 desk rank = TP0, lattice step 4 rows, S0 = 32 rows ON, lend 
     whatever stays, the card holds the price;
 (3) an unmeasured class keeps the old price (TP0: the sum) -- nothing is guessed from another class;
 (4) the reading = Q-694b's target reading (max(peak - start allocated, reserved growth)) + the draft extend's
-    reserved growth, closed at the next pass BEFORE any lend move; class maximum, ratchet up only;
+    reserved growth, closed at the next pass BEFORE any lend move; class maximum, ratchet up only; a class
+    prices only up to the widest extend measured in it (no extrapolation inside a doubling class);
 (5) armed on a rank WITH a lend floor (D) even where Q-694b is not (TP0); the rate path stays untouched;
 (6) the HALT instrument: an extend batch that ends under 300 MiB is one named line (lend open or not);
 (7) switch off = the old price and no reading on TP0, byte for byte;
@@ -197,8 +198,9 @@ def test_danger_the_price_is_never_under_300_plus_the_measured_cost(cost):
 def test_an_unmeasured_class_keeps_the_sum_nothing_is_borrowed_from_another_class():
     with envs.FLLIPER_PDFLIP_D_LEND_FLOOR_MIB.override(FLOORS), \
             envs.FLLIPER_PDFLIP_EXTEND_GROWTH_PER_ROW_MIB.override(RATE):
-        _extend(42, transient=106)                                        # class 64 measured
-        assert dtl.short_extend_need_mib(0, 64) == pytest.approx(767.0)
+        _extend(42, transient=106)                                        # class 64 measured up to 42 rows
+        assert dtl.short_extend_need_mib(0, 42) == pytest.approx(767.0)
+        assert dtl.short_extend_need_mib(0, 43) == pytest.approx(767 + 300 + 0.5871 * 43)   # wider than measured
         assert dtl.short_extend_need_mib(0, 65) == pytest.approx(767 + 300 + 0.5871 * 65)   # class 128: none
         assert dtl.short_extend_need_mib(0, 1285) == pytest.approx(767 + 300 + 0.5871 * 1285)
         _extend(1500, transient=1063)                                     # class 2048 measured
@@ -217,6 +219,19 @@ def test_the_width_vote_stays_funded_the_chunk_price_stays_in_the_max():
         assert extend_trim.rows_cap(need, 0.5871, 64) >= 1984
 
 
+def test_danger_a_class_never_prices_an_extend_wider_than_its_widest_reading():
+    """A class doubles its rows: TP0 spends ~0.75 MiB/row at 2139 rows (review A, rc28 _201023), so a
+    2100-row reading (1300 MiB) must not price a 4000-row extend (the old price holds until one is read)."""
+    with envs.FLLIPER_PDFLIP_D_LEND_FLOOR_MIB.override(FLOORS), \
+            envs.FLLIPER_PDFLIP_EXTEND_GROWTH_PER_ROW_MIB.override(RATE):
+        _extend(2100, transient=1300)
+        assert dtl.short_extend_need_mib(0, 2100) == pytest.approx(max(767, 300 + 0.5871 * 2100, 1600))
+        assert dtl.short_extend_need_mib(0, 4000) == pytest.approx(767 + 300 + 0.5871 * 4000)
+        _extend(4000, transient=2900)
+        assert dtl.short_extend_need_mib(0, 4000) == pytest.approx(3200.0)
+        assert dtl.short_extend_need_mib(0, 2100) == pytest.approx(3200.0)   # the class maximum
+
+
 def test_the_row_classes():
     assert [extend_trim.lend_cost_class(r) for r in (1, 5, 64, 65, 128, 129, 256, 1285, 2048, 2049)] == \
         [64, 64, 64, 128, 128, 256, 256, 2048, 2048, 4096]
@@ -232,8 +247,11 @@ def test_the_reading_is_the_target_cost_plus_the_draft_growth_and_ratchets_up():
         assert _extend(10, transient=90) is None                          # lower: no line, no change
         assert extend_trim.lend_cost_mib(5) == 130.0
         line = _extend(12, transient=449)
-        assert "cost_mib=449" in line and "prev=130" in line
-        assert extend_trim.lend_cost_mib(64) == 449.0
+        assert "cost_mib=449" in line and "prev=130" in line and "widest=42" in line
+        assert extend_trim.lend_cost_mib(42) == 449.0
+        assert extend_trim.lend_cost_mib(43) is None                      # wider than any measured one
+        assert _extend(60, transient=10) is None                          # wider, cheaper: the reach grows
+        assert extend_trim.lend_cost_mib(60) == 449.0
         assert extend_trim.lend_cost_mib(65) is None
 
 
@@ -341,7 +359,7 @@ def test_switch_off_is_the_old_price_and_no_reading():
         assert not extend_trim.lend_cost_armed(0)
         assert _extend(5, transient=449) is None
         assert extend_trim._CACHE["lend_cost"] is None
-        extend_trim._CACHE["lend_cost"] = {64: 449}                       # even a held value is not read
+        extend_trim._CACHE["lend_cost"] = {64: (449, 64)}                 # even a held value is not read
         assert dtl.short_extend_need_mib(0, 5) == pytest.approx(SUM_5)
 
 
