@@ -53,6 +53,36 @@ everything (fail closed, review A3b) and still posts every collective; unpaired 
 whatever ``FLLIPER_PDFLIP_L3_PRESENT_STRICT`` says (A3a).
 
 Switch ``FLLIPER_PDFLIP_SLEEP_L3_RELEASE`` (default on).
+
+S86e PARK-L3 (rc27 boot ..._893d09fa3f_1021_023225, D group TP=3 Form A). The veto above kept every HOST-ONLY node
+("not this step") and every node with an aux state on the host only. At both sleeps of that boot those two reasons
+held the whole arena: 02:44:15 ``S86 SLEEP-L3-RELEASE ... vetoed_by_group=6251 group_released=16..183
+kept=host_only:19,aux_host_only:7`` next to ``S83 VICTIM-CENSUS ... pinned=6418 tree_device=2237
+tree_host_only=4014``; ``#1470 FLUSH-UNBACKED nodes=4 tokens=10112`` and ``S85 PARK-END-UNBACKED rid=pdflip-2-30
+node=155 depth=139008 store_end=133632 lost_tokens=5376`` -- P recomputed 5376 tokens (P ``PDFLIP-CLAIM-SHORT
+rid=pdflip-2-30 ... by=kv_prefix tokens=133632``). 03:05:42 the same shape: ``kept=host_only:14,aux_host_only:8``,
+``tree_host_only=4480`` of 6485, ``#1470 FLUSH-PUBLISH ARENA-FULL-STOP unbacked=14 arena_refused=14 issued=0``, the
+anchor of pdflip-26-148 at 31488 lost (P ``CLAIM-SHORT ... lost=28 by=mamba tokens=29440``). rc29's S109/S109c (the
+host-leaf and device-round AUX stages) act in the AWAKE W3 spill only; inside the sleep's flush the workers'
+references stay until a broadcast that never comes -- this step is the only release there, and it kept them.
+
+The reset a moment later drops every one of those references anyway. So, with the same proof as above:
+
+* a HOST-ONLY node whose KV pages all have their L3 copy leaves the tree (``_evict_host_leaf``, children first) --
+  but only when its WHOLE host-only subtree leaves with it: a node with a kept descendant (or a device child) is
+  kept, and that dependency joins the S86c fixed point (``_mixed_block``: the subtree's slots, not only the node's);
+* a node whose only host-only aux state is its MAMBA anchor (device-resident or host-only) is a candidate too; on the
+  rank that owns the anchor pool its anchor must be published as on L3 by the write-behind (the S39/S109b helper
+  ``forma_l3_subtree._secure_child_anchors``: memory read, a missing copy is QUEUED and the node is kept,
+  ``anchor_pending``). A rank without an anchor pool (a Form A worker) has no anchor of its own to judge -- the
+  owner's veto keeps the node's KV slots on every rank through the group MAX. Any other host-only aux type keeps the
+  old veto.
+* every other guard stays: a host lock, a write in flight (by id, by pending id, a #1427 direct write's mamba rows),
+  an END anchor not read yet, no page hashes, staging rows, a live aux device value on a host-only node.
+
+TP0 sends a STATE for every node it changed (exists=0 for a removed host-only node, the S109c/K23 form) so its shadow
+of the workers stays true should the sleep not reset. No reserve, no timer, no switch of its own, no file I/O on the
+scheduler thread (S109b: the copies are the write-behind's; this step only reads its record).
 """
 from __future__ import annotations
 
@@ -114,32 +144,81 @@ def _slots(pool: Any, host_value: Any) -> List[int]:
     return [int(s) for s in arena_ref_slots(pool, host_value).tolist()]
 
 
+def _aux_kinds(tree: Any, node: Any) -> list:
+    """The aux component types whose state lives on the host only on ``node``."""
+    from flliper.srt.mem_cache.unified_radix_cache import _aux_components
+
+    return [c.component_type for c in _aux_components(tree)
+            if node.component_data[c.component_type].host_value is not None
+            and node.component_data[c.component_type].value is None]
+
+
+def _mamba_ct():
+    from flliper.srt.mem_cache.unified_cache_components.tree_component import ComponentType
+
+    return getattr(ComponentType, "MAMBA", None)
+
+
 def _reason(tree: Any, node: Any, pool: Any) -> Optional[str]:
-    """None = a device-resident node whose host copy may leave L2 if its pages have an L3 copy (checked by the
-    caller); else the name of the first check that keeps it. Same guards as the W3 device round, without the
-    in-phase ones that protect a read still to come (claimer chain, told head, keep-payable): at the sleep the
-    reset drops those references too."""
+    """None = a node whose host copy may leave L2 if its pages have an L3 copy (checked by the caller; S86e: and, for
+    a mamba-aux node, its anchor on the owner rank; and, for a host-only node, its whole host-only subtree); else the
+    name of the first check that keeps it. Same guards as the W3 device round / the host-leaf round, without the
+    in-phase ones that protect a read still to come (claimer chain, told head, keep-payable): at the sleep the reset
+    drops those references too."""
     from flliper.srt.mem_cache.unified_radix_cache import BASE_COMPONENT_TYPE, _aux_components
 
     cd = node.component_data[BASE_COMPONENT_TYPE]
-    if cd.value is None:
-        return "host_only"
+    host_only = cd.value is None
+    if host_only and not (getattr(node, "evicted", True) and getattr(node, "backuped", True)):
+        return "host_only_state"          # S86e: not a host leaf by the tree's own predicate
     if node.id in (getattr(tree, "ongoing_write_through", None) or {}):
         return "write_pending"
     if getattr(node, "write_through_pending_id", None) is not None:
         return "write_pending"
     if any(int(getattr(c, "host_lock_ref", 0) or 0) > 0 for c in node.component_data):
         return "host_locked"
-    aux = _aux_components(tree)
-    if any(node.component_data[c.component_type].host_value is not None
-           and node.component_data[c.component_type].value is None for c in aux):
-        return "aux_host_only"
+    if host_only:
+        if node.id in (getattr(tree, "_pdflip_direct_mamba_rows", None) or {}):
+            return "write_pending"        # a #1427 direct write's mamba rows in flight (host_only_spill V1 guard)
+        if getattr(node, "_pdflip_end_anchor", False):
+            mct = _mamba_ct()
+            if mct is not None and len(node.component_data) > int(mct) \
+                    and node.component_data[mct].host_value is not None:
+                return "end_anchor"       # a host-backed END anchor D may not have read (host_only_spill V1 guard)
+    kinds = _aux_kinds(tree, node)
+    if kinds and not all(k == _mamba_ct() for k in kinds):
+        return "aux_host_only"            # S86e: only a MAMBA anchor is judged (below); any other aux keeps the node
+    if host_only and any(node.component_data[c.component_type].value is not None for c in _aux_components(tree)):
+        return "aux_device_value"         # K15b A4: removing the node would free a live device state
     hv = cd.host_value
     if int(hv.min()) < int(getattr(pool, "staging_rows", 0)):
         return "staging"
     if not getattr(node, "hash_value", None):
         return "no_hash"
     return None
+
+
+def _anchor_reason(tree: Any, node: Any) -> Optional[str]:
+    """S86e: None when ``node`` has no host-only MAMBA anchor, when this rank owns no anchor pool (a Form A worker:
+    the owner judges it, its veto reaches this rank through the group MAX), or when the write-behind's record says
+    the anchor has its L3 copy; else the refusal (the anchor is queued for the write-behind; the node is kept).
+    Memory reads only (S109b)."""
+    mct = _mamba_ct()
+    if mct is None or len(node.component_data) <= int(mct) or node.component_data[mct].host_value is None:
+        return None
+    fn = getattr(tree, "_pdflip_mamba_pool", None)
+    try:
+        mp = fn() if callable(fn) else None
+    except Exception:  # noqa: BLE001 - an unreadable pool on the owner keeps the node (fail closed)
+        return "anchor_pool_error"
+    if getattr(mp, "arena", None) is None:
+        return None
+    from flliper.srt.pdflip import forma_l3_subtree as _fls
+
+    r = _fls._secure_child_anchors(tree, [node], [_fls.ANCHOR_SECURE_PER_FLUSH])
+    if r is None:
+        return None
+    return "anchor_pending" if str(r[0]) == "child_anchor_pending" else str(r[0])
 
 
 def _l3_proven(pool: Any, node: Any) -> bool:
@@ -154,9 +233,25 @@ def _l3_proven(pool: Any, node: Any) -> bool:
     return bool(l3_complete(node, sec))
 
 
+#: candidate kinds (third tuple element): the node stays on the device / the host-only node leaves the tree
+KIND_DEVICE = "device"
+KIND_HOST_ONLY = "host_only"
+
+
+def _depth(node: Any) -> int:
+    d, n = 0, node
+    while getattr(n, "parent", None) is not None:
+        d, n = d + 1, n.parent
+    return d
+
+
 def local_veto(tree: Any, pool: Any, n_slots: int):
     """This rank's veto vector (int64, 1 = keep) over ``n_slots`` arena slots, the nodes it may release, the
-    reasons counted and the pages proven on L3. An error vetoes every slot (fail closed)."""
+    reasons counted and the pages proven on L3. An error vetoes every slot (fail closed).
+
+    A candidate is ``(node, slots, kind, subtree_slots)``: ``kind`` KIND_DEVICE (the host copy leaves, the node stays
+    on the device) or KIND_HOST_ONLY (S86e: the node leaves the tree, after every host-only descendant -- all of them
+    are candidates, ``subtree_slots`` names their slots and the node's own)."""
     from flliper.srt.mem_cache.unified_radix_cache import BASE_COMPONENT_TYPE
 
     veto = torch.zeros(int(n_slots), dtype=torch.int64)
@@ -170,24 +265,64 @@ def local_veto(tree: Any, pool: Any, n_slots: int):
         veto.fill_(1)
         why["no_pool"] = 1
         return veto, cands, why
+
+    def _keep(r, sl):
+        why[r] = why.get(r, 0) + 1
+        if sl:
+            veto[torch.tensor(sl, dtype=torch.int64)] = 1
+
     try:
+        host_ok: Dict[int, tuple] = {}     # id(host-only node) -> (node, own slots), own checks passed
+        host_kept: Dict[int, tuple] = {}   # id(host-only node) -> (node, own slots), kept by its own checks
         for node in tree._collect_all_nodes():
             if node is tree.root_node:
                 continue
-            hv = node.component_data[BASE_COMPONENT_TYPE].host_value
+            cd = node.component_data[BASE_COMPONENT_TYPE]
+            hv = cd.host_value
             if hv is None or int(hv.numel()) == 0:
+                if cd.value is None:
+                    host_kept[id(node)] = (node, [])   # no host copy, not on the device: never removed here
                 continue
             sl = _slots(pool, hv)
-            if not sl:
+            host_only = cd.value is None
+            if not sl and not host_only:
                 continue
             r = _reason(tree, node, pool)
-            if r is None and not _l3_proven(pool, node):
+            if r is None and host_only and not sl:
+                r = "no_arena_slot"           # its host rows name no arena page: no L3 proof possible, it stays
+            if r is None and sl and not _l3_proven(pool, node):
                 r = "not_on_l3"
+            if r is None:
+                r = _anchor_reason(tree, node)
+            if host_only:
+                (host_kept if r is not None else host_ok)[id(node)] = (node, sl)
+                if r is not None:
+                    _keep("host_only:" + r, sl)
+                continue
             if r is not None:
-                why[r] = why.get(r, 0) + 1
-                veto[torch.tensor(sl, dtype=torch.int64)] = 1
+                _keep(r, sl)
             else:
-                cands.append((node, sl))
+                cands.append((node, sl, KIND_DEVICE, sl))
+        # S86e: a host-only node leaves only with its whole host-only subtree (children first). A child that is on
+        # the device, kept by its own checks, or itself blocked keeps it -- deepest first, so a child is settled
+        # before its parent.
+        blocked: Dict[int, bool] = {}
+        sub: Dict[int, List[int]] = {}
+        for nid, (node, sl) in sorted(host_ok.items(), key=lambda kv: -_depth(kv[1][0])):
+            acc = list(sl)
+            bad = False
+            for ch in list(node.children.values()):
+                cid = id(ch)
+                if cid in host_ok and not blocked.get(cid, True):
+                    acc.extend(sub[cid])
+                else:
+                    bad = True
+            blocked[nid] = bad
+            sub[nid] = acc
+            if bad:
+                _keep("host_only:child_kept", sl)
+            else:
+                cands.append((node, sl, KIND_HOST_ONLY, acc))
     except Exception:  # noqa: BLE001 - fail closed: nothing released on this rank's word
         logger.warning("%s veto raised: every slot kept", MARK, exc_info=True)
         veto.fill_(1)
@@ -196,10 +331,18 @@ def local_veto(tree: Any, pool: Any, n_slots: int):
     return veto, cands, why
 
 
+def _cand(c) -> tuple:
+    """``(node, slots, kind, subtree_slots)`` of a candidate (a 2-tuple is a device candidate, the S86 form)."""
+    if len(c) >= 4:
+        return c[0], c[1], c[2], c[3]
+    return c[0], c[1], KIND_DEVICE, c[1]
+
+
 def apply(tree: Any, pool: Any, cands: List[tuple], agreed_veto: torch.Tensor,
           released: Optional[List[int]] = None) -> List[int]:
-    """Release the host rows of every candidate none of whose slots a rank vetoed; returns the slots let go
-    (``released``, when given, is filled as it goes -- a release that raises half-way still names what it did)."""
+    """Release the host rows of every candidate none of whose slots a rank vetoed (S86e: a host-only node none of
+    whose SUBTREE slots a rank vetoed leaves the tree, deepest first); returns the slots let go (``released``, when
+    given, is filled as it goes -- a release that raises half-way still names what it did)."""
     from flliper.srt.mem_cache import form_a_host_shadow as _r12
     from flliper.srt.mem_cache.unified_cache_components.tree_component import EvictLayer
     from flliper.srt.mem_cache.unified_radix_cache import BASE_COMPONENT_TYPE
@@ -210,9 +353,12 @@ def apply(tree: Any, pool: Any, cands: List[tuple], agreed_veto: torch.Tensor,
     if base is None:
         return released
     host = _r12.role() == "host"
-    for node, sl in cands:
+    dev = [c for c in map(_cand, cands) if c[2] == KIND_DEVICE]
+    hon = sorted((c for c in map(_cand, cands) if c[2] == KIND_HOST_ONLY), key=lambda c: -_depth(c[0]))
+    for node, sl, _k, _sub in dev:
         if any(int(agreed_veto[s]) for s in sl):
             continue
+        aux = bool(_aux_kinds(tree, node))
         tree._evict_component_and_detach_lru(node, base, target=EvictLayer.HOST, tracker=None)
         try:
             tree.evictable_host_leaves.discard(node)
@@ -220,7 +366,26 @@ def apply(tree: Any, pool: Any, cands: List[tuple], agreed_veto: torch.Tensor,
             pass
         node.l3_present = True
         if host:
-            _r12.record_spill(tree, node)   # the workers released the same node themselves; a SPILL is a noop there
+            if aux:
+                # S86e: the anchor's host state left too (the tree law) -- the S109c form, a STATE
+                _r12.record_state(tree, node, why="s86e_aux_device")
+            else:
+                _r12.record_spill(tree, node)   # the workers released the same node themselves; a noop there
+        released.extend(sl)
+    for node, sl, _k, sub in hon:
+        if any(int(agreed_veto[s]) for s in sub):
+            continue
+        if not tree._is_host_leaf(node):
+            # cannot happen when the veto saw the same tree (every descendant is a released candidate, deeper
+            # first); kept -- the residual check names it (W86) instead of a silent half-release
+            logger.warning("%s S86e host-only node %s is no host leaf at its release: kept", MARK,
+                           getattr(node, "id", "?"))
+            continue
+        tracker = {ct: 0 for ct in getattr(tree, "tree_components", (BASE_COMPONENT_TYPE,))}
+        tracker.setdefault(BASE_COMPONENT_TYPE, 0)
+        tree._evict_host_leaf(node, tracker)
+        if host:
+            _r12.record_state(tree, node, why="s86e_host_only")   # exists=0: the K23 form
         released.extend(sl)
     return released
 
@@ -230,13 +395,18 @@ FIX_ROUNDS = 16
 
 def _mixed_block(cands: List[tuple], agreed: torch.Tensor) -> torch.Tensor:
     """S86c: this rank's slots that the agreed set cannot release here -- the agreed slots of a candidate node that
-    also holds a vetoed slot (the node is kept whole, so its agreed slots stay referenced). An error blocks every
-    slot (fail closed; the collective is still posted)."""
+    also holds a vetoed slot (the node is kept whole, so its agreed slots stay referenced). S86e: a host-only
+    candidate is kept whole when any slot of its host-only SUBTREE is vetoed (it can leave the tree only after every
+    descendant). An error blocks every slot (fail closed; the collective is still posted)."""
     out = torch.zeros_like(agreed)
     try:
-        for _node, sl in cands:
+        for c in cands:
+            _node, sl, _kind, sub = _cand(c)
+            if not sl:
+                continue
             flags = [int(agreed[s]) for s in sl]
-            if any(flags) and not all(flags):
+            sub_vetoed = any(int(agreed[s]) for s in sub)
+            if (any(flags) and not all(flags)) or (sub_vetoed and not all(flags)):
                 out[torch.tensor(sl, dtype=torch.int64)] = 1
     except Exception:  # noqa: BLE001
         logger.warning("%s mixed-node scan raised: every slot kept", MARK, exc_info=True)
@@ -364,7 +534,7 @@ def _after_first_collective(tree, pool, group_max, mine: int, n_slots: int, out:
     mx = group_max([cnt, -cnt, dig, -dig, err, res], label="s86_sleep_l3_release/digest")
     g_max, g_min, d_max, d_min, g_err, g_res = (int(mx[0]), -int(mx[1]), int(mx[2]), -int(mx[3]), int(mx[4]),
                                                 int(mx[5]))
-    out.update(nodes=sum(1 for n, sl in cands if not any(int(agreed[s]) for s in sl)), pages=cnt,
+    out.update(nodes=sum(1 for c in map(_cand, cands) if not any(int(agreed[s]) for s in c[3])), pages=cnt,
                group_released=g_max, agreed=(d_max == d_min and g_res == 0),
                vetoed=int((agreed > 0).sum()), why=why, ms=(time.monotonic() - t0) * 1000.0, group_error=g_err,
                fix_rounds=rounds, residual=res)

@@ -336,7 +336,9 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
     # #59b: the depth each parked request resumes from, after the retraction
     # above retained its span (every rank parks the same list).
     _ph("l3mark")
-    resumable = pdflip_resumable_depth.park_depths(
+    # #59c: the ANSWER is capped at the secured end (the sleep's reset drops device-only KV); the read clamp keeps
+    # the admission depth -- a tail the sleep's flush still secures (S86e) is read, not recomputed
+    resumable_raw, resumable = pdflip_resumable_depth.park_depths_split(
         getattr(sched, "tree_cache", None),
         [r for r in _flip_list if d_seats.park_site(r) is not None],
         getattr(sched, "ps", None),
@@ -345,12 +347,12 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
     # PARK-READ = RESUMABLE: the read of a request this park retracted ends at
     # the depth it resumes from, not at the tombstoned KV above the anchor
     # (d_park_read.clamp_to_resumable). Group-uniform: #59b's depths are.
-    if resumable:
+    if resumable_raw:
         bigram = bool(getattr(getattr(sched, "tree_cache", None), "is_eagle", False))
         for req in retracted:
             before = d_park_read.read_cap(req)
             if d_park_read.clamp_to_resumable(
-                req, resumable.get(str(req.rid)), is_bigram=bigram
+                req, resumable_raw.get(str(req.rid)), is_bigram=bigram
             ) is not None:
                 logger.info("PDFLIP-D-PARK READ=RESUMABLE rid=%s cap %s -> %s",
                             str(req.rid), before, d_park_read.describe(req))
@@ -625,14 +627,16 @@ def park_rids(sched, recv_req, *, rids, hold: str = ""):
         park_l3.mark_parked(sched, retracted)  # #248: kept by ORDER (a flip may follow before the floor falls)
     except Exception:  # noqa: BLE001 - the order is an improvement, never a wall
         logger.warning("#248 PARK-MARK failed", exc_info=True)
-    resumable = pdflip_resumable_depth.park_depths(
-        getattr(sched, "tree_cache", None), list(retracted), getattr(sched, "ps", None))
-    if resumable:
+    # #59c: the lane park is followed by no sleep -- D stays awake and keeps its device KV, so its answer is the
+    # admission depth (no secured cap; a capped answer would misprice an awake resume)
+    resumable_raw, resumable = pdflip_resumable_depth.park_depths_split(
+        getattr(sched, "tree_cache", None), list(retracted), getattr(sched, "ps", None), secured=False)
+    if resumable_raw:
         bigram = bool(getattr(getattr(sched, "tree_cache", None), "is_eagle", False))
         for req in retracted:
             before = d_park_read.read_cap(req)
             if d_park_read.clamp_to_resumable(
-                req, resumable.get(str(req.rid)), is_bigram=bigram
+                req, resumable_raw.get(str(req.rid)), is_bigram=bigram
             ) is not None:
                 logger.info("PDFLIP-D-PARK READ=RESUMABLE rid=%s cap %s -> %s",
                             str(req.rid), before, d_park_read.describe(req))
