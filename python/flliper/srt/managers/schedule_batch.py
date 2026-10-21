@@ -4534,6 +4534,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.mamba_track_mask,
             self.mamba_track_seqlens,
         )
+        # D-FORK-ANCHOR x MIXED-D (NF rc31b, 21.10.): merge_batch nulls the second-track
+        # descriptor too, so a fork plan of a SHORT D prefill that took the decodes along got
+        # no gather row and no mark -- inserted split-only (D TP0: 62/62 ``unmarked`` plans
+        # ran mixed, 64/64 ``taken`` ran unmixed). The prefill rows stay first, so the plan
+        # rides the restored track gathers below unchanged; the tails are counted, never planned.
+        _turn_tracks = self.pdflip_turn_tracks
         self.merge_batch(running_batch)
         self.out_cache_loc = out_cache_loc
         if all(t is not None for t in _mt):
@@ -4546,6 +4552,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.mamba_track_seqlens = torch.cat(
                 [_mt[2], torch.zeros(running_bs, dtype=_mt[2].dtype, device=_mt[2].device)]
             )
+            if _turn_tracks is not None:
+                _turn_tracks.append_tail_rows(running_bs)
+                self.pdflip_turn_tracks = _turn_tracks
         if merged_seq_lens_cpu is not None:
             self.seq_lens_cpu = merged_seq_lens_cpu
         if tail_base is not None:

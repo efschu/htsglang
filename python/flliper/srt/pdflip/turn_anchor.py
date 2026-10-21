@@ -203,7 +203,9 @@ def armed(server_args: Any = None) -> Optional[int]:
     ``process_batch_result``, ``cache_finished_req``) -- both after ``run_batch`` returned on this thread;
     (c) the fork node is inserted in the SAME insert call, immediately before the step's own node, with no GPU
     read in between (insert / match / lock are bookkeeping). So every reader ordering that is correct for the
-    step's own track slot under overlap is correct for the fork slot. A plan consumed without its marks (a
+    step's own track slot under overlap is correct for the fork slot. A MIXED-D batch (a short D prefill that
+    takes the running decodes along, ``ScheduleBatch.mix_with_running``) keeps its plan: the tails join behind
+    the planned rows (``TurnTracks.append_tail_rows``). A plan consumed without its marks (a
     batch that never ran, a geometry change, a captured graph) is inserted split-only and its slot freed: no
     anchor, no error."""
     tok = token()
@@ -375,6 +377,18 @@ class TurnTracks:
 
     def __len__(self) -> int:
         return len(self.rows)
+
+    def append_tail_rows(self, n: int) -> None:
+        """MIXED-D (``ScheduleBatch.mix_with_running``): ``n`` decode tails join the batch BEHIND every planned
+        row. The planned rows keep their index, prefix and extend length, and the forward's track math
+        (``h_rows`` / ``conv_starts``, upstream ``_init_track_ssm_indices``) offsets a row only by the rows
+        BEFORE it, so the plan stays exact; only the row count the forward checks grows. NF rc31b D TP0: 62 of
+        62 ``split_only why=unmarked:gdn,ple_conv,ple_ngram`` were plans of a mixed forward, 64 of 64 ``taken``
+        plans of an unmixed one -- the merge had dropped the descriptor."""
+        n = int(n)
+        if n < 0:
+            raise ValueError(f"TurnTracks.append_tail_rows: negative tail count {n}")
+        self.bs += n
 
     def complete(self) -> bool:
         return bool(self.rows) and self.need <= self.done
