@@ -133,6 +133,61 @@ def follower_pass(scheduler) -> List[Tuple[int, Any]]:
     return parked
 
 
+#: P-COMMIT V (21.10., NF rc30 boot ..._1021_063252, P PP0 09:37:12-16, pdflip-144-1508): the S82 park ended
+#: ``outcome=acks``, ``S82 PARK-ADMIT`` put the Admit (told=113728) on this pass's chain, the plan's vision pass
+#: then said ``W102 PdFlipVisionStage SKIP reason=image-cached covered=113728 src=told image_end=113719`` --
+#: no tower -- and queued the verdict "on the wire at the next intake". The next intake came only after the
+#: output receive of the older 16235-token set: PP0 ``#1466 PASS-STALL ... commit_ms=4138``, the 5090 idle
+#: ``gpu_gap_ms=4492.6`` before the 3036-token forward. Seven such drains in that boot (9.7 s of PP0 receive).
+#: An image the ADMITTED told already covers needs nothing PP0 learns later in the pass: its verdict is known
+#: when the Admit is formed, so it rides the SAME chain as the Admit and every stage releases the request in
+#: the pass that absorbs both -- the same rule as before (no rank admits an image before PP0's verdict reached
+#: it), one pass earlier, and only for the told-covered case. A staged image (tower, emb cache, pixel fetch)
+#: still gets its verdict from the plan's vision pass at the next intake.
+W_AT_ADMIT = "W102c PdFlipVisionVerdictGate VERDICT-AT-ADMIT"
+
+
+def pp0_verdicts_at_admit(scheduler, rids: Sequence[str], skip_verdict) -> List[PdFlipVisionVerdict]:
+    """PP0, ``pdflip_store_told.pp0_publish``, right after this pass's Admits are formed and BEFORE the chain
+    send: the verdicts of the image requests admitted in this pass whose told covers every image position.
+    ``skip_verdict(scheduler, req)`` is ``vision_rank_runner.stage_skip_verdict`` (the plan's own SKIP rule,
+    injected so this module stays import-light). Each verdict is marked sent and absorbed on PP0 here (PP0
+    does not dispatch its own wire tail); the caller appends them to the chain. Never raises into the pass."""
+    if not getattr(scheduler, "_pdflip_vision_gate", False) or getattr(scheduler, "pdflip_dormant", False):
+        return []
+    sent = getattr(scheduler, "_pdflip_vision_verdict_sent", None)
+    released = getattr(scheduler, "_pdflip_vision_released", None)
+    if sent is None or released is None:
+        return []
+    refused = getattr(scheduler, "_pdflip_vision_refused", None) or set()
+    want = {str(r) for r in rids}
+    out: List[PdFlipVisionVerdict] = []
+    for req in list(getattr(scheduler, "waiting_queue", None) or ()):
+        rid = str(getattr(req, "rid", ""))
+        if rid not in want or rid in released or rid in sent or rid in refused:
+            continue
+        if not is_vision_req(req):
+            continue
+        try:
+            verdict = skip_verdict(scheduler, req)
+        except Exception as exc:  # noqa: BLE001 -- the plan's vision pass decides as before
+            logger.warning("%s skipped rid=%s (%s: %s)", W_AT_ADMIT, rid, type(exc).__name__, exc)
+            continue
+        if not verdict or verdict[0] != "skip":
+            continue
+        sent.add(rid)
+        item = PdFlipVisionVerdict(rid=rid)
+        absorb(scheduler, item)
+        out.append(item)
+        n = getattr(scheduler, "_pdflip_vision_at_admit_n", 0) + 1
+        scheduler._pdflip_vision_at_admit_n = n
+        logger.info("%s rid=%s covered=%s src=%s (n=%d): the admitted told covers every image position -- the "
+                    "verdict rides THIS pass's chain beside the Admit, every stage admits it in this pass",
+                    W_AT_ADMIT, rid, verdict[1] if len(verdict) > 1 else "?",
+                    verdict[2] if len(verdict) > 2 else "?", n)
+    return out
+
+
 def take_verdicts(scheduler) -> List[PdFlipVisionVerdict]:
     out = getattr(scheduler, "_pdflip_vision_origin_verdicts", None)
     if not out:
