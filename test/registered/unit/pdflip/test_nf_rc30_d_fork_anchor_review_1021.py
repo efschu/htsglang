@@ -174,3 +174,44 @@ def test_a_full_pool_does_not_make_tp0_skip_a_step_node_the_workers_insert(group
     assert [int(p[0]) for p in hplans] == [int(p[0]) for p in wplans], "the position plans agree"
     assert _structure(host) == _structure(wk), (sorted(_structure(host)), sorted(_structure(wk)))
     assert hreq.cache_protected_len == wreq.cache_protected_len
+
+
+# -- (R4) Nachprüfung A1 (9a98793acf): a fork plan IN FLIGHT starves ANOTHER request's donation on TP0 only ----------
+
+def _inflight_pair(monkeypatch, worker: bool):
+    """R1's final step planned a fork (note_step at prepare N; consumed only in process_batch_result(N), i.e. after the
+    next scheduling). Meanwhile R2's chunk is cached (get_next_batch_to_run N+1 -> cache_unfinished_req, or an earlier
+    entry of the same process_batch_result loop): R2's donation draws from a pool TP0 alone has shrunk by R1's slot.
+    R2 has no fork plan of its own, so the A1 guard (evaluated only inside R1's fork insert) never runs for it."""
+    from flliper.srt.pdflip import turn_anchor as ta
+
+    _as_worker(monkeypatch, worker)
+    fx = TA0._fixture(False)
+    r1 = _new_req(fx, PROMPT, "pdflip-2-63")
+    r2_ids = list(range(9000, 9060))                     # no turn token: R2 plans nothing
+    r2 = _new_req(fx, r2_ids, "pdflip-2-70")
+    held = []
+    while fx.pool.mamba_allocator.available_size() > 1:  # one free slot, the same on every rank before prepare N
+        held.append(fx.pool.mamba_allocator.alloc(1))
+    TA0._write_kv(fx, r1, N)
+    batch = SimpleNamespace(reqs=[r1], req_to_token_pool=fx.pool)
+    desc = ta.note_step(batch=batch, desc=None, req=r1, row=0, prefix=0, end=N,
+                        track_mask=True, main_track=N - 1, chunk=1, page=1, tok=IM)
+    if desc is not None:
+        desc.done.add("gdn")
+    # R2's chunk insert while R1's plan is still unconsumed
+    TA0._write_kv(fx, r2, 32)
+    TA0._state(fx, r2.mamba_pool_idx, TA0.S_EARLY)
+    fx.cache.cache_unfinished_req(r2, chunked=True)
+    return fx, r1, r2
+
+
+@pytest.mark.xfail(strict=True, reason=(
+    "REVIEW NACHPRUEFUNG G1 (9a98793acf): the A1 guard covers only the fork-owning request's own donation; a fork slot "
+    "drawn at prepare N and consumed in process_batch_result(N) is in flight across the next scheduling, and another "
+    "request's chunk donation on TP0 finds the pool short by that slot (workers drew none) -> TP0 alone skips."))
+def test_an_inflight_fork_plan_does_not_make_tp0_skip_another_requests_step_node(group_d):
+    host, _h1, h2 = _inflight_pair(group_d, worker=False)
+    wk, _w1, w2 = _inflight_pair(group_d, worker=True)
+    assert h2.cache_protected_len == w2.cache_protected_len, (h2.cache_protected_len, w2.cache_protected_len)
+    assert _structure(host) == _structure(wk)
