@@ -400,6 +400,54 @@ def link_moe_pool_prefetch(layers) -> int:
     return links
 
 
+def link_moe_pool_em_prefetch(layers) -> int:
+    """EM-PREFETCH (FLLIPER_MOE_POOL_EM_PREFETCH, default ON): point every MoE block at the NEXT MoE block, so an
+    EAGER-DEVICE-EM forward (D prefill / mixed extend) can run that block's router on its own MoE input and the
+    next block's pool can take the predicted rows on the side stream while this block applies.
+
+    A SEPARATE chain from ``link_moe_pool_prefetch`` (graph-capture decode only, default off: measured to cost
+    decode, fn7p 19.09.) and from WP8's ``link_moe_lookahead`` (host-plan scratch). Distance 1. A PP-missing or
+    dense layer breaks the chain there. Returns the links made."""
+    from flliper.srt.layers.moe.expert_offload import pool_em_prefetch_enabled
+
+    if not pool_em_prefetch_enabled():
+        return 0
+    blocks = []
+    for layer in layers:
+        mlp = getattr(layer, "mlp", None)
+        ok = (
+            mlp is not None
+            and hasattr(mlp, "pool_em_prefetch_next")
+            and hasattr(mlp, "gate")
+            and hasattr(mlp, "experts")
+            and hasattr(mlp, "topk")
+        )
+        blocks.append(mlp if ok else None)
+    links = 0
+    for i, blk in enumerate(blocks):
+        j = i + 1
+        if blk is None or j >= len(blocks) or blocks[j] is None:
+            continue
+        blk.pool_em_prefetch_next = blocks[j]
+        links += 1
+    return links
+
+
+_POOL_EM_PREFETCH_TOPK = {"m": None}
+
+
+def pool_em_prefetch_topk(k: int) -> int:
+    """EM-PREFETCH: how many of the next router's top-k each token predicts: min(k, FLLIPER_MOE_POOL_EM_PREFETCH_TOPK),
+    0 (default) = all k -- a prefill fetches the union over its tokens."""
+    if _POOL_EM_PREFETCH_TOPK["m"] is None:
+        try:
+            _POOL_EM_PREFETCH_TOPK["m"] = int(envs.FLLIPER_MOE_POOL_EM_PREFETCH_TOPK.get() or 0)
+        except Exception:  # noqa: BLE001 -- no environ field: the default
+            _POOL_EM_PREFETCH_TOPK["m"] = 0
+    m = _POOL_EM_PREFETCH_TOPK["m"]
+    return int(k) if m <= 0 else max(1, min(int(k), m))
+
+
 _BREAKABLE_MODE = None
 
 
@@ -588,6 +636,62 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         # (None = off; see link_moe_pool_prefetch).
         self.pool_prefetch_next: Optional["Qwen2MoeSparseMoeBlock"] = None
         self._pool_prefetch_refused = False
+        # EM-PREFETCH: the NEXT MoE block for the eager (prefill / mixed) pool pass (None = off; see
+        # link_moe_pool_em_prefetch)
+        self.pool_em_prefetch_next: Optional["Qwen2MoeSparseMoeBlock"] = None
+        self._pool_em_prefetch_refused = False
+
+    def _pool_em_prefetch_next_block(self, hidden_states: torch.Tensor) -> None:
+        """EM-PREFETCH: predict the NEXT block's experts for an EAGER-DEVICE-EM forward and hand the prediction to
+        this block's pool, which issues it on the side stream right after its own last row copy.
+
+        The predictor is the decode prefetch's (Mixtral-Offloading): the next block's router on THIS block's MoE
+        input, plain top-k of the logits (softmax is monotone; the weights are never used). Under Form A every
+        rank holds the identical published MoE input here, so every rank predicts the identical global ids
+        (R11); each keeps the ones it owns (``pool_prefetch_local_ids``). Eager only -- under graph capture the
+        decode prefetch (``_pool_prefetch_next_block``) is the route. No host read: the band check is host ints,
+        the prediction a [T x H] @ [H x E] GEMM plus one top-k on the current stream."""
+        nxt = self.pool_em_prefetch_next
+        if nxt is None or hidden_states.shape[0] == 0 or get_is_capture_mode():
+            return
+        target_moe = getattr(nxt, "experts", None)
+        target = getattr(target_moe, "_expert_offload", None)
+        if target is None or not getattr(target_moe, "_moe_offload_pool", False):
+            return
+        cfg = nxt.topk.topk_config
+        if cfg.use_grouped_topk or cfg.correction_bias is not None:
+            if not self._pool_em_prefetch_refused:
+                self._pool_em_prefetch_refused = True
+                logger.warning(
+                    "[moe-pool-em-prefetch] layer %s: the next block routes with grouped top-k / a correction "
+                    "bias; the plain top-k predictor does not reproduce it, EM-PREFETCH stays off here",
+                    self.layer_id,
+                )
+            return
+        n_ids = int(hidden_states.shape[0]) * int(cfg.top_k)  # what the next block's pool pass will see
+        if not target.em_prefetch_wanted(n_ids)[0]:
+            return
+        k = int(cfg.top_k) - int(cfg.num_fused_shared_experts or 0)
+        if k <= 0:
+            return
+        k = pool_em_prefetch_topk(k)
+        pred_logits, _ = nxt.gate(hidden_states)
+        pred_ids = torch.topk(pred_logits, k, dim=-1).indices.to(torch.int32)
+        local = target_moe.pool_prefetch_local_ids(pred_ids)
+        own_moe = getattr(self, "experts", None)
+        own = getattr(own_moe, "_expert_offload", None)
+        if own is not None and getattr(own_moe, "_moe_offload_pool", False):
+            own.set_em_prefetch(target, local)
+        else:
+            # this block has no pool pass to ride on: issue now (behind this block's MoE input), under the same
+            # defect bracket as the pool pass (review A2) and counted on the forward's EM-FETCH record when one
+            # is open (an issue without its record would land fetched/hits without pf_layers)
+            from flliper.srt.layers.moe import em_fetch_probe
+            from flliper.srt.layers.moe.expert_offload import fire_em_prefetch
+
+            probe = em_fetch_probe.current()
+            if fire_em_prefetch(target, local, n_ids, probe=probe, src_layer=self.layer_id) and probe is None:
+                target._em_pf_landed = False
 
     def _pool_prefetch_next_block(self, hidden_states: torch.Tensor) -> None:
         """Mixtral-Offloading's speculative expert loading, for the graph pool.
@@ -903,6 +1007,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         # compute the copies hide behind.
         if self.pool_prefetch_next is not None:
             self._pool_prefetch_next_block(hidden_states)
+        # EM-PREFETCH: the eager twin -- predict the next block's experts now (cheap, current stream); this
+        # block's pool pass issues the copies after its own last row copy.
+        if self.pool_em_prefetch_next is not None:
+            self._pool_em_prefetch_next_block(hidden_states)
 
         if get_moe_a2a_backend().is_deepep():
             return self._forward_deepep(hidden_states, forward_batch)

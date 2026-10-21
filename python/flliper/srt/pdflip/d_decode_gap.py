@@ -78,6 +78,8 @@ _ATTR = "_pdflip_d_decode_gap"
 NOTE_CAUSES = ("skipfirst_hold", "f3_decode_first", "seat", "wake_read", "lend_return", "lend")
 #: S106: the notes whose own wall is measured (``note_ms``); they name the gap only when that wall dominates it
 TIMED_CAUSES = ("lend_return", "lend")
+#: rc30 (21.10.): the host spans of the lend's own hooks and of the stage move that carries an open lend
+ROW_MOVE_SPANS = ("lend_start", "seat_stage", "lend_end")
 CAUSES = ("flip", "idle", "mixed_prefill", "d_prefill") + NOTE_CAUSES + ("other",)
 
 
@@ -178,10 +180,21 @@ class Tracker:
         mixed = self.last_mixed_tokens
         other_ms = max(0.0, gap_ms - self.ext_ms)
 
+        # rc30 (21.10., D ``..._1021_063252`` TP0 08:35-08:40): 21 of 26 ``cause=other`` gaps held a return
+        # (gap 456-680 ms) whose bare unlend wall (``return_ms`` 109-288) was under half -- the rest of the row
+        # work sat in the hooks around it: ``lend_start`` (round_start: the unlend, its E1 fence and unmap
+        # join), ``seat_stage`` (the STAGE-KEEP stage move that carries the open lend, 130-173 ms) and
+        # ``lend_end``. With a lend / return note present its wall is the larger of the timed move and those
+        # spans; without the note nothing changes (a seat re-plan alone stays ``other``).
+        row_ms = sum(float(self.spans.get(k, 0.0)) for k in ROW_MOVE_SPANS)
+
         def _names(c: str) -> bool:
             # S106: a timed note names the gap only when its own wall is at least half of the rest
-            return c in notes and (c not in TIMED_CAUSES or c not in notes_ms
-                                   or notes_ms[c] >= 0.5 * other_ms)
+            if c not in notes:
+                return False
+            if c not in TIMED_CAUSES or c not in notes_ms:
+                return True
+            return max(notes_ms[c], row_ms) >= 0.5 * other_ms
 
         if flip:
             cause = "flip"

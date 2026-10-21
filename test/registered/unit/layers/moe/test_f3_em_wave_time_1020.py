@@ -77,4 +77,5 @@ def test_the_wave_counter_rides_the_one_non_blocking_d2h(monkeypatch, caplog):
     with caplog.at_level(logging.INFO, logger=P.__name__):
         S51._extend(dev)
         P.on_forward(42)
-    assert seen == [(2 + 2 * P.MAX_WAVES,)]
+    # EM-PREFETCH (21.10.) appended its three slots to the SAME counter: still one D2H
+    assert seen == [(P.COUNTER_LEN,)] and P.COUNTER_LEN == 2 + 2 * P.MAX_WAVES + 3
