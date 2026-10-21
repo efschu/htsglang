@@ -101,6 +101,20 @@ free on TP1 / TP2 (_174205, 529 / 508 extends) and >= 528 / 549 (_201023, 291 / 
 sum (>= 859 / 727). At the gated price 592 of 732 short returns on TP1 and 610 of 758 on TP2 need no
 return at all (_174205). Rows kept through the extend are its expert rows: the same experts are not
 copied again over the link.
+
+LEND-COST (21.10., nf-rc30-tp0lend-1021, planner order: the price follows the MEASURED transient, no
+reserve, no safety factor, the 300 MiB HALT line untouched): NF rc30 D ``..._1021_063252`` -- TP0 (start
+rate) priced a 5-row extend with the sum 767 + 300 + 0.5871 x 5 = 1069 MiB and gave expert rows back
+1223x in 2 h 13 min (133.9 s host wall, each a decode pause of the group; TP1/TP2 287 / 277x), 645 of
+them before extends of <= 4 rows; its target extends of <= 64 rows grew the allocator by <= 449 MiB. Now
+every rank with a lend floor measures what an extend of a row class costs its card
+(``extend_trim.lend_cost_mib``: the Q-694b reading of the target extend plus the draft extend's reserved
+growth, the class maximum, ratchet up) and the short price is ``max(floor, 300 + rate x rows, 300 +
+measured cost)``; a class without a reading keeps the old price (TP0: the S78 sum). The measured term
+only ever RAISES the max price of a measured-rate rank (TP1/TP2); on a start-rate rank it replaces the
+sum, which covered the fixed part the start rate does not see -- the measurement contains that fixed part.
+Amount rank-local like every lend amount; no verdict reads it. ``FLLIPER_PDFLIP_D_LEND_MEASURED_PRICE``
+(default ON); off = the old price byte for byte.
 """
 
 from __future__ import annotations
@@ -478,7 +492,12 @@ def short_extend_need_mib(rank: int, rows: int) -> Optional[float]:
 
     Review A (20.10.): the max applies ONLY on a rank whose rate is measured (:func:`rate_measured`);
     a start-rate rank (NF TP0: real 0.6-0.84 MiB/row at 700-2139 rows against the start 0.5871) keeps
-    the S78 sum ``floor + 300 + rate x rows``."""
+    the S78 sum ``floor + 300 + rate x rows``.
+
+    LEND-COST (21.10.): once this rank has MEASURED the card cost of the extend's row class
+    (:func:`measured_cost_mib`), every rank prices ``max(floor, 300 + rate x rows, 300 + cost)`` -- the
+    measurement holds the fixed part the start rate misses (NF TP0 <= 64 rows: <= 449 MiB against
+    0.5871 x 64 = 38), so the sum is not needed for it any more."""
     from flliper.srt.pdflip import d_seat_vram as dsv
     from flliper.srt.pdflip import extend_trim
 
@@ -489,13 +508,32 @@ def short_extend_need_mib(rank: int, rows: int) -> Optional[float]:
         return None
     if floor is None or price is None:
         return None
+    # LEND-COST (21.10.): the card cost MEASURED on this rank for the extend's row class (target + draft
+    # extend, ratchet up; None = the class has no reading yet) -- priced on the 300 MiB HALT line, nothing on top
+    cost = measured_cost_mib(int(rank), int(rows))
+    if cost is not None:
+        return max(float(floor), float(price), extend_trim.CHUNKING_FLOOR_MIB + float(cost))
     if not rate_measured(int(rank)):
         # review A (20.10.): a rank that prices with the START rate only (NF: TP0 keeps its recorded rate,
         # FLLIPER_PDFLIP_EXTEND_RATE_MEASURE_RANKS) or has not measured yet keeps the S78 sum -- the floor
         # covers the fixed part a start rate does not see (rc28 _201023 TP0 20:43:30, 2139 rows: card use
-        # 1596 MiB against max-price 1556)
+        # 1596 MiB against max-price 1556) -- until LEND-COST has measured the row class (above)
         return float(floor) + float(price)
     return max(float(floor), float(price))
+
+
+def measured_cost_mib(rank: int, rows: int) -> Optional[float]:
+    """LEND-COST (21.10.): this rank's measured card cost (MiB) of an extend of ``rows`` rows -- the
+    maximum of its row class (``extend_trim.lend_cost_mib``), ``None`` while the switch is off or the class
+    has no reading (the old price then holds)."""
+    try:
+        from flliper.srt.pdflip import extend_trim
+
+        if not extend_trim.lend_cost_armed(int(rank)):
+            return None
+        return extend_trim.lend_cost_mib(int(rows))
+    except Exception:  # noqa: BLE001 -- unreadable: no measurement, the old price
+        return None
 
 
 def rate_measured(rank: int) -> bool:
@@ -740,6 +778,7 @@ def round_start(sched) -> Optional[str]:
     pending an in-flight lend is joined (its map thread) and landed, and the returned cells go before the
     width vote reads the card (``_bytes_now``: E1 only)."""
     ctl = _controller(sched)
+    _settle_lend_cost(sched, ctl)
     poll(sched, ctl)
     if ctl is None:
         return None
@@ -762,6 +801,22 @@ def round_start(sched) -> Optional[str]:
         out = _give_back(sched, ctl, "extend pending %s" % trigger)
     _bytes_now(sched, ctl, "the pending extend's width vote")
     return out
+
+
+def _settle_lend_cost(sched, ctl) -> None:
+    """LEND-COST (21.10.): the extend batch the last pass launched (target + draft) is closed here, before
+    this pass moves a lent row -- its reserved growth is final, no lend map ran since the extend's own move
+    (``on_batch`` joins an in-flight lend before every extend). No-op without an open tail."""
+    try:
+        from flliper.srt.pdflip import extend_trim
+
+        if extend_trim._CACHE.get("lend_cost_tail") is None:
+            return
+        lent = ctl is not None and getattr(ctl, "lent_from", None) is not None
+        extend_trim.lend_cost_settle(_rank(sched), lend_open=lent,
+                                     rows_on=None if ctl is None else int(getattr(ctl, "rows_on", 0) or 0))
+    except Exception:  # noqa: BLE001 -- an instrument never stops a pass
+        pass
 
 
 def on_batch(sched, batch) -> Optional[str]:

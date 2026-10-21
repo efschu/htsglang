@@ -4200,6 +4200,16 @@ class Envs:
     #   rate) return everything as before. False = the full return, byte for
     #   byte.
     FLLIPER_PDFLIP_D_LEND_KEEP_SHORT = EnvBool(True)
+    #   LEND-COST (21.10., nf-rc30-tp0lend-1021): the KEEP-SHORT price follows the MEASURED card cost of the
+    #   extend's row class on this rank (target extend: Q-694b's max(allocator peak - start, reserved growth)
+    #   after the trim, plus the draft extend's reserved growth; max per class <= 64 / powers of two, ratchet
+    #   up) -- price = max(lend floor, 300 + rate x rows, 300 + measured cost); a class without a reading keeps
+    #   the old price. NF rc30 D (1021_063252): TP0, a start-rate rank, priced a 5-row extend with the S78 sum
+    #   767 + 300 + 0.5871 x 5 = 1069 MiB and gave rows back 1223x in 2 h 13 min (133.9 s host, each a decode
+    #   pause), while its <= 64-row extends grew the allocator by <= 449 MiB. Only ranks with a lend floor (D)
+    #   measure. Lines EXTEND-LEND-COST (new class maximum) and EXTEND-LEND-COST HALT (an extend batch ended
+    #   under the 300 MiB line). False = the old price and no reading on TP0, byte for byte.
+    FLLIPER_PDFLIP_D_LEND_MEASURED_PRICE = EnvBool(True)
     #   D-MEM-SHARE (20.10., nf-decode-host-1020): the D-MEM-SCHED census counts a prompt prefix two
     #   requests hold in ONE set of tree pages once (group-agreed credit, pdflip/d_mem_share.py). rc28 D
     #   (1020_174205): 106 of 116 KV-stage grows were held by the stage they left once the matched prefix
