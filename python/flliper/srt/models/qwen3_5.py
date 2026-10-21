@@ -1821,6 +1821,14 @@ class Qwen3_5ForCausalLM(nn.Module):
             logger.info(
                 "[moe-pool-prefetch] %d MoE blocks linked (distance 1)", n_pf
             )
+        # EM-PREFETCH (FLLIPER_MOE_POOL_EM_PREFETCH, default ON): the eager twin for D prefill / mixed
+        # extends -- each MoE block predicts the next block's experts and its EM pass prefetches them.
+        from flliper.srt.models.qwen2_moe import link_moe_pool_em_prefetch
+
+        n_em_pf = link_moe_pool_em_prefetch(self.layers)
+        logger.info(
+            "[moe-pool-em-prefetch] %d MoE blocks linked (distance 1, FLLIPER_MOE_POOL_EM_PREFETCH)", n_em_pf
+        )
 
         # #753: the mid-loop crossing wire. NoCrossingWire unless a layer set
         # is configured AND FLLIPER_PP_CROSSING_WIRE is on, so the default path

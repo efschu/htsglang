@@ -33,6 +33,18 @@ expert GEMM per layer that ``em_ms - copy_ms`` cannot separate. The line therefo
 (summed over the forward's EM layers): ``wave_copy_ms`` (copy events), ``wave_apply_ms`` (copy end -> the wave's
 last apply slice, device time) and ``wave_served`` (lanes the wave served, device counter, read with the same
 non-blocking D2H). ``wave_served`` 0 with ``wave_apply_ms`` > 0 is the empty wave's GEMM, measured. No sync.
+
+EM-PREFETCH (21.10.). A forward whose layers prefetched the NEXT layer's predicted rows on the pool prefetch side
+stream (``MoEExpertOffloadCache.prefetch_pool_em``) carries, summed over its layers::
+
+    pf_layers=<prefetches issued> pf_predicted=<distinct experts predicted> pf_fetched=<rows the side stream
+      copied> pf_hits=<of those, rows the target layer's first wave really used> pf_copy_ms=<side-stream copy time>
+
+``copy_ms`` stays the SYNCHRONOUS row copies on the forward stream (what the prefetch is meant to shrink);
+``pf_fetched - pf_hits`` is the wasted prefetch. Counters are device adds on the forward stream (the
+predicted count before the side stream forks, fetched and hits after the target layer joined it), so they
+ride the same one non-blocking D2H; the side-stream copy events are complete once the forward stream has
+joined every prefetch, which it does before its record closes. No sync.
 """
 from __future__ import annotations
 
@@ -45,6 +57,11 @@ MARK = "EM-FETCH"
 MAX_PENDING = 16
 #: F3: per-wave counters kept (EM waves are capped far below this; a higher wave index folds into the last)
 MAX_WAVES = 8
+#: EM-PREFETCH counter slots after the per-wave ones: predicted, fetched, hits
+PF_BASE = 2 + 2 * MAX_WAVES
+PF_PRED, PF_FETCHED, PF_HITS = PF_BASE, PF_BASE + 1, PF_BASE + 2
+#: the one device counter a record carries (rows, bytes, per-wave served + computed, prefetch)
+COUNTER_LEN = PF_BASE + 3
 #: the device types the probe times (a CPU harness adds "cpu" with a fake event class)
 DEVICE_TYPES = ("cuda",)
 _STATE = {"on": None, "cur": None, "pending": [], "fwd": 0, "dropped": 0}
@@ -69,7 +86,7 @@ class Record:
     """One forward's EM layers on this rank (device counters + timing events)."""
 
     __slots__ = ("fwd", "stream", "start", "end", "pairs", "counter", "layers", "waves", "tokens", "host", "done",
-                 "wave_copy", "wave_apply", "last_copy_end")
+                 "wave_copy", "wave_apply", "last_copy_end", "pf_layers", "pf_pairs")
 
     def __init__(self, fwd: int, device, cuda):
         import torch
@@ -81,7 +98,10 @@ class Record:
         self.end = None
         self.pairs: List[tuple] = []
         # [rows, bytes, served lanes of wave 1 .. MAX_WAVES (F3), computed lanes of wave 1 .. MAX_WAVES (W2)]
-        self.counter = torch.zeros(2 + 2 * MAX_WAVES, dtype=torch.int64, device=device)
+        # EM-PREFETCH: + [predicted, fetched, hits] (PF_BASE ..)
+        self.counter = torch.zeros(COUNTER_LEN, dtype=torch.int64, device=device)
+        self.pf_layers = 0
+        self.pf_pairs: List[tuple] = []  # EM-PREFETCH: side-stream copy events
         self.wave_copy: dict = {}   # F3: wave -> [(copy start, copy end)]
         self.wave_apply: dict = {}  # F3: wave -> [(copy end, apply end)]
         self.last_copy_end = None
@@ -130,6 +150,26 @@ class Record:
                 self.counter[c:c + 1].add_(int(computed))
             else:
                 self.counter[c:c + 1].add_(computed.reshape(-1).to(torch.int64).sum().reshape(1))
+
+    def prefetch_issued(self, predicted) -> None:
+        """EM-PREFETCH: one layer issued the next layer's prefetch; ``predicted`` = its distinct predicted
+        experts (device scalar/tensor, summed on the forward stream before the side stream forks)."""
+        import torch
+
+        self.pf_layers += 1
+        self.counter[PF_PRED:PF_PRED + 1].add_(predicted.reshape(-1).to(torch.int64).sum().reshape(1))
+
+    def prefetch_copy(self, e0, e1) -> None:
+        """EM-PREFETCH: the side stream's copy events of one prefetch (read once the forward has joined it)."""
+        self.pf_pairs.append((e0, e1))
+
+    def prefetch_landed(self, fetched, hits) -> None:
+        """EM-PREFETCH: on the forward stream after the target layer joined the prefetch -- the rows it copied
+        (the prefetch step's gather count) and the rows of those its first wave used (pf hit delta)."""
+        import torch
+
+        self.counter[PF_FETCHED:PF_FETCHED + 1].add_(fetched.reshape(-1)[:1].to(torch.int64))
+        self.counter[PF_HITS:PF_HITS + 1].add_(hits.reshape(-1)[:1].to(torch.int64))
 
     def end_layer(self, tokens: int) -> None:
         ev = _cuda().Event(enable_timing=True)
@@ -196,7 +236,25 @@ def line_of(rec: Record) -> str:
     return ("%s fwd=%d T=%d layers=%d waves=%d rows=%d gib=%.3f copy_ms=%.1f em_ms=%.1f link_gbps=%.2f "
             "dropped=%d (device time of this forward's EAGER-DEVICE-EM row copies vs the whole EM span; rank-local)%s"
             % (MARK, rec.fwd, rec.tokens, rec.layers, rec.waves, rows, nbytes / float(1 << 30), copy_ms, em_ms,
-               gbps, _STATE["dropped"], wave_terms(rec)))
+               gbps, _STATE["dropped"], wave_terms(rec) + pf_terms(rec)))
+
+
+def pf_terms(rec: Record) -> str:
+    """EM-PREFETCH: `` pf_layers=.. pf_predicted=.. pf_fetched=.. pf_hits=.. pf_copy_ms=..`` ('' when the forward
+    issued none). A copy pair whose end has not completed is left out, never waited for."""
+    n = int(getattr(rec, "pf_layers", 0) or 0)
+    if n <= 0:
+        return ""
+    host = rec.host
+    vals = [int(host[i]) if host is not None and i < len(host) else 0 for i in (PF_PRED, PF_FETCHED, PF_HITS)]
+    ms = 0.0
+    for a, b in getattr(rec, "pf_pairs", ()) or ():
+        try:
+            if bool(b.query()):
+                ms += float(a.elapsed_time(b))
+        except Exception:  # noqa: BLE001 -- an instrument never stops a forward
+            pass
+    return " pf_layers=%d pf_predicted=%d pf_fetched=%d pf_hits=%d pf_copy_ms=%.1f" % (n, vals[0], vals[1], vals[2], ms)
 
 
 def wave_terms(rec: Record) -> str:

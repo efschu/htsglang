@@ -3988,6 +3988,21 @@ class Envs:
     # plans on the host as before. Rank-local choice, no collective inside the
     # MoE (R11). Needs FLLIPER_OPT_MOE_POOL_EAGER_DEVICE_STEP.
     FLLIPER_OPT_MOE_POOL_EAGER_DEVICE_EM = EnvBool(True)
+    # EM-PREFETCH (21.10., D prefill, rc30 D ..._1021_063252: the EAGER-DEVICE-EM row copies are 297 of 674 s
+    #   EM forward time on the critical rank, every byte serial on the forward stream). An EAGER-DEVICE-EM
+    #   forward predicts layer L+1's experts with L+1's router on layer L's MoE input (Mixtral-Offloading's
+    #   cross-layer trick, the decode-graph pool prefetch's predictor) and copies the predicted misses into
+    #   L+1's LRU rows on the pool prefetch side stream, right after L's own last row copy -- so they move
+    #   while L applies and L+1 runs attention (the workers idle in the Form-A tp/dcp waits, their links too).
+    #   L+1 joins on ONE event before it plans; a right guess is then a plain hit, a wrong one a miss as
+    #   before. No collective, no host read, output unchanged (a hit and a miss compute the same rows).
+    #   Every rank decides by the same band (graph limit < T x K <= EM_MAX_IDS); a rank whose layer has a
+    #   resume-warm plan or deferred rows pending skips it (only that rank's copies stay synchronous).
+    #   EM-FETCH carries pf_layers/pf_predicted/pf_fetched/pf_hits/pf_copy_ms. False = byte-identical before.
+    FLLIPER_MOE_POOL_EM_PREFETCH = EnvBool(True)
+    # EM-PREFETCH: how many of the next router's top-k each token predicts (0 = all top-k). A prefill's
+    #   union over T tokens is what is fetched, so the full top-k is the default.
+    FLLIPER_MOE_POOL_EM_PREFETCH_TOPK = EnvInt(0)
     # S51: the most routed ids (T x top-k) one EAGER-DEVICE-EM forward takes;
     # longer extends keep the host plan. 20480 = 2048 tokens at top-k 10 =
     # 97 % of rc13's D extends (837 of 863 on TP0). Every wave runs over all

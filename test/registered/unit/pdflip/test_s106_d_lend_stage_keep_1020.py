@@ -412,3 +412,30 @@ def test_the_lend_moves_are_timed_into_the_gap(monkeypatch):
         assert dtl.on_batch(r.sched, types.SimpleNamespace(forward_mode=ForwardMode.DECODE)) == "lend"
         assert dtl.on_batch(r.sched, types.SimpleNamespace(forward_mode=ForwardMode.EXTEND)) == "return"
     assert [c for c, _ in got] == ["lend", "lend_return"] and all(ms >= 0.0 for _, ms in got)
+
+
+def test_rc30_the_return_with_its_hooks_and_the_carrying_stage_move_names_the_gap(caplog, monkeypatch):
+    """rc30 D ``..._1021_063252`` TP0 08:35:06: gap 498 ms cause=other, return_ms=157, spans lend_start 177,
+    seat_stage 170, rest 60 -- the lend's row work is 347 ms of it, its bare unlend wall 157. RED before:
+    other. Without a lend note a seat re-plan alone stays other."""
+    caplog.set_level(logging.INFO)
+    monkeypatch.setenv("FLLIPER_PDFLIP_GROUP", "D")
+    s = _gap_sched()
+    ddg.on_batch(s, _decode(["a"]), now=0.0)
+    ddg.note_ms(s, "lend_return", 157.0)
+    tr = getattr(s, ddg._ATTR)
+    tr.span("lend_start", 177.0)
+    tr.span("seat_stage", 170.0)
+    ddg.on_batch(s, _decode(["a"]), now=0.498)
+    line = [m for m in caplog.messages if m.startswith("D-DECODE-GAP gap_ms")][-1]
+    assert "cause=lend_return" in line and "return_ms=157" in line
+    tr.span("seat_stage", 400.0)                              # a re-plan, no lend note in this gap
+    ddg.on_batch(s, _decode(["a"]), now=1.0)
+    line = [m for m in caplog.messages if m.startswith("D-DECODE-GAP gap_ms")][-1]
+    assert "cause=other" in line
+    ddg.note_ms(s, "lend_return", 238.0)                     # 08:37:56: 244 + 32 of 644 -- the rest dominates
+    tr.span("lend_start", 244.0)
+    tr.span("seat_stage", 32.0)
+    ddg.on_batch(s, _decode(["a"]), now=1.644)
+    line = [m for m in caplog.messages if m.startswith("D-DECODE-GAP gap_ms")][-1]
+    assert "cause=other" in line
