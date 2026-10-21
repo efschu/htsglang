@@ -17748,9 +17748,9 @@ def fork_anchor_env(token: Optional[int], p_trim: bool) -> Dict[str, str]:
 
 
 def turn_anchor_env(token: Optional[int]) -> Dict[str, str]:
-    """``--turn-anchor-token``: group P's environment for the TURN ANCHOR
-    (pdflip/turn_anchor.py; {} when off -- the byte-identity guarantee). Group
-    D reads nothing new: the anchor is a regular store node at a page."""
+    """``--turn-anchor-token``: the environment for the TURN ANCHOR (pdflip/turn_anchor.py; {} when off -- the
+    byte-identity guarantee). Group P since 29.09.; group D since 21.10. (D-FORK-ANCHOR: D plans the TURN /
+    CLOSE-FORK / GEN-FORK tracks of the prompts it prefills itself, FLLIPER_PDFLIP_D_FORK_ANCHOR default on)."""
     if token is None:
         return {}
     if int(token) <= 0:
@@ -23036,7 +23036,8 @@ def build_parser() -> argparse.ArgumentParser:
              "starts (a second extend track in the same forward, no extra forward) "
              "and inserts it as an anchor -- where the next turn and a client's side "
              "request fork (y3m pdflip-50-71: FETCH CAP lost=16 pages behind the "
-             "END anchor). Adds FLLIPER_PDFLIP_TURN_ANCHOR_TOKEN to group P only; "
+             "END anchor). Adds FLLIPER_PDFLIP_TURN_ANCHOR_TOKEN to groups P and D (D: the "
+             "D-FORK-ANCHOR tracks, FLLIPER_PDFLIP_D_FORK_ANCHOR=0 turns them off); "
              "default off = argv and env byte-identical.")
     ap.add_argument(
         "--fp8-uniform-marlin", action="store_true",
@@ -26754,6 +26755,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         env_d.update(d_kv_evict_env())  # --d-kv-evict-for-placement: {} under 'off'
         env_d.update(fork_anchor_env(getattr(ns, "fork_anchor_token", None),
                                      bool(getattr(ns, "p_trim_end_anchor", False))))  # {} when off
+        # D-FORK-ANCHOR (21.10.): the TURN token goes to group D too -- D plans the TURN / CLOSE-FORK / GEN-FORK
+        # tracks (FLLIPER_PDFLIP_D_FORK_ANCHOR, default on); {} when --turn-anchor-token is off
+        env_d.update(turn_anchor_env(getattr(ns, "turn_anchor_token", None)))
         # #114: DIE EFFEKTIVE GRUPPEN-ENV GEHOERT INS LOG.
         #
         # Der Verdrahtungs-Check (pdflip/verdrahtung_check.sh) liest das
@@ -26818,6 +26822,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         env_d.update(d_kv_evict_env())  # --d-kv-evict-for-placement: {} under 'off'
         env_d.update(fork_anchor_env(getattr(ns, "fork_anchor_token", None),
                                      bool(getattr(ns, "p_trim_end_anchor", False))))  # {} when off
+        # D-FORK-ANCHOR (21.10.): the TURN token goes to group D too -- D plans the TURN / CLOSE-FORK / GEN-FORK
+        # tracks (FLLIPER_PDFLIP_D_FORK_ANCHOR, default on); {} when --turn-anchor-token is off
+        env_d.update(turn_anchor_env(getattr(ns, "turn_anchor_token", None)))
         # #114 auch HIER: es gibt ZWEI spec_d-Stellen, und die erste Fassung
         # traf nur die andere -- der Dry-Run blieb ohne die Zeile, und der
         # Verdrahtungs-Check meldete "#114 fehlt im Baum", obwohl es im Baum

@@ -177,6 +177,29 @@ def _obs_match_census_deep(
         pass
 
 
+def _obs_d_fork_read(req, node, accepted: int) -> None:
+    """D-FORK-ANCHOR READ witness (log text only, TP0): the match's best node is a fork node group D's track
+    put into the tree and its state was accepted. Once per request and depth."""
+    if req is None or node is None:
+        return
+    try:
+        from flliper.srt.pdflip import turn_anchor as _ta
+
+        kind = getattr(node, _ta.D_FORK_KIND_ATTR, None)
+        if kind is None or not _obs_is_tp0():
+            return
+        cd = node.component_data[ComponentType.MAMBA]
+        if cd.value is None and cd.host_value is None:
+            return
+        seen = getattr(req, "_pdflip_d_fork_read", None)
+        if seen == int(accepted):
+            return
+        req._pdflip_d_fork_read = int(accepted)
+        _ta.note_d_read(req, kind, int(accepted))
+    except Exception:  # noqa: BLE001 - an instrument never breaks a match
+        pass
+
+
 _NO_PROGRESS_N = 0
 
 
@@ -583,6 +606,7 @@ class MambaComponent(TreeComponent):
             branching_seqlen,
             len(result.device_indices) + int(result.host_hit_length or 0),
         )
+        _obs_d_fork_read(req, last_node, sum(len(v) for v in value_chunks[:effective_best_len]))
 
         if zeroed_by_strict_resume:
             # Full re-prefill; the branching seqlen still points at the grid

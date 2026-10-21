@@ -4318,6 +4318,11 @@ class Envs:
     # same forward) and inserts it as its own anchor -- where the next turn
     # and a client's side request fork. Unset/None = every path byte-identical.
     FLLIPER_PDFLIP_TURN_ANCHOR_TOKEN = EnvInt(None)
+    # D-FORK-ANCHOR (pdflip/turn_anchor.py, 21.10., NF rc30 1d822bd150): the TURN / CLOSE-FORK / GEN-FORK
+    # tracks on group D too (overlap schedule allowed: the slot is written by the step's own track gather and
+    # published in the same insert call as the step's own track); a Form A worker gets a split-only plan.
+    # Default ON (new features on); 0 = group D plans nothing, byte-identical to rc30.
+    FLLIPER_PDFLIP_D_FORK_ANCHOR = EnvBool(True)
     # TWIN ANCHOR (pdflip/twin_anchor.py, 30.09., NF y4a pdflip-16-28): where the
     # turn anchor and the twin deferral are armed, a prefill step also tracks
     # the state at floor_page(shared - 1) of every fork twin still queued
