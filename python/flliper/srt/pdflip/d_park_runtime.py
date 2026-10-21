@@ -33,7 +33,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-from typing import Optional
+from typing import Any, List, Optional
 
 from flliper.srt.managers import pdflip_resumable_depth
 from flliper.srt.pdflip import d_lane, d_park_draft, d_park_read, d_seats, park_hold_yield, park_retract_split
@@ -1325,6 +1325,30 @@ def _displace_candidate(sched, _sa, waiting, reqs, lanes_on):
     return None
 
 
+def _spec_batch(running_batch) -> bool:
+    return not (getattr(running_batch, "spec_algorithm", None) is None
+                or running_batch.spec_algorithm.is_none())
+
+
+def displaceable(running_batch) -> List[Any]:
+    """NF-C-SITZ 1021 (rc27 _1021_020616, D 19679 ``SEAT-AGE DISPLACE-WAIT older=pdflip-2-27 youngest=pdflip-2-28 ...
+    the youngest is not the back``; front 2271 ``SEAT-AGE ON-CREDIT rid=pdflip-2-27 victims=['pdflip-2-29']``): the
+    running requests D's SEAT-AGE CAN park at this round boundary -- every one, under speculative decoding only the
+    back of the batch. ONE rule for D's own victim (:func:`displace_for_age`) and for the front's AGE PLAN (D's
+    ``pdflip_kv.displaceable_rids`` reading): before, the front planned on its own youngest, D on the youngest by rid
+    age and could not park it (not the back) -- the head sat on D on credit, the front counted the seat and the next
+    credit stacked (seat=7/6, rc29 8/6, taken=11 > n=6). Replicated input (the running batch, its order and spec mode
+    are the same on every TP rank)."""
+    reqs = list(getattr(running_batch, "reqs", None) or [])
+    if not reqs:
+        return []
+    return reqs[-1:] if _spec_batch(running_batch) else reqs
+
+
+def displaceable_rids(running_batch) -> List[str]:
+    return [str(r.rid) for r in displaceable(running_batch)]
+
+
 def displace_for_age(sched, running_batch) -> Optional[str]:
     """SA (3) (#244, the user's design): an older request waits on D while
     every seat is held and a YOUNGER one runs -> the youngest running one is
@@ -1375,8 +1399,11 @@ def displace_for_age(sched, running_batch) -> Optional[str]:
         waiting = [q for q in waiting if d_lane.admissible_for_displace(sched, q)]
     trigger = "seat"
     pair = None
+    # NF-C-SITZ 1021: the victim is chosen among the requests D CAN park now (:func:`displaceable`) -- the set the front
+    # plans on -- and the KV fit is asked for exactly that victim; never a victim D then waits for.
+    pool_reqs = displaceable(running_batch)
     if cap and len(reqs) >= int(cap):
-        cand = _displace_candidate(sched, _sa, waiting, reqs, lanes_on)
+        cand = _displace_candidate(sched, _sa, waiting, pool_reqs, lanes_on)
         if cand is not None:
             # NF review of 2d49cd45bf: the seat trigger freed a seat without asking
             # whether the older one then FITS the KV -- a victim for nothing, against the
@@ -1384,7 +1411,7 @@ def displace_for_age(sched, running_batch) -> Optional[str]:
             # The KV half is rank-local, so it goes through the group MIN like the KV
             # trigger (the precondition -- full seats, a candidate -- is replicated,
             # so every rank enters the collective).
-            local = kv_displace_would_fit(sched, cand[0], _lane_pool(sched, reqs, cand[0], waiting, lanes_on),
+            local = kv_displace_would_fit(sched, cand[0], _lane_pool(sched, pool_reqs, cand[0], waiting, lanes_on),
                                           seat=True, view=no_token_view)
             gm = getattr(sched, "_pdflip_group_min_flags", None)
             agreed = bool(gm([local])[0]) if callable(gm) else bool(local)
@@ -1397,7 +1424,7 @@ def displace_for_age(sched, running_batch) -> Optional[str]:
         # read through the group MIN (_pdflip_group_min_flags), entered by every
         # rank because the precondition is the same on every rank -- so the
         # group displaces only when EVERY rank refused (RAENGE-NIE-UNEINS).
-        cand = _displace_candidate(sched, _sa, waiting, reqs, lanes_on)
+        cand = _displace_candidate(sched, _sa, waiting, pool_reqs, lanes_on)
         if cand is not None:
             _lm = _prio_lane_map(sched.waiting_queue, reqs)  # PRIO-AS-AGE 1014: compared by the order key
             local = no_token_rid is not None and not _sa.is_older(
@@ -1407,7 +1434,7 @@ def displace_for_age(sched, running_batch) -> Optional[str]:
                 # wenn der ältere nicht draufpasst. nicht pauschal den jüngeren verdrängen" --
                 # only when displacing the youngest seats is ENOUGH for the older one (and it
                 # does not already fit); else nobody leaves and the backfill stays.
-                local = kv_displace_would_fit(sched, cand[0], _lane_pool(sched, reqs, cand[0], waiting, lanes_on),
+                local = kv_displace_would_fit(sched, cand[0], _lane_pool(sched, pool_reqs, cand[0], waiting, lanes_on),
                                               view=no_token_view)
             gm = getattr(sched, "_pdflip_group_min_flags", None)
             agreed = bool(gm([local])[0]) if callable(gm) else bool(local)
@@ -1433,9 +1460,8 @@ def displace_for_age(sched, running_batch) -> Optional[str]:
                            [str(r) for r in released])
         return None
     idx = next(i for i, r in enumerate(reqs) if str(r.rid) == victim_rid)
-    spec = not (getattr(running_batch, "spec_algorithm", None) is None
-                or running_batch.spec_algorithm.is_none())
-    if spec and idx != len(reqs) - 1:
+    spec = _spec_batch(running_batch)
+    if spec and idx != len(reqs) - 1:   # NF-C-SITZ: unreachable (the pool is the back) -- kept as the named guard
         n = getattr(sched, "_sa_displace_waits", 0) + 1
         sched._sa_displace_waits = n
         if n <= 8 or (n & (n - 1)) == 0:
