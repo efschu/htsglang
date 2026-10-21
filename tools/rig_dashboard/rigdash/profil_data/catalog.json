@@ -42912,7 +42912,7 @@
    "id": "FLLIPER_HICACHE_ARENA_DIR",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/hicache_storage.py:3716",
+    "mem_cache/hicache_storage.py:3717",
     "pdflip/decode_warm_handoff.py:46",
     "pdflip/front.py:7572",
     "pdflip/handoff.py:30",
@@ -42925,7 +42925,7 @@
    "source": {
     "file": "mem_cache/hicache_storage.py",
     "kind": "os.environ",
-    "line": 3716,
+    "line": 3717,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -42948,7 +42948,7 @@
    "id": "FLLIPER_HICACHE_ARENA_GIB",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/hicache_storage.py:3770",
+    "mem_cache/hicache_storage.py:3771",
     "mem_cache/pool_host/arena_pool.py:1228",
     "pdflip/launcher.py:27438"
    ],
@@ -42959,7 +42959,7 @@
    "source": {
     "file": "mem_cache/hicache_storage.py",
     "kind": "os.environ",
-    "line": 3770,
+    "line": 3771,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -43082,7 +43082,7 @@
    "kind": "env",
    "lesestellen": [
     "mem_cache/form_a_host_shadow.py:1736",
-    "mem_cache/hicache_storage.py:3774",
+    "mem_cache/hicache_storage.py:3775",
     "pdflip/launcher.py:29594",
     "pdflip/launcher.py:29593",
     "pdflip/launcher.py:29620"
@@ -43986,7 +43986,7 @@
    "id": "FLLIPER_HICACHE_L3_READ_THREADS",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/hicache_storage.py:7013"
+    "mem_cache/hicache_storage.py:7052"
    ],
    "level": "expert",
    "name": "FLLIPER_HICACHE_L3_READ_THREADS",
@@ -43995,7 +43995,7 @@
    "source": {
     "file": "mem_cache/hicache_storage.py",
     "kind": "os.environ",
-    "line": 7013,
+    "line": 7052,
     "tree": "27b"
    },
    "status": "harvested",
@@ -44417,7 +44417,7 @@
    "id": "FLLIPER_HICACHE_PROBE_CHUNKED",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/hicache_storage.py:1886"
+    "mem_cache/hicache_storage.py:1887"
    ],
    "level": "expert",
    "name": "FLLIPER_HICACHE_PROBE_CHUNKED",
@@ -44426,7 +44426,7 @@
    "source": {
     "file": "mem_cache/hicache_storage.py",
     "kind": "os.environ",
-    "line": 1886,
+    "line": 1887,
     "tree": "27b"
    },
    "status": "harvested",
@@ -44478,7 +44478,7 @@
    "id": "FLLIPER_HICACHE_READ_BUFFER_MIB",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/hicache_storage.py:6497"
+    "mem_cache/hicache_storage.py:6536"
    ],
    "level": "expert",
    "name": "FLLIPER_HICACHE_READ_BUFFER_MIB",
@@ -44487,7 +44487,7 @@
    "source": {
     "file": "mem_cache/hicache_storage.py",
     "kind": "os.environ",
-    "line": 6497,
+    "line": 6536,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -44604,7 +44604,7 @@
    "id": "FLLIPER_HICACHE_STORAGE_BATCH",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/hicache_storage.py:941"
+    "mem_cache/hicache_storage.py:942"
    ],
    "level": "expert",
    "name": "FLLIPER_HICACHE_STORAGE_BATCH",
@@ -44613,7 +44613,7 @@
    "source": {
     "file": "mem_cache/hicache_storage.py",
     "kind": "os.environ",
-    "line": 941,
+    "line": 942,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -67394,7 +67394,7 @@
    "id": "FLLIPER_PDFLIP_L3FILL_JOIN_IDLE_MS",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/hicache_storage.py:514"
+    "mem_cache/hicache_storage.py:515"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_L3FILL_JOIN_IDLE_MS",
@@ -67403,7 +67403,7 @@
    "source": {
     "file": "mem_cache/hicache_storage.py",
     "kind": "os.environ",
-    "line": 514,
+    "line": 515,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -67571,7 +67571,7 @@
    "id": "FLLIPER_PDFLIP_L3FILL_REF_AT_LAND",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/hicache_storage.py:111"
+    "mem_cache/hicache_storage.py:112"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_L3FILL_REF_AT_LAND",
@@ -67580,7 +67580,7 @@
    "source": {
     "file": "mem_cache/hicache_storage.py",
     "kind": "os.environ",
-    "line": 111,
+    "line": 112,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -67872,8 +67872,8 @@
    "id": "FLLIPER_PDFLIP_L3_PERSIST",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/hicache_storage.py:2332",
-    "mem_cache/hicache_storage.py:5671",
+    "mem_cache/hicache_storage.py:2333",
+    "mem_cache/hicache_storage.py:5710",
     "mem_cache/storage/file/lru_file_evictor.py:1661"
    ],
    "level": "expert",
@@ -67883,7 +67883,7 @@
    "source": {
     "file": "mem_cache/hicache_storage.py",
     "kind": "os.environ",
-    "line": 2332,
+    "line": 2333,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -67935,7 +67935,7 @@
    "id": "FLLIPER_PDFLIP_L3_REFRESH_KEPT",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/hicache_storage.py:5213"
+    "mem_cache/hicache_storage.py:5252"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_L3_REFRESH_KEPT",
@@ -67944,7 +67944,7 @@
    "source": {
     "file": "mem_cache/hicache_storage.py",
     "kind": "os.environ",
-    "line": 5213,
+    "line": 5252,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -67995,7 +67995,7 @@
    "id": "FLLIPER_PDFLIP_L3_WRITE_BEHIND_CHUNK_PAGES",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/hicache_storage.py:3911"
+    "mem_cache/hicache_storage.py:3912"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_L3_WRITE_BEHIND_CHUNK_PAGES",
@@ -68004,7 +68004,7 @@
    "source": {
     "file": "mem_cache/hicache_storage.py",
     "kind": "os.environ",
-    "line": 3911,
+    "line": 3912,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -68027,7 +68027,7 @@
    "id": "FLLIPER_PDFLIP_L3_WRITE_BEHIND_DIRECT",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/hicache_storage.py:3918"
+    "mem_cache/hicache_storage.py:3919"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_L3_WRITE_BEHIND_DIRECT",
@@ -68036,7 +68036,7 @@
    "source": {
     "file": "mem_cache/hicache_storage.py",
     "kind": "os.environ",
-    "line": 3918,
+    "line": 3919,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -68044,6 +68044,37 @@
    "trees": [
     "27b",
     "nf"
+   ],
+   "type": "os.environ"
+  },
+  "FLLIPER_PDFLIP_L3_WRITE_BEHIND_DIRECT_MIN_KIB": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "",
+   "id": "FLLIPER_PDFLIP_L3_WRITE_BEHIND_DIRECT_MIN_KIB",
+   "kind": "env",
+   "lesestellen": [
+    "mem_cache/hicache_storage.py:3931"
+   ],
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_L3_WRITE_BEHIND_DIRECT_MIN_KIB",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "mem_cache/hicache_storage.py",
+    "kind": "os.environ",
+    "line": 3931,
+    "tree": "27b"
+   },
+   "status": "unexplained",
+   "text": "",
+   "trees": [
+    "27b"
    ],
    "type": "os.environ"
   },
@@ -83776,7 +83807,7 @@
    "id": "FLLIPER_QSA_SIDECAR_TRACE",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/hicache_storage.py:6746"
+    "mem_cache/hicache_storage.py:6785"
    ],
    "level": "expert",
    "name": "FLLIPER_QSA_SIDECAR_TRACE",
@@ -83785,7 +83816,7 @@
    "source": {
     "file": "mem_cache/hicache_storage.py",
     "kind": "os.environ",
-    "line": 6746,
+    "line": 6785,
     "tree": "27b"
    },
    "status": "unexplained",
@@ -91403,24 +91434,24 @@
  "schema": "flliper.catalog/1",
  "stats": {
   "curated": 125,
-  "entries": 2897,
-  "envs": 2018,
+  "entries": 2898,
+  "envs": 2019,
   "explained": 310,
   "flags": 864,
   "harvested": 1793,
   "trees": {
    "abweichung": 23,
    "beide": 2696,
-   "nur_27b": 179,
+   "nur_27b": 180,
    "nur_nf": 4
   },
-  "unexplained": 669
+  "unexplained": 670
  },
- "tree_rev": "27b=c40cccac11+nf=c6c0e942c2",
+ "tree_rev": "27b=19893afa64+nf=c6c0e942c2",
  "trees": {
   "27b": {
-   "entries": 2875,
-   "rev": "c40cccac11"
+   "entries": 2876,
+   "rev": "19893afa64"
   },
   "nf": {
    "entries": 2700,
