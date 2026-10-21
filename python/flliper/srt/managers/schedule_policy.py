@@ -1021,6 +1021,76 @@ def _h105c_follow_load_back(adder, req, lb_extent: int) -> torch.Tensor:
 
 #: H105d: how often a token-cut rank voted NO_TOKEN for want of load-back room.
 _H105D_REFUSED = {"n": 0}
+_H105G_DROPPED = {"n": 0}
+
+
+def _h105g_load_back_target_lost(tree_cache, best_match_node) -> str | None:
+    """H105g: why ``best_match_node`` is no load-back source any more, or None while it still is.
+
+    THE METAL (NF rc29 a773b4ebc4, D log boot_..._a773b4ebc4_1021_022209.D.log 45873-45937, TP0 02:31:11-13Z,
+    pdflip-2-44): the request matched a 150336-token HOST-ONLY leaf (the L3 prefetch of 02:30:48, 2349 pages,
+    its mamba END anchor host-only, ``MAMBA-HOST-RESUME ... depth=169216``) below an 18880-token device prefix.
+    Its own H105d room (``tc.evict``) evicted D nodes 170/167/169; backing 169 up claimed 1987 arena pages, the
+    W3 device round paid short and the host-only round (``W3-HOST-LEAF SPILL ... released_pages=2349 leaves=1
+    aux_leaves=1``) dropped exactly that leaf -- every page on L3 (``l3=on_disk:2349``), ``_evict_host_leaf``:
+    host value None, node out of the tree. The request still held the handle; ``init_load_back`` ->
+    ``LEAF-SET DETACHED node=166 evicted=True`` -> ``build_hicache_transfers``: ``assert cd.host_value is not
+    None`` -> RANK_EXCEPTION, D group gone. S109 (fa527fb6ea) let a leaf whose only host-only aux state is its
+    mamba anchor spill -- the load-back target of a hybrid match is exactly such a leaf (before, ``aux_host_only``
+    kept it as a side effect).
+
+    The same walk ``FullComponent.build_hicache_transfers(LOAD_BACK)`` asserts on: every evicted node from
+    ``best_match_node`` up to the first device node must still be in the tree and carry its Full host rows."""
+    from flliper.srt.mem_cache.unified_cache_components.tree_component import (
+        BASE_COMPONENT_TYPE,
+    )
+
+    root = getattr(tree_cache, "root_node", None)
+    page = getattr(tree_cache, "page_size", None)
+    cur = best_match_node
+    while cur is not None and cur is not root and getattr(cur, "evicted", False):
+        parent = getattr(cur, "parent", None)
+        if parent is None:
+            return "detached"
+        key = getattr(cur, "key", None)
+        children = getattr(parent, "children", None)
+        if (
+            key is not None
+            and isinstance(page, int)
+            and isinstance(children, dict)
+            and children.get(key.child_key(page)) is not cur
+        ):
+            return "detached"
+        if cur.component_data[BASE_COMPONENT_TYPE].host_value is None:
+            return "no_host_value"
+        cur = parent
+    return None
+
+
+def _h105g_target_kept(adder, req, has_extent, site: str) -> bool:
+    """H105g: the room verdict True holds only while the load-back source this pass will read is still there.
+
+    A room step that dropped it (see ``_h105g_load_back_target_lost``) answers NO_TOKEN instead -- on the token
+    cut that is THIS rank's gate in the gathered MIN (H105d/H105f), so every rank keeps the rid queued and nobody
+    loads back. The next pass matches the live tree: the dropped run is on L3 (the spill writes or finds the L3
+    copy of every page first, #257), the X gate's store arm prices it and S59 re-reads the store -- no recompute.
+    Never a rank-local exit: the answer rides the vote the caller gathers."""
+    if not has_extent:
+        return True
+    why = _h105g_load_back_target_lost(adder.tree_cache, req.best_match_node)
+    if why is None:
+        return True
+    _H105G_DROPPED["n"] += 1
+    n = _H105G_DROPPED["n"]
+    if n <= 8 or (n & (n - 1)) == 0:
+        logger.warning(
+            "H105g LOAD-BACK TARGET DROPPED rid=%s node=%s why=%s site=%s (n=%d): the load-back source this "
+            "request matched left L2 between its match and its load-back (the W3 spill of its own room step: the "
+            "pages are on L3) -- this rank votes NO_TOKEN in the gathered verdict, the group keeps the rid queued "
+            "and the next pass re-matches and reads the store; no stale handle reaches init_load_back",
+            getattr(req, "rid", "?"), getattr(req.best_match_node, "id", "?"), why, site, n,
+        )
+    return False
 
 
 def _h105d_load_back_kv_rows(best_match_node) -> int:
@@ -1102,9 +1172,10 @@ def _h105d_cut_load_back_room(adder, req, evict: bool = True) -> bool:
 
     if not form_a_token_cut_active():
         return True
+    _lb_extent = _pp_load_back_extent(req)
     kv_rows = (
         _h105d_load_back_kv_rows(req.best_match_node)
-        if _pp_load_back_extent(req)
+        if _lb_extent
         else 0
     )
     chunk_rows = _h110_chunk_rows(adder, req, kv_rows)
@@ -1113,7 +1184,8 @@ def _h105d_cut_load_back_room(adder, req, evict: bool = True) -> bool:
     alloc = adder.token_to_kv_pool_allocator
     available = int(alloc.available_size())
     if need <= available:
-        return True
+        # H105g: a True verdict only while the load-back source is still in the tree with its host rows
+        return _h105g_target_kept(adder, req, _lb_extent, "no_room_needed")
     from flliper.srt.mem_cache.base_prefix_cache import EvictParams
 
     tc = adder.tree_cache
@@ -1126,14 +1198,17 @@ def _h105d_cut_load_back_room(adder, req, evict: bool = True) -> bool:
         # H105f (NF h14 14:50:53, pdflip-0-3): the DRY vote -- may this rank make
         # the room? Nothing is evicted before the group has said ADMIT.
         if need <= available + payable:
-            return True
+            return _h105g_target_kept(adder, req, _lb_extent, "dry_vote")
     elif payable > 0 and need <= available + payable:
         res = tc.evict(EvictParams(num_tokens=min(payable, need - available)))
         # evict() returns None on some caches (as read by H105c/H106 too)
         evicted = int(getattr(res, "num_tokens_evicted", 0) or 0)
         available = int(alloc.available_size())
     if need <= available:
-        return True
+        # H105g (NF rc29 02:31:13Z): the eviction above can drop this request's OWN load-back source -- backing
+        # an evicted D node up claims arena pages, the W3 spill pays them with host-only leaves (S109: the
+        # mamba-anchor leaf a hybrid match loads back is one). Room made is no ADMIT if the source is gone.
+        return _h105g_target_kept(adder, req, _lb_extent, "after_room")
     _H105D_REFUSED["n"] += 1
     n = _H105D_REFUSED["n"]
     if n <= 3 or (n & (n - 1)) == 0:
