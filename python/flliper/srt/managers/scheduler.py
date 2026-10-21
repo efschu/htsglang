@@ -10905,6 +10905,9 @@ class Scheduler(
         self.chunked_req = None
         self._pending_chunked_abort_req = None
         self._pending_chunked_abort_delay = 0
+        # NF-RC31-R6REST (SOLL R6/R7, R11): the abort is applied -- no chunk of it launches any more; the beacon's halt record
+        # carries the exact rest the front's R6 redirect moves to P
+        Scheduler._pdflip_d_ext_halt(self, req.rid)  # via the class: bare-namespace harnesses
         # PREFILL-OOM-RETREAT: an origin-relayed abort that names its reason (the 503 the front re-routes on) keeps it;
         # every other chunked abort answers as before.
         _reason = getattr(self, "_pending_chunked_abort_reason", None)
@@ -20590,6 +20593,21 @@ class Scheduler(
         except Exception:  # noqa: BLE001
             pass
 
+    def _pdflip_d_ext_halt(self, rid) -> None:
+        """NF-RC31-R6REST (SOLL R6 + R7, R11; user order 19.10. "NICHTS SCHÄTZEN, EXAKTE ZAHLEN"): the abort of ``rid`` is applied
+        on this rank -- the beacon writes its halt record (the tokens no forward was launched for at the halt). D only reports
+        the fact; the front decides R6 on it. Rank-local, no collective, no sync; a rid this leg never extended writes nothing."""
+        b = getattr(self, "pdflip_d_ext_beacon", None)
+        if b is None or not rid:
+            return
+        try:
+            if b.note_halt(rid=str(rid)):
+                logger.info("PDFLIP D-EXT-HALT rid=%s free=%d n_launch=%d -- the abort is applied on this rank: no forward of "
+                            "it launches any more, the front's R6 decides on this rest (NF-RC31-R6REST, SOLL R6/R7)", rid,
+                            int(b._free.get(str(rid), -1)), int(b._nl.get(str(rid), 0)))
+        except Exception:  # noqa: BLE001 -- an instrument never stops the scheduler
+            pass
+
     def _pdflip_d_ext_poll(self) -> None:
         """NF-R6-REST-EXAKT: write the after-rest of every extend batch whose forward has ended (non-blocking)."""
         b = self.pdflip_d_ext_beacon
@@ -23505,6 +23523,14 @@ class Scheduler(
                     "final tail forward (the tail is on every stage's schedule)",
                     _tail.rid,
                 )
+
+        # NF-RC31-R6REST (SOLL R6/R7, R11): an abort of a rid that is NOT the running chunked prefill applies here at receipt
+        # (waiting queue / running batch): no extend of it launches any more -- its halt record. The chunked prefill's halt is
+        # written when ``process_pending_chunked_abort`` applies it (it may still launch the chunk of this pass before).
+        _cr_halt = getattr(self, "chunked_req", None)
+        if not getattr(recv_req, "abort_all", False) and getattr(recv_req, "rid", None) and not (
+                _cr_halt is not None and str(_cr_halt.rid).startswith(recv_req.rid)):
+            Scheduler._pdflip_d_ext_halt(self, recv_req.rid)  # via the class: bare-namespace harnesses
 
         # todo hisparse, release resources for abort requests in hisparse coordinator
         # Delete requests in the waiting queue

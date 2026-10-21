@@ -324,3 +324,85 @@ def test_r6k_the_kurz_rest_ends_on_d_before_the_flip_not_parked_at_a_chunk_bound
     finally:
         loop.close()
     assert calls
+
+
+# ------------------------------------------------------------------------------------------------- R6 + R7 (NF-RC31-R6REST, 21.10.)
+# SOLL R6 ("Läuft ein D-Prefill und wächst S (inkl. des laufenden Rests) über X, wird nach P geflippt") + R7 ("Kein Flip unter X")
+# + R11. Live chain NF boot ..._82784e1138_1021_202608 (front/D log, /spinning/docker-acceptance/nf/evidence): pdflip-6-401 (halb,
+# u=6550) prefills on D, chunk 1 (2240) ended 21:15:36,826 -> free 4310. pdflip-6-403 (halb, u=3786) collects. 36,982: REROUTE_P
+# why=R6 S=8096 > X=7370 "with a D prefill of 4310 running". D's next recv step came before the abort (37,114): chunk 2 (2300)
+# launched, the abort applied after it (40,07), D-PARK RETAINED tail 2069 -> real S = 3786 + 2010(+page) < X: a flip under X.
+# The R6 verdict must stand on the rest that REALLY reaches P: the running prefill is stopped first, the verdict follows on D's
+# halt record (the free at the applied abort).
+_R6R_RUN, _R6R_SET, _R6R_X, _R6R_HX = "pdflip-6-401", "pdflip-6-403", 7370, 3685
+
+
+def _r6rest_chain(monkeypatch, tmp_path):
+    import time as _time
+
+    from test_nf_r6_rest_exakt_1020 import _front_live
+    from test_pdflip_set_scheduler_1017 import _on
+
+    _on(monkeypatch)
+    now = _time.time()
+    f = _front_live(now, tmp_path, member_u=3786, ended=True, rest_start=6550, ext_len=2240, x=_R6R_X, klass="halb",
+                    waited=0.1, rid_run=_R6R_RUN, half_x=_R6R_HX)
+    f._set_st()["shorts"][_R6R_SET] = f._set_st()["shorts"].pop("pdflip-12-274")
+    ws, _ev = f._test_running[_R6R_RUN]
+    for w in ws:
+        w.announce_halt()          # the D scheduler wires note_halt (``d_extend_beacon.build``)
+    return now, f, ws
+
+
+def _r6rest_d_applies_the_stop(ws, *, chunk2):
+    """D's side after the verdict: ``chunk2`` > 0 = its next recv step came before the abort and launched chunk 2 (live 2300);
+    then the abort is applied (``process_pending_chunked_abort``) on every rank: the halt record."""
+    for w in ws:
+        if chunk2:
+            w.note_extend(rids=[_R6R_RUN], rests=[4310], extend_lens=[chunk2])
+        assert w.note_halt(rid=_R6R_RUN)
+
+
+def test_r6_r7_rc31_6401_the_verdict_stands_on_the_rest_that_reaches_p_not_on_the_free_read_before_the_abort(
+        monkeypatch, caplog, tmp_path):
+    """R6 + R7 (live 21:15:36,982 pdflip-6-401/-403): the verdict on S = 3786 + 4310 = 8096 > X stops the running prefill FIRST
+    (no flip yet). D launched chunk 2 (2300) before the abort landed -> 2010 reach P -> S = 5796 < X: NO flip (R7), the stopped
+    prefill goes back to D, the set (halb, T_halb running) keeps collecting. Before the fix: REROUTE_P on 8096 at once."""
+    import logging as _lg
+
+    from flliper.srt.environ import envs
+
+    now, f, ws = _r6rest_chain(monkeypatch, tmp_path)
+    with envs.FLLIPER_PDFLIP_DECIDER.override(True), caplog.at_level(_lg.INFO, logger="pdflip.front"):
+        assert f._dc_carried_running() == 4310                         # the free D left at the read (exact at the read)
+        assert f._decode_collect(now) == "hold"                         # stopped first, no flip on the read
+        assert f.counters["set_reroute_p"] == 0 and f.counters["r6_halt_sent"] == 1
+        assert _R6R_RUN in f._rvp_requeue                               # the leg is handed back (stream stays open)
+        assert f._decode_collect(now + 0.05) == "hold"                  # D has not applied the stop yet: the verdict waits
+        assert f.counters["set_reroute_p"] == 0
+        _r6rest_d_applies_the_stop(ws, chunk2=2300)
+        assert f._decode_collect(now + 0.1) == "hold"                   # S = 3786 + 2010 = 5796 < 7370: R3 collects on
+    msgs = caplog.messages
+    assert any("R6-HALT-CONFIRMED rid=%s counted=4310 halted_free=2010 launched_after=2300" % _R6R_RUN in m for m in msgs), msgs
+    assert any("R6-HALT-STAYS-ON-D rid=%s halted_free=2010" % _R6R_RUN in m for m in msgs), msgs
+    assert not any("verdict=REROUTE_P" in m for m in msgs if "SET-VERDICT" in m)
+    assert f.counters["set_reroute_p"] == 0 and f.counters["r6_halt_to_d"] == 1 and f.counters["r6_halt_to_p"] == 0
+    assert _R6R_RUN not in f._set_st()["go_p"]
+    assert f._dc_carried_running() == 0                                 # released: no second count of the old leg
+
+
+def test_r6_rc31_6401_without_a_chunk_after_the_verdict_the_halted_rest_flips_r6(monkeypatch, caplog, tmp_path):
+    """R6 stays R6: D applied the stop before its next chunk -> 4310 reach P, S = 8096 > X -> REROUTE_P, the stopped prefill
+    rides the flip to P."""
+    import logging as _lg
+
+    from flliper.srt.environ import envs
+
+    now, f, ws = _r6rest_chain(monkeypatch, tmp_path)
+    with envs.FLLIPER_PDFLIP_DECIDER.override(True), caplog.at_level(_lg.INFO, logger="pdflip.front"):
+        assert f._decode_collect(now) == "hold"
+        _r6rest_d_applies_the_stop(ws, chunk2=0)
+        assert f._decode_collect(now + 0.1) == "P"
+    assert any("verdict=REROUTE_P" in m and "S=8096" in m for m in caplog.messages if "SET-VERDICT" in m), caplog.messages
+    assert f.counters["set_reroute_p"] == 1 and f.counters["r6_halt_to_p"] == 1
+    assert {_R6R_RUN, _R6R_SET} <= f._set_st()["go_p"]

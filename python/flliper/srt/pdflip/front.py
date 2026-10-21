@@ -9069,15 +9069,30 @@ class Front:
             code, body = await self.rpc(self.groups["D"], "/abort_request", {"rid": rid}, 30)
         except Exception as e:  # noqa: BLE001 -- the closed leg is the fallback abort
             code, body = 0, f"{type(e).__name__}: {e}"
-        logger.info("PDFLIP PARK-HANDBACK rid=%s abort_on_d=%s %s -> P's batch", rid, code,
-                    str(body)[:120])
         p.seat = None
-        self._to_p_batch(p, "park_handback")
-        p.d_eligible = False
-        self.queue.append(p)
-        self._dp_mark(p, "reroute")  # R28
-        self._kick_controller("arrival")
-        self._d_pf_book().done(rid=rid)  # X-SUM-PRICE: handed back to P's batch -- no phantom while it waits
+        _hd = (self.__dict__.get("_r6_halt") or {}).get(str(rid))
+        if _hd is not None and _hd.get("decision") is None and _hd.get("epoch") == self.epoch and self.awake == "D":
+            # NF-RC31-R6REST: an R6 stop whose verdict is not made yet -- the request waits for it (P or back to D)
+            _hd["p"] = p
+            logger.info("PDFLIP PARK-HANDBACK rid=%s abort_on_d=%s %s -> waits for the R6 verdict on its halted rest",
+                        rid, code, str(body)[:120])
+            self._d_pf_book().done(rid=rid)
+        elif _hd is not None and _hd.get("decision") == "D":
+            logger.info("PDFLIP PARK-HANDBACK rid=%s abort_on_d=%s %s -> back to D (R6-HALT: no flip under X, R7)", rid, code,
+                        str(body)[:120])
+            self._d_pf_book().done(rid=rid)
+            Front._r6_halt_enqueue(self, p, "D", _hd)
+        else:
+            if _hd is not None and _hd.get("decision") is None:
+                _hd["decision"] = "P"   # the phase moved on (a flip came another way): P's batch takes it
+            logger.info("PDFLIP PARK-HANDBACK rid=%s abort_on_d=%s %s -> P's batch", rid, code,
+                        str(body)[:120])
+            self._to_p_batch(p, "park_handback")
+            p.d_eligible = False
+            self.queue.append(p)
+            self._dp_mark(p, "reroute")  # R28
+            self._kick_controller("arrival")
+            self._d_pf_book().done(rid=rid)  # X-SUM-PRICE: handed back to P's batch -- no phantom while it waits
         try:
             await p.fut
         except PdFlipStop as e:
@@ -12951,6 +12966,8 @@ class Front:
         self.__dict__["_r6_commit_now"] = set()
 
         def _tok(rid: str, t_grant: float, _granted: int) -> int:
+            if Front._r6_halt_same_leg(self, rid, t_grant):
+                return 0  # NF-RC31-R6REST: a stopped leg counts through ``_r6_halt_term`` (open) or not at all (released)
             if not box:
                 box.append(self._d_ext_reading_full())
             rest = _dxb.rest_of(box[0], rid, t_grant)
@@ -13001,6 +13018,7 @@ class Front:
             # of it off the member (P reads it from the store)
             (self.__dict__.setdefault("_r6_in_flight", {}))[str(rid)] = max(0, int(rest) - free)
             counted[str(rid)] = free
+            (self.__dict__.setdefault("_r6_grant", {}))[str(rid)] = float(t_grant)  # NF-RC31-R6REST: the halt reads this grant
             return free
 
         return _tok
@@ -13058,6 +13076,255 @@ class Front:
             phase_policy.V_COLLECT,
             "R6 commit pending: D fixed the next chunk of %s, its exact rest follows with that chunk's start record (was %s: "
             "%s)" % (",".join(sorted(pend)[:4]), sv.verdict, sv.why), sv.left_s, sv.s_tokens, sv.half_x)
+
+    # -- NF-RC31-R6REST: R6 STOPS FIRST, THEN DECIDES ON THE REST THAT REALLY REACHES P ------------------------------------
+    # SOLL R6 ("Läuft ein D-Prefill und wächst S (inkl. des laufenden Rests) über X, wird nach P geflippt, auch mitten im
+    # D-Prefill") + R7 ("Kein Flip unter X") + R11 ("Front entscheidet allein"); user order 19.10. "NICHTS SCHÄTZEN, EXAKTE ZAHLEN".
+    # Live NF boot ..._82784e1138_1021_202608: pdflip-6-401 (halb, u=6550) on D, chunk 1 (2240) ended 21:15:36,826; the front read
+    # free=4310 (nothing launched, no COMMITTED) and committed REROUTE_P at 36,982 (S = 3786 + 4310 = 8096 > X = 7370). The abort
+    # reached D only at 37,114 (the leg's ROS poll); D's next recv step came first and launched chunk 2 (2300, forward to 40,066).
+    # P got the tail 2069/2070: real S = 5855 < X -- a flip under X. ``free`` was exact at the read, but the redirect moves what is
+    # free when D APPLIES the abort. Now the R6 verdict stops the counted prefill first (abort now), holds, and decides again on
+    # D's halt record (``d_extend_beacon.halted_free``): S >= X -> the redirect and the flip as before; S < X -> no flip (R7), the
+    # stopped prefill goes back to D at once (its KV stays in D's tree).
+    #: a liveness guard, never a decision clock: D applies an abort at its next recv step, i.e. after the chunk in flight (live
+    #: 3.1 s); a halt record that never comes (a D that stopped looping) is named and counted with the beacon's current free
+    R6_HALT_STALE_S = 30.0
+
+    @staticmethod
+    def _r6_halt_on() -> bool:
+        try:
+            return bool(envs.FLLIPER_PDFLIP_R6_HALT_FIRST.get()) and _dxb.enabled()
+        except Exception:  # noqa: BLE001 -- a partial env (test double): the switch reads off
+            return False
+
+    def _r6_halt_open_rid(self, rid: str) -> bool:
+        """``rid`` is stopped by R6 in this D phase and not yet released (P or D): it counts through ``_r6_halt_term`` only."""
+        hd = (self.__dict__.get("_r6_halt") or {}).get(str(rid))
+        return hd is not None and hd.get("decision") is None
+
+    def _r6_halt_same_leg(self, rid: str, t_grant: float) -> bool:
+        """The book row of ``rid`` granted at ``t_grant`` is the leg R6 stopped in this D phase: its rest is never counted from
+        the leg's own record again (open: the halt term counts it; released: it left that leg -- P, or a NEW D leg/grant)."""
+        hd = (self.__dict__.get("_r6_halt") or {}).get(str(rid))
+        return (hd is not None and hd.get("epoch") == self.epoch
+                and abs(float(hd.get("t_grant", -1.0)) - float(t_grant)) < 1e-6)
+
+    def _r6_halt_refresh(self, reading=None) -> None:
+        """Read D's halt record of every open stop: ``free`` once D applied it, named once; past ``R6_HALT_STALE_S`` named and
+        taken from the beacon's current free (the pre-fix figure)."""
+        halts = self.__dict__.get("_r6_halt") or {}
+        open_ = [(r, hd) for r, hd in halts.items() if hd.get("decision") is None and hd.get("free") is None]
+        if not open_:
+            return
+        if reading is None:
+            reading = self._d_ext_reading_full()
+        now = time.time()
+        for rid, hd in open_:
+            got = _dxb.halted_free(reading, rid, hd["t_grant"]) if reading is not None else None
+            if got is not None:
+                hd["free"], hd["t_halted"] = max(0, int(got)), now
+                self.counters["r6_halt_confirmed"] += 1
+                if int(got) < int(hd["counted"]):
+                    self.counters["r6_halt_launched_after_verdict"] += 1
+                logger.info("PDFLIP R6-HALT-CONFIRMED rid=%s counted=%d halted_free=%d launched_after=%d wait_ms=%d epoch=%d -- D "
+                            "applied the stop: %d token(s) of this prefill reach P, %d were launched on D after the verdict "
+                            "read (they end on D); the set is decided again on this exact rest (SOLL R6, R7, R11)", rid,
+                            int(hd["counted"]), int(got), max(0, int(hd["counted"]) - int(got)),
+                            int(round((now - hd["t0"]) * 1000)), self.epoch, int(got),
+                            max(0, int(hd["counted"]) - int(got)))
+            elif now - hd["t0"] > Front.R6_HALT_STALE_S:
+                cur = _dxb.free_of(reading, rid, hd["t_grant"]) if reading is not None else None
+                hd["free"] = int(cur) if cur is not None and int(cur) >= 0 else int(hd["counted"])
+                hd["t_halted"], hd["stale"] = now, True
+                self.counters["r6_halt_stale"] += 1
+                logger.warning("PDFLIP R6-HALT-STALE rid=%s age_s=%.1f counted=%d taken=%d epoch=%d -- D wrote no halt record "
+                               "within %.1f s (D's loop stopped?): the beacon's current free is taken, named", rid,
+                               now - hd["t0"], int(hd["counted"]), int(hd["free"]), self.epoch, Front.R6_HALT_STALE_S)
+
+    def _r6_halt_term(self) -> int:
+        """The R6 term of the stopped prefills of this D phase: D's halted free of each (counted in ``_r6_counted`` so a
+        REROUTE_P moves it, with nothing in flight); a stop D has not applied yet adds nothing and is PENDING
+        (``_r6_halt_pending``: the verdict holds, ``_r6_halt_hold``)."""
+        halts = self.__dict__.get("_r6_halt") or {}
+        pend = set()
+        self.__dict__["_r6_halt_pending"] = pend
+        if not halts:
+            return 0
+        Front._r6_halt_refresh(self)
+        total = 0
+        counted = self.__dict__.setdefault("_r6_counted", {})
+        infl = self.__dict__.setdefault("_r6_in_flight", {})
+        for rid, hd in halts.items():
+            if hd.get("decision") is not None or hd.get("epoch") != self.epoch:
+                continue
+            if hd.get("free") is None:
+                pend.add(rid)
+                continue
+            counted[rid] = int(hd["free"])
+            infl[rid] = 0
+            total += int(hd["free"])
+        return total
+
+    def _r6_halt_hold(self, sv: "phase_policy.SetVerdict") -> "phase_policy.SetVerdict":
+        """NF-RC31-R6REST: a final verdict made while an R6 stop is not applied on D waits (COLLECT): D may still launch a chunk
+        of it, so its rest -- the number R6 needs -- is not known yet. Bounded by D's own record (one D iteration), the
+        liveness guard ``R6_HALT_STALE_S``."""
+        pend = self.__dict__.get("_r6_halt_pending") or set()
+        if not pend or sv.verdict == phase_policy.V_COLLECT:
+            return sv
+        self.counters["set_r6_halt_hold"] += 1
+        return phase_policy.SetVerdict(
+            phase_policy.V_COLLECT,
+            "R6-HALT pending: D applies the stop of %s, the verdict follows on the rest that really reaches P (was %s: %s)"
+            % (",".join(sorted(pend)[:4]), sv.verdict, sv.why), sv.left_s, sv.s_tokens, sv.half_x)
+
+    def _r6_halt_begin(self, sv: "phase_policy.SetVerdict", x_tok: int) -> bool:
+        """NF-RC31-R6REST: a REROUTE_P verdict on running D prefill(s) not stopped yet -- stop them FIRST: the leg is handed back
+        (``_park_handback``: the client stream stays open, nothing committed) and D's abort goes out NOW (not at the leg's next
+        ROS poll). True = a stop began, the verdict is held (``_r6_halt_verdict``). False = nothing to stop (switch off, every
+        counted prefill already stopped -- the verdict stands on D's halted rest)."""
+        if not Front._r6_halt_on():
+            return False
+        counted = dict(self.__dict__.get("_r6_counted") or {})
+        fresh = [r for r in counted if not Front._r6_halt_open_rid(self, r)]
+        if not fresh:
+            return False
+        if not _dxb.halt_capable(self._d_ext_reading_full()):
+            # a D that writes no halt record (no ``announce_halt``) could never confirm the stop: the redirect stands on the
+            # free read at the verdict, as before (named)
+            self.counters["r6_halt_d_not_capable"] += 1
+            return False
+        moved = self._park_handback(fresh, started=fresh)
+        if not moved:
+            return False
+        grants = self.__dict__.get("_r6_grant") or {}
+        halts = self.__dict__.setdefault("_r6_halt", collections.OrderedDict())
+        now = time.time()
+        for rid in moved:
+            halts.pop(rid, None)
+            halts[rid] = {"t0": now, "t_grant": float(grants.get(rid, now)), "counted": int(counted.get(rid, 0)),
+                          "epoch": self.epoch, "free": None, "decision": None, "p": None, "s": int(sv.s_tokens),
+                          "x": int(x_tok)}
+            self.counters["r6_halt_sent"] += 1
+            sent = Front._r6_halt_abort_now(self, rid)
+            logger.info("PDFLIP R6-HALT-SENT rid=%s counted=%d S=%d X=%d abort_now=%d epoch=%d -- R6: S over X with this running "
+                        "D prefill; D's prefill is STOPPED FIRST and the verdict waits for D's halt record: D may launch a "
+                        "chunk until the abort lands, so the rest P gets is known only then. S >= X on it -> the redirect and "
+                        "the flip; S < X -> no flip, it goes back to D (SOLL R6, R7, R11)", rid, int(counted.get(rid, 0)),
+                        int(sv.s_tokens), int(x_tok), int(sent), self.epoch)
+        while len(halts) > 256:
+            halts.popitem(last=False)
+        return True
+
+    def _r6_halt_abort_now(self, rid: str) -> bool:
+        """D's abort of ``rid`` as a task NOW (live: the leg's ROS poll sent it 125 ms after the verdict); the leg's own abort in
+        ``_requeue_park_handback`` stays (D answers a second one with "not in rid_to_state"). No loop: the leg sends it."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self.counters["r6_halt_abort_no_loop"] += 1
+            return False
+        tasks = self.__dict__.setdefault("_r6_halt_tasks", set())
+
+        async def _go():
+            try:
+                code, _body = await self.rpc(self.groups["D"], "/abort_request", {"rid": rid}, 30)
+                logger.info("PDFLIP R6-HALT-ABORT rid=%s status=%s", rid, code)
+            except Exception as e:  # noqa: BLE001 -- the leg's abort is the fallback
+                logger.warning("PDFLIP R6-HALT-ABORT rid=%s failed: %s", rid, e)
+
+        t = loop.create_task(_go())
+        tasks.add(t)
+        t.add_done_callback(tasks.discard)
+        return True
+
+    def _r6_halt_verdict(self, sv: "phase_policy.SetVerdict") -> "phase_policy.SetVerdict":
+        self.counters["set_r6_halt_hold"] += 1
+        return phase_policy.SetVerdict(
+            phase_policy.V_COLLECT,
+            "R6-HALT: %s -- the running D prefill is stopped first, the verdict follows on the rest that really reaches P "
+            "(SOLL R6, R7)" % sv.why, sv.left_s, sv.s_tokens, sv.half_x)
+
+    def _r6_halt_settle(self, route: str, sv: Optional["phase_policy.SetVerdict"], x_tok: int) -> List[str]:
+        """Release the stopped prefills whose halted rest is known: ``"P"`` = the verdict on it flips (R6, R1a), they ride it;
+        ``"D"`` = the verdict on it is no flip (R7 "kein Flip unter X") -- they go back to D at once. A COLLECT whose S still
+        reaches X (another hold stands) releases nothing; it is decided on a later tick. Returns the released rids."""
+        halts = self.__dict__.get("_r6_halt") or {}
+        if not halts:
+            return []
+        Front._r6_halt_refresh(self)
+        ready = [r for r, hd in halts.items() if hd.get("decision") is None and hd.get("free") is not None]
+        if not ready:
+            return []
+        if route == "D" and sv is not None and sv.verdict == phase_policy.V_COLLECT and 0 < int(x_tok) <= int(sv.s_tokens):
+            return []
+        for rid in ready:
+            Front._r6_halt_release(self, rid, route, sv, x_tok)
+        return ready
+
+    def _r6_halt_release(self, rid: str, route: str, sv: Optional["phase_policy.SetVerdict"], x_tok: int) -> None:
+        hd = (self.__dict__.get("_r6_halt") or {}).get(str(rid))
+        if hd is None or hd.get("decision") is not None:
+            return
+        hd["decision"] = route
+        self.counters["r6_halt_to_" + route.lower()] += 1
+        s_now = int(sv.s_tokens) if sv is not None else -1
+        if route == "D":
+            logger.info("PDFLIP R6-HALT-STAYS-ON-D rid=%s halted_free=%d counted=%d S=%d X=%d verdict=%s epoch=%d -- the verdict on "
+                        "the rest that really reaches P is no flip (SOLL R7 \"kein Flip unter X\"): the stopped prefill goes back "
+                        "to D now, D's tree holds what it computed", rid, int(hd["free"] or 0), int(hd["counted"]), s_now,
+                        int(x_tok), sv.verdict if sv is not None else "-", self.epoch)
+        else:
+            logger.info("PDFLIP R6-HALT-TO-P rid=%s halted_free=%d counted=%d S=%d X=%d verdict=%s epoch=%d -- the verdict on the "
+                        "rest that really reaches P flips: the stopped prefill rides it (SOLL R6, R1a)", rid,
+                        int(hd["free"] if hd.get("free") is not None else -1), int(hd["counted"]), s_now, int(x_tok),
+                        sv.verdict if sv is not None else "-", self.epoch)
+        p = hd.get("p")
+        if p is not None:
+            hd["p"] = None
+            Front._r6_halt_enqueue(self, p, route, hd)
+
+    def _r6_halt_enqueue(self, p: "Pending", route: str, hd: dict) -> None:
+        """The closed leg's request joins the queue on its released route: P = P's batch (the PARK-HANDBACK path); D = a queued
+        kurz/halb entry D takes like any queued SHORT (``_asr_queued_short_to_d``), priced at its halted rest, its class noted
+        from that rest (SOLL R6k)."""
+        if route == "P":
+            self._to_p_batch(p, "r6_halt")
+            p.d_eligible = False
+            self.queue.append(p)
+            self._dp_mark(p, "reroute")  # R28
+        else:
+            u = max(0, int(hd.get("free") or 0))
+            p.est_uncached = u
+            p.d_eligible = True
+            p.d_direct = False
+            p.leg1_done = False
+            try:
+                frac = Front._set_cfg()[0]
+                x = int(self.tp_prefill_max_tokens)
+                Front._r6k_note_class(self, p.rid, phase_policy.classify_arrival(u, x, frac, False), "r6_halt",
+                                      phase_policy.half_x_of(x, frac))
+            except Exception:  # noqa: BLE001 -- the class note is an R6k input; unknown -> R6 as before (named there)
+                pass
+            self.queue.append(p)
+        self._kick_controller("arrival")
+
+    def _r6_halt_tick(self) -> None:
+        """Controller tick: a stop of an EARLIER D phase (a flip came another way) or while P is awake rides to P (P-BATCH-ALL);
+        a stop D applied while no set is left goes back to D (R7)."""
+        halts = self.__dict__.get("_r6_halt") or {}
+        if not halts or not any(hd.get("decision") is None for hd in halts.values()):
+            return
+        Front._r6_halt_refresh(self)
+        for rid, hd in list(halts.items()):
+            if hd.get("decision") is not None:
+                continue
+            if hd.get("epoch") != self.epoch or self.awake != "D":
+                Front._r6_halt_release(self, rid, "P", None, int(hd.get("x", 0)))
+        st = self._set_st()
+        if not st["shorts"] and not any(not p.fut.done() for p in self.queue):
+            Front._r6_halt_settle(self, "D", None, 0)  # nothing waits: no set can form -- the decision sites need not run
 
     def _r6k_clear_class(self, rid: str) -> None:
         """SOLL R6k (review K1): forget the class of ``rid`` (a D refusal): unknown -> R6 as before, named."""
@@ -13202,7 +13469,9 @@ class Front:
         counted = dict(self.__dict__.get("_r6_counted") or {})
         if not counted:
             return []
-        moved = self._park_handback(list(counted), started=list(counted))
+        _hb = self.__dict__.get("_r6_halt") or {}
+        _halted = [r for r in counted if (_hb.get(r) or {}).get("epoch") == self.epoch]  # NF-RC31-R6REST: stopped, settled
+        moved = self._park_handback([r for r in counted if r not in _halted], started=list(counted)) + _halted
         self.counters["r6_redirected"] += len(moved)
         in_flight = self.__dict__.get("_r6_in_flight") or {}
         logger.info("PDFLIP R6-REDIRECT epoch=%d why=%s counted=%s moved=%s in_flight=%s -- the running D prefill(s) R6 counted "
@@ -13284,10 +13553,14 @@ class Front:
         self.__dict__["_r6_counted"] = {}  # S56: only this reading's counted rows may be redirected
         self.__dict__["_r6_in_flight"] = {}
         self.__dict__["_r6_commit_now"] = set()
+        self.__dict__["_r6_halt_pending"] = set()
         if not envs.FLLIPER_PDFLIP_ENABLE_DECODE_COLLECT_PREFILL_BUSY.get():
             return 0
         # S56: a started row counts D's REAL rest, and only when the front redirects it to P (``_r6_tokens_of``)
         running = Front._d_pf_pending_tokens(self, started_only=True, d_rest=True)
+        # NF-RC31-R6REST: a prefill R6 has stopped counts D's halt record (the rest that really reaches P), a halt D has not
+        # applied yet holds the verdict (``_r6_halt_hold``)
+        running += Front._r6_halt_term(self)
         granted = Front._d_pf_pending_tokens(self)
         # review A4 (NF-RC30-R6STALE): with beacon v4 a STARTED row counts only its unlaunched rest (``running`` < granted for
         # every chunk in flight) -- "not begun" is named only for rows D has really not begun (the instrument may not lie)
@@ -14320,6 +14593,7 @@ class Front:
                 new_since_last=max(0, len(members) - st["seen"]), class_x_tokens=x_cls)
             sv = Front._set_xsum_hold(self, sv, x_tok, running, decoding=decoding)
         sv = Front._r6_commit_hold(self, sv)  # review A1: no final verdict while a counted prefill's next chunk is COMMITTED
+        sv = Front._r6_halt_hold(self, sv)    # NF-RC31-R6REST: no final verdict while D has not applied an R6 stop
         kw = dict(x_tok=x_tok, x_cls=x_cls, frac=frac, t_half=t_half, decoding=decoding, seats=seats,
                   waited=max(0.0, now - st["t_open"]), xk=xk, unstarted=unstarted)
         st["urgent"] = urgent
@@ -14668,11 +14942,13 @@ class Front:
                 st["released"][rid] = "P"
                 st["go_p"].add(rid)
             st["shorts"] = {}
+            st["go_p"].update(Front._r6_halt_settle(self, "P", None, 0))  # NF-RC31-R6REST: R1a, a stopped prefill rides it
             return "P"
         ev = self._set_eval(now, live_q, st)
         if ev is None:
             st["t_open"] = None
             st["seen"] = 0
+            Front._r6_halt_settle(self, "D", None, 0)  # NF-RC31-R6REST: no set left -- a stopped prefill goes back to D (R7)
             return None
         members, sv, kw = ev
         if sv.verdict not in (phase_policy.V_COLLECT, phase_policy.V_D_AFTER_TIMER):
@@ -14691,6 +14967,16 @@ class Front:
         if sv.verdict in Front.REPROBE_VERDICTS and not Front._set_reprobe_gate(
                 self, [m.rid for m in members], "set-verdict", sv.verdict):
             return "hold"  # S63 F1: the verdict is made again on D's current numbers once they land
+        if sv.verdict == phase_policy.V_REROUTE_P and Front._r6_halt_begin(self, sv, kw.get("x_tok", 0)):
+            # NF-RC31-R6REST (SOLL R6 + R7, R11): the running D prefill R6 counted is stopped FIRST -- the verdict waits for
+            # D's halt record and is made again on the rest that really reaches P
+            sv = Front._r6_halt_verdict(self, sv)
+            self._set_log(st, members, sv, verdict=sv.verdict, why=sv.why, **kw)
+            return "hold"
+        if sv.verdict not in Front.REPROBE_VERDICTS:
+            # NF-RC31-R6REST (SOLL R7 "kein Flip unter X"): the verdict on the halted rest is no flip -- the stopped prefill
+            # goes back to D at once (it is no set member: D was prefilling it, the set stays on D)
+            Front._r6_halt_settle(self, "D", sv, kw.get("x_tok", 0))
         st["seen"] = len(members)
         _pu = st.get("urgent")
         if _pu is not None and st.get("prio_set") != st["set_id"]:
@@ -14731,6 +15017,8 @@ class Front:
                 self._d_pf_book().grant(rid=rid, tokens=int(st["shorts"][rid][1]), now=now)  # X-SUM-PRICE
         if route == "P":
             st["go_p"].update(m.rid for m in members)
+            # NF-RC31-R6REST: the stopped prefill(s) the verdict counted ride the flip to P (R6; R1a)
+            st["go_p"].update(Front._r6_halt_settle(self, "P", sv, kw.get("x_tok", 0)))
             if sv.verdict == phase_policy.V_PARK_NO_SEAT:
                 # R5: no seat for the set on D = prefill and park, NO flip begins -- committed, but not a DECIDED flip
                 # (``_flip_decided``): a kurz arrival keeps waiting for its D seat
@@ -14822,6 +15110,9 @@ class Front:
                                       d_prefill_running_uncached=_run, new_since_last=0,
                                       class_x_tokens=x_cls)
         sv = Front._r6_commit_hold(self, sv)  # review A1
+        sv = Front._r6_halt_hold(self, sv)    # NF-RC31-R6REST
+        if sv.verdict == phase_policy.V_REROUTE_P and Front._r6_halt_begin(self, sv, x_tok):
+            sv = Front._r6_halt_verdict(self, sv)
         self._set_log(st, members, sv, verdict=sv.verdict, why="queue-sum " + sv.why, x_tok=x_tok, frac=frac,
                       t_half=t_half, decoding=decoding, seats=seats, waited=0.0, x_cls=x_cls, xk=xk)
         self.counters["set_" + sv.verdict.lower()] += 1
@@ -14832,6 +15123,7 @@ class Front:
             if sv.verdict == phase_policy.V_REROUTE_P:
                 Front._r6_redirect(self, "queue-sum")  # S56
             st["go_p"].update(m.rid for m in members)
+            st["go_p"].update(Front._r6_halt_settle(self, "P", sv, x_tok))  # NF-RC31-R6REST: a stopped prefill rides the flip
             if sv.verdict == phase_policy.V_PARK_NO_SEAT:
                 st.setdefault("park_no_seat", set()).update(m.rid for m in members)     # R5: not a decided flip
             elif st.get("park_no_seat"):
@@ -21061,6 +21353,7 @@ class Front:
                 await Front._lane_reconcile(self, "controller")
                 self._hl_sweep()  # #243 seam: lost hand-offs of waiting rids -> P
                 self._rvp_take()
+                Front._r6_halt_tick(self)  # NF-RC31-R6REST: stops of an earlier phase ride P; no set left -> back to D
                 if self.awake == "D":
                     D = self.groups["D"]
                     _now = time.time()
