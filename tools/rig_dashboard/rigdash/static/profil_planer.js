@@ -376,12 +376,12 @@
     const can = !!form.proposal && s.canPropose;
     const why = !form.proposal ? form.note : !s.canPropose ? s.whyNot : "";
     return `<div class="pfx-ctl">
-      <div class="pfx-reg" data-regname="seats"><label class="pfx-rl"><input type="checkbox" data-reg-on="seats"${s.seatsOn ? " checked" : ""}> <b>Concurrent seats</b></label>
+      <div class="pfx-reg" data-regname="seats"><label class="pfx-rl"><input type="checkbox" data-reg-on="seats"${s.seatsOn ? " checked" : ""}> <b>Max concurrent seats</b></label>
         <input type="range" min="1" max="32" step="1" data-reg="seats" value="${Math.min(32, s.seats)}" aria-label="Concurrent seats (slider)"><input type="number" min="${z.seats[0]}" max="${z.seats[1]}" step="1" data-reg="seats" value="${s.seats}" aria-label="Concurrent seats (number)">
-        <span class="muted pfx-rn">${s.seatsOn ? "The planner derives the expert share (MoE) or KV and Mamba slots from this." : "off: the value of the profile applies"}</span></div>
-      <div class="pfx-reg" data-regname="ctx"><label class="pfx-rl"><input type="checkbox" data-reg-on="ctx"${s.ctxOn ? " checked" : ""}> <b>Context</b></label>
-        <input type="range" min="0" max="${CTX_STEPS.length - 1}" step="1" data-reg="ctx" value="${ctxIndex(s.ctx)}" aria-label="Context (slider)"><input type="number" min="${z.kv_tokens[0]}" max="${z.kv_tokens[1]}" step="1024" data-reg="ctx" value="${s.ctx}" aria-label="Context in tokens (number)">
-        <span class="muted pfx-rn">${s.ctxOn ? "Tokens per request the KV pool should carry." : "off: the value of the profile applies"}</span></div>
+        <span class="muted pfx-rn">${s.seatsOn ? "Decode seats (D batch size). All seats share ONE KV pool; the planner derives Mamba slots and the expert share (MoE) from this." : "off: the value of the profile applies"}</span></div>
+      <div class="pfx-reg" data-regname="ctx"><label class="pfx-rl"><input type="checkbox" data-reg-on="ctx"${s.ctxOn ? " checked" : ""}> <b>Max tokens per seat</b></label>
+        <input type="range" min="0" max="${CTX_STEPS.length - 1}" step="1" data-reg="ctx" value="${ctxIndex(s.ctx)}" aria-label="Max tokens per seat (slider)"><input type="number" min="${z.kv_tokens[0]}" max="${z.kv_tokens[1]}" step="1024" data-reg="ctx" value="${s.ctx}" aria-label="Max tokens per seat (number)">
+        <span class="muted pfx-rn">${s.ctxOn ? "Ceiling per request (--max-kv-per-request). Not seats × ceiling: the shared pool only has to hold ONE request at this ceiling; what does not fit parks to L2/L3. The pool size itself is solved by the launcher (shown with the proposal)." : "off: the value of the profile applies"}</span></div>
       <div class="pf-row-actions"><button type="button" class="pf-main" data-act="propose"${can && !s.busy ? "" : " disabled"}>${s.busy ? "computing …" : "Propose"}</button>
         <button type="button" data-act="recheck"${s.canCheck && !s.busy ? "" : " disabled"} title="Dry run of the launcher with the current values">Re-check</button>
         ${why ? `<span class="muted pf-note pfx-why">${esc(why)}</span>` : ""}</div></div>`;
@@ -420,8 +420,11 @@
     const planerV = (vd.verdikte || []).filter((x) => x.level === "fit" && x.code !== "FIT" && x.code !== "HW-BORROWED").map((x) =>
       `<li><span class="pfx-vchip pfx-v-${x.force_state === "is_blocked" ? "verweigert" : "note"}">${x.force_state === "geht" ? "ok" : x.force_state === "is_blocked" ? "does not fit" : "note"} <b class="mono">${esc(x.code)}</b></span> ${esc(clip(x.reason || x.title || "", 260))}</li>`).join("");
     const hints = [].concat(p.notes || [], v.notes || [], v.blocker || []).filter(Boolean);
+    // KV pool (shared by all seats) vs ceiling per request: two different numbers, both from the launcher's dry run (plan dump), never multiplied
+    const pc = (vd.plan || {}).pp_cut || {}, gz = (v.goals || {});
+    const poolLine = pc.chosen_pool ? `<div class="muted">KV pool of group P (shared by all seats, solved by the launcher): <b>${esc(Number(pc.chosen_pool).toLocaleString(LOC()))}</b> tokens${pc.pool_floor ? " (floor " + esc(Number(pc.pool_floor).toLocaleString(LOC())) + " = one request at the ceiling + one chunk)" : ""}${pc.layers ? " · P cut " + esc(pc.layers) : ""}${gz.kv_tokens ? " · ceiling per request " + esc(Number(gz.kv_tokens).toLocaleString(LOC())) : ""}${gz.seats ? " · seats " + esc(gz.seats) : ""}</div>` : "";
     return `<div class="pfx-prop"><div class="pf-verdict ${a[0] === "ok" ? "ok" : a[0] === "force" ? "" : "bad"}"><b>Proposal for ${esc(p.n)} card${p.n === 1 ? "" : "s"}, form ${esc(p.form)}</b>: ${esc(nCh)} values changed, ${esc(nUnb)} unverified. ${esc(a[1])}${sc ? " " + vChip(sc) : ""}
-        ${fit ? `<div class="muted">Fit (${esc(fit.art || "hw_fit, necessary condition")}): <b>${esc(({ ja: "yes", tight: "tight", nein: "no" })[fit.level] || fit.level)}</b>${fit.margin_mib != null ? ", margin " + esc(Math.round(Number(fit.margin_mib))) + " MiB" : ""}${fit.first ? " · " + esc(fit.first) : ""}</div>` : ""}</div>
+        ${fit ? `<div class="muted">Fit (${esc(fit.art || "hw_fit, necessary condition")}): <b>${esc(({ ja: "yes", tight: "tight", nein: "no" })[fit.level] || fit.level)}</b>${fit.margin_mib != null ? ", margin " + esc(Math.round(Number(fit.margin_mib))) + " MiB" : ""}${fit.first ? " · " + esc(fit.first) : ""}</div>` : ""}${poolLine}</div>
       ${planerV ? `<div class="pfx-runv"><b>Fit as a planner estimate</b> <span class="muted">(a planner calculation from model sizes, no launcher run and no measurement)</span><ul class="pfx-vd">${planerV}</ul></div>` : ""}
       ${runV ? `<div class="pfx-runv"><b>What the launcher says about the run</b> <span class="muted">(applies to the whole start, not to a single value; never a block in this page)</span><ul class="pfx-vd">${runV}</ul></div>` : ""}
       ${changed ? `<details class="pf-fold" data-fold="propchg" open><summary>What the proposal changed (${nCh})</summary><ul class="pfx-chg">${changed}</ul></details>` : ""}

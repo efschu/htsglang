@@ -73,9 +73,14 @@ mkdir -p /opt/rigdash/releases /opt/rigdash/planner/releases
 dst=/opt/rigdash/releases/$sha
 if [ ! -d "$dst/rigdash" ]; then
   tmp=$(mktemp -d /opt/rigdash/.stage.XXXXXX)
-  git -C "$repo" archive "$sha" tools/rig_dashboard/rigdash | tar -x -C "$tmp"
+  # PLANER-3090 1021: the two worker children of the editor (kartenplan_build/couplings_worker.py, oracle_worker.py) are found as
+  # <release>/kartenplan_build (profile_recompute.WORKER / profile_oracle.WORKER = dirname(rigdash)/kartenplan_build/...). Archiving rigdash
+  # alone left that directory out of every release: the live planner answered "Couplings worker does not start (timeout or exited at once)"
+  # (python: can't open file .../kartenplan_build/oracle_worker.py, rc 2).
+  git -C "$repo" archive "$sha" tools/rig_dashboard/rigdash tools/rig_dashboard/kartenplan_build | tar -x -C "$tmp"
   mkdir -p "$tmp/out"
   mv "$tmp/tools/rig_dashboard/rigdash" "$tmp/out/rigdash"
+  mv "$tmp/tools/rig_dashboard/kartenplan_build" "$tmp/out/kartenplan_build"
   rm -rf "$tmp/out/rigdash/tests"
   echo "$sha" > "$tmp/out/rigdash/VERSION"
   mv "$tmp/out" "$dst"

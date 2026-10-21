@@ -53,6 +53,8 @@ unit_flags() {
 # EIN Baum fuer Editor, Modellprofil, Hardwareprofil UND den Kopplungs-Worker (--profil-tree, Env RIGDASH_PROFIL_TREE).
 # Der Kartenplaner-Baum (KARTENPLAN_TREE bzw. $root/current) bleibt, wie er ist.
 Environment=RIGDASH_PROFIL_TREE=$tree
+# Die Release-Profile DIESES Baums (umbenannte Flags/ENV), mit gestagt; der alte Ort /spinning/gpu-arb/docker/profiles_release traegt die Flag-Namen vor der Umbenennung:
+Environment=RIGDASH_PROFILES_RELEASE_DIR=$root/profil/current/docker/flliper/profiles_release
 # Python der flliper-Umgebung fuer den Kopplungs-Worker (Balken, Topologie-Urteil des Trockenlaufs).  Rig-Standard, im Container die Image-Python:
 Environment=RIGDASH_COUPLINGS_PYTHON=/spinning/htsglang-gpu/.venv/bin/python
 # Der Worker (import flliper, torch) liegt im cgroup der Unit: gemessen RSS 612 MiB nach dem ersten Topologie-Aufruf, die Unit lag bei
@@ -134,6 +136,7 @@ case "$mode" in
       echo "  mkdir -p $root/profil/releases"
       echo "  tmp=\$(mktemp -d $root/profil/.stage.XXXXXX)"
       echo "  git -C $repo archive $sha python/flliper | tar -x -C \$tmp     # ~80 MiB"
+      echo "  git -C $repo archive $sha docker/flliper/profiles_release | tar -x -C \$tmp   # the release profiles of this tree"
       echo "  echo $sha > \$tmp/REV ; touch \$tmp/STAGED_OK ; mv \$tmp $dst"
     fi
     [ "$want_switch" = 1 ] && echo "  ln -sfn releases/$sha $root/profil/current.new && mv -T $root/profil/current.new $root/profil/current"
@@ -146,6 +149,11 @@ case "$mode" in
       tmp=$(mktemp -d "$root/profil/.stage.XXXXXX")
       trap 'rm -rf "$tmp"' EXIT
       git -C "$repo" archive "$sha" python/flliper | tar -x -C "$tmp"
+      # PLANER-3090 1021: the release profiles of THIS tree (renamed flags/env: --pdflip-*, FLLIPER_*) next to it; the dashboard's
+      # default /spinning/gpu-arb/docker/profiles_release still holds the pre-rename flag names, which this tree's launcher rejects.
+      if git -C "$repo" cat-file -e "$sha:docker/flliper/profiles_release" 2>/dev/null; then
+        git -C "$repo" archive "$sha" docker/flliper/profiles_release | tar -x -C "$tmp"
+      fi
       echo "$sha" > "$tmp/REV"
       touch "$tmp/STAGED_OK"
       mv "$tmp" "$dst"

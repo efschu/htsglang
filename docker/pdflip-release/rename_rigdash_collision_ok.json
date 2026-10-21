@@ -84,5 +84,9 @@
  ],
  "rigdash/tests/test_profil_release_edition_1984.py": [
   "flliper"
+ ],
+ "_planer3090_1021": "PLANER-3090 21.10.2026: carried 19393ee2cb (deploy line 18.10.) brings its test, which writes the old and the new IPC schema word side by side on purpose (both lines' boots must be read, the foreign schema not). A new collision file still aborts.",
+ "rigdash/tests/test_ipc_pdflip_schema_1018.py": [
+  "pdflip"
  ]
 }

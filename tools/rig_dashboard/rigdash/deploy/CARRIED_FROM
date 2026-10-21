@@ -6,3 +6,6 @@
 # so --check refuses it on the line rule and deploys go from the 27B head (F0-J section 7 step 3).
 # First field = commit (10+ hex digits), rest = what it is.
 9d3f7bed11  running release /opt/rigdash/current (08.10.): language switch EN/DE + RigTip + TTFT + sessions + History bs levels (ported as the six F0-K M3 commits)
+19393ee2cb  deploy line 18.10.: read fLLiper IPC (the renamed schema next to the old one) -- carried 21.10. (PLANER-3090: the renamed reader names.schema_ok + ipcfields.RANKSTATS_SCHEMAS)
+299945f808  deploy line 19.10.: D prefill rate at compute time (activity.compute_rate) -- carried 21.10. (cherry-pick, y8c hashes re-pinned on the renamed tree)
+8d32c66997  deploy line tip / running release 20.10.: P run honest (chunk start from the pipeline sum, p_run + trigger per flip) -- carried 21.10. (cherry-pick + the gitignored events.jsonl fixture)

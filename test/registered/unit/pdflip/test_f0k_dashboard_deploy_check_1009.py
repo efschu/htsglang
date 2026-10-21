@@ -38,6 +38,20 @@ CONTENT_PIN = {
         ("tools/rig_dashboard/rigdash/weg2line.py", r"."),
         ("tools/rig_dashboard/rigdash/deploy/rig-planner.service", r"(?m)^Environment=FLLIPER_PLANNER_READONLY=1"),
     ],
+    # deploy line 18.10.-20.10. (PLANER-3090 1021, carried onto the 27B port head): fLLiper IPC reader, D rate at compute time, P run + trigger
+    "19393ee2cb": [
+        ("tools/rig_dashboard/rigdash/ipcfields.py", r"(?m)^RANKSTATS_SCHEMAS = "),
+        ("tools/rig_dashboard/rigdash/tests/test_ipc_pdflip_schema_1018.py", r"pdflip\.state/1"),
+    ],
+    "299945f808": [
+        ("tools/rig_dashboard/rigdash/activity.py", r"def compute_rate\("),
+        ("tools/rig_dashboard/rigdash/tests/test_d_rate_untimed_1019.py", r"."),
+    ],
+    "8d32c66997": [
+        ("tools/rig_dashboard/rigdash/ipcboot.py", r"def _mark_trigger\("),
+        ("tools/rig_dashboard/rigdash/tests/test_p_run_1020.py", r"trigger"),
+        ("tools/rig_dashboard/rigdash/tests/fixtures/prun_nf_1020/events.jsonl", r"pdflip\.event/1"),
+    ],
     # running release /opt/rigdash/current: language switch EN/DE, RigTip, ...
     "9d3f7bed11": [
         ("tools/rig_dashboard/rigdash/static/i18n_de.json", r"."),
