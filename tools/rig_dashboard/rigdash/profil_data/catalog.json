@@ -16943,7 +16943,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 23757
+      "line": 23758
      }
     }
    },
@@ -18269,7 +18269,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 23740
+      "line": 23741
      }
     }
    },
@@ -19265,7 +19265,7 @@
      "source": {
       "file": "pdflip/launcher.py",
       "kind": "argparse",
-      "line": 23387
+      "line": 23388
      }
     }
    },
@@ -26879,6 +26879,26 @@
    "type": "str"
   },
   "--turn-anchor-token": {
+   "abweichung": {
+    "27b": {
+     "default": null,
+     "help": "TURN ANCHOR (NF, pdflip/turn_anchor.py): the chat template's turn-start token id (<|im_start|> = 248045 on Qwen3.8-27B and NF). Group P then also snapshots the recurrent state where the prompt's LAST message starts (a second extend track in the same forward, no extra forward) and inserts it as an anchor -- where the next turn and a client's side request fork (y3m pdflip-50-71: FETCH CAP lost=16 pages behind the END anchor). Adds FLLIPER_PDFLIP_TURN_ANCHOR_TOKEN to group P only; default off = argv and env byte-identical.",
+     "source": {
+      "file": "pdflip/launcher.py",
+      "kind": "argparse",
+      "line": 24160
+     }
+    },
+    "nf": {
+     "default": null,
+     "help": "TURN ANCHOR (NF, pdflip/turn_anchor.py): the chat template's turn-start token id (<|im_start|> = 248045 on Qwen3.8-27B and NF). Group P then also snapshots the recurrent state where the prompt's LAST message starts (a second extend track in the same forward, no extra forward) and inserts it as an anchor -- where the next turn and a client's side request fork (y3m pdflip-50-71: FETCH CAP lost=16 pages behind the END anchor). Adds FLLIPER_PDFLIP_TURN_ANCHOR_TOKEN to groups P and D (D: the D-FORK-ANCHOR tracks, FLLIPER_PDFLIP_D_FORK_ANCHOR=0 turns them off); default off = argv and env byte-identical.",
+     "source": {
+      "file": "pdflip/launcher.py",
+      "kind": "argparse",
+      "line": 23035
+     }
+    }
+   },
    "bare": false,
    "choices": null,
    "cost": "",
@@ -60227,6 +60247,34 @@
    ],
    "type": "EnvBool"
   },
+  "FLLIPER_PDFLIP_D_FORK_ANCHOR": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "True",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "D-FORK-ANCHOR (pdflip/turn_anchor.py, 21.10., NF rc30 1d822bd150): the TURN / CLOSE-FORK / GEN-FORK tracks on group D too (overlap schedule allowed: the slot is written by the step's own track gather and published in the same insert call as the step's own track); a Form A worker gets a split-only plan. Default ON (new features on); 0 = group D plans nothing, byte-identical to rc30.",
+   "id": "FLLIPER_PDFLIP_D_FORK_ANCHOR",
+   "kind": "env",
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_D_FORK_ANCHOR",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 4325,
+    "tree": "nf"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "EnvBool"
+  },
   "FLLIPER_PDFLIP_D_HOL_OVERTAKE": {
    "bare": false,
    "choices": null,
@@ -91650,28 +91698,28 @@
  "schema": "flliper.catalog/1",
  "stats": {
   "curated": 125,
-  "entries": 2905,
-  "envs": 2026,
+  "entries": 2906,
+  "envs": 2027,
   "explained": 310,
   "flags": 864,
-  "harvested": 1794,
+  "harvested": 1795,
   "trees": {
-   "abweichung": 23,
+   "abweichung": 24,
    "beide": 2697,
    "nur_27b": 179,
-   "nur_nf": 11
+   "nur_nf": 12
   },
   "unexplained": 676
  },
- "tree_rev": "27b=b5588c97aa+nf=e850daaa74",
+ "tree_rev": "27b=b5588c97aa+nf=9bfca9ba90",
  "trees": {
   "27b": {
    "entries": 2876,
    "rev": "b5588c97aa"
   },
   "nf": {
-   "entries": 2708,
-   "rev": "e850daaa74"
+   "entries": 2709,
+   "rev": "9bfca9ba90"
   }
  },
  "warnungen": []
