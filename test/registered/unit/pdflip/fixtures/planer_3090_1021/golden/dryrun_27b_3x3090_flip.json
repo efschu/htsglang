@@ -1,0 +1,93 @@
+{
+ "budgets": [
+  {
+   "card": "NVIDIA GeForce RTX 3090",
+   "group": "P",
+   "mib": 18584,
+   "nvml_idx": 0,
+   "ordinal": 0,
+   "pass": "P"
+  },
+  {
+   "card": "NVIDIA GeForce RTX 3090",
+   "group": "P",
+   "mib": 18584,
+   "nvml_idx": 1,
+   "ordinal": 1,
+   "pass": "P"
+  },
+  {
+   "card": "NVIDIA GeForce RTX 3090",
+   "group": "P",
+   "mib": 18584,
+   "nvml_idx": 2,
+   "ordinal": 2,
+   "pass": "P"
+  },
+  {
+   "card": "NVIDIA GeForce RTX 3090",
+   "group": "P",
+   "mib": 18584,
+   "nvml_idx": 0,
+   "ordinal": 0,
+   "pass": "P"
+  },
+  {
+   "card": "NVIDIA GeForce RTX 3090",
+   "group": "P",
+   "mib": 16792,
+   "nvml_idx": 1,
+   "ordinal": 1,
+   "pass": "P"
+  },
+  {
+   "card": "NVIDIA GeForce RTX 3090",
+   "group": "P",
+   "mib": 16792,
+   "nvml_idx": 2,
+   "ordinal": 2,
+   "pass": "P"
+  },
+  {
+   "card": "NVIDIA GeForce RTX 3090",
+   "group": "D",
+   "mib": 19792,
+   "nvml_idx": 0,
+   "ordinal": 0,
+   "pass": "D(dry, expectation)"
+  },
+  {
+   "card": "NVIDIA GeForce RTX 3090",
+   "group": "D",
+   "mib": 19792,
+   "nvml_idx": 1,
+   "ordinal": 1,
+   "pass": "D(dry, expectation)"
+  },
+  {
+   "card": "NVIDIA GeForce RTX 3090",
+   "group": "D",
+   "mib": 19792,
+   "nvml_idx": 2,
+   "ordinal": 2,
+   "pass": "D(dry, expectation)"
+  }
+ ],
+ "forced": [
+  "HW-BORROWED",
+  "HW-UNCALIBRATED"
+ ],
+ "group_flags_D": {
+  "--max-total-tokens": null,
+  "--rank-gpu-memory-mib": "19792,19792,19792",
+  "--rank-tp-ratio": "auto"
+ },
+ "pp_cut": {
+  "attn": "6,6,4",
+  "chosen_pool": "307660",
+  "layers": "24,24,16",
+  "makespan_ms": "1220.0",
+  "pool_floor": "264192",
+  "pool_floor_source": "flag"
+ }
+}

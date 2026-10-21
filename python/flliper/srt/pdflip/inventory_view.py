@@ -233,6 +233,16 @@ def borrow_vector(policy: Optional[str], value, calibrated: Sequence[str], live:
     return None
 
 
+def same_n_foreign(borrow, policy: Optional[str], calibrated: Sequence[str], live: Sequence[str]) -> bool:
+    """PLANER-3090 1021 (``launcher.apply_inventory_derivation``): must a vector whose entry count already IS the live card count still be
+    re-derived?  Only under the FORCED borrow (``borrow`` not None) and only when the inventory it was written for is not the live one.
+
+    Before, every same-length vector was skipped -- the count matched, so the reference rig's ordinal values stayed: on 3 x RTX 3090 PP0 kept
+    the 5090's ``MEASURED_MS_PER_LAYER`` 8.10 ms/layer and the cut solver put 32 of 64 layers on it.  Same count is not same inventory.  A
+    pinned P cut of N stages (``cut-pin``) stays a valid cut and is never re-derived."""
+    return borrow is not None and policy != CUT_PIN and tuple(calibrated) != tuple(live)
+
+
 @dataclass(frozen=True)
 class Assessment:
     """Which positional values of a profile are derivable for a live inventory."""

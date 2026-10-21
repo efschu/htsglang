@@ -327,6 +327,71 @@ def _del(la: LaunchArgv, kind: str, group: str, name: str) -> None:
 WINDOW_SPEC_FLAGS = ("--p-barlink-bar1-window-mib", "--d-reshard-presets")
 
 
+#: PLANER-3090 1021: the D objectives whose weight vector IS a measured rate ratio (``launcher.D_OPERATING_POINTS``; pinned by
+#: test_planer_3090_1021).  On N identical cards every such vector is the equal vector -- the ratio of equal rates is 1 whatever the rate --
+#: and so is ``maxkv``'s budget vector when the budgets are equal; but the launcher refuses the rate-priced positions (W61) when its card-rate
+#: library has no measured row for the class, which a foreign rig's library never has before ``card_rate_pass --run``.
+RATE_PRICED_OBJECTIVES = ("decode-bs1", "decode-bs6")
+#: PLANER-3090 1021: ``--d-reshard`` is built on the reference rig's D vector -- ``d_reshard.RC9_BASE`` = (58, 25, 25), the 5090 : 3080 :
+#: 3080 ``--rank-tp-ratio`` -- and the launcher refuses any other D weight vector ("the presets are built on --rank-tp-ratio 58,25,25",
+#: ``launcher.d_reshard_argv``).  Pinned against ``d_reshard.RC9_BASE`` by test_planer_3090_1021.
+D_RESHARD_RIG_BASE = (58, 25, 25)
+
+
+def homogeneous(classes: Sequence[str]) -> bool:
+    """N identical cards (one calibration class label for all of them, ``class`` of ``cards_from_hardware``)."""
+    return len(classes) >= 2 and len(set(classes)) == 1 and all(classes)
+
+
+def _role_index(j: int, n_live: int, n_cal: int) -> int:
+    """The stage/rank ROLE of live ordinal ``j`` in the calibrated inventory (``inventory_view.role_index``: first -> 0, last -> last,
+    every other -> the first middle one)."""
+    if j == 0:
+        return 0
+    if j == n_live - 1:
+        return n_cal - 1
+    return 1 if n_cal > 2 else n_cal - 1
+
+
+def rekey_l15_posts(text: str, calibrated: Sequence[str], cards: Sequence[Mapping[str, Any]]) -> Tuple[Optional[str], str]:
+    """``FLLIPER_PDFLIP_L15_MIB`` ``c<i>=<mib>,...`` (budget ordinals of the profile's inventory ``calibrated``) for the live ``cards``.
+
+    Two parts, both the profile's own shape: (1) WHO holds nothing -- an ordinal the value leaves unnamed is a cap-0 rank, the refill rank
+    (27b.env: "c0 = 5090 = ungenannt = 0 = Refill-Rang"; ``l15_shadow.cap0_line``: metal-proven only for EXACTLY ONE cap-0 rank); it is a
+    ROLE (rank 0), so the live ordinal of the same role stays unnamed; (2) HOW MUCH the others hold -- the smallest named post of the card's
+    class (a hold larger than the room P leaves is the one wrong direction, ``inventory_view.derive_l15_override``), the arch twin's class
+    (:data:`propose_rules.ARCH_TWIN`, sm86 -> RTX3080) when the class is not calibrated (BORROWED).  ``auto`` cannot stand in: without the
+    record ``P_AWAKE_PEAK_MIB`` of this inventory every post is 0 and the launcher refuses W-L15-NOCAP.  Returns ``(None, why)`` for identity
+    keys / malformed text (the launcher resolves or refuses those)."""
+    named: Dict[int, int] = {}
+    for part in str(text or "").split(","):
+        k, sep, v = part.strip().partition("=")
+        if not sep or not k.startswith("c") or not k[1:].isdigit() or not v.strip().isdigit():
+            return None, ""
+        named[int(k[1:])] = int(v)
+    cal = list(calibrated)
+    n = len(cards)
+    out, srcs = [], []
+    for j, c in enumerate(cards):
+        role = _role_index(j, n, len(cal)) if n >= 2 and len(cal) >= 2 else j
+        if role not in named:
+            srcs.append("c%d: cap 0 (role of calibrated c%d, the refill rank)" % (j, role))
+            continue
+        cls = c.get("class")
+        k = cls if cls in cal else R.ARCH_TWIN.get(str(c.get("arch")))
+        posts = [named[i] for i, kk in enumerate(cal) if kk == k and i in named]
+        if not posts:
+            srcs.append("c%d: class %s holds no named post" % (j, k))
+            continue
+        mib = min(posts)
+        srcs.append("c%d: %s %d MiB%s" % (j, k, mib, "" if k == cls else " (borrowed, arch twin)"))
+        out.append("c%d=%d" % (j, mib))
+    if not out:
+        return "auto", "no card of these cards holds a post derivable from '%s': auto (the launcher refuses W-L15-NOCAP without a measured P awake peak)" % text
+    return ",".join(out), ("L1.5 posts: the refill role (cap 0) as in the profile, the others the smallest named hold of their class "
+                           "(arch twin where the class is not calibrated): %s" % "; ".join(srcs))
+
+
 def vector_lengths(argv: Sequence[str], env: Optional[Mapping[str, str]] = None) -> Dict[str, int]:
     """Every positional per-card vector of a launch -> its entry count (the stdlib twin of ``launcher.positional_vector_lengths``:
     the flags of :data:`propose_rules.TOPOLOGY_VECTOR_FLAGS` at top level, the tokens of :data:`TOPOLOGY_VECTOR_TOKENS`
@@ -478,6 +543,7 @@ def propose(hardware: Any, model: Mapping[str, Any], form: str = "flip", goals: 
     la0 = LaunchArgv(b["argv"], b["env"])               # the profile as it is: the Dual form reads its own calibration from it
     bname = b["name"] or "(no profile)"
     live_cls = tuple(c["class"] for c in cards)
+    homog = homogeneous(live_cls)
     binv = _inventory_of(b["vars"])
     same_inv = binv is not None and tuple(binv) == live_cls and not z.get("force_rules")
 
@@ -575,6 +641,20 @@ def propose(hardware: Any, model: Mapping[str, Any], form: str = "flip", goals: 
         old = _get(la, kind, group, name)
         if old is None:
             return
+        if not same_inv and binv is not None and tuple(binv) != live_cls:
+            # PLANER-3090 1021: two carry values hold a CARD RATIO of the profile's own inventory and were handed verbatim to foreign
+            # cards (3 x 3090 got the 5090/3080 preset drq=652:218:218 and L1.5 posts c1=7616,c2=1792 keyed by ordinal).
+            new, why = None, ""
+            if name == "--d-reshard-presets":
+                return                                  # decided together with --d-reshard (D_RESHARD_RIG_BASE below)
+            if name == "FLLIPER_PDFLIP_L15_MIB" and str(old).strip().lower() not in ("", "auto"):
+                new, why = rekey_l15_posts(old, binv, cards)
+            if new is not None and new != old:
+                _set(la, kind, group, name, new)
+                rec.add(slot_label(kind, group, name), group=group, old=old, new=new, state=R.UNVERIFIED,
+                        source="Rule for the cards [%s] (profile %s was written for [%s])" % (",".join(live_cls), bname, inv_txt),
+                        reason=why + "; unverified on the hardware (planner calculation)", policy="carry")
+                return
         st, hk, gr = carried()
         rec.add(slot_label(kind, group, name), group=group, old=old, new=old, state=st, source=hk,
                 reason=gr + " (no card vector of the topology check of the launcher: unchanged from the profile)", policy="carry")
@@ -592,6 +672,13 @@ def propose(hardware: Any, model: Mapping[str, Any], form: str = "flip", goals: 
     if foreign and nontorch and len(foreign) == n == len(nontorch):
         ctx = [float(foreign[i]) + float(nontorch[i]) for i in range(n)]
         ctx_src = "D context (--d-foreign-context-mib + --d-nontorch-mib) of the cards"
+    elif not is_moe and not same_inv:
+        # PLANER-3090 1021: a dense D is TP-symmetric -- every rank holds 1/N of every family -- so the P stage posts (PP0 embedding,
+        # last stage head, P_PP_STAGE_FIXED_MIB by stage role) are no D context.  The old fallback charged them and gave three
+        # identical 3090s the D shares 0.346 / 0.368 / 0.286.  What a D rank pays before the model is the card residue (class record).
+        ctx = [float(hw_fit.residue_mib(fit_cards[i], asm, verdict)) for i in range(n)]
+        ctx_src = "card residue of the class (fallback for a TP-symmetric dense D, unverified)"
+        rec.unverified.append("D context per card: no --d-foreign-context-mib/--d-nontorch-mib in the profile for this inventory")
     else:
         ctx = [float(c["total_mib"] - sb["avail"][i]) for i, c in enumerate(cards)]       # total - (total - residue - posts)
         ctx_src = "P residue + stage items (fallback, unverified)"
@@ -851,6 +938,14 @@ def propose(hardware: Any, model: Mapping[str, Any], form: str = "flip", goals: 
         if dp["placement"] == "split":
             rec.notes.append("Draft solo does not fit on rank 0 (%s). Without it on rank 0 only the split across all ranks would remain, which form A refuses." % dp["why"])
             rec.blocker.append("Draft solo on rank 0 does not fit (form A demands solo)")
+    elif form != "dual" and not same_inv:
+        # PLANER-3090 1021: the form A rule (draft + ALL dense weights on rank 0) is no statement about a TP-symmetric dense D; it printed
+        # "does not fit (margin -20326 MiB)" for 27B on 3 x 3090.  For a dense D the planner states the per-rank 1/N estimate instead.
+        per = [(host_fixed + fp.draft_mib + kv_mib + d_mamba_mib) / float(n)] * n
+        worst = min(float(d_budget[i]) - per[i] for i in range(n))
+        rec.notes.append("Draft (dense, TP-symmetric D, planner estimate): per rank (weights %.0f + draft %.0f + KV obligation %.0f + Mamba %.0f) / %d = %.0f MiB "
+                         "against the D budgets %s MiB: smallest margin %.0f MiB (%s); the launcher prices the real D layout"
+                         % (host_fixed, fp.draft_mib, kv_mib, d_mamba_mib, n, per[0], R.csv(d_budget), worst, "fits" if worst >= 0 else "does not fit"))
     elif form != "dual":                      # the Dual form states its own draft rule (propose_dual: D shards the draft, P holds none)
         rec.notes.append("Draft: %s (the draft rule applies to the form A MoE line; for a dense model the draft runs per profile)" % dp["why"])
     d_kv_old = la.get_flag("--draft-kv-on-p")
@@ -862,12 +957,37 @@ def propose(hardware: Any, model: Mapping[str, Any], form: str = "flip", goals: 
         rec.add("--draft-kv-on-p", group="-", old=d_kv_old, new=d_kv_old, state=R.PROPOSED, source="Profile %s (unchanged)" % bname,
                 reason="set by the profile; without a value the launcher default on applies", policy="draft")
 
+    # --- D reshard on foreign cards (PLANER-3090 1021) ---------------------------------------------------------------------
+    dr_old = la.get_flag("--d-reshard")
+    if dr_old not in (None, "off") and not same_inv and binv is not None and tuple(binv) != live_cls:
+        la.set_flag("--d-reshard", "off")
+        pr_old = la.get_flag("--d-reshard-presets")
+        if pr_old is not None:
+            la.del_flag("--d-reshard-presets")
+        why = ("--d-reshard moves MLP units between UNEQUAL D ranks and is calibrated on the reference rig's D vector %s (d_reshard.RC9_BASE, "
+               "5090:3080:3080); the launcher refuses it on any other vector. " % (R.csv(D_RESHARD_RIG_BASE),)
+               + ("On %d identical cards the even split is already the optimum: there is nothing to move." % n if homog else
+                  "For these cards the base vector and the segment model are not calibrated (code gap, not a measurement)."))
+        rec.add("--d-reshard", group="-", old=dr_old, new="off", state=R.PROPOSED if homog else R.UNVERIFIED,
+                source="Rule for the cards [%s] (profile %s was written for [%s])" % (",".join(live_cls), bname, inv_txt), reason=why, policy="knob")
+        if pr_old is not None:
+            rec.add("--d-reshard-presets", group="-", old=pr_old, new=None, state=R.PROPOSED if homog else R.UNVERIFIED,
+                    source="follows --d-reshard off", reason="presets of the reference rig's MLP split; without --d-reshard they have no reader",
+                    in_argv=False, policy="carry")
+
     # --- the scalar knobs: D objective, seats, KV obligation ----------------------------------------------------------------
     obj = z.get("d_objective")
     if obj:
         la.set_flag("--d-tp-objective", str(obj))
         rec.add("--d-tp-objective", group="-", old=d_obj_old, new=str(obj), state=R.PROPOSED, source="Goal d_objective",
                 reason="chosen by the user", policy="knob")
+    elif d_obj_old is not None and homog and not same_inv and d_obj_old in RATE_PRICED_OBJECTIVES:
+        la.set_flag("--d-tp-objective", "maxkv")
+        rec.add("--d-tp-objective", group="-", old=d_obj_old, new="maxkv", state=R.PROPOSED,
+                source="Rule: %d identical cards [%s]" % (n, live_cls[0]),
+                reason=("%s ships the measured rate ratio of the cards; on identical cards that ratio is 1:...:1 whatever the rate, exactly the "
+                        "budget vector maxkv ships for equal budgets -- so the same weights, without the launcher's W61 refusal on a card-rate "
+                        "library that has no measured row for this class yet" % d_obj_old), policy="knob")
     elif d_obj_old is not None:
         rec.add("--d-tp-objective", group="-", old=d_obj_old, new=d_obj_old, state=R.PROPOSED, source="Profile %s (unchanged)" % bname,
                 reason="the goal value of the profile stays (a scalar of the form, no card measurement)", policy="knob")

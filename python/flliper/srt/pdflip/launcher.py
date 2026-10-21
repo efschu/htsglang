@@ -6407,7 +6407,7 @@ def apply_inventory_derivation(ns, cards: Sequence["Card"], log=None,
         if pol is None or v in (None, "", [], ()) or v == getattr(defaults, dest, None):
             continue
         cnt = _vector_len(v if isinstance(v, str) else ",".join(str(x) for x in v))
-        if cnt is None or cnt == n:
+        if cnt is None or (cnt == n and not _iv.same_n_foreign(borrow, pol, vcal, live)):   # PLANER-3090 1021
             continue
         if pol == _iv.CUT_PIN:
             setattr(ns, dest, getattr(defaults, dest, None))
@@ -6425,7 +6425,7 @@ def apply_inventory_derivation(ns, cards: Sequence["Card"], log=None,
         if v in (None, "") or pol is None:
             continue
         cnt = _vector_len(str(v))
-        if cnt is None or cnt == n:
+        if cnt is None or (cnt == n and not _iv.same_n_foreign(borrow, pol, cal, live)):   # PLANER-3090 1021
             continue
         got = _derive_csv(pol, str(v), cal, live)
         if got is not None:
@@ -6441,7 +6441,7 @@ def apply_inventory_derivation(ns, cards: Sequence["Card"], log=None,
             if tok.startswith("--") or tok not in envd:
                 continue
             cnt = _vector_len(envd[tok])
-            if cnt is None or cnt == n:
+            if cnt is None or (cnt == n and not _iv.same_n_foreign(borrow, pol, vcal, live)):   # PLANER-3090 1021
                 continue
             got = _derive_csv(pol, envd[tok], vcal, live)
             if got is not None:

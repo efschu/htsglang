@@ -570,7 +570,9 @@ class TestOtherInventories(unittest.TestCase):
         res = run.result
         # a result, never a crash: either the dry run ran through or it ended in a launcher REFUSAL (named, with its W-code)
         if res.exc_type is not None:
-            self.assertIn(res.exc_type, ("PdFlipLaunchRefused", "PdFlipXchgResidencyUnarmable", "PdFlipPPCutRefused", "PdFlipTpOperatingPointInfeasible"),
+            # PLANER-3090 1021: the cut solver raises ``planner.pp_cut_launch.PPCutRefused`` (W40) under that class name (red on b5588c97aa already)
+            self.assertIn(res.exc_type, ("PdFlipLaunchRefused", "PdFlipXchgResidencyUnarmable", "PdFlipPPCutRefused", "PPCutRefused",
+                                         "PdFlipTpOperatingPointInfeasible"),
                           "%s: %s" % (res.exc_type, res.exc_msg[:300]))
         return v, run
 
@@ -620,11 +622,17 @@ class TestOtherInventories(unittest.TestCase):
     def test_the_launcher_refusal_of_foreign_cards_is_not_hidden_by_the_planer(self):
         v, run = self._check("n3_3090", n=3)
         # AP-J 07.10.: before the AP1 port (173161c595) this was W19 (an uncalibrated third class, PdFlipLaunchRefused).  The integ base
-        # 752537e7b6 carries AP1: W19 no longer refuses, the launcher now stops at W71 (the exchange census is UUID-bound, the synthetic
-        # cards are not in it).  Either way the planner does not hide the launcher's own verdict.
-        self.assertEqual(run.result.exc_type, "PdFlipXchgResidencyUnarmable", run.result.exc_msg[:300])
-        self.assertIn("W71", run.result.exc_msg[:200])
-        self.assertNotIn("W19", run.result.exc_msg[:200])
+        # 752537e7b6 carries AP1: W19 no longer refuses, the launcher then stopped at W71 (the exchange census is UUID-bound, the synthetic
+        # cards are not in it).  On b5588c97aa W71 had become a FORCEABLE HW-BORROWED and the run stopped at a PdFlipLaunchRefused
+        # (W61 / the d_reshard base 58,25,25 of the reference rig).  PLANER-3090 1021: the planner's rules for N identical cards (maxkv,
+        # --d-reshard off, L1.5 by role/class) remove those two causes, so the FORCED dry run runs through -- and the planner still hides
+        # nothing: W71 (census) and W19 (uncalibrated class) are named among what --force went past.
+        res = run.result
+        self.assertIsNone(res.exc_type, (res.exc_type, (res.exc_msg or "")[:300]))
+        forced = " ".join(f["text"] for f in res.forced)
+        self.assertIn("W71", forced)
+        self.assertIn("W19", forced)
+        self.assertEqual({f["code"] for f in res.forced} - {"HW-UNCALIBRATED", "HW-BORROWED"}, set(), res.forced)
 
 
 if __name__ == "__main__":  # pragma: no cover
