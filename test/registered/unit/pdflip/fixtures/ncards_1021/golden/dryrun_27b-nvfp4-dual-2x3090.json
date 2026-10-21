@@ -3,12 +3,12 @@
   [
    "P",
    0,
-   18584
+   19984
   ],
   [
    "P",
    1,
-   18584
+   19984
   ],
   [
    "D(dual-share, P-Plan)",
@@ -56,7 +56,7 @@
  },
  "pp_cut": {
   "attn": "8,8",
-  "chosen_pool": "326981",
+  "chosen_pool": "416581",
   "layers": "32,32",
   "pool_floor": "263168",
   "pool_floor_source": "flag"

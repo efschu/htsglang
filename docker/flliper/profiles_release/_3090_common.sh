@@ -22,7 +22,8 @@ _p3090_drop() {
 _p3090_apply() {
   local n=$1 i reserve="" trim="" l15=""
   for ((i = 0; i < n; i++)); do
-    reserve+="${reserve:+,}1400"     # --user-reserve-mib: Klassenwert der 3080 (Arch-Zwilling sm86), Rig 1800,1400,1400 (5090,3080,3080)
+    reserve+="${reserve:+,}0"        # --user-reserve-mib: Launcher-Default 0 (Nutzerentscheid 2026-09-09). Rig 1800,1400,1400 (5090,3080,3080) ist der Kopfraum
+                                     # UNSERES Operators fuer andere Prozesse auf SEINEN Karten, kein Klassenwert und keine Modellmessung (Review 1021 A3)
     trim+="${trim:+,}0"              # D-Extend-Trim: 3080-Klasse 0 (nur die 5090 = TP0 starb am Extend, Rig 1200,0,0)
     if [ "$i" -gt 0 ]; then l15+="${l15:+,}c$i=1792"; fi   # L1.5: c0 = Refill-Rang (Kappe 0, wie Rig); sonst kleinster Halt der 3080-Klasse (Rig c1=7616,c2=1792)
   done

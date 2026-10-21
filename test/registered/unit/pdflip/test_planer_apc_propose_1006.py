@@ -93,6 +93,8 @@ _CENSUS_MAP = O.launcher_knows("--pdflip-xchg-census-map")
 _N4_REFUSAL = None if _CENSUS_MAP else "W71"
 #: the value refusals ``--force`` passes in these dry runs: the NF line also names HW-BORROWED (a census row borrowed from another card)
 _FORCED_OK = {"HW-COUNT", "HW-UNCALIBRATED"} | ({"HW-BORROWED"} if "HW-BORROWED" in {r.code for r in refusals.REGISTER} else set())
+# NCARDS 1021 (review A1): the launcher's D residency check runs for N != 3 now (3-rank reference taken to N ranks by role); its ownership solve may be forced past by name
+_FORCED_OK = _FORCED_OK | {"D-BUDGET"}
 
 _TMP = None
 _MODELS = {}
@@ -460,9 +462,10 @@ class TestVectorLengths(unittest.TestCase):
         # the 27B user reserve of 3 cards: for the 4 foreign cards the maximum of the arch twin (3080), BORROWED -> unbelegt
         w = {x["key"]: x for x in v["values"]}
         ur = w["--user-reserve-mib"]
-        self.assertEqual(ur["value"], "1400,1400,1400,1400")
-        self.assertEqual(ur["state"], "unverified")
-        self.assertIn("borrowed: RTX3080 (unverified)", ur["source"])
+        # NCARDS 1021 review A3: the reserve is the operator's headroom on HIS cards, not a class value: a card class the profile never ran on gets the launcher default 0
+        self.assertEqual(ur["value"], "0,0,0,0")
+        self.assertIn("launcher default 0", ur["source"])
+        self.assertNotIn("borrowed: RTX3080", ur["source"])
         n = _propose("nf", "n4_3090")
         for k in ("--d-foreign-context-mib", "--d-nontorch-mib"):
             self.assertEqual(len(R.parse_csv({x["key"]: x for x in n["values"]}[k]["value"])), 4)
@@ -634,7 +637,8 @@ class TestSyntheticDryRun(unittest.TestCase):
         if not _RESTAGES_P_CARD:
             self.assertIn("Stufenzahl 2 gegen 3 der Referenz", run.result.exc_msg)
         else:       # AP2 1006: the P-card reference is re-staged; only the count is passed
-            self.assertEqual([f["code"] for f in run.result.forced if f["code"] != "HW-UNCALIBRATED"], ["HW-COUNT"])   # the count (+ the class rows of the re-staged reference)
+            # the count (+ the class rows of the re-staged reference); NCARDS 1021: + D-BUDGET where the launcher's D-EIGENTUM solve (now run on N = 2) finds no form
+            self.assertEqual({f["code"] for f in run.result.forced} - {"HW-UNCALIBRATED", "D-BUDGET"}, {"HW-COUNT"})
             self.assertFalse(any("Stufenzahl" in ln for ln in run.result.text.splitlines()))
         self.assertEqual(v["n"], 2)
 
@@ -836,8 +840,10 @@ class TestOriginOfTransferredValues(unittest.TestCase):
                        draft=_MODELS["nf"][1], rates=MEASURED_RATES, library=_seed_library())
         w = {x["key"]: x for x in v3["values"]}["--env-d FLLIPER_MOE_SCRATCH_SLOTS"]
         self.assertEqual(w["state"], R.UNVERIFIED)
-        self.assertTrue(w["source"].startswith("taken from profile nf-int4-h6-abl.env for ["), w["source"])
-        self.assertIn("inventory here [RTX3090", w["source"])
+        # NCARDS 1021 review A1: the Form A host's scratch (100 rows on the rig's 5090) is capped on a host card of another class, so the value MOVES: the origin is the
+        # transfer text ("Profile ...: ...; inventory of the profile [...], here [...]"), no longer the carried-over "taken from profile" text
+        self.assertTrue(w["source"].startswith("Profile nf-int4-h6-abl.env: "), w["source"])
+        self.assertIn("here [RTX3090", w["source"])
         self._check(v3)
         self._check(v)
 

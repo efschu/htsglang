@@ -16,6 +16,7 @@ import importlib.util
 import json
 import os
 import pathlib
+import re
 import sys
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
@@ -48,6 +49,17 @@ def main(argv):
         doc["pp_cut"] = {k: pc.get(k) for k in ("layers", "attn", "chosen_pool", "pool_floor", "pool_floor_source")}
         doc["stages"] = len(str(pc.get("layers", "")).split(",")) if pc.get("layers") else 0
         doc["budgets"] = [[b.get("pass"), b.get("ordinal"), b.get("mib")] for b in plan.get("budgets", [])]
+        # review 1021 A1: the launcher's D residency check (FRACTION-SOLVE D(Karte, Erwartung)) is part of the document -- it must RUN
+        # (no ENTFAELLT) and every rank must PASS; "borrowed" = the 3-rank reference was taken to this rank count by role.
+        d_lines = [l for l in res.text.splitlines() if "FRACTION-SOLVE D(Karte, Erwartung)" in l]
+        if d_lines:
+            last = {}
+            for l in d_lines:
+                m = re.search(r"rang(\d+): Ratio .*? Scratch (\d+) .*? f ([0-9.]+) -> R (\d+), .*? nach KV -?\d+ MiB .*?-> (PASST|[A-Z]\S*)", l)
+                if m:
+                    last[int(m.group(1))] = {"scratch": int(m.group(2)), "R": int(m.group(4)), "verdict": m.group(5)}
+            doc["d_check"] = {"entfaellt": any("ENTFAELLT" in l for l in d_lines), "borrowed_by_role": any("BORROWED BY RANK ROLE" in l for l in d_lines),
+                              "ranks": [last[k] for k in sorted(last)]}
         gf = plan.get("group_flags", {})
         doc["group_flags"] = {g: {k: gf.get(g, {}).get(k) for k in ("--rank-tp-ratio", "--rank-gpu-memory-mib", "--max-total-tokens", "--tp-size", "--pp-size")}
                               for g in ("P", "D")}

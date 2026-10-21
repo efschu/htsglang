@@ -15289,13 +15289,13 @@ def dual_alloc_cache_book_env(ns, cards: List[Card], log: Log) -> Dict[str, str]
             f"measure with python -m flliper.srt.pdflip.budget_rest --dual-d-log")
         return {}
     vals = list(sel.record.value)
-    if len(vals) != len(cards):
-        # NCARDS 1021: the record is a positional 3-vector of the reference inventory; read it through the active
-        # inventory view like every other record (``profile_constant``: derive by class; the forced borrow by arch twin).
-        # Reference rig / same inventory: the view returns the value unchanged.
-        _got = inventory_view_mod.apply_active(
-            name, str(getattr(ns, "profile", None) or pdflip_form.DEFAULT_PROFILE), tuple(vals))
-        vals = list(_got)
+    # NCARDS 1021 (review A2): the record is a positional vector of the reference inventory; read it through the active
+    # inventory view like every other record (``profile_constant``: derive by class; the forced borrow by arch twin) -- ALWAYS,
+    # not only when the length differs: same count is not same inventory (``inventory_view.same_n_foreign``; on 3 x RTX 3090 the
+    # rig's ordinal vector 1318,0,0 = the 5090's growth would be booked on a 3090).  Reference rig / same inventory (or no view
+    # installed): ``apply_active`` returns the value unchanged.
+    vals = list(inventory_view_mod.apply_active(
+        name, str(getattr(ns, "profile", None) or pdflip_form.DEFAULT_PROFILE), tuple(vals)))
     if len(vals) != len(cards):
         raise PdFlipLaunchRefused(
             f"{_budget_rest.ALLOC_CACHE_MARKER}: {name} has {len(vals)} entries for {len(cards)} cards; "

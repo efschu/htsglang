@@ -3,17 +3,17 @@
   [
    "P",
    0,
-   18584
+   19984
   ],
   [
    "P",
    1,
-   18584
+   19984
   ],
   [
    "P",
    2,
-   18584
+   19984
   ],
   [
    "D(dry, expectation)",
@@ -46,16 +46,16 @@
    "--tp-size": "3"
   },
   "P": {
-   "--max-total-tokens": "402833",
+   "--max-total-tokens": "474513",
    "--pp-size": "3",
-   "--rank-gpu-memory-mib": "18584,18584,18584",
+   "--rank-gpu-memory-mib": "19984,19984,19984",
    "--rank-tp-ratio": null,
    "--tp-size": "1"
   }
  },
  "pp_cut": {
   "attn": "5,6,5",
-  "chosen_pool": "402833",
+  "chosen_pool": "474513",
   "layers": "22,22,20",
   "pool_floor": "264192",
   "pool_floor_source": "flag"

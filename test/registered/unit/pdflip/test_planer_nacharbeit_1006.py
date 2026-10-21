@@ -159,7 +159,8 @@ class TestSupplement(unittest.TestCase):
                          "this tree's launcher line is %r (the anchors are proved by test_the_cited_anchors_exist_in_the_launcher_sources_of_this_tree)"
                          % O.launcher_line())
     def test_the_cited_lines_hold_the_launcher_text(self):
-        """Die Quellenangaben sind keine Behauptung: der zitierte Text steht an der genannten Stelle des Quelltexts dieses Baums."""
+        """Die Quellenangaben sind keine Behauptung: der zitierte Text steht an der genannten Stelle des Quelltexts dieses Baums.
+        (NCARDS 1021 Runde 2: die Zeilen des Launchers liegen seit 3efdb36783 um 26 weiter unten; die Test-Pins sind mitgezogen.)"""
         def lines(mod):
             return pathlib.Path(mod.__file__).read_text(encoding="utf-8").split("\n")
 
@@ -171,11 +172,11 @@ class TestSupplement(unittest.TestCase):
         self.assertIn("W71 PdFlipXchgResidencyUnarmable: the exchange's predicted VRAM residency", span(xl, 979, 991))
         self.assertIn("--pdflip-weight-source ring", span(xl, 979, 991))
         self.assertIn("def load_census", span(xl, 318, 321))
-        self.assertIn("W64 PdFlipTpOperatingPointInfeasible: position", span(ll, 17368, 17374))
-        self.assertIn("W64-DUAL: no measured dual-share D log", span(ll, 17626, 17627))
-        self.assertIn("if mine and dual_layout:", span(ll, 17724, 17724))        # Override nur im Dual ...
-        self.assertIn("raise PdFlipLaunchRefused(mine[0]", span(ll, 17733, 17736))  # ... die Verweigerung gilt in jeder Form
-        self.assertIn("if not dual_layout or not str(refusal).startswith", span(ll, 17615, 17615))
+        self.assertIn("W64 PdFlipTpOperatingPointInfeasible: position", span(ll, 17394, 17400))
+        self.assertIn("W64-DUAL: no measured dual-share D log", span(ll, 17652, 17653))
+        self.assertIn("if mine and dual_layout:", span(ll, 17750, 17750))        # Override nur im Dual ...
+        self.assertIn("raise PdFlipLaunchRefused(mine[0]", span(ll, 17759, 17762))  # ... die Verweigerung gilt in jeder Form
+        self.assertIn("if not dual_layout or not str(refusal).startswith", span(ll, 17641, 17641))
         for w in PV.SUPPLEMENT_CODES.values():
             for m in re.finditer(r"(\w+/)?[\w.]+\.py:(\d+)(?:-(\d+))?", w["quelle"]):
                 self.assertGreater(int(m.group(2)), 0)

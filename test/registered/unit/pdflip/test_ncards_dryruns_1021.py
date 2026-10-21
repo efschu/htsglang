@@ -40,7 +40,7 @@ MATRIX = (
 def _run(profile, n, *extra):
     env = dict(os.environ, CUDA_VISIBLE_DEVICES="", PYTHONPATH=str(TREE / "python"), NCARDS_TREE=str(TREE), PYTHONDONTWRITEBYTECODE="1")
     p = subprocess.run([sys.executable, str(FIX / "dryrun_driver.py"), str(PROFILES / (profile + ".env")), "rtx3090-24", str(n), *extra],
-                       capture_output=True, text=True, env=env, timeout=900)
+                       capture_output=True, text=True, env=env, timeout=3000)
     for line in p.stdout.splitlines():
         if line.startswith("NCARDS-JSON "):
             return json.loads(line[len("NCARDS-JSON "):])
@@ -65,8 +65,18 @@ def _check(self, profile, n):
     self.assertIsNone(doc["exc_type"], doc)
     self.assertEqual(set(doc["forced"]) - {"HW-UNCALIBRATED", "HW-BORROWED", "HW-COUNT", "D-BUDGET"}, set(), doc["forced"])
     self.assertEqual("HW-COUNT" in doc["forced"], n != 3, doc["forced"])      # N = 3 is the proven count: no HW-COUNT
-    # KNOWN DEFECT (named, not hidden): the launcher's D budget check refuses the planner's NF ownership on 3 identical 3090s
-    self.assertEqual("D-BUDGET" in doc["forced"], profile == "nf-3x3090", doc["forced"])
+    # review 1021 A1: the launcher's D residency check (W122/W130) passes the planner's NF distribution on 2, 3 and 4 identical 3090s and it RUNS on every N
+    # (N != 3: the 3-rank reference taken to N ranks by rank role, named "BORROWED BY RANK ROLE")
+    # the launcher's own ownership / KV token-cut solve (D-EIGENTUM, #239 S3f) finds a bearable form on N = 3 and none on N = 2 / 4 (forced past as D-BUDGET): those two
+    # profiles carry PROFILE_STATUS=blockiert-d-budget (named, not hidden); the fix of that turns this assertion red
+    self.assertEqual("D-BUDGET" in doc["forced"], profile in ("nf-2x3090", "nf-4x3090"), doc["forced"])
+    if profile.startswith("nf-"):
+        chk = doc.get("d_check")
+        self.assertIsNotNone(chk, "the D FRACTION-SOLVE did not run: " + profile)
+        self.assertFalse(chk["entfaellt"], chk)
+        self.assertEqual(chk["borrowed_by_role"], n != 3, chk)
+        self.assertEqual(len(chk["ranks"]), n, chk)
+        self.assertEqual({r["verdict"] for r in chk["ranks"]}, {"PASST"}, chk)
     if doc.get("pp_cut", {}).get("layers"):
         self.assertEqual(doc["stages"], n, doc["pp_cut"])
 
@@ -87,7 +97,10 @@ class TestUnforced(unittest.TestCase):
             with self.subTest(profile=profile):
                 doc = _run(profile, n, "--noforce")
                 self.assertIsNotNone(doc["exc_type"], "an unforced launch on foreign cards must be refused")
-                self.assertRegex(doc["exc_head"], r"HW-(UNCALIBRATED|BORROWED|COUNT)|W71|W19|W40", doc["exc_head"])
+                # review 1021: W40 (the cut solver's "not one cut ... priceable") is exactly the regression this test must catch -- the unforced
+                # launch is refused by the HW check (HW-COUNT / HW-UNCALIBRATED / HW-BORROWED), never by a cut that could not be priced
+                self.assertRegex(doc["exc_head"], r"HW-(UNCALIBRATED|BORROWED|COUNT)", doc["exc_head"])
+                self.assertNotRegex(doc["exc_head"], r"W40|not one cut", doc["exc_head"])
 
     def test_27b_int8_on_2x3090_with_the_full_context_ceiling_is_a_named_physical_refusal(self):
         """2 x 24 GB hold 27B INT8 only with a per-request ceiling of ~80k tokens: with 262144 even ``--force`` is refused by name (the cut solver

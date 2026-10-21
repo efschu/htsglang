@@ -4139,6 +4139,40 @@ def _env_true(env: Mapping[str, str], name: str) -> bool:
     return str(env.get(name, "")).strip().lower() in _TRUE
 
 
+def _role_rekey_tuple(vals: Sequence, n: int) -> tuple:
+    """A per-RANK tuple of a measured reference (host = first, workers = the rest) taken to ``n`` ranks by ROLE: first, the middle entry
+    repeated, last (``inventory_view.role_index`` / ``propose_rules.role_rekey``)."""
+    v = list(vals)
+    if len(v) == n:
+        return tuple(v)
+    mid = v[1] if len(v) > 2 else v[-1]
+    return tuple([v[0]] + [mid] * (n - 2) + [v[-1]])
+
+
+def role_borrow_reference(ref, n_ranks: int, rank_tp_ratio: str):
+    """NCARDS 1021 (review A1): the built-in D reference (``fnFL2``: Form A on THREE ranks, ``--rank-tp-ratio 1,0,0``) taken to ``n_ranks``
+    ranks of the same Form A shape (``1,0,...,0``: rank 0 = attention host, the others expert workers) BY RANK ROLE, or ``None`` when the
+    shapes do not match.  Before, any other rank count made the whole FRACTION-SOLVE ``ENTFAELLT`` -- on 2 / 4 identical cards the D budget
+    was never checked, silently.  The borrowed values are UNMEASURED at this rank count (host / first worker / last worker of the
+    3-rank boot): the caller names that in ``source``."""
+    n = int(n_ranks)
+    ref_n = len(ref.fixed_mib) if hasattr(ref, "fixed_mib") else len(ref.headroom0_mib)
+    ref_shape = [x.strip() for x in str(ref.rank_tp_ratio).split(",")]
+    want_shape = [x.strip() for x in str(rank_tp_ratio).split(",")]
+    if (n < 2 or n == ref_n or len(ref_shape) != ref_n or ref_shape[0] != "1" or any(x != "0" for x in ref_shape[1:])
+            or len(want_shape) != n or want_shape[0] != "1" or any(x != "0" for x in want_shape[1:])):
+        return None
+    upd = {"rank_tp_ratio": ",".join(want_shape),
+           "source": "%s BORROWED BY RANK ROLE to %d ranks (host / middle worker / last worker of the %d-rank boot; UNMEASURED at this rank count)" % (
+               ref.source, n, ref_n)}
+    for f in ref.__struct_fields__:
+        v = getattr(ref, f)
+        if isinstance(v, tuple) and len(v) == ref_n:
+            upd[f] = _role_rekey_tuple(v, n)
+    return msgspec.structs.replace(ref, **upd)
+
+
+
 def _reference_for(
     *,
     model_path: str,
@@ -4188,6 +4222,10 @@ def _reference_for(
         or len(ref.fixed_mib) != n_ranks
         or ref.dense_repack_outside_pool != bool(dense_repack)
     ):
+        if (ref.model == model or _same_footprint(model_path, ref.model)) and ref.dense_repack_outside_pool == bool(dense_repack):
+            borrowed = role_borrow_reference(ref, n_ranks, rank_tp_ratio)
+            if borrowed is not None:
+                return borrowed, ""
         return None, (
             "die eingebaute Referenz (%s) gilt fuer %s mit --rank-tp-ratio %s auf %d "
             "Raengen (%s), dieser Boot faehrt %s mit %s auf %d (%s); den festen "
@@ -5168,6 +5206,10 @@ def _card_reference_for(
         or len(ref.headroom0_mib) != n_ranks
         or ref.dense_repack_outside_pool != bool(dense_repack)
     ):
+        if (ref.model == model or _same_footprint(model_path, ref.model)) and ref.dense_repack_outside_pool == bool(dense_repack):
+            borrowed = role_borrow_reference(ref, n_ranks, rank_tp_ratio)
+            if borrowed is not None:
+                return borrowed, ""
         return None, (
             "die eingebaute Karten-Referenz (%s) gilt fuer %s mit --rank-tp-ratio %s "
             "auf %d Raengen (%s), dieser Boot faehrt %s mit %s auf %d (%s); den "

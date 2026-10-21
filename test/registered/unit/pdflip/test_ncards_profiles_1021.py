@@ -70,8 +70,9 @@ class TestProfileFiles(unittest.TestCase):
                     self.assertEqual(li.vars.get("PROFILE_CARD_COUNT"), str(n))
                     self.assertEqual(li.vars.get("PROFILE_INVENTORY"), ",".join(["RTX3090"] * n))
                     self.assertEqual(li.vars.get("PROFILE_GPUS"), "NVIDIA GeForce RTX 3090=%d" % n)
-                    # NF on 3 identical 3090s: the launcher's D budget refuses the planner's ownership even forced (known defect, named in the profile)
-                    self.assertEqual(li.vars.get("PROFILE_STATUS"), "blockiert-d-budget" if name == "nf-3x3090" else "hochrechnung")
+                    # NF on 2 and 4 identical 3090s: the launcher's D-EIGENTUM (#239 S3f) solve finds no bearable form, forced past only as the named D-BUDGET
+                    # (review 1021 A1; the W122/W130 residency balance passes there); N = 3 is bootable
+                    self.assertEqual(li.vars.get("PROFILE_STATUS"), "blockiert-d-budget" if name in ("nf-2x3090", "nf-4x3090") else "hochrechnung")
                     la = P.LaunchArgv(li.argv, li.env)
                     for kind, grp, flag in VECTOR_FLAGS:
                         val = la.get_flag(flag) if kind == "flag" else la.extra_get(grp, flag)

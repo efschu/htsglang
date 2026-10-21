@@ -584,12 +584,13 @@ class TestN2Vectors(unittest.TestCase):
         if _RESTAGES_P_CARD:
             self.assertEqual(d["outcome"], "ok_with_force", [(x["code"], x["reason"][:100]) for x in d["verdikte"]])
             # every run-level verdict is a value refusal --force passed (nothing blocked, nothing unchecked): no final refusal
-            self.assertEqual({x["code"] for x in d["verdikte"] if x["level"] == "run"}, {"HW-COUNT", "HW-UNCALIBRATED"})
+            # NCARDS 1021 (review A1): the launcher's D residency check runs on N = 2 now; its ownership solve (D-EIGENTUM) may be forced past by name (D-BUDGET)
+            self.assertEqual({x["code"] for x in d["verdikte"] if x["level"] == "run"} - {"D-BUDGET"}, {"HW-COUNT", "HW-UNCALIBRATED"})
             self.assertTrue(all(x["force_state"] == PV.FORCE for x in d["verdikte"] if x["level"] == "run"))
             self.assertEqual((d["zaehlung"][PV.BLOCKED], d["zaehlung"][PV.UNCHECKED]), (0, 0))
             self.assertFalse(any("Stufenzahl" in x["reason"] for x in d["verdikte"]))
             self.assertEqual(d["mit_force"]["rc"], 0)
-            self.assertTrue({"HW-COUNT"} <= {f["code"] for f in d["forced"]} <= {"HW-COUNT", "HW-UNCALIBRATED"}, d["forced"])
+            self.assertTrue({"HW-COUNT"} <= {f["code"] for f in d["forced"]} <= {"HW-COUNT", "HW-UNCALIBRATED", "D-BUDGET"}, d["forced"])
             # what the launcher still says about the profile's 3-card records stays a named blocker of HW-COUNT
             self.assertTrue(any(x["code"] == "RECORDS-NVEC" for x in d["verdikte"]))
             return

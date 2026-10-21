@@ -169,8 +169,9 @@ class TestProposal3090(unittest.TestCase):
         self.assertEqual(len(set(shares)), 1, shares)
         self.assertFalse([x for x in v["notes"] if "does not fit (margin" in x], v["notes"])
         self.assertTrue([x for x in v["notes"] if x.startswith("Draft (dense, TP-symmetric D")], v["notes"])
-        # the user reserve and the D extend trim are class values: the 3080 class value on every 3090 (borrowed, unverified)
-        self.assertEqual(la.get_flag("--user-reserve-mib"), ",".join(["1400"] * n))
+        # the D extend trim is a class value (the 3080 class value on every 3090, borrowed, unverified); the user reserve is NOT: it is the operator's
+        # headroom on the profile's own cards, a foreign card gets the launcher default 0 (review A3, user decision 2026-09-09)
+        self.assertEqual(la.get_flag("--user-reserve-mib"), ",".join(["0"] * n))
 
     def test_3x3090(self):
         self._check(_propose("27b", 3), 3)

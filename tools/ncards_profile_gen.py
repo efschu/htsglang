@@ -136,7 +136,15 @@ def _catalog(card: str) -> Dict[str, Any]:
     return cat[card]
 
 
-def proposal(basis: str, n: int, card: str = "rtx3090-24", checkpoints: str = CKPT, form: str = "flip", kv_tokens: int = 0):
+#: goal "Sitze gleichzeitig" (decode seats) per (basis, N): empty = the profile's own seats (the rig's 6).  A seat goal below the profile's would be a
+#: planner result for cards that cannot carry them; the launcher's seat table (H95, ``D-SITZE`` lines of the dry run) names the count a host carries.
+SEATS_GOAL: Dict[Tuple[str, int], int] = {}
+#: goal "max Token je Request" per (basis, N): 0 = the profile's own (262144).  Same meaning as ``--kv-tokens``; ``--max-kv-per-request`` is a CEILING per
+#: request, the KV pool is shared (a request at the ceiling must fit the pool; seats are independent).
+KV_GOAL: Dict[Tuple[str, int], int] = {}
+
+
+def proposal(basis: str, n: int, card: str = "rtx3090-24", checkpoints: str = CKPT, form: str = "flip", kv_tokens: int = -1, seats: int = -1):
     """``(basis LaunchInput, propose() result)`` for ``n`` x ``card``."""
     if TREE + "/python" not in sys.path:
         sys.path.insert(0, TREE + "/python")
@@ -156,7 +164,11 @@ def proposal(basis: str, n: int, card: str = "rtx3090-24", checkpoints: str = CK
     draft = MP.estimate_draft(os.path.join(tmp, draft_dir))
     li = O.profile_launch_input(os.path.join(PROFILES, env_file))
     rates = {"RTX 5090": 203.42, "RTX 3080 20GB": 50.97}        # the rig's measured GEMM rates (an input, as the planner tests)
+    kv_tokens = KV_GOAL.get((basis, n), 0) if kv_tokens < 0 else kv_tokens
     goals = {"kv_tokens": int(kv_tokens)} if kv_tokens else {}
+    seats = SEATS_GOAL.get((basis, n), 0) if seats < 0 else seats
+    if seats:
+        goals["seats"] = int(seats)
     v = P.propose([_catalog(card)] * n, mp["profile"], form, goals, basis=li, draft=draft, rates=rates)
     return li, v
 
@@ -167,15 +179,17 @@ def proposal(basis: str, n: int, card: str = "rtx3090-24", checkpoints: str = CK
 KV_WORDS = ("--max-total-tokens", "--context-length", "--max-kv-per-request")
 
 
-def block(basis: str, n: int, card: str = "rtx3090-24", checkpoints: str = CKPT, kv_tokens: int = 0) -> str:
-    li, v = proposal(basis, n, card, checkpoints, kv_tokens=kv_tokens)
+def block(basis: str, n: int, card: str = "rtx3090-24", checkpoints: str = CKPT, kv_tokens: int = -1, seats: int = -1) -> str:
+    kv_tokens = KV_GOAL.get((basis, n), 0) if kv_tokens < 0 else kv_tokens
+    seats = SEATS_GOAL.get((basis, n), 0) if seats < 0 else seats
+    li, v = proposal(basis, n, card, checkpoints, kv_tokens=kv_tokens, seats=seats)
     lines = diff_lines(li.argv, li.env, v["argv"], v["env"])
     if kv_tokens:
         lines = [x for x in lines if not x.startswith("_p3090_set --max-kv-per-request")]
         lines.append("_p3090_set --max-kv-per-request %d" % kv_tokens)
         for g in ("p", "d"):
             lines += ["_p3090_extra %s %s %d" % (g, w, kv_tokens) for w in KV_WORDS]
-    kvarg = (" --kv-tokens %d" % kv_tokens) if kv_tokens else ""
+    kvarg = ((" --kv-tokens %d" % kv_tokens) if kv_tokens else "") + ((" (goal seats %d)" % seats) if seats else "")
     head = ["%s: basis=%s n=%d card=%s%s -- python tools/ncards_profile_gen.py --basis %s --n %d --card %s%s" % (BEGIN, basis, n, card, kvarg, basis, n, card, kvarg),
             "# Planner outputs (pdflip/propose.py stage A, flip form), NOT measurements: every line below is HOCHRECHNUNG. Do not edit by hand;",
             "# regenerate. Unverified inputs of this proposal (first boot = measurement, FLLIPER_FORCE=1):"]
@@ -195,10 +209,7 @@ NF_TEMPLATE = """# shellcheck shell=bash
 # Vorschlags stehen als Kommentar im Block.
 # STATUS: nie auf einer 3090 gebootet. Launcher-Trockenlauf auf einem NVML-Replay von {n} x 3090: ok_with_force (HW-UNCALIBRATED /
 # HW-BORROWED{count}); die Rekorde des Profils nextflash sind auf dem Rig gemessen und werden vom Arch-Zwilling 3080 GEBORGT.
-# N = 3 (bekannter Defekt, nicht verdeckt): das D-Budget des Launchers (W122/W130/D-EIGENTUM) verweigert die Planer-Verteilung, auch mit
-# --force -- "groesste tragbare Fraction je Rang: keine, 0.553, 0.566"; der Planer-Regel fuer Form A fehlt dort ~5 GB je Rang. N = 2 und N = 4
-# bestehen dieselbe Pruefung. Siehe /spinning/gpu-arb/deskq/done/planer-ncards-1021.md.
-# ERSTER START: FLLIPER_FORCE=1 (der erste Boot ist die Messung); vorher card_rate_pass --run. Host-Seite (Experten-Store im tmpfs, MEMAVAIL,
+{dbudget_note}# ERSTER START: FLLIPER_FORCE=1 (der erste Boot ist die Messung); vorher card_rate_pass --run. Host-Seite (Experten-Store im tmpfs, MEMAVAIL,
 # SHM) haengt nicht an N und bleibt wie nf.env: der Store traegt alle Experten, die Karten halten nur den residenten Anteil.
 # shellcheck source=/dev/null
 source "$(dirname "${{BASH_SOURCE[0]}}")/nf.env"
@@ -218,20 +229,37 @@ profile_form_env() {{
 """
 
 
-#: PROFILE_STATUS of the generated NF profiles: the planner's N = 3 ownership (89/212/211 experts, resident 0.49/0.79/0.79) is REFUSED by the launcher's own
-#: D budget check (W122 / W130 / D-EIGENTUM, forced past as D-BUDGET): "largest bearable fraction per rank: none, 0.553, 0.566" -- the planner's Form A rule
-#: is ~5 GB per rank too optimistic for N = 3 identical cards (N = 2 and N = 4 pass the same check).  Not bootable until planner and launcher agree.
-NF_STATUS = {0: ("hochrechnung", "Planer-Rechnung, keine Messung auf 3090; Abnahme erst nach Metall"),
-             3: ("blockiert-d-budget", "Launcher-D-Budget (W122/W130) verweigert die Planer-Verteilung auch mit --force (D-BUDGET): nicht startbar, siehe Kopf")}
+#: PROFILE_STATUS of the generated NF profiles (review 1021 A1).  Two checks of the launcher's D side matter: (1) the D residency balance FRACTION-SOLVE D
+#: (W122 / W130): it did not run at all for N != 3 (the 3-rank reference did not fit) and the planner counted resident rows only (``scratch_rows=0``) and kept the
+#: 5090's host scratch 100 on a 24 GB card; both fixed, every rank of every N now PASSES; (2) D-EIGENTUM (#239 S3f), the launcher's own ownership / KV token-cut
+#: solve: it finds a bearable form on N = 3, and none on N = 2 and N = 4 (forced past as D-BUDGET).  So nf-3x3090 is bootable (HOCHRECHNUNG), nf-2x3090 and
+#: nf-4x3090 stay ``blockiert-d-budget`` -- named, pinned by the dry-run golden (``D-BUDGET`` forced exactly there).
+NF_STATUS = {0: ("blockiert-d-budget", "Launcher-D-EIGENTUM (#239 S3f) findet keine tragbare Form (D-BUDGET, auch mit --force nur benannt durchgelassen): nicht startbar, siehe Kopf"),
+             3: ("hochrechnung", "Planer-Rechnung, keine Messung auf 3090; Abnahme erst nach Metall")}
+
+_DBUDGET_COMMON = (
+    "# D-BUDGET (Review 1021 A1): der D-Rechenweg des Launchers (FRACTION-SOLVE D, W122/W130) LAEUFT jetzt auf jeder Rangzahl -- fuer N != 3 mit der 3-Rang-Referenz fnFL2\n"
+    "# nach Rolle (Host / mittlerer / letzter Worker) auf N Raenge genommen, im Log benannt (\"BORROWED BY RANK ROLE\", UNMEASURED bei dieser Rangzahl); vorher entfiel die\n"
+    "# Pruefung bei N = 2 / 4 stumm. Der Planer rechnet die residente Fraction mit min(R + S, E) Zeilen (residente + Scratch-Zeilen) gegen das Rangbudget (vorher nur R),\n"
+    "# leitet den Host-Scratch aus dem Budget der Karte ab (nicht der 5090-Rollenwert 100 = 11,6 GB Zeilen auf 24 GB) und bucht die Host-Differenz zu den Rollen-Rekorden\n"
+    "# des Launchers als benannten Posten (propose_rules.launcher_host_gap_mib). Ergebnis im Trockenlauf: W122/W130 PASST auf jedem Rang jeder Rangzahl.\n")
+_DBUDGET_N = {
+    3: "# N = 3: auch D-EIGENTUM (#239 S3f, Eigentums-/KV-Token-Schnitt-Loeser) findet eine tragbare Form -- kein D-BUDGET, das Profil ist startbar (Hochrechnung).\n",
+    "other": ("# D-EIGENTUM (#239 S3f, der Eigentums-/KV-Token-Schnitt-Loeser des Launchers) findet auf N = {n} KEINE tragbare Form (\"keine mit Kante auf jedem Rang und ohne\n"
+              "# Mehr-Fehlgriffe eines Workers gegen Form A\", der Grossteil der Kandidaten an den harten Grenzen rejected: Sitze 6, Wellen 2, Token-Stufen): D-BUDGET, auch mit\n"
+              "# --force nur benannt durchgelassen. Geprueft ohne Wirkung: KV-Decke 131072 / 65536 und 5 Sitze auf N = 2. Ursache offen: der Planer (Form A) haelt den KV ungeteilt auf\n"
+              "# dem Host, der Launcher schneidet ihn nach Tokens ueber die Raenge (#239). Siehe /spinning/gpu-arb/deskq/done/planer-ncards-1021.md, Abschnitt 12.\n"),
+}
 
 
-def render_profile(basis: str, n: int, card: str = "rtx3090-24", checkpoints: str = CKPT, kv_tokens: int = 0) -> str:
+def render_profile(basis: str, n: int, card: str = "rtx3090-24", checkpoints: str = CKPT, kv_tokens: int = -1) -> str:
     """The whole ``<basis>-<n>x3090.env`` text (NF only: the 27B profiles of this family are hand-written rules, see ``_p3090_apply``)."""
     if basis != "nf":
         raise SystemExit("render_profile: only the NF profiles are generated (27B: _3090_common.sh _p3090_apply)")
     status, note = NF_STATUS.get(n, NF_STATUS[0])
-    return NF_TEMPLATE.format(n=n, count=", HW-COUNT" if n != 3 else "", inv=",".join(["RTX3090"] * n), status=status, status_note=note,
-                              block=block(basis, n, card, checkpoints, kv_tokens))
+    dnote = _DBUDGET_COMMON + (_DBUDGET_N[3] if n == 3 else _DBUDGET_N["other"].format(n=n))
+    return NF_TEMPLATE.format(n=n, count=", HW-COUNT, D-BUDGET" if n != 3 else "", inv=",".join(["RTX3090"] * n), status=status, status_note=note,
+                              dbudget_note=dnote, block=block(basis, n, card, checkpoints, kv_tokens))
 
 
 def extract(text: str) -> str:
@@ -248,7 +276,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--checkpoints", default=CKPT)
     ap.add_argument("--check", help="profile file whose generated block must equal the regenerated one (exit 1 on drift)")
     ap.add_argument("--write", help="write the whole profile file (NF) to this path")
-    ap.add_argument("--kv-tokens", type=int, default=0, help="goal: the per-request KV ceiling (0 = the profile's 262144)")
+    ap.add_argument("--kv-tokens", type=int, default=-1, help="goal: the per-request KV ceiling (0 = the profile's 262144)")
     a = ap.parse_args(argv)
     if a.write:
         with open(a.write, "w", encoding="utf-8") as fh:

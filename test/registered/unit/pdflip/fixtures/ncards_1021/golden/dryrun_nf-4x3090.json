@@ -61,9 +61,36 @@
    21576
   ]
  ],
+ "d_check": {
+  "borrowed_by_role": true,
+  "entfaellt": false,
+  "ranks": [
+   {
+    "R": 37,
+    "scratch": 48,
+    "verdict": "PASST"
+   },
+   {
+    "R": 157,
+    "scratch": 48,
+    "verdict": "PASST"
+   },
+   {
+    "R": 157,
+    "scratch": 48,
+    "verdict": "PASST"
+   },
+   {
+    "R": 157,
+    "scratch": 48,
+    "verdict": "PASST"
+   }
+  ]
+ },
  "exc_head": "",
  "exc_type": null,
  "forced": [
+  "D-BUDGET",
   "HW-BORROWED",
   "HW-COUNT",
   "HW-UNCALIBRATED"
