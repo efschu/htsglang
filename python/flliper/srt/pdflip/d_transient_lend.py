@@ -113,6 +113,13 @@ growth, the class maximum, ratchet up) and the short price is ``max(floor, 300 +
 measured cost)``; a class without a reading keeps the old price (TP0: the S78 sum). The measured term
 only ever RAISES the max price of a measured-rate rank (TP1/TP2); on a start-rate rank it replaces the
 sum, which covered the fixed part the start rate does not see -- the measurement contains that fixed part.
+What that means at the peak (review A4, 21.10.): a TP0 short extend started at the price ends at >= price -
+class max (<= 64 rows: 767 - 449 = 318 MiB) -- on the 300 HALT line like a BIG chunk under ``rows_cap``, not
+like a TP1/TP2 short extend (700 - <= 16 = >= 684 MiB there); the 767 corridor law is crossed during every
+TP0 short-extend peak by planner decision. The class reading re-bases the allocator peak at the extend's open
+(A1: an inherited decode peak never masks the extend; without a reset the inherited peak is the bound).
+round_start prices the PENDING rows, ``on_batch`` the BUILT extend (often far wider: pending 5, built 1285) --
+the built price is the guard, a return can move from round_start to on_batch (review A3).
 Amount rank-local like every lend amount; no verdict reads it. ``FLLIPER_PDFLIP_D_LEND_MEASURED_PRICE``
 (default ON); off = the old price byte for byte.
 """

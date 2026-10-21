@@ -255,7 +255,9 @@ def test_the_reading_is_the_target_cost_plus_the_draft_growth_and_ratchets_up():
         assert extend_trim.lend_cost_mib(65) is None
 
 
-def test_the_tail_closes_once_and_a_peak_the_extend_did_not_raise_is_not_its_cost():
+def test_the_tail_closes_once_and_an_inherited_peak_is_the_bound_never_a_measured_0():
+    """A1 (review 21.10.): on a backend without a peak reset the open cannot re-base the counter; an extend that
+    does not raise the inherited peak (500 MiB over the start allocation) books that peak as its bound, not 0."""
     with envs.FLLIPER_PDFLIP_D_LEND_FLOOR_MIB.override(FLOORS):
         runner = types.SimpleNamespace(tp_rank=0)
         worker = types.SimpleNamespace(tp_rank=0, model_runner=runner)
@@ -264,9 +266,95 @@ def test_the_tail_closes_once_and_a_peak_the_extend_did_not_raise_is_not_its_cos
         extend_trim.measure_close(runner, _fb(5), cuda, rank=0)           # nothing raised, nothing grew
         assert extend_trim._CACHE["lend_cost_tail"] is not None
         extend_trim.lend_cost_settle(0, cuda)
-        assert extend_trim.lend_cost_mib(5) == 0.0
+        assert extend_trim.lend_cost_mib(5) == 500.0
         assert extend_trim.lend_cost_settle(0, cuda) is None              # closed once
         assert extend_trim._CACHE["lend_cost_tail"] is None
+
+
+class ResettingCuda(Cuda):
+    """A1/B1: a backend with ``reset_peak_memory_stats`` (the peak counter restarts at the allocation now)."""
+
+    def reset_peak_memory_stats(self):
+        self.peak = self.alloc
+
+
+def _vpw_state():
+    from flliper.srt.model_executor import vram_peak_window as vpw
+
+    return vpw
+
+
+def test_a1_the_open_closes_the_round_window_and_the_extend_reads_its_own_peak(caplog):
+    """A1 + B1: decode rounds left the counter 400 MiB over the allocation; the extend itself peaks at 380.
+    The open closes and prints the round window (decode only), re-bases, and the extend reads 380 -- not 0
+    (masked), not 400 (the decode peak). The forward-end chunk record then holds the extend's own transient."""
+    vpw = _vpw_state()
+    saved = dict(vpw._STATE)
+    try:
+        with envs.FLLIPER_PDFLIP_D_LEND_FLOOR_MIB.override(FLOORS), envs.FLLIPER_PDFLIP_VRAM_PEAK.override(True), \
+                mock.patch("flliper.srt.pdflip.vram_actual.on_window", lambda *a, **k: False), \
+                caplog.at_level(logging.INFO):
+            vpw._STATE.update(t0=1.0, start_alloc=30000 * MIB, free_start=2000 * MIB, rounds=12,
+                              retries0=0, ooms0=0, seats=1)
+            runner = types.SimpleNamespace(tp_rank=0)
+            worker = types.SimpleNamespace(tp_rank=0, model_runner=runner)
+            cuda = ResettingCuda(peak=30400, alloc=30000, reserved=31000)
+            extend_trim.measure_open(worker, _fb(1100), cuda)
+            rounds = [r.getMessage() for r in caplog.records if "phase=round" in r.getMessage()]
+            assert len(rounds) == 1 and "n=12" in rounds[0] and "transient_mib=400" in rounds[0]
+            assert vpw._STATE["rounds"] == 0 and cuda.peak == 30000      # re-based at the extend's start
+            cuda.peak = 30380                                             # the extend's own peak
+            extend_trim.measure_close(runner, _fb(1100), cuda, rank=0)
+            line = vpw.on_forward_end(types.SimpleNamespace(tp_rank=0), types.SimpleNamespace(
+                forward_mode=types.SimpleNamespace(is_extend=lambda: True, is_decode=lambda: False,
+                                                   is_target_verify=lambda: False),
+                input_ids=types.SimpleNamespace(shape=(1100,)), batch_size=1), cuda)
+            extend_trim.lend_cost_settle(0, cuda)
+        assert extend_trim.lend_cost_mib(1100) == 380.0
+        assert line is not None and "phase=chunk rows=1100" in line and "transient_mib=380" in line
+    finally:
+        vpw._STATE.clear()
+        vpw._STATE.update(saved)
+
+
+def test_a1_without_open_rounds_the_open_folds_and_rebases_and_keeps_the_cumulative_peak():
+    vpw = _vpw_state()
+    saved = dict(vpw._STATE)
+    try:
+        with envs.FLLIPER_PDFLIP_D_LEND_FLOOR_MIB.override(FLOORS), envs.FLLIPER_PDFLIP_VRAM_PEAK.override(False):
+            vpw._STATE.update(rounds=0, shadow_alloc=0)
+            runner = types.SimpleNamespace(tp_rank=0)
+            worker = types.SimpleNamespace(tp_rank=0, model_runner=runner)
+            cuda = ResettingCuda(peak=30400, alloc=30000, reserved=31000)
+            extend_trim.measure_open(worker, _fb(5), cuda)
+            assert cuda.peak == 30000 and vpw._STATE["shadow_alloc"] == 30400 * MIB   # "since the pools" kept
+            extend_trim.measure_close(runner, _fb(5), cuda, rank=0)       # the extend allocated nothing above
+            extend_trim.lend_cost_settle(0, cuda)
+        assert extend_trim.lend_cost_mib(5) == 0.0                        # a READ 0, not a masked one
+    finally:
+        vpw._STATE.clear()
+        vpw._STATE.update(saved)
+
+
+def test_a1_the_q694b_rate_still_compares_against_the_raw_peak():
+    """The re-base must not change Q-694b: its transient counts only when the extend beat the RAW inherited peak."""
+    vpw = _vpw_state()
+    saved = dict(vpw._STATE)
+    try:
+        with envs.FLLIPER_PDFLIP_D_LEND_FLOOR_MIB.override(FLOORS), envs.FLLIPER_PDFLIP_VRAM_PEAK.override(False):
+            vpw._STATE.update(rounds=0)
+            runner = types.SimpleNamespace(tp_rank=1)
+            worker = types.SimpleNamespace(tp_rank=1, model_runner=runner)
+            cuda = ResettingCuda(peak=32000, alloc=30000, reserved=31000)    # raw inherited peak 2000 over
+            extend_trim.measure_open(worker, _fb(4096), cuda)
+            cuda.peak, cuda.reserved = 31500, 31000 + 1024                   # extend 1500 < raw 2000
+            line = extend_trim.measure_close(runner, _fb(4096), cuda, rank=1)
+            assert line is not None and "transient_mib=0 reserved_growth_mib=1024" in line   # as before the fix
+            extend_trim.lend_cost_settle(1, cuda)
+            assert extend_trim.lend_cost_mib(4096) == 1500.0                 # LEND-COST reads the extend's own
+    finally:
+        vpw._STATE.clear()
+        vpw._STATE.update(saved)
 
 
 def test_round_start_closes_the_tail_before_any_lend_move():

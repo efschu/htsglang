@@ -462,8 +462,19 @@ def measure_open(worker, batch, cuda=None) -> None:
         if bool(cuda.is_current_stream_capturing()):
             return
         pa, a, r = _alloc_stats(cuda)
+        # LEND-COST A1 (review 21.10.): the counter still holds the decode rounds since the last PDFLIP-VRAM-PEAK
+        # record (TP0 rc30: up to 411 MiB) -- an extend that stays under it would read transient 0. Re-base it
+        # at the extend's start (``pa_lend`` = the allocation now); where that is impossible the inherited peak
+        # stays the BOUND. Q-694b keeps comparing against the raw ``pa`` (its rate byte for byte).
+        pa_lend = pa
+        rank = getattr(worker, "tp_rank", None)
+        if lend_cost_armed(rank):
+            from flliper.srt.model_executor import vram_peak_window
+
+            if vram_peak_window.open_extend_window(cuda, int(rank or 0)):
+                pa_lend = a
         runner = getattr(worker, "model_runner", None)
-        _CACHE["pending"] = (None if runner is None else id(runner), pa, a, r)
+        _CACHE["pending"] = (None if runner is None else id(runner), pa, a, r, pa_lend)
     except Exception as exc:  # noqa: BLE001
         _CACHE["pending"] = None
         logger.debug("%s open skipped: %s", RATE_MARKER, exc)
@@ -485,7 +496,8 @@ def measure_close(runner, forward_batch, cuda, rank: Optional[int] = None) -> Op
             return None
         if getattr(runner, "is_draft_worker", False) or getattr(runner, "is_draft_model_runner", False):
             return None
-        owner, pa0, a0, r0 = pending
+        owner, pa0, a0, r0 = pending[:4]
+        pa0_lend = pending[4] if len(pending) > 4 else pa0
         if owner is not None and owner != id(runner):
             return None
         _CACHE["pending"] = None
@@ -503,8 +515,11 @@ def measure_close(runner, forward_batch, cuda, rank: Optional[int] = None) -> Op
         growth = max(0, r1 - r0)
         cost = max(transient, growth)
         if cost_on and rows > 0:
+            # A1 (review 21.10.): a peak the extend did not raise is not a measured 0 -- its transient is unknown
+            # up to the inherited peak, so that bound is booked (0 only where the open re-based the counter)
+            lend_transient = (pa1 - a0) if pa1 > pa0_lend else max(0, pa0_lend - a0)
             # the draft extend that follows grows ``reserved`` on top: the tail closes at the next scheduler pass
-            _CACHE["lend_cost_tail"] = (rows, int(transient), int(growth), int(r1))
+            _CACHE["lend_cost_tail"] = (rows, int(lend_transient), int(growth), int(r1))
         if not rate_on or rows < GROWTH_PER_ROW_MIN_ROWS:
             return None
         if cost <= 0:
@@ -545,6 +560,11 @@ def measure_close(runner, forward_batch, cuda, rank: Optional[int] = None) -> Op
 # end hook, BEFORE PDFLIP-VRAM-PEAK re-bases the peak counter):
 #
 #     forward = max(peak_allocated - allocated_at_start, reserved_after - reserved_at_start)
+#
+# A1 (review 21.10.): the open re-bases the allocator peak counter first
+# (``vram_peak_window.open_extend_window``: the open PDFLIP round window is closed and printed, else the
+# counter is folded into the shadow), so ``peak_allocated`` is the extend's own; on a backend without a
+# peak reset an extend that does not raise the inherited peak books that peak as its BOUND, never 0.
 #
 # plus the reserved growth of the draft extend that follows inside the same batch (rc12d / review A
 # method: the draft extend's reserved growth after it), closed at the next scheduler pass before any

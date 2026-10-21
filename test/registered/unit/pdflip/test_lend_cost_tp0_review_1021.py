@@ -13,7 +13,7 @@ Metal (NF rc30 D ``boot_weg2_..._1d822bd150_1021_063252.D.log``, counted by the 
   author pins that on purpose (``test_the_tail_closes_once_and_a_peak_the_extend_did_not_raise_is_not_its_cost``).
   Its true transient is then UNKNOWN in [0, pa0 - a0]; recording 0 (or the reserved growth alone, which the
   allocator cache can absorb -- 953 MiB cache left after the trim at 12:05:03) as the class cost is a lower
-  bound sold as a measurement (finding A1, xfail strict below).
+  bound sold as a measurement (finding A1; fixed by the author 21.10., the test below is green, no marker).
 * On THIS metal the hole is covered by TP0's floor: a masked transient is <= 411 MiB, the floor prices
   ``300 + cost`` up to 467 MiB -> the TP0 price stays 767 (56 MiB margin). On a measured-rate rank (TP1/TP2)
   the term only raises, so a masked reading is the KEEP-PRICE baseline, no new risk.
@@ -73,10 +73,6 @@ def _masked_extend(rows, decode_peak_mib, true_transient_mib, growth_mib=0, cach
 
 # ---- A1: a masked transient is recorded as a measured 0 ---------------------------------------------------
 
-@pytest.mark.xfail(strict=True, reason="review A1 (MITTEL): an extend that did not raise the inherited peak is "
-                   "recorded as cost 0 / growth only -- its transient is unknown up to pa0 - a0; record the "
-                   "bound pa0 - a0 (or no reading) instead, or close the open PDFLIP round window at the "
-                   "extend's open so pa0 == a0")
 def test_a1_a_masked_transient_is_never_recorded_below_its_bound():
     with envs.FLLIPER_PDFLIP_D_LEND_FLOOR_MIB.override(FLOORS):
         _masked_extend(1100, decode_peak_mib=400, true_transient_mib=380)
@@ -84,16 +80,16 @@ def test_a1_a_masked_transient_is_never_recorded_below_its_bound():
     assert cost is None or cost >= 400
 
 
-def test_a1_today_the_masked_reading_prices_a_2048_class_extend_from_the_chunk_model_alone():
-    """What A1 costs where the floor does not cover it: a masked class-2048 reading (growth 0) prices a 1100-row
-    extend at ``300 + 0.5871 x 1100`` = 946 MiB -- the start rate review A measured as too low on TP0
-    (0.6-0.84 MiB/row) -- instead of the old sum 1713. Pins today's behaviour; A1 lifts it."""
+def test_a1_the_masked_reading_books_its_bound_and_prices_a_2048_class_extend_by_it():
+    """After the A1 fix (author 21.10.): the masked class-2048 reading books the inherited peak (400 MiB) as its
+    bound -- an upper bound of what that extend cost (true 380) -- and the 1100-row price is
+    ``max(767, 300 + 0.5871 x 1100 = 946, 300 + 400)``; before the fix it booked 0. (Review doc test, re-pinned.)"""
     with envs.FLLIPER_PDFLIP_D_LEND_FLOOR_MIB.override(FLOORS), \
             envs.FLLIPER_PDFLIP_EXTEND_GROWTH_PER_ROW_MIB.override(RATE):
         assert dtl.short_extend_need_mib(0, 1100) == pytest.approx(767 + 300 + 0.5871 * 1100)
         _masked_extend(1100, decode_peak_mib=400, true_transient_mib=380)
-        assert extend_trim.lend_cost_mib(1100) == 0.0
-        assert dtl.short_extend_need_mib(0, 1100) == pytest.approx(300 + 0.5871 * 1100)
+        assert extend_trim.lend_cost_mib(1100) == 400.0
+        assert dtl.short_extend_need_mib(0, 1100) == pytest.approx(max(767, 300 + 0.5871 * 1100, 700))
 
 
 def test_a1_on_the_metal_the_tp0_floor_covers_every_maskable_transient():
