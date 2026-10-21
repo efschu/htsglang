@@ -3572,7 +3572,8 @@ async def _p_drain_pool(queue, limit: int, one, on_done, may_dispatch,
                         max_dispatch: int = 0, cost=None, budget: int = 0,
                         stats: Optional[Dict[str, int]] = None,
                         extra=None, poll_s: float = 0.0, cap_exempt=None, lane_held=None,
-                        lane_take=None, lane_take_wait=None, pick=None, on_pool_hold=None) -> int:
+                        lane_take=None, lane_take_wait=None, pick=None, on_pool_hold=None,
+                        shared=None) -> int:
     """#1459c: keep up to ``limit`` leg-1 calls in flight, refilling from
     ``queue`` (a deque; new arrivals appended while draining are taken too)
     the moment ONE finishes.  ``on_done(p)`` runs in COMPLETION order, and
@@ -3637,8 +3638,16 @@ async def _p_drain_pool(queue, limit: int, one, on_done, may_dispatch,
     it waits for P's device room, not for P's compute -- so its stored prefix can be read L3 -> L2 meanwhile
     (pdflip/l2_read_ahead.py). Called on every hold (the callee keeps its own once-per-request mark); an error in
     it never stops the drain. ``None`` = off.
+
+    P-POOL-SHARED (rc29 pphase 21.10., ``shared``): ``shared(item, in_flight_items)`` returns ``(credit, giver)`` -- the
+    tokens of ``item``'s cost that P's pool already holds for the in-flight ``giver`` (its loaded prefix is ``item``'s
+    prefix, :func:`phase_policy.p_continuation_credit`). The overlap plan then books ``cost - credit``. The credit lives
+    only while the giver is in flight: when the giver finishes first, the taker's booking goes back to its full cost
+    (the shared nodes are the taker's alone from then on). ``stats`` then also counts ``shared_credit`` (tokens) and
+    ``shared_dispatched``. ``None`` = off (full cost, as before).
     """
     inflight: Dict[Any, int] = {}
+    credit_of: Dict[Any, Tuple[Any, int]] = {}  # P-POOL-SHARED: taker task -> (giver task, credited tokens)
     inflight_tokens = 0
     dispatched_total = 0
     # Dispatch sequence per task. `asyncio.wait` returns a SET, and a P batch
@@ -3652,7 +3661,7 @@ async def _p_drain_pool(queue, limit: int, one, on_done, may_dispatch,
     rounds = 0
     if stats is not None:
         for k in ("dispatched", "peak_n", "peak_tokens", "pool_holds", "overlap_dispatched",
-                  "short_rides"):
+                  "short_rides", "shared_credit", "shared_dispatched"):
             stats.setdefault(k, 0)
 
     def _exempt_index() -> Optional[int]:
@@ -3704,6 +3713,18 @@ async def _p_drain_pool(queue, limit: int, one, on_done, may_dispatch,
                     break
                 ride = True
             c = int(cost(queue[idx])) if (cost is not None and budget > 0) else 0
+            giver_t, cred = None, 0
+            if shared is not None and c > 0 and items:
+                try:
+                    _cr, _gv = shared(queue[idx], list(items.values()))
+                    _cr = max(0, min(int(_cr or 0), c))
+                    if _cr > 0 and _gv is not None:
+                        giver_t = next((t_ for t_, it_ in items.items() if it_ is _gv), None)
+                        if giver_t is not None:
+                            cred = _cr
+                except Exception:  # noqa: BLE001 - a credit error never stops the drain: the full cost stands
+                    giver_t, cred = None, 0
+            c -= cred
             if not phase_policy.p_overlap_admits(inflight_tokens - _th, len(inflight) - _nh, c, budget):
                 if stats is not None:
                     stats["pool_holds"] += 1
@@ -3724,6 +3745,11 @@ async def _p_drain_pool(queue, limit: int, one, on_done, may_dispatch,
             t = asyncio.ensure_future(one(item))
             inflight[t] = c
             items[t] = item
+            if cred > 0:
+                credit_of[t] = (giver_t, cred)
+                if stats is not None:
+                    stats["shared_credit"] += cred
+                    stats["shared_dispatched"] += 1
             seq[t] = dispatched_total
             inflight_tokens += c
             dispatched_total += 1
@@ -3777,6 +3803,13 @@ async def _p_drain_pool(queue, limit: int, one, on_done, may_dispatch,
                      else poll_s if (extra is not None and poll_s > 0 and queue) else None))
         for t in sorted(done, key=seq.__getitem__):
             inflight_tokens -= inflight.pop(t, 0)
+            credit_of.pop(t, None)
+            for _tk, (_gt, _cr) in list(credit_of.items()):
+                if _gt is t:   # P-POOL-SHARED: the giver left first -- the taker holds the shared nodes alone now
+                    del credit_of[_tk]
+                    if _tk in inflight:
+                        inflight[_tk] += _cr
+                        inflight_tokens += _cr
             seq.pop(t, None)
             items.pop(t, None)
             if t in taken and t.cancelled():
@@ -13315,6 +13348,40 @@ class Front:
             cache[key] = int(_st.common_prefix(ia, ib))
         return cache[key]
 
+    def _p_pool_shared(self, p: Any, others: Sequence[Any]) -> Tuple[int, Any]:
+        """P-POOL-SHARED (rc29 pphase 21.10.; SOLL R1a, R1u, R11): ``(credit, giver)`` for the P overlap plan -- the
+        largest loaded prefix of a leg in flight on P (``others``) that is ``p``'s own prefix
+        (:func:`phase_policy.p_continuation_credit` over the front token ids, :meth:`_set_common`, and the legs' priced
+        store depth, :meth:`_set_depth_of`). ``(0, None)`` when no in-flight leg's loaded prefix is ``p``'s prefix or the
+        ids are not kept (then the full cost stands). Metal rc27 _023225: pdflip-0-21 continued pdflip-0-17 (depth
+        147712) and was held 23.2 s for 149741 tokens of "P's device room" while P's pool usage read 0.17-0.43; the P
+        commit at 02:37:20-25 ran with queue 0 (COMMIT-WARTEN-P-OHNE-QUEUE). Never raises."""
+        try:
+            best, giver = 0, None
+            for q in others:
+                if q is p or getattr(q, "skip_leg1", False):
+                    continue
+                d = Front._set_depth_of(self, str(q.rid), q)
+                if d <= best:
+                    continue
+                cr = phase_policy.p_continuation_credit([(Front._set_common(self, str(p.rid), str(q.rid)), d)])
+                if cr > best:
+                    best, giver = cr, q
+            if best > 0:
+                self.counters["p_pool_shared_credit"] = self.counters.get("p_pool_shared_credit", 0) + 1
+                seen = self.__dict__.setdefault("_p_pool_shared_told", set())
+                if str(p.rid) not in seen:
+                    if len(seen) > 4096:
+                        seen.clear()
+                    seen.add(str(p.rid))
+                    full = phase_policy.p_request_cost(p.est_prompt, p.leg1_prompt_tokens, p.skip_leg1)
+                    logger.info("PDFLIP P-POOL-SHARED rid=%s giver=%s credit=%d cost=%d->%d epoch=%d -- the in-flight "
+                                "leg's loaded prefix is this leg's prefix: P's pool holds it once (SOLL R1a, R1u)",
+                                p.rid, giver.rid, best, full, max(0, full - best), self.epoch)
+            return best, giver
+        except Exception:  # noqa: BLE001 -- a credit never breaks the drain: the full cost stands
+            return 0, None
+
     def _set_discount(self, items: Sequence[Tuple[str, int, float, Any]]) -> Dict[str, int]:
         """H16V F1: ``items`` = ``(rid, uncached, t_arrive, pending-or-None)`` -> the set's per-member NEW tokens
         (``phase_policy.shared_prefix_discount``): what an earlier member of the same session already prefills is not
@@ -21142,6 +21209,9 @@ class Front:
                     # S53 L2-READ-AHEAD: the head the pool plan holds is read L3 -> L2 on P meanwhile
                     on_pool_hold=((lambda p: Front._maybe_l2_read_ahead(self, p))
                                   if _l2ra.enabled() else None),
+                    # P-POOL-SHARED (rc29 pphase 21.10.): a leg continuing an in-flight leg's loaded prefix books only
+                    # what lies beyond it (SOLL R1a: the flip takes every pending prefill; R1u: a shared prefix once)
+                    shared=(lambda p, others: Front._p_pool_shared(self, p, others)),
                     # FLIPCYCLE H5: the phase cap never strands a SHORT
                     # DOUBLE-FLIP 1015: nor a request that needs P (the park's own reader), switch-independent;
                     # SEAT-AT-HAND-OFF: no seat cap on this phase, so no seat condition on the exemption either
@@ -21176,6 +21246,11 @@ class Front:
                                 self.epoch, _phase_stats["overlap_dispatched"],
                                 _phase_stats["dispatched"], _phase_stats["peak_n"],
                                 self.p_concurrency + _ahead)
+                if _phase_stats.get("shared_dispatched"):
+                    logger.info("PDFLIP P-POOL-SHARED-PHASE epoch=%d shared_dispatched=%d shared_credit=%d dispatched=%d "
+                                "pool_tokens=%d (legs that continued an in-flight leg's loaded prefix, booked beyond it)",
+                                self.epoch, _phase_stats["shared_dispatched"], _phase_stats["shared_credit"],
+                                _phase_stats["dispatched"], _p_pool_budget)
                 if passes and (self.p_phase_max_requests or _p_pool_budget):
                     _cap_hit = phase_policy.phase_cap_reached(
                         _phase_stats["dispatched"], self.p_phase_max_requests)
