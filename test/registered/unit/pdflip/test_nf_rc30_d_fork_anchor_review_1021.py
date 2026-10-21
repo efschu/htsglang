@@ -167,10 +167,7 @@ def test_control_with_the_feature_off_every_rank_inserts_the_step_alike(group_d)
     assert hreq.cache_protected_len == wreq.cache_protected_len == I_LAST + 16
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "REVIEW FINDING F1 (D-FORK-ANCHOR 33cf26403c): TP0's fork slot (pinned by the request) is the slot the step's "
-    "donation needed -- TP0 alone returns 0 from prepare_for_caching_req and skips the chunk node every worker "
-    "inserts (R12 node keys / cache_protected_len split). Remove this marker with the fix."))
+# REVIEW FINDING F1 fixed (A1, UnifiedRadixCache._d_fork_donation_room): the strict-xfail marker is removed.
 def test_a_full_pool_does_not_make_tp0_skip_a_step_node_the_workers_insert(group_d):
     host, hreq, hplans = _starved_step(group_d, worker=False)
     wk, wreq, wplans = _starved_step(group_d, worker=True)

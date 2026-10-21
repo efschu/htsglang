@@ -3464,6 +3464,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if d_mode:
                 _ta.note_d_set(req, kind, t, "skipped", why, int(req.cache_protected_len or 0))
             return
+        if state_ok and d_mode and slot is not None and not UnifiedRadixCache._d_fork_donation_room(self):
+            # D-FORK-ANCHOR review A1/F1 (21.10.): the fork slot is TP0's alone (a split-only worker draws none) and
+            # the request's lock pins it from here until the step's own insert moves the lock on. If the pool has
+            # neither a free slot nor an evictable state left for THAT step's donation
+            # (MambaComponent.prepare_for_caching_req -> _alloc_mamba_slot), TP0 alone would skip the step's node
+            # every worker inserts (R12 keys / cache_protected_len split). The fork state yields instead: split-only,
+            # its slot back -- TP0 then has free + evictable >= every worker for the donation. The node at t is put
+            # in either way, so the structure stays the group's.
+            state_ok, why = False, "no_donation_room"
         if not state_ok:
             # D split-only: the slot (if any) holds no written state -- it goes back before the insert
             self._pdflip_turn_free(slot)
@@ -3525,7 +3534,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self._pdflip_turn_free(slot)
         if d_mode:
             try:
-                setattr(new_last_node, _ta.D_FORK_KIND_ATTR, kind)
+                # F7: (kind, end depth) -- the READ witness names a resume only at exactly this depth
+                setattr(new_last_node, _ta.D_FORK_KIND_ATTR, (kind, int(t)))
             except Exception:  # noqa: BLE001 - a witness mark only
                 pass
             _ta.note_d_set(req, kind, t, "taken" if taken else ("split_only" if not state_ok else "exists"),
@@ -3539,6 +3549,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             req, t=t, prefix_len=len(new_indices), taken=taken,
             prompt=len(req.origin_input_ids), step=(step_start, step_end), kind=kind,
         )
+
+    def _d_fork_donation_room(self) -> bool:
+        """D-FORK-ANCHOR A1: may a fork state stay pinned by the request through the step's own donation? True when the
+        mamba pool still has a free slot or an evictable (unlocked) state for it -- the two sources
+        ``MambaComponent._alloc_mamba_slot`` draws from (alloc, then ``evict(mamba_num=1)``). Host bookkeeping only."""
+        alloc = getattr(self.req_to_token_pool, "mamba_allocator", None)
+        if alloc is None:
+            return True
+        free = int(alloc.available_size())
+        evictable = int((getattr(self, "component_evictable_size_", None) or {}).get(ComponentType.MAMBA, 0) or 0)
+        return free + evictable >= 1
 
     def _pdflip_turn_free(self, slot) -> None:
         """Give an unused turn slot back (through the component's free, so

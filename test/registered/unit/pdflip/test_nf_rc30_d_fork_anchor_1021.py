@@ -336,3 +336,73 @@ def test_a_classic_rank_holds_its_state_and_the_rank_check_never_swallows_an_err
     monkeypatch.setattr(m, "this_rank_follows", _undecidable)
     with pytest.raises(m.FormAFollowUndecidable):
         ta.d_split_only_rank()
+
+
+# -- review 21.10. (A1 / A4 / F6 / F7) --------------------------------------------------------------------------------
+
+REV = _load("_d_fork_review_for_feature", _HERE / "test_nf_rc30_d_fork_anchor_review_1021.py")
+
+
+def test_a1_mutant_without_the_donation_room_guard_splits_the_step_node(group_d):
+    """The danger direction of F1: without the guard TP0 keeps the fork state pinned on its last free slot, the step's
+    donation finds nothing and TP0 alone skips the chunk node the workers insert."""
+    from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+    group_d.setattr(UnifiedRadixCache, "_d_fork_donation_room", lambda self: True)
+    host, hreq, _ = REV._starved_step(group_d, worker=False)
+    wk, wreq, _ = REV._starved_step(group_d, worker=True)
+    assert _structure(host) != _structure(wk) or hreq.cache_protected_len != wreq.cache_protected_len
+
+
+def test_a1_the_starved_fork_yields_its_state_and_is_named(group_d, caplog):
+    caplog.set_level(logging.INFO, TA_LOG)
+    host, hreq, plans = REV._starved_step(group_d, worker=False)
+    assert any("state=split_only" in m and "why=no_donation_room" in m and "role=host" in m
+               for m in caplog.messages), caplog.messages
+    assert hreq.cache_protected_len == I_LAST + 16, "the step's node is in TP0's tree"
+
+
+def test_a1_with_room_the_fork_keeps_its_state(group_d):
+    _as_worker(group_d, False)
+    fx = TA0._fixture(False)
+    _d_prefill(fx)
+    assert TA0._claim(fx, NEXT) == (I_LAST, pytest.approx(TA0.S_TURN))
+
+
+def test_f6_an_unreadable_switch_stops_by_name(monkeypatch):
+    from flliper.srt.environ import envs
+    from flliper.srt.pdflip import turn_anchor as ta
+
+    def _boom():
+        raise RuntimeError("env unreadable")
+
+    monkeypatch.setattr(envs.FLLIPER_PDFLIP_D_FORK_ANCHOR, "get", _boom)
+    with pytest.raises(RuntimeError):
+        ta.d_fork_anchor_on()
+
+
+def test_f7_the_read_witness_names_only_the_forks_own_depth(group_d, caplog):
+    from flliper.srt.mem_cache.unified_cache_components import mamba_component as mc
+    from flliper.srt.pdflip import turn_anchor as ta
+
+    caplog.set_level(logging.INFO, TA_LOG)
+    node = SimpleNamespace(component_data={ComponentType.MAMBA: SimpleNamespace(value=torch.tensor([3]),
+                                                                                host_value=None)})
+    setattr(node, ta.D_FORK_KIND_ATTR, ("turn", 128))
+    mc._obs_d_fork_read(SimpleNamespace(rid="r-other"), node, 64)
+    assert not any("D-FORK-ANCHOR READ" in m for m in caplog.messages)
+    mc._obs_d_fork_read(SimpleNamespace(rid="r-own"), node, 128)
+    assert any("D-FORK-ANCHOR READ" in m and "rid=r-own" in m and "kind=turn" in m for m in caplog.messages)
+
+
+def test_a4_an_anchor_short_on_a_fork_node_is_counted_apart(monkeypatch):
+    from flliper.srt.mem_cache import form_a_host_shadow as r12
+    from flliper.srt.pdflip import turn_anchor as ta
+
+    monkeypatch.setattr(r12, "_host_flags", lambda node: (True, False))     # KV host yes, anchor host no
+    fork = SimpleNamespace()
+    setattr(fork, ta.D_FORK_KIND_ATTR, ("turn", 64))
+    assert r12._d_fork_anchor_short(fork, 1, 1, 1) is True
+    assert r12._d_fork_anchor_short(SimpleNamespace(), 1, 1, 1) is False, "not a fork node: a real short"
+    monkeypatch.setattr(r12, "_host_flags", lambda node: (False, False))    # the KV host copy missing too
+    assert r12._d_fork_anchor_short(fork, 1, 1, 1) is False, "a missing KV host copy stays short"

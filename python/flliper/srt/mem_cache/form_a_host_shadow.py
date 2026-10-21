@@ -1413,7 +1413,7 @@ def apply(tree: Any, events: List, seq: int = 0) -> Dict[str, int]:
     r = role()
     cut = cut_role() is not None
     c = dict(transit=0, kv=0, anchor=0, deleted=0, short=0, missing=0,
-             pending=0, unreconcilable=0, noop=0, rebind=0, rebind_miss=0, spill=0)
+             pending=0, unreconcilable=0, noop=0, rebind=0, rebind_miss=0, spill=0, fork_short=0)
     for e in events:
         if e[0] == K21:
             _S.k21_inbox.append(e)  # K21 verdicts are a FIFO per key: never superseded
@@ -1523,6 +1523,8 @@ def apply(tree: Any, events: List, seq: int = 0) -> Dict[str, int]:
         if r != "worker":
             continue
         out = _reconcile(tree, node, exists, kv, m)
+        if out == "short" and _d_fork_anchor_short(node, exists, kv, m):
+            out = "fork_short"   # review A4: expected on a D fork anchor (the worker holds no state there)
         if out == "pending":
             _S.pending[(h, int(depth))] = e
         elif (not exists and out != "deleted" and (h, int(depth)) not in _S.k21_expect
@@ -1559,9 +1561,9 @@ def apply(tree: Any, events: List, seq: int = 0) -> Dict[str, int]:
         logger.info(
             "R12 HOST-VERDICT APPLIED seq=%d role=%s events=%d transit=%d kv_dropped=%d "
             "anchor_dropped=%d deleted=%d short=%d missing=%d pending=%d unreconcilable=%d "
-            "rebind=%d spill=%d (n=%d)",
+            "rebind=%d spill=%d fork_short=%d (n=%d)",
             seq, r, len(events), c["transit"], c["kv"], c["anchor"], c["deleted"], c["short"],
-            c["missing"], c["pending"], c["unreconcilable"], c["rebind"], c["spill"], n)
+            c["missing"], c["pending"], c["unreconcilable"], c["rebind"], c["spill"], c["fork_short"], n)
     if c["rebind_miss"] and _note("rebind_miss", 16):
         logger.warning("R12 CUT-REBIND-MISS %d node(s): TP0 rebound a complete page, this "
                        "worker's pool could not -- it keeps its own rows (same tree shape)",
@@ -1647,6 +1649,21 @@ def _rrstate_diverged(node: Any, h: Any, depth: Any, out: str, seq: int) -> None
         "R12 READ-ROOM-STATE-DIVERGED seq=%d node=%s depth=%s hash=%s out=%s (n=%d): TP0 released this node's KV "
         "host rows for a P read and this worker could not follow at once -- the ranks differ on its host copy "
         "until the verdict applies", int(seq), getattr(node, "id", "?"), depth, str(h)[:16], out, n)
+
+
+def _d_fork_anchor_short(node: Any, exists: int, kv: int, m: int) -> bool:
+    """Review A4 (D-FORK-ANCHOR, 21.10.): TP0 names an anchor host copy on a group-D FORK node, the worker has none --
+    by design (a Form A worker plans fork tracks split-only, its mamba bookkeeping does not mirror TP0's on fork
+    nodes). Counted apart as ``fork_short`` instead of ``short`` so the sharp monitor reads ``short`` for real
+    shortfalls only. Only the anchor may be short: a missing KV host copy stays ``short``."""
+    from flliper.srt.pdflip.turn_anchor import D_FORK_KIND_ATTR
+
+    if getattr(node, D_FORK_KIND_ATTR, None) is None:
+        return False
+    has_kv, has_m = _host_flags(node)
+    want_kv = bool(exists and kv)
+    want_m = bool(exists and m)
+    return want_m and not has_m and not (want_kv and not has_kv)
 
 
 def _reconcile(tree: Any, node: Any, exists: int, kv: int, m: int) -> str:

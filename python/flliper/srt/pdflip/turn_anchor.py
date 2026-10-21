@@ -144,13 +144,13 @@ def _group() -> str:
 
 
 def d_fork_anchor_on() -> bool:
-    """``FLLIPER_PDFLIP_D_FORK_ANCHOR`` (default ON): the fork tracks on group D."""
-    try:
-        from flliper.srt.environ import envs
+    """``FLLIPER_PDFLIP_D_FORK_ANCHOR`` (default ON): the fork tracks on group D.
 
-        return bool(envs.FLLIPER_PDFLIP_D_FORK_ANCHOR.get())
-    except Exception:  # noqa: BLE001 - unreadable = on (the default)
-        return True
+    Review F6 (H99, no fallback): an unreadable value is NOT turned into a default here -- one rank answering True
+    from an exception while its peers read the env would split ``d_mode``; the error propagates and stops by name."""
+    from flliper.srt.environ import envs
+
+    return bool(envs.FLLIPER_PDFLIP_D_FORK_ANCHOR.get())
 
 
 def d_mode() -> bool:
@@ -164,7 +164,18 @@ def d_mode() -> bool:
 def d_split_only_rank() -> bool:
     """D-FORK-ANCHOR: a rank that holds no recurrent state (a Form A expert worker, a KV-only rank) plans
     every fork track SPLIT-ONLY -- no slot, no gather row, the node ``key[:t]`` without a mamba value; its
-    anchors are bookkeeping and it follows the host's depth with the mamba rule suspended (H98)."""
+    anchors are bookkeeping and it follows the host's depth with the mamba rule suspended (H98).
+
+    Review A4 (21.10.), DELIBERATE ASYMMETRY: on a D fork node the worker's mamba bookkeeping does NOT mirror TP0's
+    (TP0: the state, workers: none). Consequences, all accepted by design: (a) the #639b premise "same count,
+    replicated LRU, same tombstone set" (mem_cache/common.py peer_needs_mamba_evict) does not hold for fork nodes --
+    harmless on Form A, a worker in the follow walk reads no mamba validity; (b) an R12 STATE of TP0 that names an
+    anchor host copy on a fork node reconciles to ``short`` on the worker (form_a_host_shadow._reconcile) -- EXPECTED
+    for fork anchors, no action; (c) TP0 holds one more slot per taken fork: the review A1 guard
+    (UnifiedRadixCache._d_fork_donation_room) keeps it from ever costing the step's donation that slot, so the step
+    node is inserted on every rank alike. E1 (workers draw a byteless mirror slot) was weighed and not built: a worker
+    runs no GDN forward, so its "marks" would be a second, unverified verdict, and TP0-only slots exist anyway
+    (S109R device reads) -- the guard covers the one place the asymmetry could split the tree."""
     # No bare except (H99 audit, the bare-except trap): an undecidable rank form is a named stop in
     # ``form_a_follow_active`` -- swallowing it into "holds state" would let this rank plan a slot its peers do not.
     from flliper.srt.managers.tp_match_floor import this_rank_follows

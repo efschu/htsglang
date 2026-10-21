@@ -185,9 +185,12 @@ def _obs_d_fork_read(req, node, accepted: int) -> None:
     try:
         from flliper.srt.pdflip import turn_anchor as _ta
 
-        kind = getattr(node, _ta.D_FORK_KIND_ATTR, None)
-        if kind is None or not _obs_is_tp0():
+        mark = getattr(node, _ta.D_FORK_KIND_ATTR, None)
+        if mark is None or not _obs_is_tp0():
             return
+        kind, at = mark if isinstance(mark, tuple) else (mark, None)
+        if at is not None and int(at) != int(accepted):
+            return   # F7: the mark names the fork's end depth; any other depth is not this anchor
         cd = node.component_data[ComponentType.MAMBA]
         if cd.value is None and cd.host_value is None:
             return
