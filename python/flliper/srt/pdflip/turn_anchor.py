@@ -477,7 +477,7 @@ def note_step(batch: Any, desc: Optional[TurnTracks], req: Any, row: int,
     if not track_mask or len(getattr(req, "output_ids", None) or ()) > 0:
         return desc
     if d_mode():
-        # D-FORK-ANCHOR: the TURN, GEN-FORK and CLOSE-FORK tracks only (the twin / told-fork / sys-grid
+        # D-FORK-ANCHOR: the TURN, GEN-FORK, CLOSE-FORK and IMAGE-END tracks only (the twin / told-fork / sys-grid
         # tracks are P's -- their positions come from PP0's rows, not from the ids alone)
         twin_bounds, fork_told = (), 0
     desc = _note_turn_twin_steps(batch, desc, req, row, prefix, end, main_track,
@@ -1042,20 +1042,23 @@ def _note_image_step(batch: Any, desc: Optional[TurnTracks], req: Any, row: int,
             logger.info("PDFLIP IMAGE-END-ANCHOR SHARED rid=%s at=%d step=[%d,%d) (n=%d; another "
                         "track writes this very position)", rid, t, prefix, end, n)
         return desc
-    slot = _alloc_slot(batch)
-    if slot is None:
+    # V1 (review of the rc31 merge with D-FORK-ANCHOR): on group D the image track is a POSITION plan like the
+    # turn / close / gen tracks -- split-only on a Form A worker, split-only on a state rank without a free slot, its
+    # slot in the G1 registry, no S52 ledger -- so whether the node at t exists never hangs on a rank-local free list
+    slot, split_ok = _draw_slot(batch)
+    if slot is None and not split_ok:
         n = _count("image_no_slot")
         if _log_due(n):
             logger.info("PDFLIP IMAGE-END-ANCHOR SKIP rid=%s reason=no_free_slot at=%d "
                         "step=[%d,%d) (n=%d; no eviction, no reserve)", rid, t, prefix, end, n)
         return desc
-    if desc is None:
-        desc = TurnTracks(len(batch.reqs), need=slot_state_kinds(batch.req_to_token_pool))
-    desc.add(row, slot, t, prefix, end - prefix)
-    setattr(req, IMAGE_PENDING_ATTR, (t, slot, desc, int(prefix), int(end)))
-    from flliper.srt.pdflip import twin_anchor as _tw
+    desc = _put_plan(batch, desc, req, row, IMAGE_PENDING_ATTR, t, slot, prefix, end)
+    if not d_mode():
+        from flliper.srt.pdflip import twin_anchor as _tw
 
-    _tw.note_track_planned(rid, t)
+        _tw.note_track_planned(rid, t)
+    else:
+        note_d_planned(req, "image", t, prefix, end, slot)
     n = _count("image_planned")
     if _log_due(n):
         logger.info(
@@ -1645,7 +1648,7 @@ def note_skip(req: Any, reason: str, t: int, kind: str = "turn") -> None:
 
 # -- D-FORK-ANCHOR witnesses (21.10.) ------------------------------------------------
 D_FORK_KIND_ATTR = "pdflip_d_fork_kind"
-_ATTR_KIND = {PENDING_ATTR: "turn", CLOSE_PENDING_ATTR: "close", GEN_PENDING_ATTR: "gen"}
+_ATTR_KIND = {PENDING_ATTR: "turn", CLOSE_PENDING_ATTR: "close", GEN_PENDING_ATTR: "gen", IMAGE_PENDING_ATTR: "image"}
 
 
 def _d_role() -> str:

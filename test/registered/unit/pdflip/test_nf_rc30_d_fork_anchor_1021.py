@@ -525,3 +525,30 @@ def test_n1_mutant_without_the_clear_hook_hands_out_an_owned_slot(group_d):
         owned.add(int(s.view(-1)[0]))
     got = ta.revoke_for_donation()
     assert got is not None and int(got.view(-1)[0]) in owned, "the mutant aliases an owned slot"
+
+
+# -- V1 (merge with IMAGE-END TRACK): the image track is a position plan on D too -----------------------------------
+
+def test_v1_the_image_track_on_d_is_a_registered_position_plan(group_d):
+    from flliper.srt.pdflip import turn_anchor as ta
+
+    if not hasattr(ta, "IMAGE_PENDING_ATTR"):
+        pytest.skip("IMAGE-END TRACK not on this base")
+    ids = list(PROMPT)
+    ids[10:20] = [1_000_007] * 10
+    _as_worker(group_d, True)
+    alloc = TA0._Alloc([11, 12, 13])
+    req = TA0._sreq(ids)
+    TA0._plan(None, req, alloc, 0, N, N - 1)
+    wplan = getattr(req, ta.IMAGE_PENDING_ATTR)
+    assert wplan is not None and wplan[1] is None and alloc.free_ids == [11, 12, 13], "worker: split-only, no draw"
+    _as_worker(group_d, False)
+    req2 = TA0._sreq(ids)
+    TA0._plan(None, req2, TA0._Alloc([]), 0, N, N - 1)
+    assert getattr(req2, ta.IMAGE_PENDING_ATTR)[0] == wplan[0] and getattr(req2, ta.IMAGE_PENDING_ATTR)[1] is None, \
+        "host without a free slot: the same position, split-only"
+    req3 = TA0._sreq(ids)
+    TA0._plan(None, req3, TA0._Alloc([21, 22, 23]), 0, N, N - 1)
+    assert getattr(req3, ta.IMAGE_PENDING_ATTR)[1] is not None
+    assert any(e[1] == ta.IMAGE_PENDING_ATTR and e[0] is req3 for e in ta._INFLIGHT), "in the G1 registry"
+    assert ta._ATTR_KIND[ta.IMAGE_PENDING_ATTR] == "image"
