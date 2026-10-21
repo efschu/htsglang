@@ -461,6 +461,9 @@ def emb_cache_attach(scheduler, req) -> bool:
                 "content hash: no pixel fetch, no tower)", W_EMB_CACHE, req.rid, len(items),
                 sum(int(r.shape[0]) for r in rows), len(cache), int(cache.current_size),
                 scheduler._pdflip_vision_emb_hits)
+    # A5 (rc30 visiontail review): a hit republishes too -- a file the shared store's LRU (or a crash) dropped while
+    # this in-process cache still holds the rows comes back for D on the next turn that uses the image
+    _publish_rows(items)
     return True
 
 
