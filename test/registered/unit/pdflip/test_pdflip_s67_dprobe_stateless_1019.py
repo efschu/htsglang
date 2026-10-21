@@ -90,7 +90,9 @@ def _sched(cache):
     fake = SimpleNamespace(tree_cache=cache, model_config=SimpleNamespace(vocab_size=1 << 20),
                            pad_input_ids_func=None, _get_multimodal_inputs=None,
                            _try_apply_padded_mm_input_ids=None)
-    fake._pdflip_match_probe_one = lambda *a: S.Scheduler._pdflip_match_probe_one(fake, *a)
+    for _m in ("_pdflip_match_probe_one", "_pdflip_match_probe_pad", "_pdflip_match_probe_local",
+               "_pdflip_match_probe_group_min"):   # 27B NACHT 21.10.: the probe's halves (D-PROBE GROUP-MIN)
+        setattr(fake, _m, (lambda _n: lambda *a: getattr(S.Scheduler, _n)(fake, *a))(_m))
     return fake
 
 

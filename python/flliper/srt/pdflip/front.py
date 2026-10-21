@@ -24626,7 +24626,10 @@ EZ_ALT_SITES = {
     "d_token_budget": ("_d_token_budget_blocks", "seat"),                  # #22
     "age_seat_on_credit": ("_age_seat_on_credit", "seat"),                 # #23
     "d_phase_seats_full": ("_d_phase_seats_full", "seat"),                 # #24
-    "decode_collect": ("_decode_collect", "set"),                          # #37
+    # #37 "decode_collect" is NOT an old site any more: ``_decode_collect`` IS the set scheduler's one decision site
+    # (SOLL R1-R8, R11) and writes its own SET DECISION / SET-VERDICT records. Shadowed here it printed
+    # ``rule=ALT:decode_collect`` beside them, which the 27B INT8 metal 21.10. read as an old path still running in
+    # flip mode (rc29 14, rc29b 18 lines). 27B NACHT 21.10.: dropped from the ALT table, nothing else changes.
     "set_xsum_hold": ("_set_xsum_hold", "set"),                            # #39
     "x_exact_reprice": ("_x_exact_reprice_queue", "set"),                  # #40
     "set_flip_justified": ("_set_flip_justified", "set"),                  # #41

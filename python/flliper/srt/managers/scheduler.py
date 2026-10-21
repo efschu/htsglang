@@ -9261,53 +9261,124 @@ class Scheduler(
         return out
 
     def _pdflip_match_probe_one(self, rid, input_ids, mm_inputs, extra_key, tokenize_ms) -> PdFlipMatchProbeReqOutput:
-        """S56/S56r: one probe of ``handle_pdflip_match_probe`` -- padding like the intake, then the READ-ONLY peek."""
+        """S56/S56r: one probe of ``handle_pdflip_match_probe`` -- padding like the intake, then the READ-ONLY peek.
+
+        27B NACHT 21.10. (D-PROBE GROUP-MIN, SOLL R11 + user order 19.10. "NICHTS SCHÄTZEN, EXAKTE ZAHLEN"): on an
+        ASYMMETRIC host tier without Form A (27B D: TP3 over 3080/5090/3080, uneven DCP) the admission takes the RU MIN
+        of every rank's usable match, which no single rank can read -- the probe used to refuse by name
+        (``group_min_needed``), 22 of 22 times on the 27B INT8 metal 21.10. (rc29 ..._041a871f4b_1021_001910), and every
+        arrival went through the measuring barrier (MEASURE_ON_D): the halb requests pdflip-4-40 / 4-42 were refused
+        there, and on rc29b pdflip-0-1 / 0-4 (u 29484 / 29330, unpriced) sat unstarted on D through a D->P flip and came
+        back as ``store_short_after_flip`` -> a second flip pair. Now every rank peeks its own tree (the same read-only
+        walk) and the group reduces (ok, dev+host, dev, key depth) by MIN on the TP CPU group -- the group's number,
+        exactly the admission's MIN. Rank-uniform by construction: the probe is a broadcast control request every rank
+        handles at the same point of its intake; the mode is decided from launch facts (host tier asymmetric, Form A
+        off) BEFORE any per-rank work, and every rank reaches the reduce even when its own padding or walk failed
+        (ok=0 -> the group answers success=False by name, never one rank's number)."""
+        from flliper.srt.managers.tp_match_floor import form_a_follow_active
+
+        tc = getattr(self, "tree_cache", None)
+        group_min = False
+        if tc is not None:
+            # ``_hicache_prefetch_symmetric`` is True when the host tiers are ASYMMETRIC (the name is historical)
+            asym = bool(getattr(tc, "_hicache_prefetch_symmetric", lambda: False)())
+            group_min = asym and not form_a_follow_active()
+        if not group_min:
+            return self._pdflip_match_probe_local(rid, input_ids, mm_inputs, extra_key, tokenize_ms)
+        return self._pdflip_match_probe_group_min(rid, input_ids, mm_inputs, extra_key, tokenize_ms, tc)
+
+    def _pdflip_match_probe_pad(self, rid, input_ids, mm_inputs, extra_key):
+        """The probe's ids and image spans, padded like the intake (every rank: a broadcast mm process needs all)."""
         import types
 
         from flliper.srt.managers.io_struct import unwrap_from_pickle
-        from flliper.srt.managers.tp_match_floor import form_a_follow_active, this_rank_follows
         from flliper.srt.pdflip import d_match_probe as _dmp
         from flliper.srt.sampling.sampling_params import SamplingParams
 
+        ids = array("q", input_ids or ())
+        spans: List[List[int]] = []
+        mm = unwrap_from_pickle(mm_inputs) if mm_inputs is not None else None
+        if mm is not None:
+            image_inputs = self._get_multimodal_inputs(mm)
+            req = Req(
+                str(rid),
+                None,
+                ids,
+                SamplingParams(max_new_tokens=1),
+                vocab_size=self.model_config.vocab_size,
+                extra_key=extra_key,
+            )
+            _recv = types.SimpleNamespace(input_ids=input_ids)
+            if (
+                not self._try_apply_padded_mm_input_ids(_recv, req, image_inputs)
+                and self.pad_input_ids_func
+            ):
+                req.origin_input_ids = array(
+                    "q", self.pad_input_ids_func(req.origin_input_ids, image_inputs)
+                )
+            ids = array("q", req.origin_input_ids)
+            spans = _dmp.mm_spans(image_inputs)
+        return ids, spans
+
+    def _pdflip_match_probe_group_min(self, rid, input_ids, mm_inputs, extra_key, tokenize_ms, tc
+                                      ) -> PdFlipMatchProbeReqOutput:
+        """D-PROBE GROUP-MIN (see ``_pdflip_match_probe_one``): this rank's peek, then the group MIN. Every rank reaches
+        the reduce exactly once per probe, whatever its own work did."""
+        from flliper.srt.pdflip import d_match_probe as _dmp
+
+        t0 = time.perf_counter()
+        ok, total, dev_l, key_l, err = 1, 0, 0, 0, ""
+        ids: Any = array("q")
+        spans: List[List[int]] = []
+        try:
+            ids, spans = self._pdflip_match_probe_pad(rid, input_ids, mm_inputs, extra_key)
+            n = len(ids)
+            if n > 1:
+                dev, host, key_l = _dmp.peek_admission_match(tc, ids, extra_key, n - 1)
+                dev_l, total = int(dev), int(dev) + int(host)
+        except Exception as e:  # noqa: BLE001 -- named below; the reduce is still entered
+            ok, err = 0, f"{type(e).__name__}: {str(e)[:160]}"
+        vals = [int(ok), int(total), int(dev_l), int(key_l)]
+        grp = getattr(self, "tp_cpu_group", None)
+        if grp is not None and torch.distributed.get_world_size(grp) > 1:
+            t = torch.tensor(vals, dtype=torch.int64)
+            torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MIN, group=grp)
+            vals = [int(v) for v in t.tolist()]
+        g_ok, g_total, g_dev, g_key = vals
+        if not g_ok:
+            if err:
+                logger.warning("PDFLIP D-MATCH-PROBE FAILED rid=%s %s", rid, err)
+            return PdFlipMatchProbeReqOutput(
+                rid=rid, success=False,
+                message="group_probe_failed: a rank's padding or read-only walk failed -- no group number "
+                        "(this rank: %s)" % (err or "ok"),
+                handle_ms=(time.perf_counter() - t0) * 1000.0,
+            )
+        g_dev = min(g_dev, g_total)
+        return PdFlipMatchProbeReqOutput(
+            rid=rid,
+            success=True,
+            input_ids=ids,
+            device_tokens=int(g_dev),
+            host_tokens=int(g_total - g_dev),
+            key_match_depth=int(g_key),
+            mm_spans=spans,
+            handle_ms=(time.perf_counter() - t0) * 1000.0,
+            tokenize_ms=float(tokenize_ms or 0.0),
+        )
+
+    def _pdflip_match_probe_local(self, rid, input_ids, mm_inputs, extra_key, tokenize_ms) -> PdFlipMatchProbeReqOutput:
+        """S56/S56r: the probe on a Form A group or a symmetric host tier -- TP0's number is the group's."""
+        from flliper.srt.managers.tp_match_floor import this_rank_follows
+        from flliper.srt.pdflip import d_match_probe as _dmp
+
         t0 = time.perf_counter()
         try:
-            ids = array("q", input_ids or ())
-            spans: List[List[int]] = []
-            mm = unwrap_from_pickle(mm_inputs) if mm_inputs is not None else None
-            if mm is not None:
-                image_inputs = self._get_multimodal_inputs(mm)
-                req = Req(
-                    str(rid),
-                    None,
-                    ids,
-                    SamplingParams(max_new_tokens=1),
-                    vocab_size=self.model_config.vocab_size,
-                    extra_key=extra_key,
-                )
-                _recv = types.SimpleNamespace(input_ids=input_ids)
-                if (
-                    not self._try_apply_padded_mm_input_ids(_recv, req, image_inputs)
-                    and self.pad_input_ids_func
-                ):
-                    req.origin_input_ids = array(
-                        "q", self.pad_input_ids_func(req.origin_input_ids, image_inputs)
-                    )
-                ids = array("q", req.origin_input_ids)
-                spans = _dmp.mm_spans(image_inputs)
+            ids, spans = self._pdflip_match_probe_pad(rid, input_ids, mm_inputs, extra_key)
             n = len(ids)
             dev = host = key_depth = 0
             tc = getattr(self, "tree_cache", None)
             if n > 1 and tc is not None:
-                # whose number is the group's admission depth (R11 / Rang-Einigkeit): the Form A host's (H98), or any
-                # rank's on a symmetric host tier; else the RU MIN over the ranks decides, which this rank cannot read
-                asym = bool(getattr(tc, "_hicache_prefetch_symmetric", lambda: False)())
-                if asym and not form_a_follow_active():
-                    return PdFlipMatchProbeReqOutput(
-                        rid=rid, success=False,
-                        message="group_min_needed: asymmetric host tier without Form A -- the admission takes the "
-                                "RU MIN over the ranks, one rank's walk is not the group's number",
-                        handle_ms=(time.perf_counter() - t0) * 1000.0,
-                    )
                 if not this_rank_follows():  # a Form A worker's anchors are bookkeeping: it adopts the host's depth
                     # the admission's key: the whole ids, limit = _compute_max_prefix_len (n - 1)
                     dev, host, key_depth = _dmp.peek_admission_match(tc, ids, extra_key, n - 1)
@@ -15641,6 +15712,27 @@ class Scheduler(
         page = int(getattr(self, "page_size", 1) or 1)
         configured = int(getattr(self, "chunked_prefill_size", 0) or 0)
         if _pdflip_extend_trim.refuses_over_width(width, uncached, configured, page, rid in marks):
+            if _pdflip_extend_trim.cap_floor_crawls_under_soll_r7():
+                # 27B NACHT 21.10. (SOLL R7, user 17.10.: "kann D einen Request unter X nicht nehmen, ist das ein
+                # Defekt, kein Flipgrund"): this verdict only ever sees a request the X gate ADMITTED (u <= X). Under
+                # the central decider P takes no flip for it, so the refusal had no exit: 27B INT8 rc29 00:26:49Z
+                # deadlock (width 63, u = 234..797 refused W31 -> W50-REROUTE to a sleeping P, 6 D seats parked, no
+                # flip by R7). D takes it and prefills at the group's narrowed width (named once per rid); the
+                # width vote itself (#794, corridor law, torch cache counted) still bounds every chunk.
+                if rid not in marks:
+                    self.__dict__["_pdflip_ecf_crawl_n"] = int(self.__dict__.get("_pdflip_ecf_crawl_n", 0)) + 1
+                    logger.warning(
+                        "PDFLIP %s CRAWL rid=%s uncached=%d width=%s floor=%d configured=%d n=%d -- D takes it at "
+                        "the narrowed width instead of refusing it (SOLL R7: a request under X is D's; a refusal "
+                        "has no flip to land in)",
+                        _pdflip_extend_trim.CAP_FLOOR_MARKER, rid[:16], uncached, width,
+                        _pdflip_extend_trim.floor_rows(configured, page), configured,
+                        self.__dict__["_pdflip_ecf_crawl_n"],
+                    )
+                marks[rid] = None
+                if len(marks) > 4096:
+                    marks.pop(next(iter(marks)))
+                return verdict
             logger.warning(
                 "PDFLIP %s route=P rid=%s uncached=%d width=%s floor=%d configured=%d (D cannot fund "
                 "a floor chunk: the group's chunk width is under it, and this request is longer "

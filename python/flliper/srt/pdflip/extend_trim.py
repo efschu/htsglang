@@ -448,6 +448,19 @@ def cap_floor_armed() -> bool:
     return bool(_CACHE["cap_floor"])
 
 
+def cap_floor_crawls_under_soll_r7() -> bool:
+    """27B NACHT 21.10. (SOLL R7): True while the central decider (``FLLIPER_PDFLIP_DECIDER``, SOLL v2) runs -- then a
+    request the X gate admitted (u <= X) is never refused by the floor: P takes no flip for it (R7), so the refusal
+    deadlocked D (27B INT8 rc29 00:26:49Z). D prefills it at the narrowed group width instead. Launch env, read on
+    every rank alike (rank-uniform); off = the Q-710 refusal as before."""
+    try:
+        from flliper.srt.environ import envs
+
+        return bool(envs.FLLIPER_PDFLIP_DECIDER.get())
+    except Exception:  # noqa: BLE001 -- unknown = the refusal as before
+        return False
+
+
 def floor_rows(configured: int, page_size: int) -> int:
     """The floor chunk: ``configured / CAP_FLOOR_DIV`` rows, page aligned, at least one page."""
     page = max(1, int(page_size or 1))

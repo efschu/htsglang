@@ -342,7 +342,9 @@ def _fake_sched(tree, **kw):
     fake = types.SimpleNamespace(**base)
     from flliper.srt.managers import scheduler as S
 
-    fake._pdflip_match_probe_one = lambda *a: S.Scheduler._pdflip_match_probe_one(fake, *a)
+    for _m in ("_pdflip_match_probe_one", "_pdflip_match_probe_pad", "_pdflip_match_probe_local",
+               "_pdflip_match_probe_group_min"):   # 27B NACHT 21.10.: the probe's halves (D-PROBE GROUP-MIN)
+        setattr(fake, _m, (lambda _n: lambda *a: getattr(S.Scheduler, _n)(fake, *a))(_m))
     return fake
 
 
@@ -396,9 +398,11 @@ def test_scheduler_handler_answers_a_coalesced_batch_in_order(monkeypatch):
     assert [(d["rid"], d["device_tokens"], d["success"]) for d in more] == [("b", 10, True), ("c", 20, True)]
 
 
-def test_scheduler_handler_refuses_a_rank_local_number_by_name(monkeypatch):
-    """S56r (R11): on an asymmetric host tier without Form A the admission takes the RU MIN -- TP0's walk is not the
-    group's number: success=False, named, never TP0's guess."""
+def test_scheduler_handler_answers_the_group_min_on_an_asymmetric_tier(monkeypatch):
+    """S56r (R11) + 27B NACHT 21.10. D-PROBE GROUP-MIN: on an asymmetric host tier without Form A the admission takes
+    the RU MIN -- TP0's walk alone is not the group's number. Every rank walks and the group reduces by MIN; a single
+    rank (no TP group) answers its own walk, which IS the group's. Never ``group_min_needed`` any more (27B INT8 metal
+    21.10.: 22 of 22 probes refused, every arrival through the measuring barrier)."""
     from array import array
 
     from flliper.srt.managers import scheduler as S
@@ -410,10 +414,11 @@ def test_scheduler_handler_refuses_a_rank_local_number_by_name(monkeypatch):
             return True
 
     monkeypatch.setattr(T, "form_a_follow_active", lambda: False)
-    monkeypatch.setattr(dmp, "peek_admission_match", lambda *a: (_ for _ in ()).throw(AssertionError("no walk")))
+    monkeypatch.setattr(dmp, "peek_admission_match", lambda tc, ids, ek, limit: (6, 2, 9))
     out = S.Scheduler.handle_pdflip_match_probe(
         _fake_sched(_Tree()), PdFlipMatchProbeReqInput(rid="r", input_ids=array("q", range(10))))
-    assert out.success is False and out.message.startswith("group_min_needed")
+    assert out.success is True, out.message
+    assert (out.device_tokens, out.host_tokens, out.key_match_depth) == (6, 2, 9)
 
 
 def test_scheduler_handler_never_raises(monkeypatch):

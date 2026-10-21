@@ -176,9 +176,12 @@ class SchedulerVerdict(CustomTestCase):
                                      chunked_prefill_size=CONFIGURED)
 
     def test_refused_then_a_tail_admitted_and_marked(self):
+        """The Q-710 refusal itself, with the central decider OFF (27B NACHT 21.10.: under SOLL v2 R7 the floor
+        crawls instead, see test_27b_nacht_befunde_1021)."""
         s = self._sched(1)
         req = types.SimpleNamespace(rid="pdflip-14-78")
-        with self.assertLogs("flliper.srt.managers.scheduler", level="WARNING") as cm:
+        with mock.patch.dict(os.environ, {"FLLIPER_PDFLIP_DECIDER": "0"}), \
+                self.assertLogs("flliper.srt.managers.scheduler", level="WARNING") as cm:
             self.assertEqual(self.fn(s, req, 1546, "admit"), "W31")
         self.assertTrue(any("EXTEND-CAP-FLOOR route=P rid=pdflip-14-78 uncached=1546" in m for m in cm.output))
         tail = types.SimpleNamespace(rid="pdflip-0-1")
