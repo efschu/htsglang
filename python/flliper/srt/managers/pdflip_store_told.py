@@ -1721,6 +1721,10 @@ def pp0_publish(scheduler, recv_reqs: List) -> List:
     held rids into ``PdFlipStoreTold`` objects appended to the outgoing list.
     Returns the list to SEND; the caller keeps dispatching ``recv_reqs``."""
     held: Dict[str, Any] = scheduler._pdflip_store_held
+    # P-COMMIT MESSTOR (1): the launch end's W2C WOULD-ANNOUNCE probe learns what the socket held (log only)
+    from flliper.srt.pdflip import pp_chain_announce as _w2c_would
+
+    _w2c_would.pp0_would_at_top(scheduler, recv_reqs)
     # TW (#56): every PP0 pass counts and notes the siblings that finished,
     # also when nothing is held -- a twin arriving right after its sibling's
     # finish is held until that finish settled (the end anchor published).
@@ -1739,7 +1743,7 @@ def pp0_publish(scheduler, recv_reqs: List) -> List:
         _commit_park(scheduler, recv_reqs)
     paced_on = bool(getattr(scheduler, "_pdflip_told_paced_on", False))
     if paced_on:
-        return _pp0_publish_paced(scheduler, recv_reqs)
+        return _vision_at_admit(scheduler, recv_reqs, _pp0_publish_paced(scheduler, recv_reqs))
     if not held:
         return recv_reqs
     told_map: Dict[str, int] = scheduler._pdflip_store_told
@@ -1801,7 +1805,35 @@ def pp0_publish(scheduler, recv_reqs: List) -> List:
             )
     if not out:
         return recv_reqs
-    return list(recv_reqs) + out
+    return _vision_at_admit(scheduler, recv_reqs, list(recv_reqs) + out)
+
+
+def _vision_at_admit(scheduler, recv_reqs: List, wire: List) -> List:
+    """P-COMMIT V (pdflip/vision_verdict.pp0_verdicts_at_admit): the image requests PP0 ADMITS in this pass
+    (a paced Admit, or a single-phase told) whose told covers every image position get their vision verdict on
+    THIS chain, behind the Admit -- before, it followed at the next intake, i.e. behind the output receive of
+    the older set (NF rc30 09:37:12-16: 4138 ms). ``wire`` is ``list(recv_reqs) + out`` or ``recv_reqs`` itself.
+    Never raises into the pass."""
+    if wire is recv_reqs:
+        return wire
+    try:
+        admitted = []
+        for item in wire[len(recv_reqs):]:
+            if isinstance(item, PdFlipStoreAdmit):
+                if int(item.told) > 0:
+                    admitted.append(str(item.rid))
+            elif isinstance(item, PdFlipStoreTold) and not getattr(item, "paced", False) and int(item.told) > 0:
+                admitted.append(str(item.rid))
+        if not admitted or not getattr(scheduler, "_pdflip_vision_gate", False):
+            return wire
+        from flliper.srt.pdflip import vision_rank_runner as _vrr
+        from flliper.srt.pdflip import vision_verdict as _vv
+
+        verdicts = _vv.pp0_verdicts_at_admit(scheduler, admitted, _vrr.stage_skip_verdict)
+        return wire + verdicts if verdicts else wire
+    except Exception as exc:  # noqa: BLE001 -- the plan's vision pass queues the verdict as before
+        logger.warning("P-COMMIT V vision verdict at admit skipped (%s: %s)", type(exc).__name__, exc)
+        return wire
 
 
 def w2c_publishable(scheduler) -> List[str]:
@@ -2113,11 +2145,122 @@ def s82_note_launch(scheduler, mb_id: int, batch) -> None:
 
 
 def s82_output_pending_at_entry(scheduler) -> tuple:
-    """PP0, right before the output receive: ``(t_entry, pending)``; pending as ``_s82_output_pending``."""
+    """PP0, right before the output receive: ``(t_entry, pending)``; pending as ``_s82_output_pending``.
+    #PDRAIN: a receive that is going to block also snapshots WHO waits behind it (``pdrain_snapshot``)."""
     try:
-        return time.monotonic(), _s82_output_pending(scheduler)
+        t, pending = time.monotonic(), _s82_output_pending(scheduler)
     except Exception:  # noqa: BLE001
         return time.monotonic(), None
+    if pending is True:
+        try:
+            scheduler._pdrain_entry = (t, pdrain_snapshot(scheduler))
+        except Exception:  # noqa: BLE001 -- an instrument never breaks the pass
+            scheduler._pdrain_entry = None
+    return t, pending
+
+
+#: #PDRAIN (P-COMMIT 21.10.): what ``output_commit`` in a PP0 ``#PGAP`` line IS. MEASURED, NF rc30 boot
+#: ..._1021_063252, all 166 PP0 forwards with output_commit > 500 ms: output_commit minus (PP1 gpu_fwd_ms + PP2
+#: gpu_fwd_ms of the older set) = median 210 ms (p10 46, p90 526) -- the span is PP0 waiting in the blocking
+#: output receive (``_pp_send_recv_and_preprocess_output_tensors`` -> ``_pp_recv_dict_from_prev_stage``) for the
+#: two downstream forwards of the set it launched before, not host work. Whether that drain is a P PAUSE depends
+#: on who waited behind it, which the #PGAP line cannot say: of 144 drains in that boot, 59 had nothing routed to
+#: P (the card had nothing to do), the rest held requests whose admission needed one more PP0 pass top (paced
+#: read-ahead / Admit, the vision verdict) or whose arrival sat in the socket. One line per BLOCKING PP0 receive.
+PDRAIN_CLASSES = ("held_open", "held_ready", "paced", "vision", "twin", "admissible")
+
+
+def pdrain_snapshot(scheduler) -> dict:
+    """PP0 at the entry of a blocking output receive: the waiting queue by why it is not in the forward that
+    could run beside this drain. Read-only."""
+    held: Dict[str, Any] = getattr(scheduler, "_pdflip_store_held", None) or {}
+    pacing = getattr(scheduler, "_pdflip_told_pacing", None) or {}
+    tree = getattr(scheduler, "tree_cache", None)
+    released = getattr(scheduler, "_pdflip_vision_released", None)
+    gate = bool(getattr(scheduler, "_pdflip_vision_gate", False)) and released is not None
+    counts = {k: 0 for k in PDRAIN_CLASSES}
+    rids: Dict[str, List[str]] = {k: [] for k in PDRAIN_CLASSES}
+    for req in list(getattr(scheduler, "waiting_queue", None) or ()):
+        rid = _rid(req)
+        if rid in pacing:
+            k = "paced"
+        elif rid in held:
+            if _twin.is_deferred(scheduler, rid):
+                k = "twin"
+            else:
+                k = "held_ready" if (tree is not None and _read_terminable(tree, rid)) else "held_open"
+        elif gate and rid not in released and _vision_req(req):
+            k = "vision"
+        else:
+            k = "admissible"
+        counts[k] += 1
+        if len(rids[k]) < 4:
+            rids[k].append(rid)
+    return {"n": sum(counts.values()), "counts": counts, "rids": rids,
+            "carried": getattr(scheduler, "chunked_req", None) is not None}
+
+
+def _vision_req(req) -> bool:
+    mm = getattr(req, "multimodal_inputs", None)
+    return bool(getattr(mm, "mm_items", None))
+
+
+def pdrain_cause(snapshot: Optional[dict]) -> str:
+    """'idle' = nothing queued on PP0 behind the drain (not a P pause); else the classes that waited."""
+    if not snapshot or not snapshot.get("n"):
+        return "idle"
+    return "+".join(k for k in PDRAIN_CLASSES if snapshot["counts"].get(k))
+
+
+#: review B4: the entry only PREDICTS that the receive blocks; a drain counts into the per-boot sums only when it
+#: actually waited at least this long (the threshold of the rc30 census) -- the monitor thresholds on wait_ms, never
+#: on the line count.
+PDRAIN_SIG_MS = 500.0
+
+
+def _log_pdrain(scheduler, next_mb_id: int, now: float, rec) -> None:
+    entry = getattr(scheduler, "_pdrain_entry", None)
+    scheduler._pdrain_entry = None
+    if not entry:
+        return
+    t_entry, snap = entry
+    wait_ms = (now - float(t_entry)) * 1000.0
+    n = getattr(scheduler, "_pdrain_n", 0) + 1
+    scheduler._pdrain_n = n
+    cause = pdrain_cause(snap)
+    sig = wait_ms >= PDRAIN_SIG_MS
+    sums = getattr(scheduler, "_pdrain_ms_sums", None)
+    if sums is None:
+        sums = scheduler._pdrain_ms_sums = {"pause": 0.0, "idle": 0.0, "paced": 0.0, "w2c_would": 0.0}
+    # MESSTOR (1): queued rids a socket-triggered W2C announcement would have carried (W2C WOULD-ANNOUNCE qualifies=1)
+    would = getattr(scheduler, "_w2c_would_rids", None) or {}
+    queued_rids = {_rid(r) for r in (getattr(scheduler, "waiting_queue", None) or ())}
+    would_n = sum(1 for r in would if r in queued_rids)
+    for r in [r for r in would if r not in queued_rids]:
+        would.pop(r, None)                       # admitted or gone: it never qualifies twice
+    if sig:
+        if cause == "idle":
+            sums["idle"] += wait_ms
+        else:
+            scheduler._pdrain_pause_n = getattr(scheduler, "_pdrain_pause_n", 0) + 1
+            sums["pause"] += wait_ms
+            if snap["counts"].get("paced"):
+                sums["paced"] += wait_ms
+            if would_n:
+                sums["w2c_would"] += wait_ms
+    older = "-" if rec is None else "new=%d cached=%d launch_to_output_ms=%.0f" % (
+        int(rec[1]), int(rec[2]), (now - float(rec[0])) * 1000.0)
+    logger.info(
+        "#PDRAIN pp_rank=0 slot=%s wait_ms=%.0f sig=%d cause=%s queued=%d %s carried=%d w2c_would=%d older[%s] rids=%s "
+        "(n=%d pauses=%d pause_ms_sum=%.0f paced_ms_sum=%.0f w2c_would_ms_sum=%.0f idle_ms_sum=%.0f): PP0 sat in the "
+        "blocking output receive for the older set's downstream forwards; cause names who waited behind it (idle = "
+        "nobody: not a P pause); sums count only drains with wait_ms >= %.0f",
+        next_mb_id, wait_ms, int(sig), cause, int(snap.get("n", 0)),
+        " ".join("%s=%d" % (k, snap["counts"][k]) for k in PDRAIN_CLASSES),
+        1 if snap.get("carried") else 0, would_n, older,
+        {k: v for k, v in snap["rids"].items() if v}, n, getattr(scheduler, "_pdrain_pause_n", 0),
+        sums["pause"], sums["paced"], sums["w2c_would"], sums["idle"], PDRAIN_SIG_MS,
+    )
 
 
 def s82_after_commit(scheduler, next_mb_id: int, entry: tuple) -> None:
@@ -2134,6 +2277,11 @@ def s82_after_commit(scheduler, next_mb_id: int, entry: tuple) -> None:
         now = time.monotonic()
         recs = getattr(scheduler, "_s82_launch_rec", None) or {}
         rec = recs.pop(int(next_mb_id), None)
+        if pending is True:
+            try:
+                _log_pdrain(scheduler, int(next_mb_id), now, rec)
+            except Exception as exc:  # noqa: BLE001 -- an instrument never costs the samples below
+                logger.warning("#PDRAIN skipped (%s: %s)", type(exc).__name__, exc)
         if pending is True and rec is not None:
             _cp.note_downstream(int(rec[1]), int(rec[2]), (now - float(rec[0])) * 1000.0)
         pa = getattr(scheduler, "_s82_park_admit", None)
@@ -2202,6 +2350,23 @@ def _pp0_fork(scheduler, req, rid: str) -> int:
     return fork
 
 
+def _note_would_ack_ahead(scheduler, rid: str, told: int, item) -> None:
+    """P-COMMIT MESSTOR (2), follower: the read-ahead's absorb time and whether this rank's own key chain digests to
+    PP0's ``keys_digest`` (a told-less early ack is only usable when it does). Log-side only."""
+    try:
+        from flliper.srt.managers import pdflip_told_ack_early as _tae
+
+        theirs = getattr(item, "keys_digest", None)
+        eq = None
+        if theirs:
+            req = next((r for r in scheduler.waiting_queue if _rid(r) == rid), None)
+            if req is not None:
+                eq = _pp0_keys_digest(req) == theirs
+        _tae.note_read_ahead(scheduler, rid, told, eq)
+    except Exception:  # noqa: BLE001 -- an instrument
+        pass
+
+
 def _follower_absorb_impl(scheduler, recv_reqs: List) -> List:
     """After the forward, before dispatch: take the told objects off the list,
     store them, and register the held requests' prefetch with the told span."""
@@ -2231,6 +2396,7 @@ def _follower_absorb_impl(scheduler, recv_reqs: List) -> List:
             if getattr(item, _fb.WIRE_ACK, 0):
                 # PF: PP0 armed the group fallback -- report this read.
                 _fb.follower_expect(scheduler, rid, told)
+                _note_would_ack_ahead(scheduler, rid, told, item)
             if len(early) > 256:
                 # an aborted request never gets its Admit: keep the table
                 # to what is still queued (or just arrived, this rid)
