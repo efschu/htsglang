@@ -102,6 +102,26 @@ def p_request_cost(est_prompt: int, leg1_prompt_tokens: int = 0,
     return max(0, int(leg1_prompt_tokens or 0), int(est_prompt or 0))
 
 
+def p_continuation_credit(pairs: Iterable[Tuple[int, int]]) -> int:
+    """P-POOL-SHARED (rc29 pphase 21.10.): tokens of a dispatch candidate that P's pool already holds for a leg in flight.
+
+    ``pairs`` = ``(common, depth)`` per leg in flight on P: ``common`` = the token prefix the candidate shares with that
+    leg (front token ids), ``depth`` = the cached prefix that leg loads into P's device pool (its store depth, the told
+    point, anchor-aligned). When ``common >= depth`` the leg's whole loaded prefix IS the candidate's prefix: P's radix
+    tree matches it there (the leg's told point carries the anchor), so the candidate occupies only what lies beyond.
+    A shorter common prefix credits NOTHING -- where the candidate's match would end needs an anchor below ``common``
+    that the front does not know (conservative: never under-count P's pool). The largest credit wins (one leg's
+    nodes). Metal rc27 _023225: pdflip-0-21 (prompt 149741, u 2029) continues pdflip-0-17 (store depth 147712, in
+    flight) -- counted as 149741 it was held 23.2 s by the overlap plan while P's pool usage read 0.17-0.43.
+    """
+    best = 0
+    for common, depth in pairs:
+        c, d = int(common or 0), int(depth or 0)
+        if d > 0 and c >= d and d > best:
+            best = d
+    return best
+
+
 def p_overlap_admits(inflight_tokens: int, inflight_n: int, next_cost: int,
                      pool_tokens: int) -> bool:
     """May the next request's leg 1 start while ``inflight_n`` run?
