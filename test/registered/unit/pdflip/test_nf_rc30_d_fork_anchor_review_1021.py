@@ -212,3 +212,36 @@ def test_an_inflight_fork_plan_does_not_make_tp0_skip_another_requests_step_node
     wk, _w1, w2 = _inflight_pair(group_d, worker=True)
     assert h2.cache_protected_len == w2.cache_protected_len, (h2.cache_protected_len, w2.cache_protected_len)
     assert _structure(host) == _structure(wk)
+
+
+# -- (R5) Nachprüfung G1 (b197da0c60): the in-flight registry must not outlive a pool reset -------------------------
+
+@pytest.mark.xfail(strict=True, reason=(
+    "REVIEW NACHPRUEFUNG N1 (b197da0c60): turn_anchor._INFLIGHT validates an entry only by 'the request still carries "
+    "that plan tuple'. A pool reset (flush/sleep leg Scheduler reset -> req_to_token_pool.clear(), vram_dial shrink, "
+    "wake restore) puts the plan's slot back on the free list while a surviving request object still carries the "
+    "unconsumed plan; the next donation revoke then hands out a slot another owner already holds (#924 aliasing)."))
+def test_a_revoke_never_hands_out_a_slot_a_pool_reset_already_gave_away(group_d):
+    from flliper.srt.pdflip import turn_anchor as ta
+
+    group_d.setattr(ta, "_INFLIGHT", [])
+    _as_worker(group_d, False)
+    fx = TA0._fixture(False)
+    r1 = _new_req(fx, PROMPT, "pdflip-2-63")
+    TA0._write_kv(fx, r1, N)
+    batch = SimpleNamespace(reqs=[r1], req_to_token_pool=fx.pool)
+    ta.note_step(batch=batch, desc=None, req=r1, row=0, prefix=0, end=N,
+                 track_mask=True, main_track=N - 1, chunk=1, page=1, tok=IM)
+    plan = getattr(r1, ta.PENDING_ATTR)
+    assert plan[1] is not None and ta.inflight_count() >= 1
+    # the reset of a flush / sleep leg / vram_dial shrink: every slot free again, r1's object (and plan) survive
+    fx.pool.mamba_allocator.clear()
+    owned = set()
+    while True:                                          # new owners take every slot, the planned one included
+        s = fx.pool.mamba_allocator.alloc(1)
+        if s is None:
+            break
+        owned.add(int(s.view(-1)[0]))
+    got = ta.revoke_for_donation()
+    assert got is None or int(got.view(-1)[0]) not in owned, (
+        f"revoke handed out slot {int(got.view(-1)[0])} that a new owner already holds")
