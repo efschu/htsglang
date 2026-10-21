@@ -155,6 +155,12 @@ def test_p5_a_batch_keeps_its_full_parallelism_and_has_no_serial_tail(monkeypatc
     assert sizes == [n] and all(r == 0 for r in rc) and k == 4, (sizes, k)
     assert max(sz for _t, sz in pio.calls) <= hs.L3_TOUCH_PAGES          # sub-calls of at most L3_TOUCH_PAGES pages
     assert sum(sz for _t, sz in pio.calls) == n
+    # L3TOUCH-1021: the clock moves at most every L3_TOUCH_MIN_S (a fast read: the first and the last touch only); with
+    # the bound at 0 every sub-call touches, by the workers, as before
+    assert 2 <= len(arena.touches) <= 2 + 4 * 8, len(arena.touches)
+    monkeypatch.setattr(hs, "L3_TOUCH_MIN_S", 0.0)
+    arena, pio = _A(), _Pio()
+    be._l3_read_with_progress(arena, pio, todo, ["p"] * n, 4096, [0] * n)
     worker_touches = [t for t in arena.touches if t.startswith("l3-read")]
     assert len(worker_touches) >= n // hs.L3_TOUCH_PAGES - 4, (len(worker_touches), len(arena.touches))   # by the workers
 
@@ -165,6 +171,7 @@ def test_the_serial_small_batch_reports_progress_per_sub_call_too(monkeypatch):
     n = 50
     todo = [(i, i, 1, "s%d" % i) for i in range(n)]
     arena, pio = _A(), _Pio()
+    monkeypatch.setattr(hs, "L3_TOUCH_MIN_S", 0.0)   # L3TOUCH-1021: unthrottled = one touch per sub-call as before
     be._l3_read_with_progress(arena, pio, todo, ["p"] * n, 4096, [0] * n)
     assert [sz for _t, sz in pio.calls] == [16, 16, 16, 2]
     assert len(arena.touches) >= 4 + 2          # before, one per sub-call, after
