@@ -273,13 +273,29 @@ def extend_growth_per_row_mib(windows) -> Optional[float]:
     return math.ceil(best * 10000.0 - 1e-9) / 10000.0
 
 
-def rows_cap(post_mib: float, rate: float, page_size: int) -> int:
-    """The widest chunk the card funds: ``floor((post - 300) / rate)``, down to
-    the page, never below one page (a chunk must make progress)."""
+def corridor_line_mib() -> float:
+    """The card line the chunk's growth must leave free: the corridor LAW in force (``corridor_guard.corridor_law_mib``,
+    700 MiB) -- never the old 300 MiB halt line under it. 27B INT8 rc29b metal 21.10. (and 0798c91fcd 00:48-01:01Z alike):
+    D TP1 (3080) breached the law 17x (minimum 3-7 MiB): the vote funded a 4096-row chunk down to 300 MiB, the chunk's
+    reserved growth (0.3091 MiB/row = 1266 MiB) ate the rest. The vote is the actuator of the corridor for the extend; it
+    keeps the law itself instead of a lower private line (no reserve: the law is the corridor, nothing on top)."""
+    try:
+        from flliper.srt.managers.corridor_guard import corridor_law_mib
+
+        return max(float(CHUNKING_FLOOR_MIB), float(corridor_law_mib()))
+    except Exception:  # noqa: BLE001 -- no law reader: the halt line
+        return float(CHUNKING_FLOOR_MIB)
+
+
+def rows_cap(post_mib: float, rate: float, page_size: int, line_mib: Optional[float] = None) -> int:
+    """The widest chunk the card funds: ``floor((post - line) / rate)`` (``line`` = the corridor law, see
+    :func:`corridor_line_mib`; the 300 MiB halt line when given none), down to the page, never below one page (a chunk
+    must make progress)."""
     page = max(1, int(page_size or 1))
     if rate <= 0:
         return 1 << 30
-    rows = int(math.floor((float(post_mib) - CHUNKING_FLOOR_MIB) / float(rate)))
+    line = float(CHUNKING_FLOOR_MIB if line_mib is None else line_mib)
+    rows = int(math.floor((float(post_mib) - line) / float(rate)))
     return max(page, (rows // page) * page)
 
 
@@ -351,7 +367,8 @@ def width_vote(cuda, rank: int, configured: int, page_size: int, pending: bool,
         except Exception:  # noqa: BLE001 -- no reading: driver free alone, as before
             cache_free_mib = 0.0
         post_mib = post_mib + cache_free_mib
-        cap = rows_cap(post_mib, rate, page_size)
+        line_mib = corridor_line_mib()
+        cap = rows_cap(post_mib, rate, page_size, line_mib)
         if cap >= int(configured):
             _CACHE["logged_cap"] = None
             _CACHE["logged_floor"] = None
@@ -360,7 +377,7 @@ def width_vote(cuda, rank: int, configured: int, page_size: int, pending: bool,
             _CACHE["logged_cap"] = cap
             logger.info(
                 f"{CHUNKING_MARKER} rank={rank} geplant={int(configured)} cap={cap} "
-                f"post={post_mib:.0f} cache_free={cache_free_mib:.0f} rate={rate:.4f} floor={CHUNKING_FLOOR_MIB:.0f}"
+                f"post={post_mib:.0f} cache_free={cache_free_mib:.0f} rate={rate:.4f} floor={line_mib:.0f}"
                 + ("" if cap_post is None else f" torch_cap={torch_cap:.0f} cap_post={cap_post:.0f}")
                 + ("" if not measure_armed(rank) else
                    f" rate_src={'measured' if rate > start_rate else 'start'} start_rate={start_rate:.4f}")

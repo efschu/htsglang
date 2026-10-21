@@ -32,6 +32,17 @@ from flliper.srt.environ import envs
 from flliper.srt.pdflip import extend_trim as ET
 from flliper.test.test_utils import CustomTestCase
 
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _vote_line_300_for_this_module(monkeypatch):
+    """27B port fix 21.10.: the width vote keeps the corridor LAW (extend_trim.corridor_line_mib, 700 MiB); this module
+    pins the vote's arithmetic at the old 300 MiB halt line it was written for -- the law case is pinned in
+    test_27b_metal_hang_1021."""
+    monkeypatch.setenv("FLLIPER_CORRIDOR_LAW_FLOOR_MIB", "300")
+    yield
+
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
 MIB = 1 << 20

@@ -25,6 +25,17 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 from flliper.srt.pdflip import extend_trim as ET  # noqa: E402
 from flliper.srt.pdflip import launcher as L  # noqa: E402
 
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _vote_line_300_for_this_module(monkeypatch):
+    """27B port fix 21.10.: the width vote keeps the corridor LAW (extend_trim.corridor_line_mib, 700 MiB); this module
+    pins the vote's arithmetic at the old 300 MiB halt line it was written for -- the law case is pinned in
+    test_27b_metal_hang_1021."""
+    monkeypatch.setenv("FLLIPER_CORRIDOR_LAW_FLOOR_MIB", "300")
+    yield
+
 MIB = 1 << 20
 PAGE = 64
 RATE = 0.5871  # rc12g 05:31:15 / 05:35:05: 1578 / 2688 = 0.58705, rounded up (was 0.5625, rc12e)
