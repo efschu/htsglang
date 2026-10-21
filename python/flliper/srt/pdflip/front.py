@@ -47,6 +47,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import collections
+import dataclasses
 import contextvars
 import functools
 import gc
@@ -14049,6 +14050,7 @@ class Front:
         counted: Dict[str, int] = {}
         self.__dict__["_r6_counted"] = counted
         self.__dict__["_r6_in_flight"] = {}
+        self.__dict__["_r6_commit_now"] = set()
 
         def _tok(rid: str, t_grant: float, _granted: int) -> int:
             if not box:
@@ -14071,7 +14073,11 @@ class Front:
             # never computes (NF _1021_063252 pdflip-48-687 counted 3280 -> P 16, 42-671 4681 -> 9, 46-680 5151 -> 2911)
             free = _dxb.free_of(box[0], rid, t_grant)
             free = int(rest) if free is None else int(free)
-            if free <= 0:
+            if free != _dxb.COMMITTED:
+                Front._r6_commit_clear(self, rid)  # review 2 B1: a resolved marker forgets its first sighting
+            if free <= 0 and free != _dxb.COMMITTED:
+                # review A3: the whole rest is in launched forwards -- R1u still takes a member's share of it off the member
+                (self.__dict__.setdefault("_r6_in_flight", {}))[str(rid)] = int(rest)
                 self.counters["r6_rest_in_flight"] += 1
                 if self.__dict__.get("_r6_if_last") != (rid, rest):
                     self.__dict__["_r6_if_last"] = (rid, rest)
@@ -14088,13 +14094,72 @@ class Front:
                                 "to its end (stream committed or no D-prefill leg): it is no part of what P would get, "
                                 "R6 does not count it (S56, SOLL R6)", rid, rest, int(_granted), self.epoch)
                 return 0
+            # review 2 B2: only a redirectable leg's COMMITTED marker holds the verdict (a leg that stays on D never moves)
+            if free == _dxb.COMMITTED and Front._r6_commit_pending(self, rid, rest):
+                return 0  # review A1: D fixed the next chunk in its recv step -- its exact free follows with its start record
             if free < rest:
                 self.counters["r6_rest_in_flight_part"] += 1
-                (self.__dict__.setdefault("_r6_in_flight", {}))[str(rid)] = int(rest) - free
+            # review A3 (R1u): the in-flight piece of every counted run rides along (0 = none), so R1u can take a member's share
+            # of it off the member (P reads it from the store)
+            (self.__dict__.setdefault("_r6_in_flight", {}))[str(rid)] = max(0, int(rest) - free)
             counted[str(rid)] = free
             return free
 
         return _tok
+
+    #: review A1: a COMMITTED marker older than this is a D loop that stopped between its recv step and its launch (a crash /
+    #: a hang) -- a liveness guard, never a decision clock: D resolves the marker within one iteration (live 38-104 ms)
+    R6_COMMIT_STALE_S = 5.0
+
+    def _r6_commit_clear(self, rid: str) -> None:
+        """Review 2 B1: ``rid``'s record is no longer COMMITTED -- the marker was resolved (start record / release), so its first
+        sighting is forgotten: a LATER commit of the same rid (next chunk boundary, narrowed chunks after a wake, a #679
+        park-in-place) starts its own clock and is never stale at once."""
+        seen = self.__dict__.get("_r6_commit_seen")
+        if seen:
+            seen.pop((str(rid), int(getattr(self, "epoch", 0) or 0)), None)
+
+    def _r6_commit_pending(self, rid: str, rest: int) -> bool:
+        """NF-RC30-R6STALE review A1 (SOLL R6/R7, R11): ``rid``'s record says COMMITTED -- D's recv step fixed its next chunk,
+        the start record with the exact free has not come yet. True = pending: nothing of it counts or is redirected, and the
+        set's final verdict waits for that record (``_r6_commit_hold``). Named once per rid; a marker that outlives
+        ``R6_COMMIT_STALE_S`` is named (warning), holds nothing and counts as nothing movable."""
+        seen = self.__dict__.setdefault("_r6_commit_seen", collections.OrderedDict())
+        now = time.time()
+        key = (str(rid), int(getattr(self, "epoch", 0) or 0))
+        t0 = seen.get(key)
+        if t0 is None:
+            seen[key] = t0 = now
+            while len(seen) > 256:
+                seen.popitem(last=False)
+            self.counters["r6_commit_pending"] += 1
+            logger.info("PDFLIP R6-COMMIT-PENDING rid=%s d_rest=%d epoch=%d -- D's recv step fixed this prefill's next chunk "
+                        "(it launches in the same D iteration, before any abort can land): nothing of it is counted or "
+                        "redirected until that chunk's start record gives the exact rest P can get; the set verdict waits for "
+                        "it (SOLL R6, R7, R11)", rid, int(rest), self.epoch)
+        if now - t0 > Front.R6_COMMIT_STALE_S:
+            self.counters["r6_commit_stale"] += 1
+            if self.__dict__.get("_r6_commit_stale_last") != key:
+                self.__dict__["_r6_commit_stale_last"] = key
+                logger.warning("PDFLIP R6-COMMIT-STALE rid=%s age_s=%.1f epoch=%d -- D's COMMITTED marker was not resolved "
+                               "within %.1f s (D's loop stopped between recv and launch?): counted as nothing P can get, the "
+                               "verdict no longer waits for it", rid, now - t0, self.epoch, Front.R6_COMMIT_STALE_S)
+            return True  # stale: no hold (not in ``_r6_commit_now``), and the caller counts nothing of it
+        self.__dict__.setdefault("_r6_commit_now", set()).add(str(rid))
+        return True
+
+    def _r6_commit_hold(self, sv: "phase_policy.SetVerdict") -> "phase_policy.SetVerdict":
+        """NF-RC30-R6STALE review A1 (SOLL R6/R7): a final set verdict (flip, reroute, park, D) made while a counted D prefill's
+        next chunk is COMMITTED and its exact free not yet reported waits one controller tick: the free can only ADD to S (a D
+        verdict could become R6) and a reroute must carry it. COLLECT stands. Bounded by D's own record (one D iteration)."""
+        pend = self.__dict__.get("_r6_commit_now") or set()
+        if not pend or sv.verdict == phase_policy.V_COLLECT:
+            return sv
+        self.counters["set_r6_commit_hold"] += 1
+        return phase_policy.SetVerdict(
+            phase_policy.V_COLLECT,
+            "R6 commit pending: D fixed the next chunk of %s, its exact rest follows with that chunk's start record (was %s: "
+            "%s)" % (",".join(sorted(pend)[:4]), sv.verdict, sv.why), sv.left_s, sv.s_tokens, sv.half_x)
 
     def _r6k_clear_class(self, rid: str) -> None:
         """SOLL R6k (review K1): forget the class of ``rid`` (a D refusal): unknown -> R6 as before, named."""
@@ -14320,20 +14385,25 @@ class Front:
         ``_d_carried_tokens`` (the X-SUM price of the kurz path) is unchanged: it prices every granted row."""
         self.__dict__["_r6_counted"] = {}  # S56: only this reading's counted rows may be redirected
         self.__dict__["_r6_in_flight"] = {}
+        self.__dict__["_r6_commit_now"] = set()
         if not envs.FLLIPER_PDFLIP_ENABLE_DECODE_COLLECT_PREFILL_BUSY.get():
             return 0
         # S56: a started row counts D's REAL rest, and only when the front redirects it to P (``_r6_tokens_of``)
         running = Front._d_pf_pending_tokens(self, started_only=True, d_rest=True)
         granted = Front._d_pf_pending_tokens(self)
-        if granted > running:
+        # review A4 (NF-RC30-R6STALE): with beacon v4 a STARTED row counts only its unlaunched rest (``running`` < granted for
+        # every chunk in flight) -- "not begun" is named only for rows D has really not begun (the instrument may not lie)
+        unstarted = (Front._d_pf_pending_tokens(self, unstarted_only=True) if _dxb.enabled()
+                     else max(0, granted - running))
+        if unstarted > 0:
             # named once per change: a granted D prefill D has not begun is NOT in R6's S (S49)
             self.counters["r6_not_started_skipped"] += 1
             key = (granted, running)
             if self.__dict__.get("_r6_ns_last") != key:
                 self.__dict__["_r6_ns_last"] = key
-                logger.info("PDFLIP R6-NOT-STARTED granted=%d running=%d epoch=%d -- granted D prefill(s) D has not "
-                            "begun do not count into the set's S (SOLL R6, user 18.10. \"Nur echt laufend zählt\"; a "
-                            "big member waits its T_halb, R4)", granted, running, self.epoch)
+                logger.info("PDFLIP R6-NOT-STARTED granted=%d running=%d unstarted=%d epoch=%d -- granted D prefill(s) D has "
+                            "not begun do not count into the set's S (SOLL R6, user 18.10. \"Nur echt laufend zählt\"; a "
+                            "big member waits its T_halb, R4)", granted, running, unstarted, self.epoch)
         return running
 
     def _r1u_running(self, running: int, members: Sequence["phase_policy.SetMember"]) -> int:
@@ -14341,7 +14411,9 @@ class Front:
         flipped, P computed 797): the R6 rest and the members share an uncached piece -> counted ONCE. Takes the union of the
         pieces out of the counted rests (``phase_policy.running_overlap``), exact from the front token ids and the depths; a
         counted prefill whose ids are not kept is NAMED (``r1u_overlap_unknown``) and counts in full."""
-        if running <= 0 or not _fd.enabled():
+        self.__dict__["_r1u_member_off"] = 0
+        in_flight = dict(self.__dict__.get("_r6_in_flight") or {})
+        if (running <= 0 and not any(int(v) > 0 for v in in_flight.values())) or not _fd.enabled():
             return running
         try:
             counted = dict(self.__dict__.get("_r6_counted") or {})
@@ -14350,12 +14422,15 @@ class Front:
             book = self.__dict__.get("_set_depth") or {}
             by_rid = {str(q.rid): q for q in list(getattr(self, "queue", ()) or ())}
             runs = []
-            for rid, rest in counted.items():
+            for rid in dict.fromkeys(list(counted) + list(in_flight)):
+                free = int(counted.get(rid, 0))
+                infl = int(in_flight.get(rid, 0))
                 ia = ids.get(str(rid))
                 if ia is None or not sess_of.get(str(rid)):
                     self.counters["r1u_overlap_unknown"] += 1
                     continue
-                runs.append((str(rid), len(ia) - int(rest), int(rest), str(sess_of.get(str(rid)))))
+                # the counted (unlaunched) rest sits at [N - free, N); the launched chunk(s) right before it (review A3)
+                runs.append((str(rid), len(ia) - free, free, str(sess_of.get(str(rid))), infl))
             mem = []
             for m in members:
                 d = book.get(str(m.rid))
@@ -14368,9 +14443,17 @@ class Front:
                     self.counters["r1u_depth_unknown"] += 1
                     continue
                 mem.append((m.rid, int(d), str(sess_of.get(str(m.rid)) or "")))
-            ov = phase_policy.running_overlap(runs, mem, lambda a, b: Front._set_common(self, a, b))
+            ov, ov_m = phase_policy.running_overlap_split(runs, mem, lambda a, b: Front._set_common(self, a, b))
         except Exception:  # noqa: BLE001 -- an exactness aid never breaks a verdict: the naive figure stands
             return running
+        if ov_m > 0:
+            # review A3 (R1u "neu zu rechnende Token"): a member's share of a chunk D has launched is read by P from the store --
+            # taken off the members' side (``_r1u_members``), never below zero per member
+            self.__dict__["_r1u_member_off"] = int(ov_m)
+            self.counters["r1u_member_inflight_tokens"] += int(ov_m)
+            logger.info("PDFLIP R1U-INFLIGHT member_share=%d epoch=%d -- set members share a chunk D has already launched for a "
+                        "running prefill: P reads it from the store, it is no new token of the set (SOLL R1u, R6, R7)",
+                        int(ov_m), self.epoch)
         if ov > 0:
             self.counters["r1u_overlap_tokens"] += ov
             key = (running, ov)
@@ -14380,6 +14463,22 @@ class Front:
                             "members share an uncached piece: counted ONCE in S (SOLL R1u, R1, R6)", running, ov, running - ov,
                             self.epoch)
         return max(0, running - ov)
+
+    def _r1u_members(self, members: Sequence["phase_policy.SetMember"]) -> List["phase_policy.SetMember"]:
+        """Review A3 (SOLL R1u): take the members' share of a launched D chunk (``_r1u_running``'s ``_r1u_member_off``) off their
+        ``uncached`` (the figure S sums), in member order, never below 0; ``own_uncached`` keeps the arrival figure, so the
+        class (R2) is unchanged. Nothing to take: the members as they are."""
+        off = int(self.__dict__.get("_r1u_member_off") or 0)
+        if off <= 0:
+            return list(members)
+        out = []
+        for m in members:
+            take = min(off, max(0, int(m.uncached)))
+            off -= take
+            if take > 0:
+                m = dataclasses.replace(m, uncached=int(m.uncached) - take, own_uncached=int(m.own_uncached or m.uncached))
+            out.append(m)
+        return out
 
     def _dc_d_busy(self) -> bool:
         """D decodes, or prefills a granted SHORT: the arrivals are priced as a SET (X-SUM-PRICE, ``carried`` in the sum).
@@ -15290,6 +15389,7 @@ class Front:
         # priority. ``urgent`` stays for the log only.
         urgent = Front._prio_urgent(self, cands)
         running = Front._r1u_running(self, self._dc_carried_running(), members)
+        members = Front._r1u_members(self, members)  # review A3: a member's share of a launched D chunk is not new
         unstarted = 0
         if _fd.enabled():
             # EZ-S2a: ONE decision. S49's granted-not-started term is an INPUT of the verdict (NS:S49), not a second pass
@@ -15321,6 +15421,7 @@ class Front:
                 d_prefill_running_uncached=running,  # R6: what D REALLY prefills right now counts into S (S49)
                 new_since_last=max(0, len(members) - st["seen"]), class_x_tokens=x_cls)
             sv = Front._set_xsum_hold(self, sv, x_tok, running, decoding=decoding)
+        sv = Front._r6_commit_hold(self, sv)  # review A1: no final verdict while a counted prefill's next chunk is COMMITTED
         kw = dict(x_tok=x_tok, x_cls=x_cls, frac=frac, t_half=t_half, decoding=decoding, seats=seats,
                   waited=max(0.0, now - st["t_open"]), xk=xk, unstarted=unstarted)
         st["urgent"] = urgent
@@ -15816,10 +15917,13 @@ class Front:
                                                         else 0))
                    for q in live_q]
         decoding, seats = self._dc_decoding(), self._set_seats_free()
+        _run = Front._r1u_running(self, self._dc_carried_running(), members)
+        members = Front._r1u_members(self, members)  # review A3
         sv = phase_policy.set_verdict(members=members, x_tokens=x_tok, half_frac=frac, t_half_s=0.0, now=now,
                                       t_open=min(m.t_arrive for m in members), d_decoding=decoding, seats_free=seats,
-                                      d_prefill_running_uncached=Front._r1u_running(self, self._dc_carried_running(), members), new_since_last=0,
+                                      d_prefill_running_uncached=_run, new_since_last=0,
                                       class_x_tokens=x_cls)
+        sv = Front._r6_commit_hold(self, sv)  # review A1
         self._set_log(st, members, sv, verdict=sv.verdict, why="queue-sum " + sv.why, x_tok=x_tok, frac=frac,
                       t_half=t_half, decoding=decoding, seats=seats, waited=0.0, x_cls=x_cls, xk=xk)
         self.counters["set_" + sv.verdict.lower()] += 1

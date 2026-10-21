@@ -358,8 +358,12 @@ def test_r1u_a_shared_piece_of_the_running_rest_and_a_member_counts_once_no_flip
     sv = [m for m in caplog.messages if "PDFLIP SET-VERDICT" in m]
     assert dc == "hold", (dc, sv)
     assert not any("verdict=REROUTE_P" in m for m in sv) and f.counters["set_reroute_p"] == 0
-    assert any(" S=3068 " in m for m in sv), sv
+    # NF-RC30-R6STALE review A3: the member's [7000, 7089) lies in A's in-flight chunk [6089, 7089) -- P reads it from the store,
+    # so S = 3068 - 89 = 2979 (the 2911 of A's unlaunched rest are the member's own tail's front, counted once as before)
+    assert any(" S=2979 " in m for m in sv), sv
     assert f.counters["r1u_overlap_tokens"] == 2911 and any("PDFLIP R1U" in m for m in caplog.messages)
+    assert f.counters["r1u_member_inflight_tokens"] >= 89 and any("PDFLIP R1U-INFLIGHT member_share=89" in m
+                                                                   for m in caplog.messages)
 
 
 def test_r1u_siblings_without_overlap_keep_the_sum(monkeypatch, tmp_path):
