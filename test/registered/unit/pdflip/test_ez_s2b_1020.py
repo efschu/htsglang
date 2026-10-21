@@ -249,25 +249,36 @@ def test_c_a_prefill_whose_forward_has_ended_is_no_part_of_s_no_r6(monkeypatch, 
     assert f.counters["r6_rest_computed"] >= 1
 
 
-def test_c_a_prefill_whose_forward_is_still_running_counts_r6_stays(monkeypatch, tmp_path):
-    """The SOLL R6 / user decision 18.10. side, same fixture, same real pop: the extend batch has STARTED and its forward has not
-    ended -> the rest (182) counts, S = 198182 > X -> REROUTE_P. A GESTARTETER kurzer D prefill counts (no class rule)."""
+def test_c_a_prefill_whose_forward_is_still_running_counts_only_its_unlaunched_rest(monkeypatch, tmp_path):
+    """The SOLL R6 / user decision 18.10. side, same fixture, same real pop. NF-RC30-R6STALE (R6 + R7): the single extend batch of
+    the 182-token rest has STARTED and its forward has not ended -- the whole rest is in a launched forward, it ends on D and P
+    never computes it: nothing counts (named ``r6_rest_in_flight``), the big request waits its T_halb (R4). A chunked prefill
+    whose later chunk is not launched yet counts that part: rest 1000, chunk 400 in flight -> 600, S > X -> REROUTE_P."""
     _on(monkeypatch)
     now = time.time()
     f = _front_c(now, 566, tmp_path, done=False)
     with envs.FLLIPER_PDFLIP_DECIDER.override(True):
-        assert f._dc_carried_running() == 182
+        assert f._dc_carried_running() == 0 and f.counters["r6_rest_in_flight"] >= 1
+        assert f._decode_collect(now) == "hold" and f.counters["set_reroute_p"] == 0 and f.counters["r6_redirected"] == 0
+    d2 = tmp_path / "chunked"
+    d2.mkdir()
+    f = _front_c(now, 566, d2, done=False)
+    _beacon_reading(f, d2, RID_K, now - 0.717, 1000, 400, done=False)
+    with envs.FLLIPER_PDFLIP_DECIDER.override(True):
+        assert f._dc_carried_running() == 600
         assert f._decode_collect(now) == "P" and f.counters["set_reroute_p"] == 1 and f.counters["r6_redirected"] == 1
 
 
 def test_c_rank_equality_the_max_over_ranks_keeps_the_rest_until_every_rank_is_done(monkeypatch, tmp_path):
     """R11: the front takes the MAX over the ranks -- one rank that has not finished its forward keeps the rest alive; all ranks
-    done -> 0. Same answer whatever the file order."""
+    done -> 0. Same answer whatever the file order. NF-RC30-R6STALE: the rest stays alive (``rest_of`` 182: D still computes it),
+    but nothing of it is unlaunched, so R6 counts 0."""
     _on(monkeypatch)
     now = time.time()
     f = _front_c(now, 566, tmp_path, ranks=2, done_ranks=1)
     with envs.FLLIPER_PDFLIP_DECIDER.override(True):
-        assert f._dc_carried_running() == 182
+        assert dxb.rest_of(f._d_ext_reading(), RID_K, now - 0.9) == 182
+        assert f._dc_carried_running() == 0
     d2 = tmp_path / "all_done"
     d2.mkdir()
     f = _front_c(now, 566, d2, ranks=2, done_ranks=2)
@@ -291,18 +302,21 @@ def test_c_off_is_the_s2a_code_s_includes_the_rest_of_a_running_prefill(monkeypa
     _on(monkeypatch)
     now = time.time()
     f = _front_c(now, 566, tmp_path, done=False)
+    _beacon_reading(f, tmp_path, RID_K, now - 0.717, 1000, 818, done=False)
     with envs.FLLIPER_PDFLIP_DECIDER.override(False), caplog.at_level(logging.INFO, logger="pdflip.front"):
-        assert f._dc_carried_running() == 182
+        assert f._dc_carried_running() == 182          # NF-RC30-R6STALE: rest 1000, chunk 818 in flight -> 182 unlaunched
         f._decode_collect(now)
     sv = [m for m in caplog.messages if "PDFLIP SET-VERDICT" in m]
     assert any("verdict=REROUTE_P" in m and "S=198182" in m for m in sv), sv
 
 
 def test_c_a_halb_member_that_is_running_counts_its_rest(monkeypatch, tmp_path):
-    """R6 for a prefill that began as halb (u >= halbX): while its forward runs, its rest counts."""
+    """R6 for a prefill that began as halb (u >= halbX): while its forward runs, its rest counts -- NF-RC30-R6STALE: the part no
+    forward was launched for (rest 1000, chunk 818 in flight -> 182)."""
     _on(monkeypatch)
     now = time.time()
     f = _front_c(now, 5000, tmp_path, done=False)
+    _beacon_reading(f, tmp_path, RID_K, now - 0.717, 1000, 818, done=False)
     with envs.FLLIPER_PDFLIP_DECIDER.override(True):
         assert f._dc_carried_running() == 182
 

@@ -56,6 +56,19 @@ as soon as the forward has really ended on the device. ``note_extend_done`` (the
 already wrote is not written twice, what no event armed is written there as before, and a result always flushes the older armed
 batches first (one stream: an earlier forward has ended when a later one's result is in) -- the per-rid FIFO stays aligned. The
 record layout and ``_VERSION`` are unchanged; only the moment of the after-rest record moves to the forward's real end.
+
+NF-RC30-R6STALE (21.10., VERSION 4, SOLL R6 + R6k + R7 + R11; user order 19.10. "NICHTS SCHÄTZEN, EXAKTE ZAHLEN"): ``rest`` says
+what D still COMPUTES -- the start rest of the oldest batch whose forward has not ended (review A1, FIFO head), so it includes the
+chunk(s) D has already handed to a forward. Those chunks never reach P: an in-flight forward ends on D (an abort lands at D's next
+loop top, after it), its KV stays in D's tree and its write-through, and P reads it from the store. NF boot ``..._1021_063252``:
+pdflip-48-687 (u=3280 halb, chunk 1 = 2496 launched 07:53:11.128, chunk 2 = 784 launched 14.365) was counted with r6_rest=3280 at
+the R6 verdict 14,400 (chunk 1's done not yet polled when chunk 2 launched, chunk 2's forward then held the host 1.25 s), P computed
+16 tokens; pdflip-42-671 counted 4681 -> P 9; pdflip-46-680 counted 5151 -> P 2911 (= 5151 - chunk 1 of 2304, plus the store's
+page). v4 adds ``free`` to every record: the tokens of the request NO forward has been launched for (the newest launched batch's
+``rest_at_start - extend_len``; -1 = not known). That is what an R6 redirect can move to P, so it is what R6 counts into S.
+``rest`` keeps its meaning for the readers that ask "does D still compute it" (R6k finish hold, NF-1b ``_d_extending_rids``).
+Over the ranks ``free`` is the MIN: chunk boundaries are group-agreed (#794 GROUP-NARROWED, every rank cuts the same number) and
+a forward one rank launched runs on every rank (its collectives), so those tokens are D's on all of them.
 """
 from __future__ import annotations
 
@@ -75,10 +88,13 @@ _HDR_FMT = "<IIIqq"
 _HDR_SIZE = struct.calcsize(_HDR_FMT)
 _MAGIC = 0x44455842  # "DEXB"
 #: v3 (EZ-S2b review A2): the record LAYOUT is v2's; the SEMANTICS of ``rest`` gain the forward end -- see ``note_extend_done``
-_VERSION = 3
-#: one record (v2): rid key (u64, 0 = empty), FIRST extend start (epoch ns), rest tokens D has not computed at the
-#: batch start (-1 = not known), the rank's write counter (newest record of a key wins)
-_REC_FMT = "<Qqqq"
+_VERSION = 4
+#: one record (v4): rid key (u64, 0 = empty), FIRST extend start (epoch ns), rest tokens D has not computed at the
+#: batch start (-1 = not known), the rank's write counter (newest record of a key wins), free = tokens no forward has been
+#: launched for (NF-RC30-R6STALE; -1 = not known)
+_REC_FMT = "<Qqqqq"
+#: v2/v3 record (read only): the v4 record without ``free``
+_REC_FMT_V2 = "<Qqqq"
 #: v1 record (read only): rid key, extend start
 _REC_FMT_V1 = "<Qq"
 _REC_SIZE = struct.calcsize(_REC_FMT)
@@ -125,6 +141,8 @@ class DExtendBeacon:
         self._live: "collections.OrderedDict[str, int]" = collections.OrderedDict()
         #: v3: rid -> the rest once the CURRENT extend batch's forward has ended (rest at start - extend_len)
         self._after: "collections.OrderedDict[str, int]" = collections.OrderedDict()
+        #: v4 (NF-RC30-R6STALE): rid -> the tokens no forward has been launched for (the NEWEST launched batch's after-rest)
+        self._free: "collections.OrderedDict[str, int]" = collections.OrderedDict()
         #: NF-R6-REST-EXAKT: batch key (the rank's forward counter) -> (rids, ready) armed behind its forward, oldest first
         self._pending: "collections.OrderedDict[int, Tuple[list, Callable[[], bool]]]" = collections.OrderedDict()
         #: keys whose done the poll already wrote (the result path then writes nothing)
@@ -188,6 +206,18 @@ class DExtendBeacon:
             # rest of the OLDEST batch of this rid whose done is not written yet (the FIFO head), never less
             q0 = self._after.get(rid)
             report = int(q0[0][0]) if (q0 and rest >= 0) else rest
+            # v4 (NF-RC30-R6STALE): what no forward has been launched for -- this batch's prefix already covers every earlier
+            # launched chunk, so its start rest minus its own length is exactly the part an R6 redirect can still move to P
+            free = -1
+            if rest >= 0 and len_list is not None and i < len(len_list):
+                try:
+                    free = max(0, rest - max(0, int(len_list[i])))
+                except (TypeError, ValueError):
+                    free = -1
+            self._free.pop(rid, None)
+            self._free[rid] = free
+            while len(self._free) > ARMED_CAP:
+                self._free.popitem(last=False)
             if rest >= 0 and len_list is not None and i < len(len_list):
                 try:
                     # FIFO per rid (review A2a): with overlap scheduling chunk k+1 is launched before chunk k's result is
@@ -204,7 +234,7 @@ class DExtendBeacon:
             try:
                 off = _HDR_SIZE + (self._head % self._slots) * _REC_SIZE
                 self._head += 1
-                struct.pack_into(_REC_FMT, self.mm, off, rid_key(rid), int(t_first), int(rest), int(self._head))
+                struct.pack_into(_REC_FMT, self.mm, off, rid_key(rid), int(t_first), int(rest), int(self._head), int(free))
                 struct.pack_into("<q", self.mm, 12, self._head)
             except Exception:  # noqa: BLE001
                 return
@@ -273,10 +303,13 @@ class DExtendBeacon:
             after = q.popleft()[1]
             if not q:
                 self._after.pop(rid, None)
+            # v4: a later launched chunk keeps its own (smaller) free; with none launched it is this batch's after-rest
+            free = self._free.get(rid, after)
             try:
                 off = _HDR_SIZE + (self._head % self._slots) * _REC_SIZE
                 self._head += 1
-                struct.pack_into(_REC_FMT, self.mm, off, rid_key(rid), int(t_first), int(after), int(self._head))
+                struct.pack_into(_REC_FMT, self.mm, off, rid_key(rid), int(t_first), int(after), int(self._head),
+                                 int(free))
                 struct.pack_into("<q", self.mm, 12, self._head)
             except Exception:  # noqa: BLE001
                 return
@@ -285,6 +318,7 @@ class DExtendBeacon:
         """The rid left this rank (finished, aborted): no later extend re-reports it."""
         self._live.pop(rid, None)
         self._after.pop(rid, None)
+        self._free.pop(rid, None)
         self._armed.pop(rid, None)
 
 
@@ -319,16 +353,17 @@ def build(*, group: str, tag: str = "", env=None) -> Optional[DExtendBeacon]:
 
 def read_group_full(directory: str, group: str, sid: int,
                     session_of: Optional[Callable[[int], Optional[int]]] = None
-                    ) -> Optional[Dict[int, Tuple[int, int]]]:
-    """``{rid_key: (first extend start ns, rest)}`` over the group's LIVE ranks (pid in the group's session); None when
+                    ) -> Optional[Dict[int, Tuple[int, int, int]]]:
+    """``{rid_key: (first extend start ns, rest, free)}`` over the group's LIVE ranks (pid in the group's session); None when
     no such file is readable (no channel -- nothing is proven running). Per rank the NEWEST record of a key (its write
     counter); over ranks the larger start and, separately, the larger rest (deterministic: the file order never decides).
-    ``rest`` -1 = the rank did not report one (a v1 file)."""
+    ``rest`` -1 = the rank did not report one (a v1 file). ``free`` (v4): the MIN over the ranks that report one (a forward one
+    rank launched runs on all), -1 = no rank reported one (a v1-v3 file)."""
     if not directory or not sid:
         return None
     if session_of is None:
         from flliper.srt.pdflip.front_health import pid_session as session_of
-    out: Dict[int, Tuple[int, int]] = {}
+    out: Dict[int, Tuple[int, int, int]] = {}
     seen = False
     for path in sorted(glob.glob(os.path.join(directory, f"{group}-pid*.bin"))):
         try:
@@ -337,26 +372,38 @@ def read_group_full(directory: str, group: str, sid: int,
             magic, ver, slots, _head, pid = struct.unpack_from(_HDR_FMT, raw, 0)
         except Exception:  # noqa: BLE001
             continue
-        if magic != _MAGIC or ver not in (1, 2, _VERSION) or session_of(int(pid)) != int(sid):
+        if magic != _MAGIC or ver not in (1, 2, 3, _VERSION) or session_of(int(pid)) != int(sid):
             continue
         seen = True
-        own: Dict[int, Tuple[int, int, int]] = {}  # key -> (seq, t_first, rest)
+        own: Dict[int, Tuple[int, int, int, int]] = {}  # key -> (seq, t_first, rest, free)
         if ver == 1:
             rs = struct.calcsize(_REC_FMT_V1)
             n = min(int(slots), max(0, (len(raw) - _HDR_SIZE) // rs))
             for key, t_ns in struct.iter_unpack(_REC_FMT_V1, raw[_HDR_SIZE:_HDR_SIZE + n * rs]):
                 if key and (key not in own or t_ns > own[key][1]):
-                    own[key] = (0, int(t_ns), -1)
+                    own[key] = (0, int(t_ns), -1, -1)
+        elif ver in (2, 3):
+            rs = struct.calcsize(_REC_FMT_V2)
+            n = min(int(slots), max(0, (len(raw) - _HDR_SIZE) // rs))
+            for key, t_ns, rest, seq in struct.iter_unpack(_REC_FMT_V2, raw[_HDR_SIZE:_HDR_SIZE + n * rs]):
+                if key and (key not in own or seq > own[key][0]):
+                    own[key] = (int(seq), int(t_ns), int(rest), -1)
         else:
             n = min(int(slots), max(0, (len(raw) - _HDR_SIZE) // _REC_SIZE))
-            for key, t_ns, rest, seq in struct.iter_unpack(_REC_FMT, raw[_HDR_SIZE:_HDR_SIZE + n * _REC_SIZE]):
+            for key, t_ns, rest, seq, free in struct.iter_unpack(_REC_FMT, raw[_HDR_SIZE:_HDR_SIZE + n * _REC_SIZE]):
                 if key and (key not in own or seq > own[key][0]):
-                    own[key] = (int(seq), int(t_ns), int(rest))
-        for key, (_seq, t_ns, rest) in own.items():
+                    own[key] = (int(seq), int(t_ns), int(rest), int(free))
+        for key, (_seq, t_ns, rest, free) in own.items():
             prev = out.get(key)
             # review A2b (R11): the start stamp and the rest are merged SEPARATELY -- the later start never decides the rest;
-            # the MAX rest over the ranks does (a rank that has not finished keeps it alive)
-            out[key] = (t_ns, rest) if prev is None else (max(prev[0], t_ns), max(prev[1], rest))
+            # the MAX rest over the ranks does (a rank that has not finished keeps it alive). v4: ``free`` is the MIN over the
+            # ranks that report one (chunk boundaries are group-agreed; a launched forward runs on every rank)
+            if prev is None:
+                out[key] = (t_ns, rest, free)
+            else:
+                pf = prev[2]
+                mf = free if pf < 0 else (pf if free < 0 else min(pf, free))
+                out[key] = (max(prev[0], t_ns), max(prev[1], rest), mf)
     return out if seen else None
 
 
@@ -374,6 +421,19 @@ def _entry(reading, rid: str) -> Optional[Tuple[int, int]]:
     if isinstance(v, tuple):
         return int(v[0]), int(v[1])
     return int(v), -1  # a start-only reading (v1 file, or a caller's stub)
+
+
+def free_of(reading: Optional[Dict[int, object]], rid: str, t_grant_s: float) -> Optional[int]:
+    """NF-RC30-R6STALE (v4, SOLL R6 + R7): the tokens of ``rid`` NO forward of D has been launched for -- what an R6 redirect can
+    still move to P -- when D began it at or after its grant. A reading without ``free`` (v1-v3 file, a caller's 2-tuple stub, a
+    rank that did not report it) falls back to the rest (``rest_of``, the pre-v4 figure); None = not started / no rest."""
+    rest = rest_of(reading, rid, t_grant_s)
+    if rest is None:
+        return None
+    v = reading.get(rid_key(rid)) if reading else None
+    if isinstance(v, tuple) and len(v) >= 3 and int(v[2]) >= 0:
+        return min(int(v[2]), int(rest))
+    return int(rest)
 
 
 def started(reading: Optional[Dict[int, object]], rid: str, t_grant_s: float) -> bool:

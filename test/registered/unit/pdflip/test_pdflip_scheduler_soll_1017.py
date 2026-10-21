@@ -251,15 +251,16 @@ def test_r6k_kurz_running_and_a_halb_set_under_x_no_flip(monkeypatch, caplog, tm
 
 
 def test_r6k_halb_running_r6_as_before(monkeypatch, caplog, tmp_path):
-    """R6 bleibt fuer laufende Halb-Prefills: halber laufender (Rest 4000, Forward laeuft) + halbes Set u=3600: S = 7600 > X ->
-    REROUTE_P why=R6, der halbe wird nach P umgeleitet (R6-REDIRECT)."""
+    """R6 bleibt fuer laufende Halb-Prefills: halber laufender (Rest 6000, Chunk 2048 im Forward) + halbes Set u=3600: S = 3600 +
+    3952 = 7552 > X -> REROUTE_P why=R6, der halbe wird nach P umgeleitet (R6-REDIRECT). NF-RC30-R6STALE (R6 + R7): S zaehlt
+    nur, was nach P geht -- den Teil, fuer den D noch keinen Forward gestartet hat (der laufende Chunk endet auf D)."""
     import logging as _lg
 
     from flliper.srt.environ import envs
 
-    now, f = _r6k_front(monkeypatch, tmp_path, member_u=3600, klass="halb", ended=False, rest_start=4000, ext_len=2048)
+    now, f = _r6k_front(monkeypatch, tmp_path, member_u=3600, klass="halb", ended=False, rest_start=6000, ext_len=2048)
     with envs.FLLIPER_PDFLIP_DECIDER.override(True), caplog.at_level(_lg.INFO, logger="pdflip.front"):
-        assert f._dc_carried_running() == 4000
+        assert f._dc_carried_running() == 3952
         assert f._decode_collect(now) == "P"
     assert any("verdict=REROUTE_P" in m and "why=R6" in m for m in _r6k_lines(caplog, "PDFLIP SET-VERDICT"))
     assert f.counters["r6_redirected"] == 1
@@ -273,10 +274,10 @@ def test_r6k_halb_and_kurz_running_r6_moves_only_the_halb(monkeypatch, caplog, t
     from test_nf_r6_rest_exakt_1020 import add_running
     from flliper.srt.environ import envs
 
-    now, f = _r6k_front(monkeypatch, tmp_path, member_u=3600, klass="halb", ended=False, rest_start=4000, ext_len=2048)
+    now, f = _r6k_front(monkeypatch, tmp_path, member_u=3600, klass="halb", ended=False, rest_start=6000, ext_len=2048)
     add_running(f, now, tmp_path, "pdflip-12-276", rest_start=900, ext_len=900, ended=False, klass="kurz", key=37870)
     with envs.FLLIPER_PDFLIP_DECIDER.override(True), caplog.at_level(_lg.INFO, logger="pdflip.front"):
-        assert f._dc_carried_running() == 4000
+        assert f._dc_carried_running() == 3952      # NF-RC30-R6STALE: the halb's unlaunched 6000-2048, the kurz not at all
         assert f._decode_collect(now) == "P"
     red = _r6k_lines(caplog, "R6-REDIRECT")
     assert red and "pdflip-12-275" in red[0] and "pdflip-12-276" not in red[0], red
