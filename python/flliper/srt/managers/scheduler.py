@@ -19135,8 +19135,10 @@ class Scheduler(
         self._pdflip_ready_ms = (_wk_t3 - _wk_t2b) * 1000.0
         # TWIN ANCHOR (pdflip/twin_anchor.py): the boundaries of twins still
         # queued behind this batch's requests (None when off / none queued)
-        new_batch.pdflip_twin_bounds = _pdflip_twin_anchor.batch_bounds(
-            can_run_list, self.waiting_queue, page=self.page_size
+        # NF-TWIN-ROW 1021: PP0 decides them, a PP follower adopts PP0's row from
+        # this pass's proxy frame -- never from its own waiting queue
+        new_batch.pdflip_twin_bounds = _pdflip_twin_anchor.plan_bounds(
+            self, can_run_list, self.waiting_queue, page=self.page_size
         )
         try:
             new_batch.prepare_for_extend()

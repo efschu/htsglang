@@ -73,8 +73,25 @@ def _node_has_state(node) -> bool:
 
 def pp0_admissible(scheduler, req, told: int) -> Optional[int]:
     """The prefix PP0's own tree can resume ``req`` from, capped at ``told``
-    keys; None = the probe could not be asked (no verdict)."""
-    return _admissible(scheduler, req, told, aligned=False)
+    keys; None = the probe could not be asked (no verdict).
+
+    NF-TF-GAP 1021 (rc27 _1021_020616, P log 22402-22405, pdflip-1-22): this is
+    the SAME expression the followers ack with (:func:`rank_resumable`, the
+    #1040 state-aligned load-back reach) and the one PP0's own admission applies
+    (``stamp_state_aligned_extent``). The bare ``device + host`` count it used
+    before does not count device KV that lies between the last device node WITH
+    a recurrent state and the host run (a node whose anchor only another rank
+    holds, or none): PP0 held device KV [18688,18880) without a state, the host
+    run [18880,139008) with its anchor at 139008 -- 18688 + 120128 = 138816 <
+    told 139008, ``#TF TOLD-FIDELITY`` refused, TF-RETRY fell to 18688 and
+    120320 tokens were recomputed, while both followers had acked 139008 and the
+    load-back (``_collect_new_prefix_indices``: every node up to the last device
+    node) plus the #1040 raise (key match reaches the anchor) reaches 139008 on
+    PP0 as well. The aligned reach can only be LOWER than ``device + host``
+    where the anchor lies below the host run's end (the admission stops there
+    too) and higher only up to the anchor the key match reaches -- the depth the
+    admission resumes from, never a depth it does not."""
+    return _admissible(scheduler, req, told, aligned=True)
 
 
 def rank_resumable(scheduler, req, told: int) -> Optional[int]:
@@ -83,7 +100,8 @@ def rank_resumable(scheduler, req, told: int) -> Optional[int]:
     plus the #988 load-back -- reaches for ``req``, capped at ``told`` keys;
     None = no verdict.
 
-    :func:`pp0_admissible` plus the load-back's own clamp: a host hit loads
+    The device + host match plus the load-back's own clamp (since NF-TF-GAP
+    1021 :func:`pp0_admissible` asks exactly this, too): a host hit loads
     back only up to the state anchor (``state_aligned_extent``, the
     expression ``stamp_state_aligned_extent`` applies), so a host KV run whose
     end carries no recurrent state stops the admission at the anchor below
