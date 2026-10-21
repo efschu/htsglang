@@ -27,7 +27,9 @@ from typing import Dict, List, Optional
 
 from . import names as N
 
-STATE_ROOTS = ("/spinning/docker-acceptance/nf/state", "/spinning/docker-acceptance/27b/state")
+# 21.10.: state-dev = the NF dev container (flliper-nf-dev, Dev-Staende im Fenster) writes its boots there; without it the page says
+# "no IPC sample" while the dev container serves (patched into the running release 8d32c66997 at 06:50Z, carried here)
+STATE_ROOTS = ("/spinning/docker-acceptance/nf/state", "/spinning/docker-acceptance/nf/state-dev", "/spinning/docker-acceptance/27b/state")
 SCHEMA = "pdflip.state/1"
 EVENT_SCHEMA = "pdflip.event/1"
 TERMINAL = ("refused_preflight", "stopped_clean", "dead")

@@ -42,7 +42,10 @@ from . import redact
 
 DEFAULT_PATH = "/spinning/gpu-arb/docs/features.json"
 DEFAULT_REPO = "/spinning/htsglang"
-STATE_ROOTS = {"NF": "/spinning/docker-acceptance/nf/state", "27B": "/spinning/docker-acceptance/27b/state"}
+#: a key "<MODEL>-<suffix>" is a further state root of that model (21.10.: NF-DEV = the dev container flliper-nf-dev); the feature view
+#: shows the model's live boot from any of its roots, else the newest (``last_boot_of``)
+STATE_ROOTS = {"NF": "/spinning/docker-acceptance/nf/state", "NF-DEV": "/spinning/docker-acceptance/nf/state-dev",
+               "27B": "/spinning/docker-acceptance/27b/state"}
 PROFILE_DIRS = ("/spinning/gpu-arb/docker/profiles", "/spinning/gpu-arb/docker")
 MODELS = ("NF", "27B")
 LIVE_STATES = ("launching", "loading", "ready", "serving", "flipping")
@@ -139,8 +142,8 @@ def rc_of_image(image: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
-def last_boot(root: str) -> Optional[dict]:
-    """The model's running or last boot: state.json behind ``current``, else the newest boot dir."""
+def _last_boot_mt(root: str):
+    """``(state, mtime of its state.json)`` of the model's running or last boot under ``root``, else ``(None, 0.0)``."""
     cand = []
     cur = os.path.join(root, "current")
     if os.path.isdir(cur):
@@ -153,13 +156,38 @@ def last_boot(root: str) -> Optional[dict]:
         pass
     for d in cand:
         try:
-            with open(os.path.join(d, "state.json")) as fh:
+            p = os.path.join(d, "state.json")
+            with open(p) as fh:
                 st = json.load(fh)
+            mt = os.path.getmtime(p)
         except (OSError, ValueError):
             continue
-        if st.get("kind") == "boot":
-            return st
-    return None
+        if isinstance(st, dict) and st.get("kind") == "boot":
+            return st, mt
+    return None, 0.0
+
+
+def last_boot(root: str) -> Optional[dict]:
+    """The model's running or last boot: state.json behind ``current``, else the newest boot dir."""
+    return _last_boot_mt(root)[0]
+
+
+def roots_of(state_roots: dict, model: str) -> list:
+    """The state roots of ``model``: its own key and every ``<model>-<suffix>`` key (NF -> NF, NF-DEV), in dict order."""
+    return [r for k, r in state_roots.items() if r and (k == model or str(k).startswith(model + "-"))]
+
+
+def last_boot_of(state_roots: dict, model: str) -> Optional[dict]:
+    """``last_boot`` over every root of ``model``: a boot in a live lifecycle state wins, else the one whose state.json is newest."""
+    best, best_key = None, None
+    for root in roots_of(state_roots, model):
+        st, mt = _last_boot_mt(root)
+        if st is None:
+            continue
+        key = ((st.get("lifecycle") or {}).get("state") in LIVE_STATES, float(mt))
+        if best_key is None or key > best_key:
+            best, best_key = st, key
+    return best
 
 
 def _boot_start(boot_id: str) -> Optional[float]:
@@ -987,7 +1015,7 @@ class Features:
         feats, err, sig = self.file.load()
         models, problems = [], []
         for model in MODELS:
-            st = last_boot(self.state_roots.get(model, ""))
+            st = last_boot_of(self.state_roots, model)
             bv = boot_view(st)
             ov = self.file.boot_overrides.get((bv or {}).get("boot_id") or "")
             if bv and isinstance(ov, dict) and ov.get("lifecycle"):
