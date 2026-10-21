@@ -89,6 +89,20 @@ def fingerprint(
     return (head, waiting_rids, running_rids, landed, generation)
 
 
+#: LENDPP-1021: the index of the landed-prefetch term in ``fingerprint``'s tuple (head, waiting, running, landed,
+#: generation) -- the one term the pass CONSUMES (``_get_new_batch_prefill_raw`` pops the drain memo)
+LANDED_TERM = 3
+
+
+def same_but_landed(fp: Optional[tuple], armed: Optional[tuple]) -> bool:
+    """LENDPP-1021: ``fp`` equals the ARMED fingerprint in every term but the landed prefetches -- what a reader
+    sees once the pass's drain memo is consumed (``landed`` reads ``()``) while nothing else changed. Replicated
+    terms only."""
+    if fp is None or armed is None or len(fp) != len(armed) or len(fp) <= LANDED_TERM:
+        return False
+    return all(a == b for i, (a, b) in enumerate(zip(fp, armed)) if i != LANDED_TERM)
+
+
 class DHeadHold:
     """One per scheduler. ``group_d`` is fixed at construction; ``token_cut`` is
     read per call (the Form A plan is installed after the scheduler is built) --
