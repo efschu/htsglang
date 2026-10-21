@@ -1255,7 +1255,7 @@ class MambaComponent(TreeComponent):
             if self.cache._pin_trace_every:
                 self.cache.record_pin_trace_mamba("dec", host=False)
 
-    def _alloc_mamba_slot(self) -> Optional[torch.Tensor]:
+    def _alloc_mamba_slot(self, donation: bool = False) -> Optional[torch.Tensor]:
         """Allocate one mamba pool slot, evicting if necessary.
 
         Returns ``None`` when the pool is exhausted and eviction frees nothing
@@ -1264,6 +1264,14 @@ class MambaComponent(TreeComponent):
         MUST handle ``None`` -- cache-insert paths skip the insert.
         """
         slot = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
+        self._d_fork_revoked_last = False
+        if slot is None and donation:
+            # D-FORK-ANCHOR review G1: a step DONATION takes back an unconsumed fork plan's slot before it evicts --
+            # see turn_anchor.revoke_for_donation (the caller orders its first write behind the fork batch's gather)
+            from flliper.srt.pdflip import turn_anchor as _ta
+
+            slot = _ta.revoke_for_donation()
+            self._d_fork_revoked_last = slot is not None
         if slot is None:
             self.cache.evict(EvictParams(num_tokens=0, mamba_num=1))
             slot = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
@@ -1617,7 +1625,7 @@ class MambaComponent(TreeComponent):
             # skip cannot leave the request's buffer half-donated.
             if self.int8_ckpt_pool is not None:
                 if self.enable_mamba_extra_buffer:
-                    new_slot = self._alloc_mamba_slot()
+                    new_slot = self._alloc_mamba_slot(donation=True)
                     ckpt_slot = (
                         None if new_slot is None else self._alloc_int8_ckpt_slot()
                     )
@@ -1644,7 +1652,7 @@ class MambaComponent(TreeComponent):
                     if mamba_value_donated is None:
                         return 0
             elif self.enable_mamba_extra_buffer:
-                new_slot = self._alloc_mamba_slot()
+                new_slot = self._alloc_mamba_slot(donation=True)
                 if new_slot is None:
                     return 0
                 mamba_value_donated = (
@@ -1653,9 +1661,16 @@ class MambaComponent(TreeComponent):
                     )
                 )
             else:
-                mamba_value_donated = self._alloc_mamba_slot()
+                mamba_value_donated = self._alloc_mamba_slot(donation=True)
                 if mamba_value_donated is None:
                     return 0
+                if getattr(self, "_d_fork_revoked_last", False) and torch.cuda.is_available():
+                    # D-FORK-ANCHOR review G1, COPY branch: the copy below writes the revoked slot on the CURRENT
+                    # stream, which is not ordered behind the fork batch's late gather on the forward stream. Not
+                    # reached in production -- D fork plans exist only with extra_buffer (turn_anchor.armed), which
+                    # takes the ping-pong branches above -- so this fence costs nothing there and keeps the branch
+                    # correct by construction if a configuration ever reaches it.
+                    torch.cuda.synchronize()
                 # mamba_pool is a pure PHYSICAL store; translate both slot ids
                 # virtual->physical (identity for the non-unified memory pool) first.
                 translate = self.cache.req_to_token_pool.translate_mamba_indices

@@ -62,6 +62,11 @@ def group_d(monkeypatch):
     monkeypatch.setenv("FLLIPER_PDFLIP_GEN_FORK_ANCHOR", "0")   # the turn track alone (page 1: gen joins otherwise)
     monkeypatch.delenv("FLLIPER_PDFLIP_D_FORK_ANCHOR", raising=False)
     monkeypatch.setattr(urc, "_PDFLIP_END_ANCHOR", True)
+    from flliper.srt.pdflip import turn_anchor as ta
+
+    # review G1: the in-flight registry is per process -- every test starts with an empty one (a plan another test's
+    # fixture left unconsumed must not lend this test's donation a slot of a different pool)
+    monkeypatch.setattr(ta, "_INFLIGHT", [])
     return monkeypatch
 
 
@@ -400,9 +405,74 @@ def test_a4_an_anchor_short_on_a_fork_node_is_counted_apart(monkeypatch):
     from flliper.srt.pdflip import turn_anchor as ta
 
     monkeypatch.setattr(r12, "_host_flags", lambda node: (True, False))     # KV host yes, anchor host no
-    fork = SimpleNamespace()
+    root = SimpleNamespace(parent=None, key=())
+    fork = SimpleNamespace(parent=root, key=tuple(range(64)))
     setattr(fork, ta.D_FORK_KIND_ATTR, ("turn", 64))
+    deeper = SimpleNamespace(parent=root, key=tuple(range(96)))     # a split moved the mark onto a deeper piece
+    setattr(deeper, ta.D_FORK_KIND_ATTR, ("turn", 64))
+    assert r12._d_fork_anchor_short(deeper, 1, 1, 1) is False, "not at the fork's depth: a real short"
     assert r12._d_fork_anchor_short(fork, 1, 1, 1) is True
     assert r12._d_fork_anchor_short(SimpleNamespace(), 1, 1, 1) is False, "not a fork node: a real short"
     monkeypatch.setattr(r12, "_host_flags", lambda node: (False, False))    # the KV host copy missing too
     assert r12._d_fork_anchor_short(fork, 1, 1, 1) is False, "a missing KV host copy stays short"
+
+
+# -- re-review G1: an in-flight fork plan never starves another request's donation on TP0 alone ---------------------
+
+def test_g1_the_donation_takes_back_an_inflight_fork_slot_and_names_it(group_d, caplog):
+    from flliper.srt.pdflip import turn_anchor as ta
+
+    caplog.set_level(logging.INFO, TA_LOG)
+    host, r1, r2 = REV._inflight_pair(group_d, worker=False)
+    assert any("PDFLIP D-FORK-ANCHOR REVOKED" in m and "rid=pdflip-2-63" in m for m in caplog.messages), caplog.messages
+    plan = getattr(r1, ta.PENDING_ATTR)
+    assert plan[1] is None and plan[2] == "revoked_for_donation"
+    assert ta.insert_verdict(plan) == (False, "revoked_for_donation")
+    assert r2.cache_protected_len == 32, "R2's step node is in TP0's tree"
+
+
+def test_g1_mutant_without_the_revoke_splits_the_trees(group_d):
+    from flliper.srt.pdflip import turn_anchor as ta
+
+    group_d.setattr(ta, "revoke_for_donation", lambda: None)
+    host, _h1, h2 = REV._inflight_pair(group_d, worker=False)
+    wk, _w1, w2 = REV._inflight_pair(group_d, worker=True)
+    assert h2.cache_protected_len != w2.cache_protected_len or _structure(host) != _structure(wk)
+
+
+def test_g1_a_worker_and_group_p_never_revoke(group_d, monkeypatch):
+    from flliper.srt.pdflip import turn_anchor as ta
+
+    _as_worker(group_d, True)
+    assert ta.revoke_for_donation() is None
+    monkeypatch.setenv("FLLIPER_PDFLIP_GROUP", "P")
+    assert ta.revoke_for_donation() is None
+
+
+def test_g1_only_the_step_donation_may_take_a_fork_slot():
+    """A non-donation allocation (S90b / S109R device read: an H2D copy on the CURRENT stream, not ordered behind the
+    fork batch's late gather on the forward stream) must never take an in-flight fork slot: exactly the three step
+    donation sites pass donation=True (two ping-pong branches, first write on the forward stream; the copy branch
+    fences before its current-stream copy)."""
+    import inspect
+
+    from flliper.srt.mem_cache.unified_cache_components import mamba_component as mc
+
+    body = inspect.getsource(mc.MambaComponent._prepare_for_caching_req_impl)
+    src = inspect.getsource(mc.MambaComponent)
+    assert body.count("_alloc_mamba_slot(donation=True)") == 3
+    assert src.count("_alloc_mamba_slot(donation=True)") == 3, "no other caller may revoke"
+    i = body.index("mamba_value_donated = self._alloc_mamba_slot(donation=True)")
+    assert body.index("torch.cuda.synchronize()", i) < body.index("copy_from(", i), "the fence precedes the copy"
+
+
+def test_g1_a_revoked_plan_is_inserted_split_only_on_the_host(group_d, caplog):
+    caplog.set_level(logging.INFO, TA_LOG)
+    host, r1, r2 = REV._inflight_pair(group_d, worker=False)
+    TA0._state(host, r1.mamba_pool_idx, TA0.S_END)
+    TA0._finish(host, r1)
+    wk, w1, w2 = REV._inflight_pair(group_d, worker=True)
+    TA0._state(wk, w1.mamba_pool_idx, TA0.S_END)
+    TA0._finish(wk, w1)
+    assert _structure(host) == _structure(wk)
+    assert any("state=split_only" in m and "why=revoked_for_donation" in m for m in caplog.messages), caplog.messages

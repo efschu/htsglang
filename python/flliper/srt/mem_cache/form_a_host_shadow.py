@@ -1658,8 +1658,18 @@ def _d_fork_anchor_short(node: Any, exists: int, kv: int, m: int) -> bool:
     shortfalls only. Only the anchor may be short: a missing KV host copy stays ``short``."""
     from flliper.srt.pdflip.turn_anchor import D_FORK_KIND_ATTR
 
-    if getattr(node, D_FORK_KIND_ATTR, None) is None:
+    mark = getattr(node, D_FORK_KIND_ATTR, None)
+    if mark is None:
         return False
+    if isinstance(mark, tuple):
+        # re-review: the mark names the fork's end depth; a node that no longer ends there (a later split moved the
+        # mark onto a deeper piece) is no fork anchor -- a short there is a real short
+        depth, n = 0, node
+        while n is not None and getattr(n, "parent", None) is not None:
+            depth += len(getattr(n, "key", None) or ())
+            n = n.parent
+        if depth != int(mark[1]):
+            return False
     has_kv, has_m = _host_flags(node)
     want_kv = bool(exists and kv)
     want_m = bool(exists and m)

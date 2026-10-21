@@ -1321,10 +1321,70 @@ def _put_plan(batch: Any, desc: Optional["TurnTracks"], req: Any, row: int, attr
         if desc is None:
             desc = TurnTracks(len(batch.reqs), need=slot_state_kinds(batch.req_to_token_pool))
         desc.add(row, slot, t, prefix, end - prefix)
-        setattr(req, attr, (t, slot, desc, int(prefix), int(end)))
+        plan = (t, slot, desc, int(prefix), int(end))
+        setattr(req, attr, plan)
+        if d_mode():
+            _register_inflight(req, attr, plan)
     else:
         setattr(req, attr, (t, None, None, int(prefix), int(end)))   # D split-only
     return desc
+
+
+# -- D-FORK-ANCHOR review G1 (21.10.): the in-flight fork slots of THIS rank -----------------------------------------
+#: (req, attr, plan) of every D fork plan that holds a slot and was not consumed yet. Validated lazily: an entry whose
+#: request no longer carries that very plan tuple (consumed by the insert, freed as stale) is dropped on the next walk.
+_INFLIGHT: List[Tuple[Any, str, Any]] = []
+
+
+def _register_inflight(req: Any, attr: str, plan: Any) -> None:
+    _prune_inflight()
+    _INFLIGHT.append((req, attr, plan))
+
+
+def _prune_inflight() -> None:
+    _INFLIGHT[:] = [e for e in _INFLIGHT if getattr(e[0], e[1], None) is e[2]]
+
+
+def inflight_count() -> int:
+    _prune_inflight()
+    return len(_INFLIGHT)
+
+
+def revoke_for_donation() -> Any:
+    """Review G1: a fork slot is drawn at ``prepare_for_extend`` (batch N) but a last-step plan is consumed only by
+    ``process_batch_result(N)`` -- after the next scheduling. In that window ANOTHER request's step donation
+    (``cache_unfinished_req`` of the chunked request, an earlier entry of the same result loop) draws from a pool that
+    is short by exactly that slot on TP0 alone (a split-only worker drew none): TP0 alone would skip that request's
+    node. So the state-holding D rank's donation, when the free list is empty, takes back the slot of the OLDEST
+    unconsumed fork plan BEFORE it evicts anything: the plan turns split-only (``why=revoked_for_donation``), its node
+    at t is still inserted on every rank. TP0's donation sources are then a superset of every worker's (the workers
+    hold exactly these slots free). No reserve, no eviction.
+
+    STREAM ORDER (checked at the code): the three callers are the step donations of
+    ``MambaComponent.prepare_for_caching_req``. The two extra_buffer branches hand the slot to the donating request as
+    its PING-PONG track buffer (``donate_mamba_ping_pong_slot``): its first write is a later forward's track gather on
+    the forward stream, i.e. after batch N's late fork row into the same slot on that stream -- the old row is dead
+    bytes, overwritten. The copy branch (no extra_buffer -- unreachable with D fork plans, ``armed`` requires
+    extra_buffer) fences the device before its current-stream copy. No other allocation (S90b/S109R device reads,
+    the admission COW) may take a fork slot. A plan whose request left without consuming it (the F5 leak) is
+    revoked like any other -- its slot comes back. Returns the slot (a one-element tensor) or None."""
+    if not d_mode() or d_split_only_rank():
+        return None
+    _prune_inflight()
+    while _INFLIGHT:
+        req, attr, plan = _INFLIGHT.pop(0)
+        if getattr(req, attr, None) is not plan:
+            continue
+        t, slot, _desc, prefix, end = plan
+        setattr(req, attr, (t, None, "revoked_for_donation", int(prefix), int(end)))
+        n = _count("d_revoked")
+        if n <= 64 or (n & (n - 1)) == 0:
+            logger.info("PDFLIP D-FORK-ANCHOR REVOKED n=%d rid=%s kind=%s at=%d (an unconsumed fork plan gave its "
+                        "slot to another request's step donation: the free list was empty on this rank and the "
+                        "workers hold this slot free -- the fork goes split-only)", n,
+                        str(getattr(req, "rid", "?")), _ATTR_KIND.get(attr, "?"), int(t))
+        return slot
+    return None
 
 
 def _free_slot(batch_or_pool: Any, slot) -> None:
@@ -1372,8 +1432,10 @@ def forward_rows(forward_batch: Any) -> Optional[TurnTracks]:
 
 
 def insert_verdict(pend) -> Tuple[bool, str]:
-    """(insert?, reason) for a consumed plan."""
+    """(insert?, reason) for a consumed plan. A revoked D plan (review G1) carries its reason in the desc field."""
     t, slot, desc, prefix, end = pend
+    if isinstance(desc, str):
+        return False, desc
     if desc is None or slot is None:
         return False, "no_plan"
     if not desc.complete():
@@ -1423,6 +1485,7 @@ def note_skip(req: Any, reason: str, t: int, kind: str = "turn") -> None:
 
 # -- D-FORK-ANCHOR witnesses (21.10.) ------------------------------------------------
 D_FORK_KIND_ATTR = "pdflip_d_fork_kind"
+_ATTR_KIND = {PENDING_ATTR: "turn", CLOSE_PENDING_ATTR: "close", GEN_PENDING_ATTR: "gen"}
 
 
 def _d_role() -> str:

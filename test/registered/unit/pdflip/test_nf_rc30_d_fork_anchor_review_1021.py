@@ -206,10 +206,7 @@ def _inflight_pair(monkeypatch, worker: bool):
     return fx, r1, r2
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "REVIEW NACHPRUEFUNG G1 (9a98793acf): the A1 guard covers only the fork-owning request's own donation; a fork slot "
-    "drawn at prepare N and consumed in process_batch_result(N) is in flight across the next scheduling, and another "
-    "request's chunk donation on TP0 finds the pool short by that slot (workers drew none) -> TP0 alone skips."))
+# REVIEW NACHPRUEFUNG G1 fixed (turn_anchor.revoke_for_donation at the step donation): the strict-xfail marker is removed.
 def test_an_inflight_fork_plan_does_not_make_tp0_skip_another_requests_step_node(group_d):
     host, _h1, h2 = _inflight_pair(group_d, worker=False)
     wk, _w1, w2 = _inflight_pair(group_d, worker=True)
