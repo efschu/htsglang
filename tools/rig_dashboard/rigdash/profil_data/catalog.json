@@ -75570,7 +75570,7 @@
    "id": "FLLIPER_PDFLIP_SPILL_STATE_MEMO",
    "kind": "env",
    "lesestellen": [
-    "pdflip/spill_memo.py:51"
+    "pdflip/spill_memo.py:55"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_SPILL_STATE_MEMO",
@@ -75579,7 +75579,7 @@
    "source": {
     "file": "pdflip/spill_memo.py",
     "kind": "os.environ",
-    "line": 51,
+    "line": 55,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -91662,7 +91662,7 @@
   },
   "unexplained": 676
  },
- "tree_rev": "27b=b5588c97aa+nf=47e0703e37",
+ "tree_rev": "27b=b5588c97aa+nf=58e1022250",
  "trees": {
   "27b": {
    "entries": 2876,
@@ -91670,7 +91670,7 @@
   },
   "nf": {
    "entries": 2708,
-   "rev": "47e0703e37"
+   "rev": "58e1022250"
   }
  },
  "warnungen": []
