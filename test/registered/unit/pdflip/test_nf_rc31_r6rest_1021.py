@@ -266,8 +266,11 @@ def test_front_the_leg_closed_before_the_verdict_waits_then_goes_back_to_d_price
                 w.note_extend(rids=[RID], rests=[FREE1], extend_lens=[CHUNK2])
                 w.note_halt(rid=RID)
             assert f._decode_collect(now + 0.1) == "hold"
-            q = [q for q in f.queue if q.rid == RID]
-            assert len(q) == 1 and q[0].d_eligible and int(q[0].est_uncached) == FREE2 and not q[0].d_direct
+            # review A2 (SOLL R2): kurz by its halted rest -> D's admission line at once (QUEUED-SHORT), not after the set
+            assert not [q for q in f.queue if q.rid == RID]
+            q = [q for q in f._ready_for_d if q.rid == RID]
+            assert len(q) == 1 and q[0].d_eligible and int(q[0].est_uncached) == FREE2 and q[0].d_direct
+            assert f.counters["r6_halt_kurz_to_d_now"] == 1
             assert f._r6k_class[RID][0] == "kurz"
         finally:
             _close(loop, task)

@@ -640,10 +640,31 @@ def halted_free(reading: Optional[Dict[int, object]], rid: str, t_grant_s: float
     g = _of_grant(reading, rid, t_grant_s, key=halt_key(rid))
     if g is None:
         return None
+    # Review NF-RC31-R6REST A3 (SOLL R11, rank unanimity): the halt counts only once EVERY live rank that holds this grant's
+    # extend record has applied the abort. A rank that has not may still launch a chunk (its free would be smaller); reading the
+    # first rank alone would rest the verdict on one rank's state. Until then: None -> the verdict holds (liveness guard
+    # ``Front.R6_HALT_STALE_S`` names a rank that never halts). A reading without per-rank values (a stub) keeps the merged entry.
+    n_ext = _n_ranks_of_grant(reading, rid_key(rid), t_grant_s)
+    n_halt = _n_ranks_of_grant(reading, halt_key(rid), t_grant_s)
+    if n_ext is not None and n_halt is not None and n_halt < n_ext:
+        return None
     free = int(g[1])
     if free < 0:
         return None if int(g[0]) < 0 else int(g[0])
     return free
+
+
+def _n_ranks_of_grant(reading, key: int, t_grant_s: float) -> Optional[int]:
+    """Review A3: how many ranks carry a record under ``key`` of the grant at ``t_grant_s``; None = the reading has no per-rank
+    values (a stub, a caller's tuple) -- the count is not known."""
+    v = reading.get(int(key)) if reading else None
+    if v is None:
+        return 0
+    ranks = getattr(v, "ranks", None)
+    if not ranks:
+        return None
+    t0 = int(float(t_grant_s) * 1e9)
+    return sum(1 for r in ranks if int(r[0]) >= t0)
 
 
 def halt_capable(reading: Optional[Dict[int, object]]) -> bool:

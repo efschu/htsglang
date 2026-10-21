@@ -292,7 +292,11 @@ class TheReachIsOneCallChain(unittest.TestCase):
         self.assertEqual([f for f, _ in self._sites("_sum_priced_take")], ["_asr_queued_short_to_d"])
 
     def test_the_hand_over_is_called_only_from_the_arrival_seat_step(self):
-        self.assertEqual([f for f, _ in self._sites("_asr_queued_short_to_d")], ["_arrival_seat_step"])
+        # Review NF-RC31-R6REST A2 (SOLL R2): an R6-stopped prefill that goes back to D kurz by its halted rest takes the SAME
+        # hand-over (X-SUM price, seat) at once -- the set hold returns before the arrival-seat step reaches it. Second site,
+        # same function: the price is never bypassed.
+        self.assertEqual(sorted(f for f, _ in self._sites("_asr_queued_short_to_d")),
+                         ["_arrival_seat_step", "_r6_halt_enqueue"])
 
     def test_the_arrival_seat_step_is_called_once_in_the_arrival_seat_branch(self):
         sites = self._sites("_arrival_seat_step")
