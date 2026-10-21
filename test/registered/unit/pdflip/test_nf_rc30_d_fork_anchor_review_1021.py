@@ -216,11 +216,7 @@ def test_an_inflight_fork_plan_does_not_make_tp0_skip_another_requests_step_node
 
 # -- (R5) Nachprüfung G1 (b197da0c60): the in-flight registry must not outlive a pool reset -------------------------
 
-@pytest.mark.xfail(strict=True, reason=(
-    "REVIEW NACHPRUEFUNG N1 (b197da0c60): turn_anchor._INFLIGHT validates an entry only by 'the request still carries "
-    "that plan tuple'. A pool reset (flush/sleep leg Scheduler reset -> req_to_token_pool.clear(), vram_dial shrink, "
-    "wake restore) puts the plan's slot back on the free list while a surviving request object still carries the "
-    "unconsumed plan; the next donation revoke then hands out a slot another owner already holds (#924 aliasing)."))
+# REVIEW NACHPRUEFUNG N1 fixed (allocator clear() -> turn_anchor.on_pool_clear): the strict-xfail marker is removed.
 def test_a_revoke_never_hands_out_a_slot_a_pool_reset_already_gave_away(group_d):
     from flliper.srt.pdflip import turn_anchor as ta
 

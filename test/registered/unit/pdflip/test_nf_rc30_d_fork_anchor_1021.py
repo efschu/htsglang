@@ -476,3 +476,52 @@ def test_g1_a_revoked_plan_is_inserted_split_only_on_the_host(group_d, caplog):
     TA0._finish(wk, w1)
     assert _structure(host) == _structure(wk)
     assert any("state=split_only" in m and "why=revoked_for_donation" in m for m in caplog.messages), caplog.messages
+
+
+# -- re-review 2 N1: a pool reset neutralises the in-flight plans ---------------------------------------------------
+
+def test_n1_a_pool_clear_turns_the_inflight_plans_split_only_and_nothing_frees_them_again(group_d, caplog):
+    from flliper.srt.pdflip import turn_anchor as ta
+
+    caplog.set_level(logging.INFO, TA_LOG)
+    _as_worker(group_d, False)
+    fx = TA0._fixture(False)
+    r1 = TA0._req(fx, PROMPT)
+    TA0._write_kv(fx, r1, N)
+    batch = SimpleNamespace(reqs=[r1], req_to_token_pool=fx.pool)
+    ta.note_step(batch=batch, desc=None, req=r1, row=0, prefix=0, end=N,
+                 track_mask=True, main_track=N - 1, chunk=1, page=1, tok=IM)
+    assert getattr(r1, ta.PENDING_ATTR)[1] is not None and ta.inflight_count() >= 1
+    fx.pool.mamba_allocator.clear()
+    plan = getattr(r1, ta.PENDING_ATTR)
+    assert plan[1] is None and plan[2] == "pool_reset" and ta.inflight_count() == 0
+    assert ta.insert_verdict(plan) == (False, "pool_reset")
+    assert any("D-FORK-ANCHOR POOL-RESET" in m for m in caplog.messages)
+    # a later stale-plan walk (the next note_step of r1) frees nothing: the plan holds no slot any more
+    free = fx.pool.mamba_allocator.available_size()
+    ta.note_step(batch=batch, desc=None, req=r1, row=0, prefix=N, end=N, track_mask=False, main_track=None,
+                 chunk=1, page=1, tok=IM)
+    assert fx.pool.mamba_allocator.available_size() == free
+
+
+def test_n1_mutant_without_the_clear_hook_hands_out_an_owned_slot(group_d):
+    from flliper.srt.pdflip import turn_anchor as ta
+
+    group_d.setattr(ta, "on_pool_clear", lambda alloc: 0)
+    group_d.setattr(ta, "_epoch", lambda alloc: 0)
+    _as_worker(group_d, False)
+    fx = TA0._fixture(False)
+    r1 = TA0._req(fx, PROMPT)
+    TA0._write_kv(fx, r1, N)
+    batch = SimpleNamespace(reqs=[r1], req_to_token_pool=fx.pool)
+    ta.note_step(batch=batch, desc=None, req=r1, row=0, prefix=0, end=N,
+                 track_mask=True, main_track=N - 1, chunk=1, page=1, tok=IM)
+    fx.pool.mamba_allocator.clear()
+    owned = set()
+    while True:
+        s = fx.pool.mamba_allocator.alloc(1)
+        if s is None:
+            break
+        owned.add(int(s.view(-1)[0]))
+    got = ta.revoke_for_donation()
+    assert got is not None and int(got.view(-1)[0]) in owned, "the mutant aliases an owned slot"

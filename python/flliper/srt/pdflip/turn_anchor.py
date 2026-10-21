@@ -1324,25 +1324,62 @@ def _put_plan(batch: Any, desc: Optional["TurnTracks"], req: Any, row: int, attr
         plan = (t, slot, desc, int(prefix), int(end))
         setattr(req, attr, plan)
         if d_mode():
-            _register_inflight(req, attr, plan)
+            _register_inflight(req, attr, plan,
+                               getattr(getattr(batch, "req_to_token_pool", None), "mamba_allocator", None))
     else:
         setattr(req, attr, (t, None, None, int(prefix), int(end)))   # D split-only
     return desc
 
 
 # -- D-FORK-ANCHOR review G1 (21.10.): the in-flight fork slots of THIS rank -----------------------------------------
-#: (req, attr, plan) of every D fork plan that holds a slot and was not consumed yet. Validated lazily: an entry whose
-#: request no longer carries that very plan tuple (consumed by the insert, freed as stale) is dropped on the next walk.
-_INFLIGHT: List[Tuple[Any, str, Any]] = []
+#: (req, attr, plan, allocator, clear epoch) of every D fork plan that holds a slot and was not consumed yet. Validated
+#: lazily: an entry whose request no longer carries that very plan tuple (consumed by the insert, freed as stale), or
+#: whose allocator was cleared since (review N1), is dropped on the next walk.
+_INFLIGHT: List[Tuple[Any, str, Any, Any, int]] = []
 
 
-def _register_inflight(req: Any, attr: str, plan: Any) -> None:
+def _epoch(alloc: Any) -> int:
+    return int(getattr(alloc, "_pdflip_clear_epoch", 0) or 0)
+
+
+def _register_inflight(req: Any, attr: str, plan: Any, alloc: Any = None) -> None:
     _prune_inflight()
-    _INFLIGHT.append((req, attr, plan))
+    _INFLIGHT.append((req, attr, plan, alloc, _epoch(alloc)))
+
+
+def _live(e) -> bool:
+    req, attr, plan, alloc, ep = e
+    return getattr(req, attr, None) is plan and _epoch(alloc) == ep
 
 
 def _prune_inflight() -> None:
-    _INFLIGHT[:] = [e for e in _INFLIGHT if getattr(e[0], e[1], None) is e[2]]
+    _INFLIGHT[:] = [e for e in _INFLIGHT if _live(e)]
+
+
+def on_pool_clear(alloc: Any) -> int:
+    """Review N1 (21.10.): ``clear()`` of a mamba allocator (flush / sleep-leg reset, wake restore, vram_dial shrink)
+    puts every slot back on the free list of a fresh generation. A request object that survives it still carries its
+    unconsumed fork plan -- whose slot a new owner may hold from now on. Every such plan drawn from ``alloc`` turns
+    split-only here (desc field ``"pool_reset"``): no later donation revokes that slot, no stale free and no insert
+    release it again. Returns how many plans were neutralised."""
+    n = 0
+    keep = []
+    for e in _INFLIGHT:
+        req, attr, plan, a, _ep = e
+        if a is not alloc:
+            keep.append(e)
+            continue
+        if getattr(req, attr, None) is plan:
+            t, _slot, _desc, prefix, end = plan
+            setattr(req, attr, (t, None, "pool_reset", int(prefix), int(end)))
+            n += 1
+    _INFLIGHT[:] = keep
+    if n:
+        k = _count("d_pool_reset")
+        if _log_due(k):
+            logger.info("PDFLIP D-FORK-ANCHOR POOL-RESET n=%d plans=%d (the mamba allocator was cleared: the "
+                        "unconsumed fork plans lost their slots and turn split-only)", k, n)
+    return n
 
 
 def inflight_count() -> int:
@@ -1372,9 +1409,10 @@ def revoke_for_donation() -> Any:
         return None
     _prune_inflight()
     while _INFLIGHT:
-        req, attr, plan = _INFLIGHT.pop(0)
-        if getattr(req, attr, None) is not plan:
+        e = _INFLIGHT.pop(0)
+        if not _live(e):
             continue
+        req, attr, plan, _alloc, _ep = e
         t, slot, _desc, prefix, end = plan
         setattr(req, attr, (t, None, "revoked_for_donation", int(prefix), int(end)))
         n = _count("d_revoked")
