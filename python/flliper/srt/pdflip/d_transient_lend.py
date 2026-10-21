@@ -109,6 +109,8 @@ import logging
 import time
 from typing import Optional
 
+from flliper.srt.pdflip import d_head_hold
+
 logger = logging.getLogger(__name__)
 
 MARK = "PDFLIP D-TRANSIENT-LEND"
@@ -227,10 +229,41 @@ def _dqh_holds_queue(sched) -> bool:
         fp_of = getattr(sched, "_pdflip_d_head_fingerprint", None)
         if not callable(fp_of):
             return False
-        fp = fp_of(getattr(sched, "running_batch", None), sched.__dict__.get("_pass_prefetch_verdicts"))
-        return fp is not None and fp == st.fingerprint
+        memo = sched.__dict__.get("_pass_prefetch_verdicts")
+        fp = fp_of(getattr(sched, "running_batch", None), memo)
+        if fp is None:
+            return False
+        if fp == st.fingerprint:
+            return True
+        # LENDPP-1021: the evaluated pass's admission CONSUMED the drain memo (``_get_new_batch_prefill_raw`` pops
+        # it) and, having built nothing, re-armed DQH on it. Read without the memo, the landed term is ``()`` and
+        # the re-armed fingerprint looked "changed": on_batch gave the rows back before a head the admission had
+        # just refused, the next pass lent them again (rc27 1021_023225 TP1 02:42:44-43:44: 31 return/lend pairs,
+        # D-DECODE-GAP cause=lend extends=0). Without a memo no newer drain exists than the one DQH armed on --
+        # the armed landed term is the latest; every other term must still match.
+        if memo is None and d_head_hold.same_but_landed(fp, st.fingerprint):
+            _note_lendpp(sched, st.fingerprint)
+            return True
+        return False
     except Exception:  # noqa: BLE001 -- unreadable: not held (the conservative side: the lend goes back)
         return False
+
+
+#: LENDPP-1021: the live witness -- DQH held through a consumed drain memo (rank-local count, replicated verdict)
+LENDPP_N_ATTR = "_pdflip_d_lend_lendpp_n"
+
+
+def _note_lendpp(sched, armed: tuple) -> None:
+    try:
+        n = int(sched.__dict__.get(LENDPP_N_ATTR, 0) or 0) + 1
+        sched.__dict__[LENDPP_N_ATTR] = n
+        if n <= 16 or (n & (n - 1)) == 0:
+            logger.info("%s rank=%d LENDPP keep n=%d head=%s waiting=%d landed=%d -- DQH re-armed on this pass's "
+                        "own prefetch memo (the admission consumed it and built nothing): the head stays refused, "
+                        "no return before it and no re-lend after it", MARK, _rank(sched), n, armed[0] or "-",
+                        len(armed[1]), len(armed[d_head_hold.LANDED_TERM]))
+    except Exception:  # noqa: BLE001 -- an instrument never stops a lend
+        pass
 
 
 def held_reason(sched, req, dqh: Optional[bool] = None) -> Optional[str]:
