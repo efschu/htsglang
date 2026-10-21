@@ -78377,6 +78377,68 @@
    ],
    "type": "os.environ"
   },
+  "FLLIPER_PDFLIP_VISION_ROWS_DIR": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "",
+   "id": "FLLIPER_PDFLIP_VISION_ROWS_DIR",
+   "kind": "env",
+   "lesestellen": [
+    "pdflip/vision_row_store.py:108"
+   ],
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_VISION_ROWS_DIR",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "pdflip/vision_row_store.py",
+    "kind": "os.environ",
+    "line": 108,
+    "tree": "nf"
+   },
+   "status": "unexplained",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "os.environ"
+  },
+  "FLLIPER_PDFLIP_VISION_ROWS_MB": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": null,
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "",
+   "id": "FLLIPER_PDFLIP_VISION_ROWS_MB",
+   "kind": "env",
+   "lesestellen": [
+    "pdflip/vision_row_store.py:89"
+   ],
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_VISION_ROWS_MB",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "pdflip/vision_row_store.py",
+    "kind": "os.environ",
+    "line": 89,
+    "tree": "nf"
+   },
+   "status": "unexplained",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "os.environ"
+  },
   "FLLIPER_PDFLIP_VISION_SOURCE": {
    "bare": false,
    "choices": null,
@@ -91587,8 +91649,8 @@
  "schema": "flliper.catalog/1",
  "stats": {
   "curated": 125,
-  "entries": 2903,
-  "envs": 2024,
+  "entries": 2905,
+  "envs": 2026,
   "explained": 310,
   "flags": 864,
   "harvested": 1794,
@@ -91596,19 +91658,19 @@
    "abweichung": 23,
    "beide": 2697,
    "nur_27b": 179,
-   "nur_nf": 9
+   "nur_nf": 11
   },
-  "unexplained": 674
+  "unexplained": 676
  },
- "tree_rev": "27b=b5588c97aa+nf=ab74fa1313",
+ "tree_rev": "27b=b5588c97aa+nf=47e0703e37",
  "trees": {
   "27b": {
    "entries": 2876,
    "rev": "b5588c97aa"
   },
   "nf": {
-   "entries": 2706,
-   "rev": "ab74fa1313"
+   "entries": 2708,
+   "rev": "47e0703e37"
   }
  },
  "warnungen": []
