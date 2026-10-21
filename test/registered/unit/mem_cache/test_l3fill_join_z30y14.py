@@ -100,32 +100,45 @@ class _InterleavedClaims:
         return out
 
 
+# 27B port 20./21.10.: the OTHER RANK is a real second PROCESS sharing the shm arena, as on the metal (PP1/PP2 are rank
+# processes). The NF fill takes over a claim of ITS OWN process that no live sibling thread holds (L3-FILL SELF-JOIN);
+# an in-process thread standing in for another rank was therefore taken over -- a harness artifact, not the z30y14 shape.
+# The danger directions and every assertion are unchanged.
+import multiprocessing as _mp  # noqa: E402
+
+_CTX = _mp.get_context("fork")
+
+
+def _other_rank_fills_5_to_9(path, stems, conn, delay):
+    a = ShmArena(path, TOTAL, 64)
+    other = a.claim_slots(stems[5:10], [TOTAL] * 5)
+    conn.send([(int(s_), int(st), int(g)) for s_, st, g in other])
+    time.sleep(delay)
+    for i, (s_, _st, _g) in zip(range(5, 10), other):
+        a.slot_view(s_, TOTAL)[:] = bytes([i + 1]) * TOTAL
+    conn.send(list(a.complete_slots([s_ for s_, _st, _g in other], [g for _s, _st, g in other], [(0, TOTAL)])))
+
+
 def test_a_page_another_rank_is_filling_does_not_end_this_ranks_prefix(tmp_path):
     """The other follower holds fresh claims on pages 5..9 and completes them
     while this rank's fill runs. This rank's prefix fill must still yield all
     N pages, byte-exact -- the joined pages through the bounded wait, never
     by writing into the other's slots."""
     be, stems = _store(tmp_path)
-    arena = ShmArena(str(tmp_path / "kv.bin"), TOTAL, 64)
-    other = arena.claim_slots(stems[5:10], [TOTAL] * 5)
+    path = str(tmp_path / "kv.bin")
+    arena = ShmArena(path, TOTAL, 64)
+    pc, cc = _CTX.Pipe()
+    proc = _CTX.Process(target=_other_rank_fills_5_to_9, args=(path, stems, cc, 0.3))
+    proc.start()
+    other = pc.recv()
     assert [st for _s, st, _g in other] == [0] * 5  # the other rank's fresh claims
-    done = {}
-
-    def _other_reads():
-        time.sleep(0.3)
-        for i, (s, _st, _g) in zip(range(5, 10), other):
-            arena.slot_view(s, TOTAL)[:] = bytes([i + 1]) * TOTAL
-        done["cs"] = arena.complete_slots([s for s, _st, _g in other], [g for _s, _st, g in other],
-                                          [(0, TOTAL)])
-
     joins0 = hs._FILL_JOIN_N[1]
     box = {}
     with envs.FLLIPER_PDFLIP_L3FILL_JOIN_WAIT_MS.override(3000):
-        th_o = threading.Thread(target=_other_reads)
-        th_o.start()
         _on_prefetch_thread(0, lambda: HiCacheFile.arena_fill_from_disk(be, arena, stems, TOTAL, prefix=True),
                             box, "out").join(15)
-        th_o.join(15)
+    cs = pc.recv()
+    proc.join(15)
     out = box["out"]
     assert hs._FILL_JOIN_N[1] - joins0 == 5          # the five pages were JOINED, not raced in complete
     assert all(s is not None for s in out), [i for i, s in enumerate(out) if s is None]
@@ -134,29 +147,46 @@ def test_a_page_another_rank_is_filling_does_not_end_this_ranks_prefix(tmp_path)
         assert arena.find_slots([stems[i]]) == [(s, 2)]
     # the other rank completed its own claims itself (status 1: this fill wrote
     # nothing into them), never recycled (3) or freed (4) under it
-    assert done["cs"] == [1] * 5
+    assert cs == [1] * 5
     assert [out[i] for i in range(5, 10)] == [s for s, _st, _g in other]
     assert arena.stats()["claimed"] == 0
+
+
+def _follower_b(path, root, stems, evs, conn):
+    be = object.__new__(HiCacheFile)
+    be._existing_path = lambda stem: os.path.join(root, stem + ".bin")
+    be._stat_stems = lambda ss: {x: os.path.getsize(be._existing_path(x)) for x in ss
+                                 if os.path.exists(be._existing_path(x))}
+    be._arena_evict_to_disk = lambda arena, want, need=0: 0
+    view = _InterleavedClaims(ShmArena(path, TOTAL, 64), lambda i: i % 2 == 1, evs)
+    box = {}
+    with envs.FLLIPER_PDFLIP_L3FILL_JOIN_WAIT_MS.override(1500):
+        _on_prefetch_thread(1, lambda: HiCacheFile.arena_fill_from_disk(be, view, stems, TOTAL, prefix=True),
+                            box, "out").join(20)
+    conn.send(box.get("out"))
 
 
 def test_both_followers_reach_the_same_depth(tmp_path):
     """The z30y14 shape: two followers, the same need set, interleaved claims
     (A claims the even pages first, B the odd ones), both fills concurrent on
-    prefetch io threads. Both must answer the full prefix -- the same depth
-    for one told. Red on f7099c0cbd: each waited for the other's unread pages
-    and ended at the other's first claim (A at 1, B at 0)."""
+    prefetch io threads -- of two rank PROCESSES. Both must answer the full
+    prefix -- the same depth for one told. Red on f7099c0cbd: each waited for
+    the other's unread pages and ended at the other's first claim (A at 1, B at 0)."""
     be, stems = _store(tmp_path)
-    arena = ShmArena(str(tmp_path / "kv.bin"), TOTAL, 64)
-    ev = [threading.Event() for _ in range(N)]
+    path = str(tmp_path / "kv.bin")
+    arena = ShmArena(path, TOTAL, 64)
+    ev = [_CTX.Event() for _ in range(N)]
+    pc, cc = _CTX.Pipe()
+    proc = _CTX.Process(target=_follower_b, args=(path, str(tmp_path / "store"), stems, ev, cc))
+    proc.start()
     view_a = _InterleavedClaims(arena, lambda i: i % 2 == 0, ev)
-    view_b = _InterleavedClaims(arena, lambda i: i % 2 == 1, ev)
     box = {}
     with envs.FLLIPER_PDFLIP_L3FILL_JOIN_WAIT_MS.override(1500):
-        ths = [_on_prefetch_thread(k, (lambda v=v: HiCacheFile.arena_fill_from_disk(
-            be, v, stems, TOTAL, prefix=True)), box, k) for k, v in enumerate((view_a, view_b))]
-        for th in ths:
-            th.join(20)
-    a, b = box[0], box[1]
+        _on_prefetch_thread(0, lambda: HiCacheFile.arena_fill_from_disk(be, view_a, stems, TOTAL, prefix=True),
+                            box, 0).join(20)
+    b = pc.recv()
+    proc.join(20)
+    a = box[0]
     depth = lambda out: next((i for i, s in enumerate(out) if s is None), N)  # noqa: E731
     assert (depth(a), depth(b)) == (N, N)
     assert a == b
@@ -166,6 +196,14 @@ def test_both_followers_reach_the_same_depth(tmp_path):
     assert arena.stats()["claimed"] == 0
 
 
+def _other_rank_holds_7(path, stems, conn, release):
+    a = ShmArena(path, TOTAL, 64)
+    ((s7, st7, g7),) = a.claim_slots([stems[7]], [TOTAL])
+    conn.send((int(s7), int(st7), int(g7)))
+    release.wait(30)
+    conn.send(list(a.complete_slots([s7], [g7], [(0, TOTAL)])))
+
+
 def test_a_join_given_back_leaves_the_slot_to_its_first_writer(tmp_path):
     """The other rank holds the claim on page 7 and does not complete it
     within this fill's bound. This rank gives its join back -- it must not
@@ -173,21 +211,61 @@ def test_a_join_given_back_leaves_the_slot_to_its_first_writer(tmp_path):
     already read and completed, stay in the L2 (the other follower may be
     waiting for exactly those); only the ANSWER past 7 is None (prefix)."""
     be, stems = _store(tmp_path)
-    arena = ShmArena(str(tmp_path / "kv.bin"), TOTAL, 64)
-    ((s7, st7, g7),) = arena.claim_slots([stems[7]], [TOTAL])
+    path = str(tmp_path / "kv.bin")
+    arena = ShmArena(path, TOTAL, 64)
+    pc, cc = _CTX.Pipe()
+    release = _CTX.Event()
+    proc = _CTX.Process(target=_other_rank_holds_7, args=(path, stems, cc, release))
+    proc.start()
+    s7, st7, g7 = pc.recv()
     assert st7 == 0
     box = {}
-    with envs.FLLIPER_PDFLIP_L3FILL_JOIN_WAIT_MS.override(100):
+    # the 27B give-back shape is the FIXED bound (JOIN-LIVENESS off, the stale reap above the bound): the NF liveness
+    # wait instead follows a holder that touches its claims (every NF-code rank does, S23) and reaps one that is silent
+    # for the idle bound -- pinned separately below (test_nf_a_silent_holder_is_reaped_and_read_not_recomputed)
+    with envs.FLLIPER_PDFLIP_L3FILL_JOIN_WAIT_MS.override(100), \
+            envs.FLLIPER_PDFLIP_L3FILL_JOIN_LIVENESS.override(False), \
+            envs.FLLIPER_PDFLIP_L3FILL_STALE_CLAIM_S.override(30.0):
         _on_prefetch_thread(1, lambda: HiCacheFile.arena_fill_from_disk(be, arena, stems, TOTAL, prefix=True),
                             box, "out").join(15)
     out = box["out"]
-    assert all(s is not None for s in out[:7])
-    assert all(s is None for s in out[7:])
-    assert arena.find_slots([stems[7]]) == [(s7, 1)]  # still CLAIMED, still the other's
-    assert arena.claim_info([s7])[0][5] == 1          # one open writer: the other's (the join went)
-    assert [st for _s, st in arena.find_slots(stems[8:])] == [2] * (N - 8)
-    assert arena.complete_slots([s7], [g7], [(0, TOTAL)]) == [1]
+    try:
+        assert all(s is not None for s in out[:7])
+        assert all(s is None for s in out[7:])
+        assert arena.find_slots([stems[7]]) == [(s7, 1)]  # still CLAIMED, still the other's
+        assert arena.claim_info([s7])[0][5] == 1          # one open writer: the other's (the join went)
+        assert [st for _s, st in arena.find_slots(stems[8:])] == [2] * (N - 8)
+    finally:
+        release.set()
+    assert pc.recv() == [1]                           # the other rank completes its own claim
+    proc.join(15)
     assert arena.stats()["claimed"] == 0
+
+
+def test_nf_a_silent_holder_is_reaped_and_read_not_recomputed(tmp_path):
+    """NF STALE-CLAIM-REAP under the liveness wait (the h-series fix): a holder that keeps its claim on page 7 WITHOUT
+    any progress for the idle bound is quarantined (generation kept) and this rank reads the page itself -- the full
+    prefix, nothing recomputed; the silent holder's late completion is refused (never written over the new owner)."""
+    be, stems = _store(tmp_path)
+    path = str(tmp_path / "kv.bin")
+    arena = ShmArena(path, TOTAL, 64)
+    pc, cc = _CTX.Pipe()
+    release = _CTX.Event()
+    proc = _CTX.Process(target=_other_rank_holds_7, args=(path, stems, cc, release))
+    proc.start()
+    s7, _st7, _g7 = pc.recv()
+    box = {}
+    with envs.FLLIPER_PDFLIP_L3FILL_JOIN_WAIT_MS.override(100), envs.FLLIPER_PDFLIP_L3FILL_JOIN_LIVENESS.override(True):
+        _on_prefetch_thread(1, lambda: HiCacheFile.arena_fill_from_disk(be, arena, stems, TOTAL, prefix=True),
+                            box, "out").join(15)
+    release.set()
+    late = pc.recv()
+    proc.join(15)
+    out = box["out"]
+    assert all(s is not None for s in out), [i for i, s in enumerate(out) if s is None]
+    for i, s in enumerate(out):
+        assert bytes(arena.slot_view(s, TOTAL)[:4]) == bytes([i + 1]) * 4
+    assert late != [1]                                # the silent holder's completion does not land on the page
 
 
 def test_a_fresh_claim_given_back_unread_is_freed(tmp_path):
