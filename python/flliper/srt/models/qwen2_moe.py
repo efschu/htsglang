@@ -336,6 +336,22 @@ def _shared_expert_uneven_misaligned(
     return False
 
 
+def _link_next_block(blk, attr: str, nxt) -> None:
+    """Set ``blk.<attr> = nxt`` as a PLAIN reference, never as a registered submodule (NF-RC31-TOD 21.10.).
+
+    ``nn.Module.__setattr__`` registers any Module value in ``_modules``. A next-block link set that way makes
+    layer L+1's MoE block a CHILD of layer L's: ``named_modules()`` / ``named_parameters()`` / ``named_buffers()``
+    (deduplicated, the default) then report every linked block under the chain path
+    ``model.layers.<first>.mlp.<attr>.<attr>...`` instead of ``model.layers.<i>.mlp`` -- and the first layer of
+    the chain differs per rank (P under PP holds a slice, D under TP all layers). The weight exchange pairs
+    pieces across the groups by name, so 304 expert pieces (8.86 GB) had no counterpart: W74 at the join
+    prewarm, W106 / W4 on the first flip leg, PP2 rank death (rc31 boot ``..._c6e3d38f55_1021_200429``).
+    The link is a forward-time pointer to a module that already lives in the model tree; it is not part of it.
+    ``object.__setattr__`` writes the instance ``__dict__`` (where ``__init__``'s ``None`` lives), which the
+    normal attribute lookup reads before ``nn.Module.__getattr__``."""
+    object.__setattr__(blk, attr, nxt)
+
+
 def link_moe_lookahead(layers, distance: Optional[int] = None) -> int:
     """WP8: point every MoE block at the MoE block ``distance`` layers ahead
     (``FLLIPER_MOE_EXPERT_LOOKAHEAD``; 0 = off). Only blocks that carry a
@@ -360,7 +376,7 @@ def link_moe_lookahead(layers, distance: Optional[int] = None) -> int:
         j = i + distance
         if blk is None or j >= len(blocks) or blocks[j] is None:
             continue
-        blk.lookahead_next = blocks[j]
+        _link_next_block(blk, "lookahead_next", blocks[j])
         links += 1
     return links
 
@@ -395,7 +411,7 @@ def link_moe_pool_prefetch(layers) -> int:
         j = i + 1
         if blk is None or j >= len(blocks) or blocks[j] is None:
             continue
-        blk.pool_prefetch_next = blocks[j]
+        _link_next_block(blk, "pool_prefetch_next", blocks[j])
         links += 1
     return links
 
@@ -428,7 +444,7 @@ def link_moe_pool_em_prefetch(layers) -> int:
         j = i + 1
         if blk is None or j >= len(blocks) or blocks[j] is None:
             continue
-        blk.pool_em_prefetch_next = blocks[j]
+        _link_next_block(blk, "pool_em_prefetch_next", blocks[j])
         links += 1
     return links
 
