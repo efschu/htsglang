@@ -20,7 +20,8 @@ retain publish, all answering 0, on PP1/PP2's scheduler thread between forwards 
 THE RULE. After a W3 room-set spill that released 0 pages and is not UNDECIDED (PP0 waiting for an acknowledgement /
 a follower's transient debt -- those resolve without an arena change and are never memoised), the state it saw is
 remembered: arena (free slots, COMPLETE slots, referenced COMPLETE slots, sum of references), the W3 set generation
-this rank applied/published, this rank's debts, and the tree (evictable/protected tokens, device/host leaf counts). The
+this rank applied/published, this rank's debts, the tree (evictable/protected tokens, device/host leaf counts), and
+(NF-RC31 B) the host-lock release counter and the number of write-throughs in flight. The
 next spill with the SAME state returns 0 at once (no walk) -- its answer is provably the same. Any change of a term
 (a slot freed or unreferenced anywhere in the group, a new set, a lock released, a node inserted or evicted) walks
 again. No timer, no wait, no file I/O (the arena header is shared memory, the census is a numpy read).
@@ -42,6 +43,9 @@ logger = logging.getLogger(__name__)
 
 ENV = "FLLIPER_PDFLIP_SPILL_STATE_MEMO"
 ATTR = "_w3_spill_state_memo"
+#: NF-RC31 B (rc30 review Folgefix B): a per-cache counter ``UnifiedRadixCache.dec_host_lock_ref`` raises on every host
+#: lock release -- a released host lock frees a node the last walk kept (``host_locked``) without any other term moving
+HOST_LOCK_GEN = "_pdflip_host_lock_release_gen"
 #: per-cache counters, read into the PUBLISH-SWEEP / RETAIN-PUBLISH stats
 CALLS, SKIPS, MS = "_w3_spill_calls", "_w3_spill_memo_skips", "_w3_spill_ms"
 _N = {"skip": 0}
@@ -79,6 +83,10 @@ def state(cache: Any, pool: Any) -> Optional[Tuple]:
             int(cache.component_protected_size_.get(ct, 0) or 0),
             len(getattr(cache, "evictable_device_leaves", ()) or ()),
             len(getattr(cache, "evictable_host_leaves", ()) or ()),
+            # NF-RC31 B: a host lock released / a write-through retired keeps a node no longer (``host_locked`` /
+            # ``write_pending`` in the walk) although no arena or tree term above moved -- both forget the memo
+            int(d.get(HOST_LOCK_GEN, 0) or 0),
+            len(getattr(cache, "ongoing_write_through", None) or ()),
         )
     except Exception:  # noqa: BLE001 -- no reading: walk as before
         return None

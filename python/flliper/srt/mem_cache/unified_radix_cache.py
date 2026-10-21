@@ -2966,6 +2966,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return DecLockRefResult()
         for component in self._components_tuple:
             component.release_component_lock(node=node, params=params, lock_host=True)
+        # NF-RC31 B: a host lock let go is a SPILL-MEMO term (pdflip/spill_memo.HOST_LOCK_GEN) -- the W3 spill's
+        # memo of "released nothing" is forgotten, the next spill walks
+        self.__dict__["_pdflip_host_lock_release_gen"] = int(
+            self.__dict__.get("_pdflip_host_lock_release_gen", 0) or 0) + 1
 
         self._update_evictable_leaf_sets(node)
         return DecLockRefResult()
