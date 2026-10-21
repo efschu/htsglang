@@ -49976,6 +49976,62 @@
    ],
    "type": "EnvBool"
   },
+  "FLLIPER_MOE_POOL_EM_PREFETCH": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "True",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "EM-PREFETCH (21.10., D prefill, rc30 D ..._1021_063252: the EAGER-DEVICE-EM row copies are 297 of 674 s EM forward time on the critical rank, every byte serial on the forward stream). An EAGER-DEVICE-EM forward predicts layer L+1's experts with L+1's router on layer L's MoE input (Mixtral-Offloading's cross-layer trick, the decode-graph pool prefetch's predictor) and copies the predicted misses into L+1's LRU rows on the pool prefetch side stream, right after L's own last row copy -- so they move while L applies and L+1 runs attention (the workers idle in the Form-A tp/dcp waits, their links too). L+1 joins on ONE event before it plans; a right guess is then a plain hit, a wrong one a miss as before. No collective, no host read, output unchanged (a hit and a miss compute the same rows). Every rank decides by the same band (graph limit < T x K <= EM_MAX_IDS); a rank whose layer has a resume-warm plan or deferred rows pending skips it (only that rank's copies stay synchronous). EM-FETCH carries pf_layers/pf_predicted/pf_fetched/pf_hits/pf_copy_ms. False = byte-identical before.",
+   "id": "FLLIPER_MOE_POOL_EM_PREFETCH",
+   "kind": "env",
+   "level": "expert",
+   "name": "FLLIPER_MOE_POOL_EM_PREFETCH",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 4002,
+    "tree": "nf"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "EnvBool"
+  },
+  "FLLIPER_MOE_POOL_EM_PREFETCH_TOPK": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "0",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "EM-PREFETCH: how many of the next router's top-k each token predicts (0 = all top-k). A prefill's union over T tokens is what is fetched, so the full top-k is the default.",
+   "id": "FLLIPER_MOE_POOL_EM_PREFETCH_TOPK",
+   "kind": "env",
+   "level": "expert",
+   "name": "FLLIPER_MOE_POOL_EM_PREFETCH_TOPK",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "environ.py",
+    "kind": "environ",
+    "line": 4005,
+    "tree": "nf"
+   },
+   "status": "harvested",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "EnvInt"
+  },
   "FLLIPER_MOE_POOL_PREFETCH": {
    "bare": false,
    "choices": null,
@@ -60928,7 +60984,7 @@
    "source": {
     "file": "environ.py",
     "kind": "environ",
-    "line": 4208,
+    "line": 4223,
     "tree": "nf"
    },
    "status": "harvested",
@@ -91587,28 +91643,28 @@
  "schema": "flliper.catalog/1",
  "stats": {
   "curated": 125,
-  "entries": 2903,
-  "envs": 2024,
+  "entries": 2905,
+  "envs": 2026,
   "explained": 310,
   "flags": 864,
-  "harvested": 1794,
+  "harvested": 1796,
   "trees": {
    "abweichung": 23,
    "beide": 2697,
    "nur_27b": 179,
-   "nur_nf": 9
+   "nur_nf": 11
   },
   "unexplained": 674
  },
- "tree_rev": "27b=b5588c97aa+nf=ab74fa1313",
+ "tree_rev": "27b=b5588c97aa+nf=a0056194c2",
  "trees": {
   "27b": {
    "entries": 2876,
    "rev": "b5588c97aa"
   },
   "nf": {
-   "entries": 2706,
-   "rev": "ab74fa1313"
+   "entries": 2708,
+   "rev": "a0056194c2"
   }
  },
  "warnungen": []
