@@ -39,6 +39,7 @@ stream (``MoEExpertOffloadCache.prefetch_pool_em``) carries, summed over its lay
 
     pf_layers=<prefetches issued> pf_predicted=<distinct experts predicted> pf_fetched=<rows the side stream
       copied> pf_hits=<of those, rows the target layer's first wave really used> pf_copy_ms=<side-stream copy time>
+      pf_wait_ms=<review A4: time the forward stream stood at a join for the side stream (join -> copy end, >= 0)>
 
 ``copy_ms`` stays the SYNCHRONOUS row copies on the forward stream (what the prefetch is meant to shrink);
 ``pf_fetched - pf_hits`` is the wasted prefetch. Counters are device adds on the forward stream (the
@@ -86,7 +87,7 @@ class Record:
     """One forward's EM layers on this rank (device counters + timing events)."""
 
     __slots__ = ("fwd", "stream", "start", "end", "pairs", "counter", "layers", "waves", "tokens", "host", "done",
-                 "wave_copy", "wave_apply", "last_copy_end", "pf_layers", "pf_pairs")
+                 "wave_copy", "wave_apply", "last_copy_end", "pf_layers", "pf_pairs", "pf_waits")
 
     def __init__(self, fwd: int, device, cuda):
         import torch
@@ -102,6 +103,7 @@ class Record:
         self.counter = torch.zeros(COUNTER_LEN, dtype=torch.int64, device=device)
         self.pf_layers = 0
         self.pf_pairs: List[tuple] = []  # EM-PREFETCH: side-stream copy events
+        self.pf_waits: List[tuple] = []  # review A4: (join event on the forward stream, copy end on the side)
         self.wave_copy: dict = {}   # F3: wave -> [(copy start, copy end)]
         self.wave_apply: dict = {}  # F3: wave -> [(copy end, apply end)]
         self.last_copy_end = None
@@ -163,6 +165,12 @@ class Record:
         """EM-PREFETCH: the side stream's copy events of one prefetch (read once the forward has joined it)."""
         self.pf_pairs.append((e0, e1))
 
+    def prefetch_wait(self, join_ev, end_ev) -> None:
+        """Review A4: the forward stream reached a prefetch's join at ``join_ev``; the side stream's copy ended at
+        ``end_ev``. ``max(0, join -> end)`` is the time the forward stood still for it (summed at line time over
+        completed pairs only, never waited for)."""
+        self.pf_waits.append((join_ev, end_ev))
+
     def prefetch_landed(self, fetched, hits) -> None:
         """EM-PREFETCH: on the forward stream after the target layer joined the prefetch -- the rows it copied
         (the prefetch step's gather count) and the rows of those its first wave used (pf hit delta)."""
@@ -183,6 +191,16 @@ def _cuda():
     import torch
 
     return torch.cuda
+
+
+def current() -> Optional[Record]:
+    """The record of the forward that is open (None = off, under capture, or no EM layer yet). Never opens one."""
+    try:
+        if not enabled():
+            return None
+        return _STATE["cur"]
+    except Exception:  # noqa: BLE001 -- an instrument never stops a forward
+        return None
 
 
 def begin_layer(device) -> Optional[Record]:
@@ -254,7 +272,15 @@ def pf_terms(rec: Record) -> str:
                 ms += float(a.elapsed_time(b))
         except Exception:  # noqa: BLE001 -- an instrument never stops a forward
             pass
-    return " pf_layers=%d pf_predicted=%d pf_fetched=%d pf_hits=%d pf_copy_ms=%.1f" % (n, vals[0], vals[1], vals[2], ms)
+    wait = 0.0
+    for a, b in getattr(rec, "pf_waits", ()) or ():
+        try:
+            if bool(a.query()) and bool(b.query()):
+                wait += max(0.0, float(a.elapsed_time(b)))
+        except Exception:  # noqa: BLE001 -- an instrument never stops a forward
+            pass
+    return (" pf_layers=%d pf_predicted=%d pf_fetched=%d pf_hits=%d pf_copy_ms=%.1f pf_wait_ms=%.1f"
+            % (n, vals[0], vals[1], vals[2], ms, wait))
 
 
 def wave_terms(rec: Record) -> str:

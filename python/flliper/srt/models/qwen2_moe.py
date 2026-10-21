@@ -683,8 +683,15 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if own is not None and getattr(own_moe, "_moe_offload_pool", False):
             own.set_em_prefetch(target, local)
         else:
-            # this block has no pool pass to ride on: issue now (behind this block's MoE input)
-            target.prefetch_pool_em(local)
+            # this block has no pool pass to ride on: issue now (behind this block's MoE input), under the same
+            # defect bracket as the pool pass (review A2) and counted on the forward's EM-FETCH record when one
+            # is open (an issue without its record would land fetched/hits without pf_layers)
+            from flliper.srt.layers.moe import em_fetch_probe
+            from flliper.srt.layers.moe.expert_offload import fire_em_prefetch
+
+            probe = em_fetch_probe.current()
+            if fire_em_prefetch(target, local, n_ids, probe=probe, src_layer=self.layer_id) and probe is None:
+                target._em_pf_landed = False
 
     def _pool_prefetch_next_block(self, hidden_states: torch.Tensor) -> None:
         """Mixtral-Offloading's speculative expert loading, for the graph pool.

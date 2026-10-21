@@ -531,3 +531,126 @@ def test_the_wiring_is_in_the_forward_and_the_model(monkeypatch):
     i = fwd.index("self._pool_em_prefetch_next_block(hidden_states)")
     assert i < fwd.index("self._forward_router_experts(hidden_states)")
     assert "link_moe_pool_em_prefetch(self.layers)" in inspect.getsource(qwen3_5)
+
+
+# ---------------------------------------------------------------------------------------------- review A1-A4, E1, E2
+
+def _tables_snapshot(t):
+    return {k: getattr(t, k).clone() for k in ("hot_phys", "row_key", "row_use", "pf_row", "pf_counts", "clock",
+                                               "miss_count", "error")}
+
+
+def test_review_a1_a_raise_after_the_step_takes_its_filled_rows_back(monkeypatch):
+    """B-1: the copy raises after the prefetch step wrote the tables -- no table entry may name a row whose bytes
+    never arrived; the predicted experts are simply not resident, the next real step fetches them."""
+    b = S51._pool_cache(monkeypatch, warm=[8, 9])
+    t = b._pool_tables
+    real = ep.copy_rows
+
+    def _copy(srcs, dsts, src_rows, dst_rows, count):
+        if b._pool_pf_buffers is not None and src_rows is b._pool_pf_buffers.gather_src:
+            raise RuntimeError("copy launch failed")
+        return real(srcs, dsts, src_rows, dst_rows, count)
+
+    monkeypatch.setattr(ep, "copy_rows", _copy)
+    with pytest.raises(RuntimeError):
+        b.prefetch_pool_em(torch.tensor(S51.ROUTES, dtype=torch.int32))
+    clock = int(t.clock[0])
+    lo, hi = t.lru_start, t.pool_rows
+    assert not bool((t.pf_row[lo:hi] == clock).any())
+    for e in _cold(S51.ROUTES):
+        if e in (8, 9):
+            continue
+        assert int(t.hot_phys[e]) < 0, e                  # never a row without its bytes
+    for e in (8, 9):                                      # untouched residents keep their rows and bytes
+        r = int(t.hot_phys[e])
+        assert r >= lo and float(b._resident["w13"][r, 0]) == float(e)
+    assert ep.bijection_breaks(t) == 0 and int(t.error[0]) == 0
+    assert b._em_pf_landed is False
+    monkeypatch.setattr(ep, "copy_rows", real)
+    got = S51._extend(b, seed=12)
+    assert torch.equal(got[:, 0], S51._truth(seed=12))
+
+
+def test_review_a1_on_cuda_a_raising_copy_lands_nothing_and_still_owes_the_join(monkeypatch):
+    log = []
+    _fake_cuda(monkeypatch, log)
+    b = S51._pool_cache(monkeypatch)
+    b._pool_pf_begin, b._pool_pf_done = _Event("begin", log), _Event("done", log)
+    monkeypatch.setattr(b, "_em_prefetch_streams", lambda: True)
+    monkeypatch.setattr(ep, "copy_rows", lambda *a: (_ for _ in ()).throw(RuntimeError("copy")))
+    with pytest.raises(RuntimeError):
+        b.prefetch_pool_em(torch.tensor(S51.ROUTES, dtype=torch.int32))
+    assert ("record", "done", "side") in log
+    assert b._pool_pf_armed is True and b._em_pf_landed is False
+
+
+def test_review_a2_the_block_without_its_own_pool_goes_through_the_defect_bracket(monkeypatch, caplog):
+    q, me, target, own, gate_calls, _ = _block(monkeypatch, own=False)
+
+    def _boom(local, probe=None):
+        raise ValueError("direct")
+
+    target.prefetch_pool_em = _boom
+    with caplog.at_level(logging.ERROR, logger=eo.__name__):
+        q.Qwen2MoeSparseMoeBlock._pool_em_prefetch_next_block(me, torch.randn(4, 16))   # does not raise
+    assert any("EM-PREFETCH DEFECT layer 3" in r.getMessage() for r in caplog.records)
+    assert eo.pool_em_prefetch_enabled() is False
+
+
+def test_review_a3_promote_deferred_joins_a_prefetch_in_flight(monkeypatch):
+    log = []
+    _fake_cuda(monkeypatch, log)
+    b = S51._pool_cache(monkeypatch)
+    b._pool_pf_buffers = ep.allocate_step_buffers("cpu", E, S51.WIDTH)
+    b._pool_pf_armed, b._pool_pf_done = True, _Event("done", log)
+    b._deferred_rows = SimpleNamespace(full=None)
+    b._promote_deferred()
+    assert log == [("wait", "main", "done")] and b._pool_pf_armed is False
+
+
+def test_review_a4_the_join_records_the_visible_wait_and_the_line_carries_it(monkeypatch, caplog):
+    log = []
+    _fake_cuda(monkeypatch, log)
+    b = S51._pool_cache(monkeypatch)
+    P.on_forward(81)
+    rec = P.begin_layer(torch.device("cpu"))
+    end = rec.mark()                                     # the side stream's copy end ...
+    b._pool_pf_armed, b._pool_pf_done, b._em_pf_end_ev = True, _Event("done", log), end
+    b._join_pool_prefetch()                              # ... reached by the forward stream after it: no wait
+    assert len(rec.pf_waits) == 1 and b._em_pf_end_ev is None
+    late = rec.mark()
+    rec.prefetch_wait(rec.pf_waits[0][0], late)          # a copy that ended 1.5 ms after the join: a wait
+    rec.pf_layers = 1
+    rec.end_layer(6)
+    with caplog.at_level(logging.INFO, logger=P.__name__):
+        P.on_forward(82)
+    line = [r.getMessage() for r in caplog.records if r.getMessage().startswith(P.MARK)][-1]
+    assert "pf_wait_ms=1.5" in line, line
+
+
+def test_review_e1_the_prefetch_variant_is_built_at_install_as_a_table_no_op(monkeypatch):
+    b = S51._pool_cache(monkeypatch, warm=[8, 9])
+    calls = []
+    real = ep.step
+    monkeypatch.setattr(ep, "step", lambda *a, **k: (calls.append(k.get("prefetch")), real(*a, **k))[1])
+    before = _tables_snapshot(b._pool_tables)
+    assert b.em_prefetch_prebuild() is True
+    assert calls == [True]
+    assert b._pool_pf_buffers.gather_src.shape[0] == S51.WIDTH   # the EM width the live prefetch uses
+    for k, v in _tables_snapshot(b._pool_tables).items():
+        assert torch.equal(v, before[k]), k
+    assert int(b._pool_pf_buffers.gather_count[0]) == 0
+    with envs.FLLIPER_MOE_POOL_EM_PREFETCH.override(False):
+        eo.pool_em_prefetch_reset_for_tests()
+        assert S51._pool_cache(monkeypatch).em_prefetch_prebuild() is False
+
+
+def test_review_e2_the_band_follows_the_em_pass_verdict(monkeypatch):
+    c = S51._pool_cache(monkeypatch)
+    c._route_note = True
+    assert c.em_prefetch_wanted(18) == (False, "host_instrument")
+    c._route_note = False
+    with envs.FLLIPER_OPT_MOE_POOL_EAGER_DEVICE_EM_WAVES.override(1):
+        assert c.em_prefetch_wanted(18) == (False, "em_waves_cap")
+    assert c.em_prefetch_wanted(18) == (True, "em")

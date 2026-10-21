@@ -15,9 +15,9 @@ What the author's file (test_em_prefetch_1021.py) does not pin, on the same S51 
 * R-5 memory: the prefetch buffers are allocated once per layer, at the EM step's width (so the only new kernel
   specialisation is PREFETCH=True), and stay the same object;
 * R-6 the prefetch side stream is a registered ROW stream (F3 fence covers it);
-* B-1 (FINDING, xfail strict): a defect AFTER the prefetch step ran but BEFORE its row copy (here: the copy raises)
+* B-1 (FINDING, fixed by review A1 -- revoke_prefetched_rows): a defect AFTER the prefetch step ran but BEFORE its row copy (here: the copy raises)
   leaves the target's tables naming rows whose bytes never arrived -- the next real step takes them as hits and
-  computes with the wrong bytes. "Defect -> off" is then not a safe fallback. Flip to a plain test when fixed.
+  computes with the wrong bytes. Was xfail strict on a0056194c2; plain test since A1.
 """
 
 import importlib.util
@@ -288,8 +288,6 @@ def test_r6_the_prefetch_side_stream_is_a_registered_row_stream(monkeypatch):
 
 # ---------------------------------------------------------------------------------------------- finding B-1
 
-@pytest.mark.xfail(strict=True, reason="REVIEW B-1: a defect between the prefetch step and its row copy leaves "
-                   "table entries for rows whose bytes never arrived; the next real step serves them as hits")
 def test_b1_a_defect_after_the_prefetch_step_never_serves_a_row_whose_copy_failed(monkeypatch):
     a, b = _pair(monkeypatch)
     real_copy = ep.copy_rows

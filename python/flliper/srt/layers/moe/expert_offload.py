@@ -1079,6 +1079,58 @@ def em_prefetch_lanes(local_ids, num_experts: int):
     return torch.where(mark[:E] > 0, lane_e, torch.full_like(lane_e, -1)), mark[:E]
 
 
+def revoke_prefetched_rows(tables) -> None:
+    """EM-PREFETCH review A1 (B-1): take back every row the prefetch step filled at the current clock
+    (``pf_row == clock``) -- its expert unmapped (``hot_phys`` -> -1 where the row owns it), the row free (key -1,
+    use 0), the mark cleared. Runs when anything raised after the prefetch step and before its row copy was
+    enqueued: the tables must never name a row whose bytes did not arrive (the next real step would serve it as a
+    hit with the victim's bytes). A row filled earlier at the same clock is freed too -- conservative, it only
+    costs residency. Device ops only (one gather, one scatter-min, three slice writes), no host read; OFF seat
+    rows (key >= E) and staging rows (outside [lru_start, pool_rows)) are never touched."""
+    import torch
+
+    E = int(tables.num_experts)
+    lo, hi = int(tables.lru_start), int(tables.pool_rows)
+    if hi <= lo:
+        return
+    pf = tables.pf_row[lo:hi]
+    key = tables.row_key[lo:hi].to(torch.int64)
+    clock = tables.clock.reshape(-1)[:1].to(pf.dtype)
+    filled = (pf == clock) & (key >= 0) & (key < E)
+    rows = torch.arange(lo, hi, dtype=torch.int64, device=key.device)
+    safe = torch.where(filled, key, torch.zeros_like(key))
+    owner = tables.hot_phys.index_select(0, safe).to(torch.int64)
+    own = filled & (owner == rows)
+    hp = tables.hot_phys
+    ceiling = torch.full_like(safe, torch.iinfo(hp.dtype).max, dtype=hp.dtype)
+    hp.scatter_reduce_(0, safe, torch.where(own, torch.full_like(ceiling, -1), ceiling), reduce="amin",
+                       include_self=True)
+    tables.row_key[lo:hi] = torch.where(filled, torch.full_like(tables.row_key[lo:hi], -1), tables.row_key[lo:hi])
+    tables.row_use[lo:hi] = torch.where(filled, torch.zeros_like(tables.row_use[lo:hi]), tables.row_use[lo:hi])
+    tables.pf_row[lo:hi] = torch.where(filled, torch.full_like(pf, -1), pf)
+
+
+def fire_em_prefetch(target, local_ids, n_ids: int, probe=None, src_layer=None) -> bool:
+    """EM-PREFETCH: issue ``local_ids`` into ``target`` under the ONE defect bracket (review A2: the block without a
+    pool pass of its own goes through here too). False = nothing issued; a raise is named once as
+    ``EM-PREFETCH DEFECT`` and switches the prefetch off for the process -- after A1 the target's tables never name
+    a row whose copy did not happen, so off is a safe fallback."""
+    try:
+        if not target.em_prefetch_wanted(int(n_ids))[0]:
+            return False
+        return bool(target.prefetch_pool_em(local_ids, probe=probe))
+    except Exception:  # noqa: BLE001 -- a defect is named once and switches the prefetch off, loudly
+        import logging
+
+        _POOL_EM_PREFETCH["defect"] = True
+        logging.getLogger(__name__).exception(
+            "EM-PREFETCH DEFECT layer %s -> %s: the prefetch raised; it is OFF for the rest of this "
+            "process (FLLIPER_MOE_POOL_EM_PREFETCH). Report it.",
+            src_layer, getattr(getattr(target, "layer", None), "layer_id", None),
+        )
+        return False
+
+
 def pool_prefetch_stream():
     """ONE side stream per rank for every layer's speculative prefetch.
 
@@ -3843,6 +3895,7 @@ class MoEExpertOffloadCache:
     #: EM-PREFETCH (set per instance in __init__; class defaults for harness-built caches)
     _em_pf_pending = None
     _em_pf_landed = False
+    _em_pf_end_ev = None
     _pool_pf_armed = False
     _pool_pf_buffers = None
     _pool_pf_begin = None
@@ -3986,6 +4039,7 @@ class MoEExpertOffloadCache:
         # landed here: count its fetched rows and hits in this forward's EM-FETCH line"
         self._em_pf_pending = None
         self._em_pf_landed = False
+        self._em_pf_end_ev = None  # review A4: the side stream's copy end of the prefetch in flight
         # #276 heat record (FLLIPER_DEBUG_MOE_HEAT, default off): the device
         # histogram of the captured step's routed ids (layers/moe/pool_heat).
         # None = off: prepare_pool then adds no op to the captured step.
@@ -4952,12 +5006,19 @@ class MoEExpertOffloadCache:
             self._pool_pf_begin = torch.cuda.Event()
             self._pool_pf_done = torch.cuda.Event()
         self._pool_ready = True
+        decode_pf = self._pool_pf_buffers is not None
+        # review E1 (21.10.): the EM-PREFETCH step variant is compiled here, never in a serving forward
+        em_pf = self.em_prefetch_prebuild()
+        if em_pf and getattr(self.layer, "layer_id", None) in (0, None):
+            logging.getLogger(__name__).info(
+                "EM-PREFETCH: PREFETCH step variant built at install (width %d, pool rows %d) -- no JIT in the "
+                "first EM forward", int(self._pool_buffers.gather_src.shape[0]), int(self._pool_tables.pool_rows))
         logging.getLogger(__name__).info(
             "MoE expert pool on layer %s: residents %d, LRU rows %d, staging %d, "
             "spill rows %d, tensors %d, prefetch %s%s",
             getattr(self.layer, "layer_id", None), R, C - staging, staging,
             sum(1 for h in host_row if h >= 0), len(attrs),
-            "on" if self._pool_pf_buffers is not None else "off",
+            "on" if decode_pf else ("em" if em_pf else "off"),
             (", seat rows %d (H95c, OFF until a D phase funds them)" % self.seat_rows)
             if self.seat_rows > 0 else "",
         )
@@ -5650,10 +5711,20 @@ class MoEExpertOffloadCache:
         if not self._pool_pf_armed:
             return
         self._pool_pf_armed = False
+        end_ev = self._em_pf_end_ev
+        self._em_pf_end_ev = None
         done = self._pool_pf_done
         if done is not None:
             import torch
 
+            if end_ev is not None:
+                # review A4: the VISIBLE wait -- an event on this stream where it reaches the join, against the
+                # side stream's copy end; positive elapsed = the forward stood still for the prefetch
+                from flliper.srt.layers.moe import em_fetch_probe
+
+                rec = em_fetch_probe.current()
+                if rec is not None:
+                    rec.prefetch_wait(rec.mark(), end_ev)
             torch.cuda.current_stream().wait_event(done)
 
     def set_em_prefetch(self, target, local_ids) -> None:
@@ -5669,8 +5740,6 @@ class MoEExpertOffloadCache:
         Rang-Einigkeit). The two guards after the band are this rank's own table state: a layer with a
         resume-warm plan in flight or deferred rows not landed keeps its rows to those writers. A rank that
         skips copies its misses synchronously, as before -- no output, no collective differs."""
-        from flliper.srt.environ import envs
-
         if not pool_em_prefetch_enabled():
             return False, "switch_off"
         if not (self._pool_eager_device_step and self._pool_eager_device_em):
@@ -5679,11 +5748,11 @@ class MoEExpertOffloadCache:
             return False, "pool_not_ready"
         if n_ids <= self.eager_device_limit():
             return False, "graph_form"
-        cap_ids = int(envs.FLLIPER_OPT_MOE_POOL_EAGER_DEVICE_EM_MAX_IDS.get() or 0)
-        if cap_ids > 0 and n_ids > cap_ids:
-            return False, "em_max_ids"
-        if int(self._pool_tables.num_experts) > int(self._pool_buffers.gather_src.shape[0]):
-            return False, "em_width"
+        # review E2 (B-5): exactly the EM pass's own verdict (switches, host instrument, streaming partials, NaN
+        # guard, id cap, step width, wave cap) -- a layer that will plan on the host is not prefetched into
+        em_waves, em_reason = self.eager_device_em_waves(int(n_ids))
+        if not em_waves:
+            return False, em_reason
         if getattr(self, "_rw_plan", None) is not None:
             return False, "resume_warm"
         if getattr(self, "_deferred_rows", None) is not None:
@@ -5697,20 +5766,8 @@ class MoEExpertOffloadCache:
         if pending is None:
             return False
         target, local_ids = pending
-        try:
-            if not target.em_prefetch_wanted(int(n_ids))[0]:
-                return False
-            return bool(target.prefetch_pool_em(local_ids, probe=probe))
-        except Exception:  # noqa: BLE001 -- a defect is named once and switches the prefetch off, loudly
-            import logging
-
-            _POOL_EM_PREFETCH["defect"] = True
-            logging.getLogger(__name__).exception(
-                "EM-PREFETCH DEFECT layer %s -> %s: the prefetch raised; it is OFF for the rest of this "
-                "process (FLLIPER_MOE_POOL_EM_PREFETCH). Report it.",
-                getattr(self.layer, "layer_id", None), getattr(getattr(target, "layer", None), "layer_id", None),
-            )
-            return False
+        return fire_em_prefetch(target, local_ids, n_ids, probe=probe,
+                                src_layer=getattr(self.layer, "layer_id", None))
 
     def prefetch_pool_em(self, local_ids, probe=None) -> bool:
         """EM-PREFETCH: copy THIS layer's predicted misses into its LRU rows on the pool prefetch side stream.
@@ -5747,6 +5804,7 @@ class MoEExpertOffloadCache:
         if probe is not None:
             probe.prefetch_issued(mark)
         if not self._em_prefetch_streams():
+            # inline (desk harness): nothing is in flight, so there is no join and no wait to measure
             self._em_prefetch_body(lanes, waves, probe)
             self._em_pf_landed = True
             return True
@@ -5758,13 +5816,15 @@ class MoEExpertOffloadCache:
         main = torch.cuda.current_stream()
         self._pool_pf_begin.record(main)
         self._pool_pf_armed = True  # from here on the join is owed, whatever happens below
-        self._em_pf_landed = True
+        self._em_pf_end_ev = None
         with torch.cuda.stream(side):
             side.wait_event(self._pool_pf_begin)
             try:
-                self._em_prefetch_body(lanes, waves, probe)
+                end_ev = self._em_prefetch_body(lanes, waves, probe)
             finally:
                 self._pool_pf_done.record(side)
+        self._em_pf_end_ev = end_ev
+        self._em_pf_landed = True  # only a body that did not raise lands (review A1)
         return True
 
     def _em_prefetch_streams(self) -> bool:
@@ -5778,12 +5838,51 @@ class MoEExpertOffloadCache:
 
         t = self._pool_tables
         pf = self._pool_pf_buffers
+        # review A1 (B-1): nothing that can raise sits between the step and its copy -- the start event before the
+        # step, and a raise after the step takes its filled rows back before it propagates (no table entry for a
+        # row whose bytes did not arrive). Returns the copy's end event (A4), or None without a probe.
+        e0 = probe.mark() if probe is not None else None
         stamp_predicted_rows(t, lanes)
         step(t, lanes, pf, prefetch=True, waves=waves)
-        e0 = probe.mark() if probe is not None else None
-        copy_rows(self._pool_srcs, self._pool_dsts, pf.gather_src, pf.gather_dst, pf.gather_count)
-        if probe is not None:
-            probe.prefetch_copy(e0, probe.mark())
+        try:
+            copy_rows(self._pool_srcs, self._pool_dsts, pf.gather_src, pf.gather_dst, pf.gather_count)
+        except BaseException:
+            revoke_prefetched_rows(t)
+            raise
+        if probe is None:
+            return None
+        e1 = probe.mark()
+        probe.prefetch_copy(e0, e1)
+        return e1
+
+    def em_prefetch_prebuild(self) -> bool:
+        """Review E1 (B-6): build the pool step's ``PREFETCH=True`` specialisation at the EM width NOW (install
+        time) instead of in the first EM-band forward on the scheduler thread: the prefetch buffers at the EM
+        step's width and one prefetch step with every lane -1 -- a table no-op (no distinct id: nothing counted,
+        no victim scanned, gather count 0). Same WIDTH, BLOCK_R and scalar arguments as the live prefetch, so the
+        live launch hits the compiled kernel. False when the prefetch is off or the width does not hold E."""
+        from flliper.srt.layers.moe.expert_pool_device import (
+            allocate_step_buffers,
+            pool_row_capacity,
+            pool_waves_for,
+            resident_count,
+            step,
+        )
+
+        if not pool_em_prefetch_enabled() or not self._pool_ready or self._pool_tables is None:
+            return False
+        t = self._pool_tables
+        E = int(t.num_experts)
+        width = int(self._pool_buffers.gather_src.shape[0])
+        if E > width:
+            return False
+        if self._pool_pf_buffers is None:
+            self._pool_pf_buffers = allocate_step_buffers(t.hot_phys.device, E, width)
+        pf = self._pool_pf_buffers
+        pf.ids[:E].fill_(-1)
+        step(t, pf.ids[:E], pf, prefetch=True,
+             waves=pool_waves_for(E, E, resident_count(t), pool_row_capacity(t, 0)))
+        return True
 
     def eager_device_limit(self) -> int:
         """D-Mini-Extend: the most routed ids an eager forward may hand the
@@ -6370,7 +6469,9 @@ class MoEExpertOffloadCache:
                     early=early)
                 deferred_rows_fill().add(self)
             if self._pool_pf_buffers is not None:
-                self._pool_pf_armed = False
+                # review A3 (21.10.): a prefetch in flight is JOINED (one stream wait), never dropped -- the
+                # EM-PREFETCH buffers are lazy and live, the reinit below the side stream must not race it
+                self._join_pool_prefetch()
         return row_list
 
     def _deferred_layout(self, extra, entries):
@@ -6423,7 +6524,7 @@ class MoEExpertOffloadCache:
             apply_pool_layout(self._pool_tables, d.full)
         self._scratch_holds.clear()
         if self._pool_pf_buffers is not None:
-            self._pool_pf_armed = False
+            self._join_pool_prefetch()  # review A3: join, never drop, a prefetch in flight
         self._deferred_rows = None
         return moved
 
