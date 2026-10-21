@@ -174,17 +174,74 @@ def test_store_roundtrip_identity_and_width(store):
 
 
 def test_store_refuses_a_corrupt_or_foreign_file(store):
+    from safetensors.torch import save
+
     vrs.put(store, HASH, GRID, _rows())
     p = os.path.join(store, vrs.key_name(HASH, GRID))
     data = open(p, "rb").read()
     open(p, "wb").write(data[:-10])                               # truncated payload
     assert vrs.get(store, HASH, GRID, WIDTH) is None
-    open(p, "wb").write(data.replace(b'"rows":506', b'"rows":505'))
+    # a valid safetensors file under this name whose metadata names another image: never served
+    open(p, "wb").write(save({"rows": _rows()}, metadata={"hash": "%016x" % (HASH ^ 1), "grid": "1x22x92"}))
     assert vrs.get(store, HASH, GRID, WIDTH) is None
 
 
+def test_the_file_is_safetensors_with_identity_metadata(store):
+    """A6: the checkpoint format (Apache-2.0), tensor ``rows`` + metadata {hash, grid} -- no own format."""
+    from safetensors import safe_open
+
+    r = _rows()
+    vrs.put(store, HASH, GRID, r)
+    with safe_open(os.path.join(store, vrs.key_name(HASH, GRID)), framework="pt") as f:
+        assert f.metadata() == {"hash": "%016x" % HASH, "grid": "1x22x92"}
+        assert torch.equal(f.get_tensor("rows"), r)
+
+
+def test_put_replaces_a_short_existing_file_and_keeps_a_whole_one(store):
+    """A5: an existing file is trusted only at its exact size."""
+    vrs.put(store, HASH, GRID, _rows())
+    p = os.path.join(store, vrs.key_name(HASH, GRID))
+    good = open(p, "rb").read()
+    open(p, "wb").write(good[:100])
+    assert vrs.get(store, HASH, GRID, WIDTH) is None
+    assert vrs.put(store, HASH, GRID, _rows())                     # republished
+    assert os.path.getsize(p) == len(good) and torch.equal(vrs.get(store, HASH, GRID, WIDTH), _rows())
+    ino = os.stat(p).st_ino
+    assert vrs.put(store, HASH, GRID, _rows()) and os.stat(p).st_ino == ino   # whole: not rewritten
+
+
+def test_a1_put_never_takes_the_tmpfs_floor(store, monkeypatch):
+    """A1: the container /dev/shm (16 GiB, 3.6 GiB free live) also carries the arena, the seq lanes and the tail
+    hand-off parts -- a write leaves max(1 GiB, TAIL_KEEP_MIB) free: own LRU entries go first, then a named skip."""
+    one = len(vrs._blob(HASH, GRID, _rows()))
+    vrs.put(store, HASH + 1, GRID, _rows(seed=1))
+    vrs.put(store, HASH + 2, GRID, _rows(seed=2))
+    os.utime(os.path.join(store, vrs.key_name(HASH + 1, GRID)), (1000.0, 1000.0))
+    floor = vrs.free_floor()
+    assert floor >= 1 << 30
+    def free(d):  # two own files leave 10 bytes over the floor; each file gone frees one more
+        return floor + 10 + (2 - sum(1 for f in os.listdir(d) if f.endswith(vrs.SUFFIX))) * one
+
+    monkeypatch.setattr(vrs, "_free_bytes", free)
+    # room after dropping the OLDEST own entry exactly
+    assert vrs.put(store, HASH, GRID, _rows())
+    names = os.listdir(store)
+    assert vrs.key_name(HASH + 1, GRID) not in names and vrs.key_name(HASH, GRID) in names
+    # no room even with every own entry gone: a named skip, False, nothing written
+    monkeypatch.setattr(vrs, "_free_bytes", lambda d: floor - 1)
+    assert vrs.put(store, HASH + 9, GRID, _rows()) is False
+    assert not vrs.has(store, HASH + 9, GRID)
+
+
+def test_a1_the_floor_follows_tail_keep_mib(monkeypatch):
+    monkeypatch.setenv("FLLIPER_PDFLIP_TAIL_KEEP_MIB", "512")
+    assert vrs.free_floor() == 1 << 30
+    monkeypatch.setenv("FLLIPER_PDFLIP_TAIL_KEEP_MIB", "3072")
+    assert vrs.free_floor() == 3072 << 20
+
+
 def test_store_is_bounded_lru(store):
-    one = len(vrs.MAGIC) + 200 + 506 * WIDTH * 2
+    one = len(vrs._blob(HASH, GRID, _rows()))
     cap = int(one * 2.5)
     for i in range(3):
         assert vrs.put(store, HASH + i, GRID, _rows(seed=i), cap=cap)
@@ -194,18 +251,43 @@ def test_store_is_bounded_lru(store):
     assert len(names) == 2 and vrs.key_name(HASH, GRID) not in names  # the oldest went
 
 
-def test_store_off_and_namespace(monkeypatch):
+def _ckpt(root, name, vision=None, visual_shard_bytes=b"V"):
+    d = root / name
+    d.mkdir()
+    (d / "config.json").write_text(json.dumps({"vision_config": vision or {"out_hidden_size": WIDTH, "depth": 27}}))
+    (d / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {
+        "model.visual.blocks.0.attn.qkv.weight": "model-00001.safetensors",
+        "model.language_model.layers.0.mlp.weight": "model-00002.safetensors"}}))
+    (d / "model-00001.safetensors").write_bytes(visual_shard_bytes)
+    (d / "model-00002.safetensors").write_bytes(b"L")
+    return str(d)
+
+
+def test_store_namespace_is_the_tower_identity_not_the_served_name(tmp_path, monkeypatch):
+    """A2: rc30 boots P and D from the SAME checkpoint (...INT4-Mixed-AutoRound-Minachist-abl-wxp; the MTP-g32 path
+    is D's draft) -> one directory. A served-name alias of another checkpoint must never share it."""
     monkeypatch.delenv(vrs.ENV_DIR, raising=False)
-    sa = types.SimpleNamespace(keep_mm_feature_on_device=False, served_model_name="NF",
-                               model_path="/m/Qwen3.8-Flash-Next-INT4-Mixed-AutoRound")
-    sd = types.SimpleNamespace(keep_mm_feature_on_device=False, served_model_name="NF",
-                               model_path="/m/Qwen3.8-Flash-Next-MTP-INT4-g32")
-    # P and D boot different checkpoints served as one model (rc30): one directory
-    assert vrs.store_dir_for(sa) == vrs.store_dir_for(sd) and vrs.store_dir_for(sa).startswith("/dev/shm/pdflip-vrows-")
+    monkeypatch.delenv(vrs.ENV_MB, raising=False)
+    vrs.tower_id.cache_clear()
+    a = _ckpt(tmp_path, "Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist-abl-wxp")
+    b = _ckpt(tmp_path, "other-checkpoint", visual_shard_bytes=b"VV")
+    link = tmp_path / "alias"
+    link.symlink_to(a)
+    p = types.SimpleNamespace(keep_mm_feature_on_device=False, served_model_name="NF", model_path=a)
+    d = types.SimpleNamespace(keep_mm_feature_on_device=False, served_model_name="NF", model_path=str(link))
+    o = types.SimpleNamespace(keep_mm_feature_on_device=False, served_model_name="NF", model_path=b)
+    assert vrs.store_dir_for(p) == vrs.store_dir_for(d)                    # same checkpoint, resolved path
+    assert vrs.store_dir_for(p).startswith("/dev/shm/pdflip-vrows-")
+    assert vrs.store_dir_for(o) != vrs.store_dir_for(p)                    # same served name, another tower
+    c = _ckpt(tmp_path, "same-shards-other-vision", vision={"out_hidden_size": WIDTH, "depth": 32})
+    assert vrs.store_dir_for(types.SimpleNamespace(keep_mm_feature_on_device=False, model_path=c)) not in (
+        vrs.store_dir_for(p), None)
+    assert vrs.store_dir_for(types.SimpleNamespace(keep_mm_feature_on_device=False, model_path="hf/remote-id")) is None
     monkeypatch.setenv(vrs.ENV_MB, "0")
-    assert vrs.store_dir_for(sa) is None
-    monkeypatch.setenv(vrs.ENV_MB, "2048")
-    assert vrs.store_dir_for(types.SimpleNamespace(keep_mm_feature_on_device=True, served_model_name="NF")) is None
+    assert vrs.store_dir_for(p) is None
+    monkeypatch.setenv(vrs.ENV_MB, "1024")
+    assert vrs.store_dir_for(types.SimpleNamespace(keep_mm_feature_on_device=True, model_path=a)) is None
+    vrs.tower_id.cache_clear()
 
 
 def test_publish_and_available_spans(store):
@@ -315,7 +397,7 @@ def test_the_rows_branch_sits_in_the_d_verdict_behind_a_replicated_refuse():
     from flliper.srt.managers.scheduler import Scheduler
 
     src = inspect.getsource(Scheduler._pdflip_vision_d_verdict)
-    assert "v == _vdg.REFUSE and covered is not None" in src
+    assert "out == _vdg.REFUSE and covered is not None" in src
     rows = inspect.getsource(Scheduler._pdflip_vision_d_rows)
     assert '_form_a_tp_exchange("pdflip-vision-rows/tp<-rows"' in rows
     assert rows.index("if src:") < rows.index("_vrs.load(items, d, w)")
@@ -364,3 +446,47 @@ def test_a_crashed_writes_temporary_file_is_cleared(store):
     os.utime(stale, (old, old))
     assert vrs.put(store, HASH + 2, GRID, _rows())
     assert not os.path.exists(stale) and os.path.exists(fresh)    # a write in flight is never touched
+
+
+def test_a7_rows_also_after_a_bounded_tail_wait(store, monkeypatch):
+    """A7: a tail wait (DEFER) that ``bounded`` turns into REFUSE tries the rows too, from the covered prefix."""
+    from flliper.srt.managers.scheduler import Scheduler
+    from flliper.srt.pdflip import tail_adopt
+
+    vrs.put(store, HASH, GRID, _rows())
+    monkeypatch.setattr(tail_adopt, "peek_target_start", lambda req, c, batch_empty=True: (COVERED + 5, True))
+    req = _req()
+    h = _sched()
+    h._pdflip_vision_d_defers = {req.rid: g.DEFER_BOUND_PASSES}
+    assert Scheduler._pdflip_vision_d_verdict(h, req, None) == g.ADMIT
+    assert vrs.has_rows(req.multimodal_inputs.mm_items[0])
+
+
+def test_a3_a_pp_stage_never_reads_on_its_own(store, monkeypatch):
+    from flliper.srt.managers.scheduler import Scheduler
+
+    vrs.put(store, HASH, GRID, _rows())
+    monkeypatch.setattr(vrs, "load", lambda *a, **k: (_ for _ in ()).throw(AssertionError("read per stage")))
+    h = _sched()
+    h.ps.pp_size = 2
+    assert Scheduler._pdflip_vision_d_verdict(h, _req(), None) == g.REFUSE
+
+
+def test_a4_the_launcher_sweeps_the_family():
+    from flliper.srt.pdflip import launcher
+
+    assert any(vrs.PREFIX.startswith(p) for p in launcher.SHM_OWN_PREFIXES)
+
+
+def test_a5_p_republishes_on_an_emb_cache_hit(store, monkeypatch):
+    from flliper.srt import runtime_context
+    from flliper.srt.pdflip import vision_rank_runner as vrr
+
+    monkeypatch.setattr(runtime_context, "get_server_args",
+                        lambda: types.SimpleNamespace(keep_mm_feature_on_device=False, model_path="/x"))
+    calls = []
+    monkeypatch.setattr(vrr, "_publish_rows", lambda items: calls.append(len(items)) or 1)
+    import inspect
+
+    src = inspect.getsource(vrr.emb_cache_attach)
+    assert src.rindex("_publish_rows(items)") > src.index("attach_precomputed_embeddings(items, rows")

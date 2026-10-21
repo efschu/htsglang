@@ -20,11 +20,16 @@ are scattered. P already keeps those rows per image (S66c ``vision_rank_runner.e
 ``MultiModalStaticCache``) -- in P's PP0 process, invisible to D's.
 
 THE FIX. This module is the cross-process half of that cache:
-  * P (PP0, after every attach -- ``vision_rank_runner.emb_cache_store``) PUBLISHES each image's rows as one file
-    ``<hash>-<grid>.rows`` in a host tmpfs directory named by the served model (``/dev/shm/pdflip-vrows-<id>``):
-    a header (hash, grid, rows, width, dtype) plus the raw bytes, written atomically (tmp + rename), bounded in
-    bytes (LRU by mtime, readers refresh it). The identity of an entry is (content hash, image_grid_thw) -- the
-    S66c-r B1 rule: equal pixel bytes under another grid are other rows.
+  * P (PP0, after every attach and every EMB-CACHE hit -- ``vision_rank_runner``) PUBLISHES each image's rows as
+    one safetensors file ``<hash>-<grid>.safetensors`` (tensor ``rows``, metadata ``{hash, grid}``) in a host tmpfs
+    directory named by the TOWER identity (``/dev/shm/pdflip-vrows-<tower id>``: realpath of the checkpoint, its
+    ``vision_config``, size + mtime of the shard files that hold ``visual.*`` tensors -- a served-name alias of
+    another checkpoint never serves foreign rows), written atomically (tmp + rename), bounded in bytes (LRU by
+    mtime, readers refresh it) AND by the free space of the tmpfs: a write never leaves less than
+    ``max(1 GiB, FLLIPER_PDFLIP_TAIL_KEEP_MIB)`` free (own LRU entries go first, then the write is skipped by
+    name) -- the container's /dev/shm also carries the arena, the seq lanes and the tail hand-off parts. The
+    identity of an entry is (content hash, image_grid_thw) -- the S66c-r B1 rule: equal pixel bytes under another
+    grid are other rows.
   * D's TOKENIZER answers the front's probe with the image spans whose rows are published (``mm_rows``); the
     FRONT (R11: it decides alone) counts an image as ``image_in_tail`` only when its span ends past ``covered``
     AND D cannot get its rows (``d_match_probe.exact_price``). An already encoded image is no p_only (R9 holds
@@ -44,15 +49,21 @@ Upstream's global embedding cache (``--enable-mm-global-cache``, Mooncake store)
 but needs the Mooncake transfer engine and its master service, which this image does not carry; the upstream
 EPD path (encoder server -> language server) ships rows per request from a dedicated encoder instance, while
 here the encoder (P's PP0) sleeps whenever D serves. The in-process ``MultiModalStaticCache`` is reused as the
-P-side keeper (S66c) and its lookup path is the D-side consumer.
+P-side keeper (S66c) and its lookup path is the D-side consumer. The file format is safetensors (Apache-2.0, the
+checkpoint format; vLLM's ``ECExampleConnector`` stores encoder outputs the same way, one safetensors file per
+mm hash).
 
-``FLLIPER_PDFLIP_VISION_ROWS_MB`` (default 2048; 0 = off), ``FLLIPER_PDFLIP_VISION_ROWS_DIR`` (directory
+P and D boot the SAME checkpoint (rc30: ``...INT4-Mixed-AutoRound-Minachist-abl-wxp`` on both; the
+``...MTP-INT4-g32...`` path is D's draft model), so the tower identity is equal on both groups.
+
+``FLLIPER_PDFLIP_VISION_ROWS_MB`` (default 1024; 0 = off), ``FLLIPER_PDFLIP_VISION_ROWS_DIR`` (directory
 override; default under ``/dev/shm``). Only where the item hash is the content hash computed alike in every
 process (``d_mm_item_cache.hash_reason``).
 """
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import logging
@@ -67,19 +78,25 @@ logger = logging.getLogger(__name__)
 TAG = "PDFLIP VISION-ROWS"
 ENV_MB = "FLLIPER_PDFLIP_VISION_ROWS_MB"
 ENV_DIR = "FLLIPER_PDFLIP_VISION_ROWS_DIR"
-DEFAULT_MB = 2048
+#: 1024 MB: the working set is the RECENT images (the one ending in the partial page is the newest), ~390 images of
+#: 506 rows x 2560 x bf16 (2.59 MB); the container tmpfs sizing is in the rc30 visiontail report (A1)
+DEFAULT_MB = 1024
 ROOT = "/dev/shm"
 PREFIX = "pdflip-vrows-"
-SUFFIX = ".rows"
-MAGIC = b"PDVROWS1\n"
+SUFFIX = ".safetensors"
+#: the free space a write always leaves on the tmpfs, at least (A1): the tail hand-off parts, the D park parts and the
+#: seq lanes' whole-tag fallback buffers are written there on demand
+FREE_FLOOR_MIN = 1 << 30
 #: the attribute D's scheduler attaches a row tensor under (read by mm_utils._get_chunked_embedding_by_item)
 ITEM_ATTR = "pdflip_tail_rows"
+TENSOR = "rows"
 
 _DTYPES = {
     "bfloat16": torch.bfloat16,
     "float16": torch.float16,
     "float32": torch.float32,
 }
+_SKIPS = [0]
 
 
 # ---------------------------------------------------------------------------- configuration
@@ -92,25 +109,75 @@ def cap_bytes(env: Optional[Dict[str, str]] = None) -> int:
     return max(0, mb) << 20
 
 
-def model_id(model_name: Any) -> str:
-    """The directory's model key: the SERVED model name -- the name the shared KV store keys its pages with, the
-    one P and D share. NOT the checkpoint path: rc30 boots P from ...-INT4-Mixed-AutoRound-... and D from
-    ...-MTP-INT4-g32-... (boot 1d822bd150_1021_063252), both served as one model, D reading P's KV pages."""
-    p = str(model_name or "")
-    return hashlib.sha1(p.encode("utf-8", "replace")).hexdigest()[:16]
+def free_floor() -> int:
+    """A1: what a write leaves free on the tmpfs, at least: max(1 GiB, FLLIPER_PDFLIP_TAIL_KEEP_MIB)."""
+    try:
+        from flliper.srt.environ import envs
+
+        keep = max(0, int(envs.FLLIPER_PDFLIP_TAIL_KEEP_MIB.get())) << 20
+    except Exception:  # noqa: BLE001 -- no reading is the minimum, never less
+        keep = 0
+    return max(FREE_FLOOR_MIN, keep)
 
 
-def store_dir(model_name: Any, env: Optional[Dict[str, str]] = None) -> Optional[str]:
-    """The shared directory of this model's rows, or None when the store is off / no model is named."""
+def _free_bytes(d: str) -> int:
+    st = os.statvfs(d)
+    return int(st.f_bavail) * int(st.f_frsize)
+
+
+def _visual_shards(root: str) -> List[str]:
+    """The checkpoint files holding ``visual.*`` tensors (all weight files when the index names none)."""
+    idx = os.path.join(root, "model.safetensors.index.json")
+    try:
+        with open(idx, encoding="utf-8") as fh:
+            wm = json.load(fh).get("weight_map") or {}
+        files = sorted({f for k, f in wm.items() if "visual" in k}) or sorted(set(wm.values()))
+        return files
+    except (OSError, ValueError, AttributeError):
+        pass
+    return ["model.safetensors"] if os.path.isfile(os.path.join(root, "model.safetensors")) else []
+
+
+@functools.lru_cache(maxsize=8)
+def tower_id(model_path: Any) -> Optional[str]:
+    """A2: the directory's key = the TOWER's identity -- the resolved checkpoint path, its ``vision_config`` and size +
+    mtime of the shard files with ``visual.*`` tensors. None when it cannot be established (no local checkpoint, no
+    vision_config, no shard): then there is no store -- never a guessed namespace."""
+    if not model_path:
+        return None
+    try:
+        root = os.path.realpath(str(model_path))
+        with open(os.path.join(root, "config.json"), encoding="utf-8") as fh:
+            cfg = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    vc = cfg.get("vision_config") if isinstance(cfg, dict) else None
+    if not isinstance(vc, dict):
+        return None
+    stats = []
+    for f in _visual_shards(root):
+        try:
+            st = os.stat(os.path.join(root, f))
+        except OSError:
+            return None
+        stats.append([f, int(st.st_size), int(st.st_mtime_ns)])
+    if not stats:
+        return None
+    key = json.dumps([root, vc, stats], sort_keys=True, default=str)
+    return hashlib.sha1(key.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def store_dir(tower: Any, env: Optional[Dict[str, str]] = None) -> Optional[str]:
+    """The shared directory of this tower's rows, or None when the store is off / the tower has no identity."""
     e = os.environ if env is None else env
     if cap_bytes(e) <= 0:
         return None
     override = str(e.get(ENV_DIR, "") or "").strip()
     if override:
         return override
-    if not model_name:
+    if not tower:
         return None
-    return os.path.join(ROOT, PREFIX + model_id(model_name))
+    return os.path.join(ROOT, PREFIX + str(tower))
 
 
 def hash_ok(server_args: Any) -> str:
@@ -127,11 +194,13 @@ def hash_ok(server_args: Any) -> str:
 
 
 def store_dir_for(server_args: Any, env: Optional[Dict[str, str]] = None) -> Optional[str]:
-    """The directory for a process with these server args, or None (off, no content hash)."""
+    """The directory for a process with these server args, or None (off, no content hash, no tower identity)."""
     if hash_ok(server_args):
         return None
-    name = getattr(server_args, "served_model_name", None) or getattr(server_args, "model_path", None)
-    return store_dir(name, env)
+    e = os.environ if env is None else env
+    if cap_bytes(e) > 0 and str(e.get(ENV_DIR, "") or "").strip():
+        return store_dir(None, e)
+    return store_dir(tower_id(getattr(server_args, "model_path", None)), e)
 
 
 # ---------------------------------------------------------------------------- items
@@ -206,8 +275,16 @@ def attach(items: Sequence[Any], rows: Sequence[torch.Tensor]) -> int:
 
 
 # ---------------------------------------------------------------------------- the files
+def _hex(h: int) -> str:
+    return "%016x" % (int(h) & ((1 << 64) - 1))
+
+
+def _grid_s(grid: Sequence[int]) -> str:
+    return "x".join(str(int(x)) for x in grid)
+
+
 def key_name(h: int, grid: Sequence[int]) -> str:
-    return "%016x-%s%s" % (int(h) & ((1 << 64) - 1), "x".join(str(int(x)) for x in grid), SUFFIX)
+    return "%s-%s%s" % (_hex(h), _grid_s(grid), SUFFIX)
 
 
 def _path(d: str, h: int, grid: Sequence[int]) -> str:
@@ -264,41 +341,79 @@ def _evict_to(d: str, cap: int, incoming: int) -> int:
     return total
 
 
+def _make_room(d: str, incoming: int, floor: int) -> Tuple[bool, int]:
+    """A1: drop own LRU entries until the tmpfs keeps ``floor`` free after ``incoming`` more bytes.
+    (room, free bytes now)."""
+    entries = sorted(_dir_entries(d))
+    free = _free_bytes(d)
+    for _t, s, p in entries:
+        if free - incoming >= floor:
+            break
+        try:
+            os.unlink(p)
+        except OSError:
+            continue
+        free = _free_bytes(d)
+    return free - incoming >= floor, free
+
+
+def _blob(h: int, grid: Sequence[int], t: torch.Tensor) -> bytes:
+    from safetensors.torch import save
+
+    return save({TENSOR: t}, metadata={"hash": _hex(h), "grid": _grid_s(grid)})
+
+
 def put(d: Optional[str], h: Optional[int], grid: Optional[Sequence[int]], rows: Any,
         cap: Optional[int] = None) -> bool:
-    """Publish one image's rows (host tensor, 2-D). True when the file exists afterwards."""
+    """Publish one image's rows (host tensor, 2-D). True when a valid file exists afterwards."""
     if not d or h is None or not grid or not isinstance(rows, torch.Tensor):
         return False
-    if rows.is_cuda or rows.dim() != 2:
-        return False
-    dt = {v: k for k, v in _DTYPES.items()}.get(rows.dtype)
-    if dt is None:
+    if rows.is_cuda or rows.dim() != 2 or rows.dtype not in _DTYPES.values():
         return False
     cap = cap_bytes() if cap is None else int(cap)
-    p = _path(d, h, grid)
-    if os.path.isfile(p):
-        try:
-            os.utime(p)
-        except OSError:
-            pass
-        return True
-    t = rows.detach().contiguous()
-    payload = t.view(torch.uint8).numpy().tobytes() if t.numel() else b""
-    head = json.dumps({"hash": "%016x" % (int(h) & ((1 << 64) - 1)), "grid": [int(x) for x in grid],
-                       "rows": int(t.shape[0]), "width": int(t.shape[1]), "dtype": dt},
-                      separators=(",", ":")).encode() + b"\n"
-    size = len(MAGIC) + len(head) + len(payload)
+    try:
+        blob = _blob(h, grid, rows.detach().contiguous())
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("%s PUT-FAILED key=%s %s: %s", TAG, key_name(h, grid), type(exc).__name__, exc)
+        return False
+    size = len(blob)
     if size > cap:
         return False
+    p = _path(d, h, grid)
+    try:
+        if os.path.getsize(p) == size:  # A5: an existing file is trusted only at its exact size
+            try:
+                os.utime(p)
+            except OSError:
+                pass
+            return True
+        os.unlink(p)  # a short / foreign file: replaced
+    except OSError:
+        pass
     try:
         os.makedirs(d, exist_ok=True)
         _evict_to(d, cap, size)
+        floor = free_floor()
+        room, free = _make_room(d, size, floor)
+        if not room:
+            _SKIPS[0] += 1
+            n = _SKIPS[0]
+            if n <= 8 or n % 256 == 0:
+                logger.warning("%s SKIP-NO-ROOM key=%s bytes=%d free=%d floor=%d n=%d (the tmpfs keeps its floor for "
+                               "the tail hand-off / park parts; D treats this image as P-only)",
+                               TAG, key_name(h, grid), size, free, floor, n)
+            return False
         tmp = "%s.tmp.%d.%d" % (p, os.getpid(), time.monotonic_ns())
-        with open(tmp, "wb") as f:
-            f.write(MAGIC)
-            f.write(head)
-            f.write(payload)
-        os.replace(tmp, p)
+        try:
+            with open(tmp, "wb") as f:
+                f.write(blob)
+            os.replace(tmp, p)
+        except OSError:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
     except OSError as exc:
         logger.warning("%s PUT-FAILED key=%s %s: %s", TAG, key_name(h, grid), type(exc).__name__, exc)
         return False
@@ -307,41 +422,27 @@ def put(d: Optional[str], h: Optional[int], grid: Optional[Sequence[int]], rows:
 
 def get(d: Optional[str], h: Optional[int], grid: Optional[Sequence[int]],
         width: Optional[int] = None) -> Optional[torch.Tensor]:
-    """One image's rows (a host tensor), or None: missing, or a header that is not exactly this identity."""
+    """One image's rows (a host tensor), or None: missing, unreadable, or metadata that is not exactly this identity."""
     if not d or h is None or not grid:
         return None
     p = _path(d, h, grid)
     try:
-        with open(p, "rb") as f:
-            data = f.read()
-    except OSError:
+        from safetensors import safe_open
+
+        with safe_open(p, framework="pt") as f:
+            md = f.metadata() or {}
+            if md.get("hash") != _hex(h) or md.get("grid") != _grid_s(grid) or list(f.keys()) != [TENSOR]:
+                return None
+            t = f.get_tensor(TENSOR)
+    except Exception:  # noqa: BLE001 -- missing, truncated or foreign: no rows
         return None
-    if not data.startswith(MAGIC):
-        return None
-    nl = data.find(b"\n", len(MAGIC))
-    if nl < 0:
-        return None
-    try:
-        head = json.loads(data[len(MAGIC):nl].decode())
-        dtype = _DTYPES[str(head["dtype"])]
-        nrows, w = int(head["rows"]), int(head["width"])
-        same = (str(head["hash"]) == "%016x" % (int(h) & ((1 << 64) - 1))
-                and tuple(int(x) for x in head["grid"]) == tuple(int(x) for x in grid))
-    except (ValueError, KeyError, TypeError):
-        return None
-    if not same or (width is not None and w != int(width)):
-        return None
-    raw = data[nl + 1:]
-    elsize = torch.tensor([], dtype=dtype).element_size()
-    if len(raw) != nrows * w * elsize:
+    if t.dim() != 2 or t.dtype not in _DTYPES.values() or (width is not None and int(t.shape[1]) != int(width)):
         return None
     try:
         os.utime(p)
     except OSError:
         pass
-    if not raw:
-        return torch.empty((nrows, w), dtype=dtype)
-    return torch.frombuffer(bytearray(raw), dtype=torch.uint8).view(dtype).reshape(nrows, w)
+    return t
 
 
 # ---------------------------------------------------------------------------- the three callers

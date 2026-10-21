@@ -19,7 +19,7 @@ What the author's suite (test_pdflip_vision_rows_tail_1021.py) does not pin and 
   4. SOLL R9: a new image (no rows, or rows under another grid) stays p_only; an image whose rows exist is priced
      with its exact u INCLUDING its image tokens (user 19.10. 12:48:53Z: "die ganz normale regel").
 
-Two Auflagen are pinned as strict xfails (they turn red when fixed, so the marker must then be removed):
+Two Auflagen were pinned as strict xfails; both are fulfilled on desk/nf-rc30-visiontail-1021 and the markers removed:
   A3 a D with pp_size > 1 reads the store on every stage -> stages can disagree;
   A4 the launcher's /dev/shm residue sweep does not know the ``pdflip-vrows-`` family.
 """
@@ -365,8 +365,7 @@ def test_real_broadcast_pyobj_carries_the_frombuffer_bf16_rows_bit_exactly(store
     assert all(d and b == want for _k, d, b in got)
 
 
-@pytest.mark.xfail(strict=True, reason="AUFLAGE A3: a D with pp_size > 1 reads the store on every PP stage itself "
-                                       "(tp == 1 -> src=True): an eviction between two stages' reads splits them")
+# AUFLAGE A3 fulfilled (rc30 visiontail): pp>1 is a named MISS on every stage
 def test_auflage_a3_pp_stages_never_read_independently(store):
     from flliper.srt.managers.scheduler import Scheduler
 
@@ -431,8 +430,7 @@ def test_enospc_is_false_not_an_exception(store, monkeypatch):
     assert not vrs.has(store, HASH, GRID)
 
 
-@pytest.mark.xfail(strict=True, reason="AUFLAGE A4: pdflip-vrows- is not one of the launcher's SHM_OWN_PREFIXES -- "
-                                       "residue is never swept and the host census books it as other_tmpfs")
+# AUFLAGE A4 fulfilled (rc30 visiontail): pdflip-vrows- is in SHM_OWN_PREFIXES
 def test_auflage_a4_launcher_sweep_knows_the_vrows_family():
     from flliper.srt.pdflip import launcher
 
