@@ -7275,9 +7275,19 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         from flliper.srt.pdflip import w3_room_set as _w3rs
 
         if _w3rs.armed(self):
+            # SPILL-MEMO (NF rc27 1021_023225 PP1 18488-18508 / PP2 18561-18606: RETAIN-PUBLISH issue_ms 498-827 for
+            # 20 skipped nodes, each running this whole walk again with the same answer 0; pdflip/spill_memo.py): a
+            # spill that released nothing (decided) is not walked again until the arena or the tree changed
+            from flliper.srt.pdflip import spill_memo as _smemo
+
+            if _smemo.unchanged(self, pool):
+                self._w3_room_undecided = False
+                return 0
+            _t_sm = time.perf_counter()
             # F1: a PP group spills ONE slot set -- PP0 decides from the arena order, every stage
             # gives back exactly these slots (a slot frees only when all stages let go)
             _rel = _w3rs.spill(self, pool, int(need_pages), want, released_out, claimer=claimer)
+            _smemo.note(self, pool, _rel, _w3rs.undecided(self), _t_sm)
             if _rel == 0 and _w3rs.backoff_ok(self):
                 # review F1 A4: an UNDECIDED spill (PP0 waits for a follower's acknowledgement, a
                 # follower holds debts of PP0's set) is no empty answer -- no backoff
@@ -8913,6 +8923,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         _t_sweep0 = time.perf_counter()
         _issue_s = 0.0
         _walked = 0
+        from flliper.srt.pdflip import spill_memo as _smemo
+
+        _sm0 = _smemo.counters(self)   # SPILL-MEMO instrument: W3 spill walks / skips / ms inside THIS sweep
         self._pdflip_sweep_last_refusal = None
         self._s73_sweep_why = {}   # S73: refusal reasons of THIS sweep (the line's refused_by=)
         # SWEEP-FULL-ARENA: armed for this sweep; engaged by its first arena_claim refusal
@@ -9040,6 +9053,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 _full_arena = _full_arena or (
                     _full_arena_armed and self._pdflip_sweep_last_refusal == "arena_claim")
         stats["walked"] = _walked
+        _sm1 = _smemo.counters(self)
+        if _sm1 != _sm0:
+            stats["spill_walks"] = _sm1[0] - _sm0[0]
+            stats["spill_memo_skips"] = _sm1[1] - _sm0[1]
+            stats["spill_ms"] = round(_sm1[2] - _sm0[2], 1)
         stats["refused_by"] = dict(sorted((getattr(self, "_s73_sweep_why", None) or {}).items()))
         self._s73_sweep_why = None
         stats["issue_ms"] = round(_issue_s * 1000.0, 1)

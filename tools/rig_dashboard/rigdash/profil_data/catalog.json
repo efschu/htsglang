@@ -64076,6 +64076,37 @@
    ],
    "type": "os.environ"
   },
+  "FLLIPER_PDFLIP_EVICT_FIT": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"1\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "",
+   "id": "FLLIPER_PDFLIP_EVICT_FIT",
+   "kind": "env",
+   "lesestellen": [
+    "pdflip/evict_fit.py:41"
+   ],
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_EVICT_FIT",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "pdflip/evict_fit.py",
+    "kind": "os.environ",
+    "line": 41,
+    "tree": "nf"
+   },
+   "status": "unexplained",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "os.environ"
+  },
   "FLLIPER_PDFLIP_EVIDENCE_DIR": {
    "bare": false,
    "choices": null,
@@ -75846,6 +75877,37 @@
    ],
    "type": "os.environ"
   },
+  "FLLIPER_PDFLIP_SPILL_STATE_MEMO": {
+   "bare": false,
+   "choices": null,
+   "cost": "",
+   "default": "\"1\"",
+   "depends": [],
+   "gain": "",
+   "group": "",
+   "help": "",
+   "id": "FLLIPER_PDFLIP_SPILL_STATE_MEMO",
+   "kind": "env",
+   "lesestellen": [
+    "pdflip/spill_memo.py:51"
+   ],
+   "level": "expert",
+   "name": "FLLIPER_PDFLIP_SPILL_STATE_MEMO",
+   "nargs": null,
+   "planner_derived": false,
+   "source": {
+    "file": "pdflip/spill_memo.py",
+    "kind": "os.environ",
+    "line": 51,
+    "tree": "nf"
+   },
+   "status": "unexplained",
+   "text": "",
+   "trees": [
+    "nf"
+   ],
+   "type": "os.environ"
+  },
   "FLLIPER_PDFLIP_STANDARD_FORM": {
    "bare": false,
    "choices": null,
@@ -76284,7 +76346,7 @@
    "id": "FLLIPER_PDFLIP_SWEEP_REFUSED_MEMO",
    "kind": "env",
    "lesestellen": [
-    "mem_cache/unified_radix_cache.py:9118"
+    "mem_cache/unified_radix_cache.py:9136"
    ],
    "level": "expert",
    "name": "FLLIPER_PDFLIP_SWEEP_REFUSED_MEMO",
@@ -76293,7 +76355,7 @@
    "source": {
     "file": "mem_cache/unified_radix_cache.py",
     "kind": "os.environ",
-    "line": 9118,
+    "line": 9136,
     "tree": "nf"
    },
    "status": "unexplained",
@@ -91879,8 +91941,8 @@
  "schema": "flliper.catalog/1",
  "stats": {
   "curated": 125,
-  "entries": 2901,
-  "envs": 2022,
+  "entries": 2903,
+  "envs": 2024,
   "explained": 310,
   "flags": 864,
   "harvested": 1796,
@@ -91888,19 +91950,19 @@
    "abweichung": 53,
    "beide": 2463,
    "nur_27b": 180,
-   "nur_nf": 240
+   "nur_nf": 242
   },
-  "unexplained": 670
+  "unexplained": 672
  },
- "tree_rev": "27b=0798c91fcd+nf=f416e284d7",
+ "tree_rev": "27b=0798c91fcd+nf=cb46a2c9bb+0d1a700383",
  "trees": {
   "27b": {
    "entries": 2643,
    "rev": "0798c91fcd"
   },
   "nf": {
-   "entries": 2703,
-   "rev": "f416e284d7"
+   "entries": 2705,
+   "rev": "cb46a2c9bb+0d1a700383"
   }
  },
  "warnungen": []
