@@ -168,7 +168,7 @@ _NF_FR_D = "0.06,0.51,0.48"
 #: the real files instead).
 MODELS: Dict[str, SimModel] = {m.key: m for m in (
     SimModel("27B-INT8", "qwen27b", "int8", 27648,
-             _27B_BASE + ("--env-d", "FLLIPER_PDFLIP_EXTEND_TRIM_MIB=1200,0,0"),
+             _27B_BASE + ("--env-d", "FLLIPER_PDFLIP_EXTEND_TRIM_MIB=1200,700,700"),
              {"FLLIPER_PDFLIP_L15": "1", "FLLIPER_PDFLIP_L15_MIB": "c1=7616,c2=1792"},
              "27b.env (27b-base.env, :50 extend trim, :117/:133 L15 c1=7616,c2=1792); ckpt 27 G (plan 3.1, S)"),
     SimModel("27B-FP8", "qwen27b", "fp8", 29437, _27B_BASE, {}, "27b-fp8.env; safetensors 29437 MiB (du 25422 is the ZFS-compressed size)"),
