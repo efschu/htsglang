@@ -660,7 +660,9 @@ def make_handler(app: App):
                 if path == "/api/profil/modelle":
                     return self._json(app.profil.known_models())
                 if path == "/api/profil/planer-katalog":
-                    return self._json(app.planer_ui.katalog())
+                    from urllib.parse import parse_qs, urlsplit
+                    lang = (parse_qs(urlsplit(self.path).query).get("lang") or [""])[0]
+                    return self._json(app.planer_ui.katalog(lang))
             except profil.ProfileError as e:
                 return self._json({"ok": False, "error": str(e)}, 400)
             return self._send(404, "not found", "text/plain")

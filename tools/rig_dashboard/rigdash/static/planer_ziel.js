@@ -9,6 +9,10 @@
 (function (root) {
   "use strict";
   const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  const LANG = () => (typeof RigI18n === "undefined" ? "en" : RigI18n.lang());
+  // texts that the server built are localized by the server (``lang`` in the request); the translation memory must not touch them again (review B2)
+  const sv = (html) => (LANG() === "de" ? `<span data-i18n="skip">${html}</span>` : html);
+  const katQ = () => (LANG() === "de" ? "?lang=de" : "");
   const LOC = () => (typeof RigI18n === "undefined" ? "en-US" : RigI18n.loc());
   const num = (v) => (v == null || v === "" || isNaN(Number(v)) ? esc(v) : Number(v).toLocaleString(LOC()));
   const gib = (mib) => (Number(mib) / 1024).toLocaleString(LOC(), { maximumFractionDigits: 1 }) + " GiB";
@@ -19,7 +23,7 @@
   function hwChip(hw, msg) {
     if (!hw) return "";
     const btn = hw.measure && (hw.measure.cards || []).length ? ` <button type="button" data-pz="measure" title="Books a GPU window on the window plan and measures memory bandwidth and compute of these cards">Measure rates</button>` : "";
-    return `<span class="pz-chip ${hw.quelle === "gemessen" ? "pz-ok" : "pz-warn"}" title="${esc(hw.text)}">hardware figures: ${esc(hw.label)}</span>${btn}${msg ? ` <span class="muted pz-hwmsg" role="status">${esc(msg)}</span>` : ""}`;
+    return `<span class="pz-chip ${hw.quelle === "gemessen" ? "pz-ok" : "pz-warn"}" title="${esc(hw.text)}">hardware figures: ${sv(esc(hw.label))}</span>${btn}${msg ? ` <span class="muted pz-hwmsg" role="status">${sv(esc(msg))}</span>` : ""}`;
   }
 
   // ------------------------------------------------------------------ step 2: cards
@@ -49,10 +53,10 @@
       const ch = CHIP[l.status] || CHIP.blocked;
       const sel = l.id === selected;
       return `<div class="pz-lay${l.possible ? "" : " off"}${sel ? " sel" : ""}">
-        <button type="button" data-pz="layout" data-id="${esc(l.id)}" aria-pressed="${sel}"${l.possible ? "" : " disabled"}><b>${esc(l.name)}</b><span>${esc(l.satz)}</span></button>
+        <button type="button" data-pz="layout" data-id="${esc(l.id)}" aria-pressed="${sel}"${l.possible ? "" : " disabled"}><b>${esc(l.name)}</b><span>${sv(esc(l.satz))}</span></button>
         <div class="pz-lh"><span class="pz-chip ${ch[0]}">${esc(ch[1])}</span></div>
-        ${l.why.length ? `<ul class="pz-why">${l.why.map((w) => `<li>${esc(String(w).length > 220 ? String(w).slice(0, 218) + "…" : w)}</li>`).join("")}</ul>` : ""}
-        <details class="pz-calc"><summary>calculation</summary><ul>${l.calc.map((x) => `<li>${esc(x)}</li>`).join("")}</ul></details></div>`;
+        ${l.why.length ? `<ul class="pz-why">${l.why.map((w) => `<li>${sv(esc(String(w).length > 220 ? String(w).slice(0, 218) + "…" : w))}</li>`).join("")}</ul>` : ""}
+        <details class="pz-calc"><summary>calculation</summary><ul>${l.calc.map((x) => `<li>${sv(esc(x))}</li>`).join("")}</ul></details></div>`;
     }).join("");
     return `<div class="pz-lays">${tiles}</div><div class="muted pz-note">${esc(lay.note || "")}</div>`;
   }
@@ -63,23 +67,23 @@
   }
   function renderRow(r, karten) {
     const val = r.je_karte && r.je_karte.length ? perCard(r, karten) : `<b class="mono">${num(r.wert)}</b>${r.einheit ? ` <span class="muted">${esc(r.einheit)}</span>` : ""}`;
-    return `<tr><td class="pz-l">${esc(r.label)}${r.schaetzung ? ` <span class="pz-chip pz-warn" title="An estimate: the launcher sizes this at boot">estimate</span>` : ""}</td><td class="pz-v">${val}</td>
-      <td class="pz-s"><span class="muted">${esc(r.warum || "")}</span> <span class="pz-src" title="${esc(r.roh || "")}">${esc(r.quelle || "")}</span></td></tr>`;
+    return `<tr><td class="pz-l">${sv(esc(r.label))}${r.schaetzung ? ` <span class="pz-chip pz-warn" title="An estimate: the launcher sizes this at boot">estimate</span>` : ""}</td><td class="pz-v">${val}</td>
+      <td class="pz-s"><span class="muted">${sv(esc(r.warum || ""))}</span> <span class="pz-src" title="${esc(r.roh || "")}">${sv(esc(r.quelle || ""))}</span></td></tr>`;
   }
   function renderPlan(p) {
     if (!p) return "";
     const head = `<h3 class="pz-h">${esc(p.model.name)} &middot; ${esc(p.layout.name)} &middot; ${esc(p.n)} card${p.n === 1 ? "" : "s"}</h3>`;
     if (p.status === "n_unsupported" || p.status === "blocked" || p.status === "error") {
       const t = p.status === "n_unsupported" ? "Not supported yet" : p.status === "blocked" ? "Not possible" : "The planner gave no proposal";
-      return `${head}<div class="pz-verdict bad"><b>${t}.</b><ul>${(p.hinweise || []).map((h) => `<li>${esc(h)}</li>`).join("")}</ul></div>`;
+      return `${head}<div class="pz-verdict bad"><b>${t}.</b><ul>${(p.hinweise || []).map((h) => `<li>${sv(esc(h))}</li>`).join("")}</ul></div>`;
     }
     const v = p.verdikt || {}, bad = v.outcome === "verweigert" || v.outcome === "crash";
-    const hw = p.hw ? `<span class="pz-chip ${p.hw.quelle === "gemessen" ? "pz-ok" : "pz-warn"}" title="${esc(p.hw.text)}">hardware figures: ${esc(p.hw.label)}</span>` : "";   // the button sits in step 2
-    const items = (v.items || []).map((i) => `<li><span class="pz-chip ${i.blocked ? "pz-bad" : "pz-warn"}">${i.blocked ? "refused" : "needs force"}</span> <span class="mono">${esc(i.code)}</span>${i.count > 1 ? ` <span class="muted">&times;${i.count}</span>` : ""} ${esc(String(i.text).length > 200 ? String(i.text).slice(0, 198) + "…" : i.text)}</li>`).join("");
+    const hw = p.hw ? `<span class="pz-chip ${p.hw.quelle === "gemessen" ? "pz-ok" : "pz-warn"}" title="${esc(p.hw.text)}">hardware figures: ${sv(esc(p.hw.label))}</span>` : "";   // the button sits in step 2
+    const items = (v.items || []).map((i) => `<li><span class="pz-chip ${i.blocked ? "pz-bad" : "pz-warn"}">${i.blocked ? "refused" : "needs force"}</span> <span class="mono">${esc(i.code)}</span>${i.count > 1 ? ` <span class="muted">&times;${i.count}</span>` : ""} ${sv(esc(String(i.text).length > 200 ? String(i.text).slice(0, 198) + "…" : i.text))}</li>`).join("");
     const fit = v.fit && v.fit.level ? ` Fit: <b>${esc(({ ja: "yes", tight: "tight", nein: "no" })[v.fit.level] || v.fit.level)}</b>${v.fit.margin_mib != null ? ", margin " + num(Math.round(v.fit.margin_mib)) + " MiB" : ""}.` : "";
     const groups = (p.felder || []).map((g) => `<section class="pz-g"><h4>${esc(g.titel)}</h4><table class="pz-t"><tbody>${g.zeilen.map((r) => renderRow(r, p.karten)).join("")}</tbody></table></section>`).join("");
-    const notes = (p.hinweise || []).length ? `<details class="pz-calc"><summary>${p.hinweise.length} planner note${p.hinweise.length === 1 ? "" : "s"}</summary><ul>${p.hinweise.map((h) => `<li>${esc(h)}</li>`).join("")}</ul></details>` : "";
-    return `${head}<div class="pz-verdict ${bad ? "bad" : "ok"}"><b>${esc(v.text || "")}</b>${fit} ${hw}${items ? `<details class="pz-calc"><summary>${(v.items || []).length} launcher note${(v.items || []).length === 1 ? "" : "s"}</summary><ul class="pz-vi">${items}</ul></details>` : ""}</div>${groups}${notes}`;
+    const notes = (p.hinweise || []).length ? `<details class="pz-calc"><summary>${p.hinweise.length} planner note${p.hinweise.length === 1 ? "" : "s"}</summary><ul>${p.hinweise.map((h) => `<li>${sv(esc(h))}</li>`).join("")}</ul></details>` : "";
+    return `${head}<div class="pz-verdict ${bad ? "bad" : "ok"}"><b>${sv(esc(v.text || ""))}</b>${fit} ${hw}${items ? `<details class="pz-calc"><summary>${(v.items || []).length} launcher note${(v.items || []).length === 1 ? "" : "s"}</summary><ul class="pz-vi">${items}</ul></details>` : ""}</div>${groups}${notes}`;
   }
 
   const api = { esc, shortCard, totalCards, cardsBody, hwChip, renderCards, renderLayouts, renderPlan, renderRow, CHIP };
@@ -98,7 +102,7 @@
     if (!r.ok || j.ok === false) throw new Error(j.error || ("HTTP " + r.status));
     return j;
   }
-  const reqBody = () => ({ model: st.model, cards: cardsBody(st.counts), seats: st.seatsDirty ? st.seats : undefined, tokens: st.tokensDirty ? st.tokens : undefined });
+  const reqBody = () => ({ lang: LANG() === "de" ? "de" : undefined, model: st.model, cards: cardsBody(st.counts), seats: st.seatsDirty ? st.seats : undefined, tokens: st.tokensDirty ? st.tokens : undefined });
   function draw() {
     if (!st.cat) { host.innerHTML = st.err ? `<div class="pz-verdict bad">${esc(st.err)}</div>` : `<div class="muted">loading &hellip;</div>`; return; }
     const act = document.activeElement, keep = act && act.dataset && act.dataset.k ? `[data-k="${act.dataset.k}"]` : "";
@@ -114,7 +118,7 @@
         <div class="pz-in"><label>Max seats <input type="number" data-k="seats" min="${st.cat.goals.seats[0]}" max="${st.cat.goals.seats[1]}" value="${esc(seats)}" placeholder="${esc(st.cat.defaults.seats)}"></label>
           <label>Max tokens per seat <input type="number" data-k="tokens" min="${st.cat.goals.tokens[0]}" max="${st.cat.goals.tokens[1]}" step="1024" value="${esc(tokens)}" placeholder="${esc(st.cat.defaults.tokens)}"></label>
           <span class="pz-presets">${presets}</span></div>
-        <div class="muted pz-note">Seats = concurrent requests. Tokens per seat is a <b>ceiling for one request</b>, not a share: all seats use one shared KV pool, so seats &times; tokens is not a memory budget; what does not fit parks to host memory and disk.</div></section>
+        <div class="muted pz-note">Seats = concurrent requests. Tokens per seat is a ceiling for one request, not a share: all seats use one shared KV pool, so seats &times; tokens is not a memory budget; what does not fit parks to host memory and disk.</div></section>
       <section class="pz-step"><h3><span class="pz-no">5</span> Result ${st.busy ? `<span class="pz-chip pz-warn" role="status">${esc(st.busy)}</span>` : ""}</h3>
         ${st.plan ? renderPlan(st.plan) : `<div class="muted">${st.layout ? "computing &hellip;" : "Choose a layout (step 3); everything else is computed from the model and the cards."}</div>`}
         <details class="pz-calc pz-exp"><summary>For start scripts</summary>
@@ -193,7 +197,7 @@
   async function start() {
     if (st.started) return; st.started = true;
     try {
-      st.cat = await call("planer-katalog");
+      st.cat = await call("planer-katalog" + katQ());
       st.model = st.cat.models[0] ? st.cat.models[0].id : "";
       setCounts((st.cat.machine && st.cat.machine.cards) || st.cat.shortcuts[0].cards);
       st.seats = st.cat.defaults.seats; st.tokens = st.cat.defaults.tokens;
@@ -201,6 +205,13 @@
     draw();
     if (st.cat) loadLayouts();
   }
+  // language switch: the server texts are localized by the server, so ask again in the new language (state, counts and inputs stay)
+  let lastLang = LANG();
+  if (typeof window !== "undefined" && typeof window.addEventListener === "function") window.addEventListener("rigdash-lang", () => {
+    if (!st.started || !st.cat || lastLang === LANG()) return;
+    lastLang = LANG(); st.cache.clear();
+    call("planer-katalog" + katQ()).then((c) => { st.cat = c; return loadLayouts(); }, (e) => { st.err = e.message; draw(); });
+  });
   root.RigPlaner = { show: start };
   const tab = document.getElementById("tab-profil");
   if (tab && !tab.hidden) start();

@@ -281,5 +281,79 @@ class FixesBeyondTheReviewTests(unittest.TestCase):
         self.assertEqual(k["qwen38-27b-int8"]["weights_mib"], Z.load_steckbrief()["qwen38-27b-int8"]["weights_total_mib"])
 
 
+class GermanPage(unittest.TestCase):
+    """Review B2: the server answers in German when the page asks (``lang: de``): complete sentences, no half-translated mixtures."""
+
+    ENGLISH = ("the ", " of ", " and ", " with ", "must fit", "work as", "does not fit", "rough")
+
+    def _texts(self, o, out):
+        if isinstance(o, str):
+            out.append(o)
+        elif isinstance(o, list):
+            for x in o:
+                self._texts(x, out)
+        elif isinstance(o, dict):
+            for k, v in o.items():
+                if k not in ("roh", "intern", "key", "id"):
+                    self._texts(v, out)
+        return out
+
+    def test_layouts_and_calculation_lines_are_german(self):
+        z = Z.ZielPlaner(StubEditor(hw_rig()))
+        for model in ("qwen38-27b-int8", "qwen38-27b-nvfp4", "qwen38-nf-int4"):
+            out = z.layouts({"model": model, "cards": RIG, "lang": "de"})
+            texts = self._texts([[l["satz"], l["why"], l["calc"]] for l in out["layouts"]] + [out["note"], out["hw"]["text"]], [])
+            for t in texts:
+                self.assertFalse(any(w in t.lower() for w in self.ENGLISH), t)
+        l = {x["id"]: x for x in z.layouts({"model": "qwen38-27b-nvfp4", "cards": RIG, "lang": "de"})["layouts"]}["flip"]
+        self.assertTrue(l["calc"][0].startswith("Anzahl Karten: 3"), l["calc"][0])
+        self.assertIn("Gewichte:", l["calc"][1])
+        self.assertTrue(any("EIN Request an der Decke" in x for x in l["calc"]))
+
+    def test_english_and_unknown_languages_are_unchanged(self):
+        z = Z.ZielPlaner(StubEditor(hw_rig()))
+        en = z.layouts({"model": "qwen38-27b-int8", "cards": RIG})
+        self.assertEqual(en, z.layouts({"model": "qwen38-27b-int8", "cards": RIG, "lang": "en"}))
+        self.assertEqual(en, z.layouts({"model": "qwen38-27b-int8", "cards": RIG, "lang": "fr"}))
+        self.assertTrue(en["layouts"][0]["calc"][0].startswith("cards: 3 cards"))
+
+    def test_plan_rows_are_german_and_the_raw_flags_and_the_start_profile_are_not_touched(self):
+        res = canned("res_27b_int8_flip_rig.json")
+        z = Z.ZielPlaner(StubEditor(hw_rig(), res))
+        de = z.plan({"model": "qwen38-27b-int8", "layout": "flip", "cards": RIG, "lang": "de"})
+        en = z.plan({"model": "qwen38-27b-int8", "layout": "flip", "cards": RIG})
+        self.assertEqual(de["intern"], en["intern"])
+        fd, fe = fields(de), fields(en)
+        self.assertEqual(sorted(fd), sorted(fe))
+        for k in fd:
+            self.assertEqual((fd[k]["roh"], fd[k]["wert"], fd[k]["je_karte"]), (fe[k]["roh"], fe[k]["wert"], fe[k]["je_karte"]), k)
+        self.assertEqual(fd["d_pool"]["label"], "KV-Pool, Decode-Gruppe (von allen Sitzen geteilt)")
+        self.assertIn("Festposten 3 x 1926 MiB", fd["d_pool"]["warum"])
+        self.assertEqual(fd["p_pool"]["quelle"], "Launcher-Trockenlauf (--max-total-tokens)")
+        self.assertEqual(de["verdikt"]["text"], "Der Trockenlauf des Launchers geht ohne Force durch.")
+        self.assertEqual(de["verdikt"]["outcome"], en["verdikt"]["outcome"])
+
+    def test_every_german_text_uses_only_placeholders_its_english_key_has(self):
+        import re as _re
+        de = json.load(open(Z.DE_FILE, encoding="utf-8"))["de"]
+        for en, g in de.items():
+            n = len(_re.findall(r"%[-.\d]*[dsrf]", en.replace("%%", "")))
+            used = [int(x) for x in _re.findall(r"\{(\d+)\}", g)]
+            self.assertTrue(all(i < n for i in used), (en, g))
+            self.assertNotIn("%s", g, en)
+
+    def test_the_launcher_outcome_geht_has_its_text(self):
+        """The dry run of OUR rig ends with outcome ``geht``: the verdict line must say so, not "No launcher verdict (geht)"."""
+        out, _ = plan("res_27b_int8_flip_rig.json", "qwen38-27b-int8", "flip", RIG, hw_rig())
+        self.assertEqual(out["verdikt"]["text"], "The launcher's dry run passes without force.")
+
+    def test_the_katalog_in_german(self):
+        k = Z.ZielPlaner(StubEditor(hw_rig())).katalog("de")
+        self.assertEqual(k["layouts"][0]["name"], "Solo (nur TP)")
+        self.assertTrue(k["layouts"][0]["satz"].startswith("Alle Karten"))
+        self.assertTrue(any(x["label"].startswith("Referenz-Rig") for x in k["shortcuts"]))
+        self.assertEqual([m["id"] for m in k["models"]], [m["id"] for m in Z.MODELS])
+
+
 if __name__ == "__main__":
     unittest.main()

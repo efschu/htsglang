@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Any, Dict, List, Optional
 
 from . import kartenplan_catalog as CAT
@@ -38,6 +39,7 @@ from . import kartenplan_catalog as CAT
 SCHEMA = "flliper.planer-ziel/1"
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "planer_data")
 STECKBRIEF_FILE = os.path.join(DATA_DIR, "steckbrief.json")
+DE_FILE = os.path.join(DATA_DIR, "planer_ziel_de.json")
 MIB = float(1 << 20)
 
 #: FALLBACK card counts when the topology cannot be asked (no editor / no planner gate): N = 3 is the metal-proven shape.  The page asks the topology itself
@@ -90,6 +92,72 @@ SHORTCUTS = [
     {"id": "3x3090", "label": "3 x RTX 3090", "cards": [{"card": "rtx3090-24", "count": 3}]},
     {"id": "rig", "label": "Reference rig (RTX 5090 + 2 x RTX 3080 20 GB)", "cards": [{"card": "rtx5090-32", "count": 1}, {"card": "rtx3080-20", "count": 2}]},
 ]
+
+
+# ---------------------------------------------------------------------------------------------------------------------------- German (review B2)
+_DE_RULES: Optional[list] = None
+
+
+def _de_rules() -> list:
+    """The German texts of ``planer_data/planer_ziel_de.json`` as (exact dict, [(regex, template)]) -- a template (printf placeholders) becomes a regex."""
+    global _DE_RULES
+    if _DE_RULES is None:
+        try:
+            with open(DE_FILE, encoding="utf-8") as fh:
+                de = json.load(fh).get("de") or {}
+        except (OSError, ValueError):
+            de = {}
+        exact: Dict[str, str] = {}
+        pats: List[tuple] = []
+        for en, g in de.items():
+            parts = re.split(r"(%%|%[-.\d]*[dsrf])", en)
+            if any(x.startswith("%") and x != "%%" for x in parts):
+                rx = ""
+                for x in parts:
+                    if x == "%%":
+                        rx += "%"
+                    elif x.startswith("%"):
+                        rx += r"(-?\d+)" if x.endswith("d") else r"(-?[\d.]+)" if x.endswith("f") else "(.*)"
+                    else:
+                        rx += re.escape(x)
+                pats.append((re.compile("^" + rx + "$", re.S), g))
+            else:
+                exact[en.replace("%%", "%")] = g
+        _DE_RULES = [exact, pats]
+    return _DE_RULES
+
+
+def _de_text(s: str) -> str:
+    exact, pats = _de_rules()
+    if s in exact:
+        return exact[s]
+    for rx, g in pats:
+        m = rx.match(s)
+        if m:
+            try:
+                return g.format(*[_de_text(x) for x in m.groups()])
+            except (IndexError, KeyError, ValueError):
+                return s
+    return s
+
+
+def localize(obj, lang: Optional[str]):
+    """The answer of the page API in the page language: every string with a German text in ``planer_ziel_de.json`` is replaced (exact text or template), anything
+    else stays English (never blank).  ``lang`` other than ``de`` returns ``obj`` unchanged.  The structural keys (``id``, ``key``, ``roh`` = the raw flag, ``intern`` = the start profile that goes back to the server) are not touched."""
+    if lang != "de":
+        return obj
+    if isinstance(obj, str):
+        return _de_text(obj)
+    if isinstance(obj, list):
+        return [localize(x, lang) for x in obj]
+    if isinstance(obj, dict):
+        return {k: (v if k in ("id", "key", "roh", "code", "schema", "intern", "form", "outcome", "status") else localize(v, lang)) for k, v in obj.items()}
+    return obj
+
+
+def _lang(body) -> Optional[str]:
+    l = (body or {}).get("lang") if isinstance(body, dict) else None
+    return l if l in ("de", "en") else None
 
 
 class ZielError(ValueError):
@@ -251,7 +319,7 @@ class ZielPlaner:
         return self._supported
 
     # ------------------------------------------------------------------ Katalog
-    def katalog(self) -> dict:
+    def katalog(self, lang: Optional[str] = None) -> dict:
         mine = self._hw_cards()
         counts: Dict[str, int] = {}
         for e in mine:
@@ -263,10 +331,10 @@ class ZielPlaner:
             models.append({"id": m["id"], "name": m["name"], "format": m["format"],
                            "layouts": [l["id"] for l in LAYOUTS if m["profiles"].get(l["id"])],
                            "weights_mib": self._weights_mib(m["id"])})
-        return {"ok": True, "schema": SCHEMA, "models": models, "cards": cards, "layouts": [dict(l) for l in LAYOUTS], "supported_n": list(self.supported_n()),
+        return localize({"ok": True, "schema": SCHEMA, "models": models, "cards": cards, "layouts": [dict(l) for l in LAYOUTS], "supported_n": list(self.supported_n()),
                 "machine": ({"cards": [{"card": k, "count": v} for k, v in counts.items()], "n": len(mine)} if mine else None),
                 "shortcuts": [dict(x) for x in SHORTCUTS], "defaults": {"seats": DEFAULT_SEATS, "tokens": DEFAULT_TOKENS}, "goals": GOALS,
-                "overhead_per_card_mib": OVERHEAD_PER_CARD_MIB}
+                "overhead_per_card_mib": OVERHEAD_PER_CARD_MIB}, lang)
 
     # ------------------------------------------------------------------ Layouts (Rechenbegruendung)
     def _weights_mib(self, mid: str) -> Optional[int]:
@@ -334,6 +402,9 @@ class ZielPlaner:
         return ["%s: %s" % (k, v) for k, v in seen.items()]
 
     def layouts(self, body: dict) -> dict:
+        return localize(self._layouts(body), _lang(body))
+
+    def _layouts(self, body: dict) -> dict:
         model = self._model(body.get("model"))
         cards = self._cards(body.get("cards"))
         seats = self._int(body.get("seats"), "seats", *GOALS["seats"]) or DEFAULT_SEATS
@@ -379,7 +450,10 @@ class ZielPlaner:
 
     # ------------------------------------------------------------------ Vorschlag
     def plan(self, body: dict) -> dict:
-        lay = self.layouts(body)
+        return localize(self._plan(body), _lang(body))
+
+    def _plan(self, body: dict) -> dict:
+        lay = self._layouts(body)
         model = self._model(body.get("model"))
         layout = self._layout(body.get("layout"))
         li = next(x for x in lay["layouts"] if x["id"] == layout["id"])
@@ -387,7 +461,9 @@ class ZielPlaner:
         base = {"ok": True, "schema": SCHEMA, "model": lay["model"], "layout": {"id": layout["id"], "name": layout["name"]}, "n": lay["n"], "hw": lay["hw"],
                 "layout_info": li}
         if li["status"] in ("n_unsupported", "blocked"):
-            return dict(base, status=li["status"], felder=[], verdikt=None, hinweise=li["why"])
+            # dict literals, not keyword arguments: the release rename (ident map) renames a ``verdikt=`` keyword but never a string key, which would split the
+            # JSON contract of the page in the renamed tree (review B6)
+            return dict(base, **{"status": li["status"], "felder": [], "verdikt": None, "hinweise": li["why"]})
         seats = self._int(body.get("seats"), "seats", *GOALS["seats"])
         tokens = self._int(body.get("tokens"), "tokens", *GOALS["tokens"])
         goals: Dict[str, Any] = {}
@@ -401,7 +477,7 @@ class ZielPlaner:
         res = self.ed.propose(req)
         out = dict(base, status="ok" if res.get("ok") else "error")
         if not res.get("ok"):
-            return dict(out, felder=[], verdikt=None, hinweise=[res.get("error") or "the planner gave no proposal"] + list(res.get("notes") or []))
+            return dict(out, **{"felder": [], "verdikt": None, "hinweise": [res.get("error") or "the planner gave no proposal"] + list(res.get("notes") or [])})
         out.update(self._summary(model, layout["id"], cards, res, seats, tokens))
         out["intern"] = {"basis": model["profiles"][layout["id"]], "form": layout["form"], "oracle": res.get("oracle"),
                          "startprofil": {"doc": (res.get("startprofil") or {}).get("doc"), "name": (res.get("startprofil") or {}).get("name")}}
@@ -621,7 +697,7 @@ class ZielPlaner:
                     continue
                 seen[code] = {"code": code, "text": (x.get("reason") or x.get("title") or "")[:300], "blocked": bool(blocked), "force": bool(x.get("forcebar")), "count": 1}
                 items.append(seen[code])
-        text = {"ok": "The launcher's dry run passes without force.",
+        text = {"geht": "The launcher's dry run passes without force.", "ok": "The launcher's dry run passes without force.",
                 "ok_with_force": "The launcher's dry run passes only with force: it does not trust numbers that were not measured on these cards (see the notes). "
                                  "The first boot is the measurement.",
                 "verweigert": "The launcher refuses this combination (see the reasons).", "crash": "The launcher's dry run failed (see the reasons)."}.get(outcome, "No launcher verdict (%s)." % (outcome,))

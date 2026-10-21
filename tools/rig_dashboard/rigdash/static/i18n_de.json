@@ -1,4 +1,5 @@
-{"words": {
+{
+"words": {
 "as of": "Stand",
 "at avg": "bei Ø",
 "attempted": "versucht",
@@ -62,7 +63,11 @@
 "values,": "Werte,",
 "verified": "belegt",
 "Window:": "Fenster:",
-"window:": "Fenster:"
+"window:": "Fenster:",
+"of VRAM": "VRAM",
+"margin": "Reserve",
+"One less": "Eine weniger",
+"One more": "Eine mehr"
 },
 "de": {
 "\" not readable (shell variable?): not calculated.": "\" nicht lesbar (Shell-Variable?): nicht gerechnet.",
@@ -5125,5 +5130,15 @@
 "your input / planner default": "Ihre Eingabe / Planer-Standard",
 "model fact sheet": "Modell-Steckbrief",
 "The launcher's dry run passes without force.": "Der Trockenlauf des Launchers geht ohne Force durch.",
-"hardware figures:": "Hardware-Zahlen:"
-}}
+"hardware figures:": "Hardware-Zahlen:",
+"Seats = concurrent requests. Tokens per seat is a ceiling for one request, not a share: all seats use one shared KV pool, so seats × tokens is not a memory budget; what does not fit parks to host memory and disk.": "Sitze = gleichzeitige Requests. Token pro Sitz ist eine Decke für einen Request, kein Anteil: alle Sitze nutzen einen gemeinsamen KV-Pool, also ist Sitze × Token kein Speicherbudget; was nicht passt, wird in Host-Speicher und auf Platte geparkt.",
+"Measure rates": "Raten messen",
+"Books a GPU window on the window plan and measures memory bandwidth and compute of these cards": "Bucht ein GPU-Fenster im Fensterplan und misst Speicherbandbreite und Rechenleistung dieser Karten",
+"asking the window plan …": "frage den Fensterplan …",
+"measurement requested": "Messung angefordert",
+"Reference rig": "Referenz-Rig",
+"estimate": "Schätzung",
+"An estimate: the launcher sizes this at boot": "Eine Schätzung: der Launcher bemisst dies beim Boot",
+"The planner stores this plan as a start profile (an internal name). Start scripts take it with": "Der Planer legt diesen Plan als Startprofil ab (ein interner Name). Startskripte nehmen es mit"
+}
+}
