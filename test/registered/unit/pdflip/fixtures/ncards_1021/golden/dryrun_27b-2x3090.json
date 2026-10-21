@@ -1,0 +1,65 @@
+{
+ "budgets": [
+  [
+   "P",
+   0,
+   18584
+  ],
+  [
+   "P",
+   1,
+   18584
+  ],
+  [
+   "P",
+   0,
+   18584
+  ],
+  [
+   "P",
+   1,
+   16792
+  ],
+  [
+   "D(dry, expectation)",
+   0,
+   19792
+  ],
+  [
+   "D(dry, expectation)",
+   1,
+   19792
+  ]
+ ],
+ "exc_head": "",
+ "exc_type": null,
+ "forced": [
+  "HW-BORROWED",
+  "HW-COUNT",
+  "HW-UNCALIBRATED"
+ ],
+ "group_flags": {
+  "D": {
+   "--max-total-tokens": null,
+   "--pp-size": "1",
+   "--rank-gpu-memory-mib": "19792,19792",
+   "--rank-tp-ratio": "auto",
+   "--tp-size": "2"
+  },
+  "P": {
+   "--max-total-tokens": "81623",
+   "--pp-size": "2",
+   "--rank-gpu-memory-mib": "18584,16792",
+   "--rank-tp-ratio": null,
+   "--tp-size": "1"
+  }
+ },
+ "pp_cut": {
+  "attn": "9,7",
+  "chosen_pool": "81623",
+  "layers": "39,25",
+  "pool_floor": "67584",
+  "pool_floor_source": "flag"
+ },
+ "stages": 2
+}

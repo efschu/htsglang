@@ -256,6 +256,24 @@ def arch_twin_class(card) -> Optional[str]:
     return None
 
 
+def arch_twin_of_label(label: str) -> Optional[str]:
+    """NCARDS 1021: :func:`arch_twin_class` for a class LABEL (the ``"<model>/<total>MiB/sm<cc>"`` card key an inventory
+    signature carries), where no card object is at hand (the launcher's stage tables are mapped before the cards are
+    re-read). ``sm86`` -> RTX3080, ``sm120`` -> RTX5090; ``None`` for a label without an ``sm<cc>`` suffix or an arch no
+    calibrated class shares. Same rule, same caveat: a NAME for a borrow, never a measurement."""
+    m = re.search(r"/sm(\d+)$", str(label or ""))
+    if not m:
+        return None
+    digits = m.group(1)
+    cc = (int(digits[:-1]), int(digits[-1])) if len(digits) > 1 else None
+    if cc is None:
+        return None
+    for cls in CALIBRATED_CLASSES:
+        if tuple(cls.cc) == cc:
+            return cls.label
+    return None
+
+
 def class_label(card) -> str:
     """The record-lookup label: the calibration class, else :func:`card_key`."""
     return calibration_class(card) or card_key(card)

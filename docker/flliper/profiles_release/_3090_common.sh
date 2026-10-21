@@ -35,3 +35,69 @@ _p3090_apply() {
   _p3090_set --env-d "FLLIPER_PDFLIP_EXTEND_TRIM_MIB=$trim"
   P3090_L15_MIB=$l15
 }
+
+# ---- NCARDS 1021: Setzer fuer die Worte INNERHALB der Gruppen-Strings (--extra-p/--extra-d, --env-p/--env-d), die ``tools/ncards_profile_gen.py``
+# aus dem Vorschlag des Profil-Planers (propose, Stufe A) ableitet. Gleiche Regeln wie ``propose.LaunchArgv``: ein Wert wird an Ort und Stelle
+# ersetzt, nichts sonst am String angehaengt oder umgebaut; fehlt das Wort, wird es angehaengt. Beide Schreibweisen des Gruppen-Strings
+# ("--extra-p TEXT" und "--extra-p=TEXT") werden gelesen und in ihrer Schreibweise zurueckgeschrieben.
+# _p3090_gfind FLAG: setzt _GI (Index des Textes in PROFILE_ARGS, letztes Vorkommen, -1 = fehlt) und _GM (sep | eq | none).
+_p3090_gfind() {
+  local _f=$1 _k
+  _GI=-1 _GM=none
+  for ((_k = 0; _k < ${#PROFILE_ARGS[@]}; _k++)); do
+    if [ "${PROFILE_ARGS[_k]}" = "$_f" ]; then _GI=$((_k + 1)) _GM=sep
+    elif [[ "${PROFILE_ARGS[_k]}" == "$_f="* ]]; then _GI=$_k _GM=eq; fi
+  done
+}
+_p3090_gread() { if [ "$_GM" = eq ]; then printf '%s' "${PROFILE_ARGS[_GI]#*=}"; else printf '%s' "${PROFILE_ARGS[_GI]}"; fi; }
+_p3090_gwrite() { if [ "$_GM" = eq ]; then PROFILE_ARGS[_GI]="$1=$2"; else PROFILE_ARGS[_GI]=$2; fi; }
+# _p3090_extra G FLAG VALUE: das Wort "FLAG VALUE" im --extra-G-String ersetzen (angehaengt, wenn FLAG fehlt).
+_p3090_extra() {
+  local _g=$1 _f=$2 _v=$3 _t
+  _p3090_gfind "--extra-$_g"
+  if [ "$_GM" = none ]; then PROFILE_ARGS+=("--extra-$_g" "$_f $_v"); return; fi
+  _t=$(_p3090_gread)
+  if printf '%s' "$_t" | grep -qE "(^|[[:space:]])${_f}([[:space:]]|=)"; then
+    _t=$(printf '%s' "$_t" | sed -E "s#(^|[[:space:]])${_f}([[:space:]]+|=)[^[:space:]]+#\\1${_f} ${_v}#")
+  else
+    _t="$_t $_f $_v"
+  fi
+  _p3090_gwrite "--extra-$_g" "$_t"
+}
+# _p3090_extra_drop G FLAG: das Wort samt Wert aus dem --extra-G-String nehmen.
+_p3090_extra_drop() {
+  local _g=$1 _f=$2 _t
+  _p3090_gfind "--extra-$_g"
+  [ "$_GM" != none ] || return 0
+  _t=$(_p3090_gread | sed -E "s#(^|[[:space:]])${_f}([[:space:]]+|=)[^[:space:]]+##; s#^[[:space:]]+##")
+  _p3090_gwrite "--extra-$_g" "$_t"
+}
+# _p3090_env G KEY VALUE: "KEY=VALUE" im --env-G-String ersetzen (angehaengt, wenn KEY fehlt).
+_p3090_env() {
+  local _g=$1 _k=$2 _v=$3 _t
+  _p3090_gfind "--env-$_g"
+  if [ "$_GM" = none ]; then PROFILE_ARGS+=("--env-$_g" "$_k=$_v"); return; fi
+  _t=$(_p3090_gread)
+  if printf '%s' "$_t" | grep -qE "(^|;)${_k}="; then
+    _t=$(printf '%s' "$_t" | sed -E "s#(^|;)${_k}=[^;]*#\\1${_k}=${_v}#")
+  else
+    _t="$_t;$_k=$_v"
+  fi
+  _p3090_gwrite "--env-$_g" "$_t"
+}
+# _p3090_env_drop G KEY: "KEY=..." aus dem --env-G-String nehmen.
+_p3090_env_drop() {
+  local _g=$1 _k=$2 _t
+  _p3090_gfind "--env-$_g"
+  [ "$_GM" != none ] || return 0
+  _t=$(_p3090_gread | sed -E "s#(^|;)${_k}=[^;]*##; s#^;##")
+  _p3090_gwrite "--env-$_g" "$_t"
+}
+# _p3090_form KEY VALUE: ein global exportiertes Form-Env des Vorschlags (Launcher kopiert os.environ in Front + beide Gruppen); wirkt, sobald das Profil
+# profile_form_env() ueber _p3090_form_apply aufruft (siehe die NF-/27B-Profile). _form kommt vom Entrypoint.
+P3090_FORM=()
+_p3090_form() { P3090_FORM+=("$1" "$2"); }
+_p3090_form_apply() {
+  local _k
+  for ((_k = 0; _k < ${#P3090_FORM[@]}; _k += 2)); do _form "${P3090_FORM[_k]}" "${P3090_FORM[_k + 1]}"; done
+}

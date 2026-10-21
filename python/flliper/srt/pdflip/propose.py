@@ -336,6 +336,9 @@ RATE_PRICED_OBJECTIVES = ("decode-bs1", "decode-bs6")
 #: 3080 ``--rank-tp-ratio`` -- and the launcher refuses any other D weight vector ("the presets are built on --rank-tp-ratio 58,25,25",
 #: ``launcher.d_reshard_argv``).  Pinned against ``d_reshard.RC9_BASE`` by test_planer_3090_1021.
 D_RESHARD_RIG_BASE = (58, 25, 25)
+#: NCARDS 1021: the per-rank D flag whose host-ordinal value is a ROLE value of Form A (see ``per_class``): --d-nontorch-mib (host 1981 MiB on the
+#: rig, workers 528 / 524).
+HOST_ROLE_FLAG = "--d-nontorch-mib"
 
 
 def homogeneous(classes: Sequence[str]) -> bool:
@@ -624,6 +627,15 @@ def propose(hardware: Any, model: Mapping[str, Any], form: str = "flip", goals: 
             return
         if binv is not None and len(vec) == len(binv):
             new, srcs = R.class_rekey(vec, binv, cards)
+            if is_moe and name == HOST_ROLE_FLAG and new and binv[0] != live_cls[0]:
+                # NCARDS 1021: what a Form A D rank keeps OUTSIDE the torch allocator is a ROLE value, not only a class value: the host
+                # (rank 0, the dense weights, the PLE/dispatch handles) measured 1981 MiB on the rig's 5090, the workers 528 / 524 on the
+                # 3080s.  A class rekey would hand the host of N identical 3090s the worker value (528): 1.4 GB too little on exactly the
+                # card that dies first (the host's TP0 OOM at load).  The host ordinal keeps at least the profile's own host-ordinal value
+                # (conservative direction, books more), named as a role borrow.
+                host = max(float(new[0]), float(vec[0]))
+                new[0] = str(int(host)) if host.is_integer() else str(host)
+                srcs[0] = "%s; host role (Form A rank 0): not below the profile's host-ordinal value %s (unverified)" % (srcs[0], vec[0])
             newt = R.csv(new)
             _set(la, kind, group, name, newt)
             borrowed = [s for s in srcs if s.startswith(("borrowed", "unverified", "borrowed", "unverified"))]

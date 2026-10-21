@@ -1464,15 +1464,19 @@ P_PREFILL_GRAPH_STAGES = 3
 def p_group_stages() -> int:
     """HW-P1c 1003: group P's stage count = the launch's card count (one stage
     per card). :data:`P_PREFILL_GRAPH_STAGES` (3) wherever NVML cannot say, so
-    the reference rig and every desk test read what they always read."""
+    the reference rig and every desk test read what they always read.
+
+    NCARDS 1021: the live inventory's count also for a FOREIGN inventory (N identical
+    RTX 3090). It used to answer 3 there ("meets the named HW-COUNT / HW-UNCALIBRATED
+    refusal in main first"), but a forced launch (the first boot on new cards IS the
+    measurement) then priced a 4-stage cut with the 3-entry graph pool post:
+    ``prefill_graph_pool_mib has 3 entries for 4 stages`` refused every candidate of the
+    cut solver (W40 "not one cut ... is priceable at all"). Without --force the named
+    refusals still come first; on the reference rig (3 cards) and on N=3 nothing moves."""
     live = _live_inventory_or_none()
     if not live:
         return P_PREFILL_GRAPH_STAGES
-    # only a launch the inventory check will DERIVE (a subset of the calibrated
-    # cards) changes the table; a foreign inventory keeps the three-stage tables
-    # and meets the named HW-COUNT / HW-UNCALIBRATED refusal in main first
-    cal, _ = records_inventory(pdflip_form.DEFAULT_PROFILE)
-    return len(live) if inventory_view_mod.is_subset(live, cal) else P_PREFILL_GRAPH_STAGES
+    return len(live)
 
 
 def p_prefill_graph_pool_mib(ns) -> Tuple[float, ...]:
@@ -1812,16 +1816,31 @@ def _p_chunk_by_class(items, key, stages: int, profile: Optional[str]):
     ``(mapped items, the reference index each live stage took)``; ``None`` when
     there is nothing to map (same count) or no mapping exists."""
     items = tuple(items)
-    if int(stages) == len(items):
-        return None
     prof = str(profile or pdflip_form.DEFAULT_PROFILE)
     cal, _ = records_inventory(prof)
     live = _live_inventory_or_none()
     if not live or len(live) != int(stages) or len(cal) != len(items):
         return None
-    if not inventory_view_mod.is_subset(live, cal):
+    if tuple(live) == tuple(cal):
         return None
-    idx = tuple(max((i for i, k in enumerate(cal) if k == c), key=lambda i: key(items[i])) for c in live)
+    if inventory_view_mod.is_subset(live, cal):
+        if int(stages) == len(items):
+            return None
+        twins: Dict[str, str] = {}
+    else:
+        # NCARDS 1021: a FOREIGN inventory (N x RTX 3090) under the forced borrow: each live stage takes the SLOWEST
+        # calibrated stage of its card's arch twin class (the AP1/W19 rule, as the records: inventory_view.borrow_vector).
+        # The forced boot names every borrow (HW-UNCALIBRATED FORCED-PAST); without --force the named refusals come
+        # first. No twin (sm_89, unclassified): refused as before (len mismatch below).
+        twins = {c: card_identity.arch_twin_of_label(c) for c in set(live) if c not in cal}
+    idx_l = []
+    for c in live:
+        k = c if c in cal else twins.get(c)
+        pool = [i for i, kk in enumerate(cal) if k and kk == k]
+        if not pool:
+            return None
+        idx_l.append(max(pool, key=lambda i: key(items[i])))
+    idx = tuple(idx_l)
     return tuple(items[i] for i in idx), idx
 
 
@@ -15270,6 +15289,13 @@ def dual_alloc_cache_book_env(ns, cards: List[Card], log: Log) -> Dict[str, str]
             f"measure with python -m flliper.srt.pdflip.budget_rest --dual-d-log")
         return {}
     vals = list(sel.record.value)
+    if len(vals) != len(cards):
+        # NCARDS 1021: the record is a positional 3-vector of the reference inventory; read it through the active
+        # inventory view like every other record (``profile_constant``: derive by class; the forced borrow by arch twin).
+        # Reference rig / same inventory: the view returns the value unchanged.
+        _got = inventory_view_mod.apply_active(
+            name, str(getattr(ns, "profile", None) or pdflip_form.DEFAULT_PROFILE), tuple(vals))
+        vals = list(_got)
     if len(vals) != len(cards):
         raise PdFlipLaunchRefused(
             f"{_budget_rest.ALLOC_CACHE_MARKER}: {name} has {len(vals)} entries for {len(cards)} cards; "

@@ -1,0 +1,95 @@
+{
+ "budgets": [
+  [
+   "P",
+   0,
+   21608
+  ],
+  [
+   "P",
+   1,
+   21608
+  ],
+  [
+   "P",
+   2,
+   21608
+  ],
+  [
+   "P",
+   3,
+   21608
+  ],
+  [
+   "D(Karte, Erwartung)",
+   0,
+   19208
+  ],
+  [
+   "D(Karte, Erwartung)",
+   1,
+   21384
+  ],
+  [
+   "D(Karte, Erwartung)",
+   2,
+   21384
+  ],
+  [
+   "D(Karte, Erwartung)",
+   3,
+   21576
+  ],
+  [
+   "D(dry, expectation)",
+   0,
+   19208
+  ],
+  [
+   "D(dry, expectation)",
+   1,
+   21384
+  ],
+  [
+   "D(dry, expectation)",
+   2,
+   21384
+  ],
+  [
+   "D(dry, expectation)",
+   3,
+   21576
+  ]
+ ],
+ "exc_head": "",
+ "exc_type": null,
+ "forced": [
+  "HW-BORROWED",
+  "HW-COUNT",
+  "HW-UNCALIBRATED"
+ ],
+ "group_flags": {
+  "D": {
+   "--max-total-tokens": "262144",
+   "--pp-size": "1",
+   "--rank-gpu-memory-mib": "19208,21384,21384,21576",
+   "--rank-tp-ratio": "1,0,0,0",
+   "--tp-size": "4"
+  },
+  "P": {
+   "--max-total-tokens": "262144",
+   "--pp-size": "4",
+   "--rank-gpu-memory-mib": "21608,21608,21608,21608",
+   "--rank-tp-ratio": null,
+   "--tp-size": "1"
+  }
+ },
+ "pp_cut": {
+  "attn": "3,3,3,3",
+  "chosen_pool": "1895021",
+  "layers": "12,12,12,12",
+  "pool_floor": "none",
+  "pool_floor_source": "none"
+ },
+ "stages": 4
+}

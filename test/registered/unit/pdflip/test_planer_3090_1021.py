@@ -211,7 +211,9 @@ def _compare(test, path, doc):
         test.fail("golden regenerated: %s (run again without PLANER_3090_REGEN)" % path)
     with open(path, encoding="utf-8") as fh:
         want = json.load(fh)
-    test.assertEqual(json.loads(json.dumps(doc, sort_keys=True, ensure_ascii=False)), want)
+    # NCARDS 1021: the argv carries the checkout path of the worktree the golden was written in; compare path-independently
+    mask = lambda o: json.loads(re.sub(r"/spinning/wt-[A-Za-z0-9_.-]+", "<TREE>", json.dumps(o, sort_keys=True, ensure_ascii=False)))
+    test.assertEqual(mask(doc), mask(want))
 
 
 class TestGoldens3090(unittest.TestCase):
